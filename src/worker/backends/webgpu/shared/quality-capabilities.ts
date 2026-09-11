@@ -39,6 +39,18 @@ export const UNIVERSAL_QUALITY_KEYS: ReadonlySet<QualityKey> = new Set<QualityKe
     "integerScale", "aspectMode", "scanlines", "crt",
 ]);
 
+/**
+ * Keys the movie decoder consumes (video/video-engine.ts), not a graphics backend: they
+ * apply to whatever the VideoEngine decodes regardless of which backend presents it. They
+ * are never a backend gap, but they are also not universal — a title that plays its
+ * cutscenes through its OWN player DLL (the guest's Escape/Bink code running on the CPU)
+ * never hands us a frame, and then nothing here reaches the screen. That gap is reported
+ * where it can be seen: `state(['video'])` lists the sessions each knob actually touched.
+ */
+export const VIDEO_QUALITY_KEYS: ReadonlySet<QualityKey> = new Set<QualityKey>([
+    "videoChroma", "videoDither", "videoDeinterlace",
+]);
+
 interface RegisteredBackend {
     backend: string;
     supports: ReadonlySet<QualityKey>;
@@ -94,7 +106,7 @@ export function computeQualityGaps(quality: QualityConfig): QualityKey[] {
     if (!active) return [];
     const gaps: QualityKey[] = [];
     for (const key of Object.keys(DEFAULT_QUALITY) as QualityKey[]) {
-        if (UNIVERSAL_QUALITY_KEYS.has(key)) continue;
+        if (UNIVERSAL_QUALITY_KEYS.has(key) || VIDEO_QUALITY_KEYS.has(key)) continue;
         if (active.supports.has(key)) continue;
         if (quality[key] === DEFAULT_QUALITY[key]) continue;
         gaps.push(key);

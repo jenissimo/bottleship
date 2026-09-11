@@ -11,6 +11,10 @@
 export type AspectMode = "stretch" | "pillarbox" | "integer";
 export type PostAA = "off" | "fxaa";
 export type ToneMap = "off" | "aces";
+/** nearest = 4:2:0 chroma replicated 2x2 (what period software players drew); smooth = filtered up. */
+export type VideoChroma = "nearest" | "smooth";
+/** auto = only frames the decoder flags interlaced; always = every frame (fields baked into the picture). */
+export type VideoDeinterlace = "off" | "auto" | "always";
 
 export interface QualityConfig {
     // --- Sampler overrides (safe side of the seam — GPU-resident only) ---
@@ -58,6 +62,14 @@ export interface QualityConfig {
     internalScale: number;
     /** Auto-generate mip chains on texture upload (prereq for trilinear/AF to bite). */
     autoMipmap: boolean;
+
+    // --- Movie decode (video/video-engine.ts — the frames a title's cutscene/intro player gets) ---
+    /** How 4:2:0 chroma is brought to full resolution before the frame reaches the game. */
+    videoChroma: VideoChroma;
+    /** Ordered dither when a frame is packed to a 16-bit surface (the bands in every fade). */
+    videoDither: boolean;
+    /** Field rebuild for interlaced frames. */
+    videoDeinterlace: VideoDeinterlace;
 }
 
 export const DEFAULT_QUALITY: QualityConfig = {
@@ -76,6 +88,9 @@ export const DEFAULT_QUALITY: QualityConfig = {
     msaa: 1,
     internalScale: 0,
     autoMipmap: false,
+    videoChroma: "nearest",
+    videoDither: false,
+    videoDeinterlace: "off",
 };
 
 function clampNum(v: unknown, lo: number, hi: number, dflt: number): number {
@@ -104,6 +119,8 @@ const INTERNAL_SCALE_STEPS = [0, 1, 2, 4] as const;
 const ASPECT_MODES: readonly AspectMode[] = ["stretch", "pillarbox", "integer"];
 const POST_AA: readonly PostAA[] = ["off", "fxaa"];
 const TONEMAPS: readonly ToneMap[] = ["off", "aces"];
+const VIDEO_CHROMA: readonly VideoChroma[] = ["nearest", "smooth"];
+const VIDEO_DEINTERLACE: readonly VideoDeinterlace[] = ["off", "auto", "always"];
 
 /**
  * Validate + clamp an untrusted partial (from manifest JSON, host UI, or dbg console)
@@ -129,6 +146,9 @@ export function mergeQuality(base: QualityConfig, partial: Partial<QualityConfig
     if ("msaa" in partial) out.msaa = snapTo(partial.msaa, SAMPLE_STEPS, base.msaa);
     if ("internalScale" in partial) out.internalScale = snapTo(partial.internalScale, INTERNAL_SCALE_STEPS, base.internalScale);
     if ("autoMipmap" in partial) out.autoMipmap = !!partial.autoMipmap;
+    if ("videoChroma" in partial) out.videoChroma = VIDEO_CHROMA.includes(partial.videoChroma as VideoChroma) ? partial.videoChroma as VideoChroma : base.videoChroma;
+    if ("videoDither" in partial) out.videoDither = !!partial.videoDither;
+    if ("videoDeinterlace" in partial) out.videoDeinterlace = VIDEO_DEINTERLACE.includes(partial.videoDeinterlace as VideoDeinterlace) ? partial.videoDeinterlace as VideoDeinterlace : base.videoDeinterlace;
 
     // integerScale and aspectMode:'integer' are two spellings of the same intent — keep them coherent.
     if (out.aspectMode === "integer") out.integerScale = true;

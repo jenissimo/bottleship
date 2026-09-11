@@ -46,6 +46,7 @@ import {
     type EncodedStreamConfig, type I420Frame, type WebCodecsStats,
 } from "./webcodecs-backend";
 import { WebmVideoSource, looksLikeWebm } from "./webm-source";
+import type { QualityConfig } from "../worker/core/quality-config";
 
 export type { I420Frame, WebCodecsStats, EncodedStreamConfig };
 
@@ -77,10 +78,40 @@ interface DecoderWasmExports {
     decoder_get_video_fourcc?: (handle: number) => number;
     decoder_get_video_pix_fmt?: (handle: number) => number;
     decoder_get_video_codec_name?: (handle: number) => number;
+    decoder_set_enhance?: (handle: number, flags: number) => void;
+    decoder_get_enhance?: (handle: number) => number;
+    decoder_get_frame_interlaced?: (handle: number) => number;
+    decoder_get_interlaced_frames?: (handle: number) => number;
+    decoder_get_video_color_range?: (handle: number) => number;
+    decoder_get_video_colorspace?: (handle: number) => number;
 }
 
 /** Max codec name length when scanning WASM memory for a null terminator. */
 const MAX_CODEC_NAME_BYTES = 256;
+
+/** decoder_api.c ENH_* bits — the opt-in enhancements; 0 is the period-faithful conversion. */
+export const ENH_CHROMA_SMOOTH = 1;
+export const ENH_DITHER_16 = 2;
+export const ENH_DEINTERLACE = 4;
+export const ENH_DEINTERLACE_FORCE = 8;
+
+/** The QualityConfig video knobs as the decoder's flag word. */
+export function videoEnhancementFlags(q: Pick<QualityConfig, "videoChroma" | "videoDither" | "videoDeinterlace">): number {
+    let f = 0;
+    if (q.videoChroma === "smooth") f |= ENH_CHROMA_SMOOTH;
+    if (q.videoDither) f |= ENH_DITHER_16;
+    if (q.videoDeinterlace === "auto") f |= ENH_DEINTERLACE;
+    if (q.videoDeinterlace === "always") f |= ENH_DEINTERLACE | ENH_DEINTERLACE_FORCE;
+    return f;
+}
+
+/** AVCOL_RANGE_* / AVCOL_SPC_* as the decoder reports them, named for logs and the harness. */
+const COLOR_RANGE_NAMES: Record<number, string> = { 0: "unspecified", 1: "limited", 2: "full" };
+const COLOR_SPACE_NAMES: Record<number, string> = {
+    0: "rgb", 1: "bt709", 2: "unspecified", 4: "fcc", 5: "bt470bg", 6: "smpte170m",
+    7: "smpte240m", 8: "ycgco", 9: "bt2020ncl",
+};
+const nameOf = (table: Record<number, string>, v: number): string => table[v] ?? (v < 0 ? "n/a" : String(v));
 
 /** Metadata returned by getInfo(). */
 export interface VideoInfo {
@@ -97,6 +128,13 @@ export interface VideoInfo {
     codecId:      number;
     fourCC:       string;
     pixFmt:       number;
+    /** Range/matrix the decoder tagged the frames with — what the YUV→BGRA conversion honours. */
+    colorRange:   string;
+    colorSpace:   string;
+    /** Frames so far the decoder flagged interlaced (what videoDeinterlace:"auto" acts on). */
+    interlacedFrames: number;
+    /** decoder_api.c ENH_* bits in effect for this stream. */
+    enhanceFlags: number;
 }
 
 /** PAL8 frame data: 8-bit palette indices + 256-entry BGRA palette. */
@@ -128,6 +166,8 @@ interface DecoderSession {
     /** Bytes required before STATE_PLAYING (0 = start on first chunk). */
     audioPrerollBytes: number;
     audioPlaybackStarted: boolean;
+    /** ENH_* word last pushed to the decoder — compared per frame so a settings change lands. */
+    enhFlags:     number;
 }
 
 /**
@@ -181,6 +221,50 @@ export class VideoEngine {
     /** WebCodecs-backed sessions. Disjoint from `sessions` — one handle space, two backends. */
     private wcSessions: Map<number, WebCodecsEntry> = new Map();
     private nextJsHandle = 1;
+    /** Where the video knobs come from (the worker's EmulatorConfig); null = faithful defaults. */
+    private qualitySource: (() => Pick<QualityConfig, "videoChroma" | "videoDither" | "videoDeinterlace">) | null = null;
+
+    /**
+     * Inject the quality source. Read per frame rather than pushed, so a manifest layer
+     * applied at load or a set_quality mid-movie both land without a second wiring point.
+     */
+    setQualitySource(fn: (() => Pick<QualityConfig, "videoChroma" | "videoDither" | "videoDeinterlace">) | null): void {
+        this.qualitySource = fn;
+    }
+
+    private currentEnhanceFlags(): number {
+        return this.qualitySource ? videoEnhancementFlags(this.qualitySource()) : 0;
+    }
+
+    /** Push the current flag word to a session's decoder when it changed. */
+    private syncEnhance(s: DecoderSession): void {
+        const flags = this.currentEnhanceFlags();
+        if (flags === s.enhFlags) return;
+        s.enhFlags = flags;
+        this.exp().decoder_set_enhance?.(s.wasmHandle, flags);
+    }
+
+    /**
+     * What the video knobs are actually touching — the harness answer to "did this setting
+     * reach any frame": every open WASM session with its tags and the flags it decodes under.
+     */
+    getEnhancementState(): {
+        flags: number;
+        sessions: Array<{ handle: number; codec: string; width: number; height: number;
+            colorRange: string; colorSpace: string; interlacedFrames: number; enhanceFlags: number }>;
+    } {
+        const sessions: ReturnType<VideoEngine["getEnhancementState"]>["sessions"] = [];
+        for (const [handle, s] of this.sessions) {
+            const info = this.getInfo(handle);
+            if (!info) continue;
+            sessions.push({
+                handle, codec: info.codecName, width: s.width, height: s.height,
+                colorRange: info.colorRange, colorSpace: info.colorSpace,
+                interlacedFrames: info.interlacedFrames, enhanceFlags: info.enhanceFlags,
+            });
+        }
+        return { flags: this.currentEnhanceFlags(), sessions };
+    }
 
     // ── Loader ───────────────────────────────────────────────────────────────
 
@@ -327,7 +411,10 @@ export class VideoEngine {
             sab, sabWriteCursor: 0, sabBufferBytes: hasAudio ? AUDIO_SAB_BYTES : 0, audioId,
             audioPrerollBytes,
             audioPlaybackStarted: false,
+            enhFlags: 0,
         });
+        // Before the first frame, so the first conversion already runs under the user's knobs.
+        this.syncEnhance(this.sessions.get(jsHandle)!);
 
         const codecName = this._readCodecName(wHandle);
         const codecId = exp.decoder_get_video_codec_id?.(wHandle) ?? 0;
@@ -337,11 +424,14 @@ export class VideoEngine {
             fourCCRaw & 0xFF, (fourCCRaw >> 8) & 0xFF,
             (fourCCRaw >> 16) & 0xFF, (fourCCRaw >> 24) & 0xFF
         ) : "";
+        const colorRange = nameOf(COLOR_RANGE_NAMES, exp.decoder_get_video_color_range?.(wHandle) ?? -1);
+        const colorSpace = nameOf(COLOR_SPACE_NAMES, exp.decoder_get_video_colorspace?.(wHandle) ?? -1);
 
         Logger.log(LogCategory.SYSTEM,
             `[VideoEngine] open → jsHandle=${jsHandle} wHandle=${wHandle} ` +
             `${width}×${height} fps=${fps.toFixed(2)} frames=${frameCount} ` +
             `codec="${codecName}" fourCC="${fourCC}" codecId=${codecId} pixFmt=${pixFmt} ` +
+            `range=${colorRange} matrix=${colorSpace} enhance=${this.currentEnhanceFlags()} ` +
             `audio=${hasAudio ? `${sampleRate}Hz×${channels}ch` : "none"}`);
 
         return jsHandle;
@@ -369,6 +459,7 @@ export class VideoEngine {
         const s = this.sessions.get(jsHandle);
         if (!s) return false;
         const exp = this.exp();
+        this.syncEnhance(s);
         const ret = exp.decoder_do_frame(s.wasmHandle);
         if (ret < 0) return false;
 
@@ -409,6 +500,8 @@ export class VideoEngine {
         if (!s) return null;
         const exp = this.exp();
         if (!exp.decoder_get_frame_rgb565_ptr) return null;
+        // The packer runs lazily on this call, so a dither toggle must be pushed before it.
+        this.syncEnhance(s);
         const ptr = exp.decoder_get_frame_rgb565_ptr!(s.wasmHandle);
         if (!ptr) return null;
         const mem = this.refreshMemView();
@@ -525,6 +618,10 @@ export class VideoEngine {
             codecId,
             fourCC,
             pixFmt,
+            colorRange:   nameOf(COLOR_RANGE_NAMES, exp.decoder_get_video_color_range?.(s.wasmHandle) ?? -1),
+            colorSpace:   nameOf(COLOR_SPACE_NAMES, exp.decoder_get_video_colorspace?.(s.wasmHandle) ?? -1),
+            interlacedFrames: exp.decoder_get_interlaced_frames?.(s.wasmHandle) ?? 0,
+            enhanceFlags: exp.decoder_get_enhance?.(s.wasmHandle) ?? 0,
         };
     }
 
@@ -812,6 +909,12 @@ export class VideoEngine {
             codecId: 0,
             fourCC: "",
             pixFmt: -1,
+            // The browser decoder's own conversion (webcodecs-backend.ts) reads the VideoFrame's
+            // colorSpace; the WASM knobs do not reach it.
+            colorRange: "browser",
+            colorSpace: "browser",
+            interlacedFrames: 0,
+            enhanceFlags: 0,
         };
     }
 

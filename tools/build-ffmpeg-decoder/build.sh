@@ -93,11 +93,11 @@ echo "[build] Configuring FFmpeg (curated legacy-game video set) …"
 emconfigure ./configure \
     --prefix="$FFMPEG_INSTALL" \
     --disable-everything \
-    --enable-demuxer=bink,smacker,avi,mov,asf,flv,ogg,mpegps,mpegvideo,mpegts,roq,vmd,flic,dv,wav,idcin,fourxm,str \
+    --enable-demuxer=bink,smacker,avi,mov,asf,flv,ogg,mpegps,mpegvideo,mpegts,roq,vmd,flic,dv,wav,idcin,fourxm,str,rpl \
     --enable-decoder=bink,smacker,cinepak,indeo2,indeo3,indeo4,indeo5,msvideo1,msrle,rawvideo,mjpeg,mjpegb \
     --enable-decoder=mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3,h263,h263i,h263p \
     --enable-decoder=wmv1,wmv2,wmv3,vc1,flv,vp3,vp5,vp6,vp6a,vp6f,svq1,svq3,rpza,qtrle,smc,qdraw,qpeg,tscc,tscc2 \
-    --enable-decoder=roq,truemotion1,truemotion2,dvvideo,flic,idcin,interplay_video,mdec,fourxm,cdgraphics,theora \
+    --enable-decoder=roq,truemotion1,truemotion2,dvvideo,flic,idcin,interplay_video,mdec,fourxm,cdgraphics,theora,escape124,escape130 \
     --enable-decoder=mp2,mp2float,mp3,mp3float,wmav1,wmav2,vorbis,smackaud,binkaudio_dct,binkaudio_rdft \
     --enable-decoder=roq_dpcm,vmdaudio,nellymoser,qdm2,truespeech,interplay_dpcm,xan_dpcm \
     --enable-decoder=pcm_u8,pcm_s8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw \
@@ -171,6 +171,12 @@ EXPORTED_FUNCTIONS=(
     "_decoder_get_video_codec_name"
     "_decoder_get_video_fourcc"
     "_decoder_get_video_pix_fmt"
+    "_decoder_set_enhance"
+    "_decoder_get_enhance"
+    "_decoder_get_frame_interlaced"
+    "_decoder_get_interlaced_frames"
+    "_decoder_get_video_color_range"
+    "_decoder_get_video_colorspace"
 )
 
 # Build JSON array of exported function names

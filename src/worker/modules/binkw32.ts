@@ -149,7 +149,7 @@ export function rebaseBinkPacing(s: BinkPacingState): void {
  * Guessing bytes-per-pixel from `pitch / width` is a fallback for the flags==8P case
  * only (see binkSurfaceFromFlags).
  */
-const enum BinkSurface {
+export const enum BinkSurface {
     P8       = 0,   // 8-bit palette indices
     BGR24    = 1,   // BINKSURFACE24
     RGB24    = 2,   // BINKSURFACE24R
@@ -232,7 +232,7 @@ function isGpuVideoPresenterActive(): boolean {
 }
 
 /** Pack one BGRA pixel into the 16-bit layout `surf` names. */
-function pack16(surf: BinkSurface, b: number, g: number, r: number, a: number): number {
+export function pack16(surf: BinkSurface, b: number, g: number, r: number, a: number): number {
     switch (surf) {
         case BinkSurface.ARGB4444: return ((a & 0xF0) << 8) | ((r & 0xF0) << 4) | (g & 0xF0) | (b >> 4);
         case BinkSurface.ARGB1555: return (a >= 0x80 ? 0x8000 : 0) | ((r & 0xF8) << 7) | ((g & 0xF8) << 2) | (b >> 3);
@@ -243,17 +243,45 @@ function pack16(surf: BinkSurface, b: number, g: number, r: number, a: number): 
     }
 }
 
+/** 4x4 Bayer thresholds, 0..15 — the same pattern the WASM RGB565 packer uses. */
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
+/**
+ * Ordered-dithered quantization of an 8-bit channel to n bits, in the quantizer's own
+ * domain: k = floor(v·(2ⁿ−1)/255 + t/16). Dithering v>>(8−n) instead sits half a step high
+ * once the surface is expanded back ((k<<3)|(k>>2)). `t` is the 0..15 Bayer threshold.
+ */
+export function quant(v: number, n: number, t: number): number {
+    const levels = (1 << n) - 1;
+    return ((v * levels * 16 + t * 255) / 4080) | 0;
+}
+
+/** pack16 with the Bayer threshold `t` applied to every colour channel. */
+export function pack16Dithered(surf: BinkSurface, b: number, g: number, r: number, a: number, t: number): number {
+    switch (surf) {
+        case BinkSurface.ARGB4444: return ((a & 0xF0) << 8) | (quant(r, 4, t) << 8) | (quant(g, 4, t) << 4) | quant(b, 4, t);
+        case BinkSurface.ARGB1555: return (a >= 0x80 ? 0x8000 : 0) | (quant(r, 5, t) << 10) | (quant(g, 5, t) << 5) | quant(b, 5, t);
+        case BinkSurface.XRGB1555: return (quant(r, 5, t) << 10) | (quant(g, 5, t) << 5) | quant(b, 5, t);
+        case BinkSurface.RGB655:   return (quant(r, 6, t) << 10) | (quant(g, 5, t) << 5) | quant(b, 5, t);
+        case BinkSurface.RGB664:   return (quant(r, 6, t) << 10) | (quant(g, 6, t) << 4) | quant(b, 4, t);
+        default:                   return (quant(r, 5, t) << 11) | (quant(g, 6, t) << 5) | quant(b, 5, t); // RGB565
+    }
+}
+
 /**
  * Copy one row of decoded pixels into the destination format the game declared.
  * The decoder emits BGRA: [B, G, R, A], i.e. little-endian u32 A<<24|R<<16|G<<8|B.
  *
  * The 16bpp packers use Uint32Array/Uint16Array views where alignment allows
  * (~3-5x over byte-at-a-time); BINKSURFACE32 is already native DDraw order (memcpy).
+ * `ditherRow` >= 0 orders-dithers the 16bpp packing with that row's Bayer phase
+ * (quality.videoDither); -1 truncates, which is what the game's own blitter did.
  */
 function copyDecodedRow(
     src: Uint8Array, srcOff: number,
     dst: Uint8Array, dstOff: number,
     width: number, surf: BinkSurface,
+    ditherRow = -1,
 ): void {
     switch (surf) {
         case BinkSurface.P8:
@@ -304,7 +332,16 @@ function copyDecodedRow(
         default: {
             const srcAbs = src.byteOffset + srcOff;
             const dstAbs = dst.byteOffset + dstOff;
-            if ((srcAbs & 3) === 0 && (dstAbs & 1) === 0) {
+            if (ditherRow >= 0) {
+                const th = (ditherRow & 3) * 4;
+                for (let x = 0; x < width; x++) {
+                    const si = srcOff + x * 4;
+                    const v = pack16Dithered(surf, src[si], src[si + 1], src[si + 2], src[si + 3], BAYER4[th + (x & 3)]);
+                    const di = dstOff + x * 2;
+                    dst[di]     = v & 0xFF;
+                    dst[di + 1] = (v >> 8) & 0xFF;
+                }
+            } else if ((srcAbs & 3) === 0 && (dstAbs & 1) === 0) {
                 const src32 = new Uint32Array(src.buffer, srcAbs, width);
                 const dst16 = new Uint16Array(dst.buffer, dstAbs, width);
                 for (let x = 0; x < width; x++) {
@@ -1491,10 +1528,11 @@ export class BinkW32 implements IModule {
 
             const srcPitch = s.width * 4;
             const rowScratch = new Uint8Array(copyWidth * destBpp);
+            const dither = destBpp === 2 && EmulatorConfig.getInstance().quality.videoDither;
             for (let row = 0; row < rows; row++) {
                 const srcOff = row * srcPitch;
                 const dstOff = destPtr + (destY + row) * pitch + destX * destBpp;
-                copyDecodedRow(bgra, srcOff, rowScratch, 0, copyWidth, surf);
+                copyDecodedRow(bgra, srcOff, rowScratch, 0, copyWidth, surf, dither ? row : -1);
                 if (!this.writeBytesChecked(dstOff, rowScratch)) {
                     markPointerFault();
                     return 0;
@@ -1589,10 +1627,11 @@ export class BinkW32 implements IModule {
 
             const fullSrcPitch = s.width * 4;
             const rowScratch = new Uint8Array(clipW * destBpp);
+            const dither = destBpp === 2 && EmulatorConfig.getInstance().quality.videoDither;
             for (let row = 0; row < clipH; row++) {
                 const srcOff = (srcT + row) * fullSrcPitch + srcL * 4;
                 const dstOff = destPtr + (destY + row) * pitch + destX * destBpp;
-                copyDecodedRow(bgra, srcOff, rowScratch, 0, clipW, surf);
+                copyDecodedRow(bgra, srcOff, rowScratch, 0, clipW, surf, dither ? srcT + row : -1);
                 if (!this.writeBytesChecked(dstOff, rowScratch)) {
                     markPointerFault();
                     return 0;

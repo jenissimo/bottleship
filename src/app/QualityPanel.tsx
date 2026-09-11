@@ -218,6 +218,46 @@ export default function QualityPanel({ quality, onChange, unsupported, overridde
           />
         </label>
       </div>
+
+      {/* --- Movies (cutscenes / intros decoded by the emulator's own video engine) --- */}
+      <h3 className={s["settings-subhead"]}>Movies</h3>
+      <div className={s["settings-grid"]}>
+        <div className={s["settings-row"]}>
+          <span className={s["quality-resolved"]}>
+            Applies to Bink/Smacker/AVI/MPEG movies the emulator decodes. A game that plays its
+            cutscenes through its own player DLL is not affected.
+          </span>
+        </div>
+        <label className={s["settings-row"]}>
+          <span>Chroma upsampling<GapNote unsupported={unsupported} overridden={overridden} k="videoChroma" /></span>
+          <select
+            value={quality.videoChroma}
+            onChange={(e) => onChange({ videoChroma: e.target.value as QualityConfig["videoChroma"] })}
+          >
+            <option value="nearest">Original (blocky colour, as the game drew it)</option>
+            <option value="smooth">Smooth (filtered)</option>
+          </select>
+        </label>
+        <label className={s["settings-row"]}>
+          <span>Dither 16-bit output<GapNote unsupported={unsupported} overridden={overridden} k="videoDither" /></span>
+          <input
+            type="checkbox"
+            checked={quality.videoDither}
+            onChange={(e) => onChange({ videoDither: e.target.checked })}
+          />
+        </label>
+        <label className={s["settings-row"]}>
+          <span>Deinterlace<GapNote unsupported={unsupported} overridden={overridden} k="videoDeinterlace" /></span>
+          <select
+            value={quality.videoDeinterlace}
+            onChange={(e) => onChange({ videoDeinterlace: e.target.value as QualityConfig["videoDeinterlace"] })}
+          >
+            <option value="off">Off</option>
+            <option value="auto">Auto (frames the decoder flags interlaced)</option>
+            <option value="always">Always (fields baked into the picture)</option>
+          </select>
+        </label>
+      </div>
     </div>
   );
 }
