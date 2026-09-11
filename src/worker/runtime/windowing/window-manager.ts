@@ -20,6 +20,15 @@ export interface WindowClass {
     hbrBackground: number;
 }
 
+/** Who owns the foreground: the window, and the thread whose input queue it belongs to. */
+export interface ForegroundQueue {
+    hwnd: number;
+    threadId: number;
+}
+
+/** `null` on either side means no foreground at all (NT gpqForeground == NULL). */
+export type ForegroundQueueObserver = (next: ForegroundQueue | null, prev: ForegroundQueue | null) => void;
+
 export interface WindowObject {
     hwnd: number;
     wndClass: WindowClass;
@@ -82,6 +91,7 @@ export class WindowManager {
     private activeHwnd = 0;     // Active top-level window (GetActiveWindow)
     private focusHwnd = 0;      // Focus window — may be a child (GetFocus)
     private foregroundHwnd = 0; // Foreground top-level window (GetForegroundWindow)
+    private foregroundThreadId = 0; // Queue behind foregroundHwnd (NT gpqForeground)
     private captureHwnd = 0;    // Mouse capture owner (GetCapture / SetCapture)
 
     /**
@@ -105,6 +115,9 @@ export class WindowManager {
      * is drawn on top and clicked through.
      */
     private childZOrderProvider: ((parentHwnd: number) => number[] | undefined) | null = null;
+    private windowStateProvider: ((hwnd: number) => { visible: boolean; disabled: boolean } | undefined) | null = null;
+    private activationObservers: ((hwnd: number) => void)[] = [];
+    private foregroundQueueObservers: ForegroundQueueObserver[] = [];
 
     constructor() { }
 
@@ -114,6 +127,74 @@ export class WindowManager {
 
     registerChildZOrderProvider(provider: (parentHwnd: number) => number[] | undefined): void {
         this.childZOrderProvider = provider;
+    }
+
+    /**
+     * Same reasoning as the sibling list: user32 OWNS "is this window visible" (ShowWindow,
+     * SetWindowLong(GWL_STYLE) write it there), and a copy kept here goes stale the moment
+     * one of those writers forgets to mirror it — which is invisible, because everything
+     * except the MOUSE reads user32's copy.
+     */
+    registerWindowStateProvider(provider: (hwnd: number) => { visible: boolean; disabled: boolean } | undefined): void {
+        this.windowStateProvider = provider;
+    }
+
+    /**
+     * Notified whenever a window is made active, which is the only event that updates
+     * "last active popup" (Wine server make_window_active, called from set_active_window).
+     * user32 owns the per-window record because it owns the owner chain; this is the one
+     * place the active window changes, so registering here is what keeps a second, drifting
+     * copy from growing next to it.
+     */
+    registerActivationObserver(observer: (hwnd: number) => void): void {
+        if (!this.activationObservers.includes(observer)) this.activationObservers.push(observer);
+    }
+
+    /**
+     * Notified when the FOREGROUND INPUT QUEUE changes — NT xxxSetForegroundWindow2 guards
+     * its global-mode teardown with `gpqForeground != gpqForegroundPrev` (focusact.c), and
+     * a queue is a thread's, so moving the foreground between two windows of ONE thread is
+     * not a switch and must leave those modes alone. The cursor clip is the mode we drop
+     * here ("it is a global mode that gets removed when switching"); LockWindowUpdate and
+     * mouse tracking are the others NT drops at the same point.
+     *
+     * Observers are deduped by identity so a re-`initialize()` on a game switch cannot
+     * grow a second copy of the same one.
+     */
+    registerForegroundQueueObserver(observer: ForegroundQueueObserver): void {
+        if (!this.foregroundQueueObservers.includes(observer)) this.foregroundQueueObservers.push(observer);
+    }
+
+    /**
+     * The single writer of the foreground slot. Everything that hands the foreground to a
+     * window (or takes it away) goes through here so the queue-switch event has exactly one
+     * source; a second assignment elsewhere is a switch nobody sees.
+     */
+    private setForegroundSlot(next: number): void {
+        const prevHwnd = this.foregroundHwnd;
+        const prevThreadId = this.foregroundThreadId;
+        // Resolved on entry, not on notify: destroyWindow removes the dying window before
+        // handing the foreground on, so the previous queue is only knowable if we kept it.
+        const nextThreadId = next ? (this.windows.get(next)?.creatorThreadId ?? 0) : 0;
+        this.foregroundHwnd = next;
+        this.foregroundThreadId = nextThreadId;
+        if ((prevHwnd !== 0) === (next !== 0) && prevThreadId === nextThreadId) return;
+        const prev = prevHwnd ? { hwnd: prevHwnd, threadId: prevThreadId } : null;
+        const incoming = next ? { hwnd: next, threadId: nextThreadId } : null;
+        for (const observer of this.foregroundQueueObservers) observer(incoming, prev);
+    }
+
+    /**
+     * Is this window hit-testable — user32's copy of WS_VISIBLE when it knows it.
+     *
+     * DISABLED is deliberately not consulted: WindowFromPoint returns a disabled window
+     * (Wine's NtUserWindowFromPoint calls window_from_point with no style filter; only
+     * ChildWindowFromPointEx skips disabled, and only when asked via CWP_SKIPDISABLED).
+     * A modal dialog disables its owner, and Windows still routes clicks on the owner TO
+     * the owner, which ignores them; skipping it here sends them somewhere else instead.
+     */
+    private isHitTestable(win: WindowObject): boolean {
+        return this.windowStateProvider?.(win.hwnd)?.visible ?? win.visible;
     }
 
     /**
@@ -141,14 +222,14 @@ export class WindowManager {
 
     /**
      * Faithful WindowFromPoint: walk the top-level Z-order front→back, skipping
-     * invisible / WS_DISABLED windows; the first whose rect contains the point wins.
-     * Then descend into its visible, enabled children (deepest containing child).
+     * INVISIBLE windows only; the first whose rect contains the point wins.
+     * Then descend into its visible children (deepest containing child).
      * Returns the resolved hwnd (0 if none).
      */
     windowFromPoint(screenX: number, screenY: number): number {
         for (const hwnd of this.zOrder) {
             const win = this.windows.get(hwnd);
-            if (!win || !win.visible || (win.style & WS_DISABLED) !== 0) continue;
+            if (!win || !this.isHitTestable(win)) continue;
             if (!this.rectContains(win, screenX, screenY)) continue;
             // Descend into children (deepest hit wins). Child rects are parent-relative.
             return this.descendToChildAtPoint(hwnd, win.rect.x, win.rect.y, screenX, screenY);
@@ -185,13 +266,13 @@ export class WindowManager {
 
     /**
      * Walk children of `parentHwnd` (origin originX/originY in screen space), returning
-     * the deepest visible+enabled child containing the point, or parentHwnd if none.
+     * the deepest visible child containing the point, or parentHwnd if none.
      */
     private descendToChildAtPoint(parentHwnd: number, originX: number, originY: number, screenX: number, screenY: number): number {
         const children = this.childrenFrontToBack(parentHwnd);
         for (let i = 0; i < children.length; i++) {
             const child = children[i];
-            if (!child.visible || (child.style & WS_DISABLED) !== 0) continue;
+            if (!this.isHitTestable(child)) continue;
             const cx = originX + child.rect.x;
             const cy = originY + child.rect.y;
             if (screenX >= cx && screenX < cx + child.rect.w && screenY >= cy && screenY < cy + child.rect.h) {
@@ -321,7 +402,7 @@ export class WindowManager {
         // Owned windows (hWndParent != 0 but no WS_CHILD) ARE top-level and can be active.
         if (this.activeHwnd === 0 && window.visible && (style & WS_CHILD) === 0) {
             this.activeHwnd = hwnd;
-            this.foregroundHwnd = hwnd;
+            this.setForegroundSlot(hwnd);
             this.focusHwnd = hwnd;
         }
 
@@ -365,14 +446,14 @@ export class WindowManager {
             const prevActive = wasActive ? hwnd : this.activeHwnd;
             if (successor) {
                 this.activeHwnd = successor;
-                this.foregroundHwnd = successor;
+                this.setForegroundSlot(successor);
                 this.focusHwnd = successor;
                 // prev is gone; no deactivation target, and no application boundary:
                 // the destroyed window and its successor are both ours.
                 this.postActivationChain(successor, 0);
             } else {
                 if (wasActive) this.activeHwnd = 0;
-                if (wasForeground) this.foregroundHwnd = 0;
+                if (wasForeground) this.setForegroundSlot(0);
             }
             void prevActive;
         }
@@ -429,7 +510,7 @@ export class WindowManager {
     /** Clear active/foreground/focus slots when a top-level window is hidden and no successor exists. */
     clearActiveWindow(hwnd: number): void {
         if (this.activeHwnd === hwnd) this.activeHwnd = 0;
-        if (this.foregroundHwnd === hwnd) this.foregroundHwnd = 0;
+        if (this.foregroundHwnd === hwnd) this.setForegroundSlot(0);
         if (this.focusHwnd === hwnd || this.isDescendantOf(this.focusHwnd, hwnd)) this.focusHwnd = 0;
     }
 
@@ -483,9 +564,10 @@ export class WindowManager {
         // Owned windows (parent != 0 but no WS_CHILD) ARE top-level and can be active.
         if (win && (win.style & WS_CHILD) === 0) {
             this.activeHwnd = hwnd;
-            this.foregroundHwnd = hwnd;
+            this.setForegroundSlot(hwnd);
             this.focusHwnd = hwnd;
             this.bringToTop(hwnd);
+            for (const observer of this.activationObservers) observer(hwnd);
             Logger.log(LogCategory.SYSTEM, `WindowManager: active window changed 0x${prevActive.toString(16)} -> 0x${hwnd.toString(16)}`);
         }
         return prevActive;
@@ -523,7 +605,7 @@ export class WindowManager {
         if (top) {
             // Auto-activate (legacy behavior preserved); keep foreground/focus in sync.
             this.activeHwnd = top;
-            this.foregroundHwnd = top;
+            this.setForegroundSlot(top);
             this.focusHwnd = top;
             return this.windows.get(top);
         }
@@ -780,6 +862,11 @@ export class WindowManager {
         this.messageQueue.wakeWaiters();
     }
 
+    /** Diagnostic: what is queued, per priority tier, with each entry's target thread. */
+    messageQueueSnapshot(): Record<string, unknown> {
+        return this.messageQueue.snapshot();
+    }
+
     hasMessages(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
         return this.messageQueue.hasMessages(msgMin, msgMax, callerThreadId);
     }
@@ -825,7 +912,10 @@ export class WindowManager {
         this.nextHwnd = DESKTOP_HWND + 1;
         this.activeHwnd = 0;
         this.focusHwnd = 0;
+        // Teardown, not a foreground switch: the whole process is going away and each owner
+        // of a global input mode resets its own state, so this must not fire the observers.
         this.foregroundHwnd = 0;
+        this.foregroundThreadId = 0;
         this.setCaptureHwnd(0);
         this.zOrder = [];
         Logger.log(LogCategory.SYSTEM, 'WindowManager reset');

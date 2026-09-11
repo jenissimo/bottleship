@@ -13,8 +13,9 @@ import { createInputExports as input, registerFastPathInputFunctions } from './i
 import { createMenuExports as menu } from './menu';
 import { createMessageExports as message, registerFastPathMessageFunctions as registerFastPathmessage } from './message';
 import { createSystemExports as system } from './system';
-import { createWindowExports as window, registerFastPathWindowFunctions } from './window';
-import { getChildZOrder, resetUser32SharedState } from './shared-state';
+import { createWindowExports as window, registerFastPathWindowFunctions, resetWindowMessageForwardState } from './window';
+import { resetUser32SharedState } from './shared-state';
+import { installUser32WindowObservers } from './window-observers';
 import { resetUser32Classes } from './class';
 import { resetDeviceNotifications } from './device-notify';
 import { resetHooks } from './hooks';
@@ -30,8 +31,7 @@ export class User32 implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     initialize(process: Process): void {
-        // WindowFromPoint hit-tests siblings in Z-order, and user32 owns that list.
-        System.getInstance().windowManager.registerChildZOrderProvider(getChildZOrder);
+        installUser32WindowObservers(System.getInstance().windowManager);
         // class functions
         Object.assign(this.exports, class_());
         // dialog functions
@@ -62,5 +62,6 @@ export class User32 implements IModule {
         resetMenuState();
         resetScrollState();
         resetControlInteractionState();
+        resetWindowMessageForwardState();
     }
 }

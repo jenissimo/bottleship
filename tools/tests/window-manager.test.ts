@@ -202,10 +202,14 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(80, 80)).toBe(grandchild);
     });
 
-    test("WS_DISABLED top-level is skipped (window behind it is hit)", () => {
-        const back = mkTopLevel(wm, 0, 0, 200, 200);
-        mkTopLevel(wm, 0, 0, 200, 200, { disabled: true }); // covers back, but disabled
-        expect(wm.windowFromPoint(50, 50)).toBe(back);
+    // WindowFromPoint does NOT filter on WS_DISABLED (Wine NtUserWindowFromPoint calls
+    // window_from_point with no style filter; only ChildWindowFromPointEx skips disabled,
+    // and only when asked via CWP_SKIPDISABLED). A modal dialog disables its owner and
+    // Windows still routes clicks on the owner TO the owner, which ignores them.
+    test("WS_DISABLED top-level still answers (Windows does not skip it)", () => {
+        mkTopLevel(wm, 0, 0, 200, 200);
+        const disabled = mkTopLevel(wm, 0, 0, 200, 200, { disabled: true });
+        expect(wm.windowFromPoint(50, 50)).toBe(disabled);
     });
 
     test("hidden top-level is skipped", () => {
@@ -214,10 +218,16 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(50, 50)).toBe(back);
     });
 
-    test("disabled / hidden child is skipped → resolves to parent", () => {
+    test("hidden child is skipped → resolves to parent", () => {
         const top = mkTopLevel(wm, 0, 0, 300, 300);
-        mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
+        mkChild(wm, top, 50, 50, 100, 100, { visible: false });
         expect(wm.windowFromPoint(75, 75)).toBe(top);
+    });
+
+    test("disabled child still answers (same no-filter rule as a top-level)", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const child = mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
+        expect(wm.windowFromPoint(75, 75)).toBe(child);
     });
 
     // The sibling list lives in user32 and SetWindowPos reorders it there; a child raised

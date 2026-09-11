@@ -650,11 +650,34 @@ export function getVirtualScreenRect(): CursorClipRect {
 
 export function setCursorClipRect(rect: CursorClipRect | null): void {
     cursorClipRect = rect;
-    setPointerClipped(rect !== null);
+    // A clip covering the whole virtual screen confines nothing — wineserver's
+    // is_cursor_clipped() is exactly `clip_rect != virtual_screen_rect`, and win32u
+    // tells the driver to RELEASE its grab for such a rect ("we are clipping if the
+    // clip rectangle is smaller than the screen"). Every app that pins the pointer to
+    // its own fullscreen window therefore keeps the plain absolute host transport.
+    const screen = getVirtualScreenRect();
+    const confining = rect !== null && (rect.left > screen.left || rect.top > screen.top
+        || rect.right < screen.right || rect.bottom < screen.bottom);
+    setPointerClipped(confining ? rect : null);
 }
 
 export function getCursorClipRect(): CursorClipRect | null {
     return cursorClipRect;
+}
+
+/**
+ * The foreground input queue switched, so the clip goes — NT xxxSetForegroundWindow2:
+ * "Remove the clip cursor rectangle - it is a global mode that gets removed when
+ * switching" (focusact.c, guarded by gpqForeground != gpqForegroundPrev; wineserver
+ * set_foreground_input does the same with SET_CURSOR_NOCLIP). The clip is ONE global
+ * rect, so the process that set it is not consulted and does not keep it; afterwards
+ * GetClipCursor answers with the whole virtual screen, since zzzClipCursor(NULL) stores
+ * grcCursorClip = rcScreen rather than a "no clip" flag.
+ */
+export function releaseCursorClipOnForegroundSwitch(): void {
+    if (cursorClipRect === null) return;
+    setCursorClipRect(null);
+    Logger.verbose(LogCategory.USER32, 'ClipCursor released: foreground queue switched');
 }
 
 export function isCursorClipped(): boolean {
@@ -804,8 +827,11 @@ let lastForwardedCursorImageObj: unknown = null;
  * installed shape. Real Windows draws whatever image SetCursor installed whenever the
  * cursor is visible — a game that renders its own pointer hides the system one first
  * (SetCursor(NULL) or ShowCursor to a negative count), so a visible custom cursor means
- * the HOST renders its image. Every cursor-state mutator (SetCursor, ShowCursor, dialog
- * forcing, the D3D device cursor) must end here — do not re-derive visibility at call sites.
+ * the HOST renders its image. Every cursor-state mutator (SetCursor, ShowCursor, the D3D
+ * device cursor) must end here — do not re-derive visibility at call sites. The count and
+ * the handle are the GUEST's, so nothing else may write them to get a pointer it wants:
+ * Windows does not re-show the cursor because a dialog appeared, and a host-side override
+ * belongs in core/pointer-policy, layered on top of these facts.
  */
 export function syncHostCursorToGuestState(): void {
     const sys = System.getInstance();
@@ -927,13 +953,16 @@ export function warpGuestCursorTo(x: number, y: number): void {
     noteCursorRecentre(from.x, from.y, to.x, to.y);
 }
 
+/**
+ * ShowCursor's counter is a plain running total, and the value it returns is the
+ * app's own bookkeeping (NT zzzShowCursor: `pq->iCursorLevel` incremented or
+ * decremented, no floor; hidden is simply `< 0`). Clamping it makes a matched
+ * ShowCursor(FALSE)/ShowCursor(TRUE) pair from a doubly-nested caller re-show a
+ * pointer the outer level still wants hidden, and hands the guest a level it
+ * never reached.
+ */
 export function updateCursorDisplayCount(delta: number): number {
     cursorDisplayCount += delta;
-    // Clamp to -1 minimum: on real Windows the counter can go deeply negative,
-    // but our message pump runs faster than native, causing far more
-    // ShowCursor(FALSE) calls than expected. Clamping ensures a single
-    // ShowCursor(TRUE) can restore visibility (matching real-world game behavior).
-    if (cursorDisplayCount < -1) cursorDisplayCount = -1;
     return cursorDisplayCount;
 }
 
@@ -957,13 +986,6 @@ export function emptyClipboard(): void {
     clipboardDataByFormat.clear();
 }
 
-/** GDI dialogs need a visible host cursor; games may leave ShowCursor count negative after DDraw init. */
-export function ensureHostCursorForDialog(): void {
-    if (cursorDisplayCount < 0) cursorDisplayCount = 0;
-    if (currentCursorHandle === 0) currentCursorHandle = DEFAULT_CURSOR;
-    syncHostCursorToGuestState();
-}
-
 export function resetUser32SharedState(): void {
     windows.clear();
     cursorDisplayCount = 0;
@@ -982,4 +1004,11 @@ export function resetUser32SharedState(): void {
     clipboardDataByFormat.clear();
     clipboardOpenOwner = null;
     Logger.log(LogCategory.USER32, 'User32 shared state reset');
+}
+
+/** Hit-test view of a window for the WindowManager — user32 owns both facts. */
+export function getWindowHitTestState(hwnd: number): { visible: boolean; disabled: boolean } | undefined {
+    const win = windows.get(hwnd);
+    if (!win) return undefined;
+    return { visible: !!win.visible, disabled: (win.style & 0x08000000 /* WS_DISABLED */) !== 0 };
 }

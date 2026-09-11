@@ -28,6 +28,26 @@ function resolveWndProc(hwnd: number): number {
     return windows.get(hwnd)?.wndProc ?? 0;
 }
 
+/**
+ * Wine server make_window_active: activating a window records it as the last active
+ * window of ITSELF and of every window up its OWNER chain — no style filter, and the
+ * whole chain, not just the immediate owner. GetLastActivePopup then answers with that
+ * record, which is how MFC's CWnd::GetSafeOwner picks the dialog on screen instead of
+ * the frame; hand it the frame and the app maps that HWND back to CMainFrame and calls a
+ * dialog-only virtual on it.
+ *
+ * `parent` is the owner for a top-level window and the parent for a WS_CHILD one, so the
+ * walk stops at a child exactly as Wine's separate `owner` field does.
+ */
+export function recordLastActive(hwnd: number): void {
+    for (let cur = hwnd, guard = 0; cur && guard < 64; guard++) {
+        const win = windows.get(cur);
+        if (!win) break;
+        win.lastActivePopupHwnd = hwnd;
+        cur = (win.style & WS_CHILD) !== 0 ? 0 : (win.parent ?? 0);
+    }
+}
+
 /** Current wndProc for activation delivery (subclass may change between steps). */
 export function resolveActivationWndProc(hwnd: number, fallback = 0): number {
     return resolveWndProc(hwnd) || fallback;
