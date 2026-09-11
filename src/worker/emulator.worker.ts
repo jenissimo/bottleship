@@ -2,6 +2,31 @@ import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, type ChildBoot } from "./core/child-process";
+import { createChildVfsClient } from "./core/child-vfs";
+import { ChildSessionTransport } from './core/child-session';
+import { ChildFrameClock } from './core/child-frame-clock';
+
+let childBoot: ChildBoot | null = null;
+let childSessionTransport: ChildSessionTransport | null = null;
+let childFrameClock: ChildFrameClock | null = null;
+let childImageReady: Promise<void> | null = null;
+let resolveChildImageReady: (() => void) | null = null;
+const postToParent = (self as unknown as Worker).postMessage.bind(self);
+self.postMessage = ((message: any, options?: Transferable[] | StructuredSerializeOptions) => {
+  if (childSessionTransport) childSessionTransport.post(message, Array.isArray(options) ? options : options?.transfer);
+  else postToParent(message, options as Transferable[]);
+}) as typeof self.postMessage;
+setChildSessionPublisher((port, record) => {
+  System.getInstance().inputManager.setInputBuffer(null);
+  (self as unknown as Worker).postMessage({ type: 'child_session', port, imagePath: record.imagePath, record }, [port]);
+}, () => System.getInstance().releaseChildSessionBroker());
+setChildBootContext(() => ({
+  config: EmulatorConfig.getInstance().snapshotForChild(),
+  registry: System.getInstance().registry.serialize(),
+  namedObjects: namedObjects.snapshot(),
+}));
+(globalThis as Record<string, unknown>).__childProcesses = childProcessHistory;
 
 // Which guest thread is driving a given VFS read — the shared-cursor question can only
 // be answered where every file API converges, not at one API's fast path.
@@ -66,6 +91,7 @@ import { Iphlpapi } from "./modules/iphlpapi";
 import { Tapi32 } from "./modules/tapi32";
 import { Setupapi } from "./modules/setupapi";
 import { Hid } from "./modules/hid";
+import { XInput1_3 } from "./modules/xinput1_3";
 import { Netapi32 } from "./modules/netapi32";
 import { ImageHlp } from "./modules/imagehlp";
 import { DbgHelp } from "./modules/dbghelp";
@@ -1046,12 +1072,17 @@ const drawPlaceholder = () => {
   requestAnimationFrame(drawPlaceholder);
 };
 
-const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
+/** How a PE load ended. "failed" means the process is already torn down and reported —
+ *  the caller's boot sequence (progress "done", first-present arm, prefetch) must NOT run,
+ *  or the host is told the load succeeded and keeps its launch overlay up over the crash. */
+type PeLoadResult = "ok" | "queued" | "failed";
+
+const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promise<PeLoadResult> => {
   const system = System.getInstance();
   if (!system.process) {
     Logger.log(LogCategory.SYSTEM, "System not ready, queuing PE data");
     pendingPeData = peData;
-    return;
+    return "queued";
   }
   // The Process exists but the dispatch table may still be empty (see hleReady).
   await hleReady;
@@ -1226,8 +1257,13 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     const mem8 = system.process.v86.mem8 || (system.process.v86.v86 && system.process.v86.v86.cpu.mem8);
 
     if (!cpu || !mem8) {
-      Logger.error(LogCategory.SYSTEM, "Could not find CPU or memory for bootloader setup");
-      return;
+      // Fatal and unrecoverable: route it through the single crash funnel like every
+      // other fatal class, or the host waits forever on a load that already died.
+      system.reportGuestCrash({
+        reason: "PE load failed: could not find CPU or memory for bootloader setup",
+        eip: 0, threadId: null,
+      });
+      return "failed";
     }
 
     // Create the bootloader that will switch to protected mode and jump to PE entry
@@ -1290,6 +1326,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     resumeEmulator();
     framePacer.start();
     gameSessionActive = true;
+    return "ok";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     Logger.error(LogCategory.SYSTEM, `PE load failed: ${message}`);
@@ -1297,6 +1334,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     // "game crashed" dialog with a copyable report (e.g. a missing HLE API
     // discovered while generating import thunks), instead of a silent worker log.
     system.reportGuestCrash({ reason: `PE load failed: ${message}`, eip: 0, threadId: null });
+    return "failed";
   }
 };
 
@@ -1456,7 +1494,10 @@ const applyUe1FirstRunSetup = async (entrypointPath?: string): Promise<void> => 
   if (entrypointPath) {
     const exeName = entrypointPath.split(/[\\/]/).pop() ?? "";
     const gameIni = exeName.replace(/\.[^.]+$/i, "");
-    if (gameIni) iniPaths.push(`C:\\System\\${gameIni}.ini`);
+    if (gameIni) {
+      config.ue1ConfigIni = `C:\\System\\${gameIni}.ini`;
+      iniPaths.push(config.ue1ConfigIni);
+    }
   }
   for (const iniPath of iniPaths) {
     await pinGuestEngineIni(vfs, iniPath, hasPcPackages);
@@ -1509,6 +1550,7 @@ const orderSliceFiles = (bins: File[], base: string, slicesPerDisk: number): Fil
  * Pauses the guest loop first so the 1ms scheduler cannot restart v86 mid-reset.
  */
 const prepareFullGameSwitch = async (): Promise<void> => {
+  stopChildProcesses();
   if (gameSessionActive) {
     Logger.log(LogCategory.SYSTEM, "[GameSwitch] full reset before loading new game");
   }
@@ -1540,6 +1582,7 @@ const prepareFullGameSwitch = async (): Promise<void> => {
 
   resetHeapSlab();
   await system.reset();
+  if (state.inputBuffer) system.connectInput(state.inputBuffer);
   gameSessionActive = false;
   bootMark("system-reset-done");
 };
@@ -2028,6 +2071,8 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     }
     bootMark("prefetch-done");
 
+    // Video knobs come from the effective quality (user pref + manifest layer), read per frame.
+    videoEngine.setQualitySource(() => EmulatorConfig.getInstance().quality);
     if (!EmulatorConfig.getInstance().skipVideo) {
         void videoEngine.ensureLoaded().then(() => {
             Logger.log(LogCategory.SYSTEM, "[VideoEngine] preloaded at boot");
@@ -2212,7 +2257,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     system.fileSystem.setCurrentDirectory(executableDir);
     Logger.log(LogCategory.SYSTEM, `Executable: name="${exeName}", path="${executablePath}", args="${system.executableArgs}"`);
 
-    await loadPeData(bundle.entrypointBytes, true);
+    // A failed load has already torn the process down and told the host (crash dialog).
+    // Everything below announces a SUCCESSFUL boot — the "done" progress post alone would
+    // put the launch overlay back over that dialog and read as a hang.
+    if (await loadPeData(bundle.entrypointBytes, true) === "failed") return;
     bootMark("pe-loaded");
 
     // AOT units must be transaction-committed BEFORE the JIT claims their pages
@@ -2374,7 +2422,7 @@ const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches
         `[ReExec] flushAll did not drain within ${REEXEC_FLUSH_BUDGET_MS}ms — restarting anyway`);
       once();
     }, REEXEC_FLUSH_BUDGET_MS);
-    System.getInstance().fileSystem.flushAll()
+    stopChildProcesses().then(() => System.getInstance().fileSystem.flushAll())
       .catch((e) => Logger.warn(LogCategory.SYSTEM, `[ReExec] flushAll failed: ${e}`))
       .then(() => { clearTimeout(budget); once(); });
     return true;
@@ -2395,6 +2443,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
   resetHleReady();
   // Try to apply RAM configuration from pending bundle if available
   let ramSize = EMU_MEMORY_SIZE;
+  if (childBoot?.config) ramSize = EmulatorConfig.getInstance().memory.ram;
   if (pendingBundle) {
     try {
       let bundle;
@@ -2433,8 +2482,29 @@ const initV86 = async (canvas: OffscreenCanvas) => {
   // across cold starts (it is keyed by URL and only fires for the *Streaming entry points —
   // v86's own loader uses the buffer form and therefore always recompiles). Falls back to the
   // buffered path by itself, so this can never be load-bearing for correctness.
-  const wasmPath = import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm";
+  let wasmPath = import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm";
+  const labWasmPath = (globalThis as { __v86LabWasmPath?: string }).__v86LabWasmPath;
+  if (import.meta.env?.DEV && labWasmPath !== undefined) {
+    if (!/^\/apps\/source-pair-lab\/engines\/[a-f0-9]{64}\.wasm$/.test(labWasmPath)) {
+      throw new Error('Invalid content-addressed lab engine path');
+    }
+    wasmPath = labWasmPath;
+  }
   const wasmLoader = createStreamingWasmLoader(wasmPath);
+  // Engine identity is what was actually INSTANTIATED, never what was asked for: a lab
+  // override that arrives after this point loads nothing and an A/B would compare a binary
+  // against itself while reporting two arms. Reported as a hash of the fetched bytes, and
+  // as an explicit failure when they could not be captured.
+  const engineLoad: {
+    requested: string; path: string; sha256: string | null; bytes: number | null; error: string | null;
+  } = { requested: labWasmPath ?? "/v86.wasm", path: wasmPath, sha256: null, bytes: null, error: null };
+  (globalThis as Record<string, unknown>).__v86EngineLoad = engineLoad;
+  void wasmLoader.sourceBytes.then(async (bytes) => {
+    if (!bytes) { engineLoad.error = "engine bytes not captured"; return; }
+    engineLoad.bytes = bytes.byteLength;
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    engineLoad.sha256 = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+  }).catch((e) => { engineLoad.error = String(e); });
 
   // v86 settings
   const settings = {
@@ -2562,8 +2632,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       system.setHostCursorWarpModeCallback((active) => {
         self.postMessage({ type: "cursor_warp", active });
       });
-      system.setHostCursorClipSignalCallback((active) => {
-        self.postMessage({ type: "clip_cursor", clip: active });
+      system.setHostCursorClipSignalCallback((active, rect) => {
+        self.postMessage({ type: "clip_cursor", clip: active, rect });
       });
       system.setHostInputResetCallback(() => {
         self.postMessage({ type: "input_reset" });
@@ -2651,6 +2721,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const tapi32 = new Tapi32();
       const setupapi = new Setupapi();
       const hid = new Hid();
+      const xinput1_3 = new XInput1_3();
       const netapi32 = new Netapi32();
       const psapi = new Psapi();
       const imagehlp = new ImageHlp();
@@ -2732,6 +2803,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       tapi32.initialize(process);
       setupapi.initialize(process);
       hid.initialize(process);
+      xinput1_3.initialize(process);
       netapi32.initialize(process);
 
       process.registerModule(kernel32.name, kernel32);
@@ -2792,6 +2864,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(tapi32.name, tapi32);
       process.registerModule(setupapi.name, setupapi);
       process.registerModule(hid.name, hid);
+      process.registerModule(xinput1_3.name, xinput1_3);
       process.registerModule(netapi32.name, netapi32);
       process.registerModule(imagehlp.name, imagehlp);
       const dbghelp = new DbgHelp(process);
@@ -2864,6 +2937,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(tapi32.name, tapi32.exports);
       process.dispatcher.registerModule(setupapi.name, setupapi.exports);
       process.dispatcher.registerModule(hid.name, hid.exports);
+      process.dispatcher.registerModule(xinput1_3.name, xinput1_3.exports);
       process.dispatcher.registerModule(netapi32.name, netapi32.exports);
       process.dispatcher.registerModule(imagehlp.name, imagehlp.exports);
       process.dispatcher.registerModule(dbghelp.name, dbghelp.exports);
@@ -3165,6 +3239,35 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // Start registry access log flush
       startRegistryFlush();
 
+      if (childBoot) {
+        const boot = childBoot;
+        // Initialization may have created a provisional scheduler thread while v86
+        // was still in its BIOS state. Use the same clean boot boundary as a root
+        // image before restoring inherited objects; otherwise that stale TEB survives
+        // while the new bootloader resets FS, and CRT startup faults at fs:[0].
+        await prepareFullGameSwitch();
+        if (boot.registry) system.registry.restore(boot.registry);
+        if (boot.namedObjects) adoptNamedObjects(boot.namedObjects, {
+          event: (manualReset, initialState) => system.scheduler.createEvent(manualReset, initialState),
+          mutex: () => system.scheduler.createMutex(false),
+          semaphore: (initialCount, maximumCount) => system.scheduler.createSemaphore(initialCount, maximumCount),
+        });
+        system.fileSystem = createChildVfsClient(boot.io,
+          request => self.postMessage({ type: 'child_io', request }), boot.currentDirectory);
+        process.loader.setVfs(system.fileSystem);
+        system.onProcessExit = payload => {
+          void system.fileSystem.flushAll().then(() => self.postMessage({
+            type: 'process_exit', ...payload, logs: Logger.getRecentEntries(100),
+          })).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+        };
+        system.executablePath = boot.imagePath;
+        system.executableName = boot.imagePath.split(/[\\/]/).pop() ?? 'child.exe';
+        system.executableArgs = boot.commandLine;
+        system.executableCommandLine = boot.rawCommandLine ?? null;
+        if (boot.environment) process.environment = new Map(boot.environment);
+        if (await loadPeData(boot.bytes, true) === 'ok') resolveChildImageReady?.();
+      }
+
       if (pendingPeData) {
         const buffered = pendingPeData;
         pendingPeData = null;
@@ -3252,6 +3355,51 @@ function postQualityState(q: QualityConfig): void {
 onQualityBackendChanged(() => postQualityState(EmulatorConfig.getInstance().quality));
 
 const handleWorkerMessage = (event: MessageEvent): void => {
+  if (event.data?.type === 'child_boot') {
+    if (childBoot || System.getInstance().process) return;
+    childBoot = event.data as ChildBoot;
+    childImageReady = new Promise<void>(resolve => { resolveChildImageReady = resolve; });
+    childSessionTransport = new ChildSessionTransport((message, transfer = []) => postToParent(message, transfer), handleWorkerMessage);
+    childFrameClock = new ChildFrameClock(() => postToParent({ type: 'child_animation_request' }));
+    self.requestAnimationFrame = childFrameClock.request;
+    self.cancelAnimationFrame = childFrameClock.cancel;
+    if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
+    const canvas = new OffscreenCanvas(640, 480);
+    state.canvas = canvas;
+    void initV86(canvas).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    return;
+  }
+  if (event.data?.type === 'child_animation_frame') {
+    childFrameClock?.frame(event.data.time - performance.timeOrigin);
+    return;
+  }
+  if (event.data?.type === 'child_session') {
+    childSessionTransport?.attach(event.data.port);
+    return;
+  }
+  if (event.data?.type === 'child_surface') {
+    const message = event.data;
+    // An immediately exiting parent can offer the session before child boot starts.
+    // Attach after its clean reset and PE load, so reset cannot discard the new input/DCs.
+    void (childImageReady ?? hleReady).then(() => {
+      const system = System.getInstance();
+      const canvas = message.canvas as OffscreenCanvas;
+      const backend = system.services.render.getBackend();
+      if (backend?.kind !== 'webgpu') throw new Error('Child display attachment requires the WebGPU backend');
+      (backend as WebGPUBackend).attachCanvas(canvas);
+      state.canvas = canvas;
+      state.width = canvas.width; state.height = canvas.height;
+      system.process!.canvas = canvas;
+      system.gdiContext.attachScreenCanvas(canvas);
+      state.inputBuffer = message.inputBuffer;
+      system.connectInput(message.inputBuffer);
+      system.services.render.armFirstPresent();
+      system.gdiContext.setOverlayDirty(true);
+      kickGdiPresentLoop();
+      self.postMessage({ type: 'child_surface_ready', imagePath: system.executablePath });
+    }).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    return;
+  }
   const message = event.data;
 
   if (message?.type === "dbg") {

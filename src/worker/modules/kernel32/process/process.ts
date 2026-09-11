@@ -2,6 +2,11 @@
 // GetCurrentProcessId, GetCurrentThreadId, ExitProcess, GetStartupInfo*, IsProcessorFeaturePresent
 
 import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import {
+    startChildProcess, promoteChildSession, hasChildSession, pendingChildHandoff,
+    ChildProcessCancelled, ChildNeedsSession,
+    type ChildProcessRequest, type ChildProcessRecord,
+} from '../../../core/child-process';
 import { Logger, LogCategory } from '../../../core/logger';
 import { System, type GuestImagePatch } from '../../../core/system';
 import {
@@ -18,8 +23,10 @@ import { SystemResourceProvider } from '../../../core/resources/system-resource-
 import { encodeAnsi } from '../../codepage-utils';
 import { applyShellExecFake, hasShellExecFakeMatch, isDifferentCommandLine } from '../../shell32';
 import { isUe1RenderProbeCommandLine } from '../../../runtime/filesystem/ue1-firstrun';
+import { applyUe1RenderProbeResult } from '../ue1-render-probe';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
-import { hostToolsEnabled, runHostTool, type HostToolFile } from '../../../core/host-tool-bridge';
+import { hostToolsEnabled } from '../../../core/host-tool-bridge';
+import { startGuestHostTool } from '../../../core/guest-host-tool';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
@@ -280,9 +287,41 @@ function module32WImpl(mem: Uint8Array, hSnapshot: number, lpme: number, isFirst
     return module32Impl(mem, hSnapshot, lpme, isFirst, true);
 }
 
+/**
+ * Attach display/input to the existing child worker, preserving its CPU, memory and
+ * open files. The parent worker stays available as its VFS broker. Selection follows
+ * guest behavior: a titled top-level window, or a parent exit leaving a live child.
+ * A helper that computes and exits while its parent waits never claims the display.
+ */
+const handOffToChild = (system: System, child: ChildProcessRecord): boolean => {
+    // The self-launch loop guard the re-exec path has always needed: an image relaunching
+    // itself with the command line it is already running reaches the same launch and asks
+    // again, forever.
+    const isSelf = system.isSelfImage(child.imagePath);
+    if (isSelf && !isDifferentCommandLine(child.commandLine, system.executableArgs)) {
+        Logger.warn(LogCategory.SYSTEM,
+            `[KERNEL32] not handing off to "${child.imagePath}" — same image, same command line`);
+        return false;
+    }
+    if (!promoteChildSession(child)) return false;
+    Logger.log(LogCategory.SYSTEM,
+        `[KERNEL32] attached live child "${child.imagePath}" "${child.commandLine}" to the session ` +
+        `(${child.needsSession ?? "the parent exited while it was still running"})`);
+    return true;
+};
+
 const shutdownProcess = (exitCode: number): ThunkResult => {
     const system = System.getInstance();
     Logger.log(LogCategory.KERNEL32, `ShutdownProcess code=${exitCode}`);
+
+    // Select the surviving child before terminating guest threads. The selected
+    // worker and the parent's VFS broker must outlive this guest's ExitProcess.
+    try {
+        const leftover = hasChildSession() ? null : pendingChildHandoff();
+        if (leftover) handOffToChild(system, leftover);
+    } catch (e) {
+        Logger.warn(LogCategory.KERNEL32, `ShutdownProcess: child hand-off failed: ${e}`);
+    }
 
     // Forensic call stack for ANY app close. ExitProcess is a clean thunk (no
     // WASM trap), so the worker fault-snapshot never fires — but a game
@@ -379,67 +418,6 @@ export const stripFirstCommandLineToken = (commandLine: string): string => {
     }
     const sp = s.search(/\s/);
     return sp < 0 ? '' : s.slice(sp).trimStart();
-};
-
-/** Split a Win32 command line the way CommandLineToArgvW does for the simple cases a
- *  console tool is spawned with: whitespace-separated, double quotes group. */
-const commandLineToArgv = (commandLine: string): string[] => {
-    const out: string[] = [];
-    let cur = "";
-    let inQuote = false;
-    for (const ch of commandLine) {
-        if (ch === '"') { inQuote = !inQuote; continue; }
-        if (!inQuote && /\s/.test(ch)) {
-            if (cur) { out.push(cur); cur = ""; }
-            continue;
-        }
-        cur += ch;
-    }
-    if (cur) out.push(cur);
-    return out;
-};
-
-/**
- * Forward a console tool the guest spawned to the dev host (see core/host-tool-bridge.ts).
- *
- * The tool is run in a scratch directory seeded with every argument that names a file the
- * guest actually has, and everything it produces there is written back under the same bare
- * name — so this needs no knowledge of one tool's flags (which argument is the input, which
- * `/Fc` names an output). Returns the child's exit code, or null when the bridge declined,
- * in which case the caller keeps refusing the spawn honestly.
- */
-const runGuestToolOnHost = async (imagePath: string, commandLine: string): Promise<number | null> => {
-    const argv = commandLineToArgv(commandLine);
-    const tool = (imagePath.split(/[\\/]/).pop() ?? "").replace(/\.exe$/i, "").toLowerCase();
-    if (!tool) return null;
-
-    const vfs = System.getInstance().fileSystem;
-    const inputs: HostToolFile[] = [];
-    // The sidecar deliberately accepts bare-name argv only. Copying VFS inputs and returned
-    // outputs by basename preserves that contract; path-bearing arguments are refused there.
-    for (const arg of argv.slice(1)) {
-        if (arg.startsWith("/") || arg.startsWith("-")) continue;
-        const size = vfs.getFileSize(arg);
-        if (!size || size <= 0) continue;
-        const h = await vfs.open(arg, GENERIC_READ, OPEN_EXISTING);
-        if (!h) continue;
-        const bytes = await vfs.read(h, size);
-        if (bytes) inputs.push({ name: arg.split(/[\\/]/).pop() ?? arg, bytes });
-    }
-
-    const result = await runHostTool(tool, argv.slice(1), inputs);
-    if (!result) return null;
-
-    for (const out of result.outputs) {
-        const h = await vfs.open(out.name, 0x40000000, 2); // GENERIC_WRITE, CREATE_ALWAYS
-        if (!h) continue;
-        await vfs.write(h, out.bytes);
-        await vfs.flushFile(h.path);
-    }
-    Logger.log(LogCategory.SYSTEM,
-        `[KERNEL32] host tool "${tool}" ${argv.slice(1).join(" ")} -> exit=${result.exitCode} ` +
-        `in=[${inputs.map(f => f.name).join(",")}] out=[${result.outputs.map(f => f.name).join(",")}]`);
-    return result.exitCode;
 };
 
 const isCurrentProcessHandle = (handle: number): boolean => {
@@ -650,16 +628,7 @@ const hasPeExecutableHeader = (path: string): boolean => {
     return (view.getUint16(peOffset + 22, true) & IMAGE_FILE_DLL) === 0;
 };
 
-/**
- * True when the image's PE optional header says WINDOWS_CUI — a console tool.
- *
- * Handing our session over to a child (see the exec branches in createVirtualProcess)
- * REPLACES the running process, which is only ever right for a launcher starting the
- * game. A console tool is spawned to do a job and be waited on — CryEngine runs
- * `Bin32\fxc.exe` to compile a shader mid-render — and its parent keeps running,
- * so replacing the session on it destroys the very process waiting for the result.
- * The subsystem field is the image's own statement of which of the two it is.
- */
+/** Selects the optional console host-tool backend; GUI images can be headless helpers too. */
 const isConsoleSubsystemImage = (path: string): boolean => {
     const vfs = System.getInstance().fileSystem;
     const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
@@ -677,11 +646,7 @@ const isConsoleSubsystemImage = (path: string): boolean => {
 };
 
 /**
- * True when `path` names an executable that ships in the mounted bundle — the only kind
- * of child we can honour, because running it means remounting this bundle on that entry
- * point. An .exe the guest merely *names* (notepad, a system tool, an installer that was
- * never packed) is not there, and must keep failing rather than restarting the session
- * onto a file that does not exist.
+ * A child needs a stored executable in the current VFS, not merely an executable name.
  *
  * The header decides; the extension is only the answer for a bundled file whose first
  * bytes are not readable without going async (a compressed entry not yet cached), where
@@ -708,7 +673,7 @@ const failVirtualProcess = (
     Logger.warn(
         LogCategory.KERNEL32,
         `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}") ` +
-        `-> FAILURE (no shellExecFake match; emulator cannot spawn real child processes)`
+        `-> FAILURE (child image unavailable or child execution failed)`
     );
     return { value: 0, stackCleanup: 40 };
 };
@@ -735,10 +700,14 @@ const finishVirtualProcess = (
     isWide: boolean,
     noOpProbe: boolean,
     deferredExec?: { imagePath: string; commandLine: string },
-    /** Present when the child has ALREADY run to completion (host-tool bridge): the handle
+    /** Present when the child has ALREADY run to completion: the handle
      *  must be signalled before we return, or the parent's WaitForSingleObject never
      *  completes and it spins on a child that will never exist. */
     exitCode?: number,
+    /** Present when a headless child runtime is to run this process. Started here, after
+     *  the handles are published, and it owns the exit code from now on. */
+    childRequest?: ChildProcessRequest,
+    childBackend: 'worker' | 'host' = 'worker',
 ): ThunkResult => {
     const manager = getVirtualProcessManager();
     const proc = manager.createProcess({
@@ -746,6 +715,7 @@ const finishVirtualProcess = (
         commandLine,
         currentDirectory,
         creationFlags: dwCreationFlags,
+        runtimeBacked: !!childRequest,
     });
 
     if (!writeProcessInformation(
@@ -774,6 +744,29 @@ const finishVirtualProcess = (
 
     if (exitCode !== undefined) manager.terminateProcess(proc.processHandle, exitCode);
 
+    if (childRequest) {
+        const vfs = System.getInstance().fileSystem;
+        const task = childBackend === 'host' ? startGuestHostTool(vfs, childRequest)
+            : startChildProcess(vfs, childRequest, undefined, record => handOffToChild(System.getInstance(), record));
+        const complete = manager.bindRuntime(proc.processId, task);
+        task.onGuestExit = complete;
+        task.completion.then(
+            complete,
+            (error) => {
+                if (error instanceof ChildProcessCancelled || !manager.isRuntimeCurrent(proc.processId, task)) return;
+                // The child that wants the screen gets it here, without waiting for a
+                // parent exit that a blocked parent will never reach.
+                if (error instanceof ChildNeedsSession
+                    && handOffToChild(System.getInstance(), error.record)) return;
+                // Otherwise the handle still has to stop being STILL_ACTIVE, or a parent
+                // waiting on a child we could neither run nor hand the session to waits
+                // forever. Failure, loudly: the record keeps why.
+                Logger.error(LogCategory.SYSTEM,
+                    `Child process "${childRequest.imagePath}" failed: ${error}`);
+                complete(1);
+            });
+    }
+
     System.getInstance().scheduler.setLastError(0);
     return { value: 1, stackCleanup: 40 };
 };
@@ -789,7 +782,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     const commandLine = readNullableProcessString(memory, lpCommandLine, isWide);
     const currentDirectory = readNullableProcessString(memory, lpCurrentDirectory, isWide);
 
-    if (!lpProcessInformation) {
+    if (!lpProcessInformation || !isValidAddress(lpProcessInformation, 16, 'rw')) {
         System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
         return { value: 0, stackCleanup: 40 };
     }
@@ -808,10 +801,14 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     const probeCommand = commandLine || applicationName;
     const hasFakeRule = hasShellExecFakeMatch(probeCommand);
     const noOpProbe = !hasFakeRule && isUnrealBrowserProbe(applicationName, commandLine);
-    if (!hasFakeRule && !noOpProbe) {
-        // Self re-exec: the launcher pattern (System.isSelfImage), and only once neither a
-        // shellExecFake rule nor the UE1 probe claimed this launch — those self-launches
-        // exist for a file side effect, and restarting for them never terminates.
+    if (noOpProbe) {
+        // The virtual child still owes its config side effect — see ue1-render-probe.
+        return applyUe1RenderProbeResult(probeCommand).then(() => finishVirtualProcess(
+            lpProcessInformation, applicationName, commandLine,
+            currentDirectory, dwCreationFlags, isWide, true,
+        ));
+    }
+    if (!hasFakeRule) {
         // lpApplicationName may be NULL, in which case the image is argv[0] of the command
         // line and the arguments are what follows it, the split CreateProcess itself performs.
         const system = System.getInstance();
@@ -819,38 +816,12 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         const reExecArgs = applicationName
             ? (commandLine || "")
             : stripFirstCommandLineToken(commandLine || "");
-        if (argv0 && system.isSelfImage(argv0, currentDirectory || "")
-            && isDifferentCommandLine(reExecArgs, system.executableArgs)
-            && system.requestReExec(reExecArgs)) {
-            Logger.log(LogCategory.SYSTEM,
-                `[KERNEL32] CreateProcess("${argv0}", "${reExecArgs}") -> re-exec ` +
-                `(launcher relaunching its own image; restarting with the new command line)`);
-            return finishVirtualProcess(
-                lpProcessInformation, applicationName, commandLine,
-                currentDirectory, dwCreationFlags, isWide, true,
-            );
-        }
-        // A launcher starting the GAME: a different image, but one that ships in the same
-        // bundle. One process hosts one image here, so run it the same way a self re-exec
-        // runs: restart on that entry point. The launcher exits right after either way.
         const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
         const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
             || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
-        // A console tool is never a session host: the parent spawned it to WAIT on it.
+        // Subsystem selects the optional host-tool backend, never permission to replace the parent.
         const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
-        const execCandidate = !!imagePath && isBundledImage(imagePath) && !isConsoleTool;
-        // ...but on a dev box that tool can actually be run (host-tool bridge), which is how a
-        // game that compiles its own shaders at run time gets to fill its on-disk cache once.
-        if (isConsoleTool && hostToolsEnabled()) {
-            return runGuestToolOnHost(imagePath, commandLine || applicationName).then((exitCode) =>
-                exitCode === null
-                    ? failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide)
-                    : finishVirtualProcess(
-                        lpProcessInformation, applicationName, commandLine,
-                        currentDirectory, dwCreationFlags, isWide, false, undefined, exitCode,
-                    )
-            );
-        }
+        const execCandidate = !!imagePath && isBundledImage(imagePath);
         if (execCandidate && deferExec) {
             return finishVirtualProcess(
                 lpProcessInformation, applicationName, commandLine,
@@ -858,13 +829,25 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
                 { imagePath, commandLine: reExecArgs },
             );
         }
-        if (execCandidate && system.requestReExec(reExecArgs, imagePath)) {
-            Logger.log(LogCategory.SYSTEM,
-                `[KERNEL32] CreateProcess("${imagePath}", "${reExecArgs}") -> exec ` +
-                `(launcher starting another image from the bundle; restarting on it)`);
+        if (execCandidate && !deferExec) {
+            // Windows starts the child and RETURNS; it never blocks the caller, and nothing
+            // here can know which of our two single-session realizations this child needs.
+            // Blocking until it exits answered that question with the PE subsystem and got
+            // it wrong twice over: a GUI image can be a helper the parent waits on, and a
+            // console image can be the program the user is meant to end up in front of.
+            // So do what Windows does, and let the parent's own next move say it — a wait
+            // completes against the headless run, an exit hands the session over
+            // (pendingChildHandoff, consumed in shutdownProcess).
             return finishVirtualProcess(
                 lpProcessInformation, applicationName, commandLine,
-                currentDirectory, dwCreationFlags, isWide, true,
+                currentDirectory, dwCreationFlags, isWide, false, undefined, undefined,
+                {
+                    imagePath, commandLine: reExecArgs,
+                    currentDirectory: currentDirectory || system.fileSystem.currentDir,
+                    rawCommandLine: commandLine || applicationName,
+                    environment: system.process ? [...system.process.environment] : undefined,
+                },
+                isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
             );
         }
         return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide);
@@ -895,7 +878,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         currentDirectory,
         dwCreationFlags,
         isWide,
-        noOpProbe
+        false
     );
 };
 

@@ -53,7 +53,7 @@ function initCommandLine(mem: Uint8Array): void {
     ensureCommandLineAllocated();
     if (!cmdLineAddrA || !cmdLineAddrW) return;
 
-    const cmdLineA = buildGuestCommandLine(exeName, system.executableArgs);
+    const cmdLineA = system.executableCommandLine ?? buildGuestCommandLine(exeName, system.executableArgs);
     const cmdLineABytes = encodeAnsi(cmdLineA);
     const cmdLineACopy = Math.min(cmdLineABytes.length, CMD_LINE_BUF_SIZE - 1);
     mem.set(cmdLineABytes.subarray(0, cmdLineACopy), cmdLineAddrA);
