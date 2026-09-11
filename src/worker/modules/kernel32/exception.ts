@@ -40,6 +40,79 @@ const EXCEPTION_CONTINUE_SEARCH = 0;
 const EXCEPTION_EXECUTE_HANDLER = 1;
 const UEF_STACK_CLEANUP = 4;
 
+// C++ throw capture ring. A C++ exception (RaiseException 0xe06d7363) is caught by
+// the app's own __CxxFrameHandler, so breakOnApi/sehLog never see it, and the throw
+// stack is gone by the time a fatal MessageBox pauses the guest. We snapshot a
+// heuristic guest backtrace (FPO-tolerant) at the raise itself into a bounded ring
+// that survives even the UEF's GetModuleFileNameA module-walk flood (worker-side,
+// socket-independent). Read via harness `cxxThrows()`.
+export interface CxxThrowRecord {
+    seq: number;
+    t: number;
+    code: number;
+    typeName: string;
+    valuePtr: number;
+    objDump: string;
+    eip: number;
+    frames: Array<{ retAddr: string; mod: string | null; off: number; isThunk: boolean }>;
+    /** raw thrown-object pointer, used only for short-window dedup of the same throw. */
+    valuePtrRaw?: number;
+}
+const cxxThrowRing: CxxThrowRecord[] = [];
+let cxxThrowSeq = 0;
+const CXX_RING_MAX = 64;
+export function getCxxThrowRing(): CxxThrowRecord[] { return cxxThrowRing; }
+export function resetCxxThrowRing(): void { cxxThrowRing.length = 0; cxxThrowSeq = 0; }
+
+/** Snapshot a C++ throw (0xe06d7363) into the ring — called at the RaiseException thunk
+ *  entry, before any dispatch, so it fires whatever path the throw takes and survives the
+ *  UEF's log flood. A heuristic stack scan from the raise ESP recovers the guest caller
+ *  past the FPO CRT frames an EBP walk can't. */
+export function captureCxxThrow(mem: Uint8Array, thunkEsp: number, thrownObjPtr: number, throwInfoPtr: number): void {
+    try {
+        const system = System.getInstance();
+        thrownObjPtr = thrownObjPtr >>> 0;
+        throwInfoPtr = throwInfoPtr >>> 0;
+        // Dedup: the same throw funnels through dispatchCxxException more than once — skip a
+        // repeat of the last object within a short window so the ring shows distinct throws.
+        const lastRec = cxxThrowRing[cxxThrowRing.length - 1];
+        const nowMs = Math.round(performance.now());
+        if (lastRec && lastRec.valuePtrRaw === thrownObjPtr && nowMs - lastRec.t < 50) return;
+
+        const rec: CxxThrowRecord = {
+            seq: ++cxxThrowSeq, t: nowMs, code: 0xe06d7363,
+            typeName: '', valuePtr: 0, objDump: '', eip: 0, frames: [], valuePtrRaw: thrownObjPtr,
+        };
+        // Each enrichment is independent and best-effort — push the record no matter which
+        // part fails, so a broken backtrace never loses the throw itself.
+        try {
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            if (throwInfoPtr) {
+                const ctArrayPtr = view.getUint32(throwInfoPtr + 12, true) >>> 0;
+                if (ctArrayPtr && (view.getUint32(ctArrayPtr, true) >>> 0) < 100) {
+                    const ctRVA = view.getUint32(ctArrayPtr + 4, true) >>> 0;
+                    const tdPtr = ctRVA ? (view.getUint32(ctRVA + 4, true) >>> 0) : 0;
+                    if (tdPtr) rec.typeName = readAnsiFromGuest(mem, tdPtr + 8, 96);
+                }
+            }
+            if (thrownObjPtr) { rec.valuePtr = view.getUint32(thrownObjPtr, true) >>> 0; rec.objDump = dumpGuestDwords(mem, thrownObjPtr, 8); }
+        } catch { /* decode best-effort */ }
+        try {
+            const cpu = system.process?.v86 ? getCPU(system.process.v86) : null;
+            rec.eip = (cpu?.instruction_pointer?.[0] ?? 0) >>> 0;
+        } catch { /* */ }
+        try {
+            const bt = system.process?.dispatcher?.getGuestCallStack?.(thunkEsp >>> 0, 0x2000, 40, { recent: false });
+            rec.frames = (bt?.frames ?? []).map((f: any) => ({
+                retAddr: '0x' + (f.retAddr >>> 0).toString(16), mod: f.moduleName ?? null,
+                off: f.moduleOffset >>> 0, isThunk: !!f.isThunk,
+            }));
+        } catch { /* backtrace best-effort */ }
+        cxxThrowRing.push(rec);
+        while (cxxThrowRing.length > CXX_RING_MAX) cxxThrowRing.shift();
+    } catch { /* best-effort */ }
+}
+
 // EncodePointer/DecodePointer cookie — module-scope so fast path can access it.
 // Must NOT be zero! See comment in exceptionExports below.
 let pointerCookie = 0;
@@ -291,6 +364,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const nNumberOfArguments = args[2];
         const lpArguments = args[3];
 
+        // Snapshot every C++ throw at the raise point (see cxxThrowRing / captureCxxThrow) —
+        // before dispatchCxxException, which returns early for an app-caught throw and never
+        // reaches the x86-dispatch fallback below. Read via harness `cxxThrows()`.
+        if ((dwExceptionCode >>> 0) === 0xe06d7363 && lpArguments && nNumberOfArguments >= 3) {
+            const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            captureCxxThrow(mem, ctx.esp >>> 0, v.getUint32(lpArguments + 4, true), v.getUint32(lpArguments + 8, true));
+        }
+
         let extra = '';
         if (dwExceptionCode === 0xe06d7363 && lpArguments && nNumberOfArguments >= 3) {
             // MSVC C++ exception: args[0]=magic, args[1]=thrown object ptr, args[2]=_ThrowInfo ptr
@@ -361,6 +442,31 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 }
             } catch (e) {
                 extra += ` (failed to decode: ${e})`;
+            }
+        }
+
+        // MSVC delay-load failure (0xC06D007E module-not-found / 0xC06D007F proc-not-found):
+        // the single argument is a DelayLoadInfo* (cb=0x24). Decode szDll + szProcName/ordinal
+        // so the log names exactly which delay import the guest's __delayLoadHelper2 could not
+        // resolve — the generic bug is always a DLL we did not register or an export we do not
+        // hand back to GetProcAddress, never the game.
+        if ((dwExceptionCode === 0xc06d007f || dwExceptionCode === 0xc06d007e)
+            && lpArguments && nNumberOfArguments >= 1) {
+            try {
+                const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                const pInfo = dv.getUint32(lpArguments, true) >>> 0;
+                if (pInfo && pInfo + 0x24 <= mem.length) {
+                    const cb = dv.getUint32(pInfo + 0, true);
+                    const szDll = dv.getUint32(pInfo + 12, true) >>> 0;
+                    const fByName = dv.getUint32(pInfo + 16, true) >>> 0;
+                    const dlp = dv.getUint32(pInfo + 20, true) >>> 0;
+                    const hmodCur = dv.getUint32(pInfo + 24, true) >>> 0;
+                    const dllName = szDll ? readAnsiFromGuest(mem, szDll, 128) : '?';
+                    const proc = fByName ? `"${readAnsiFromGuest(mem, dlp, 128)}"` : `#ord${dlp}`;
+                    extra += ` DELAYLOAD FAIL: dll="${dllName}" proc=${proc} hmodCur=0x${hmodCur.toString(16)} cb=0x${cb.toString(16)}`;
+                }
+            } catch (e) {
+                extra += ` (delayload decode failed: ${e})`;
             }
         }
 

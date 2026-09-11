@@ -350,6 +350,9 @@ class LoggerImpl {
         this.setCategoryLevel(LogCategory.COM, LogLevel.WARN);     // COM operations
     }
 
+    /** Ring capacity — a reader that returns this many entries may have been TRUNCATED by it. */
+    getBufferSize(): number { return this.bufferSize; }
+
     setBufferSize(size: number): void {
         this.bufferSize = size;
         this.buffer = [];

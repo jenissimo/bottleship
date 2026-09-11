@@ -28,6 +28,7 @@ import { Logger, LogCategory } from './logger';
 import { System } from './system';
 import { debugSession } from './debug/debug-session';
 import { recordSehFrame, repairSehSelfLoop } from './tools/seh-chain-repair';
+import { captureCxxThrow } from '../modules/kernel32/exception';
 import { guardStackWrite } from './memory/stack-write-guard';
 import { isValidAddress } from './memory/address-guard';
 
@@ -2091,6 +2092,15 @@ export function dispatchCxxException(
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const tebAddr = cpu.segment_offsets[4];
     let sehHead = dv.getUint32(tebAddr, true);
+
+    // Snapshot a NEW throw into the harness ring (cxxThrows) — this is the single choke
+    // point every C++ exception passes through, whatever raised it (RaiseException thunk,
+    // an app's static _CxxThrowException, a rethrow's re-entry all funnel here). A heuristic
+    // stack scan from the current ESP recovers the guest raiser past the FPO CRT frames an
+    // EBP walk can't, before the stack unwinds and a fatal MessageBox pauses the guest.
+    if ((pExceptionObject >>> 0) !== 0 && (pThrowInfo >>> 0) !== 0) {
+        captureCxxThrow(mem, cpu.reg32[4] >>> 0, pExceptionObject >>> 0, pThrowInfo >>> 0);
+    }
 
     // Re-throw support: `throw;` passes pObj=0, pThrow=0 — resolve from the stored
     // exception. NOTE the lifecycle (matches CRT CallCatchBlock, NOT the old model):

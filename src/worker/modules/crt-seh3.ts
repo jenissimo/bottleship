@@ -13,6 +13,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { Marshaler } from "../core/memory/marshaler";
 import { getCPU } from "../core/thunking/thunk-utils";
 import { dispatchCxxException, evaluateSimpleFilter } from "../core/seh-dispatch";
+import { captureCxxThrow } from "./kernel32/exception";
 import type { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import type { Process } from "../core/process";
 
@@ -325,6 +326,12 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
             Logger.error(LogCategory.SYSTEM, '_CxxThrowException: cannot get CPU');
             return 0;
         }
+
+        // Snapshot the throw into the harness ring (cxxThrows) at the raise site — a game
+        // whose CRT throws (e.g. _invalid_parameter behind an FPO frame) is caught by its
+        // own __CxxFrameHandler, so this is the only place a heuristic guest backtrace can
+        // be taken before the stack unwinds and a fatal MessageBox pauses the guest.
+        captureCxxThrow(mem, ctx.esp >>> 0, pExceptionObject >>> 0, pThrowInfo >>> 0);
 
         // _CxxThrowException is cdecl(obj, throwInfo): thunk RET 8.
         const result = dispatchCxxException(mem, cpu, pExceptionObject, pThrowInfo, 8);
