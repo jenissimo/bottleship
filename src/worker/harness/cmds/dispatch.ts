@@ -198,11 +198,17 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
     // here the guard is a bound on the window rather than a correction.
     const suspectWrap = windowMs > 30_000;
 
-    const exits = d.moduleReentry + d.moduleChainedEdge;
+    // MODULE_EXIT_INDIRECT is incremented BEFORE RET chaining is attempted. A hit
+    // therefore belongs to chained transitions, not returns to cycle_internal.
+    if (d.retChainHit > d.moduleExitIndirect) {
+        return { ok: false, code: HarnessErrorCode.INTERNAL,
+            refuse: 'RET chain hits exceed indirect attempts; counter scopes are inconsistent' };
+    }
+    const exits = d.moduleReentry + d.moduleChainedEdge + d.retChainHit;
     const classes = {
         // Chained at compile time: the successor eip was a constant and a tail call took
         // it. These pay no dispatch, and they are in the denominator on purpose.
-        chained: d.moduleChainedEdge,
+        chained: d.moduleChainedEdge + d.retChainHit,
         // A constant successor that was NOT chained: the target sat outside the region.
         // Lever: region formation (roadmap 06) / JIT_INDIRECT_REGION_MAX_PAGES.
         constantTargetUnchained: d.moduleExitChainable,
@@ -210,7 +216,7 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
         dynamic: d.moduleExitDynamic,
         // Indirect jmp/call whose target left the module: the C++ virtual call.
         // Lever: a call-site inline cache.
-        indirect: d.moduleExitIndirect,
+        indirect: d.moduleExitIndirect - d.retChainHit,
     };
     const other = Math.max(0, d.moduleReentry - classes.constantTargetUnchained - classes.dynamic - classes.indirect);
 
@@ -224,6 +230,7 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
         chainHit: d.retChainHit, chainMiss: d.retChainMiss,
     };
     const memoAccounted = memo.hit + memo.alias + memo.cold + memo.budget;
+    const memoProbes = memo.chainHit + memo.chainMiss;
 
     let dominant: string, lever: string;
     const chainableShare = exits > 0 ? classes.constantTargetUnchained / exits : 0;
@@ -265,7 +272,7 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
             // slightly LOW, and comparable between arms rather than absolute.
             exitsPerKiloInsn: round((exits / retired) * 1000, 3),
             blockExecutions: d.blockExecution,
-            intraModuleEdges: Math.max(0, d.blockExecution - d.moduleReentry - d.moduleChainedEdge),
+            intraModuleEdges: Math.max(0, d.blockExecution - exits),
 
             classes: {
                 chained: { n: classes.chained, pct: pct(classes.chained, exits) },
@@ -279,10 +286,11 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
                 dispatches: abseip,
                 perKiloInsn: round((abseip / retired) * 1000, 3),
                 ...memo,
-                // The three probe outcomes plus the budget bail partition every dispatch;
-                // a mismatch means the split itself drifted and no share here is usable.
-                probeOutcomesSumOk: abseip === 0 ? null : memoAccounted === abseip,
-                unaccounted: abseip - memoAccounted,
+                // In-module AbsoluteEip dispatch can succeed without probing the RET memo.
+                // Probe outcomes partition calls of the dynamic-chain resolver only.
+                memoProbes,
+                probeOutcomesSumOk: memoProbes === 0 ? null : memoAccounted === memoProbes,
+                unaccounted: memoProbes - memoAccounted,
             },
 
             chaining: { budgetExit: d.moduleChainBudgetExit, miss: d.moduleChainMiss },

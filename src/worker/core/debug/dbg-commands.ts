@@ -227,6 +227,7 @@ export const dbg = {
      *   dbg.quality({ brightness: 1.3, contrast: 1.1 })
      *   dbg.quality({ aspectMode: 'pillarbox' })
      *   dbg.quality({ crt: true })            // example post-fx
+     *   dbg.quality({ videoChroma: 'smooth', videoDither: true, videoDeinterlace: 'auto' })  // movie decode
      */
     quality(partial?: Partial<QualityConfig>): QualityConfig {
         const c = EmulatorConfig.getInstance();

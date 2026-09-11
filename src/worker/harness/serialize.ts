@@ -18,7 +18,9 @@ import {
     isCursorClipped,
     isGuestCursorVisible,
 } from "../modules/user32/shared-state";
+import { getWindowClass, getWindowClassByName } from "../modules/user32/class";
 import { getActiveDeviceCursor, isDeviceCursorVisible } from "../core/device-cursor";
+import { describePointerPolicy } from "../core/pointer-policy";
 import { leaseRegistry } from "../core/memory/lease-registry";
 import { memoryEventBuffer } from "../core/memory/memory-event-buffer";
 import { THREAD_STATE_NAMES, WAIT_REASON_NAMES } from "../core/scheduler/types";
@@ -212,6 +214,12 @@ export function serializeSurfaces(): unknown {
     return out;
 }
 
+/** The registered class behind a window, by atom when we have one and by name otherwise. */
+function windowClassInfo(w: { classId?: number; nativeClassName?: string }): { hCursor?: number } | undefined {
+    if (w.classId !== undefined) return getWindowClass(w.classId);
+    return w.nativeClassName ? getWindowClassByName(w.nativeClassName) : undefined;
+}
+
 export function serializeWindows(): unknown {
     const out: unknown[] = [];
     const wm = sys().windowManager;
@@ -265,6 +273,16 @@ export function serializeWindows(): unknown {
             // Which proc will see a message: a subclassed control's guest proc runs first
             // and reaches the class behaviour only through CallWindowProc.
             subclassed: !!w.wndProcSubclassed,
+            // The pointer Windows shows over a window is its CLASS cursor, applied by
+            // DefWindowProc's WM_SETCURSOR — an app that wants no pointer registers the
+            // class with hCursor NULL and never calls ShowCursor. Without this fact the
+            // only way to see it is to decode an MFC-synthesised class NAME.
+            //
+            // Resolved by name as well as by atom: CreateWindowEx only records classId
+            // when the app passed an ATOM, so a class-cursor read keyed on classId alone
+            // answers 0 for nearly every window — indistinguishable from a real NULL.
+            classCursor: u32(windowClassInfo(w)?.hCursor),
+            classKnown: !!windowClassInfo(w),
         });
     }
     return out;
@@ -339,6 +357,10 @@ export function serializeVideo(): unknown {
         // Separates "we replaced the guest's ffmpeg decode" from "we declined and it is still
         // running its own": `served` counts frames we published, `declined` calls handed back.
         ffmpegHle: getFfmpegHleStats(),
+        // The video quality knobs (videoChroma/videoDither/videoDeinterlace) only touch frames
+        // WE decode. `sessions` empty while a movie is visibly playing means the title runs
+        // its own player DLL on the CPU and no knob can reach that picture.
+        enhance: videoEngine?.getEnhancementState?.() ?? null,
     };
 }
 
@@ -347,8 +369,9 @@ export function serializeVideo(): unknown {
  * A game hides the system pointer either with SetCursor(NULL) (handle 0) or by
  * driving the display count negative, and is then expected to draw its own; the
  * shape the host renders comes from the CURSOR user object behind the handle.
- * `visible` is what the host is told, so it separates "we hid it" from "we kept
- * it but the shape never arrived".
+ * `visible` is READ from core/pointer-policy — the decision the host actually acts
+ * on — next to the guest facts it was derived from, so "we hid it", "something
+ * outranks it" and "we kept it but the shape never arrived" stay distinguishable.
  */
 export function serializeCursor(): unknown {
     const handle = getCurrentCursorHandle();
@@ -357,10 +380,16 @@ export function serializeCursor(): unknown {
         && obj.pixels instanceof Uint8Array
         && obj.width > 0 && obj.height > 0;
     const device = getActiveDeviceCursor();
+    const policy = describePointerPolicy();
     return {
-        // What the host is actually told to draw: the D3D device cursor outranks the
-        // Win32 one, so `visible: false` with a live device cursor is not a hidden pointer.
-        visible: !!device || isGuestCursorVisible(),
+        // READ from the policy, never re-derived: core/pointer-policy is what the host
+        // acts on, and a second derivation here reports a pointer the host was never
+        // asked for (an acquired exclusive-mode DI mouse hides it with no Win32 call).
+        visible: policy.outputs.pointerShown,
+        // The Win32 half on its own, so "we hid it" and "something else outranks it"
+        // stay distinguishable.
+        win32Visible: isGuestCursorVisible(),
+        pointerPolicy: policy,
         displayCount: getCursorDisplayCount(),
         handle,
         handleHex: "0x" + handle.toString(16),

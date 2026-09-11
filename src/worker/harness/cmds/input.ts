@@ -438,17 +438,22 @@ export function registerInputCommands(svc: HarnessService): void {
     /**
      * hitTest(x, y) — the two answers a click depends on, side by side.
      *
-     * `windowFromPoint` is the window a mouse message is ADDRESSED to; `control` is what
-     * the container hit-test then finds under the same point and runs the class behaviour
-     * for. They are normally the same window, and when they are not the click still
-     * "works" for every control WE drive — while a control the guest SUBCLASSED never
-     * receives a message at all, because the guest's proc is only reached through the
-     * address. That asymmetry is invisible in pixels and in `dialogs`.
+     * `addressed` is the window a mouse message actually goes to — the INPUT ROUTING
+     * answer (WindowManager.getMouseTargetWindow), which is WindowFromPoint plus the
+     * dialog-overlay resolver that answers when the tree walk finds nothing. Reporting
+     * only `windowFromPoint` therefore said "nobody" for messages that were in fact being
+     * delivered. Capture outranks both and is reported separately: a click that lands
+     * somewhere unexpected while `capture` is non-zero went there by capture, not by point.
+     * `control` is what the container hit-test then finds under the same point and runs
+     * the class behaviour for. Address and control differing still "works" for every
+     * control WE drive — while a control the guest SUBCLASSED never receives a message at
+     * all, because the guest's proc is only reached through the address.
      */
     svc.register("hitTest", (args) => {
         const x = Number(args[0]) | 0, y = Number(args[1]) | 0;
         const wm = sys().windowManager as any;
-        const at = wm?.windowFromPoint?.(x, y) >>> 0;
+        const fromPoint = wm?.windowFromPoint?.(x, y) >>> 0;
+        const at = (wm?.getMouseTargetWindow?.(x, y)?.hwnd ?? 0) >>> 0;
         const addressed = at ? windows.get(at) : undefined;
         // The class behaviour is hit-tested over a CONTAINER's subtree (message.ts
         // resolves a leaf control up to its parent), so mirror that resolution here.
@@ -457,7 +462,9 @@ export function registerInputCommands(svc: HarnessService): void {
         const control = host ? hitTestSystemControlAtScreenPoint(host, x, y) : undefined;
         return {
             at: [x, y],
-            windowFromPoint: at,
+            windowFromPoint: fromPoint,
+            /** Set when the display owner makes the tree answer unreachable for input. */
+            routingDiffers: fromPoint !== at,
             addressed: addressed ? describeDlgControl(at, addressed) : null,
             host,
             control: control ? describeDlgControl(control.handle, control) : null,

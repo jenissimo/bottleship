@@ -37,6 +37,33 @@ function toCategoryEnums(names?: string[]): LogCategory[] | undefined {
 const categoryName = (c: LogCategory): string => (LogCategory as any)[c] ?? String(c);
 
 export function registerLogCommands(svc: HarnessService): void {
+    // Host wall time between guest-emitted markers. Polling/file I/O outside the
+    // two markers cannot inflate this interval. The tap is diagnostics only.
+    let phaseTap: ((e: { message: string }) => void) | undefined;
+    let phase: { begin: number | null; end: number | null; begins: number; ends: number; compileBegin: number | null; compileEnd: number | null } | undefined;
+    svc.register("logPhase", (args) => {
+        if (args[0] === "arm") {
+            if (phaseTap) Logger.removeLogTap(phaseTap);
+            const begin = String(args[1] ?? ""), end = String(args[2] ?? "");
+            if (!begin || !end || begin === end) throw new Error("Distinct nonempty markers required");
+            phase = { begin: null, end: null, begins: 0, ends: 0, compileBegin: null, compileEnd: null };
+            phaseTap = (e) => {
+                if (e.message.endsWith(`: "${begin}"`)) {
+                    phase!.begins++; phase!.begin = performance.now();
+                    phase!.compileBegin = (globalThis as any).__jitCompileStats?.count ?? null;
+                }
+                if (e.message.endsWith(`: "${end}"`)) {
+                    phase!.ends++; phase!.end = performance.now();
+                    phase!.compileEnd = (globalThis as any).__jitCompileStats?.count ?? null;
+                }
+            };
+            Logger.addLogTap(phaseTap);
+            return { armed: true };
+        }
+        if (args[0] === "seal" && phaseTap) { Logger.removeLogTap(phaseTap); phaseTap = undefined; }
+        return phase ? { ...phase, valid: phase.begins === 1 && phase.ends === 1 && phase.end! > phase.begin!,
+            ms: phase.begin !== null && phase.end !== null ? phase.end - phase.begin : null } : null;
+    });
     svc.register("streamLogs", (args) => {
         const categories = toCategoryEnums(args[0] as string[] | undefined);
         Logger.setStreamCallback((batch) => {
@@ -163,11 +190,26 @@ export function registerLogCommands(svc: HarnessService): void {
         if (ts === undefined) throw new HarnessError(`no log mark '${label}' (call markLog first)`, HarnessErrorCode.NOT_FOUND);
         const opts = (args[1] ?? {}) as { filter?: string; count?: number };
         const filter = opts.filter?.toLowerCase();
-        let entries = Logger.getRecentEntries(opts.count ?? 0)
+        const recent = Logger.getRecentEntries(opts.count ?? 0);
+        const available = recent.length;
+        let entries = recent
             .filter((e) => e.timestamp >= ts)
             .map((e) => ({ timestamp: e.timestamp, category: categoryName(e.category), level: e.level, message: e.message }));
         if (filter) entries = entries.filter((e) => e.message.toLowerCase().includes(filter) || e.category.toLowerCase().includes(filter));
-        return { since: ts, sinceLabel: label, count: entries.length, entries };
+        // The ring is SMALL (50 entries by default) and a firehose empties it in
+        // milliseconds. Without saying so, an evicted window is indistinguishable from
+        // "it never happened" — the reader returns 0 either way, and a filtered 0 reads
+        // as proof of absence. Say which of the two it is.
+        const capacity = Logger.getBufferSize();
+        const truncated = available >= capacity;
+        return {
+            since: ts, sinceLabel: label, count: entries.length, entries,
+            ringCapacity: capacity, scanned: available, truncated,
+            ...(truncated ? {
+                note: `the ring held its full ${capacity} entries, so this window starts at the OLDEST SURVIVING line, not at the mark — `
+                    + `an empty or short result is NOT evidence of absence. Quiet the firehose (logLevel), enlarge the ring, or use watchLog (a live tap).`,
+            } : {}),
+        };
     });
 
     /**

@@ -46,9 +46,9 @@ describe("dispatch class split", () => {
         const after = snap({
             atMs: 1000, retiredCounter: 1_000_000,
             counters: counters({
-                blockExecution: 5000, moduleReentry: 400, moduleChainedEdge: 600,
-                moduleExitChainable: 100, moduleExitDynamic: 250, moduleExitIndirect: 40,
-                abseipDispatch: 250, retMemoHit: 200, retMemoAlias: 30, retMemoCold: 15, retChainBudget: 5,
+                blockExecution: 5000, moduleReentry: 400, moduleChainedEdge: 355,
+                moduleExitChainable: 100, moduleExitDynamic: 250, moduleExitIndirect: 285,
+                abseipDispatch: 350, retMemoHit: 200, retMemoAlias: 30, retMemoCold: 15, retChainBudget: 5,
                 retMetaHit: 45, retChainHit: 245, retChainMiss: 5,
             }),
         });
@@ -62,6 +62,8 @@ describe("dispatch class split", () => {
         // 1000 exits per 1e6 instructions.
         expect(r.exitsPerKiloInsn).toBe(1);
         expect(r.absEip.probeOutcomesSumOk).toBe(true);
+        expect(r.absEip.memoProbes).toBe(250);
+        expect(r.intraModuleEdges).toBe(4000);
         expect(r.verdict.dominantClass).toBe("dynamic");
         expect(r.verdict.lever).toContain("memo");
     });
@@ -70,12 +72,31 @@ describe("dispatch class split", () => {
         const r = armed(summarizeDispatch(snap(), snap({
             atMs: 10, retiredCounter: 1000,
             counters: counters({
-                blockExecution: 10, moduleReentry: 10, moduleExitDynamic: 10,
+                blockExecution: 110, moduleReentry: 110, moduleExitDynamic: 10, moduleExitIndirect: 100, retChainMiss: 100,
                 abseipDispatch: 100, retMemoHit: 40, retMemoAlias: 5, retMemoCold: 5, retChainBudget: 0,
             }),
         })));
         expect(r.absEip.probeOutcomesSumOk).toBe(false);
         expect(r.absEip.unaccounted).toBe(50);
+    });
+
+    test("NFSU observed counters partition transitions after excluding successful RET chains", () => {
+        const r = armed(summarizeDispatch(snap(), snap({
+            atMs: 5024, retiredCounter: 868764501,
+            counters: counters({ blockExecution: 175415083, moduleReentry: 16675142,
+                moduleExitChainable: 11481971, moduleExitDynamic: 2227062, moduleExitIndirect: 14033277,
+                abseipDispatch: 17908461, retMemoHit: 10812151, retMemoAlias: 392498,
+                retMemoCold: 11668, retChainBudget: 2816960, retMetaHit: 255017,
+                retChainHit: 11067168, retChainMiss: 2966109 }),
+        })));
+        expect(r.moduleExits).toBe(27742310);
+        expect(r.classes.indirect.n).toBe(2966109);
+        expect(r.classes.chained.n).toBe(11067168);
+        expect(r.classes.other.n).toBe(0);
+        expect(Object.values(r.classes).reduce((n: number, c: any) => n + c.n, 0)).toBe(r.moduleExits);
+        expect(r.absEip.probeOutcomesSumOk).toBe(true);
+        expect(r.absEip.unaccounted).toBe(0);
+        expect(r.verdict.dominantClass).toBe('constantTargetUnchained');
     });
 
     test("an indirect-dominated profile names the inline-cache lever", () => {

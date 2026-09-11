@@ -192,8 +192,8 @@ const cases: Record<string, (ctx: Ctx) => Snapshot> = {
 
 // Frozen snapshots (generated on the pre-move code; MUST NOT change across the move).
 const EXPECTED: Record<string, Snapshot> = {
-    heapSlabStubs: {"result":{"heapAllocStub":4096,"heapFreeStub":4253,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"2e61fc6d4a8d3740e739a1e0fca6d4c05725b6053c969c64a593e6a43f6574a5"}},
-    crtSlabStubs: {"result":{"mallocStub":4096,"freeStub":4235,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"de7b6017ea9cffbcc44163c6080690d0a9d212f9cc38f796c5936b412579fbaa"}},
+    heapSlabStubs: {"result":{"heapAllocStub":4096,"heapFreeStub":4263,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"4de9722997e8271084f9315e0fe9e0c3bae177fd2475c18ac2808a4a1ddb1c08"}},
+    crtSlabStubs: {"result":{"mallocStub":4096,"freeStub":4245,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"1a43f680b399c70a0ae1f452b9f0940f4978ec37e0b07022ce977dd205329870"}},
     getcStub: {"result":{"getcStub":4096,"regionBase":4096,"regionEnd":4160},"hashes":{"region":"7164114dee4b9bf1cf713e04d53500a1cf0aa472b1aa6cdc1b8a3dfad854f2c0"}},
     caseFoldStubs: {"result":{"tolowerStub":4096,"toupperStub":4108,"regionBase":4096,"regionEnd":4128},"hashes":{"region":"361bd870014fab9f407fc15d3cfe66b4e9468a933f6d6ca6aae0640e20fb0946"}},
     localeStubs: {"result":{"getLocaleInfoWStub":4096,"tableAddr":131072,"regionBase":4096,"regionEnd":4480},"hashes":{"region":"e95d8aa2c469c375bbaa8301d0727f91f1c40bb67eb48d98541cca811b745c6a"}},

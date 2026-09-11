@@ -272,6 +272,8 @@ export class ThunkDispatcher {
     private fastPathCounts = new Uint32Array(MAX_THUNK_ID);
     /** Per-funcId WBUF ring census; null until opted into — see censusWriteBufRange. */
     private wbufCallCounts: Uint32Array | null = null;
+    private wbufSequenceWant = 0;
+    private wbufSequence: number[] | null = null;
     /**
      * Thunks whose stub is used AS a window procedure. Such a stub is a callback
      * target, so [ESP] on entry is a callback return stub — the one shape the
@@ -1190,6 +1192,9 @@ export class ThunkDispatcher {
         let offset = this.wbufTail;
         let segment = 0; // barrier (draw) count — must mirror buildWbufCoalesceIndex's walk
         if (this.wbufCallCounts) this.censusWriteBufRange(mem32, dataBase, offset, head);
+        // Counts say WHAT the ring carries; only the order says what shape a run detector
+        // would have to match, which is why this is a separate, separately-armed tier.
+        if (this.wbufSequenceWant > 0) this.recordWriteBufSequence(mem32, dataBase, offset, head);
         const coalescing = this.wbufCoalescingEnabled && this.buildWbufCoalesceIndex(mem32, dataBase, offset, head);
         while (offset < head) {
             const funcId: number = mem32[(dataBase + offset) >> 2] >>> 0;
@@ -4576,6 +4581,41 @@ export class ThunkDispatcher {
 
     resetWriteBufCensus(): void {
         this.wbufCallCounts?.fill(0);
+    }
+
+    /**
+     * Arm a one-shot capture of the next `want` ring entries IN ORDER. Separate from the
+     * census because a run detector is matched on sequence, not on totals.
+     */
+    armWriteBufSequence(want: number): void {
+        this.wbufSequenceWant = want > 0 ? want : 0;
+        this.wbufSequence = want > 0 ? [] : null;
+    }
+
+    /** null while unarmed — a disarmed capture must not answer [] and read as "nothing ran". */
+    getWriteBufSequence(): { armed: boolean; want: number; ids: string[] } | null {
+        const seq = this.wbufSequence;
+        if (!seq) return null;
+        return {
+            armed: this.wbufSequenceWant > 0,
+            want: seq.length,
+            ids: seq.map((id) => this.namesTable[id] || `thunk#${id}`),
+        };
+    }
+
+    private recordWriteBufSequence(mem32: Uint32Array, dataBase: number, offset: number, head: number): void {
+        const out = this.wbufSequence;
+        if (!out) return;
+        let probe = offset;
+        while (probe < head && out.length < this.wbufSequenceWant) {
+            const id = mem32[(dataBase + probe) >> 2] >>> 0;
+            if (!(id > 0 && id < MAX_THUNK_ID)) break;
+            const stride = this.getWbufEntryStride(mem32, dataBase, probe, this.writeBufArgCountTable[id]);
+            if (stride <= 0) break;
+            out.push(id);
+            probe += stride;
+        }
+        if (out.length >= this.wbufSequenceWant) this.wbufSequenceWant = 0;
     }
 
     /**
