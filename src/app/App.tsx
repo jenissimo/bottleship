@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SessionWorker } from './session-worker';
+import { ChildSessionSurface } from './child-session-surface';
 import { cx } from "../ui/cx";
 import s from "./App.module.css";
 import OpfsTool from '../debug/OpfsTool';
@@ -52,6 +54,7 @@ import { INPUT_BUFFER_SIZE, INPUT_INDEX } from "../input/sab-layout";
 import { GuestCursorRenderer } from "./guest-cursor";
 import { inputDevice } from "../input/virtual-device";
 import { relativeIntent } from "../input/relative-intent";
+import { HostPointerTrack } from "../input/host-pointer-track";
 import { touchDriver } from "../input/touch/driver";
 import { TouchControlLayer, type TouchControlsHandle } from "./TouchControlLayer";
 import { TouchHud } from "./TouchHud";
@@ -272,6 +275,15 @@ export default function App() {
   // is driven by one signal and a fresh load clears it. `crashed` distinguishes a
   // clean exit from an unhandled access violation (fault carries EIP/addr).
   const [exitInfo, setExitInfo] = useState<GuestExitInfo | null>(null);
+  // A load that DIED still has progress messages in flight behind the exit — a PE link
+  // failure reports the crash and the loader then posts its trailing "done". Read
+  // synchronously in the message handler (state lags a tick), so the dead load cannot
+  // raise the boot overlay back over the crash dialog.
+  // Mirrored in an effect, never during render: a render pass can be started, thrown away
+  // and replayed (StrictMode, a concurrent update), and a replay carrying the pre-crash
+  // snapshot would write `null` back over a ref the message handler has already set.
+  const exitInfoRef = useRef<GuestExitInfo | null>(null);
+  useEffect(() => { exitInfoRef.current = exitInfo; }, [exitInfo]);
   const [isBufferInitialized, setIsBufferInitialized] = useState(false);
   const [isLoadingApp, setIsLoadingApp] = useState(false);
   // Unified launch overlay model, covering the WHOLE journey click → first flip:
@@ -292,6 +304,8 @@ export default function App() {
     canvasRef.current?.focus();
     setIsLoadingApp(true);
     setErrorMessage(null);
+    setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+    exitInfoRef.current = null;
     setBundleDisplayName(null);
     setLoadingProgress({ phase: "loading", percent: 0, label: "" });
     // One file uses the blob sniff path; several files use multi-part install.
@@ -583,6 +597,8 @@ export default function App() {
           canvasRef.current?.focus();
           setIsLoadingApp(true);
           setErrorMessage(null);
+          setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+          exitInfoRef.current = null;
           setBundleDisplayName(null);
           setLoadingProgress({ phase: "loading", percent: 0, label: "" });
           globalWorker?.postMessage(
@@ -648,6 +664,9 @@ export default function App() {
   const userReleasedLockRef = useRef(false);
   /** Host F11 fullscreen — ref so the mount-stable input effect can call it. */
   const toggleFullscreenRef = useRef<() => void>(() => {});
+  /** Reads the host pointer as motion whenever the guest has moved its own pointer out
+   *  from under it (SetCursorPos) — the no-Pointer-Lock half of the one-position rule. */
+  const hostPointerTrackRef = useRef(new HostPointerTrack());
 
   const requestPointerLockSafe = (canvas: HTMLCanvasElement) => {
     if (pointerLockCooldownRef.current) return;
@@ -983,10 +1002,10 @@ export default function App() {
 
     // 1. Initialize Worker (only once)
     if (!globalWorker) {
-      globalWorker = new Worker(
+      globalWorker = new SessionWorker(new Worker(
         new URL("../worker/emulator.worker.ts", import.meta.url),
         { type: "module" }
-      );
+      ));
 
       // Expose worker to console for debugging
       (window as any).worker = globalWorker;
@@ -1162,6 +1181,7 @@ export default function App() {
       getLogClient().enable();
     }
     const worker = globalWorker;
+    const childSurface = new ChildSessionSurface(canvas, captureRects);
 
     // 2. Initialize SharedArrayBuffer (only once)
     if (!globalSab) {
@@ -1231,6 +1251,7 @@ export default function App() {
       const fitH = Math.min(availH, availW / aspect);
       const renderWidth = Math.max(1, Math.floor(fitW * devicePixelRatio));
       const renderHeight = Math.max(1, Math.floor(fitH * devicePixelRatio));
+      childSurface.fit(renderWidth / devicePixelRatio, renderHeight / devicePixelRatio);
 
       // Update ref for event calculations (cannot set canvas.width/height anymore)
       resolutionRef.current = { width: renderWidth, height: renderHeight };
@@ -1250,6 +1271,15 @@ export default function App() {
 
     // 3. Setup Worker Message Handling
     worker.onmessage = (event: MessageEvent) => {
+      if (event.data?.type === 'child_session') {
+        audioEngine?.stopAll();
+        setExitInfo(null); exitInfoRef.current = null;
+        const { width, height } = resolutionRef.current;
+        const surface = childSurface.create(width, height);
+        worker.postMessage({ type: 'child_surface', canvas: surface, inputBuffer }, [surface]);
+        return;
+      }
+      if (event.data?.type === 'child_session_reset') { childSurface.clear(); return; }
       //console.log('BottleShip: Worker message received:', event.data?.type);
       
       // Forward logs to server (if enabled)
@@ -1323,11 +1353,13 @@ export default function App() {
         // The guest process called ExitProcess (or crashed → SEH → ExitProcess).
         // The emulator has torn down all threads; reflect a clean exit instead of
         // leaving the last (now stale) frame on screen.
-        setExitInfo({
+        const info: GuestExitInfo = {
           code: typeof event.data.exitCode === "number" ? event.data.exitCode : 0,
           crashed: !!event.data.crashed,
           fault: event.data.fault ?? undefined,
-        });
+        };
+        exitInfoRef.current = info;
+        setExitInfo(info);
         // The worker is gone but the worklet keeps rendering whatever ring/legacy
         // sources were still PLAYING — a looping/circular buffer drones the stale
         // ring forever. Silence everything on guest exit.
@@ -1370,8 +1402,10 @@ export default function App() {
       }
       if (event.data?.type === "loading_progress") {
         const { phase, percent, label } = event.data;
-        // A fresh load clears any prior "game exited" state.
-        setExitInfo(null);
+        // Progress belonging to a load that already died is stale — a fresh load clears
+        // exitInfo at its own start, so anything arriving while one is set is the corpse
+        // of the previous one talking.
+        if (exitInfoRef.current) return;
         if (phase === "done") {
           // PE is loaded but the guest hasn't drawn yet. DON'T hide the overlay here —
           // switch it to an indeterminate "booting" state and keep it up until the worker
@@ -1405,6 +1439,9 @@ export default function App() {
         }, 450);
       }
       if (event.data?.type === "install_progress") {
+        // Same rule as loading_progress: progress from a load that already died must not
+        // raise the launch overlay back over the exit/crash dialog.
+        if (exitInfoRef.current) return;
         const { phase, doneBytes, totalBytes } = event.data;
         const doneMb = (doneBytes / 1024 / 1024).toFixed(0);
         const totalMb = totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(0) : "?";
@@ -1571,10 +1608,16 @@ export default function App() {
         );
       }
       if (event.data?.type === "clip_cursor") {
-        // Guest ClipCursor(rect) confines the cursor (relative/captured mouse, e.g. Unreal
-        // SetMouseCapture); ClipCursor(NULL) releases it. Feed it into the same intent as
-        // ShowCursor so confined-but-visible games also engage pointer-lock.
-        relativeIntent.set("clipped", event.data?.clip === true);
+        // Guest ClipCursor(rect) confines the cursor; ClipCursor(NULL) releases it. It says
+        // nothing about visibility — confining a VISIBLE pointer to a window's client area
+        // is its commonest use — so it feeds the same intent as ShowCursor and Pointer Lock
+        // is the transport either way (the canvas draws no host pointer of its own).
+        // The rect also arms the host's own confinement, which is what the guest sees while
+        // the lock is not held; the worker only sends one when it actually confines.
+        const clipped = event.data?.clip === true;
+        const rect = clipped ? (event.data?.rect ?? null) : null;
+        hostPointerTrackRef.current.setConfine(rect);
+        relativeIntent.set("clipped", clipped);
         updatePointerLockIntent();
       }
       if (event.data?.type === "mouse_capture") {
@@ -1600,6 +1643,8 @@ export default function App() {
         assertVirtualPad();
         inputDevice.commit({ immediate: true });
         relativeIntent.reset();
+        hostPointerTrackRef.current.lose();
+        hostPointerTrackRef.current.setConfine(null);
         updatePointerLockIntent();
       }
       if (event.data?.type === "set_cursor_pos") {
@@ -1617,7 +1662,7 @@ export default function App() {
       }
       if (event.data?.type === "show_message_box") {
         const { id, text, caption, uType } = event.data;
-        const targetWorker = event.target as Worker;
+        const targetWorker = worker instanceof SessionWorker ? worker.replyTarget(event) : event.target as Worker;
         const isDevMode = new URLSearchParams(window.location.search).get("game") === "dev";
         const typeMask = (Number(uType) || 0) & 0xf;
         // Harness auto-modal: consult the single resolver. If it returns a
@@ -1713,7 +1758,11 @@ export default function App() {
 
     worker.onerror = (event: ErrorEvent) => {
       setWorkerStatus("error");
-      setErrorMessage(event.message);
+      setErrorMessage(event.message || "Worker error");
+      // Same teardown as the worker's own `error` message: leave the launch overlay up
+      // and the error dialog sits behind a screen that still says the game is starting.
+      setLoadingProgress(null);
+      setIsLoadingApp(false);
     };
 
     // 4. Initialize Offscreen Control (only once)
@@ -1824,6 +1873,9 @@ export default function App() {
         inputDevice.setButtonsMask(event.buttons, "hw-mouse");
         inputDevice.commit();
         recordSample(inputView, 0, 0, event.movementX, event.movementY);
+        // The lock supplies motion directly; nothing here tracks an absolute host
+        // position, so releasing it must re-seat rather than resume an old one.
+        hostPointerTrackRef.current.lose();
         return;
       }
 
@@ -1835,6 +1887,7 @@ export default function App() {
         event.clientY >= rect.top &&
         event.clientY <= rect.bottom;
       if (!insideCanvas && !hasCaptured) {
+        hostPointerTrackRef.current.lose();
         if (isCanvasHoveredRef.current) {
           handlePointerLeave(event);
         }
@@ -1846,7 +1899,13 @@ export default function App() {
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
       const guest = clientToGuestPoint(rect, event.clientX, event.clientY, width, height);
-      inputDevice.setPointerAbsolute(guest.x, guest.y);
+      // SetCursorPos moved the guest's pointer and the physical one did not follow, so
+      // the host position is stale by that warp — apply what it MOVED (see
+      // HostPointerTrack). Identical to publishing `guest` while nothing has warped.
+      const target = hostPointerTrackRef.current.next(
+        guest, inputDevice.getCursor(), { x: width, y: height },
+      );
+      inputDevice.setPointerAbsolute(target.x, target.y);
       inputDevice.setButtonsMask(event.buttons, "hw-mouse");
       const dinputDX = Math.round(event.movementX * scaleX);
       const dinputDY = Math.round(event.movementY * scaleY);
@@ -1876,6 +1935,7 @@ export default function App() {
       if (event && canvas.hasPointerCapture(event.pointerId)) return;
 
       isCanvasHoveredRef.current = false;
+      hostPointerTrackRef.current.lose();
       syncCursorPresence();
       const inputView = globalInputView;
       if (!inputView) return;
@@ -2046,10 +2106,13 @@ export default function App() {
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
       inputDevice.setPointerBounds(width, height);
-      inputDevice.setPointerAbsolute(
-        (event.clientX - rect.left) * scaleX,
-        (event.clientY - rect.top) * scaleY,
+      // Same host pointer as writePointer's, so the same track: a wheel notch must not
+      // republish a stale absolute position over a pointer the guest has warped.
+      const wheelTarget = hostPointerTrackRef.current.next(
+        { x: (event.clientX - rect.left) * scaleX, y: (event.clientY - rect.top) * scaleY },
+        inputDevice.getCursor(), { x: width, y: height },
       );
+      inputDevice.setPointerAbsolute(wheelTarget.x, wheelTarget.y);
       // Normalize deltaY to CSS pixel equivalent regardless of deltaMode:
       //   DOM_DELTA_PIXEL (0): use as-is (~100px per notch → InputManager * 1.2 ≈ 120 WHEEL_DELTA)
       //   DOM_DELTA_LINE  (1): ~33px per line; 3 lines/notch → 99px → * 1.2 ≈ 120
@@ -2148,6 +2211,8 @@ export default function App() {
       rotateLogFile(bundleLogName(path) + "-hle");
       setIsLoadingApp(true);
       setErrorMessage(null);
+      setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+      exitInfoRef.current = null;
       setBundleDisplayName(null);
       canvasRef.current?.focus();
       const lower = path.toLowerCase();
@@ -2171,6 +2236,7 @@ export default function App() {
       setIsLoadingApp(true);
       setErrorMessage(null); // Clear any previous errors
       setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+      exitInfoRef.current = null;
       setBundleDisplayName(null);
       document.title = "BottleShip";
       // Drop the previous PE's favicon until the next window_icon arrives.
@@ -2500,6 +2566,7 @@ export default function App() {
       // requesting lock against a stale canvasRef after unmount/remount.
       disarmPointerLockGesture();
       guestCursor.dispose();
+      childSurface.dispose();
       // Keep loadApp exposed for buttons
     };
     // Deps are mount-stable only. Pause/load/worker-ready are read via refs
@@ -2788,6 +2855,7 @@ export default function App() {
     setIsLoadingApp(true);
     setErrorMessage(null);
     setExitInfo(null);
+    exitInfoRef.current = null;
     setBundleDisplayName(null);
     audioEngine?.stopAll();
     setLoadingProgress({ phase: "loading", percent: 0, label: "" });

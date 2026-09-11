@@ -28,7 +28,7 @@ export interface MessageBoxRequest {
   text: string;
   caption: string;
   typeMask: number;
-  worker: Worker;
+  worker: Worker | MessagePort;
 }
 
 interface MessageBoxModalProps {

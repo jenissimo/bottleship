@@ -92,6 +92,17 @@ export class WebGPUBackend implements RenderBackend {
         this.createDeviceResources();
     }
 
+    /** Replace only the presentation surface: textures, pipelines and guest state survive. */
+    attachCanvas(canvas: OffscreenCanvas): void {
+        const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
+        if (!context || !this.device) throw new Error('Cannot attach child display without a WebGPU context/device');
+        this.context?.unconfigure();
+        this.context = context;
+        this.configureContext();
+        this.screenMirror?.destroy();
+        this.screenMirror = null;
+    }
+
     /** requestAdapter + requestDevice. Throws with the reason a caller can act on. */
     private async requestDevice(): Promise<GPUDevice> {
         const adapter = await navigator.gpu.requestAdapter();
