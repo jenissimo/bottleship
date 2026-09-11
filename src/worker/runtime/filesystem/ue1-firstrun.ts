@@ -63,6 +63,61 @@ export function isUe1RenderProbeCommandLine(commandLine: string): boolean {
         || /(?:^|\s)-b\s+false(?:\s|$)/i.test(commandLine);
 }
 
+/** The render-device class a `testrendev=<Class>` probe is asking about, or null. */
+export function parseUe1RenderProbeDevice(commandLine: string): string | null {
+    const m = commandLine.match(/(?:^|\s)testrendev\s*=\s*("[^"]*"|[^\s"]+)/i);
+    if (!m) return null;
+    const device = m[1].replace(/^"|"$/g, "").trim();
+    return device.length > 0 ? device : null;
+}
+
+/**
+ * URenderDevice::DescFlags bits (Engine/Inc/UnRenDev.h).
+ *
+ * The probe child writes Incompatible BEFORE calling Init, so a driver that faults
+ * during init stays excluded; a device whose Init succeeds ORs in Certified. The
+ * first-run wizard shows a class when its Autodetect DLL exists, when DescFlags
+ * carries Certified, or when it is the built-in software renderer — so this value IS
+ * the probe's whole observable effect on the device list (the Detected.ini the parent
+ * polls for is an empty completion marker, nothing more).
+ */
+export const RDDESCF_CERTIFIED = 1;
+export const RDDESCF_INCOMPATIBLE = 2;
+
+/**
+ * Write `DescFlags=<flags>` into `[<deviceClass>]` (pure, idempotent), creating the
+ * section if the config has none. Every other line is preserved verbatim, and the
+ * source's line ending is kept — same contract as pinUe1RenderDevice.
+ */
+export function setUe1RenderDeviceDescFlags(iniText: string, deviceClass: string, flags: number): string {
+    const eol = iniText.includes("\r\n") ? "\r\n" : "\n";
+    const wantedHeader = deviceClass.trim().toLowerCase();
+    const line = `DescFlags=${flags}`;
+
+    const sections = parseIniSections(iniText);
+    const idx = sections.findIndex((s) => {
+        const m = s.header?.match(/^\s*\[(.+?)\]\s*$/);
+        return m ? m[1].trim().toLowerCase() === wantedHeader : false;
+    });
+
+    if (idx === -1) {
+        sections.push({ header: `[${deviceClass}]`, lines: [line] });
+        return serializeIniSections(sections, eol);
+    }
+
+    const section = sections[idx];
+    for (let i = 0; i < section.lines.length; i++) {
+        if (keyOfLine(section.lines[i])?.toLowerCase() !== "descflags") continue;
+        if (section.lines[i] === line) return iniText;
+        section.lines[i] = line;
+        return serializeIniSections(sections, eol);
+    }
+    let insertAt = section.lines.length;
+    while (insertAt > 0 && section.lines[insertAt - 1].trim() === "") insertAt--;
+    section.lines.splice(insertAt, 0, line);
+    return serializeIniSections(sections, eol);
+}
+
 /**
  * Reactive-handler classification of a requested filename (pure).
  *  - "detected": basename is Detected.ini / Detected.log — materialize empty,

@@ -17,6 +17,10 @@ import {
     pinUeEngineIni,
     classifyUe1FirstRunFile,
     isUe1RenderProbeCommandLine,
+    parseUe1RenderProbeDevice,
+    setUe1RenderDeviceDescFlags,
+    RDDESCF_CERTIFIED,
+    RDDESCF_INCOMPATIBLE,
     dirOfWindowsPath,
     baseOfWindowsPath,
     UE1_RENDER_DEVICE,
@@ -309,5 +313,44 @@ describe("pinUeEngineIni on an empty config — the short-read trap", () => {
         expect(pinned).toContain("Paths=..\System\*.u");
         expect(pinned).toContain(`GameRenderDevice=${UE1_RENDER_DEVICE}`);
         expect(pinned).not.toContain("SoftDrv.SoftwareRenderDevice");
+    });
+});
+
+describe("render probe result", () => {
+    const CRLF = "\r\n";
+    const CMD = "testrendev=D3DDrv.D3DRenderDevice log=Detected.log";
+
+    test("parses the probed class, quoted or bare", () => {
+        expect(parseUe1RenderProbeDevice(CMD)).toBe(UE1_RENDER_DEVICE);
+        expect(parseUe1RenderProbeDevice('TESTRENDEV="GlideDrv.GlideRenderDevice"'))
+            .toBe("GlideDrv.GlideRenderDevice");
+        expect(parseUe1RenderProbeDevice("-b false")).toBeNull();
+        expect(parseUe1RenderProbeDevice("testrendev=")).toBeNull();
+    });
+
+    test("DescFlags lands in the device's own section, preserving the rest", () => {
+        const ini = [
+            "[Engine.Engine]",
+            "GameRenderDevice=SoftDrv.SoftwareRenderDevice",
+            "",
+            "[D3DDrv.D3DRenderDevice]",
+            "Translucency=True",
+        ].join(CRLF);
+        const out = setUe1RenderDeviceDescFlags(ini, UE1_RENDER_DEVICE, RDDESCF_CERTIFIED);
+        expect(out).toContain(["[D3DDrv.D3DRenderDevice]", "Translucency=True", "DescFlags=1"].join(CRLF));
+        expect(out).toContain("GameRenderDevice=SoftDrv.SoftwareRenderDevice");
+        // Idempotent, and a later probe result replaces rather than duplicates the key.
+        expect(setUe1RenderDeviceDescFlags(out, UE1_RENDER_DEVICE, RDDESCF_CERTIFIED)).toBe(out);
+        const failed = setUe1RenderDeviceDescFlags(out, UE1_RENDER_DEVICE, RDDESCF_INCOMPATIBLE);
+        expect(failed).toContain("DescFlags=2");
+        expect(failed.match(/DescFlags=/g)!.length).toBe(1);
+    });
+
+    test("a config with no section for the device grows one", () => {
+        const out = setUe1RenderDeviceDescFlags(
+            "[Engine.Engine]\nFoo=1\n", "OpenGLDrv.OpenGLRenderDevice", RDDESCF_INCOMPATIBLE);
+        expect(out).toContain("[OpenGLDrv.OpenGLRenderDevice]");
+        expect(out).toContain("DescFlags=2");
+        expect(out).toContain("Foo=1");
     });
 });

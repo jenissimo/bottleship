@@ -366,6 +366,11 @@ export class EmulatorConfig {
     // reactively the first time Detected.ini/Detected.log is opened. null until learned.
     public ue1UserDir: string | null = null;
 
+    // The engine's active config (`System\<exe>.ini`) — the file UE1's GConfig writes
+    // when a caller passes no filename. The virtual render probe patches DescFlags
+    // there, so it must be the same path applyUe1FirstRunSetup pins.
+    public ue1ConfigIni: string | null = null;
+
     // VFS paths to delete from CoW overlay on every boot
     public deleteOnBoot: string[] = [];
 
@@ -414,6 +419,15 @@ export class EmulatorConfig {
             EmulatorConfig.instance = new EmulatorConfig();
         }
         return EmulatorConfig.instance;
+    }
+
+    /** Process creation inherits configuration, without replaying any boot file mutations. */
+    snapshotForChild(): Record<string, unknown> { return structuredClone({ ...this }) as unknown as Record<string, unknown>; }
+    restoreForChild(snapshot: Record<string, unknown>): void {
+        const fields = this as unknown as Record<string, unknown>;
+        for (const key of Object.keys(this)) {
+            if (Object.hasOwn(snapshot, key)) fields[key] = structuredClone(snapshot[key]);
+        }
     }
 
     /**
@@ -698,6 +712,7 @@ export class EmulatorConfig {
         this.createDirs = [];
         this.ue1 = false;
         this.ue1UserDir = null;
+        this.ue1ConfigIni = null;
         // Manifest-only when present: without this, a CP1251/non-US title leaves its
         // ACP/OEMCP/LCID for the next Western title that omits those fields.
         this.ansiCodePage = 1252;

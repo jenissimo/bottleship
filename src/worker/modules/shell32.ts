@@ -11,9 +11,11 @@ import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { invalidateIniCache } from "./kernel32/profile";
-import { readAnsiFromGuest, encodeAnsi } from "./codepage-utils";
+import { readAnsiFromGuest, readWideFromGuest, encodeAnsi } from "./codepage-utils";
 import { isUe1RenderProbeCommandLine } from "../runtime/filesystem/ue1-firstrun";
+import { applyUe1RenderProbeResult } from "./kernel32/ue1-render-probe";
 import { Marshaler } from "../core/memory/marshaler";
+import { performShFileOperation, DE_INVALIDFILES } from "./shell32-fileop";
 import {
     countPeIcons,
     loadIconFromPeByIndex,
@@ -32,6 +34,51 @@ import {
  * keeps a narrow UE1 `-b false` no-op child fallback because some builds do not
  * tolerate a hard failure on that probe.
  */
+/**
+ * SHFILEOPSTRUCTA/W field offsets. shellapi.h wraps the whole header in
+ * `#include <pshpack1.h>`, so this struct is PACKED: fAnyOperationsAborted sits at 18,
+ * UNALIGNED, and reading it at the naturally-aligned 20 would take the top half of
+ * fFlags plus two bytes of the BOOL — the caller then sees "aborted" written into its
+ * flags. Same table for A and W: only the strings the pointers name differ.
+ */
+export const SHFILEOPSTRUCT_OFFSETS = {
+    hwnd: 0,
+    wFunc: 4,
+    pFrom: 8,
+    pTo: 12,
+    fFlags: 16,
+    fAnyOperationsAborted: 18,
+    hNameMappings: 22,
+    lpszProgressTitle: 26,
+};
+
+/**
+ * A double-NUL-terminated path LIST. A caller may also pass a plain NUL-terminated path
+ * (the shell accepts both), which is the same thing read one element deep.
+ */
+function readPathList(mem: Uint8Array, ptr: number, wide: boolean): string[] {
+    if (!ptr) return [];
+    const out: string[] = [];
+    let at = ptr >>> 0;
+    const MAX_ENTRIES = 4096;
+    for (let n = 0; n < MAX_ENTRIES; n++) {
+        const text = wide ? readWideFromGuest(mem, at) : readAnsiFromGuest(mem, at);
+        if (text.length === 0) break;
+        out.push(text);
+        // Advance past this element's own NUL, in the units the list is stored in.
+        if (wide) {
+            let i = 0;
+            while (i < 32768 && (mem[at + i * 2] !== 0 || mem[at + i * 2 + 1] !== 0)) i++;
+            at += (i + 1) * 2;
+        } else {
+            let i = 0;
+            while (i < 32768 && mem[at + i] !== 0) i++;
+            at += i + 1;
+        }
+    }
+    return out;
+}
+
 export function hasShellExecFakeMatch(commandLine: string): boolean {
     return EmulatorConfig.getInstance().shellExecFake.some(rule => commandLine.includes(rule.match));
 }
@@ -274,6 +321,7 @@ export class Shell32 implements IModule {
             // launching anything. Claiming success here is the same honesty rule as below —
             // the artifact the parent goes on to read does exist.
             if (!launched && isUe1RenderProbeCommandLine(parameters)) {
+                await applyUe1RenderProbeResult(parameters);
                 System.getInstance().scheduler.setLastError(0);
                 Logger.log(
                     LogCategory.SYSTEM,
@@ -692,6 +740,49 @@ export class Shell32 implements IModule {
             Mem.writeUint32(ppszPath, buf >>> 0);
             return 0; // S_OK
         };
+
+        /**
+         * int SHFileOperationA/W(LPSHFILEOPSTRUCT lpFileOp)
+         *
+         * The real bulk copy/move/delete, not an acknowledgement. A title's first run
+         * seeds its writable state through this call; answering 0 without moving bytes
+         * leaves a game that boots, renders, and silently saves nothing — with no
+         * failure anywhere near the cause.
+         */
+        const fileOperation = async (mem: Uint8Array, lpFileOp: number, wide: boolean): Promise<number> => {
+            const name = wide ? "SHFileOperationW" : "SHFileOperationA";
+            if (!lpFileOp) {
+                Logger.warn(LogCategory.SYSTEM, `${name}: NULL SHFILEOPSTRUCT`);
+                return DE_INVALIDFILES;
+            }
+            const o = SHFILEOPSTRUCT_OFFSETS;
+            const wFunc = Mem.readUint32(lpFileOp + o.wFunc);
+            const pFrom = Mem.readUint32(lpFileOp + o.pFrom);
+            const pTo = Mem.readUint32(lpFileOp + o.pTo);
+            const fFlags = Mem.readUint16(lpFileOp + o.fFlags);
+            if (wFunc === null || pFrom === null || pTo === null || fFlags === null) {
+                Logger.warn(LogCategory.SYSTEM, `${name}: unreadable SHFILEOPSTRUCT at 0x${lpFileOp.toString(16)}`);
+                return DE_INVALIDFILES;
+            }
+
+            const from = readPathList(mem, pFrom, wide);
+            const to = readPathList(mem, pTo, wide);
+            Logger.log(LogCategory.SYSTEM,
+                `${name}(wFunc=${wFunc}, flags=0x${fFlags.toString(16)}, from=[${from.join("; ")}], to=[${to.join("; ")}])`);
+
+            const outcome = await performShFileOperation({ wFunc, from, to, flags: fFlags });
+            // fAnyOperationsAborted is the caller's own "did everything happen" check, and
+            // it lives at an UNALIGNED offset — see SHFILEOPSTRUCT_OFFSETS.
+            Mem.writeUint32(lpFileOp + o.fAnyOperationsAborted, outcome.aborted ? 1 : 0);
+            // FOF_WANTMAPPINGHANDLE is not honoured: we never rename on collision, so
+            // there is no name map to hand back and the field stays as the caller left it.
+            Logger.log(LogCategory.SYSTEM,
+                `${name} -> 0x${outcome.result.toString(16)} (${outcome.filesTouched} file(s), aborted=${outcome.aborted})`);
+            return outcome.result;
+        };
+
+        this.exports["SHFileOperationA"] = (ctx, mem, args) => fileOperation(mem, args[0] >>> 0, false);
+        this.exports["SHFileOperationW"] = (ctx, mem, args) => fileOperation(mem, args[0] >>> 0, true);
 
         // SHAppBarMessage - taskbar/appbar notifications (not modeled in HLE).
         this.exports["SHAppBarMessage"] = () => 0;
