@@ -77,13 +77,23 @@ const candAbi = typeof ex.bs_oracle_abi === "function" ? ex.bs_oracle_abi() >>> 
 if (typeof ex.bs_set_capture === "function") ex.bs_set_capture(L.STATE, L.STACK_TOP);
 
 let faultApplied = null;
+// The image extent is the CASE's, not a constant: a case whose data lives above the historical
+// IMAGE_END would otherwise be written into a DataView too small to hold it, and `writeDataImage`
+// would skip its block entirely — leaving this arm running over a different image than the v86
+// arm while both claim to share one source of truth.
+const imageEnd = c.imageEnd ?? L.IMAGE_END;
 function loadImage() {
-    new Uint8Array(mem.buffer, base, L.IMAGE_END).fill(0);
-    L.writeDataImage(new DataView(mem.buffer, base, L.IMAGE_END), 0);
+    if (base + imageEnd > mem.buffer.byteLength) {
+        console.error(`candidate memory holds ${mem.buffer.byteLength - base} bytes at base `
+            + `0x${base.toString(16)}; case ${c.id} needs 0x${imageEnd.toString(16)}`);
+        process.exit(2);
+    }
+    new Uint8Array(mem.buffer, base, imageEnd).fill(0);
+    L.writeDataImage(new DataView(mem.buffer, base, imageEnd), 0, imageEnd);
     if (args.fault) {
         const f = c.faults?.[args.fault];
         if (!f) { console.error(`case ${c.id} has no fault "${args.fault}"`); process.exit(2); }
-        faultApplied = { name: args.fault, detail: f(new DataView(mem.buffer, base, L.IMAGE_END), 0) };
+        faultApplied = { name: args.fault, detail: f(new DataView(mem.buffer, base, imageEnd), 0) };
     }
 }
 

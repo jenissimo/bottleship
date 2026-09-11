@@ -1,0 +1,10 @@
+<!doctype html><meta charset="utf-8"><title>NFSU AOT paired probe</title>
+<style>body{font:16px system-ui;background:#15202b;color:#e6edf3;margin:20px}button{padding:10px;margin:4px}iframe{width:1100px;height:850px}pre{white-space:pre-wrap}</style>
+<h1>NFSU saved AOT: live comparison</h1>
+<p>Diagnostic same-session comparison. The saved OPFS cache stays unchanged.</p>
+<button id="load-game">Load saved NFSU</button><button id="run-game">Run A/C probe in current scene</button>
+<button data-vk="13">Game Enter</button><button data-vk="27">Game Escape</button>
+<button data-vk="38">Game Up</button><button data-vk="40">Game Down</button>
+<button id="start" hidden></button><button id="direct" hidden></button>
+<div id="status">Ready</div><pre id="output"></pre><div id="guest"></div>
+<script type="module" src="./game-aot-paired.mjs"></script>

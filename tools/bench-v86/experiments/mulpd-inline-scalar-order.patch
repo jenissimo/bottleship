@@ -1,0 +1,33 @@
+diff --git a/src/rust/jit_instructions.rs b/src/rust/jit_instructions.rs
+--- a/src/rust/jit_instructions.rs
++++ b/src/rust/jit_instructions.rs
+@@ -6498,9 +6498,27 @@
+ pub fn instr_660F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+-    sse_read128_xmm_mem(ctx, "instr_660F59", modrm_byte, r);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    let src = global_pointers::sse_scratch_register as u32;
++    // Complete the full faulting read before modifying either destination lane.
++    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, src);
++    mulpd_inline(ctx, src, global_pointers::get_reg_xmm_offset(r));
+ }
+ pub fn instr_660F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+-    sse_read128_xmm_xmm(ctx, "instr_660F59", r1, r2);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    mulpd_inline(ctx, global_pointers::get_reg_xmm_offset(r1), global_pointers::get_reg_xmm_offset(r2));
+ }
++fn mulpd_inline(ctx: &mut JitContext, src: u32, dst: u32) {
++    // Match the compiled helper's destination * source operand order. Each lane reads
++    // both operands before its store, including the r1 == r2 case.
++    for lane in [0, 8] {
++        ctx.builder.const_i32((dst + lane) as i32);
++        ctx.builder.const_i32((dst + lane) as i32);
++        ctx.builder.load_aligned_f64(0);
++        ctx.builder.const_i32((src + lane) as i32);
++        ctx.builder.load_aligned_f64(0);
++        ctx.builder.mul_f64();
++        ctx.builder.store_aligned_f64(0);
++    }
++}
+ pub fn instr_F20F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+     sse_read64_xmm_mem(ctx, "instr_F20F59", modrm_byte, r);
+ }

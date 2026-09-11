@@ -162,6 +162,13 @@ export const CASES = {
             // architectural edx at the capture point (setne dl of that very word).
             "src-last": flipWord(L.SRC1 + (L.COUNT - 1) * 4),
         },
+        // Pages an MMU scenario (corpus/mmu.mjs) may revoke. `code` is the wrapper page, so a
+        // scenario can make the FETCH fault rather than a data access.
+        mmuTargets: { src: L.SRC1, dst: L.DST3, code: L.K3_ADDR, dstNext: (L.DST3 & ~0xfff) + 0x1000 },
+        // How far the destination actually reaches, so a scenario about the NEXT page can tell
+        // "did not fault" from "could never have faulted at this element count".
+        mmuSpanBytes: { dst: () => L.COUNT * 4 },
+        mmuCursor: "ecx",
         raw: { fn: "run_k3", args: (outer, mode) => [outer, mode, L.DST3, (L.SRC1 - L.DST3) >>> 0, L.COUNT] },
         provenance: { va: KERNELS.k3.va, sha256: KERNELS.k3.sha256, from: "NFSU Speed.exe" },
     },
@@ -200,6 +207,8 @@ export const CASES = {
             // Feeds the very first inner-loop read; changes DST4's first element.
             "src-first": flipWord(L.SRC1),
         },
+        mmuTargets: { src: L.SRC1, dst: L.DST4, code: L.K4_ADDR, frame: L.FRAME3, dstNext: (L.DST4 & ~0xfff) + 0x1000 },
+        mmuSpanBytes: { dst: () => L.K4_OUTER * L.K4_MID * L.K4_INNER * 4 },
         raw: { fn: "run_k4", args: (outer, mode) => [outer, mode, L.FRAME3] },
         provenance: { va: KERNELS.k4.va, sha256: KERNELS.k4.sha256, from: "NFSU Speed.exe" },
     },
@@ -239,6 +248,8 @@ export const CASES = {
             // An early NUL: changes the bitmap AND esi/eax/ecx/edx at the capture point.
             "src-term": setByte(L.STR5 + 48, 0),
         },
+        mmuTargets: { src: L.STR5, dst: L.K5_BITMAP, code: L.K5_ADDR, dstNext: (L.K5_BITMAP & ~0xfff) + 0x1000 },
+        mmuSpanBytes: { dst: () => 32 },
         raw: { fn: "run_k5", args: (outer, mode) => [outer, mode, L.STR5, L.FRAME5] },
         provenance: { va: KERNELS.k5.va, sha256: KERNELS.k5.sha256, from: "NFSU Speed.exe" },
     },
@@ -313,6 +324,65 @@ export const CASES = {
         },
         raw: null,
         provenance: { va: null, sha256: null, from: "synthetic (hand-assembled, corpus/cases.mjs)" },
+    },
+
+    // K8 — the case chosen by MEASURED CPU-TIME, not by instruction shape.
+    //
+    // A count-weighted census covering 73.4% of retired guest work during a real NFSU race
+    // attributed 10.03% of ALL guest instructions to this one function, while k3/k4/k5 measured
+    // 0.00% in that scene. It is the whole function, prologue to `ret`, so the compared regions
+    // include its own frame: the eight-times-per-row reload of `src`/`dst`/`bias` out of that
+    // frame is the redundant obligation the plan's candidate mechanisms exist to remove, and a
+    // pass that eliminates a reload must still leave the frame exactly as the guest left it.
+    k8: {
+        id: "k8",
+        body: KERNELS.k8.bytes,
+        codeAddr: L.K8_ADDR,
+        insPerIter: KERNELS.k8.insPerIter,
+        insStatic: KERNELS.k8.insStatic,
+        iters: L.K8_ROWS,
+        // Exact, because this body carries its own prologue, loop guard and epilogue:
+        //     5  prologue plus the initial jmp into the loop test
+        //    57  row 0 (test 2 + body 48 + advance 7; the increment block is skipped)
+        //   420  rows 1..7 at 60 each (increment 3 + test 2 + body 48 + advance 7)
+        //     5  the final increment and the test that fails
+        //     3  epilogue (mov esp,ebp / pop ebp / ret)
+        insPerCall: 5 + 57 + 7 * 60 + 5 + 3,
+        imageEnd: L.K8_IMAGE_END,
+        calls: [
+            {
+                off: 0,
+                // The real call site is cdecl with four stack arguments; the body includes its
+                // own `push ebp; mov ebp,esp`, so it reads them off the stack. `stackArgs` makes
+                // the wrapper build that frame for real (see buildImage) rather than pretending
+                // registers can stand in for it.
+                prologue: [],
+                stackArgs: [L.K8_SRC, L.K8_SRC_STRIDE, L.K8_DST, L.K8_BIAS],
+            },
+        ],
+        regions: [
+            { name: "K8_DST", addr: L.K8_DST, len: L.K8_ROWS * L.K8_ROW_DST_STRIDE },
+            // The function ADVANCES its own arguments in place (src += stride, dst += 0x40).
+            // Those slots live on the driver's stack, which the wrapper pops on return, so they
+            // are not a stable compared region; STATE plus the destination carry the outcome.
+            STATE_REGION,
+        ],
+        faults: {
+            // The last byte the last row reads: changes exactly one output dword, and nothing
+            // else, so a candidate that drops the final store cannot hide behind another change.
+            "src-last": setByte(L.K8_SRC + (L.K8_ROWS - 1) * L.K8_SRC_STRIDE + (L.K8_COLS - 1), 0xA5),
+        },
+        mmuTargets: { src: L.K8_SRC, dst: L.K8_DST, code: L.K8_ADDR,
+            dstNext: (L.K8_DST & ~0xfff) + 0x1000 },
+        mmuSpanBytes: { dst: () => L.K8_ROWS * L.K8_ROW_DST_STRIDE },
+        mmuCursor: null,
+        // No `raw` descriptor: k8 takes its arguments on the stack and has no static frame, so
+        // there is nothing for a foreign module's flat argument list to point at. A raw candidate
+        // for this case needs an ABI decision first; inventing one here would hand `run-raw` an
+        // `undefined` argument and let it report a divergence that is ours, not the candidate's.
+        provenance: { va: KERNELS.k8.va, sha256: KERNELS.k8.sha256, from: "NFSU Speed.exe",
+            selected_by: "measured count-weighted CPU-time share (10.03% of retired guest work, "
+                + "in-race NFSU, tools/aot/opt/capture-attribution.harness.ts 2026-09-05)" },
     },
 };
 

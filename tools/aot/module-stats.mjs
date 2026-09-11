@@ -123,7 +123,7 @@ export function moduleStats(bytes, label = "") {
     // immediate whose length we got wrong desynchronises the stream and lands somewhere else.
     // That is the closest thing to a second decoder available without a wabt dependency.
     for (const ins of walkBody(bytes, instrStart, instrEnd)) {
-        const known = OPS.get(ins.op);
+        const known = ins.op===0xfd ? [ins.imm.subop===0?'v128.load':'v128.store','mem'] : OPS.get(ins.op);
         if (!known) {                                                          // self-check 4
             throw new Error(`${label}: unknown opcode 0x${ins.op.toString(16)} at +${ins.offset - instrStart}`
                 + " — a decode hole mis-attributes every byte after it");

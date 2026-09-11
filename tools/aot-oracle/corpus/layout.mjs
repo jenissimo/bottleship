@@ -62,9 +62,62 @@ export const IN7       = DATA + 0x0A40;   // K7 inputs (NOT compared)
 // JIT_THRESHOLD = 200_000 (jit.rs:1254, cpu.rs:3284), so a three-instruction body is never
 // compiled at any plausible outer count and the case reports ARM_FAILED with an empty capture.
 export const K7_ITERS  = 64;
-export const DST3      = DATA + 0x4800;   // K3: COUNT * 4
-export const DST4      = DATA + 0x4900;   // K4: OUTER * MID * INNER * 4
-export const IMAGE_END = DATA + 0x5000;
+// DST3 holds 0x2000, enough for the largest supported count; the binding limit is SRC1's 0x1000
+// (1024 elements) and `assertCountFits` names whichever span a count exceeds. Spacing here is
+// load-bearing: an overlap between two count-scaled destinations is invisible in a run that
+// writes only one of them.
+// DST3 deliberately starts mid-page: a page-aligned destination can never cross into the page
+// after it at any legal count, which makes `pf-partial-dst` — the only scenario that faults with
+// stores already committed — permanently inapplicable.
+export const DST3      = DATA + 0x6800;   // K3: COUNT * 4, up to 0x2800
+export const DST4      = DATA + 0x9000;   // K4: OUTER * MID * INNER * 4
+export const IMAGE_END = DATA + 0xA000;
+
+// ── MMU conformance structures ────────────────────────────────────────────────
+// Present ONLY in an image built with an `mmu` scenario. A timing image is byte-identical
+// to the one a timing arm runs: a fault fixture must not become the thing a baseline is
+// measured on.
+//
+// v86's multiboot entry leaves `sreg[i] = 0xB002` with no GDT behind it ("OS isn't allowed to
+// reload without setting up a proper GDT", cpu.js), so an IDT gate has no selector to name
+// until we install one. The GDT installed here is deliberately flat base=0 limit=4GB for both
+// code and data, i.e. the same address arithmetic the multiboot fake describes, so IS_32 /
+// SS32 / CPL3 / FLAT_SEGS — v86's whole JIT cache key (state_flags.rs) — are unchanged.
+// Above every count-scaled span: DST3/DST4 grow with AOT_ORACLE_COUNT, so a structure placed
+// immediately after them is reachable by a large count, and a destination landing on the GDT
+// faults inside LGDT before any kernel runs. `assertNoMmuOverlap` makes that a build-time error.
+export const MMU_BASE     = DATA + 0x10000;
+export const GDT_ADDR     = MMU_BASE + 0x000;   // 3 descriptors: null, code32, data32
+export const GDTR_ADDR    = MMU_BASE + 0x040;   // 6-byte pseudo-descriptor
+export const IDTR_ADDR    = MMU_BASE + 0x048;   // 6-byte pseudo-descriptor
+export const FAULT        = MMU_BASE + 0x050;   // FAULT_FIELDS below
+export const SFAULT       = MMU_BASE + 0x080;   // register file at fault time (STATE layout)
+export const IDT_ADDR     = DATA + 0x11000;      // 256 gates * 8 bytes
+export const MMU_CODE     = DATA + 0x12000;      // the #PF handler
+export const MMU_IMAGE_END = DATA + 0x13000;
+
+export const GDT_CODE_SEL = 0x08;
+export const GDT_DATA_SEL = 0x10;
+
+/**
+ * What the #PF handler records. `taken` is written LAST and is the only witness that the
+ * handler ran at all: an all-zero record and "no fault happened" are otherwise the same bytes,
+ * and a fault oracle that cannot tell those apart proves nothing.
+ */
+export const FAULT_FIELDS = [
+    ["cr2", 0x00, 4], ["error_code", 0x04, 4], ["fault_eip", 0x08, 4],
+    ["fault_cs", 0x0c, 4], ["taken", 0x10, 4],
+];
+export const FAULT_LEN = 0x14;
+
+/** PTE index within PT0 (which maps 0..4MB) for a guest address. */
+export function pteIndex(addr) {
+    if (addr >>> 22) throw new Error(`0x${addr.toString(16)} is outside PT0's 0..4MB range`);
+    return (addr >>> 12) & 0x3ff;
+}
+/** Guest address of the PTE dword governing `addr`. */
+export function pteAddr(addr) { return PT0_ADDR + pteIndex(addr) * 4; }
+
 
 // K4 trip counts. Small on purpose: the case exists to exercise a CFG with three back edges
 // and five read-modify-write operands, not to be a long-running benchmark.
@@ -93,12 +146,19 @@ export const STATE_FIELDS = [
 ];
 export const STATE_LEN = 0x24;
 
-// Inner iterations per kernel call. Overridable from the environment so the FIXED per-call
-// cost (module entry/exit + the driver loop) can be separated from the per-iteration cost by
-// running two element counts and taking a slope — every arm reads these same constants, so
-// the comparison stays apples-to-apples.
-export const COUNT  = Number(process.env.AOT_ORACLE_COUNT || 64);   // K1 elements per call
-export const VCOUNT = Number(process.env.AOT_ORACLE_VCOUNT || 64);  // K2 vertices per call
+/**
+ * Inner iterations per kernel call. Overridable so the FIXED per-call cost (module entry/exit and
+ * the driver loop) can be separated from the per-iteration cost by running two element counts and
+ * taking a slope — every arm reads these same constants, so the comparison stays apples-to-apples.
+ *
+ * Read from the environment where there is one and from a global where there is not. This module
+ * is shared with the BROWSER arm, and `process` there is a `ReferenceError` that stops the whole
+ * page before anything reports why.
+ */
+const override = (name) => globalThis.process?.env?.[name] ?? globalThis[`__${name}__`];
+
+export const COUNT  = Number(override("AOT_ORACLE_COUNT") || 64);   // K1 elements per call
+export const VCOUNT = Number(override("AOT_ORACLE_VCOUNT") || 64);  // K2 vertices per call
 
 export const PORT = 0x310;  // marker port (unclaimed in v86's io map)
 
@@ -117,11 +177,56 @@ function lcg(seed) {
 }
 
 /**
+ * Every span that scales with the element counts, in layout order. A count is only legal when
+ * each of these still fits before the next allocation AND inside the image being built.
+ *
+ * The binding limit is not any single neighbour: the image itself ends at IMAGE_END, so a guard
+ * naming only SRC1-vs-DST1 permits counts that die later as an unlabelled RangeError from a
+ * DataView write.
+ */
+function countScaledSpans(src1Bytes) {
+    return [
+        ["SRC1", SRC1, src1Bytes, "DST1", DST1],
+        ["DST1", DST1, COUNT * 4, "SRC2", SRC2],
+        ["SRC2", SRC2, VCOUNT * 16, "DST2", DST2],
+        ["DST2", DST2, VCOUNT * 16, "DST3", DST3],
+        ["DST3", DST3, COUNT * 4, "DST4", DST4],
+    ];
+}
+
+/** Refuse an element count whose spans do not fit, naming the span and the bound it hit. */
+export function assertCountFits(imageEnd, src1Bytes = Math.max(0x400, COUNT * 4)) {
+    for (const [name, addr, len, nextName, nextAddr] of countScaledSpans(src1Bytes)) {
+        if (addr + len > nextAddr) {
+            throw new Error(
+                `AOT_ORACLE_COUNT=${COUNT} / AOT_ORACLE_VCOUNT=${VCOUNT}: ${name} needs `
+                + `0x${len.toString(16)} bytes at 0x${addr.toString(16)} and would run into `
+                + `${nextName} at 0x${nextAddr.toString(16)}. `
+                + `The tightest count-scaled gap is SRC1->DST1 (0x${(DST1 - SRC1).toString(16)} `
+                + `bytes, ${(DST1 - SRC1) / 4} elements).`);
+        }
+        if (addr + len > imageEnd) {
+            throw new Error(
+                `AOT_ORACLE_COUNT=${COUNT}: ${name} ends at 0x${(addr + len).toString(16)}, past the `
+                + `image end 0x${imageEnd.toString(16)}. A larger count needs a larger image, not a `
+                + "larger DataView.");
+        }
+    }
+}
+
+/**
  * Write the data section of the image (guest-physical addressed).
  * @param {DataView} dv view whose byte 0 corresponds to guest address `origin`
  * @param {number} origin guest address of dv byte 0
  */
-export function writeDataImage(dv, origin) {
+/**
+ * @param {DataView} dv view whose byte 0 is guest address `origin`
+ * @param {number} origin guest address of dv byte 0
+ * @param {number} [imageEnd] end of the image being built. Data that lives above it belongs to a
+ *   case whose image is larger; writing it into a smaller buffer throws, and skipping it silently
+ *   would leave that case reading zeros, so the boundary is explicit and checked.
+ */
+export function writeDataImage(dv, origin, imageEnd = IMAGE_END) {
     const w32 = (addr, v) => dv.setUint32(addr - origin, v >>> 0, true);
     const wf32 = (addr, v) => dv.setFloat32(addr - origin, v, true);
 
@@ -149,8 +254,14 @@ export function writeDataImage(dv, origin) {
     w32(FRAME1 - 8, 0);               // fild scratch slot
 
     // Source words: ~1/3 zero so `setne` alternates and the stored float varies.
+    //
+    // The fill covers the COUNT in use, not a fixed 0x400: K3/K4 read SRC1 with COUNT elements,
+    // and reading past the filled span gives every element the same zero, which sends the
+    // data-dependent branch one way and stops the kernel exercising what it was chosen for.
+    const src1Bytes = Math.max(0x400, COUNT * 4);
+    assertCountFits(imageEnd, src1Bytes);
     const rnd = lcg(0xC0FFEE);
-    for (let off = 0; off < 0x400; off += 4) {
+    for (let off = 0; off < src1Bytes; off += 4) {
         const r = rnd();
         w32(SRC1 + off, (r % 3 === 0) ? 0 : r);
     }
@@ -178,6 +289,19 @@ export function writeDataImage(dv, origin) {
         }
     }
     for (let i = 0; i < VCOUNT * 4; i++) w32(DST2 + i * 4, 0);
+
+    // ── K8 source ──────────────────────────────────────────────────────────
+    // Only for an image built large enough to contain it (see `imageEnd`).
+    if (imageEnd >= K8_IMAGE_END) {
+        // Distinct, non-zero bytes across the whole span the eight rows read, so every element
+        // of the output differs from its neighbours and a dropped or duplicated store shows.
+        for (let row = 0; row < K8_ROWS; row++) {
+            for (let col = 0; col < K8_COLS; col++) {
+                dv.setUint8(K8_SRC + row * K8_SRC_STRIDE + col - origin, (row * 37 + col * 11 + 1) & 0xff);
+            }
+        }
+        for (let i = 0; i < K8_ROWS * (K8_ROW_DST_STRIDE / 4); i++) w32(K8_DST + i * 4, 0);
+    }
 
     // ── K3 / K4 destinations ───────────────────────────────────────────────
     // Both read SRC1 (already filled above), so no new source data is needed — which also
@@ -211,3 +335,44 @@ export function writeDataImage(dv, origin) {
     // STATE+0 rather than passing quietly.
     for (let off = 0; off < STATE_LEN; off += 4) w32(STATE + off, 0);
 }
+
+/** Guest spans the MMU scenario structures own; nothing a case compares may overlap them. */
+export const MMU_SPANS = [
+    ["GDT/GDTR/IDTR/FAULT/SFAULT", MMU_BASE, IDT_ADDR - MMU_BASE],
+    ["IDT", IDT_ADDR, 0x800],
+    ["PF handler", MMU_CODE, 0x1000],
+];
+
+/**
+ * Fail loudly when a case's compared regions (which grow with AOT_ORACLE_COUNT) reach into the
+ * scenario structures. Silently overlapping them corrupts the descriptor tables and the guest
+ * faults during setup, which looks nothing like the scenario under test.
+ */
+export function assertNoMmuOverlap(regions) {
+    for (const r of regions) {
+        for (const [name, addr, len] of MMU_SPANS) {
+            if (r.addr < addr + len && addr < r.addr + r.len) {
+                throw new Error(
+                    `region ${r.name} (0x${r.addr.toString(16)}+0x${r.len.toString(16)}) overlaps the MMU `
+                    + `scenario span ${name} (0x${addr.toString(16)}+0x${len.toString(16)}). `
+                    + "Lower AOT_ORACLE_COUNT or move MMU_BASE.");
+            }
+        }
+    }
+}
+
+// ── K8 — the measured-hot kernel ──────────────────────────────────────────────
+// Placed ABOVE the MMU scenario structures rather than in the crowded low data area: DST3/DST4
+// grow with AOT_ORACLE_COUNT, and every future collision there is a silent one.
+export const K8_ADDR   = DATA + 0x14000;   // the wrapper + body, on its own page like a .text page
+export const K8_SRC    = DATA + 0x15000;   // byte source, read 8 per row for 8 rows
+export const K8_DST    = DATA + 0x16000;   // dword destination, 8 written per 0x40-byte row
+// The page after the destination stays EMPTY so `pf-partial-dst` has something to revoke that is
+// not also the code or the source; putting the next allocation there makes that scenario
+// unrunnable, which the applicability check would then (correctly) refuse.
+export const K8_IMAGE_END = DATA + 0x18000;
+export const K8_ROWS   = 8;                // the function's own hard-coded outer trip count
+export const K8_COLS   = 8;                // elements written per row
+export const K8_ROW_DST_STRIDE = 0x40;     // bytes; the function writes 8 dwords and skips 8
+export const K8_SRC_STRIDE = 16;           // arg1; chosen so rows read distinct source bytes
+export const K8_BIAS = 0x21;               // arg3; nonzero so the add is observable in the output

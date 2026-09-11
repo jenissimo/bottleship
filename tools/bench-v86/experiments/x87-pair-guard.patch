@@ -1,0 +1,105 @@
+diff --git a/src/rust/codegen.rs b/src/rust/codegen.rs
+index 8fb8fac..01c71c0 100644
+--- a/src/rust/codegen.rs
++++ b/src/rust/codegen.rs
+@@ -3549,7 +3549,7 @@ pub fn gen_x87_local_cache_free_all(ctx: &mut JitContext) {
+     }
+ }
+ 
+-fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
++fn gen_fpu_relaxed_repr_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
+     if let Some((_bits, valid)) = gen_x87_local_slot(ctx, i) {
+         ctx.builder.get_local(&valid);
+         // UNLIKELY, not LIKELY: the slot cache is invalidated almost as often as it is read
+@@ -3565,6 +3565,10 @@ fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
+     else {
+         gen_fpu_relaxed_tag_ok(ctx, addr);
+     }
++}
++
++fn gen_fpu_relaxed_st_ok(ctx: &mut JitContext, i: u32, addr: &WasmLocal) {
++    gen_fpu_relaxed_repr_ok(ctx, i, addr);
+     // …and the register must hold a value at all.
+     //
+     // Neither test above can tell: FFREE marks the register empty and leaves its sixteen bytes
+@@ -3594,6 +3598,25 @@ fn gen_fpu_relaxed_not_empty(ctx: &mut JitContext, addr: &WasmLocal) {
+     ctx.builder.eqz_i32();
+ }
+ 
++
++/// Both operands must have a relaxed representation AND be nonempty. Duplicate the
++/// physical empty byte so rotating TOP also handles ST(i) wrapping from register 7 to 0.
++/// This predicate reads state only; it must run before any stack mutation or helper.
++fn gen_fpu_relaxed_pair_ok(ctx: &mut JitContext, i: u32, st0: &WasmLocal, sti: &WasmLocal) {
++    gen_fpu_relaxed_repr_ok(ctx, 0, st0);
++    gen_fpu_relaxed_repr_ok(ctx, i, sti);
++    ctx.builder.and_i32();
++    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
++    ctx.builder.const_i32(0x101);
++    ctx.builder.mul_i32();
++    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
++    ctx.builder.shr_u_i32();
++    ctx.builder.const_i32((1 | (1u32 << i)) as i32);
++    ctx.builder.and_i32();
++    ctx.builder.eqz_i32();
++    ctx.builder.and_i32();
++}
++
+ fn gen_fpu_load_relaxed_st_bits(
+     ctx: &mut JitContext,
+     i: u32,
+@@ -4230,9 +4253,7 @@ pub fn gen_fpu_relaxed_binop_sti(
+     else {
+         gen_fpu_st_addr(ctx, sti)
+     };
+-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+-    gen_fpu_relaxed_st_ok(ctx, sti, &op_addr);
+-    ctx.builder.and_i32();
++    gen_fpu_relaxed_pair_ok(ctx, sti, &st0_addr, &op_addr);
+     ctx.builder.eqz_i32();
+     ctx.builder.if_void();
+     gen_fpu_relaxed_record_fallback(ctx);
+@@ -4726,9 +4747,7 @@ pub fn gen_fpu_relaxed_fcom_sti(
+ 
+     let st0_addr = gen_fpu_st_addr(ctx, 0);
+     let sti_addr = gen_fpu_st_addr(ctx, i);
+-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+-    gen_fpu_relaxed_st_ok(ctx, i, &sti_addr);
+-    ctx.builder.and_i32();
++    gen_fpu_relaxed_pair_ok(ctx, i, &st0_addr, &sti_addr);
+     ctx.builder.eqz_i32();
+     ctx.builder.if_void();
+     gen_fpu_relaxed_record_fallback(ctx);
+@@ -4814,9 +4833,7 @@ pub fn gen_fpu_relaxed_fucom_sti(
+ 
+     let st0_addr = gen_fpu_st_addr(ctx, 0);
+     let sti_addr = gen_fpu_st_addr(ctx, i);
+-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+-    gen_fpu_relaxed_st_ok(ctx, i, &sti_addr);
+-    ctx.builder.and_i32();
++    gen_fpu_relaxed_pair_ok(ctx, i, &st0_addr, &sti_addr);
+     ctx.builder.eqz_i32();
+     ctx.builder.if_void();
+     gen_fpu_relaxed_record_fallback(ctx);
+@@ -4843,9 +4860,7 @@ pub fn gen_fpu_relaxed_fucompp(ctx: &mut JitContext) {
+ 
+     let st0_addr = gen_fpu_st_addr(ctx, 0);
+     let st1_addr = gen_fpu_st_addr(ctx, 1);
+-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+-    gen_fpu_relaxed_st_ok(ctx, 1, &st1_addr);
+-    ctx.builder.and_i32();
++    gen_fpu_relaxed_pair_ok(ctx, 1, &st0_addr, &st1_addr);
+     ctx.builder.eqz_i32();
+     ctx.builder.if_void();
+     gen_fpu_relaxed_record_fallback(ctx);
+@@ -4872,9 +4887,7 @@ pub fn gen_fpu_relaxed_fcomi(ctx: &mut JitContext, i: u32, pop: bool, slow_helpe
+ 
+     let st0_addr = gen_fpu_st_addr(ctx, 0);
+     let sti_addr = gen_fpu_st_addr(ctx, i);
+-    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+-    gen_fpu_relaxed_st_ok(ctx, i, &sti_addr);
+-    ctx.builder.and_i32();
++    gen_fpu_relaxed_pair_ok(ctx, i, &st0_addr, &sti_addr);
+     ctx.builder.eqz_i32();
+     ctx.builder.if_void();
+     gen_fpu_relaxed_record_fallback(ctx);

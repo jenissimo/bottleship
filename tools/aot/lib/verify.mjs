@@ -9,7 +9,7 @@
 
 import fs from "node:fs";
 import { parseModule, walkBody, bodyStats } from "./wdis.mjs";
-import { G, reg32Offset, HELPERS_NONFAULTING } from "./abi.mjs";
+import { G, reg32Offset, HELPERS_NONFAULTING, FLAGS_ALL } from "./abi.mjs";
 
 const OP_END = 0x0b, OP_BR = 0x0c, OP_BR_IF = 0x0d, OP_BR_TABLE = 0x0e, OP_RETURN = 0x0f;
 const OP_CALL = 0x10, OP_I32CONST = 0x41, OP_I32STORE = 0x36, OP_LOCAL_GET = 0x20;
@@ -449,8 +449,37 @@ export function verifyUnit(bytes, unit, opts) {
             }
             return true;
         });
-        check("C14", unmodelled.length === 0 && flagsWrites.length > 0 && rebuilt.length === 0,
+        // The obligation is CONDITIONAL, and the contract's own model (C6/C7) is to discharge such
+        // an obligation by proving its condition false rather than by faking the obligation.
+        //
+        // A unit owes an authoritative `flags` write only when some bit is ever READ back out of
+        // that word — which happens exactly when a `flags_changed` it writes leaves an arithmetic
+        // bit unclaimed, so `get_eflags` takes that bit from `flags` instead of recomputing it.
+        // A unit whose every `flags_changed` claims all of FLAGS_ALL never has a bit read from
+        // `flags`, and requiring a write from it would demand a store that changes nothing.
+        //
+        // So: prove that premise, or owe the write. Both are mechanical, and neither weakens the
+        // real rule — every write that DOES happen must still be read-modify-write, because
+        // `flags` also holds DF (N106).
+        const changedWrites = stores.filter((i) => target(i) === G.flags_changed);
+        const constWritten = (i) => {
+            // The value is the top of the store's operand expression; a constant one is a plain
+            // `i32.const` immediately before the store.
+            const prev = body[i - 1];
+            return prev?.op === OP_I32CONST ? prev.imm : null;
+        };
+        const alwaysRecomputed = changedWrites.length > 0
+            && changedWrites.every((i) => {
+                const v = constWritten(i);
+                return v !== null && (v & FLAGS_ALL) === FLAGS_ALL;
+            });
+        const owesWrite = !alwaysRecomputed;
+        check("C14", unmodelled.length === 0 && rebuilt.length === 0
+            && (flagsWrites.length > 0 || !owesWrite),
             `${flagsWrites.length} authoritative flags writes, all read-modify-write`
+            + (flagsWrites.length === 0 && alwaysRecomputed
+                ? " (none owed: every flags_changed claims all arithmetic bits, so no bit is ever "
+                  + "read out of `flags`)" : "")
             + (rebuilt.length ? ` (${rebuilt.length} rebuild the word: +${rebuilt.map((s) => body[s].offset).join(",+")})` : "")
             + (unmodelled.length ? ` (unmodelled: ${unmodelled.join("; ")})` : ""));
     }

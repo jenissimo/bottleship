@@ -10,7 +10,13 @@
 //               export call).
 //
 //   node run-v86.mjs --case k1 [--outer N] [--warmup W] [--aot unit.json] [--capture out]
-//                    [--fault name] [--flags "5=0"] [--relaxed 0]
+//                    [--fault name] [--flags "5=0"] [--relaxed 0] [--one-call] [--mmu scenario]
+//
+// --fault and --mmu are different things and neither substitutes for the other. `--fault`
+// mutates INPUT BYTES (a negative control: does the oracle notice a changed result?).
+// `--mmu` changes the PAGE TABLES, so the guest takes a real #PF whose identity — CR2, error
+// code, faulting EIP, and which stores had already landed — is what a translator claiming to
+// skip per-access permission work has to reproduce.
 //
 // Prints ONE JSON object on stdout (the last line). Everything the oracle compares or gates
 // on is in it: the compared guest regions (bytes, not just hashes), the full architectural
@@ -22,19 +28,23 @@ import url from "node:url";
 import crypto from "node:crypto";
 import { buildImage } from "../corpus/image.mjs";
 import * as L from "../corpus/layout.mjs";
+import * as MMU from "../corpus/mmu.mjs";
 import { getCase } from "../corpus/cases.mjs";
 import { readV86State } from "../lib/state.mjs";
+import {
+    WASM_TABLE_OFFSET, WASM_TABLE_SIZE, PAGE_SIZE,
+    aotIdentity as sharedAotIdentity, applyRelocations, applyShape as sharedApplyShape,
+    aotLiveness as sharedAotLiveness, jitIdentity as sharedJitIdentity,
+    manifestMatchesLiveIdentity, publishUnit as sharedPublishUnit,
+} from "../lib/engine-unit.mjs";
 import { parseArgs, parseFlagOverrides, usageExit } from "../lib/args.mjs";
 import { findTlbDataBase, ORACLE_PROBE_PAGES } from "../../aot/lib/tlb-base.mjs";
 import { SHIPPING_JIT } from "../../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const REPO = path.resolve(__dirname, "../../..");
-const WASM_TABLE_OFFSET = 1024;   // vendor/v86/src/const.js
-const WASM_TABLE_SIZE = 900;      // vendor/v86/src/rust/jit.rs and src/const.js
-const PAGE_SIZE = 4096;
 
-const KNOWN = ["case", "outer", "warmup", "timeout", "aot", "capture", "fault", "flags", "relaxed"];
+const KNOWN = ["case", "outer", "warmup", "timeout", "aot", "capture", "fault", "flags", "relaxed", "one-call", "mmu"];
 let args;
 try { args = parseArgs(process.argv, KNOWN); } catch (e) { usageExit(e); }
 
@@ -69,7 +79,31 @@ for (const p of [libv86Path, wasmPath]) {
 }
 const { V86 } = await import(url.pathToFileURL(libv86Path).href);
 
-const image = buildImage(c, { warmup, n1, n2 });
+const oneCall = args["one-call"] === "1";
+let mmuPlan = null;
+if (args.mmu) {
+    const scenario = MMU.getScenario(args.mmu);
+    // Fail closed, and do it HERE: applicability depends on AOT_ORACLE_COUNT, which only this
+    // process knows. A scenario whose premise the case cannot satisfy would still fault — on a
+    // different access than the one it names — and that is a confidently wrong result, which is
+    // worse than no result.
+    const fit = MMU.applicability(c, scenario);
+    if (!fit.applicable) {
+        console.log(JSON.stringify({
+            arm: "reference", impl: "v86", case: c.id, status: "MMU_SCENARIO_INAPPLICABLE",
+            mmu: { scenario: scenario.id, applicable: false, reason: fit.reason },
+        }));
+        process.exit(4);
+    }
+    mmuPlan = {
+        scenario,
+        patches: MMU.resolvePatches(c, scenario),
+        touch: MMU.resolveTouch(c, scenario),
+        touchAfter: MMU.resolveTouch(c, scenario, "touch_after"),
+        touchWriteAfter: MMU.resolveTouch(c, scenario, "touch_write_after"),
+    };
+}
+const image = buildImage(c, { warmup, n1, n2, oneCall, mmu: mmuPlan });
 let faultApplied = null;
 if (args.fault) {
     const f = c.faults?.[args.fault];
@@ -107,97 +141,30 @@ const shaPage = (mem, addr) => sha256(Buffer.from(mem.subarray(addr, addr + PAGE
  * value is read back through `get_jit_config` and a mismatch aborts the arm, because the
  * alternative is a run that measures one shape and is labelled another (design F-d).
  */
-function jitIdentity(ex) {
-    for (const fn of [
-        "jit_config_abi_version", "jit_config_supported_mask",
-        "jit_codegen_fingerprint_lo", "jit_codegen_fingerprint_hi",
-    ]) {
-        if (typeof ex[fn] !== "function") {
-            console.error(`engine lacks ${fn} — cannot verify Rust JIT codegen identity`);
-            process.exit(2);
-        }
-    }
-    const abi = ex.jit_config_abi_version() >>> 0;
-    if (abi !== 4) {
-        console.error(`unsupported JIT config ABI ${abi}; expected 4`);
+/**
+ * The shared loader REPORTS; this arm EXITS. Keeping that split here means the browser arm can
+ * surface the same failure as a value instead of inheriting a process exit it has no process for.
+ */
+function orExit(fn) {
+    try {
+        return fn();
+    } catch (e) {
+        console.error(String(e.message ?? e));
         process.exit(2);
     }
-    return {
-        abi,
-        supported_mask: ex.jit_config_supported_mask() >>> 0,
-        fingerprint_lo: ex.jit_codegen_fingerprint_lo() >>> 0,
-        fingerprint_hi: ex.jit_codegen_fingerprint_hi() >>> 0,
-    };
 }
 
-// This is the replay envelope, not a request-shaped configuration. Every field is measured
-// from the instance that will receive the staged unit, so a manifest cannot cross an engine,
-// RAM, codegen, or AOT-transaction ABI boundary by accident.
-function aotIdentity(cpu) {
-    const ex = cpu.wm.exports;
-    // `memory_size` is the live guest-RAM word maintained by the engine (and is what the JS
-    // allocator/restart paths use). It is authoritative even on builds that deliberately do
-    // not expose a redundant wasm getter.
-    if (!cpu.memory_size || !Number.isInteger(cpu.memory_size[0])) {
-        console.error("engine lacks live memory_size — cannot verify AOT RAM identity");
-        process.exit(2);
-    }
-    return {
-        aot_abi: 5,
-        engine_sha256: sha256(fs.readFileSync(wasmPath)),
-        ram_size: cpu.memory_size[0] >>> 0,
-        ...jitIdentity(ex),
-    };
-}
-
-function manifestMatchesLiveIdentity(manifest, live) {
-    const got = manifest.jit_identity;
-    if (!got || typeof got !== "object") return false;
-    return got.aot_abi === live.aot_abi
-        && got.engine_sha256 === live.engine_sha256
-        && got.ram_size === live.ram_size
-        && got.abi === live.abi
-        && got.supported_mask === live.supported_mask
-        && got.fingerprint_lo === live.fingerprint_lo
-        && got.fingerprint_hi === live.fingerprint_hi;
-}
+const jitIdentity = (ex) => orExit(() => sharedJitIdentity(ex));
+const aotIdentity = (cpu) => orExit(() => sharedAotIdentity(cpu, sha256(fs.readFileSync(wasmPath))));
+const publishUnit = (cpu, unit, identity) =>
+    sharedPublishUnit(cpu, unit, identity, { pageSha: (page) => shaPage(cpu.mem8, page * PAGE_SIZE) });
+const aotLiveness = (cpu) => sharedAotLiveness(cpu, aotUnits);
 
 function applyShape(ex) {
-    for (const fn of ["set_jit_config", "get_jit_config", "set_relaxed_fpu", "get_relaxed_fpu"]) {
-        if (typeof ex[fn] !== "function") {
-            console.error(`engine lacks ${fn} — not the BottleShip fork, or too old to verify its own codegen shape`);
-            process.exit(2);
-        }
-    }
-    const before = jitIdentity(ex);
-    const eff = {};
-    for (const [i, v] of JIT_FLAGS) {
-        if (!(before.supported_mask & (1 << i))) {
-            console.error(`JIT config index ${i} is unsupported by mask 0x${before.supported_mask.toString(16)}`);
-            process.exit(2);
-        }
-        const status = ex.set_jit_config(i, v);
-        if (status !== 0) {
-            console.error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
-            process.exit(2);
-        }
-        const got = ex.get_jit_config(i) >>> 0;
-        if (got !== (v >>> 0)) {
-            console.error(`set_jit_config(${i}, ${v}) read back ${got} — the knob did not take `
-                + `(unknown index, or a boolean normalised); refusing to run a shape nobody asked for`);
-            process.exit(2);
-        }
-        eff[i] = got;
-    }
-    ex.set_relaxed_fpu(relaxed);
-    const gotRelaxed = ex.get_relaxed_fpu() >>> 0;
-    if (gotRelaxed !== relaxed) {
-        console.error(`set_relaxed_fpu(${relaxed}) read back ${gotRelaxed}`);
-        process.exit(2);
-    }
-    effectiveFlags = eff;
-    effectiveRelaxed = gotRelaxed;
-    effectiveJitIdentity = jitIdentity(ex);
+    const got = orExit(() => sharedApplyShape(ex, { flags: JIT_FLAGS, relaxed }));
+    effectiveFlags = got.flags;
+    effectiveRelaxed = got.relaxed;
+    effectiveJitIdentity = got.identity;
 }
 
 function jitFacts(cpu) {
@@ -219,8 +186,78 @@ function jitFacts(cpu) {
     return out;
 }
 
+/**
+ * The regions compared for this run. The PTE span is always present when a scenario is active:
+ * accessed/dirty bits are guest-visible bytes the walker writes, so they are compared like any
+ * other effect instead of being asserted in prose. FAULT/SFAULT carry the #PF identity and the
+ * register file as of the faulting instruction.
+ */
+function comparedRegions() {
+    if (!mmuPlan) return c.regions;
+    const pte = MMU.pteRegion(c);
+    return [
+        ...c.regions,
+        { name: "FAULT", addr: L.FAULT, len: L.FAULT_LEN, fields: L.FAULT_FIELDS },
+        { name: "SFAULT", addr: L.SFAULT, len: L.STATE_LEN, fields: L.STATE_FIELDS },
+        ...(pte ? [pte] : []),
+    ];
+}
+
+/**
+ * The scenario's own verdict: what was patched, what the CPU actually did, and how the page
+ * tables looked afterwards. `verdict` compares the outcome against what the scenario declared
+ * it expects, so a scenario that stops faulting (a patch that no longer lands, a TLB that was
+ * never invalidated) reports FAILED rather than quietly passing as a clean run.
+ */
+function mmuReport(cpu) {
+    if (!mmuPlan) return null;
+    const rec = readFaultRecord(cpu);
+    const expect = mmuPlan.scenario.expect;
+    const dv = new DataView(cpu.mem8.buffer, cpu.mem8.byteOffset, cpu.mem8.byteLength);
+    const ptes = MMU.ptePagesForCase(c).map((page) => ({
+        page: "0x" + page.toString(16),
+        ...MMU.describePte(dv.getUint32(L.pteAddr(page), true)),
+    }));
+    const decoded = rec.taken ? MMU.describeErrorCode(rec.error_code) : null;
+    const accessOk = !mmuPlan.scenario.expect_access || decoded?.access === mmuPlan.scenario.expect_access;
+    const verdict = expect === "fault"
+        ? (rec.taken === 1 && accessOk ? "AS_EXPECTED"
+            : rec.taken !== 1 ? "FAILED_NO_FAULT" : `FAILED_ACCESS_${decoded?.access}`)
+        : (rec.taken === 0 ? "AS_EXPECTED" : "FAILED_UNEXPECTED_FAULT");
+    return {
+        scenario: mmuPlan.scenario.id,
+        why: mmuPlan.scenario.why,
+        when: mmuPlan.scenario.when,
+        wp: mmuPlan.scenario.wp,
+        invalidate: mmuPlan.scenario.invalidate !== false,
+        touched: mmuPlan.touch.map((p) => "0x" + p.toString(16)),
+        patches: mmuPlan.patches.map((p) => ({
+            target: p.target, mode: p.mode, page: "0x" + p.page.toString(16),
+            pte_addr: "0x" + p.pte_addr.toString(16), value: "0x" + p.value.toString(16),
+        })),
+        expect, expect_access: mmuPlan.scenario.expect_access ?? null,
+        observed: { ...rec, error: decoded },
+        ptes,
+        verdict,
+    };
+}
+
+/** Decode the #PF record the handler spilled. Null when the image has no scenario. */
+function readFaultRecord(cpu) {
+    if (!mmuPlan) return null;
+    const dv = new DataView(cpu.mem8.buffer, cpu.mem8.byteOffset + L.FAULT, L.FAULT_LEN);
+    const u32 = (off) => dv.getUint32(off, true);
+    return {
+        cr2: u32(0x00), error_code: u32(0x04), fault_eip: u32(0x08),
+        fault_cs: u32(0x0c), taken: u32(0x10),
+    };
+}
+
 function regions(cpu) {
-    return c.regions.map((r) => {
+    // Only the CASE's own regions are checked: FAULT/SFAULT deliberately live inside the
+    // scenario span, and comparing them against it would always "collide".
+    if (mmuPlan) L.assertNoMmuOverlap(c.regions);
+    return comparedRegions().map((r) => {
         const slice = Buffer.from(cpu.mem8.subarray(r.addr, r.addr + r.len));
         return { name: r.name, addr: r.addr, len: r.len, fields: r.fields ?? null,
             sha256: sha256(slice), hex: slice.toString("hex") };
@@ -233,126 +270,6 @@ function regions(cpu) {
  * two constraints bought with failed attempts (handoff §2.1): a unit is only replayable in
  * the slot its bytes were compiled for, and transaction commit must not stamp the TLB (one
  * jit_aot_flush_tlb for the whole batch afterwards).
- */
-/**
- * Overwrite the fixed-width padded LEB placeholders a relocatable unit declares (design §S3).
- * Only values that are properties of the LIVE engine instance are relocated; anything an
- * offline compiler could have known is baked. A unit that declares a relocation the loader has
- * no value for is REFUSED, never patched with a guess.
- */
-function applyRelocations(bytes, unit, values) {
-    for (const r of unit.relocs ?? []) {
-        const v = values[r.kind];
-        if (v === undefined) throw new Error(`no value for relocation ${r.kind}`);
-        if (r.width !== 5) throw new Error(`relocation width ${r.width} unsupported`);
-        let x = v >>> 0;
-        for (let i = 0; i < 5; i++) { bytes[r.fileOffset + i] = (x & 0x7f) | (i < 4 ? 0x80 : 0); x >>>= 7; }
-    }
-    return bytes;
-}
-
-function publishUnit(cpu, unit, identity) {
-    const w = cpu.wm.exports;
-    const table = cpu.wm.wasm_table;
-    const mem = cpu.mem8;
-    const refuse = (why) => ({ registered: false, why });
-
-    for (const p of unit.pages) {
-        if (!Number.isInteger(p.physPage) || p.physPage < 0 || p.physPage > 0xFFFFF) return refuse("bad-physical-page");
-        const live = shaPage(mem, p.physPage * PAGE_SIZE);
-        if (live !== p.sha) return refuse(`content-mismatch page 0x${p.physPage.toString(16)}: live ${live.slice(0, 16)} != unit ${p.sha.slice(0, 16)}`);
-    }
-    let fn;
-    try {
-        const inst = new WebAssembly.Instance(new WebAssembly.Module(unit.bytes), { "e": cpu.jit_imports });
-        fn = inst.exports["f"];
-        if (typeof fn !== "function") return refuse("no-export-f");
-    } catch (e) {
-        return refuse(`instantiate: ${String(e).slice(0, 120)}`);
-    }
-    const required = ["jit_aot_tx_begin", "jit_aot_tx_page_begin", "jit_aot_tx_entry_push",
-        "jit_aot_tx_page_finish", "jit_aot_tx_prepare_finish", "jit_aot_tx_commit", "jit_aot_tx_abort"];
-    if (!required.every((name) => typeof w[name] === "function")) return refuse("transaction-api-unavailable");
-    if (!(unit.tableIndex > 0 && unit.tableIndex < WASM_TABLE_SIZE)) return refuse("bad-table-index");
-    let rc = w.jit_aot_tx_begin(unit.tableIndex, unit.pages.length, identity.fingerprint_lo, identity.fingerprint_hi) >>> 0;
-    if (rc !== 0) return refuse(`tx-begin-${rc}`);
-    const abort = () => (w.jit_aot_tx_abort() >>> 0) === 0;
-    for (const p of unit.pages) {
-        rc = w.jit_aot_tx_page_begin(p.physPage * PAGE_SIZE, p.stateFlags, p.entries.length) >>> 0;
-        if (rc !== 0) break;
-        for (const [off, st] of p.entries) {
-            rc = w.jit_aot_tx_entry_push(off, st) >>> 0;
-            if (rc !== 0) break;
-        }
-        if (rc !== 0) break;
-        rc = w.jit_aot_tx_page_finish() >>> 0;
-        if (rc !== 0) break;
-    }
-    if (rc === 0) rc = w.jit_aot_tx_prepare_finish() >>> 0;
-    if (rc !== 0) {
-        return abort() ? refuse(`tx-prepare-${rc}`) : refuse(`tx-prepare-${rc}-abort-failed`);
-    }
-    let tableMayHaveBeenWritten = false;
-    try {
-        tableMayHaveBeenWritten = true;
-        table.set(unit.tableIndex + WASM_TABLE_OFFSET, fn);
-        rc = w.jit_aot_tx_commit() >>> 0;
-        if (rc !== 0) throw new Error(`commit-${rc}`);
-    } catch (e) {
-        if (tableMayHaveBeenWritten) {
-            try { table.set(unit.tableIndex + WASM_TABLE_OFFSET, null); }
-            catch { return refuse("table-clear-failed-staged-slot-retained"); }
-        }
-        return abort() ? refuse(`tx-post-set-${String(e).slice(0, 120)}`) : refuse("tx-abort-failed");
-    }
-    w.jit_aot_flush_tlb();
-    return { registered: true, idx: unit.tableIndex, fn, pages: unit.pages.map((p) => p.physPage) };
-}
-
-/**
- * Was EVERY published unit still ours at the end, and was each actually entered?
- *
- * A manifest may carry several units. Reading the last one only reported the liveness of one
- * unit while the JIT could have been running the rest — precisely what `aot.registered` exists
- * to catch, so the gate that guards against "the candidate arm silently ran the JIT" has to
- * quantify over all of them.
- */
-function aotLiveness(cpu) {
-    if (aotUnits.length === 0) return null;
-    const w = cpu.wm.exports;
-    const table = cpu.wm.wasm_table;
-    const per = aotUnits.map((u) => {
-        if (!u.registered) return { registered: false, why: u.why };
-        const sameFn = table.get(u.idx + WASM_TABLE_OFFSET) === u.fn;
-        const ownsPage = u.pages.some((p) => (w.jit_aot_page_table_index(p * PAGE_SIZE) >>> 0) === u.idx);
-        const entries = w.jit_get_module_entry_total ? w.jit_get_module_entry_total(u.idx) >>> 0 : null;
-        return {
-            registered: true, idx: u.idx, pages: u.pages.map((p) => "0x" + p.toString(16)),
-            // Function identity, not "the page points at our slot": a freed slot is recycled by
-            // the very next compilation, so a slot check credits the AOT unit with a JIT
-            // module's work (handoff §3).
-            alive: sameFn && ownsPage, sameFn, ownsPage, entries, entered: sameFn && ownsPage && entries > 0,
-        };
-    });
-    const all = (f) => per.every(f);
-    return {
-        registered: all((u) => u.registered === true),
-        alive: all((u) => u.alive === true),
-        entered: all((u) => u.entered === true),
-        sameFn: all((u) => u.sameFn === true),
-        ownsPage: all((u) => u.ownsPage === true),
-        units: per.length,
-        entries: per.reduce((n, u) => n + (u.entries ?? 0), 0),
-        why: per.filter((u) => !u.registered).map((u) => u.why).join("; ") || undefined,
-        per_unit: per,
-    };
-}
-
-/**
- * Re-derive every relocated value from THIS instance and compare it with what was patched in.
- * A relocation is the one place an offline unit can be silently wrong about the engine, so it
- * is measured rather than assumed — a mismatch invalidates the run instead of producing a
- * plausible number over a unit reading the wrong addresses.
  */
 function aotRelocationAudit(cpu) {
     if (!relocApplied) return null;
@@ -408,19 +325,40 @@ function finish(status) {
     clearTimeout(timer);
     const cpu = emulator.v86.cpu;
     let result = { arm: args.aot ? "unit" : "reference", impl: "v86", case: c.id, status,
-        node: process.version, fault: faultApplied };
+        node: process.version, fault: faultApplied, mmu: mmuReport(cpu) };
 
     if (status === "ok") {
-        const ns = (i, j) => Number(marks[j] - marks[i]);
-        const t1 = ns(0, 1), t2 = ns(1, 2);
-        const nsPerOuter = (t2 - t1) / (n2 - n1);
+        const timing = oneCall ? null : (() => {
+            const ns = (i, j) => Number(marks[j] - marks[i]);
+            const t1 = ns(0, 1), t2 = ns(1, 2);
+            const nsPerOuter = (t2 - t1) / (n2 - n1);
+            return { t1, t2, nsPerOuter };
+        })();
         result = {
             ...result,
-            outer: { warmup, n1, n2 },
-            phase_ns: { p1: t1, p2: t2 },
-            ns_per_outer: nsPerOuter,
-            guest_ins_per_outer: image.insPerOuter,
-            guest_mips: image.insPerOuter / nsPerOuter * 1000,
+            ...(oneCall ? {
+                conformance: {
+                    mode: "one-call",
+                    work: image.oneCallWork,
+                    // The P1 k3 slice has exactly one faulting read effect and one store per
+                    // body iteration. Other cases deliberately publish no invented ledger.
+                    expected_ledger: c.id === "k3" ? {
+                        source: "corpus-static-instruction/effect-count",
+                        effects: c.iters * 2,
+                        accounting: c.iters * c.insPerIter,
+                    } : null,
+                    // The raw HLT EIP belongs to the driver. This is the only EIP identity a
+                    // one-call adapter may compare with an isolated kernel interpreter.
+                    logical_continuation: "wrapper-return",
+                    capture_eip: image.captureEip,
+                },
+            } : {
+                outer: { warmup, n1, n2 },
+                phase_ns: { p1: timing.t1, p2: timing.t2 },
+                ns_per_outer: timing.nsPerOuter,
+                guest_ins_per_outer: image.insPerOuter,
+                guest_mips: image.insPerOuter / timing.nsPerOuter * 1000,
+            }),
             jit: jitFacts(cpu),
             aot: aotLiveness(cpu),
             aot_relocations: aotRelocationAudit(cpu),
@@ -460,7 +398,15 @@ function finish(status) {
 }
 
 emulator.bus.register("cpu-event-halt", () => {
-    if (marks.length === 3) finish("ok");
+    // A scenario expecting a fault halts inside the #PF handler, so it has passed no phase
+    // markers at all. `taken` is what separates that from a driver that halted early for an
+    // unrelated reason: an untaken record and a run that never faulted are the same zeros.
+    if (mmuPlan?.scenario.expect === "fault") {
+        const taken = readFaultRecord(emulator.v86.cpu)?.taken;
+        if (taken === 1) return finish("ok");
+        return finish(`EXPECTED_FAULT_NOT_TAKEN_MARKS_${marks.length}`);
+    }
+    if (marks.length === (oneCall ? 0 : 3)) finish("ok");
     else finish(`HALT_WITH_${marks.length}_MARKS`);
 });
 

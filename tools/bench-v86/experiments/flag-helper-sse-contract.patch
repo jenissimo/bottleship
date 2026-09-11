@@ -1,0 +1,16 @@
+diff --git a/src/rust/wasmgen/wasm_builder.rs b/src/rust/wasmgen/wasm_builder.rs
+index a366288..0fd6758 100644
+--- a/src/rust/wasmgen/wasm_builder.rs
++++ b/src/rust/wasmgen/wasm_builder.rs
+@@ -160,6 +160,11 @@ fn flag_spill_whitelisted(name: &str) -> bool {
+         || name.starts_with("report_")
+         || name.starts_with("jit_find_cache_entry")
+         || name == "coverage_log"
++        // Exact contracts audited in cpu/fpu.rs, instructions.rs, instructions_0f.rs.
++        // These calls touch FPU/SIMD state/status and dedicated conversion scratch only.
++        // Current FPU exception helpers record SW bits, without delivering an interrupt.
++        // Do NOT generalize to fpu_* or instr_*: FCOMI writes EFLAGS; FCMOV reads them.
++        || matches!(name, "fpu_get_sti_jit" | "f32_to_f80_jit" | "f64_to_f80_jit" | "i32_to_f80_jit" | "i64_to_f80_jit" | "f80_to_f32" | "f80_to_f64" | "fpu_fadd" | "fpu_fmul" | "fpu_fsub" | "fpu_fsubr" | "fpu_fdiv" | "fpu_fdivr" | "fpu_push" | "fpu_pop" | "instr16_D9_6_reg" | "instr16_D9_7_reg" | "instr_0F16" | "instr_660F59")
+ }
+ 
+ #[derive(Eq, PartialEq)]

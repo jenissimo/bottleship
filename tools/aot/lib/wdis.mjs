@@ -130,7 +130,7 @@ const MEMARG = new Set([
     0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
     0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
 ]);
-const ONE_ULEB = new Set([0x0c, 0x0d, 0x10, 0x20, 0x21, 0x22, 0x23, 0x24]);
+const ONE_ULEB = new Set([0x0c, 0x0d, 0x10, 0x12, 0x20, 0x21, 0x22, 0x23, 0x24]);
 
 /**
  * Walk the function body, yielding {offset, op, depth, imm}. `depth` is the label depth BEFORE
@@ -162,8 +162,15 @@ export function* walkBody(bytes, from, to) {
             const [o, a] = uleb(bytes, p); p += a;
             imm = { align, offset: o, offsetAt: p - a };
         }
-        else if (op === 0x11) { p += skipLeb(bytes, p); p += skipLeb(bytes, p); }
+        else if (op === 0x11 || op === 0x13) { p += skipLeb(bytes, p); p += skipLeb(bytes, p); }
         else if (op === 0x3f || op === 0x40) p++;
+        else if (op === 0xfd) {
+            const [subop,n]=uleb(bytes,p);p+=n;
+            if(subop!==0&&subop!==11) throw new Error(`unsupported SIMD opcode ${subop} at ${off}`);
+            const [align,a]=uleb(bytes,p);p+=a;
+            const offsetAt=p,[offset,k]=uleb(bytes,p);p+=k;
+            imm={subop,align,offset,offsetAt};
+        }
         yield { offset: off, op, depth, imm };
     }
 }

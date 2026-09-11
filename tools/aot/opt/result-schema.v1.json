@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:bottleship:aot-opt-fixed-work-result:v1",
+  "title": "BottleShip optimizing translator fixed-work Arm A result",
+  "description": "Version 1 envelope emitted by tools/aot/opt/runner.mjs. The executable validator is result-schema.mjs.",
+  "type": "object",
+  "required": [
+    "schema",
+    "kind",
+    "arm",
+    "status",
+    "created_at",
+    "provenance",
+    "envelope",
+    "fixed_work",
+    "function_identity",
+    "timing",
+    "state",
+    "effects",
+    "oracle",
+    "samples"
+  ],
+  "properties": {
+    "schema": {
+      "type": "object",
+      "required": ["name", "version", "id"],
+      "properties": {
+        "name": { "const": "bottleship.aot.opt.fixed-work-result" },
+        "version": { "const": 1 },
+        "id": { "const": "bottleship.aot.opt.fixed-work-result.v1" }
+      },
+      "additionalProperties": true
+    },
+    "kind": { "const": "fixed-work-arm-result" },
+    "arm": { "const": "A" },
+    "status": { "enum": ["ok", "arm_failed", "invalid"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "provenance": { "type": "object" },
+    "envelope": { "type": "object" },
+    "fixed_work": { "type": "object" },
+    "function_identity": { "type": "object" },
+    "timing": { "type": "object" },
+    "state": { "type": "object" },
+    "effects": { "type": "object" },
+    "oracle": {
+      "type": "object",
+      "required": ["mode", "verdict", "comparable"],
+      "properties": {
+        "mode": { "const": "baseline-self-validation" },
+        "verdict": { "enum": ["BASELINE", "CORRECT", "DIVERGENT", "INVALID", "ARM_FAILED"] },
+        "comparable": { "const": false }
+      },
+      "additionalProperties": true
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["rep", "status", "raw", "state_digest", "effect_digest"],
+        "properties": {
+          "rep": { "type": "integer", "minimum": 0 },
+          "status": { "enum": ["ok", "arm_failed"] },
+          "raw": { "type": "object" },
+          "state_digest": { "type": ["string", "null"] },
+          "effect_digest": { "type": ["string", "null"] }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

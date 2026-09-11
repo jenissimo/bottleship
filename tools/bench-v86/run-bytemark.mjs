@@ -21,6 +21,7 @@
 //   --out <file>      result JSON path (default: results/<label>-<epoch>.json)
 //   --timeout <min>   abort after N minutes (default 90)
 //   --verbose         log serial output + mirror downloads
+//   --helper-census   count JIT→helper calls (perturbs execution; scores INVALID, exit 4)
 //
 // First run needs network (lazy-mirrors 9p chunks from i.copy.sh); later runs are offline.
 
@@ -155,6 +156,8 @@ let lastLineAt = 0;
 let phase = "boot"; // boot → clocksource → clock1 → clock2 → bench → done
 const clockMarks = [];
 let clockHostMarks = [];
+const helperCounts = Object.create(null);
+let censusInstalled = false;
 
 const watchdog = setTimeout(() => {
     console.error(`\n[bench] TIMEOUT after ${timeoutMs / 60000} min (phase=${phase})`);
@@ -232,6 +235,18 @@ function beginProbes() {
 emulator.bus.register("emulator-started", () => {
     console.error(`[bench] engine started: ${label} (boot=${bootMode})`);
     applyEngineConfig(); // before guest code compiles — consistent codegen for the whole run
+    if (args['helper-census'] && !censusInstalled) {
+        const imports = emulator.v86.cpu.jit_imports;
+        if (!imports) throw Error('JIT imports unavailable for census');
+        for (const [name, fn] of Object.entries(imports)) if (typeof fn === 'function') {
+            imports[name] = (...a) => {
+                if (phase === 'bench') helperCounts[name] = (helperCounts[name] || 0) + 1;
+                return fn(...a);
+            };
+        }
+        censusInstalled = true;
+        console.error('[bench] DIAGNOSTIC helper census: scores are not performance evidence');
+    }
     if (bootMode === "state") setTimeout(beginProbes, 1000);
     // fs mode: wait for the login prompt (detected in the serial listener)
 });
@@ -352,6 +367,10 @@ function finish() {
     result.finished_at = new Date().toISOString();
     result.engine_counters = sampleEngineCounters();
     result.judgements = judgeEngineCounters(result.engine_counters);
+    if (args['helper-census']) {
+        result.helper_census = Object.fromEntries(Object.entries(helperCounts).sort((a,b) => b[1]-a[1]));
+        result.judgements.push({id:'diagnostic.helper_census',ok:false,why:'JS import wrappers perturb execution; call counts only, scores invalid'});
+    }
     if (result.engine_counters) {
         const c = result.engine_counters;
         console.error(`[bench] engine counters: tier2Threshold=${c.tier2Threshold} `

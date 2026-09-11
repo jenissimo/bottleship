@@ -1,0 +1,96 @@
+    let lookup = ctx.builder.block_void();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    let eip = ctx.builder.set_new_local();
+    ctx.builder.get_local(&eip);
+    let hash = ctx.builder.set_new_local();
+    ctx.builder.load_fixed_u8(std::ptr::addr_of!(RET_CACHE_HASH_MIX) as u32);
+    ctx.builder.if_void();
+        ctx.builder.get_local(&eip);
+        ctx.builder.get_local(&eip);
+        ctx.builder.const_i32(12);
+        ctx.builder.shr_u_i32();
+        ctx.builder.xor_i32();
+        ctx.builder.get_local(&eip);
+        ctx.builder.const_i32(20);
+        ctx.builder.shr_u_i32();
+        ctx.builder.xor_i32();
+        ctx.builder.set_local(&hash);
+    ctx.builder.block_end();
+    ctx.builder.const_i32(std::ptr::addr_of!(RET_CACHE) as u32 as i32);
+    ctx.builder.get_local(&hash);
+    ctx.builder.const_i32(2);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(RET_CACHE_MASK) as u32);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(16);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    let memo = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&memo);
+    ctx.builder.load_aligned_i32(0);
+    ctx.builder.get_local(&eip);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(lookup);
+    ctx.builder.get_local(&memo);
+    ctx.builder.load_aligned_i32(4);
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(lookup);
+    ctx.builder.get_local(&memo);
+    ctx.builder.load_aligned_i32(12);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(lookup);
+    ctx.builder.get_local(&memo);
+    ctx.builder.load_aligned_i32(8);
+    let packed = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.lt_i32();
+    ctx.builder.br_if(lookup);
+
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(cpu::WASM_TABLE_OFFSET as i32);
+    ctx.builder.sub_i32();
+    let table_index = ctx.builder.set_new_local();
+    gen_direct_chain_entry_accounting(ctx, &table_index);
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.return_call_indirect_fn1();
+    ctx.builder.block_end();
+
+    ctx.builder.free_local(table_index);
+    ctx.builder.free_local(packed);
+    ctx.builder.free_local(memo);
+    ctx.builder.free_local(hash);
+    ctx.builder.free_local(eip);
+
+    // A miss retains the original resolver and its cache fill. This activation
+    // was already credited before the budget guard; passing zero avoids duplication.
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.const_i32(ctx.wasm_table_index as i32);
+    ctx.builder.const_i32(0);
+    ctx.builder.call_fn3_ret("jit_find_cache_entry_for_dynamic_chaining");
+    let fallback = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.ge_i32();
+    ctx.builder.if_void();
+        ctx.builder.get_local(&fallback);
+        ctx.builder.const_i32(0xFFFF);
+        ctx.builder.and_i32();
+        ctx.builder.get_local(&fallback);
+        ctx.builder.const_i32(16);
+        ctx.builder.shr_u_i32();
+        ctx.builder.return_call_indirect_fn1();
+    ctx.builder.block_end();
+    ctx.builder.free_local(fallback);
+    ctx.builder.block_end(); // budget attempt
+    codegen::gen_debug_track_jit_exit(ctx.builder, last_instruction_addr);
+    ctx.builder.br(ctx.exit_label);
+}

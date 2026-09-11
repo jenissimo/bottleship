@@ -102,6 +102,24 @@ for (const [id, c] of Object.entries(CASES)) {
     rec.binary_sha256 = sha(slice);
     rec.status = Buffer.compare(Buffer.from(c.body), slice) === 0 && rec.binary_sha256 === rec.declared_sha256
         ? "VERIFIED" : "DRIFT_VS_BINARY";
+
+    // 3. A hash proves the bytes; it says nothing about the COUNTS declared alongside them, and
+    // those counts are what every work ledger and every MIPS denominator divides by. So the body
+    // is decoded and its instructions counted. A retail body may legitimately fall outside the
+    // decoder's slice (k1/k2 carry x87), which is reported rather than treated as a failure —
+    // but a body the decoder CAN read must agree with its own `insStatic`.
+    if (rec.status === "VERIFIED" && k?.insStatic !== undefined) {
+        try {
+            const decoded = await decodeWholeBody(c.body, c.codeAddr);
+            rec.decode = { ...decoded, declared_insStatic: k.insStatic };
+            if (decoded.instructions !== k.insStatic) {
+                rec.status = "INSTRUCTION_COUNT_MISMATCH";
+                rec.why = `decoded ${decoded.instructions} instructions, corpus declares insStatic ${k.insStatic}`;
+            }
+        } catch (e) {
+            rec.decode = { unavailable: e.message };
+        }
+    }
     if (rec.status !== "VERIFIED") out.ok = false;
     out.cases[id] = rec;
 }
