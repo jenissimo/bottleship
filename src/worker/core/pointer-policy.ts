@@ -20,19 +20,34 @@
  *  - a SOFTWARE D3D device cursor is a sprite the runtime composites into the frame, not the
  *    OS pointer, so nothing that hides the OS pointer hides it (wined3d device.c,
  *    dxvk d3d9_cursor.cpp); a HARDWARE one IS the OS pointer and follows it;
- *  - ClipCursor alone is ordinary windowed confinement, which keeps a visible pointer;
- *    confinement with NO visible pointer is what marks relative-mouse emulation.
+ *  - ClipCursor confines the pointer whether or not it is drawn. Visibility and the clip
+ *    rect are disjoint state everywhere it matters: wineserver keeps `cursor_count` and
+ *    `cursor.clip` in different fields updated by different request flags, and the X11
+ *    driver gates its real pointer grab on focus / XInput2 / the rect being smaller than
+ *    the screen — never on the show count. Confining a VISIBLE pointer to a window's
+ *    client area is ClipCursor's most common use, and dropping it left the guest's
+ *    pointer pinned at the clip edge while the host's kept travelling.
  */
 import { System } from "./system";
 
 /** How the active D3D device cursor is realised, or "none" while no device drives one. */
 export type DeviceCursorKind = "none" | "hardware" | "software";
 
+/** Screen-space confinement bounds; right/bottom EXCLUSIVE, as in Win32 RECT. */
+export interface PointerClipRect {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+}
+
 export interface PointerFacts {
     /** user32: display count >= 0 AND a non-NULL SetCursor handle. */
     win32Visible: boolean;
     deviceCursor: DeviceCursorKind;
-    /** user32 ClipCursor confinement is in force. */
+    /** user32 ClipCursor confinement is in force AND actually confines — a clip rect
+     *  equal to the whole virtual screen is not confinement (wineserver
+     *  is_cursor_clipped: `clip_rect != virtual_screen_rect`). */
     clipped: boolean;
     /** user32 recentre-burst detector: the app steers by warping the pointer back. */
     warping: boolean;
@@ -44,7 +59,8 @@ export interface PointerOutputs {
     pointerShown: boolean;
     /** Relative-mouse claim from an exclusive DI acquisition. */
     captured: boolean;
-    /** Relative-mouse claim from confinement with no pointer drawn. */
+    /** Confinement claim: the host owes the guest a pointer that cannot leave the clip
+     *  rect. Independent of whether a pointer is drawn — see the header. */
     confinedRelative: boolean;
     /** Relative-mouse claim from the recentre burst. */
     warping: boolean;
@@ -60,7 +76,7 @@ export function derivePointerOutputs(f: PointerFacts): PointerOutputs {
     return {
         pointerShown,
         captured: f.exclusiveMouse,
-        confinedRelative: f.clipped && !pointerShown,
+        confinedRelative: f.clipped,
         warping: f.warping,
     };
 }
@@ -75,6 +91,11 @@ const facts: PointerFacts = {
     exclusiveMouse: false,
 };
 
+// The bounds behind facts.clipped. Not an input to the derivation — the host needs it to
+// realise the confinement (Wine hands its driver the rect for the same reason), and there
+// is exactly one clip in a process, so it rides with the claim rather than in the facts.
+let clipRect: PointerClipRect | null = null;
+
 // Keyed by the DI device object, not a global flag: a process may hold several mouse
 // devices, and the last one to Unacquire is what releases the claim.
 const exclusiveMouseOwners = new Set<object>();
@@ -84,7 +105,7 @@ function publish(): void {
     const sys = System.getInstance();
     sys.requestHostCursorVisible(out.pointerShown);
     sys.requestHostMouseCapture(out.captured);
-    sys.requestHostCursorClipSignal(out.confinedRelative);
+    sys.requestHostCursorClipSignal(out.confinedRelative, out.confinedRelative ? clipRect : null);
     sys.requestHostCursorWarpMode(out.warping);
 }
 
@@ -99,9 +120,19 @@ export function setPointerVisibilityFacts(win32Visible: boolean, deviceCursor: D
     publish();
 }
 
-export function setPointerClipped(clipped: boolean): void {
-    if (facts.clipped === clipped) return;
+/**
+ * The bounds the guest's pointer is confined to, or null when nothing confines it.
+ * The CALLER reduces a clip that covers the whole virtual screen to null — only it knows
+ * the screen — because that is not confinement (wineserver is_cursor_clipped).
+ */
+export function setPointerClipped(rect: PointerClipRect | null): void {
+    const clipped = rect !== null;
+    const same = facts.clipped === clipped && (!rect || (clipRect
+        && clipRect.left === rect.left && clipRect.top === rect.top
+        && clipRect.right === rect.right && clipRect.bottom === rect.bottom));
+    if (same) return;
     facts.clipped = clipped;
+    clipRect = rect;
     publish();
 }
 
@@ -145,8 +176,14 @@ export function isExclusiveMouseAcquired(): boolean {
 }
 
 /** Harness readout: the facts and what they derive to, in one place. */
-export function describePointerPolicy(): { facts: PointerFacts; outputs: PointerOutputs; exclusiveMouseOwners: number } {
-    return { facts: { ...facts }, outputs: derivePointerOutputs(facts), exclusiveMouseOwners: exclusiveMouseOwners.size };
+export function describePointerPolicy(): {
+    facts: PointerFacts; outputs: PointerOutputs; clipRect: PointerClipRect | null; exclusiveMouseOwners: number;
+} {
+    return {
+        facts: { ...facts }, outputs: derivePointerOutputs(facts),
+        clipRect: clipRect ? { ...clipRect } : null,
+        exclusiveMouseOwners: exclusiveMouseOwners.size,
+    };
 }
 
 /** Game switch. */
@@ -155,6 +192,7 @@ export function resetPointerPolicy(): void {
     facts.win32Visible = true;
     facts.deviceCursor = "none";
     facts.clipped = false;
+    clipRect = null;
     facts.warping = false;
     facts.exclusiveMouse = false;
 }

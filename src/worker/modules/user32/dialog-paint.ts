@@ -6,7 +6,7 @@
  */
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, ensureHostCursorForDialog, getChildrenInPaintOrder, hasSystemControlChildren } from './shared-state';
+import { WindowInfo, windows, isEffectivelyVisible, getAbsoluteWindowPosition, getAncestorClipRect, getChildrenInPaintOrder, hasSystemControlChildren } from './shared-state';
 import { paintChildControls, repaintChildControls, restoreClientUnderStampedControls } from './controls';
 import { registerOwnedPopupRestamper } from './paint-hooks';
 import { registerFullDialogRepainter, registerOverlayRepairRepainter } from './control-interaction';
@@ -492,7 +492,6 @@ export function paintDialogToOverlay(dialogHwnd: number, mode: 'full' | 'control
     const hdc = gdi.createOverlayDC();
     if (!hdc) return;
 
-    ensureHostCursorForDialog();
     paintWindowSubtreeToOverlay(dialogHwnd, hdc, new Set<number>(), mode);
 
     // Restore Z-order on the flat overlay: re-stamp any owned popup dialogs that

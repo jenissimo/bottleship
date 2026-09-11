@@ -1,5 +1,6 @@
 
 import { Process } from "./process";
+import { stopChildProcesses, hasChildSession } from "./child-process";
 import { WindowManager } from "../runtime/windowing/window-manager";
 import { GDIContext } from "../modules/gdi32/context";
 import { InputManager } from "../runtime/input/input-manager";
@@ -31,6 +32,7 @@ import { hookRegistry } from "./hooks";
 import { resetSehDispatchState } from "./seh-dispatch";
 import { namedObjects } from "../modules/kernel32/named-objects";
 import { hypercallDataManager } from "./cpu/hypercall-data";
+import type { PointerClipRect } from "./pointer-policy";
 
 /**
  * The crash payload posted to the host (`process_exit{crashed:true, fault}`) and
@@ -282,6 +284,7 @@ export class System {
     public executableName: string = "app.exe";  // Name of the main executable (from manifest)
     public executablePath: string = "C:\\app.exe";  // Full VFS path to the executable
     public executableArgs: string = "";  // Command-line arguments from manifest
+    public executableCommandLine: string | null = null;
 
     /**
      * Installed by the worker: restart the guest process with a new command line.
@@ -377,8 +380,8 @@ export class System {
     private hostCursorPositionState: string | null = null;
     private hostCursorWarpMode: ((active: boolean) => void) | null = null;
     private hostCursorWarpModeState = false;
-    private hostCursorClipSignal: ((active: boolean) => void) | null = null;
-    private hostCursorClipSignalState: boolean | null = null;
+    private hostCursorClipSignal: ((active: boolean, rect: PointerClipRect | null) => void) | null = null;
+    private hostCursorClipSignalState: string | null = null;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
     private hostMouseCaptureState: boolean | null = null;
     private hostWindowTitle: ((title: string) => void) | null = null;
@@ -475,6 +478,7 @@ export class System {
      *  strand the host's exit dialog behind a promise that never settles. */
     private static readonly EXIT_FLUSH_BUDGET_MS = 3000;
     private exitNotified = false;
+    public onProcessExit: ((payload: Record<string, unknown>) => void) | null = null;
 
     /**
      * THE single process-exit notification. `process_exit` is the host's cue that the
@@ -487,9 +491,35 @@ export class System {
      *
      * Idempotent: a process exits once, however many exit paths report it.
      */
+    private brokerExit: Record<string, unknown> | null = null;
+
+    releaseChildSessionBroker(): void {
+        if (!this.brokerExit || hasChildSession()) return;
+        const payload = this.brokerExit;
+        this.brokerExit = null;
+        this.exitNotified = false;
+        this.postProcessExitWhenDurable(payload);
+    }
+
     postProcessExitWhenDurable(payload: Record<string, unknown>): void {
         if (this.exitNotified) return;
         this.exitNotified = true;
+        if (hasChildSession()) {
+            this.brokerExit = payload;
+            // Guest threads have exited; this worker still owns the live child's VFS.
+            // The child reports its own final exit over the page's foreground port.
+            const notifyParent = this.onProcessExit;
+            void stopChildProcesses(true).then(() => this.fileSystem.flushAll())
+                .then(() => notifyParent?.({ ...payload, broker: true }))
+                .catch(error => Logger.warn(LogCategory.SYSTEM, `parent exit flush failed: ${error}`));
+            return;
+        }
+        const childrenStopped = stopChildProcesses();
+        if (this.onProcessExit) {
+            const onExit = this.onProcessExit;
+            void childrenStopped.then(() => onExit(payload));
+            return;
+        }
         // A launcher exiting into its own re-exec is a restart, not an exit — but the
         // page reload that serves it is exactly the teardown that drops buffered
         // writes, so the barrier still runs; only the host dialog is suppressed.
@@ -508,7 +538,7 @@ export class System {
                 `process exit: flushAll did not drain within ${System.EXIT_FLUSH_BUDGET_MS}ms — notifying host anyway`);
             post();
         }, System.EXIT_FLUSH_BUDGET_MS) as unknown as number;
-        this.fileSystem.flushAll()
+        childrenStopped.then(() => this.fileSystem.flushAll())
             .catch((e) => Logger.warn(LogCategory.SYSTEM, `process exit: flushAll failed: ${e}`))
             .then(() => { clearTimeout(budget); post(); });
     }
@@ -781,18 +811,21 @@ export class System {
         }
     }
 
-    setHostCursorClipSignalCallback(callback: (active: boolean) => void): void {
+    setHostCursorClipSignalCallback(callback: (active: boolean, rect: PointerClipRect | null) => void): void {
         this.hostCursorClipSignal = callback;
     }
 
     /**
-     * Confinement that means relative-mouse steering (see core/pointer-policy). The
-     * confinement itself we enforce ourselves — this is only the transport signal.
+     * ClipCursor confinement (see core/pointer-policy). We clamp guest-visible positions
+     * ourselves, but the HOST pointer is a second, unconfined pointer: without the rect it
+     * keeps travelling past the wall and the two diverge by exactly the drift. So the rect
+     * travels with the claim, the way Wine hands its driver the rect to grab against.
      */
-    requestHostCursorClipSignal(active: boolean): void {
-        if (this.hostCursorClipSignalState === active) return;
-        this.hostCursorClipSignalState = active;
-        this.hostCursorClipSignal?.(active);
+    requestHostCursorClipSignal(active: boolean, rect: PointerClipRect | null): void {
+        const key = active && rect ? `${rect.left},${rect.top},${rect.right},${rect.bottom}` : String(active);
+        if (this.hostCursorClipSignalState === key) return;
+        this.hostCursorClipSignalState = key;
+        this.hostCursorClipSignal?.(active, rect);
     }
 
     /**
@@ -864,6 +897,10 @@ export class System {
      * Reset all system state - clear all subsystems
      */
     async reset(): Promise<void> {
+        this.brokerExit = null;
+        await stopChildProcesses();
+        this.executableCommandLine = null;
+        this.onProcessExit = null;
         Logger.log(LogCategory.SYSTEM, 'Resetting system state');
 
         // Save registry state and flush access log before reset
@@ -949,6 +986,12 @@ export class System {
         this.isCleaningUp = false;
         this._releaseCount = 0;
         this._crashReported = false; // fresh game → allow a new crash report
+        // Both latches are per-PROCESS, not per-worker: an in-worker game switch
+        // ("Load File…", a launcher's in-worker re-exec) keeps this System alive, and a
+        // latch left standing silently disables the host's exit/crash dialog for every
+        // game loaded after the first — the failure looks like a hang, not an error.
+        this.exitNotified = false;
+        this.isReExecPending = false;
         loadDiagnostics.reset();
 
         // Reset all subsystems
