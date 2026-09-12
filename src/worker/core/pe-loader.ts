@@ -90,6 +90,30 @@ export class PELoader {
         return this.apiRegistry.getFunctionNameByOrdinal(dllName, f.ordinal) ?? `ord_${f.ordinal}`;
     }
 
+    /**
+     * Register a stub DLL's freshly bumped code range with MemoryManager.
+     *
+     * The ThunkGenerator's arena is registered once at its INITIAL size, but the bump
+     * frontier grows for the life of the process; only this call extends the registration
+     * and advances the THUNK_CODE bucket past the live stubs. Without it the bucket's own
+     * allocator can hand the same range out again, on top of code the guest's IAT points at.
+     *
+     * The kind is therefore not optional: allocAt defaults to HEAP/rw, and a thunk address
+     * is outside the HEAP bucket by construction, so an unkinded call can only throw.
+     */
+    private reserveStubCodeRegion(dllName: string, baseAddress: number, size: number): void {
+        const memory = System.getInstance().process?.memory;
+        if (!memory) return;
+        try {
+            memory.allocAt(baseAddress, size, "THUNK_CODE", "rx");
+        } catch (e) {
+            // A range already reserved at this size returns rather than throwing, so a
+            // throw here means the stubs sit in memory nothing owns — say so out loud.
+            Logger.warn(LogCategory.SYSTEM,
+                `[PE] Stub code for ${dllName} at 0x${baseAddress.toString(16)} (${size} bytes) not reserved: ${e}`);
+        }
+    }
+
     private getMemory: () => Uint8Array;
     private thunkGenerator: ThunkGenerator;
     private apiRegistry: APIRegistry;
@@ -1775,14 +1799,7 @@ export class PELoader {
 
                 // Load stub code into memory (skip if all stubs were reused)
                 if (stubDll.stubCode.length > 0) {
-                    try {
-                        const system = System.getInstance();
-                        if (system.process?.memory) {
-                            system.process.memory.allocAt(stubDll.baseAddress, stubDll.stubCode.length);
-                        }
-                    } catch (e) {
-                        // If already reserved, that's fine
-                    }
+                    this.reserveStubCodeRegion(dllName, stubDll.baseAddress, stubDll.stubCode.length);
                     if (!writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress)) {
                         Logger.error(LogCategory.SYSTEM,
                             `[PE] Stub DLL for ${dllName} at 0x${stubDll.baseAddress.toString(16)} overruns guest memory — ` +
@@ -2016,14 +2033,7 @@ export class PELoader {
         }
 
         // Load stub code into memory
-        try {
-            const system = System.getInstance();
-            if (system.process?.memory) {
-                system.process.memory.allocAt(stubDll.baseAddress, stubDll.stubCode.length);
-            }
-        } catch (e) {
-            // If already reserved, that's fine
-        }
+        this.reserveStubCodeRegion(dllName, stubDll.baseAddress, stubDll.stubCode.length);
         if (!writeGuestCode(this.memory, stubDll.stubCode, stubDll.baseAddress)) {
             Logger.error(LogCategory.SYSTEM,
                 `[PE] Stub DLL for ${dllName} at 0x${stubDll.baseAddress.toString(16)} overruns guest memory — ` +
