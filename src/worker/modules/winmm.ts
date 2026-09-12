@@ -1,6 +1,6 @@
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { type HleDispatcher, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { registerWinmmJoystickExports, resetWinmmJoystick } from "./winmm-joystick";
 import { registerWinmmCapsExports } from "./winmm-caps";
 import { registerWinmmMciExports } from "./winmm-mci";
@@ -39,6 +39,14 @@ const MMSYSERR_NOERROR = 0;
 const MMSYSERR_BADDEVICEID = 2;
 const MMSYSERR_INVALPARAM = 11;
 const MMSYSERR_ERROR = 1;
+const MMSYSERR_NOTENABLED = 3;
+const MMSYSERR_ALLOCATED = 4;
+const MMSYSERR_INVALHANDLE = 5;
+const MMSYSERR_NODRIVER = 6;
+const MMSYSERR_NOMEM = 7;
+const MMSYSERR_NOTSUPPORTED = 8;
+const MMSYSERR_BADERRNUM = 9;
+const MMSYSERR_INVALFLAG = 10;
 const TIME_ONESHOT = 0x0000;
 const TIME_PERIODIC = 0x0001;
 const TIME_CALLBACK_FUNCTION = 0x0000;
@@ -653,13 +661,13 @@ export class WinMM implements IModule {
         return newTimerId;
     }
 
-    registerFastPathTimerFunctions(dispatcher: any): void {
+    registerFastPathTimerFunctions(dispatcher: HleDispatcher): void {
         if (!dispatcher?.registerFastPath) return;
         const mod = this;
         dispatcher.registerFastPath(
             'winmm',
             'timeSetEvent',
-            (cpu: { reg32: number[] }, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView) =>
+            (_esp: number, view: DataView, _mem: Uint8Array, _mem32: Uint32Array, cpu: any) =>
                 mod.fastPathTimeSetEvent(cpu, view),
             { trivial: true },
         );
@@ -1017,14 +1025,27 @@ export class WinMM implements IModule {
         return Mem.writeUint16(ptr + copyLen * 2, 0);
     }
 
-    private waveOutErrorText(mmrError: number): string {
+    /**
+     * MMRESULT description text. One table, because Windows has one: waveIn, waveOut,
+     * midiIn, midiOut and mixer all return the same MMSYSERR_* codes and their six
+     * GetErrorText entry points read the same strings out of winmm's resources.
+     */
+    private mmErrorText(mmrError: number): string {
         const known: Record<number, string> = {
             [MMSYSERR_NOERROR]: "No error",
             [MMSYSERR_ERROR]: "Unspecified error",
             [MMSYSERR_BADDEVICEID]: "The specified device identifier is out of range.",
+            [MMSYSERR_NOTENABLED]: "The driver was not enabled.",
+            [MMSYSERR_ALLOCATED]: "The specified device is already in use. Wait until it is free, and then try again.",
+            [MMSYSERR_INVALHANDLE]: "The specified device handle is invalid.",
+            [MMSYSERR_NODRIVER]: "There is no driver installed on your system.",
+            [MMSYSERR_NOMEM]: "There is not enough memory available for this task. Quit one or more applications to increase available memory, and then try again.",
+            [MMSYSERR_NOTSUPPORTED]: "The specified device is not supported.",
+            [MMSYSERR_BADERRNUM]: "The specified error number is out of range.",
+            [MMSYSERR_INVALFLAG]: "An invalid flag was passed.",
             [MMSYSERR_INVALPARAM]: "The specified parameter is invalid.",
         };
-        return known[mmrError] ?? `Wave output error ${mmrError}`;
+        return known[mmrError] ?? `Unrecognized error value ${mmrError}`;
     }
 
     /**
@@ -1695,27 +1716,23 @@ export class WinMM implements IModule {
             return MMSYSERR_NOERROR;
         };
 
-        this.exports["waveOutGetErrorTextA"] = (_ctx, _mem, args) => {
+        // (mmrError, pszText, cchText) — the shape all six entry points share.
+        const getErrorText = (wide: boolean): ThunkImplementation => (_ctx, _mem, args) => {
             const mmrError = args[0] >>> 0;
             const pszText = args[1] >>> 0;
             const cchText = args[2] >>> 0;
             if (!pszText || cchText === 0) return MMSYSERR_INVALPARAM;
-            if (!this.writeAnsiString(pszText, cchText, this.waveOutErrorText(mmrError))) {
-                return MMSYSERR_ERROR;
-            }
-            return MMSYSERR_NOERROR;
+            const text = this.mmErrorText(mmrError);
+            const written = wide
+                ? this.writeWideString(pszText, cchText, text)
+                : this.writeAnsiString(pszText, cchText, text);
+            return written ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
         };
 
-        this.exports["waveOutGetErrorTextW"] = (_ctx, _mem, args) => {
-            const mmrError = args[0] >>> 0;
-            const pszText = args[1] >>> 0;
-            const cchText = args[2] >>> 0;
-            if (!pszText || cchText === 0) return MMSYSERR_INVALPARAM;
-            if (!this.writeWideString(pszText, cchText, this.waveOutErrorText(mmrError))) {
-                return MMSYSERR_ERROR;
-            }
-            return MMSYSERR_NOERROR;
-        };
+        for (const family of ["waveOut", "waveIn", "midiOut", "midiIn"]) {
+            this.exports[`${family}GetErrorTextA`] = getErrorText(false);
+            this.exports[`${family}GetErrorTextW`] = getErrorText(true);
+        }
 
         // waveIn / midiIn / mixer / aux device-caps and stub handlers live in
         // winmm-caps.ts (same wiring pattern as winmm-joystick).

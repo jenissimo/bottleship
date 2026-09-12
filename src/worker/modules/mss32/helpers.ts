@@ -304,6 +304,35 @@ export function reinitDriverFields(
 }
 
 /**
+ * The digital driver's master volume, 0–127.
+ *
+ * It lives in the GUEST driver struct at +0x10 — the field computeSampleVolumes
+ * already mixes into every voice — so that is the state, not a JS shadow of it.
+ * Miles exposes it under two decorations that differ by SDK version (MSS 5's S32
+ * 0–127 pair and MSS 6's F32 0.0–1.0 `_level` pair); both address this one field,
+ * and a title may read it out of the struct directly besides.
+ */
+export function getDigitalMasterVolume(ctx: MSSContext): number {
+    if (!ctx.digitalDriverHandle) return 127;
+    const mem = getMemory(ctx);
+    if (!MemoryGuard.isValidRange(mem, ctx.digitalDriverHandle + 0x10, 4)) return 127;
+    const raw = makeView(mem).getInt32(ctx.digitalDriverHandle + 0x10, true);
+    return Math.max(0, Math.min(127, raw));
+}
+
+/** Store the master volume and recompute the per-voice fields that derive from it. */
+export function setDigitalMasterVolume(ctx: MSSContext, volume127: number): void {
+    if (!ctx.digitalDriverHandle) return;
+    const clamped = Math.max(0, Math.min(127, Math.round(volume127)));
+    const mem = getMemory(ctx);
+    const view = makeView(mem);
+    MemoryGuard.writeUint32(mem, view, ctx.digitalDriverHandle + 0x10, clamped >>> 0, "MSS32:setDigitalMasterVolume");
+    for (const sample of ctx.samples.values()) {
+        computeSampleVolumes(view, sample.handle, ctx.digitalDriverHandle);
+    }
+}
+
+/**
  * Compute and write volL, volR, effectiveVol×16 fields into a SAMPLE struct.
  * Mirrors real MSS32 FUN_2100f2d0 (volume recalculation).
  *
@@ -637,9 +666,19 @@ export function refreshSampleLenDone(ctx: MSSContext, sample: MSSSample): void {
 export function setStreamStatus(ctx: MSSContext, stream: MSSStream, status: number): void {
     const mem = getMemory(ctx);
     const view = makeView(mem);
-    if (MemoryGuard.isValidRange(mem, stream.handle, 4)) {
-        view.setUint32(stream.handle + 0x00, status, true);
+    if (!MemoryGuard.isValidRange(mem, stream.handle, 4)) return;
+
+    // Miles notifies the registered stream callback when a stream reaches the end of
+    // its file, however it was fed. An incrementally served stream reaches that point
+    // in stream-engine's rollOver, which has its own once-guard; one played from a
+    // whole decoded buffer only ever reaches it here, at the PLAYING→DONE edge, and
+    // firing on the edge is what keeps a status rewritten every heartbeat to one call.
+    const previous = view.getUint32(stream.handle + 0x00, true);
+    if (status === SMP_DONE && previous === SMP_PLAYING && !stream.source) {
+        const callback = ctx.streamCallbacks.get(stream.handle) ?? 0;
+        if (callback) ctx.pendingStreamCallbacks.push({ callback, handle: stream.handle });
     }
+    view.setUint32(stream.handle + 0x00, status, true);
 }
 
 export function writeStreamPosition(ctx: MSSContext, stream: MSSStream, position: number): void {

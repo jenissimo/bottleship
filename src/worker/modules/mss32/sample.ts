@@ -18,6 +18,7 @@ import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, see
 import { System } from "../../core/system";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
 import { ensureListener3D, writeListener3D } from "./spatial";
+import { clampLevel, f32Arg, levelsToVolumePan, pan127ToPanLevel, panLevelToPan127, volumePanToLevels } from "./volume-levels";
 
 export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -351,6 +352,54 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         MemoryGuard.writeUint32(m, view, s.handle + 0x60, s.pan >>> 0, "MSS32:set_pan:real");
         computeSampleVolumes(view, s.handle, ctx.digitalDriverHandle);
         if (s.isPlaying) updateSamplePlayback(ctx, s);
+        return 0;
+    };
+
+    // ---- MSS 6 F32 volume API ----------------------------------------------
+    // The same volume and pan fields the S32 pair above owns, spelled as floats.
+    // Delegating keeps the struct dual-writes and the playback kick in one place;
+    // a second copy of them would drift the moment either offset moved.
+    const setVolumePan127 = (ctxThunk: Parameters<ThunkImplementation>[0], mem: Uint8Array,
+                             handle: number, volume: number, pan: number): number => {
+        exports["_AIL_set_sample_volume@8"]!(ctxThunk, mem, [handle, volume]);
+        exports["_AIL_set_sample_pan@8"]!(ctxThunk, mem, [handle, pan]);
+        return 0;
+    };
+
+    /** Write an optional F32 out-parameter; Miles treats a NULL as "not wanted". */
+    const writeOptionalF32 = (mem: Uint8Array, pointer: number, value: number): void => {
+        if (!pointer || !MemoryGuard.isValidRange(mem, pointer, 4)) return;
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setFloat32(pointer, value, true);
+    };
+
+    exports["_AIL_set_sample_volume_pan@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        return setVolumePan127(ctxThunk, mem, args[0],
+            Math.round(clampLevel(f32Arg(args[1])) * 127), panLevelToPan127(f32Arg(args[2])));
+    };
+
+    exports["_AIL_sample_volume_pan@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        writeOptionalF32(mem, args[1], clampLevel(sample.volume / 127));
+        writeOptionalF32(mem, args[2], pan127ToPanLevel(sample.pan));
+        return 0;
+    };
+
+    exports["_AIL_set_sample_volume_levels@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        const { volume, pan } = levelsToVolumePan(f32Arg(args[1]), f32Arg(args[2]));
+        return setVolumePan127(ctxThunk, mem, args[0], volume, pan);
+    };
+
+    exports["_AIL_sample_volume_levels@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        const { left, right } = volumePanToLevels(sample.volume, sample.pan);
+        writeOptionalF32(mem, args[1], left);
+        writeOptionalF32(mem, args[2], right);
         return 0;
     };
 
@@ -788,6 +837,18 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         const previous = view.getUint32(sample + 0x4C, true);
         view.setUint32(sample + 0x4C, callback, true);
         return previous === 0xFFFFFFFF ? 0 : previous;
+    };
+
+    // _AIL_sample_user_data@8(sample, index) -> value. The slot lives in the GUEST
+    // sample struct at +0x40 + index*4, which an app may write directly, so read it
+    // back from there rather than from our own copy.
+    exports["_AIL_sample_user_data@8"] = (ctxThunk, mem, args) => {
+        const sample = args[0] >>> 0;
+        const index = args[1] | 0;
+        if (index < 0 || !ctx.samples.has(sample)) return 0;
+        const offset = sample + 0x40 + index * 4;
+        if (!MemoryGuard.isValidRange(mem, offset, 4)) return 0;
+        return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(offset, true);
     };
 
     // _AIL_set_sample_user_data@12

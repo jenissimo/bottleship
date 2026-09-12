@@ -291,9 +291,24 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_MDI_driver_type@4", 1),
         makeFunc("_AIL_set_XMIDI_master_volume@8", 2),
         makeFunc("_AIL_XMIDI_master_volume@4", 1),
-        // Digital master volume
+        // Digital master volume. MSS 5 spells it S32 0–127, MSS 6 adds the F32
+        // 0.0–1.0 `_level` pair; a shipped DLL exports both and they share a field.
         makeFunc("_AIL_set_digital_master_volume@8", 2),
         makeFunc("_AIL_digital_master_volume@4", 1),
+        makeFunc("_AIL_set_digital_master_volume_level@8", 2),
+        makeFunc("_AIL_digital_master_volume_level@4", 1),
+        // MSS 6 F32 per-voice volume: a left/right level pair, or a volume/pan pair.
+        // An F32 argument still occupies one stdcall slot, so the @N is unsurprising.
+        makeFunc("_AIL_set_sample_volume_levels@12", 3),
+        makeFunc("_AIL_sample_volume_levels@12", 3),
+        makeFunc("_AIL_set_sample_volume_pan@12", 3),
+        makeFunc("_AIL_sample_volume_pan@12", 3),
+        makeFunc("_AIL_set_stream_volume_levels@12", 3),
+        makeFunc("_AIL_stream_volume_levels@12", 3),
+        makeFunc("_AIL_set_stream_volume_pan@12", 3),
+        makeFunc("_AIL_stream_volume_pan@12", 3),
+        makeFunc("_AIL_sample_user_data@8", 2),
+        makeFunc("_AIL_set_DirectSound_HWND@8", 2),
 
         // Auto-generated from reference signatures
         makeFunc("AIL_allocate_sample_handle", 1),

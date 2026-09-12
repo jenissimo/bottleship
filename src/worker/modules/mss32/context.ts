@@ -40,6 +40,8 @@ export interface MSSContext {
 
     initialized: boolean;
     digitalDriverHandle: number;
+    /** Window the app named for a DirectSound driver (AIL_set_DirectSound_HWND). */
+    directSoundHwnd: number;
     driverDummyBuffer: number;
     driverWaveFormat: number;
     driverNoopStub: number;
@@ -141,6 +143,7 @@ export function createMSSContext(process: Process): MSSContext {
 
         initialized: false,
         digitalDriverHandle: 0,
+        directSoundHwnd: 0,
         driverDummyBuffer: 0,
         driverWaveFormat: 0,
         driverNoopStub: 0,

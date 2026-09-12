@@ -22,6 +22,26 @@ export class Msvfw32 implements IModule {
     initialize(process: Process): void {
         this.process = process;
 
+        // No VCM codec is installed, which is a state real Windows can be in: ICLocate
+        // and ICOpen answer NULL and ICInfo FALSE, so a caller sees "this format has no
+        // decompressor" and takes its own fallback. Handing back a non-NULL HIC we
+        // cannot drive would instead make it commit to the compressed path.
+        this.exports["ICLocate"] = () => 0;
+        this.exports["ICOpen"] = () => 0;
+        this.exports["ICInfo"] = () => 0;
+
+        // With no handle ever issued, every call carrying one is ICERR_BADHANDLE.
+        // These return LRESULT, where 0 is ICERR_OK — the failure has to be explicit.
+        const ICERR_BADHANDLE = -8;
+        this.exports["ICClose"] = () => ICERR_BADHANDLE;
+        this.exports["ICSendMessage"] = () => ICERR_BADHANDLE;
+        this.exports["ICDecompress"] = () => ICERR_BADHANDLE;
+
+        // VideoForWindowsVersion() — VFW 1.1, the version every 32-bit Windows reports.
+        const videoForWindowsVersion = () => 0x040003B6;
+        this.exports["VideoForWindowsVersion"] = videoForWindowsVersion;
+        this.exports["ord_2"] = videoForWindowsVersion;
+
         // DrawDibOpen() → HDRAWDIB
         this.exports["DrawDibOpen"] = (_ctx, _mem, _args) => {
             const handle = nextDrawDibHandle++;

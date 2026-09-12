@@ -36,6 +36,19 @@ export const avifil32Module: ModuleDescriptor = {
         makeFunc("AVIFileInfoA", 3),              // pfile, pfi (LPAVIFILEINFOA), lSize
         makeFunc("AVIFileGetStream", 4),          // pfile, ppavi, fccType, lParam
 
+        // AVI authoring. We read AVIs, we do not write them; a title that offers a
+        // recording feature links these unconditionally, so they must bind with the
+        // right stack metadata and answer AVIERR_READONLY (see the module) rather than
+        // the S_OK a status-code export with no handler would default to.
+        makeFunc("AVIFileCreateStreamA", 3, { onUnimplemented: "hresult" }),      // pfile, ppavi, psi
+        makeFunc("AVIFileCreateStreamW", 3, { onUnimplemented: "hresult" }),
+        makeFunc("AVIMakeCompressedStream", 4, { onUnimplemented: "hresult" }),   // ppsCompressed, ppsSource, lpOptions, pclsidHandler
+        makeFunc("AVIStreamSetFormat", 4, { onUnimplemented: "hresult" }),        // pavi, lPos, lpFormat, cbFormat
+        makeFunc("AVIStreamWrite", 8, { onUnimplemented: "hresult" }),            // pavi, lStart, lSamples, lpBuffer, cbBuffer, dwFlags, plSampWritten, plBytesWritten
+        makeFunc("AVIFileWriteData", 4, { onUnimplemented: "hresult" }),          // pfile, ckid, lpData, cbData
+        makeFunc("AVISaveOptionsFree", 2, { onUnimplemented: "hresult" }),        // nStreams, ppOptions
+        makeFunc("AVISaveOptions", 5),                                            // hwnd, uiFlags, nStreams, ppavi, ppOptions → BOOL
+
         // Stream open/close
         makeFunc("AVIStreamOpenFromFileA", 6),   // ppavi, szFile, fccType, lParam, mode, pclsidHandler
         makeFunc("AVIStreamRelease", 1),          // pavi

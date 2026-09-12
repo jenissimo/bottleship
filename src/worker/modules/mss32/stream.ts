@@ -21,6 +21,7 @@ import {
     closeStreamSource, closeVfsStreamSource, openStreamSource, openVfsStreamSource,
     seekIncrementalStream, serveIncrementalStreams, sniffVfsStream, startIncrementalStream,
 } from "./stream-engine";
+import { clampLevel, f32Arg, levelsToVolumePan, pan127ToPanLevel, panLevelToPan127, volumePanToLevels } from "./volume-levels";
 
 /** The NUL-terminated bytes at `ptr`, copied out of guest memory (host-side, so it
  *  survives the yields the caller makes). Bounded — a missing terminator is a bad
@@ -418,6 +419,51 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         stream.pan = Math.max(0, Math.min(127, pan));
         writeStreamPan(ctx, stream, stream.pan);
         if (stream.isPlaying) updateStreamPlayback(ctx, stream);
+        return 0;
+    };
+
+    // ---- MSS 6 F32 volume API ----------------------------------------------
+    // The stream twins of the sample pair: the same volume and pan fields, spelled
+    // as floats, delegating so the struct writeback stays in one place.
+    const setVolumePan127 = (ctxThunk: Parameters<ThunkImplementation>[0], mem: Uint8Array,
+                             handle: number, volume: number, pan: number): number => {
+        exports["_AIL_set_stream_volume@8"]!(ctxThunk, mem, [handle, volume]);
+        exports["_AIL_set_stream_pan@8"]!(ctxThunk, mem, [handle, pan]);
+        return 0;
+    };
+
+    /** Write an optional F32 out-parameter; Miles treats a NULL as "not wanted". */
+    const writeOptionalF32 = (mem: Uint8Array, pointer: number, value: number): void => {
+        if (!pointer || !isValidAddress(mem, pointer, 4, "rw")) return;
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setFloat32(pointer, value, true);
+    };
+
+    exports["_AIL_set_stream_volume_pan@12"] = (ctxThunk, mem, args) => {
+        if (!ctx.streams.has(args[0])) return 0;
+        return setVolumePan127(ctxThunk, mem, args[0],
+            Math.round(clampLevel(f32Arg(args[1])) * 127), panLevelToPan127(f32Arg(args[2])));
+    };
+
+    exports["_AIL_stream_volume_pan@12"] = (ctxThunk, mem, args) => {
+        const stream = ctx.streams.get(args[0]);
+        if (!stream) return 0;
+        writeOptionalF32(mem, args[1], clampLevel(stream.volume / 127));
+        writeOptionalF32(mem, args[2], pan127ToPanLevel(stream.pan));
+        return 0;
+    };
+
+    exports["_AIL_set_stream_volume_levels@12"] = (ctxThunk, mem, args) => {
+        if (!ctx.streams.has(args[0])) return 0;
+        const { volume, pan } = levelsToVolumePan(f32Arg(args[1]), f32Arg(args[2]));
+        return setVolumePan127(ctxThunk, mem, args[0], volume, pan);
+    };
+
+    exports["_AIL_stream_volume_levels@12"] = (ctxThunk, mem, args) => {
+        const stream = ctx.streams.get(args[0]);
+        if (!stream) return 0;
+        const { left, right } = volumePanToLevels(stream.volume, stream.pan);
+        writeOptionalF32(mem, args[1], left);
+        writeOptionalF32(mem, args[2], right);
         return 0;
     };
 

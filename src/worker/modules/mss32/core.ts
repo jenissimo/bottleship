@@ -4,8 +4,10 @@ import { Marshaler } from "../../core/memory/marshaler";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { isValidAddress } from "../../core/memory/address-guard";
 import { MSSContext, SMP_PLAYING } from "./context";
-import { ensureDriverHandle, startHeartbeat, stopHeartbeat, freeDriverResources, getBytesPerSecond, getPlaybackLengthBytes } from "./helpers";
-import { updateEmulatorState, stopRingBuffer } from "./playback-engine";
+import { ensureDriverHandle, startHeartbeat, stopHeartbeat, freeDriverResources, getBytesPerSecond, getPlaybackLengthBytes, getDigitalMasterVolume, setDigitalMasterVolume } from "./helpers";
+import { updateEmulatorState, stopRingBuffer, updateSamplePlayback, updateStreamPlayback } from "./playback-engine";
+import { clampLevel, f32Arg } from "./volume-levels";
+import { fpuPush } from "../../core/fpu-helper";
 import { processPendingTimerCallbacks, processPendingEOSCallbacks, processPendingStreamCallbacks } from "./callbacks";
 import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
 import { ensureListener3D } from "./spatial";
@@ -617,13 +619,43 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
 
     // ==================== Digital Master Volume ====================
 
-    exports["_AIL_set_digital_master_volume@8"] = (ctxThunk, mem, args) => {
-        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_set_digital_master_volume@8 dig=0x${args[0].toString(16)} vol=${args[1]}`);
+    // MSS 5 spelling: S32 0–127. MSS 6 adds the F32 `_level` pair below; both are
+    // exported by a shipped mss32.dll and both address driver+0x10, so a title's
+    // volume slider must move the same field whichever SDK it was built against.
+    const applyMasterVolume = (volume127: number): number => {
+        setDigitalMasterVolume(ctx, volume127);
+        for (const sample of ctx.samples.values()) {
+            if (sample.isPlaying) updateSamplePlayback(ctx, sample);
+        }
+        for (const stream of ctx.streams.values()) {
+            if (stream.isPlaying) updateStreamPlayback(ctx, stream);
+        }
         return 0;
     };
 
-    exports["_AIL_digital_master_volume@4"] = (ctxThunk, mem, args) => {
-        return 127;
+    exports["_AIL_set_digital_master_volume@8"] = (ctxThunk, mem, args) => {
+        Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_set_digital_master_volume@8 dig=0x${args[0].toString(16)} vol=${args[1]}`);
+        return applyMasterVolume(args[1] | 0);
+    };
+
+    exports["_AIL_digital_master_volume@4"] = () => getDigitalMasterVolume(ctx);
+
+    exports["_AIL_set_digital_master_volume_level@8"] = (ctxThunk, mem, args) =>
+        applyMasterVolume(clampLevel(f32Arg(args[1])) * 127);
+
+    // F32 return: x87 hands it back in ST(0), not EAX.
+    exports["_AIL_digital_master_volume_level@4"] = () => {
+        fpuPush(ctx.process.v86, getDigitalMasterVolume(ctx) / 127);
+        return 0;
+    };
+
+    // void AIL_set_DirectSound_HWND(HDIGDRIVER, HWND) — the window a DirectSound
+    // driver would set its cooperative level against. Our mixer is the audio worklet,
+    // which has no window, but the association is readable state a caller may set
+    // before it opens a driver and expect to survive.
+    exports["_AIL_set_DirectSound_HWND@8"] = (ctxThunk, mem, args) => {
+        ctx.directSoundHwnd = args[1] >>> 0;
+        return 0;
     };
 
     return exports;

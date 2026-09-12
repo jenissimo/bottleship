@@ -720,6 +720,23 @@ export class Avifil32 implements IModule {
             return 0x8004406F; // AVIERR_READONLY
         };
 
+        // ── AVI authoring ────────────────────────────────────────────────────
+        // Every file this module hands out is opened for reading, so the whole write
+        // side answers AVIERR_READONLY — the same code real avifil32 returns for a
+        // write against a read-mode file, and the one a caller already handles.
+        const AVIERR_READONLY = 0x8004406F;
+        const AVIERR_NOCOMPRESSOR = 0x80044071;
+        for (const name of ["AVIFileCreateStreamA", "AVIFileCreateStreamW",
+                            "AVIStreamSetFormat", "AVIStreamWrite", "AVIFileWriteData"]) {
+            this.exports[name] = () => AVIERR_READONLY;
+        }
+        // No VCM compressor is installed (see msvfw32), so there is nothing to make a
+        // compressed stream with.
+        this.exports["AVIMakeCompressedStream"] = () => AVIERR_NOCOMPRESSOR;
+        // The compression-options dialog is cancelled, which leaves nothing to free.
+        this.exports["AVISaveOptions"] = () => 0;
+        this.exports["AVISaveOptionsFree"] = () => 0;
+
         // ── AVIStreamFindSample(pavi, lPos, lFlags) ──────────────────────────
         this.exports["AVIStreamFindSample"] = (_ctx, _mem, args) => {
             const handle = args[0];
