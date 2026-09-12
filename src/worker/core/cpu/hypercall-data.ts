@@ -138,6 +138,14 @@ const HANDLER_STRCMP = 59;
 const HANDLER_STRCPY = 60;
 const HANDLER_STRICMP = 61;
 const HANDLER_MEMCMP = 62;
+// Bulk-memory leaves. These have no scalar body in Rust: a residency-guard miss falls
+// through to the JS implementation, so they are registered only once the engine reports
+// the matching ABI (see BULK_MEMORY_HANDLERS below).
+const HANDLER_MEMMOVE = 84;
+const HANDLER_MEMCHR = 85;
+const BULK_MEMORY_HANDLERS = new Set([HANDLER_MEMMOVE, HANDLER_MEMCHR]);
+/** Must match `get_bulk_memory_abi()` in vendor/v86/src/rust/cpu/bulk_memory.rs. */
+const BULK_MEMORY_ABI = 1;
 // Scheduler hypercalls (Tier 4)
 const HANDLER_SLEEP = 63;
 const HANDLER_TLS_GET_VALUE = 64;
@@ -369,6 +377,9 @@ const HANDLER_MAP: Record<string, number> = {
     'crtdll._strcmpi': HANDLER_STRICMP,
     'msvcrt.memcmp': HANDLER_MEMCMP,
     'crtdll.memcmp': HANDLER_MEMCMP,
+    'msvcrt.memmove': HANDLER_MEMMOVE,
+    'crtdll.memmove': HANDLER_MEMMOVE,
+    'msvcrt.memchr': HANDLER_MEMCHR,
     // Narrow ANSI string leaves — _strnicmp (count==0 → equal, NARROW convention), strstr, atoi/atol
     'msvcrt._strnicmp': HANDLER_STRNICMP,
     'crtdll._strnicmp': HANDLER_STRNICMP,
@@ -1013,6 +1024,12 @@ export class HypercallDataManager {
         this.view.setUint32(this.hpBase + OFF_HC_EVENT_STARVATION_LIMIT, limit >>> 0, true);
     }
 
+    /** The engine's bulk-memory ABI, or 0 when this build has no bulk kernels. */
+    private bulkMemoryAbi(): number {
+        const probe = (this.cpu as any)?.wm?.exports?.get_bulk_memory_abi;
+        return typeof probe === "function" ? Number(probe()) : 0;
+    }
+
     /**
      * Register a function for WASM handling.
      * Called after stubs are generated so functionId is known.
@@ -1024,6 +1041,10 @@ export class HypercallDataManager {
         const key = `${dllName.toLowerCase()}.${functionName.toLowerCase()}`;
         const handlerId = HANDLER_MAP[key];
         if (!handlerId) return;
+        // A v86 built before these kernels has no handler behind the id, and an unhandled
+        // dispatch answers with an untouched EAX rather than declining. Registering only
+        // when the engine reports the ABI keeps such a build on its JS fallbacks.
+        if (BULK_MEMORY_HANDLERS.has(handlerId) && this.bulkMemoryAbi() !== BULK_MEMORY_ABI) return;
 
         this.refreshViews();
         if (!this.view) return;

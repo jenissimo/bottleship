@@ -80,6 +80,8 @@
     "logs:stats": "bun tools/log-manager.ts stats",
     "analyze-trace": "bun tools/analyze-trace.ts",
     "test:fpu-relaxed": "node vendor/v86/tests/fpu-relaxed-diff.mjs",
+    "test:rep-differential": "node tools/runtime-test/rep-differential.test.mjs",
+    "test:string-differential": "node tools/runtime-test/string-differential.test.mjs",
     "test:dead-flags": "node vendor/v86/tests/dead-flag-elision-diff.mjs",
     "test:sse-move": "node tools/test-sse-move.mjs",
     "build:v86": "cd vendor/v86 && bash build-wasm.sh && cp build/v86.wasm ../../public/v86.wasm && echo 'v86.wasm copied to public/'",
