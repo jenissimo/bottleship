@@ -15,6 +15,8 @@ import {
     guestMemoryBorrowCount,
     setGuestMemoryBorrowBypass,
     isGuestMemoryBorrowBypassed,
+    borrowGuestMemory,
+    setGuestMemoryStaleGuard,
 } from "../../src/worker/core/memory/guest-memory";
 
 /** Stand-in for vendor/v86/src/lib.js `view()`: element access goes through a trap. */
@@ -128,5 +130,50 @@ describe("toPlainGuestMemory", () => {
             expect(after.buffer).toBe(grown.buffer);
             expect(after.length).toBe(32);
         });
+    });
+
+    describe("view identity", () => {
+        it("does not serve one subview's cached plain view to a different subview", () => {
+            const backing = new Uint8Array(64);
+            const lo = v86StyleProxy(backing.subarray(4, 12));
+            const hi = v86StyleProxy(backing.subarray(20, 32));
+
+            const first = toPlainGuestMemory(lo);
+            expect(first.byteOffset).toBe(4);
+            expect(toPlainGuestMemory(lo)).toBe(first);
+
+            // Same ArrayBuffer, different extent: buffer identity alone is NOT view identity.
+            const second = toPlainGuestMemory(hi);
+            expect(second.byteOffset).toBe(20);
+            expect(second.length).toBe(12);
+            second[0] = 0xad;
+            expect(backing[20]).toBe(0xad);
+            expect(backing[4]).toBe(0);
+        });
+    });
+});
+
+describe("stale-view guard", () => {
+    it("keeps typed-array accessors working and throws only on a stale touch", () => {
+        const memory = new WebAssembly.Memory({ initial: 1 });
+        const proxy = v86StyleProxy(new Uint8Array(memory.buffer));
+        setGuestMemoryStaleGuard(true);
+        try {
+            const guarded = borrowGuestMemory(proxy)!;
+            // buffer/byteLength/length are %TypedArray%.prototype accessors that validate
+            // `this`; forwarding the Proxy as the Reflect.get receiver TypeErrors on all three.
+            expect(guarded.length).toBe(65536);
+            expect(guarded.byteLength).toBe(65536);
+            expect(guarded.buffer).toBe(memory.buffer);
+            guarded[7] = 18;
+            expect(guarded.subarray(7, 8)[0]).toBe(18);
+
+            memory.grow(1);
+            toPlainGuestMemory(v86StyleProxy(new Uint8Array(memory.buffer)));
+            expect(() => guarded[7]).toThrow(/STALE/);
+            expect(() => { guarded[7] = 42; }).toThrow(/STALE/);
+        } finally {
+            setGuestMemoryStaleGuard(false);
+        }
     });
 });

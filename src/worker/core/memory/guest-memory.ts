@@ -56,6 +56,17 @@ export function isGuestMemoryBorrowBypassed(): boolean {
     return _bypass;
 }
 
+/**
+ * True for a real typed-array view, false for v86's `view()` Proxy.
+ *
+ * `ArrayBuffer.isView` reads an internal slot, so it answers WITHOUT entering the Proxy —
+ * which a Proxy over a plain object does not have. Declared as a plain boolean (not a type
+ * predicate) so it discriminates without narrowing the caller's generic to `never`.
+ */
+function isRealView(v: unknown): boolean {
+    return ArrayBuffer.isView(v);
+}
+
 export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw: T): T {
     _borrows++;
     if (_bypass) return raw;
@@ -68,11 +79,18 @@ export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw:
     // the old (non-shared) ArrayBuffer, so "still attached" is the buffer-identity test the
     // slow path performs.
     if (raw === _lastRaw && _lastPlain !== null && _lastPlain.byteLength !== 0) return _lastPlain as T;
-    // Already a canonical Uint8Array (non-proxy / post-fix steady state) — nothing to do.
-    if (raw.constructor === Uint8Array) return raw;
+    // Already a real typed-array view (non-proxy / post-fix steady state) — nothing to do.
+    // `ArrayBuffer.isView` reads an internal slot, so it answers without entering the
+    // Proxy at all; `raw.constructor` was a `get` trap that, because the property is a
+    // function, handed back a freshly allocated `Uint8Array.bind(view)` every time the
+    // identity fast path above missed.
+    if (isRealView(raw)) return raw;
     const buffer = raw.buffer; // proxy get → the CURRENT (possibly just-grown) ArrayBuffer
     if (!buffer) return raw;
-    if (buffer === _lastBuffer && _lastPlain) return _lastPlain as T;
+    // Buffer identity alone does NOT identify a view: two subviews of one ArrayBuffer differ
+    // only in offset/length, and answering with the wrong one silently reads the wrong bytes.
+    if (buffer === _lastBuffer && _lastPlain &&
+        raw.byteOffset === _lastPlain.byteOffset && raw.length === _lastPlain.length) return _lastPlain as T;
     // NB: read `raw.length` (whitelisted in v86's view() Proxy get-trap), NOT
     // `raw.byteLength` (absent from the whitelist → trips dbg_assert in a DEBUG
     // v86 build). For a Uint8Array the two are identical.
@@ -133,11 +151,14 @@ function makeStaleGuard(view: Uint8Array): Uint8Array {
         }
     };
     return new Proxy(view, {
-        get(target, prop, receiver) {
+        get(target, prop) {
             if (typeof prop === "string" && (prop === "buffer" || prop === "byteLength" || /^\d+$/.test(prop))) {
                 assertLive(prop);
             }
-            const x = Reflect.get(target, prop, receiver);
+            // Receiver must be the TYPED ARRAY, not the Proxy: buffer/byteLength/length are
+            // prototype accessors that ValidateTypedArray(this), and a Proxy has no
+            // [[TypedArrayName]] slot — forwarding the proxy makes every one of them TypeError.
+            const x = Reflect.get(target, prop, target);
             return typeof x === "function" ? x.bind(target) : x;
         },
         set(target, prop, value) {
