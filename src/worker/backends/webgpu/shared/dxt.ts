@@ -21,6 +21,8 @@
  * 4×4 blocks, so there is nothing to reuse there.
  */
 
+import { tryDecodeDxtKernel } from "./dxt-kernel";
+
 // D3DFORMAT FourCC codes (little-endian 'DXT1'..'DXT5').
 export const D3DFMT_DXT1 = 0x31545844; // 'DXT1' — BC1 (1-bit alpha)
 export const D3DFMT_DXT2 = 0x32545844; // 'DXT2' — BC2, premultiplied alpha
@@ -144,11 +146,16 @@ function decodeColorPalette(
 /**
  * Decode a DXT1/DXT3/DXT5 surface to tightly-packed RGBA8 (bytesPerRow = width*4).
  *
+ * The reference implementation of the format, and the fallback whenever the WASM
+ * kernel is absent or declines the layout. Callers go through `decodeDxtToRgba`;
+ * this is exported so a differential test can drive both paths over one
+ * implementation rather than a duplicated oracle.
+ *
  * @param src       compressed blocks
  * @param srcPitch  byte pitch of one block row in `src` (== dxtRowPitch)
- * @param dst       destination RGBA8 buffer (>= width*height*4 bytes)
+ * @param dst       destination RGBA8 buffer (>= width*height*4 bytes), word-aligned
  */
-export function decodeDxtToRgba(
+export function decodeDxtToRgbaCpu(
     format: number,
     src: Uint8Array,
     srcPitch: number,
@@ -234,4 +241,49 @@ export function decodeDxtToRgba(
             }
         }
     }
+}
+
+/**
+ * Checked public entry point. Validates the whole request once, then routes bulk
+ * surfaces to the WASM kernel and everything else to the TypeScript decoder.
+ *
+ * Native BC upload remains the preferred path for block-aligned textures on an
+ * adapter with `texture-compression-bc`; this is what the CPU fallback costs.
+ */
+export function decodeDxtToRgba(
+    format: number,
+    src: Uint8Array,
+    srcPitch: number,
+    width: number,
+    height: number,
+    dst: Uint8Array
+): void {
+    if (!isDxtFormat(format)) throw new RangeError("decodeDxtToRgba: unsupported DXT format");
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) ||
+        !Number.isSafeInteger(srcPitch) || width < 0 || height < 0 || srcPitch < 0) {
+        throw new RangeError("decodeDxtToRgba: invalid dimensions or pitch");
+    }
+    if (width === 0 || height === 0) return;
+    const rowBytes = dxtRowPitch(format, width);
+    const srcBytes = (blocksHigh(height) - 1) * srcPitch + rowBytes;
+    const dstBytes = width * height * 4;
+    if (srcPitch < rowBytes || !Number.isSafeInteger(srcBytes) || !Number.isSafeInteger(dstBytes) ||
+        srcBytes > src.byteLength || dstBytes > dst.byteLength) {
+        throw new RangeError("decodeDxtToRgba: source/destination too short or pitch invalid");
+    }
+    if (src.buffer === dst.buffer && src.byteOffset < dst.byteOffset + dstBytes &&
+        dst.byteOffset < src.byteOffset + srcBytes) {
+        throw new RangeError("decodeDxtToRgba: source and destination overlap");
+    }
+    // The FourCC's trailing digit is the kernel's format discriminant.
+    if (tryDecodeDxtKernel((format >>> 24) - 0x30, src, srcPitch, width, height, dst, srcBytes)) return;
+    // The byte-buffer API admits any byteOffset; the Uint32Array the decoder
+    // writes through does not, so an odd destination is decoded into a scratch.
+    if ((dst.byteOffset & 3) !== 0) {
+        const aligned = new Uint8Array(dstBytes);
+        decodeDxtToRgbaCpu(format, src, srcPitch, width, height, aligned);
+        dst.set(aligned);
+        return;
+    }
+    decodeDxtToRgbaCpu(format, src, srcPitch, width, height, dst);
 }

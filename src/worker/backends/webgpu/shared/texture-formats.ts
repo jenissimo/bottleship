@@ -900,11 +900,24 @@ export function decodeD3DTextureToRgba8(
     const out = options.out && options.out.length >= requiredBytes
         ? options.out.subarray(0, requiredBytes)
         : new Uint8Array(requiredBytes);
+    // Degenerate geometry yields a zeroed buffer. This is an upload path inside
+    // the frame loop, so a bad extent must not become a thrown RangeError from
+    // one of the checked decoders below.
+    if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) return out;
 
     if (isDxtFormat(format)) {
-        const pitch = options.pitch ?? dxtRowPitch(format, width);
+        const rowBytes = dxtRowPitch(format, width);
+        // The pitch is guest-supplied (a LockRect stride). Nothing can decode
+        // below one block row, so clamp instead of letting the validated decoder
+        // reject a whole frame's texture upload.
+        const pitch = Number.isSafeInteger(options.pitch) ? Math.max(options.pitch!, rowBytes) : rowBytes;
         const bytes = pitch * blocksHigh(height);
-        const compressed = src.subarray(srcPtr, Math.min(src.length, srcPtr + bytes));
+        // A guest surface can end short of the block count its dimensions imply.
+        // decodeDxtToRgba validates the whole extent up front, so pad the tail
+        // with zeroes rather than hand it a buffer it must reject.
+        const available = src.subarray(srcPtr, Math.min(src.length, srcPtr + bytes));
+        const compressed = available.length >= bytes ? available : new Uint8Array(bytes);
+        if (compressed !== available) compressed.set(available);
         decodeDxtToRgba(format, compressed, pitch, width, height, out);
         return out;
     }
