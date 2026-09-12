@@ -16,6 +16,7 @@
 import type { HarnessService } from "../service";
 import type { HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
+import { retiredDelta } from "./perf";
 import { sys, cpu, guestMem, proc } from "../serialize";
 import { TimeService } from "../../runtime/time";
 import { guestTimeSteps } from "../../core/guest-time-steps";
@@ -48,12 +49,30 @@ function buildPredicate(marker: unknown): () => boolean {
     const readF32 = (a: number) => view()?.getFloat32(a >>> 0, true) ?? 0;
     const eip = () => (cpu()?.instruction_pointer?.[0] ?? 0) >>> 0;
     const reg = (i: number) => (cpu()?.reg32?.[i] ?? 0) >>> 0;
+    // retired() — guest instructions since THIS wait began, accumulated across the counter's
+    // 32-bit wrap. A load is the one thing whose length is a property of the guest rather
+    // than of our speed, so it is what a paired timing run should stop on: both arms then
+    // do identical guest work and only the wall clock differs. Fresh per predicate, so the
+    // number always reads "since the wait started" and never carries a previous run in.
+    let retiredAcc = 0;
+    let retiredLast: number | null = null;
+    const retired = () => {
+        const c = cpu() as { instruction_counter?: Int32Array } | null;
+        // An unreadable counter reports NO progress. Defaulting it to 0 makes the next
+        // wrap-safe delta ~4.3e9 and satisfies any target instantly, with a perfectly
+        // plausible elapsed time attached — the failure this project keeps rediscovering.
+        if (!c?.instruction_counter) return retiredAcc;
+        const now = c.instruction_counter[0]! >>> 0;
+        if (retiredLast !== null) retiredAcc += retiredDelta(retiredLast, now);
+        retiredLast = now;
+        return retiredAcc;
+    };
     const factory = new Function(
-        "read32", "read16", "read8", "readF32", "readU32", "eip", "reg", "Mem",
+        "read32", "read16", "read8", "readF32", "readU32", "eip", "reg", "Mem", "retired",
         `"use strict"; return (${src});`,
     );
     const Mem = { read32, read16, read8, readF32 };
-    return factory(read32, read16, read8, readF32, read32, eip, reg, Mem) as () => boolean;
+    return factory(read32, read16, read8, readF32, read32, eip, reg, Mem, retired) as () => boolean;
 }
 
 export function registerTimeCommands(svc: HarnessService): void {

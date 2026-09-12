@@ -23,6 +23,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { retiredDelta } from "./perf";
 import { cpu } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
+import { readTextureKernelLedger } from "../../backends/webgpu/shared/dxt-kernel";
 import {
     classifyOpcode, classGroup, classifyAddrKey, simdFamily,
     type InstrClass, type AddrForm, type SimdFamily,
@@ -254,6 +255,86 @@ export function summarizeCensus(before: CensusSnapshot, after: CensusSnapshot): 
     };
 }
 
+/**
+ * The guarded fast-path kernels and the shape of each one's ledger.
+ *
+ * Every kernel counts its hits per operation plus one decline bucket, so hits + declines
+ * is every call that reached it. A kernel that is compiled in but never asked answers
+ * zero on both, which is a different fact from a kernel that is not in the binary at all —
+ * hence `present`, rather than a plausible row of zeros either way.
+ */
+const KERNELS = [
+    { name: "bulk", abi: "get_bulk_memory_abi", ptr: "get_bulk_memory_stats_ptr",
+      enable: "set_bulk_memory_enabled",
+      fields: ["copy", "fill", "compare", "move", "find", "declined"] },
+    { name: "rep", abi: "get_rep_memory_abi", ptr: "get_rep_memory_stats_ptr",
+      enable: "set_rep_memory_enabled",
+      fields: ["cmps", "scas", "stosw", "stosd", "declined"] },
+    { name: "unalignedRep", abi: "get_unaligned_rep_abi", ptr: "get_unaligned_rep_stats_ptr",
+      enable: "set_unaligned_rep_enabled",
+      fields: ["cmpsw", "cmpsd", "scasw", "scasd", "stosw", "stosd", "bridge", "declined"] },
+    { name: "string", abi: "get_string_memory_abi", ptr: "get_string_memory_stats_ptr",
+      enable: "set_string_memory_enabled",
+      fields: ["strlen", "wcslen", "strcmp", "stricmp", "wcsicmp", "strchr", "strrchr",
+               "wcschr", "strcpy", "wcscpy", "declined"] },
+] as const;
+
+export interface KernelLedger {
+    present: boolean;
+    abi: number | null;
+    counts: Record<string, number>;
+    hits: number;
+    declined: number;
+}
+
+export function readKernelLedgers(): Record<string, KernelLedger> {
+    const w = exportsOf();
+    const buffer = (cpu() as { wasm_memory?: WebAssembly.Memory } | null)?.wasm_memory?.buffer;
+    const out: Record<string, KernelLedger> = {};
+    for (const k of KERNELS) {
+        const abiFn = w?.[k.abi];
+        const ptrFn = w?.[k.ptr];
+        if (typeof abiFn !== "function" || typeof ptrFn !== "function" || !buffer) {
+            out[k.name] = { present: false, abi: null, counts: {}, hits: 0, declined: 0 };
+            continue;
+        }
+        const raw = new Uint32Array(buffer, ptrFn() >>> 0, k.fields.length);
+        const counts: Record<string, number> = {};
+        let hits = 0;
+        for (let i = 0; i < k.fields.length; i++) {
+            const field = k.fields[i]!;
+            counts[field] = raw[i]!;
+            if (field !== "declined") hits += raw[i]!;
+        }
+        out[k.name] = { present: true, abi: abiFn() >>> 0, counts, hits, declined: counts["declined"] ?? 0 };
+    }
+    return out;
+}
+
+let kernelMark: Record<string, KernelLedger> | null = null;
+let textureMark: ReturnType<typeof readTextureKernelLedger> | null = null;
+
+function diffLedgers(before: Record<string, KernelLedger>, after: Record<string, KernelLedger>) {
+    const out: Record<string, unknown> = {};
+    for (const k of KERNELS) {
+        const a = after[k.name]!;
+        const b = before[k.name];
+        if (!a.present) { out[k.name] = { present: false }; continue; }
+        const counts: Record<string, number> = {};
+        for (const field of k.fields) counts[field] = a.counts[field]! - (b?.counts[field] ?? 0);
+        const declined = counts["declined"] ?? 0;
+        const hits = k.fields.reduce((n, f) => f === "declined" ? n : n + counts[f]!, 0);
+        out[k.name] = {
+            present: true, hits, declined,
+            // Of the calls that reached the kernel, the share it actually answered. A low
+            // share with a high total means the guard is rejecting, not that the path is cold.
+            answeredShare: hits + declined ? round(hits / (hits + declined)) : null,
+            counts,
+        };
+    }
+    return out;
+}
+
 export function registerCensusCommands(svc: HarnessService): void {
     /**
      * opcodeCensusArm() — switch census emission on, zero the buffers and clear the JIT
@@ -296,5 +377,65 @@ export function registerCensusCommands(svc: HarnessService): void {
         const out = summarizeCensus(mark, readCensusSnapshot());
         if (!out.ok) throw new HarnessError(out.refuse, out.code);
         return out.report;
+    });
+
+    /**
+     * kernelLedgers() — how much work the guarded fast-path kernels actually did, over the
+     * window since kernelLedgersMark() (or since the process started, without one).
+     *
+     * This is the ONLY way to see the REP kernels: they run inside guest instruction
+     * execution, never cross the dispatcher, and so appear in no thunk bucket of a trace.
+     * Read it before designing any A/B — a counter that does not move is the answer.
+     */
+    svc.register("kernelLedgers", () => {
+        const now = readKernelLedgers();
+        const absent = KERNELS.filter(k => !now[k.name]!.present).map(k => k.name);
+        // The texture kernels are a separate wasm module with no v86 export, so they are
+        // read from their own ledger rather than through the engine.
+        const texture = readTextureKernelLedger();
+        return {
+            windowed: kernelMark !== null,
+            ledgers: diffLedgers(kernelMark ?? {}, now),
+            texture: textureMark
+                ? { ...texture,
+                    decode: texture.decode - textureMark.decode,
+                    decodeDeclined: texture.decodeDeclined - textureMark.decodeDeclined,
+                    convert: texture.convert - textureMark.convert,
+                    convertDeclined: texture.convertDeclined - textureMark.convertDeclined }
+                : texture,
+            ...(absent.length
+                ? { warning: `not in this v86 build: ${absent.join(", ")} — rebuild vendor/v86 (build-wasm.sh)` }
+                : {}),
+        };
+    });
+
+    /** kernelLedgersMark() — window baseline, so a load screen can be measured apart from a frame loop. */
+    svc.register("kernelLedgersMark", () => {
+        kernelMark = readKernelLedgers();
+        textureMark = readTextureKernelLedger();
+        return { marked: true, atMs: round(performance.now()) };
+    });
+
+    /**
+     * kernelSwitch({bulk, rep, unalignedRep, string}) — flip a kernel off or on without a
+     * rebuild, so both arms of an A/B are the SAME binary and no build difference can be
+     * mistaken for the effect.
+     */
+    svc.register("kernelSwitch", (args) => {
+        const want = (args[0] ?? {}) as Record<string, boolean | undefined>;
+        const w = exportsOf();
+        const applied: Record<string, boolean> = {};
+        for (const k of KERNELS) {
+            const on = want[k.name];
+            if (on === undefined) continue;
+            const fn = w?.[k.enable];
+            if (typeof fn !== "function") {
+                throw new HarnessError(`${k.enable} missing — rebuild vendor/v86 (build-wasm.sh)`,
+                    HarnessErrorCode.INTERNAL);
+            }
+            fn(on ? 1 : 0);
+            applied[k.name] = on;
+        }
+        return { applied };
     });
 }

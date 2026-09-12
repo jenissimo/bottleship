@@ -190,14 +190,35 @@ export function getTextureKernelStatus(): { ready: boolean; failure: string | nu
     return { ready: kernel !== null, failure, variant };
 }
 
+/**
+ * Decode and convert hits, and the calls that fell back to TypeScript.
+ *
+ * Without this there is no way to tell a kernel that is never asked from one that is
+ * asked and declines, and the two call for opposite conclusions: the first means the
+ * path is cold and the work is wasted, the second means the guard is rejecting.
+ * Pixels routed to TS on purpose (unkeyed RGB565) count as `declined` like any other.
+ */
+const ledger = { decode: 0, decodeDeclined: 0, convert: 0, convertDeclined: 0 };
+
+export function readTextureKernelLedger(): {
+    ready: boolean; variant: KernelVariant | null; failure: string | null;
+    decode: number; decodeDeclined: number; convert: number; convertDeclined: number;
+} {
+    return { ready: kernel !== null, variant, failure, ...ledger };
+}
+
 export function tryDecodeDxtKernel(kind: number, src: Uint8Array, pitch: number,
     width: number, height: number, dst: Uint8Array, srcBytes: number): boolean {
-    return kernel !== null && kernel.tryDecodeDxt(kind, src, pitch, width, height, dst, srcBytes);
+    const ok = kernel !== null && kernel.tryDecodeDxt(kind, src, pitch, width, height, dst, srcBytes);
+    if (ok) ledger.decode++; else ledger.decodeDeclined++;
+    return ok;
 }
 
 export function tryConvertPixelKernel(kind: number, src: Uint8Array, srcOffset: number, pitch: number,
     width: number, height: number, dst: Uint8Array, key?: { low: number; high: number }): boolean {
-    return kernel !== null && kernel.tryConvertPixels(kind, src, srcOffset, pitch, width, height, dst, key);
+    const ok = kernel !== null && kernel.tryConvertPixels(kind, src, srcOffset, pitch, width, height, dst, key);
+    if (ok) ledger.convert++; else ledger.convertDeclined++;
+    return ok;
 }
 
 // Warm the kernel as soon as the worker module graph loads: the first texture
