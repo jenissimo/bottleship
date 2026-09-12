@@ -35,6 +35,8 @@ const IS_WIN = process.platform === "win32";
 const CHROME_PATH = IS_MAC
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "C:/Program Files/Google/Chrome/Application/chrome.exe";
+/** Where a detached Chrome's stdout/stderr land — see launchChrome. */
+export const CHROME_STDIO_DIR = `${process.cwd()}/logs/chrome`;
 const DEFAULT_PROFILE = IS_MAC
     ? `${process.env.HOME}/.bottleship-cdp-profile`
     : `${process.cwd()}/tmp/cdp-profile`;
@@ -170,8 +172,17 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
     } else {
         // Detached via PowerShell Start-Process so Chrome outlives this bun process
         // (a plain Bun.spawn child dies with bun on Windows).
+        //
+        // stdout/stderr are redirected to disk because renderer subprocesses inherit these
+        // handles, and a V8 fatal-OOM banner or a sandbox abort is printed there and NOWHERE
+        // else — not in the trace, not in the page, not in any CDP event. Without this a
+        // renderer or worker that dies of memory pressure leaves no evidence at all.
+        mkdirSync(CHROME_STDIO_DIR, { recursive: true });
         const psArgs = args.map((a) => `'${a}'`).join(",");
-        Bun.spawnSync(["powershell", "-NoProfile", "-Command", `Start-Process -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}`]);
+        Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+            `Start-Process -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}` +
+            ` -RedirectStandardOutput '${CHROME_STDIO_DIR}/stdout.log'` +
+            ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`]);
     }
     return waitForChrome(port, 50);
 }
@@ -299,6 +310,13 @@ export class CdpSession {
  * load-bearing one — without it the trace has no Profile/ProfileChunk events and the
  * analyzer reports nothing.
  */
+/** The default recording set — exported so a caller can bisect it (see harness trace --without). */
+export const DEFAULT_TRACE_CATEGORIES = [
+    "disabled-by-default-v8.cpu_profiler",
+    "v8", "v8.execute", "devtools.timeline", "blink.user_timing", "toplevel",
+    "gpu", "disabled-by-default-gpu.dawn",
+];
+
 export async function captureTrace(
     outFile: string,
     seconds: number,
@@ -311,8 +329,12 @@ export async function captureTrace(
          *  whose FIRST milliseconds are the subject (a cold boot). Keep it short — the window
          *  is already running while it awaits. */
         onStarted?: () => Promise<void>;
+        /** Chrome's TraceLog buffer policy. "recordAsMuchAsPossible" grows until the buffer
+         *  cap; "recordContinuously" is a bounded RING that overwrites the oldest events and
+         *  therefore never grows. Use the ring for long windows where only the tail matters. */
+        recordMode?: "recordAsMuchAsPossible" | "recordContinuously" | "recordUntilFull";
     } = {},
-): Promise<{ file: string; events: number; bytes: number }> {
+): Promise<{ file: string; events: number; bytes: number; maxPercentFull: number; bufferFull: boolean }> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const version = await fetchJson(port, "/json/version");
     const session = await CdpSession.connect(version.webSocketDebuggerUrl);
@@ -325,11 +347,7 @@ export async function captureTrace(
     // WebGPU/Dawn work items, which is the only place a "the GPU is the second wall" claim can
     // come from. Recording them costs trace size, not runtime: they are emitted by the GPU
     // process, not by the worker under measurement.
-    const categories = opts.categories ?? [
-        "disabled-by-default-v8.cpu_profiler",
-        "v8", "v8.execute", "devtools.timeline", "blink.user_timing", "toplevel",
-        "gpu", "disabled-by-default-gpu.dawn",
-    ];
+    const categories = opts.categories ?? DEFAULT_TRACE_CATEGORIES;
     const events: any[] = [];
     // Not `push(...batch)`: the spread passes every element as an ARGUMENT, and Chrome sends
     // batches well past the engine's argument limit on a busy trace — a RangeError thrown
@@ -337,9 +355,22 @@ export async function captureTrace(
     session.on("Tracing.dataCollected", (p) => { if (p?.value) for (const e of p.value) events.push(e); });
     const complete = new Promise<void>((resolve) => session.on("Tracing.tracingComplete", () => resolve()));
 
+    // Buffer telemetry. Chrome's trace buffer is FINITE, and when it fills the recording keeps
+    // running while silently dropping events — the artifact then looks complete and every
+    // count read off it is wrong. `bufferUsage` is the only signal that this happened, so it
+    // is always on and always reported.
+    let maxPercentFull = 0;
+    let lastEventCount = 0;
+    session.on("Tracing.bufferUsage", (p) => {
+        if (typeof p?.percentFull === "number") maxPercentFull = Math.max(maxPercentFull, p.percentFull);
+        if (typeof p?.value === "number") maxPercentFull = Math.max(maxPercentFull, p.value);
+        if (typeof p?.eventCount === "number") lastEventCount = p.eventCount;
+    });
+
     await session.send("Tracing.start", {
-        traceConfig: { includedCategories: categories, recordMode: "recordAsMuchAsPossible" },
+        traceConfig: { includedCategories: categories, recordMode: opts.recordMode ?? "recordAsMuchAsPossible" },
         transferMode: "ReportEvents",
+        bufferUsageReportingInterval: 1000,
     });
     // `during` runs INSIDE the recording window (a third of the way in, so its own sampling
     // interval finishes comfortably before Tracing.end). This is how the bottleship.hotblocks
@@ -375,7 +406,15 @@ export async function captureTrace(
         createGzip(),
         createWriteStream(outFile),
     );
-    return { file: outFile, events: events.length, bytes: statSync(outFile).size };
+    return {
+        file: outFile,
+        events: events.length,
+        bytes: statSync(outFile).size,
+        maxPercentFull,
+        // Chrome reports percentFull as a 0..1 fraction; anything at the cap means the
+        // recording dropped events and the artifact is a SAMPLE, not the window.
+        bufferFull: maxPercentFull >= 0.99 || (lastEventCount > 0 && maxPercentFull >= 0.99),
+    };
 }
 
 /** Connect to the game=dev page target. */

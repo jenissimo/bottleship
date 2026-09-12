@@ -49,6 +49,9 @@ import {
 import { resolve as resolvePath, sep } from "node:path";
 import { readdirSync } from "node:fs";
 import { readCanvasGeometry } from "./cdp-geometry";
+import { watchWorkerHealth, formatWorkerHealth } from "./cdp-worker-health";
+import { listCrashes, formatCrash } from "./cdp-crashes";
+import { DEFAULT_TRACE_CATEGORIES } from "./cdp-core";
 import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
 import { HarnessChain } from "../src/harness/dsl";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "../src/harness/types";
@@ -268,6 +271,12 @@ async function cmdUp(): Promise<void> {
 async function cmdRun(scriptPath: string): Promise<void> {
     if (!scriptPath) throw new Error("usage: harness run <script.harness.ts>");
     const abs = scriptPath.startsWith("/") || /^[A-Za-z]:/.test(scriptPath) ? scriptPath : `${process.cwd()}/${scriptPath}`;
+    // A missing script must be an ERROR, not a quiet success: `run` on a path that does
+    // not exist otherwise prints the banner, exits 0, and reads exactly like a run whose
+    // assertions all passed.
+    if (!(await Bun.file(abs).exists())) {
+        throw new Error(`harness run: script not found: ${abs}`);
+    }
     console.log(`[harness run] ${abs}`);
     // An absolute self-import re-enters this file as the process entry (see the CLI guard at
     // the bottom). The guard stops the recursion; naming it here is what stops the next
@@ -596,7 +605,8 @@ async function cmdTrace(secondsArg?: string, out?: string, ...rest: string[]): P
     const bootIdx = argv.indexOf("--boot");
     const bootBundle = bootIdx >= 0 ? argv[bootIdx + 1] : undefined;
     if (bootIdx >= 0 && !bootBundle) throw new Error("trace --boot needs a bundle id or path");
-    out = argv.find((a, i) => a !== "--boot" && argv[i - 1] !== "--boot");
+    const FLAGS_WITH_VALUE = new Set(["--boot", "--without", "--categories"]);
+    out = argv.find((a, i) => !a.startsWith("--") && !FLAGS_WITH_VALUE.has(argv[i - 1] ?? ""));
     const tabs = await listSessionTabs().catch(() => []);
     if (tabs.length > 1 && process.env.BS_ALLOW_PARALLEL_TRACE !== "1") {
         throw new Error(
@@ -605,6 +615,17 @@ async function cmdTrace(secondsArg?: string, out?: string, ...rest: string[]): P
             "  Close the other sessions' tabs, or set BS_ALLOW_PARALLEL_TRACE=1 if you really only want the trace shape.",
         );
     }
+    // Category surgery, for bisecting a trace that KILLS what it is measuring: `--without a,b`
+    // drops categories from the default set, `--categories a,b` replaces it outright, and
+    // `--no-mark` records without the in-window hotBlocksMark so the recording itself is the
+    // only variable. Without these, "is it the tracer?" can only be answered by editing code.
+    const listArg = (flag: string) => {
+        const i = argv.indexOf(flag);
+        return i >= 0 ? (argv[i + 1] ?? "").split(",").map((x) => x.trim()).filter(Boolean) : null;
+    };
+    const without = listArg("--without");
+    const only = listArg("--categories");
+    const noMark = argv.includes("--no-mark");
     const file = out ?? artifact(`logs/trace-${seconds}s${bootBundle ? "-boot" : ""}.json.gz`);
     // A cold boot needs a fresh worker, and the reload must be OUTSIDE the window — otherwise
     // page teardown/startup is the first thing the trace shows instead of the boot itself.
@@ -615,13 +636,19 @@ async function cmdTrace(secondsArg?: string, out?: string, ...rest: string[]): P
         console.log(`page reloaded; recording ${seconds}s from the first byte of ${bootBundle} …`);
     }
     console.log(`tracing ${seconds}s -> ${file} …`);
+    // A trace that kills the worker used to surface as an unrelated 300 s pageEval timeout.
+    // Watching existence costs nothing and attaches nothing, so it is always on.
+    const workerWatch = await watchWorkerHealth({ processMemory: true, pageWsUrl: (await findOrCreateTab(DEFAULT_DEV_URL)).webSocketDebuggerUrl });
     // Arm the guest-attribution mark INSIDE the window: without bottleship.hotblocks every
     // wasm frame in the artifact stays an opaque wasm-function[N] (v86's table indices do not
     // match Chrome's numbering, so the join is sampled, never computed) and the trace analyses
     // shallow while looking complete.
     let hotBlocks: { blocks?: number; marked?: boolean; note?: string } | null = null;
     const sampleMs = Math.min(3000, Math.max(800, (seconds * 1000) / 4));
+    const categories = only ?? (without ? DEFAULT_TRACE_CATEGORIES.filter((c) => !without.includes(c)) : undefined);
+    if (categories) console.log(`  categories: ${categories.join(", ")}`);
     const r = await captureTrace(file, seconds, {
+        categories,
         onStarted: bootBundle && bootSession
             // Deliberately NOT awaited: openWgb resolves only when the load completes, which
             // is the very thing being measured.
@@ -633,19 +660,71 @@ async function cmdTrace(secondsArg?: string, out?: string, ...rest: string[]): P
                 );
             }
             : undefined,
-        during: async () => {
+        during: noMark ? undefined : async () => {
             try {
-                const res = await execViaCdp([{ cmd: "hotBlocksMark", args: [{ ms: sampleMs }], opts: { timeoutMs: sampleMs + 30_000 } } as unknown as HarnessStep]);
+                // Raced, because the page-batch budget has a 300 s floor: when the worker is
+                // dead this hook otherwise blocks for five minutes INSIDE the recording
+                // window, and a "25 s trace" quietly becomes a 300 s one.
+                const res = await Promise.race([
+                    execViaCdp([{ cmd: "hotBlocksMark", args: [{ ms: sampleMs }], opts: { timeoutMs: sampleMs + 30_000 } } as unknown as HarnessStep]),
+                    Bun.sleep(sampleMs + 20_000).then(() => { throw new Error(`no answer in ${(sampleMs + 20_000) / 1000}s — the worker is not responding`); }),
+                ]);
                 hotBlocks = (res.steps?.[0]?.result ?? null) as typeof hotBlocks;
             } catch (e) {
                 console.warn(`  hotBlocksMark failed (guest attribution will be unavailable): ${e}`);
             }
         },
     });
-    console.log(`  ${r.events} events, ${(r.bytes / 1024 / 1024).toFixed(1)} MB`);
+    const health = await workerWatch.stop();
+    console.log(`  ${r.events} events, ${(r.bytes / 1024 / 1024).toFixed(1)} MB, buffer peak ${(r.maxPercentFull * 100).toFixed(0)}%`);
+    if (r.bufferFull) {
+        console.log("  BUFFER FULL — Chrome dropped events while still recording. Every count read");
+        console.log("  off this artifact is a lower bound, not a measurement. Shorten the window or");
+        console.log("  drop categories (--without) until the peak stays below 100%.");
+    }
+    console.log(formatWorkerHealth(health));
     if (hotBlocks?.marked) console.log(`  bottleship.hotblocks: ${hotBlocks.blocks} blocks — wasm frames resolve to module:rva`);
     else console.log(`  bottleship.hotblocks: NOT emitted${hotBlocks?.note ? ` (${hotBlocks.note})` : ""} — guest attribution will read UNAVAILABLE`);
     console.log(`  analyze: bun tools/analyze-trace.ts ${file} --thread worker --top 40`);
+}
+
+/** crashes [minutes] — Chrome's own crash dumps for this profile, newest last.
+ *  A renderer crash is invisible from inside the tooling (the page target survives, the
+ *  workers vanish, nothing is logged), so "the worker died silently" is what it looks like
+ *  from every other verb. This is the one place that can say it was a crash and name it. */
+async function cmdCrashes(args: string[]): Promise<void> {
+    const minutes = Number(args[0] ?? 0);
+    const since = minutes > 0 ? new Date(Date.now() - minutes * 60_000) : undefined;
+    const list = listCrashes({ since });
+    if (!list.length) {
+        console.log(minutes ? `no crash dumps in the last ${minutes} min` : "no crash dumps in this Chrome profile");
+        return;
+    }
+    for (const c of list) console.log(formatCrash(c));
+    const byPrint = new Map<string, number>();
+    for (const c of list) byPrint.set(c.fingerprint, (byPrint.get(c.fingerprint) ?? 0) + 1);
+    if (byPrint.size < list.length) {
+        console.log("");
+        console.log("repeats (same faulting instruction):");
+        for (const [fp, n] of [...byPrint].filter(([, n]) => n > 1)) console.log(`  ${n}x ${fp}`);
+    }
+}
+
+/** workers <seconds> [--heap] — watch this session's worker targets and report whether they
+ *  survived the window. Use it around anything suspected of killing the emulator worker: a
+ *  dead worker is otherwise invisible until an unrelated verb times out minutes later.
+ *  `--heap` attaches a debugger session per worker to sample V8 heap usage — informative,
+ *  but it perturbs the isolate, so leave it off when instrumentation is the suspect. */
+async function cmdWorkers(args: string[]): Promise<void> {
+    const seconds = Number(args.find((a) => !a.startsWith("--")) ?? 30);
+    const heap = args.includes("--heap");
+    const tab = await findOrCreateTab(DEFAULT_DEV_URL);
+    const watch = await watchWorkerHealth({ heap, processMemory: true, pageWsUrl: tab.webSocketDebuggerUrl });
+    console.log(`watching worker targets for ${seconds}s${heap ? " (+heap)" : ""} …`);
+    await Bun.sleep(seconds * 1000);
+    const report = await watch.stop();
+    console.log(formatWorkerHealth(report));
+    console.log(JSON.stringify({ survived: report.survived, died: report.died, peakUsedMb: report.peakUsedMb }, null, 2));
 }
 
 const REGRESSION_DIR = resolvePath(import.meta.dir, "harness", "regression");
@@ -802,10 +881,12 @@ async function main(): Promise<void> {
         case "shot": await cmdShot(rest[0], ...rest.slice(1)); break;
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
         case "trace": await cmdTrace(rest[0], rest[1], ...rest.slice(2)); break;
+        case "workers": await cmdWorkers(rest); break;
+        case "crashes": await cmdCrashes(rest); break;
         case "reload": await cmdReload(); break;
         case "regress": await cmdRegress(rest); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,
