@@ -163,6 +163,17 @@ export function resolveDibSectionRectRgba(
                 out[di + 2] = (v & 0x1F) * 255 / 31;
                 out[di + 3] = 255;
             }
+        } else if (bpp === 1) {
+            for (let c = 0; c < w; c++) {
+                const px = x + c;
+                const index = (mem[srcRow + (px >> 3)] >> (7 - (px & 7))) & 1;
+                const color = palette?.[index] ?? (index ? 0xffffffff : 0xff000000);
+                const di = dstOff + c * 4;
+                out[di] = (color >> 16) & 0xff;
+                out[di + 1] = (color >> 8) & 0xff;
+                out[di + 2] = color & 0xff;
+                out[di + 3] = 255;
+            }
         } else if (bpp === 8 && palette && palette.length > 0) {
             for (let c = 0; c < w; c++) {
                 const color = palette[mem[srcRow + x + c]] ?? 0xff000000;
@@ -184,8 +195,8 @@ export function resolveDibSectionRectRgba(
  * selected must land there, because apps read the bits back and post-process them, and
  * because the canvas is re-materialized FROM those bits on the next SelectObject (a
  * draw that never wrote back is discarded there). Mirrors the canvas rect into 32bpp
- * bits as B,G,R, preserving the reserved/alpha byte the app owns. No-op for anything
- * that is not a 32bpp DIBSection.
+ * bits as B,G,R, preserving the reserved/alpha byte the app owns, or into 1bpp bits as
+ * MSB-first colour-table indices. No-op for the depths in between.
  */
 export function writeBackDibSectionRect(
     hBitmap: number,
@@ -194,7 +205,9 @@ export function writeBackDibSectionRect(
 ): void {
     if (!hBitmap) return;
     const obj = unwrapBitmapObj(hBitmap);
-    if (!obj || !obj.bitsPtr || !obj.dibStride || (obj.dibBpp ?? 32) !== 32) return;
+    if (!obj || !obj.bitsPtr || !obj.dibStride) return;
+    const bpp = obj.dibBpp ?? 32;
+    if (bpp !== 32 && bpp !== 1) return;
     // Per-pixel write-back below; getCurrentMemory() hands out v86's Proxy, whose
     // per-element trap V8 cannot JIT. Nothing here re-enters the guest, so the plain
     // view cannot go stale mid-call.
@@ -209,6 +222,10 @@ export function writeBackDibSectionRect(
     let img: ImageData;
     try { img = ctx.getImageData(cx, cy, cw, ch); } catch { return; }
     const src = img.data;
+    if (bpp === 1) {
+        writeBackMonochromeRect(obj, mem, src, cx, cy, cw, ch, bh);
+        return;
+    }
     for (let ry = 0; ry < ch; ry++) {
         const dibY = obj.dibTopDown ? cy + ry : bh - 1 - (cy + ry);
         let o = obj.bitsPtr + dibY * obj.dibStride + cx * 4;
@@ -217,6 +234,39 @@ export function writeBackDibSectionRect(
             mem[o] = src[si + 2];
             mem[o + 1] = src[si + 1];
             mem[o + 2] = src[si];
+        }
+    }
+}
+
+/**
+ * A 1bpp DIBSection stores colour-table INDICES, MSB first, so a pixel is quantized to
+ * whichever of the two table entries it is nearer — there is no channel to copy. The
+ * default table is the monochrome one GDI uses when the app supplied none (0 = black,
+ * 1 = white). Read-modify-write per byte: a rect that starts or ends mid-byte shares it
+ * with pixels outside the rect, which the caller's clip deliberately excluded.
+ */
+function writeBackMonochromeRect(
+    obj: BitmapUserObj,
+    mem: Uint8Array,
+    src: Uint8ClampedArray,
+    cx: number, cy: number, cw: number, ch: number, bh: number,
+): void {
+    const palette = obj.dibPalette;
+    const c0 = palette?.[0] ?? 0xff000000;
+    const c1 = palette?.[1] ?? 0xffffffff;
+    const distance = (r: number, g: number, b: number, c: number) =>
+        (r - ((c >>> 16) & 0xff)) ** 2 + (g - ((c >>> 8) & 0xff)) ** 2 + (b - (c & 0xff)) ** 2;
+    for (let ry = 0; ry < ch; ry++) {
+        const dibY = obj.dibTopDown ? cy + ry : bh - 1 - (cy + ry);
+        const row = obj.bitsPtr! + dibY * obj.dibStride!;
+        let si = ry * cw * 4;
+        for (let rx = 0; rx < cw; rx++, si += 4) {
+            const r = src[si], g = src[si + 1], b = src[si + 2];
+            const index = distance(r, g, b, c0) <= distance(r, g, b, c1) ? 0 : 1;
+            const px = cx + rx;
+            const mask = 0x80 >> (px & 7);
+            const at = row + (px >> 3);
+            mem[at] = index ? (mem[at] | mask) : (mem[at] & ~mask);
         }
     }
 }
@@ -283,6 +333,18 @@ function readDibSectionRgbaGeneric(
                 out[di] = ((v >> 11) & 0x1F) * 255 / 31;
                 out[di + 1] = ((v >> 5) & 0x3F) * 255 / 63;
                 out[di + 2] = (v & 0x1F) * 255 / 31;
+                out[di + 3] = 255;
+            }
+        } else if (dibBpp === 1) {
+            // Monochrome DIBs are often created with no colour table at all; GDI's
+            // default is 0 = black, 1 = white, so a mask still reads back as a mask.
+            for (let x = 0; x < w; x++) {
+                const index = (mem[srcRow + (x >> 3)] >> (7 - (x & 7))) & 1;
+                const color = palette?.[index] ?? (index ? 0xffffffff : 0xff000000);
+                const di = dstOff + x * 4;
+                out[di] = (color >> 16) & 0xff;
+                out[di + 1] = (color >> 8) & 0xff;
+                out[di + 2] = color & 0xff;
                 out[di + 3] = 255;
             }
         } else if (dibBpp === 8 && palette && palette.length > 0) {

@@ -253,7 +253,9 @@ export const gdi32Module: ModuleDescriptor = {
         makeFunc("CreateScalableFontResourceA", 4),
         makeFunc("CreateScalableFontResourceW", 4),
         makeFunc("AddFontResourceA", 1),
+        makeFunc("AddFontResourceW", 1),
         makeFunc("RemoveFontResourceA", 1),
+        makeFunc("RemoveFontResourceW", 1),
         makeFunc("DeleteColorSpace", 1),
         makeFunc("DeleteEnhMetaFile", 1),
         makeFunc("DeleteMetaFile", 1),
@@ -266,6 +268,8 @@ export const gdi32Module: ModuleDescriptor = {
         // Font enumeration, metafiles, pens, and misc GDI
         makeFunc("EnumFontFamiliesA", 4),
         makeFunc("EnumFontFamiliesExA", 5),
+        makeFunc("EnumFontFamiliesExW", 5),
+        makeFunc("GetFontLanguageInfo", 1),
         makeFunc("GetTextFaceA", 3),
         makeFunc("GetNearestColor", 2),
         makeFunc("ExtCreatePen", 5),

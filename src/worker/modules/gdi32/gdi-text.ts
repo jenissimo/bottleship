@@ -7,8 +7,7 @@
  */
 import { Logger, LogCategory } from "../../core/logger";
 import { drawTextPrefixOptions, fillTextWithMnemonic, parseMnemonicText } from "../win32-text";
-import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
-import { Mem } from "../../core/memory/mem-accessor";
+import { writeBackDibSectionRect } from "./bitmap-resolve";
 import type { GDIContext } from './context';
 
 const NONANTIALIASED_QUALITY = 3;
@@ -83,54 +82,6 @@ function fillTextAliased(
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(aliasScratch!, 0, 0, w, h, x0, y0, w, h);
     ctx.imageSmoothingEnabled = smoothing;
-}
-
-/** After drawing on a DC with a selected DIBSection, mirror the drawn rect into the
- *  guest bits (ppvBits). Engines read those bytes directly (e.g. font-atlas builders
- *  rasterize glyphs via ExtTextOut and upload the DIB memory as a texture) — without
- *  this the guest sees the zero-fill. GDI-faithful 32bpp layout: [B,G,R,0] with the
- *  reserved byte 0; untouched pixels stay 0x00000000. */
-function syncTextRectToDibSection(
-    state: { hBitmap: number },
-    ctx: OffscreenCanvasRenderingContext2D,
-    x: number,
-    y: number,
-    w: number,
-    h: number
-): void {
-    const hbm = state.hBitmap;
-    if (!hbm) return;
-    if ((ctx.canvas as any).__linkedBitmap !== hbm) return;
-    const obj = SystemResourceProvider.getInstance().getUserObject(hbm) as {
-        bitsPtr?: number; dibStride?: number; dibBpp?: number; dibTopDown?: boolean;
-        width?: number; height?: number;
-    } | null;
-    const bitsPtr = obj?.bitsPtr ?? 0;
-    const stride = obj?.dibStride ?? 0;
-    if (!bitsPtr || !stride) return;
-    if (obj!.dibBpp !== 32) {
-        Logger.verbose(LogCategory.GDI32, `syncTextRectToDibSection: unsupported dibBpp=${obj!.dibBpp}`);
-        return;
-    }
-    const bw = obj!.width ?? 0, bh = obj!.height ?? 0;
-    const x0 = Math.max(0, Math.floor(x)), y0 = Math.max(0, Math.floor(y));
-    const x1 = Math.min(bw, Math.ceil(x + w)), y1 = Math.min(bh, Math.ceil(y + h));
-    if (x1 <= x0 || y1 <= y0) return;
-    const iw = x1 - x0, ih = y1 - y0;
-    const d = ctx.getImageData(x0, y0, iw, ih).data;
-    const topDown = !!obj!.dibTopDown;
-    const row = new Uint8Array(iw * 4);
-    for (let yy = 0; yy < ih; yy++) {
-        const dy = y0 + yy;
-        let si = yy * iw * 4;
-        for (let xx = 0, ri = 0; xx < iw; xx++, si += 4, ri += 4) {
-            row[ri] = d[si + 2];
-            row[ri + 1] = d[si + 1];
-            row[ri + 2] = d[si];
-            row[ri + 3] = 0;
-        }
-        Mem.writeBytes(bitsPtr + (topDown ? dy : (bh - 1 - dy)) * stride + x0 * 4, row);
-    }
 }
 
 /** fillText honoring the selected font's GDI quality (aliased for small/bitmap-era fonts). */
@@ -237,7 +188,7 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
         // Rotated glyphs land anywhere in the swept circle, so mirror that whole box.
         const reach = Math.max(metrics.width, state.fontSize * 1.7) + 4;
         const back = gdi.clipCopyRect(hdc, x - reach, y - reach, reach * 2, reach * 2);
-        if (back) syncTextRectToDibSection(state, ctx, back.x, back.y, back.w, back.h);
+        if (back) writeBackDibSectionRect(state.hBitmap, ctx, back.x, back.y, back.w, back.h);
     } else {
         // No rotation - draw normally
         // Only draw background if OPAQUE mode (bkMode=2)
@@ -256,7 +207,7 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
         fillTextGdi(ctx, state, text, x, y);
         if (clipped) ctx.restore();
         const back = gdi.clipCopyRect(hdc, x - 2, y - 2, metrics.width + 4, state.fontSize * 1.7 + 4);
-        if (back) syncTextRectToDibSection(state, ctx, back.x, back.y, back.w, back.h);
+        if (back) writeBackDibSectionRect(state.hBitmap, ctx, back.x, back.y, back.w, back.h);
     }
 
     // Mark as dirty for ReleaseDC optimization
@@ -281,13 +232,11 @@ export function textOut(gdi: GDIContext, hdc: number, x: number, y: number, text
     if (linkedBitmap) {
         const bitmapCtx = linkedBitmap.getContext('2d');
         if (bitmapCtx) {
-            // Apply same font and color
-            if (state.appliedFont !== state.font) {
-                bitmapCtx.font = state.font;
-            }
-            if (state.appliedFillStyle !== state.textColor) {
-                bitmapCtx.fillStyle = state.textColor;
-            }
+            // state.applied* caches what is set on the DC's OWN canvas, and the sync above
+            // already made it match — so testing it here would never set the mirror at all,
+            // leaving it to render with whatever font/colour it last held.
+            bitmapCtx.font = state.font;
+            bitmapCtx.fillStyle = state.textColor;
             bitmapCtx.textBaseline = 'top';
             bitmapCtx.textAlign = 'left';
             // Same DC, same clip: the mirror is a second render target, not a second DC.
@@ -583,6 +532,16 @@ export function drawText(
 
     paint(ctx);
     if (state.bkMode === 2) state.appliedFillStyle = state.textColor;
+
+    // Same contract as TextOut: a DIBSection selected into this DC IS the pixel surface,
+    // so the glyphs have to reach the guest bits or the next SelectObject discards them.
+    // Without a format rect DrawText lays out from the origin, so the laid-out extent is
+    // the whole reach; the alignment origin can sit at its centre or right edge.
+    const painted = rect
+        ? { x: rect.left, y: rect.top, w: boxWidth, h: rect.bottom - rect.top }
+        : { x: originX - layout.width, y: originY, w: layout.width * 2, h: layout.height };
+    const back = gdi.clipCopyRect(hdc, painted.x - 2, painted.y - 2, painted.w + 4, painted.h + 4);
+    if (back) writeBackDibSectionRect(state.hBitmap, ctx, back.x, back.y, back.w, back.h);
 
     // Mark as dirty for ReleaseDC optimization
     gdi.markDirty(hdc);

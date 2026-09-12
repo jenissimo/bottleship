@@ -33,18 +33,21 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         return 1;
     };
 
-    // int EnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA lpCallback, LPARAM lParam, DWORD dwFlags)
-    exports['EnumFontFamiliesExA'] = (ctx, mem, args): number => {
+    // int EnumFontFamiliesEx{A,W}(HDC, LPLOGFONT, FONTENUMPROC, LPARAM, DWORD dwFlags)
+    // The LOGFONT is only read for logging, so A and W share one body.
+    const enumFontFamiliesEx = (name: string): ThunkImplementation => (ctx, mem, args): number => {
         const hdc = args[0];
         const lpCallback = args[2];
         const dwFlags = args[4] >>> 0;
         Logger.verbose(
             LogCategory.GDI32,
-            `EnumFontFamiliesExA(hdc=0x${hdc.toString(16)}, proc=0x${lpCallback.toString(16)}, flags=0x${dwFlags.toString(16)})`,
+            `${name}(hdc=0x${hdc.toString(16)}, proc=0x${lpCallback.toString(16)}, flags=0x${dwFlags.toString(16)})`,
         );
         if (!lpCallback) return 0;
         return 1;
     };
+    exports['EnumFontFamiliesExA'] = enumFontFamiliesEx('EnumFontFamiliesExA');
+    exports['EnumFontFamiliesExW'] = enumFontFamiliesEx('EnumFontFamiliesExW');
 
     // int GetTextFaceA(HDC hdc, int c, LPSTR lpName)
     exports['GetTextFaceA'] = (ctx, mem, args): number => {
@@ -189,10 +192,10 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         return 1;
     };
 
-    // int AddFontResourceA(LPCSTR pszFilename)
-    exports['AddFontResourceA'] = (ctx, mem, args): number | Promise<number> => {
-        const path = args[0] ? Marshaler.readString(mem, args[0]) : '';
-        Logger.verbose(LogCategory.GDI32, `AddFontResourceA("${path}")`);
+    // int AddFontResource{A,W}(LPCTSTR pszFilename) — the two differ only in how
+    // the filename is decoded, so both names share one body.
+    const addFontResourceByPath = (api: string, path: string): number | Promise<number> => {
+        Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
 
         if (!path) return 0;
 
@@ -200,7 +203,7 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         const resolved = vfs.resolvePath(path);
         const size = vfs.getFileSize(resolved);
         if (size <= 0) {
-            Logger.verbose(LogCategory.GDI32, `AddFontResourceA: file not found "${path}"`);
+            Logger.verbose(LogCategory.GDI32, `${api}: file not found "${path}"`);
             return 0;
         }
 
@@ -215,20 +218,43 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
                 const data = await vfs.read(handle, size);
                 return await addFontResource(resolved, data);
             } catch (e) {
-                Logger.warn(LogCategory.GDI32, `AddFontResourceA: read failed for "${path}": ${e}`);
+                Logger.warn(LogCategory.GDI32, `${api}: read failed for "${path}": ${e}`);
                 return 0;
             }
         })();
     };
 
-    // BOOL RemoveFontResourceA(LPCSTR pszFilename)
-    exports['RemoveFontResourceA'] = (ctx, mem, args): number => {
-        const path = args[0] ? Marshaler.readString(mem, args[0]) : '';
-        Logger.verbose(LogCategory.GDI32, `RemoveFontResourceA("${path}")`);
+    const removeFontResourceByPath = (api: string, path: string): number => {
+        Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
         if (!path) return 0;
         const vfs = System.getInstance().fileSystem;
         return removeFontResource(vfs.resolvePath(path)) ? 1 : 0;
     };
+
+    // int AddFontResourceA(LPCSTR pszFilename)
+    exports['AddFontResourceA'] = (ctx, mem, args): number | Promise<number> =>
+        addFontResourceByPath('AddFontResourceA', args[0] ? Marshaler.readString(mem, args[0]) : '');
+
+    // int AddFontResourceW(LPCWSTR pszFilename)
+    exports['AddFontResourceW'] = (ctx, mem, args): number | Promise<number> =>
+        addFontResourceByPath(
+            'AddFontResourceW',
+            args[0] ? Marshaler.readWideString(mem, args[0]) : '',
+        );
+
+    // BOOL RemoveFontResourceA(LPCSTR pszFilename)
+    exports['RemoveFontResourceA'] = (ctx, mem, args): number =>
+        removeFontResourceByPath(
+            'RemoveFontResourceA',
+            args[0] ? Marshaler.readString(mem, args[0]) : '',
+        );
+
+    // BOOL RemoveFontResourceW(LPCWSTR pszFilename)
+    exports['RemoveFontResourceW'] = (ctx, mem, args): number =>
+        removeFontResourceByPath(
+            'RemoveFontResourceW',
+            args[0] ? Marshaler.readWideString(mem, args[0]) : '',
+        );
 
     // BOOL GetICMProfileW(HDC hdc, LPDWORD pBufSize, LPWSTR pszFilename)
     //

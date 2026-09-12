@@ -83,6 +83,7 @@ test("DrawText keeps font smoothing for DEFAULT_QUALITY", () => {
             invalidateImageDataCache() {},
             // No clip region on this DC: the text path must not save/restore for one.
             beginClipOn() { return false; },
+            clipCopyRect() { return null; },
         };
 
         expect(drawText(gdi as any, 1, "Begin the Journey", {
@@ -122,6 +123,7 @@ test("DrawText thresholds only explicitly NONANTIALIASED_QUALITY fonts", () => {
             contexts: new Map([[1, target]]), hdcStates: new Map([[1, state]]),
             overlayCtx: null, setOverlayDirty() {}, markDirty() {}, invalidateImageDataCache() {},
             beginClipOn() { return false; },
+            clipCopyRect() { return null; },
         };
 
         expect(drawText(gdi as any, 1, "Begin the Journey", {
