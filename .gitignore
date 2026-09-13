@@ -105,3 +105,6 @@ tools/aot/units/
 # (tools/d3d9-parity/native-probe/README.md); obj/ also embeds this machine's paths.
 tools/d3d9-parity/native-probe/bin/
 tools/d3d9-parity/native-probe/obj/
+
+# libid signature packs — derived from this machine's DLLs, rebuilt with `libid.py sigs`
+tools/re/libsigs/
