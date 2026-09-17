@@ -115,3 +115,54 @@ Both need `V86_TEST_BINARY` pointed at a build carrying the kernels; the first a
 `bun tools/harness.ts run tools/harness/kernel-census.harness.ts` with `WGB=<bundle>` prints
 each kernel's hit and decline ledger for a title. Run it before proposing any work here: a
 counter that does not move is the answer.
+
+---
+
+## 6. Round two (2026-09-17): the fork's 11.09–16.09 work
+
+The fork branches from our **`main`**, which has not moved since 2026-07-15 while `develop`
+is 449 commits ahead. That is the governing fact for everything below: most of what looks
+like a new fix over there is a bug this tree already fixed, independently, months later.
+Diff against `develop`, never against his base.
+
+Eight commits landed after §2's harvest. Reviewed; two were taken.
+
+**Taken** (`53a52d7`, `06c6bb0`):
+
+- `commitPages` — preserve the walker's A/D bits, flush the TLB only on a real mapping
+  change, and route the recommit zeroing through `invalidateGuestCode`. From his
+  `840c586a`. His version does not port: it keeps a fastmem-generation bump we already
+  removed, and calls `cpu.jit_dirty_cache` directly. `tools/tests/page-table-commit.test.ts`
+  fails 3/4 when neutralized in place.
+- `GetProcAddress` by ordinal now resolves the canonical export name. From his `1c549da6`.
+
+**Already ours, do not re-take.** Each was a `main`-era bug we fixed on `develop`:
+the SEH catching-frame relink (`1657bf8`, 21.08 — he re-derived it on the same game,
+Serious Sam, and his version relinks unconditionally where ours only undoes its own
+unlink); HMODULE-scoped export resolution (`export-resolver.ts` has no unqualified
+fallback); `ModuleRegistry` keying on the basename, so his full-path reverse lookup
+solves a problem we cannot have; VC6 `struct _stat` at 36 bytes; `VirtualAlloc`
+reserve-without-commit decommitting (`markDecommitted`). `resetNativeQsort` at process
+reset is deliberately NOT ours — see the reasoning at `crtdll.ts:232`.
+
+**Refused.** `src/worker/core/game-fixes/gta-san-andreas-timing.ts` patches the guest's
+`.text` at a hardcoded address behind a SHA-256 of the exe (and a second one for FX
+quality); `max-payne-tree.patch` does the same inside v86. Flat §3.0, and both write
+guest code outside the §3.1 chokepoint.
+
+**Left on the table, in rough order of interest:** `PageTableManager` commit/mismatch
+counters (ledger discipline on a path we now have opinions about); `io-worker`'s batched
+range prefetch that keeps two transport slots free for synchronous guest faults (we have
+`SabIoSource: read timed out` on record); `translation-cache.ts` for the §5 AOT track; the
+d3d9 `geometry-upload-batch` / `guest-staging-pool` / `triangle-indices` / `surface-blitter`
+set, which arrives with tests.
+
+**GameBox**, for the record, is not a format of ours and not a rename of `.wgb`: it is a
+host product that embeds bottleship as a pinned engine — directory bundles served by HTTP
+Range, Ed25519-signed catalogs with a local trust store, and per-title sidecars
+(filesystem priority, GPU pipelines, prepared AOT) produced offline. His `91dae3bb` is the
+end state of that idea: rip out runtime hotness profiling entirely so the only optimized
+path is what the compiler prepared ahead of time.
+
+**§1 still stands.** Nothing is pushed, and the message has not gone out. It now covers
+more of his work than when it was drafted.
