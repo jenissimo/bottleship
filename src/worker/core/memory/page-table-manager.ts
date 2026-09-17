@@ -21,6 +21,7 @@
 
 import { Logger, LogCategory } from '../logger';
 import { setWriteMapBase } from './address-space';
+import { invalidateGuestCode } from './guest-code';
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE, MEM_PAGETABLE_BASE, MEM_PAGETABLE_SIZE, MEM_GUARD_BASE, MEM_GUARD_SIZE } from '../cpu/emulator-config';
 
 // Page table constants
@@ -36,6 +37,9 @@ const PTE_PRESENT = 0x01;
 const PTE_RW = 0x02;
 const PTE_USER = 0x04;
 const PTE_DEFAULT = PTE_PRESENT | PTE_RW | PTE_USER; // 0x07
+// Accessed + Dirty. The walker sets these to describe USE, not mapping or
+// permission — rewriting a PTE that differs only here is not a remap.
+const PTE_ACCESSED_DIRTY = 0x60;
 // CR0 bits
 const CR0_PG = 0x80000000; // Paging enable (bit 31)
 const CR0_WP = 0x00010000; // Write protect (bit 16)
@@ -189,12 +193,16 @@ export class PageTableManager {
         // a page the guest asked to be read-only. Detect it and bump, rather than trusting
         // every future caller to honour the fresh-range contract above.
         let protectionRaised = false;
+        let mappingChanged = false;
         for (let page = startPage; page < endPage; page++) {
             const physAddr = page * PAGE_SIZE;
             const pteOffset = this._getPteOffset(page);
             const pte = view.getUint32(pteOffset, true);
             if ((pte & PTE_PRESENT) !== 0 && (pte & PTE_RW) === 0) protectionRaised = true;
-            view.setUint32(pteOffset, physAddr | PTE_DEFAULT, true);
+            const next = (physAddr | PTE_DEFAULT) >>> 0;
+            if (((pte & ~PTE_ACCESSED_DIRTY) >>> 0) === next) continue;
+            view.setUint32(pteOffset, next, true);
+            mappingChanged = true;
         }
 
         // A present identity-mapped page becomes readable immediately. RO and RW
@@ -206,14 +214,21 @@ export class PageTableManager {
                 `in 0x${baseAddr.toString(16)}+0x${sizeBytes.toString(16)} — caller should use ` +
                 `ensurePagesCommitted`);
         }
-        if (exports?.full_clear_tlb) {
+        // Only a real mapping change invalidates translations. A commit over pages
+        // that already carry exactly this PTE is the common case (MemoryManager
+        // commits HEAP eagerly), and a full_clear_tlb there is pure churn on a path
+        // a growing heap drives continuously.
+        if (mappingChanged && exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
         // Track 2b Phase W: committed pages are present + RW → mark base-writable (Rust
         // clamps to the identity-RAM envelope and skips the THUNK_CODE exclusion band).
         setWriteMapBase(baseAddr, sizeBytes, true);
 
-        // Zero memory — Windows guarantees clean pages on recommit
+        // Zero memory — Windows guarantees clean pages on recommit. The span may have
+        // held guest code before it was decommitted, and full_clear_tlb does not drop
+        // compiled blocks, so this JS write needs the §3.1 invalidation like any other.
+        invalidateGuestCode(baseAddr, sizeBytes);
         mem.fill(0, baseAddr, baseAddr + sizeBytes);
 
         Logger.verbose(LogCategory.SYSTEM,
