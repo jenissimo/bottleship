@@ -1364,7 +1364,14 @@ function initModuleFunctions(): void {
                     if (dataAddr !== undefined) {
                         address = dataAddr >>> 0;
                     } else {
-                        address = resolveThunkedExportAddress(dispatcher, dllName, procName, verbose);
+                        // An ordinal names an export of THIS DLL. Descriptors that declare a
+                        // function by name with an `ordinal:` tag carry no literal `ord_N`
+                        // entry, so the placeholder resolves nothing — ask the registry for
+                        // the canonical name first, exactly as the PE import walk does.
+                        const exportName = isOrdinal
+                            ? apiRegistry.getFunctionNameByOrdinal(dllName, ordinal) ?? procName
+                            : procName;
+                        address = resolveThunkedExportAddress(dispatcher, dllName, exportName, verbose);
                     }
                 }
 
