@@ -391,7 +391,12 @@ export class D3D9StateTracker {
             return this.pipelineKey;
         }
 
-        const cullMode = this.renderStates[D3DRS_CULLMODE];
+        // Out-of-enum CULLMODE is D3DCULL_NONE on every real driver (wined3d's
+        // vk_cull_mode_from_wined3d, DXVK's DecodeCullMode `default:`). Normalise before it
+        // enters the key's 8-bit field, or 0x102 truncates to D3DCULL_CW and culls geometry
+        // the guest never asked to cull.
+        const rawCull = this.renderStates[D3DRS_CULLMODE]!;
+        const cullMode = rawCull >= 1 && rawCull <= 3 ? rawCull : 1; // D3DCULL_NONE
         const lighting = this.renderStates[D3DRS_LIGHTING];
         // Defaults live in seedRenderStateDefaults, not here: renderStates is an Int32Array,
         // so `?? 1` at a read site is dead code (0 is not nullish) and only looks like a default.

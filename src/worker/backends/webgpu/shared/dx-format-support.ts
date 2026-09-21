@@ -33,9 +33,14 @@ import {
 } from './texture-formats';
 import { resolveDxMsaaPolicy } from './msaa-policy';
 import { resolveD3D9VolumePolicy } from './volume-policy';
-import { resolveD3D9FloatTexturePolicy } from './float-format-policy';
+import {
+    isD3D9FloatRenderTargetBlendable,
+    isD3D9FloatRenderTargetSupported,
+    resolveD3D9FloatTexturePolicy,
+} from './float-format-policy';
 import { getD3D9MsaaCapabilityContract } from '../d3d9/multisample';
 import { capabilityGeneration } from './capability-generation';
+import { Logger, LogCategory } from '../../../core/logger';
 
 export type DxVersion = 8 | 9;
 
@@ -95,6 +100,7 @@ const refusedFormats = new Map<number, number>();
 export function resetDxFormatSupportCensus(): void {
     refusedFourCCs.clear();
     refusedFormats.clear();
+    refusedCreates.clear();
 }
 
 export function getDxFormatSupportCensus(): {
@@ -120,6 +126,35 @@ function noteRefusedFourCC(format: number): void {
 function noteRefusedFormat(format: number): void {
     const fmt = format >>> 0;
     refusedFormats.set(fmt, (refusedFormats.get(fmt) ?? 0) + 1);
+}
+
+/**
+ * A resource CONSTRUCTOR refused a format. The query census above records what we declined
+ * to ADVERTISE; this records what we declined to BUILD — the half that is otherwise
+ * invisible, since the caller gets a failed HRESULT and an untouched out-pointer and
+ * nothing on our side says so. Loud once per (reason, format), counted always, and
+ * surfaced by d3d9Census().creationRefusals so a run can be checked against the query
+ * census for disagreement.
+ */
+const refusedCreates = new Map<string, number>();
+const warnedCreates = new Set<string>();
+
+export function noteRefusedCreate(reason: string, format: number, width = 0, height = 0): void {
+    const extent = width > 0 && height > 0 ? `${width}x${height}` : "";
+    const key = extent ? `${reason}:${format >>> 0}:${extent}` : `${reason}:${format >>> 0}`;
+    refusedCreates.set(key, (refusedCreates.get(key) ?? 0) + 1);
+    if (!warnedCreates.has(key)) {
+        warnedCreates.add(key);
+        Logger.warn(LogCategory.D3D9,
+            `[D3D9] refused to create ${reason} ${extent} in format ${format >>> 0}; the caller gets `
+            + `a NULL out-pointer it may not check, and the deref lands in its own code`);
+    }
+}
+
+export function getDxCreationRefusals(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [key, count] of refusedCreates) out[key] = count;
+    return out;
 }
 
 /**
@@ -313,7 +348,6 @@ const D3D9_ONLY_FORMATS = new Set([
  */
 const D3D9_UNSUPPORTED_FORMATS = new Set([
     85,              // S8_LOCKABLE (stencil-only lockable depth)
-    114, 115, 116,   // R32F / G32R32F / A32B32G32R32F
     117,             // CxV8U8 (normal-compression sampler path)
 ]);
 
@@ -321,7 +355,9 @@ const D3D9_UNSUPPORTED_FORMATS = new Set([
 export function isDxUnsupportedFormat(format: number, version: DxVersion): boolean {
     if (version !== 9) return false;
     const fmt = format >>> 0;
-    if (d3dFloatFormatInfo(fmt)?.bytesPerChannel === 2) {
+    // Every float format is gated by its probed contract, not by a hardcoded list: an
+    // adapter that cannot store it must refuse it, and one that can must not.
+    if (d3dFloatFormatInfo(fmt) !== null) {
         return !resolveD3D9FloatTexturePolicy(fmt).supported;
     }
     return D3D9_UNSUPPORTED_FORMATS.has(fmt);
@@ -359,10 +395,11 @@ export function isDxDisplayFormat(format: number, version: DxVersion): boolean {
 export function isDxRenderTargetFormat(format: number, version: DxVersion): boolean {
     const fmt = format >>> 0;
     if (isDxUnsupportedFormat(fmt, version)) return false;
-    // The bounded float contract covers sampled 2-D 16-bit-float textures only.
-    // Do not let the broad renderable-format set turn that into an attachment
-    // claim before a float render-target path has been proven.
-    if (version === 9 && d3dFloatFormatInfo(fmt)?.bytesPerChannel === 2) return false;
+    // Float attachments are their own probed contract (attachment + readback of a rendered
+    // texel), separate from the sampled-storage one and from blending.
+    if (version === 9 && d3dFloatFormatInfo(fmt) !== null) {
+        return isD3D9FloatRenderTargetSupported(fmt);
+    }
     if (
         fmt === D3DFMT_R5G6B5 ||
         fmt === D3DFMT_X1R5G5B5 ||
@@ -377,14 +414,27 @@ export function isDxRenderTargetFormat(format: number, version: DxVersion): bool
     ) {
         return true;
     }
-    // No float attachment is renderable: every surface is backed by an rgba8-or-wider
-    // integer target. A float render-target path needs a native float attachment, a
-    // matching resolve/readback encoder, and a blend contract before it can be claimed.
+    // The remaining wide integer formats are backed by an rgba8-or-wider integer target.
     if (version === 9 && (fmt === D3DFMT_A2R10G10B10 || fmt === D3DFMT_A2B10G10R10 ||
         fmt === D3DFMT_A16B16G16R16)) {
         return true;
     }
     return false;
+}
+
+/**
+ * Can a render-target SURFACE of this format actually be created? One predicate for the
+ * constructors, so "renderable by our HAL" and "float attachments are not backed" cannot
+ * drift apart between them.
+ */
+export function isDxCreatableRenderTargetFormat(format: number, version: DxVersion): boolean {
+    const fmt = format >>> 0;
+    if (!isDxRenderableFormat(fmt, version)) return false;
+    // Float attachments are only creatable where the adapter probe backed them.
+    if (version === 9 && d3dFloatFormatInfo(fmt) !== null) {
+        return isD3D9FloatRenderTargetSupported(fmt);
+    }
+    return true;
 }
 
 /**
@@ -549,13 +599,19 @@ function computeDxDeviceFormat(
     if (isDxExclusiveFormat(fmt, version)) return refuseFormat();
     if (!isDxSupportedFourCC(fmt)) return refuseFormat();
     if (isDxUnsupportedFormat(fmt, version)) return refuseFormat();
-    if (version === 9 && d3dFloatFormatInfo(fmt)?.bytesPerChannel === 2) {
-        // The first float seam is deliberately limited to IDirect3DTexture9
-        // sampled storage. Surfaces and cubes still use the RGBA8/attachment
-        // paths and must not inherit this answer.
-        const policy = resolveD3D9FloatTexturePolicy(fmt);
-        if (!policy.supported || rType !== D3DRTYPE_TEXTURE ||
-            (usage & D3DUSAGE_RENDERTARGET) !== 0) return refuseFormat();
+    if (version === 9 && d3dFloatFormatInfo(fmt) !== null) {
+        // Sampled storage is an IDirect3DTexture9-only seam; cubes still take the RGBA8
+        // conversion path and must not inherit it.  Attachment use is the separate probed
+        // contract and answers for the TEXTURE and SURFACE forms a render target is asked
+        // about — a game that gets "no" here creates the target anyway and keeps the NULL.
+        const wantsRenderTarget = (usage & D3DUSAGE_RENDERTARGET) !== 0;
+        if (wantsRenderTarget) {
+            if (!isD3D9FloatRenderTargetSupported(fmt) ||
+                (rType !== D3DRTYPE_TEXTURE && rType !== D3DRTYPE_SURFACE &&
+                 rType !== D3DRTYPE_CUBETEXTURE)) return refuseFormat();
+        } else if (!resolveD3D9FloatTexturePolicy(fmt).supported || rType !== D3DRTYPE_TEXTURE) {
+            return refuseFormat();
+        }
     }
     // D3D9 dropped palettized textures — no D3D9 driver advertises P8/A8P8 here (Wine and
     // DXVK refuse them too). Saying yes is not harmlessly permissive: a game's "pick the
@@ -620,12 +676,13 @@ function computeDxDeviceFormat(
         // sample-only formats must not pass this query merely because their texture
         // decoder exists.
         if ((usage & D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING) !== 0 &&
-            !isDxRenderTargetFormat(fmt, version)) {
+            (!isDxRenderTargetFormat(fmt, version) ||
+             (d3dFloatFormatInfo(fmt) !== null && !isD3D9FloatRenderTargetBlendable(fmt)))) {
             return refuseFormat();
         }
         // Remaining float/CxV8U8/S8 formats have already been refused above because they do
-        // not enter that conversion path faithfully. R16F is allowed only for sampled 2-D
-        // storage under its explicit contract; render-target use was rejected above.
+        // not enter that conversion path faithfully; the 16-bit float family passes only
+        // under its explicit sampled-storage and attachment contracts.
     }
 
     let hr: number;

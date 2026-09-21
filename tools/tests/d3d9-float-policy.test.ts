@@ -6,6 +6,11 @@ import {
     getD3D9FloatCapabilityContract,
     makeD3D9FloatUpload,
     makeD3D9R16FUpload,
+    D3DFMT_R32F,
+    isD3D9FloatRenderTargetBlendable,
+    isD3D9FloatRenderTargetSupported,
+    isGpuColorFormatBlendable,
+    resolveD3D9FloatRenderTargetPolicy,
     resolveD3D9FloatTexturePolicy,
     setD3D9FloatCapabilityContract,
 } from "../../src/worker/backends/webgpu/shared/float-format-policy";
@@ -13,6 +18,7 @@ import {
     checkDxDeviceFormat,
     D3DERR_NOTAVAILABLE,
     D3D_OK,
+    isDxCreatableRenderTargetFormat,
     isDxRenderTargetFormat,
     isDxUnsupportedFormat,
 } from "../../src/worker/backends/webgpu/shared/dx-format-support";
@@ -21,12 +27,18 @@ afterEach(() => {
     setD3D9FloatCapabilityContract(null);
 });
 
-function installContract(overrides: Partial<Record<"supportsTexture" | "supportsUpload" | "supportsSampling" | "supportsReadback", (format: number) => boolean>> = {}): void {
+type ProbeName = "supportsTexture" | "supportsUpload" | "supportsSampling" | "supportsReadback"
+    | "supportsRenderTarget" | "supportsRenderTargetBlending";
+
+/** Sampled storage passes by default; attachment is opt-in, matching the two contracts. */
+function installContract(overrides: Partial<Record<ProbeName, (format: number) => boolean>> = {}): void {
     setD3D9FloatCapabilityContract({
         supportsTexture: () => true,
         supportsUpload: () => true,
         supportsSampling: () => true,
         supportsReadback: () => true,
+        supportsRenderTarget: () => false,
+        supportsRenderTargetBlending: () => false,
         ...overrides,
     });
 }
@@ -60,8 +72,8 @@ describe("D3D9 16-bit float texture capability policy", () => {
             supported: true, gpuFormat: "rgba16float", bytesPerTexel: 8, reason: null,
         });
         for (const format of FLOAT16_FORMATS) expect(isDxUnsupportedFormat(format, 9)).toBe(false);
-        // The bounded seam is sampled texture storage only; a float attachment
-        // must remain refused until a separate render-target contract exists.
+        // Sampled storage alone does not make an attachment: the render-target contract
+        // is separate, and this arm has it OFF.
         for (const format of FLOAT16_FORMATS) {
             expect(checkDxDeviceFormat(9, 0, 1, 22, 0, 3, format)).toBe(D3D_OK);
             expect(checkDxDeviceFormat(9, 0, 1, 22, 0x1, 3, format)).toBe(D3DERR_NOTAVAILABLE);
@@ -71,10 +83,69 @@ describe("D3D9 16-bit float texture capability policy", () => {
         }
     });
 
-    test("keeps other float formats outside the first bounded path", () => {
+    test("answers for float attachments only when the render-target probe passed", () => {
+        installContract({ supportsRenderTarget: () => true });
+        for (const format of FLOAT16_FORMATS) {
+            expect(resolveD3D9FloatRenderTargetPolicy(format).supported, format.toString()).toBe(true);
+            expect(isDxRenderTargetFormat(format, 9), format.toString()).toBe(true);
+            expect(isDxCreatableRenderTargetFormat(format, 9), format.toString()).toBe(true);
+            // TEXTURE / SURFACE / CUBETEXTURE are the forms a render target is asked about.
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0x1, 3, format), format.toString()).toBe(D3D_OK);
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0x1, 1, format), format.toString()).toBe(D3D_OK);
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0x1, 5, format), format.toString()).toBe(D3D_OK);
+            // Sampled storage stays a 2-D texture answer even with attachments allowed.
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0, 5, format), format.toString()).toBe(D3DERR_NOTAVAILABLE);
+        }
+        // A format the adapter refuses as sampled storage is not an attachment either.
+        installContract({ supportsTexture: () => false, supportsRenderTarget: () => true });
+        for (const format of FLOAT16_FORMATS) {
+            expect(resolveD3D9FloatRenderTargetPolicy(format).supported, format.toString()).toBe(false);
+            expect(isDxRenderTargetFormat(format, 9), format.toString()).toBe(false);
+        }
+    });
+
+    test("covers the 32-bit float family under the same probed contract", () => {
         installContract();
+        for (const [format, gpuFormat, bytesPerTexel] of
+            [[114, "r32float", 4], [115, "rg32float", 8], [116, "rgba32float", 16]] as const) {
+            expect(resolveD3D9FloatTexturePolicy(format), format.toString())
+                .toMatchObject({ supported: true, gpuFormat, bytesPerTexel, reason: null });
+            expect(isDxUnsupportedFormat(format, 9), format.toString()).toBe(false);
+        }
+        // An adapter that refuses the storage refuses the format — no hardcoded allow-list.
+        installContract({ supportsSampling: () => false });
         for (const format of [114, 115, 116]) {
             expect(resolveD3D9FloatTexturePolicy(format).supported, format.toString()).toBe(false);
+            expect(isDxUnsupportedFormat(format, 9), format.toString()).toBe(true);
+        }
+    });
+
+    test("separates attachment from blending on a float target", () => {
+        // Attachable but NOT blendable — the r32float shadow-map case. Creation must
+        // succeed; the blending capability query must still say no.
+        installContract({ supportsRenderTarget: () => true });
+        for (const format of [D3DFMT_R32F, D3DFMT_A16B16G16R16F]) {
+            expect(isD3D9FloatRenderTargetSupported(format), format.toString()).toBe(true);
+            expect(isD3D9FloatRenderTargetBlendable(format), format.toString()).toBe(false);
+            expect(isGpuColorFormatBlendable(
+                resolveD3D9FloatTexturePolicy(format).gpuFormat!), format.toString()).toBe(false);
+            // usage RENDERTARGET|QUERY_POSTPIXELSHADER_BLENDING
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0x80001, 3, format), format.toString())
+                .toBe(D3DERR_NOTAVAILABLE);
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0x1, 3, format), format.toString()).toBe(D3D_OK);
+        }
+        installContract({ supportsRenderTarget: () => true, supportsRenderTargetBlending: () => true });
+        for (const format of [D3DFMT_R32F, D3DFMT_A16B16G16R16F]) {
+            expect(isD3D9FloatRenderTargetBlendable(format), format.toString()).toBe(true);
+            expect(checkDxDeviceFormat(9, 0, 1, 22, 0x80001, 3, format), format.toString()).toBe(D3D_OK);
+        }
+        // A non-float target is always blendable — the predicate must not be a blanket no.
+        expect(isGpuColorFormatBlendable("bgra8unorm")).toBe(true);
+    });
+
+    test("keeps non-float exotics outside the supported set", () => {
+        installContract();
+        for (const format of [85, 117]) {
             expect(isDxUnsupportedFormat(format, 9), format.toString()).toBe(true);
         }
     });

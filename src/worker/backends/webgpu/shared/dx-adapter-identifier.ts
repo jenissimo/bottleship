@@ -28,6 +28,47 @@ export const DEFAULT_DRIVER_VERSION = 0x001f0000000f0e73n;
 export const DEFAULT_DRIVER_DLL = 'nvd3dum.dll';
 export const DEFAULT_DEVICE_DESC = 'NVIDIA GeForce RTX 3090';
 
+/**
+ * Diagnostic override for the identity above (`setWorkerFlag('__d3d9AdapterId', {...})`).
+ *
+ * A title that ships a CARD DATABASE — most 2000s engines do — looks our VendorId/DeviceId
+ * up in it and drops unknown hardware into a fallback tier, which is indistinguishable from
+ * a bug in our caps: every quality list comes back at its minimum, or empty. So "what card
+ * do we claim to be" is a variable worth A/B-ing, and there is no way to ask the question
+ * without changing the answer. Unset in normal operation; the defaults above are what ships.
+ */
+interface AdapterIdentityOverride {
+    vendorId?: number;
+    deviceId?: number;
+    description?: string;
+    driver?: string;
+}
+
+function adapterOverride(): AdapterIdentityOverride | null {
+    const v = (globalThis as { __d3d9AdapterId?: unknown }).__d3d9AdapterId;
+    return v && typeof v === "object" ? v as AdapterIdentityOverride : null;
+}
+
+export function adapterVendorId(): number {
+    const v = adapterOverride()?.vendorId;
+    return typeof v === "number" ? v >>> 0 : DEFAULT_VENDOR_ID;
+}
+
+export function adapterDeviceId(): number {
+    const v = adapterOverride()?.deviceId;
+    return typeof v === "number" ? v >>> 0 : DEFAULT_DEVICE_ID;
+}
+
+export function adapterDescription(): string {
+    const v = adapterOverride()?.description;
+    return typeof v === "string" && v.length > 0 ? v : DEFAULT_DEVICE_DESC;
+}
+
+export function adapterDriverDll(): string {
+    const v = adapterOverride()?.driver;
+    return typeof v === "string" && v.length > 0 ? v : DEFAULT_DRIVER_DLL;
+}
+
 export const D3DADAPTER_IDENTIFIER8_SIZE = 1068;
 
 const D3DADAPTER_IDENTIFIER8_OFFSETS = {
@@ -70,8 +111,8 @@ function writeStableAdapterIds(mem: Uint8Array, pIdentifier: number, offsets: {
     view.setBigUint64(pIdentifier + offsets.DriverVersion, DEFAULT_DRIVER_VERSION, true);
 
     if (
-        !Mem.writeUint32(pIdentifier + offsets.VendorId, DEFAULT_VENDOR_ID) ||
-        !Mem.writeUint32(pIdentifier + offsets.DeviceId, DEFAULT_DEVICE_ID) ||
+        !Mem.writeUint32(pIdentifier + offsets.VendorId, adapterVendorId()) ||
+        !Mem.writeUint32(pIdentifier + offsets.DeviceId, adapterDeviceId()) ||
         !Mem.writeUint32(pIdentifier + offsets.SubSysId, 0) ||
         !Mem.writeUint32(pIdentifier + offsets.Revision, 1)
     ) {
@@ -98,8 +139,8 @@ export function writeAdapterIdentifier8(mem: Uint8Array, pIdentifier: number, fl
         return false;
     }
 
-    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER8_OFFSETS.Driver, DEFAULT_DRIVER_DLL, 512);
-    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER8_OFFSETS.Description, DEFAULT_DEVICE_DESC, 512);
+    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER8_OFFSETS.Driver, adapterDriverDll(), 512);
+    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER8_OFFSETS.Description, adapterDescription(), 512);
 
     return writeStableAdapterIds(mem, pIdentifier, D3DADAPTER_IDENTIFIER8_OFFSETS, flags);
 }
@@ -109,8 +150,8 @@ export function writeAdapterIdentifier9(mem: Uint8Array, pIdentifier: number, fl
         return false;
     }
 
-    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER9_OFFSETS.Driver, DEFAULT_DRIVER_DLL, 512);
-    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER9_OFFSETS.Description, DEFAULT_DEVICE_DESC, 512);
+    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER9_OFFSETS.Driver, adapterDriverDll(), 512);
+    Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER9_OFFSETS.Description, adapterDescription(), 512);
     Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER9_OFFSETS.DeviceName, '\\\\.\\DISPLAY1', 32);
 
     return writeStableAdapterIds(mem, pIdentifier, D3DADAPTER_IDENTIFIER9_OFFSETS, flags);

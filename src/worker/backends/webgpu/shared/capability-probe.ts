@@ -1,7 +1,10 @@
 import {
     D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F,
     D3DFMT_G16R16F,
+    D3DFMT_G32R32F,
     D3DFMT_R16F,
+    D3DFMT_R32F,
     setD3D9FloatCapabilityContract,
 } from "./float-format-policy";
 import {
@@ -35,10 +38,17 @@ type ProbeResult = {
     readback: boolean;
 };
 
+// 32-bit float sampling needs `float32-filterable`; without it WebGPU allows only a
+// non-filtering sampler, which is a different bind-group layout than every other texture
+// takes. The probe below samples with a linear sampler, so an adapter without the feature
+// fails it and the format stays refused rather than half-working.
 const FLOAT_FORMATS = [
     [D3DFMT_R16F, "r16float", 2],
     [D3DFMT_G16R16F, "rg16float", 4],
     [D3DFMT_A16B16G16R16F, "rgba16float", 8],
+    [D3DFMT_R32F, "r32float", 4],
+    [D3DFMT_G32R32F, "rg32float", 8],
+    [D3DFMT_A32B32G32R32F, "rgba32float", 16],
 ] as const;
 
 // WebGPU constants are globals in a browser, but numeric fallbacks keep the
@@ -243,6 +253,83 @@ async function probeTexture(
     return result;
 }
 
+/**
+ * Probe a format as a COLOR ATTACHMENT, which is a different contract from sampled
+ * storage: the pipeline must accept the target format and the rendered texels must survive
+ * a copy back out. BLENDING is a third, separate question — r32float is renderable on every
+ * adapter and blendable on almost none — so it is probed as its own arm rather than folded
+ * in, or a shadow-map target nobody blends into would be refused for a capability it never
+ * needed.
+ */
+async function probeRenderTarget(
+    device: GPUDevice,
+    format: GPUTextureFormat,
+    bytesPerTexel: number,
+    withBlending: boolean,
+): Promise<boolean> {
+    let target: GPUTexture | null = null;
+    let buffer: GPUBuffer | null = null;
+    try {
+        const shader = device.createShaderModule({ code: attachmentShader() });
+        if (typeof shader.getCompilationInfo === "function" &&
+            hasCompilationError(await shader.getCompilationInfo())) return false;
+        device.pushErrorScope("validation");
+        target = device.createTexture({
+            size: { width: 1, height: 1 },
+            format,
+            usage: textureUsage("RENDER_ATTACHMENT", RENDER_ATTACHMENT) |
+                textureUsage("TEXTURE_BINDING", TEXTURE_BINDING) |
+                textureUsage("COPY_SRC", COPY_SRC),
+        });
+        const pipeline = device.createRenderPipeline({
+            layout: "auto",
+            vertex: { module: shader, entryPoint: "vs" },
+            fragment: {
+                module: shader,
+                entryPoint: "fs",
+                targets: [withBlending ? {
+                    format,
+                    blend: {
+                        color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                        alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+                    },
+                } : { format }],
+            },
+            primitive: { topology: "triangle-list" },
+        });
+        const bytesPerRow = alignment256(bytesPerTexel);
+        buffer = device.createBuffer({
+            size: bytesPerRow,
+            usage: bufferUsage("COPY_DST", COPY_DST) | bufferUsage("MAP_READ", MAP_READ),
+        });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginRenderPass({
+            colorAttachments: [{ view: target.createView(), loadOp: "clear", storeOp: "store" }],
+        });
+        pass.setPipeline(pipeline);
+        pass.draw(3);
+        pass.end();
+        encoder.copyTextureToBuffer({ texture: target }, { buffer, bytesPerRow }, { width: 1, height: 1 });
+        device.queue.submit([encoder.finish()]);
+        if (typeof device.queue.onSubmittedWorkDone === "function") {
+            await device.queue.onSubmittedWorkDone();
+        }
+        if (await device.popErrorScope()) return false;
+        // The shader writes opaque white; a target that reports success but hands back
+        // zeroes is not a render target we can build a scene on.
+        await buffer.mapAsync(1 /* GPUMapMode.READ */);
+        const mapped = new Uint8Array(buffer.getMappedRange().slice(0, bytesPerTexel));
+        buffer.unmap();
+        return mapped.some(byte => byte !== 0);
+    } catch {
+        try { await device.popErrorScope(); } catch { /* already popped or device lost */ }
+        return false;
+    } finally {
+        buffer?.destroy();
+        target?.destroy();
+    }
+}
+
 async function probeMsaaSampleCount(device: GPUDevice, sampleCount: D3D9MsaaSampleCount): Promise<boolean> {
     let color: GPUTexture | null = null;
     let depth: GPUTexture | null = null;
@@ -348,11 +435,23 @@ export async function probeD3D9WebGpuCapabilities(
         floatResults.set(format, await probeTexture(device, gpuFormat, "2d", bytesPerTexel));
     }
     if (!isCurrent()) return;
+    const floatRenderTargets = new Map<number, boolean>();
+    const floatRenderTargetBlending = new Map<number, boolean>();
+    for (const [format, gpuFormat, bytesPerTexel] of FLOAT_FORMATS) {
+        const attachable = floatResults.get(format)?.texture === true &&
+            await probeRenderTarget(device, gpuFormat, bytesPerTexel, false);
+        floatRenderTargets.set(format, attachable);
+        floatRenderTargetBlending.set(format,
+            attachable && await probeRenderTarget(device, gpuFormat, bytesPerTexel, true));
+    }
+    if (!isCurrent()) return;
     setD3D9FloatCapabilityContract({
         supportsTexture: (format) => floatResults.get(format)?.texture === true,
         supportsUpload: (format) => floatResults.get(format)?.upload === true,
         supportsSampling: (format) => floatResults.get(format)?.sampling === true,
         supportsReadback: (format) => floatResults.get(format)?.readback === true,
+        supportsRenderTarget: (format) => floatRenderTargets.get(format) === true,
+        supportsRenderTargetBlending: (format) => floatRenderTargetBlending.get(format) === true,
     });
 
     const volume = await probeTexture(device, "rgba8unorm", "3d", 4);

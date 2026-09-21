@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
 import { createResourcesExports } from "../../src/worker/modules/d3d9/resources";
@@ -15,6 +15,10 @@ import {
     isValidBufferUsagePool,
     isValidTextureUsagePool,
 } from "../../src/worker/modules/d3d9/resource-contract";
+import {
+    isD3D9FloatTextureFormatSupported,
+    setD3D9FloatCapabilityContract,
+} from "../../src/worker/backends/webgpu/shared/float-format-policy";
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -347,5 +351,61 @@ describe("D3D9 resource lock edge contracts", () => {
 
         // A stale pointer answers 0, not an HRESULT posing as the previous LOD.
         expect(call(resources, "IDirect3DTexture9_SetLOD", 0xdead, 1)).toBe(0);
+    });
+});
+
+/**
+ * A cube's float gate must be the SAME probe a 2D texture of that format answers to.
+ *
+ * It was not: any sampled float cube was refused NOTAVAILABLE regardless of the probe,
+ * because the cube upload path only knew how to decode into rgba8unorm. RA3 loads two
+ * A16B16G16R16F environment cubes through D3DX; both were refused, and the engine reads a
+ * failed create as a missing asset — silently, with nothing downstream reporting anything.
+ */
+describe("cube float gate", () => {
+    const D3DFMT_A16B16G16R16F = 113;
+    const D3DERR_NOTAVAILABLE = 0x8876086a;
+    const D3DPOOL_MANAGED = 1;
+    const contract = (ok: boolean) => ({
+        supportsTexture: () => ok,
+        supportsUpload: () => ok,
+        supportsSampling: () => ok,
+        supportsReadback: () => ok,
+        supportsRenderTarget: () => ok,
+        supportsRenderTargetBlending: () => ok,
+    });
+
+    afterEach(() => setD3D9FloatCapabilityContract(null));
+
+    // This fixture has no guest process, so a create that gets PAST the format gates dies at
+    // the vtable lookup. That throw is the signal we want: it can only happen once the gate
+    // has let the format through.
+    const createOutcome = (name: string, ...args: number[]): number | "reachedVtable" => {
+        try {
+            return call(resources, name, ...args);
+        } catch {
+            return "reachedVtable";
+        }
+    };
+
+    test("a probe-supported sampled float cube is not refused for being float", () => {
+        setD3D9FloatCapabilityContract(contract(true));
+        expect(isD3D9FloatTextureFormatSupported(D3DFMT_A16B16G16R16F)).toBe(true);
+        expect(createOutcome("IDirect3DDevice9_CreateCubeTexture",
+            DEVICE, 128, 8, 0, D3DFMT_A16B16G16R16F, D3DPOOL_MANAGED, OUT)).toBe("reachedVtable");
+    });
+
+    test("a probe-rejected float cube is still refused, and says so", () => {
+        setD3D9FloatCapabilityContract(contract(false));
+        const hr = call(resources, "IDirect3DDevice9_CreateCubeTexture",
+            DEVICE, 128, 8, 0, D3DFMT_A16B16G16R16F, D3DPOOL_MANAGED, OUT);
+        expect(hr).toBe(D3DERR_NOTAVAILABLE);
+        expect(new DataView(memory.buffer).getUint32(OUT, true)).toBe(0);
+    });
+
+    test("the 2D path answers the same probe the same way", () => {
+        setD3D9FloatCapabilityContract(contract(true));
+        expect(createOutcome("IDirect3DDevice9_CreateTexture",
+            DEVICE, 128, 128, 8, 0, D3DFMT_A16B16G16R16F, D3DPOOL_MANAGED, OUT)).toBe("reachedVtable");
     });
 });

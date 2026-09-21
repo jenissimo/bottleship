@@ -627,6 +627,16 @@ fn ffpProjectTexcoord(tc: vec4<f32>, flags: u32) -> vec2<f32> {
     if (count == 2u) { q = tc.y; }
     else if (count == 3u) { q = tc.z; }
     return tc.xy / select(1.0, q, abs(q) > 1e-6);
+}
+
+// Cube stages take the coordinate set as a DIRECTION (u,v,w); the face and the 2-D position
+// inside it are the hardware's business, so no address mode applies. Projection still divides
+// by the COUNT's last component, which for a 3-component set is already the direction's w.
+fn ffpProjectTexcoord3(tc: vec4<f32>, flags: u32) -> vec3<f32> {
+    if ((flags & 256u) == 0u) { return tc.xyz; }
+    let count = flags & 0x7u;
+    if (count != 4u) { return tc.xyz; }
+    return tc.xyz / select(1.0, tc.w, abs(tc.w) > 1e-6);
 }`;
 
 /**
@@ -762,4 +772,22 @@ fn ffpComputeLighting(
     out[1] = vec4<f32>(clamp(matSpc.xyz * specular, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0);
     return out;
 }`;
+}
+
+/**
+ * Whether the FFP vertex stage lights this draw.
+ *
+ * A PRE-TRANSFORMED declaration (D3DFVF_XYZRHW / D3DDECLUSAGE_POSITIONT) is never lit,
+ * whatever D3DRS_LIGHTING holds: the vertices are already in screen space and carry their
+ * own colour. Wine returns from `wined3d_ffp_get_vs_settings` before it reads
+ * WINED3D_RS_LIGHTING (utils.c, `if (vdecl->position_transformed)`), leaving
+ * `settings->lighting` at the memset zero; DXVK gates the same way on `HasPositionT`.
+ *
+ * The state defaults to TRUE, so reading it unconditionally lights every screen-space
+ * composite quad an engine draws without ever touching lighting state — by zero lights with
+ * no material, i.e. black. The scene behind it is intact, which is why nothing else reports
+ * a problem.
+ */
+export function ffpLightingEnabled(preTransformed: boolean, renderStateLighting: number): boolean {
+    return !preTransformed && renderStateLighting !== 0;
 }

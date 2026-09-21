@@ -67,9 +67,12 @@ describe("FFP refuses only what the cascade actually samples", () => {
         expect(resolve()).toBe(DRAWN);
     });
 
-    test("a cube texture ON a sampled stage is still refused", () => {
-        expect(resolveProbe({ cube: 1 << 0, stages: 1 }).resolve()).toBe(-1);
-        expect(resolveProbe({ cube: 1 << 1, stages: 2 }).resolve()).toBe(-1);
+    test("a cube texture ON a sampled stage draws — the FFP samples cubes", () => {
+        // Environment mapping is fixed-function D3D. The stage declares texture_cube, the
+        // bind-group layout is built for the same mask, and the mask rides the pipeline key
+        // (blendCacheKey's dimMask), so a cube and a 2-D variant never share a pipeline.
+        expect(resolveProbe({ cube: 1 << 0, stages: 1 }).resolve()).toBe(DRAWN);
+        expect(resolveProbe({ cube: 1 << 1, stages: 2 }).resolve()).toBe(DRAWN);
     });
 
     test("a volume texture above the cascade draws; one inside it is refused", () => {

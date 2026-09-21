@@ -19,6 +19,26 @@
 export type BufferUploadBackend = "d3d9" | "d3d8";
 
 /**
+ * WHY an upload carried the bytes it carried. `amplification` says how much surplus there is;
+ * without the reason, any fix to the upload path is a guess about which of these dominates.
+ *
+ *  - `dirtySpan`     partial upload of [min(lock offsets), max(lock ends)). Surplus here is
+ *                    the GAPS between disjoint locks — a buffer locked at both ends ships
+ *                    everything in between.
+ *  - `wholeRingNew`  a version-ring slot built this frame holds nothing, so its first upload
+ *                    cannot be partial.
+ *  - `wholeRenamed`  D3DLOCK_DISCARD renamed onto a fresh slot mid-frame; same reason.
+ *  - `wholeNewBuffer` the store created the GPUBuffer now.
+ *  - `wholeRestore`  a whole-buffer re-raise (device loss, or setDirty(true) by any owner).
+ */
+export type UploadReason =
+    | "dirtySpan" | "wholeRingNew" | "wholeRenamed" | "wholeNewBuffer" | "wholeRestore";
+
+const UPLOAD_REASONS: readonly UploadReason[] = [
+    "dirtySpan", "wholeRingNew", "wholeRenamed", "wholeNewBuffer", "wholeRestore",
+];
+
+/**
  * Widen `[start, end)` to what `queue.writeBuffer` will accept against a buffer of
  * `gpuCapacity` bytes: both the destination offset and the length must be multiples of 4,
  * and the write must not run past the buffer. Widening is safe in both directions — the extra
@@ -79,6 +99,11 @@ interface BackendCensus {
     /** Uploads restricted to the range the guest rewrote. */
     partialUploads: number;
     buckets: Int32Array;
+    /** Per-reason tally. `covered` is the bytes the guest actually locked since that buffer's
+     *  previous upload, so `uploaded - covered` is the surplus this reason is responsible for. */
+    reasonCount: Int32Array;
+    reasonUploaded: Float64Array;
+    reasonCovered: Float64Array;
 }
 
 function emptyBackend(): BackendCensus {
@@ -87,6 +112,9 @@ function emptyBackend(): BackendCensus {
         uploads: 0, uploadedBytes: 0,
         fullUploads: 0, partialUploads: 0,
         buckets: new Int32Array(BUCKET_NAMES.length),
+        reasonCount: new Int32Array(UPLOAD_REASONS.length),
+        reasonUploaded: new Float64Array(UPLOAD_REASONS.length),
+        reasonCovered: new Float64Array(UPLOAD_REASONS.length),
     };
 }
 
@@ -117,6 +145,26 @@ export function noteBufferUpload(backend: BufferUploadBackend, bytes: number, fu
     c.buckets[b]!++;
 }
 
+/**
+ * WHY this upload carried `bytes`, and how many of them the guest had actually locked since
+ * this buffer's previous upload. Called where the reason is known, which for the deferred
+ * path is queue time, not drain time — so it is deliberately NOT the same call as
+ * `noteBufferUpload`, and the two are cross-checked in the report rather than assumed equal.
+ */
+export function noteUploadReason(
+    backend: BufferUploadBackend, bytes: number, reason: UploadReason, coveredBytes: number,
+): void {
+    if (bytes <= 0) return;
+    const i = UPLOAD_REASONS.indexOf(reason);
+    if (i < 0) return;
+    const c = census[backend];
+    c.reasonCount[i]!++;
+    c.reasonUploaded[i]! += bytes;
+    // Clamped: a lock wider than the upload (the guest locked a range we then clipped to the
+    // buffer) would otherwise make surplus negative and hide a real one elsewhere in the sum.
+    c.reasonCovered[i]! += Math.min(coveredBytes, bytes);
+}
+
 export function resetBufferUploadCensus(): void {
     census.d3d9 = emptyBackend();
     census.d3d8 = emptyBackend();
@@ -139,6 +187,44 @@ function snapshotBackend(c: BackendCensus): Record<string, unknown> {
             ? Math.round((c.uploadedBytes / c.guestWroteBytes) * 10) / 10
             : null,
         buckets,
+        byReason: reasonBreakdown(c),
+    };
+}
+
+const mb = (b: number) => +(b / 1048576).toFixed(2);
+
+/**
+ * The surplus, split by cause, plus an explicit statement of how much of the window's bytes
+ * this split actually accounts for. A breakdown that silently covered 12% of the traffic would
+ * still look like an answer, so `accountedPct` and `unattributed` are part of the result, not
+ * a footnote.
+ */
+function reasonBreakdown(c: BackendCensus): Record<string, unknown> {
+    const rows: Record<string, unknown> = {};
+    let accounted = 0;
+    for (let i = 0; i < UPLOAD_REASONS.length; i++) {
+        accounted += c.reasonUploaded[i]!;
+        if (!c.reasonCount[i]) continue;
+        const up = c.reasonUploaded[i]!, cov = c.reasonCovered[i]!;
+        rows[UPLOAD_REASONS[i]!] = {
+            count: c.reasonCount[i]!,
+            // Raw bytes as well as MB: 0.06 MB and 0.00 MB are both "no surplus" to a reader,
+            // and on this workload most uploads are under a kilobyte.
+            uploadedBytes: up, coveredBytes: cov, surplusBytes: up - cov,
+            uploadedMB: mb(up), coveredMB: mb(cov), surplusMB: mb(up - cov),
+            amplification: cov > 0 ? Math.round((up / cov) * 10) / 10 : null,
+            shareOfUploadedPct: c.uploadedBytes > 0 ? +((up / c.uploadedBytes) * 100).toFixed(1) : 0,
+        };
+    }
+    const gap = c.uploadedBytes - accounted;
+    return {
+        rows,
+        accountedPct: c.uploadedBytes > 0 ? +((accounted / c.uploadedBytes) * 100).toFixed(1) : 0,
+        unattributedMB: mb(Math.max(0, gap)),
+        verdict: c.uploads === 0 ? "no uploads in this window"
+            : Math.abs(gap) <= c.uploadedBytes * 0.01 ? "complete"
+            : `INCOMPLETE: ${mb(Math.abs(gap))} MB of ${mb(c.uploadedBytes)} MB reached a writeBuffer `
+              + `${gap > 0 ? "with no reason attached" : "counted twice"} — an upload path this split does not model`,
     };
 }
 

@@ -9,7 +9,8 @@ import {
     D3DRS_CULLMODE, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_STENCILFUNC,
     D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL, D3DRS_STENCILPASS, D3DRS_STENCILMASK, D3DRS_STENCILWRITEMASK,
     D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILZFAIL,
-    D3DRS_CCW_STENCILPASS, isD3D9DepthStencilStateRepresentable, d3dColorToGpu,
+    D3DRS_CCW_STENCILPASS, isD3D9DepthStencilStateRepresentable,
+    unrepresentableD3D9DepthStencilState, d3dColorToGpu,
 } from "../../src/worker/backends/webgpu/d3d9/d3d9-blend";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -240,20 +241,29 @@ describe("depth/stencil state validation", () => {
         expect(isD3D9DepthStencilStateRepresentable(get(m))).toBe(true);
     });
 
-    test("refuses invalid active cull/depth/stencil enums", () => {
+    // Real drivers draw an out-of-enum D3DRS_CULLMODE unculled rather than dropping the call
+    // (DXVK DecodeCullMode `default:` -> D3DCULL_NONE, wined3d vk_cull_mode_from_wined3d
+    // FIXME -> VK_CULL_MODE_NONE). Refusing it deleted Red Alert 3's whole world.
+    test("an out-of-enum cull mode is not a refusal", () => {
         const cull = depthDefaults(); cull[D3DRS_CULLMODE] = 0;
-        expect(isD3D9DepthStencilStateRepresentable(get(cull))).toBe(false);
+        expect(unrepresentableD3D9DepthStencilState(get(cull))).toBeNull();
+        cull[D3DRS_CULLMODE] = 0xdead;
+        expect(unrepresentableD3D9DepthStencilState(get(cull))).toBeNull();
+    });
+
+    test("refuses invalid active depth/stencil enums, and names the one it refused", () => {
         const z = depthDefaults(); z[D3DRS_ZFUNC] = 0xdead;
+        expect(unrepresentableD3D9DepthStencilState(get(z))).toContain("ZFUNC");
         expect(isD3D9DepthStencilStateRepresentable(get(z))).toBe(false);
         const stencil = depthDefaults();
         stencil[D3DRS_STENCILENABLE] = 1;
         stencil[D3DRS_STENCILPASS] = 0xdead;
-        expect(isD3D9DepthStencilStateRepresentable(get(stencil))).toBe(false);
+        expect(unrepresentableD3D9DepthStencilState(get(stencil))).toContain("STENCILPASS");
         const back = depthDefaults();
         back[D3DRS_STENCILENABLE] = 1;
         back[D3DRS_TWOSIDEDSTENCILMODE] = 1;
         back[D3DRS_CCW_STENCILFUNC] = 0;
-        expect(isD3D9DepthStencilStateRepresentable(get(back))).toBe(false);
+        expect(unrepresentableD3D9DepthStencilState(get(back))).toContain("CCW_STENCILFUNC");
     });
 });
 

@@ -29,6 +29,7 @@ import {
     D3DLIGHT_DIRECTIONAL,
     type FfpUniformParams,
     type FfpLightInput,
+    ffpLightingEnabled,
 } from "../../src/worker/backends/webgpu/d3d9/ffp-lighting";
 
 /** Size + alignment, in FLOATS, of the WGSL types the FFP uniform struct uses. */
@@ -317,5 +318,32 @@ describe("D3D_ALPHALESS_FORMATS", () => {
             28 /* A8 */, 41 /* P8 */, 113 /* A16B16G16R16F */, 116 /* A32B32G32R32F */]) {
             expect(D3D_ALPHALESS_FORMATS.has(format)).toBe(false);
         }
+    });
+});
+
+/**
+ * A pre-transformed draw is never lit.
+ *
+ * D3DRS_LIGHTING DEFAULTS TO TRUE, so an engine that composites its frame through a screen
+ * quad and never touches lighting state has LIGHTING=1, zero lights and no material. Reading
+ * the state unconditionally lights that quad to black while the scene it samples is intact —
+ * RA3's black world with a correct HUD and minimap. Wine's `wined3d_ffp_get_vs_settings`
+ * returns before it reads WINED3D_RS_LIGHTING when `vdecl->position_transformed`
+ * (dlls/wined3d/utils.c), leaving `settings->lighting` zero; DXVK gates on `HasPositionT`.
+ */
+describe("pre-transformed vertices are never lit", () => {
+    test("a pre-transformed draw ignores D3DRS_LIGHTING, however it is set", () => {
+        expect(ffpLightingEnabled(true, 1)).toBe(false);
+        expect(ffpLightingEnabled(true, 0)).toBe(false);
+    });
+
+    test("an untransformed draw still follows D3DRS_LIGHTING", () => {
+        expect(ffpLightingEnabled(false, 1)).toBe(true);
+        expect(ffpLightingEnabled(false, 0)).toBe(false);
+    });
+
+    test("the D3D9 default (LIGHTING never written, so TRUE) does not light a screen quad", () => {
+        const D3DRS_LIGHTING_DEFAULT = 1;
+        expect(ffpLightingEnabled(true, D3DRS_LIGHTING_DEFAULT)).toBe(false);
     });
 });

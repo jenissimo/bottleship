@@ -140,6 +140,15 @@ export class D3D9CommandRecorder {
     private currentStencilReference: number | null = null;
     private currentBlendConstant: number | null = null;
     private drawCount = 0;
+    /**
+     * Indexed LOGICAL draws ever recorded into a frame, in the same units as the API's
+     * `drawIndexedPrimitive` counter and the encoder's `drawIndexedCalls`. It is the third
+     * point of the handoff, and the one that splits an unaccounted difference in two: draws
+     * lost BEFORE recording (the device never got as far as a command) versus draws recorded
+     * and then not encoded — which includes the frame still being recorded when a snapshot is
+     * taken. Monotonic across frames; never reset by present.
+     */
+    private indexedDrawsRecorded = 0;
 
     constructor(private framePool: RenderFramePool) {
         this.frame = framePool.acquire();
@@ -305,6 +314,7 @@ export class D3D9CommandRecorder {
         this.frame.pushSetIndexBuffer(cmd.ibGpuBuffer, cmd.ibFormat);
         this.frame.pushDrawIndexed(cmd.indexCount, cmd.startIndex, cmd.baseVertex, cmd.instanceCount ?? 1);
         this.drawCount++;
+        this.indexedDrawsRecorded++;
     }
 
     /** Record one compact host command for an arena-authoritative indexed pair run. */
@@ -352,6 +362,9 @@ export class D3D9CommandRecorder {
         // ordinary draw to publish BindProgrammable even when it reuses the same state slot.
         this.currentBindStateIndex = null;
         this.drawCount += cmd.pairCount + (cmd.prefixVsBits ? 1 : 0);
+        // Same unit as the API side, which mints one drawIndexedPrimitive per pair plus the
+        // fused prefix draw.
+        this.indexedDrawsRecorded += cmd.pairCount + (cmd.prefixVsBits ? 1 : 0);
     }
 
     /** Associate the just-recorded RenderFrame draw with its WASM-arena command. */
@@ -397,6 +410,16 @@ export class D3D9CommandRecorder {
      */
     getDrawCount(): number {
         return this.drawCount;
+    }
+
+    /** Indexed logical draws recorded into frames for the lifetime of this recorder. */
+    getIndexedDrawsRecorded(): number {
+        return this.indexedDrawsRecorded;
+    }
+
+    /** Rewind the midpoint alongside the api/backend counters it is compared against. */
+    resetIndexedDrawsRecorded(): void {
+        this.indexedDrawsRecorded = 0;
     }
 
     /**

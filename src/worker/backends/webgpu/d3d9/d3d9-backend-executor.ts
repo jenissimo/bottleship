@@ -9,7 +9,9 @@ import { WebGPUBackend } from "../webgpu-backend";
 import { RenderFrame, RenderCommandType, ProgrammableDrawState, FfpDrawState, type ArenaDrawBinding } from "../render-frame";
 import { Logger, LogCategory } from "../../../core/logger";
 import { recordGpuError } from "../../../core/gpu-error-log";
-import { d3d9PerfVertexRangeOOB } from "../../../modules/d3d9/d3d9-perf";
+import {
+    d3d9PerfVertexRangeOOB, d3d9NoteIndexedDrawUnencoded, d3d9NoteFence, d3d9NoteStagedBytes,
+} from "../../../modules/d3d9/d3d9-perf";
 import { frameProfiler } from "../../../core/frame-profiler";
 import { statsOverlay } from "../../../core/stats-overlay";
 import { PROG_BIND } from "./shader";
@@ -43,6 +45,9 @@ export interface PipelineInfo {
      *  from a differently-counted per-draw snapshot is a WebGPU validation error, not a
      *  degraded picture. */
     ffpStageCount: number;
+    /** FFP stages whose shader declared texture_cube. The bind-group layout, the shader and
+     *  the bound views must all agree on it — WebGPU types a texture slot by view dimension. */
+    ffpCubeMask: number;
     /** arrayStride of every vertex-buffer slot this pipeline declares (index = slot, 0 = no
      *  layout there). The encoder sizes each draw against these — see planVertexRangePadding. */
     strides: number[];
@@ -321,6 +326,7 @@ class UniformArena {
             } else {
                 // Diagnostic OFF arm for an apples-to-apples A/B on one build.
                 this.device.queue.writeBuffer(this.buffer!, offset, data, 0, floatLen);
+                d3d9NoteStagedBytes("constants", floatLen * 4);
             }
         }
         this.cursor = nextCursor;
@@ -334,6 +340,7 @@ class UniformArena {
         if (!this.bulkUpload || !this.dirty || !this.buffer || this.cursor === 0) return;
         // Typed-array overload: dataOffset and size are in elements, not bytes.
         queue.writeBuffer(this.buffer, 0, this.staging, 0, this.cursor >>> 2);
+        d3d9NoteStagedBytes("constants", this.cursor);
         this.dirty = false;
     }
 }
@@ -600,6 +607,7 @@ export class D3D9BackendExecutor {
             seenSaturated: this.censusSeenSaturated,
             bindGroupSets: this.metrics.bindGroupSets,
             bindGroupSetSkips: this.metrics.bindGroupSetSkips,
+            bindGroupSetSameGroup: this.metrics.bindGroupSetSameGroup,
             drawCalls: this.metrics.drawCalls,
             // us/call for acquireProgBindGroup, by outcome. null = the profile never ran
             // (`__d3d9BindGroupProfile`), which is not the same as "it was free".
@@ -722,6 +730,9 @@ export class D3D9BackendExecutor {
         pipelineSets: 0,
         bindGroupSets: 0,
         bindGroupSetSkips: 0,
+        /** Re-binds that kept the same bind group and changed only a dynamic offset. The
+         *  denominator `bindGroupSetSkips` needs to mean anything. */
+        bindGroupSetSameGroup: 0,
         bindGroupCacheHits: 0,
         // Bind groups actually built. The hit count alone cannot say whether a cache is
         // working — a path that never hits and a path that never runs read the same.
@@ -729,6 +740,19 @@ export class D3D9BackendExecutor {
         drawCalls: 0,
         /** Indexed draws actually encoded, including every pair replayed by an arena run. */
         drawIndexedCalls: 0,
+        /**
+         * Recorded indexed draws the encoder refused, by the precondition that refused them.
+         * The API layer already minted an `apiDrawIndexed` for each, so a refusal that counts
+         * nothing is a draw that disappears between the two ledgers — the failure mode this
+         * whole trio exists to make impossible. See D3D9ArenaRunReconcile.apiDrawUnaccounted.
+         */
+        drawIndexedSkippedNoPipeline: 0,
+        drawIndexedSkippedValidator: 0,
+        /** Indexed logical draws lost with a frame that was discarded before encode (no GPU
+         *  device) or abandoned mid-encode by a throw. */
+        drawIndexedFrameDiscarded: 0,
+        /** The same loss counted in arena PAIRS, for the producer/executor pair identity. */
+        arenaRunPairsFrameDiscarded: 0,
         renderBundleHits: 0,
         renderBundleMisses: 0,
         renderBundleBuilds: 0,
@@ -1069,10 +1093,11 @@ export class D3D9BackendExecutor {
         this.vsArena = null;
         this.psArena = null;
         this.ffpArena = null;
-        this.ffpLayout = null;
+        this.ffpLayouts.clear();
         this.ffpCacheSampler = [];
         this.ffpCacheView = [];
         this.ffpCacheStages = [];
+        this.ffpCacheCube = [];
         this.ffpCacheGroup = [];
         this.ffpCacheLen = 0;
         this.ffpCacheCursor = 0;
@@ -1094,10 +1119,11 @@ export class D3D9BackendExecutor {
         strides: number[] = [],
         attrEnds: number[] = [],
         arenaIdentity?: string,
+        ffpCubeMask = 0,
     ): number {
         const id = this.pipelines.length;
         this.pipelines.push(pipeline);
-        this.pipelineInfo.push({ pipeline, hasTexture, programmable, ffpStageCount, strides, attrEnds });
+        this.pipelineInfo.push({ pipeline, hasTexture, programmable, ffpStageCount, ffpCubeMask, strides, attrEnds });
         if (programmable && arenaIdentity !== undefined) {
             this.arenaPipelinesByIdentity.set(arenaIdentity, id);
         }
@@ -1425,11 +1451,14 @@ export class D3D9BackendExecutor {
     // choice is baked into every FFP pipeline at creation, so it must not change while
     // pipelines are cached. Read once, like __progCacheN.
     private readonly ffpDynOffsetEnabled = (globalThis as Record<string, unknown>).__ffpDynOffset === true;
-    private ffpLayout: { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } | null = null;
+    // Keyed by the cube-sampler mask, exactly like progLayouts: a texture slot is typed by its
+    // view dimension, so an all-2D layout cannot accept a cube view (mask 0 = the common case).
+    private ffpLayouts = new Map<number, { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout }>();
     // Flat per-slot stage arrays: slot s occupies [s*FFP_MAX_STAGES, +FFP_MAX_STAGES).
     private ffpCacheSampler: (GPUSampler | null)[] = [];
     private ffpCacheView: (GPUTextureView | null)[] = [];
     private ffpCacheStages: number[] = [];
+    private ffpCacheCube: number[] = [];
     private ffpCacheGroup: GPUBindGroup[] = [];
     private ffpCacheLen = 0;
     private ffpCacheCursor = 0;
@@ -1993,6 +2022,7 @@ export class D3D9BackendExecutor {
         if (usedSlots > 0 && this.megaVsBuffer) {
             const uploadStarted = performance.now();
             queue.writeBuffer(this.megaVsBuffer, 0, this.megaVsStagingBits, 0, usedSlots * slotWords);
+            d3d9NoteStagedBytes("constants", usedSlots * slotWords * 4);
             this.metrics.megaBatchUploadMs += performance.now() - uploadStarted;
         }
         this.metrics.megaBatchPrepareMs += performance.now() - prepareStarted;
@@ -2000,15 +2030,17 @@ export class D3D9BackendExecutor {
     }
 
     /**
-     * Shared, explicit bind-group/pipeline layout for FFP pipelines. One layout serves every
-     * FFP shader variant: binding 0 is the fixed-size uniform block with a dynamic offset,
+     * Shared, explicit bind-group/pipeline layout for FFP pipelines, parameterised by the
+     * cube-sampler mask: binding 0 is the fixed-size uniform block with a dynamic offset,
      * bindings 1/2 are the stage-0 sampler + texture. Variants that sample no texture simply
      * do not declare 1/2 — a pipeline layout may be a superset of what the shader uses, and
      * the bind group supplies fallbacks. Because the layout is shared (not per-pipeline as
-     * with "auto"), one cached bind group is compatible with all FFP pipelines.
+     * with "auto"), one cached bind group is compatible with every FFP pipeline of that mask.
      */
-    private getFfpLayout(): { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } {
-        if (!this.ffpLayout) {
+    private getFfpLayout(cubeMask = 0): { bindGroupLayout: GPUBindGroupLayout; pipelineLayout: GPUPipelineLayout } {
+        const key = cubeMask & ((1 << FFP_MAX_STAGES) - 1);
+        let cached = this.ffpLayouts.get(key);
+        if (!cached) {
             const device = this.backend.getDevice()!;
             const entries: GPUBindGroupLayoutEntry[] = [
                 // Read by both stages (vertex: transform/lighting; fragment: stage ops, fog, clip).
@@ -2020,19 +2052,21 @@ export class D3D9BackendExecutor {
             // FFP pipeline.
             for (let s = 0; s < FFP_MAX_STAGES; s++) {
                 entries.push({ binding: 1 + s * 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "filtering" } });
-                entries.push({ binding: 2 + s * 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "2d" } });
+                entries.push({ binding: 2 + s * 2, visibility: GPUShaderStage.FRAGMENT,
+                    texture: { sampleType: "float", viewDimension: ((key >> s) & 1) ? "cube" : "2d" } });
             }
             const bindGroupLayout = device.createBindGroupLayout({ entries });
             const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
-            this.ffpLayout = { bindGroupLayout, pipelineLayout };
+            cached = { bindGroupLayout, pipelineLayout };
+            this.ffpLayouts.set(key, cached);
         }
-        return this.ffpLayout;
+        return cached;
     }
 
     /** Layout for FFP render pipelines: the shared explicit one when the dynamic-offset shape
      *  is enabled, else WebGPU's implicit per-pipeline layout (the historical behaviour). */
-    getFfpPipelineLayout(): GPUPipelineLayout | GPUAutoLayoutMode {
-        return this.ffpDynOffsetEnabled ? this.getFfpLayout().pipelineLayout : "auto";
+    getFfpPipelineLayout(cubeMask = 0): GPUPipelineLayout | GPUAutoLayoutMode {
+        return this.ffpDynOffsetEnabled ? this.getFfpLayout(cubeMask).pipelineLayout : "auto";
     }
 
     /**
@@ -2049,21 +2083,26 @@ export class D3D9BackendExecutor {
         validStages: number,
         fallbackSampler: GPUSampler,
         fallbackView: GPUTextureView,
+        cubeMask = 0,
+        fallbackCube: GPUTextureView | null = null,
     ): GPUBindGroup {
         // `validStages` is how far the arrays were actually written this draw; entries past it
         // are stale (render-frame only clears slot 0). They are non-null, so the `?? fallback`
         // does NOT catch them — an earlier, deeper draw's sampler/view would be bound, and a
         // view can outlive its texture. The "auto" branch already honours this; both must.
         const live = (n: number) => n < validStages;
+        const stageFallback = (n: number): GPUTextureView =>
+            ((cubeMask >> n) & 1) !== 0 ? (fallbackCube ?? fallbackView) : fallbackView;
         // Compare only the stages this pipeline uses: the rest bind fallbacks, so two draws with
-        // the same used stages share a group whatever stale values sit in the tail.
+        // the same used stages share a group whatever stale values sit in the tail. The mask is
+        // part of the identity because it selects the LAYOUT the group was built against.
         for (let s = 0; s < this.ffpCacheLen; s++) {
-            if (this.ffpCacheStages[s] !== stageCount) continue;
+            if (this.ffpCacheStages[s] !== stageCount || this.ffpCacheCube[s] !== cubeMask) continue;
             const base = s * FFP_MAX_STAGES;
             let match = true;
             for (let n = 0; n < stageCount; n++) {
                 if (this.ffpCacheSampler[base + n] !== ((live(n) ? samplers[n] : null) ?? fallbackSampler)
-                    || this.ffpCacheView[base + n] !== ((live(n) ? views[n] : null) ?? fallbackView)) { match = false; break; }
+                    || this.ffpCacheView[base + n] !== ((live(n) ? views[n] : null) ?? stageFallback(n))) { match = false; break; }
             }
             if (match) {
                 this.metrics.bindGroupCacheHits++;
@@ -2077,19 +2116,20 @@ export class D3D9BackendExecutor {
         for (let n = 0; n < FFP_MAX_STAGES; n++) {
             const inRange = n < stageCount && live(n);
             entries.push({ binding: 1 + n * 2, resource: (inRange ? samplers[n] : null) ?? fallbackSampler });
-            entries.push({ binding: 2 + n * 2, resource: (inRange ? views[n] : null) ?? fallbackView });
+            entries.push({ binding: 2 + n * 2, resource: (inRange ? views[n] : null) ?? stageFallback(n) });
         }
-        const bindGroup = device.createBindGroup({ layout: this.getFfpLayout().bindGroupLayout, entries });
+        const bindGroup = device.createBindGroup({ layout: this.getFfpLayout(cubeMask).bindGroupLayout, entries });
         this.metrics.bindGroupBuilds++;
         this.census.ffpSharedBuilds++;
         const slot = this.ffpCacheLen < FFP_CACHE_N
             ? this.ffpCacheLen++
             : (this.ffpCacheCursor = (this.ffpCacheCursor + 1) % FFP_CACHE_N);
         this.ffpCacheStages[slot] = stageCount;
+        this.ffpCacheCube[slot] = cubeMask;
         const base = slot * FFP_MAX_STAGES;
         for (let n = 0; n < stageCount; n++) {
             this.ffpCacheSampler[base + n] = (live(n) ? samplers[n] : null) ?? fallbackSampler;
-            this.ffpCacheView[base + n] = (live(n) ? views[n] : null) ?? fallbackView;
+            this.ffpCacheView[base + n] = (live(n) ? views[n] : null) ?? stageFallback(n);
         }
         this.ffpCacheGroup[slot] = bindGroup;
         return bindGroup;
@@ -2154,10 +2194,15 @@ export class D3D9BackendExecutor {
         this.metrics.pipelineSets = 0;
         this.metrics.bindGroupSets = 0;
         this.metrics.bindGroupSetSkips = 0;
+        this.metrics.bindGroupSetSameGroup = 0;
         this.metrics.bindGroupCacheHits = 0;
         this.metrics.bindGroupBuilds = 0;
         this.metrics.drawCalls = 0;
         this.metrics.drawIndexedCalls = 0;
+        this.metrics.drawIndexedSkippedNoPipeline = 0;
+        this.metrics.drawIndexedSkippedValidator = 0;
+        this.metrics.drawIndexedFrameDiscarded = 0;
+        this.metrics.arenaRunPairsFrameDiscarded = 0;
         this.metrics.renderBundleHits = 0;
         this.metrics.renderBundleMisses = 0;
         this.metrics.renderBundleBuilds = 0;
@@ -2257,6 +2302,53 @@ export class D3D9BackendExecutor {
      *  hash collision is visible to the verify drain instead of being reported as a hit. */
     private arenaSeenPipelineKeys = new Map<number, string>();
     private arenaRunInvariantLogs = 0;
+
+    /**
+     * Indexed logical draws (and arena pairs) a frame still owed the encoder from `from`
+     * onwards. A frame that is discarded whole, or abandoned by a throw, takes every draw it
+     * holds with it — the API counted each one and the encoder never saw it, which is
+     * indistinguishable from a lost draw unless the loss is counted here.
+     */
+    private countUnencodedIndexedDraws(
+        frame: RenderFrame, from: number,
+    ): { logicalDraws: number; pairs: number } {
+        let logicalDraws = 0;
+        let pairs = 0;
+        for (let i = Math.max(0, from); i < frame.commandTypes.length; i++) {
+            const type = frame.commandTypes[i];
+            if (type === RenderCommandType.DrawIndexed) {
+                logicalDraws++;
+            } else if (type === RenderCommandType.DrawIndexedArenaRun) {
+                const run = frame.arenaIndexedRuns[frame.commandA[i] >>> 0];
+                if (!run) continue;
+                logicalDraws += arenaRunExpectedLogicalDraws(run);
+                pairs += run.expectedPairCount;
+            }
+        }
+        return { logicalDraws, pairs };
+    }
+
+    private noteFrameIndexedDrawsLost(frame: RenderFrame, from: number): void {
+        const lost = this.countUnencodedIndexedDraws(frame, from);
+        this.metrics.drawIndexedFrameDiscarded += lost.logicalDraws;
+        this.metrics.arenaRunPairsFrameDiscarded += lost.pairs;
+    }
+
+    /**
+     * A frame that was FINALIZED and then thrown away before execute() ever saw it — the
+     * submit-side refusals (no colour view, no target formats, an MSAA layout we decline).
+     * Those return before a single command is read, so neither the encoder's declines nor the
+     * mid-flush abort walk can see the draws the frame was holding; without this they leave
+     * the API counter minted and nothing on the other side. `reason` names the refusing site,
+     * so the ledger says WHICH refusal is eating draws rather than only that some did.
+     */
+    noteFrameDiscardedBeforeExecute(frame: RenderFrame, reason: string): void {
+        const lost = this.countUnencodedIndexedDraws(frame, 0);
+        if (lost.logicalDraws > 0) {
+            d3d9NoteIndexedDrawUnencoded(`submitRefused:${reason}`, lost.logicalDraws);
+        }
+        this.metrics.arenaRunPairsFrameDiscarded += lost.pairs;
+    }
 
     getArenaDrainStats(): typeof this.arenaDrainStats {
         return { ...this.arenaDrainStats };
@@ -3104,6 +3196,7 @@ export class D3D9BackendExecutor {
         // No device: every handle this frame would reference is dead and `submit` is a
         // validated no-op. Discard the frame rather than build it against nothing.
         if (!device || !queue) {
+            this.noteFrameIndexedDrawsLost(frame, 0);
             this.arenaPipelinesByIdentity.clear();
             frame.releaseTemporaryBuffers();
             return;
@@ -3216,6 +3309,9 @@ export class D3D9BackendExecutor {
             for (let i = 0; i < frame.uploadBuffers.length; i++) {
                 const bytes = frame.uploadData[i] as Uint8Array;
                 queue.writeBuffer(frame.uploadBuffers[i], frame.uploadOffsets[i] ?? 0, bytes as any);
+                // Already copied into the frame's own staging by queueUpload, so an
+                // off-thread staging copy adds nothing for this class (plan §5).
+                d3d9NoteStagedBytes("vertexIndexCopied", bytes.byteLength);
                 noteBufferUpload("d3d9", bytes.byteLength, (frame.uploadOffsets[i] ?? 0) === 0
                     && bytes.byteLength >= frame.uploadBuffers[i]!.size);
             }
@@ -3388,6 +3484,7 @@ export class D3D9BackendExecutor {
                         upload.fill(0);
                         upload.set(bytes);
                         queue.writeBuffer(buffer, 0, upload);
+                        d3d9NoteStagedBytes("vertexIndexDirect", uploadSize);
                         arenaUpBuffers.set(row, { buffer, size: byteLen });
                         arenaUpBytes += uploadSize;
                     } catch {
@@ -3788,14 +3885,22 @@ export class D3D9BackendExecutor {
                             if (arenaState) this.bindProgrammable(renderPass, arenaState);
                         }
                         // commandD = instance count (SetStreamSourceFreq); 1 for an ordinary draw.
-                        if (this.currentPipelineId === null) break;
+                        if (this.currentPipelineId === null) {
+                            this.metrics.drawIndexedSkippedNoPipeline++;
+                            break;
+                        }
                         if (validateD3D9RasterDrawCommand({
                             kind: "indexed",
                             count: indexCount,
                             start: startIndex,
                             baseVertex,
                             instanceCount: frame.commandD[i]!,
-                        }) !== null) break;
+                        }) !== null) {
+                            // The arena replays count the same refusal as arenaRunValidatorSkips;
+                            // the ordinary row counted nothing, so the draw simply vanished.
+                            this.metrics.drawIndexedSkippedValidator++;
+                            break;
+                        }
                         renderPass.drawIndexed(indexCount, frame.commandD[i], startIndex, baseVertex, 0);
                         this.metrics.drawCalls++;
                         this.metrics.drawIndexedCalls++;
@@ -4212,6 +4317,14 @@ export class D3D9BackendExecutor {
                 "d3d9Executor.executeFrame",
                 `frame=${frameSerial} command=${commandIndex}: ${String(e)}`,
             );
+            // The aborting command itself is counted only when it is an ordinary DrawIndexed:
+            // WebGPU raises no exception from drawIndexed, so a throw here came from the bind
+            // work BEFORE it and the draw was not encoded. An arena run reports its own
+            // shortfall through the expected/encoded logical ledger, so counting it here too
+            // would double-count the same loss.
+            const abortFrom = frame.commandTypes[commandIndex] === RenderCommandType.DrawIndexed
+                ? commandIndex : commandIndex + 1;
+            this.noteFrameIndexedDrawsLost(frame, abortFrom);
             this.executeFrameThrows = (this.executeFrameThrows + 1) >>> 0;
             if (this.executeFrameThrows % 200 === 1) {
                 Logger.error(LogCategory.D3D9,
@@ -4447,6 +4560,9 @@ export class D3D9BackendExecutor {
             this.noteQuerySubmission();
             this.d3d9MsaaCache?.flushGarbage();
             frameProfiler.endTimer("gpu", submitStart);
+            // One fence: the guest parks once for the pair. Shared with the harness (shot(),
+            // dumpSurface), so a census window that screenshots inflates its own count.
+            d3d9NoteFence("backbufferReadback");
             await queue.onSubmittedWorkDone();
 
             await readback.mapAsync(GPUMapMode.READ);
@@ -4492,14 +4608,24 @@ export class D3D9BackendExecutor {
     }
 
     /** [diag] Ring of the last passes submitted (harness passCensus verb). */
-    private passRing: Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string }> = [];
+    private passRing: Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string; rts?: Array<string | null>; atPresent: number; depth: string }> = [];
+    /** Presents observed, so a ring entry can say HOW OLD it is. A 64-entry ring survives a
+     *  guest that has stopped drawing entirely, and its stale passes then read as live
+     *  evidence — which is how a stalled session gets diagnosed as a rendering bug. */
+    private passPresentSerial = 0;
 
     /** Record one submitted pass. A frame is many passes and each carries ONE opening
      *  viewport/target, so a per-draw census cannot say what a pass was actually given —
      *  the two disagreeing is precisely how a stale pass-level snapshot hides. */
     private notePass(
         frame: RenderFrame,
-        target: { colorViews: Array<GPUTextureView | null>; backbuffer?: boolean } | null | undefined,
+        target: {
+            colorViews: Array<GPUTextureView | null>;
+            backbuffer?: boolean;
+            rtIdentities?: Array<string | null>;
+            depthStencil?: GPURenderPassDepthStencilAttachment;
+            depthView?: GPUTextureView;
+        } | null | undefined,
         present: boolean,
         viewport?: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number },
     ): void {
@@ -4507,21 +4633,43 @@ export class D3D9BackendExecutor {
         for (const type of frame.commandTypes) {
             if (type === RenderCommandType.Draw || type === RenderCommandType.DrawIndexed) draws++;
         }
+        // What this pass will do with DEPTH, recorded from the same inputs the attachment is
+        // built from below. A pass that LOADS depth where the guest asked for a clear, or that
+        // gets no depth surface at all, rejects every fragment against a buffer nobody wrote —
+        // and nothing else in a census can tell that apart from "the geometry never arrived".
+        const depthKind = !target
+            ? "backbuffer-default"
+            : target.depthStencil
+                ? "explicit"
+                : target.depthView
+                    ? ((frame.hasClear && (frame.clear.flags & 2) !== 0)
+                        ? `clear(${frame.clear.depth})` : "load")
+                    : "none";
         this.passRing.push({
             commands: frame.commandTypes.length,
             draws,
+            depth: depthKind,
             target: !target ? "offscreen" : target.backbuffer ? "backbuffer" : "rendertarget",
             present,
             viewport: viewport
                 ? `${viewport.x},${viewport.y} ${viewport.width}x${viewport.height} z=${viewport.minZ}..${viewport.maxZ}`
                 : "default",
+            ...(target?.rtIdentities ? { rts: target.rtIdentities } : {}),
+            atPresent: this.passPresentSerial,
         });
+        if (present) this.passPresentSerial++;
         if (this.passRing.length > 64) this.passRing.shift();
     }
 
-    /** HARNESS passCensus verb: the passes of the last frames, newest last. */
-    getPassDebug(): Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string }> {
-        return [...this.passRing];
+    /** HARNESS passCensus verb: the passes of the last frames, newest last.
+     *  `agePresents` is how many presents ago the pass was submitted — 0 is the frame in
+     *  flight. Every row carrying a large age means the guest has STOPPED drawing and the
+     *  ring is a fossil, not this frame's graph. */
+    getPassDebug(): Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string; rts?: Array<string | null>; agePresents: number; depth: string }> {
+        return this.passRing.map(({ atPresent, ...rest }) => ({
+            ...rest,
+            agePresents: this.passPresentSerial - atPresent,
+        }));
     }
 
     /**
@@ -4650,7 +4798,7 @@ export class D3D9BackendExecutor {
      */
     stretchRect(
         src: { view: GPUTextureView; width: number; height: number } | null,
-        dst: { view: GPUTextureView; width: number; height: number } | null,
+        dst: { view: GPUTextureView; width: number; height: number; format?: GPUTextureFormat } | null,
         srcRect: { left: number; top: number; right: number; bottom: number },
         dstRect: { left: number; top: number; right: number; bottom: number },
         linear: boolean,
@@ -4666,7 +4814,7 @@ export class D3D9BackendExecutor {
             width: this.offscreenSize!.width,
             height: this.offscreenSize!.height,
         };
-        const destination = dst ?? {
+        const destination: { view: GPUTextureView; width: number; height: number; format?: GPUTextureFormat } = dst ?? {
             view: this.offscreenView!,
             width: this.offscreenSize!.width,
             height: this.offscreenSize!.height,
@@ -4686,7 +4834,9 @@ export class D3D9BackendExecutor {
             srcWidth: source.width,
             srcHeight: source.height,
             dstView: destination.view,
-            dstFormat: format,
+            // The blit pipeline must be built for the ATTACHMENT it writes; an HDR target
+            // is not the backend's color format.
+            dstFormat: destination.format ?? format,
             dstWidth: destination.width,
             dstHeight: destination.height,
             srcRect,
@@ -4757,6 +4907,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             ? new Float32Array([color[0] ?? 0, color[1] ?? 0, color[2] ?? 0, color[3] ?? 0])
             : new Float32Array([color.r, color.g, color.b, color.a]);
         queue.writeBuffer(this.solidFillUniform!, 0, rgba);
+        d3d9NoteStagedBytes("constants", rgba.byteLength);
         const bindGroup = device.createBindGroup({
             layout: this.solidFillBindGroupLayout!,
             entries: [{ binding: 0, resource: { buffer: this.solidFillUniform! } }],
@@ -4948,6 +5099,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         }
 
         queue.writeBuffer(resources.uniform, 0, new Float32Array([depthWrite ? depth : 0]));
+        d3d9NoteStagedBytes("constants", 4);
         const bindGroup = device.createBindGroup({
             layout: resources.bindGroupLayout,
             entries: [{ binding: 0, resource: { buffer: resources.uniform } }],
@@ -5148,6 +5300,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             // Copy constant registers
             data.set(uniforms.vsConstants!.subarray(0, constCount * 4), 4);
             queue.writeBuffer(this.vsUniformBuffer, 0, data.buffer, 0, bufferBytes);
+            d3d9NoteStagedBytes("constants", bufferBytes);
             activeBuffer = this.vsUniformBuffer;
         } else {
             // FFP path: the expanded uniform block (viewport + MVP + worldView + material/lights;
@@ -5166,6 +5319,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                     this.bindGroupCache.clear();
                 }
                 queue.writeBuffer(this.uniformBuffer, 0, block);
+                d3d9NoteStagedBytes("constants", block.byteLength);
             } else {
                 // Defensive fallback: viewport (vec2) + pad (vec2) + mat4x4 MVP only.
                 // No pixel-centre offset here (uniformData[2] stays 0, MVP goes in raw) —
@@ -5183,6 +5337,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                 this.uniformData[3] = 0;
                 this.uniformData.set(uniforms.mvp, 4);
                 queue.writeBuffer(this.uniformBuffer, 0, this.uniformData.buffer);
+                d3d9NoteStagedBytes("constants", this.uniformData.buffer.byteLength);
             }
             activeBuffer = this.uniformBuffer;
         }
@@ -5206,7 +5361,11 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             // the sampler/texture a textureless variant never samples; with "auto" only the
             // slots the shader itself declares exist, so filling them would be invalid.
             const shared = this.ffpDynOffsetEnabled;
-            const layout = shared ? this.getFfpLayout().bindGroupLayout : pipeline.getBindGroupLayout(0);
+            // A cube stage's slot is typed cube by the pipeline's own shader, so this
+            // frame-level group has to be built for the same mask and hand that stage a cube
+            // view — the single texture it knows is stage 0's 2-D one.
+            const frameCubeMask = info?.ffpCubeMask ?? 0;
+            const layout = shared ? this.getFfpLayout(frameCubeMask).bindGroupLayout : pipeline.getBindGroupLayout(0);
             const entries: GPUBindGroupEntry[] = [
                 { binding: 0, resource: { buffer: activeBuffer } }
             ];
@@ -5219,9 +5378,12 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                 // is invalid and every draw in the pass is dropped.
                 const stages = shared ? FFP_MAX_STAGES : Math.max(1, info?.ffpStageCount ?? 1);
                 const fallback = this.getFallbackTextureView();
+                const fallbackCube = frameCubeMask !== 0 ? this.getFallbackCubeView() : fallback;
                 for (let n = 0; n < stages; n++) {
+                    const isCube = ((frameCubeMask >> n) & 1) !== 0;
                     entries.push({ binding: 1 + n * 2, resource: this.getSampler() });
-                    entries.push({ binding: 2 + n * 2, resource: (n === 0 ? textureView : null) ?? fallback });
+                    entries.push({ binding: 2 + n * 2,
+                        resource: (n === 0 && !isCube ? textureView : null) ?? (isCube ? fallbackCube : fallback) });
                 }
             }
 
@@ -5266,6 +5428,10 @@ struct VsOut { @builtin(position) position: vec4<f32> };
 
         const fallbackSampler = this.getSampler();
         const fallbackView = this.getFallbackTextureView();
+        // The dimension of each stage slot is the PIPELINE's too: a stage the draw leaves
+        // unbound still has to receive a view of the dimension its shader declared.
+        const cubeMask = info?.ffpCubeMask ?? 0;
+        const fallbackCube = cubeMask !== 0 ? this.getFallbackCubeView() : null;
         // The PIPELINE decides how many stage pairs to bind, not the draw snapshot: the two are
         // computed from the same state and normally agree, but only the pipeline's number
         // matches the layout its shader produced. A stage the snapshot did not fill binds the
@@ -5278,6 +5444,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             // shader ignores still bind the fallbacks: the layout declares every slot.
             const bindGroup = this.acquireFfpBindGroup(
                 fs.samplers, fs.textures, stageCount, fs.stageCount, fallbackSampler, fallbackView,
+                cubeMask, fallbackCube,
             );
             this.setBindGroup0(renderPass, bindGroup, offset, -1, 1);
             return;
@@ -5289,6 +5456,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         const bindGroup = this.acquireFfpAutoBindGroup(
             device, this.currentPipelineId, offset, Math.max(16, fs.blockLen * 4),
             info?.hasTexture === true ? stageCount : 0, fs, fallbackSampler, fallbackView,
+            cubeMask, fallbackCube,
         );
         this.setBindGroup0(renderPass, bindGroup);
     }
@@ -5309,6 +5477,8 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         fs: FfpDrawState,
         fallbackSampler: GPUSampler,
         fallbackView: GPUTextureView,
+        cubeMask = 0,
+        fallbackCube: GPUTextureView | null = null,
     ): GPUBindGroup {
         // FNV-1a over the identity ids; collisions are fine, the bucket is verified below.
         this.census.ffpAutoAcquires++;
@@ -5319,7 +5489,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         hash = Math.imul(hash ^ stages, 0x01000193);
         for (let n = 0; n < stages; n++) {
             hash = Math.imul(hash ^ this.gpuId(this.stageSampler(fs, n, fallbackSampler)), 0x01000193);
-            hash = Math.imul(hash ^ this.gpuId(this.stageView(fs, n, fallbackView)), 0x01000193);
+            hash = Math.imul(hash ^ this.gpuId(this.stageView(fs, n, fallbackView, cubeMask, fallbackCube)), 0x01000193);
         }
         hash >>>= 0;
 
@@ -5333,7 +5503,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                 let match = true;
                 for (let n = 0; n < stages; n++) {
                     if (this.ffpAutoSampler[base + n] !== this.stageSampler(fs, n, fallbackSampler)
-                        || this.ffpAutoView[base + n] !== this.stageView(fs, n, fallbackView)) { match = false; break; }
+                        || this.ffpAutoView[base + n] !== this.stageView(fs, n, fallbackView, cubeMask, fallbackCube)) { match = false; break; }
                 }
                 if (match) { this.metrics.bindGroupCacheHits++; this.census.ffpAutoHits++; return this.ffpAutoGroup[s]!; }
             }
@@ -5350,7 +5520,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         entries.push(this.ffpAutoEntry(0, buf));
         for (let n = 0; n < stages; n++) {
             entries.push(this.ffpAutoEntry(1 + n * 2, this.stageSampler(fs, n, fallbackSampler)));
-            entries.push(this.ffpAutoEntry(2 + n * 2, this.stageView(fs, n, fallbackView)));
+            entries.push(this.ffpAutoEntry(2 + n * 2, this.stageView(fs, n, fallbackView, cubeMask, fallbackCube)));
         }
         this.ffpAutoDesc.layout = this.getAutoLayout(pipelineId);
         const bindGroup = device.createBindGroup(this.ffpAutoDesc);
@@ -5374,7 +5544,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         const base = slot * FFP_MAX_STAGES;
         for (let n = 0; n < stages; n++) {
             this.ffpAutoSampler[base + n] = this.stageSampler(fs, n, fallbackSampler);
-            this.ffpAutoView[base + n] = this.stageView(fs, n, fallbackView);
+            this.ffpAutoView[base + n] = this.stageView(fs, n, fallbackView, cubeMask, fallbackCube);
         }
         this.ffpAutoGroup[slot] = bindGroup;
         return bindGroup;
@@ -5453,8 +5623,12 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         return (n < fs.stageCount ? fs.samplers[n] : null) ?? fallback;
     }
 
-    private stageView(fs: FfpDrawState, n: number, fallback: GPUTextureView): GPUTextureView {
-        return (n < fs.stageCount ? fs.textures[n] : null) ?? fallback;
+    /** The view for stage `n`, or the fallback of the dimension THIS pipeline's shader declared
+     *  there — a 2-D fallback in a cube slot is a bind-group validation error, not a wrong pixel. */
+    private stageView(fs: FfpDrawState, n: number, fallback: GPUTextureView,
+                      cubeMask = 0, fallbackCube: GPUTextureView | null = null): GPUTextureView {
+        const chosen = ((cubeMask >> n) & 1) !== 0 ? (fallbackCube ?? fallback) : fallback;
+        return (n < fs.stageCount ? fs.textures[n] : null) ?? chosen;
     }
 
     private bindProgrammable(
@@ -5520,8 +5694,19 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         this.lastBoundBindGroup = null;
         this.lastBindOffset0 = -1;
         this.lastBindOffset1 = -1;
+        // The group alone already forces a miss, but a cache that keeps one live field after
+        // an invalidation is a cache whose next reader has to know which fields are real.
+        this.lastBindDynCount = 0;
     }
 
+    /**
+     * `bindGroupSetSkips: 0` is ambiguous on its own — a guard that is never ASKED and a guard
+     * that is asked and always refused read the same. `bindGroupSetSameGroup` separates them:
+     * it counts the calls that repeated the previous bind group and were still forced to
+     * re-bind, which on the programmable path means the dynamic offset moved (every arena-run
+     * pair writes a fresh constant block, so it moves by construction). Skips fire on the FFP
+     * per-draw path, where consecutive draws sharing a block re-point at the same arena offset.
+     */
     private setBindGroup0(
         renderPass: GPURenderPassEncoder,
         bindGroup: GPUBindGroup,
@@ -5529,8 +5714,9 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         offset1 = -1,
         dynCount = offset0 >= 0 ? 2 : 0,
     ): void {
+        const sameGroup = this.lastBoundBindGroup === bindGroup;
         if (
-            this.lastBoundBindGroup === bindGroup &&
+            sameGroup &&
             this.lastBindOffset0 === offset0 &&
             this.lastBindOffset1 === offset1 &&
             this.lastBindDynCount === dynCount
@@ -5538,6 +5724,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             this.metrics.bindGroupSetSkips++;
             return;
         }
+        if (sameGroup) this.metrics.bindGroupSetSameGroup++;
 
         if (dynCount === 1) {
             this.ffpDynOffsets[0] = offset0;
@@ -5872,6 +6059,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
                 usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
             });
             this.fallbackTextureView = this.fallbackTexture.createView();
+            d3d9NoteStagedBytes("texture", 4);
             this.backend.getQueue()!.writeTexture(
                 { texture: this.fallbackTexture },
                 new Uint8Array([255, 255, 255, 255]),
@@ -5894,6 +6082,7 @@ struct VsOut { @builtin(position) position: vec4<f32> };
             });
             const white = new Uint8Array([255, 255, 255, 255]);
             for (let face = 0; face < 6; face++) {
+                d3d9NoteStagedBytes("texture", 4);
                 this.backend.getQueue()!.writeTexture(
                     { texture: this.fallbackCubeTexture, origin: { x: 0, y: 0, z: face } },
                     white,
@@ -5912,10 +6101,15 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         if (!this.fallbackVolumeView) {
             const device = this.backend.getDevice()!;
             this.fallbackVolumeTexture = device.createTexture({
+                // createTexture defaults to a 2-D texture, and a 3-D VIEW over one is a
+                // validation error — which drops the whole bind group, and with it every
+                // draw of the frame.
+                dimension: "3d",
                 size: { width: 1, height: 1, depthOrArrayLayers: 1 },
                 format: "rgba8unorm",
                 usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
             });
+            d3d9NoteStagedBytes("texture", 4);
             this.backend.getQueue()!.writeTexture(
                 { texture: this.fallbackVolumeTexture },
                 new Uint8Array([255, 255, 255, 255]),

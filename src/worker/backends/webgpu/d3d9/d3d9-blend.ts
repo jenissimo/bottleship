@@ -11,6 +11,7 @@
  * shared/d3d-blend-factor.ts — DirectDraw/D3D3-8 FFP (ddraw/pipeline-factory.ts)
  * shares the identical enum values and legacy rule.
  */
+import { isGpuColorFormatBlendable } from "../shared/float-format-policy";
 import {
     mapBlendFactor, mapBlendOp, fixupBoth, isKnownBlendFactor, isKnownBlendOperation,
     hasDualSourceBlendFactor,
@@ -102,7 +103,11 @@ export function buildColorTargetState(
     targetIndex: number = 0,
 ): GPUColorTargetState {
     const writeMask = colorWriteMask(getRS, targetIndex);
-    if (getRS(D3DRS_ALPHABLENDENABLE) === 0) {
+    // A target whose format cannot be blended into rejects the whole PIPELINE if a blend
+    // state is declared, which discards every draw in the pass. The capability query already
+    // told the app there is no post-pixel-shader blending for this format, so honour that
+    // answer here instead of building a pipeline WebGPU will refuse.
+    if (getRS(D3DRS_ALPHABLENDENABLE) === 0 || !isGpuColorFormatBlendable(format)) {
         return { format, writeMask };
     }
 
@@ -239,25 +244,36 @@ function isD3D9StencilOperation(raw: number): boolean {
  * States that D3D9 ignores while their feature is disabled are deliberately not inspected.
  */
 export function isD3D9DepthStencilStateRepresentable(getRS: GetRenderState): boolean {
-    const cull = getRS(D3DRS_CULLMODE) >>> 0;
-    if (cull < 1 || cull > 3) return false; // NONE/CW/CCW
+    return unrepresentableD3D9DepthStencilState(getRS) === null;
+}
 
+/**
+ * Names the state that makes the depth/stencil configuration unrepresentable, or null when it
+ * is fine. A refusal that cannot say WHAT it refused reads as "the driver is broken" in a log.
+ *
+ * D3DRS_CULLMODE is deliberately absent. Only NONE/CW/CCW are documented, but a value outside
+ * the enum is what every real driver treats as "no culling" and draws anyway (DXVK's
+ * DecodeCullMode falls through `default:` into D3DCULL_NONE; wined3d's
+ * vk_cull_mode_from_wined3d FIXMEs and returns VK_CULL_MODE_NONE). Refusing the draw instead
+ * deletes geometry that an out-of-enum write would only have left unculled.
+ */
+export function unrepresentableD3D9DepthStencilState(getRS: GetRenderState): string | null {
     const zEnable = getRS(D3DRS_ZENABLE) >>> 0;
-    if (zEnable > 2) return false; // FALSE/TRUE/USEW (USEW is refused by the device policy)
-    if (zEnable !== 0 && !isD3D9CompareFunction(getRS(D3DRS_ZFUNC))) return false;
+    if (zEnable > 2) return `ZENABLE=${zEnable}`; // FALSE/TRUE/USEW (USEW is refused by device policy)
+    if (zEnable !== 0 && !isD3D9CompareFunction(getRS(D3DRS_ZFUNC))) return `ZFUNC=${getRS(D3DRS_ZFUNC)}`;
 
-    if (getRS(D3DRS_STENCILENABLE) === 0) return true;
-    if (!isD3D9CompareFunction(getRS(D3DRS_STENCILFUNC))
-        || !isD3D9StencilOperation(getRS(D3DRS_STENCILFAIL))
-        || !isD3D9StencilOperation(getRS(D3DRS_STENCILZFAIL))
-        || !isD3D9StencilOperation(getRS(D3DRS_STENCILPASS))) return false;
+    if (getRS(D3DRS_STENCILENABLE) === 0) return null;
+    if (!isD3D9CompareFunction(getRS(D3DRS_STENCILFUNC))) return `STENCILFUNC=${getRS(D3DRS_STENCILFUNC)}`;
+    if (!isD3D9StencilOperation(getRS(D3DRS_STENCILFAIL))) return `STENCILFAIL=${getRS(D3DRS_STENCILFAIL)}`;
+    if (!isD3D9StencilOperation(getRS(D3DRS_STENCILZFAIL))) return `STENCILZFAIL=${getRS(D3DRS_STENCILZFAIL)}`;
+    if (!isD3D9StencilOperation(getRS(D3DRS_STENCILPASS))) return `STENCILPASS=${getRS(D3DRS_STENCILPASS)}`;
     if (getRS(D3DRS_TWOSIDEDSTENCILMODE) !== 0) {
-        if (!isD3D9CompareFunction(getRS(D3DRS_CCW_STENCILFUNC))
-            || !isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILFAIL))
-            || !isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILZFAIL))
-            || !isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILPASS))) return false;
+        if (!isD3D9CompareFunction(getRS(D3DRS_CCW_STENCILFUNC))) return `CCW_STENCILFUNC=${getRS(D3DRS_CCW_STENCILFUNC)}`;
+        if (!isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILFAIL))) return `CCW_STENCILFAIL=${getRS(D3DRS_CCW_STENCILFAIL)}`;
+        if (!isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILZFAIL))) return `CCW_STENCILZFAIL=${getRS(D3DRS_CCW_STENCILZFAIL)}`;
+        if (!isD3D9StencilOperation(getRS(D3DRS_CCW_STENCILPASS))) return `CCW_STENCILPASS=${getRS(D3DRS_CCW_STENCILPASS)}`;
     }
-    return true;
+    return null;
 }
 
 /**

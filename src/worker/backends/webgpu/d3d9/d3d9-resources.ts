@@ -8,8 +8,9 @@
 import {
     getD3DTextureLayout,
 } from "../shared/texture-formats";
-import { noteGuestBufferWrite, writeDirtyRange } from "../buffer-upload";
+import { alignUploadRange, noteGuestBufferWrite, noteUploadReason, writeDirtyRange } from "../buffer-upload";
 import { d3d9WasmArena } from "./d3d9-wasm-arena";
+import { d3d9NoteStagedBytes } from "../../../modules/d3d9/d3d9-perf";
 
 /**
  * `[dirtyStart, dirtyEnd)` accumulates the union of the locked ranges since the last upload
@@ -39,6 +40,10 @@ export class VertexBufferStore {
     private dirtyFlags: Uint8Array;    // Boolean as byte
     private dirtyStarts: Uint32Array;  // union of locked ranges since last upload
     private dirtyEnds: Uint32Array;    // exclusive; end <= start = clean
+    // Bytes the guest actually locked since this buffer's last upload. The dirty SPAN cannot
+    // answer that: two disjoint locks produce a span covering the gap between them, and the
+    // gap is exactly the surplus an upload-amplification census has to attribute.
+    private lockedSinceUpload: Uint32Array;
     private generations: Uint16Array;
 
     // Handle mapping
@@ -58,6 +63,7 @@ export class VertexBufferStore {
         this.dirtyFlags = new Uint8Array(initialCapacity);
         this.dirtyStarts = new Uint32Array(initialCapacity);
         this.dirtyEnds = new Uint32Array(initialCapacity);
+        this.lockedSinceUpload = new Uint32Array(initialCapacity);
         this.generations = new Uint16Array(initialCapacity);
     }
 
@@ -136,6 +142,13 @@ export class VertexBufferStore {
     isLocked(index: number): boolean { return this.lockedPtrs[index] !== -1; }
     getDirtyStart(index: number): number { return this.dirtyStarts[index]; }
     getDirtyEnd(index: number): number { return this.dirtyEnds[index]; }
+    /** Bytes locked since the last upload, consumed by reading: the next upload of this buffer
+     *  must account for its own locks only, never a previous upload's. */
+    takeLockedSinceUpload(index: number): number {
+        const n = this.lockedSinceUpload[index] ?? 0;
+        this.lockedSinceUpload[index] = 0;
+        return n;
+    }
 
     // Setters
     setGpuBuffer(index: number, buffer: GPUBuffer): void { this.gpuBuffers[index] = buffer; }
@@ -187,6 +200,7 @@ export class VertexBufferStore {
         this.lockedSizes[index] = 0;
         this.lockedOffsets[index] = 0;
         noteGuestBufferWrite("d3d9", size);
+        this.lockedSinceUpload[index] = (this.lockedSinceUpload[index] ?? 0) + size;
         if (this.dirtyFlags[index] && this.dirtyEnds[index] > this.dirtyStarts[index]) {
             this.dirtyStarts[index] = Math.min(this.dirtyStarts[index], offset);
             this.dirtyEnds[index] = Math.max(this.dirtyEnds[index], offset + size);
@@ -215,6 +229,18 @@ export class VertexBufferStore {
                     });
                     whole = true;
                 }
+                // Written straight out of the CPU shadow — no per-frame staging copy stands
+                // between the guest's next Unlock and this upload, which is the class plan §5
+                // would have to start copying.
+                const range = alignUploadRange(
+                    whole ? 0 : this.dirtyStarts[i]!,
+                    whole ? this.sizes[i]! : this.dirtyEnds[i]!,
+                    this.gpuBuffers[i]!.size);
+                d3d9NoteStagedBytes("vertexIndexDirect", range.length);
+                const covered = this.takeLockedSinceUpload(i);
+                noteUploadReason("d3d9", range.length,
+                    whole ? "wholeNewBuffer" : covered === 0 ? "wholeRestore" : "dirtySpan",
+                    covered);
                 writeDirtyRange(queue, this.gpuBuffers[i]!, data,
                     whole ? 0 : this.dirtyStarts[i], whole ? this.sizes[i] : this.dirtyEnds[i], "d3d9", whole);
                 this.setDirty(i, false);
@@ -274,6 +300,9 @@ export class VertexBufferStore {
         const newDirtyEnds = new Uint32Array(newCapacity);
         newDirtyEnds.set(this.dirtyEnds);
         this.dirtyEnds = newDirtyEnds;
+        const newLockedSince = new Uint32Array(newCapacity);
+        newLockedSince.set(this.lockedSinceUpload);
+        this.lockedSinceUpload = newLockedSince;
 
         const newGenerations = new Uint16Array(newCapacity);
         newGenerations.set(this.generations);
@@ -338,6 +367,8 @@ export class IndexBufferStore {
     private dirtyFlags: Uint8Array;
     private dirtyStarts: Uint32Array;
     private dirtyEnds: Uint32Array;
+    /** See VertexBufferStore.lockedSinceUpload. */
+    private lockedSinceUpload: Uint32Array;
     private generations: Uint16Array;
 
     private handleToIndex: Map<number, number> = new Map();
@@ -356,6 +387,7 @@ export class IndexBufferStore {
         this.dirtyFlags = new Uint8Array(initialCapacity);
         this.dirtyStarts = new Uint32Array(initialCapacity);
         this.dirtyEnds = new Uint32Array(initialCapacity);
+        this.lockedSinceUpload = new Uint32Array(initialCapacity);
         this.generations = new Uint16Array(initialCapacity);
     }
 
@@ -432,6 +464,13 @@ export class IndexBufferStore {
     isDirty(index: number): boolean { return this.dirtyFlags[index] !== 0; }
     getDirtyStart(index: number): number { return this.dirtyStarts[index]; }
     getDirtyEnd(index: number): number { return this.dirtyEnds[index]; }
+    /** Bytes locked since the last upload, consumed by reading: the next upload of this buffer
+     *  must account for its own locks only, never a previous upload's. */
+    takeLockedSinceUpload(index: number): number {
+        const n = this.lockedSinceUpload[index] ?? 0;
+        this.lockedSinceUpload[index] = 0;
+        return n;
+    }
 
     setGpuBuffer(index: number, buffer: GPUBuffer): void { this.gpuBuffers[index] = buffer; }
     /** `true` dirties the WHOLE buffer — see VertexBufferStore.setDirty. */
@@ -474,6 +513,7 @@ export class IndexBufferStore {
         this.lockedSizes[index] = 0;
         this.lockedOffsets[index] = 0;
         noteGuestBufferWrite("d3d9", size);
+        this.lockedSinceUpload[index] = (this.lockedSinceUpload[index] ?? 0) + size;
         if (this.dirtyFlags[index] && this.dirtyEnds[index] > this.dirtyStarts[index]) {
             this.dirtyStarts[index] = Math.min(this.dirtyStarts[index], offset);
             this.dirtyEnds[index] = Math.max(this.dirtyEnds[index], offset + size);
@@ -497,6 +537,18 @@ export class IndexBufferStore {
                     });
                     whole = true;
                 }
+                // Written straight out of the CPU shadow — no per-frame staging copy stands
+                // between the guest's next Unlock and this upload, which is the class plan §5
+                // would have to start copying.
+                const range = alignUploadRange(
+                    whole ? 0 : this.dirtyStarts[i]!,
+                    whole ? this.sizes[i]! : this.dirtyEnds[i]!,
+                    this.gpuBuffers[i]!.size);
+                d3d9NoteStagedBytes("vertexIndexDirect", range.length);
+                const covered = this.takeLockedSinceUpload(i);
+                noteUploadReason("d3d9", range.length,
+                    whole ? "wholeNewBuffer" : covered === 0 ? "wholeRestore" : "dirtySpan",
+                    covered);
                 writeDirtyRange(queue, this.gpuBuffers[i]!, data,
                     whole ? 0 : this.dirtyStarts[i], whole ? this.sizes[i] : this.dirtyEnds[i], "d3d9", whole);
                 this.setDirty(i, false);
@@ -556,6 +608,9 @@ export class IndexBufferStore {
         const newDirtyEnds = new Uint32Array(newCapacity);
         newDirtyEnds.set(this.dirtyEnds);
         this.dirtyEnds = newDirtyEnds;
+        const newLockedSince = new Uint32Array(newCapacity);
+        newLockedSince.set(this.lockedSinceUpload);
+        this.lockedSinceUpload = newLockedSince;
 
         const newGenerations = new Uint16Array(newCapacity);
         newGenerations.set(this.generations);

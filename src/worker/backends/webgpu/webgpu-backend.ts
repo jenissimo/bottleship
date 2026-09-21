@@ -118,6 +118,13 @@ export class WebGPUBackend implements RenderBackend {
         if (adapter.features.has("texture-compression-bc")) {
             requiredFeatures.push("texture-compression-bc");
         }
+        // 32-bit float textures are filterable on the SM3 hardware D3D9 games were written
+        // against; without this feature WebGPU would only allow a non-filtering sampler for
+        // them, which is a different bind-group layout and a different picture. Enabling it
+        // keeps r32float/rgba32float on exactly the same sampling path as every other format.
+        if (adapter.features.has("float32-filterable")) {
+            requiredFeatures.push("float32-filterable");
+        }
         return await adapter.requestDevice({ requiredFeatures });
     }
 
