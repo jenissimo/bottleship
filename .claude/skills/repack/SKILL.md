@@ -25,6 +25,7 @@ don't reach for a binary.
 | `.rar` | store-only RAR5 wrapper around an installer (typical game drop), incl. `.partN.rar` sets | `bun tools/rar-extract.ts <a.rar> <out> [--list]` — refuses compressed/solid/encrypted/RAR4 |
 | `.zip` / `.wgb` | store+deflate ZIP (also the `.wgb` container) | `bun tools/wgb.ts` |
 | Blizzard `setup.exe` / `.mpq` | MoPaQ archive appended to a self-extracting stub | `bun tools/mpq-extract.ts <installer.exe> <out> [--list]` |
+| `.tar.xz`, or a Linux `.sh` installer | a tar.xz **appended to a shell stub** (makeself, YAD Simple Installer) — the shape a Wine-wrapped repack arrives as | `bun tools/tar-extract.ts <a.sh> <out> [--list] [--filter s] [--strip n]` — finds the appended stream itself |
 
 A Blizzard installer payload carries no `(listfile)` — MPQ stores hashes, not names — so
 `--list` comes up empty and extraction has to go by block index. The names live in the
@@ -35,6 +36,14 @@ still decrypt: the key is recovered from the sector table.
 Cores live in `packages/formats/src/<fmt>/`; the native codec backend (LZMA1/2/srep) is
 `public/unpack-streaming.wasm` (Rust crate `tools/build-unpack-streaming`). See CLAUDE.md
 "Archive / installer formats" for the authoritative list.
+
+A Linux repack is a whole Wine prefix, so the game is `…/prefix/drive_c/<install dir>` and the
+tarball also carries Wine itself — extract the subtree, not the archive (`--filter prefix/
+--strip <n>`). Beware Git Bash rewriting an argument that looks like a POSIX path: `--filter
+/prefix/` arrives as `C:/Program Files/Git/prefix/` and matches nothing (an empty extraction
+now fails loudly instead of exiting 0). The prefix's `system.reg`/`user.reg` are the
+authoritative record of what the installer wrote and `--reg-import` reads them directly —
+with `--reg-import-under`, since a hive is a whole machine's registry (see §2).
 
 ## 2. Pack with make-wgb (never hand-write JSON)
 
@@ -48,6 +57,13 @@ bun tools/make-wgb.ts <game-dir> <out.wgb> \
 escaping) and packs in one step. **Never** write registry.json/manifest.json by hand
 (shell heredoc / Write) — backslash escaping is unreliable across editors/linters/hooks.
 `--help` prints the full flag list.
+
+Registry from a real install rather than retyped: `--reg-import <file>` takes an exported
+`.reg` OR a Wine prefix's own `system.reg`/`user.reg`, and `--reg-import-under "Software\Vendor"`
+(repeatable, and an error if it matches nothing) keeps the game's subtree out of the 17 000
+other keys a hive carries. `--reg-path`/`--reg-value` still win on a value they both name —
+which is how the install path gets corrected, since the prefix records where the game lived
+THERE (`C:\game\RA3\`) and a bundle's rom is the guest's `C:\`.
 
 ## 3. THE EMPTY-DIRECTORY PITFALL (read this — it is brutal to diagnose)
 

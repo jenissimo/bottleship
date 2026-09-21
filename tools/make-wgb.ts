@@ -24,7 +24,7 @@
  *   --height <n>          Screen height (default: 480)
  *   --bpp    <n>          Bits per pixel (default: 16)
  *   --ram    <n>          RAM in MB (default: 64)
- *   --os     win95|win98|winnt  OS version preset (default: win98)
+ *   --os     win95|win98|winnt|win2k|winxp  OS version preset (default: win98)
  *   --reg-hive  HKLM|HKCU      Registry hive for InstallPath key (default: HKLM)
  *   --reg-path  <str>     Registry key path, backslash-separated (default: none)
  *   --reg-install <str>   Value data for the install-path key (default: C:\)
@@ -32,10 +32,15 @@
  *                         --reg-value "War3CD=D:\\" --reg-value "Program=C:\game.exe".
  *                         One InstallPath is not enough for an installer that wrote several.
  *                         Requires --reg-path; a duplicate value name is an error.
- *   --reg-import <file>   Import a Windows .reg file (repeatable) — the keys an installer or
- *                         a Wine prefix actually wrote. A WOW6432Node segment is folded out
- *                         (the guest is 32-bit, so that IS the key the game reads). Combines
- *                         with --reg-path, which wins on a value they both name.
+ *   --reg-import <file>   Import a registry file (repeatable) — the keys an installer or a
+ *                         Wine prefix actually wrote. Both dialects: an exported .reg and a
+ *                         Wine prefix's own system.reg/user.reg. A WOW6432Node segment is
+ *                         folded out (the guest is 32-bit, so that IS the key the game
+ *                         reads). Combines with --reg-path, which wins on a shared value.
+ *   --reg-import-under <key>  Keep only imported keys under this subtree, repeatable:
+ *                         --reg-import-under "Software\Electronic Arts". Required in
+ *                         practice for a Wine hive, which is a whole machine's registry.
+ *                         A subtree that matches nothing is an error, not an empty import.
  *   --reg-name <str>      Value NAME for it (default: InstallPath). Titles differ —
  *                         GTA III reads HKLM\SOFTWARE\Rockstar Games\GTA 3\InstallDir.
  *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
@@ -46,6 +51,10 @@
  *                         ships a wrapper/proxy DLL — an ASI loader, a Glide or ddraw
  *                         shim — which otherwise never executes. Example:
  *                         --app-dir-dlls "ddraw"
+ *   --working-dir <path>  Guest cwd at boot when it is NOT the entrypoint's folder —
+ *                         an engine module a launcher starts inherits the LAUNCHER's
+ *                         directory and resolves its data paths against it. Example:
+ *                         --working-dir "C:\\" for an exe that lives under Data\.
  *   --skip-video          Set emulator.skipVideo=true
  *   --codepage <n>       ANSI code page (default: 1252). Use 1251 for Cyrillic
  *   --oem-codepage <n>   OEM code page (default: 437). Use 866 for Cyrillic OEM
@@ -191,6 +200,7 @@ if (!exeName) {
 // Build manifest — JSON.stringify handles all escaping correctly
 const name       = get('--name') ?? basename(gameDir);
 const args       = get('--args');
+const workingDir = get('--working-dir');
 const width      = parseInt(get('--width')  ?? '640', 10);
 const height     = parseInt(get('--height') ?? '480', 10);
 const bpp        = parseInt(get('--bpp')    ?? '16',  10);
@@ -301,6 +311,7 @@ const manifest: Record<string, unknown> = {
     },
 };
 if (args) (manifest as any).args = args;
+if (workingDir) (manifest.emulator as any).workingDir = workingDir;
 
 // Build registry — JSON.stringify guarantees \\ escaping of backslashes
 const regPath    = get('--reg-path');
@@ -324,6 +335,15 @@ const extraRegValues = getAll('--reg-value').map((pair) => {
 // Repeatable; the guest is 32-bit, so a WOW6432Node segment folds out (that IS the key the
 // game reads). Imported keys come first so an explicit --reg-path/--reg-value still wins.
 const regImports = getAll('--reg-import');
+// A Wine prefix's hive is the whole machine, not the game: seeding its thousands of COM,
+// font and MIME keys would bury the handful the game reads and hand our registry a
+// machine's worth of state to answer from. Restrict the import to the subtrees named.
+const regUnder = getAll('--reg-import-under').map((k) => k.replace(/\//g, '\\').replace(/^\\+|\\+$/g, '').toLowerCase());
+const underMatch = (path: string): boolean => {
+    if (regUnder.length === 0) return true;
+    const p = path.toLowerCase();
+    return regUnder.some((u) => p === u || p.startsWith(`${u}\\`));
+};
 const importedSeeds: RegSeed[] = [];
 for (const file of regImports) {
     if (!existsSync(file)) {
@@ -331,12 +351,29 @@ for (const file of regImports) {
         process.exit(1);
     }
     try {
-        importedSeeds.push(...parseRegFile(readFileSync(file), {
+        const seeds = parseRegFile(readFileSync(file), {
             foldWow6432Node: true,
-            onSkip: (reason) => console.warn(`  ${basename(file)}: skipped ${reason}`),
-        }));
+            // A skip inside a key we are importing has to stay loud; one in the rest of a
+            // whole-machine hive is not ours, and a storm of those hides the one that is.
+            onSkip: (reason, key) => {
+                if (key !== undefined && !underMatch(key.replace(/^HK[A-Z]+\\/, ''))) return;
+                console.warn(`  ${basename(file)}: skipped ${reason}${key ? ` under ${key}` : ''}`);
+            },
+        });
+        const kept = seeds.filter((s) => underMatch(s.path));
+        if (regUnder.length > 0) {
+            console.log(`  ${basename(file)}: ${kept.length} of ${seeds.length} key(s) under the named subtree(s)`);
+        }
+        importedSeeds.push(...kept);
     } catch (err) {
         console.error(`Error: --reg-import "${file}": ${err}`);
+        process.exit(1);
+    }
+}
+// A subtree that matched nothing is a typo or the wrong hive, not an empty game key.
+for (const u of regUnder) {
+    if (!importedSeeds.some((s) => underMatch(s.path) && (s.path.toLowerCase() === u || s.path.toLowerCase().startsWith(`${u}\\`)))) {
+        console.error(`Error: --reg-import-under "${u}" matched no key in the imported file(s).`);
         process.exit(1);
     }
 }

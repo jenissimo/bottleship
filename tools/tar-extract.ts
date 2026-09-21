@@ -11,9 +11,15 @@
  * for them) — they are counted and listed at the end so a tree that depends on one is
  * visible rather than quietly incomplete.
  *
+ * An archive APPENDED to a stub (a self-extracting `.sh`, an SFX `.exe`) is read in place:
+ * with no `--offset`, the stub prologue is searched for an xz stream whose trailing footer
+ * lands exactly on EOF, which is what makes the hit a stream rather than a magic-looking
+ * byte run inside a bundled binary. No multi-GB carve-out copy either way.
+ *
  * Usage:
  *   bun tools/tar-extract.ts <archive.tar[.xz]> <out-dir> [--list] [--filter <substr>]
  *                            [--strip <n>] [--quiet] [--no-verify]
+ *                            [--offset <n>] [--length <n>]
  */
 import { openSync, writeSync, closeSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -31,11 +37,17 @@ function flagValue(name: string): string | undefined {
     return i >= 0 ? argv[i + 1] : undefined;
 }
 // A flag's value is positional-looking; drop it from the positional list.
-const consumed = new Set([flagValue("--filter"), flagValue("--strip")].filter(Boolean) as string[]);
+const consumed = new Set(
+    [flagValue("--filter"), flagValue("--strip"), flagValue("--offset"), flagValue("--length")].filter(
+        Boolean,
+    ) as string[],
+);
 const args = positional.filter((a) => !consumed.has(a));
 
 if (args.length < 1) {
-    console.error("Usage: bun tools/tar-extract.ts <archive.tar[.xz]> <out-dir> [--list] [--filter s] [--strip n]");
+    console.error(
+        "Usage: bun tools/tar-extract.ts <archive.tar[.xz]> <out-dir> [--list] [--filter s] [--strip n] [--offset n] [--length n]",
+    );
     process.exit(1);
 }
 const archivePath = resolve(args[0]!);
@@ -44,6 +56,10 @@ const quiet = flags.has("--quiet");
 const verify = !flags.has("--no-verify");
 const filter = flagValue("--filter")?.toLowerCase();
 const strip = Number(flagValue("--strip") ?? 0);
+const offsetArg = flagValue("--offset") === undefined ? undefined : Number(flagValue("--offset"));
+const lengthArg = flagValue("--length") === undefined ? undefined : Number(flagValue("--length"));
+if (offsetArg !== undefined && !Number.isSafeInteger(offsetArg)) throw new Error("--offset must be an integer");
+if (lengthArg !== undefined && !Number.isSafeInteger(lengthArg)) throw new Error("--length must be an integer");
 if (!listOnly && !args[1]) {
     console.error("An output directory is required unless --list is given.");
     process.exit(1);
@@ -133,7 +149,44 @@ function onEntry(entry: TarEntry): TarSink | null {
     };
 }
 
-const src = new FileSource(archivePath);
+/**
+ * Locate an xz stream appended to a stub. A candidate is accepted only if parseXz agrees,
+ * which anchors on the footer at EOF — so the magic bytes of a bundled `xz` binary in the
+ * prologue cannot masquerade as the payload.
+ */
+function findAppendedXz(path: string, searchBytes: number): number | null {
+    const probe = new FileSource(path);
+    const window = probe.readRangeSync(0, Math.min(searchBytes, probe.size));
+    for (let i = 0; i + 6 <= window.length; i++) {
+        if (!detectXz(window.subarray(i, i + 12))) continue;
+        try {
+            parseXz(new FileSource(path, i));
+            return i;
+        } catch {
+            /* magic-looking bytes inside the stub; keep scanning */
+        }
+    }
+    return null;
+}
+
+const SFX_SEARCH_BYTES = 64 << 20;
+let offset = offsetArg ?? 0;
+if (offsetArg === undefined && lengthArg === undefined) {
+    const probeHead = new FileSource(archivePath).readRangeSync(0, 264);
+    const isTar = new TextDecoder().decode(probeHead.subarray(257, 262)) === "ustar";
+    if (!detectXz(probeHead) && !isTar) {
+        const found = findAppendedXz(archivePath, SFX_SEARCH_BYTES);
+        if (found === null) {
+            throw new Error(
+                `${archivePath}: not an xz or tar, and no appended xz stream found in the first ${human(SFX_SEARCH_BYTES)}`,
+            );
+        }
+        offset = found;
+        if (!quiet) console.log(`appended xz stream found at offset ${offset} (stub is ${human(offset)})`);
+    }
+}
+
+const src = new FileSource(archivePath, offset, lengthArg);
 const tar = new TarStream({ onEntry });
 const head = src.readRangeSync(0, 12);
 
@@ -173,6 +226,14 @@ console.log(
     `${listOnly ? "listed" : "extracted"} ${stats.files} file(s), ${human(stats.bytes)}, ${stats.dirs} dir(s)` +
         (stats.skipped ? `, ${stats.skipped} skipped` : ""),
 );
+// A filter that matched nothing is a typo, not an empty archive — and it costs a full decode
+// pass to find out, so say so rather than exit 0 on an empty output directory. (Git Bash
+// rewrites an argument that looks like a POSIX path: `--filter /prefix/` arrives as
+// `C:/Program Files/Git/prefix/` and matches no entry.)
+if (filter && stats.files === 0 && stats.dirs === 0) {
+    console.error(`--filter "${filter}" matched no entry out of ${stats.skipped} (nothing was written).`);
+    process.exit(1);
+}
 if (stats.symlinks.length) {
     console.log(`${stats.symlinks.length} link(s) NOT recreated:`);
     for (const s of stats.symlinks.slice(0, 40)) console.log(`  ${s}`);
