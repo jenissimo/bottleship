@@ -29,8 +29,8 @@ import { TimeService } from '../../runtime/time';
 import { Logger } from '../logger';
 import { EmulatorConfig } from '../emulator-config-manager';
 import type { QualityConfig } from '../quality-config';
-import { getD3D9PerfSnapshot, reconcileD3D9ArenaRuns, resetD3D9Perf } from '../../modules/d3d9/d3d9-perf';
-import { devices, stateBlocks } from '../../modules/d3d9/shared-state';
+import { reconcileD3D9ArenaRuns, resetD3D9Perf } from '../../modules/d3d9/d3d9-perf';
+import { devices, stateBlocks, getD3D9PerfSnapshotWithDevices } from '../../modules/d3d9/shared-state';
 import { getD3D9QueryLedger, resetD3D9QueryLedger } from '../../modules/d3d9/query';
 import type { QueryManagerCounters } from '../../modules/d3d9/query-manager';
 import { d3d9WasmArena, isWasmPathEnabled, setWasmPathEnabled, setArenaVerifyDrainEnabled, setWasmBlocksEnabled } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
@@ -2255,22 +2255,7 @@ export const dbg = {
                 resetD3D9QueryLedger();
                 for (const dev of devices.values()) queryManagerOf(dev)?.resetCounters?.();
             }
-            const snap = getD3D9PerfSnapshot();
-            const stateTracker: Record<string, number> = {};
-            const backendExtra: Record<string, number> = {};
-            for (const dev of devices.values()) {
-                const sub = dev.collectSubsystemPerf();
-                for (const [k, v] of Object.entries(sub.stateTracker)) {
-                    stateTracker[k] = (stateTracker[k] ?? 0) + v;
-                }
-                for (const [k, v] of Object.entries(sub.backend)) {
-                    backendExtra[k] = (backendExtra[k] ?? 0) + v;
-                }
-            }
-            for (const [k, v] of Object.entries(backendExtra)) {
-                snap.backend[k] = (snap.backend[k] ?? 0) + v;
-            }
-            snap.stateTracker = stateTracker;
+            const snap = getD3D9PerfSnapshotWithDevices();
             snap.stateBlocks.liveBlocks = stateBlocks.size;
             snap.devices = devices.size;
             const d = System.getInstance().process?.dispatcher as {

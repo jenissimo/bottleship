@@ -20,12 +20,32 @@
 
 import type { HarnessService, HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
+import { guestTrace } from "../guest-trace";
+import type { RegisterRead } from "../serialize";
 import { sys, proc, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 import { apiBreaks } from "../api-breaks";
 import { eipBreaks, type BreakWhen, type BreakCapture } from "../eip-breaks";
 import { breakEvents } from "../break-events";
 import { symbolMap } from "../symbol-map";
+
+/**
+ * What the wasm holds AFTER a trace was armed. An instruction trace only exists on the
+ * INTERPRETER path — `dbg_on_instruction` is not emitted from JIT'd blocks — so a run with
+ * JIT still enabled reports "armed" and then captures nothing, which reads downstream as
+ * "the guest executed none of it". Returning the live knobs makes the two distinguishable.
+ */
+function traceArmReadback(exports: Record<string, unknown>): {
+    jitDisabled: number | null; stepRemaining: number | null; stepOnBp: number | null;
+} {
+    const num = (f: unknown, ...a: number[]): number | null =>
+        typeof f === "function" ? ((f as (...x: number[]) => number)(...a) >>> 0) : null;
+    return {
+        jitDisabled: num(exports.get_jit_config, 0),
+        stepRemaining: num(exports.dbg_step_remaining),
+        stepOnBp: num(exports.dbg_get_step_on_bp),
+    };
+}
 
 function toAddr(x: number | string): number {
     if (typeof x === "number") return x >>> 0;
@@ -143,11 +163,18 @@ export function registerBreakpointCommands(svc: HarnessService): void {
 
     /** breakOnApi('d3d9.*' | '*DrawPrimitive*' | 'Direct3DCreate9') — JS layer, no JIT off.
      *  `argEq: {index, value}` narrows to one call among many (`breakOnApi('user32:LoadStringA',
-     *  {argEq:{index:1, value:137}})` catches the one interesting string id out of 400). */
+     *  {argEq:{index:1, value:137}})` catches the one interesting string id out of 400).
+     *  `capture.reads` settles register-relative reads AT the hit — the caller's object is
+     *  usually in a REGISTER (`this` in ECX, an engine wrapper in ESI), and nothing read after
+     *  the thunk returns describes that frame any more. */
     svc.register("breakOnApi", (args, ctx) => {
         const pattern = String(args[0] ?? "");
         if (!pattern) throw new HarnessError("breakOnApi expects a pattern", HarnessErrorCode.BAD_ARGS);
-        const opts = (args[1] ?? {}) as { continuous?: boolean; argEq?: { index: number; value: number } };
+        const opts = (args[1] ?? {}) as {
+            continuous?: boolean;
+            argEq?: { index: number; value: number };
+            capture?: { reads?: RegisterRead[] };
+        };
         if (opts.argEq && (typeof opts.argEq.index !== "number" || typeof opts.argEq.value !== "number")) {
             throw new HarnessError("breakOnApi argEq expects {index:number, value:number}", HarnessErrorCode.BAD_ARGS);
         }
@@ -156,6 +183,7 @@ export function registerBreakpointCommands(svc: HarnessService): void {
                 runId: ctx.runId,
                 continuous: !!opts.continuous,
                 argEq: opts.argEq,
+                reads: opts.capture?.reads,
                 onHit: opts.continuous ? undefined : (snap) => resolve({ hit: snap, pattern }),
             });
             if (opts.continuous) resolve({ armed: true, id, pattern, continuous: true });
@@ -315,12 +343,72 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return { count: log.length, events: log, zeroFlips: zeros };
     });
 
-    /** step(n) — arm an interpreter trace of the next N instructions (-> [DBG] log). */
+    /** step(n) — arm an interpreter trace of the next N instructions, captured for guestTrace(). */
     svc.register("step", (args) => {
         const n = Math.max(1, Number(args[0] ?? 1) | 0);
+        // The wasm debug exports are a BUILD artifact: without them dbg.enable()/dbg.step() are
+        // silent no-ops and the verb would report a trace that was never armed.
+        const exports = (globalThis as { preemption?: { getWasmExports?: () => Record<string, unknown> | null } })
+            .preemption?.getWasmExports?.();
+        if (!exports?.dbg_arm_step) {
+            throw new HarnessError(
+                "wasm debug exports missing (dbg_arm_step) — rebuild vendor/v86 (build-wasm.sh); no trace was armed",
+                HarnessErrorCode.BAD_ARGS,
+            );
+        }
+        // Capture BEFORE arming: the wasm can emit its first line inside dbg.step().
+        guestTrace.start(Math.max(4096, n * 2));
+        guestTrace.noteRequested(n);
         dbg.enable();
         dbg.step(n);
-        return { armed: n, note: "instruction trace appears in [DBG] traces (console.error) — observe via streamLogs" };
+        return { armed: n, ...traceArmReadback(exports), note: "read the trace with guestTrace()" };
+    });
+
+    /**
+     * stepOnBp(n) — trace the next N instructions AFTER a breakpoint hits, armed inside the
+     * wasm rather than from JS.
+     *
+     * `step(n)` arms from the JS side, which means the guest must still be executing when the
+     * RPC lands; after an API break it often is not, and the trace comes back empty with no
+     * way to tell that from "the guest ran nothing interesting". This hands the arming to the
+     * breakpoint itself, and it also RESEATS the dbg config — `DBG_STEP_COUNTER` is what
+     * silences the hook once it passes DBG_MAX_DUMPS, and only a re-arm zeroes it.
+     */
+    svc.register("stepOnBp", (args) => {
+        const n = Math.max(1, Number(args[0] ?? 1) | 0);
+        const exports = (globalThis as { preemption?: { getWasmExports?: () => Record<string, unknown> | null } })
+            .preemption?.getWasmExports?.();
+        if (!exports?.dbg_set_step_on_bp) {
+            throw new HarnessError(
+                "wasm debug exports missing (dbg_set_step_on_bp) — rebuild vendor/v86; nothing was armed",
+                HarnessErrorCode.BAD_ARGS,
+            );
+        }
+        guestTrace.start(Math.max(8192, n * 4));
+        guestTrace.noteRequested(n);
+        // Deliberately NOT dbg.enable(): that turns the JIT off globally and the guest crawls
+        // for the whole boot. The hook only needs DBG_ENABLED, which the FAST breakpoint sets
+        // — so pair this with breakOn(addr, {fast:true}), whose page-gate interprets one page
+        // and leaves the rest at speed. Arm the count FIRST: a bp re-seats the whole config.
+        dbg.maxDumps(1_000_000);
+        dbg.stepOnBp(n);
+        return { armed: n, ...traceArmReadback(exports), note: "now arm breakOn(addr, {fast:true, pause:false}); the trace starts when it hits" };
+    });
+
+    /**
+     * guestTrace({limit, filter, clear, capacity}) — the guest-side diagnostics the wasm wrote
+     * to the worker's console.error (step traces, write-watch dumps).
+     *
+     * Those lines describe what the GUEST ran between two thunks, which is precisely the window
+     * a wild EIP lands in — and they used to reach only the worker's own console, where no log
+     * stream or archive could see them. `{clear:true}` empties the ring after reading.
+     */
+    svc.register("guestTrace", (args) => {
+        const opts = (args[0] ?? {}) as { limit?: number; filter?: string; clear?: boolean; capacity?: number };
+        if (opts.capacity) guestTrace.start(opts.capacity);
+        const out = guestTrace.read(opts.limit ?? 200, opts.filter);
+        if (opts.clear) guestTrace.clear();
+        return out;
     });
 
     /** loadSymbols(module, {name:rva,...}) — install a sidecar symbol map for breakOnSymbol. */

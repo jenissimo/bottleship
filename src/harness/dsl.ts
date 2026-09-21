@@ -41,6 +41,8 @@ export interface BreakCaptureSpec {
 
 export class HarnessChain {
     private steps: HarnessStep[] = [];
+    /** Last absolute pointer target this chain set — the origin `sweepTo` interpolates from. */
+    private lastPointer: [number, number] | null = null;
     constructor(private readonly exec: StepExecutor) {}
 
     /** Generic escape hatch: enqueue any worker command. */
@@ -125,7 +127,10 @@ export class HarnessChain {
         return this.pushTimed("waitForControl", [target, opts], (opts?.timeoutMs ?? 120_000) + 10_000);
     }
     /** Click at guest-pixel coordinates (DDraw/D3D-composed UIs with no Win32 controls to target by label). */
-    clickAt(x: number, y: number, button?: number): this { return this.push("clickAt", [x, y, button]); }
+    clickAt(x: number, y: number, button?: number): this {
+        this.lastPointer = [x, y];
+        return this.push("clickAt", [x, y, button]);
+    }
     /** Host-side snapshot of the published input record (the other half of state(["input"])). */
     inputSab(): this { return this.push("inputSab", []); }
     /** Press + hold at guest coords, release on a timer — for low-fps state-polling guests that miss a synchronous click. */
@@ -136,7 +141,39 @@ export class HarnessChain {
      *  (DirectInput/GetAsyncKeyState) — use this for game menus (e.g. NFSU). */
     keyHold(vk: number | string, holdMs = 350): this { return this.push("keyHold", [vk, holdMs]); }
     type(text: string): this { return this.push("type", [text]); }
-    move(x: number, y: number): this { return this.push("move", [x, y]); }
+    move(x: number, y: number): this {
+        this.lastPointer = [x, y];
+        return this.push("move", [x, y]);
+    }
+    /**
+     * Aim at (x,y) the way a HAND does — a run of small steps with guest frames between
+     * them — instead of teleporting there.
+     *
+     * `move` is one jump. A title that draws its own cursor by following the pointer per
+     * frame cannot follow a jump: it sees a single enormous delta, clamps, and its cursor
+     * ends up pinned in a corner while every readout here still says the pointer is on the
+     * item. The click that follows then lands on nothing, and NOTHING in the run reports a
+     * failure — the frame renders, the messages arrive, the events are delivered and
+     * counted. Sweeping is what makes such a title's cursor arrive where we aimed.
+     *
+     * Starts from the last absolute pointer position this chain set. A chain that has not
+     * moved the pointer yet has no way to ask the guest where it is, so the sweep starts
+     * from a fixed (960,540); `move()` first when that is not near the real cursor.
+     */
+    sweepTo(x: number, y: number, opts?: { steps?: number; framesPerStep?: number }): this {
+        const steps = Math.max(1, opts?.steps ?? 16);
+        const frames = Math.max(1, opts?.framesPerStep ?? 2);
+        const [x0, y0] = this.lastPointer ?? [960, 540];
+        for (let i = 1; i <= steps; i++) {
+            this.push("move", [
+                Math.round(x0 + (x - x0) * i / steps),
+                Math.round(y0 + (y - y0) * i / steps),
+            ]);
+            this.push("tickFrames", [frames]);
+        }
+        this.lastPointer = [x, y];
+        return this;
+    }
     /**
      * Relative pointer motion, leaving the ABSOLUTE pointer where it is — the worker-side
      * twin of the host's Pointer Lock delta path, and the only way to steer a guest that
@@ -161,6 +198,16 @@ export class HarnessChain {
      *  no page-side verb can grant). The gate for every relative-mouse behaviour: honored
      *  SetCursorPos warps, DirectInput deltas, and the host-drawn cursor. */
     pointerLock(engage = true): this { return this.push("pointerLock", [engage]); }
+    /** A click through the BROWSER's input stack (CDP-side): canvas PointerEvent →
+     *  App.tsx → virtual device → SAB, user activation included, so the Pointer Lock
+     *  engagement a first click triggers is exercised. `clickAt`/`clickHere` write the
+     *  SAB from inside the worker and skip all of it. Coordinates are guest px. */
+    hostClick(opts?: { x?: number; y?: number; holdMs?: number; button?: "left" | "right" | "middle"; move?: boolean }): this {
+        return this.push("hostClick", [opts ?? {}]);
+    }
+    /** Relative motion through the browser stack — under Pointer Lock the page reads
+     *  movementX/Y, which only a dispatched move produces. */
+    hostMove(dx: number, dy: number, steps?: number): this { return this.push("hostMove", [dx, dy, steps]); }
     /** Record the pointer/keyboard WM_* the input layer posts — the ring expectMessages asserts over. */
     wmTrace(action: "start" | "stop" | "read" | "clear" = "read"): this { return this.push("wmTrace", [action]); }
     /** THE instrument for a BLANK control / an unpainted dialog: records every link of the
@@ -271,9 +318,10 @@ export class HarnessChain {
      *  alpha-bit census of source and destination — that pair is what names the op that
      *  dropped a masked texture's transparency. `alphaLostOnly` returns just those ops. */
     surfaceOps(opts?: { arm?: number; alpha?: boolean; alphaLostOnly?: boolean }): this { return this.push("surfaceOps", [opts]); }
-    /** One COMPLETED GL frame, decoded per draw: drawable size, the viewport/scissor that
-     *  were active, and each draw's NDC + resulting screen box. Separates "wrong quad" from
-     *  "wrong viewport/render target" without guessing. */
+    /** One COMPLETED GL frame, decoded per draw: drawable size (guest) and render extent
+     *  (drawable x internalScale), the viewport/scissor that were active, and each draw's
+     *  NDC + resulting screen box. Separates "wrong quad" from "wrong viewport/render
+     *  target" — and a guest-space quantity from a render-space one — without guessing. */
     glFrame(opts?: { timeoutMs?: number }): this { return this.push("glFrame", [opts]); }
     glTextures(): this { return this.push("glTextures", []); }
     glDumpTexture(id: number): this { return this.push("glDumpTexture", [id]); }
@@ -411,11 +459,16 @@ export class HarnessChain {
      *  caller's — a later readBytes races the resumed guest and answers with zeros. */
     breakOnExport(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number }; capture?: BreakCaptureSpec }): this { return this.pushTimed("breakOnExport", [name, opts], 0); }
     breakOnSymbol(name: string, opts?: { continuous?: boolean; pause?: boolean; fast?: boolean; when?: { arg: number; ebp?: boolean; eq?: number; ne?: number }; capture?: BreakCaptureSpec }): this { return this.pushTimed("breakOnSymbol", [name, opts], 0); }
-    /** `argEq` breaks only when a stack argument matches — the way to hit ONE call of a hot API. */
-    breakOnApi(pattern: string, opts?: { continuous?: boolean; argEq?: { index: number; value: number } }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
+    /** `argEq` breaks only when a stack argument matches — the way to hit ONE call of a hot API.
+     *  `capture.reads` settles register-relative reads at the hit, which is the only moment the
+     *  caller's object (in ECX/ESI, not on the stack) is still the one you asked about. */
+    breakOnApi(pattern: string, opts?: { continuous?: boolean; argEq?: { index: number; value: number }; capture?: Pick<BreakCaptureSpec, "reads"> }): this { return this.pushTimed("breakOnApi", [pattern, opts], 0); }
     /** Armed breakpoints + their hit counts. A `0 hits` eip entry comes back with the
      *  block-entry caveat attached — it is not evidence the code did not run. */
     breaks(): this { return this.push("breaks", []); }
+    /** The guest-side trace the wasm wrote to the worker console (armed by `step`). Without it
+     *  a step trace is written somewhere no log stream can read. */
+    guestTrace(opts?: { limit?: number; filter?: string; clear?: boolean; capacity?: number }): this { return this.push("guestTrace", [opts]); }
     /** Breakpoint hits recorded in the WORKER ring (EIP + API), with call-site evidence.
      *  Read this instead of accumulating hits in a script: a continuous break outlives every
      *  reader's timeout, the ring keeps the evidence, and `since: lastSeq` resumes without a gap. */
@@ -428,6 +481,18 @@ export class HarnessChain {
     }
     memTrapReport(): this { return this.push("memTrapReport", []); }
     memTrapClear(): this { return this.push("memTrapClear", []); }
+    /** The JS-side sibling of `trapWrites`. A write OUR handlers make through `Mem` raises no
+     *  #PF, so the MMU trap counts it as silence; this one sees it and names the thunk plus the
+     *  guest call stack that asked for it. Pair it with `wasmStringWriters(false)`, or the WASM
+     *  memcpy/memset writers stay invisible to both traps and a null result means nothing. */
+    trapJsWrites(addr: number | string, len?: number, label?: string): this {
+        return this.push("trapJsWrites", [addr, len, label]);
+    }
+    jsWriteReport(): this { return this.push("jsWriteReport", []); }
+    jsWriteClear(): this { return this.push("jsWriteClear", []); }
+    /** Route the guest-memory-writing WASM string/memory hypercalls to their JS fallbacks, so
+     *  both traps can see them. Doubles as the A/B that convicts or clears those kernels. */
+    wasmStringWriters(on: boolean): this { return this.push("wasmStringWriters", [on]); }
     pause(): this { return this.push("pause", []); }
     resume(): this { return this.push("resume", []); }
 

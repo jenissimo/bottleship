@@ -11,7 +11,7 @@
  */
 
 import { harnessBus } from "./event-bus";
-import { readCallSnapshot } from "./serialize";
+import { readCallSnapshot, settleRegisterReads, type RegisterRead } from "./serialize";
 import { breakEvents } from "./break-events";
 
 /** Break only when a stack argument equals a value — `{ index, value }`, index 0-based
@@ -31,6 +31,7 @@ interface ApiBreakEntry {
     continuous: boolean;
     hits: number;
     argEq?: ApiArgFilter;
+    reads?: RegisterRead[];
     onHit?: (snapshot: unknown) => void;
 }
 
@@ -51,7 +52,7 @@ class ApiBreakRegistry {
     private entries: ApiBreakEntry[] = [];
     private nextId = 1;
 
-    arm(pattern: string, opts: { runId?: number | null; continuous?: boolean; argEq?: ApiArgFilter; onHit?: (s: unknown) => void } = {}): number {
+    arm(pattern: string, opts: { runId?: number | null; continuous?: boolean; argEq?: ApiArgFilter; reads?: RegisterRead[]; onHit?: (s: unknown) => void } = {}): number {
         const id = this.nextId++;
         this.entries.push({
             id,
@@ -61,6 +62,7 @@ class ApiBreakRegistry {
             continuous: !!opts.continuous,
             hits: 0,
             argEq: opts.argEq,
+            reads: opts.reads,
             onHit: opts.onHit,
         });
         this.active = true;
@@ -87,7 +89,7 @@ class ApiBreakRegistry {
      * Called from the dispatcher hot path ONLY when `active`. Matches the thunk
      * name and, on a hit, emits apiBreak + resolves a one-shot waiter.
      */
-    check(thunkName: string, eip: number, esp: number): void {
+    check(thunkName: string, eip: number, esp: number, cpuState?: { reg32: Int32Array | Uint32Array }): void {
         if (!this.entries.length) return;
         let snapshot: unknown | undefined;
         // Iterate a copy so a one-shot disarm during the loop is safe.
@@ -99,11 +101,24 @@ class ApiBreakRegistry {
                 if ((args[e.argEq.index] >>> 0) !== (e.argEq.value >>> 0)) continue;
             }
             e.hits++;
+            // A caller's object usually rides in a REGISTER, not on the stack — `this` in ECX,
+            // the engine's wrapper in ESI. Reading it here is the only honest moment: after the
+            // thunk returns the guest runs on, and a later readBytes describes a different frame.
+            // A hit that silently carries no `reads` is indistinguishable from one that was
+            // armed without them, so a missing register file is reported, not dropped.
+            const hit = !e.reads
+                ? snapshot
+                : {
+                    ...(snapshot as Record<string, unknown>),
+                    reads: cpuState
+                        ? settleRegisterReads(cpuState, e.reads)
+                        : [{ error: "no register file at this dispatch site — capture.reads could not be settled" }],
+                };
             // Same durability rule as EIP breaks: a continuous break's evidence lives in the
             // worker ring, so the death of whatever is reading it loses nothing (`breakEvents`).
-            breakEvents.push("api", e.id, thunkName, snapshot);
-            harnessBus.emit("apiBreak", snapshot, e.runId);
-            if (e.onHit) e.onHit(snapshot);
+            breakEvents.push("api", e.id, thunkName, hit);
+            harnessBus.emit("apiBreak", hit, e.runId);
+            if (e.onHit) e.onHit(hit);
             if (!e.continuous) this.disarm(e.id);
         }
     }

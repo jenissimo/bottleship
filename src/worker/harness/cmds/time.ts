@@ -21,6 +21,7 @@ import { sys, cpu, guestMem, proc } from "../serialize";
 import { TimeService } from "../../runtime/time";
 import { guestTimeSteps } from "../../core/guest-time-steps";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
+import { readRetiredInsns } from "../../core/cpu/cpu-views";
 import { harnessBus } from "../event-bus";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 
@@ -62,7 +63,7 @@ function buildPredicate(marker: unknown): () => boolean {
         // wrap-safe delta ~4.3e9 and satisfies any target instantly, with a perfectly
         // plausible elapsed time attached — the failure this project keeps rediscovering.
         if (!c?.instruction_counter) return retiredAcc;
-        const now = c.instruction_counter[0]! >>> 0;
+        const now = readRetiredInsns(c) >>> 0;
         if (retiredLast !== null) retiredAcc += retiredDelta(retiredLast, now);
         retiredLast = now;
         return retiredAcc;

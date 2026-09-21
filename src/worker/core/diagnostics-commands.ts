@@ -1215,10 +1215,17 @@ if (typeof globalThis !== 'undefined') {
             });
         (rows as any).topEips = topEips;
 
+        // `top` says how many rows the CALLER wants back; it must not also decide how many
+        // reach the console. captureHotBlocksMark asks for every row (99999) so the trace
+        // mark is complete, and printing that many — console.table plus a JSON.stringify of
+        // the same array, each entry also forwarded to an attached CDP client — allocated
+        // enough to kill the worker outright on a long-running session, where the JIT cache
+        // is large and where profiling is most wanted. The rows returned are unaffected.
+        const printed = Math.min(top, rows.length, CONSOLE_ROW_CAP);
         console.log(`[dumpHotJitBlocks] ${count} JIT blocks, ${runningSamples} EIP samples in ${elapsed.toFixed(0)}ms, ${pagesRunning.size} unique hot pages, ${eipRunning.size} unique EIPs`);
-        console.log(`Top ${Math.min(top, rows.length)} JIT blocks (by EIP samples):`);
-        console.log('[dumpHotJitBlocks][JSON] ' + JSON.stringify({ count, runningSamples, hotPages: pagesRunning.size, rows: rows.slice(0, top) }));
-        console.table(rows.slice(0, top));
+        console.log(`Top ${printed} of ${rows.length} JIT blocks (by EIP samples):`);
+        console.log('[dumpHotJitBlocks][JSON] ' + JSON.stringify({ count, runningSamples, hotPages: pagesRunning.size, rows: rows.slice(0, printed) }));
+        console.table(rows.slice(0, printed));
         // Return the full table so callers can post-process or save it.
         return rows;
     };
@@ -1230,6 +1237,9 @@ Logger.log(LogCategory.SYSTEM, '[eipSample] Console API: eipSample(durationMs=30
 // saveHotJitBlocks: convenience wrapper — runs dumpHotJitBlocks, triggers a
 // file download of the full row array (not just top-N) so it can be fed to
 // analyze-trace.ts --map without copy-paste gymnastics.
+/** Most rows dumpHotJitBlocks will ever PRINT, whatever `top` the caller asked to receive. */
+const CONSOLE_ROW_CAP = 25;
+
 (globalThis as any).saveHotJitBlocks = async (durationMs = 3000, intervalMs = 5) => {
     const rows = await (globalThis as any).dumpHotJitBlocks?.(durationMs, intervalMs, 9999);
     if (!rows || !Array.isArray(rows)) {

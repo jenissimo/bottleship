@@ -382,6 +382,16 @@ export class EmulatorConfig {
     public createDirs: string[] = [];
 
     /**
+     * Guest working directory at boot. Empty means "the entrypoint's own folder", which is
+     * right whenever the exe sits at the install root. It is NOT right for an image a
+     * launcher starts: CreateProcess gives the child the PARENT's directory, so an engine
+     * module under a subfolder runs with the install ROOT as its cwd and resolves every
+     * data path against it. Booting such an image directly without this doubles the
+     * subfolder into the path, and the engine reports its own data as unbuilt.
+     */
+    public workingDir = "";
+
+    /**
      * Guarded Inner-Loop HLE — signature-detects known
      * engine/library code in loaded PE images and hooks pure-compute leaf
      * functions with semantically-equivalent host kernels. Every shadow-enabled
@@ -655,6 +665,11 @@ export class EmulatorConfig {
                 LogCategory.SYSTEM,
                 `EmulatorConfig: writeFiles loaded (${this.writeFiles.length}): ${this.writeFiles.map((f) => f.path).join(", ")}`
             );
+        }
+
+        if (typeof config.workingDir === "string" && config.workingDir.trim().length > 0) {
+            this.workingDir = config.workingDir.trim();
+            Logger.log(LogCategory.SYSTEM, `EmulatorConfig: workingDir = "${this.workingDir}"`);
         }
 
         // Apply createDirs list (installer-created empty dirs lost by ZIP packing)

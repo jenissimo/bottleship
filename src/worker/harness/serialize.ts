@@ -76,6 +76,101 @@ export function symbolize(addr: number): string | null {
 
 /* ───────────────────────────── section serializers ───────────────────────── */
 
+/** What to read AT a breakpoint hit: address = reg + offset, or *(reg + offset) with `deref`. */
+export interface RegisterRead {
+    reg: string;
+    offset?: number;
+    size?: number;
+    deref?: boolean;
+    /**
+     * Follow a POINTER CHAIN from the first address: each entry is dereferenced, then the next
+     * offset is added. `{reg:'esp', offset:0x14, chain:[0x10, 0x4c, 0]}` is `[[[[esp+0x14]+0x10]+0x4c]]`.
+     *
+     * A material's texture slot is three or four hops from anything a register holds, and a
+     * chain walked AFTER the guest resumes reads a different object — the giveaway being a link
+     * that comes back as executable code. The whole walk has to settle at the hit, and the
+     * result names WHICH link was null instead of leaving the reader to guess.
+     */
+    chain?: number[];
+    label?: string;
+}
+
+const REG_INDEX: Record<string, number> = { eax: 0, ecx: 1, edx: 2, ebx: 3, esp: 4, ebp: 5, esi: 6, edi: 7 };
+
+/**
+ * Settle register-relative reads at the instant of a hit. Deliberately not an expression
+ * language: the point is that the value is read WHILE the frame is still the caller's, since
+ * anything read after the guest resumes describes a later moment and cannot be told apart from
+ * a wrong offset. An unknown register or an unreadable address is an ERROR entry, never a zero.
+ *
+ * Shared by the EIP and the API breakpoint paths so the two cannot answer differently.
+ */
+export function settleRegisterReads(cpuState: { reg32: Int32Array | Uint32Array }, specs: readonly RegisterRead[]): unknown[] {
+    const mem = guestMem();
+    const out: unknown[] = [];
+    // An empty array reads as "nothing was asked for". A request that could not be served
+    // has to say so, or a hit with no guest memory is indistinguishable from a hit with no
+    // reads configured.
+    if (!mem) {
+        for (const spec of specs.slice(0, 32)) {
+            out.push({ label: spec.label ?? spec.reg, error: "no guest memory in this realm — nothing was read" });
+        }
+        return out;
+    }
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const hx = (n: number): string => "0x" + (n >>> 0).toString(16);
+    const readU32 = (at: number): number | null =>
+        at >= 0 && at + 4 <= mem.length ? view.getUint32(at, true) >>> 0 : null;
+
+    for (const spec of specs.slice(0, 32)) {
+        const label = spec.label ?? `${spec.reg}+0x${(spec.offset ?? 0).toString(16)}${spec.deref ? "*" : ""}`;
+        const ri = REG_INDEX[String(spec.reg).toLowerCase()];
+        if (ri === undefined) {
+            out.push({ label, error: `unknown register '${spec.reg}' (eax/ecx/edx/ebx/esp/ebp/esi/edi)` });
+            continue;
+        }
+        const base = ((cpuState.reg32[ri]! >>> 0) + ((spec.offset ?? 0) | 0)) >>> 0;
+        let addr = base;
+        let via: string | undefined;
+        if (spec.chain && spec.chain.length) {
+            const hops: string[] = [hx(base)];
+            let cur = base;
+            let broke = false;
+            for (let i = 0; i < Math.min(spec.chain.length, 8); i++) {
+                const p = readU32(cur);
+                if (p === null) {
+                    out.push({ label, hops, error: `link ${i} at ${hx(cur)} is outside guest memory` });
+                    broke = true;
+                    break;
+                }
+                if (p === 0) {
+                    // The answer this exists for: name the hop that is null, not the symptom.
+                    out.push({ label, hops, nullAtLink: i, error: `link ${i} (read at ${hx(cur)}) is NULL` });
+                    broke = true;
+                    break;
+                }
+                cur = (p + (spec.chain[i]! | 0)) >>> 0;
+                hops.push(`*${hx(p)}+0x${(spec.chain[i]! | 0).toString(16)}=${hx(cur)}`);
+            }
+            if (broke) continue;
+            via = hops.join(" -> ");
+            addr = cur;
+        } else if (spec.deref) {
+            const p = readU32(base);
+            if (p === null) { out.push({ label, base: hx(base), error: "deref source out of guest range" }); continue; }
+            if (p === 0) { out.push({ label, base: hx(base), ptr: "0x0", error: "pointer is NULL — not read" }); continue; }
+            via = hx(base);
+            addr = p;
+        }
+        const size = Math.min(Math.max((spec.size ?? 4) | 0, 1), 4096);
+        if (addr < 4 || addr + size > mem.length) { out.push({ label, addr: hx(addr), via, error: "out of guest range" }); continue; }
+        let hex = "";
+        for (let i = 0; i < size; i++) hex += mem[addr + i]!.toString(16).padStart(2, "0");
+        out.push({ label, addr: hx(addr), via, size, hex, u32: size === 4 ? hx(view.getUint32(addr, true) >>> 0) : undefined });
+    }
+    return out;
+}
+
 export function serializeCpu(): unknown {
     const c = cpu();
     if (!c) return null;
@@ -142,6 +237,9 @@ export function serializeThreads(): unknown {
     return {
         currentThreadId, runQueue, count: threads.length, threads,
         suspendWait: sched.suspendWaitStats ? { ...sched.suspendWaitStats } : null,
+        // Stack footprint + release ledger: a thread-churn leak is invisible in a point
+        // sample of the thread list, and `stats.held*` names whatever is refusing release.
+        stacks: sched.getStackFootprint?.() ?? null,
     };
 }
 

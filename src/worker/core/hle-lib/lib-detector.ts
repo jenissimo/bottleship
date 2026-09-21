@@ -111,6 +111,16 @@ let lastScanMiss: ScanMiss | null = null;
 const hex = (b: Uint8Array | null) =>
     b ? Array.from(b).map(v => v.toString(16).padStart(2, '0')).join(' ') : '<unreadable>';
 
+/** Render a near-miss as evidence. Shared so the signature and function stages cannot drift. */
+function describeScanMiss(miss: ScanMiss): string {
+    if (miss.unreadable) {
+        return `SECTION UNREADABLE at 0x${miss.bestAddr.toString(16)} — nothing was compared ` +
+            `(paging/ordering, not a build difference)`;
+    }
+    return `best match ${miss.bestLen}/${miss.expected.length} bytes at 0x${miss.bestAddr.toString(16)}` +
+        `\n    expected: ${hex(miss.expected)}\n    actual:   ${hex(miss.actual)}`;
+}
+
 function scanBytes(module: LoadedPEModule, section: PESection, pattern: Uint8Array, mask: string): number {
     lastScanMiss = null;
     if (pattern.length !== mask.length) {
@@ -156,10 +166,16 @@ export function takeLastScanMiss(): ScanMiss | null {
     return m;
 }
 
-function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): SignatureHit | null {
+interface SignatureEvaluation {
+    hit: SignatureHit | null;
+    /** Near-miss evidence, when the signature was a byte scan that recorded one. */
+    miss: ScanMiss | null;
+}
+
+function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): SignatureEvaluation {
     const sectionName = (sig as any).section ?? (sig.kind === 'prologue' ? '.text' : '.rdata');
     const section = getSection(module, sectionName);
-    if (!section) return null;
+    if (!section) return { hit: null, miss: null };
 
     let address = -1;
     switch (sig.kind) {
@@ -176,8 +192,12 @@ function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): 
             address = scanBytes(module, section, sig.pattern, sig.mask);
             break;
     }
-    if (address < 0) return null;
-    return { signatureId: id, address, weight: sig.weight };
+    if (address >= 0) return { hit: { signatureId: id, address, weight: sig.weight }, miss: null };
+    // Only a byte scan leaves a record, and consuming it HERE also keeps one
+    // signature's miss from being read as another signature's — or as a function
+    // probe's — later in the run.
+    const scanned = sig.kind === 'bytes' || sig.kind === 'prologue';
+    return { hit: null, miss: scanned ? takeLastScanMiss() : null };
 }
 
 /**
@@ -485,12 +505,31 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
     if (!module.sections || module.sections.length === 0) return null;
 
     const signatureHits: SignatureHit[] = [];
+    const nearMisses: Array<{ id: string; sig: Signature; miss: ScanMiss }> = [];
     let confidence = 0;
     for (const [id, sig] of Object.entries(descriptor.signatures)) {
-        const hit = evaluateSignature(module, id, sig);
+        const { hit, miss } = evaluateSignature(module, id, sig);
         if (hit) {
             signatureHits.push(hit);
             confidence += hit.weight;
+        } else if (miss) {
+            nearMisses.push({ id, sig, miss });
+        }
+    }
+
+    // A near-miss is only evidence once SOMETHING of this library is already in this
+    // module. With zero hits the "longest prefix" is just whichever unrelated bytes
+    // came closest, in a section that never held the library — and every module load
+    // would print one. With a hit it names the exact signature a different build
+    // moved, which is the whole difference between a patch and an RE session.
+    // scanBytes keeps only the best position, so this is one line per missed
+    // signature, not per scan position.
+    if (confidence > 0) {
+        for (const { id, sig, miss } of nearMisses) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[HLE-lib] ${descriptor.id} (${descriptor.displayName}): signature '${id}' ` +
+                `(${sig.kind}, worth +${sig.weight}) NOT MATCHED in ${module.name} — ` +
+                `confidence ${confidence}/${descriptor.minConfidence} without it; ${describeScanMiss(miss)}`);
         }
     }
 
@@ -519,12 +558,7 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
             Logger.warn(LogCategory.SYSTEM,
                 `[HLE-lib] ${descriptor.id}: function '${name}' NOT FOUND in ${module.name}` +
                 `${decl.required ? ' (required — aborting)' : ' (optional — hook will NOT install)'}` +
-                (!miss
-                    ? ''
-                    : miss.unreadable
-                        ? `; SECTION UNREADABLE at 0x${miss.bestAddr.toString(16)} — nothing was compared (paging/ordering, not a build difference)`
-                        : `; best prologue match ${miss.bestLen}/${miss.expected.length} bytes at ` +
-                          `0x${miss.bestAddr.toString(16)}\n    expected: ${hex(miss.expected)}\n    actual:   ${hex(miss.actual)}`));
+                (miss ? `; ${describeScanMiss(miss)}` : ''));
             if (decl.required) return null;
         }
     }

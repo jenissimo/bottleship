@@ -14,6 +14,39 @@ import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
 import { getD3D9PerfSnapshot, resetD3D9Perf } from "../../modules/d3d9/d3d9-perf";
 import { collectShaderCensus, censusComplete } from "../shader-census";
 import type { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
+import {
+    getD3D9FloatCapabilityContract,
+    isD3D9FloatRenderTargetBlendable,
+    isD3D9FloatRenderTargetSupported,
+    resolveD3D9FloatRenderTargetPolicy,
+    resolveD3D9FloatTexturePolicy,
+} from "../../backends/webgpu/shared/float-format-policy";
+
+/** The D3D9 float formats with a native WebGPU storage path (R/RG/RGBA, 16- and 32-bit). */
+const D3D9_FLOAT_FORMATS = [111, 112, 113, 114, 115, 116] as const;
+
+/**
+ * What this device actually decided about float formats. Three SEPARATE answers per format —
+ * sampled storage, colour attachment, blending into it — because a game whose lighting
+ * accumulates additively into an HDR target renders a plausible but wrong picture when only
+ * the third one is no, and nothing else in a frame says which of the three was refused.
+ */
+function floatCapabilityAnswers(): Record<string, unknown> {
+    const contract = getD3D9FloatCapabilityContract();
+    const formats: Record<string, unknown> = {};
+    for (const format of D3D9_FLOAT_FORMATS) {
+        const sampled = resolveD3D9FloatTexturePolicy(format);
+        const attachment = resolveD3D9FloatRenderTargetPolicy(format);
+        formats[String(format)] = {
+            gpuFormat: sampled.gpuFormat,
+            sampled: sampled.supported,
+            renderTarget: isD3D9FloatRenderTargetSupported(format),
+            blendable: isD3D9FloatRenderTargetBlendable(format),
+            reason: sampled.supported ? attachment.reason : sampled.reason,
+        };
+    }
+    return { probed: !!contract, formats };
+}
 
 interface WgslDiagnostic {
     type: string;
@@ -156,12 +189,48 @@ export function registerShaderCommands(svc: HarnessService): void {
         return {
             dropDraws: { ...perf.droppedDraws },
             ffpUnimplemented: { ...perf.ffpUnimplemented },
+            // What the fixed-function pipelines this scene BUILT declare per sampler slot.
+            // ffpUnimplemented says what we refused; this says what we took.
+            ffpSamplerDims: { ...perf.ffpSamplerDims },
+            // "bound" vs "redundant" vs "unknownPointer": whether the renderer is SAMPLING
+            // anything. A stage that is never bound draws the same as one bound efficiently.
+            textureBindOutcome: { ...perf.textureBindOutcome },
             approximated: { ...perf.approximated },
             formatSupport: perf.formatSupport,
+            // What a CONSTRUCTOR refused. A format that formatSupport does NOT list as refused
+            // but that appears here is advertised-then-rejected — a NULL the guest cannot see.
+            creationRefusals: { ...perf.creationRefusals },
+            // `probed:false` means EVERY float answer below is a default refusal, not a
+            // measurement — the one state in which the numbers here mean nothing.
+            floatCapabilities: floatCapabilityAnswers(),
             shaderUnsupported: Number(shaders.unsupported ?? 0),
             shaderApproximated: Number(shaders.approximated ?? 0),
             shaderCensus: shaders.census,
         };
+    });
+
+    /** shaderConstants({vertex?, start?, count?}) — the live float constant bank, per device.
+     *  Names the difference an effect-constant census cannot: a register written with zeros
+     *  versus one nothing ever wrote. `null` rows mean the device exposes no bank. */
+    svc.register("shaderConstants", (args) => {
+        const o = (args[0] ?? {}) as { vertex?: boolean; start?: number; count?: number };
+        const vertex = o.vertex !== false;
+        const start = Math.max(0, Math.trunc(o.start ?? 0));
+        const count = Math.max(1, Math.min(64, Math.trunc(o.count ?? 4)));
+        const out: Array<Record<string, unknown>> = [];
+        for (const [ptr, dev] of d3d9Devices) {
+            const read = (dev as { readShaderConstantF?: (v: boolean, s: number, c: number) => number[] })
+                .readShaderConstantF?.bind(dev);
+            out.push({
+                device: "0x" + (ptr >>> 0).toString(16),
+                stage: vertex ? "vs" : "ps",
+                start,
+                registers: read
+                    ? Array.from({ length: count }, (_, i) => read(vertex, start + i, 1))
+                    : null,
+            });
+        }
+        return out;
     });
 
     /** dropDraws({reset?}) — the small, direct view of the draw-refusal histogram. */

@@ -298,6 +298,8 @@ export function registerFsCommands(svc: HarnessService): void {
                 hitOverlaySync: c.hitOverlaySync,
             },
             asyncFallbacks: c.asyncFallbacks,
+            /** Sync ROM reads refused for coming back short mid-file (they retry blocking). */
+            romSyncShortFalls: c.romSyncShortFalls,
             /** Reads the ladder served without naming an arm. MUST be 0 — see vfsIoCensus. */
             armUnattributed: c.armUnattributed,
             /** null with no reads: a cross-check over an empty census is vacuously true, and

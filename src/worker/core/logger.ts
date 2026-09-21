@@ -311,6 +311,7 @@ class LoggerImpl {
      */
     isEnabled(category: LogCategory, level: LogLevel): boolean {
         if (level === LogLevel.VERBOSE) {
+            if (this.verboseSuppressedByCategory(category)) return false;
             return (
                 this.getCategoryLevel(category) >= LogLevel.VERBOSE ||
                 this.verboseStore.isEnabled() ||
@@ -318,6 +319,20 @@ class LoggerImpl {
             );
         }
         return this.getCategoryLevel(category) >= level;
+    }
+
+    /**
+     * An EXPLICIT category level below VERBOSE silences that category for EVERY sink,
+     * stream included — the same "only a configured category filters" rule keepInRing
+     * uses. Without this an attached stream re-enabled every verbose entry, so the one
+     * documented way to quiet a firehose (harness `logLevel('D3D9','WARN')`) could not
+     * work: a per-draw-call title kept emitting ~30k entries/s into the stream, the
+     * socket reported CLIENT GAP, and the evidence a diagnosis needed was the thing
+     * being dropped. Nothing configured still means "the stream sees everything".
+     */
+    private verboseSuppressedByCategory(category: LogCategory): boolean {
+        const configured = this.categoryLevels.get(category);
+        return configured !== undefined && configured < LogLevel.VERBOSE;
     }
 
     /**
@@ -366,6 +381,8 @@ class LoggerImpl {
      * The messageFn is only called if logging is actually enabled.
      */
     verboseLazy(category: LogCategory, messageFn: () => string): void {
+        // Ahead of messageFn(): a silenced category must not pay for the string either.
+        if (this.verboseSuppressedByCategory(category)) return;
         const isVerboseEnabled = this.globalEnabled && this.getCategoryLevel(category) >= LogLevel.VERBOSE;
         const isStoreEnabled = this.verboseStore.isEnabled();
         const isStreamEnabled = this.streamCallback !== null;
@@ -391,6 +408,7 @@ class LoggerImpl {
      * Log a verbose message (only shown in VERBOSE mode or when flushed)
      */
     verbose(category: LogCategory, message: string): void {
+        if (this.verboseSuppressedByCategory(category)) return;
         const isVerboseEnabled = this.globalEnabled && this.getCategoryLevel(category) >= LogLevel.VERBOSE;
         const isStoreEnabled = this.verboseStore.isEnabled();
         const isStreamEnabled = this.streamCallback !== null;

@@ -49,8 +49,41 @@ export const SILENT_STUBS = new Set<string>([
     "d3d8:IDirect3DDevice8_ProcessVertices",  // software T&L+lighting → dest VB; if no-op, garbage verts
 ]);
 
+/**
+ * A FAILED HRESULT is the third kind of silent hole, and the worst to chase: the call is
+ * implemented, it answers honestly, and the guest stores the NULL out-param it was handed
+ * and derefs it several seconds later in its own code. The census names the API that said
+ * no, so "a NULL nobody checked" stops being a reverse-engineering exercise.
+ *
+ * Only modules whose exports really return HRESULTs are watched — elsewhere a high bit is
+ * an ordinary negative return (a handle, a count) and would be a false accusation.
+ */
+const HRESULT_MODULES = new Set<string>([
+    "d3d9", "d3dx9", "d3d8", "d3dx8", "ddraw", "dsound", "dinput", "dinput8",
+    "quartz", "dplayx", "dmusic", "d3drm", "wined3d",
+]);
+
+export interface ApiFailureRecord {
+    /** "module:Method". */
+    name: string;
+    /** The failing HRESULT, unsigned. */
+    hr: number;
+    count: number;
+    firstCaller: number;
+    lastCaller: number;
+    lastSeq: number;
+}
+
+/** Does a failing return from this thunk mean an HRESULT failure? */
+export function isHresultThunk(name: string): boolean {
+    const colon = name.indexOf(":");
+    return colon > 0 && HRESULT_MODULES.has(name.slice(0, colon));
+}
+
 class ApiCensus {
     private map = new Map<string, ApiCallRecord>();
+    /** Keyed "name|hr" so one export failing two different ways stays two rows. */
+    private failures = new Map<string, ApiFailureRecord>();
     private seq = 0;
 
     /** Record one implemented dispatch. `arity` = impl.length (handler param count).
@@ -79,6 +112,31 @@ class ApiCensus {
         return [...this.map.values()].sort((a, b) => b.lastSeq - a.lastSeq);
     }
 
+    /** Record one FAILED HRESULT. The dispatcher has already gated on the module. */
+    recordFailure(name: string, hr: number, caller: number): void {
+        const value = hr >>> 0;
+        const key = `${name}|${value}`;
+        const existing = this.failures.get(key);
+        if (existing) {
+            existing.count++;
+            existing.lastCaller = caller >>> 0;
+            existing.lastSeq = ++this.seq;
+            return;
+        }
+        // Unbounded growth is impossible in practice (one row per export/HRESULT pair), but
+        // a corrupted name stream must not be able to grow this without limit either.
+        if (this.failures.size >= 512) return;
+        this.failures.set(key, {
+            name, hr: value, count: 1,
+            firstCaller: caller >>> 0, lastCaller: caller >>> 0, lastSeq: ++this.seq,
+        });
+    }
+
+    /** Every HRESULT failure the guest was handed, most-recent first. */
+    failureList(): ApiFailureRecord[] {
+        return [...this.failures.values()].sort((a, b) => b.lastSeq - a.lastSeq);
+    }
+
     /** Only the likely silent stubs the guest actually CALLED (most-hit first). */
     suspectStubs(): ApiCallRecord[] {
         return [...this.map.values()].filter(r => r.suspectStub).sort((a, b) => b.count - a.count);
@@ -86,6 +144,7 @@ class ApiCensus {
 
     clear(): void {
         this.map.clear();
+        this.failures.clear();
     }
 }
 

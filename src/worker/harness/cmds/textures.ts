@@ -306,6 +306,34 @@ export function registerTextureCommands(svc: HarnessService): void {
         if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
         return emit(d9.rgba, d9.w, d9.h, `${d9Source}(fmt ${d9.format})`);
     };
+    /** rtGallery() — every D3D9 render target with its RAW value range, in one call.
+     *
+     *  The frame graph as numbers. `dumpSurface` quantises to 8-bit RGBA, which cannot tell
+     *  an HDR buffer holding 40.0 from one holding 1.0 (both clamp to white) nor a luminance
+     *  target holding 0.001 from one holding 0.0 (both round to black) — so on a deferred
+     *  renderer it answers "wrong" for every stage and names none. This reports each
+     *  attachment in its own value space, newest store index last, so the first dark,
+     *  saturated or NaN link in the chain identifies itself. */
+    svc.register("rtGallery", async () => {
+        const rows: Array<Record<string, unknown>> = [];
+        for (const [device, instance] of d3d9Devices) {
+            const gallery = (instance as unknown as {
+                renderTargetGallery?: () => Promise<Array<Record<string, unknown>>>;
+            }).renderTargetGallery;
+            if (typeof gallery !== "function") continue;
+            for (const row of await gallery.call(instance)) {
+                rows.push({ device: "0x" + (device >>> 0).toString(16), ...row });
+            }
+        }
+        if (!rows.length) {
+            throw new HarnessError(
+                "no D3D9 render targets (no device, or the guest released them)",
+                HarnessErrorCode.NOT_FOUND,
+            );
+        }
+        return rows;
+    });
+
     svc.register("dumpSurface", dump);
     svc.register("dumpTexture", dump);
 
@@ -595,8 +623,9 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  Reading the same answer out of the log firehose is not possible — the flags change
      *  the picture, and the picture is the measurement.
      *
-     *  The D3D9 backend carries the four stage-removal levers (`forceCullNone`,
-     *  `forceDisableZTest`, `forceDisableAlphaTest`, `forceDisableAlphaBlend`); DDraw/D3D7/D3D8
+     *  The D3D9 backend carries five stage-removal levers (`forceCullNone`,
+     *  `forceDisableZTest`, `forceDisableAlphaTest`, `forceDisableAlphaBlend`,
+     *  `forceDisableStencil`); DDraw/D3D7/D3D8
      *  carry the fuller set above. A name no live backend owns is an ERROR, never a no-op.
      *
      *  Call with no name to read the current flags, keyed by backend. Toggles are sticky;
@@ -655,14 +684,23 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  the identical black patch. Call with no argument to read the current cut plus
      *  `lastFrameDraws`, so a scrub that is silently doing nothing is visible as such.
      *  drawScrub(0, -1) (or no-arg after setting) leaves it inert; drawScrub(N, N) shows
-     *  ONE draw's contribution over whatever the previous frame left behind. */
+     *  ONE draw's contribution over whatever the previous frame left behind.
+     *
+     *  A third argument SCOPES the cut to one render target (a `rtSurfacePtr` from
+     *  `captureFrame`'s `targets`), numbering draws within that attachment and leaving every
+     *  other pass whole. Frame-absolute numbering is stable only when every earlier pass has a
+     *  fixed draw count, and on a deferred renderer a shadow map's does not — it follows the
+     *  units and the camera — so the same index names a different draw each frame and the
+     *  bisect reads as noise. Scope the scrub whenever a pass you care about is not the first. */
     svc.register("drawScrub", (args) => {
         const dev: any = sys().services?.render?.getActive?.();
         if (!dev?.setDrawScrub) throw new HarnessError("active presenter has no draw scrub", HarnessErrorCode.UNSUPPORTED);
         if (args.length > 0) {
             const min = Number(args[0] ?? 0) | 0;
             const max = args[1] === undefined ? -1 : Number(args[1]) | 0;
-            dev.setDrawScrub(min, max);
+            // Third argument scopes the cut to ONE render target, numbering draws within it.
+            const target = args[2] === undefined ? 0 : Number(args[2]) >>> 0;
+            dev.setDrawScrub(min, max, target);
         }
         return dev.getDrawScrub();
     });

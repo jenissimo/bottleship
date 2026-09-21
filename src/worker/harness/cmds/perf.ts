@@ -30,6 +30,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { type FrameTail } from "../../core/frame-time-distribution";
 import { dbg, type FastmemStats } from "../../core/debug/dbg-commands";
 import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
+import { getWasmGrowthStats } from "../../core/cpu/cpu-views";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { compareScenes, probeScene, type SceneProbe } from "./scene";
 
@@ -123,6 +124,12 @@ type CounterSnapshot = {
     fastmem: FastmemCounters | null;
     tier2: Record<string, number> | null;
     codeInvalidations: { wired: boolean; ranges: number; bytes: number; deferred: number };
+    /** WASM buffer-identity changes. This is the safety margin of every cached-view
+     *  decision in the worker: v86's `view()` Proxy re-resolves on EVERY access to guard
+     *  against exactly this event, so how often it actually happens says whether that
+     *  guard is earning its cost. A session that grows 0-2 times after boot is one where
+     *  it is not. */
+    wasmGrowths: number;
     hypercalls: number;
     handlers: ReturnType<typeof hypercallDataManager.getHandlerReport>;
 };
@@ -150,6 +157,7 @@ function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
         fastmem,
         tier2,
         codeInvalidations: guestCodeInvalidationStats(),
+        wasmGrowths: getWasmGrowthStats().growths,
         hypercalls: hypercallDataManager.getCallCount(),
         handlers: hypercallDataManager.getHandlerReport(),
     };
@@ -216,6 +224,7 @@ function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
             bytes: now.codeInvalidations.bytes - base.codeInvalidations.bytes,
             wired: now.codeInvalidations.wired,
         },
+        wasmGrowths: now.wasmGrowths - base.wasmGrowths,
         hypercalls: {
             delta: hcDelta,
             wrapCaveat: "32-bit wrapping total; delta is computed unsigned so ONE wrap is recovered.",
@@ -957,9 +966,21 @@ export function registerPerfCommands(svc: HarnessService): void {
      *  per element (guest-memory.ts), the ~140x class. Heuristic, not proof: sync thunks
      *  only, and one Mem.read* anywhere in the call clears the flag — it under-reports
      *  rather than cries wolf. Confirm a suspect with `dbg.memProxyBench` (A/B both arms in
-     *  one session) and price the loop with `dbg.memBench` (ns per Proxy access here). */
+     *  one session) and price the loop with `dbg.memBench` (ns per Proxy access here).
+     *
+     *  There is no `reset` here: the session aggregates AND `sessionFrames` (the msPerFrame
+     *  divisor) are cleared together by frameProfiler.reset(), i.e. by perfProfile({reset:true}),
+     *  which is how a window is opened. An ignored option would report the whole session under
+     *  a name that promised a window, so unknown keys are refused. */
     svc.register("perfThunks", (args) => {
         const opts = (args[0] ?? {}) as { top?: number; filter?: string };
+        const unknown = Object.keys(opts).filter((k) => k !== "top" && k !== "filter");
+        if (unknown.length > 0) {
+            throw new HarnessError(
+                `perfThunks: unknown option(s) ${unknown.map((k) => `'${k}'`).join(", ")} — takes only {top, filter}`
+                + (unknown.includes("reset") ? "; window it with perfProfile({reset:true}) before the drive" : ""),
+                HarnessErrorCode.BAD_ARGS);
+        }
         return frameProfiler.getThunkReport(opts.top ?? 20, opts.filter);
     });
 

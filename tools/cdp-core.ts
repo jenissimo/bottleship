@@ -283,12 +283,26 @@ export class CdpSession {
         });
     }
 
-    send(method: string, params: any = {}, sessionId?: string): Promise<any> {
+    /** `timeoutMs` is opt-in: CDP has no deadline of its own, and several commands here
+     *  (Tracing, navigation) are legitimately unbounded. Give it to any command that can
+     *  wait on the RENDERER — a request that never settles spends wall-clock silently. */
+    send(method: string, params: any = {}, sessionId?: string, opts?: { timeoutMs?: number }): Promise<any> {
         const id = this.nextId++;
         const payload: any = { id, method, params };
         if (sessionId) payload.sessionId = sessionId;
         this.ws.send(JSON.stringify(payload));
-        return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+        return new Promise((resolve, reject) => {
+            this.pending.set(id, { resolve, reject });
+            const ms = opts?.timeoutMs;
+            if (!ms) return;
+            const timer = setTimeout(() => {
+                if (!this.pending.delete(id)) return;
+                reject(new Error(`CDP ${method} did not answer within ${ms}ms`));
+            }, ms);
+            const entry = this.pending.get(id)!;
+            const settle = (fn: (v: any) => void) => (v: any) => { clearTimeout(timer); fn(v); };
+            this.pending.set(id, { resolve: settle(entry.resolve), reject: settle(entry.reject) });
+        });
     }
 
     on(method: string, cb: (params: any, sessionId?: string) => void): void {
@@ -601,9 +615,27 @@ export async function workerStack(
 }
 
 /** Capture a page screenshot (PNG base64). */
-export async function screenshot(session: CdpSession): Promise<string> {
-    const r = await session.send("Page.captureScreenshot", { format: "png" });
-    return r.result?.data ?? "";
+/**
+ * Page.captureScreenshot waits for the next COMPOSITOR frame and Chrome puts no deadline
+ * on it: with a guest saturating the renderer it can sit for minutes, during which the
+ * emulator keeps running. A capture that silently lets wall-clock pass invalidates every
+ * timing-sensitive observation bracketed by it — a minute-long intro can start and finish
+ * between the click and the picture of it. So it is bounded and fails loudly; the worker's
+ * own `shot` verb reads the present mirror and does not depend on the compositor.
+ */
+export async function screenshot(session: CdpSession, opts: { timeoutMs?: number } = {}): Promise<string> {
+    const timeoutMs = opts.timeoutMs ?? 20_000;
+    try {
+        const r = await session.send("Page.captureScreenshot", { format: "png" }, undefined, { timeoutMs });
+        return r.result?.data ?? "";
+    } catch (e) {
+        throw new Error(
+            `${(e as Error).message} — the tab produced no compositor frame in time (a busy or ` +
+            "backgrounded guest does this). Wall-clock passed with the guest running: treat any " +
+            "timing-sensitive observation around this call as void, and use the harness `shot` " +
+            "verb (present mirror) rather than the CDP capture.",
+        );
+    }
 }
 
 export interface HealthReport {

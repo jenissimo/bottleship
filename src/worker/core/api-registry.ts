@@ -5,6 +5,7 @@ import { lgvidModule } from "../api/lgvid.api";
 import { oledlgModule } from "../api/oledlg.api";
 import { msiModule } from "../api/msi.api";
 import { xinput1_3Module } from "../api/xinput1_3.api";
+import { msvcp140Module } from "../api/msvcp140.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -85,6 +86,7 @@ export class APIRegistry {
         this.registerModule(oledlgModule);
         this.registerModule(msiModule);
         this.registerModule(xinput1_3Module);
+        this.registerModule(msvcp140Module);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });

@@ -340,6 +340,27 @@ export function registerStateCommands(svc: HarnessService): void {
      * `silent` is listed separately and first on purpose: a handler that returns success
      * without doing the work is worse than a missing one — the guest is told it worked.
      */
+    /**
+     * apiFailures(limit?) — every COM/DX call that answered FAILURE, with the guest caller.
+     *
+     * The complement of `apiCoverage`: that names what we did not implement or faked, this
+     * names what we implemented and REFUSED. A refusal is invisible at the crash site — the
+     * guest keeps the NULL out-param and derefs it later, in its own code — so this is the
+     * list to read first when a title dies with a null pointer some seconds after a load.
+     */
+    svc.register("apiFailures", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 40;
+        const hex = (v: number): string => "0x" + (v >>> 0).toString(16);
+        const all = apiCensus.failureList();
+        return {
+            total: all.length,
+            failures: all.slice(0, limit).map((f) => ({
+                api: f.name, hr: hex(f.hr), count: f.count,
+                lastCaller: hex(f.lastCaller), lastCallerSym: symbolize(f.lastCaller),
+            })),
+        };
+    });
+
     svc.register("apiCoverage", (args) => {
         const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 25;
         const hex = (v: number): string => "0x" + (v >>> 0).toString(16);
@@ -641,8 +662,17 @@ export function registerStateCommands(svc: HarnessService): void {
             // false ⇒ no instruction at `eip` addresses CR2; the jit only materializes
             // eip's low 12 bits, so read CR2/cr2Candidates instead of chasing that EIP.
             eipTrusted: f.eipTrusted,
+            // The block the CPU ENTERED before faulting. On a wild EIP this is the only
+            // survivor that still names a real code address — without it the record says
+            // where control ended up and nothing about where it came from.
+            previousEip: f.previousEip !== undefined ? hx(f.previousEip) : undefined,
+            // true ⇒ eip/errorCode are placeholders, not measurements.
+            frameUnread: f.frameUnread,
             cr2Candidates: f.cr2Candidates,
             badCall: f.badCall,
+            // "ret" ⇒ a SLOT held the wrong address (a smashed frame / mis-cleaned stack);
+            // "call" ⇒ a bad target was fetched at the named call site.
+            transfer: f.transfer,
             outcome: f.outcome,
             regs: {
                 eax: f.regs.eax !== undefined ? hx(f.regs.eax) : undefined,

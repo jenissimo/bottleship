@@ -31,7 +31,7 @@
  */
 
 import { harnessBus } from "./event-bus";
-import { faultSnapshot, proc, cpu, guestMem, symbolize } from "./serialize";
+import { faultSnapshot, proc, cpu, guestMem, settleRegisterReads, symbolize } from "./serialize";
 import { breakEvents } from "./break-events";
 import { dbg } from "../core/debug/dbg-commands";
 import { getWasmView, getFpuControlWord, decodeF80, FPU_ST_OFFSET, F80_SIZE } from "../core/fpu-helper";
@@ -112,9 +112,6 @@ function readFpuTop(cpu: any): Record<string, unknown> | null {
         return { error: String(e) };
     }
 }
-
-/** Register file order in v86's reg32. */
-const REG_INDEX: Record<string, number> = { eax: 0, ecx: 1, edx: 2, ebx: 3, esp: 4, ebp: 5, esi: 6, edi: 7 };
 
 export interface BreakWhen {
     /** Argument index (0-based). By default read from [ESP + 4 + arg*4] (entry convention).
@@ -347,27 +344,9 @@ class EipBreakRegistry {
             }
         }
 
-        // Arbitrary register-relative reads (`capture.reads`).
-        const reads: unknown[] = [];
-        for (const s of (capture?.reads ?? []).slice(0, 32)) {
-            const label = s.label ?? `${s.reg}+0x${(s.offset ?? 0).toString(16)}${s.deref ? "*" : ""}`;
-            const ri = REG_INDEX[String(s.reg).toLowerCase()];
-            if (ri === undefined) { reads.push({ label, error: `unknown register '${s.reg}' (eax/ecx/edx/ebx/esp/ebp/esi/edi)` }); continue; }
-            const base = ((c.reg32[ri] >>> 0) + ((s.offset ?? 0) | 0)) >>> 0;
-            let addr = base;
-            let via: string | undefined;
-            if (s.deref) {
-                const p = rU(base);
-                if (p === null) { reads.push({ label, base: hx(base), error: "deref source out of guest range" }); continue; }
-                if (p === 0) { reads.push({ label, base: hx(base), ptr: "0x0", error: "pointer is NULL — not read" }); continue; }
-                via = hx(base); addr = p;
-            }
-            const size = Math.min(Math.max((s.size ?? 4) | 0, 1), 4096);
-            if (addr < 4 || addr + size > mem.length) { reads.push({ label, addr: hx(addr), via, error: "out of guest range" }); continue; }
-            let hex = "";
-            for (let i = 0; i < size; i++) hex += mem[addr + i]!.toString(16).padStart(2, "0");
-            reads.push({ label, addr: hx(addr), via, size, hex, u32: size === 4 ? hx(view.getUint32(addr, true) >>> 0) : undefined });
-        }
+        // Arbitrary register-relative reads (`capture.reads`) — the same settler the API
+        // breakpoint uses, so a value read at one kind of hit means what it means at the other.
+        const reads = settleRegisterReads(c, capture?.reads ?? []);
 
         return {
             armedEip: hx(armedEip),

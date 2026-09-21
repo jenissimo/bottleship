@@ -94,7 +94,13 @@ export function setDeviceCursorPosition(devicePtr: number, x: number, y: number)
     const cursor = cursorFor(devicePtr);
     cursor.x = x;
     cursor.y = y;
-    if (cursor.hardware) warpGuestCursorTo(x, y);
+    // Only a cursor the runtime is actually DRAWING moves the OS pointer (wined3d
+    // wined3d_device_set_cursor_position: bCursorVisible && cursor_texture). A device that
+    // never had SetCursorProperties called, or whose cursor is hidden, has nothing to move.
+    // Warping regardless closes a loop through the app: the warp posts WM_MOUSEMOVE, the
+    // app's handler reads GetCursorPos and forwards it straight back here, and the queue
+    // never drains — the same position redelivered until the frame loop starves.
+    if (cursor.hardware && cursor.visible && cursor.image) warpGuestCursorTo(x, y);
     else publishSpritePosition();
 }
 

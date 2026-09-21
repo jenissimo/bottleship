@@ -262,6 +262,20 @@ export function registerInputCommands(svc: HarnessService): void {
         return { ok: true, at, holdMs, button, ...pointerPosture(im) };
     });
 
+    // clickInstant(button?) — press AND release at the published pointer inside one JS
+    // turn, so poll() observes both edges with no guest execution between them. That is
+    // the sub-poll press a level publication can only carry through the button latch,
+    // and the only way to drive that path on purpose: every timed verb above spans real
+    // frames and is served by the level alone.
+    svc.register("clickInstant", (args) => {
+        const im = input();
+        const button = Number(args[0] ?? 0) | 0;
+        const at = im.getPublishedPointer();
+        im.injectButtonAtScreen(at.x, at.y, button, true);
+        im.injectButtonAtScreen(at.x, at.y, button, false);
+        return { ok: true, at, button, ...pointerPosture(im) };
+    });
+
     // keyHold(vk, holdMs?) — keyboard twin of clickHold: press, hold across real
     // frames, release on a timer. A synchronous key tap (down+up in one tick) is
     // INVISIBLE to guests that poll key state at low frame rates (DirectInput /
@@ -274,6 +288,13 @@ export function registerInputCommands(svc: HarnessService): void {
         setTimeout(() => { try { im.injectKey(vk, false); } catch { /* torn down */ } }, Math.max(1, holdMs));
         return { ok, vk, holdMs };
     });
+
+    /** vk -> how often the guest polled it and how often it read as DOWN, busiest first. */
+    function pollCensus(probe: { polls: Map<number, { reads: number; pressed: number }> }): Array<{ vk: number; reads: number; pressed: number }> {
+        return [...probe.polls.entries()]
+            .map(([vk, c]) => ({ vk, reads: c.reads, pressed: c.pressed }))
+            .sort((a, b) => b.reads - a.reads);
+    }
 
     // inputTrace(action) — sniff what the GUEST actually reads from the input layer:
     // buffered DInput drains (mouse/keyboard), immediate wheel consumption (lZ),
@@ -291,12 +312,15 @@ export function registerInputCommands(svc: HarnessService): void {
             originals: Record<string, (...a: unknown[]) => unknown>;
             lastButtons: number;
             lastVkSig: string;
+            /** vk -> reads/pressedReads. GetAsyncKeyState/GetKeyState polling, any tier. */
+            polls: Map<number, { reads: number; pressed: number }>;
+            lastPolled: Map<number, boolean>;
         };
         let probe: Probe | undefined = im.__inputTraceProbe;
 
         if (action === "start") {
             if (probe) return { ok: true, already: true, entries: probe.entries.length };
-            probe = { entries: [], originals: {}, lastButtons: -1, lastVkSig: "" };
+            probe = { entries: [], originals: {}, lastButtons: -1, lastVkSig: "", polls: new Map(), lastPolled: new Map() };
             im.__inputTraceProbe = probe;
             const push = (e: Record<string, unknown>): void => {
                 if (probe!.entries.length >= MAX) probe!.entries.shift();
@@ -336,6 +360,23 @@ export function registerInputCommands(svc: HarnessService): void {
                 if (v) push({ k: "latchRead", buttons: v }); // 0 is every quiet frame — noise
                 return v;
             };
+            // The polled readers (GetAsyncKeyState / GetKeyState) reach the SAB through
+            // noteGuestKeyRead on EVERY tier — the WASM fast path included — so this is the
+            // only place that can see them. breakOnApi cannot: a fast-path call never enters
+            // JS dispatch, which is why a guest polling VK_LBUTTON reads as "never asks".
+            probe.originals.noteGuestKeyRead = im.noteGuestKeyRead.bind(im);
+            im.noteGuestKeyRead = (vk: number, pressed: boolean) => {
+                const cell = probe!.polls.get(vk) ?? { reads: 0, pressed: 0 };
+                cell.reads++;
+                if (pressed) cell.pressed++;
+                probe!.polls.set(vk, cell);
+                // One entry per TRANSITION: a per-frame poll would otherwise bury the ring.
+                if (probe!.lastPolled.get(vk) !== pressed) {
+                    probe!.lastPolled.set(vk, pressed);
+                    push({ k: "keyPoll", vk, pressed });
+                }
+                return probe!.originals.noteGuestKeyRead(vk, pressed);
+            };
             probe.originals.getKeyboardStateVk = im.getKeyboardStateVk.bind(im);
             im.getKeyboardStateVk = (target?: Uint8Array) => {
                 const ks = probe!.originals.getKeyboardStateVk(target) as Uint8Array;
@@ -354,14 +395,24 @@ export function registerInputCommands(svc: HarnessService): void {
             if (!probe) return { ok: true, already: true };
             for (const [name, fn] of Object.entries(probe.originals)) im[name] = fn;
             const entries = probe.entries;
+            const polls = pollCensus(probe);
             delete im.__inputTraceProbe;
-            return { ok: true, stopped: true, entries };
+            return { ok: true, stopped: true, entries, polls };
         }
         if (action === "clear") {
-            if (probe) probe.entries.length = 0;
+            if (probe) {
+                probe.entries.length = 0;
+                probe.polls.clear();
+                probe.lastPolled.clear();
+            }
             return { ok: true };
         }
-        return { ok: true, active: !!probe, entries: probe ? probe.entries : [] };
+        return {
+            ok: true,
+            active: !!probe,
+            entries: probe ? probe.entries : [],
+            polls: probe ? pollCensus(probe) : [],
+        };
     });
 
     /** dinputDiag() — buffered queues, the immediate-mouse handoff counters, and the

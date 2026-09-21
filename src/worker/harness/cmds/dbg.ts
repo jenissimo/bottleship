@@ -14,6 +14,7 @@
  */
 
 import type { HarnessService } from "../service";
+import { PROXY_BASELINE, syncProxyBaselineFlag } from '../../core/cpu/cpu-views';
 import { dbg } from "../../core/debug/dbg-commands";
 import { System } from "../../core/system";
 import { getSehUnwindTrace } from "../../core/seh-dispatch";
@@ -584,7 +585,10 @@ export function registerDbgCommands(svc: HarnessService): void {
         const prev = g[name];
         g[name] = value;
         noteAppliedWorkerFlag(name);
-        return { name, value, prev: prev ?? null };
+        // Flags that hot paths read through a cached mirror (rather than off globalThis on
+        // every access) must be re-synced here, or the arm is set and nothing observes it.
+        syncProxyBaselineFlag();
+        return { name, value, prev: prev ?? null, proxyBaseline: PROXY_BASELINE.on };
     });
 
     /** resetWorkerFlags() — drop every flag applied to the LIVE worker this session.
@@ -599,6 +603,7 @@ export function registerDbgCommands(svc: HarnessService): void {
         const cleared = applied ? Array.from(applied) : [];
         for (const name of cleared) delete g[name];
         applied?.clear();
-        return { cleared, count: cleared.length };
+        syncProxyBaselineFlag();
+        return { cleared, count: cleared.length, proxyBaseline: PROXY_BASELINE.on };
     });
 }

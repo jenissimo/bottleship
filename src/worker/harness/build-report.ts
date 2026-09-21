@@ -5,6 +5,7 @@
 
 import { serializeCpu, serializeThreads, proc, symbolize, guestMem } from "./serialize";
 import { faultRecorder } from "../core/memory/fault-recorder";
+import { getWasmGrowthStats, type WasmGrowthStats } from "../core/cpu/cpu-views";
 import { stubRegistry } from "../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../core/diagnostics/get-proc-address-registry";
 import { moduleHandleMissRegistry } from "../core/diagnostics/module-handle-miss-registry";
@@ -16,7 +17,9 @@ import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
 import { getGpuErrorReport, type GpuErrorReport } from "../core/gpu-error-log";
 import { gpuDeviceLifecycle, type GpuDeviceLifecycleReport } from "../core/gpu/gpu-device-lifecycle";
 import { pendingMessageBoxes } from "../runtime/dialog-bridge";
-import { getD3D9PerfSnapshot, type D3D9PerfSnapshot } from "../modules/d3d9/d3d9-perf";
+import { type D3D9PerfSnapshot } from "../modules/d3d9/d3d9-perf";
+import { getD3D9PerfSnapshotWithDevices } from "../modules/d3d9/shared-state";
+import { d3dxConstantTableCensus } from "../modules/d3dx9/constant-table";
 import { collectShaderCensus, censusComplete } from "./shader-census";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { activeQualityBackend, computeQualityGaps } from "../backends/webgpu/shared/quality-capabilities";
@@ -66,7 +69,7 @@ function numberOrZero(value: unknown): number {
 }
 
 function buildD3D9Report(): HarnessD3D9Report {
-    const perf = getD3D9PerfSnapshot();
+    const perf = getD3D9PerfSnapshotWithDevices();
     // Same collector the shaderOps verb uses: a device torn down mid-query must not be
     // swallowed into a census that then calls itself complete.
     const collection = collectShaderCensus(false);
@@ -138,6 +141,17 @@ export interface HarnessReport {
      */
     gpuErrors: GpuErrorReport;
     /**
+     * How many times WASM linear memory actually changed identity (grew) this session, and
+     * where the guest was when it did.
+     *
+     * v86 hands the CPU state and guest RAM out as `view()` Proxies that re-resolve on
+     * EVERY access, purely to make this event transparent. That is a per-access tax paid
+     * against a per-session event, and nothing else in the worker reports how often the
+     * event happens — so a decision to cache a view (or not) had no evidence behind it.
+     * `events` is a head, not a ring: the useful question is when growth STOPS.
+     */
+    wasmGrowth: WasmGrowthStats;
+    /**
      * The GPU device's own lifecycle: `status:"lost"` means every draw since is a no-op and
      * the picture on screen is stale — a diagnosis no pixel or counter can express, and the
      * one that separates "the guest stopped drawing" from "the GPU stopped listening".
@@ -153,12 +167,24 @@ export interface HarnessReport {
     /** D3D9 drop-draw and feature census; empty droppedDraws is the healthy state. */
     d3d9: HarnessD3D9Report;
     /**
+     * D3DXGetShaderConstantTable outcomes. A title that ships precompiled shaders binds
+     * every uniform through here, so `built: 0` with a non-zero `noTable` says the
+     * shaders carry no reflection data — and `unresolvedHandles` says we published a
+     * table whose names do not match what the game asks for. Both look like bad art.
+     */
+    d3dxConstantTables: ReturnType<typeof d3dxConstantTableCensus>;
+    /**
      * Message boxes the guest is blocked on. The host draws them as DOM, so no canvas
      * capture can show one: without this, a guest waiting on an error box is indistinguishable
      * from a freeze, and the text naming the actual problem is invisible.
      */
     pendingModals: Array<{ id: number; text: string; caption: string; uType: number; waitingMs: number }>;
     silentStubs: Array<{ api: string; count: number; arity: number; lastCaller: string; lastCallerSym: string | null }>;
+    /**
+     * COM/DX calls that answered FAILURE. The guest keeps the NULL out-param and derefs it
+     * later in its own code, so the crash site names nothing and this list does.
+     */
+    apiFailures: Array<{ api: string; hr: string; count: number; lastCaller: string; lastCallerSym: string | null }>;
     getProcMisses: Array<{
         module: string; proc: string; count: number;
         firstCaller: string; firstCallerSym: string | null;
@@ -196,6 +222,10 @@ export interface HarnessReport {
          *  entry near the top of the list is not thereby near the crash in time. */
         ageMs: number;
         eip: string; eipTrusted?: boolean; faultAddr: string; cr2Candidates?: string[];
+        /** Where the CPU entered the block — the only surviving pointer at the code when
+         *  `eipTrusted` is false. Symbolized, so it names a function rather than a number. */
+        transfer?: unknown;
+        previousEip?: string; previousEipSym?: string | null;
         badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
         lastThunk: string; threadId: number | null; outcome?: string;
         /** Registers AT THE FAULT. The post-mortem dump in a crash report is taken at
@@ -302,12 +332,14 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         })),
         lastThunks: bt?.recent ?? [],
         gpuErrors: getGpuErrorReport(),
+        wasmGrowth: getWasmGrowthStats(),
         gpuDevice: gpuDeviceLifecycle.report(),
         quality: {
             backend: activeQualityBackend(),
             unsupported: computeQualityGaps(EmulatorConfig.getInstance().quality),
         },
         d3d9: buildD3D9Report(),
+        d3dxConstantTables: d3dxConstantTableCensus(),
         pendingModals: pendingMessageBoxes(),
         stubs: stubRegistry.list().map((s) => ({
             api: s.key,
@@ -322,6 +354,13 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             arity: s.arity,
             lastCaller: hx(s.lastCaller),
             lastCallerSym: symbolize(s.lastCaller),
+        })),
+        apiFailures: apiCensus.failureList().map((f) => ({
+            api: f.name,
+            hr: hx(f.hr),
+            count: f.count,
+            lastCaller: hx(f.lastCaller),
+            lastCallerSym: symbolize(f.lastCaller),
         })),
         getProcMisses: getProcAddressRegistry.misses().map((h) => ({
             module: hx(h.hModule),
@@ -367,6 +406,9 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             ageMs: Math.max(0, Math.round(performance.now() - f.ts)),
             eip: hx(f.eip),
             eipTrusted: f.eipTrusted,
+            transfer: f.transfer,
+            previousEip: f.previousEip === undefined ? undefined : "0x" + (f.previousEip >>> 0).toString(16),
+            previousEipSym: f.previousEip === undefined ? undefined : symbolize(f.previousEip >>> 0),
             faultAddr: hx(f.faultAddr),
             cr2Candidates: f.cr2Candidates,
             badCall: f.badCall,
