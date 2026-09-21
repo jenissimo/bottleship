@@ -50,18 +50,26 @@ await session.send("Page.navigate", { url: PAGE });
 await session.send("Page.bringToFront", {}).catch(() => { /* not fatal */ });
 await sleep(3000);
 
-console.log(`[series] ${order} on ${PAGE}`);
-await pageEval(session, `[...document.querySelectorAll('button')].find(x=>x.textContent.includes('Серия сравнения')).click(),'started'`);
+// --enter: ONE entry on ONE engine instead of the comparison series. A census reads counters
+// out of a single build; running a four-arm series for it would spend three boots proving
+// nothing, and the arms are not comparable anyway when only one engine carries the counters.
+const single = process.argv.includes("--enter");
+const button = single ? "Войти в эталонную гонку" : "Серия сравнения";
+console.log(`[series] ${single ? "single entry" : order} on ${PAGE}`);
+await pageEval(session, `[...document.querySelectorAll('button')].find(x=>x.textContent.includes(${JSON.stringify(button)})).click(),'started'`);
 
 const deadline = Date.now() + timeoutMin * 60_000;
 let last = "";
+// The single-entry path leaves "Готово: ..."; the series leaves "Серия готова".
+const isReady = (s: string) => s.startsWith("Серия готова") || s.startsWith("Готово:");
+const isDone = (s: string) => isReady(s) || s.startsWith("Серия остановлена") || s.startsWith("Остановлено:");
 while (Date.now() < deadline) {
     await sleep(10_000);
     const status: string = await pageEval(session, `document.querySelector('#status').textContent`);
     if (status !== last) { last = status; console.log(`[series] ${status}`); }
-    if (last.startsWith("Серия готова") || last.startsWith("Серия остановлена")) break;
+    if (isDone(last)) break;
 }
-if (!last.startsWith("Серия")) console.log(`[series] TIMEOUT after ${timeoutMin} min - last status: ${last}`);
+if (!isDone(last)) console.log(`[series] TIMEOUT after ${timeoutMin} min - last status: ${last}`);
 
 // --profile: the series leaves its last arm paused on a validated scene, which is exactly
 // what the frame profile needs. Attribution, not timing — safe to run right after.
@@ -69,7 +77,7 @@ if (!last.startsWith("Серия")) console.log(`[series] TIMEOUT after ${timeou
 // mark inside the window, so `analyze-trace` can split the frame into guest JIT blocks, our JS
 // and glue. That split is the one number the codegen track's whole ceiling depends on, and the
 // two accountings currently on record disagree about it by a factor of three.
-if (process.argv.includes("--trace") && last.startsWith("Серия готова")) {
+if (process.argv.includes("--trace") && isReady(last)) {
     const seconds = Number(process.argv[process.argv.indexOf("--trace") + 1]) || 12;
     const tagIndex = process.argv.indexOf("--tag");
     const tag = tagIndex > 0 ? process.argv[tagIndex + 1] : `${seconds}s`;
@@ -120,7 +128,7 @@ if (process.argv.includes("--trace") && last.startsWith("Серия готова
 
 // --experiment <name>: run an exported function from nfsu-experiment.mjs on the scene the
 // series just left paused. This is where an in-boot paired A/B of a runtime JIT lever runs.
-if (process.argv.includes("--experiment") && last.startsWith("Серия готова")) {
+if (process.argv.includes("--experiment") && isReady(last)) {
     const name = process.argv[process.argv.indexOf("--experiment") + 1];
     console.log(`[experiment] ${name}`);
     await pageEval(session, `(async () => {
@@ -157,7 +165,7 @@ if (process.argv.includes("--experiment") && last.startsWith("Серия гот�
         if (done) { console.log(`[experiment] done: ${done}`); break; }
     }
 }
-if (process.argv.includes("--profile") && last.startsWith("Серия готова")) {
+if (process.argv.includes("--profile") && isReady(last)) {
     console.log("[profile] снимаю профиль готовой сцены");
     await pageEval(session, `[...document.querySelectorAll('button')].find(x=>x.textContent.includes('Снять профиль')).click(),'started'`);
     const profileDeadline = Date.now() + 10 * 60_000;

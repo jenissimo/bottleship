@@ -1,0 +1,308 @@
+{
+ "traceEvents": [
+  {
+   "ph": "M",
+   "cat": "__metadata",
+   "name": "thread_name",
+   "pid": 1,
+   "tid": 10,
+   "ts": 0,
+   "args": {
+    "name": "DedicatedWorker thread"
+   }
+  },
+  {
+   "ph": "M",
+   "cat": "__metadata",
+   "name": "thread_name",
+   "pid": 1,
+   "tid": 20,
+   "ts": 0,
+   "args": {
+    "name": "DedicatedWorker thread"
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.present.ledger",
+   "pid": 1,
+   "tid": 10,
+   "ts": 999000,
+   "s": "t",
+   "args": {
+    "data": {
+     "presentSerial": 1,
+     "guestPresentSerial": 1
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1000000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 1
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1004000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 1
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1016000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 2
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1020000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 2
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1032000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 3
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1036000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 3
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1048000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 4
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1060000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 4
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1064000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 5
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1068000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 5
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1080000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 6
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1084000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 6
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1096000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 7
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1100000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 7
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1112000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 8
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1120000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 8
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1128000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 9
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.present.ledger",
+   "pid": 1,
+   "tid": 10,
+   "ts": 1129000,
+   "s": "t",
+   "args": {
+    "data": {
+     "presentSerial": 9,
+     "guestPresentSerial": 9
+    }
+   }
+  },
+  {
+   "ph": "I",
+   "cat": "blink.user_timing",
+   "name": "bottleship.flip",
+   "pid": 1,
+   "tid": 20,
+   "ts": 1132000,
+   "s": "t",
+   "args": {
+    "data": {
+     "serial": 9
+    }
+   }
+  }
+ ]
+}

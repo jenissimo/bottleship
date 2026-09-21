@@ -116,6 +116,9 @@ interface RenderFrameAnalysis {
   budgetMs?: number;
   /** Set when --range narrowed these intervals, so the header can say so. */
   scopedTo?: string;
+  /** `pid:tid` of the thread that emitted these marks — frames belong to a thread, not a trace. */
+  threadKey?: string;
+  threadLabel?: string;
 }
 
 const TIMELINE_BUCKET_US = 2_000_000;
@@ -430,27 +433,148 @@ function computeRenderFrameStats(intervals: RenderFrameInterval[], budgetMs?: nu
   return frameTailFromSamples(intervals.map(i => i.frameMs), { budgetMs, maxBuckets: 24 });
 }
 
-function extractRenderFrameAnalysis(events: TraceEvent[], budgetMs?: number): RenderFrameAnalysis | null {
-  const marks = events
-    .filter(ev => (ev as any)?.name === "bottleship.flip" && Number.isFinite((ev as any).ts))
-    .map(ev => (ev as any).ts as number)
-    .sort((a, b) => a - b);
+/**
+ * A single `bottleship.flip` UserTiming mark. `serial` is the app's present serial when the
+ * mark carries one (`args.data.serial` / `presentSerial` / `guestPresentSerial`); a trace whose
+ * marks carry no serial can still be timed, it just cannot be ledger-checked.
+ */
+interface FlipMark {
+  tsUs: number;
+  serial: number | null;
+}
 
+/** One thread's flip marks. Threads are never merged: two threads presenting into one sorted
+ *  interval list halves every interval and doubles the FPS, and nothing downstream notices. */
+interface FlipSeries {
+  key: string;
+  pid: number;
+  tid: number;
+  label: string;
+  marks: FlipMark[];
+  analysis: RenderFrameAnalysis | null;
+}
+
+/**
+ * Presents counted from the ledger mark, as a SPAN over the trace window.
+ *
+ * The fields the mark carries are monotonic SERIALS, and a serial is not a count: a window
+ * that opens at present 5000 and holds nine frames carries serial 5008, which against nine
+ * flip marks reads as 4999 missing frames on a perfectly healthy trace. Only last - first + 1
+ * is a count of this window, so a single sample yields `null` and is reported as uncheckable
+ * rather than compared.
+ */
+interface PresentLedger {
+  guestSpan: number | null;
+  presentsSpan: number | null;
+  guestSamples: number;
+  presentSamples: number;
+  source: string;
+}
+
+interface FlipLedgerRow {
+  key: string;
+  label: string;
+  markCount: number;
+  /** maxSerial - minSerial + 1: how many presents the app numbered across this series' span. */
+  serialSpan: number | null;
+  /** serialSpan - markCount: presents that happened without a mark reaching this series. */
+  missing: number | null;
+}
+
+interface FlipLedger {
+  rows: FlipLedgerRow[];
+  guest: PresentLedger | null;
+  presenterKey: string | null;
+  /** Non-empty => the report must refuse to quote a single frame count. */
+  divergences: string[];
+  /** What the ledger could NOT check, named — so an agreement line never covers for it. */
+  notes: string[];
+  /** Named reason when no ledger source exists, so silence is never mistaken for agreement. */
+  unavailable: string | null;
+}
+
+const FLIP_MARK = "bottleship.flip";
+/** Guest-side present count. Emitted next to the flip mark by whichever thread drives present;
+ *  the flip mark itself only says "a frame reached the screen on THIS thread". */
+const PRESENT_LEDGER_MARK = "bottleship.present.ledger";
+
+function markSerial(ev: TraceEvent): number | null {
+  const d = ev.args?.data as Record<string, unknown> | undefined;
+  if (!d) return null;
+  for (const k of ["serial", "presentSerial", "guestSerial", "guestPresentSerial"]) {
+    const v = d[k];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+/** Flip marks grouped by the thread that emitted them — same `pid:tid` key space as
+ *  extractThreadNames and the remapped profile chunks, so the three join without re-parsing. */
+function extractFlipSeries(events: TraceEvent[], threadNames: Map<string, string>): FlipSeries[] {
+  const byThread = new Map<string, FlipSeries>();
+  for (const ev of events) {
+    if (ev.name !== FLIP_MARK || !Number.isFinite(ev.ts)) continue;
+    const key = `${ev.pid}:${ev.tid}`;
+    let s = byThread.get(key);
+    if (!s) {
+      s = { key, pid: ev.pid, tid: ev.tid, label: threadNames.get(key) ?? `Thread ${key}`, marks: [], analysis: null };
+      byThread.set(key, s);
+    }
+    s.marks.push({ tsUs: ev.ts, serial: markSerial(ev) });
+  }
+  const list = [...byThread.values()];
+  for (const s of list) s.marks.sort((a, b) => a.tsUs - b.tsUs);
+  // Most marks first: that series is the one that actually put frames on the screen.
+  list.sort((a, b) => b.marks.length - a.marks.length || a.key.localeCompare(b.key));
+  return list;
+}
+
+const LEDGER_GUEST_KEYS = ["guestPresentSerial", "guestSerial", "guestPresents"] as const;
+const LEDGER_PRESENT_KEYS = ["presentSerial", "serial", "presents"] as const;
+
+export function extractPresentLedger(events: TraceEvent[]): PresentLedger | null {
+  let seen = false;
+  const g = { min: Infinity, max: -Infinity, n: 0 };
+  const p = { min: Infinity, max: -Infinity, n: 0 };
+  const note = (acc: typeof g, v: number) => { acc.min = Math.min(acc.min, v); acc.max = Math.max(acc.max, v); acc.n++; };
+  for (const ev of events) {
+    if (ev.name !== PRESENT_LEDGER_MARK) continue;
+    const d = ev.args?.data as Record<string, unknown> | undefined;
+    if (!d) continue;
+    seen = true;
+    const pick = (keys: readonly string[]) => {
+      for (const k of keys) {
+        const v = d[k];
+        if (typeof v === "number" && Number.isFinite(v)) return v;
+      }
+      return null;
+    };
+    const gv = pick(LEDGER_GUEST_KEYS);
+    const pv = pick(LEDGER_PRESENT_KEYS);
+    if (gv !== null) note(g, gv);
+    if (pv !== null) note(p, pv);
+  }
+  // Two samples are the minimum that makes a window count; see PresentLedger.
+  const span = (acc: typeof g) => (acc.n >= 2 ? acc.max - acc.min + 1 : null);
+  return seen
+    ? { guestSpan: span(g), presentsSpan: span(p), guestSamples: g.n, presentSamples: p.n, source: PRESENT_LEDGER_MARK }
+    : null;
+}
+
+function analysisFromMarks(
+  marks: FlipMark[],
+  budgetMs: number | undefined,
+  meta: { key: string; label: string; scopedTo?: string }
+): RenderFrameAnalysis | null {
   if (marks.length < 2) return null;
-
   const intervals: RenderFrameInterval[] = [];
   for (let i = 1; i < marks.length; i++) {
-    const startTsUs = marks[i - 1]!;
-    const endTsUs = marks[i]!;
+    const startTsUs = marks[i - 1]!.tsUs;
+    const endTsUs = marks[i]!.tsUs;
     const deltaUs = endTsUs - startTsUs;
     if (!(deltaUs > 0) || !Number.isFinite(deltaUs)) continue;
-    intervals.push({
-      startTsUs,
-      endTsUs,
-      frameMs: deltaUs / 1000,
-    });
+    intervals.push({ startTsUs, endTsUs, frameMs: deltaUs / 1000 });
   }
-
   if (intervals.length === 0) return null;
   const stats = computeRenderFrameStats(intervals, budgetMs);
   return {
@@ -459,7 +583,108 @@ function extractRenderFrameAnalysis(events: TraceEvent[], budgetMs?: number): Re
     stats,
     // Budget actually used: explicit, or the one the distribution derived from this window.
     budgetMs: budgetMs ?? (stats.ok && stats.budget ? stats.budget.ms : undefined),
+    threadKey: meta.key,
+    threadLabel: meta.label,
+    scopedTo: meta.scopedTo,
   };
+}
+
+/**
+ * One timescale for every thread: the budget is derived ONCE from the presenting series and
+ * then imposed on the others. A per-series derived budget would give each thread its own
+ * definition of "over budget" and make the columns silently incomparable.
+ */
+export function buildFlipSeries(
+  events: TraceEvent[],
+  threadNames: Map<string, string>,
+  budgetMs?: number
+): FlipSeries[] {
+  const series = extractFlipSeries(events, threadNames);
+  if (series.length === 0) return series;
+  const presenter = series[0]!;
+  presenter.analysis = analysisFromMarks(presenter.marks, budgetMs, presenter);
+  const shared = budgetMs ?? presenter.analysis?.budgetMs;
+  for (const s of series.slice(1)) s.analysis = analysisFromMarks(s.marks, shared, s);
+  return series;
+}
+
+/**
+ * The ledger: frames that reached the screen versus presents the app says it made. A
+ * best-effort single number here is the exact failure this instrument exists to prevent — a
+ * render thread that drops every second present still produces a perfectly plausible p50.
+ */
+export function computeFlipLedger(series: FlipSeries[], guest: PresentLedger | null): FlipLedger {
+  const tidOf = (key: string) => key.split(":")[1] ?? "?";
+  const rows: FlipLedgerRow[] = series.map(s => {
+    const serials = s.marks.map(m => m.serial).filter((v): v is number => v !== null);
+    // Reduced, not spread: a long trace carries tens of thousands of marks and the argument
+    // limit would turn a healthy series into a RangeError.
+    let lo = Infinity, hi = -Infinity;
+    for (const v of serials) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    const serialSpan = serials.length >= 2 ? hi - lo + 1 : null;
+    return {
+      key: s.key,
+      label: s.label,
+      markCount: s.marks.length,
+      serialSpan,
+      missing: serialSpan === null ? null : serialSpan - s.marks.length,
+    };
+  });
+
+  const divergences: string[] = [];
+  for (const r of rows) {
+    if (r.missing !== null && r.missing !== 0) {
+      divergences.push(
+        `${r.label} (tid ${tidOf(r.key)}): ${r.markCount} flip marks but present serials span ${r.serialSpan}` +
+        ` — ${r.missing > 0 ? `${r.missing} present(s) never reached this thread` : `${-r.missing} more marks than serials (duplicated marks)`}`
+      );
+    }
+  }
+
+  const presenter = rows[0] ?? null;
+  const notes: string[] = [];
+  // The guest's own count is the independent oracle. `presentSerial` is the render side's own
+  // counter, so falling back to it is a self-comparison and is labelled as one rather than
+  // passed off as the guest's.
+  const guestCount = guest?.guestSpan ?? guest?.presentsSpan ?? null;
+  const countKind = guest?.guestSpan !== null && guest?.guestSpan !== undefined
+    ? "guest-side present count"
+    : "RENDER-side present count (not the guest's — no guest serial in the ledger mark, so this compares the presenting thread against itself)";
+  if (guest && guestCount === null) {
+    const samples = Math.max(guest.guestSamples, guest.presentSamples);
+    notes.push(samples === 0
+      ? `${guest.source} carries no present count under any name this tool reads`
+        + ` (${[...LEDGER_GUEST_KEYS, ...LEDGER_PRESENT_KEYS].join(", ")}) — the guest side was NOT checked.`
+      : `${guest.source} has a single sample: one absolute serial cannot say how many presents this`
+        + ` window covers, so the guest side was NOT checked. Emit the mark per present.`);
+  }
+  if (presenter && guestCount !== null && guestCount !== presenter.markCount) {
+    divergences.push(
+      `${countKind} ${guestCount} (${guest!.source}) != ${presenter.markCount} flip marks on the presenting thread` +
+      ` ${presenter.label} (tid ${tidOf(presenter.key)}) — ${Math.abs(guestCount - presenter.markCount)} frame(s) unaccounted for`
+    );
+  }
+  if (rows.length > 1) {
+    const counts = rows.map(r => r.markCount);
+    if (Math.max(...counts) !== Math.min(...counts)) {
+      divergences.push(
+        `flip marks are split across ${rows.length} threads with unequal counts (` +
+        `${rows.map(r => `tid ${tidOf(r.key)}: ${r.markCount}`).join(", ")}) — no single FPS number describes this trace`
+      );
+    }
+  }
+
+  // Nothing comparable on either side is UNAVAILABLE, never agreement — a ledger mark whose
+  // field names drifted away from the ones read above yields no number at all, and an "OK"
+  // printed over that is a false assurance about a check that never ran.
+  const unavailable = guestCount === null && rows.every(r => r.serialSpan === null)
+    ? (guest === null
+        ? `no guest-side present count in this trace: neither a ${PRESENT_LEDGER_MARK} mark nor a serial on the ${FLIP_MARK} marks.`
+        : `${notes[0] ?? `${guest.source} yielded no usable count`} No ${FLIP_MARK} mark carries a serial either.`)
+      + ` Frame counts below are what REACHED a thread, and cannot be checked against what the app presented.`
+    : null;
+
+  return { rows, guest, presenterKey: presenter?.key ?? null, divergences, notes, unavailable };
 }
 
 function renderStatsForBucket(
@@ -509,7 +734,7 @@ function attributeRange(profile: MergedProfile, startTsUs: number, endTsUs: numb
   return { totalUs, byCategory, top, coveragePct: Math.min(100, (totalUs / spanUs) * 100) };
 }
 
-function extractThreadNames(events: TraceEvent[]): Map<string, string> {
+export function extractThreadNames(events: TraceEvent[]): Map<string, string> {
   const names = new Map<string, string>();
   for (const ev of events) {
     if (ev.ph === "M" && ev.name === "thread_name" && ev.args?.name) {
@@ -722,7 +947,7 @@ function sliceProfileByRange(
   };
 }
 
-function analyzeThread(
+export function analyzeThread(
   key: string,
   name: string,
   profile: MergedProfile
@@ -839,6 +1064,105 @@ function aggregateCallersForLeaf(
     byCaller.set(caller, (byCaller.get(caller) ?? 0) + dt);
   }
   return byCaller;
+}
+
+// ─── v86 view() Proxy rollup (--proxy) ────────────────────────────────────────
+//
+// v86 hands guest RAM and the CPU state block out as `view()` Proxies
+// (vendor/v86/src/lib.js), so every element access is a trap: a `get`/`set` frame plus the
+// `resolve` closure. In a profile those land under their own names, in v86's own file, with
+// the CALLER — the thing that would have to change — one or more frames up.
+//
+// This folds every such frame into its nearest non-v86 ancestor and reports the share.
+// That share is the independent oracle for a Proxy-removal A/B: it is measured from stack
+// frames, not from FPS, so it cannot move because the two arms happened to be looking at
+// different scenes (§3.4 — an A/B needs a counter the picture cannot fake).
+
+/** A frame that IS the Proxy machinery, not a caller of it. */
+function isProxyFrame(frame: CallFrame): boolean {
+  const url = frame.url ?? "";
+  if (!/libv86|\/v86|v86\.mjs|lib\.js/.test(url)) return false;
+  const fn = frame.functionName ?? "";
+  return fn === "get" || fn === "set" || fn === "resolve" || fn === "get buffer"
+    || fn === "" || fn.startsWith("get ") || fn.startsWith("set ");
+}
+
+/** Any frame inside v86's own JS — an ancestor here is still not OUR caller. */
+function isV86JsFrame(frame: CallFrame): boolean {
+  return /libv86|\/v86|v86\.mjs/.test(frame.url ?? "");
+}
+
+interface ProxyRollupRow { owner: string; us: number; samples: number }
+
+function reportProxyRollup(a: ThreadAnalysis): string {
+  const byOwner = new Map<string, ProxyRollupRow>();
+  let proxyUs = 0;
+  let proxySamples = 0;
+
+  for (let i = 0; i < a.profile.samples.length; i++) {
+    const leafId = a.profile.samples[i]!;
+    const dt = a.profile.timeDeltas[i] ?? 0;
+    if (dt <= 0) continue;
+    const leaf = a.profile.nodes.get(leafId);
+    if (!leaf || !isProxyFrame(leaf.callFrame)) continue;
+
+    proxyUs += dt;
+    proxySamples++;
+
+    // Nearest ancestor that is neither Proxy machinery nor any other v86-internal frame:
+    // attributing to `resolve`'s parent `get` would name the trap twice and the caller never.
+    let owner = "(entry / no stack)";
+    let cur: number | undefined = a.parentMap.get(leafId);
+    const seen = new Set<number>([leafId]);
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur);
+      const n = a.profile.nodes.get(cur);
+      const name = n?.callFrame.functionName;
+      if (n && name && name !== "(root)" && name !== "(program)" && name !== "(idle)"
+          && name !== "(garbage collector)" && !isV86JsFrame(n.callFrame)) {
+        owner = frameLabel(n.callFrame, false);
+        break;
+      }
+      cur = a.parentMap.get(cur);
+    }
+    const row = byOwner.get(owner) ?? { owner, us: 0, samples: 0 };
+    row.us += dt;
+    row.samples++;
+    byOwner.set(owner, row);
+  }
+
+  const lines: string[] = [];
+  lines.push(`\n${sep("═")}`);
+  lines.push(`v86 view() PROXY TRAPS — ${a.name}`);
+  lines.push(sep("═"));
+  if (proxySamples === 0) {
+    // A zero here is only meaningful if the sampler could have seen one at all.
+    lines.push(`  0 samples landed in a v86 view() Proxy frame.`);
+    lines.push(`  Either the hot paths no longer index one, or this trace has no worker JS samples`);
+    lines.push(`  at all (${a.sampleCount} samples, ${fmtUs(a.totalUs)} total) — check the thread report above`);
+    lines.push(`  before reading this as "the Proxy cost is gone".`);
+    return lines.join("\n");
+  }
+  // Two denominators, because one of them is misleading on its own: this thread is mostly
+  // JIT-executed guest code, so a share of the WHOLE thread makes any JS cost look like
+  // rounding. The share of the JS bucket is what a JS-side change can actually move.
+  const jsUs = a.byCategory.js;
+  lines.push(`  ${fmtUs(proxyUs)} in Proxy machinery over ${num(proxySamples)} samples:`);
+  lines.push(`    ${pct(proxyUs, a.totalUs)} of the whole thread (mostly JIT-executed guest code), and`);
+  lines.push(`    ${jsUs > 0 ? pct(proxyUs, jsUs) : "n/a"} of its JS bucket (${fmtUs(jsUs)}) — the share a JS-side change can move.`);
+  lines.push(`  Attributed to the nearest caller OUTSIDE v86's own JS — that is the code that would change.`);
+  // A sampling profiler sees a trap only when a sample lands INSIDE it. A get trap is a few
+  // dozen nanoseconds, so most of them are never on top of the stack when the sampler fires
+  // and are charged to the caller instead. Treat every number here as a LOWER BOUND.
+  lines.push(`  LOWER BOUND: a sampler only catches a trap it lands inside; short traps are charged to the caller.`);
+  lines.push("");
+  lines.push(`  ${pad("caller", 54, true)} ${pad("time", 10)} ${pad("share", 8)}`);
+  lines.push(`  ${"─".repeat(54)} ${"─".repeat(10)} ${"─".repeat(8)}`);
+  const rows = [...byOwner.values()].sort((x, y) => y.us - x.us).slice(0, 20);
+  for (const r of rows) {
+    lines.push(`  ${pad(r.owner.slice(0, 54), 54, true)} ${pad(fmtUs(r.us), 10)} ${pad(pct(r.us, proxyUs), 8)}`);
+  }
+  return lines.join("\n");
 }
 
 // ─── Timeline ─────────────────────────────────────────────────────────────────
@@ -1213,39 +1537,118 @@ function fmtTail(ms: number | null): string {
   return ms === null ? "n/a" : fmtFrameMs(ms);
 }
 
-function reportRenderFrames(renderFrames: RenderFrameAnalysis | null): string | null {
-  if (!renderFrames) return null;
+/**
+ * RENDER FRAME TIMING — one block per thread that emitted flip marks, all on ONE budget.
+ *
+ * Frames belong to the thread that presented them. A render worker and the guest worker both
+ * appear as "DedicatedWorker thread" and both classify as role "worker", so the only honest
+ * label is the tid plus what the trace observed; the presenting thread is simply the one whose
+ * marks are most numerous, and it is named as such rather than assumed.
+ */
+export function reportRenderFrames(series: FlipSeries[]): string | null {
+  const withMarks = series.filter(s => s.marks.length > 0);
+  if (withMarks.length === 0) return null;
 
-  const s = renderFrames.stats;
   const lines: string[] = [];
   lines.push(`\n${sep("═")}`);
   lines.push(`RENDER FRAME TIMING`);
   lines.push(sep("═"));
-  lines.push(`Source: bottleship.flip UserTiming marks (app-level present cadence)`
-    + (renderFrames.scopedTo ? `  [scoped to --range ${renderFrames.scopedTo}]` : ""));
-  lines.push(`Marks: ${num(renderFrames.markCount)}  Intervals: ${num(s.sampleCount)}`);
-  if (!s.ok) {
-    lines.push(`No distribution: ${s.status} — ${s.note}`);
-    return lines.join("\n");
+  const scopedTo = withMarks.find(s => s.analysis?.scopedTo)?.analysis?.scopedTo;
+  lines.push(`Source: ${FLIP_MARK} UserTiming marks (app-level present cadence)`
+    + (scopedTo ? `  [scoped to --range ${scopedTo}]` : ""));
+  const presenter = withMarks[0]!;
+  const tied = withMarks.filter(s => s.marks.length === presenter.marks.length).length;
+  if (withMarks.length > 1) {
+    lines.push(`${withMarks.length} threads emitted flip marks. They are NEVER merged: one sorted interval list`);
+    lines.push(`over two threads halves every interval and doubles the FPS. Presenting thread (most marks):`);
+    lines.push(`  ${presenter.label} (tid ${presenter.tid}) — ${num(presenter.marks.length)} marks.`);
+    // A trace carries no role discriminator: both workers are "DedicatedWorker thread" and both
+    // classify as role "worker". On a tie the pick is tid order and says so rather than implying
+    // the tool knows which thread owned the screen.
+    if (tied > 1) {
+      lines.push(`  NOTE: ${tied} threads tie on mark count — "PRESENTED" is tid order here, not an observation.`);
+    }
   }
-  lines.push(
-    `Avg: ${fmtFrameMs(s.meanMs)} (${(s.meanMs > 0 ? 1000 / s.meanMs : 0).toFixed(1)} FPS)  ` +
-    `P50: ${fmtTail(s.p50Ms)}  P95: ${fmtTail(s.p95Ms)}  ` +
-    `P99: ${fmtTail(s.p99Ms)}  Max: ${fmtFrameMs(s.maxMs)}`
-  );
-  lines.push(`  (percentiles are bucket UPPER BOUNDS, same definition as the live harness frameReport)`);
-  for (const why of s.unavailable) lines.push(`  ${why}`);
-  if (s.budget) {
-    const b = s.budget;
+
+  for (const s of withMarks) {
+    const a = s.analysis;
+    lines.push(``);
+    lines.push(`[${s.key === presenter.key ? "PRESENTED" : "also flipping"}] ${s.label} (tid ${s.tid})`);
+    if (!a) {
+      lines.push(`  Marks: ${num(s.marks.length)} — too few for an interval distribution (need >= 2).`);
+      continue;
+    }
+    const st = a.stats;
+    lines.push(`  Marks: ${num(a.markCount)}  Intervals: ${num(st.sampleCount)}`);
+    if (!st.ok) {
+      lines.push(`  No distribution: ${st.status} — ${st.note}`);
+      continue;
+    }
     lines.push(
-      `Budget ${fmtFrameMs(b.ms)} (${b.source}): over ${num(b.overFrames)} (${b.overPct.toFixed(1)}%)  ` +
-      `>2x budget: ${num(b.over2xFrames)}  lost ~${b.excessMsApprox.toFixed(0)}ms  p99/budget: ${b.p99OverBudget ?? "n/a"}`
+      `  Avg: ${fmtFrameMs(st.meanMs)} (${(st.meanMs > 0 ? 1000 / st.meanMs : 0).toFixed(1)} FPS)  ` +
+      `P50: ${fmtTail(st.p50Ms)}  P95: ${fmtTail(st.p95Ms)}  ` +
+      `P99: ${fmtTail(st.p99Ms)}  Max: ${fmtFrameMs(st.maxMs)}`
     );
-    if (b.straddleFrames > 0) lines.push(`  ${num(b.straddleFrames)} frames sit in the bucket the budget falls inside (unclassifiable either way)`);
-  } else if (s.budgetNote) {
-    lines.push(`Budget: ${s.budgetNote}`);
+    for (const why of st.unavailable) lines.push(`    ${why}`);
+    if (st.budget) {
+      const b = st.budget;
+      lines.push(
+        `  Budget ${fmtFrameMs(b.ms)} (${b.source}): over ${num(b.overFrames)} (${b.overPct.toFixed(1)}%)  ` +
+        `>2x budget: ${num(b.over2xFrames)}  lost ~${b.excessMsApprox.toFixed(0)}ms  p99/budget: ${b.p99OverBudget ?? "n/a"}`
+      );
+      if (b.straddleFrames > 0) lines.push(`    ${num(b.straddleFrames)} frames sit in the bucket the budget falls inside (unclassifiable either way)`);
+    } else if (st.budgetNote) {
+      lines.push(`  Budget: ${st.budgetNote}`);
+    }
+  }
+  lines.push(`  (percentiles are bucket UPPER BOUNDS, same definition as the live harness frameReport)`);
+  if (withMarks.length > 1) {
+    lines.push(`  (every block above is judged against the presenting thread's budget, so the two are on one scale)`);
   }
   lines.push(`  --budget-ms <n> to judge against the title's own cadence instead of the derived one.`);
+  return lines.join("\n");
+}
+
+/**
+ * FRAME LEDGER — what reached the screen against what the app says it presented.
+ *
+ * The check that makes the frame numbers above quotable: percentiles over a series that is
+ * missing half its presents look entirely healthy. A divergence is printed LOUD and the single
+ * FPS number is explicitly refused; an absent ledger source prints its own named reason.
+ */
+export function reportFlipLedger(ledger: FlipLedger): string {
+  const lines: string[] = [];
+  lines.push(`\n${sep("═")}`);
+  lines.push(`FRAME LEDGER CROSS-CHECK (presented vs guest-side present count)`);
+  lines.push(sep("═"));
+  lines.push(` ${pad("thread", 40)} ${pad("marks", 8, true)} ${pad("serials", 9, true)} ${pad("missing", 8, true)}`);
+  for (const r of ledger.rows) {
+    lines.push(` ${pad(`${r.label} (tid ${r.key.split(":")[1]})`, 40)} ${pad(num(r.markCount), 8, true)} ` +
+      `${pad(r.serialSpan === null ? "n/a" : num(r.serialSpan), 9, true)} ${pad(r.missing === null ? "n/a" : num(r.missing), 8, true)}`);
+  }
+  if (ledger.guest) {
+    lines.push(`Guest-side ledger (${ledger.guest.source}): presents in window=${ledger.guest.presentsSpan ?? "n/a"}` +
+      `  guest presents in window=${ledger.guest.guestSpan ?? "n/a"}` +
+      `  (spans over ${ledger.guest.guestSamples || ledger.guest.presentSamples} sample(s); a span, not a serial)`);
+  }
+  // Notes come BEFORE the verdict: what was not checked has to be read together with it.
+  for (const n of ledger.notes) lines.push(`NOT CHECKED: ${n}`);
+  if (ledger.unavailable) {
+    lines.push(`LEDGER UNAVAILABLE: ${ledger.unavailable}`);
+    return lines.join("\n");
+  }
+  if (ledger.divergences.length === 0) {
+    const checked = ledger.rows.some(r => r.serialSpan !== null) ? "per-thread serial spans" : "";
+    const guestChecked = ledger.guest && (ledger.guest.guestSpan !== null || ledger.guest.presentsSpan !== null)
+      ? "the ledger mark's present count" : "";
+    lines.push(`LEDGER OK: ${[checked, guestChecked].filter(Boolean).join(" and ")} agree with the flip marks.`);
+    return lines.join("\n");
+  }
+  lines.push(``);
+  lines.push(`!!! LEDGER DIVERGENCE — frame counts below do NOT describe the same work !!!`);
+  for (const d of ledger.divergences) lines.push(`  !!! ${d}`);
+  lines.push(`  REFUSED: a single FPS / p50 for this trace. Frames that never reached the presenting`);
+  lines.push(`  thread are invisible to an inter-mark distribution, which stays plausible while halving.`);
   return lines.join("\n");
 }
 
@@ -1812,6 +2215,280 @@ function classifyThreadRole(name: string): "worker" | "main" | "audio" | "other"
  *   - before/after attribution: JIT noise is bracketed by wasm-function[N]/main_loop/
  *     jit_find_cache_*; real GPU/IO wait would be bracketed by writeBuffer/submit/Atomics.
  */
+/** The three dispatcher regions a JS self-sample can sit in, in the order they are reported. */
+const DISPATCHER_REGIONS = [
+  "under drainWriteBuffer",
+  "under the boundary, outside the drain",
+  "outside the boundary",
+] as const;
+type DispatcherRegion = typeof DISPATCHER_REGIONS[number];
+
+interface DeferrableCensus {
+  totalUs: number;
+  /** Self-time the profiler attributed to the idle family — the gap between the two denominators. */
+  idleUs: number;
+  busyUs: number;
+  bucketUs: number;
+  /** The ceiling: JS self-time under the ring drain or the D3D9 executor's frame walk. */
+  offGuestUs: number;
+  /**
+   * The ceiling split by WHICH SIDE of the render-worker boundary the work would land on.
+   * `offGuestUs` answers "is this work the guest is already done waiting for"; these two
+   * answer "would moving the executor take it away", which is the question a placement plan
+   * is actually costed against. They differ by an order of magnitude — the drain region IS
+   * the recorder, and a recorder stays on the guest thread. Reporting only the union is how
+   * render-worker-plan-2026-09-11 came to quote a ceiling 3-5x its own scope.
+   */
+  movesUs: number;
+  keepsUs: number;
+  byRegion: Map<DispatcherRegion, number>;
+  drainLeaves: Map<string, number>;
+  outsideLeaves: Map<string, number>;
+}
+
+/**
+ * The modules a render worker would own (render-worker-plan-2026-09-11 SS4). Everything else
+ * in the deferrable region is recorder/shadow state, which stays with the guest thread.
+ */
+const RENDER_WORKER_SIDE = [
+  /d3d9-backend-executor/, /webgpu-backend/, /post-fx-chain/, /presenter/,
+  /frame-interpolator/, /gpu-device-lifecycle/,
+];
+
+function jsOwnerFileOf(f: CallFrame): string {
+  const url = f.url ?? "";
+  if (!url) return "(no url)";
+  const parts = url.split('/');
+  const base = parts[parts.length - 1]!.split(String.fromCharCode(92)).pop() ?? url;
+  return base.split("?")[0] || base;
+}
+
+/**
+ * The DEFERRABLE census — work that runs on the guest thread and owes the guest no
+ * synchronous answer (the Tier-0 ring drain plus the D3D9 executor's frame walk, which runs
+ * after the guest has already been told S_OK). It is the CEILING for moving the D3D9 half to
+ * its own worker: perfect overlap, no fence priced.
+ *
+ * Pure, and separate from the printing, because the number it produces is quoted in planning
+ * documents in BOTH denominators — a figure whose denominator is ambiguous is the failure this
+ * file exists to prevent, and a figure nothing can assert on is untestable.
+ */
+export function computeDeferrable(analysis: ThreadAnalysis): DeferrableCensus {
+  const totalUs = analysis.totalUs;
+  const idleUs = analysis.nodes
+    .filter(ns => optBucket(ns.node.callFrame) === "idle")
+    .reduce((a, ns) => a + ns.selfUs, 0);
+  const busyUs = Math.max(1, totalUs - idleUs);
+
+  // The bucket under study, by the same classifier the roll-up uses — so the two cannot drift.
+  const isJsBucket = (n: RawNode) => optBucket(n.callFrame) === "JS HLE + glue";
+  let bucketUs = 0;
+  for (const ns of analysis.nodes) if (isJsBucket(ns.node)) bucketUs += ns.selfUs;
+
+  // Walked per SAMPLE, not per node: the same function can appear under different
+  // ancestors, and only the sample knows which stack it was on.
+  const nameOf = (id: number) => analysis.profile.nodes.get(id)?.callFrame?.functionName ?? "";
+  const byRegion = new Map<DispatcherRegion, number>();
+  const outsideLeaves = new Map<string, number>();
+  const drainLeaves = new Map<string, number>();
+  let offGuestUs = 0, movesUs = 0, keepsUs = 0;
+  for (let i = 0; i < analysis.profile.samples.length; i++) {
+    const leafId = analysis.profile.samples[i]!;
+    const leaf = analysis.profile.nodes.get(leafId);
+    if (!leaf || !isJsBucket(leaf)) continue;
+    const dt = analysis.profile.timeDeltas[i] ?? 0;
+    if (dt <= 0) continue;
+    // Walk to the root looking for the two markers. The drain is nested inside the
+    // boundary, so it is checked first and wins.
+    let cur: number | undefined = leafId;
+    const seen = new Set<number>();
+    let inDrain = false, inBoundary = false, inMoves = false;
+    // Walked to the ROOT, never broken early: the executor can sit under the drain, and a
+    // walk that stops at the first marker cannot tell the two sides of the boundary apart.
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur);
+      const nm = nameOf(cur);
+      const file = jsOwnerFileOf(analysis.profile.nodes.get(cur)!.callFrame);
+      if (RENDER_WORKER_SIDE.some(re => re.test(file))) inMoves = true;
+      if (nm === "drainWriteBuffer") inDrain = true;
+      if (nm === "handlePortWrite" || nm === "_handlePortWriteSlow") inBoundary = true;
+      cur = analysis.parentMap.get(cur);
+    }
+    const region: DispatcherRegion = inDrain ? DISPATCHER_REGIONS[0] : inBoundary ? DISPATCHER_REGIONS[1] : DISPATCHER_REGIONS[2];
+    byRegion.set(region, (byRegion.get(region) ?? 0) + dt);
+    if (inDrain || inMoves) offGuestUs += dt;
+    if (inMoves) movesUs += dt; else if (inDrain) keepsUs += dt;
+    const lf = `${leaf.callFrame.functionName || "(anonymous)"} @ ${jsOwnerFileOf(leaf.callFrame)}`;
+    if (region === DISPATCHER_REGIONS[2]) outsideLeaves.set(lf, (outsideLeaves.get(lf) ?? 0) + dt);
+    if (region === DISPATCHER_REGIONS[0]) drainLeaves.set(lf, (drainLeaves.get(lf) ?? 0) + dt);
+  }
+
+  return { totalUs, idleUs, busyUs, bucketUs, offGuestUs, movesUs, keepsUs, byRegion, drainLeaves, outsideLeaves };
+}
+
+/**
+ * --js-owners: split the "JS HLE + glue" bucket into owners.
+ *
+ * Two independent cuts of the same self-time, because they answer different questions and a
+ * disagreement between them is informative:
+ *
+ *  (A) BY FILE — every JS self sample belongs to exactly one source file, so this sums to the
+ *      bucket with no inclusive-time double counting. This is the owner list.
+ *  (B) BY DISPATCHER REGION — for each JS self sample, whether it sits under drainWriteBuffer
+ *      (the Tier-0 ring drain, which runs BEFORE the thunk timer is started), under
+ *      handlePortWrite but outside the drain, or outside the boundary entirely. This is the
+ *      timed-versus-untimed split that `perfStats` structurally cannot see, so it is what
+ *      reconciles the frame profiler's `thunk` category against this bucket.
+ *
+ * The unattributed remainder is printed with its own top leaves rather than left as a
+ * residual: a bucket that cannot name its tail is the thing this file exists to prevent.
+ */
+function reportJsOwners(analysis: ThreadAnalysis): void {
+  const total = analysis.totalUs;
+  if (total === 0) {
+    console.log(`JS OWNERS: no sampled time on ${analysis.name} — nothing to split.`);
+    return;
+  }
+  const census = computeDeferrable(analysis);
+  const { idleUs, busyUs: busy, bucketUs } = census;
+  const isJsBucket = (n: RawNode) => optBucket(n.callFrame) === "JS HLE + glue";
+  if (bucketUs === 0) {
+    console.log(`JS OWNERS: the "JS HLE + glue" bucket is empty on ${analysis.name} — no owners to name.`);
+    return;
+  }
+  const fileOf = jsOwnerFileOf;
+
+  // ── (A) by file, and within a file by function ──────────────────────────────
+  const byFile = new Map<string, number>();
+  const byFileFn = new Map<string, Map<string, number>>();
+  for (const ns of analysis.nodes) {
+    if (!isJsBucket(ns.node) || ns.selfUs <= 0) continue;
+    const file = fileOf(ns.node.callFrame);
+    byFile.set(file, (byFile.get(file) ?? 0) + ns.selfUs);
+    let fns = byFileFn.get(file);
+    if (!fns) { fns = new Map(); byFileFn.set(file, fns); }
+    const fn = ns.node.callFrame.functionName || "(anonymous)";
+    fns.set(fn, (fns.get(fn) ?? 0) + ns.selfUs);
+  }
+
+  console.log(sep());
+  console.log(`JS OWNERS — the "JS HLE + glue" bucket split by who owns the code`);
+  console.log(sep());
+  console.log(`Thread: ${analysis.name}   bucket ${fmtUs(bucketUs)} = ${pct(bucketUs, total)} of thread, ${pct(bucketUs, busy)} of busy`);
+  console.log(``);
+  console.log(`(A) BY FILE — self time, so these sum to the bucket (no inclusive double counting)`);
+  console.log(` ${pad("file", 34)} ${pad("self", 9, true)} ${pad("%thread", 8, true)} ${pad("%busy", 7, true)} ${pad("%bucket", 8, true)}`);
+  const files = [...byFile.entries()].sort((a, b) => b[1] - a[1]);
+  let shown = 0;
+  for (const [file, us] of files.slice(0, 14)) {
+    shown += us;
+    console.log(` ${pad(file, 34)} ${pad(fmtUs(us), 9, true)} ${pad(pct(us, total), 8, true)} ${pad(pct(us, busy), 7, true)} ${pad(pct(us, bucketUs), 8, true)}`);
+  }
+  if (files.length > 14) {
+    const rest = bucketUs - shown;
+    console.log(` ${pad(`(${files.length - 14} more files)`, 34)} ${pad(fmtUs(rest), 9, true)} ${pad(pct(rest, total), 8, true)} ${pad(pct(rest, busy), 7, true)} ${pad(pct(rest, bucketUs), 8, true)}`);
+  }
+  console.log(``);
+  console.log(`    top functions inside the three largest files:`);
+  for (const [file] of files.slice(0, 3)) {
+    const fns = [...(byFileFn.get(file) ?? new Map()).entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+    console.log(`    ${file}: ${fns.map(([n, u]) => `${n} ${pct(u, total)}`).join("  |  ")}`);
+  }
+
+  // ── (B) by dispatcher region ────────────────────────────────────────────────
+  // Regions, the DEFERRABLE ceiling and the leaf tallies all come from computeDeferrable, so
+  // the printed number and the asserted number are the same number.
+  const REGIONS = DISPATCHER_REGIONS;
+  const { byRegion, outsideLeaves, drainLeaves, offGuestUs } = census;
+
+  console.log(``);
+  console.log(`(B) BY DISPATCHER REGION — where in the boundary the work sits.`);
+  console.log(`    The Tier-0 ring drain runs BEFORE the thunk timer is armed, so everything`);
+  console.log(`    under it is invisible to the frame profiler's 'thunk' category by construction.`);
+  console.log(` ${pad("region", 42)} ${pad("self", 9, true)} ${pad("%thread", 8, true)} ${pad("%bucket", 8, true)}`);
+  for (const r of REGIONS) {
+    const us = byRegion.get(r) ?? 0;
+    console.log(` ${pad(r, 42)} ${pad(fmtUs(us), 9, true)} ${pad(pct(us, total), 8, true)} ${pad(pct(us, bucketUs), 8, true)}`);
+  }
+  const top = (m: Map<string, number>) =>
+    [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `${k} ${pct(v, total)}`).join("\n      ");
+  console.log(``);
+  console.log(`    DEFERRABLE — runs on the guest thread, owes the guest no synchronous answer`);
+  console.log(`    (the ring drain + the executor's frame walk, assuming perfect overlap and no fence)`);
+  // BOTH denominators, always, on one line: "% of thread" includes idle and "% of busy" does
+  // not, so a figure quoted without saying which one is unusable — and the gap between them is
+  // exactly the idle share, printed here so it needs no second run to recover.
+  console.log(`      ${fmtUs(offGuestUs)}  ${pct(offGuestUs, total)} of thread (incl. idle)  ` +
+    `${pct(offGuestUs, busy)} of busy  ${pct(offGuestUs, bucketUs)} of the JS bucket`);
+  // Deferrable is not the same question as movable, and the two answers differ by 3-5x. A
+  // placement plan is costed against MOVES alone; quoting the union overstates its own scope.
+  const { movesUs, keepsUs } = census;
+  console.log(`      of which, split by side of a render-worker boundary:`);
+  console.log(`        MOVES ${fmtUs(movesUs)}  ${pct(movesUs, total)} of thread  ${pct(movesUs, busy)} of busy` +
+    `   — executor, backend, postfx, presenter`);
+  console.log(`        KEEPS ${fmtUs(keepsUs)}  ${pct(keepsUs, total)} of thread  ${pct(keepsUs, busy)} of busy` +
+    `   — recorder + shadow state, stays with the guest`);
+  console.log(`      MOVES is the ceiling for a placement change; the union above is not.`);
+  console.log(`      idle on this thread: ${fmtUs(idleUs)} = ${pct(idleUs, total)} of thread ` +
+    `(the whole difference between the two denominators above)`);
+  console.log(``);
+  console.log(`    leaves OUTSIDE the boundary (the part no thunk timer could ever reach):`);
+  console.log(`      ${top(outsideLeaves) || "(none)"}`);
+  console.log(``);
+  console.log(`    leaves under the drain:`);
+  console.log(`      ${top(drainLeaves) || "(none)"}`);
+
+  // ── What would moving the boundary into Rust actually remove? ────────────────────────────
+  //
+  // "61% of our JS runs under drainWriteBuffer" is true and says nothing about where that time
+  // goes: the ring carries DRAWS as well as setters, so the whole per-draw D3D9 path is under it
+  // too. The architectural question — relocate the boundary, or remove redundant work — turns on
+  // splitting the region into the RING MACHINERY (dispatch, decode, shadow slots: cost that a
+  // Rust-resident ingest deletes) and everything it dispatches TO (payload, which still has to
+  // run somewhere, in some language).
+  //
+  // The machinery list is spelled out and PRINTED rather than inferred, because a classifier
+  // nobody can audit is how a plausible number gets attributed to the wrong cause. Everything
+  // not on the list is payload by default — the conservative direction for the claim being made,
+  // since it makes the relocatable share SMALLER.
+  const RING_MACHINERY = new Set([
+    "drainWriteBuffer", "handlePortWrite", "_handlePortWriteSlow", "writeShadowSlot",
+    "tryResetWbufHead", "write32", "io_port_write32", "readShadowSlot", "wbufDecode",
+  ]);
+  let machineryUs = 0, payloadUs = 0;
+  const machineryLeaves = new Map<string, number>();
+  for (const [lf, us] of drainLeaves) {
+    const fn = lf.split(" @ ")[0] ?? "";
+    if (RING_MACHINERY.has(fn)) { machineryUs += us; machineryLeaves.set(lf, us); }
+    else payloadUs += us;
+  }
+  const drainUs = byRegion.get(REGIONS[0]) ?? 0;
+  console.log(``);
+  console.log(`    THE DRAIN REGION SPLIT — ring machinery vs what it dispatches to`);
+  console.log(`    machinery names counted: ${[...RING_MACHINERY].join(", ")}`);
+  console.log(` ${pad("", 42)} ${pad("self", 9, true)} ${pad("%thread", 8, true)} ${pad("%drain", 8, true)}`);
+  console.log(` ${pad("ring machinery (relocatable)", 42)} ${pad(fmtUs(machineryUs), 9, true)} ${pad(pct(machineryUs, total), 8, true)} ${pad(pct(machineryUs, drainUs), 8, true)}`);
+  console.log(` ${pad("payload it dispatches to", 42)} ${pad(fmtUs(payloadUs), 9, true)} ${pad(pct(payloadUs, total), 8, true)} ${pad(pct(payloadUs, drainUs), 8, true)}`);
+  if (machineryLeaves.size) {
+    console.log(`    machinery leaves actually seen:`);
+    for (const [lf, us] of [...machineryLeaves.entries()].sort((a, b) => b[1] - a[1])) {
+      console.log(`      ${lf} ${pct(us, total)}`);
+    }
+  }
+  // The full payload list to a coverage floor, so the reader can classify it themselves rather
+  // than trust the four names that fit in a summary.
+  const payloadSorted = [...drainLeaves.entries()].filter(([lf]) => !RING_MACHINERY.has(lf.split(" @ ")[0] ?? ""))
+    .sort((a, b) => b[1] - a[1]);
+  let acc = 0;
+  console.log(`    payload leaves (to 90% of payload):`);
+  for (const [lf, us] of payloadSorted) {
+    if (acc >= payloadUs * 0.9) { break; }
+    acc += us;
+    console.log(`      ${pad(lf, 56)} ${pad(pct(us, total), 8, true)} ${pad(pct(us, drainUs), 8, true)}`);
+  }
+  console.log(`      (${payloadSorted.length} payload leaves in total)`);
+}
+
 function printIdleShape(profile: MergedProfile, label: string): void {
   const nameOf = (id: number) => profile.nodes.get(id)?.callFrame?.functionName ?? "?";
   const isIdle = (nm: string) => nm === "(idle)" || nm === "(program)" || nm === "(root)";
@@ -1824,33 +2501,61 @@ function printIdleShape(profile: MergedProfile, label: string): void {
     if (isIdle(names[i]!)) fam.set(names[i]!, (fam.get(names[i]!) ?? 0) + (profile.timeDeltas[i] ?? 0));
   }
 
-  // run-length histogram + before/after attribution of idle runs
-  const buckets = { "1": 0, "2-5": 0, "6-15": 0, "16-40": 0, "41+": 0 };
-  const before = new Map<string, number>();
-  const after = new Map<string, number>();
-  let runs = 0, idleSamples = 0, i = 0;
+  // Run-length histogram, counted BOTH ways. The count answers "how many attribution
+  // failures were there", the time answers "how much of the idle bucket is this" — and a
+  // verdict on the first is a verdict about a population that can hold a minority of the
+  // time. Only the second shares a denominator with every ceiling normalised to busy.
+  type Bkt = "1" | "2-5" | "6-15" | "16-40" | "41+";
+  const BKTS: Bkt[] = ["1", "2-5", "6-15", "16-40", "41+"];
+  const bktOf = (len: number): Bkt =>
+    len === 1 ? "1" : len <= 5 ? "2-5" : len <= 15 ? "6-15" : len <= 40 ? "16-40" : "41+";
+  const runsBy: Record<Bkt, number> = { "1": 0, "2-5": 0, "6-15": 0, "16-40": 0, "41+": 0 };
+  const usBy: Record<Bkt, number> = { "1": 0, "2-5": 0, "6-15": 0, "16-40": 0, "41+": 0 };
+  // Before/after attribution kept separately for short (<=5 samples) and long (>=6) runs:
+  // the thousands of short attribution failures otherwise bury the few hundred runs that
+  // carry the time, which is the question being asked.
+  const beforeShort = new Map<string, number>();
+  const afterShort = new Map<string, number>();
+  const beforeLong = new Map<string, number>();
+  const afterLong = new Map<string, number>();
+  const longRunUs: number[] = [];
+  let runs = 0, idleSamples = 0, idleUs = 0, i = 0;
   while (i < names.length) {
     if (isIdle(names[i]!)) {
       let j = i;
-      while (j < names.length && isIdle(names[j]!)) j++;
+      let runUs = 0;
+      while (j < names.length && isIdle(names[j]!)) { runUs += profile.timeDeltas[j] ?? 0; j++; }
       const len = j - i;
-      runs++; idleSamples += len;
-      if (len === 1) buckets["1"]++; else if (len <= 5) buckets["2-5"]++;
-      else if (len <= 15) buckets["6-15"]++; else if (len <= 40) buckets["16-40"]++; else buckets["41+"]++;
-      const b = i > 0 ? names[i - 1]! : "<start>";
-      const a = j < names.length ? names[j]! : "<end>";
-      before.set(b, (before.get(b) ?? 0) + 1);
-      after.set(a, (after.get(a) ?? 0) + 1);
+      const b = bktOf(len);
+      runs++; idleSamples += len; idleUs += runUs;
+      runsBy[b]++; usBy[b] += runUs;
+      const bn = i > 0 ? names[i - 1]! : "<start>";
+      const an = j < names.length ? names[j]! : "<end>";
+      if (len >= 6) {
+        beforeLong.set(bn, (beforeLong.get(bn) ?? 0) + 1);
+        afterLong.set(an, (afterLong.get(an) ?? 0) + 1);
+        longRunUs.push(runUs);
+      } else {
+        beforeShort.set(bn, (beforeShort.get(bn) ?? 0) + 1);
+        afterShort.set(an, (afterShort.get(an) ?? 0) + 1);
+      }
       i = j;
     } else i++;
   }
   const avgIntervalUs = profile.timeDeltas.length ? total / profile.timeDeltas.length : 0;
   const top = (m: Map<string, number>) =>
-    [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([k, v]) => `${v}× ${k}`).join("  |  ");
+    [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, 6).map(([k, v]) => v + "x " + k).join("  |  ");
 
-  const longRuns = buckets["16-40"] + buckets["41+"];
   const gpuIoRe = /writeBuffer|submit|Present|Flip|Blt|readback|Atomics|__wait|WaitFor/i;
-  const gpuIoRuns = [...before.entries()].filter(([k]) => gpuIoRe.test(k)).reduce((a, [, v]) => a + v, 0);
+  const gpuIoRuns = [...beforeShort.entries(), ...beforeLong.entries()]
+    .filter(([k]) => gpuIoRe.test(k)).reduce((a, [, v]) => a + v, 0);
+  const gpuIoLongRuns = [...beforeLong.entries()].filter(([k]) => gpuIoRe.test(k)).reduce((a, [, v]) => a + v, 0);
+
+  const longUs = usBy["6-15"] + usBy["16-40"] + usBy["41+"];
+  const longRuns = runsBy["6-15"] + runsBy["16-40"] + runsBy["41+"];
+  const tinyRunFrac = runs ? (runsBy["1"] + runsBy["2-5"]) / runs : 0;
+  const tinyTimeFrac = idleUs ? (usBy["1"] + usBy["2-5"]) / idleUs : 0;
+  const longTimeFrac = idleUs ? longUs / idleUs : 0;
 
   console.log(sep());
   console.log(`IDLE-SHAPE — is the "idle" bucket real wait or WASM/JIT sampling noise?`);
@@ -1858,25 +2563,54 @@ function printIdleShape(profile: MergedProfile, label: string): void {
   console.log(`Thread: ${label}`);
   console.log(`idle-family self-time: ${[...fam.entries()].sort((a, b) => b[1] - a[1])
     .map(([k, v]) => `${k} ${pct(v, total)}`).join("  ")}`);
-  console.log(`avg sample interval: ${Math.round(avgIntervalUs)}µs   idle runs: ${num(runs)}  (${num(idleSamples)} samples)`);
-  console.log(`run-length histogram: ${JSON.stringify(buckets)}`);
-  console.log(`  BEFORE idle: ${top(before)}`);
-  console.log(`  AFTER  idle: ${top(after)}`);
+  console.log(`avg sample interval: ${Math.round(avgIntervalUs)}us   idle runs: ${num(runs)}  (${num(idleSamples)} samples, ${fmtUs(idleUs)} = ${pct(idleUs, total)} of thread)`);
   console.log(``);
-  // Verdict on the DOMINANT signal (run fractions), noting minority real-wait separately.
-  const tinyFrac = runs ? (buckets["1"] + buckets["2-5"]) / runs : 0;
-  const longFrac = runs ? longRuns / runs : 0;
-  const minorWait = gpuIoRuns > 0 ? ` (${gpuIoRuns} run${gpuIoRuns === 1 ? "" : "s"} bracketed by GPU/IO/Atomics — minor real wait)` : "";
-  if (tinyFrac > 0.9 && longFrac < 0.05) {
-    console.log(`VERDICT: ${(tinyFrac * 100).toFixed(0)}% of idle runs are 1-5 samples, bracketed by WASM/JIT frames`);
-    console.log(`  → dominated by V8 sampling NOISE around v86's dynarec, NOT reclaimable slack.${minorWait}`);
+  console.log(`Run-length distribution — BY COUNT and BY TIME (the two disagree; time is the one`);
+  console.log(`that shares a denominator with every ceiling normalised to busy):`);
+  console.log(` ${pad("run len", 10)} ${pad("runs", 8, true)} ${pad("%runs", 7, true)} ${pad("time", 9, true)} ${pad("%idle", 7, true)} ${pad("%thread", 8, true)} ${pad("avg run", 9, true)}`);
+  for (const b of BKTS) {
+    if (runsBy[b] === 0) continue;
+    const avgRunMs = runsBy[b] ? usBy[b] / runsBy[b] / 1000 : 0;
+    console.log(
+      ` ${pad(b, 10)} ${pad(num(runsBy[b]), 8, true)} ${pad(pct(runsBy[b], runs), 7, true)} ` +
+      `${pad(fmtUs(usBy[b]), 9, true)} ${pad(pct(usBy[b], idleUs), 7, true)} ${pad(pct(usBy[b], total), 8, true)} ` +
+      `${pad(avgRunMs.toFixed(2) + "ms", 9, true)}`
+    );
+  }
+  if (longRunUs.length) {
+    const s = [...longRunUs].sort((a, b) => a - b);
+    const q = (p: number) => s[Math.min(s.length - 1, Math.floor(p * s.length))] ?? 0;
+    console.log(` long runs (>=6 samples): p50 ${(q(0.5) / 1000).toFixed(2)}ms  p90 ${(q(0.9) / 1000).toFixed(2)}ms  max ${(s[s.length - 1]! / 1000).toFixed(2)}ms`);
+  }
+  console.log(``);
+  console.log(`  SHORT runs (1-5 samples, ${pct(usBy["1"] + usBy["2-5"], idleUs)} of idle time):`);
+  console.log(`    BEFORE: ${top(beforeShort)}`);
+  console.log(`    AFTER : ${top(afterShort)}`);
+  console.log(`  LONG runs (>=6 samples, ${pct(longUs, idleUs)} of idle time) — these carry the wait, if any:`);
+  console.log(`    BEFORE: ${top(beforeLong) || "(none)"}`);
+  console.log(`    AFTER : ${top(afterLong) || "(none)"}`);
+  console.log(``);
+  // The verdict is taken on TIME. A population of short attribution failures can be 90% of
+  // runs while holding a minority of the bucket, and calling the bucket "noise" on that
+  // basis writes off wait that every ceiling is normalised against.
+  const minorWait = gpuIoRuns > 0
+    ? ` (${gpuIoRuns} run${gpuIoRuns === 1 ? "" : "s"} bracketed by GPU/IO/Atomics, ${gpuIoLongRuns} of them long)`
+    : "";
+  console.log(`By COUNT: ${(tinyRunFrac * 100).toFixed(0)}% of runs are 1-5 samples.`);
+  console.log(`By TIME : ${(tinyTimeFrac * 100).toFixed(0)}% of idle time is in those runs; ` +
+    `${(longTimeFrac * 100).toFixed(0)}% (${fmtUs(longUs)}, ${pct(longUs, total)} of the thread) is in runs of 6+.`);
+  if (longTimeFrac < 0.15) {
+    console.log(`VERDICT: idle is dominated BY TIME by 1-5-sample runs bracketed by WASM/JIT frames`);
+    console.log(`  -> V8 sampling NOISE around v86's dynarec, NOT reclaimable slack.${minorWait}`);
     console.log(`  Do not plan async-present/readback to "reclaim" this number.`);
-  } else if (longFrac > 0.2 || gpuIoRuns > runs * 0.1) {
-    console.log(`VERDICT: substantial long idle runs${gpuIoRuns ? " bracketed by GPU/IO/Atomics frames" : ""}`);
-    console.log(`  → REAL blocking wait likely present; confirm with an in-worker timestamp bracket around submit/wait.`);
   } else {
-    console.log(`VERDICT: mixed — mostly JIT noise but ${(longFrac * 100).toFixed(0)}% longer runs${minorWait};`);
-    console.log(`  inspect before/after attribution above before treating idle as reclaimable.`);
+    console.log(`VERDICT: ${(longTimeFrac * 100).toFixed(0)}% of idle TIME sits in runs of 6+ samples ` +
+      `(avg ${(longUs / Math.max(1, longRuns) / 1000).toFixed(2)}ms, up to ${(longRunUs.reduce((m, v) => (v > m ? v : m), 0) / 1000).toFixed(1)}ms).`);
+    console.log(`  A JIT-boundary attribution failure is 1-2 samples; runs this long are NOT that shape.`);
+    console.log(`  -> Treat this fraction as POSSIBLY REAL WAIT until an in-worker timestamp bracket`);
+    console.log(`     around submit/readback/Atomics says otherwise. Read the LONG-run BEFORE/AFTER`);
+    console.log(`     attribution above: it names what the thread was doing on either side.${minorWait}`);
+    console.log(`  Every ceiling normalised to "busy" moves by this much if it is wait.`);
   }
 }
 
@@ -1888,16 +2622,24 @@ async function main() {
     console.log("  bun tools/analyze-trace.ts <file>                    # basic analysis");
     console.log("  bun tools/analyze-trace.ts <file> --top 50           # more functions");
     console.log("  bun tools/analyze-trace.ts <file> --thread worker    # worker only");
+    console.log("  bun tools/analyze-trace.ts <file> --js-owners       # split the JS bucket by owning file + dispatcher region");
+    console.log("  bun tools/analyze-trace.ts <file> --proxy            # fold v86 view() Proxy traps into their callers");
     console.log("  bun tools/analyze-trace.ts <file> --range 0-7s       # slice profile to time window");
     console.log("  bun tools/analyze-trace.ts <file> --budget-ms 33.34  # judge frames against the title's cadence");
     console.log("  bun tools/analyze-trace.ts <file> --map blocks.json  # annotate wasm-function[N] with guest addr");
     console.log("  bun tools/analyze-trace.ts <file> --no-auto-map      # skip hot-block sidecar discovery");
     console.log("");
+    console.log("--proxy reports the share of worker time spent in v86's view() Proxy get/set/resolve, attributed to");
+    console.log("the nearest caller outside v86's own JS. That share is measured from stack frames, not FPS, so it is");
+    console.log("the scene-independent oracle for a Proxy-removal A/B.");
     console.log("--range accepts: A-Bs (seconds) or Ams-Bms (milliseconds). Times are relative to profile start.");
     console.log("--map expects JSON produced by worker-side dumpHotJitBlocks() (array of {wasm_fn, phys_addr, module}).");
     console.log("Traces with embedded bottleship.hotblocks marks are annotated automatically without --map.");
     console.log("Traces with bottleship.flip marks report FPS, inter-frame p50/p95/p99 (same shared definition as the");
     console.log("harness frameReport verb), frames over budget, and a WORST FRAMES table with per-frame stack attribution.");
+    console.log("Flip marks are reported PER EMITTING THREAD on one budget — never merged into a single series — and");
+    console.log("cross-checked against the guest-side present count (a bottleship.present.ledger mark, or a serial on");
+    console.log("the flip marks): a thread that misses presents diverges loudly instead of printing a plausible p50.");
     console.log("--budget-ms sets the frame budget; without it the budget is DERIVED from the observed cadence.");
     console.log("Without --map or embedded hot-blocks, the analyzer auto-discovers hot-block sidecars next to the trace.");
     process.exit(0);
@@ -1955,7 +2697,6 @@ async function main() {
   // Read trace
   console.log(`Reading ${filePath} ...`);
   const { events, rawSize, gzipSize } = readTrace(filePath);
-  let renderFrames = extractRenderFrameAnalysis(events, budgetMs);
   const perfWindow = extractPerfWindow(events);
 
   // Embedded hot-blocks (Level-3): always extract for the HOT GUEST PAGES report,
@@ -1980,6 +2721,12 @@ async function main() {
 
   const threadNames = extractThreadNames(events);
   const profiles = mergeProfileChunks(events);
+
+  // Frames belong to the thread that emitted the mark; the series are built once, per thread,
+  // on the presenting thread's budget, and everything downstream reads them from here.
+  const flipSeries = buildFlipSeries(events, threadNames, budgetMs);
+  let presenterSeries: FlipSeries | null = flipSeries[0] ?? null;
+  let renderFrames = presenterSeries?.analysis ?? null;
 
   // --idle-shape: focused diagnostic — is the "idle" bucket real wait or JIT sampling noise?
   if (args.includes("--idle-shape")) {
@@ -2028,19 +2775,43 @@ async function main() {
 
   // --range must scope the FRAME statistics too. A sliced report whose frame tail silently
   // covered the whole trace is the exact failure mode this instrument exists to avoid.
-  if (range && renderFrames) {
-    const base = Array.from(profiles.values()).find((p) => Number.isFinite(p.startTs))?.startTs;
-    if (Number.isFinite(base)) {
-      const lo = (base as number) + range.startUs;
-      const hi = (base as number) + range.endUs;
-      const intervals = renderFrames.intervals.filter((iv) => iv.endTsUs >= lo && iv.endTsUs < hi);
-      renderFrames = {
-        markCount: intervals.length > 0 ? intervals.length + 1 : 0,
-        intervals,
-        stats: computeRenderFrameStats(intervals, budgetMs),
-        budgetMs: renderFrames.budgetMs,
-        scopedTo: range.raw,
-      };
+  //
+  // The window base is the PRESENTING thread's profile clock, not whichever profile the Map
+  // happened to hold first: with more than one worker those clocks are different starts, and a
+  // window taken against an unrelated one is a plausible number for the wrong interval.
+  // One window clock for the whole report: --range, the harness join seam (which PRINTS a
+  // --range to paste back) and the timeline buckets must agree, or the seam recommends a window
+  // the slicer then reads against a different start.
+  const windowClock = (() => {
+    const presenterProfile = presenterSeries ? profiles.get(presenterSeries.key) : undefined;
+    if (presenterProfile && Number.isFinite(presenterProfile.startTs)) {
+      return { base: presenterProfile.startTs, source: `presenting thread ${presenterSeries!.label} (tid ${presenterSeries!.tid})` };
+    }
+    const starts = Array.from(profiles.values()).map(pr => pr.startTs).filter(t => Number.isFinite(t));
+    return starts.length > 0
+      ? { base: Math.min(...starts), source: "earliest profile start (the presenting thread has no profile in this trace)" }
+      : { base: undefined as number | undefined, source: "no profile in this trace" };
+  })();
+
+  if (range && flipSeries.length > 0) {
+    const baseSource = windowClock.source;
+    const base = windowClock.base;
+    if (base !== undefined) {
+      const lo = base + range.startUs;
+      const hi = base + range.endUs;
+      console.log(`[analyze-trace] --range window taken against ${baseSource}`);
+      for (const s of flipSeries) {
+        // The real count of marks INSIDE the window: intervals+1 is a fabricated count that
+        // silently invents a mark whenever the window clips the series.
+        s.marks = s.marks.filter(m => m.tsUs >= lo && m.tsUs < hi);
+      }
+      flipSeries.sort((a, b) => b.marks.length - a.marks.length || a.key.localeCompare(b.key));
+      presenterSeries = flipSeries[0] ?? null;
+      const scopedBudget = budgetMs ?? renderFrames?.budgetMs;
+      for (const s of flipSeries) {
+        s.analysis = analysisFromMarks(s.marks, scopedBudget, { key: s.key, label: s.label, scopedTo: range.raw });
+      }
+      renderFrames = presenterSeries?.analysis ?? null;
     }
   }
 
@@ -2104,11 +2875,15 @@ async function main() {
     return classifyThreadRole(a.name) === threadFilter || a.name.toLowerCase().includes(threadFilter);
   };
 
+  const jsOwners = args.includes("--js-owners");
+  const proxyRollup = args.includes("--proxy");
   for (const a of workerThreads) {
     if (!shouldShow(a)) continue;
     console.log(reportThread(a, topN, `WORKER THREAD (${a.name})`, true));
     console.log(reportWasm(a, topN));
     console.log(reportOptimizationBuckets(a));
+    if (jsOwners) reportJsOwners(a);
+    if (proxyRollup) console.log(reportProxyRollup(a));
   }
 
   for (const a of mainThreads) {
@@ -2123,17 +2898,30 @@ async function main() {
     console.log(reportThread(a, topN, `AUDIO WORKLET (${a.name})`, false));
   }
 
-  const renderFrameReport = reportRenderFrames(renderFrames);
+  const renderFrameReport = reportRenderFrames(flipSeries);
   if (renderFrameReport) {
     console.log(renderFrameReport);
   }
+  if (flipSeries.length > 0) {
+    console.log(reportFlipLedger(computeFlipLedger(flipSeries, extractPresentLedger(events))));
+  }
 
-  const worstFrameReport = reportWorstFrames(renderFrames, workerThreads[0]?.profile ?? null, 10);
+  // Stack attribution belongs to the thread that PRESENTED the frame. Taking it from
+  // "the busiest worker" attributes a render worker's frame to the guest worker's stacks and
+  // says nothing about it; when that thread has no profile the reason is printed instead.
+  const presenterProfileForAttribution = presenterSeries ? (profiles.get(presenterSeries.key) ?? null) : null;
+  if (presenterSeries && !presenterProfileForAttribution) {
+    console.log(`
+[analyze-trace] WORST FRAMES / TAIL COMPOSITION unavailable: the presenting thread `
+      + `${presenterSeries.label} (tid ${presenterSeries.tid}) emitted flip marks but has no CPU profile in this trace. `
+      + `Attributing its frames to another thread's stacks would be a plausible answer to a different question.`);
+  }
+  const worstFrameReport = reportWorstFrames(renderFrames, presenterProfileForAttribution, 10);
   if (worstFrameReport) {
     console.log(worstFrameReport);
   }
 
-  const tailCompReport = reportTailComposition(renderFrames, workerThreads[0]?.profile ?? null);
+  const tailCompReport = reportTailComposition(renderFrames, presenterProfileForAttribution);
   if (tailCompReport) {
     console.log(tailCompReport);
   }
@@ -2141,11 +2929,12 @@ async function main() {
   // The join seam: a live `frameReport({reset:true})` publishes its window as UserTiming
   // marks, so a trace taken across it can be sliced to exactly that window.
   if (perfWindow) {
-    const base = workerThreads[0]?.profile?.startTs;
+    const base = windowClock.base;
     const rel = (ts: number) => (Number.isFinite(base) ? `${((ts - (base as number)) / 1_000_000).toFixed(2)}s` : `${(ts / 1000).toFixed(0)}ms(abs)`);
     console.log(`\n${sep("═")}`);
     console.log(`HARNESS PERF WINDOW (join seam)`);
     console.log(sep("═"));
+    console.log(`  clock: ${windowClock.source} — the same base --range slices against.`);
     console.log(`  begin: ${perfWindow.beginTsUs !== null ? rel(perfWindow.beginTsUs) : "(no begin mark)"}`
       + `  end: ${perfWindow.endTsUs !== null ? rel(perfWindow.endTsUs) : "(no end mark)"}`);
     if (perfWindow.beginTsUs !== null && perfWindow.endTsUs !== null && Number.isFinite(base)) {
@@ -2249,14 +3038,23 @@ async function main() {
   // report a whole-trace GPU average next to range-scoped CPU numbers in the same output.
   let gpuEvents = events;
   if (range) {
-    const base = Array.from(profiles.values()).find((p) => Number.isFinite(p.startTs))?.startTs;
-    if (Number.isFinite(base)) {
-      const lo = (base as number) + range.startUs;
-      const hi = (base as number) + range.endUs;
+    // Same base as the frame window above, for the same reason.
+    const presenterProfile = presenterSeries ? profiles.get(presenterSeries.key) : undefined;
+    const starts = Array.from(profiles.values()).map(pr => pr.startTs).filter(t => Number.isFinite(t));
+    const base = presenterProfile && Number.isFinite(presenterProfile.startTs)
+      ? presenterProfile.startTs
+      : (starts.length > 0 ? Math.min(...starts) : undefined);
+    if (base !== undefined) {
+      const lo = base + range.startUs;
+      const hi = base + range.endUs;
       gpuEvents = events.filter((ev) => ev.ts + (ev.dur ?? 0) >= lo && ev.ts < hi);
     }
   }
-  const framesForGpu = gpuEvents.filter(ev => (ev as any)?.name === "bottleship.flip").length;
+  // Frames for "GPU ms/frame" are the PRESENTING thread's marks only: counting every thread's
+  // marks halves the figure the moment a second thread presents, with nothing to show for it.
+  const framesForGpu = presenterSeries
+    ? gpuEvents.filter(ev => ev.name === FLIP_MARK && `${ev.pid}:${ev.tid}` === presenterSeries!.key).length
+    : 0;
   console.log(reportGpuProcess(gpuEvents, threadNames, framesForGpu, range?.raw));
 
   // ── Warnings (always show — runs on all threads regardless of filter) ──

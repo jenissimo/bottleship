@@ -284,18 +284,40 @@ export async function emittedBytes({call,save,note,sleep,scene}){
   rows.push(await sample('базовый'));
   await arm("w.set_stack_raw_unsafe(3);");
   rows.push(await sample('без проверок памяти'));
-  await arm("w.set_stack_raw_unsafe(0); if(w.jit_no_flag_tuple_set) w.jit_no_flag_tuple_set(1);");
-  rows.push(await sample('без кортежа флагов'));
+  // NEVER `if (w.fn) w.fn(...)`. The census engine does not carry jit_no_flag_tuple_set — only
+  // prepare-flag-tuple-ablation / prepare-codegen-ceiling-combo build it — so from the day this
+  // experiment was written the flag arm silently ran the BASELINE and both published numbers
+  // (2.1%, and the 0.20% its bytes/insn recomputation gave) are baseline against baseline.
+  // Demand the switch and read it back, the way codegen-bench.ts:139-141 already does.
+  await arm("w.set_stack_raw_unsafe(0);"
+   +"if(!w.jit_no_flag_tuple_set||!w.jit_no_flag_tuple_get) throw new Error("
+   +"'engine has no jit_no_flag_tuple_set/get: build it with prepare-flag-tuple-ablation.mjs');"
+   +"w.jit_no_flag_tuple_set(1);"
+   +"if(w.jit_no_flag_tuple_get()>>>0!==1) throw new Error('flag-tuple readback');");
+  rows.push({...await sample('без кортежа флагов'),
+   armedReadback:await call('evalWorker',
+     "return globalThis.preemption.getWasmExports().jit_no_flag_tuple_get()>>>0;")});
   const base=rows[0];
-  const share=r=>base.bytesPerSecond?+(100*(1-r.bytesPerSecond/base.bytesPerSecond)).toFixed(1):null;
+  // BYTES PER INSTRUCTION, not bytes per second. Removing bytes makes the guest retire MORE
+  // instructions per second, so a per-second denominator reads part of the speed-up as a byte
+  // saving — and reads a slower arm as one too. Proof it matters, from the stack-class run:
+  // knob modes 2 and 3 emit identical code (68.71 vs 68.75 B/insn, one call site in codegen.rs)
+  // and per-second reports them 0.83 pp apart. Per-second is kept, labelled, for continuity.
+  const share=r=>base.bytesPerInsn?+(100*(1-r.bytesPerInsn/base.bytesPerInsn)).toFixed(2):null;
+  const perSecond=r=>base.bytesPerSecond?+(100*(1-r.bytesPerSecond/base.bytesPerSecond)).toFixed(2):null;
   const out={rows,guardByteShare:share(rows[1]),flagByteShare:share(rows[2]),
-    bytesPerInsn:base.bytesPerInsn};
+    bytesPerInsn:base.bytesPerInsn,
+    contaminated:{note:'bytes/second denominator, kept only to compare with pre-2026-09-11 records',
+      guardByteShare:perSecond(rows[1]),flagByteShare:perSecond(rows[2])}};
   await save('emitted-bytes',out);
   note('байт wasm на инструкцию x86: '+base.bytesPerInsn
-   +'; доля байт у проверок памяти '+out.guardByteShare+'%, у кортежа флагов '+out.flagByteShare+'%');
+   +'; доля байт у проверок памяти '+out.guardByteShare+'%, у кортежа флагов '+out.flagByteShare+'%'
+   +' (по байтам/с, загрязнённо: '+out.contaminated.guardByteShare+'% / '
+   +out.contaminated.flagByteShare+'%)');
  } finally {
   await call('pause').catch(()=>{});
-  await arm("w.set_stack_raw_unsafe(0); if(w.jit_no_flag_tuple_set) w.jit_no_flag_tuple_set(0); w.set_dispatch_stats(0);").catch(()=>{});
+  await arm("w.set_stack_raw_unsafe(0); w.set_dispatch_stats(0);"
+   +"if(w.jit_no_flag_tuple_set) w.jit_no_flag_tuple_set(0);").catch(()=>{});
  }
 }
 
@@ -1020,21 +1042,35 @@ export async function wbufOrder({call,save,note,sleep,scene}){
  const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
  const initial=await call('evalWorker',scene);
  if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
- await call('evalWorker','globalThis.__wbufSequenceOut=[];globalThis.__wbufSequence=600;return true;');
- await call('resume');await sleep(4000);await call('pause');
- const seq=await call('evalWorker',
-   "const d=System.getInstance().process.dispatcher;"
-  +"const ids=globalThis.__wbufSequenceOut||[];"
-  +"const g=d.thunkGenerator;const names={};"
-  // No funcId->name accessor exists; walk the generator's stubs once and invert the map.
-  +"const all=(g&&g.getAllStubs)?g.getAllStubs():[];"
-  +"for(const st of all){if(st&&st.functionId)names[st.functionId]=((st.dllName||'?')+':'+(st.functionName||'?'));}"
-  +"return {ids:ids.slice(0,600),names};");
- await save('wbuf-order',seq);
- const short=(n)=>String(n).replace(/^d3d9:IDirect3DDevice9_/,'').replace(/^d3d9:/,'');
- const line=seq.ids.map(i=>short(seq.names[i])).slice(0,120).join(' ');
- note('Порядок снят: '+seq.ids.length+' записей');
- return line;
+ // The previous version of this verb set globalThis.__wbufSequence / __wbufSequenceOut, which
+ // NOTHING in src/ reads, then reported `ids.length` as a successful capture — so it printed
+ // "0 записей" and that zero read like a statement about the ring. The real mechanism is
+ // ThunkDispatcher.armWriteBufSequence / getWriteBufSequence, reached through
+ // d3d9Perf({wbufSequence: N}); getWriteBufSequence returns NAMES already and answers null
+ // while unarmed, precisely so a disarmed capture cannot answer [] and read as "nothing ran".
+ // Armed and read through `apiCensus` — the harness verb that owns this dispatcher pair
+ // (`state.ts:414`). Arming returns early with {wbufSequence:"armed"}; the capture is read by
+ // calling again, and `getWriteBufSequence` answers null while unarmed precisely so a disarmed
+ // read cannot come back as [] and be mistaken for an empty ring.
+ const WANT=4000;
+ const armed=await call('apiCensus',{wbufSequence:WANT});
+ if(armed?.wbufSequence!=='armed')throw Error('wbufSequence did not arm: '+JSON.stringify(armed));
+ await call('resume');note('Снимаю последовательность кольца: '+WANT+' записей');
+ await sleep(6000);
+ await call('pause');
+ const census=await call('apiCensus');
+ const seq=census?.wbufSequence;
+ if(!seq)throw Error('wbufSequence came back null: the capture was never armed on this dispatcher');
+ if(!seq.ids||!seq.ids.length)throw Error('capture armed but empty — the ring produced nothing in '
+  +'the window (want '+WANT+', still armed: '+seq.armed+')');
+ await save('wbuf-order',{want:WANT,captured:seq.ids.length,stillArmed:seq.armed,ids:seq.ids});
+ const short=n=>String(n).replace(/^d3d9:IDirect3DDevice9_/,'').replace(/^d3d9:/,'');
+ const names=seq.ids.map(short);
+ const tally={};for(const n of names)tally[n]=(tally[n]||0)+1;
+ const top=Object.entries(tally).sort((a,b)=>b[1]-a[1]).slice(0,8);
+ note('Порядок снят: '+names.length+' записей, '+Object.keys(tally).length+' различных; топ: '
+  +top.map(([n,c])=>n+' '+c).join(', '));
+ return {captured:names.length,distinct:Object.keys(tally).length,top};
 }
 
 /** Turn every landed lever OFF (or ON) at once, for a trace comparison of the TOTAL.
@@ -1050,3 +1086,536 @@ export async function leversSet({call,save,note},on){
 }
 export async function leversOn(ctx){ return leversSet(ctx,true); }
 export async function leversOff(ctx){ return leversSet(ctx,false); }
+
+
+/** Measurement 2 of the perf campaign: the stack-access census, split ESP-only / EBP-in-window /
+ *  EBP-out-of-window, execution-weighted over a validated race window — and, in the SAME boot,
+ *  the executed-wasm-byte share that the stack-fastmem knob actually removes at each mode.
+ *
+ *  What it decides (v86-emitter-target-architecture.md §3 lever 2 step (a)): the mode-1 ceiling.
+ *  The knob admits base ESP **or EBP** (modrm.rs:21-26), but a window proven around ESP says
+ *  nothing about an EBP-based access in /Oy code — so the knob's ceiling is an upper bound on an
+ *  unsound superset. The ESP-only share is the honest ceiling; the EBP distance bands say how
+ *  much of the rest a cheap in-window proof could reach.
+ *
+ *  TWO INSTRUMENTS, ONE PREDICTION. The class census counts READS; the byte census counts
+ *  EXECUTED WASM BYTES. Mode 1 and mode 2 elide the identical per-read guard sequence over
+ *  different populations, so their byte shares must stand in the ratio the READ counts predict:
+ *
+ *      byteShare(mode1) / byteShare(mode2)  ==  (espW32 + ebpW32) / (espW32 + ebpW32 + otherW32)
+ *
+ *  Only 32-bit reads appear because `stack_raw_applies` is reached from
+ *  `gen_modrm_resolve_safe_read32` alone. A census that mis-assigned a class and a byte counter
+ *  that measured the wrong arm would both have to be wrong in the SAME direction to pass this.
+ *
+ *  The class census runs on its own switch so its own emitted increments are not counted as
+ *  executed bytes. Needs the combined census engine (prepare-stack-class-census.mjs). */
+export async function stackClassCensus({call,save,note,sleep,scene}){
+ const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
+ const initial=await call('evalWorker',scene);
+ if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
+ const NAMES=['readEspTotal','readEspW8','readEspW16','readEspW32','readEspW64','readEspW128',
+  'readEbpTotal','readEbpW8','readEbpW16','readEbpW32','readEbpW64','readEbpW128',
+  'readEbpNear4k','readEbpNear64k','readEbpNear1m','readEbpFar',
+  'readOtherTotal','readIneligible','readEspDispNeg','readEspDispGe4k','readTotal',
+  'readOtherW32','readOtherW64','readOtherW128',
+  'stackPopRead32','stackLeaveRead','stackLeaveNear64k','stackPushWrite32'];
+ const arm=expr=>call('evalWorker',
+   "const w=globalThis.preemption.getWasmExports();"+expr
+  +"if(w.jit_clear_cache_js) w.jit_clear_cache_js(); return true;");
+ /** Warm, zero the counters, hold a 10 s window, read them back — with scene validity on both
+  *  sides so an arm that left the race is refused rather than averaged in. */
+ const window10=async(label,zero,read)=>{
+  await call('resume');note(label+': прогрев 12 с');await sleep(12000);
+  await call('evalWorker',zero);
+  const sb=await call('evalWorker',scene);
+  note(label+': окно 10 с');await sleep(10000);
+  const r=await call('evalWorker',read);
+  const sa=await call('evalWorker',scene);
+  await call('pause');
+  return {r,valid:valid(sb)&&valid(sa)&&sa.mover>sb.mover};
+ };
+ await arm(
+   "if(!w.stack_class_get) throw new Error('engine has no stack_class_get');"
+  +"if(!w.emit_bytes_get) throw new Error('engine has no emit_bytes_get');"
+  +"if(w.get_jit_config(21)) throw new Error('flag locals (idx 21) must be OFF: the class census "
+  +"emits if/else, which is a flag boundary');"
+  +"w.set_stack_raw_unsafe(0); w.set_dispatch_stats(1);"
+  +"w.set_stack_class_census(1); w.stack_class_reset();"
+  +"if(w.get_stack_class_census()!==1) throw new Error('class census switch did not take');");
+ try{
+  // arm 1: the class census
+  const a1=await window10('перепись классов стека',
+   "const w=globalThis.preemption.getWasmExports();"
+   +"w.stack_class_reset(); w.emit_bytes_reset(); return true;",
+   "const w=globalThis.preemption.getWasmExports();"
+   +"return {slots:Array.from({length:28},(_,i)=>w.stack_class_get(i)),"
+   +"insns:w.emit_bytes_get(1)};");
+  const c=Object.fromEntries(NAMES.map((n,i)=>[n,a1.r.slots[i]]));
+  // Instructions retired in the SAME window as the class counts, so reads-per-instruction is a
+  // measured ratio rather than two numbers from two arms divided by each other.
+  const censusInsns=a1.r.insns;
+  const sum=(...k)=>k.reduce((a,n)=>a+c[n],0);
+  const invariants={
+   classesSumToTotal:sum('readEspTotal','readEbpTotal','readOtherTotal','readIneligible')===c.readTotal,
+   espWidthsSum:sum('readEspW8','readEspW16','readEspW32','readEspW64','readEspW128')===c.readEspTotal,
+   ebpWidthsSum:sum('readEbpW8','readEbpW16','readEbpW32','readEbpW64','readEbpW128')===c.readEbpTotal,
+   ebpBandsSum:sum('readEbpNear4k','readEbpNear64k','readEbpNear1m','readEbpFar')===c.readEbpTotal,
+   otherWidthsFit:sum('readOtherW32','readOtherW64','readOtherW128')<=c.readOtherTotal,
+   leaveNearFits:c.stackLeaveNear64k<=c.stackLeaveRead,
+   censusInsnsCounted:censusInsns>0,
+  };
+  // arms 2-5: executed bytes at each knob mode, class census OFF
+  await arm("w.set_stack_class_census(0);"
+   +"if(w.get_stack_class_census()!==0) throw new Error('class census did not disarm');");
+  const byteRows=[];
+  for (const mode of [0,1,2,3]) {
+   await arm("w.set_stack_raw_unsafe("+mode+");"
+    +"if(w.get_stack_raw_unsafe()!=="+mode+") throw new Error('mode readback');");
+   const w=await window10('байты, режим '+mode,
+    "globalThis.preemption.getWasmExports().emit_bytes_reset();return true;",
+    "const w=globalThis.preemption.getWasmExports();"
+    +"return {bytes:w.emit_bytes_get(0),insns:w.emit_bytes_get(1)};");
+   byteRows.push({mode,bytesPerSecond:Math.round(w.r.bytes/10),insnsPerSecond:Math.round(w.r.insns/10),
+    bytesPerInsn:w.r.insns?+(w.r.bytes/w.r.insns).toFixed(2):null,valid:w.valid});
+  }
+  const base=byteRows[0];
+  // See emittedBytes: the share is per RETIRED INSTRUCTION. Removing guards speeds the guest up,
+  // so a per-second denominator folds the speed-up into the byte saving. On this very run that
+  // turns the cross-check below from +1.3% (agrees) into -10.9% (refuses) while nothing about
+  // the emitted code changed.
+  const share=r=>base.bytesPerInsn?+(100*(1-r.bytesPerInsn/base.bytesPerInsn)).toFixed(2):null;
+  const perSecond=r=>base.bytesPerSecond?+(100*(1-r.bytesPerSecond/base.bytesPerSecond)).toFixed(2):null;
+  const byteShare=Object.fromEntries(byteRows.slice(1).map(r=>['mode'+r.mode,share(r)]));
+  const byteSharePerSecond=Object.fromEntries(byteRows.slice(1).map(r=>['mode'+r.mode,perSecond(r)]));
+  // the cross-check
+  // Read counts predict the byte ratio: mode 1 and mode 2 elide the IDENTICAL per-read guard
+  // sequence, over populations the class census counted separately.
+  const covered1=sum('readEspW32','readEbpW32');
+  const covered2=covered1+c.readOtherW32;
+  const predicted=covered2?covered1/covered2:null;
+  const measured=byteShare.mode2?byteShare.mode1/byteShare.mode2:null;
+  const crossCheck={predictedRatio:predicted&&+predicted.toFixed(4),
+   measuredRatio:measured&&+measured.toFixed(4),
+   relativeError:predicted&&measured?+((measured-predicted)/predicted).toFixed(4):null};
+  crossCheck.agrees=crossCheck.relativeError!==null&&Math.abs(crossCheck.relativeError)<=0.10;
+  const t=c.readTotal||1;
+  // The whole-guard-chain ablation is +10.06% frame (independently measured). The ceiling is
+  // mode 1's MEASURED share of that chain's bytes, times that gain — deliberately NOT the
+  // "1% of bytes = 0.53% FPS" rate, which is 10.06/18.9 restated and therefore cannot check
+  // anything derived from it.
+  const CHAIN=10.06;
+  const chainBytes=byteShare.mode3??byteShare.mode2;
+  const modeOneFraction=chainBytes?byteShare.mode1/chainBytes:null;
+  // ── the LEVER's class is wider than the KNOB's ───────────────────────────────────────────
+  // The knob branches inside gen_modrm_resolve_safe_read32 and so cannot touch PUSH/POP/CALL/
+  // RET/LEAVE. A guard proving a window around ESP covers them all (B §3.2: "no check at all on
+  // the covered accesses inside the unit"). To price them, derive the guard's byte cost PER
+  // ELIDED READ from the arms that did run — and check that derivation against itself: modes 1
+  // and 2 elide the same sequence over different populations, so both must give the same rate.
+  const perInsn=n=>censusInsns?n/censusInsns:0;
+  const b0=base.bytesPerInsn;
+  const rateFrom=(arm,reads)=>{
+   const saved=b0-byteRows[arm].bytesPerInsn, r=perInsn(reads);
+   return r?saved/r:null;
+  };
+  const rate1=rateFrom(1,sum('readEspW32','readEbpW32'));
+  const rate2=rateFrom(2,sum('readEspW32','readEbpW32')+c.readOtherW32);
+  const rateCheck={fromMode1:rate1&&+rate1.toFixed(2),fromMode2:rate2&&+rate2.toFixed(2),
+   relativeError:rate1&&rate2?+((rate2-rate1)/rate1).toFixed(4):null};
+  rateCheck.agrees=rateCheck.relativeError!==null&&Math.abs(rateCheck.relativeError)<=0.10;
+  // Reads only: the raw-memory ablation measured the same ratio with and without write guards,
+  // so PUSH/CALL writes are counted and reported but never added to a ceiling.
+  const extraReads=c.stackPopRead32+c.stackLeaveNear64k;
+  const extraByteShare=rate1&&b0?+(100*perInsn(extraReads)*rate1/b0).toFixed(2):null;
+  const wider=extraByteShare===null||!chainBytes?null:{
+   guardBytesPerRead:rateCheck.fromMode1, rateCheck,
+   popRead32:c.stackPopRead32, leaveReadInWindow:c.stackLeaveNear64k,
+   pushWrite32:c.stackPushWrite32, note:'writes weigh ~0 by ablation; not in the ceiling',
+   extraByteSharePct:extraByteShare,
+   leverByteSharePct:+(byteShare.mode1+extraByteShare).toFixed(2),
+   leverCeilingPct:+(10.06*(byteShare.mode1+extraByteShare)/chainBytes).toFixed(2),
+   leverCeilingDiscounted:+(10.06*(byteShare.mode1+extraByteShare)/chainBytes/3).toFixed(2)};
+  const espShare=c.readEspTotal/t, ebpInWindow=sum('readEbpNear4k','readEbpNear64k')/t;
+  // Within the class, how much a SOUND guard reaches: ESP always, EBP only when in-window.
+  const espOfClass=(c.readEspW32+c.readEbpW32)?c.readEspW32/(c.readEspW32+c.readEbpW32):0;
+  const ebpInWindowOfEbp=c.readEbpTotal?sum('readEbpNear4k','readEbpNear64k')/c.readEbpTotal:0;
+  const soundFraction=espOfClass+(1-espOfClass)*ebpInWindowOfEbp;
+  const measuredCeiling=modeOneFraction===null?null:{
+   knobSuperset:+(CHAIN*modeOneFraction).toFixed(2),
+   espOnly:+(CHAIN*modeOneFraction*espOfClass).toFixed(2),
+   espPlusEbpInWindow:+(CHAIN*modeOneFraction*soundFraction).toFixed(2),
+   espPlusEbpInWindowDiscounted:+(CHAIN*modeOneFraction*soundFraction/3).toFixed(2),
+   modeOneShareOfChain:+(modeOneFraction).toFixed(4)};
+  const row={counters:c,censusInsns,invariants,byteRows,byteShare,byteSharePerSecond,crossCheck,
+   measuredCeiling,wider,
+   shares:{esp:+espShare.toFixed(4),ebp:+(c.readEbpTotal/t).toFixed(4),
+    ebpInWindow64k:+ebpInWindow.toFixed(4),other:+(c.readOtherTotal/t).toFixed(4),
+    ineligible:+(c.readIneligible/t).toFixed(4)},
+   ceilingPct:{espOnly:+(espShare*CHAIN).toFixed(2),
+    espOnlyDiscounted:+(espShare*CHAIN/3).toFixed(2),
+    espPlusEbpInWindow:+((espShare+ebpInWindow)*CHAIN).toFixed(2),
+    espPlusEbpInWindowDiscounted:+((espShare+ebpInWindow)*CHAIN/3).toFixed(2),
+    knobSupersetEspPlusAllEbp:+((espShare+c.readEbpTotal/t)*CHAIN).toFixed(2)},
+   valid:a1.valid&&byteRows.every(r=>r.valid)&&Object.values(invariants).every(Boolean)
+    &&(wider===null||rateCheck.agrees)};
+  await save('stack-class-census',row);
+  note('reads '+c.readTotal+' → ESP '+(100*row.shares.esp).toFixed(1)+'% · EBP '
+   +(100*row.shares.ebp).toFixed(1)+'% (в окне 64K '+(100*row.shares.ebpInWindow64k).toFixed(1)
+   +'%) · прочие '+(100*row.shares.other).toFixed(1)+'% | байты: '+JSON.stringify(byteShare)
+   +' | сверка '+(crossCheck.agrees?'СОШЛАСЬ':'РАЗОШЛАСЬ')+' ('+crossCheck.predictedRatio+' vs '
+   +crossCheck.measuredRatio+') → измеренный потолок: ESP-only '+measuredCeiling?.espOnly
+   +'%, ESP+EBP-в-окне '+measuredCeiling?.espPlusEbpInWindow+'% (после /3: '
+   +measuredCeiling?.espPlusEbpInWindowDiscounted+'%) | ШИРЕ (с POP/RET/LEAVE): байт '
+   +wider?.leverByteSharePct+'%, потолок '+wider?.leverCeilingPct+'% (после /3: '
+   +wider?.leverCeilingDiscounted+'%), охранник '+wider?.guardBytesPerRead+' байт/чтение '
+   +(rateCheck.agrees?'СОШЁЛСЯ':'РАЗОШЁЛСЯ')+(row.valid?'':' (ОТКЛОНЕНО)'));
+  return row;
+ } finally {
+  await call('pause').catch(()=>{});
+  await arm("w.set_stack_raw_unsafe(0); w.set_stack_class_census(0); w.set_dispatch_stats(0);")
+   .catch(()=>{});
+ }
+}
+
+/** Measurement 3 of the perf campaign: the io config arm, plus the three ride-alongs that a
+ *  single NFSU boot owes.
+ *
+ *  ONE ARM PER PROCESS. `cacheMB` / `prefetchChunks` are read ONCE from `globalThis.__wgbIoTune`
+ *  at `SabIoSource.create` (`sab-io-source.ts:170`), i.e. at bundle load — they are not runtime
+ *  knobs like the JIT config, so an arm is a fresh load seeded by
+ *  `?flags={"__wgbIoTune":{...}}`, never an in-boot toggle. Compare arms across runs.
+ *
+ *  The readback is not a formality. A flag that failed to apply produces a perfectly plausible
+ *  arm, and the io worker deliberately echoes its EFFECTIVE tuning into the control words for
+ *  exactly this reason — so the requested tune and the echoed one are compared here and a
+ *  mismatch REFUSES rather than reports.
+ *
+ *  Ride-alongs, all read in the same boot because a boot costs minutes:
+ *   1. the d3d9 counter fix — `report()` and the live snapshot must answer equally for every
+ *      shared counter name (they disagreed by millions before the fix, and that claim has
+ *      never been checked on a running worker);
+ *   2. `arenaRunReconcile` — either the shortfall itemises by reason or `apiDrawUnaccounted`
+ *      names a real leak; it can no longer be quiet and wrong;
+ *   3. `bindGroupSetSameGroup` — a FALSIFIABLE prediction. If the arena replay really does
+ *      bump-allocate a fresh offset per pair, sameGroup must be LARGE. Near zero refutes that
+ *      model and the elision has to be re-examined. */
+export async function ioConfig({call,save,note,sleep,scene}){
+ const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
+ const initial=await call('evalWorker',scene);
+ if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
+
+ // What this boot was actually seeded with, and what the io worker actually applied.
+ const requested=await call('evalWorker',
+   "return {tune:globalThis.__wgbIoTune??null};");
+ const armed=await call('ioReport');
+ if(!armed.armed)throw Error('ioReport not armed: '+(armed.reason??'unknown')
+  +' — this bundle is not streamed, so measurement 3 has no subject on this boot');
+ const effective=armed.ioWorker?.config??null;
+ if(!effective)throw Error('ioReport carries no effective config; cannot verify the tune applied');
+ const req=requested.tune??{};
+ const mismatch=Object.entries(req)
+  .filter(([k,v])=>typeof v==='number'&&effective[k]!==undefined&&effective[k]!==v)
+  .map(([k,v])=>k+' requested '+v+' but io-worker applied '+effective[k]);
+ if(mismatch.length)throw Error('io tune did not take: '+mismatch.join('; '));
+
+ await save('io-config-arm',{requested:req,effective,lifetimeBefore:armed});
+ note('Рука io: '+JSON.stringify(effective));
+
+ // ── the window ───────────────────────────────────────────────────────────────────────────
+ await call('resume');note('Прогрев io: 12 с');await sleep(12000);
+ await call('ioMark');
+ const sb=await call('evalWorker',scene);
+ note('Окно io: 20 с');await sleep(20000);
+ const io=await call('ioReport',{since:'mark'});
+ const sa=await call('evalWorker',scene);
+ await call('pause');
+
+ // ── ride-along 1: one answer per counter name ────────────────────────────────────────────
+ const live=await call('evalWorker',
+   "return import('/src/worker/modules/d3d9/shared-state.ts').then(m=>{"
+  +"const s=m.getD3D9PerfSnapshotWithDevices();return {backend:s.backend,api:s.api,wbuf:s.wbuf};});");
+ const rep=await call('report');
+ const repBackend=rep?.d3d9?.backend??{};
+ const names=[...new Set([...Object.keys(live.backend??{}),...Object.keys(repBackend)])];
+ const disagree=names.filter(n=>(live.backend?.[n]??0)!==(repBackend[n]??0))
+  .map(n=>({name:n,live:live.backend?.[n]??0,report:repBackend[n]??0}));
+
+ // ── ride-along 2: the draw ledger ────────────────────────────────────────────────────────
+ const rec=await call('evalWorker',
+   "return import('/src/worker/modules/d3d9/d3d9-perf.ts').then(m=>"
+  +"import('/src/worker/modules/d3d9/shared-state.ts').then(s=>{"
+  +"const snap=s.getD3D9PerfSnapshotWithDevices();"
+  +"return {reconcile:m.reconcileD3D9ArenaRuns(snap.wbuf,snap.api,snap.backend),"
+  +"unencoded:snap.indexedDrawUnencoded??null,dropped:snap.droppedDraws??null};}));");
+
+ // ── ride-along 3: the falsifiable prediction ─────────────────────────────────────────────
+ const b=live.backend??{};
+ const skips=b.bindGroupSetSkips??0, sets=b.bindGroupSet??b.bindGroupSets??0, same=b.bindGroupSetSameGroup??0;
+ const bindModel=same>0
+  ? 'CONFIRMED: asked and refused by the moving offset ('+same+' same-group sets, '+skips+' skips)'
+  : 'REFUTED or not exercised: sameGroup is '+same+' — the arena model predicts a LARGE value';
+
+ const row={requested:req,effective,io,
+  ride:{counterParity:{names:names.length,disagree},reconcile:rec,
+   bind:{sets,skips,sameGroup:same,verdict:bindModel}},
+  valid:valid(sb)&&valid(sa)&&sa.mover>sb.mover};
+ await save('io-config',row);
+ note('io: запросов '+io.guest?.requests+', ожидание '+io.guest?.waitMs+' мс (p50 '
+  +io.guest?.p50Ms+' / p95 '+io.guest?.p95Ms+' / p99 '+io.guest?.p99Ms+') | счётчики: '
+  +(disagree.length?'РАСХОДЯТСЯ в '+disagree.length+' именах':'сходятся во всех '+names.length)
+  +' | draws: '+(rec.reconcile?.healthy?'healthy':'unaccounted='+rec.reconcile?.apiDrawUnaccounted)
+  +' | bind: '+bindModel+(row.valid?'':' (ОТКЛОНЕНО)'));
+ return row;
+}
+
+/** The three NFSU ride-alongs, split out of `ioConfig` because they are NFSU-specific and the
+ *  io arm is not: project G's entire evidence is PAINKILLER (portfolio §"Project G" — 382 blocked
+ *  reads, 48 MB cache against a ~296 MB working set, 328 random faults against 28 sequential).
+ *  Measuring the io config on NFSU would be the `bindGroupSetSkips` mistake again: reading a
+ *  counter on a title that does not exercise the mechanism.
+ *
+ *  A lifetime `ioReport` is taken here anyway, as an OBSERVATION rather than a measurement —
+ *  how much this title streams at all is exactly what says whether it could ever have stood in. */
+export async function nfsuRideAlongs({call,save,note,scene}){
+ const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
+ const initial=await call('evalWorker',scene);
+ if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
+
+ // 1 — one answer per counter name (owed since session 1; argued from code, never measured).
+ const live=await call('evalWorker',
+   "return import('/src/worker/modules/d3d9/shared-state.ts').then(m=>{"
+  +"const s=m.getD3D9PerfSnapshotWithDevices();"
+  +"return {backend:s.backend,api:s.api,unencoded:s.indexedDrawUnencoded??null};});")
+  .catch(e=>({error:String(e),backend:{}}));
+ const rep=await call('report').catch(e=>({error:String(e)}));
+ const repBackend=rep?.d3d9?.backend??{};
+ const names=[...new Set([...Object.keys(live.backend??{}),...Object.keys(repBackend)])];
+ const disagree=names.filter(n=>(live.backend?.[n]??0)!==(repBackend[n]??0))
+  .map(n=>({name:n,live:live.backend?.[n]??0,report:repBackend[n]??0}));
+
+ // 2 — the draw ledger: itemised, or a named leak. It can no longer be quiet and wrong.
+ //     `wbuf` is NOT on the perf snapshot — dbg-commands enriches it from the dispatcher
+ //     (`dbg-commands.ts:2267`), and `report()` carries neither it nor the reconcile at all.
+ //     So this reads the dispatcher the same way rather than trusting the snapshot to be whole.
+ const rec=await call('evalWorker',
+   "return import('/src/worker/modules/d3d9/d3d9-perf.ts').then(m=>"
+  +"import('/src/worker/modules/d3d9/shared-state.ts').then(s=>{"
+  +"const snap=s.getD3D9PerfSnapshotWithDevices();"
+  +"const d=System.getInstance().process?.dispatcher;"
+  +"const wbuf=d&&d.getWbufStats?d.getWbufStats():null;"
+  +"return {wbuf,"
+  +"reconcile:wbuf?m.reconcileD3D9ArenaRuns(wbuf,snap.api,snap.backend):null,"
+  +"reconcileMissingBecause:wbuf?null:'dispatcher has no getWbufStats',"
+  +"unencoded:snap.indexedDrawUnencoded??null,dropped:snap.droppedDraws??null};}));")
+  .catch(e=>({error:String(e)}));
+
+ // 3 — the falsifiable prediction. The arena model says sameGroup must be LARGE.
+ const b=live.backend??{};
+ const skips=b.bindGroupSetSkips??0, sets=b.bindGroupSets??0, same=b.bindGroupSetSameGroup??0;
+ const verdict=sets===0?'NOT EXERCISED (0 sets)'
+  :same>sets*0.5?'CONFIRMED: '+same+' of '+sets+' sets repeated the group and were refused by the moving offset'
+  :same>0?'PARTIAL: '+same+' of '+sets+' — smaller than the arena model predicts, look again'
+  :'REFUTED: sameGroup is 0 against '+sets+' sets — the arena model does not hold';
+
+ // Observation only: does this title stream enough to have hosted measurement 3 at all?
+ const ioLifetime=await call('ioReport').catch(e=>({armed:false,reason:String(e)}));
+ // report() carries no wbuf and no arenaRunReconcile (grep build-report.ts) — worth recording,
+ // because CLAUDE.md sends every agent to report() first and the reconcile is invisible there.
+ const reportCarriesReconcile=rep?.d3d9?.arenaRunReconcile!==undefined;
+
+ const row={counterParity:{names:names.length,disagree,agrees:disagree.length===0,
+   liveError:live.error??null,reportError:rep?.error??null,reportCarriesReconcile},
+  reconcile:rec,bind:{sets,skips,sameGroup:same,verdict},
+  ioObservation:{armed:ioLifetime.armed,
+   requests:ioLifetime.guest?.requests??null,waitMs:ioLifetime.guest?.waitMs??null,
+   config:ioLifetime.ioWorker?.config??null,
+   note:'OBSERVATION, not measurement 3: project G is a Painkiller signature'},
+  valid:valid(await call('evalWorker',scene))};
+ await save('nfsu-ride-alongs',row);
+ note('счётчики: '+(row.counterParity.agrees?'сходятся во всех '+names.length:'РАСХОДЯТСЯ в '+disagree.length)
+  +' | draws: '+(rec.reconcile?.healthy?'healthy':'unaccounted='+rec.reconcile?.apiDrawUnaccounted)
+  +' | bind: '+verdict+' | io (наблюдение): '+(ioLifetime.armed?ioLifetime.guest?.requests+' запросов, '+ioLifetime.guest?.waitMs+' мс':'не стримится'));
+ return row;
+}
+
+/** The four numbers that discriminate the three explanations of `apiDrawUnaccounted`, plus the
+ *  control that separates two of them without any code reading at all.
+ *
+ *  WHY THE CONTROL MATTERS MORE THAN THE NUMBERS. `apiDrawIndexed` is minted at the API call and
+ *  `drawIndexedCalls` at encode, so a snapshot taken at an arbitrary instant counts every draw
+ *  already recorded into a frame that has not been submitted yet as "unaccounted", with an empty
+ *  ledger and nothing lost. A single reading cannot tell that from a leak — which is how "+100"
+ *  and "+4" were once divided by their windows and reported as a consistent rate. They are two
+ *  TAIL SIZES, not two event counts.
+ *
+ *  So: take the snapshot TWICE with presents in between. A work-in-flight residual moves with the
+ *  recording frame; a genuine leak accumulates monotonically. Three readings make the difference
+ *  between "wanders around a small number" and "grows" visible without arithmetic.
+ *
+ *  Decision tree (from the agent that built the counters):
+ *    threw: N present                          -> the exception path, closed
+ *    submitRefused:<site>: N present           -> the submit-refusal path, closed, site named
+ *    ledger empty AND recorded-calls == unaccounted -> nothing lost; the snapshot caught a frame
+ *                                                     mid-record
+ *    ledger empty AND api > recorded           -> an eighth path, between the api counter and
+ *                                                 recordDrawIndexed: half the search space gone
+ */
+export async function drawLedger({call,save,note,sleep,scene}){
+ const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
+ const initial=await call('evalWorker',scene);
+ if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
+
+ const read=()=>call('evalWorker',
+   "return import('/src/worker/modules/d3d9/d3d9-perf.ts').then(m=>"
+  +"import('/src/worker/modules/d3d9/shared-state.ts').then(s=>{"
+  +"const snap=s.getD3D9PerfSnapshotWithDevices();"
+  +"const d=System.getInstance().process?.dispatcher;"
+  +"const wbuf=d&&d.getWbufStats?d.getWbufStats():null;"
+  +"const b=snap.backend||{};"
+  +"return {t:performance.now(),serial:System.getInstance().services.render.getPresentSerial(),"
+  +"api:snap.api&&snap.api.drawIndexedPrimitive,"
+  +"backendCalls:b.drawIndexedCalls,recorded:b.drawIndexedRecorded,"
+  +"throws:b.indexedDrawThrows,"
+  +"skips:b.bindGroupSetSkips,sameGroup:b.bindGroupSetSameGroup,sets:b.bindGroupSets,"
+  +"unencoded:snap.indexedDrawUnencoded||null,dropped:snap.droppedDraws||null,"
+  +"arenaInvariantFailures:b.arenaRunInvariantFailures??null,"
+  +"reconcile:wbuf?m.reconcileD3D9ArenaRuns(wbuf,snap.api,snap.backend):null};}));");
+
+ await call('resume');note('Прогрев: 12 с');await sleep(12000);
+ const samples=[];
+ for(let i=0;i<3;i++){
+  samples.push(await read());
+  if(i<2){note('Снимок '+(i+1)+'/3 снят; 5 с до следующего');await sleep(5000);}
+ }
+ const after=await call('evalWorker',scene);
+ await call('pause');
+
+ const rows=samples.map(s=>({
+  serial:s.serial,
+  api:s.api,backendCalls:s.backendCalls,recorded:s.recorded,
+  // the reconcile's own residual
+  unaccounted:s.reconcile?s.reconcile.apiDrawUnaccounted:null,
+  // the two halves the new term splits it into
+  lostBeforeCommand:(s.api??0)-(s.recorded??0),
+  recordedNotConsumed:(s.recorded??0)-(s.backendCalls??0),
+  throws:s.throws,unencoded:s.unencoded,dropped:s.dropped,
+ }));
+ const resid=rows.map(r=>r.unaccounted);
+ const monotonic=resid.every((v,i)=>i===0||v>=resid[i-1]);
+ const grew=resid[2]-resid[0];
+ const ledgerNamed=samples.some(s=>s.unencoded&&Object.keys(s.unencoded).length>0);
+ const verdict=ledgerNamed
+  ? 'LEDGER NAMES IT: '+JSON.stringify(samples[2].unencoded)
+  : (rows.every(r=>r.lostBeforeCommand<=0)
+     ? 'WORK IN FLIGHT: api never exceeds recorded, so nothing was lost before a command existed'
+     : (monotonic&&grew>0
+        ? 'EIGHTH PATH: the residual is monotonic and grew by '+grew+' across '
+          +(rows[2].serial-rows[0].serial)+' presents, and api exceeds recorded'
+        : 'WANDERS: residual '+resid.join(' -> ')+' is not monotonic — consistent with a moving tail, not a leak'));
+
+ const row={samples:rows,residual:resid,monotonic,grewBy:grew,
+  presents:rows[2].serial-rows[0].serial,
+  bind:{sets:samples[2].sets,skips:samples[2].skips,sameGroup:samples[2].sameGroup},
+  arenaInvariantFailures:samples[2].arenaInvariantFailures,
+  verdict,valid:valid(after)};
+ await save('draw-ledger',row);
+ note('остаток '+resid.join(' → ')+' за '+row.presents+' present | '+verdict
+  +(row.valid?'':' (ОТКЛОНЕНО)'));
+ return row;
+}
+
+/** Step 1 of the render-worker experiment: how often would the guest thread have to FENCE?
+ *
+ *  THE HYPOTHESIS BEING TESTED. 15-22% of the worker thread is work that runs on the guest's
+ *  thread and owes the guest no synchronous answer (the ring drain + the executor's frame walk).
+ *  Moving it to its own worker over shared memory stops that time summing with the guest's — but
+ *  only if the guest rarely asks a question whose answer depends on the queued work. Every such
+ *  call is a cross-thread round trip, and at a high enough rate they eat the whole win.
+ *
+ *  So this is the gate, and it is deliberately measured BEFORE anything is built: a coarse
+ *  per-frame rate of calls by class. The classification is by name suffix and is PRINTED with the
+ *  result, because a classifier nobody can audit is how a plausible number gets attributed to the
+ *  wrong cause — that failure happened six times in this codebase in one session.
+ *
+ *  Three classes, and the distinction that matters is the third:
+ *    fireAndForget      returns S_OK with nothing the guest reads back  -> never a fence
+ *    answerableLocally  a Get* we serve from our own shadow, or a Create* whose handle we can
+ *                       mint eagerly                                    -> never a fence
+ *    needsQueuedWork    the answer depends on work already queued: Lock/LockRect on a resource
+ *                       in flight, readbacks, query GetData             -> A FENCE
+ *
+ *  D3D9 already carries the contract that makes the design possible: D3DLOCK_DISCARD and
+ *  D3DLOCK_NOOVERWRITE exist precisely so a driver can keep rendering while the app writes, and
+ *  real drivers rely on it. So a high Lock rate is NOT fatal on its own — it only decides whether
+ *  the next (more expensive) step is a per-flag breakdown. That refinement is worth building only
+ *  if this coarse number lands anywhere near the draw rate.
+ */
+export async function fenceCensus({call,save,note,sleep,scene}){
+ const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
+ const initial=await call('evalWorker',scene);
+ if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
+
+ const snap=async()=>{
+  const c=await call('apiCensus');
+  const s=await call('evalWorker',scene);
+  const rows={};
+  for(const r of (c?.calls??c??[])){ if(r&&r.api) rows[r.api]=r.count; }
+  return {rows,serial:s.serial,t:s.time};
+ };
+
+ await call('resume');note('Прогрев: 10 с');await sleep(10000);
+ const a=await snap();
+ note('Окно переписи вызовов: 20 с');await sleep(20000);
+ const b=await snap();
+ await call('pause');
+ const frames=b.serial-a.serial;
+ if(frames<50)throw Error('too few presents in the window: '+frames);
+
+ // ── the classifier, printed with the result ─────────────────────────────────────────────
+ const FENCE=[/_Lock(Rect|Box)?$/,/_GetRenderTargetData$/,/_GetFrontBufferData$/,/_GetData$/,
+              /_GetDC$/,/_TestCooperativeLevel$/,/_Present$/];
+ const LOCAL=[/_Get[A-Z]/,/_Create[A-Z]/,/_Release$/,/_AddRef$/,/_QueryInterface$/];
+ const cls=n=>FENCE.some(r=>r.test(n))?'needsQueuedWork'
+            :LOCAL.some(r=>r.test(n))?'answerableLocally':'fireAndForget';
+
+ const delta={},byClass={fireAndForget:0,answerableLocally:0,needsQueuedWork:0};
+ const fenceRows=[];
+ for(const [api,n] of Object.entries(b.rows)){
+  const d=n-(a.rows[api]??0);
+  if(d<=0)continue;
+  delta[api]=d;
+  const k=cls(api);
+  byClass[k]+=d;
+  if(k==='needsQueuedWork')fenceRows.push([api,d,+(d/frames).toFixed(2)]);
+ }
+ fenceRows.sort((x,y)=>y[1]-x[1]);
+ const draws=Object.entries(delta).filter(([n])=>/_Draw/.test(n)).reduce((s,[,n])=>s+n,0);
+ const total=byClass.fireAndForget+byClass.answerableLocally+byClass.needsQueuedWork;
+ const perFrame=n=>+(n/frames).toFixed(2);
+
+ const row={frames,draws,drawsPerFrame:perFrame(draws),total,
+  byClass,perFrame:{fireAndForget:perFrame(byClass.fireAndForget),
+   answerableLocally:perFrame(byClass.answerableLocally),
+   needsQueuedWork:perFrame(byClass.needsQueuedWork)},
+  fencesPerDraw:draws?+(byClass.needsQueuedWork/draws).toFixed(4):null,
+  fenceRows:fenceRows.slice(0,15),
+  classifier:{fence:FENCE.map(String),local:LOCAL.map(String)},
+  // Ring-carried setters may not increment `count` (the row carries `wbufCount` separately), so
+  // fireAndForget here is a LOWER bound. The decisive figure is absolute — fences per frame — and
+  // a call that returns a value cannot be ring-buffered at all, so that half is unaffected.
+  caveat:'fireAndForget may be understated: ring-carried calls count in wbufCount, not count',
+  wbufCounts:Object.fromEntries((await call('apiCensus'))?.calls
+   ?.filter(r=>r.wbufCount)?.slice(0,12)?.map(r=>[r.api,r.wbufCount])??[]),
+  topCalls:Object.entries(delta).sort((x,y)=>y[1]-x[1]).slice(0,12)
+   .map(([n,c])=>[n,c,perFrame(c),cls(n)]),
+  valid:valid(await call('evalWorker',scene))};
+ await save('fence-census',row);
+ note('кадров '+frames+', draw/кадр '+row.drawsPerFrame
+  +' | фенсов/кадр '+row.perFrame.needsQueuedWork
+  +' ('+row.fencesPerDraw+' на draw) | без ответа '+row.perFrame.fireAndForget
+  +'/кадр, локально '+row.perFrame.answerableLocally+'/кадр'
+  +' | топ фенсов: '+fenceRows.slice(0,4).map(r=>r[0].replace(/^d3d9:IDirect3DDevice9_/,'')+' '+r[2]).join(', ')
+  +(row.valid?'':' (ОТКЛОНЕНО)'));
+ return row;
+}

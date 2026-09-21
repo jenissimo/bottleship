@@ -47,13 +47,14 @@
  * (but bindable) import does NOT fail the run — it is a bring-up work list, not a gate.
  */
 
-import { readdirSync, readFileSync, statSync } from "fs";
+import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync } from "fs";
 import { join, resolve, basename, extname } from "path";
 import { pathToFileURL } from "url";
 import { spawnSync } from "child_process";
 import { parsePeImports, isPeImage } from "../packages/formats/src/pe";
 import { resolveThunkedDllAlias } from "../src/worker/core/dll-aliases";
 import { ApiCoverageIndex } from "../src/worker/tools/api-coverage";
+import { deriveStackCleanupFromMangledName } from "../src/worker/core/thunking/msvc-mangling";
 
 const REPO = resolve(import.meta.dir, "..");
 
@@ -242,6 +243,10 @@ async function loadKnownNames(): Promise<ArityTables> {
  * The step numbering follows that function so the two stay comparable.
  */
 function isBindable(tables: ArityTables, dll: string, name: string): boolean {
+    // The loader derives cleanup straight from MSVC C++ mangling (it encodes the
+    // convention and the parameter list), so a mangled name needs no table at all.
+    // Case-sensitive — the mangling is, and `func` below is lowercased.
+    if (name.startsWith("?") && deriveStackCleanupFromMangledName(name) !== undefined) return true;
     const func = name.toLowerCase();
     const table = tables.byDll.get(dll);
     const decorated = /@\d+$/.test(func);
@@ -317,10 +322,14 @@ function* walk(dir: string): Generator<string> {
 }
 
 // A PE is a PE whatever it is named. Mod loaders (.asi), DirectShow filters (.ax), control
-// panels (.cpl), codecs (.acm/.drv) and COM servers (.ocx) all load as DLLs and all fail the
-// same way on one unbindable import — filtering to .exe/.dll reports "all bindable" for a
-// game whose plugins are the very things that break.
-const PE_EXTENSIONS = new Set([".exe", ".dll", ".asi", ".ax", ".ocx", ".cpl", ".drv", ".acm", ".flt", ".mix", ".m3d"]);
+// panels (.cpl), codecs (.acm/.drv), COM servers (.ocx) and engine modules (SAGE's .game)
+// all load as DLLs and all fail the same way on one unbindable import — filtering to
+// .exe/.dll reports "all bindable" for a game whose plugins are the very things that break.
+// The list is only needed where opening the file is expensive (a .wgb entry has to be
+// extracted whole); a directory scan sniffs the header instead and needs no list at all.
+const PE_EXTENSIONS = new Set([
+    ".exe", ".dll", ".asi", ".ax", ".ocx", ".cpl", ".drv", ".acm", ".flt", ".mix", ".m3d", ".game",
+]);
 
 function listWgbEntries(archive: string): string[] {
     const list = spawnSync("bun", [join(REPO, "tools", "wgb.ts"), "list", archive], {
@@ -345,9 +354,23 @@ function* peFilesFromWgb(archive: string, entries = listWgbEntries(archive)): Ge
     }
 }
 
+/** `MZ` in the first two bytes, without reading the rest — a `.big` archive costs 2 bytes. */
+function looksLikePe(file: string): boolean {
+    let fd: number | undefined;
+    try {
+        fd = openSync(file, "r");
+        const head = new Uint8Array(2);
+        return readSync(fd, head, 0, 2, 0) === 2 && head[0] === 0x4d && head[1] === 0x5a;
+    } catch {
+        return false;
+    } finally {
+        if (fd !== undefined) closeSync(fd);
+    }
+}
+
 function* peFilesFromDir(dir: string): Generator<[string, Uint8Array]> {
     for (const file of walk(dir)) {
-        if (!PE_EXTENSIONS.has(extname(file).toLowerCase())) continue;
+        if (!looksLikePe(file)) continue;
         yield [basename(file), new Uint8Array(readFileSync(file))];
     }
 }

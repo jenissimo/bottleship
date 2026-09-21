@@ -314,6 +314,40 @@ class SourceGraph {
         return { records: [], reason: `unsupported merge source (${ts.SyntaxKind[expr.kind]})`, file: null };
     }
 
+    /**
+     * The export NAME an `exports[…] = handler` key denotes: a string literal, or a member
+     * of a const name table (`exports[GOG_GALAXY_EXPORTS.getInstance]`). A module that
+     * keeps its mangled MSVC names in one `as const` table — the readable way to write
+     * them — otherwise registers handlers this scan cannot see, and the census then calls
+     * a working export unimplemented. Follows one import hop; anything else is null.
+     */
+    resolveExportKey(expr: ts.Node, file: string, depth = 0): string | null {
+        if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
+        if (depth > 2) return null;
+        if (ts.isAsExpression(expr) || ts.isParenthesizedExpression(expr)) {
+            return this.resolveExportKey(expr.expression, file, depth + 1);
+        }
+        if (!ts.isPropertyAccessExpression(expr) || !ts.isIdentifier(expr.expression)
+            || !ts.isIdentifier(expr.name)) {
+            return null;
+        }
+        const table = expr.expression.text;
+        const imported = this.imports(file).get(table);
+        const home = imported?.file ?? file;
+        let init = this.findInitializer(home, imported?.symbol && imported.symbol !== '*'
+            ? imported.symbol : table);
+        while (init && (ts.isAsExpression(init) || ts.isParenthesizedExpression(init))) {
+            init = init.expression;
+        }
+        if (!init || !ts.isObjectLiteralExpression(init)) return null;
+        for (const prop of init.properties) {
+            if (!ts.isPropertyAssignment(prop)) continue;
+            const key = ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) ? prop.name.text : null;
+            if (key === expr.name.text) return literalTextOf(prop.initializer);
+        }
+        return null;
+    }
+
     /** The file that builds the object an expression denotes, without enumerating it. */
     private definingFileOf(expr: ts.Node, file: string, seen: Set<string>): string | null {
         if (ts.isIdentifier(expr)) {
@@ -670,7 +704,7 @@ function scanExtraExports(filePath: string, graph: SourceGraph): ImplRecord[] {
             const obj = node.left.expression;
             const onExports = (ts.isIdentifier(obj) && obj.text === 'exports')
                 || (ts.isPropertyAccessExpression(obj) && ts.isIdentifier(obj.name) && obj.name.text === 'exports');
-            const key = literalText(node.left.argumentExpression);
+            const key = graph.resolveExportKey(node.left.argumentExpression, filePath);
             if (onExports && key) out.push(makeRecord(key, node.right, filePath, sf, node));
         }
 

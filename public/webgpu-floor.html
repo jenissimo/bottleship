@@ -1,0 +1,168 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebGPU submit floor</title>
+<body style="font:13px ui-monospace,monospace;background:#111;color:#ddd;padding:16px">
+<pre id="out">starting...</pre>
+<script type="module">
+const out = document.getElementById('out');
+const log = (s) => { out.textContent += "\n" + s; console.log(s); };
+window.__FLOOR__ = { done: false, rows: null, error: null };
+
+// Encode-side cost only. The GPU is deliberately starved: the vertex shader emits a
+// degenerate triangle, so rasterisation is ~0 and what is left is the JS + Dawn-wire cost
+// of issuing the commands -- which is the part a Rust ingest/resolve tier could remove.
+const WGSL = [
+  'struct U { k: vec4f };',
+  '@group(0) @binding(0) var<uniform> u: U;',
+  '@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {',
+  '  return vec4f(u.k.x * 0.0, 0.0, 0.0, 1.0);',
+  '}',
+  '@fragment fn fs() -> @location(0) vec4f { return vec4f(0.0); }'
+].join('\n');
+
+async function main() {
+  if (!navigator.gpu) throw new Error("no navigator.gpu");
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error("no adapter");
+  const device = await adapter.requestDevice();
+  device.addEventListener('uncapturederror', (e) => log("GPU ERROR: " + e.error.message));
+
+  const FMT = 'rgba8unorm';
+  const target = device.createTexture({
+    size: [1024, 768], format: FMT, usage: GPUTextureUsage.RENDER_ATTACHMENT
+  });
+  const view = target.createView();
+
+  const module = device.createShaderModule({ code: WGSL });
+  const bgl = device.createBindGroupLayout({
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', hasDynamicOffset: true } }]
+  });
+  const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
+
+  // Distinct pipelines, so a "pipeline set" really rebinds.
+  const PIPELINES = 192;
+  const pipelines = [];
+  for (let i = 0; i < PIPELINES; i++) {
+    pipelines.push(device.createRenderPipeline({
+      layout: layout,
+      vertex: { module: module, entryPoint: 'vs' },
+      fragment: { module: module, entryPoint: 'fs', targets: [{ format: FMT, writeMask: (i & 0xF) }] },
+      primitive: { topology: 'triangle-list' }
+    }));
+  }
+
+  // Uniform buffer with dynamic offsets: one bind group, many offsets, is how the target
+  // architecture wants constants addressed.
+  const ALIGN = device.limits.minUniformBufferOffsetAlignment;
+  const SLOTS = 2048;
+  const ubo = device.createBuffer({ size: ALIGN * SLOTS, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const BINDGROUPS = 256;
+  const bindGroups = [];
+  for (let i = 0; i < BINDGROUPS; i++) {
+    bindGroups.push(device.createBindGroup({
+      layout: bgl, entries: [{ binding: 0, resource: { buffer: ubo, offset: 0, size: 16 } }]
+    }));
+  }
+
+  const vbo = device.createBuffer({ size: 4096, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+  const ibo = device.createBuffer({ size: 4096, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+  const constUpload = new Float32Array(64);
+
+  function encodeFrame(cfg) {
+    const draws = cfg.draws, passes = cfg.passes, submits = cfg.submits;
+    const drawsPerPass = passes > 0 ? Math.ceil(draws / passes) : draws;
+    const passesPerSubmit = submits > 0 ? Math.ceil(passes / submits) : passes;
+    const pipeEvery = cfg.pipelineSets > 0 ? Math.max(1, Math.round(draws / cfg.pipelineSets)) : Infinity;
+    const bindEvery = cfg.bindGroupSets > 0 ? Math.max(1, Math.round(draws / cfg.bindGroupSets)) : Infinity;
+    const vbEvery = cfg.vertexSets > 0 ? Math.max(1, Math.round(draws / cfg.vertexSets)) : Infinity;
+
+    let enc = device.createCommandEncoder();
+    let passesInEnc = 0;
+    let drawn = 0;
+    for (let p = 0; p < passes; p++) {
+      const rp = enc.beginRenderPass({
+        colorAttachments: [{ view: view, loadOp: p === 0 ? 'clear' : 'load', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 1 } }]
+      });
+      // A pass always binds once -- bind groups are not inherited across passes.
+      rp.setPipeline(pipelines[p % PIPELINES]);
+      rp.setBindGroup(0, bindGroups[p % BINDGROUPS], [0]);
+      rp.setVertexBuffer(0, vbo);
+      rp.setIndexBuffer(ibo, 'uint16');
+      for (let d = 0; d < drawsPerPass && drawn < draws; d++, drawn++) {
+        if (drawn % pipeEvery === 0) rp.setPipeline(pipelines[drawn % PIPELINES]);
+        if (drawn % bindEvery === 0) rp.setBindGroup(0, bindGroups[drawn % BINDGROUPS], [(drawn % SLOTS) * ALIGN]);
+        if (drawn % vbEvery === 0) { rp.setVertexBuffer(0, vbo); rp.setIndexBuffer(ibo, 'uint16'); }
+        rp.drawIndexed(3, 1, 0, 0, 0);
+      }
+      rp.end();
+      passesInEnc++;
+      if (passesInEnc >= passesPerSubmit && p < passes - 1) {
+        device.queue.submit([enc.finish()]);
+        enc = device.createCommandEncoder();
+        passesInEnc = 0;
+      }
+    }
+    // Buffer writes are queue-side, not encoder-side.
+    for (let w = 0; w < cfg.bufferWrites; w++) {
+      device.queue.writeBuffer(ubo, (w % SLOTS) * ALIGN, constUpload, 0, 16);
+    }
+    device.queue.submit([enc.finish()]);
+  }
+
+  async function measure(name, cfg, iters, warmup) {
+    iters = iters || 60; warmup = warmup || 20;
+    for (let i = 0; i < warmup; i++) encodeFrame(cfg);
+    await device.queue.onSubmittedWorkDone();
+    const samples = [];
+    for (let i = 0; i < iters; i++) {
+      const t0 = performance.now();
+      encodeFrame(cfg);
+      samples.push(performance.now() - t0);
+      // Keep the GPU from becoming the limiter and back-pressuring the encode loop.
+      if ((i & 7) === 7) await device.queue.onSubmittedWorkDone();
+    }
+    await device.queue.onSubmittedWorkDone();
+    samples.sort((a, b) => a - b);
+    const med = samples[samples.length >> 1];
+    const p10 = samples[Math.floor(samples.length * 0.1)];
+    const p90 = samples[Math.floor(samples.length * 0.9)];
+    log(name.padEnd(36) + " median " + med.toFixed(3) + " ms   p10 " + p10.toFixed(3) + "  p90 " + p90.toFixed(3));
+    return { name: name.trim(), cfg: cfg, medianMs: med, p10Ms: p10, p90Ms: p90, samples: samples.length };
+  }
+
+  // The live NFSU frame, measured 2026-09-11.
+  const LIVE = { draws: 1509, passes: 64, submits: 18, pipelineSets: 156, bindGroupSets: 1269, bufferWrites: 739, vertexSets: 598 };
+  const V = (o) => Object.assign({}, LIVE, o);
+
+  const info = adapter.info || {};
+  log("adapter: " + (info.vendor || '?') + " " + (info.architecture || '') + " " + (info.description || ''));
+  log("minUniformBufferOffsetAlignment=" + ALIGN);
+  log("");
+  log("Each row is ONE frame of encoding at that shape. GPU work is ~0 by construction");
+  log("(degenerate triangles), so this is the JS + Dawn-wire cost of issuing the commands.");
+  log("");
+
+  const rows = [];
+  rows.push(await measure("LIVE shape (full)", LIVE));
+  rows.push(await measure("  passes+submits only, no draws", V({ draws: 0, pipelineSets: 0, bindGroupSets: 0, vertexSets: 0, bufferWrites: 0 })));
+  rows.push(await measure("  + draws (1 pipe, 1 bind)", V({ pipelineSets: 0, bindGroupSets: 0, vertexSets: 0, bufferWrites: 0 })));
+  rows.push(await measure("  + pipeline sets", V({ bindGroupSets: 0, vertexSets: 0, bufferWrites: 0 })));
+  rows.push(await measure("  + bind-group sets", V({ vertexSets: 0, bufferWrites: 0 })));
+  rows.push(await measure("  + vertex/index sets", V({ bufferWrites: 0 })));
+  rows.push(await measure("  + buffer writes (= LIVE)", LIVE));
+  log("");
+  rows.push(await measure("one submit per pass (64)", V({ submits: 64 })));
+  rows.push(await measure("one submit per frame (1)", V({ submits: 1 })));
+  rows.push(await measure("one pass, one submit", V({ passes: 1, submits: 1 })));
+  log("");
+  rows.push(await measure("2066 draws (portfolio frame)", V({ draws: 2066, pipelineSets: 167, bindGroupSets: 1900 })));
+
+  window.__FLOOR__ = { done: true, rows: rows, adapter: info, align: ALIGN, live: LIVE };
+  log("");
+  log("DONE");
+}
+main().catch((e) => {
+  window.__FLOOR__ = { done: true, rows: null, error: String((e && e.stack) || e) };
+  log("ERROR: " + e);
+});
+</script>

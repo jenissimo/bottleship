@@ -877,6 +877,21 @@ export class SignatureValidator {
         };
         collectOrdinalArrays(sourceFile);
 
+        // Descriptors routinely keep groups of exports in a named array and spread it into
+        // `functions` (comctl32's image-list block, msvcrt's UCRT block). Without resolving
+        // the spread this scan reads those groups as absent, and every export in them then
+        // looks undeclared to the coverage index — silently, which is the worst way for a
+        // census to be wrong.
+        const namedArrays: Map<string, ts.ArrayLiteralExpression> = new Map();
+        const collectNamedArrays = (node: ts.Node) => {
+            if (ts.isVariableDeclaration(node) && node.initializer
+                && ts.isArrayLiteralExpression(node.initializer) && ts.isIdentifier(node.name)) {
+                namedArrays.set(node.name.text, node.initializer);
+            }
+            ts.forEachChild(node, collectNamedArrays);
+        };
+        collectNamedArrays(sourceFile);
+
         const addFunction = (name: string, argCount: number): void => {
             if (!name) return;
             if (typeof argCount !== 'number' || Number.isNaN(argCount)) return;
@@ -922,6 +937,7 @@ export class SignatureValidator {
             }
         };
 
+        const spreadArraysSeen = new Set<ts.ArrayLiteralExpression>();
         const extractFunctionsFromArray = (node: ts.Node): void => {
             if (!ts.isArrayLiteralExpression(node)) return;
             for (const element of node.elements) {
@@ -954,6 +970,14 @@ export class SignatureValidator {
                 // Handle spread elements like ...WSOCK_ORDINALS.map(...)
                 if (ts.isSpreadElement(element)) {
                     const spreadExpr = element.expression;
+                    // `...localGroup` — a named array of descriptors declared in this file.
+                    if (ts.isIdentifier(spreadExpr)) {
+                        const group = namedArrays.get(spreadExpr.text);
+                        if (group && !spreadArraysSeen.has(group)) {
+                            spreadArraysSeen.add(group);
+                            extractFunctionsFromArray(group);
+                        }
+                    }
                     // Check for ARRAY.map(...) pattern
                     if (ts.isCallExpression(spreadExpr) &&
                         ts.isPropertyAccessExpression(spreadExpr.expression) &&
