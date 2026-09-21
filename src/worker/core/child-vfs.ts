@@ -1,4 +1,5 @@
 import { VirtualFileSystem, type VfsFileHandle } from '../runtime/filesystem/vfs';
+import { Logger, LogCategory } from './logger';
 
 // The parent owns the filesystem and file objects; the child owns its cwd and address space.
 // Blocking only the child worker lets synchronous CRT/loader reads use the same VFS as async APIs.
@@ -26,6 +27,27 @@ type Request = { method: string; args: unknown[] };
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** Ceiling on waiting out a child's in-flight VFS dispatches. Generous: a real commit of a
+ *  large write must never be cut short, and only a wedged one should ever reach it. */
+let CHILD_VFS_CLOSE_BUDGET_MS = 30_000;
+/** A test that must observe the ceiling fire cannot wait out the shipping one. */
+export function setChildVfsCloseBudgetForTests(ms: number): void { CHILD_VFS_CLOSE_BUDGET_MS = ms; }
+
+/**
+ * Wait for `work`, but not forever: resolves true if the budget expired first.
+ *
+ * `work` is never cancelled — a bound that abandons unwritten bytes is worse than the hang
+ * it replaces. Only the WAIT is bounded, so the caller can report a named failure and
+ * release whatever it was holding while the operation keeps running.
+ */
+export function settleWithin(work: Promise<unknown>, budgetMs: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return Promise.race([
+        work.then(() => false, () => false),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), budgetMs); }),
+    ]).finally(() => clearTimeout(timer));
+}
+
 export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArrayBuffer,
     onMutation?: (path: string) => void,
 ) {
@@ -34,7 +56,7 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
     const handles = new Map<number, VfsFileHandle>();
     let nextHandle = 1;
     let closed = false;
-    const pending = new Set<Promise<void>>();
+    const pending = new Map<Promise<void>, string>();
     const pack = (value: unknown): unknown => {
         if (value instanceof Uint8Array) return { childBytes: Array.from(value) };
         if (value && typeof value === 'object' && (value as VfsFileHandle).kind === 'file'
@@ -84,15 +106,35 @@ export function createChildVfsServer(vfs: VirtualFileSystem, buffer: SharedArray
     return Object.assign((request: Request): Promise<void> => {
         if (closed) return Promise.resolve();
         const work = dispatch(request);
-        pending.add(work);
+        pending.set(work, request.method);
         void work.then(() => pending.delete(work), () => pending.delete(work));
         return work;
     }, {
+        /**
+         * Bounded, because this is awaited on the path that makes a child's handle stop
+         * being STILL_ACTIVE: a dispatch that never settles (a wedged overlay commit is
+         * the realistic one) would otherwise hang the parent's guest forever, with the
+         * fault three layers below the symptom.
+         *
+         * The bound is on the WAIT only — the dispatch keeps running and its bytes still
+         * reach the VFS, so nothing is abandoned; what is given up is the ordering
+         * guarantee that in-flight work landed before the handle signalled. That is worth
+         * naming, so the warning names the operations still outstanding.
+         */
         close: async (): Promise<void> => {
             closed = true;
-            await Promise.all([...pending]);
+            const stalled = await settleWithin(Promise.all([...pending.keys()]),
+                CHILD_VFS_CLOSE_BUDGET_MS);
+            if (stalled) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `Child VFS server close: ${pending.size} dispatch(es) still in flight after ` +
+                    `${CHILD_VFS_CLOSE_BUDGET_MS}ms [${[...new Set(pending.values())].join(', ')}] — ` +
+                    `releasing the child anyway; their writes may land after its handle signals`);
+            }
             handles.clear();
         },
+        /** What close() would still be waiting on, for a caller reporting a stalled drain. */
+        pendingOperations: (): string[] => [...new Set(pending.values())],
     });
 }
 

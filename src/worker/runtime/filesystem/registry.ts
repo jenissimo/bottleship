@@ -43,6 +43,16 @@ export type RegistryMutation =
     | { op: "deleteKey"; key: string; subKey?: string }
     | { op: "deleteValue"; key: string; name: string };
 
+/**
+ * Which neighbour on the process tree a replayed mutation arrived from.
+ *
+ * The hive is one object shared by the whole tree, so a write has to reach every process
+ * in it, not just the one that owns persistence. Each store relays an applied mutation to
+ * every neighbour EXCEPT its origin; a process tree has no cycles, so that terminates —
+ * without the exclusion a parent and its child trade one write forever.
+ */
+export type RegistryOrigin = { from: "owner" } | { from: "child"; id?: number };
+
 /** VER_PLATFORM_WIN32_WINDOWS — the Win9x branch of EmulatorConfig.osVersion. */
 const PLATFORM_WIN32_WINDOWS = 1;
 
@@ -126,6 +136,8 @@ export class RegistryStore {
     private accessLogBuffer: RegistryAccessLogEntry[] = [];
     private onChangeCallback: (() => void) | null = null;
     private mutationSink: ((mutation: RegistryMutation) => void) | null = null;
+    private downstreamSink: ((mutation: RegistryMutation, exceptChildId?: number) => void) | null = null;
+    private replayOrigin: RegistryOrigin | null = null;
     private readonly MAX_LOG_BUFFER_SIZE = 1000;
 
     reset(): void {
@@ -135,6 +147,8 @@ export class RegistryStore {
         this.gameId = "";
         this.onChangeCallback = null;
         this.mutationSink = null;
+        this.downstreamSink = null;
+        this.replayOrigin = null;
     }
 
     /** The system baseline, built on first use so it reflects the manifest's osVersion
@@ -466,31 +480,61 @@ export class RegistryStore {
         this.mutationSink = sink;
     }
 
+    /**
+     * Forward every guest write DOWN to the live children of this process.
+     *
+     * The upward sink alone makes the hive one-way: a parent that writes while its child
+     * runs is invisible to that child's copy, which on Windows is not a thing that can
+     * happen. `exceptChildId` is the origin exclusion that keeps the relay finite.
+     */
+    setDownstreamSink(sink: ((mutation: RegistryMutation, exceptChildId?: number) => void) | null): void {
+        this.downstreamSink = sink;
+    }
+
     /** Replay a mutation forwarded from another process, as if this store's API produced it. */
-    applyMutation(mutation: RegistryMutation): void {
-        switch (mutation.op) {
-            case "setValue":
-                this.setValue(mutation.key, mutation.name, mutation.value);
-                break;
-            case "createKey":
-                this.createKey(mutation.root, mutation.path);
-                break;
-            case "deleteKey":
-                this.deleteKey(mutation.key, mutation.subKey);
-                break;
-            case "deleteValue":
-                this.deleteValue(mutation.key, mutation.name);
-                break;
+    // A mutation with no stated origin came from below — that is the direction that
+    // composes, so it keeps travelling up. An id-less child cannot be excluded from the
+    // downward relay; the message route always supplies one.
+    applyMutation(mutation: RegistryMutation, origin: RegistryOrigin = { from: "child" }): void {
+        // Read back inside emit(), which the setters below reach synchronously.
+        const outer = this.replayOrigin;
+        this.replayOrigin = origin;
+        try {
+            switch (mutation.op) {
+                case "setValue":
+                    this.setValue(mutation.key, mutation.name, mutation.value);
+                    break;
+                case "createKey":
+                    this.createKey(mutation.root, mutation.path);
+                    break;
+                case "deleteKey":
+                    this.deleteKey(mutation.key, mutation.subKey);
+                    break;
+                case "deleteValue":
+                    this.deleteValue(mutation.key, mutation.name);
+                    break;
+            }
+        } finally {
+            this.replayOrigin = outer;
         }
     }
 
     /** Sink failures must not fail the guest's write — the local store is already correct. */
     private emit(mutation: RegistryMutation): void {
-        if (!this.mutationSink) return;
-        try {
-            this.mutationSink(mutation);
-        } catch (e) {
-            Logger.warn(LogCategory.SYSTEM, `Registry mutation forward failed: ${e}`);
+        const origin = this.replayOrigin;
+        if (this.mutationSink && origin?.from !== "owner") {
+            try {
+                this.mutationSink(mutation);
+            } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `Registry mutation forward failed: ${e}`);
+            }
+        }
+        if (this.downstreamSink) {
+            try {
+                this.downstreamSink(mutation, origin?.from === "child" ? origin.id : undefined);
+            } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `Registry mutation relay to children failed: ${e}`);
+            }
         }
     }
 

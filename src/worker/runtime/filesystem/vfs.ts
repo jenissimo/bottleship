@@ -3350,7 +3350,17 @@ class OpfsOverlay {
                     clearTimeout(cacheEntry.flushTimer);
                     cacheEntry.flushTimer = null;
                 }
-                if (cacheEntry.flushInFlight) {
+                // Drop the entry up front: ensureSyncHandle() refuses while a writer entry
+                // exists, and removing it lets the post-commit reader open a fresh sync
+                // handle. It also gives the drain below an END: the write paths attach a
+                // buffered run to whatever writerCache holds for this key.
+                this.writerCache.delete(key);
+
+                // Draining once is not enough. A flush that starts while we are awaiting the
+                // previous one installs its own flushInFlight, and it has ALREADY taken its
+                // bytes out of memoryBuffer — so those bytes are in neither place we look,
+                // and its write lands in the stream closed below. Drain until quiescent.
+                while (cacheEntry.flushInFlight) {
                     try {
                         await cacheEntry.flushInFlight;
                     } catch (e) {
@@ -3361,10 +3371,6 @@ class OpfsOverlay {
                 const pending = cacheEntry.memoryBuffer;
                 const pendingOffset = cacheEntry.bufferOffset;
                 const replace = cacheEntry.replaceExisting;
-
-                // Drop the entry up front: ensureSyncHandle() refuses while a writer entry
-                // exists, and removing it lets the post-commit reader open a fresh sync handle.
-                this.writerCache.delete(key);
 
                 try {
                     if (cacheEntry.writer) {

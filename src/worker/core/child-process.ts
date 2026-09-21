@@ -1,4 +1,5 @@
-import { CHILD_IO_BYTES, createChildVfsServer } from './child-vfs';
+import { CHILD_IO_BYTES, createChildVfsServer, settleWithin } from './child-vfs';
+import { Logger, LogCategory } from './logger';
 import type { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/registry';
 import type { NamedObjectSpec } from '../modules/kernel32/named-objects';
@@ -33,6 +34,27 @@ export interface ChildProcessRecord extends ChildProcessRequest {
     guestExitCode?: number;
     fault?: unknown;
     logs?: unknown;
+    /** Which teardown step outlived its budget, if the record was settled without it. */
+    stalled?: string;
+}
+
+/**
+ * Ceiling on a child's teardown drain. `completion` settling is what makes the guest's
+ * process handle stop being STILL_ACTIVE, so a cleanup or a flush that never settles is
+ * an unbounded guest hang with nothing to see. The budget is on the WAIT only: the drain
+ * keeps running, and the owning process flushes again at its own exit barrier.
+ */
+let CHILD_DRAIN_BUDGET_MS = 30_000;
+/** A test that must observe the ceiling fire cannot wait out the shipping one. */
+export function setChildDrainBudgetForTests(ms: number): void { CHILD_DRAIN_BUDGET_MS = ms; }
+
+/** Records a teardown step that outlived its budget, and says what the caller gets instead. */
+function stall(record: ChildProcessRecord, step: string): void {
+    record.stalled = record.stalled ? `${record.stalled}, ${step}` : step;
+    Logger.warn(LogCategory.SYSTEM,
+        `Child process "${record.imagePath}": ${step} did not settle within ${CHILD_DRAIN_BUDGET_MS}ms — ` +
+        `signalling its handle anyway; the operation is still running and its bytes are not lost, ` +
+        `but the guest may read this child's output before it lands`);
 }
 
 export interface ChildProcessTask {
@@ -72,8 +94,28 @@ export function setChildBootContext(provider: typeof bootContext): void { bootCo
 
 /** Applies a child's registry write to THIS process's store — the registry is system-wide,
  *  so the child's hive is ours, and only we hold the gameId and the autosave that persist it. */
-let applyChildRegistry: ((mutation: RegistryMutation) => void) | undefined;
+let applyChildRegistry: ((mutation: RegistryMutation, childId: number) => void) | undefined;
 export function setChildRegistrySink(apply: typeof applyChildRegistry): void { applyChildRegistry = apply; }
+
+/** Live children that can still be handed a registry write made above them. */
+const registryRelays = new Map<number, (mutation: RegistryMutation) => void>();
+let nextRegistryRelay = 1;
+
+/**
+ * Relay one registry write DOWN to this process's live children.
+ *
+ * The other half of the child→owner forwarding: the hive is system-wide, so a parent that
+ * writes while its child runs must be visible to that child too. `exceptChildId` excludes
+ * the child a mutation came from, which is what keeps the relay from bouncing forever.
+ */
+export function forwardRegistryToChildren(mutation: RegistryMutation, exceptChildId?: number): void {
+    for (const [id, send] of registryRelays) {
+        if (id === exceptChildId) continue;
+        try { send(mutation); } catch (e) {
+            Logger.warn(LogCategory.SYSTEM, `Registry relay to child ${id} failed: ${e}`);
+        }
+    }
+}
 
 /** The page keeps the parent worker as the VFS broker, and talks directly to this port. */
 export function setChildSessionPublisher(publish: typeof publishSession, finished?: () => void): void {
@@ -158,13 +200,20 @@ export function startChildExecution(
             let failure: unknown;
             try { code = await execute(context); } catch (error) { failure = error; }
             stopResources();
-            // In-flight VFS work must settle before handles become signalled, including forced exit.
-            await Promise.all(drains);
+            // In-flight VFS work must settle before handles become signalled, including
+            // forced exit — but only within a budget: this await is what the guest's
+            // WaitForSingleObject on the child handle ultimately blocks on.
+            const drained = Promise.all(drains);
+            if (await settleWithin(drained, CHILD_DRAIN_BUDGET_MS)) stall(record, 'cleanup drain');
+            else await drained;
             if (forcedExit === undefined) {
                 context.checkActive();
                 if (failure !== undefined) throw failure;
             }
-            await vfs.flushAll();
+            const flushed = vfs.flushAll();
+            void flushed.catch(() => {}); // its owner logs it; an unbounded wait must not be the only handler
+            if (await settleWithin(flushed, CHILD_DRAIN_BUDGET_MS)) stall(record, 'vfs.flushAll');
+            else await flushed;
             if (forcedExit === undefined) context.checkActive();
             record.exitCode = (forcedExit ?? code) >>> 0;
             unfinished.delete(record);
@@ -221,8 +270,11 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
         });
         const child = createWorker();
         worker = child;
+        const registryId = nextRegistryRelay++;
+        registryRelays.set(registryId, mutation => child.postMessage({ type: 'child_registry_down', mutation }));
         let animationFrame: number | null = null;
         context.onStop(() => {
+            registryRelays.delete(registryId);
             if (animationFrame !== null) cancelAnimationFrame(animationFrame);
             child.onmessage = null;
             child.onerror = null;
@@ -246,7 +298,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                 if (done || context.signal.aborted) return;
                 const message = event.data;
                 if (message.type === 'child_io') void serve(message.request);
-                else if (message.type === 'child_registry') applyChildRegistry?.(message.mutation);
+                else if (message.type === 'child_registry') applyChildRegistry?.(message.mutation, registryId);
                 else if (message.type === 'child_session' && publishSession) {
                     // An already-exiting child can itself be the VFS broker for a live
                     // descendant. Forward its port without starting either image again.
@@ -263,6 +315,9 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                 else if (message.type === 'process_exit') {
                     context.record.fault = message.fault;
                     context.record.logs = message.logs;
+                    // The child exited; its barrier did not drain. Not a crash, but the
+                    // record must say so or the failure is invisible from up here.
+                    if (message.flushError) context.record.stalled = `child exit flush: ${message.flushError}`;
                     if (message.broker) {
                         context.record.guestExitCode = message.exitCode >>> 0;
                         task.onGuestExit?.(message.exitCode >>> 0);

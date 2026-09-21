@@ -2,13 +2,17 @@ import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
-import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, type ChildBoot } from "./core/child-process";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot } from "./core/child-process";
 import { createChildVfsClient } from "./core/child-vfs";
+import type { RegistryMutation } from "./runtime/filesystem/registry";
 import { ChildSessionTransport } from './core/child-session';
 import { ChildFrameClock } from './core/child-frame-clock';
 
 let childBoot: ChildBoot | null = null;
 let childSessionTransport: ChildSessionTransport | null = null;
+/** Owner writes that reached this child before its store was restored. */
+const pendingRegistryDown: RegistryMutation[] = [];
+let childRegistryReady = false;
 let childFrameClock: ChildFrameClock | null = null;
 let childImageReady: Promise<void> | null = null;
 let resolveChildImageReady: (() => void) | null = null;
@@ -26,7 +30,7 @@ setChildBootContext(() => ({
   registry: System.getInstance().registry.serialize(),
   namedObjects: namedObjects.snapshot(),
 }));
-setChildRegistrySink(mutation => System.getInstance().registry.applyMutation(mutation));
+setChildRegistrySink((mutation, childId) => System.getInstance().registry.applyMutation(mutation, { from: 'child', id: childId }));
 (globalThis as Record<string, unknown>).__childProcesses = childProcessHistory;
 
 // Which guest thread is driving a given VFS read — the shared-cursor question can only
@@ -3249,6 +3253,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // Start registry access log flush
       startRegistryFlush();
 
+      // Every process can have children, so every store relays a write downward; the
+      // child branch below adds the upward half.
+      system.registry.setDownstreamSink(forwardRegistryToChildren);
       if (childBoot) {
         const boot = childBoot;
         // Initialization may have created a provisional scheduler thread while v86
@@ -3261,6 +3268,12 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // the overridden self.postMessage: a child that owns the screen talks to the PAGE,
         // and the page is not what persists the registry.
         system.registry.setMutationSink(mutation => postToParent({ type: 'child_registry', mutation }));
+        // Writes the owner made while we were booting arrived before restore() and would
+        // have been overwritten by the snapshot it lays down; they apply now instead.
+        childRegistryReady = true;
+        for (const mutation of pendingRegistryDown.splice(0)) {
+          system.registry.applyMutation(mutation, { from: 'owner' });
+        }
         if (boot.namedObjects) adoptNamedObjects(boot.namedObjects, {
           event: (manualReset, initialState) => system.scheduler.createEvent(manualReset, initialState),
           mutex: () => system.scheduler.createMutex(false),
@@ -3270,9 +3283,20 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           request => self.postMessage({ type: 'child_io', request }), boot.currentDirectory);
         process.loader.setVfs(system.fileSystem);
         system.onProcessExit = payload => {
-          void system.fileSystem.flushAll().then(() => self.postMessage({
-            type: 'process_exit', ...payload, logs: Logger.getRecentEntries(100),
-          })).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+          // The process HAS exited, whatever the barrier managed to drain. Reporting the
+          // flush failure as `error` instead would substitute a crash for an exit: the
+          // guest's exit code is lost, and a parent that can no longer serve this child's
+          // VFS — the exact case this barrier fails in — reads as a child that crashed.
+          const report = (flushError?: unknown) => {
+            if (flushError !== undefined) {
+              Logger.warn(LogCategory.SYSTEM, `child exit: durability barrier failed: ${flushError}`);
+            }
+            self.postMessage({
+              type: 'process_exit', ...payload, logs: Logger.getRecentEntries(100),
+              flushError: flushError === undefined ? undefined : String(flushError),
+            });
+          };
+          void system.drainDurableState().then(() => report(), report);
         };
         system.executablePath = boot.imagePath;
         system.executableName = boot.imagePath.split(/[\\/]/).pop() ?? 'child.exe';
@@ -3381,6 +3405,13 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     const canvas = new OffscreenCanvas(640, 480);
     state.canvas = canvas;
     void initV86(canvas).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    return;
+  }
+  if (event.data?.type === 'child_registry_down') {
+    // The hive is the owner's and it just changed. Queue until restore() has run, or the
+    // inherited snapshot lands on top of the newer value.
+    if (childRegistryReady) System.getInstance().registry.applyMutation(event.data.mutation, { from: 'owner' });
+    else pendingRegistryDown.push(event.data.mutation);
     return;
   }
   if (event.data?.type === 'child_animation_frame') {
