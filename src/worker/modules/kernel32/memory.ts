@@ -4,7 +4,7 @@
  * Atomic implementation for memory operations
  */
 
-import { FastPathImplementation, ThunkImplementation, type X86Context } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, FastPathImplementation, ThunkImplementation, type X86Context } from '../../core/thunking/thunk-dispatcher';
 import type { ThunkMemoryRegions } from '../../core/thunking/thunk-memory-manager';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
@@ -2349,7 +2349,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // bottom-up HeapAlloc. Ignoring it handed low addresses and SmartHeap's
                 // pool math eventually VirtualAlloc'd a multi-hundred-MB bogus size.
                 if (flAllocationType & MEM_TOP_DOWN) {
-                    address = process.memory.allocFromHigh(alignedSize, ALLOC_GRANULARITY);
+                    address = process.memory.allocTopDown(alignedSize, ALLOC_GRANULARITY, perms);
                 } else {
                     address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
                 }
@@ -2611,7 +2611,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // PTE-level operation itself.
         const ptm = process.pageTableManager;
         if (ptm?.isPagingEnabled()) {
-            ptm.setProtection(alignedAddr, alignedSize, flNewProtect, false);
+            ptm.setProtection(alignedAddr, alignedSize, flNewProtect);
         }
 
         Logger.verbose(LogCategory.KERNEL32,
@@ -2998,6 +2998,20 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return false;
     };
 
+    /**
+     * The REGION MAP is what makes an IsBad* answerable. The address space is identity-mapped,
+     * so every linear address is inside `mem` — a bound of mem.length can only ever answer
+     * "good", which is not a check at all. A caller acts on the answer: a stack walker told
+     * every frame pointer is valid walks garbage until something else stops it, and RA3's
+     * crash reporter did exactly that for 144 million calls without terminating.
+     */
+    const rangeHasPerms = (addr: number, size: number, perms: RegionPerms): boolean => {
+        const space = System.getInstance().process?.addressSpace;
+        // No address space yet (very early boot): nothing to answer from, so do not refuse.
+        if (!space) return true;
+        return space.validateRange(addr, size, perms);
+    };
+
     // IsBadReadPtr - test whether the calling process has read access to a memory range
     // Returns FALSE (0) if readable, TRUE (non-zero) if not
     exports['IsBadReadPtr'] = (ctx, mem, args) => {
@@ -3008,8 +3022,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (ucb === 0) return 0;
         // NULL pointer with non-zero size is bad
         if (lp === 0) return 1;
-        // Check bounds against guest memory
-        if (lp + ucb > mem.length) return 1;
+        if (!rangeHasPerms(lp, ucb, 'r')) return 1;
         // Decommitted pages are inaccessible on real Windows
         if (isInDecommittedRange(lp, ucb)) return 1;
 
@@ -3023,7 +3036,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         if (ucb === 0) return 0;
         if (lp === 0) return 1;
-        if (lp + ucb > mem.length) return 1;
+        if (!rangeHasPerms(lp, ucb, 'rw')) return 1;
         // Decommitted pages are inaccessible on real Windows
         if (isInDecommittedRange(lp, ucb)) return 1;
 
@@ -3034,12 +3047,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     exports['IsBadHugeReadPtr'] = exports['IsBadReadPtr'];
     exports['IsBadHugeWritePtr'] = exports['IsBadWritePtr'];
 
-    // IsBadCodePtr - test whether the calling process has read access to the specified address
+    // IsBadCodePtr - test whether the specified address is executable. A data pointer is a BAD
+    // code pointer: that distinction is the whole point of the call.
     exports['IsBadCodePtr'] = (ctx, mem, args) => {
         const lp = args[0] >>> 0;
 
         if (lp === 0) return 1;
-        if (lp >= mem.length) return 1;
+        if (!rangeHasPerms(lp, 1, 'rx')) return 1;
 
         return 0; // Valid code pointer
     };
@@ -3051,11 +3065,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const ucchMax = args[1] >>> 0;
 
         if (lpsz === 0) return 1; // Bad pointer
-        if (lpsz >= mem.length) return 1;
-
-        // Check that we can read up to ucchMax chars or null terminator
-        const end = Math.min(lpsz + ucchMax, mem.length);
-        if (end > mem.length) return 1;
+        // Only the first byte can be checked: the read stops at the terminator, so a legal
+        // short string in a small region must not be refused for the whole ucchMax window.
+        if (!rangeHasPerms(lpsz, 1, 'r')) return 1;
+        if (ucchMax === 0) return 0;
 
         return 0; // Valid string pointer
     };
@@ -3066,10 +3079,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const ucchMax = args[1] >>> 0;
 
         if (lpsz === 0) return 1;
-        if (lpsz >= mem.length) return 1;
-
-        const end = Math.min(lpsz + ucchMax * 2, mem.length);
-        if (end > mem.length) return 1;
+        if (!rangeHasPerms(lpsz, 2, 'r')) return 1;
+        if (ucchMax === 0) return 0;
 
         return 0;
     };
@@ -3354,8 +3365,7 @@ export function queryVirtualMemory(addr: number): Record<string, unknown> | null
 // HeapSize mirrors exports['HeapSize'] in full: every branch it has is a constant
 // compare, an O(log n) interval probe or a Map get, and none of them has a side
 // effect, so there is nothing left for the slow tier to own.
-export const heapSizeFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-    const esp = cpu.reg32[4] >>> 0;
+export const heapSizeFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
     if (esp + 16 > mem8.length) return null;
     const lpMem = view.getUint32(esp + 12, true) >>> 0;
 
@@ -3376,8 +3386,7 @@ export const heapSizeFastPath: FastPathImplementation = (cpu, mem8, _mem32, view
 // is a real allocation, and a refusal (size 0 / oversize) is what the guest turns
 // into bad_alloc — both stay on the slow tier, which owns the copy, the free funnel
 // and the call-site diagnostics that name the caller.
-export const heapReAllocFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-    const esp = cpu.reg32[4] >>> 0;
+export const heapReAllocFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
     if (esp + 20 > mem8.length) return null;
     const dwFlags = view.getUint32(esp + 8, true) >>> 0;
     const lpMem = view.getUint32(esp + 12, true) >>> 0;
@@ -3422,7 +3431,7 @@ export const heapReAllocFastPath: FastPathImplementation = (cpu, mem8, _mem32, v
  * carry has to be honoured here as well or it is silently gone: the fast path is the
  * tier that actually serves a slab fallthrough.
  */
-export function registerFastPathHeapFunctions(dispatcher: any): void {
+export function registerFastPathHeapFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // A refused allocation is what the guest turns into std::bad_alloc, so it must be
@@ -3463,8 +3472,7 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
             `\n  recent: ${recent}`);
     };
 
-    const heapAllocFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const heapAllocFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         if (esp + 16 > mem8.length) return null;
 
         const dwFlags = view.getUint32(esp + 8, true) >>> 0;
@@ -3505,8 +3513,7 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
         }
     };
 
-    const heapFreeFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const heapFreeFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         const system = System.getInstance();
         const process = system.process;
         if (!process) return null;
@@ -3601,8 +3608,7 @@ function auditVirtualQueryFast(lpAddress: number, lpBuffer: number, mem: Uint8Ar
         `(Base, AllocationBase, AllocationProtect, RegionSize, State, Protect, Type)`);
 }
 
-const virtualQueryFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-    const esp = cpu.reg32[4] >>> 0;
+const virtualQueryFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
     if (esp + 16 > mem8.length) { vqFastDefers++; return null; }
 
     const lpAddress = view.getUint32(esp + 4, true) >>> 0;
@@ -3718,7 +3724,7 @@ export function resetVirtualQueryFastStats(): void {
 /** Test seam: the fast-path implementation, so a differential test can drive it directly. */
 export const __virtualQueryFastPathForTests = virtualQueryFastPath;
 
-export function registerFastPathVirtualQuery(dispatcher: any): void {
+export function registerFastPathVirtualQuery(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
     dispatcher.registerFastPath('kernel32', 'VirtualQuery', virtualQueryFastPath, { trivial: true });
     Logger.log(LogCategory.KERNEL32, 'Registered fast path for VirtualQuery');

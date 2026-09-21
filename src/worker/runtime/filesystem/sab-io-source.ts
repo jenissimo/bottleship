@@ -62,6 +62,8 @@ export interface SabWaitStats {
     /** Waits that hit WAIT_TIMEOUT_MS. */
     waitsTimedOut: number;
     timeouts: number;
+    /** Responses shorter than the range asked for — each one is a read that failed. */
+    shortReads: number;
     /** Wall-clock ms spent inside Atomics.wait, summed. EXCLUDES the postMessage
      *  marshalling before it and the copy-out after, so it reads slightly BELOW the
      *  self-time a profiler attributes to `request`. */
@@ -109,6 +111,7 @@ export class SabIoSource implements ZipSource {
     private _waitsNotEqual = 0;
     private _waitsTimedOut = 0;
     private _timeouts = 0;
+    private _shortReads = 0;
     /** Accumulated ms inside Atomics.wait. Two performance.now() calls per wait —
      *  ~100 ns each against a round-trip measured in tens of microseconds at best,
      *  so under 0.5% of the thing being measured, and zero cost on the warm path
@@ -309,6 +312,14 @@ export class SabIoSource implements ZipSource {
         // reuses it for the next request).
         const buf = this.data.slice(0, rlen);
         Atomics.store(this.ctl, CTL_STATE, ST_IDLE);
+        // A SHORT answer is a failed read, not a small one: the range was already clamped to
+        // the file, so every requested byte exists. Returning it would hand the caller zeros
+        // where data belongs — an archive whose header table reads as empty, and a game that
+        // reports its own assets missing, with nothing anywhere naming the read that failed.
+        if (rlen !== len) {
+            this._shortReads++;
+            throw new Error(`SabIoSource: short read (off=${off} want=${len} got=${rlen})`);
+        }
         return buf;
     }
 
@@ -335,6 +346,7 @@ export class SabIoSource implements ZipSource {
                 waitsNotEqual: this._waitsNotEqual,
                 waitsTimedOut: this._waitsTimedOut,
                 timeouts: this._timeouts,
+                shortReads: this._shortReads,
                 waitMs: this._waitMs,
                 histogram: Array.from(this._hist),
                 bucketsMs: Array.from(WAIT_BUCKETS_MS),

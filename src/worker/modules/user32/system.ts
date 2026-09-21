@@ -916,6 +916,31 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     exports['LoadCursorW'] = (ctx, mem, args) => loadCursorCommon('LoadCursorW', args[0], args[1] >>> 0);
 
+    /**
+     * LoadCursorFromFile: a game that ships its own .cur/.ani asks for one per pointer shape and
+     * stores what it gets. NULL is a legal answer only when the file is missing, so answering it
+     * unconditionally hands the caller a handle it will dereference — RA3 read through it at
+     * +0x34 and took the process down. The SHAPE is still the system arrow (as it is for a PE
+     * resource cursor), so the pointer stays visible; only the identity is real.
+     */
+    const loadCursorFromFile = (mem: Uint8Array, namePtr: number, isWide: boolean): number => {
+        const apiName = isWide ? 'LoadCursorFromFileW' : 'LoadCursorFromFileA';
+        if (!namePtr) return 0;
+        const filename = isWide ? Marshaler.readWideString(mem, namePtr) : Marshaler.readString(mem, namePtr);
+        // Existence is the whole question — opening the file would take (and never give
+        // back) the overlay's exclusive sync handle for a file we never read.
+        if (!System.getInstance().fileSystem.fileExists(filename)) {
+            Logger.warn(LogCategory.USER32, `${apiName}: no such file "${filename}"`);
+            return 0;
+        }
+        const handle = getSystemCursorHandle(0);
+        Logger.verbose(LogCategory.USER32, `${apiName}("${filename}") -> 0x${handle.toString(16)}`);
+        return handle;
+    };
+
+    exports['LoadCursorFromFileA'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, false);
+    exports['LoadCursorFromFileW'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, true);
+
     let nextIconHandle = 0x200;
 
     const loadIconCommon = (mem: Uint8Array, hInstance: number, lpIconName: number, isWide: boolean): number => {
@@ -2785,6 +2810,22 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const lpsz = args[0];
         // Simple: advance by 1 byte unless at NUL terminator (no DBCS support)
         return (lpsz && lpsz < _mem.length && _mem[lpsz] !== 0) ? lpsz + 1 : lpsz;
+    };
+
+    // LPWSTR CharNextW(LPCWSTR lpsz) — one UTF-16 code unit, and a pointer that stops
+    // ON the terminator rather than walking past it (a caller's loop ends on == prev).
+    exports['CharNextW'] = (_ctx, mem, args) => {
+        const lpsz = args[0] >>> 0;
+        if (!lpsz || lpsz + 1 >= mem.length) return lpsz;
+        const ch = mem[lpsz] | (mem[lpsz + 1] << 8);
+        return ch === 0 ? lpsz : lpsz + 2;
+    };
+
+    // LPWSTR CharPrevW(LPCWSTR start, LPCWSTR current)
+    exports['CharPrevW'] = (_ctx, _mem, args) => {
+        const start = args[0] >>> 0;
+        const current = args[1] >>> 0;
+        return current > start ? current - 2 : start;
     };
 
     // DWORD CharUpperBuffA(LPSTR lpsz, DWORD cchLength)

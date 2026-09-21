@@ -158,6 +158,10 @@ const SE_ERR_MAX = 31;
 const SE_ERR_ACCESSDENIED = 5;
 const SHELL_EXEC_OK = 42;
 const ERROR_ACCESS_DENIED = 5;
+/** SHCreateDirectoryEx's own return codes — it answers with a Win32 code, not an HRESULT. */
+const ERROR_BAD_PATHNAME = 161;
+const ERROR_ALREADY_EXISTS = 183;
+const ERROR_FILENAME_EXCED_RANGE = 206;
 const SEE_MASK_NOCLOSEPROCESS = 0x00000040;
 
 function getSpecialFolderPath(csidl: number): string {
@@ -259,6 +263,55 @@ export function createFolderPathExports(): Record<string, ThunkImplementation> {
             view.setUint16(pszPath + path.length * 2, 0, true);
         }
         return 0; // S_OK
+    };
+
+    /**
+     * SHCreateDirectoryEx(hwnd, pszPath, psa) — mkdir -p, as Win32 ships it.
+     *
+     * CreateDirectory fails when a parent is missing, so this is the call a game makes to
+     * lay down its whole save/config tree in one go. Refusing it (the unimplemented
+     * answer) leaves every later fopen("wb") under that tree failing, which surfaces far
+     * away as "the game saves nothing" — and, for a title that builds a manager per
+     * config directory, as a NULL it never checks.
+     *
+     * The path must be ABSOLUTE: Windows answers ERROR_BAD_PATHNAME for a relative one
+     * rather than resolving it against the current directory.
+     */
+    const createDirectoryTree = (path: string): number => {
+        if (!path) return ERROR_BAD_PATHNAME;
+        const full = path.replace(/\//g, "\\").replace(/\\+$/, "");
+        if (!/^[A-Za-z]:\\/.test(full) && !full.startsWith("\\\\")) return ERROR_BAD_PATHNAME;
+        if (full.length > 248) return ERROR_FILENAME_EXCED_RANGE;
+
+        const vfs = System.getInstance().fileSystem;
+        const drive = full.slice(0, 2);
+        const parts = full.slice(3).split("\\").filter(Boolean);
+        let cur = drive;
+        let createdAny = false;
+        for (const part of parts) {
+            cur += "\\" + part;
+            const r = vfs.createDirectorySync(cur);
+            if (r.ok) { createdAny = true; continue; }
+            // An existing ancestor is the normal case on the way down; only the LEAF's
+            // "already there" is what the caller is told about.
+            if (r.error === ERROR_ALREADY_EXISTS) continue;
+            return r.error;
+        }
+        return createdAny ? 0 : ERROR_ALREADY_EXISTS;
+    };
+
+    exports["SHCreateDirectoryExA"] = (_ctx, mem, args) => {
+        const path = args[1] ? readAnsiFromGuest(mem, args[1] >>> 0) : "";
+        const rc = createDirectoryTree(path);
+        Logger.log(LogCategory.SYSTEM, `SHCreateDirectoryExA("${path}") -> ${rc}`);
+        return rc;
+    };
+
+    exports["SHCreateDirectoryExW"] = (_ctx, mem, args) => {
+        const path = args[1] ? readWideFromGuest(mem, args[1] >>> 0) : "";
+        const rc = createDirectoryTree(path);
+        Logger.log(LogCategory.SYSTEM, `SHCreateDirectoryExW("${path}") -> ${rc}`);
+        return rc;
     };
 
     return exports;

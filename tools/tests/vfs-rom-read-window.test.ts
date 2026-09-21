@@ -114,33 +114,48 @@ describe("§4.1 — a STORED-entry read run is served from one window", () => {
     });
 });
 
-describe("§4.1 — the window never over-reports", () => {
-    test("a short source read yields only the bytes that came back", async () => {
+describe("§4.1 — a short source read is refused, never answered", () => {
+    /**
+     * A partially-resident run makes the block cache answer short. Handing that to the guest
+     * is a read that says "the file gave me 300 bytes" at a position where the file has more —
+     * indistinguishable, to a caller reading an archive header, from the truth. NT never does
+     * it on a synchronous file object. So the sync tier declines and the caller parks on the
+     * blocking path, which faults the rest in; only EOF may answer short.
+     */
+    test("a short source read mid-file falls back instead of answering", async () => {
         const SHORT = 300;
         const ramp = rampArchive(ENTRY_SIZE, { shortTo: SHORT });
         const vfs = await romVfs("level.pak", ramp, ENTRY_SIZE);
         const h = vfs.openSync("C:\\level.pak", GENERIC_READ, OPEN_EXISTING)!;
 
-        const first = vfs.readSync(h, 674)!;
-        expect(first.length).toBe(SHORT);
-        expect(vfs.tell(h)).toBe(SHORT);
-        expect(Array.from(first)).toEqual(Array.from(ramp.bytes.subarray(0, SHORT)));
-
-        // Whatever the window holds, it must describe bytes that were actually read:
-        // the next read continues exactly where the short one stopped.
-        const second = vfs.readSync(h, 674)!;
-        expect(Array.from(second)).toEqual(Array.from(ramp.bytes.subarray(SHORT, SHORT + second.length)));
+        const before = vfsIoCensus.romSyncShortFalls;
+        expect(vfs.readSync(h, 674)).toBeNull();
+        expect(vfsIoCensus.romSyncShortFalls).toBe(before + 1);
+        // The cursor must not move for a read that was never served.
+        expect(vfs.tell(h)).toBe(0);
     });
 
-    test("readIntoSync does not report more than a short read delivered", async () => {
+    test("a short read AT EOF is a real answer and is served", async () => {
+        const TAIL = 200;
+        const ramp = rampArchive(TAIL);
+        const vfs = await romVfs("tail.pak", ramp, TAIL);
+        const h = vfs.openSync("C:\\tail.pak", GENERIC_READ, OPEN_EXISTING)!;
+
+        const out = vfs.readSync(h, 674)!;
+        expect(out.length).toBe(TAIL);
+        expect(Array.from(out)).toEqual(Array.from(ramp.bytes.subarray(0, TAIL)));
+        expect(vfs.tell(h)).toBe(TAIL);
+    });
+
+    test("readIntoSync declines a short mid-file read rather than report it", async () => {
         const SHORT = 64;
         const ramp = rampArchive(ENTRY_SIZE, { shortTo: SHORT });
         const vfs = await romVfs("short.pak", ramp, ENTRY_SIZE);
         const h = vfs.openSync("C:\\short.pak", GENERIC_READ, OPEN_EXISTING)!;
 
         const target = new Uint8Array(1024).fill(0xcd);
-        expect(vfs.readIntoSync(h, target, 0, 1024)).toBe(SHORT);
-        expect(target[SHORT]).toBe(0xcd);      // nothing written past what was delivered
+        expect(vfs.readIntoSync(h, target, 0, 1024)).toBeNull();
+        expect(target[0]).toBe(0xcd);          // nothing written at all
     });
 });
 

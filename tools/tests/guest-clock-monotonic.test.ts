@@ -28,8 +28,21 @@ const PAGE_BYTES = 0x20000;
 
 type FakeCpu = { wasm_memory: { buffer: ArrayBuffer }; instruction_counter: Uint32Array };
 
+/** v86 global_pointers.rs: instruction_counter is a u32 IN wasm linear memory. */
+const INSN_COUNTER_OFFSET = 664;
+
+// The counter must be read out of `wasm_memory.buffer`, not out of a standalone array
+// parked beside it: a reader that re-derives its view from the live buffer (as v86's own
+// `view()` Proxy does, and as core/cpu/cpu-views.ts does) would then see a DIFFERENT
+// counter from the one this test writes, and every assertion here would pass while
+// measuring nothing. Re-derived per access so a grow/restart is transparent, exactly like
+// the Proxy it stands in for.
 function makeCpu(): FakeCpu {
-    return { wasm_memory: { buffer: new ArrayBuffer(PAGE_BYTES) }, instruction_counter: new Uint32Array(1) };
+    const cpu = { wasm_memory: { buffer: new ArrayBuffer(PAGE_BYTES) } } as FakeCpu;
+    Object.defineProperty(cpu, "instruction_counter", {
+        get: () => new Uint32Array(cpu.wasm_memory.buffer, INSN_COUNTER_OFFSET, 1),
+    });
+    return cpu;
 }
 
 function pageView(cpu: FakeCpu): DataView {

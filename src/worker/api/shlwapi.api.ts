@@ -27,6 +27,8 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("PathAppendW", 2),
         makeFunc("PathCanonicalizeA", 2),
         makeFunc("PathCanonicalizeW", 2),
+        makeFunc("PathCombineA", 3),
+        makeFunc("PathCombineW", 3),
         makeFunc("PathAddBackslashA", 1),
         makeFunc("PathAddBackslashW", 1),
         makeFunc("PathRemoveFileSpecA", 1),

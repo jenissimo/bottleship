@@ -215,6 +215,14 @@ export class Ole32 implements IModule {
             return this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized);
         }) as ThunkImplementation;
 
+        // CoSetProxyBlanket - set authentication on a proxy. Everything here is
+        // in-process, so there is no proxy to configure and no security to set;
+        // Windows returns S_OK for an in-proc object too.
+        this.exports["CoSetProxyBlanket"] = (ctx, mem, args) => {
+            Logger.verbose(LogCategory.COM, `CoSetProxyBlanket(pProxy=0x${args[0].toString(16)})`);
+            return S_OK;
+        };
+
         // CoCreateGuid - create a new GUID
         this.exports["CoCreateGuid"] = (ctx, mem, args) => {
             const pguid = args[0] >>> 0;

@@ -44,9 +44,9 @@ function callFastPath(
     mem: Uint8Array,
     args: number[],
 ): number | null {
-    let impl: ((cpu: unknown, mem8: Uint8Array) => number | null) | null = null;
+    let impl: ((esp: number, view: DataView, mem8: Uint8Array) => number | null) | null = null;
     const dispatcher = {
-        registerFastPath(_dll: string, fn: string, f: (cpu: unknown, mem8: Uint8Array) => number | null) {
+        registerFastPath(_dll: string, fn: string, f: (esp: number, view: DataView, mem8: Uint8Array) => number | null) {
             if (fn === name) impl = f;
         },
         registerWriteBufferFunction() { /* not exercised here */ },
@@ -59,7 +59,8 @@ function callFastPath(
     const esp = 0x800;
     const view = new DataView(mem.buffer);
     for (let i = 0; i < args.length; i++) view.setUint32(esp + 4 + i * 4, args[i]! >>> 0, true);
-    return (impl as (cpu: unknown, mem8: Uint8Array) => number | null)({ reg32: { 4: esp } }, mem);
+    return (impl as (esp: number, view: DataView, mem8: Uint8Array) => number | null)(
+        esp, new DataView(mem.buffer, mem.byteOffset, mem.byteLength), mem);
 }
 
 /** Both paths on identical input; returns their return values and resulting buffers. */

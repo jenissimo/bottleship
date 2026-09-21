@@ -250,8 +250,8 @@ function mkFixture(): Fixture {
     const wrap = (name: string) => {
         const fn = fns[name];
         if (!fn) throw new Error(`${name} fast path did not register`);
-        return (esp: number, m: Uint8Array) => fn({ reg32: new Uint32Array([0, 0, 0, 0, esp, 0, 0, 0]) }, m,
-            new Uint32Array(m.buffer), new DataView(m.buffer));
+        return (esp: number, m: Uint8Array) => fn(esp, new DataView(m.buffer, m.byteOffset, m.byteLength), m,
+            new Uint32Array(m.buffer));
     };
     return {
         mem, mbToWc: mbToWcStub, wcToMb: wcToMbStub, codePage: table.codePage,

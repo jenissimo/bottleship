@@ -475,7 +475,7 @@ export class Comctl32 implements IModule {
         const imageListBulk: Record<string, ThunkImplementation> = {
             ImageList_DrawEx: () => 1,
             ImageList_DrawIndirect: () => 1,
-            ImageList_AddIcon: (ctx, mem, args) => replaceIcon(ctx, mem, [args[0], 0xffffffff, args[2]]),
+            ImageList_AddIcon: (ctx, mem, args) => replaceIcon(ctx, mem, [args[0], 0xffffffff, args[1]]),
             ImageList_SetImageCount: (_ctx, _mem, args) => {
                 const list = this.imageLists.get(args[0] >>> 0);
                 if (!list) return 0;

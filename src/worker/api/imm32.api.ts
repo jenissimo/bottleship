@@ -28,6 +28,8 @@ export const imm32Module: ModuleDescriptor = {
         makeFunc("ImmIsIME", 1),
         makeFunc("ImmGetOpenStatus", 1),
         makeFunc("ImmSetOpenStatus", 2),
+        makeFunc("ImmCreateContext", 0),
+        makeFunc("ImmDestroyContext", 1),
         makeFunc("ImmGetContext", 1),
         makeFunc("ImmReleaseContext", 2),
 

@@ -1,7 +1,7 @@
 // Process-related functions for kernel32
 // GetCurrentProcessId, GetCurrentThreadId, ExitProcess, GetStartupInfo*, IsProcessorFeaturePresent
 
-import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import {
     startChildProcess, promoteChildSession, hasChildSession, pendingChildHandoff,
     ChildProcessCancelled, ChildNeedsSession,
@@ -1018,6 +1018,11 @@ function fillVersionExW(mem: Uint8Array, lpVersionInfo: number, apiName: string)
     return 1;
 }
 
+let rpmCalls = 0;
+let lastRpmLog = 0;
+let rpmPartial = 0;
+let lastRpmPartialLog = 0;
+
 export const exports: Record<string, ThunkImplementation> = {
     ...createActCtxExports(),
 
@@ -1383,6 +1388,31 @@ export const exports: Record<string, ThunkImplementation> = {
     'GetVersionExA': (ctx, mem, args) => fillVersionExA(mem, args[0], 'GetVersionExA'),
 
     'GetVersionExW': (ctx, mem, args) => fillVersionExW(mem, args[0], 'GetVersionExW'),
+
+    /**
+     * DWORD SetThreadIdealProcessor(HANDLE hThread, DWORD dwIdealProcessor)
+     *
+     * Returns the PREVIOUS ideal processor, not a BOOL — MAXIMUM_PROCESSORS when the thread had
+     * none, and (DWORD)-1 on failure. The unimplemented default answered 0, which reads as "the
+     * previous ideal processor was CPU 0" and is a plausible-looking lie; a pool that records it
+     * to restore later then pins every thread to one core. We are single-core, so the request is
+     * recorded and echoed back rather than acted on.
+     */
+    'SetThreadIdealProcessor': (ctx, mem, args) => {
+        const hThread = args[0] >>> 0;
+        const ideal = args[1] >>> 0;
+        const MAXIMUM_PROCESSORS = 32;
+        const scheduler = System.getInstance().scheduler as unknown as {
+            idealProcessors?: Map<number, number>;
+        };
+        if (!scheduler.idealProcessors) scheduler.idealProcessors = new Map<number, number>();
+        // MAXIMUM_PROCESSORS as the argument is a QUERY: it leaves the value unchanged.
+        const previous = scheduler.idealProcessors.get(hThread) ?? MAXIMUM_PROCESSORS;
+        if (ideal !== MAXIMUM_PROCESSORS) scheduler.idealProcessors.set(hThread, ideal);
+        Logger.verbose(LogCategory.KERNEL32,
+            `SetThreadIdealProcessor(hThread=0x${hThread.toString(16)}, ideal=${ideal}) -> ${previous}`);
+        return { value: previous >>> 0, stackCleanup: 8 };
+    },
 
     'SetThreadPriority': (ctx, mem, args) => {
         const hThread = args[0];
@@ -2154,10 +2184,20 @@ export const exports: Record<string, ThunkImplementation> = {
         const lpBuffer = args[2] >>> 0;
         const nSize = args[3] >>> 0;
         const lpNumberOfBytesRead = args[4] >>> 0;
-        Logger.verbose(
-            LogCategory.KERNEL32,
-            `ReadProcessMemory(hProcess=0x${hProcess.toString(16)}, base=0x${lpBaseAddress.toString(16)}, size=${nSize})`
-        );
+        // Summary, not a line per call. A crash handler's stack scanner calls this millions
+        // of times, and one line each does not merely fill the log — it evicts the boot the
+        // reader came to look at, so the failure that CAUSED the crash is the part missing.
+        rpmCalls++;
+        const nowMs = performance.now();
+        if (nowMs - lastRpmLog >= 1000) {
+            Logger.verbose(
+                LogCategory.KERNEL32,
+                `ReadProcessMemory: calls=${rpmCalls} last(hProcess=0x${hProcess.toString(16)}, ` +
+                `base=0x${lpBaseAddress.toString(16)}, size=${nSize})`
+            );
+            lastRpmLog = nowMs;
+            rpmCalls = 0;
+        }
 
         if (!isKnownProcessHandle(hProcess)) {
             Logger.warn(
@@ -2210,10 +2250,21 @@ export const exports: Record<string, ThunkImplementation> = {
         const snapshot = new Uint8Array(source);
         const copied = Mem.writeBytes(lpBuffer, snapshot);
         if (copied !== nSize) {
-            Logger.warn(
-                LogCategory.KERNEL32,
-                `ReadProcessMemory partial copy copied=${copied} expected=${nSize} dst=0x${lpBuffer.toString(16)}`
-            );
+            // A probing caller (a crash handler scanning the stack for return addresses)
+            // expects most of these to fail — that refusal is how its walk terminates. One
+            // warning per attempt drowns the boot that led to the crash, so this is the same
+            // once-a-second summary the call itself gets.
+            rpmPartial++;
+            const partialNow = performance.now();
+            if (partialNow - lastRpmPartialLog >= 1000) {
+                Logger.warn(
+                    LogCategory.KERNEL32,
+                    `ReadProcessMemory: ${rpmPartial} partial copy/copies, last copied=${copied} ` +
+                    `expected=${nSize} dst=0x${lpBuffer.toString(16)}`
+                );
+                lastRpmPartialLog = partialNow;
+                rpmPartial = 0;
+            }
             if (lpNumberOfBytesRead) {
                 Mem.writeUint32(lpNumberOfBytesRead, copied >>> 0);
             }
@@ -2466,12 +2517,11 @@ export const exports: Record<string, ThunkImplementation> = {
  * Faithful: the suspend count still flips and the scheduler still skips a suspended
  * thread — only the dispatch overhead is removed.
  */
-export function registerFastPathProcessFunctions(dispatcher: any): void {
+export function registerFastPathProcessFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // DWORD SuspendThread(HANDLE hThread) — stdcall, RET 4. Returns prev suspend count.
-    dispatcher.registerFastPath('kernel32', 'SuspendThread', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    dispatcher.registerFastPath('kernel32', 'SuspendThread', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 8 > mem8.length) return null;
         const sched = System.getInstance().scheduler;
         if (!sched) return null;
@@ -2483,8 +2533,7 @@ export function registerFastPathProcessFunctions(dispatcher: any): void {
     });
 
     // DWORD ResumeThread(HANDLE hThread) — stdcall, RET 4. Returns prev suspend count.
-    dispatcher.registerFastPath('kernel32', 'ResumeThread', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    dispatcher.registerFastPath('kernel32', 'ResumeThread', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 8 > mem8.length) return null;
         const sched = System.getInstance().scheduler;
         if (!sched) return null;

@@ -4,7 +4,7 @@
  * Atomic implementation for input operations
  */
 
-import { FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { Marshaler } from '../../core/memory/marshaler';
@@ -682,10 +682,9 @@ export function createInputExports(): Record<string, ThunkImplementation> {
 }
 
 /** Fast no-op path for the identical ClipCursor rect reasserted by launcher idle loops. */
-export function registerFastPathInputFunctions(dispatcher: any): void {
+export function registerFastPathInputFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
-    const clipCursorNoop: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const clipCursorNoop: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         const ptr = view.getUint32(esp + 4, true);
         const current = getCursorClipRect();
         if (!ptr) return current === null ? 1 : null;
@@ -710,22 +709,19 @@ export function registerFastPathInputFunctions(dispatcher: any): void {
     // SAB and OR bookkeeping bits into it — no wait, no acquire, no path that can park or
     // switch a thread — and the busy-wait detector they skip tracks only the three time
     // thunks, so no yield decision is lost.
-    const asyncKeyState: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const asyncKeyState: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         if (esp + 8 > mem8.length) return null;
         return readAsyncKeyState(view.getUint32(esp + 4, true) & 0xFF);
     };
     dispatcher.registerFastPath('user32', 'GetAsyncKeyState', asyncKeyState, { trivial: true });
 
-    const keyState: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const keyState: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         if (esp + 8 > mem8.length) return null;
         return readKeyState(view.getUint32(esp + 4, true) & 0xFF);
     };
     dispatcher.registerFastPath('user32', 'GetKeyState', keyState, { trivial: true });
 
-    const keyboardState: FastPathImplementation = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const keyboardState: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         if (esp + 8 > mem8.length) return null;
         const lpKeyState = view.getUint32(esp + 4, true) >>> 0;
         if (!lpKeyState) return 0;

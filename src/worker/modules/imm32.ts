@@ -42,6 +42,17 @@ export class Imm32 implements IModule {
             return DEFAULT_HIMC;
         };
 
+        /**
+         * HIMC ImmCreateContext(void) — a caller stores the result and dereferences it
+         * later, so a NULL from an unimplemented export is not a no-op: it is a pointer the
+         * app will read through. There is no IME here, but the HANDLE must still be a
+         * handle; the same one ImmGetContext hands out keeps the two consistent.
+         */
+        this.exports["ImmCreateContext"] = () => DEFAULT_HIMC;
+
+        // BOOL ImmDestroyContext(HIMC hIMC)
+        this.exports["ImmDestroyContext"] = () => TRUE;
+
         // BOOL ImmReleaseContext(HWND hWnd, HIMC hIMC)
         this.exports["ImmReleaseContext"] = (ctx, mem, args) => {
             const hWnd = args[0] >>> 0;

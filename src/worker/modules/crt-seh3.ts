@@ -1,7 +1,13 @@
 /**
- * MSVC VC5/6-era SEH exports: _except_handler3, __CxxFrameHandler and
- * _CxxThrowException (plus the local-unwind / except-block-jump / complex-
- * filter-redirect helpers they share).
+ * MSVC scope-table SEH exports: _except_handler3 (VC5/6), _except_handler4_common
+ * (VC8+), __CxxFrameHandler and _CxxThrowException, plus the local-unwind /
+ * except-block-jump / complex-filter-redirect helpers they share.
+ *
+ * V3 and V4 walk the SAME frame and the same 12-byte scope records. V4 differs in two
+ * places only: the frame's scope-table pointer is XORed with the module's security
+ * cookie, and the table carries a 16-byte cookie header before its first record. Get
+ * either wrong and the walk reads the header as a record — a filter address of, say,
+ * `gs_cookie_xor` — so every exception goes unhandled and the guest spins in an AV loop.
  *
  * Host supplies Process (CPU access + dispatcher's SEH notification/redirect
  * primitives) and terminateProcess for the unhandled-C++-exception path.
@@ -45,7 +51,20 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
      *   [+4] filterAddr (0 = __finally, else filter function)
      *   [+8] handlerAddr (except/finally block address)
      */
-    function exceptHandler3(ctx: any, mem: Uint8Array, args: number[]): ThunkResult | number {
+    /**
+     * Where a frame's scope records start. V3 stores the table pointer plainly and the
+     * records begin at it; V4 stores it XORed with `*cookiePtr` and puts a four-dword
+     * cookie header first.
+     */
+    function resolveScopeTable(dv: DataView, frameAddr: number, cookiePtr: number): { table: number; entries: number } {
+        const raw = dv.getUint32(frameAddr + 8, true) >>> 0;
+        if (!cookiePtr) return { table: raw, entries: raw };
+        const cookie = dv.getUint32(cookiePtr, true) >>> 0;
+        const table = (raw ^ cookie) >>> 0;
+        return { table, entries: (table + 16) >>> 0 };
+    }
+
+    function exceptHandler3(ctx: any, mem: Uint8Array, args: number[], cookiePtr = 0): ThunkResult | number {
         const pExcRec = args[0] >>> 0;
         const frameAddr = args[1] >>> 0;
         const pContext = args[2] >>> 0;
@@ -66,7 +85,7 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
 
         if (excFlags & (EH_UNWINDING | EH_EXIT_UNWIND)) {
             // Unwind phase: run __finally blocks, then return ContinueSearch
-            _eh3LocalUnwind(dv, mem, frameAddr, -1);
+            _eh3LocalUnwind(dv, mem, frameAddr, -1, cookiePtr);
             return 1; // ContinueSearch
         }
 
@@ -77,11 +96,11 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
             return 1;
         }
 
-        const scopeTable = dv.getUint32(frameAddr + 8, true);
+        const { table: scopeTable, entries: scopeEntries } = resolveScopeTable(dv, frameAddr, cookiePtr);
         let trylevel = dv.getInt32(frameAddr + 12, true);
         const frameEbp = frameAddr + 16;
 
-        if (scopeTable < 0x1000 || scopeTable + 12 > mem.length) {
+        if (scopeTable < 0x1000 || scopeEntries + 12 > mem.length) {
             Logger.warn(LogCategory.SYSTEM,
                 `_except_handler3: invalid scopeTable=0x${scopeTable.toString(16)} frame=0x${frameAddr.toString(16)}`);
             return 1;
@@ -108,7 +127,7 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
         let safety = 0;
         while (trylevel >= 0 && safety < 256) {
             safety++;
-            const entryBase = scopeTable + trylevel * 12;
+            const entryBase = scopeEntries + trylevel * 12;
             if (entryBase + 12 > mem.length) break;
 
             const previousTryLevel = dv.getInt32(entryBase, true);
@@ -220,18 +239,18 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
      * running __finally blocks. For now, just logs and updates trylevel (most game code
      * uses __except, not __finally).
      */
-    function _eh3LocalUnwind(dv: DataView, mem: Uint8Array, frameAddr: number, targetLevel: number): void {
+    function _eh3LocalUnwind(dv: DataView, mem: Uint8Array, frameAddr: number, targetLevel: number, cookiePtr = 0): void {
         if (frameAddr + 16 > mem.length) return;
 
-        const scopeTable = dv.getUint32(frameAddr + 8, true);
+        const { table: scopeTable, entries: scopeEntries } = resolveScopeTable(dv, frameAddr, cookiePtr);
         let trylevel = dv.getInt32(frameAddr + 12, true);
 
-        if (scopeTable < 0x1000 || scopeTable + 12 > mem.length) return;
+        if (scopeTable < 0x1000 || scopeEntries + 12 > mem.length) return;
 
         let safety = 0;
         while (trylevel >= 0 && trylevel !== targetLevel && safety < 256) {
             safety++;
-            const entryBase = scopeTable + trylevel * 12;
+            const entryBase = scopeEntries + trylevel * 12;
             if (entryBase + 12 > mem.length) break;
 
             const previousTryLevel = dv.getInt32(entryBase, true);
@@ -365,6 +384,24 @@ export function registerCrtSeh3Exports(exports: Record<string, ThunkImplementati
     }
 
     exports["_except_handler3"]    = (ctx, mem, args) => exceptHandler3(ctx, mem, args);
+    /**
+     * _except_handler4_common(cookie, check_cookie, rec, frame, context, dispatcher) —
+     * VC8+ funnels every __try frame through this one cdecl entry point. The last four
+     * arguments ARE _except_handler3's; the first two carry the security cookie the scope
+     * table is XORed with (the cookie check itself is the compiler's, not ours).
+     */
+    exports["_except_handler4_common"] = (ctx, mem, args) =>
+        exceptHandler3(ctx, mem, args.slice(2), args[0] >>> 0);
+    /** _local_unwind4(cookie, frame, trylevel) — the V4 spelling of _local_unwind2. */
+    exports["_local_unwind4"] = (_ctx, mem, args) => {
+        const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        _eh3LocalUnwind(dv, mem, args[1] >>> 0, args[2] | 0, args[0] >>> 0);
+        return 0;
+    };
     exports["__CxxFrameHandler"]   = (ctx, mem, args) => cxxFrameHandler(ctx, mem, args);
+    // VC7+ (msvcr71 … vcruntime140) renamed the personality routine but kept the
+    // 4-argument handler ABI and the FuncInfo layout this reads; the version field in
+    // FuncInfo is what distinguishes them, and it is read from the table, not the name.
+    exports["__CxxFrameHandler3"]  = (ctx, mem, args) => cxxFrameHandler(ctx, mem, args);
     exports["_CxxThrowException"]  = (ctx, mem, args) => cxxThrowException(ctx, mem, args);
 }

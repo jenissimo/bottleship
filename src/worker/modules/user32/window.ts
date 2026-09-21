@@ -4,7 +4,7 @@
  * Atomic implementation for window operations
  */
 
-import { FastPathImplementation, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, FastPathImplementation, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
@@ -3043,22 +3043,20 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 }
 
 /** Hot launcher-loop reads/no-ops that do not need argument marshaling or a boundary per call. */
-export function registerFastPathWindowFunctions(dispatcher: any): void {
+export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     const getForeground: FastPathImplementation = () =>
         System.getInstance().windowManager.getForegroundHwnd();
 
-    const showCursor: FastPathImplementation = (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const showCursor: FastPathImplementation = (esp: number, view: DataView) => {
         const beforeVisible = isGuestCursorVisible();
         const next = updateCursorDisplayCount(view.getUint32(esp + 4, true) !== 0 ? 1 : -1);
         if (beforeVisible !== isGuestCursorVisible()) syncHostCursorToGuestState();
         return next;
     };
 
-    const showWindowNoop: FastPathImplementation = (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const showWindowNoop: FastPathImplementation = (esp: number, view: DataView) => {
         const hwnd = view.getUint32(esp + 4, true);
         const cmd = view.getInt32(esp + 8, true);
         const win = windows.get(hwnd);

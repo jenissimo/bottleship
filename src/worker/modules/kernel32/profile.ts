@@ -320,6 +320,66 @@ function withIniData(
 }
 
 /**
+ * The Get/WritePrivateProfileStruct pair stores a binary blob as hex digit PAIRS with one
+ * extra pair holding the low byte of the sum. The checksum is the whole point: a caller
+ * uses these to tell "no value yet" from "a value I can trust", so answering TRUE with a
+ * blob of the wrong length or a bad sum is worse than answering FALSE.
+ */
+function hexByte(text: string, at: number): number {
+    const hi = parseInt(text[at] ?? '', 16);
+    const lo = parseInt(text[at + 1] ?? '', 16);
+    return Number.isNaN(hi) || Number.isNaN(lo) ? -1 : (hi << 4) | lo;
+}
+
+function getProfileStruct(section: string, key: string, bufPtr: number, len: number, fileName: string): number | Promise<ThunkResult> {
+    const STACK_CLEANUP = 20;
+    if (!bufPtr) return 0;
+    return withIniData(fileName, STACK_CLEANUP, (ini) => {
+        const value = ini ? getIniValue(ini, section, key) : undefined;
+        if (value === undefined || value.length !== 2 * len + 2) return 0;
+
+        const bytes = new Uint8Array(len);
+        let checksum = 0;
+        for (let i = 0; i < len; i++) {
+            const b = hexByte(value, i * 2);
+            if (b < 0) return 0;
+            bytes[i] = b;
+            checksum = (checksum + b) & 0xff;
+        }
+        const stored = hexByte(value, len * 2);
+        if (stored !== checksum) return 0;
+
+        Mem.writeBytes(bufPtr, bytes);
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `GetPrivateProfileStruct: [${section}]${key} = ${len} byte(s)`);
+        return 1;
+    });
+}
+
+function putProfileStruct(
+    section: string | null,
+    key: string | null,
+    bufPtr: number,
+    len: number,
+    fileName: string | null,
+    caller: string,
+): number | Promise<ThunkResult> {
+    // A NULL buffer is the documented "delete this value" (and all three NULL, "flush").
+    if (!bufPtr) return writeIniValue(fileName, section, key, null, caller);
+
+    let text = '';
+    let sum = 0;
+    for (let i = 0; i < len; i++) {
+        const b = Mem.readUint8(bufPtr + i) ?? 0;
+        text += b.toString(16).padStart(2, '0').toUpperCase();
+        sum += b;
+    }
+    text += (sum & 0xff).toString(16).padStart(2, '0').toUpperCase();
+
+    Logger.log(LogCategory.KERNEL32, `${caller}: [${section}] ${key} = ${len} byte(s) in "${fileName}"`);
+    return writeIniValue(fileName, section, key, text, caller);
+}
+
+/**
  * Look up a value from INI data
  */
 function getIniValue(ini: IniData, section: string, key: string): string | undefined {
@@ -578,6 +638,44 @@ export const exports: Record<string, ThunkImplementation> = {
         return writeIniValue(fileName, section, key, value, 'WritePrivateProfileStringW');
     },
 
+    'GetPrivateProfileStructA': (ctx, mem, args) =>
+        getProfileStruct(
+            args[0] ? Marshaler.readString(mem, args[0]) : '',
+            args[1] ? Marshaler.readString(mem, args[1]) : '',
+            args[2] >>> 0,
+            args[3] >>> 0,
+            args[4] ? Marshaler.readString(mem, args[4]) : '',
+        ),
+
+    'GetPrivateProfileStructW': (ctx, mem, args) =>
+        getProfileStruct(
+            args[0] ? Marshaler.readWideString(mem, args[0]) : '',
+            args[1] ? Marshaler.readWideString(mem, args[1]) : '',
+            args[2] >>> 0,
+            args[3] >>> 0,
+            args[4] ? Marshaler.readWideString(mem, args[4]) : '',
+        ),
+
+    'WritePrivateProfileStructA': (ctx, mem, args) =>
+        putProfileStruct(
+            args[0] ? Marshaler.readString(mem, args[0]) : null,
+            args[1] ? Marshaler.readString(mem, args[1]) : null,
+            args[2] >>> 0,
+            args[3] >>> 0,
+            args[4] ? Marshaler.readString(mem, args[4]) : null,
+            'WritePrivateProfileStructA',
+        ),
+
+    'WritePrivateProfileStructW': (ctx, mem, args) =>
+        putProfileStruct(
+            args[0] ? Marshaler.readWideString(mem, args[0]) : null,
+            args[1] ? Marshaler.readWideString(mem, args[1]) : null,
+            args[2] >>> 0,
+            args[3] >>> 0,
+            args[4] ? Marshaler.readWideString(mem, args[4]) : null,
+            'WritePrivateProfileStructW',
+        ),
+
     'GetPrivateProfileStringW': (ctx, mem, args) => {
         const lpAppName = args[0];
         const lpKeyName = args[1];
@@ -621,6 +719,49 @@ export const exports: Record<string, ThunkImplementation> = {
                 );
             }
             return writeWideStringToBuffer(lpReturnedString, value !== undefined ? value : defaultValue, nSize);
+        });
+    },
+
+    /**
+     * GetPrivateProfileSectionNamesA(lpszReturnBuffer, nSize, lpFileName)
+     *
+     * The same section list GetPrivateProfileStringA(NULL, …) produces, as its own export —
+     * and the one a config-driven engine uses to discover what IS in its INI. Answering 0
+     * says the file has no sections, which reads as a valid empty config rather than as a
+     * failure, and whatever the game builds from it stays empty.
+     *
+     * Returns the characters written, NOT counting the final terminator; 0 for a missing
+     * file, and nSize-2 when the buffer was too small (Windows fills it and truncates).
+     */
+    'GetPrivateProfileSectionNamesA': (ctx, mem, args) => {
+        const lpszReturnBuffer = args[0];
+        const nSize = args[1];
+        const fileName = args[2] ? Marshaler.readString(mem, args[2]) : '';
+
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `GetPrivateProfileSectionNamesA(bufSize=${nSize}, file="${fileName}")`);
+
+        if (!lpszReturnBuffer || nSize === 0) return 0;
+        // Three arguments, so the async completion RETs 12 — not the 24 the six-argument
+        // GetPrivateProfileString path above uses.
+        return withIniData(fileName, 12, (ini) => {
+            if (!ini) { Mem.writeUint8(lpszReturnBuffer, 0); return 0; }
+            return enumerateSections(mem, lpszReturnBuffer, nSize, ini);
+        });
+    },
+
+    'GetPrivateProfileSectionNamesW': (ctx, mem, args) => {
+        const lpszReturnBuffer = args[0];
+        const nSize = args[1];
+        const fileName = args[2] ? Marshaler.readWideString(mem, args[2]) : '';
+
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `GetPrivateProfileSectionNamesW(bufSize=${nSize}, file="${fileName}")`);
+
+        if (!lpszReturnBuffer || nSize === 0) return 0;
+        return withIniData(fileName, 12, (ini) => {
+            if (!ini) { Mem.writeUint16(lpszReturnBuffer, 0); return 0; }
+            return enumerateSectionsWide(lpszReturnBuffer, nSize, ini);
         });
     },
 

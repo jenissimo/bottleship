@@ -1,7 +1,8 @@
 // Module management functions for kernel32
 // GetModuleHandle*, LoadLibrary*, GetProcAddress, FreeLibrary, GetModuleFileName*
 
-import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import type { FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { System } from '../../../core/system';
 import { Marshaler } from '../../../core/memory/marshaler';
 import { Logger, LogCategory, LogLevel } from '../../../core/logger';
@@ -333,7 +334,7 @@ const resolveThunkedExportAddress = resolveHleExportAddress;
 
 /** Boot-time warmup for exports resolved only via GetProcAddress (not PE imports). */
 export function ensureGetProcAddressDynamicExports(
-    dispatcher: any,
+    dispatcher: HleDispatcher,
     exports: Array<{ dll: string; name: string }>,
 ): void {
     ensureProcessLocalCaches();
@@ -1417,7 +1418,7 @@ initModuleFunctions();
  * Call after applyPendingRegistrations() to eliminate cold-miss stub allocation
  * at runtime (~0.3s saved during loading).
  */
-export function prePopulateGetProcAddressCache(dispatcher: any): void {
+export function prePopulateGetProcAddressCache(dispatcher: HleDispatcher): void {
     ensureProcessLocalCaches();
     const tg = dispatcher?.thunkGenerator;
     if (!tg || typeof tg.getAllStubs !== 'function') return;
@@ -1441,11 +1442,10 @@ export function prePopulateGetProcAddressCache(dispatcher: any): void {
 /**
  * Register GetModuleHandleA fast path — covers the common case of thunked DLL lookups.
  */
-export function registerFastPathModuleFunctions(dispatcher: any): void {
+export function registerFastPathModuleFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher?.registerFastPath) return;
 
-    const impl = (cpu: any, mem8: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    const impl: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 8 > mem8.length) return null;
         const lpName = view.getUint32(esp + 4, true) >>> 0;
         if (lpName === 0) return getMainExeHandle();

@@ -28,8 +28,11 @@ export interface VfsFileHandle {
     buffer?: Uint8Array;
     /** File offset of buffer[0] */
     bufferOffset?: number;
-    /** Epoch `buffer` was filled under — see VirtualFileSystem.windowEpoch. */
+    /** Epoch `buffer` was filled under — see VirtualFileSystem.windowEpochs. */
     bufferEpoch?: number;
+    /** This path's epoch cell, resolved on first use: comparing against it costs a property
+     *  read, so a per-path epoch is no dearer on the hot path than a global one was. */
+    epochRef?: { e: number };
     /** In-flight prefetch for next sequential chunk */
     prefetchPromise?: Promise<Uint8Array> | null;
     /** File offset where prefetched chunk starts */
@@ -154,6 +157,10 @@ export const vfsIoCensus = {
     hitOverlaySync: 0,
     /** Sync ladder returned null → the caller must park the guest thread and await. */
     asyncFallbacks: 0,
+    /** Sync ROM reads that came back SHORT mid-file and were refused rather than answered.
+     *  A short answer is indistinguishable from the truth to a caller reading an archive
+     *  header, so these fall through to the blocking path; the count says how often. */
+    romSyncShortFalls: 0,
     /** Served synchronously but by a branch that named no arm — a ladder branch the
      *  census cannot see. MUST be 0; anything else means the arm split below is
      *  under-counting and the rates built on it are wrong. */
@@ -317,10 +324,13 @@ export class VirtualFileSystem {
      * cover bytes that no longer exist. Stamping every window with the epoch and
      * rejecting a stale stamp is the reach, at the cost of one integer compare per read.
      *
-     * Deliberately global rather than per-path: truncation is rare, the hot path is not,
-     * and a per-path lookup would cost a key normalization on every buffered read.
+     * PER PATH, not global. A global counter means any file the game creates or truncates —
+     * a profile, a log, a shader cache, written continuously — discards the read window of
+     * every OTHER open handle, including the multi-gigabyte archive being streamed from. The
+     * per-read cost the global version avoided is paid once per handle instead: a handle
+     * holds its path's epoch cell, so the check stays a property compare.
      */
-    private windowEpoch = 0;
+    private windowEpochs = new Map<string, { e: number }>();
     /** Rate limit for the stale-window tripwire (see reportStaleWindow). */
     private staleWindowReports = 0;
 
@@ -622,12 +632,12 @@ export class VirtualFileSystem {
      * a file that no longer exists, and the VFS cannot reach those handles directly.
      */
     private resetOverlayFileSync(full: string): void {
-        this.bumpWindowEpoch();
+        this.bumpWindowEpoch(full);
         this.overlay!.prepareCreateSync(full);
     }
 
     private async resetOverlayFile(overlay: OpfsOverlay, full: string): Promise<void> {
-        this.bumpWindowEpoch();
+        this.bumpWindowEpoch(full);
         await overlay.truncateFile(full);
     }
 
@@ -944,7 +954,7 @@ export class VirtualFileSystem {
             if (offset >= cached.byteLength) return new Uint8Array();
             const data = cached.subarray(offset, Math.min(cached.byteLength, offset + length));
             this.advanceCursor(handle, data.length);
-            this.installWindow(handle, cached, 0, this.windowEpoch);
+            this.installWindow(handle, cached, 0, this.epochOf(handle));
             return data;
         }
 
@@ -966,17 +976,27 @@ export class VirtualFileSystem {
         // HINT keeps NT's stricter two-contiguous-requests test, since that one steers
         // speculation below this layer.
         const sequential = this.isSequentialRead(handle);
-        const epoch = this.windowEpoch;
+        const epoch = this.epochOf(handle);
         // A/B kill-switch: globalThis.__noRomReadWindow restores the un-widened read.
         const widen = !(globalThis as { __noRomReadWindow?: boolean }).__noRomReadWindow
             && (sequential || handle.lastReadEnd === undefined);
         const want = widen ? Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE) : length;
         const data = this.romArchive.readEntryRangeSync(entry, handle.position, want, sequential);
         if (!data) return null;
+        // A SHORT answer mid-file is not a small read, it is a MISS: the block cache below
+        // could not serve the whole range synchronously. Returning it anyway hands the guest
+        // fewer bytes than it asked for at a position where the file has more — which a
+        // caller reading an archive header cannot tell from the truth, and which surfaces
+        // much later as the game reporting its own assets missing. Fall through to the
+        // blocking path instead, which fetches what is not resident.
+        const endOfEntry = handle.position + data.byteLength >= entry.uncompressedSize;
+        if (data.byteLength < length && !endOfEntry) {
+            vfsIoCensus.romSyncShortFalls++;
+            return null;
+        }
         this.lastSyncArm = "hitRomRangeSync";
-        // The window's extent is what came BACK: readEntryRangeSync clamps to the entry
-        // and the block cache below it can return short, and a window sized from the
-        // request would then serve bytes nobody read.
+        // The window's extent is what came BACK: readEntryRangeSync clamps to the entry, and a
+        // window sized from the request would then serve bytes nobody read.
         if (data.byteLength > length) this.installWindow(handle, data, handle.position, epoch);
         const out = data.subarray(0, Math.min(length, data.byteLength));
         this.advanceCursor(handle, out.length);
@@ -1038,7 +1058,7 @@ export class VirtualFileSystem {
                 // window is served silently at full length by readFromHandleBuffer.
                 const pending = handle.prefetchPromise;
                 const prefetchOffset = handle.prefetchOffset;
-                const prefetchEpoch = handle.prefetchEpoch ?? this.windowEpoch;
+                const prefetchEpoch = handle.prefetchEpoch ?? this.epochOf(handle);
                 const prefetched = await pending;
                 if (handle.prefetchPromise === pending) {
                     handle.prefetchPromise = null;
@@ -1072,7 +1092,7 @@ export class VirtualFileSystem {
             const readSize = isWholeTailRead
                 ? remaining
                 : Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE);
-            const readEpoch = this.windowEpoch;
+            const readEpoch = this.epochOf(handle);
             const dataWindow = await this.fetchRange(handle, offset, readSize);
             this.installWindow(handle, dataWindow, offset, readEpoch);
 
@@ -1247,7 +1267,7 @@ export class VirtualFileSystem {
         const rel = this.relRomPath(full).toLowerCase();
         const romEntry = rel ? this.romIndex.get(rel) : undefined;
         const hasRomFile = !!romEntry && !romEntry.isDirectory && !this.romWhiteouts.has(rel);
-        this.bumpWindowEpoch(); // windows on a deleted (or now whited-out) file describe nothing
+        this.bumpWindowEpoch(full); // windows on a deleted (or now whited-out) file describe nothing
         const deletedOverlay = await this.overlay.deleteFile(full);
         if (hasRomFile) {
             this.romWhiteouts.add(rel);
@@ -1276,7 +1296,7 @@ export class VirtualFileSystem {
         const romEntry = rel ? this.romIndex.get(rel) : undefined;
         const romExists = !!romEntry && !romEntry.isDirectory;
         const hadWhiteout = rel !== "" && this.romWhiteouts.has(rel);
-        this.bumpWindowEpoch();
+        this.bumpWindowEpoch(full);
         // Settle the commit that may still be writing this file before removing it — a game
         // whose config is mid-flush is exactly when a fixture reset gets asked for, and racing
         // the commit leaves the delete waiting on a lock it cannot get.
@@ -1366,7 +1386,7 @@ export class VirtualFileSystem {
         // Every window taken before now may cover bytes past the new EOF, including
         // windows on handles this call cannot see. Bump BEFORE the await so a read that
         // interleaves with the truncate cannot install bytes under the old epoch.
-        this.bumpWindowEpoch();
+        this.bumpWindowEpoch(normalizePath(full));
         await this.overlay.truncateFileAt(full, size);
         // SetEndOfFile sets the authoritative EOF; beyond it Windows reads zero, never ROM.
         // Once a ROM-backed file's end is set here, the overlay masks the ROM underlay.
@@ -2165,9 +2185,36 @@ export class VirtualFileSystem {
         handle.prefetchEpoch = undefined;
     }
 
-    /** A truncate/delete/re-create invalidates every window taken before this point. */
-    private bumpWindowEpoch(): void {
-        this.windowEpoch = (this.windowEpoch + 1) | 0;
+    /** The epoch cell for a handle's path, resolved on first use and then held. */
+    private epochOf(handle: VfsFileHandle): number {
+        let ref = handle.epochRef;
+        if (!ref) {
+            ref = this.epochRefFor(handle.path);
+            handle.epochRef = ref;
+        }
+        return ref.e;
+    }
+
+    /**
+     * This path's epoch cell, created on demand. NORMALIZED, because the callers do not
+     * agree on a spelling — openSync holds an un-normalized `full`, truncate normalizes —
+     * and two spellings of one file would be two epochs, so a bump on one would not
+     * invalidate a window taken under the other.
+     */
+    private epochRefFor(full: string): { e: number } {
+        const key = normalizePath(full).toLowerCase();
+        let ref = this.windowEpochs.get(key);
+        if (!ref) {
+            ref = { e: 0 };
+            this.windowEpochs.set(key, ref);
+        }
+        return ref;
+    }
+
+    /** A truncate/delete/re-create invalidates every window on THAT path taken before now. */
+    private bumpWindowEpoch(full: string): void {
+        const ref = this.epochRefFor(full);
+        ref.e = (ref.e + 1) | 0;
     }
 
     /**
@@ -2181,7 +2228,7 @@ export class VirtualFileSystem {
         Logger.warn(
             LogCategory.SYSTEM,
             `VFS: stale read window discarded for "${handle.path}" ` +
-            `(window epoch=${handle.bufferEpoch}, current=${this.windowEpoch}, ` +
+            `(window epoch=${handle.bufferEpoch}, current=${this.epochOf(handle)}, ` +
             `offset=${handle.bufferOffset}, position=${handle.position}) — ` +
             `the file was truncated/replaced while this handle held a window`,
         );
@@ -2193,7 +2240,7 @@ export class VirtualFileSystem {
      * so they are dropped rather than installed.
      */
     private installWindow(handle: VfsFileHandle, data: Uint8Array, offset: number, epoch: number): boolean {
-        if (epoch !== this.windowEpoch) return false;
+        if (epoch !== this.epochOf(handle)) return false;
         handle.buffer = data;
         handle.bufferOffset = offset;
         handle.bufferEpoch = epoch;
@@ -2206,7 +2253,7 @@ export class VirtualFileSystem {
         if (!buffer || bufferOffset === undefined) {
             return null;
         }
-        if (handle.bufferEpoch !== this.windowEpoch) {
+        if (handle.bufferEpoch !== this.epochOf(handle)) {
             this.reportStaleWindow(handle);
             this.invalidateReadWindow(handle);
             return null;
@@ -2236,7 +2283,7 @@ export class VirtualFileSystem {
         if (nextOffset >= fileSize) return;
 
         handle.prefetchOffset = nextOffset;
-        handle.prefetchEpoch = this.windowEpoch;
+        handle.prefetchEpoch = this.epochOf(handle);
         handle.prefetchPromise = this.fetchRange(handle, nextOffset, VirtualFileSystem.PREFETCH_CHUNK_SIZE)
             .catch(() => new Uint8Array(0));
     }

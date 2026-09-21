@@ -4,7 +4,7 @@
  * Atomic implementation for message queue operations
  */
 
-import { ThunkImplementation, FastPathImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, FastPathImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
@@ -847,6 +847,25 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     };
 
     exports['GetMessageA'] = exports['GetMessageW'];
+
+    /**
+     * GetQueueStatus — HIWORD is what is in the queue now, LOWORD what arrived since
+     * the previous call. Our queue carries no per-QS_* class bits (same limitation
+     * MsgWaitForMultipleObjects documents below), so a non-empty queue answers with
+     * the caller's own mask in both words. That over-reports for a narrow mask, in the
+     * safe direction: the caller pumps, finds nothing of its class, and loops. The
+     * opposite error would have it wait on a queue that already holds its message.
+     */
+    exports['GetQueueStatus'] = (ctx, mem, args) => {
+        const flags = args[0] >>> 0;
+        const system = System.getInstance();
+        const currentThreadId = system.scheduler.getCurrentThreadId();
+
+        system.inputManager.poll(true);
+
+        const present = system.windowManager.hasMessages(0, 0, currentThreadId) ? flags & 0xffff : 0;
+        return ((present << 16) | present) >>> 0;
+    };
 
     exports['WaitMessage'] = (ctx, mem, args) => {
         const system = System.getInstance();
@@ -1838,18 +1857,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
  * Called when WASM handler falls through (queue non-empty or starvation limit).
  * Reads args directly from stack, avoids marshaling overhead.
  */
-export function registerFastPathMessageFunctions(dispatcher: any): void {
+export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     const WM_QUIT = 0x0012;
 
-    const fastPathPeekMessage: FastPathImplementation = (
-        cpu: any,
-        mem8: Uint8Array,
-        _mem32: Uint32Array,
-        dataView: DataView
-    ): number | null => {
-        const esp = cpu.reg32[4]; // ESP
+    const fastPathPeekMessage: FastPathImplementation = (esp: number, dataView: DataView, mem8: Uint8Array): number | null => {
 
         // PeekMessageA/W(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)
         // stdcall: args at ESP+4 through ESP+20
@@ -1958,13 +1971,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
     dispatcher.registerFastPath('user32', 'PeekMessageW', fastPathPeekMessage);
 
     // GetMessageA/W fast path: sync dequeue when message available, null → async slow path
-    const fastPathGetMessage: FastPathImplementation = (
-        cpu: any,
-        mem8: Uint8Array,
-        _mem32: Uint32Array,
-        dataView: DataView
-    ): number | null => {
-        const esp = cpu.reg32[4]; // ESP
+    const fastPathGetMessage: FastPathImplementation = (esp: number, dataView: DataView, mem8: Uint8Array): number | null => {
 
         // GetMessageA/W(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax)
         const lpMsg = dataView.getUint32(esp + 4, true);

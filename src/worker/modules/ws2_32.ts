@@ -9,6 +9,7 @@ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
+import { WAIT_BLOCKED_NO_SWITCH } from "../core/scheduler/types";
 import {
     SOCKET_ERROR,
     WSAEFAULT,
@@ -227,32 +228,44 @@ export class Ws2_32 implements IModule {
             return 1;
         };
 
-        this.exports["WSAWaitForMultipleEvents"] = (_ctx, _mem, args) => {
+        /**
+         * A real wait, not a poll. Returning WSA_WAIT_EVENT_0 when nothing is signalled tells
+         * the caller an event fired: it resets the event and waits again, and the thread spins
+         * at full speed forever — 16 million round trips before this was a wait. The result
+         * codes coincide with the Win32 ones (EVENT_0 = OBJECT_0 = 0, TIMEOUT = 258,
+         * FAILED = 0xFFFFFFFF), so the scheduler's answer is returned unchanged.
+         */
+        this.exports["WSAWaitForMultipleEvents"] = (ctx, mem, args) => {
             if (!requireStarted()) return WSA_WAIT_FAILED;
             const count = args[0] >>> 0;
             const handlesPtr = args[1] >>> 0;
             const waitAll = (args[2] >>> 0) !== 0;
             const timeout = args[3] >>> 0;
-            if (count === 0 || !handlesPtr) {
+            if (count === 0 || !handlesPtr || handlesPtr + count * 4 > mem.length) {
                 setError(WSAEINVAL);
                 return WSA_WAIT_FAILED;
             }
+            const handles: number[] = [];
+            for (let i = 0; i < count; i++) handles.push((Mem.readUint32(handlesPtr + i * 4) ?? 0) >>> 0);
+
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const returnAddr = view.getUint32(ctx.esp, true);
+            // 4 (return address) + 5 args
+            const postReturnEsp = ctx.esp + 24;
+
             const sched = System.getInstance().scheduler;
-            const threadId = sched.getCurrentThreadId();
-            const threadLookup = () => null;
-            for (let i = 0; i < count; i++) {
-                const handle = Mem.readUint32(handlesPtr + i * 4) ?? 0;
-                if (sched.syncObjects.isSignaled(handle >>> 0, threadId, threadLookup)) {
-                    return i >>> 0;
-                }
+            const result = sched.waitForObjectsWithContext(
+                handles,
+                waitAll,
+                timeout,
+                returnAddr,
+                postReturnEsp,
+                { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+            );
+            if (result === WAIT_BLOCKED_NO_SWITCH) {
+                return { value: 0, blockedNoSwitch: true, stackCleanup: 20 };
             }
-            if (timeout === 0) {
-                return WSA_WAIT_TIMEOUT;
-            }
-            if (waitAll && count > 1) {
-                return WSA_WAIT_TIMEOUT;
-            }
-            return 0;
+            return result >>> 0;
         };
 
         this.exports["WSAEventSelect"] = (_ctx, _mem, args) => {

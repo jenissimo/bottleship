@@ -594,6 +594,38 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     /**
+     * FindResourceExW - wide extended form. Argument order matches FindResourceExA
+     * (type, then name — the reverse of FindResourceW), and language is ignored:
+     * our PE walk takes the first language entry, which is what a single-language
+     * image has anyway.
+     */
+    'FindResourceExW': (ctx, mem, args) => {
+        let hModule = args[0];
+        const lpType = args[1];
+        const lpName = args[2];
+        const wLanguage = args[3];
+
+        if (hModule === 0) {
+            hModule = 0x00400000;
+        }
+
+        const resourceName = interpretResourceIdW(mem, lpName);
+        const resourceType = interpretResourceIdW(mem, lpType);
+
+        Logger.verbose(LogCategory.KERNEL32,
+            `FindResourceExW(hModule=0x${hModule.toString(16)}, type=${resourceType}, name=${resourceName}, lang=${wLanguage})`);
+
+        const entry = findResourceInPE(mem, hModule, resourceType, resourceName);
+        if (!entry) {
+            return 0;
+        }
+
+        const hrsrc = nextResourceHandle++;
+        resourceCache.set(hrsrc, entry);
+        return hrsrc;
+    },
+
+    /**
      * EnumResourceNamesA - enumerate resource names of a given type.
      * Compatibility stub: report success without callback invocation.
      */

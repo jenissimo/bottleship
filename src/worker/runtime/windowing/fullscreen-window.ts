@@ -16,9 +16,13 @@
 import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
 import { windows as sharedWindows } from "../../modules/user32/shared-state";
+import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
 const WM_SIZE = 0x0005;
 const SIZE_RESTORED = 0;
+const WS_VISIBLE = 0x10000000;
+const WS_CHILD = 0x40000000;
+const HWND_TOP = 0;
 
 /**
  * Put `hwnd`'s client area at `width`x`height` and tell the guest about it.
@@ -54,6 +58,8 @@ export function resizeFullscreenWindowToMode(
 
     if (!winObj && !sharedWin) return;
 
+    showFullscreenWindow(hwnd, source);
+
     // The app updates its viewport/projection from this, exactly as it does for a real
     // fullscreen switch.
     system.windowManager?.postMessage(hwnd, WM_SIZE, SIZE_RESTORED,
@@ -87,4 +93,48 @@ export function deviceWindowClientExtent(hwnd: number): { width: number; height:
         return { width: winObj.rect.w | 0, height: winObj.rect.h | 0 };
     }
     return null;
+}
+
+/**
+ * A fullscreen mode-set also SHOWS the window it takes over.
+ *
+ * The runtime does this itself — an app is entitled to create its window without
+ * WS_VISIBLE, never call ShowWindow, and go straight to a fullscreen device; the
+ * mode-set is what puts the window on screen, activates it and brings it to the
+ * front (wined3d's setup_fullscreen_window does exactly this via SetWindowPos with
+ * SWP_SHOWWINDOW). The Bard's Tale does precisely that.
+ *
+ * Leaving it hidden is not cosmetic: an invisible window cannot be the target of
+ * WindowFromPoint, so mouse routing finds nothing and every click is dropped while
+ * the game renders normally — dead input with a perfectly live frame.
+ *
+ * Visibility lives in the same two maps the rect does, and user32 owns the
+ * authoritative copy, so both are written here rather than in one API's module.
+ */
+function showFullscreenWindow(hwnd: number, source: string): void {
+    const system = System.getInstance();
+    const sharedWin = sharedWindows.get(hwnd);
+    const winObj = system.windowManager?.getWindow(hwnd);
+
+    const alreadyVisible = sharedWin ? sharedWin.visible : winObj?.visible;
+    if (alreadyVisible) return;
+
+    // A child window is never the fullscreen target; showing one here would be inventing
+    // a state change no mode-set performs.
+    const style = sharedWin?.style ?? winObj?.style ?? 0;
+    if ((style & WS_CHILD) !== 0) return;
+
+    if (sharedWin) {
+        sharedWin.visible = true;
+        sharedWin.style |= WS_VISIBLE;
+    }
+    if (winObj) {
+        winObj.visible = true;
+        winObj.style |= WS_VISIBLE;
+    }
+
+    system.windowManager?.setWindowZOrder(hwnd, HWND_TOP);
+    activateTopLevelWindow(hwnd);
+    Logger.log(LogCategory.SYSTEM,
+        `${source}: fullscreen mode-set shows hwnd=0x${hwnd.toString(16)}`);
 }

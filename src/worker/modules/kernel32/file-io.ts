@@ -4,7 +4,7 @@
  * Atomic implementation for file operations
  */
 
-import { ThunkImplementation, ThunkResult, DeferredWrite } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult, DeferredWrite } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory, LogLevel } from '../../core/logger';
 import { registerFileIoCommExports } from './file-io-comm';
 import { registerFileIoConsoleExports, ConsoleDeviceHandle, isConsoleDeviceHandle, isWindowsDevice } from './file-io-console';
@@ -2508,14 +2508,13 @@ export function resetFileIoState(): void {
  * SetFilePointer: ~44K calls (169ms), ReadFile: ~33K calls (286ms) in UT99 demo.
  * Bypasses full thunk context deserialization for sync operations.
  */
-export function registerFastPathFileIOFunctions(dispatcher: any): void {
+export function registerFastPathFileIOFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // =========================================================================
     // SetFilePointer fast path — 44K calls, 169ms
     // =========================================================================
-    dispatcher.registerFastPath('kernel32', 'SetFilePointer', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('kernel32', 'SetFilePointer', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 20 > mem8.length) return null;
         const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -2564,8 +2563,7 @@ export function registerFastPathFileIOFunctions(dispatcher: any): void {
     // =========================================================================
     // ReadFile fast path — 33K calls, 286ms (sync ROM cache hits only)
     // =========================================================================
-    dispatcher.registerFastPath('kernel32', 'ReadFile', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('kernel32', 'ReadFile', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 24 > mem8.length) return null;
         const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 

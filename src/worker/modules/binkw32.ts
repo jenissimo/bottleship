@@ -39,6 +39,11 @@ import {
     BinkStructLayout, BINK_LAYOUT_DEFAULT, BINK_SET_VOLUME_DECORATED_POPS,
     binkBuildFor, selectBinkBuild,
 } from "./bink-struct";
+import {
+    BFB, BinkPlane, BINKFRAMEBUFFERS_SIZE, BINK_FLAG_ALPHA,
+    BINK_HEADER_VIDEOFLAGS_OFFSET, bgraToBinkPlanes, binkPlaneGeometry, planeOffset,
+    type BinkPlaneGeometry,
+} from "./bink-frame-buffers";
 
 /** The one export whose argument list RAD changed without changing its decorated name. */
 const BINK_SET_VOLUME_EXPORT = "_BinkSetVolume@8";
@@ -413,6 +418,24 @@ interface BinkSession {
     hasPointerFault: boolean;
     videoOn: boolean;   // BinkSetVideoOnOff — mutes video path only, audio/timing keep running
     ioSize:  number;    // IO buffer size hint set by BinkSetIOSize before BinkOpen
+    /** videoflags from the 44-byte file header — the stream's own answer to "has alpha". */
+    videoFlags: number;
+    /** Guest-visible YUV planes, allocated on the first BinkGetFrameBuffersInfo. */
+    framePlanes: BinkFramePlanes | null;
+}
+
+/**
+ * The planes `BinkGetFrameBuffersInfo` publishes. Allocated once per session, on demand:
+ * a title that only ever calls BinkCopyToBuffer never pays for them.
+ */
+interface BinkFramePlanes {
+    /** Guest base address of the whole Y+cR+cB(+A) block. */
+    base: number;
+    geom: BinkPlaneGeometry;
+    /** Host-side staging for one conversion — blitted into guest memory in one write. */
+    scratch: Uint8Array;
+    /** frameDecodeCount the planes currently hold; -1 when never filled. */
+    filledForFrame: number;
 }
 
 interface BinkBufferSession {
@@ -663,6 +686,58 @@ export class BinkW32 implements IModule {
         return { kind: "none", valid: false };
     }
 
+    /**
+     * Allocate the guest-visible plane block for this session, once.
+     *
+     * Real Bink allocates the frame buffers inside BinkOpen (unless the app passed
+     * BINKNOFRAMEBUFFERS and registers its own), so by the time the app asks for them the
+     * pointers are already valid — which is exactly what it reads out of the struct. We
+     * defer the allocation to the first ask because most titles never take this path.
+     */
+    private ensureFramePlanes(s: BinkSession): BinkFramePlanes | null {
+        if (s.framePlanes) return s.framePlanes;
+        const geom = binkPlaneGeometry(s.width, s.height, !!(s.videoFlags & BINK_FLAG_ALPHA));
+        const base = this.process.memory.alloc(geom.totalBytes);
+        if (!base) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[BINK] frame buffers: cannot allocate ${geom.totalBytes} bytes for ${s.width}x${s.height}`);
+            return null;
+        }
+        const m = this.getMemory();
+        // Neutral YUV, not zero: an app that samples the planes before the first decode
+        // would otherwise get bright green (Y=0,cR=cB=0) rather than black.
+        m.fill(16, base + geom.yOffset, base + geom.cROffset);
+        m.fill(128, base + geom.cROffset, base + geom.aOffset);
+        if (geom.hasAlpha) m.fill(255, base + geom.aOffset, base + geom.totalBytes);
+        s.framePlanes = { base, geom, scratch: new Uint8Array(geom.totalBytes), filledForFrame: -1 };
+        Logger.log(LogCategory.SYSTEM,
+            `[BINK] frame buffers for 0x${s.guestPtr.toString(16)}: Y ${geom.yWidth}x${geom.yHeight}, ` +
+            `cRcB ${geom.cWidth}x${geom.cHeight}${geom.hasAlpha ? ", +A" : ""} @0x${base.toString(16)}`);
+        return s.framePlanes;
+    }
+
+    /**
+     * Convert the frame the decoder just produced into the published planes.
+     *
+     * Built host-side and blitted in ONE write: a per-byte store through the guest view
+     * costs ~40x, which at 1024x768 is the difference between a pass and a stall.
+     */
+    private fillFramePlanes(s: BinkSession): void {
+        const fp = s.framePlanes;
+        if (!fp || fp.filledForFrame === s.frameDecodeCount) return;
+        const bgra = videoEngine.getFrameBgra(s.engineHandle);
+        if (!bgra) return;
+        bgraToBinkPlanes(bgra, s.width, s.height, fp.scratch, fp.geom);
+        this.getMemory().set(fp.scratch, fp.base);
+        fp.filledForFrame = s.frameDecodeCount;
+    }
+
+    private releaseFramePlanes(s: BinkSession): void {
+        if (!s.framePlanes) return;
+        this.process.memory.free(s.framePlanes.base);
+        s.framePlanes = null;
+    }
+
     private buildFrameViews(s: BinkSession): VideoFrameViews {
         const pal8 = videoEngine.getFramePal8(s.engineHandle);
         return {
@@ -911,6 +986,7 @@ export class BinkW32 implements IModule {
         const fpsDividend = view.getUint32(28, true);
         const fpsDivisor = view.getUint32(32, true) || 1;
         const fps = fpsDividend / fpsDivisor;
+        const videoFlags = view.getUint32(BINK_HEADER_VIDEOFLAGS_OFFSET, true);
 
         const L = this.layout;
         const guestPtr = this.process.memory.alloc(BINK_HANDLE_SIZE);
@@ -942,6 +1018,8 @@ export class BinkW32 implements IModule {
             hasBufferApiHint: false, hasPointerFault: false,
             videoOn: false,
             ioSize: this.pendingIoSize,
+            videoFlags,
+            framePlanes: null,
         });
         Logger.log(LogCategory.SYSTEM,
             `BinkOpen(${label}) → 0x${guestPtr.toString(16)} SKIPPED as a finished stream ` +
@@ -1355,6 +1433,11 @@ export class BinkW32 implements IModule {
                     hasPointerFault: false,
                     videoOn: true,
                     ioSize:  this.pendingIoSize,
+                    videoFlags: bytes.length > BINK_HEADER_VIDEOFLAGS_OFFSET + 4
+                        ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+                            .getUint32(BINK_HEADER_VIDEOFLAGS_OFFSET, true)
+                        : 0,
+                    framePlanes: null,
                 };
 
                 // Wire up audio SAB for sync pacing
@@ -1401,6 +1484,7 @@ export class BinkW32 implements IModule {
             if (s.paused || s.eof) return 0;
 
             this._decodeFrame(s, bink);
+            if (!s.eof) this.fillFramePlanes(s);
             if (!s.eof && s.videoOn) {
                 System.getInstance().videoRouting.onFrameDecoded({
                     codec: "bink",
@@ -1415,6 +1499,82 @@ export class BinkW32 implements IModule {
             }
             return 0;
         };
+
+        // ── BinkGetFrameBuffersInfo(HBINK, BINKFRAMEBUFFERS*) ───────────────────
+        // Publishes the plane geometry AND the plane pointers. A title that converts
+        // YUV→RGB itself reads both out of this struct, so answering without writing it
+        // hands the caller uninitialised stack to dereference.
+        this.exports["_BinkGetFrameBuffersInfo@8"] = (_ctx, _mem, args) => {
+            const bink = args[0];
+            const out  = args[1];
+            const s = this.sessions.get(bink);
+            if (!s) return 0;
+            if (!this.validateWritableSpan(out, BINKFRAMEBUFFERS_SIZE)) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `[BINK] BinkGetFrameBuffersInfo(0x${bink.toString(16)}): unwritable target 0x${out.toString(16)}`);
+                return 0;
+            }
+            this._logApi(bink, "GetFrameBuffersInfo", `out=0x${out.toString(16)}`);
+
+            const fp = this.ensureFramePlanes(s);
+            const m = this.getMemory();
+            m.fill(0, out, out + BINKFRAMEBUFFERS_SIZE);
+            if (!fp) return 0;
+            const g = fp.geom;
+
+            // One buffer set: we decode into a single frame's planes, so FrameNum — the set
+            // the last decode landed in — is always 0. Claiming two would promise the caller
+            // a second set that never changes.
+            this.writeU32(m, out + BFB.TotalFrames, 1);
+            this.writeU32(m, out + BFB.YABufferWidth, g.yWidth);
+            this.writeU32(m, out + BFB.YABufferHeight, g.yHeight);
+            this.writeU32(m, out + BFB.cRcBBufferWidth, g.cWidth);
+            this.writeU32(m, out + BFB.cRcBBufferHeight, g.cHeight);
+            this.writeU32(m, out + BFB.FrameNum, 0);
+
+            // Allocate=0 says "Bink owns this buffer, here it is" — the answer for a stream
+            // opened WITHOUT BINKNOFRAMEBUFFERS, which is the only shape we serve.
+            const plane = (p: BinkPlane, ptr: number, pitch: number) => {
+                const o = out + planeOffset(0, p);
+                this.writeU32(m, o + 0, 0);
+                this.writeU32(m, o + 4, ptr);
+                this.writeU32(m, o + 8, pitch);
+            };
+            plane(BinkPlane.Y,  fp.base + g.yOffset,  g.yWidth);
+            plane(BinkPlane.cR, fp.base + g.cROffset, g.cWidth);
+            plane(BinkPlane.cB, fp.base + g.cBOffset, g.cWidth);
+            if (g.hasAlpha) plane(BinkPlane.A, fp.base + g.aOffset, g.yWidth);
+
+            // A stream already decoded past (skipVideo, or a mid-playback query) must not
+            // publish planes that no decode will ever fill.
+            this.fillFramePlanes(s);
+            return 1;
+        };
+
+        // ── BinkShouldSkip(HBINK) ───────────────────────────────────────────────
+        // "Is playback far enough behind that this frame should be decoded but not
+        // shown?" Real Bink answers from the audio clock; so do we. A stream with no
+        // audio has no clock to fall behind, and a finished one has nothing to skip.
+        this.exports["_BinkShouldSkip@4"] = (_ctx, _mem, args) => {
+            const bink = args[0];
+            const s = this.sessions.get(bink);
+            if (!s || s.eof || s.paused || s.engineHandle < 0) return 0;
+            if (!s.audioCtrl || s.audioBaselineMs < 0 || s.fps <= 0) return 0;
+            const audioMs = this._getAudioTimeMs(s);
+            if (audioMs < 0) return 0;
+            const frameMs = 1000 / s.fps;
+            const videoMs = s.frameDecodeCount * frameMs;
+            // One whole frame behind is the point past which showing it is worse than
+            // dropping it — the same threshold Bink's own pacing uses.
+            return (audioMs - s.audioBaselineMs) - videoMs > frameMs ? 1 : 0;
+        };
+
+        // ── BinkOpenDirectSound(LPDIRECTSOUND) ──────────────────────────────────
+        // Passed to BinkSetSoundSystem as a FUNCTION POINTER; Bink calls it at open time
+        // to bind the track to DirectSound. Our audio path already owns output, so binding
+        // succeeds with nothing to do — but it must say so, because 0 means "no sound
+        // system" and the guest then plays the movie mute.
+        this.exports["_BinkOpenDirectSound@4"] = (_ctx, _mem, _args) => 1;
 
         // в”Ђв”Ђ BinkCopyToBuffer(HBINK, void* buf, pitch, h, x, y, flags) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         this.exports["_BinkCopyToBuffer@28"] = (_ctx, _mem, args) => {
@@ -1753,6 +1913,7 @@ export class BinkW32 implements IModule {
                 Logger.verbose(LogCategory.SYSTEM, `BinkClose(0x${bink.toString(16)}): unknown handle`);
                 return 0;
             }
+            this.releaseFramePlanes(s);
             videoEngine.close(s.engineHandle);
             (self as any).postMessage({ type: 'video_end' });
             System.getInstance().videoRouting.closeSession("bink", bink);

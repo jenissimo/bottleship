@@ -6,11 +6,11 @@
  * import-table name, so one HLE module has to answer for both; the export sets are
  * disjoint, which is what keeps them apart.
  *
- * What we recreate is a Galaxy SDK that constructs locally and does nothing online: the
- * factory hands back real interfaces whose methods are no-ops. Returning NULL instead is
- * what a real Galaxy.dll never does past `CreateInstance` — its getters THROW rather than
- * answer NULL, so callers dereference the result unchecked, and a NULL there is an access
- * violation rather than a graceful decline.
+ * What we recreate is a Galaxy SDK that constructs locally and does nothing online: it
+ * hands back real interfaces whose methods are no-ops. Returning NULL instead is what a
+ * real Galaxy.dll does not do once the SDK is up — the factory generation's getters THROW
+ * rather than answer NULL — so callers dereference the result unchecked, and a NULL there
+ * is an access violation rather than a graceful decline.
  *
  * THE VTABLE LAYOUT IS THE CONTRACT — see d3dx9/effects.ts for the same rule. A guest
  * calls slot N with the arity the real interface declares; an invented order answers with
@@ -43,9 +43,56 @@
  *     with three pushed args (0x441dc6), slot 4 then IUser slot 3 with none — "GOG: Signing
  *     In..." (0x442a2b), slot 10 then IListenerRegistrar slot 1 with two (twelve sites,
  *     0x443da6..0x444e5d), slot 12 with none in the per-frame pump (0x441e90).
+ *
+ * TWO SDK GENERATIONS, TWO SETS OF LAYOUTS. A later SDK drops `GalaxyFactory` for
+ * namespace-level free functions (`galaxy::api::Init/User/Apps/Stats/Utils/…`). Its
+ * interfaces are NOT the factory generation's with methods appended — `IUser` agrees for
+ * three slots and then diverges — so the layouts below are kept apart rather than shared.
+ * Provenance for that generation (Galaxy.dll of The Bard's Tale ARPG, GOG build
+ * 1207659164, 32-bit, image base 0x10000000):
+ *   - Each getter is `mov eax,[singleton]; test eax,eax; je -> xor eax,eax; add eax,0x34`
+ *     (`User` 0x100bfe50, `Stats` 0x100be8f0, `Utils` 0x100bfe70, `Apps` 0x100bd030), so
+ *     the interface is a base subobject at +0x34 of a facade object, and it answers NULL
+ *     while that singleton is absent — unlike the factory generation's throwing getters.
+ *   - The singletons are constructed at 0x100bd8a0.. and stored to 0x10a9c868 (User),
+ *     0x10a9c87c (Stats), 0x10a9c880 (Utils), 0x10a9c888 (Apps); their constructors store
+ *     the +0x34 vftable directly (0x100e1c2f, 0x1010814f, 0x10113f7f, 0x1011e3f6), which
+ *     is what ties each singleton to the RTTI-named class whose table is transcribed
+ *     below. Teardown (0x100bd148..) calls slot 0 with a pushed 1 and NULLs the global,
+ *     so after `Shutdown` the getters answer NULL again.
+ *   - `Init` (0x100bd4e0) reads its by-reference argument at +0x00, +0x0c, +0x10, +0x14,
+ *     +0x18 and +0x1c (word) — the extent validated at our boundary.
+ *   - Per-slot PUSHED-ARG COUNT is the `RET imm16`, measured with `re vtable`, which
+ *     follows control flow: MSVC lays the `__unwind$`/`__catch$` funclets inside the same
+ *     address range and a funclet ends in a bare `ret`, so a linear read of these bodies
+ *     answers `0` for methods that clean up arguments.
+ *   - Cross-checked against what the title actually calls (The Bard's Tale.exe, base
+ *     0x400000): IUser slot 7 with two pushed args (0x597f58, 0x597fb3, 0x598023,
+ *     0x735113), IApps slot 3 with two (0x735180), IStats slots 8 and 9 with one each
+ *     (0x73555d), IUtils slot 6 with none, tail-jumped straight after the per-frame
+ *     `ProcessData` (0x735010). Every one of those getters' results is dereferenced
+ *     without a NULL test. `Init` is handed a 0x30-byte local whose fields it fills to
+ *     +0x1b (0x7350b0), which is the caller-side half of the extent below.
+ *   - RETURN KIND per slot is the instruction that last defines EAX on the reachable
+ *     return paths: a write to AL is a bool, a leftover from the epilogue's `std::string`
+ *     destructor (0x1000738d) is a void, an immediate is an enum, and a load of a cached
+ *     `c_str()` is a `const char*`. `IApps::GetCurrentGameLanguage` (0x1011e680) and
+ *     `GetCurrentGameLanguageCode` (0x1011ea20) additionally carry the DLL's own defaults
+ *     as literals — 0x1089b590 "english" and 0x1089b5d8 "en-US" — which is where the
+ *     values in the table come from. `IUser::GetGalaxyID` (0x1013ea40) reads `[ebp+8]`
+ *     into ESI and returns it: a struct-by-value, so its one pushed argument is the
+ *     hidden buffer, not a parameter.
+ *
+ * KNOWN GAP: the factory generation's sub-interfaces above carry arity only. The same
+ * "0 is not a pointer" hazard applies to them, and it is unmeasured here because the
+ * binary that defines them is a different build (Worms World Party's), not the one in
+ * this bundle. Measure it against that DLL before trusting those slots' returns.
  */
 
 import { Process } from '../../core/process';
+import { Logger, LogCategory } from '../../core/logger';
+import { isValidAddress } from '../../core/memory/address-guard';
+import { Mem } from '../../core/memory/mem-accessor';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/module-adapter';
 import { InterfaceDescriptor, ModuleDescriptor } from '../../api/types';
@@ -58,6 +105,27 @@ export const GOG_GALAXY_EXPORTS = {
     getErrorManager: '?GetErrorManager@GalaxyFactory@api@galaxy@@SAPAVIErrorManager@23@XZ',
     resetInstance: '?ResetInstance@GalaxyFactory@api@galaxy@@SAXXZ',
 } as const;
+
+/**
+ * The later generation's free-function facade. `YA` — __cdecl, so the CALLER cleans up
+ * and our stubs pop nothing; `Init` is the only one with an argument.
+ */
+export const GOG_GALAXY_API_EXPORTS = {
+    init: '?Init@api@galaxy@@YAXABUInitOptions@12@@Z',
+    shutdown: '?Shutdown@api@galaxy@@YAXXZ',
+    processData: '?ProcessData@api@galaxy@@YAXXZ',
+    user: '?User@api@galaxy@@YAPAVIUser@12@XZ',
+    apps: '?Apps@api@galaxy@@YAPAVIApps@12@XZ',
+    stats: '?Stats@api@galaxy@@YAPAVIStats@12@XZ',
+    utils: '?Utils@api@galaxy@@YAPAVIUtils@12@XZ',
+} as const;
+
+/**
+ * `galaxy::api::InitOptions` — the by-reference argument of `Init`. Not a layout we
+ * claim to know field by field: this is the extent Galaxy.dll's own `Init` dereferences
+ * (highest touched member is a word at +0x1c), rounded to the struct's pointer alignment.
+ */
+export const GOG_GALAXY_INIT_OPTIONS_SIZE = 0x20;
 
 function method(name: string, argCount: number) {
     return {
@@ -80,6 +148,44 @@ function iface(name: string, argCounts: readonly number[]): InterfaceDescriptor 
         methods: argCounts.map((n, i) =>
             method(i === 0 ? 'Destructor' : `Slot${i}`, n)),
     };
+}
+
+/**
+ * WHAT A SLOT LEAVES IN EAX is part of the contract, alongside the arity.
+ *
+ * Answering 0 is only safe where the real method returns void, a bool or an integer. A
+ * slot that returns a POINTER answers a value the guest dereferences, and the SDK's own
+ * `const char*` getters never return NULL — they return an empty string when nothing is
+ * set, which is why callers `strcmp` the result with no NULL test (The Bard's Tale does
+ * exactly that on `IApps::GetCurrentGameLanguage`). That is the same hazard the factory
+ * getters have, one level deeper.
+ *
+ * `str` is a `const char*`; the text is the DLL's own default where it has one, else "".
+ * `sret` is a struct returned BY VALUE: MSVC pushes a hidden buffer as the first argument
+ * and the callee returns THAT pointer in EAX, so the slot must hand `args[0]` back.
+ */
+type SlotReturn =
+    | { readonly kind: 'str'; readonly text: string }
+    | { readonly kind: 'sret'; readonly bytes: number };
+
+const str = (text: string): SlotReturn => ({ kind: 'str', text });
+const sret = (bytes: number): SlotReturn => ({ kind: 'sret', bytes });
+
+/** args, the name the shipped facade logs for itself, and the return kind when 0 is wrong. */
+type SlotSpec = readonly [args: number, name: string, returns?: SlotReturn];
+
+/** `${interface}_${method}` -> the value the slot must answer. */
+const slotReturns = new Map<string, SlotReturn>();
+
+/**
+ * A facade interface: every slot named by the shipped DLL and measured for BOTH arity and
+ * return kind. Unlike `iface` above, nothing here is positional guesswork.
+ */
+function facadeIface(name: string, slots: readonly SlotSpec[]): InterfaceDescriptor {
+    for (const [, methodName, returns] of slots) {
+        if (returns) slotReturns.set(`${name}_${methodName}`, returns);
+    }
+    return { name, methods: slots.map(([args, methodName]) => method(methodName, args)) };
 }
 
 /** galaxy::api::IUser — UserTranslator vftable 0x102eb250, 13 slots. */
@@ -177,9 +283,126 @@ const IGALAXY_GETTERS: ReadonlyArray<readonly [string, string]> = [
     ['GetUnknown11', 'IGalaxyUnknown'],
 ];
 
+/**
+ * The free-function generation's interfaces, each the subobject at +0x34 of the facade
+ * the matching getter hands out. Named after the RTTI class the transcription came from,
+ * because that — not the SDK header we do not have — is what was measured.
+ *
+ * Slot NAMES are the shipped DLL's own: every facade method pushes its name as a literal
+ * for its `%s: …: error=%s` log line, so the names are read out of the binary like the
+ * arities. The three slots the DLL never names keep a positional one.
+ *
+ * galaxy::api::IUser — PeerUserFacade vftable 0x10896c84, 38 slots.
+ * SignInPS4/XB1/Xbox log "method not available on this platform" and throw; slot 12 logs
+ * "Specified method is not implemented on current facade" and throws. They have no normal
+ * return, so there is nothing for them to answer.
+ */
+const IUserFacade = facadeIface('IUserFacade', [
+    [1, 'Destructor'],
+    [0, 'SignedIn'],
+    [1, 'GetGalaxyID', sret(8)],
+    [3, 'SignInCredentials'],
+    [2, 'SignInToken'],
+    [1, 'SignInLauncher'],
+    [4, 'SignInSteam'],
+    [2, 'SignInGalaxy'],
+    [0, 'SignInPS4'],
+    [0, 'SignInXB1'],
+    [0, 'SignInXbox'],
+    [5, 'SignInXBLive'],
+    [1, 'Slot12'],
+    [1, 'SignInAnonymousTelemetry'],
+    [2, 'SignInServerKey'],
+    [3, 'SignInAuthorizationCode'],
+    [0, 'SignOut'],
+    [3, 'RequestUserData'],
+    [2, 'IsUserDataAvailable'],
+    [3, 'GetUserData', str('')],
+    [5, 'GetUserDataCopy'],
+    [3, 'SetUserData'],
+    [2, 'GetUserDataCount'],
+    [7, 'GetUserDataByIndex'],
+    [2, 'DeleteUserData'],
+    [0, 'IsLoggedOn'],
+    [3, 'RequestEncryptedAppTicket'],
+    [3, 'GetEncryptedAppTicket'],
+    [5, 'CreateOpenIDConnection'],
+    [7, 'LoginWithOpenIDConnect'],
+    [0, 'GetSessionID'],
+    [0, 'GetAccessToken', str('')],
+    [2, 'GetAccessTokenCopy'],
+    [0, 'GetRefreshToken', str('')],
+    [2, 'GetRefreshTokenCopy'],
+    [0, 'GetIDToken', str('')],
+    [2, 'GetIDTokenCopy'],
+    [2, 'ReportInvalidAccessToken'],
+]);
+/** galaxy::api::IStats — StatsFacade vftable 0x10899a98, 35 slots. */
+const IStatsFacade = facadeIface('IStatsFacade', [
+    [1, 'Destructor'],
+    [3, 'RequestUserStatsAndAchievements'],
+    [3, 'GetStatInt'],
+    [3, 'GetStatFloat'],
+    [2, 'SetStatInt'],
+    [2, 'SetStatFloat'],
+    [4, 'UpdateAvgRateStat'],
+    [5, 'GetAchievement'],
+    [1, 'SetAchievement'],
+    [1, 'ClearAchievement'],
+    [1, 'StoreStatsAndAchievements'],
+    [1, 'ResetStatsAndAchievements'],
+    [1, 'GetAchievementDisplayName', str('')],
+    [3, 'GetAchievementDisplayNameCopy'],
+    [1, 'GetAchievementDescription', str('')],
+    [3, 'GetAchievementDescriptionCopy'],
+    [1, 'IsAchievementVisible'],
+    [1, 'IsAchievementVisibleWhileLocked'],
+    [1, 'RequestLeaderboards'],
+    [1, 'GetLeaderboardDisplayName', str('')],
+    [3, 'GetLeaderboardDisplayNameCopy'],
+    [1, 'GetLeaderboardSortMethod'],
+    [1, 'GetLeaderboardDisplayType'],
+    [4, 'RequestLeaderboardEntriesGlobal'],
+    [6, 'RequestLeaderboardEntriesAroundUser'],
+    [4, 'RequestLeaderboardEntriesForUsers'],
+    [4, 'GetRequestedLeaderboardEntry'],
+    [7, 'GetRequestedLeaderboardEntryWithDetails'],
+    [4, 'SetLeaderboardScore'],
+    [6, 'SetLeaderboardScoreWithDetails'],
+    [1, 'GetLeaderboardEntryCount'],
+    [2, 'FindLeaderboard'],
+    [5, 'FindOrCreateLeaderboard'],
+    [3, 'RequestUserTimePlayed'],
+    [2, 'GetUserTimePlayed'],
+]);
+/** galaxy::api::IUtils — PeerUtilsFacade vftable 0x1089aa14, 10 slots. */
+const IUtilsFacade = facadeIface('IUtilsFacade', [
+    [1, 'Destructor'],
+    [3, 'GetImageSize'],
+    [3, 'GetImageRGBA'],
+    [1, 'RegisterForNotification'],
+    [7, 'GetNotification'],
+    [1, 'ShowOverlayWithWebPage'],
+    [0, 'IsOverlayVisible'],
+    [0, 'GetOverlayState'],
+    [1, 'DisableOverlayPopups'],
+    [0, 'GetGogServicesConnectionState'],
+]);
+/** galaxy::api::IApps — AppsFacade vftable 0x1089b514, 7 slots. */
+const IAppsFacade = facadeIface('IAppsFacade', [
+    [1, 'Destructor'],
+    [2, 'IsDlcInstalled'],
+    [3, 'IsDlcOwned'],
+    [2, 'GetCurrentGameLanguage', str('english')],
+    [4, 'GetCurrentGameLanguageCopy'],
+    [2, 'GetCurrentGameLanguageCode', str('en-US')],
+    [4, 'GetCurrentGameLanguageCodeCopy'],
+]);
+
 const INTERFACES: readonly InterfaceDescriptor[] = [
     IGalaxy, IErrorManager, IError,
     IUser, IFriends, IMatchmaking, INetworking, IStats, IListenerRegistrar, IGalaxyUnknown,
+    IUserFacade, IStatsFacade, IUtilsFacade, IAppsFacade,
 ];
 
 const gogGalaxyDescriptor: ModuleDescriptor = {
@@ -187,6 +410,25 @@ const gogGalaxyDescriptor: ModuleDescriptor = {
     functions: [],
     interfaces: [...INTERFACES],
 };
+
+/**
+ * The published shape — interface name -> pushed-arg count per slot, in slot order.
+ * Derived from the descriptors the vtables are actually built from, so the test that
+ * pins it is testing what the guest gets rather than a second copy of the numbers.
+ */
+export const GOG_GALAXY_INTERFACE_LAYOUTS: Readonly<Record<string, readonly number[]>> =
+    Object.freeze(Object.fromEntries(
+        INTERFACES.map((d) => [d.name, Object.freeze(d.methods.map((m) => m.params.length))])));
+
+/**
+ * `${interface}_${method}` -> the slot's return kind, for the slots where 0 is not an
+ * answer the real method can give. The pinned counterpart of the layouts above: a slot
+ * silently reclassified as void is a NULL the guest dereferences.
+ */
+export const GOG_GALAXY_SLOT_RETURNS: ReadonlyMap<string, SlotReturn> = slotReturns;
+
+/** Every interface this module publishes, for the tests that pin their shape. */
+export const GOG_GALAXY_INTERFACES: readonly InterfaceDescriptor[] = INTERFACES;
 
 /** GalaxyError::GALAXY_ERROR / UNAUTHORIZED_ACCESS — "no client", the offline branch. */
 const GALAXY_ERROR_TYPE = 1;
@@ -197,12 +439,36 @@ let galaxyInstance = 0;
 const singletons = new Map<string, number>();
 /** Status of the LAST SDK call — see IErrorManager::GetError below. */
 let lastCallFailed = false;
+/** The free-function generation's "the singletons exist" state — set by Init, cleared by Shutdown. */
+let apiInitialized = false;
+/** Backing store for the `const char*` slots, keyed by text. */
+const stringPool = new Map<string, number>();
+const ZERO_SRET = new Uint8Array(16);
+
+/**
+ * A C string in guest memory with a PROCESS-LIFETIME address. The SDK's `const char*`
+ * getters promise a pointer that outlives the call — titles cache it — so this comes from
+ * a system block that we never release, and an unreleased block is never handed to
+ * another owner. Interning by text keeps repeat calls at one allocation.
+ */
+function guestString(process: Process, text: string): number {
+    const existing = stringPool.get(text);
+    if (existing) return existing;
+    const bytes = new Uint8Array(text.length + 1);
+    for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 0xff;
+    const addr = process.memory.allocSystemBlock(bytes.length) >>> 0;
+    Mem.writeBytes(addr, bytes);
+    stringPool.set(text, addr);
+    return addr;
+}
 
 export function resetGogGalaxyState(): void {
     vtables = null;
     galaxyInstance = 0;
     singletons.clear();
     lastCallFailed = false;
+    apiInitialized = false;
+    stringPool.clear();
 }
 
 export function createGogGalaxyExports(process: Process): Record<string, ThunkImplementation> {
@@ -269,6 +535,74 @@ export function createGogGalaxyExports(process: Process): Record<string, ThunkIm
     exports['IErrorManager_GetError'] = getError;
     exports['IGalaxy_GetError'] = getError;
     exports['IError_GetType'] = () => GALAXY_ERROR_TYPE;
+
+    // ── The free-function facade ────────────────────────────────────────────────────
+    // `Init` takes `const InitOptions&`, so the one pushed argument is a guest pointer
+    // the real SDK dereferences. Validate the whole extent it reads against the region
+    // map before trusting it: a bounds test would accept a pointer into THUNK_CODE or a
+    // red zone. We read nothing out of it — there is nothing in a client id or a config
+    // path a locally-constructed SDK can act on — but a reference the real Init would
+    // have faulted on must not read back as a clean success.
+    exports[GOG_GALAXY_API_EXPORTS.init] = (_ctx, mem, args) => {
+        const options = args[0] >>> 0;
+        if (!isValidAddress(mem, options, GOG_GALAXY_INIT_OPTIONS_SIZE, 'r')) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[Galaxy] api::Init: unreadable InitOptions& 0x${options.toString(16)}`);
+            lastCallFailed = true;
+            return 0;
+        }
+        apiInitialized = true;
+        lastCallFailed = false;
+        return 0;
+    };
+
+    // Shutdown destroys the singletons and NULLs the statics behind them, so the getters
+    // answer NULL again afterwards. Our objects are kept — the guest may still hold a
+    // pointer to one, and handing the same object back on a later Init costs nothing.
+    exports[GOG_GALAXY_API_EXPORTS.shutdown] = () => {
+        apiInitialized = false;
+        lastCallFailed = false;
+        return 0;
+    };
+
+    // The per-frame pump. Locally there is no client traffic to dispatch and no listener
+    // registered through us, so it does nothing — but it must stay cheap: titles call it
+    // once per frame, some once per subsystem per frame.
+    exports[GOG_GALAXY_API_EXPORTS.processData] = () => 0;
+
+    // The getters are a read of the singleton with a NULL check, not a throwing accessor:
+    // `mov eax,[g]; test eax,eax; je -> xor eax,eax`. So NULL before Init and after
+    // Shutdown is the SHIPPED behaviour, not a decline of ours, and answering an object
+    // there would be the invention.
+    const apiGetter = (target: string) => () => {
+        if (!apiInitialized) return 0;
+        lastCallFailed = false;
+        return objectFor(target);
+    };
+    exports[GOG_GALAXY_API_EXPORTS.user] = apiGetter('IUserFacade');
+    exports[GOG_GALAXY_API_EXPORTS.apps] = apiGetter('IAppsFacade');
+    exports[GOG_GALAXY_API_EXPORTS.stats] = apiGetter('IStatsFacade');
+    exports[GOG_GALAXY_API_EXPORTS.utils] = apiGetter('IUtilsFacade');
+
+    // …and the slots where 0 is not a value the real method can return. Installed AFTER
+    // the blanket no-op loop above, which is what makes that loop's "answer 0" a decision
+    // about void/bool/integer slots rather than a default applied to everything.
+    for (const [key, ret] of slotReturns) {
+        if (ret.kind === 'str') {
+            exports[key] = () => { lastCallFailed = false; return guestString(process, ret.text); };
+        } else {
+            exports[key] = (_ctx, mem, args) => {
+                const out = args[0] >>> 0;
+                if (!isValidAddress(mem, out, ret.bytes, 'rw')) { lastCallFailed = true; return 0; }
+                // Zero IS the answer: an all-zero GalaxyID is the invalid one, which is
+                // what "nobody is signed in" means. Leaving the caller's uninitialised
+                // buffer alone would hand it a plausible id instead.
+                Mem.writeBytes(out, ZERO_SRET.subarray(0, ret.bytes));
+                lastCallFailed = false;
+                return out;
+            };
+        }
+    }
 
     return exports;
 }

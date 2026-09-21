@@ -119,14 +119,14 @@ describe("HeapSize / HeapReAlloc fast path == slow path", () => {
 
     const fastSize = (lpMem: number): number | null => {
         pushArgs([HHEAP, 0, lpMem]);
-        return heapSizeFastPath(cpu, mem, new Uint32Array(mem.buffer), view) as number | null;
+        return heapSizeFastPath(cpu.reg32[4], view, mem, new Uint32Array(mem.buffer), cpu) as number | null;
     };
     const slowSize = (lpMem: number): number =>
         (memExports["HeapSize"] as any)(ctx, mem, [HHEAP, 0, lpMem]) as number;
 
     const fastReAlloc = (flags: number, lpMem: number, bytes: number): number | null => {
         pushArgs([HHEAP, flags, lpMem, bytes]);
-        return heapReAllocFastPath(cpu, mem, new Uint32Array(mem.buffer), view) as number | null;
+        return heapReAllocFastPath(cpu.reg32[4], view, mem, new Uint32Array(mem.buffer), cpu) as number | null;
     };
     const slowReAlloc = (flags: number, lpMem: number, bytes: number): number =>
         (memExports["HeapReAlloc"] as any)(ctx, mem, [HHEAP, flags, lpMem, bytes]) as number;

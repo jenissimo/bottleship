@@ -4,13 +4,19 @@
  */
 
 import { IModule } from "../core/module";
+import { cpuViews, readEip, readEsp } from '../core/cpu/cpu-views';
+import type { HleDispatcher, FastPathImplementation } from '../core/thunking/thunk-dispatcher';
 import { Process } from "../core/process";
 import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import { VfsFileHandle } from "../runtime/filesystem/vfs";
-import { fpuGetST, fpuPop, fpuPush, fpuSetST0 } from "../core/fpu-helper";
+import {
+    fpuGetST, fpuPop, fpuPush, fpuSetST0,
+    getFpuControlWord, setFpuControlWord, getFpuStatusWord, setFpuStatusWord,
+    msvcControlWordFromX87, msvcStatusWordFromX87, x87ControlWordFromMsvc, MSVC_MCW_DN,
+} from "../core/fpu-helper";
 import { getCPU, getMemory } from "../core/thunking/thunk-utils";
 import { Marshaler } from "../core/memory/marshaler";
 import { VaListReader, ArrayVaListReader, encodeAnsi, formatCLazy } from "./crt-format";
@@ -27,7 +33,6 @@ import { ensureNativeCBsearch } from "./crt-cbsearch";
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from "../core/diagnostics/large-io-trace";
 import { registerVc9AbiExports } from "./crt-vc9-abi";
 import { registerVc9IoExports, resetVc9TimeStatics, fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
-import { registerVc9SehExports } from "./crt-vc9-seh";
 import { registerVc9SetjmpExports } from "./crt-vc9-setjmp";
 import { registerCrtMathExports } from "./crt-math";
 import { registerCrtTimeExports, resetCrtTimeStatics } from "./crt-time";
@@ -36,8 +41,11 @@ import { registerCrtMbExports } from "./crt-mb";
 import { registerCrtConvExports } from "./crt-conv";
 import { registerCrtPathExports } from "./crt-path";
 import { registerCrtSeh3Exports } from "./crt-seh3";
+import { registerCrtVc8Exports } from "./crt-vc8";
 import { ensureNativeEHProlog } from "./crt-eh-prolog";
 import { registerRttiExports, demangleTypeInfoName } from "./crt-rtti";
+import { registerUcrtExports } from "./crt-ucrt";
+import { invokeGuestVoidChain, readFunctionPointerTable } from "./crt-callback-chain";
 
 /** Priming value for fgetsLoop — a generator's first next() discards its argument. */
 const EMPTY_BYTES = new Uint8Array(0);
@@ -85,6 +93,7 @@ export class Msvcrt implements IModule {
     private envpVectorAddr = 0;
     private environVarAddr = 0;  // char** _environ / __environ / _environ_dll
     private iobAddr = 0;
+    private tmpnamBuf = 0;
     private pioinfoAddr = 0;
     private badioinfoAddr = 0;
     private lcCodepageAddr = 0;  // int __lc_codepage — the CRT's active ANSI codepage
@@ -96,7 +105,15 @@ export class Msvcrt implements IModule {
     private newMode = 0;
     private strerrorBuf = 0;
     private crtDbgFlag = 0;
-    private controlFpWord = 0x0009001f;
+    /** Last x87 control-word write the CRT made, plus a call/mismatch tally. Preallocated and
+     *  mutated in place: `controlfp` is on the UI render path. */
+    static readonly controlFpTrace = { calls: 0, mismatches: 0, live: -1, want: -1, readBack: -1 };
+
+    /** _MCW_DN only. Every other field of the CRT control word is DERIVED from the live x87
+     *  control word, which is per-thread and rides the context-switch snapshot (§3.6); a
+     *  process-wide shadow would answer for whichever thread wrote last. Denormal control is an
+     *  SSE (MXCSR) field the x87 word cannot carry, so it alone lives here. */
+    private controlFpDnBits = 0x00000000;
     private tempnamCounter = 0;
     /** atexit/_onexit table, registration order (exit runs it reversed). */
     private exitHandlers: number[] = [];
@@ -235,6 +252,7 @@ export class Msvcrt implements IModule {
         exports["sprintf"] = (ctx, mem, args) => this.sprintf(args);
         exports["printf"] = (ctx, mem, args) => this.printf(args);
         exports["sscanf"] = (ctx, mem, args) => this.sscanf(args);
+        exports["sscanf_s"] = (ctx, mem, args) => this.sscanf(args, true);
         exports["fscanf"] = (ctx, mem, args) => this.fscanf(args);
         // setbuf/setvbuf — buffering is internal to our VFS; accept and no-op.
         exports["setbuf"] = () => 0;
@@ -328,7 +346,14 @@ export class Msvcrt implements IModule {
         exports["_finite"] = (ctx, mem, args) => this.finite(args[0] ?? 0, args[1] ?? 0);
         exports["_controlfp"] = (ctx, mem, args) => this.controlfp(args[0] ?? 0, args[1] ?? 0);
         exports["_control87"] = (ctx, mem, args) => this.controlfp(args[0] ?? 0, args[1] ?? 0);
-        exports["_clearfp"] = () => 0;
+        // _clearfp returns the status it is about to clear, in the CRT's layout — a caller that
+        // reads the flags THEN clears them in one call gets nothing from a constant 0.
+        exports["_clearfp"] = () => {
+            const v86 = this.process?.v86;
+            const prior = msvcStatusWordFromX87(getFpuStatusWord(v86) ?? 0);
+            setFpuStatusWord(v86, 0);
+            return prior;
+        };
         exports["_vsnwprintf"] = (ctx, mem, args) =>
             this.vsnwprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
 
@@ -365,6 +390,19 @@ export class Msvcrt implements IModule {
             return 0;
         };
         exports["_wgetenv"] = () => 0; // NULL
+
+        // --- VC8 (msvcr80) additions: *_s, 64-bit conversions, aligned alloc, FPU state ---
+        registerCrtVc8Exports(exports, {
+            process: this.process,
+            readCString: (p, max) => this.readCString(p, max),
+            writeCString: (p, v) => this.writeCString(p, v),
+            readWString: (p, max) => this.readWString(p, max),
+            writeWString: (p, v, max) => this.writeWString(p, v, max),
+            malloc: (n) => this.malloc(n),
+            free: (p) => this.free(p),
+            setErrno: (e) => { this.setErrno(e); },
+            vsnprintf: (dest, count, fmt, va) => this.vsnprintf(dest, count, fmt, va),
+        });
 
         // --- String functions (see crt-string.ts) ---
         registerCrtStringExports(exports, {
@@ -509,6 +547,7 @@ export class Msvcrt implements IModule {
         exports["ftell"] = (ctx, mem, args) => this.ftell(args[0] ?? 0);
         exports["fflush"] = () => 0;
         exports["fprintf"] = (ctx, mem, args) => this.fprintf(args);
+        exports["vfprintf"] = (ctx, mem, args) => this.vfprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
         exports["feof"] = (ctx, mem, args) => this.feof_fn(args[0] ?? 0);
         exports["ferror"] = (ctx, mem, args) => this.ferror_fn(args[0] ?? 0);
         exports["clearerr"] = (ctx, mem, args) => this.clearerr_fn(args[0] ?? 0);
@@ -541,6 +580,7 @@ export class Msvcrt implements IModule {
         exports["isleadbyte"] = () => 0;
         exports["iswalpha"] = (ctx, mem, args) => this.iswctype(args[0] ?? 0, 0x0100 | 0x0001 | 0x0002);
         exports["iswdigit"] = (ctx, mem, args) => this.iswctype(args[0] ?? 0, 0x0004);
+        exports["iswalnum"] = (ctx, mem, args) => this.iswctype(args[0] ?? 0, 0x0100 | 0x0001 | 0x0002 | 0x0004);
         exports["iswpunct"] = (ctx, mem, args) => this.iswctype(args[0] ?? 0, 0x0010);
 
         // --- Memory ---
@@ -563,6 +603,14 @@ export class Msvcrt implements IModule {
         exports["_heapused"] = () => 0;
         exports["__heapused"] = () => 0;
         exports["_iob"] = () => this.iobAddr >>> 0;
+        // VC8 stopped exporting `_iob` as DATA and made stdin/stdout/stderr call this
+        // instead; it returns the same array base, so `stdout` is __iob_func() + 1*sizeof(FILE).
+        exports["__iob_func"] = () => this.iobAddr >>> 0;
+        exports["freopen"] = (ctx, mem, args) => this.freopen(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
+        exports["tmpnam"] = (ctx, mem, args) => this.tmpnam(args[0] ?? 0);
+        // No command processor exists here. system(NULL) asks whether one does — "no" is 0;
+        // any actual command fails, which is -1, NOT a silent success the caller acts on.
+        exports["system"] = (ctx, mem, args) => ((args[0] ?? 0) === 0 ? 0 : -1);
         exports["__pioinfo"] = () => this.pioinfoAddr >>> 0;
         exports["__badioinfo"] = () => this.badioinfoAddr >>> 0;
         exports["??3@YAXPAX@Z"] = (ctx, mem, args) => this.free(args[0] ?? 0);
@@ -671,11 +719,38 @@ export class Msvcrt implements IModule {
             memset: (p: number, v: number, n: number) => this.memset(p, v, n),
         };
         registerVc9IoExports(exports, ioHost);
-        registerVc9SetjmpExports(exports, { process: this.process });
-        registerVc9SehExports(exports, {
+        // Last, so the UCRT-shaped entry points are declared over a table that already
+        // holds every shared CRT name they delegate to.
+        registerUcrtExports(exports, {
             process: this.process,
-            notifySehAborted: (reason) => this.process.dispatcher.notifySehDispatchAborted(reason),
+            free: (p) => this.free(p),
+            realloc: (p, n) => this.realloc(p, n),
+            calloc: (n, s) => this.calloc(n, s),
+            msize: (p) => this.msize(p),
+            memset: (d, v, n) => this.memset(d, v, n),
+            strdup: (p) => this.strdup(p),
+            readCString: (p, max) => this.readCString(p, max),
+            readWString: (p, max) => this.readWString(p, max),
+            formatWide: (fmt, reader) => this.formatWide(fmt, reader),
+            setErrno: (e) => this.setErrno(e),
+            terminateProcess: (c, r) => this.terminateProcess(c, r),
+            endProcessAfterChain: (c) => {
+                Logger.log(LogCategory.SYSTEM, `msvcrt: quick_exit(0x${(c >>> 0).toString(16)}) chain done`);
+                this.beginProcessExit(c >>> 0);
+                this.process.dispatcher.parkTerminatedThreadAtSpinLoop();
+                return null;
+            },
+            setAppType: (t) => this.setAppType(t),
+            registerExitHandler: (fn) => this.registerExitHandler(fn) !== 0,
+            stdioFile: (i) => this.stdioFile(i),
+            stdStreamIndex: (p) => this.stdStreamIndex(p),
+            vfprintf: (f, fmt, va) => this.vfprintf(f, fmt, va),
+            fmodeAddr: () => this.fmodeAddr,
+            commandLineAddr: () => this.acmdlnAddr,
+            newHandler: () => this.newHandlerPtr >>> 0,
+            setNewMode: (mode) => { const prev = this.newMode; this.newMode = mode; return prev; },
         });
+        registerVc9SetjmpExports(exports, { process: this.process });
     }
 
     reset(): void {
@@ -694,7 +769,7 @@ export class Msvcrt implements IModule {
         this.crtAllocations.clear();
         this.appType = 0;
         this.userMathErrHandler = 0;
-        this.controlFpWord = 0x0009001f;
+        this.controlFpDnBits = 0x00000000;
         this.currentLocale = "C";
         this.localeAddr = 0;
         this.lconvAddr = 0;
@@ -905,6 +980,17 @@ export class Msvcrt implements IModule {
      * Guest addresses of the 256-byte lower/upper case LUTs (ensures they're allocated+built).
      * pe-loader reads these to emit the trap-free inline tolower/toupper stubs.
      */
+    /** Read a guest ANSI string with this CRT's active code page. For sibling HLE
+     *  modules (msvcp*) that must not carry a second decoder. */
+    readGuestCString(ptr: number, maxLen: number): string {
+        return this.readCString(ptr, maxLen);
+    }
+
+    /** End the guest process the way the CRT's own fatal paths do. */
+    terminateGuestProcess(code: number, reason: string): ThunkResult {
+        return this.terminateProcess(code, reason);
+    }
+
     getCaseTableAddrs(): { lower: number; upper: number } {
         if (this.caseLowerTableAddr === 0) this.ensureRuntimeStorage();
         return { lower: this.caseLowerTableAddr, upper: this.caseUpperTableAddr };
@@ -1303,7 +1389,7 @@ export class Msvcrt implements IModule {
         Logger.log(LogCategory.SYSTEM, `msvcrt.exit(0x${exitCode.toString(16)}): running ${pending} atexit handler(s)`);
 
         // cdecl, no args: the thunk stub RETs with 0 cleanup, the caller pops `code`.
-        if (!callbackManager.saveSuspendedThunkContext({ esp: cpu.reg32[4] >>> 0 }, 0, "CrtExitChain")) {
+        if (!callbackManager.saveSuspendedThunkContext({ esp: readEsp(cpu) }, 0, "CrtExitChain")) {
             this.exitChainRunning = false;
             return this.exitProcess(exitCode);
         }
@@ -1648,7 +1734,7 @@ export class Msvcrt implements IModule {
         return text.length;
     }
 
-    private sscanf(args: number[]): number {
+    private sscanf(args: number[], secure = false): number {
         const inputPtr = args[0] ?? 0;
         const fmtPtr = args[1] ?? 0;
         if (!inputPtr || !fmtPtr) return 0;
@@ -1656,7 +1742,7 @@ export class Msvcrt implements IModule {
         // %s/%c/%[scanset]/%n, width, '*' suppression, length modifiers, literal/whitespace matching.
         const input = this.readCString(inputPtr, 0x100000);
         const format = this.readCString(fmtPtr, 0x100000);
-        const { assigned, eof } = scanfCore(input, format, args, 2);
+        const { assigned, eof } = scanfCore(input, format, args, 2, secure);
         // C: EOF (-1) when input runs out before the first conversion; otherwise the assigned count.
         return eof && assigned === 0 ? -1 : assigned;
     }
@@ -1880,7 +1966,7 @@ export class Msvcrt implements IModule {
         if (!handle) {
             this.setErrno(9);
             const cpu = getCPU(this.process.v86);
-            if (cpu?.reg32) cpu.reg32[2] = 0xffffffff;
+            if (cpu) cpuViews(cpu).reg32[2] = 0xffffffff;
             return -1;
         }
 
@@ -1888,7 +1974,7 @@ export class Msvcrt implements IModule {
         const vfs = System.getInstance().fileSystem;
         const newPos = vfs.setPosition(handle, signedOffset, origin | 0);
         const cpu = getCPU(this.process.v86);
-        if (cpu?.reg32) cpu.reg32[2] = Math.floor(newPos / 0x100000000) >>> 0;
+        if (cpu) cpuViews(cpu).reg32[2] = Math.floor(newPos / 0x100000000) >>> 0;
         return newPos >>> 0;
     }
 
@@ -1962,66 +2048,12 @@ export class Msvcrt implements IModule {
             return { value: 0, skipStackCheck: true };
         }
 
-        // Collect all non-null function pointers from the initializer table
-        const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const numEntries = (pfend - pfbegin) >>> 2;
-        const constructors: number[] = [];
-        for (let i = 0; i < numEntries; i++) {
-            const ptr = dv.getUint32(pfbegin + i * 4, true);
-            if (ptr !== 0) constructors.push(ptr);
-        }
-
+        const constructors = readFunctionPointerTable(mem, pfbegin, pfend);
         Logger.log(LogCategory.SYSTEM,
             `_initterm(0x${pfbegin.toString(16)}, 0x${pfend.toString(16)}): ` +
-            `${numEntries} entries, ${constructors.length} non-null`);
+            `${(pfend - pfbegin) >>> 2} entries, ${constructors.length} non-null`);
 
-        if (constructors.length === 0) {
-            return { value: 0, skipStackCheck: true };
-        }
-
-        // Use the callback chaining mechanism (same pattern as DllMain invocation).
-        // saveSuspendedThunkContext saves the current ESP and return address so that
-        // after all constructors complete, the callback system restores state and
-        // returns to the CRT caller naturally via stack-based POP EAX + RET.
-        const callbackManager = this.process.dispatcher.callbackManager;
-        const esp = cpu.reg32[4] >>> 0;
-
-        // cdecl _initterm: thunk stub uses RET (0 cleanup). Caller cleans args.
-        callbackManager.saveSuspendedThunkContext({ esp }, 0);
-
-        let ctorIndex = 0;
-        const completeThunk = (_retVal: number): number | null => {
-            ctorIndex++;
-            if (ctorIndex < constructors.length) {
-                // Chain to next constructor
-                callbackManager.invokeCallback(
-                    constructors[ctorIndex],
-                    [],   // void(*)(void) — no arguments
-                    0,    // no caller cleanup
-                    completeThunk,
-                    true  // isCdecl
-                );
-                return null; // Continue chain
-            }
-            // All constructors completed
-            Logger.info(LogCategory.SYSTEM,
-                `_initterm: all ${constructors.length} static constructors completed`);
-            return 0; // Final value (return 0 to CRT)
-        };
-
-        // Start first constructor
-        callbackManager.invokeCallback(
-            constructors[0],
-            [],   // no arguments
-            0,    // no caller cleanup
-            completeThunk,
-            true  // isCdecl
-        );
-
-        // Return skipStackCheck: invokeCallback has set EIP/ESP to the first constructor.
-        // The thunk dispatcher will not perform manual RET — the callback system handles
-        // all state restoration when the chain completes.
-        return { value: 0, skipStackCheck: true };
+        return invokeGuestVoidChain(this.process, constructors, "_initterm");
     }
 
     private readCString(ptr: number, maxLen: number): string {
@@ -2364,7 +2396,7 @@ export class Msvcrt implements IModule {
             // Stack top (raw ESP dump)
             const esp = reg32[4] >>> 0;
             const ebp = reg32[5] >>> 0;
-            const eip = cpu.instruction_pointer?.[0] ?? cpu.eip ?? 0;
+            const eip = readEip(cpu) || (cpu.eip ?? 0);
             const mem = getMemory(this.process.v86);
             const stackLines: string[] = [];
             if (mem && esp > 0x1000 && esp + 64 <= mem.length) {
@@ -2407,13 +2439,50 @@ export class Msvcrt implements IModule {
         }
     }
 
+    /**
+     * _controlfp / _control87 — and they must reach the FPU.
+     *
+     * This used to fold the request into a JS field and return it, which reads as working from
+     * every angle except the only one that matters: the guest's arithmetic. Direct3D switches
+     * the x87 to SINGLE precision at CreateDevice (applyD3dCreateDeviceFpuMode), and a title
+     * that calls `_fpreset(); _controlfp(_PC_24, _MCW_PC|_MCW_RC)` around its own float work —
+     * RA3's UI renderer does, hundreds of thousands of times — was then left at the CRT default
+     * EXTENDED precision, because the _fpreset half DID reach the control word and the
+     * _controlfp half did not. Same expression, one precision step wider: invisible in a
+     * rendered frame, decisive wherever a result is compared exactly or used as an index.
+     *
+     * The current value is READ BACK from the live control word rather than remembered, so the
+     * answer stays right across _fpreset, D3D's own switch and a context switch.
+     */
     private controlfp(newControl: number, mask: number): number {
-        const m = mask >>> 0;
-        if (m !== 0) {
-            const n = newControl >>> 0;
-            this.controlFpWord = ((this.controlFpWord & ~m) | (n & m)) >>> 0;
+        const v86 = this.process?.v86;
+        const live = getFpuControlWord(v86);
+        // No CPU (unit tests, early boot): there is nothing to control, so the DN shadow is
+        // the whole answer rather than a second copy of a word we cannot read.
+        if (live === null) {
+            const m0 = mask >>> 0;
+            if (m0 !== 0) {
+                this.controlFpDnBits = (((this.controlFpDnBits & ~m0) | ((newControl >>> 0) & m0)) & MSVC_MCW_DN) >>> 0;
+            }
+            return this.controlFpDnBits >>> 0;
         }
-        return this.controlFpWord >>> 0;
+        const current = (msvcControlWordFromX87(live) | this.controlFpDnBits) >>> 0;
+        const m = mask >>> 0;
+        if (m === 0) return current;
+        const next = ((current & ~m) | ((newControl >>> 0) & m)) >>> 0;
+        this.controlFpDnBits = (next & MSVC_MCW_DN) >>> 0;
+        const want = x87ControlWordFromMsvc(next, live);
+        const readBack = setFpuControlWord(v86, want);
+        // Answering "did the guest's request reach the FPU?" from outside is otherwise
+        // impossible: the control word is PER-THREAD, so a later read of the live register
+        // file reports whichever thread the harness happened to interrupt, not this one.
+        // Mutated in place — this runs tens of thousands of times a frame.
+        const t = Msvcrt.controlFpTrace;
+        t.calls++; t.live = live; t.want = want; t.readBack = readBack ?? -1;
+        if (readBack !== want) t.mismatches++;
+        return readBack === null
+            ? next
+            : (msvcControlWordFromX87(readBack) | this.controlFpDnBits) >>> 0;
     }
 
     private getCurrentEsp(): number {
@@ -2853,6 +2922,53 @@ export class Msvcrt implements IModule {
         const path = this.readCString(pathPtr, 512);
         const mode = this.readCString(modePtr, 16);
         return this.fopenPath(path, mode);
+    }
+
+    /**
+     * freopen binds a NEW file to the SAME FILE*, which is the whole reason a caller uses it
+     * (redirecting stdout to a log keeps every `stdout` reference valid). Opening a second
+     * stream and returning that pointer instead would leave the caller's own `stdout` still
+     * pointing at the console.
+     */
+    private freopen(pathPtr: number, modePtr: number, filePtr: number): number {
+        if (!filePtr) return 0;
+        const path = this.readCString(pathPtr, 512);
+        const mode = this.readCString(modePtr, 16);
+        const existing = this.fileStreams.get(filePtr);
+        if (existing) {
+            this.fds.delete(existing.fd);
+            this.fileStreams.delete(filePtr);
+            // Same teardown fclose does, minus the FILE* itself — that is the caller's
+            // pointer and the new stream is about to be re-homed onto it.
+            if (existing.bufPtr) { try { this.free(existing.bufPtr); } catch { /* best-effort */ } }
+        }
+        if (!path || !mode) return 0;
+
+        const fresh = this.fopenPath(path, mode);
+        if (!fresh) return 0;
+        const stream = this.fileStreams.get(fresh);
+        if (!stream) return 0;
+        // Re-home the new stream onto the caller's FILE*, then drop the placeholder the
+        // open allocated for it.
+        this.fileStreams.delete(fresh);
+        this.fileStreams.set(filePtr, stream);
+        if (stream.structPtr && stream.structPtr !== filePtr) {
+            try { this.free(stream.structPtr); } catch { /* best-effort */ }
+            stream.structPtr = undefined;
+        }
+        return filePtr >>> 0;
+    }
+
+    /** tmpnam: a per-process unique name in the temp directory, returned in a static buffer. */
+    private tmpnam(bufPtr: number): number {
+        const name = `\\s${(this.tempnamCounter++ & 0xffff).toString(16).padStart(4, "0")}.`;
+        if (bufPtr) {
+            this.writeCString(bufPtr, name);
+            return bufPtr >>> 0;
+        }
+        if (!this.tmpnamBuf) this.tmpnamBuf = this.process.memory.alloc(64, "THUNK_DATA", "rw");
+        this.writeCString(this.tmpnamBuf, name);
+        return this.tmpnamBuf >>> 0;
     }
 
     private wfopen(pathPtr: number, modePtr: number): number {
@@ -3384,13 +3500,38 @@ export class Msvcrt implements IModule {
         return ch & 0xff;
     }
 
+    /**
+     * FILE* for one of the three standard streams. The `_iob` array is ours, so its
+     * stride is our own FILE size — the UCRT stopped publishing that layout at all and
+     * hands every FILE* out through __acrt_iob_func for exactly this reason.
+     */
+    private stdioFile(index: number): number {
+        if (index > 2) return 0;
+        this.ensureRuntimeStorage();
+        return (this.iobAddr + index * Msvcrt.MSVC_FILE_SIZE) >>> 0;
+    }
+
+    /** Which standard stream `filePtr` is (0/1/2), or -1 when it is a real file. */
+    private stdStreamIndex(filePtr: number): number {
+        const base = this.iobAddr >>> 0;
+        if (!base) return -1;
+        const offset = (filePtr >>> 0) - base;
+        if (offset < 0 || offset >= 3 * Msvcrt.MSVC_FILE_SIZE) return -1;
+        return offset % Msvcrt.MSVC_FILE_SIZE === 0 ? offset / Msvcrt.MSVC_FILE_SIZE : -1;
+    }
+
+    private vfprintf(filePtr: number, fmtPtr: number, vaListPtr: number): number {
+        return this.fprintfCore(filePtr, fmtPtr, new VaListReader(vaListPtr >>> 0));
+    }
+
     private fprintf(args: number[]): number {
-        const filePtr = args[0] ?? 0;
-        const fmtPtr = args[1] ?? 0;
+        return this.fprintfCore(args[0] ?? 0, args[1] ?? 0, new ArrayVaListReader(args, 2));
+    }
+
+    private fprintfCore(filePtr: number, fmtPtr: number, reader: VaListReader | ArrayVaListReader): number {
         const stream = this.fileStreams.get(filePtr);
         if (!stream || !fmtPtr) return -1;
         const format = this.readCString(fmtPtr, 0x100000);
-        const reader = new ArrayVaListReader(args, 2);
         const text = formatCLazy(format, reader, (addr, maxLen) => this.readCString(addr, maxLen));
         this.flushGetcBuffer(filePtr, stream.handle);
         const written = System.getInstance().fileSystem.writeSync(stream.handle, encodeAnsi(text));
@@ -3445,17 +3586,15 @@ export class Msvcrt implements IModule {
  * Register fast-path implementations for high-frequency CRT string functions.
  * _wcsnicmp: ~49K calls (188ms) in UT99 demo — inline wide string compare.
  */
-export function registerFastPathMsvcrtFunctions(dispatcher: any): void {
+export function registerFastPathMsvcrtFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // =========================================================================
     // _wcsnicmp fast path — 49K calls, 188ms
     // cdecl: args on stack, caller cleans up
     // =========================================================================
-    const fastPathWcsnicmp = (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    const fastPathWcsnicmp: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 16 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         // Stack layout (cdecl):
         // esp + 0  = return address
@@ -3501,8 +3640,8 @@ export function registerFastPathMsvcrtFunctions(dispatcher: any): void {
     // which demangles + allocs + populates the cache, so the demangle logic lives in
     // exactly one place and only cold calls pay for it.
     // =========================================================================
-    const fastPathTypeInfoName = (cpu: any, mem8: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-        const self = cpu.reg32[1] >>> 0; // ECX = thiscall `this`
+    const fastPathTypeInfoName: FastPathImplementation = (_esp, view, mem8, _mem32, cpu) => {
+        const self = cpuViews(cpu).reg32[1] >>> 0; // ECX = thiscall `this`
         if (!self || self + 8 > mem8.length) return null;
         const cached = view.getUint32(self + 4, true) >>> 0;
         return cached !== 0 ? cached : null; // hit → return cached ptr; miss → slow thunk
@@ -3518,7 +3657,7 @@ export function registerFastPathMsvcrtFunctions(dispatcher: any): void {
     let cachedWasmBuf: ArrayBuffer | null = null;
     let cachedWasmDv: DataView | null = null;
 
-    const fastPathFtol = (cpu: any): number | null => {
+    const fastPathFtol: FastPathImplementation = (_esp, _view, _mem8, _mem32, cpu) => {
         if (typeof cpu.fpu_get_sti_f64 !== 'function') return null;
         const value = cpu.fpu_get_sti_f64(0);
 

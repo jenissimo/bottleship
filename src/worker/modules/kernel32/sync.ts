@@ -4,7 +4,8 @@
  * Atomic implementation for critical sections and debugging
  */
 
-import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import type { FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { recordSyncEvent } from '../../core/scheduler/sync-objects';
 import { System } from '../../core/system';
@@ -1816,9 +1817,8 @@ const syncModule = (() => {
      * Fast-path implementations for high-frequency synchronization functions.
      * ZERO-OVERHEAD: Optimized to the absolute limit.
      */
-    const fastPathEnterCriticalSection = (cpu: any, mem8: Uint8Array, mem32: Uint32Array, dataView: DataView): number | null | undefined => {
+    const fastPathEnterCriticalSection: FastPathImplementation = (esp, dataView, mem8, mem32) => {
         // [ESP+4] is lpCriticalSection
-        const esp = cpu.reg32[4];
         const ptr = dataView.getUint32(esp + 4, true);
 
         if (ptr === 0 || ptr + 24 > mem8.length) return 0; // Guard (CS is at least 24 bytes)
@@ -1869,8 +1869,7 @@ const syncModule = (() => {
         return null;
     };
 
-    const fastPathLeaveCriticalSection = (cpu: any, mem8: Uint8Array, mem32: Uint32Array, dataView: DataView): number | null | undefined => {
-        const esp = cpu.reg32[4];
+    const fastPathLeaveCriticalSection: FastPathImplementation = (esp, dataView, mem8, mem32) => {
         const ptr = dataView.getUint32(esp + 4, true);
 
         if (ptr === 0 || ptr + 24 > mem8.length || (ptr & 3) !== 0) return 0;
@@ -1921,8 +1920,7 @@ const syncModule = (() => {
      * Both refuse anything that could block or wake a thread: blocking and waking are thread
      * switches, and those may only happen through the scheduler's switch primitive (§3.6).
      */
-    const srwLockPtrArg = (cpu: any, mem8: Uint8Array, dataView: DataView): number => {
-        const esp = cpu.reg32[4] >>> 0;
+    const srwLockPtrArg = (esp: number, mem8: Uint8Array, dataView: DataView): number => {
         if (esp + 8 > mem8.length) return 0;
         return dataView.getUint32(esp + 4, true) >>> 0;
     };
@@ -1934,9 +1932,9 @@ const syncModule = (() => {
             : ((sched?.currentThreadId ?? 0) >>> 0);
     };
 
-    const makeFastPathAcquireSrw = (exclusive: boolean) =>
-        (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, dataView: DataView): number | null => {
-            const lockPtr = srwLockPtrArg(cpu, mem8, dataView);
+    const makeFastPathAcquireSrw = (exclusive: boolean): FastPathImplementation =>
+        (esp, dataView, mem8) => {
+            const lockPtr = srwLockPtrArg(esp, mem8, dataView);
             if (lockPtr === 0) return null;
             const tid = srwCurrentThreadId();
             if (tid === 0) return null;
@@ -1947,9 +1945,9 @@ const syncModule = (() => {
             return granted ? 0 : null;
         };
 
-    const makeFastPathReleaseSrw = (exclusive: boolean) =>
-        (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, dataView: DataView): number | null => {
-            const lockPtr = srwLockPtrArg(cpu, mem8, dataView);
+    const makeFastPathReleaseSrw = (exclusive: boolean): FastPathImplementation =>
+        (esp, dataView, mem8) => {
+            const lockPtr = srwLockPtrArg(esp, mem8, dataView);
             if (lockPtr === 0) return null;
             const tid = srwCurrentThreadId();
             if (tid === 0) return null;
@@ -1994,7 +1992,7 @@ const syncModule = (() => {
     return {
         exports,
         reset,
-        registerFastPathSyncFunctions: (dispatcher: any) => {
+        registerFastPathSyncFunctions: (dispatcher: HleDispatcher) => {
             if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
                 dispatcher.registerFastPath('kernel32', 'EnterCriticalSection', fastPathEnterCriticalSection);
                 dispatcher.registerFastPath('kernel32', 'LeaveCriticalSection', fastPathLeaveCriticalSection);

@@ -1987,8 +1987,7 @@ export class DSound implements IModule {
             };
             if (dispatcher?.registerFastPath) {
                 dispatcher.registerFastPath('dsound', 'idirectsoundbuffer8_getstatus',
-                    (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                        const esp = cpu.reg32[4];
+                    (esp: number, view: DataView): number => {
                         const buffer = this.getBuffer(view.getUint32(esp + 4, true));
                         const statusPtr = view.getUint32(esp + 8, true);
                         this.dbgAudioCalls.getStatus++;
@@ -2014,8 +2013,7 @@ export class DSound implements IModule {
                     }, { trivial: true });
 
                 dispatcher.registerFastPath('dsound', 'idirectsoundbuffer8_getcurrentposition',
-                    (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                        const esp = cpu.reg32[4];
+                    (esp: number, view: DataView): number => {
                         const buffer = this.getBuffer(view.getUint32(esp + 4, true));
                         if (!buffer) return DSERR_INVALIDPARAM;
                         const playPtr = view.getUint32(esp + 8, true);

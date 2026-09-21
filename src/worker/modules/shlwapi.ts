@@ -26,6 +26,9 @@ export class Shlwapi implements IModule {
         bindA("PathAppendA", (args) => this.pathAppendA(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
         bindA("PathAppendW", (args) => this.pathAppendW(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
 
+        bindA("PathCombineA", (args) => this.pathCombineA(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0), 12);
+        bindA("PathCombineW", (args) => this.pathCombineW(args[0] >>> 0, args[1] >>> 0, args[2] >>> 0), 12);
+
         bindA("PathCanonicalizeA", (args) => this.pathCanonicalizeA(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
         bindA("PathCanonicalizeW", (args) => this.pathCanonicalizeW(args[0] >>> 0, args[1] >>> 0) ? 1 : 0, 8);
 
@@ -252,6 +255,11 @@ export class Shlwapi implements IModule {
 
     private canonicalizePath(path: string): string {
         path = this.normalizeSlashes(path);
+        // PathCanonicalize only rewrites "." and "..": it copies every other character
+        // through, so a TRAILING separator survives. Dropping it turns a caller's
+        // `PathCombine(dst, dir, L"Launcher\\")` + `strcat(dst, L"file")` into
+        // `C:\Launcherfile` — a path that exists nowhere, reported only as "file not found".
+        const trailing = path.length > 1 && path.endsWith("\\");
         const { root, rest } = this.splitRoot(path);
         const segments = rest.split("\\").filter((s) => s.length > 0);
         const stack: string[] = [];
@@ -283,6 +291,7 @@ export class Shlwapi implements IModule {
             result += "\\";
         }
 
+        if (trailing && !result.endsWith("\\")) result += "\\";
         return result;
     }
 
@@ -323,6 +332,74 @@ export class Shlwapi implements IModule {
         const result = this.joinPath(path, more);
         if (result.length >= MAX_PATH) return false;
         return this.writeWide(pathPtr, result);
+    }
+
+    /** PathIsRelative: anything that neither starts at a root nor names a drive. */
+    private isRelativePath(path: string): boolean {
+        if (!path) return true;
+        return !(path[0] === "\\" || path[1] === ":");
+    }
+
+    /**
+     * PathCombine's rules are NOT PathAppend's, and the difference is load-bearing: a `file`
+     * that names a drive replaces `dir` outright, while one that merely STARTS with a
+     * backslash keeps only `dir`'s root. `null` is the caller-visible failure — the API
+     * reports it by writing an empty destination and returning NULL.
+     */
+    private combinePath(dir: string | null, file: string | null): string | null {
+        if (dir === null && file === null) return null;
+
+        let tmp: string;
+        if ((file === null || file === "") && dir !== null) {
+            tmp = dir;
+        } else if (dir === null || dir === "" || !this.isRelativePath(file!)) {
+            if (dir === null || dir === "" || file![0] !== "\\" || this.isUncPath(file!)) {
+                tmp = file!;
+            } else {
+                const root = this.stripRootValue(dir);
+                if (root === null) return null;
+                tmp = this.appendBackslash(root);
+                if (tmp.length + file!.length - 1 >= MAX_PATH) return null;
+                tmp += file!.substring(1);
+            }
+        } else {
+            tmp = this.appendBackslash(dir);
+            if (tmp.length + file!.length >= MAX_PATH) return null;
+            tmp += file!;
+        }
+
+        return this.canonicalizePath(tmp);
+    }
+
+    /** PathAddBackslash on a value rather than a buffer. */
+    private appendBackslash(path: string): string {
+        return path === "" || path.endsWith("\\") ? path : `${path}\\`;
+    }
+
+    private pathCombineA(destPtr: number, dirPtr: number, filePtr: number): number {
+        if (!destPtr) return 0;
+        const result = this.combinePath(
+            dirPtr ? this.readAnsi(dirPtr) : null,
+            filePtr ? this.readAnsi(filePtr) : null,
+        );
+        if (result === null || !this.writeAnsi(destPtr, result)) {
+            this.writeAnsi(destPtr, "");
+            return 0;
+        }
+        return destPtr;
+    }
+
+    private pathCombineW(destPtr: number, dirPtr: number, filePtr: number): number {
+        if (!destPtr) return 0;
+        const result = this.combinePath(
+            dirPtr ? this.readWide(dirPtr) : null,
+            filePtr ? this.readWide(filePtr) : null,
+        );
+        if (result === null || !this.writeWide(destPtr, result)) {
+            this.writeWide(destPtr, "");
+            return 0;
+        }
+        return destPtr;
     }
 
     private pathCanonicalizeA(destPtr: number, srcPtr: number): boolean {

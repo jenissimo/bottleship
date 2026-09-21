@@ -1,3 +1,5 @@
+import type { FastPathImplementation } from '../core/thunking/thunk-dispatcher';
+
 export type TimeMode = "realtime" | "manual";
 
 export class TimeService {
@@ -248,16 +250,11 @@ export class TimeService {
      * they must not be the primary tier for a clock the WASM tier is also serving.
      */
 
-    static fastPathGetTickCount(cpu: any, memory: Uint8Array): number {
-        const timeService = TimeService.getInstance();
-        return timeService.nowMs() | 0;
-    }
+    static fastPathGetTickCount: FastPathImplementation = () => {
+        return TimeService.getInstance().nowMs() | 0;
+    };
 
-    static fastPathQueryPerformanceCounter(cpu: any, memory: Uint8Array): number {
-        const timeService = TimeService.getInstance();
-        const esp = cpu.reg32[4]; // ESP register
-        const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
-
+    static fastPathQueryPerformanceCounter: FastPathImplementation = (esp, view, memory) => {
         // Read argument from stack (first argument at ESP + 4)
         let lpPerformanceCount = 0;
         if (esp + 4 + 4 <= memory.length) {
@@ -265,16 +262,13 @@ export class TimeService {
         }
 
         if (lpPerformanceCount !== 0 && lpPerformanceCount + 8 <= memory.length) {
-            const now = BigInt(timeService.nowMicros());
+            const now = BigInt(TimeService.getInstance().nowMicros());
             view.setBigUint64(lpPerformanceCount, now, true);
         }
         return 1; // TRUE
-    }
+    };
 
-    static fastPathQueryPerformanceFrequency(cpu: any, memory: Uint8Array): number {
-        const esp = cpu.reg32[4]; // ESP register
-        const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
-
+    static fastPathQueryPerformanceFrequency: FastPathImplementation = (esp, view, memory) => {
         // Read argument from stack (first argument at ESP + 4)
         let lpFrequency = 0;
         if (esp + 4 + 4 <= memory.length) {
@@ -286,5 +280,5 @@ export class TimeService {
             view.setBigUint64(lpFrequency, freq, true);
         }
         return 1; // TRUE
-    }
+    };
 }

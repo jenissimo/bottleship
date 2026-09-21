@@ -73,6 +73,7 @@ import { Version } from "./modules/version";
 import { W32skrnl } from "./modules/w32skrnl";
 import { Msvcrt } from "./modules/msvcrt";
 import { Msvcp90 } from "./modules/msvcp90";
+import { Msvcp140 } from "./modules/msvcp140";
 import { Msvcp60 } from "./modules/msvcp60";
 import { Crtdll } from "./modules/crtdll";
 import { Winspool } from "./modules/winspool";
@@ -1273,6 +1274,8 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
     // stacks (e.g., UT's recursive UObject deserialization during level loading).
     const peStackReserve = module.sizeOfStackReserve || 0;
     const mainStackSize = Math.max(peStackReserve, 0x100000); // At least 1MB
+    // Every CreateThread reserves the same, since dwStackSize only names the initial commit.
+    system.scheduler?.setImageStackReserve(mainStackSize);
     let stackPointer: number;
     if (system.process?.memory) {
       const stackBase = system.process.memory.alloc(mainStackSize, 'HEAP');
@@ -2254,7 +2257,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     }
     const lastSlashIdx = executablePath.lastIndexOf("\\");
     const executableDir = lastSlashIdx > 2 ? executablePath.slice(0, lastSlashIdx + 1) : "C:\\";
-    system.fileSystem.setCurrentDirectory(executableDir);
+    system.fileSystem.setCurrentDirectory(EmulatorConfig.getInstance().workingDir || executableDir);
     Logger.log(LogCategory.SYSTEM, `Executable: name="${exeName}", path="${executablePath}", args="${system.executableArgs}"`);
 
     // A failed load has already torn the process down and told the host (crash dialog).
@@ -2704,6 +2707,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const w32skrnl = new W32skrnl();
       const msvcrt = new Msvcrt();
       const msvcp90 = new Msvcp90();
+      const msvcp140 = new Msvcp140();
       const msvcp60 = new Msvcp60();
       const crtdll = new Crtdll();
       const winspool = new Winspool();
@@ -2776,6 +2780,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       msvcrt.initialize(process);
       msvcp90.setMsvcrt(msvcrt);
       msvcp90.initialize(process);
+      msvcp140.setMsvcrt(msvcrt);
+      msvcp140.initialize(process);
       msvcp60.setMsvcrt(msvcrt);
       msvcp60.initialize(process);
       crtdll.initialize(process);
@@ -2790,6 +2796,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       wintrust.initialize(process);
       crypt32.initialize(process);
       ws2_32.initialize(process);
+      iphlpapi.initialize(process);
       psapi.initialize(process);
       imagehlp.initialize(process);
       ifc20.initialize(process);
@@ -2846,6 +2853,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(w32skrnl.name, w32skrnl);
       process.registerModule(msvcrt.name, msvcrt);
       process.registerModule(msvcp90.name, msvcp90);
+      process.registerModule(msvcp140.name, msvcp140);
       process.registerModule(msvcp60.name, msvcp60);
       process.registerModule(crtdll.name, crtdll);
       process.registerModule(winspool.name, winspool);
@@ -2919,6 +2927,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(w32skrnl.name, w32skrnl.exports);
       process.dispatcher.registerModule(msvcrt.name, msvcrt.exports);
       process.dispatcher.registerModule(msvcp90.name, msvcp90.exports);
+      process.dispatcher.registerModule(msvcp140.name, msvcp140.exports);
       process.dispatcher.registerModule(msvcp60.name, msvcp60.exports);
       process.dispatcher.registerModule(crtdll.name, crtdll.exports);
       process.dispatcher.registerModule(winspool.name, winspool.exports);

@@ -19,16 +19,20 @@ import {
     resetVirtualQueryFastStats,
 } from "../../src/worker/modules/kernel32/memory";
 
-const MEM_HEAP_BASE = 0x01000000;
+// Imported, not copied: the fast path's own guard compares against this constant, so a
+// layout change must move the fixture with it rather than silently testing a dead range.
+import { MEM_HEAP_BASE } from "../../src/worker/core/cpu/emulator-config";
 const PAGE_READWRITE = 0x04;
+/** VirtualQuery's MEM_IMAGE Type — a flag that happens to look like an address. */
+const MEM_IMAGE_TYPE = 0x01000000;
 const MEM_COMMIT = 0x1000;
 const MEM_RESERVE = 0x2000;
 const MEM_DECOMMIT = 0x4000;
 
-const MEM_SIZE = 0x02000000; // 32 MB — covers the EXE range and the low HEAP bucket
+const MEM_SIZE = MEM_HEAP_BASE + 0x02000000; // the EXE range plus the low HEAP bucket
 
 /** Where the mock allocator hands blocks out from (well inside HEAP, page aligned). */
-const ALLOC_START = 0x01800000;
+const ALLOC_START = MEM_HEAP_BASE + 0x00800000;
 
 describe("VirtualQuery fast path == full body", () => {
     let mem: Uint8Array;
@@ -44,9 +48,9 @@ describe("VirtualQuery fast path == full body", () => {
     } as any;
 
     /** Guest stack the fast path reads its arguments from: [ret][arg0][arg1][arg2]. */
-    const FAKE_ESP = 0x01700000;
-    const FAST_BUF = 0x01710000;
-    const SLOW_BUF = 0x01720000;
+    const FAKE_ESP = MEM_HEAP_BASE + 0x00700000;
+    const FAST_BUF = MEM_HEAP_BASE + 0x00710000;
+    const SLOW_BUF = MEM_HEAP_BASE + 0x00720000;
 
     const cpu = { reg32: new Uint32Array(8) } as any;
 
@@ -119,7 +123,7 @@ describe("VirtualQuery fast path == full body", () => {
         view.setUint32(FAKE_ESP + 4, addr, true);
         view.setUint32(FAKE_ESP + 8, buf, true);
         view.setUint32(FAKE_ESP + 12, 28, true);
-        return __virtualQueryFastPathForTests(cpu, mem, new Uint32Array(mem.buffer), view) as number | null;
+        return __virtualQueryFastPathForTests(cpu.reg32[4], view, mem, new Uint32Array(mem.buffer), cpu) as number | null;
     };
 
     const mbi = (buf: number): number[] => {
@@ -140,7 +144,7 @@ describe("VirtualQuery fast path == full body", () => {
     };
 
     test("a plain committed heap page is served, and matches the full body", () => {
-        const heapPage = 0x01100000;
+        const heapPage = MEM_HEAP_BASE + 0x00100000;
         const r = differential(heapPage);
         expect(r.served).toBe(true);
         expect(r.fast).toEqual(r.slow);
@@ -149,7 +153,7 @@ describe("VirtualQuery fast path == full body", () => {
     });
 
     test("an unaligned address inside a heap page answers for the page", () => {
-        const r = differential(0x01100abc);
+        const r = differential(MEM_HEAP_BASE + 0x00100abc);
         expect(r.served).toBe(true);
         expect(r.fast).toEqual(r.slow);
     });
@@ -157,7 +161,7 @@ describe("VirtualQuery fast path == full body", () => {
     test("a PE image page defers (the image branch reports MEM_IMAGE per-section)", () => {
         registry.register({
             name: "engine", path: "c:\\engine.dll",
-            baseAddress: 0x01200000, size: 0x20000, entryPoint: 0,
+            baseAddress: MEM_HEAP_BASE + 0x00200000, size: 0x20000, entryPoint: 0,
             exports: new Map(), ordinalExports: new Map(),
             isRealDll: true, initialized: true,
             sections: [
@@ -165,17 +169,17 @@ describe("VirtualQuery fast path == full body", () => {
                 { name: ".data", virtualAddress: 0x9000, virtualSize: 0x2000, rawSize: 0x2000, characteristics: 0xC0000040 },
             ],
         });
-        const r = differential(0x01201000);
+        const r = differential(MEM_HEAP_BASE + 0x00201000);
         expect(r.served).toBe(false);
-        expect(r.slow[6]).toBe(0x01000000); // MEM_IMAGE
-        expect(r.slow[1]).toBe(0x01200000); // AllocationBase = image base
+        expect(r.slow[6]).toBe(MEM_IMAGE_TYPE); // MEM_IMAGE
+        expect(r.slow[1]).toBe(MEM_HEAP_BASE + 0x00200000); // AllocationBase = image base
     });
 
     test("a thread-stack page defers (the stack branch reports the whole reservation)", () => {
-        stacks.push({ base: 0x01300000, top: 0x01340000 });
-        const r = differential(0x01320000);
+        stacks.push({ base: MEM_HEAP_BASE + 0x00300000, top: MEM_HEAP_BASE + 0x00340000 });
+        const r = differential(MEM_HEAP_BASE + 0x00320000);
         expect(r.served).toBe(false);
-        expect(r.slow[1]).toBe(0x01300000);
+        expect(r.slow[1]).toBe(MEM_HEAP_BASE + 0x00300000);
         expect(r.slow[3]).toBe(0x40000);
     });
 
@@ -210,7 +214,7 @@ describe("VirtualQuery fast path == full body", () => {
     test("the main-EXE range defers (MEM_IMAGE at 0x400000)", () => {
         const r = differential(0x00401000);
         expect(r.served).toBe(false);
-        expect(r.slow[6]).toBe(0x01000000);
+        expect(r.slow[6]).toBe(MEM_IMAGE_TYPE);
     });
 
     test("past backed RAM the body reports the tail RESERVED, so a walk can step over it", () => {
@@ -235,17 +239,17 @@ describe("VirtualQuery fast path == full body", () => {
 
     test("a too-small output buffer defers to the body's own refusal", () => {
         view.setUint32(FAKE_ESP, 0xDEADBEEF, true);
-        view.setUint32(FAKE_ESP + 4, 0x01100000, true);
+        view.setUint32(FAKE_ESP + 4, MEM_HEAP_BASE + 0x00100000, true);
         view.setUint32(FAKE_ESP + 8, FAST_BUF, true);
         view.setUint32(FAKE_ESP + 12, 4, true);
-        expect(__virtualQueryFastPathForTests(cpu, mem, new Uint32Array(mem.buffer), view)).toBeNull();
-        expect((memExports["VirtualQuery"] as any)(ctx, mem, [0x01100000, FAST_BUF, 4])).toBe(0);
+        expect(__virtualQueryFastPathForTests(cpu.reg32[4], view, mem, new Uint32Array(mem.buffer), cpu)).toBeNull();
+        expect((memExports["VirtualQuery"] as any)(ctx, mem, [MEM_HEAP_BASE + 0x00100000, FAST_BUF, 4])).toBe(0);
     });
 
     test("the audit flag differences every served answer and stays silent when they agree", () => {
         (globalThis as any).__virtualQueryFastAudit = true;
         try {
-            for (const addr of [0x01100000, 0x01101000, 0x01102000]) differential(addr);
+            for (const addr of [MEM_HEAP_BASE + 0x00100000, MEM_HEAP_BASE + 0x00101000, MEM_HEAP_BASE + 0x00102000]) differential(addr);
             const stats = virtualQueryFastStats();
             expect(stats.auditArmed).toBe(true);
             expect(stats.auditChecked).toBe(3);
@@ -256,7 +260,7 @@ describe("VirtualQuery fast path == full body", () => {
     });
 
     test("stats separate the tier that served from the tier that deferred", () => {
-        differential(0x01100000);
+        differential(MEM_HEAP_BASE + 0x00100000);
         differential(0x00300000);
         const stats = virtualQueryFastStats();
         expect(stats.hits).toBe(1);

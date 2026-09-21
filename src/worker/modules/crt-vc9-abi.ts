@@ -89,8 +89,6 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
     };
     exports["??_V@YAXPAX@Z"] = (_ctx, _mem, args) => host.free(args[0] ?? 0);
 
-    // _except_handler4_common — registered by crt-vc9-seh.ts (semantic)
-
     exports["_CIatan"] = () => {
         try {
             const x = fpuGetST(host.process.v86, 0);

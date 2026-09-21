@@ -63,7 +63,9 @@ const imageListFuncs = [
 
     makeFunc("ImageList_Add", 3),
 
-    makeFunc("ImageList_AddIcon", 3),
+    // A MACRO over ImageList_ReplaceIcon(himl, -1, hicon) in the SDK, but a real
+    // 2-argument stdcall export in the DLL: declaring 3 makes the stub RET 12.
+    makeFunc("ImageList_AddIcon", 2),
 
     makeFunc("ImageList_AddMasked", 3),
 

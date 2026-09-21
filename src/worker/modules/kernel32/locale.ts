@@ -1,7 +1,7 @@
 // Locale and string conversion functions for kernel32
 // GetACP, GetOEMCP, WideCharToMultiByte, MultiByteToWideChar, etc.
 
-import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
@@ -1521,7 +1521,7 @@ function writeCPInfo(view: DataView, mem: Uint8Array, lpCPInfo: number, codePage
 // ============================================================================
 // Fast path registrations for high-call-rate locale/string functions
 // ============================================================================
-export function registerFastPathLocaleFunctions(dispatcher: any): void {
+export function registerFastPathLocaleFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     ensureLocaleCache();
@@ -1530,13 +1530,12 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // GetLocaleInfoW — 850K calls/session (CRT reads ANSI CP, decimal sep, etc.)
     // Stack (stdcall @16): [esp+4]=locale [esp+8]=lcType [esp+12]=lpLCData [esp+16]=cchData
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoW', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
-        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
-        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
-        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
-        // paths walk tens of millions of bytes over a load.
+    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoW', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 20 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -1591,13 +1590,12 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // GetLocaleInfoA — same as W but writes ANSI bytes
     // Stack (stdcall @16): [esp+4]=locale [esp+8]=lcType [esp+12]=lpLCData [esp+16]=cchData
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoA', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
-        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
-        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
-        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
-        // paths walk tens of millions of bytes over a load.
+    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoA', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 20 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -1648,13 +1646,12 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // Stack (stdcall @12): [esp+4]=dwInfoType [esp+8]=lpSrcStr [esp+12]=cchSrc [esp+16]=lpCharType
     // Note: 4 args = stdcall @16
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetStringTypeW', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
-        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
-        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
-        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
-        // paths walk tens of millions of bytes over a load.
+    dispatcher.registerFastPath('kernel32', 'GetStringTypeW', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 20 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -1692,9 +1689,8 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // Only plain LCMAP_LOWERCASE / LCMAP_UPPERCASE, only where every character maps 1:1;
     // sort keys, normalisation and anything else go to the thunk.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'LCMapStringW', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+    dispatcher.registerFastPath('kernel32', 'LCMapStringW', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 28 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -1739,13 +1735,12 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // Stack (stdcall @24): [+4]=CodePage [+8]=dwFlags [+12]=lpMB [+16]=cbMB [+20]=lpWC [+24]=cchWC
     // Fast path covers CP_ACP/CP_OEMCP/1252 with cbMB=-1 (null-terminated) or positive length.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'MultiByteToWideChar', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
-        // Leaf hot loop: index a PLAIN view, never v86's Proxy. The dispatcher must keep the
-        // Proxy (it is how WASM growth is detected — see updateMemoryCache), so the unwrap
-        // belongs here, once per call. Per-BYTE through the Proxy is ~13x slower, and these
-        // paths walk tens of millions of bytes over a load.
+    dispatcher.registerFastPath('kernel32', 'MultiByteToWideChar', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 28 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -1833,13 +1828,12 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     //                       [+28]=lpDefaultChar [+32]=lpUsedDefaultChar
     // Fast path: ASCII-only strings (all codepoints < 0x80), CP1252/OEMCP/ACP.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'WideCharToMultiByte', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+    dispatcher.registerFastPath('kernel32', 'WideCharToMultiByte', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
         // The slow path stays the source of truth for null-termination and code-page
         // semantics: this handles ONLY the plainly-representable case and hands back
         // anything else — a default char, a flag, or a code point the page cannot encode —
         // so it can never be the one that decides a subtle case.
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 36 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -1909,9 +1903,8 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // GetCPInfo — a pure function of the code page, re-asked per conversion by the CRT.
     // Stack (stdcall @8): [esp+4]=CodePage [esp+8]=lpCPInfo
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetCPInfo', (cpu: any, rawMem8: Uint8Array, _m32: Uint32Array, dv: DataView): number | null => {
+    dispatcher.registerFastPath('kernel32', 'GetCPInfo', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
         const mem8 = borrowGuestMemory(rawMem8);
-        const esp = (cpu.reg32[4]) >>> 0;
         if (esp + 12 > mem8.length) return null;
         const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
         const lpCPInfo = view.getUint32(esp + 8, true);

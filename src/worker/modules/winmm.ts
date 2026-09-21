@@ -629,11 +629,10 @@ export class WinMM implements IModule {
      * Fast-path timeSetEvent: self-rearm refresh only (NFSU FUN_0063eaa0 hot path).
      * Returns timer id on success, null to fall through to full export.
      */
-    fastPathTimeSetEvent(cpu: { reg32: number[] }, view: DataView): number | null {
+    fastPathTimeSetEvent(esp: number, view: DataView): number | null {
         // A/B kill-switch: fall through to the full export so the self-rearm collapse can be
         // bisected out of a timer/audio regression. `dbgFlag('__noFastTimeSetEvent', true)`.
         if ((globalThis as any).__noFastTimeSetEvent) return null;
-        const esp = cpu.reg32[4] >>> 0;
         const uDelay = view.getUint32(esp + 4, true);
         const fuEvent = view.getUint32(esp + 20, true);
         const callbackType = fuEvent & TIME_CALLBACK_TYPEMASK;
@@ -667,8 +666,7 @@ export class WinMM implements IModule {
         dispatcher.registerFastPath(
             'winmm',
             'timeSetEvent',
-            (_esp: number, view: DataView, _mem: Uint8Array, _mem32: Uint32Array, cpu: any) =>
-                mod.fastPathTimeSetEvent(cpu, view),
+            (esp: number, view: DataView) => mod.fastPathTimeSetEvent(esp, view),
             { trivial: true },
         );
     }

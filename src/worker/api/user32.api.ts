@@ -331,6 +331,8 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("LoadBitmapA", 2),
         // String functions
         makeFunc("CharNextA", 1),
+        makeFunc("CharNextW", 1),
+        makeFunc("CharPrevW", 2),
         makeFunc("CharUpperBuffA", 2),
         // Additional user32 imports from newer runtimes/launchers
         makeFunc("PaintDesktop", 1),

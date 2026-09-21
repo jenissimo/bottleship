@@ -1,9 +1,10 @@
 /**
  * The guest-log CONTENT mirror must be gated on a level that a log STREAM cannot turn on.
  *
- * `Logger.isEnabled(cat, VERBOSE)` answers true whenever a stream callback is attached, and
- * the harness attaches one for the whole session — so gating the 32 KB slice + codepage
- * decode on it left the work running in exactly the windows where the frame tail is measured.
+ * `Logger.isEnabled(cat, VERBOSE)` answers true whenever a stream callback is attached (for
+ * any category the operator has not explicitly quieted), and the harness attaches one for the
+ * whole session — so gating the 32 KB slice + codepage decode on it left the work running in
+ * exactly the windows where the frame tail is measured.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { logGuestWriteContent } from "../../src/worker/modules/kernel32/file-io";
@@ -33,8 +34,12 @@ describe("WriteFile log-content decode gate", () => {
     test("a stream at NORMAL does not decode a routine .txt append", () => {
         Logger.setStreamCallback(() => { /* the harness's session-wide stream */ });
         Logger.setCategoryLevel(LogCategory.KERNEL32, LogLevel.NORMAL);
-        // Falsifiability control: the OLD gate really would have passed here.
-        expect(Logger.isEnabled(LogCategory.KERNEL32, LogLevel.VERBOSE)).toBe(true);
+        // Falsifiability control: the session-wide stream is attached, which is the whole
+        // input the OLD gate keyed on — an unconfigured category still reports verbose-enabled
+        // because of it, so this test is not passing merely because no stream was present.
+        // (KERNEL32 itself no longer answers true: an explicit category level now outranks the
+        // stream for every sink — see logger-verbose-stream-gate.test.ts.)
+        expect(Logger.isEnabled(LogCategory.SYSTEM, LogLevel.VERBOSE)).toBe(true);
 
         SpyMem.slices = 0;
         logGuestWriteContent("C:\\game\\Log.txt", payload("frame 1234 ok"), 0, 13);

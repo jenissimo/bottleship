@@ -232,6 +232,12 @@ export interface WgbManifest {
          */
         createDirs?: string[];
         /**
+         * Guest cwd at boot, when it is NOT the entrypoint's own folder — an engine module
+         * a launcher starts inherits the LAUNCHER's directory, and resolves its data paths
+         * against that. Example: "C:\\" for an exe that lives under Data\.
+         */
+        workingDir?: string;
+        /**
          * Persist/ephemeral policy (the ".gitignore" analog). Default is PERSIST: every guest
          * write survives unless its (overlay-relative, case-insensitive) path matches a global default
          * or one of these glob patterns — those are kept ephemeral (scratch / wiped, never written to

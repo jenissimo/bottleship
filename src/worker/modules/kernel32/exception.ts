@@ -4,7 +4,9 @@
  * Atomic implementation for exception handling
  */
 
-import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { cpuViews } from '../../core/cpu/cpu-views';
+import type { FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { getCPU } from '../../core/thunking/thunk-utils';
@@ -596,7 +598,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         }
 
-        const tebAddr = cpu.segment_offsets?.[4] ?? 0;
+        const tebAddr = cpuViews(cpu).segmentOffsets[4] ?? 0;
         if (tebAddr === 0) {
             Logger.error(LogCategory.KERNEL32, `RtlUnwind: no TEB`);
             return 0;
@@ -652,7 +654,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 `RtlUnwind: nothing to unwind, FS:[0] = 0x${targetFrame.toString(16)} (targetFrame stays — Win32 contract)`);
         }
 
-        cpu.reg32[0] = returnValue | 0;
+        cpuViews(cpu).reg32[0] = returnValue | 0;
         return { value: returnValue, stackCleanup: RTLUNWIND_CLEANUP };
     };
 
@@ -688,6 +690,17 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // EncodePointer(NULL) as sentinel for "no handler". If EncodePointer(NULL)=0
     // (identity), CRT confuses "no handler" with "uninitialized" → _invoke_watson
     // terminates instead of returning from _invalid_parameter.
+    /**
+     * DebugBreak — INT 3 with no debugger attached raises STATUS_BREAKPOINT, which
+     * an app's own __try normally swallows. We have no debugger to attach, so the
+     * faithful observable outcome is "the exception was handled and execution
+     * continued"; log it, because a guest reaching here is reporting something.
+     */
+    exports['DebugBreak'] = () => {
+        Logger.warn(LogCategory.KERNEL32, 'DebugBreak() — no debugger attached, continuing');
+        return 0;
+    };
+
     exports['EncodePointer'] = (ctx, mem, args) => {
         return (args[0] ^ getPointerCookie()) >>> 0;
     };
@@ -703,11 +716,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
  * Register fast paths for EncodePointer/DecodePointer (5841 calls during Montezuma load).
  * Both are the same XOR operation (self-inverse).
  */
-export function registerFastPathPointerFunctions(dispatcher: any): void {
+export function registerFastPathPointerFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher?.registerFastPath) return;
 
-    const impl = (cpu: any, mem8: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    const impl: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 8 > mem8.length) return null;
         const ptr = view.getUint32(esp + 4, true) >>> 0;
         return (ptr ^ getPointerCookie()) >>> 0;

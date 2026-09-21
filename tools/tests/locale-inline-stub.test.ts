@@ -196,8 +196,8 @@ function mkFixture(): Fixture {
     return {
         mem,
         stub: getLocaleInfoWStub,
-        jsFastPath: (esp, m) => fn({ reg32: new Uint32Array([0, 0, 0, 0, esp, 0, 0, 0]) }, m,
-            new Uint32Array(m.buffer), new DataView(m.buffer)),
+        jsFastPath: (esp, m) => fn(esp, new DataView(m.buffer, m.byteOffset, m.byteLength), m,
+            new Uint32Array(m.buffer)),
     };
 }
 

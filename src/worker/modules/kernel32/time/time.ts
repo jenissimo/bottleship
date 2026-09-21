@@ -1,7 +1,7 @@
 // Time-related functions for kernel32
 // GetTickCount, GetSystemTimeAsFileTime, QueryPerformanceCounter, QueryPerformanceFrequency
 
-import { ThunkImplementation, FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { TimeService } from '../../../runtime/time';
 import { Logger, LogCategory } from '../../../core/logger';
 import { System } from '../../../core/system';
@@ -26,7 +26,7 @@ let lastSleepExStormWarnMs = 0;
 /**
  * Register fast path implementations for high-frequency time functions
  */
-export function registerFastPathTimeFunctions(dispatcher: any): void {
+export function registerFastPathTimeFunctions(dispatcher: HleDispatcher): void {
     if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
         dispatcher.registerFastPath('kernel32', 'GetTickCount', TimeService.fastPathGetTickCount);
         dispatcher.registerFastPath('winmm', 'timeGetTime', TimeService.fastPathGetTickCount);
@@ -36,10 +36,7 @@ export function registerFastPathTimeFunctions(dispatcher: any): void {
         // Sleep(0) fast path: skip full thunk when no context switch is needed.
         // D2 calls Sleep(0) ~600K times in 20s. When no other thread is runnable,
         // this is a pure no-op — avoid UD2 trap → JS marshal → scheduler round-trip.
-        const fastPathSleep: FastPathImplementation = (
-            cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, dataView: DataView
-        ): number | null => {
-            const esp = cpu.reg32[4]; // ESP
+        const fastPathSleep: FastPathImplementation = (esp: number, dataView: DataView): number | null => {
             const dwMilliseconds = dataView.getUint32(esp + 4, true);
 
             if (dwMilliseconds === 0) {

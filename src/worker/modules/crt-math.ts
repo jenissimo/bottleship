@@ -15,7 +15,7 @@
 
 import { Mem } from "../core/memory/mem-accessor";
 import { Logger, LogCategory } from "../core/logger";
-import { fpuGetST, fpuPop, fpuPush, fpuSetST0 } from "../core/fpu-helper";
+import { fpuGetST, fpuPop, fpuPush, fpuSetST0, xmmGetLowDouble, xmmSetLowDouble } from "../core/fpu-helper";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import type { Process } from "../core/process";
 
@@ -62,6 +62,66 @@ export function registerCrtMathExports(exports: Record<string, ThunkImplementati
     exports["_CIacos"] = () => ci1("_CIacos", Math.acos, 0);
     exports["_CIasin"] = () => ci1("_CIasin", Math.asin, 0);
     exports["_CIlog10"] = () => ci1("_CIlog10", Math.log10, 0);
+    exports["_CIsinh"] = () => ci1("_CIsinh", Math.sinh, 0);
+    exports["_CIcosh"] = () => ci1("_CIcosh", Math.cosh, 1);
+    exports["_CItanh"] = () => ci1("_CItanh", Math.tanh, 0);
+
+    // --- MSVC 2015+ /arch:SSE2 entries: operands and result in XMM, NOTHING on ---
+    // --- the stack. Same computation as the libc-style block below; only how the -
+    // --- operand travels differs, so the stub must pop 0 bytes.                  -
+    const sse2Unary = (fn: (x: number) => number): ThunkImplementation => () => {
+        const x = xmmGetLowDouble(host.process.v86, 0);
+        if (x === null) {
+            Logger.warn(LogCategory.SYSTEM, "msvcrt._libm_sse2_*: no SSE state available");
+            return 0;
+        }
+        xmmSetLowDouble(host.process.v86, 0, fn(x));
+        return 0;
+    };
+    exports["_libm_sse2_acos_precise"] = sse2Unary(Math.acos);
+    exports["_libm_sse2_atan_precise"] = sse2Unary(Math.atan);
+    exports["_libm_sse2_cos_precise"] = sse2Unary(Math.cos);
+    exports["_libm_sse2_exp_precise"] = sse2Unary(Math.exp);
+    exports["_libm_sse2_log_precise"] = sse2Unary(Math.log);
+    exports["_libm_sse2_sin_precise"] = sse2Unary(Math.sin);
+    exports["_libm_sse2_sqrt_precise"] = sse2Unary(Math.sqrt);
+    exports["_libm_sse2_tan_precise"] = sse2Unary(Math.tan);
+    exports["_libm_sse2_pow_precise"] = () => {
+        const base = xmmGetLowDouble(host.process.v86, 0);
+        const exponent = xmmGetLowDouble(host.process.v86, 1);
+        if (base === null || exponent === null) {
+            Logger.warn(LogCategory.SYSTEM, "msvcrt._libm_sse2_pow_precise: no SSE state available");
+            return 0;
+        }
+        xmmSetLowDouble(host.process.v86, 0, Math.pow(base, exponent));
+        return 0;
+    };
+
+    /**
+     * The FP-error reporting hook the _libm_sse2_* routines call when a computation
+     * raised an exception, returning the (possibly substituted) result in ST(0). We
+     * compute exactly and never unmask an FP exception, so the caller's own `res`
+     * stands — the branch the real _except1 takes when nothing is unmasked.
+     *
+     * double _except1(DWORD fpe, int op, double arg, double res, DWORD cw, void *unk)
+     */
+    exports["_except1"] = (_c, _m, a) => {
+        fpuPush(host.process.v86, host.u32PairToDouble(a[4] ?? 0, a[5] ?? 0));
+        return 0;
+    };
+
+    /** _FPCLASS_* (float.h). */
+    exports["_fpclass"] = (_c, _m, a) => {
+        const x = host.u32PairToDouble(a[0] ?? 0, a[1] ?? 0);
+        if (Number.isNaN(x)) return 0x0002;                       // _FPCLASS_QNAN
+        if (x === Infinity) return 0x0200;                        // _FPCLASS_PINF
+        if (x === -Infinity) return 0x0004;                       // _FPCLASS_NINF
+        const negative = x < 0 || Object.is(x, -0);
+        if (x === 0) return negative ? 0x0020 : 0x0040;           // _FPCLASS_NZ / _PZ
+        const subnormal = Math.abs(x) < 2.2250738585072014e-308;  // < DBL_MIN
+        if (negative) return subnormal ? 0x0010 : 0x0008;         // _FPCLASS_ND / _NN
+        return subnormal ? 0x0080 : 0x0100;                       // _FPCLASS_PD / _PN
+    };
 
     // --- libc-style: double args as (lo,hi) u32, result via ST(0) ------------
     /** Generic unary math function: takes double as (lo,hi) u32, returns via FPU ST(0). */

@@ -5,6 +5,7 @@ import { Logger, LogCategory } from "../core/logger";
 import { WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION } from "../core/scheduler/types";
 
 const CREATE_SUSPENDED = 0x00000004;
+const STACK_SIZE_PARAM_IS_A_RESERVATION = 0x00010000;
 const STATUS_SUCCESS = 0x00000000;
 const STATUS_INVALID_PARAMETER = 0xC000000D;
 const HEAP_ZERO_MEMORY = 0x00000008;
@@ -173,8 +174,11 @@ export class Ntdll implements IModule {
             const outThreadHandlePtr = args[8] >>> 0;
             const outClientIdPtr = args[9] >>> 0;
 
-            const stackSize = stackCommit || stackReserved || 0;
-            const flags = createSuspended ? CREATE_SUSPENDED : 0;
+            // RtlCreateUserThread takes both sizes explicitly, so pass the RESERVE when the
+            // caller gave one — the commit only says how much of it starts backed.
+            const stackSize = stackReserved || stackCommit || 0;
+            const flags = (createSuspended ? CREATE_SUSPENDED : 0)
+                | (stackReserved ? STACK_SIZE_PARAM_IS_A_RESERVATION : 0);
 
             Logger.log(
                 LogCategory.KERNEL32,

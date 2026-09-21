@@ -1,5 +1,5 @@
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
 import { System } from '../../core/system';
@@ -2075,6 +2075,47 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return 1;
     };
 
+    exports['ExtTextOutW'] = (ctx, mem, args): number => {
+        const hdc = args[0];
+        const x = args[1] | 0;
+        const y = args[2] | 0;
+        const options = args[3];
+        const lpString = args[5];
+        const c = args[6];
+        const lpDx = args[7];
+        // lpString is legitimately NULL for a text-less ETO_OPAQUE/ETO_CLIPPED rect fill.
+        const text = lpString ? Marshaler.readWideString(mem, lpString).substring(0, c) : '';
+        Logger.verbose(LogCategory.GDI32, `ExtTextOutW: '${text}' at (${x},${y}) options=0x${options.toString(16)}`);
+
+        const gdi = System.getInstance().gdiContext;
+        // The spacing array is c ints long; a short one is a caller bug, and reading past it
+        // would throw out of the DataView rather than mis-space a string.
+        if (lpDx && c > 0 && lpDx + c * 4 <= mem.length) {
+            const dxView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            let curX = x;
+            for (let i = 0; i < c; i++) {
+                gdi.textOut(hdc, curX, y, text[i] ?? '');
+                curX += dxView.getInt32(lpDx + i * 4, true);
+            }
+        } else {
+            gdi.textOut(hdc, x, y, text);
+        }
+        return 1;
+    };
+
+    /**
+     * GetFontLanguageInfo — the GCP_* bits that tell a caller its text needs special
+     * handling (bidi reordering, glyph substitution, kashida justification). Zero is a
+     * real answer, not a decline: it is what Windows returns for a Latin font in a
+     * Latin locale, and it steers the caller onto the simple path our text stack can
+     * actually draw. A font needing shaping would want GCP_GLYPHSHAPE here, which we
+     * would have to be able to honour first.
+     */
+    exports['GetFontLanguageInfo'] = (ctx, mem, args): number => {
+        Logger.verbose(LogCategory.GDI32, `GetFontLanguageInfo(hdc=0x${args[0].toString(16)}) -> 0`);
+        return 0;
+    };
+
     // Bitmap creation
     exports['CreateDIBitmap'] = (ctx, mem, args): number => {
         const hdc = args[0];
@@ -2538,7 +2579,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
  * Register high-frequency GDI functions to the Fast Path table.
  * This avoids the overhead of creating X86Context and stack manipulation.
  */
-export function registerFastPathGdiFunctions(dispatcher: any): void {
+export function registerFastPathGdiFunctions(dispatcher: HleDispatcher): void {
     if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
         // OPTIMIZATION: Cache GDIContext reference to avoid System.getInstance() on every call
         let cachedGdiContext: ReturnType<typeof System.getInstance>['gdiContext'] | null = null;
@@ -2552,8 +2593,7 @@ export function registerFastPathGdiFunctions(dispatcher: any): void {
         let lastHeight = 0;
 
         // FastPathImplementation = (cpu, memory) => number
-        dispatcher.registerFastPath('gdi32', 'GetPixel', (cpu: any, mem: Uint8Array): number => {
-            const esp = cpu.reg32[4];
+        dispatcher.registerFastPath('gdi32', 'GetPixel', (esp: number, _view: DataView, mem: Uint8Array): number => {
 
             // Read arguments directly from stack
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
