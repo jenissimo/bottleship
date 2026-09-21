@@ -2,7 +2,7 @@ import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
-import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, type ChildBoot } from "./core/child-process";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, type ChildBoot } from "./core/child-process";
 import { createChildVfsClient } from "./core/child-vfs";
 import { ChildSessionTransport } from './core/child-session';
 import { ChildFrameClock } from './core/child-frame-clock';
@@ -26,6 +26,7 @@ setChildBootContext(() => ({
   registry: System.getInstance().registry.serialize(),
   namedObjects: namedObjects.snapshot(),
 }));
+setChildRegistrySink(mutation => System.getInstance().registry.applyMutation(mutation));
 (globalThis as Record<string, unknown>).__childProcesses = childProcessHistory;
 
 // Which guest thread is driving a given VFS read — the shared-cursor question can only
@@ -2425,7 +2426,7 @@ const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches
         `[ReExec] flushAll did not drain within ${REEXEC_FLUSH_BUDGET_MS}ms — restarting anyway`);
       once();
     }, REEXEC_FLUSH_BUDGET_MS);
-    stopChildProcesses().then(() => System.getInstance().fileSystem.flushAll())
+    stopChildProcesses().then(() => System.getInstance().drainDurableState())
       .catch((e) => Logger.warn(LogCategory.SYSTEM, `[ReExec] flushAll failed: ${e}`))
       .then(() => { clearTimeout(budget); once(); });
     return true;
@@ -3256,6 +3257,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // while the new bootloader resets FS, and CRT startup faults at fs:[0].
         await prepareFullGameSwitch();
         if (boot.registry) system.registry.restore(boot.registry);
+        // The hive is the parent's; this worker only holds a copy of it. postToParent, not
+        // the overridden self.postMessage: a child that owns the screen talks to the PAGE,
+        // and the page is not what persists the registry.
+        system.registry.setMutationSink(mutation => postToParent({ type: 'child_registry', mutation }));
         if (boot.namedObjects) adoptNamedObjects(boot.namedObjects, {
           event: (manualReset, initialState) => system.scheduler.createEvent(manualReset, initialState),
           mutex: () => system.scheduler.createMutex(false),

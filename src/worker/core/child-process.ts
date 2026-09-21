@@ -1,6 +1,6 @@
 import { CHILD_IO_BYTES, createChildVfsServer } from './child-vfs';
 import type { VirtualFileSystem } from '../runtime/filesystem/vfs';
-import type { RegistryStore } from '../runtime/filesystem/registry';
+import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/registry';
 import type { NamedObjectSpec } from '../modules/kernel32/named-objects';
 
 export interface ChildProcessRequest {
@@ -69,6 +69,11 @@ let publishSession: ((port: MessagePort, record: ChildProcessRecord) => void) | 
 let sessionFinished: (() => void) | undefined;
 let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects'>) | undefined;
 export function setChildBootContext(provider: typeof bootContext): void { bootContext = provider; }
+
+/** Applies a child's registry write to THIS process's store — the registry is system-wide,
+ *  so the child's hive is ours, and only we hold the gameId and the autosave that persist it. */
+let applyChildRegistry: ((mutation: RegistryMutation) => void) | undefined;
+export function setChildRegistrySink(apply: typeof applyChildRegistry): void { applyChildRegistry = apply; }
 
 /** The page keeps the parent worker as the VFS broker, and talks directly to this port. */
 export function setChildSessionPublisher(publish: typeof publishSession, finished?: () => void): void {
@@ -241,6 +246,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                 if (done || context.signal.aborted) return;
                 const message = event.data;
                 if (message.type === 'child_io') void serve(message.request);
+                else if (message.type === 'child_registry') applyChildRegistry?.(message.mutation);
                 else if (message.type === 'child_session' && publishSession) {
                     // An already-exiting child can itself be the VFS broker for a live
                     // descendant. Forward its port without starting either image again.

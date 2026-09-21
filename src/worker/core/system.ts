@@ -489,6 +489,10 @@ export class System {
      * in it — and a config whose first byte is NUL reads as empty to the app that wrote
      * it, which is exactly how "the game saved my settings and lost them" happens.
      *
+     * The registry is the other half of that state and is debounced the same way, so it
+     * drains here too — a launcher that writes its config and exits is the common case,
+     * not the corner one.
+     *
      * Idempotent: a process exits once, however many exit paths report it.
      */
     private brokerExit: Record<string, unknown> | null = null;
@@ -509,7 +513,7 @@ export class System {
             // Guest threads have exited; this worker still owns the live child's VFS.
             // The child reports its own final exit over the page's foreground port.
             const notifyParent = this.onProcessExit;
-            void stopChildProcesses(true).then(() => this.fileSystem.flushAll())
+            void stopChildProcesses(true).then(() => this.drainDurableState())
                 .then(() => notifyParent?.({ ...payload, broker: true }))
                 .catch(error => Logger.warn(LogCategory.SYSTEM, `parent exit flush failed: ${error}`));
             return;
@@ -538,9 +542,19 @@ export class System {
                 `process exit: flushAll did not drain within ${System.EXIT_FLUSH_BUDGET_MS}ms — notifying host anyway`);
             post();
         }, System.EXIT_FLUSH_BUDGET_MS) as unknown as number;
-        childrenStopped.then(() => this.fileSystem.flushAll())
+        childrenStopped.then(() => this.drainDurableState())
             .catch((e) => Logger.warn(LogCategory.SYSTEM, `process exit: flushAll failed: ${e}`))
             .then(() => { clearTimeout(budget); post(); });
+    }
+
+    /** Everything the guest wrote that is still only in memory: the overlay's debounced
+     *  OPFS commits and the registry's debounced container write. */
+    async drainDurableState(): Promise<void> {
+        await Promise.all([
+            this.fileSystem.flushAll(),
+            this.registry.flush().catch((e) =>
+                Logger.warn(LogCategory.SYSTEM, `process exit: registry flush failed: ${e}`)),
+        ]);
     }
 
     /**

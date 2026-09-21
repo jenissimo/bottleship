@@ -29,6 +29,20 @@ export interface RegistrySeed {
     values: RegistryValue[];
 }
 
+/**
+ * One guest-visible registry write, in the vocabulary of the API that produced it.
+ *
+ * The Windows registry is system-wide: a child process writing HKCU writes the hive its
+ * parent reads, and persistence belongs to the system, not to whichever process happened
+ * to call RegSetValueEx. A child runs in its own worker with its own RegistryStore, so its
+ * writes are forwarded up to the process that owns persistence (see setMutationSink).
+ */
+export type RegistryMutation =
+    | { op: "setValue"; key: string; name: string; value: RegistryValue }
+    | { op: "createKey"; root: string; path: string }
+    | { op: "deleteKey"; key: string; subKey?: string }
+    | { op: "deleteValue"; key: string; name: string };
+
 /** VER_PLATFORM_WIN32_WINDOWS — the Win9x branch of EmulatorConfig.osVersion. */
 const PLATFORM_WIN32_WINDOWS = 1;
 
@@ -111,6 +125,7 @@ export class RegistryStore {
     private gameId: string = "";
     private accessLogBuffer: RegistryAccessLogEntry[] = [];
     private onChangeCallback: (() => void) | null = null;
+    private mutationSink: ((mutation: RegistryMutation) => void) | null = null;
     private readonly MAX_LOG_BUFFER_SIZE = 1000;
 
     reset(): void {
@@ -119,6 +134,7 @@ export class RegistryStore {
         this.accessLogBuffer = [];
         this.gameId = "";
         this.onChangeCallback = null;
+        this.mutationSink = null;
     }
 
     /** The system baseline, built on first use so it reflects the manifest's osVersion
@@ -261,6 +277,7 @@ export class RegistryStore {
             data: value.data,
         });
 
+        this.emit({ op: "setValue", key: keyHandle, name: valueName, value });
         // Notify change
         this.notifyChange();
     }
@@ -280,6 +297,7 @@ export class RegistryStore {
                 result: "success",
             });
 
+            this.emit({ op: "createKey", root, path });
             // Notify change
             this.notifyChange();
         }
@@ -317,6 +335,7 @@ export class RegistryStore {
             result: "success",
         });
 
+        this.emit({ op: "deleteKey", key: baseKey, subKey });
         this.notifyChange();
         return true;
     }
@@ -345,6 +364,7 @@ export class RegistryStore {
         });
 
         if (deleted) {
+            this.emit({ op: "deleteValue", key: baseKey, name: valueName });
             this.notifyChange();
         }
         return deleted;
@@ -434,6 +454,47 @@ export class RegistryStore {
     }
 
     /**
+     * Forward every guest write to the process that owns persistence.
+     *
+     * A child process gets its own worker and its own store, so without this its writes
+     * live and die inside that worker: nothing there holds the gameId or the autosave the
+     * root boot installed, and the settings a configurator writes on its way out are gone
+     * before anyone could save them. The sink is the registry's half of what
+     * createChildVfsClient already does for files.
+     */
+    setMutationSink(sink: ((mutation: RegistryMutation) => void) | null): void {
+        this.mutationSink = sink;
+    }
+
+    /** Replay a mutation forwarded from another process, as if this store's API produced it. */
+    applyMutation(mutation: RegistryMutation): void {
+        switch (mutation.op) {
+            case "setValue":
+                this.setValue(mutation.key, mutation.name, mutation.value);
+                break;
+            case "createKey":
+                this.createKey(mutation.root, mutation.path);
+                break;
+            case "deleteKey":
+                this.deleteKey(mutation.key, mutation.subKey);
+                break;
+            case "deleteValue":
+                this.deleteValue(mutation.key, mutation.name);
+                break;
+        }
+    }
+
+    /** Sink failures must not fail the guest's write — the local store is already correct. */
+    private emit(mutation: RegistryMutation): void {
+        if (!this.mutationSink) return;
+        try {
+            this.mutationSink(mutation);
+        } catch (e) {
+            Logger.warn(LogCategory.SYSTEM, `Registry mutation forward failed: ${e}`);
+        }
+    }
+
+    /**
      * Serialize current registry state for persistence
      */
     serialize(): PersistedRegistryState {
@@ -494,6 +555,20 @@ export class RegistryStore {
         if (this.onChangeCallback) {
             this.onChangeCallback();
         }
+    }
+
+    /**
+     * Commit this store to its container NOW.
+     *
+     * The autosave is debounced, so a process that writes its settings and calls
+     * ExitProcess in the same breath exits inside that window — the durability barrier
+     * awaits this so the write lands before the host is told the process is gone. A store
+     * with no gameId owns no container: that is a child's copy, and its writes reach disk
+     * through the owner it forwards them to, not from here.
+     */
+    async flush(): Promise<void> {
+        if (!this.gameId) return;
+        await RegistryPersistence.save(this.gameId, this.serialize());
     }
 
     /**
