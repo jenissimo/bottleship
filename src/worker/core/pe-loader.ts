@@ -4,7 +4,6 @@
 import { ThunkGenerator } from './thunking/thunk-generator';
 import { markHleModuleLoaded, redirectHleImageExport } from './hle-module-images';
 import { hleExportBindingAddress } from './thunking/export-resolver';
-import { deriveStackCleanupFromMangledName } from './thunking/msvc-mangling';
 import { APIRegistry } from './api-registry';
 import { System } from './system';
 import { Logger, LogCategory } from './logger';
@@ -16,7 +15,6 @@ import { hypercallDataManager } from './cpu/hypercall-data';
 import { libHleManager } from './hle-lib/lib-hle-manager';
 import { hookRegistry } from './hooks';
 import { runNativeModulePatchers } from '../modules/native-patchers';
-import { normalizeDllBaseName, resolveThunkedDllAlias } from './dll-aliases';
 import { findDllRule, normalizeDllPathToken } from './dll-rules';
 import { isUnderSystemDirectory } from './hle-system-catalog';
 import { EmulatorConfig } from './emulator-config-manager';
@@ -30,10 +28,7 @@ import { writeMbwcStubs, resetMbwcInlineStubs, type MbwcInlineStubs } from '../m
 import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kernel32/codepage-lut';
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
-
-function isD3dx9VersionedDll(dllNameLower: string): boolean {
-    return resolveThunkedDllAlias(normalizeDllBaseName(dllNameLower)) === 'd3dx9';
-}
+import { resolveImportBinding, isD3dx9VersionedDll } from './pe-import-binding';
 
 export interface LoadedModule {
     baseAddress: number;
@@ -62,20 +57,6 @@ const DLL_PROCESS_ATTACH = 1;
 const DLL_PROCESS_DETACH = 0;
 const DLL_THREAD_ATTACH = 2;
 const DLL_THREAD_DETACH = 3;
-
-/**
- * DLLs whose implementation IS the emulator. The "registry cannot cover these imports, but
- * a real file exists in the VFS — load it natively" fallback must never reach them: a real
- * kernel32/ntdll/user32 expects an NT kernel underneath (syscalls, PEB/TEB internals, a
- * real GDI driver) and there is none, so satisfying the import from a shipped copy trades
- * a handful of missing exports for a certain, unexplainable death. A bundle that happens
- * to ship one of these (installers routinely do) must stay thunked; unknown imports keep
- * their trap stubs, which fail one call loudly instead of the whole process silently.
- */
-const HLE_ONLY_DLLS = new Set<string>([
-    'kernel32', 'kernelbase', 'ntdll', 'user32', 'gdi32', 'advapi32',
-    'ddraw', 'd3d8', 'd3d9', 'dsound', 'dinput', 'dinput8', 'opengl32', 'glide2x', 'glide3x',
-]);
 
 export class PELoader {
     /**
@@ -1379,70 +1360,28 @@ export class PELoader {
             if (nameRVA === 0) break;
 
             const dllNameRaw = this.readString(baseAddress + nameRVA);
-            const dllNameBeforeAlias = dllNameRaw.toLowerCase().replace(/\.dll$/i, '');
-            const dllName = resolveThunkedDllAlias(dllNameBeforeAlias);
-            const aliasTarget = dllName !== dllNameBeforeAlias ? dllName : null;
-            if (aliasTarget) {
-                Logger.log(LogCategory.SYSTEM, `[PE] DLL alias: ${dllNameRaw} → ${aliasTarget} (using thunked implementation)`);
-            }
 
             const iltRVA = this.view.getUint32(descriptorAddr, true); // Import Lookup Table
             const iatRVA = this.view.getUint32(descriptorAddr + 16, true); // Import Address Table
 
             const functions = this.parseImportTable(baseAddress, iltRVA || iatRVA);
 
-            // Check if this DLL is thunked (has API registry entries).
-            // Video DLLs are excluded when native loading is enabled — they fall through to VFS.
-            let isThunked = this.apiRegistry.hasModule(dllName) &&
-                !(EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName));
-
-            // manifest.appDirDlls: the game ships its own copy of this DLL next to the exe,
-            // and Windows' search order binds to THAT — it is a wrapper/proxy (ASI loader,
-            // Glide or ddraw shim) whose whole purpose is to run first. Checked before the
-            // coverage rule below and outside its exclusions, because the DLLs games wrap
-            // are exactly the video ones that rule skips. A rule with no file on disk stays
-            // thunked: metadata must not be able to turn an import into an unbound one.
-            if (isThunked && findDllRule(EmulatorConfig.getInstance().appDirDlls, dllNameRaw) !== null) {
-                const appDirPath = this.findDllPath(dllName);
-                if (appDirPath && !isUnderSystemDirectory(normalizeDllPathToken(appDirPath))) {
-                    Logger.log(LogCategory.SYSTEM,
-                        `[PE] "${dllNameRaw}" -> the game's own ${appDirPath} (manifest.appDirDlls), not the HLE module`);
-                    isThunked = false;
-                }
-            }
-
-            // A thunked module must cover every requested import — stdcall stubs need
-            // argCount or stackCleanupBytes, and generateStubDll throws otherwise.
-            // A registry module name can collide with an unrelated real DLL a game ships
-            // (same filename, different library): if the registry cannot satisfy some
-            // imports but the real file exists in the VFS, load it natively instead.
-            // Aliased DLLs keep their trap-stub handling for unknown imports; DLLs the
-            // native loader refuses (HLE-only video/d3dx9) stay thunked.
-            if (isThunked && !aliasTarget &&
-                !HLE_ONLY_DLLS.has(dllName) &&
-                !(!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllName)) &&
-                !isD3dx9VersionedDll(dllName)) {
-                const uncovered = functions.filter(f => {
-                    if (f.name) {
-                        const cc = this.apiRegistry.getCallingConvention(dllName, f.name);
-                        return (!cc || cc === 'stdcall') &&
-                            this.thunkGenerator.getDataExportAddress(dllName, f.name) === undefined &&
-                            this.apiRegistry.getArgCount(dllName, f.name) === undefined &&
-                            this.apiRegistry.getStackCleanupBytes(dllName, f.name) === undefined &&
-                            deriveStackCleanupFromMangledName(f.name) === undefined;
+            const { dllName, aliasTarget, isThunked } = resolveImportBinding(dllNameRaw, functions, {
+                hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
+                findDllPath: (n) => this.findDllPath(n),
+                appDirRule: (raw) => findDllRule(EmulatorConfig.getInstance().appDirDlls, raw),
+                isUnderSystemDirectory: (p) => isUnderSystemDirectory(normalizeDllPathToken(p)),
+                exportFacts: (thunked, f) => f.name !== undefined
+                    ? {
+                        callingConvention: this.apiRegistry.getCallingConvention(thunked, f.name),
+                        argCount: this.apiRegistry.getArgCount(thunked, f.name),
+                        stackCleanupBytes: this.apiRegistry.getStackCleanupBytes(thunked, f.name),
+                        isDataExport: this.thunkGenerator.getDataExportAddress(thunked, f.name) !== undefined,
                     }
-                    return f.ordinal !== undefined &&
-                        this.apiRegistry.getArgCountByOrdinal(dllName, f.ordinal) === undefined;
-                });
-                if (uncovered.length > 0 && this.findDllPath(dllName) !== null) {
-                    const names = uncovered.slice(0, 5).map(f => this.resolveImportName(dllName, f)).join(', ');
-                    Logger.warn(LogCategory.SYSTEM,
-                        `[PE] Thunked module "${dllName}" cannot cover ${uncovered.length}/${functions.length} ` +
-                        `imports of ${dllNameRaw} (${names}${uncovered.length > 5 ? ', …' : ''}); ` +
-                        `real DLL exists in VFS — loading natively instead of thunking`);
-                    isThunked = false;
-                }
-            }
+                    : { argCount: f.ordinal !== undefined ? this.apiRegistry.getArgCountByOrdinal(thunked, f.ordinal) : undefined },
+                log: (m) => Logger.log(LogCategory.SYSTEM, m),
+                warn: (m) => Logger.warn(LogCategory.SYSTEM, m),
+            });
 
             // Log ALL DLLs and their functions
             const importedNames = functions.map(f => this.resolveImportName(dllName, f));
