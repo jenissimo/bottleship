@@ -1286,8 +1286,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             }
 
             // Win32 CreateWindowEx(WS_VISIBLE) delivers WM_SHOWWINDOW/WM_SIZE synchronously
-            // (via the initial show-SetWindowPos) BEFORE returning; only WM_PAINT arrives via
-            // the queue. Deliver them here for guest-proc windows — including system controls
+            // BEFORE returning, after WM_CREATE; only WM_PAINT arrives via the queue.
+            // Deliver them here for guest-proc windows — including system controls
             // subclassed by a CBT hook above — so post-Create guest code observes the WM_SIZE
             // side effects in real user32 order (a deferred WM_SIZE lands AFTER the caller's
             // post-Create setup and can wipe its state).

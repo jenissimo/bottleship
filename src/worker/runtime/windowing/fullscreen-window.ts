@@ -137,9 +137,10 @@ function showFullscreenWindow(hwnd: number, source: string): void {
     system.windowManager?.setWindowZOrder(hwnd, HWND_TOP);
     activateTopLevelWindow(hwnd);
 
-    // A hidden->visible transition owes the window WM_SHOWWINDOW(TRUE) — SetWindowPos with
-    // SWP_SHOWWINDOW sends it, so a mode-set that shows the window must too. Apps hang real
-    // work off it: HL's launcher loads the menu's background DIB and button strip in
+    // A mode-set brings the device window up through ShowWindow, and ShowWindow is what
+    // sends WM_SHOWWINDOW(TRUE) on a hidden->visible transition (SetWindowPos's
+    // SWP_SHOWWINDOW does not — see tools/tests/setwindowpos-showwindow.test.ts). Apps hang
+    // real work off it: HL's launcher loads the menu's background DIB and button strip in
     // OnShowWindow(bShow=TRUE), and without the message the menu paints on bare black.
     system.windowManager?.postMessage(hwnd, WM_SHOWWINDOW, 1, 0);
 

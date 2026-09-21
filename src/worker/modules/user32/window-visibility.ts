@@ -2,11 +2,12 @@
  * The dialog manager's show step.
  *
  * Win32 creates a dialog hidden, runs WM_INITDIALOG on it, and then shows it —
- * DialogBox* always, CreateDialog* when the template carries WS_VISIBLE. Showing is
- * SetWindowPos(SWP_SHOWWINDOW), so the hidden->visible transition owes the window
- * WM_SHOWWINDOW(TRUE); apps hang real work off it (HL's launcher loads the menu's
- * background DIB there). ShowWindow/SetWindowPos own the general case; this is the
- * one path USER runs on the dialog manager's behalf.
+ * DialogBox* always, CreateDialog* when the template carries WS_VISIBLE. That show is a
+ * ShowWindow, which is the API that sends WM_SHOWWINDOW(TRUE) on a hidden->visible
+ * transition; SetWindowPos(SWP_SHOWWINDOW) does not (tools/tests/setwindowpos-showwindow.test.ts).
+ * Apps hang real work off it — HL's launcher loads the menu's background DIB there.
+ * ShowWindow owns the general case; this is the one path USER runs on the dialog
+ * manager's behalf.
  */
 import { System } from '../../core/system';
 import { windows } from './shared-state';

@@ -40,9 +40,9 @@ function withRecordedMessages(fn: () => void): Array<{ hwnd: number; msg: number
 
 afterEach(() => { sharedWindows.delete(HWND); });
 
-// A mode-set that takes a hidden window fullscreen SHOWS it (wined3d's
-// setup_fullscreen_window does it with SWP_SHOWWINDOW), and a hidden->visible transition
-// owes the window WM_SHOWWINDOW(TRUE). Apps hang real work off that message — HL's
+// A mode-set that takes a hidden window fullscreen SHOWS it, and a hidden->visible
+// transition made through ShowWindow owes the window WM_SHOWWINDOW(TRUE) — the message
+// SetWindowPos never sends. Apps hang real work off it — HL's
 // launcher loads the menu's background DIB in OnShowWindow(bShow=TRUE) — so flipping
 // WS_VISIBLE without the message leaves the app believing it was never shown.
 test('a fullscreen mode-set that shows a hidden window delivers WM_SHOWWINDOW(TRUE)', () => {
