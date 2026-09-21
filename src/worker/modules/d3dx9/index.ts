@@ -12,7 +12,13 @@ import { createSurfaceExports } from './surfaces';
 import { createTextureExports } from './textures';
 import { createEffectExports, resetEffectState } from './effects';
 import { createBufferExports, resetD3DXBuffers } from './buffer';
+import { createEffectPoolExports, resetEffectPools, resetEffectPoolVtable } from './effect-pool';
 import { createShaderExports, resetShaderAsmState } from './shaders';
+import { createConstantTableExports, resetD3DXConstantTables } from './constant-table';
+import { createTextureRequirementExports } from './texture-requirements';
+import { resetEffectInstances } from './effect-state';
+import { resetEffectApplyWarnings, resetEffectZeroConstantCensus } from './effect-apply';
+import { resetEffectParamWriteCensus } from './effect-values';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -45,7 +51,10 @@ export class D3dx9 implements IModule {
         Object.assign(this.exports, createTextureExports());
         Object.assign(this.exports, createEffectExports(process));
         Object.assign(this.exports, createBufferExports(process));
+        Object.assign(this.exports, createEffectPoolExports(process));
         Object.assign(this.exports, createShaderExports(process));
+        Object.assign(this.exports, createConstantTableExports());
+        Object.assign(this.exports, createTextureRequirementExports());
 
         this.exports['D3DXTessellateNPatches'] = () => D3DERR_INVALIDCALL;
         this.exports['D3DXSavePRTCompBufferToFileW'] = () => D3DERR_INVALIDCALL;
@@ -72,6 +81,15 @@ export class D3dx9 implements IModule {
         warnedStubs.clear();
         resetEffectState();
         resetD3DXBuffers();
+        resetEffectPools();
+        resetEffectPoolVtable();
         resetShaderAsmState();
+        resetD3DXConstantTables();
+        // The effect registry is keyed by GUEST pointer: leaving it populated lets a new
+        // effect that lands on a recycled address inherit the previous process's model.
+        resetEffectInstances();
+        resetEffectApplyWarnings();
+        resetEffectZeroConstantCensus();
+        resetEffectParamWriteCensus();
     }
 }

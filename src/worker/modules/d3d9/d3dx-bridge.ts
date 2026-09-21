@@ -4,6 +4,7 @@
 
 import { Mem } from '../../core/memory/mem-accessor';
 import { resolveSurfaceInfo, resolveTextureInfo, D3D_OK, D3DERR_INVALIDCALL } from './resource-registry';
+import { getD3DTextureLayout } from '../../backends/webgpu/shared/texture-formats';
 
 const D3DX_FILTER_LINEAR = 3;
 
@@ -234,6 +235,97 @@ export function rgbaToBgra(rgba: Uint8Array, out?: Uint8Array): Uint8Array {
         dst[i + 3] = rgba[i + 3];
     }
     return dst;
+}
+
+/**
+ * Copy a DDS's surface bytes into a texture created in the SAME format, level by level.
+ *
+ * D3DX preserves the file's format by default (D3DFMT_FROM_FILE), and an engine that reads
+ * GetLevelDesc back expects exactly what it asked for — decoding a block-compressed file to
+ * RGBA answers a different question than the one it asked, besides costing 4x the memory and
+ * every mip the file already contains. A DDS stores its mip chain consecutively, so the walk
+ * is just the per-level layout.
+ */
+export function uploadDdsLevels(
+    texturePtr: number,
+    data: Uint8Array,
+    dataOffset: number,
+    format: number,
+    width: number,
+    height: number,
+    levels: number,
+): boolean {
+    const info = resolveTextureInfo(texturePtr);
+    if (!info) return false;
+    let offset = dataOffset;
+    for (let level = 0; level < levels; level++) {
+        const w = Math.max(1, width >>> level);
+        const h = Math.max(1, height >>> level);
+        const layout = getD3DTextureLayout(format, w, h);
+        if (offset + layout.bytes > data.length) {
+            // A truncated chain is the file's business, not ours to invent: stop at what it
+            // actually carries rather than uploading whatever follows it.
+            return level > 0;
+        }
+        if (!info.device.setTextureLevelPixels(texturePtr, level, data.subarray(offset, offset + layout.bytes), layout.pitch)) {
+            return false;
+        }
+        offset += layout.bytes;
+    }
+    return true;
+}
+
+/**
+ * Copy a cube .dds straight into the six faces, in the FILE's own format — the block-compressed
+ * sibling of uploadDdsLevels. A cube .dds stores the faces in +X,-X,+Y,-Y,+Z,-Z order, each
+ * carrying its WHOLE mip chain, so the walk advances over every level the file holds even when
+ * the caller asked for fewer: skipping that stride reads the next face from the middle of this
+ * one, which decodes as plausible-looking garbage rather than as a failure. The walk itself is
+ * separated out so that stride can be asserted without a live device behind it.
+ */
+export function ddsCubeFaceLayout(
+    format: number,
+    edge: number,
+    fileLevels: number,
+    dataOffset: number,
+): Array<{ face: number; level: number; offset: number; bytes: number; pitch: number }> {
+    const out: Array<{ face: number; level: number; offset: number; bytes: number; pitch: number }> = [];
+    let offset = dataOffset;
+    for (let face = 0; face < 6; face++) {
+        for (let level = 0; level < fileLevels; level++) {
+            const size = Math.max(1, edge >>> level);
+            const layout = getD3DTextureLayout(format, size, size);
+            out.push({ face, level, offset, bytes: layout.bytes, pitch: layout.pitch });
+            offset += layout.bytes;
+        }
+    }
+    return out;
+}
+
+export function uploadDdsCubeFaces(
+    cubePtr: number,
+    data: Uint8Array,
+    dataOffset: number,
+    format: number,
+    edge: number,
+    levels: number,
+    fileLevels: number,
+): boolean {
+    const info = resolveTextureInfo(cubePtr);
+    if (!info) return false;
+    const setFace = (info.device as unknown as {
+        setCubeFacePixels?: (t: number, f: number, l: number, src: Uint8Array, pitch: number) => boolean;
+    }).setCubeFacePixels;
+    if (!setFace) return false;
+    let uploadedAny = false;
+    for (const slice of ddsCubeFaceLayout(format, edge, fileLevels, dataOffset)) {
+        if (slice.offset + slice.bytes > data.length) return uploadedAny;
+        if (slice.level >= levels) continue;
+        if (!setFace.call(info.device, cubePtr, slice.face, slice.level,
+            data.subarray(slice.offset, slice.offset + slice.bytes), slice.pitch)) return false;
+        uploadedAny = true;
+    }
+    return uploadedAny;
 }
 
 export function uploadRgbaToTexture(

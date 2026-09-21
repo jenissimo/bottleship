@@ -45,12 +45,19 @@ export type DecodedImage = {
     mipLevels: number;
 };
 
+import { getD3DTextureLayout } from '../../backends/webgpu/shared/texture-formats';
+
 const DDS_MAGIC = 0x20534444; // "DDS "
 const DDS_HEADER_SIZE = 124;
 const DDS_PIXELFORMAT_SIZE = 32;
 const DDSD_PITCH = 0x00000008;
 const DDPF_ALPHA = 0x00000002;
 const DDPF_LUMINANCE = 0x00020000;
+const DDSCAPS2_CUBEMAP = 0x00000200;
+const DDSCAPS2_VOLUME = 0x00200000;
+const D3DRTYPE_TEXTURE = 3;
+const D3DRTYPE_VOLUMETEXTURE = 4;
+const D3DRTYPE_CUBETEXTURE = 5;
 const FOURCC_DX10 = 0x30315844; // "DX10"
 
 // DXGI_FORMAT values used by DDS DX10 headers. We decode the first 2D
@@ -113,6 +120,40 @@ function ddsFourCCToD3DFormat(fourCC: number): number {
     }
 }
 
+/**
+ * A DDS whose surface format has no four-character code carries the D3DFORMAT enum VALUE in
+ * dwFourCC instead — that is how d3dx writes the float formats (R16F .. A32B32G32R32F) and
+ * A16B16G16R16. Reading such a value as a four-character code returns 0 and refuses a
+ * perfectly good HDR map, which an engine then treats as a missing asset.
+ *
+ * A real code is four PRINTABLE bytes; anything else is a number. The value is still only
+ * accepted when the shared format table knows it, so an unrecognised one stays a refusal
+ * rather than becoming a wrong layout.
+ */
+const NUMERIC_FOURCC_FORMATS = new Set<number>([
+    36,   // D3DFMT_A16B16G16R16
+    110,  // D3DFMT_Q16W16V16U16
+    111,  // D3DFMT_R16F
+    112,  // D3DFMT_G16R16F
+    113,  // D3DFMT_A16B16G16R16F
+    114,  // D3DFMT_R32F
+    115,  // D3DFMT_G32R32F
+    116,  // D3DFMT_A32B32G32R32F
+]);
+
+function numericFourCCFormat(fourCC: number): number {
+    let printable = 0;
+    for (let i = 0; i < 4; i++) {
+        const b = (fourCC >>> (i * 8)) & 0xff;
+        if (b >= 0x20 && b < 0x7f) printable++;
+    }
+    if (printable === 4) return 0;
+    // An explicit list, NOT a "does the format table know it" test: d3dFormatBpp answers 32 for
+    // everything it does not recognise, so that check would accept any number at all and hand
+    // the loader a wrong layout instead of a refusal.
+    return NUMERIC_FOURCC_FORMATS.has(fourCC >>> 0) ? fourCC >>> 0 : 0;
+}
+
 function dxgiFormatToD3DFormat(dxgiFormat: number): number {
     switch (dxgiFormat) {
         case DXGI_FORMAT_R8G8B8A8_UNORM:
@@ -157,6 +198,112 @@ function dxgiFormatToD3DFormat(dxgiFormat: number): number {
         default:
             return 0;
     }
+}
+
+/** No D3D9 device holds a larger surface, so a header naming one is not a file. */
+const MAX_DDS_EXTENT = 16384;
+
+/** The handful of uncompressed D3DFORMAT values a DDS header can name. */
+const D3DFMT_R8G8B8_INFO = 20;
+const D3DFMT_A8R8G8B8_INFO = 21;
+const D3DFMT_X8R8G8B8_INFO = 22;
+const D3DFMT_R5G6B5_INFO = 23;
+const D3DFMT_A1R5G5B5_INFO = 25;
+
+/** D3DXIMAGE_FILEFORMAT. */
+export const enum ImageFileFormat {
+    Bmp = 0, Jpg = 1, Tga = 2, Png = 3, Dds = 4, Ppm = 5, Dib = 6, Hdr = 7, Pfm = 8,
+}
+
+/**
+ * What the CONTAINER is, from its magic alone. D3DX answers D3DXIMAGE_INFO.ImageFileFormat
+ * from the header, never from a decode — and an engine that switches on the value it gets
+ * back will index a jump table with it, so a placeholder there is a call through a garbage
+ * pointer rather than a cosmetic wrong field.
+ */
+export function imageFileFormatOf(data: Uint8Array): ImageFileFormat | null {
+    if (data.length >= 4 && readU32LE(data, 0) === DDS_MAGIC) return ImageFileFormat.Dds;
+    if (data.length >= 4 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+        return ImageFileFormat.Png;
+    }
+    if (data.length >= 2 && data[0] === 0xff && data[1] === 0xd8) return ImageFileFormat.Jpg;
+    if (data.length >= 2 && data[0] === 0x42 && data[1] === 0x4d) return ImageFileFormat.Bmp;
+    if (data.length >= 18) return ImageFileFormat.Tga;
+    return null;
+}
+
+/**
+ * A DDS header read WITHOUT decoding: dimensions, real mip count and the surface format the
+ * file stores. The decode that follows converts to RGBA, but the info query has to describe
+ * the file.
+ */
+export function readDdsInfo(
+    data: Uint8Array,
+): {
+    width: number; height: number; depth: number; mipLevels: number;
+    /** What the HEADER claims, which is what d3dx would create. `mipLevels` is what the
+     *  payload actually carries; a streamed asset ships fewer. */
+    claimedMipLevels: number;
+    format: number; resourceType: number; dataOffset: number;
+} | null {
+    if (data.length < 128 || readU32LE(data, 0) !== DDS_MAGIC) return null;
+    if (readU32LE(data, 4) !== DDS_HEADER_SIZE || readU32LE(data, 76) !== DDS_PIXELFORMAT_SIZE) return null;
+    const height = readU32LE(data, 12);
+    const width = readU32LE(data, 16);
+    // A garbage/hostile header is just bytes: an extent no D3D9 device could hold is not a
+    // file we describe, it is a create call for gigabytes. D3D9's own cap is 8192.
+    if (width <= 0 || height <= 0 || width > MAX_DDS_EXTENT || height > MAX_DDS_EXTENT) return null;
+    const mipMapCount = readU32LE(data, 28);
+    // caps2 separates the three shapes a .dds can hold. An engine picks its loader from the
+    // RESOURCE TYPE d3dx reports back, so answering 2D for a cube map sends it down a branch
+    // that builds a different object than the file describes.
+    const caps2 = readU32LE(data, 112);
+    const isCube = (caps2 & DDSCAPS2_CUBEMAP) !== 0;
+    const isVolume = (caps2 & DDSCAPS2_VOLUME) !== 0;
+    const depthField = readU32LE(data, 24);
+    if (isVolume && depthField > MAX_DDS_EXTENT) return null;
+    const depth = isVolume ? Math.max(1, depthField) : 1;
+    const resourceType = isCube ? D3DRTYPE_CUBETEXTURE : isVolume ? D3DRTYPE_VOLUMETEXTURE : D3DRTYPE_TEXTURE;
+    const pfFlags = readU32LE(data, 80);
+    const fourCC = readU32LE(data, 84);
+    let format = 0;
+    if ((pfFlags & DDPF_FOURCC) !== 0) {
+        format = fourCC === FOURCC_DX10 && data.length >= 148
+            ? dxgiFormatToD3DFormat(readU32LE(data, 128))
+            : ddsFourCCToD3DFormat(fourCC) || numericFourCCFormat(fourCC);
+    } else {
+        // An uncompressed DDS: the masks name the format. Only the spellings a D3D9 title
+        // actually ships are recognised; anything else stays 0 and the caller falls back to
+        // describing what the decode produced.
+        const bpp = readU32LE(data, 88);
+        const aMask = readU32LE(data, 104);
+        if (bpp === 32) format = aMask ? D3DFMT_A8R8G8B8_INFO : D3DFMT_X8R8G8B8_INFO;
+        else if (bpp === 24) format = D3DFMT_R8G8B8_INFO;
+        else if (bpp === 16) format = aMask ? D3DFMT_A1R5G5B5_INFO : D3DFMT_R5G6B5_INFO;
+    }
+    if (!format) return null;
+    // Where the surface bytes begin: past the 124-byte header, past the DX10 extension, and
+    // past an 8-bit palette when the file carries one.
+    let dataOffset = 128;
+    if (fourCC === FOURCC_DX10 && (pfFlags & DDPF_FOURCC) !== 0) dataOffset = 148;
+    else if ((pfFlags & DDPF_PALETTEINDEXED8) !== 0) dataOffset += 256 * 4;
+    // The header's mip COUNT and the levels the payload actually carries are two different
+    // numbers, and a caller that trusts the first walks off the end of a texture built from
+    // the second. Report what is there.
+    const claimed = Math.max(1, mipMapCount);
+    let present = 0;
+    let at = dataOffset;
+    for (let level = 0; level < claimed; level++) {
+        const layout = getD3DTextureLayout(format, Math.max(1, width >>> level), Math.max(1, height >>> level));
+        if (at + layout.bytes > data.length) break;
+        at += layout.bytes;
+        present++;
+    }
+    return {
+        width, height, depth,
+        mipLevels: Math.max(1, present), claimedMipLevels: claimed,
+        format, resourceType, dataOffset,
+    };
 }
 
 function decodeDDS(data: Uint8Array): { width: number; height: number; rgba: Uint8Array; mipLevels: number } | null {
