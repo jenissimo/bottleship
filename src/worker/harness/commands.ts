@@ -26,6 +26,7 @@ import { registerSceneCommands } from "./cmds/scene";
 import { registerCodeSceneCommands } from "./cmds/code-scene";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
 import { registerTextureCommands } from "./cmds/textures";
+import { registerGdiCommands } from "./cmds/gdi";
 import { registerGlCommands } from "./cmds/gl";
 import { registerGlideCommands } from "./cmds/glide";
 import { registerFsCommands } from "./cmds/fs";
@@ -78,6 +79,7 @@ export function installHarnessCommands(): void {
     registerCodeSceneCommands(harnessService);
     registerBreakpointCommands(harnessService);
     registerTextureCommands(harnessService);
+    registerGdiCommands(harnessService);
     registerGlCommands(harnessService);
     registerGlideCommands(harnessService);
     registerGpuCommands(harnessService);

@@ -572,6 +572,16 @@ export class GDIContext {
         this.windowClientBacking.delete(hwnd);
     }
 
+    /** Retained client images, for diagnostics: which hwnd has one and over which rect. */
+    listWindowClientBackings(): { hwnd: number; x: number; y: number; w: number; h: number }[] {
+        return [...this.windowClientBacking].map(([hwnd, e]) => ({ hwnd, x: e.x, y: e.y, w: e.w, h: e.h }));
+    }
+
+    /** The retained client image itself — the canvas a restoreWindowClientRect draws from. */
+    getWindowClientBackingCanvas(hwnd: number): OffscreenCanvas | null {
+        return this.windowClientBacking.get(hwnd)?.canvas ?? null;
+    }
+
     /** Scratch RGBA buffer reused by drawBgraToOverlayRect. */
     private overlayBgraScratch: Uint8Array | null = null;
     private overlayFrameCanvas: OffscreenCanvas | null = null;

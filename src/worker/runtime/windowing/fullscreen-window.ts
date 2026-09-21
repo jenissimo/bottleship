@@ -19,6 +19,7 @@ import { windows as sharedWindows } from "../../modules/user32/shared-state";
 import { activateTopLevelWindow } from "../../modules/user32/activation-messages";
 
 const WM_SIZE = 0x0005;
+const WM_SHOWWINDOW = 0x0018;
 const SIZE_RESTORED = 0;
 const WS_VISIBLE = 0x10000000;
 const WS_CHILD = 0x40000000;
@@ -135,6 +136,13 @@ function showFullscreenWindow(hwnd: number, source: string): void {
 
     system.windowManager?.setWindowZOrder(hwnd, HWND_TOP);
     activateTopLevelWindow(hwnd);
+
+    // A hidden->visible transition owes the window WM_SHOWWINDOW(TRUE) — SetWindowPos with
+    // SWP_SHOWWINDOW sends it, so a mode-set that shows the window must too. Apps hang real
+    // work off it: HL's launcher loads the menu's background DIB and button strip in
+    // OnShowWindow(bShow=TRUE), and without the message the menu paints on bare black.
+    system.windowManager?.postMessage(hwnd, WM_SHOWWINDOW, 1, 0);
+
     Logger.log(LogCategory.SYSTEM,
         `${source}: fullscreen mode-set shows hwnd=0x${hwnd.toString(16)}`);
 }

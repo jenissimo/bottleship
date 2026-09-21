@@ -313,6 +313,12 @@ export class HarnessChain {
     textures(): this { return this.push("textures", []); }
     dumpTexture(sel: string | { stage: number }): this { return this.push("dumpTexture", [sel]); }
     dumpSurface(sel: string): this { return this.push("dumpSurface", [sel]); }
+    /** WHICH GDI surface holds what: every live DC, every retained window-client image and
+     *  the overlay, each with an opaque/non-black/luma summary. An all-black surface is then
+     *  a measurement rather than a deduction about DC topology. */
+    gdiDcs(opts?: { pixels?: boolean }): this { return this.push("gdiDcs", [opts]); }
+    /** One GDI surface as a PNG: "dc:<hdc>" | "client:<hwnd>" | "bitmap:<hbitmap>" | "overlay". */
+    gdiDump(sel: string, save?: string): this { return this.push("gdiDump", [sel, save]); }
     /** DDraw composition-op ring: `{arm:N}` to record the next N Blt/BltFast/Flip/Load/fill ops,
      *  then call again with no argument to take them. `alpha:true` adds a per-op ARGB1555
      *  alpha-bit census of source and destination — that pair is what names the op that
