@@ -196,6 +196,32 @@ export function registerFsCommands(svc: HarnessService): void {
         return { flushed: true };
     });
 
+    /** fsFlushHealth({timeoutMs?}) — does the teardown barrier still SETTLE, and which
+     *  paths are holding it?
+     *
+     *  flushAll is awaited by child-process exit, guest exit and session switch, and a
+     *  commit that cannot finish stalls all three with no error and no timeout. From the
+     *  outside that is indistinguishable from a busy guest: the game simply never moves
+     *  on. `settles:false` names it in one call, and `pending` names the file — which is
+     *  the whole diagnosis, because the stuck path is the one the guest is rewriting. */
+    svc.register("fsFlushHealth", async (args) => {
+        const timeoutMs = Number((args[0] as { timeoutMs?: number })?.timeoutMs ?? 5000);
+        const overlay = vfs().overlay;
+        if (!overlay) return { overlay: false, settles: true, pending: [], writers: [], committing: [] };
+        const snapshot = {
+            overlay: true,
+            pending: [...overlay.pendingFlushes.keys()],
+            writers: [...overlay.writerCache.keys()],
+            committing: [...(overlay.committingPaths ?? [])],
+            syncHandles: [...overlay.syncHandleCache.keys()],
+        };
+        const settles = await Promise.race([
+            vfs().flushAll().then(() => true, () => true),
+            new Promise<boolean>((r) => setTimeout(() => r(false), timeoutMs)),
+        ]);
+        return { ...snapshot, settles, timeoutMs };
+    });
+
     /** watchFiles(on?) — enable/disable the fileWritten event (off by default; the
      *  guest write path is hot). */
     svc.register("watchFiles", (args) => {

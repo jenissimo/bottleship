@@ -2389,6 +2389,14 @@ class OpfsOverlay {
      */
     private pendingFlushes = new Map<string, Promise<void>>();
     /**
+     * Paths whose pendingFlushes commit is currently ON THE STACK. That commit awaits the
+     * entry's flushInFlight, which reaches ensureWriter — whose lock-conflict recovery
+     * awaits pendingFlushes for the same path. Awaiting it there closes a cycle onto the
+     * caller, and the path's whole commit chain (and with it flushAll, the teardown
+     * barrier every child-process and guest exit runs through) never settles again.
+     */
+    private committingPaths = new Set<string>();
+    /**
      * In-memory authoritative content for overlay files written this session. OPFS
      * exposes WritableFileStream and FileSystemSyncAccessHandle as mutually-exclusive,
      * and a guest's write→close→reopen→read happens far faster than the async OPFS
@@ -3192,7 +3200,9 @@ class OpfsOverlay {
         } catch (e) {
             if ((e as { name?: string })?.name !== "NoModificationAllowedError") throw e;
             const key = toKey(entry.path);
-            const pending = this.pendingFlushes.get(key);
+            // Only a commit we are NOT part of can still settle; the one that is awaiting
+            // this call cannot, and awaiting it wedges the path's chain permanently.
+            const pending = this.committingPaths.has(key) ? undefined : this.pendingFlushes.get(key);
             if (pending) { try { await pending; } catch { /* its owner logs it */ } }
             // A sync-handle open still in flight holds the same exclusive lock and is
             // invisible to closeSyncHandle (which only bumps the revocation counter for
@@ -3334,54 +3344,59 @@ class OpfsOverlay {
             if (prev) { try { await prev; } catch { /* ignore */ } }
             if (this.writerCache.get(key) !== cacheEntry) return; // superseded by a newer writer
 
-            if (cacheEntry.flushTimer !== null) {
-                clearTimeout(cacheEntry.flushTimer);
-                cacheEntry.flushTimer = null;
-            }
-            if (cacheEntry.flushInFlight) {
-                try {
-                    await cacheEntry.flushInFlight;
-                } catch (e) {
-                    Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") in-flight buffer flush failed: ${e}`);
-                }
-            }
-
-            const pending = cacheEntry.memoryBuffer;
-            const pendingOffset = cacheEntry.bufferOffset;
-            const replace = cacheEntry.replaceExisting;
-
-            // Drop the entry up front: ensureSyncHandle() refuses while a writer entry
-            // exists, and removing it lets the post-commit reader open a fresh sync handle.
-            this.writerCache.delete(key);
-
+            this.committingPaths.add(key);
             try {
-                if (cacheEntry.writer) {
-                    // A WritableFileStream was already opened for this file — finish through
-                    // it (it holds the exclusive lock) and close so the file is committed.
-                    if (pending.length > 0) {
-                        await cacheEntry.writer.seek(pendingOffset);
-                        // SAB-backed: cast at DOM boundary
-                        const exact = pending.byteOffset === 0 && pending.length === pending.buffer.byteLength
-                            ? pending.buffer
-                            : new Uint8Array(pending);
-                        await cacheEntry.writer.write(exact as unknown as FileSystemWriteChunkType);
-                    }
-                    await cacheEntry.queue;
-                    await cacheEntry.writer.close();
-                } else if (pending.length > 0) {
-                    // Lazy case (the common one): commit synchronously via a sync access
-                    // handle. createSyncAccessHandle requires the file to exist, so create it.
-                    // Reads are served from contentCache regardless, so a failure here only
-                    // costs cross-session persistence, not in-session read-after-write.
-                    const sh = await this.ensureSyncHandle(path, true);
-                    if (sh) {
-                        if (replace) sh.truncate(pendingOffset + pending.length);
-                        sh.write(pending, { at: pendingOffset });
-                        sh.flush();
+                if (cacheEntry.flushTimer !== null) {
+                    clearTimeout(cacheEntry.flushTimer);
+                    cacheEntry.flushTimer = null;
+                }
+                if (cacheEntry.flushInFlight) {
+                    try {
+                        await cacheEntry.flushInFlight;
+                    } catch (e) {
+                        Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") in-flight buffer flush failed: ${e}`);
                     }
                 }
-            } catch (e) {
-                Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") commit failed: ${e}`);
+
+                const pending = cacheEntry.memoryBuffer;
+                const pendingOffset = cacheEntry.bufferOffset;
+                const replace = cacheEntry.replaceExisting;
+
+                // Drop the entry up front: ensureSyncHandle() refuses while a writer entry
+                // exists, and removing it lets the post-commit reader open a fresh sync handle.
+                this.writerCache.delete(key);
+
+                try {
+                    if (cacheEntry.writer) {
+                        // A WritableFileStream was already opened for this file — finish through
+                        // it (it holds the exclusive lock) and close so the file is committed.
+                        if (pending.length > 0) {
+                            await cacheEntry.writer.seek(pendingOffset);
+                            // SAB-backed: cast at DOM boundary
+                            const exact = pending.byteOffset === 0 && pending.length === pending.buffer.byteLength
+                                ? pending.buffer
+                                : new Uint8Array(pending);
+                            await cacheEntry.writer.write(exact as unknown as FileSystemWriteChunkType);
+                        }
+                        await cacheEntry.queue;
+                        await cacheEntry.writer.close();
+                    } else if (pending.length > 0) {
+                        // Lazy case (the common one): commit synchronously via a sync access
+                        // handle. createSyncAccessHandle requires the file to exist, so create it.
+                        // Reads are served from contentCache regardless, so a failure here only
+                        // costs cross-session persistence, not in-session read-after-write.
+                        const sh = await this.ensureSyncHandle(path, true);
+                        if (sh) {
+                            if (replace) sh.truncate(pendingOffset + pending.length);
+                            sh.write(pending, { at: pendingOffset });
+                            sh.flush();
+                        }
+                    }
+                } catch (e) {
+                    Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") commit failed: ${e}`);
+                }
+            } finally {
+                this.committingPaths.delete(key);
             }
         })();
 

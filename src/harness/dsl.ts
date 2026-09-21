@@ -513,6 +513,9 @@ export class HarnessChain {
     fsList(path: string): this { return this.push("fsList", [path]); }
     fsStat(path: string): this { return this.push("fsStat", [path]); }
     fsFlush(): this { return this.push("fsFlush", []); }
+    /** Does flushAll still settle, and which path is holding it? A stuck commit stalls
+     *  child-process/guest exit silently, and reads from outside as a busy guest. */
+    fsFlushHealth(opts?: { timeoutMs?: number }): this { return this.pushTimed("fsFlushHealth", [opts], (opts?.timeoutMs ?? 5000) + 10_000); }
     regGet(root: string, key: string, value?: string): this { return this.push("regGet", [root, key, value]); }
 
     // ── OPFS container fixtures (keyed by container; usable before a bundle loads) ──
