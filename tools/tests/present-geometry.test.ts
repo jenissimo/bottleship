@@ -85,10 +85,20 @@ const CASES: Case[] = [
         expect: { x: 20, y: 50, w: 960, h: 600 },
     },
     {
-        name: "canvas SMALLER than the guest still scales 1 (picture overhangs)",
+        // No whole-number step fits, so integer must FIT rather than overscan: presenting
+        // the source at its own size inside a smaller target crops every edge.
+        name: "canvas SMALLER than the source fits instead of overhanging",
         quality: q({ aspectMode: "integer", integerScale: false }),
         srcW: 640, srcH: 480, outW: 320, outH: 240,
-        expect: { x: -160, y: -120, w: 640, h: 480 },
+        expect: { x: 0, y: 0, w: 320, h: 240 },
+    },
+    {
+        // The supersampled case: Auto renders above the canvas, so the presented texture is
+        // routinely larger than the target. Integer has nothing to add and must not crop.
+        name: "a supersampled offscreen is fitted, not centre-cropped",
+        quality: q({ aspectMode: "integer", integerScale: false }),
+        srcW: 2064, srcH: 1548, outW: 1032, outH: 774,
+        expect: { x: 0, y: 0, w: 1032, h: 774 },
     },
 ];
 

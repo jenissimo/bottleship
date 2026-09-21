@@ -14,13 +14,25 @@
  *     regardless of canvas size. The compatibility/low-power fallback: predictable cost,
  *     and an escape hatch if a title's own post-process (LFB reads, screen-space effects)
  *     turns out to assume the render target IS the logical resolution.
- *   - 0 ("Auto", the default): follow the canvas's own physical-pixel size instead of a
- *     fixed multiplier, so the internal target is only ever as big as the display can
- *     actually show, and tracks the window/DPI as they change. Without this, "internal
- *     resolution" and "presentation resolution" are two unrelated numbers: a fixed-size
- *     render permanently downsamples into a differently-sized canvas, which reads as
- *     cleaner edges but never as MORE resolution — the gap Auto closes.
+ *   - 0 ("Auto", the default): follow the canvas's own physical-pixel size AND supersample
+ *     on top of it, so the picture tracks the window/DPI instead of a fixed multiplier that
+ *     is too small on a large display and wasted on a small one. Fitting alone is not
+ *     enough: it makes the render target exactly the present target, one rendered sample
+ *     per presented pixel, so there is nothing to resolve and edges stay aliased — which
+ *     reads as the final picture being scaled rather than as a detailed one. Auto therefore
+ *     fits AND multiplies, and the present pass resolves back down.
  */
+
+/**
+ * Samples per presented pixel, per axis, that "Auto" asks for on top of the canvas fit.
+ * 2 is the whole useful range here: it costs 4x the pixels for the edge quality a 1x fit
+ * cannot produce at all, while the MAX_SCALE ceiling keeps that bounded on the guest
+ * modes where the fit is already large.
+ */
+const AUTO_SUPERSAMPLE = 2;
+
+/** Ceiling for every regime — past this, cost (factor squared) outruns what a display shows. */
+const MAX_SCALE = 4;
 
 /**
  * The single uniform scale factor to render `guestWidth x guestHeight` at, given the
@@ -41,18 +53,19 @@ export function resolveInternalScaleFactor(
 ): number {
     const n = Number(internalScaleSetting);
     if (Number.isFinite(n) && n >= 2) {
-        return Math.max(1, Math.min(4, Math.round(n)));
+        return Math.max(1, Math.min(MAX_SCALE, Math.round(n)));
     }
     // Native (1): exact guest resolution, no auto-fit — an explicit request, not a fallback.
     if (n === 1) return 1;
     // 0 ("Auto") and any other degenerate/unrecognized value fail safe to auto-fit rather
     // than to a silent no-op, matching DEFAULT_QUALITY.internalScale (0).
-    if (guestWidth <= 0 || guestHeight <= 0 || canvasWidth <= 0 || canvasHeight <= 0) return 1;
+    // Written as a POSITIVE test so a NaN extent fails it: `NaN <= 0` is false, and a NaN
+    // fit propagates through both clamps to a NaN scale, which sizes a texture to nothing.
+    if (!(guestWidth > 0) || !(guestHeight > 0) || !(canvasWidth > 0) || !(canvasHeight > 0)) return 1;
     const fit = Math.min(canvasWidth / guestWidth, canvasHeight / guestHeight);
     // Never below 1x — auto only ADDS resolution; a canvas transiently smaller than the
     // guest mode (e.g. before host CSS layout has settled after a resize) must not blur the
-    // picture below what the game itself asked for. Capped at 4x to match the
-    // explicit-multiplier ceiling: past that, GPU cost (factor² pixels) outruns any benefit
-    // a display can actually show.
-    return Math.max(1, Math.min(4, fit));
+    // picture below what the game itself asked for. The supersample rides on the FIT, not on
+    // the guest mode, so one setting behaves the same way on every window size.
+    return Math.max(1, Math.min(MAX_SCALE, fit * AUTO_SUPERSAMPLE));
 }

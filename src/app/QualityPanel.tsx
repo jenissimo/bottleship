@@ -107,9 +107,9 @@ export default function QualityPanel({ quality, onChange, unsupported, overridde
             value={quality.aspectMode}
             onChange={(e) => onChange({ aspectMode: e.target.value as QualityConfig["aspectMode"] })}
           >
-            <option value="stretch">Stretch (fill)</option>
             <option value="pillarbox">Pillarbox (preserve AR)</option>
             <option value="integer">Integer (pixel-perfect)</option>
+            <option value="stretch">Stretch (fill, distorts)</option>
           </select>
         </label>
         <label className={s["settings-row"]}>

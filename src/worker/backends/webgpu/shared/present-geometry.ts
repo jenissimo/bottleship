@@ -19,12 +19,12 @@ export interface PresentRect { x: number; y: number; w: number; h: number; }
  * that must stay allocation- and branch-free).
  *
  * `srcW/srcH` are the PRESENTED TEXTURE's extent, which is the guest's own only at
- * internalScale Native — every backend that supersamples (Glide, D3D9) presents its
- * physical offscreen. Aspect ratio is unaffected (the scale is uniform), but integer
- * scaling is: an offscreen already fitted to the canvas floors to 1, so `integerScale`
- * quietly does nothing above Native. One rule for both backends, deliberately — a second
- * policy measuring the guest extent here would make the two disagree about where the same
- * picture lands, and every overlay is placed in this rect.
+ * internalScale Native — every backend that supersamples presents its physical offscreen.
+ * Aspect ratio is unaffected (the scale is uniform), but integer scaling is: there is no
+ * whole-number step that fits a supersampled offscreen into the canvas, so `integerScale`
+ * quietly does nothing above Native and the picture is fitted instead. One rule for both
+ * backends, deliberately — a second policy measuring the guest extent here would make the
+ * two disagree about where the same picture lands, and every overlay is placed in this rect.
  */
 export function computePresentDestRect(
     srcW: number, srcH: number, outW: number, outH: number, q: QualityConfig,
@@ -33,9 +33,15 @@ export function computePresentDestRect(
     if (q.aspectMode === "stretch" && !q.integerScale) return null;
 
     if (q.integerScale || q.aspectMode === "integer") {
-        const scale = Math.max(1, Math.floor(Math.min(outW / srcW, outH / srcH)));
-        const w = srcW * scale, h = srcH * scale;
-        return { x: Math.floor((outW - w) / 2), y: Math.floor((outH - h) / 2), w, h };
+        // Only when a whole-number step actually fits. A supersampled offscreen is LARGER
+        // than the canvas, where the floor is 0: forcing it to 1 would present the texture
+        // at its own size inside a smaller target, i.e. centre-crop the picture at every
+        // edge. "Does nothing above Native" has to mean fit, not overscan.
+        const scale = Math.floor(Math.min(outW / srcW, outH / srcH));
+        if (scale >= 1) {
+            const w = srcW * scale, h = srcH * scale;
+            return { x: Math.floor((outW - w) / 2), y: Math.floor((outH - h) / 2), w, h };
+        }
     }
     // pillarbox: preserve source AR, fit inside output.
     const ar = srcW / srcH;

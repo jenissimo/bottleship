@@ -197,8 +197,10 @@ export function parseStoredQuality(raw: string | null | undefined): QualityConfi
         return { ...DEFAULT_QUALITY };
     }
     if (!parsed || typeof parsed !== "object") return { ...DEFAULT_QUALITY };
-    if (parsed.schema !== QUALITY_SCHEMA && parsed.internalScale === 1) {
-        delete parsed.internalScale;
-    }
+    // Each migration is scoped to the version that introduced it: a later bump must not
+    // re-run an earlier one over a value that HAS since been chosen deliberately.
+    const stored = Number(parsed.schema);
+    const schema = Number.isFinite(stored) ? stored : 0;
+    if (schema < 2 && parsed.internalScale === 1) delete parsed.internalScale;
     return mergeQuality(DEFAULT_QUALITY, parsed);
 }

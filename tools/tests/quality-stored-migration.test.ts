@@ -47,6 +47,22 @@ describe("parseStoredQuality", () => {
         expect("schema" in out).toBe(false);
     });
 
+    test("a stored aspectMode is carried forward, whatever it is", () => {
+        // Stretch is the default again, so no migration may touch aspectMode: every stored
+        // value is the user's, and a fit mode is chosen per display, not per schema.
+        for (const mode of ["stretch", "pillarbox", "integer"] as const) {
+            const stored = JSON.stringify({ ...DEFAULT_QUALITY, aspectMode: mode, schema: 1 });
+            expect(parseStoredQuality(stored).aspectMode).toBe(mode);
+        }
+    });
+
+    test("a later bump does not re-run an earlier migration", () => {
+        // A schema-2 blob's internalScale:1 IS the deliberate Native the schema-2 marker
+        // records; only a blob older than 2 can have inherited it as the inert default.
+        const stored = JSON.stringify({ ...DEFAULT_QUALITY, internalScale: 1, schema: 2 });
+        expect(parseStoredQuality(stored).internalScale).toBe(1);
+    });
+
     test("junk, empty and absent storage all fall back to the defaults", () => {
         for (const raw of [null, undefined, "", "not json", "[]", '"a string"', "null", "7"]) {
             expect(parseStoredQuality(raw)).toEqual(DEFAULT_QUALITY);
