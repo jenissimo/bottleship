@@ -166,6 +166,27 @@ function generateVolumeMips(texturePtr: number, filter: number): number {
     return D3D_OK;
 }
 
+type VolumeTextureFactory = (
+    devicePtr: number, width: number, height: number, depth: number,
+    levels: number, usage: number, format: number, pool: number, ppTexture: number,
+) => number;
+
+/** Bound when the d3d9 volume exports are built; D3DX's loader goes through it. */
+let volumeTextureFactory: VolumeTextureFactory | null = null;
+
+/**
+ * Create a volume texture the same way IDirect3DDevice9::CreateVolumeTexture does.
+ * Answers D3DERR_INVALIDCALL before the d3d9 exports exist rather than a half-built object.
+ */
+export function createGuestVolumeTexture(
+    devicePtr: number, width: number, height: number, depth: number,
+    levels: number, usage: number, format: number, pool: number, ppTexture: number,
+): number {
+    return volumeTextureFactory
+        ? volumeTextureFactory(devicePtr, width, height, depth, levels, usage, format, pool, ppTexture)
+        : 0x8876086c;
+}
+
 export function createVolumeExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     const baseTextureState = new Map<number, { lod: number; autoGenFilterType: number }>();
@@ -263,17 +284,22 @@ export function createVolumeExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    exports['IDirect3DDevice9_CreateVolumeTexture'] = (_ctx, _mem, args) => {
-        const pDevice = args[0] >>> 0;
-        const width = args[1] >>> 0;
-        const height = args[2] >>> 0;
-        const depth = args[3] >>> 0;
-        const requestedLevels = args[4] >>> 0;
-        const usage = args[5] >>> 0;
-        const format = args[6] >>> 0;
-        const pool = args[7] >>> 0;
-        const ppTexture = args[8] >>> 0;
-
+    /**
+     * The ONE volume-texture constructor. D3DX's volume loader needs exactly this object — the
+     * COM wrapper, the per-level buffers, the device registration and every finalizer — so it
+     * calls in here rather than grow a second, subtly different one.
+     */
+    const createVolumeTexture = (
+        pDevice: number,
+        width: number,
+        height: number,
+        depth: number,
+        requestedLevels: number,
+        usage: number,
+        format: number,
+        pool: number,
+        ppTexture: number,
+    ): number => {
         if (!ppTexture) return D3DERR_INVALIDCALL;
         initReturnPtr(ppTexture);
         if (!isValidTextureUsagePool(usage, pool)) return D3DERR_INVALIDCALL;
@@ -345,6 +371,13 @@ export function createVolumeExports(): Record<string, ThunkImplementation> {
         }
         return D3D_OK;
     };
+
+    volumeTextureFactory = createVolumeTexture;
+
+    exports['IDirect3DDevice9_CreateVolumeTexture'] = (_ctx, _mem, args) => createVolumeTexture(
+        args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0,
+        args[4] >>> 0, args[5] >>> 0, args[6] >>> 0, args[7] >>> 0, args[8] >>> 0,
+    );
 
     exports['IDirect3DVolumeTexture9_GetDevice'] = resourceGetDevice;
     exports['IDirect3DVolume9_GetDevice'] = resourceGetDevice;

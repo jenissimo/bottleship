@@ -24,6 +24,7 @@
  */
 
 import { Mem } from '../../core/memory/mem-accessor';
+import { invalidateResourceId, resetResourceIds } from './resource-ids';
 
 /**
  * Guest-block offset of the authoritative refcount. Offset 0 is the vtable
@@ -138,9 +139,17 @@ function storeCount(key: number, next: number): void {
     if (guestStoreLive) writeGuestCount(key, next);
 }
 
+/**
+ * The ONE place an object stops existing — `releaseComRef`'s 1->0 transition and
+ * `forgetComObject` both land here, and the guest-side Release stub declines at a count of 1, so
+ * no destruction bypasses it. That is why the pointer->id invalidation lives here and not at the
+ * six call sites: the block is about to be recyclable, and an id table still naming it would
+ * dispatch into whoever takes the block next.
+ */
 function dropCount(key: number): void {
     comRefCounts.delete(key);
     if (guestStoreLive) writeGuestCount(key, 0);
+    invalidateResourceId(key);
 }
 
 /**
@@ -326,4 +335,6 @@ export function drainComFinalizers(): void {
     if (guestStoreLive) for (const key of comRefCounts.keys()) writeGuestCount(key, 0);
     comRefCounts.clear();
     comDisposers.clear();
+    // Every object just ceased to exist without passing through dropCount.
+    resetResourceIds();
 }

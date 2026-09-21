@@ -116,6 +116,11 @@ export type CapturedDrawCall = {
      *  what decides whether it is visible. `alphalessFormat` says whether the sampled alpha is
      *  the texture's own or the 1.0 we substitute for formats that carry none. */
     stages?: Array<Record<string, number | string | boolean | null>>;
+    /** Every BOUND sampler slot, which for a programmable draw is the only record of what it
+     *  sampled: `stages` walks the fixed-function stage count, and a pixel shader reads
+     *  samplers 0..15 no matter what that count is. Each row carries the guest handle, so it
+     *  leads straight to dumpTexture. */
+    samplers?: Array<Record<string, number | string | boolean | null>>;
     /** The operands FFP lighting computes from — material, light count, ambient, and the
      *  RESOLVED colour sources. For a mesh whose FVF carries no vertex colour these are the
      *  only source of its colour, so "black" is decidable here and nowhere else. */

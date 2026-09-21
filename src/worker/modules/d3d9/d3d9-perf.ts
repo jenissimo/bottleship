@@ -5,6 +5,7 @@
 import {
     getDxFormatSupportCensus,
     resetDxFormatSupportCensus,
+    getDxCreationRefusals,
 } from "../../backends/webgpu/shared/dx-format-support";
 import { Logger, LogCategory } from "../../core/logger";
 
@@ -20,13 +21,35 @@ export interface D3D9ArenaRunReconcile {
     apiDrawIndexed: number;
     backendDrawIndexed: number;
     apiDrawDelta: number;
+    /**
+     * Indexed API draws that provably never became an encoded drawIndexed AND said so: the
+     * device-side fate ledger (`indexedDrawUnencoded`) plus the executor's own declines. An
+     * indexed draw legitimately leaves this path — a fan is rewound into a non-indexed draw,
+     * a lost device drops the frame — so `apiDrawIndexed === backendDrawIndexed` is the wrong
+     * invariant. The right one is that every difference is NAMED.
+     */
+    apiDrawUnencoded: number;
+    /** apiDrawIndexed - backendDrawIndexed - apiDrawUnencoded. Non-zero means draws went
+     *  missing between the API and the encoder with nothing counting them. Must be 0. */
+    apiDrawUnaccounted: number;
     healthy: boolean;
+}
+
+function sumRecord(src: Record<string, number> | undefined): number {
+    if (!src) return 0;
+    let total = 0;
+    for (const key in src) total += src[key] ?? 0;
+    return total;
 }
 
 export function reconcileD3D9ArenaRuns(
     wbuf: { pairRuns: number; pairs: number },
     api: Record<string, number>,
     backend: Record<string, number>,
+    /** Device-side fates of an indexed API draw that did not reach the encoder, by reason.
+     *  Defaults to this module's live ledger so a caller cannot reconcile against a
+     *  half-supplied one; tests pass their own. */
+    indexedUnencoded: Record<string, number> = indexedDrawUnencoded,
 ): D3D9ArenaRunReconcile {
     const producerRuns = wbuf.pairRuns;
     const executorCommands = backend.arenaRunCommands ?? 0;
@@ -35,16 +58,32 @@ export function reconcileD3D9ArenaRuns(
     const executorExecutedPairs = backend.arenaRunExecutedPairs ?? 0;
     const apiDrawIndexed = api.drawIndexedPrimitive ?? 0;
     const backendDrawIndexed = backend.drawIndexedCalls ?? 0;
+    // Pairs a discarded/aborted frame never handed to the encoder. They were recorded (so the
+    // producer counted them) and never expected (execute() returned first), which is the one
+    // way the pair identity can break without a single run misbehaving.
+    const discardedPairs = backend.arenaRunPairsFrameDiscarded ?? 0;
     const runDelta = executorCommands - producerRuns;
-    const expectedDelta = executorExpectedPairs - producerPairs;
+    const expectedDelta = executorExpectedPairs + discardedPairs - producerPairs;
     const executedDelta = executorExecutedPairs - executorExpectedPairs;
     const apiDrawDelta = backendDrawIndexed - apiDrawIndexed;
+    // An arena run whose command was seen but whose pairs were not all encoded reports the
+    // shortfall itself; it is the same lost work expressed in logical draws.
+    const arenaLogicalShortfall = Math.max(0,
+        (backend.arenaRunExpectedLogicalDraws ?? 0) - (backend.arenaRunEncodedLogicalDraws ?? 0));
+    const apiDrawUnencoded = sumRecord(indexedUnencoded)
+        + (backend.drawIndexedSkippedNoPipeline ?? 0)
+        + (backend.drawIndexedSkippedValidator ?? 0)
+        + (backend.drawIndexedFrameDiscarded ?? 0)
+        + arenaLogicalShortfall;
+    const apiDrawUnaccounted = apiDrawIndexed - backendDrawIndexed - apiDrawUnencoded;
     return {
         producerRuns, executorCommands, runDelta,
         producerPairs, executorExpectedPairs, executorExecutedPairs,
         expectedDelta, executedDelta,
         apiDrawIndexed, backendDrawIndexed, apiDrawDelta,
-        healthy: runDelta === 0 && expectedDelta === 0 && executedDelta === 0 && apiDrawDelta === 0,
+        apiDrawUnencoded, apiDrawUnaccounted,
+        healthy: runDelta === 0 && expectedDelta === 0 && executedDelta === 0
+            && apiDrawUnaccounted === 0,
     };
 }
 
@@ -57,6 +96,14 @@ export interface D3D9PerfSnapshot {
     droppedDraws: Record<string, number>;
     /** Batched counter increments refused as out-of-domain. Empty is the healthy state. */
     counterRejections: Record<string, number>;
+    /**
+     * Fate of every indexed API draw that did NOT produce an encoded indexed draw, by reason.
+     * `apiDrawIndexed - backendDrawIndexed` is not a defect on its own — the device rewinds a
+     * fan into a non-indexed draw, drops a draw it cannot represent, or loses a frame with the
+     * GPU device — but an UNNAMED difference is. `unclassified` is the honest bucket: it means
+     * this ledger itself failed to attribute the draw, and is never 0 by construction.
+     */
+    indexedDrawUnencoded: Record<string, number>;
     /** Query lifecycle ledger; filled by dbg.d3d9Perf from the query module + managers. */
     queries?: Record<string, number> | null;
     /**
@@ -69,8 +116,20 @@ export interface D3D9PerfSnapshot {
     resetRefusals: Record<string, number>;
     /** FFP state a draw needed and the shader does not implement. Empty is the healthy state. */
     ffpUnimplemented: Record<string, number>;
+    /** Fixed-function pipelines BUILT, keyed by the sampler dimensions their shader declared
+     *  ("2d" / "cube:<mask>"). The counterpart to ffpUnimplemented's cubeTextureStage*: a
+     *  scene with env-mapping and no cube pipelines here never reached the cube path, and
+     *  nothing else distinguishes that from a scene that simply binds no cube. */
+    ffpSamplerDims: Record<string, number>;
+    /** SetTexture outcome census — see d3d9NoteTextureBind. */
+    textureBindOutcome: Record<string, number>;
     /** FFP state the shader lowers deliberately but without a native WebGPU equivalent. */
     approximated: Record<string, number>;
+    /** Resource CONSTRUCTORS that refused a format, keyed `${reason}:${format}`. The other
+     *  half of formatSupport: that one says what we declined to advertise, this says what we
+     *  declined to build. A non-empty entry whose format the query ADVERTISES is a lie the
+     *  caller cannot detect — it holds a NULL resource. Empty is the healthy state. */
+    creationRefusals: Record<string, number>;
     /** FourCC capability probes refused because no decoder/storage path is shipped. */
     formatSupport: {
         refusedFormat: Record<string, number>;
@@ -214,6 +273,7 @@ const BACKEND_KEYS = [
     "pipelineSets",
     "bindGroupSets",
     "bindGroupSetSkips",
+    "bindGroupSetSameGroup",
     "bindGroupCacheHits",
     "bindGroupBuilds",
     "progConstWrites",
@@ -238,6 +298,9 @@ const BACKEND_KEYS = [
     "batchRunsGe4",
     // Draws where only the shader constants differ from the previous draw.
     "captureConstOnly",
+    "captureConstOnlyHits",
+    "captureConstOnlyChecked",
+    "captureConstOnlyMismatch",
     // Stage-window resolution: a miss re-resolves 16 texture views and 16 samplers for a bank
     // in which typically one stage changed. Hits/misses size that loop independently of the
     // constant copy the capture memo also covers.
@@ -298,8 +361,36 @@ const skip: Record<SkipKey, number> = {
 /** reason -> count; keys are free-form so a new early-out needs no schema edit. */
 const droppedDraws: Record<string, number> = {};
 
+/**
+ * What each SetTexture actually DID: "bound" (a new texture reached the stage), "redundant"
+ * (already there), "unbound" (the guest passed NULL), "unknownPointer" (a pointer this store
+ * does not know — the stage is unbound and the call fails).
+ *
+ * `skip.setTexture` collapses the last three into one number, and a title binding nothing at
+ * all then looks exactly like one binding efficiently: RA3 reported 160 096 calls and 160 096
+ * skips, which is either perfect redundancy elision or a renderer sampling no textures, and
+ * nothing in the census could say which.
+ */
+const textureBindOutcome: Record<string, number> = {};
+
+export function d3d9NoteTextureBind(outcome: "bound" | "redundant" | "unbound" | "unknownPointer"): void {
+    textureBindOutcome[outcome] = (textureBindOutcome[outcome] ?? 0) + 1;
+}
+
 /** API key -> refused batched increments (non-integer/negative counts). Empty is healthy. */
 const counterRejections: Record<string, number> = {};
+
+/** reason -> indexed API draws that never became an encoded indexed draw. See the snapshot. */
+const indexedDrawUnencoded: Record<string, number> = {};
+
+export function d3d9NoteIndexedDrawUnencoded(reason: string, count = 1): void {
+    if (!Number.isSafeInteger(count) || count < 0) {
+        counterRejections[`indexedDrawUnencoded:${reason}`] =
+            (counterRejections[`indexedDrawUnencoded:${reason}`] ?? 0) + 1;
+        return;
+    }
+    indexedDrawUnencoded[reason] = (indexedDrawUnencoded[reason] ?? 0) + count;
+}
 
 /**
  * FFP state a draw ASKED for that the D3D9 fixed-function shader does not implement.
@@ -311,6 +402,14 @@ const ffpUnimplemented: Record<string, number> = {};
 
 export function d3d9PerfFfpUnimplemented(feature: string): void {
     ffpUnimplemented[feature] = (ffpUnimplemented[feature] ?? 0) + 1;
+}
+
+/** One FFP pipeline built, named by the sampler dimensions baked into its shader. */
+const ffpSamplerDims: Record<string, number> = {};
+
+export function d3d9NoteFfpSamplerDims(cubeMask: number): void {
+    const key = cubeMask === 0 ? "2d" : `cube:${(cubeMask >>> 0).toString(16)}`;
+    ffpSamplerDims[key] = (ffpSamplerDims[key] ?? 0) + 1;
 }
 
 /** Record shader-side semantic lowerings whose result is intentionally approximate. */
@@ -359,6 +458,7 @@ const backend: Record<BackendKey, number> = {
     pipelineSets: 0,
     bindGroupSets: 0,
     bindGroupSetSkips: 0,
+    bindGroupSetSameGroup: 0,
     bindGroupCacheHits: 0,
     bindGroupBuilds: 0,
     progConstWrites: 0,
@@ -376,6 +476,9 @@ const backend: Record<BackendKey, number> = {
     batchRunDraws: 0,
     batchRunsGe4: 0,
     captureConstOnly: 0,
+    captureConstOnlyHits: 0,
+    captureConstOnlyChecked: 0,
+    captureConstOnlyMismatch: 0,
     stageWindowHits: 0,
     stageWindowMisses: 0,
     stageReuse: 0,
@@ -491,9 +594,15 @@ export function d3d9NoteResetRefusal(reason: string): void {
  *  happens. */
 const warnedDropReasons = new Set<string>();
 
+/** Total drops, in any reason. Lets a caller ask "did a drop happen inside this call?" without
+ *  re-summing the reason map or teaching every early-out site about a second counter. */
+let droppedDrawTotal = 0;
+export function d3d9DroppedDrawTotal(): number { return droppedDrawTotal; }
+
 export function d3d9DropDraw(reason: string): number {
     const seen = (droppedDraws[reason] ?? 0) + 1;
     droppedDraws[reason] = seen;
+    droppedDrawTotal++;
     if (!warnedDropReasons.has(reason)) {
         warnedDropReasons.add(reason);
         Logger.warn(LogCategory.D3D9,
@@ -576,16 +685,289 @@ export function d3d9PerfBackendAdd(key: BackendKey, count: number): void {
     backend[key] += count;
 }
 
+/* ── Render-boundary census (render-worker plan §8.0, censuses A and C) ────────────────
+ *
+ * Two quantities the existing counters cannot answer, both needed BEFORE the render-worker
+ * is built: how often a GPU round trip parks the guest per presented frame, and how many
+ * dirty bytes cross to the GPU per frame. Both are per-FRAME questions — a session total
+ * hides the shape, and the shape is what the stop condition is about — so the counts live
+ * in a ring indexed by present boundary, not in scalars.
+ *
+ * The ledger is leaf: it records, it never judges. Every refusal and every ratio lives in
+ * harness/cmds/render-boundary.ts, where it is a pure function with a test.
+ */
+
+/** A GPU round trip that PARKS the guest thread (CLAUDE.md §3.5). A non-blocking pump (the
+ *  glide mirror) is deliberately not in this list: merging the two makes a per-present
+ *  fence budget unfalsifiable. */
+export const RENDER_FENCE_KINDS = [
+    "presentPermit",
+    "textureReadback",
+    "backbufferReadback",
+    "rtRgbaReadback",
+    "queryBatch",
+] as const;
+export type RenderFenceKind = typeof RENDER_FENCE_KINDS[number];
+
+/**
+ * Dirty bytes by kind, split on the one axis the plan's §5 cost model turns on: whether the
+ * bytes were ALREADY staged into a per-frame copy before reaching the queue. The recorder's
+ * queueUpload already copies (render-frame.ts), so for that class an off-thread staging copy
+ * is zero marginal cost; a direct write out of the shadow buffer is where §5 would add one.
+ */
+export const STAGED_BYTE_KINDS = [
+    "vertexIndexCopied",
+    "vertexIndexDirect",
+    "texture",
+    "constants",
+] as const;
+export type StagedByteKind = typeof STAGED_BYTE_KINDS[number];
+
+const RB_RING = 512;
+const RB_F = RENDER_FENCE_KINDS.length;
+const RB_B = STAGED_BYTE_KINDS.length;
+const RB_STRIDE = RB_F + RB_B;
+
+const rbFenceIdx: Record<string, number> = {};
+RENDER_FENCE_KINDS.forEach((k, i) => { rbFenceIdx[k] = i; });
+const rbByteIdx: Record<string, number> = {};
+STAGED_BYTE_KINDS.forEach((k, i) => { rbByteIdx[k] = RB_F + i; });
+
+const rbRing = new Float64Array(RB_RING * RB_STRIDE);
+const rbRingSerial = new Float64Array(RB_RING);
+const rbTotals = new Float64Array(RB_STRIDE);
+/** Slot accumulating the frame that has not reached its present boundary yet. */
+let rbSlot = 0;
+/** Present boundaries seen since the last reset. Frames older than RB_RING are gone from the
+ *  ring but still in rbTotals, which is what lets the report say a distribution is partial
+ *  instead of quietly describing the tail as the whole window. */
+let rbFrames = 0;
+let rbQueriesServed = 0;
+let rbEpoch = 0;
+let rbLedgerBytes = 0;
+let rbLedgerWrites = 0;
+let rbQueueBytes = 0;
+let rbQueueWrites = 0;
+let rbAuditArmed = false;
+
+type QueueWriteFn = (...args: never[]) => unknown;
+let rbPatchedWriteBuffer: QueueWriteFn | null = null;
+let rbPatchedWriteTexture: QueueWriteFn | null = null;
+
+/** The bypass that proves the byte census can fail: when set to a kind name, notes of that
+ *  kind are dropped on the floor. With the queue audit armed, the report must then say the
+ *  byte section is unusable rather than print a smaller, plausible number. */
+function rbSuppressedKind(): string {
+    const v = (globalThis as { __noRenderBoundaryNote?: unknown }).__noRenderBoundaryNote;
+    return typeof v === "string" ? v : "";
+}
+
+export function d3d9NoteFence(kind: RenderFenceKind, count = 1): void {
+    if (!Number.isSafeInteger(count) || count < 0) {
+        counterRejections[`fence:${kind}`] = (counterRejections[`fence:${kind}`] ?? 0) + 1;
+        return;
+    }
+    if (rbSuppressedKind() === kind) return;
+    const i = rbFenceIdx[kind];
+    if (i === undefined) return;
+    rbRing[rbSlot * RB_STRIDE + i]! += count;
+    rbTotals[i]! += count;
+}
+
+/** Occlusion queries a single resolve fence answered — the fence is per batch, so the count
+ *  of queries it served is the only thing that says whether one fence is cheap or dear. */
+export function d3d9NoteFenceQueriesServed(count: number): void {
+    if (!Number.isSafeInteger(count) || count < 0) {
+        counterRejections["fence:queriesServed"] = (counterRejections["fence:queriesServed"] ?? 0) + 1;
+        return;
+    }
+    rbQueriesServed += count;
+}
+
+export function d3d9NoteStagedBytes(kind: StagedByteKind, bytes: number): void {
+    if (!Number.isFinite(bytes) || bytes < 0) {
+        counterRejections[`stagedBytes:${kind}`] = (counterRejections[`stagedBytes:${kind}`] ?? 0) + 1;
+        return;
+    }
+    if (bytes === 0) return;
+    if (rbSuppressedKind() === kind) return;
+    const i = rbByteIdx[kind];
+    if (i === undefined) return;
+    rbRing[rbSlot * RB_STRIDE + i]! += bytes;
+    rbTotals[i]! += bytes;
+    rbLedgerBytes += bytes;
+    rbLedgerWrites++;
+}
+
+/** Close the current frame at a present boundary and open the next one. */
+export function d3d9NoteRenderFrameBoundary(presentSerial: number): void {
+    rbRingSerial[rbSlot] = Number.isFinite(presentSerial) ? presentSerial : -1;
+    rbFrames++;
+    rbSlot = (rbSlot + 1) % RB_RING;
+    const base = rbSlot * RB_STRIDE;
+    for (let i = 0; i < RB_STRIDE; i++) rbRing[base + i] = 0;
+    rbRingSerial[rbSlot] = -1;
+}
+
+/** Called by the armed queue shim for every byte WebGPU actually received. Independent of
+ *  the classified notes above; the two are compared, never reconciled. */
+export function d3d9NoteQueueWrite(bytes: number): void {
+    if (!Number.isFinite(bytes) || bytes < 0) return;
+    rbQueueBytes += bytes;
+    rbQueueWrites++;
+}
+
+/**
+ * Arm/disarm the queue-byte audit. Patches GPUQueue.prototype, because the classified notes
+ * sit at ~30 call sites and a site added later would otherwise go uncounted in silence —
+ * which is the whole failure mode this census exists to avoid. Default OFF and identity-cost
+ * while off; an armed shim must never be left on across a timing arm.
+ *
+ * Returns whether a shim is installed. `false` with `on === true` means the environment has
+ * no GPUQueue (a unit test, a headless worker) — the caller reports that, it is not a no-op.
+ */
+export function setRenderBoundaryQueueAudit(on: boolean): boolean {
+    const proto = (globalThis as unknown as { GPUQueue?: { prototype: Record<string, unknown> } })
+        .GPUQueue?.prototype;
+    if (on) {
+        rbAuditArmed = true;
+        if (!proto || rbPatchedWriteBuffer) return !!rbPatchedWriteBuffer;
+        const origBuffer = proto["writeBuffer"] as QueueWriteFn;
+        const origTexture = proto["writeTexture"] as QueueWriteFn;
+        if (typeof origBuffer !== "function" || typeof origTexture !== "function") return false;
+        rbPatchedWriteBuffer = origBuffer;
+        rbPatchedWriteTexture = origTexture;
+        proto["writeBuffer"] = function (this: unknown, ...args: unknown[]) {
+            d3d9NoteQueueWrite(queueWriteBufferBytes(args));
+            return (origBuffer as unknown as (...a: unknown[]) => unknown).apply(this, args);
+        };
+        proto["writeTexture"] = function (this: unknown, ...args: unknown[]) {
+            d3d9NoteQueueWrite(byteLengthOfSource(args[1]));
+            return (origTexture as unknown as (...a: unknown[]) => unknown).apply(this, args);
+        };
+        return true;
+    }
+    rbAuditArmed = false;
+    if (proto && rbPatchedWriteBuffer && rbPatchedWriteTexture) {
+        proto["writeBuffer"] = rbPatchedWriteBuffer;
+        proto["writeTexture"] = rbPatchedWriteTexture;
+    }
+    rbPatchedWriteBuffer = null;
+    rbPatchedWriteTexture = null;
+    return false;
+}
+
+function byteLengthOfSource(src: unknown): number {
+    const v = src as { byteLength?: number; BYTES_PER_ELEMENT?: number } | undefined;
+    return typeof v?.byteLength === "number" ? v.byteLength : 0;
+}
+
+/** writeBuffer(buffer, offset, data, dataOffset?, size?) — dataOffset/size are in ELEMENTS
+ *  for a typed array and in bytes for an ArrayBuffer, which is why this cannot be one rule. */
+function queueWriteBufferBytes(args: unknown[]): number {
+    const data = args[2] as { byteLength?: number; BYTES_PER_ELEMENT?: number } | undefined;
+    const size = args[4];
+    if (typeof size === "number") {
+        const el = typeof data?.BYTES_PER_ELEMENT === "number" ? data.BYTES_PER_ELEMENT : 1;
+        return size * el;
+    }
+    const total = byteLengthOfSource(data);
+    const off = args[3];
+    if (typeof off === "number") {
+        const el = typeof data?.BYTES_PER_ELEMENT === "number" ? data.BYTES_PER_ELEMENT : 1;
+        return Math.max(0, total - off * el);
+    }
+    return total;
+}
+
+export interface RenderBoundaryLedger {
+    atMs: number;
+    /** Bumped by resetRenderBoundaryCensus(). A window spanning two epochs is a fragment. */
+    epoch: number;
+    /** Present boundaries closed since the reset. */
+    frames: number;
+    ringCapacity: number;
+    /** Global frame index of `perFrame[0]`; frames below it have left the ring. */
+    frameIndexBase: number;
+    /** Chronological, one row per retained CLOSED frame, RENDER_FENCE_KINDS then
+     *  STAGED_BYTE_KINDS. */
+    perFrame: number[][];
+    /** Present serial recorded at each retained frame's boundary. */
+    serials: number[];
+    totals: Record<string, number>;
+    queriesServed: number;
+    ledgerBytes: number;
+    ledgerWrites: number;
+    audit: { armed: boolean; installed: boolean; queueBytes: number; queueWrites: number };
+    /** Echo of __noRenderBoundaryNote so a gagged site cannot read as a clean census. */
+    suppressedKind: string;
+}
+
+export function readRenderBoundaryLedger(): RenderBoundaryLedger {
+    const retained = Math.min(rbFrames, RB_RING - 1);
+    const perFrame: number[][] = [];
+    const serials: number[] = [];
+    for (let n = retained; n >= 1; n--) {
+        const slot = (rbSlot - n + RB_RING * 2) % RB_RING;
+        const base = slot * RB_STRIDE;
+        const row = new Array<number>(RB_STRIDE);
+        for (let i = 0; i < RB_STRIDE; i++) row[i] = rbRing[base + i]!;
+        perFrame.push(row);
+        serials.push(rbRingSerial[slot]!);
+    }
+    const totals: Record<string, number> = {};
+    RENDER_FENCE_KINDS.forEach((k, i) => { totals[k] = rbTotals[i]!; });
+    STAGED_BYTE_KINDS.forEach((k, i) => { totals[k] = rbTotals[RB_F + i]!; });
+    return {
+        atMs: performance.now(),
+        epoch: rbEpoch,
+        frames: rbFrames,
+        ringCapacity: RB_RING - 1,
+        frameIndexBase: rbFrames - retained,
+        perFrame,
+        serials,
+        totals,
+        queriesServed: rbQueriesServed,
+        ledgerBytes: rbLedgerBytes,
+        ledgerWrites: rbLedgerWrites,
+        audit: {
+            armed: rbAuditArmed,
+            installed: rbPatchedWriteBuffer !== null,
+            queueBytes: rbQueueBytes,
+            queueWrites: rbQueueWrites,
+        },
+        suppressedKind: rbSuppressedKind(),
+    };
+}
+
+export function resetRenderBoundaryCensus(): void {
+    rbRing.fill(0);
+    rbRingSerial.fill(-1);
+    rbTotals.fill(0);
+    rbSlot = 0;
+    rbFrames = 0;
+    rbQueriesServed = 0;
+    rbLedgerBytes = 0;
+    rbLedgerWrites = 0;
+    rbQueueBytes = 0;
+    rbQueueWrites = 0;
+    rbEpoch++;
+}
+
 export function resetD3D9Perf(): void {
     for (const k of API_KEYS) api[k] = 0;
     for (const k of SKIP_KEYS) skip[k] = 0;
     for (const k of BACKEND_KEYS) backend[k] = 0;
     for (const k in stateBlock) (stateBlock as Record<string, number>)[k] = 0;
     for (const k in droppedDraws) delete droppedDraws[k];
+    droppedDrawTotal = 0;
+    for (const k in indexedDrawUnencoded) delete indexedDrawUnencoded[k];
     warnedDropReasons.clear();
     for (const k in counterRejections) delete counterRejections[k];
     for (const k in resetRefusals) delete resetRefusals[k];
     for (const k in ffpUnimplemented) delete ffpUnimplemented[k];
+    for (const k in ffpSamplerDims) delete ffpSamplerDims[k];
+    for (const k in textureBindOutcome) delete textureBindOutcome[k];
     for (const k in approximated) delete approximated[k];
     resetDxFormatSupportCensus();
     ffpColorOps.fill(0);
@@ -594,6 +976,9 @@ export function resetD3D9Perf(): void {
     for (const k in buffers) (buffers as unknown as Record<string, number>)[k] = 0;
     stateBlockByType = {};
     stateBlockOps = {};
+    // Same reset boundary, so a render-boundary window can never span a d3d9Perf reset
+    // without saying so — the epoch bump is what makes the fragment visible.
+    resetRenderBoundaryCensus();
 }
 
 function pickRecord<T extends string>(src: Record<T, number>, keys: readonly T[]): Record<string, number> {
@@ -610,9 +995,13 @@ export function getD3D9PerfSnapshot(): D3D9PerfSnapshot {
         stateTracker: {},
         droppedDraws: { ...droppedDraws },
         counterRejections: { ...counterRejections },
+        indexedDrawUnencoded: { ...indexedDrawUnencoded },
         resetRefusals: { ...resetRefusals },
         ffpUnimplemented: { ...ffpUnimplemented },
+        ffpSamplerDims: { ...ffpSamplerDims },
+        textureBindOutcome: { ...textureBindOutcome },
         approximated: { ...approximated },
+        creationRefusals: getDxCreationRefusals(),
         formatSupport: getDxFormatSupportCensus(),
         ffpOps: ffpOpsSnapshot(),
         materialEverSet,

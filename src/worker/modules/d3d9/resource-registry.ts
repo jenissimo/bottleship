@@ -21,6 +21,12 @@ import { isDxExclusiveFormat } from '../../backends/webgpu/shared/dx-format-supp
 import { resetDeviceCursor } from '../../core/device-cursor';
 import { clearResourceContract, resetResourceContract } from './resource-contract';
 import { volumeTextureResources } from './volume-resources';
+import {
+    vertexDeclComObjects,
+    vertexShaderComObjects,
+    pixelShaderComObjects,
+} from '../../backends/webgpu/d3d9/d3d9-com-objects';
+import { D3D9ResourceKind, registerResourceKindProbe } from './resource-ids';
 
 export type TextureMeta = {
     width: number;
@@ -638,3 +644,24 @@ export function createGuestTexture(
 }
 
 export { D3D_OK, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8 };
+
+/**
+ * Teach the pointer->id table what a live resource of each kind looks like. The table mints an id
+ * only for a pointer one of these registries still vouches for, so it can never name a block that
+ * was never a D3D9 resource — and, because every teardown path deletes from the same registry
+ * before or as the COM object dies, a re-minted id after a recycle is a genuinely new resource.
+ *
+ * Installed from `registerFastPathD3D9Functions` rather than at module scope so the wiring has one
+ * named, ordered init point; the probes are idempotent.
+ */
+export function installD3D9ResourceKindProbes(): void {
+    registerResourceKindProbe(
+        D3D9ResourceKind.Texture,
+        (ptr) => textureMeta.has(ptr) || volumeTextureResources.has(ptr),
+    );
+    registerResourceKindProbe(D3D9ResourceKind.VertexBuffer, (ptr) => vertexBufferMeta.has(ptr));
+    registerResourceKindProbe(D3D9ResourceKind.IndexBuffer, (ptr) => indexBufferMeta.has(ptr));
+    registerResourceKindProbe(D3D9ResourceKind.VertexShader, (ptr) => vertexShaderComObjects.has(ptr));
+    registerResourceKindProbe(D3D9ResourceKind.PixelShader, (ptr) => pixelShaderComObjects.has(ptr));
+    registerResourceKindProbe(D3D9ResourceKind.VertexDeclaration, (ptr) => vertexDeclComObjects.has(ptr));
+}

@@ -21,8 +21,8 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { writeDeviceCaps8 } from './caps';
 import { logDxCheckDeviceFormat, setDxCheckFormatVerboseLogging } from '../../backends/webgpu/shared/dx-format-check-log';
 import {
-    DEFAULT_DEVICE_ID,
-    DEFAULT_VENDOR_ID,
+    adapterDeviceId,
+    adapterVendorId,
     writeAdapterIdentifier8,
 } from '../../backends/webgpu/shared/dx-adapter-identifier';
 import { registerLossTrackedDevice } from '../../core/gpu/gpu-device-loss-contract';
@@ -126,8 +126,8 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             loggedD3D8AdapterIdentifier = true;
             Logger.log(
                 LogCategory.D3D9,
-                `D3D8 GetAdapterIdentifier: VendorId=0x${DEFAULT_VENDOR_ID.toString(16)} ` +
-                    `DeviceId=0x${DEFAULT_DEVICE_ID.toString(16)} (GTA3 cache key)`,
+                `D3D8 GetAdapterIdentifier: VendorId=0x${adapterVendorId().toString(16)} ` +
+                    `DeviceId=0x${adapterDeviceId().toString(16)} (GTA3 cache key)`,
             );
         }
         return writeAdapterIdentifier8(mem, pIdentifier, flags) ? D3D_OK : D3DERR_INVALIDCALL;

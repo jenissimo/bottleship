@@ -38,6 +38,10 @@ import {
 } from './resource-registry';
 import { getD3DTextureLayout, isD3DFloatFormat } from '../../backends/webgpu/shared/texture-formats';
 import {
+    isD3D9FloatRenderTargetSupported,
+    isD3D9FloatTextureFormatSupported,
+} from '../../backends/webgpu/shared/float-format-policy';
+import {
     initReturnPtr,
     D3DFMT_UNKNOWN,
     normalizePalettizedTexturePool,
@@ -46,6 +50,8 @@ import {
     isDxExclusiveFormat,
     isDxDepthStencilFormat,
     isDxRenderableFormat,
+    isDxCreatableRenderTargetFormat,
+    noteRefusedCreate,
     isDxUnsupportedFormat,
 } from '../../backends/webgpu/shared/dx-format-support';
 import {
@@ -358,6 +364,28 @@ function completeCubeFaceLock(
     return 0;
 }
 
+/**
+ * The cube-texture constructor, published for d3dx9's cube loaders. Same shape as volume.ts's
+ * factory: the real work lives inside the export closure (vtables, finalizers, face surfaces),
+ * so this hands that one implementation out rather than growing a second one that would drift.
+ */
+const D3DERR_INVALIDCALL_HR = 0x8876086c;
+
+type CubeTextureFactory = (
+    devicePtr: number, edge: number, levels: number, usage: number,
+    format: number, pool: number, ppCubeTexture: number,
+) => number;
+let cubeTextureFactory: CubeTextureFactory | null = null;
+
+export function createGuestCubeTexture(
+    devicePtr: number, edge: number, levels: number, usage: number,
+    format: number, pool: number, ppCubeTexture: number,
+): number {
+    return cubeTextureFactory
+        ? cubeTextureFactory(devicePtr, edge, levels, usage, format, pool, ppCubeTexture)
+        : D3DERR_INVALIDCALL_HR;
+}
+
 export function createResourcesExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -661,11 +689,17 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (Format === D3DFMT_UNKNOWN || isDxExclusiveFormat(Format, 9)) {
             return D3DERR_INVALIDCALL;
         }
-        if (isDxUnsupportedFormat(Format, 9)) return D3DERR_NOTAVAILABLE;
-        // The opt-in float seam is sampled 2-D storage only.  A texture created
-        // as a render target would still be attached through the ordinary
-        // backend-format path, so refuse it rather than silently quantizing it.
-        if (isD3DFloatFormat(Format) && (Usage >>> 0) & D3DUSAGE_RENDERTARGET) {
+        if (isDxUnsupportedFormat(Format, 9)) {
+            noteRefusedCreate("texture:unsupportedFormat", Format, Width >>> 0, Height >>> 0);
+            return D3DERR_NOTAVAILABLE;
+        }
+        // A float render target keeps its own GPU format (rgba16float and friends) and the
+        // pass/pipelines key on it.  Refuse only what the adapter probe actually refused:
+        // a silent NOTAVAILABLE here is indistinguishable from success to a caller that only
+        // checked the capability query, and the NULL it keeps faults somewhere else.
+        if (isD3DFloatFormat(Format) && ((Usage >>> 0) & D3DUSAGE_RENDERTARGET) !== 0 &&
+            !isD3D9FloatRenderTargetSupported(Format)) {
+            noteRefusedCreate("texture:floatRenderTarget", Format, Width >>> 0, Height >>> 0);
             return D3DERR_NOTAVAILABLE;
         }
 
@@ -746,11 +780,24 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (Format === D3DFMT_UNKNOWN || isDxExclusiveFormat(Format, 9)) {
             return D3DERR_INVALIDCALL;
         }
-        if (isDxUnsupportedFormat(Format, 9)) return D3DERR_NOTAVAILABLE;
-        // The bounded float contract is currently a 2-D sampled-texture path;
-        // cube uploads still use the legacy RGBA8 layer conversion and must not
-        // claim fidelity for any float format.
-        if (isD3DFloatFormat(Format)) return D3DERR_NOTAVAILABLE;
+        if (isDxUnsupportedFormat(Format, 9)) {
+            noteRefusedCreate("cubeTexture:unsupportedFormat", Format, EdgeLength >>> 0, EdgeLength >>> 0);
+            return D3DERR_NOTAVAILABLE;
+        }
+        // The same rule 2D textures follow: refuse only what the adapter probe actually
+        // refused.  A render-target cube rides the attachment contract (its faces come from
+        // rendering); a sampled one rides the texture contract and keeps its own float
+        // storage.  Refusing a supported float cube hands back a NULL the caller may not
+        // check, and the engine reads it as a missing asset instead of an error.
+        if (isD3DFloatFormat(Format)) {
+            const supported = ((Usage >>> 0) & D3DUSAGE_RENDERTARGET) !== 0
+                ? isD3D9FloatRenderTargetSupported(Format)
+                : isD3D9FloatTextureFormatSupported(Format);
+            if (!supported) {
+                noteRefusedCreate("cubeTexture:float", Format, EdgeLength >>> 0, EdgeLength >>> 0);
+                return D3DERR_NOTAVAILABLE;
+            }
+        }
 
         const device = devices.get(pDevice);
         if (!device) {
@@ -807,6 +854,14 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         }
         return D3D_OK;
     };
+
+    // Publish the same implementation to d3dx9 (D3DXCreateCubeTextureFromFileInMemoryEx). The
+    // export reads only `args`, so the delegation cannot diverge from what the guest call does.
+    cubeTextureFactory = (devicePtr, edge, levels, usage, format, pool, ppCubeTexture) =>
+        exports['IDirect3DDevice9_CreateCubeTexture']!(
+            undefined as never, undefined as never,
+            [devicePtr, edge, levels, usage, format, pool, ppCubeTexture] as never,
+        ) as number;
 
     exports['IDirect3DDevice9_CreateDepthStencilSurface'] = (_ctx, mem, args) => {
         const pDevice = args[0];
@@ -893,8 +948,14 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         // An offscreen plain surface is a D3DRTYPE_SURFACE and would require a
         // separate attachment/readback proof; do not let a valid R16F texture
         // probe accidentally make this surface constructor succeed.
-        if (isD3DFloatFormat(format)) return D3DERR_NOTAVAILABLE;
-        if (isDxUnsupportedFormat(format, 9)) return D3DERR_NOTAVAILABLE;
+        if (isD3DFloatFormat(format)) {
+            noteRefusedCreate("offscreenPlainSurface:float", format, width, height);
+            return D3DERR_NOTAVAILABLE;
+        }
+        if (isDxUnsupportedFormat(format, 9)) {
+            noteRefusedCreate("offscreenPlainSurface:unsupportedFormat", format, width, height);
+            return D3DERR_NOTAVAILABLE;
+        }
 
         const device = devices.get(pDevice);
         if (!device) return D3DERR_INVALIDCALL;
@@ -964,8 +1025,10 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (width === 0 || height === 0) return D3DERR_INVALIDCALL;
         if (multiSampleQuality !== 0) return D3DERR_NOTAVAILABLE;
         if (format === D3DFMT_UNKNOWN || isDxExclusiveFormat(format, 9)) return D3DERR_INVALIDCALL;
-        if (isD3DFloatFormat(format)) return D3DERR_NOTAVAILABLE;
-        if (!isDxRenderableFormat(format, 9)) return D3DERR_NOTAVAILABLE;
+        if (!isDxCreatableRenderTargetFormat(format, 9)) {
+            noteRefusedCreate("rendertarget", format, width, height);
+            return D3DERR_NOTAVAILABLE;
+        }
         // The texture below is the single-sample resolve/storage image exposed to
         // the guest.  When this surface is bound with 2x/4x, the executor renders
         // into its cached multisample color attachment and resolves into this

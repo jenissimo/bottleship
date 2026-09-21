@@ -18,7 +18,7 @@ import type { D3D9StateBlockData } from '../../backends/webgpu/d3d9/d3d9-state-b
 import { clearD3D9ComObjectRegistries } from '../../backends/webgpu/d3d9/d3d9-com-objects';
 import { resetShaderValidators } from './shader-validator';
 import { resetQueryState } from './query';
-import { resetD3D9Perf } from './d3d9-perf';
+import { resetD3D9Perf, getD3D9PerfSnapshot, type D3D9PerfSnapshot } from './d3d9-perf';
 import { d3d9WasmArena } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
 import { allocateComObject, freeComObject } from '../../core/com/com-memory';
 import { drainComFinalizers, trackComObject } from './com-refs';
@@ -201,4 +201,32 @@ export function resolveD3D9LockedTextureTarget(
         if (hit) return hit;
     }
     return null;
+}
+
+/**
+ * The D3D9 perf snapshot with the live per-device executor counters folded in.
+ *
+ * `d3d9-perf`'s own `backend` record declares names the executor also keeps —
+ * `pipelineSets`, `bindGroupSets`, `drawCalls` and friends — but nothing ever writes them
+ * there, so the bare snapshot answers a permanent zero for each while the executor's copy
+ * counts in the millions. Both readers go through here so one name cannot have two answers.
+ */
+export function getD3D9PerfSnapshotWithDevices(): D3D9PerfSnapshot {
+    const snap = getD3D9PerfSnapshot();
+    const stateTracker: Record<string, number> = {};
+    const backendExtra: Record<string, number> = {};
+    for (const dev of devices.values()) {
+        const sub = dev.collectSubsystemPerf();
+        for (const [k, v] of Object.entries(sub.stateTracker)) {
+            stateTracker[k] = (stateTracker[k] ?? 0) + v;
+        }
+        for (const [k, v] of Object.entries(sub.backend)) {
+            backendExtra[k] = (backendExtra[k] ?? 0) + v;
+        }
+    }
+    for (const [k, v] of Object.entries(backendExtra)) {
+        snap.backend[k] = (snap.backend[k] ?? 0) + v;
+    }
+    snap.stateTracker = stateTracker;
+    return snap;
 }

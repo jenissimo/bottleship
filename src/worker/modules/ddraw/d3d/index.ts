@@ -4,7 +4,8 @@
  * Combines all D3D implementations into a single exports object.
  * This replaces the monolithic d3d.ts file with a modular structure.
  */
-import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
+import { type HleDispatcher, ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
+import type { FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { assignStubsOnce } from "../../../core/thunking/stub-merge";
 import { DDrawContext } from "../context";
 import { Logger, LogCategory } from "../../../core/logger";
@@ -56,7 +57,7 @@ export const createD3DExports = (context: DDrawContext): Record<string, ThunkImp
  * FastPath bypasses X86Context creation and reads arguments directly from stack.
  * This significantly reduces thunking overhead for functions called 100K+ times per frame.
  */
-export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawContext): void {
+export function registerFastPathD3DFunctions(dispatcher: HleDispatcher, context: DDrawContext): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') {
         return;
     }
@@ -79,8 +80,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice3_SetRenderState - 206K calls, 728ms total
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_SetRenderState', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4]; // ESP register
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_SetRenderState', (esp: number, view: DataView): number => {
 
         // Stack layout (stdcall, args pushed right-to-left):
         // esp + 0  = return address
@@ -110,8 +110,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // IDirect3DDevice3_SetTextureStageState - 422K calls, 3313ms total
     // No deduplication previously — now skips redundant writes via cached TSS array.
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_SetTextureStageState', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_SetTextureStageState', (esp: number, view: DataView): number => {
 
         // esp + 4  = thisPtr
         // esp + 8  = stage
@@ -142,8 +141,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice7_SetRenderState
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetRenderState', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetRenderState', (esp: number, view: DataView): number => {
 
         const thisPtr = view.getUint32(esp + 4, true);
         const state = view.getUint32(esp + 8, true);
@@ -165,8 +163,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice7_SetTextureStageState
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetTextureStageState', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetTextureStageState', (esp: number, view: DataView): number => {
 
         const thisPtr = view.getUint32(esp + 4, true);
         const stage = view.getUint32(esp + 8, true);
@@ -196,8 +193,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // Skips the diagnostic logging in the slow-path impl.
     // ============================================================================
     const transformScratch7 = new Float32Array(16);
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetTransform', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetTransform', (esp: number, view: DataView): number => {
         const thisPtr = view.getUint32(esp + 4, true);
         const state   = view.getUint32(esp + 8, true);
         const pMatrix = view.getUint32(esp + 12, true);
@@ -223,8 +219,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // IDirect3DDevice7_SetMaterial — per-draw material upload (68-byte struct).
     // Skips slow-path diagnostic block that rebuilds a key string on every call.
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetMaterial', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetMaterial', (esp: number, view: DataView): number => {
         const thisPtr    = view.getUint32(esp + 4, true);
         const lpMaterial = view.getUint32(esp + 8, true);
         if (lpMaterial === 0) return D3D_OK;
@@ -250,8 +245,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice7_GetRenderState — per-draw state readback; trivial lookup + write.
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_GetRenderState', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_GetRenderState', (esp: number, view: DataView): number => {
         const thisPtr = view.getUint32(esp + 4, true);
         const state   = view.getUint32(esp + 8, true);
         const pValue  = view.getUint32(esp + 12, true);
@@ -275,7 +269,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // cheaply — so it defers to the JS handler (return null) for as long as ANY surface is
     // lost, which is a handful of frames per loss and never in a normal run.
     // ============================================================================
-    const isLostFn = (_cpu: any, _mem: Uint8Array, _mem32: Uint32Array, _view: DataView): number | null =>
+    const isLostFn: FastPathImplementation = () =>
         lostSurfaceCount() === 0 ? DD_OK : null;
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface4_IsLost', isLostFn, { trivial: true });
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface7_IsLost', isLostFn, { trivial: true });
@@ -284,10 +278,8 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // IDirect3DDevice3_DrawPrimitive - 393K calls, 3002ms total (1163ms in drawPrimitive)
     // FastPath saves ~1.8 sec thunking overhead
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_DrawPrimitive', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_DrawPrimitive', (esp: number, view: DataView, mem: Uint8Array): number => {
         if (!sharedDrawHandler) return D3D_OK;
-
-        const esp = cpu.reg32[4];
 
         // Stack layout:
         // esp + 4  = thisPtr (IDirect3DDevice3*)
@@ -308,10 +300,8 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice7_DrawPrimitive
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_DrawPrimitive', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_DrawPrimitive', (esp: number, view: DataView, mem: Uint8Array): number => {
         if (!sharedDrawHandler) return D3D_OK;
-
-        const esp = cpu.reg32[4];
 
         const thisPtr = view.getUint32(esp + 4, true);
         const primitiveType = view.getUint32(esp + 8, true);
@@ -327,10 +317,8 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // IDirect3DDevice3_DrawIndexedPrimitive - thousands of calls per frame (Sea Dogs: 4511)
     // Same as DrawPrimitive but with 3 extra args: lpIndices, indexCount, flags
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_DrawIndexedPrimitive', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_DrawIndexedPrimitive', (esp: number, view: DataView, mem: Uint8Array): number => {
         if (!sharedDrawHandler) return D3D_OK;
-
-        const esp = cpu.reg32[4];
 
         // Stack layout:
         // esp + 4  = thisPtr (IDirect3DDevice3*)
@@ -356,10 +344,8 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice7_DrawIndexedPrimitive
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_DrawIndexedPrimitive', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_DrawIndexedPrimitive', (esp: number, view: DataView, mem: Uint8Array): number => {
         if (!sharedDrawHandler) return D3D_OK;
-
-        const esp = cpu.reg32[4];
 
         const thisPtr = view.getUint32(esp + 4, true);
         const primitiveType = view.getUint32(esp + 8, true);
@@ -378,8 +364,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // Note: This is a simplified fast path that only updates the device state.
     // Eager texture sync is deferred to DrawPrimitive for better batching.
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_SetTexture', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice3_SetTexture', (esp: number, view: DataView): number => {
 
         // esp + 4  = thisPtr
         // esp + 8  = stage
@@ -407,8 +392,7 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // ============================================================================
     // IDirect3DDevice7_SetTexture
     // ============================================================================
-    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetTexture', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('ddraw', 'IDirect3DDevice7_SetTexture', (esp: number, view: DataView): number => {
 
         const thisPtr = view.getUint32(esp + 4, true);
         const stage = view.getUint32(esp + 8, true);
@@ -549,9 +533,8 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
     // Both interface generations share one body (d3d-impl aliases the v7 names onto the v6
     // ones), but a fast path is bound per EXPORT NAME — registering only the v6 spelling
     // left the v7 one, which is the generation a D3D7 title actually uses, on the slow tier.
-    const vbLockFast =
-        (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4] >>> 0;
+    const vbLockFast: FastPathImplementation =
+        (esp, view, mem) => {
             if (esp + 20 > mem.length) return null;
             const thisPtr = view.getUint32(esp + 4, true);
             const lplpData = view.getUint32(esp + 12, true);
@@ -566,9 +549,8 @@ export function registerFastPathD3DFunctions(dispatcher: any, context: DDrawCont
             obj.beginLock();
             return D3D_OK;
         };
-    const vbUnlockFast =
-        (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4] >>> 0;
+    const vbUnlockFast: FastPathImplementation =
+        (esp, view, mem) => {
             if (esp + 8 > mem.length) return null;
             const obj = resourceProvider.getComObjectByAddress(view.getUint32(esp + 4, true)) as Direct3DVertexBufferObject | null;
             if (!obj) return null;   // a foreign/double Unlock must reach the thunk that reports it

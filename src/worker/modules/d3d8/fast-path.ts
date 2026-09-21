@@ -21,6 +21,7 @@
  */
 
 import { Logger, LogCategory } from '../../core/logger';
+import type { HleDispatcher } from '../../core/thunking/thunk-dispatcher';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
 import { devices, resourceToDevice } from './shared-state';
 import { validateLockRange } from './resources';
@@ -36,7 +37,7 @@ const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
 const D3DLIGHT8_SIZE = 104;
 
-export function registerFastPathD3D8Functions(dispatcher: any): void {
+export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // Debug no-op of the D3D8 debug runtime; retail does nothing with it. A constant-return
@@ -52,8 +53,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
     if (!(globalThis as any).__noCapsMemo) {
         // CheckDeviceFormat(this, Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat)
         dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDeviceFormat',
-            (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-                const esp = cpu.reg32[4];
+            (esp: number, view: DataView): number | null => {
                 return peekDxDeviceFormat(8,
                     view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                     view.getUint32(esp + 20, true), view.getUint32(esp + 24, true), view.getUint32(esp + 28, true));
@@ -62,8 +62,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
         // CheckDeviceMultiSampleType(this, Adapter, DeviceType, SurfaceFormat, Windowed,
         //                            MultiSampleType) — D3D8 has no pQualityLevels out-param.
         dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDeviceMultiSampleType',
-            (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-                const esp = cpu.reg32[4];
+            (esp: number, view: DataView): number | null => {
                 return peekDxDeviceMultiSampleType(8,
                     view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                     view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
@@ -71,8 +70,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
         // CheckDepthStencilMatch(this, Adapter, DeviceType, AdapterFormat, RTFormat, DSFormat)
         dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDepthStencilMatch',
-            (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-                const esp = cpu.reg32[4];
+            (esp: number, view: DataView): number | null => {
                 return peekDxDepthStencilMatch(8,
                     view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                     view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
@@ -81,8 +79,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetRenderState(this, State, Value)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetRenderState',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const state = view.getUint32(esp + 8, true), value = view.getUint32(esp + 12, true);
@@ -93,8 +90,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetTextureStageState(this, Stage, Type, Value)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetTextureStageState',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const stage = view.getUint32(esp + 8, true), type = view.getUint32(esp + 12, true), value = view.getUint32(esp + 16, true);
@@ -105,8 +101,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetTexture(this, Stage, pTexture) — resolve COM ptr → surface at call time.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetTexture',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const stage = view.getUint32(esp + 8, true), texPtr = view.getUint32(esp + 12, true);
@@ -118,8 +113,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_LightEnable(this, Index, Enable)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_LightEnable',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const index = view.getUint32(esp + 8, true), enable = view.getUint32(esp + 12, true) !== 0;
@@ -131,8 +125,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
     // IDirect3DDevice8_SetTransform(this, State, pMatrix[16 floats]) — capture-at-call
     // (pMatrix is guest scratch; copy the 16 floats out now).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetTransform',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const state = view.getUint32(esp + 8, true), pMatrix = view.getUint32(esp + 12, true) >>> 0;
@@ -146,8 +139,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetStreamSource(this, StreamNumber, pStreamData, Stride) — D3D8 has NO OffsetInBytes.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetStreamSource',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const streamNumber = view.getUint32(esp + 8, true) >>> 0;
@@ -165,8 +157,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetIndices(this, pIndexData, BaseVertexIndex) — D3D8 folds BaseVertexIndex here.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetIndices',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const ibPtr = view.getUint32(esp + 8, true) >>> 0;
@@ -180,8 +171,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetVertexShader(this, Handle) — D3D8 quirk: FVF token (bit0 clear) or shader handle (bit0 set).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetVertexShader',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const token = view.getUint32(esp + 8, true) >>> 0;
@@ -196,8 +186,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetViewport(this, pViewport) — capture-at-call (sanitize vs active RT).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetViewport',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const pVP = view.getUint32(esp + 8, true) >>> 0;
@@ -219,8 +208,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
     // ── Draws on the FastPath (kill the slow-path prologue; ring/barrier comes in Phase 2) ──
     // IDirect3DDevice8_DrawPrimitive(this, PrimitiveType, StartVertex, PrimitiveCount)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_DrawPrimitive',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             return device.drawPrimitive(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
@@ -228,8 +216,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_DrawIndexedPrimitive(this, PrimType, MinIndex, NumVertices, StartIndex, PrimCount)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_DrawIndexedPrimitive',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             return device.drawIndexedPrimitive(
@@ -244,8 +231,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DVertexBuffer8_Lock(this, Offset, Size, ppData, Flags)
     dispatcher.registerFastPath('d3d8', 'IDirect3DVertexBuffer8_Lock',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const pVB = view.getUint32(esp + 4, true);
             const offset = view.getUint32(esp + 8, true);
             const size = view.getUint32(esp + 12, true);
@@ -270,8 +256,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DIndexBuffer8_Lock(this, Offset, Size, ppData, Flags)
     dispatcher.registerFastPath('d3d8', 'IDirect3DIndexBuffer8_Lock',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const pIB = view.getUint32(esp + 4, true);
             const offset = view.getUint32(esp + 8, true);
             const size = view.getUint32(esp + 12, true);
@@ -299,8 +284,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
     // IDirect3DDevice8_SetLight(this, Index, pLight) — reads the guest D3DLIGHT8 through
     // the same reader the thunk uses (state.ts readD3DLight8), so the two cannot drift.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetLight',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const index = view.getUint32(esp + 8, true);

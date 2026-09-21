@@ -1,4 +1,5 @@
-import { ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
+import type { FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from "../../core/logger";
 import { assignStubsOnce } from "../../core/thunking/stub-merge";
 import { System } from "../../core/system";
@@ -2940,7 +2941,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
  * GetAttachedSurface is called ~972K times in UT99 demo (3.6s total).
  * The result is deterministic per surface: source → attached is fixed for a flipping chain.
  */
-export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDrawContext): void {
+export function registerFastPathSurfaceFunctions(dispatcher: HleDispatcher, context: DDrawContext): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     const resourceProvider = context.resourceProvider;
@@ -2951,10 +2952,8 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
     // primary's address — returning the old backbuffer then sends every frame to a zombie surface).
     const attachedCache = new Map<string, { srcObj: unknown; addr: number; obj: { addRef(): number } }>();
 
-    const fastPathGetAttachedSurface = (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    const fastPathGetAttachedSurface: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 16 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         // Stack layout (stdcall, args pushed right-to-left):
         // esp + 0  = return address

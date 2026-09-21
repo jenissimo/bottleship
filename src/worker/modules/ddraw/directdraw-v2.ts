@@ -15,8 +15,10 @@ import {
     IID_IDirectDrawSurface,
 } from "./constants";
 import {
-    DEFAULT_VENDOR_ID,
-    DEFAULT_DEVICE_ID,
+    adapterVendorId,
+    adapterDeviceId,
+    adapterDescription,
+    adapterDriverDll,
     DEFAULT_DRIVER_VERSION,
     DEFAULT_DEVICE_DESC,
     DEFAULT_DRIVER_DLL,
@@ -145,21 +147,21 @@ export function registerDirectDraw2Exports(
         // The SAME adapter D3D8/D3D9 report — see dx-adapter-identifier.ts. An app that
         // asks both interfaces in one process must not be told it is on two machines.
         // szDriver at offset 0 — the display driver's file name, not a category word.
-        const driverBytes = new TextEncoder().encode(DEFAULT_DRIVER_DLL);
+        const driverBytes = new TextEncoder().encode(adapterDriverDll());
         const driverLen = Math.min(driverBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
         for (let i = 0; i < driverLen; i++) mem[lpdddi + i] = driverBytes[i];
 
         // szDescription at offset 512
-        const descBytes = new TextEncoder().encode(DEFAULT_DEVICE_DESC);
+        const descBytes = new TextEncoder().encode(adapterDescription());
         const descLen = Math.min(descBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
         for (let i = 0; i < descLen; i++) mem[lpdddi + 512 + i] = descBytes[i];
 
         // liDriverVersion at offset 1024
         view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
         // dwVendorId at offset 1032
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, adapterVendorId(), true);
         // dwDeviceId at offset 1036
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, adapterDeviceId(), true);
         // dwSubSysId at offset 1040 stays zero; dwRevision at 1044 matches the D3D answer.
         view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwRevision, 1, true);
         // guidDeviceIdentifier at offset 1048 (16 bytes)

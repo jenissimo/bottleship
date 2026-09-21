@@ -28,6 +28,7 @@
  */
 
 import { Logger, LogCategory } from '../../core/logger';
+import type { HleDispatcher } from '../../core/thunking/thunk-dispatcher';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { devices, stateBlocks, resourceToDevice, addComRef } from './shared-state';
@@ -38,6 +39,7 @@ import {
     D3DSURFACE_DESC_SIZE,
     ensureTextureLevelSurface,
     packSurfaceDesc,
+    installD3D9ResourceKindProbes,
     surfaceMeta,
     textureMeta,
 } from './resource-registry';
@@ -65,7 +67,11 @@ function validGuestRange(mem: Uint8Array, ptr: number, size: number): boolean {
     return ptr !== 0 && size >= 0 && ptr <= mem.length - size;
 }
 
-export function registerFastPathD3D9Functions(dispatcher: any): void {
+export function registerFastPathD3D9Functions(dispatcher: HleDispatcher): void {
+    // Before any setter can be reached: the pointer->id table refuses to mint an id for a
+    // pointer no registry vouches for, so it must know the registries first.
+    installD3D9ResourceKindProbes();
+
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') {
         return;
     }
@@ -86,8 +92,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // globalThis.__noCapsMemo, which also stops dx-format-support filling the memo.
     if (!(globalThis as any).__noCapsMemo) {
         // CheckDeviceFormat(this, Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat)
-        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDeviceFormat', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDeviceFormat', (esp: number, view: DataView): number | null => {
             return peekDxDeviceFormat(9,
                 view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                 view.getUint32(esp + 20, true), view.getUint32(esp + 24, true), view.getUint32(esp + 28, true));
@@ -95,8 +100,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
         // CheckDeviceMultiSampleType(this, Adapter, DeviceType, SurfaceFormat, Windowed,
         //                            MultiSampleType, pQualityLevels)
-        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDeviceMultiSampleType', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDeviceMultiSampleType', (esp: number, view: DataView): number | null => {
             const hr = peekDxDeviceMultiSampleType(9,
                 view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                 view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
@@ -109,8 +113,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         }, { trivial: true });
 
         // CheckDepthStencilMatch(this, Adapter, DeviceType, AdapterFormat, RTFormat, DSFormat)
-        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDepthStencilMatch', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        dispatcher.registerFastPath('d3d9', 'IDirect3D9_CheckDepthStencilMatch', (esp: number, view: DataView): number | null => {
             return peekDxDepthStencilMatch(9,
                 view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                 view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
@@ -121,16 +124,14 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // IDirect3DQuery9_GetData(this, pData, dwSize, dwGetDataFlags) — 298K calls over one
     // Far Cry level load, almost all of them one turn of the guest's poll loop. The
     // ANSWER is unchanged (query.ts owns it); only the dispatch cost goes away.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DQuery9_GetData', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DQuery9_GetData', (esp: number, view: DataView): number | null => {
         return tryFastGetData(
             view.getUint32(esp + 4, true), view.getUint32(esp + 8, true),
             view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
     }, { trivial: true });
 
     // IDirect3DSurface9_GetDesc(this, pDesc) — a pure read of the surface registry.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DSurface9_GetDesc', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DSurface9_GetDesc', (esp: number, view: DataView, mem: Uint8Array): number | null => {
         const meta = surfaceMeta.get(view.getUint32(esp + 4, true));
         if (!meta) return null;
         const pDesc = view.getUint32(esp + 8, true) >>> 0;
@@ -144,8 +145,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
     // IDirect3DTexture9_GetSurfaceLevel(this, Level, ppSurfaceLevel) — two Map gets plus an
     // AddRef of the TEXTURE (D3D9 subresource surfaces have no refcount of their own).
-    dispatcher.registerFastPath('d3d9', 'IDirect3DTexture9_GetSurfaceLevel', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DTexture9_GetSurfaceLevel', (esp: number, view: DataView, mem: Uint8Array): number | null => {
         const pTexture = view.getUint32(esp + 4, true);
         const level = view.getUint32(esp + 8, true) >>> 0;
         const ppSurfaceLevel = view.getUint32(esp + 12, true) >>> 0;
@@ -168,8 +168,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // ========================================================================
 
     // IDirect3DDevice9_SetRenderState(thisPtr, State, Value)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetRenderState', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetRenderState', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         const state = view.getUint32(esp + 8, true);
@@ -182,8 +181,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // IDirect3DDevice9_SetTransform(thisPtr, State, pMatrix)
     // CAPTURE-AT-CALL (not WBUF): pMatrix is guest scratch memory and may be reused
     // before the next OUT trap drains the write-buffer.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTransform', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTransform', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         const pMatrix = view.getUint32(esp + 12, true);
@@ -196,48 +194,42 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     }, { trivial: true });
 
     // IDirect3DDevice9_SetFVF(thisPtr, FVF)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetFVF', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetFVF', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setFVF(view.getUint32(esp + 8, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetSamplerState(thisPtr, Sampler, Type, Value)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetSamplerState', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetSamplerState', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setSamplerState(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetTexture(thisPtr, Stage, pTexture)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTexture', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTexture', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setTexture(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetStreamSource(thisPtr, StreamNumber, pStreamData, OffsetInBytes, Stride)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetStreamSource', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetStreamSource', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setStreamSource(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), view.getUint32(esp + 20, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetIndices(thisPtr, pIndexData)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetIndices', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetIndices', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setIndices(view.getUint32(esp + 8, true));
     }, { trivial: true });
 
     // IDirect3DDevice9_SetVertexShader(thisPtr, pShader) — resolve COM ptr → internal handle.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetVertexShader', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetVertexShader', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3D_OK;
         const pShader = view.getUint32(esp + 8, true);
@@ -248,8 +240,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     }, { trivial: true });
 
     // IDirect3DDevice9_SetPixelShader(thisPtr, pShader)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetPixelShader', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetPixelShader', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3D_OK;
         const pShader = view.getUint32(esp + 8, true);
@@ -261,16 +252,14 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
     // IDirect3DDevice9_SetVertexShaderConstantF(thisPtr, StartRegister, pConstantData, Vector4fCount)
     // WBUF trampoline captures float bits at call time; FastPath is ring-overflow fallback.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetVertexShaderConstantF', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetVertexShaderConstantF', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (device) device.setVertexShaderConstantF(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), mem);
         return D3D_OK;
     }, { trivial: true });
 
     // IDirect3DDevice9_SetPixelShaderConstantF(thisPtr, StartRegister, pConstantData, Vector4fCount)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetPixelShaderConstantF', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetPixelShaderConstantF', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (device) device.setPixelShaderConstantF(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), mem);
         return D3D_OK;
@@ -279,8 +268,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // IDirect3DDevice9_SetTextureStageState(thisPtr, Stage, Type, Value) — pure FFP
     // texture-stage setter, scalar args. NFSU menu: ~38K/interval, previously all on
     // the slow path. Trivial like SetSamplerState.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTextureStageState', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetTextureStageState', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (device) device.setTextureStageState(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
         return D3D_OK;
@@ -288,8 +276,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
     // IDirect3DDevice9_SetMaterial(thisPtr, pMaterial)
     // CAPTURE-AT-CALL (not WBUF): D3DMATERIAL9 is passed by pointer.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetMaterial', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetMaterial', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         const pMaterial = view.getUint32(esp + 8, true);
@@ -299,8 +286,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
     // IDirect3DDevice9_SetLight(thisPtr, Index, pLight)
     // CAPTURE-AT-CALL (not WBUF): D3DLIGHT9 is passed by pointer.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetLight', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetLight', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         const pLight = view.getUint32(esp + 12, true);
@@ -309,8 +295,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     }, { trivial: true });
 
     // IDirect3DDevice9_LightEnable(thisPtr, Index, Enable)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_LightEnable', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_LightEnable', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.lightEnable(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true));
@@ -318,8 +303,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
     // IDirect3DDevice9_SetViewport(thisPtr, pViewport)
     // CAPTURE-AT-CALL (not WBUF): D3DVIEWPORT9 is passed by pointer.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetViewport', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetViewport', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         return device.setViewport(view.getUint32(esp + 8, true), mem);
@@ -327,8 +311,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
 
     // IDirect3DDevice9_SetClipPlane(thisPtr, Index, pPlane)
     // CAPTURE-AT-CALL (not WBUF): pPlane points to four guest floats.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetClipPlane', (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetClipPlane', (esp: number, view: DataView, mem: Uint8Array): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3DERR_INVALIDCALL;
         const pPlane = view.getUint32(esp + 12, true);
@@ -341,8 +324,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     }, { trivial: true });
 
     // IDirect3DDevice9_SetVertexDeclaration(thisPtr, pDecl) — resolve COM ptr → handle.
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetVertexDeclaration', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_SetVertexDeclaration', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (!device) return D3D_OK;
         const pDecl = view.getUint32(esp + 8, true);
@@ -362,16 +344,14 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // NON-trivial: per completeFastPathSync, trapped Draw* always notify the
     // scheduler boundary (no deferral), matching the legacy slow-path behaviour.
     // IDirect3DDevice9_DrawPrimitive(thisPtr, PrimitiveType, StartVertex, PrimitiveCount)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_DrawPrimitive', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_DrawPrimitive', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (device) device.drawPrimitive(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
         return D3D_OK;
     });
 
     // IDirect3DDevice9_DrawIndexedPrimitive(thisPtr, PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_DrawIndexedPrimitive', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_DrawIndexedPrimitive', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (device) device.drawIndexedPrimitive(
             view.getUint32(esp + 8, true), view.getInt32(esp + 12, true), view.getUint32(esp + 16, true),
@@ -380,8 +360,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     });
 
     // IDirect3DDevice9_DrawPrimitiveUP(thisPtr, PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_DrawPrimitiveUP', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DDevice9_DrawPrimitiveUP', (esp: number, view: DataView): number => {
         const device = devices.get(view.getUint32(esp + 4, true));
         if (device) device.drawPrimitiveUP(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true), view.getUint32(esp + 20, true));
         return D3D_OK;
@@ -394,8 +373,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     // must be ordered vs ring setters — the drain-before-every-trap invariant gives
     // both for free).
     // IDirect3DStateBlock9_Apply(thisPtr)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DStateBlock9_Apply', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DStateBlock9_Apply', (esp: number, view: DataView): number => {
         const block = stateBlocks.get(view.getUint32(esp + 4, true));
         const device = block ? devices.get(block.devicePtr) : null;
         if (!block || !device) return D3DERR_INVALIDCALL;
@@ -403,8 +381,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     }, { trivial: true });
 
     // IDirect3DStateBlock9_Capture(thisPtr)
-    dispatcher.registerFastPath('d3d9', 'IDirect3DStateBlock9_Capture', (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('d3d9', 'IDirect3DStateBlock9_Capture', (esp: number, view: DataView): number => {
         const block = stateBlocks.get(view.getUint32(esp + 4, true));
         const device = block ? devices.get(block.devicePtr) : null;
         if (!block || !device) return D3DERR_INVALIDCALL;
@@ -439,8 +416,7 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         ['IDirect3DIndexBuffer9', 'lockIndexBuffer', 'unlockIndexBuffer'],
     ] as const) {
         // Lock(thisPtr, OffsetToLock, SizeToLock, ppbData, Flags)
-        dispatcher.registerFastPath('d3d9', `${iface}_Lock`, (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        dispatcher.registerFastPath('d3d9', `${iface}_Lock`, (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const pBuf = view.getUint32(esp + 4, true);
             const device = resourceToDevice.get(pBuf);
             // Unknown buffer / bad out-param: no state touched yet, so let the slow path
@@ -461,8 +437,8 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
         }, { trivial: true });
 
         // Unlock(thisPtr)
-        dispatcher.registerFastPath('d3d9', `${iface}_Unlock`, (cpu: any, mem: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const pBuf = view.getUint32(cpu.reg32[4] + 4, true);
+        dispatcher.registerFastPath('d3d9', `${iface}_Unlock`, (esp: number, view: DataView, mem: Uint8Array): number | null => {
+            const pBuf = view.getUint32(esp + 4, true);
             const device = resourceToDevice.get(pBuf);
             if (!device) return null;
             (device as any)[unlockFn](pBuf, mem);
@@ -477,8 +453,8 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
     for (const prefix of ['IDirect3DTexture9', 'IDirect3DCubeTexture9', 'IDirect3DSurface9', 'IDirect3DVertexBuffer9', 'IDirect3DIndexBuffer9']) {
         const oracled = prefix === 'IDirect3DTexture9';
         dispatcher.registerFastPath('d3d9', `${prefix}_AddRef`,
-            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                const ptr = view.getUint32(cpu.reg32[4] + 4, true);
+            (esp: number, view: DataView): number => {
+                const ptr = view.getUint32(esp + 4, true);
                 // Read BEFORE the mutation: the oracle needs the count as JS found it to
                 // separate a real disagreement from one its own trap's drain created.
                 const oracle = oracled && guestAddRefOracleActive();
@@ -490,8 +466,8 @@ export function registerFastPathD3D9Functions(dispatcher: any): void {
             },
             { trivial: true });
         dispatcher.registerFastPath('d3d9', `${prefix}_Release`,
-            (cpu: any, _mem: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                const ptr = view.getUint32(cpu.reg32[4] + 4, true);
+            (esp: number, view: DataView): number => {
+                const ptr = view.getUint32(esp + 4, true);
                 const oracle = oracled && guestReleaseOracleActive();
                 const before = oracle ? readComRefGuestWord(ptr) : 0;
                 const answer = releaseD3D9ComRef(prefix, ptr);

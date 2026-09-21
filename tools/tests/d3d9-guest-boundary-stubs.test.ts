@@ -252,7 +252,7 @@ describe('the oracles are actually wired into the handlers that run', () => {
         const mem = new Uint8Array(1024);
         const view = new DataView(mem.buffer);
         view.setUint32(0x104, 0xdeadbe00, true);            // [esp+4] = this
-        handler!({ reg32: [0, 0, 0, 0, 0x100] }, mem, new Uint32Array(mem.buffer), view);
+        handler!(0x100, view, mem, new Uint32Array(mem.buffer), { reg32: [0, 0, 0, 0, 0x100] });
 
         const stats = d3d9GuestAddRefStats();
         expect(stats.checked).toBe(1);

@@ -14,6 +14,8 @@
  * measured sample count or timestamp.
  */
 
+import { d3d9NoteFence, d3d9NoteFenceQueriesServed } from "./d3d9-perf";
+
 export const D3D9_QUERYTYPE_OCCLUSION = 9;
 export const D3D9_QUERYTYPE_TIMESTAMP = 10;
 
@@ -935,6 +937,10 @@ export class D3D9QueryManager {
                 failureReason = validationError;
                 throw new Error(validationError);
             }
+            // One fence per resolve BATCH, not per GetData: GetData itself is a synchronous
+            // spin-polled thunk and never parks the guest.
+            d3d9NoteFence("queryBatch");
+            d3d9NoteFenceQueriesServed(batch.entries.length);
             await this.queue.onSubmittedWorkDone();
             await readbackBuffer.mapAsync(MAP_MODE_READ, 0, batch.entries.length * RESULT_BYTES);
             const mapped = readbackBuffer.getMappedRange(0, batch.entries.length * RESULT_BYTES);
