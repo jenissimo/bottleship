@@ -314,6 +314,12 @@ export class InputManager {
      *  guest read; consumeMouseButtonLatch() drains it, one sample wide, so a level-only
      *  API like DirectInput's immediate mouse state still sees the press exactly once. */
     private mouseButtonLatch = 0;
+    /** Latched buttons already observed released at the previous sample — see
+     *  ageMouseButtonLatch(). An immediate-state read reports the CURRENT device state,
+     *  so a latched press that outlives the release is a press reported at a moment the
+     *  device is not holding it; bounding it to one sample is what keeps the latch a
+     *  recovered sample rather than an event replayed into whatever runs next. */
+    private mouseButtonLatchStale = 0;
     private gamepadConnected = false;
     private gamepadButtons = 0;
     private gamepadAxes: [number, number, number, number] = [0, 0, 0, 0];
@@ -494,6 +500,10 @@ export class InputManager {
         // record, so it must run BEFORE the seq gate below (which returns early on
         // every quiet poll).
         this.pumpTypematic(forceEnqueue);
+        // Latch ageing is time-driven for the same reason typematic is: a released
+        // button publishes no new SAB record, so the seq gate below would never let
+        // the press expire.
+        this.ageMouseButtonLatch();
 
         // SAB input seqlock (reader/acquire side; writers = host App.tsx +
         // the worker injectors below, both bracket payload with begin/end so
@@ -1175,6 +1185,7 @@ export class InputManager {
         this.hasQueuedKeyState = false;
         this.keyPressedSinceLastQuery.fill(0);
         this.mouseButtonLatch = 0;
+        this.mouseButtonLatchStale = 0;
         this.prevKeyBitfield.fill(0);
         this.repeatVk = -1;
         this.repeatNextAt = 0;
@@ -1222,7 +1233,28 @@ export class InputManager {
     consumeMouseButtonLatch(): number {
         const latched = this.mouseButtonLatch;
         this.mouseButtonLatch = 0;
+        this.mouseButtonLatchStale = 0;
         return this.currentButtons | latched;
+    }
+
+    /**
+     * Expire a latched press one sample after poll() observed its release.
+     *
+     * The latch answers "the press was too short for a guest sample to fall inside it";
+     * it does NOT make the button pressed. A reader that only comes back after the
+     * release has been sampled must see what the device holds — UP — or one press is
+     * delivered to whoever happens to be running then, which for a level-only API is
+     * indistinguishable from a second click. Bounded here to the sample that saw the
+     * release plus one, so an unread press dies with its sample instead of waiting.
+     */
+    private ageMouseButtonLatch(): void {
+        if (!this.mouseButtonLatch) {
+            this.mouseButtonLatchStale = 0;
+            return;
+        }
+        const released = this.mouseButtonLatch & ~this.currentButtons;
+        this.mouseButtonLatch &= ~(released & this.mouseButtonLatchStale);
+        this.mouseButtonLatchStale = this.mouseButtonLatch & ~this.currentButtons;
     }
 
     private _noteDInputTrail(dev: DInputTrailEntry["dev"], ofs: number, data: number, seq: number): void {

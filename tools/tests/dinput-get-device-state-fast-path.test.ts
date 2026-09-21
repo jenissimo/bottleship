@@ -47,7 +47,7 @@ function callFast(thisPtr: number, cbData: number, lpvData: number): number | nu
     view.setUint32(ESP + 4, thisPtr >>> 0, true);
     view.setUint32(ESP + 8, cbData >>> 0, true);
     view.setUint32(ESP + 12, lpvData >>> 0, true);
-    return fastImpl(cpu, mem, mem32, view) as number | null;
+    return fastImpl(cpu.reg32[4]!, view, mem, mem32, cpu) as number | null;
 }
 
 function seed(pressedVk?: number): void {
@@ -95,6 +95,6 @@ describe("dinput GetDeviceState: fast path == thunk body", () => {
     test("declines rather than decode three arguments off the end of guest RAM", () => {
         seed();
         cpu.reg32[4] = MEM_SIZE - 8;
-        expect(fastImpl(cpu, mem, mem32, view)).toBe(null);
+        expect(fastImpl(cpu.reg32[4]!, view, mem, mem32, cpu)).toBe(null);
     });
 });

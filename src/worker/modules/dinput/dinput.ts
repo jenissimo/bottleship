@@ -1,4 +1,5 @@
 import { IModule } from "../../core/module";
+import type { HleDispatcher, FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Process } from "../../core/process";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
@@ -327,8 +328,99 @@ const notifyRegistry = new DInputNotifyRegistry({
     setEvent: (handle) => System.getInstance().scheduler.setEvent(handle),
 });
 
+/**
+ * DIDEVCAPS.dwDevType / DIDEVICEINSTANCE.dwDevType for a device of this kind.
+ *
+ * The constant family is the ASKING INTERFACE's generation, not a global choice: dinput8
+ * answers DI8DEVTYPE_* (0x11..0x15) and dinput<=7 answers DIDEVTYPE_* (1..5). Handing the
+ * legacy family to a DI8 app does not give it a smaller number — it gives it a device it
+ * cannot classify, and an engine that dispatches its buffered reads on the type then
+ * discards every event while looking, from every other vantage point, perfectly healthy.
+ */
+export function deviceTypeConstant(deviceType: string, di8: boolean): number {
+    switch (deviceType) {
+        case "keyboard":
+            return di8 ? DI8DEVTYPE_KEYBOARD : DIDEVTYPE_KEYBOARD;
+        case "mouse":
+            return di8 ? DI8DEVTYPE_MOUSE : DIDEVTYPE_MOUSE;
+        case "joystick":
+            return di8 ? DI8DEVTYPE_JOYSTICK : DIDEVTYPE_JOYSTICK;
+        case "gamepad":
+            return di8 ? DI8DEVTYPE_GAMEPAD : DIDEVTYPE_GAMEPAD;
+        default:
+            return di8 ? DI8DEVTYPE_DEVICE : DIDEVTYPE_DEVICE;
+    }
+}
+
 /** Every live device object, for the harness `dinputState` readout. */
 const liveDInputDevices = new Set<DirectInputDeviceObject>();
+
+/**
+ * What the guest's buffered reads actually YIELD, per device kind.
+ *
+ * `dinputState` answers what the device believes; this answers what the read loop got.
+ * A game that polls GetDeviceData every frame and receives nothing looks identical, from
+ * every other vantage point, to one that never asked — the frame renders, the messages
+ * arrive, and the menu simply does not move. Counting the returns is the only thing that
+ * separates "we produced no events" from "we refused the read" from "the guest ignored
+ * what we handed it".
+ */
+interface DInputTrafficRow {
+    getDeviceDataCalls: number;
+    notAcquired: number;
+    inputLost: number;
+    queryCountCalls: number;
+    peekCalls: number;
+    drains: number;
+    eventsDelivered: number;
+    emptyDrains: number;
+    overflows: number;
+    acquireCalls: number;
+    acquireNoEffect: number;
+    /** Guest return address of the read that last carried events — who consumes them. */
+    lastDeliveringCaller: number;
+}
+
+function emptyTrafficRow(): DInputTrafficRow {
+    return {
+        getDeviceDataCalls: 0, notAcquired: 0, inputLost: 0, queryCountCalls: 0,
+        peekCalls: 0, drains: 0, eventsDelivered: 0, emptyDrains: 0, overflows: 0,
+        acquireCalls: 0, acquireNoEffect: 0, lastDeliveringCaller: 0,
+    };
+}
+
+const dinputTraffic = new Map<string, DInputTrafficRow>();
+
+function trafficFor(kind: string): DInputTrafficRow {
+    let row = dinputTraffic.get(kind);
+    if (!row) { row = emptyTrafficRow(); dinputTraffic.set(kind, row); }
+    return row;
+}
+
+export function describeDInputTraffic(): Record<string, unknown> {
+    const im = System.getInstance().inputManager;
+    const rows: Record<string, unknown> = {};
+    for (const [kind, row] of dinputTraffic) {
+        rows[kind] = { ...row, lastDeliveringCaller: `0x${row.lastDeliveringCaller.toString(16)}` };
+    }
+    return {
+        rows,
+        pending: {
+            mouse: im.getDInputMouseEventCount(),
+            keyboard: im.getDInputKeyboardEventCount(),
+            gamepad: im.getDInputGamepadEventCount(),
+        },
+        bufferSize: {
+            mouse: im.getDInputMouseBufferSize(),
+            keyboard: im.getDInputKeyboardBufferSize(),
+            gamepad: im.getDInputGamepadBufferSize(),
+        },
+    };
+}
+
+export function resetDInputTraffic(): void {
+    dinputTraffic.clear();
+}
 
 /**
  * What DirectInput currently believes about each device. Cooperative level and acquisition
@@ -345,6 +437,7 @@ export function describeDInputDevices(): Array<Record<string, unknown>> {
         inputLost: d.inputLost,
         notifyEvent: d.notifyEvent ? `0x${d.notifyEvent.toString(16)}` : 0,
         isActionMapped: d.isActionMapped,
+        isDI8: d.isDI8,
     }));
 }
 
@@ -377,6 +470,13 @@ class DirectInputDeviceObject extends BaseComObject {
         else untrackLosableDevice(this);
     }
     public dataFormat: DeviceKind = "unknown";
+    /**
+     * Which DirectInput generation handed this device out. The device-type constants are
+     * NOT shared between them — dinput8 reports DI8DEVTYPE_* (0x11..0x15) where dinput<=7
+     * reports DIDEVTYPE_* (1..5) — and a DI8 app that switches on the value drops every
+     * event for a device it cannot classify.
+     */
+    public isDI8 = false;
     public dataSize = 0;
     public acquired = false;
     /** Set when the pad was unplugged while acquired; cleared by Acquire. */
@@ -955,6 +1055,7 @@ export class DInput implements IModule {
 
         this.exports["IDirectInputDeviceA_Acquire"] = (ctx, mem, args) => {
             const device = this.getDevice(args[0]);
+            trafficFor(device?.deviceType ?? "unknown").acquireCalls++;
             // Already acquired: answer DI_NOEFFECT (Wine: dinput_device_Acquire) and skip the
             // acquisition side effects below — re-running them per call is NOT a no-op, since
             // the mouse re-baseline discards the motion accumulated since the last frame and a
@@ -966,6 +1067,7 @@ export class DInput implements IModule {
             // Acquire was silently keeping it alive, and skipping it took the cursor with it.
             // Idempotent, so re-asserting costs nothing.
             if (device?.acquired && !device.inputLost) {
+                trafficFor(device.deviceType).acquireNoEffect++;
                 if (device.deviceType === "mouse") setExclusiveMouseOwner(device, device.exclusive);
                 return DI_NOEFFECT;
             }
@@ -1101,7 +1203,7 @@ export class DInput implements IModule {
             if (size < 12) return DIERR_INVALIDPARAM;
 
             const device = this.getDevice(thisPtr);
-            const devType = this.getDeviceTypeValue(device?.deviceType ?? "unknown");
+            const devType = this.getDeviceTypeValue(device?.deviceType ?? "unknown", device?.isDI8 ?? false);
 
             // dwFlags: report DIDC_ATTACHED for devices we actually present. Keyboard and
             // mouse are always attached; joystick only when a browser gamepad is connected
@@ -1150,7 +1252,7 @@ export class DInput implements IModule {
             if (size < 4) return DIERR_INVALIDPARAM;
 
             const device = this.getDevice(thisPtr);
-            this.writeDeviceInstance(mem, lpddi, size, device?.deviceType ?? "unknown");
+            this.writeDeviceInstance(mem, lpddi, size, device?.deviceType ?? "unknown", device?.isDI8 ?? false);
             return DI_OK;
         };
 
@@ -1480,12 +1582,14 @@ export class DInput implements IModule {
 
             const device = this.getDevice(thisPtr);
             const im = System.getInstance().inputManager;
-            if (device?.inputLost) return DIERR_INPUTLOST;
+            const traffic = trafficFor(device?.deviceType ?? "unknown");
+            traffic.getDeviceDataCalls++;
+            if (device?.inputLost) { traffic.inputLost++; return DIERR_INPUTLOST; }
             // An unacquired device yields DIERR_NOTACQUIRED, exactly as GetDeviceState does.
             // Engines poll the buffered queue and treat that error as "(re)acquire now" —
             // handing them events instead leaves the device unacquired forever, and any
             // input the engine gates on its own acquired flag is then silently dropped.
-            if (device && !device.acquired) return DIERR_NOTACQUIRED;
+            if (device && !device.acquired) { traffic.notAcquired++; return DIERR_NOTACQUIRED; }
 
             // DI8 action-mapped device (keyboard): replay key-state edges as buffered
             // DIDEVICEOBJECTDATA events carrying the app's uAppData. This is the path NFSU's
@@ -1526,6 +1630,7 @@ export class DInput implements IModule {
 
             // NULL rgdod = query how many events are pending
             if (!rgdod) {
+                traffic.queryCountCalls++;
                 if (pdwInOut) view.setUint32(pdwInOut, pending, true);
                 return DI_OK;
             }
@@ -1540,18 +1645,24 @@ export class DInput implements IModule {
             const stride = Math.max(cbObjectData, DIDEVICEOBJECTDATA_SIZE);
 
             if (peek) {
+                traffic.peekCalls++;
                 // Peek mode: report count without consuming
                 if (pdwInOut) view.setUint32(pdwInOut, Math.min(maxItems, pending), true);
                 return DI_OK;
             }
 
             const events = drainFn(maxItems);
+            traffic.drains++;
+            traffic.eventsDelivered += events.length;
+            if (events.length === 0) traffic.emptyDrains++;
+            else traffic.lastDeliveringCaller = view.getUint32(ctx.esp >>> 0, true) >>> 0;
             // Only a buffer that actually LOST events reports DI_BUFFEROVERFLOW. A backlog
             // deeper than the caller's array is ordinary buffered use — the remainder stays
             // queued for the next call. Reporting it as overflow makes the engine's own
             // recovery (flush the input table and re-read) fire on every drain, which
             // wipes a held key the moment anything else is producing events.
             const overflow = takeOverflow();
+            if (overflow) traffic.overflows++;
 
             // Write DIDEVICEOBJECTDATA entries
             for (let i = 0; i < events.length; i++) {
@@ -1801,6 +1912,7 @@ export class DInput implements IModule {
         const obj = ComObjectFactory.create<DirectInputDeviceObject>(iid, vtableAddr, iid);
         if (!obj) return 0;
         obj.deviceType = deviceType;
+        obj.isDI8 = true;
         const objAddr = allocateComObject(this.process.memory, mem, vtableAddr);
         SystemResourceProvider.getInstance().mapAddressToHandle(objAddr, obj.handle);
         return objAddr;
@@ -2361,10 +2473,9 @@ export class DInput implements IModule {
      * fast-path tier. The handler only reads input state and writes the caller's own
      * buffer — it cannot park or switch a thread — hence `trivial`.
      */
-    private registerFastPaths(dispatcher: any): void {
+    private registerFastPaths(dispatcher: HleDispatcher): void {
         if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
-        const getDeviceState = (cpu: any, mem8: Uint8Array, _mem32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4] >>> 0;
+        const getDeviceState: FastPathImplementation = (esp, view, mem8) => {
             if (esp + 16 > mem8.length) return null;
             const thisPtr = view.getUint32(esp + 4, true) >>> 0;
             const cbData = view.getUint32(esp + 8, true) >>> 0;
@@ -2443,19 +2554,8 @@ export class DInput implements IModule {
         return "unknown";
     }
 
-    private getDeviceTypeValue(deviceType: string): number {
-        switch (deviceType) {
-            case "keyboard":
-                return DIDEVTYPE_KEYBOARD;
-            case "mouse":
-                return DIDEVTYPE_MOUSE;
-            case "joystick":
-                return DIDEVTYPE_JOYSTICK;
-            case "gamepad":
-                return DIDEVTYPE_GAMEPAD;
-            default:
-                return DIDEVTYPE_DEVICE;
-        }
+    private getDeviceTypeValue(deviceType: string, di8: boolean): number {
+        return deviceTypeConstant(deviceType, di8);
     }
 
     private readGuidBytes(mem: Uint8Array, address: number): Uint8Array {
@@ -2477,7 +2577,7 @@ export class DInput implements IModule {
         return true;
     }
 
-    private writeDeviceInstance(mem: Uint8Array, address: number, size: number, deviceType: string): void {
+    private writeDeviceInstance(mem: Uint8Array, address: number, size: number, deviceType: string, di8: boolean): void {
         const freshMem = this.getMemory();
         const view = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
         const cappedSize = Math.min(size, DIDEVICEINSTANCEA_SIZE);
@@ -2489,7 +2589,7 @@ export class DInput implements IModule {
         const isGamepad = deviceType === "gamepad" || deviceType === "joystick";
         const guidInstance = isKeyboard ? GUID_SYS_KEYBOARD : (isMouse ? GUID_SYS_MOUSE : (isGamepad ? GUID_SYS_GAMEPAD : GUID_SYS_KEYBOARD));
         const guidProduct = guidInstance;
-        const devType = isKeyboard ? DIDEVTYPE_KEYBOARD : (isMouse ? DIDEVTYPE_MOUSE : (isGamepad ? DIDEVTYPE_JOYSTICK : DIDEVTYPE_DEVICE));
+        const devType = this.getDeviceTypeValue(isKeyboard ? "keyboard" : isMouse ? "mouse" : isGamepad ? "joystick" : "unknown", di8);
         const instanceName = isKeyboard ? "Keyboard" : (isMouse ? "Mouse" : (isGamepad ? "Gamepad" : "Input Device"));
         const productName = isKeyboard ? "Standard Keyboard" : (isMouse ? "Standard Mouse" : (isGamepad ? "Browser Gamepad" : "Input Device"));
 

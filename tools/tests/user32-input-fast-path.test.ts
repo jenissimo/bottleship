@@ -51,7 +51,7 @@ function callSlow(name: string, args: number[]): number {
 function callFast(name: string, args: number[]): number | null {
     cpu.reg32[4] = ESP;
     for (let i = 0; i < args.length; i++) view.setUint32(ESP + 4 + 4 * i, args[i] >>> 0, true);
-    return fastPaths.get(name)!.impl(cpu, mem, mem32, view) as number | null;
+    return fastPaths.get(name)!.impl(cpu.reg32[4]!, view, mem, mem32, cpu) as number | null;
 }
 
 /** Fresh SAB + a cleared manager, then the case's own key events. */
@@ -173,7 +173,7 @@ describe("user32 polled key readers: fast path == thunk", () => {
         seed(() => { });
         cpu.reg32[4] = MEM_SIZE - 4;
         for (const name of ["GetKeyState", "GetAsyncKeyState", "GetKeyboardState"]) {
-            expect(fastPaths.get(name)!.impl(cpu, mem, mem32, view)).toBe(null);
+            expect(fastPaths.get(name)!.impl(cpu.reg32[4]!, view, mem, mem32, cpu)).toBe(null);
         }
     });
 
@@ -181,5 +181,52 @@ describe("user32 polled key readers: fast path == thunk", () => {
         for (const name of ["GetKeyState", "GetAsyncKeyState", "GetKeyboardState"]) {
             expect(fastPaths.get(name)?.trivial).toBe(true);
         }
+    });
+});
+
+/**
+ * The ABSOLUTE Win32 contract of the two polled readers, not just tier agreement:
+ * both tiers can be wrong together, and a click that "leaks" into the next screen is
+ * what a mis-specified edge bit looks like from the game's side.
+ *
+ * GetAsyncKeyState: bit 15 = down NOW, bit 0 = pressed since the PREVIOUS call, and
+ * the call clears bit 0 (the flag is per-key and global, not per-caller).
+ * GetKeyState: level + toggle only — it carries no pressed-since edge at all.
+ */
+describe("polled key readers: the Win32 bit contract", () => {
+    test("GetAsyncKeyState bit 0 reports the press once and the call clears it", () => {
+        seed(() => { System.getInstance().inputManager.injectKey(VK_A, true); });
+        const first = callSlow("GetAsyncKeyState", [VK_A]);
+        expect(first & 0x8000).toBe(0x8000);
+        expect(first & 0x0001).toBe(0x0001);
+        // Still held: the level stands, the edge does not survive the read that took it.
+        const second = callSlow("GetAsyncKeyState", [VK_A]);
+        expect(second & 0x8000).toBe(0x8000);
+        expect(second & 0x0001).toBe(0);
+    });
+
+    test("GetAsyncKeyState still reports a press already released, then forgets it", () => {
+        seed(() => { System.getInstance().inputManager.injectKeyTap(VK_A); });
+        const first = callSlow("GetAsyncKeyState", [VK_A]);
+        expect(first & 0x8000).toBe(0);
+        expect(first & 0x0001).toBe(0x0001);
+        expect(callSlow("GetAsyncKeyState", [VK_A])).toBe(0);
+    });
+
+    test("the fast tier clears the same edge the thunk does", () => {
+        seed(() => { System.getInstance().inputManager.injectKey(VK_A, true); });
+        expect(callFast("GetAsyncKeyState", [VK_A])! & 0x0001).toBe(0x0001);
+        expect(callFast("GetAsyncKeyState", [VK_A])! & 0x0001).toBe(0);
+        expect(callSlow("GetAsyncKeyState", [VK_A]) & 0x0001).toBe(0);
+    });
+
+    test("GetKeyState never carries a pressed-since edge", () => {
+        seed(() => { System.getInstance().inputManager.injectKeyTap(VK_A); });
+        // A tapped non-toggle key: released, and no toggle bit — so the answer is 0,
+        // and a GetAsyncKeyState-style edge bit here would be a wrong low bit.
+        expect(callSlow("GetKeyState", [VK_A])).toBe(0);
+        seed(() => { System.getInstance().inputManager.injectKeyTap(VK_CAPITAL); });
+        expect(callSlow("GetKeyState", [VK_CAPITAL]) & 0x0001).toBe(0x0001); // toggle, not edge
+        expect(callSlow("GetKeyState", [VK_CAPITAL]) & 0x0001).toBe(0x0001); // and it persists
     });
 });
