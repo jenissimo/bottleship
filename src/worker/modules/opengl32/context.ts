@@ -434,6 +434,10 @@ export interface OpenGLContext {
     backend: WebGPUBackend | null;
     executor: any | null; // OpenGLBackendExecutor
     presenter: any | null;
+    /** The DC the current WGL context was made current for — the drawable the default
+     *  framebuffer belongs to. Kept across an unbind, which does not change what is on
+     *  screen (see wglMakeCurrent). */
+    drawableDC: number;
 
     // Error
     error: number; // GL_NO_ERROR = 0
@@ -704,6 +708,7 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         backend: null,
         executor: null,
         presenter: null,
+        drawableDC: 0,
 
         error: 0,
 

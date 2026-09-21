@@ -50,6 +50,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         const hdc = args[0] >>> 0;
         const hglrc = nextHglrc++;
         contexts.set(hglrc, { hdc });
+        if (!ctx.drawableDC) ctx.drawableDC = hdc;
         Logger.log(LogCategory.GDI32, `wglCreateContext(hdc=0x${hdc.toString(16)}) -> 0x${hglrc.toString(16)}`);
         return hglrc;
     };
@@ -87,6 +88,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         }
         currentHglrc = hglrc;
         currentHdc = hdc;
+        if (hdc) ctx.drawableDC = hdc;
 
         // Lazily initialize OpenGL executor once WebGPU backend is available.
         if (!ctx.executor && ctx.backend) {

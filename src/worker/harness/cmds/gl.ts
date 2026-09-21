@@ -6,7 +6,9 @@
  *   scissor that were active, the NDC bounding box the vertices actually cover,
  *   and the texcoord range. That triple ("where the guest asked to draw" vs
  *   "where the pixels land" vs "how big the framebuffer is") is what separates a
- *   projection bug from a viewport/render-target bug without guessing.
+ *   projection bug from a viewport/render-target bug without guessing. It also
+ *   names the two spaces apart: `drawable` is guest pixels (what every vp/scissor
+ *   below is in), `render` is what that frame was rasterized at.
  * - glTextures()/glDumpTexture(id): the texture gallery + a PNG of one texture,
  *   so "is the quad wrong or is its texture wrong" is one call, not a theory.
  */
@@ -83,7 +85,7 @@ function decodeTexEnv(
 export function registerGlCommands(svc: HarnessService): void {
     svc.register("glFrame", async (args) => {
         const opts = (args[0] ?? {}) as { timeoutMs?: number };
-        glCtx(); // fail fast when the title is not GL
+        const ctx = glCtx(); // fail fast when the title is not GL
         armGLFrameCapture();
         const deadline = Date.now() + (opts.timeoutMs ?? 3000);
         let cap = takeGLFrameCapture();
@@ -142,7 +144,16 @@ export function registerGlCommands(svc: HarnessService): void {
                 st: n ? [round(s0), round(s1), round(t0), round(t1)] : null,
             });
         }
-        return { frameId: cap.frameId, drawable: [cap.drawableW, cap.drawableH], count: cap.count, commands };
+        // Both spaces, named: `drawable` is what the guest thinks it draws into (and what
+        // every vp/scissor above is in), `render` is what it was rasterized at.
+        const space = ctx.executor?.getRenderSpace?.();
+        return {
+            frameId: cap.frameId,
+            drawable: [cap.drawableW, cap.drawableH],
+            render: space ? [space.renderW, space.renderH] : null,
+            internalScale: space ? Math.round(space.scale * 1000) / 1000 : null,
+            count: cap.count, commands,
+        };
     });
 
     svc.register("glTextures", () => {

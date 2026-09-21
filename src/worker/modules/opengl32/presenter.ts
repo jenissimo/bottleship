@@ -5,6 +5,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { frameProfiler } from "../../core/frame-profiler";
 import { statsOverlay } from "../../core/stats-overlay";
 import { captureGLFrameIfArmed } from "./frame-capture";
+import { guestDrawableSize } from "./drawable";
 
 export class OpenGLPresenter implements RenderActive {
     readonly suppressGdiOverlay = true;
@@ -35,6 +36,11 @@ export class OpenGLPresenter implements RenderActive {
         }
 
         if (ctx.executor && (ctx.commands.count > 0 || ctx.textures.size > 0)) {
+            // The module owns the DC→window mapping, so the drawable is resolved here and
+            // handed to the executor; the executor may not read user32, and must not fall
+            // back to the canvas (a different space) once a context is current.
+            const d = guestDrawableSize(ctx.drawableDC);
+            ctx.executor.setDrawableSize(d.width, d.height);
             const [dw, dh] = ctx.executor.getDrawableSize();
             captureGLFrameIfArmed(ctx, dw, dh);
             ctx.executor.executeFrame({

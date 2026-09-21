@@ -12,6 +12,9 @@ import { OpenGLFrameInput } from "./opengl-types";
 import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-factory";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { registerBackendQualitySupport } from "../shared/quality-capabilities";
+import { resolveInternalScaleFactor } from "../shared/internal-resolution";
+import { readbackSourceRect, resolveReadback } from "./opengl-readback";
+import { scissorRect, viewportRect } from "./opengl-render-space";
 import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
 import {
     GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS,
@@ -140,9 +143,22 @@ export class OpenGLBackendExecutor {
      *  the compare function INSTEAD of clearing, so a per-frame clear drops every
      *  fragment of the GEQUAL frame. */
     private depthStencilInitialized = false;
-    /** Last frame's default-framebuffer resolution (the GL drawable). */
+    /** Last frame's PHYSICAL default-framebuffer resolution (drawable x renderScale). */
     private presentSourceW = 0;
     private presentSourceH = 0;
+    /** The drawable's guest extent, as published by the opengl32 module. */
+    private drawableW = 0;
+    private drawableH = 0;
+    /**
+     * Internal render scale — ONE uniform scalar (shared/internal-resolution.ts), the same
+     * policy Glide and D3D9 render at. The guest keeps its own drawable: glViewport,
+     * glScissor and glReadPixels all speak guest pixels, and every one of them is multiplied
+     * by this on the way into the render target and divided back out on the way to the guest.
+     */
+    private renderScale = 1;
+    /** Guest extent the current offscreen was allocated for — the space readPixels answers in. */
+    private offscreenGuestW = 0;
+    private offscreenGuestH = 0;
     private targetFormat: GPUTextureFormat | null = null;
 
     private shaderModule: GPUShaderModule | null = null;
@@ -184,7 +200,7 @@ export class OpenGLBackendExecutor {
 
     constructor(backend: WebGPUBackend) {
         this.backend = backend;
-        registerBackendQualitySupport("opengl", ["anisotropy", "forceTrilinear"]);
+        registerBackendQualitySupport("opengl", ["anisotropy", "forceTrilinear", "internalScale"]);
         // All of this is rebuilt lazily by ensureStaticResources/ensureTargets/resolveTexture
         // from the GL object state, which lives on the CPU side and outlives the device.
         registerGpuDeviceObserver("opengl-executor", {
@@ -214,10 +230,50 @@ export class OpenGLBackendExecutor {
         });
     }
 
-    /** Default-framebuffer size: the presentation surface a WGL context owns. */
+    /**
+     * The GUEST-space extent of the default framebuffer, published by the opengl32 module
+     * (which owns the DC→window mapping). The canvas is only the fallback for a frame
+     * executed before any WGL context was made current — it is the PRESENT TARGET, sized by
+     * the host container, and a drawable measured from it puts the guest's own viewport in a
+     * corner of the render target.
+     */
+    setDrawableSize(width: number, height: number): void {
+        if (width > 0 && height > 0) {
+            this.drawableW = width;
+            this.drawableH = height;
+        }
+    }
+
+    /** Default-framebuffer size in GUEST pixels: the surface a WGL context owns. */
     getDrawableSize(): [number, number] {
+        if (this.drawableW > 0 && this.drawableH > 0) return [this.drawableW, this.drawableH];
         const canvas = this.backend.getContext()?.canvas as OffscreenCanvas | undefined;
         return [canvas?.width ?? 0, canvas?.height ?? 0];
+    }
+
+    /** Both spaces side by side, for the harness — naming them is the opposite of conflating them. */
+    getRenderSpace(): { guestW: number; guestH: number; renderW: number; renderH: number; scale: number } {
+        const [guestW, guestH] = this.getDrawableSize();
+        return {
+            guestW, guestH,
+            renderW: this.presentSourceW, renderH: this.presentSourceH,
+            scale: this.renderScale,
+        };
+    }
+
+    /**
+     * The scalar this frame renders the drawable at. `canvasW/H` are handed in by the caller
+     * that already read them: the resolver decides a SAMPLE COUNT, and the render target it
+     * sizes must still fit what the device can allocate.
+     */
+    private resolveRenderScale(
+        device: GPUDevice, guestW: number, guestH: number, canvasW: number, canvasH: number,
+    ): number {
+        const scale = resolveInternalScaleFactor(
+            EmulatorConfig.getInstance().quality.internalScale, guestW, guestH, canvasW, canvasH,
+        );
+        const maxDim = device.limits.maxTextureDimension2D;
+        return Math.max(1, Math.min(scale, maxDim / guestW, maxDim / guestH));
     }
 
     executeFrame(input: OpenGLFrameInput): void {
@@ -240,13 +296,25 @@ export class OpenGLBackendExecutor {
         }
 
         const format = this.backend.getFormat() ?? "bgra8unorm";
-        // The default framebuffer is sized by the DRAWABLE (here: the presentation
-        // surface a WGL context always owns), never by glViewport — glViewport only
-        // maps NDC onto a rectangle inside it. A frame whose last viewport is a
-        // sub-rect (a portal, a HUD strip, a letterboxed 2D pass) must still render
-        // at full drawable resolution.
-        const renderW = screenW;
-        const renderH = screenH;
+        // The default framebuffer is sized by the DRAWABLE — the client area of the window
+        // the WGL context owns, in GUEST pixels — never by glViewport (which only maps NDC
+        // onto a rectangle inside it, so a portal/HUD/letterboxed pass must still render at
+        // full drawable resolution) and never by the canvas (the present target, which the
+        // present pass stretches this offscreen onto).
+        const [guestW, guestH] = this.getDrawableSize();
+        if (guestW <= 0 || guestH <= 0) {
+            Logger.warn(LogCategory.SYSTEM, `OpenGL executeFrame: early exit — drawable ${guestW}x${guestH}`);
+            return;
+        }
+        // The guest's drawable times ONE internal-scale scalar. Everything below that crosses
+        // into the render target — viewport, scissor, the readback rect — multiplies by the
+        // same `scale`; nothing the guest can query does.
+        const scale = this.resolveRenderScale(device, guestW, guestH, screenW, screenH);
+        const renderW = Math.max(1, Math.round(guestW * scale));
+        const renderH = Math.max(1, Math.round(guestH * scale));
+        this.renderScale = scale;
+        this.offscreenGuestW = guestW;
+        this.offscreenGuestH = guestH;
         this.presentSourceW = renderW;
         this.presentSourceH = renderH;
         this.ensureStaticResources(device);
@@ -365,7 +433,7 @@ export class OpenGLBackendExecutor {
                     const uniformOffset = this.allocateUniformSlot();
                     if (uniformOffset < 0) break;
 
-                    this.writeUniforms(queue, uniformOffset, renderW, renderH, I, F, i, f, useTex0, useTex1);
+                    this.writeUniforms(queue, uniformOffset, guestW, guestH, I, F, i, f, useTex0, useTex1);
 
                     const stencilTest = (flags & DF_STENCIL_TEST) !== 0;
                     const pipelineCfg: OpenGLPipelineConfig = {
@@ -395,16 +463,19 @@ export class OpenGLBackendExecutor {
                     const pipeline = this.getOrCreatePipeline(device, pipelineCfg);
                     const bindGroup = this.getOrCreateBindGroup(device, sampler0, view0, sampler1, view1);
                     const pass = beginDrawPass();
-                    if (!this.applyScissor(pass, I, i, flags, renderW, renderH)) break;
+                    if (!this.applyScissor(pass, I, i, flags, guestW, guestH, scale, renderW, renderH)) break;
 
-                    // OpenGL Y-up → WebGPU Y-down, inside the drawable-sized target.
+                    // OpenGL Y-up → WebGPU Y-down, in the guest's own drawable, then scaled
+                    // into the render target. The shader normalises by the GUEST viewport
+                    // dims (writeUniforms), so the geometry needs no change — only the rect.
                     const cmdVpW = I[i + CI_VP_W];
                     const cmdVpH = I[i + CI_VP_H];
-                    const vpW = cmdVpW > 0 ? cmdVpW : renderW;
-                    const vpH = cmdVpH > 0 ? cmdVpH : renderH;
-                    const vpX = I[i + CI_VP_X];
-                    const vpY = renderH - I[i + CI_VP_Y] - vpH;
-                    pass.setViewport(vpX, vpY, vpW, vpH, this.depthRangeMin, this.depthRangeMax);
+                    const vpW = cmdVpW > 0 ? cmdVpW : guestW;
+                    const vpH = cmdVpH > 0 ? cmdVpH : guestH;
+                    const vp = viewportRect(
+                        I[i + CI_VP_X], I[i + CI_VP_Y], vpW, vpH, guestW, guestH, scale, renderW, renderH);
+                    if (!vp) break;
+                    pass.setViewport(vp.x, vp.y, vp.w, vp.h, this.depthRangeMin, this.depthRangeMax);
 
                     pass.setPipeline(pipeline);
                     if (stencilTest) {
@@ -483,7 +554,8 @@ export class OpenGLBackendExecutor {
 
         Logger.verbose(
             LogCategory.SYSTEM,
-            `OpenGL frame: cmds=${stream.count} draws=${drawCount} drawable=${renderW}x${renderH}`,
+            `OpenGL frame: cmds=${stream.count} draws=${drawCount} drawable=${guestW}x${guestH} `
+            + `render=${renderW}x${renderH} scale=${scale.toFixed(3)}`,
         );
     }
 
@@ -509,7 +581,17 @@ export class OpenGLBackendExecutor {
         queue.submit([encoder.finish()]);
     }
 
-    /** Blit offscreen render target to the swapchain, upscaling with nearest filter when needed. */
+    /**
+     * Blit the offscreen render target onto the swapchain.
+     *
+     * Filtering is LINEAR, as in every other backend's present (glide/d3d9 pass no
+     * sampler override). The offscreen is sized by the internal-scale policy, which
+     * preserves the guest aspect with one scalar, so it rarely matches the canvas
+     * exactly; selecting nearest on "sizes differ" made every fractional fit resample
+     * with point sampling, which reads as irregular pixel doubling rather than as the
+     * crisp upscale the flag was named for. Pixel-crisp presentation is an aspectMode /
+     * integerScale decision in the present pass, not a per-backend sampler choice.
+     */
     private blitOffscreenToCanvas(
         targetView: GPUTextureView,
         encoder: GPUCommandEncoder,
@@ -519,7 +601,6 @@ export class OpenGLBackendExecutor {
         if (!this.offscreenView) return;
         const srcW = this.presentSourceW > 0 ? this.presentSourceW : screenW;
         const srcH = this.presentSourceH > 0 ? this.presentSourceH : screenH;
-        const upscale = srcW !== screenW || srcH !== screenH;
         this.backend.drawTexture(
             this.offscreenView,
             targetView,
@@ -528,7 +609,7 @@ export class OpenGLBackendExecutor {
             screenW,
             screenH,
             { r: 0, g: 0, b: 0, a: 1 },
-            upscale,
+            undefined,
             { srcW, srcH, outW: screenW, outH: screenH, toCanvas: true },
         );
     }
@@ -669,6 +750,9 @@ export class OpenGLBackendExecutor {
      * Read a rectangle of the colour buffer back as RGBA8, GL orientation (row 0 is the
      * BOTTOM row, as glReadPixels defines it).
      *
+     * `x/y/width/height` are GUEST drawable pixels and so is the image returned: the
+     * internal render scale is ours, and opengl-readback.ts is what keeps it invisible here.
+     *
      * The source is the offscreen colour target, which holds the most recently EXECUTED
      * frame: commands accumulate until present, so a read issued before SwapBuffers sees
      * the previous frame. That is a one-frame lag, not undefined data — and the caller
@@ -684,43 +768,31 @@ export class OpenGLBackendExecutor {
         const size = this.offscreenSize;
         if (!device || !queue || !texture || !size || !this.offscreenInitialized) return null;
         if (width <= 0 || height <= 0) return null;
-        if (x < 0 || y < 0 || x + width > size.width || y + height > size.height) return null;
+        const guestW = this.offscreenGuestW > 0 ? this.offscreenGuestW : size.width;
+        const guestH = this.offscreenGuestH > 0 ? this.offscreenGuestH : size.height;
+        if (x < 0 || y < 0 || x + width > guestW || y + height > guestH) return null;
 
-        // GL's y counts up from the bottom of the drawable; the texture's counts down.
-        const topY = size.height - (y + height);
-        const bytesPerRow = (width * 4 + 255) & ~255;
+        const scale = this.renderScale;
+        const rect = readbackSourceRect(x, y, width, height, guestH, scale, size.width, size.height);
+        const bytesPerRow = (rect.width * 4 + 255) & ~255;
         const staging = device.createBuffer({
-            size: bytesPerRow * height,
+            size: bytesPerRow * rect.height,
             usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
         });
         try {
             const encoder = device.createCommandEncoder();
             encoder.copyTextureToBuffer(
-                { texture, origin: { x, y: topY, z: 0 } },
-                { buffer: staging, bytesPerRow, rowsPerImage: height },
-                { width, height, depthOrArrayLayers: 1 },
+                { texture, origin: { x: rect.x, y: rect.y, z: 0 } },
+                { buffer: staging, bytesPerRow, rowsPerImage: rect.height },
+                { width: rect.width, height: rect.height, depthOrArrayLayers: 1 },
             );
             queue.submit([encoder.finish()]);
             await staging.mapAsync(GPUMapMode.READ);
             const mapped = new Uint8Array(staging.getMappedRange());
-            const out = new Uint8Array(width * height * 4);
-            const bgra = this.targetFormat === "bgra8unorm";
-            for (let row = 0; row < height; row++) {
-                // Flip vertically on the way out: the last texture row is GL's row 0.
-                const src = (height - 1 - row) * bytesPerRow;
-                const dst = row * width * 4;
-                if (bgra) {
-                    for (let px = 0; px < width; px++) {
-                        const s = src + px * 4, d = dst + px * 4;
-                        out[d] = mapped[s + 2];
-                        out[d + 1] = mapped[s + 1];
-                        out[d + 2] = mapped[s];
-                        out[d + 3] = mapped[s + 3];
-                    }
-                } else {
-                    out.set(mapped.subarray(src, src + width * 4), dst);
-                }
-            }
+            const out = resolveReadback(
+                mapped, bytesPerRow, rect, x, y, width, height, guestH, scale,
+                this.targetFormat === "bgra8unorm",
+            );
             staging.unmap();
             return out;
         } finally {
@@ -1218,8 +1290,8 @@ export class OpenGLBackendExecutor {
     private writeUniforms(
         queue: GPUQueue,
         offset: number,
-        _screenW: number,
-        _screenH: number,
+        guestW: number,
+        guestH: number,
         I: Int32Array,
         F: Float32Array,
         i: number,
@@ -1233,11 +1305,12 @@ export class OpenGLBackendExecutor {
         const vpH = I[i + CI_VP_H];
 
         // 0..16 — use the viewport dimensions that were active when vertices were
-        // transformed (in transformVertices), NOT the canvas size. The vertex shader
-        // reverses the viewport transform: ndcX = (pos.x / screen.x) * 2 - 1, so
-        // screen.x must match the viewportW used in the JS-side viewport transform.
-        this.uniformScratchF32[0] = vpW > 0 ? vpW : _screenW;
-        this.uniformScratchF32[1] = vpH > 0 ? vpH : _screenH;
+        // transformed (in transformVertices), in GUEST pixels — never the canvas, and never
+        // the scaled render extent. The vertex shader reverses the viewport transform:
+        // ndcX = (pos.x / screen.x) * 2 - 1, so screen.x must match the viewportW used in
+        // the JS-side viewport transform.
+        this.uniformScratchF32[0] = vpW > 0 ? vpW : guestW;
+        this.uniformScratchF32[1] = vpH > 0 ? vpH : guestH;
         this.uniformScratchF32[2] = this.clamp01(F[f + CF_ALPHA_REF]);
 
         // 16..48 (u32s)
@@ -1283,34 +1356,28 @@ export class OpenGLBackendExecutor {
         queue.writeBuffer(this.uniformBuffer!, offset, this.uniformScratchBuffer, 0, UNIFORM_BLOCK_SIZE);
     }
 
+    /** The guest's scissor box (guest pixels, GL lower-left) placed in the scaled render target. */
     private applyScissor(
         pass: GPURenderPassEncoder,
         I: Int32Array,
         i: number,
         flags: number,
-        screenW: number,
-        screenH: number,
+        guestW: number,
+        guestH: number,
+        scale: number,
+        renderW: number,
+        renderH: number,
     ): boolean {
         if ((flags & DF_SCISSOR) === 0) {
-            pass.setScissorRect(0, 0, screenW, screenH);
+            pass.setScissorRect(0, 0, renderW, renderH);
             return true;
         }
 
-        const sx = I[i + CI_SCISSOR_X];
-        const sy = I[i + CI_SCISSOR_Y];
-        const sw = Math.max(0, I[i + CI_SCISSOR_W]);
-        const sh = Math.max(0, I[i + CI_SCISSOR_H]);
-
-        // OpenGL scissor origin is lower-left, WebGPU scissor origin is top-left.
-        const x = this.clampInt(sx, 0, screenW);
-        const y = this.clampInt(screenH - (sy + sh), 0, screenH);
-        const w = this.clampInt(sw, 0, screenW - x);
-        const h = this.clampInt(sh, 0, screenH - y);
-        if (w <= 0 || h <= 0) {
-            return false;
-        }
-
-        pass.setScissorRect(x, y, w, h);
+        const r = scissorRect(
+            I[i + CI_SCISSOR_X], I[i + CI_SCISSOR_Y], I[i + CI_SCISSOR_W], I[i + CI_SCISSOR_H],
+            guestW, guestH, scale, renderW, renderH);
+        if (!r) return false;
+        pass.setScissorRect(r.x, r.y, r.w, r.h);
         return true;
     }
 
@@ -1477,12 +1544,6 @@ export class OpenGLBackendExecutor {
         if (v <= 0) return 0;
         if (v >= 1) return 1;
         return v;
-    }
-
-    private clampInt(v: number, min: number, max: number): number {
-        if (v < min) return min;
-        if (v > max) return max;
-        return v | 0;
     }
 
     private buildShaderCode(): string {
