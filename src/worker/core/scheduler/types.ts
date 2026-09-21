@@ -264,6 +264,36 @@ export const WAIT_ABANDONED = 0x00000080;
 export const WAIT_BLOCKED_NO_SWITCH = 0xFFFFFFFE;
 export const INFINITE = 0xFFFFFFFF;
 export const CREATE_SUSPENDED = 0x00000004;
+/** dwStackSize names the RESERVE instead of the initial commit (Win32 CreateThread). */
+export const STACK_SIZE_PARAM_IS_A_RESERVATION = 0x00010000;
+
+/** A stack is a reservation, so it is rounded up like any other (Win32 dwAllocationGranularity). */
+export const STACK_ALLOCATION_GRANULARITY = 0x10000;
+
+/**
+ * How much address space a CreateThread stack gets.
+ *
+ * `dwStackSize` is the initial COMMIT, not the whole stack: Windows reserves
+ * SizeOfStackReserve from the image header and grows into it on demand, and only
+ * STACK_SIZE_PARAM_IS_A_RESERVATION makes dwStackSize the reserve. Reading it as the
+ * reserve hands a thread an order of magnitude less stack than it has on Windows, and
+ * the overflow lands in whatever the allocator placed underneath.
+ *
+ * The granularity rounding is not cosmetic: SizeOfStackReserve is whatever the linker
+ * was told, and a header may name less than a single page. Windows rounds that up to
+ * the allocation granularity, so the floor a thread can be given is 64 KB, never the
+ * literal header value.
+ */
+export function threadStackReserve(
+    stackSize: number, creationFlags: number, imageReserve: number, defaultReserve: number,
+): number {
+    const reserve = imageReserve > 0 ? imageReserve : defaultReserve;
+    const asked = stackSize > 0 ? stackSize : 0;
+    const want = (creationFlags & STACK_SIZE_PARAM_IS_A_RESERVATION) !== 0
+        ? (asked > 0 ? asked : reserve)
+        : Math.max(asked, reserve);
+    return Math.ceil(want / STACK_ALLOCATION_GRANULARITY) * STACK_ALLOCATION_GRANULARITY;
+}
 
 // ─── Wait Decision ──────────────────────────────────────────────────────────────
 

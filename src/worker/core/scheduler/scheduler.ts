@@ -21,6 +21,7 @@ import { System, type ImplicitTlsEntry } from '../system';
 import { SystemResourceProvider } from '../resources/system-resource-provider';
 import { TimeService } from '../../runtime/time';
 import { clearAllActiveExceptions } from '../seh-dispatch';
+import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { Mem } from '../memory/mem-accessor';
 import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
@@ -53,7 +54,7 @@ import {
     KernelThreadObject,
     SchedulerConfig, DEFAULT_SCHEDULER_CONFIG,
     WAIT_OBJECT_0, WAIT_IO_COMPLETION, WAIT_TIMEOUT, WAIT_FAILED,
-    WAIT_BLOCKED_NO_SWITCH, INFINITE, CREATE_SUSPENDED,
+    WAIT_BLOCKED_NO_SWITCH, INFINITE, CREATE_SUSPENDED, threadStackReserve,
     MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED,
 } from './types';
 import {
@@ -160,6 +161,48 @@ export class Scheduler {
     private threadExitStubAddr = 0;
     private readonly threadExitStubSize = 32;
     private readonly defaultStackSize = 1024 * 1024;
+    /** One unmapped page below each thread stack (Windows' PAGE_GUARD page). */
+    private static readonly STACK_GUARD = 0x1000;
+    /** The image's SizeOfStackReserve — what CreateThread reserves when the caller did not
+     *  ask for a reservation. Set at image load; 0 until then (falls back to the default). */
+    private imageStackReserve = 0;
+    /**
+     * Stack address space the scheduler currently holds — live stacks plus the idle ones
+     * parked in `stackPool`. The quantity that decides whether a large SizeOfStackReserve
+     * is affordable; reported when an allocation fails, so heap exhaustion names its cause.
+     * Decremented only where the VA genuinely goes back to MemoryManager (releaseStack's
+     * over-cap branch).
+     */
+    private stackBytesReserved = 0;
+    /**
+     * Idle thread stacks, keyed by exact reserve size; the value is each block's ALLOC
+     * base (guard page included), so a reuse re-derives the same stack/guard layout.
+     *
+     * Reuse is confined to thread stacks — the scheduler never hands a dead stack back to
+     * the general allocator — which is what makes releasing one safe at all: a stale
+     * pointer into a dead stack can then only ever land in another thread's stack, never
+     * in a live heap object, COM struct or surface. NT keeps a per-process stack cache for
+     * the same reason. Self-bounding: an entry exists only between a thread's death and
+     * the next CreateThread at that size, so the pool cannot exceed peak concurrency.
+     */
+    private stackPool = new Map<number, number[]>();
+    private stackBytesPooled = 0;
+    /** Stack bases the scheduler itself allocated. The main thread's stack comes from the
+     *  bootloader (setMainStackInfo), not from us — releasing VA we never owned would hand
+     *  the running process's own stack to the next CreateThread. */
+    private ownedStackBases = new Set<number>();
+    /** Ceiling on idle pooled VA. Past it a released stack goes back to MemoryManager
+     *  (guard page reset first) instead of being cached — so a title cycling through
+     *  ever-larger reserves cannot turn the cache into the leak it replaces. */
+    private static readonly STACK_POOL_MAX_BYTES = 16 * 1024 * 1024;
+    /** Stack lifecycle ledger. `held*` are the refusals: each one is a stack we chose to
+     *  leak because something could still point into it (see canReleaseStack). A climbing
+     *  `heldAsyncInFlight` with a growing footprint names the cause without a repro. */
+    public stackPoolStats = {
+        fresh: 0, reused: 0, pooled: 0, released: 0,
+        heldCurrent: 0, heldAsyncInFlight: 0, heldSuspendedFrame: 0,
+        heldForeignEsp: 0, heldLiveFsBase: 0,
+    };
 
     // Thunk region boundaries for context save
     private thunkStubBase = 0;
@@ -510,7 +553,7 @@ export class Scheduler {
         if (value === this.debugWordWatchPrev) return;
         const prev = this.debugWordWatchPrev;
         this.debugWordWatchPrev = value;
-        const eip = cpu.instruction_pointer[0] >>> 0;
+        const eip = readEip(cpu);
         const entry = `0x${(prev >>> 0).toString(16)}->0x${value.toString(16)} ` +
             `T${this.currentThreadId ?? 0}@0x${eip.toString(16)} insn=${this.retiredInsns(cpu) >>> 0}`;
         if (this.debugWordWatchLog.length < 4096) this.debugWordWatchLog.push(entry);
@@ -530,7 +573,7 @@ export class Scheduler {
         const prev = this.debugHeadWatchPrevHead;
         this.debugHeadWatchPrevHead = head;
         if ((head === 0 || prev === 0) && this.debugHeadZeroSnaps.length < 2000) {
-            const eip = cpu.instruction_pointer[0] >>> 0;
+            const eip = readEip(cpu);
             this.debugHeadZeroSnaps.push(
                 `head 0x${(prev >>> 0).toString(16)}->0x${head.toString(16)} ` +
                 `cur=T${this.currentThreadId ?? 0}@0x${eip.toString(16)} insn=${this.retiredInsns(cpu) >>> 0}`);
@@ -692,6 +735,12 @@ export class Scheduler {
         this.reapQueue.length = 0;
         this.reapHead = 0;
         this.lastReapCheckMs = 0;
+        // process.reset() rewinds the bump allocator, so every pooled base is about to
+        // belong to someone else. Drop the cache; the footprint goes with it.
+        this.stackPool.clear();
+        this.stackBytesPooled = 0;
+        this.stackBytesReserved = 0;
+        this.ownedStackBases.clear();
         this.activeCriticalRuntime = null;
         this.transientExecRanges.clear();
         // Stubs are regenerated after reset() (pe-loader re-runs writeHeapSlabStubs), which
@@ -728,7 +777,7 @@ export class Scheduler {
      * Returns true if the halt fired (the caller must return immediately).
      */
     private handleUnhandledFaultHalt(cpu: V86Cpu, source: string): boolean {
-        const eip0 = cpu.instruction_pointer[0] >>> 0;
+        const eip0 = readEip(cpu);
         if (this.unhandledFaultFired ||
             eip0 < (PF_HALT_TARGET >>> 0) || eip0 > ((PF_HALT_TARGET + 3) >>> 0)) {
             return false;
@@ -759,7 +808,8 @@ export class Scheduler {
     /** Retired guest instructions (v86 32-bit counter; wraps ~every 42 s at target MIPS, so
      *  callers must use an unsigned `>>> 0` delta over a sub-quantum window). */
     private retiredInsns(cpu: V86Cpu): number {
-        return (cpu?.instruction_counter?.[0] ?? 0) >>> 0;
+        if (PROXY_BASELINE.on) return (cpu?.instruction_counter?.[0] ?? 0) >>> 0;
+        return readRetiredInsns(cpu);
     }
 
     /** True once `thread` has retired a full quantum's worth of guest instructions since its last
@@ -917,7 +967,7 @@ export class Scheduler {
         {
             const cur = this.getCurrentThread();
             if (cur && cur.state === ThreadState.RUNNING) {
-                const eip = cpu.instruction_pointer[0] >>> 0;
+                const eip = readEip(cpu);
                 if (this.spinLoopBase > 0 && eip >= this.spinLoopBase && eip < this.spinLoopEnd) {
                     this.spinBoundaryHits.set(cur.id, (this.spinBoundaryHits.get(cur.id) ?? 0) + 1);
                 }
@@ -980,7 +1030,7 @@ export class Scheduler {
             // Strict equality on spinLoopBase — SEH stubs live at +2/+4/+0x200
             // and must keep running, so the wider range check stays yield-only.
             if (current && current.state === ThreadState.RUNNING) {
-                const eip = cpu.instruction_pointer[0] >>> 0;
+                const eip = readEip(cpu);
                 if (this.spinLoopBase > 0 && eip === this.spinLoopBase) {
                     // A thread that owns a live suspended-thunk frame (dialog pump) lands
                     // here after EVERY intermediate callback return — park it WAITING; the
@@ -1071,7 +1121,7 @@ export class Scheduler {
                 // queue and `lastTickExit=7` on every tick. It is spinning, not working —
                 // request the switch so peers run. It stays runnable, so a late restore still
                 // resumes it. (HP CoS: froze at the boot splash with window.dll READY.)
-                if (this.spinLoopBase > 0 && (cpu.instruction_pointer[0] >>> 0) === this.spinLoopBase) {
+                if (this.spinLoopBase > 0 && readEip(cpu) === this.spinLoopBase) {
                     this.switchRequested = true;
                 }
                 const quantumExpired = !(globalThis as { __noQuantumPreempt?: boolean }).__noQuantumPreempt &&
@@ -1087,7 +1137,7 @@ export class Scheduler {
                     // slab state) cannot be interleaved by another thread → "two owners, one
                     // block" (D2 Fog/Storm corruption). The stub is straight-line and exits
                     // within a few instructions, so the defer is bounded to the next tick.
-                    const eip = cpu.instruction_pointer[0] >>> 0;
+                    const eip = readEip(cpu);
                     if (this.isEipNonPreemptible(eip)) {
                         // Safety valve: a straight-line stub leaves the range within a handful
                         // of instructions, so a thread "stuck" at the same EIP across many
@@ -1189,7 +1239,7 @@ export class Scheduler {
 
         // During active SEH dispatch, allow only explicit transient/control boundaries.
         if (kind === ThunkBoundaryKind.GUEST_CODE || kind === ThunkBoundaryKind.THUNK_STUB) {
-            const eip = cpu.instruction_pointer[0] >>> 0;
+            const eip = readEip(cpu);
             this.sehDeferredSwitchCount++;
             const kindName = kind === ThunkBoundaryKind.GUEST_CODE ? 'GUEST_CODE' : 'THUNK_STUB';
             Logger.warn(LogCategory.THREAD,
@@ -1413,7 +1463,7 @@ export class Scheduler {
             case ThunkBoundaryKind.THUNK_STUB: {
                 // Between OUT and RET N → construct post-return context
                 const mem = this.process!.getCurrentMemory();
-                const esp = cpu.reg32[4] >>> 0;
+                const esp = readEsp(cpu);
                 if (esp < 4 || esp + 4 > mem.length) return this.saveCurrentThreadContext(cpu, 'thunk_stub');
 
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1438,7 +1488,7 @@ export class Scheduler {
 
             case ThunkBoundaryKind.GUEST_CODE: {
                 // Normal guest code — validate EIP range
-                const eip = cpu.instruction_pointer[0] >>> 0;
+                const eip = readEip(cpu);
                 if (isValidGuestEip(eip)) {
                     return this.saveCurrentThreadContext(cpu, 'guest');
                 }
@@ -1486,7 +1536,7 @@ export class Scheduler {
         }
 
         this.applyContextState(cpu, ctx, ctx.esp, ownerThreadId);
-        cpu.instruction_pointer[0] = ctx.eip;
+        cpuViews(cpu).instructionPointer[0] = ctx.eip;
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
 
         return true;
@@ -1501,21 +1551,33 @@ export class Scheduler {
      * the direct path writes EIP, the stack path lets RET N pop it off the stack.
      */
     private applyContextState(cpu: V86Cpu, ctx: CpuContext, esp: number, ownerThreadId?: number): void {
-        const reg = cpu.reg32;
+        if (PROXY_BASELINE.on) { this.applyContextStateViaProxy(cpu, ctx, esp, ownerThreadId); return; }
+        const v = cpuViews(cpu);
+        const reg = v.reg32;
         reg[0] = ctx.eax; reg[1] = ctx.ecx; reg[2] = ctx.edx; reg[3] = ctx.ebx;
         reg[4] = esp; reg[5] = ctx.ebp; reg[6] = ctx.esi; reg[7] = ctx.edi;
-        cpu.flags[0] = ctx.eflags;
+        v.flags[0] = ctx.eflags;
         // Mirror v86's update_eflags/popf: the written EFLAGS is authoritative —
         // clear the lazy-flags dirty mask so the resumed thread does NOT recompute
         // arithmetic flags from the OUTGOING thread's last ALU result (shared
         // register file, same hazard class as fpu/simd below).
+        if (v.flagsChanged.length !== 0) v.flagsChanged[0] = 0;
+        this.restoreFpuSimdState(cpu, ctx, ownerThreadId);
+    }
+
+    /** A/B arm only: the pre-conversion register-file write, through v86's Proxy. */
+    private applyContextStateViaProxy(cpu: V86Cpu, ctx: CpuContext, esp: number, ownerThreadId?: number): void {
+        const reg = cpu.reg32;
+        reg[0] = ctx.eax; reg[1] = ctx.ecx; reg[2] = ctx.edx; reg[3] = ctx.ebx;
+        reg[4] = esp; reg[5] = ctx.ebp; reg[6] = ctx.esi; reg[7] = ctx.edi;
+        cpu.flags[0] = ctx.eflags;
         if (cpu.flags_changed) cpu.flags_changed[0] = 0;
         this.restoreFpuSimdState(cpu, ctx, ownerThreadId);
     }
 
     private handleUnsaveableCurrentThread(thread: Thread, cpu: V86Cpu, kind: ThunkBoundaryKind, cleanup: number, source: string): boolean {
-        const eip = cpu.instruction_pointer[0] >>> 0;
-        const esp = cpu.reg32[4] >>> 0;
+        const eip = readEip(cpu);
+        const esp = readEsp(cpu);
         const detail =
             `cannot-save T${thread.id},state=${THREAD_STATE_NAMES[thread.state]},` +
             `eip=${hx(eip)},esp=${hx(esp)},cleanup=${cleanup}`;
@@ -1591,7 +1653,7 @@ export class Scheduler {
         // `torn`. Build a string + push ONLY on the rare discriminating events (torn or
         // switching out mid-splice) — nothing on ordinary switches, so timing is undisturbed.
         if (this.debugHeadWatch) {
-            const outEip = (current?.context?.eip ?? cpu.instruction_pointer[0]) >>> 0;
+            const outEip = (current?.context?.eip ?? cpuViews(cpu).instructionPointer[0]) >>> 0;
             const midMutation = outEip >= this.debugHeadWatch.loEip && outEip < this.debugHeadWatch.hiEip;
             const head = (Mem.readUint32(this.debugHeadWatch.headAddr) ?? 0) >>> 0;
             if ((head === 0 || midMutation) && this.debugHeadWatchLog.length < 4000) {
@@ -1606,7 +1668,7 @@ export class Scheduler {
         // Self-restore optimization
         if (current && next.id === current.id) {
             // If at spin loop with saved context pointing elsewhere, must restore
-            const eip = cpu.instruction_pointer[0] >>> 0;
+            const eip = readEip(cpu);
             const atSpinLoop = this.spinLoopBase > 0 && eip >= this.spinLoopBase && eip < this.spinLoopEnd;
             if (atSpinLoop && next.context && next.context.eip !== eip) {
                 // Fall through to full restore
@@ -1631,7 +1693,7 @@ export class Scheduler {
         this.transitionTo(next, ThreadState.RUNNING, null, null);
 
         // Determine restore method based on current EIP location
-        const currentEip = cpu.instruction_pointer[0] >>> 0;
+        const currentEip = readEip(cpu);
         const inThunkRegion = (currentEip >= this.thunkStubBase && currentEip < this.thunkStubEnd) ||
             (this.callbackStubBase > 0 && currentEip >= this.callbackStubBase && currentEip < this.callbackStubEnd);
 
@@ -1648,7 +1710,7 @@ export class Scheduler {
         // SAVED context GPRs against the LIVE cpu regs after restore — a mismatch is our
         // save/restore losing a register (esi=0 hypothesis). Method = which restore path ran.
         if (this.debugHeadWatch && savedCtx.eip >= this.debugHeadWatch.loEip && savedCtx.eip < this.debugHeadWatch.hiEip) {
-            const r = cpu.reg32;
+            const r = cpuViews(cpu).reg32;
             const method = (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB) ? "stack" : "direct";
             const mism = ((r[6] >>> 0) !== (savedCtx.esi >>> 0)) || ((r[4] >>> 0) !== (savedCtx.esp >>> 0)) ||
                          ((r[7] >>> 0) !== (savedCtx.edi >>> 0)) || ((r[3] >>> 0) !== (savedCtx.ebx >>> 0));
@@ -1723,6 +1785,174 @@ export class Scheduler {
     // Thread Lifecycle
     // ═══════════════════════════════════════════════════════════════════════
 
+    /** Make the page below a thread stack unmapped, so an overflow faults instead of
+     *  silently overwriting the neighbour. No-op before paging comes up — the page is
+     *  still reserved, so nothing else is handed that address either way. */
+    private protectStackGuardPage(guardBase: number): void {
+        const ptm = this.process?.pageTableManager;
+        if (!ptm?.isPagingEnabled?.()) return;
+        try {
+            ptm.setProtection(guardBase, Scheduler.STACK_GUARD, 0x01 /* PAGE_NOACCESS */);
+        } catch (e) {
+            Logger.warn(LogCategory.THREAD, `stack guard page at 0x${guardBase.toString(16)}: ${e}`);
+        }
+    }
+
+    /** Undo protectStackGuardPage, so a block leaving the stack pool does not carry a
+     *  not-present page into the middle of whatever the allocator hands it to next (the
+     *  region map would report that allocation `rw` while the PTE says otherwise). */
+    private unprotectStackGuardPage(guardBase: number): void {
+        const ptm = this.process?.pageTableManager;
+        if (!ptm?.isPagingEnabled?.()) return;
+        try {
+            ptm.setProtection(guardBase, Scheduler.STACK_GUARD, 0x04 /* PAGE_READWRITE */);
+        } catch (e) {
+            Logger.warn(LogCategory.THREAD, `stack guard page reset at 0x${guardBase.toString(16)}: ${e}`);
+        }
+    }
+
+    /**
+     * Guard-page-included alloc base for a stack of `size` bytes: a pooled block when one
+     * of that exact size is idle, otherwise fresh VA from MemoryManager (which may throw).
+     *
+     * A pooled block's guard page is still PAGE_NOACCESS from its previous tenant — that is
+     * the protection the next tenant wants at exactly that address, so it is deliberately
+     * left in place.
+     */
+    private acquireStack(size: number): { allocBase: number; reused: boolean } {
+        const total = size + Scheduler.STACK_GUARD;
+        const free = this.stackPool.get(size);
+        const pooled = free?.pop();
+        if (pooled !== undefined) {
+            if (free!.length === 0) this.stackPool.delete(size);
+            this.stackBytesPooled -= total;
+            this.ownedStackBases.add((pooled + Scheduler.STACK_GUARD) >>> 0);
+            this.stackPoolStats.reused++;
+            return { allocBase: pooled, reused: true };
+        }
+        const allocBase = this.process!.memory.alloc(total, undefined, undefined, Scheduler.STACK_GUARD);
+        this.protectStackGuardPage(allocBase);
+        this.stackBytesReserved += total;
+        this.ownedStackBases.add((allocBase + Scheduler.STACK_GUARD) >>> 0);
+        this.stackPoolStats.fresh++;
+        return { allocBase, reused: false };
+    }
+
+    /**
+     * May the reaper take `thread`'s stack back?
+     *
+     * Freeing a stack introduces address REUSE, and the leak it replaces was accidentally
+     * protective: nothing else could ever be handed those bytes. Every refusal below is a
+     * live reference we cannot prove dead, and each one costs exactly one leaked stack —
+     * which is the trade this whole path is built around.
+     */
+    private canReleaseStack(thread: Thread): boolean {
+        const s = this.stackPoolStats;
+        if (thread.id === this.currentThreadId) { s.heldCurrent++; return false; }
+
+        // An async thunk parked on this thread holds guest pointers INTO its frame (the
+        // out-params the handler will write) and completes on a later turn; termination
+        // does not cancel the in-flight JS work, only the restore that would have followed.
+        // Typed, not duck-typed: a rename on the dispatcher must be a compile error here,
+        // not a gate that silently stops holding anything.
+        if (this.process?.dispatcher?.hasActiveAsyncThunkForThread(thread.id)) {
+            s.heldAsyncInFlight++;
+            return false;
+        }
+
+        // A live suspended-thunk frame (a JS-driven pump) is resumed from its own saved
+        // ESP on this stack.
+        if (this.onThreadOwnsSuspendedFrame?.(thread.id)) { s.heldSuspendedFrame++; return false; }
+
+        const base = thread.stackBase >>> 0;
+        const top = thread.stackTop >>> 0;
+
+        // FS still selects this thread's TEB, whose StackBase/StackLimit name the range we
+        // are about to hand out — the guest has not left this context yet.
+        const cpu = this.getCpu();
+        const fsBase = cpu ? (cpuViews(cpu).segmentOffsets[4] ?? 0) >>> 0 : 0;
+        if (fsBase !== 0 && thread.tebAddress > 0 && fsBase === (thread.tebAddress >>> 0)) {
+            s.heldLiveFsBase++;
+            return false;
+        }
+
+        // Guests switch ESP onto stacks they did not allocate (fibers, coroutine runtimes).
+        // A surviving thread parked on the dead thread's stack must keep it. The RUNNING
+        // thread's ESP is in the register file, not in its saved context (which is stale
+        // while it runs), so it is read live rather than from the loop below.
+        const liveEsp = cpu ? readEsp(cpu) : 0;
+        if (liveEsp >= base && liveEsp < top) { s.heldForeignEsp++; return false; }
+        for (const other of this.threads.values()) {
+            if (other.id === thread.id || other.state === ThreadState.TERMINATED) continue;
+            const esp = (other.context?.esp ?? 0) >>> 0;
+            if (esp >= base && esp < top) { s.heldForeignEsp++; return false; }
+        }
+        return true;
+    }
+
+    /**
+     * Give a reaped thread's stack back — to the stack pool, or (past the pool ceiling)
+     * to MemoryManager. Windows deallocates the stack when the thread terminates; holding
+     * it forever is the deviation, and at 8 MB of SizeOfStackReserve a handful of dead
+     * threads exhaust the heap.
+     */
+    private releaseStack(thread: Thread): void {
+        const size = thread.stackSize >>> 0;
+        const base = thread.stackBase >>> 0;
+        if (size === 0 || !this.ownedStackBases.has(base)) return;
+        if (!this.canReleaseStack(thread)) return;
+
+        this.ownedStackBases.delete(base);
+        const allocBase = base - Scheduler.STACK_GUARD;
+        const total = size + Scheduler.STACK_GUARD;
+        if (this.stackBytesPooled + total > Scheduler.STACK_POOL_MAX_BYTES) {
+            this.unprotectStackGuardPage(allocBase);
+            // Leaving the pool means the general allocator may carve this VA for anything,
+            // and the next tenant is filled by a JS write the JIT cannot see. Drop the
+            // blocks v86 compiled from what ran on this stack here, where we still know
+            // the extent (§3.1 coherence) — MemoryManager.free does not.
+            invalidateGuestCode(allocBase, total);
+            this.process?.memory.free(allocBase);
+            this.stackBytesReserved -= total;
+            this.stackPoolStats.released++;
+            return;
+        }
+        let free = this.stackPool.get(size);
+        if (!free) { free = []; this.stackPool.set(size, free); }
+        free.push(allocBase);
+        this.stackBytesPooled += total;
+        this.stackPoolStats.pooled++;
+    }
+
+    /** Stack footprint + lifecycle ledger (harness `threads` state, CreateThread failures).
+     *  The three quantities partition `reservedBytes`: what threads that still exist hold,
+     *  what is idle in the pool, and what a refused release leaked (see canReleaseStack) —
+     *  summing live+pooled would otherwise bury the leak the refusals pay for. */
+    getStackFootprint(): {
+        reservedBytes: number; pooledBytes: number; liveBytes: number; heldBytes: number;
+        pooledBlocks: number; stats: Scheduler['stackPoolStats'];
+    } {
+        let pooledBlocks = 0;
+        for (const free of this.stackPool.values()) pooledBlocks += free.length;
+        let liveBytes = 0;
+        for (const t of this.threads.values()) {
+            if (this.ownedStackBases.has(t.stackBase >>> 0)) liveBytes += (t.stackSize >>> 0) + Scheduler.STACK_GUARD;
+        }
+        return {
+            reservedBytes: this.stackBytesReserved,
+            pooledBytes: this.stackBytesPooled,
+            liveBytes,
+            heldBytes: this.stackBytesReserved - this.stackBytesPooled - liveBytes,
+            pooledBlocks,
+            stats: { ...this.stackPoolStats },
+        };
+    }
+
+    /** Publish the image's SizeOfStackReserve (see the sizing rule in createThread). */
+    setImageStackReserve(bytes: number): void {
+        this.imageStackReserve = Math.max(0, bytes | 0);
+    }
+
     createThread(
         startAddress: number, parameter: number, stackSize: number,
         creationFlags: number, outThreadId: number, memory: Uint8Array
@@ -1730,17 +1960,34 @@ export class Scheduler {
         if (!this.process) return 0;
         this.writeThreadExitStub();
 
-        const size = stackSize > 0 ? stackSize : this.defaultStackSize;
+        const size = threadStackReserve(stackSize, creationFlags, this.imageStackReserve, this.defaultStackSize);
+        // Windows puts a PAGE_GUARD page below every thread stack, so an overflow raises
+        // STATUS_STACK_OVERFLOW at the moment it happens. Without one the overflow is
+        // silent and lands in whatever the allocator placed underneath — the corruption
+        // then detonates in an unrelated subsystem with nothing pointing back here.
         let stackBase: number;
+        let reusedStack: boolean;
         try {
-            stackBase = this.process.memory.alloc(size);
+            const acquired = this.acquireStack(size);
+            stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
+            reusedStack = acquired.reused;
         } catch (e) {
-            Logger.error(LogCategory.THREAD, `CreateThread failed: ${e}`);
+            const f = this.getStackFootprint();
+            Logger.error(LogCategory.THREAD,
+                `CreateThread failed: ${e} (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
+                `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
+                `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
+                `the stack pool, ${f.heldBytes} leaked by a refused release)`);
             return 0;
         }
 
         const stackTop = stackBase + size;
         memory.fill(0, stackBase, stackTop);
+        // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
+        // into the dead zone below ESP is ours), so a recycled stack can still carry v86
+        // blocks compiled from its previous tenant. The zero-fill above is a JS write and
+        // is invisible to the JIT — same turn, no await between (see §3.1 coherence).
+        if (reusedStack) invalidateGuestCode(stackBase, size);
 
         // Set up stack: [parameter, exitStubAddr]
         const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
@@ -1929,6 +2176,12 @@ export class Scheduler {
             if (entry.threadId === this.currentThreadId) break;
             const thread = this.threads.get(entry.threadId);
             if (thread && thread.state === ThreadState.TERMINATED) {
+                // Release before the record goes: releaseStack reads stackBase/stackSize
+                // and the gate walks the live threads for a foreign ESP in this span.
+                // Reap time, not terminate time — the grace period is what puts thousands
+                // of context switches between the last instruction executed on this stack
+                // and the moment its address can be handed out again.
+                this.releaseStack(thread);
                 this.threads.delete(entry.threadId);
                 this.stackSpanIndex = null;
             }
@@ -2442,7 +2695,7 @@ export class Scheduler {
         // Without this guard, tick boundaries fire timerWheel.poll() → onTimerFire
         // → dispatchTimerThreadCallbacks while a previous callback is still executing,
         // causing nested callbacks that defer the counter-incrementing epilogue.
-        const eip = cpu.instruction_pointer[0] >>> 0;
+        const eip = readEip(cpu);
         if (this.spinLoopBase > 0 && (eip < this.spinLoopBase || eip >= this.spinLoopEnd)) {
             this.timerDispatchStats.eipGuard++;
             return false;
@@ -2511,11 +2764,11 @@ export class Scheduler {
         this.timerDispatchStats.invoked++;
         this.traceTimerThread(
             `invoke#${this.timerDispatchStats.invoked} cb=0x${cb.callbackAddr.toString(16)} ` +
-            `esp=0x${(cpu.reg32[4] >>> 0).toString(16)} inFlight=${cbMgr.getWinmmInFlight?.() ?? 0}`);
+            `esp=0x${readEsp(cpu).toString(16)} inFlight=${cbMgr.getWinmmInFlight?.() ?? 0}`);
         this.timerDispatchStats.deferStreak = 0;
 
         Logger.verbose(LogCategory.THREAD,
-            `dispatchTimerCallback: T${currentThread.id} cb=0x${cb.callbackAddr.toString(16)} timerId=${cb.timerId} EIP=0x${(cpu.instruction_pointer[0] >>> 0).toString(16)} ESP=0x${(cpu.reg32[4] >>> 0).toString(16)}`);
+            `dispatchTimerCallback: T${currentThread.id} cb=0x${cb.callbackAddr.toString(16)} timerId=${cb.timerId} EIP=0x${readEip(cpu).toString(16)} ESP=0x${readEsp(cpu).toString(16)}`);
 
         // Track the peak in-flight winmm_timer count (cheap). With the atomic-execution pin
         // the previous callback always returns before we dispatch here, so this stays ~0-1;
@@ -2606,7 +2859,7 @@ export class Scheduler {
         const thread = this.getCurrentThread();
         if (!thread) return false;
 
-        const eip = cpu.instruction_pointer[0] >>> 0;
+        const eip = readEip(cpu);
         if (!this.isValidEipForRestore(eip)) return false;
         const context = this.saveCurrentThreadContext(cpu);
 
@@ -3541,8 +3794,8 @@ export class Scheduler {
         if (threadId === this.getTimerThreadId()) {
             this.timerDispatchStats.asyncParkTimer++;
             this.traceTimerThread(
-                `asyncPark T${threadId} eip=0x${(cpu.instruction_pointer[0] >>> 0).toString(16)} ` +
-                `esp=0x${(cpu.reg32[4] >>> 0).toString(16)}`);
+                `asyncPark T${threadId} eip=0x${readEip(cpu).toString(16)} ` +
+                `esp=0x${readEsp(cpu).toString(16)}`);
         }
 
         const waitInfo: WaitInfo = {
@@ -3561,9 +3814,9 @@ export class Scheduler {
         // later restoreContext puts the CPU exactly where RET would have.
         // Skip when EIP is ALREADY at the spin loop (retro-park from the tick-boundary
         // safety net) — the RET has executed and ESP is final; +4 would skew it.
-        if (this.spinLoopBase > 0 && (cpu.instruction_pointer[0] >>> 0) !== this.spinLoopBase) {
+        if (this.spinLoopBase > 0 && readEip(cpu) !== this.spinLoopBase) {
             context.eip = this.spinLoopBase >>> 0;
-            context.esp = (cpu.reg32[4] + 4) >>> 0;
+            context.esp = (cpuViews(cpu).reg32[4] + 4) >>> 0;
         }
 
         const nextAsyncParkGeneration = (((thread.asyncParkGeneration >>> 0) + 1) >>> 0) || 1;
@@ -3629,7 +3882,7 @@ export class Scheduler {
         const parked = thread.context;
         const result = this.transitionTo(thread, ThreadState.RUNNING, null, null);
         if (result.success && cpu && parked) {
-            const reg = cpu.reg32;
+            const reg = cpuViews(cpu).reg32;
             const live = {
                 ebx: reg[3] >>> 0,
                 ebp: reg[5] >>> 0,
@@ -3694,10 +3947,11 @@ export class Scheduler {
 
         this.traceAsyncRestore(source, cpu,
             `apply eip=${hx(eip)},esp=${hx(esp)},eax=${hx(eax)},target=T${target?.threadId ?? this.currentThreadId ?? 0}/g${target?.asyncParkGeneration ?? 0}`);
-        cpu.reg32[0] = eax >>> 0;
-        cpu.reg32[4] = esp >>> 0;
+        const v = cpuViews(cpu);
+        v.reg32[0] = eax >>> 0;
+        v.reg32[4] = esp >>> 0;
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
-        cpu.instruction_pointer[0] = eip >>> 0;
+        v.instructionPointer[0] = eip >>> 0;
         if (target) this.consumeAsyncParkGeneration(target.threadId, target.asyncParkGeneration, source, cpu);
         return true;
     }
@@ -3715,7 +3969,7 @@ export class Scheduler {
         if (!thread || thread.state === ThreadState.TERMINATED) return;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const esp = cpu.reg32[4] >>> 0;
+        const esp = readEsp(cpu);
         if (esp + 4 > mem.length) return;
 
         const exitCode = view.getUint32(esp, true);
@@ -3942,7 +4196,7 @@ export class Scheduler {
         Logger.error(LogCategory.THREAD, `FATAL GUARD: code=0x${code.toString(16)} arg=0x${arg.toString(16)} thread=${threadId}`);
         const sys = System.getInstance();
         const cpu = this.getCpu();
-        const eip = (cpu?.instruction_pointer?.[0] ?? arg) >>> 0;
+        const eip = cpu ? readEip(cpu) : (arg >>> 0);
         this.dumpSchedulerAsyncState(`fatalGuard:0x${code.toString(16)}`, cpu, undefined,
             `code=${hx(code)},arg=${hx(arg)},thread=T${threadId}`, 'error');
         sys.reportGuestCrash({
@@ -4022,8 +4276,8 @@ export class Scheduler {
         const current = this.getCurrentThread();
         this.pushTrace({
             seq: ++this.asyncTraceSeq,
-            eip: cpu ? cpu.instruction_pointer[0] >>> 0 : 0,
-            esp: cpu ? cpu.reg32[4] >>> 0 : 0,
+            eip: cpu ? readEip(cpu) : 0,
+            esp: cpu ? readEsp(cpu) : 0,
             threadId: current?.id ?? 0,
             state: current?.state ?? -1,
             kind,
@@ -4047,7 +4301,7 @@ export class Scheduler {
     traceAsyncRestore(source: string, cpu?: V86Cpu | null, detail: string = ''): void {
         const current = this.getCurrentThread();
         const live = cpu
-            ? `liveEip=${hx(cpu.instruction_pointer[0])},liveEsp=${hx(cpu.reg32[4])}`
+            ? `liveEip=${hx(cpuViews(cpu).instructionPointer[0])},liveEsp=${hx(cpuViews(cpu).reg32[4])}`
             : 'live=?';
         const entry = `t=${Math.round(performance.now())} source=${source} ${live} ${formatThreadSnapshot(current)} ${detail}`.trim();
         this.pushTrace(entry);
@@ -4061,7 +4315,7 @@ export class Scheduler {
     private dumpSchedulerAsyncState(source: string, cpu: V86Cpu | null, kind?: ThunkBoundaryKind, detail: string = '', level: 'warn' | 'error' = 'error'): void {
         const current = this.getCurrentThread();
         const live = cpu
-            ? `liveEip=${hx(cpu.instruction_pointer[0])},liveEsp=${hx(cpu.reg32[4])}`
+            ? `liveEip=${hx(cpuViews(cpu).instructionPointer[0])},liveEsp=${hx(cpuViews(cpu).reg32[4])}`
             : 'live=?';
         const message =
             `[ASYNC-SCHED-DUMP] source=${source},boundary=${boundaryKindName(kind)},${live},` +
@@ -4703,7 +4957,7 @@ export class Scheduler {
 
         const stackBase = this.mainStackBase || 0;
         const stackSize = this.mainStackTop > 0 ? this.mainStackTop - stackBase : 0;
-        const stackTop = this.mainStackTop || (cpu.reg32[4] >>> 0);
+        const stackTop = this.mainStackTop || readEsp(cpu);
 
         let tebAddress = 0;
         if (this.process.memory && stackTop > 0) {
@@ -4718,13 +4972,13 @@ export class Scheduler {
             state: ThreadState.RUNNING,
             context: null,
             stackBase, stackSize, stackTop,
-            startAddress: cpu.instruction_pointer[0] >>> 0,
+            startAddress: readEip(cpu),
             parameter: 0,
             waitInfo: null, exitCode: null,
             tlsValues: new Map(), lastError: 0,
             suspendCount: 0, priority: 0,
             lastSwitchTime: performance.now(),
-            lastSwitchInsn: (cpu?.instruction_counter?.[0] ?? 0) >>> 0,
+            lastSwitchInsn: readRetiredInsns(cpu),
             tebAddress, kernelPinCount: 0,
             apcQueue: [],
             quitPosted: false, quitExitCode: 0,

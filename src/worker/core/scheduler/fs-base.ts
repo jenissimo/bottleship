@@ -1,6 +1,7 @@
 import { GDT_FS_DESCRIPTOR_ADDRESS } from "../bootloader";
 import { Mem } from "../memory/mem-accessor";
 import type { V86Cpu } from "./types";
+import { cpuViews } from "../cpu/cpu-views";
 
 /**
  * Program the guest FS base for a thread's TEB — the ONE writer of that state.
@@ -20,7 +21,8 @@ import type { V86Cpu } from "./types";
 export function setFsBase(cpu: V86Cpu, tebAddress: number): void {
     const base = tebAddress >>> 0;
 
-    if (cpu.segment_offsets) cpu.segment_offsets[4] = base | 0;
+    const segOffsets = cpuViews(cpu).segmentOffsets;
+    if (segOffsets.length > 4) segOffsets[4] = base | 0;
 
     // Descriptor base is split 15:0 / 23:16 / 31:24 across bytes +2..+3, +4 and +7.
     // No writeGuestCode/invalidateGuestCode here: these are DATA bytes. v86 re-reads the

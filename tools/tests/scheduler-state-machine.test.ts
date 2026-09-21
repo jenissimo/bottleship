@@ -994,13 +994,23 @@ function v86ViewProxy(buffer: ArrayBuffer, offset: number, length: number): unkn
 }
 
 /** Fake CPU backed by a WASM-memory ArrayBuffer so simd/fpu snapshot can read it. */
+// v86 keeps the whole CPU state block at fixed offsets in wasm linear memory
+// (global_pointers.rs) and only PUBLISHES it as `cpu.reg32` & co. A fake whose register
+// file is a standalone array beside the buffer is not the same machine: a reader that
+// re-derives from `wasm_memory.buffer` writes somewhere this fake never looks, and the
+// test passes while asserting on the wrong bytes.
+const REG32_WASM_OFFSET = 64;
+const FLAGS_WASM_OFFSET = 120;
+const EIP_WASM_OFFSET = 556;
+const SREG_WASM_OFFSET = 668;
+
 function fakeCpuWithWasm(opts?: { exportDirtyFlag?: boolean; v86ViewProxy?: boolean }): V86Cpu {
     const buffer = new ArrayBuffer(4096);
     const cpu: Record<string, unknown> = {
-        reg32: new Int32Array(8),
-        instruction_pointer: new Int32Array(1),
-        flags: new Int32Array(1),
-        sreg: new Int16Array(8),
+        reg32: new Int32Array(buffer, REG32_WASM_OFFSET, 8),
+        instruction_pointer: new Int32Array(buffer, EIP_WASM_OFFSET, 1),
+        flags: new Int32Array(buffer, FLAGS_WASM_OFFSET, 1),
+        sreg: new Int16Array(buffer, SREG_WASM_OFFSET, 8),
         is_jumping: false,
         wasm_memory: { buffer },
     };
