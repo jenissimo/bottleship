@@ -8,6 +8,7 @@ import ch from "../ui/Chip/Chip.module.css";
 import sh from "../ui/SectionHeading/SectionHeading.module.css";
 import hm from "../ui/Hint/Hint.module.css";
 import { Spacer } from "../ui/Spacer";
+import { useHostModal } from "../harness/use-host-modal";
 import {
   X,
   UploadSimple,
@@ -340,6 +341,8 @@ export default function WgbWizardModal({
   onEditLibrary,
   onPersisted,
 }: WgbWizardModalProps): React.ReactElement | null {
+  // Host modal, not a guest one — see harness/use-host-modal.ts.
+  useHostModal("wgbWizard", isOpen, { caption: "Add a game" });
   const [step, setStep] = useState<StepId>(1);
   const [maxStepReached, setMaxStepReached] = useState<StepId>(1);
 

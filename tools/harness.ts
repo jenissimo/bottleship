@@ -859,7 +859,15 @@ async function cmdReload(): Promise<void> {
 /** Run a single harness cmd and pretty-print its result (report/stubs/backtrace).
  *  Numeric args (e.g. an esp) are parsed; everything else passes through. */
 async function cmdSingle(cmd: string, rest: string[]): Promise<void> {
-    const args = rest.map((a) => {
+    // `--parent` addresses the ROOT worker instead of a promoted child. A launcher that
+    // hands off (its child opens a MessageBox) moves the harness channel to the child's
+    // realm, and the parent's history — its childProcesses(), thunk ring, stubs, VFS —
+    // is then unreachable, not gone. The address belongs on the TRANSPORT, not on one
+    // verb: after a hand-off every parent-side verb is equally unreachable, so
+    // `report --parent` / `stubs --parent` / `fsIoReport --parent` all work the same way.
+    const parent = rest.includes("--parent");
+    const opts = parent ? { target: "root" as const } : undefined;
+    const args = rest.filter((a) => a !== "--parent").map((a) => {
         if (/^0x[0-9a-f]+$/i.test(a)) return parseInt(a, 16);
         if (/^\d+$/.test(a)) return Number(a);
         // "false" must not arrive as a truthy string: `gpuToggle <flag> false` would
@@ -868,7 +876,7 @@ async function cmdSingle(cmd: string, rest: string[]): Promise<void> {
         if (/^[[{]/.test(a)) { try { return JSON.parse(a); } catch { return a; } } // {"continuous":true} etc.
         return a;
     });
-    const result = await execViaCdp([{ cmd, args } as unknown as HarnessStep]);
+    const result = await execViaCdp([{ cmd, args, opts } as unknown as HarnessStep]);
     console.log(JSON.stringify(result.steps?.[0]?.result ?? result, null, 2));
 }
 
@@ -891,7 +899,7 @@ async function main(): Promise<void> {
         case "reload": await cmdReload(); break;
         case "regress": await cmdRegress(rest); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...] [--parent]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,

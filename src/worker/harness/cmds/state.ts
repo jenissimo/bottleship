@@ -22,6 +22,10 @@ import { apiCensus } from "../../core/diagnostics/api-census";
 import { childProcessHistory, runChildProcess } from "../../core/child-process";
 
 export function registerStateCommands(svc: HarnessService): void {
+    // A clean ExitProcess sets isExiting and emits nothing. Without this the service
+    // cannot tell "the guest is busy" from "the guest is gone", and every live-guest
+    // verb after an exit pays out its full timeout instead of saying so.
+    svc.setGuestExitProbe(() => !!sys()?.isExiting);
     svc.register("childProcesses", () => ({ processes: childProcessHistory.map(record => ({ ...record })) }));
     svc.register("runChildProcess", async args => {
         const imagePath = sys().fileSystem.resolvePath(String(args[0]));

@@ -3,6 +3,7 @@ import { getEffectiveManifest, saveOverride, type ManifestOverride } from "../wg
 import { cx } from "../ui/cx";
 import s from "./ManifestEditorModal.module.css";
 import ms from "../ui/Modal/Modal.module.css";
+import { useHostModal } from "../harness/use-host-modal";
 import { ActionButton } from "../ui/ActionButton";
 
 interface ManifestEditorModalProps {
@@ -86,6 +87,9 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
       .catch((err) => setError(`Failed to read manifest: ${err?.message ?? err}`))
       .finally(() => setLoading(false));
   }, [gameKey]);
+
+  // Host modal, not a guest one — see harness/use-host-modal.ts.
+  useHostModal("manifestEditor", !!gameKey, { caption: "Edit manifest", text: gameKey ?? undefined });
 
   if (!gameKey) return null;
 

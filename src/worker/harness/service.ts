@@ -41,6 +41,8 @@ export type HarnessHandler = (args: unknown[], ctx: HarnessCtx) => unknown | Pro
 interface InFlight {
     controller: AbortController;
     timer: ReturnType<typeof setTimeout> | null;
+    /** Waits on guest progress, so a clean exit must end it early. */
+    needsGuest: boolean;
 }
 
 /**
@@ -64,6 +66,30 @@ export class HarnessService {
     private inFlight = new Map<number, InFlight>();
     /** Set by a fatal fault; every later command fails until the guest is reloaded. */
     private crashed: HarnessError | null = null;
+    /**
+     * "Has the guest process ended cleanly?" A crash emits a fatal `fault` and latches
+     * `crashed`; a clean ExitProcess emits nothing, so every live-guest verb used to poll
+     * for progress that could never come and pay out its own multi-minute timeout — which
+     * reads as the RPC channel having died. Probed rather than latched so a reload clears
+     * it with no extra bookkeeping.
+     */
+    private guestExited: (() => boolean) | null = null;
+
+    /** Wire the clean-exit probe (worker-side, see cmds/state.ts). */
+    setGuestExitProbe(probe: (() => boolean) | null): void {
+        this.guestExited = probe;
+    }
+
+    private exitedError(): HarnessError | null {
+        let exited = false;
+        try { exited = !!this.guestExited?.(); } catch { return null; }
+        if (!exited) return null;
+        return new HarnessError(
+            "guest process has exited (ExitProcess) — nothing will advance. The post-mortem "
+            + "verbs still answer: report, stubs, state, logs, fs*, childProcesses.",
+            HarnessErrorCode.EXITED,
+        );
+    }
 
     constructor() {
         // A fatal guest crash ends every wait NOW. Without this a script that was
@@ -95,6 +121,27 @@ export class HarnessService {
         for (const f of this.inFlight.values()) f.controller.abort(err);
     }
 
+    /**
+     * A clean exit announces itself to nobody, so a wait already parked when the guest
+     * called ExitProcess has nothing to wake it. Poll — but only while a live-guest verb
+     * is actually parked, so an idle worker pays nothing.
+     */
+    private exitPoll: ReturnType<typeof setInterval> | null = null;
+
+    private watchForExit(): void {
+        const waiting = [...this.inFlight.values()].some((f) => f.needsGuest);
+        if (!waiting) {
+            if (this.exitPoll !== null) { clearInterval(this.exitPoll); this.exitPoll = null; }
+            return;
+        }
+        if (this.exitPoll !== null) return;
+        this.exitPoll = setInterval(() => {
+            const dead = this.exitedError();
+            if (!dead) { this.watchForExit(); return; }
+            for (const f of this.inFlight.values()) if (f.needsGuest) f.controller.abort(dead);
+        }, 250);
+    }
+
     /** Register a command handler. Re-registration overwrites (last wins). */
     register(name: string, handler: HarnessHandler): void {
         this.handlers.set(name, handler);
@@ -118,9 +165,12 @@ export class HarnessService {
     /** Dispatch a harness_rpc message, posting the correlated reply. */
     async dispatch(msg: HarnessRequest): Promise<void> {
         const { id, cmd, args, opts } = msg;
-        if (this.crashed && NEEDS_LIVE_GUEST.has(cmd)) {
-            this.reply({ type: HARNESS_REPLY, id, ok: false, error: toErrorPayload(this.crashed) });
-            return;
+        if (NEEDS_LIVE_GUEST.has(cmd)) {
+            const dead = this.crashed ?? this.exitedError();
+            if (dead) {
+                this.reply({ type: HARNESS_REPLY, id, ok: false, error: toErrorPayload(dead) });
+                return;
+            }
         }
         const handler = this.handlers.get(cmd);
         if (!handler) {
@@ -137,7 +187,8 @@ export class HarnessService {
                 controller.abort(new HarnessError(`timeout after ${ms}ms`, HarnessErrorCode.TIMEOUT));
             }, ms);
         }
-        this.inFlight.set(id, { controller, timer });
+        this.inFlight.set(id, { controller, timer, needsGuest: NEEDS_LIVE_GUEST.has(cmd) });
+        this.watchForExit();
 
         const ctx: HarnessCtx = {
             runId: id,
@@ -162,6 +213,7 @@ export class HarnessService {
             const f = this.inFlight.get(id);
             if (f?.timer) clearTimeout(f.timer);
             this.inFlight.delete(id);
+            this.watchForExit();
         }
     }
 

@@ -368,11 +368,21 @@ class LoggerImpl {
     /** Ring capacity — a reader that returns this many entries may have been TRUNCATED by it. */
     getBufferSize(): number { return this.bufferSize; }
 
+    /**
+     * Resize the ring, CARRYING the entries it already holds (newest kept when the
+     * new capacity is smaller). A resize is not a clear — `clear()` is the spelling
+     * for that. The host replays a persisted `__logRingSize` mid-boot, so a
+     * discarding resize silently emptied exactly the window (module load, import
+     * binding, device init) the size was raised to capture.
+     */
     setBufferSize(size: number): void {
-        this.bufferSize = size;
-        this.buffer = [];
-        this.writeIndex = 0;
-        this.entryCount = 0;
+        const cap = Math.max(1, Math.floor(size));
+        const kept = this.getOrderedEntries().slice(-cap);
+        this.bufferSize = cap;
+        this.buffer = kept;
+        // A full ring reads as wrapped (getOrderedEntries keys off buffer.length),
+        // so writeIndex must be the oldest slot; a partial ring still appends.
+        this.writeIndex = kept.length % cap;
     }
 
     /**

@@ -12,7 +12,8 @@ const ring = () => Logger.getRecentEntries();
 describe("category level gates the log ring", () => {
     beforeEach(() => {
         Logger.resetCategoryLevels();
-        Logger.setBufferSize(200); // also clears the ring
+        Logger.setBufferSize(200);
+        Logger.clear(); // a resize CARRIES its entries now; clear() is the spelling for empty
     });
 
     test("an unconfigured category still fills the ring", () => {

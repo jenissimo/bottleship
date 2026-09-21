@@ -1,6 +1,7 @@
 import React from "react";
 import StorageManagerBody from "./StorageManagerBody";
 import ms from "../ui/Modal/Modal.module.css";
+import { useHostModal } from "../harness/use-host-modal";
 
 /**
  * User-facing storage manager, reachable from the library page (not just Settings).
@@ -13,6 +14,8 @@ interface Props {
 }
 
 const StorageManagerModal: React.FC<Props> = ({ isOpen, onClose }) => {
+    // Host modal, not a guest one — see harness/use-host-modal.ts.
+    useHostModal("storageManager", isOpen, { caption: "Storage" });
     if (!isOpen) return null;
 
     return (

@@ -33,6 +33,45 @@ export class SessionWorker extends EventTarget implements Worker {
         const message = new MessageEvent('message', { data: event.data, ports: [...event.ports] });
         this.sources.set(message, source ?? this.root);
         this.dispatchEvent(message);
+        // A promoted child that has exited is about to be terminated by its parent, so
+        // leaving the channel pointed at it turns every later harness call into a post
+        // into a dead port — which reads as "the RPC died" and is unrecoverable short of
+        // a page reload. Exit is when a post-mortem is wanted most. The root worker
+        // outlives the child (it stays up as its VFS broker) and holds the child's
+        // record, so the channel falls back there. `broker` is the PARENT's own exit
+        // relayed through the child's port, not the child's.
+        if (event.data?.type === 'process_exit' && source !== null && source === this.foreground
+            && !event.data.broker) {
+            this.retireForeground();
+        }
+    }
+
+    /** Point the channel back at the root and settle anything still addressed to the
+     *  retired port — a caller must be told, not left to time out. */
+    private retireForeground(): void {
+        const retired = this.foreground;
+        if (!retired) return;
+        this.foreground = null;
+        for (const [id, target] of [...this.requests]) {
+            if (target !== retired) continue;
+            this.requests.delete(id);
+            const dead = new MessageEvent('message', {
+                data: {
+                    type: 'harness_reply', id, ok: false,
+                    error: {
+                        code: 'CRASHED',
+                        message: 'the child session exited while this call was in flight — '
+                            + 'the harness now targets the parent worker; its childProcesses() '
+                            + 'holds the exited child’s record, logs and fault',
+                    },
+                },
+            });
+            this.sources.set(dead, this.root);
+            this.dispatchEvent(dead);
+        }
+        const reset = new MessageEvent('message', { data: { type: 'child_session_reset' } });
+        this.sources.set(reset, this.root);
+        this.dispatchEvent(reset);
     }
 
     postMessage(message: any, options: Transferable[] | StructuredSerializeOptions = []): void {
@@ -47,7 +86,13 @@ export class SessionWorker extends EventTarget implements Worker {
         if (['set_session', 'set_quality', 'set_debug_flag', 'logging_global_enable'].includes(message?.type)) {
             this.settings.set(`${message.type}:${message.key ?? ''}`, message);
         }
-        if (message?.type === 'harness_rpc') this.requests.set(message.id, this.foreground);
+        // `target:'root'` addresses the ROOT worker even while a child holds the
+        // foreground. The parent keeps running (VFS broker) and owns the history a
+        // promoted child's realm cannot see — its own childProcesses(), its thunk ring,
+        // its VFS. Without an address for it that state is merely unreachable, not gone.
+        const toRoot = message?.type === 'harness_rpc' && message?.opts?.target === 'root';
+        if (message?.type === 'harness_rpc') this.requests.set(message.id, toRoot ? null : this.foreground);
+        if (toRoot) { this.root.postMessage(message, options as Transferable[]); return; }
         if (message?.type === 'harness_cancel' && this.requests.has(message.id)) {
             (this.requests.get(message.id) ?? this.root).postMessage(message);
             return;

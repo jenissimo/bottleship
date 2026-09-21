@@ -15,8 +15,9 @@ export interface HarnessStep {
     /** Optional human label for the journal/log. */
     label?: string;
     /** Per-step RPC options (e.g. a longer/unbounded timeout for long waits).
-     *  timeoutMs<=0 disables the RPC envelope (the verb's own deadline governs). */
-    opts?: { timeoutMs?: number };
+     *  timeoutMs<=0 disables the RPC envelope (the verb's own deadline governs).
+     *  `target:'root'` addresses the parent worker instead of a promoted child. */
+    opts?: { timeoutMs?: number; target?: "auto" | "root" };
 }
 
 /** Marker for a serialized predicate/function argument (e.g. waitUntil). */

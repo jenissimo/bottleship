@@ -44,6 +44,14 @@ export interface HarnessRequest {
 export interface HarnessCallOpts {
     /** Override the default timeout. 0 or negative disables the timeout. */
     timeoutMs?: number;
+    /**
+     * Which worker realm answers. "auto" (default) is the promoted child when one holds
+     * the foreground, else the root. "root" addresses the ROOT worker explicitly — the
+     * parent survives a child's promotion and owns history the child's realm never had
+     * (its own childProcesses(), thunk ring, VFS). Honored by the page-side broker
+     * (src/app/session-worker.ts); a plain single-realm setup ignores it.
+     */
+    target?: "auto" | "root";
 }
 
 export interface HarnessCancel {
@@ -90,6 +98,8 @@ export const HarnessErrorCode = {
     UNSUPPORTED: "UNSUPPORTED",
     /** The guest process died while the command was waiting — no point waiting out the timeout. */
     CRASHED: "CRASHED",
+    /** The guest called ExitProcess. A clean exit, not a fault — the post-mortem verbs still answer. */
+    EXITED: "EXITED",
     /** An expect* verb looked, and what it found violated the invariant it asserts. */
     ASSERT_FAILED: "ASSERT_FAILED",
     INTERNAL: "INTERNAL",

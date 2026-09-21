@@ -36,6 +36,7 @@ import { relativeIntent } from "../input/relative-intent";
 /** Verbs handled page-side (browser-only) rather than forwarded to the worker. */
 const BROWSER_ONLY = new Set([
     "openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal", "dismissModal", "inputSab",
+    "report", "hostModals", "setHostModal",
     "hostRecord", "hostRecordStop", "hostReplay",
 ]);
 
@@ -176,6 +177,52 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
 
     function setLiveModal(dismiss: ((button: number) => void) | null, box: { text?: string; caption?: string } = {}): void {
         liveModal = dismiss ? { dismiss, box } : null;
+    }
+
+    /**
+     * HOST-level modals — the host's own DOM dialogs (storage manager, the WGB wizard,
+     * a manifest editor), which no guest ever asks for and `report().pendingModals`
+     * therefore cannot see: that census is built in the worker from the guest's
+     * MessageBox bridge. A host modal sits over the canvas and swallows the clicks a
+     * chain sends, so a blocked chain and a slow one look identical — which is the one
+     * thing a diagnostic must never do. Components register while mounted; `report()`
+     * folds them into the same `pendingModals` list, tagged `source:"host"`, so "is
+     * something blocking?" has ONE answer rather than two half-answers.
+     */
+    const hostModals = new Map<string, { caption?: string; text?: string; since: number }>();
+
+    function setHostModal(name: string, info: { caption?: string; text?: string } | null): { open: string[] } {
+        if (info) hostModals.set(name, { ...info, since: Date.now() });
+        else hostModals.delete(name);
+        return { open: [...hostModals.keys()] };
+    }
+
+    /** Host modals currently on screen. Also the blocking check openWgb makes. */
+    function hostModalCensus(): Array<{ name: string; caption?: string; text?: string; waitingMs: number }> {
+        const now = Date.now();
+        return [...hostModals.entries()].map(([name, m]) => ({
+            name, caption: m.caption, text: m.text, waitingMs: now - m.since,
+        }));
+    }
+
+    /**
+     * report(), plus the half of "what is blocking?" that only the page can see. The
+     * worker's own pendingModals entries are tagged `source:"guest"` so a reader can
+     * still tell them apart; `hostModals` carries the host ones on their own as well.
+     */
+    async function reportWithHost(args: unknown[], opts?: HarnessCallOpts): Promise<unknown> {
+        const r = await rpc("report", args, opts) as Record<string, unknown> | null;
+        const host = hostModalCensus();
+        if (!r || typeof r !== "object") return r;
+        const guest = Array.isArray(r.pendingModals) ? r.pendingModals : [];
+        return {
+            ...r,
+            hostModals: host,
+            pendingModals: [
+                ...guest.map((m) => ({ ...(m as object), source: "guest" })),
+                ...host.map((m) => ({ ...m, source: "host" })),
+            ],
+        };
     }
 
     /**
@@ -350,6 +397,20 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
     async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean; args?: string }): Promise<unknown> {
         const path = await resolveBundlePath(idOrUrl);
         const w = window as any;
+        // A host modal over the canvas eats the load's own UI and every click that
+        // follows, and it is not the guest's, so nothing in the worker reports it. Say
+        // so HERE: a chain that is blocked must not be indistinguishable from a chain
+        // that is merely slow, which is what the 120s stall bound below would make it.
+        const blocking = hostModalCensus();
+        if (blocking.length) {
+            const names = blocking.map((m) => `${m.name}${m.caption ? ` (${m.caption})` : ""}`).join(", ");
+            throw new HarnessError(
+                `openWgb("${path}"): a host modal is on screen and would block the load: ${names}. `
+                + `Close it first (harness.dismissModal() answers a guest MessageBox; a host dialog `
+                + `needs its own close), or check harness.report().pendingModals.`,
+                HarnessErrorCode.UNSUPPORTED,
+            );
+        }
         // The worker reports a failed load as {type:"error"}, never as a "done" phase, so
         // waiting only for "done" turns every load failure into a 120s stall that still
         // reports ok — the run then fails later, somewhere unrelated, with the real reason
@@ -373,7 +434,13 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         }
         const done = await loadDone;
         if (done?.type === "error") throw new Error(`openWgb("${path}"): ${done.message}`);
-        if (!done) throw new Error(`openWgb("${path}"): no load completion within 120s`);
+        if (!done) {
+            // A modal that went up DURING the load is the likeliest reason nothing
+            // progressed; naming it beats reporting a bare stall.
+            const late = hostModalCensus();
+            throw new Error(`openWgb("${path}"): no load completion within 120s`
+                + (late.length ? ` — a host modal is on screen: ${late.map((m) => m.name).join(", ")}` : ""));
+        }
         return { path, loaded: true, progress: done };
     }
 
@@ -561,6 +628,8 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         if (step.cmd === "onModal") { onMessageBox((step.args[0] as string) ?? ".*", (step.args[1] as string | number) ?? "ok"); return { armed: true, pattern: step.args[0] ?? ".*" }; }
         if (step.cmd === "clearModals") { clearModalAnswers(); return { cleared: true }; }
         if (step.cmd === "dismissModal") return dismissModal((step.args[0] as number | string) ?? "ok", (step.args[1] as boolean) ?? true);
+        if (step.cmd === "report") return reportWithHost(step.args, step.opts);
+        if (step.cmd === "hostModals") return { modals: hostModalCensus() };
         // Predicate args (waitUntil) are pre-serialized as {__fn} — pass through;
         // the worker reconstructs and evaluates them in its own context.
         return rpc(step.cmd, step.args, step.opts);
@@ -611,6 +680,9 @@ export function installHarnessFacade(worker: Worker, getInputView?: () => Int32A
         autoModalReply,
         setLiveModal,
         dismissModal,
+        setHostModal,
+        hostModals: () => ({ modals: hostModalCensus() }),
+        report: (...args: unknown[]) => reportWithHost(args),
     };
 
     // Proxy so any worker command is callable as harness.<cmd>(...args) (like the

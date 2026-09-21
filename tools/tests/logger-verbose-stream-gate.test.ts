@@ -18,6 +18,7 @@ describe("an explicit category level silences verbose for the stream too", () =>
     beforeEach(() => {
         Logger.resetCategoryLevels();
         Logger.setBufferSize(500);
+        Logger.clear();
         streamed = [];
         Logger.setStreamCallback((entries: any) => {
             for (const e of Array.isArray(entries) ? entries : [entries]) streamed.push(String(e.message));

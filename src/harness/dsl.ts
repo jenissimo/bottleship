@@ -54,6 +54,12 @@ export class HarnessChain {
         this.steps.push({ cmd, args: ser(args), label });
         return this;
     }
+    /** Push a step with explicit RPC options (e.g. `target:'root'` to address the parent
+     *  worker rather than a promoted child). */
+    private pushWithOpts(cmd: string, args: unknown[], opts?: HarnessStep["opts"]): this {
+        this.steps.push({ cmd, args: ser(args), opts });
+        return this;
+    }
     /** Push a step with an explicit RPC timeout (long/unbounded waits — so the
      *  default 60s RPC envelope doesn't pre-empt the verb's own deadline). */
     private pushTimed(cmd: string, args: unknown[], timeoutMs: number): this {
@@ -239,8 +245,20 @@ export class HarnessChain {
     stubs(): this { return this.push("stubs", []); }
     /** Guest restart requests (image + command line + caller). Pair with setWorkerFlag('__noReExec', true) to stop a relaunch loop on its first iteration. */
     reExecs(): this { return this.push("reExecs", []); }
-    /** Child image, command line, completion and exit code without losing the parent session. */
-    childProcesses(): this { return this.push("childProcesses", []); }
+    /**
+     * Child image, command line, completion and exit code.
+     *
+     * `{ parent: true }` asks the ROOT worker rather than whichever realm currently holds
+     * the foreground. After a launcher hands off (its child opens a MessageBox) the
+     * channel points at the CHILD's realm, whose own history is empty — the record of the
+     * hand-off lives in the parent, which is still running as the child's VFS broker.
+     */
+    childProcesses(opts?: { parent?: boolean }): this {
+        return this.pushWithOpts("childProcesses", [], opts?.parent ? { target: "root" } : undefined);
+    }
+    /** Host DOM dialogs on screen (storage manager, wizard, manifest editor) — the half of
+     *  "is something blocking?" the worker cannot see. Also folded into report().pendingModals. */
+    hostModals(): this { return this.push("hostModals", []); }
     fsHash(path: string, options?: { chunkBytes?: number }): this { return this.push("fsHash", [path, options]); }
     runChildProcess(image: string, args = '', cwd?: string): this {
         return this.push("runChildProcess", [image, args, cwd]);
