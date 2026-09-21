@@ -399,51 +399,58 @@ Quality Gate (mandatory order):
      too and are outside that model — a code-shape gap, not a scope one)
  13. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
  14. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
- 15. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
- 16. bun tools/validate-jit-shipping-config.ts   (the ONE shipping JIT envelope, tools/jit-config/shipping.mjs,
+ 15. bun tools/validate-cpu-proxy-reads.ts      (v86 publishes the CPU state block — reg32, EIP,
+     instruction_counter, segment_offsets — as `view()` Proxies, so every INDEX is a get trap +
+     resolve() + buffer compare, per access, on the thunk/scheduler hot paths. core/cpu/cpu-views.ts
+     is the single owner of plain views over those bytes and of the pinned offsets;
+     `cpuViews(cpu)` / `readEip` / `readEsp` / `readRetiredInsns` are the sanctioned spellings.
+     Ownership + a pinned per-file census, so the class can shrink but never grow — a bare
+     comment cannot hold it, because indexing the Proxy is always CORRECT)
+ 16. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
+ 17. bun tools/validate-jit-shipping-config.ts   (the ONE shipping JIT envelope, tools/jit-config/shipping.mjs,
      is what PreemptionManager applies and what every offline arm calls "shipping")
- 17. bun tools/validate-census-abi.ts            (opcode-census key layout agrees between opstats.rs and
+ 18. bun tools/validate-census-abi.ts            (opcode-census key layout agrees between opstats.rs and
      guest-opcode-classes.ts)
- 18. bun tools/validate-tlb-mirror.mjs           (`tlb_data` has ONE writer, cpu::set_tlb_entry, in any
+ 19. bun tools/validate-tlb-mirror.mjs           (`tlb_data` has ONE writer, cpu::set_tlb_entry, in any
      assignment spelling — the permission bitmap is a mirror of it)
- 19. bun tools/validate-eagl-read-cursor.mjs     (every function that CLEARS a TLB entry
+ 20. bun tools/validate-eagl-read-cursor.mjs     (every function that CLEARS a TLB entry
      — `set_tlb_entry(page, 0)` — also drops the EAGL read cursor. That containment is the
      whole safety argument for the cursor outliving a hypercall; a fifth clearing site
      would otherwise let it answer from a page the CPU no longer maps, and the read would
      succeed with the wrong bytes)
- 20. bun tools/validate-video-plane-policy.ts   (the video plane has ONE composite policy —
+ 21. bun tools/validate-video-plane-policy.ts   (the video plane has ONE composite policy —
      `video/video-plane-policy.ts`. Six present paths reach the screen; when each decided for
      itself from "the plane still holds a bitmap" they disagreed about when it STOPS being on
      screen, and a finished movie covered the menu. Nothing outside `src/worker/video/` may
      reach `getOverlayService()`)
- 21. bun tools/validate-render-space-ownership.ts   (the host canvas size is not a guest-space
+ 22. bun tools/validate-render-space-ownership.ts   (the host canvas size is not a guest-space
      quantity. Guest space is the extent the app asked for — viewport, scissor, the XYZRHW
      divisor, every readback extent; the canvas is the present target, sized by the host
      container. D3D9 conflated them and rendered a 640x480 game into the top-left corner of a
      1557x1168 canvas. Reading the canvas is a pinned census of file+member: the present pass
      and the internal-scale resolver, nothing else)
- 22. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+ 23. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
      arity that helper declares — our shaders are template strings, invisible to the typechecker,
      and one bad call blackens a whole pass)
- 23. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+ 24. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
      LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
      missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
- 24. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+ 25. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
      from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
      statement before the device is published)
- 25. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+ 26. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
      predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
- 26. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+ 27. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
      writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
- 27. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+ 28. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
      is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
      capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
      intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
      one with `--update-baseline`)
- 28. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+ 29. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
      naga is an error instead of a silent skip)
- 29. bun run typecheck
- 30. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+ 30. bun run typecheck
+ 31. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
      every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
 
 `bun run gate` runs all of it in order — including the test suite as the final step. CI runs
@@ -525,6 +532,14 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
                       [--list]`. An installer payload has NO `(listfile)`: names come from the
                       install script inside it, and `readBlockByIndex` recovers a block's key from
                       its own sector table when there is no name to hash.
+    - xz/ + tar/    — the `.tar.xz` a Linux game drop arrives as (xz container over the shared
+                      LZMA2 backend; ustar + GNU/pax tar). CLI: `tools/tar-extract.ts <archive>
+                      <out> [--list] [--filter s] [--strip n] [--offset n]`. A stream APPENDED to
+                      a stub — a makeself/YAD `.sh` installer, an SFX `.exe` — is found in place
+                      by anchoring the candidate on the footer at EOF, so no carve-out copy of an
+                      11 GB payload. Such a drop is a whole Wine prefix: the game is under
+                      `prefix/drive_c/`, and the prefix's `system.reg`/`user.reg` feed make-wgb's
+                      `--reg-import` + `--reg-import-under`.
     - unpack/       — shared native codec backend (LZMA1/LZMA2/srep) built from the Rust crate
                       `tools/build-unpack-streaming` → `public/unpack-streaming.wasm`, plus the
                       dependency-free primitives (RandomAccessSource, Crc32/Md5/Sha1) every reader uses.
