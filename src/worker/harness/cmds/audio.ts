@@ -408,4 +408,43 @@ export function registerAudioCommands(svc: HarnessService): void {
             configuredEmpty,
         };
     });
+
+    /** openalSources() — every AL source, with the queue accounting the guest reads back.
+     *
+     *  OpenAL audio is invisible everywhere else: `audioBuffers`/`audioSignal.buffers`
+     *  enumerate DirectSound, and a source that is wedged reports nothing but the
+     *  AL_SOURCE_STATE / AL_BUFFERS_PROCESSED pair the app polls. Both come from OUR
+     *  bookkeeping, so a source parked in AL_PLAYING with no ring behind it (`playing`
+     *  with `ring:null`) or a `processed` count that never rises while `queued` does is
+     *  the whole failure, visible in one row. `backlog` is ring bytes written but not yet
+     *  played: a healthy stream keeps it well above 0, and 0 with a non-empty queue is a
+     *  starving refill. */
+    svc.register("openalSources", () => {
+        const al: any = getModule("wrap_oal");
+        if (!al) return { error: "no wrap_oal module" };
+        const STATE: Record<number, string> = {
+            0x1011: "INITIAL", 0x1012: "PLAYING", 0x1013: "PAUSED", 0x1014: "STOPPED",
+        };
+        const sources: unknown[] = [];
+        for (const s of al.sources.values()) {
+            const st = s.stream;
+            sources.push({
+                id: s.id,
+                state: STATE[s.state] ?? s.state,
+                bufferId: s.bufferId,
+                gain: s.gain,
+                queued: s.queue.length,
+                processed: s.processedBuffers.length,
+                staticRing: !!s.sab,
+                ring: st ? {
+                    bytes: st.ringBytes,
+                    written: st.written,
+                    played: al.streamPlayed(st),
+                    backlog: st.written - al.streamPlayed(st),
+                    channels: st.channels, sampleRate: st.sampleRate, bits: st.bits,
+                } : null,
+            });
+        }
+        return { sources, buffers: al.buffers.size };
+    });
 }

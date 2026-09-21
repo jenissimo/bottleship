@@ -7,6 +7,12 @@
  * Audio path: alBufferData stores PCM → alSourcePlay creates SAB ring buffer
  * → posts audio_register to main thread → AudioWorklet plays.
  *
+ * A source is STATIC (alSourcei AL_BUFFER) or STREAMING (alSourceQueueBuffers).
+ * A streaming source plays its whole queue through ONE circular ring and retires
+ * buffers to AL_BUFFERS_PROCESSED as the worklet consumes them — that count is the
+ * only signal an app's refill loop runs on, so it must come from the play cursor
+ * rather than from an explicit stop.
+ *
  * All OpenAL functions use cdecl calling convention.
  */
 
@@ -35,6 +41,11 @@ import {
     STATE_PAUSED,
     STATE_STOPPED,
     FLAG_CIRCULAR,
+    FLAG_STREAMING,
+    CTRL_BLOCK_BYTES,
+    CTRL_RESERVED,
+    CTRL_PLAY_CURSOR,
+    CTRL_WRITE_CURSOR,
     floatToI32,
 } from "../../../audio/audio-ring-buffer";
 
@@ -110,6 +121,36 @@ interface ALBuffer {
     data: Uint8Array;     // raw PCM copy
 }
 
+/** One buffer in a streaming source's queue, tracked against the ring it feeds. */
+interface ALQueueEntry {
+    bufId: number;
+    /** Ring bytes this buffer contributes. */
+    bytes: number;
+    /** Bytes of it already appended to the ring. */
+    appended: number;
+    /** `ALStream.written` at which its last byte lands; -1 until fully appended. */
+    end: number;
+}
+
+/**
+ * The ring a streaming (queued) source plays through.
+ *
+ * One ring for the source's whole life, not one per buffer: an OpenAL queue plays
+ * back to back with no gap, and a per-buffer ring would restart the worklet at every
+ * boundary. `written` is monotonic, so the worklet's modulo play cursor unwraps
+ * exactly (see streamPlayed) and buffer retirement is byte-accurate.
+ */
+interface ALStream {
+    sab: SharedArrayBuffer;
+    ringBytes: number;
+    frameBytes: number;
+    channels: number;
+    sampleRate: number;
+    bits: number;
+    /** Total bytes ever appended — never wrapped. */
+    written: number;
+}
+
 interface ALSource {
     id: number;
     state: number;        // AL_INITIAL / AL_PLAYING / AL_PAUSED / AL_STOPPED
@@ -120,11 +161,13 @@ interface ALSource {
     posX: number; posY: number; posZ: number;
     relative: boolean;
     // Queue for streaming
-    queuedBuffers: number[];
+    queue: ALQueueEntry[];
     processedBuffers: number[];
-    // Audio worklet registration
+    stream: ALStream | null;
+    // Audio worklet registration (static buffer playback)
     audioId: number;      // 0 = not registered
     sab: SharedArrayBuffer | null;
+    streamAudioId: number;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -145,6 +188,12 @@ interface ALSource {
 function syncSourceState(src: ALSource): void {
     if (src.state !== AL_PLAYING || !src.sab) return;
     if (getCtrl(src.sab, CTRL_STATE) === STATE_STOPPED) src.state = AL_STOPPED;
+}
+
+/** Ring capacity for a streaming source: enough for several of the app's own buffers. */
+function streamRingBytes(entryBytes: number, frameBytes: number): number {
+    const want = Math.min(Math.max(entryBytes * 4, 96 * 1024), 4 * 1024 * 1024);
+    return Math.max(frameBytes * 2, Math.floor(want / frameBytes) * frameBytes);
 }
 
 function writeString(process: Process, str: string): number {
@@ -194,6 +243,8 @@ export class OpenAL implements IModule {
     // Pre-allocated string pointers
     private stringPtrs = new Map<number, number>();
 
+    private lastPumpAllMs = 0;
+
     initialize(process: Process): void {
         this.process = process;
 
@@ -240,7 +291,17 @@ export class OpenAL implements IModule {
 
         // ── AL (core state) ──────────────────────────────────────────────
 
-        this.exports["alGetError"] = () => AL_NO_ERROR;
+        // Safety net for an app that never polls a streaming source's state: the ring
+        // still has to be topped up and its buffers retired. Throttled — alGetError is
+        // one of the hottest calls an OpenAL app makes.
+        this.exports["alGetError"] = () => {
+            const now = performance.now();
+            if (now - this.lastPumpAllMs >= 4) {
+                this.lastPumpAllMs = now;
+                for (const src of this.sources.values()) this.pumpStream(src);
+            }
+            return AL_NO_ERROR;
+        };
         this.exports["alEnable"] = () => 0;
         this.exports["alDisable"] = () => 0;
         this.exports["alIsEnabled"] = () => AL_FALSE;
@@ -287,8 +348,8 @@ export class OpenAL implements IModule {
                     id, state: AL_INITIAL, bufferId: 0,
                     gain: 1.0, pitch: 1.0, looping: false,
                     posX: 0, posY: 0, posZ: 0, relative: false,
-                    queuedBuffers: [], processedBuffers: [],
-                    audioId: 0, sab: null,
+                    queue: [], processedBuffers: [], stream: null,
+                    audioId: 0, sab: null, streamAudioId: 0,
                 });
                 dv.setUint32(sourcesPtr + i * 4, id, true);
             }
@@ -316,16 +377,22 @@ export class OpenAL implements IModule {
             if (!src) return 0;
             const fval = Math.fround(new Float32Array(new Uint32Array([value]).buffer)[0]);
             switch (param) {
-                case AL_GAIN:
+                case AL_GAIN: {
                     src.gain = fval;
-                    if (src.sab) setCtrl(src.sab, CTRL_VOLUME, gainToCentibels(fval));
+                    const cb = gainToCentibels(fval);
+                    if (src.sab) setCtrl(src.sab, CTRL_VOLUME, cb);
+                    if (src.stream) setCtrl(src.stream.sab, CTRL_VOLUME, cb);
                     break;
+                }
                 case AL_PITCH:
                     src.pitch = fval;
                     // Pitch → frequency ratio applied to SAB
                     if (src.sab && src.bufferId) {
                         const buf = this.buffers.get(src.bufferId);
                         if (buf) setCtrl(src.sab, CTRL_FREQUENCY, Math.round(buf.sampleRate * fval));
+                    }
+                    if (src.stream) {
+                        setCtrl(src.stream.sab, CTRL_FREQUENCY, Math.round(src.stream.sampleRate * fval));
                     }
                     break;
             }
@@ -341,11 +408,12 @@ export class OpenAL implements IModule {
             const f3 = Math.fround(new Float32Array(new Uint32Array([v3]).buffer)[0]);
             if (param === AL_POSITION) {
                 src.posX = f1; src.posY = f2; src.posZ = f3;
-                if (src.sab) {
-                    setCtrlFloat(src.sab, CTRL_3D_POS_X, f1);
-                    setCtrlFloat(src.sab, CTRL_3D_POS_Y, f2);
-                    setCtrlFloat(src.sab, CTRL_3D_POS_Z, f3);
-                    setCtrl(src.sab, CTRL_3D_FLAGS, 1); // has3D
+                for (const sab of [src.sab, src.stream?.sab ?? null]) {
+                    if (!sab) continue;
+                    setCtrlFloat(sab, CTRL_3D_POS_X, f1);
+                    setCtrlFloat(sab, CTRL_3D_POS_Y, f2);
+                    setCtrlFloat(sab, CTRL_3D_POS_Z, f3);
+                    setCtrl(sab, CTRL_3D_FLAGS, 1); // has3D
                 }
             }
             return 0;
@@ -360,9 +428,15 @@ export class OpenAL implements IModule {
             switch (param) {
                 case AL_BUFFER:
                     src.bufferId = value;
+                    // Spec: attaching a buffer (0 included) clears the source's queue.
+                    this.releaseStream(src);
+                    src.queue.length = 0;
+                    src.processedBuffers.length = 0;
                     break;
                 case AL_LOOPING:
                     src.looping = value !== 0;
+                    // A streaming source's ring must never stop at its own end — the queue
+                    // decides when the source is exhausted, not the ring extent.
                     if (src.sab) setCtrl(src.sab, CTRL_LOOP_MODE, src.looping ? -1 : 1);
                     break;
                 case AL_SOURCE_RELATIVE:
@@ -399,10 +473,13 @@ export class OpenAL implements IModule {
             const dv = new DataView(mem.buffer, mem.byteOffset);
             let value = 0;
             if (src) {
+                this.pumpStream(src);
                 if (param === AL_SOURCE_STATE) syncSourceState(src);
                 switch (param) {
                     case AL_SOURCE_STATE: value = src.state; break;
-                    case AL_BUFFERS_QUEUED: value = src.queuedBuffers.length; break;
+                    // Spec: AL_BUFFERS_QUEUED counts everything still attached to the
+                    // queue, processed-but-not-yet-unqueued included.
+                    case AL_BUFFERS_QUEUED: value = src.queue.length + src.processedBuffers.length; break;
                     case AL_BUFFERS_PROCESSED: value = src.processedBuffers.length; break;
                     case AL_BUFFER: value = src.bufferId; break;
                     case AL_LOOPING: value = src.looping ? AL_TRUE : AL_FALSE; break;
@@ -485,14 +562,18 @@ export class OpenAL implements IModule {
             const dv = new DataView(mem.buffer, mem.byteOffset);
             for (let i = 0; i < nb; i++) {
                 const bufId = dv.getUint32(buffersPtr + i * 4, true);
-                src.queuedBuffers.push(bufId);
+                const buf = this.buffers.get(bufId);
+                src.queue.push({ bufId, bytes: buf?.data.byteLength ?? 0, appended: 0, end: -1 });
             }
+            // Queueing onto a source that is already playing extends it without a restart.
+            this.pumpStream(src);
             return 0;
         };
 
         this.exports["alSourceUnqueueBuffers"] = (_ctx, mem, args) => {
             const [sourceId, nb, buffersPtr] = args;
             const src = this.sources.get(sourceId);
+            if (src) this.pumpStream(src);
             const dv = new DataView(mem.buffer, mem.byteOffset);
             for (let i = 0; i < nb; i++) {
                 const bufId = src?.processedBuffers.shift() ?? 0;
@@ -593,13 +674,24 @@ export class OpenAL implements IModule {
         const src = this.sources.get(sourceId);
         if (!src) return;
 
-        // Resolve buffer — static or first queued
-        const bufId = src.bufferId || src.queuedBuffers[0] || 0;
-        const buf = bufId ? this.buffers.get(bufId) : undefined;
+        // A queued source plays its whole queue through one ring, not just its head.
+        if (!src.bufferId && (src.queue.length > 0 || src.stream)) {
+            if (src.stream && src.state === AL_PAUSED) {
+                setCtrl(src.stream.sab, CTRL_STATE, STATE_PLAYING);
+            }
+            src.state = AL_PLAYING;
+            this.pumpStream(src);
+            return;
+        }
+
+        const buf = src.bufferId ? this.buffers.get(src.bufferId) : undefined;
 
         if (!buf || buf.data.byteLength === 0) {
-            // No data to play — set state but skip audio registration
-            src.state = AL_PLAYING;
+            // Nothing to play, so nothing is playing. A source parked in AL_PLAYING with no
+            // playback behind it never comes back, and an engine that hunts for a finished
+            // voice (UE1's ALAudio Update) then sees every voice busy for the rest of the run.
+            this.unregisterAudio(src);
+            src.state = AL_STOPPED;
             return;
         }
 
@@ -650,7 +742,7 @@ export class OpenAL implements IModule {
         src.state = AL_PLAYING;
 
         Logger.verbose(LogCategory.SYSTEM,
-            `[OpenAL] playSource(${sourceId}) buf=${bufId} size=${buf.data.byteLength} ` +
+            `[OpenAL] playSource(${sourceId}) buf=${src.bufferId} size=${buf.data.byteLength} ` +
             `freq=${buf.sampleRate} ch=${buf.channels} loop=${src.looping}`);
     }
 
@@ -662,11 +754,12 @@ export class OpenAL implements IModule {
             setCtrl(src.sab, CTRL_STOP_REQUESTED, 1);
         }
         this.unregisterAudio(src);
+        this.releaseStream(src);
         src.state = AL_STOPPED;
 
-        // Move queued → processed
-        while (src.queuedBuffers.length > 0) {
-            src.processedBuffers.push(src.queuedBuffers.shift()!);
+        // Spec: stopping marks every buffer still in the queue as processed.
+        while (src.queue.length > 0) {
+            src.processedBuffers.push(src.queue.shift()!.bufId);
         }
     }
 
@@ -676,6 +769,9 @@ export class OpenAL implements IModule {
 
         if (src.sab) {
             setCtrl(src.sab, CTRL_STATE, STATE_PAUSED);
+        }
+        if (src.stream) {
+            setCtrl(src.stream.sab, CTRL_STATE, STATE_PAUSED);
         }
         src.state = AL_PAUSED;
     }
@@ -688,10 +784,140 @@ export class OpenAL implements IModule {
         src.sab = null;
     }
 
+    // ── Streaming queue engine ───────────────────────────────────────────
+
+    private releaseStream(src: ALSource): void {
+        if (src.streamAudioId) {
+            (self as any).postMessage({ type: "audio_unregister", payload: { id: src.streamAudioId } });
+            src.streamAudioId = 0;
+        }
+        src.stream = null;
+        for (const e of src.queue) { e.appended = 0; e.end = -1; }
+    }
+
+    /**
+     * Ring bytes the worklet has consumed, unwrapped from its modulo play cursor.
+     *
+     * Exact because the producer never runs more than one ring-length ahead: the gap
+     * between the two modulo cursors IS the unplayed backlog.
+     */
+    private streamPlayed(st: ALStream): number {
+        const play = getCtrl(st.sab, CTRL_PLAY_CURSOR) % st.ringBytes;
+        const write = st.written % st.ringBytes;
+        const used = (write - play + st.ringBytes) % st.ringBytes;
+        return Math.max(0, st.written - used);
+    }
+
+    private createStream(src: ALSource, buf: ALBuffer, entryBytes: number): ALStream {
+        const frameBytes = Math.max(1, buf.channels * (buf.bitsPerSample >> 3));
+        const ringBytes = streamRingBytes(entryBytes, frameBytes);
+        const sab = createAudioRingBuffer(ringBytes, {
+            channels: buf.channels,
+            sampleRate: buf.sampleRate,
+            bitsPerSample: buf.bitsPerSample,
+        }, true /* circular */);
+
+        setCtrl(sab, CTRL_FLAGS, FLAG_CIRCULAR | FLAG_STREAMING);
+        setCtrl(sab, CTRL_DATA_LENGTH, ringBytes);
+        setCtrl(sab, CTRL_PLAY_CURSOR, 0);
+        setCtrl(sab, CTRL_WRITE_CURSOR, 0);
+        setCtrl(sab, CTRL_RESERVED, 1);
+        // The queue, not the ring extent, decides when the source is exhausted.
+        setCtrl(sab, CTRL_LOOP_MODE, -1);
+        setCtrl(sab, CTRL_VOLUME, gainToCentibels(src.gain));
+        setCtrl(sab, CTRL_FREQUENCY, Math.round(buf.sampleRate * src.pitch));
+        if (src.posX !== 0 || src.posY !== 0 || src.posZ !== 0) {
+            setCtrlFloat(sab, CTRL_3D_POS_X, src.posX);
+            setCtrlFloat(sab, CTRL_3D_POS_Y, src.posY);
+            setCtrlFloat(sab, CTRL_3D_POS_Z, src.posZ);
+            setCtrl(sab, CTRL_3D_FLAGS, 1);
+        }
+
+        const audioId = audioIdCounter++;
+        (self as any).postMessage({ type: "audio_register", payload: { id: audioId, sab } });
+        setCtrl(sab, CTRL_STATE, STATE_PLAYING);
+
+        src.streamAudioId = audioId;
+        return {
+            sab, ringBytes, frameBytes,
+            channels: buf.channels, sampleRate: buf.sampleRate, bits: buf.bitsPerSample,
+            written: 0,
+        };
+    }
+
+    /**
+     * Advance a streaming source: top the ring up from the queue, retire what the
+     * worklet has played, and stop the source when the queue runs out.
+     *
+     * Called from the entry points an OpenAL app polls (alGetSourcei / unqueue / queue /
+     * play) plus a throttled sweep in alGetError, because nothing else ticks in the worker.
+     */
+    private pumpStream(src: ALSource): void {
+        if (src.bufferId || src.state !== AL_PLAYING) return;
+        if (!src.stream && src.queue.length === 0) return;
+
+        if (!src.stream) {
+            const head = src.queue.find(e => e.bytes > 0);
+            if (!head) return;                       // only empty buffers queued so far
+            const buf = this.buffers.get(head.bufId);
+            if (!buf) return;
+            src.stream = this.createStream(src, buf, head.bytes);
+            Logger.verbose(LogCategory.SYSTEM,
+                `[OpenAL] stream source=${src.id} ring=${src.stream.ringBytes} ` +
+                `freq=${buf.sampleRate} ch=${buf.channels} bits=${buf.bitsPerSample}`);
+        }
+
+        const st = src.stream;
+        const data = new Uint8Array(st.sab, CTRL_BLOCK_BYTES, st.ringBytes);
+
+        // Append — never closer than one frame to the play cursor, or a full ring would
+        // read back as an empty one.
+        for (const entry of src.queue) {
+            if (entry.end >= 0) continue;
+            const buf = this.buffers.get(entry.bufId);
+            const bytes = buf ? buf.data.byteLength : 0;
+            entry.bytes = bytes;
+            if (bytes === 0) { entry.end = st.written; continue; }
+            // A ring carries ONE format. Real AL refuses the mismatched queue outright; we
+            // let the ring drain and stop, so the next Play rebuilds it for the new format
+            // instead of playing the new PCM at the old rate.
+            if (buf!.channels !== st.channels || buf!.sampleRate !== st.sampleRate ||
+                buf!.bitsPerSample !== st.bits) break;
+            while (entry.appended < bytes) {
+                const backlog = st.written - this.streamPlayed(st);
+                const room = Math.floor((st.ringBytes - backlog - st.frameBytes) / st.frameBytes) * st.frameBytes;
+                if (room <= 0) break;
+                const n = Math.min(room, bytes - entry.appended);
+                const at = st.written % st.ringBytes;
+                const first = Math.min(n, st.ringBytes - at);
+                data.set(buf!.data.subarray(entry.appended, entry.appended + first), at);
+                if (first < n) data.set(buf!.data.subarray(entry.appended + first, entry.appended + n), 0);
+                entry.appended += n;
+                st.written += n;
+            }
+            setCtrl(st.sab, CTRL_WRITE_CURSOR, st.written % st.ringBytes);
+            if (entry.appended < bytes) break;       // ring full; the rest waits
+            entry.end = st.written;
+        }
+
+        // Retire everything the worklet has played through.
+        const played = this.streamPlayed(st);
+        while (src.queue.length > 0 && src.queue[0]!.end >= 0 && src.queue[0]!.end <= played) {
+            src.processedBuffers.push(src.queue.shift()!.bufId);
+        }
+
+        // Underrun with an empty queue is the end of the stream, exactly as in real AL.
+        if (src.queue.length === 0 && played >= st.written) {
+            this.releaseStream(src);
+            src.state = AL_STOPPED;
+        }
+    }
+
     reset(): void {
         // Stop all sources
         for (const src of this.sources.values()) {
             this.unregisterAudio(src);
+            this.releaseStream(src);
         }
         this.sources.clear();
         this.buffers.clear();
