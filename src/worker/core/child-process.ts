@@ -265,14 +265,18 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                     finish(message.exitCode >>> 0);
                 } else if (message.type === 'error' || message.type === 'crash') {
                     finish(undefined, new Error(message.message ?? message.reason ?? 'Child process crashed'));
-                } else if (message.type === 'window_title') {
-                    const detail = `it opened a titled top-level window (${JSON.stringify(message.title)})`;
+                } else if (message.type === 'window_title' || message.type === 'show_message_box') {
+                    // MessageBox is a titled top-level window on Windows; ours is host-served
+                    // DOM with no HWND, so it never reaches the window_title callback. Both are
+                    // the child saying it wants the one screen, and the queued request replays
+                    // to the page on attach.
+                    const detail = message.type === 'window_title'
+                        ? `it opened a titled top-level window (${JSON.stringify(message.title)})`
+                        : `it opened a message box (${JSON.stringify(message.caption)}: ${JSON.stringify(message.text)})`;
                     context.record.needsSession = detail;
                     if (!task.record.session && !(onSessionRequest?.(task.record) ?? task.promote?.())) {
                         finish(undefined, new ChildNeedsSession(context.record, detail));
                     }
-                } else if (message.type === 'show_message_box') {
-                    finish(undefined, new Error(`Headless child requires a dialog: ${message.caption}: ${message.text}`));
                 }
             };
             child.postMessage({ type: 'child_boot', ...request, ...inherited, bytes, io } satisfies ChildBoot);

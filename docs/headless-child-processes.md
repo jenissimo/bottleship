@@ -16,11 +16,15 @@ user is meant to end up in front of.
 What decides it is what the guest DID, observed at run time. Two facts hand the session to
 the child (`kernel32 handOffToChild`):
 
-- **The child claimed a titled top-level window** (`window_title`). There is one screen;
-  the notification that names the tab for the session's image is the child saying it wants
-  it. `Landgen` cannot reach it — it has no user32 import at all. This fires while the parent
+- **The child claimed a titled top-level window** (`window_title`), or put up a
+  **`MessageBox`** (`show_message_box`). There is one screen; the notification that names
+  the tab for the session's image is the child saying it wants it. A message box is a
+  titled top-level window on Windows, and says the same thing — ours is host-served DOM
+  with no HWND, so it arrives as its own message rather than through `window_title`.
+  `Landgen` can reach neither — it has no user32 import at all. This fires while the parent
   is still blocked in its wait, which is the only recovery available there: Warcraft III's
-  launcher waits on `war3demo.exe`, and that child never exits.
+  launcher waits on `war3demo.exe`, and that child never exits; Gothic's `GothicStarter`
+  waits on a `GothicMod.exe` whose first act is a first-start notice.
 - **The parent exited leaving the child running** (`pendingChildHandoff`). It never collected
   an exit code, so nothing it did depended on one — Red Faction's launcher `CreateProcess`es
   `RF.exe` and returns from `WinMain`.
@@ -46,9 +50,10 @@ closes old ports and cancels/drains the whole old process tree before replacing 
 
 The parent can finish its guest execution while its worker remains alive as a VFS broker.
 Guest exit is delivered separately from worker disposal, so chains of exiting launchers also
-work. A `MessageBox` before selection still fails explicitly; after attachment the normal
-host modal service handles it. A launcher waiting on a child that neither exits nor titles a
-window still supplies no display-selection signal and remains outside these two rules.
+work. A `MessageBox` before selection selects the child and replays to the page on attach;
+with nobody to promote to it still fails explicitly. A launcher waiting on a child that
+neither exits nor shows UI still supplies no display-selection signal and remains outside
+these two rules.
 
 ## Isolation and filesystem contract
 

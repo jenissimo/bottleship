@@ -315,6 +315,42 @@ describe('helper or session', () => {
         expect(pendingChildHandoff()?.needsSession).toContain('Warcraft III');
     });
 
+    test('a message box is the same claim on the screen as a titled window', async () => {
+        stopChildProcesses();
+        const ports: MessagePort[] = [];
+        setChildSessionPublisher(port => { ports.push(port); });
+        const worker = new FakeWorker();
+        const task = startChildProcess(filesystem(), request, () => worker as unknown as Worker);
+        const settled = task.completion.catch(e => e);
+        await started(worker);
+        worker.onmessage!({ data: { type: 'show_message_box', id: 1, caption: 'First start!', text: 'Please restart the game!' } });
+        // Promoted, not killed: the prompt waits in the child's queue for the page.
+        expect(hasChildSession()).toBe(true);
+        expect(task.record.needsSession).toContain('First start!');
+        expect(ports.length).toBe(1);
+        expect(worker.terminated).toBe(false);
+        expect(task.record.finished).toBeUndefined();
+        worker.exit(7);
+        expect(await settled).toBe(7);
+        for (const port of ports) port.close();
+        for (const message of worker.messages) message.port?.close();
+        setChildSessionPublisher(undefined);
+    });
+
+    test('a message box with nobody to promote to still fails explicitly', async () => {
+        stopChildProcesses();
+        setChildSessionPublisher(undefined);
+        const worker = new FakeWorker();
+        const rejected = runChildProcess(filesystem(), request, () => worker as unknown as Worker).catch(e => e);
+        await started(worker);
+        worker.onmessage!({ data: { type: 'show_message_box', id: 1, caption: 'First start!', text: 'Please restart the game!' } });
+        const error = await Promise.race([rejected, new Promise(resolve =>
+            setTimeout(() => resolve(new Error('the child asked for the screen and nobody noticed')), 1000))]);
+        expect(error).toBeInstanceOf(ChildNeedsSession);
+        expect((error as ChildNeedsSession).record.needsSession).toContain('First start!');
+        expect(worker.terminated).toBe(true);
+    });
+
     test('teardown leaves nobody to hand the session to', async () => {
         const worker = new FakeWorker();
         const rejected = runChildProcess(filesystem(), request, () => worker as unknown as Worker).catch(e => e);
