@@ -1,7 +1,7 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
-import { transform } from "esbuild";
+import { build as esbuild } from "esbuild";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -32,10 +32,21 @@ function audioWorkletPlugin(): Plugin {
   const src = path.resolve(__dirname, "src/audio/bottleship-audio-worklet.ts");
   const out = path.resolve(__dirname, "src/audio/bottleship-audio-worklet.js");
 
+  // BUNDLED, not merely transpiled: an AudioWorklet module cannot resolve imports at
+  // runtime, so the worklet used to re-declare every control-block constant it reads.
+  // Bundling lets it import the one definition instead, which is what keeps the
+  // worker's writes and the worklet's reads from drifting apart silently.
   async function compile() {
-    const code = fs.readFileSync(src, "utf-8");
-    const result = await transform(code, { loader: "ts", target: "esnext" });
-    fs.writeFileSync(out, result.code);
+    const result = await esbuild({
+      entryPoints: [src],
+      bundle: true,
+      format: "esm",
+      target: "esnext",
+      platform: "browser",
+      write: false,
+      logLevel: "silent",
+    });
+    fs.writeFileSync(out, result.outputFiles[0]!.text);
   }
 
   return {
@@ -45,9 +56,15 @@ function audioWorkletPlugin(): Plugin {
     },
     configureServer(server) {
       server.watcher.on("change", async (file) => {
-        if (path.normalize(file) === path.normalize(src)) {
+        if (path.normalize(file) !== path.normalize(src)) return;
+        // A half-saved edit (or a module that does not resolve yet) must not take the dev
+        // server down with it — keep the last good bundle and say what broke.
+        try {
           await compile();
           console.log("[audio-worklet] Recompiled bottleship-audio-worklet.js");
+        } catch (e) {
+          console.error("[audio-worklet] bundle FAILED — keeping the previous build:",
+            e instanceof Error ? e.message : e);
         }
       });
     },

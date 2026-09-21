@@ -47,7 +47,18 @@ import {
     CTRL_PLAY_CURSOR,
     CTRL_WRITE_CURSOR,
     floatToI32,
+    i32ToFloat,
 } from "../../../audio/audio-ring-buffer";
+import { Mem } from "../../core/memory/mem-accessor";
+import {
+    ALContextSpatial, ALListenerState, ALSourceSpatial,
+    createALListenerSab, createContextSpatial, createListenerState, createSourceSpatial,
+    gainToCentibels, writeListener, writeSourceMotion, writeSourceSpatial,
+    AL_CONE_INNER_ANGLE, AL_CONE_OUTER_ANGLE, AL_CONE_OUTER_GAIN,
+    AL_DIRECTION, AL_DISTANCE_MODEL, AL_DOPPLER_FACTOR, AL_MAX_DISTANCE,
+    AL_MAX_GAIN, AL_MIN_GAIN, AL_ORIENTATION, AL_POSITION, AL_REFERENCE_DISTANCE,
+    AL_ROLLOFF_FACTOR, AL_SOURCE_RELATIVE, AL_SPEED_OF_SOUND, AL_VELOCITY,
+} from "./spatial";
 
 // ── OpenAL constants ─────────────────────────────────────────────────────────
 const AL_NO_ERROR       = 0;
@@ -67,11 +78,6 @@ const AL_STOPPED = 0x1014;
 // Source properties
 const AL_PITCH          = 0x1003;
 const AL_GAIN           = 0x100A;
-const AL_MIN_GAIN       = 0x100D;
-const AL_MAX_GAIN       = 0x100E;
-const AL_MAX_DISTANCE   = 0x1023;
-const AL_ROLLOFF_FACTOR = 0x1021;
-const AL_REFERENCE_DISTANCE = 0x1020;
 const AL_LOOPING        = 0x1007;
 const AL_BUFFER         = 0x1009;
 const AL_SOURCE_STATE   = 0x1010;
@@ -81,10 +87,6 @@ const AL_SEC_OFFSET     = 0x1024;
 const AL_SAMPLE_OFFSET  = 0x1025;
 const AL_BYTE_OFFSET    = 0x1026;
 const AL_SOURCE_TYPE    = 0x1027;
-const AL_POSITION       = 0x1004;
-const AL_VELOCITY       = 0x1006;
-const AL_DIRECTION      = 0x1005;
-const AL_SOURCE_RELATIVE = 0x0202;
 
 // Buffer properties
 const AL_FREQUENCY      = 0x2001;
@@ -158,8 +160,7 @@ interface ALSource {
     gain: number;         // 0.0 .. 1.0+
     pitch: number;        // 0.5 .. 2.0
     looping: boolean;
-    posX: number; posY: number; posZ: number;
-    relative: boolean;
+    spatial: ALSourceSpatial;
     // Queue for streaming
     queue: ALQueueEntry[];
     processedBuffers: number[];
@@ -204,19 +205,23 @@ function writeString(process: Process, str: string): number {
     return ptr;
 }
 
-/** Convert OpenAL linear gain (0..1+) to DirectSound centibels (-10000..0) */
-function gainToCentibels(gain: number): number {
-    if (gain <= 0) return -10000;
-    if (gain >= 1) return 0;
-    return Math.max(-10000, Math.round(2000 * Math.log10(gain)));
-}
-
 function formatChannels(format: number): number {
     return (format === AL_FORMAT_STEREO8 || format === AL_FORMAT_STEREO16) ? 2 : 1;
 }
 
 function formatBits(format: number): number {
     return (format === AL_FORMAT_MONO16 || format === AL_FORMAT_STEREO16) ? 16 : 8;
+}
+
+/** Floats a source property carries. Only the three vectors are multi-valued. */
+function sourceParamFloats(param: number): number {
+    return (param === AL_POSITION || param === AL_VELOCITY || param === AL_DIRECTION) ? 3 : 1;
+}
+
+/** Floats a listener property carries. AL_ORIENTATION is the at/up pair, so six. */
+function listenerParamFloats(param: number): number {
+    if (param === AL_ORIENTATION) return 6;
+    return (param === AL_POSITION || param === AL_VELOCITY) ? 3 : 1;
 }
 
 let audioIdCounter = 0x0A000001;
@@ -245,6 +250,13 @@ export class OpenAL implements IModule {
 
     private lastPumpAllMs = 0;
 
+    // 3D state. One listener per context, exactly as in AL.
+    private listener: ALListenerState = createListenerState();
+    private global: ALContextSpatial = createContextSpatial();
+    private listenerSab: SharedArrayBuffer | null = null;
+    /** Scratch for every *fv marshal — six floats covers AL_ORIENTATION, the widest. */
+    private readonly fv = new Float32Array(6);
+
     initialize(process: Process): void {
         this.process = process;
 
@@ -259,6 +271,10 @@ export class OpenAL implements IModule {
         this.exports["alcCloseDevice"] = () => { return ALC_TRUE; };
         this.exports["alcCreateContext"] = (_ctx, _mem, _args) => {
             this.currentContext = this.nextContextId++;
+            // AL's listener exists from context creation, at the origin facing -Z. Publishing
+            // it now is what lets a source be spatialized against a listener the app never
+            // touches — without it the mixer would have no listener and skip 3D entirely.
+            this.publishListener();
             return this.currentContext;
         };
         this.exports["alcDestroyContext"] = () => 0;
@@ -317,22 +333,86 @@ export class OpenAL implements IModule {
         this.exports["alGetEnumValue"] = () => 0;
         this.exports["alGetProcAddress"] = () => 0;
         this.exports["alIsExtensionPresent"] = () => AL_FALSE;
-        this.exports["alDistanceModel"] = () => 0;
-        this.exports["alDopplerFactor"] = () => 0;
-        this.exports["alDopplerVelocity"] = () => 0;
-        this.exports["alSpeedOfSound"] = () => 0;
+        this.exports["alDistanceModel"] = (_ctx, _mem, args) => {
+            this.global.distanceModel = args[0];
+            this.publishListener();
+            return 0;
+        };
+        this.exports["alDopplerFactor"] = (_ctx, _mem, args) => {
+            const v = i32ToFloat(args[0] | 0);
+            if (v >= 0) { this.global.dopplerFactor = v; this.publishListener(); }
+            return 0;
+        };
+        // Pre-1.1 spelling of the same quantity: AL_DOPPLER_VELOCITY scaled the speed of
+        // sound rather than replacing it. Kept so an app written against 1.0 still shifts.
+        this.exports["alDopplerVelocity"] = (_ctx, _mem, args) => {
+            const v = i32ToFloat(args[0] | 0);
+            if (v > 0) { this.global.speedOfSound = v; this.publishListener(); }
+            return 0;
+        };
+        this.exports["alSpeedOfSound"] = (_ctx, _mem, args) => {
+            const v = i32ToFloat(args[0] | 0);
+            if (v > 0) { this.global.speedOfSound = v; this.publishListener(); }
+            return 0;
+        };
 
         // ── Listener ─────────────────────────────────────────────────────
 
-        this.exports["alListenerf"] = () => 0;
-        this.exports["alListener3f"] = () => 0;
-        this.exports["alListenerfv"] = () => 0;
+        this.exports["alListenerf"] = (_ctx, _mem, args) => {
+            this.setListenerFloats(args[0], i32ToFloat(args[1] | 0), 0, 0, 1);
+            return 0;
+        };
+        this.exports["alListener3f"] = (_ctx, _mem, args) => {
+            this.setListenerFloats(args[0], i32ToFloat(args[1] | 0), i32ToFloat(args[2] | 0),
+                                   i32ToFloat(args[3] | 0), 3);
+            return 0;
+        };
+        // AL_ORIENTATION is the six-float at/up pair and has no 3f spelling, so fv is the
+        // ONLY way an app can turn the listener — the call UE1 makes every frame.
+        this.exports["alListenerfv"] = (_ctx, _mem, args) => {
+            const [param, ptr] = args;
+            const n = listenerParamFloats(param);
+            if (!ptr || !Mem.readFloat32Into(ptr, n, this.fv)) return 0;
+            if (param === AL_ORIENTATION) {
+                this.setListenerOrientation(this.fv[0]!, this.fv[1]!, this.fv[2]!,
+                                            this.fv[3]!, this.fv[4]!, this.fv[5]!);
+            } else {
+                this.setListenerFloats(param, this.fv[0]!, this.fv[1]!, this.fv[2]!, n);
+            }
+            return 0;
+        };
         this.exports["alListeneri"] = () => 0;
         this.exports["alListener3i"] = () => 0;
         this.exports["alListeneriv"] = () => 0;
-        this.exports["alGetListenerf"] = () => 0;
-        this.exports["alGetListener3f"] = () => 0;
-        this.exports["alGetListenerfv"] = () => 0;
+
+        this.exports["alGetListenerf"] = (_ctx, mem, args) => {
+            const [param, valuePtr] = args;
+            if (valuePtr) {
+                const dv = new DataView(mem.buffer, mem.byteOffset);
+                dv.setFloat32(valuePtr, param === AL_GAIN ? this.listener.gain : 0, true);
+            }
+            return 0;
+        };
+        this.exports["alGetListener3f"] = (_ctx, mem, args) => {
+            const [param, p1, p2, p3] = args;
+            const n = this.readListenerFloats(param);
+            const dv = new DataView(mem.buffer, mem.byteOffset);
+            if (n >= 3) {
+                if (p1) dv.setFloat32(p1, this.fv[0]!, true);
+                if (p2) dv.setFloat32(p2, this.fv[1]!, true);
+                if (p3) dv.setFloat32(p3, this.fv[2]!, true);
+            }
+            return 0;
+        };
+        this.exports["alGetListenerfv"] = (_ctx, mem, args) => {
+            const [param, valuePtr] = args;
+            const n = this.readListenerFloats(param);
+            if (valuePtr && n > 0) {
+                const dv = new DataView(mem.buffer, mem.byteOffset);
+                for (let i = 0; i < n; i++) dv.setFloat32(valuePtr + i * 4, this.fv[i]!, true);
+            }
+            return 0;
+        };
         this.exports["alGetListeneri"] = () => 0;
         this.exports["alGetListeneriv"] = () => 0;
         this.exports["alGetListener3i"] = () => 0;
@@ -347,7 +427,7 @@ export class OpenAL implements IModule {
                 this.sources.set(id, {
                     id, state: AL_INITIAL, bufferId: 0,
                     gain: 1.0, pitch: 1.0, looping: false,
-                    posX: 0, posY: 0, posZ: 0, relative: false,
+                    spatial: createSourceSpatial(),
                     queue: [], processedBuffers: [], stream: null,
                     audioId: 0, sab: null, streamAudioId: 0,
                 });
@@ -372,54 +452,26 @@ export class OpenAL implements IModule {
         };
 
         this.exports["alSourcef"] = (_ctx, _mem, args) => {
-            const [sourceId, param, value] = args;
-            const src = this.sources.get(sourceId);
-            if (!src) return 0;
-            const fval = Math.fround(new Float32Array(new Uint32Array([value]).buffer)[0]);
-            switch (param) {
-                case AL_GAIN: {
-                    src.gain = fval;
-                    const cb = gainToCentibels(fval);
-                    if (src.sab) setCtrl(src.sab, CTRL_VOLUME, cb);
-                    if (src.stream) setCtrl(src.stream.sab, CTRL_VOLUME, cb);
-                    break;
-                }
-                case AL_PITCH:
-                    src.pitch = fval;
-                    // Pitch → frequency ratio applied to SAB
-                    if (src.sab && src.bufferId) {
-                        const buf = this.buffers.get(src.bufferId);
-                        if (buf) setCtrl(src.sab, CTRL_FREQUENCY, Math.round(buf.sampleRate * fval));
-                    }
-                    if (src.stream) {
-                        setCtrl(src.stream.sab, CTRL_FREQUENCY, Math.round(src.stream.sampleRate * fval));
-                    }
-                    break;
-            }
+            this.setSourceFloats(args[0], args[1], i32ToFloat(args[2] | 0), 0, 0, 1);
             return 0;
         };
 
         this.exports["alSource3f"] = (_ctx, _mem, args) => {
-            const [sourceId, param, v1, v2, v3] = args;
-            const src = this.sources.get(sourceId);
-            if (!src) return 0;
-            const f1 = Math.fround(new Float32Array(new Uint32Array([v1]).buffer)[0]);
-            const f2 = Math.fround(new Float32Array(new Uint32Array([v2]).buffer)[0]);
-            const f3 = Math.fround(new Float32Array(new Uint32Array([v3]).buffer)[0]);
-            if (param === AL_POSITION) {
-                src.posX = f1; src.posY = f2; src.posZ = f3;
-                for (const sab of [src.sab, src.stream?.sab ?? null]) {
-                    if (!sab) continue;
-                    setCtrlFloat(sab, CTRL_3D_POS_X, f1);
-                    setCtrlFloat(sab, CTRL_3D_POS_Y, f2);
-                    setCtrlFloat(sab, CTRL_3D_POS_Z, f3);
-                    setCtrl(sab, CTRL_3D_FLAGS, 1); // has3D
-                }
-            }
+            this.setSourceFloats(args[0], args[1], i32ToFloat(args[2] | 0),
+                                 i32ToFloat(args[3] | 0), i32ToFloat(args[4] | 0), 3);
             return 0;
         };
 
-        this.exports["alSourcefv"] = () => 0;
+        // The per-frame path: an engine's Update pushes AL_POSITION/AL_VELOCITY for every
+        // live voice through this entry point, so it must cost a bounds-checked read and
+        // a few stores — never a recomputation.
+        this.exports["alSourcefv"] = (_ctx, _mem, args) => {
+            const [sourceId, param, ptr] = args;
+            const n = sourceParamFloats(param);
+            if (!ptr || !Mem.readFloat32Into(ptr, n, this.fv)) return 0;
+            this.setSourceFloats(sourceId, param, this.fv[0]!, this.fv[1]!, this.fv[2]!, n);
+            return 0;
+        };
 
         this.exports["alSourcei"] = (_ctx, _mem, args) => {
             const [sourceId, param, value] = args;
@@ -440,32 +492,71 @@ export class OpenAL implements IModule {
                     if (src.sab) setCtrl(src.sab, CTRL_LOOP_MODE, src.looping ? -1 : 1);
                     break;
                 case AL_SOURCE_RELATIVE:
-                    src.relative = value !== 0;
+                    src.spatial.relative = value !== 0;
+                    this.publishSpatial(src);
+                    break;
+                // Integer spellings of properties AL also exposes as floats: an app may set
+                // the same state through either, so they must land in the same place.
+                case AL_CONE_INNER_ANGLE:
+                case AL_CONE_OUTER_ANGLE:
+                case AL_REFERENCE_DISTANCE:
+                case AL_MAX_DISTANCE:
+                case AL_ROLLOFF_FACTOR:
+                    this.setSourceFloats(sourceId, param, value, 0, 0, 1);
                     break;
             }
             return 0;
         };
 
-        this.exports["alSource3i"] = () => 0;
-        this.exports["alSourceiv"] = () => 0;
-
-        this.exports["alGetSourcef"] = (_ctx, mem, args) => {
-            const [sourceId, param, valuePtr] = args;
-            const src = this.sources.get(sourceId);
+        this.exports["alSource3i"] = (_ctx, _mem, args) => {
+            const [sourceId, param, v1, v2, v3] = args;
+            this.setSourceFloats(sourceId, param, v1 | 0, v2 | 0, v3 | 0, 3);
+            return 0;
+        };
+        this.exports["alSourceiv"] = (ctx, mem, args) => {
+            const [sourceId, param, ptr] = args;
+            if (!ptr) return 0;
             const dv = new DataView(mem.buffer, mem.byteOffset);
-            let fval = 0.0;
-            if (src) {
-                switch (param) {
-                    case AL_GAIN: fval = src.gain; break;
-                    case AL_PITCH: fval = src.pitch; break;
-                }
+            if (sourceParamFloats(param) >= 3) {
+                this.setSourceFloats(sourceId, param, dv.getInt32(ptr, true),
+                                     dv.getInt32(ptr + 4, true), dv.getInt32(ptr + 8, true), 3);
+            } else {
+                this.exports["alSourcei"]!(ctx, mem, [sourceId, param, dv.getInt32(ptr, true)]);
             }
-            if (valuePtr) dv.setFloat32(valuePtr, fval, true);
             return 0;
         };
 
-        this.exports["alGetSource3f"] = () => 0;
-        this.exports["alGetSourcefv"] = () => 0;
+        this.exports["alGetSourcef"] = (_ctx, mem, args) => {
+            const [sourceId, param, valuePtr] = args;
+            const n = this.readSourceFloats(sourceId, param);
+            if (valuePtr) {
+                const dv = new DataView(mem.buffer, mem.byteOffset);
+                dv.setFloat32(valuePtr, n > 0 ? this.fv[0]! : 0, true);
+            }
+            return 0;
+        };
+
+        this.exports["alGetSource3f"] = (_ctx, mem, args) => {
+            const [sourceId, param, p1, p2, p3] = args;
+            const n = this.readSourceFloats(sourceId, param);
+            if (n >= 3) {
+                const dv = new DataView(mem.buffer, mem.byteOffset);
+                if (p1) dv.setFloat32(p1, this.fv[0]!, true);
+                if (p2) dv.setFloat32(p2, this.fv[1]!, true);
+                if (p3) dv.setFloat32(p3, this.fv[2]!, true);
+            }
+            return 0;
+        };
+
+        this.exports["alGetSourcefv"] = (_ctx, mem, args) => {
+            const [sourceId, param, valuePtr] = args;
+            const n = this.readSourceFloats(sourceId, param);
+            if (valuePtr && n > 0) {
+                const dv = new DataView(mem.buffer, mem.byteOffset);
+                for (let i = 0; i < n; i++) dv.setFloat32(valuePtr + i * 4, this.fv[i]!, true);
+            }
+            return 0;
+        };
 
         this.exports["alGetSourcei"] = (_ctx, mem, args) => {
             const [sourceId, param, valuePtr] = args;
@@ -483,14 +574,26 @@ export class OpenAL implements IModule {
                     case AL_BUFFERS_PROCESSED: value = src.processedBuffers.length; break;
                     case AL_BUFFER: value = src.bufferId; break;
                     case AL_LOOPING: value = src.looping ? AL_TRUE : AL_FALSE; break;
-                    case AL_SOURCE_RELATIVE: value = src.relative ? AL_TRUE : AL_FALSE; break;
+                    case AL_SOURCE_RELATIVE: value = src.spatial.relative ? AL_TRUE : AL_FALSE; break;
+                    case AL_CONE_INNER_ANGLE: value = Math.round(src.spatial.coneInnerAngle); break;
+                    case AL_CONE_OUTER_ANGLE: value = Math.round(src.spatial.coneOuterAngle); break;
                 }
             }
             if (valuePtr) dv.setInt32(valuePtr, value, true);
             return 0;
         };
 
-        this.exports["alGetSource3i"] = () => 0;
+        this.exports["alGetSource3i"] = (_ctx, mem, args) => {
+            const [sourceId, param, p1, p2, p3] = args;
+            const n = this.readSourceFloats(sourceId, param);
+            if (n >= 3) {
+                const dv = new DataView(mem.buffer, mem.byteOffset);
+                if (p1) dv.setInt32(p1, Math.round(this.fv[0]!), true);
+                if (p2) dv.setInt32(p2, Math.round(this.fv[1]!), true);
+                if (p3) dv.setInt32(p3, Math.round(this.fv[2]!), true);
+            }
+            return 0;
+        };
         // Same contract as alGetSourcei for every single-valued property (which is all of
         // the ones above) — returning a bare 0 would report AL_SOURCE_STATE as "not a state"
         // and re-open the never-finishes hole through the other entry point.
@@ -668,6 +771,183 @@ export class OpenAL implements IModule {
         this.exports["EAXSet"] = () => 0;
     }
 
+    // ── 3D state ─────────────────────────────────────────────────────────
+
+    /**
+     * A source is spatialized only if its audio is MONO. AL plays a stereo buffer as
+     * authored — no attenuation, no panning — and honouring that is what stops music and
+     * pre-mixed ambience from being pulled down by a distance curve meant for point sources.
+     */
+    private sourceIsMono(src: ALSource): boolean {
+        if (src.stream) return src.stream.channels === 1;
+        const buf = src.bufferId ? this.buffers.get(src.bufferId) : undefined;
+        if (buf) return buf.channels === 1;
+        const head = src.queue.find(e => e.bytes > 0);
+        const queued = head ? this.buffers.get(head.bufId) : undefined;
+        return queued ? queued.channels === 1 : true;
+    }
+
+    /** Every live ring this source feeds — a static buffer and a queue ring are distinct. */
+    private publishSpatial(src: ALSource): void {
+        const mono = this.sourceIsMono(src);
+        if (src.sab) writeSourceSpatial(src.sab, src.spatial, mono);
+        if (src.stream) writeSourceSpatial(src.stream.sab, src.spatial, mono);
+    }
+
+    private publishMotion(src: ALSource): void {
+        if (src.sab) writeSourceMotion(src.sab, src.spatial);
+        if (src.stream) writeSourceMotion(src.stream.sab, src.spatial);
+    }
+
+    private publishListener(): void {
+        if (!this.listenerSab) this.listenerSab = createALListenerSab();
+        writeListener(this.listenerSab, this.listener, this.global);
+    }
+
+    /**
+     * One landing place for every float-valued source property, whatever spelling the app
+     * used (alSourcef / alSource3f / alSourcefv / the integer siblings). `count` is how
+     * many of v1..v3 the caller actually supplied, so a 3-vector set through a 1-float
+     * entry point is ignored rather than silently zeroing y and z.
+     */
+    private setSourceFloats(sourceId: number, param: number, v1: number, v2: number, v3: number, count: number): void {
+        const src = this.sources.get(sourceId);
+        if (!src) return;
+        const sp = src.spatial;
+        switch (param) {
+            case AL_POSITION:
+                if (count < 3) return;
+                sp.posX = v1; sp.posY = v2; sp.posZ = v3;
+                this.publishMotion(src);
+                return;
+            case AL_VELOCITY:
+                if (count < 3) return;
+                sp.velX = v1; sp.velY = v2; sp.velZ = v3;
+                this.publishMotion(src);
+                return;
+            case AL_DIRECTION:
+                if (count < 3) return;
+                sp.dirX = v1; sp.dirY = v2; sp.dirZ = v3;
+                break;
+            case AL_GAIN: {
+                src.gain = v1;
+                const cb = gainToCentibels(v1);
+                if (src.sab) setCtrl(src.sab, CTRL_VOLUME, cb);
+                if (src.stream) setCtrl(src.stream.sab, CTRL_VOLUME, cb);
+                return;
+            }
+            case AL_PITCH:
+                src.pitch = v1;
+                if (src.sab && src.bufferId) {
+                    const buf = this.buffers.get(src.bufferId);
+                    if (buf) setCtrl(src.sab, CTRL_FREQUENCY, Math.round(buf.sampleRate * v1));
+                }
+                if (src.stream) {
+                    setCtrl(src.stream.sab, CTRL_FREQUENCY, Math.round(src.stream.sampleRate * v1));
+                }
+                return;
+            case AL_MIN_GAIN:           sp.minGain = v1; break;
+            case AL_MAX_GAIN:           sp.maxGain = v1; break;
+            case AL_REFERENCE_DISTANCE: sp.referenceDistance = v1; break;
+            case AL_MAX_DISTANCE:       sp.maxDistance = v1; break;
+            case AL_ROLLOFF_FACTOR:     sp.rolloffFactor = v1; break;
+            case AL_CONE_INNER_ANGLE:   sp.coneInnerAngle = v1; break;
+            case AL_CONE_OUTER_ANGLE:   sp.coneOuterAngle = v1; break;
+            case AL_CONE_OUTER_GAIN:    sp.coneOuterGain = v1; break;
+            default: return;
+        }
+        this.publishSpatial(src);
+    }
+
+    /** Fill `this.fv` with a source property and return how many floats it holds. */
+    private readSourceFloats(sourceId: number, param: number): number {
+        const src = this.sources.get(sourceId);
+        if (!src) return 0;
+        const sp = src.spatial;
+        switch (param) {
+            case AL_POSITION:  this.fv[0] = sp.posX; this.fv[1] = sp.posY; this.fv[2] = sp.posZ; return 3;
+            case AL_VELOCITY:  this.fv[0] = sp.velX; this.fv[1] = sp.velY; this.fv[2] = sp.velZ; return 3;
+            case AL_DIRECTION: this.fv[0] = sp.dirX; this.fv[1] = sp.dirY; this.fv[2] = sp.dirZ; return 3;
+            case AL_GAIN:               this.fv[0] = src.gain; return 1;
+            case AL_PITCH:              this.fv[0] = src.pitch; return 1;
+            case AL_MIN_GAIN:           this.fv[0] = sp.minGain; return 1;
+            case AL_MAX_GAIN:           this.fv[0] = sp.maxGain; return 1;
+            case AL_REFERENCE_DISTANCE: this.fv[0] = sp.referenceDistance; return 1;
+            case AL_MAX_DISTANCE:       this.fv[0] = sp.maxDistance; return 1;
+            case AL_ROLLOFF_FACTOR:     this.fv[0] = sp.rolloffFactor; return 1;
+            case AL_CONE_INNER_ANGLE:   this.fv[0] = sp.coneInnerAngle; return 1;
+            case AL_CONE_OUTER_ANGLE:   this.fv[0] = sp.coneOuterAngle; return 1;
+            case AL_CONE_OUTER_GAIN:    this.fv[0] = sp.coneOuterGain; return 1;
+            default: return 0;
+        }
+    }
+
+    private setListenerFloats(param: number, v1: number, v2: number, v3: number, count: number): void {
+        switch (param) {
+            case AL_POSITION:
+                if (count < 3) return;
+                this.listener.posX = v1; this.listener.posY = v2; this.listener.posZ = v3;
+                break;
+            case AL_VELOCITY:
+                if (count < 3) return;
+                this.listener.velX = v1; this.listener.velY = v2; this.listener.velZ = v3;
+                break;
+            case AL_GAIN:
+                this.listener.gain = v1;
+                break;
+            default: return;
+        }
+        this.publishListener();
+    }
+
+    /** AL_ORIENTATION: at (first three) then up (last three), both in world space. */
+    private setListenerOrientation(atX: number, atY: number, atZ: number,
+                                   upX: number, upY: number, upZ: number): void {
+        this.listener.atX = atX; this.listener.atY = atY; this.listener.atZ = atZ;
+        this.listener.upX = upX; this.listener.upY = upY; this.listener.upZ = upZ;
+        this.publishListener();
+    }
+
+    private readListenerFloats(param: number): number {
+        const l = this.listener;
+        switch (param) {
+            case AL_POSITION: this.fv[0] = l.posX; this.fv[1] = l.posY; this.fv[2] = l.posZ; return 3;
+            case AL_VELOCITY: this.fv[0] = l.velX; this.fv[1] = l.velY; this.fv[2] = l.velZ; return 3;
+            case AL_ORIENTATION:
+                this.fv[0] = l.atX; this.fv[1] = l.atY; this.fv[2] = l.atZ;
+                this.fv[3] = l.upX; this.fv[4] = l.upY; this.fv[5] = l.upZ;
+                return 6;
+            case AL_GAIN: this.fv[0] = l.gain; return 1;
+            default: return 0;
+        }
+    }
+
+    /** Diagnostic snapshot of the 3D model — the half of an AL source `openalSources` cannot see. */
+    openalSpatial(): unknown {
+        const sources: unknown[] = [];
+        for (const src of this.sources.values()) {
+            const sp = src.spatial;
+            sources.push({
+                id: src.id,
+                spatialized: (src.sab || src.stream) ? this.sourceIsMono(src) : false,
+                relative: sp.relative,
+                pos: [sp.posX, sp.posY, sp.posZ],
+                vel: [sp.velX, sp.velY, sp.velZ],
+                dir: [sp.dirX, sp.dirY, sp.dirZ],
+                gain: src.gain, minGain: sp.minGain, maxGain: sp.maxGain,
+                refDistance: sp.referenceDistance, maxDistance: sp.maxDistance,
+                rolloff: sp.rolloffFactor,
+                cone: [sp.coneInnerAngle, sp.coneOuterAngle, sp.coneOuterGain],
+            });
+        }
+        return {
+            listener: { ...this.listener },
+            global: { ...this.global },
+            listenerPublished: !!this.listenerSab,
+            sources,
+        };
+    }
+
     // ── Playback engine ──────────────────────────────────────────────────
 
     private playSource(sourceId: number): void {
@@ -722,13 +1002,7 @@ export class OpenAL implements IModule {
             setCtrl(sab, CTRL_FLAGS, FLAG_CIRCULAR);
         }
 
-        // 3D position
-        if (src.posX !== 0 || src.posY !== 0 || src.posZ !== 0) {
-            setCtrlFloat(sab, CTRL_3D_POS_X, src.posX);
-            setCtrlFloat(sab, CTRL_3D_POS_Y, src.posY);
-            setCtrlFloat(sab, CTRL_3D_POS_Z, src.posZ);
-            setCtrl(sab, CTRL_3D_FLAGS, 1);
-        }
+        writeSourceSpatial(sab, src.spatial, buf.channels === 1);
 
         // Register with AudioWorklet
         const audioId = audioIdCounter++;
@@ -826,12 +1100,7 @@ export class OpenAL implements IModule {
         setCtrl(sab, CTRL_LOOP_MODE, -1);
         setCtrl(sab, CTRL_VOLUME, gainToCentibels(src.gain));
         setCtrl(sab, CTRL_FREQUENCY, Math.round(buf.sampleRate * src.pitch));
-        if (src.posX !== 0 || src.posY !== 0 || src.posZ !== 0) {
-            setCtrlFloat(sab, CTRL_3D_POS_X, src.posX);
-            setCtrlFloat(sab, CTRL_3D_POS_Y, src.posY);
-            setCtrlFloat(sab, CTRL_3D_POS_Z, src.posZ);
-            setCtrl(sab, CTRL_3D_FLAGS, 1);
-        }
+        writeSourceSpatial(sab, src.spatial, buf.channels === 1);
 
         const audioId = audioIdCounter++;
         (self as any).postMessage({ type: "audio_register", payload: { id: audioId, sab } });
@@ -928,6 +1197,9 @@ export class OpenAL implements IModule {
         this.currentContext = 0;
         this.currentDevice = 0;
         this.stringPtrs.clear();
+        this.listener = createListenerState();
+        this.global = createContextSpatial();
+        this.listenerSab = null;
     }
 
     // ── String helpers ───────────────────────────────────────────────────

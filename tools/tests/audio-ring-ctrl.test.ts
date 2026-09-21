@@ -38,7 +38,9 @@ import {
     centibelToLinear,
 } from "../../src/audio/audio-ring-buffer";
 
-/** The worklet hard-codes these integers; drifting them silently breaks playback. */
+/** The worker writes these fields and the worklet reads them; drifting an index
+ *  silently breaks playback. The worklet imports them now (the build bundles it), so
+ *  this pins the on-wire layout both threads and these tests agree on. */
 test("control-block field indices are stable", () => {
     expect(CTRL_PLAY_CURSOR).toBe(0);
     expect(CTRL_WRITE_CURSOR).toBe(1);
@@ -51,7 +53,7 @@ test("control-block field indices are stable", () => {
     expect(CTRL_VOLUME).toBe(9);
     expect(CTRL_FREQUENCY).toBe(11);
     expect(CTRL_FLAGS).toBe(14);
-    expect(CTRL_BLOCK_BYTES).toBe(128);
+    expect(CTRL_BLOCK_BYTES).toBe(256);
 });
 
 test("createAudioRingBuffer publishes the format the worklet gates on", () => {

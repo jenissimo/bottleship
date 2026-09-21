@@ -7,65 +7,38 @@ declare const sampleRate: number;
 declare const currentTime: number;
 declare function registerProcessor(name: string, ctor: typeof AudioWorkletProcessor): void;
 
-// ─── Inline ring buffer constants (duplicated from audio-ring-buffer.ts to avoid import issues in worklet scope) ───
+// The build bundles this file (vite.config.ts), so the control-block contract is
+// IMPORTED rather than re-declared: the worker writes these fields and this file
+// reads them, and a layout that drifted between the two is silent — the mixer just
+// misreads a format and drops the source.
 
-const CTRL_PLAY_CURSOR = 0;
-const CTRL_WRITE_CURSOR = 1;
-const CTRL_BUFFER_BYTES = 2;
-const CTRL_CHANNELS = 3;
-const CTRL_SAMPLE_RATE = 4;
-const CTRL_BITS_PER_SAMPLE = 5;
-const CTRL_BLOCK_ALIGN = 6;
-const CTRL_STATE = 7;
-const CTRL_LOOP_MODE = 8;
-const CTRL_VOLUME = 9;
-const CTRL_PAN = 10;
-const CTRL_FREQUENCY = 11;
-const CTRL_DATA_LENGTH = 12;
-const CTRL_STOP_REQUESTED = 13;
-const CTRL_FLAGS = 14;
-const CTRL_RESET_POSITION = 15;
-const CTRL_BLOCK_BYTES = 128;
-const STATE_PLAYING = 1;
-const FLAG_CIRCULAR = 1;
-const FLAG_STREAMING = 2;
+import {
+    CTRL_PLAY_CURSOR, CTRL_WRITE_CURSOR, CTRL_BUFFER_BYTES, CTRL_CHANNELS,
+    CTRL_SAMPLE_RATE, CTRL_BITS_PER_SAMPLE, CTRL_BLOCK_ALIGN, CTRL_STATE,
+    CTRL_LOOP_MODE, CTRL_VOLUME, CTRL_PAN, CTRL_FREQUENCY, CTRL_DATA_LENGTH,
+    CTRL_STOP_REQUESTED, CTRL_FLAGS, CTRL_RESERVED, CTRL_BLOCK_BYTES, CTRL_SLOTS,
+    STATE_PLAYING, FLAG_CIRCULAR, FLAG_STREAMING,
+    CTRL_3D_POS_X, CTRL_3D_POS_Y, CTRL_3D_POS_Z,
+    CTRL_3D_VEL_X, CTRL_3D_VEL_Y, CTRL_3D_VEL_Z,
+    CTRL_3D_MIN_DIST, CTRL_3D_MAX_DIST, CTRL_3D_MODE,
+    CTRL_3D_CONE_INNER, CTRL_3D_CONE_OUTER,
+    CTRL_3D_CONE_ORI_X, CTRL_3D_CONE_ORI_Y, CTRL_3D_CONE_ORI_Z,
+    CTRL_3D_CONE_OUTVOL, CTRL_3D_FLAGS,
+    CTRL_3D_ROLLOFF, CTRL_3D_MIN_GAIN, CTRL_3D_MAX_GAIN,
+    FLAG3D_HAS_3D, FLAG3D_SOURCE_ROLLOFF,
+    LCTRL_POS_X, LCTRL_POS_Y, LCTRL_POS_Z,
+    LCTRL_VEL_X, LCTRL_VEL_Y, LCTRL_VEL_Z,
+    LCTRL_FRONT_X, LCTRL_FRONT_Y, LCTRL_FRONT_Z,
+    LCTRL_TOP_X, LCTRL_TOP_Y, LCTRL_TOP_Z,
+    LCTRL_DIST_FACTOR, LCTRL_ROLLOFF_FACTOR, LCTRL_DOPPLER_FACTOR,
+    LCTRL_GAIN, LCTRL_DISTANCE_MODEL, LCTRL_SPEED_OF_SOUND, LCTRL_FLAGS,
+    LFLAG_LEFT_HANDED, LISTENER_SLOTS,
+    i32ToFloat,
+} from "./audio-ring-buffer";
+import { spatialize, makeSpatialResult, type SpatialParams } from "./spatializer";
 
-// ─── 3D per-buffer control fields ───────────────────────────────────────────
-
-const CTRL_3D_POS_X = 16;
-const CTRL_3D_POS_Y = 17;
-const CTRL_3D_POS_Z = 18;
-const CTRL_3D_VEL_X = 19;
-const CTRL_3D_VEL_Y = 20;
-const CTRL_3D_VEL_Z = 21;
-const CTRL_3D_MIN_DIST = 22;
-const CTRL_3D_MAX_DIST = 23;
-const CTRL_3D_MODE = 24;
-const CTRL_3D_CONE_INNER = 25;
-const CTRL_3D_CONE_OUTER = 26;
-const CTRL_3D_CONE_ORI_X = 27;
-const CTRL_3D_CONE_ORI_Y = 28;
-const CTRL_3D_CONE_ORI_Z = 29;
-const CTRL_3D_CONE_OUTVOL = 30;
-const CTRL_3D_FLAGS = 31;
-
-// ─── Listener SAB fields ────────────────────────────────────────────────────
-
-const LCTRL_POS_X = 0;
-const LCTRL_POS_Y = 1;
-const LCTRL_POS_Z = 2;
-const LCTRL_VEL_X = 3;
-const LCTRL_VEL_Y = 4;
-const LCTRL_VEL_Z = 5;
-const LCTRL_FRONT_X = 6;
-const LCTRL_FRONT_Y = 7;
-const LCTRL_FRONT_Z = 8;
-const LCTRL_TOP_X = 9;
-const LCTRL_TOP_Y = 10;
-const LCTRL_TOP_Z = 11;
-const LCTRL_DIST_FACTOR = 12;
-const LCTRL_ROLLOFF_FACTOR = 13;
-const LCTRL_DOPPLER_FACTOR = 14;
+/** CTRL_RESERVED under the name this file uses it for: a producer-set seek request. */
+const CTRL_RESET_POSITION = CTRL_RESERVED;
 
 // ─── Signal-stats SAB fields (duplicated from audio-ring-buffer.ts) ─────────
 
@@ -108,7 +81,7 @@ const LIMIT_K = 1 - LIMIT_T;
 // audio-engine.ts verifies the echo and logs loudly on a mismatch or timeout,
 // because a cache hit that silently skips this whole file is worse than a version
 // bump you forgot: the failure otherwise looks identical to "nothing is wrong".
-const WORKLET_MODULE_VERSION = 6;
+const WORKLET_MODULE_VERSION = 7;
 
 // Discontinuity detector threshold: |s[n]−s[n−1]| above this between adjacent
 // output samples counts as a click/splice candidate.
@@ -125,19 +98,6 @@ const CONCEAL_FADE_FRAMES = 64;
 const DS3DMODE_NORMAL = 0;
 const DS3DMODE_HEAD_RELATIVE = 1;
 const DS3DMODE_DISABLE = 2;
-
-// Speed of sound in meters/sec (DirectSound default)
-const SPEED_OF_SOUND = 340.0;
-
-// ─── Float ↔ Int32 helper (inlined) ────────────────────────────────────────
-
-const _wf32 = new Float32Array(1);
-const _wi32 = new Int32Array(_wf32.buffer);
-
-function i32ToFloat(i: number): number {
-    _wi32[0] = i;
-    return _wf32[0];
-}
 
 // ─── Ring buffer source type ─────────────────────────────────────────────────
 
@@ -183,8 +143,24 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
   // SAB ring buffer sources (zero-copy path)
   private ringBuffers: Map<number, RingBufferSource> = new Map();
 
-  // Listener SAB (global singleton, shared from dsound)
+  // Listener SAB (global singleton; whichever audio API the guest uses owns it)
   private listenerCtrl: Int32Array | null = null;
+
+  // Spatializer scratch — reused for every source of every block (no allocation
+  // inside the render quantum).
+  private spatialParams: SpatialParams = {
+    lPosX: 0, lPosY: 0, lPosZ: 0, lVelX: 0, lVelY: 0, lVelZ: 0,
+    lAtX: 0, lAtY: 0, lAtZ: 1, lUpX: 0, lUpY: 1, lUpZ: 0,
+    listenerGain: 1, distanceFactor: 1, dopplerFactor: 1,
+    speedOfSound: 340, distanceModel: 0, rightHanded: true,
+    sPosX: 0, sPosY: 0, sPosZ: 0, sVelX: 0, sVelY: 0, sVelZ: 0,
+    refDistance: 1, maxDistance: 1e9, rolloff: 1,
+    coneInner: 360, coneOuter: 360, coneOuterGain: 1,
+    dirX: 0, dirY: 0, dirZ: 0,
+    sourceGain: 1, minGain: 0, maxGain: 1,
+    relative: false,
+  };
+  private spatialOut = makeSpatialResult();
 
   // Signal-stats SAB (global singleton; worklet is the only counter writer)
   private statsCtrl: Int32Array | null = null;
@@ -200,7 +176,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
       // ─── Listener SAB registration ───
       if (msg.type === "register_listener") {
-        this.listenerCtrl = new Int32Array(msg.sab, 0, 16);
+        this.listenerCtrl = new Int32Array(msg.sab, 0, LISTENER_SLOTS);
         return;
       }
 
@@ -216,7 +192,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         const id: number = msg.id;
         this.ringBuffers.set(id, {
           id,
-          ctrl: new Int32Array(sab, 0, 32),
+          ctrl: new Int32Array(sab, 0, CTRL_SLOTS),
           data: new DataView(sab),
           // Explicit lengths: a SAB whose byteLength is not a multiple of the element
           // size would make the 1-argument constructor throw.
@@ -512,15 +488,10 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       let rate = (frequency / sampleRate);
       if (rate <= 0) continue;
 
-      // Volume: centibels to linear
-      let linearVol: number;
-      if (volumeCb <= -10000) {
-        linearVol = 0;
-      } else if (volumeCb >= 0) {
-        linearVol = 1;
-      } else {
-        linearVol = Math.pow(10, volumeCb / 2000);
-      }
+      // Volume: centibels to linear. POSITIVE centibels are honoured as gain above
+      // 1.0 — DirectSound can never produce them (DSBVOLUME_MAX is 0), but OpenAL's
+      // AL_GAIN has no such ceiling and is carried through this same field.
+      const linearVol = volumeCb <= -10000 ? 0 : Math.pow(10, volumeCb / 2000);
 
       // Pan: centibels to L/R gain (app-level pan)
       let leftGain: number;
@@ -540,155 +511,65 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       }
 
       // ─── 3D spatialization ───
+      // Recomputed once per 128-frame block from whatever the control block currently
+      // holds. The setters on the guest side only store — an app that calls
+      // alSourcefv(AL_POSITION) thousands of times per second costs one Atomics.store
+      // each, and collapses into one evaluation here.
       const flags3d = Atomics.load(ctrl, CTRL_3D_FLAGS);
-      const has3D = (flags3d & 1) !== 0;
       const mode3d = Atomics.load(ctrl, CTRL_3D_MODE);
 
-      if (has3D && this.listenerCtrl && mode3d !== DS3DMODE_DISABLE) {
+      if ((flags3d & FLAG3D_HAS_3D) !== 0 && this.listenerCtrl && mode3d !== DS3DMODE_DISABLE) {
         const lctrl = this.listenerCtrl;
+        const p = this.spatialParams;
 
-        // Read listener state
-        const lPosX = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_X));
-        const lPosY = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Y));
-        const lPosZ = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Z));
-        const lVelX = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_X));
-        const lVelY = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Y));
-        const lVelZ = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Z));
-        const lFrontX = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_X));
-        const lFrontY = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Y));
-        const lFrontZ = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Z));
-        const lTopX = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_X));
-        const lTopY = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Y));
-        const lTopZ = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Z));
-        const distFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DIST_FACTOR));
-        const rolloff = i32ToFloat(Atomics.load(lctrl, LCTRL_ROLLOFF_FACTOR));
-        const dopplerFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DOPPLER_FACTOR));
+        p.lPosX = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_X));
+        p.lPosY = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Y));
+        p.lPosZ = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Z));
+        p.lVelX = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_X));
+        p.lVelY = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Y));
+        p.lVelZ = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Z));
+        p.lAtX = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_X));
+        p.lAtY = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Y));
+        p.lAtZ = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Z));
+        p.lUpX = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_X));
+        p.lUpY = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Y));
+        p.lUpZ = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Z));
+        p.listenerGain = i32ToFloat(Atomics.load(lctrl, LCTRL_GAIN));
+        p.distanceFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DIST_FACTOR));
+        p.dopplerFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DOPPLER_FACTOR));
+        p.speedOfSound = i32ToFloat(Atomics.load(lctrl, LCTRL_SPEED_OF_SOUND));
+        p.distanceModel = Atomics.load(lctrl, LCTRL_DISTANCE_MODEL);
+        p.rightHanded = (Atomics.load(lctrl, LCTRL_FLAGS) & LFLAG_LEFT_HANDED) === 0;
 
-        // Read source state
-        const sPosX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_X));
-        const sPosY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Y));
-        const sPosZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Z));
-        const sVelX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_X));
-        const sVelY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Y));
-        const sVelZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Z));
-        const minDist = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MIN_DIST));
-        const maxDist = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MAX_DIST));
-        const coneInner = Atomics.load(ctrl, CTRL_3D_CONE_INNER);
-        const coneOuter = Atomics.load(ctrl, CTRL_3D_CONE_OUTER);
-        const coneOriX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_X));
-        const coneOriY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Y));
-        const coneOriZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Z));
+        p.sPosX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_X));
+        p.sPosY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Y));
+        p.sPosZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Z));
+        p.sVelX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_X));
+        p.sVelY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Y));
+        p.sVelZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Z));
+        p.refDistance = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MIN_DIST));
+        p.maxDistance = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MAX_DIST));
+        // Rolloff is a LISTENER property in DS3D and a SOURCE property in OpenAL.
+        p.rolloff = (flags3d & FLAG3D_SOURCE_ROLLOFF) !== 0
+          ? i32ToFloat(Atomics.load(ctrl, CTRL_3D_ROLLOFF))
+          : i32ToFloat(Atomics.load(lctrl, LCTRL_ROLLOFF_FACTOR));
+        p.coneInner = Atomics.load(ctrl, CTRL_3D_CONE_INNER);
+        p.coneOuter = Atomics.load(ctrl, CTRL_3D_CONE_OUTER);
         const coneOutVolCb = Atomics.load(ctrl, CTRL_3D_CONE_OUTVOL);
+        p.coneOuterGain = coneOutVolCb <= -10000 ? 0 : Math.min(1, Math.pow(10, coneOutVolCb / 2000));
+        p.dirX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_X));
+        p.dirY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Y));
+        p.dirZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Z));
+        p.sourceGain = linearVol;
+        p.minGain = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MIN_GAIN));
+        p.maxGain = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MAX_GAIN));
+        p.relative = mode3d === DS3DMODE_HEAD_RELATIVE;
 
-        // Direction vector from listener to source
-        let dx: number, dy: number, dz: number;
-        if (mode3d === DS3DMODE_HEAD_RELATIVE) {
-          dx = sPosX;
-          dy = sPosY;
-          dz = sPosZ;
-        } else {
-          dx = sPosX - lPosX;
-          dy = sPosY - lPosY;
-          dz = sPosZ - lPosZ;
-        }
-
-        const rawDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        const dist = rawDist * (distFactor > 0 ? distFactor : 1);
-
-        // Normalize direction
-        let dirX = 0, dirY = 0, dirZ = 1;
-        if (rawDist > 1e-7) {
-          const invDist = 1 / rawDist;
-          dirX = dx * invDist;
-          dirY = dy * invDist;
-          dirZ = dz * invDist;
-        }
-
-        // 1. Distance attenuation (DS3D inverse-distance model)
-        const safeMinDist = Math.max(minDist, 1e-7);
-        const clampedDist = Math.max(safeMinDist, Math.min(dist, maxDist));
-        const distAtten = safeMinDist / (safeMinDist + rolloff * (clampedDist - safeMinDist));
-
-        // 2. Stereo pan from azimuth
-        // Listener's right vector = cross(front, top)
-        const rightX = lFrontY * lTopZ - lFrontZ * lTopY;
-        const rightY = lFrontZ * lTopX - lFrontX * lTopZ;
-        const rightZ = lFrontX * lTopY - lFrontY * lTopX;
-        // Normalize right vector
-        const rightLen = Math.sqrt(rightX * rightX + rightY * rightY + rightZ * rightZ);
-        let nrX = 0, nrY = 0, nrZ = 0;
-        if (rightLen > 1e-7) {
-          const invR = 1 / rightLen;
-          nrX = rightX * invR;
-          nrY = rightY * invR;
-          nrZ = rightZ * invR;
-        }
-        // Pan value: dot(direction, right) in [-1, 1]
-        const panValue = dirX * nrX + dirY * nrY + dirZ * nrZ;
-        // Equal-power panning: theta = (panValue + 1) * PI/4
-        const theta = (panValue + 1) * 0.7853981633974483; // PI/4
-        const leftGain3d = Math.cos(theta);
-        const rightGain3d = Math.sin(theta);
-
-        // 3. Doppler pitch shift
-        if (dopplerFactor > 0) {
-          const c = SPEED_OF_SOUND;
-          // Velocity of listener projected onto direction
-          let vls: number, vss: number;
-          if (mode3d === DS3DMODE_HEAD_RELATIVE) {
-            vls = 0;
-            vss = sVelX * dirX + sVelY * dirY + sVelZ * dirZ;
-          } else {
-            vls = lVelX * dirX + lVelY * dirY + lVelZ * dirZ;
-            vss = sVelX * dirX + sVelY * dirY + sVelZ * dirZ;
-          }
-          const denom = c - dopplerFactor * vss;
-          if (Math.abs(denom) > 1e-7) {
-            const dopplerMul = (c - dopplerFactor * vls) / denom;
-            // Clamp to reasonable range
-            rate *= Math.max(0.1, Math.min(10, dopplerMul));
-          }
-        }
-
-        // 4. Cone attenuation
-        let coneAtten = 1.0;
-        if (coneInner < 360 || coneOuter < 360) {
-          // Normalize cone orientation
-          const coneLen = Math.sqrt(coneOriX * coneOriX + coneOriY * coneOriY + coneOriZ * coneOriZ);
-          if (coneLen > 1e-7) {
-            const invCone = 1 / coneLen;
-            const ncX = coneOriX * invCone;
-            const ncY = coneOriY * invCone;
-            const ncZ = coneOriZ * invCone;
-            // Angle between -direction and cone orientation
-            // (we want angle from source's perspective, looking at listener)
-            const dotCone = -(dirX * ncX + dirY * ncY + dirZ * ncZ);
-            const angleDeg = Math.acos(Math.max(-1, Math.min(1, dotCone))) * (180 / Math.PI);
-            const halfInner = coneInner * 0.5;
-            const halfOuter = coneOuter * 0.5;
-            if (angleDeg <= halfInner) {
-              coneAtten = 1.0;
-            } else if (angleDeg >= halfOuter) {
-              // Outside cone: apply cone outside volume
-              if (coneOutVolCb <= -10000) {
-                coneAtten = 0;
-              } else if (coneOutVolCb >= 0) {
-                coneAtten = 1;
-              } else {
-                coneAtten = Math.pow(10, coneOutVolCb / 2000);
-              }
-            } else {
-              // Interpolate between inner and outer
-              const outerGain = coneOutVolCb <= -10000 ? 0 : (coneOutVolCb >= 0 ? 1 : Math.pow(10, coneOutVolCb / 2000));
-              const t = (angleDeg - halfInner) / (halfOuter - halfInner);
-              coneAtten = 1.0 + t * (outerGain - 1.0);
-            }
-          }
-        }
-
-        // 5. Final gains: combine app-level with 3D
-        leftGain = linearVol * leftGain * distAtten * coneAtten * leftGain3d;
-        rightGain = linearVol * rightGain * distAtten * coneAtten * rightGain3d;
+        spatialize(p, this.spatialOut);
+        // The app-level pan still rides on top: a 3D source may also carry one.
+        leftGain *= this.spatialOut.leftGain;
+        rightGain *= this.spatialOut.rightGain;
+        rate *= this.spatialOut.rateMul;
       } else {
         // Non-3D: apply volume directly
         leftGain *= linearVol;

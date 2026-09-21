@@ -46,6 +46,7 @@ import { registerPerfCommands } from "./cmds/perf";
 import { registerLfbUnpackCommands } from "./cmds/lfb-unpack";
 import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
+import { registerOpenAlCommands } from "./cmds/openal";
 import { registerDbgCommands } from "./cmds/dbg";
 import { registerFpuCommands } from "./cmds/fpu";
 import { registerCodegenCommands } from "./cmds/codegen";
@@ -100,6 +101,7 @@ export function installHarnessCommands(): void {
     registerLfbUnpackCommands(harnessService);
     registerFadeProbeCommands(harnessService);
     registerAudioCommands(harnessService);
+    registerOpenAlCommands(harnessService);
     registerDbgCommands(harnessService);
     registerFpuCommands(harnessService);
     registerCodegenCommands(harnessService);

@@ -75,11 +75,30 @@ export const CTRL_3D_CONE_ORI_Y = 28;
 export const CTRL_3D_CONE_ORI_Z = 29;
 /** Cone outside volume in centibels (default 0) */
 export const CTRL_3D_CONE_OUTVOL = 30;
-/** 3D flags: bit0 = has3D */
+/** 3D flags: see FLAG3D_* */
 export const CTRL_3D_FLAGS = 31;
 
-/** Size of control block in bytes (32 Int32 entries × 4 bytes) */
-export const CTRL_BLOCK_BYTES = 128;
+// ─── OpenAL-shaped per-source fields (slots 32+) ────────────────────────────
+// DirectSound3D carries rolloff on the LISTENER and has no per-source gain clamp;
+// OpenAL carries both per SOURCE. A producer that never writes these keeps the
+// DS3D reading of the same block (see FLAG3D_SOURCE_ROLLOFF).
+
+/** Per-source rolloff factor (float-as-i32); honoured only with FLAG3D_SOURCE_ROLLOFF */
+export const CTRL_3D_ROLLOFF = 32;
+/** AL_MIN_GAIN — floor on the post-distance, post-cone gain (float-as-i32, default 0) */
+export const CTRL_3D_MIN_GAIN = 33;
+/** AL_MAX_GAIN — ceiling on the same (float-as-i32, default 1) */
+export const CTRL_3D_MAX_GAIN = 34;
+
+/** CTRL_3D_FLAGS bit 0: this source is spatialized at all */
+export const FLAG3D_HAS_3D = 1;
+/** CTRL_3D_FLAGS bit 1: use CTRL_3D_ROLLOFF instead of the listener's rolloff */
+export const FLAG3D_SOURCE_ROLLOFF = 2;
+
+/** Int32 entries in the control block */
+export const CTRL_SLOTS = 64;
+/** Size of control block in bytes (CTRL_SLOTS × 4) */
+export const CTRL_BLOCK_BYTES = 256;
 
 /** State constants */
 export const STATE_STOPPED = 0;
@@ -108,9 +127,30 @@ export const LCTRL_TOP_Z = 11;
 export const LCTRL_DIST_FACTOR = 12;
 export const LCTRL_ROLLOFF_FACTOR = 13;
 export const LCTRL_DOPPLER_FACTOR = 14;
+/** Master listener gain, AL_GAIN on the listener (float-as-i32, default 1) */
+export const LCTRL_GAIN = 15;
+/** Distance model — one of the DIST_* values in spatializer.ts (default 0) */
+export const LCTRL_DISTANCE_MODEL = 16;
+/** Speed of sound in m/s for the Doppler shift (float-as-i32, default 340) */
+export const LCTRL_SPEED_OF_SOUND = 17;
+/** Listener flags: see LFLAG_* */
+export const LCTRL_FLAGS = 18;
 
-/** Listener SAB size in bytes (16 Int32 entries × 4 bytes) */
-export const LISTENER_SAB_BYTES = 64;
+/**
+ * LCTRL_FLAGS bit 0: the orientation basis is LEFT-handed, so the listener's right is
+ * cross(up, at) rather than cross(at, up).
+ *
+ * Clear is right-handed — OpenAL's basis, and the one the mixer has always used. A
+ * left-handed producer (DirectSound3D, Miles) mixes as though its basis were
+ * right-handed while this bit stays clear, which mirrors its stereo image; the field
+ * exists so that is a stated choice rather than an accident of the formula.
+ */
+export const LFLAG_LEFT_HANDED = 1;
+
+/** Int32 entries in the listener block */
+export const LISTENER_SLOTS = 32;
+/** Listener SAB size in bytes (LISTENER_SLOTS × 4) */
+export const LISTENER_SAB_BYTES = 128;
 
 // ─── Worklet signal-stats SAB field indices (Int32Array element offsets) ──────
 // Single writer: the AudioWorklet (accumulates per 128-frame block, one
@@ -168,17 +208,32 @@ export function i32ToFloat(i: number): number {
     return _f32[0];
 }
 
+/**
+ * Int32 view over a control block, cached per SAB.
+ *
+ * A fresh `new Int32Array(sab, …)` per field store is an allocation on what is now a
+ * per-frame-per-voice path (an engine pushing AL_POSITION for every live source costs six
+ * stores each), so the view is derived once and kept for the SAB's life. The map is weak,
+ * so a retired ring's view goes with it.
+ */
+const ctrlViews = new WeakMap<SharedArrayBuffer, Int32Array>();
+
+export function ctrlView(sab: SharedArrayBuffer): Int32Array {
+    let v = ctrlViews.get(sab);
+    if (!v) { v = new Int32Array(sab, 0, CTRL_SLOTS); ctrlViews.set(sab, v); }
+    return v;
+}
+
 export function setCtrlFloat(sab: SharedArrayBuffer, field: number, value: number): void {
-    const ctrl = new Int32Array(sab, 0, 32);
     _f32[0] = value;
-    Atomics.store(ctrl, field, _i32[0]);
+    Atomics.store(ctrlView(sab), field, _i32[0]);
 }
 
 // ─── Listener SAB factory ───────────────────────────────────────────────────
 
 export function createListenerSab(): SharedArrayBuffer {
     const sab = new SharedArrayBuffer(LISTENER_SAB_BYTES);
-    const ctrl = new Int32Array(sab, 0, 16);
+    const ctrl = new Int32Array(sab, 0, LISTENER_SLOTS);
     // Position (0,0,0)
     Atomics.store(ctrl, LCTRL_POS_X, floatToI32(0));
     Atomics.store(ctrl, LCTRL_POS_Y, floatToI32(0));
@@ -199,6 +254,12 @@ export function createListenerSab(): SharedArrayBuffer {
     Atomics.store(ctrl, LCTRL_DIST_FACTOR, floatToI32(1));
     Atomics.store(ctrl, LCTRL_ROLLOFF_FACTOR, floatToI32(1));
     Atomics.store(ctrl, LCTRL_DOPPLER_FACTOR, floatToI32(1));
+    Atomics.store(ctrl, LCTRL_GAIN, floatToI32(1));
+    // Defaults are DirectSound3D's, so a producer that writes none of the newer
+    // fields mixes exactly as it did before they existed.
+    Atomics.store(ctrl, LCTRL_DISTANCE_MODEL, 0);
+    Atomics.store(ctrl, LCTRL_SPEED_OF_SOUND, floatToI32(340));
+    Atomics.store(ctrl, LCTRL_FLAGS, 0);
     return sab;
 }
 
@@ -238,7 +299,7 @@ export function createAudioRingBuffer(
     circular: boolean,
 ): SharedArrayBuffer {
     const sab = new SharedArrayBuffer(CTRL_BLOCK_BYTES + bufferBytes);
-    const ctrl = new Int32Array(sab, 0, 32);
+    const ctrl = new Int32Array(sab, 0, CTRL_SLOTS);
     const blockAlign = format.channels * (format.bitsPerSample >> 3);
 
     Atomics.store(ctrl, CTRL_PLAY_CURSOR, 0);
@@ -275,6 +336,9 @@ export function createAudioRingBuffer(
     Atomics.store(ctrl, CTRL_3D_CONE_ORI_Z, floatToI32(1.0));
     Atomics.store(ctrl, CTRL_3D_CONE_OUTVOL, 0);
     Atomics.store(ctrl, CTRL_3D_FLAGS, 0);
+    Atomics.store(ctrl, CTRL_3D_ROLLOFF, floatToI32(1.0));
+    Atomics.store(ctrl, CTRL_3D_MIN_GAIN, floatToI32(0.0));
+    Atomics.store(ctrl, CTRL_3D_MAX_GAIN, floatToI32(1.0));
 
     return sab;
 }
@@ -306,16 +370,14 @@ export function writeRingData(
  * Atomics.store a control field.
  */
 export function setCtrl(sab: SharedArrayBuffer, field: number, value: number): void {
-    const ctrl = new Int32Array(sab, 0, 32);
-    Atomics.store(ctrl, field, value);
+    Atomics.store(ctrlView(sab), field, value);
 }
 
 /**
  * Atomics.load a control field.
  */
 export function getCtrl(sab: SharedArrayBuffer, field: number): number {
-    const ctrl = new Int32Array(sab, 0, 32);
-    return Atomics.load(ctrl, field);
+    return Atomics.load(ctrlView(sab), field);
 }
 
 // ─── Worklet-side helpers ────────────────────────────────────────────────────

@@ -13,6 +13,7 @@
 import type { HarnessService } from "../service";
 import { sys, getModule, symbolize } from "../serialize";
 import { getHostAudioStats, resetHostAudioStats } from "../../worker-handlers/audio-bridge";
+import { CTRL_BLOCK_BYTES } from "../../../audio/audio-ring-buffer";
 
 interface PumpSnapshot {
     tMs: number;
@@ -218,7 +219,6 @@ export function registerAudioCommands(svc: HarnessService): void {
             resetHostAudioStats();
         }
 
-        const CTRL_BLOCK_BYTES = 128;
         const NAMES: Record<number, string> = {
             0: "playCursor", 1: "writeCursor", 2: "bufferBytes", 3: "channels",
             4: "sampleRate", 5: "bitsPerSample", 6: "blockAlign", 7: "state",
