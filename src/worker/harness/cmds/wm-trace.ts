@@ -30,6 +30,9 @@ const TRACED_MSG: Record<number, string> = {
     0x0008: "WM_KILLFOCUS",
     0x001C: "WM_ACTIVATEAPP",
     0x0086: "WM_NCACTIVATE",
+    // Shown/hidden is a lifecycle fact an app acts on (lazy art loads, allocations),
+    // and a missing one is invisible everywhere else.
+    0x0018: "WM_SHOWWINDOW",
     0x0020: "WM_SETCURSOR",
     0x004E: "WM_NOTIFY",
     // Multimedia-device completion is delivered as an ordinary posted message.  Keep

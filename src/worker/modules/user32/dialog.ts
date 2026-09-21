@@ -21,7 +21,8 @@ import { loadBitmapFromPeResource, parseResourceNameFromTitle } from '../kernel3
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
 import { isGroupBoxSystemControl, hitTestSystemControlAtClient, applyComboBoxClosedHeight } from './controls';
 import { clickAutoButton, handleSystemControlMouseAtScreen, resetControlInteractionState, takePendingControlNotification } from './control-interaction';
-import { noteDialogOverlayCandidate, resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
+import { resolveMouseTargetHwnd, eraseDialogOverlay, registerOverlayPaintRepair } from './dialog-overlay';
+import { showDialogWindow } from './window-visibility';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
 import { getDefWindowProcAddress } from './system-classes';
@@ -40,6 +41,7 @@ import {
     activateOwnedDialog,
     reactivateOwnerIfNeeded,
     isCreateInProgress,
+    type ActivationStep,
 } from './activation-messages';
 import { getSystemColorRef, COLOR_BTNFACE_INDEX } from './system';
 // Active-dialog registry + modal-pump lifetime binding.
@@ -763,10 +765,13 @@ function runModalDialog(
         }
     }
 
+    // Win32 creates the dialog HIDDEN and sends WM_INITDIALOG while it still is — that
+    // is where apps size, populate and position controls. DialogBox* shows it afterwards
+    // whatever the template says, and the show is what delivers WM_SHOWWINDOW(TRUE).
     const dialogHwnd = system.windowManager.createWindow(
         '#32770',
         dlgTitle,
-        dlgStyle | WS_VISIBLE,
+        dlgStyle & ~WS_VISIBLE,
         parsed?.exStyle ?? 0,
         dlgX, dlgY, dlgWidth, dlgHeight,
         hWndParent, 0, hInstance || 0x400000, dwInitParam
@@ -789,13 +794,13 @@ function runModalDialog(
     const dialogInfo: WindowInfo = {
         handle: dialogHwnd,
         title: dlgTitle,
-        style: dlgStyle | WS_VISIBLE,
+        style: dlgStyle & ~WS_VISIBLE,
         exStyle: parsed?.exStyle,
         x: dlgX, y: dlgY,
         width: dlgWidth, height: dlgHeight,
         parent: hWndParent || undefined,
         children: [],
-        visible: true,
+        visible: false,
         wndProc: lpDialogFunc,
         userData: 0,
         cbWndExtra: 40,
@@ -819,8 +824,6 @@ function runModalDialog(
     if (parsed && parsed.controls.length > 0) {
         createDialogChildren(system, dialogHwnd, dialogInfo, parsed, hInstance || 0x400000);
     }
-
-    noteDialogOverlayCandidate(dialogInfo);
 
     Logger.log(LogCategory.USER32,
         `${label}: created modal dialog hwnd=0x${dialogHwnd.toString(16)} ` +
@@ -1292,6 +1295,9 @@ function runModalDialog(
 
         dialogInfo.dialogInitInProgress = false;
 
+        // Init is done, so the dialog goes on screen.
+        showDialogWindow(dialogHwnd);
+
         // Dialog is fully constructed and about to start its pump — surface it (and its
         // controls' global coords) to tooling so loops can drive launchers via
         // window.dbg.waitForEvent('dialogShow') + window.dbg.dlgClick(...).
@@ -1392,15 +1398,12 @@ function createModelessDialog(
         dlgY = 0;
     }
 
-    // Real Windows: CreateDialogIndirectParam/CreateDialogParam (modeless) create the
-    // dialog HIDDEN unless the template specifies WS_VISIBLE. The app then shows it via
-    // ShowWindow, which is when WM_SHOWWINDOW fires — HL's launcher menu loads its
-    // background DIB (gfx/shell/splash.bmp) + button strip in OnShowWindow(bShow=TRUE).
-    // Forcing WS_VISIBLE here swallowed that hidden->visible transition so the menu's
-    // OnShowWindow never ran and the background stayed black. (DialogBox/DialogBoxParam —
-    // modal — always show; that path is runModalDialog, which still forces WS_VISIBLE.)
+    // Real Windows: CreateDialogParam*/CreateDialogIndirectParam* create the dialog
+    // HIDDEN, send WM_INITDIALOG while it is still hidden, and show it afterwards only
+    // if the template carries WS_VISIBLE — the show being what delivers WM_SHOWWINDOW.
+    // A template without the bit stays hidden until the app calls ShowWindow itself.
     const templateVisible = (dlgStyle & WS_VISIBLE) !== 0;
-    const dialogCreateStyle = templateVisible ? (dlgStyle | WS_VISIBLE) : (dlgStyle & ~WS_VISIBLE);
+    const dialogCreateStyle = dlgStyle & ~WS_VISIBLE;
 
     // Create a window via WindowManager
     const prevActiveBeforeCreate = system.windowManager.getActiveHwnd();
@@ -1421,7 +1424,7 @@ function createModelessDialog(
         width: dlgWidth, height: dlgHeight,
         parent: hWndParent || undefined,
         children: [],
-        visible: templateVisible,
+        visible: false,
         wndProc: lpDialogFunc,
         userData: 0,
         cbWndExtra: 40,
@@ -1449,26 +1452,40 @@ function createModelessDialog(
     }
     const initFocusHwnd = getInitialDialogFocus(hwnd);
 
-    noteDialogOverlayCandidate(windowInfo);
-
     Logger.log(LogCategory.USER32,
         `${label}: created dialog hwnd=0x${hwnd.toString(16)} ${dlgWidth}x${dlgHeight} ` +
         `with ${windowInfo.children.length} children`);
 
     // Invoke dlgProc(WM_INITDIALOG) via callback, with CBT hooks first
     const callbackManager = system.process?.dispatcher?.callbackManager;
-    const needsActivation = !hWndParent && system.windowManager.getActiveHwnd() === hwnd;
-    if (needsActivation) {
-        markPendingActivation(hwnd);
-    }
-    const activationSteps = needsActivation
-        ? buildPendingActivationSteps(hwnd, lpDialogFunc, prevActiveBeforeCreate)
-        : [];
+
+    // The show is a post-init step, so which window is active — and therefore whether
+    // this dialog owes itself the initial activation chain — is only decided once it is
+    // on screen. Activation messages still trail WM_INITDIALOG: an OnActivate that runs
+    // first re-enters GetMessage and the creation never completes.
+    let needsActivation = false;
+    let activationSteps: ActivationStep[] = [];
+    let shown = false;
+    const showDialogAfterInit = (): void => {
+        if (shown) return;
+        shown = true;
+        if (!templateVisible) return;
+        showDialogWindow(hwnd);
+        // Nothing active yet: the first visible top-level window of a process owns
+        // activation, and for a dialog that moment is the show, not the create.
+        if (!hWndParent && system.windowManager.getActiveHwnd() === 0) {
+            system.windowManager.setActiveWindow(hwnd);
+        }
+        needsActivation = !hWndParent && system.windowManager.getActiveHwnd() === hwnd;
+        if (needsActivation) {
+            markPendingActivation(hwnd);
+            activationSteps = buildPendingActivationSteps(hwnd, lpDialogFunc, prevActiveBeforeCreate);
+        }
+    };
 
     if (callbackManager && lpDialogFunc) {
         const cbtHooks = getHooksOfType(WH_CBT);
         const totalCbtHooks = cbtHooks.length;
-        const activationCount = activationSteps.length;
 
         // Allocate CBT_CREATEWND if hooks exist
         let cbtCreateWndPtr = 0;
@@ -1523,6 +1540,7 @@ function createModelessDialog(
                 } catch (e) {
                     windowInfo.dialogInitInProgress = false;
                     Logger.warn(LogCategory.USER32, `${label}: WM_INITDIALOG invoke failed: ${e}`);
+                    showDialogAfterInit();
                     finalizeDialogPaint(hwnd);
                     return hwnd;
                 }
@@ -1531,14 +1549,15 @@ function createModelessDialog(
             if (!initFocusApplied) {
                 applyInitDialogFocus(hwnd, ret, initFocusHwnd);
                 initFocusApplied = true;
+                showDialogAfterInit();
             }
 
-            if (needsActivation && activationStep < activationCount && needsActivationDelivery(hwnd)) {
+            if (needsActivation && activationStep < activationSteps.length && needsActivationDelivery(hwnd)) {
                 windowInfo.dialogInitInProgress = false;
                 if (activationStep === 0) {
                     Logger.log(LogCategory.USER32,
                         `${label}: WM_INITDIALOG returned hwnd=0x${hwnd.toString(16)}, ` +
-                        `delivering activation (${activationCount} steps)`);
+                        `delivering activation (${activationSteps.length} steps)`);
                 }
                 const step = activationSteps[activationStep]!;
                 activationStep++;
@@ -1560,7 +1579,7 @@ function createModelessDialog(
                 }
             }
 
-            if (!activationMarked && activationCount > 0 && activationStep >= activationCount) {
+            if (!activationMarked && activationSteps.length > 0 && activationStep >= activationSteps.length) {
                 markActivationDelivered(hwnd);
                 activationMarked = true;
             }
@@ -1600,6 +1619,7 @@ function createModelessDialog(
         return { value: hwnd, suspendedForCallback: true, callbackId: first.callbackId, stackCleanup };
     }
 
+    showDialogAfterInit();
     if (needsActivation) {
         postInitialActivationMessages(hwnd);
     }
