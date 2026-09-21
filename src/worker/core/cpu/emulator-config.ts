@@ -20,9 +20,18 @@ export const MEM_LOWMEM_BASE = 0x00000000;
 export const MEM_LOWMEM_SIZE = 0x00100000;
 
 // HEAP: Main application heap for VirtualAlloc, HeapAlloc, etc.
-// Expanded to 512MB for memory-intensive games (Heroes 3, NFS, etc.)
-export const MEM_HEAP_BASE = 0x01000000;      // 16MB start
-export const MEM_HEAP_SIZE = 0x20000000;      // 512MB (was 176MB)
+//
+// The base is what separates the heap from the EXE WINDOW — the gap above low memory that
+// a PE mapped at its preferred ImageBase (0x00400000 for essentially every game) occupies.
+// That window has to fit the WHOLE image: the heap is used BEFORE the image is mapped (the
+// PEB/LDR block is allocated during process init), so an image reaching past the heap base
+// lands on top of live allocations, silently — the bump allocator's skip-over-foreign-regions
+// guard only works once the image region EXISTS. Same silent-and-lethal class as the
+// page-table collision below. 63MB of window fits any 32-bit game image.
+// The heap's END is unchanged (it still abuts MEM_THUNK_CODE_BASE); the window is bought
+// from the heap's low side, and HEAP_HIGH past the 1GB layout absorbs the difference.
+export const MEM_HEAP_BASE = 0x04000000;      // 64MB start — above any game image
+export const MEM_HEAP_SIZE = 0x1d000000;      // 464MB, ending at MEM_THUNK_CODE_BASE
 
 // THUNK_CODE: Executable thunk stubs (callbacks, API trampolines)
 // Must be RX-only and never overlap with writable regions

@@ -55,6 +55,13 @@ const DATA_EXPORT_DLL_FORWARDS: Record<string, string> = {
     msvcr80: "msvcrt",
     msvcr71: "msvcrt",
     msvcr70: "msvcrt",
+    // The C++ runtime's <ymath.h> constants (_FInf and friends) are DATA. An image that
+    // imports one from msvcp80 must reach the same bytes msvcp90 publishes, or the import
+    // gets a function stub's first bytes read as a float — and, lacking an arity, fails the
+    // whole image's bind before that.
+    msvcp80: "msvcp90",
+    msvcp71: "msvcp90",
+    msvcp70: "msvcp90",
 };
 
 export class ThunkGenerator {

@@ -59,14 +59,15 @@ const DLL_IMAGE_GRANULARITY = 0x10000;
  * previous tenant (a freed stub region, a DLL image unloaded and reloaded at the same base),
  * and the JS write that fills the new allocation is invisible to v86 — see memory/guest-code.
  * Doing it here means an x86 emitter cannot obtain executable guest memory without the
- * invalidation happening, whether or not it remembers to ask.
- *
- * HEAP is the hot path (every HeapAlloc) and is never executable, so it short-circuits first.
+ * invalidation happening, whether or not it remembers to ask. That structural guarantee is
+ * the whole reason the chokepoint sits in the allocator, so it cannot hold for some kinds
+ * only: VirtualAlloc hands the guest's own flProtect straight through as `perms` against
+ * kind HEAP, so a guest PAGE_EXECUTE_READWRITE arena IS heap-kind executable memory.
+ * The permission decides, never the bucket.
  */
 function maybeInvalidateExecutableRange(kind: RegionKind, perms: RegionPerms, addr: number, size: number): void {
-    if (kind === 'HEAP') return;
-    const executable = kind === 'THUNK_CODE' || kind === 'CALLBACK_STUB' || kind === 'SPIN_LOOP'
-        || perms === 'rx' || perms === 'rwx';
+    const executable = perms === 'rx' || perms === 'rwx'
+        || kind === 'THUNK_CODE' || kind === 'CALLBACK_STUB' || kind === 'SPIN_LOOP';
     if (!executable) return;
     invalidateGuestCode(addr, size);
 }
@@ -425,6 +426,30 @@ export class MemoryManager {
             } catch { /* high region full — the low heap is still a valid home */ }
         }
         return this.allocFromHigh(size, 0x10000);
+    }
+
+    /**
+     * VirtualAlloc's MEM_TOP_DOWN placement. Win32 treats the flag as a HINT ("allocate at
+     * the highest possible address"), not a constraint: an allocation that fits anywhere
+     * must not fail because the high frontier is full. Prefer HEAP's high end (that is what
+     * keeps these pools segregated from bottom-up HeapAlloc), then HEAP_HIGH's, and only
+     * then the ordinary bump — which spills across both buckets on its own.
+     */
+    allocTopDown(size: number, alignment: number = 0x10000, perms?: RegionPerms): number {
+        // allocFromHigh carves below the frontier without going through alloc(), so the
+        // invalidation chokepoint has to be re-asserted on this path: the guest's own
+        // flProtect arrives here too, and high VA is recycled like any other.
+        const fromHigh = (bucket?: RegionKind): number => {
+            const addr = bucket ? this.allocFromHigh(size, alignment, bucket) : this.allocFromHigh(size, alignment);
+            maybeInvalidateExecutableRange('HEAP', perms ?? 'rw', addr,
+                this.alignUp(size, Math.max(alignment, 0x10000)));
+            return addr;
+        };
+        try { return fromHigh(); } catch { /* HEAP high end full */ }
+        if (this.bucketState.has('HEAP_HIGH')) {
+            try { return fromHigh('HEAP_HIGH'); } catch { /* also full */ }
+        }
+        return this.alloc(size, 'HEAP', perms, alignment);
     }
 
     allocAt(addr: number, size: number, kind?: RegionKind, perms?: RegionPerms): number {

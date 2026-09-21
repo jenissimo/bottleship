@@ -150,12 +150,11 @@ export class AddressSpace {
      * load over it stays architecturally correct (it reads freed-but-mapped memory, which
      * is what real hardware does until the OS decommits). The accessibility change that
      * CAN invalidate speculation — MEM_DECOMMIT / protect-down — goes through
-     * PageTableManager, which bumps the generation itself.
+     * PageTableManager, which clears the TLB and drops the affected pages' write-map bit.
      *
-     * So: no bump here. The generation is global — one bump deoptimises the whole
-     * compiled working set (see PageTableManager.noteCommitOnlyMappingChange) — and a
-     * loading game frees non-HEAP blocks many times a second, which is a rate that keeps
-     * the JIT permanently cold.
+     * So: no fastmem-generation bump here. That generation is global — one bump
+     * deoptimises the whole compiled working set — and a loading game frees non-HEAP
+     * blocks many times a second, which is a rate that keeps the JIT permanently cold.
      */
     releaseRegion(base: number): boolean {
         const idx = this.regions.findIndex(region => region.base === base && region.owner !== "Layout");

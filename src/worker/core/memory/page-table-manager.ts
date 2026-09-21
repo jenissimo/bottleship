@@ -190,7 +190,7 @@ export class PageTableManager {
         // That is a protect-class change, not a commit: `setWriteMapBase(.., true)` below
         // marks the whole span base-writable, and that map is consulted per store with no
         // generation guard — so a speculated store would start bypassing the slow path on
-        // a page the guest asked to be read-only. Detect it and bump, rather than trusting
+        // a page the guest asked to be read-only. Detect it and say so, rather than trusting
         // every future caller to honour the fresh-range contract above.
         let protectionRaised = false;
         let mappingChanged = false;
@@ -280,7 +280,7 @@ export class PageTableManager {
      * Update PTE flags based on Windows protection constants.
      * Used by VirtualProtect.
      */
-    setProtection(baseAddr: number, sizeBytes: number, protect: number, _bumpGeneration = true): void {
+    setProtection(baseAddr: number, sizeBytes: number, protect: number): void {
         const PAGE_NOACCESS = 0x01;
         const PAGE_READONLY = 0x02;
         const PAGE_READWRITE = 0x04;

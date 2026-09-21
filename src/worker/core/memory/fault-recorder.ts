@@ -45,6 +45,13 @@ export interface FaultRecord {
      */
     eipTrusted?: boolean;
     /**
+     * v86's `previous_ip` — the address the CPU entered this block at. On a JIT fault `eip`
+     * carries only the low 12 bits, so it can name a page it never ran; this one is written by
+     * the dispatcher on every block entry and is the only survivor that still says WHERE. It is
+     * a block entry, not the faulting instruction, so it names the FUNCTION, not the line.
+     */
+    previousEip?: number;
+    /**
      * True when the #PF interrupt frame could NOT be read, so `eip` and `errorCode` are
      * placeholder zeros rather than measurements. Without this the record is a confident
      * lie — "EIP 0x0, faultAddr 0x0" reads as a NULL-call wild jump and sends the reader
@@ -63,6 +70,8 @@ export interface FaultRecord {
      *  `slotAddr` is -1 for the register form (`call reg`), where the target came from a
      *  register rather than a memory slot. */
     badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
+    /** HOW control reached a wild EIP — see classifyWildTransfer. */
+    transfer?: WildTransfer;
 }
 
 const REG_NAMES = ["EAX", "ECX", "EDX", "EBX", "ESP", "EBP", "ESI", "EDI"];
@@ -158,6 +167,41 @@ export function isFaultEipConsistent(
         ea = (ea + ((mem[p] << 24) >> 24)) >>> 0;
     }
     return ea === (faultAddr >>> 0);
+}
+
+export type WildTransfer =
+    | { how: "ret"; retSlot: number }
+    | { how: "call"; retAddr: number }
+    | { how: "unknown"; stackTop: number };
+
+/**
+ * HOW did control reach a wild EIP — a RET, a CALL, or neither?
+ *
+ * This is the first question every wild-EIP crash asks and the stack answers it in one word.
+ * A CALL pushes its return address, so the guest ESP at the fault POINTS AT it; a RET pops its
+ * target, so ESP points one word PAST it and the popped word — equal to the faulting EIP — is
+ * still sitting at ESP-4. Without the distinction `badCall` tries to decode an indirect CALL
+ * ending at whatever the callee's first argument happens to be, finds nothing, and reports
+ * nothing at all; a smashed return address then looks identical to a bad vtable slot.
+ *
+ * "ret" is the one that names a STACK overwrite (a caller's frame written past, a mis-cleaned
+ * stack) rather than a bad pointer — the slot it names is where the wrong address was stored.
+ */
+export function classifyWildTransfer(
+    mem: Uint8Array,
+    gameEsp: number,
+    faultingEip: number,
+    /** Whether an indirect CALL was actually DECODED ending at [gameEsp] (analyzeIndirectCallFault).
+     *  Without that proof the top word is just a plausible-looking number, and calling it a
+     *  return address is the guess this classification exists to avoid. */
+    callConfirmed: boolean,
+): WildTransfer | null {
+    if (gameEsp < 4 || gameEsp + 4 > mem.length) return null;
+    const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const popped = dv.getUint32(gameEsp - 4, true) >>> 0;
+    if (popped === (faultingEip >>> 0)) return { how: "ret", retSlot: (gameEsp - 4) >>> 0 };
+    const top = dv.getUint32(gameEsp, true) >>> 0;
+    return callConfirmed ? { how: "call", retAddr: top } : { how: "unknown", stackTop: top };
 }
 
 /**

@@ -22,7 +22,7 @@ import { BusyWaitDetector } from './busy-wait-detector';
 import { WinApiCallRing } from './winapi-call-ring';
 import { dumpExceptionContext } from './exception-context-dumper';
 import { guardStackWrite } from '../memory/stack-write-guard';
-import { guestMemoryBorrowCount } from '../memory/guest-memory';
+import { guestMemoryBorrowCount, toPlainGuestMemory } from '../memory/guest-memory';
 import * as DispatcherForensics from './dispatcher-forensics';
 import { APIRegistry } from '../api-registry';
 import {
@@ -33,10 +33,11 @@ import { thunkChecksumManager } from '../memory/thunk-checksum';
 import { invalidateGuestCode } from '../memory/guest-code';
 import { hypercallDataManager } from '../cpu/hypercall-data';
 import { preemptionManager } from '../cpu/preemption-manager';
+import { cpuViewsForBuffer, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { PF_HALT_TARGET, TRAP_MARKER_VECTOR } from '../bootloader';
-import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault } from '../memory/fault-recorder';
+import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault, classifyWildTransfer } from '../memory/fault-recorder';
 import { stubRegistry } from '../diagnostics/stub-registry';
-import { apiCensus } from '../diagnostics/api-census';
+import { apiCensus, isHresultThunk } from '../diagnostics/api-census';
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_DATA_BASE, MEM_THUNK_DATA_SIZE } from '../cpu/emulator-config';
 import type { Scheduler } from '../scheduler/scheduler';
 import { ThunkBoundaryKind } from '../scheduler/types';
@@ -64,12 +65,47 @@ export type ThunkImplementation = (
     args: number[]
 ) => number | Promise<number> | ThunkResult | Promise<ThunkResult>;
 
+/**
+ * A tier-1 fast path: the whole call, answered in JS without building an X86Context.
+ *
+ * Parameters are ordered by how often a handler needs them, and ESP comes FIRST because
+ * every handler wants it and the dispatcher has already read it — reading `cpu.reg32[4]`
+ * again inside the handler was a v86 `view()` Proxy trap per call, for a value the caller
+ * was holding. It is the same read: taken immediately before the call, with no guest
+ * execution in between. Arguments are at `esp + 4`, `esp + 8`, …
+ *
+ * Return `null` to decline (the JS thunk runs instead) or `undefined` to signal that a
+ * context switch has been arranged.
+ */
 export type FastPathImplementation = (
-    cpu: any,
+    esp: number,
+    dataView: DataView,
     mem8: Uint8Array,
     mem32: Uint32Array,
-    dataView: DataView
+    cpu: any,
 ) => number | null | undefined;
+
+/**
+ * The dispatcher as an HLE module's `registerFastPath*` entry point sees it.
+ *
+ * Every one of those registrars used to take `dispatcher: any`, which meant the compiler
+ * checked NOTHING about the handlers they registered — and a change to
+ * `FastPathImplementation` (the argument order, say) compiled clean while every handler
+ * silently received the wrong values. The intersection keeps that convenience for the
+ * dozen other dispatcher members these modules reach for, while making the one signature
+ * that has a contract an actual contract.
+ */
+export interface FastPathRegistrar {
+    registerFastPath(
+        dllName: string,
+        functionName: string,
+        impl: FastPathImplementation,
+        options?: { trivial?: boolean },
+    ): void;
+}
+
+/** `FastPathRegistrar` plus the untyped remainder of the dispatcher surface. */
+export type HleDispatcher = FastPathRegistrar & Record<string, any>;
 
 /**
  * Tier-0 write-buffer drain handler.
@@ -268,6 +304,8 @@ export class ThunkDispatcher {
     // --- DOD: Flat Arrays for O(1) Access ---
     private dispatchTable: Array<ThunkImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
     private fastPathTable: Array<FastPathImplementation | null> = new Array(MAX_THUNK_ID).fill(null);
+    /** Caller of the dispatch in flight, for the HRESULT-failure census. */
+    private lastCensusCaller = 0;
     /** Per-thunk fast-path hit counts — the census for the tier apiCensus cannot see. */
     private fastPathCounts = new Uint32Array(MAX_THUNK_ID);
     /** Per-funcId WBUF ring census; null until opted into — see censusWriteBufRange. */
@@ -359,11 +397,12 @@ export class ThunkDispatcher {
     private cachedScheduler: Scheduler | null = null;
 
     // Direct Int32Array views into wasm_memory.buffer, bypassing v86's view() Proxy (which
-    // allocates a fresh typed array on every indexed access — see vendor/v86/src/lib.js:17).
-    // Offsets are fixed by v86's CPU state layout (vendor/v86/src/cpu.js:64,120,556,736).
-    // Rebuilt in updateMemoryCache() when mem8.buffer changes (WASM memory growth).
+    // re-resolves on every indexed access — see vendor/v86/src/lib.js:17). Offsets come
+    // from core/cpu/cpu-views.ts, the single owner; rebound by bindCpuStateViews() when
+    // mem8.buffer changes (WASM memory growth).
     private cachedReg32Raw: Int32Array | null = null;
     private cachedIpRaw: Int32Array | null = null;
+    private cachedPreviousIpRaw: Int32Array | null = null;
     private cachedFlagsRaw: Int32Array | null = null;
     private cachedSegOffsetsRaw: Int32Array | null = null;
     private cachedWasmBuffer: ArrayBufferLike | null = null;
@@ -607,6 +646,20 @@ export class ThunkDispatcher {
         return raw.length !== 0 && dv.buffer === this.cachedWasmBuffer;
     }
 
+    /**
+     * The whole-guest-memory DataView, refreshed if the WASM buffer moved.
+     *
+     * `this.getMemory()` hands back v86's Proxy, so `new DataView(mem.buffer,
+     * mem.byteOffset, mem.byteLength)` is three Proxy traps plus an allocation — per call,
+     * on paths that run per render-state set. The cached view is the same bytes over the
+     * same extent; `isDataViewValid()` is what makes reusing it safe across a grow.
+     * Null only before any memory is bound.
+     */
+    private memDataView(): DataView | null {
+        if (!this.isDataViewValid()) this.updateMemoryCache();
+        return this.cachedDataView;
+    }
+
     public clearStackCheck(): void {
         this.lastThunkNameAfterReturn = "";
     }
@@ -656,47 +709,128 @@ export class ThunkDispatcher {
     }
 
     /**
+     * The plain (non-Proxy) GPR file and EIP view, with the same fallback chain the hot
+     * paths already spell inline. Present so the COLD paths — the ones that park a thread
+     * at the spin loop, or zero EAX on a validation failure — do not have to choose
+     * between a Proxy trap and repeating that chain.
+     *
+     * Falls back to v86's Proxy only in the window before `setupPortHook` has bound the
+     * CPU, where correctness, not speed, is the only concern.
+     *
+     * A DETACHED view (length 0 after a grow) is rebound first: these callers park a thread
+     * at the spin loop, and a store into a detached array is a silent no-op — EIP would stay
+     * on the RET N the redirect exists to prevent.
+     */
+    private get regsRaw(): Int32Array {
+        let raw = this.cachedReg32Raw;
+        if (raw !== null && raw.length === 0) { this.updateMemoryCache(); raw = this.cachedReg32Raw; }
+        if (raw !== null && raw.length !== 0) return raw;
+        return this.cachedReg32 ?? this.cachedCpu?.reg32;
+    }
+
+    private get ipRawView(): Int32Array {
+        let raw = this.cachedIpRaw;
+        if (raw !== null && raw.length === 0) { this.updateMemoryCache(); raw = this.cachedIpRaw; }
+        if (raw !== null && raw.length !== 0) return raw;
+        return this.cachedInstructionPointer ?? this.cachedCpu?.instruction_pointer;
+    }
+
+    /**
+     * A fast path grew guest memory, detaching the plain view it was handed.
+     *
+     * Every read it made through that view after the grow returned `undefined`, and every
+     * write went nowhere — silently, far from the store. The contract is that a fast path
+     * is a synchronous answer, not an allocation; this says so once per offender instead of
+     * letting the tier quietly return garbage.
+     */
+    private fastPathGrowthReported = new Set<number>();
+
+    private reportFastPathGrewMemory(functionId: number): void {
+        // The next toPlainGuestMemory() re-derives on its own (the detached view fails its
+        // freshness test), so this only has to refresh the DataView / CPU-state views.
+        this.updateMemoryCache();
+        if (this.fastPathGrowthReported.has(functionId)) return;
+        this.fastPathGrowthReported.add(functionId);
+        Logger.error(LogCategory.THUNK,
+            `FAST PATH GREW GUEST MEMORY: ${this.namesTable[functionId] || `id_${functionId}`} ` +
+            `(id=${functionId}) detached the plain view it was given — its reads after the grow ` +
+            `read undefined and its writes were dropped. A fast path must answer, not allocate; ` +
+            `move the allocating branch to the JS thunk (return null to decline).`);
+    }
+
+    /**
+     * Re-derive the hot CPU-state views after a WASM buffer change.
+     *
+     * The offsets live in `core/cpu/cpu-views.ts` — the single owner (§ the same reason
+     * `guest-code.ts` owns jit_dirty_cache: a second copy of a pinned v86 layout is a
+     * place for a bump to be missed). The dispatcher keeps its own FIELDS because these
+     * four are read several times per dispatched call and a field beats a call plus an
+     * identity compare; what it must not keep is its own idea of where they live.
+     */
+    private bindCpuStateViews(buffer: ArrayBufferLike): void {
+        const v = cpuViewsForBuffer(buffer);
+        this.cachedReg32Raw      = v.reg32;
+        this.cachedFlagsRaw      = v.flags;
+        this.cachedIpRaw         = v.instructionPointer;
+        this.cachedPreviousIpRaw = v.previousIp;
+        this.cachedSegOffsetsRaw = v.segmentOffsets;
+    }
+
+    /**
      * Call this whenever emulator memory buffer might have changed (resize/init)
      */
     public updateMemoryCache(): void {
         // cachedMem8 MUST stay v86's always-live Proxy: the dispatcher detects WASM growth by
         // comparing the live buffer (cachedMem8.buffer, re-resolved by the Proxy) against its
-        // cached DataView/Int32 views' buffers (isDataViewValid). It also writes the guest stack
-        // / return EIP through this view AFTER a thunk may have re-entered the guest (WndProc
-        // callbacks) and grown memory. A plain snapshot here silently drops those post-grow
-        // writes into a detached buffer → corrupt return → 0x7c07 escape-to-bootloader. The
-        // plain (JIT-fast) view is taken at the leaf hot loops instead (synchronous, no re-entry).
+        // cached DataView/Int32 views' buffers (isDataViewValid). It also hands this view to
+        // SLOW-path handlers, which may re-enter the guest (WndProc callbacks) and await, then
+        // write the guest stack / return EIP through it afterwards. A plain snapshot there
+        // silently drops those post-grow writes into a detached buffer → corrupt return →
+        // 0x7c07 escape-to-bootloader.
+        //
+        // The FAST-path tier is handed a plain view of the same bytes instead, derived at the
+        // dispatch site — its contract is a synchronous answer with no re-entry and no
+        // allocation, i.e. exactly the window in which a plain view cannot go stale.
         const mem8 = this.getMemory ? this.getMemory() : (this.v86.mem8 || (this.v86.v86 && this.v86.v86.cpu.mem8));
-        if (mem8 && mem8.byteLength > 0) {
-            this.cachedMem8 = mem8;
-            this.memLength = mem8.length;
-            // Only recreate DataView if buffer changed or was detached
-            // Use cachedMem8.byteLength check instead of cachedDataView.byteLength to avoid errors
-            if (!this.cachedDataView || this.cachedDataView.buffer !== mem8.buffer || (this.cachedMem8 && this.cachedMem8.byteLength === 0)) {
-                this.cachedDataView = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
-            }
-            if ((mem8.byteOffset & 3) === 0) {
-                const length32 = mem8.byteLength >>> 2;
-                if (!this.cachedMem32 ||
-                    this.cachedMem32.buffer !== mem8.buffer ||
-                    this.cachedMem32.byteOffset !== mem8.byteOffset ||
-                    this.cachedMem32.length !== length32) {
-                    this.cachedMem32 = new Uint32Array(mem8.buffer, mem8.byteOffset, length32);
-                }
-            } else {
-                this.cachedMem32 = null;
-            }
+        if (!mem8) return;
+        // Resolve the Proxy ONCE. Every property read below is a get trap, and this runs on
+        // the slow dispatch path; reading the geometry seven times to build one DataView was
+        // most of what `isDataViewValid`/`updateMemoryCache` cost in a profile. `length`, not
+        // `byteLength`: they are identical for a Uint8Array, and `byteLength` is absent from
+        // v86's view() whitelist (it trips dbg_assert in a DEBUG v86 build).
+        const length = mem8.length;
+        if (!(length > 0)) return;
+        const buffer = mem8.buffer;
+        const byteOffset = mem8.byteOffset;
+        // A/B arm: the four extra geometry reads the single-resolve version removed.
+        if (PROXY_BASELINE.on) { void mem8.buffer; void mem8.byteOffset; void mem8.buffer; void mem8.length; }
 
-            // Direct CPU-state views. mem8.buffer === wasm_memory.buffer (v86 routes both
-            // mem8 and reg32 through the same wasm linear memory). Rebuild when the buffer
-            // identity changes (WebAssembly.Memory growth detaches the old ArrayBuffer).
-            if (this.cachedWasmBuffer !== mem8.buffer) {
-                this.cachedWasmBuffer = mem8.buffer;
-                this.cachedReg32Raw      = new Int32Array(mem8.buffer, 64,  8);
-                this.cachedFlagsRaw      = new Int32Array(mem8.buffer, 120, 1);
-                this.cachedIpRaw         = new Int32Array(mem8.buffer, 556, 1);
-                this.cachedSegOffsetsRaw = new Int32Array(mem8.buffer, 736, 8);
+        this.cachedMem8 = mem8;
+        this.memLength = length;
+        // Rebuild the DataView only when the buffer identity changed (a grow detaches the
+        // old one), or when the extent within it moved.
+        if (!this.cachedDataView || this.cachedDataView.buffer !== buffer ||
+            this.cachedDataView.byteOffset !== byteOffset || this.cachedDataView.byteLength !== length) {
+            this.cachedDataView = new DataView(buffer, byteOffset, length);
+        }
+        if ((byteOffset & 3) === 0) {
+            const length32 = length >>> 2;
+            if (!this.cachedMem32 ||
+                this.cachedMem32.buffer !== buffer ||
+                this.cachedMem32.byteOffset !== byteOffset ||
+                this.cachedMem32.length !== length32) {
+                this.cachedMem32 = new Uint32Array(buffer, byteOffset, length32);
             }
+        } else {
+            this.cachedMem32 = null;
+        }
+
+        // Direct CPU-state views. mem8.buffer === wasm_memory.buffer (v86 routes both
+        // mem8 and reg32 through the same wasm linear memory). Rebuild when the buffer
+        // identity changes (WebAssembly.Memory growth detaches the old ArrayBuffer).
+        if (this.cachedWasmBuffer !== buffer) {
+            this.cachedWasmBuffer = buffer;
+            this.bindCpuStateViews(buffer);
         }
     }
 
@@ -817,8 +951,8 @@ export class ThunkDispatcher {
     }
 
     /** Common error-exit for suspended-thunk validation failures: zero EAX + THUNK_STUB boundary. */
-    private handleSuspendedThunkError(cpu: any, cleanup: number): void {
-        cpu.reg32[0] = 0;
+    private handleSuspendedThunkError(_cpu: any, cleanup: number): void {
+        this.regsRaw[0] = 0;
         this.boundaryKind = ThunkBoundaryKind.THUNK_STUB;
         this.boundaryCleanup = cleanup;
     }
@@ -896,8 +1030,8 @@ export class ThunkDispatcher {
         const cpu = this.cachedCpu ?? this.v86?.cpu ?? this.v86?.v86?.cpu;
         if (!cpu) return;
         this.updateMemoryCache();
-        cpu.instruction_pointer[0] = this.spinLoopAddress;
-        this.redirectStackToSpinLoop(((this.cachedReg32Raw ?? cpu.reg32)[4]) >>> 0);
+        this.ipRawView[0] = this.spinLoopAddress;
+        this.redirectStackToSpinLoop(this.regsRaw[4] >>> 0);
         this.lastExpectedEspAfterReturn = 0;
         this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
         if (System.getInstance().isExiting) {
@@ -1445,10 +1579,7 @@ export class ThunkDispatcher {
         // CPU was available; refresh now via cachedMem8.buffer.
         if (this.cachedMem8 && this.cachedWasmBuffer !== this.cachedMem8.buffer) {
             this.cachedWasmBuffer = this.cachedMem8.buffer;
-            this.cachedReg32Raw      = new Int32Array(this.cachedMem8.buffer, 64,  8);
-            this.cachedFlagsRaw      = new Int32Array(this.cachedMem8.buffer, 120, 1);
-            this.cachedIpRaw         = new Int32Array(this.cachedMem8.buffer, 556, 1);
-            this.cachedSegOffsetsRaw = new Int32Array(this.cachedMem8.buffer, 736, 8);
+            this.bindCpuStateViews(this.cachedMem8.buffer);
         }
 
         // Cache scheduler reference (lazy - set on first use since scheduler may init later)
@@ -1584,15 +1715,33 @@ export class ThunkDispatcher {
                 // boolean, as on the slow path.
                 if (harnessApiBreaks.active) {
                     const eipNow = (this.cachedIpRaw ? this.cachedIpRaw[0] : (cpu.instruction_pointer?.[0] ?? 0)) >>> 0;
-                    harnessApiBreaks.check(this.namesTable[functionId] || "unknown", eipNow, espAtEntry);
+                    // The dispatcher already holds a plain view over the register file; a break
+                    // reads THAT rather than taking its own, so the single-owner rule holds.
+                    harnessApiBreaks.check(
+                        this.namesTable[functionId] || "unknown", eipNow, espAtEntry,
+                        this.cachedReg32Raw ? { reg32: this.cachedReg32Raw } : undefined,
+                    );
                 }
                 this.fastPathCallCount++;
+                // The fast-path tier gets a PLAIN view, not v86's Proxy: handlers that read a
+                // guest string or validate an extent were paying ~13x per byte through it, and
+                // several had started unwrapping it by hand. Sound only because a fast path is
+                // synchronous — no re-entry, no await, no allocation — so the view cannot go
+                // stale while it is held. DERIVED PER DISPATCH, never stored (§3.1: a stored
+                // plain view outlives the turn that derived it); the identity cache inside
+                // toPlainGuestMemory makes that a compare plus a length read.
+                // A/B arm: hand over v86's Proxy and re-read ESP through it, which is the
+                // pair of traps per fast-path call that the conversion removed.
+                const mem8Plain = PROXY_BASELINE.on ? this.cachedMem8 : toPlainGuestMemory(this.cachedMem8);
+                const espArg = PROXY_BASELINE.on ? (cpu.reg32[4] >>> 0) : espAtEntry;
                 const doProfile = (this.fastPathCallCount & 0x1F) === 0; // Sample 1/32
 
                 if (doProfile) {
                     frameProfiler.markThunkStart();
                     const thunkStart = frameProfiler.startTimer();
-                    const res = fastImpl(cpu, this.cachedMem8, this.cachedMem32!, this.cachedDataView!);
+                    const res = fastImpl(espArg, this.cachedDataView!, mem8Plain, this.cachedMem32!, cpu);
+                    const grew = mem8Plain.length === 0;
+                    if (grew) this.reportFastPathGrewMemory(functionId);
 
                     if (this.dbgFastPathRec !== null) this._recordFastPath(functionId, res);
                     if (res === undefined) {
@@ -1605,8 +1754,10 @@ export class ThunkDispatcher {
                     }
 
                     if (res !== null) {
-                        // Success (Fast Path)
-                        reg32[0] = res >>> 0;
+                        // Success (Fast Path). A handler that grew memory detached the local
+                        // `reg32`, and a store into a detached view drops the return value the
+                        // guest is about to read — take the rebound view in that case.
+                        (grew ? this.regsRaw : reg32)[0] = res >>> 0;
                         const thunkName = this.namesTable[functionId] || "unknown";
                         const duration = frameProfiler.endTimer("thunk", thunkStart);
                         frameProfiler.recordThunk(thunkName, duration * 32, 32, false, duration);
@@ -1623,14 +1774,16 @@ export class ThunkDispatcher {
                     frameProfiler.markThunkEnd();
                 } else {
                     // ZERO OVERHEAD PATH (no profiling)
-                    const res = fastImpl(cpu, this.cachedMem8, this.cachedMem32!, this.cachedDataView!);
+                    const res = fastImpl(espArg, this.cachedDataView!, mem8Plain, this.cachedMem32!, cpu);
+                    const grew = mem8Plain.length === 0;
+                    if (grew) this.reportFastPathGrewMemory(functionId);
 
                     if (this.dbgFastPathRec !== null) this._recordFastPath(functionId, res);
                     if (res === undefined) return; // Context switch
 
                     if (res !== null) {
-                        // Success
-                        reg32[0] = res >>> 0;
+                        // Success — see the note on the profiled branch above.
+                        (grew ? this.regsRaw : reg32)[0] = res >>> 0;
 
                         const cachedCleanup = this.stackCleanupTable[functionId];
                         const fastArgCount = this.argCountsTable[functionId];
@@ -1812,16 +1965,20 @@ export class ThunkDispatcher {
         // --- PHASE 5: Offset +5 Detection ---
         const eip = (this.cachedIpRaw ? this.cachedIpRaw[0] : (cpu.instruction_pointer?.[0] ?? 0)) >>> 0;
 
-        if (this.cachedMem8 && eip >= 11 && eip < this.memLength) {
+        if (eip >= 11 && eip < this.memLength && this.isDataViewValid()) {
             const stubStart = eip - 11;
-            if (stubStart >= 0) {
+            // A/B arm: the five Proxy byte reads this probe used to make.
+            if (PROXY_BASELINE.on && this.cachedMem8) {
                 const b = this.cachedMem8;
-                if (b[stubStart] === 0xB8 && b[stubStart + 5] === 0xBA && b[stubStart + 10] === 0xEF) {
-                    const stubId = b[stubStart + 1] | (b[stubStart + 2] << 8) | (b[stubStart + 3] << 16) | (b[stubStart + 4] << 24);
-                    if (functionId !== stubId) {
-                        Logger.error(LogCategory.THUNK, `?? OFFSET +5 CALL DETECTED! Correcting ID ${functionId} -> ${stubId}`);
-                        functionId = stubId;
-                    }
+                void (b[stubStart] + b[stubStart + 1] + b[stubStart + 2] + b[stubStart + 5] + b[stubStart + 10]);
+            }
+            const dv = this.cachedDataView!;
+            if (dv.getUint8(stubStart) === 0xB8 && dv.getUint8(stubStart + 5) === 0xBA &&
+                dv.getUint8(stubStart + 10) === 0xEF) {
+                const stubId = dv.getUint32(stubStart + 1, true) | 0;
+                if (functionId !== stubId) {
+                    Logger.error(LogCategory.THUNK, `?? OFFSET +5 CALL DETECTED! Correcting ID ${functionId} -> ${stubId}`);
+                    functionId = stubId;
                 }
             }
         }
@@ -1837,7 +1994,8 @@ export class ThunkDispatcher {
             // Without this, v86 resumes the thunk stub's RET N on the terminated
             // thread's stack > jumps to garbage > #UD crash. Also redirect [ESP] so a
             // JIT-merged OUT+RET N can't pop that garbage. See redirectStackToSpinLoop.
-            cpu.instruction_pointer[0] = this.spinLoopAddress;
+            const ipRaw = this.cachedIpRaw;
+            if (ipRaw) ipRaw[0] = this.spinLoopAddress; else cpu.instruction_pointer[0] = this.spinLoopAddress;
             this.redirectStackToSpinLoop((this.cachedReg32Raw ?? cpu.reg32)[4] >>> 0);
             this.lastExpectedEspAfterReturn = 0;
             this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
@@ -1870,7 +2028,10 @@ export class ThunkDispatcher {
         // no JIT-off needed. Logic lives in src/worker/harness/api-breaks.ts.
         if (harnessApiBreaks.active) {
             const eipNow = (this.cachedIpRaw ? this.cachedIpRaw[0] : (cpu.instruction_pointer?.[0] ?? 0)) >>> 0;
-            harnessApiBreaks.check(thunkName, eipNow, espAtEntry);
+            harnessApiBreaks.check(
+                thunkName, eipNow, espAtEntry,
+                this.cachedReg32Raw ? { reg32: this.cachedReg32Raw } : undefined,
+            );
         }
 
         // Slow-path profiling: count hits per thunk (gated — zero overhead when disabled)
@@ -1912,7 +2073,8 @@ export class ThunkDispatcher {
                     }
                 }
             }
-            if (this.busyWaitDetector.check(thunkName, (cpu.instruction_counter?.[0] ?? 0) >>> 0)) {
+            if (this.busyWaitDetector.check(thunkName,
+                    PROXY_BASELINE.on ? ((cpu.instruction_counter?.[0] ?? 0) >>> 0) : readRetiredInsns(cpu))) {
                 sched.requestSwitch();
             }
         }
@@ -1941,7 +2103,7 @@ export class ThunkDispatcher {
         } catch { /* detached buffer */ }
         this.recordWinApiCall(thunkName, functionId, espAtEntry, ringArg0);
         this.checkEspSanity(espAtEntry, thunkName);
-        this.checkEbpSanity(cpu.reg32[5] >>> 0, thunkName);
+        this.checkEbpSanity(reg32Raw[5] >>> 0, thunkName);
         const profileThunk = profilerEnabled && this.shouldProfileThunk(thunkName);
         if (profileThunk) profiler.startAsync(thunkName);
 
@@ -1989,16 +2151,26 @@ export class ThunkDispatcher {
         // falls behind wall-clock. Credit handler time to keep game timing consistent.
         const implWallStart = performance.now();
         try {
-            const regsRaw = this.cachedReg32 || cpu.reg32;
+            // FRESHNESS: the raw views are plain arrays over one buffer, so a WASM grow
+            // DETACHES them — reading a detached view yields undefined, which would land in
+            // ctx as NaN rather than fail. What makes this safe is the check at the top of
+            // _handlePortWriteSlow: isDataViewValid() tests cachedReg32Raw.length and forces
+            // updateMemoryCache() when it is 0, and nothing between there and here can grow
+            // guest memory (JS and the guest CPU share one thread, so no guest code runs).
+            const regsRaw = PROXY_BASELINE.on
+                ? cpu.reg32                      // A/B arm: the pre-conversion Proxy read
+                : this.cachedReg32Raw || this.cachedReg32 || cpu.reg32;
             const ctx = this.reusableContext;
             ctx.eax = regsRaw[0]; ctx.ecx = regsRaw[1]; ctx.edx = regsRaw[2]; ctx.ebx = regsRaw[3];
             ctx.esp = regsRaw[4]; ctx.ebp = regsRaw[5]; ctx.esi = regsRaw[6]; ctx.edi = regsRaw[7];
-            ctx.eip = (this.cachedInstructionPointer || cpu.instruction_pointer)[0];
+            ctx.eip = (PROXY_BASELINE.on
+                ? cpu.instruction_pointer
+                : this.cachedIpRaw || this.cachedInstructionPointer || cpu.instruction_pointer)[0];
             // Materialize lazy arithmetic flags: this ctx.eflags feeds
             // createPostReturnContext for async/blocked thunks, whose restore
             // clears flags_changed — a raw flags[0] here would bake stale
             // ZF/CF/SF/OF into the resumed context (see saveCpuContext).
-            ctx.eflags = (cpu as any)["get_eflags"] ? (cpu as any)["get_eflags"]() : (this.cachedFlags || cpu.flags)[0];
+            ctx.eflags = (cpu as any)["get_eflags"] ? (cpu as any)["get_eflags"]() : (this.cachedFlagsRaw || this.cachedFlags || cpu.flags)[0];
 
             // API census — record EVERY unique JS-dispatched thunk/COM method the guest
             // calls this session (deduped → one Map entry per name, bumped on repeat) and
@@ -2011,6 +2183,9 @@ export class ThunkDispatcher {
             const censusCaller = (this.cachedDataView && this.isDataViewValid() && espAtEntry < this.memLength - 4)
                 ? this.cachedDataView.getUint32(espAtEntry, true) >>> 0 : 0;
             apiCensus.record(thunkName, impl.length, censusCaller);
+            // Remember the caller for the failure census below: by then the guest stack has
+            // moved on, and a failing HRESULT with no caller names nothing.
+            this.lastCensusCaller = censusCaller;
 
             // `cachedMem8` is the Proxy (see updateMemoryCache); a leaf that indexes it per
             // element instead of borrowing a plain view is ~140x slower. Sampling the borrow
@@ -2045,6 +2220,12 @@ export class ThunkDispatcher {
                 frameProfiler.recordThunk(thunkName, dur * 16, 16, false, dur);
             }
             frameProfiler.markThunkEnd();
+            // A COM call that answers FAILURE hands the guest a NULL out-param it usually
+            // does not check; the deref lands seconds later in its own code. Name it here,
+            // where the answer is still attributable, not at the crash site.
+            if (typeof result === "number" && (result & 0x80000000) !== 0 && isHresultThunk(thunkName)) {
+                apiCensus.recordFailure(thunkName, result, this.lastCensusCaller);
+            }
             this._handleSyncResult(result, functionId, thunkName, cpu, this.reusableContext, argCount, espAtEntry);
             if (this.checkCalleeSaved) this.reportCalleeSavedDrift(cpu, thunkName);
 
@@ -2348,7 +2529,7 @@ export class ThunkDispatcher {
             // First, set EIP to spin loop to prevent executing RET with corrupt stack.
             // Also redirect [ESP] so a JIT-merged OUT+RET N pops the spin loop rather than
             // the terminated thread's garbage stack. See redirectStackToSpinLoop.
-            cpu.instruction_pointer[0] = this.spinLoopAddress;
+            this.ipRawView[0] = this.spinLoopAddress;
             this.redirectStackToSpinLoop(espAtEntry >>> 0);
 
             const sched = System.getInstance().scheduler;
@@ -2390,14 +2571,14 @@ export class ThunkDispatcher {
                 return;
             }
 
-            const mem8 = this.cachedMem8!;
             const view = this.cachedDataView!;
+            const memLength = this.memLength;
             const esp = reg32[4];  // Points to RetAddr on stack
 
             // Validate ESP before reading return address
-            if (esp < 4 || esp + 4 > mem8.length) {
+            if (esp < 4 || esp + 4 > memLength) {
                 Logger.error(LogCategory.THUNK,
-                    `Invalid ESP when suspending thunk: 0x${esp.toString(16)} (memory size: 0x${mem8.length.toString(16)})`);
+                    `Invalid ESP when suspending thunk: 0x${esp.toString(16)} (memory size: 0x${memLength.toString(16)})`);
                 this.handleSuspendedThunkError(cpu, suspendErrCleanup);
                 return;
             }
@@ -2405,9 +2586,9 @@ export class ThunkDispatcher {
             const returnAddr = view.getUint32(esp, true);
 
             // Validate returnAddr
-            if (returnAddr < 0x1000 || returnAddr >= mem8.length) {
+            if (returnAddr < 0x1000 || returnAddr >= memLength) {
                 Logger.error(LogCategory.THUNK,
-                    `Invalid returnAddr when suspending thunk: 0x${returnAddr.toString(16)} (memory size: 0x${mem8.length.toString(16)})`);
+                    `Invalid returnAddr when suspending thunk: 0x${returnAddr.toString(16)} (memory size: 0x${memLength.toString(16)})`);
                 this.handleSuspendedThunkError(cpu, suspendErrCleanup);
                 return;
             }
@@ -2455,7 +2636,7 @@ export class ThunkDispatcher {
         // The thread is already in WAITING state; sleeping threads will eventually wake
         // and may signal the event. performSwitch (at tick boundary) will restore context.
         if (typeof result === 'object' && result !== null && (result as ThunkResult).blockedNoSwitch) {
-            cpu.instruction_pointer[0] = this.spinLoopAddress;
+            this.ipRawView[0] = this.spinLoopAddress;
             // Setting EIP alone is not enough (OUT+RET JIT atomicity) — without the [ESP]
             // redirect the RET N resumes guest code on a WAITING thread, which re-blocks
             // and trips "Invalid transition WAITING->WAITING". See redirectStackToSpinLoop.
@@ -3901,9 +4082,8 @@ export class ThunkDispatcher {
 
     /** Bind the active owner (e.g. COM device `this`) for all setter-shadow trampolines. */
     setShadowOwner(ownerPtr: number): void {
-        if (this.shadowOwnerGlobal === 0 || !this.getMemory) return;
-        const mem = this.getMemory();
-        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(this.shadowOwnerGlobal, ownerPtr >>> 0, true);
+        if (this.shadowOwnerGlobal === 0) return;
+        this.memDataView()?.setUint32(this.shadowOwnerGlobal, ownerPtr >>> 0, true);
     }
 
     /** Re-sentinel a shadow table (every slot → "never set"), forcing the next set of each slot to
@@ -3911,9 +4091,8 @@ export class ThunkDispatcher {
      *  else a stale "equal" would wrongly skip a needed set. */
     resetShadow(dllName: string, funcName: string): void {
         const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
-        if (!h || !this.getMemory) return;
-        const mem = this.getMemory();
-        const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const dv = h ? this.memDataView() : null;
+        if (!h || !dv) return;
         for (let i = 0; i < h.slotCount; i++) dv.setUint32(h.shadowBase + i * 4, h.sentinel, true);
         dv.setUint32(h.skipCounterAddr, 0, true);
     }
@@ -3925,18 +4104,22 @@ export class ThunkDispatcher {
      *  that matches the stale shadow (the NFSU state-block translucency/untexture bug). */
     writeShadowSlot(dllName: string, funcName: string, slot: number, value: number): void {
         const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
-        if (!h || !this.getMemory || slot < 0 || slot >= h.slotCount) return;
-        const mem = this.getMemory();
-        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setInt32(h.shadowBase + slot * 4, value | 0, true);
+        if (!h || slot < 0 || slot >= h.slotCount) return;
+        if (PROXY_BASELINE.on && this.getMemory) {
+            // A/B arm: rebuild the view from the Proxy, as this did per SetRenderState.
+            const mem = this.getMemory();
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setInt32(h.shadowBase + slot * 4, value | 0, true);
+            return;
+        }
+        this.memDataView()?.setInt32(h.shadowBase + slot * 4, value | 0, true);
     }
 
     /** Raw guest-RAM shadow slot values for a shadowed setter (diagnostic: diff vs the JS
      *  state-of-record to find wrong-skip desyncs). Returns null if unknown/not ready. */
     dumpShadowValues(dllName: string, funcName: string): number[] | null {
         const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
-        if (!h || !this.getMemory) return null;
-        const mem = this.getMemory();
-        const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const dv = h ? this.memDataView() : null;
+        if (!h || !dv) return null;
         const out: number[] = new Array(h.slotCount);
         for (let i = 0; i < h.slotCount; i++) out[i] = dv.getInt32(h.shadowBase + i * 4, true);
         return out;
@@ -3979,9 +4162,8 @@ export class ThunkDispatcher {
     /** Guest-side skip counters per shadowed setter (the only direct A/B signal of the win). */
     getShadowStats(): Record<string, number> {
         const out: Record<string, number> = {};
-        if (!this.getMemory) return out;
-        const mem = this.getMemory();
-        const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const dv = this.memDataView();
+        if (!dv) return out;
         for (const [key, h] of this.shadowHandles) out[key] = dv.getUint32(h.skipCounterAddr, true);
         return out;
     }
@@ -4690,6 +4872,10 @@ export class ThunkDispatcher {
      * Unlike hasActiveAsyncThunks() which is global, this only checks the running thread.
      * Use this for callback processing guards � other threads' async thunks (e.g. GetMessageW
      * awaiting messages) should NOT block callback dispatch on the current thread.
+     *
+     * Also the stack-release gate (Scheduler.canReleaseStack): an in-flight handler holds
+     * guest pointers into that thread's frame and completes on a later turn, so the stack
+     * must stay reserved even after the thread terminates.
      */
     hasActiveAsyncThunkForThread(threadId: number | null): boolean {
         if (threadId === null) return false;
@@ -6127,13 +6313,24 @@ export class ThunkDispatcher {
         // the candidates would have silently suppressed it.
         const isFetchFault = (faultAddr >>> 0) === (faultingEip >>> 0);
         const cr2Candidates = isFetchFault ? [] : cr2RegisterCandidates(faultAddr, faultRegs);
-        const eipConsistent = this.cachedMem8
-            ? isFaultEipConsistent(this.cachedMem8, faultingEip, faultAddr, faultRegs)
-            : null;
+        // On a FETCH fault the pushed EIP is the address that could not be fetched — it IS the
+        // answer, by construction. Decoding "the instruction at eip" there decodes whatever the
+        // unmapped page reads as and reports the one true number as untrusted, which is worse
+        // than saying nothing.
+        const eipConsistent = isFetchFault
+            ? true
+            : this.cachedMem8
+                ? isFaultEipConsistent(this.cachedMem8, faultingEip, faultAddr, faultRegs)
+                : null;
         // A fetch fault, or a data fault no register explains ⇒ likely an indirect CALL whose
         // target (vtable slot / IAT entry / register) was bad. Name the call site.
         const badCall = (this.cachedMem8 && (isFetchFault || (cr2Candidates.length === 0 && eipConsistent !== true)))
             ? analyzeIndirectCallFault(this.cachedMem8, faultGameEsp, faultRegs)
+            : null;
+        // A wild EIP is reached by a RET or by a CALL, and the stack says which — a RET names
+        // the SLOT that held the wrong address (a smashed frame), a CALL names the call site.
+        const transfer = (this.cachedMem8 && isFetchFault)
+            ? classifyWildTransfer(this.cachedMem8, faultGameEsp, faultingEip, badCall !== null)
             : null;
         faultRecorder.record({
             ts: performance.now(),
@@ -6146,8 +6343,12 @@ export class ThunkDispatcher {
             regs: faultRegs,
             cr2Candidates,
             eipTrusted: frameRead ? (eipConsistent ?? undefined) : false,
+            // Worth having exactly when eip is not: an untrusted eip leaves nothing else
+            // pointing at the code that faulted.
+            previousEip: this.cachedPreviousIpRaw ? this.cachedPreviousIpRaw[0]! >>> 0 : undefined,
             frameUnread: frameRead ? undefined : true,
             badCall: badCall ?? undefined,
+            transfer: transfer ?? undefined,
             recentCalls: this.winApiRing?.getCrashTraceLines?.(48) ?? [],
             gameEsp: faultGameEsp,
             stackDump: faultStackDump,
@@ -6358,6 +6559,21 @@ export class ThunkDispatcher {
                 `SEH AV frame #${frameCount} preview: handler[0..31]=${previewBytes(handler, 32)} ` +
                 `scope[0..31]=${previewBytes(scopeTable, 32)}`);
 
+            // ASK the frame's handler what shape it is, rather than guessing from the bytes
+            // it points at. A VC8 frame's scopeTable field is XOR'd with the module's security
+            // cookie, so it is an arbitrary 32-bit value: often pointer-shaped, occasionally
+            // pointing at real zeros, and then this walk reads a filter of 0 for every level
+            // and hands the exception on as unhandled. The handler address is unambiguous —
+            // it IS our own export's stub.
+            const handlerStub = this.thunkGenerator.getStubByAddress(handler >>> 0);
+            const handlerName = handlerStub?.functionName ?? "";
+            if (handlerName === "_except_handler4_common" || handlerName === "_local_unwind4") {
+                Logger.warn(LogCategory.SYSTEM,
+                    `SEH AV: frame #${frameCount} is _except_handler4_common (encoded scope table) > slow path`);
+                needsSlowPath = true;
+                break;
+            }
+
             // Check if this is an __except_handler3 frame (scopeTable is a valid pointer, trylevel in range)
             const isHandler3 = scopeTable >= 0x10000 &&
                 scopeTable <= this.memLength - 4 &&
@@ -6399,6 +6615,18 @@ export class ThunkDispatcher {
                 const previousTryLevel = view.getInt32(entryBase, true);
                 const filterAddr = view.getUint32(entryBase + 4, true);
                 const handlerAddr = view.getUint32(entryBase + 8, true);
+                // A record with NEITHER a filter nor a handler does not exist: a __finally
+                // has a handler and an __except has a filter. Reading one means the table is
+                // not a scope table at all (a C++ FuncInfo, or a V4 frame whose pointer is
+                // still XOR-encoded), and walking it turns every exception into "unhandled"
+                // — which the guest retries, which is the storm. Hand it to the slow path.
+                if (filterAddr === 0 && handlerAddr === 0) {
+                    Logger.warn(LogCategory.SYSTEM,
+                        `SEH AV: frame #${frameCount} scope level=${level} is all zeroes ` +
+                        `(scopeTable=0x${scopeTable.toString(16)}) > slow path`);
+                    needsSlowPath = true;
+                    break;
+                }
                 Logger.warn(LogCategory.SYSTEM,
                     `SEH AV scope level=${level}: prev=${previousTryLevel} filter=0x${filterAddr.toString(16)} ` +
                     `handler=0x${handlerAddr.toString(16)} filter[0..47]=${previewBytes(filterAddr, 48)}`);

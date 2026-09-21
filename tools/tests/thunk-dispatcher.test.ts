@@ -7,6 +7,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import { ThunkDispatcher } from '../../src/worker/core/thunking/thunk-dispatcher';
+import { Logger } from '../../src/worker/core/logger';
 import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
 
 const SPIN_ADDR = 0xdead0000;
@@ -650,5 +651,111 @@ describe('ThunkDispatcher.drainWriteBuffer — prefix-fusion consumer that throw
         mem32[CONTROL >> 2] = head;
         d.drainWriteBuffer();
         expect(d.getWriteBufCensus().length).toBe(3);
+    });
+});
+
+describe('ThunkDispatcher — plain CPU-state views cannot be read stale', () => {
+    // The per-thunk X86Context is assembled from `cachedReg32Raw`, a PLAIN Int32Array over
+    // the WASM buffer. A grow detaches it, and a detached typed array reads `undefined`
+    // rather than throwing — ctx.eax would silently become NaN. The whole safety argument
+    // is that `isDataViewValid()` sees the detachment and sends the caller through
+    // updateMemoryCache() BEFORE the context is built, which is what this pins.
+    it('isDataViewValid() reports a detached register view as invalid', () => {
+        const d = mkDispatcher();
+        const { mem } = bindMemory(d);
+        expect(d.isDataViewValid()).toBe(true);
+
+        // ArrayBuffer.transfer() detaches the original, exactly as WebAssembly.Memory.grow does.
+        (mem.buffer as ArrayBuffer).transfer();
+
+        expect(d.cachedReg32Raw.length).toBe(0);
+        expect(d.isDataViewValid()).toBe(false);
+    });
+
+    it('a half-bound cache (memory views only) also reads as invalid', () => {
+        const d = mkDispatcher();
+        const mem = new Uint8Array(0x10000);
+        d.cachedMem8 = mem;
+        d.cachedDataView = new DataView(mem.buffer);
+        d.memLength = mem.length;
+        // No CPU-state views bound: answering "valid" here would let the slow path build a
+        // context out of whatever `cachedReg32` still points at.
+        expect(d.isDataViewValid()).toBe(false);
+    });
+});
+
+describe('ThunkDispatcher — fast-path calling convention', () => {
+    // The fast-path signature is (esp, dataView, mem8, mem32, cpu). Nothing in the type
+    // system pinned it until `registerFastPath` stopped being reached through a
+    // `dispatcher: any` — so the order is pinned HERE too, at the real dispatch site,
+    // because a silently reordered argument is a wrong pointer, not a crash.
+    it('passes (esp, dataView, mem8, mem32, cpu) with the live ESP first', () => {
+        const d = mkDispatcher();
+        const { mem, dv } = bindMemory(d);
+        const ESP = 0x2000;
+        d.cachedReg32Raw[4] = ESP;
+
+        const cpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw };
+        d.cachedCpu = cpu;
+        d.cachedScheduler = { onThunkEnter: () => {}, onThunkBoundary: () => {} };
+
+        const seen: any[] = [];
+        const FID = 77;
+        d.fastPathTable[FID] = (...args: any[]) => { seen.push(args); return 0x1234; };
+        d.namesTable[FID] = 'test:FastPathProbe';
+
+        // TWO call sites dispatch a fast path — the frame-profiled one fires on every 32nd
+        // call, the plain one on the rest — and they pass the arguments independently. One
+        // call exercises only the plain branch, which is how a planted reorder in the
+        // profiled branch went undetected the first time this test was written.
+        for (let i = 0; i < 33; i++) d.handlePortWrite(FID);
+
+        expect(seen.length).toBe(33);
+        for (const [esp, dataView, mem8, mem32, gotCpu] of seen) {
+            expect(esp).toBe(ESP);
+            expect(dataView).toBe(dv);
+            expect(mem8).toBe(mem);
+            expect(mem32).toBe(d.cachedMem32);
+            expect(gotCpu).toBe(cpu);
+        }
+        // The answer lands in EAX.
+        expect(d.cachedReg32Raw[0] >>> 0).toBe(0x1234);
+    });
+});
+
+describe('ThunkDispatcher — a fast path that grows guest memory is caught, not tolerated', () => {
+    // The fast-path tier is handed a PLAIN guest view, which is only sound because a fast
+    // path may not allocate. If one does, the view detaches and every later read in that
+    // handler yields `undefined` while its writes vanish — silently. This pins the detector.
+    it('names the offending export and refreshes the cache', () => {
+        const d = mkDispatcher();
+        const { mem } = bindMemory(d);
+        d.cachedReg32Raw[4] = 0x2000;
+        d.cachedCpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw };
+        d.cachedScheduler = { onThunkEnter: () => {}, onThunkBoundary: () => {} };
+
+        const errors: string[] = [];
+        const spy = (Logger as any).error;
+        (Logger as any).error = (_cat: unknown, msg: string) => { errors.push(msg); };
+
+        const FID = 78;
+        d.namesTable[FID] = 'test:GrowsMemory';
+        d.fastPathTable[FID] = (_esp: number, _dv: DataView, mem8: Uint8Array) => {
+            (mem8.buffer as ArrayBuffer).transfer(); // what a WASM grow does to this view
+            return 0;
+        };
+        // getMemory() is what updateMemoryCache re-reads from after the detach.
+        const replacement = new Uint8Array(0x10000);
+        d.getMemory = () => replacement;
+
+        try {
+            d.handlePortWrite(FID);
+        } finally {
+            (Logger as any).error = spy;
+        }
+
+        expect(errors.some(e => e.includes('FAST PATH GREW GUEST MEMORY') && e.includes('test:GrowsMemory'))).toBe(true);
+        // And the cache is re-derived, so the NEXT dispatch is not handed the dead view.
+        expect(d.cachedMem8!.length).toBe(replacement.length);
     });
 });

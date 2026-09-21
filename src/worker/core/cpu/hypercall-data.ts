@@ -7,6 +7,7 @@
  */
 
 import { TimeService } from '../../runtime/time';
+import { readRetiredInsns } from './cpu-views';
 import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
 import { EMU_MEMORY_SIZE } from './emulator-config';
@@ -675,7 +676,7 @@ export class HypercallDataManager {
         if (this.enabled) {
             this.view.setUint32(this.hpBase + OFF_HC_ENABLED, 1, true);
             // Re-snapshot instruction counter and wall-clock — it may also have been reset
-            this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
+            this.lastInsnSnapshot = readRetiredInsns(this.cpu);
             this.lastWallSnapshot = performance.now();
             Logger.log(LogCategory.SYSTEM,
                 `[HYPERCALL] Re-synced state after buffer change ` +
@@ -810,27 +811,30 @@ export class HypercallDataManager {
         return addr;
     }
 
+    private mutexMirrorView(): Uint32Array | null {
+        if (!this.mutexMirrorAddr || !this.wasmMemory) return null;
+        const memBase = this.guestMemBase();
+        if (memBase === null) return null;
+        return new Uint32Array(this.wasmMemory, memBase + this.mutexMirrorAddr, EVENT_TABLE_SLOTS);
+    }
+
     private writeMutexMirrorState(): void {
-        if (!this.mutexMirrorAddr || !this.wasmMemory) return;
-        const base = this.mutexMirrorAddr;
-        const u32 = new Uint32Array(this.wasmMemory);
+        const u32 = this.mutexMirrorView();
+        if (!u32) return;
         for (let slot = 0; slot < EVENT_TABLE_SLOTS; slot++) {
-            u32[(base >>> 2) + slot] = this.mutexMirrorShadow[slot]!;
+            u32[slot] = this.mutexMirrorShadow[slot]!;
         }
     }
 
     private writeMutexMirrorSlot(slot: number): void {
-        if (!this.mutexMirrorAddr || !this.wasmMemory) return;
-        const u32 = new Uint32Array(this.wasmMemory);
-        u32[(this.mutexMirrorAddr >>> 2) + slot] = this.mutexMirrorShadow[slot]!;
+        const u32 = this.mutexMirrorView();
+        if (u32) u32[slot] = this.mutexMirrorShadow[slot]!;
     }
 
     private liveMutexWord(slot: number): number {
         this.refreshViews();
-        if (this.mutexMirrorAddr && this.wasmMemory) {
-            const u32 = new Uint32Array(this.wasmMemory);
-            return u32[(this.mutexMirrorAddr >>> 2) + slot]!;
-        }
+        const u32 = this.mutexMirrorView();
+        if (u32) return u32[slot]!;
         return this.mutexMirrorShadow[slot] ?? 0;
     }
 
@@ -1181,7 +1185,7 @@ export class HypercallDataManager {
         // Only snapshot the instruction-counter baseline on the FIRST enable (must seed once).
         // Re-enable after buffer change (rewriteState) already re-snapshots.
         if (!this.enabled) {
-            this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
+            this.lastInsnSnapshot = readRetiredInsns(this.cpu);
             this.lastWallSnapshot = performance.now();
         }
         this.enabled = true;
@@ -1228,7 +1232,7 @@ export class HypercallDataManager {
 
     /** Reset instruction baseline after pause/resume to prevent stale delta. */
     resetInsnBaseline(): void {
-        this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
+        this.lastInsnSnapshot = readRetiredInsns(this.cpu);
         this.lastWallSnapshot = performance.now();
         this.resetPublishedClock();
     }
@@ -1251,7 +1255,7 @@ export class HypercallDataManager {
         const timeService = TimeService.getInstance();
 
         // --- Compute instruction-based virtual delta ---
-        const insnNow = this.cpu?.instruction_counter?.[0] ?? 0;
+        const insnNow = readRetiredInsns(this.cpu);
         const insnDelta = (insnNow - this.lastInsnSnapshot) >>> 0;
         let virtualDeltaMs = insnDelta / TARGET_INSN_PER_MS;
 
@@ -1454,7 +1458,7 @@ export class HypercallDataManager {
         // Same publish primitive as updateTimeData: this is a re-anchor of the very same
         // interpolation, so it carries the same monotonicity obligation. One publisher is the
         // invariant — a second one writing the fields directly bypasses the floor.
-        this.publishClock(TimeService.getInstance(), (cpu?.instruction_counter?.[0] ?? 0) >>> 0);
+        this.publishClock(TimeService.getInstance(), readRetiredInsns(cpu));
     }
 
     /**
@@ -1545,12 +1549,22 @@ export class HypercallDataManager {
      */
     private slabBlockBase(): number {
         if (this.slabControlAddr !== 0) {
-            const memBase = this.cpu?.mem8?.byteOffset;
-            if (typeof memBase === 'number') {
+            const memBase = this.guestMemBase();
+            if (memBase !== null) {
                 return memBase + this.slabControlAddr - OFF_HC_SLAB_BASE;
             }
         }
         return this.hpBase;
+    }
+
+    /**
+     * Offset of guest RAM inside the WASM buffer. Addresses published through the
+     * hypercall page are GUEST addresses (Rust uses memory::read32); JS indexes the
+     * buffer, where guest RAM starts after the CPU/runtime data.
+     */
+    private guestMemBase(): number | null {
+        const memBase = this.cpu?.mem8?.byteOffset;
+        return typeof memBase === 'number' ? memBase : null;
     }
 
     /** Initialize a heap slab for HeapAlloc/HeapFree (inline stub + JS share the block). */

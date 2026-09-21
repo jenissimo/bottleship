@@ -32,6 +32,26 @@ function getCPU(v86: any): any {
     return v86?.cpu ?? v86?.v86?.cpu ?? null;
 }
 
+// The x87/SSE state lives at fixed offsets in WASM linear memory, and save/restore runs on
+// every context switch. Rebuilding a DataView and a Uint8Array per call allocated on that
+// path for no reason: the pair stays valid for as long as the buffer's identity holds, and
+// a grow replaces that identity. Re-checked on every hand-out, so these can never become
+// the stale-view hazard a cached GUEST-RAM view is.
+let wasmViewBuffer: ArrayBufferLike | null = null;
+let wasmViewDv: DataView | null = null;
+let wasmViewBytes: Uint8Array | null = null;
+
+function wasmViews(cpu: any): { dv: DataView; bytes: Uint8Array } | null {
+    const buffer = cpu?.wasm_memory?.buffer;
+    if (!buffer || buffer.byteLength === 0) return null;
+    if (wasmViewBuffer !== buffer || wasmViewDv === null || wasmViewBytes === null) {
+        wasmViewBuffer = buffer;
+        wasmViewDv = new DataView(buffer);
+        wasmViewBytes = new Uint8Array(buffer);
+    }
+    return { dv: wasmViewDv, bytes: wasmViewBytes };
+}
+
 /** v86 lib.js `view()` wraps WASM memory in a Proxy — not instanceof Uint8Array. */
 function isV86MemoryByteView(v: unknown): v is { [index: number]: number; length: number } {
     if (v == null || typeof v !== "object") return false;
@@ -44,14 +64,22 @@ function getExportedFpuSimdDirty(cpu: any): { [index: number]: number; length: n
     return isV86MemoryByteView(exported) ? exported : null;
 }
 
+/**
+ * The live dirty byte.
+ *
+ * The v86-exported `cpu.fpu_simd_dirty` view and the raw-offset fallback address the SAME
+ * byte of WASM memory, so this reads that byte directly and skips the Proxy on a path that
+ * runs at every context switch. `hasFpuSimdDirtyFlag` — which must distinguish a wired
+ * export from pre-rebuild padding, and cannot be answered from the byte's value — still
+ * asks the CPU object.
+ */
 function getFpuSimdDirtyView(v86: any): { [index: number]: number; length: number } | null {
     const cpu = getCPU(v86);
-    const exported = getExportedFpuSimdDirty(cpu);
-    if (exported) return exported;
-    // JS-side mark/clear only when post-rebuild export is absent (pre-rebuild wasm).
-    const wasmMem = cpu?.wasm_memory;
-    if (!wasmMem?.buffer || wasmMem.buffer.byteLength <= FPU_SIMD_DIRTY_OFFSET) return null;
-    return new Uint8Array(wasmMem.buffer, FPU_SIMD_DIRTY_OFFSET, 1);
+    const views = wasmViews(cpu);
+    if (views && views.bytes.length > FPU_SIMD_DIRTY_OFFSET) {
+        return views.bytes.subarray(FPU_SIMD_DIRTY_OFFSET, FPU_SIMD_DIRTY_OFFSET + 1);
+    }
+    return getExportedFpuSimdDirty(cpu);
 }
 
 /** True only when v86 cpu.js wired cpu.fpu_simd_dirty (post-rebuild). No raw-offset probe —
@@ -77,15 +105,14 @@ export function clearFpuSimdDirty(v86: any): void {
 
 /**
  * Get a DataView over WASM linear memory.
- * Creates a fresh DataView each time since the underlying ArrayBuffer can detach.
+ *
+ * Spans the WHOLE buffer, so absolute `global_pointers.rs` offsets address it directly.
  */
 export function getWasmView(v86OrCpu: any): DataView | null {
     // Accepts either the v86 instance or a bare CPU — callers on the harness side
     // already hold the CPU, and making them re-wrap it invites a silent null.
     const cpu = getCPU(v86OrCpu) ?? v86OrCpu;
-    const wasmMem = cpu?.wasm_memory;
-    if (!wasmMem?.buffer || wasmMem.buffer.byteLength === 0) return null;
-    return new DataView(wasmMem.buffer);
+    return wasmViews(cpu)?.dv ?? null;
 }
 
 function readFpuByte(dv: DataView, offset: number): number {
@@ -226,10 +253,9 @@ export function createDefaultFpuSnapshot(): Uint8Array {
 /** Copy the full x87 state out of WASM memory. Pass a reusable target buffer
  *  (length ≥ FPU_SNAPSHOT_BYTES) to avoid per-switch allocation, or omit it. */
 export function fpuSnapshot(v86: any, target?: Uint8Array): Uint8Array | null {
-    const cpu = getCPU(v86);
-    const wasmMem = cpu?.wasm_memory;
-    if (!wasmMem?.buffer || wasmMem.buffer.byteLength === 0) return null;
-    const src = new Uint8Array(wasmMem.buffer);
+    const views = wasmViews(getCPU(v86));
+    if (!views) return null;
+    const src = views.bytes;
     const out = target && target.length >= FPU_SNAPSHOT_BYTES ? target : new Uint8Array(FPU_SNAPSHOT_BYTES);
     out.set(src.subarray(FPU_ST_OFFSET, FPU_ST_OFFSET + 128), 0);
     out[128] = src[FPU_STACK_PTR_OFFSET];
@@ -241,8 +267,85 @@ export function fpuSnapshot(v86: any, target?: Uint8Array): Uint8Array | null {
     return out;
 }
 
+// ─── the CRT's _controlfp / _statusfp layout ─────────────────────────────────
+//
+// The MSVC CRT does NOT hand the x87 words through: it defines its own bit layout and
+// translates both ways. Two fields are RE-ENCODED rather than shifted — the six exception
+// bits are in a different ORDER, and the precision field's values run the other way
+// (_PC_24 is the x87 encoding 0, _PC_64 is 3) — so passing the raw word through answers with
+// a perfectly plausible number that means something else. This is the single owner of that
+// mapping; `_controlfp`, `_control87`, `_statusfp` and `_clearfp` all go through it.
+//
+// Polarity note: a set _EM_* bit means the exception is MASKED, which is the same polarity as
+// the x87 mask bits, so only the positions move.
+
+/** _MCW_EM — the six interrupt-exception masks. */
+export const MSVC_MCW_EM = 0x0008001f;
+/** _MCW_RC — rounding control. Same value order as x87 (near, down, up, chop). */
+export const MSVC_MCW_RC = 0x00000300;
+/** _MCW_PC — precision control. Value order is REVERSED against x87. */
+export const MSVC_MCW_PC = 0x00030000;
+/** _MCW_IC — infinity control (387 legacy; x87 control word bit 12). */
+export const MSVC_MCW_IC = 0x00040000;
+/** _MCW_DN — denormal control. An SSE (MXCSR FTZ/DAZ) field: the x87 has no such control,
+ *  so it round-trips through the caller's shadow rather than through the control word. */
+export const MSVC_MCW_DN = 0x03000000;
+
+/** [msvc bit, x87 bit] for each exception, in _EM_/mask order. */
+const EXCEPTION_BITS: ReadonlyArray<readonly [number, number]> = [
+    [0x00000010, 0x01],  // invalid
+    [0x00080000, 0x02],  // denormal
+    [0x00000008, 0x04],  // zero divide
+    [0x00000004, 0x08],  // overflow
+    [0x00000002, 0x10],  // underflow
+    [0x00000001, 0x20],  // inexact
+];
+/** _PC_64/_PC_53/_PC_24 (0,1,2) -> x87 PC (3=64-bit, 2=53-bit, 0=24-bit). */
+const PC_MSVC_TO_X87 = [3, 2, 0, 3];
+/** x87 PC -> MSVC. Encoding 1 is reserved on the x87 and reads back as _PC_64. */
+const PC_X87_TO_MSVC = [2, 0, 1, 0];
+
+/** The x87 CONTROL word as the CRT would report it (minus _MCW_DN, which x87 lacks). */
+export function msvcControlWordFromX87(cw: number): number {
+    let out = 0;
+    for (const [msvcBit, x87Bit] of EXCEPTION_BITS) if (cw & x87Bit) out |= msvcBit;
+    out |= PC_X87_TO_MSVC[(cw >> 8) & 3]! << 16;
+    out |= ((cw >> 10) & 3) << 8;
+    if (cw & 0x1000) out |= MSVC_MCW_IC;
+    return out >>> 0;
+}
+
+/** The x87 control word a CRT-layout value asks for, keeping `base`'s reserved bits. */
+export function x87ControlWordFromMsvc(msvc: number, base: number): number {
+    let cw = base & ~0x1f3f;
+    for (const [msvcBit, x87Bit] of EXCEPTION_BITS) if (msvc & msvcBit) cw |= x87Bit;
+    cw |= PC_MSVC_TO_X87[(msvc >> 16) & 3]! << 8;
+    cw |= ((msvc >> 8) & 3) << 10;
+    if (msvc & MSVC_MCW_IC) cw |= 0x1000;
+    return cw & 0xffff;
+}
+
+/** The x87 STATUS word as the CRT would report it: _SW_* share the _EM_* positions. */
+export function msvcStatusWordFromX87(sw: number): number {
+    let out = 0;
+    for (const [msvcBit, x87Bit] of EXCEPTION_BITS) if (sw & x87Bit) out |= msvcBit;
+    return out >>> 0;
+}
+
 /** D3DCREATE_FPU_PRESERVE. */
 const D3DCREATE_FPU_PRESERVE = 0x2;
+
+/** Read the live x87 status word, or null when WASM memory is unavailable. */
+export function getFpuStatusWord(v86: any): number | null {
+    const dv = getWasmView(v86);
+    return dv ? dv.getUint16(FPU_STATUS_WORD_OFFSET, true) : null;
+}
+
+/** Write the live x87 status word (the CRT's _fpreset clears it). */
+export function setFpuStatusWord(v86: any, value: number): void {
+    const dv = getWasmView(v86);
+    if (dv) dv.setUint16(FPU_STATUS_WORD_OFFSET, value & 0xffff, true);
+}
 
 /** Read the live x87 control word, or null when WASM memory is unavailable. */
 export function getFpuControlWord(v86: any): number | null {
@@ -324,10 +427,9 @@ export function applyD3dCreateDeviceFpuMode(v86: any, behaviorFlags: number): nu
 
 /** Write a previously captured x87 snapshot back into WASM memory. */
 export function fpuRestore(v86: any, snap: Uint8Array): boolean {
-    const cpu = getCPU(v86);
-    const wasmMem = cpu?.wasm_memory;
-    if (!wasmMem?.buffer || wasmMem.buffer.byteLength === 0 || snap.length < FPU_SNAPSHOT_BYTES) return false;
-    const dst = new Uint8Array(wasmMem.buffer);
+    const views = wasmViews(getCPU(v86));
+    if (!views || snap.length < FPU_SNAPSHOT_BYTES) return false;
+    const dst = views.bytes;
     dst.set(snap.subarray(0, 128), FPU_ST_OFFSET);
     dst[FPU_STACK_PTR_OFFSET] = snap[128];
     dst[FPU_STACK_EMPTY_OFFSET] = snap[129];
@@ -485,10 +587,9 @@ export function createDefaultSimdSnapshot(): Uint8Array {
  *  CPU has no WASM memory (e.g. unit-test fakes) — callers treat that as "no SSE
  *  state to carry", identical to fpuSnapshot. */
 export function simdSnapshot(v86: any, target?: Uint8Array): Uint8Array | null {
-    const cpu = getCPU(v86);
-    const wasmMem = cpu?.wasm_memory;
-    if (!wasmMem?.buffer || wasmMem.buffer.byteLength === 0) return null;
-    const src = new Uint8Array(wasmMem.buffer);
+    const views = wasmViews(getCPU(v86));
+    if (!views) return null;
+    const src = views.bytes;
     if (src.length < REG_XMM_OFFSET + REG_XMM_BYTES) return null;
     const out = target && target.length >= SIMD_SNAPSHOT_BYTES ? target : new Uint8Array(SIMD_SNAPSHOT_BYTES);
     out[0] = src[MXCSR_OFFSET];
@@ -499,12 +600,37 @@ export function simdSnapshot(v86: any, target?: Uint8Array): Uint8Array | null {
     return out;
 }
 
+/**
+ * The low 64 bits of XMM<i> read as a double — the operand/result register of the
+ * MSVC `_libm_sse2_*` math entry points, which pass nothing on the stack. Returns
+ * null when the CPU has no WASM memory, so a caller can fall back rather than
+ * invent a value.
+ */
+export function xmmGetLowDouble(v86: any, index: number): number | null {
+    const views = wasmViews(getCPU(v86));
+    if (!views) return null;
+    const offset = REG_XMM_OFFSET + index * 16;
+    if (views.dv.byteLength < offset + 8) return null;
+    return views.dv.getFloat64(offset, true);
+}
+
+/** Set the low 64 bits of XMM<i> from a double, zeroing the high half as the SSE2
+ *  scalar math routines do. False when the CPU has no WASM memory. */
+export function xmmSetLowDouble(v86: any, index: number, value: number): boolean {
+    const views = wasmViews(getCPU(v86));
+    if (!views) return false;
+    const offset = REG_XMM_OFFSET + index * 16;
+    if (views.dv.byteLength < offset + 16) return false;
+    views.dv.setFloat64(offset, value, true);
+    views.dv.setFloat64(offset + 8, 0, true);
+    return true;
+}
+
 /** Write a previously captured SSE snapshot back into WASM memory. */
 export function simdRestore(v86: any, snap: Uint8Array): boolean {
-    const cpu = getCPU(v86);
-    const wasmMem = cpu?.wasm_memory;
-    if (!wasmMem?.buffer || wasmMem.buffer.byteLength === 0 || snap.length < SIMD_SNAPSHOT_BYTES) return false;
-    const dst = new Uint8Array(wasmMem.buffer);
+    const views = wasmViews(getCPU(v86));
+    if (!views || snap.length < SIMD_SNAPSHOT_BYTES) return false;
+    const dst = views.bytes;
     if (dst.length < REG_XMM_OFFSET + REG_XMM_BYTES) return false;
     dst[MXCSR_OFFSET] = snap[0];
     dst[MXCSR_OFFSET + 1] = snap[1];
