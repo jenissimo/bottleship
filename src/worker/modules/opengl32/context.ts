@@ -221,9 +221,17 @@ export interface GLTextureObject {
     gpuVersion: number;
 }
 
+/** GL name 0 is the DEFAULT texture object, not "no texture": it exists per target from
+ *  context creation, takes uploads and parameters, and is sampled when texturing is on.
+ *  It is only unnameable — glGenTextures never returns it and glDeleteTextures ignores it.
+ *  Its storage needs a key outside the generated name space because the command buffer
+ *  spells "texturing disabled" as 0, and id Tech 2's Draw_StretchRaw uploads every
+ *  cinematic frame into it. */
+export const DEFAULT_TEXTURE_STORAGE_ID = 0x7FFFFF01;
+
 export interface GLTextureUnit {
     enabled2d: boolean;
-    boundTexture: number; // texture name (0=none)
+    boundTexture: number; // texture name (0 = the default texture object)
     texEnvMode: number;
     /** GL_TEXTURE_ENV_COLOR — the GL_CONSTANT combiner argument. */
     envColor: Float32Array;
@@ -237,6 +245,11 @@ export interface GLTextureUnit {
     opAlpha: Int32Array;
     rgbScale: number;      // GL_RGB_SCALE: 1, 2 or 4
     alphaScale: number;    // GL_ALPHA_SCALE
+}
+
+/** Storage key for whatever this unit has bound, the default object included. */
+export function boundTextureStorageId(unit: GLTextureUnit): number {
+    return unit.boundTexture === 0 ? DEFAULT_TEXTURE_STORAGE_ID : unit.boundTexture;
 }
 
 export function createTextureUnit(): GLTextureUnit {

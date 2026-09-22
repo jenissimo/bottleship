@@ -11,7 +11,7 @@ import {
     CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
     DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
     DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
-    writeTexEnvSlots,
+    writeTexEnvSlots, boundTextureStorageId,
 } from "./context";
 import {
     GL_TRIANGLES, GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_QUADS, GL_QUAD_STRIP,
@@ -331,8 +331,8 @@ function pushGLDrawCommand(ctx: OpenGLContext, mode: number, vertOffset: number,
     I[i + CI_ALPHA_FUNC] = ctx.alphaFunc;
     I[i + CI_CULL_FACE] = ctx.cullFace;
     I[i + CI_FRONT_FACE] = ctx.frontFace;
-    I[i + CI_TEX_ID0] = unit0.enabled2d ? unit0.boundTexture : 0;
-    I[i + CI_TEX_ID1] = unit1.enabled2d ? unit1.boundTexture : 0;
+    I[i + CI_TEX_ID0] = unit0.enabled2d ? boundTextureStorageId(unit0) : 0;
+    I[i + CI_TEX_ID1] = unit1.enabled2d ? boundTextureStorageId(unit1) : 0;
     I[i + CI_TEXENV0] = unit0.texEnvMode;
     I[i + CI_TEXENV1] = unit1.texEnvMode;
     writeTexEnvSlots(I, F, i, f, unit0, unit1);

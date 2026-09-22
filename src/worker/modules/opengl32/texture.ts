@@ -1,6 +1,6 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Mem } from "../../core/memory/mem-accessor";
-import { OpenGLContext, GLTextureObject } from "./context";
+import { OpenGLContext, GLTextureObject, boundTextureStorageId } from "./context";
 import {
     GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D, GL_RGBA,
     GL_PROXY_TEXTURE_2D, GL_IMPL_MAX_TEXTURE_SIZE,
@@ -174,8 +174,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             return 0;
         }
 
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
         tex.width = width;
         tex.height = texHeight;
@@ -219,8 +218,8 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             return 0;
         }
 
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0 || data === 0 || imageSize <= 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
+        if (data === 0 || imageSize <= 0) return 0;
         const tex = ctx.textures.get(texId);
         if (!tex || !tex.data) return 0;
 
@@ -266,6 +265,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const ptr = args[1] >>> 0;
         for (let j = 0; j < n; j++) {
             const id = Mem.readUint32(ptr + j * 4)! >>> 0;
+            if (id === 0) continue; // the default object is not deletable
             ctx.textures.delete(id);
             for (const unit of ctx.textureUnits) {
                 if (unit.boundTexture === id) unit.boundTexture = 0;
@@ -278,8 +278,9 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const target = args[0] >>> 0;
         const texture = args[1] >>> 0;
         if (!isSupportedTextureTarget(target)) return 0;
-        ctx.textureUnits[ctx.activeTextureUnit].boundTexture = texture;
-        if (texture !== 0) ensureTexture(texture);
+        const unit = ctx.textureUnits[ctx.activeTextureUnit];
+        unit.boundTexture = texture;
+        ensureTexture(boundTextureStorageId(unit));
         return 0;
     };
 
@@ -310,8 +311,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
 
         if (target !== GL_TEXTURE_2D || level !== 0) return 0;
 
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
 
         tex.width = width;
@@ -361,8 +361,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const pixels = args[8] >>> 0;
 
         if (target !== GL_TEXTURE_2D) return 0;
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ctx.textures.get(texId);
         if (!tex || !tex.data || pixels === 0) return 0;
 
@@ -408,8 +407,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const pname = args[1] >>> 0;
         const param = args[2] | 0;
         if (!isSupportedTextureTarget(target)) return 0;
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
         switch (pname) {
             case GL_TEXTURE_WRAP_S: tex.wrapS = param; break;
@@ -425,8 +423,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const pname = args[1] >>> 0;
         const param = bitsToF32(args[2]) | 0;
         if (!isSupportedTextureTarget(target)) return 0;
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
         switch (pname) {
             case GL_TEXTURE_WRAP_S: tex.wrapS = param; break;

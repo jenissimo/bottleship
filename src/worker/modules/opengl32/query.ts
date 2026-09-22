@@ -1,6 +1,6 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Mem } from "../../core/memory/mem-accessor";
-import { OpenGLContext } from "./context";
+import { OpenGLContext, boundTextureStorageId } from "./context";
 import {
     GL_NO_ERROR, GL_VENDOR, GL_RENDERER, GL_VERSION, GL_EXTENSIONS,
     GL_MAX_TEXTURE_SIZE, GL_MAX_TEXTURE_UNITS, GL_MAX_MODELVIEW_STACK_DEPTH,
@@ -377,7 +377,7 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
     exports['glGetMaterialiv'] = (): number => 0;
 
     function texParameterValue(pname: number): number | null {
-        const tex = ctx.textures.get(ctx.textureUnits[ctx.activeTextureUnit].boundTexture);
+        const tex = ctx.textures.get(boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]));
         if (!tex) return null;
         switch (pname) {
             case GL_TEXTURE_WRAP_S: return tex.wrapS;
@@ -418,7 +418,7 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
             height = ctx.proxyTextureHeight;
             internalFormat = ctx.proxyTextureInternalFormat;
         } else {
-            const tex = ctx.textures.get(ctx.textureUnits[ctx.activeTextureUnit].boundTexture);
+            const tex = ctx.textures.get(boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]));
             if (!tex || level !== 0) return 0;
             width = tex.width; height = tex.height; internalFormat = tex.internalFormat;
         }
