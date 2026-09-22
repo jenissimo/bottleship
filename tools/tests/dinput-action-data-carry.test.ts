@@ -20,6 +20,8 @@ const DIDEVICEOBJECTDATA8_SIZE = 20;
 const MEM_SIZE = 0x20000;
 const RGDOD = 0x2000;
 const PDWINOUT = 0x3000;
+const ESP = 0x4000;
+const CALLER_RET = 0x5c189e;
 
 const mem = new Uint8Array(MEM_SIZE);
 const view = new DataView(mem.buffer);
@@ -44,12 +46,23 @@ function device() {
     } as any;
 }
 
+/** The ledger row the slow path maintains; the action-mapped path must keep the same one. */
+function trafficRow() {
+    return {
+        getDeviceDataCalls: 0, notAcquired: 0, inputLost: 0, queryCountCalls: 0,
+        peekCalls: 0, drains: 0, eventsDelivered: 0, emptyDrains: 0, overflows: 0,
+        acquireCalls: 0, acquireNoEffect: 0, lastDeliveringCaller: 0,
+    };
+}
+
 /** One GetDeviceData call asking for `maxItems`; returns hr plus what it reported. */
-function getData(dev: any, maxItems: number, opts: { rgdod?: number; flags?: number } = {}) {
+function getData(dev: any, maxItems: number, opts: { rgdod?: number; flags?: number; traffic?: any } = {}) {
     const rgdod = opts.rgdod ?? RGDOD;
     view.setUint32(PDWINOUT, maxItems, true);
+    view.setUint32(ESP, CALLER_RET, true); // [ESP] = the guest return address the ledger names
     const hr = (dinput as any).getActionMappedDeviceData(
         dev, DIDEVICEOBJECTDATA8_SIZE, rgdod, PDWINOUT, opts.flags ?? 0, view,
+        opts.traffic ?? trafficRow(), { esp: ESP },
     );
     const items = view.getUint32(PDWINOUT, true);
     const appData: number[] = [];
@@ -94,6 +107,42 @@ describe("action-mapped GetDeviceData", () => {
         const read = getData(dev, 8);
         expect(read.items).toBe(2);
         expect(read.appData.sort()).toEqual([1, 2]);
+    });
+
+    // §3.4 ledger rule: this path answers the same call as the buffered one, so a reader
+    // asking "did the guest ever RECEIVE anything" must not have to know which path ran.
+    // Counting only the calls made it report 0 events for a device that was delivering.
+    test("the fast path updates the same traffic ledger as the buffered path", () => {
+        press(0x41, 0x44);
+        const dev = device();
+        const traffic = trafficRow();
+
+        const read = getData(dev, 8, { traffic });
+        expect(read.items).toBe(2);
+        expect(traffic.drains).toBe(1);
+        expect(traffic.eventsDelivered).toBe(2);
+        expect(traffic.emptyDrains).toBe(0);
+        expect(traffic.lastDeliveringCaller).toBe(CALLER_RET);
+
+        // A quiet poll is an empty drain, not a silent one.
+        const quiet = getData(dev, 8, { traffic });
+        expect(quiet.items).toBe(0);
+        expect(traffic.drains).toBe(2);
+        expect(traffic.eventsDelivered).toBe(2);
+        expect(traffic.emptyDrains).toBe(1);
+    });
+
+    test("count-only and PEEK are accounted as their own calls, not as drains", () => {
+        press(0x41, 0x44);
+        const dev = device();
+        const traffic = trafficRow();
+
+        getData(dev, 0, { rgdod: 0, traffic });       // count-only
+        getData(dev, 8, { flags: 0x1, traffic });      // DIGDD_PEEK
+        expect(traffic.queryCountCalls).toBe(1);
+        expect(traffic.peekCalls).toBe(1);
+        expect(traffic.drains).toBe(0);
+        expect(traffic.eventsDelivered).toBe(0);
     });
 
     test("only a real refusal reports DI_BUFFEROVERFLOW", () => {

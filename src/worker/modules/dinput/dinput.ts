@@ -1595,7 +1595,8 @@ export class DInput implements IModule {
             // DIDEVICEOBJECTDATA events carrying the app's uAppData. This is the path NFSU's
             // per-frame poll (Poll + GetDeviceData(20,...)) consumes.
             if (device && device.isActionMapped) {
-                return this.getActionMappedDeviceData(device, cbObjectData, rgdod, pdwInOut, dwFlags, view);
+                return this.getActionMappedDeviceData(
+                    device, cbObjectData, rgdod, pdwInOut, dwFlags, view, traffic, ctx);
             }
 
             if (!device) {
@@ -2251,7 +2252,8 @@ export class DInput implements IModule {
 
     private getActionMappedDeviceData(
         device: DirectInputDeviceObject, cbObjectData: number, rgdod: number,
-        pdwInOut: number, dwFlags: number, view: DataView
+        pdwInOut: number, dwFlags: number, view: DataView,
+        traffic: DInputTrafficRow, ctx: any
     ): number {
         if (!device.acquired) {
             return DIERR_NOTACQUIRED;
@@ -2314,6 +2316,7 @@ export class DInput implements IModule {
         // A count-only or PEEK call consumes nothing, so it cannot have lost anything:
         // a backlog deeper than the caller's array is ordinary buffered use.
         if (!rgdod || peek) {
+            if (!rgdod) traffic.queryCountCalls++; else traffic.peekCalls++;
             const reportable = !rgdod ? pending : Math.min(maxItems, pending);
             if (pdwInOut) view.setUint32(pdwInOut, reportable, true);
             return DI_OK;
@@ -2335,8 +2338,13 @@ export class DInput implements IModule {
         }
         queue.splice(0, n);
         if (pdwInOut) view.setUint32(pdwInOut, n, true);
+        traffic.drains++;
+        traffic.eventsDelivered += n;
+        if (n === 0) traffic.emptyDrains++;
+        else traffic.lastDeliveringCaller = view.getUint32(ctx.esp >>> 0, true) >>> 0;
         const overflow = device.actionDataOverflowed;
         device.actionDataOverflowed = false;
+        if (overflow) traffic.overflows++;
         return overflow ? DI_BUFFEROVERFLOW : DI_OK;
     }
 
