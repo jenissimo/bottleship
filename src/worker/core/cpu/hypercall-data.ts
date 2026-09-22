@@ -657,7 +657,7 @@ export class HypercallDataManager {
         // Mutex mirror table pointer — same contract as slab: guest table survives, page pointer does not.
         if (this.mutexMirrorAddr !== 0) {
             this.view.setUint32(this.hpBase + OFF_HC_MUTEX_MIRROR_PTR, this.mutexMirrorAddr, true);
-            this.writeMutexMirrorState();
+            this.writeMutexMirrorState(true);
         }
 
         // EAGL token-dispatch config pointer — same contract (guest block survives).
@@ -812,16 +812,36 @@ export class HypercallDataManager {
     }
 
     private mutexMirrorView(): Uint32Array | null {
+        // `wasmMemory` detaches on grow, and a view over a detached buffer throws rather
+        // than writing — so every derivation re-bases first (refreshViews updates the cache
+        // before it resyncs, so the nested call here sees no change).
+        this.refreshViews();
         if (!this.mutexMirrorAddr || !this.wasmMemory) return null;
         const memBase = this.guestMemBase();
         if (memBase === null) return null;
         return new Uint32Array(this.wasmMemory, memBase + this.mutexMirrorAddr, EVENT_TABLE_SLOTS);
     }
 
-    private writeMutexMirrorState(): void {
+    /**
+     * Flush the JS-owned shadow into the mirror table.
+     *
+     * @param preserveLive when true (buffer-change resync), a slot the live table still
+     * reports VALID is left alone and the shadow is refreshed FROM it. WASM owns the whole
+     * mutex word — handle_wait_for_single_object / handle_release_mutex take and drop
+     * ownership without JS ever seeing it, so the shadow is only as fresh as the last
+     * contended op JS handled. Rewriting a live slot from it resurrects a long-dead owner,
+     * and a mutex nobody holds then blocks every waiter forever. The table lives in guest
+     * RAM, which survives a grow; only a restart zeroes it, and that is the VALID-clear
+     * case this still republishes.
+     */
+    private writeMutexMirrorState(preserveLive = false): void {
         const u32 = this.mutexMirrorView();
         if (!u32) return;
         for (let slot = 0; slot < EVENT_TABLE_SLOTS; slot++) {
+            if (preserveLive && (u32[slot]! & MUX_VALID) !== 0) {
+                this.mutexMirrorShadow[slot] = u32[slot]!;
+                continue;
+            }
             u32[slot] = this.mutexMirrorShadow[slot]!;
         }
     }

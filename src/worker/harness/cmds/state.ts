@@ -546,6 +546,61 @@ export function registerStateCommands(svc: HarnessService): void {
      * "T1 waits on handle H" AND "H is not signalled, and nobody is left to signal it".
      * `ringNote` travels with the ring because the ring cannot see hypercall-served signals.
      */
+    /**
+     * waitGraph() — every blocked thread joined to the object it waits on, its holder,
+     * and whether the WaitEngine can still reach it.
+     *
+     * `syncObjects` says an object is owned and a thread dump says a thread waits; neither
+     * says whether the two are connected. `registered` is that link: a waiter absent from
+     * the handle index gets no wake, so an INFINITE wait there can never end — which a
+     * dump of either side alone reads as ordinary contention. `satisfiable` re-runs the
+     * scheduler's own checkWait: true while the thread is still WAITING is a LOST WAKE,
+     * the object became available and nobody delivered it.
+     */
+    svc.register("waitGraph", () => {
+        const scheduler = sys().scheduler as any;
+        if (!scheduler?.syncObjects || !scheduler?.waitEngine) {
+            throw new HarnessError("no scheduler", HarnessErrorCode.NO_PROCESS);
+        }
+        const syncObjects = scheduler.syncObjects;
+        const waitEngine = scheduler.waitEngine;
+        const threads: Map<number, any> = scheduler.threads;
+        const lookup = (tid: number) => threads.get(tid) ?? null;
+
+        const waiters = [];
+        for (const t of threads.values()) {
+            const info = t.waitInfo;
+            if (!info || t.state !== 3 /* WAITING */) continue;
+            const handles = (info.handles ?? []).map((h: number) => ({
+                handle: h,
+                hex: "0x" + (h >>> 0).toString(16),
+                object: syncObjects.describeHandle(h),
+                registered: waitEngine.getHandleWaiters(h).includes(t.id),
+                otherWaiters: waitEngine.getHandleWaiters(h).filter((id: number) => id !== t.id),
+            }));
+            let satisfiable: boolean | null = null;
+            if (handles.length > 0) {
+                satisfiable = syncObjects.checkWait(info.handles, !!info.waitAll, t.id, lookup).ready;
+            }
+            waiters.push({
+                tid: t.id,
+                eip: "0x" + (t.eip >>> 0).toString(16),
+                eipSym: symbolize(t.eip),
+                reason: info.reason,
+                timed: (t.waitTimeoutTimerId ?? 0) !== 0,
+                handles,
+                satisfiable,
+                lostWake: satisfiable === true,
+                unreachable: handles.length > 0 && handles.every((h: any) => !h.registered),
+            });
+        }
+        return {
+            waiters,
+            objects: syncObjects.describeAll(),
+            runQueue: scheduler.runQueue ?? [],
+        };
+    });
+
     svc.register("syncObjects", (args) => {
         const scheduler = sys().scheduler as any;
         if (!scheduler?.syncObjects) throw new HarnessError("no scheduler", HarnessErrorCode.NO_PROCESS);
