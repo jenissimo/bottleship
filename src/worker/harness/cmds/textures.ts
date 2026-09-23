@@ -694,6 +694,24 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  bisect reads as noise. Scope the scrub whenever a pass you care about is not the first. */
     svc.register("drawScrub", (args) => {
         const dev: any = sys().services?.render?.getActive?.();
+        const ddrawExec: any = ddraw()?.context?.executor;
+        if (!dev?.setDrawScrub && ddrawExec?.setDebugToggle) {
+            // The DDraw/D3D7 executor's levers: skip [0, min-1], cut after max.
+            if (args.length > 0) {
+                const min = Number(args[0] ?? 0) | 0;
+                const max = args[1] === undefined ? -1 : Number(args[1]) | 0;
+                ddrawExec.setDebugToggle("drawSkipFrom", min > 0, 0);
+                ddrawExec.setDebugToggle("drawSkipTo", min > 0, min - 1);
+                ddrawExec.setDebugToggle("drawScrubMax", max >= 0, max);
+            }
+            const f = ddrawExec.getDebugFlags();
+            return {
+                backend: "ddraw",
+                min: f.drawSkipFrom === 0 && f.drawSkipTo >= 0 ? f.drawSkipTo + 1 : 0,
+                max: f.drawScrubMax,
+                lastFrameDraws: f.scrubLastFrameDraws,
+            };
+        }
         if (!dev?.setDrawScrub) throw new HarnessError("active presenter has no draw scrub", HarnessErrorCode.UNSUPPORTED);
         if (args.length > 0) {
             const min = Number(args[0] ?? 0) | 0;
