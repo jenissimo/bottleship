@@ -34,6 +34,7 @@ import {
     FLAG_STREAMING,
 } from "../../audio/audio-ring-buffer";
 import { ensureAudioStatsSab } from "./audio-stats-sab";
+import type { VfsFileHandle, VirtualFileSystem } from "../runtime/filesystem/vfs";
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_BADDEVICEID = 2;
@@ -127,10 +128,71 @@ export function mmioSelectsMemoryIoProc(
     return !filename && !fccIOProc && !pIOProc;
 }
 
+/** A file's bytes, read by range. */
+export interface MmioByteSource {
+    readonly size: number;
+    /** Up to `length` bytes at `offset` — short only at EOF — or null when unreadable. */
+    read(offset: number, length: number): Uint8Array | null;
+}
+
+const EMPTY_BYTES = new Uint8Array(0);
+
+export function mmioArraySource(data: Uint8Array): MmioByteSource {
+    return {
+        size: data.length,
+        read: (offset, length) => {
+            const from = Math.max(0, Math.min(offset, data.length));
+            return data.subarray(from, Math.min(data.length, from + Math.max(0, length)));
+        },
+    };
+}
+
+/**
+ * A disk file read on demand through mmio's own file object, as mmioDosIOProc reads it: the
+ * size of the file is never the size of a read, so an archive of hundreds of MB opens as
+ * cheaply as a lone WAV. Holds one read-ahead window so a chunk walk (12-byte headers) does
+ * not cross the VFS once per header.
+ */
+export class VfsMmioSource implements MmioByteSource {
+    private winStart = 0;
+    private win: Uint8Array = EMPTY_BYTES;
+
+    constructor(
+        private readonly handle: VfsFileHandle,
+        readonly size: number,
+        private readonly vfs: Pick<VirtualFileSystem, "setPosition" | "readSync"> = System.getInstance().fileSystem,
+    ) {}
+
+    read(offset: number, length: number): Uint8Array | null {
+        const from = Math.max(0, Math.min(offset, this.size));
+        const to = Math.min(this.size, from + Math.max(0, length));
+        if (to <= from) return EMPTY_BYTES;
+        if (from >= this.winStart && to <= this.winStart + this.win.length) {
+            return this.win.subarray(from - this.winStart, to - this.winStart);
+        }
+        const want = Math.min(this.size - from, Math.max(to - from, MMIO_GUEST_BUFSIZE));
+        const out = new Uint8Array(want);
+        let filled = 0;
+        this.vfs.setPosition(this.handle, from, 0 /* FILE_BEGIN */);
+        while (filled < want) {
+            const chunk = this.vfs.readSync(this.handle, want - filled);
+            if (!chunk || chunk.length === 0) break;
+            out.set(chunk, filled);
+            filled += chunk.length;
+        }
+        // Short of the request mid-file is a failed read, not a short file.
+        if (filled < to - from) return null;
+        this.winStart = from;
+        this.win = out.subarray(0, filled);
+        return this.win.subarray(0, to - from);
+    }
+}
+
 /** The MMIO direct-I/O buffering state an MMIOHandle carries (subset used by the
  *  pure helpers below). Kept structural so it's testable without the WinMM class. */
 export interface MmioBufState {
-    data: Uint8Array | null;
+    /** A disk file's bytes; null for a memory file, whose bytes are the guest's. */
+    source: MmioByteSource | null;
     position: number;
     guestBuffer?: number;
     guestBufferSize?: number;
@@ -141,18 +203,17 @@ export interface MmioBufState {
 }
 
 /**
- * Copy a window of `state.data` starting at `state.position` into the already-allocated
+ * Copy a window of the disk file starting at `state.position` into the already-allocated
  * guest buffer, recording how many bytes are live (bufFilled) and where the window starts
- * in the file (bufFileOffset). Returns the byte count (0 at EOF). Pure aside from Mem writes.
+ * in the file (bufFileOffset). Returns the byte count (0 at EOF or on a failed read).
  */
 export function mmioFillGuestWindow(state: MmioBufState): number {
-    if (!state.data || !state.guestBuffer) return 0;
+    if (!state.source || !state.guestBuffer) return 0;
     const cap = state.guestBufferSize ?? MMIO_GUEST_BUFSIZE;
-    const start = Math.max(0, Math.min(state.position, state.data.length));
-    const n = Math.min(cap, state.data.length - start);
-    if (n > 0) {
-        Mem.writeBytes(state.guestBuffer, state.data.subarray(start, start + n));
-    }
+    const start = Math.max(0, Math.min(state.position, state.source.size));
+    const bytes = state.source.read(start, cap);
+    const n = bytes?.length ?? 0;
+    if (n > 0) Mem.writeBytes(state.guestBuffer, bytes!);
     state.bufFileOffset = start;
     state.bufFilled = n;
     return n;
@@ -169,14 +230,14 @@ export function mmioFillGuestWindow(state: MmioBufState): number {
  * use (§3.1): a plain view stored across turns detaches the instant WASM memory grows, and
  * a detached view answers length 0 — the file would then report EOF instead of failing, and
  * the caller's sound or video would simply go quiet with nothing logged. A disk file's
- * `data` is a JS-owned copy and is safe to hold, so it is returned unchanged.
+ * source owns no guest view and is returned unchanged.
  */
-export function mmioResolveBytes(state: MmioBufState, mem: Uint8Array | null): Uint8Array | null {
-    if (!state.memoryBase) return state.data;
+export function mmioResolveSource(state: MmioBufState, mem: Uint8Array | null): MmioByteSource | null {
+    if (!state.memoryBase) return state.source;
     if (!mem) return null;
     const size = state.guestBufferSize ?? 0;
     if (state.memoryBase + size > mem.length) return null;
-    return mem.subarray(state.memoryBase, state.memoryBase + size);
+    return mmioArraySource(mem.subarray(state.memoryBase, state.memoryBase + size));
 }
 
 export function mmioWriteInfoStruct(lpmmioinfo: number, hmmio: number, state: MmioBufState): void {
@@ -253,9 +314,9 @@ const TIME_BYTES = 0x0004;
 interface MMIOHandle {
     filename: string;
     position: number;
-    data: Uint8Array | null;
+    source: MmioByteSource | null;
     /** Guest-side I/O buffer for direct memory access (pchBuffer/pchNext/pchEndRead).
-     *  Allocated lazily on first mmioGetInfo. Holds a rotating window of `data`. */
+     *  Allocated lazily on first mmioGetInfo. Holds a rotating window of the file. */
     guestBuffer?: number;
     /** Capacity of guestBuffer in bytes. */
     guestBufferSize?: number;
@@ -416,17 +477,17 @@ export class WinMM implements IModule {
      * can read audio bytes directly via pchBuffer..pchEndRead (mmioGetInfo/mmioAdvance).
      * Returns the number of bytes loaded (0 at EOF / on failure).
      */
-    /** The handle's bytes, re-derived from the CURRENT guest memory — see mmioResolveBytes. */
-    private mmioBytes(mmio: MMIOHandle): Uint8Array | null {
-        return mmioResolveBytes(mmio, System.getInstance().process?.getCurrentMemory() ?? null);
+    /** The handle's bytes, re-derived from the CURRENT guest memory — see mmioResolveSource. */
+    private mmioSource(mmio: MMIOHandle): MmioByteSource | null {
+        return mmioResolveSource(mmio, System.getInstance().process?.getCurrentMemory() ?? null);
     }
 
     private mmioRefillGuestBuffer(mmio: MMIOHandle): number {
-        const bytes = this.mmioBytes(mmio);
-        if (!bytes) return 0;
+        const source = this.mmioSource(mmio);
+        if (!source) return 0;
         // A memory file has no window to slide: the caller's whole block is already the file,
         // and copying it over itself would be both pointless and destructive of guest writes.
-        if (mmio.memoryBase) return Math.max(0, bytes.length - mmio.position);
+        if (mmio.memoryBase) return Math.max(0, source.size - mmio.position);
         if (!mmio.guestBuffer) {
             const mem = System.getInstance().process?.memory;
             const cap = MMIO_GUEST_BUFSIZE;
@@ -1850,12 +1911,12 @@ export class WinMM implements IModule {
                 }
                 const handle = this.nextMMIOHandle++;
                 // The block stays the GUEST's and anything it writes there is what the next
-                // mmioRead must see, so this is a view — derived per use by mmioBytes() from
+                // mmioRead must see, so this is a view — derived per use by mmioSource() from
                 // memoryBase/guestBufferSize. Storing the view itself would detach it on the
                 // next WASM memory growth and turn the file into a silent EOF.
                 this.mmioHandles.set(handle, {
                     filename, position: 0,
-                    data: null,
+                    source: null,
                     memoryBase: pchBuffer,
                     guestBuffer: pchBuffer,
                     guestBufferSize: cchBuffer,
@@ -1869,8 +1930,9 @@ export class WinMM implements IModule {
                 return handle;
             }
 
-            // Read the file synchronously from VFS so mmioDescend/mmioRead work correctly.
-            let data: Uint8Array | null = null;
+            // The file is read on demand, never copied whole. The first window is read here so
+            // a file that cannot be read synchronously still fails the OPEN, as it always has.
+            let source: MmioByteSource | null = null;
             let failure = MMIOERR_FILENOTFOUND;
             try {
                 const vfs = System.getInstance().fileSystem;
@@ -1878,11 +1940,9 @@ export class WinMM implements IModule {
                 const OPEN_EXISTING = 3;
                 const fh = vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING);
                 if (fh) {
-                    const fileSize = vfs.getFileSize(filename);
-                    if (fileSize > 32 * 1024 * 1024) failure = MMIOERR_CANNOTREAD;
-                    else if (fileSize <= 0) data = new Uint8Array(0);
-                    else data = vfs.readSync(fh, fileSize);
-                    if (!data && failure === MMIOERR_FILENOTFOUND) failure = MMIOERR_CANNOTREAD;
+                    const disk = new VfsMmioSource(fh, Math.max(0, vfs.getFileSize(filename)));
+                    if (disk.read(0, MMIO_GUEST_BUFSIZE)) source = disk;
+                    else failure = MMIOERR_CANNOTREAD;
                 }
             } catch (e) {
                 failure = MMIOERR_CANNOTREAD;
@@ -1896,7 +1956,7 @@ export class WinMM implements IModule {
             // fallback the failure was supposed to select — THPS2 loads every sound effect
             // from its .pkr only after mmioOpen says the loose file is not there.
             // MMIO_CREATE asks to create the file, which this read-only mmio cannot do.
-            if (!data) {
+            if (!source) {
                 if (lpmmioinfo) Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, failure);
                 Logger.verbose(LogCategory.SYSTEM,
                     `mmioOpenA: "${filename}" not opened (err=${failure}${(dwOpenFlags & MMIO_CREATE) ? ", MMIO_CREATE unsupported" : ""})`);
@@ -1904,12 +1964,12 @@ export class WinMM implements IModule {
             }
 
             const handle = this.nextMMIOHandle++;
-            this.mmioHandles.set(handle, { filename, position: 0, data });
+            this.mmioHandles.set(handle, { filename, position: 0, source });
             if (lpmmioinfo) {
                 Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, 0);
                 Mem.writeUint32(lpmmioinfo + MMIOINFO_HMMIO, handle);
             }
-            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: opened "${filename}" as handle ${handle}, size=${data.length}`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: opened "${filename}" as handle ${handle}, size=${source.size}`);
             return handle;
         };
 
@@ -1943,15 +2003,15 @@ export class WinMM implements IModule {
 
             if (!pch || cch <= 0) return 0;
 
-            const bytes = this.mmioBytes(mmio);
-            if (!bytes) return 0;
+            const source = this.mmioSource(mmio);
+            if (!source) return 0;
 
-            const available = bytes.length - mmio.position;
-            if (available <= 0) return 0;
-            const toRead = Math.min(cch >>> 0, available);
-            Mem.writeBytes(pch, bytes.subarray(mmio.position, mmio.position + toRead));
-            mmio.position += toRead;
-            return toRead;
+            if (source.size - mmio.position <= 0) return 0;
+            const bytes = source.read(mmio.position, cch >>> 0);
+            if (!bytes) return -1;
+            Mem.writeBytes(pch, bytes);
+            mmio.position += bytes.length;
+            return bytes.length;
         };
 
         this.exports["mmioSeek"] = (ctx, mem, args) => {
@@ -1973,7 +2033,7 @@ export class WinMM implements IModule {
                     newPos = mmio.position + lOffset;
                     break;
                 case SEEK_END:
-                    newPos = (this.mmioBytes(mmio)?.length ?? 0) + lOffset;
+                    newPos = (this.mmioSource(mmio)?.size ?? 0) + lOffset;
                     break;
                 default:
                     return -1;
@@ -2048,13 +2108,13 @@ export class WinMM implements IModule {
             const MMIO_FINDRIFF  = 0x0020;
             const MMIO_FINDLIST  = 0x0040;
 
-            const data = this.mmioBytes(mmio);
-            if (!data) return MMIOERR_CANNOTOPEN;
+            const source = this.mmioSource(mmio);
+            if (!source) return MMIOERR_CANNOTOPEN;
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
             // Determine end of search region (parent chunk bounds, or entire file)
-            let searchEnd = data.length;
+            let searchEnd = source.size;
             if (lpckParent) {
                 const parentDataOffset = view.getUint32(lpckParent + 12, true);
                 const parentCkSize     = view.getUint32(lpckParent + 4,  true);
@@ -2070,12 +2130,14 @@ export class WinMM implements IModule {
             const listId   = 0x5453494c; // 'LIST'
 
             let pos = mmio.position;
-            while (pos + 8 <= searchEnd && pos + 8 <= data.length) {
-                const ckid   = (data[pos] | (data[pos+1]<<8) | (data[pos+2]<<16) | (data[pos+3]<<24)) >>> 0;
-                const cksize = (data[pos+4] | (data[pos+5]<<8) | (data[pos+6]<<16) | (data[pos+7]<<24)) >>> 0;
+            while (pos + 8 <= searchEnd && pos + 8 <= source.size) {
+                const hdr = source.read(pos, 12);
+                if (!hdr || hdr.length < 8) return MMIOERR_CANNOTREAD;
+                const ckid   = (hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24)) >>> 0;
+                const cksize = (hdr[4] | (hdr[5]<<8) | (hdr[6]<<16) | (hdr[7]<<24)) >>> 0;
                 const isContainer = (ckid === riffId || ckid === listId);
-                const fccType = isContainer && pos + 12 <= data.length
-                    ? (data[pos+8] | (data[pos+9]<<8) | (data[pos+10]<<16) | (data[pos+11]<<24)) >>> 0
+                const fccType = isContainer && hdr.length >= 12
+                    ? (hdr[8] | (hdr[9]<<8) | (hdr[10]<<16) | (hdr[11]<<24)) >>> 0
                     : 0;
 
                 let matched = false;
