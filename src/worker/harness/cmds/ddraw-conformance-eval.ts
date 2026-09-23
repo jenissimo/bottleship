@@ -29,7 +29,9 @@ export type Mutation =
     | "noop-flip"
     | "ignore-subrect"
     | "skip-colorfill"
-    | "allow-double-lock";
+    | "allow-double-lock"
+    | "desc-write-back"
+    | "lock-reports-lpsurface";
 
 /**
  * The injected bugs, and the row groups each one must break. `groups` is a list of row-name
@@ -59,6 +61,15 @@ export const MUTATIONS: Record<Mutation, { how: string; groups: string[] }> = {
     "allow-double-lock": {
         how: "a Lock that answered DDERR_SURFACEBUSY is reported as DD_OK",
         groups: ["lockExclusivity.secondLock"],
+    },
+    "desc-write-back": {
+        how: "after a SYSTEMMEMORY CreateSurface the scene writes DDSD_LPSURFACE + that surface's lpSurface "
+            + "into the caller's desc, as a CreateSurface that treats its [in] desc as an out-param would",
+        groups: ["createSurface.descUnchanged", "createSurface.reusedDescDistinctMemory"],
+    },
+    "lock-reports-lpsurface": {
+        how: "a successful IDirectDrawSurface7_Lock also sets DDSD_LPSURFACE in the returned desc",
+        groups: ["lock.noLpSurfaceFlag"],
     },
 };
 

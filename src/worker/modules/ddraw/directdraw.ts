@@ -806,39 +806,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             );
         }
 
-        // Write back to DDSURFACEDESC2
-        if (lpDesc) {
-            if (enableDiagnostics && isTexture) {
-                const originalSize = view.getUint32(lpDesc + 0, true);
-                Logger.log(LogCategory.DDRAW, 
-                    `CreateSurface DIAG: Before write - DDSURFACEDESC2 at 0x${lpDesc.toString(16)} ` +
-                    `originalSize=${originalSize} (needs >= 40 for lpSurface)`
-                );
-            }
-
-            const outDesc: any = {
-                ...normalizedDesc,
-                pitch: surfaceState.pitch,
-                caps: surfaceState.caps, // Use surfaceState.caps — includes FLIP|COMPLEX|VIDEOMEMORY additions
-            };
-
-            // Real DirectDraw behavior:
-            // - SYSMEM surfaces: lpSurface IS returned in CreateSurface (app-managed memory)
-            // - VIDMEM/primary/backbuffer: lpSurface is NOT returned — game must call Lock()
-            // Some engines check for DDSD_LPSURFACE and may reject surfaces that have it set
-            if (isSystemMemory) {
-                outDesc.surfacePtr = surfacePtr;
-                outDesc.flags = (outDesc.flags || 0) | DDSD_LPSURFACE | DDSD_PITCH | DDSD_PIXELFORMAT;
-                if (normalizedDesc.caps) {
-                    outDesc.flags |= DDSD_CAPS;
-                }
-            } else {
-                // VIDMEM surfaces: do NOT expose lpSurface in CreateSurface response
-                outDesc.surfacePtr = 0;
-            }
-
-            writeSurfaceDesc(mem, lpDesc, outDesc);
-        }
+        // lpDDSurfaceDesc is [in]: CreateSurface never writes it back. Apps reuse one desc for
+        // several creates, so an injected DDSD_LPSURFACE hands the next surface this one's pixels.
 
         // Use correct IID for surface version (Surface4 vs Surface7)
         // This prevents IID mismatch that can cause QueryInterface to fail or return wrong behavior

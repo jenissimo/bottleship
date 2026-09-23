@@ -83,6 +83,7 @@ describe("mutation effectiveness", () => {
             "flip3d.currentBackBuffer", "flip3d.otherChainSlot",
             "subrect1x1.(0,0)", "colorfill.fullSurfaceLock", "colorfill.xChannel",
             "lockExclusivity.secondLock",
+            "createSurface.descUnchanged", "createSurface.reusedDescDistinctMemory", "lock.noLpSurfaceFlag",
         ];
         for (const m of Object.values(MUTATIONS)) {
             for (const g of m.groups) {

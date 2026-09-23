@@ -59,7 +59,7 @@ import {
     DDSCL_NORMAL,
     DDSD_CAPS, DDSD_WIDTH, DDSD_HEIGHT, DDSD_PIXELFORMAT, DDSD_BACKBUFFERCOUNT,
     DDSD_CKSRCBLT, DDCKEY_SRCBLT, DDCKEY_DESTBLT, DDCKEY_COLORSPACE, DDERR_NOCOLORKEYHW,
-    DDSCAPS_3DDEVICE, DDSCAPS_FLIP, DDSCAPS_COMPLEX, DDSCAPS_SYSTEMMEMORY,
+    DDSCAPS_3DDEVICE, DDSCAPS_FLIP, DDSCAPS_COMPLEX, DDSCAPS_SYSTEMMEMORY, DDSCAPS_VIDEOMEMORY, DDSD_LPSURFACE,
     DDSURFACEDESC2_SIZE, DDSURFACEDESC2_OFFSETS,
     DDPIXELFORMAT_OFFSETS, DDPF_RGB,
     DDBLTFX_SIZE, DDBLTFX_OFFSETS, DDBLT_COLORFILL, DDBLT_WAIT,
@@ -171,6 +171,21 @@ class Scene {
         const hr = (typeof raw === "number" ? raw : (raw as ThunkResult).value) >>> 0;
 
         if (m === "allow-double-lock" && name === "IDirectDrawSurface7_Lock" && hr === DDERR_SURFACEBUSY) return DD_OK;
+        if (m === "lock-reports-lpsurface" && name === "IDirectDrawSurface7_Lock" && hr === DD_OK) {
+            const flagsAt = args[2]! + DDSURFACEDESC2_OFFSETS.flags;
+            this.setU32(flagsAt, this.u32(flagsAt) | DDSD_LPSURFACE);
+        }
+        if (m === "desc-write-back" && name === "IDirectDraw7_CreateSurface" && hr === DD_OK
+            && (this.u32(args[1]! + DDSURFACEDESC2_OFFSETS.caps) & DDSCAPS_SYSTEMMEMORY) !== 0) {
+            const surface = this.u32(args[2]!);
+            const lockDesc = this.desc();
+            if (await this.call("IDirectDrawSurface7_Lock", [surface, 0, lockDesc, DDLOCK_READONLY, 0]) === DD_OK) {
+                await this.call("IDirectDrawSurface7_Unlock", [surface, 0]);
+                const desc = args[1]!;
+                this.setU32(desc + DDSURFACEDESC2_OFFSETS.flags, this.u32(desc + DDSURFACEDESC2_OFFSETS.flags) | DDSD_LPSURFACE);
+                this.setU32(desc + DDSURFACEDESC2_OFFSETS.lpSurface, this.u32(lockDesc + DDSURFACEDESC2_OFFSETS.lpSurface));
+            }
+        }
         return hr;
     }
 
@@ -570,6 +585,65 @@ async function assertLockExclusivity(s: Scene, ddraw: number, out: ConformanceCh
     }
 }
 
+/**
+ * CreateSurface's desc is [in]: Wine takes it `const` and copies it. Titles build one desc and
+ * reuse it — a SYSTEMMEMORY staging texture, then its VIDEOMEMORY twin for Load() — so a
+ * written-back DDSD_LPSURFACE turns the second create into a user-memory surface aliasing the
+ * first one's pixels, and releasing either destroys what the other still draws with.
+ */
+async function assertCreateSurfaceDescIsInput(s: Scene, ddraw: number, out: ConformanceCheck[]): Promise<void> {
+    const WINE = "surface.c:6697 ddraw_surface_create(const DDSURFACEDESC2 *); 7044-7049 user memory needs SYSTEMMEMORY";
+    try {
+        const d = s.desc();
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.width, PLAIN_W);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.height, PLAIN_H);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.caps, DDSCAPS_OFFSCREENPLAIN | DDSCAPS_SYSTEMMEMORY);
+        s.writeKeyDescPixelFormat(d);
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.flags, DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+
+        const before: number[] = [];
+        for (let o = 0; o < DDSURFACEDESC2_SIZE; o += 4) before.push(s.u32(d + o));
+        const outA = s.alloc(4);
+        await s.must("IDirectDraw7_CreateSurface", [ddraw, d, outA, 0]);
+        const changed: string[] = [];
+        for (let o = 0; o < DDSURFACEDESC2_SIZE; o += 4) {
+            if (s.u32(d + o) !== before[o / 4]) changed.push(`+${o}`);
+        }
+        out.push(check(
+            "createSurface.descUnchanged", WINE, "no dword changed", changed.length ? `changed ${changed.join(",")}` : "no dword changed",
+            changed.length === 0,
+            "the caller's DDSURFACEDESC2 is an input; nothing may be written back into it",
+        ));
+
+        s.setU32(d + DDSURFACEDESC2_OFFSETS.caps, DDSCAPS_OFFSCREENPLAIN | DDSCAPS_VIDEOMEMORY);
+        const outB = s.alloc(4);
+        await s.must("IDirectDraw7_CreateSurface", [ddraw, d, outB, 0]);
+        let lockFlags = 0;
+        const lpOf = async (surface: number): Promise<number> => {
+            const ld = s.desc();
+            await s.must("IDirectDrawSurface7_Lock", [surface, 0, ld, DDLOCK_READONLY | DDLOCK_WAIT, 0]);
+            await s.must("IDirectDrawSurface7_Unlock", [surface, 0]);
+            lockFlags = s.u32(ld + DDSURFACEDESC2_OFFSETS.flags);
+            return s.u32(ld + DDSURFACEDESC2_OFFSETS.lpSurface);
+        };
+        const lpA = await lpOf(s.u32(outA));
+        out.push(check(
+            "lock.noLpSurfaceFlag", "ddraw4.c:7952-7954 test_set_surface_desc",
+            "lpSurface set, DDSD_LPSURFACE clear", `lpSurface ${hex(lpA)}, flags ${hex(lockFlags)}`,
+            lpA !== 0 && (lockFlags & DDSD_LPSURFACE) === 0,
+            "a locked desc carries the pointer but never the flag; reusing it must not ask for user memory",
+        ));
+        const lpB = await lpOf(s.u32(outB));
+        out.push(check(
+            "createSurface.reusedDescDistinctMemory", WINE, "two distinct lpSurface", `${hex(lpA)} / ${hex(lpB)}`,
+            lpA !== 0 && lpB !== 0 && lpA !== lpB,
+            "the same desc reused for a VIDEOMEMORY create must yield a surface with its own memory",
+        ));
+    } catch (e) {
+        out.push(setupFailure("createSurface.descIsInput", WINE, e));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runner
 // ---------------------------------------------------------------------------
@@ -620,6 +694,7 @@ export async function runDDrawConformance(opts: { mutate?: Mutation | null } = {
         await assertColorfillFullLock(s, ddraw, checks);
         await assertLockExclusivity(s, ddraw, checks);
         await assertColorKeyRange(s, ddraw, checks);
+        await assertCreateSurfaceDescIsInput(s, ddraw, checks);
 
         const failed = checks.filter((c) => !c.pass).length;
         // Whether a mutation was CAUGHT is a two-run question (clean vs mutated) and is

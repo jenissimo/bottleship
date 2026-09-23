@@ -380,7 +380,6 @@ export const writeSurfaceDesc = (
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.size, targetSize, true);
     }
     // Build flags based on what we actually write (not what game sent)
-    // Old engines check flags strictly - if DDSD_LPSURFACE is set but DDSD_PITCH is missing, they won't write
     let flags = desc.flags ?? 0;
     
     // We always write these fields — flags must be set
@@ -394,13 +393,13 @@ export const writeSurfaceDesc = (
     // We write caps if provided
     if (desc.caps) flags |= DDSD_CAPS;
     
-    // If lpSurface is provided, MUST also have PITCH and other flags
+    // Windows fills lpSurface but never reports DDSD_LPSURFACE in a desc it returns (Wine
+    // ddraw4.c test_set_surface_desc). An app that feeds such a desc back into CreateSurface
+    // would otherwise ask for user memory aliasing the surface it came from.
+    flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_LPSURFACE;
-        flags |= DDSD_PITCH; // Absolutely required if lpSurface is set
-        flags |= DDSD_PIXELFORMAT; // Also required
+        flags |= DDSD_PITCH;
         if (desc.caps) flags |= DDSD_CAPS;
-        Logger.verbose(LogCategory.DDRAW, `writeSurfaceDesc: adding DDSD_LPSURFACE, flags=0x${flags.toString(16)}, surfacePtr=0x${desc.surfacePtr.toString(16)}, lpSurface_offset=${DDSURFACEDESC2_OFFSETS.lpSurface}`);
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.flags)) {
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.flags, flags, true);
@@ -533,10 +532,9 @@ export const writeSurfaceDescV1 = (
     flags |= DDSD_PIXELFORMAT;
     if (desc.caps) flags |= DDSD_CAPS;
     
+    flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_LPSURFACE;
         flags |= DDSD_PITCH;
-        flags |= DDSD_PIXELFORMAT;
         if (desc.caps) flags |= DDSD_CAPS;
     }
     
