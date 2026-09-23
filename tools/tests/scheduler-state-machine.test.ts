@@ -2041,34 +2041,6 @@ describe("scheduler/waitForSingleObjectWithContext — blocked with runnable pee
     });
 });
 
-describe("scheduler/parkCurrentThreadUntil — synchronous HLE deadline", () => {
-    test("always parks a sole runnable thread and prebuilds a zero return context", () => {
-        const s = new Scheduler();
-        const t1 = mkBlockableCurrent(s, 1);
-
-        const ret = s.parkCurrentThreadUntil(
-            25,
-            0x401000,
-            0x10ffa00,
-            { ecx: 1, edx: 2, ebx: 3, ebp: 4, esi: 5, edi: 6, eflags: 0x202 },
-        );
-
-        expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
-        expect(t1.state).toBe(ThreadState.WAITING);
-        expect(t1.waitInfo?.reason).toBe(WaitReason.SLEEP);
-        expect(t1.waitInfo?.timeoutTimerId).toBeGreaterThan(0);
-        expect(t1.context?.eip >>> 0).toBe(0x401000);
-        expect(t1.context?.esp >>> 0).toBe(0x10ffa00);
-        expect(t1.context?.eax >>> 0).toBe(0);
-
-        const wheel = (s as any).timerWheel as TimerWheel;
-        const now = (s as any).timeService.nowMs();
-        expect(wheel.nextFireIn(now)).toBeGreaterThan(20);
-        expect(wheel.nextFireIn(now)).toBeLessThanOrEqual(25);
-        expect((s as any).shouldPumpIdleVirtualTime()).toBe(true);
-    });
-});
-
 // ─── 11. timer dispatch pre-guard (Task B — cheap boundary reject) ─────────────
 
 describe("scheduler/timer dispatch pre-guard", () => {

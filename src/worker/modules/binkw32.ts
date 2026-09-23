@@ -17,7 +17,7 @@
 
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation, ThunkResult, X86Context } from "../core/thunking/thunk-dispatcher";
+import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { EmulatorConfig } from "../core/emulator-config-manager";
@@ -769,27 +769,6 @@ export class BinkW32 implements IModule {
      * Derive absolute audio playback time (ms) from the ring buffer's play cursor.
      * Detects wraps by checking if cursor jumped backward by more than half the buffer.
      */
-    /**
-     * Replace a hot BinkWait poll loop with one scheduler deadline. The thunk stays
-     * synchronous from the guest's perspective: its post-return context is saved and
-     * EAX=0 (frame ready) is delivered only when the timer wakes the thread.
-     */
-    private markVideoWaitNotReady(ctx: X86Context, mem: Uint8Array, waitMs: number): number | ThunkResult {
-        if (ctx.esp < 0 || ctx.esp + 4 > mem.length) {
-            return 1;
-        }
-        const returnAddr = new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
-            .getUint32(ctx.esp, true);
-        const result = System.getInstance().scheduler.parkCurrentThreadUntil(
-            Math.max(1, waitMs),
-            returnAddr,
-            (ctx.esp + 8) >>> 0,
-            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
-        );
-        if (result === 0) return 1;
-        return { value: 0, blockedNoSwitch: true, stackCleanup: 4 };
-    }
-
     private _getAudioTimeMs(s: BinkSession): number {
         if (!s.audioCtrl) return -1;
 
@@ -1851,9 +1830,10 @@ export class BinkW32 implements IModule {
         };
 
         // в”Ђв”Ђ BinkWait(HBINK) → 0 = ready, 1 = not ready в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-        // MUST be synchronous: callers poll BinkWait from their own event loop and use the
-        // result to decide whether to decode/copy/render the next frame.
-        this.exports["_BinkWait@4"] = (ctx, mem, args) => {
+        // A non-blocking poll, as in the SDK: callers poll BinkWait from their own loop and
+        // keep rendering/pumping between frames, so "not yet" must return at once — holding
+        // the thread to the frame deadline throttles the whole loop to the video's fps.
+        this.exports["_BinkWait@4"] = (_ctx, _mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
             if (!s || s.paused || s.eof) return 0;
@@ -1870,11 +1850,7 @@ export class BinkW32 implements IModule {
                 const audioMs = this._getAudioTimeMs(s);
                 if (audioMs >= 0 && audioMs < targetAudioMs) {
                     const wallElapsed = performance.now() - s.lastFrameMs;
-                    if (wallElapsed < msPerFrame * 3) {
-                        const audioRemaining = targetAudioMs - audioMs;
-                        const safetyRemaining = msPerFrame * 3 - wallElapsed;
-                        return this.markVideoWaitNotReady(ctx, mem, Math.min(audioRemaining, safetyRemaining));
-                    }
+                    if (wallElapsed < msPerFrame * 3) return 1;
                 }
                 return 0; // ready
             }
@@ -1882,7 +1858,7 @@ export class BinkW32 implements IModule {
             // Fallback: wall-clock pacing (no active audio to sync against).
             const elapsed = performance.now() - s.lastFrameMs;
             if (elapsed < msPerFrame - 2) {
-                return this.markVideoWaitNotReady(ctx, mem, msPerFrame - 2 - elapsed);
+                return 1;
             }
             return 0; // ready
         };

@@ -2295,38 +2295,6 @@ export class Scheduler {
         return WAIT_BLOCKED_NO_SWITCH;
     }
 
-    /**
-     * Park a synchronous HLE call until a short deadline and resume it as if it
-     * returned zero. Unlike sleepWithContext(), this never turns a sole-runnable
-     * wait into an immediate return plus host yield: callers use it to collapse a
-     * hot polling API into one scheduler wait while preserving a synchronous guest
-     * call/return boundary.
-     */
-    parkCurrentThreadUntil(
-        delayMs: number, returnAddr: number, postReturnEsp: number,
-        callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
-    ): number {
-        const thread = this.getCurrentThread();
-        if (!thread) return 0;
-
-        if (!isValidGuestEip(returnAddr)) {
-            Logger.error(LogCategory.THREAD,
-                `parkCurrentThreadUntil: invalid returnAddr=0x${returnAddr.toString(16)} T${thread.id}`);
-            return 0;
-        }
-
-        const waitMs = Math.max(1, Number.isFinite(delayMs) ? delayMs : 1);
-        const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
-        this.blockThread(thread, WaitReason.SLEEP, [], false, waitMs, false, 0, context);
-
-        if (this.hasOtherRunnableThreads(thread.id)) {
-            this.requestSwitch();
-        } else {
-            this.requestYieldToHost(this.computeYieldMs(waitMs), "hleDeadline");
-        }
-        return WAIT_BLOCKED_NO_SWITCH;
-    }
-
     waitForMessage(
         returnAddr: number,
         postReturnEsp: number,
