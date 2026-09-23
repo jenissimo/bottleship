@@ -698,8 +698,17 @@ export function generateShaderCode(config: ShaderConfig): string {
         : "";
 
     const fogBlock = `
+                // Table fog is PIXEL fog: evaluate it from the interpolated depth (DXVK FragCoord.z /
+                // FragCoord.w, as the D3D9 FFP does). A per-vertex factor is clamped before
+                // interpolation, which is wrong across a primitive that spans FOGSTART..FOGEND.
+                var fogFactor = in.fogFactor;
+                if (uniforms.fogParams.w >= 1.0 && uniforms.fogParams.w < 4.0) {
+                    let fragDepth = in.position.z / in.position.w;
+                    fogFactor = ffpFogFactor(uniforms.fogParams.w, uniforms.fogParams.x, uniforms.fogParams.y, uniforms.fogParams.z,
+                        fragDepth, fragDepth, in.specular.a, fragDepth);
+                }
                 if (uniforms.fogParams.w > 0.0) {
-                    finalColor = vec4f(mix(finalColor.rgb, uniforms.fogColor.rgb, in.fogFactor), finalColor.a);
+                    finalColor = vec4f(mix(finalColor.rgb, uniforms.fogColor.rgb, fogFactor), finalColor.a);
                 }`;
     const fragmentShader = `
             @fragment
@@ -963,8 +972,17 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 }
 
                 // Fog
+                // Table fog is PIXEL fog: evaluate it from the interpolated depth (DXVK FragCoord.z /
+                // FragCoord.w, as the D3D9 FFP does). A per-vertex factor is clamped before
+                // interpolation, which is wrong across a primitive that spans FOGSTART..FOGEND.
+                var fogFactor = in.fogFactor;
+                if (draw.fogParams.w >= 1.0 && draw.fogParams.w < 4.0) {
+                    let fragDepth = in.position.z / in.position.w;
+                    fogFactor = ffpFogFactor(draw.fogParams.w, draw.fogParams.x, draw.fogParams.y, draw.fogParams.z,
+                        fragDepth, fragDepth, in.specular.a, fragDepth);
+                }
                 if (draw.fogParams.w > 0.0) {
-                    finalColor = vec4f(mix(finalColor.rgb, draw.fogColor.rgb, in.fogFactor), finalColor.a);
+                    finalColor = vec4f(mix(finalColor.rgb, draw.fogColor.rgb, fogFactor), finalColor.a);
                 }
 
                 ${!shouldEnableBlending ? `
