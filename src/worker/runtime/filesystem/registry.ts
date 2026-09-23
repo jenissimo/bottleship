@@ -10,6 +10,23 @@ const IMPLICIT_EMPTY_KEYS = new Set<string>([
     "hklm\\software",
 ]);
 
+/** A predefined hive has ONE key space whichever spelling names it; advapi32 speaks the short
+ *  form, so the long names fold onto it. */
+const ROOT_ALIASES: Record<string, string> = {
+    HKEY_CLASSES_ROOT: "HKCR",
+    HKEY_CURRENT_USER: "HKCU",
+    HKEY_LOCAL_MACHINE: "HKLM",
+    HKEY_USERS: "HKU",
+    HKEY_CURRENT_CONFIG: "HKCC",
+    HKEY_PERFORMANCE_DATA: "HKPD",
+    HKEY_DYN_DATA: "HKDD",
+};
+
+function canonicalRoot(root: string): string {
+    const upper = root.toUpperCase();
+    return ROOT_ALIASES[upper] ?? upper;
+}
+
 function validateRegType(type: string): RegistryValueType {
     if (!VALID_REG_TYPES.has(type)) {
         throw new Error(`Unknown registry type "${type}". Valid types: ${[...VALID_REG_TYPES].join(", ")}`);
@@ -437,7 +454,7 @@ export class RegistryStore {
     }
 
     private normalizeKey(root: string, path: string): string {
-        const cleanRoot = root.toUpperCase();
+        const cleanRoot = canonicalRoot(root);
         const cleanPath = path.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
         return `${cleanRoot}\\${cleanPath}`.toLowerCase();
     }
@@ -577,7 +594,11 @@ export class RegistryStore {
                     data: valueData.data,
                 });
             }
-            this.keys.set(keyPath, values);
+            const sep = keyPath.indexOf("\\");
+            const key = sep < 0 ? keyPath : this.normalizeKey(keyPath.slice(0, sep), keyPath.slice(sep + 1));
+            const existing = this.keys.get(key);
+            if (existing) for (const [n, v] of values) existing.set(n, v);
+            else this.keys.set(key, values);
         }
     }
 
