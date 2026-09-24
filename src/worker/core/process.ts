@@ -23,6 +23,7 @@ import { ensureGuestPagesCommitted } from './memory/guest-page-commit';
 import { invalidateGuestCode } from './memory/guest-code';
 import type { PageTableManager } from './memory/page-table-manager';
 import { SEH_SCRATCH_TOTAL_SIZE } from './thunking/seh-layout';
+import { AllocTable } from './memory/alloc-table';
 
 export interface MemoryMetrics {
     totalAllocated: number;  // Total bytes ever allocated
@@ -77,8 +78,8 @@ export class MemoryManager {
         this.bucketState = new Map();
     }
 
-    // Memory tracking
-    private allocations: Map<number, number> = new Map();
+    // Memory tracking: each live allocation's size and the bucket it came from.
+    private allocs = new AllocTable<RegionKind>();
     private totalAllocated = 0;
     private currentBytes = 0;
     private peakBytes = 0;
@@ -91,11 +92,7 @@ export class MemoryManager {
     // on that determinism — e.g. an engine that re-creates its UI pools on re-entry and
     // still holds stale pointers into the old (identically re-laid-out) pool.
     private largeFreeBlocks: Map<RegionKind, Array<{ addr: number; size: number }>> = new Map();
-    // Track which bucket kind each allocation belongs to
-    private allocBucket: Map<number, RegionKind> = new Map();
-
     private bucketState: Map<RegionKind, BucketState> = new Map();
-    private reservedAddresses: Set<number> = new Set();
 
     // [DIAG] Large-allocation (≥64KB) lifecycle log. VirtualAlloc-class blocks are
     // rare, so a long ring spans the whole session — unlike the 4K generic
@@ -300,10 +297,10 @@ export class MemoryManager {
         // a hit here means two owners share a block (overlapping live allocations) → the
         // classic UAF / pointer high-byte stomp. Always-on, O(1) — logs the colliding
         // sizes so the next repro pins the mechanism instead of guessing.
-        if (this.allocations.has(addr)) {
+        if (this.allocs.has(addr)) {
             Logger.error(LogCategory.SYSTEM,
                 `[MemoryManager] DOUBLE-HAND-OUT 0x${addr.toString(16)}: already live ` +
-                `(liveSize=0x${(this.allocations.get(addr) ?? 0).toString(16)}, ` +
+                `(liveSize=0x${(this.allocs.getSize(addr) ?? 0).toString(16)}, ` +
                 `newReq=0x${aligned.toString(16)}, bucket=${bucketKind}) — overlapping ` +
                 `live allocations → use-after-free.`);
         }
@@ -324,7 +321,7 @@ export class MemoryManager {
         }
 
         this.recordAllocation(addr, aligned);
-        this.allocBucket.set(addr, usedBucketKind);
+        this.allocs.setBucket(addr, usedBucketKind);
         this.logLargeEvent('alloc', addr, aligned);
 
         if (isHeapBucket(usedBucketKind) || usedBucketKind === 'SURFACE') {
@@ -382,14 +379,14 @@ export class MemoryManager {
                 `(${blocker.owner ?? 'unnamed'}/${blocker.tag ?? '-'}) — skipping below it`);
             top = blocker.base >>> 0;
         }
-        if (this.allocations.has(addr)) {
+        if (this.allocs.has(addr)) {
             throw new Error(
                 `MemoryManager: high-end collide at 0x${addr.toString(16)} ` +
-                `(liveSize=0x${(this.allocations.get(addr) ?? 0).toString(16)})`);
+                `(liveSize=0x${(this.allocs.getSize(addr) ?? 0).toString(16)})`);
         }
         bucket.slabTop = addr;
         this.recordAllocation(addr, aligned);
-        this.allocBucket.set(addr, bucketKind);
+        this.allocs.setBucket(addr, bucketKind);
         ensureGuestPagesCommitted(addr, aligned);
         this.logLargeEvent('alloc', addr, aligned);
         return addr;
@@ -466,7 +463,7 @@ export class MemoryManager {
             throw new Error(`MemoryManager: allocAt out of bucket bounds (0x${addr.toString(16)} size=0x${aligned.toString(16)})`);
         }
 
-        const existingSize = this.allocations.get(addr);
+        const existingSize = this.allocs.getSize(addr);
         if (existingSize !== undefined && existingSize >= aligned) {
             if (bucketKind === 'HEAP' || bucketKind === 'SURFACE') {
                 ensureGuestPagesCommitted(addr, aligned);
@@ -485,7 +482,7 @@ export class MemoryManager {
 
         bucket.next = Math.max(bucket.next, addr + aligned);
         this.recordAllocation(addr, aligned);
-        this.allocBucket.set(addr, bucketKind);
+        this.allocs.setBucket(addr, bucketKind);
         this.logLargeEvent('alloc', addr, aligned);
         if (bucketKind === 'HEAP' || bucketKind === 'SURFACE') {
             ensureGuestPagesCommitted(addr, aligned);
@@ -495,21 +492,20 @@ export class MemoryManager {
     }
 
     free(ptr: number): void {
-        const size = this.allocations.get(ptr);
+        const size = this.allocs.getSize(ptr);
         if (size === undefined) return;
 
         // HEAP allocs are not registered in addressSpace.regions (skipped in alloc),
         // so skip releaseRegion for them to avoid O(n) scan of a non-existent entry.
-        const bucketKind = this.allocBucket.get(ptr);
+        const bucketKind = this.allocs.getBucket(ptr);
         if (!isHeapBucket(bucketKind)) {
             this.addressSpace.releaseRegion(ptr);
         }
         this.currentBytes -= size;
-        this.allocations.delete(ptr);
-        this.reservedAddresses.delete(ptr);
+        this.allocs.deleteSize(ptr);
 
         if (bucketKind) {
-            this.allocBucket.delete(ptr);
+            this.allocs.deleteBucket(ptr);
             const bucket = this.bucketState.get(bucketKind);
             // MEM_TOP_DOWN / slab frontier: LIFO free at slabTop rejoins the high zone
             // instead of the bottom-up free lists (keeps high VA available for TOP_DOWN).
@@ -526,13 +522,7 @@ export class MemoryManager {
         }
         this.logLargeEvent('free', ptr, size);
 
-        memoryEventBuffer.record({
-            timestamp: performance.now(),
-            type: MemoryEventType.FREE,
-            address: ptr,
-            size: size,
-            context: 'MemoryManager.free',
-        });
+        memoryEventBuffer.recordEvent(MemoryEventType.FREE, ptr, size, 'MemoryManager.free');
     }
 
     /**
@@ -628,12 +618,12 @@ export class MemoryManager {
             totalAllocated: this.totalAllocated,
             currentBytes: this.currentBytes,
             peakBytes: this.peakBytes,
-            allocationCount: this.allocations.size,
+            allocationCount: this.allocs.size,
         };
     }
 
     getSize(ptr: number): number | undefined {
-        return this.allocations.get(ptr);
+        return this.allocs.getSize(ptr);
     }
 
     /**
@@ -665,10 +655,8 @@ export class MemoryManager {
      */
     snapshotHeapAllocations(): Array<{ addr: number; size: number }> {
         const out: Array<{ addr: number; size: number }> = [];
-        for (const [addr, size] of this.allocations) {
-            if (isHeapBucket(this.allocBucket.get(addr))) {
-                out.push({ addr, size });
-            }
+        for (const { addr, size, bucket } of this.allocs.entriesByInsertion()) {
+            if (isHeapBucket(bucket)) out.push({ addr, size });
         }
         out.reverse();
         return out;
@@ -722,16 +710,14 @@ export class MemoryManager {
 
     /** Register a page-aligned alias so VirtualFree can find VirtualAlloc blocks. */
     registerAlias(alignedAddr: number, size: number): void {
-        this.allocations.set(alignedAddr, size);
+        this.allocs.setSize(alignedAddr, size);
         this.logLargeEvent('alias', alignedAddr, size);
     }
 
     reset(): void {
-        this.allocations.clear();
+        this.allocs.clear();
         this.freeBlocks.clear();
         this.largeFreeBlocks.clear();
-        this.allocBucket.clear();
-        this.reservedAddresses.clear();
         this.sysPoolArena = null;
         this.sysPoolFree.clear();
         this.totalAllocated = 0;
@@ -968,19 +954,12 @@ export class MemoryManager {
     }
 
     private recordAllocation(address: number, size: number): void {
-        this.allocations.set(address, size);
-        this.reservedAddresses.add(address);
+        this.allocs.setSize(address, size);
         this.currentBytes += size;
         this.totalAllocated += size;
         this.peakBytes = Math.max(this.peakBytes, this.currentBytes);
 
-        memoryEventBuffer.record({
-            timestamp: performance.now(),
-            type: MemoryEventType.ALLOC,
-            address: address,
-            size: size,
-            context: 'MemoryManager.alloc',
-        });
+        memoryEventBuffer.recordEvent(MemoryEventType.ALLOC, address, size, 'MemoryManager.alloc');
     }
 
     private getMemory(): Uint8Array {

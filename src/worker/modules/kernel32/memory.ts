@@ -16,6 +16,7 @@ import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit
 import { profiler } from '../../core/profiler';
 import { GUEST_PROCESSOR_TYPE, GUEST_PROCESSOR_LEVEL, GUEST_PROCESSOR_REVISION } from '../../core/guest-cpu-identity';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
+import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import {
     MEM_HEAP_BASE,
     MEM_THUNK_DATA_BASE,
@@ -1802,8 +1803,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // fast path. A FREE-marked header (0x534C46xx) means a DOUBLE-FREE — capture
                 // the guest caller to find the load-bearing double-free source.
                 const p = lpMem >>> 0;
-                if (p >= 4 && p + 0 <= mem.length) {
-                    const hdr = (mem[p - 4] | mem[p - 3] << 8 | mem[p - 2] << 16 | mem[p - 1] << 24) >>> 0;
+                const plain = toPlainGuestMemory(mem);
+                if (p >= 4 && p + 0 <= plain.length) {
+                    const hdr = (plain[p - 4] | plain[p - 3] << 8 | plain[p - 2] << 16 | plain[p - 1] << 24) >>> 0;
                     if ((hdr & 0xFFFFFF00) === SLAB_MAGIC_FREE && _dblFreeLogCount < 40) {
                         _dblFreeLogCount++;
                         let bt = '';
