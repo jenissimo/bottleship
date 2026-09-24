@@ -16,10 +16,11 @@
 import { describe, it, expect } from 'bun:test';
 import { writeLocaleStubs } from '../../src/worker/modules/kernel32/locale-stubs';
 import {
-    serializeLocaleStubTable, writeLocaleStubDestLimit, ensureLocaleCache, _localeWCache,
+    serializeLocaleStubTable, writeLocaleStubDestLimit, ensureLocaleCache, invalidateLocaleCache, _localeWCache,
     LOCALE_STUB_ANSWERED_OFF, LOCALE_STUB_BAIL_OFF, LOCALE_STUB_BAIL_REASONS,
 } from '../../src/worker/modules/kernel32/locale-data';
-import { registerFastPathLocaleFunctions } from '../../src/worker/modules/kernel32/locale';
+import { exports as kernelExports, registerFastPathLocaleFunctions } from '../../src/worker/modules/kernel32/locale';
+import { EmulatorConfig } from '../../src/worker/core/emulator-config-manager';
 import type { StubAllocator } from '../../src/worker/core/thunking/thunk-memory-manager';
 
 const MEM_SIZE = 1 << 20;
@@ -140,8 +141,8 @@ function run(mem: Uint8Array, entry: number, args: number[]): RunResult {
                 throw new Error(`8B: unsupported modrm ${b1.toString(16)}`);
             }
             case 0x3B: {                                                                   // CMP r32, [disp32]
-                if (b1 !== 0x15) throw new Error('3B: only CMP EDX,[disp32] supported');
-                cmp(r[EDX], dv.getUint32(dv.getUint32(eip + 2, true), true)); eip += 6; continue;
+                if (b1 !== 0x15 && b1 !== 0x05) throw new Error('3B: only CMP EDX|EAX,[disp32] supported');
+                cmp(r[b1 === 0x15 ? EDX : EAX], dv.getUint32(dv.getUint32(eip + 2, true), true)); eip += 6; continue;
             }
             case 0xFF: {                                                                   // INC dword [disp32]
                 if (b1 !== 0x05) throw new Error('FF: only INC [disp32] supported');
@@ -218,49 +219,77 @@ function runStub(f: Fixture, args: number[]): { res: RunResult; mem: Uint8Array 
     return { res: run(m, f.stub, args), mem: m };
 }
 
+/** Run the full JS thunk (the third tier) over its own copy of memory. */
+function runThunk(f: Fixture, args: number[]): { ret: number; mem: Uint8Array } {
+    const m = new Uint8Array(f.mem.length);
+    m.set(f.mem);
+    const handler = (kernelExports as Record<string, (c: unknown, m: Uint8Array, a: number[]) => number>).GetLocaleInfoW!;
+    return { ret: handler({}, m, args), mem: m };
+}
+
+function withManifest(lcid: number, body: () => void): void {
+    const cfg = EmulatorConfig.getInstance();
+    const saved = cfg.lcid;
+    cfg.lcid = lcid;
+    invalidateLocaleCache();
+    try { body(); } finally { cfg.lcid = saved; invalidateLocaleCache(); }
+}
+
 describe('inline GetLocaleInfoW stub', () => {
-    it('agrees with the JS fast path for every cached LCTYPE, sized and read', () => {
-        const f = mkFixture();
-        ensureLocaleCache();
-        const types = [..._localeWCache!.keys()].sort((a, b) => a - b);
-        expect(types.length).toBeGreaterThan(20);
+    for (const manifest of [0x0409, 0x0419]) {
+        it(`manifest 0x${manifest.toString(16)}: stub, JS fast path and thunk agree for every cached LCTYPE`, () => withManifest(manifest, () => {
+            const f = mkFixture();
+            ensureLocaleCache();
+            const types = [..._localeWCache!.keys()].sort((a, b) => a - b);
+            expect(types.length).toBeGreaterThan(100);
 
-        let answered = 0;
-        for (const t of types) {
-            // Size query.
-            const sizeArgs = [0x0409, t, 0, 0];
-            const js = runJs(f, sizeArgs);
-            const st = runStub(f, sizeArgs);
-            expect(st.res.bailed).toBe(false);
-            expect(st.res.eax).toBe(js.ret!);
-            expect(st.res.espDelta).toBe(20);
-            answered++;
-
-            // Real read into an exactly-sized buffer, and into an oversized one.
-            const need = js.ret!;
-            for (const cch of [need, need + 8]) {
-                const args = [0x0409, t, DEST, cch];
-                const jsR = runJs(f, args);
-                const stR = runStub(f, args);
-                expect(stR.res.bailed).toBe(false);
-                expect(stR.res.eax).toBe(jsR.ret!);
-                expect(stR.res.espDelta).toBe(20);
-                expect([...stR.mem.subarray(DEST, DEST + need * 2)])
-                    .toEqual([...jsR.mem.subarray(DEST, DEST + need * 2)]);
+            let answered = 0;
+            for (const t of types) {
+                // Size query.
+                const sizeArgs = [manifest, t, 0, 0];
+                const js = runJs(f, sizeArgs);
+                const st = runStub(f, sizeArgs);
+                expect(st.res.bailed).toBe(false);
+                expect(st.res.eax).toBe(js.ret!);
+                expect(st.res.eax).toBe(runThunk(f, sizeArgs).ret);
+                expect(st.res.espDelta).toBe(20);
                 answered++;
+
+                // Real read into an exactly-sized buffer, and into an oversized one.
+                const need = js.ret!;
+                for (const cch of [need, need + 8]) {
+                    const args = [manifest, t, DEST, cch];
+                    const jsR = runJs(f, args);
+                    const stR = runStub(f, args);
+                    const thR = runThunk(f, args);
+                    expect(stR.res.bailed).toBe(false);
+                    expect(stR.res.eax).toBe(jsR.ret!);
+                    expect(stR.res.eax).toBe(thR.ret);
+                    expect(stR.res.espDelta).toBe(20);
+                    const bytes = [...stR.mem.subarray(DEST, DEST + need * 2)];
+                    expect(bytes).toEqual([...jsR.mem.subarray(DEST, DEST + need * 2)]);
+                    expect(bytes).toEqual([...thR.mem.subarray(DEST, DEST + need * 2)]);
+                    answered++;
+                }
             }
-        }
-        // The counter the harness verb reads must have moved by exactly the answers given.
-        const one = runStub(f, [0x0409, types[0], 0, 0]);
-        expect(new DataView(one.mem.buffer).getUint32(TABLE_ADDR + LOCALE_STUB_ANSWERED_OFF, true)).toBe(1);
-        expect(answered).toBeGreaterThan(60);
-    });
+            if (manifest === 0x0419) {
+                // Not an en-US table under another name: the stub hands out the Russian data.
+                const r = runStub(f, [manifest, 0x0038, DEST, 64]); // LOCALE_SMONTHNAME1
+                expect(String.fromCharCode(...new Uint16Array(r.mem.buffer, DEST, r.res.eax - 1))).toBe('январь');
+            }
+            // The counter the harness verb reads must have moved by exactly the answers given.
+            const one = runStub(f, [manifest, types[0], 0, 0]);
+            expect(new DataView(one.mem.buffer).getUint32(TABLE_ADDR + LOCALE_STUB_ANSWERED_OFF, true)).toBe(1);
+            expect(answered).toBeGreaterThan(300);
+        }));
+    }
 
     it('bails to the trap on every case outside its contract', () => {
         const f = mkFixture();
         const KNOWN = 0x000E; // LOCALE_SDECIMAL — "." → 2 WCHARs
         const cases: Record<string, number[]> = {
-            returnNumber: [0x0409, KNOWN | 0x20000000, DEST, 16],
+            lcid: [0x0436, KNOWN, DEST, 16],
+            returnFlags: [0x0409, KNOWN | 0x20000000, DEST, 16],
             typeOutOfTable: [0x0409, 0x1100, DEST, 16],
             unknownType: [0x0409, 0x0FF0, DEST, 16],
             negativeCch: [0x0409, KNOWN, DEST, -1],
@@ -269,6 +298,10 @@ describe('inline GetLocaleInfoW stub', () => {
             destPastMemory: [0x0409, KNOWN, MEM_SIZE - 2, 16],
             destWraps: [0x0409, KNOWN, 0xFFFFFFFF, 16],
         };
+        const genitive = runStub(f, [0x0409, 0x0038 | 0x10000000, DEST, 16]);
+        expect(genitive.res.bailed).toBe(true);
+        expect(new DataView(genitive.mem.buffer).getUint32(TABLE_ADDR + LOCALE_STUB_BAIL_OFF
+            + LOCALE_STUB_BAIL_REASONS.indexOf('returnFlags') * 4, true)).toBe(1);
         for (const [name, args] of Object.entries(cases)) {
             const { res, mem } = runStub(f, args);
             expect(`${name}:${res.bailed}`).toBe(`${name}:true`);
@@ -296,6 +329,24 @@ describe('inline GetLocaleInfoW stub', () => {
         expect(dv.getUint32(TABLE_ADDR + LOCALE_STUB_BAIL_OFF
             + LOCALE_STUB_BAIL_REASONS.indexOf('destPastMemory') * 4, true)).toBe(1);
         expect(mem[inTable]).toBe(before);
+    });
+
+    it('answers only for the LCIDs its table lists, and the JS fast path declines the same ones', () => {
+        const f = mkFixture();
+        const KNOWN = 0x000E;
+        // Pseudo-LCIDs and the configured locale: answered by both tiers, identically.
+        for (const lcid of [0x0000, 0x0400, 0x0800, 0x0409]) {
+            const st = runStub(f, [lcid, KNOWN, DEST, 16]);
+            const js = runJs(f, [lcid, KNOWN, DEST, 16]);
+            expect(`${lcid}:${st.res.bailed}`).toBe(`${lcid}:false`);
+            expect(st.res.eax).toBe(js.ret!);
+        }
+        // Any other locale, the invariant, a neutral, a sort variant: neither fast tier
+        // answers; the thunk resolves them from the database (or refuses).
+        for (const lcid of [0x0436, 0x0419, 0x007f, 0x0009, 0x10407, 0x0abc]) {
+            expect(`${lcid}:${runStub(f, [lcid, KNOWN, DEST, 16]).res.bailed}`).toBe(`${lcid}:true`);
+            expect(`${lcid}:${runJs(f, [lcid, KNOWN, DEST, 16]).ret}`).toBe(`${lcid}:null`);
+        }
     });
 
     it('serves a size query for a known type without writing', () => {

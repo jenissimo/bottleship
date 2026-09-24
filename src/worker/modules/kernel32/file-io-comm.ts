@@ -3,7 +3,12 @@
  * family, PurgeComm, SetupComm, GetOverlappedResult, DeviceIoControl). Games
  * almost never use serial ports — faithful stubs.
  */
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { isValidAddress } from '../../core/memory/address-guard';
+import {
+    INFINITE, WAIT_BLOCKED_NO_SWITCH, WAIT_FAILED, WAIT_IO_COMPLETION, WAIT_OBJECT_0,
+} from '../../core/scheduler/types';
+import { deliverPendingApcs } from './sync';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -11,6 +16,8 @@ import { Mem } from '../../core/memory/mem-accessor';
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_IO_INCOMPLETE = 996;
 const COMMCONFIG_SIZE = 48;
+const OVERLAPPED_SIZE = 20;
+const STATUS_PENDING = 0x103;
 
 function writeStubDcb(lpDCB: number): void {
     Mem.writeUint32(lpDCB + 0, 28); // DCBlength
@@ -28,6 +35,79 @@ function writeStubDcb(lpDCB: number): void {
     Mem.writeUint8(lpDCB + 24, 0);
     Mem.writeUint8(lpDCB + 25, 0);
     Mem.writeUint16(lpDCB + 26, 0);
+}
+
+/** The Win32 codes an I/O completion status maps to (RtlNtStatusToDosError). */
+function ioStatusToWin32(status: number): number {
+    switch (status >>> 0) {
+        case STATUS_PENDING: return ERROR_IO_INCOMPLETE;
+        case 0x80000005: return 234;  // STATUS_BUFFER_OVERFLOW -> ERROR_MORE_DATA
+        case 0xC0000008: return 6;    // STATUS_INVALID_HANDLE
+        case 0xC000000D: return ERROR_INVALID_PARAMETER;
+        case 0xC0000011: return 38;   // STATUS_END_OF_FILE -> ERROR_HANDLE_EOF
+        case 0xC0000022: return 5;    // STATUS_ACCESS_DENIED
+        case 0xC000007F: return 112;  // STATUS_DISK_FULL
+        case 0xC00000BB: return 50;   // STATUS_NOT_SUPPORTED
+        case 0xC0000120: return 995;  // STATUS_CANCELLED -> ERROR_OPERATION_ABORTED
+        case 0xC000014B: return 109;  // STATUS_PIPE_BROKEN
+        default: return 317;          // ERROR_MR_MID_NOT_FOUND, RtlNtStatusToDosError's own default
+    }
+}
+
+/**
+ * GetOverlappedResult[Ex]: the OVERLAPPED's Internal/InternalHigh are the operation's
+ * status and byte count. A pending operation with a non-zero timeout waits on hEvent
+ * (the file handle when there is none); the low two bits of a handle are tag bits the
+ * object manager ignores, which is where the "no completion packet" flag lives.
+ */
+function overlappedResult(
+    ctx: X86Context, mem: Uint8Array, hFile: number, lpOverlapped: number, lpBytes: number,
+    timeoutMs: number, alertable: boolean, cleanup: number,
+): ThunkResult {
+    const sched = System.getInstance().scheduler;
+    if (!lpOverlapped || !isValidAddress(mem, lpOverlapped, OVERLAPPED_SIZE, 'r')) {
+        sched.setLastError(ERROR_INVALID_PARAMETER);
+        return { value: 0, stackCleanup: cleanup };
+    }
+
+    const complete = (): { value: number; lastError?: number } => {
+        // Signalled yet still marked pending: the waited object said done, so it is.
+        let status = Mem.readUint32(lpOverlapped) ?? 0;
+        if (lpBytes) Mem.writeUint32(lpBytes, Mem.readUint32(lpOverlapped + 4) ?? 0);
+        if (status === STATUS_PENDING) status = 0;
+        return status === 0 ? { value: 1 } : { value: 0, lastError: ioStatusToWin32(status) };
+    };
+    const afterWait = (waitResult: number): { value: number; lastError?: number } => {
+        if (waitResult === WAIT_OBJECT_0) return complete();
+        if (waitResult === WAIT_FAILED) return { value: 0, lastError: 6 }; // ERROR_INVALID_HANDLE
+        return { value: 0, lastError: waitResult };                      // WAIT_TIMEOUT / WAIT_IO_COMPLETION
+    };
+    const answer = (r: { value: number; lastError?: number }): ThunkResult => {
+        if (r.lastError !== undefined) sched.setLastError(r.lastError);
+        return { value: r.value, stackCleanup: cleanup };
+    };
+
+    if ((Mem.readUint32(lpOverlapped) ?? 0) !== STATUS_PENDING) return answer(complete());
+    if (timeoutMs === 0) return answer({ value: 0, lastError: ERROR_IO_INCOMPLETE });
+
+    if (alertable) {
+        const alerted = deliverPendingApcs(ctx, 'GetOverlappedResultEx:APC', cleanup, () => {
+            sched.setLastError(WAIT_IO_COMPLETION);
+            return 0;
+        });
+        if (alerted) return alerted;
+    }
+
+    const hEvent = Mem.readUint32(lpOverlapped + 16) ?? 0;
+    const waitOn = (hEvent ? hEvent : hFile) & ~3;
+    const returnAddr = Mem.readUint32(ctx.esp) ?? 0;
+    const result = sched.waitForObjectsWithContext(
+        [waitOn >>> 0], false, timeoutMs, returnAddr, ctx.esp + 4 + cleanup,
+        { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+        alertable, afterWait,
+    );
+    if (result === WAIT_BLOCKED_NO_SWITCH) return { value: 0, blockedNoSwitch: true, stackCleanup: cleanup };
+    return answer(afterWait(result));
 }
 
 export function registerFileIoCommExports(exports: Record<string, ThunkImplementation>): void {
@@ -150,51 +230,13 @@ export function registerFileIoCommExports(exports: Record<string, ThunkImplement
         return 1;
     };
 
-    exports['GetOverlappedResult'] = (ctx, mem, args) => {
-        const hFile = args[0];
-        const lpOverlapped = args[1];
-        const lpNumberOfBytesTransferred = args[2];
-        const bWait = args[3];
+    // BOOL GetOverlappedResult(HANDLE, LPOVERLAPPED, LPDWORD lpNumberOfBytesTransferred, BOOL bWait)
+    exports['GetOverlappedResult'] = (ctx, mem, args) =>
+        overlappedResult(ctx, mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] ? INFINITE : 0, false, 16);
 
-        if (lpOverlapped && lpOverlapped + 20 <= mem.length) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const status = view.getUint32(lpOverlapped, true);       // Internal
-            const bytesTransferred = view.getUint32(lpOverlapped + 4, true); // InternalHigh
-
-            // If operation is still pending (Internal == STATUS_PENDING = 0x103) and bWait, wait on hEvent
-            if (status === 0x103 && bWait) {
-                const hEvent = view.getUint32(lpOverlapped + 16, true);
-                if (hEvent) {
-                    // For now, just report it — our ReadFile completes synchronously so this shouldn't happen
-                    Logger.warn(LogCategory.KERNEL32,
-                        `GetOverlappedResult: pending I/O with bWait=1, hEvent=0x${hEvent.toString(16)}`);
-                }
-            }
-
-            if (lpNumberOfBytesTransferred) {
-                Mem.writeUint32(lpNumberOfBytesTransferred, bytesTransferred);
-            }
-
-            // Return TRUE if completed successfully (Internal == 0)
-            if (status === 0) {
-                return 1;
-            }
-            // Still pending
-            if (status === 0x103) {
-                System.getInstance().scheduler.setLastError(996); // ERROR_IO_INCOMPLETE
-                return 0;
-            }
-            // Error
-            System.getInstance().scheduler.setLastError(status);
-            return 0;
-        }
-
-        // No OVERLAPPED pointer - just succeed
-        if (lpNumberOfBytesTransferred) {
-            Mem.writeUint32(lpNumberOfBytesTransferred, 0);
-        }
-        return 1;
-    };
+    // BOOL GetOverlappedResultEx(HANDLE, LPOVERLAPPED, LPDWORD, DWORD dwMilliseconds, BOOL bAlertable)
+    exports['GetOverlappedResultEx'] = (ctx, mem, args) =>
+        overlappedResult(ctx, mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0, args[4] !== 0, 20);
 
     // BOOL DeviceIoControl(HANDLE, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize,
     //   LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned, LPOVERLAPPED)

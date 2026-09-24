@@ -355,6 +355,8 @@ export interface PendingTimerCallback {
     sourceTimer?: WinMMTimer;
     /** If set, use these args directly instead of [timerId, 0, dwUser, 0, 0] */
     args?: number[];
+    /** Runs once the guest callback has returned (a thread-pool callback instance ending). */
+    onReturn?: () => void;
 }
 
 interface WaveFormat {
@@ -424,6 +426,14 @@ export class WinMM implements IModule {
     /** MCI subsystem (device registry + AVI playback) — see winmm-mci.ts. Created in initialize(). */
     private mci: WinmmMci | null = null;
     private periodRefCounts: Map<number, number> = new Map();
+
+    private publishTimerResolution(): void {
+        let finest: number | null = null;
+        for (const period of this.periodRefCounts.keys()) {
+            if (finest === null || period < finest) finest = period;
+        }
+        TimeService.getInstance().setTimerResolutionMs(finest);
+    }
     private waveOutDevices: Map<number, WaveOutDevice> = new Map();
     private nextWaveOutId = 0x20000000;
 
@@ -437,6 +447,8 @@ export class WinMM implements IModule {
     private timerThreadHandle: number = 0;
     public timerWakeEvent: number = 0;
     private pendingTimerCallbacks: PendingTimerCallback[] = [];
+    /** The posted callback now running on the pump, while it carries an onReturn. */
+    private dispatchingPosted: PendingTimerCallback | null = null;
     /** Head index for O(1) dequeue — avoids Array.shift() on every timer callback (~100Hz). */
     private pendingTimerHead = 0;
     private dispatchingTimerCallback: WinMMTimer | null = null;
@@ -534,6 +546,7 @@ export class WinMM implements IModule {
         if (this.pendingTimerHead > 32 && this.pendingTimerHead > (this.pendingTimerCallbacks.length >> 1)) {
             this.compactPendingQueue();
         }
+        this.dispatchingPosted = cb?.onReturn ? cb : null;
         if (cb?.sourceTimer) {
             this.dispatchingTimerCallback = cb.sourceTimer;
         } else if (cb) {
@@ -950,11 +963,39 @@ export class WinMM implements IModule {
      * The callback is self-cleaning stdcall (dispatch passes callerCleanup=0). No-op if the
      * pump could not be created.
      */
-    postGuestCallback(callbackAddr: number, args: number[]): void {
-        if (!callbackAddr) return;
+    postGuestCallback(callbackAddr: number, args: number[], onReturn?: () => void): boolean {
+        if (!callbackAddr) return false;
         this.ensureTimerThread();
-        if (this.timerThreadId === 0) return;
-        this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: 0, args });
+        if (this.timerThreadId === 0) return false;
+        this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: 0, args, onReturn });
+        return true;
+    }
+
+    /**
+     * Drop posted callbacks that have not started, e.g. a thread-pool object's pending
+     * callbacks cancelled by WaitForThreadpool*Callbacks(fCancelPendingCallbacks). Returns
+     * the entries removed; one already dispatched is not in the queue and is unaffected.
+     */
+    cancelPostedGuestCallbacks(match: (cb: PendingTimerCallback) => boolean): PendingTimerCallback[] {
+        const removed: PendingTimerCallback[] = [];
+        const kept: PendingTimerCallback[] = [];
+        for (let i = this.pendingTimerHead; i < this.pendingTimerCallbacks.length; i++) {
+            const cb = this.pendingTimerCallbacks[i];
+            (!cb.sourceTimer && match(cb) ? removed : kept).push(cb);
+        }
+        if (removed.length > 0) {
+            this.pendingTimerCallbacks = kept;
+            this.pendingTimerHead = 0;
+        }
+        return removed;
+    }
+
+    /** The timer-pump callback that just returned: finish a posted callback's instance. */
+    notePostedCallbackReturned(callbackAddr: number): void {
+        const cb = this.dispatchingPosted;
+        if (!cb || cb.callbackAddr !== (callbackAddr >>> 0)) return;
+        this.dispatchingPosted = null;
+        cb.onReturn?.();
     }
 
     /**
@@ -1279,6 +1320,7 @@ export class WinMM implements IModule {
                 return MMSYSERR_INVALPARAM;
             }
             this.periodRefCounts.set(uPeriod, (this.periodRefCounts.get(uPeriod) ?? 0) + 1);
+            this.publishTimerResolution();
             this.timerDebug(`timeBeginPeriod(${uPeriod}) -> MMSYSERR_NOERROR`);
             return MMSYSERR_NOERROR;
         };
@@ -1299,6 +1341,7 @@ export class WinMM implements IModule {
             } else {
                 this.periodRefCounts.set(uPeriod, refCount - 1);
             }
+            this.publishTimerResolution();
             this.timerDebug(`timeEndPeriod(${uPeriod}) -> MMSYSERR_NOERROR`);
             return MMSYSERR_NOERROR;
         };
@@ -2261,11 +2304,13 @@ export class WinMM implements IModule {
         this.pendingTimerHead = 0;
         this.timerCallbackDrainCount = 0;
         this.dispatchingTimerCallback = null;
+        this.dispatchingPosted = null;
         this.timerThreadId = 0;
         this.timerThreadHandle = 0;
         this.timerWakeEvent = 0;
         scheduler?.notifyWinmmTimerThread(0, 0);
         this.periodRefCounts.clear();
+        this.publishTimerResolution();
 
         // Clear MMIO handles, freeing any guest-side I/O buffers.
         const mem = System.getInstance().process?.memory;

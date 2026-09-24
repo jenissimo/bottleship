@@ -107,8 +107,19 @@ describe('GetProcAddress does not hand out an export that cannot report failure'
         },
     };
 
-    it('answers NULL for GetTickCount64 — a 64-bit tick count has no failure value', () => {
-        expect(resolveHleExportAddress(dispatcherWithStub, 'kernel32', 'GetTickCount64')).toBe(0);
+    it('answers NULL for an unimplemented export whose every return value is a legal answer', () => {
+        registry.registerModule({
+            name: 'nofailtest',
+            functions: [{
+                name: 'TickCount64', params: [], returnType: 'u64', callingConvention: 'stdcall',
+                onUnimplemented: 'unresolvable',
+            }],
+        } as any);
+        expect(resolveHleExportAddress(dispatcherWithStub, 'nofailtest', 'TickCount64')).toBe(0);
+    });
+
+    it('resolves GetTickCount64 now that it has a handler', () => {
+        expect(resolveHleExportAddress(dispatcherWithStub, 'kernel32', 'GetTickCount64')).toBe(0x00401234);
     });
 
     it('still resolves an ordinary unimplemented export (its stub CAN report failure)', () => {

@@ -29,6 +29,7 @@ import { clearExclusiveMouseOwners, setExclusiveMouseOwner } from "../../core/po
 import { GUEST_INPUT_FLAG } from "../../../input/sab-layout";
 import { DInputNotifyRegistry, DI_OK, DIERR_INVALIDPARAM, DI_NOEFFECT } from "./dinput-notify";
 import { GAMEPAD_BUTTONS, POV_CENTERED, gamepadPovAngle } from "./emulated-gamepad";
+import { directInputInitialize } from "./dinput-initialize";
 
 // DirectInput error codes (HRESULT = MAKE_HRESULT(ERROR, FACILITY_WIN32, win32err))
 const DIERR_OUTOFMEMORY = 0x8007000E;
@@ -289,7 +290,7 @@ interface SavedActionBinding {
 // GetDeviceStatus is NOT here: DI_OK means "that device is attached right now", and
 // answering it for a pad nobody plugged in makes a game take the joystick path and read
 // a permanently neutral stick instead of falling back to the keyboard.
-const IDirectInputA_StubMethods = ["RunControlPanel", "Initialize"];
+const IDirectInputA_StubMethods = ["RunControlPanel"];
 
 /** Every IID an IDirectInput object answers to. The DX3/5/7 A and W chains share one
  *  vtable shape here; the DX8 interfaces are separate objects with their own tables and
@@ -731,6 +732,9 @@ export class DInput implements IModule {
         for (const method of IDirectInputA_StubMethods) {
             this.exports[`IDirectInputA_${method}`] = () => DI_OK;
         }
+        // HRESULT Initialize(HINSTANCE hinst, DWORD dwVersion) — dinput.dll's version rules.
+        this.exports["IDirectInputA_Initialize"] = (_ctx, _mem, args) =>
+            directInputInitialize(args[1] >>> 0, args[2] >>> 0, false);
 
         // HRESULT GetDeviceStatus(REFGUID rguidInstance) — DI_OK means "attached and
         // usable right now", DI_NOTATTACHED means the instance is known but absent. The
@@ -1767,7 +1771,9 @@ export class DInput implements IModule {
         this.exports["IDirectInput8A_EnumDevices"] = this.exports["IDirectInputA_EnumDevices"];
         this.exports["IDirectInput8A_GetDeviceStatus"] = this.exports["IDirectInputA_GetDeviceStatus"];
         this.exports["IDirectInput8A_RunControlPanel"] = this.exports["IDirectInputA_RunControlPanel"];
-        this.exports["IDirectInput8A_Initialize"] = this.exports["IDirectInputA_Initialize"];
+        // dinput8.dll accepts exactly DIRECTINPUT_VERSION 0x0800.
+        this.exports["IDirectInput8A_Initialize"] = (_ctx, _mem, args) =>
+            directInputInitialize(args[1] >>> 0, args[2] >>> 0, true);
         this.exports["IDirectInput8A_FindDevice"] = this.exports["IDirectInput7A_FindDevice"];
         // CreateDevice on IDirectInput8 must hand back an IDirectInputDevice8A (the full vtable
         // with Build/SetActionMap), not the DX7 Device2A — a DI8 game may action-map a device it
@@ -1795,7 +1801,7 @@ export class DInput implements IModule {
         this.exports["IDirectInput8W_EnumDevices"] = this.exports["IDirectInputA_EnumDevices"];
         this.exports["IDirectInput8W_GetDeviceStatus"] = this.exports["IDirectInputA_GetDeviceStatus"];
         this.exports["IDirectInput8W_RunControlPanel"] = this.exports["IDirectInputA_RunControlPanel"];
-        this.exports["IDirectInput8W_Initialize"] = this.exports["IDirectInputA_Initialize"];
+        this.exports["IDirectInput8W_Initialize"] = this.exports["IDirectInput8A_Initialize"];
         this.exports["IDirectInput8W_FindDevice"] = this.exports["IDirectInput7A_FindDevice"];
         this.exports["IDirectInput8W_CreateDevice"] = (ctx, mem, args) => {
             const rguid = args[1];

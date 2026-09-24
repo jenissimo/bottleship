@@ -9,6 +9,10 @@
  *   bun tools/harness.ts repl               interactive: eval lines in the page
  *   bun tools/harness.ts health             probe Vite/log-server/Chrome
  *   bun tools/harness.ts eval <expr>        one-off page eval (debug)
+ *   bun tools/harness.ts heapsample [sec] [top] [--major]   rank the worker's JS allocation sites
+ *                                           (GC pressure; --major = only what full GCs reclaim)
+ *   bun tools/harness.ts heapsnap [top]     worker JS heap residents by constructor (GC pause size)
+ *   bun tools/harness.ts audiocapture [sec] [out.wav]  record the final audio mix to a WAV
  *
  * Scripts import the fluent builder from here:
  *     import { harness } from "../tools/harness";
@@ -39,6 +43,9 @@ import {
     pageEval,
     workerEval,
     workerStack,
+    workerHeapSample,
+    workerHeapSnapshotSummary,
+    captureAudioOutput,
     screenshot,
     captureTrace,
     health,
@@ -348,6 +355,54 @@ async function cmdStack(samplesArg?: string): Promise<void> {
         }
         if (frames.length > 30) console.log(`  … ${frames.length - 30} more frames`);
     });
+}
+
+/** heapsample [seconds] [top] — who feeds the worker's GC. A MajorGC or a dozen MinorGCs a
+ *  second stall every guest thread at once (an audio pump misses its deadline, a frame
+ *  hitches) and nothing guest-side can see it; this names the allocating frames by bytes/s. */
+async function cmdHeapSample(...args: string[]): Promise<void> {
+    const session = await ensureSession();
+    const majorOnly = args.includes("--major");
+    const [secondsArg, topArg] = args.filter((a) => !a.startsWith("--"));
+    const r = await workerHeapSample(session, {
+        seconds: secondsArg ? Number(secondsArg) : 5,
+        top: topArg ? Number(topArg) : 25,
+        majorOnly,
+    });
+    if (majorOnly) console.log("(objects that survived the young generation — what paces full GCs)");
+    console.log(`worker allocation ≈ ${(r.totalBytesPerSec / 1048576).toFixed(1)} MB/s (sampled); `
+        + `JS heap ${r.heapUsedMB ?? "?"} / ${r.heapTotalMB ?? "?"} MB used/total`);
+    for (const s of r.sites) {
+        console.log(`  ${String(s.pct).padStart(5)}%  ${(s.bytesPerSec / 1048576).toFixed(2).padStart(6)} MB/s  ${s.functionName} (${s.url}:${s.line})`);
+    }
+}
+
+/** heapsnap [top] — what is RESIDENT in the worker's JS heap, by constructor. A full GC's pause
+ *  scales with the live heap; heapsample names the churn, this names the residents. */
+async function cmdHeapSnap(topArg?: string): Promise<void> {
+    const session = await ensureSession();
+    const r = await workerHeapSnapshotSummary(session, { top: topArg ? Number(topArg) : 30 });
+    console.log(`worker JS heap snapshot: ${r.totalMB} MB self-size total`);
+    for (const x of r.rows) console.log(`  ${x.selfMB.toFixed(2).padStart(8)} MB  ${String(x.count).padStart(8)}  ${x.type}  ${x.name}`);
+    console.log("strings by prefix:");
+    for (const x of r.stringPrefixes) console.log(`  ${x.MB.toFixed(2).padStart(8)} MB  ${String(x.count).padStart(8)}  ${JSON.stringify(x.prefix)}`);
+}
+
+/** audiocapture [seconds] [out.wav] — record the FINAL audio mix (what the speakers get) to a
+ *  16-bit WAV and print its rate, latency and clipped-frame count. Ring and worklet counters
+ *  describe intermediate stages; this is the artifact to listen to or analyse. */
+async function cmdAudioCapture(secondsArg?: string, outArg?: string): Promise<void> {
+    const session = await ensureSession();
+    const r = await captureAudioOutput(session, secondsArg ? Number(secondsArg) : 10);
+    const out = outArg ?? artifact("logs/audio-capture.wav");
+    const hdr = Buffer.alloc(44);
+    hdr.write("RIFF", 0); hdr.writeUInt32LE(36 + r.pcm.length, 4); hdr.write("WAVE", 8); hdr.write("fmt ", 12);
+    hdr.writeUInt32LE(16, 16); hdr.writeUInt16LE(1, 20); hdr.writeUInt16LE(2, 22); hdr.writeUInt32LE(r.rate, 24);
+    hdr.writeUInt32LE(r.rate * 4, 28); hdr.writeUInt16LE(4, 32); hdr.writeUInt16LE(16, 34);
+    hdr.write("data", 36); hdr.writeUInt32LE(r.pcm.length, 40);
+    await Bun.write(out, Buffer.concat([hdr, r.pcm]));
+    console.log(JSON.stringify({ out, rate: r.rate, frames: r.frames, clippedFrames: r.clippedFrames,
+        baseLatency: r.baseLatency, outputLatency: r.outputLatency }));
 }
 
 /**
@@ -890,6 +945,9 @@ async function main(): Promise<void> {
         case "eval": await cmdEval(rest.join(" ")); break;
         case "worker-eval": await cmdWorkerEval(rest.join(" ")); break;
         case "stack": await cmdStack(rest[0]); break;
+        case "heapsample": await cmdHeapSample(...rest); break;
+        case "heapsnap": await cmdHeapSnap(rest[0]); break;
+        case "audiocapture": await cmdAudioCapture(rest[0], rest[1]); break;
         case "fixture": await cmdFixture(rest[0], rest[1], rest.slice(2)); break;
         case "shot": await cmdShot(rest[0], ...rest.slice(1)); break;
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;

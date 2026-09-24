@@ -5,10 +5,10 @@ import { type HleDispatcher, ThunkImplementation, FastPathImplementation } from 
 import { TimeService } from '../../../runtime/time';
 import { Logger, LogCategory } from '../../../core/logger';
 import { System } from '../../../core/system';
-import { Mem } from '../../../core/memory/mem-accessor';
 import { WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION } from '../../../core/scheduler/types';
-import { encodeAnsi } from '../../codepage-utils';
 import { deliverPendingApcs } from '../sync';
+import { cpuViews } from '../../../core/cpu/cpu-views';
+import { getCPU } from '../../../core/thunking/thunk-utils';
 
 
 export const exports: Record<string, ThunkImplementation> = {};
@@ -58,6 +58,15 @@ export function registerFastPathTimeFunctions(dispatcher: HleDispatcher): void {
 function initTimeFunctions(): void {
     exports['GetTickCount'] = (ctx, mem, args): number => {
         return TimeService.getInstance().nowMs() | 0;
+    };
+
+    // ULONGLONG GetTickCount64(void): the same clock, unwrapped; EDX:EAX. Its low dword is
+    // what GetTickCount answers at the same instant.
+    exports['GetTickCount64'] = (): number => {
+        const ms = Math.max(0, Math.floor(TimeService.getInstance().nowMs()));
+        const cpu = getCPU(System.getInstance().process?.v86);
+        if (cpu) cpuViews(cpu).reg32[2] = Math.floor(ms / 0x100000000) | 0;
+        return ms >>> 0;
     };
 
     const writeSystemTimeAsFileTime = (mem: Uint8Array, lpSystemTimeAsFileTime: number): void => {
@@ -314,133 +323,6 @@ function initTimeFunctions(): void {
         } else {
             return 0;
         }
-    };
-
-    // GetDateFormatA - format date as string
-    exports['GetDateFormatA'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpDate = args[2];      // SYSTEMTIME* or NULL for current
-        const lpFormat = args[3];    // format string or NULL for default
-        const lpDateStr = args[4];   // output buffer
-        const cchDate = args[5];     // buffer size
-
-        const now = lpDate ? readSystemTime(mem, lpDate) : new Date();
-
-        // Simple default format: MM/dd/yyyy
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        const day = String(now.getDate()).padStart(2, '0');
-        const year = now.getFullYear();
-        const dateStr = `${month}/${day}/${year}`;
-
-        if (cchDate === 0) {
-            // Return required buffer size
-            return dateStr.length + 1;
-        }
-
-        if (lpDateStr && cchDate > 0) {
-            const bytes = encodeAnsi(dateStr + '\0');
-            const toWrite = bytes.subarray(0, Math.min(bytes.length, cchDate));
-            Mem.writeBytes(lpDateStr, toWrite);
-            return toWrite.length - 1; // exclude null terminator from count
-        }
-
-        return 0;
-    };
-
-    exports['GetDateFormatW'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpDate = args[2];
-        const lpFormat = args[3];
-        const lpDateStr = args[4];
-        const cchDate = args[5];
-
-        const now = lpDate ? readSystemTime(mem, lpDate) : new Date();
-
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        const day = String(now.getDate()).padStart(2, '0');
-        const year = now.getFullYear();
-        const dateStr = `${month}/${day}/${year}`;
-
-        if (cchDate === 0) {
-            return dateStr.length + 1;
-        }
-
-        if (lpDateStr && cchDate > 0) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const len = Math.min(dateStr.length, cchDate - 1);
-            for (let i = 0; i < len; i++) {
-                view.setUint16(lpDateStr + i * 2, dateStr.charCodeAt(i), true);
-            }
-            view.setUint16(lpDateStr + len * 2, 0, true); // null terminator
-            return len;
-        }
-
-        return 0;
-    };
-
-    // GetTimeFormatA - format time as string
-    exports['GetTimeFormatA'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpTime = args[2];      // SYSTEMTIME* or NULL for current
-        const lpFormat = args[3];    // format string or NULL for default
-        const lpTimeStr = args[4];   // output buffer
-        const cchTime = args[5];     // buffer size
-
-        const now = lpTime ? readSystemTime(mem, lpTime) : new Date();
-
-        // Simple default format: HH:mm:ss
-        const hours = String(now.getHours()).padStart(2, '0');
-        const minutes = String(now.getMinutes()).padStart(2, '0');
-        const seconds = String(now.getSeconds()).padStart(2, '0');
-        const timeStr = `${hours}:${minutes}:${seconds}`;
-
-        if (cchTime === 0) {
-            return timeStr.length + 1;
-        }
-
-        if (lpTimeStr && cchTime > 0) {
-            const bytes = encodeAnsi(timeStr + '\0');
-            const toWrite = bytes.subarray(0, Math.min(bytes.length, cchTime));
-            Mem.writeBytes(lpTimeStr, toWrite);
-            return toWrite.length - 1;
-        }
-
-        return 0;
-    };
-
-    exports['GetTimeFormatW'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpTime = args[2];
-        const lpFormat = args[3];
-        const lpTimeStr = args[4];
-        const cchTime = args[5];
-
-        const now = lpTime ? readSystemTime(mem, lpTime) : new Date();
-
-        const hours = String(now.getHours()).padStart(2, '0');
-        const minutes = String(now.getMinutes()).padStart(2, '0');
-        const seconds = String(now.getSeconds()).padStart(2, '0');
-        const timeStr = `${hours}:${minutes}:${seconds}`;
-
-        if (cchTime === 0) {
-            return timeStr.length + 1;
-        }
-
-        if (lpTimeStr && cchTime > 0) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const len = Math.min(timeStr.length, cchTime - 1);
-            for (let i = 0; i < len; i++) {
-                view.setUint16(lpTimeStr + i * 2, timeStr.charCodeAt(i), true);
-            }
-            view.setUint16(lpTimeStr + len * 2, 0, true);
-            return len;
-        }
-
-        return 0;
     };
 
     // BOOL GetFileTime(HANDLE hFile, LPFILETIME lpCreationTime, LPFILETIME lpLastAccessTime, LPFILETIME lpLastWriteTime)

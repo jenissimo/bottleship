@@ -134,7 +134,13 @@ export interface WaitInfo {
      *  alongside `handles`, and this is the result its leg delivers (WAIT_OBJECT_0 +
      *  nCount). Set means "arriving input also ends this wait", whatever the reason. */
     messageWakeResult?: number;
+    /** The API's own answer for a wait whose Win32 return is not the wait status
+     *  (WaitOnAddress, GetOverlappedResultEx): maps the raw wake result to EAX and,
+     *  optionally, the woken thread's last error. */
+    onWake?: WaitCompletion;
 }
+
+export type WaitCompletion = (waitResult: number) => { value: number; lastError?: number };
 
 // ─── APC ────────────────────────────────────────────────────────────────────────
 

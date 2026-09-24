@@ -17,6 +17,7 @@ import {
     openClipboard,
     closeClipboard,
     emptyClipboard,
+    setClipboardFormatData,
 } from './shared-state';
 
 const CF_TEXT = 1;
@@ -63,8 +64,8 @@ export function setClipboardText(mem: Uint8Array, owner: number, text: string): 
     emptyClipboard();
     // Windows SYNTHESIZES the other charset on demand; our clipboard is a plain
     // format→handle map, so both charsets are published up front instead.
-    clipboardDataByFormat.set(CF_UNICODETEXT, hWide);
-    clipboardDataByFormat.set(CF_TEXT, hAnsi);
+    setClipboardFormatData(CF_UNICODETEXT, hWide);
+    setClipboardFormatData(CF_TEXT, hAnsi);
     closeClipboard();
     return true;
 }

@@ -114,6 +114,9 @@ type RingBufferSource = {
   f32: Float32Array;
   position: number;     // Fractional frame position (float)
   loopsCompleted: number;
+  /** Frames of fade-in left after a starved stretch: data resumes mid-waveform, and a
+   *  step from the silence the starve faded to is a click of its own. */
+  fadeIn: number;
 };
 
 class BottleShipAudioProcessor extends AudioWorkletProcessor {
@@ -201,6 +204,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           f32: new Float32Array(sab, 0, sab.byteLength >> 2),
           position: 0,
           loopsCompleted: 0,
+          fadeIn: 0,
         });
         return;
       }
@@ -595,6 +599,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       const f32 = rb.f32;
       let pos = rb.position;
       let loopsCompleted = rb.loopsCompleted;
+      let fadeIn = rb.fadeIn;
       let alive = true;
       // Last per-channel contribution of THIS source, for underrun concealment.
       let concealLast0 = 0, concealLast1 = 0;
@@ -653,6 +658,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           if (available === 0) {
             // Play position caught up to write cursor — no more data this block.
             if (i === 0) starvedBlocks++; else underrunMid++;
+            fadeIn = CONCEAL_FADE_FRAMES;
             // Concealment: ramp the last contributed sample to zero over a short
             // window instead of a hard step to silence (which clicks). When the
             // block is starved from frame 0, concealLast* is 0 → plain silence.
@@ -708,13 +714,14 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           } else {
             gain = (leftGain + rightGain) * 0.5;
           }
-          const contrib = sample * gain;
+          const contrib = fadeIn > 0 ? sample * gain * (1 - fadeIn / CONCEAL_FADE_FRAMES) : sample * gain;
           const ca = contrib < 0 ? -contrib : contrib;
           if (ca > srcPeak) srcPeak = ca;
           output[ch][i] += contrib;
           if (ch === 0) concealLast0 = contrib; else if (ch === 1) concealLast1 = contrib;
         }
 
+        if (fadeIn > 0) fadeIn--;
         pos += rate;
       }
 
@@ -726,6 +733,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
       rb.position = pos;
       rb.loopsCompleted = loopsCompleted;
+      rb.fadeIn = fadeIn;
 
       // Write back play cursor (byte offset)
       if (alive) {

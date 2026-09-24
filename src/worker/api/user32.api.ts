@@ -583,5 +583,32 @@ export const user32Module: ModuleDescriptor = {
         makeFunc("ShowWindowAsync", 2),
         makeFunc("TranslateMDISysAccel", 2),
         makeFunc("wsprintfW", 16, { callingConvention: "cdecl" }),
+        // Win7+ touch and Win8+ pointer input
+        makeFunc("RegisterTouchWindow", 2),
+        makeFunc("UnregisterTouchWindow", 1),
+        makeFunc("IsTouchWindow", 2),
+        makeFunc("GetTouchInputInfo", 4),
+        makeFunc("CloseTouchInputHandle", 1),
+        makeFunc("GetPointerType", 2),
+        makeFunc("EnableMouseInPointer", 1),
+        // Win8.1/Win10 DPI awareness and the *ForDpi metrics
+        makeFunc("SetProcessDpiAwarenessContext", 1),
+        makeFunc("SetThreadDpiAwarenessContext", 1),
+        makeFunc("GetThreadDpiAwarenessContext", 0),
+        makeFunc("AreDpiAwarenessContextsEqual", 2),
+        makeFunc("GetAwarenessFromDpiAwarenessContext", 1),
+        makeFunc("EnableNonClientDpiScaling", 1),
+        makeFunc("AdjustWindowRectExForDpi", 5),
+        makeFunc("SystemParametersInfoForDpi", 5),
+        makeFunc("GetSystemMetricsForDpi", 2),
+        // CCD display configuration — these return a Win32 error code, not BOOL
+        makeFunc("GetDisplayConfigBufferSizes", 3, { onUnimplemented: "win32Status" }),
+        makeFunc("QueryDisplayConfig", 6, { onUnimplemented: "win32Status" }),
+        makeFunc("DisplayConfigGetDeviceInfo", 1, { onUnimplemented: "win32Status" }),
+        // UIPI message filters and power-setting notifications
+        makeFunc("ChangeWindowMessageFilter", 2),
+        makeFunc("ChangeWindowMessageFilterEx", 4),
+        makeFunc("RegisterPowerSettingNotification", 3),
+        makeFunc("UnregisterPowerSettingNotification", 1),
     ]
 };

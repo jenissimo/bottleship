@@ -11,7 +11,7 @@ import { registerFileIoConsoleExports, ConsoleDeviceHandle, isConsoleDeviceHandl
 import { registerFileIoFindExports } from './file-io-find';
 import { registerFileIoVolumeExports } from './file-io-volume';
 import { registerFileIoPathExports } from './file-io-path';
-import { readStringA, readStringW } from './file-io-strings';
+import { readStringA, readStringW, encodeFileApiString, setFileApisAnsi, areFileApisAnsi } from './file-io-strings';
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
@@ -19,7 +19,7 @@ import { Process } from '../../core/process';
 import { VfsFileHandle, VirtualFileSystem } from '../../runtime/filesystem/vfs';
 import { noteBootFileActivity } from '../../runtime/boot-status';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
-import { encodeAnsi, getCodePageDecoder } from '../codepage-utils';
+import { getCodePageDecoder } from '../codepage-utils';
 import {
     classifyUe1FirstRunFile,
     dirOfWindowsPath,
@@ -333,6 +333,7 @@ const fileIoModule = (() => {
     const ERROR_SEEK = 25;
     const ERROR_NOACCESS = 998;
     const ERROR_IO_DEVICE = 1117;
+    const ERROR_NOT_FOUND = 1168;
     const INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
 
     const FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -437,6 +438,22 @@ const fileIoModule = (() => {
         Logger.verbose(LogCategory.KERNEL32, `CancelIo(0x${hFile.toString(16)}) -> TRUE (no pending I/O)`);
         System.getInstance().scheduler.setLastError(0);
         return 1; // TRUE
+    };
+
+    // BOOL CancelIoEx(HANDLE hFile, LPOVERLAPPED lpOverlapped)
+    // Unlike CancelIo, finding nothing to cancel is a failure: ERROR_NOT_FOUND. Every
+    // operation here has completed before its issuing call returns, so that is the answer
+    // for any live handle.
+    exports['CancelIoEx'] = (_ctx, _mem, args) => {
+        const hFile = args[0] >>> 0;
+        const sched = System.getInstance().scheduler;
+        const isStd = hFile === 0 || hFile === 1 || hFile === 2;
+        if (!isStd && !System.getInstance().resourceProvider.getFileHandle(hFile)) {
+            sched.setLastError(ERROR_INVALID_HANDLE);
+            return { value: 0, stackCleanup: 8 };
+        }
+        sched.setLastError(ERROR_NOT_FOUND);
+        return { value: 0, stackCleanup: 8 };
     };
 
     exports['GetFileType'] = (ctx, mem, args) => {
@@ -691,7 +708,7 @@ const fileIoModule = (() => {
             view.setUint16(lpReOpenBuff + 2, 0, true); // nErrCode
             view.setUint16(lpReOpenBuff + 4, 0, true);
             view.setUint16(lpReOpenBuff + 6, 0, true);
-            const pathBytes = encodeAnsi(filename + '\0');
+            const pathBytes = encodeFileApiString(filename + '\0');
             const max = Math.min(pathBytes.length, 128);
             mem.set(pathBytes.slice(0, max), lpReOpenBuff + 8);
         }
@@ -2422,10 +2439,37 @@ const fileIoModule = (() => {
         return 1; // TRUE
     };
 
-    exports['CreateSymbolicLinkW'] = () => {
-        System.getInstance().scheduler.setLastError(1314); // ERROR_PRIVILEGE_NOT_HELD
-        return 0;
+    // BOOLEAN CreateSymbolicLink{A,W}(LPCTSTR lpSymlinkFileName, LPCTSTR lpTargetFileName, DWORD dwFlags)
+    // The VFS has no reparse points, so the process holds no SeCreateSymbolicLinkPrivilege —
+    // the position of an unelevated process without Developer Mode, where
+    // SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE does not help. The checks Windows makes
+    // before it reaches the privilege (flags, an existing name, a missing parent) keep their
+    // own errors.
+    const createSymbolicLink = (link: string | null, target: string | null, flags: number): number => {
+        const fail = (code: number) => { System.getInstance().scheduler.setLastError(code); return 0; };
+        if (link === null || target === null || (flags & ~0x3)) return fail(ERROR_INVALID_PARAMETER);
+        if (!link) return fail(123); // ERROR_INVALID_NAME
+        const vfs = System.getInstance().fileSystem;
+        const resolved = vfs.resolvePath(link);
+        if (vfs.fileExists(resolved) || vfs.directoryExists(resolved)) return fail(ERROR_ALREADY_EXISTS);
+        const cut = resolved.replace(/\\+$/, '').lastIndexOf('\\');
+        const parent = cut > 2 ? resolved.slice(0, cut) : resolved.slice(0, 3);
+        if (!vfs.directoryExists(parent)) return fail(ERROR_PATH_NOT_FOUND);
+        Logger.log(LogCategory.KERNEL32, `CreateSymbolicLink("${link}" -> "${target}", 0x${flags.toString(16)}): ERROR_PRIVILEGE_NOT_HELD`);
+        return fail(1314); // ERROR_PRIVILEGE_NOT_HELD
     };
+
+    exports['CreateSymbolicLinkW'] = (_ctx, mem, args) => createSymbolicLink(
+        args[0] ? readStringW(mem, args[0]) : null, args[1] ? readStringW(mem, args[1]) : null, args[2]! >>> 0);
+
+    exports['CreateSymbolicLinkA'] = (_ctx, mem, args) => createSymbolicLink(
+        args[0] ? readStringA(mem, args[0]) : null, args[1] ? readStringA(mem, args[1]) : null, args[2]! >>> 0);
+
+    // SetFileApisToOEM / SetFileApisToANSI switch the code page of every A file API: the
+    // paths they read and the names they return.
+    exports['SetFileApisToANSI'] = (_ctx, _mem, _args) => { setFileApisAnsi(true); return 0; };
+    exports['SetFileApisToOEM'] = (_ctx, _mem, _args) => { setFileApisAnsi(false); return 0; };
+    exports['AreFileApisANSI'] = (_ctx, _mem, _args) => (areFileApisAnsi() ? 1 : 0);
 
     exports['GetFileInformationByHandleEx'] = (ctx, mem, args) => {
         const hFile = args[0] >>> 0;
@@ -2501,6 +2545,7 @@ export const exports: Record<string, ThunkImplementation> = fileIoModule.exports
 
 export function resetFileIoState(): void {
     fileIoModule.reset();
+    setFileApisAnsi(true);
 }
 
 /**

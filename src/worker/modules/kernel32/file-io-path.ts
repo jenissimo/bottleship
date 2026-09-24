@@ -9,9 +9,9 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { VirtualFileSystem } from '../../runtime/filesystem/vfs';
-import { encodeAnsi } from '../codepage-utils';
 import { dirOfWindowsPath } from '../../runtime/filesystem/ue1-firstrun';
-import { readStringA, readStringW, encodeUTF16LE } from './file-io-strings';
+import { readStringA, readStringW, encodeUTF16LE, encodeFileApiString } from './file-io-strings';
+import { searchPathSafeMode } from '../../core/dll-search-order';
 
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_INVALID_PARAMETER = 87;
@@ -47,9 +47,12 @@ const collectDefaultSearchDirectories = (): string[] => {
     const appDir = dirOfWindowsPath(exePath);
     if (appDir) dirs.push(appDir);
 
-    if (vfs?.currentDir) dirs.push(vfs.currentDir);
+    // SetSearchPathMode's safe mode moves the current directory behind the system ones.
+    const safeMode = searchPathSafeMode();
+    if (vfs?.currentDir && !safeMode) dirs.push(vfs.currentDir);
 
     dirs.push('C:\\WINDOWS', 'C:\\WINDOWS\\SYSTEM', 'C:\\WINDOWS\\SYSTEM32');
+    if (vfs?.currentDir && safeMode) dirs.push(vfs.currentDir);
 
     const pathEnv = system.process?.environment.get('PATH');
     if (pathEnv) {
@@ -69,7 +72,7 @@ const writeSearchPathResultA = (
     lpBuffer: number,
     lpFilePart: number,
 ): number => {
-    const pathBytes = encodeAnsi(fullPath + '\0');
+    const pathBytes = encodeFileApiString(fullPath + '\0');
     const required = pathBytes.length;
 
     if (nBufferLength < required) {
@@ -106,7 +109,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             currentDir += '\\';
         }
 
-        const dirBytes = encodeAnsi(currentDir + '\0');
+        const dirBytes = encodeFileApiString(currentDir + '\0');
 
         if (nBufferLength < dirBytes.length) {
             return dirBytes.length; // Required buffer size
@@ -193,7 +196,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
         }
 
         Logger.verbose(LogCategory.KERNEL32, `GetFullPathNameA("${fileName}") -> "${fullPath}"`);
-        const pathBytes = encodeAnsi(fullPath + '\0');
+        const pathBytes = encodeFileApiString(fullPath + '\0');
 
         if (nBufferLength < pathBytes.length) {
             return pathBytes.length; // Required size
@@ -374,7 +377,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         const longPath = lpszLongPath ? readStringA(mem, lpszLongPath) : '';
         const shortPath = longPath;
-        const pathBytes = encodeAnsi(shortPath + '\0');
+        const pathBytes = encodeFileApiString(shortPath + '\0');
 
         if (cchBuffer < pathBytes.length) {
             return shortPath.length; // Required size (excluding null)
@@ -419,7 +422,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             if (full.length === 2 && full[1] === ':') full += '\\';
             longPath = full;
         }
-        const pathBytes = encodeAnsi(longPath + '\0');
+        const pathBytes = encodeFileApiString(longPath + '\0');
 
         Logger.verbose(LogCategory.KERNEL32, `GetLongPathNameA("${inputPath}") -> "${longPath}"`);
 
@@ -457,7 +460,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             tempPath += '\\';
         }
 
-        const pathBytes = encodeAnsi(tempPath + '\0');
+        const pathBytes = encodeFileApiString(tempPath + '\0');
 
         // Windows API behavior: if buffer is too small, return required size without writing
         if (nBufferLength < pathBytes.length) {

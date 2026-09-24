@@ -25,6 +25,11 @@ import { resetSystemCursorHandles } from './system-cursors';
 import { resetMenuState } from './menu';
 import { resetScrollState } from './scroll-state';
 import { resetControlInteractionState } from './control-interaction';
+import { createDpiExports, resetDpiAwareness } from './dpi-awareness';
+import { createDisplayConfigExports } from './display-config';
+import { createTouchPointerExports, resetTouchPointerState } from './touch-pointer';
+import { createMessageFilterExports } from './message-filter';
+import { createPowerNotifyExports, resetPowerNotifications } from './power-notify';
 
 export class User32 implements IModule {
     name = 'user32';
@@ -46,6 +51,11 @@ export class User32 implements IModule {
         registerFastPathmessage(process.dispatcher);
         // system functions
         Object.assign(this.exports, system());
+        Object.assign(this.exports, createDpiExports(this.exports));
+        Object.assign(this.exports, createDisplayConfigExports());
+        Object.assign(this.exports, createTouchPointerExports());
+        Object.assign(this.exports, createMessageFilterExports());
+        Object.assign(this.exports, createPowerNotifyExports());
         // window functions
         Object.assign(this.exports, window());
         registerFastPathWindowFunctions(process.dispatcher);
@@ -63,5 +73,8 @@ export class User32 implements IModule {
         resetScrollState();
         resetControlInteractionState();
         resetWindowMessageForwardState();
+        resetDpiAwareness();
+        resetTouchPointerState();
+        resetPowerNotifications();
     }
 }

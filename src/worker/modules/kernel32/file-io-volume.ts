@@ -8,7 +8,7 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { encodeAnsi } from '../codepage-utils';
-import { readStringA, readStringW, encodeUTF16LE } from './file-io-strings';
+import { readStringA, readStringW, encodeUTF16LE, encodeFileApiString } from './file-io-strings';
 
 const ERROR_PATH_NOT_FOUND = 3;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -43,7 +43,20 @@ const DOS_DEVICE_TARGETS: Record<string, string> = {
 
 const ENUMERATED_DOS_DEVICES = ["AUX", "CON", "NUL", "PRN", "C:", "D:"];
 
-const resolveDosDeviceTarget = (deviceName: string): string | null => {
+const FILE_NAME_OPENED = 0x8;
+const VOLUME_NAME_GUID = 0x1;
+const VOLUME_NAME_NT = 0x2;
+const VOLUME_NAME_NONE = 0x4;
+const ERROR_INVALID_HANDLE = 6;
+const ERROR_NOT_ENOUGH_MEMORY = 8;
+
+/** The volume-GUID root of a drive: a fixed, per-letter identity, stable across runs. */
+function volumeGuidPath(drive: string): string {
+    const letter = drive.toUpperCase().charCodeAt(0).toString(16).padStart(12, "0");
+    return `\\\\?\\Volume{b0771e5b-0000-0000-0000-${letter}}\\`;
+}
+
+export const resolveDosDeviceTarget = (deviceName: string): string | null => {
     const trimmed = deviceName.trim();
     if (!trimmed) return null;
     const upper = trimmed.toUpperCase();
@@ -522,5 +535,58 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
         Logger.verbose(LogCategory.KERNEL32, `GetVolumeInformationW("${rootPath}") -> volume="${volumeName}"`);
         System.getInstance().scheduler.setLastError(0);
         return 1; // TRUE
+    };
+
+    // DWORD GetFinalPathNameByHandle(HANDLE hFile, LPTSTR lpszFilePath, DWORD cchFilePath, DWORD dwFlags)
+    // Returns the length written (no NUL), or the size needed INCLUDING the NUL when it does not fit.
+    const finalPathName = (hFile: number, flags: number): string | null => {
+        const sched = System.getInstance().scheduler;
+        if (flags & ~(FILE_NAME_OPENED | VOLUME_NAME_GUID | VOLUME_NAME_NONE | VOLUME_NAME_NT)) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return null;
+        }
+        const path: string | undefined = System.getInstance().resourceProvider.getFileHandle(hFile)?.vfsHandle?.path;
+        if (!path || !/^[A-Za-z]:\\/.test(path)) {
+            sched.setLastError(ERROR_INVALID_HANDLE);
+            return null;
+        }
+        const drive = path.slice(0, 2).toUpperCase();
+        const tail = path.slice(2);                      // the path below the drive root
+        switch (flags & ~FILE_NAME_OPENED) {
+            case VOLUME_NAME_NONE: return tail;
+            case VOLUME_NAME_NT: return `${resolveDosDeviceTarget(drive)}${tail}`;
+            case VOLUME_NAME_GUID: return `${volumeGuidPath(drive)}${tail.slice(1)}`;
+            default: return `\\\\?\\${drive}${tail}`;
+        }
+    };
+
+    const finishFinalPath = (path: string, length: number, cch: number, write: () => boolean): number => {
+        const sched = System.getInstance().scheduler;
+        if (length >= cch) {
+            sched.setLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return length + 1;
+        }
+        if (!write()) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        Logger.verbose(LogCategory.KERNEL32, `GetFinalPathNameByHandle -> "${path}"`);
+        return length;
+    };
+
+    exports['GetFinalPathNameByHandleW'] = (_ctx, _mem, args) => {
+        const path = finalPathName(args[0] >>> 0, args[3] >>> 0);
+        if (path === null) return 0;
+        const bytes = encodeUTF16LE(path);
+        return finishFinalPath(path, path.length, args[2] >>> 0,
+            () => Mem.writeBytes(args[1] >>> 0, bytes) === bytes.length);
+    };
+
+    exports['GetFinalPathNameByHandleA'] = (_ctx, _mem, args) => {
+        const path = finalPathName(args[0] >>> 0, args[3] >>> 0);
+        if (path === null) return 0;
+        const bytes = encodeFileApiString(path);
+        return finishFinalPath(path, bytes.length - 1, args[2] >>> 0,
+            () => Mem.writeBytes(args[1] >>> 0, bytes) === bytes.length);
     };
 }

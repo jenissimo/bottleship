@@ -1205,6 +1205,8 @@ export default function App() {
       // and take effect when ensureReady() builds the master gain).
       audioEngine.setMasterVolume(uiSettingsRef.current.masterVolume);
       audioEngine.setMuted(uiSettingsRef.current.muted);
+      // Diagnostics: the harness `audiocapture` taps the final mix through this.
+      ((window as any).__BS__ ??= {}).audioEngine = audioEngine;
     }
     // Resume the AudioContext on the first user gesture anywhere on the page (and
     // auto-recover from later browser suspensions). Without this the context stays

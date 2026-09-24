@@ -15,7 +15,7 @@
  *
  * Silent-stub signal:
  *   - arity 0  : `impl.length === 0` → the handler ignores ctx/mem/args entirely
- *                (the `() => D3D_OK` pattern). Strong auto-signal, zero annotation.
+ *                (the `() => D3D_OK` pattern) of an export that takes arguments.
  *   - curated  : SILENT_STUBS holds keys for handlers that DECLARE (ctx,mem,args)
  *                but still don't do the work (can't be caught by arity). Add as found.
  *
@@ -48,6 +48,34 @@ export const SILENT_STUBS = new Set<string>([
     "d3d8:IDirect3DDevice8_GetFrontBuffer",   // should copy front buffer to the given surface
     "d3d8:IDirect3DDevice8_ProcessVertices",  // software T&L+lighting → dest VB; if no-op, garbage verts
 ]);
+
+/**
+ * Handlers that take no parameters ON PURPOSE for an export that does: each was checked
+ * against the real contract and answers it without reading its arguments (a device class
+ * with no devices, a handle that can never be issued, a call Windows itself ignores). They
+ * are exempt from the arity signal so the census stays a list worth reading.
+ */
+export const VERIFIED_PARAMETERLESS = new Set<string>([
+    // hid: no HID interface is ever enumerable, so every handle argument is invalid.
+    "hid:HidD_GetAttributes", "hid:HidD_GetManufacturerString", "hid:HidD_GetProductString",
+    "hid:HidD_GetSerialNumberString", "hid:HidD_GetIndexedString", "hid:HidD_GetPreparsedData",
+    "hid:HidD_FreePreparsedData", "hid:HidD_SetFeature", "hid:HidD_GetFeature",
+    "hid:HidD_SetNumInputBuffers", "hid:HidD_SetOutputReport", "hid:HidD_GetInputReport",
+    "hid:HidP_GetCaps", "hid:HidP_GetButtonCaps", "hid:HidP_GetValueCaps",
+    "hid:HidP_MaxDataListLength", "hid:HidP_GetData",
+    // user32: no WM_TOUCH is ever delivered, so no touch-input handle exists.
+    "user32:GetTouchInputInfo", "user32:CloseTouchInputHandle",
+    // imm32: NT's ImmReleaseContext only returns TRUE.
+    "imm32:ImmReleaseContext",
+    // d3d9: takes only `this`; one adapter.
+    "d3d9:IDirect3D9_GetAdapterCount",
+]);
+
+/** The one silent-stub rule, shared by the call census and the GetProcAddress census. */
+export function isSuspectSilentStub(name: string, arity: number, argCount: number): boolean {
+    if (SILENT_STUBS.has(name)) return true;
+    return arity === 0 && argCount !== 0 && !VERIFIED_PARAMETERLESS.has(name);
+}
 
 /**
  * A FAILED HRESULT is the third kind of silent hole, and the worst to chase: the call is
@@ -86,9 +114,11 @@ class ApiCensus {
     private failures = new Map<string, ApiFailureRecord>();
     private seq = 0;
 
-    /** Record one implemented dispatch. `arity` = impl.length (handler param count).
-     *  Hot-path cheap: a Map lookup + a couple of field writes, no Date/time call. */
-    record(name: string, arity: number, caller: number): void {
+    /** Record one implemented dispatch. `arity` = impl.length (handler param count);
+     *  `argCount` = the export's declared argument count (-1 unknown). A handler that
+     *  takes nothing is only suspect when the export does take something: GetDesktopWindow
+     *  has no arguments to ignore. Hot-path cheap: a Map lookup + a couple of field writes. */
+    record(name: string, arity: number, caller: number, argCount: number = -1): void {
         const existing = this.map.get(name);
         if (existing) {
             existing.count++;
@@ -100,7 +130,7 @@ class ApiCensus {
             name,
             count: 1,
             arity: arity | 0,
-            suspectStub: arity === 0 || SILENT_STUBS.has(name),
+            suspectStub: isSuspectSilentStub(name, arity, argCount),
             firstCaller: caller >>> 0,
             lastCaller: caller >>> 0,
             lastSeq: ++this.seq,

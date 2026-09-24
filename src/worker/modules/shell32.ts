@@ -16,6 +16,7 @@ import { isUe1RenderProbeCommandLine } from "../runtime/filesystem/ue1-firstrun"
 import { applyUe1RenderProbeResult } from "./kernel32/ue1-render-probe";
 import { Marshaler } from "../core/memory/marshaler";
 import { performShFileOperation, DE_INVALIDFILES } from "./shell32-fileop";
+import { windows } from "./user32/shared-state";
 import {
     countPeIcons,
     loadIconFromPeByIndex,
@@ -588,9 +589,17 @@ export class Shell32 implements IModule {
         };
         this.exports["DragFinish"] = () => ({ value: 0, stackCleanup: 4 });
 
-        // void DragAcceptFiles(HWND hWnd, BOOL fAccept)
-        // Registers/unregisters window for drag-and-drop вЂ” no-op in emulator
-        this.exports["DragAcceptFiles"] = () => ({ value: 0, stackCleanup: 8 });
+        // void DragAcceptFiles(HWND hWnd, BOOL fAccept) — toggles WS_EX_ACCEPTFILES, which is
+        // all "accepting dropped files" is; a non-window is ignored.
+        this.exports["DragAcceptFiles"] = (_ctx, _mem, args) => {
+            const WS_EX_ACCEPTFILES = 0x00000010;
+            const win = windows.get(args[0] >>> 0);
+            if (win) {
+                const exStyle = win.exStyle ?? 0;
+                win.exStyle = (args[1] ? exStyle | WS_EX_ACCEPTFILES : exStyle & ~WS_EX_ACCEPTFILES) >>> 0;
+            }
+            return { value: 0, stackCleanup: 8 };
+        };
 
         // IsUserAnAdmin — always return FALSE (not admin)
         this.exports["IsUserAnAdmin"] = () => ({ value: 0, stackCleanup: 0 });

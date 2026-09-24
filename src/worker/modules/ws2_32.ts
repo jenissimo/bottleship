@@ -16,6 +16,8 @@ import {
     WsaSocketTable,
     makeSocketExports,
     makeWsaStartup,
+    makeWsaCleanup,
+    wsaStartupCount,
     inetAddr,
     createDnsStubs,
     createProtoServStubs,
@@ -40,7 +42,6 @@ export class Ws2_32 implements IModule {
     exports: Record<string, ThunkImplementation> = {};
     private socketTable = new WsaSocketTable();
     private resetAddrInfo: (() => void) | null = null;
-    private wsaStarted = false;
 
     initialize(process: Process): void {
         let wsaLastError = 0;
@@ -78,22 +79,13 @@ export class Ws2_32 implements IModule {
         const fdIsSet = makeFdIsSet();
 
         const requireStarted = (): boolean => {
-            if (this.wsaStarted) return true;
+            if (wsaStartupCount.started) return true;
             setError(WSANOTINITIALISED);
             return false;
         };
 
-        this.exports["WSAStartup"] = (ctx, mem, args) => {
-            const result = startup(ctx, mem, args);
-            if (typeof result === "number" && result === 0) {
-                this.wsaStarted = true;
-            }
-            return result;
-        };
-        this.exports["WSACleanup"] = () => {
-            this.wsaStarted = false;
-            return 0;
-        };
+        this.exports["WSAStartup"] = startup;
+        this.exports["WSACleanup"] = makeWsaCleanup(wsaStartupCount, setError);
         this.exports["WSAGetLastError"] = getLastError;
         this.exports["WSASetLastError"] = setLastError;
         Object.assign(this.exports, socketExports);
@@ -361,6 +353,6 @@ export class Ws2_32 implements IModule {
     reset(): void {
         this.socketTable.reset();
         this.resetAddrInfo?.();
-        this.wsaStarted = false;
+        wsaStartupCount.reset();
     }
 }

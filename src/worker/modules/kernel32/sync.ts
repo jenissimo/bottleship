@@ -31,6 +31,8 @@ import { namedObjects } from './named-objects';
  */
 const ioCompletionAssociations: Map<number, { portHandle: number; key: number }> = new Map();
 
+const ERROR_INVALID_PARAMETER = 87;
+
 /**
  * Queue an I/O completion packet for a finished overlapped operation, exactly as
  * the OS does when the handle is associated with a completion port. Signalling
@@ -172,7 +174,11 @@ export function resetIoCompletionWaiters(): void {
  * draining tells the caller a routine ran when none did, and the canonical
  * `while (WaitForMultipleObjectsEx(..., TRUE) == WAIT_IO_COMPLETION)` loop then spins for ever.
  */
-export function deliverPendingApcs(ctx: X86Context, label: string, stackCleanup: number): ThunkResult | null {
+export function deliverPendingApcs(
+    ctx: X86Context, label: string, stackCleanup: number,
+    /** EAX once the queue is drained, for an API whose alerted answer is not WAIT_IO_COMPLETION. */
+    alertedValue: () => number = () => WAIT_IO_COMPLETION,
+): ThunkResult | null {
     const system = System.getInstance();
     const sched = system.scheduler;
     const tid = sched.getCurrentThread()?.id ?? 0;
@@ -199,7 +205,7 @@ export function deliverPendingApcs(ctx: X86Context, label: string, stackCleanup:
 
     const next = (): number | null => {
         const apc = sched.takePendingApc(tid);
-        if (!apc) return WAIT_IO_COMPLETION;
+        if (!apc) return alertedValue();
         callbackManager.invokeCallback(apc.routine, argsFor(apc), cleanupFor(apc), next, false, label, frameId);
         return null;
     };
@@ -900,6 +906,39 @@ const syncModule = (() => {
         return handle;
     };
 
+    // The *Ex creators take the classic creator's options as flags plus a desired-access
+    // mask. Handles here carry no access rights, so the mask has nothing to narrow.
+    const CREATE_EVENT_MANUAL_RESET = 0x1;
+    const CREATE_EVENT_INITIAL_SET = 0x2;
+    const CREATE_MUTEX_INITIAL_OWNER = 0x1;
+
+    const viaClassic = (classic: string, ctx: X86Context, mem: Uint8Array, args: number[]): number =>
+        exports[classic](ctx, mem, args) as number;
+
+    // HANDLE CreateEventEx(LPSECURITY_ATTRIBUTES, LPCTSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess)
+    const eventExArgs = (args: number[]): number[] => [
+        args[0], (args[2] & CREATE_EVENT_MANUAL_RESET) ? 1 : 0, (args[2] & CREATE_EVENT_INITIAL_SET) ? 1 : 0, args[1],
+    ];
+    exports['CreateEventExA'] = (ctx, mem, args) =>
+        ({ value: viaClassic('CreateEventA', ctx, mem, eventExArgs(args)), stackCleanup: 16 });
+    exports['CreateEventExW'] = (ctx, mem, args) =>
+        ({ value: viaClassic('CreateEventW', ctx, mem, eventExArgs(args)), stackCleanup: 16 });
+
+    // HANDLE CreateMutexEx(LPSECURITY_ATTRIBUTES, LPCTSTR lpName, DWORD dwFlags, DWORD dwDesiredAccess)
+    const mutexExArgs = (args: number[]): number[] =>
+        [args[0], (args[2] & CREATE_MUTEX_INITIAL_OWNER) ? 1 : 0, args[1]];
+    exports['CreateMutexExA'] = (ctx, mem, args) =>
+        ({ value: viaClassic('CreateMutexA', ctx, mem, mutexExArgs(args)), stackCleanup: 16 });
+    exports['CreateMutexExW'] = (ctx, mem, args) =>
+        ({ value: viaClassic('CreateMutexW', ctx, mem, mutexExArgs(args)), stackCleanup: 16 });
+
+    // HANDLE CreateSemaphoreEx(LPSECURITY_ATTRIBUTES, LONG lInitialCount, LONG lMaximumCount,
+    //   LPCTSTR lpName, DWORD dwFlags (reserved), DWORD dwDesiredAccess)
+    exports['CreateSemaphoreExA'] = (ctx, mem, args) =>
+        ({ value: viaClassic('CreateSemaphoreA', ctx, mem, args.slice(0, 4)), stackCleanup: 24 });
+    exports['CreateSemaphoreExW'] = (ctx, mem, args) =>
+        ({ value: viaClassic('CreateSemaphoreW', ctx, mem, args.slice(0, 4)), stackCleanup: 24 });
+
     exports['CreateIoCompletionPort'] = (ctx, mem, args) => {
         const fileHandle = args[0] >>> 0;
         const existingPortHandle = args[1] >>> 0;
@@ -1146,6 +1185,11 @@ const syncModule = (() => {
         const name = lpName ? readStringA(lpName) : '';
         const sched = System.getInstance().scheduler;
 
+        if (lMaximumCount <= 0 || lInitialCount < 0 || lInitialCount > lMaximumCount) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+
         if (name) {
             const existing = namedObjects.acquire('semaphore', name);
             if (existing !== undefined) {
@@ -1168,6 +1212,11 @@ const syncModule = (() => {
         const lpName = args[3];
         const name = lpName ? readStringW(lpName) : '';
         const sched = System.getInstance().scheduler;
+
+        if (lMaximumCount <= 0 || lInitialCount < 0 || lInitialCount > lMaximumCount) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
 
         if (name) {
             const existing = namedObjects.acquire('semaphore', name);
@@ -1530,6 +1579,13 @@ const syncModule = (() => {
         const tid = getScheduler().getCurrentThreadId();
         return tryAcquireSrwExclusive(lockPtr, tid) ? 1 : 0;
     };
+
+    exports['TryAcquireSRWLockShared'] = (_ctx, _mem, args) => {
+        const lockPtr = args[0] >>> 0;
+        const tid = getScheduler().getCurrentThreadId();
+        return tryAcquireSrwShared(lockPtr, tid) ? 1 : 0;
+    };
+
 
     exports['WakeConditionVariable'] = (_ctx, _mem, args) => {
         const cvPtr = args[0] >>> 0;

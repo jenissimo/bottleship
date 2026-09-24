@@ -458,6 +458,9 @@ export class CallbackManager {
                     callback.ownerThreadId ?? 0,
                     callback.callbackAddress >>> 0
                 );
+                (System.getInstance().process?.getModule('winmm') as
+                    { notePostedCallbackReturned?(addr: number): void } | undefined)
+                    ?.notePostedCallbackReturned?.(callback.callbackAddress >>> 0);
                 // End the cycle slice: the return resumes at the spin loop, which v86
                 // would otherwise honestly execute until the next tick boundary.
                 sch.onWinmmTimerCallbackReturned?.();

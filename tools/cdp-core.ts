@@ -614,6 +614,165 @@ export async function workerStack(
     return out;
 }
 
+export interface HeapSampleSite {
+    functionName: string;
+    url: string;
+    line: number;
+    /** Sampled bytes attributed to this frame itself, extrapolated to a per-second rate. */
+    bytesPerSec: number;
+    /** Share of all sampled bytes in the window. */
+    pct: number;
+}
+
+/**
+ * Sample the WORKER's JS allocations for `seconds` (HeapProfiler.startSampling) and rank the
+ * allocating frames by bytes/s. Answers "who feeds the GC": a worker that minor-GCs a dozen
+ * times a second, or takes a memory-reducer MajorGC mid-game, stalls every guest thread for the
+ * collection — no guest-side counter can see it. Sampled bytes include objects already dead
+ * at stop (includeObjectsCollectedBy*), because garbage is exactly what is being measured;
+ * `majorOnly` narrows that to objects promoted before dying, the ones that pace full GCs.
+ */
+export async function workerHeapSample(
+    session: CdpSession,
+    opts: { seconds?: number; intervalBytes?: number; top?: number; majorOnly?: boolean } = {},
+): Promise<{ totalBytesPerSec: number; heapUsedMB: number | null; heapTotalMB: number | null; sites: HeapSampleSite[] }> {
+    const seconds = opts.seconds ?? 5;
+    const sessionId = await attachWorkerSession(session);
+    await session.send("HeapProfiler.enable", {}, sessionId);
+    await session.send("HeapProfiler.startSampling", {
+        samplingInterval: opts.intervalBytes ?? 16_384,
+        includeObjectsCollectedByMajorGC: true,
+        // majorOnly drops what the scavenger reclaims, leaving objects that outlived the young
+        // generation and died in old space — exactly the population that paces full GCs.
+        includeObjectsCollectedByMinorGC: !opts.majorOnly,
+    }, sessionId);
+    await Bun.sleep(seconds * 1000);
+    const r = await session.send("HeapProfiler.stopSampling", {}, sessionId);
+    await session.send("HeapProfiler.disable", {}, sessionId).catch(() => { /* */ });
+    const profile = r.result?.profile;
+    // The live heap is what a mark-compact has to walk: its size, not the allocation rate,
+    // sets how long each full GC holds the thread.
+    const usage = await session.send("Runtime.getHeapUsage", {}, sessionId).catch(() => null);
+    const bySite = new Map<string, { f: any; bytes: number }>();
+    const sizeOf = new Map<number, number>();
+    for (const s of profile?.samples ?? []) sizeOf.set(s.nodeId, (sizeOf.get(s.nodeId) ?? 0) + s.size);
+    let total = 0;
+    // A builtin (Map.set, subarray, a getter) has no URL of its own; charge it to the nearest
+    // caller that has one, or "Map.delete" names a mechanism instead of an owner.
+    const walk = (n: any, owner: any): void => {
+        const cf = n.callFrame ?? {};
+        const bytes = sizeOf.get(n.id) ?? n.selfSize ?? 0;
+        if (bytes > 0) {
+            const site = cf.url || !owner ? cf : { ...owner, functionName: `${cf.functionName || "<builtin>"} <- ${owner.functionName}` };
+            const key = `${site.functionName}|${site.url}|${site.lineNumber}`;
+            const e = bySite.get(key) ?? { f: site, bytes: 0 };
+            e.bytes += bytes; bySite.set(key, e); total += bytes;
+        }
+        for (const c of n.children ?? []) walk(c, cf.url ? cf : owner);
+    };
+    if (profile?.head) walk(profile.head, null);
+    const sites = [...bySite.values()].sort((a, b) => b.bytes - a.bytes).slice(0, opts.top ?? 25).map((e) => ({
+        functionName: e.f.functionName || "<anonymous>",
+        url: String(e.f.url ?? "").replace(/^.*\//, "").replace(/\?.*$/, ""),
+        line: (e.f.lineNumber ?? 0) + 1,
+        bytesPerSec: Math.round(e.bytes / seconds),
+        pct: total > 0 ? Math.round((1000 * e.bytes) / total) / 10 : 0,
+    }));
+    const mb = (b: unknown) => (typeof b === "number" ? Math.round(b / 1048576) : null);
+    return {
+        totalBytesPerSec: Math.round(total / seconds),
+        heapUsedMB: mb(usage?.result?.usedSize), heapTotalMB: mb(usage?.result?.totalSize),
+        sites,
+    };
+}
+
+/**
+ * Take a heap snapshot of the WORKER and summarise it by (node type, constructor name): count
+ * and self bytes. A full GC's atomic pause scales with the live heap it has to mark and
+ * evacuate, so "what is resident" is the question once the pause itself is the problem.
+ */
+export async function workerHeapSnapshotSummary(
+    session: CdpSession,
+    opts: { top?: number } = {},
+): Promise<{ totalMB: number; rows: Array<{ type: string; name: string; count: number; selfMB: number }>;
+    stringPrefixes: Array<{ prefix: string; count: number; MB: number }> }> {
+    const sessionId = await attachWorkerSession(session);
+    await session.send("HeapProfiler.enable", {}, sessionId);
+    const chunks: string[] = [];
+    session.on("HeapProfiler.addHeapSnapshotChunk", (params, sid) => {
+        if (sid === sessionId) chunks.push(params.chunk);
+    });
+    await session.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false }, sessionId, { timeoutMs: 180_000 });
+    await session.send("HeapProfiler.disable", {}, sessionId).catch(() => { /* */ });
+    const snap = JSON.parse(chunks.join(""));
+    const meta = snap.snapshot.meta;
+    const fields: string[] = meta.node_fields;
+    const types: string[] = meta.node_types[0];
+    const stride = fields.length;
+    const iType = fields.indexOf("type"), iName = fields.indexOf("name"), iSize = fields.indexOf("self_size");
+    const nodes: number[] = snap.nodes;
+    const strings: string[] = snap.strings;
+    const agg = new Map<string, { type: string; name: string; count: number; bytes: number }>();
+    let total = 0;
+    // Strings are grouped by a short prefix too: "39 MB of (string)" names nothing, while
+    // "120k strings starting with `[THUNK]`" names the owner.
+    const prefixes = new Map<string, { count: number; bytes: number }>();
+    for (let i = 0; i < nodes.length; i += stride) {
+        const type = types[nodes[i + iType]];
+        const name = type === "string" || type === "concatenated string" || type === "sliced string"
+            ? "(string)" : type === "number" ? "(heap number)" : strings[nodes[i + iName]];
+        const size = nodes[i + iSize];
+        total += size;
+        if (name === "(string)") {
+            const prefix = String(strings[nodes[i + iName]] ?? "").slice(0, 24).replace(/[0-9a-fA-F]{3,}/g, "#");
+            const p = prefixes.get(prefix) ?? { count: 0, bytes: 0 };
+            p.count++; p.bytes += size; prefixes.set(prefix, p);
+        }
+        const key = `${type}|${name}`;
+        const e = agg.get(key) ?? { type, name, count: 0, bytes: 0 };
+        e.count++; e.bytes += size; agg.set(key, e);
+    }
+    const rows = [...agg.values()].sort((a, b) => b.bytes - a.bytes).slice(0, opts.top ?? 30)
+        .map((e) => ({ type: e.type, name: e.name.slice(0, 80), count: e.count, selfMB: Math.round(e.bytes / 10485.76) / 100 }));
+    const stringPrefixes = [...prefixes].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, opts.top ?? 30)
+        .map(([prefix, v]) => ({ prefix, count: v.count, MB: Math.round(v.bytes / 10485.76) / 100 }));
+    return { totalMB: Math.round(total / 10485.76) / 100, rows, stringPrefixes };
+}
+
+/**
+ * Record what actually reaches the speakers — the final mix after masterGain and the limiter —
+ * for `seconds`, as 16-bit PCM. A tap AudioWorklet is connected in parallel to the engine's
+ * output node, so what it hears is exactly the signal the destination gets. Every in-emulator
+ * audio counter describes an intermediate stage; this is the one that describes the result.
+ */
+export async function captureAudioOutput(
+    session: CdpSession, seconds: number,
+): Promise<{ rate: number; frames: number; clippedFrames: number; baseLatency: number; outputLatency: number; pcm: Buffer }> {
+    const expr = `(async () => {
+  const eng = window.__BS__?.audioEngine;
+  const ctx = eng?.context, tap = eng?.masterLimiterNode;
+  if (!ctx || !tap) return { err: 'no audio engine / output node (is a game with audio running?)', state: ctx?.state };
+  const code = "class R extends AudioWorkletProcessor{constructor(){super();this.on=true;this.port.onmessage=()=>{this.on=false}}process(i){const c=i[0];if(this.on&&c&&c.length){this.port.postMessage([c[0].slice(),(c[1]||c[0]).slice()])}return this.on}}registerProcessor('bs-capture-tap',R)";
+  if (!window.__bsCaptureTapLoaded) { await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))); window.__bsCaptureTapLoaded = true; }
+  const node = new AudioWorkletNode(ctx, 'bs-capture-tap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+  const sink = ctx.createGain(); sink.gain.value = 0;
+  const L = [], R = []; let n = 0; const want = Math.round(ctx.sampleRate * ${seconds});
+  const done = new Promise(res => { node.port.onmessage = (e) => { L.push(e.data[0]); R.push(e.data[1]); n += e.data[0].length; if (n >= want) res(); }; });
+  tap.connect(node); node.connect(sink); sink.connect(ctx.destination);
+  await Promise.race([done, new Promise(r => setTimeout(r, ${seconds} * 1000 + 5000))]);
+  node.port.postMessage(0); tap.disconnect(node); node.disconnect(); sink.disconnect();
+  const frames = Math.min(n, want); const pcm = new Int16Array(frames * 2); let k = 0, clip = 0;
+  outer: for (let b = 0; b < L.length; b++) for (let i = 0; i < L[b].length; i++) { if (k >= frames) break outer;
+    const l = L[b][i], r = R[b][i]; if (Math.abs(l) >= 1 || Math.abs(r) >= 1) clip++;
+    pcm[2*k] = Math.max(-32768, Math.min(32767, Math.round(l * 32767))); pcm[2*k+1] = Math.max(-32768, Math.min(32767, Math.round(r * 32767))); k++; }
+  const bytes = new Uint8Array(pcm.buffer); let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return { rate: ctx.sampleRate, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency, frames, clip, b64: btoa(bin) };
+})()`;
+    const r = await pageEval(session, expr, { timeoutMs: (seconds + 30) * 1000 });
+    if (!r || r.err) throw new Error(`audiocapture: ${r?.err ?? "no result"}${r?.state ? ` (context ${r.state})` : ""}`);
+    return { rate: r.rate, frames: r.frames, clippedFrames: r.clip, baseLatency: r.baseLatency, outputLatency: r.outputLatency, pcm: Buffer.from(r.b64, "base64") };
+}
+
 /** Capture a page screenshot (PNG base64). */
 /**
  * Page.captureScreenshot waits for the next COMPOSITOR frame and Chrome puts no deadline

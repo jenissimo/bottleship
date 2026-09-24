@@ -97,6 +97,9 @@ import { Iphlpapi } from "./modules/iphlpapi";
 import { Tapi32 } from "./modules/tapi32";
 import { Setupapi } from "./modules/setupapi";
 import { Hid } from "./modules/hid";
+import { Combase } from "./modules/combase";
+import { Shcore } from "./modules/shcore";
+import { Kernelbase } from "./modules/kernelbase";
 import { XInput1_3 } from "./modules/xinput1_3";
 import { Netapi32 } from "./modules/netapi32";
 import { ImageHlp } from "./modules/imagehlp";
@@ -142,6 +145,7 @@ import { buildStagedBundle, inspectBundle, finalizeBundle, readStagedEntry, type
 import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
 import { Logger, LogLevel, LogCategory } from "./core/logger";
+import { postHostTask } from "./core/host-task";
 import { recordGpuError, resetGpuErrors } from "./core/gpu-error-log";
 import { resetDeviceLossContract } from "./core/gpu/gpu-device-loss-contract";
 import { createStreamingWasmLoader } from "./core/wasm-loader";
@@ -2730,6 +2734,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const tapi32 = new Tapi32();
       const setupapi = new Setupapi();
       const hid = new Hid();
+      const combase = new Combase();
+      const shcore = new Shcore();
+      const kernelbase = new Kernelbase();
       const xinput1_3 = new XInput1_3();
       const netapi32 = new Netapi32();
       const psapi = new Psapi();
@@ -2815,6 +2822,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       tapi32.initialize(process);
       setupapi.initialize(process);
       hid.initialize(process);
+      combase.initialize(process);
+      shcore.initialize(process);
+      kernelbase.setHosts([kernel32, advapi32, shlwapi]);
+      kernelbase.initialize(process);
       xinput1_3.initialize(process);
       netapi32.initialize(process);
 
@@ -2877,6 +2888,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(tapi32.name, tapi32);
       process.registerModule(setupapi.name, setupapi);
       process.registerModule(hid.name, hid);
+      process.registerModule(combase.name, combase);
+      process.registerModule(shcore.name, shcore);
+      process.registerModule(kernelbase.name, kernelbase);
       process.registerModule(xinput1_3.name, xinput1_3);
       process.registerModule(netapi32.name, netapi32);
       process.registerModule(imagehlp.name, imagehlp);
@@ -2951,6 +2965,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(tapi32.name, tapi32.exports);
       process.dispatcher.registerModule(setupapi.name, setupapi.exports);
       process.dispatcher.registerModule(hid.name, hid.exports);
+      process.dispatcher.registerModule(combase.name, combase.exports);
+      process.dispatcher.registerModule(shcore.name, shcore.exports);
+      process.dispatcher.registerModule(kernelbase.name, kernelbase.exports);
       process.dispatcher.registerModule(xinput1_3.name, xinput1_3.exports);
       process.dispatcher.registerModule(netapi32.name, netapi32.exports);
       process.dispatcher.registerModule(imagehlp.name, imagehlp.exports);
@@ -3112,6 +3129,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           // page the moment it has. No-op (one boolean) when nothing is armed.
           memWriteTrap.onTickBoundary(cpu);
           hypercallDataManager.updateTimeData();
+          // After the clock advance, so the deadline is measured against this tick's now.
+          if (!urgentExit && !(globalThis as { __noTimerSliceCap?: boolean }).__noTimerSliceCap) {
+            preemptionManager.capSliceForTimerDeadline(system.scheduler.timerSliceBudgetInsns());
+          }
           // Robust unified-clock activation. The one-shot enable() gates in loadPeData
           // (~651) and the v86-init block (~1389) race with stub registration and v86
           // restarts (reset_cpu re-zeroes HYPERCALL_PAGE → hc_enabled=0), so enable() was
@@ -3184,7 +3205,16 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // MessageChannel creates macrotasks (not microtasks) — rAF/setInterval work correctly.
         if (typeof v86Inner["register_yield_direct"] === "function") {
           v86Inner["register_yield_direct"]();
-          Logger.log(LogCategory.SYSTEM, "[HYPERCALL] yield-Worker replaced with MessageChannel");
+          // The next tick is queued as a host task rather than a MessagePort message
+          // (see postHostTask). v86 ignores a stale tick number, so one reused callback
+          // reading the latest is exact and allocates nothing per tick.
+          let pendingTick = 0;
+          const runTick = (): void => { v86Inner["yield_callback"](pendingTick); };
+          v86Inner["yield"] = (t: number, tick: number): void => {
+            if (t < 1) { pendingTick = tick; postHostTask(runTick); }
+            else setTimeout(() => v86Inner["yield_callback"](tick), t);
+          };
+          Logger.log(LogCategory.SYSTEM, "[HYPERCALL] v86 ticks queued as host tasks");
         }
 
         Logger.log(LogCategory.SYSTEM,

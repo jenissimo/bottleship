@@ -564,7 +564,28 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
         return res ? 1 : 0;
     };
 
-    exports['CopyImage'] = (ctx, mem, args) => args[0] >>> 0;
+    // HANDLE CopyImage(HANDLE h, UINT type, int cx, int cy, UINT flags). An icon or cursor
+    // copy is a NEW handle — DestroyIcon on either must leave the other alive. Bitmaps
+    // still alias their source.
+    exports['CopyImage'] = (ctx, mem, args) => {
+        const LR_COPYRETURNORG = 0x4;
+        const LR_COPYDELETEORG = 0x8;
+        const hImage = args[0] >>> 0;
+        const cx = args[2] | 0;
+        const cy = args[3] | 0;
+        const flags = args[4] >>> 0;
+        const provider = System.getInstance().resourceProvider;
+        const src = hImage ? provider.getUserObject(hImage) : null;
+        if (!src || (src.type !== 'ICON' && src.type !== 'CURSOR')) return hImage;
+        const sameSize = (cx === 0 || cx === src.width) && (cy === 0 || cy === src.height);
+        if ((flags & LR_COPYRETURNORG) && sameSize) return hImage;
+        const { shared: _shared, systemCursorId: _systemCursorId, ...rest } = src;
+        const copy = provider.registerUserObject({ ...rest });
+        if ((flags & LR_COPYDELETEORG) && !src.shared && src.systemCursorId === undefined) {
+            provider.unregisterUserObject(hImage);
+        }
+        return copy;
+    };
     exports['GetIconInfo'] = (ctx, mem, args) => {
         const piconinfo = args[1] >>> 0;
         if (piconinfo && piconinfo + 20 <= mem.length) {

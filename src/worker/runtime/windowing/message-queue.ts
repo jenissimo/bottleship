@@ -17,6 +17,8 @@ export interface Message {
     ptY: number;
     targetThreadId?: number;  // 0 or undefined = any thread; >0 = specific thread only
     keyStatePacked?: Uint8Array;
+    /** dwExtraInfo of the input that produced it; GetMessageExtraInfo reads it back. */
+    extraInfo?: number;
 }
 
 const WM_MOUSEMOVE = 0x0200;
@@ -35,6 +37,7 @@ type PendingMessage = {
     ptY: number;
     targetThreadId: number;
     keyStatePacked?: Uint8Array;
+    extraInfo?: number;
 };
 
 (globalThis as Record<string, any>).h3QueueSetMouseMoveCoalescing = (enabled: boolean): boolean => {
@@ -58,6 +61,7 @@ class RingBuffer {
     private targetThreadIds: Uint32Array;
     private keyStatePresent: Uint8Array;
     private keyStatesPacked: Uint8Array;
+    private extraInfos: Uint32Array;
 
     constructor(capacity: number) {
         this.capacity = nextPowerOfTwo(capacity);
@@ -72,6 +76,7 @@ class RingBuffer {
         this.targetThreadIds = new Uint32Array(this.capacity);
         this.keyStatePresent = new Uint8Array(this.capacity);
         this.keyStatesPacked = new Uint8Array(this.capacity * KEY_STATE_BYTES);
+        this.extraInfos = new Uint32Array(this.capacity);
     }
 
     get length(): number {
@@ -111,7 +116,8 @@ class RingBuffer {
         ptX = 0,
         ptY = 0,
         targetThreadId = 0,
-        keyStatePacked?: Uint8Array
+        keyStatePacked?: Uint8Array,
+        extraInfo = 0
     ): void {
         if (this.count === this.capacity) {
             this.head = (this.head + 1) & this.mask;
@@ -127,6 +133,7 @@ class RingBuffer {
         this.ptYs[idx] = ptY | 0;
         this.targetThreadIds[idx] = targetThreadId >>> 0;
         this.setKeyStateSnapshot(idx, keyStatePacked);
+        this.extraInfos[idx] = extraInfo >>> 0;
         this.tail = (this.tail + 1) & this.mask;
         this.count++;
     }
@@ -163,6 +170,7 @@ class RingBuffer {
                         ptY: this.ptYs[idx],
                         targetThreadId: target,
                         keyStatePacked: this.getKeyStateSnapshot(idx),
+                        extraInfo: this.extraInfos[idx],
                     };
                     // Remove by shifting earlier entries forward
                     for (let j = i; j > 0; j--) {
@@ -206,6 +214,7 @@ class RingBuffer {
             ptX: this.ptXs[idx],
             ptY: this.ptYs[idx],
             keyStatePacked: this.getKeyStateSnapshot(idx),
+            extraInfo: this.extraInfos[idx],
         };
     }
 
@@ -261,6 +270,7 @@ class RingBuffer {
                     ptX: this.ptXs[idx],
                     ptY: this.ptYs[idx],
                     keyStatePacked: this.getKeyStateSnapshot(idx),
+                    extraInfo: this.extraInfos[idx],
                 };
                 // Shift earlier entries forward to close the gap
                 for (let j = i; j > 0; j--) {
@@ -449,7 +459,8 @@ export class MessageQueue {
         ptX = 0,
         ptY = 0,
         targetThreadId = 0,
-        keyStatePacked?: Uint8Array
+        keyStatePacked?: Uint8Array,
+        extraInfo = 0
     ): boolean {
         const time = TimeService.getInstance().nowMs() | 0;
 
@@ -467,6 +478,7 @@ export class MessageQueue {
                 ptY,
                 targetThreadId,
                 keyStatePacked: keyStatePacked ? keyStatePacked.slice(0, KEY_STATE_BYTES) : undefined,
+                extraInfo,
             });
             return false;
         } else if (msg === WM_PAINT) {
@@ -479,6 +491,7 @@ export class MessageQueue {
                 ptY,
                 targetThreadId,
                 keyStatePacked: keyStatePacked ? keyStatePacked.slice(0, KEY_STATE_BYTES) : undefined,
+                extraInfo,
             });
             // Must wake waiters + set the WASM queue flag — otherwise PeekMessage fast path
             // spins in guest code forever while paint sits in paintPending (HL launcher).
@@ -496,6 +509,7 @@ export class MessageQueue {
                     ptY,
                     targetThreadId,
                     keyStatePacked: keyStatePacked ? keyStatePacked.slice(0, KEY_STATE_BYTES) : undefined,
+                    extraInfo,
                 },
             });
             this.drainWaiters();
@@ -513,11 +527,12 @@ export class MessageQueue {
                     pendingMouse.ptX,
                     pendingMouse.ptY,
                     0,
-                    pendingMouse.keyStatePacked
+                    pendingMouse.keyStatePacked,
+                    pendingMouse.extraInfo ?? 0
                 );
                 this.lastMouseMove.delete(hwnd);
             }
-            this.inputQueue.enqueue(hwnd, msg, wParam, lParam, time, ptX, ptY, targetThreadId, keyStatePacked);
+            this.inputQueue.enqueue(hwnd, msg, wParam, lParam, time, ptX, ptY, targetThreadId, keyStatePacked, extraInfo);
         }
         this.drainWaiters();
         return true;
@@ -568,6 +583,7 @@ export class MessageQueue {
                     ptX: pending.ptX,
                     ptY: pending.ptY,
                     keyStatePacked: pending.keyStatePacked,
+                    extraInfo: pending.extraInfo,
                 };
                 this.trackDequeued(msg);
                 return msg;
@@ -585,6 +601,7 @@ export class MessageQueue {
                     wParam: pending.wParam, lParam: pending.lParam,
                     time: pending.time, ptX: pending.ptX, ptY: pending.ptY,
                     keyStatePacked: pending.keyStatePacked,
+                    extraInfo: pending.extraInfo,
                 };
                 this.trackDequeued(msg);
                 return msg;
@@ -610,6 +627,7 @@ export class MessageQueue {
                     ptY: pending.ptY,
                     targetThreadId: pending.targetThreadId,
                     keyStatePacked: pending.keyStatePacked,
+                    extraInfo: pending.extraInfo,
                 };
                 this.trackDequeued(msg);
                 return msg;
@@ -643,6 +661,7 @@ export class MessageQueue {
                     ptX: pending.ptX,
                     ptY: pending.ptY,
                     keyStatePacked: pending.keyStatePacked,
+                    extraInfo: pending.extraInfo,
                 };
             }
         }
@@ -655,6 +674,7 @@ export class MessageQueue {
                     wParam: pending.wParam, lParam: pending.lParam,
                     time: pending.time, ptX: pending.ptX, ptY: pending.ptY,
                     keyStatePacked: pending.keyStatePacked,
+                    extraInfo: pending.extraInfo,
                 };
             }
         }
@@ -675,6 +695,7 @@ export class MessageQueue {
                     ptY: pending.ptY,
                     targetThreadId: pending.targetThreadId,
                     keyStatePacked: pending.keyStatePacked,
+                    extraInfo: pending.extraInfo,
                 };
             }
         }
@@ -825,7 +846,7 @@ export class MessageQueue {
             }
         }
         for (const m of kept) {
-            this.inputQueue.enqueue(m.hwnd, m.message, m.wParam, m.lParam, m.time, m.ptX, m.ptY, m.targetThreadId ?? 0, m.keyStatePacked);
+            this.inputQueue.enqueue(m.hwnd, m.message, m.wParam, m.lParam, m.time, m.ptX, m.ptY, m.targetThreadId ?? 0, m.keyStatePacked, m.extraInfo ?? 0);
         }
     }
 

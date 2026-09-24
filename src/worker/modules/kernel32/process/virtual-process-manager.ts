@@ -340,6 +340,15 @@ export class VirtualProcessManager {
         return this.processesByHandle.get(handle >>> 0)?.pid ?? null;
     }
 
+    /** What a process handle names, for the APIs that report on the process itself. */
+    describeProcessHandle(handle: number): {
+        pid: number; imageName: string; commandLine: string; currentDirectory: string;
+    } | null {
+        this.pruneStaleHandles();
+        const p = this.processesByHandle.get(handle >>> 0);
+        return p ? { pid: p.pid, imageName: p.imageName, commandLine: p.commandLine, currentDirectory: p.currentDirectory } : null;
+    }
+
     hasProcessHandle(handle: number): boolean {
         this.pruneStaleHandles();
         return this.processesByHandle.has(handle >>> 0);

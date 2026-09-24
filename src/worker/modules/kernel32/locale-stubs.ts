@@ -8,9 +8,11 @@
 //
 // The table this reads is serialised from the JS answer cache (locale-data.ts,
 // serializeLocaleStubTable), so stub and thunk cannot answer differently. Every case the
-// stub does not cover — LOCALE_RETURN_NUMBER, an unknown LCTYPE, a negative or too-small
-// cchData, a NULL destination, a destination past guest RAM — JMPs to the original OUT
-// trap, which keeps last-error and the odd cases JS-side where they belong.
+// stub does not cover — an LCID outside its list (it serves the process locale only),
+// LOCALE_RETURN_NUMBER or RETURN_GENITIVE_NAMES, an unknown LCTYPE, a negative or
+// too-small cchData, a NULL destination, a destination past guest RAM — JMPs to the
+// original OUT trap, which keeps last-error and the odd cases JS-side where they
+// belong.
 //
 // No non-preemptible range: unlike the heap slab stubs this touches no shared mutable
 // state (the table is read-only; the two counters are plain increments whose exactness
@@ -23,7 +25,7 @@ import type { StubAllocator } from '../../core/thunking/thunk-memory-manager';
 import {
     LOCALE_CACHE_SIZE, LOCALE_STUB_ANSWERED_OFF, LOCALE_STUB_BAIL_OFF,
     LOCALE_STUB_BAIL_REASONS, LOCALE_STUB_DESTLIMIT_OFF, LOCALE_STUB_INDEX_OFF,
-    LOCALE_STUB_BLOB_OFF,
+    LOCALE_STUB_BLOB_OFF, LOCALE_STUB_DECLINED_FLAGS, LOCALE_STUB_LCIDS_OFF, LOCALE_STUB_LCID_SLOTS,
 } from './locale-data';
 
 export interface LocaleInlineStubs {
@@ -51,7 +53,7 @@ export function resetLocaleInlineStubs(): void {
  * Emit the inline GetLocaleInfoW stub.
  *
  * `int GetLocaleInfoW(LCID, LCTYPE lcType, LPWSTR lpLCData, int cchData)` — stdcall,
- * RET 16. LCID is ignored, exactly as the JS fast path ignores it (we serve one locale).
+ * RET 16. Answers only for an LCID in the table's fast-path list, as the JS fast path does.
  *
  * @param allocator  Narrow THUNK_CODE allocator (ThunkMemoryManager.stubAllocator)
  * @param getMemory  Callback returning current guest memory (refetched after alloc)
@@ -64,7 +66,7 @@ export function writeLocaleStubs(
     tableAddr: number,
     trapAddr: number,
 ): LocaleInlineStubs {
-    const REGION_SIZE = 384;
+    const REGION_SIZE = 512;
     const base = allocator.alloc(REGION_SIZE, 'THUNK_CODE', 'rx');
     const mem = getMemory();
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -82,6 +84,7 @@ export function writeLocaleStubs(
     const BLOB_ABS = tableAddr + LOCALE_STUB_BLOB_OFF;
     const ANSWERED_ABS = tableAddr + LOCALE_STUB_ANSWERED_OFF;
     const DESTLIMIT_ABS = tableAddr + LOCALE_STUB_DESTLIMIT_OFF;
+    const LCIDS_ABS = tableAddr + LOCALE_STUB_LCIDS_OFF;
 
     const getLocaleInfoWStub = off;
     // One landing pad per bail site, so the census says WHICH case declined — a single
@@ -93,12 +96,29 @@ export function writeLocaleStubs(
     };
     const haveBufPatches: number[] = [];
 
+    // The LCID gate: answer only for an LCID the table lists (locale-data fastPathLcids —
+    // the pseudo-LCIDs and the configured LCID verbatim). Anything else is the thunk's.
+    // MOV EAX, [ESP+4]            ; 8B 44 24 04   Locale
+    w8(0x8B); w8(0x44); w8(0x24); w8(0x04);
+    const lcidOkPatches: number[] = [];
+    for (let i = 0; i < LOCALE_STUB_LCID_SLOTS; i++) {
+        // CMP EAX, [LCIDS_ABS + i*4] ; 3B 05 disp32
+        w8(0x3B); w8(0x05); w32(LCIDS_ABS + i * 4);
+        // JE .lcidOk                 ; 0F 84 rel32
+        w8(0x0F); w8(0x84); lcidOkPatches.push(off); w32(0);
+    }
+    // JMP .bail                    ; E9 rel32
+    w8(0xE9); bail('lcid');
+    // .lcidOk:
+    const lcidOkAddr = off;
+
     // MOV EAX, [ESP+8]            ; 8B 44 24 08   lcType
     w8(0x8B); w8(0x44); w8(0x24); w8(0x08);
-    // TEST EAX, LOCALE_RETURN_NUMBER ; A9 imm32   (out-param is a DWORD, not a string)
-    w8(0xA9); w32(0x20000000);
+    // TEST EAX, RETURN_NUMBER|RETURN_GENITIVE_NAMES ; A9 imm32
+    // (a DWORD out-param, or month names the cache does not hold)
+    w8(0xA9); w32(LOCALE_STUB_DECLINED_FLAGS);
     // JNZ .bail                   ; 0F 85 rel32
-    w8(0x0F); w8(0x85); bail('returnNumber');
+    w8(0x0F); w8(0x85); bail('returnFlags');
     // MOVZX EAX, AX               ; 0F B7 C0      cleanType = lcType & 0xFFFF (as the JS path)
     w8(0x0F); w8(0xB7); w8(0xC0);
     // CMP EAX, LOCALE_CACHE_SIZE  ; 3D imm32
@@ -201,6 +221,7 @@ export function writeLocaleStubs(
         for (const patchOff of bailPatches[i]) dv.setInt32(patchOff, padAddr - (patchOff + 4), true);
     });
     for (const patchOff of haveBufPatches) dv.setInt32(patchOff, haveBufAddr - (patchOff + 4), true);
+    for (const patchOff of lcidOkPatches) dv.setInt32(patchOff, lcidOkAddr - (patchOff + 4), true);
 
     Logger.log(LogCategory.SYSTEM,
         `Inline GetLocaleInfoW stub emitted: 0x${getLocaleInfoWStub.toString(16)} ` +

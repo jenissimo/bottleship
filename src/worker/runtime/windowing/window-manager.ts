@@ -816,14 +816,15 @@ export class WindowManager {
         ptX = 0,
         ptY = 0,
         targetThreadId = 0,
-        keyStatePacked?: Uint8Array
+        keyStatePacked?: Uint8Array,
+        extraInfo = 0
     ): void {
         // Auto-resolve thread targeting from window ownership (matches Windows behavior:
         // PostMessage routes to the thread that created the window)
         if (targetThreadId === 0 && hwnd > 0) {
             targetThreadId = this.getWindowOwnerThread(hwnd);
         }
-        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked);
+        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo);
         if (discrete) {
             // Eagerly update shared flag so WASM PeekMessage sees new messages immediately.
             // Coalesced WM_MOUSEMOVE does NOT set the flag (starvation / spin avoidance).

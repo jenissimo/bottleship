@@ -196,7 +196,7 @@ const EXPECTED: Record<string, Snapshot> = {
     crtSlabStubs: {"result":{"mallocStub":4096,"freeStub":4245,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"1a43f680b399c70a0ae1f452b9f0940f4978ec37e0b07022ce977dd205329870"}},
     getcStub: {"result":{"getcStub":4096,"regionBase":4096,"regionEnd":4160},"hashes":{"region":"7164114dee4b9bf1cf713e04d53500a1cf0aa472b1aa6cdc1b8a3dfad854f2c0"}},
     caseFoldStubs: {"result":{"tolowerStub":4096,"toupperStub":4108,"regionBase":4096,"regionEnd":4128},"hashes":{"region":"361bd870014fab9f407fc15d3cfe66b4e9468a933f6d6ca6aae0640e20fb0946"}},
-    localeStubs: {"result":{"getLocaleInfoWStub":4096,"tableAddr":131072,"regionBase":4096,"regionEnd":4480},"hashes":{"region":"e95d8aa2c469c375bbaa8301d0727f91f1c40bb67eb48d98541cca811b745c6a"}},
+    localeStubs: {"result":{"getLocaleInfoWStub":4096,"tableAddr":131072,"regionBase":4096,"regionEnd":4608},"hashes":{"region":"b393bd49291ee6c29070494be5f94fdd2e20de66702baeca337f7f487c6303ab"}},
     mbwcStubs: {"result":{"mbToWcStub":4096,"wcToMbStub":4570,"tableAddr":131072,"codePage":1252,"regionBase":4096,"regionEnd":5632},"hashes":{"region":"60837cbfa0d2213d9d44b4db927a172c19ad782330c129662a1065054d51dc79"}},
     shadowTrampolineSampler: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"741930ffcf73a40db8441fb9bb641dfbccba2b2c42557dcd7a699f5a89bd1b49","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
     shadowTrampolineRenderStateNoOwner: {"result":{"trampAddr":5136,"shadowBase":4100,"slotCount":256,"sentinel":2147483648,"skipCounterAddr":4096,"dataRegionBase":4096,"dataRegionEnd":5124,"codeRegionBase":5136,"codeRegionEnd":5392},"hashes":{"code":"7a68f74852f7dd022d3f1da86a9ff701adc75aecd71a88664f10eb1a70b42d49","data":"496f0eda84c76c10945e95128f4f8b16a640633720f19ab135d044da70da04fc"}},
@@ -214,7 +214,7 @@ describe('an emitter that outgrows its region writes nothing outside it', () => 
     // The region check used to run AFTER the overflowing bytes had landed, and pe-loader
     // downgrades the throw to a warn — so the damage stayed in whatever THUNK_CODE follows.
     // Forcing an overflow is the only way to see the difference: the locale stub emits one
-    // 9-byte landing pad per bail reason, so extra reasons grow it past its 384B region.
+    // 11-byte landing pad per bail reason, so extra reasons grow it past its 512B region.
     it('the GetLocaleInfoW stub refuses to emit past its region', () => {
         const ctx = mkCtx();
         const reasons = LOCALE_STUB_BAIL_REASONS as unknown as string[];
@@ -222,7 +222,7 @@ describe('an emitter that outgrows its region writes nothing outside it', () => 
         for (let i = 0; i < added; i++) reasons.push(`overflowProbe${i}`);
         try {
             const base = 0x1000;
-            const REGION_SIZE = 384;   // writeLocaleStubs' own region
+            const REGION_SIZE = 512;   // writeLocaleStubs' own region
             const tail = base + REGION_SIZE;
             ctx.mem.fill(0xA5, tail, tail + 0x400);
             expect(() => writeLocaleStubs(ctx.allocator, ctx.getMemory, SLAB_CTL, TRAP_A))

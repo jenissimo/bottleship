@@ -12,6 +12,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { exports as kernelExports } from "../../src/worker/modules/kernel32/locale";
+import { invalidateLocaleCache } from "../../src/worker/modules/kernel32/locale-data";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { System } from "../../src/worker/core/system";
 
@@ -300,8 +301,9 @@ const LOCALE_SDECIMAL = 0x000E;
 const LOCALE_ILANGUAGE = 0x0001;
 const LOCALE_SDAYNAME7 = 0x0030;          // "Sunday"
 const LOCALE_RETURN_NUMBER = 0x20000000;
-/** Inside the claimed 0x00..0x1014 span but absent from the table (LOCALE_FONTSIGNATURE). */
-const LOCALE_UNKNOWN_HOLE = 0x0058;
+/** Inside the 0x00..0x1014 span but no LCTYPE of Windows' (between SKEYBOARDSTOINSTALL and
+ *  SSHORTESTDAYNAME1). */
+const LOCALE_UNKNOWN_HOLE = 0x005F;
 const UNTOUCHED = 0xcc;
 
 /** The scheduler stores last-error on the CURRENT THREAD, and there is none here, so
@@ -467,5 +469,83 @@ describe("WideCharToMultiByte reports substitution honestly on a multi-byte page
         new DataView(mem.buffer).setUint32(USED, 0xdeadbeef, true);
         callThunk(mem, [932, 0, SRC, 3, DST, 64, 0, USED]);
         expect(new DataView(mem.buffer).getUint32(USED, true)).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// The fast tiers answer the process locale out of a cache built from the same lookup the
+// thunk uses. Agreement is checked type by type against the thunk, under more than one
+// manifest locale, rather than argued from the construction.
+// ---------------------------------------------------------------------------
+
+describe("GetLocaleInfo fast paths agree with the thunk for the process locale", () => {
+    const LOCALE_RETURN_GENITIVE_NAMES = 0x10000000;
+    const LOCALE_SMONTHNAME1 = 0x0038;
+    const LOCALE_FONTSIGNATURE = 0x0058;
+    const LOCALE_SSHORTTIME = 0x0079;
+
+    function withManifest(lcid: number, body: () => void): void {
+        const cfg = EmulatorConfig.getInstance();
+        const saved = cfg.lcid;
+        cfg.lcid = lcid;
+        invalidateLocaleCache();
+        try { body(); } finally { cfg.lcid = saved; invalidateLocaleCache(); }
+    }
+
+    for (const manifest of [0x0409, 0x0419, 0x0411]) {
+        test(`manifest 0x${manifest.toString(16)}: every LCTYPE, W and A, sized, size-queried and RETURN_NUMBER`, () => {
+            withManifest(manifest, () => {
+                let answered = 0;
+                // The two LCTYPE ranges Windows defines, plus a margin past each end.
+                const types = [...Array(0x88).keys(), ...Array.from({ length: 0x20 }, (_, i) => 0x1000 + i)];
+                for (const type of types) {
+                    for (const lcid of [0x0400, manifest]) {
+                        for (const [name, flags, cch] of [
+                            ["GetLocaleInfoW", 0, 0], ["GetLocaleInfoW", 0, 200],
+                            ["GetLocaleInfoW", LOCALE_RETURN_NUMBER, 2],
+                            ["GetLocaleInfoA", 0, 0], ["GetLocaleInfoA", 0, 400],
+                            ["GetLocaleInfoA", LOCALE_RETURN_NUMBER, 4],
+                        ] as const) {
+                            const r = bothTiers(name, () => { }, [lcid, type | flags, cch ? DST : 0, cch]);
+                            if (r.fast === null) continue; // declined: the thunk's answer stands alone
+                            const tag = `${name} lcid=${lcid.toString(16)} type=0x${(type | flags).toString(16)}`;
+                            expect(`${tag} -> ${r.fast}/${r.fastErr}`).toBe(`${tag} -> ${r.slow}/${r.slowErr}`);
+                            expect([...r.fastMem.subarray(DST, DST + cch)]).toEqual([...r.slowMem.subarray(DST, DST + cch)]);
+                            if (r.fast) answered++;
+                        }
+                    }
+                }
+                expect(answered).toBeGreaterThan(600);
+            });
+        });
+    }
+
+    test("a string LCTYPE has no RETURN_NUMBER form", () => {
+        const r = bothTiers("GetLocaleInfoW", () => { }, [0x409, LOCALE_SDECIMAL | LOCALE_RETURN_NUMBER, DST, 2]);
+        expect([r.fast, r.fastErr, r.slow, r.slowErr]).toEqual([0, ERROR_INVALID_FLAGS, 0, ERROR_INVALID_FLAGS]);
+    });
+
+    test("FONTSIGNATURE is 16 WCHARs with no terminator; the A fast path leaves it to the thunk", () => {
+        const w = bothTiers("GetLocaleInfoW", () => { }, [0x409, LOCALE_FONTSIGNATURE, DST, 16]);
+        expect([w.fast, w.slow]).toEqual([16, 16]);
+        expect([...w.fastMem.subarray(DST, DST + 34)]).toEqual([...w.slowMem.subarray(DST, DST + 34)]);
+        const a = bothTiers("GetLocaleInfoA", () => { }, [0x409, LOCALE_FONTSIGNATURE, DST, 32]);
+        expect([a.fast, a.slow]).toEqual([null, 32]);
+    });
+
+    test("genitive names and foreign LCIDs are declined to the thunk, which answers them", () => {
+        withManifest(0x0409, () => {
+            const g = bothTiers("GetLocaleInfoW", () => { }, [0x419, LOCALE_SMONTHNAME1 | LOCALE_RETURN_GENITIVE_NAMES, DST, 64]);
+            expect([g.fast, g.slow]).toEqual([null, 7]);
+            const own = bothTiers("GetLocaleInfoW", () => { }, [0x409, LOCALE_SMONTHNAME1 | LOCALE_RETURN_GENITIVE_NAMES, DST, 64]);
+            expect([own.fast, own.slow]).toEqual([null, 8]);
+            // A refuses genitive names outright, and SSHORTTIME by name.
+            const ga = bothTiers("GetLocaleInfoA", () => { }, [0x409, LOCALE_SMONTHNAME1 | LOCALE_RETURN_GENITIVE_NAMES, DST, 64]);
+            expect([ga.fast, ga.slow, ga.slowErr]).toEqual([null, 0, ERROR_INVALID_FLAGS]);
+            const st = bothTiers("GetLocaleInfoA", () => { }, [0x409, LOCALE_SSHORTTIME, DST, 64]);
+            expect([st.fast, st.fastErr, st.slow, st.slowErr]).toEqual([0, ERROR_INVALID_FLAGS, 0, ERROR_INVALID_FLAGS]);
+            const de = bothTiers("GetLocaleInfoW", () => { }, [0x407, LOCALE_SDECIMAL, DST, 64]);
+            expect([de.fast, de.slow]).toEqual([null, 2]);
+        });
     });
 });

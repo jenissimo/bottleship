@@ -2182,7 +2182,7 @@ export class ThunkDispatcher {
             // so this stays cheap). See diagnostics/api-census.ts.
             const censusCaller = (this.cachedDataView && this.isDataViewValid() && espAtEntry < this.memLength - 4)
                 ? this.cachedDataView.getUint32(espAtEntry, true) >>> 0 : 0;
-            apiCensus.record(thunkName, impl.length, censusCaller);
+            apiCensus.record(thunkName, impl.length, censusCaller, this.argCountsTable[functionId]);
             // Remember the caller for the failure census below: by then the guest stack has
             // moved on, and a failing HRESULT with no caller names nothing.
             this.lastCensusCaller = censusCaller;

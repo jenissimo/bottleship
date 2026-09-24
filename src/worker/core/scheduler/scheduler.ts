@@ -41,6 +41,7 @@ import { TimerWheel } from './timer-wheel';
 import { SyncObjectManager, recordSyncEvent } from './sync-objects';
 import { WaitEngine } from './wait-engine';
 import { CallbackCoordinator } from './callback-coord';
+import { postHostTask } from '../host-task';
 import { TARGET_INSN_PER_MS } from './timing';
 import { setFsBase } from './fs-base';
 import { framePacer } from '../frame-pacer';
@@ -55,7 +56,7 @@ import {
     SchedulerConfig, DEFAULT_SCHEDULER_CONFIG,
     WAIT_OBJECT_0, WAIT_IO_COMPLETION, WAIT_TIMEOUT, WAIT_FAILED,
     WAIT_BLOCKED_NO_SWITCH, INFINITE, CREATE_SUSPENDED, threadStackReserve,
-    MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED,
+    MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED, WaitCompletion,
 } from './types';
 import {
     isValidGuestEip,
@@ -587,8 +588,7 @@ export class Scheduler {
     private static readonly REAP_GRACE_MS = 5000;
     private static readonly REAP_THROTTLE_MS = 250;
 
-    // MessageChannel for sub-ms yields
-    private yieldPort: MessagePort | null = null;
+    // Sub-ms yields: one host task in flight at a time (see postHostTask)
     private yieldPortResolve: (() => void) | null = null;
     // In-flight setTimeout-based idle yield (allBlocked etc.) — tracked so an async
     // thunk completion can resume it early instead of waiting out the ~50ms timer.
@@ -624,17 +624,15 @@ export class Scheduler {
     constructor(config: Partial<SchedulerConfig> = {}) {
         this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
 
-        // Pre-allocate MessageChannel for sub-ms yields (bypasses setTimeout 4ms floor)
-        const ch = new MessageChannel();
-        this.yieldPort = ch.port2;
-        ch.port1.onmessage = () => {
-            const resolve = this.yieldPortResolve;
-            if (resolve) {
-                this.yieldPortResolve = null;
-                resolve();
-            }
-        };
     }
+
+    private readonly onYieldTask = (): void => {
+        const resolve = this.yieldPortResolve;
+        if (resolve) {
+            this.yieldPortResolve = null;
+            resolve();
+        }
+    };
 
     // ═══════════════════════════════════════════════════════════════════════
     // Initialization
@@ -825,6 +823,21 @@ export class Scheduler {
      *  delta (the v86 counter wraps ~every 42 s, so callers must stay within one quantum). */
     private insnsSinceSwitch(thread: Thread, cpu: V86Cpu): number {
         return (this.retiredInsns(cpu) - (thread.lastSwitchInsn >>> 0)) >>> 0;
+    }
+
+    /**
+     * Guest instructions the next slice may retire before the earliest pending timer is due,
+     * rounded UP to the process's timer resolution; 0 = no timer, no cap. Timers are only
+     * polled at a boundary, so without this a thread running pure guest code holds every
+     * Sleep(1) for a whole slice even after the app asked for timeBeginPeriod(1). At the NT
+     * default (15.6ms) the result always exceeds the normal slice and changes nothing.
+     */
+    timerSliceBudgetInsns(): number {
+        const d = this.timerWheel.nextFireIn(this.timeService.nowMs());
+        if (!Number.isFinite(d)) return 0;
+        const res = this.timeService.timerResolutionMs;
+        const ms = Math.max(res, Math.ceil(d / res) * res);
+        return Math.ceil(ms * TARGET_INSN_PER_MS);
     }
 
     /**
@@ -2367,7 +2380,8 @@ export class Scheduler {
         handles: number[], waitAll: boolean, timeoutMs: number,
         returnAddr: number, postReturnEsp: number,
         callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
-        alertable: boolean = false
+        alertable: boolean = false,
+        onWake?: WaitCompletion,
     ): number {
         const thread = this.getCurrentThread();
         if (!thread) return WAIT_FAILED;
@@ -2421,13 +2435,15 @@ export class Scheduler {
         // time and the wheel entry blockThread registers delivers the WAIT_TIMEOUT.
         if (!this.hasOtherRunnableThreads(thread.id)) {
             this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
-                resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context);
+                resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context,
+                false, false, false, undefined, onWake);
             this.requestYieldToHost(this.computeYieldMs(timeoutMs), "waitObj");
             return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
-            resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context);
+            resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context,
+            false, false, false, undefined, onWake);
         this.requestSwitch();
         // Must NOT return WAIT_OBJECT_0 to the sync thunk — the thread is WAITING with a
         // saved post-return context; stub RET would resume guest code on a parked thread
@@ -3038,10 +3054,10 @@ export class Scheduler {
      * onto the shared timer-pump thread so it runs as real guest code, decoupled from the
      * wheel-fire JS context. Reuses the WinMM timer thread + queue + dispatch machinery.
      */
-    postTimerCallback(callbackAddr: number, args: number[]): void {
-        if (!callbackAddr) return;
+    postTimerCallback(callbackAddr: number, args: number[], onReturn?: () => void): boolean {
+        if (!callbackAddr) return false;
         const winmm = this.process?.getModule('winmm') as WinMM | undefined;
-        winmm?.postGuestCallback(callbackAddr, args);
+        return winmm?.postGuestCallback(callbackAddr, args, onReturn) ?? false;
     }
 
     /** @deprecated Use setEvent on the CS LockSemaphore handle instead */
@@ -3117,6 +3133,20 @@ export class Scheduler {
             this.wakeWaitingThreadsForHandle(handle);
         }
         return this.syncObjects.resetEvent(handle);
+    }
+
+    /**
+     * Satisfy a wait on `handle` for `threadId` without parking anyone — a thread-pool wait
+     * object's check. Consumes the signal exactly as a real wait would (auto-reset, semaphore
+     * count, mutex ownership); null when the handle is not a waitable object.
+     */
+    tryConsumeWait(handle: number, threadId: number): boolean | null {
+        if (!this.syncObjects.validateHandles([handle >>> 0])) return null;
+        const decision = this.syncObjects.checkWait(
+            [handle >>> 0], false, threadId, (tid) => this.threads.get(tid) ?? null);
+        if (!decision.ready) return false;
+        this.syncObjects.consumeWait(decision, threadId);
+        return true;
     }
 
     /** Check if any threads are currently waiting on the given handle. */
@@ -3415,6 +3445,12 @@ export class Scheduler {
 
     getCurrentThreadHandle(): number { return 0xFFFFFFFE; }
 
+    /** Id of the live thread a handle (or the GetCurrentThread pseudo-handle) names; null if none. */
+    getThreadIdByHandle(handle: number): number | null {
+        const t = this.getThreadByHandle(this.resolveHandle(handle >>> 0));
+        return t ? t.id : null;
+    }
+
     getThreadStateById(threadId: number): { state: ThreadState; stateName: string } | null {
         const t = this.threads.get(threadId);
         if (!t) return null;
@@ -3579,6 +3615,16 @@ export class Scheduler {
         if (hypercallDataManager.isInitialized()) {
             hypercallDataManager.writeLastError(code >>> 0);
         }
+    }
+
+    /** Last error of a thread that may not be current: a wait completed at its wake. */
+    private setThreadLastError(t: Thread, code: number): void {
+        if (t.id === this.currentThreadId) {
+            this.setLastError(code);
+            return;
+        }
+        t.lastError = code >>> 0;
+        if (t.tebAddress > 0) this.tebManager.syncLastError(t.id, code >>> 0);
     }
 
     getLastError(): number {
@@ -4086,7 +4132,8 @@ export class Scheduler {
                 // notifyPauseResume()'s re-anchor; the deficit instead drains over a few pumps.
                 const elapsed = Math.min(wallNow - this.idleAnchorWallMs, IDLE_PUMP_MAX_MS);
                 if (elapsed > 0) {
-                    this.timeService.advanceVirtualTime(elapsed);
+                    if (this.onHasPendingAsyncRestores?.()) this.timeService.creditIdleMs(elapsed);
+                    else this.timeService.advanceVirtualTime(elapsed);
                     frameVarianceDiagnostics.recordIdleTime('hlt', elapsed);
                 }
                 // Re-anchor unconditionally so a stale anchor can't accumulate a later jump.
@@ -4113,9 +4160,12 @@ export class Scheduler {
      * Gates idle virtual-time pumping in pollTimeouts() — see there for the rationale.
      */
     private shouldPumpIdleVirtualTime(): boolean {
-        // Pending async restores will be woken by their JS promises; their wait path
-        // advances time itself and runs every frame. Don't credit wall-clock dt here.
-        if (this.onHasPendingAsyncRestores?.()) return false;
+        // A pending async restore (a Present held for vsync) does not stop time for the
+        // threads beside it: a Sleep(1) there must end after a millisecond, not when the
+        // Present returns a frame later. pollTimeouts credits that case clamped to wall,
+        // so the async path's own deficit credit cannot count the same time twice.
+        if ((globalThis as { __noAsyncIdlePump?: boolean }).__noAsyncIdlePump
+            && this.onHasPendingAsyncRestores?.()) return false;
         let needsIdlePump = false;
         let anyNonAsyncWaiter = false;
         for (const t of this.threads.values()) {
@@ -4419,6 +4469,7 @@ export class Scheduler {
         boolReturn = false,
         cvReacquireCs = false,
         messageWakeResult?: number,
+        onWake?: WaitCompletion,
     ): void {
         // Create timeout timer if needed
         let timerId = 0;
@@ -4441,6 +4492,7 @@ export class Scheduler {
             boolReturn: boolReturn || undefined,
             cvReacquireCs: cvReacquireCs || undefined,
             messageWakeResult,
+            onWake,
         };
 
         this.transitionTo(thread, ThreadState.WAITING, waitInfo, context);
@@ -4535,6 +4587,13 @@ export class Scheduler {
                 return;
             }
             result = result === WAIT_OBJECT_0 ? 1 : 0;
+        }
+
+        const onWake = thread.waitInfo?.onWake;
+        if (onWake) {
+            const done = onWake(result);
+            result = done.value;
+            if (done.lastError !== undefined) this.setThreadLastError(thread, done.lastError);
         }
 
         // Unregister from wait engine
@@ -4677,14 +4736,21 @@ export class Scheduler {
             }
         }
 
-        // Prefer a different thread than excludeId
+        // Prefer a different thread than excludeId: the highest priority, FIFO among equals.
+        // NT dispatches a readied TIME_CRITICAL audio thread ahead of the normal-priority
+        // threads queued before it; a latency-sensitive pump depends on exactly that.
+        const byPriority = !(globalThis as { __noPriorityPick?: boolean }).__noPriorityPick;
+        let best: Thread | null = null;
         for (let i = 0; i < this.runQueue.length; i++) {
             const id = this.runQueue[i];
             if (id !== excludeId) {
                 const t = this.threads.get(id);
-                if (this.isRunnable(t)) return t;
+                if (!this.isRunnable(t)) continue;
+                if (!byPriority) return t;
+                if (!best || t.priority > best.priority) best = t;
             }
         }
+        if (best) return best;
 
         // No different thread — return any ready thread
         for (let i = 0; i < this.runQueue.length; i++) {
@@ -4755,6 +4821,15 @@ export class Scheduler {
         preemptionManager.setMultiThread(alive > 1);
     }
 
+    // The yield in flight, read back by resumeFromYield. One resume function for every
+    // yield rather than a closure per call: yields run thousands of times a second, and a
+    // closure each is steady garbage for the worker's GC.
+    private yieldCpu: V86Cpu | null = null;
+    private yieldMs = 0;
+    private yieldStartMs = 0;
+    private yieldSourceName = "req";
+    private yieldEngine: any = null;
+
     private yieldToHost(cpu: V86Cpu, ms: number, source?: string): void {
         if (ms <= 0) return;
         const yieldSource = source ?? this.pendingYieldSource;
@@ -4771,56 +4846,18 @@ export class Scheduler {
         const v86 = starter?.v86 ?? starter;
         if (v86?.stop) v86.stop();
 
-        const resume = () => {
-            if (this.idleYieldResumeActive) {
-                this.traceAsyncRestore("wakeEarlyFromIdleYield", cpu, "resume re-entry suppressed");
-                return;
-            }
-            this.idleYieldResumeActive = true;
-            // Clear the yield flag BEFORE the diagnostics below (which could throw). If
-            // intentionalYield stayed true, the startScheduler restart backstop (gated on
-            // !intentionalYield) and the heartbeat "v86 not running" warn are permanently
-            // disabled → silent hang. A reYield re-sets it via the nested yieldToHost.
-            this.intentionalYield = false;
-            const actual = performance.now() - yieldStartMs;
-            try {
-                frameVarianceDiagnostics.recordIdleTime('yield', actual);
-                this.recordYield(yieldSource, actual, ms);
-                // Drain pending async restores BEFORE restarting v86. Without this,
-                // v86 resumes at spinLoopAddress and spins for a full quantum
-                // (~5 ms / 500K cycles) until tick_hooks_after eventually fires.
-                // Applying here moves EIP to returnAddr so resume is productive.
-                if (this.onPollAsyncRestores) {
-                    // May need multiple passes if several restores queued for current thread.
-                    // Cap the loop to avoid any unexpected reentry.
-                    for (let i = 0; i < 8; i++) {
-                        if (!this.onPollAsyncRestores(cpu, "yieldToHost.resume")) break;
-                    }
-                }
-                // If after draining the current thread is still WAITING and no
-                // other thread can run, re-yield instead of restarting v86 — its
-                // only runnable target would be the spin loop. Each iteration is
-                // scheduled via setTimeout/MessageChannel (a macrotask), so this
-                // cannot blow the stack.
-                const current = this.getCurrentThread();
-                if (current && current.state === ThreadState.WAITING && this.runQueue.length === 0) {
-                    // Clamp to ≥1: a 0 from computeYieldMs (overdue timer) would make the
-                    // nested yieldToHost early-return with v86 stopped and NO resume scheduled.
-                    this.yieldToHost(cpu, Math.max(1, this.computeYieldMs(4)), "reYield");
-                    return;
-                }
-                if (v86?.run && !System.getInstance().isExiting) v86.run();
-            } finally {
-                this.idleYieldResumeActive = false;
-            }
-        };
+        this.yieldCpu = cpu;
+        this.yieldMs = ms;
+        this.yieldStartMs = yieldStartMs;
+        this.yieldSourceName = yieldSource;
+        this.yieldEngine = v86;
+        const resume = this.resumeFromYield;
 
-        // For very short yields (≤1ms), use MessageChannel to bypass the
-        // browser's 4ms setTimeout floor. This reduces spin-loop yield
-        // overhead from ~4ms to ~0.1ms.
-        if (ms <= 1 && this.yieldPort && !this.yieldPortResolve) {
+        // Very short yields (≤1ms) go out as a host task, which has no 4ms
+        // setTimeout floor (see postHostTask).
+        if (ms <= 1 && !this.yieldPortResolve) {
             this.yieldPortResolve = resume;
-            this.yieldPort.postMessage(null);
+            postHostTask(this.onYieldTask);
         } else {
             // Track the timer + resume so an async-thunk completion (which queues a
             // restore that makes a thread runnable) can resume immediately instead of
@@ -4829,13 +4866,71 @@ export class Scheduler {
             // v86.stop() window can re-enter yieldToHost before the first resume fires).
             if (this.idleYieldTimer !== null) clearTimeout(this.idleYieldTimer);
             this.idleYieldResume = resume;
-            this.idleYieldTimer = setTimeout(() => {
-                this.idleYieldTimer = null;
-                this.idleYieldResume = null;
-                resume();
-            }, ms);
+            this.idleYieldTimer = setTimeout(this.onIdleYieldTimer, ms);
         }
     }
+
+    private readonly onIdleYieldTimer = (): void => {
+        this.idleYieldTimer = null;
+        this.idleYieldResume = null;
+        this.resumeFromYield();
+    };
+
+    private readonly resumeFromYield = (): void => {
+        const cpu = this.yieldCpu!;
+        const ms = this.yieldMs;
+        const yieldStartMs = this.yieldStartMs;
+        const yieldSource = this.yieldSourceName;
+        const v86 = this.yieldEngine;
+        if (this.idleYieldResumeActive) {
+            this.traceAsyncRestore("wakeEarlyFromIdleYield", cpu, "resume re-entry suppressed");
+            return;
+        }
+        this.idleYieldResumeActive = true;
+        // Clear the yield flag BEFORE the diagnostics below (which could throw). If
+        // intentionalYield stayed true, the startScheduler restart backstop (gated on
+        // !intentionalYield) and the heartbeat "v86 not running" warn are permanently
+        // disabled → silent hang. A reYield re-sets it via the nested yieldToHost.
+        this.intentionalYield = false;
+        const actual = performance.now() - yieldStartMs;
+        try {
+            frameVarianceDiagnostics.recordIdleTime('yield', actual);
+            this.recordYield(yieldSource, actual, ms);
+            // Drain pending async restores BEFORE restarting v86. Without this,
+            // v86 resumes at spinLoopAddress and spins for a full quantum
+            // (~5 ms / 500K cycles) until tick_hooks_after eventually fires.
+            // Applying here moves EIP to returnAddr so resume is productive.
+            if (this.onPollAsyncRestores) {
+                // May need multiple passes if several restores queued for current thread.
+                // Cap the loop to avoid any unexpected reentry.
+                for (let i = 0; i < 8; i++) {
+                    if (!this.onPollAsyncRestores(cpu, "yieldToHost.resume")) break;
+                }
+            }
+            // Time passes while the CPU idles: a thread asleep beside one parked in an
+            // async wait (a Present held for vsync) must still wake on its deadline.
+            // The host setInterval pump is clamped to ~4ms, which alone would hold
+            // every Sleep(1) until the parked thread returns.
+            if (!(globalThis as { __noYieldResumePoll?: boolean }).__noYieldResumePoll) {
+                this.pollTimeouts();
+            }
+            // If after draining the current thread is still WAITING and no
+            // other thread can run, re-yield instead of restarting v86 — its
+            // only runnable target would be the spin loop. Each iteration is
+            // scheduled via setTimeout or a host task (a macrotask), so this
+            // cannot blow the stack.
+            const current = this.getCurrentThread();
+            if (current && current.state === ThreadState.WAITING && this.runQueue.length === 0) {
+                // Clamp to ≥1: a 0 from computeYieldMs (overdue timer) would make the
+                // nested yieldToHost early-return with v86 stopped and NO resume scheduled.
+                this.yieldToHost(cpu, Math.max(1, this.computeYieldMs(4)), "reYield");
+                return;
+            }
+            if (v86?.run && !System.getInstance().isExiting) v86.run();
+        } finally {
+            this.idleYieldResumeActive = false;
+        }
+    };
 
     /**
      * Resume an in-flight setTimeout-based idle yield (e.g. "allBlocked") right now.
@@ -4848,7 +4943,7 @@ export class Scheduler {
      * stuck in ~50ms allBlocked yields → single-digit FPS). The dispatcher's
      * async-completion path calls this so the worker resumes within a microtask of
      * the Promise resolving.
-     * No-op (returns false) for the MessageChannel fast-path, which already resumes
+     * No-op (returns false) for the sub-ms host-task fast path, which already resumes
      * in ~0.1ms, or when no setTimeout yield is in flight.
      */
     wakeEarlyFromIdleYield(): boolean {

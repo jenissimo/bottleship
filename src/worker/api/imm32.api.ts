@@ -1,6 +1,6 @@
 /**
  * IMM32.dll API descriptor.
- * Input Method Manager shims for legacy apps.
+ * Input Method Manager of a system with no IME installed.
  */
 
 import { ModuleDescriptor, FunctionDescriptor, ParameterDescriptor } from "./types";
@@ -49,7 +49,21 @@ export const imm32Module: ModuleDescriptor = {
         makeFunc("ImmNotifyIME", 4),
         makeFunc("ImmSimulateHotKey", 2),
         makeFunc("ImmAssociateContext", 2),
+        makeFunc("ImmAssociateContextEx", 3),
         makeFunc("ImmSetCandidateWindow", 2),
         makeFunc("ImmSetCompositionWindow", 2),
+        makeFunc("ImmGetDefaultIMEWnd", 1),
+
+        // immdev.h: the INPUTCONTEXT and its IMCC component blocks.
+        makeFunc("ImmLockIMC", 1),
+        makeFunc("ImmUnlockIMC", 1),
+        makeFunc("ImmGetIMCLockCount", 1),
+        makeFunc("ImmCreateIMCC", 1),
+        makeFunc("ImmDestroyIMCC", 1),
+        makeFunc("ImmLockIMCC", 1),
+        makeFunc("ImmUnlockIMCC", 1),
+        makeFunc("ImmGetIMCCLockCount", 1),
+        makeFunc("ImmGetIMCCSize", 1),
+        makeFunc("ImmReSizeIMCC", 2),
     ],
 };

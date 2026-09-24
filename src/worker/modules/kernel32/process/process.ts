@@ -310,7 +310,7 @@ const handOffToChild = (system: System, child: ChildProcessRecord): boolean => {
     return true;
 };
 
-const shutdownProcess = (exitCode: number): ThunkResult => {
+export const shutdownProcess = (exitCode: number): ThunkResult => {
     const system = System.getInstance();
     Logger.log(LogCategory.KERNEL32, `ShutdownProcess code=${exitCode}`);
 
@@ -1709,10 +1709,6 @@ export const exports: Record<string, ThunkImplementation> = {
             `GetProcessVersion: Returning version ${emulatorConfig.osVersion.major}.${emulatorConfig.osVersion.minor} (0x${versionDword.toString(16)})`);
 
         return versionDword >>> 0; // Unsigned 32-bit
-    },
-
-    'AreFileApisANSI': () => {
-        return 1; // TRUE
     },
 
     'SetProcessAffinityMask': (ctx, mem, args) => {

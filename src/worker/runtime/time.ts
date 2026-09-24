@@ -176,6 +176,18 @@ export class TimeService {
     // Must stay in sync with hypercall-data.ts's MAX_AHEAD_MS (updateTimeData's clamp).
     static readonly MAX_AHEAD_MS = 2;
 
+    /** NT's default clock-interrupt interval. A process that never calls timeBeginPeriod
+     *  sees Sleep/wait timeouts rounded to it. */
+    static readonly DEFAULT_TIMER_RESOLUTION_MS = 15.625;
+    private _timerResolutionMs = TimeService.DEFAULT_TIMER_RESOLUTION_MS;
+
+    /** Effective timer resolution: the finest period requested via timeBeginPeriod, else
+     *  the NT default. Bounds how long the CPU may run before a due timer is noticed. */
+    get timerResolutionMs(): number { return this._timerResolutionMs; }
+    setTimerResolutionMs(ms: number | null): void {
+        this._timerResolutionMs = ms !== null && ms > 0 ? ms : TimeService.DEFAULT_TIMER_RESOLUTION_MS;
+    }
+
     nowMs(): number {
         let currentMs: number;
         if (this.mode === "manual") {

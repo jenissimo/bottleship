@@ -3,6 +3,8 @@
  * Versioned or wrapper DLL names map to a single HLE module.
  */
 
+import { APISET_SCHEMA } from "./apiset-schema.generated";
+
 const STATIC_ALIASES: Record<string, string> = {
     xdd: "ddraw",
     ddraw32: "ddraw",
@@ -90,7 +92,24 @@ export function resolveThunkedDllAlias(name: string): string {
         return "msvcp90";
     }
 
+    const apiSetHost = resolveApiSetHost(base);
+    if (apiSetHost) return resolveThunkedDllAlias(apiSetHost);
+
     return base;
+}
+
+/**
+ * The host DLL an api-set contract (api-ms-win-*, ext-ms-win-*) resolves to, or undefined.
+ *
+ * The loader never maps a contract as a file: it looks the name up in the ApiSetSchema,
+ * ignoring the last version component, and hands back the HOST's module. So
+ * LoadLibrary("api-ms-win-core-synch-l1-2-0") returns kernelbase's HMODULE, and
+ * GetProcAddress on it sees exactly kernelbase's exports.
+ */
+export function resolveApiSetHost(name: string): string | undefined {
+    const base = normalizeDllBaseName(name);
+    if (!base.startsWith("api-ms-") && !base.startsWith("ext-ms-")) return undefined;
+    return APISET_SCHEMA[base.replace(/-\d+$/, "")];
 }
 
 /**

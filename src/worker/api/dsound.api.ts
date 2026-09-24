@@ -97,6 +97,17 @@ export const IDirectSoundCapture: InterfaceDescriptor = {
     ],
 };
 
+/** IDirectSoundFullDuplex (IID_IDirectSoundFullDuplex8 is the same IID). */
+export const IDirectSoundFullDuplex: InterfaceDescriptor = {
+    name: "IDirectSoundFullDuplex",
+    inherits: "IUnknown",
+    iid: "EDCB4C7A-DAAB-4216-A42E-6C50596DDC1D",
+    methods: [
+        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        makeMethod("Initialize", 9),
+    ],
+};
+
 const captureBufferMethodSpecs = [
     { name: "GetCaps", args: 2 },
     { name: "GetCurrentPosition", args: 3 },
@@ -222,6 +233,35 @@ export const dsoundModule: ModuleDescriptor = {
             callingConvention: "stdcall",
         },
         {
+            name: "DirectSoundCaptureCreate8",
+            ordinal: 12,
+            params: [
+                { name: "lpcGuidDevice", type: "ptr", optional: true },
+                { name: "ppDSC8", type: "ptr", direction: "out" },
+                { name: "pUnkOuter", type: "ptr", optional: true },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+        {
+            name: "DirectSoundFullDuplexCreate",
+            ordinal: 10,
+            params: [
+                { name: "pcGuidCaptureDevice", type: "ptr", optional: true },
+                { name: "pcGuidRenderDevice", type: "ptr", optional: true },
+                { name: "pcDSCBufferDesc", type: "ptr" },
+                { name: "pcDSBufferDesc", type: "ptr" },
+                { name: "hWnd", type: "u32" },
+                { name: "dwLevel", type: "u32" },
+                { name: "ppDSFD", type: "ptr", direction: "out" },
+                { name: "ppDSCBuffer8", type: "ptr", direction: "out" },
+                { name: "ppDSBuffer8", type: "ptr", direction: "out" },
+                { name: "pUnkOuter", type: "ptr", optional: true },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+        {
             name: "DirectSoundEnumerateA",
             ordinal: 2, // ord_2 in dsound.dll
             params: [
@@ -278,6 +318,7 @@ export const dsoundModule: ModuleDescriptor = {
         IDirectSoundNotify,
         IDirectSoundCapture,
         IDirectSoundCaptureBuffer8,
+        IDirectSoundFullDuplex,
         IDirectSound3DListener,
         IDirectSound3DBuffer,
     ],

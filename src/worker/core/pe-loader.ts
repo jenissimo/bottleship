@@ -29,6 +29,7 @@ import { serializeMbwcStubTable, writeMbwcStubDestLimit } from '../modules/kerne
 import { loadDiagnostics } from './diagnostics/load-diagnostics';
 import { writeGuestCode, invalidateGuestCode } from './memory/guest-code';
 import { resolveImportBinding, isD3dx9VersionedDll } from './pe-import-binding';
+import { dllSearchDirectories } from './dll-search-order';
 
 export interface LoadedModule {
     baseAddress: number;
@@ -639,7 +640,7 @@ export class PELoader {
      * loaded", and only the "path" case actually reads a file. Keeping the decision in one
      * place is what stops the sync predicate and the loader drifting apart.
      */
-    private resolveLoadTarget(dllName: string):
+    private resolveLoadTarget(dllName: string, loadFlags = 0):
         | { kind: "none" }
         | { kind: "existing"; module: LoadedPEModule }
         | { kind: "path"; path: string; nameLower: string } {
@@ -674,7 +675,7 @@ export class PELoader {
         }
 
         // Find DLL in VFS
-        const dllPath = this.findDllPath(dllNameLower);
+        const dllPath = this.findDllPath(dllNameLower, loadFlags);
         if (!dllPath) return { kind: "none" };
         return { kind: "path", path: dllPath, nameLower: dllNameLower };
     }
@@ -684,17 +685,17 @@ export class PELoader {
      * already-loaded module, or "io" — a file must actually be read. Only the last case
      * has to park the guest thread, so LoadLibrary* asks this first.
      */
-    peekLoadDll(dllName: string):
+    peekLoadDll(dllName: string, loadFlags = 0):
         | { kind: "none" }
         | { kind: "existing"; module: LoadedPEModule }
         | { kind: "io" } {
-        const target = this.resolveLoadTarget(dllName);
+        const target = this.resolveLoadTarget(dllName, loadFlags);
         return target.kind === "path" ? { kind: "io" } : target;
     }
 
     /** Load a real DLL from VFS. Returns the module, or null if it is not there. */
-    async loadDll(dllName: string, invokeDllMain: boolean = true): Promise<LoadedPEModule | null> {
-        const target = this.resolveLoadTarget(dllName);
+    async loadDll(dllName: string, invokeDllMain: boolean = true, loadFlags = 0): Promise<LoadedPEModule | null> {
+        const target = this.resolveLoadTarget(dllName, loadFlags);
         if (target.kind === "none") return null;
         if (target.kind === "existing") return target.module;
         if (!this.vfs || !this.moduleRegistry) return null;
@@ -1247,7 +1248,7 @@ export class PELoader {
     /** VFS path of a DLL by the Windows search order, or null. Public because HLE
      *  modules that shadow a shipped DLL still need the file (e.g. to read its
      *  version resource and match that build's ABI). */
-    findDllPath(dllName: string): string | null {
+    findDllPath(dllName: string, loadFlags = 0): string | null {
         if (!this.vfs) return null;
 
         const dllNameLower = dllName.toLowerCase();
@@ -1285,34 +1286,13 @@ export class PELoader {
         const lastSlash = exePath.lastIndexOf('\\');
         const appDir = lastSlash > 2 ? exePath.slice(0, lastSlash + 1) : 'C:\\';
 
-        // Search order (real Windows default DLL search order, without SafeDllSearchMode):
-        // 1. Application directory (same directory as the EXE) - highest priority
-        // 2. Current directory (SetCurrentDirectoryA scope — games commonly cd into a
-        //    driver/plugin subfolder, then LoadLibraryA a bare filename expecting it to
-        //    resolve there, e.g. Max Payne's e2driver\*_driver_mfc.dll)
-        // 3. Root directory (C:\)
-        // 4. Windows system directories
-        const currentDir = this.vfs.currentDir;
-
-        const searchPaths = [
-            `${appDir}${dllFileName}`,
-        ];
-
-        // Only add current directory if it's different from appDir
-        if (currentDir.toLowerCase() !== appDir.toLowerCase()) {
-            searchPaths.push(`${currentDir}${dllFileName}`);
-        }
-
-        // Only add C:\ root if it's different from appDir and currentDir
-        if (appDir.toLowerCase() !== 'c:\\' && currentDir.toLowerCase() !== 'c:\\') {
-            searchPaths.push(`C:\\${dllFileName}`);
-        }
-
-        searchPaths.push(
-            `C:\\WINDOWS\\SYSTEM32\\${dllFileName}`,
-            `C:\\WINDOWS\\SYSTEM\\${dllFileName}`,
-            `C:\\WINDOWS\\${dllFileName}`,
-        );
+        // Current-directory slot: games commonly cd into a driver/plugin subfolder and then
+        // LoadLibrary a bare name expecting it to resolve there (Max Payne's
+        // e2driver\*_driver_mfc.dll). SetDllDirectory / LOAD_LIBRARY_SEARCH_* reshape the
+        // list — see dll-search-order.ts.
+        const searchPaths = dllSearchDirectories({
+            appDir, currentDir: this.vfs.currentDir, loadFlags,
+        }).map((dir) => `${dir}${dllFileName}`);
 
         Logger.verbose(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): searching in ${searchPaths.join(', ')}`);
 

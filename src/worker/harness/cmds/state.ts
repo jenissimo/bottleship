@@ -312,6 +312,24 @@ export function registerStateCommands(svc: HarnessService): void {
      * getProcMisses() — GetProcAddress lookups that returned NULL (ERROR_PROC_NOT_FOUND),
      * deduped with hit count + guest caller. Shorthand for report().getProcMisses.
      */
+    /**
+     * getProcStubbed() — GetProcAddress lookups answered with an UNIMPLEMENTED or silent stub,
+     * in full (report() keeps only the top 12). This is the list that reads as success to the
+     * caller: a runtime feature probe (UCRT/msvcp140 winapi thunks, SDL's SetThreadDescription)
+     * gets a callable address, so it uses it instead of falling back.
+     */
+    svc.register("getProcStubbed", () => {
+        return getProcAddressRegistry.unsatisfied()
+            .filter((h) => h.kind !== "null")
+            .map((h) => ({
+                module: h.dll ?? "0x" + h.hModule.toString(16),
+                proc: h.procName,
+                kind: h.kind,
+                count: h.count,
+                lastCallerSym: symbolize(h.lastCaller),
+            }));
+    });
+
     svc.register("getProcMisses", () => {
         return getProcAddressRegistry.misses().map((h) => ({
             module: "0x" + h.hModule.toString(16),

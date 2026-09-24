@@ -398,6 +398,16 @@ export class PreemptionManager {
         this.setCycleLimit(Math.max(1, insns | 0));
     }
 
+    /** Shorten the NEXT slice to at most `insns` so the tick boundary that polls timers
+     *  lands when the earliest one is due. Never lengthens a slice, and leaves an urgent
+     *  exit (limit 0) alone. */
+    capSliceForTimerDeadline(insns: number): void {
+        if (!this.initialized || insns <= 0) return;
+        const current = this.getCycleLimit();
+        if (current <= 0 || insns >= current) return;
+        this.setCycleLimit(insns >>> 0);
+    }
+
     /** Read back the live cycle-limit slot (diagnostic). -1 if unavailable. A RUNNING
      *  thread observed with cycle_limit===0 means a per-tick prepareForExecution restore
      *  was missed after an async-park requestImmediateExit → v86 retires 0 instructions

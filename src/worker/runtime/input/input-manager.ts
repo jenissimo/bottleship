@@ -6,7 +6,7 @@
 import { WindowManager } from '../windowing/window-manager';
 import type { WindowObject } from '../windowing/window-manager';
 import { Logger, LogCategory } from '../../core/logger';
-import { getAbsoluteWindowPosition, clampToCursorClip, getWindowByHandle } from '../../modules/user32/shared-state';
+import { getAbsoluteWindowPosition, clampToCursorClip, getWindowByHandle, getDoubleClickTimeMs } from '../../modules/user32/shared-state';
 import { vkToDik } from '../../modules/dinput/dinput-vk-dik';
 import { TimeService } from '../time';
 import { markJoystickInputLost } from '../../modules/dinput/device-presence';
@@ -269,7 +269,6 @@ function typematicNowMs(): number {
 }
 
 // Double-click detection thresholds
-const DBLCLK_TIME_MS = 500;
 const DBLCLK_DIST_PX = 4;
 
 // Default WM_MOUSEHOVER delay (matches Windows default HOVER_DEFAULT)
@@ -1054,7 +1053,7 @@ export class InputManager {
 
         const now = performance.now();
         const withinTime = this.lastDownTime[btn] !== 0
-            && now - this.lastDownTime[btn] <= DBLCLK_TIME_MS;
+            && now - this.lastDownTime[btn] <= getDoubleClickTimeMs();
         const withinRect = Math.abs(x - this.lastDownX[btn]) <= DBLCLK_DIST_PX
             && Math.abs(y - this.lastDownY[btn]) <= DBLCLK_DIST_PX;
 

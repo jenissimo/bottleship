@@ -16,6 +16,7 @@ import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
 import { windows, registerWindowDestroyObserver } from "./user32/shared-state";
 import { DragDropRegistry } from "./ole32-dragdrop";
+import { comApartments, ComApartments } from "../core/com/apartment";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -34,12 +35,6 @@ const IID_IMALLOC = "00000002-0000-0000-c000-000000000046";
 // BLOWFISH.DLL IBlockCipher::Submit_Key — stdcall, max 56-byte key (Ghidra @ 0x11002011)
 const BF_MAX_KEY_LEN = 0x38;
 
-// Thread-local storage for COM initialization state
-const comInitialized = new Map<number, boolean>(); // Thread ID -> initialized
-// Drag-and-drop is an OLE service, not merely a COM service.  In particular,
-// RegisterDragDrop must reject a CoInitialize-only apartment.
-const oleInitialized = new Set<number>();
-
 export class Ole32 implements IModule {
     name = "ole32";
     exports: Record<string, ThunkImplementation> = {};
@@ -55,7 +50,7 @@ export class Ole32 implements IModule {
     private nextClassRegistration = 0x1000;
     private messageFilter = 0;
     private dragDropRegistrations = new DragDropRegistry({
-        isOleInitialized: () => oleInitialized.has(System.getInstance().scheduler.getCurrentThreadId()),
+        isOleInitialized: () => comApartments.isOleInitialized(System.getInstance().scheduler.getCurrentThreadId()),
         isWindowValid: (hwnd) => {
             const window = windows.get(hwnd >>> 0);
             return !!window && !window.pendingDestroy;
@@ -88,10 +83,7 @@ export class Ole32 implements IModule {
             Logger.log(LogCategory.COM, `CoInitialize called: pvReserved=0x${pvReserved.toString(16)}`);
 
             const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            comInitialized.set(threadId, true);
-
-            Logger.verbose(LogCategory.COM, `CoInitialize: Thread ${threadId} initialized`);
-            return S_OK;
+            return comApartments.enter(threadId, "sta");
         };
 
         // CoInitializeEx - initialize COM library with threading model
@@ -102,22 +94,14 @@ export class Ole32 implements IModule {
             Logger.log(LogCategory.COM, `CoInitializeEx called: pvReserved=0x${pvReserved.toString(16)}, coInit=0x${coInit.toString(16)}`);
 
             const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            if (comInitialized.get(threadId)) {
-                return S_FALSE; // already initialized on this thread
-            }
-            comInitialized.set(threadId, true);
-            return S_OK;
+            return comApartments.enter(threadId, ComApartments.modelFromCoInit(coInit >>> 0));
         };
 
         // CoUninitialize - uninitialize COM library
         this.exports["CoUninitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, 'CoUninitialize called');
 
-            const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            if (comInitialized.delete(threadId)) {
-                Logger.verbose(LogCategory.COM, `CoUninitialize: Thread ${threadId} uninitialized`);
-            }
-
+            comApartments.leave(System.getInstance().scheduler.getCurrentThreadId());
             return 0; // Return 0 for void function (COM convention)
         };
 
@@ -376,18 +360,13 @@ export class Ole32 implements IModule {
         // HRESULT OleInitialize(LPVOID pvReserved)
         this.exports["OleInitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, `OleInitialize called`);
-            const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            comInitialized.set(threadId, true);
-            oleInitialized.add(threadId);
-            return S_OK;
+            return comApartments.enterOle(System.getInstance().scheduler.getCurrentThreadId());
         };
 
         // void OleUninitialize()
         this.exports["OleUninitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, `OleUninitialize called`);
-            const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            comInitialized.delete(threadId);
-            oleInitialized.delete(threadId);
+            comApartments.leaveOle(System.getInstance().scheduler.getCurrentThreadId());
             return 0;
         };
 
@@ -1372,8 +1351,7 @@ export class Ole32 implements IModule {
      * THUNK_CODE. Stubs are regenerated in recreateVTables() after the new layout exists.
      */
     reset(): void {
-        comInitialized.clear();
-        oleInitialized.clear();
+        comApartments.reset();
         this.dragDropRegistrations.reset();
         this.objectAddressMap.clear();
         this.classRegistrations.clear();

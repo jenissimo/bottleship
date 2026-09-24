@@ -8,6 +8,8 @@ import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import {
     makeWsaStartup,
+    makeWsaCleanup,
+    wsaStartupCount,
     WsaSocketTable,
     makeSocketExports,
     inetAddr,
@@ -71,7 +73,8 @@ export class Wsock32 implements IModule {
         };
 
         this.exports["WSAStartup"] = startup;
-        this.exports["WSACleanup"] = ok;
+        const cleanup = makeWsaCleanup(wsaStartupCount, setError);
+        this.exports["WSACleanup"] = cleanup;
         this.exports["WSAGetLastError"] = getLastError;
         this.exports["WSASetLastError"] = setLastError;
         Object.assign(this.exports, socketExports);
@@ -157,11 +160,12 @@ export class Wsock32 implements IModule {
         this.exports["ord_113"] = ok;      // WSACancelBlockingCall
         this.exports["ord_114"] = ok;      // WSAIsBlocking
         this.exports["ord_115"] = startup; // WSAStartup
-        this.exports["ord_116"] = ok;      // WSACleanup
+        this.exports["ord_116"] = cleanup; // WSACleanup
         this.exports["ord_151"] = fdIsSet; // __WSAFDIsSet
     }
 
     reset(): void {
         this.socketTable.reset();
+        wsaStartupCount.reset();
     }
 }

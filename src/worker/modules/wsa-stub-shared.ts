@@ -971,6 +971,90 @@ export const WSAENOTCONN = 10057;
 export const WSAEWOULDBLOCK = 10035;
 export const WSAEFAULT = 10014;
 export const WSAENOBUFS = 10055;
+export const WSAEINVAL = 10022;
+export const WSAEPROTONOSUPPORT = 10043;
+export const WSAESOCKTNOSUPPORT = 10044;
+export const WSAEAFNOSUPPORT = 10047;
+export const WSAVERNOTSUPPORTED = 10092;
+export const WSANOTINITIALISED = 10093;
+
+/**
+ * The process's WSAStartup count. wsock32 forwards to ws2_32 on Windows, so a startup made
+ * through either DLL is one count, and the last WSACleanup through either ends it.
+ */
+export class WsaStartupCount {
+    private count = 0;
+
+    get started(): boolean {
+        return this.count > 0;
+    }
+
+    startup(): void {
+        this.count++;
+    }
+
+    /** WSACleanup: false (WSANOTINITIALISED) when there is no startup left to undo. */
+    cleanup(): boolean {
+        if (this.count === 0) return false;
+        this.count--;
+        return true;
+    }
+
+    reset(): void {
+        this.count = 0;
+    }
+}
+
+export const wsaStartupCount = new WsaStartupCount();
+
+/** WSACleanup against a startup count, with Winsock's error reporting. */
+export function makeWsaCleanup(
+    counter: WsaStartupCount,
+    setLastError: (code: number) => void,
+): ThunkImplementation {
+    return () => {
+        if (!counter.cleanup()) {
+            setLastError(WSANOTINITIALISED);
+            return SOCKET_ERROR;
+        }
+        return 0;
+    };
+}
+
+const AF_IPX = 6;
+const AF_INET6 = 23;
+const AF_BTH = 32;
+const SOCK_RAW = 3;
+const SOCK_SEQPACKET = 5;
+
+/** The provider catalog (Wine ws2_32 supported_protocols): family, type, protocol range. */
+const PROTOCOL_CATALOG: ReadonlyArray<{ af: number; type: number; protocol: number; maxOffset: number }> = [
+    { af: AF_INET, type: SOCK_STREAM, protocol: IPPROTO_TCP, maxOffset: 0 },
+    { af: AF_INET, type: SOCK_DGRAM, protocol: IPPROTO_UDP, maxOffset: 0 },
+    { af: AF_INET, type: SOCK_RAW, protocol: 0, maxOffset: 255 },
+    { af: AF_INET6, type: SOCK_STREAM, protocol: IPPROTO_TCP, maxOffset: 0 },
+    { af: AF_INET6, type: SOCK_DGRAM, protocol: IPPROTO_UDP, maxOffset: 0 },
+    { af: AF_IPX, type: SOCK_DGRAM, protocol: 1000, maxOffset: 255 },
+    { af: AF_IPX, type: SOCK_SEQPACKET, protocol: 1256, maxOffset: 0 },
+    { af: AF_IPX, type: SOCK_SEQPACKET, protocol: 1257, maxOffset: 0 },
+    { af: AF_BTH, type: SOCK_STREAM, protocol: 3, maxOffset: 0 },
+];
+
+/**
+ * socket()/WSASocket() argument check against the catalog: 0 when some provider serves
+ * (af, type, protocol) — a zero type or protocol matches any — else the WSA error naming
+ * the first coordinate no provider accepts.
+ */
+export function validateSocketTriple(af: number, type: number, protocol: number): number {
+    if (af === AF_UNSPEC && protocol === 0) return WSAEINVAL;
+    const byFamily = PROTOCOL_CATALOG.filter((e) => af === AF_UNSPEC || e.af === af);
+    if (byFamily.length === 0) return WSAEAFNOSUPPORT;
+    const byType = byFamily.filter((e) => type === 0 || e.type === type);
+    if (byType.length === 0) return WSAESOCKTNOSUPPORT;
+    const served = byType.some((e) => protocol === 0 ||
+        (protocol >= e.protocol && protocol <= e.protocol + e.maxOffset));
+    return served ? 0 : WSAEPROTONOSUPPORT;
+}
 
 interface StubSocket {
     connected: boolean;
@@ -1086,7 +1170,23 @@ export class WsaSocketTable {
 export function makeSocketExports(
     table: WsaSocketTable,
     setLastError: (code: number) => void,
+    counter: WsaStartupCount = wsaStartupCount,
 ): Record<string, ThunkImplementation> {
+    /** socket(af, type, protocol) and WSASocketA without a protocol-info override. */
+    const createSocket = (af: number, type: number, protocol: number): number => {
+        if (!counter.started) {
+            setLastError(WSANOTINITIALISED);
+            return INVALID_SOCKET;
+        }
+        const err = validateSocketTriple(af, type, protocol);
+        if (err) {
+            setLastError(err);
+            return INVALID_SOCKET;
+        }
+        const id = table.socket();
+        setLastError(0);
+        return id;
+    };
     const requireSocket = (s: number): boolean => {
         if (!table.isValid(s)) {
             setLastError(WSAENOTSOCK);
@@ -1096,11 +1196,7 @@ export function makeSocketExports(
     };
 
     return {
-        socket: () => {
-            const id = table.socket();
-            setLastError(0);
-            return id;
-        },
+        socket: (_ctx, _mem, args) => createSocket(args[0] | 0, args[1] | 0, args[2] | 0),
         closesocket: (_ctx, _mem, args) => {
             const s = args[0] >>> 0;
             const ret = table.closesocket(s);
@@ -1293,31 +1389,40 @@ export function makeSocketExports(
             setLastError(0);
             return 0;
         },
-        WSASocketA: () => {
-            const id = table.socket();
-            setLastError(0);
-            return id;
+        // WSASocketA(af, type, protocol, lpProtocolInfo, g, dwFlags). A protocol-info block
+        // supplies the triple itself; its provider is taken as given.
+        WSASocketA: (_ctx, _mem, args) => {
+            if ((args[3] >>> 0) !== 0) {
+                if (!counter.started) {
+                    setLastError(WSANOTINITIALISED);
+                    return INVALID_SOCKET;
+                }
+                const id = table.socket();
+                setLastError(0);
+                return id;
+            }
+            return createSocket(args[0] | 0, args[1] | 0, args[2] | 0);
         },
     };
 }
 
+/**
+ * WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData). The error is the RETURN value —
+ * there is no Winsock yet to hold a last error — and only a successful call is counted.
+ */
 export function makeWsaStartup(
     setLastError: (code: number) => void,
     wsaeFault: number,
-    socketError: number,
+    _socketError: number,
+    counter: WsaStartupCount = wsaStartupCount,
 ): ThunkImplementation {
     return (_ctx, mem, args) => {
-        // stdcall: WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData)
         const wVersionRequested = args[0] ?? 0;
         const lpWSAData = args[1] >>> 0;
-        if (!lpWSAData) {
-            setLastError(wsaeFault);
-            return socketError;
-        }
-        if (!writeWsaData(lpWSAData, wVersionRequested, mem)) {
-            setLastError(wsaeFault);
-            return socketError;
-        }
+        if (lpWSAData && !writeWsaData(lpWSAData, wVersionRequested, mem)) return wsaeFault;
+        if ((wVersionRequested & 0xff) === 0) return WSAVERNOTSUPPORTED;
+        if (!lpWSAData) return wsaeFault;
+        counter.startup();
         setLastError(0);
         return 0;
     };

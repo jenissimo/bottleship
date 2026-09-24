@@ -14,6 +14,8 @@ import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { invalidateWindow } from './paint-region';
 import { repaintDialogOverlayIfVisible } from './dialog-paint';
 import { applyComboBoxClosedHeight } from './controls';
+import { USER_DEFAULT_SCREEN_DPI } from './monitor';
+import { systemMetricForDpi, SM_CXFRAME_INDEX, SM_CYCAPTION_INDEX, SM_CYMENU_INDEX } from './dpi-metrics';
 
 /** Callbacks back into window.ts (avoids an import cycle). */
 export interface WindowGeometryHost {
@@ -117,7 +119,10 @@ function writeRectChecked(
     return true;
 }
 
-function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, bMenu: number, dwExStyle: number): number {
+export function adjustWindowRectCore(
+    mem: Uint8Array, lpRect: number, dwStyle: number, bMenu: number, dwExStyle: number,
+    dpi: number = USER_DEFAULT_SCREEN_DPI,
+): number {
     if (!lpRect || lpRect + 16 > mem.length) return 0;
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -142,9 +147,14 @@ function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, 
         return 1;
     }
 
-    const borderWidth = (dwStyle & WS_THICKFRAME) ? 4 : ((dwStyle & WS_BORDER) ? 1 : 0);
-    const captionHeight = (dwStyle & WS_CAPTION) ? 23 : 0;
-    const menuHeight = bMenu ? 19 : 0;
+    // Only the SPI-derived parts (sizing frame, caption, menu bar) follow the DPI; the
+    // 1px border and the 3D edges do not (win32u adjust_window_rect). At 96 DPI the
+    // deltas are zero and this is AdjustWindowRectEx exactly.
+    const at = (index: number): number =>
+        (systemMetricForDpi(index, dpi) ?? 0) - (systemMetricForDpi(index, USER_DEFAULT_SCREEN_DPI) ?? 0);
+    const borderWidth = (dwStyle & WS_THICKFRAME) ? 4 + at(SM_CXFRAME_INDEX) : ((dwStyle & WS_BORDER) ? 1 : 0);
+    const captionHeight = (dwStyle & WS_CAPTION) ? 23 + at(SM_CYCAPTION_INDEX) : 0;
+    const menuHeight = bMenu ? 19 + at(SM_CYMENU_INDEX) : 0;
     const exBorder =
         ((dwExStyle & WS_EX_CLIENTEDGE) ? 2 : 0) +
         ((dwExStyle & WS_EX_WINDOWEDGE) ? 1 : 0) +

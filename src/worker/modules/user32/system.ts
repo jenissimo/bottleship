@@ -23,6 +23,10 @@ import {
     openClipboard as openClipboardState,
     closeClipboard as closeClipboardState,
     emptyClipboard as emptyClipboardState,
+    setClipboardFormatData,
+    getClipboardSequenceNumber,
+    getDoubleClickTimeMs,
+    setDoubleClickTimeMs,
     setCapture as setCaptureState,
     releaseCapture as releaseCaptureState,
     getCapture as getCaptureState,
@@ -39,6 +43,8 @@ import * as Classic from './classic-theme';
 import { getSystemCursorHandle } from './system-cursors';
 import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
 import { invokeWindowMessageSync } from './message';
+import { PRIMARY_HMONITOR, monitorFromRect, monitorFallback } from './monitor';
+import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 
 // wsprintf's output buffer: reused across calls (hot path, thousands per frame) and
 // sized to the API's own 1024 code-unit budget including the terminator.
@@ -334,10 +340,68 @@ function writeLogFont(
     }
 }
 
+const DEFAULT_DISPLAY_REFRESH_RATE = 60;
+export type DisplayMode = { width: number; height: number; bpp: number; refreshRate: number };
+
+export const normalizeRefreshRate = (refreshRate: number | undefined): number => {
+    const hz = Number(refreshRate);
+    return Number.isFinite(hz) && hz > 0 ? Math.trunc(hz) : DEFAULT_DISPLAY_REFRESH_RATE;
+};
+
+/** The current mode of the one emulated display — what EnumDisplaySettings(ENUM_CURRENT_SETTINGS),
+ *  SM_CXSCREEN and the display-config paths all report. */
+export const getCurrentScreenMode = (): DisplayMode => {
+    const system = System.getInstance();
+    // System.requestHostResize is the single publisher of the emulated mode, so it is
+    // right even for a title that never creates a DDraw context; ddrawContext.display
+    // is the same value for DDraw titles and stays as the fallback for anything that
+    // sets it directly.
+    const mode = system.emulatedDisplayMode;
+    const ddraw = system.ddrawContext;
+    const cfg = EmulatorConfig.getInstance().screenResolution;
+    const screen = getVirtualScreenRect();
+    return {
+        width: screen.right,
+        height: screen.bottom,
+        bpp: mode?.bpp || ddraw?.display?.bpp || cfg.bpp || 16,
+        refreshRate: normalizeRefreshRate(mode?.refreshRate || ddraw?.display?.refresh || cfg.refreshRate),
+    };
+};
+
+/** The mode list EnumDisplaySettings enumerates. */
+export const getDisplayModes = (): DisplayMode[] => {
+    const configuredModes = EmulatorConfig.getInstance().supportedResolutions;
+    if (!configuredModes || configuredModes.length === 0) {
+        return [
+            { width: 640, height: 480, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 640, height: 480, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 800, height: 600, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 800, height: 600, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1024, height: 768, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1024, height: 768, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1152, height: 864, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1152, height: 864, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 960, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 960, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 1024, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 1024, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1600, height: 1200, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1600, height: 1200, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 720, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1920, height: 1080, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+        ];
+    }
+    return configuredModes.map((mode) => ({
+        width: mode.width,
+        height: mode.height,
+        bpp: mode.bpp,
+        refreshRate: normalizeRefreshRate(mode.refreshRate),
+    }));
+};
+
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     let mouseButtonsSwapped = false;
-    let doubleClickTimeMs = 500;
     const registeredClipboardFormats = new Map<string, number>();
     let nextRegisteredClipboardFormat = 0xC000;
 
@@ -429,32 +493,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     const SM_REMOTESESSION = 0x1000;
     const SM_SHUTTINGDOWN = 0x2000;
     const SM_REMOTECONTROL = 0x2001;
+    const SM_DIGITIZER = 94;
+    const SM_MAXIMUMTOUCHES = 95;
 
-    const DEFAULT_DISPLAY_REFRESH_RATE = 60;
-    type DisplayMode = { width: number; height: number; bpp: number; refreshRate: number };
-
-    const normalizeRefreshRate = (refreshRate: number | undefined): number => {
-        const hz = Number(refreshRate);
-        return Number.isFinite(hz) && hz > 0 ? Math.trunc(hz) : DEFAULT_DISPLAY_REFRESH_RATE;
-    };
-
-    const getCurrentScreenMode = (): DisplayMode => {
-        const system = System.getInstance();
-        // System.requestHostResize is the single publisher of the emulated mode, so it is
-        // right even for a title that never creates a DDraw context; ddrawContext.display
-        // is the same value for DDraw titles and stays as the fallback for anything that
-        // sets it directly.
-        const mode = system.emulatedDisplayMode;
-        const ddraw = system.ddrawContext;
-        const cfg = EmulatorConfig.getInstance().screenResolution;
-        const screen = getVirtualScreenRect();
-        return {
-            width: screen.right,
-            height: screen.bottom,
-            bpp: mode?.bpp || ddraw?.display?.bpp || cfg.bpp || 16,
-            refreshRate: normalizeRefreshRate(mode?.refreshRate || ddraw?.display?.refresh || cfg.refreshRate),
-        };
-    };
 
     exports['GetSystemMetrics'] = (ctx, mem, args) => {
         const nIndex = args[0];
@@ -564,6 +605,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             // Nothing publishes a horizontal wheel and no WM_MOUSEHWHEEL is dispatched.
             case SM_MOUSEHORIZONTALWHEELPRESENT: return 0;
             case SM_CXPADDEDBORDER: return 0;    // Classic frame has no padded border
+            // No touch or pen digitizer: RegisterTouchWindow succeeds, but no WM_TOUCH comes.
+            case SM_DIGITIZER:      return 0;
+            case SM_MAXIMUMTOUCHES: return 0;
             case SM_REMOTESESSION:  return 0;
             case SM_SHUTTINGDOWN:   return 0;
             case SM_REMOTECONTROL:  return 0;
@@ -675,9 +719,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const KEYEVENTF_KEYUP = 0x0002;
         const msg = (dwFlags & KEYEVENTF_KEYUP) !== 0 ? 0x0101 : 0x0100; // WM_KEYUP/WM_KEYDOWN
         const lParam = 1 | (bScan << 16);
+        const dwExtraInfo = args[3] >>> 0;
         const hwnd = System.getInstance().windowManager.getInputTargetWindow()?.hwnd ?? 0;
         if (hwnd) {
-            System.getInstance().windowManager.postMessage(hwnd, msg, bVk, lParam);
+            System.getInstance().windowManager.postMessage(hwnd, msg, bVk, lParam, 0, 0, 0, undefined, dwExtraInfo);
         }
         return 0;
     };
@@ -687,6 +732,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const dx = args[1] | 0;
         const dy = args[2] | 0;
         const dwData = args[3] >>> 0;
+        const dwExtraInfo = args[4] >>> 0;
 
         const MOUSEEVENTF_MOVE = 0x0001;
         const MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -728,7 +774,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
         const pos = inputManager.getMouseState();
         const lParam = ((pos.y & 0xffff) << 16) | (pos.x & 0xffff);
-        const post = (msg: number, wParam = 0) => wm.postMessage(hwnd, msg, wParam, lParam);
+        const post = (msg: number, wParam = 0) =>
+            wm.postMessage(hwnd, msg, wParam, lParam, 0, 0, 0, undefined, dwExtraInfo);
 
         if (dwFlags & MOUSEEVENTF_LEFTDOWN) post(0x0201, 0x0001);
         if (dwFlags & MOUSEEVENTF_LEFTUP) post(0x0202, 0);
@@ -941,7 +988,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['LoadCursorFromFileA'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, false);
     exports['LoadCursorFromFileW'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, true);
 
-    let nextIconHandle = 0x200;
+    const FIRST_LOADICON_HANDLE = 0x200;
+    let nextIconHandle = FIRST_LOADICON_HANDLE;
 
     const loadIconCommon = (mem: Uint8Array, hInstance: number, lpIconName: number, isWide: boolean): number => {
         if (!lpIconName) {
@@ -1636,11 +1684,21 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return handle;
     };
 
+    // LR_SHARED icons and cursors outlive DestroyIcon/DestroyCursor (they die with the process).
+    const LR_SHARED = 0x8000;
+    const markSharedImage = (handle: number, fuLoad: number): number => {
+        if (handle && (fuLoad & LR_SHARED) !== 0) {
+            const obj = System.getInstance().resourceProvider.getUserObject(handle);
+            if (obj && (obj.type === 'ICON' || obj.type === 'CURSOR')) obj.shared = true;
+        }
+        return handle;
+    };
+
     // LoadImageA - load image, cursor, or icon
-    exports["LoadImageA"] = async (ctx, mem, args) => loadImageCommon(ctx, mem, args, false);
+    exports["LoadImageA"] = async (ctx, mem, args) => markSharedImage(await loadImageCommon(ctx, mem, args, false), args[5] >>> 0);
 
     // LoadImageW - load image, cursor, or icon (wide)
-    exports["LoadImageW"] = async (ctx, mem, args) => loadImageCommon(ctx, mem, args, true);
+    exports["LoadImageW"] = async (ctx, mem, args) => markSharedImage(await loadImageCommon(ctx, mem, args, true), args[5] >>> 0);
 
     // SetCursor - set cursor shape
     exports['SetCursor'] = (ctx, mem, args) => {
@@ -1778,7 +1836,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                 for (let i = 0; i < 3; i++) mouseAccel[i] = v.getInt32(pvParam + i * 4, true);
                 return 1;
             case SPI_SETDOUBLECLICKTIME:
-                doubleClickTimeMs = uiParam || 500;
+                setDoubleClickTimeMs(uiParam);
                 return 1;
             case SPI_SETMOUSEBUTTONSWAP:
                 mouseButtonsSwapped = uiParam !== 0;
@@ -2252,17 +2310,12 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 1;
     };
 
-    // Bumped on every clipboard content change (EmptyClipboard/SetClipboardData),
-    // mirroring the real counter's "changed since last check" contract.
-    let clipboardSequence = 1;
-
     exports['EmptyClipboard'] = (ctx, mem, args) => {
         if (!isClipboardOpen()) {
             System.getInstance().scheduler.setLastError(1418); // ERROR_CLIPBOARD_NOT_OPEN
             return 0;
         }
         emptyClipboardState();
-        clipboardSequence++;
         System.getInstance().scheduler.setLastError(0);
         return 1;
     };
@@ -2276,13 +2329,12 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        clipboardDataByFormat.set(uFormat, hMem);
-        clipboardSequence++;
+        setClipboardFormatData(uFormat, hMem);
         System.getInstance().scheduler.setLastError(0);
         return hMem;
     };
 
-    exports['GetClipboardSequenceNumber'] = () => clipboardSequence;
+    exports['GetClipboardSequenceNumber'] = () => getClipboardSequenceNumber();
 
     exports['GetClipboardData'] = (ctx, mem, args) => {
         const uFormat = args[0] >>> 0;
@@ -2494,35 +2546,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         );
     };
 
-    const getDisplayModes = (): DisplayMode[] => {
-        const configuredModes = EmulatorConfig.getInstance().supportedResolutions;
-        if (!configuredModes || configuredModes.length === 0) {
-            return [
-                { width: 640, height: 480, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 640, height: 480, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 800, height: 600, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 800, height: 600, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1024, height: 768, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1024, height: 768, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1152, height: 864, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1152, height: 864, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 960, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 960, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 1024, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 1024, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1600, height: 1200, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1600, height: 1200, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 720, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1920, height: 1080, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-            ];
-        }
-        return configuredModes.map((mode) => ({
-            width: mode.width,
-            height: mode.height,
-            bpp: mode.bpp,
-            refreshRate: normalizeRefreshRate(mode.refreshRate),
-        }));
-    };
 
     const enumDisplaySettings = (mem: Uint8Array, args: number[], offsets: DevModeOffsets, apiName: string): number => {
         const lpszDeviceName = args[0];
@@ -2951,11 +2974,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['SetWinEventHook'] = () => 1;
     exports['NotifyWinEvent'] = () => 0;
     exports['GetCaretBlinkTime'] = () => 530;
-    exports['GetDoubleClickTime'] = () => doubleClickTimeMs;
-    exports['SetDoubleClickTime'] = (ctx, mem, args) => {
-        const interval = args[0] >>> 0;
-        if (interval < 4 || interval > 5000) return 0;
-        doubleClickTimeMs = interval;
+    exports['GetDoubleClickTime'] = () => getDoubleClickTimeMs();
+    // SetDoubleClickTime is SPI_SETDOUBLECLICKTIME: it cannot fail on a value.
+    exports['SetDoubleClickTime'] = (_ctx, _mem, args) => {
+        setDoubleClickTimeMs(args[0] >>> 0);
         return 1;
     };
     exports['EnumWindows'] = () => 1;
@@ -2995,7 +3017,25 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     // GetCursor()==NULL visibility test both need the real installed handle.
     exports['GetCursor'] = () => getCurrentCursorHandle();
     exports['DestroyCursor'] = () => 1;
-    exports['DestroyIcon'] = () => 1;
+
+    // BOOL DestroyIcon(HICON) — NtUserDestroyCursor semantics: a shared icon (LoadIcon,
+    // LR_SHARED, a system cursor) is not freed and still answers TRUE; the installed cursor
+    // is locked and answers FALSE; anything that is not an icon/cursor handle fails.
+    const ERROR_INVALID_CURSOR_HANDLE = 1402;
+    exports['DestroyIcon'] = (_ctx, _mem, args) => {
+        const hIcon = args[0] >>> 0;
+        if (hIcon >= FIRST_LOADICON_HANDLE && hIcon < nextIconHandle) return 1;
+        const provider = System.getInstance().resourceProvider;
+        const obj = hIcon ? provider.getUserObject(hIcon) : null;
+        if (!obj || (obj.type !== 'ICON' && obj.type !== 'CURSOR')) {
+            System.getInstance().scheduler?.setLastError(ERROR_INVALID_CURSOR_HANDLE);
+            return 0;
+        }
+        if (obj.shared || obj.systemCursorId !== undefined) return 1;
+        if (hIcon === getCurrentCursorHandle()) return 0;
+        provider.unregisterUserObject(hIcon);
+        return 1;
+    };
 
     // The confinement rect an app can save and restore; unconfined reads back as the
     // whole screen (wineserver seeds desktop cursor.clip with the virtual screen rect).
@@ -3030,9 +3070,33 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return hdc;
     };
 
-    exports['MonitorFromWindow'] = () => 1;
-    exports['MonitorFromPoint'] = () => 1;
-    exports['MonitorFromRect'] = () => 1;
+    // HMONITOR MonitorFromWindow(HWND, DWORD dwFlags): the monitor the window's rect
+    // intersects. An invalid window resolves like a rect on no monitor.
+    exports['MonitorFromWindow'] = (_ctx, _mem, args) => {
+        const hWnd = args[0] >>> 0;
+        const flags = args[1] >>> 0;
+        if (hWnd === DESKTOP_HWND) return PRIMARY_HMONITOR;
+        const win = hWnd ? windows.get(hWnd) : undefined;
+        if (!win) return monitorFallback(flags);
+        const { x, y } = getAbsoluteWindowPosition(win);
+        return monitorFromRect(x, y, x + win.width, y + win.height, flags);
+    };
+    // HMONITOR MonitorFromPoint(POINT pt, DWORD dwFlags) — POINT is passed by value.
+    exports['MonitorFromPoint'] = (_ctx, _mem, args) => {
+        const x = args[0] | 0;
+        const y = args[1] | 0;
+        return monitorFromRect(x, y, x + 1, y + 1, args[2] >>> 0);
+    };
+    // HMONITOR MonitorFromRect(LPCRECT lprc, DWORD dwFlags)
+    exports['MonitorFromRect'] = (_ctx, mem, args) => {
+        const lprc = args[0] >>> 0;
+        const flags = args[1] >>> 0;
+        if (!lprc || lprc + 16 > mem.length || !isValidAddress(mem, lprc, 16, 'r')) {
+            return monitorFallback(flags);
+        }
+        return monitorFromRect(Mem.readInt32(lprc) ?? 0, Mem.readInt32(lprc + 4) ?? 0,
+            Mem.readInt32(lprc + 8) ?? 0, Mem.readInt32(lprc + 12) ?? 0, flags);
+    };
 
     const writeMonitorInfo = (mem: Uint8Array, pmi: number, wide: boolean): boolean => {
         if (!pmi || pmi + 40 > mem.length) return false;
@@ -3106,7 +3170,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         callbackManager.saveSuspendedThunkContext(ctx, STACK_CLEANUP);
         const { callbackId } = callbackManager.invokeCallback(
             lpfnEnum,
-            [1, hdc, rectPtr, dwData],
+            [PRIMARY_HMONITOR, hdc, rectPtr, dwData],
             CALLBACK_CLEANUP,
             () => {
                 process!.memory.free(rectPtr);
@@ -3129,13 +3193,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         if (pdwFlags && pdwFlags + 4 <= mem.length) view.setUint32(pdwFlags, 0x2, true); // LWA_ALPHA
         return 1;
     };
-
-    exports['SetProcessDPIAware'] = () => 1;
-    exports['IsProcessDPIAware'] = () => 1;
-
-    // UINT GetDpiForSystem(VOID) — the virtual desktop is unscaled, so this must agree with
-    // the LOGPIXELSX/Y that gdi32 GetDeviceCaps reports (USER_DEFAULT_SCREEN_DPI).
-    exports['GetDpiForSystem'] = () => 96;
 
     // HDEVNOTIFY RegisterDeviceNotificationA/W(HANDLE hRecipient, LPVOID NotificationFilter, DWORD Flags)
     exports['RegisterDeviceNotificationA'] = (ctx, mem, args) =>

@@ -13,10 +13,11 @@ import { encodeAnsi } from '../../codepage-utils';
 import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { FORCE_NATIVE_PACKAGE_LOAD, isUnderSystemDirectory } from '../../../core/hle-system-catalog';
 import { findDllRule } from '../../../core/dll-rules';
+import { validLoadLibrarySearchFlags } from '../../../core/dll-search-order';
 import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, markHleModuleLoaded } from '../../../core/hle-module-images';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
 import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handle-miss-registry';
-import { SILENT_STUBS } from '../../../core/diagnostics/api-census';
+import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
 import { resolveHleExportAddress } from '../../../core/thunking/export-resolver';
 
 export const exports: Record<string, ThunkImplementation> = {};
@@ -799,6 +800,11 @@ function initModuleFunctions(): void {
         ensureProcessLocalCaches();
         pinUntrackedModules();
 
+        if (!validLoadLibrarySearchFlags(dwFlags, dllName)) {
+            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
+            return { value: 0, stackCleanup: 12 };
+        }
+
         const system = System.getInstance();
         const moduleRegistry = system.process?.moduleRegistry;
         const loader = system.process?.loader;
@@ -845,7 +851,7 @@ function initModuleFunctions(): void {
 
         // PRIORITY 3: Try to load real DLL from VFS
         if (loader) {
-            const peek = loader.peekLoadDll(dllName);
+            const peek = loader.peekLoadDll(dllName, dwFlags);
             if (peek.kind === "existing") {
                 const res = loaded(peek.module);
                 // A pending DllMain chain is only walked on the async-restore path, which
@@ -857,7 +863,7 @@ function initModuleFunctions(): void {
                 Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}"): trying to load from VFS...`);
                 return (async () => {
                     try {
-                        const module = await loader.loadDll(dllName, true);
+                        const module = await loader.loadDll(dllName, true, dwFlags);
                         if (module) return loaded(module);
                     } catch (e) {
                         Logger.warn(LogCategory.KERNEL32,
@@ -881,6 +887,11 @@ function initModuleFunctions(): void {
 
         ensureProcessLocalCaches();
         pinUntrackedModules();
+
+        if (!validLoadLibrarySearchFlags(dwFlags, dllName)) {
+            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
+            return { value: 0, stackCleanup: 12 };
+        }
 
         const system = System.getInstance();
         const moduleRegistry = system.process?.moduleRegistry;
@@ -928,7 +939,7 @@ function initModuleFunctions(): void {
 
         // PRIORITY 3: Try to load real DLL from VFS
         if (loader) {
-            const peek = loader.peekLoadDll(dllName);
+            const peek = loader.peekLoadDll(dllName, dwFlags);
             if (peek.kind === "existing") {
                 const res = loaded(peek.module);
                 // A pending DllMain chain is only walked on the async-restore path, which
@@ -940,7 +951,7 @@ function initModuleFunctions(): void {
                 Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}"): trying to load from VFS...`);
                 return (async () => {
                     try {
-                        const module = await loader.loadDll(dllName, true);
+                        const module = await loader.loadDll(dllName, true, dwFlags);
                         if (module) return loaded(module);
                     } catch (e) {
                         Logger.warn(LogCategory.KERNEL32,
@@ -1277,8 +1288,7 @@ function initModuleFunctions(): void {
             if (!info) return { kind: 'stub', dll: stub.dllName };
             // Arity 0 only condemns a handler when the export takes arguments it is
             // therefore provably ignoring — GetTickCount legitimately needs none.
-            const silent = (info.arity === 0 && info.argCount > 0)
-                || SILENT_STUBS.has(`${stub.dllName}:${stub.functionName}`);
+            const silent = isSuspectSilentStub(`${stub.dllName}:${stub.functionName}`, info.arity, info.argCount);
             return { kind: silent ? 'silent-stub' : 'hle', dll: stub.dllName };
         };
         const finish = (address: number): { value: number; stackCleanup: number } => {

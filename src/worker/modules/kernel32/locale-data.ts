@@ -1,192 +1,386 @@
-// Locale value tables and the pre-built UTF-16LE answer cache shared by every
-// GetLocaleInfoW tier: the full thunk, the JS fast path, and the trap-free inline
-// x86 stub (whose guest-RAM table is SERIALISED FROM THIS CACHE — see
-// serializeLocaleStubTable, and locale-stubs.ts for the stub that reads it). One
-// source of truth is why the stub and the JS handler cannot answer differently.
+// The single source of every locale answer: getLocaleValue(lcid, lctype), backed by the
+// compiled locale database (locale-db.ts), and the pre-built answer caches the fast
+// GetLocaleInfo tiers serve for the process locale — the JS fast path and the trap-free
+// inline x86 stub, whose guest-RAM table is SERIALISED FROM THE SAME CACHE (see
+// serializeLocaleStubTable, and locale-stubs.ts for the stub that reads it). The caches are
+// filled through localeInfo, the function the thunk answers with, so no tier can differ.
 //
-// Leaf module by design: it imports nothing but EmulatorConfig, so pe-loader can
-// pull the serialiser in without dragging the kernel32 module graph behind it.
-
-import { EmulatorConfig } from '../../core/emulator-config-manager';
-
-// US English (0409) locale data, keyed by LCTYPE.
+// The LCTYPE -> field mapping, including the derived fields (SDATE/IDATE/... parsed out of
+// the date and time pictures, the sign positions computed from ICURRENCY and INEGCURR),
+// follows kernelbase's get_locale_info.
 //
-// LCTYPE values and en-US answers are taken from winnls.h and Wine's kernelbase/locale.c
-// (the derived fields — IPOSSIGNPOSN/INEGSIGNPOSN/I*SYMPRECEDES/I*SEPBYSPACE — are what
-// that file computes from ICURRENCY=0 / INEGCURR=0). The set is deliberately COMPLETE for
-// the range the CRT walks: `setlocale()` rebuilds the whole of `lconv` from these. A type
-// we do not hold is NOT answered with an empty string — that is a wrong answer the caller
-// cannot detect (a missing SNEGATIVESIGN formats -1 as 1); it fails with
-// ERROR_INVALID_FLAGS, exactly as GetLocaleInfoW does off the end of its own switch.
-//
-// Numeric types are stored in the spelling Wine's locale_return_number PRINTS them in
-// (%04x for ILANGUAGE/IDEFAULTLANGUAGE, %03u for IDEFAULTEBCDICCODEPAGE, %u otherwise),
-// so LOCALE_RETURN_NUMBER must parse them back with localeNumericValue's per-type radix.
-const US_LOCALE_DATA: Record<number, string> = {
-    0x0001: "0409",            // ILANGUAGE
-    0x0002: "English (United States)", // SLANGUAGE
-    0x0003: "ENU",             // SABBREVLANGNAME
-    0x0004: "English",         // SNATIVELANGNAME
-    0x0005: "1",               // ICOUNTRY
-    0x0006: "United States",   // SCOUNTRY
-    0x0007: "USA",             // SABBREVCTRYNAME
-    0x0008: "United States",   // SNATIVECTRYNAME
-    0x0009: "0409",            // IDEFAULTLANGUAGE
-    0x000A: "1",               // IDEFAULTCOUNTRY
-    0x000B: "437",             // IDEFAULTCODEPAGE     (overridden by the OEM code page)
-    0x000C: ",",               // SLIST
-    0x000D: "1",               // IMEASURE             (0 = metric, 1 = US)
-    0x000E: ".",               // SDECIMAL
-    0x000F: ",",               // STHOUSAND
-    0x0010: "3;0",             // SGROUPING
-    0x0011: "2",               // IDIGITS
-    0x0012: "1",               // ILZERO
-    0x0013: "0123456789",      // SNATIVEDIGITS
-    0x0014: "$",               // SCURRENCY
-    0x0015: "USD",             // SINTLSYMBOL
-    0x0016: ".",               // SMONDECIMALSEP
-    0x0017: ",",               // SMONTHOUSANDSEP
-    0x0018: "3;0",             // SMONGROUPING
-    0x0019: "2",               // ICURRDIGITS
-    0x001A: "2",               // IINTLCURRDIGITS
-    0x001B: "0",               // ICURRENCY
-    0x001C: "0",               // INEGCURR
-    0x001D: "/",               // SDATE
-    0x001E: ":",               // STIME
-    0x001F: "M/d/yyyy",        // SSHORTDATE
-    0x0020: "dddd, MMMM dd, yyyy", // SLONGDATE
-    0x0021: "0",               // IDATE                (MDY)
-    0x0022: "0",               // ILDATE
-    0x0023: "0",               // ITIME                (12-hour)
-    0x0024: "0",               // ICENTURY
-    0x0025: "0",               // ITLZERO
-    0x0026: "0",               // IDAYLZERO
-    0x0027: "0",               // IMONLZERO
-    0x0028: "AM",              // S1159
-    0x0029: "PM",              // S2359
-    0x002A: "Monday",          // SDAYNAME1 (LCTYPE day 1 is MONDAY, not Sunday)
-    0x002B: "Tuesday",
-    0x002C: "Wednesday",
-    0x002D: "Thursday",
-    0x002E: "Friday",
-    0x002F: "Saturday",
-    0x0030: "Sunday",          // SDAYNAME7
-    0x0031: "Mon",             // SABBREVDAYNAME1
-    0x0032: "Tue",
-    0x0033: "Wed",
-    0x0034: "Thu",
-    0x0035: "Fri",
-    0x0036: "Sat",
-    0x0037: "Sun",             // SABBREVDAYNAME7
-    0x0038: "January",         // SMONTHNAME1
-    0x0039: "February",
-    0x003A: "March",
-    0x003B: "April",
-    0x003C: "May",
-    0x003D: "June",
-    0x003E: "July",
-    0x003F: "August",
-    0x0040: "September",
-    0x0041: "October",
-    0x0042: "November",
-    0x0043: "December",        // SMONTHNAME12
-    0x0044: "Jan",             // SABBREVMONTHNAME1
-    0x0045: "Feb",
-    0x0046: "Mar",
-    0x0047: "Apr",
-    0x0048: "May",
-    0x0049: "Jun",
-    0x004A: "Jul",
-    0x004B: "Aug",
-    0x004C: "Sep",
-    0x004D: "Oct",
-    0x004E: "Nov",
-    0x004F: "Dec",             // SABBREVMONTHNAME12
-    0x0050: "",                // SPOSITIVESIGN        (en-US has none)
-    0x0051: "-",               // SNEGATIVESIGN
-    0x0052: "3",               // IPOSSIGNPOSN         (from INEGCURR = 0)
-    0x0053: "0",               // INEGSIGNPOSN
-    0x0054: "1",               // IPOSSYMPRECEDES      (from ICURRENCY = 0)
-    0x0055: "0",               // IPOSSEPBYSPACE
-    0x0056: "1",               // INEGSYMPRECEDES
-    0x0057: "0",               // INEGSEPBYSPACE
-    0x0059: "en",              // SISO639LANGNAME
-    0x005A: "US",              // SISO3166CTRYNAME
-    0x1001: "English",         // SENGLANGUAGE
-    0x1002: "United States",   // SENGCOUNTRY
-    0x1003: "h:mm:ss tt",      // STIMEFORMAT
-    0x1004: "1252",            // IDEFAULTANSICODEPAGE (overridden by the ANSI code page)
-    0x1005: "0",               // ITIMEMARKPOSN
-    0x1006: "MMMM yyyy",       // SYEARMONTH
-    0x1007: "US Dollar",       // SENGCURRNAME
-    0x1008: "US Dollar",       // SNATIVECURRNAME
-    0x1009: "1",               // ICALENDARTYPE        (Gregorian)
-    0x100A: "1",               // IPAPERSIZE           (letter)
-    0x100B: "0",               // IOPTIONALCALENDAR
-    0x100C: "6",               // IFIRSTDAYOFWEEK      (0 = Monday .. 6 = Sunday)
-    0x100D: "0",               // IFIRSTWEEKOFYEAR
-    0x1010: "1",               // INEGNUMBER
-    0x1011: "10000",           // IDEFAULTMACCODEPAGE
-    0x1012: "037",             // IDEFAULTEBCDICCODEPAGE (Wine prints this one %03u)
-    0x1013: "Default",         // SSORTNAME
-    0x1014: "1",               // IDIGITSUBSTITUTION   (none)
-};
+// Kept free of the kernel32 module graph (EmulatorConfig and the locale-db/-names leaves
+// only) so pe-loader can pull the serialiser in cheaply.
 
-// Dynamic locale value lookup — overrides static table for codepage-dependent fields
-export function getLocaleValue(cleanType: number): string | undefined {
-    const config = EmulatorConfig.getInstance();
-    // LOCALE_IDEFAULTCODEPAGE (0x000B) — OEM code page
-    if (cleanType === 0x000B) return String(config.oemCodePage);
-    // LOCALE_IDEFAULTANSICODEPAGE (0x1004) — ANSI code page
-    if (cleanType === 0x1004) return String(config.ansiCodePage);
-    return US_LOCALE_DATA[cleanType];
+import { EmulatorConfig, encodeAnsiString } from '../../core/emulator-config-manager';
+import { arrayItem, arrayPresent, localeField, localeString } from './locale-db';
+import { LocaleField as F } from './locale-db-schema';
+import { DEFAULT_PSEUDO_LCIDS, type LocaleEntry, localeFromLcid, userDefaultLocale } from './locale-names';
+
+export const LOCALE_NOUSEROVERRIDE = 0x80000000;
+export const LOCALE_USE_CP_ACP = 0x40000000;
+export const LOCALE_RETURN_NUMBER = 0x20000000;
+export const LOCALE_RETURN_GENITIVE_NAMES = 0x10000000;
+/** Binary: 16 WCHARs with no terminator, returned by count, never as a string. */
+export const LOCALE_FONTSIGNATURE = 0x0058;
+export const LOCALE_SSHORTTIME = 0x0079;
+
+const CP_ACP = 0, CP_OEMCP = 1, CP_MACCP = 2, CP_UTF8 = 65001;
+
+// ---------------------------------------------------------------------------------------
+// Picture scanning (find_format) for the fields derived from SSHORTDATE / STIMEFORMAT
+// ---------------------------------------------------------------------------------------
+
+/** find_format: the first format character from `accept` at or after `from`, skipping
+ *  quoted runs and "ddd"/"dddd" (a day name is not a day field); -1 when there is none. */
+function findFormat(s: string, from: number, accept: string): number {
+    for (let i = from; i < s.length; i++) {
+        const c = s[i]!;
+        if (c === "'") {
+            i = s.indexOf("'", i + 1);
+            if (i < 0) return -1;
+        } else if (accept.includes(c)) {
+            if (c !== 'd' || s[i + 1] !== 'd' || s[i + 2] !== 'd') return i;
+            i += 2;
+            while (s[i + 1] === 'd') i++;
+        }
+    }
+    return -1;
+}
+
+/** LOCALE_SDATE / LOCALE_STIME: what separates the picture's first two fields. */
+function pictureSeparator(pic: string, accept: string): string | undefined {
+    let i = findFormat(pic, 0, accept);
+    if (i < 0) return undefined;
+    while (pic[i + 1] === pic[i]) i++;
+    const end = findFormat(pic, i + 1, accept);
+    return end < 0 ? undefined : pic.slice(i + 1, end);
+}
+
+/** IDATE / ILDATE: 0 = MDY, 1 = DMY, 2 = YMD — whichever of d/y last precedes the month. */
+function dateOrder(pic: string): number {
+    let val = 0;
+    for (let i = findFormat(pic, 0, 'dMy'); i >= 0; i = findFormat(pic, i + 1, 'dMy')) {
+        if (pic[i] === 'M') break;
+        val = pic[i] === 'y' ? 2 : 1;
+    }
+    return val;
+}
+
+/** A property of the first `accept` field of a picture, or undefined when it has none. */
+function pictureFlag(pic: string, accept: string, test: (pic: string, i: number) => boolean): number | undefined {
+    const i = findFormat(pic, 0, accept);
+    return i < 0 ? undefined : +test(pic, i);
+}
+
+const IPOSSIGNPOSN = [3, 3, 4, 2, 1, 1, 3, 4, 1, 3, 4, 2, 4, 3, 3, 1];
+const INEGSIGNPOSN = [0, 3, 4, 2, 0, 1, 3, 4, 1, 3, 4, 2, 4, 3, 0, 0];
+const INEGSYMPRECEDES = [1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 0];
+
+/** get_locale_sortname: the sort's display name is keyed by the LCID, not the locale row. */
+function sortName(lcid: number): string {
+    const primary = lcid & 0x3ff, sub = (lcid >>> 10) & 0x3f, sort = (lcid >>> 16) & 0xf;
+    switch (primary) {
+        case 0x04: // LANG_CHINESE
+            switch (sort) {
+                case 0: return (sub === 0x01 || sub === 0x03 || sub === 0x1f) ? 'Stroke Count' : 'Pronunciation';
+                case 1: return 'Unicode';
+                case 2: return 'Stroke Count';
+                case 3: return 'Bopomofo';
+                case 4: return 'Radical/Stroke';
+                case 5: return 'Surname';
+            }
+            break;
+        case 0x37: return sort === 1 ? 'Modern' : 'Traditional';               // LANG_GEORGIAN
+        case 0x07:                                                             // LANG_GERMAN
+            if (sub === 0 || sub === 1) return sort === 1 ? 'Phone Book (DIN)' : 'Dictionary';
+            break;
+        case 0x0e: if (sort === 1) return 'Technical'; break;                  // LANG_HUNGARIAN
+        case 0x7f: return sort === 0 ? 'Default' : 'Maths Alphanumerics';      // LANG_INVARIANT
+        case 0x11:                                                             // LANG_JAPANESE
+            if (sort === 1) return 'XJIS';
+            if (sort === 2) return 'Unicode';
+            if (sort === 4) return 'Radical/Stroke';
+            break;
+        case 0x12: return sort === 1 ? 'Unicode' : 'Dictionary';              // LANG_KOREAN
+        case 0x0a:                                                             // LANG_SPANISH
+            if (sub === 0 || sub === 3) return 'International';
+            if (sub === 1) return 'Traditional';
+            break;
+    }
+    return 'Default';
+}
+
+// ---------------------------------------------------------------------------------------
+// get_locale_info
+// ---------------------------------------------------------------------------------------
+
+/** A locale answer: a string, or a number for the types locale_return_number serves. */
+export type LocaleValue = string | number;
+
+/** The process (user = system) default locale, where the manifest's code pages apply. */
+function isDefaultRow(entry: LocaleEntry): boolean {
+    return entry.locale === userDefaultLocale().locale;
+}
+
+/** Month names honour LOCALE_RETURN_GENITIVE_NAMES when the locale has genitive forms. */
+function monthName(row: number, lctype: number, abbrev: boolean, idx: number): string {
+    const genitive = localeField(row, abbrev ? F.AAbbrevGenitiveMonth : F.AGenitiveMonth);
+    const arr = (lctype & LOCALE_RETURN_GENITIVE_NAMES) && arrayPresent(genitive)
+        ? genitive
+        : localeField(row, abbrev ? F.AAbbrevMonthName : F.AMonthName);
+    return arrayItem(arr, idx);
 }
 
 /**
- * The number LOCALE_RETURN_NUMBER must hand back for `value`.
- *
- * The radix is a property of the LCTYPE, not of the digits: Wine's locale_return_number
- * formats ILANGUAGE / IDEFAULTLANGUAGE as %04x, so "0409" is the LANGID 0x409 (1033) and
- * reading it as decimal answers 409 — a number no Windows ever returns.
+ * get_locale_info for a resolved locale: the answer for `lctype` (flags in the high word
+ * honoured where Windows honours them), or `undefined` for an LCTYPE Windows fails with
+ * ERROR_INVALID_FLAGS.
  */
-export function localeNumericValue(cleanType: number, value: string): number {
-    const radix = (cleanType === 0x0001 || cleanType === 0x0009) ? 16 : 10;
-    const n = parseInt(value, radix);
-    return Number.isFinite(n) ? n >>> 0 : 0;
+export function localeInfo(entry: LocaleEntry, lctype: number): LocaleValue | undefined {
+    const row = entry.locale;
+    const s = (f: F) => localeString(row, f);
+    const n = (f: F) => localeField(row, f);
+    const first = (f: F) => arrayItem(localeField(row, f), 0);
+    const type = lctype & 0xffff;
+    switch (type) {
+        case 0x0001: return n(F.INotNeutral) ? n(F.ILanguage) : n(F.IDefaultLanguage);   // ILANGUAGE
+        case 0x0002: return s(F.SEngDisplayName);            // SLOCALIZEDDISPLAYNAME
+        case 0x0003: return s(F.SAbbrevLangName);
+        case 0x0004: return s(F.SNativeLangName);
+        case 0x0005: return n(F.ICountry);
+        case 0x0006: return s(F.SEngCountry);                // SLOCALIZEDCOUNTRYNAME
+        case 0x0007: return s(F.SAbbrevCtryName);
+        case 0x0008: return s(F.SNativeCtryName);
+        case 0x0009: return n(F.IDefaultLanguage);
+        case 0x000A: return n(F.ICountry);                   // IDEFAULTCOUNTRY
+        case 0x000B: {                                       // IDEFAULTCODEPAGE (OEM)
+            if (isDefaultRow(entry)) return EmulatorConfig.getInstance().oemCodePage;
+            const cp = n(F.IDefaultCodePage);
+            return cp === CP_UTF8 ? CP_OEMCP : cp;
+        }
+        case 0x000C: return s(F.SList);
+        case 0x000D: return n(F.IMeasure);
+        case 0x000E: return s(F.SDecimal);
+        case 0x000F: return s(F.SThousand);
+        case 0x0010: return s(F.SGrouping);
+        case 0x0011: return n(F.IDigits);
+        case 0x0012: return n(F.ILZero);
+        case 0x0013: return s(F.SNativeDigits);
+        case 0x0014: return s(F.SCurrency);
+        case 0x0015: return s(F.SIntlSymbol);
+        case 0x0016: return s(F.SMonDecimalSep);
+        case 0x0017: return s(F.SMonThousandSep);
+        case 0x0018: return s(F.SMonGrouping);
+        case 0x0019:                                         // ICURRDIGITS
+        case 0x001A: return n(F.ICurrDigits);                // IINTLCURRDIGITS
+        case 0x001B: return n(F.ICurrency);
+        case 0x001C: return n(F.INegCurr);
+        case 0x001D: return pictureSeparator(first(F.AShortDate), 'dMy');     // SDATE
+        case 0x001E: return pictureSeparator(first(F.ATimeFormat), 'Hhms');   // STIME
+        case 0x001F: return first(F.AShortDate);
+        case 0x0020: return first(F.ALongDate);
+        case 0x0021: return dateOrder(first(F.AShortDate));                  // IDATE
+        case 0x0022: return dateOrder(first(F.ALongDate));                   // ILDATE
+        case 0x0023: return pictureFlag(first(F.ATimeFormat), 'Hh', (p, i) => p[i] === 'H');        // ITIME
+        case 0x0024: return pictureFlag(first(F.AShortDate), 'y', (p, i) => p.startsWith('yyyy', i)); // ICENTURY
+        case 0x0025: return pictureFlag(first(F.ATimeFormat), 'Hh', (p, i) => p[i + 1] === p[i]);   // ITLZERO
+        case 0x0026: return pictureFlag(first(F.AShortDate), 'd', (p, i) => p[i + 1] === 'd');      // IDAYLZERO
+        case 0x0027: return pictureFlag(first(F.AShortDate), 'M', (p, i) => p[i + 1] === 'M');      // IMONLZERO
+        case 0x0028: return s(F.S1159);
+        case 0x0029: return s(F.S2359);
+        case 0x0050: return s(F.SPositiveSign);
+        case 0x0051: return s(F.SNegativeSign);
+        case 0x0052: return IPOSSIGNPOSN[n(F.INegCurr) & 15];
+        case 0x0053: return INEGSIGNPOSN[n(F.INegCurr) & 15];
+        case 0x0054: return +!(n(F.ICurrency) & 1);         // IPOSSYMPRECEDES
+        case 0x0055: return +!!(n(F.ICurrency) & 2);        // IPOSSEPBYSPACE
+        case 0x0056: return INEGSYMPRECEDES[n(F.INegCurr) & 15];
+        case 0x0057: return +(n(F.INegCurr) >= 8);          // INEGSEPBYSPACE
+        case LOCALE_FONTSIGNATURE: return s(F.FontSignature);
+        case 0x0059: return s(F.SIso639LangName);
+        case 0x005A: return s(F.SIso3166CtryName);
+        case 0x005B: return (n(F.IGeoIdLo) | (n(F.IGeoIdHi) << 16)) >>> 0;      // IGEOID
+        case 0x005C: return entry.name;                                      // SNAME
+        case 0x005D: return first(F.ADuration);
+        case 0x005E: return s(F.SKeyboardsToInstall);
+        case 0x0067: return s(F.SIso639LangName2);
+        case 0x0068: return s(F.SIso3166CtryName2);
+        case 0x0069: return s(F.SNan);
+        case 0x006A: return s(F.SPosInfinity);
+        case 0x006B: return s(F.SNegInfinity);
+        case 0x006C: return s(F.SScripts);
+        case 0x006D: return s(F.SParent);
+        case 0x006E: return s(F.SConsoleFallbackName);
+        case 0x006F: return s(F.SEngLanguage);               // SLOCALIZEDLANGUAGENAME
+        case 0x0070: return n(F.IReadingLayout);
+        case 0x0071: return +!n(F.INotNeutral);              // INEUTRAL
+        case 0x0072: return s(F.SEngDisplayName);
+        case 0x0073: return s(F.SNativeDisplayName);
+        case 0x0074: return n(F.INegativePercent);
+        case 0x0075: return n(F.IPositivePercent);
+        case 0x0076: return s(F.SPercent);
+        case 0x0077: return '‰';                        // SPERMILLE
+        case 0x0078: return first(F.AMonthDay);
+        case LOCALE_SSHORTTIME: return first(F.AShortTime);
+        case 0x007A: return s(F.SOpenTypeLanguageTag);
+        case 0x007B: return entry.alternateSort ? entry.name : s(F.SSortLocale);  // SSORTLOCALE
+        case 0x007C: return s(F.SRelativeLongDate);
+        case 0x007D: return 0;                               // undocumented; always 0
+        case 0x007E: return s(F.SShortestAm);
+        case 0x007F: return s(F.SShortestPm);
+        case 0x1001: return s(F.SEngLanguage);
+        case 0x1002: return s(F.SEngCountry);
+        case 0x1003: return first(F.ATimeFormat);
+        case 0x1004: {                                       // IDEFAULTANSICODEPAGE
+            if (isDefaultRow(entry)) return EmulatorConfig.getInstance().ansiCodePage;
+            const cp = n(F.IDefaultAnsiCodePage);
+            return cp === CP_UTF8 ? CP_ACP : cp;
+        }
+        case 0x1005: return pictureFlag(first(F.ATimeFormat), 'Hhmst', (p, i) => p[i] === 't');    // ITIMEMARKPOSN
+        case 0x1006: return first(F.AYearMonth);
+        case 0x1007: return s(F.SEngCurrName);
+        case 0x1008: return s(F.SNativeCurrName);
+        case 0x1009: return n(F.ICalendarType);
+        case 0x100A: return n(F.IPaperSize);
+        case 0x100B: return n(F.IOptionalCalendar);
+        case 0x100C: return (n(F.IFirstDayOfWeek) + 6) % 7;  // stored Monday = 0
+        case 0x100D: return n(F.IFirstWeekOfYear);
+        case 0x100E: return monthName(row, lctype, false, 12);
+        case 0x100F: return monthName(row, lctype, true, 12);
+        case 0x1010: return n(F.INegNumber);
+        case 0x1011: {                                       // IDEFAULTMACCODEPAGE
+            const cp = n(F.IDefaultMacCodePage);
+            return cp === CP_UTF8 ? CP_MACCP : cp;
+        }
+        case 0x1012: return n(F.IDefaultEbcdicCodePage);
+        case 0x1013: return sortName(entry.lcid);
+        case 0x1014: return n(F.IDigitSubstitution);
+    }
+    // LCTYPE day 1 is Monday; the stored arrays start on Sunday.
+    if (type >= 0x002A && type <= 0x0030) return arrayItem(n(F.ADayName), (type - 0x002A + 1) % 7);
+    if (type >= 0x0031 && type <= 0x0037) return arrayItem(n(F.AAbbrevDayName), (type - 0x0031 + 1) % 7);
+    if (type >= 0x0060 && type <= 0x0066) return arrayItem(n(F.AShortestDayName), (type - 0x0060 + 1) % 7);
+    if (type >= 0x0038 && type <= 0x0043) return monthName(row, lctype, false, type - 0x0038);
+    if (type >= 0x0044 && type <= 0x004F) return monthName(row, lctype, true, type - 0x0044);
+    return undefined;
 }
 
-// Pre-built UTF-16LE byte buffers for GetLocaleInfoW (keyed by cleanType)
-// Built lazily on first call to registerFastPathLocaleFunctions so EmulatorConfig is ready.
+/** locale_return_number's text: %04x for the two LANGID types, %03u for the EBCDIC page. */
+export function localeNumberText(lctype: number, value: number): string {
+    const type = lctype & 0xffff;
+    if (type === 0x0001 || type === 0x0009) return value.toString(16).padStart(4, '0');
+    if (type === 0x1012) return String(value).padStart(3, '0');
+    return String(value);
+}
+
+/**
+ * The WCHARs GetLocaleInfoW writes for an answer: the text plus its NUL — except
+ * LOCALE_FONTSIGNATURE, which is binary and returned by exact count.
+ */
+export function localeWideData(lctype: number, value: LocaleValue): string {
+    if (typeof value === 'number') return localeNumberText(lctype, value) + '\0';
+    return (lctype & 0xffff) === LOCALE_FONTSIGNATURE ? value : value + '\0';
+}
+
+/** getLocaleValue for an already-resolved locale: the answer as text, NUL excluded. */
+export function localeText(entry: LocaleEntry, lctype: number): string | undefined {
+    const v = localeInfo(entry, lctype);
+    return typeof v === 'number' ? localeNumberText(lctype, v) : v;
+}
+
+/**
+ * THE locale lookup: what GetLocaleInfoW answers for `lcid` (any LCID argument, the
+ * pseudo-LCIDs included) and `lctype`, as text; `undefined` when the LCID denotes no
+ * locale or Windows has no answer for the type.
+ */
+export function getLocaleValue(lcid: number, lctype: number): string | undefined {
+    const entry = localeFromLcid(lcid);
+    return entry ? localeText(entry, lctype) : undefined;
+}
+
+/**
+ * get_locale_codepage: the page GetLocaleInfoA converts through — the locale's own ANSI
+ * page (for the default locale that is the manifest's, as its IDEFAULTANSICODEPAGE says),
+ * or the process page under LOCALE_USE_CP_ACP and for a Unicode-only locale.
+ */
+export function localeAnsiCodePage(entry: LocaleEntry, lctype: number): number {
+    const acp = EmulatorConfig.getInstance().ansiCodePage;
+    if ((lctype & LOCALE_USE_CP_ACP) || isDefaultRow(entry)) return acp;
+    const cp = localeField(entry.locale, F.IDefaultAnsiCodePage);
+    return cp === CP_UTF8 ? acp : cp;
+}
+
+/** GetLocaleInfoA's conversion. Every ANSI page a locale names is ASCII below 0x80, so an
+ *  ASCII answer (most of them) needs no code-page table at all. */
+export function encodeLocaleAnsi(text: string, codePage: number): Uint8Array {
+    let ascii = true;
+    for (let i = 0; i < text.length && ascii; i++) ascii = text.charCodeAt(i) < 0x80;
+    if (!ascii) return encodeAnsiString(text, codePage);
+    const out = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i);
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------
+// The fast tiers' answer caches — the process locale only
+// ---------------------------------------------------------------------------------------
+
+/** The LCID arguments the fast tiers (JS fast path, inline stub) may answer without asking
+ *  the thunk: the pseudo-LCIDs and the configured LCID verbatim, each of which means the
+ *  process locale. Any other LCID goes to the thunk, which answers every installed one. */
+export function fastPathLcids(): number[] {
+    return [...new Set([...DEFAULT_PSEUDO_LCIDS, EmulatorConfig.getInstance().lcid >>> 0])];
+}
+
+/** GetLocaleInfoW's bytes (UTF-16LE, NUL included) for the process locale, by cleanType. */
 export let _localeWCache: Map<number, Uint8Array> | null = null;
-/** RETURN_NUMBER values by cleanType. Uint32, not Uint16: a LANGID is 0x409 today but the
- *  out-param is a DWORD and a page number (10000) or a hex LCID must survive the store. */
+/** GetLocaleInfoA's bytes (NUL included) for the same types in the process ANSI page.
+ *  FONTSIGNATURE and SSHORTTIME are absent: A answers the first by count and refuses the
+ *  second. */
+export let _localeACache: Map<number, Uint8Array> | null = null;
+/** RETURN_NUMBER values by cleanType. Uint32, not Uint16: the out-param is a DWORD and a
+ *  page number (10000) or a GEOID must survive the store. */
 export let _localeWNumCache: Uint32Array | null = null;
+/** 1 where the type is numeric; RETURN_NUMBER on any other type is ERROR_INVALID_FLAGS. */
+export let _localeIsNumber: Uint8Array | null = null;
+/** fastPathLcids(), frozen with the answer cache it gates. */
+export let _localeFastLcids: Set<number> | null = null;
 export const LOCALE_CACHE_SIZE = 0x1100;
 
 export function ensureLocaleCache(): void {
     if (_localeWCache) return;
-    _localeWCache = new Map();
-    _localeWNumCache = new Uint32Array(LOCALE_CACHE_SIZE);
-    const config = EmulatorConfig.getInstance();
-    const entries: Record<number, string> = { ...US_LOCALE_DATA };
-    entries[0x000B] = String(config.oemCodePage);
-    entries[0x1004] = String(config.ansiCodePage);
-    for (const [typeStr, value] of Object.entries(entries)) {
-        const cleanType = parseInt(typeStr);
-        const len = value.length + 1; // including null
-        const buf = new Uint8Array(len * 2); // UTF-16LE
-        for (let i = 0; i < value.length; i++) {
-            buf[i * 2] = value.charCodeAt(i) & 0xFF;
-            buf[i * 2 + 1] = 0; // ASCII locale strings are all BMP < 0x100
+    const wCache = new Map<number, Uint8Array>();
+    const aCache = new Map<number, Uint8Array>();
+    const nums = new Uint32Array(LOCALE_CACHE_SIZE);
+    const isNum = new Uint8Array(LOCALE_CACHE_SIZE);
+    const entry = userDefaultLocale();
+    const acp = EmulatorConfig.getInstance().ansiCodePage;
+    for (let type = 0; type < LOCALE_CACHE_SIZE; type++) {
+        const value = localeInfo(entry, type);
+        if (value === undefined) continue;
+        const wide = localeWideData(type, value);
+        const buf = new Uint8Array(wide.length * 2);
+        for (let i = 0; i < wide.length; i++) {
+            const c = wide.charCodeAt(i);
+            buf[i * 2] = c & 0xff;
+            buf[i * 2 + 1] = c >> 8;
         }
-        // null terminator is already 0
-        _localeWCache.set(cleanType, buf);
-        if (cleanType < LOCALE_CACHE_SIZE) {
-            _localeWNumCache[cleanType] = localeNumericValue(cleanType, value);
+        wCache.set(type, buf);
+        if (typeof value === 'number') {
+            nums[type] = value >>> 0;
+            isNum[type] = 1;
+        }
+        if (type !== LOCALE_FONTSIGNATURE && type !== LOCALE_SSHORTTIME) {
+            aCache.set(type, encodeLocaleAnsi(wide, acp));
         }
     }
+    _localeFastLcids = new Set(fastPathLcids());
+    _localeWNumCache = nums;
+    _localeIsNumber = isNum;
+    _localeACache = aCache;
+    _localeWCache = wCache;
 }
-
 
 // ============================================================================
 // Guest-RAM table for the trap-free inline GetLocaleInfoW stub
@@ -195,25 +389,31 @@ export function ensureLocaleCache(): void {
 //
 //   +0x00  answered  u32       fast returns  (the stub's only visible instrument)
 //   +0x04  destLimit u32       the stub's destination bound (see writeLocaleStubDestLimit)
-//   +0x08  bail      u32 × 8   one per bail site, LOCALE_STUB_BAIL_REASONS order
-//   +0x28  index     u32 × LOCALE_CACHE_SIZE, entry = (byteLen << 16) | blobOff
+//   +0x08  bail      u32 × 9   one per bail site, LOCALE_STUB_BAIL_REASONS order
+//   +0x2C  lcids     u32 × LOCALE_STUB_LCID_SLOTS   the LCIDs the stub may answer for
+//   ...    index     u32 × LOCALE_CACHE_SIZE, entry = (byteLen << 16) | blobOff
 //                    0 = no such LCTYPE (the stub bails)
-//   ...    blob      UTF-16LE strings, NUL-terminated, blobOff relative to blob base
+//   ...    blob      the W cache's bytes, blobOff relative to blob base
 //
-// byteLen counts the NUL, so the stub's return value is byteLen >> 1 — exactly what
-// the JS fast path returns for the same type.
+// byteLen is the W cache entry's length (NUL included, FONTSIGNATURE excepted), so the
+// stub's return value is byteLen >> 1 — exactly what the JS fast path returns for the type.
 
 export const LOCALE_STUB_ANSWERED_OFF = 0x00;
 export const LOCALE_STUB_DESTLIMIT_OFF = 0x04;
 export const LOCALE_STUB_BAIL_OFF = 0x08;
 /** One counter per bail site, in emission order. A single "bailed" total says the stub
- *  declined; only the reason says whether that is the contract working (RETURN_NUMBER)
- *  or a table that is missing the types the caller actually asks for. */
+ *  declined; only the reason says whether that is the contract working (RETURN_NUMBER or
+ *  RETURN_GENITIVE_NAMES: 'returnFlags') or a table missing the types callers ask for. */
 export const LOCALE_STUB_BAIL_REASONS = [
-    'returnNumber', 'typeOutOfTable', 'unknownType', 'negativeCch',
+    'lcid', 'returnFlags', 'typeOutOfTable', 'unknownType', 'negativeCch',
     'bufferTooSmall', 'nullDest', 'destWraps', 'destPastMemory',
 ] as const;
-export const LOCALE_STUB_INDEX_OFF = LOCALE_STUB_BAIL_OFF + LOCALE_STUB_BAIL_REASONS.length * 4;
+/** LCTYPE flags the stub hands to JS: a DWORD out-param, and names the cache does not hold. */
+export const LOCALE_STUB_DECLINED_FLAGS = LOCALE_RETURN_NUMBER | LOCALE_RETURN_GENITIVE_NAMES;
+/** Fixed so the emitted compare chain has a fixed shape; unused slots repeat a real LCID. */
+export const LOCALE_STUB_LCID_SLOTS = 10;
+export const LOCALE_STUB_LCIDS_OFF = LOCALE_STUB_BAIL_OFF + LOCALE_STUB_BAIL_REASONS.length * 4;
+export const LOCALE_STUB_INDEX_OFF = LOCALE_STUB_LCIDS_OFF + LOCALE_STUB_LCID_SLOTS * 4;
 export const LOCALE_STUB_BLOB_OFF = LOCALE_STUB_INDEX_OFF + LOCALE_CACHE_SIZE * 4;
 
 /**
@@ -254,7 +454,10 @@ export function retireLocaleStubTable(mem: Uint8Array): void {
 /** Drop the cached answers so the next call rebuilds them from the current config. */
 export function invalidateLocaleCache(): void {
     _localeWCache = null;
+    _localeACache = null;
     _localeWNumCache = null;
+    _localeIsNumber = null;
+    _localeFastLcids = null;
 }
 
 /**
@@ -278,6 +481,14 @@ export function serializeLocaleStubTable(): Uint8Array {
     }
     const out = new Uint8Array(LOCALE_STUB_BLOB_OFF + blobBytes);
     const dv = new DataView(out.buffer);
+
+    const lcids = [..._localeFastLcids!];
+    if (lcids.length > LOCALE_STUB_LCID_SLOTS) {
+        throw new Error(`[locale-stub] ${lcids.length} fast-path LCIDs do not fit ${LOCALE_STUB_LCID_SLOTS} slots`);
+    }
+    for (let i = 0; i < LOCALE_STUB_LCID_SLOTS; i++) {
+        dv.setUint32(LOCALE_STUB_LCIDS_OFF + i * 4, lcids[Math.min(i, lcids.length - 1)]! >>> 0, true);
+    }
 
     let blobOff = 0;
     for (const [type, buf] of cache) {

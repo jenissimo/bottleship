@@ -1,6 +1,9 @@
 import { ModuleDescriptor, UnimplementedReturn, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
 import { hidModule } from "../api/hid.api";
+import { combaseModule } from "../api/combase.api";
+import { shcoreModule } from "../api/shcore.api";
+import { kernelbaseModule } from "../api/kernelbase.api";
 import { lgvidModule } from "../api/lgvid.api";
 import { oledlgModule } from "../api/oledlg.api";
 import { msiModule } from "../api/msi.api";
@@ -82,6 +85,9 @@ export class APIRegistry {
         // is fixed at compile time — new *.api.ts files are invisible until rebuild).
         this.registerModule(setupapiModule);
         this.registerModule(hidModule);
+        this.registerModule(combaseModule);
+        this.registerModule(shcoreModule);
+        this.registerModule(kernelbaseModule);
         this.registerModule(lgvidModule);
         this.registerModule(oledlgModule);
         this.registerModule(msiModule);

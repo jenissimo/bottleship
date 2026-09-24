@@ -435,6 +435,24 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     bindMsgTimerDiag("msgTimerDiag");
     bindMsgTimerDiag("h3TimerDiag"); // deprecated alias
 
+    // Per-thread GetMessageExtraInfo value: the dwExtraInfo of the input behind the last
+    // message GetMessage/PeekMessage handed this thread (0 for posted and host input), or
+    // whatever SetMessageExtraInfo stored since.
+    const messageExtraInfo = new Map<number, number>();
+    function noteRetrievedExtraInfo(threadId: number, msg: { extraInfo?: number }): void {
+        messageExtraInfo.set(threadId, (msg.extraInfo ?? 0) >>> 0);
+    }
+
+    exports['GetMessageExtraInfo'] = () =>
+        messageExtraInfo.get(System.getInstance().scheduler.getCurrentThreadId()) ?? 0;
+
+    exports['SetMessageExtraInfo'] = (ctx, mem, args) => {
+        const tid = System.getInstance().scheduler.getCurrentThreadId();
+        const previous = messageExtraInfo.get(tid) ?? 0;
+        messageExtraInfo.set(tid, args[0] >>> 0);
+        return previous;
+    };
+
     function writeMsgToMemory(mem: Uint8Array, lpMsg: number, msg: any) {
         if (lpMsg) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -743,6 +761,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             }
             // WH_GETMESSAGE fires on the message about to be returned (any message,
             // not just keys) unless a keyboard chain already handled it above.
+            noteRetrievedExtraInfo(currentThreadId, msg);
             const gm = dispatchGetMessageHook(
                 ctx, msg, true, currentThreadId, lpMsg, 16,
                 (delivered) => (delivered ? (delivered.message === WM_QUIT ? 0 : 1) : 1), 'GetMessage:WH_GETMESSAGE',
@@ -771,7 +790,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             // an idle timeout signal (4ms), but real Windows GetMessage blocks until
             // a genuine message arrives. Returning WM_NULL with hwnd=0 to the game
             // causes crashes when null messages are processed (e.g. some galaxy.dll builds).
-            let waitMsg: { hwnd: number; message: number; wParam: number; lParam: number; time: number; ptX?: number; ptY?: number };
+            let waitMsg: { hwnd: number; message: number; wParam: number; lParam: number; time: number; ptX?: number; ptY?: number; extraInfo?: number };
             for (;;) {
                 waitMsg = await system.windowManager.waitForMessage(currentThreadId);
 
@@ -830,6 +849,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                     `GetMessageW(async): delivering msg=0x${waitMsg.message.toString(16)} WITHOUT ` +
                     `${keyHookPending ? 'WH_KEYBOARD' : 'WH_GETMESSAGE'} hook dispatch`);
             }
+            noteRetrievedExtraInfo(currentThreadId, waitMsg);
             const retVal = waitMsg.message === WM_QUIT ? 0 : 1;
             if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(async)', waitMsg.hwnd, waitMsg.message, {
                 ret: retVal,
@@ -1073,6 +1093,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         // WH_GETMESSAGE fires on any message about to be returned unless the keyboard
         // chain already handled it above.
+        noteRetrievedExtraInfo(callerThreadId, msg);
         const gm = dispatchGetMessageHook(
             ctx, msg, wRemoveMsg !== 0, callerThreadId, lpMsg, 20,
             (delivered) => (delivered ? 1 : 0), 'PeekMessage:WH_GETMESSAGE',

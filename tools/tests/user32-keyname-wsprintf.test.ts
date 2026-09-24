@@ -9,6 +9,7 @@
 import { describe, expect, test } from "bun:test";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { createSystemExports } from "../../src/worker/modules/user32/system";
+import { createDpiExports } from "../../src/worker/modules/user32/dpi-awareness";
 
 const exports = createSystemExports();
 // Guest writes go through the Mem accessor (region-permission validation), whose
@@ -152,6 +153,7 @@ describe("wsprintf", () => {
 
 describe("GetDpiForSystem", () => {
     test("agrees with the LOGPIXELS gdi32 reports for the unscaled desktop", () => {
-        expect(call("GetDpiForSystem", [])).toBe(96);
+        const dpi = createDpiExports(exports);
+        expect(dpi["GetDpiForSystem"]!({} as any, mem, []) as number).toBe(96);
     });
 });

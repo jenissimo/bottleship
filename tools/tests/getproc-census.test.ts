@@ -81,6 +81,12 @@ describe("call census silent-stub signal", () => {
         expect(apiCensus.list()).toHaveLength(2);
     });
 
+    it("does not flag a parameterless handler of an export that takes no arguments", () => {
+        apiCensus.record("user32:GetDesktopWindow", 0, 0x401000, 0);
+        apiCensus.record("user32:DestroyIcon", 0, 0x401000, 1);
+        expect(apiCensus.suspectStubs().map((s) => s.name)).toEqual(["user32:DestroyIcon"]);
+    });
+
     it("flags a curated handler even when it declares its arguments", () => {
         const curated = [...SILENT_STUBS][0];
         expect(curated).toBeDefined();

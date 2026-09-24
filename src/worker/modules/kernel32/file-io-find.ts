@@ -5,8 +5,7 @@
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { encodeAnsi } from '../codepage-utils';
-import { readStringA, readStringW } from './file-io-strings';
+import { readStringA, readStringW, encodeFileApiString } from './file-io-strings';
 
 const INVALID_HANDLE_VALUE = -1;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -89,7 +88,7 @@ const fillFindDataA = (mem: Uint8Array, addr: number, entry: any) => {
 
     // FileName (A) - limit to 259 chars + null
     const name = entry.name.substring(0, 259);
-    const nameBytes = encodeAnsi(name + '\0');
+    const nameBytes = encodeFileApiString(name + '\0');
     mem.set(nameBytes, addr + 44);
 };
 

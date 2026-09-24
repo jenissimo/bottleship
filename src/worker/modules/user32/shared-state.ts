@@ -51,6 +51,8 @@ export interface WindowInfo {
     nativeClassName?: string;
     /** HFONT currently assigned by WM_SETFONT / dialog-template DS_SETFONT. */
     fontHandle?: number;
+    /** RegisterTouchWindow's TWF_* flags; undefined = not registered for WM_TOUCH. */
+    touchWindowFlags?: number;
     /** Dialog default push button id (DM_GETDEFID / BM_SETSTYLE bookkeeping). */
     dialogDefaultId?: number;
     /** Per-dialog MapDialogRect base units (from template font / system font). */
@@ -982,8 +984,37 @@ export function closeClipboard(): boolean {
     return true;
 }
 
+/** GetClipboardSequenceNumber: bumped by every content change, whoever makes it. */
+let clipboardSequence = 1;
+
+export function getClipboardSequenceNumber(): number {
+    return clipboardSequence;
+}
+
 export function emptyClipboard(): void {
     clipboardDataByFormat.clear();
+    clipboardSequence = (clipboardSequence + 1) >>> 0;
+}
+
+export function setClipboardFormatData(format: number, hData: number): void {
+    clipboardDataByFormat.set(format, hData);
+    clipboardSequence = (clipboardSequence + 1) >>> 0;
+}
+
+/** The double-click interval (SetDoubleClickTime / SPI_SETDOUBLECLICKTIME) that both
+ *  GetDoubleClickTime answers and the WM_*BUTTONDBLCLK synthesizer applies. */
+const DEFAULT_DOUBLE_CLICK_MS = 500;
+const MAX_DOUBLE_CLICK_MS = 5000;
+let doubleClickTimeMs = DEFAULT_DOUBLE_CLICK_MS;
+
+export function getDoubleClickTimeMs(): number {
+    return doubleClickTimeMs;
+}
+
+/** 0 selects the 500 ms default and anything above 5000 is stored as 5000 (documented). */
+export function setDoubleClickTimeMs(ms: number): void {
+    const value = ms >>> 0;
+    doubleClickTimeMs = value === 0 ? DEFAULT_DOUBLE_CLICK_MS : Math.min(value, MAX_DOUBLE_CLICK_MS);
 }
 
 export function resetUser32SharedState(): void {
@@ -1003,6 +1034,7 @@ export function resetUser32SharedState(): void {
     controlImageHandles.clear();
     clipboardDataByFormat.clear();
     clipboardOpenOwner = null;
+    doubleClickTimeMs = DEFAULT_DOUBLE_CLICK_MS;
     Logger.log(LogCategory.USER32, 'User32 shared state reset');
 }
 
