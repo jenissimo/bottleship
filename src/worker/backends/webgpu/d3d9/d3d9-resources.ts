@@ -178,6 +178,15 @@ export class VertexBufferStore {
     }
 
     // Lock operations — returns guest pointer for the locked region
+    /** D3DLOCK_DISCARD: the buffer's prior contents are undefined from here on, so bytes
+     *  dirtied but not yet uploaded — including a whole-buffer re-dirty — no longer need
+     *  to reach the GPU; only what the guest writes under this lock does. */
+    discardPendingDirty(index: number): void {
+        this.dirtyFlags[index] = 0;
+        this.dirtyStarts[index] = 0;
+        this.dirtyEnds[index] = 0;
+    }
+
     lock(index: number, offset: number, size: number): number {
         const guestBase = this.guestPtrs[index];
         if (guestBase < 0) return -1;
@@ -489,6 +498,15 @@ export class IndexBufferStore {
             this.setDirty(i, true);
         }
         return n;
+    }
+
+    /** D3DLOCK_DISCARD: the buffer's prior contents are undefined from here on, so bytes
+     *  dirtied but not yet uploaded — including a whole-buffer re-dirty — no longer need
+     *  to reach the GPU; only what the guest writes under this lock does. */
+    discardPendingDirty(index: number): void {
+        this.dirtyFlags[index] = 0;
+        this.dirtyStarts[index] = 0;
+        this.dirtyEnds[index] = 0;
     }
 
     lock(index: number, offset: number, size: number): number {

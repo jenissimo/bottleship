@@ -3976,10 +3976,13 @@ export class D3D9Device {
             const target = ring[slot]!;
             store.setGpuBuffer(index, target);
             // Partial uploads are only sound into a slot that already holds this buffer's
-            // previous bytes. A renamed slot and a just-built ring do not, so they take the
-            // whole shadow; slot 0 across frames does, because syncBufferFrame re-dirties in
-            // full any buffer whose frame ended on a higher slot.
-            const whole = renamed || ringIsNew;
+            // previous bytes. A just-built ring does not, so it takes the whole shadow; slot 0
+            // across frames does, because syncBufferFrame re-dirties in full any buffer whose
+            // frame ended on a higher slot. A renamed slot needs only what the guest wrote
+            // since the DISCARD: D3DLOCK_DISCARD leaves the whole buffer's prior contents
+            // undefined, so the app has rewritten everything it will draw from.
+            const whole = ringIsNew
+                || (renamed && (globalThis as { __noDiscardPartialUpload?: boolean }).__noDiscardPartialUpload === true);
             const range = whole
                 ? { offset: 0, length: gpuSize }
                 : alignUploadRange(store.getDirtyStart(index), store.getDirtyEnd(index), gpuSize);
@@ -4149,7 +4152,10 @@ export class D3D9Device {
         if (index === null) return 0;
         d3d9PerfBufferLock(flags);
         this.vbLastLockFlags.set(index, flags);
-        if (flags & D3DLOCK_DISCARD) this.discardedVb.add(index);
+        if (flags & D3DLOCK_DISCARD) {
+            this.discardedVb.add(index);
+            if ((globalThis as { __noDiscardPartialUpload?: boolean }).__noDiscardPartialUpload !== true) this.vertexBuffers.discardPendingDirty(index);
+        }
 
         const bufSize = this.vertexBuffers.getSize(index);
         // Faithful D3D9: a lock range that starts at/past the end of the buffer is
@@ -4200,7 +4206,10 @@ export class D3D9Device {
         if (index === null) return 0;
         d3d9PerfBufferLock(flags);
         this.ibLastLockFlags.set(index, flags);
-        if (flags & D3DLOCK_DISCARD) this.discardedIb.add(index);
+        if (flags & D3DLOCK_DISCARD) {
+            this.discardedIb.add(index);
+            if ((globalThis as { __noDiscardPartialUpload?: boolean }).__noDiscardPartialUpload !== true) this.indexBuffers.discardPendingDirty(index);
+        }
 
         const bufSize = this.indexBuffers.getSize(index);
         // Faithful D3D9: out-of-range lock start = INVALIDCALL (see lockVertexBuffer).
