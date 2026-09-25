@@ -1427,6 +1427,12 @@ initModuleFunctions();
  * Pre-populate GetProcAddress cache for all known thunked exports.
  * Call after applyPendingRegistrations() to eliminate cold-miss stub allocation
  * at runtime (~0.3s saved during loading).
+ *
+ * The cached value is the resolver's answer, not the stub's own address: a data export
+ * (msvcrt's native qsort/bsearch, _EH_prolog, the CRT variables) keeps a declared stub
+ * whose handler is only a placeholder, so caching the stub hands a runtime-resolving
+ * importer (a UPX-packed DLL resolves every import this way) a different export than the
+ * IAT binds.
  */
 export function prePopulateGetProcAddressCache(dispatcher: HleDispatcher): void {
     ensureProcessLocalCaches();
@@ -1439,10 +1445,11 @@ export function prePopulateGetProcAddressCache(dispatcher: HleDispatcher): void 
         const base = hleImageBase(dllLower);
         if (base === undefined) continue;
         const key = buildGetProcCacheKey(base, stub.functionName, false, 0);
-        if (!getProcAddressCache.has(key)) {
-            getProcAddressCache.set(key, stub.address >>> 0);
-            count++;
-        }
+        if (getProcAddressCache.has(key)) continue;
+        const address = resolveHleExportAddress(dispatcher, stub.dllName, stub.functionName);
+        if (address === 0) continue;
+        getProcAddressCache.set(key, address >>> 0);
+        count++;
     }
     if (count > 0) {
         Logger.log(LogCategory.KERNEL32, `GetProcAddress cache pre-populated: ${count} entries`);
