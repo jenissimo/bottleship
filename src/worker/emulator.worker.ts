@@ -3399,7 +3399,16 @@ function resumeEmulator(): void {
   const kick = (): void => {
     if (isPaused) return;                                   // a newer pause owns the CPU now
     if (System.getInstance().process?.v86 !== v86) return;   // process replaced under us
-    if (!(v86.is_running?.() ?? false)) { v86.run(); Logger.log(LogCategory.SYSTEM, "[RESUME] Emulator resumed"); }
+    if (!(v86.is_running?.() ?? false)) { v86.run(); Logger.log(LogCategory.SYSTEM, "[RESUME] Emulator resumed"); return; }
+    // Seen from outside do_tick, running && !idle means the last tick threw out of main_loop:
+    // no tick is scheduled and no stop will ever be acknowledged, so the guard above would
+    // leave the CPU frozen for good. The core's run() reschedules the loop; a stale pending
+    // tick, if one existed, is superseded by v86's own tick_counter check.
+    const core = v86.v86;
+    if (core && core["running"] && core["idle"] === false) {
+      core["run"]();
+      Logger.warn(LogCategory.SYSTEM, "[RESUME] v86 tick loop was dead (a tick threw) — rescheduled");
+    }
   };
   const raced = pendingStop;
   kick();

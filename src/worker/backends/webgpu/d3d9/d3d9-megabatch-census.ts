@@ -69,7 +69,7 @@ export function createD3D9MegaBatchCensus(): D3D9MegaBatchCensus {
  * the scan never attempts to join draws across another RenderFrame command (query, dynamic
  * state, clear, target switch, etc.). */
 export function censusD3D9MegaBatchFrame(
-    frame: Pick<RenderFrame, "commandTypes" | "commandA" | "commandD" | "arenaIndexedRuns">,
+    frame: Pick<RenderFrame, "commandTypes" | "commandA" | "commandD" | "commandCount" | "arenaIndexedRuns">,
     arena: D3D9MegaBatchArenaReader,
     totals: D3D9MegaBatchCensus = createD3D9MegaBatchCensus(),
 ): D3D9MegaBatchCensus {
@@ -82,7 +82,7 @@ export function censusD3D9MegaBatchFrame(
     const c = arena.getCommandC();
     let seenRun = false;
 
-    for (let command = 0; command < frame.commandTypes.length; command++) {
+    for (let command = 0; command < frame.commandCount; command++) {
         if (frame.commandTypes[command] !== RenderCommandType.DrawIndexedArenaRun) continue;
 
         totals.arenaRuns++;

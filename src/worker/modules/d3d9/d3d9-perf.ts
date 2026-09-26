@@ -545,7 +545,12 @@ export function d3d9PerfStateBlockWasmCapture(): void {
     stateBlock.wasmCaptures++;
 }
 
+/** Split D3D9: the render twin replays every API call the front already counted. */
+let apiMuted = false;
+export function d3d9PerfMuteApi(on: boolean): void { apiMuted = on; }
+
 export function d3d9PerfInc(key: ApiKey): void {
+    if (apiMuted) return;
     api[key]++;
 }
 
@@ -560,10 +565,12 @@ export function d3d9PerfAdd(key: ApiKey, count: number): void {
         counterRejections[key] = (counterRejections[key] ?? 0) + 1;
         return;
     }
+    if (apiMuted) return;
     api[key] += count;
 }
 
 export function d3d9PerfSkip(key: SkipKey): void {
+    if (apiMuted) return;
     skip[key]++;
 }
 
@@ -649,6 +656,7 @@ export function d3d9PerfIndexRangeOOB(overshootBytes: number): void {
 }
 
 export function d3d9PerfBufferLock(flags: number): void {
+    if (apiMuted) return;
     if (flags & 0x2000) buffers.lockDiscard++;
     else if (flags & 0x1000) buffers.lockNoOverwrite++;
     else buffers.lockPlain++;

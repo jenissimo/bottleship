@@ -19,6 +19,7 @@ import {
     stateBlocks,
 } from './shared-state';
 import { surfaceMeta, textureMeta, vertexBufferMeta } from './resource-registry';
+import { splitForgetComObject, splitForgetStateBlock, splitRegisterComObject, splitRegisterStateBlock } from './split';
 import {
     beginStateBlockShadowWindow, endStateBlockShadowWindow,
 } from './state-block-shadow-window';
@@ -117,9 +118,12 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             coverage.psConstRanges,
         );
         stateBlocks.set(sbPtr, data);
+        const owner = devices.get(devicePtr);
+        if (owner) splitRegisterStateBlock(owner, sbPtr, data);
         registerDeviceChildFinalizer(sbPtr, devicePtr, () => {
             disposeStateBlockData(data);
             stateBlocks.delete(sbPtr);
+            if (owner) splitForgetStateBlock(owner, sbPtr);
         });
         return sbPtr;
     }
@@ -752,7 +756,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             internalHandle: result.handle,
             bytecode: result.bytecode,
         });
-        registerDeviceChildFinalizer(shaderPtr, pDevice, () => vertexShaderComObjects.delete(shaderPtr));
+        splitRegisterComObject(device, "vs", shaderPtr, result.handle);
+        registerDeviceChildFinalizer(shaderPtr, pDevice, () => {
+            vertexShaderComObjects.delete(shaderPtr);
+            splitForgetComObject(device, "vs", shaderPtr);
+        });
 
         if (!writeComPtrOut(ppShader, shaderPtr, mem)) {
             releaseComRef(shaderPtr);
@@ -894,7 +902,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             internalHandle: result.handle,
             elements,
         });
-        registerDeviceChildFinalizer(declPtr, pDevice, () => vertexDeclComObjects.delete(declPtr));
+        splitRegisterComObject(device, "decl", declPtr, result.handle);
+        registerDeviceChildFinalizer(declPtr, pDevice, () => {
+            vertexDeclComObjects.delete(declPtr);
+            splitForgetComObject(device, "decl", declPtr);
+        });
 
         if (!writeComPtrOut(ppDecl, declPtr, mem)) {
             releaseComRef(declPtr);
@@ -954,7 +966,11 @@ export function createStateExports(): Record<string, ThunkImplementation> {
             internalHandle: result.handle,
             bytecode: result.bytecode,
         });
-        registerDeviceChildFinalizer(shaderPtr, pDevice, () => pixelShaderComObjects.delete(shaderPtr));
+        splitRegisterComObject(device, "ps", shaderPtr, result.handle);
+        registerDeviceChildFinalizer(shaderPtr, pDevice, () => {
+            pixelShaderComObjects.delete(shaderPtr);
+            splitForgetComObject(device, "ps", shaderPtr);
+        });
 
         if (!writeComPtrOut(ppShader, shaderPtr, mem)) {
             releaseComRef(shaderPtr);

@@ -17,6 +17,10 @@ export class TexturePaletteStore {
         this.palettes.set(paletteNumber >>> 0, pal);
     }
 
+    setPalette(paletteNumber: number, entries: Uint32Array): void {
+        this.palettes.set(paletteNumber >>> 0, entries.slice(0, 256));
+    }
+
     getPaletteEntries(paletteNumber: number, pEntries: number, mem: Uint8Array): boolean {
         if (!pEntries || pEntries + 256 * 4 > mem.length) return false;
         const pal = this.palettes.get(paletteNumber >>> 0);

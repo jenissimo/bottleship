@@ -264,6 +264,7 @@ describe("D3D9Ex lifecycle contracts", () => {
                 this.viewport = { x: 0, y: 0, width: 800, height: 600, minZ: 0, maxZ: 1 };
                 return D3D_OK;
             },
+            restoreViewportSnapshot(v: typeof this.viewport) { this.viewport = { ...v }; },
             resetSubsystemPerf() {},
         };
         devices.set(DEVICE, state as any);

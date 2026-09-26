@@ -232,6 +232,7 @@ export class D3D9QueryManager {
         poolExhaustedFallbacks: 0, passSplitFallbacks: 0,
         displacedGenerations: 0, displacedLost: 0,
     };
+    private readonly inflight = new Set<Promise<void>>();
     private submittedSerial = 0;
     private reservedSerial = 0;
     private deviceLost = false;
@@ -688,7 +689,7 @@ export class D3D9QueryManager {
         for (const entry of batch.entries) entry.state.submitted = true;
         const validation = batch.finishValidationScope?.() ?? Promise.resolve(null);
         batch.validation = validation;
-        batch.completion = this.completeBatch(batch);
+        batch.completion = this.track(this.completeBatch(batch));
     }
 
     /** Mark a batch as submitted when its command encoder was submitted together with
@@ -702,7 +703,7 @@ export class D3D9QueryManager {
         for (const entry of batch.entries) entry.state.submitted = true;
         const validation = batch.finishValidationScope?.() ?? Promise.resolve(null);
         batch.validation = validation;
-        batch.completion = this.completeBatch(batch);
+        batch.completion = this.track(this.completeBatch(batch));
     }
 
     /**
@@ -726,6 +727,22 @@ export class D3D9QueryManager {
         }
         destroyGpuObject(batch.resolveBuffer);
         destroyGpuObject(batch.readbackBuffer);
+    }
+
+    /** A resolve readback is still in flight: a result that will arrive without new work. */
+    hasInflight(): boolean {
+        return this.inflight.size > 0;
+    }
+
+    /** Resolve once every readback submitted so far has settled. */
+    async settled(): Promise<void> {
+        while (this.inflight.size) await Promise.allSettled([...this.inflight]);
+    }
+
+    private track(completion: Promise<void>): Promise<void> {
+        this.inflight.add(completion);
+        void completion.finally(() => this.inflight.delete(completion));
+        return completion;
     }
 
     /** Awaitable test/integration hook for the asynchronous map transition. */

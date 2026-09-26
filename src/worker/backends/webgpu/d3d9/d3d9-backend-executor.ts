@@ -13,7 +13,13 @@ import {
     d3d9PerfVertexRangeOOB, d3d9NoteIndexedDrawUnencoded, d3d9NoteFence, d3d9NoteStagedBytes,
 } from "../../../modules/d3d9/d3d9-perf";
 import { frameProfiler } from "../../../core/frame-profiler";
-import { statsOverlay } from "../../../core/stats-overlay";
+import type { RenderActive } from "../../../runtime/runtime-services";
+import {
+    D3D9FrameVehicle, d3d9BitmapPresentWanted, type D3D9FrameMeta, type D3D9FrameSink,
+} from "./d3d9-frame-handoff";
+import {
+    D3D9ScreenLayer, presentD3D9FrameToCanvas, type D3D9ScreenLayerStats, type D3D9ScreenOverlays,
+} from "./d3d9-screen-layer";
 import { PROG_BIND } from "./shader";
 import { PS_PROGRAMMABLE_BIND_BYTES, VS_PROGRAMMABLE_BIND_BYTES, VS_HIDDEN_VEC4_COUNT } from "./shader/link/uniforms";
 import { padRegion, vertexRangeEndBytes, zeroStreamBuffer } from "../shared/vertex-streams";
@@ -534,6 +540,13 @@ type MegaBatchFusionCandidate = {
     ibFormat: number;
 };
 
+const PASS_RING_SIZE = 64;
+interface PassRingEntry {
+    commands: number; draws: number; depthKind: string; depthClear: number; target: string; present: boolean;
+    hasViewport: boolean; vx: number; vy: number; vw: number; vh: number; vminZ: number; vmaxZ: number;
+    rts: Array<string | null> | undefined; atPresent: number;
+}
+
 export class D3D9BackendExecutor {
     private backend: WebGPUBackend;
     private pipelines: GPURenderPipeline[] = [];
@@ -687,6 +700,14 @@ export class D3D9BackendExecutor {
     private presentedTexture: GPUTexture | null = null;
     private presentedRepaintView: GPUTextureView | null = null;
     private hasPresented = false;
+    /** Where a presented frame goes instead of the canvas (setFrameSink); null = the canvas. */
+    private frameSink: D3D9FrameSink | null = null;
+    private frameVehicle: D3D9FrameVehicle | null = null;
+    private inProcessScreen: D3D9ScreenLayer | null = null;
+    private frameHandoffSerial = 0;
+    private readonly frameHandoff = { presents: 0, sent: 0, vehicleFailures: 0, sinkErrors: 0 };
+    /** The device's draw count for the present being executed (D3D9FrameMeta.drawCount). */
+    private presentDrawCount: number | null = null;
     /** Shared textured-quad copier used by D3D9 StretchRect. */
     private stretchRectPipeline: ColorKeyBlitPipeline | null = null;
     /** Solid fill pipelines used by ColorFill on GPU render-target sub-rectangles, keyed
@@ -1228,7 +1249,7 @@ export class D3D9BackendExecutor {
         let pipelineId = -1;
         let padBytes = 0;
 
-        for (let i = 0; i < frame.commandTypes.length; i++) {
+        for (let i = 0; i < frame.commandCount; i++) {
             const type = frame.commandTypes[i];
             if (type === RenderCommandType.SetPipeline) {
                 pipelineId = frame.commandA[i];
@@ -1673,7 +1694,7 @@ export class D3D9BackendExecutor {
         let candidate: MegaBatchFusionCandidate | null = null;
         let lastDrawType = 0;
 
-        for (let command = 0; command < frame.commandTypes.length; command++) {
+        for (let command = 0; command < frame.commandCount; command++) {
             const type = frame.commandTypes[command];
             if (type === RenderCommandType.SetPipeline) {
                 pipelineId = frame.commandA[command] | 0;
@@ -2314,7 +2335,7 @@ export class D3D9BackendExecutor {
     ): { logicalDraws: number; pairs: number } {
         let logicalDraws = 0;
         let pairs = 0;
-        for (let i = Math.max(0, from); i < frame.commandTypes.length; i++) {
+        for (let i = Math.max(0, from); i < frame.commandCount; i++) {
             const type = frame.commandTypes[i];
             if (type === RenderCommandType.DrawIndexed) {
                 logicalDraws++;
@@ -2796,7 +2817,7 @@ export class D3D9BackendExecutor {
             candidate.logicalDraws += logicalDraws;
         };
 
-        for (let i = 0; i < frame.commandTypes.length; i++) {
+        for (let i = 0; i < frame.commandCount; i++) {
             const type = frame.commandTypes[i];
             if (type === RenderCommandType.SetPipeline) {
                 pipelineId = frame.commandA[i] | 0;
@@ -3398,7 +3419,7 @@ export class D3D9BackendExecutor {
             if (megaBatchPlans.size > 0) {
                 let pendingPipelineCommand = -1;
                 let pendingMegaRun = -1;
-                for (let scan = 0; scan < frame.commandTypes.length; scan++) {
+                for (let scan = 0; scan < frame.commandCount; scan++) {
                     const type = frame.commandTypes[scan];
                     if (type === RenderCommandType.SetPipeline) {
                         pendingMegaRun = -1;
@@ -3553,7 +3574,7 @@ export class D3D9BackendExecutor {
             // NOTAVAILABLE instead of leaving a permanently pending query.
             const occlusionQueryIds: number[] = [];
             if (queryManager) {
-                for (let i = 0; i < frame.commandTypes.length; i++) {
+                for (let i = 0; i < frame.commandCount; i++) {
                     const type = frame.commandTypes[i];
                     if (type === RenderCommandType.BeginOcclusionQuery || type === RenderCommandType.EndOcclusionQuery) {
                         occlusionQueryIds.push(frame.commandA[i] >>> 0);
@@ -3620,7 +3641,7 @@ export class D3D9BackendExecutor {
             const arenaCommandB = arenaByFrameDraw ? d3d9WasmArena.getCommandB() : null;
             const arenaCommandC = arenaByFrameDraw ? d3d9WasmArena.getCommandC() : null;
             const arenaPipelineKeys = arenaByFrameDraw ? d3d9WasmArena.getPipelineKeys() : null;
-            for (let i = 0; i < frame.commandTypes.length; i++) {
+            for (let i = 0; i < frame.commandCount; i++) {
                 commandIndex = i;
                 const preparedBundle = renderBundleSegments.get(i);
                 if (preparedBundle) {
@@ -4233,6 +4254,7 @@ export class D3D9BackendExecutor {
             }
 
             const rendersToBackbuffer = !target || target.backbuffer === true;
+            let frameForSink = false;
 
             // Copy to canvas if presenting
             if (present && rendersToBackbuffer) {
@@ -4252,7 +4274,8 @@ export class D3D9BackendExecutor {
                     );
                     this.hasPresented = true;
                 }
-                this.presentToCanvas(this.offscreenView!, off.width, off.height, encoder, overlays);
+                if (this.frameSink) frameForSink = this.encodeFrameForSink(device, encoder, off);
+                else this.presentToCanvas(this.offscreenView!, off.width, off.height, encoder, overlays);
 
                 // The single offscreen texture otherwise has COPY semantics. DISCARD
                 // must not feed the previous presented image into the next frame.
@@ -4288,6 +4311,7 @@ export class D3D9BackendExecutor {
                 queryManager.notifySubmitted(querySubmissionSerial);
             }
             frameProfiler.endTimer("gpu", submitStart);
+            if (frameForSink) this.shipFrameToSink();
         } catch (e) {
             if (renderBundlesAttempted) {
                 this.metrics.renderBundleFailures++;
@@ -4340,71 +4364,134 @@ export class D3D9BackendExecutor {
         }
     }
 
-    /**
-     * The ONE route from the physical backbuffer image to the canvas, shared by present and
-     * repaint so the two can never scale the same frame differently.
-     *
-     * It goes through PostFxChain (drawTexture opaque + `present:{…}`), which is what gives
-     * D3D9 gamma, colour grade, FXAA and — because src and out are genuinely different sizes —
-     * aspectMode/integerScale. The overlays follow it onto the CANVAS: they are guest-space
-     * planes placed in the published content rect, and blit/blitRects measure that rect
-     * against the canvas, not against a supersampled offscreen.
-     */
+    /** The shared canvas composite (presentD3D9FrameToCanvas), for a frame that stays here. */
     private presentToCanvas(
         sourceView: GPUTextureView,
         srcW: number,
         srcH: number,
         encoder: GPUCommandEncoder,
-        overlays?: {
-            videoOverlayCanvas?: OffscreenCanvas | null;
-            gdiOverlayCanvas?: OffscreenCanvas | null;
-            gdiOverlayRects?: Array<{ x: number; y: number; w: number; h: number }>;
-        },
+        overlays?: D3D9ScreenOverlays,
     ): void {
-        const context = this.backend.getContext();
-        if (!context) return;
-        const currentTexture = context.getCurrentTexture();
-        const targetView = currentTexture.createView();
-        this.backend.drawTexture(
-            sourceView,
-            targetView,
-            encoder,
-            true,
-            undefined,
-            undefined,
-            { r: 0, g: 0, b: 0, a: 1 },
-            undefined,
-            {
-                srcW, srcH,
-                outW: currentTexture.width, outH: currentTexture.height,
-                toCanvas: true,
-            },
-        );
+        presentD3D9FrameToCanvas(this.backend, sourceView, srcW, srcH, encoder, overlays);
+    }
 
-        // Video plane first, then GDI: a live dialog sits above a movie.
-        if (overlays?.videoOverlayCanvas) {
-            this.backend.blit(overlays.videoOverlayCanvas, targetView, encoder);
+    /**
+     * Hand each presented frame to `sink` instead of the canvas (d3d9-frame-handoff.ts): the
+     * render side's whole dependency on the screen. Null presents to the canvas again.
+     */
+    setFrameSink(sink: D3D9FrameSink | null): void {
+        this.frameSink = sink;
+        this.inProcessScreen = null;
+        if (!sink) this.frameVehicle = null;
+    }
+
+    hasFrameSink(): boolean {
+        return this.frameSink !== null;
+    }
+
+    /** Before a handed-off present: the guest's draw count for it, carried in its meta. */
+    setPresentDrawCount(draws: number | null): void {
+        this.presentDrawCount = draws;
+    }
+
+    /**
+     * The in-process hand-off: the screen layer lives on this same worker, so it is built here
+     * and the RenderActive repaint that reaches this executor is answered by it. `owner` is the
+     * presenter whose overlay policy the composite follows; null returns to the canvas.
+     */
+    useInProcessScreenLayer(owner: RenderActive | null): void {
+        if (owner === null) {
+            if (this.inProcessScreen) this.setFrameSink(null);
+            return;
         }
-        if (overlays?.gdiOverlayCanvas) {
-            const rects = overlays.gdiOverlayRects;
-            if (rects) {
-                // 3D renderer owns the screen: composite only live-dialog rects (never the
-                // whole overlay). An empty list intentionally composites nothing.
-                if (rects.length) this.backend.blitRects(overlays.gdiOverlayCanvas, targetView, encoder, rects);
-            } else {
-                this.backend.blit(overlays.gdiOverlayCanvas, targetView, encoder);
+        if (this.inProcessScreen?.owner === owner) return;
+        // A sink installed through setFrameSink (a render worker's postMessage) is the owner's
+        // decision; a flag mirrored into that worker must not re-route its frames.
+        if (this.frameSink && !this.inProcessScreen) return;
+        const layer = new D3D9ScreenLayer(this.backend, owner);
+        this.setFrameSink((bitmap, meta) => layer.presentFrame(bitmap, meta));
+        this.inProcessScreen = layer;
+    }
+
+    /** Per present on a render twin: follow `__d3d9BitmapPresent` (d3d9BitmapPresentWanted). */
+    syncInProcessScreenLayer(owner: RenderActive): void {
+        this.useInProcessScreenLayer(d3d9BitmapPresentWanted() ? owner : null);
+    }
+
+    /** Every sink present is exactly one of `sent` / `vehicleFailures`; a sent frame's fate is
+     *  the receiving layer's ledger (`screen`, when that layer is in-process). */
+    getFrameHandoffStats(): {
+        sink: boolean; inProcess: boolean; presents: number; sent: number; vehicleFailures: number;
+        sinkErrors: number; screen: D3D9ScreenLayerStats | null;
+    } {
+        return {
+            sink: this.frameSink !== null,
+            inProcess: this.inProcessScreen !== null,
+            ...this.frameHandoff,
+            screen: this.inProcessScreen?.getStats() ?? null,
+        };
+    }
+
+    private encodeFrameForSink(device: GPUDevice, encoder: GPUCommandEncoder, source: GPUTexture): boolean {
+        this.frameHandoff.presents++;
+        const format = this.backend.getFormat();
+        try {
+            this.frameVehicle ??= new D3D9FrameVehicle();
+            if (format && this.frameVehicle.encode(device, format, encoder, source)) return true;
+            this.noteFrameVehicleFailure("the vehicle canvas has no WebGPU context");
+        } catch (e) {
+            this.noteFrameVehicleFailure(String(e));
+        }
+        return false;
+    }
+
+    /** After the submit that carries encodeFrameForSink's copy. */
+    private shipFrameToSink(): void {
+        const sink = this.frameSink;
+        const vehicle = this.frameVehicle;
+        if (!sink || !vehicle) return;
+        let bitmap: ImageBitmap | null;
+        try {
+            bitmap = vehicle.transfer();
+        } catch (e) {
+            this.noteFrameVehicleFailure(String(e));
+            return;
+        }
+        if (!bitmap) {
+            this.noteFrameVehicleFailure("the vehicle had no encoded frame to transfer");
+            return;
+        }
+        const guest = this.getGuestBackbufferSize();
+        const physical = this.offscreenSize ?? { width: bitmap.width, height: bitmap.height };
+        const meta: D3D9FrameMeta = {
+            serial: ++this.frameHandoffSerial,
+            guestWidth: guest.width,
+            guestHeight: guest.height,
+            physicalWidth: physical.width,
+            physicalHeight: physical.height,
+            format: this.backend.getFormat()!,
+            drawCount: this.presentDrawCount,
+            sentAt: performance.timeOrigin + performance.now(),
+        };
+        this.presentDrawCount = null;
+        this.frameHandoff.sent++;
+        try {
+            sink(bitmap, meta);
+        } catch (e) {
+            this.frameHandoff.sinkErrors++;
+            recordGpuError("callback", "d3d9Executor.frameSink", String(e));
+            if (this.frameHandoff.sinkErrors % 200 === 1) {
+                Logger.error(LogCategory.D3D9, `[D3D9 hand-off] frame sink threw (${this.frameHandoff.sinkErrors} so far): ${e}`);
             }
         }
+    }
 
-        if (statsOverlay.isEnabled()) {
-            const statsCanvas = statsOverlay.getCanvas();
-            if (statsCanvas) {
-                if (statsOverlay.isDirty()) {
-                    this.backend.updateStatsTexture(statsCanvas);
-                    statsOverlay.clearDirty();
-                }
-                this.backend.renderStatsOverlay(targetView, encoder);
-            }
+    private noteFrameVehicleFailure(message: string): void {
+        this.frameHandoff.vehicleFailures++;
+        recordGpuError("throw", "d3d9Executor.frameVehicle", message);
+        if (this.frameHandoff.vehicleFailures % 200 === 1) {
+            Logger.error(LogCategory.D3D9,
+                `[D3D9 hand-off] frame not sent (${this.frameHandoff.vehicleFailures} so far): ${message}`);
         }
     }
 
@@ -4418,6 +4505,10 @@ export class D3D9BackendExecutor {
      * it on every route.
      */
     repaintLastFrame(): void {
+        if (this.inProcessScreen) {
+            this.inProcessScreen.repaintLastFrame();
+            return;
+        }
         // Re-present the last COMPLETE frame, not the live offscreen (which is transiently black
         // between a frame's backbuffer clear and its scene redraw — pronounced when render-to-
         // texture passes sit in that gap). Until the first present, nothing valid exists → skip,
@@ -4607,8 +4698,15 @@ export class D3D9BackendExecutor {
         return canvas.convertToBlob({ type: "image/png" });
     }
 
-    /** [diag] Ring of the last passes submitted (harness passCensus verb). */
-    private passRing: Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string; rts?: Array<string | null>; atPresent: number; depth: string }> = [];
+    /** [diag] Ring of the last passes submitted (harness passCensus verb). Fixed slots
+     *  rewritten in place, strings formatted on read: this runs once per pass, and building
+     *  the row here was an object, a template string and a spread every time. */
+    private readonly passRing: PassRingEntry[] = Array.from({ length: PASS_RING_SIZE }, () => ({
+        commands: 0, draws: 0, depthKind: "", depthClear: 0, target: "", present: false,
+        hasViewport: false, vx: 0, vy: 0, vw: 0, vh: 0, vminZ: 0, vmaxZ: 0, rts: undefined, atPresent: 0,
+    }));
+    private passRingNext = 0;
+    private passRingCount = 0;
     /** Presents observed, so a ring entry can say HOW OLD it is. A 64-entry ring survives a
      *  guest that has stopped drawing entirely, and its stale passes then read as live
      *  evidence — which is how a stalled session gets diagnosed as a rendering bug. */
@@ -4630,35 +4728,39 @@ export class D3D9BackendExecutor {
         viewport?: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number },
     ): void {
         let draws = 0;
-        for (const type of frame.commandTypes) {
+        const types = frame.commandTypes;
+        const commandCount = frame.commandCount;
+        for (let i = 0; i < commandCount; i++) {
+            const type = types[i];
             if (type === RenderCommandType.Draw || type === RenderCommandType.DrawIndexed) draws++;
         }
+        const e = this.passRing[this.passRingNext]!;
+        this.passRingNext = (this.passRingNext + 1) % PASS_RING_SIZE;
+        if (this.passRingCount < PASS_RING_SIZE) this.passRingCount++;
+        e.commands = commandCount;
+        e.draws = draws;
         // What this pass will do with DEPTH, recorded from the same inputs the attachment is
         // built from below. A pass that LOADS depth where the guest asked for a clear, or that
         // gets no depth surface at all, rejects every fragment against a buffer nobody wrote —
         // and nothing else in a census can tell that apart from "the geometry never arrived".
-        const depthKind = !target
+        e.depthKind = !target
             ? "backbuffer-default"
             : target.depthStencil
                 ? "explicit"
                 : target.depthView
-                    ? ((frame.hasClear && (frame.clear.flags & 2) !== 0)
-                        ? `clear(${frame.clear.depth})` : "load")
+                    ? ((frame.hasClear && (frame.clear.flags & 2) !== 0) ? "clear" : "load")
                     : "none";
-        this.passRing.push({
-            commands: frame.commandTypes.length,
-            draws,
-            depth: depthKind,
-            target: !target ? "offscreen" : target.backbuffer ? "backbuffer" : "rendertarget",
-            present,
-            viewport: viewport
-                ? `${viewport.x},${viewport.y} ${viewport.width}x${viewport.height} z=${viewport.minZ}..${viewport.maxZ}`
-                : "default",
-            ...(target?.rtIdentities ? { rts: target.rtIdentities } : {}),
-            atPresent: this.passPresentSerial,
-        });
+        e.depthClear = frame.clear.depth;
+        e.target = !target ? "offscreen" : target.backbuffer ? "backbuffer" : "rendertarget";
+        e.present = present;
+        e.hasViewport = !!viewport;
+        if (viewport) {
+            e.vx = viewport.x; e.vy = viewport.y; e.vw = viewport.width; e.vh = viewport.height;
+            e.vminZ = viewport.minZ; e.vmaxZ = viewport.maxZ;
+        }
+        e.rts = target?.rtIdentities;
+        e.atPresent = this.passPresentSerial;
         if (present) this.passPresentSerial++;
-        if (this.passRing.length > 64) this.passRing.shift();
     }
 
     /** HARNESS passCensus verb: the passes of the last frames, newest last.
@@ -4666,10 +4768,21 @@ export class D3D9BackendExecutor {
      *  flight. Every row carrying a large age means the guest has STOPPED drawing and the
      *  ring is a fossil, not this frame's graph. */
     getPassDebug(): Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string; rts?: Array<string | null>; agePresents: number; depth: string }> {
-        return this.passRing.map(({ atPresent, ...rest }) => ({
-            ...rest,
-            agePresents: this.passPresentSerial - atPresent,
-        }));
+        const out: Array<{ commands: number; draws: number; target: string; present: boolean; viewport: string; rts?: Array<string | null>; agePresents: number; depth: string }> = [];
+        for (let k = this.passRingCount; k > 0; k--) {
+            const e = this.passRing[(this.passRingNext - k + PASS_RING_SIZE) % PASS_RING_SIZE]!;
+            out.push({
+                commands: e.commands,
+                draws: e.draws,
+                depth: e.depthKind === "clear" ? `clear(${e.depthClear})` : e.depthKind,
+                target: e.target,
+                present: e.present,
+                viewport: e.hasViewport ? `${e.vx},${e.vy} ${e.vw}x${e.vh} z=${e.vminZ}..${e.vmaxZ}` : "default",
+                ...(e.rts ? { rts: e.rts } : {}),
+                agePresents: this.passPresentSerial - e.atPresent,
+            });
+        }
+        return out;
     }
 
     /**

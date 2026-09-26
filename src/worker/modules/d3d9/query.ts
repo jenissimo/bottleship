@@ -28,6 +28,8 @@
  * its own submitted yet. The serial seam below therefore returns S_FALSE until
  * the presentation boundary submits the batch containing the END marker, without
  * pretending that JS scheduling latency is a GPU fence.
+ * A render-worker front applies that contract at the SHIP of the batch holding the END: its
+ * worker's reply would make every frame's event spin wait out one cross-worker round trip.
  */
 
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
@@ -46,6 +48,7 @@ import { initReturnPtr } from '../../backends/webgpu/shared/dx-com-helpers';
 import { IID_IUNKNOWN, readD3D9GuidKey } from './object-contracts';
 import type { D3D9QueryManager } from './query-manager';
 import { deviceCooperativeLevel } from '../../core/gpu/gpu-device-loss-contract';
+import type { SplitQueryChannel } from '../../render/d3d9-remote-state';
 
 const D3D_OK = 0;
 const E_NOINTERFACE = 0x80004002;
@@ -110,6 +113,15 @@ type QueryRecord = {
     /** Real WebGPU query-set path when the owning device has a live adapter. */
     gpuManager?: D3D9QueryManager;
     gpuMode: boolean;
+    /** Split D3D9 front rendering in the render worker: that worker's manager resolves the
+     *  query, and GetData answers from the results it sends back (split.ts). */
+    remote?: SplitQueryChannel;
+    /** The END generation GetData waits for on `remote` (0: none). */
+    remoteToken: number;
+    /** A FLUSH already shipped this generation's work. */
+    remoteFlushed: boolean;
+    /** The ship carrying this generation's END (`remote.shipped`). */
+    remoteShipMark: number;
 };
 
 /**
@@ -221,6 +233,7 @@ function deviceDrawCount(devicePtr: number): number {
 
 type QueryDeviceHooks = {
     getQueryManager?: () => D3D9QueryManager | null;
+    splitQueries?: SplitQueryChannel | null;
     recordQueryBegin?: (queryPtr: number) => void;
     recordQueryEnd?: (queryPtr: number) => void;
     recordQueryTimestamp?: (queryPtr: number) => void;
@@ -360,6 +373,11 @@ export function tryFastGetData(queryPtr: number, pData: number, size: number, fl
     if (!pData && size) return null;
     if (query.gpuManager?.isDeviceLost?.()) return null;
     if (deviceCooperativeLevel(query.devicePtr) !== 'ok') return null;
+    if (query.remote) {
+        if (query.remote.result(query.remoteToken) || remoteReadyOnShip(query)) return null;
+        ledger.pending++;
+        return S_FALSE;
+    }
     const observedSerial = hasManagerSubmissionDomain(query.gpuManager)
         ? query.gpuManager!.getSubmittedSerial()
         : (deviceSubmissionSerial.get(query.devicePtr) ?? 0);
@@ -463,6 +481,58 @@ function noteGetData(queryPtr: number, hr: number): number {
     return hr;
 }
 
+/** END on a split front: the worker is told in stream order and names this generation back. */
+function remoteEnd(query: QueryRecord, queryPtr: number): void {
+    completeQueryEnd(query);
+    query.remoteToken = query.remote!.end(queryPtr, query.remoteToken, readyOnShip(query.type));
+    query.remoteShipMark = query.remote!.shipMark();
+    query.remoteFlushed = false;
+}
+
+/** EVENT and TIMESTAMPDISJOINT fence submission only (their DATA is the front's record), so
+ *  on a split front they are ready once their END has shipped — see the header. */
+function readyOnShip(type: number): boolean {
+    return type === D3DQUERYTYPE_EVENT || type === D3DQUERYTYPE_TIMESTAMPDISJOINT;
+}
+
+function remoteReadyOnShip(query: QueryRecord): boolean {
+    return readyOnShip(query.type) && query.remote!.shipped(query.remoteShipMark);
+}
+
+/**
+ * GetData on a split front, after the END. OCCLUSION and TIMESTAMP wait for the render worker's
+ * measured result for THIS generation; EVENT and TIMESTAMPDISJOINT are ready once their END shipped.
+ */
+function remoteGetData(query: QueryRecord, queryPtr: number, pData: number, count: number, flags: number): number {
+    const remote = query.remote!;
+    // One ship per generation: the guest spins on GetData(FLUSH), and everything the END fences
+    // was recorded before it.
+    if ((flags & D3DGETDATA_FLUSH) !== 0 && !query.remoteFlushed) {
+        query.remoteFlushed = true;
+        remote.flush(queryPtr, query.remoteToken);
+    }
+    if (remoteReadyOnShip(query)) {
+        remote.noteShipReadyAnswered();
+        if (count === 0) return D3D_OK;
+        return writeQueryData(pData, count, issuedQueryValue(query)) ? D3D_OK : D3DERR_INVALIDCALL;
+    }
+    const result = remote.result(query.remoteToken);
+    if (!result) return S_FALSE;
+    remote.noteAnswered();
+    if (query.type === D3DQUERYTYPE_OCCLUSION || query.type === D3DQUERYTYPE_TIMESTAMP) {
+        if (result.state === 'unavailable' || result.value === undefined) return D3DERR_NOTAVAILABLE;
+        if (count === 0) return D3D_OK;
+        if (query.type === D3DQUERYTYPE_TIMESTAMP) {
+            return writeQueryUint64(pData, Math.min(count, 8), result.value) ? D3D_OK : D3DERR_INVALIDCALL;
+        }
+        return writeQueryData(pData, count,
+            occlusionPixelsFromGpu(query, result.value, result.sampleScale, result.sampleScaleMixed === true))
+            ? D3D_OK : D3DERR_INVALIDCALL;
+    }
+    if (count === 0) return D3D_OK;
+    return writeQueryData(pData, count, issuedQueryValue(query)) ? D3D_OK : D3DERR_INVALIDCALL;
+}
+
 export function createQueryExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -488,8 +558,9 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
             return D3DERR_NOTAVAILABLE;
         }
         const manager = queryDeviceHooks(pDevice)?.getQueryManager?.() ?? null;
-        if (type === D3DQUERYTYPE_TIMESTAMP && manager
-            && !manager.getCapability('timestamp').supported) {
+        const remote = manager ? null : queryDeviceHooks(pDevice)?.splitQueries ?? null;
+        if (type === D3DQUERYTYPE_TIMESTAMP && ((manager && !manager.getCapability('timestamp').supported)
+            || (remote && !remote.timestampSupported()))) {
             Logger.log(LogCategory.D3D9, 'CreateQuery(TIMESTAMP): timestamp-query feature unavailable');
             if (ppQuery) initReturnPtr(ppQuery);
             return D3DERR_NOTAVAILABLE;
@@ -514,6 +585,9 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
             awaitingResult: false,
             lostNoted: false,
             gpuMode: false,
+            remoteToken: 0,
+            remoteFlushed: false,
+            remoteShipMark: 0,
         };
         if (manager) {
             const handle = manager.acquire(queryPtr, record);
@@ -529,11 +603,17 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         }
         queries.set(queryPtr, record);
         ledger.created++;
+        // Static information queries (VCACHE, TIMESTAMPFREQ) fence nothing: answered here.
+        if (remote && queryNeedsSubmission(type)) {
+            record.remote = remote;
+            remote.create(queryPtr, type);
+        }
         registerDeviceChildFinalizer(queryPtr, pDevice, () => {
             // A recycled COM pointer hands this finalizer the NEXT object's record; passing
             // our own lets the manager's guard — and the identity check — keep to our generation.
             record.gpuManager?.release(queryPtr, record);
             if (queries.get(queryPtr) !== record) return;
+            record.remote?.release(queryPtr, record.remoteToken);
             noteRetired(record);
             queries.delete(queryPtr);
         });
@@ -635,10 +715,16 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                 query.disjointBeginTime = query.type === D3DQUERYTYPE_TIMESTAMPDISJOINT
                     ? nowD3dTicks() : null;
                 query.disjointEndTime = null;
-                if (query.type === D3DQUERYTYPE_OCCLUSION) {
+                if (query.remote) {
+                    query.remote.begin(args[0] >>> 0, query.remoteToken);
+                    query.remoteToken = 0;
+                } else if (query.type === D3DQUERYTYPE_OCCLUSION) {
                     queryDeviceHooks(query.devicePtr)?.recordQueryBegin?.(args[0] >>> 0);
                 }
             }
+        } else if (query.remote) {
+            // The worker runs the re-arm / re-begin sequence against its own manager.
+            remoteEnd(query, args[0] >>> 0);
         } else {
             if (query.type === D3DQUERYTYPE_OCCLUSION && !query.begun) {
                 // END-only is an implicit zero-width interval, but the GPU query API still
@@ -716,7 +802,9 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
             }
             return S_FALSE;
         }
-        if (!query.issued) {
+        if (!query.issued && query.remote) {
+            remoteEnd(query, args[0] >>> 0);
+        } else if (!query.issued) {
             if (query.type === D3DQUERYTYPE_OCCLUSION && !query.begun) {
                 queryDeviceHooks(query.devicePtr)?.recordQueryBegin?.(args[0] >>> 0);
             }
@@ -727,6 +815,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
                 queryDeviceHooks(query.devicePtr)?.recordQueryTimestamp?.(args[0] >>> 0);
             }
         }
+        if (query.remote) return remoteGetData(query, args[0] >>> 0, pData, count, args[3] >>> 0);
         // D3DGETDATA_FLUSH asks the runtime to flush the command buffer so the work this
         // query fenced can retire. A live GPU manager still reports S_FALSE until its mapped
         // resolve is ready; for CPU-side completion records a flush request advances the local

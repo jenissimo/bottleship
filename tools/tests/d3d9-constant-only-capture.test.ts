@@ -41,7 +41,7 @@ function fixture(bump = false, relative = false) {
         getRS: (k: number) => rs.get(k) ?? 0,
         stateTracker: { getRenderState: (k: number) => rs.get(k) ?? 0, getTexture: (i: number) => i < 2 ? i : null },
         getTextureStageState: (s: number, k: number) => stages.get(s * 256 + k) ?? 0,
-        boundComparisonSamplers: () => new Map(), boundCubeMask: () => 0,
+        boundComparisonSamplers: () => new Map(), boundComparisonMask: () => 0, boundCubeMask: () => 0,
         boundVolumeMask: () => 0, boundVertexVolumeMask: () => 0,
         resolveFragmentStageView: (s: number) => views[s] ?? null,
         resolveStageSampler: (s: number) => samplers[s < 16 ? s : s - 241],
@@ -153,11 +153,12 @@ describe('constant-only snapshot', () => {
             }
             recorder.recordEndOcclusionQuery(123);
             const frame = recorder.getCurrentFrame();
-            expect(frame.commandTypes.filter(x => x === RenderCommandType.DrawIndexed)).toHaveLength(12);
+            const n = frame.commandCount;
+            expect(frame.commandTypes.slice(0, n).filter(x => x === RenderCommandType.DrawIndexed)).toHaveLength(12);
             expect(recorder.getIndexedDrawsRecorded()).toBe(12);
             expect(frame.drawStateCount).toBe(12);
-            return { types: frame.commandTypes, a: frame.commandA, b: frame.commandB,
-                c: frame.commandC, d: frame.commandD,
+            return { types: frame.commandTypes.slice(0, n), a: frame.commandA.slice(0, n), b: frame.commandB.slice(0, n),
+                c: frame.commandC.slice(0, n), d: frame.commandD.slice(0, n),
                 vs: frame.drawStates.map(s => Array.from(s.vsBits.subarray(0, s.vsLen))),
                 ps: frame.drawStates.map(s => Array.from(s.psBits.subarray(0, s.psLen))) };
         }

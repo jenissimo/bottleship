@@ -35,8 +35,74 @@ export {
 // Shared vtables - created once and reused
 let vtables: Record<string, VTableInfo> | null = null;
 
-// Shared device registry - maps COM object pointer to D3D9Device instance
-export const devices: Map<number, D3D9Device> = new Map();
+/**
+ * Device registry: COM object pointer -> D3D9Device. `lookup` is the per-call path of the
+ * setter handlers, which read the device pointer out of guest memory: a pointer above 2^30
+ * is not a Smi, so handing it to Map.get boxes a HeapNumber on every call. A one-entry cache
+ * compares the raw number instead, and every mutation drops it, so a torn-down or
+ * re-registered pointer can never alias a stale device.
+ */
+class DeviceRegistry extends Map<number, D3D9Device> {
+    private lastPtr = -1;
+    private lastDevice: D3D9Device | undefined = undefined;
+
+    lookup(ptr: number): D3D9Device | undefined {
+        let device: D3D9Device | undefined;
+        if (ptr === this.lastPtr) device = this.lastDevice;
+        else {
+            device = super.get(ptr);
+            this.lastPtr = ptr;
+            this.lastDevice = device;
+        }
+        return splitReplayDepth === 0 || device === undefined ? device : (device.renderTwin ?? device);
+    }
+
+    override get(key: number): D3D9Device | undefined {
+        const device = super.get(key);
+        return splitReplayDepth === 0 || device === undefined ? device : (device.renderTwin ?? device);
+    }
+
+    override set(key: number, value: D3D9Device): this {
+        this.forget();
+        return super.set(key, value);
+    }
+
+    override delete(key: number): boolean {
+        this.forget();
+        return super.delete(key);
+    }
+
+    override clear(): void {
+        this.forget();
+        super.clear();
+    }
+
+    private forget(): void {
+        this.lastPtr = -1;
+        this.lastDevice = undefined;
+    }
+}
+
+export const devices = new DeviceRegistry();
+
+/**
+ * Split D3D9 (modules/d3d9/split.ts): while the render twin replays the call stream, the
+ * registries the ring handlers read answer with the twin's objects — the same handler code
+ * then drives the twin. Outside a replay they are the front's, as always.
+ */
+let splitReplayDepth = 0;
+export function beginD3D9SplitReplay(): void { splitReplayDepth++; }
+export function endD3D9SplitReplay(): void { splitReplayDepth--; }
+export function isD3D9SplitReplay(): boolean { return splitReplayDepth !== 0; }
+
+/** The render twin's state blocks, by COM pointer (registered through the call stream). */
+export const twinStateBlocks: Map<number, D3D9StateBlockData> = new Map();
+
+class StateBlockRegistry extends Map<number, D3D9StateBlockData> {
+    override get(key: number): D3D9StateBlockData | undefined {
+        return splitReplayDepth === 0 ? super.get(key) : twinStateBlocks.get(key);
+    }
+}
 
 // Parent relationship for IDirect3DDevice9::GetDirect3D
 export const deviceToD3D9: Map<number, number> = new Map();
@@ -77,7 +143,7 @@ export const deviceBackBufferInfo: Map<number, {
 export const resourceToDevice: Map<number, D3D9Device> = new Map();
 
 // State block COM objects → captured/replayed state data
-export const stateBlocks: Map<number, D3D9StateBlockData> = new Map();
+export const stateBlocks: Map<number, D3D9StateBlockData> = new StateBlockRegistry();
 
 /**
  * Device COM ptr → D3DCLIPSTATUS9 {ClipUnion, ClipIntersection}, as last written by

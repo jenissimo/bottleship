@@ -132,9 +132,9 @@ describe("D3D9 WASM arena pipeline identity", () => {
             arenaCommandType: 3,
         });
         const frame = recorder.finalize();
-        expect(frame.commandTypes.at(-1)).toBe(RenderCommandType.Draw);
+        expect(frame.commandTypes[frame.commandCount - 1]).toBe(RenderCommandType.Draw);
         expect(frame.arenaDrawBindings).toEqual([{
-            frameDrawCommand: frame.commandTypes.length - 1,
+            frameDrawCommand: frame.commandCount - 1,
             arenaDrawCommand: 4,
             arenaPipelineKey: 0xdeadbeef,
             pipelineId: 7,
@@ -172,9 +172,10 @@ describe("D3D9 WASM arena pipeline identity", () => {
         });
 
         const frame = recorder.finalize();
-        const runAt = frame.commandTypes.indexOf(RenderCommandType.DrawIndexedArenaRun);
+        const live = frame.commandTypes.slice(0, frame.commandCount);
+        const runAt = live.indexOf(RenderCommandType.DrawIndexedArenaRun);
         expect(runAt).toBeGreaterThanOrEqual(0);
-        expect(frame.commandTypes.slice(runAt + 1)).toContain(RenderCommandType.BindProgrammable);
+        expect(live.slice(runAt + 1)).toContain(RenderCommandType.BindProgrammable);
     });
 
     test("clears cube metadata when a TextureStore slot is destroyed and recycled", () => {

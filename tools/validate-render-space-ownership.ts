@@ -39,6 +39,8 @@ const SCOPES = [
     // so the modules that own them are in scope or the rule holds only where it was written.
     join("src", "worker", "modules", "ddraw"),
     join("src", "worker", "modules", "glide2x"),
+    // The split D3D9 render worker renders to a canvas of its own and is TOLD the present target.
+    join("src", "worker", "render"),
 ];
 
 /**
@@ -84,6 +86,8 @@ const ALLOWED = new Set<string>([
     // The renderSpace harness verb REPORTS the canvas as the canvas, side by side with the
     // guest extent — naming the two spaces is the opposite of confusing them.
     "src/worker/backends/webgpu/d3d9/d3d9-device.ts#getRenderSpace",
+    // Split D3D9: the emulator worker's present target, sent to the render worker's resolver.
+    "src/worker/render/d3d9-render-client.ts#syncPresentTarget",
     // DDraw: the no-WebGPU present. That 2D drawImage IS the present pass, and it owes the
     // same host-sized stretch the GPU one does — the scratch it copies from is guest-sized.
     "src/worker/modules/ddraw/presenter.ts#drawFrame",

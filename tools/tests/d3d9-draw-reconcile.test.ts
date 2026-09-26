@@ -268,6 +268,7 @@ describe("d3d9 frame-discard draw accounting", () => {
             RenderCommandType.DrawIndexed,
         ],
         commandA: [0, 0, 0],
+        commandCount: 3,
         arenaIndexedRuns: [{ expectedPairCount: 12, prefixVsBits: new Uint32Array(4) }],
     } as unknown as RenderFrame;
 
@@ -289,6 +290,7 @@ describe("d3d9 frame-discard draw accounting", () => {
         const dangling = {
             commandTypes: [RenderCommandType.DrawIndexedArenaRun, RenderCommandType.DrawIndexed],
             commandA: [7, 0],
+            commandCount: 2,
             arenaIndexedRuns: [],
         } as unknown as RenderFrame;
         const e = makeExecutor();
@@ -374,6 +376,7 @@ describe("d3d9 frame refused before execute", () => {
             RenderCommandType.DrawIndexed,
         ],
         commandA: [0, 0, 0],
+        commandCount: 3,
         arenaIndexedRuns: [{ expectedPairCount: 12, prefixVsBits: new Uint32Array(4) }],
     } as unknown as RenderFrame;
 
@@ -422,7 +425,7 @@ describe("d3d9 frame refused before execute", () => {
         resetD3D9Perf();
         const e = makeExecutor();
         e.noteFrameDiscardedBeforeExecute(
-            { commandTypes: [], commandA: [], arenaIndexedRuns: [] } as unknown as RenderFrame,
+            { commandTypes: [], commandA: [], commandCount: 0, arenaIndexedRuns: [] } as unknown as RenderFrame,
             "noColorTargetFormats");
         expect(getD3D9PerfSnapshot().indexedDrawUnencoded).toEqual({});
         expect(e.metrics.arenaRunPairsFrameDiscarded).toBe(0);

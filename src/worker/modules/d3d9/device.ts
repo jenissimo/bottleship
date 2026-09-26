@@ -46,6 +46,7 @@ import {
     releaseComRef, resourceToDevice, deviceToD3D9, deviceCreationParams,
     deviceBackBufferInfo,
 } from './shared-state';
+import { addBindingRef, adoptBindingRef, releaseBindingRef } from './com-refs';
 import {
     clearDeviceRenderTargets,
     deviceBoundDepthStencil,
@@ -79,6 +80,9 @@ import {
     validateDevicePresent,
 } from './swapchain';
 import { notifyDeviceSubmission } from './query';
+import { attachD3D9Split, d3d9SplitWanted, splitBindDevicePointer } from './split';
+import { acquireD3D9RenderClient, d3d9SplitWorkerWanted, type RenderHandlerSource } from '../../render/d3d9-render-client';
+import { d3d9WasmArena } from '../../backends/webgpu/d3d9/d3d9-wasm-arena';
 import { initReturnPtr } from '../../backends/webgpu/shared/dx-com-helpers';
 
 const D3DFMT_X8R8G8B8 = 22;
@@ -137,7 +141,7 @@ function surfaceRefTarget(surfacePtr: number): number {
  *  free it), and what was incremented is recorded — see deviceSlotRefs. */
 function rebindSurfaceSlot(devicePtr: number, slot: string, surfacePtr: number): void {
     const target = surfaceRefTarget(surfacePtr);
-    if (target) addComRef(target);
+    if (target) addBindingRef(target);
     releaseSurfaceSlot(devicePtr, slot);
     if (target) setDeviceSlotRef(devicePtr, slot, target);
 }
@@ -146,12 +150,15 @@ function rebindSurfaceSlot(devicePtr: number, slot: string, surfacePtr: number):
 function adoptSurfaceSlot(devicePtr: number, slot: string, surfacePtr: number): void {
     const target = surfaceRefTarget(surfacePtr);
     releaseSurfaceSlot(devicePtr, slot);
-    if (target) setDeviceSlotRef(devicePtr, slot, target);
+    if (target) {
+        adoptBindingRef(target);
+        setDeviceSlotRef(devicePtr, slot, target);
+    }
 }
 
 function releaseSurfaceSlot(devicePtr: number, slot: string): void {
     const held = takeDeviceSlotRef(devicePtr, slot);
-    if (held) releaseComRef(held);
+    if (held) releaseBindingRef(held);
 }
 
 function renderTargetSlot(index: number): string {
@@ -164,7 +171,7 @@ function renderTargetSlot(index: number): string {
  *  identity before the census makes an app that merely kept its GetBackBuffer pointer look
  *  like it leaked a render target. */
 function releaseDeviceBindingRefs(devicePtr: number): void {
-    for (const held of takeAllDeviceSlotRefs(devicePtr)) releaseComRef(held);
+    for (const held of takeAllDeviceSlotRefs(devicePtr)) releaseBindingRef(held);
 }
 
 /** The above plus the implicit back buffers — device teardown, or a Reset that succeeded. */
@@ -583,6 +590,21 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             // Create D3D9Device instance
             const device = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
             device.isExtended = isExtended;
+            // Split D3D9: a render twin replays everything this device is asked, from here on —
+            // in this worker (built second, so it is the active presenter) or in the render worker.
+            if (d3d9SplitWanted() && process.dispatcher) {
+                const dispatcher = process.dispatcher as unknown as Parameters<typeof attachD3D9Split>[2] & RenderHandlerSource;
+                const remote = d3d9SplitWorkerWanted() ? await acquireD3D9RenderClient(dispatcher) : null;
+                if (remote) {
+                    d3d9WasmArena.suspend();
+                    attachD3D9Split(device, null, dispatcher, remote);
+                } else if (!d3d9SplitWorkerWanted()) {
+                    d3d9WasmArena.suspend();
+                    const twin = new D3D9Device(backend, getD3D9MsaaCapabilityContract());
+                    twin.isExtended = isExtended;
+                    attachD3D9Split(device, twin, dispatcher, null);
+                }
+            }
             // D3DCREATE_SOFTWARE_VERTEXPROCESSING selects the initial VP mode. Mixed VP starts
             // in hardware mode and can be switched explicitly with SetSoftwareVertexProcessing.
             device.setSoftwareVertexProcessing((BehaviorFlags & D3DCREATE_SOFTWARE_VERTEXPROCESSING) !== 0);
@@ -649,7 +671,8 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
             
             // Store device instance mapped to COM object pointer
             devices.set(devicePtr, device);
-            registerLossTrackedDevice(devicePtr);
+            splitBindDevicePointer(device, devicePtr);
+            registerLossTrackedDevice(devicePtr, device.getSplitLossSource() ?? undefined);
             deviceToD3D9.set(devicePtr, pD3D9);
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter >>> 0,

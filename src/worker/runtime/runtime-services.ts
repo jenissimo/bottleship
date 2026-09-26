@@ -218,12 +218,27 @@ export class RenderService {
         this.firstPresentFired = false;
     }
 
+    /** A present that reaches the canvas in the same call: both edges at once. */
     notifyPresent(presenterKind: PresenterKind): void {
+        if (presenterKind !== "video") this.notifyGuestPresent();
+        this.notifyCanvasPresent(presenterKind);
+    }
+
+    /**
+     * The GUEST's Present, for a presenter whose pixels reach the canvas later (threaded D3D9:
+     * the frame arrives from the render side and brings notifyCanvasPresent with it). Advances
+     * only the serial video routing and the GDI loop read "did the app present" from.
+     */
+    notifyGuestPresent(): void {
+        this.guestPresentSerial += 1;
+    }
+
+    /** Pixels reached the canvas: the mirror, first-present, cadence and frame-time edge. */
+    notifyCanvasPresent(presenterKind: PresenterKind): void {
         this.presentSerial += 1;
-        if (presenterKind !== "video") this.guestPresentSerial += 1;
         this.lastPresenterKind = presenterKind;
-        // Screenshot mirror: encoded here because EVERY present path funnels through
-        // notifyPresent, so no backend can silently miss it and leave a stale image.
+        // Screenshot mirror: encoded here because EVERY present path funnels through this
+        // edge, so no backend can silently miss it and leave a stale image.
         if (this.mirrorCurrentFrame()) this.screenMirrorSerial = this.presentSerial;
         if (!this.firstPresentFired) {
             this.firstPresentFired = true;

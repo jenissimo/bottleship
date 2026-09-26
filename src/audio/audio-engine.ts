@@ -69,7 +69,7 @@ const STREAMING_THRESHOLD_BYTES = 512 * 1024;
 // to be discovered as "the counters are all zero for no visible reason" —
 // AudioContext caches a worklet module by exact URL, so an unbumped `v` after
 // an edit serves the OLD module (old code, old baked-in version) silently.
-const AUDIO_WORKLET_VERSION = 6;
+const AUDIO_WORKLET_VERSION = 7;
 /** How long to wait for a worklet's "ready" handshake before treating a missing
  *  one as a stale-module load worth a loud console.error rather than silence. */
 const WORKLET_READY_TIMEOUT_MS = 3000;

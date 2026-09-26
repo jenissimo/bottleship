@@ -41,15 +41,21 @@ let wasmViewBuffer: ArrayBufferLike | null = null;
 let wasmViewDv: DataView | null = null;
 let wasmViewBytes: Uint8Array | null = null;
 
+const wasmViewPair: { dv: DataView; bytes: Uint8Array } = { dv: null!, bytes: null! };
+
+/** The cached pair, handed out as one reused object (callers read it immediately). */
 function wasmViews(cpu: any): { dv: DataView; bytes: Uint8Array } | null {
     const buffer = cpu?.wasm_memory?.buffer;
-    if (!buffer || buffer.byteLength === 0) return null;
+    if (!buffer) return null;
     if (wasmViewBuffer !== buffer || wasmViewDv === null || wasmViewBytes === null) {
+        if (buffer.byteLength === 0) return null;
         wasmViewBuffer = buffer;
         wasmViewDv = new DataView(buffer);
         wasmViewBytes = new Uint8Array(buffer);
+        wasmViewPair.dv = wasmViewDv;
+        wasmViewPair.bytes = wasmViewBytes;
     }
-    return { dv: wasmViewDv, bytes: wasmViewBytes };
+    return wasmViewPair;
 }
 
 /** v86 lib.js `view()` wraps WASM memory in a Proxy — not instanceof Uint8Array. */
@@ -73,13 +79,25 @@ function getExportedFpuSimdDirty(cpu: any): { [index: number]: number; length: n
  * export from pre-rebuild padding, and cannot be answered from the byte's value — still
  * asks the CPU object.
  */
-function getFpuSimdDirtyView(v86: any): { [index: number]: number; length: number } | null {
+function readFpuSimdDirty(v86: any): number {
+    const cpu = getCPU(v86);
+    const views = wasmViews(cpu);
+    if (views && views.bytes.length > FPU_SIMD_DIRTY_OFFSET) return views.bytes[FPU_SIMD_DIRTY_OFFSET]!;
+    const flag = getExportedFpuSimdDirty(cpu);
+    return flag !== null ? flag[0]! : 0;
+}
+
+/** Indexes the whole-memory byte view at the flag's offset: a one-byte subarray per call
+ *  was an allocation on every context switch. */
+function writeFpuSimdDirty(v86: any, value: number): void {
     const cpu = getCPU(v86);
     const views = wasmViews(cpu);
     if (views && views.bytes.length > FPU_SIMD_DIRTY_OFFSET) {
-        return views.bytes.subarray(FPU_SIMD_DIRTY_OFFSET, FPU_SIMD_DIRTY_OFFSET + 1);
+        views.bytes[FPU_SIMD_DIRTY_OFFSET] = value;
+        return;
     }
-    return getExportedFpuSimdDirty(cpu);
+    const flag = getExportedFpuSimdDirty(cpu);
+    if (flag) flag[0] = value;
 }
 
 /** True only when v86 cpu.js wired cpu.fpu_simd_dirty (post-rebuild). No raw-offset probe —
@@ -89,18 +107,15 @@ export function hasFpuSimdDirtyFlag(v86: any): boolean {
 }
 
 export function isFpuSimdDirty(v86: any): boolean {
-    const flag = getFpuSimdDirtyView(v86);
-    return flag !== null && flag[0] !== 0;
+    return readFpuSimdDirty(v86) !== 0;
 }
 
 export function markFpuSimdDirty(v86: any): void {
-    const flag = getFpuSimdDirtyView(v86);
-    if (flag) flag[0] = 1;
+    writeFpuSimdDirty(v86, 1);
 }
 
 export function clearFpuSimdDirty(v86: any): void {
-    const flag = getFpuSimdDirtyView(v86);
-    if (flag) flag[0] = 0;
+    writeFpuSimdDirty(v86, 0);
 }
 
 /**

@@ -369,7 +369,7 @@ export class D3D9CommandRecorder {
 
     /** Associate the just-recorded RenderFrame draw with its WASM-arena command. */
     recordArenaBinding(binding: Omit<ArenaDrawBinding, "frameDrawCommand">): void {
-        const drawCommand = this.frame.commandTypes.length - 1;
+        const drawCommand = this.frame.commandCount - 1;
         if (drawCommand < 0 || (this.frame.commandTypes[drawCommand] !== RenderCommandType.Draw
             && this.frame.commandTypes[drawCommand] !== RenderCommandType.DrawIndexed)) return;
         this.frame.arenaDrawBindings.push({ ...binding, frameDrawCommand: drawCommand });

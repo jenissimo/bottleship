@@ -144,14 +144,20 @@ export class RenderFrame {
     hasClear = false;
     clear: RenderClear = { color: { r: 0, g: 0, b: 0, a: 1 }, depth: 1.0, stencil: 0, flags: 0 };
 
+    /** Command lanes. Only `[0, commandCount)` is this frame's; the arrays keep their
+     *  high-water length across reset(), because shrinking a V8 array to 0 frees its backing
+     *  store and a frame of ~10k commands then regrows it from nothing on every flush. */
     commandTypes: number[] = [];
     commandA: number[] = [];
     commandB: number[] = [];
     commandC: number[] = [];
     /** Vertex-buffer slot for SetVertexBuffer commands (= D3D stream number); 0 otherwise. */
     commandD: number[] = [];
+    commandCount = 0;
 
+    /** Indexed by command lanes; `[0, bufferRefCount)` is live, same discipline as the lanes. */
     bufferRefs: GPUBuffer[] = [];
+    private bufferRefCount = 0;
     uploadBuffers: GPUBuffer[] = [];
     uploadData: Uint8Array[] = [];
     /** Destination byte offset per queued upload — a partial upload writes only the range
@@ -181,12 +187,11 @@ export class RenderFrame {
         // A clear descriptor belongs to the submitted frame; do not carry its plane mask into
         // the next pooled RenderFrame.
         this.clear.flags = 0;
-        this.commandTypes.length = 0;
-        this.commandA.length = 0;
-        this.commandB.length = 0;
-        this.commandC.length = 0;
-        this.commandD.length = 0;
-        this.bufferRefs.length = 0;
+        this.commandCount = 0;
+        // Drop the previous frame's buffer references so a destroyed GPUBuffer is not held
+        // past its frame; the slots themselves stay allocated.
+        for (let i = 0; i < this.bufferRefCount; i++) this.bufferRefs[i] = undefined as unknown as GPUBuffer;
+        this.bufferRefCount = 0;
         this.uploadBuffers.length = 0;
         this.uploadData.length = 0;
         this.uploadOffsets.length = 0;
@@ -215,44 +220,42 @@ export class RenderFrame {
         this.hasClear = true;
     }
 
+    private pushCommand(type: number, a: number, b: number, c: number, d: number): void {
+        const n = this.commandCount++;
+        this.commandTypes[n] = type;
+        this.commandA[n] = a;
+        this.commandB[n] = b;
+        this.commandC[n] = c;
+        this.commandD[n] = d;
+    }
+
+    private pushBufferRef(buffer: GPUBuffer): number {
+        const index = this.bufferRefCount++;
+        this.bufferRefs[index] = buffer;
+        return index;
+    }
+
     pushSetPipeline(pipelineId: number): void {
-        this.commandTypes.push(RenderCommandType.SetPipeline);
-        this.commandA.push(pipelineId);
-        this.commandB.push(0);
-        this.commandC.push(0);
-        this.commandD.push(0);
+        this.pushCommand(RenderCommandType.SetPipeline, pipelineId, 0, 0, 0);
     }
 
     pushSetVertexBuffer(buffer: GPUBuffer, offset: number, size: number, slot = 0): void {
-        const index = this.bufferRefs.length;
-        this.bufferRefs.push(buffer);
-        this.commandTypes.push(RenderCommandType.SetVertexBuffer);
-        this.commandA.push(index);
-        this.commandB.push(offset);
-        this.commandC.push(size);
-        this.commandD.push(slot);
+        const index = this.pushBufferRef(buffer);
+        this.pushCommand(RenderCommandType.SetVertexBuffer, index, offset, size, slot);
     }
 
     /** commandC carries the guest's SetStreamSource stride for slot 0 — diagnostic only, but
      *  it is the one number the encoder cannot recover, and a refused draw needs BOTH it and
      *  the pipeline's arrayStride to say which of the two is wrong. */
     pushDraw(vertexCount: number, startVertex: number, guestStride = 0, instanceCount = 1): void {
-        this.commandTypes.push(RenderCommandType.Draw);
-        this.commandA.push(vertexCount);
-        this.commandB.push(startVertex);
-        this.commandC.push(guestStride);
-        this.commandD.push(Math.max(0, instanceCount | 0));
+        this.pushCommand(RenderCommandType.Draw, vertexCount, startVertex, guestStride, Math.max(0, instanceCount | 0));
     }
 
     /** Set the raster scissor for the following draw. Coordinates are already clamped to the
      * active render target by the D3D9 device; keeping them in the compact command lanes avoids
      * allocating a per-draw object in the frame recorder. */
     pushSetScissor(left: number, top: number, width: number, height: number): void {
-        this.commandTypes.push(RenderCommandType.SetScissor);
-        this.commandA.push(left | 0);
-        this.commandB.push(top | 0);
-        this.commandC.push(width | 0);
-        this.commandD.push(height | 0);
+        this.pushCommand(RenderCommandType.SetScissor, left | 0, top | 0, width | 0, height | 0);
     }
 
     /** Set the viewport for the following draws. D3D9 viewport is per-draw state while a
@@ -261,58 +264,37 @@ export class RenderFrame {
     pushSetViewport(x: number, y: number, width: number, height: number, minZ: number, maxZ: number): void {
         const base = this.viewportData.length;
         this.viewportData.push(x, y, width, height, minZ, maxZ);
-        this.commandTypes.push(RenderCommandType.SetViewport);
-        this.commandA.push(base);
-        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+        this.pushCommand(RenderCommandType.SetViewport, base, 0, 0, 0);
     }
 
     pushBeginOcclusionQuery(queryPtr: number): void {
-        this.commandTypes.push(RenderCommandType.BeginOcclusionQuery);
-        this.commandA.push(queryPtr >>> 0);
-        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+        this.pushCommand(RenderCommandType.BeginOcclusionQuery, queryPtr >>> 0, 0, 0, 0);
     }
 
     pushEndOcclusionQuery(queryPtr: number): void {
-        this.commandTypes.push(RenderCommandType.EndOcclusionQuery);
-        this.commandA.push(queryPtr >>> 0);
-        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+        this.pushCommand(RenderCommandType.EndOcclusionQuery, queryPtr >>> 0, 0, 0, 0);
     }
 
     pushTimestampQuery(queryPtr: number): void {
-        this.commandTypes.push(RenderCommandType.TimestampQuery);
-        this.commandA.push(queryPtr >>> 0);
-        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+        this.pushCommand(RenderCommandType.TimestampQuery, queryPtr >>> 0, 0, 0, 0);
     }
 
     pushSetStencilReference(reference: number): void {
-        this.commandTypes.push(RenderCommandType.SetStencilReference);
-        this.commandA.push(reference & 0xff);
-        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+        this.pushCommand(RenderCommandType.SetStencilReference, reference & 0xff, 0, 0, 0);
     }
 
     pushSetBlendConstant(color: number): void {
-        this.commandTypes.push(RenderCommandType.SetBlendConstant);
-        this.commandA.push(color >>> 0);
-        this.commandB.push(0); this.commandC.push(0); this.commandD.push(0);
+        this.pushCommand(RenderCommandType.SetBlendConstant, color >>> 0, 0, 0, 0);
     }
 
     pushSetIndexBuffer(buffer: GPUBuffer, format: "uint16" | "uint32"): void {
-        const index = this.bufferRefs.length;
-        this.bufferRefs.push(buffer);
-        this.commandTypes.push(RenderCommandType.SetIndexBuffer);
-        this.commandA.push(index);
-        this.commandB.push(format === "uint16" ? 16 : 32);
-        this.commandC.push(0);
-        this.commandD.push(0);
+        const index = this.pushBufferRef(buffer);
+        this.pushCommand(RenderCommandType.SetIndexBuffer, index, format === "uint16" ? 16 : 32, 0, 0);
     }
 
     /** `instanceCount` is D3D9 hardware instancing (SetStreamSourceFreq); 1 = ordinary draw. */
     pushDrawIndexed(indexCount: number, startIndex: number, baseVertex: number, instanceCount = 1): void {
-        this.commandTypes.push(RenderCommandType.DrawIndexed);
-        this.commandA.push(indexCount);
-        this.commandB.push(startIndex);
-        this.commandC.push(baseVertex);
-        this.commandD.push(instanceCount);
+        this.pushCommand(RenderCommandType.DrawIndexed, indexCount, startIndex, baseVertex, instanceCount);
     }
 
     pushDrawIndexedArenaRun(
@@ -325,11 +307,7 @@ export class RenderFrame {
             arenaCommandStart, arenaCommandEnd, bindStateIndex, pipelineId, expectedPairCount,
             compactDescriptorOffset, prefixVsBits, prefixStartFloat,
         });
-        this.commandTypes.push(RenderCommandType.DrawIndexedArenaRun);
-        this.commandA.push(runIndex);
-        this.commandB.push(0);
-        this.commandC.push(0);
-        this.commandD.push(0);
+        this.pushCommand(RenderCommandType.DrawIndexedArenaRun, runIndex, 0, 0, 0);
     }
 
     /**
@@ -391,11 +369,7 @@ export class RenderFrame {
     }
 
     pushBindProgrammable(stateIndex: number): void {
-        this.commandTypes.push(RenderCommandType.BindProgrammable);
-        this.commandA.push(stateIndex);
-        this.commandB.push(0);
-        this.commandC.push(0);
-        this.commandD.push(0);
+        this.pushCommand(RenderCommandType.BindProgrammable, stateIndex, 0, 0, 0);
     }
 
     /** Acquire a pooled FFP draw-state slot; caller fills block/texture.
@@ -422,11 +396,7 @@ export class RenderFrame {
     }
 
     pushBindFfp(stateIndex: number): void {
-        this.commandTypes.push(RenderCommandType.BindFfp);
-        this.commandA.push(stateIndex);
-        this.commandB.push(0);
-        this.commandC.push(0);
-        this.commandD.push(0);
+        this.pushCommand(RenderCommandType.BindFfp, stateIndex, 0, 0, 0);
     }
 
     /** `dstOffset` is where `data` lands in the target buffer; it must be 4-aligned and the
@@ -463,7 +433,7 @@ export class RenderFrame {
     }
 
     hasWork(): boolean {
-        return this.hasClear || this.commandTypes.length > 0 || this.uploadBuffers.length > 0;
+        return this.hasClear || this.commandCount > 0 || this.uploadBuffers.length > 0;
     }
 }
 

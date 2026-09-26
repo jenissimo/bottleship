@@ -18,7 +18,7 @@ const draw = (viewport: ReturnType<typeof vp>) => ({
 });
 
 const viewportCommands = (frame: ReturnType<D3D9CommandRecorder["finalize"]>) =>
-    frame.commandTypes.flatMap((type, i) =>
+    frame.commandTypes.slice(0, frame.commandCount).flatMap((type, i) =>
         type === RenderCommandType.SetViewport
             ? [frame.viewportData.slice(frame.commandA[i], frame.commandA[i] + 6)]
             : []);
