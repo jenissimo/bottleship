@@ -130,6 +130,12 @@ export async function moduleEdges({call,save,note,sleep,scene}){
 }
 export async function targetSizeAb(ctx){ return leverAb(ctx,'targetsize'); }
 export async function blockChainAb(ctx){ return leverAb(ctx,'blockchain'); }
+/** Page-tail compilation OFF (0) vs ON (1): 16 ABBA windows in one boot. */
+export async function pageTailsAb(ctx){ return leverAb(ctx,'pagetails'); }
+/** Hot-edge region formation OFF (0) vs ON (1): 16 ABBA windows in one boot. */
+export async function hotEdgeAb(ctx){ return leverAb(ctx,'hotedge'); }
+/** jsprof: split batch-buffer recycling off (0) vs on (1). */
+export async function queueRecycleAb(ctx){ return leverAb(ctx,'queuerecycle'); }
 
 /** Where the FRAME goes, as opposed to where the worker's BUSY time goes.
  *  Every ceiling in this campaign was computed against busy time; if a material part of the
@@ -647,6 +653,60 @@ export async function permMapCensus({call,save,note,sleep,scene}){
  }
 }
 export async function permMapAb(ctx){ return leverAb(ctx,'permmap'); }
+// ABBA over a chosen pair of lever modes (the same 16-window pattern as the default order).
+const abba=(a,b)=>[0,1,1,0,1,0,0,1,1,0,0,1,1,0,1,0].map(x=>x?b:a);
+async function withOrder(order,fn){
+ const prev=globalThis.__leverOrder;globalThis.__leverOrder=order;
+ try{return await fn();}finally{globalThis.__leverOrder=prev;}
+}
+/** idx21 on: full helper sync (1) vs derived contracts (2). */
+export async function flagContractAb(ctx){ return withOrder(abba(1,2),()=>leverAb(ctx,'flagcontract')); }
+/** Shipping (idx21 off, 0) vs idx21 on with derived contracts (2). */
+export async function flagContractVsShippingAb(ctx){ return withOrder(abba(0,2),()=>leverAb(ctx,'flagcontract')); }
+/** perm-map replace (2) vs the UNSOUND call-free ablation (3). */
+export async function permMap3Ab(ctx){ return withOrder(abba(2,3),()=>leverAb(ctx,'permmap')); }
+/** perm-map off (0) vs the UNSOUND call-free ablation (3). */
+export async function permMap3VsOffAb(ctx){ return withOrder(abba(0,3),()=>leverAb(ctx,'permmap')); }
+/** perm-map off (0) vs replace (2), explicitly (permMapAb's default order is 0/1 = the probe). */
+export async function permMap2Ab(ctx){ return withOrder(abba(0,2),()=>leverAb(ctx,'permmap')); }
+
+/** Executed flag-sync words per frame around helper calls (idx21 on), contract off vs on.
+ *  The counters are increments compiled into blocks, so this is a COUNT, never an FPS window. */
+export async function flagSyncCensus({call,save,note,sleep,scene}){
+ const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
+ const initial=await call('evalWorker',scene);
+ if(!valid(initial)||!initial.paused)throw Error('Нужна готовая сцена на паузе');
+ const W="const w=globalThis.preemption.getWasmExports();";
+ const stats=()=>call('evalWorker',W
+  +"const s=System.getInstance();"
+  +"return {serial:s.services.render.getPresentSerial(),stats:Array.from({length:9},(_,i)=>w.flag_sync_stat_get(i))};");
+ const rows={};
+ try{
+  for(const contract of [0,1]){
+   await call('evalWorker',W
+    +"globalThis.preemption.setFlagLocals(true); w.set_flag_helper_contract("+contract+");"
+    +"w.set_flag_sync_counting(1); w.flag_sync_stats_reset();"
+    +"if(w.jit_clear_cache_js) w.jit_clear_cache_js(); return true;");
+   await call('resume');note('Прогрев, contract='+contract+': 12 с');await sleep(12000);
+   const a=await stats(),sa=await call('evalWorker',scene);
+   await sleep(10000);
+   const b=await stats(),sb=await call('evalWorker',scene);
+   await call('pause');
+   const frames=b.serial-a.serial, d=b.stats.map((v,i)=>v-a.stats[i]);
+   rows['contract'+contract]={frames,valid:valid(sa)&&valid(sb),
+     execCallsPerFrame:d[6]/frames,execSpillWordsPerFrame:d[7]/frames,execReloadWordsPerFrame:d[8]/frames,
+     emitted:{calls:b.stats[0],contracted:b.stats[1],spillWords:b.stats[2],reloadWords:b.stats[3],
+       spillElided:b.stats[4],reloadElided:b.stats[5]}};
+   note('contract='+contract+': '+JSON.stringify(rows['contract'+contract]));
+  }
+  await save('flagsync-census',rows);
+ } finally {
+  await call('pause').catch(()=>{});
+  await call('evalWorker',W
+   +"w.set_flag_sync_counting(0); w.set_flag_helper_contract(0); globalThis.preemption.setFlagLocals(false);"
+   +"if(w.jit_clear_cache_js) w.jit_clear_cache_js(); return true;").catch(()=>{});
+ }
+}
 export async function comboAllAb(ctx){ return leverAb(ctx,'comboall'); }
 export async function fastmemWritesAb(ctx){ return leverAb(ctx,'fastmemwrites'); }
 /** N measurement windows with NO lever, each carrying its calibrator reading.
@@ -656,6 +716,8 @@ export async function fastmemWritesAb(ctx){ return leverAb(ctx,'fastmemwrites');
 export async function windowsOnly(ctx){ return leverAb({...ctx,__windowsOnly:true},'none'); }
 
 export async function stackRawAb(ctx){ return leverAb(ctx,'stackraw'); }
+/** Shipping (perm-map 0, idx21 off, contract 0) vs the STACK (perm-map 2, idx21 on, contract 1). */
+export async function stackAb(ctx){ return leverAb(ctx,'stack'); }
 
 async function leverAb({call,save,note,sleep,scene},lever){
  const valid=s=>s.raceState===4&&s.mode===3&&s.track===1003&&s.traffic===0&&s.players===1;
@@ -665,9 +727,59 @@ async function leverAb({call,save,note,sleep,scene},lever){
   ? call('evalWorker',
      "const w=globalThis.preemption.getWasmExports();"
     +" if(!w.set_perm_map_reads) throw new Error('engine has no set_perm_map_reads');"
+    // Mode 3 is the UNSOUND call-free ablation; the engine refuses it unless armed.
+    +" if(w.arm_perm_map_unsound_ablation) w.arm_perm_map_unsound_ablation("+(mode===3?1:0)+");"
     +" w.set_perm_map_reads("+mode+");"
     +" const back=w.get_perm_map_reads()>>>0;"
     +" if(back!=="+mode+") throw new Error('perm_map readback '+back);"
+    +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
+    +" return back;")
+  : lever==='flagcontract'
+  // 0 = shipping (idx21 off), 1 = idx21 on with the full helper sync, 2 = idx21 on with the
+  // derived flag-helper contracts. Pick the pair with globalThis.__leverOrder.
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.set_flag_helper_contract) throw new Error('engine has no set_flag_helper_contract');"
+    +" if(w.get_flag_helper_contract_mutated()) throw new Error('engine carries a MUTATED contract table');"
+    +" globalThis.preemption.setFlagLocals("+(mode>0)+");"
+    +" w.set_flag_helper_contract("+(mode===2?1:0)+");"
+    +" const a=w.get_jit_config(21)>>>0, b=w.get_flag_helper_contract()>>>0;"
+    +" if(a!=="+(mode>0?1:0)+"||b!=="+(mode===2?1:0)+") throw new Error('flagcontract readback '+a+'/'+b);"
+    +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
+    +" return "+mode+";")
+  : lever==='stack'
+  // 0 = shipping; 1 = perm-map read mode 2 + idx21 flag locals + derived flag-helper contract.
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.set_perm_map_reads||!w.set_flag_helper_contract) throw new Error('engine lacks a stack switch');"
+    +" if(w.get_flag_helper_contract_mutated()) throw new Error('engine carries a MUTATED contract table');"
+    +" if(w.arm_perm_map_unsound_ablation) w.arm_perm_map_unsound_ablation(0);"
+    +" w.set_perm_map_reads("+(mode?2:0)+");"
+    +" globalThis.preemption.setFlagLocals("+(mode>0)+");"
+    +" w.set_flag_helper_contract("+(mode?1:0)+");"
+    +" const p=w.get_perm_map_reads()>>>0, a=w.get_jit_config(21)>>>0, b=w.get_flag_helper_contract()>>>0;"
+    +" if(p!=="+(mode?2:0)+"||a!=="+(mode?1:0)+"||b!=="+(mode?1:0)+") throw new Error('stack readback '+p+'/'+a+'/'+b);"
+    +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
+    +" return "+mode+";")
+  : lever==='pagetails'
+  // Page-tail compilation (vendor/v86 set_jit_page_tails): a codegen input, so the cache goes.
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.set_jit_page_tails) throw new Error('engine has no set_jit_page_tails');"
+    +" w.set_jit_page_tails("+mode+");"
+    +" const back=w.get_jit_page_tails()>>>0;"
+    +" if(back!=="+mode+") throw new Error('page-tails readback '+back);"
+    +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
+    +" return back;")
+  : lever==='hotedge'
+  // Hot-edge region formation (set_jit_hot_edge_regions). Joins are policy state that survives a
+  // cache clear, so both arms reset it: an OFF arm must not inherit the ON arm's regions.
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.set_jit_hot_edge_regions) throw new Error('engine has no set_jit_hot_edge_regions');"
+    +" w.set_jit_hot_edge_regions("+mode+"); w.jit_hot_edge_reset();"
+    +" const back=w.get_jit_hot_edge_regions()>>>0;"
+    +" if(back!=="+mode+") throw new Error('hot-edge readback '+back);"
     +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
     +" return back;")
   : lever==='blockchain'
@@ -679,6 +791,11 @@ async function leverAb({call,save,note,sleep,scene},lever){
     // A codegen input: blocks compiled before the flip carry the old exit shape.
     +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
     +" return back;")
+  : lever==='queuerecycle'
+  // jsprof: split batch buffers recycled from the render worker (1) vs a fresh copy per batch (0).
+  ? call('evalWorker',
+     "globalThis.__d3d9SplitNoQueueRecycle="+(mode===0)+";"
+    +" return globalThis.__d3d9SplitNoQueueRecycle?0:1;")
   : lever==='targetsize'
   ? call('evalWorker',
      "globalThis.__noD3D9TargetSizeCache="+(mode===0)+";"
@@ -809,7 +926,26 @@ async function leverAb({call,save,note,sleep,scene},lever){
   if(!(r&&r.median>0))throw Error('calibrator returned '+JSON.stringify(r));
   return r.median;
  };
- await save(lever+'-start',{initial,lever});
+ // Same-work instruments: T1 retired instructions, API draws as the render worker encoded them,
+ // split-stream health and guest page faults, all as window deltas.
+ const work=async()=>{
+  const g=await call('evalWorker',
+    "return import('/src/worker/core/memory/fault-recorder.ts').then(fr=>{"
+   +"const f=fr.faultRecorder.recent(64);"
+   +"return {t:performance.now(),insns:System.getInstance().scheduler.getThreadRetiredInsns(),faultTs:f.map(x=>x.ts)};});");
+  const d=await call('d3d9Split',{});
+  const sum=o=>Object.values(o??{}).reduce((a,b)=>a+(+b||0),0);
+  const b=d.renderWorker?.report?.perf?.backend??{};
+  return {...g,draws:b.drawCalls??null,wanted:d.wanted,worker:!!d.renderWorker,
+    divergences:sum(d.stream?.divergences),replayErrors:sum(d.stream?.replayErrors),
+    unsupported:sum(d.stream?.unsupported),encodeErrors:sum(d.stream?.encodeErrors)};
+ };
+ const split0=await work();
+ const splitCfg=await call('evalWorker',"return {split:globalThis.__d3d9Split===true,splitWorker:globalThis.__d3d9SplitWorker===true};");
+ if(!split0.wanted||!split0.worker||!splitCfg.split||!splitCfg.splitWorker)
+  throw Error('Not the split-worker configuration: '+JSON.stringify({splitCfg,wanted:split0.wanted,worker:split0.worker}));
+ let firstScene=null;
+ await save(lever+'-start',{initial,lever,splitCfg});
  const order=lever==='none'?[0,0,0,0,0,0,0,0,0,0,0,0]:lever==='stackraw2'?[0,2,2,0,2,0,0,2,2,0,0,2,2,0,2,0]:lever==='stackraw3'?[0,3,3,0,3,0,0,3,3,0,0,3,3,0,3,0]:((globalThis.__leverOrder)||[0,1,1,0,1,0,0,1,1,0,0,1,1,0,1,0]);
  const windows=[];
  try{
@@ -825,10 +961,26 @@ async function leverAb({call,save,note,sleep,scene},lever){
    const calibBefore=await calibrate();
    const before=await call('evalWorker',scene);
    const perfBefore=(await call('dbgCall','d3d9Perf')).backend;
+   const engineCounters=()=>call('evalWorker',"const w=globalThis.preemption.getWasmExports();"
+     +"const g=globalThis; if(!g.__jitCompileStats) g.__jitCompileStats={count:0,bytes:0};"
+     +"return {permAblationMisses:w.perm_ablation_misses?w.perm_ablation_misses():null,"
+     +"compiles:g.__jitCompileStats.count|0,compileBytes:g.__jitCompileStats.bytes|0,"
+     +"hotEdge:w.get_jit_hot_edge_stat?Array.from({length:9},(_,i)=>w.get_jit_hot_edge_stat(i)):null};").catch(()=>({}));
+   const ecBefore=await engineCounters();
+   const wkBefore=await work();
    note('Окно '+(i+1)+': 15 с');
    await sleep(15000);
    const after=await call('evalWorker',scene);
+   const wkAfter=await work();
    const perfAfter=(await call('dbgCall','d3d9Perf')).backend;
+   const ecAfter=await engineCounters();
+   const probe=await call('sceneProbe',{samples:4,gapMs:250}).catch(e=>({error:String(e)}));
+   if(!firstScene&&probe.fingerprint)firstScene=probe;
+   const sceneCmp=firstScene&&probe.fingerprint?await call('sceneCompare',firstScene,probe).catch(()=>null):null;
+   if(i<2||i>=order.length-2){
+    const shot=await call('shot').catch(()=>null);
+    if(shot?.base64)await save('checkpoint',{label:lever+'-w'+i+'-m'+mode,shot});
+   }
    const calibAfter=await calibrate();
    const calib=(calibBefore+calibAfter)/2;
    // WHERE the lost time goes when a plateau drops: the calibrator says it is not the host CPU,
@@ -836,8 +988,10 @@ async function leverAb({call,save,note,sleep,scene},lever){
    const split=await call('perfStats').catch(()=>null);
    const raw=after.raw,frames=after.serial-before.serial;
    const ok=valid(before)&&valid(after)&&after.mover>before.mover&&frames>50
-     &&(raw.length===frames||raw.length===frames-1)
-     &&after.guestSerial-before.guestSerial===frames&&before.source===after.source;
+     // The split worker publishes flips and serials asynchronously: a ±3-frame skew in a ~400-frame
+     // window is read timing, not lost frames.
+     &&Math.abs(raw.length-frames)<=3
+     &&Math.abs(after.guestSerial-before.guestSerial-frames)<=3&&before.source===after.source;
    const total=raw.reduce((a,b)=>a+b,0);
    // Proof the lever DID something: an arm whose work counters match the other arm's is a
    // dead switch reporting a null result, which is indistinguishable from "no effect".
@@ -852,25 +1006,44 @@ async function leverAb({call,save,note,sleep,scene},lever){
      split:split&&split.average?{...split.average.categories,frameMs:split.average.frameMs}:null,
      gpuErrors:split?split.spikeCount:null,
      calibSpreadPct:+(100*Math.abs(calibAfter-calibBefore)/calib).toFixed(1),
-     moverPerFrame:(after.mover-before.mover)/frames,compile:[before.compile,after.compile]};
+     moverPerFrame:(after.mover-before.mover)/frames,compile:[before.compile,after.compile],
+     // Mode 3 reads raw memory on a miss; nonzero means the arm may not be the same guest work.
+     permAblationMissesPerFrame:ecBefore.permAblationMisses==null?null:(ecAfter.permAblationMisses-ecBefore.permAblationMisses)/Math.max(1,frames),
+     // JIT work inside the window: modules compiled and bytes emitted (a lever that reshapes
+     // modules pays here), and the hot-edge former's own ledger when the engine has one.
+     compilesInWindow:ecAfter.compiles==null?null:ecAfter.compiles-ecBefore.compiles,
+     compileBytesInWindow:ecAfter.compileBytes==null?null:ecAfter.compileBytes-ecBefore.compileBytes,
+     hotEdge:ecAfter.hotEdge?{joinsTotal:ecAfter.hotEdge[0],joinedCompilesTotal:ecAfter.hotEdge[3],
+       joinedPagesTotal:ecAfter.hotEdge[8],refusedInWindow:ecAfter.hotEdge[2]-ecBefore.hotEdge[2],
+       samplesInWindow:ecAfter.hotEdge[7]-ecBefore.hotEdge[7]}:null,
+     t1InsnsPerFrame:Math.round(((wkAfter.insns[1]??0)-(wkBefore.insns[1]??0))/Math.max(1,frames)),
+     totalInsnsPerFrame:Math.round((Object.values(wkAfter.insns).reduce((a,b)=>a+b,0)-Object.values(wkBefore.insns).reduce((a,b)=>a+b,0))/Math.max(1,frames)),
+     drawsPerFrame:wkAfter.draws==null?null:+((wkAfter.draws-wkBefore.draws)/Math.max(1,frames)).toFixed(1),
+     serialStart:before.serial,serialEnd:after.serial,
+     divergences:wkAfter.divergences-wkBefore.divergences,replayErrors:wkAfter.replayErrors-wkBefore.replayErrors,
+     unsupported:wkAfter.unsupported-wkBefore.unsupported,encodeErrors:wkAfter.encodeErrors-wkBefore.encodeErrors,
+     pageFaults:wkAfter.faultTs.filter(t=>t>wkBefore.t).length,
+     motion:probe.motion??null,sceneDistance:sceneCmp?.distance??null,sceneVerdict:sceneCmp?.verdict??null};
    windows.push(row);
    await save(lever+'-window',{...row,lever,before,after,raw});
    note('Рука '+(i+1)+': '+row.fps.toFixed(2)+' FPS · калибратор '+row.calibMs+' мс'+(ok?'':' (ОТКЛОНЕНО)'));
   }
  } finally {
   await call('pause').catch(()=>{});
-  await setLever(lever==='relaxedfpu'?1:0).catch(()=>{});
+  await setLever((lever==='relaxedfpu'||lever==='queuerecycle')?1:0).catch(()=>{});
  }
  const good=windows.filter(w=>w.valid);
  const med=xs=>{const v=[...xs].sort((a,b)=>a-b);return v.length%2?v[(v.length-1)/2]:(v[v.length/2-1]+v[v.length/2])/2;};
- const off=good.filter(w=>w.mode===0).map(w=>w.fps),on=good.filter(w=>w.mode!==0).map(w=>w.fps);
+ // "off" is the order's first mode (the A arm), so a pair like 2-vs-3 summarises too.
+ const baseMode=order[0];
+ const off=good.filter(w=>w.mode===baseMode).map(w=>w.fps),on=good.filter(w=>w.mode!==baseMode).map(w=>w.fps);
  // Normalised FPS: fps x (calibrator / median calibrator). A window that ran on a slow plateau
  // has a LONGER calibrator, so multiplying restores it to the reference plateau.
  const calibs=good.map(w=>w.calibMs).filter(x=>typeof x==='number');
  const calibRef=calibs.length?med(calibs):null;
  const norm=w=>calibRef?w.fps*(w.calibMs/calibRef):w.fps;
- const offN=good.filter(w=>w.mode===0).map(norm),onN=good.filter(w=>w.mode!==0).map(norm);
- const summary={order,windows,rejected:windows.length-good.length,
+ const offN=good.filter(w=>w.mode===baseMode).map(norm),onN=good.filter(w=>w.mode!==baseMode).map(norm);
+ const summary={order,baseMode,windows,rejected:windows.length-good.length,
    medianOff:off.length?med(off):null,medianOn:on.length?med(on):null,
    ratio:off.length&&on.length?med(on)/med(off):null,
    calibRef,medianOffNorm:offN.length?med(offN):null,medianOnNorm:onN.length?med(onN):null,

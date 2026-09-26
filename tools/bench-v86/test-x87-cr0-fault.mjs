@@ -1,6 +1,6 @@
 import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
 import {V86} from '../../vendor/v86/build/libv86.mjs';
-import {SHIPPING_JIT} from '../jit-config/shipping.mjs';
+import {SHIPPING_JIT,applyCodegenSwitches} from '../jit-config/shipping.mjs';
 const man=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const BASE=0x100000,DATA=0x103000,N=300000;
 function fixture(bits){
@@ -31,7 +31,7 @@ for(const bits of [4,8,12])for(const arm of ['interpreter','baseline','candidate
  const em=new V86({autostart:false,memory_size:16<<20,wasm_path:a.wasm,log_level:0});await new Promise(r=>em.add_listener('emulator-loaded',r));
  try{
   const c=em.v86.cpu,w=c.wm.exports,im=fixture(bits);c.reboot_internal();c.reset_memory();c.load_multiboot(im.b.buffer);
-  for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);w.set_jit_config(0,arm==='interpreter'?1:0);
+  for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);applyCodegenSwitches(w);w.set_jit_config(0,arm==='interpreter'?1:0);
   let jitFaults=0;const deliver=c.jit_imports.trigger_fault_end_jit;
   c.jit_imports.trigger_fault_end_jit=()=>{jitFaults++;return deliver();};
   await new Promise((resolve,reject)=>{const t=setTimeout(()=>{em.stop();reject(Error('Timeout'));},20000);em.bus.register('cpu-event-halt',()=>{clearTimeout(t);em.stop();resolve();});em.run();});

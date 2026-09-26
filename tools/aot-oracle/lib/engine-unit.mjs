@@ -11,6 +11,8 @@
  * the set of things a browser computes differently and everything else must not be.
  */
 
+import { SHIPPING_CODEGEN_SWITCHES, applyCodegenSwitches } from "../../jit-config/shipping.mjs";
+
 /** v86 places JIT slot i at wasm_table[i + WASM_TABLE_OFFSET] (vendor/v86/src/const.js). */
 export const WASM_TABLE_OFFSET = 1024;
 /** vendor/v86/src/rust/jit.rs and src/const.js. */
@@ -82,7 +84,7 @@ export function manifestMatchesLiveIdentity(manifest, live) {
  * Every knob is read back: a setter that silently normalises a value, or an index the build does
  * not support, would otherwise produce a run that measures one shape and is labelled another.
  */
-export function applyShape(ex, { flags, relaxed }) {
+export function applyShape(ex, { flags, relaxed, switches = SHIPPING_CODEGEN_SWITCHES }) {
     for (const fn of ["set_jit_config", "get_jit_config", "set_relaxed_fpu", "get_relaxed_fpu"]) {
         if (typeof ex[fn] !== "function") {
             throw new EngineError(`engine lacks ${fn} — not the BottleShip fork, or too old to `
@@ -108,12 +110,15 @@ export function applyShape(ex, { flags, relaxed }) {
         }
         effective[i] = got;
     }
+    let effectiveSwitches;
+    try { effectiveSwitches = applyCodegenSwitches(ex, switches); }
+    catch (e) { throw new EngineError(String(e.message ?? e)); }
     ex.set_relaxed_fpu(relaxed);
     const gotRelaxed = ex.get_relaxed_fpu() >>> 0;
     if (gotRelaxed !== relaxed) {
         throw new EngineError(`set_relaxed_fpu(${relaxed}) read back ${gotRelaxed}`);
     }
-    return { flags: effective, relaxed: gotRelaxed, identity: jitIdentity(ex) };
+    return { flags: effective, switches: effectiveSwitches, relaxed: gotRelaxed, identity: jitIdentity(ex) };
 }
 
 /**

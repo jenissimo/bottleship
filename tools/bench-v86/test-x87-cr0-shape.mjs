@@ -1,6 +1,6 @@
 import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
 import {V86} from '../../vendor/v86/build/libv86.mjs';
-import {SHIPPING_JIT} from '../jit-config/shipping.mjs';
+import {SHIPPING_JIT,applyCodegenSwitches} from '../jit-config/shipping.mjs';
 import {analyze} from './analyze-jit-wasm.mjs';
 const manifest=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const BASE=0x100000,DATA=0x103000,N=300000;
@@ -22,7 +22,7 @@ for(const fence of ['none','nop','branch'])for(const arm of ['interpreter','base
  await new Promise(r=>em.add_listener('emulator-loaded',r));
  try{
   const c=em.v86.cpu,w=c.wm.exports;
-  c.reboot_internal();c.reset_memory();for(const [i,x]of SHIPPING_JIT)w.set_jit_config(i,x);
+  c.reboot_internal();c.reset_memory();for(const [i,x]of SHIPPING_JIT)w.set_jit_config(i,x);applyCodegenSwitches(w);
   w.set_jit_config(0,arm==='interpreter'?1:0);c.load_multiboot(fixture(fence).buffer);
   const faultObservations=[];let faultPrepared=0;
   const prepare=c.jit_imports.task_switch_test_jit;

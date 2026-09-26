@@ -126,7 +126,7 @@ let relocApplied = null; // relocation values taken from the manifest, audited a
 // The codegen shape READ BACK OUT of the engine, never the shape we asked for: the reported
 // value has to be the measured one, or a knob that silently failed to take would be reported
 // as if it had (see applyShape()).
-let effectiveFlags = null, effectiveRelaxed = null, effectiveJitIdentity = null;
+let effectiveFlags = null, effectiveSwitches = null, effectiveRelaxed = null, effectiveJitIdentity = null;
 const timer = setTimeout(() => finish("TIMEOUT"), timeoutMs);
 
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
@@ -163,6 +163,7 @@ const aotLiveness = (cpu) => sharedAotLiveness(cpu, aotUnits);
 function applyShape(ex) {
     const got = orExit(() => sharedApplyShape(ex, { flags: JIT_FLAGS, relaxed }));
     effectiveFlags = got.flags;
+    effectiveSwitches = got.switches;
     effectiveRelaxed = got.relaxed;
     effectiveJitIdentity = got.identity;
 }
@@ -367,6 +368,7 @@ function finish(status) {
             paging_on: ((cpu.cr[0] >>> 0) & 0x80000000) !== 0,
             // Read back out of the engine, not copied from the request (applyShape).
             jit_flags: effectiveFlags,
+            jit_switches: effectiveSwitches,
             jit_flag_overrides: Object.fromEntries([...FLAG_OVERRIDES]),
             relaxed_fpu: effectiveRelaxed,
             capture_eip: "0x" + image.captureEip.toString(16),

@@ -23,6 +23,7 @@ import {
     JIT_CONFIG_ABI_VERSION,
     JIT_CONFIG_SUPPORTED_MASK,
     SHIPPING_JIT,
+    SHIPPING_CODEGEN_SWITCHES,
 } from "../../jit-config/shipping.mjs";
 import {
     RESULT_SCHEMA_ID,
@@ -193,7 +194,15 @@ function objectFlags(flags) {
 function makeEnvelope({ raw, engineDir, browser }) {
     const expectedFlags = Object.fromEntries([...SHIPPING_JIT].map(([index, value]) => [String(index), value]));
     const effectiveFlags = objectFlags(raw?.jit_flags);
-    const sameFlags = Object.keys(expectedFlags).every((index) => effectiveFlags[index] === expectedFlags[index]);
+    // Switches outside the slot envelope: a sample that does not report them predates the
+    // switch set and is compared on the slots alone.
+    const expectedSwitches = Object.fromEntries(SHIPPING_CODEGEN_SWITCHES);
+    const effectiveSwitches = raw?.jit_switches ?? null;
+    const sameSwitches = effectiveSwitches === null || Object.keys(expectedSwitches).every((name) =>
+        effectiveSwitches[name] === expectedSwitches[name]
+        || (expectedSwitches[name] === 0 && effectiveSwitches[name] === "absent"));
+    const sameFlags = sameSwitches
+        && Object.keys(expectedFlags).every((index) => effectiveFlags[index] === expectedFlags[index]);
     const enginePath = path.join(engineDir, "build", "v86.wasm");
     return {
         v86: {

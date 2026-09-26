@@ -1,5 +1,5 @@
 import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
-import {V86} from '../../vendor/v86/build/libv86.mjs';import {SHIPPING_JIT} from '../jit-config/shipping.mjs';
+import {V86} from '../../vendor/v86/build/libv86.mjs';import {SHIPPING_JIT,applyCodegenSwitches} from '../jit-config/shipping.mjs';
 const man=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const BASE=0x100000,PD=0x108000,PT=0x109000,FAULT=0x200000,VALID=0x210000,DATA=0x220000,N=300000;
 const cases=[{name:'first',addr:FAULT,delta:8,operand:0},{name:'second',addr:FAULT-8,delta:8,operand:1},{name:'first-negative',addr:FAULT+8,delta:-8,operand:0},{name:'second-negative',addr:FAULT+4096,delta:-8,operand:1},{name:'first-cross',addr:FAULT-2,delta:8,operand:0},{name:'second-cross',addr:FAULT-10,delta:8,operand:1}];
@@ -27,7 +27,7 @@ for(const test of cases)for(const arm of ['interpreter','baseline','candidate'])
   const c=em.v86.cpu,w=c.wm.exports,im=fixture(test);c.reboot_internal();c.reset_memory();c.load_multiboot(im.b.buffer);
   for(let i=0;i<1024;i++){c.write32(PD+i*4,0);c.write32(PT+i*4,(i<<12)|3);}c.write32(PD,PT|3);
   c.write32(VALID,11);c.write32(VALID+test.delta,22);c.write32(test.addr,42);c.write32(test.addr+test.delta,84);
-  for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);w.set_jit_config(0,arm==='interpreter'?1:0);
+  for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);applyCodegenSwitches(w);w.set_jit_config(0,arm==='interpreter'?1:0);
   let jitFaults=0;const deliver=c.jit_imports.trigger_fault_end_jit;c.jit_imports.trigger_fault_end_jit=()=>{jitFaults++;return deliver();};
   await new Promise((resolve,reject)=>{const t=setTimeout(()=>{em.stop();reject(Error('timeout'));},20000);em.bus.register('cpu-event-halt',()=>{clearTimeout(t);em.stop();resolve();});em.run();});
   const read=a=>c.read32s(a)>>>0;

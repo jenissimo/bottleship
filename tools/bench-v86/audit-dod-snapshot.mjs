@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { SHIPPING_JIT, formatFlags } from '../jit-config/shipping.mjs';
+import { SHIPPING_JIT, SHIPPING_CODEGEN_SWITCHES, formatFlags, formatSwitches } from '../jit-config/shipping.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const output = fs.mkdtempSync(path.join(root, 'tools/bench-v86/results/dod-audit-'));
@@ -45,7 +45,7 @@ const manifest = {
     totalMemory: os.totalmem(), freeMemory: os.freemem(),
     head: git(root, ['rev-parse', 'HEAD']).toString().trim(),
     vendorHead: git(path.join(root, 'vendor/v86'), ['rev-parse', 'HEAD']).toString().trim(),
-    artifacts, sources, shipping: [...SHIPPING_JIT], flags: formatFlags(SHIPPING_JIT), relaxed: 1,
+    artifacts, sources, shipping: [...SHIPPING_JIT], flags: formatFlags(SHIPPING_JIT), switches: formatSwitches(SHIPPING_CODEGEN_SWITCHES), relaxed: 1,
     publicWasmMatches: sha(fs.readFileSync(path.join(root, 'public/v86.wasm'))) === artifacts['v86.wasm'].sha256,
     scope: 'Pinned current dirty engine; no production files replaced. Headless Node CPU evidence, not game FPS.',
     sourceToBinary: 'Existing build and current source captured separately; no rebuild establishes that these exact sources produced this binary.',

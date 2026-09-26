@@ -20,7 +20,7 @@ import { buildImage } from "../aot-oracle/corpus/image.mjs";
 import * as L from "../aot-oracle/corpus/layout.mjs";
 import { getCase } from "../aot-oracle/corpus/cases.mjs";
 import { findTlbDataBase, ORACLE_PROBE_PAGES } from "./lib/tlb-base.mjs";
-import { SHIPPING_JIT } from "../jit-config/shipping.mjs";
+import { SHIPPING_JIT, applyCodegenSwitches } from "../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 const REPO = path.resolve(__dirname, "../..");
@@ -152,6 +152,7 @@ emulator.add_listener("emulator-loaded", () => {
             throw new Error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
         }
     }
+    applyCodegenSwitches(ex);
     ex.set_relaxed_fpu(1);
     if (cpu.jit_clear_cache) cpu.jit_clear_cache();
     globalThis["__wasmDump"] = { pages: new Set([c.codeAddr >>> 12]), out: [], keepLatestPerPage: true };
