@@ -94,6 +94,23 @@ function snapshot(): Record<string, unknown> {
 }
 
 export function registerGpuCommands(svc: HarnessService): void {
+    /**
+     * gpuCensus({arm?, sites?, reset?}) — live GPUBuffer/GPUTexture/GPUQuerySet/ImageBitmap/
+     * GPUDevice objects on this worker AND the split render worker (core/gpu/gpu-resource-census.ts).
+     * GPU-process memory is invisible to a heap profile; `live` growing across two reads of the
+     * same scene is the leak, `collected` is a missing destroy() that GC happened to rescue, and
+     * `sites:true` names the creation stack of both. Counts only objects created after arming.
+     */
+    svc.register("gpuCensus", async (args) => {
+        const opts = (args[0] ?? {}) as { arm?: boolean; sites?: boolean; reset?: boolean };
+        const census = await import("../../core/gpu/gpu-resource-census");
+        if (opts.arm) census.armGpuResourceCensus("emulator", opts);
+        const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+        const client = getD3D9RenderClient();
+        const renderWorker = client ? await client.request("gpuCensus", { ...opts }) : null;
+        return { emulator: census.gpuResourceCensus(), renderWorker };
+    });
+
     /** gpuDeviceState() — status/generation + the answers the guest would get. */
     svc.register("gpuDeviceState", () => snapshot());
 

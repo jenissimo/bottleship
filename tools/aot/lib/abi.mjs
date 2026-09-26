@@ -30,6 +30,18 @@ export const G = {
 };
 export const reg32Offset = (i) => G.reg32 + i * 4;
 
+/**
+ * Extent [lo, hi) of v86's fixed CPU-state block. `G` names only the fields this ABI touches;
+ * arrays (reg32, segment_offsets, reg_xmm, fpu_st) have interior addresses, so a classifier must
+ * test the range, not membership in G. lo = reg32 (global_pointers.rs:9, the lowest pointer;
+ * cpu.js:178 `view(Int32Array, memory, 64, 8)`); hi = fpu_st + 8 x 16-byte F80 slots
+ * (global_pointers.rs:75, cpu.js:180 `view(Int32Array, memory, 1152, 4 * 8)`, and the JIT's own
+ * stride in codegen.rs gen_fpu_st_addr). Rust statics start at GLOBAL_BASE
+ * (build-wasm.sh / Makefile `--global-base=4096`), so [hi, GLOBAL_BASE) is unused low memory.
+ */
+export const STATE_BLOCK = { lo: 64, hi: 1152 + 8 * 16 };
+export const GLOBAL_BASE = 4096;
+
 /** vendor/v86/src/rust/cpu/cpu.rs:84-124 */
 export const FLAG = {
     SUB: -0x8000_0000, CARRY: 1, PARITY: 4, ADJUST: 16, ZERO: 64, SIGN: 128, OVERFLOW: 2048,

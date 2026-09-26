@@ -33,6 +33,7 @@ import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
 import { getWasmGrowthStats } from "../../core/cpu/cpu-views";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { compareScenes, probeScene, type SceneProbe } from "./scene";
+import type { SplitReplayStats } from "../../backends/webgpu/d3d9/split-replay";
 
 /** Compact a category record to ms (drop zero buckets) for terse output. */
 function categoriesMs(categories: Record<string, number>): Record<string, number> {
@@ -1314,6 +1315,162 @@ export function registerPerfCommands(svc: HarnessService): void {
             sceneBefore: before,
             sceneAfter: after,
             report,
+        };
+    });
+
+    /**
+     * wbufTransport({on?, defer?, sites?, reset?}) — threaded-D3D9 P1: drain the WBUF ring from
+     * a COPY (`__wbufTransport`), the way a consumer on another worker would have to, and with
+     * `defer` (`__wbufDefer`) run the copied entries only at fences. Reports the
+     * drains and bytes that went through the copy and the guest-memory views the handlers still
+     * took inside them (each one a read that consumer could not make); `sites:true` samples
+     * where they come from. Runtime-switchable, so both arms run inside one boot.
+     */
+    svc.setVerbFence(() => {
+        (proc()?.dispatcher as { executeWbufQueue?: () => void } | undefined)?.executeWbufQueue?.();
+    });
+    svc.register("wbufTransport", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; defer?: boolean; sites?: boolean; reset?: boolean };
+        const dispatcher = proc()?.dispatcher as {
+            getWbufTransportStats?: (reset?: boolean) => Record<string, unknown>;
+            getWbufDeferStats?: (reset?: boolean) => Record<string, unknown>;
+            wbufTransportSites?: Map<string, number> | null;
+        } | undefined;
+        if (!dispatcher?.getWbufTransportStats) {
+            throw new HarnessError("wbufTransport: no dispatcher", HarnessErrorCode.NO_PROCESS);
+        }
+        const g = globalThis as { __wbufTransport?: boolean; __wbufDefer?: boolean };
+        if (opts.on !== undefined) g.__wbufTransport = !!opts.on;
+        if (opts.defer !== undefined) g.__wbufDefer = !!opts.defer;
+        const sites = dispatcher.wbufTransportSites;
+        const siteRows = sites
+            ? [...sites].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([site, samples]) => ({ site, samples }))
+            : null;
+        if (opts.sites !== undefined) dispatcher.wbufTransportSites = opts.sites ? new Map() : null;
+        else if (opts.reset && sites) sites.clear();
+        return {
+            ...dispatcher.getWbufTransportStats(!!opts.reset),
+            defer: dispatcher.getWbufDeferStats?.(!!opts.reset) ?? null,
+            sites: siteRows,
+            note: siteRows ? "sites are sampled 1 in 16 borrows" : undefined,
+        };
+    });
+
+    /**
+     * d3d9Split({reset?, audit?, sites?}) — the split D3D9 call stream (`__d3d9Split`, boot-time):
+     * calls recorded / replayed, fences, DIVERGENCES (front and twin answered differently),
+     * calls the twin cannot perform yet, encode/replay errors, twin paths that reached the front,
+     * and the queue's guest-memory reads during replay. `audit:true` brings the twin current and
+     * compares its state with the front's getter by getter. Render worker only: `queries` is the
+     * front's query-result table (generations awaited / answered from the worker), `gpu` the
+     * worker device's lifecycle as the fronts see it; `loseWorkerDevice:true` loses that device
+     * through its real loss path first.
+     */
+    svc.register("d3d9Split", async (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean; audit?: boolean; sites?: boolean; capture?: string; loseWorkerDevice?: boolean };
+        const split = await import("../../modules/d3d9/split");
+        const { devices } = await import("../../modules/d3d9/shared-state");
+        const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+        const client = getD3D9RenderClient();
+        const lostWorkerDevice = opts.loseWorkerDevice && client ? await client.request("loseDevice") : undefined;
+        // The front's side is read BEFORE awaiting the worker: the guest keeps recording across
+        // the await, and a later read counts calls the worker's answer cannot include. The flush
+        // ships what the front holds, so the answer (in stream order) covers every record counted.
+        split.d3d9SplitFlush();
+        const { emptyReplayStats } = await import("../../backends/webgpu/d3d9/split-replay");
+        const front = split.d3d9SplitStats(!!opts.reset, client ? emptyReplayStats() : undefined);
+        const report = client ? await client.request("stats", { reset: !!opts.reset }) as { replay?: SplitReplayStats | null } | null : null;
+        const stream = front && report?.replay ? { ...front, ...report.replay } : front;
+        const renderWorker = client
+            ? {
+                counters: { ...client.counters }, lastError: client.lastError, orphanFrames: client.orphanFrames,
+                screens: client.screenStats(), report,
+                queries: { ...client.queryResults.counters, outstanding: client.queryResults.outstanding() },
+                gpu: {
+                    status: client.gpuLifecycle.status(), generation: client.gpuLifecycle.generation(),
+                    losses: client.gpuLifecycle.losses, recreations: client.gpuLifecycle.recreations,
+                    forcedLoss: lostWorkerDevice,
+                },
+            }
+            : null;
+        let captured: string | null = null;
+        if (opts.capture && client) {
+            const png = await client.request("capture", { slot: 0 }) as Uint8Array | null;
+            if (png && png.length) {
+                const { bytesToBase64, debugDumpPath } = await import("./screen");
+                (self as unknown as Worker).postMessage({ type: "debug_png_dump", name: opts.capture, base64: bytesToBase64(png) });
+                captured = debugDumpPath(opts.capture);
+            }
+        }
+        const dispatcher = proc()?.dispatcher as {
+            getWbufDeferStats?: (reset?: boolean) => Record<string, unknown>;
+            wbufTransportSites?: Map<string, number> | null;
+        } | undefined;
+        const audit = opts.audit ? split.d3d9SplitAudit(devices.values()) : undefined;
+        const sites = dispatcher?.wbufTransportSites;
+        const siteRows = sites
+            ? [...sites].sort((a, b) => b[1] - a[1]).slice(0, 30).map(([site, samples]) => ({ site, samples }))
+            : null;
+        if (dispatcher && opts.sites !== undefined) dispatcher.wbufTransportSites = opts.sites ? new Map() : null;
+        else if (opts.reset && sites) sites.clear();
+        return {
+            wanted: split.d3d9SplitWanted(),
+            stream,
+            queue: dispatcher?.getWbufDeferStats?.(!!opts.reset) ?? null,
+            audit,
+            sites: siteRows,
+            renderWorker,
+            captured,
+        };
+    });
+
+    /**
+     * threadWork({ms?=10000}) — per guest thread, retired guest instructions and worker ms
+     * per presented frame over one window. Instructions do not depend on host speed, so they
+     * answer "whose work is it" where wall time cannot. Run it twice at different frame
+     * lengths (`__forcePresentInterval`): a thread whose instructions/frame stay put does
+     * per-frame work; one whose instructions/SECOND stay put is time-driven (a fixed-step
+     * sim, a timer callback, a mixer). `cpuMs` is wall time while the thread was current —
+     * it includes the thunks it called and idle spent parked while it was current.
+     */
+    svc.register("threadWork", async (args) => {
+        const opts = (args[0] ?? {}) as { ms?: number };
+        const ms = Math.max(500, Math.min(opts.ms ?? 10000, 120000));
+        const sched = sys().scheduler as any;
+        const render = sys().services?.render as RenderLike | undefined;
+        if (!sched?.getThreadRetiredInsns || !render?.getPresentSerial) {
+            throw new HarnessError("threadWork: no scheduler or render service", HarnessErrorCode.NO_PROCESS);
+        }
+        const read = () => ({
+            t: performance.now(), serial: render.getPresentSerial!(),
+            insns: sched.getThreadRetiredInsns() as Record<number, number>,
+            cpuMs: sched.getThreadCpuMs() as Record<number, number>,
+        });
+        const a = read();
+        await new Promise((r) => setTimeout(r, ms));
+        const b = read();
+        const frames = b.serial - a.serial;
+        const elapsedMs = b.t - a.t;
+        const ids = [...new Set([...Object.keys(a.insns), ...Object.keys(b.insns)])].map(Number).sort((x, y) => x - y);
+        let totalInsns = 0;
+        const threads = ids.map((id) => {
+            const insns = (b.insns[id] ?? 0) - (a.insns[id] ?? 0);
+            const cpuMs = (b.cpuMs[id] ?? 0) - (a.cpuMs[id] ?? 0);
+            totalInsns += insns;
+            return {
+                id, insns, cpuMs: +cpuMs.toFixed(2),
+                insnsPerSec: Math.round(insns * 1000 / elapsedMs),
+                insnsPerFrame: frames > 0 ? Math.round(insns / frames) : null,
+                cpuMsPerFrame: frames > 0 ? +(cpuMs / frames).toFixed(2) : null,
+            };
+        });
+        return {
+            elapsedMs: +elapsedMs.toFixed(1), frames,
+            frameMs: frames > 0 ? +(elapsedMs / frames).toFixed(2) : null,
+            totalInsnsPerFrame: frames > 0 ? Math.round(totalInsns / frames) : null,
+            mips: +(totalInsns / elapsedMs / 1000).toFixed(1),
+            threads: threads.filter((t) => t.insns > 0 || t.cpuMs > 0),
+            note: frames > 0 ? undefined : "no presents in the window — per-frame figures are unavailable, not zero",
         };
     });
 
