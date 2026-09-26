@@ -141,6 +141,9 @@ export async function guardGroupsAb(ctx){ return leverAb(ctx,'guardgroups'); }
 export async function eaglViewsAb(ctx){ return leverAb(ctx,'eaglviews'); }
 /** jsprof: split batch-buffer recycling off (0) vs on (1). */
 export async function queueRecycleAb(ctx){ return leverAb(ctx,'queuerecycle'); }
+/** Tier-2 bookkeeping call gates (vendor/v86 jit_tier2_call_gate_set) OFF (0, unconditional calls)
+ *  vs ON (1): 16 ABBA windows in one boot. Runtime bookkeeping only — the JIT cache is kept. */
+export async function tier2GateAb(ctx){ return leverAb(ctx,'tier2gate'); }
 
 /** Where the FRAME goes, as opposed to where the worker's BUSY time goes.
  *  Every ceiling in this campaign was computed against busy time; if a material part of the
@@ -898,6 +901,15 @@ async function leverAb({call,save,note,sleep,scene},lever){
     +" const back=w.eagl_page_views_get()>>>0;"
     +" if(back!=="+mode+") throw new Error('eagl-views readback '+back);"
     +" return back;")
+  : lever==='tier2gate'
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.jit_tier2_call_gate_set) throw new Error('engine has no jit_tier2_call_gate_set');"
+    +" if((w.get_jit_config(15)>>>0)!==0) throw new Error('tier-2 is on; this lever measures the OFF path');"
+    +" w.jit_tier2_call_gate_set("+mode+");"
+    +" const back=w.jit_tier2_call_gate_get()>>>0;"
+    +" if(back!=="+mode+") throw new Error('tier2-gate readback '+back);"
+    +" return back;")
   : lever==='eaglcursor'
   ? call('evalWorker',
      "const w=globalThis.preemption.getWasmExports();"
@@ -1054,7 +1066,7 @@ async function leverAb({call,save,note,sleep,scene},lever){
   }
  } finally {
   await call('pause').catch(()=>{});
-  await setLever((lever==='relaxedfpu'||lever==='queuerecycle')?1:0).catch(()=>{});
+  await setLever((lever==='relaxedfpu'||lever==='queuerecycle'||lever==='tier2gate')?1:0).catch(()=>{});
  }
  const good=windows.filter(w=>w.valid);
  const med=xs=>{const v=[...xs].sort((a,b)=>a-b);return v.length%2?v[(v.length-1)/2]:(v[v.length/2-1]+v[v.length/2])/2;};

@@ -42,6 +42,22 @@ describe("Chrome trace accounting", () => {
         expect(computeStats(p).get(1)?.totalUs).toBe(50);
     });
 
+    test("a late sampler start is not charged to sample 0, and no sample moves", () => {
+        const common = { ph: "P", pid: 42, id: "0x2" };
+        const merge = (deltas: number[]) => mergeProfileChunks([
+            { ...common, name: "Profile", tid: 7, ts: 1000, args: { data: { startTime: 1000 } } },
+            { ...common, name: "ProfileChunk", tid: 7, ts: 9000,
+                args: { data: { cpuProfile: { nodes: [node(1), node(2, { parent: 1 }), node(3, { parent: 1 })],
+                    samples: [2, 3, 3, 3] }, timeDeltas: deltas } } },
+        ] as any).get("42:7")!;
+        const late = merge([300_000, 250, 260, 240]);
+        expect(late.timeDeltas).toEqual([250, 250, 260, 240]);
+        expect(late.startTs + late.timeDeltas[0]!).toBe(1000 + 300_000);
+        expect(computeStats(late).get(2)?.selfUs).toBe(250);
+        // A normal first interval is left alone.
+        expect(merge([270, 250, 260, 240]).timeDeltas).toEqual([270, 250, 260, 240]);
+    });
+
     test("GPU coverage unions nested and overlapping scopes separately per thread", () => {
         const event = (ts: number, dur: number, tid = 2) => ({
             ph: "X", name: "task", cat: "disabled-by-default-gpu.dawn", pid: 1, tid, ts, dur,

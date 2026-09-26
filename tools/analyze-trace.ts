@@ -826,6 +826,22 @@ export function mergeProfileChunks(events: TraceEvent[]): Map<string, MergedProf
     }
   }
 
+  // The first delta runs from Profile.startTime to the first sample. When the sampler starts
+  // late it is hundreds of ms nothing observed, and as self time it lands on whatever sample 0
+  // happens to be (one sample once read as a 0.7 ms/frame "rise" of a v86 helper). Past 10x
+  // the median interval it becomes one median interval; startTs absorbs the rest, so every
+  // sample keeps its absolute position.
+  for (const profile of byId.values()) {
+    const d0 = profile.timeDeltas[0];
+    if (d0 === undefined || profile.timeDeltas.length < 3) continue;
+    const rest = profile.timeDeltas.slice(1).sort((a, b) => a - b);
+    const median = rest[rest.length >> 1]!;
+    if (median > 0 && d0 > 10 * median) {
+      profile.startTs += d0 - median;
+      profile.timeDeltas[0] = median;
+    }
+  }
+
   // Remap keys: replace (pid:id) with the named (pid:tid) from Profile events
   const result = new Map<string, MergedProfile>();
   for (const [idKey, profile] of byId) {
