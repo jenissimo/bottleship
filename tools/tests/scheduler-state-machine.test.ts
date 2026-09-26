@@ -43,6 +43,8 @@ import {
 } from "../../src/worker/core/scheduler/types";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { hasFpuSimdDirtyFlag } from "../../src/worker/core/fpu-helper";
+import { System } from "../../src/worker/core/system";
+import { preemptionManager, PreemptionManager } from "../../src/worker/core/cpu/preemption-manager";
 
 const ALL_STATES: ThreadState[] = [
     ThreadState.CREATED,
@@ -1437,6 +1439,38 @@ describe("scheduler/thread-exit liveness — survivor switched in after a siblin
         expect(yielded).toBe(true);
     });
 
+    // A pause landing while every thread sleeps finds v86 already stopped by the yield, so it
+    // stops nothing; the yield's own resume then restarted the guest under the pause.
+    test("an idle-yield resume does not restart a paused CPU", () => {
+        const s = mkProcSched();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        let runs = 0;
+        const any = s as any;
+        const arm = () => {
+            any.yieldCpu = fakeCpu({ eip: 0x00401000 });
+            any.yieldEngine = { run: () => { runs++; }, stop: () => {} };
+            any.yieldMs = 4;
+            any.yieldStartMs = performance.now();
+            s.intentionalYield = true;
+        };
+        const sys = System.getInstance();
+        const wasPaused = sys.isPaused;
+        try {
+            sys.isPaused = true;
+            arm();
+            any.resumeFromYield();
+            expect(runs).toBe(0);
+            expect(s.intentionalYield).toBe(false);
+
+            sys.isPaused = false;
+            arm();
+            any.resumeFromYield();
+            expect(runs).toBe(1);
+        } finally {
+            sys.isPaused = wasPaused;
+        }
+    });
+
     test("F4: the reaper does not delete the thread still marked current (no +5s door-slam)", () => {
         const s = mkProcSched();
         inject(s, mkThread(3, ThreadState.TERMINATED), { current: true });
@@ -2076,5 +2110,145 @@ describe("scheduler/timer dispatch pre-guard", () => {
         s.reset();
         expect((s as any).cachedWinmmTimerThreadId).toBe(0);
         expect((s as any).cachedWinmmTimerWakeEvent).toBe(0);
+    });
+});
+
+// ─── Urgent exit vs. the thread switched in behind it ─────────────────────────
+// requestImmediateExit() zeroes the live cycle limit for the thread LEAVING the CPU. v86's
+// cycle loop keeps the budget it read at slice entry, so when a switch loads another context
+// in the same JS turn, that thread runs the rest of the slice — and with the live slot still
+// 0 every chain check refuses and every later pass of main_loop retires nothing.
+
+describe("scheduler/urgent exit — the switched-in thread gets the slice back", () => {
+    const PARK = 0x21047000;
+    /** Point the singleton at a private hypercall page; returns the undo. */
+    function armPreemption(): () => void {
+        const pm = preemptionManager as any;
+        const keys = ["wasmExports", "hpBase", "initialized", "wasmMemoryObj", "wasmMemory", "view",
+            "sliceGrant", "urgentExitPending", "sliceEndHeld", "sliceResumes"];
+        const saved = Object.fromEntries(keys.map((k) => [k, pm[k]]));
+        const memory = new WebAssembly.Memory({ initial: 1 });
+        Object.assign(pm, { wasmExports: { memory }, wasmMemoryObj: memory, wasmMemory: null, view: null,
+            hpBase: 0x100, initialized: true, sliceResumes: 0 });
+        return () => Object.assign(pm, saved);
+    }
+    function parkAndSwitch(peerEip: number): { s: Scheduler; t2: Thread; cpu: V86Cpu } {
+        const s = new Scheduler();
+        (s as any).spinLoopBase = PARK;
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t2 = mkThread(2, ThreadState.READY);
+        t2.context = createInitialContext(peerEip, 0x00290000);
+        inject(s, t2, { runnable: true });
+        const cpu = fakeCpu({ eip: 0x00401000, esp: 0x0028ff00 });
+        preemptionManager.prepareForExecution(cpu, false);
+        expect(s.markThreadAsyncParked(1, cpu)).toBe(true);
+        preemptionManager.requestImmediateExit();
+        expect(preemptionManager.getCycleLimit()).toBe(0);
+        expect((s as any).performSwitch(cpu, ThunkBoundaryKind.SPIN_LOOP, 0)).toBe(true);
+        return { s, t2, cpu };
+    }
+
+    test("async park + in-turn switch: the incoming thread runs with the slice's grant, not 0", () => {
+        const undo = armPreemption();
+        try {
+            const { t2 } = parkAndSwitch(0x00402000);
+            expect(t2.state).toBe(ThreadState.RUNNING);
+            expect(preemptionManager.getCycleLimit()).toBe(PreemptionManager.SINGLE_THREAD_LIMIT);
+            expect(preemptionManager.sliceResumes).toBe(1);
+        } finally { undo(); }
+    });
+
+    test("the restored budget is the grant this slice started with (timer-capped slice)", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const t2 = mkThread(2, ThreadState.READY);
+            t2.context = createInitialContext(0x00402000, 0x00290000);
+            inject(s, t2, { runnable: true });
+            const cpu = fakeCpu({ eip: 0x00401000 });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.capSliceForTimerDeadline(200_000);
+            s.markThreadAsyncParked(1, cpu);
+            preemptionManager.requestImmediateExit();
+            (s as any).performSwitch(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+            expect(preemptionManager.getCycleLimit()).toBe(200_000);
+        } finally { undo(); }
+    });
+
+    test("a switch onto the park address keeps the exit (a chain into JMP $ would skip the park-exit)", () => {
+        const undo = armPreemption();
+        try {
+            parkAndSwitch(PARK);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+            expect(preemptionManager.sliceResumes).toBe(0);
+        } finally { undo(); }
+    });
+
+    test("a pause-held exit survives the switch", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const t2 = mkThread(2, ThreadState.READY);
+            t2.context = createInitialContext(0x00402000, 0x00290000);
+            inject(s, t2, { runnable: true });
+            const cpu = fakeCpu({ eip: 0x00401000 });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.endSliceUntilNextTick();
+            (s as any).performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+            // ... and ends with the tick: the next slice is granted normally.
+            preemptionManager.prepareForExecution(cpu, false);
+            expect(preemptionManager.getCycleLimit()).toBe(PreemptionManager.SINGLE_THREAD_LIMIT);
+        } finally { undo(); }
+    });
+
+    test("a self-reschedule keeps the exit: the thread that asked for it is still on the CPU", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const cpu = fakeCpu({ eip: 0x2100000c });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.requestImmediateExit();
+            expect((s as any).performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0)).toBe(false);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+        } finally { undo(); }
+    });
+
+    test("__noSliceResume is the A/B arm: the old behaviour, limit left at 0", () => {
+        const undo = armPreemption();
+        const g = globalThis as { __noSliceResume?: boolean };
+        g.__noSliceResume = true;
+        try {
+            parkAndSwitch(0x00402000);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+        } finally { delete g.__noSliceResume; undo(); }
+    });
+
+    test("a same-turn async restore resumes the parked thread at real code with the grant", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            const cpu = fakeCpu({ eip: PARK, esp: 0x0028ff00 });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.requestImmediateExit();
+            expect(s.applyAsyncRestoreCpuState(cpu, 0x00401234, 0x0028ff08, 1, "test")).toBe(true);
+            expect(preemptionManager.getCycleLimit()).toBe(PreemptionManager.SINGLE_THREAD_LIMIT);
+        } finally { undo(); }
+    });
+
+    test("an urgent tick (current WAITING) grants 0 and nothing can resume it", () => {
+        const undo = armPreemption();
+        try {
+            preemptionManager.prepareForExecution(undefined, true);
+            expect(preemptionManager.resumeSliceForIncomingThread()).toBe(false);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+        } finally { undo(); }
     });
 });

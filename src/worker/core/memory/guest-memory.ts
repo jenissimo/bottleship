@@ -37,6 +37,13 @@ export function guestMemoryBorrowCount(): number {
     return _borrows;
 }
 
+let _borrowProbe: (() => void) | null = null;
+/** Diagnostic hook run on every borrow while set — how the threaded-D3D9 transport census
+ *  names the sites that still read guest memory from inside a drain. */
+export function setGuestMemoryBorrowProbe(probe: (() => void) | null): void {
+    _borrowProbe = probe;
+}
+
 /** Dev A/B switch — see setGuestMemoryBorrowBypass. */
 let _bypass = false;
 
@@ -67,18 +74,27 @@ function isRealView(v: unknown): boolean {
     return ArrayBuffer.isView(v);
 }
 
+/** Whether a plain view still covers live memory. `ArrayBuffer.detached` answers with a
+ *  boolean; `byteLength` answers with a number past the Smi range for a multi-GB guest,
+ *  which boxes a HeapNumber on every call of the busiest guest-memory entry point. */
+function isAttached(buffer: ArrayBufferLike | null, plain: Uint8Array): boolean {
+    const detached = (buffer as { detached?: boolean } | null)?.detached;
+    return detached === undefined ? plain.byteLength !== 0 : !detached;
+}
+
 export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw: T): T {
     _borrows++;
+    if (_borrowProbe !== null) _borrowProbe();
     if (_bypass) return raw;
     if (!raw) return raw;
     // FAST PATH — no proxy trap. Both property reads below are `get` traps (and
     // `.constructor` allocates a fresh `Uint8Array.bind(view)` per call), which on the
     // busiest guest-memory entry point in the worker is the cost this module exists to
     // remove. Identity alone proves nothing — the proxy outlives growth — so the freshness
-    // test is `_lastPlain.byteLength`, read trap-free off the PLAIN view: growth detaches
-    // the old (non-shared) ArrayBuffer, so "still attached" is the buffer-identity test the
-    // slow path performs.
-    if (raw === _lastRaw && _lastPlain !== null && _lastPlain.byteLength !== 0) return _lastPlain as T;
+    // test is whether the PLAIN view's buffer is still attached (isAttached, trap-free):
+    // growth detaches the old (non-shared) ArrayBuffer, so "still attached" is the
+    // buffer-identity test the slow path performs.
+    if (raw === _lastRaw && _lastPlain !== null && isAttached(_lastBuffer, _lastPlain)) return _lastPlain as T;
     // Already a real typed-array view (non-proxy / post-fix steady state) — nothing to do.
     // `ArrayBuffer.isView` reads an internal slot, so it answers without entering the
     // Proxy at all; `raw.constructor` was a `get` trap that, because the property is a

@@ -338,15 +338,30 @@ export class Scheduler {
      *  the EIP-sampler's yield-point bias. */
     private threadCpuMs = new Map<number, number>();
     private threadCpuMarkMs = 0;
+    /** Per-thread retired guest instructions, folded at the same points as threadCpuMs.
+     *  Wall time says which thread holds the worker; this says how much guest WORK each one
+     *  does, which a slower host cannot inflate. Totals are doubles fed by 32-bit deltas —
+     *  every fold happens well inside one counter wrap. */
+    private threadRetiredInsns = new Map<number, number>();
+    private threadInsnMark = -1;
 
-    /** Attribute wall time since the last mark to the outgoing current thread. */
+    /** Attribute wall time and retired instructions since the last mark to the outgoing current thread. */
     private accumThreadCpu(): void {
         const now = performance.now();
-        if (this.threadCpuMarkMs > 0 && this.currentThreadId !== null) {
+        const cpu = this.getCpu();
+        const insns = cpu ? readRetiredInsns(cpu) : -1;
+        if (this.currentThreadId !== null) {
             const id = this.currentThreadId;
-            this.threadCpuMs.set(id, (this.threadCpuMs.get(id) ?? 0) + (now - this.threadCpuMarkMs));
+            if (this.threadCpuMarkMs > 0) {
+                this.threadCpuMs.set(id, (this.threadCpuMs.get(id) ?? 0) + (now - this.threadCpuMarkMs));
+            }
+            if (this.threadInsnMark >= 0 && insns >= 0) {
+                const delta = (insns - this.threadInsnMark) >>> 0;
+                this.threadRetiredInsns.set(id, (this.threadRetiredInsns.get(id) ?? 0) + delta);
+            }
         }
         this.threadCpuMarkMs = now;
+        this.threadInsnMark = insns;
     }
 
     /** Snapshot of per-thread worker-time attribution (ms, monotonic totals). */
@@ -354,6 +369,14 @@ export class Scheduler {
         this.accumThreadCpu(); // fold in the in-progress slice
         const out: Record<number, number> = {};
         for (const [id, ms] of this.threadCpuMs) out[id] = Math.round(ms * 100) / 100;
+        return out;
+    }
+
+    /** Snapshot of per-thread retired guest instructions (monotonic totals). */
+    public getThreadRetiredInsns(): Record<number, number> {
+        this.accumThreadCpu();
+        const out: Record<number, number> = {};
+        for (const [id, n] of this.threadRetiredInsns) out[id] = n;
         return out;
     }
     public fpuSwitchStats = {
@@ -1754,6 +1777,9 @@ export class Scheduler {
 
         next.lastSwitchTime = performance.now();
         next.lastSwitchInsn = this.retiredInsns(cpu); // deterministic quantum baseline for the resumed thread
+        // An urgent exit requested for the outgoing thread must not starve the incoming one.
+        const park = this.spinLoopBase >>> 0;
+        if ((savedCtx.eip >>> 0) !== park && readEip(cpu) !== park) preemptionManager.resumeSliceForIncomingThread();
         return true;
     }
 
@@ -3967,6 +3993,8 @@ export class Scheduler {
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
         v.instructionPointer[0] = eip >>> 0;
         if (target) this.consumeAsyncParkGeneration(target.threadId, target.asyncParkGeneration, source, cpu);
+        // The park's urgent exit is spent: the thread now resumes real code.
+        if ((eip >>> 0) !== (this.spinLoopBase >>> 0)) preemptionManager.resumeSliceForIncomingThread();
         return true;
     }
 
@@ -4240,13 +4268,21 @@ export class Scheduler {
      *  SetRenderState → one-frame surface flicker) and desync the ring. The RUNNING
      *  thread is excluded: it is at an OUT trap and its stored context may be stale. */
     hasParkedThreadInRange(lo: number, hi: number): boolean {
-        for (const t of this.threads.values()) {
-            if (t.state === ThreadState.RUNNING || t.state === ThreadState.TERMINATED) continue;
-            const eip = t.context ? (t.context.eip >>> 0) : 0;
-            if (eip >= lo && eip < hi) return true;
-        }
-        return false;
+        // Asked on every drained WBUF ring: a Map iterator here was a per-drain allocation.
+        this.parkedProbeLo = lo;
+        this.parkedProbeHi = hi;
+        this.parkedProbeHit = false;
+        this.threads.forEach(this.parkedProbe);
+        return this.parkedProbeHit;
     }
+    private parkedProbeLo = 0;
+    private parkedProbeHi = 0;
+    private parkedProbeHit = false;
+    private readonly parkedProbe = (t: Thread): void => {
+        if (this.parkedProbeHit || t.state === ThreadState.RUNNING || t.state === ThreadState.TERMINATED) return;
+        const eip = t.context ? (t.context.eip >>> 0) : 0;
+        if (eip >= this.parkedProbeLo && eip < this.parkedProbeHi) this.parkedProbeHit = true;
+    };
 
     /** Stack bounds [base, top) for a thread, or null if unknown. Used by the thunk
      *  dispatcher's ESP-sanity tripwire (cached per thread switch, not hot-path). */
@@ -4894,6 +4930,10 @@ export class Scheduler {
         this.intentionalYield = false;
         const actual = performance.now() - yieldStartMs;
         try {
+            // A pause taken during the yield owns the CPU and resumeEmulator restarts it.
+            // The engine was not running, so the pause had nothing to stop: restarting it
+            // here runs the guest while paused.
+            if (System.getInstance().isPaused) return;
             frameVarianceDiagnostics.recordIdleTime('yield', actual);
             this.recordYield(yieldSource, actual, ms);
             // Drain pending async restores BEFORE restarting v86. Without this,
