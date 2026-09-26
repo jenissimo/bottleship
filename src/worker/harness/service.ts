@@ -162,6 +162,13 @@ export class HarnessService {
         if (f) f.controller.abort(new HarnessError("cancelled", HarnessErrorCode.CANCELLED));
     }
 
+    /** Runs before every verb. A verb reads back-end state as of the last executed command, and
+     *  with deferred execution (`__wbufDefer`) that lags the guest, so every verb is a fence. */
+    private verbFence: (() => void) | null = null;
+    setVerbFence(fence: (() => void) | null): void {
+        this.verbFence = fence;
+    }
+
     /** Dispatch a harness_rpc message, posting the correlated reply. */
     async dispatch(msg: HarnessRequest): Promise<void> {
         const { id, cmd, args, opts } = msg;
@@ -201,6 +208,7 @@ export class HarnessService {
         const prevRunId = harnessBus.getRunId();
         harnessBus.setRunId(id);
         try {
+            this.verbFence?.();
             const result = await Promise.race([
                 Promise.resolve(handler(Array.isArray(args) ? args : [], ctx)),
                 this.abortPromise(controller.signal),

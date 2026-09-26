@@ -13,6 +13,7 @@
  * return value (if any) rides the RPC reply.
  */
 
+import { getD3D9RenderClient } from "../../render/d3d9-render-client";
 import type { HarnessService } from "../service";
 import { PROXY_BASELINE, syncProxyBaselineFlag } from '../../core/cpu/cpu-views';
 import { dbg } from "../../core/debug/dbg-commands";
@@ -20,7 +21,7 @@ import { System } from "../../core/system";
 import { getSehUnwindTrace } from "../../core/seh-dispatch";
 import { guestCodeInvalidationStats, takeGuestCodeAuditPages } from "../../core/memory/guest-code";
 import { localeFastPathStats } from "../../modules/kernel32/locale";
-import { d3d9RefcountStorageStats } from "../../modules/d3d9/com-refs";
+import { d3d9BindingRefStats, d3d9RefcountStorageStats } from "../../modules/d3d9/com-refs";
 import { d3d9GuestAddRefStats } from "../../modules/d3d9/guest-addref-stub";
 import { d3d9StateBlockShadowStats } from "../../modules/d3d9/state-block-shadow-window";
 import { d3d9GuestReleaseStats } from "../../modules/d3d9/guest-release-stub";
@@ -409,6 +410,20 @@ export function registerDbgCommands(svc: HarnessService): void {
         return d3d9RefcountStorageStats(!!opts.reset);
     });
 
+    /** d3d9BindingRefs({on?}) — do device bindings hold PUBLIC or INTERNAL references?
+     *
+     *  Native D3D9 keeps Set{Texture,StreamSource,Indices,*Shader,VertexDeclaration,RenderTarget,
+     *  DepthStencilSurface} and captured state blocks out of the public count, so Release answers
+     *  what the app holds, and an object released to zero while bound lives until unbound. `on`
+     *  selects that model (`__d3d9InternalBindingRefs`). It is read at every binding acquire and
+     *  release stays balanced across a flip, so one boot can A/B it. `pendingDestruction` counts
+     *  objects alive only because something still binds them. */
+    svc.register("d3d9BindingRefs", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean };
+        if (opts.on !== undefined) (globalThis as Record<string, unknown>).__d3d9InternalBindingRefs = !!opts.on;
+        return d3d9BindingRefStats();
+    });
+
     /** d3d9StateBlockShadow({reset?}) — did a recorded state block lose setters?
      *
      *  A shadowed setter skips in GUEST code, so a setter elided while BeginStateBlock was
@@ -585,6 +600,8 @@ export function registerDbgCommands(svc: HarnessService): void {
         const prev = g[name];
         g[name] = value;
         noteAppliedWorkerFlag(name);
+        // The split D3D9 render worker reads its own copy of every switch.
+        getD3D9RenderClient()?.setFlag(name, value);
         // Flags that hot paths read through a cached mirror (rather than off globalThis on
         // every access) must be re-synced here, or the arm is set and nothing observes it.
         syncProxyBaselineFlag();
@@ -603,6 +620,8 @@ export function registerDbgCommands(svc: HarnessService): void {
         const cleared = applied ? Array.from(applied) : [];
         for (const name of cleared) delete g[name];
         applied?.clear();
+        const renderClient = getD3D9RenderClient();
+        for (const name of cleared) renderClient?.setFlag(name, undefined);
         syncProxyBaselineFlag();
         return { cleared, count: cleared.length, proxyBaseline: PROXY_BASELINE.on };
     });

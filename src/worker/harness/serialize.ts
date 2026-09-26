@@ -200,6 +200,8 @@ export function serializeThreads(): unknown {
     const runQueue: number[] = Array.isArray(sched.runQueue) ? [...sched.runQueue] : [];
     const liveCpu = cpu();
     const threads: unknown[] = [];
+    const retired: Record<number, number> = sched.getThreadRetiredInsns?.() ?? {};
+    const cpuMs: Record<number, number> = sched.getThreadCpuMs?.() ?? {};
     if (threadsMap) {
         for (const [, t] of threadsMap) {
             const isRunning = t.id === currentThreadId;
@@ -228,6 +230,9 @@ export function serializeThreads(): unknown {
                 suspendCount: t.suspendCount ?? 0,
                 priority: t.priority ?? 0,
                 running: isRunning,
+                startAddress: u32(t.startAddress),
+                retiredInsns: retired[t.id] ?? 0,
+                cpuMs: cpuMs[t.id] ?? 0,
             });
         }
     }
