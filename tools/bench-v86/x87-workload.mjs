@@ -1,3 +1,4 @@
+import { applyCodegenSwitches } from '../jit-config/shipping.mjs';
 // Shared Node/browser workload and correctness gates; no platform-specific I/O.
 export function createX87Workload(V86, {wasm, shipping, engineModule}) {
 const SHIPPING_JIT = shipping;
@@ -96,6 +97,7 @@ async function boot(im, { jit = true, locals = 0, flagLocals, stats = false } = 
     for (const [i, v] of SHIPPING_JIT) {
         if (w.set_jit_config(i, v) !== 0 || (w.get_jit_config(i) >>> 0) !== v) throw Error(`config ${i}`);
     }
+    applyCodegenSwitches(w);
     w.set_jit_config(0, jit ? 0 : 1); w.set_jit_config(10, locals);
     if (flagLocals !== undefined && (w.set_jit_config(21, flagLocals) !== 0 || w.get_jit_config(21) !== flagLocals)) throw Error('config 21');
     w.set_relaxed_fpu(1); w.set_fpu_relaxed_stats(stats ? 1 : 0); w.profiler_init();

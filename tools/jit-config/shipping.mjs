@@ -93,3 +93,50 @@ export const flagsWith = (base, changes) => {
 
 export const shippingWith = (...changes) => flagsWith(SHIPPING_JIT, changes);
 export const referenceWith = (...changes) => flagsWith(REFERENCE_ALL_OFF, changes);
+
+/**
+ * Code-shaping switches that live OUTSIDE the set_jit_config slots (the slot envelope is full):
+ * each is an exported `set_<name>` / `get_<name>` pair in vendor/v86, a codegen input, and part
+ * of "shipping" exactly like an index above. PreemptionManager applies every one of them at v86
+ * init through `applyCodegenSwitch` (before the guest runs, so before any compile);
+ * tools/validate-jit-shipping-config.ts checks the two lists agree and that every offline
+ * consumer of SHIPPING_JIT applies these too.
+ */
+export const SHIPPING_CODEGEN_SWITCHES = Object.freeze(new Map([
+    ["jit_page_tails", 1],          // compile instructions in the last 15 bytes of a page
+    ["jit_hot_edge_regions", 0],    // hot-edge region formation: measured −3..−4 %, OFF
+]));
+
+/** The all-off reference for the switches. */
+export const REFERENCE_CODEGEN_SWITCHES = Object.freeze(new Map(
+    [...SHIPPING_CODEGEN_SWITCHES.keys()].map((name) => [name, 0])));
+
+/**
+ * Apply switches to a v86 exports object and PROVE they took (readback). An engine without a
+ * switch is accepted only when the requested value is 0: that engine predates the feature,
+ * which is the same thing as the feature being off. Returns {name: readback | "absent"}.
+ */
+export function applyCodegenSwitches(ex, switches = SHIPPING_CODEGEN_SWITCHES) {
+    const effective = {};
+    for (const [name, value] of switches) {
+        const set = ex[`set_${name}`], get = ex[`get_${name}`];
+        if (typeof set !== "function" || typeof get !== "function") {
+            if (value !== 0) throw new Error(`engine lacks set_${name}/get_${name} but the shape asks for ${value}`);
+            effective[name] = "absent";
+            continue;
+        }
+        set(value);
+        const got = get() >>> 0;
+        if (got !== value) throw new Error(`set_${name}(${value}) read back ${got}`);
+        effective[name] = got;
+    }
+    return effective;
+}
+
+export const formatSwitches = (switches) =>
+    [...switches.entries()].map(([name, value]) => `${name}=${value}`).join(",");
+export const parseSwitches = (text) => new Map(String(text || "").split(",").filter(Boolean).map((pair) => {
+    const [name, value] = pair.split("=");
+    if (!SHIPPING_CODEGEN_SWITCHES.has(name)) throw new Error(`unknown codegen switch ${name}`);
+    return [name, Number(value)];
+}));

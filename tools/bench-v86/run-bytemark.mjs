@@ -22,6 +22,9 @@
 //   --timeout <min>   abort after N minutes (default 90)
 //   --verbose         log serial output + mirror downloads
 //   --helper-census   count JIT→helper calls (perturbs execution; scores INVALID, exit 4)
+//   --flag-contract 0|1  set_flag_helper_contract (fork only; needs 21=1 in --flags to matter)
+//   --flag-sync-count    compile executed flag-sync counters into blocks (counts only; perturbs
+//                        timing, so the scores are recorded but judged INVALID)
 //
 // First run needs network (lazy-mirrors 9p chunks from i.copy.sh); later runs are offline.
 
@@ -29,6 +32,7 @@ import fs from "node:fs";
 import path from "node:path";
 import url from "node:url";
 import { installLazyMirror } from "./fs-lazy-mirror.mjs";
+import { SHIPPING_CODEGEN_SWITCHES, applyCodegenSwitches, parseSwitches } from "../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
 
@@ -171,6 +175,18 @@ function applyEngineConfig() {
         if (!exports?.set_relaxed_fpu) { console.error("--relaxed requested but set_relaxed_fpu export missing (stock engine?)"); process.exit(2); }
         exports.set_relaxed_fpu(Number(args.relaxed));
     }
+    if (args["flag-contract"] !== undefined || args["flag-sync-count"]) {
+        if (typeof exports?.set_flag_helper_contract !== "function") {
+            console.error("--flag-contract requested but set_flag_helper_contract export missing");
+            process.exit(2);
+        }
+        const mode = Number(args["flag-contract"] ?? 0);
+        exports.set_flag_helper_contract(mode);
+        exports.set_flag_sync_counting(args["flag-sync-count"] ? 1 : 0);
+        if ((exports.get_flag_helper_contract() >>> 0) !== mode) { console.error("flag contract readback mismatch"); process.exit(2); }
+        if (exports.get_flag_helper_contract_mutated()) { console.error("engine carries a MUTATED flag-contract table"); process.exit(2); }
+        result.flag_contract = mode;
+    }
     if (flagPairs.length) {
         const setConfig = exports?.["set_jit_config"];
         const getConfig = exports?.["get_jit_config"];
@@ -200,7 +216,16 @@ function applyEngineConfig() {
                 process.exit(2);
             }
         }
+        // Code-shaping switches outside the slot envelope. --flags describes a shipping-derived
+        // arm, so the shipping switches come with it unless --switches says otherwise (the
+        // bench-matrix reference arms pass the all-off set explicitly).
+        let switchReadback;
+        try {
+            switchReadback = applyCodegenSwitches(exports,
+                args.switches !== undefined ? parseSwitches(args.switches) : SHIPPING_CODEGEN_SWITCHES);
+        } catch (e) { console.error(String(e.message ?? e)); process.exit(2); }
         result.jit_config_provenance = {
+            switches: switchReadback,
             verified: true,
             abiVersion,
             supportedMask: supportedMask === null ? null : `0x${supportedMask.toString(16).padStart(8, "0")}`,
@@ -326,6 +351,10 @@ function sampleEngineCounters() {
         tier2Evictions: num("jit_get_tier2_evictions"),
         tier2BlockedByCap: num("jit_get_tier2_blocked_by_cap"),
         tier2PendingDropped: num("jit_get_tier2_pending_dropped"),
+        flagSync: typeof e["flag_sync_stat_get"] === "function"
+            ? Object.fromEntries(["calls", "contracted", "spillWords", "reloadWords", "spillElided", "reloadElided",
+                "execCalls", "execSpillWords", "execReloadWords"].map((n, i) => [n, e["flag_sync_stat_get"](i)]))
+            : null,
     };
 }
 
@@ -367,6 +396,9 @@ function finish() {
     result.finished_at = new Date().toISOString();
     result.engine_counters = sampleEngineCounters();
     result.judgements = judgeEngineCounters(result.engine_counters);
+    if (args['flag-sync-count']) {
+        result.judgements.push({id:'diagnostic.flag_sync_count',ok:false,why:'executed-sync counters are compiled into blocks; counts only, scores invalid'});
+    }
     if (args['helper-census']) {
         result.helper_census = Object.fromEntries(Object.entries(helperCounts).sort((a,b) => b[1]-a[1]));
         result.judgements.push({id:'diagnostic.helper_census',ok:false,why:'JS import wrappers perturb execution; call counts only, scores invalid'});

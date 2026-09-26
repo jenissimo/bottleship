@@ -1541,6 +1541,30 @@ export const dbg = {
         console.log(`[dbg] permMapReads=${out.enabled} (JIT cache cleared). Warm up, then read hit/miss.`);
         return out;
     },
+    /** Flag-helper contracts (vendor/v86 wasm_builder.rs): with flag locals on (idx 21), sync only
+     *  the lazy-flag words each helper's derived contract names. `counting` compiles executed
+     *  spill/reload counters into new blocks (counts only — it perturbs timing). Clears the JIT
+     *  cache; returns the emitted/executed call-site sync counters so far. */
+    flagHelperContract(mode = 1, counting = false): Record<string, number> | null {
+        const w = wasm(); if (!w) return null;
+        if (typeof w["set_flag_helper_contract"] !== "function") {
+            console.warn("[dbg] set_flag_helper_contract missing — rebuild vendor/v86");
+            return null;
+        }
+        w["set_flag_helper_contract"](mode);
+        w["set_flag_sync_counting"](counting ? 1 : 0);
+        if (w.jit_clear_cache_js) w.jit_clear_cache_js();
+        const names = ["calls", "contracted", "spillWords", "reloadWords", "spillElided", "reloadElided",
+            "execCalls", "execSpillWords", "execReloadWords"];
+        const out: Record<string, number> = {
+            mode: w["get_flag_helper_contract"]() >>> 0,
+            flagLocals: (w["get_jit_config"]?.(21) ?? -1) >>> 0,
+            mutatedTable: w["get_flag_helper_contract_mutated"]() >>> 0,
+        };
+        names.forEach((n, i) => { out[n] = w["flag_sync_stat_get"](i); });
+        console.log(`[dbg] flagHelperContract=${out.mode} (idx21=${out.flagLocals}, JIT cache cleared) ${JSON.stringify(out)}`);
+        return out;
+    },
     /** Turn the guest opcode/addressing census on and clear the JIT cache so hot code
      *  recompiles WITH the per-instruction counters. Costs an increment per retired
      *  instruction while on, so it measures SHARES, never the FPS of the same window. */
@@ -1630,6 +1654,8 @@ export const dbg = {
         // pinStarvation > 0 means a callback pin (WndProc/Enum*) was overriding preemption long
         // enough to starve queued peers — each one is a freeze the bound turned into a hiccup.
         const out = { ...s, honestQuantum, fpu, pinStarvationForced: sched?.pinStarvationForced ?? -1, lastTickExit: sched?.lastTickExit ?? -1,
+            // Mid-slice urgent exits voided because another context was switched in (see resumeSliceForIncomingThread).
+            sliceResumes: (globalThis as { preemption?: { sliceResumes?: number } }).preemption?.sliceResumes ?? -1,
             urgentPct: pct(s.urgentTicks, s.ticks),
             urgentNoReadyPct: pct(s.urgentNoReady, s.ticks),
             selfReschedulePct: pct(s.selfReschedule, s.selfReschedule + s.realSwitch),

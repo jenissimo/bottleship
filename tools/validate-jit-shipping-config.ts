@@ -26,11 +26,12 @@
  * does not model is a hard failure, so a future engine change makes this step red instead of
  * quietly unverified.
  */
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { resolve, join, relative } from "node:path";
 import {
     JIT_CONFIG_ABI_VERSION, JIT_CONFIG_SUPPORTED_MASK, SUPPORTED_INDICES,
     SHIPPING_JIT, MIN_VALID, REFERENCE_ALL_OFF, minValid,
+    SHIPPING_CODEGEN_SWITCHES, REFERENCE_CODEGEN_SWITCHES,
 } from "./jit-config/shipping.mjs";
 
 const REPO = resolve(import.meta.dir, "..");
@@ -226,6 +227,79 @@ for (const index of MIN_VALID.keys()) {
     if (!SUPPORTED_INDICES.includes(index)) fail(`MIN_VALID declares index ${index}, which the supported mask excludes`);
 }
 
+// ── rule 4: code-shaping switches outside the slot envelope ─────────────────
+// Each is a `set_<name>`/`get_<name>` export pair. PreemptionManager applies every one at init
+// through applyCodegenSwitch, with the value shipping.mjs declares; the engine default of the
+// backing static must be OFF, so an engine nobody configured is the reference, never shipping.
+const rustAll = (() => {
+    const out: string[] = [];
+    const walk = (dir: string) => {
+        for (const e of readdirSync(dir)) {
+            const p = join(dir, e);
+            if (statSync(p).isDirectory()) walk(p);
+            else if (p.endsWith(".rs")) out.push(readFileSync(p, "utf8"));
+        }
+    };
+    walk(resolve(REPO, "vendor/v86/src/rust"));
+    return out.join("\n");
+})();
+const pmSwitches = new Map<string, number>();
+for (const m of pmSrc.matchAll(/applyCodegenSwitch\(this\.wasmExports,\s*"([a-z0-9_]+)",\s*([^)]+)\)/g)) {
+    const expr = m[2]!.trim();
+    const bool = /^this\.(\w+) \? 1 : 0$/.exec(expr);
+    const plain = /^this\.(\w+)$/.exec(expr);
+    const field = bool?.[1] ?? plain?.[1];
+    if (!field || !fieldDefaults.has(field)) { fail(`PreemptionManager applies switch ${m[1]} as \`${expr}\`, unresolvable`); continue; }
+    pmSwitches.set(m[1]!, fieldDefaults.get(field)! >>> 0);
+}
+for (const [name, value] of SHIPPING_CODEGEN_SWITCHES) {
+    if (!pmSwitches.has(name)) fail(`switch ${name}: declared in SHIPPING_CODEGEN_SWITCHES but PreemptionManager never applies it`);
+    else if (pmSwitches.get(name) !== value) fail(`switch ${name}: PreemptionManager applies ${pmSwitches.get(name)}, shipping.mjs says ${value}`);
+    for (const fn of [`set_${name}`, `get_${name}`]) {
+        if (!new RegExp(`#\\[no_mangle\\]\\s*pub (?:unsafe )?fn ${fn}\\(`).test(rustAll)) fail(`switch ${name}: no #[no_mangle] ${fn} in vendor/v86/src/rust`);
+    }
+    // The setter's backing static: `pub fn set_<name>(..) { unsafe { STATIC = on != 0 } }`.
+    const setter = new RegExp(`pub fn set_${name}\\([^)]*\\)\\s*\\{\\s*unsafe \\{\\s*([A-Z0-9_]+)\\s*=`).exec(rustAll);
+    if (!setter) fail(`switch ${name}: cannot find the static set_${name} writes — extend the parser`);
+    else {
+        const def = new RegExp(`static mut ${setter[1]}\\s*:\\s*[a-z0-9]+\\s*=\\s*([^;]+);`).exec(rustAll);
+        const v = def ? rustLiteral(def[1]!) : null;
+        if (v === null) fail(`switch ${name}: cannot parse the default of ${setter[1]}`);
+        else if (v !== 0) fail(`switch ${name}: engine default of ${setter[1]} is ${v}; switches default OFF in the engine`);
+    }
+    if (REFERENCE_CODEGEN_SWITCHES.get(name) !== 0) fail(`switch ${name}: REFERENCE_CODEGEN_SWITCHES is not 0`);
+}
+for (const name of pmSwitches.keys()) {
+    if (!SHIPPING_CODEGEN_SWITCHES.has(name)) fail(`switch ${name}: PreemptionManager applies it but shipping.mjs does not declare it`);
+}
+if (pmSwitches.size === 0 && SHIPPING_CODEGEN_SWITCHES.size > 0) fail("parsed 0 applyCodegenSwitch() sites — the parser has drifted");
+
+// ── rule 5: every offline consumer of SHIPPING_JIT also applies the switches ─
+// Directly (applyCodegenSwitches / SHIPPING_CODEGEN_SWITCHES) or through a shared helper that
+// does (applyShape, createX87Workload, run-bytemark's --flags path). Archived result snapshots
+// under tools/bench-v86/results/ are frozen copies, not consumers.
+const consumers: string[] = [];
+const walkTools = (dir: string) => {
+    for (const e of readdirSync(dir)) {
+        const p = join(dir, e);
+        if (e === "node_modules" || e === "results" || e === "probes") continue;
+        if (statSync(p).isDirectory()) walkTools(p);
+        else if (/\.(mjs|ts|js)$/.test(e)) {
+            const src = readFileSync(p, "utf8");
+            if (src.includes("jit-config/shipping") && /\bSHIPPING_JIT\b/.test(src)) consumers.push(p);
+        }
+    }
+};
+walkTools(resolve(REPO, "tools"));
+for (const p of consumers) {
+    const rel = relative(REPO, p).replace(/\\/g, "/");
+    if (rel === "tools/validate-jit-shipping-config.ts") continue;
+    const src = readFileSync(p, "utf8");
+    if (!/applyCodegenSwitches|SHIPPING_CODEGEN_SWITCHES|createX87Workload|applyShape|run-bytemark/.test(src)) {
+        fail(`${rel} uses SHIPPING_JIT but never applies the codegen switches — its "shipping" arm is not shipping`);
+    }
+}
+
 if (errors.length > 0) {
     console.error("Production JIT configuration drift:\n");
     for (const e of errors) console.error(`  ${e}`);
@@ -237,5 +311,7 @@ console.log(
     `JIT shipping config OK — ${SUPPORTED_INDICES.length} supported index/es covered, ` +
     `${pmApplied.size} applied by PreemptionManager (${[...pmApplied.keys()].sort((a, b) => a - b).join(",")}), ` +
     `${SUPPORTED_INDICES.length - pmApplied.size} at the jit.rs default, ` +
-    `${MIN_VALID.size} minimum(s) (${rustClampFloor.size} clamped by the setter), ABI ${rustAbi}.`,
+    `${MIN_VALID.size} minimum(s) (${rustClampFloor.size} clamped by the setter), ABI ${rustAbi}; ` +
+    `codegen switches ${[...SHIPPING_CODEGEN_SWITCHES].map(([n, v]) => `${n}=${v}`).join(",")} applied by ` +
+    `PreemptionManager; ${consumers.length} offline consumer(s) apply them.`,
 );

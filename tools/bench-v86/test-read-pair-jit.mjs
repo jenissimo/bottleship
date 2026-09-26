@@ -1,5 +1,5 @@
 import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
-import {V86} from '../../vendor/v86/build/libv86.mjs';import {SHIPPING_JIT} from '../jit-config/shipping.mjs';
+import {V86} from '../../vendor/v86/build/libv86.mjs';import {SHIPPING_JIT,applyCodegenSwitches} from '../jit-config/shipping.mjs';
 import {parseModule,walkBody} from '../aot/lib/wdis.mjs';
 const mutate=process.argv.includes('--mutate-shared-load');
 function sharedLoads(bytes){
@@ -26,7 +26,7 @@ for(const fence of ['none','nop','branch','base-write'])for(const arm of ['inter
  const em=new V86({autostart:false,memory_size:16<<20,wasm_path:a.wasm,log_level:0});await new Promise(r=>em.add_listener('emulator-loaded',r));
  try{
   const c=em.v86.cpu,w=c.wm.exports;c.reboot_internal();c.reset_memory();c.load_multiboot(fixture(fence).buffer);for(let i=0;i<256;i++)c.write32(SRC+i*4,i+1);
-  for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);w.set_jit_config(0,arm==='interpreter'?1:0);
+  for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);applyCodegenSwitches(w);w.set_jit_config(0,arm==='interpreter'?1:0);
   globalThis.__wasmDump={out:[],keepLatestPerPage:true};
   let patched=0,recognized=0;
   c.test_hook_did_generate_wasm=bytes=>{

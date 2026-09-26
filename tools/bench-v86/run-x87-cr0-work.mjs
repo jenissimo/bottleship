@@ -1,5 +1,5 @@
 import fs from 'node:fs';import path from 'node:path';import {createHash} from 'node:crypto';
-import {V86} from '../../vendor/v86/build/libv86.mjs';import {SHIPPING_JIT} from '../jit-config/shipping.mjs';
+import {V86} from '../../vendor/v86/build/libv86.mjs';import {SHIPPING_JIT,applyCodegenSwitches} from '../jit-config/shipping.mjs';
 const man=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const source=fs.readFileSync('tools/bench-v86/test-x87-cr0-shape.mjs','utf8');
 const start=source.indexOf('function fixture('),end=source.indexOf('\nconst rows=[];',start);
@@ -14,7 +14,7 @@ try{
   const a=man.arms[arm];if(createHash('sha256').update(fs.readFileSync(a.wasm)).digest('hex')!==a.hash)throw Error('Artifact drift');
   const em=new V86({autostart:false,memory_size:16<<20,wasm_path:a.wasm,log_level:0});engines[arm]={em};
   await new Promise(r=>em.add_listener('emulator-loaded',r));const c=em.v86.cpu,w=c.wm.exports;
-  c.reboot_internal();c.reset_memory();for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);c.load_multiboot(fixture('none').buffer);
+  c.reboot_internal();c.reset_memory();for(const [i,v]of SHIPPING_JIT)w.set_jit_config(i,v);applyCodegenSwitches(w);c.load_multiboot(fixture('none').buffer);
   await new Promise((resolve,reject)=>{const t=setTimeout(()=>{em.stop();reject(Error('warm timeout'));},20000);em.bus.register('cpu-event-halt',()=>{clearTimeout(t);em.stop();resolve();});em.run();});
   const meta=w.jit_debug_meta_lo(0x100)>>>0,slabs=w.jit_get_dispatch_slabs_ptr()>>>0;
   const state=new DataView(c.wasm_memory.buffer).getUint16(slabs+(meta&65535)*8192+0x47*2,true)-1;

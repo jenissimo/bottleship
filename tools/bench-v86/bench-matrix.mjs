@@ -16,6 +16,7 @@ import url from "node:url";
 import {
     SHIPPING_JIT, SUPPORTED_INDICES, REFERENCE_ALL_OFF, MIN_VALID, minValid,
     formatFlags, parseFlags, shippingWith, referenceWith,
+    REFERENCE_CODEGEN_SWITCHES, formatSwitches,
 } from "../jit-config/shipping.mjs";
 
 const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
@@ -246,6 +247,7 @@ function runOne(name, cfg, runIdx) {
             "--timeout", args.timeout || "90",
         ];
         if (cfg.flags) argv.push("--flags", cfg.flags);
+        if (cfg.reference) argv.push("--switches", formatSwitches(REFERENCE_CODEGEN_SWITCHES));
         if (cfg.relaxed !== undefined) argv.push("--relaxed", String(cfg.relaxed));
         if (args.tests) argv.push("--tests", args.tests);
         console.log(`\n=== ${name} run ${runIdx + 1}/${runs} ===`);
