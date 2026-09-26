@@ -22,7 +22,7 @@ import { BusyWaitDetector } from './busy-wait-detector';
 import { WinApiCallRing } from './winapi-call-ring';
 import { dumpExceptionContext } from './exception-context-dumper';
 import { guardStackWrite } from '../memory/stack-write-guard';
-import { guestMemoryBorrowCount, toPlainGuestMemory } from '../memory/guest-memory';
+import { guestMemoryBorrowCount, setGuestMemoryBorrowProbe, toPlainGuestMemory } from '../memory/guest-memory';
 import * as DispatcherForensics from './dispatcher-forensics';
 import { APIRegistry } from '../api-registry';
 import {
@@ -33,6 +33,10 @@ import { thunkChecksumManager } from '../memory/thunk-checksum';
 import { invalidateGuestCode } from '../memory/guest-code';
 import { hypercallDataManager } from '../cpu/hypercall-data';
 import { preemptionManager } from '../cpu/preemption-manager';
+import {
+    WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW, WBUF_PAYLOAD_MAX_BYTES, wbufEntryStride,
+} from './wbuf-format';
+export { WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW };
 import { cpuViewsForBuffer, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { PF_HALT_TARGET, TRAP_MARKER_VECTOR } from '../bootloader';
 import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault, classifyWildTransfer } from '../memory/fault-recorder';
@@ -116,6 +120,19 @@ export type HleDispatcher = FastPathRegistrar & Record<string, any>;
  */
 export type WriteBufHandler = (mem8: Uint8Array, mem32: Uint32Array, dataPtr: number) => void;
 
+/** The split D3D9 call stream's side of the WBUF queue (modules/d3d9/split.ts). */
+export interface WbufSplitClient {
+    armed(): boolean;
+    /** Bracket the front's own drain of the guest ring: calls it makes are not recorded. */
+    drainBegin(): void;
+    drainEnd(): void;
+    /** Bracket queue execution: registries resolve the render twin's objects. */
+    replayBegin(): void;
+    replayEnd(): void;
+    /** The twin lives in another worker: take the queue bytes [0, end) instead of running them. */
+    ship?(queue: Uint8Array, end: number): boolean;
+}
+
 /**
  * Optional drain-time fusion for an exact alternating pair run. `startPtr` points at the
  * first entry's funcId and `endPtr` is exclusive. Returning false is a transaction decline:
@@ -128,6 +145,18 @@ export type WriteBufPairRunHandler = (
      * intervening non-barrier setters in original order before offering this extension. */
     prefixConstantPtr?: number, prefixDrawPtr?: number,
 ) => boolean;
+
+/** Ring owners whose drain handlers read only their own entry (d3d9: every handler indexes
+ *  from its entry pointer, including the struct and shader-constant captures). */
+const WBUF_TRANSPORT_SAFE_MODULES = new Set(['d3d9']);
+
+/** Modules whose traps neither read nor change graphics back-end state, so deferred execution
+ *  (`__wbufDefer`) lets the queue stay pending across them. Anything not listed is a fence. */
+const WBUF_NO_FENCE_MODULES = new Set(['kernel32', 'kernelbase', 'ntdll', 'dsound', 'winmm', 'dinput', 'dinput8', 'advapi32']);
+/** A queue past this size runs at the next boundary rather than waiting for a fence. */
+const WBUF_DEFER_QUEUE_LIMIT = 8 * 1024 * 1024;
+
+interface ShadowHandle { trampAddr: number; shadowBase: number; slotCount: number; sentinel: number; skipCounterAddr: number }
 
 interface WriteBufPairRunRegistration {
     firstDll: string;
@@ -142,8 +171,6 @@ interface WriteBufPairRunBinding {
     handler: WriteBufPairRunHandler;
 }
 
-/** writeBufArgCountTable sentinel: ring entry stride = (4 + vec4Count×4) × 4 bytes. */
-export const WBUF_ARG_SHADER_CONSTANT = 255;
 
 /**
  * A COM AddRef whose refcount is a dword INSIDE the guest object, answered entirely in guest
@@ -163,9 +190,6 @@ export interface IncRefStubSpec {
     kind?: 'inc' | 'dec';
 }
 
-/** writeBufArgCountTable sentinel for captured UP draws: ring entry =
- *  [funcId][this][primType][primCount][stride][byteCount][payload…], stride = 24 + byteCount. */
-export const WBUF_ARG_UP_DRAW = 254;
 
 /**
  * Represents a write to be applied after async thunk completion.
@@ -333,6 +357,11 @@ export class ThunkDispatcher {
     // Gated by profileSlowPathEnabled — Map.set per slow-path thunk is expensive at >100K/s.
     private slowPathHitCounts: Map<string, number> = new Map();
     private profileSlowPathEnabled: boolean = false;
+    /** Exact per-id crossing ledger for harness crossingCensus/crossingCost; null = off. */
+    private crossingLedger: {
+        slow: Uint32Array; async: Uint32Array; fastFallthrough: Uint32Array;
+        callbackReturns: number; sehResults: number;
+    } | null = null;
     private wasmMissWarned: Set<number> = new Set();
     // Static DLL forwarding table: source DLL > target DLL
     // shfolder.dll forwards all exports to shell32.dll on real Windows
@@ -467,7 +496,12 @@ export class ThunkDispatcher {
      *  device `this`). Allocated lazily on first shadowed registration; seeded via setShadowOwner. */
     private shadowOwnerGlobal = 0;
     /** Per-(dll:func) shadow trampoline handles, for the registering module to seed/invalidate/A-B. */
-    private shadowHandles = new Map<string, { trampAddr: number; shadowBase: number; slotCount: number; sentinel: number; skipCounterAddr: number }>();
+    private shadowHandles = new Map<string, ShadowHandle>();
+    /** shadowHandles by the caller's (dll, func) strings as passed. The per-set lookup
+     *  (writeShadowSlot, once per real state change) must not build and lowercase a key
+     *  string each time; the callers pass literals, so the raw pair is a stable key. Misses
+     *  are cached too, and the whole cache drops on every registration. */
+    private shadowHandleCache = new Map<string, Map<string, ShadowHandle | null>>();
 
     // Virtual time compensation: credit wall-clock time spent in sync thunk handlers.
     // Without this, sync thunks (which replaced async spin-loop thunks) create a virtual
@@ -1113,6 +1147,55 @@ export class ThunkDispatcher {
      *  to orphan its entry → lost SetTexture/SetRenderState → one-frame surface flicker. */
     private wbufTail = 0;
     private wbufResetDeferredTotal = 0; // times the head reset was blocked by a mid-trampoline thread
+    /** Transport copy of the pending ring entries (see drainWriteBuffer). Sized to the ring,
+     *  entries kept at their ring offsets so the parser runs unchanged over either. */
+    private wbufTransportU8: Uint8Array | null = null;
+    private wbufTransportU32: Uint32Array | null = null;
+    /** 1 = the funcId's drain handler reads only its own entry, so it can run from the copy. */
+    private readonly wbufTransportSafe = new Uint8Array(MAX_THUNK_ID);
+    private readonly wbufTransportStats = { drains: 0, bytes: 0, guestBorrows: 0 };
+    /** Deferred execution (`__wbufDefer`): ring entries accumulate here, copied out of the guest
+     *  ring at every OUT trap, and run only when a trap needs the back-end current (a fence). */
+    private wbufQueueU8: Uint8Array | null = null;
+    private wbufQueueU32: Uint32Array | null = null;
+    private wbufQueueEnd = 0;
+    /** 1 = a queue-only handler (the stub still traps; its fast path enqueues the call). */
+    private readonly wbufQueueOnly = new Uint8Array(MAX_THUNK_ID);
+    private readonly deferredHandlerByName = new Map<string, { argCount: number; handler: WriteBufHandler; dllName: string }>();
+    private readonly deferredIdByName = new Map<string, number>();
+    private readonly noFenceTrapNames = new Set<string>();
+    /** Per trapped funcId: 0 = not yet classified, 1 = fence, 2 = the queue may stay pending. */
+    private readonly trapFencePolicy = new Uint8Array(MAX_THUNK_ID);
+    private readonly wbufDeferStats = {
+        transports: 0, executes: 0, bytesQueued: 0, enqueuedCalls: 0, payloadBytes: 0, fenceTraps: 0,
+        unsafeFlushes: 0, peakQueueBytes: 0, guestBorrows: 0,
+    };
+    /** Queue-only payload handlers with no export behind them, by synthetic id (top of the id
+     *  space, which no stub uses). Kept apart so reset() can re-bind them. */
+    private readonly queuePayloadHandlers = new Map<number, WriteBufHandler>();
+    private nextQueuePayloadId = MAX_THUNK_ID - 1;
+    /** Split D3D9: the front applies the ring at every trap, and the queue carries the same
+     *  entries (plus recorded calls) to the render twin, run at the client's fences. */
+    private wbufSplitClient: WbufSplitClient | null = null;
+    /** Armed by the harness: sample the call sites of guest-memory borrows made inside a
+     *  transport drain (1 in 16, the first frames below the accessor layer). */
+    wbufTransportSites: Map<string, number> | null = null;
+    private wbufTransportSiteTick = 0;
+    private readonly wbufTransportSiteProbe = (): void => {
+        const sites = this.wbufTransportSites;
+        if (!sites || (this.wbufTransportSiteTick++ & 15) !== 0 || sites.size >= 256) return;
+        const errorCtor = Error as { stackTraceLimit?: number };
+        const limit = errorCtor.stackTraceLimit;
+        errorCtor.stackTraceLimit = 24;
+        const stack = new Error().stack ?? "";
+        errorCtor.stackTraceLimit = limit;
+        const frames = stack.split("\n").slice(2)
+            .filter((f) => !/guest-memory\.ts|mem-accessor\.ts|getCurrentMemory|get memory /.test(f))
+            .slice(0, 4)
+            .map((f) => f.trim().replace(/^at /, "").replace(/https?:\/\/[^/]+\//, "").replace(/\?[^:)]*/, ""));
+        const key = frames.join(" <- ");
+        sites.set(key, (sites.get(key) ?? 0) + 1);
+    };
     private wbufTrampLo = 0;
     private wbufTrampHi = 0;
     private wbufCoalesceCap = 0;
@@ -1202,17 +1285,7 @@ export class ThunkDispatcher {
     }
 
     private getWbufEntryStride(mem32: Uint32Array, dataBase: number, offset: number, argCount: number): number {
-        if (argCount === WBUF_ARG_SHADER_CONSTANT) {
-            const vec4Count = mem32[(dataBase + offset + 12) >> 2] >>> 0;
-            if (!vec4Count || vec4Count > 256) return -1;
-            return (4 + vec4Count * 4) * 4;
-        }
-        if (argCount === WBUF_ARG_UP_DRAW) {
-            const byteCount = mem32[(dataBase + offset + 20) >> 2] >>> 0;
-            if (!byteCount || byteCount > 65536 || (byteCount & 3) !== 0) return -1;
-            return 24 + byteCount;
-        }
-        return (argCount + 1) * 4;
+        return wbufEntryStride(mem32, dataBase, offset, argCount);
     }
 
     /** Rebind durable name-based pair registrations after stub regeneration. */
@@ -1234,11 +1307,20 @@ export class ThunkDispatcher {
         }
     }
 
-    /** Return an exclusive end offset for an exact first/second alternating run. */
+    /** Second result of findWriteBufferPairRunEnd, which runs for every entry that opens a
+     *  registered pair — thousands per frame — and so must not return an object. */
+    private pairRunPairs = 0;
+    /** The prefix scan's short run of plain setters between the first constant and the first
+     *  draw (at most four), held in fixed storage for the same reason. */
+    private readonly prefixMiddleOffsets = new Int32Array(4);
+    private readonly prefixMiddleIds = new Int32Array(4);
+
+    /** Return an exclusive end offset for an exact first/second alternating run; the pair
+     *  count is left in pairRunPairs. */
     private findWriteBufferPairRunEnd(
         mem32: Uint32Array, dataBase: number, start: number, head: number,
         firstId: number, secondIds: Set<number>,
-    ): { end: number; pairs: number } {
+    ): number {
         let offset = start;
         let pairs = 0;
         while (offset < head) {
@@ -1257,7 +1339,8 @@ export class ThunkDispatcher {
             offset = secondOffset + secondStride;
             pairs++;
         }
-        return { end: offset, pairs };
+        this.pairRunPairs = pairs;
+        return offset;
     }
 
     private buildWbufCoalesceIndex(mem32: Uint32Array, dataBase: number, start: number, head: number): boolean {
@@ -1281,6 +1364,557 @@ export class ThunkDispatcher {
             offset += stride;
         }
         return offset === head;
+    }
+
+    /** Modules whose ring handlers were audited to read nothing but their own entry. */
+    private noteWriteBufTransportSafety(id: number, dllName: string): void {
+        this.wbufTransportSafe[id] = WBUF_TRANSPORT_SAFE_MODULES.has(dllName.toLowerCase()) ? 1 : 0;
+        this.wbufHandlerGeneration++;
+    }
+
+    /** Bumped whenever a ring handler is (re)bound: function ids are per stub generation. */
+    private wbufHandlerGeneration = 0;
+
+    getWbufHandlerGeneration(): number {
+        return this.wbufHandlerGeneration;
+    }
+
+    /**
+     * The transport-safe ring handlers by function id, for a consumer in another worker that
+     * rebuilds the same handlers by name: [id, "dll:function", argCount].
+     */
+    describeTransportSafeHandlers(): { generation: number; entries: Array<[number, string, number]> } {
+        const entries: Array<[number, string, number]> = [];
+        for (let id = 1; id < MAX_THUNK_ID; id++) {
+            if (this.wbufTransportSafe[id] !== 1 || !this.writeBufHandlerTable[id] || this.queuePayloadHandlers.has(id)) continue;
+            const name = this.namesTable[id];
+            if (name) entries.push([id, name, this.writeBufArgCountTable[id]]);
+        }
+        return { generation: this.wbufHandlerGeneration, entries };
+    }
+
+    private wbufTransportArmed(): boolean {
+        return (globalThis as { __wbufTransport?: boolean }).__wbufTransport === true
+            && this.writeBufCapacity > 0;
+    }
+
+    private copyRingToTransport(guestMem8: Uint8Array, dataBase: number, from: number, to: number): void {
+        const size = Math.max(this.writeBufCapacity, to) + 64;
+        if (!this.wbufTransportU8 || this.wbufTransportU8.length < size) {
+            const buffer = new ArrayBuffer((size + 4095) & ~4095);
+            this.wbufTransportU8 = new Uint8Array(buffer);
+            this.wbufTransportU32 = new Uint32Array(buffer);
+        }
+        this.wbufTransportU8.set(guestMem8.subarray(dataBase + from, dataBase + to), from);
+        this.wbufTransportStats.drains++;
+        this.wbufTransportStats.bytes += to - from;
+    }
+
+    /** Transport-mode counters: how many drains ran from the copy, how many bytes it carried,
+     *  and how many guest-memory views the handlers still took while doing it — each of
+     *  those is a read a consumer on another worker could not make. */
+    getWbufTransportStats(reset = false): { armed: boolean; drains: number; bytes: number; guestBorrows: number } {
+        const out = { armed: this.wbufTransportArmed(), ...this.wbufTransportStats };
+        if (reset) {
+            this.wbufTransportStats.drains = 0;
+            this.wbufTransportStats.bytes = 0;
+            this.wbufTransportStats.guestBorrows = 0;
+        }
+        return out;
+    }
+
+    wbufDeferring(): boolean {
+        return (globalThis as { __wbufDefer?: boolean }).__wbufDefer === true && this.writeBufCapacity > 0
+            && !this.wbufSplitting();
+    }
+
+    /**
+     * Register a drain handler for a call that still TRAPS (its stub is not patched): in
+     * deferred mode the fast path hands the call to enqueueWriteBufCall instead of executing
+     * it, and this handler applies it later, in order with the ring entries around it.
+     */
+    registerDeferredWriteBufHandler(dllName: string, funcName: string, argCount: number, handler: WriteBufHandler): void {
+        this.deferredHandlerByName.set(`${dllName}:${funcName}`, { argCount, handler, dllName });
+    }
+
+    /** Append a trapped call to the deferred queue: funcId, then argCount dwords read from the
+     *  guest stack at argPtr (the first argument). Returns false when the call has no deferred
+     *  handler, and the caller must then execute it itself. */
+    enqueueWriteBufCall(dllName: string, funcName: string, view: DataView, argPtr: number): boolean {
+        const key = `${dllName}:${funcName}`;
+        const reg = this.deferredHandlerByName.get(key);
+        if (!reg) return false;
+        if (reg.argCount === WBUF_ARG_PAYLOAD) return false;
+        const id = this.bindDeferredHandler(key, reg);
+        if (id === 0) return false;
+        const bytes = (reg.argCount + 1) * 4;
+        this.ensureWbufQueue(this.wbufQueueEnd + bytes);
+        const q32 = this.wbufQueueU32!;
+        const w = this.wbufQueueEnd >> 2;
+        q32[w] = id;
+        for (let i = 0; i < reg.argCount; i++) q32[w + 1 + i] = view.getUint32(argPtr + i * 4, true);
+        this.wbufQueueEnd += bytes;
+        this.wbufDeferStats.enqueuedCalls++;
+        return true;
+    }
+
+    /** A trapped call that neither reads nor changes back-end state (it is answered from
+     *  front-end data), so deferred execution may leave the queue pending across it. */
+    registerNoFenceTrap(dllName: string, funcName: string): void {
+        this.noFenceTrapNames.add(`${dllName}:${funcName}`);
+    }
+
+    /**
+     * Append a payload entry: four header dwords and `byteCount` bytes copied NOW from
+     * `src[srcOffset..]` (guest memory at the moment of the call). The handler registered with
+     * registerDeferredWriteBufHandler(..., WBUF_ARG_PAYLOAD, ...) receives ptr at the header;
+     * the bytes start at ptr + 20.
+     */
+    enqueueWriteBufPayload(
+        dllName: string, funcName: string, h0: number, h1: number, h2: number, h3: number,
+        src: Uint8Array, srcOffset: number, byteCount: number,
+    ): boolean {
+        const key = `${dllName}:${funcName}`;
+        const reg = this.deferredHandlerByName.get(key);
+        if (!reg || reg.argCount !== WBUF_ARG_PAYLOAD) return false;
+        const id = this.bindDeferredHandler(key, reg);
+        if (id === 0) return false;
+        return this.enqueuePayloadById(id, h0, h1, h2, h3, src, srcOffset, byteCount);
+    }
+
+    /** A queue-only payload handler with no export behind it; returns its synthetic id. */
+    registerQueuePayloadHandler(handler: WriteBufHandler): number {
+        const id = this.nextQueuePayloadId--;
+        this.queuePayloadHandlers.set(id, handler);
+        this.bindQueuePayloadHandler(id, handler);
+        return id;
+    }
+
+    private bindQueuePayloadHandler(id: number, handler: WriteBufHandler): void {
+        this.writeBufHandlerTable[id] = handler;
+        this.writeBufArgCountTable[id] = WBUF_ARG_PAYLOAD;
+        // A recorded call may read state the ring set around it: the coalescer must not merge
+        // two setters across it (the front applied them one trap at a time).
+        this.writeBufBarrierTable[id] = 1;
+        this.wbufQueueOnly[id] = 1;
+        this.wbufTransportSafe[id] = 1;
+    }
+
+    setWbufSplitClient(client: WbufSplitClient | null): void {
+        this.wbufSplitClient = client;
+    }
+
+    private wbufSplitting(): boolean {
+        return this.wbufSplitClient !== null && this.wbufSplitClient.armed() && this.writeBufCapacity > 0;
+    }
+
+    enqueuePayloadById(
+        id: number, h0: number, h1: number, h2: number, h3: number,
+        src: Uint8Array, srcOffset: number, byteCount: number,
+    ): boolean {
+        if (byteCount < 0 || byteCount > WBUF_PAYLOAD_MAX_BYTES) return false;
+        const stride = 24 + ((byteCount + 3) & ~3);
+        this.ensureWbufQueue(this.wbufQueueEnd + stride);
+        const q32 = this.wbufQueueU32!;
+        const w = this.wbufQueueEnd >> 2;
+        q32[w] = id;
+        q32[w + 1] = h0 >>> 0;
+        q32[w + 2] = h1 >>> 0;
+        q32[w + 3] = h2 >>> 0;
+        q32[w + 4] = h3 >>> 0;
+        q32[w + 5] = byteCount >>> 0;
+        if (byteCount > 0) this.wbufQueueU8!.set(src.subarray(srcOffset, srcOffset + byteCount), this.wbufQueueEnd + 24);
+        this.wbufQueueEnd += stride;
+        this.wbufDeferStats.enqueuedCalls++;
+        this.wbufDeferStats.payloadBytes += byteCount;
+        return true;
+    }
+
+    private bindDeferredHandler(key: string, reg: { argCount: number; handler: WriteBufHandler; dllName: string }): number {
+        let id = this.deferredIdByName.get(key);
+        if (id !== undefined) return id;
+        const sep = key.indexOf(":");
+        id = this.findStubsByName(key.slice(0, sep), key.slice(sep + 1))[0]?.functionId ?? 0;
+        if (id > 0 && id < MAX_THUNK_ID) {
+            this.writeBufHandlerTable[id] = reg.handler;
+            this.writeBufArgCountTable[id] = reg.argCount;
+            this.wbufQueueOnly[id] = 1;
+            this.noteWriteBufTransportSafety(id, reg.dllName);
+        } else {
+            id = 0;
+        }
+        this.deferredIdByName.set(key, id);
+        return id;
+    }
+
+    private ensureWbufQueue(bytes: number): void {
+        if (this.wbufQueueU8 && this.wbufQueueU8.length >= bytes) return;
+        const size = Math.max(bytes, (this.wbufQueueU8?.length ?? 0) * 2, 1 << 20);
+        const buffer = new ArrayBuffer((size + 4095) & ~4095);
+        const u8 = new Uint8Array(buffer);
+        if (this.wbufQueueU8) u8.set(this.wbufQueueU8.subarray(0, this.wbufQueueEnd));
+        this.wbufQueueU8 = u8;
+        this.wbufQueueU32 = new Uint32Array(buffer);
+    }
+
+    /** Deferred mode's replacement for the per-trap drain: move the guest ring's pending entries
+     *  into the queue, then run the queue only if this trap is a fence. */
+    private deferredTrapBoundary(functionId: number): void {
+        this.transportRingToQueue();
+        if (this.trapNeedsFence(functionId)) {
+            this.wbufDeferStats.fenceTraps++;
+            this.executeWbufQueue();
+        } else if (this.wbufQueueEnd > WBUF_DEFER_QUEUE_LIMIT) {
+            this.executeWbufQueue();
+        }
+    }
+
+    private trapNeedsFence(functionId: number): boolean {
+        if (!(functionId > 0 && functionId < MAX_THUNK_ID)) return true;
+        let policy = this.trapFencePolicy[functionId];
+        if (policy === 0) {
+            const name = this.namesTable[functionId] ?? "";
+            const dll = name.slice(0, Math.max(0, name.indexOf(":"))).toLowerCase();
+            const deferrable = WBUF_NO_FENCE_MODULES.has(dll) || this.deferredHandlerByName.has(name)
+                || this.noFenceTrapNames.has(name);
+            policy = deferrable ? 2 : 1;
+            this.trapFencePolicy[functionId] = policy;
+        }
+        return policy === 1;
+    }
+
+    private transportRingToQueue(): void {
+        if (this.writeBufControlAddr === 0) return;
+        let mem32 = this.cachedMem32;
+        const headWordIdx = this.writeBufControlAddr >> 2;
+        if (!mem32 || headWordIdx >= mem32.length) {
+            this.updateMemoryCache();
+            mem32 = this.cachedMem32;
+            if (!mem32 || headWordIdx >= mem32.length) return;
+        }
+        const head = mem32[headWordIdx];
+        if (!head) { this.wbufTail = 0; return; }
+        const tail = this.wbufTail;
+        if (head === tail) { this.tryResetWbufHead(mem32, headWordIdx, head); return; }
+        const base = this.writeBufDataBase;
+        // Only entries whose handlers read nothing but the entry may wait in the queue.
+        for (let off = tail; off < head;) {
+            const id = mem32[(base + off) >> 2] >>> 0;
+            const argCount = id > 0 && id < MAX_THUNK_ID ? this.writeBufArgCountTable[id] : 0;
+            const stride = argCount > 0 && this.writeBufHandlerTable[id] && this.wbufTransportSafe[id] === 1
+                ? this.getWbufEntryStride(mem32, base, off, argCount) : -1;
+            if (stride <= 0) {
+                this.wbufDeferStats.unsafeFlushes++;
+                this.executeWbufQueue();
+                this.drainWriteBuffer();
+                return;
+            }
+            off += stride;
+        }
+        if (this.wbufCallCounts) this.censusWriteBufRange(mem32, base, tail, head);
+        if (this.wbufSequenceWant > 0) this.recordWriteBufSequence(mem32, base, tail, head);
+        const bytes = head - tail;
+        this.ensureWbufQueue(this.wbufQueueEnd + bytes);
+        this.wbufQueueU8!.set(this.cachedMem8!.subarray(base + tail, base + head), this.wbufQueueEnd);
+        this.wbufQueueEnd += bytes;
+        this.wbufDeferStats.transports++;
+        this.wbufDeferStats.bytesQueued += bytes;
+        if (this.wbufQueueEnd > this.wbufDeferStats.peakQueueBytes) this.wbufDeferStats.peakQueueBytes = this.wbufQueueEnd;
+        this.wbufTail = head;
+        this.tryResetWbufHead(mem32, headWordIdx, head);
+    }
+
+    /** Entries of modules not marked transport-safe that the current drain applied. */
+    private drainUnsafeSeen = 0;
+
+    /** Split mode: after the front applied ring entries [from, to), queue the ones of
+     *  transport-safe modules (d3d9) for the render twin, runs copied as blocks. */
+    private queueSplitRingRange(mem32: Uint32Array, base: number, from: number, to: number): void {
+        let off = from;
+        let runStart = -1;
+        while (off < to) {
+            const id = mem32[(base + off) >> 2] >>> 0;
+            const argCount = id > 0 && id < MAX_THUNK_ID ? this.writeBufArgCountTable[id] : 0;
+            const stride = argCount > 0 ? this.getWbufEntryStride(mem32, base, off, argCount) : -1;
+            if (stride <= 0) {
+                Logger.error(LogCategory.THUNK, `[WBUF] split: unparsable ring entry id=${id} at +${off}; the twin misses [${off}, ${to})`);
+                break;
+            }
+            const safe = this.wbufTransportSafe[id] === 1;
+            if (safe && runStart < 0) runStart = off;
+            if (!safe && runStart >= 0) { this.appendRingBytes(base, runStart, off); runStart = -1; }
+            off += stride;
+        }
+        if (runStart >= 0) this.appendRingBytes(base, runStart, off);
+    }
+
+    private appendRingBytes(base: number, from: number, to: number): void {
+        const bytes = to - from;
+        this.ensureWbufQueue(this.wbufQueueEnd + bytes);
+        this.wbufQueueU8!.set(this.cachedMem8!.subarray(base + from, base + to), this.wbufQueueEnd);
+        this.wbufQueueEnd += bytes;
+        this.wbufDeferStats.transports++;
+        this.wbufDeferStats.bytesQueued += bytes;
+        if (this.wbufQueueEnd > this.wbufDeferStats.peakQueueBytes) this.wbufDeferStats.peakQueueBytes = this.wbufQueueEnd;
+    }
+
+    /** Run everything queued, in order. Public so a reader of back-end state outside a trap
+     *  (a harness verb, a diagnostic) can bring it current first. */
+    executeWbufQueue(): void {
+        const end = this.wbufQueueEnd;
+        if (end === 0) return;
+        this.wbufQueueEnd = 0;
+        if (!this.isDataViewValid()) this.updateMemoryCache();
+        const borrowsBefore = guestMemoryBorrowCount();
+        if (this.wbufTransportSites) setGuestMemoryBorrowProbe(this.wbufTransportSiteProbe);
+        const split = this.wbufSplitting() ? this.wbufSplitClient : null;
+        if (split?.ship && split.ship(this.wbufQueueU8!, end)) {
+            this.wbufDeferStats.executes++;
+            return;
+        }
+        split?.replayBegin();
+        try {
+            this.applyWriteBufEntries(this.wbufQueueU8!, this.wbufQueueU32!, 0, 0, end, true,
+                this.cachedMem8!, this.cachedMem32!, false);
+        } finally {
+            split?.replayEnd();
+            if (this.wbufTransportSites) setGuestMemoryBorrowProbe(null);
+            this.wbufDeferStats.guestBorrows += guestMemoryBorrowCount() - borrowsBefore;
+            this.wbufDeferStats.executes++;
+        }
+    }
+
+    getWbufDeferStats(reset = false): Record<string, number | boolean> {
+        const out = { armed: this.wbufDeferring(), pendingBytes: this.wbufQueueEnd, ...this.wbufDeferStats };
+        if (reset) {
+            for (const k of Object.keys(this.wbufDeferStats) as Array<keyof typeof this.wbufDeferStats>) {
+                this.wbufDeferStats[k] = 0;
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Apply ring entries [offset, head) of the buffer (rMem8/rMem32, entries at rBase + offset)
+     * in program order and return where it stopped. The guest ring and the deferred queue both
+     * run through here; `transport` means rMem8 is a copy, so an entry of a module not marked
+     * transport-safe is handed the guest ring instead (guestMem8/guestMem32 at the ring base).
+     */
+    private applyWriteBufEntries(
+        rMem8: Uint8Array, rMem32: Uint32Array, rBase: number, offset: number, head: number,
+        transport: boolean, guestMem8: Uint8Array, mem32: Uint32Array, verbose: boolean,
+    ): number {
+        let segment = 0; // barrier (draw) count — must mirror buildWbufCoalesceIndex's walk
+        if (this.wbufCallCounts) this.censusWriteBufRange(rMem32, rBase, offset, head);
+        // Counts say WHAT the ring carries; only the order says what shape a run detector
+        // would have to match, which is why this is a separate, separately-armed tier.
+        if (this.wbufSequenceWant > 0) this.recordWriteBufSequence(rMem32, rBase, offset, head);
+        const coalescing = this.wbufCoalescingEnabled && this.buildWbufCoalesceIndex(rMem32, rBase, offset, head);
+        while (offset < head) {
+            const funcId: number = rMem32[(rBase + offset) >> 2] >>> 0;
+            if (funcId > 0 && funcId < MAX_THUNK_ID) {
+                // Exact pair fusion is attempted before either ordinary handler mutates state.
+                // A decline is therefore a strict rollback point: resume at the same offset.
+                const pairBindings: WriteBufPairRunBinding[] | null = this.writeBufPairRunByFirst[funcId];
+                // Fused pair runs are skipped in transport mode: their consumers were written
+                // against the guest ring and have not been audited for reads beyond it.
+                if (pairBindings && !coalescing && !transport) {
+                    let consumed = false;
+                    for (let bi = 0; bi < pairBindings.length; bi++) {
+                        const binding = pairBindings[bi]!;
+                        const runEnd = this.findWriteBufferPairRunEnd(rMem32, rBase, offset, head, funcId, binding.secondIds);
+                        const runPairs = this.pairRunPairs;
+                        // Default-on prefix extension (false is the benchmark/debug kill switch):
+                        // first-constant, a short run of ordinary non-barrier
+                        // setters, first-draw, then the established alternating pair run. Apply
+                        // constant/setters in original order, then let the consumer prepend the
+                        // first draw as instance zero. On a decline only that first draw is
+                        // replayed here; the following exact run remains at tailStart and is
+                        // offered normally on the next loop iteration.
+                        if (runPairs === 0
+                            && (globalThis as { __d3d9PrefixMegaRun?: boolean })
+                                .__d3d9PrefixMegaRun !== false) {
+                            const firstStride = this.getWbufEntryStride(
+                                rMem32, rBase, offset, this.writeBufArgCountTable[funcId],
+                            );
+                            let cursor = offset + firstStride;
+                            let middleCount = 0;
+                            let prefixDrawOffset = -1;
+                            for (let n = 0; firstStride > 0 && cursor < head && n < this.prefixMiddleIds.length; n++) {
+                                const id = rMem32[(rBase + cursor) >> 2] >>> 0;
+                                if (binding.secondIds.has(id) && this.writeBufHandlerTable[id]) {
+                                    prefixDrawOffset = cursor;
+                                    break;
+                                }
+                                if (!(id > 0 && id < MAX_THUNK_ID) || id === funcId
+                                    || this.writeBufBarrierTable[id] || !this.writeBufHandlerTable[id]
+                                    || this.writeBufArgCountTable[id] <= 0) break;
+                                const stride = this.getWbufEntryStride(
+                                    rMem32, rBase, cursor, this.writeBufArgCountTable[id],
+                                );
+                                if (stride <= 0 || cursor + stride > head) break;
+                                this.prefixMiddleOffsets[middleCount] = cursor;
+                                this.prefixMiddleIds[middleCount] = id;
+                                middleCount++;
+                                cursor += stride;
+                            }
+                            if (prefixDrawOffset >= 0 && middleCount > 0) {
+                                const prefixDrawId = rMem32[(rBase + prefixDrawOffset) >> 2] >>> 0;
+                                const drawStride = this.getWbufEntryStride(
+                                    rMem32, rBase, prefixDrawOffset,
+                                    this.writeBufArgCountTable[prefixDrawId],
+                                );
+                                const tailStart = prefixDrawOffset + drawStride;
+                                if (drawStride > 0 && tailStart < head
+                                    && (rMem32[(rBase + tailStart) >> 2] >>> 0) === funcId) {
+                                    const tailEnd = this.findWriteBufferPairRunEnd(
+                                        rMem32, rBase, tailStart, head, funcId, binding.secondIds,
+                                    );
+                                    const tailPairs = this.pairRunPairs;
+                                    if (tailPairs >= 2) {
+                                        this.writeBufHandlerTable[funcId]!(
+                                            rMem8, rMem32, rBase + offset + 4,
+                                        );
+                                        this.wbufHitsTotal++;
+                                        for (let m = 0; m < middleCount; m++) {
+                                            this.writeBufHandlerTable[this.prefixMiddleIds[m]]!(
+                                                rMem8, rMem32, rBase + this.prefixMiddleOffsets[m] + 4,
+                                            );
+                                            this.wbufHitsTotal++;
+                                        }
+                                        // The first constant and the middle setters are already
+                                        // applied. Letting a throw unwind the drain would leave
+                                        // wbufTail at the run start and apply them a second time,
+                                        // so a throwing consumer takes the decline path instead.
+                                        let fused: boolean;
+                                        try {
+                                            fused = binding.handler(
+                                                rMem8, rMem32,
+                                                rBase + tailStart, rBase + tailEnd,
+                                                tailPairs,
+                                                rBase + offset, rBase + prefixDrawOffset,
+                                            );
+                                        } catch (e) {
+                                            fused = false;
+                                            if (this.wbufFusedConsumerThrows++ === 0) {
+                                                Logger.error(LogCategory.THUNK,
+                                                    `drainWriteBuffer: fused pair-run consumer for funcId `
+                                                    + `${funcId} threw; declining to the ordinary path: ${e}`);
+                                            }
+                                        }
+                                        if (fused) {
+                                            offset = tailEnd;
+                                            segment += tailPairs + 1;
+                                            this.wbufBarrierEntriesTotal += tailPairs + 1;
+                                            this.wbufHitsTotal += tailPairs * 2 + 1;
+                                            this.wbufPairRunsTotal++;
+                                            this.wbufPairsTotal += tailPairs;
+                                        } else {
+                                            this.writeBufHandlerTable[prefixDrawId]!(
+                                                rMem8, rMem32, rBase + prefixDrawOffset + 4,
+                                            );
+                                            offset = tailStart;
+                                            segment++;
+                                            this.wbufBarrierEntriesTotal++;
+                                            this.wbufHitsTotal++;
+                                            this.wbufPairFallbacksTotal++;
+                                        }
+                                        consumed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (consumed) break;
+                        // One pair rarely amortises the cross-language setup; leave it on the
+                        // established path. Runs of two or more are the useful workload shape.
+                        if (runPairs < 2) continue;
+                        // A throwing consumer is a DECLINE, exactly as on the prefix branch
+                        // above. Nothing has been applied here yet, so falling through to the
+                        // ordinary handlers is the correct completion; letting the exception
+                        // escape instead unwinds out of the drain entirely, leaving wbufTail at
+                        // the run start with the ring un-drained — the whole batch is then
+                        // either replayed or lost, and nothing downstream notices.
+                        let fusedExact: boolean;
+                        try {
+                            fusedExact = binding.handler(
+                                rMem8, rMem32, rBase + offset, rBase + runEnd, runPairs);
+                        } catch (e) {
+                            fusedExact = false;
+                            if (this.wbufFusedConsumerThrows++ === 0) {
+                                Logger.error(LogCategory.THUNK,
+                                    `drainWriteBuffer: exact pair-run consumer for funcId ${funcId} threw; `
+                                    + `declining to the ordinary path: ${e}`);
+                            }
+                        }
+                        if (fusedExact) {
+                            offset = runEnd;
+                            segment += runPairs;
+                            this.wbufBarrierEntriesTotal += runPairs;
+                            this.wbufHitsTotal += runPairs * 2;
+                            this.wbufPairRunsTotal++;
+                            this.wbufPairsTotal += runPairs;
+                            consumed = true;
+                            break;
+                        }
+                        this.wbufPairFallbacksTotal++;
+                    }
+                    if (consumed) continue;
+                }
+                const handler = this.writeBufHandlerTable[funcId];
+                const argCount = this.writeBufArgCountTable[funcId];
+                if (handler && argCount > 0) {
+                    const stride = this.getWbufEntryStride(rMem32, rBase, offset, argCount);
+                    if (stride <= 0) {
+                        const vec4Count = rMem32[(rBase + offset + 12) >> 2] >>> 0;
+                        Logger.warn(LogCategory.THUNK,
+                            `drainWriteBuffer: bad shader-constant vec4Count ${vec4Count} at offset ${offset}`);
+                        offset = head;
+                        break;
+                    }
+                    // Verbose: dump each ring entry during first drains
+                    if (verbose) {
+                        const name = this.namesTable[funcId] || `id_${funcId}`;
+                        const args: string[] = [];
+                        const dumpCount = argCount === WBUF_ARG_SHADER_CONSTANT
+                            ? 3 + (rMem32[(rBase + offset + 12) >> 2] >>> 0) * 4
+                            : argCount === WBUF_ARG_UP_DRAW ? 5
+                            : Math.min(argCount, 12);
+                        for (let a = 0; a < dumpCount; a++) {
+                            args.push(`0x${(rMem32[(rBase + offset + 4 + a * 4) >> 2] >>> 0).toString(16)}`);
+                        }
+                        Logger.log(LogCategory.THUNK,
+                            `[WBUF]   @${offset}: ${name}(${args.join(', ')})`);
+                    }
+                    if (this.writeBufBarrierTable[funcId]) {
+                        segment++;
+                        this.wbufBarrierEntriesTotal++;
+                    }
+                    if (this.wbufTransportSafe[funcId] !== 1) this.drainUnsafeSeen++;
+                    const coalesceMask = coalescing ? this.writeBufCoalesceMaskTable[funcId] : 0;
+                    if (coalesceMask && this.wbufCoalesceLatest(rMem32, rBase + offset + 4, funcId, coalesceMask, segment) !== offset) {
+                        this.wbufCoalescedSkipsTotal++;
+                    } else if (transport && this.wbufTransportSafe[funcId] === 0) {
+                        handler(guestMem8, mem32, this.writeBufDataBase + offset + 4);
+                    } else {
+                        handler(rMem8, rMem32, rBase + offset + 4);
+                    }
+                    offset += stride;
+                    this.wbufHitsTotal++;
+                } else {
+                    // No registered handler or zero argCount — ring is corrupt, bail
+                    Logger.warn(LogCategory.THUNK, `drainWriteBuffer: unregistered funcId ${funcId} (argCount=${argCount}) in ring at offset ${offset}`);
+                    offset = head; // skip corrupt tail; reset below clears the ring
+                    break;
+                }
+            } else {
+                // Corrupted/unknown funcId — reset and abort to avoid infinite loop
+                Logger.warn(LogCategory.THUNK, `drainWriteBuffer: unexpected funcId 0x${funcId.toString(16)} at offset ${offset}`);
+                offset = head;
+                break;
+            }
+        }
+        return offset;
     }
 
     private drainWriteBuffer(): void {
@@ -1321,208 +1955,46 @@ export class ThunkDispatcher {
             }
         }
 
-        const mem8 = this.cachedMem8!;
-        const dataBase = this.writeBufDataBase;
+        const guestMem8 = this.cachedMem8!;
+        let rMem8: Uint8Array = guestMem8;
+        let rMem32: Uint32Array = mem32;
+        let rBase = this.writeBufDataBase;
         let offset = this.wbufTail;
-        let segment = 0; // barrier (draw) count — must mirror buildWbufCoalesceIndex's walk
-        if (this.wbufCallCounts) this.censusWriteBufRange(mem32, dataBase, offset, head);
-        // Counts say WHAT the ring carries; only the order says what shape a run detector
-        // would have to match, which is why this is a separate, separately-armed tier.
-        if (this.wbufSequenceWant > 0) this.recordWriteBufSequence(mem32, dataBase, offset, head);
-        const coalescing = this.wbufCoalescingEnabled && this.buildWbufCoalesceIndex(mem32, dataBase, offset, head);
-        while (offset < head) {
-            const funcId: number = mem32[(dataBase + offset) >> 2] >>> 0;
-            if (funcId > 0 && funcId < MAX_THUNK_ID) {
-                // Exact pair fusion is attempted before either ordinary handler mutates state.
-                // A decline is therefore a strict rollback point: resume at the same offset.
-                const pairBindings: WriteBufPairRunBinding[] | null = this.writeBufPairRunByFirst[funcId];
-                if (pairBindings && !coalescing) {
-                    let consumed = false;
-                    for (const binding of pairBindings as WriteBufPairRunBinding[]) {
-                        const run = this.findWriteBufferPairRunEnd(mem32, dataBase, offset, head, funcId, binding.secondIds);
-                        // Default-on prefix extension (false is the benchmark/debug kill switch):
-                        // first-constant, a short run of ordinary non-barrier
-                        // setters, first-draw, then the established alternating pair run. Apply
-                        // constant/setters in original order, then let the consumer prepend the
-                        // first draw as instance zero. On a decline only that first draw is
-                        // replayed here; the following exact run remains at tailStart and is
-                        // offered normally on the next loop iteration.
-                        if (run.pairs < 2 && run.pairs === 0
-                            && (globalThis as { __d3d9PrefixMegaRun?: boolean })
-                                .__d3d9PrefixMegaRun !== false) {
-                            const firstStride = this.getWbufEntryStride(
-                                mem32, dataBase, offset, this.writeBufArgCountTable[funcId],
-                            );
-                            let cursor = offset + firstStride;
-                            const middle: Array<{ offset: number; id: number }> = [];
-                            let prefixDrawOffset = -1;
-                            for (let n = 0; firstStride > 0 && cursor < head && n < 4; n++) {
-                                const id = mem32[(dataBase + cursor) >> 2] >>> 0;
-                                if (binding.secondIds.has(id) && this.writeBufHandlerTable[id]) {
-                                    prefixDrawOffset = cursor;
-                                    break;
-                                }
-                                if (!(id > 0 && id < MAX_THUNK_ID) || id === funcId
-                                    || this.writeBufBarrierTable[id] || !this.writeBufHandlerTable[id]
-                                    || this.writeBufArgCountTable[id] <= 0) break;
-                                const stride = this.getWbufEntryStride(
-                                    mem32, dataBase, cursor, this.writeBufArgCountTable[id],
-                                );
-                                if (stride <= 0 || cursor + stride > head) break;
-                                middle.push({ offset: cursor, id });
-                                cursor += stride;
-                            }
-                            if (prefixDrawOffset >= 0 && middle.length > 0) {
-                                const prefixDrawId = mem32[(dataBase + prefixDrawOffset) >> 2] >>> 0;
-                                const drawStride = this.getWbufEntryStride(
-                                    mem32, dataBase, prefixDrawOffset,
-                                    this.writeBufArgCountTable[prefixDrawId],
-                                );
-                                const tailStart = prefixDrawOffset + drawStride;
-                                if (drawStride > 0 && tailStart < head
-                                    && (mem32[(dataBase + tailStart) >> 2] >>> 0) === funcId) {
-                                    const tailRun = this.findWriteBufferPairRunEnd(
-                                        mem32, dataBase, tailStart, head, funcId, binding.secondIds,
-                                    );
-                                    if (tailRun.pairs >= 2) {
-                                        this.writeBufHandlerTable[funcId]!(
-                                            mem8, mem32, dataBase + offset + 4,
-                                        );
-                                        this.wbufHitsTotal++;
-                                        for (const item of middle) {
-                                            this.writeBufHandlerTable[item.id]!(
-                                                mem8, mem32, dataBase + item.offset + 4,
-                                            );
-                                            this.wbufHitsTotal++;
-                                        }
-                                        // The first constant and the middle setters are already
-                                        // applied. Letting a throw unwind the drain would leave
-                                        // wbufTail at the run start and apply them a second time,
-                                        // so a throwing consumer takes the decline path instead.
-                                        let fused: boolean;
-                                        try {
-                                            fused = binding.handler(
-                                                mem8, mem32,
-                                                dataBase + tailStart, dataBase + tailRun.end,
-                                                tailRun.pairs,
-                                                dataBase + offset, dataBase + prefixDrawOffset,
-                                            );
-                                        } catch (e) {
-                                            fused = false;
-                                            if (this.wbufFusedConsumerThrows++ === 0) {
-                                                Logger.error(LogCategory.THUNK,
-                                                    `drainWriteBuffer: fused pair-run consumer for funcId `
-                                                    + `${funcId} threw; declining to the ordinary path: ${e}`);
-                                            }
-                                        }
-                                        if (fused) {
-                                            offset = tailRun.end;
-                                            segment += tailRun.pairs + 1;
-                                            this.wbufBarrierEntriesTotal += tailRun.pairs + 1;
-                                            this.wbufHitsTotal += tailRun.pairs * 2 + 1;
-                                            this.wbufPairRunsTotal++;
-                                            this.wbufPairsTotal += tailRun.pairs;
-                                        } else {
-                                            this.writeBufHandlerTable[prefixDrawId]!(
-                                                mem8, mem32, dataBase + prefixDrawOffset + 4,
-                                            );
-                                            offset = tailStart;
-                                            segment++;
-                                            this.wbufBarrierEntriesTotal++;
-                                            this.wbufHitsTotal++;
-                                            this.wbufPairFallbacksTotal++;
-                                        }
-                                        consumed = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (consumed) break;
-                        // One pair rarely amortises the cross-language setup; leave it on the
-                        // established path. Runs of two or more are the useful workload shape.
-                        if (run.pairs < 2) continue;
-                        // A throwing consumer is a DECLINE, exactly as on the prefix branch
-                        // above. Nothing has been applied here yet, so falling through to the
-                        // ordinary handlers is the correct completion; letting the exception
-                        // escape instead unwinds out of the drain entirely, leaving wbufTail at
-                        // the run start with the ring un-drained — the whole batch is then
-                        // either replayed or lost, and nothing downstream notices.
-                        let fusedExact: boolean;
-                        try {
-                            fusedExact = binding.handler(
-                                mem8, mem32, dataBase + offset, dataBase + run.end, run.pairs);
-                        } catch (e) {
-                            fusedExact = false;
-                            if (this.wbufFusedConsumerThrows++ === 0) {
-                                Logger.error(LogCategory.THUNK,
-                                    `drainWriteBuffer: exact pair-run consumer for funcId ${funcId} threw; `
-                                    + `declining to the ordinary path: ${e}`);
-                            }
-                        }
-                        if (fusedExact) {
-                            offset = run.end;
-                            segment += run.pairs;
-                            this.wbufBarrierEntriesTotal += run.pairs;
-                            this.wbufHitsTotal += run.pairs * 2;
-                            this.wbufPairRunsTotal++;
-                            this.wbufPairsTotal += run.pairs;
-                            consumed = true;
-                            break;
-                        }
-                        this.wbufPairFallbacksTotal++;
-                    }
-                    if (consumed) continue;
-                }
-                const handler = this.writeBufHandlerTable[funcId];
-                const argCount = this.writeBufArgCountTable[funcId];
-                if (handler && argCount > 0) {
-                    const stride = this.getWbufEntryStride(mem32, dataBase, offset, argCount);
-                    if (stride <= 0) {
-                        const vec4Count = mem32[(dataBase + offset + 12) >> 2] >>> 0;
-                        Logger.warn(LogCategory.THUNK,
-                            `drainWriteBuffer: bad shader-constant vec4Count ${vec4Count} at offset ${offset}`);
-                        offset = head;
-                        break;
-                    }
-                    // Verbose: dump each ring entry during first drains
-                    if (verbose) {
-                        const name = this.namesTable[funcId] || `id_${funcId}`;
-                        const args: string[] = [];
-                        const dumpCount = argCount === WBUF_ARG_SHADER_CONSTANT
-                            ? 3 + (mem32[(dataBase + offset + 12) >> 2] >>> 0) * 4
-                            : argCount === WBUF_ARG_UP_DRAW ? 5
-                            : Math.min(argCount, 12);
-                        for (let a = 0; a < dumpCount; a++) {
-                            args.push(`0x${(mem32[(dataBase + offset + 4 + a * 4) >> 2] >>> 0).toString(16)}`);
-                        }
-                        Logger.log(LogCategory.THUNK,
-                            `[WBUF]   @${offset}: ${name}(${args.join(', ')})`);
-                    }
-                    if (this.writeBufBarrierTable[funcId]) {
-                        segment++;
-                        this.wbufBarrierEntriesTotal++;
-                    }
-                    const coalesceMask = coalescing ? this.writeBufCoalesceMaskTable[funcId] : 0;
-                    if (coalesceMask && this.wbufCoalesceLatest(mem32, dataBase + offset + 4, funcId, coalesceMask, segment) !== offset) {
-                        this.wbufCoalescedSkipsTotal++;
-                    } else {
-                        handler(mem8, mem32, dataBase + offset + 4);
-                    }
-                    offset += stride;
-                    this.wbufHitsTotal++;
-                } else {
-                    // No registered handler or zero argCount — ring is corrupt, bail
-                    Logger.warn(LogCategory.THUNK, `drainWriteBuffer: unregistered funcId ${funcId} (argCount=${argCount}) in ring at offset ${offset}`);
-                    offset = head; // skip corrupt tail; reset below clears the ring
-                    break;
-                }
-            } else {
-                // Corrupted/unknown funcId — reset and abort to avoid infinite loop
-                Logger.warn(LogCategory.THUNK, `drainWriteBuffer: unexpected funcId 0x${funcId.toString(16)} at offset ${offset}`);
-                offset = head;
-                break;
+        // Transport mode (P1 of the threaded D3D9 split): the pending entries are COPIED out
+        // of the guest ring and the drain parses the copy, exactly as a consumer on another
+        // worker would have to. Only modules marked transport-safe get the copy; any other
+        // entry is still handed the guest ring, which the copy leaves intact until the reset.
+        const split = this.wbufSplitting() ? this.wbufSplitClient : null;
+        if (split) {
+            const start = offset;
+            this.drainUnsafeSeen = 0;
+            split.drainBegin();
+            try {
+                offset = this.applyWriteBufEntries(rMem8, rMem32, rBase, offset, head, false, guestMem8, mem32, verbose);
+            } finally {
+                split.drainEnd();
             }
+            // Only transport-safe entries seen (the usual case): the range is the twin's as is.
+            if (this.drainUnsafeSeen === 0) this.appendRingBytes(rBase, start, offset);
+            else this.queueSplitRingRange(mem32, rBase, start, offset);
+            this.wbufTail = offset;
+            this.tryResetWbufHead(mem32, headWordIdx, mem32[headWordIdx]);
+            return;
+        }
+        const transport = this.wbufTransportArmed();
+        let borrowsBefore = 0;
+        if (transport) {
+            this.copyRingToTransport(guestMem8, rBase, offset, head);
+            rMem8 = this.wbufTransportU8!;
+            rMem32 = this.wbufTransportU32!;
+            rBase = 0;
+            borrowsBefore = guestMemoryBorrowCount();
+            if (this.wbufTransportSites) setGuestMemoryBorrowProbe(this.wbufTransportSiteProbe);
+        }
+        offset = this.applyWriteBufEntries(rMem8, rMem32, rBase, offset, head, transport, guestMem8, mem32, verbose);
+        if (transport) {
+            this.wbufTransportStats.guestBorrows += guestMemoryBorrowCount() - borrowsBefore;
+            if (this.wbufTransportSites) setGuestMemoryBorrowProbe(null);
         }
         this.wbufTail = offset;
         this.tryResetWbufHead(mem32, headWordIdx, mem32[headWordIdx]);
@@ -1618,15 +2090,28 @@ export class ThunkDispatcher {
         }
     }
 
+    /** Traps that arrived while paused (completed, then the slice was ended). */
+    public pausedTraps = 0;
+
+    private endSliceForPause(functionId: number): void {
+        if (this.pausedTraps++ < 8) {
+            Logger.warn(LogCategory.THUNK,
+                `Thunk ${this.namesTable[functionId] || `0x${functionId.toString(16)}`} arrived during PAUSE — completing it and ending the slice`);
+        }
+        // The inner engine: the starter's stop() leaves a bus listener behind per call.
+        const engine = this.v86?.v86 ?? this.v86;
+        try { engine?.stop?.(); } catch { }
+        preemptionManager.endSliceUntilNextTick();
+    }
+
     // =========================================================================
     // HOT PATH - Main Dispatcher
     // =========================================================================
     private handlePortWrite(functionId: number): void {
-        // Early bail if paused � v86.stop() is async so CPU may still fire thunks briefly
-        if (System.getInstance().isPaused) {
-            try { this.v86.stop(); } catch { }
-            return;
-        }
+        // The OUT has already retired, so a trap that outruns a pause (stop() is honoured
+        // at the next tick; a pause taken inside a trap leaves the slice running) must
+        // still complete — dropping it hands the guest its own function id as the result.
+        if (System.getInstance().isPaused) this.endSliceForPause(functionId);
 
         // ── Hypercall ring (crash-hunt): record EVERY hypercall (fast + slow). Zero-alloc.
         // Gated: only records when armed (headWatch verb) — off by default to keep the hot path free.
@@ -1658,12 +2143,18 @@ export class ThunkDispatcher {
         // The ring is drained here so that all pending state changes are applied before
         // the flush trigger (DrawPrimitive, glEnd, wglSwapBuffers) executes.
         // Cost when ring is empty: ~2 ns (one branch + one u32 read).
-        this.drainWriteBuffer();
+        if (this.wbufDeferring()) this.deferredTrapBoundary(functionId);
+        else if (this.wbufSplitting()) this.drainWriteBuffer();
+        else {
+            // Switching deferral off must not strand what it had queued.
+            if (this.wbufQueueEnd !== 0) this.executeWbufQueue();
+            this.drainWriteBuffer();
+        }
 
         // WBUF miss diagnostic: if a WBUF-registered function hits OUT trap,
         // read back stub bytes to determine why the JMP patch isn't executing.
         if (functionId > 0 && functionId < MAX_THUNK_ID &&
-            this.writeBufHandlerTable[functionId]) {
+            this.writeBufHandlerTable[functionId] && this.wbufQueueOnly[functionId] === 0) {
             this.wbufOutTrapHitsTotal++;
             if (this.wbufMissLogCount < 5) {
                 this.wbufMissLogCount++;
@@ -1796,6 +2287,7 @@ export class ThunkDispatcher {
 
                 // Fast path returned null > fall through to slow path
                 // (scheduler enter already called above)
+                if (this.crossingLedger) this.crossingLedger.fastFallthrough[functionId]!++;
                 this._handlePortWriteSlow(functionId, true);
                 return;
             }
@@ -1845,12 +2337,7 @@ export class ThunkDispatcher {
     private _handlePortWriteSlow(functionId: number, schedulerEnterAlreadyCalled: boolean): void {
         const system = System.getInstance();
 
-        // 0. Pause & Exit checks
-        if (system.isPaused) {
-            Logger.warn(LogCategory.THUNK, `Thunk call 0x${functionId.toString(16)} during PAUSE! Stopping CPU.`);
-            try { this.v86.stop(); } catch { }
-            return;
-        }
+        // 0. Exit check (a pause is handled in handlePortWrite: the call completes)
         if (system.isExiting) {
             Logger.verbose(LogCategory.THUNK, `Ignoring thunk call during exit: 0x${functionId.toString(16)}`);
             try { this.v86.stop(); } catch { }
@@ -1910,6 +2397,7 @@ export class ThunkDispatcher {
         // --- PHASE 2b: SEH Dispatch Result (0x7FFF0002) ---
         // Fired by the SEH dispatch stub after calling all handlers natively.
         if (functionId === 0x7FFF0002) {
+            if (this.crossingLedger) this.crossingLedger.sehResults++;
             this._handleSehDispatchResult(cpu);
             return;
         }
@@ -1927,6 +2415,7 @@ export class ThunkDispatcher {
 
         // --- PHASE 3: Callback Returns (0x80xxxxxx) ---
         if ((functionId & 0x80000000) !== 0) {
+            if (this.crossingLedger) this.crossingLedger.callbackReturns++;
             if (this._callbackManager) {
                 const reg32 = this.cachedReg32Raw ?? cpu.reg32;
                 const ipRaw = this.cachedIpRaw;
@@ -2038,6 +2527,7 @@ export class ThunkDispatcher {
         if (this.profileSlowPathEnabled) {
             this.slowPathHitCounts.set(thunkName, (this.slowPathHitCounts.get(thunkName) ?? 0) + 1);
         }
+        if (this.crossingLedger) this.crossingLedger.slow[functionId]!++;
 
         // One-time warning per functionId: if WASM handler is registered but JS is handling it
         if (hypercallDataManager.isEnabled() && !this.wasmMissWarned.has(functionId)) {
@@ -2207,6 +2697,7 @@ export class ThunkDispatcher {
 
         const isAsync = result instanceof Promise;
         if (isAsync) {
+            if (this.crossingLedger) this.crossingLedger.async[functionId]!++;
             this._handleAsyncResult(result, functionId, thunkName, cpu, espAtEntry, argCount, thunkStart);
         } else {
             const dur = frameProfiler.endTimer("thunk", thunkStart);
@@ -3871,6 +4362,8 @@ export class ThunkDispatcher {
             // Register the drain handler
             const id = stub.functionId;
             this.writeBufHandlerTable[id]  = handler;
+
+            this.noteWriteBufTransportSafety(id, dllName);
             this.writeBufArgCountTable[id] = argCount;
             this.writeBufCoalesceMaskTable[id] = coalesceArgMask & 0x7;
             this.writeBufBarrierTable[id] = opts?.barrier ? 1 : 0;
@@ -4030,6 +4523,7 @@ export class ThunkDispatcher {
         this.registerWriteBufferFunction(dllName, funcName, argCount, handler, true, coalesceArgMask,
             { trampolineOverride: h.trampAddr, shadowSpec: spec });
 
+        this.shadowHandleCache.clear();
         this.shadowHandles.set(key, {
             trampAddr: h.trampAddr, shadowBase: h.shadowBase, slotCount: h.slotCount,
             sentinel: h.sentinel, skipCounterAddr: h.skipCounterAddr,
@@ -4086,11 +4580,22 @@ export class ThunkDispatcher {
         this.memDataView()?.setUint32(this.shadowOwnerGlobal, ownerPtr >>> 0, true);
     }
 
+    private shadowHandle(dllName: string, funcName: string): ShadowHandle | null {
+        let byFunc = this.shadowHandleCache.get(dllName);
+        if (!byFunc) { byFunc = new Map(); this.shadowHandleCache.set(dllName, byFunc); }
+        let h = byFunc.get(funcName);
+        if (h === undefined) {
+            h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase()) ?? null;
+            byFunc.set(funcName, h);
+        }
+        return h;
+    }
+
     /** Re-sentinel a shadow table (every slot → "never set"), forcing the next set of each slot to
      *  pass through. MUST be called wherever the module's JS state-of-record is (re)created/reset,
      *  else a stale "equal" would wrongly skip a needed set. */
     resetShadow(dllName: string, funcName: string): void {
-        const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
+        const h = this.shadowHandle(dllName, funcName);
         const dv = h ? this.memDataView() : null;
         if (!h || !dv) return;
         for (let i = 0; i < h.slotCount; i++) dv.setUint32(h.shadowBase + i * 4, h.sentinel, true);
@@ -4103,7 +4608,7 @@ export class ThunkDispatcher {
      *  directly). Without it the guest shadow drifts behind the tracker and wrong-skips a later set
      *  that matches the stale shadow (the NFSU state-block translucency/untexture bug). */
     writeShadowSlot(dllName: string, funcName: string, slot: number, value: number): void {
-        const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
+        const h = this.shadowHandle(dllName, funcName);
         if (!h || slot < 0 || slot >= h.slotCount) return;
         if (PROXY_BASELINE.on && this.getMemory) {
             // A/B arm: rebuild the view from the Proxy, as this did per SetRenderState.
@@ -4117,7 +4622,7 @@ export class ThunkDispatcher {
     /** Raw guest-RAM shadow slot values for a shadowed setter (diagnostic: diff vs the JS
      *  state-of-record to find wrong-skip desyncs). Returns null if unknown/not ready. */
     dumpShadowValues(dllName: string, funcName: string): number[] | null {
-        const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
+        const h = this.shadowHandle(dllName, funcName);
         const dv = h ? this.memDataView() : null;
         if (!h || !dv) return null;
         const out: number[] = new Array(h.slotCount);
@@ -4147,7 +4652,7 @@ export class ThunkDispatcher {
      *  the setter is registered plain (no shadow) or not yet registered. */
     getShadowTrampolineInfo(dllName: string, funcName: string):
         { shadowBase: number; slotCount: number; skipCounterAddr: number } | null {
-        const h = this.shadowHandles.get(`${dllName}:${funcName}`.toLowerCase());
+        const h = this.shadowHandle(dllName, funcName);
         if (!h) return null;
         return { shadowBase: h.shadowBase, slotCount: h.slotCount, skipCounterAddr: h.skipCounterAddr };
     }
@@ -4266,6 +4771,8 @@ export class ThunkDispatcher {
             // Register drain handler — floatCount is the argCount for stride calculation
             const id = stub.functionId;
             this.writeBufHandlerTable[id]  = handler;
+
+            this.noteWriteBufTransportSafety(id, dllName);
             this.writeBufArgCountTable[id] = floatCount;
             this.writeBufCoalesceMaskTable[id] = 0;
             this.writeBufBarrierTable[id] = 0;
@@ -4340,6 +4847,8 @@ export class ThunkDispatcher {
 
         const id = stub.functionId;
         this.writeBufHandlerTable[id]  = handler;
+
+        this.noteWriteBufTransportSafety(id, dllName);
         this.writeBufArgCountTable[id] = WBUF_ARG_SHADER_CONSTANT;
         this.writeBufCoalesceMaskTable[id] = 0;
         this.writeBufBarrierTable[id] = 0;
@@ -4404,6 +4913,8 @@ export class ThunkDispatcher {
             return;
         }
         this.writeBufHandlerTable[id] = handler;
+
+        this.noteWriteBufTransportSafety(id, dllName);
         // Standard stride formula (n+1)*4 with n = scalars + payload dwords.
         this.writeBufArgCountTable[id] = argCount + payloadDwords;
         this.writeBufCoalesceMaskTable[id] = 0;
@@ -4454,6 +4965,8 @@ export class ThunkDispatcher {
             return;
         }
         this.writeBufHandlerTable[id] = handler;
+
+        this.noteWriteBufTransportSafety(id, dllName);
         this.writeBufArgCountTable[id] = argCount + ptrArgIndices.length * payloadDwords;
         this.writeBufCoalesceMaskTable[id] = 0;
         this.writeBufBarrierTable[id] = 1;
@@ -4485,6 +4998,8 @@ export class ThunkDispatcher {
             return;
         }
         this.writeBufHandlerTable[id] = handler;
+
+        this.noteWriteBufTransportSafety(id, dllName);
         this.writeBufArgCountTable[id] = WBUF_ARG_UP_DRAW;
         this.writeBufCoalesceMaskTable[id] = 0;
         this.writeBufBarrierTable[id] = 1;
@@ -4763,6 +5278,18 @@ export class ThunkDispatcher {
 
     resetWriteBufCensus(): void {
         this.wbufCallCounts?.fill(0);
+    }
+
+    setCrossingLedgerEnabled(on: boolean): void {
+        if (!on) { this.crossingLedger = null; return; }
+        this.crossingLedger ??= {
+            slow: new Uint32Array(MAX_THUNK_ID), async: new Uint32Array(MAX_THUNK_ID),
+            fastFallthrough: new Uint32Array(MAX_THUNK_ID), callbackReturns: 0, sehResults: 0,
+        };
+    }
+
+    getCrossingLedger(): typeof this.crossingLedger {
+        return this.crossingLedger;
     }
 
     /**
@@ -8235,6 +8762,14 @@ export class ThunkDispatcher {
         this.writeBufCoalesceMaskTable.fill(0);
         this.writeBufPairRunByFirst.fill(null);
         this.wbufCoalescingEnabled = false;
+        // Queued entries and id caches name the OLD stubs' function ids.
+        this.wbufQueueEnd = 0;
+        this.deferredIdByName.clear();
+        this.trapFencePolicy.fill(0);
+        this.wbufQueueOnly.fill(0);
+        this.wbufTransportSafe.fill(0);
+        this.wbufHandlerGeneration++;
+        for (const [id, handler] of this.queuePayloadHandlers) this.bindQueuePayloadHandler(id, handler);
         // Emitted-code handles name addresses in the OLD thunk arena. The pending
         // registrations survive (above) and re-emit against the new one; keeping the handles
         // would point a stub JMP at whatever the new layout put there.

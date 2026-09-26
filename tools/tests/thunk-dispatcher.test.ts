@@ -9,6 +9,7 @@ import { describe, it, expect } from 'bun:test';
 import { ThunkDispatcher } from '../../src/worker/core/thunking/thunk-dispatcher';
 import { Logger } from '../../src/worker/core/logger';
 import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
+import { System } from '../../src/worker/core/system';
 
 const SPIN_ADDR = 0xdead0000;
 
@@ -720,6 +721,42 @@ describe('ThunkDispatcher — fast-path calling convention', () => {
         }
         // The answer lands in EAX.
         expect(d.cachedReg32Raw[0] >>> 0).toBe(0x1234);
+    });
+});
+
+describe('ThunkDispatcher — a trap that outruns a pause completes', () => {
+    // v86 honours stop() at the next tick, so the guest can still reach an OUT after a pause.
+    // The OUT has retired: dropping the trap leaves the function id in EAX as the "result"
+    // (CreateThread answered with its own id and created nothing).
+    it('dispatches the call, answers in EAX and stops the inner engine', () => {
+        const d = mkDispatcher();
+        bindMemory(d);
+        d.cachedReg32Raw[4] = 0x2000;
+        d.cachedCpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw };
+        d.cachedScheduler = { onThunkEnter: () => {}, onThunkBoundary: () => {} };
+        let stops = 0;
+        d.v86 = { v86: { stop: () => { stops++; } }, stop: () => { throw new Error('starter stop() used'); } };
+
+        const FID = 79;
+        d.namesTable[FID] = 'test:DuringPause';
+        d.fastPathTable[FID] = () => 0x30010;
+        d.cachedReg32Raw[0] = FID;
+
+        const sys = System.getInstance();
+        const wasPaused = sys.isPaused;
+        const warn = (Logger as any).warn;
+        (Logger as any).warn = () => {};
+        sys.isPaused = true;
+        try {
+            d.handlePortWrite(FID);
+        } finally {
+            sys.isPaused = wasPaused;
+            (Logger as any).warn = warn;
+        }
+
+        expect(d.cachedReg32Raw[0] >>> 0).toBe(0x30010);
+        expect(stops).toBe(1);
+        expect(d.pausedTraps).toBe(1);
     });
 });
 

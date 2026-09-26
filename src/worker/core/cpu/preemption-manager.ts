@@ -82,6 +82,14 @@ export class PreemptionManager {
      *  code compete in the same unit. */
     private tier2Threshold = 0;                 // config idx 15 (experimental, opt-in)
 
+    /** Code-shaping switches outside the set_jit_config slots (exports set_<name>/get_<name>),
+     *  applied at every init like the slots above. tools/jit-config/shipping.mjs
+     *  SHIPPING_CODEGEN_SWITCHES must agree (validate-jit-shipping-config).
+     *  Page tails: compile instructions in the last 15 bytes of a page (NFSU in-race +3..+5 %).
+     *  Hot-edge regions: measured −3..−4 % in-race, kept OFF. */
+    private pageTailsEnabled = true;            // switch jit_page_tails
+    private hotEdgeRegionsEnabled = false;      // switch jit_hot_edge_regions
+
     /** Walks every PARKED thread's saved x87 snapshot. Registered by the Scheduler
      *  (which owns the thread table and already depends on this module), same provider
      *  seam as stack-write-guard's setParkedStackProvider. */
@@ -128,6 +136,18 @@ export class PreemptionManager {
 
     /** Current desired relaxed-FPU state (the single authority). */
     isRelaxedFpuEnabled(): boolean { return this.relaxedFpuEnabled; }
+
+    /** An engine without the switch predates the feature, which is the same as OFF. */
+    private applyCodegenSwitch(ex: any, name: string, value: number): void {
+        const set = ex?.[`set_${name}`], get = ex?.[`get_${name}`];
+        if (typeof set !== "function" || typeof get !== "function") {
+            if (value !== 0) console.warn(`[PERF] engine lacks set_${name} — ${name} stays off`);
+            return;
+        }
+        set(value >>> 0);
+        const got = get() >>> 0;
+        if (got !== (value >>> 0)) throw new Error(`set_${name}(${value}) read back ${got}`);
+    }
 
     private applyJitConfig(ex: any, index: number, value: number): boolean {
         if (typeof ex?.set_jit_config !== "function") return false;
@@ -291,6 +311,11 @@ export class PreemptionManager {
             // authority (wasm statics reset per game load).
             this.applyJitConfig(this.wasmExports, 15, this.tier2Threshold);
             console.log(`[PERF] B3 tiering: retiredThreshold=${this.tier2Threshold || "OFF"}`);
+
+            // Code-shaping switches — applied here, before the guest runs, so before any compile.
+            this.applyCodegenSwitch(this.wasmExports, "jit_page_tails", this.pageTailsEnabled ? 1 : 0);
+            this.applyCodegenSwitch(this.wasmExports, "jit_hot_edge_regions", this.hotEdgeRegionsEnabled ? 1 : 0);
+            console.log(`[PERF] codegen switches: pageTails=${this.pageTailsEnabled ? "on" : "off"} hotEdgeRegions=${this.hotEdgeRegionsEnabled ? "on" : "off"}`);
         }
 
         // EAGL read-cursor lifetime (cpu/hypercall_eagl.rs). The wasm default is the
@@ -368,18 +393,57 @@ export class PreemptionManager {
     }
 
     /**
-     * Force v86 to exit its current cycle loop as soon as possible.
-     * Writes 0 to the hypercall page cycle-limit slot so the next read
-     * in WASM's do_many_cycles_native breaks the inner loop immediately.
+     * Force v86 out of its cycle loop as soon as possible. Writes 0 to the live
+     * cycle-limit slot: every chain check refuses, and the next
+     * do_many_cycles_native pass runs nothing. The pass in progress keeps the
+     * budget it read at entry and stops at the park address.
      *
      * Callers use this after transitioning the current thread to WAITING
      * (e.g. async thunk parking) to avoid burning the full quantum in the
      * spin loop. prepareForExecution() restores the normal limit on the
-     * next tick.
+     * next tick; a switch-in restores it sooner (resumeSliceForIncomingThread).
      */
     requestImmediateExit(): void {
         if (!this.initialized) return;
         this.setCycleLimit(0);
+        this.urgentExitPending = true;
+    }
+
+    /** requestImmediateExit() that a thread switch must NOT undo: the engine is being
+     *  stopped (a harness pause), so whoever is switched in must not run either. Held
+     *  until the next prepareForExecution. */
+    endSliceUntilNextTick(): void {
+        if (!this.initialized) return;
+        this.requestImmediateExit();
+        this.sliceEndHeld = true;
+    }
+
+    /** What prepareForExecution (and the pre-slice caps) granted this slice — the value
+     *  `do_many_cycles_native` read ONCE at entry and keeps as its loop bound. */
+    private sliceGrant = 0;
+    /** The live limit is 0 because of a requestImmediateExit this slice. */
+    private urgentExitPending = false;
+    private sliceEndHeld = false;
+    /** Mid-slice urgent exits voided by a switch-in (resumeSliceForIncomingThread). */
+    sliceResumes = 0;
+
+    /**
+     * An urgent exit is requested on behalf of the thread LEAVING the CPU. If the scheduler
+     * loads another context in the same JS turn, the slice goes on for that thread: v86's
+     * cycle loop keeps the budget it read at entry and only the chain checks re-read the
+     * live slot, so a 0 there refuses every chain for the rest of the slice and empties each
+     * later pass of the same main_loop. Restore the grant itself — a smaller live value
+     * would only refuse chains again; the quantum is enforced at the tick boundary.
+     * Callers must not resume onto the park address (a chain into `JMP $` skips the
+     * loop's park-exit).
+     */
+    resumeSliceForIncomingThread(): boolean {
+        if (!this.initialized || !this.urgentExitPending || this.sliceEndHeld || this.sliceGrant === 0) return false;
+        if ((globalThis as { __noSliceResume?: boolean }).__noSliceResume) return false;
+        this.setCycleLimit(this.sliceGrant);
+        this.urgentExitPending = false;
+        this.sliceResumes++;
+        return true;
     }
 
     /**
@@ -395,7 +459,8 @@ export class PreemptionManager {
     requestBoundedSlice(insns: number): void {
         if (!this.initialized) return;
         if (this.getCycleLimit() === 0) return;
-        this.setCycleLimit(Math.max(1, insns | 0));
+        this.sliceGrant = Math.max(1, insns | 0);
+        this.setCycleLimit(this.sliceGrant);
     }
 
     /** Shorten the NEXT slice to at most `insns` so the tick boundary that polls timers
@@ -405,7 +470,8 @@ export class PreemptionManager {
         if (!this.initialized || insns <= 0) return;
         const current = this.getCycleLimit();
         if (current <= 0 || insns >= current) return;
-        this.setCycleLimit(insns >>> 0);
+        this.sliceGrant = insns >>> 0;
+        this.setCycleLimit(this.sliceGrant);
     }
 
     /** Read back the live cycle-limit slot (diagnostic). -1 if unavailable. A RUNNING
@@ -429,7 +495,9 @@ export class PreemptionManager {
      *  RUNNING thread is found with a 0 budget (missed restore). */
     rearmCycleBudget(): void {
         if (!this.initialized) return;
-        this.setCycleLimit(PreemptionManager.SINGLE_THREAD_LIMIT);
+        this.sliceGrant = PreemptionManager.SINGLE_THREAD_LIMIT;
+        this.urgentExitPending = false;
+        this.setCycleLimit(this.sliceGrant);
     }
 
     /**
@@ -449,7 +517,10 @@ export class PreemptionManager {
         // so even at 100K cycles we get ~1ms preemption granularity.
         // MULTI_THREAD_QUANTUM (50K ~0.5ms) can be enabled later for more
         // responsive scheduling once the tick-boundary path is battle-tested.
-        this.setCycleLimit(urgentExit ? 0 : PreemptionManager.SINGLE_THREAD_LIMIT);
+        this.sliceGrant = urgentExit ? 0 : PreemptionManager.SINGLE_THREAD_LIMIT;
+        this.urgentExitPending = false;
+        this.sliceEndHeld = false;
+        this.setCycleLimit(this.sliceGrant);
     }
 
     /** Called after main_loop() returns — check if preemption should fire */
