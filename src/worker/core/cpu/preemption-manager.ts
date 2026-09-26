@@ -86,9 +86,12 @@ export class PreemptionManager {
      *  applied at every init like the slots above. tools/jit-config/shipping.mjs
      *  SHIPPING_CODEGEN_SWITCHES must agree (validate-jit-shipping-config).
      *  Page tails: compile instructions in the last 15 bytes of a page (NFSU in-race +3..+5 %).
-     *  Hot-edge regions: measured −3..−4 % in-race, kept OFF. */
+     *  Hot-edge regions: measured −3..−4 % in-race, kept OFF.
+     *  Guard groups: accesses through one base register share the first one's TLB check
+     *  (NFSU in-race +5.1 %, 16/16 ABBA pairs). */
     private pageTailsEnabled = true;            // switch jit_page_tails
     private hotEdgeRegionsEnabled = false;      // switch jit_hot_edge_regions
+    private guardGroupsEnabled = true;          // switch jit_guard_groups
 
     /** Walks every PARKED thread's saved x87 snapshot. Registered by the Scheduler
      *  (which owns the thread table and already depends on this module), same provider
@@ -315,7 +318,8 @@ export class PreemptionManager {
             // Code-shaping switches — applied here, before the guest runs, so before any compile.
             this.applyCodegenSwitch(this.wasmExports, "jit_page_tails", this.pageTailsEnabled ? 1 : 0);
             this.applyCodegenSwitch(this.wasmExports, "jit_hot_edge_regions", this.hotEdgeRegionsEnabled ? 1 : 0);
-            console.log(`[PERF] codegen switches: pageTails=${this.pageTailsEnabled ? "on" : "off"} hotEdgeRegions=${this.hotEdgeRegionsEnabled ? "on" : "off"}`);
+            this.applyCodegenSwitch(this.wasmExports, "jit_guard_groups", this.guardGroupsEnabled ? 1 : 0);
+            console.log(`[PERF] codegen switches: pageTails=${this.pageTailsEnabled ? "on" : "off"} hotEdgeRegions=${this.hotEdgeRegionsEnabled ? "on" : "off"} guardGroups=${this.guardGroupsEnabled ? "on" : "off"}`);
         }
 
         // EAGL read-cursor lifetime (cpu/hypercall_eagl.rs). The wasm default is the

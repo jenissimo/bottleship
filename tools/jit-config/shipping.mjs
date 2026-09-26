@@ -105,6 +105,7 @@ export const referenceWith = (...changes) => flagsWith(REFERENCE_ALL_OFF, change
 export const SHIPPING_CODEGEN_SWITCHES = Object.freeze(new Map([
     ["jit_page_tails", 1],          // compile instructions in the last 15 bytes of a page
     ["jit_hot_edge_regions", 0],    // hot-edge region formation: measured −3..−4 %, OFF
+    ["jit_guard_groups", 1],        // one widened TLB check per group of same-base accesses
 ]));
 
 /** The all-off reference for the switches. */
