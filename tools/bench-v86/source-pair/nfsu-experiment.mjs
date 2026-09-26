@@ -134,6 +134,8 @@ export async function blockChainAb(ctx){ return leverAb(ctx,'blockchain'); }
 export async function pageTailsAb(ctx){ return leverAb(ctx,'pagetails'); }
 /** Hot-edge region formation OFF (0) vs ON (1): 16 ABBA windows in one boot. */
 export async function hotEdgeAb(ctx){ return leverAb(ctx,'hotedge'); }
+/** Guard groups (set_jit_guard_groups) OFF (0) vs ON (1): 16 ABBA windows in one boot. */
+export async function guardGroupsAb(ctx){ return leverAb(ctx,'guardgroups'); }
 /** jsprof: split batch-buffer recycling off (0) vs on (1). */
 export async function queueRecycleAb(ctx){ return leverAb(ctx,'queuerecycle'); }
 
@@ -769,6 +771,17 @@ async function leverAb({call,save,note,sleep,scene},lever){
     +" w.set_jit_page_tails("+mode+");"
     +" const back=w.get_jit_page_tails()>>>0;"
     +" if(back!=="+mode+") throw new Error('page-tails readback '+back);"
+    +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
+    +" return back;")
+  : lever==='guardgroups'
+  // Guard groups (vendor/v86 set_jit_guard_groups): a codegen input, so the cache goes. The
+  // debug bits are forced to 0 so no counter increments are compiled into either arm.
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.set_jit_guard_groups) throw new Error('engine has no set_jit_guard_groups');"
+    +" w.set_jit_guard_groups_debug(0); w.set_jit_guard_groups("+mode+");"
+    +" const back=w.get_jit_guard_groups()>>>0;"
+    +" if(back!=="+mode+"||(w.get_jit_guard_groups_debug()>>>0)!==0) throw new Error('guard-groups readback '+back);"
     +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
     +" return back;")
   : lever==='hotedge'
