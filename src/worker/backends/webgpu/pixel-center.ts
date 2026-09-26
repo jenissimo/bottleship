@@ -46,11 +46,22 @@ export function pixelCenterClipOffset(
     viewportHeight: number,
     renderScale = 1,
 ): { dx: number; dy: number } {
-    const px = pixelCenterOffsetPx(renderScale);
     return {
-        dx: px > 0 && viewportWidth > 0 ? (2 * px) / viewportWidth : 0,
-        dy: px > 0 && viewportHeight > 0 ? -(2 * px) / viewportHeight : 0,
+        dx: pixelCenterClipDx(viewportWidth, renderScale),
+        dy: pixelCenterClipDy(viewportHeight, renderScale),
     };
+}
+
+/** The two halves of pixelCenterClipOffset as scalars, for per-draw callers that must not
+ *  allocate the pair. */
+export function pixelCenterClipDx(viewportWidth: number, renderScale = 1): number {
+    const px = pixelCenterOffsetPx(renderScale);
+    return px > 0 && viewportWidth > 0 ? (2 * px) / viewportWidth : 0;
+}
+
+export function pixelCenterClipDy(viewportHeight: number, renderScale = 1): number {
+    const px = pixelCenterOffsetPx(renderScale);
+    return px > 0 && viewportHeight > 0 ? -(2 * px) / viewportHeight : 0;
 }
 
 const pixelCentreVersionF32 = new Float32Array(1);
@@ -64,12 +75,14 @@ export function withPixelCenterVersion(
 ): number {
     let h1 = Math.floor((baseVersion ?? 0) / 0x100000000) >>> 0;
     let h2 = (baseVersion ?? 0) >>> 0;
-    for (const value of [dx, dy]) {
-        pixelCentreVersionF32[0] = value;
-        const bits = pixelCentreVersionU32[0]!;
-        h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
-        h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
-    }
+    pixelCentreVersionF32[0] = dx;
+    let bits = pixelCentreVersionU32[0]!;
+    h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
+    h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
+    pixelCentreVersionF32[0] = dy;
+    bits = pixelCentreVersionU32[0]!;
+    h1 = Math.imul(h1 ^ bits, 0x01000193) >>> 0;
+    h2 = (Math.imul(h2 ^ bits, 0x85ebca6b) + 0x9e3779b9) >>> 0;
     return ((h1 & 0x1fffff) * 0x100000000) + h2;
 }
 
@@ -87,7 +100,8 @@ export function writeMvpWithPixelCenter(
     viewportHeight: number,
     renderScale = 1,
 ): void {
-    const { dx, dy } = pixelCenterClipOffset(viewportWidth, viewportHeight, renderScale);
+    const dx = pixelCenterClipDx(viewportWidth, renderScale);
+    const dy = pixelCenterClipDy(viewportHeight, renderScale);
 
     for (let row = 0; row < 4; row++) {
         const i = row * 4;

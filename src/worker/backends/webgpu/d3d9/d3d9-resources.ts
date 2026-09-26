@@ -196,19 +196,34 @@ export class VertexBufferStore {
         return guestBase + offset;
     }
 
+    /** The current lock's [offset, size), or null when the buffer is not locked. */
+    lockedRange(index: number): { offset: number; size: number } | null {
+        if (this.guestPtrs[index] < 0 || this.lockedPtrs[index] === -1) return null;
+        return { offset: this.lockedOffsets[index], size: this.lockedSizes[index] };
+    }
+
     unlock(index: number, memory: Uint8Array): void {
         const guestBase = this.guestPtrs[index];
         if (guestBase < 0 || this.lockedPtrs[index] === -1) return;
+        const start = guestBase + this.lockedOffsets[index];
+        noteGuestBufferWrite("d3d9", this.lockedSizes[index]);
+        this.commitUnlock(index, memory.subarray(start, start + this.lockedSizes[index]));
+    }
+
+    /** Unlock with the locked range's bytes captured elsewhere (the split render twin). */
+    unlockFromBytes(index: number, bytes: Uint8Array): void {
+        if (this.guestPtrs[index] < 0 || this.lockedPtrs[index] === -1) return;
+        this.commitUnlock(index, bytes.subarray(0, this.lockedSizes[index]));
+    }
+
+    private commitUnlock(index: number, src: Uint8Array): void {
         const size = this.lockedSizes[index];
         const offset = this.lockedOffsets[index];
         const data = this.data[index];
-        if (data) {
-            data.set(memory.subarray(guestBase + offset, guestBase + offset + size), offset);
-        }
+        if (data) data.set(src, offset);
         this.lockedPtrs[index] = -1;
         this.lockedSizes[index] = 0;
         this.lockedOffsets[index] = 0;
-        noteGuestBufferWrite("d3d9", size);
         this.lockedSinceUpload[index] = (this.lockedSinceUpload[index] ?? 0) + size;
         if (this.dirtyFlags[index] && this.dirtyEnds[index] > this.dirtyStarts[index]) {
             this.dirtyStarts[index] = Math.min(this.dirtyStarts[index], offset);
@@ -518,19 +533,34 @@ export class IndexBufferStore {
         return guestBase + offset;
     }
 
+    /** The current lock's [offset, size), or null when the buffer is not locked. */
+    lockedRange(index: number): { offset: number; size: number } | null {
+        if (this.guestPtrs[index] < 0 || this.lockedPtrs[index] === -1) return null;
+        return { offset: this.lockedOffsets[index], size: this.lockedSizes[index] };
+    }
+
     unlock(index: number, memory: Uint8Array): void {
         const guestBase = this.guestPtrs[index];
         if (guestBase < 0 || this.lockedPtrs[index] === -1) return;
+        const start = guestBase + this.lockedOffsets[index];
+        noteGuestBufferWrite("d3d9", this.lockedSizes[index]);
+        this.commitUnlock(index, memory.subarray(start, start + this.lockedSizes[index]));
+    }
+
+    /** Unlock with the locked range's bytes captured elsewhere (the split render twin). */
+    unlockFromBytes(index: number, bytes: Uint8Array): void {
+        if (this.guestPtrs[index] < 0 || this.lockedPtrs[index] === -1) return;
+        this.commitUnlock(index, bytes.subarray(0, this.lockedSizes[index]));
+    }
+
+    private commitUnlock(index: number, src: Uint8Array): void {
         const size = this.lockedSizes[index];
         const offset = this.lockedOffsets[index];
         const data = this.data[index];
-        if (data) {
-            data.set(memory.subarray(guestBase + offset, guestBase + offset + size), offset);
-        }
+        if (data) data.set(src, offset);
         this.lockedPtrs[index] = -1;
         this.lockedSizes[index] = 0;
         this.lockedOffsets[index] = 0;
-        noteGuestBufferWrite("d3d9", size);
         this.lockedSinceUpload[index] = (this.lockedSinceUpload[index] ?? 0) + size;
         if (this.dirtyFlags[index] && this.dirtyEnds[index] > this.dirtyStarts[index]) {
             this.dirtyStarts[index] = Math.min(this.dirtyStarts[index], offset);
@@ -984,13 +1014,32 @@ export class TextureStore {
             this.guestSerials[index] = (this.dataSerials[index] - 1) >>> 0;
             return;
         }
-        const data = this.data[index];
-        if (data) {
-            // Compressed surfaces hold height/4 block rows, not `height` rows; with the
-            // block-row pitch this avoids copying ~height*3/4 of adjacent guest memory.
-            const bytes = this.levelBytes(index);
-            data.set(memory.subarray(guestBase, guestBase + bytes));
+        // Compressed surfaces hold height/4 block rows, not `height` rows; with the
+        // block-row pitch this avoids copying ~height*3/4 of adjacent guest memory.
+        this.commitUnlock(index, memory.subarray(guestBase, guestBase + this.levelBytes(index)), opts);
+    }
+
+    /** Level-0 bytes the lock exposed, as the guest left them (the split front's capture). */
+    lockedLevelBytes(index: number, memory: Uint8Array): Uint8Array | null {
+        const guestBase = this.guestPtrs[index];
+        if (guestBase < 0 || this.lockedPtrs[index] === -1) return null;
+        return memory.slice(guestBase, guestBase + this.levelBytes(index));
+    }
+
+    /** Unlock with level-0 bytes captured elsewhere (the split render twin). */
+    unlockFromBytes(index: number, bytes: Uint8Array | null, opts: { readOnly?: boolean; noDirtyUpdate?: boolean } = {}): void {
+        if (this.guestPtrs[index] < 0 || this.lockedPtrs[index] === -1) return;
+        this.lockedPtrs[index] = -1;
+        if (opts.readOnly || !bytes) {
+            this.guestSerials[index] = (this.dataSerials[index] - 1) >>> 0;
+            return;
         }
+        this.commitUnlock(index, bytes, opts);
+    }
+
+    private commitUnlock(index: number, src: Uint8Array, opts: { noDirtyUpdate?: boolean }): void {
+        const data = this.data[index];
+        if (data) data.set(src.subarray(0, Math.min(src.length, data.length)));
         if (!opts.noDirtyUpdate) this.setDirty(index, true);
         // The guest buffer IS what `data` was just set from, so it is in sync by construction.
         this.guestSerials[index] = this.dataSerials[index];

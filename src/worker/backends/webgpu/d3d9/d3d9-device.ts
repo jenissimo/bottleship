@@ -9,12 +9,12 @@ import { EmulatorConfig } from "../../../core/emulator-config-manager";
 // ddraw executor, but its render targets and the texture-handle registry are the same objects.
 import "../../../modules/ddraw/surface-device-loss";
 import {
-    D3D9StateTracker, FFP_TEXTURE_TRANSFORM_COUNT, D3D9_FFP_STAGE_COUNT, D3D9_TEXTURE_SLOT_COUNT,
+    D3D9StateTracker, FFP_TEXTURE_TRANSFORM_COUNT, FFP_WORLD_MATRIX_COUNT, D3D9_FFP_STAGE_COUNT, D3D9_TEXTURE_SLOT_COUNT,
     D3D9_PIXEL_TEXTURE_STAGE_COUNT,
     D3D9_VERTEX_TEXTURE_SAMPLER_BASE, D3D9_VERTEX_TEXTURE_SAMPLER_COUNT,
     d3d9TextureStageSlot, isD3D9TextureStage,
 } from "./d3d9-state-tracker";
-import { D3D9CommandRecorder } from "./d3d9-command-recorder";
+import { D3D9CommandRecorder, type DrawIndexedCommand, type PlannedVertexBindings } from "./d3d9-command-recorder";
 import {
     censusD3D9MegaBatchFrame,
     createD3D9MegaBatchCensus,
@@ -34,6 +34,9 @@ import {
 } from "./multisample";
 import { resolveD3D9ClearRegion, resolveD3D9RectClearPolicy } from "./clear-policy";
 import { D3D9QueryManager } from "../../../modules/d3d9/query-manager";
+import { SplitQueryHost } from "./split-query-host";
+import type { SplitQueryChannel, SplitQueryResult, RemoteGpuObserver } from "../../../render/d3d9-remote-state";
+import type { DeviceLossSource } from "../../../core/gpu/gpu-device-loss-contract";
 import { VertexBufferStore, IndexBufferStore, TextureStore } from "./d3d9-resources";
 import { copyD3D9SurfaceRectCpu, isD3D9CpuCopyDestinationFormat, writeD3D9Pixel } from "./copy-cpu";
 import {
@@ -85,7 +88,7 @@ import {
     d3d9ResetDropDrawWarnings, d3d9NoteIndexedDrawUnencoded, d3d9DroppedDrawTotal,
     d3d9NoteFence, d3d9NoteStagedBytes, d3d9NoteRenderFrameBoundary, d3d9NoteTextureBind,
     d3d9NoteFfpSamplerDims } from "../../../modules/d3d9/d3d9-perf";
-import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
+import { addBindingRef, releaseBindingRef } from "../../../modules/d3d9/com-refs";
 import { d3d9ReadbackCounters } from "../../../modules/d3d9/lock-stats";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { Mem } from "../../../core/memory/mem-accessor";
@@ -102,7 +105,8 @@ import {
 } from "./shader";
 import type { CensusSummary } from "./shader/census";
 import { AlphaTest, alphaTestSnippet } from "./shader/sm-wgsl";
-import { noteD3D9TextureUpload } from "../../../modules/d3d9/shared-state";
+import { devices as d3d9Devices, noteD3D9TextureUpload, twinStateBlocks } from "../../../modules/d3d9/shared-state";
+import { pixelShaderComObjects, vertexDeclComObjects, vertexShaderComObjects } from "./d3d9-com-objects";
 // renderSpace only: the windowed regime is exactly where the guest picture space and the
 // guest POINTER space stop coinciding, so the verb has to be able to print both.
 import { windows as sharedUserWindows, getVirtualScreenRect } from "../../../modules/user32/shared-state";
@@ -141,7 +145,7 @@ import {
 import { FFP_FOG_WGSL, resolveFfpFogMode, resolveProgrammablePixelFogMode } from "./ffp-fog";
 import { d3dShaderTokenCount } from "./shader/bytecode-extent";
 import { resolveFfpVertexBlend } from "./ffp-vertex-blend";
-import { pixelCenterClipOffset, pixelCenterOffsetPx, withPixelCenterVersion } from "../pixel-center";
+import { pixelCenterClipDx, pixelCenterClipDy, pixelCenterOffsetPx, withPixelCenterVersion } from "../pixel-center";
 import { alignUploadRange, noteUploadReason } from "../buffer-upload";
 import { FFP_IMPLEMENTED_OPS, emitFfpCombinerWgsl } from "./ffp-combiner";
 import {
@@ -203,6 +207,18 @@ const EMPTY_COMPARISON_SAMPLERS: Map<number, { clampDref?: boolean }> = new Map(
 
 /** Numeric sort comparator, hoisted: the light gather sorts per draw. */
 const ascending = (a: number, b: number): number => a - b;
+
+/** Leading views of long-lived constant banks, one per (bank, length). The per-draw bank copy
+ *  is a `set` (a memcpy) and must stay one, but building its source with `subarray` each time
+ *  allocated two views per draw. Banks are JS-owned, so a view never detaches. */
+const prefixViews = new WeakMap<Uint32Array, Map<number, Uint32Array>>();
+function prefixView(bank: Uint32Array, len: number): Uint32Array {
+    let byLen = prefixViews.get(bank);
+    if (!byLen) { byLen = new Map(); prefixViews.set(bank, byLen); }
+    let view = byLen.get(len);
+    if (!view) { view = bank.subarray(0, len); byLen.set(len, view); }
+    return view;
+}
 
 /** Diagnostic oracle: compare payload bits and object identities, not only content hashes. */
 export function programmableSnapshotsEqual(a: ProgrammableDrawState, b: ProgrammableDrawState): boolean {
@@ -600,9 +616,82 @@ function makeShaderBankHashCache(words: number): ShaderBankHashCache {
     return { h1: new Uint32Array(blocks), h2: new Uint32Array(blocks), valid: new Uint8Array(blocks) };
 }
 
+/** Values Reset consumes from D3DPRESENT_PARAMETERS (read at the call). */
+export interface D3D9ResetParams {
+    width: number;
+    height: number;
+    windowed: number;
+    enableAutoDepthStencil: number;
+    autoDepthStencilFormat: number;
+    presentationInterval: number;
+    swapEffect: number;
+}
+
+export interface D3D9ViewportValues { x: number; y: number; width: number; height: number; minZ: number; maxZ: number }
+
+/** True inside the split D3D9 render worker (render/d3d9-render-worker.ts). */
+function inRenderWorker(): boolean {
+    return (globalThis as { __d3d9RenderWorker?: boolean }).__d3d9RenderWorker === true;
+}
+
+/** What the split render twin passes where a call wants guest memory it must not touch. */
+const NO_GUEST_MEMORY = new Uint8Array(0);
+
+/** Vertices a non-indexed draw of `count` primitives reads (0 for an unknown topology). */
+function d3dPrimitiveVertexCount(primitiveType: number, count: number): number {
+    switch (primitiveType) {
+        case D3DPT_POINTLIST: return count;
+        case D3DPT_TRIANGLELIST: return count * 3;
+        case D3DPT_TRIANGLEFAN:
+        case D3DPT_TRIANGLESTRIP: return count + 2;
+        case D3DPT_LINELIST: return count * 2;
+        case D3DPT_LINESTRIP: return count + 1;
+        default: return 0;
+    }
+}
+
+/** The first 16 elements are all finite. Runs per SetTransform: no per-call allocation. */
+function finiteMatrix16(m: Float32Array): boolean {
+    for (let i = 0; i < 16; i++) if (!Number.isFinite(m[i]!)) return false;
+    return true;
+}
+
+/** `getTransform(state) !== null`, without the matrix view getTransform builds for it. */
+function isTransformState(state: number): boolean {
+    return (state >= D3DTS_WORLD && state < D3DTS_WORLD + FFP_WORLD_MATRIX_COUNT)
+        || state === D3DTS_VIEW || state === D3DTS_PROJECTION
+        || (state >= D3DTS_TEXTURE0 && state < D3DTS_TEXTURE0 + FFP_TEXTURE_TRANSFORM_COUNT);
+}
+
 export class D3D9Device {
     /** Set when the parent interface is IDirect3D9Ex; Ex reset/pool rules follow the parent. */
     public isExtended = false;
+    /**
+     * Split D3D9 (plan/d3d9-threaded/P2-PLAN.md). 'both' is the single device. 'front' is the
+     * one the guest calls: every method runs as usual except GPU work. 'render' is its twin,
+     * replaying the front's call stream: GPU work only, no guest-visible effect, no guest reads.
+     */
+    role: "both" | "front" | "render" = "both";
+    renderTwin: D3D9Device | null = null;
+    /** On the twin, the front's answer to the call being replayed — what it adopts where the
+     *  answer is guest-owned (a guest allocation, a handle the front minted). */
+    splitFrontResult: unknown = undefined;
+    /** On a front whose twin is in another worker: resolves when the twin is close enough
+     *  behind that another frame may be recorded (back-pressure; see split.ts). */
+    splitPresentGate: (() => Promise<void>) | null = null;
+    /** A split front whose frames come from the render worker: the canvas edge arrives with them. */
+    splitFramesRemote = false;
+    /** On a split front: the twin's level-0 shadow of a texture after its GPU readbacks settled,
+     *  with the answer the twin's `method` gave (see adoptTwinReadback). */
+    splitFetchTexture: ((texPtr: number, method: string) => Promise<{ data: Uint8Array | null; answer: unknown }>) | null = null;
+    /** On a front whose twin is in the render worker: where GetData's GPU answers come from. */
+    splitQueries: SplitQueryChannel | null = null;
+    /** On that front: the render worker's GPUDevice, which its resources live on and whose
+     *  loss is this device's loss (adoptSplitLossSource). */
+    private splitLossSource: DeviceLossSource | null = null;
+    private unregisterGpuObserver: (() => void) | null = null;
+    /** On a render twin in the worker: the GPU half of the front's queries. */
+    private splitQueryHost: SplitQueryHost | null = null;
     // A hardware-3D presenter owns the screen: GDI window-background paints must NOT composite
     // over (and black out) the rendered 3D frame. Matches D3D8/Glide/OpenGL (RenderActive contract).
     readonly suppressGdiOverlay = true;
@@ -669,6 +758,24 @@ export class D3D9Device {
         return System.getInstance().process!.getCurrentMemory();
     }
 
+    /** Guest heap belongs to the front: the render twin takes the address the front's call
+     *  returned (a bare pointer, or the `ptr` of a lock result) and allocates nothing. */
+    private guestAlloc(bytes: number): number {
+        if (this.role === "render") {
+            const r = this.splitFrontResult;
+            const ptr = typeof r === "number" ? r : (r as { ptr?: unknown } | null | undefined)?.ptr;
+            if (typeof ptr !== "number" || ptr <= 0) throw new Error("split twin: no front allocation to adopt");
+            return ptr;
+        }
+        return System.getInstance().process!.memory.alloc(bytes, "HEAP");
+    }
+
+    private guestFree(ptr: number): void {
+        if (this.role === "render") return;
+        const process = System.getInstance().process;
+        process?.memory.free(ptr);
+    }
+
     /** THE per-slot stream state (see StreamBindingTable). Written only by setStreamSource. */
     private readonly streams = new StreamBindingTable();
     /** Reused per-draw binding plan — every slot a draw binds, slot 0 included. */
@@ -711,6 +818,16 @@ export class D3D9Device {
     private drawCount = 0;
     private lastPresentTime = 0;
     private fps = 0;
+    /** Arguments handed to a callee that consumes them before returning (the arena resolver,
+     *  the command recorder, the debug snapshot). Written in place per draw: as literals they
+     *  were three objects on every indexed draw. */
+    private readonly indexedArenaSpec: Extract<ArenaRecordSpec, { kind: "indexed" }> = {
+        kind: "indexed", topology: 0, indexCount: 0, startIndex: 0, baseVertex: 0, stride: 0, forceCullNone: false,
+    };
+    private drawIndexedCmd: (DrawIndexedCommand & PlannedVertexBindings) | null = null;
+    private readonly lastDrawSnapshot: {
+        api: "d3d9"; primitiveType: number; numVerts: number; numIndices: number | undefined; timestamp: number;
+    } = { api: "d3d9", primitiveType: 0, numVerts: 0, numIndices: undefined, timestamp: 0 };
     // Frame snapshot tracking for debug panel
     private frameSnapshot: {
         frameId: number;
@@ -1185,11 +1302,13 @@ export class D3D9Device {
             // DEFAULT render-target handles survive a device loss, but their GPU object does
             // not. Recreate it before accepting the bind so Reset/rehydration can follow the
             // normal SetRenderTarget call order without making the app know about WebGPU loss.
-            if (!this.textures.getGpuTexture(idx)) {
-                if (!this.backend.getDevice()) return D3DERR_INVALIDCALL;
-                this.ensureTexture(idx);
+            if (this.role !== "front") {
+                if (!this.textures.getGpuTexture(idx)) {
+                    if (!this.backend.getDevice()) return D3DERR_INVALIDCALL;
+                    this.ensureTexture(idx);
+                }
+                if (!this.textures.getGpuTexture(idx)) return D3DERR_INVALIDCALL;
             }
-            if (!this.textures.getGpuTexture(idx)) return D3DERR_INVALIDCALL;
             newTarget = idx;
             // Only a cube RT honors a face selector; a plain 2D RT renders to layer 0.
             newFace = this.textures.isCubeMap(idx) ? face : -1;
@@ -1287,9 +1406,11 @@ export class D3D9Device {
             if (index === null || !isDxDepthStencilFormat(this.textures.getFormat(index), 9)) {
                 return D3DERR_INVALIDCALL;
             }
-            const device = this.backend.getDevice();
-            if (device) this.ensureDepthTexture(index, device);
-            if (!this.textures.getView(index)) return D3DERR_INVALIDCALL;
+            if (this.role !== "front") {
+                const device = this.backend.getDevice();
+                if (device) this.ensureDepthTexture(index, device);
+                if (!this.textures.getView(index)) return D3DERR_INVALIDCALL;
+            }
             next = index;
         }
         if (next === this.depthTextureIndex && this.activeStandaloneDepthSurface === null) return D3D_OK;
@@ -1414,7 +1535,7 @@ export class D3D9Device {
         this.submitFrame(false);
         this.depthTextureIndex = null;
         this.activeStandaloneDepthSurface = ptr;
-        if (!this.ensureStandaloneDepthSurface(ptr)) {
+        if (this.role !== "front" && !this.ensureStandaloneDepthSurface(ptr)) {
             this.activeStandaloneDepthSurface = null;
             return D3DERR_INVALIDCALL;
         }
@@ -1916,12 +2037,16 @@ export class D3D9Device {
     private suppressStateBlockRecording = false;
     private viewport = { x: 0, y: 0, width: 800, height: 600, minZ: 0, maxZ: 1 };
 
+    /** Move a binding's reference from `current` to `next` — a BINDING reference, which native
+     *  D3D9 keeps out of the public count (com-refs, `__d3d9InternalBindingRefs`). The new one is
+     *  taken first so rebinding cannot transiently free an object held only by this slot. */
     private replaceHeldComRef(current: number, next: number): number {
         const currentPtr = current >>> 0;
         const nextPtr = next >>> 0;
         if (currentPtr === nextPtr) return currentPtr;
-        if (nextPtr !== 0) addComRef(nextPtr);
-        if (currentPtr !== 0) releaseComRef(currentPtr);
+        if (this.role === "render") return nextPtr;
+        if (nextPtr !== 0) addBindingRef(nextPtr);
+        if (currentPtr !== 0) releaseBindingRef(currentPtr);
         return nextPtr;
     }
 
@@ -1952,6 +2077,7 @@ export class D3D9Device {
      *  state WITHOUT going through the setters must call this, or the trampoline keeps
      *  answering "already set" for state the device no longer holds. */
     private resetSetterShadows(): void {
+        if (this.role === "render") return;
         let d = this.shadowSyncDispatcher;
         if (!d) {
             d = (System.getInstance().process?.dispatcher as typeof this.shadowSyncDispatcher) ?? null;
@@ -1978,7 +2104,21 @@ export class D3D9Device {
         // Register as active renderer
         System.getInstance().services.render.setActive(this);
 
-        registerGpuDeviceObserver("d3d9-device", { onDeviceLost: () => this.onDeviceLost() });
+        this.unregisterGpuObserver = registerGpuDeviceObserver("d3d9-device", { onDeviceLost: () => this.onDeviceLost() });
+    }
+
+    /**
+     * A split front whose twin renders on the render worker's GPUDevice: that device's loss is
+     * this device's loss — this worker's own device only composites the frames it sends.
+     */
+    adoptSplitLossSource(source: DeviceLossSource & { subscribe(observer: RemoteGpuObserver): () => void }): void {
+        this.unregisterGpuObserver?.();
+        this.splitLossSource = source;
+        this.unregisterGpuObserver = source.subscribe({ onDeviceLost: () => this.onDeviceLost() });
+    }
+
+    getSplitLossSource(): DeviceLossSource | null {
+        return this.splitLossSource;
     }
 
     /** Capability gate used by D3D9 module entry points before creating MSAA surfaces. */
@@ -2169,7 +2309,7 @@ export class D3D9Device {
         if (width > 0 && height > 0) {
             // Only a fullscreen device's backbuffer IS the display mode; a windowed one is a
             // size inside the desktop and must not be published as SM_CXSCREEN.
-            System.getInstance().requestHostResize(width, height, { modeSet: fullscreen });
+            if (this.role !== "render") System.getInstance().requestHostResize(width, height, { modeSet: fullscreen });
             this.backendExecutor.setGuestBackbufferSize(width, height);
             this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
         }
@@ -2222,6 +2362,7 @@ export class D3D9Device {
     /** Keep a guest-side setter shadow slot in lock-step with this tracker on every real change,
      *  regardless of which path drove the change. No-op when the shadow isn't registered. */
     private syncSetterShadow(funcName: string, slot: number, value: number): void {
+        if (this.role === "render") return;
         let d = this.shadowSyncDispatcher;
         if (!d) {
             d = (System.getInstance().process?.dispatcher as typeof this.shadowSyncDispatcher) ?? null;
@@ -2300,8 +2441,12 @@ export class D3D9Device {
     }
 
     createVertexShader(bytecodePtr: number, mem: Uint8Array): { hr: number; handle: number; bytecode: Uint32Array } {
+        return this.createVertexShaderFromTokens(this.captureShaderTokens(bytecodePtr, mem));
+    }
+
+    createVertexShaderFromTokens(bytecode: Uint32Array): { hr: number; handle: number; bytecode: Uint32Array } {
         try {
-            const bytecode = this.readShaderTokens(bytecodePtr, mem);
+            if (bytecode.length === 0) throw new Error("shader bytecode has no END token");
             const compiled = compileVertexShader(bytecode);
             const handle = this.vsNextHandle++;
             this.vsShaderRegistry.set(handle, compiled);
@@ -2322,8 +2467,12 @@ export class D3D9Device {
     }
 
     createPixelShader(bytecodePtr: number, mem: Uint8Array): { hr: number; handle: number; bytecode: Uint32Array } {
+        return this.createPixelShaderFromTokens(this.captureShaderTokens(bytecodePtr, mem));
+    }
+
+    createPixelShaderFromTokens(bytecode: Uint32Array): { hr: number; handle: number; bytecode: Uint32Array } {
         try {
-            const bytecode = this.readShaderTokens(bytecodePtr, mem);
+            if (bytecode.length === 0) throw new Error("shader bytecode has no END token");
             const compiled = compilePixelShader(bytecode);
             const handle = this.psNextHandle++;
             this.psShaderRegistry.set(handle, compiled);
@@ -2700,23 +2849,23 @@ export class D3D9Device {
     }
 
     /** Apply shader constants captured in the WBUF ring (float bits already inlined). */
+    /** Returns true when the bank actually changed. Per-call path: no closures, no views. */
     private copyShaderConstantsFromWbufRing(
         targetBits: Uint32Array,
-        onChanged: () => void,
         skipKey: "vsConstantUnchanged" | "psConstantUnchanged",
         apiKey: "setVertexShaderConstantF" | "setPixelShaderConstantF",
         stateOp: "vertexShaderConstantF" | "pixelShaderConstantF",
         mem32: Uint32Array,
         dataPtr: number,
-        arenaWrite?: (startFloat: number, data: Float32Array) => void,
-    ): void {
+        arenaBank: "vs" | "ps" | null,
+    ): boolean {
         d3d9PerfInc(apiKey);
         const w = dataPtr >> 2;
         const startRegister = mem32[w + 1]!;
         const vector4fCount = mem32[w + 2]!;
         const baseIdx = startRegister * 4;
         const count = Math.min(vector4fCount * 4, targetBits.length - baseIdx);
-        if (count <= 0) return;
+        if (count <= 0) return false;
 
         const srcIdx = w + 3;
         if (this.recordingStateBlock) {
@@ -2724,18 +2873,15 @@ export class D3D9Device {
             const data = new Float32Array(count);
             new Uint32Array(data.buffer).set(mem32.subarray(srcIdx, srcIdx + count));
             this.recordStateBlock({ op: stateOp, start: startRegister, data });
-            return;
+            return false;
         }
-        if (this.copyShaderConstantBitsFromMem32(targetBits, baseIdx, mem32, srcIdx, count)) {
-            onChanged();
-        } else {
-            d3d9PerfSkip(skipKey);
+        const changed = this.copyShaderConstantBitsFromMem32(targetBits, baseIdx, mem32, srcIdx, count);
+        if (!changed) d3d9PerfSkip(skipKey);
+        if (arenaBank && d3d9WasmArena.isInitialized()) {
+            if (arenaBank === "vs") d3d9WasmArena.setVertexShaderConstantBits(baseIdx, targetBits, count);
+            else d3d9WasmArena.setPixelShaderConstantBits(baseIdx, targetBits, count);
         }
-        if (arenaWrite) {
-            // targetBits shares its buffer (byteOffset 0) with the owning Float32Array
-            // (vsConstants/psConstants), so this slices the exact bits just written above.
-            arenaWrite(baseIdx, new Float32Array(targetBits.buffer, baseIdx * 4, count));
-        }
+        return changed;
     }
 
     private copyShaderConstantBitsFromMem32(
@@ -2796,8 +2942,8 @@ export class D3D9Device {
         const intWords = SHADER_INTEGER_REGISTER_COUNT * 4;
         // Bulk copies: the destination is a fresh pooled slot, and a typed-array set is what
         // the old per-word loop was doing by hand while also hashing.
-        if (dstBits !== cBits) dstBits.set(cBits.subarray(0, cLen), 0);
-        dstBits.set(iBits.subarray(0, intWords), cLen);
+        if (dstBits !== cBits) dstBits.set(prefixView(cBits, cLen), 0);
+        dstBits.set(prefixView(iBits, intWords), cLen);
         dstBits[cLen + intWords] = boolMask >>> 0;
         for (let i = 1; i < boolWords; i++) dstBits[cLen + intWords + i] = 0;
 
@@ -3295,21 +3441,22 @@ export class D3D9Device {
         if (changedHw || changedSwvp) this.vsConstantsVersion++;
         else d3d9PerfSkip("vsConstantUnchanged");
         if (!arenaAlreadyUpdated && d3d9WasmArena.isInitialized() && hwCount > 0) {
-            d3d9WasmArena.setVertexShaderConstantF(baseIdx, this.vsConstants.subarray(baseIdx, baseIdx + hwCount));
+            d3d9WasmArena.setVertexShaderConstantBits(baseIdx, this.vsConstantBits, hwCount);
         }
     }
 
     setPixelShaderConstantFFromWbufRing(mem32: Uint32Array, dataPtr: number): void {
-        this.copyShaderConstantsFromWbufRing(
+        if (this.copyShaderConstantsFromWbufRing(
             this.psConstantBits,
-            () => { this.psConstantsVersion++; },
             "psConstantUnchanged",
             "setPixelShaderConstantF",
             "pixelShaderConstantF",
             mem32,
             dataPtr,
-            d3d9WasmArena.isInitialized() ? (sf, data) => d3d9WasmArena.setPixelShaderConstantF(sf, data) : undefined,
-        );
+            "ps",
+        )) {
+            this.psConstantsVersion++;
+        }
     }
 
     setPixelShaderConstantFFromArray(startRegister: number, data: Float32Array, _mem: Uint8Array): number {
@@ -3798,14 +3945,13 @@ export class D3D9Device {
     }
 
     createVertexBuffer(vbPtr: number, size: number, fvf: number, pool = 0): number {
-        const process = System.getInstance().process;
-        if (!process) return 0;
+        if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary (see BUF_CANARY) — kept outside the size the store/game sees.
-            const guestPtr = process.memory.alloc(size + D3D9Device.BUF_CANARY_BYTES, "HEAP");
+            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES);
             const index = this.vertexBuffers.create(vbPtr, size, fvf, guestPtr, pool);
             this.dropBufferVersions(index, "vb");
-            this.writeCanary(null, guestPtr, size);
+            if (this.role !== "render") this.writeCanary(null, guestPtr, size);
             return guestPtr;
         } catch (e) {
             Logger.error(LogCategory.D3D9, `createVertexBuffer: HEAP alloc failed size=${size}: ${e}`);
@@ -3843,9 +3989,14 @@ export class D3D9Device {
     private vbLastLockFlags = new Map<number, number>();
     private ibLastLockFlags = new Map<number, number>();
     private bufferFrameSerial = -1;
+    /** This device's own Presents, on every role. The version rings are this device's GPU
+     *  resources, so their frame is this device's frame: a boundary only the guest-side
+     *  device advances (the harness capture serial) never moves on a render twin in another
+     *  worker, and its rings then grow by one buffer per DISCARD for the life of the device. */
+    private presentBoundarySerial = 0;
 
     /**
-     * Reset the per-frame version bookkeeping when the producer frame boundary moves. Every
+     * Reset the per-frame version bookkeeping when this device's frame boundary moves. Every
      * buffer restarts at ring slot 0, which is safe for GPU ordering because the previous
      * frame's draws have been submitted — but the buffer's current bytes live in the slot that
      * frame ENDED on, and an upload only happens while `store.isDirty`. So rewinding the slot
@@ -3853,7 +4004,7 @@ export class D3D9Device {
      * written) and WebGPU reports nothing.
      */
     private syncBufferFrame(): void {
-        const serial = frameCapture.getFrameBoundarySerial();
+        const serial = this.presentBoundarySerial;
         if (serial === this.bufferFrameSerial) return;
         this.bufferFrameSerial = serial;
         for (const [index, slot] of this.vbSlotThisFrame) {
@@ -4186,14 +4337,13 @@ export class D3D9Device {
     }
 
     createIndexBuffer(ibPtr: number, size: number, format: number, pool = 0): number {
-        const process = System.getInstance().process;
-        if (!process) return 0;
+        if (this.role !== "render" && !System.getInstance().process) return 0;
         try {
             // +16: tail canary, same scheme as createVertexBuffer.
-            const guestPtr = process.memory.alloc(size + D3D9Device.BUF_CANARY_BYTES, "HEAP");
+            const guestPtr = this.guestAlloc(size + D3D9Device.BUF_CANARY_BYTES);
             const index = this.indexBuffers.create(ibPtr, size, format, guestPtr, pool);
             this.dropBufferVersions(index, "ib");
-            this.writeCanary(null, guestPtr, size);
+            if (this.role !== "render") this.writeCanary(null, guestPtr, size);
             return guestPtr;
         } catch (e) {
             Logger.error(LogCategory.D3D9, `createIndexBuffer: HEAP alloc failed size=${size}: ${e}`);
@@ -4224,6 +4374,210 @@ export class D3D9Device {
         const bytes = size === 0 ? maxSize : Math.min(size, maxSize);
         const ptr = this.indexBuffers.lock(index, offset, bytes);
         return ptr >= 0 ? ptr : 0;
+    }
+
+    // ── Split D3D9: the front captures guest bytes at the call; the twin applies them ──
+
+    captureLockedVertexBytes(vbPtr: number): Uint8Array | null {
+        const index = this.vertexBuffers.getIndex(vbPtr);
+        const range = index === null ? null : this.vertexBuffers.lockedRange(index);
+        if (index === null || !range) return null;
+        const start = this.vertexBuffers.getGuestPtr(index) + range.offset;
+        return this.memory.slice(start, start + range.size);
+    }
+
+    captureLockedIndexBytes(ibPtr: number): Uint8Array | null {
+        const index = this.indexBuffers.getIndex(ibPtr);
+        const range = index === null ? null : this.indexBuffers.lockedRange(index);
+        if (index === null || !range) return null;
+        const start = this.indexBuffers.getGuestPtr(index) + range.offset;
+        return this.memory.slice(start, start + range.size);
+    }
+
+    unlockVertexBufferBytes(vbPtr: number, bytes: Uint8Array | null): number {
+        const index = this.vertexBuffers.getIndex(vbPtr);
+        if (index !== null && bytes) this.vertexBuffers.unlockFromBytes(index, bytes);
+        return 0;
+    }
+
+    unlockIndexBufferBytes(ibPtr: number, bytes: Uint8Array | null): number {
+        const index = this.indexBuffers.getIndex(ibPtr);
+        if (index !== null && bytes) this.indexBuffers.unlockFromBytes(index, bytes);
+        return 0;
+    }
+
+    captureLockedTextureBytes(texPtr: number, level: number): Uint8Array | null {
+        const index = this.textures.getIndex(texPtr);
+        if (index === null) return null;
+        if (level === 0) return this.textures.lockedLevelBytes(index, this.memory);
+        const lock = this.mipLevelLocks.get(`${texPtr}:${level}`);
+        if (!lock) return null;
+        const levelWidth = Math.max(1, this.textures.getWidth(index) >>> level);
+        const levelHeight = Math.max(1, this.textures.getHeight(index) >>> level);
+        const rows = getD3DTextureLayout(this.textures.getFormat(index), levelWidth, levelHeight).rows;
+        return this.memory.slice(lock.guestPtr, lock.guestPtr + lock.pitch * rows);
+    }
+
+    unlockTextureBytes(
+        texPtr: number,
+        level: number,
+        bytes: Uint8Array | null,
+        options: boolean | { readOnly?: boolean; noDirtyUpdate?: boolean } = false,
+    ): number {
+        const readOnly = typeof options === "boolean" ? options : options.readOnly === true;
+        const noDirtyUpdate = typeof options === "boolean" ? false : options.noDirtyUpdate === true;
+        const index = this.textures.getIndex(texPtr);
+        if (index === null) return 0;
+        if (level !== 0) {
+            const key = `${texPtr}:${level}`;
+            if (!this.mipLevelLocks.delete(key)) return 0;
+            if (readOnly || !bytes) return 0;
+            this.mipLevelData.set(key, bytes);
+            if (!noDirtyUpdate) this.textures.setDirty(index, true);
+            this.arenaSamplerBankGeneration++;
+            return 0;
+        }
+        this.textures.unlockFromBytes(index, bytes, { readOnly, noDirtyUpdate });
+        return 0;
+    }
+
+    captureLockedCubeFaceBytes(cubePtr: number, face: number, level: number): Uint8Array | null {
+        const index = this.textures.getIndex(cubePtr);
+        const lock = this.cubeFaceLocks.get(`${cubePtr}:${face}:${level}`);
+        if (index === null || !lock || lock.readOnly) return null;
+        const edge = Math.max(1, this.textures.getHeight(index) >>> level);
+        const rows = getD3DTextureLayout(this.textures.getFormat(index), edge, edge).rows;
+        return this.memory.slice(lock.guestPtr, lock.guestPtr + lock.pitch * rows);
+    }
+
+    /** Viewport values a FastPath SetViewport points at, or null when the pointer is bad. */
+    readViewportArg(pViewport: number, mem: Uint8Array, captured: boolean): D3D9ViewportValues | null {
+        if (captured ? pViewport + 24 > mem.length : (!pViewport || !isValidAddress(mem, pViewport, 24))) return null;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        return {
+            x: view.getUint32(pViewport + 0, true),
+            y: view.getUint32(pViewport + 4, true),
+            width: view.getUint32(pViewport + 8, true),
+            height: view.getUint32(pViewport + 12, true),
+            minZ: view.getFloat32(pViewport + 16, true),
+            maxZ: view.getFloat32(pViewport + 20, true),
+        };
+    }
+
+    /** DrawPrimitiveUP's vertex bytes, copied at the call (null: the draw is out of range). */
+    captureUpVertexBytes(
+        primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number, ringSource?: Uint8Array,
+    ): Uint8Array | null {
+        const vertices = d3dPrimitiveVertexCount(primitiveType, primitiveCount);
+        const bytes = vertices * stride;
+        if (!Number.isSafeInteger(bytes) || bytes <= 0 || vertexDataPtr < 0) return null;
+        const src = ringSource ?? this.memory;
+        if (!this.upSourceInRange(src, ringSource, vertexDataPtr, bytes)) return null;
+        return src.slice(vertexDataPtr, vertexDataPtr + bytes);
+    }
+
+    /** A vertex buffer's CPU shadow, copied (ProcessVertices' destination, sent to the twin). */
+    captureVertexBufferData(vbPtr: number): Uint8Array | null {
+        const index = this.vertexBuffers.getIndex(vbPtr >>> 0);
+        const data = index === null ? null : this.vertexBuffers.getData(index);
+        return data ? data.slice() : null;
+    }
+
+    /** The twin's side of ProcessVertices: the front computed the vertices; take its result. */
+    twinWriteVertexBufferData(vbPtr: number, bytes: Uint8Array | null): void {
+        const index = this.vertexBuffers.getIndex(vbPtr >>> 0);
+        const data = index === null ? null : this.vertexBuffers.getData(index);
+        if (index === null || !data || !bytes) return;
+        data.set(bytes.subarray(0, data.length));
+        this.vertexBuffers.setDirty(index, true);
+    }
+
+    /** DrawIndexedPrimitiveUP's index span and vertex span [0, (MinVertexIndex+NumVertices)×stride),
+     *  copied at the call (null: out of range — the twin's own validation drops it the same way). */
+    captureIndexedUpBytes(
+        primitiveType: number, minVertexIndex: number, numVertices: number, primitiveCount: number,
+        indexDataPtr: number, indexIs32: boolean, vertexDataPtr: number, stride: number,
+    ): { index: Uint8Array; vertex: Uint8Array } | null {
+        const idxCount = d3dPrimitiveVertexCount(primitiveType, primitiveCount);
+        const indexBytes = idxCount * (indexIs32 ? 4 : 2);
+        const vertexBytes = (minVertexIndex + numVertices) * stride;
+        if (!Number.isSafeInteger(indexBytes) || indexBytes <= 0 || !Number.isSafeInteger(vertexBytes) || vertexBytes <= 0) return null;
+        const mem = this.memory;
+        if (!isValidAddress(mem, indexDataPtr, indexBytes) || !isValidAddress(mem, vertexDataPtr, vertexBytes)) return null;
+        return {
+            index: mem.slice(indexDataPtr, indexDataPtr + indexBytes),
+            vertex: mem.slice(vertexDataPtr, vertexDataPtr + vertexBytes),
+        };
+    }
+
+    /** Shader tokens up to END, or an empty array when the stream has none. */
+    captureShaderTokens(bytecodePtr: number, mem: Uint8Array): Uint32Array {
+        try {
+            return this.readShaderTokens(bytecodePtr, mem);
+        } catch (e) {
+            Logger.error(LogCategory.D3D9, `[D3D9] shader bytecode unreadable at 0x${(bytecodePtr >>> 0).toString(16)}: ${e}`);
+            return new Uint32Array(0);
+        }
+    }
+
+    applyStateBlockDataBySbPtr(sbPtr: number): number {
+        const data = twinStateBlocks.get(sbPtr >>> 0);
+        return data ? this.applyStateBlockData(data) : 0;
+    }
+
+    captureStateBlockDataBySbPtr(sbPtr: number): number {
+        const data = twinStateBlocks.get(sbPtr >>> 0);
+        return data ? this.captureStateBlockData(data) : 0;
+    }
+
+    /** The twin's own copy of a state block the modules built on the front. */
+    twinRegisterStateBlock(sbPtr: number, devicePtr: number, blockType: number, entries: StateBlockEntry[]): void {
+        twinStateBlocks.set(sbPtr >>> 0, { devicePtr, blockType, entries });
+    }
+
+    twinForgetStateBlock(sbPtr: number): void {
+        twinStateBlocks.delete(sbPtr >>> 0);
+    }
+
+    /**
+     * Registries the front's modules fill for the ring handlers. In-process the twin reads the
+     * front's own maps, so these write only in the render worker, whose maps start empty.
+     */
+    twinBindDevicePointer(devicePtr: number): void {
+        if (inRenderWorker()) d3d9Devices.set(devicePtr >>> 0, this);
+    }
+
+    twinRegisterComObject(kind: "vs" | "ps" | "decl", comPtr: number, handle: number): void {
+        if (!inRenderWorker()) return;
+        const key = comPtr >>> 0;
+        if (kind === "decl") vertexDeclComObjects.set(key, { devicePtr: 0, internalHandle: handle, elements: [] });
+        else (kind === "vs" ? vertexShaderComObjects : pixelShaderComObjects)
+            .set(key, { devicePtr: 0, internalHandle: handle, bytecode: new Uint32Array(0) });
+    }
+
+    /** A query boundary the front's query.ts crossed, for the render worker's query manager. */
+    twinQuery(op: string, queryPtr: number, arg: number): void {
+        (this.splitQueryHost ??= new SplitQueryHost(this)).apply(op, queryPtr, arg);
+    }
+
+    /** Query generations that became answerable since the last call (render worker). */
+    collectSplitQueryResults(): SplitQueryResult[] {
+        return this.splitQueryHost?.collect() ?? [];
+    }
+
+    /** Resolves true once in-flight query readbacks settled; false when none were in flight. */
+    splitQueriesInflight(): Promise<boolean> {
+        return this.splitQueryHost?.inflight() ?? Promise.resolve(false);
+    }
+
+    splitQueryHostCounters(): Record<string, unknown> | null {
+        return this.splitQueryHost ? JSON.parse(JSON.stringify(this.splitQueryHost.counters)) as Record<string, unknown> : null;
+    }
+
+    twinForgetComObject(kind: "vs" | "ps" | "decl", comPtr: number): void {
+        if (!inRenderWorker()) return;
+        const key = comPtr >>> 0;
+        (kind === "decl" ? vertexDeclComObjects : kind === "vs" ? vertexShaderComObjects : pixelShaderComObjects).delete(key);
     }
 
     unlockIndexBuffer(ibPtr: number, memory: Uint8Array): number {
@@ -4262,6 +4616,10 @@ export class D3D9Device {
 
     setPaletteEntries(paletteNumber: number, pEntries: number, mem: Uint8Array): void {
         this.texturePalettes.setPaletteEntries(paletteNumber, pEntries, mem);
+    }
+
+    setPaletteEntriesFromBytes(paletteNumber: number, bytes: Uint8Array): void {
+        if (bytes.length >= 1024) this.texturePalettes.setPalette(paletteNumber, new Uint32Array(bytes.slice(0, 1024).buffer));
     }
 
     getPaletteEntries(paletteNumber: number, pEntries: number, mem: Uint8Array): boolean {
@@ -4396,16 +4754,15 @@ export class D3D9Device {
     }
 
     createTexture(texPtr: number, width: number, height: number, levels: number, format: number, usage: number = 0, pool = 0): number {
-        const process = System.getInstance().process;
-        if (!process) return 0;
+        if (this.role !== "render" && !System.getInstance().process) return 0;
         const bytes = getD3DTextureLayout(format, width, height).bytes;
         try {
-            const guestPtr = process.memory.alloc(bytes, "HEAP");
+            const guestPtr = this.guestAlloc(bytes);
             const index = this.textures.create(texPtr, width, height, levels, format, guestPtr, pool);
             // Standard D3D depth textures are both render attachments and shadow-map
             // resources. Keeping them as a native depth format is required by WebGPU's
             // texture_depth_2d / sampler_comparison validation contract.
-            if (isDxDepthStencilFormat(format, 9)) {
+            if (isDxDepthStencilFormat(format, 9) && this.role !== "front") {
                 const dev = this.backend.getDevice();
                 if (dev) this.ensureDepthTexture(index, dev);
             }
@@ -4415,7 +4772,11 @@ export class D3D9Device {
             // empty data and the draw would fall back to the white 1×1 texture → white flash).
             const D3DUSAGE_RENDERTARGET = 0x1;
             if (this.rtCreateLog.length < 24) this.rtCreateLog.push(`${width}x${height} usage=0x${usage.toString(16)} fmt=${format} -> tex=0x${texPtr.toString(16)}${(usage & D3DUSAGE_RENDERTARGET) ? " [RT]" : ""}`);
-            if (usage & D3DUSAGE_RENDERTARGET) {
+            if ((usage & D3DUSAGE_RENDERTARGET) && this.role === "front") {
+                this.gpuResourceGeneration++;
+                this.textures.markRenderTarget(index);
+                this.textures.setDirty(index, false);
+            } else if (usage & D3DUSAGE_RENDERTARGET) {
                 const dev = this.backend.getDevice();
                 if (dev) {
                     // Non-HDR targets match the swap-chain/pipeline color format (sampling a
@@ -4452,21 +4813,27 @@ export class D3D9Device {
      * static cubes upload LockRect'd face pixels via ensureCubeTexture.
      */
     createCubeTexture(cubePtr: number, edge: number, levels: number, format: number, usage: number = 0, pool = 0): number {
-        const process = System.getInstance().process;
-        if (!process) return 0;
+        if (this.role !== "render" && !System.getInstance().process) return 0;
         const e = Math.max(1, edge >>> 0);
         const levelCount = Math.max(1, levels >>> 0);
         try {
             // Scratch HEAP backing keeps TextureStore.create's bookkeeping uniform with 2D
             // textures; cube faces are locked into per-face scratch on demand (lockCubeFace).
-            const guestPtr = process.memory.alloc(getD3DTextureLayout(format, e, e).bytes, "HEAP");
+            const guestPtr = this.guestAlloc(getD3DTextureLayout(format, e, e).bytes);
             const index = this.textures.create(cubePtr, e, e, levelCount, format, guestPtr, pool);
             this.textures.markCube(index);
             // Arena texture ids reserve zero for "unbound"; the resource store starts at
             // index zero, so mirror a one-based id in the compact Rust state.
             if (d3d9WasmArena.isInitialized()) d3d9WasmArena.markTextureCube(index + 1, true);
 
-            const dev = this.backend.getDevice();
+            if (this.role === "front") {
+                this.gpuResourceGeneration++;
+                if (usage & 0x1) {
+                    this.textures.markRenderTarget(index);
+                    this.textures.setDirty(index, false);
+                }
+            }
+            const dev = this.role === "front" ? null : this.backend.getDevice();
             if (dev) {
                 const D3DUSAGE_RENDERTARGET = 0x1;
                 const isRT = (usage & D3DUSAGE_RENDERTARGET) !== 0;
@@ -4524,18 +4891,17 @@ export class D3D9Device {
         const existing = this.cubeFaceLocks.get(key);
         if (existing) return { ptr: existing.guestPtr, pitch: existing.pitch };
 
-        const process = System.getInstance().process;
-        if (!process) return null;
+        if (this.role !== "render" && !System.getInstance().process) return null;
         let guestPtr: number;
         try {
-            guestPtr = process.memory.alloc(bytes, "HEAP");
+            guestPtr = this.guestAlloc(bytes);
         } catch (err) {
             Logger.error(LogCategory.D3D9, `lockCubeFace: HEAP alloc failed bytes=${bytes}: ${err}`);
             return null;
         }
         // Seed with prior contents so a partial re-lock round-trips.
         const prior = this.cubeFaceData.get(key);
-        if (!options.discard && prior && prior.length === bytes) this.memory.set(prior, guestPtr);
+        if (this.role !== "render" && !options.discard && prior && prior.length === bytes) this.memory.set(prior, guestPtr);
 
         this.cubeFaceLocks.set(key, {
             guestPtr,
@@ -4547,6 +4913,20 @@ export class D3D9Device {
     }
 
     /** UnlockRect a cube face: persist the written pixels and mark the cube for re-upload. */
+    unlockCubeFaceBytes(cubePtr: number, face: number, level: number, bytes: Uint8Array | null): boolean {
+        const index = this.textures.getIndex(cubePtr);
+        if (index === null) return false;
+        const key = `${cubePtr}:${face}:${level}`;
+        const lock = this.cubeFaceLocks.get(key);
+        if (!lock) return false;
+        this.cubeFaceLocks.delete(key);
+        if (lock.readOnly || !bytes) return true;
+        this.cubeFaceData.set(key, bytes);
+        if (!lock.noDirtyUpdate) this.textures.setDirty(index, true);
+        this.arenaSamplerBankGeneration++;
+        return true;
+    }
+
     unlockCubeFace(cubePtr: number, face: number, level: number, memory: Uint8Array): boolean {
         const index = this.textures.getIndex(cubePtr);
         if (index === null) return false;
@@ -4554,7 +4934,7 @@ export class D3D9Device {
         const lock = this.cubeFaceLocks.get(key);
         if (!lock) return false;
         if (lock.readOnly) {
-            System.getInstance().process?.memory.free(lock.guestPtr);
+            this.guestFree(lock.guestPtr);
             this.cubeFaceLocks.delete(key);
             return true;
         }
@@ -4565,7 +4945,7 @@ export class D3D9Device {
         const saved = new Uint8Array(bytes);
         saved.set(memory.subarray(lock.guestPtr, lock.guestPtr + bytes));
         this.cubeFaceData.set(key, saved);
-        System.getInstance().process?.memory.free(lock.guestPtr);
+        this.guestFree(lock.guestPtr);
         this.cubeFaceLocks.delete(key);
         if (!lock.noDirtyUpdate) this.textures.setDirty(index, true);
         this.arenaSamplerBankGeneration++; // content change: the resolved stage window must re-run ensureTexture
@@ -4759,9 +5139,37 @@ export class D3D9Device {
         const dstIdx = this.textures.getIndex(dstTexPtr);
         if (srcIdx === null || dstIdx === null) return D3DERR_INVALIDCALL;
         d3d9ReadbackCounters.getRenderTargetData++;
+        if (this.role === "front") {
+            const answer = await this.adoptTwinReadback(dstTexPtr, "readTextureIntoGuestTexture");
+            return typeof answer === "number" ? answer : D3DERR_INVALIDCALL;
+        }
         return (await this.downloadGpuTextureIntoData(srcIdx, dstIdx, srcLevel, srcFace))
             ? 0
             : D3DERR_INVALIDCALL;
+    }
+
+    /**
+     * A split front's GPU readback: the twin performed the recorded call into its own shadow;
+     * take that shadow (after the twin's readbacks settled) as this texture's level-0 data and
+     * answer what the twin answered. Yields first, so the call that got us here is recorded
+     * and shipped before the twin is asked.
+     */
+    private async adoptTwinReadback(texPtr: number, method: string): Promise<unknown> {
+        await null;
+        const fetched = await this.splitFetchTexture?.(texPtr, method);
+        const index = this.textures.getIndex(texPtr);
+        const data = index === null ? null : this.textures.getData(index);
+        if (!fetched?.data || index === null || !data) return undefined;
+        data.set(fetched.data.subarray(0, data.length));
+        this.textures.noteDataWritten(index);
+        return fetched.answer;
+    }
+
+    /** The level-0 CPU shadow of a texture, copied (what a split front adopts after a readback). */
+    copyTextureShadow(texPtr: number): Uint8Array | null {
+        const index = this.textures.getIndex(texPtr);
+        const data = index === null ? null : this.textures.getData(index);
+        return data ? data.slice() : null;
     }
 
     /**
@@ -4780,6 +5188,10 @@ export class D3D9Device {
         const D3DERR_INVALIDCALL = 0x8876086c;
         const dstIdx = this.textures.getIndex(dstTexPtr);
         if (dstIdx === null) return D3DERR_INVALIDCALL;
+        if (this.role === "front") {
+            const answer = await this.adoptTwinReadback(dstTexPtr, "readBackbufferIntoGuestTexture");
+            return typeof answer === "number" ? answer : D3DERR_INVALIDCALL;
+        }
 
         // The destination is a SYSTEMMEM staging surface the guest reads with LockRect, so
         // the CPU layout it expects is D3D9's, not WebGPU's.
@@ -4848,6 +5260,12 @@ export class D3D9Device {
         if (level !== 0 || discard) return null;
         const index = this.textures.getIndex(texPtr);
         if (index === null) return null;
+        // A split front never holds the GPU texture: the twin decides whether one exists.
+        if (this.role === "front") {
+            if (!this.textures.isRenderTarget(index)) return null;
+            d3d9ReadbackCounters.lockReadbacks++;
+            return this.adoptTwinReadback(texPtr, "textureReadbackForLock").then((answer) => answer === true);
+        }
         if (!this.textures.isRenderTarget(index) || !this.textures.getGpuTexture(index)) return null;
         d3d9ReadbackCounters.lockReadbacks++;
         return this.downloadGpuTextureIntoData(index, index);
@@ -4897,7 +5315,9 @@ export class D3D9Device {
             }
             const publish = !discard
                 && (globalThis as { __noD3D9LockReadback?: boolean }).__noD3D9LockReadback !== true;
-            const held = this.textures.lock(index, this.memory, { publish });
+            const held = this.role === "render"
+                ? this.textures.lock(index, NO_GUEST_MEMORY, { publish: false })
+                : this.textures.lock(index, this.memory, { publish });
             if (held?.published) d3d9ReadbackCounters.publishes++;
             return held;
         }
@@ -4917,18 +5337,17 @@ export class D3D9Device {
             return { ptr: existingLock.guestPtr, pitch: existingLock.pitch };
         }
 
-        const process = System.getInstance().process;
-        if (!process) return null;
+        if (this.role !== "render" && !System.getInstance().process) return null;
         let guestPtr: number;
         try {
-            guestPtr = process.memory.alloc(bytes, "HEAP");
+            guestPtr = this.guestAlloc(bytes);
         } catch (e) {
             Logger.error(LogCategory.D3D9, `lockTexture mip${level}: HEAP alloc failed bytes=${bytes}: ${e}`);
             return null;
         }
 
         const existing = this.mipLevelData.get(key);
-        if (existing && existing.length === bytes) {
+        if (this.role !== "render" && existing && existing.length === bytes) {
             this.memory.set(existing, guestPtr);
         }
 
@@ -5044,7 +5463,7 @@ export class D3D9Device {
             const lock = this.mipLevelLocks.get(key);
             if (lock) {
                 if (readOnly) {
-                    System.getInstance().process?.memory.free(lock.guestPtr);
+                    this.guestFree(lock.guestPtr);
                     this.mipLevelLocks.delete(key);
                     return 0;
                 }
@@ -5055,7 +5474,7 @@ export class D3D9Device {
                 const saved = new Uint8Array(bytes);
                 saved.set(memory.subarray(lock.guestPtr, lock.guestPtr + bytes));
                 this.mipLevelData.set(key, saved);
-                System.getInstance().process?.memory.free(lock.guestPtr);
+                this.guestFree(lock.guestPtr);
                 this.mipLevelLocks.delete(key);
                 // Mark dirty so ensureTexture re-uploads (and re-sizes the chain) with the new mip.
                 if (!noDirtyUpdate) this.textures.setDirty(index, true);
@@ -5153,7 +5572,7 @@ export class D3D9Device {
             this.commandRecorder.registerTemporaryBuffer(vb.gpuBuffer);
         }
         if (vb && vb.guestPtr > 0) {
-            System.getInstance().process?.memory.free(vb.guestPtr);
+            this.guestFree(vb.guestPtr);
         }
     }
 
@@ -5169,7 +5588,7 @@ export class D3D9Device {
             this.commandRecorder.registerTemporaryBuffer(ib.gpuBuffer);
         }
         if (ib && ib.guestPtr > 0) {
-            System.getInstance().process?.memory.free(ib.guestPtr);
+            this.guestFree(ib.guestPtr);
         }
     }
 
@@ -5181,7 +5600,7 @@ export class D3D9Device {
         const mipPrefix = `${texPtr}:`;
         for (const [key, lock] of this.mipLevelLocks.entries()) {
             if (key.startsWith(mipPrefix)) {
-                System.getInstance().process?.memory.free(lock.guestPtr);
+                this.guestFree(lock.guestPtr);
                 this.mipLevelLocks.delete(key);
             }
         }
@@ -5191,7 +5610,7 @@ export class D3D9Device {
         const cubePrefix = `${texPtr}:`;
         for (const [key, lock] of this.cubeFaceLocks.entries()) {
             if (key.startsWith(cubePrefix)) {
-                System.getInstance().process?.memory.free(lock.guestPtr);
+                this.guestFree(lock.guestPtr);
                 this.cubeFaceLocks.delete(key);
             }
         }
@@ -5209,7 +5628,7 @@ export class D3D9Device {
         const tex = this.textures.release(texPtr);
         if (!tex) return;
         if (tex.guestPtr > 0) {
-            System.getInstance().process?.memory.free(tex.guestPtr);
+            this.guestFree(tex.guestPtr);
         }
         if (tex.gpuTexture) {
             tex.gpuTexture.destroy();
@@ -5218,15 +5637,14 @@ export class D3D9Device {
 
     setTransform(state: number, matrix: Float32Array): number {
         d3d9PerfInc("setTransform");
-        if (!Number.isInteger(state) || matrix.length < 16 ||
-            !Array.from(matrix.subarray(0, 16)).every(Number.isFinite)) {
+        if (!Number.isInteger(state) || matrix.length < 16 || !finiteMatrix16(matrix)) {
             d3d9PerfSkip("setTransform");
             return D3DERR_INVALIDCALL;
         }
         // The tracker returns `false` both for an invalid selector and for an
         // unchanged matrix.  Validate the selector first so the former remains
         // an observable D3DERR_INVALIDCALL rather than a successful no-op.
-        if (!this.getTransform(state)) {
+        if (!isTransformState(state)) {
             d3d9PerfSkip("setTransform");
             return D3DERR_INVALIDCALL;
         }
@@ -5859,6 +6277,11 @@ export class D3D9Device {
     clear(flags: number, color: number, z: number, stencil: number): number {
         if (this.gpuGone) return 0;
         d3d9PerfInc("clear");
+        if (this.role === "front") {
+            // The GDI overlay is guest-thread state (see the TARGET branch below).
+            if (flags & 1) this.getGdiContext()?.clearOverlay();
+            return 0;
+        }
         // D3D9 clears the VIEWPORT (intersected with the scissor when the test is on), not the
         // whole attachment. A frame-level loadOp cannot be scissored, so anything short of full
         // coverage goes through the rectangle lowering — otherwise a per-viewport clear (shadow
@@ -5900,7 +6323,7 @@ export class D3D9Device {
         // Not clearing the overlay causes text to accumulate (draw over itself),
         // which destroys antialiasing and causes "rough edges".
         const D3DCLEAR_TARGET = 1;
-        if (flags & D3DCLEAR_TARGET) {
+        if ((flags & D3DCLEAR_TARGET) && this.role !== "render") {
             const gdiContext = this.getGdiContext();
             if (gdiContext) {
                 gdiContext.clearOverlay();
@@ -5960,6 +6383,7 @@ export class D3D9Device {
         stencil = 0,
     ): boolean {
         if (this.gpuGone || rects.length === 0) return false;
+        if (this.role === "front") return true;
         if (frameCapture.isCapturing()) {
             const size = this.getCurrentTargetSize();
             frameCapture.recordClearRaw(flags, color, z, stencil,
@@ -6097,18 +6521,32 @@ export class D3D9Device {
     }
 
     reset(pPresentationParameters: number, mem: Uint8Array): number {
-        if (!pPresentationParameters) return 0x8876086c; // D3DERR_INVALIDCALL
+        const params = this.readResetParams(pPresentationParameters, mem);
+        return params ? this.resetFromParams(params) : 0x8876086c; // D3DERR_INVALIDCALL
+    }
 
+    /** The D3DPRESENT_PARAMETERS fields Reset consumes, read at the call. */
+    readResetParams(pPresentationParameters: number, mem: Uint8Array): D3D9ResetParams | null {
+        if (!pPresentationParameters) return null;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const width = Math.max(1, view.getUint32(pPresentationParameters + 0, true) || 800);
-        const height = Math.max(1, view.getUint32(pPresentationParameters + 4, true) || 600);
-        const windowed = view.getUint32(pPresentationParameters + 32, true);
-        const enableAutoDepthStencil = view.getUint32(pPresentationParameters + 36, true);
-        const autoDepthStencilFormat = view.getUint32(pPresentationParameters + 40, true);
-        // Reset re-declares the swap interval (PresentationInterval @ +52) like every other
-        // present parameter — an in-game vsync toggle is exactly this call.
-        this.setPresentationInterval(view.getUint32(pPresentationParameters + 52, true));
-        this.setSwapEffect(readD3d9SwapEffect(view, pPresentationParameters));
+        return {
+            width: Math.max(1, view.getUint32(pPresentationParameters + 0, true) || 800),
+            height: Math.max(1, view.getUint32(pPresentationParameters + 4, true) || 600),
+            windowed: view.getUint32(pPresentationParameters + 32, true),
+            enableAutoDepthStencil: view.getUint32(pPresentationParameters + 36, true),
+            autoDepthStencilFormat: view.getUint32(pPresentationParameters + 40, true),
+            // Reset re-declares the swap interval (PresentationInterval @ +52) like every other
+            // present parameter — an in-game vsync toggle is exactly this call.
+            presentationInterval: view.getUint32(pPresentationParameters + 52, true),
+            swapEffect: readD3d9SwapEffect(view, pPresentationParameters),
+        };
+    }
+
+    resetFromParams(params: D3D9ResetParams | null): number {
+        if (!params) return 0x8876086c;
+        const { width, height, windowed, enableAutoDepthStencil, autoDepthStencilFormat } = params;
+        this.setPresentationInterval(params.presentationInterval);
+        this.setSwapEffect(params.swapEffect);
 
         Logger.log(
             LogCategory.D3D9,
@@ -6118,7 +6556,7 @@ export class D3D9Device {
 
         // Only a FULLSCREEN device sets the display mode. A windowed device's backbuffer is a
         // size inside the desktop; publishing it would make SM_CXSCREEN report the window.
-        System.getInstance().requestHostResize(width, height, { modeSet: windowed === 0 });
+        if (this.role !== "render") System.getInstance().requestHostResize(width, height, { modeSet: windowed === 0 });
         this.deviceIsWindowed = windowed !== 0;
         this.backendExecutor.setGuestBackbufferSize(width, height);
         this.viewport = { x: 0, y: 0, width, height, minZ: 0, maxZ: 1 };
@@ -6126,8 +6564,12 @@ export class D3D9Device {
         return 0; // D3D_OK
     }
 
-    setViewport(pViewport: number, mem: Uint8Array): number {
-        if (!pViewport || !isValidAddress(mem, pViewport, 24)) return 0x8876086c;
+    /** `captured`: the D3DVIEWPORT9 was copied into the WBUF ring by the trampoline, so `mem`
+     *  may be the transport copy and `pViewport` an offset into it — bounds, not the region map. */
+    setViewport(pViewport: number, mem: Uint8Array, captured = false): number {
+        if (captured ? pViewport + 24 > mem.length : (!pViewport || !isValidAddress(mem, pViewport, 24))) {
+            return 0x8876086c;
+        }
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const { w: targetW, h: targetH } = this.getCurrentTargetSize();
         const viewport = sanitizeViewport({
@@ -6147,6 +6589,11 @@ export class D3D9Device {
         }
         this.viewport = viewport;
         return 0;
+    }
+
+    /** ResetEx: put back the exact viewport (depth range included) held across the reset. */
+    restoreViewportSnapshot(viewport: D3D9ViewportValues): void {
+        this.viewport = { ...viewport };
     }
 
     /** Apply a viewport captured by a state block without fabricating a guest pointer. */
@@ -6335,6 +6782,7 @@ export class D3D9Device {
      * be replaced.
      */
     private get gpuGone(): boolean {
+        if (this.splitLossSource) return !this.splitLossSource.isUsable();
         return this.backend.getDevice() === null;
     }
 
@@ -7130,12 +7578,7 @@ export class D3D9Device {
         if (result === 0) {
             this.frameSnapshot.drawCalls++;
             this.frameSnapshot.frameId = ++this.frameIdCounter;
-            this.frameSnapshot.lastDraw = {
-                api: "d3d9",
-                primitiveType: D3DPT_TRIANGLELIST,
-                numVerts: tessellation.vertexCount,
-                timestamp: performance.now(),
-            };
+            this.noteLastDraw(D3DPT_TRIANGLELIST, tessellation.vertexCount);
         }
         return result;
     }
@@ -7143,6 +7586,7 @@ export class D3D9Device {
     drawPrimitive(primitiveType: number, startVertex: number, primitiveCount: number): number {
         if (this.gpuGone) return d3d9DropDraw("drawPrimitive:deviceLost");
         d3d9PerfInc("drawPrimitive");
+        if (this.role === "front") return 0;
         if (frameCapture.isCapturing()) {
             const ss = this.stateTracker.getStreamSource();
             const vb = ss ? this.vertexBuffers.getData(ss.index) : null;
@@ -7264,12 +7708,7 @@ export class D3D9Device {
         // Update frame snapshot for debug panel
         this.frameSnapshot.drawCalls++;
         this.frameSnapshot.frameId = ++this.frameIdCounter;
-        this.frameSnapshot.lastDraw = {
-            api: "d3d9",
-            primitiveType,
-            numVerts: vertexCount,
-            timestamp: performance.now(),
-        };
+        this.noteLastDraw(primitiveType, vertexCount);
 
         if (this.frameSnapshot.frameCounters) {
             this.frameSnapshot.frameCounters.vertexBytes += this.vertexBuffers.getSize(vbIndex) - streamSource.offset;
@@ -7604,9 +8043,12 @@ export class D3D9Device {
         indexIs32: boolean,
         vertexDataPtr: number,
         stride: number,
+        /** Split twin: the index and vertex spans copied at the call; the pointers are offsets into them. */
+        upSources?: { index: Uint8Array; vertex: Uint8Array },
     ): number {
         if (this.gpuGone) return d3d9DropDraw("drawIndexedPrimitiveUP:deviceLost");
         d3d9PerfInc("drawIndexedPrimitiveUP");
+        if (this.role === "front") return 0;
         if (!Number.isSafeInteger(minVertexIndex)
             || !Number.isSafeInteger(numVertices) || numVertices <= 0
             || !Number.isSafeInteger(primitiveCount) || primitiveCount <= 0
@@ -7639,7 +8081,8 @@ export class D3D9Device {
         // One guest-memory snapshot for the whole call: the accessor re-derives the view from
         // v86 on every use (it must never be stored across an await), and a UP draw asked for
         // it five times. Same JS turn, so the view cannot detach underneath us.
-        const guestMem = this.memory;
+        const guestMem = upSources?.vertex ?? this.memory;
+        const idxMem = upSources?.index ?? guestMem;
         const idxSize = indexIs32 ? 4 : 2;
         const vertexLimit = minVertexIndex + numVertices;
         const indexBytes = idxCount * idxSize;
@@ -7650,9 +8093,9 @@ export class D3D9Device {
             || !Number.isSafeInteger(vertexLimit) || vertexLimit <= 0
             || !Number.isSafeInteger(indexBytes) || !Number.isSafeInteger(vertexBytes)
             || !Number.isSafeInteger(captureOffset) || !Number.isSafeInteger(captureBytes)
-            || !isValidAddress(guestMem, indexDataPtr, indexBytes)
-            || !isValidAddress(guestMem, vertexDataPtr, vertexBytes)
-            || !isValidAddress(guestMem, captureOffset, captureBytes)) {
+            || !this.upSourceInRange(idxMem, upSources?.index, indexDataPtr, indexBytes)
+            || !this.upSourceInRange(guestMem, upSources?.vertex, vertexDataPtr, vertexBytes)
+            || !this.upSourceInRange(guestMem, upSources?.vertex, captureOffset, captureBytes)) {
             return d3d9DropDraw("drawIndexedPrimitiveUP:range");
         }
         if (frameCapture.isCapturing()) {
@@ -7670,27 +8113,27 @@ export class D3D9Device {
 
         if (primitiveType === D3DPT_POINTLIST) {
             if (this.isProgrammable() && this.tryDrawIndexedProgrammablePointList(
-                this.memory,
+                idxMem,
                 indexDataPtr,
                 indexIs32,
                 primitiveCount,
                 0,
                 minVertexIndex,
                 numVertices,
-                this.memory,
+                guestMem,
                 vertexDataPtr,
                 stride,
                 UP_STREAM_SLOTS,
             )) return 0;
             const ok = this.tryDrawIndexedPointSprites(
-                this.memory,
+                idxMem,
                 indexDataPtr,
                 indexIs32,
                 primitiveCount,
                 0,
                 minVertexIndex,
                 numVertices,
-                this.memory,
+                guestMem,
                 vertexDataPtr,
                 stride,
                 this.stateTracker.getFVF(),
@@ -7701,7 +8144,7 @@ export class D3D9Device {
         // One scratch, two spans: [0, idxCount) holds the app's indices, [idxCount, …) the
         // per-output-vertex source index after the strip/fan rewind.
         const scratch = this.ensureIndexScratch(idxCount + finalVertexCount);
-        const mem = this.memory;
+        const mem = idxMem;
         for (let i = 0; i < idxCount; i++) {
             const p = indexDataPtr + i * idxSize;
             const v = indexIs32
@@ -7752,25 +8195,30 @@ export class D3D9Device {
         const finalData = this.ensureConversionBuffer(finalVertexCount * stride);
         for (let i = 0; i < finalVertexCount; i++) {
             const src = vertexDataPtr + scratch[o + i]! * stride;
-            finalData.set(mem.subarray(src, src + stride), i * stride);
+            finalData.set(guestMem.subarray(src, src + stride), i * stride);
         }
 
         this.frameSnapshot.drawCalls++;
         this.frameSnapshot.frameId = ++this.frameIdCounter;
-        this.frameSnapshot.lastDraw = {
-            api: "d3d9",
-            primitiveType,
-            numVerts: finalVertexCount,
-            timestamp: performance.now(),
-        };
+        this.noteLastDraw(primitiveType, finalVertexCount);
         // No bound streams take part: a *UP draw supplies its vertices inline.
         this.streamPlan.reset();
         return this.recordConvertedDraw(finalData, finalVertexCount, stride, topology, UP_STREAM_SLOTS);
     }
 
-    drawPrimitiveUP(primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number): number {
+    private upSourceInRange(mem: Uint8Array, source: Uint8Array | undefined, ptr: number, len: number): boolean {
+        return source !== undefined ? ptr >= 0 && ptr + len <= source.length : isValidAddress(mem, ptr, len);
+    }
+
+    /** `ringSource` is the view holding the vertex bytes when they were captured into the WBUF ring
+     *  (guest memory, or the transport copy): our own bytes, bounds-checked. Without it
+     *  `vertexDataPtr` is a guest pointer and is validated against the region map. */
+    drawPrimitiveUP(
+        primitiveType: number, primitiveCount: number, vertexDataPtr: number, stride: number, ringSource?: Uint8Array,
+    ): number {
         if (this.gpuGone) return d3d9DropDraw("drawPrimitiveUP:deviceLost");
         d3d9PerfInc("drawPrimitiveUP");
+        if (this.role === "front") return 0;
         if (!Number.isSafeInteger(primitiveCount) || primitiveCount <= 0) {
             return d3d9DropDraw("drawPrimitiveUP:range");
         }
@@ -7800,10 +8248,10 @@ export class D3D9Device {
                 return d3d9DropDraw("drawPrimitiveUP:unsupportedTopology");
         }
         // One snapshot for the call (see drawIndexedPrimitiveUP).
-        const guestMem = this.memory;
+        const guestMem = ringSource ?? this.memory;
         const sourceByteLen = srcVertexCount * stride;
         if (!Number.isSafeInteger(srcVertexCount) || !Number.isSafeInteger(sourceByteLen)
-            || sourceByteLen <= 0 || !isValidAddress(guestMem, vertexDataPtr, sourceByteLen)) {
+            || sourceByteLen <= 0 || !this.upSourceInRange(guestMem, ringSource, vertexDataPtr, sourceByteLen)) {
             return d3d9DropDraw("drawPrimitiveUP:range");
         }
         // harness capture (UP renders non-trilist too)
@@ -7820,7 +8268,7 @@ export class D3D9Device {
         if (this.npatchMode > 1.0) {
             if (primitiveType !== D3DPT_TRIANGLELIST) return d3d9DropDraw("drawPrimitiveUP:npatchTopology");
             if (!Number.isSafeInteger(vertexDataPtr) || vertexDataPtr < 0 || stride <= 0
-                || !isValidAddress(guestMem, vertexDataPtr, primitiveCount * 3 * stride)) {
+                || !this.upSourceInRange(guestMem, ringSource, vertexDataPtr, primitiveCount * 3 * stride)) {
                 return d3d9DropDraw("drawPrimitiveUP:npatchRange");
             }
             const source = guestMem.subarray(vertexDataPtr, vertexDataPtr + primitiveCount * 3 * stride);
@@ -7831,7 +8279,7 @@ export class D3D9Device {
         // point count equals primitiveCount for a point list. Falls through only if the
         // programmable/declaration or FFP lowering could not validate the source payload.
         if (primitiveType === D3DPT_POINTLIST) {
-            if (!isValidAddress(guestMem, vertexDataPtr, primitiveCount * stride)) {
+            if (!this.upSourceInRange(guestMem, ringSource, vertexDataPtr, primitiveCount * stride)) {
                 return d3d9DropDraw("drawPrimitiveUP:range");
             }
             const srcBytes = guestMem.subarray(vertexDataPtr, vertexDataPtr + primitiveCount * stride);
@@ -7843,7 +8291,7 @@ export class D3D9Device {
         }
 
         // Read source vertices from memory
-        const srcData = this.memory.subarray(vertexDataPtr, vertexDataPtr + sourceByteLen);
+        const srcData = guestMem.subarray(vertexDataPtr, vertexDataPtr + sourceByteLen);
 
         // Convert to triangle list if needed (WebGPU doesn't support TRIANGLEFAN)
         let finalData: Uint8Array;
@@ -7968,12 +8416,7 @@ export class D3D9Device {
         // Update frame snapshot for debug panel
         this.frameSnapshot.drawCalls++;
         this.frameSnapshot.frameId = ++this.frameIdCounter;
-        this.frameSnapshot.lastDraw = {
-            api: "d3d9",
-            primitiveType,
-            numVerts: srcVertexCount,
-            timestamp: performance.now(),
-        };
+        this.noteLastDraw(primitiveType, srcVertexCount);
 
         return 0;
     }
@@ -8001,6 +8444,10 @@ export class D3D9Device {
         startIndex: number,
         primitiveCount: number
     ): number {
+        if (this.role === "front") {
+            if (!this.gpuGone) d3d9PerfInc("drawIndexedPrimitive");
+            return 0;
+        }
         const dropsBefore = d3d9DroppedDrawTotal();
         this.indexedDrawFate = "";
         // The attribution has to survive an EXCEPTION, not just a return: the api counter is
@@ -8033,6 +8480,30 @@ export class D3D9Device {
 
     /** DrawIndexedPrimitive calls that unwound. Logged once, counted always. */
     private indexedDrawThrows = 0;
+
+    private fillIndexedArenaSpec(
+        topology: number, indexCount: number, startIndex: number, baseVertex: number, stride: number,
+    ): ArenaRecordSpec {
+        const spec = this.indexedArenaSpec;
+        spec.topology = topology;
+        spec.indexCount = indexCount;
+        spec.startIndex = startIndex;
+        spec.baseVertex = baseVertex;
+        spec.stride = stride;
+        spec.forceCullNone = false;
+        return spec;
+    }
+
+    /** The debug monitor structured-clones the snapshot when it posts it, so the one object
+     *  can be rewritten per draw. `timestamp` is -1 until the frame's Present stamps it. */
+    private noteLastDraw(primitiveType: number, numVerts: number, numIndices?: number): void {
+        const d = this.lastDrawSnapshot;
+        d.primitiveType = primitiveType;
+        d.numVerts = numVerts;
+        d.numIndices = numIndices;
+        d.timestamp = -1;
+        this.frameSnapshot.lastDraw = d;
+    }
 
     private drawIndexedPrimitiveImpl(
         primitiveType: number,
@@ -8173,7 +8644,7 @@ export class D3D9Device {
             pipelineId = this.resolveProgrammablePipeline(
                 topology, false, undefined, slotMask, false,
                 !instancing.instanced && baseVertexIndex >= 0 && slotMask === 1
-                    ? { kind: "indexed", topology: arenaTopology, indexCount, startIndex, baseVertex: baseVertexIndex, stride: streamSource.stride, forceCullNone: false }
+                    ? this.fillIndexedArenaSpec(arenaTopology, indexCount, startIndex, baseVertexIndex, streamSource.stride)
                     : undefined,
             );
             arenaRecord = this.takePendingArenaRecord();
@@ -8210,22 +8681,28 @@ export class D3D9Device {
             );
         }
         this.indexedDrawFate = "encoded";
-        this.commandRecorder.recordDrawIndexed({
-            pipelineId,
-            streams: plan,
-            ibGpuBuffer: ibBuffer,
-            ibFormat: this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16 ? "uint16" : "uint32",
-            indexCount,
-            startIndex,
-            baseVertex: baseVertexIndex,
-            instanceCount: instancing.instanceCount,
-            bindStateIndex,
-            ffpStateIndex,
-            scissorRect: this.getScissorRectForDraw(),
-            viewport: this.viewport,
-            stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
-            blendConstant: this.getRS(D3DRS_BLENDFACTOR) >>> 0,
-        });
+        let cmd = this.drawIndexedCmd;
+        if (!cmd) {
+            cmd = this.drawIndexedCmd = {
+                pipelineId: 0, streams: plan, ibGpuBuffer: ibBuffer, ibFormat: "uint16",
+                indexCount: 0, startIndex: 0, baseVertex: 0,
+            };
+        }
+        cmd.pipelineId = pipelineId;
+        cmd.streams = plan;
+        cmd.ibGpuBuffer = ibBuffer;
+        cmd.ibFormat = this.indexBuffers.getFormat(ibIndex) === D3DFMT_INDEX16 ? "uint16" : "uint32";
+        cmd.indexCount = indexCount;
+        cmd.startIndex = startIndex;
+        cmd.baseVertex = baseVertexIndex;
+        cmd.instanceCount = instancing.instanceCount;
+        cmd.bindStateIndex = bindStateIndex;
+        cmd.ffpStateIndex = ffpStateIndex;
+        cmd.scissorRect = this.getScissorRectForDraw();
+        cmd.viewport = this.viewport;
+        cmd.stencilReference = this.getRS(D3DRS_STENCILREF) & 0xff;
+        cmd.blendConstant = this.getRS(D3DRS_BLENDFACTOR) >>> 0;
+        this.commandRecorder.recordDrawIndexed(cmd);
         this.linkArenaDraw(
             arenaRecord?.commandStart ?? -1, arenaRecord?.key, pipelineId, bindStateIndex,
             arenaRecord?.identity.words, arenaRecord?.identity.key,
@@ -8238,13 +8715,7 @@ export class D3D9Device {
         // Update frame snapshot for debug panel
         this.frameSnapshot.drawCalls++;
         this.frameSnapshot.frameId = ++this.frameIdCounter;
-        this.frameSnapshot.lastDraw = {
-            api: "d3d9",
-            primitiveType,
-            numVerts: numVertices,
-            numIndices: indexCount,
-            timestamp: performance.now(),
-        };
+        this.noteLastDraw(primitiveType, numVertices, indexCount);
         
         if (this.frameSnapshot.frameCounters) {
             this.frameSnapshot.frameCounters.vertexBytes += 
@@ -8272,7 +8743,7 @@ export class D3D9Device {
             .__d3d9CompactProfile === true;
         const tryStarted = phaseProfile ? performance.now() : 0;
         if ((globalThis as { __noD3D9ArenaRuns?: boolean }).__noD3D9ArenaRuns === true
-            || pairCount < 2 || this.gpuGone || frameCapture.isCapturing()
+            || this.role !== "both" || pairCount < 2 || this.gpuGone || frameCapture.isCapturing()
             || this.recordingStateBlock || this.softwareVertexProcessing
             || this.npatchMode > 1.0 || this.scrubbedOut()
             || !d3d9WasmArena.supportsWbufIndexedRuns()) return false;
@@ -8562,13 +9033,7 @@ export class D3D9Device {
         this.drawCount += pairCount + prefixCount;
         this.frameSnapshot.drawCalls += pairCount + prefixCount;
         this.frameSnapshot.frameId = ++this.frameIdCounter;
-        this.frameSnapshot.lastDraw = {
-            api: "d3d9",
-            primitiveType: D3DPT_TRIANGLELIST,
-            numVerts: mem32[lastDrawWord + 5] >>> 0,
-            numIndices: (mem32[lastDrawWord + 7] >>> 0) * 3,
-            timestamp: performance.now(),
-        };
+        this.noteLastDraw(D3DPT_TRIANGLELIST, mem32[lastDrawWord + 5] >>> 0, (mem32[lastDrawWord + 7] >>> 0) * 3);
         if (phaseProfile) this.wbufRunPublishMs += performance.now() - phaseStarted;
         this.wbufRunAccepted++;
         if (phaseProfile) this.wbufRunTryMs += performance.now() - tryStarted;
@@ -8601,15 +9066,19 @@ export class D3D9Device {
         // (which the app polls for exactly this) already says so — see the loss contract.
         if (this.gpuGone) return 0x88760868;
         const presentStart = frameProfiler.startTimer();
+        const guestSide = this.role !== "render";
 
         // Frame Pacer: hold for the swap interval the device was created with. An rAF permit,
         // not a GPU fence — counted apart from the readback fences for exactly that reason.
-        d3d9NoteFence("presentPermit");
-        await framePacer.waitForPresentInterval(this.presentInterval);
-        framePacer.reserveFrameSlot();
+        if (guestSide) {
+            if (this.splitPresentGate) await this.splitPresentGate();
+            d3d9NoteFence("presentPermit");
+            await framePacer.waitForPresentInterval(this.presentInterval);
+            framePacer.reserveFrameSlot();
+        }
 
         this.lastActualPresent = performance.now();
-        this.fetchAuditOnPresent();
+        if (this.role !== "front") this.fetchAuditOnPresent();
         // Defensive: if the guest left an RT bound at Present, flush its work to that RT, then
         // return authority to the backbuffer so the present actually copies the scene to the canvas.
         if (this.renderTargetIndices.some(index => index !== null)) {
@@ -8621,20 +9090,37 @@ export class D3D9Device {
             this.invalidateLastResolve();
         }
         this.submitFrame(true);
-        this.updateFps();
-        const renderSvc = System.getInstance().services.render;
-        renderSvc.notifyPresent("d3d9");
-        // Close the render-boundary census frame on the same edge the serial advances, so a
-        // per-frame row and its serial can never come from different boundaries.
-        d3d9NoteRenderFrameBoundary(renderSvc.getGuestPresentSerial());
-        frameCapture.onFrameEnd("d3d9"); // harness CaptureBus frame boundary (D3D9)
+        this.presentBoundarySerial++;
+        if (this.role !== "front") this.updateFps();
+        // An in-process twin drew to the canvas just now, during the front's recorder flush —
+        // the front resumes only after its pacer wait, often in a later task. The canvas edge
+        // (screenshot mirror: getCurrentTexture) must be taken in THIS task: taken later it
+        // acquires a fresh swap texture, which is then presented blank (a black frame).
+        if (this.role === "render" && !this.backendExecutor.hasFrameSink()) {
+            System.getInstance().services.render.notifyCanvasPresent("d3d9");
+        }
+        if (guestSide) {
+            const renderSvc = System.getInstance().services.render;
+            // A handed-off frame brings the canvas edge with it when it reaches the screen,
+            // and an in-process twin that draws to the canvas brings it itself (above).
+            if (this.splitFramesRemote || this.renderTwin) renderSvc.notifyGuestPresent();
+            else renderSvc.notifyPresent("d3d9");
+            // Close the render-boundary census frame on the same edge the serial advances, so a
+            // per-frame row and its serial can never come from different boundaries.
+            d3d9NoteRenderFrameBoundary(renderSvc.getGuestPresentSerial());
+            frameCapture.onFrameEnd("d3d9"); // harness CaptureBus frame boundary (D3D9)
+        }
 
         // Update frame snapshot for debug panel
         this.frameSnapshot.presents++;
         this.frameSnapshot.frameId = ++this.frameIdCounter;
+        const presentedAt = performance.now();
         this.frameSnapshot.lastPresent = {
-            timestamp: performance.now(),
+            timestamp: presentedAt,
         };
+        // The last draw is stamped with the present that closed its frame: a clock read per
+        // draw cost more than everything else the debug snapshot records.
+        if (this.lastDrawSnapshot.timestamp < 0) this.lastDrawSnapshot.timestamp = presentedAt;
 
         // Reset frame counters for next frame
         if (this.frameSnapshot.frameCounters) {
@@ -8650,18 +9136,20 @@ export class D3D9Device {
         this.frameSnapshot.drawCalls = 0;
         d3d9ResetDropDrawWarnings();
 
-        frameProfiler.endTimer("present", presentStart);
-        frameProfiler.markFrame("d3d9");
+        if (guestSide) {
+            frameProfiler.endTimer("present", presentStart);
+            frameProfiler.markFrame("d3d9");
 
-        // Feed frame time to stats overlay
-        const now = performance.now();
-        if (this.prevPresentTime > 0) {
-            statsOverlay.updateMetrics(now - this.prevPresentTime);
+            // Feed frame time to stats overlay
+            const now = performance.now();
+            if (this.prevPresentTime > 0) {
+                statsOverlay.updateMetrics(now - this.prevPresentTime);
+            }
+            this.prevPresentTime = now;
+
+            // Release frame slot for FramePacer
+            framePacer.releaseFrameSlot();
         }
-        this.prevPresentTime = now;
-
-        // Release frame slot for FramePacer
-        framePacer.releaseFrameSlot();
 
         return 0;
     }
@@ -8883,6 +9371,9 @@ export class D3D9Device {
             if (dstIndex === null || this.textures.isRenderTarget(dstIndex)) return false;
             const destinationPixels = this.getTextureLevelPixels(dst.texturePtr, 0);
             if (!destinationPixels) return false;
+            if (this.role === "front") {
+                return this.adoptTwinReadback(dst.texturePtr, "stretchRect").then((answer) => answer === true);
+            }
             return this.readRenderTargetRgba(src.texturePtr).then((sourcePixels) => {
                 if ('err' in sourcePixels) return false;
                 const copied = copyD3D9SurfaceRectCpu(
@@ -8934,6 +9425,8 @@ export class D3D9Device {
             }
         }
 
+        // A GPU-to-GPU stretch is the twin's; the front has no GPU objects to resolve.
+        if (this.role === "front") return true;
         this.submitFrame(false);
         const resolve = (surface: NonNullable<typeof src>):
             { view: GPUTextureView; width: number; height: number; format?: GPUTextureFormat } | null => {
@@ -8974,6 +9467,8 @@ export class D3D9Device {
             const size = this.backendExecutor.getGuestBackbufferSize();
             if (size.width <= 0 || size.height <= 0) return false;
             const effectiveRect = rect ?? { left: 0, top: 0, right: size.width, bottom: size.height };
+            // The fill is GPU work, the twin's (a split front has no backbuffer of its own).
+            if (this.role === "front") return true;
             // Flush preceding draws before the direct offscreen fill, preserving command order
             // even when ColorFill targets a sub-rect of the implicit backbuffer.
             this.submitFrame(false);
@@ -8987,6 +9482,7 @@ export class D3D9Device {
 
         const gpuTex = this.textures.getGpuTexture(index);
         if (this.textures.isRenderTarget(index) || (gpuTex && !this.textures.getData(index))) {
+            if (this.role === "front") return true;
             if (!gpuTex) return false;
             const device = this.backend.getDevice();
             const queue = this.backend.getQueue();
@@ -10965,13 +11461,14 @@ export class D3D9Device {
         const index = frame.drawStateCount;
         const state = frame.nextDrawState(vsLen, psLen);
 
-        const { dx, dy } = pixelCenterClipOffset(this.viewport.width, this.viewport.height,
-            this.activeRenderScale());
+        const renderScale = this.activeRenderScale();
+        const dx = pixelCenterClipDx(this.viewport.width, renderScale);
+        const dy = pixelCenterClipDy(this.viewport.height, renderScale);
         // Only the hidden tail needs zeroing: the c# prefix below is overwritten wholesale by
         // the bank copy, and this slot is reused for every draw in the frame — clearing the
         // whole block first meant writing the constant bank twice on every draw.
         state.vsConst.fill(0, vsConstantLen, vsLen);
-        if (vs) state.vsBits.set(this.vsConstantBits.subarray(0, vsConstantLen), 0);
+        if (vs) state.vsBits.set(prefixView(this.vsConstantBits, vsConstantLen), 0);
         state.vsConst[vsConstantLen + 0] = dx;
         state.vsConst[vsConstantLen + 1] = dy;
         // The hidden c[] tail is also the point-expansion sidecar: programmable point-list
@@ -11061,11 +11558,7 @@ export class D3D9Device {
         // Effective cube mask = shader dcl_cube ∪ stages with a cube texture bound. MUST equal the
         // mask resolveProgrammablePipeline used to build the pipeline layout (same derivation) so
         // the per-draw bind group stays compatible.
-        const comparisonSamplers = ps
-            ? this.boundComparisonSamplers()
-            : new Map<number, { clampDref?: boolean }>();
-        let comparisonMask = 0;
-        for (const stage of comparisonSamplers.keys()) comparisonMask |= 1 << stage;
+        const comparisonMask = ps ? this.boundComparisonMask() : 0;
         const cubeMask = (computeCubeMask(ps) | this.boundCubeMask()) & ~comparisonMask;
         const volumeMask = ps ? ((computeVolumeMask(ps) | this.boundVolumeMask()) & ~comparisonMask) : 0;
         const vertexVolumeMask = vs ? (computeVertexVolumeMask(vs) | this.boundVertexVolumeMask()) : 0;
@@ -11218,8 +11711,10 @@ export class D3D9Device {
             const cLen = previous.vsLen - SHADER_INTEGER_REGISTER_COUNT * 4 - SHADER_BOOLEAN_BANK_BYTES / 4;
             const key = this.copyProgrammableBankWithKey(state.vsBits, state.vsBits, cLen,
                 this.vsIntegerBits, this.vsBooleanMask, this.vsConstantBits, prefix);
-            const { dx, dy } = pixelCenterClipOffset(this.viewport.width, this.viewport.height, this.activeRenderScale());
-            state.vsVersion = withPixelCenterVersion(key, dx, dy);
+            const renderScale = this.activeRenderScale();
+            state.vsVersion = withPixelCenterVersion(key,
+                pixelCenterClipDx(this.viewport.width, renderScale),
+                pixelCenterClipDy(this.viewport.height, renderScale));
         }
         if (this.lastCapturePsVersion !== this.psConstantsVersion) {
             const cLen = Math.max(1, Math.min(ps.analysis.constantCount, PS_FLOAT_REGISTER_COUNT)) * 4;
@@ -11525,6 +12020,7 @@ export class D3D9Device {
     }
 
     private submitFrame(present: boolean): void {
+        if (this.role === "front") return;
         if (!this.commandRecorder.hasWork() && !present) {
             return;
         }
@@ -11567,7 +12063,7 @@ export class D3D9Device {
                 p: ++this.frameLogSerial,
                 hasClear: frame.hasClear,
                 flags: frame.clear.flags,
-                cmds: frame.commandTypes.length,
+                cmds: frame.commandCount,
                 draws: this.frameSnapshot.drawCalls,
                 color: `${c.r.toFixed(2)},${c.g.toFixed(2)},${c.b.toFixed(2)}`,
                 rtSets: this.rtSetsThisFrame,
@@ -11747,7 +12243,12 @@ export class D3D9Device {
         const textureView = this.resolveCurrentTexture();
         const system = System.getInstance();
         const gdiContext = this.getGdiContext();
-        const composit = present && !hasExplicitTarget;
+        if (present && this.role === "render") this.backendExecutor.syncInProcessScreenLayer(this);
+        // A handed-off frame is composited where it arrives (D3D9ScreenLayer), which also
+        // makes the overlay decision and acknowledges it; nothing of the screen is decided here.
+        const handedOff = present && this.backendExecutor.hasFrameSink();
+        if (handedOff) this.backendExecutor.setPresentDrawCount(this.getLastPresentDrawCount());
+        const composit = present && !hasExplicitTarget && !handedOff;
         // The video plane's single shared policy (getVideoPlanePlan) — an explicit render
         // target is not the screen, so nothing is composited over it either way.
         const videoPlan = composit ? getVideoPlanePlan() : null;
@@ -11793,7 +12294,7 @@ export class D3D9Device {
         // safe to reuse without a GPU fence.
         releasePooledBuffers();
 
-        if (present) {
+        if (present && !handedOff) {
             if (videoOverlayCanvas && videoPlan) {
                 notifyVideoPlaneComposited(videoPlan);
             }
@@ -12154,8 +12655,9 @@ export class D3D9Device {
      */
     private ensureCubeTexture(index: number, device: GPUDevice): void {
         let gpuTexture = this.textures.getGpuTexture(index);
-        if (!gpuTexture) return; // created eagerly in createCubeTexture; defensive only
-        if (!this.textures.isDirty(index)) return;
+        // A missing GPU object is a device loss: MANAGED faces live on in cubeFaceData and
+        // dropGpuResources re-raised `dirty`, so the chain is rebuilt below like any resize.
+        if (gpuTexture && !this.textures.isDirty(index)) return;
 
         const handle = this.textures.getHandle(index);
         const format = this.textures.getFormat(index);
@@ -12171,8 +12673,9 @@ export class D3D9Device {
         const isRenderTarget = this.textures.isRenderTarget(index);
         const gpuFormat = this.sampledCubeGpuFormat(format);
         const floatPolicy = gpuFormat === "rgba8unorm" ? null : resolveD3D9FloatTexturePolicy(format);
-        const levels = isRenderTarget ? gpuTexture.mipLevelCount : authoredLevels;
-        if (!isRenderTarget && gpuTexture.mipLevelCount !== levels) {
+        if (isRenderTarget && !gpuTexture) return; // ensureTexture's RT branch owns attachments
+        const levels = isRenderTarget ? gpuTexture!.mipLevelCount : authoredLevels;
+        if (!gpuTexture || (!isRenderTarget && gpuTexture.mipLevelCount !== levels)) {
             const replacement = device.createTexture({
                 size: {
                     width: this.textures.getWidth(index),
@@ -12440,16 +12943,16 @@ export class D3D9Device {
                             const start = ranges[idx * 2]!;
                             const count = ranges[idx * 2 + 1]!;
                             const floats = views.constPool.subarray(val, val + count);
-                            if (kind === 2) this.setVertexShaderConstantFFromArray(start, floats, this.memory);
-                            else this.setPixelShaderConstantFFromArray(start, floats, this.memory);
+                            if (kind === 2) this.setVertexShaderConstantFFromArray(start, floats, NO_GUEST_MEMORY);
+                            else this.setPixelShaderConstantFFromArray(start, floats, NO_GUEST_MEMORY);
                         }
                     }
                 }
                 if (data.handleEntries && data.handleEntries.length > 0) {
-                    applyStateBlockEntries(this, data.handleEntries, this.memory);
+                    applyStateBlockEntries(this, data.handleEntries, NO_GUEST_MEMORY);
                 }
             } else {
-                applyStateBlockEntries(this, data.entries, this.memory);
+                applyStateBlockEntries(this, data.entries, NO_GUEST_MEMORY);
             }
         } finally {
             this.suppressStateBlockRecording = false;

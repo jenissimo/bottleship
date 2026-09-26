@@ -25,15 +25,21 @@ const messages = new Map<string, { kind: GpuErrorKind; site: string; count: numb
 /** Set only when a distinct message was actually turned away, never merely because the
  *  table filled — "we are hiding something" must not be reported on a hunch. */
 let distinctDropped = false;
+/** Set in a worker whose census is not the one `report()` reads (the D3D9 render worker):
+ *  every record is also handed to it, to be carried back to the emulator worker. */
+let forwarder: ((kind: GpuErrorKind, site: string, message: string) => void) | null = null;
 
-export function recordGpuError(kind: GpuErrorKind, site: string, message: string): void {
-    counts[kind]++;
-    bySite[site] = (bySite[site] ?? 0) + 1;
+export function setGpuErrorForwarder(fn: typeof forwarder): void { forwarder = fn; }
+
+export function recordGpuError(kind: GpuErrorKind, site: string, message: string, count = 1): void {
+    forwarder?.(kind, site, message);
+    counts[kind] += count;
+    bySite[site] = (bySite[site] ?? 0) + count;
     const key = `${kind}|${site}|${message}`;
     const seen = messages.get(key);
-    if (seen) { seen.count++; return; }
+    if (seen) { seen.count += count; return; }
     if (messages.size >= MAX_DISTINCT) { distinctDropped = true; return; }
-    messages.set(key, { kind, site, count: 1, message });
+    messages.set(key, { kind, site, count, message });
 }
 
 export interface GpuErrorReport {

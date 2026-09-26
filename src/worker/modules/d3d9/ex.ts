@@ -38,6 +38,7 @@ import {
     validatePresentExFlags,
 } from './swapchain';
 import { notifyDeviceSubmission } from './query';
+import { releaseBindingRef } from './com-refs';
 import { isDxDisplayFormat } from '../../backends/webgpu/shared/dx-format-support';
 import { parsePresentationParameters9, validatePresentationParameters9 } from '../../backends/webgpu/d3d9/presentation';
 import {
@@ -86,8 +87,9 @@ function promoteDeviceToEx(devicePtr: number): boolean {
     const key = devicePtr >>> 0;
     const exVtable = getVTables()['IDirect3DDevice9Ex']?.address ?? 0;
     if (!key || !exVtable || !Mem.writeUint32(key, exVtable)) return false;
-    const device = devices.get(key) as unknown as ({ isExtended?: boolean } | undefined);
+    const device = devices.get(key) as unknown as ({ isExtended?: boolean; renderTwin?: { isExtended?: boolean } | null } | undefined);
     if (device) device.isExtended = true;
+    if (device?.renderTwin) device.renderTwin.isExtended = true;
     extendedDevices.add(key);
     return true;
 }
@@ -109,7 +111,7 @@ function resetExDevice(devicePtr: number, pPresentationParameters: number, mem: 
         setDepthStencilTexture?: (texturePtr: number) => number;
         reset?: (parameters: number, memory: Uint8Array) => number;
         getViewport?: () => { x: number; y: number; width: number; height: number; minZ: number; maxZ: number };
-        viewport?: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number };
+        restoreViewportSnapshot?: (viewport: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number }) => void;
     } | undefined);
     if (!device || !pPresentationParameters) return D3DERR_INVALIDCALL;
     const params = parsePresentationParameters9(mem, pPresentationParameters);
@@ -124,7 +126,7 @@ function resetExDevice(devicePtr: number, pPresentationParameters: number, mem: 
     // the module's binding slots so the next frame starts unbound.
     for (let index = 0; index < 4; index++) device.setRenderTarget?.(index, 0, -1, 0);
     device.setDepthStencilTexture?.(0);
-    for (const held of takeAllDeviceSlotRefs(devicePtr)) releaseComRef(held);
+    for (const held of takeAllDeviceSlotRefs(devicePtr)) releaseBindingRef(held);
     deviceBoundDepthStencil.delete(devicePtr >>> 0);
     clearDeviceRenderTargets(devicePtr);
 
@@ -133,7 +135,7 @@ function resetExDevice(devicePtr: number, pPresentationParameters: number, mem: 
         // D3D9Ex preserves the viewport's depth range across ResetEx.  The
         // backend stores this state on the device; restore the complete snapshot
         // after reset so x/y/extent and MinZ/MaxZ remain coherent together.
-        device.viewport = { ...viewport };
+        device.restoreViewportSnapshot?.(viewport);
     }
     return result;
 }

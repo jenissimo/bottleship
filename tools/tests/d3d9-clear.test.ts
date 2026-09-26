@@ -51,7 +51,7 @@ describe("RenderFrame clear submission boundaries", () => {
 
         expect(first.hasClear).toBe(true);
         expect(first.clear.flags).toBe(1 | 2);
-        expect(first.commandTypes).toContain(RenderCommandType.Draw);
+        expect(first.commandTypes.slice(0, first.commandCount)).toContain(RenderCommandType.Draw);
         expect(second.clear.flags).toBe(2);
         expect(second.clear.depth).toBe(0.75);
     });

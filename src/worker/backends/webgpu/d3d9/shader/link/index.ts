@@ -98,32 +98,37 @@ export function compilePixelShader(tokens: Uint32Array): CompiledPs {
  * pipeline layout and the bound group never drift.
  */
 export function computeCubeMask(ps: CompiledPs | null): number {
-    if (!ps) return 0;
-    let mask = 0;
-    for (const [stage, t] of ps.analysis.samplerTexType ?? []) {
-        if (stage < PROG_BIND.MAX_TEX && t === TexType.CUBE) mask |= (1 << stage);
-    }
-    return mask;
+    return ps ? samplerTypeMasks(ps.analysis.samplerTexType).cube : 0;
 }
 
 /** Bitmask of fragment sampler stages declared as D3D volume (3-D) textures. */
 export function computeVolumeMask(ps: CompiledPs | null): number {
-    if (!ps) return 0;
-    let mask = 0;
-    for (const [stage, t] of ps.analysis.samplerTexType ?? []) {
-        if (stage < PROG_BIND.MAX_TEX && t === TexType.VOLUME) mask |= (1 << stage);
-    }
-    return mask;
+    return ps ? samplerTypeMasks(ps.analysis.samplerTexType).volume : 0;
 }
 
 /** Bitmask of VS vertex-texture stages declared as D3D volume textures. */
 export function computeVertexVolumeMask(vs: CompiledVs | null): number {
-    if (!vs) return 0;
-    let mask = 0;
-    for (const [stage, t] of vs.analysis.samplerTexType ?? []) {
-        if (stage < 4 && t === TexType.VOLUME) mask |= (1 << stage);
+    return vs ? samplerTypeMasks(vs.analysis.samplerTexType).vertexVolume : 0;
+}
+
+interface SamplerTypeMasks { cube: number; volume: number; vertexVolume: number }
+const NO_SAMPLER_TYPES: SamplerTypeMasks = { cube: 0, volume: 0, vertexVolume: 0 };
+/** A program's declared sampler types never change after analysis, and the three masks are
+ *  asked for on every draw — walking the Map there allocated an entry pair per stage. */
+const samplerTypeMaskCache = new WeakMap<Map<number, number>, SamplerTypeMasks>();
+function samplerTypeMasks(types: Map<number, number> | undefined): SamplerTypeMasks {
+    if (!types) return NO_SAMPLER_TYPES;
+    let masks = samplerTypeMaskCache.get(types);
+    if (!masks) {
+        masks = { cube: 0, volume: 0, vertexVolume: 0 };
+        for (const [stage, t] of types) {
+            if (stage < PROG_BIND.MAX_TEX && t === TexType.CUBE) masks.cube |= (1 << stage);
+            if (stage < PROG_BIND.MAX_TEX && t === TexType.VOLUME) masks.volume |= (1 << stage);
+            if (stage < 4 && t === TexType.VOLUME) masks.vertexVolume |= (1 << stage);
+        }
+        samplerTypeMaskCache.set(types, masks);
     }
-    return mask;
+    return masks;
 }
 
 /** Why a requested link variant could not be generated. */

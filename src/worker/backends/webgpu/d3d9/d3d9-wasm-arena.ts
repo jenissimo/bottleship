@@ -190,6 +190,8 @@ class D3D9WasmArena {
     private shaderConstLenPs!: Uint16Array; // [1024]
     private vsConstants!: Float32Array;
     private psConstants!: Float32Array;
+    private vsConstantBits!: Uint32Array;
+    private psConstantBits!: Uint32Array;
     private constVersions!: Uint32Array; // [vsConstVersion, psConstVersion]
     private pipelineIdentity!: Uint32Array; // canonical programmable pipeline identity [16]
     private commandTypes!: Uint32Array;
@@ -239,6 +241,11 @@ class D3D9WasmArena {
         if (this.declineLogged) return;
         this.declineLogged = true;
         console.warn(`[D3D9 arena] disabled: ${reason}`);
+    }
+
+    /** Split D3D9: one live mirror cannot serve a front and a twin that is behind it. */
+    suspend(): void {
+        this.initialized = false;
     }
 
     initialize(cpu: any): void {
@@ -326,6 +333,8 @@ class D3D9WasmArena {
         this.shaderConstLenPs = new Uint16Array(buf, b + layout[LayoutIdx.ShaderConstLenPs], D3D9_ARENA_SHADER_HANDLE_SLOTS);
         this.vsConstants = new Float32Array(buf, b + layout[LayoutIdx.VsConstants], D3D9_ARENA_VS_CONST_FLOATS);
         this.psConstants = new Float32Array(buf, b + layout[LayoutIdx.PsConstants], D3D9_ARENA_PS_CONST_FLOATS);
+        this.vsConstantBits = new Uint32Array(buf, b + layout[LayoutIdx.VsConstants], D3D9_ARENA_VS_CONST_FLOATS);
+        this.psConstantBits = new Uint32Array(buf, b + layout[LayoutIdx.PsConstants], D3D9_ARENA_PS_CONST_FLOATS);
         this.constVersions = new Uint32Array(buf, b + layout[LayoutIdx.VsConstVersion], 2);
         this.pipelineIdentity = new Uint32Array(buf, b + layout[LayoutIdx.PipelineIdentity], 16);
         this.commandTypes = new Uint32Array(buf, b + layout[LayoutIdx.CmdTypes], cap);
@@ -437,6 +446,23 @@ class D3D9WasmArena {
     setPixelShaderConstantF(startFloat: number, data: Float32Array): void {
         this.ensureFresh();
         this.psConstants.set(data, startFloat);
+        this.constVersions[1] = (this.constVersions[1] + 1) >>> 0;
+    }
+
+    /** Mirror `count` words of a device constant bank at the same float index, bit-exact.
+     *  This is the per-SetShaderConstantF path (thousands a frame), so it takes the bank and
+     *  a range rather than a subarray view the caller would have to allocate per call. */
+    setVertexShaderConstantBits(startFloat: number, bank: Uint32Array, count: number): void {
+        this.ensureFresh();
+        const dst = this.vsConstantBits;
+        for (let i = startFloat, end = startFloat + count; i < end; i++) dst[i] = bank[i];
+        this.constVersions[0] = (this.constVersions[0] + 1) >>> 0;
+    }
+
+    setPixelShaderConstantBits(startFloat: number, bank: Uint32Array, count: number): void {
+        this.ensureFresh();
+        const dst = this.psConstantBits;
+        for (let i = startFloat, end = startFloat + count; i < end; i++) dst[i] = bank[i];
         this.constVersions[1] = (this.constVersions[1] + 1) >>> 0;
     }
 

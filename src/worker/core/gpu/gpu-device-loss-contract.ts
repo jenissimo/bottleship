@@ -8,8 +8,9 @@
  * DDERR_SURFACELOST and the app calls Restore()/RestoreAllSurfaces().
  *
  * Both reduce to one question — "is what you are holding older than the current device?" —
- * so both are answered from `gpuDeviceLifecycle.generation()` and nothing else. A device or
- * surface acknowledges a generation; anything acknowledging an older one is lost.
+ * so both are answered from the owning GPUDevice's generation (`gpuDeviceLifecycle`, unless a
+ * device names another source) and nothing else. A device or surface acknowledges a
+ * generation; anything acknowledging an older one is lost.
  *
  * WHAT SURVIVES A LOSS, and why the two APIs answer differently:
  *   - d3d9/d3d8 textures and vertex/index buffers keep a CPU shadow in their stores, so we
@@ -37,16 +38,35 @@ export type CooperativeLevel =
     /** A device exists; the app must release default-pool resources and Reset. */
     | "notreset";
 
+/**
+ * The GPUDevice a guest device's contents live on. This worker's own device by default; a split
+ * D3D9 front renders on the render worker's device, which is lost and recreated independently
+ * of this one (render/d3d9-remote-state.ts mirrors it).
+ */
+export interface DeviceLossSource {
+    generation(): number;
+    isUsable(): boolean;
+}
+
 /** deviceKey (the guest COM pointer) -> the generation that device last acknowledged. */
 const acknowledged = new Map<number, number>();
+const sources = new Map<number, DeviceLossSource>();
+
+function sourceOf(key: number): DeviceLossSource {
+    return sources.get(key) ?? gpuDeviceLifecycle;
+}
 
 /** Called when a device object is created, so it starts life current. */
-export function registerLossTrackedDevice(deviceKey: number): void {
-    acknowledged.set(deviceKey >>> 0, gpuDeviceLifecycle.generation());
+export function registerLossTrackedDevice(deviceKey: number, source?: DeviceLossSource): void {
+    const key = deviceKey >>> 0;
+    if (source) sources.set(key, source);
+    else sources.delete(key);
+    acknowledged.set(key, sourceOf(key).generation());
 }
 
 export function forgetLossTrackedDevice(deviceKey: number): void {
     acknowledged.delete(deviceKey >>> 0);
+    sources.delete(deviceKey >>> 0);
 }
 
 export function deviceCooperativeLevel(deviceKey: number): CooperativeLevel {
@@ -55,8 +75,9 @@ export function deviceCooperativeLevel(deviceKey: number): CooperativeLevel {
     // simply failed to register would send a correct app into a Reset loop it cannot leave.
     const ack = acknowledged.get(key);
     if (ack === undefined) return "ok";
-    if (ack === gpuDeviceLifecycle.generation() && gpuDeviceLifecycle.isUsable()) return "ok";
-    return gpuDeviceLifecycle.isUsable() ? "notreset" : "lost";
+    const source = sourceOf(key);
+    if (ack === source.generation() && source.isUsable()) return "ok";
+    return source.isUsable() ? "notreset" : "lost";
 }
 
 /**
@@ -65,8 +86,10 @@ export function deviceCooperativeLevel(deviceKey: number): CooperativeLevel {
  * to keep polling instead of proceeding onto a device that does not exist.
  */
 export function acknowledgeDeviceReset(deviceKey: number): boolean {
-    if (!gpuDeviceLifecycle.isUsable()) return false;
-    acknowledged.set(deviceKey >>> 0, gpuDeviceLifecycle.generation());
+    const key = deviceKey >>> 0;
+    const source = sourceOf(key);
+    if (!source.isUsable()) return false;
+    acknowledged.set(key, source.generation());
     return true;
 }
 
@@ -112,5 +135,6 @@ export function lostSurfaceCount(): number {
  *  themselves with their states; the count is zeroed so a leaked flag cannot outlive the run. */
 export function resetDeviceLossContract(): void {
     acknowledged.clear();
+    sources.clear();
     lostCount = 0;
 }

@@ -21,6 +21,15 @@
  * never trap. Storage correctness is the prerequisite, and this file is only that
  * prerequisite — the membership lookup below still costs a Map hit per call, so
  * moving the storage alone is not itself a speedup.
+ *
+ * BINDINGS ARE NOT PUBLIC REFERENCES. Native D3D9 never lets SetTexture / SetStreamSource /
+ * SetIndices / Set*Shader / SetVertexDeclaration / SetRenderTarget / a captured state block show
+ * in AddRef/Release's answer: the runtime holds an INTERNAL reference, only the Get* methods
+ * AddRef the public count, and an object whose public count reaches zero while still bound
+ * stays alive until the last binding lets go (dropping its device reference at the zero, as a
+ * device child does — so releasing the device last still destroys it). Under
+ * `__d3d9InternalBindingRefs` bindings are counted separately here; without it a binding takes
+ * a public reference, the historical behaviour.
  */
 
 import { Mem } from '../../core/memory/mem-accessor';
@@ -47,8 +56,29 @@ interface RefcountFlags {
     __d3d9MirrorRefcount?: boolean;
     /** Maintain both stores and count disagreements (default off). */
     __d3d9RefcountVerify?: boolean;
+    /** Device/state-block bindings hold INTERNAL references, not public ones (default off). */
+    __d3d9InternalBindingRefs?: boolean;
 }
 const flags = globalThis as RefcountFlags;
+
+/** Binding references per object. Populated only under `__d3d9InternalBindingRefs`. */
+const comBindingRefs: Map<number, number> = new Map();
+/** Sum of comBindingRefs, so the default mode's binding release costs no Map lookup. */
+let bindingRefsHeld = 0;
+/** Device child -> the device its creation reference retains (registerDeviceChildFinalizer). */
+const comParents: Map<number, number> = new Map();
+/** Children that reached public zero while bound: their device reference is already dropped. */
+const parentDetached: Set<number> = new Set();
+
+/**
+ * Read at every binding ACQUIRE, so one boot can A/B both. Release does not consult it: it
+ * drops an internal reference when the object has one and a public one otherwise, which keeps
+ * a mid-run flip balanced in both directions (counts are fungible, and consuming the internal
+ * ones first can only keep an object alive longer, never destroy it early).
+ */
+function internalBindingRefsWanted(): boolean {
+    return flags.__d3d9InternalBindingRefs === true;
+}
 
 /**
  * Real COM keeps the count inside the object, and so do we now: the guest block is the count
@@ -140,9 +170,9 @@ function storeCount(key: number, next: number): void {
 }
 
 /**
- * The ONE place an object stops existing — `releaseComRef`'s 1->0 transition and
- * `forgetComObject` both land here, and the guest-side Release stub declines at a count of 1, so
- * no destruction bypasses it. That is why the pointer->id invalidation lives here and not at the
+ * The ONE place an object stops existing — `releaseComRef`'s 1->0 transition, the last
+ * `releaseBindingRef` of an object already at public zero, and `forgetComObject` all land here,
+ * and the guest-side Release stub declines at a count of 1, so no destruction bypasses it. That is why the pointer->id invalidation lives here and not at the
  * six call sites: the block is about to be recyclable, and an id table still naming it would
  * dispatch into whoever takes the block next.
  */
@@ -232,6 +262,8 @@ export function unpinGuestRefcountStoreForTests(): void {
 export function trackComObject(ptr: number, dispose?: () => void): void {
     const key = ptr >>> 0;
     syncStorageMode();
+    // A recycled block is a new object: nothing it inherits from the previous occupant is its.
+    dropBindingState(key);
     storeCount(key, 1);
     if (dispose) comDisposers.set(key, dispose);
 }
@@ -243,6 +275,7 @@ export function addComRef(ptr: number): number | undefined {
     syncStorageMode();
     const next = currentCount(key, mirrored) + 1;
     storeCount(key, next);
+    if (parentDetached.size !== 0) reattachParent(key);
     return next;
 }
 
@@ -254,9 +287,21 @@ export function releaseComRef(ptr: number): number | undefined {
     const next = currentCount(key, mirrored) - 1;
     if (next > 0) {
         storeCount(key, next);
+        // The guest AddRef stub can lift a count off zero without JS seeing it.
+        if (parentDetached.size !== 0) reattachParent(key);
         return next;
     }
+    if (bindingRefsHeld !== 0 && comBindingRefs.has(key)) {
+        // Public zero while bound: the object lives until unbound, its device reference does not.
+        storeCount(key, 0);
+        detachParent(key);
+        return 0;
+    }
+    destroyComObject(key);
+    return 0;
+}
 
+function destroyComObject(key: number): void {
     dropCount(key);
     // Unregister before running: a finalizer that reaches back here (forgetComObject
     // on a subresource, a parent release) must not re-enter this object's teardown.
@@ -269,7 +314,98 @@ export function releaseComRef(ptr: number): number | undefined {
     } finally {
         dispose?.();
     }
-    return 0;
+}
+
+/**
+ * Take the reference a device binding (or a captured state block) holds. Returns false for a
+ * pointer that is not a live object, in which case nothing was taken and nothing may be released.
+ */
+export function addBindingRef(ptr: number): boolean {
+    const key = ptr >>> 0;
+    if (!internalBindingRefsWanted()) return addComRef(key) !== undefined;
+    if (!comRefCounts.has(key)) return false;
+    comBindingRefs.set(key, (comBindingRefs.get(key) ?? 0) + 1);
+    bindingRefsHeld++;
+    return true;
+}
+
+/** Drop one binding reference; the last one destroys an object already at public zero. */
+export function releaseBindingRef(ptr: number): void {
+    const key = ptr >>> 0;
+    if (bindingRefsHeld !== 0) {
+        const held = comBindingRefs.get(key);
+        if (held !== undefined) {
+            bindingRefsHeld--;
+            if (held > 1) {
+                comBindingRefs.set(key, held - 1);
+                return;
+            }
+            comBindingRefs.delete(key);
+            const mirrored = comRefCounts.get(key);
+            if (mirrored === undefined) return;
+            syncStorageMode();
+            if (currentCount(key, mirrored) === 0) destroyComObject(key);
+            return;
+        }
+    }
+    releaseComRef(key);
+}
+
+/**
+ * Hand a binding the public reference its caller already owns — an implicit object created
+ * for the slot, which native D3D9 creates at public count 0.
+ */
+export function adoptBindingRef(ptr: number): void {
+    if (!internalBindingRefsWanted()) return;
+    if (addBindingRef(ptr)) releaseComRef(ptr);
+}
+
+function detachParent(key: number): void {
+    const parent = comParents.get(key);
+    if (parent === undefined || parentDetached.has(key)) return;
+    parentDetached.add(key);
+    // Last: this may destroy the device, whose unbinding destroys this object.
+    releaseComRef(parent);
+}
+
+function reattachParent(key: number): void {
+    if (!parentDetached.delete(key)) return;
+    const parent = comParents.get(key);
+    if (parent !== undefined && addComRef(parent) === undefined) comParents.delete(key);
+}
+
+function dropBindingState(key: number): void {
+    const held = comBindingRefs.get(key);
+    if (held !== undefined) {
+        bindingRefsHeld -= held;
+        comBindingRefs.delete(key);
+    }
+    comParents.delete(key);
+    parentDetached.delete(key);
+}
+
+/**
+ * Binding-reference readout. `pendingDestruction` counts objects the app has released to zero
+ * that a binding still keeps alive — legal in D3D9, and the case the default mode cannot express.
+ */
+export function d3d9BindingRefStats(): {
+    internal: boolean;
+    boundObjects: number;
+    bindingRefs: number;
+    pendingDestruction: number;
+    devicesDetached: number;
+} {
+    let pendingDestruction = 0;
+    for (const key of comBindingRefs.keys()) {
+        if (comRefCounts.get(key) === 0) pendingDestruction++;
+    }
+    return {
+        internal: internalBindingRefsWanted(),
+        boundObjects: comBindingRefs.size,
+        bindingRefs: bindingRefsHeld,
+        pendingDestruction,
+        devicesDetached: parentDetached.size,
+    };
 }
 
 export function registerComFinalizer(ptr: number, finalizer: () => void): void {
@@ -277,22 +413,27 @@ export function registerComFinalizer(ptr: number, finalizer: () => void): void {
 }
 
 /**
- * Keep a D3D9 device alive for the complete lifetime of one of its child COM
- * objects — real D3D9 holds a device reference for every resource, state block
- * and shader it created. The finally block guarantees a balanced parent
- * reference even if a resource-specific cleanup path throws.
+ * Keep a D3D9 device alive while one of its child COM objects is publicly referenced — real
+ * D3D9 holds a device reference for every resource, state block and shader it created, and
+ * drops it when the child's public count reaches zero even if a binding keeps the child alive
+ * (see detachParent). The finally block guarantees a balanced parent reference even if a
+ * resource-specific cleanup path throws.
  */
 export function registerDeviceChildFinalizer(
     childPtr: number,
     devicePtr: number,
     finalizer: () => void,
 ): void {
+    const child = childPtr >>> 0;
     const retainedDevice = addComRef(devicePtr) !== undefined;
-    registerComFinalizer(childPtr, () => {
+    if (retainedDevice) comParents.set(child, devicePtr >>> 0);
+    registerComFinalizer(child, () => {
         try {
             finalizer();
         } finally {
-            if (retainedDevice) releaseComRef(devicePtr);
+            const detached = parentDetached.delete(child);
+            comParents.delete(child);
+            if (retainedDevice && !detached) releaseComRef(devicePtr);
         }
     });
 }
@@ -301,6 +442,7 @@ export function registerDeviceChildFinalizer(
 export function forgetComObject(ptr: number): void {
     const key = ptr >>> 0;
     syncStorageMode();
+    dropBindingState(key);
     dropCount(key);
     comFinalizers.delete(key);
     const dispose = comDisposers.get(key);
@@ -335,6 +477,10 @@ export function drainComFinalizers(): void {
     if (guestStoreLive) for (const key of comRefCounts.keys()) writeGuestCount(key, 0);
     comRefCounts.clear();
     comDisposers.clear();
+    comBindingRefs.clear();
+    bindingRefsHeld = 0;
+    comParents.clear();
+    parentDetached.clear();
     // Every object just ceased to exist without passing through dropCount.
     resetResourceIds();
 }

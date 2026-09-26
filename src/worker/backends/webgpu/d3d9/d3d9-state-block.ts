@@ -14,7 +14,8 @@ import {
 import { KeyedStateBlockRecorder } from "../shared/state-block-recorder";
 import { MAX_VERTEX_STREAMS } from "../shared/vertex-streams";
 import { d3d9WasmArena, isWasmBlocksEnabled } from "./d3d9-wasm-arena";
-import { addComRef, releaseComRef } from "../../../modules/d3d9/com-refs";
+import { addBindingRef, releaseBindingRef } from "../../../modules/d3d9/com-refs";
+import { isD3D9SplitReplay } from "../../../modules/d3d9/shared-state";
 import {
     D3D9_PIXEL_TEXTURE_STAGE_COUNT,
     D3D9_VERTEX_TEXTURE_SAMPLER_BASE,
@@ -321,18 +322,23 @@ function activeHandleEntries(data: D3D9StateBlockData): StateBlockEntry[] {
 }
 
 export function releaseStateBlockRefs(data: D3D9StateBlockData): void {
+    // COM references are the front's; the split render twin's copy of a block holds none.
+    if (isD3D9SplitReplay()) return;
     for (const ptr of data.retainedRefs ?? []) {
-        releaseComRef(ptr);
+        releaseBindingRef(ptr);
     }
     data.retainedRefs = [];
 }
 
+/** A captured object is held the way a device binding holds it (wined3d stateblocks take
+ *  internal references), so a Capture never shows in the object's public count. */
 export function retainStateBlockRefs(data: D3D9StateBlockData): void {
+    if (isD3D9SplitReplay()) return;
     releaseStateBlockRefs(data);
     const retained: number[] = [];
     for (const entry of activeHandleEntries(data)) {
         const ptr = retainedEntryPtr(entry);
-        if (ptr !== 0 && addComRef(ptr) !== undefined) retained.push(ptr);
+        if (ptr !== 0 && addBindingRef(ptr)) retained.push(ptr);
     }
     data.retainedRefs = retained;
 }
