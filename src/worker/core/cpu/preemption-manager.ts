@@ -351,6 +351,23 @@ export class PreemptionManager {
             console.warn("[PERF] eagl_read_cursor_set_policy missing — stale v86.wasm, cursor stays per-dispatch");
         }
 
+        // EAGL page views (cpu/hypercall_eagl.rs): a page the exact accessor has just
+        // translated is read/written directly for the rest of the hypercall (reads: until
+        // the same TLB drops that end the cursor). Default OFF in wasm; TS owns the default
+        // for the same reason as the cursor. Gated on the structural self-test, which drives
+        // the shipped lookup/lifetime code; `__eaglNoPageViews` is the A/B arm.
+        if (this.wasmExports.eagl_page_views_set) {
+            const fail = this.wasmExports.eagl_page_views_selftest
+                ? this.wasmExports.eagl_page_views_selftest() >>> 0 : -1;
+            const want = fail === 0 && !(globalThis as { __eaglNoPageViews?: boolean }).__eaglNoPageViews;
+            this.wasmExports.eagl_page_views_set(want ? 1 : 0);
+            if (fail !== 0) {
+                console.error(`[PERF] EAGL page views selftest ${fail < 0 ? "missing" : `FAILED (mask=0x${fail.toString(16)})`} — views off`);
+            } else {
+                console.log(`[PERF] EAGL page views: ${want ? "on" : "off"} (selftest ok)`);
+            }
+        }
+
         // Re-apply any active guest-debugger config onto this (fresh) wasm instance.
         // v86 is re-created per game load, which clears the wasm dbg_* statics; the
         // debugger keeps its intended config in dbg-commands and re-applies it here.

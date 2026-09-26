@@ -136,6 +136,9 @@ export async function pageTailsAb(ctx){ return leverAb(ctx,'pagetails'); }
 export async function hotEdgeAb(ctx){ return leverAb(ctx,'hotedge'); }
 /** Guard groups (set_jit_guard_groups) OFF (0) vs ON (1): 16 ABBA windows in one boot. */
 export async function guardGroupsAb(ctx){ return leverAb(ctx,'guardgroups'); }
+/** EAGL hypercall page views (vendor/v86 eagl_page_views_set) OFF (0) vs ON (1): 16 ABBA windows in
+ *  one boot. Not a codegen input — the JIT cache is kept. */
+export async function eaglViewsAb(ctx){ return leverAb(ctx,'eaglviews'); }
 /** jsprof: split batch-buffer recycling off (0) vs on (1). */
 export async function queueRecycleAb(ctx){ return leverAb(ctx,'queuerecycle'); }
 
@@ -886,6 +889,14 @@ async function leverAb({call,save,note,sleep,scene},lever){
     // A codegen input: blocks compiled before the flip carry the old shape, so the cache
     // must go or the arm measures a mixture of both.
     +" if(w.jit_clear_cache_js) w.jit_clear_cache_js();"
+    +" return back;")
+  : lever==='eaglviews'
+  ? call('evalWorker',
+     "const w=globalThis.preemption.getWasmExports();"
+    +" if(!w.eagl_page_views_set) throw new Error('engine has no eagl_page_views_set');"
+    +" w.eagl_page_views_set_verify(0); w.eagl_page_views_set("+mode+");"
+    +" const back=w.eagl_page_views_get()>>>0;"
+    +" if(back!=="+mode+") throw new Error('eagl-views readback '+back);"
     +" return back;")
   : lever==='eaglcursor'
   ? call('evalWorker',

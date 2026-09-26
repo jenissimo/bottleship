@@ -393,6 +393,34 @@ export function registerDbgCommands(svc: HarnessService): void {
         };
     });
 
+    /** eaglPageViews({on?, verify?, reset?}) — the EAGL hypercalls' per-invocation page views
+     *  (a page the exact accessor just translated is accessed directly afterwards).
+     *
+     *  `on:false` is the kill switch. `verify:true` re-reads every view read through the exact
+     *  accessor and re-translates every view write's target (plus its no-code / not-mapped
+     *  premises); only then are `hits`/`installs` counted, so `checked: 0` means the oracle
+     *  never ran, not that it passed. Evidence = `checked` large AND `mismatch` 0. */
+    svc.register("eaglPageViews", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; verify?: boolean; reset?: boolean };
+        const ex = (globalThis as any).preemption?.getWasmExports?.();
+        if (!ex?.eagl_page_views_get) {
+            throw new Error("eagl_page_views_* exports missing — stale v86.wasm, rebuild vendor/v86");
+        }
+        if (opts.reset) ex.eagl_page_views_reset_stats();
+        if (opts.on !== undefined) ex.eagl_page_views_set(opts.on ? 1 : 0);
+        if (opts.verify !== undefined) ex.eagl_page_views_set_verify(opts.verify ? 1 : 0);
+        const checked = ex.eagl_page_views_stat(2) >>> 0;
+        const mismatch = ex.eagl_page_views_stat(3) >>> 0;
+        return {
+            on: ex.eagl_page_views_get() !== 0,
+            hits: ex.eagl_page_views_stat(0) >>> 0,
+            installs: ex.eagl_page_views_stat(1) >>> 0,
+            checked,
+            mismatch,
+            verdict: checked === 0 ? "oracle did not run" : (mismatch === 0 ? "agree" : "DISAGREE"),
+        };
+    });
+
     /** d3d9GuestRefcount({on?, verify?, reset?}) — where a D3D9 COM object's refcount lives.
      *
      *  `on` moves the count of record into the guest COM block (real COM's own layout, and the

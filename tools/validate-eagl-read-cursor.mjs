@@ -15,6 +15,11 @@
  * away, and nothing at runtime would notice: the read succeeds and returns the
  * wrong page.
  *
+ * The EAGL page views (same file) are translations too, cached under the same
+ * rule, so `eagl_read_cursor_invalidate` itself must drop them (`pv_reset()`):
+ * otherwise all four sites could call it and the views would still outlive the
+ * entry. Checked here for the same reason — nothing at runtime would notice.
+ *
  * Not covered, deliberately: a call that INSTALLS a translation
  * (`set_tlb_entry(page, entry)`) or that only flips TLB_HAS_CODE. Neither can
  * change the address a live cursor resolves to.
@@ -25,7 +30,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const CPU_RS = join(root, 'vendor/v86/src/rust/cpu/cpu.rs');
+const CPU_RS = process.env.EAGL_CURSOR_CPU_RS || join(root, 'vendor/v86/src/rust/cpu/cpu.rs');
+const EAGL_RS = process.env.EAGL_CURSOR_EAGL_RS || join(root, 'vendor/v86/src/rust/cpu/hypercall_eagl.rs');
 
 let src;
 try {
@@ -35,10 +41,8 @@ try {
     process.exit(0);
 }
 
-const lines = src.split(/\r?\n/);
-
-/** Split the file into top-level `fn` bodies by brace depth. */
-function functions() {
+/** Split a source into top-level `fn` bodies by brace depth. */
+function functions(lines) {
     const out = [];
     let cur = null, depth = 0;
     for (let i = 0; i < lines.length; i++) {
@@ -60,7 +64,7 @@ const DROP = /eagl_read_cursor_invalidate\s*\(/;
 
 const clearing = [];
 const bad = [];
-for (const fn of functions()) {
+for (const fn of functions(src.split(/\r?\n/))) {
     const text = fn.body.join('\n');
     if (!CLEAR.test(text)) continue;
     clearing.push(fn.name);
@@ -83,6 +87,20 @@ if (bad.length > 0) {
     process.exit(1);
 }
 
+// The page views: present in the source => dropped by the invalidation hook.
+let views = 'no page views in this source';
+const eagl = (() => { try { return readFileSync(EAGL_RS, 'utf8'); } catch { return null; } })();
+if (eagl && /static mut PV_RTAG\b/.test(eagl)) {
+    const inv = functions(eagl.split(/\r?\n/)).find((f) => f.name === 'eagl_read_cursor_invalidate');
+    if (!inv || !/\bpv_reset\s*\(/.test(inv.body.join('\n'))) {
+        console.error('validate-eagl-read-cursor: FAIL — eagl_read_cursor_invalidate() does not drop the EAGL page views.');
+        console.error('  vendor/v86/src/rust/cpu/hypercall_eagl.rs: call `pv_reset()` there, or a view can answer');
+        console.error('  a read from a page the CPU no longer maps after every TLB-clearing site ran the hook.');
+        process.exit(1);
+    }
+    views = 'page views dropped by the same hook';
+}
+
 console.log(
     `EAGL read-cursor containment OK — ${clearing.length} TLB-clearing function(s) ` +
-    `all drop the cursor: ${clearing.join(', ')}`);
+    `all drop the cursor: ${clearing.join(', ')}; ${views}`);
