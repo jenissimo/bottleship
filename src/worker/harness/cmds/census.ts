@@ -20,7 +20,7 @@
 
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import { retiredDelta } from "./perf";
+import { startRetiredAccumulator, peekRetiredTotal, stopRetiredAccumulator, type RetiredAccumulator } from "./perf";
 import { cpu } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 import { readTextureKernelLedger } from "../../backends/webgpu/shared/dxt-kernel";
@@ -47,7 +47,9 @@ export interface CensusSnapshot {
     opcode: Float64Array;
     addr: Float64Array;
     simd: Float64Array;
-    retiredCounter: number;
+    /** Instructions retired since opcodeCensusMark(), wrap-safe. The raw counter is 32-bit and
+     *  wraps every few seconds at game speed, while a census window is as long as the caller likes. */
+    retiredTotal: number;
     enabled: number;
     armEpoch: number;
 }
@@ -55,6 +57,7 @@ export interface CensusSnapshot {
 let armEpoch = 0;
 let armedAtMs = -1;
 let mark: CensusSnapshot | null = null;
+let retiredAcc: RetiredAccumulator | null = null;
 
 export function readCensusSnapshot(): CensusSnapshot {
     const w = exportsOf();
@@ -83,10 +86,9 @@ export function readCensusSnapshot(): CensusSnapshot {
     for (let i = 0; i < ADDR_KEYS; i++) addr[i] = Number(getAddr(i));
     const simd = new Float64Array(SIMD_KEYS);
     for (let i = 0; i < SIMD_KEYS; i++) simd[i] = Number(getSimd(i));
-    const ic = (cpu() as { instruction_counter?: Int32Array } | null)?.instruction_counter;
     return {
         atMs: performance.now(), opcode, addr, simd,
-        retiredCounter: ic ? ic[0]! >>> 0 : 0,
+        retiredTotal: retiredAcc ? peekRetiredTotal(retiredAcc) : 0,
         enabled: getEnabled() >>> 0,
         armEpoch,
     };
@@ -132,7 +134,7 @@ export function summarizeCensus(before: CensusSnapshot, after: CensusSnapshot): 
         };
     }
 
-    const retired = retiredDelta(before.retiredCounter, after.retiredCounter);
+    const retired = after.retiredTotal - before.retiredTotal;
 
     const byClass = new Map<InstrClass, number>();
     const byGroup = new Map<string, number>();
@@ -364,6 +366,8 @@ export function registerCensusCommands(svc: HarnessService): void {
 
     /** opcodeCensusMark() — window baseline. */
     svc.register("opcodeCensusMark", () => {
+        if (retiredAcc) stopRetiredAccumulator(retiredAcc);
+        retiredAcc = startRetiredAccumulator();
         mark = readCensusSnapshot();
         return {
             marked: true, atMs: round(mark.atMs), armEpoch: mark.armEpoch, enabled: mark.enabled,

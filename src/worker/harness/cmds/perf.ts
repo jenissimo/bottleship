@@ -369,12 +369,14 @@ type CountedWindow = {
  * counts every retired instruction, in the SAME unit trace2 weights blocks by, so the two
  * divide into a measured coverage figure.
  *
- * It is a 32-bit counter that wraps (~40s of guest execution), so the window is accumulated
+ * It is a 32-bit counter that wraps (~17s at full guest speed), so the window is accumulated
  * from periodic deltas rather than from one end-to-end subtraction — a single subtraction
  * across a wrap yields a plausible small number, which is exactly the failure this project
  * keeps rediscovering.
  */
-type RetiredAccumulator = { total: number; last: number; timer: number | null; wraps: number };
+export type RetiredAccumulator = {
+    total: number; last: number; timer: number | null; wraps: number; read: () => number | null;
+};
 
 /** Wrap-safe delta of the 32-bit retired-instruction counter. A plain `now - prev` across a
  *  wrap yields a large NEGATIVE number, and clamping it to 0 would silently drop ~4.3e9
@@ -389,17 +391,11 @@ const readInsnCounter = (): number | null => {
     return c?.instruction_counter ? c.instruction_counter[0] >>> 0 : null;
 };
 
-function startRetiredAccumulator(): RetiredAccumulator {
-    const acc: RetiredAccumulator = { total: 0, last: readInsnCounter() ?? 0, timer: null, wraps: 0 };
-    const tick = () => {
-        const now = readInsnCounter();
-        if (now === null) return;
-        if (now < acc.last) acc.wraps++;
-        acc.total += retiredDelta(acc.last, now);
-        acc.last = now;
-    };
-    // 1s is far inside the ~40s wrap period, so no single delta can span two wraps.
-    acc.timer = setInterval(tick, 1000) as unknown as number;
+export function startRetiredAccumulator(read: () => number | null = readInsnCounter): RetiredAccumulator {
+    const acc: RetiredAccumulator = { total: 0, last: read() ?? 0, timer: null, wraps: 0, read };
+    // 1s is far inside the wrap period (~17s at full guest speed), so no single delta can
+    // span two wraps.
+    acc.timer = setInterval(() => peekRetiredTotal(acc), 1000) as unknown as number;
     return acc;
 }
 
@@ -407,8 +403,8 @@ function startRetiredAccumulator(): RetiredAccumulator {
  *  RUNNING. A read against a still-armed window must not stop it: with the ticker dead the
  *  next read has only one end-to-end subtraction to work from, which is exactly the
  *  wrap-unsafe number this accumulator exists to replace. */
-function peekRetiredTotal(acc: RetiredAccumulator): number {
-    const now = readInsnCounter();
+export function peekRetiredTotal(acc: RetiredAccumulator): number {
+    const now = acc.read();
     if (now !== null) {
         if (now < acc.last) acc.wraps++;
         acc.total += retiredDelta(acc.last, now);
@@ -417,7 +413,7 @@ function peekRetiredTotal(acc: RetiredAccumulator): number {
     return acc.total;
 }
 
-function stopRetiredAccumulator(acc: RetiredAccumulator): number {
+export function stopRetiredAccumulator(acc: RetiredAccumulator): number {
     const total = peekRetiredTotal(acc);
     if (acc.timer !== null) { clearInterval(acc.timer); acc.timer = null; }
     return total;
