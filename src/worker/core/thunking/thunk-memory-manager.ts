@@ -85,6 +85,17 @@ export interface StubAllocator {
 }
 
 /**
+ * Whether guest-side stubs wrap themselves in pushfd/popfd. EFLAGS are caller-saved in every
+ * 32-bit Windows calling convention (only DF must be clear across a call, and no stub sets
+ * it), so by default they do not: the pair is two v86 helper calls — a full flags
+ * materialisation and update_eflags — on stubs that run tens of thousands of times a frame.
+ * `__stubsPreserveEflags` restores the saving frame, for A/B. Read at emit time.
+ */
+export function stubsPreserveEflags(): boolean {
+    return (globalThis as { __stubsPreserveEflags?: boolean }).__stubsPreserveEflags === true;
+}
+
+/**
  * Manages memory regions for thunk system components
  * Allocates safe regions that don't conflict with emulated application memory
  */
@@ -653,6 +664,8 @@ export class ThunkMemoryManager {
         const addrs: number[] = new Array(21);  // 16 standard + 4 PtrDeref + 1 shader-constant
         let off = base;
         const lean = (globalThis as { __wbufLeanTrampolines?: boolean }).__wbufLeanTrampolines === true;
+        // pushfd shifts every stack argument by 4 when the saving frame is emitted.
+        const pf = stubsPreserveEflags() ? 4 : 0;
 
         // The trampoline's capacity check is `cmp head, LIMIT; jge overflow` BEFORE
         // writing the entry — it must leave room for the LARGEST entry (funcId + 8
@@ -701,8 +714,7 @@ export class ThunkMemoryManager {
                     continue;
                 }
 
-                // pushfd (save EFLAGS — trampoline must not clobber flags, matching OUT-trap behavior)
-                w8(0x9C);
+                if (pf) w8(0x9C); // pushfd
                 // push edx (save EDX, used as head register)
                 w8(0x52);
                 // push ebx (save EBX, used as ring write pointer)
@@ -722,10 +734,10 @@ export class ThunkMemoryManager {
                 // mov [ebx], eax  — write funcId
                 w8(0x89); w8(0x03);
 
-                // Per-arg: read from [esp + 16 + i*4] (3 pushes + ret addr = 16),
+                // Per-arg: read from [esp + 12 + pf + i*4] (EDX+EBX pushes + ret addr),
                 // write to [ebx + (i+1)*4].
                 for (let i = 0; i < argCount; i++) {
-                    const stackOff = 16 + i * 4;     // 3 pushes (EFLAGS+EDX+EBX) + ret addr = 16
+                    const stackOff = 12 + pf + i * 4;
                     const bufOff   = (i + 1) * 4;     // disp8 ≤ 32
                     // mov eax, [esp + stackOff]
                     w8(0x8B); w8(0x44); w8(0x24); w8(stackOff);
@@ -743,8 +755,7 @@ export class ThunkMemoryManager {
                 w8(0xBA); w32(0xB077);
                 // xor eax, eax  (return 0)
                 w8(0x31); w8(0xC0);
-                // popfd (restore original EFLAGS — must come after XOR to avoid re-clobbering)
-                w8(0x9D);
+                if (pf) w8(0x9D); // popfd — after the XOR, which would clobber it again
                 // ret N (stdcall) or ret (cdecl)
                 const bytesToPop = argCount * 4;
                 if (isStdcall) { w8(0xC2); w8(bytesToPop & 0xFF); w8((bytesToPop >> 8) & 0xFF); }
@@ -754,7 +765,7 @@ export class ThunkMemoryManager {
                 const overflowAddr = off;
                 w8(0x5B); // pop ebx
                 w8(0x5A); // pop edx
-                w8(0x9D); // popfd (restore EFLAGS before falling back to OUT trap)
+                if (pf) w8(0x9D); // popfd
                 w8(0xBA); w32(0xB077); // mov edx, 0xB077
                 w8(0xEF); // out dx, eax
                 if (isStdcall) { w8(0xC2); w8(bytesToPop & 0xFF); w8((bytesToPop >> 8) & 0xFF); }
@@ -778,15 +789,14 @@ export class ThunkMemoryManager {
 
                 const stride = (floatCount + 1) * 4;  // funcId + N floats
 
-                // pushfd
-                w8(0x9C);
+                if (pf) w8(0x9C); // pushfd
                 // push edx
                 w8(0x52);
                 // push ebx
                 w8(0x53);
                 // push ecx  (need extra reg for pointer deref)
                 w8(0x51);
-                // Stack: [ESP+0]=ECX [+4]=EBX [+8]=EDX [+12]=EFLAGS [+16]=retAddr [+20]=ptr
+                // Stack: [ESP+0]=ECX [+4]=EBX [+8]=EDX [+12(+pf)]=retAddr [+16(+pf)]=ptr
 
                 // mov edx, [ctrlAddr]  — load WBUF_HEAD
                 w8(0x8B); w8(0x15); w32(ctrlAddr);
@@ -803,8 +813,8 @@ export class ThunkMemoryManager {
                 // mov [ebx], eax  — write funcId
                 w8(0x89); w8(0x03);
 
-                // mov ecx, [esp+20]  — ECX = float* ptr
-                w8(0x8B); w8(0x4C); w8(0x24); w8(20);
+                // mov ecx, [esp+16+pf]  — ECX = float* ptr
+                w8(0x8B); w8(0x4C); w8(0x24); w8(16 + pf);
 
                 // Dereference floats from [ecx] into ring buffer
                 for (let i = 0; i < floatCount; i++) {
@@ -828,8 +838,7 @@ export class ThunkMemoryManager {
                 w8(0x5A);
                 // xor eax, eax  (return 0)
                 w8(0x31); w8(0xC0);
-                // popfd
-                w8(0x9D);
+                if (pf) w8(0x9D); // popfd
                 // ret 4 (stdcall: pop 1 ptr arg) or ret (cdecl)
                 if (isStdcall) { w8(0xC2); w8(0x04); w8(0x00); }
                 else           { w8(0xC3); }
@@ -839,7 +848,7 @@ export class ThunkMemoryManager {
                 w8(0x59); // pop ecx
                 w8(0x5B); // pop ebx
                 w8(0x5A); // pop edx
-                w8(0x9D); // popfd
+                if (pf) w8(0x9D); // popfd
                 w8(0xBA); w32(0xB077); // mov edx, 0xB077
                 w8(0xEF); // out dx, eax
                 if (isStdcall) { w8(0xC2); w8(0x04); w8(0x00); }
@@ -931,17 +940,18 @@ export class ThunkMemoryManager {
                 w8(0xC2); w8(16); w8(0);
             } else {
 
-            w8(0x9C); // pushfd
+            if (pf) w8(0x9C); // pushfd
             w8(0x52); // push edx
             w8(0x53); // push ebx
             w8(0x51); // push ecx
             w8(0x56); // push esi
             w8(0x57); // push edi
-            // [esp+24]=ret [+28]=this [+32]=start [+36]=pData [+40]=vec4Count
+            // [esp+20+pf]=ret [+24+pf]=this [+28+pf]=start [+32+pf]=pData [+36+pf]=vec4Count
+            const sp = 20 + pf;
 
             w8(0x89); w8(0xC7); // mov edi, eax  (save funcId)
             w8(0x8B); w8(0x15); w32(ctrlAddr); // mov edx, [ctrlAddr]  head
-            w8(0x8B); w8(0x4C); w8(0x24); w8(40); // mov ecx, [esp+40]  vec4Count
+            w8(0x8B); w8(0x4C); w8(0x24); w8(sp + 16); // mov ecx, [esp+vec4Count]
             w8(0x85); w8(0xC9); // test ecx, ecx
             w8(0x0F); w8(0x84); // jz .overflow
             const jzOverflowOff = off; w32(0);
@@ -960,14 +970,14 @@ export class ThunkMemoryManager {
             w8(0xBB); w32(dataBase); // mov ebx, dataBase
             w8(0x03); w8(0xDA); // add ebx, edx  ring write ptr
             w8(0x89); w8(0x3B); // mov [ebx], edi  funcId
-            w8(0x8B); w8(0x44); w8(0x24); w8(28); // mov eax, [esp+28]  thisPtr
+            w8(0x8B); w8(0x44); w8(0x24); w8(sp + 4); // mov eax, [esp+this]
             w8(0x89); w8(0x43); w8(4); // mov [ebx+4], eax
-            w8(0x8B); w8(0x44); w8(0x24); w8(32); // mov eax, [esp+32]  startReg
+            w8(0x8B); w8(0x44); w8(0x24); w8(sp + 8); // mov eax, [esp+startReg]
             w8(0x89); w8(0x43); w8(8); // mov [ebx+8], eax
             w8(0x89); w8(0x4B); w8(12); // mov [ebx+12], ecx  vec4Count
-            w8(0x8B); w8(0x74); w8(0x24); w8(36); // mov esi, [esp+36]  pData
+            w8(0x8B); w8(0x74); w8(0x24); w8(sp + 12); // mov esi, [esp+pData]
             w8(0x8D); w8(0x7B); w8(16); // lea edi, [ebx+16]  ring float dest
-            w8(0x8B); w8(0x4C); w8(0x24); w8(40); // mov ecx, [esp+40]
+            w8(0x8B); w8(0x4C); w8(0x24); w8(sp + 16); // mov ecx, [esp+vec4Count]
             w8(0xC1); w8(0xE1); w8(2); // shl ecx, 2  dword count
 
             const copyLoopAddr = off;
@@ -999,7 +1009,7 @@ export class ThunkMemoryManager {
             w8(0x5A); // pop edx
             w8(0xBA); w32(0xB077); // mov edx, 0xB077
             w8(0x31); w8(0xC0); // xor eax, eax
-            w8(0x9D); // popfd
+            if (pf) w8(0x9D); // popfd
             w8(0xC2); w8(16); w8(0); // ret 16
 
             const overflowAddr = off;
@@ -1013,7 +1023,7 @@ export class ThunkMemoryManager {
             w8(0x59); // pop ecx
             w8(0x5B); // pop ebx
             w8(0x5A); // pop edx
-            w8(0x9D); // popfd
+            if (pf) w8(0x9D); // popfd
             w8(0xBA); w32(0xB077); // mov edx, 0xB077
             w8(0xEF); // out dx, eax
             w8(0xC2); w8(16); w8(0); // ret 16

@@ -6,7 +6,7 @@
 // ThunkMemoryManager.stubAllocator.
 
 import { Logger, LogCategory } from '../../core/logger';
-import type { StubAllocator } from '../../core/thunking/thunk-memory-manager';
+import { stubsPreserveEflags, type StubAllocator } from '../../core/thunking/thunk-memory-manager';
 
 /**
  * Describes a high-volume, idempotent stdcall setter that a module wants to short-circuit in
@@ -103,17 +103,19 @@ export function writeShadowTrampoline(
     const capacityLimit = capacity - 36;
     const stride = (argCount + 1) * 4;
     const retPop = argCount * 4;
-    // After 4 pushes (flags/edx/ebx/ecx) + retAddr, stdcall args are at [ESP+20 + i*4].
-    const argDisp = (i: number) => 20 + i * 4;
+    const pf = stubsPreserveEflags() ? 4 : 0;
+    // After edx/ebx/ecx (+ optional flags) + retAddr, stdcall args are at [ESP+16+pf + i*4].
+    const argDisp = (i: number) => 16 + pf + i * 4;
     const valueDisp = argDisp(valueArgIndex);
 
     const trampStart = off;
     const ringPatch: number[] = []; // rel32 sites → .ringwrite (owner mismatch / out-of-range)
 
-    // pushfd; push edx; push ebx; push ecx
-    w8(0x9C); w8(0x52); w8(0x53); w8(0x51);
+    // [pushfd]; push edx; push ebx; push ecx
+    if (pf) w8(0x9C);
+    w8(0x52); w8(0x53); w8(0x51);
 
-    // Owner gate: mov ebx,[esp+20] (arg0); cmp ebx,[lastOwnerGlobal]; jne .ringwrite
+    // Owner gate: mov ebx,[esp+arg0]; cmp ebx,[lastOwnerGlobal]; jne .ringwrite
     if (lastOwnerGlobal !== 0) {
         w8(0x8B); w8(0x5C); w8(0x24); w8(argDisp(0));
         w8(0x3B); w8(0x1D); w32(lastOwnerGlobal);
@@ -161,31 +163,30 @@ export function writeShadowTrampoline(
     w8(0x03); w8(0xDA);                                // add ebx, edx
     w8(0x89); w8(0x03);                                // mov [ebx], eax (funcId)
     for (let i = 0; i < argCount; i++) {
-        w8(0x8B); w8(0x44); w8(0x24); w8(argDisp(i));  // mov eax, [esp+20+i*4]
+        w8(0x8B); w8(0x44); w8(0x24); w8(argDisp(i));  // mov eax, [esp+arg i]
         w8(0x89); w8(0x43); w8((i + 1) * 4);           // mov [ebx+(i+1)*4], eax
     }
     w8(0x83); w8(0x05); w32(ctrlAddr); w8(stride);     // add dword [ctrlAddr], stride
 
-    // .tail: pop ecx; pop ebx; pop edx; mov edx,0xB077; xor eax,eax; popfd; ret retPop
+    // .tail: pop ecx; pop ebx; pop edx; mov edx,0xB077; xor eax,eax; [popfd]; ret retPop
     w8(0x59); w8(0x5B); w8(0x5A);
     w8(0xBA); w32(0xB077);
     w8(0x31); w8(0xC0);
-    w8(0x9D);
+    if (pf) w8(0x9D);
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);
 
-    // .skip: inc [skipCounter]; pop ecx; pop ebx; pop edx; xor eax,eax; popfd; ret retPop
-    // (inc dirties EFLAGS, but the following popfd restores the caller's flags.)
+    // .skip: inc [skipCounter]; pop ecx; pop ebx; pop edx; xor eax,eax; [popfd]; ret retPop
     const skipAddr = off;
     w8(0xFF); w8(0x05); w32(skipCounterAddr);  // inc dword [skipCounterAddr]
     w8(0x59); w8(0x5B); w8(0x5A);
     w8(0x31); w8(0xC0);
-    w8(0x9D);
+    if (pf) w8(0x9D);
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);
 
-    // .overflow: pop ecx; pop ebx; pop edx; popfd; mov edx,0xB077; out dx,eax; ret retPop
+    // .overflow: pop ecx; pop ebx; pop edx; [popfd]; mov edx,0xB077; out dx,eax; ret retPop
     const ovfAddr = off;
     w8(0x59); w8(0x5B); w8(0x5A);
-    w8(0x9D);
+    if (pf) w8(0x9D);
     w8(0xBA); w32(0xB077);
     w8(0xEF);
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);
@@ -251,14 +252,16 @@ export function writeIncRefStubTrampoline(
     const w8 = (v: number) => { mem[off++] = v & 0xFF; };
     const w32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
     const outPatch: number[] = [];
+    const pf = stubsPreserveEflags() ? 4 : 0;
 
     const trampAddr = off;
-    // pushfd; push ecx; push edx — 3 pushes + retAddr, so `this` sits at [esp+16].
-    w8(0x9C); w8(0x51); w8(0x52);
+    // [pushfd]; push ecx; push edx — with retAddr, `this` sits at [esp+12+pf].
+    if (pf) w8(0x9C);
+    w8(0x51); w8(0x52);
     if (predictAddr) {
         w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x00);   // mov byte [predict+4], 0
     }
-    w8(0x8B); w8(0x4C); w8(0x24); w8(16);                     // mov ecx, [esp+16]
+    w8(0x8B); w8(0x4C); w8(0x24); w8(12 + pf);                // mov ecx, [esp+this]
     w8(0x85); w8(0xC9);                                       // test ecx, ecx
     w8(0x0F); w8(0x84); outPatch.push(off); w32(0);           // jz .out
     w8(0x8B); w8(0x11);                                       // mov edx, [ecx]
@@ -273,12 +276,14 @@ export function writeIncRefStubTrampoline(
     } else {
         w8(0xFF); w8(0x41); w8(fieldOffset);                  // inc dword [ecx+off]
         w8(0x8B); w8(0x41); w8(fieldOffset);                  // mov eax, [ecx+off]
-        w8(0x5A); w8(0x59); w8(0x9D);                         // pop edx; pop ecx; popfd
+        w8(0x5A); w8(0x59);                                   // pop edx; pop ecx
+        if (pf) w8(0x9D);                                     // popfd
         w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
     }
 
     const outAddr = off;                                      // .out: original OUT-trap tail
-    w8(0x5A); w8(0x59); w8(0x9D);                             // pop edx; pop ecx; popfd
+    w8(0x5A); w8(0x59);                                       // pop edx; pop ecx
+    if (pf) w8(0x9D);                                         // popfd
     w8(0xBA); w32(0xB077);                                    // mov edx, 0xB077
     w8(0xEF);                                                 // out dx, eax  (EAX = funcId)
     w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
@@ -344,14 +349,16 @@ export function writeDecRefStubTrampoline(
     const w8 = (v: number) => { mem[off++] = v & 0xFF; };
     const w32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
     const outPatch: number[] = [];
+    const pf = stubsPreserveEflags() ? 4 : 0;
 
     const trampAddr = off;
-    // pushfd; push ecx; push edx — 3 pushes + retAddr, so `this` sits at [esp+16].
-    w8(0x9C); w8(0x51); w8(0x52);
+    // [pushfd]; push ecx; push edx — with retAddr, `this` sits at [esp+12+pf].
+    if (pf) w8(0x9C);
+    w8(0x51); w8(0x52);
     if (predictAddr) {
         w8(0xC6); w8(0x05); w32(predictAddr + 4); w8(0x00);   // mov byte [predict+4], 0
     }
-    w8(0x8B); w8(0x4C); w8(0x24); w8(16);                     // mov ecx, [esp+16]
+    w8(0x8B); w8(0x4C); w8(0x24); w8(12 + pf);                // mov ecx, [esp+this]
     w8(0x85); w8(0xC9);                                       // test ecx, ecx
     w8(0x0F); w8(0x84); outPatch.push(off); w32(0);           // jz .out
     w8(0x8B); w8(0x11);                                       // mov edx, [ecx]
@@ -375,12 +382,14 @@ export function writeDecRefStubTrampoline(
         w8(0x0F); w8(0x86); outPatch.push(off); w32(0);       // jbe .out  (the 1→0, and a bogus 0)
         w8(0xFF); w8(0x49); w8(fieldOffset);                  // dec dword [ecx+off]
         w8(0x8B); w8(0x41); w8(fieldOffset);                  // mov eax, [ecx+off]
-        w8(0x5A); w8(0x59); w8(0x9D);                         // pop edx; pop ecx; popfd
+        w8(0x5A); w8(0x59);                                   // pop edx; pop ecx
+        if (pf) w8(0x9D);                                     // popfd
         w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
     }
 
     const outAddr = off;                                      // .out: original OUT-trap tail
-    w8(0x5A); w8(0x59); w8(0x9D);                             // pop edx; pop ecx; popfd
+    w8(0x5A); w8(0x59);                                       // pop edx; pop ecx
+    if (pf) w8(0x9D);                                         // popfd
     w8(0xBA); w32(0xB077);                                    // mov edx, 0xB077
     w8(0xEF);                                                 // out dx, eax  (EAX = funcId)
     w8(0xC2); w8(popBytes & 0xFF); w8((popBytes >> 8) & 0xFF);
@@ -425,10 +434,12 @@ export function writeOwnerDisarmScalarTrampoline(
     const w32 = (v: number) => { dv.setUint32(off, v >>> 0, true); off += 4; };
     const capacityLimit = capacity - 36;
     const bytesToPop = argCount * 4;
+    const pf = stubsPreserveEflags() ? 4 : 0;
 
     const trampAddr = off;
-    // pushfd; push edx; push ebx
-    w8(0x9C); w8(0x52); w8(0x53);
+    // [pushfd]; push edx; push ebx
+    if (pf) w8(0x9C);
+    w8(0x52); w8(0x53);
     // mov edx, [ctrlAddr]; cmp edx, capacityLimit; jge .overflow
     w8(0x8B); w8(0x15); w32(ctrlAddr);
     w8(0x81); w8(0xFA); w32(capacityLimit);
@@ -440,22 +451,22 @@ export function writeOwnerDisarmScalarTrampoline(
     w8(0x03); w8(0xDA);
     w8(0x89); w8(0x03);
     for (let i = 0; i < argCount; i++) {
-        // mov eax, [esp + 16 + i*4]; mov [ebx + (i+1)*4], eax
-        w8(0x8B); w8(0x44); w8(0x24); w8(16 + i * 4);
+        // mov eax, [esp + 12 + pf + i*4]; mov [ebx + (i+1)*4], eax
+        w8(0x8B); w8(0x44); w8(0x24); w8(12 + pf + i * 4);
         w8(0x89); w8(0x43); w8((i + 1) * 4);
     }
     // add dword [ctrlAddr], stride
     w8(0x83); w8(0x05); w32(ctrlAddr); w8((argCount + 1) * 4);
-    // pop ebx; pop edx; mov edx,0xB077; xor eax,eax; popfd; ret N
+    // pop ebx; pop edx; mov edx,0xB077; xor eax,eax; [popfd]; ret N
     w8(0x5B); w8(0x5A);
     w8(0xBA); w32(0xB077);
     w8(0x31); w8(0xC0);
-    w8(0x9D);
+    if (pf) w8(0x9D);
     w8(0xC2); w8(bytesToPop & 0xFF); w8((bytesToPop >> 8) & 0xFF);
-    // .overflow: pop ebx; pop edx; popfd; mov edx,0xB077; out dx,eax; ret N
+    // .overflow: pop ebx; pop edx; [popfd]; mov edx,0xB077; out dx,eax; ret N
     const overflowAddr = off;
     w8(0x5B); w8(0x5A);
-    w8(0x9D);
+    if (pf) w8(0x9D);
     w8(0xBA); w32(0xB077);
     w8(0xEF);
     w8(0xC2); w8(bytesToPop & 0xFF); w8((bytesToPop >> 8) & 0xFF);
@@ -505,13 +516,15 @@ export function writeStructCaptureTrampoline(
     const strideBytes = (1 + argCount + payloadDwords) * 4;
     const payloadBytes = payloadDwords * 4;
     const retPop = argCount * 4;
-    // 6 pushes (flags,edx,ebx,ecx,esi,edi) + retAddr → stdcall arg i at [esp+28+4i].
-    const argDisp = (i: number) => 28 + i * 4;
+    const pf = stubsPreserveEflags() ? 4 : 0;
+    // 5 pushes (edx,ebx,ecx,esi,edi) [+ flags] + retAddr → stdcall arg i at [esp+24+pf+4i].
+    const argDisp = (i: number) => 24 + pf + i * 4;
     const ramLimit = mem.length >>> 0;
     const ovfPatch: number[] = [];
 
     const trampStart = off;
-    w8(0x9C); w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57); // pushfd; push edx,ebx,ecx,esi,edi
+    if (pf) w8(0x9C);                                            // pushfd
+    w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57);            // push edx,ebx,ecx,esi,edi
     w8(0x89); w8(0xC7);                                          // mov edi, eax (funcId)
     w8(0x8B); w8(0x74); w8(0x24); w8(argDisp(ptrArgIndex));      // mov esi, [esp+ptrDisp]
     w8(0x85); w8(0xF6);                                          // test esi, esi
@@ -535,13 +548,13 @@ export function writeStructCaptureTrampoline(
     w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);            // pop edi,esi,ecx,ebx,edx
     w8(0xBA); w32(0xB077);                                       // mov edx, 0xB077
     w8(0x31); w8(0xC0);                                          // xor eax, eax
-    w8(0x9D);                                                    // popfd
+    if (pf) w8(0x9D);                                            // popfd
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);       // ret retPop
 
     const ovfAddr = off;                                         // .ovf: OUT-trap fallback
     w8(0x89); w8(0xF8);                                          // mov eax, edi (funcId)
     w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);
-    w8(0x9D);                                                    // popfd
+    if (pf) w8(0x9D);                                            // popfd
     w8(0xBA); w32(0xB077);
     w8(0xEF);                                                    // out dx, eax
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);
@@ -597,13 +610,15 @@ export function writeMultiStructCaptureTrampoline(
     const strideBytes = (1 + argCount + ptrCount * payloadDwords) * 4;
     const payloadBytes = payloadDwords * 4;
     const retPop = argCount * 4;
-    // 6 pushes (flags,edx,ebx,ecx,esi,edi) + retAddr → stdcall arg i at [esp+28+4i].
-    const argDisp = (i: number) => 28 + i * 4;
+    const pf = stubsPreserveEflags() ? 4 : 0;
+    // 5 pushes (edx,ebx,ecx,esi,edi) [+ flags] + retAddr → stdcall arg i at [esp+24+pf+4i].
+    const argDisp = (i: number) => 24 + pf + i * 4;
     const ramLimit = mem.length >>> 0;
     const ovfPatch: number[] = [];
 
     const trampStart = off;
-    w8(0x9C); w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57); // pushfd; push edx,ebx,ecx,esi,edi
+    if (pf) w8(0x9C);                                            // pushfd
+    w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57);            // push edx,ebx,ecx,esi,edi
     w8(0x89); w8(0xC7);                                          // mov edi, eax (funcId)
     // Validate EVERY pointer first — edi still carries funcId here, which is what .ovf
     // hands back to the trap, and nothing has been written to the ring yet.
@@ -626,7 +641,7 @@ export function writeMultiStructCaptureTrampoline(
     }
     // rep movsd walks upward only with DF clear. The ABI guarantees that at a call
     // boundary, but this trampoline runs guest code we emitted, so assert it rather than
-    // inherit it; popfd puts the caller's flags back either way.
+    // inherit it; DF=0 is also what the ABI requires the caller to get back.
     w8(0xFC);                                                    // cld
     w8(0x8D); w8(0x7B); w8((1 + argCount) * 4);                  // lea edi, [ebx+(1+argCount)*4]
     for (const p of ptrArgIndices) {
@@ -640,13 +655,13 @@ export function writeMultiStructCaptureTrampoline(
     w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);            // pop edi,esi,ecx,ebx,edx
     w8(0xBA); w32(0xB077);                                       // mov edx, 0xB077
     w8(0x31); w8(0xC0);                                          // xor eax, eax
-    w8(0x9D);                                                    // popfd
+    if (pf) w8(0x9D);                                            // popfd
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);       // ret retPop
 
     const ovfAddr = off;                                         // .ovf: OUT-trap fallback
     w8(0x89); w8(0xF8);                                          // mov eax, edi (funcId)
     w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);
-    w8(0x9D);                                                    // popfd
+    if (pf) w8(0x9D);                                            // popfd
     w8(0xBA); w32(0xB077);
     w8(0xEF);                                                    // out dx, eax
     w8(0xC2); w8(retPop & 0xFF); w8((retPop >> 8) & 0xFF);
@@ -686,13 +701,16 @@ export function writeUpDrawCaptureTrampoline(
     const ramLimit = mem.length >>> 0;
     const ovfPatch: number[] = [];
     const havePatch: number[] = []; // rel8 sites → .have
-    // 6 pushes + retAddr: this@28, primType@32, primCount@36, pData@40, stride@44.
+    const pf = stubsPreserveEflags() ? 4 : 0;
+    // 5 pushes [+ flags] + retAddr: this, primType, primCount, pData, stride from [esp+24+pf].
+    const THIS = 24 + pf, PRIM_TYPE = 28 + pf, PRIM_COUNT = 32 + pf, P_DATA = 36 + pf, STRIDE = 40 + pf;
 
     const trampStart = off;
-    w8(0x9C); w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57);
+    if (pf) w8(0x9C);                                       // pushfd
+    w8(0x52); w8(0x53); w8(0x51); w8(0x56); w8(0x57);       // push edx,ebx,ecx,esi,edi
     w8(0x89); w8(0xC7);                                     // mov edi, eax (funcId)
-    w8(0x8B); w8(0x44); w8(0x24); w8(32);                   // mov eax, [esp+32] primType
-    w8(0x8B); w8(0x4C); w8(0x24); w8(36);                   // mov ecx, [esp+36] primCount
+    w8(0x8B); w8(0x44); w8(0x24); w8(PRIM_TYPE);            // mov eax, [esp+primType]
+    w8(0x8B); w8(0x4C); w8(0x24); w8(PRIM_COUNT);           // mov ecx, [esp+primCount]
     w8(0x85); w8(0xC9);                                     // test ecx, ecx
     w8(0x0F); w8(0x84); ovfPatch.push(off); w32(0);         // jz .ovf
     // vertexCount by primType: 4→*3, 5/6→+2, 3→+1, 2→*2, else .ovf
@@ -716,7 +734,7 @@ export function writeUpDrawCaptureTrampoline(
     w8(0x83); w8(0xC1); w8(2);                              // add ecx,2
     const haveAddr = off;                                   // .have:
     for (const p of havePatch) mem[p] = haveAddr - (p + 1);
-    w8(0x8B); w8(0x44); w8(0x24); w8(44);                   // mov eax, [esp+44] stride
+    w8(0x8B); w8(0x44); w8(0x24); w8(STRIDE);               // mov eax, [esp+stride]
     w8(0x85); w8(0xC0);                                     // test eax, eax
     w8(0x0F); w8(0x84); ovfPatch.push(off); w32(0);         // jz .ovf
     w8(0xA8); w8(0x03);                                     // test al, 3 (dword-multiple only)
@@ -726,7 +744,7 @@ export function writeUpDrawCaptureTrampoline(
     w8(0x0F); w8(0xAF); w8(0xC8);                           // imul ecx, eax → byteCount
     w8(0x81); w8(0xF9); w32(65536);                         // cmp ecx, 64KiB
     w8(0x0F); w8(0x87); ovfPatch.push(off); w32(0);         // ja .ovf
-    w8(0x8B); w8(0x74); w8(0x24); w8(40);                   // mov esi, [esp+40] pData
+    w8(0x8B); w8(0x74); w8(0x24); w8(P_DATA);               // mov esi, [esp+pData]
     w8(0x85); w8(0xF6);                                     // test esi, esi
     w8(0x0F); w8(0x84); ovfPatch.push(off); w32(0);         // jz .ovf
     w8(0x81); w8(0xFE); w32(ramLimit);                      // cmp esi, ramLimit (kills lea wrap)
@@ -741,10 +759,10 @@ export function writeUpDrawCaptureTrampoline(
     w8(0xBB); w32(dataBase);                                // mov ebx, dataBase
     w8(0x03); w8(0xDA);                                     // add ebx, edx
     w8(0x89); w8(0x3B);                                     // mov [ebx], edi (funcId)
-    w8(0x8B); w8(0x44); w8(0x24); w8(28); w8(0x89); w8(0x43); w8(4);   // this
-    w8(0x8B); w8(0x44); w8(0x24); w8(32); w8(0x89); w8(0x43); w8(8);   // primType
-    w8(0x8B); w8(0x44); w8(0x24); w8(36); w8(0x89); w8(0x43); w8(12);  // primCount
-    w8(0x8B); w8(0x44); w8(0x24); w8(44); w8(0x89); w8(0x43); w8(16);  // stride
+    w8(0x8B); w8(0x44); w8(0x24); w8(THIS); w8(0x89); w8(0x43); w8(4);        // this
+    w8(0x8B); w8(0x44); w8(0x24); w8(PRIM_TYPE); w8(0x89); w8(0x43); w8(8);   // primType
+    w8(0x8B); w8(0x44); w8(0x24); w8(PRIM_COUNT); w8(0x89); w8(0x43); w8(12); // primCount
+    w8(0x8B); w8(0x44); w8(0x24); w8(STRIDE); w8(0x89); w8(0x43); w8(16);     // stride
     w8(0x89); w8(0x4B); w8(20);                             // mov [ebx+20], ecx (byteCount)
     w8(0x8D); w8(0x7B); w8(24);                             // lea edi, [ebx+24]
     w8(0xC1); w8(0xE9); w8(2);                              // shr ecx, 2
@@ -755,13 +773,13 @@ export function writeUpDrawCaptureTrampoline(
     w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);       // pops
     w8(0xBA); w32(0xB077);
     w8(0x31); w8(0xC0);                                     // xor eax, eax
-    w8(0x9D);                                               // popfd
+    if (pf) w8(0x9D);                                       // popfd
     w8(0xC2); w8(20); w8(0);                                // ret 20
 
     const ovfAddr = off;                                    // .ovf: OUT-trap fallback
     w8(0x89); w8(0xF8);                                     // mov eax, edi
     w8(0x5F); w8(0x5E); w8(0x59); w8(0x5B); w8(0x5A);
-    w8(0x9D);
+    if (pf) w8(0x9D);                                       // popfd
     w8(0xBA); w32(0xB077);
     w8(0xEF);
     w8(0xC2); w8(20); w8(0);
