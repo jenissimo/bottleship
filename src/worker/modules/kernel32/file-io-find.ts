@@ -6,6 +6,7 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { readStringA, readStringW, encodeFileApiString } from './file-io-strings';
+import { VFS_FILETIME } from '../../runtime/filesystem/file-time';
 
 const INVALID_HANDLE_VALUE = -1;
 const ERROR_FILE_NOT_FOUND = 2;
@@ -79,10 +80,9 @@ const fillFindDataA = (mem: Uint8Array, addr: number, entry: any) => {
     mem.fill(0, addr, Math.min(addr + WIN32_FIND_DATAA_SIZE, mem.length));
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     view.setUint32(addr, entry.kind === 'dir' ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE, true);
-    // Times (stubs)
-    view.setBigUint64(addr + 4, 0n, true);
-    view.setBigUint64(addr + 12, 0n, true);
-    view.setBigUint64(addr + 20, 0n, true);
+    view.setBigUint64(addr + 4, VFS_FILETIME, true);
+    view.setBigUint64(addr + 12, VFS_FILETIME, true);
+    view.setBigUint64(addr + 20, VFS_FILETIME, true);
     view.setUint32(addr + 28, Math.floor(entry.size / 0x100000000), true);
     view.setUint32(addr + 32, entry.size >>> 0, true);
 
@@ -97,10 +97,9 @@ const fillFindDataW = (mem: Uint8Array, addr: number, entry: any) => {
     mem.fill(0, addr, Math.min(addr + WIN32_FIND_DATAW_SIZE, mem.length));
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     view.setUint32(addr, entry.kind === 'dir' ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE, true);
-    // Times (stubs)
-    view.setBigUint64(addr + 4, 0n, true);
-    view.setBigUint64(addr + 12, 0n, true);
-    view.setBigUint64(addr + 20, 0n, true);
+    view.setBigUint64(addr + 4, VFS_FILETIME, true);
+    view.setBigUint64(addr + 12, VFS_FILETIME, true);
+    view.setBigUint64(addr + 20, VFS_FILETIME, true);
     view.setUint32(addr + 28, Math.floor(entry.size / 0x100000000), true);
     view.setUint32(addr + 32, entry.size >>> 0, true);
 

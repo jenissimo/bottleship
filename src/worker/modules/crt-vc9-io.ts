@@ -5,6 +5,7 @@
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import type { VfsEntry, VfsFileHandle } from "../runtime/filesystem/vfs";
+import { VFS_FILE_TIME_UNIX_SECONDS } from "../runtime/filesystem/file-time";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { getCPU } from "../core/thunking/thunk-utils";
 import { ArrayVaListReader, scanCLazy } from "./crt-format";
@@ -119,20 +120,10 @@ function findAttrib(entry: VfsEntry): number {
     return entry.kind === "dir" ? A_SUBDIR : (A_NORMAL | A_ARCH);
 }
 
-/**
- * The one timestamp every file carries: 2020-01-01 UTC, as time_t.
- *
- * The VFS keeps no per-file mtime, and leaving the fields at zero dates every file to the
- * epoch — a guest that compares a cache/save against its source then sees "1970" for both
- * operands, which is not a comparison anyone wrote code for. A single plausible instant makes
- * same-age the answer, and it is the SAME instant kernel32's BY_HANDLE_FILE_INFORMATION and
- * WIN32_FIND_DATA report, so the CRT and Win32 views of a file cannot disagree.
- */
-const FIXED_TIME_T = 1577836800; // 2020-01-01T00:00:00Z
-
-/** Write a time_t at `offset`; `wide` selects the 64-bit __time64_t layout. */
+/** Write the VFS file time (see file-time.ts) as a time_t at `offset`; `wide` selects
+ *  the 64-bit __time64_t layout. */
 function writeTimeT(structPtr: number, offset: number, wide: boolean): void {
-    Mem.writeUint32(structPtr + offset, FIXED_TIME_T);
+    Mem.writeUint32(structPtr + offset, VFS_FILE_TIME_UNIX_SECONDS);
     if (wide) Mem.writeUint32(structPtr + offset + 4, 0);
 }
 
