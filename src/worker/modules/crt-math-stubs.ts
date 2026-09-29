@@ -4,6 +4,7 @@
 
 import { Logger, LogCategory } from '../core/logger';
 import type { StubAllocator } from '../core/thunking/thunk-memory-manager';
+import { FTOL_TRUNCATE_BODY } from '../core/hle-lib/native-leaves';
 
 /** Micro-thunk entry points, as named on {@link CrtMathStubs}. */
 export type CrtMathStubName = 'floorStub' | 'ceilStub' | 'fabsStub' | 'sqrtStub' | 'ftolStub';
@@ -22,9 +23,8 @@ export interface CrtMathStubs {
 const RC_MASK = 0x0C00;
 const RC_DOWN = 0x0400;   // toward -inf  (floor)
 const RC_UP = 0x0800;     // toward +inf  (ceil)
-const RC_TRUNC = 0x0C00;  // toward zero  (_ftol)
 
-/** 5 stubs, largest 42 bytes; one 256-byte block keeps them on one page. */
+/** 5 stubs, largest 37 bytes; one 256-byte block keeps them on one page. */
 const REGION_SIZE = 256;
 
 /**
@@ -42,11 +42,11 @@ const REGION_SIZE = 256;
  * exactly like the hypercall's fpu_push.
  *
  * floor/ceil set the x87 rounding control around FRNDINT and restore the caller's
- * control word, which is what the real CRT does; _ftol sets RC=truncate around
- * FISTP, which is literally the shipped MSVC _ftol body. Scratch space is the
- * argument area ([ESP+4..+11], dead once loaded — in 32-bit cdecl the parameter
- * slots are the callee's to modify) for the double-arg stubs, and 16 bytes of
- * fresh stack for _ftol, which has no argument area.
+ * control word, which is what the real CRT does; _ftol is FISTTP, which truncates
+ * without touching the control word (shared with the static-CRT copies, native-leaves.ts).
+ * Scratch space is the argument area ([ESP+4..+11], dead once loaded — in 32-bit cdecl
+ * the parameter slots are the callee's to modify) for the double-arg stubs, and 8 bytes
+ * of fresh stack for _ftol, which has no argument area.
  *
  * The FLDCW window is preempt-safe: the control word is per-thread state — saved and
  * restored with the rest of the x87 snapshot (fpu-helper.ts) — and softfloat reads RC/PC
@@ -119,38 +119,10 @@ export function writeCrtMathStubs(
     w(0xD9, 0xFA);
     w(0xC3);
 
-    /**
-     * __int64 _ftol(void): operand in ST(0), truncated toward zero, popped,
-     * returned in EDX:EAX. The shipped MSVC body, minus the EBP frame:
-     *   83 EC 10          sub    esp, 16
-     *   D9 3C 24          fnstcw word [esp]
-     *   66 8B 04 24       mov    ax, [esp]
-     *   66 0D 00 0C       or     ax, RC_TRUNC     ; RC=11, both bits set — no AND needed
-     *   66 89 44 24 04    mov    [esp+4], ax
-     *   D9 6C 24 04       fldcw  word [esp+4]
-     *   DF 7C 24 08       fistp  qword [esp+8]    ; store+pop the 64-bit integer
-     *   D9 2C 24          fldcw  word [esp]       ; restore caller CW
-     *   8B 44 24 08       mov    eax, [esp+8]
-     *   8B 54 24 0C       mov    edx, [esp+12]
-     *   83 C4 10          add    esp, 16
-     *   C3                ret
-     * Out-of-range/NaN yields the x87 integer indefinite (0x8000000000000000) rather
-     * than the hypercall's saturation — hardware behavior, and the in-range results
-     * every real caller uses are identical.
-     */
+    // __int64 _ftol(void): operand in ST(0), truncated toward zero, popped, returned in
+    // EDX:EAX — see FTOL_TRUNCATE_BODY.
     const ftolStub = off;
-    w(0x83, 0xEC, 0x10);
-    w(0xD9, 0x3C, 0x24);
-    w(0x66, 0x8B, 0x04, 0x24);
-    w(0x66, 0x0D, RC_TRUNC & 0xFF, (RC_TRUNC >> 8) & 0xFF);
-    w(0x66, 0x89, 0x44, 0x24, 0x04);
-    w(0xD9, 0x6C, 0x24, 0x04);
-    w(0xDF, 0x7C, 0x24, 0x08);
-    w(0xD9, 0x2C, 0x24);
-    w(0x8B, 0x44, 0x24, 0x08);
-    w(0x8B, 0x54, 0x24, 0x0C);
-    w(0x83, 0xC4, 0x10);
-    w(0xC3);
+    w(...FTOL_TRUNCATE_BODY);
 
     if (off > base + REGION_SIZE) {
         // A silent overrun would corrupt whatever the allocator handed out next.

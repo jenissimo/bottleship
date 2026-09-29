@@ -3686,6 +3686,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
       enable: cfg.enable,
       logOnly: cfg.logOnly,
       report: libHleManager.getReport(),
+      nativeLeaves: libHleManager.getNativeLeafSites(),
     });
     return;
   }

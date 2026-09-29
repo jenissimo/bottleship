@@ -22,6 +22,7 @@ import { EmulatorConfig } from '../emulator-config-manager';
 import { runDetector } from './lib-detector';
 import { libRegistry } from './lib-registry';
 import { applyPatch, PatchContext } from './lib-patcher';
+import { applyNativeLeaves, findNativeLeaves, type NativeLeafSite } from './native-leaves';
 import {
     LiveShadowView,
     ScratchShadowView,
@@ -69,6 +70,9 @@ class LibHleManager {
     private sentinelAddress = 0;
     /** One-shot log latch: run_guest_until missing from the wasm build. */
     private warnedNoExport = false;
+    /** Static CRT leaves replaced in place (native-leaves.ts) — they run as guest code, so
+     *  there is no hit count, only where they were replaced. */
+    private nativeLeafSites: NativeLeafSite[] = [];
 
     initialize(init: ManagerInit): void {
         this.init = init;
@@ -161,6 +165,8 @@ class LibHleManager {
         const cfg = EmulatorConfig.getInstance().hleLibs;
         if (!cfg.enable) return;
 
+        this.replaceNativeLeaves(module, cfg.logOnly);
+
         const descriptors = libRegistry.getAll();
         if (descriptors.length === 0) {
             Logger.warn(LogCategory.SYSTEM, `[HLE-lib] onModuleLoaded(${module.name}) — no descriptors registered; did libs/*/index.ts import?`);
@@ -207,6 +213,24 @@ class LibHleManager {
 
             this.applyMatch(match);
         }
+    }
+
+    /** Kill switch for A/B: `setWorkerFlag('__noNativeLeaves', true)` before the image loads. */
+    private replaceNativeLeaves(module: LoadedPEModule, logOnly: boolean): void {
+        if ((globalThis as { __noNativeLeaves?: boolean }).__noNativeLeaves === true) return;
+        const image = this.init?.getMemory();
+        if (!image) return;
+        if (logOnly) {
+            for (const s of findNativeLeaves(image, module)) {
+                Logger.log(LogCategory.SYSTEM, `[HLE-lib] logOnly=true — native leaf ${s.crt} ${s.name} @ 0x${s.address.toString(16)} NOT replaced`);
+            }
+            return;
+        }
+        this.nativeLeafSites.push(...applyNativeLeaves(image, module));
+    }
+
+    getNativeLeafSites(): NativeLeafSite[] {
+        return [...this.nativeLeafSites];
     }
 
     private applyMatch(match: LibMatch): void {
@@ -629,6 +653,7 @@ class LibHleManager {
         this.patches.clear();
         this.hits.clear();
         this.shadowRuntimes.clear();
+        this.nativeLeafSites = [];
         this.sentinelAddress = 0; // thunk region is rebuilt with the process
         this.warnedNoExport = false;
         // Descriptors hold per-site state resolved out of the old image (table addresses,
