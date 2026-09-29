@@ -28,7 +28,7 @@ function counters(over: Partial<DispatchCounters> = {}): DispatchCounters {
 
 function snap(over: Partial<DispatchSnapshot> = {}): DispatchSnapshot {
     return {
-        atMs: 0, counters: counters(), retiredCounter: 0,
+        atMs: 0, counters: counters(), retiredTotal: 0,
         statsEnabled: 1, profilerEnabled: false, armEpoch: 1, entryEip: NO_EIP,
         ...over,
     };
@@ -44,7 +44,7 @@ describe("dispatch class split", () => {
     test("shares are of every module exit, chained ones included", () => {
         const before = snap();
         const after = snap({
-            atMs: 1000, retiredCounter: 1_000_000,
+            atMs: 1000, retiredTotal: 1_000_000,
             counters: counters({
                 blockExecution: 5000, moduleReentry: 400, moduleChainedEdge: 355,
                 moduleExitChainable: 100, moduleExitDynamic: 250, moduleExitIndirect: 285,
@@ -70,7 +70,7 @@ describe("dispatch class split", () => {
 
     test("a probe split that does not partition the dispatches says so", () => {
         const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 10, retiredCounter: 1000,
+            atMs: 10, retiredTotal: 1000,
             counters: counters({
                 blockExecution: 110, moduleReentry: 110, moduleExitDynamic: 10, moduleExitIndirect: 100, retChainMiss: 100,
                 abseipDispatch: 100, retMemoHit: 40, retMemoAlias: 5, retMemoCold: 5, retChainBudget: 0,
@@ -82,7 +82,7 @@ describe("dispatch class split", () => {
 
     test("NFSU observed counters partition transitions after excluding successful RET chains", () => {
         const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 5024, retiredCounter: 868764501,
+            atMs: 5024, retiredTotal: 868764501,
             counters: counters({ blockExecution: 175415083, moduleReentry: 16675142,
                 moduleExitChainable: 11481971, moduleExitDynamic: 2227062, moduleExitIndirect: 14033277,
                 abseipDispatch: 17908461, retMemoHit: 10812151, retMemoAlias: 392498,
@@ -101,7 +101,7 @@ describe("dispatch class split", () => {
 
     test("an indirect-dominated profile names the inline-cache lever", () => {
         const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 100, retiredCounter: 500_000,
+            atMs: 100, retiredTotal: 500_000,
             counters: counters({
                 blockExecution: 900, moduleReentry: 800, moduleChainedEdge: 20,
                 moduleExitIndirect: 600, moduleExitDynamic: 100, moduleExitChainable: 50,
@@ -113,7 +113,7 @@ describe("dispatch class split", () => {
 
     test("cold memo misses steer AWAY from widening the memo", () => {
         const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 100, retiredCounter: 500_000,
+            atMs: 100, retiredTotal: 500_000,
             counters: counters({
                 blockExecution: 900, moduleReentry: 800, moduleExitDynamic: 700,
                 abseipDispatch: 700, retMemoHit: 100, retMemoAlias: 50, retMemoCold: 550,
@@ -125,21 +125,21 @@ describe("dispatch class split", () => {
 
     test("a shipping build reports the profiler-only classes as absent, not zero", () => {
         const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 100, retiredCounter: 1000,
+            atMs: 100, retiredTotal: 1000,
             counters: counters({ blockExecution: 10, moduleReentry: 10, moduleExitDynamic: 10 }),
         })));
         expect(r.profilerOnly.available).toBe(false);
         expect(r.profilerOnly.reason).toContain("Absent, not zero");
     });
 
-    test("the retired counter is differenced wrap-safely", () => {
+    test("a window longer than several counter wraps keeps its full denominator", () => {
         const r = armed(summarizeDispatch(
-            snap({ retiredCounter: 0xffff_f000 }),
+            snap(),
             snap({
-                atMs: 100, retiredCounter: 0x0000_1000,
+                atMs: 43_000, retiredTotal: 2 * 0x1_0000_0000 + 2_111_476_080,
                 counters: counters({ blockExecution: 10, moduleReentry: 10 }),
             })));
-        expect(r.retired).toBe(0x2000);
+        expect(r.retired).toBe(10_701_410_672);
     });
 });
 
@@ -151,7 +151,7 @@ describe("dispatchReport refuses rather than reporting a confident zero", () => 
     });
 
     test("counters flat while the guest retired instructions", () => {
-        const s = summarizeDispatch(snap(), snap({ atMs: 100, retiredCounter: 5_000_000 }));
+        const s = summarizeDispatch(snap(), snap({ atMs: 100, retiredTotal: 5_000_000 }));
         expect(s.ok).toBe(false);
         expect((s as any).refuse).toContain("BLOCK_EXECUTION did not move");
     });
@@ -174,19 +174,11 @@ describe("dispatchReport refuses rather than reporting a confident zero", () => 
         expect((s as any).armed).toBe(false);
         expect((s as any).reason).toContain("retired no instructions");
     });
-
-    test("a window past the retired counter's wrap period is flagged", () => {
-        const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 45_000, retiredCounter: 1_000_000,
-            counters: counters({ blockExecution: 10, moduleReentry: 10 }),
-        })));
-        expect(r.retiredWarning).toContain("wrap period");
-    });
 });
 
 describe("the entry-EIP census carries its own completeness", () => {
     const withEip = (over: Partial<EntryEipCensus>): DispatchSnapshot => snap({
-        atMs: 100, retiredCounter: 100_000,
+        atMs: 100, retiredTotal: 100_000,
         counters: counters({ blockExecution: 500, moduleReentry: 500, moduleExitDynamic: 500 }),
         entryEip: {
             available: true, samples: 1000, evictions: 0, evictionPct: 0, attributed: 1000,
@@ -214,7 +206,7 @@ describe("the entry-EIP census carries its own completeness", () => {
 
     test("a build without the census reports unavailable rather than an empty ranking", () => {
         const r = armed(summarizeDispatch(snap(), snap({
-            atMs: 100, retiredCounter: 100_000,
+            atMs: 100, retiredTotal: 100_000,
             counters: counters({ blockExecution: 10, moduleReentry: 10 }),
         })));
         expect(r.entryEip.available).toBe(false);

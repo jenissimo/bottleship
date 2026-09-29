@@ -21,7 +21,7 @@
 
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import { retiredDelta } from "./perf";
+import { startRetiredAccumulator, peekRetiredTotal, stopRetiredAccumulator, type RetiredAccumulator } from "./perf";
 import { cpu, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 
@@ -56,8 +56,9 @@ export interface EntryEipCensus {
 export interface DispatchSnapshot {
     atMs: number;
     counters: DispatchCounters;
-    /** cpu.instruction_counter, 32-bit and wrapping — differenced with retiredDelta. */
-    retiredCounter: number;
+    /** Instructions retired since dispatchMark(), wrap-safe: the raw counter is 32-bit and
+     *  wraps every few seconds at game speed, so one end-to-end difference undercounts. */
+    retiredTotal: number;
     /** get_dispatch_stats(): 1 while the always-on counters are being emitted. */
     statsEnabled: number;
     /** profiler_is_enabled(): the feature-gated counters (INDIRECT_JUMP_NO_ENTRY,
@@ -79,6 +80,7 @@ const exportsOf = (): Exports | null =>
 let armEpoch = 0;
 let armedAtMs = -1;
 let mark: DispatchSnapshot | null = null;
+let retiredAcc: RetiredAccumulator | null = null;
 
 export function readDispatchSnapshot(): DispatchSnapshot {
     const w = exportsOf();
@@ -94,12 +96,11 @@ export function readDispatchSnapshot(): DispatchSnapshot {
     }
     const enabledGet = w?.["get_dispatch_stats"];
     const profGet = w?.["profiler_is_enabled"];
-    const ic = (cpu() as { instruction_counter?: Int32Array } | null)?.instruction_counter;
     return {
         atMs: performance.now(),
         counters,
         entryEip: readEntryEipCensus(w),
-        retiredCounter: ic ? ic[0]! >>> 0 : 0,
+        retiredTotal: retiredAcc ? peekRetiredTotal(retiredAcc) : 0,
         statsEnabled: typeof enabledGet === "function" ? enabledGet() >>> 0 : -1,
         profilerEnabled: typeof profGet === "function" ? !!profGet() : false,
         armEpoch,
@@ -178,7 +179,7 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
 
     const d = {} as DispatchCounters;
     for (const k of DISPATCH_STAT_NAMES) d[k] = after.counters[k] - before.counters[k];
-    const retired = retiredDelta(before.retiredCounter, after.retiredCounter);
+    const retired = after.retiredTotal - before.retiredTotal;
 
     if (retired === 0) {
         return { ok: true, armed: false, windowMs: round(windowMs), reason: "the guest retired no instructions in this window" };
@@ -193,11 +194,6 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
                 + "Arm, warm the scene up, THEN mark.",
         };
     }
-    // A wrapped 32-bit retired counter over a long window is silently plausible; the
-    // denominator would be ~4.3e9 too small. Ticking the accumulator is perf.ts's job, so
-    // here the guard is a bound on the window rather than a correction.
-    const suspectWrap = windowMs > 30_000;
-
     // MODULE_EXIT_INDIRECT is incremented BEFORE RET chaining is attempted. A hit
     // therefore belongs to chained transitions, not returns to cycle_internal.
     if (d.retChainHit > d.moduleExitIndirect) {
@@ -257,12 +253,6 @@ export function summarizeDispatch(before: DispatchSnapshot, after: DispatchSnaps
             armed: true,
             windowMs: round(windowMs),
             retired,
-            ...(suspectWrap
-                ? {
-                    retiredWarning: "window longer than the ~40 s wrap period of cpu.instruction_counter; "
-                        + "`retired` and every per-instruction rate below may be one wrap short",
-                }
-                : {}),
 
             // Every module exit, chained or not: the dispatch tax's denominator.
             moduleExits: exits,
@@ -350,6 +340,8 @@ export function registerDispatchCommands(svc: HarnessService): void {
 
     /** dispatchMark() — window baseline. */
     svc.register("dispatchMark", () => {
+        if (retiredAcc) stopRetiredAccumulator(retiredAcc);
+        retiredAcc = startRetiredAccumulator();
         mark = readDispatchSnapshot();
         return {
             marked: true, atMs: round(mark.atMs), armEpoch: mark.armEpoch,

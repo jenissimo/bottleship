@@ -6,7 +6,10 @@
  * failure mode this project keeps rediscovering.
  */
 import { describe, expect, it } from "bun:test";
-import { pagesForRanges, retiredDelta, rollUpRanges, type CountedBlockSample } from "../../src/worker/harness/cmds/perf";
+import {
+    pagesForRanges, peekRetiredTotal, retiredDelta, rollUpRanges, startRetiredAccumulator, stopRetiredAccumulator,
+    type CountedBlockSample,
+} from "../../src/worker/harness/cmds/perf";
 
 describe("pagesForRanges", () => {
     it("covers every page a range touches, including the last one", () => {
@@ -89,5 +92,25 @@ describe("retiredDelta", () => {
         // 4 294 967 294 instructions from the denominator while still returning a number.
         expect(retiredDelta(0xffff_ffff, 1)).toBe(2);
         expect(retiredDelta(0xffff_f000, 0x1000)).toBe(0x2000);
+    });
+});
+
+describe("retired accumulator", () => {
+    it("keeps every wrap of a window far longer than the counter's period", () => {
+        // 250M instructions per 1s tick: the 32-bit counter wraps every ~17 ticks, so one
+        // end-to-end difference over 43 ticks would lose two whole wraps.
+        let raw = 0x1234_5678;
+        const acc = startRetiredAccumulator(() => raw);
+        try {
+            for (let t = 0; t < 43; t++) {
+                raw = (raw + 250_000_000) >>> 0;
+                peekRetiredTotal(acc);
+            }
+            expect(peekRetiredTotal(acc)).toBe(43 * 250_000_000);
+            expect(acc.wraps).toBe(2);
+        } finally {
+            stopRetiredAccumulator(acc);
+        }
+        expect(acc.timer).toBeNull();
     });
 });

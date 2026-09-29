@@ -170,7 +170,7 @@ function snap(over: Partial<CensusSnapshot> = {}): CensusSnapshot {
         opcode: new Float64Array(OPCODE_KEYS),
         addr: new Float64Array(256),
         simd: new Float64Array(1024),
-        retiredCounter: 0, enabled: 1, armEpoch: 1,
+        retiredTotal: 0, enabled: 1, armEpoch: 1,
         ...over,
     };
 }
@@ -182,7 +182,7 @@ function after(opts: {
     addrs?: Array<[number, number]>;
     simds?: Array<[number, number]>;
 }): CensusSnapshot {
-    const s = snap({ atMs: opts.atMs ?? 1000, retiredCounter: opts.retired ?? 0 });
+    const s = snap({ atMs: opts.atMs ?? 1000, retiredTotal: opts.retired ?? 0 });
     if (opts.enabled !== undefined) s.enabled = opts.enabled;
     if (opts.armEpoch !== undefined) s.armEpoch = opts.armEpoch;
     for (const [k, n] of opts.opcodes ?? []) {
