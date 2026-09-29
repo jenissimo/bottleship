@@ -68,19 +68,12 @@ describe('crt-math-stubs encodings', () => {
         expect(hex(mem, stubs.sqrtStub, 7)).toBe('dd 44 24 04 d9 fa c3');
     });
 
-    it('_ftol truncates via FISTP and returns EDX:EAX', () => {
-        expect(hex(mem, stubs.ftolStub, 42)).toBe(
-            '83 ec 10 ' +        // sub    esp, 16
-            'd9 3c 24 ' +        // fnstcw word [esp]
-            '66 8b 04 24 ' +     // mov    ax, [esp]
-            '66 0d 00 0c ' +     // or     ax, 0x0c00     (RC = truncate)
-            '66 89 44 24 04 ' +  // mov    [esp+4], ax
-            'd9 6c 24 04 ' +     // fldcw  word [esp+4]
-            'df 7c 24 08 ' +     // fistp  qword [esp+8]
-            'd9 2c 24 ' +        // fldcw  word [esp]      (restore caller CW)
-            '8b 44 24 08 ' +     // mov    eax, [esp+8]
-            '8b 54 24 0c ' +     // mov    edx, [esp+12]
-            '83 c4 10 ' +        // add    esp, 16
+    it('_ftol truncates via FISTTP and returns EDX:EAX', () => {
+        expect(hex(mem, stubs.ftolStub, 9)).toBe(
+            '83 ec 08 ' +        // sub    esp, 8
+            'dd 0c 24 ' +        // fisttp qword [esp]     (truncates whatever RC says)
+            '58 ' +              // pop    eax
+            '5a ' +              // pop    edx
             'c3');               // ret                    (cdecl: no args on the stack)
     });
 
@@ -96,7 +89,7 @@ describe('crt-math-stubs encodings', () => {
 
     it('the whole emission fits its region', () => {
         expect(stubs.regionEnd - stubs.regionBase).toBe(256);
-        expect(stubs.ftolStub + 42).toBeLessThanOrEqual(stubs.regionEnd);
+        expect(stubs.ftolStub + 9).toBeLessThanOrEqual(stubs.regionEnd);
     });
 });
 
@@ -154,28 +147,24 @@ function runStub(mem: Uint8Array, entry: number, arg?: number, st0In?: number, c
         if (at(eip, 0xC3)) return { st0: fpu[0], depth: fpu.length, cw, eax, edx, esp };
         if (at(eip, 0xDD, 0x44, 0x24, 0x04)) { fpu.unshift(dv.getFloat64(esp + 4, true)); eip += 4; }
         else if (at(eip, 0xD9, 0x7C, 0x24)) { dv.setUint16(esp + mem[eip + 3], cw, true); eip += 4; }
-        else if (at(eip, 0xD9, 0x3C, 0x24)) { dv.setUint16(esp, cw, true); eip += 3; }
         else if (at(eip, 0xD9, 0x6C, 0x24)) { cw = dv.getUint16(esp + mem[eip + 3], true); eip += 4; }
-        else if (at(eip, 0xD9, 0x2C, 0x24)) { cw = dv.getUint16(esp, true); eip += 3; }
         else if (at(eip, 0xD9, 0xFC)) { fpu[0] = roundByRc(fpu[0], cw); eip += 2; }
         else if (at(eip, 0xD9, 0xE1)) { fpu[0] = Math.abs(fpu[0]); eip += 2; }
         else if (at(eip, 0xD9, 0xFA)) { fpu[0] = Math.sqrt(fpu[0]); eip += 2; }
-        else if (at(eip, 0xDF, 0x7C, 0x24)) {
-            const v = roundByRc(fpu.shift()!, cw);
-            // x87 integer indefinite on NaN / out of range, exactly like the hardware.
+        else if (at(eip, 0xDD, 0x0C, 0x24)) {
+            // FISTTP: truncation regardless of RC; indefinite on NaN / out of range.
+            const v = Math.trunc(fpu.shift()!);
             const ok = Number.isFinite(v) && v >= -(2 ** 63) && v < 2 ** 63;
-            dv.setBigInt64(esp + mem[eip + 3], ok ? BigInt(v) : -(2n ** 63n), true);
-            eip += 4;
+            dv.setBigInt64(esp, ok ? BigInt(v) : -(2n ** 63n), true);
+            eip += 3;
         }
+        else if (at(eip, 0x58)) { eax = dv.getUint32(esp, true); esp += 4; eip += 1; }
+        else if (at(eip, 0x5A)) { edx = dv.getUint32(esp, true); esp += 4; eip += 1; }
         else if (at(eip, 0x66, 0x8B, 0x44, 0x24)) { eax = (eax & ~0xFFFF) | dv.getUint16(esp + mem[eip + 4], true); eip += 5; }
-        else if (at(eip, 0x66, 0x8B, 0x04, 0x24)) { eax = (eax & ~0xFFFF) | dv.getUint16(esp, true); eip += 4; }
         else if (at(eip, 0x66, 0x89, 0x44, 0x24)) { dv.setUint16(esp + mem[eip + 4], eax & 0xFFFF, true); eip += 5; }
         else if (at(eip, 0x66, 0x25)) { eax = (eax & ~0xFFFF) | ((eax & dv.getUint16(eip + 2, true)) & 0xFFFF); eip += 4; }
         else if (at(eip, 0x66, 0x0D)) { eax = (eax & ~0xFFFF) | ((eax | dv.getUint16(eip + 2, true)) & 0xFFFF); eip += 4; }
-        else if (at(eip, 0x8B, 0x44, 0x24)) { eax = dv.getUint32(esp + mem[eip + 3], true); eip += 4; }
-        else if (at(eip, 0x8B, 0x54, 0x24)) { edx = dv.getUint32(esp + mem[eip + 3], true); eip += 4; }
         else if (at(eip, 0x83, 0xEC)) { esp -= mem[eip + 2]; eip += 3; }
-        else if (at(eip, 0x83, 0xC4)) { esp += mem[eip + 2]; eip += 3; }
         else throw new Error(`unexpected opcode at +0x${(eip - entry).toString(16)}: ${hex(mem, eip, 6)}`);
     }
     throw new Error('stub did not return');
