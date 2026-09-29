@@ -35,6 +35,7 @@ import { registerIdleCommands } from "./cmds/idle";
 import { registerDispatchCommands } from "./cmds/dispatch";
 import { registerCensusCommands } from "./cmds/census";
 import { registerCrossingCommands } from "./cmds/crossings";
+import { registerHleCommands } from "./cmds/hle";
 import { registerPacingCommands } from "./cmds/pacing";
 import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
@@ -91,6 +92,7 @@ export function installHarnessCommands(): void {
     registerDispatchCommands(harnessService);
     registerCensusCommands(harnessService);
     registerCrossingCommands(harnessService);
+    registerHleCommands(harnessService);
     registerPacingCommands(harnessService);
     registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);
