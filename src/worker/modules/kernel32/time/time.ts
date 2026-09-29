@@ -3,6 +3,7 @@
 
 import { type HleDispatcher, ThunkImplementation, FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { TimeService } from '../../../runtime/time';
+import { VFS_FILETIME } from '../../../runtime/filesystem/file-time';
 import { Logger, LogCategory } from '../../../core/logger';
 import { System } from '../../../core/system';
 import { WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION } from '../../../core/scheduler/types';
@@ -326,7 +327,6 @@ function initTimeFunctions(): void {
     };
 
     // BOOL GetFileTime(HANDLE hFile, LPFILETIME lpCreationTime, LPFILETIME lpLastAccessTime, LPFILETIME lpLastWriteTime)
-    // Stub: reports a fixed epoch timestamp for all three fields so callers get valid output.
     exports['GetFileTime'] = (ctx, mem, args) => {
         const hFile = args[0];
         const lpCreationTime  = args[1] >>> 0;
@@ -336,14 +336,10 @@ function initTimeFunctions(): void {
         Logger.verbose(LogCategory.KERNEL32,
             `GetFileTime(hFile=0x${hFile.toString(16)})`);
 
-        // Use a fixed epoch: 2000-01-01 00:00:00 UTC
-        const unixMs = BigInt(Date.UTC(2000, 0, 1));
-        const windowsTicks = (unixMs + 11644473600000n) * 10000n;
-
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         for (const ptr of [lpCreationTime, lpLastAccessTime, lpLastWriteTime]) {
             if (ptr && ptr + 8 <= mem.length) {
-                view.setBigUint64(ptr, windowsTicks, true);
+                view.setBigUint64(ptr, VFS_FILETIME, true);
             }
         }
 

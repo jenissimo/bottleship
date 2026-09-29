@@ -17,6 +17,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { Process } from '../../core/process';
 import { VfsFileHandle, VirtualFileSystem } from '../../runtime/filesystem/vfs';
+import { VFS_FILETIME } from '../../runtime/filesystem/file-time';
 import { noteBootFileActivity } from '../../runtime/boot-status';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { getCodePageDecoder } from '../codepage-utils';
@@ -2424,8 +2425,7 @@ const fileIoModule = (() => {
         // +44: nFileIndexHigh (DWORD)
         // +48: nFileIndexLow (DWORD)
         view.setUint32(lpFileInformation + 0, 0x80, true);   // FILE_ATTRIBUTE_NORMAL
-        // Creation/access/write times: 2020-01-01 as FILETIME
-        const fakeTime = 132224352000000000n; // 2020-01-01 as FILETIME
+        const fakeTime = VFS_FILETIME;
         view.setBigUint64(lpFileInformation + 4, fakeTime, true);
         view.setBigUint64(lpFileInformation + 12, fakeTime, true);
         view.setBigUint64(lpFileInformation + 20, fakeTime, true);
@@ -2486,7 +2486,7 @@ const fileIoModule = (() => {
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const fileSize = fileHandle.size >>> 0;
-        const fakeTime = 132224352000000000n;
+        const fakeTime = VFS_FILETIME;
 
         // FileBasicInfo = 0 (40 bytes)
         if (infoClass === 0) {
