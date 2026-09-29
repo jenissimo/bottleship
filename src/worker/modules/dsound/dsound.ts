@@ -3015,10 +3015,14 @@ export class DSound implements IModule {
             // An app that writes one Lock's worth per wake loses a whole block when the cursor
             // moves a Lock's worth or more between two of its queries, so that is the bound;
             // the query cadence only bounds apps whose Lock size is not yet known.
+            // Floored at one typical gap of playback: below that the bound caps the RATE, not
+            // a pause's jump, and a pump that sizes each Lock from the cursor delta feeds its
+            // shrinking Locks back into the bound until it streams a fraction of real time.
             const lockCount = buffer.stepLockCount ?? 0;
             const limit = lockCount > 0
-                ? medianOf(buffer.stepLockSizes!, Math.min(lockCount, CURSOR_LOCK_WINDOW), this.stepGapScratch)
-                    - Math.max(1, buffer.format.blockAlign)
+                ? Math.max(typical * nominalBytesPerMs,
+                    medianOf(buffer.stepLockSizes!, Math.min(lockCount, CURSOR_LOCK_WINDOW), this.stepGapScratch)
+                        - Math.max(1, buffer.format.blockAlign))
                 : Math.max(1, typical * CURSOR_STEP_TYPICAL_GAPS) * nominalBytesPerMs;
             if (advance > limit) {
                 cursor = (last + Math.floor(limit)) % size;
