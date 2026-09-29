@@ -204,8 +204,11 @@ export class SyncObjectManager {
             return false;
         }
         const recursion = mirrored ? mirrored.recursion : mutex.recursion;
-        if (recursion > 0) mutex.recursion = recursion - 1;
-        else mutex.recursion = 0;
+        // Adopt the verified owner before writing back: the fast path takes and drops the
+        // mutex without touching this object, so its owner field can name whoever JS last
+        // granted it to — and a partial release would hand the mutex to that thread.
+        mutex.ownerThreadId = owner;
+        mutex.recursion = recursion > 0 ? recursion - 1 : 0;
         if (mutex.recursion === 0) mutex.ownerThreadId = null;
         hypercallDataManager.writeMutexMirror(handle, mutex.ownerThreadId, mutex.recursion);
         // `rec` that does not continue the previous entry's means a WASM-tier op ran between
