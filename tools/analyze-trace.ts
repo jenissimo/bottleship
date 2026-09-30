@@ -1518,6 +1518,62 @@ export function reportGpuProcess(events: TraceEvent[], threadNames: Map<string, 
   return lines.join("\n");
 }
 
+/** Chrome's posted-from site of a message or timer task — the two queues a self-scheduled
+ *  tick loop can starve. */
+const MESSAGE_TASK_SRC = /^(PostMessageToWorkerGlobalScope|PostMessageToWorkerObject)$/;
+const TIMER_TASK_SRC = /^DOMTimer$/;
+const SELF_TASK_SRC = /^DOMTask$/;
+
+/**
+ * Which host tasks each worker ran, by the site that POSTED them (`src_func`). A profile
+ * cannot show this — a starved message is not a sample, it is an absence — and a tick loop
+ * that keeps its own queue non-empty starves postMessage, setTimeout and rAF while its FPS
+ * counter reads normal, because the counter lives on the same starving thread.
+ */
+export function reportWorkerTaskSources(events: TraceEvent[], threadNames: Map<string, string>): string {
+  const byThread = new Map<string, { name: string; tasks: number; bySrc: Map<string, { n: number; us: number }> }>();
+  let lo = Infinity, hi = -Infinity;
+  for (const ev of events) {
+    if (ev.ph !== "X" || ev.name !== "ThreadControllerImpl::RunTask") continue;
+    const key = `${ev.pid}:${ev.tid}`;
+    const name = threadNames.get(key) ?? "";
+    if (!/DedicatedWorker/.test(name)) continue;
+    const t = byThread.get(key) ?? { name, tasks: 0, bySrc: new Map() };
+    const src = String((ev.args as any)?.src_func ?? "?");
+    const s = t.bySrc.get(src) ?? { n: 0, us: 0 };
+    s.n++;
+    s.us += ev.dur ?? 0;
+    t.bySrc.set(src, s);
+    t.tasks++;
+    byThread.set(key, t);
+    lo = Math.min(lo, ev.ts);
+    hi = Math.max(hi, ev.ts + (ev.dur ?? 0));
+  }
+  const lines: string[] = [];
+  lines.push(`\n${sep("═")}`);
+  lines.push("WORKER HOST TASKS (by posted-from site)");
+  lines.push(sep("═"));
+  if (byThread.size === 0) {
+    lines.push("No worker RunTask slices in this trace (needs the `toplevel` category).");
+    return lines.join("\n");
+  }
+  const windowS = hi > lo ? (hi - lo) / 1e6 : 0;
+  for (const t of [...byThread.values()].sort((a, b) => b.tasks - a.tasks)) {
+    if (t.tasks < 50) continue;
+    const count = (re: RegExp) => [...t.bySrc].filter(([k]) => re.test(k)).reduce((s, [, v]) => s + v.n, 0);
+    const self = count(SELF_TASK_SRC), msgs = count(MESSAGE_TASK_SRC), timers = count(TIMER_TASK_SRC);
+    lines.push(` ${t.name}: ${num(t.tasks)} tasks over ${windowS.toFixed(1)}s — postTask ${num(self)}, messages ${num(msgs)}, timers ${num(timers)}`);
+    const top = [...t.bySrc].sort((a, b) => b[1].n - a[1].n).slice(0, 6);
+    for (const [src, v] of top) lines.push(`   ${pad(num(v.n), 8, true)} ${pad((v.us / 1000).toFixed(0) + "ms", 9, true)}  ${src}`);
+    if (self > 500 && msgs <= 2 && timers <= 2) {
+      lines.push(`  !! EVENT LOOP STARVED: ${num(self)} self-scheduled tasks, ${msgs} message(s), ${timers} timer(s).`);
+      lines.push("     A self-scheduling loop is keeping its own queue non-empty; input, harness RPC and");
+      lines.push("     setTimeout wait behind it. Confirm with a round trip: `bun tools/harness.ts ping`.");
+    }
+  }
+  return lines.join("\n");
+}
+
 function reportWarnings(analyses: ThreadAnalysis[]): string {
   const lines: string[] = [];
   lines.push(`\n${sep("═")}`);
@@ -3072,6 +3128,7 @@ async function main() {
     ? gpuEvents.filter(ev => ev.name === FLIP_MARK && `${ev.pid}:${ev.tid}` === presenterSeries!.key).length
     : 0;
   console.log(reportGpuProcess(gpuEvents, threadNames, framesForGpu, range?.raw));
+  console.log(reportWorkerTaskSources(gpuEvents, threadNames));
 
   // ── Warnings (always show — runs on all threads regardless of filter) ──
   console.log(reportWarnings(analyses));

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildParentMap, computeStats, mergeProfileChunks, reportGpuProcess } from "../analyze-trace";
+import { buildParentMap, computeStats, mergeProfileChunks, reportGpuProcess, reportWorkerTaskSources } from "../analyze-trace";
 
 const node = (id: number, fields: { parent?: number; children?: number[] } = {}) => ({
     id, callFrame: { functionName: `n${id}`, url: "", lineNumber: 0, columnNumber: 0 }, ...fields,
@@ -71,5 +71,20 @@ describe("Chrome trace accounting", () => {
         expect(text).toMatch(/VizCompositorThread\s+7\.0\s+1\s+3\.50/);
         expect(text).toContain("neither scheduled CPU time nor GPU hardware time");
         expect(text).toContain("GPU HARDWARE TIMINGS: NOT DECODED");
+    });
+
+    test("worker host tasks: a self-scheduled loop that starves messages and timers is named", () => {
+        const task = (i: number, src: string) => ({
+            ph: "X", name: "ThreadControllerImpl::RunTask", pid: 1, tid: 7, ts: i * 2000, dur: 1500, args: { src_func: src },
+        });
+        const names = new Map([["1:7", "DedicatedWorker thread"]]);
+        const starved = Array.from({ length: 600 }, (_, i) => task(i, "DOMTask"));
+        starved.push(task(600, "PostMessageToWorkerGlobalScope"), task(601, "DOMTimer"));
+        expect(reportWorkerTaskSources(starved, names)).toContain("EVENT LOOP STARVED");
+
+        const healthy = Array.from({ length: 600 }, (_, i) => task(i, i % 3 === 0 ? "DOMTimer" : i % 3 === 1 ? "PostMessageToWorkerGlobalScope" : "DOMTask"));
+        const text = reportWorkerTaskSources(healthy, names);
+        expect(text).toMatch(/postTask 200, messages 200, timers 200/);
+        expect(text).not.toContain("STARVED");
     });
 });
