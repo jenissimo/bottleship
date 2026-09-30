@@ -145,7 +145,7 @@ import { buildStagedBundle, inspectBundle, finalizeBundle, readStagedEntry, type
 import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
 import { Logger, LogLevel, LogCategory } from "./core/logger";
-import { postHostTask } from "./core/host-task";
+import { createTickYield } from "./core/host-task";
 import { recordGpuError, resetGpuErrors } from "./core/gpu-error-log";
 import { resetDeviceLossContract } from "./core/gpu/gpu-device-loss-contract";
 import { createStreamingWasmLoader } from "./core/wasm-loader";
@@ -3206,14 +3206,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         if (typeof v86Inner["register_yield_direct"] === "function") {
           v86Inner["register_yield_direct"]();
           // The next tick is queued as a host task rather than a MessagePort message
-          // (see postHostTask). v86 ignores a stale tick number, so one reused callback
-          // reading the latest is exact and allocates nothing per tick.
-          let pendingTick = 0;
-          const runTick = (): void => { v86Inner["yield_callback"](pendingTick); };
-          v86Inner["yield"] = (t: number, tick: number): void => {
-            if (t < 1) { pendingTick = tick; postHostTask(runTick); }
-            else setTimeout(() => v86Inner["yield_callback"](tick), t);
-          };
+          // (see postHostTask), one in flight at a time (see createTickYield).
+          v86Inner["yield"] = createTickYield((tick: number) => v86Inner["yield_callback"](tick));
           Logger.log(LogCategory.SYSTEM, "[HYPERCALL] v86 ticks queued as host tasks");
         }
 

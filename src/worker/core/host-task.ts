@@ -34,3 +34,32 @@ export function postHostTask(cb: () => void): void {
     }
     viaMessageChannel(cb);
 }
+
+/**
+ * v86's `yield(t, tick)` over host tasks. v86 queues a new tick from run() and from the CPU's
+ * wake callback while one may already be queued, and relies on `yield_callback` discarding
+ * every tick number but the latest. A queued callback that reads a shared "latest tick" passes
+ * that check every time, so each extra queue became a second self-perpetuating tick chain —
+ * hundreds piled up in the host queue, starving messages, timers and rAF. So at most one host
+ * task is in flight, and it runs whichever tick is latest when it fires; a tick that a later
+ * timed yield superseded is still discarded by v86's own check.
+ */
+export function createTickYield(yieldCallback: (tick: number) => void): (t: number, tick: number) => void {
+    let pendingTick = 0;
+    let queued = false;
+    const runTick = (): void => {
+        queued = false;
+        yieldCallback(pendingTick);
+    };
+    return (t: number, tick: number): void => {
+        if (t < 1) {
+            pendingTick = tick;
+            if (!queued) {
+                queued = true;
+                postHostTask(runTick);
+            }
+        } else {
+            setTimeout(() => yieldCallback(tick), t);
+        }
+    };
+}
