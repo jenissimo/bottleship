@@ -1886,9 +1886,26 @@ export class DSound implements IModule {
             const audioPtr2 = args[3];
             const bytes2 = args[4] >>> 0;
 
-            const offset = buffer.lockOffset ?? 0;
-            const firstSize = buffer.lockFirstSize ?? 0;
-            const secondSize = buffer.lockSecondSize ?? 0;
+            // The API contract identifies the locked region by the POINTERS Lock handed
+            // out, not by call order: two producers may hold interleaved Lock/Unlock
+            // sequences on one buffer (UE1-Galaxy's music mixer and its level stream do),
+            // and a state slot shared across those calls misattributes every span after
+            // the first interleave. Derive both spans from the pointers; the remembered
+            // lock state stays only as a fallback for a pointer outside the buffer.
+            let offset: number;
+            let firstSize: number;
+            let secondSize: number;
+            if (audioPtr1 >= buffer.ptr && audioPtr1 < buffer.ptr + buffer.bytes) {
+                offset = audioPtr1 - buffer.ptr;
+                firstSize = Math.min(bytes1, buffer.bytes - offset);
+                // Part 2 is Lock's wrap segment at offset 0; the two spans of one Lock
+                // never cover more than the buffer.
+                secondSize = Math.min(bytes2, buffer.bytes - offset - firstSize);
+            } else {
+                offset = buffer.lockOffset ?? 0;
+                firstSize = buffer.lockFirstSize ?? 0;
+                secondSize = buffer.lockSecondSize ?? 0;
+            }
             const lockFlags = buffer.lockFlags ?? 0;
             const requestedBytes = buffer.lockRequestedBytes ?? 0;
 
