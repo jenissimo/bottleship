@@ -81,7 +81,7 @@ const LIMIT_K = 1 - LIMIT_T;
 // audio-engine.ts verifies the echo and logs loudly on a mismatch or timeout,
 // because a cache hit that silently skips this whole file is worse than a version
 // bump you forgot: the failure otherwise looks identical to "nothing is wrong".
-const WORKLET_MODULE_VERSION = 7;
+const WORKLET_MODULE_VERSION = 10;
 
 // Discontinuity detector threshold: |s[n]−s[n−1]| above this between adjacent
 // output samples counts as a click/splice candidate.
@@ -210,6 +210,40 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       }
       if (msg.type === "unregister") {
         this.ringBuffers.delete(msg.id);
+        return;
+      }
+      // ringDump: the worklet's eye view of every registered ring — its own read head,
+      // the last block's contribution peak, starve count, and the sample under the head.
+      // This is the only place those live (the SAB cursor block is shared with the
+      // producer's synthesized cursors), and "producer writes data, head reads zeros"
+      // is otherwise indistinguishable from "the mix is genuinely silent". Answered
+      // via port.postMessage; harness facade: harness().ringDump().
+      if (msg.type === "ringDump") {
+        const dump: any[] = [];
+        for (const [id, rb] of this.ringBuffers.entries()) {
+          const ctrl = rb.ctrl;
+          const d: any = (rb as any).dbg ?? {};
+          const state = Atomics.load(ctrl, CTRL_STATE);
+          const blockAlign = Math.max(1, Atomics.load(ctrl, CTRL_BLOCK_ALIGN) || 4);
+          const totalFrames = Math.max(1, Math.floor((Math.min(Atomics.load(ctrl, CTRL_DATA_LENGTH) > 0 ? Atomics.load(ctrl, CTRL_DATA_LENGTH) : Atomics.load(ctrl, CTRL_BUFFER_BYTES), Atomics.load(ctrl, CTRL_BUFFER_BYTES))) / blockAlign));
+          const frame = Math.floor((d.pos ?? 0)) % totalFrames;
+          const byteOff = CTRL_BLOCK_BYTES + frame * blockAlign;
+          dump.push({
+            id,
+            state,
+            pos: d.pos ?? null,
+            srcPeak: d.srcPeak ?? null,
+            play: Atomics.load(ctrl, CTRL_PLAY_CURSOR),
+            write: Atomics.load(ctrl, CTRL_WRITE_CURSOR),
+            bufBytes: Atomics.load(ctrl, CTRL_BUFFER_BYTES),
+            dataLen: Atomics.load(ctrl, CTRL_DATA_LENGTH),
+            sampleAtHead: rb.i16[byteOff >> 1],
+            sampleAtHeadP: rb.i16[(byteOff + 4) >> 1],
+            starves: d.starves ?? 0,
+            blocks: d.blocks ?? 0,
+          });
+        }
+        this.port.postMessage({ type: "ringDump", dump });
         return;
       }
 
@@ -581,6 +615,13 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       }
 
       const isStreaming = (flags & FLAG_STREAMING) !== 0;
+      // The write-cursor hold below is for one-shot streams (video audio) that must END at
+      // the last written byte. A LOOPING buffer never holds: NT5's Grace mixer computes the
+      // play position from the primary's DAC position and mixes the ring unconditionally —
+      // an under-written lap replays its last content. Holding a looping stream would let
+      // the app's own pump decide whether the play cursor advances, and a pump that sizes
+      // each Lock from the cursor delta then deadlocks the moment it goes quiet.
+      const streamingHold = isStreaming && loopMode !== -1;
       const dataView = rb.data;
       const bytesPerSample = bitsPerSample >> 3;
       // Which typed view can address this source's samples. CTRL_BLOCK_BYTES is a
@@ -603,6 +644,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       let alive = true;
       // Last per-channel contribution of THIS source, for underrun concealment.
       let concealLast0 = 0, concealLast1 = 0;
+      let starvedThisSource = 0;
 
       // For streaming sources, read write cursor once per process() call
       // writeCursorFrame = boundary up to which data has been written by the app
@@ -651,13 +693,14 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
         // Streaming: check if play position has caught up to write cursor
         // Output silence (don't advance pos) until app writes more data
-        if (isStreaming) {
+        if (streamingHold) {
           const playFrame = Math.floor(pos) % totalFrames;
           // Check if we've caught up: available = (write - play + total) % total
           const available = (writeCursorFrame - playFrame + totalFrames) % totalFrames;
           if (available === 0) {
             // Play position caught up to write cursor — no more data this block.
             if (i === 0) starvedBlocks++; else underrunMid++;
+            starvedThisSource++; // TEMP PROBE
             fadeIn = CONCEAL_FADE_FRAMES;
             // Concealment: ramp the last contributed sample to zero over a short
             // window instead of a hard step to silence (which clicks). When the
@@ -734,6 +777,14 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       rb.position = pos;
       rb.loopsCompleted = loopsCompleted;
       rb.fadeIn = fadeIn;
+      // TEMP PROBE (ring read diagnosis) — remove after the no-sound regression is closed.
+      {
+        const d: any = (rb as any).dbg ?? ((rb as any).dbg = {});
+        d.pos = pos;
+        d.srcPeak = srcPeak;
+        d.blocks = (d.blocks ?? 0) + 1;
+        if (starvedThisSource) d.starves = (d.starves ?? 0) + starvedThisSource;
+      }
 
       // Write back play cursor (byte offset)
       if (alive) {

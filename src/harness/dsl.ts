@@ -287,6 +287,27 @@ export class HarnessChain {
     /** PNG of the SCREEN (canvas, overlays composited). `source:'layer'` asks for the
      *  presenter's pre-composite game layer instead — labelled `composited:false`. */
     shot(opts?: { save?: string; source?: "screen" | "layer" }): this { return this.push("shot", [opts]); }
+    /** The audio worklet's eye view of every registered ring: its own read head, the last
+     *  block's contribution peak, starve count, and the sample under the head. Only the
+     *  worklet knows these (the SAB cursor block is shared with the producer's synthesized
+     *  cursors), and "producer writes data, head reads zeros" is otherwise
+     *  indistinguishable from "the mix is genuinely silent". */
+    ringDump(): this {
+        const expr = `(async () => {
+  const ae = window.__BS__ && window.__BS__.audioEngine;
+  if (!ae || !ae.node) return { error: "no audioEngine node" };
+  return await new Promise((resolve) => {
+    const prev = ae.node.port.onmessage;
+    ae.node.port.onmessage = (e) => {
+      if (e.data && e.data.type === "ringDump") { ae.node.port.onmessage = prev; resolve(e.data); return; }
+      if (typeof prev === "function") prev(e);
+    };
+    ae.node.port.postMessage({ type: "ringDump" });
+    setTimeout(() => resolve({ error: "ringDump timeout (stale worklet module? bump AUDIO_WORKLET_VERSION)" }), 3000);
+  });
+})()`;
+        return this.push("evalPage", [expr, 10000]);
+    }
     /** Our screen vs a NATIVE Windows capture, per pixel, over named regions. The reference
      *  is palette-remapped first (the demos are the classic CODE path but not the classic
      *  colour scheme); unmapped reference pixels are counted, not silently skipped. Reports
