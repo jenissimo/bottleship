@@ -351,7 +351,7 @@ export function handleDebugMonitorMessage(message: any): boolean {
     return true;
   }
 
-  // ── AOT code cache (docs/performance/sota-roadmap/05-A0-play-and-record.md) ──
+  // ── AOT code cache ──
   //
   // The panel drives the same three verbs the console has, but through a request/reply so a
   // result is visible in the UI. Recording a session is a two-step ritual with a

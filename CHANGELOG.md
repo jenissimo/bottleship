@@ -48,5 +48,4 @@
 - The GOG CLI uses the project's installer reader without external unpacker fallbacks.
 
 See [compatibility](docs/compatibility.md) for edition limits and [GOG import](docs/gog-import.md)
-for storage requirements. Release readiness findings are recorded in
-[the release audit](docs/release-audit.md).
+for storage requirements.

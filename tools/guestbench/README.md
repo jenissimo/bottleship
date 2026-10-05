@@ -1,6 +1,6 @@
-# guestbench — synthetic guest fixtures for the SOTA roadmap
+# guestbench — synthetic guest performance fixtures
 
-`docs/performance/sota-roadmap/README.md` makes a perf fixture mandatory for every lever:
+The [measurement contracts](../../docs/performance.md) require repeatable guest work:
 fixed work, a deterministic checksum, no sleep or frame limiter, a SCALE knob so the model
 `ms = fixed + k × SCALE` can be checked, and — the part that has actually bitten this
 project — the fixtures living **in this repository**, because a demo on one machine cannot

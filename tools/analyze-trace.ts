@@ -2319,7 +2319,7 @@ interface DeferrableCensus {
 }
 
 /**
- * The render-worker module boundary (docs/performance/benchmark-method.md). Everything else
+ * The render-worker module boundary (docs/performance.md). Everything else
  * in the deferrable region is recorder/shadow state, which stays with the guest thread.
  */
 const RENDER_WORKER_SIDE = [

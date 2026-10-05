@@ -241,7 +241,6 @@ export const KERNELS = {
     // Each of the eight unrolled elements RELOADS src/dst/bias from the frame: 24 stack loads per
     // row where three values would do, each paying a full per-access safe-read. That redundancy
     // is what makes this the kernel to aim a memory-scope or load-forwarding pass at.
-    // Attribution: docs/performance/user-mode-optimizing-translator-p0-results-2026-09-05.md.
     k8: {
         va: 0x0064a71f,
         fileOff: 0x0024a71f,

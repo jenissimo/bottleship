@@ -1,6 +1,5 @@
 /**
- * Pins the fixes from docs/d3d8-parity/04-vertex-pipeline.md (Findings 1, 2, 5) and
- * 02-samplers.md (F4): programmable-VS topology, D3DCOLOR-vs-UBYTE4 disambiguation,
+ * Checks programmable-VS topology, D3DCOLOR-vs-UBYTE4 disambiguation,
  * per-element texcoord degrade, D3DVSDE_POSITION2/NORMAL2, and D3DVSD_CONSTMEM parsing.
  */
 import { describe, expect, test } from "bun:test";

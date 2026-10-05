@@ -373,6 +373,11 @@ insufficient, EXTEND the harness (a new `cmds/*` module) rather than write a thr
 the harness is the durable home for diagnostic capability, one-off probes are a smell. After fixing, keep
 the reusable tool and delete the probe.
 
+Documentation hygiene: `docs/` contains maintained guides and reference material. Session plans,
+handoffs, audits, experiment reports and research registries stay in ignored `plan/`; screenshots,
+dumps, traces and raw measurements stay in ignored `logs/`. Share evidence in the issue or PR;
+commit reusable harness scenarios under `tools/harness/`, without links to local session artifacts.
+
 Quality Gate (mandatory order):
   1. bun tools/generate-index.ts
   2. bun tools/validate-signatures.ts

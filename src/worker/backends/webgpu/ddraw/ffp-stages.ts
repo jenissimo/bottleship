@@ -85,8 +85,8 @@ export const FFP_STAGE_PACK_WORDS = MAX_FFP_STAGES * 4;
  * Which D3D version's D3DTSS_MIPFILTER numbering the texture-stage state array was written
  * in. This decoder is SHARED by genuine DDraw/D3D7 callers and D3D8's fixed-function draws —
  * D3D7 titles write D3DTFP_* (NONE=1/POINT=2/LINEAR=3), D3D8 titles write D3DTEXF_* (D3D9's
- * NONE=0/POINT=1/LINEAR=2), and the two are NOT numerically compatible for mip filtering (see
- * docs/d3d8-parity/02-samplers.md F1). Defaults to "d3d7" so every existing DDraw/D3D7 call
+ * NONE=0/POINT=1/LINEAR=2), and the two are NOT numerically compatible for mip filtering.
+ * Defaults to "d3d7" so every existing DDraw/D3D7 call
  * site is byte-for-byte unaffected unless a D3D8 caller explicitly opts in via
  * setFilterVocabulary().
  */
@@ -344,7 +344,7 @@ export class FfpStagesState {
 
             // MIN/MAGFILTER: D3D7's D3DTFN_*/D3DTFG_* and D3D8/9's D3DTEXF_* share bit patterns
             // for POINT/LINEAR/ANISOTROPIC, so no vocabulary-dependent translation is needed here
-            // (see docs/d3d8-parity/02-samplers.md — only MIPFILTER genuinely diverges).
+            // because only MIPFILTER uses different numbering.
             this.minFilter[s] = textureStates[base + D3DTSS_MINFILTER] || 0;
             this.magFilter[s] = textureStates[base + D3DTSS_MAGFILTER] || 0;
             const rawMip = textureStates[base + D3DTSS_MIPFILTER];

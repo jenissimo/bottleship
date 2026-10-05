@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Permission-bitmap differential (docs/performance/sota-roadmap/03).
+ * Permission-bitmap differential.
  *
  * The bitmap is a MIRROR of `tlb_data`, and a mirror that has drifted does not crash: it
  * reads the wrong page, or misses a page fault, and the guest carries on with a plausible

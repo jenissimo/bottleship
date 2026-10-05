@@ -1,5 +1,5 @@
 /**
- * D3D8 fixed-function/programmable sampler decode parity — docs/d3d8-parity/02-samplers.md.
+ * D3D8 fixed-function/programmable sampler decode parity.
  *
  * F1: the shared FFP decode (ffp-stages.ts + bind-group-manager.ts) is used by BOTH genuine
  * DDraw/D3D7 callers (D3DTFP_* mip-filter numbering: NONE=1/POINT=2/LINEAR=3) and D3D8's

@@ -11,9 +11,8 @@
  *      to touch flags after the last regeneration keeps its old, now-wrong, row otherwise.
  *   2. Not a negative-control table — FLAG_CONTRACT_MUTATED is false.
  *   3. Anchors — known writers/readers/host-reaching helpers are classified as such, and the
- *      helpers audited by hand in docs/performance/v86-flag-helper-contract-2026-09-05.md come
- *      out flag-neutral. The first half is what stops the analysis silently degrading to
- *      "everything is neutral"; the second stops it silently degrading to "nothing is".
+ *      audited floating-point helpers come out flag-neutral. The first half stops the analysis
+ *      degrading to "everything is neutral"; the second stops it degrading to "nothing is".
  *   4. Self-test — a table generated with --mutate fpu_fcomi must FAIL rule 3.
  *
  * Absent from the table = full sync, the pre-contract behaviour; that default needs no rule.

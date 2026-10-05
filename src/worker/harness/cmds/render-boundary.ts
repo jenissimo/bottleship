@@ -1,6 +1,6 @@
 /**
  * renderBoundaryMark / renderBoundary / renderBoundaryAudit — GPU waits and dirty-byte
- * accounting (docs/performance/benchmark-method.md).
+ * accounting (docs/performance.md).
  *
  * Two questions the gate turns on, neither of which any existing counter answers:
  *

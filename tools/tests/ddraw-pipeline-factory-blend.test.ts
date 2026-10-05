@@ -88,8 +88,7 @@ describe("PipelineFactory mapBlendOperation — every D3DBLENDOP value", () => {
 });
 
 describe("PipelineFactory resolveBlendFactors — DirectX-6 BOTH*SRCALPHA fixup", () => {
-    // The exact bug from docs/d3d8-parity/07-unification-map.md F1 / §2.1: SRCBLEND
-    // naming a BOTH* legacy value must EXPAND into an (src,dst) pair and DESTBLEND
+    // SRCBLEND naming a BOTH* legacy value must EXPAND into an (src,dst) pair and DESTBLEND
     // must be ignored outright, whatever value the game left there.
     test("BOTHSRCALPHA(12) resolves to (SRCALPHA, INVSRCALPHA) regardless of DESTBLEND", () => {
         for (const dstBlendFromGame of [ZERO, ONE, DESTCOLOR, 0, 0xdead]) {

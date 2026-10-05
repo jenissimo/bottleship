@@ -80,7 +80,7 @@ export function decodeD3d8TssSampler(
     const anisoRequested = minV === D3DTEXF_ANISOTROPIC || magV === D3DTEXF_ANISOTROPIC;
     // D3DTSS_MAXANISOTROPY is a plain DWORD (DXVK forwards TSS 1:1 to D3D9's SetSamplerState) —
     // read the game's real request instead of forcing a fixed 16x whenever ANISOTROPIC is merely
-    // selected as the filter mode (docs/d3d8-parity/02-samplers.md F3).
+    // selected as the filter mode.
     const maxAnisotropy = Math.max(1, get(D3DTSS_MAXANISOTROPY) >>> 0);
     const unsupportedFeatures: DxSamplerUnsupportedFeature[] = [];
     // A request above the advertised MaxAnisotropy=16 is CLAMPED, not refused: engines write

@@ -87,7 +87,7 @@ const COLOR_WRITE_ALL = 0xf;
  * (D3DBLEND_BOTHSRCALPHA/BOTHINVSRCALPHA imply BOTH factors and DESTBLEND is ignored —
  * see shared/d3d-blend-factor.ts `fixupBoth`, the same rule d3d9-blend.ts applies). An
  * out-of-range or dual-source enum is refused rather than silently mapped to a plausible
- * default — that silent-default was exactly F1's failure mode (docs/d3d8-parity/07-unification-map.md §2.1).
+ * default, which would hide an unsupported render state.
  * The refusal is an INTERNAL invariant: every per-draw caller passes a value that already
  * went through `sanitizeBlendFactor`, so guest state can never reach the throw.
  */

@@ -1,9 +1,8 @@
 /**
- * demo_stack_mix — memory-op mix with a controllable stack share
- * (docs/performance/sota-roadmap/02, 03).
+ * demo_stack_mix — memory-op mix with a controllable stack share.
  *
- * Item 02 claims a win proportional to the share of accesses that are ESP/EBP-based with a
- * constant displacement; item 03 claims one on the remainder. A single workload cannot
+ * Stack fastmem targets ESP/EBP-based accesses with a constant displacement; permission
+ * bitmaps also target the remainder. A single workload cannot
  * distinguish "the guard is cheaper than the TLB lookup" from "this workload happens to be
  * stack-heavy", so the mix is a PARAMETER: `--mix 20|50|80` is the percentage of the
  * loop's memory operands that are stack-relative, the rest split between base+const and

@@ -76,6 +76,10 @@ template):
 
 ## Rules that keep this fun
 
+- **Keep session artifacts local.** Plans, handoffs, audits, experiment reports and research
+  registries belong in ignored `plan/`; screenshots, dumps, traces and raw measurements in
+  ignored `logs/`. `docs/` contains maintained guides and reference material. Put evidence
+  in the issue or PR and commit reusable harness scenarios under `tools/harness/`.
 - **Never commit game files**, box art you can't redistribute, decompiled binaries, or
   leaked source. Reports and fixes about commercial games are welcome; their bytes are not.
 - **You own what you submit.** AI-assisted is welcome and assumed — but you are the author:

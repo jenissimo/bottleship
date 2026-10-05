@@ -2,7 +2,7 @@
 
 /**
  * Presenter-kind census over the `.wgb` library.
- * See docs/performance/benchmark-method.md for the render-worker measurement boundary.
+ * See docs/performance.md for the render-worker measurement boundary.
  *
  * The question: stage 1 moves the D3D9 executor + composite off the guest thread and
  * REFUSES LOUDLY for every other executor (ddraw/D3D7, D3D8, glide, opengl). How many

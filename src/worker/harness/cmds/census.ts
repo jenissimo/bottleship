@@ -1,8 +1,8 @@
 /**
  * opcodeCensusArm / opcodeCensusMark / opcodeCensus — the retired-instruction class table
- * for the game actually being measured (docs/performance/sota-roadmap/10).
+ * for the game actually being measured.
  *
- * Roadmap items 02, 03 and 05 pick their target by the share of an instruction class, so the
+ * Codegen optimizations pick their target by the share of an instruction class, so the
  * share must come from the live title rather than a proxy demo — and, the harder half, the
  * verb must be unable to answer plausibly when it cannot answer at all:
  *
