@@ -82,3 +82,29 @@ demos/**/*.exe
 # ReactOS-sourced headers are re-fetchable via `bun run fetch-reference-headers`; proprietary
 # ones (mss.h) are BYO. Only the derived, fact-only *.sig.json are tracked and shipped.
 tools/reference/**/*.h
+
+# Perf/investigation plan docs — local scratch, not shipped
+/plan/
+
+# Throwaway bring-up/debug probe scripts — local scratch; durable scenarios live in tools/harness/
+/tools/probes/
+
+# bench-v86 local caches
+tools/bench-v86/images/
+tools/bench-v86/engines/
+tools/bench-v86/results/
+
+# AOT capture/compile outputs — per-machine, keyed to one engine binary
+tools/aot/jobs/
+tools/aot/units/
+
+# Screenshots dropped in the repo root during investigation — they belong in logs/.
+/*.png
+
+# .NET build output of the native D3D9 parity probe — rebuilt with `dotnet build`
+# (tools/d3d9-parity/native-probe/README.md); obj/ also embeds this machine's paths.
+tools/d3d9-parity/native-probe/bin/
+tools/d3d9-parity/native-probe/obj/
+
+# libid signature packs — derived from this machine's DLLs, rebuilt with `libid.py sigs`
+tools/re/libsigs/

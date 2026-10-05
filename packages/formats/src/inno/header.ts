@@ -79,73 +79,78 @@ export interface InnoHeader {
 }
 
 function loadFlags(r: BinaryReader, version: InnoVersion): number {
-    const padBits = version.bits();
-    const fr = r.storedFlagReader(padBits);
+    const fr = r.storedFlagReader(version.bits());
     let options = 0;
-    const bit = (i: number) => 1 << i;
-    const add = (i: number, cond = true) => {
-        if (!cond) return;
-        fr.add(bit(i));
+    const add = (cond = true, flag = 0) => {
+        if (cond) fr.add(flag);
     };
-    // header.hpp:51-104 + header.cpp:569-733
-    add(0); // DisableStartupPrompt
-    add(1); // CreateAppDir
-    add(2); // AllowNoIcons
-    add(3, version.atLeast(3, 0, 3)); // AlwaysRestart
-    add(4); // AlwaysUsePersonalGroup
+    const before = (a: number, b: number, c: number, d = 0) =>
+        version.value < INNO_VERSION_EXT(a, b, c, d);
+
+    add();
+    add(before(5, 3, 10));
+    add();
+    add(before(5, 3, 3));
+    add(before(1, 3, 6));
+    add(before(5, 3, 3));
+    add();
+    add(before(3, 0, 0) || version.atLeast(3, 0, 3));
+    add(before(1, 3, 3));
+    add();
     if (version.value < INNO_VERSION_EXT(6, 4, 0, 1)) {
-        add(5);
-        add(6);
-        add(7);
-        add(8);
+        add(); add(); add(); add();
     }
-    add(9); // EnableDirDoesntExistWarning
-    add(10); // Password
-    add(11, version.atLeast(1, 2, 6));
-    add(12, version.atLeast(1, 2, 14));
-    add(13, version.bits() !== 16 && version.value < INNO_VERSION_EXT(5, 6, 1, 0));
-    add(14, version.atLeast(1, 3, 1));
-    add(15, version.atLeast(1, 3, 3) && version.value < INNO_VERSION_EXT(6, 4, 0, 1));
-    add(16, version.atLeast(1, 3, 10));
-    add(17, version.atLeast(1, 3, 20));
-    add(18, version.atLeast(2, 0, 0));
-    if (version.atLeast(2, 0, 0)) for (let i = 19; i <= 24; i++) add(i);
+    add();
+    add(before(4, 1, 2));
+    add();
+    add(version.atLeast(1, 2, 6));
+    add(version.atLeast(1, 2, 14));
+    if (version.bits() !== 16) {
+        add(before(3, 0, 4));
+        add(before(3, 0, 0));
+        add(before(1, 3, 6));
+        add(before(5, 6, 1));
+    }
+    add(version.atLeast(1, 3, 0) && before(5, 3, 8));
+    add(version.atLeast(1, 3, 1));
+    add(version.atLeast(1, 3, 3) && before(6, 4, 0, 1));
+    add(version.atLeast(1, 3, 10));
+    add(version.atLeast(1, 3, 20));
+    add(version.atLeast(2, 0, 0) || (version.isIsx() && version.atLeast(1, 3, 10)));
+    if (version.atLeast(2, 0, 0)) for (let i = 0; i < 6; i++) add();
     if (version.atLeast(2, 0, 7)) {
-        add(25);
-        add(26);
+        add(); add();
     }
-    add(27, version.atLeast(2, 0, 18));
+    add(version.atLeast(2, 0, 17) && before(4, 1, 5));
+    add(version.atLeast(2, 0, 18));
     if (version.atLeast(3, 0, 0)) {
-        add(28);
-        add(29);
+        add(); add();
     }
-    add(30, version.atLeast(3, 0, 1));
-    add(31, version.atLeast(3, 0, 3));
-    add(32, version.atLeast(4, 0, 0));
-    if (version.atLeast(4, 0, 9)) add(33);
-    else options |= bit(33);
-    add(34, version.atLeast(4, 1, 3));
+    add(version.atLeast(3, 0, 1));
+    add(version.atLeast(3, 0, 3));
+    add(version.atLeast(4, 0, 0) || (version.isIsx() && version.atLeast(3, 0, 3)));
+    add(version.atLeast(4, 0, 0) && before(4, 0, 10));
+    add(version.atLeast(4, 0, 1) && before(4, 0, 10));
+    add(version.atLeast(4, 0, 9));
+    add(version.atLeast(4, 1, 3));
     if (version.atLeast(4, 1, 8)) {
-        add(35);
-        add(36);
+        add(); add();
     }
-    add(37, version.atLeast(4, 2, 2));
-    add(40, version.atLeast(5, 1, 13));
-    add(41, version.atLeast(5, 2, 1));
-    add(42, version.atLeast(5, 3, 8));
-    add(43, version.atLeast(5, 3, 9));
+    add(version.atLeast(4, 2, 2), 1 << 5);
+    add(version.atLeast(5, 0, 4) && before(5, 6, 1));
+    add(version.atLeast(5, 1, 7) && !version.isUnicode());
+    add(version.atLeast(5, 1, 13));
+    add(version.atLeast(5, 2, 1));
+    add(version.atLeast(5, 3, 8));
+    add(version.atLeast(5, 3, 9));
     if (version.atLeast(5, 5, 0)) {
-        add(44);
-        add(45);
-        add(46);
-    } else options |= bit(46);
-    add(47, version.atLeast(5, 5, 7));
-    if (version.atLeast(6, 0, 0)) {
-        add(48);
-        add(49);
-        add(50);
+        add(); add(); add();
     }
-    add(51, version.atLeast(6, 3, 0));
+    add(version.atLeast(5, 5, 7));
+    if (version.atLeast(6, 0, 0)) {
+        add(); add(); add();
+    }
+    add(version.atLeast(6, 3, 0));
     options |= fr.finalize();
     return options;
 }
@@ -211,7 +216,6 @@ export function loadHeader(r: BinaryReader, version: InnoVersion, codepage: numb
     if (version.atLeast(5, 2, 5)) compiledCode = r.encodedString(cp);
     if (version.atLeast(2, 0, 6) && !version.isUnicode()) {
         r.readBytes(32);
-        if (bits === 32) r.u8();
     }
     const languageCount = version.atLeast(4, 0, 0) ? r.u32() : version.atLeast(2, 0, 1) ? 1 : 0;
     const messageCount = version.atLeast(4, 2, 1) ? r.u32() : 0;

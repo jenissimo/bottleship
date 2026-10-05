@@ -5,22 +5,21 @@
 
 import { Process } from "../../core/process";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
+import { GLCvaState, createCvaState } from "./client-arrays";
 import { GL_MODELVIEW, GL_LESS, GL_ONE, GL_ZERO, GL_ALWAYS, GL_BACK, GL_CCW, GL_SMOOTH,
          GL_FILL, GL_LINEAR, GL_MODULATE, GL_NEAREST, GL_REPEAT, GL_TEXTURE0,
-         GL_EYE_LINEAR } from "./constants";
+         GL_EYE_LINEAR,
+         GL_ADD, GL_REPLACE, GL_ADD_SIGNED, GL_INTERPOLATE, GL_SUBTRACT,
+         GL_DOT3_RGB, GL_DOT3_RGBA, GL_DOT3_RGB_EXT, GL_DOT3_RGBA_EXT,
+         GL_TEXTURE, GL_CONSTANT, GL_PRIMARY_COLOR, GL_PREVIOUS,
+         GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+         GL_COMBINE, GL_RENDER, NAME_STACK_MAX_DEPTH,
+       } from "./constants";
 
 // ---- Draw command types ----
 
 /** Floats per vertex in the flat buffer: [x,y,z,w, r,g,b,a, nx,ny,nz, s0,t0,s1,t1] */
 export const VERT_FLOATS = 15;
-
-export interface GLDrawVertex {
-    x: number; y: number; z: number; w: number;
-    r: number; g: number; b: number; a: number;
-    nx: number; ny: number; nz: number;
-    s0: number; t0: number;
-    s1: number; t1: number;
-}
 
 // ---- Pre-baked display list types ----
 
@@ -35,76 +34,176 @@ export const enum GLDrawCommandType {
     SCISSOR = 3,
 }
 
-export interface GLClearCommand {
-    type: GLDrawCommandType.CLEAR;
-    mask: number;
-    r: number; g: number; b: number; a: number;
-    depth: number;
-    stencil: number;
+// ---- Flat (SoA) command stream ----
+//
+// A frame's commands are fixed-size records over two parallel typed arrays: one
+// Int32Array for enums/handles/bit flags, one Float32Array for the float state.
+// Vertices are NOT owned by a command — they live in the per-frame GLVertexArena
+// and a DRAW references them as (CI_VERT_OFFSET, CI_VERT_COUNT). Both the stream
+// and the arena are reset (not reallocated) at present, so nothing may retain a
+// command or an arena slice past executeFrame().
+
+/** Int32 slots per command record. */
+export const CMD_I32 = 37;
+/** Float32 slots per command record. */
+export const CMD_F32 = 18;
+
+export const CI_TYPE = 0;
+
+// DRAW — integer state
+export const CI_MODE = 1;
+/** Float index of the first vertex inside the frame vertex arena. */
+export const CI_VERT_OFFSET = 2;
+export const CI_VERT_COUNT = 3;
+export const CI_FLAGS = 4;
+export const CI_DEPTH_FUNC = 5;
+export const CI_BLEND_SRC = 6;
+export const CI_BLEND_DST = 7;
+export const CI_ALPHA_FUNC = 8;
+export const CI_CULL_FACE = 9;
+export const CI_FRONT_FACE = 10;
+export const CI_TEX_ID0 = 11;
+export const CI_TEX_ID1 = 12;
+export const CI_TEXENV0 = 13;
+export const CI_TEXENV1 = 14;
+export const CI_SHADE_MODEL = 15;
+export const CI_FOG_MODE = 16;
+export const CI_POLYGON_MODE = 17;
+export const CI_STENCIL_FUNC = 18;
+export const CI_STENCIL_REF = 19;
+export const CI_STENCIL_MASK = 20;
+export const CI_STENCIL_FAIL = 21;
+export const CI_STENCIL_ZFAIL = 22;
+export const CI_STENCIL_ZPASS = 23;
+export const CI_STENCIL_WRITE_MASK = 24;
+export const CI_SCISSOR_X = 25;
+export const CI_SCISSOR_Y = 26;
+export const CI_SCISSOR_W = 27;
+export const CI_SCISSOR_H = 28;
+/** Viewport active when the draw was emitted; also the VIEWPORT command payload. */
+export const CI_VP_X = 29;
+export const CI_VP_Y = 30;
+export const CI_VP_W = 31;
+export const CI_VP_H = 32;
+/** Packed GL_COMBINE state per unit (see "Combiner encoding" below). Only read when
+ *  the matching CI_TEXENV slot is GL_COMBINE. */
+export const CI_COMBINE0_RGB = 33;
+export const CI_COMBINE0_ALPHA = 34;
+export const CI_COMBINE1_RGB = 35;
+export const CI_COMBINE1_ALPHA = 36;
+
+// CLEAR — aliases over the same slots (a record is only ever one command type)
+export const CI_CLEAR_MASK = 1;
+export const CI_CLEAR_STENCIL = 2;
+
+// DRAW — float state
+export const CF_ALPHA_REF = 0;
+export const CF_FOG_R = 1;
+export const CF_FOG_G = 2;
+export const CF_FOG_B = 3;
+export const CF_FOG_A = 4;
+export const CF_FOG_DENSITY = 5;
+export const CF_FOG_START = 6;
+export const CF_FOG_END = 7;
+export const CF_DEPTH_RANGE_NEAR = 8;
+export const CF_DEPTH_RANGE_FAR = 9;
+/** GL_TEXTURE_ENV_COLOR per unit — the GL_CONSTANT combiner argument. */
+export const CF_ENV_COLOR0 = 10; // ..13
+export const CF_ENV_COLOR1 = 14; // ..17
+
+// CLEAR — float aliases
+export const CF_CLEAR_R = 0;
+export const CF_CLEAR_G = 1;
+export const CF_CLEAR_B = 2;
+export const CF_CLEAR_A = 3;
+export const CF_CLEAR_DEPTH = 4;
+
+/** DRAW boolean state, packed into CI_FLAGS. */
+export const DF_DEPTH_TEST = 1 << 0;
+export const DF_DEPTH_MASK = 1 << 1;
+export const DF_BLEND = 1 << 2;
+export const DF_ALPHA_TEST = 1 << 3;
+export const DF_CULL = 1 << 4;
+export const DF_FOG = 1 << 5;
+export const DF_COLOR_MASK_R = 1 << 6;
+export const DF_COLOR_MASK_G = 1 << 7;
+export const DF_COLOR_MASK_B = 1 << 8;
+export const DF_COLOR_MASK_A = 1 << 9;
+export const DF_STENCIL_TEST = 1 << 10;
+export const DF_SCISSOR = 1 << 11;
+
+export class GLCommandStream {
+    count = 0;
+    i32: Int32Array;
+    f32: Float32Array;
+    private capacity: number;
+
+    constructor(capacity = 2048) {
+        this.capacity = capacity;
+        this.i32 = new Int32Array(capacity * CMD_I32);
+        this.f32 = new Float32Array(capacity * CMD_F32);
+    }
+
+    /** Reserve one record and return its index. Slots are NOT cleared — the
+     *  emitter writes every slot its command type reads. */
+    alloc(type: GLDrawCommandType): number {
+        if (this.count === this.capacity) this.grow();
+        const idx = this.count++;
+        this.i32[idx * CMD_I32 + CI_TYPE] = type;
+        return idx;
+    }
+
+    /** Drop the most recently allocated record (used when a draw merges backwards). */
+    pop(): void {
+        if (this.count > 0) this.count--;
+    }
+
+    typeAt(idx: number): number {
+        return this.i32[idx * CMD_I32 + CI_TYPE];
+    }
+
+    reset(): void {
+        this.count = 0;
+    }
+
+    private grow(): void {
+        const capacity = this.capacity * 2;
+        const i32 = new Int32Array(capacity * CMD_I32);
+        i32.set(this.i32);
+        const f32 = new Float32Array(capacity * CMD_F32);
+        f32.set(this.f32);
+        this.i32 = i32;
+        this.f32 = f32;
+        this.capacity = capacity;
+    }
 }
 
-export interface GLDrawCommand {
-    type: GLDrawCommandType.DRAW;
-    mode: number;
-    vertData: Float32Array;
-    vertCount: number;
-    depthTest: boolean;
-    depthFunc: number;
-    depthMask: boolean;
-    blendEnabled: boolean;
-    blendSrc: number;
-    blendDst: number;
-    alphaTest: boolean;
-    alphaFunc: number;
-    alphaRef: number;
-    cullEnabled: boolean;
-    cullFace: number;
-    frontFace: number;
-    textureId0: number;
-    textureId1: number;
-    texEnvMode0: number;
-    texEnvMode1: number;
-    shadeModel: number;
-    fogEnabled: boolean;
-    fogMode: number;
-    fogR: number; fogG: number; fogB: number; fogA: number;
-    fogDensity: number;
-    fogStart: number;
-    fogEnd: number;
-    polygonMode: number;
-    colorMaskR: boolean;
-    colorMaskG: boolean;
-    colorMaskB: boolean;
-    colorMaskA: boolean;
-    stencilTest: boolean;
-    stencilFunc: number;
-    stencilRef: number;
-    stencilMask: number;
-    stencilFail: number;
-    stencilZFail: number;
-    stencilZPass: number;
-    stencilWriteMask: number;
-    scissorEnabled: boolean;
-    scissorX: number; scissorY: number;
-    scissorW: number; scissorH: number;
-    /** Viewport active when this draw was emitted */
-    vpX: number; vpY: number;
-    vpW: number; vpH: number;
-    depthRangeNear: number;
-    depthRangeFar: number;
-}
+/** Growable per-frame vertex store. Draw commands hold (offset, count) into it. */
+export class GLVertexArena {
+    data: Float32Array;
+    /** Write cursor, in floats. */
+    used = 0;
 
-export interface GLViewportCommand {
-    type: GLDrawCommandType.VIEWPORT;
-    x: number; y: number; w: number; h: number;
-}
+    constructor(vertexCapacity = 65536) {
+        this.data = new Float32Array(vertexCapacity * VERT_FLOATS);
+    }
 
-export interface GLScissorCommand {
-    type: GLDrawCommandType.SCISSOR;
-    x: number; y: number; w: number; h: number;
-}
+    /** Guarantee room for `vertexCount` more vertices at the cursor. Doubles on
+     *  overflow and preserves written data — earlier commands hold offsets into it. */
+    reserve(vertexCount: number): void {
+        const need = this.used + vertexCount * VERT_FLOATS;
+        if (need <= this.data.length) return;
+        let capacity = this.data.length;
+        while (capacity < need) capacity *= 2;
+        const next = new Float32Array(capacity);
+        next.set(this.data.subarray(0, this.used));
+        this.data = next;
+    }
 
-export type GLCommand = GLClearCommand | GLDrawCommand | GLViewportCommand | GLScissorCommand;
+    reset(): void {
+        this.used = 0;
+    }
+}
 
 // ---- Texture state ----
 
@@ -122,10 +221,179 @@ export interface GLTextureObject {
     gpuVersion: number;
 }
 
+/** GL name 0 is the DEFAULT texture object, not "no texture": it exists per target from
+ *  context creation, takes uploads and parameters, and is sampled when texturing is on.
+ *  It is only unnameable — glGenTextures never returns it and glDeleteTextures ignores it.
+ *  Its storage needs a key outside the generated name space because the command buffer
+ *  spells "texturing disabled" as 0, and id Tech 2's Draw_StretchRaw uploads every
+ *  cinematic frame into it. */
+export const DEFAULT_TEXTURE_STORAGE_ID = 0x7FFFFF01;
+
 export interface GLTextureUnit {
     enabled2d: boolean;
-    boundTexture: number; // texture name (0=none)
+    boundTexture: number; // texture name (0 = the default texture object)
     texEnvMode: number;
+    /** GL_TEXTURE_ENV_COLOR — the GL_CONSTANT combiner argument. */
+    envColor: Float32Array;
+    // ARB/EXT_texture_env_combine. Defaults are the spec's (GL 1.3 table 3.20), which
+    // reproduce GL_MODULATE exactly, so a unit that never sets them behaves as before.
+    combineRgb: number;
+    combineAlpha: number;
+    srcRgb: Int32Array;    // [SOURCE0_RGB, SOURCE1_RGB, SOURCE2_RGB]
+    srcAlpha: Int32Array;
+    opRgb: Int32Array;     // [OPERAND0_RGB, OPERAND1_RGB, OPERAND2_RGB]
+    opAlpha: Int32Array;
+    rgbScale: number;      // GL_RGB_SCALE: 1, 2 or 4
+    alphaScale: number;    // GL_ALPHA_SCALE
+}
+
+/** Storage key for whatever this unit has bound, the default object included. */
+export function boundTextureStorageId(unit: GLTextureUnit): number {
+    return unit.boundTexture === 0 ? DEFAULT_TEXTURE_STORAGE_ID : unit.boundTexture;
+}
+
+export function createTextureUnit(): GLTextureUnit {
+    return {
+        enabled2d: false,
+        boundTexture: 0,
+        texEnvMode: GL_MODULATE,
+        envColor: new Float32Array([0, 0, 0, 0]),
+        combineRgb: GL_MODULATE,
+        combineAlpha: GL_MODULATE,
+        srcRgb: new Int32Array([GL_TEXTURE, GL_PREVIOUS, GL_CONSTANT]),
+        srcAlpha: new Int32Array([GL_TEXTURE, GL_PREVIOUS, GL_CONSTANT]),
+        opRgb: new Int32Array([GL_SRC_COLOR, GL_SRC_COLOR, GL_SRC_ALPHA]),
+        opAlpha: new Int32Array([GL_SRC_ALPHA, GL_SRC_ALPHA, GL_SRC_ALPHA]),
+        rgbScale: 1,
+        alphaScale: 1,
+    };
+}
+
+// ---- Combiner encoding ----
+//
+// The whole per-unit combiner is squeezed into ONE int per channel so a DRAW record
+// stays flat and the merge comparison in commandsEqual keeps working by value. The
+// executor decodes the same two words in WGSL; the two encodings are defined here and
+// mirrored in the shader, so they cannot be edited independently.
+//
+//   bits 0..3   function        (COMBINER_FN_*)
+//   bits 4..5   arg0 source     (COMBINER_SRC_*)
+//   bits 6..7   arg0 operand    (COMBINER_OP_*)
+//   bits 8..9   arg1 source     bits 10..11 arg1 operand
+//   bits 12..13 arg2 source     bits 14..15 arg2 operand
+//   bits 16..17 log2(scale)     (0, 1 or 2 => 1x, 2x, 4x)
+
+export const COMBINER_FN_REPLACE = 0;
+export const COMBINER_FN_MODULATE = 1;
+export const COMBINER_FN_ADD = 2;
+export const COMBINER_FN_ADD_SIGNED = 3;
+export const COMBINER_FN_INTERPOLATE = 4;
+export const COMBINER_FN_SUBTRACT = 5;
+export const COMBINER_FN_DOT3_RGB = 6;
+export const COMBINER_FN_DOT3_RGBA = 7;
+
+export const COMBINER_SRC_TEXTURE = 0;
+export const COMBINER_SRC_CONSTANT = 1;
+export const COMBINER_SRC_PRIMARY = 2;
+export const COMBINER_SRC_PREVIOUS = 3;
+
+export const COMBINER_OP_SRC_COLOR = 0;
+export const COMBINER_OP_ONE_MINUS_SRC_COLOR = 1;
+export const COMBINER_OP_SRC_ALPHA = 2;
+export const COMBINER_OP_ONE_MINUS_SRC_ALPHA = 3;
+
+function combinerFn(glEnum: number): number {
+    switch (glEnum) {
+        case GL_REPLACE: return COMBINER_FN_REPLACE;
+        case GL_ADD: return COMBINER_FN_ADD;
+        case GL_ADD_SIGNED: return COMBINER_FN_ADD_SIGNED;
+        case GL_INTERPOLATE: return COMBINER_FN_INTERPOLATE;
+        case GL_SUBTRACT: return COMBINER_FN_SUBTRACT;
+        case GL_DOT3_RGB: case GL_DOT3_RGB_EXT: return COMBINER_FN_DOT3_RGB;
+        case GL_DOT3_RGBA: case GL_DOT3_RGBA_EXT: return COMBINER_FN_DOT3_RGBA;
+        default: return COMBINER_FN_MODULATE;
+    }
+}
+
+function combinerSrc(glEnum: number): number {
+    switch (glEnum) {
+        case GL_CONSTANT: return COMBINER_SRC_CONSTANT;
+        case GL_PRIMARY_COLOR: return COMBINER_SRC_PRIMARY;
+        case GL_PREVIOUS: return COMBINER_SRC_PREVIOUS;
+        default: return COMBINER_SRC_TEXTURE;
+    }
+}
+
+function combinerOp(glEnum: number): number {
+    switch (glEnum) {
+        case GL_ONE_MINUS_SRC_COLOR: return COMBINER_OP_ONE_MINUS_SRC_COLOR;
+        case GL_SRC_ALPHA: return COMBINER_OP_SRC_ALPHA;
+        case GL_ONE_MINUS_SRC_ALPHA: return COMBINER_OP_ONE_MINUS_SRC_ALPHA;
+        default: return COMBINER_OP_SRC_COLOR;
+    }
+}
+
+function scaleLog2(scale: number): number {
+    if (scale >= 4) return 2;
+    if (scale >= 2) return 1;
+    return 0;
+}
+
+function packCombinerWord(fn: number, src: Int32Array, op: Int32Array, scale: number): number {
+    return (combinerFn(fn)
+        | (combinerSrc(src[0]) << 4) | (combinerOp(op[0]) << 6)
+        | (combinerSrc(src[1]) << 8) | (combinerOp(op[1]) << 10)
+        | (combinerSrc(src[2]) << 12) | (combinerOp(op[2]) << 14)
+        | (scaleLog2(scale) << 16)) | 0;
+}
+
+export function packCombinerRgb(unit: GLTextureUnit): number {
+    return packCombinerWord(unit.combineRgb, unit.srcRgb, unit.opRgb, unit.rgbScale);
+}
+
+export function packCombinerAlpha(unit: GLTextureUnit): number {
+    return packCombinerWord(unit.combineAlpha, unit.srcAlpha, unit.opAlpha, unit.alphaScale);
+}
+
+/** Neutral combiner word for a synthesized draw that does not use GL_COMBINE. Slots
+ *  are never cleared by alloc(), so every DRAW emitter must write them regardless. */
+export const COMBINER_WORD_DEFAULT = (COMBINER_FN_MODULATE
+    | (COMBINER_SRC_TEXTURE << 4) | (COMBINER_OP_SRC_COLOR << 6)
+    | (COMBINER_SRC_PREVIOUS << 8) | (COMBINER_OP_SRC_COLOR << 10)
+    | (COMBINER_SRC_CONSTANT << 12) | (COMBINER_OP_SRC_ALPHA << 14)) | 0;
+
+/**
+ * Write the combiner + env-colour slots of one DRAW record. Units NOT in GL_COMBINE
+ * get the neutral word and a zero constant so two draws that differ only in combiner
+ * state they never consult still merge.
+ */
+export function writeTexEnvSlots(
+    I: Int32Array, F: Float32Array, i: number, f: number,
+    unit0: GLTextureUnit, unit1: GLTextureUnit,
+): void {
+    writeOneTexEnvSlot(I, F, i + CI_COMBINE0_RGB, i + CI_COMBINE0_ALPHA, f + CF_ENV_COLOR0, unit0);
+    writeOneTexEnvSlot(I, F, i + CI_COMBINE1_RGB, i + CI_COMBINE1_ALPHA, f + CF_ENV_COLOR1, unit1);
+}
+
+function writeOneTexEnvSlot(
+    I: Int32Array, F: Float32Array,
+    rgbSlot: number, alphaSlot: number, colorSlot: number, unit: GLTextureUnit,
+): void {
+    if (unit.texEnvMode === GL_COMBINE) {
+        I[rgbSlot] = packCombinerRgb(unit);
+        I[alphaSlot] = packCombinerAlpha(unit);
+        F[colorSlot] = unit.envColor[0];
+        F[colorSlot + 1] = unit.envColor[1];
+        F[colorSlot + 2] = unit.envColor[2];
+        F[colorSlot + 3] = unit.envColor[3];
+    } else {
+        I[rgbSlot] = COMBINER_WORD_DEFAULT;
+        I[alphaSlot] = COMBINER_WORD_DEFAULT;
+        F[colorSlot] = 0;
+        F[colorSlot + 1] = 0;
+        F[colorSlot + 2] = 0;
+        F[colorSlot + 3] = 0;
+    }
 }
 
 // ---- Matrix stack ----
@@ -179,6 +447,10 @@ export interface OpenGLContext {
     backend: WebGPUBackend | null;
     executor: any | null; // OpenGLBackendExecutor
     presenter: any | null;
+    /** The DC the current WGL context was made current for — the drawable the default
+     *  framebuffer belongs to. Kept across an unbind, which does not change what is on
+     *  screen (see wglMakeCurrent). */
+    drawableDC: number;
 
     // Error
     error: number; // GL_NO_ERROR = 0
@@ -272,6 +544,26 @@ export interface OpenGLContext {
     textureUnits: GLTextureUnit[];
     textures: Map<number, GLTextureObject>;
     nextTextureId: number;
+    /** 6 user clip plane equations (4 doubles each), as glClipPlane was given them. */
+    clipPlanes: Float64Array;
+
+    // ---- Selection / feedback ----
+    /** GL_RENDER, GL_SELECT or GL_FEEDBACK. Only GL_RENDER rasterizes. */
+    renderMode: number;
+    nameStack: Int32Array;
+    /** Index of the top entry, -1 when the stack is empty. */
+    nameStackTop: number;
+    selectBufferPtr: number;
+    selectBufferSize: number;
+    feedbackBufferPtr: number;
+    feedbackBufferSize: number;
+    feedbackBufferType: number;
+
+    /** GL_PROXY_TEXTURE_2D result of the last proxy glTexImage2D. All zero means the
+     *  request would NOT fit — that is the only way glGetTexLevelParameter can say no. */
+    proxyTextureWidth: number;
+    proxyTextureHeight: number;
+    proxyTextureInternalFormat: number;
 
     // Immediate mode
     immediateMode: boolean;
@@ -287,6 +579,8 @@ export interface OpenGLContext {
     normalArray: GLArrayPointer;
     colorArray: GLArrayPointer;
     texCoordArrays: GLArrayPointer[];
+    /** EXT_compiled_vertex_array: gathered/transformed cache for the locked range. */
+    cva: GLCvaState;
 
     // Display lists
     displayLists: Map<number, GLDisplayList>;
@@ -297,8 +591,9 @@ export interface OpenGLContext {
     compilingCommands: Array<{ fn: string; args: number[] }>;
     replayingList: boolean;
 
-    // Command stream for backend
-    commands: GLCommand[];
+    // Command stream for backend + the vertex arena its DRAW records point into
+    commands: GLCommandStream;
+    vertArena: GLVertexArena;
 
     // Frame stats
     frameSnapshot: GLFrameSnapshot;
@@ -426,6 +721,7 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         backend: null,
         executor: null,
         presenter: null,
+        drawableDC: 0,
 
         error: 0,
 
@@ -502,12 +798,21 @@ export function createOpenGLContext(process: Process): OpenGLContext {
 
         activeTextureUnit: 0,
         clientActiveTextureUnit: 0,
-        textureUnits: [
-            { enabled2d: false, boundTexture: 0, texEnvMode: GL_MODULATE },
-            { enabled2d: false, boundTexture: 0, texEnvMode: GL_MODULATE },
-        ],
+        textureUnits: [createTextureUnit(), createTextureUnit()],
         textures: new Map(),
         nextTextureId: 1,
+        clipPlanes: new Float64Array(24),
+        renderMode: GL_RENDER,
+        nameStack: new Int32Array(NAME_STACK_MAX_DEPTH),
+        nameStackTop: -1,
+        selectBufferPtr: 0,
+        selectBufferSize: 0,
+        feedbackBufferPtr: 0,
+        feedbackBufferSize: 0,
+        feedbackBufferType: 0,
+        proxyTextureWidth: 0,
+        proxyTextureHeight: 0,
+        proxyTextureInternalFormat: 0,
 
         immediateMode: false,
         immediateFlatBuf: new Float32Array(65536 * 15),
@@ -521,6 +826,7 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         normalArray: defaultArrayPointer(),
         colorArray: defaultArrayPointer(),
         texCoordArrays: [defaultArrayPointer(), defaultArrayPointer()],
+        cva: createCvaState(),
 
         displayLists: new Map(),
         nextListId: 1,
@@ -530,7 +836,8 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         compilingCommands: [],
         replayingList: false,
 
-        commands: [],
+        commands: new GLCommandStream(),
+        vertArena: new GLVertexArena(),
 
         frameSnapshot: { frameId: 0, drawCalls: 0, presents: 0, texUploads: 0, clearCalls: 0, vertexCount: 0 },
         frameId: 0,
@@ -576,16 +883,21 @@ export function createOpenGLContext(process: Process): OpenGLContext {
 }
 
 export function resetOpenGLContext(ctx: OpenGLContext): void {
-    ctx.error = 0;
-    ctx.commands.length = 0;
-    ctx.textures.clear();
-    ctx.displayLists.clear();
-    ctx.compilingList = null;
-    ctx.compilingCommands = [];
-    ctx.replayingList = false;
-    ctx.nextTextureId = 1;
-    ctx.nextListId = 1;
-    ctx.frameSnapshot = { frameId: 0, drawCalls: 0, presents: 0, texUploads: 0, clearCalls: 0, vertexCount: 0 };
-    ctx.frameId = 0;
-    ctx.stringCache.clear();
+    // Exports close over this ctx object — rebuild state in place (keep process/backend/presenter).
+    try {
+        ctx.executor?.destroy();
+    } catch {
+        /* best-effort GPU teardown */
+    }
+    const backend = ctx.backend;
+    const presenter = ctx.presenter;
+    const fresh = createOpenGLContext(ctx.process);
+    for (const key of Object.keys(fresh) as (keyof OpenGLContext)[]) {
+        if (key === "process" || key === "backend" || key === "presenter" || key === "executor") continue;
+        if (typeof fresh[key] === "function") continue;
+        (ctx as any)[key] = (fresh as any)[key];
+    }
+    ctx.backend = backend;
+    ctx.presenter = presenter;
+    ctx.executor = null;
 }

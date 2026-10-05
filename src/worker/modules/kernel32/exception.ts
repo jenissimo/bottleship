@@ -4,11 +4,13 @@
  * Atomic implementation for exception handling
  */
 
-import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { cpuViews } from '../../core/cpu/cpu-views';
+import type { FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { getCPU } from '../../core/thunking/thunk-utils';
-import { dispatchCxxException, dispatchFinallyUnwind } from '../../core/seh-dispatch';
+import { dispatchCxxException, dispatchUnwindPass } from '../../core/seh-dispatch';
 import { readAnsiFromGuest } from '../codepage-utils';
 
 function tryReadUeAnsiFString(mem: Uint8Array, arrayPtr: number, maxChars = 512): string | null {
@@ -35,6 +37,84 @@ function dumpGuestDwords(mem: Uint8Array, ptr: number, words: number = 8): strin
     return `ptr=0x${ptr.toString(16)} ${parts.join(' ')}`;
 }
 
+/** Exception-filter dispositions, and the stdcall arg size both filters share. */
+const EXCEPTION_CONTINUE_SEARCH = 0;
+const EXCEPTION_EXECUTE_HANDLER = 1;
+const UEF_STACK_CLEANUP = 4;
+
+// C++ throw capture ring. A C++ exception (RaiseException 0xe06d7363) is caught by
+// the app's own __CxxFrameHandler, so breakOnApi/sehLog never see it, and the throw
+// stack is gone by the time a fatal MessageBox pauses the guest. We snapshot a
+// heuristic guest backtrace (FPO-tolerant) at the raise itself into a bounded ring
+// that survives even the UEF's GetModuleFileNameA module-walk flood (worker-side,
+// socket-independent). Read via harness `cxxThrows()`.
+export interface CxxThrowRecord {
+    seq: number;
+    t: number;
+    code: number;
+    typeName: string;
+    valuePtr: number;
+    objDump: string;
+    eip: number;
+    frames: Array<{ retAddr: string; mod: string | null; off: number; isThunk: boolean }>;
+    /** raw thrown-object pointer, used only for short-window dedup of the same throw. */
+    valuePtrRaw?: number;
+}
+const cxxThrowRing: CxxThrowRecord[] = [];
+let cxxThrowSeq = 0;
+const CXX_RING_MAX = 64;
+export function getCxxThrowRing(): CxxThrowRecord[] { return cxxThrowRing; }
+export function resetCxxThrowRing(): void { cxxThrowRing.length = 0; cxxThrowSeq = 0; }
+
+/** Snapshot a C++ throw (0xe06d7363) into the ring — called at the RaiseException thunk
+ *  entry, before any dispatch, so it fires whatever path the throw takes and survives the
+ *  UEF's log flood. A heuristic stack scan from the raise ESP recovers the guest caller
+ *  past the FPO CRT frames an EBP walk can't. */
+export function captureCxxThrow(mem: Uint8Array, thunkEsp: number, thrownObjPtr: number, throwInfoPtr: number): void {
+    try {
+        const system = System.getInstance();
+        thrownObjPtr = thrownObjPtr >>> 0;
+        throwInfoPtr = throwInfoPtr >>> 0;
+        // Dedup: the same throw funnels through dispatchCxxException more than once — skip a
+        // repeat of the last object within a short window so the ring shows distinct throws.
+        const lastRec = cxxThrowRing[cxxThrowRing.length - 1];
+        const nowMs = Math.round(performance.now());
+        if (lastRec && lastRec.valuePtrRaw === thrownObjPtr && nowMs - lastRec.t < 50) return;
+
+        const rec: CxxThrowRecord = {
+            seq: ++cxxThrowSeq, t: nowMs, code: 0xe06d7363,
+            typeName: '', valuePtr: 0, objDump: '', eip: 0, frames: [], valuePtrRaw: thrownObjPtr,
+        };
+        // Each enrichment is independent and best-effort — push the record no matter which
+        // part fails, so a broken backtrace never loses the throw itself.
+        try {
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            if (throwInfoPtr) {
+                const ctArrayPtr = view.getUint32(throwInfoPtr + 12, true) >>> 0;
+                if (ctArrayPtr && (view.getUint32(ctArrayPtr, true) >>> 0) < 100) {
+                    const ctRVA = view.getUint32(ctArrayPtr + 4, true) >>> 0;
+                    const tdPtr = ctRVA ? (view.getUint32(ctRVA + 4, true) >>> 0) : 0;
+                    if (tdPtr) rec.typeName = readAnsiFromGuest(mem, tdPtr + 8, 96);
+                }
+            }
+            if (thrownObjPtr) { rec.valuePtr = view.getUint32(thrownObjPtr, true) >>> 0; rec.objDump = dumpGuestDwords(mem, thrownObjPtr, 8); }
+        } catch { /* decode best-effort */ }
+        try {
+            const cpu = system.process?.v86 ? getCPU(system.process.v86) : null;
+            rec.eip = (cpu?.instruction_pointer?.[0] ?? 0) >>> 0;
+        } catch { /* */ }
+        try {
+            const bt = system.process?.dispatcher?.getGuestCallStack?.(thunkEsp >>> 0, 0x2000, 40, { recent: false });
+            rec.frames = (bt?.frames ?? []).map((f: any) => ({
+                retAddr: '0x' + (f.retAddr >>> 0).toString(16), mod: f.moduleName ?? null,
+                off: f.moduleOffset >>> 0, isThunk: !!f.isThunk,
+            }));
+        } catch { /* backtrace best-effort */ }
+        cxxThrowRing.push(rec);
+        while (cxxThrowRing.length > CXX_RING_MAX) cxxThrowRing.shift();
+    } catch { /* best-effort */ }
+}
+
 // EncodePointer/DecodePointer cookie — module-scope so fast path can access it.
 // Must NOT be zero! See comment in exceptionExports below.
 let pointerCookie = 0;
@@ -44,6 +124,11 @@ const getPointerCookie = (): number => {
     }
     return pointerCookie;
 };
+
+/** New process ⇒ fresh EncodePointer cookie (Process.reset reuses the Process object). */
+export function resetPointerCookie(): void {
+    pointerCookie = 0;
+}
 
 // Well-known NTSTATUS exception codes
 const EXCEPTION_CODE_NAMES: Record<number, string> = {
@@ -235,9 +320,44 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // Best-effort diagnostics
         }
 
-        // EXCEPTION_CONTINUE_SEARCH = 0
-        // We don't handle exceptions, so continue search
-        return 0;
+        // Windows hands the exception to the filter the app registered with
+        // SetUnhandledExceptionFilter and returns whatever that filter decides. Skipping
+        // that call is not a missing diagnostic but a wrong answer: an app whose filter
+        // would have said "continue execution" — the shape anti-debug probes take, where a
+        // deliberate INT 3 is expected to come back through here — instead sees its own
+        // exception go unhandled and dies.
+        const dispatcher = System.getInstance().process?.dispatcher;
+        const filter = dispatcher?.getUnhandledExceptionFilter() ?? 0;
+        const callbackManager = dispatcher?.callbackManager;
+        if (filter && callbackManager) {
+            const frameId = callbackManager.saveSuspendedThunkContext(ctx, UEF_STACK_CLEANUP, 'UnhandledExceptionFilter');
+            if (frameId) {
+                const { callbackId } = callbackManager.invokeCallback(
+                    filter,
+                    [ExceptionInfo],
+                    UEF_STACK_CLEANUP,
+                    // A filter that declines still ends the process on Windows: UEF puts up
+                    // the fatal-error dialog and reports EXCEPTION_EXECUTE_HANDLER so the
+                    // CRT's __except runs its exit path.
+                    (ret: number) => (ret === EXCEPTION_CONTINUE_SEARCH ? EXCEPTION_EXECUTE_HANDLER : ret),
+                    false,
+                    'UnhandledExceptionFilter',
+                    frameId,
+                );
+                if (callbackId) {
+                    return {
+                        value: 0,
+                        suspendedForCallback: true,
+                        callbackId,
+                        stackCleanup: UEF_STACK_CLEANUP,
+                    };
+                }
+            }
+            Logger.error(LogCategory.KERNEL32,
+                `UnhandledExceptionFilter: could not invoke the app filter at 0x${filter.toString(16)}`);
+        }
+
+        return EXCEPTION_EXECUTE_HANDLER;
     };
 
     exports['RaiseException'] = (ctx, mem, args) => {
@@ -245,6 +365,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const dwExceptionFlags = args[1];
         const nNumberOfArguments = args[2];
         const lpArguments = args[3];
+
+        // Snapshot every C++ throw at the raise point (see cxxThrowRing / captureCxxThrow) —
+        // before dispatchCxxException, which returns early for an app-caught throw and never
+        // reaches the x86-dispatch fallback below. Read via harness `cxxThrows()`.
+        if ((dwExceptionCode >>> 0) === 0xe06d7363 && lpArguments && nNumberOfArguments >= 3) {
+            const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            captureCxxThrow(mem, ctx.esp >>> 0, v.getUint32(lpArguments + 4, true), v.getUint32(lpArguments + 8, true));
+        }
 
         let extra = '';
         if (dwExceptionCode === 0xe06d7363 && lpArguments && nNumberOfArguments >= 3) {
@@ -319,6 +447,31 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             }
         }
 
+        // MSVC delay-load failure (0xC06D007E module-not-found / 0xC06D007F proc-not-found):
+        // the single argument is a DelayLoadInfo* (cb=0x24). Decode szDll + szProcName/ordinal
+        // so the log names exactly which delay import the guest's __delayLoadHelper2 could not
+        // resolve — the generic bug is always a DLL we did not register or an export we do not
+        // hand back to GetProcAddress, never the game.
+        if ((dwExceptionCode === 0xc06d007f || dwExceptionCode === 0xc06d007e)
+            && lpArguments && nNumberOfArguments >= 1) {
+            try {
+                const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                const pInfo = dv.getUint32(lpArguments, true) >>> 0;
+                if (pInfo && pInfo + 0x24 <= mem.length) {
+                    const cb = dv.getUint32(pInfo + 0, true);
+                    const szDll = dv.getUint32(pInfo + 12, true) >>> 0;
+                    const fByName = dv.getUint32(pInfo + 16, true) >>> 0;
+                    const dlp = dv.getUint32(pInfo + 20, true) >>> 0;
+                    const hmodCur = dv.getUint32(pInfo + 24, true) >>> 0;
+                    const dllName = szDll ? readAnsiFromGuest(mem, szDll, 128) : '?';
+                    const proc = fByName ? `"${readAnsiFromGuest(mem, dlp, 128)}"` : `#ord${dlp}`;
+                    extra += ` DELAYLOAD FAIL: dll="${dllName}" proc=${proc} hmodCur=0x${hmodCur.toString(16)} cb=0x${cb.toString(16)}`;
+                }
+            } catch (e) {
+                extra += ` (delayload decode failed: ${e})`;
+            }
+        }
+
         // Log caller return address for context, with module identification
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const callerEIP = ctx.esp ? view.getUint32(ctx.esp, true) : 0;
@@ -350,7 +503,27 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             if (cpu) {
                 // RaiseException is stdcall(code, flags, nArgs, lpArgs): thunk RET 16.
                 const result = dispatchCxxException(mem, cpu, objPtr, throwInfoPtr, 16);
-                if (result) return result;
+                if (result && !('deferToX86' in result)) return result;
+
+                if (result) {
+                    // JS walk met a non-C++ frame (__try/__except) whose filter must run
+                    // natively. For a rethrow tracked only on the JS side, complete the
+                    // record's parameters so guest __CxxFrameHandler can type-match
+                    // without CRT per-thread state.
+                    if (objPtr === 0 && throwInfoPtr === 0 && result.pExceptionObject !== 0) {
+                        view.setUint32(lpArguments + 4, result.pExceptionObject, true);
+                        view.setUint32(lpArguments + 8, result.pThrowInfo, true);
+                    }
+                    return dispatchRaiseExceptionViaSeh(
+                        mem,
+                        ctx,
+                        dwExceptionCode,
+                        dwExceptionFlags,
+                        nNumberOfArguments,
+                        lpArguments,
+                        `C++ defer obj=0x${result.pExceptionObject.toString(16)}, throwInfo=0x${result.pThrowInfo.toString(16)}`,
+                    );
+                }
 
                 // JS-side parser couldn't recognize the handler FuncInfo layout (e.g. modern MSVC).
                 // Fall back to x86-based dispatch: call real handlers via static SEH stub.
@@ -425,7 +598,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         }
 
-        const tebAddr = cpu.segment_offsets?.[4] ?? 0;
+        const tebAddr = cpuViews(cpu).segmentOffsets[4] ?? 0;
         if (tebAddr === 0) {
             Logger.error(LogCategory.KERNEL32, `RtlUnwind: no TEB`);
             return 0;
@@ -438,27 +611,31 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             `RtlUnwind(targetFrame=0x${targetFrame.toString(16)}, excRec=0x${pExceptionRecord.toString(16)}, ` +
             `retVal=0x${returnValue.toString(16)}) sehHead=0x${sehHead.toString(16)}`);
 
-        // Set EH_UNWINDING flag on the exception record so handlers know this is an unwind pass
+        // Mark the record as an unwind pass. A missing TargetFrame is an EXIT unwind (the
+        // whole chain goes), which handlers distinguish from a normal one — Windows sets
+        // both bits here, and a runtime that only tests EH_EXIT_UNWIND sees nothing without
+        // it. A NULL record is synthesized further down, where there is scratch to put it.
         if (pExceptionRecord !== 0 && pExceptionRecord + 8 <= mem.length) {
-            const EH_UNWINDING = 0x02;
+            const EH_UNWINDING = 0x02, EH_EXIT_UNWIND = 0x04;
             const oldFlags = view.getUint32(pExceptionRecord + 4, true);
-            view.setUint32(pExceptionRecord + 4, oldFlags | EH_UNWINDING, true);
+            view.setUint32(pExceptionRecord + 4,
+                oldFlags | EH_UNWINDING | (targetFrame !== 0 ? 0 : EH_EXIT_UNWIND), true);
         }
 
         // RtlUnwind is stdcall with 4 args → stub does RET 16
         const RTLUNWIND_CLEANUP = 16;
 
-        // Try to run __finally blocks via trampoline on the dead stack.
-        // dispatchFinallyUnwind walks __except_handler3 frames from FS:[0] to targetFrame,
-        // collects scope table entries with filterAddr==0, and emits a trampoline that
-        // calls each funclet (MOV EBP, frame+16; CALL handler), updates FS:[0], then
-        // returns to our caller via MOV ESP, callerEsp; JMP retAddr.
-        const trampolineResult = dispatchFinallyUnwind(
+        // Run the unwind pass on the dead stack: dispatchUnwindPass walks FS:[0] to
+        // targetFrame and emits a trampoline that calls every frame's handler with
+        // EH_UNWINDING, popping each frame after its handler, then returns to our caller
+        // via MOV ESP, callerEsp; JMP retAddr.
+        const trampolineResult = dispatchUnwindPass(
             mem, cpu, ctx.esp, tebAddr, targetFrame, returnValue, RTLUNWIND_CLEANUP,
+            pExceptionRecord,
         );
         if (trampolineResult) return trampolineResult;
 
-        // No __finally blocks found — simple path: just unlink frames and return.
+        // Nothing between FS:[0] and targetFrame — simple path: unlink and return.
         // Windows RtlUnwind unlinks all frames from FS:[0] up to but NOT INCLUDING
         // targetFrame, leaving FS:[0] = targetFrame. The target is the catching frame and
         // STAYS in the chain: for C-style SEH (_except_handler3, one registration per
@@ -474,10 +651,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (targetFrame !== 0) {
             view.setUint32(tebAddr, targetFrame, true);
             Logger.log(LogCategory.KERNEL32,
-                `RtlUnwind: no __finally blocks, FS:[0] = 0x${targetFrame.toString(16)} (targetFrame stays — Win32 contract)`);
+                `RtlUnwind: nothing to unwind, FS:[0] = 0x${targetFrame.toString(16)} (targetFrame stays — Win32 contract)`);
         }
 
-        cpu.reg32[0] = returnValue | 0;
+        cpuViews(cpu).reg32[0] = returnValue | 0;
         return { value: returnValue, stackCleanup: RTLUNWIND_CLEANUP };
     };
 
@@ -513,6 +690,17 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // EncodePointer(NULL) as sentinel for "no handler". If EncodePointer(NULL)=0
     // (identity), CRT confuses "no handler" with "uninitialized" → _invoke_watson
     // terminates instead of returning from _invalid_parameter.
+    /**
+     * DebugBreak — INT 3 with no debugger attached raises STATUS_BREAKPOINT, which
+     * an app's own __try normally swallows. We have no debugger to attach, so the
+     * faithful observable outcome is "the exception was handled and execution
+     * continued"; log it, because a guest reaching here is reporting something.
+     */
+    exports['DebugBreak'] = () => {
+        Logger.warn(LogCategory.KERNEL32, 'DebugBreak() — no debugger attached, continuing');
+        return 0;
+    };
+
     exports['EncodePointer'] = (ctx, mem, args) => {
         return (args[0] ^ getPointerCookie()) >>> 0;
     };
@@ -528,11 +716,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
  * Register fast paths for EncodePointer/DecodePointer (5841 calls during Montezuma load).
  * Both are the same XOR operation (self-inverse).
  */
-export function registerFastPathPointerFunctions(dispatcher: any): void {
+export function registerFastPathPointerFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher?.registerFastPath) return;
 
-    const impl = (cpu: any, mem8: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    const impl: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 8 > mem8.length) return null;
         const ptr = view.getUint32(esp + 4, true) >>> 0;
         return (ptr ^ getPointerCookie()) >>> 0;

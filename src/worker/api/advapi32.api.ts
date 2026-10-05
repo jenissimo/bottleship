@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -18,14 +19,14 @@ const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDes
 export const advapi32Module: ModuleDescriptor = {
     name: "advapi32",
     functions: [
-        makeFunc("RegOpenKeyEx", 5),
+        makeFunc("RegOpenKeyEx", 5, { onUnimplemented: "win32Status" }),
         makeFunc("RegOpenKeyExA", 5),
         makeFunc("RegOpenKeyExW", 5),
         makeFunc("RegOpenKeyA", 3),
         makeFunc("RegOpenKeyW", 3),
         makeFunc("RegOpenKeyTransactedA", 7),
         makeFunc("RegOpenKeyTransactedW", 7),
-        makeFunc("RegQueryValueEx", 6),
+        makeFunc("RegQueryValueEx", 6, { onUnimplemented: "win32Status" }),
         makeFunc("RegQueryValueExA", 6),
         makeFunc("RegQueryValueExW", 6),
         makeFunc("RegGetValueA", 7),
@@ -54,6 +55,22 @@ export const advapi32Module: ModuleDescriptor = {
         makeFunc("CreateServiceA", 13),
         makeFunc("OpenServiceA", 3),
         makeFunc("CloseServiceHandle", 1),
+        // Service control/query set — copy-protection drivers (SafeDisc's drvmgt.dll)
+        // install and poke a kernel service through these, and one missing name fails
+        // the whole DLL's load.
+        makeFunc("StartServiceA", 3),                  // hService, dwNumServiceArgs, lpServiceArgVectors
+        makeFunc("ControlService", 3),                 // hService, dwControl, lpServiceStatus
+        makeFunc("DeleteService", 1),
+        makeFunc("QueryServiceStatus", 2),             // hService, lpServiceStatus
+        makeFunc("QueryServiceConfigA", 4),            // hService, lpServiceConfig, cbBufSize, pcbBytesNeeded
+        makeFunc("ChangeServiceConfigA", 11),          // hService, type, start, error, path, group, tagId, deps, user, pw, display
+        makeFunc("QueryServiceObjectSecurity", 5),     // hService, si, lpSecurityDescriptor, cbBufSize, pcbBytesNeeded
+        makeFunc("SetServiceObjectSecurity", 3),       // hService, si, lpSecurityDescriptor
+        makeFunc("LockServiceDatabase", 1),
+        makeFunc("UnlockServiceDatabase", 1),
+        // RtlGenRandom, exported only under this name — the CRT and mod code use it as
+        // the system entropy source.
+        makeFunc("SystemFunction036", 2),    // pbBuffer, ulLen
         makeFunc("StartServiceCtrlDispatcherA", 1),
         makeFunc("RegisterServiceCtrlHandlerA", 2),
         makeFunc("SetServiceStatus", 2),
@@ -66,6 +83,7 @@ export const advapi32Module: ModuleDescriptor = {
         makeFunc("AddAccessAllowedAce", 4),
         makeFunc("AddAccessDeniedAce", 4),
         makeFunc("OpenProcessToken", 3),
+        makeFunc("OpenThreadToken", 4),
         makeFunc("GetTokenInformation", 5),
         makeFunc("RegEnumKeyA", 4),
         makeFunc("RegQueryValueA", 4),
@@ -76,22 +94,24 @@ export const advapi32Module: ModuleDescriptor = {
         makeFunc("CryptGenRandom", 3),
         makeFunc("CryptCreateHash", 5),
         makeFunc("CryptHashData", 4),
+        makeFunc("CryptGetHashParam", 5),
+        makeFunc("CryptEncrypt", 7),
         makeFunc("CryptImportKey", 6),
         makeFunc("CryptVerifySignatureA", 6),
         makeFunc("CryptDestroyHash", 1),
         makeFunc("CryptDestroyKey", 1),
         makeFunc("IsValidSid", 1),
         makeFunc("IsTextUnicode", 3),
-        makeFunc("RegQueryValueW", 4),
-        makeFunc("RegEnumKeyW", 4),
-        makeFunc("RegDeleteKeyExA", 4),
-        makeFunc("RegDeleteKeyExW", 4),
+        makeFunc("RegQueryValueW", 4, { onUnimplemented: "win32Status" }),
+        makeFunc("RegEnumKeyW", 4, { onUnimplemented: "win32Status" }),
+        makeFunc("RegDeleteKeyExA", 4, { onUnimplemented: "win32Status" }),
+        makeFunc("RegDeleteKeyExW", 4, { onUnimplemented: "win32Status" }),
         makeFunc("RegSetValueA", 5),
         makeFunc("RegSetValueW", 5),
-        makeFunc("SetNamedSecurityInfoW", 7),
+        makeFunc("SetNamedSecurityInfoW", 7, { onUnimplemented: "win32Status" }),
         makeFunc("OpenSCManagerW", 3),
         makeFunc("OpenServiceW", 3),
-        makeFunc("CryptAcquireContextW", 5),
+        makeFunc("CryptAcquireContextW", 5, { onUnimplemented: "zero" }),
         makeFunc("CryptVerifySignatureW", 6),
         makeFunc("LookupAccountSidA", 7),
         makeFunc("LookupAccountSidW", 7),
@@ -108,9 +128,9 @@ export const advapi32Module: ModuleDescriptor = {
 
         // Auto-generated from reference signatures
         makeFunc("ConvertFiberToThread", 0),
-        makeFunc("RegisterApplicationRecoveryCallback", 4),
-        makeFunc("RegisterApplicationRestart", 2),
-        makeFunc("RegisterEventSourceA", 2),
+        makeFunc("RegisterApplicationRecoveryCallback", 4, { onUnimplemented: "hresult" }),
+        makeFunc("RegisterApplicationRestart", 2, { onUnimplemented: "hresult" }),
+        makeFunc("RegisterEventSourceA", 2, { onUnimplemented: "zero" }),
         makeFunc("RegisterEventSourceW", 2),
         makeFunc("RegisterWaitForSingleObject", 6),
         makeFunc("RegisterWaitForSingleObjectEx", 5),

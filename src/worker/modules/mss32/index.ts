@@ -6,9 +6,11 @@ import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
 import { TimeService } from "../../runtime/time";
 import { MSSContext, createMSSContext, SMP_DONE, SMP_PLAYING } from "./context";
-import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, stopHeartbeat } from "./helpers";
-import { updateEmulatorState, playSample, appendDecodedChunk } from "./playback-engine";
+import { finishSamplePlayback, getBytesPerSecond, getPlaybackLengthBytes, setSampleStatus, setStreamStatus, writeSamplePosition, writeStreamPosition, startHeartbeat, stopHeartbeat } from "./helpers";
+import { updateEmulatorState, playSample, appendDecodedChunk, resetMssRingBuffers } from "./playback-engine";
 import { invokeEOSCallback } from "./callbacks";
+import { pumpVfsStreams, serveIncrementalStreams } from "./stream-engine";
+import { mss32Module } from "../../api/mss32.api";
 import { convertToFloat } from "./audio-decode";
 import { createCoreExports } from "./core";
 import { createDigitalDriverExports } from "./digital-driver";
@@ -22,6 +24,26 @@ import { createFileIOExports } from "./file-io";
 import { createWavInfoExports } from "./wav-info";
 import { createSequenceExports } from "./sequence";
 import { createMidiDriverExports } from "./midi-driver";
+import { mssCensus, type MssCensus } from "./census";
+
+/**
+ * Bytes each export pops on return, read from the SAME descriptor the guest stub's
+ * `RET N` was generated from (ThunkGenerator.resolveBytesToPop).
+ *
+ * It cannot be derived from the name. 81 of mss32's exports are undecorated MSS 3.x
+ * aliases that are still stdcall with real arguments — `AIL_stream_status` pops 4,
+ * `AIL_stream_info` pops 20 — and the decoration lies even when present, which is why
+ * `stackCleanupBytes` exists (`_AIL_file_read@8` takes three arguments). A parked
+ * thunk does not run its stub's RET: the frame restores ESP from the cleanup we hand
+ * it, so a wrong number here desynchronises the guest stack only on the calls where a
+ * refill happened to come due.
+ */
+const EXPORT_CLEANUP: ReadonlyMap<string, number> = new Map(
+    mss32Module.functions.map((fn) => [
+        fn.name,
+        fn.stackCleanupBytes ?? (fn.callingConvention === "cdecl" ? 0 : fn.params.length * 4),
+    ]),
+);
 
 export class MSS32 implements IModule {
     name = "mss32";
@@ -30,23 +52,17 @@ export class MSS32 implements IModule {
     private ctx!: MSSContext;
 
     initialize(process: Process): void {
-        const memory = process.v86.mem8 || (process.v86.v86 && process.v86.v86.cpu.mem8);
-        this.ctx = createMSSContext(process, memory);
+        this.ctx = createMSSContext(process);
 
-        // Start the heartbeat loop to sync emulator memory with playback state (50Hz / 20ms):
-        // EOS detection (samples reaching SMP_DONE) + position writeback. Driven by the scheduler
-        // virtual-time timer wheel, NOT host setInterval — a busy-spinning guest thread starves
-        // host macrotasks, freezing sample completion → MSS32 voice-pool saturation hang (mac).
-        const scheduler = System.getInstance().scheduler;
-        if (scheduler) {
-            this.ctx.updateInterval = scheduler.timerWheel.add(
-                20, true, TimerKind.MSS_TIMER,
-                () => updateEmulatorState(this.ctx),
-                TimeService.getInstance().nowMs(),
-            );
-        } else {
-            Logger.warn(LogCategory.SYSTEM, "MSS32: scheduler unavailable at initialize — playback-state heartbeat disabled");
-        }
+        // The heartbeat syncs emulator memory with playback state (50Hz / 20ms): EOS
+        // detection (samples reaching SMP_DONE), position writeback, and the service
+        // point for VFS-backed incremental streams (no guest call to hang a refill on).
+        // Driven by the scheduler virtual-time timer wheel, NOT host setInterval — a
+        // busy-spinning guest thread starves host macrotasks, freezing sample completion
+        // → MSS32 voice-pool saturation hang (mac). startHeartbeat re-arms it whenever a
+        // digital driver is (re)opened; closing one stops it.
+        this.ctx.heartbeatTick = () => { pumpVfsStreams(this.ctx); updateEmulatorState(this.ctx); };
+        startHeartbeat(this.ctx);
 
         // Merge all domain exports
         Object.assign(this.exports, createCoreExports(this.ctx));
@@ -65,6 +81,46 @@ export class MSS32 implements IModule {
         // SmartHeap/MSS compatibility probes used by some games during startup.
         this.exports["_MemSetPatching@4"] = () => 0;
         this.exports["MemPoolInit"] = () => 1;
+
+        this.installStreamServicePoints();
+    }
+
+    /**
+     * Every export doubles as a tick of Miles' stream timer.
+     *
+     * Real MSS services its streams from a background thread it starts itself, so a
+     * title need never call AIL_serve — GTA Vice City registers file callbacks and
+     * then only ever queries and steers, which left an app-backed stream to drain its
+     * ring mid-file and stop for good. We cannot run that thread: topping such a
+     * stream up means calling the app's own file callbacks, which is guest code, and
+     * guest code needs a thunk to park — something the playback heartbeat does not
+     * have. Every entry into mss32 does, so every entry is where the timer's work
+     * lands. Servicing on the API surface as a whole, rather than on the calls one
+     * title happens to make, is what keeps this generic.
+     *
+     * The export's own work runs FIRST and its answer is carried through the refill
+     * chain, so a service point is invisible to the caller except in timing. A
+     * handler that parked itself (open_stream, serve) returns a ThunkResult rather
+     * than a number and is left strictly alone — there is one thunk to park, and it
+     * already used it.
+     */
+    private installStreamServicePoints(): void {
+        for (const name of Object.keys(this.exports)) {
+            // Parking a thunk whose stack cleanup we cannot read from the descriptor
+            // would corrupt the guest stack. An export we decline to service still
+            // works; there are ~300 others to carry the timer's work.
+            const stackCleanup = EXPORT_CLEANUP.get(name);
+            if (stackCleanup === undefined) continue;
+
+            const impl = this.exports[name]!;
+            const serviced: ThunkImplementation = (thunkCtx, mem, args) => {
+                const result = impl(thunkCtx, mem, args);
+                if (typeof result !== "number") return result;
+                return serveIncrementalStreams(
+                    this.ctx, thunkCtx, stackCleanup, `mss32:${name}`, result) ?? result;
+            };
+            this.exports[name] = serviced;
+        }
     }
 
     // ==================== Public methods (called from emulator.worker.ts) ====================
@@ -175,9 +231,10 @@ export class MSS32 implements IModule {
             return;
         }
 
-        // Check if it's a stream
+        // Check if it's a stream (a paused one keeps isPlaying; a late position report
+        // must not stamp SMP_PLAYING back over the SMP_STOPPED pause published for it)
         const stream = ctx.streamsById.get(id);
-        if (stream && stream.isPlaying) {
+        if (stream && stream.isPlaying && !stream.isPaused) {
             const channels = Math.max(1, stream.channels || 1);
             const bytesPerSample = Math.max(1, (stream.bitsPerSample || 16) >> 3);
             const blockAlign = stream.blockAlign || channels * bytesPerSample;
@@ -237,6 +294,11 @@ export class MSS32 implements IModule {
         }
     }
 
+    /** Live Miles state for the harness (`mssAudio`) — see census.ts. */
+    dbgMssCensus(): MssCensus {
+        return mssCensus(this.ctx);
+    }
+
     /**
      * Get playing samples count (for diagnostics)
      */
@@ -261,6 +323,7 @@ export class MSS32 implements IModule {
         ctx.pendingTimerCallbacks.length = 0;
         ctx.pendingEOSCallbacks.length = 0;
         ctx.insideAilServe = false;
+        resetMssRingBuffers();
         ctx.samples.clear();
         ctx.samplesById.clear();
         ctx.streams.clear();
@@ -268,6 +331,11 @@ export class MSS32 implements IModule {
         ctx.waveOuts.clear();
         ctx.fileHandles.clear();
         ctx.sequences.clear();
+        // Dropping the handles is the whole of this module's claim on the drive. The drive
+        // itself is shared with MCI's `cdaudio`, and resetting it from one of its two front
+        // ends is not this module's call: WinmmMci.reset() owns that (stop + eject + TOC
+        // invalidate) and runs in the same module sweep, so playback is already stopped.
+        ctx.redbookHandles.clear();
         for (const ptr of ctx.memAllocatedByMss) {
             ctx.process.memory.free(ptr);
         }

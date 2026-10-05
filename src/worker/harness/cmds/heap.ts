@@ -1,0 +1,248 @@
+/**
+ * heap — guest allocator health over the harness RPC.
+ *
+ * The kernel32 heap has three tiers: an inline x86 slab stub in guest code, the
+ * Rust hypercall, and the JS HeapAlloc thunk. Only the last one costs microseconds
+ * per call, and it is reached exactly when the slab arena is exhausted — so a load
+ * phase that suddenly runs at a fraction of its speed looks identical to "the guest
+ * got slower" unless you can see `fallbacks` climbing. heapSlab() makes that tier
+ * split observable, and heapSlabRates() turns the monotonic counters into the rate
+ * the question is actually about.
+ */
+
+import type { HarnessService } from "../service";
+import {
+    slabReport, queryVirtualMemory, virtualQueryFastStats, resetVirtualQueryFastStats,
+    heapZeroGrowStats, resetHeapZeroGrowStats,
+} from "../../modules/kernel32/memory";
+import { getLocaleInlineStubs } from "../../modules/kernel32/locale-stubs";
+import { LOCALE_STUB_ANSWERED_OFF, LOCALE_STUB_BAIL_OFF, LOCALE_STUB_BAIL_REASONS } from "../../modules/kernel32/locale-data";
+import { getMbwcInlineStubs } from "../../modules/kernel32/mbwc-stubs";
+import {
+    MBWC_ANSWERED_MBTWC_OFF, MBWC_ANSWERED_WCTMB_OFF, MBWC_MBTWC_BAIL_OFF,
+    MBWC_WCTMB_BAIL_OFF, MBTWC_BAIL_REASONS, WCTMB_BAIL_REASONS,
+} from "../../modules/kernel32/codepage-lut";
+import { Mem } from "../../core/memory/mem-accessor";
+import { HarnessError, HarnessErrorCode } from "../rpc";
+import { sys } from "../serialize";
+
+export function registerHeapCommands(svc: HarnessService): void {
+    /** vaQuery(addr) — the MEMORY_BASIC_INFORMATION the GUEST would get for `addr`.
+     *  Reading our own AddressSpace answers a different question than the guest asked;
+     *  when a heap manager, a stack-bounds helper or a pointer validator misbehaves, this
+     *  is the answer it actually saw.
+     *
+     *  vaQuery("stacks") runs it over every thread's [stackBase, stackTop) midpoint and
+     *  judges the answer: Win32 describes a stack by its RESERVATION, so AllocationBase
+     *  must be the stack base and RegionSize the whole run — a page-granular answer hands
+     *  every stack-bounds helper inverted or 4KB-wide bounds. */
+    svc.register("vaQuery", (args) => {
+        const target = args[0];
+        if (target !== "stacks") {
+            const addr = typeof target === "string" ? Number.parseInt(target, 16) : Number(target);
+            if (!Number.isFinite(addr)) throw new HarnessError("vaQuery expects an address or \"stacks\"", HarnessErrorCode.BAD_ARGS);
+            return queryVirtualMemory(addr >>> 0);
+        }
+        const scheduler = (sys() as any).scheduler;
+        if (!scheduler?.threads) throw new HarnessError("no scheduler", HarnessErrorCode.NO_PROCESS);
+        const rows = [];
+        for (const t of scheduler.threads.values()) {
+            const base = t.stackBase >>> 0, top = t.stackTop >>> 0;
+            if (!(top > base)) continue;
+            const mbi = queryVirtualMemory((base + Math.floor((top - base) / 2)) & ~0xFFF);
+            const reservationReported = mbi?.allocationBase === `0x${base.toString(16)}`
+                && (mbi?.regionSize as number) === top - base;
+            rows.push({
+                thread: t.id,
+                stackBase: `0x${base.toString(16)}`,
+                stackTop: `0x${top.toString(16)}`,
+                mbi,
+                reservationReported,
+            });
+        }
+        return { threads: rows, allReportReservation: rows.length > 0 && rows.every((r) => r.reservationReported) };
+    });
+
+    /** vaFastStats({reset?}) — did the VirtualQuery fast tier actually serve the calls?
+     *  `hits` vs `defers` is the tier split; `slowPathThunks` going to zero says the
+     *  dispatch disappeared, this says WHICH tier absorbed it. With
+     *  `setWorkerFlag('__virtualQueryFastAudit', true)` armed, `auditChecked` is how many
+     *  fast answers were differenced against the full body and `auditMismatches` must
+     *  stay 0 — a non-zero count also logs the address and both records. */
+    svc.register("vaFastStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stats = virtualQueryFastStats();
+        if (opts.reset) resetVirtualQueryFastStats();
+        return stats;
+    });
+
+    /** localeStubStats({reset?}) — did the trap-free GetLocaleInfoW stub answer?
+     *
+     *  An inline stub answers inside guest code, so the calls it absorbs vanish from
+     *  slowPathThunks, apiCensus, the fast-path census and breakOnApi alike — "the stub
+     *  works" and "the stub was never installed" are the same zero everywhere else.
+     *  These two counters live in the stub's own guest-RAM table and are the only
+     *  instrument that can tell them apart. Acceptance is `answered` in the millions with
+     *  `bailed` small; `installed: false` means the IAT redirect never happened (check the
+     *  title reaches GetLocaleInfoW through its IAT, not GetProcAddress). */
+    svc.register("localeStubStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stubs = getLocaleInlineStubs();
+        if (!stubs) return { installed: false, answered: 0, bailed: 0, bail: {} };
+        const rd = (off: number) => (Mem.readUint32(stubs.tableAddr + off) ?? 0) >>> 0;
+        const answered = rd(LOCALE_STUB_ANSWERED_OFF);
+        const bail: Record<string, number> = {};
+        let bailed = 0;
+        LOCALE_STUB_BAIL_REASONS.forEach((reason, i) => {
+            const n = rd(LOCALE_STUB_BAIL_OFF + i * 4);
+            bailed += n;
+            if (n) bail[reason] = n;
+        });
+        if (opts.reset) {
+            Mem.writeUint32(stubs.tableAddr + LOCALE_STUB_ANSWERED_OFF, 0);
+            LOCALE_STUB_BAIL_REASONS.forEach((_r, i) => Mem.writeUint32(stubs.tableAddr + LOCALE_STUB_BAIL_OFF + i * 4, 0));
+        }
+        return {
+            installed: true,
+            stubAddr: `0x${stubs.getLocaleInfoWStub.toString(16)}`,
+            tableAddr: `0x${stubs.tableAddr.toString(16)}`,
+            answered,
+            bailed,
+            bail,
+            bailPct: answered + bailed > 0 ? Math.round((bailed / (answered + bailed)) * 1000) / 10 : 0,
+        };
+    });
+
+    /** mbwcStubStats({reset?}) — did the trap-free MultiByteToWideChar / WideCharToMultiByte
+     *  stubs answer? Same blindness as localeStubStats: an inline stub answers inside guest
+     *  code, so its calls leave slowPathThunks / apiCensus / breakOnApi and the fast-path
+     *  census alike, and "it works" and "it was never installed" are the same zero
+     *  everywhere else. Read alongside localeFastPath(): `answered` here should rise by
+     *  what `mbtwcThunk` / `wctmbFast` there lose. A `bail` reason dominating names the
+     *  case the stubs do not cover — `otherCodePage` means the title converts through a
+     *  page the table does not hold, which is a contract limit, not a defect. */
+    svc.register("mbwcStubStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stubs = getMbwcInlineStubs();
+        if (!stubs) return { installed: false, mbToWc: { answered: 0, bailed: 0, bail: {} }, wcToMb: { answered: 0, bailed: 0, bail: {} } };
+        const rd = (off: number) => (Mem.readUint32(stubs.tableAddr + off) ?? 0) >>> 0;
+        const side = (answeredOff: number, bailOff: number, reasons: readonly string[]) => {
+            const answered = rd(answeredOff);
+            const bail: Record<string, number> = {};
+            let bailed = 0;
+            reasons.forEach((reason, i) => {
+                const n = rd(bailOff + i * 4);
+                bailed += n;
+                if (n) bail[reason] = n;
+            });
+            return {
+                answered, bailed, bail,
+                bailPct: answered + bailed > 0 ? Math.round((bailed / (answered + bailed)) * 1000) / 10 : 0,
+            };
+        };
+        const out = {
+            installed: true,
+            codePage: stubs.codePage,
+            mbToWcStub: `0x${stubs.mbToWcStub.toString(16)}`,
+            wcToMbStub: `0x${stubs.wcToMbStub.toString(16)}`,
+            tableAddr: `0x${stubs.tableAddr.toString(16)}`,
+            mbToWc: side(MBWC_ANSWERED_MBTWC_OFF, MBWC_MBTWC_BAIL_OFF, MBTWC_BAIL_REASONS),
+            wcToMb: side(MBWC_ANSWERED_WCTMB_OFF, MBWC_WCTMB_BAIL_OFF, WCTMB_BAIL_REASONS),
+        };
+        if (opts.reset) {
+            Mem.writeUint32(stubs.tableAddr + MBWC_ANSWERED_MBTWC_OFF, 0);
+            Mem.writeUint32(stubs.tableAddr + MBWC_ANSWERED_WCTMB_OFF, 0);
+            MBTWC_BAIL_REASONS.forEach((_r, i) => Mem.writeUint32(stubs.tableAddr + MBWC_MBTWC_BAIL_OFF + i * 4, 0));
+            WCTMB_BAIL_REASONS.forEach((_r, i) => Mem.writeUint32(stubs.tableAddr + MBWC_WCTMB_BAIL_OFF + i * 4, 0));
+        }
+        return out;
+    });
+
+    /** heapSlab() — slab arena snapshot: alloc/free/fallback counters, active-slab
+     *  occupancy, and the retired-generation history. `current.fallbacks` climbing
+     *  means allocation has dropped to the JS thunk; `totalMB` near `totalCap` means
+     *  it can never climb back out. */
+    /** heapZeroGrow({reset?}) — how often HeapReAlloc(HEAP_ZERO_MEMORY) was answered
+     *  WITHOUT moving the block, which is the one case no tier can serve correctly: the
+     *  window the caller expects zeroed starts at a size neither the slab nor the
+     *  allocation map records. `slab` is the half that matters (its window is up to the
+     *  bin; a tracked block's is the 8/16-byte rounding). A zero total over a real boot is
+     *  the evidence that recording the request in the slab header — a Rust and inline-stub
+     *  change plus a wasm rebuild — is not worth paying for; a non-zero one names its
+     *  first caller so the claim can be checked against real code. */
+    svc.register("heapZeroGrow", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const stats = heapZeroGrowStats();
+        if (opts.reset) resetHeapZeroGrowStats();
+        return stats;
+    });
+
+    svc.register("heapSlab", () => slabReport());
+
+    /** heapSlabRates({ms?=2000}) — the same counters as deltas/sec over a wall-clock
+     *  window, plus the growth the arena took during it. allocsPerSec vs fallbacksPerSec
+     *  is the tier split: a fallbacksPerSec in the thousands with allocsPerSec at zero is
+     *  an exhausted arena serving every small alloc from the JS thunk.
+     *
+     *  The counters live in the active slab's control block, so installing a new
+     *  generation resets them to zero. A window that spans a grow reports rates as null
+     *  rather than the negative numbers that subtraction would produce — `arenaGrewMB`
+     *  is what that window actually measured. */
+    svc.register("heapSlabRates", async (args) => {
+        const ms = ((args[0] ?? {}) as { ms?: number }).ms ?? 2000;
+        const a = slabReport();
+        const t0 = performance.now();
+        await new Promise((r) => setTimeout(r, ms));
+        const b = slabReport();
+        const dtSec = (performance.now() - t0) / 1000;
+        const grew = b.generations.length !== a.generations.length;
+        const rate = (x: number, y: number) => (grew ? null : Math.round(((y - x) / dtSec) * 10) / 10);
+        return {
+            windowSec: Math.round(dtSec * 100) / 100,
+            allocsPerSec: rate(a.current.allocs, b.current.allocs),
+            freesPerSec: rate(a.current.frees, b.current.frees),
+            fallbacksPerSec: rate(a.current.fallbacks, b.current.fallbacks),
+            countersReset: grew,
+            arenaGrewMB: +(b.totalMB - a.totalMB).toFixed(2),
+            generations: b.generations.length,
+            totalMB: b.totalMB,
+            capMB: b.totalCap / 1024 / 1024,
+            activeFreePct: b.current.freePct,
+        };
+    });
+
+    /** heapBuckets() — per-REGION allocator occupancy (HEAP, THUNK_*, SURFACE, ROM).
+     *  heapSlab() only sees the small-alloc arena; an "HEAP exhausted at slab boundary"
+     *  bad_alloc is about the BUCKET around it — the bump frontier growing up and the
+     *  slab arena growing down until they meet. Sampling this over a load says whether a
+     *  title genuinely needs more than the bucket holds or is failing to reuse what it
+     *  frees: `liveMB` flat while `bumpMB` climbs is a reuse failure, both climbing
+     *  together is real demand. */
+    svc.register("heapBuckets", () => {
+        const process = sys().process;
+        const stats = (process?.memory as any)?.getBucketStats?.() as any[] | undefined;
+        if (!stats) throw new HarnessError("no process", HarnessErrorCode.NO_PROCESS);
+        const mb = (n: number) => Math.round((n / 1048576) * 100) / 100;
+        return {
+            metrics: process!.memory.getMetrics(),
+            buckets: stats.map((b) => ({
+                kind: b.kind,
+                range: `0x${b.base.toString(16)}..0x${b.limit.toString(16)}`,
+                capMB: mb(b.limit - b.base),
+                bumpMB: mb(b.used),
+                liveMB: mb(b.liveUsed),
+                freeListMB: mb(b.freeBytes),
+                freeBlocks: b.freeBlocks,
+                // Bump headroom, already discounting a slab arena growing down from the top.
+                headroomMB: mb(b.free),
+                slabArenaMB: mb(b.limit - b.slabTop),
+            })),
+            // The biggest live blocks, largest first — "who is holding 380 MB" is the
+            // question a bucket total always raises and never answers.
+            topBlocks: ((process!.memory as any).snapshotHeapAllocations?.() ?? [])
+                .sort((a: any, z: any) => z.size - a.size)
+                .slice(0, 12)
+                .map((a: any) => ({ addr: `0x${(a.addr >>> 0).toString(16)}`, MB: mb(a.size) })),
+        };
+    });
+}

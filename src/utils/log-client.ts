@@ -10,12 +10,29 @@
  * - Automatic flush on connect
  */
 
+import { sessionFromLocation, sessionLogPath, sessionRelPath } from "../harness/session";
+
 type LogEntry = {
   timestamp: number;
   category: string;
   level: number;
   message: string;
 };
+
+/** The dev sidecar this page talks to. VITE_SIDECAR_PORT points a second dev stack at its
+ *  own sidecar (see BS_SIDECAR_PORT) instead of the first stack's logs/. */
+export const SIDECAR_PORT = Number(import.meta.env?.VITE_SIDECAR_PORT ?? 3001);
+
+/** This tab's harness session (`?bs=<name>`), or "" for the default single-tab one. */
+function pageSession(): string {
+  return typeof location === "undefined" ? "" : sessionFromLocation(location.search);
+}
+
+/** Where a logs-relative artifact this tab writes actually lands on disk. Use it for the
+ *  message you print, so an agent is never pointed at another tab's evidence. */
+export function logArtifactPath(rel: string): string {
+  return sessionLogPath(rel, pageSession());
+}
 
 const CONFIG = {
   MAX_BUFFER_SIZE: 10000,      // Max entries to buffer when disconnected
@@ -31,16 +48,24 @@ class LogClient {
   private reconnectDelay = 1000; // Start with 1 second
   private isEnabled = false;
   private url: string;
+  /** Harness session of the tab this client runs in — the archive and every debug file
+   *  it writes are scoped to it, so parallel guests don't interleave into one stream. */
+  private session = pageSession();
 
   // Buffering and batching
   private buffer: LogEntry[] = [];
   private batchTimer: number | null = null;
+  /** Entries the cap threw away while disconnected or backlogged. Announced into the stream
+   *  itself on the next successful send — a gap the archive never hears about is a hole no
+   *  reader of the log can see. */
+  private droppedEntries = 0;
+  private droppedSince = 0;
   
   // Backpressure callback (optional)
   private backpressureCallback: ((isHeavy: boolean) => void) | null = null;
   private backpressureState = false;
 
-  constructor(port: number = 3001) {
+  constructor(port: number = SIDECAR_PORT) {
     this.url = `ws://localhost:${port}`;
   }
 
@@ -154,8 +179,10 @@ class LogClient {
     // Add to buffer
     this.buffer.push(entry);
 
-    // Trim buffer if too large (keep newest entries)
+    // Trim buffer if too large (keep newest entries), counting what goes.
     if (this.buffer.length > CONFIG.MAX_BUFFER_SIZE) {
+      if (!this.droppedSince) this.droppedSince = Date.now();
+      this.droppedEntries += this.buffer.length - CONFIG.MAX_BUFFER_SIZE;
       this.buffer = this.buffer.slice(-CONFIG.MAX_BUFFER_SIZE);
     }
 
@@ -172,6 +199,21 @@ class LogClient {
     }
   }
 
+  /** The gap marker, as a log entry, so a dropped window is visible in the archive file. */
+  private takeGapEntry(): LogEntry | null {
+    if (!this.droppedEntries) return null;
+    const entry: LogEntry = {
+      timestamp: Date.now(),
+      category: "LOGCLIENT",
+      level: 1,
+      message: `[CLIENT GAP] ${this.droppedEntries} entries dropped since ` +
+        `${new Date(this.droppedSince).toISOString()} — the log socket could not keep up`,
+    };
+    this.droppedEntries = 0;
+    this.droppedSince = 0;
+    return entry;
+  }
+
   /**
    * Flush buffered logs to server
    */
@@ -182,6 +224,8 @@ class LogClient {
 
     // Take a batch from the buffer
     const batch = this.buffer.splice(0, CONFIG.BATCH_SIZE);
+    const gap = this.takeGapEntry();
+    if (gap) batch.unshift(gap);
 
     try {
       // Send as batch message
@@ -228,6 +272,11 @@ class LogClient {
         this.reconnectAttempts = 0;
         this.reconnectDelay = 1000;
         console.log("[LogClient] Connected to log server");
+        // Claim our own archive file BEFORE the first batch — the sidecar keeps one
+        // log stream per session, and an unclaimed connection lands in the shared one.
+        if (this.session) {
+          try { this.ws?.send(JSON.stringify({ type: "log_session", session: this.session })); } catch { /* best-effort */ }
+        }
         // Flush any buffered logs
         this.flushBuffer();
       };
@@ -311,7 +360,7 @@ class LogClient {
       return false;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "write_file", path: filename, content }));
+      this.ws.send(JSON.stringify({ type: "write_file", path: sessionRelPath(filename, this.session), content }));
       return true;
     } catch {
       return false;
@@ -328,7 +377,7 @@ class LogClient {
       return false;
     }
     try {
-      this.ws.send(JSON.stringify({ type: "write_file_b64", path: filename, base64 }));
+      this.ws.send(JSON.stringify({ type: "write_file_b64", path: sessionRelPath(filename, this.session), base64 }));
       return true;
     } catch {
       return false;

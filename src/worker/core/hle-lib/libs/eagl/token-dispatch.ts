@@ -3,12 +3,25 @@
  *
  * Target: NFSU retail `FUN_005c97cb` — the per-token commit switch that
  * translates an EAGL token node into IDirect3DDevice9 calls. In-race at max
- * settings: 1.15M calls/s, 36.9% of hot guest exec-weight; token-class census:
+ * settings the dispatcher's pages are 22.5% of ALL guest execution and the hook
+ * removes 81% of that (measured, plan/experiments/e18 — an earlier "36.9%" in
+ * this header was a share of watched hot pages, not of execution). Token-class census:
  * class 8 SetSamplerState 46.6%, class 1 SetRenderState 31.8%, class 2
  * SetTextureStageState 1.9% — the three pure-state-set classes = 80.4% of all
  * dispatches.
  *
- * Architecture (three tiers, faithful at each):
+ * Architecture (four tiers, faithful at each):
+ *   0. TIER 0 — inside the guest filter, no boundary crossing at all. 73.9% of
+ *      the tokens a frame dispatches are REDUNDANT sets whose whole answer is
+ *      "the shadow already holds this value, return D3D_OK". The filter now
+ *      evaluates that predicate itself (token-dispatch-filter.ts) and RETs, so
+ *      ~15.9K crossings a frame stop existing rather than getting cheaper.
+ *      Its predicate is `eagl_dispatch_simple`'s, gate for gate and in order,
+ *      because cfg skipMode 2 turns it into an oracle: the filter predicts, the
+ *      handler decides, and `eaglTokenCounts` demands the two agree exactly.
+ *      Consequence to read counters by: a class-1/8 skip taken here no longer
+ *      bumps the SHADOW trampoline's srsSkip/sampSkip — it lands in the cfg's
+ *      own Tier-0 cells instead, which is what `filterSkip` reports.
  *   1. GUEST FILTER (built by buildTokenDispatchFilter, installed as the
  *      patch-JMP target): resolves the token exactly like the original
  *      prologue (param==-1 alias at node[0x19]) and classifies via the token
@@ -45,6 +58,8 @@
  *   unreachable on these paths)
  */
 
+import { Logger, LogCategory } from '../../../logger';
+import { writeGuestCode } from '../../../memory/guest-code';
 import { Mem } from '../../../memory/mem-accessor';
 import { System } from '../../../system';
 import { hypercallDataManager } from '../../../cpu/hypercall-data';
@@ -53,6 +68,10 @@ import type { ThunkImplementation } from '../../../thunking/thunk-dispatcher';
 import type { EntryFilterInfo } from '../../types';
 import {
     FILTER_ENABLED_FLAG_OFF,
+    FILTER_SKIP_MODE_OFF,
+    FILTER_CFG_RING_LIMIT,
+    FILTER_CFG_SKIP_SRS,
+    FILTER_CFG_SKIP_SAMP,
     assembleTokenDispatchFilter,
     tokenDispatchFilterSize,
 } from './token-dispatch-filter';
@@ -91,6 +110,29 @@ const CFG_SPS_FID = 0x44;
 const CFG_VSCF_FID = 0x48;
 const CFG_PSCF_FID = 0x4c;
 const CFG_TEX_FID = 0x50;
+// Guest-filter–private cells. hypercall_eagl.rs reads 0x00..0x50 only, so these
+// need no cfg version bump — the Rust handler cannot see them.
+const CFG_RING_LIMIT = FILTER_CFG_RING_LIMIT;   // ring capacity - 36
+const CFG_SKIP_SRS = FILTER_CFG_SKIP_SRS;       // guest Tier-0 skip counters
+const CFG_SKIP_SAMP = FILTER_CFG_SKIP_SAMP;
+const CFG_SKIP_MODE = FILTER_SKIP_MODE_OFF;     // 0 off, 1 live, 2 oracle
+
+/**
+ * Tier 0 — the guest filter answers a redundant state set without crossing the
+ * boundary. Default ON: it is the same predicate handler 132 already evaluates,
+ * one tier earlier. `__eaglNoFilterSkip` is the A/B arm; `__eaglFilterSkipOracle`
+ * makes the filter predict and still cross, so its counters can be compared with
+ * the handler's own skip delta (see eaglTokenCounts).
+ */
+interface FilterSkipFlags {
+    __eaglNoFilterSkip?: boolean;
+    __eaglFilterSkipOracle?: boolean;
+}
+function filterSkipMode(): number {
+    const f = globalThis as FilterSkipFlags;
+    if (f.__eaglFilterSkipOracle) return 2;
+    return f.__eaglNoFilterSkip ? 0 : 1;
+}
 
 const SETTERS = {
     srs: ['d3d9', 'IDirect3DDevice9_SetRenderState'] as const,
@@ -123,7 +165,7 @@ function ensureCfg(dv: DataView): boolean {
     if (cfgAddr !== 0) return true;
     const memMgr = System.getInstance().process?.memory;
     if (!memMgr) {
-        console.error('[HLE-eagl] no process memory for config block — refusing filter');
+        Logger.error(LogCategory.SYSTEM, '[HLE-eagl] no process memory for config block — refusing filter');
         return false;
     }
     cfgAddr = memMgr.alloc(CFG_SIZE) >>> 0;
@@ -161,7 +203,7 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
     // opcode check so a layout drift refuses the hook instead of mis-reading.
     if (mem[targetAddress + TOKEN_TABLE_MOV_OFF] !== 0x8b ||
         mem[targetAddress + TOKEN_TABLE_MOV_OFF + 1] !== 0x88) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-eagl] token-dispatch: expected 8B 88 (mov ecx,[eax+disp32]) at +0x${TOKEN_TABLE_MOV_OFF.toString(16)}, ` +
             `found ${mem[targetAddress + TOKEN_TABLE_MOV_OFF]?.toString(16)} ${mem[targetAddress + TOKEN_TABLE_MOV_OFF + 1]?.toString(16)} — refusing filter`);
         return null;
@@ -177,10 +219,16 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
     const size = tokenDispatchFilterSize();
     const filterAddr = info.allocCode(size);
     if (!filterAddr || filterAddr + size > mem.length) return null;
-    const code = assembleTokenDispatchFilter(
+    const { code, commitRanges } = assembleTokenDispatchFilter(
         filterAddr, cfgAddr, tokenTableBase, stubAddress, trampolineAddress);
-    mem.set(code, filterAddr);
-    console.log(
+    writeGuestCode(mem, code, filterAddr);
+    // The Tier-0 skip counters are non-atomic RMWs on cells shared by every
+    // guest thread; only those two windows need the quantum held off.
+    const scheduler = System.getInstance().scheduler;
+    for (const r of commitRanges) {
+        try { scheduler?.registerNonPreemptibleRange(r.start, r.end); } catch { /* non-fatal */ }
+    }
+    Logger.log(LogCategory.SYSTEM,
         `[HLE-eagl] token-dispatch filter @0x${filterAddr.toString(16)} (${code.length}B) ` +
         `tokenTable=0x${tokenTableBase.toString(16)} cfg=0x${cfgAddr.toString(16)} (disarmed until D3D9 WBUF ready)`);
     return filterAddr;
@@ -194,6 +242,14 @@ export function buildTokenDispatchFilter(info: EntryFilterInfo): number | null {
 export function armTokenDispatchWhenReady(): void {
     if (armPollTimer !== null) { clearInterval(armPollTimer); armPollTimer = null; }
     armed = false;
+    // The guest filter gates on cfg RAM, not on `armed` — so a re-arm must close the
+    // gate too, or the filter keeps routing dispatches into the WASM handler against
+    // the PREVIOUS config (stale function ids, ring and shadow addresses) until the
+    // poll happens to succeed. tryArm() re-opens it once the snapshot is valid again.
+    if (cfgAddr !== 0) {
+        Mem.writeUint8(cfgAddr + CFG_ENABLED_FLAG, 0);
+        hypercallDataManager.setEaglTokenConfigPtr(0);
+    }
     armPollTimer = setInterval(() => {
         if (cfgAddr === 0) { clearInterval(armPollTimer!); armPollTimer = null; return; }
         if (tryArm()) {
@@ -241,12 +297,22 @@ function tryArm(): boolean {
     w(CFG_VSCF_FID, stubs.vscf.functionId);
     w(CFG_PSCF_FID, stubs.pscf.functionId);
     w(CFG_TEX_FID, stubs.tex.functionId);
+    // Tier-0 cells. The ring gate is a compare against a precomputed limit so
+    // the guest filter's decline predicate is bit-identical to the handler's
+    // `head >= capacity - 36`.
+    w(CFG_RING_LIMIT, (ring.capacity - 36) | 0);
+    w(CFG_SKIP_SRS, 0);
+    w(CFG_SKIP_SAMP, 0);
     w(CFG_GENERATION, ++cfgGeneration);
     w(CFG_VERSION, CFG_VERSION_VALUE);
+    // Tier 0 needs BOTH shadows: without one, its class declines to the stub
+    // and the mode byte only decides how loudly. Written before the gate so a
+    // dispatch can never see an armed filter with a stale mode.
+    Mem.writeUint8(cfgAddr + CFG_SKIP_MODE, filterSkipMode());
     Mem.writeUint8(cfgAddr + CFG_ENABLED_FLAG, 1); // guest filter gate
     hypercallDataManager.setEaglTokenConfigPtr(cfgAddr);
     armed = true;
-    console.log(
+    Logger.log(LogCategory.SYSTEM,
         `[HLE-eagl] token-dispatch ARMED (v${CFG_VERSION_VALUE}): cfg=0x${cfgAddr.toString(16)} ring=0x${ring.ctrlAddr.toString(16)} ` +
         `srs=${stubs.srs.functionId}${srsShadow ? '(shadowed)' : '(plain)'} samp=${stubs.samp.functionId}${sampShadow ? '(shadowed)' : '(plain)'} ` +
         `tss=${stubs.tss.functionId} fvf=${stubs.fvf.functionId} svs=${stubs.svs.functionId} sps=${stubs.sps.functionId} ` +
@@ -273,10 +339,59 @@ export function getTokenDispatchStats(): Record<string, unknown> {
     for (const [d, n] of class6DeclineByDesc) declineByDesc['0x' + (d >>> 0).toString(16)] = n;
     return {
         armed, class6Declines, class6DeclineLastMode, declineByDesc, class6DeclineProbe, cfgAddr, cfg,
+        filterSkip: getFilterSkipCounters(),
     };
+}
+
+/**
+ * Tier-0 readout. `mode` is what the GUEST is running, read back from the cfg
+ * cell rather than from the flag, so a filter armed before the flag changed
+ * reports what it actually does.
+ *
+ * In oracle mode `srs + samp` must equal the handler's own skip delta over the
+ * same window (harness `eaglTokenCounts`) — the filter predicted and crossed
+ * anyway, so both tiers decided on the same calls. An inequality names a wrong
+ * offset or a missing gate; equality with `srs + samp === 0` says the oracle
+ * never ran, which is not the same as agreement.
+ */
+export function getFilterSkipCounters(): {
+    mode: number; modeName: string; srs: number; samp: number; total: number;
+} {
+    const mode = cfgAddr !== 0 ? (Mem.readUint8(cfgAddr + CFG_SKIP_MODE) ?? 0) : 0;
+    const srs = cfgAddr !== 0 ? (Mem.readUint32(cfgAddr + CFG_SKIP_SRS) ?? 0) : 0;
+    const samp = cfgAddr !== 0 ? (Mem.readUint32(cfgAddr + CFG_SKIP_SAMP) ?? 0) : 0;
+    return {
+        mode,
+        modeName: mode === 2 ? 'oracle' : mode === 1 ? 'live' : 'off',
+        srs, samp, total: srs + samp,
+    };
+}
+
+/** Zero the Tier-0 counters so a window is a difference, not a lifetime total. */
+export function resetFilterSkipCounters(): void {
+    if (cfgAddr === 0) return;
+    Mem.writeUint32(cfgAddr + CFG_SKIP_SRS, 0);
+    Mem.writeUint32(cfgAddr + CFG_SKIP_SAMP, 0);
+}
+
+/**
+ * Re-publish the Tier-0 mode from the current flags without re-arming. The
+ * filter reads the cell on every class-1/8 dispatch, so this is a live A/B
+ * switch — unlike the stub patching in guest-release-stub.ts, which is
+ * boot-time only.
+ */
+export function setFilterSkipMode(mode?: number): number {
+    if (cfgAddr === 0) return -1;
+    const m = mode === undefined ? filterSkipMode() : (mode | 0);
+    if (m < 0 || m > 2) return -1;
+    Mem.writeUint8(cfgAddr + CFG_SKIP_MODE, m);
+    return m;
 }
 // Same worker-global pattern as hleStatus — reachable from dbg/harness eval.
 (globalThis as any).eaglTokenDispatchStats = getTokenDispatchStats;
+(globalThis as any).eaglFilterSkipCounters = getFilterSkipCounters;
+(globalThis as any).eaglSetFilterSkipMode = setFilterSkipMode;
+(globalThis as any).eaglResetFilterSkipCounters = resetFilterSkipCounters;
 
 
 /**
@@ -296,7 +411,7 @@ export const tokenDispatchHandler: ThunkImplementation = (ctx, memory, args) => 
     const bail = (why: string): number => {
         if (!structuralBailDone) {
             structuralBailDone = true;
-            console.error(`[HLE-eagl] token-dispatch STRUCTURAL BAIL (${why}) — completing via sync original, then unpatching`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-eagl] token-dispatch STRUCTURAL BAIL (${why}) — completing via sync original, then unpatching`);
             const res = libHleManager.callOriginalSync(LIB_ID, FN_NAME, [node, stage], 'stdcall', true);
             libHleManager.unpatch(LIB_ID, FN_NAME);
             Mem.writeUint8(cfgAddr + CFG_ENABLED_FLAG, 0);
@@ -375,7 +490,7 @@ export const tokenDispatchHandler: ThunkImplementation = (ctx, memory, args) => 
         if (head < 0 || head >= cap - 36) {
             // Should not happen post-drain; complete this ONE call via the
             // original (no unpatch — transient).
-            console.warn('[HLE-eagl] token-dispatch: ring full after drain — completing via sync original');
+            Logger.warn(LogCategory.SYSTEM, '[HLE-eagl] token-dispatch: ring full after drain — completing via sync original');
             const res = libHleManager.callOriginalSync(LIB_ID, FN_NAME, [node, stage], 'stdcall', true);
             return res.ok ? res.eax : 0;
         }

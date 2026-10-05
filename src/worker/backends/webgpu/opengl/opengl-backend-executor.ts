@@ -11,7 +11,32 @@
 import { OpenGLFrameInput } from "./opengl-types";
 import { OpenGLPipelineConfig, pipelineConfigKey } from "./opengl-pipeline-factory";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
-import { GLCommand, GLDrawCommand, GLDrawCommandType, GLTextureObject, VERT_FLOATS } from "../../../modules/opengl32/context";
+import { registerBackendQualitySupport } from "../shared/quality-capabilities";
+import { resolveInternalScaleFactor } from "../shared/internal-resolution";
+import { readbackSourceRect, resolveReadback } from "./opengl-readback";
+import { scissorRect, viewportRect } from "./opengl-render-space";
+import { registerGpuDeviceObserver } from "../../../core/gpu/gpu-device-lifecycle";
+import {
+    GLCommandStream, GLDrawCommandType, GLTextureObject, VERT_FLOATS,
+    CMD_I32, CMD_F32, CI_TYPE,
+    CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
+    CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
+    CI_FOG_MODE, CI_POLYGON_MODE, CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK,
+    CI_STENCIL_FAIL, CI_STENCIL_ZFAIL, CI_STENCIL_ZPASS, CI_STENCIL_WRITE_MASK,
+    CI_SCISSOR_X, CI_SCISSOR_Y, CI_SCISSOR_W, CI_SCISSOR_H, CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H,
+    CI_CLEAR_MASK, CI_CLEAR_STENCIL,
+    CF_ALPHA_REF, CF_FOG_R, CF_FOG_G, CF_FOG_B, CF_FOG_A, CF_FOG_DENSITY, CF_FOG_START, CF_FOG_END,
+    CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
+    CI_COMBINE0_RGB, CI_COMBINE0_ALPHA, CI_COMBINE1_RGB, CI_COMBINE1_ALPHA,
+    CF_ENV_COLOR0, CF_ENV_COLOR1,
+    COMBINER_FN_REPLACE, COMBINER_FN_MODULATE, COMBINER_FN_ADD, COMBINER_FN_ADD_SIGNED,
+    COMBINER_FN_INTERPOLATE, COMBINER_FN_SUBTRACT, COMBINER_FN_DOT3_RGB, COMBINER_FN_DOT3_RGBA,
+    COMBINER_SRC_CONSTANT, COMBINER_SRC_PRIMARY, COMBINER_SRC_PREVIOUS,
+    COMBINER_OP_ONE_MINUS_SRC_COLOR, COMBINER_OP_SRC_ALPHA, COMBINER_OP_ONE_MINUS_SRC_ALPHA,
+    CF_CLEAR_R, CF_CLEAR_G, CF_CLEAR_B, CF_CLEAR_A, CF_CLEAR_DEPTH,
+    DF_DEPTH_TEST, DF_DEPTH_MASK, DF_BLEND, DF_ALPHA_TEST, DF_CULL, DF_FOG,
+    DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_STENCIL_TEST, DF_SCISSOR,
+} from "../../../modules/opengl32/context";
 import {
     GL_ADD,
     GL_ALWAYS,
@@ -20,6 +45,7 @@ import {
     GL_CLAMP_TO_EDGE,
     GL_CCW,
     GL_COLOR_BUFFER_BIT,
+    GL_COMBINE,
     GL_DECAL,
     GL_DECR,
     GL_DEPTH_BUFFER_BIT,
@@ -91,9 +117,17 @@ interface PreparedDrawData {
     byteLength: number;
 }
 
+/** Vertices selected for a draw: a (buffer, first-vertex, count) window. */
+interface SelectedVertices {
+    data: Float32Array;
+    first: number;
+    count: number;
+    topology: OpenGLTopology;
+}
+
 const VERTEX_FLOAT_STRIDE = 12; // pos.xyz + color.rgba + uv0.xy + uv1.xy + pad
 const VERTEX_BYTE_STRIDE = VERTEX_FLOAT_STRIDE * 4;
-const UNIFORM_BLOCK_SIZE = 96;
+const UNIFORM_BLOCK_SIZE = 144;
 
 export class OpenGLBackendExecutor {
     private readonly backend: WebGPUBackend;
@@ -104,9 +138,27 @@ export class OpenGLBackendExecutor {
     private depthView: GPUTextureView | null = null;
     private offscreenSize: { width: number; height: number } | null = null;
     private offscreenInitialized = false;
-    /** Last frame render resolution (GL viewport); may be smaller than the canvas. */
+    /** Depth/stencil survives SwapBuffers exactly as GL's is: only glClear resets it.
+     *  Quake-lineage engines run gl_ztrick — alternate frames swap the depth range and
+     *  the compare function INSTEAD of clearing, so a per-frame clear drops every
+     *  fragment of the GEQUAL frame. */
+    private depthStencilInitialized = false;
+    /** Last frame's PHYSICAL default-framebuffer resolution (drawable x renderScale). */
     private presentSourceW = 0;
     private presentSourceH = 0;
+    /** The drawable's guest extent, as published by the opengl32 module. */
+    private drawableW = 0;
+    private drawableH = 0;
+    /**
+     * Internal render scale — ONE uniform scalar (shared/internal-resolution.ts), the same
+     * policy Glide and D3D9 render at. The guest keeps its own drawable: glViewport,
+     * glScissor and glReadPixels all speak guest pixels, and every one of them is multiplied
+     * by this on the way into the render target and divided back out on the way to the guest.
+     */
+    private renderScale = 1;
+    /** Guest extent the current offscreen was allocated for — the space readPixels answers in. */
+    private offscreenGuestW = 0;
+    private offscreenGuestH = 0;
     private targetFormat: GPUTextureFormat | null = null;
 
     private shaderModule: GPUShaderModule | null = null;
@@ -126,6 +178,8 @@ export class OpenGLBackendExecutor {
     private vertexBufferSize = 0;
     private vertexUploadCursor = 0;
     private vertexScratch = new Float32Array(0);
+    /** Staging for polygon-mode wireframe / line-loop closing expansions. */
+    private expandScratch = new Float32Array(0);
 
     private uniformBuffer: GPUBuffer | null = null;
     private uniformStride = 256;
@@ -135,12 +189,91 @@ export class OpenGLBackendExecutor {
     private readonly uniformScratchF32 = new Float32Array(this.uniformScratchBuffer);
     private readonly uniformScratchU32 = new Uint32Array(this.uniformScratchBuffer);
 
+    /** Current draw's glDepthRange, as WebGPU takes it (see readDepthRange). */
+    private depthRangeMin = 0;
+    private depthRangeMax = 1;
+    private depthRangeReversed = false;
+
     private readonly samplerIds = new WeakMap<GPUSampler, number>();
     private readonly textureViewIds = new WeakMap<GPUTextureView, number>();
     private nextObjectId = 1;
 
     constructor(backend: WebGPUBackend) {
         this.backend = backend;
+        registerBackendQualitySupport("opengl", ["anisotropy", "forceTrilinear", "internalScale"]);
+        // All of this is rebuilt lazily by ensureStaticResources/ensureTargets/resolveTexture
+        // from the GL object state, which lives on the CPU side and outlives the device.
+        registerGpuDeviceObserver("opengl-executor", {
+            onDeviceLost: () => {
+                this.offscreenTexture = null;
+                this.offscreenView = null;
+                this.depthTexture = null;
+                this.depthView = null;
+                this.targetFormat = null;
+                this.shaderModule = null;
+                this.bindGroupLayout = null;
+                this.pipelineLayout = null;
+                this.pipelineCache.clear();
+                this.textureCache.clear();
+                this.samplerCache.clear();
+                this.bindGroupCache.clear();
+                this.whiteTexture = null;
+                this.whiteTextureView = null;
+                this.defaultSampler = null;
+                this.vertexBuffer = null;
+                this.vertexBufferSize = 0;
+                this.vertexUploadCursor = 0;
+                this.uniformBuffer = null;
+                this.uniformCapacity = 0;
+                this.uniformCursor = 0;
+            },
+        });
+    }
+
+    /**
+     * The GUEST-space extent of the default framebuffer, published by the opengl32 module
+     * (which owns the DC→window mapping). The canvas is only the fallback for a frame
+     * executed before any WGL context was made current — it is the PRESENT TARGET, sized by
+     * the host container, and a drawable measured from it puts the guest's own viewport in a
+     * corner of the render target.
+     */
+    setDrawableSize(width: number, height: number): void {
+        if (width > 0 && height > 0) {
+            this.drawableW = width;
+            this.drawableH = height;
+        }
+    }
+
+    /** Default-framebuffer size in GUEST pixels: the surface a WGL context owns. */
+    getDrawableSize(): [number, number] {
+        if (this.drawableW > 0 && this.drawableH > 0) return [this.drawableW, this.drawableH];
+        const canvas = this.backend.getContext()?.canvas as OffscreenCanvas | undefined;
+        return [canvas?.width ?? 0, canvas?.height ?? 0];
+    }
+
+    /** Both spaces side by side, for the harness — naming them is the opposite of conflating them. */
+    getRenderSpace(): { guestW: number; guestH: number; renderW: number; renderH: number; scale: number } {
+        const [guestW, guestH] = this.getDrawableSize();
+        return {
+            guestW, guestH,
+            renderW: this.presentSourceW, renderH: this.presentSourceH,
+            scale: this.renderScale,
+        };
+    }
+
+    /**
+     * The scalar this frame renders the drawable at. `canvasW/H` are handed in by the caller
+     * that already read them: the resolver decides a SAMPLE COUNT, and the render target it
+     * sizes must still fit what the device can allocate.
+     */
+    private resolveRenderScale(
+        device: GPUDevice, guestW: number, guestH: number, canvasW: number, canvasH: number,
+    ): number {
+        const scale = resolveInternalScaleFactor(
+            EmulatorConfig.getInstance().quality.internalScale, guestW, guestH, canvasW, canvasH,
+        );
+        const maxDim = device.limits.maxTextureDimension2D;
+        return Math.max(1, Math.min(scale, maxDim / guestW, maxDim / guestH));
     }
 
     executeFrame(input: OpenGLFrameInput): void {
@@ -163,8 +296,25 @@ export class OpenGLBackendExecutor {
         }
 
         const format = this.backend.getFormat() ?? "bgra8unorm";
-        const renderW = input.viewportW > 0 ? input.viewportW : screenW;
-        const renderH = input.viewportH > 0 ? input.viewportH : screenH;
+        // The default framebuffer is sized by the DRAWABLE — the client area of the window
+        // the WGL context owns, in GUEST pixels — never by glViewport (which only maps NDC
+        // onto a rectangle inside it, so a portal/HUD/letterboxed pass must still render at
+        // full drawable resolution) and never by the canvas (the present target, which the
+        // present pass stretches this offscreen onto).
+        const [guestW, guestH] = this.getDrawableSize();
+        if (guestW <= 0 || guestH <= 0) {
+            Logger.warn(LogCategory.SYSTEM, `OpenGL executeFrame: early exit — drawable ${guestW}x${guestH}`);
+            return;
+        }
+        // The guest's drawable times ONE internal-scale scalar. Everything below that crosses
+        // into the render target — viewport, scissor, the readback rect — multiplies by the
+        // same `scale`; nothing the guest can query does.
+        const scale = this.resolveRenderScale(device, guestW, guestH, screenW, screenH);
+        const renderW = Math.max(1, Math.round(guestW * scale));
+        const renderH = Math.max(1, Math.round(guestH * scale));
+        this.renderScale = scale;
+        this.offscreenGuestW = guestW;
+        this.offscreenGuestH = guestH;
         this.presentSourceW = renderW;
         this.presentSourceH = renderH;
         this.ensureStaticResources(device);
@@ -187,8 +337,7 @@ export class OpenGLBackendExecutor {
         const encoder = device.createCommandEncoder();
         let renderPass: GPURenderPassEncoder | null = null;
         let colorHasContent = this.offscreenInitialized;
-        // Do not preserve depth/stencil across presents by default.
-        let depthStencilHasContent = false;
+        let depthStencilHasContent = this.depthStencilInitialized;
         let drawsIssued = 0;
 
         const endPass = (): void => {
@@ -222,19 +371,25 @@ export class OpenGLBackendExecutor {
             return renderPass;
         };
 
-        for (const command of input.commands) {
-            switch (command.type) {
+        const stream = input.commands;
+        const I = stream.i32;
+        const F = stream.f32;
+
+        for (let c = 0; c < stream.count; c++) {
+            const i = c * CMD_I32;
+            const f = c * CMD_F32;
+            switch (I[i + CI_TYPE]) {
                 case GLDrawCommandType.CLEAR: {
                     endPass();
                     if (this.encodeClearPass(
                         encoder,
-                        command.mask,
-                        command.r,
-                        command.g,
-                        command.b,
-                        command.a,
-                        command.depth,
-                        command.stencil,
+                        I[i + CI_CLEAR_MASK] >>> 0,
+                        F[f + CF_CLEAR_R],
+                        F[f + CF_CLEAR_G],
+                        F[f + CF_CLEAR_B],
+                        F[f + CF_CLEAR_A],
+                        F[f + CF_CLEAR_DEPTH],
+                        I[i + CI_CLEAR_STENCIL] >>> 0,
                         colorHasContent,
                         depthStencilHasContent,
                     )) {
@@ -244,18 +399,23 @@ export class OpenGLBackendExecutor {
                     break;
                 }
                 case GLDrawCommandType.DRAW: {
-                    const cmd = command as GLDrawCommand;
-                    if (cmd.vertCount <= 0) break;
-                    if (cmd.cullEnabled && cmd.cullFace === GL_FRONT_AND_BACK) break;
+                    const vertCount = I[i + CI_VERT_COUNT];
+                    if (vertCount <= 0) break;
+                    const flags = I[i + CI_FLAGS];
+                    const cullEnabled = (flags & DF_CULL) !== 0;
+                    const cullFace = I[i + CI_CULL_FACE] >>> 0;
+                    if (cullEnabled && cullFace === GL_FRONT_AND_BACK) break;
 
-                    const prepared = this.prepareDrawData(cmd);
+                    const prepared = this.prepareDrawData(
+                        input.vertArena, I[i + CI_VERT_OFFSET], vertCount,
+                        I[i + CI_MODE] >>> 0, I[i + CI_POLYGON_MODE] >>> 0);
                     if (!prepared || prepared.vertexCount <= 0) break;
 
                     const vertexOffset = this.uploadVertices(queue, prepared.data, prepared.byteLength);
                     if (vertexOffset < 0) break;
 
-                    const tex0 = this.resolveTexture(device, queue, input.textures, cmd.textureId0);
-                    const tex1 = this.resolveTexture(device, queue, input.textures, cmd.textureId1);
+                    const tex0 = this.resolveTexture(device, queue, input.textures, I[i + CI_TEX_ID0]);
+                    const tex1 = this.resolveTexture(device, queue, input.textures, I[i + CI_TEX_ID1]);
                     const useTex0 = !!tex0;
                     const useTex1 = !!tex1;
 
@@ -273,55 +433,53 @@ export class OpenGLBackendExecutor {
                     const uniformOffset = this.allocateUniformSlot();
                     if (uniformOffset < 0) break;
 
-                    this.writeUniforms(
-                        queue,
-                        uniformOffset,
-                        renderW,
-                        renderH,
-                        cmd,
-                        useTex0,
-                        useTex1,
-                    );
+                    this.writeUniforms(queue, uniformOffset, guestW, guestH, I, F, i, f, useTex0, useTex1);
 
+                    const stencilTest = (flags & DF_STENCIL_TEST) !== 0;
                     const pipelineCfg: OpenGLPipelineConfig = {
                         topology: prepared.topology,
-                        blendEnabled: cmd.blendEnabled,
-                        blendSrc: cmd.blendSrc,
-                        blendDst: cmd.blendDst,
-                        depthTest: cmd.depthTest,
-                        depthWrite: cmd.depthMask,
-                        depthFunc: cmd.depthFunc,
-                        cullEnabled: cmd.cullEnabled,
-                        cullFace: cmd.cullFace,
-                        frontFace: cmd.frontFace,
-                        colorMaskR: cmd.colorMaskR,
-                        colorMaskG: cmd.colorMaskG,
-                        colorMaskB: cmd.colorMaskB,
-                        colorMaskA: cmd.colorMaskA,
-                        stencilTest: cmd.stencilTest,
-                        stencilFunc: cmd.stencilFunc,
-                        stencilMask: cmd.stencilMask,
-                        stencilWriteMask: cmd.stencilWriteMask,
-                        stencilFail: cmd.stencilFail,
-                        stencilZFail: cmd.stencilZFail,
-                        stencilZPass: cmd.stencilZPass,
+                        blendEnabled: (flags & DF_BLEND) !== 0,
+                        blendSrc: I[i + CI_BLEND_SRC] >>> 0,
+                        blendDst: I[i + CI_BLEND_DST] >>> 0,
+                        depthTest: (flags & DF_DEPTH_TEST) !== 0,
+                        depthWrite: (flags & DF_DEPTH_MASK) !== 0,
+                        depthFunc: I[i + CI_DEPTH_FUNC] >>> 0,
+                        cullEnabled,
+                        cullFace,
+                        frontFace: I[i + CI_FRONT_FACE] >>> 0,
+                        colorMaskR: (flags & DF_COLOR_MASK_R) !== 0,
+                        colorMaskG: (flags & DF_COLOR_MASK_G) !== 0,
+                        colorMaskB: (flags & DF_COLOR_MASK_B) !== 0,
+                        colorMaskA: (flags & DF_COLOR_MASK_A) !== 0,
+                        stencilTest,
+                        stencilFunc: I[i + CI_STENCIL_FUNC] >>> 0,
+                        stencilMask: I[i + CI_STENCIL_MASK] >>> 0,
+                        stencilWriteMask: I[i + CI_STENCIL_WRITE_MASK] >>> 0,
+                        stencilFail: I[i + CI_STENCIL_FAIL] >>> 0,
+                        stencilZFail: I[i + CI_STENCIL_ZFAIL] >>> 0,
+                        stencilZPass: I[i + CI_STENCIL_ZPASS] >>> 0,
                     };
 
                     const pipeline = this.getOrCreatePipeline(device, pipelineCfg);
                     const bindGroup = this.getOrCreateBindGroup(device, sampler0, view0, sampler1, view1);
                     const pass = beginDrawPass();
-                    if (!this.applyScissor(pass, cmd, renderW, renderH)) break;
+                    if (!this.applyScissor(pass, I, i, flags, guestW, guestH, scale, renderW, renderH)) break;
 
-                    // OpenGL Y-up → WebGPU Y-down; render at the app's viewport resolution.
-                    const vpW = cmd.vpW > 0 ? cmd.vpW : renderW;
-                    const vpH = cmd.vpH > 0 ? cmd.vpH : renderH;
-                    const vpX = cmd.vpX;
-                    const vpY = renderH - cmd.vpY - vpH;
-                    pass.setViewport(vpX, vpY, vpW, vpH, cmd.depthRangeNear, cmd.depthRangeFar);
+                    // OpenGL Y-up → WebGPU Y-down, in the guest's own drawable, then scaled
+                    // into the render target. The shader normalises by the GUEST viewport
+                    // dims (writeUniforms), so the geometry needs no change — only the rect.
+                    const cmdVpW = I[i + CI_VP_W];
+                    const cmdVpH = I[i + CI_VP_H];
+                    const vpW = cmdVpW > 0 ? cmdVpW : guestW;
+                    const vpH = cmdVpH > 0 ? cmdVpH : guestH;
+                    const vp = viewportRect(
+                        I[i + CI_VP_X], I[i + CI_VP_Y], vpW, vpH, guestW, guestH, scale, renderW, renderH);
+                    if (!vp) break;
+                    pass.setViewport(vp.x, vp.y, vp.w, vp.h, this.depthRangeMin, this.depthRangeMax);
 
                     pass.setPipeline(pipeline);
-                    if (cmd.stencilTest) {
-                        pass.setStencilReference(cmd.stencilRef >>> 0);
+                    if (stencilTest) {
+                        pass.setStencilReference(I[i + CI_STENCIL_REF] >>> 0);
                     }
                     pass.setBindGroup(0, bindGroup, [uniformOffset]);
                     pass.setVertexBuffer(0, this.vertexBuffer!, vertexOffset, prepared.byteLength);
@@ -354,20 +512,16 @@ export class OpenGLBackendExecutor {
                     screenW,
                     screenH,
                     { r: 0, g: 0, b: 0, a: 1 },
+                    undefined,
+                    { srcW: fallbackTex.width, srcH: fallbackTex.height, outW: screenW, outH: screenH, toCanvas: true },
                 );
-                this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
+                this.compositeStatsOverlay(targetView, encoder);
                 queue.submit([encoder.finish()]);
                 this.offscreenInitialized = false;
-                const cmdSummary = input.commands.map(c => {
-                    if (c.type === GLDrawCommandType.CLEAR) return `CLEAR(m=0x${(c as any).mask?.toString(16)})`;
-                    if (c.type === GLDrawCommandType.VIEWPORT) return `VP(${(c as any).w}x${(c as any).h})`;
-                    if (c.type === GLDrawCommandType.SCISSOR) return `SCISSOR`;
-                    if (c.type === GLDrawCommandType.DRAW) return `DRAW(v=${(c as any).vertCount})`;
-                    return `?${(c as any).type}`;
-                }).join(',');
                 Logger.log(
                     LogCategory.SYSTEM,
-                    `OpenGL fallback present: tex=${fallbackTex.id} ${fallbackTex.width}x${fallbackTex.height} draws=0 cmds=${input.commands.length} [${cmdSummary}]`,
+                    `OpenGL fallback present: tex=${fallbackTex.id} ${fallbackTex.width}x${fallbackTex.height} draws=0 ` +
+                    `cmds=${stream.count} [${this.summarizeCommands(stream)}]`,
                 );
                 return;
             }
@@ -387,18 +541,21 @@ export class OpenGLBackendExecutor {
                 false,
             );
             colorHasContent = true;
+            depthStencilHasContent = true;
         }
 
         this.offscreenInitialized = colorHasContent;
+        this.depthStencilInitialized = depthStencilHasContent;
 
         const targetView = context.getCurrentTexture().createView();
         this.blitOffscreenToCanvas(targetView, encoder, screenW, screenH);
-        this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
+        this.compositeStatsOverlay(targetView, encoder);
         queue.submit([encoder.finish()]);
 
         Logger.verbose(
             LogCategory.SYSTEM,
-            `OpenGL frame: cmds=${input.commands.length} draws=${drawCount} viewport=${input.viewportW}x${input.viewportH}`,
+            `OpenGL frame: cmds=${stream.count} draws=${drawCount} drawable=${guestW}x${guestH} `
+            + `render=${renderW}x${renderH} scale=${scale.toFixed(3)}`,
         );
     }
 
@@ -420,11 +577,21 @@ export class OpenGLBackendExecutor {
         const encoder = device.createCommandEncoder();
         const targetView = context.getCurrentTexture().createView();
         this.blitOffscreenToCanvas(targetView, encoder, screenW, screenH);
-        this.compositeStatsOverlay(targetView, encoder, screenW, screenH);
+        this.compositeStatsOverlay(targetView, encoder);
         queue.submit([encoder.finish()]);
     }
 
-    /** Blit offscreen render target to the swapchain, upscaling with nearest filter when needed. */
+    /**
+     * Blit the offscreen render target onto the swapchain.
+     *
+     * Filtering is LINEAR, as in every other backend's present (glide/d3d9 pass no
+     * sampler override). The offscreen is sized by the internal-scale policy, which
+     * preserves the guest aspect with one scalar, so it rarely matches the canvas
+     * exactly; selecting nearest on "sizes differ" made every fractional fit resample
+     * with point sampling, which reads as irregular pixel doubling rather than as the
+     * crisp upscale the flag was named for. Pixel-crisp presentation is an aspectMode /
+     * integerScale decision in the present pass, not a per-backend sampler choice.
+     */
     private blitOffscreenToCanvas(
         targetView: GPUTextureView,
         encoder: GPUCommandEncoder,
@@ -434,7 +601,6 @@ export class OpenGLBackendExecutor {
         if (!this.offscreenView) return;
         const srcW = this.presentSourceW > 0 ? this.presentSourceW : screenW;
         const srcH = this.presentSourceH > 0 ? this.presentSourceH : screenH;
-        const upscale = srcW !== screenW || srcH !== screenH;
         this.backend.drawTexture(
             this.offscreenView,
             targetView,
@@ -443,16 +609,12 @@ export class OpenGLBackendExecutor {
             screenW,
             screenH,
             { r: 0, g: 0, b: 0, a: 1 },
-            upscale,
+            undefined,
+            { srcW, srcH, outW: screenW, outH: screenH, toCanvas: true },
         );
     }
 
-    private compositeStatsOverlay(
-        targetView: GPUTextureView,
-        encoder: GPUCommandEncoder,
-        width: number,
-        height: number,
-    ): void {
+    private compositeStatsOverlay(targetView: GPUTextureView, encoder: GPUCommandEncoder): void {
         if (!statsOverlay.isEnabled()) return;
         const statsCanvas = statsOverlay.getCanvas();
         if (!statsCanvas) return;
@@ -460,7 +622,7 @@ export class OpenGLBackendExecutor {
             this.backend.updateStatsTexture(statsCanvas);
             statsOverlay.clearDirty();
         }
-        this.backend.renderStatsOverlay(targetView, encoder, width, height);
+        this.backend.renderStatsOverlay(targetView, encoder);
     }
 
     destroy(): void {
@@ -581,6 +743,61 @@ export class OpenGLBackendExecutor {
 
         this.offscreenSize = { width, height };
         this.offscreenInitialized = false;
+        this.depthStencilInitialized = false;
+    }
+
+    /**
+     * Read a rectangle of the colour buffer back as RGBA8, GL orientation (row 0 is the
+     * BOTTOM row, as glReadPixels defines it).
+     *
+     * `x/y/width/height` are GUEST drawable pixels and so is the image returned: the
+     * internal render scale is ours, and opengl-readback.ts is what keeps it invisible here.
+     *
+     * The source is the offscreen colour target, which holds the most recently EXECUTED
+     * frame: commands accumulate until present, so a read issued before SwapBuffers sees
+     * the previous frame. That is a one-frame lag, not undefined data — and the caller
+     * gets a real image either way.
+     *
+     * Returns null when there is nothing rendered yet or the rect falls outside it; the
+     * caller must then say so rather than leave the guest buffer untouched.
+     */
+    async readPixels(x: number, y: number, width: number, height: number): Promise<Uint8Array | null> {
+        const device = this.backend.getDevice();
+        const queue = this.backend.getQueue();
+        const texture = this.offscreenTexture;
+        const size = this.offscreenSize;
+        if (!device || !queue || !texture || !size || !this.offscreenInitialized) return null;
+        if (width <= 0 || height <= 0) return null;
+        const guestW = this.offscreenGuestW > 0 ? this.offscreenGuestW : size.width;
+        const guestH = this.offscreenGuestH > 0 ? this.offscreenGuestH : size.height;
+        if (x < 0 || y < 0 || x + width > guestW || y + height > guestH) return null;
+
+        const scale = this.renderScale;
+        const rect = readbackSourceRect(x, y, width, height, guestH, scale, size.width, size.height);
+        const bytesPerRow = (rect.width * 4 + 255) & ~255;
+        const staging = device.createBuffer({
+            size: bytesPerRow * rect.height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+                { texture, origin: { x: rect.x, y: rect.y, z: 0 } },
+                { buffer: staging, bytesPerRow, rowsPerImage: rect.height },
+                { width: rect.width, height: rect.height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await staging.mapAsync(GPUMapMode.READ);
+            const mapped = new Uint8Array(staging.getMappedRange());
+            const out = resolveReadback(
+                mapped, bytesPerRow, rect, x, y, width, height, guestH, scale,
+                this.targetFormat === "bgra8unorm",
+            );
+            staging.unmap();
+            return out;
+        } finally {
+            staging.destroy();
+        }
     }
 
     private pruneTextureCache(textures: Map<number, GLTextureObject>): void {
@@ -596,26 +813,55 @@ export class OpenGLBackendExecutor {
         }
     }
 
-    private countDrawCommands(commands: GLCommand[]): number {
+    private countDrawCommands(stream: GLCommandStream): number {
         let count = 0;
-        for (const cmd of commands) {
-            if (cmd.type === GLDrawCommandType.DRAW) count++;
+        for (let c = 0; c < stream.count; c++) {
+            if (stream.i32[c * CMD_I32 + CI_TYPE] === GLDrawCommandType.DRAW) count++;
         }
         return count;
     }
 
-    private estimateVertexBytes(commands: GLCommand[]): number {
+    private estimateVertexBytes(stream: GLCommandStream): number {
+        const I = stream.i32;
         let totalVertices = 0;
-        for (const cmd of commands) {
-            if (cmd.type !== GLDrawCommandType.DRAW) continue;
-            let count = cmd.vertCount;
-            if (cmd.mode === GL_LINE_LOOP) count += 1;
-            if (cmd.polygonMode === GL_LINE && this.isTriangleLikeMode(cmd.mode)) {
+        for (let c = 0; c < stream.count; c++) {
+            const i = c * CMD_I32;
+            if (I[i + CI_TYPE] !== GLDrawCommandType.DRAW) continue;
+            const mode = I[i + CI_MODE] >>> 0;
+            let count = I[i + CI_VERT_COUNT];
+            if (mode === GL_LINE_LOOP) count += 1;
+            if ((I[i + CI_POLYGON_MODE] >>> 0) === GL_LINE && this.isTriangleLikeMode(mode)) {
                 count *= 2;
             }
             totalVertices += count;
         }
         return Math.max(1, totalVertices * VERTEX_BYTE_STRIDE);
+    }
+
+    private summarizeCommands(stream: GLCommandStream): string {
+        const I = stream.i32;
+        const parts: string[] = [];
+        for (let c = 0; c < stream.count; c++) {
+            const i = c * CMD_I32;
+            switch (I[i + CI_TYPE]) {
+                case GLDrawCommandType.CLEAR:
+                    parts.push(`CLEAR(m=0x${(I[i + CI_CLEAR_MASK] >>> 0).toString(16)})`);
+                    break;
+                case GLDrawCommandType.VIEWPORT:
+                    parts.push(`VP(${I[i + CI_VP_W]}x${I[i + CI_VP_H]})`);
+                    break;
+                case GLDrawCommandType.SCISSOR:
+                    parts.push('SCISSOR');
+                    break;
+                case GLDrawCommandType.DRAW:
+                    parts.push(`DRAW(v=${I[i + CI_VERT_COUNT]})`);
+                    break;
+                default:
+                    parts.push(`?${I[i + CI_TYPE]}`);
+                    break;
+            }
+        }
+        return parts.join(',');
     }
 
     private ensureUniformCapacity(device: GPUDevice, drawCount: number): void {
@@ -670,21 +916,27 @@ export class OpenGLBackendExecutor {
         return offset;
     }
 
-    private prepareDrawData(cmd: GLDrawCommand): PreparedDrawData | null {
-        const selected = this.selectFlatVertices(cmd);
+    private prepareDrawData(
+        arena: Float32Array,
+        vertOffset: number,
+        vertCount: number,
+        mode: number,
+        polygonMode: number,
+    ): PreparedDrawData | null {
+        const selected = this.selectFlatVertices(arena, vertOffset, vertCount, mode, polygonMode);
         if (!selected || selected.count <= 0) return null;
 
-        const vertexCount = selected.count;
-        const floatCount = vertexCount * VERTEX_FLOAT_STRIDE;
+        const count = selected.count;
+        const floatCount = count * VERTEX_FLOAT_STRIDE;
         if (this.vertexScratch.length < floatCount) {
             this.vertexScratch = new Float32Array(this.nextPow2(floatCount));
         }
         const out = this.vertexScratch.subarray(0, floatCount);
 
         const src = selected.data;
+        let si = selected.first;
         let idx = 0;
-        for (let i = 0; i < vertexCount; i++) {
-            const si = i * VERT_FLOATS;
+        for (let i = 0; i < count; i++) {
             out[idx++] = src[si];       // clip.x
             out[idx++] = src[si+1];     // clip.y
             out[idx++] = src[si+2];     // clip.z
@@ -697,70 +949,81 @@ export class OpenGLBackendExecutor {
             out[idx++] = src[si+12];    // t0
             out[idx++] = src[si+13];    // s1
             out[idx++] = src[si+14];    // t1
+            si += VERT_FLOATS;
         }
 
         return {
             topology: selected.topology,
-            vertexCount,
+            vertexCount: count,
             data: out,
-            byteLength: vertexCount * VERTEX_BYTE_STRIDE,
+            byteLength: count * VERTEX_BYTE_STRIDE,
         };
     }
 
-    private selectFlatVertices(cmd: GLDrawCommand): { data: Float32Array; count: number; topology: OpenGLTopology } | null {
-        let topology: OpenGLTopology = "triangle-list";
-        let data = cmd.vertData;
-        let count = cmd.vertCount;
+    /** Scratch big enough for `floats`, preserving nothing. */
+    private expandBuffer(floats: number): Float32Array {
+        if (this.expandScratch.length < floats) {
+            this.expandScratch = new Float32Array(this.nextPow2(floats));
+        }
+        return this.expandScratch;
+    }
 
-        if (cmd.polygonMode === GL_LINE && this.isTriangleLikeMode(cmd.mode)) {
-            const triCount = (count / 3) | 0;
+    private selectFlatVertices(
+        arena: Float32Array,
+        vertOffset: number,
+        vertCount: number,
+        mode: number,
+        polygonMode: number,
+    ): SelectedVertices | null {
+        if (polygonMode === GL_LINE && this.isTriangleLikeMode(mode)) {
+            const triCount = (vertCount / 3) | 0;
             if (triCount <= 0) return null;
             const wireCount = triCount * 6;
-            const wire = new Float32Array(wireCount * VERT_FLOATS);
+            const wire = this.expandBuffer(wireCount * VERT_FLOATS);
             let wi = 0;
-            for (let i = 0; i + 2 < count; i += 3) {
-                const ai = i * VERT_FLOATS, bi = (i+1) * VERT_FLOATS, ci = (i+2) * VERT_FLOATS;
-                wire.set(data.subarray(ai, ai+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(bi, bi+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(bi, bi+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(ci, ci+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(ci, ci+VERT_FLOATS), (wi++) * VERT_FLOATS);
-                wire.set(data.subarray(ai, ai+VERT_FLOATS), (wi++) * VERT_FLOATS);
+            for (let i = 0; i + 2 < vertCount; i += 3) {
+                const a = vertOffset + i * VERT_FLOATS;
+                const b = a + VERT_FLOATS;
+                const c = b + VERT_FLOATS;
+                wi = this.copyVertTo(arena, a, wire, wi);
+                wi = this.copyVertTo(arena, b, wire, wi);
+                wi = this.copyVertTo(arena, b, wire, wi);
+                wi = this.copyVertTo(arena, c, wire, wi);
+                wi = this.copyVertTo(arena, c, wire, wi);
+                wi = this.copyVertTo(arena, a, wire, wi);
             }
-            data = wire;
-            count = wireCount;
-            topology = "line-list";
-        } else if (cmd.polygonMode === GL_POINT && this.isTriangleLikeMode(cmd.mode)) {
-            topology = "point-list";
-        } else {
-            switch (cmd.mode) {
-                case GL_POINTS:
-                    topology = "point-list";
-                    break;
-                case GL_LINES:
-                    topology = "line-list";
-                    break;
-                case GL_LINE_STRIP:
-                    topology = "line-strip";
-                    break;
-                case GL_LINE_LOOP: {
-                    if (count < 2) return null;
-                    // Append first vertex to close the loop
-                    const looped = new Float32Array((count + 1) * VERT_FLOATS);
-                    looped.set(data.subarray(0, count * VERT_FLOATS));
-                    looped.set(data.subarray(0, VERT_FLOATS), count * VERT_FLOATS);
-                    data = looped;
-                    count = count + 1;
-                    topology = "line-strip";
-                    break;
-                }
-                default:
-                    topology = "triangle-list";
-                    break;
-            }
+            return { data: wire, first: 0, count: wireCount, topology: "line-list" };
         }
 
-        return { data, count, topology };
+        if (polygonMode === GL_POINT && this.isTriangleLikeMode(mode)) {
+            return { data: arena, first: vertOffset, count: vertCount, topology: "point-list" };
+        }
+
+        switch (mode) {
+            case GL_POINTS:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "point-list" };
+            case GL_LINES:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "line-list" };
+            case GL_LINE_STRIP:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "line-strip" };
+            case GL_LINE_LOOP: {
+                if (vertCount < 2) return null;
+                // Append the first vertex to close the loop.
+                const floats = (vertCount + 1) * VERT_FLOATS;
+                const looped = this.expandBuffer(floats);
+                for (let k = 0; k < vertCount * VERT_FLOATS; k++) looped[k] = arena[vertOffset + k];
+                this.copyVertTo(arena, vertOffset, looped, vertCount * VERT_FLOATS);
+                return { data: looped, first: 0, count: vertCount + 1, topology: "line-strip" };
+            }
+            default:
+                return { data: arena, first: vertOffset, count: vertCount, topology: "triangle-list" };
+        }
+    }
+
+    /** Copy one VERT_FLOATS vertex; returns the advanced destination index. */
+    private copyVertTo(src: Float32Array, s: number, dst: Float32Array, d: number): number {
+        for (let k = 0; k < VERT_FLOATS; k++) dst[d + k] = src[s + k];
+        return d + VERT_FLOATS;
     }
 
     private isTriangleLikeMode(mode: number): boolean {
@@ -1027,68 +1290,116 @@ export class OpenGLBackendExecutor {
     private writeUniforms(
         queue: GPUQueue,
         offset: number,
-        _screenW: number,
-        _screenH: number,
-        cmd: GLDrawCommand,
+        guestW: number,
+        guestH: number,
+        I: Int32Array,
+        F: Float32Array,
+        i: number,
+        f: number,
         useTex0: boolean,
         useTex1: boolean,
     ): void {
         this.uniformScratchF32.fill(0);
+        const flags = I[i + CI_FLAGS];
+        const vpW = I[i + CI_VP_W];
+        const vpH = I[i + CI_VP_H];
 
         // 0..16 — use the viewport dimensions that were active when vertices were
-        // transformed (in transformVertices), NOT the canvas size. The vertex shader
-        // reverses the viewport transform: ndcX = (pos.x / screen.x) * 2 - 1, so
-        // screen.x must match the viewportW used in the JS-side viewport transform.
-        this.uniformScratchF32[0] = cmd.vpW > 0 ? cmd.vpW : _screenW;
-        this.uniformScratchF32[1] = cmd.vpH > 0 ? cmd.vpH : _screenH;
-        this.uniformScratchF32[2] = this.clamp01(cmd.alphaRef);
+        // transformed (in transformVertices), in GUEST pixels — never the canvas, and never
+        // the scaled render extent. The vertex shader reverses the viewport transform:
+        // ndcX = (pos.x / screen.x) * 2 - 1, so screen.x must match the viewportW used in
+        // the JS-side viewport transform.
+        this.uniformScratchF32[0] = vpW > 0 ? vpW : guestW;
+        this.uniformScratchF32[1] = vpH > 0 ? vpH : guestH;
+        this.uniformScratchF32[2] = this.clamp01(F[f + CF_ALPHA_REF]);
 
         // 16..48 (u32s)
-        this.uniformScratchU32[4] = cmd.alphaFunc >>> 0;
-        this.uniformScratchU32[5] = cmd.texEnvMode0 >>> 0;
-        this.uniformScratchU32[6] = cmd.texEnvMode1 >>> 0;
-        this.uniformScratchU32[7] = cmd.alphaTest ? 1 : 0;
+        this.uniformScratchU32[4] = I[i + CI_ALPHA_FUNC] >>> 0;
+        this.uniformScratchU32[5] = I[i + CI_TEXENV0] >>> 0;
+        this.uniformScratchU32[6] = I[i + CI_TEXENV1] >>> 0;
+        this.uniformScratchU32[7] = (flags & DF_ALPHA_TEST) !== 0 ? 1 : 0;
         this.uniformScratchU32[8] = useTex0 ? 1 : 0;
         this.uniformScratchU32[9] = useTex1 ? 1 : 0;
-        this.uniformScratchU32[10] = cmd.fogEnabled ? 1 : 0;
-        this.uniformScratchU32[11] = cmd.fogMode >>> 0;
+        this.uniformScratchU32[10] = (flags & DF_FOG) !== 0 ? 1 : 0;
+        this.uniformScratchU32[11] = I[i + CI_FOG_MODE] >>> 0;
 
         // 48..64
-        this.uniformScratchF32[12] = Math.max(0, cmd.fogDensity);
-        this.uniformScratchF32[13] = cmd.fogStart;
-        this.uniformScratchF32[14] = cmd.fogEnd;
+        this.uniformScratchF32[12] = Math.max(0, F[f + CF_FOG_DENSITY]);
+        this.uniformScratchF32[13] = F[f + CF_FOG_START];
+        this.uniformScratchF32[14] = F[f + CF_FOG_END];
 
         // 64..80 fogColor
-        this.uniformScratchF32[16] = this.clamp01(cmd.fogR);
-        this.uniformScratchF32[17] = this.clamp01(cmd.fogG);
-        this.uniformScratchF32[18] = this.clamp01(cmd.fogB);
-        this.uniformScratchF32[19] = this.clamp01(cmd.fogA);
+        this.uniformScratchF32[16] = this.clamp01(F[f + CF_FOG_R]);
+        this.uniformScratchF32[17] = this.clamp01(F[f + CF_FOG_G]);
+        this.uniformScratchF32[18] = this.clamp01(F[f + CF_FOG_B]);
+        this.uniformScratchF32[19] = this.clamp01(F[f + CF_FOG_A]);
+
+        // 80..84 — reversed glDepthRange (see readDepthRange): the sorted pair goes to
+        // setViewport, the mirroring happens here. writeUniforms runs before the
+        // setViewport that consumes the same read.
+        this.readDepthRange(F, f);
+        this.uniformScratchU32[20] = this.depthRangeReversed ? 1 : 0;
+
+        // 84..100 — packed GL_COMBINE words, decoded in the shader by the same layout
+        // context.ts encodes them with.
+        this.uniformScratchU32[21] = I[i + CI_COMBINE0_RGB] >>> 0;
+        this.uniformScratchU32[22] = I[i + CI_COMBINE0_ALPHA] >>> 0;
+        this.uniformScratchU32[23] = I[i + CI_COMBINE1_RGB] >>> 0;
+        this.uniformScratchU32[24] = I[i + CI_COMBINE1_ALPHA] >>> 0;
+
+        // 112..144 — GL_TEXTURE_ENV_COLOR per unit (vec4 alignment leaves 100..112 pad)
+        for (let k = 0; k < 4; k++) {
+            this.uniformScratchF32[28 + k] = this.clamp01(F[f + CF_ENV_COLOR0 + k]);
+            this.uniformScratchF32[32 + k] = this.clamp01(F[f + CF_ENV_COLOR1 + k]);
+        }
 
         queue.writeBuffer(this.uniformBuffer!, offset, this.uniformScratchBuffer, 0, UNIFORM_BLOCK_SIZE);
     }
 
-    private applyScissor(pass: GPURenderPassEncoder, cmd: GLDrawCommand, screenW: number, screenH: number): boolean {
-        if (!cmd.scissorEnabled) {
-            pass.setScissorRect(0, 0, screenW, screenH);
+    /** The guest's scissor box (guest pixels, GL lower-left) placed in the scaled render target. */
+    private applyScissor(
+        pass: GPURenderPassEncoder,
+        I: Int32Array,
+        i: number,
+        flags: number,
+        guestW: number,
+        guestH: number,
+        scale: number,
+        renderW: number,
+        renderH: number,
+    ): boolean {
+        if ((flags & DF_SCISSOR) === 0) {
+            pass.setScissorRect(0, 0, renderW, renderH);
             return true;
         }
 
-        const sx = Math.round(cmd.scissorX);
-        const sy = Math.round(cmd.scissorY);
-        const sw = Math.max(0, Math.round(cmd.scissorW));
-        const sh = Math.max(0, Math.round(cmd.scissorH));
-
-        // OpenGL scissor origin is lower-left, WebGPU scissor origin is top-left.
-        const x = this.clampInt(sx, 0, screenW);
-        const y = this.clampInt(screenH - (sy + sh), 0, screenH);
-        const w = this.clampInt(sw, 0, screenW - x);
-        const h = this.clampInt(sh, 0, screenH - y);
-        if (w <= 0 || h <= 0) {
-            return false;
-        }
-
-        pass.setScissorRect(x, y, w, h);
+        const r = scissorRect(
+            I[i + CI_SCISSOR_X], I[i + CI_SCISSOR_Y], I[i + CI_SCISSOR_W], I[i + CI_SCISSOR_H],
+            guestW, guestH, scale, renderW, renderH);
+        if (!r) return false;
+        pass.setScissorRect(r.x, r.y, r.w, r.h);
         return true;
+    }
+
+    /**
+     * glDepthRange(near, far) as WebGPU can express it.
+     *
+     * GL clamps both to [0,1] and explicitly ALLOWS near > far (a reversed mapping);
+     * WebGPU's setViewport rejects minDepth > maxDepth and invalidates the whole command
+     * buffer, so the frame is dropped and the canvas shows an unwritten swap image. Hand
+     * setViewport the sorted pair and tell the vertex shader to mirror its normalized depth
+     * (t → 1-t), which reproduces GL's z_window bit for bit.
+     *
+     * Results land in depthRangeMin/Max/Reversed — a per-draw call, so no object per draw.
+     */
+    private readDepthRange(F: Float32Array, f: number): void {
+        const rawNear = F[f + CF_DEPTH_RANGE_NEAR];
+        const rawFar = F[f + CF_DEPTH_RANGE_FAR];
+        const near = this.clamp01(Number.isFinite(rawNear) ? rawNear : 0);
+        const far = this.clamp01(Number.isFinite(rawFar) ? rawFar : 1);
+        this.depthRangeReversed = near > far;
+        this.depthRangeMin = this.depthRangeReversed ? far : near;
+        this.depthRangeMax = this.depthRangeReversed ? near : far;
     }
 
     private encodeClearPass(
@@ -1235,12 +1546,6 @@ export class OpenGLBackendExecutor {
         return v;
     }
 
-    private clampInt(v: number, min: number, max: number): number {
-        if (v < min) return min;
-        if (v > max) return max;
-        return v | 0;
-    }
-
     private buildShaderCode(): string {
         return `
 struct Uniforms {
@@ -1260,6 +1565,16 @@ struct Uniforms {
     fogEnd: f32,            // 56..60
     _pad1: f32,             // 60..64
     fogColor: vec4f,        // 64..80
+    depthFlip: u32,         // 80..84
+    comb0Rgb: u32,          // 84..88
+    comb0Alpha: u32,        // 88..92
+    comb1Rgb: u32,          // 92..96
+    comb1Alpha: u32,        // 96..100
+    _pad2: u32,             // 100..104
+    _pad3: u32,             // 104..108
+    _pad4: u32,             // 108..112
+    envColor0: vec4f,       // 112..128
+    envColor1: vec4f,       // 128..144
 };
 
 struct VertexIn {
@@ -1283,7 +1598,86 @@ struct VertexOut {
 @group(0) @binding(3) var samp1: sampler;
 @group(0) @binding(4) var tex1: texture_2d<f32>;
 
-fn applyTexEnv(mode: u32, incoming: vec4f, texel: vec4f) -> vec4f {
+// ---- ARB/EXT_texture_env_combine ----
+//
+// The packed word layout is defined in modules/opengl32/context.ts; these decoders are
+// the other half of that contract. GL_COMBINE is the reason an engine drops its
+// multi-pass lightmap path, so evaluating it as plain MODULATE is not a lost effect —
+// it is the wrong image for geometry the engine deliberately stopped drawing twice.
+
+fn combSource(src: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> vec4f {
+    if (src == ${COMBINER_SRC_CONSTANT}u) { return konst; }
+    if (src == ${COMBINER_SRC_PRIMARY}u) { return primary; }
+    if (src == ${COMBINER_SRC_PREVIOUS}u) { return previous; }
+    return texel;
+}
+
+fn combOperandRgb(op: u32, v: vec4f) -> vec3f {
+    if (op == ${COMBINER_OP_ONE_MINUS_SRC_COLOR}u) { return vec3f(1.0) - v.rgb; }
+    if (op == ${COMBINER_OP_SRC_ALPHA}u) { return vec3f(v.a); }
+    if (op == ${COMBINER_OP_ONE_MINUS_SRC_ALPHA}u) { return vec3f(1.0 - v.a); }
+    return v.rgb;
+}
+
+// Alpha arguments accept only SRC_ALPHA / ONE_MINUS_SRC_ALPHA.
+fn combOperandAlpha(op: u32, v: vec4f) -> f32 {
+    if (op == ${COMBINER_OP_ONE_MINUS_SRC_ALPHA}u) { return 1.0 - v.a; }
+    return v.a;
+}
+
+fn combArg(word: u32, index: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> vec4f {
+    let shift = 4u + index * 4u;
+    let src = (word >> shift) & 3u;
+    return combSource(src, texel, primary, previous, konst);
+}
+
+fn combOpBits(word: u32, index: u32) -> u32 {
+    return (word >> (6u + index * 4u)) & 3u;
+}
+
+fn combineRgb(word: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> vec3f {
+    let fn_ = word & 15u;
+    let a0 = combOperandRgb(combOpBits(word, 0u), combArg(word, 0u, texel, primary, previous, konst));
+    let a1 = combOperandRgb(combOpBits(word, 1u), combArg(word, 1u, texel, primary, previous, konst));
+    let a2 = combOperandRgb(combOpBits(word, 2u), combArg(word, 2u, texel, primary, previous, konst));
+    var rgb: vec3f;
+    if (fn_ == ${COMBINER_FN_REPLACE}u) { rgb = a0; }
+    else if (fn_ == ${COMBINER_FN_ADD}u) { rgb = a0 + a1; }
+    else if (fn_ == ${COMBINER_FN_ADD_SIGNED}u) { rgb = a0 + a1 - vec3f(0.5); }
+    else if (fn_ == ${COMBINER_FN_INTERPOLATE}u) { rgb = a0 * a2 + a1 * (vec3f(1.0) - a2); }
+    else if (fn_ == ${COMBINER_FN_SUBTRACT}u) { rgb = a0 - a1; }
+    else if (fn_ == ${COMBINER_FN_DOT3_RGB}u || fn_ == ${COMBINER_FN_DOT3_RGBA}u) {
+        rgb = vec3f(4.0 * dot(a0 - vec3f(0.5), a1 - vec3f(0.5)));
+    }
+    else { rgb = a0 * a1; }   // ${COMBINER_FN_MODULATE}
+    let scale = f32(1u << ((word >> 16u) & 3u));
+    return clamp(rgb * scale, vec3f(0.0), vec3f(1.0));
+}
+
+fn combineAlpha(word: u32, rgbWord: u32, texel: vec4f, primary: vec4f, previous: vec4f, konst: vec4f) -> f32 {
+    // DOT3_RGBA replaces alpha with the same dot product, ignoring the alpha combiner.
+    if ((rgbWord & 15u) == ${COMBINER_FN_DOT3_RGBA}u) {
+        return combineRgb(rgbWord, texel, primary, previous, konst).r;
+    }
+    let fn_ = word & 15u;
+    let a0 = combOperandAlpha(combOpBits(word, 0u), combArg(word, 0u, texel, primary, previous, konst));
+    let a1 = combOperandAlpha(combOpBits(word, 1u), combArg(word, 1u, texel, primary, previous, konst));
+    let a2 = combOperandAlpha(combOpBits(word, 2u), combArg(word, 2u, texel, primary, previous, konst));
+    var a: f32;
+    if (fn_ == ${COMBINER_FN_REPLACE}u) { a = a0; }
+    else if (fn_ == ${COMBINER_FN_ADD}u) { a = a0 + a1; }
+    else if (fn_ == ${COMBINER_FN_ADD_SIGNED}u) { a = a0 + a1 - 0.5; }
+    else if (fn_ == ${COMBINER_FN_INTERPOLATE}u) { a = a0 * a2 + a1 * (1.0 - a2); }
+    else if (fn_ == ${COMBINER_FN_SUBTRACT}u) { a = a0 - a1; }
+    else { a = a0 * a1; }
+    let scale = f32(1u << ((word >> 16u) & 3u));
+    return clamp(a * scale, 0.0, 1.0);
+}
+
+fn applyTexEnv(
+    mode: u32, incoming: vec4f, texel: vec4f,
+    primary: vec4f, combRgb: u32, combAlpha: u32, konst: vec4f,
+) -> vec4f {
     if (mode == ${GL_REPLACE}u) {
         return texel;
     }
@@ -1292,6 +1686,12 @@ fn applyTexEnv(mode: u32, incoming: vec4f, texel: vec4f) -> vec4f {
     }
     if (mode == ${GL_ADD}u) {
         return vec4f(min(incoming.rgb + texel.rgb, vec3f(1.0)), min(incoming.a + texel.a, 1.0));
+    }
+    if (mode == ${GL_COMBINE}u) {
+        return vec4f(
+            combineRgb(combRgb, texel, primary, incoming, konst),
+            combineAlpha(combAlpha, combRgb, texel, primary, incoming, konst),
+        );
     }
     return incoming * texel; // GL_MODULATE / default
 }
@@ -1326,8 +1726,11 @@ fn computeFogFactor(mode: u32, density: f32, start: f32, end: f32, coord: f32) -
 fn vs_main(input: VertexIn) -> VertexOut {
     var out: VertexOut;
     // Pass clip-space coordinates — GPU handles perspective divide, clipping,
-    // and viewport transform. Remap Z from OpenGL [-w,w] to WebGPU [0,w].
-    out.position = vec4f(input.pos.x, input.pos.y, input.pos.z * 0.5 + input.pos.w * 0.5, input.pos.w);
+    // and viewport transform. Remap Z from OpenGL [-w,w] to WebGPU [0,w]; depthFlip
+    // mirrors it for a reversed glDepthRange, whose sorted pair the viewport carries.
+    let zHalf = input.pos.z * 0.5 + input.pos.w * 0.5;
+    let zOut = select(zHalf, input.pos.w - zHalf, uniforms.depthFlip != 0u);
+    out.position = vec4f(input.pos.x, input.pos.y, zOut, input.pos.w);
     out.color = input.color;
     out.uv0 = input.uv0;
     out.uv1 = input.uv1;
@@ -1341,13 +1744,18 @@ fn vs_main(input: VertexIn) -> VertexOut {
 fn fs_main(input: VertexOut) -> @location(0) vec4f {
     var color = input.color;
 
+    // GL_PRIMARY_COLOR is the fragment's interpolated colour for EVERY unit; GL_PREVIOUS
+    // is the running result, which at unit 0 is the same thing.
+    let primary = input.color;
     if (uniforms.useTex0 != 0u) {
         let t0 = textureSample(tex0, samp0, input.uv0);
-        color = applyTexEnv(uniforms.texEnv0, color, t0);
+        color = applyTexEnv(uniforms.texEnv0, color, t0, primary,
+                            uniforms.comb0Rgb, uniforms.comb0Alpha, uniforms.envColor0);
     }
     if (uniforms.useTex1 != 0u) {
         let t1 = textureSample(tex1, samp1, input.uv1);
-        color = applyTexEnv(uniforms.texEnv1, color, t1);
+        color = applyTexEnv(uniforms.texEnv1, color, t1, primary,
+                            uniforms.comb1Rgb, uniforms.comb1Alpha, uniforms.envColor1);
     }
 
     color = vec4f(clamp(color.rgb, vec3f(0.0), vec3f(1.0)), clamp(color.a, 0.0, 1.0));

@@ -22,13 +22,23 @@ import {
     type HarnessCallOpts,
     type HarnessReply,
     type HarnessEventMsg,
+    HarnessError,
+    HarnessErrorCode,
 } from "../worker/harness/rpc";
+import { sessionFromLocation } from "./session";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "./types";
 import { isSerializedFn } from "./types";
 import { HarnessChain } from "./dsl";
+import { diskBundleUrl } from "../utils/bundle-url";
+import { INPUT_INDEX, KEY_BITFIELD_BASE, KEY_BITFIELD_COUNT } from "../input/sab-layout";
+import { relativeIntent } from "../input/relative-intent";
 
 /** Verbs handled page-side (browser-only) rather than forwarded to the worker. */
-const BROWSER_ONLY = new Set(["openWgb", "loadPe", "audioGesture", "waitForEvent"]);
+const BROWSER_ONLY = new Set([
+    "openWgb", "loadPe", "audioGesture", "waitForEvent", "onModal", "dismissModal", "inputSab",
+    "report", "hostModals", "setHostModal",
+    "hostRecord", "hostRecordStop", "hostReplay",
+]);
 
 export interface HarnessFacade {
     /** Low-level: invoke any worker command, await the {ok,result|error} reply. */
@@ -43,13 +53,30 @@ export interface HarnessFacade {
     /** Execute a serialized step list (CLI/MCP entry); returns one POJO. */
     __runSteps(steps: HarnessStep[]): Promise<HarnessRunResult>;
     // Browser-only verbs:
-    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean }): Promise<unknown>;
+    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; args?: string }): Promise<unknown>;
     loadPe(url: string): Promise<unknown>;
     audioGesture(): Promise<unknown>;
-    /** Auto-answer matching MessageBox prompts; returns a disposer. */
+    /** Host-side snapshot of the published input record + touch transport state. */
+    inputSab(): Promise<unknown>;
+    /** Arm the page recorder so MANUAL play is captured (the worker's recorder
+     *  only sees harness-injected input). */
+    hostRecord(): Promise<unknown>;
+    /** Disarm and return the captured samples. */
+    hostRecordStop(): Promise<unknown>;
+    /** Re-apply captured samples; deterministic replays from the sample stamps. */
+    hostReplay(samples: unknown, opts?: { deterministic?: boolean }): Promise<unknown>;
+    /** Auto-answer matching MessageBox prompts; returns a disposer. Survives the reload
+     *  openWgb() does, and therefore also later runs in the same tab — clear it when a
+     *  script wants the prompts back. */
     onMessageBox(pattern: RegExp | string, reply?: number | string): () => void;
+    /** Drop every armed auto-answer, including ones persisted across reloads. */
+    clearModalAnswers(): void;
     /** Resolver App.tsx consults for a prompt; buttonId to auto-answer, null to defer. */
     autoModalReply(box: { text?: string; caption?: string }): number | null;
+    /** App.tsx publishes a dismisser while its MessageBox modal is mounted (null on close). */
+    setLiveModal(dismiss: ((button: number) => void) | null, box?: { text?: string; caption?: string }): void;
+    /** Answer the modal that is ALREADY on screen. onMessageBox only pre-arms. */
+    dismissModal(button?: number | string, required?: boolean): { dismissed: boolean; text?: string };
     // Generic worker verbs (state, click, breakOn, ...) reachable via the Proxy.
     [cmd: string]: unknown;
 }
@@ -58,7 +85,7 @@ let facade: HarnessFacade | null = null;
 
 /** Install the facade onto window.__BS__.harness. Called once from App.tsx with
  *  the worker handle. Idempotent. */
-export function installHarnessFacade(worker: Worker): HarnessFacade {
+export function installHarnessFacade(worker: Worker, getInputView?: () => Int32Array | null): HarnessFacade {
     if (facade) return facade;
 
     let nextId = 1;
@@ -68,6 +95,24 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
     // Auto-modal matchers: {pattern, button}. Win32 IDs IDOK=1, IDCANCEL=2, IDYES=6, IDNO=7.
     const BUTTON_IDS: Record<string, number> = { ok: 1, cancel: 2, abort: 3, retry: 4, ignore: 5, yes: 6, no: 7 };
     const modalMatchers: Array<{ test: (m: any) => boolean; button: number }> = [];
+
+    /**
+     * Auto-answers outlive the reload openWgb() does. `.onModal(..).openWgb(..)` is the
+     * order every script writes — arm the answer, then start the game — and a matcher
+     * that only lived in this page instance was gone before the guest ever asked, so the
+     * run hung on a modal the script had already answered for.
+     */
+    const MODAL_STORE_KEY = "__bsHarnessModalMatchers";
+    function persistModalMatchers(specs: Array<{ source: string; button: number }>): void {
+        try { sessionStorage.setItem(MODAL_STORE_KEY, JSON.stringify(specs)); } catch { /* private mode */ }
+    }
+    function readModalSpecs(): Array<{ source: string; button: number }> {
+        try {
+            const raw = sessionStorage.getItem(MODAL_STORE_KEY);
+            return raw ? JSON.parse(raw) : [];
+        } catch { return []; }
+    }
+    const modalSpecs: Array<{ source: string; button: number }> = readModalSpecs();
 
     worker.addEventListener("message", (ev: MessageEvent) => {
         const m = ev.data;
@@ -109,13 +154,117 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         const button = typeof reply === "number" ? reply : (BUTTON_IDS[reply.toLowerCase()] ?? 1);
         const entry = { test: (m: any) => re.test(String(m.text ?? "")) || re.test(String(m.caption ?? "")), button };
         modalMatchers.push(entry);
-        return () => { const i = modalMatchers.indexOf(entry); if (i >= 0) modalMatchers.splice(i, 1); };
+        const spec = { source: re.source, button };
+        modalSpecs.push(spec);
+        persistModalMatchers(modalSpecs);
+        return () => {
+            const i = modalMatchers.indexOf(entry);
+            if (i >= 0) modalMatchers.splice(i, 1);
+            const j = modalSpecs.indexOf(spec);
+            if (j >= 0) modalSpecs.splice(j, 1);
+            persistModalMatchers(modalSpecs);
+        };
+    }
+
+    /**
+     * The modal currently on screen, published by App.tsx while it is mounted.
+     * onMessageBox can only PRE-arm: App.tsx consults the resolver once, before
+     * rendering, so arming after a prompt is up answers nothing and the guest thread
+     * stays parked in MessageBoxA forever. A run that wants the prompt as a pause point
+     * — arm logging, then continue — needs this instead.
+     */
+    let liveModal: { dismiss: (button: number) => void; box: { text?: string; caption?: string } } | null = null;
+
+    function setLiveModal(dismiss: ((button: number) => void) | null, box: { text?: string; caption?: string } = {}): void {
+        liveModal = dismiss ? { dismiss, box } : null;
+    }
+
+    /**
+     * HOST-level modals — the host's own DOM dialogs (storage manager, the WGB wizard,
+     * a manifest editor), which no guest ever asks for and `report().pendingModals`
+     * therefore cannot see: that census is built in the worker from the guest's
+     * MessageBox bridge. A host modal sits over the canvas and swallows the clicks a
+     * chain sends, so a blocked chain and a slow one look identical — which is the one
+     * thing a diagnostic must never do. Components register while mounted; `report()`
+     * folds them into the same `pendingModals` list, tagged `source:"host"`, so "is
+     * something blocking?" has ONE answer rather than two half-answers.
+     */
+    const hostModals = new Map<string, { caption?: string; text?: string; since: number }>();
+
+    function setHostModal(name: string, info: { caption?: string; text?: string } | null): { open: string[] } {
+        if (info) hostModals.set(name, { ...info, since: Date.now() });
+        else hostModals.delete(name);
+        return { open: [...hostModals.keys()] };
+    }
+
+    /** Host modals currently on screen. Also the blocking check openWgb makes. */
+    function hostModalCensus(): Array<{ name: string; caption?: string; text?: string; waitingMs: number }> {
+        const now = Date.now();
+        return [...hostModals.entries()].map(([name, m]) => ({
+            name, caption: m.caption, text: m.text, waitingMs: now - m.since,
+        }));
+    }
+
+    /**
+     * report(), plus the half of "what is blocking?" that only the page can see. The
+     * worker's own pendingModals entries are tagged `source:"guest"` so a reader can
+     * still tell them apart; `hostModals` carries the host ones on their own as well.
+     */
+    async function reportWithHost(args: unknown[], opts?: HarnessCallOpts): Promise<unknown> {
+        const r = await rpc("report", args, opts) as Record<string, unknown> | null;
+        const host = hostModalCensus();
+        if (!r || typeof r !== "object") return r;
+        const guest = Array.isArray(r.pendingModals) ? r.pendingModals : [];
+        return {
+            ...r,
+            hostModals: host,
+            pendingModals: [
+                ...guest.map((m) => ({ ...(m as object), source: "guest" })),
+                ...host.map((m) => ({ ...m, source: "host" })),
+            ],
+        };
+    }
+
+    /**
+     * `required: false` opts out for a caller that is only clearing a prompt that MAY be
+     * up; by default a missing modal throws, because a chain step that silently reports
+     * success reads as "the prompt was dismissed" when the prompt never appeared.
+     */
+    function dismissModal(button: number | string = "ok", required = true): { dismissed: boolean; text?: string } {
+        if (!liveModal) {
+            if (required) throw new HarnessError("no modal is on screen to dismiss", HarnessErrorCode.NOT_FOUND);
+            return { dismissed: false };
+        }
+        const id = typeof button === "number" ? button : (BUTTON_IDS[button.toLowerCase()] ?? 1);
+        const text = liveModal.box.text;
+        liveModal.dismiss(id);
+        liveModal = null;
+        return { dismissed: true, text };
+    }
+
+    /** Clear every armed auto-answer, including the ones persisted across reloads. */
+    function clearModalAnswers(): void {
+        modalMatchers.length = 0;
+        modalSpecs.length = 0;
+        persistModalMatchers(modalSpecs);
+    }
+
+    // Rehydrate what an earlier page instance armed (see MODAL_STORE_KEY).
+    for (const spec of modalSpecs.slice()) {
+        const re = new RegExp(spec.source, "i");
+        modalMatchers.push({
+            test: (m: any) => re.test(String(m.text ?? "")) || re.test(String(m.caption ?? "")),
+            button: spec.button,
+        });
     }
 
     /** Resolver consulted by App.tsx: returns the button id for a matching prompt,
      *  or null to let App handle it (render dev modal / non-dev auto-reply). */
     function autoModalReply(box: { text?: string; caption?: string }): number | null {
         const m = modalMatchers.find((mm) => mm.test(box));
+        // Say so: matchers persist across reloads and into later runs in the same tab, so
+        // a silently swallowed prompt would read as "the game never asked".
+        if (m) console.log(`[harness] auto-answered MessageBox "${box.caption ?? ""}" -> ${m.button}`);
         return m ? m.button : null;
     }
 
@@ -125,6 +274,16 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         if (ws && ws.length) {
             eventWaiters[name] = [];
             for (const w of ws) w(data);
+        }
+        // A dead process will never deliver the event anyone is waiting for —
+        // release every waiter instead of letting each sit out its timeout.
+        if (name === "fault" && (data as { fatal?: boolean } | null)?.fatal) {
+            for (const other of Object.keys(eventWaiters)) {
+                const waiters = eventWaiters[other];
+                if (!waiters?.length) continue;
+                eventWaiters[other] = [];
+                for (const w of waiters) w(null);
+            }
         }
     }
 
@@ -167,61 +326,189 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
     }
 
     /** Wait for a raw worker message matching a predicate (load completion etc.). */
-    function waitForWorkerMessage(pred: (m: any) => boolean, timeoutMs: number): Promise<any> {
+    /**
+     * Wait for a worker message matching `pred`.
+     *
+     * `timeoutMs` bounds SILENCE, not the whole wait, when `progress` is given: every message
+     * the predicate accepts as progress restarts the clock. A total-duration bound is the wrong
+     * shape for anything whose duration scales with input — a cold multi-gigabyte bundle load
+     * legitimately outruns any constant, so a constant either fails a healthy load or waits out
+     * a dead one. A stall bound fails the dead load faster AND never fails the healthy one.
+     */
+    function waitForWorkerMessage(
+        pred: (m: any) => boolean,
+        timeoutMs: number,
+        progress?: (m: any) => boolean,
+    ): Promise<any> {
         return new Promise((resolve) => {
             let done = false;
-            const onMsg = (ev: MessageEvent) => {
-                if (done) return;
-                if (pred(ev.data)) {
-                    done = true;
-                    clearTimeout(timer);
-                    worker.removeEventListener("message", onMsg);
-                    resolve(ev.data);
-                }
-            };
-            const timer = setTimeout(() => {
+            let timer: ReturnType<typeof setTimeout>;
+            const finish = (value: any) => {
                 if (done) return;
                 done = true;
+                clearTimeout(timer);
                 worker.removeEventListener("message", onMsg);
-                resolve(null);
-            }, timeoutMs);
+                resolve(value);
+            };
+            const arm = () => {
+                clearTimeout(timer);
+                timer = setTimeout(() => finish(null), timeoutMs);
+            };
+            const onMsg = (ev: MessageEvent) => {
+                if (done) return;
+                if (pred(ev.data)) { finish(ev.data); return; }
+                if (progress?.(ev.data)) arm();
+            };
+            arm();
             worker.addEventListener("message", onMsg);
         });
     }
 
     /* ───────────────────────── browser-only verbs ───────────────────────── */
 
-    function resolveBundlePath(idOrUrl: string): string {
+    async function resolveBundlePath(idOrUrl: string): Promise<string> {
+        // A Windows path in a double-quoted JS literal is a trap: "g:\WGB\todo\bod.wgb"
+        // is really `g:WGB<TAB>odo<BACKSPACE>od.wgb` — \t and \b are escapes and \W just
+        // loses its backslash. The fetch then 404s and the ZIP reader reports "EOCD not
+        // found", which sends the reader hunting for a corrupt bundle. Fail here, naming
+        // the actual problem.
+        const ctrl = idOrUrl.match(/[\x00-\x1f]/);
+        if (ctrl) {
+            const shown = [...idOrUrl].map((c) => (c.charCodeAt(0) < 32 ? `<${c.charCodeAt(0)}>` : c)).join("");
+            throw new Error(
+                `bundle path contains a control character (${shown}) — a "\\t"/"\\b"-style escape in a ` +
+                `double-quoted literal. Use forward slashes ("g:/WGB/todo/x.wgb") or a raw string.`,
+            );
+        }
         if (/^https?:\/\//i.test(idOrUrl)) return idOrUrl;
-        // Absolute disk path (Windows "X:\…"/"X:/…" or a POSIX "/…*.wgb") → dev disk-stream
-        // route: serveWgbFromDisk (vite.config) streams it straight off disk via Range, so
-        // the agent/make-wgb can hand a raw path — no symlink, no hardcoded folder.
+        // Absolute disk path (Windows "X:\…"/"X:/…" or a POSIX "/…*.wgb") → stream it straight
+        // off disk via Range, so the agent/make-wgb can hand a raw path — no symlink, no
+        // hardcoded folder. Route choice (sidecar over Vite) lives in diskBundleUrl.
         const isWinAbs = /^[a-zA-Z]:[\\/]/.test(idOrUrl);
         const isPosixAbsWgb = idOrUrl.startsWith("/") && !idOrUrl.startsWith("/apps/")
             && !idOrUrl.startsWith("/__wgb/") && idOrUrl.toLowerCase().endsWith(".wgb");
-        if (isWinAbs || isPosixAbsWgb) return `/__wgb/?path=${encodeURIComponent(idOrUrl)}`;
+        if (isWinAbs || isPosixAbsWgb) return (await diskBundleUrl(idOrUrl)).url;
         if (idOrUrl.includes("/")) return idOrUrl;                       // already a URL (/apps/…, /__wgb/…)
         // Bare id → a bundled demo served statically from public/apps.
         if (idOrUrl.toLowerCase().endsWith(".wgb")) return `/apps/${idOrUrl}`;
         return `/apps/${idOrUrl}.wgb`;
     }
 
-    async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean }): Promise<unknown> {
-        const path = resolveBundlePath(idOrUrl);
+    async function openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean; args?: string }): Promise<unknown> {
+        const path = await resolveBundlePath(idOrUrl);
         const w = window as any;
+        // A host modal over the canvas eats the load's own UI and every click that
+        // follows, and it is not the guest's, so nothing in the worker reports it. Say
+        // so HERE: a chain that is blocked must not be indistinguishable from a chain
+        // that is merely slow, which is what the 120s stall bound below would make it.
+        const blocking = hostModalCensus();
+        if (blocking.length) {
+            const names = blocking.map((m) => `${m.name}${m.caption ? ` (${m.caption})` : ""}`).join(", ");
+            throw new HarnessError(
+                `openWgb("${path}"): a host modal is on screen and would block the load: ${names}. `
+                + `Close it first (harness.dismissModal() answers a guest MessageBox; a host dialog `
+                + `needs its own close), or check harness.report().pendingModals.`,
+                HarnessErrorCode.UNSUPPORTED,
+            );
+        }
+        // The worker reports a failed load as {type:"error"}, never as a "done" phase, so
+        // waiting only for "done" turns every load failure into a 120s stall that still
+        // reports ok — the run then fails later, somewhere unrelated, with the real reason
+        // only in the log. Watch for both and let the error be the answer.
+        // 120s of SILENCE, not 120s total: a cold 2.2 GB bundle load takes longer than any
+        // constant worth hardcoding, but it reports loading_progress throughout, so a stall
+        // bound is both safer and stricter than the total bound this used to have.
         const loadDone = waitForWorkerMessage(
-            (m) => m?.type === "loading_progress" && m.phase === "done",
+            (m) => (m?.type === "loading_progress" && m.phase === "done") || m?.type === "error",
             120_000,
+            (m) => m?.type === "loading_progress",
         );
         if (opts?.hle && typeof w.enableHleAndLoad === "function") {
             await w.enableHleAndLoad(path, !!opts.logOnly);
         } else if (typeof w.loadApp === "function") {
-            await w.loadApp(path);
+            // `args` boots straight into the scene a front-end would otherwise gate behind
+            // menu clicks — the command line the game's own re-exec would have used.
+            await w.loadApp(path, opts?.args !== undefined ? { args: opts.args } : undefined);
         } else {
             throw new Error("window.loadApp not available (open ?game=dev)");
         }
         const done = await loadDone;
-        return { path, loaded: !!done, progress: done ?? null };
+        if (done?.type === "error") throw new Error(`openWgb("${path}"): ${done.message}`);
+        if (!done) {
+            // A modal that went up DURING the load is the likeliest reason nothing
+            // progressed; naming it beats reporting a bare stall.
+            const late = hostModalCensus();
+            throw new Error(`openWgb("${path}"): no load completion within 120s`
+                + (late.length ? ` — a host modal is on screen: ${late.map((m) => m.name).join(", ")}` : ""));
+        }
+        return { path, loaded: true, progress: done };
+    }
+
+    /**
+     * Set a worker A/B flag so it SURVIVES a reload.
+     *
+     * The worker-side verb only assigns `globalThis[key]` in the CURRENT worker, and
+     * `openWgb()` reloads the page before loading (fresh worker + code) — so a chain of
+     * `setWorkerFlag(...).openWgb(...)` silently lost the flag and every `__no*` A/B
+     * measured the DEFAULT path while reporting success. (Observed: __noHeapSlab left
+     * the slab counters byte-identical.) Persist through the same localStorage channel
+     * the host replays on every worker init, BEFORE any game loads, then forward the RPC
+     * so the flag also applies to the live worker.
+     */
+    async function setWorkerFlag(key: string, value: unknown): Promise<unknown> {
+        if (typeof key !== "string" || !key.startsWith("__")) {
+            throw new Error(`setWorkerFlag: refusing non-dunder flag '${String(key)}'`);
+        }
+        // Session-scoped store when this tab has a ?bs=<name>: localStorage is origin-wide,
+        // so a global flag would silently apply to every parallel agent's tab too.
+        const session = sessionFromLocation(window.location.search);
+        if (key === "__hostTools" && !session) {
+            throw new Error("setWorkerFlag('__hostTools', ...): a ?bs=<session> URL is required");
+        }
+        const store = session ? `bs_debug_flags:${session}` : "bs_debug_flags";
+        let persisted = false;
+        try {
+            const flags = JSON.parse(localStorage.getItem(store) || "{}");
+            if (value === undefined || value === null) delete flags[key]; else flags[key] = value;
+            localStorage.setItem(store, JSON.stringify(flags));
+            persisted = true;
+        } catch (e) {
+            // Fail LOUDLY: a silently-unpersisted flag is worse than no flag, because the
+            // A/B that follows looks like it ran.
+            throw new Error(`setWorkerFlag('${key}'): could not persist to localStorage ` +
+                `(${(e as Error).message}) — the flag would be lost by openWgb's reload, ` +
+                `so the A/B would measure the default path. Refusing.`);
+        }
+        const live = await rpc("setWorkerFlag", [key, value]);
+        return { ...(live as object), persisted, survivesReload: persisted, store };
+    }
+
+    /** Remove the complete session-scoped worker-flag envelope before a clean benchmark.
+     *  Clearing a hand-maintained flag list is not sufficient: a retired experiment can
+     *  remain in localStorage and silently make an otherwise empty arm non-reproducible.
+     *  The envelope alone is not sufficient either — the LIVE worker keeps every flag it
+     *  already applied — so the flags are dropped there too, and the result says which of
+     *  the two actually happened rather than claiming both. */
+    async function resetWorkerFlags(): Promise<unknown> {
+        const session = sessionFromLocation(window.location.search);
+        const store = session ? `bs_debug_flags:${session}` : "bs_debug_flags";
+        try {
+            localStorage.removeItem(store);
+        } catch (e) {
+            throw new Error(`resetWorkerFlags: could not clear localStorage ` +
+                `(${(e as Error).message}); refusing a contaminated clean arm`);
+        }
+        let clearedLive = false;
+        let liveCleared: string[] = [];
+        let liveError: string | null = null;
+        try {
+            const live = await rpc("resetWorkerFlags", [], { timeoutMs: 3000 }) as { cleared?: string[] };
+            liveCleared = Array.isArray(live?.cleared) ? live.cleared : [];
+            clearedLive = true;
+        } catch (e) {
+            liveError = (e as Error).message;
+        }
+        return { clearedStorage: true, clearedLive, liveCleared, liveError, survivesReload: true, store };
     }
 
     async function loadPe(url: string): Promise<unknown> {
@@ -230,6 +517,83 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         const loadDone = waitForWorkerMessage((m) => m?.type === "ready" || (m?.type === "loading_progress" && m.phase === "done"), 120_000);
         await w.loadApp(url);
         return { url, loaded: !!(await loadDone) };
+    }
+
+    /**
+     * What the host last PUBLISHED into the input SAB, plus the state that decides how
+     * a contact is translated. The guest-side view is `state(["input"])`; this is the
+     * other half — it answers "did the host even see that gesture" without a game loaded.
+     */
+    async function inputSab(): Promise<unknown> {
+        const view = getInputView?.();
+        if (!view) return { attached: false };
+        const keys: number[] = [];
+        for (let w = 0; w < KEY_BITFIELD_COUNT; w++) {
+            const bits = view[KEY_BITFIELD_BASE + w];
+            for (let b = 0; b < 32; b++) if (bits & (1 << b)) keys.push(w * 32 + b);
+        }
+        return {
+            attached: true,
+            seq: Atomics.load(view, INPUT_INDEX.seq),
+            mouse: {
+                x: view[INPUT_INDEX.mouseX],
+                y: view[INPUT_INDEX.mouseY],
+                buttons: view[INPUT_INDEX.buttons],
+                inside: view[INPUT_INDEX.mouseInside] !== 0,
+                wheel: view[INPUT_INDEX.mouseWheel],
+                dinputDX: view[INPUT_INDEX.dinputDX],
+                dinputDY: view[INPUT_INDEX.dinputDY],
+            },
+            keysDown: keys,
+            pad: {
+                connected: view[INPUT_INDEX.gamepadConnected] === 1,
+                buttons: view[INPUT_INDEX.gamepadButtons],
+                axes: [
+                    view[INPUT_INDEX.gamepadAxis0], view[INPUT_INDEX.gamepadAxis1],
+                    view[INPUT_INDEX.gamepadAxis2], view[INPUT_INDEX.gamepadAxis3],
+                ],
+            },
+            relativeIntent: { active: relativeIntent.get(), reasons: relativeIntent.reasons() },
+            pointerLocked: document.pointerLockElement !== null,
+            // Under Pointer Lock the OS pointer is hidden and the guest cursor is ours to
+            // draw; `drawn:false` while locked with a visible guest cursor = no pointer.
+            cursorOverlay: (window as any).__BS__?.cursorOverlay ?? { drawn: false },
+            maxTouchPoints: navigator.maxTouchPoints,
+        };
+    }
+
+    /* ── host input capture ───────────────────────────────────────────────────
+     * The HUMAN's mouse/keyboard reaches the guest through the page's SAB
+     * publication, not through applyInput — so the worker's present-serial
+     * recorder never sees manual play. These forward to the page recorder, which
+     * captures the published SAB record; that makes "play it once by hand" a
+     * re-runnable artifact instead of something only a person can reproduce.
+     * Samples are edge-recorded and level-applied, so a key held across many
+     * samples replays as held. */
+
+    async function hostRecord(): Promise<unknown> {
+        const start = (window as any).startRecording;
+        if (typeof start !== "function") throw new Error("host recorder unavailable (App not mounted)");
+        start();
+        return { recording: true };
+    }
+
+    async function hostRecordStop(): Promise<unknown> {
+        const stop = (window as any).stopRecording;
+        if (typeof stop !== "function") throw new Error("host recorder unavailable (App not mounted)");
+        const samples = stop() ?? [];
+        return { recording: false, samples, count: samples.length };
+    }
+
+    /** hostReplay(samples, {deterministic?}) — deterministic drives manual virtual
+     *  time from the sample stamps, so replay does not depend on host wall-clock. */
+    async function hostReplay(samples: unknown, opts?: { deterministic?: boolean }): Promise<unknown> {
+        const play = (window as any).playRecording;
+        if (typeof play !== "function") throw new Error("host replay unavailable (App not mounted)");
+        const list = Array.isArray(samples) ? samples : [];
+        if (!list.length) throw new Error("hostReplay: empty recording");
+        play(list, opts);
+        return { replaying: true, count: list.length, deterministic: opts?.deterministic ?? true };
     }
 
     async function audioGesture(): Promise<unknown> {
@@ -251,10 +615,21 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
     /* ─────────────────────── serialized step executor ───────────────────── */
 
     async function runOneStep(step: HarnessStep): Promise<unknown> {
+        if (step.cmd === "setWorkerFlag") return setWorkerFlag(step.args[0] as string, step.args[1]);
+        if (step.cmd === "resetWorkerFlags") return resetWorkerFlags();
         if (step.cmd === "openWgb") return openWgb(step.args[0] as string, step.args[1] as any);
         if (step.cmd === "loadPe") return loadPe(step.args[0] as string);
         if (step.cmd === "audioGesture") return audioGesture();
+        if (step.cmd === "inputSab") return inputSab();
+        if (step.cmd === "hostRecord") return hostRecord();
+        if (step.cmd === "hostRecordStop") return hostRecordStop();
+        if (step.cmd === "hostReplay") return hostReplay(step.args[0], step.args[1] as any);
         if (step.cmd === "waitForEvent") return waitForEvent(step.args[0] as string, step.args[1] as any);
+        if (step.cmd === "onModal") { onMessageBox((step.args[0] as string) ?? ".*", (step.args[1] as string | number) ?? "ok"); return { armed: true, pattern: step.args[0] ?? ".*" }; }
+        if (step.cmd === "clearModals") { clearModalAnswers(); return { cleared: true }; }
+        if (step.cmd === "dismissModal") return dismissModal((step.args[0] as number | string) ?? "ok", (step.args[1] as boolean) ?? true);
+        if (step.cmd === "report") return reportWithHost(step.args, step.opts);
+        if (step.cmd === "hostModals") return { modals: hostModalCensus() };
         // Predicate args (waitUntil) are pre-serialized as {__fn} — pass through;
         // the worker reconstructs and evaluates them in its own context.
         return rpc(step.cmd, step.args, step.opts);
@@ -296,8 +671,18 @@ export function installHarnessFacade(worker: Worker): HarnessFacade {
         openWgb,
         loadPe,
         audioGesture,
+        inputSab,
+        hostRecord,
+        hostRecordStop,
+        hostReplay,
         onMessageBox,
+        clearModalAnswers,
         autoModalReply,
+        setLiveModal,
+        dismissModal,
+        setHostModal,
+        hostModals: () => ({ modals: hostModalCensus() }),
+        report: (...args: unknown[]) => reportWithHost(args),
     };
 
     // Proxy so any worker command is callable as harness.<cmd>(...args) (like the

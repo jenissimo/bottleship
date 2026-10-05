@@ -8,8 +8,22 @@
 import { Logger, LogCategory } from "../../../core/logger";
 import { DDrawContext } from "../context";
 import { Direct3DLightObject, Direct3DMaterial3Object } from "../com-objects";
+import { bytesToGuid } from "../helpers";
+import { isValidAddress } from "../../../core/memory/address-guard";
+import {
+    IID_IDirect3DMaterial,
+    IID_IDirect3DMaterial2,
+    IID_IDirect3DMaterial3,
+} from "../constants";
+import { allocateComObject } from "../../../core/com/com-memory";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL } from "./types";
 import { D3DLight7Data, D3DMaterial7Data, D3DColorValue, D3DVector } from "./types";
+
+const E_NOINTERFACE = 0x80004002;
+const E_POINTER = 0x80004003;
+const E_FAIL = 0x80004005;
+const DDERR_ALREADYINITIALIZED = 0x88760005; // MAKE_DDHRESULT(5)
+const DDERR_UNSUPPORTED = 0x80004001; // ddraw.h: DDERR_UNSUPPORTED == E_NOTIMPL
 
 // ============================================================================
 // Helper: read/write D3DCOLORVALUE (16 bytes: r,g,b,a as f32)
@@ -74,6 +88,7 @@ const LIGHT2_OFF = {
 // D3DMATERIAL structure offsets (76 bytes)
 // ============================================================================
 // dwSize(0), diffuse(4..19), ambient(20..35), specular(36..51), emissive(52..67), power(68), hTexture(72)
+const MAT_SIZE = 76;
 const MAT_OFF = {
     dwSize: 0,
     diffuse: 4,       // D3DCOLORVALUE (16 bytes)
@@ -83,6 +98,9 @@ const MAT_OFF = {
     power: 68,
     hTexture: 72,
 };
+
+const readIid = (mem: Uint8Array, riidPtr: number): string =>
+    bytesToGuid(mem.slice(riidPtr, riidPtr + 16));
 
 export const createLightMaterialExports = (context: DDrawContext): D3DExports => {
     const exports: D3DExports = {};
@@ -94,16 +112,8 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
 
     exports["IDirect3DLight_QueryInterface"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        if (!obj) return 0x80004002;
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
-        return obj.queryInterface(iidBytes.reduce((s, b, i) => {
-            if (i === 4 || i === 6 || i === 8 || i === 10) s += "-";
-            s += b.toString(16).padStart(2, "0");
-            return s;
-        }, ""), ppvObject, mem);
+        if (!obj) return E_NOINTERFACE;
+        return obj.queryInterface(readIid(mem, args[1]), args[2], mem);
     };
 
     exports["IDirect3DLight_AddRef"] = (ctx, mem, args) => {
@@ -123,7 +133,9 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpLight = args[1];
 
-        if (!lpLight) return D3DERR_INVALIDCALL;
+        // Borrowed pointer: validate the whole struct once, then read it through a hoisted
+        // view (CLAUDE.md 3.1 — the check belongs at the boundary, not on every field).
+        if (!lpLight || !isValidAddress(mem, lpLight, LIGHT2_SIZE, "r")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DLightObject | null;
         if (!obj) return 0x80004002;
@@ -167,7 +179,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpLight = args[1];
 
-        if (!lpLight) return D3DERR_INVALIDCALL;
+        if (!lpLight || !isValidAddress(mem, lpLight, LIGHT2_SIZE, "rw")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DLightObject | null;
         if (!obj) return 0x80004002;
@@ -196,18 +208,62 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
     // IDirect3DMaterial3
     // ========================================================================
 
+    // The three material versions are NOT one vtable: v1 carries Initialize plus the
+    // Reserve/Unreserve tail (9 slots), v2/v3 are 6. So QI hands back a tear-off over
+    // the requested version's table, aliased to the same object — material data and the
+    // D3DMATERIALHANDLE must stay shared however the guest reached the material.
+    const materialTearOffs = new WeakMap<object, Map<string, number>>();
+    const materialVTableByIid: Record<string, string> = {
+        [IID_IDirect3DMaterial.toLowerCase()]: "IDirect3DMaterial",
+        [IID_IDirect3DMaterial2.toLowerCase()]: "IDirect3DMaterial2",
+        [IID_IDirect3DMaterial3.toLowerCase()]: "IDirect3DMaterial3",
+    };
+
     exports["IDirect3DMaterial3_QueryInterface"] = (ctx, mem, args) => {
-        const obj = resourceProvider.getComObjectByAddress(args[0]);
-        if (!obj) return 0x80004002;
-        const riidPtr = args[1];
+        const thisPtr = args[0];
         const ppvObject = args[2];
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
-        return obj.queryInterface(iidBytes.reduce((s, b, i) => {
-            if (i === 4 || i === 6 || i === 8 || i === 10) s += "-";
-            s += b.toString(16).padStart(2, "0");
-            return s;
-        }, ""), ppvObject, mem);
+        const obj = resourceProvider.getComObjectByAddress(thisPtr);
+        if (!obj) return E_NOINTERFACE;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
+        if (!args[1] || !isValidAddress(mem, args[1], 16, "r")) return E_POINTER;
+
+        const iidStr = readIid(mem, args[1]);
+        const vtableKey = materialVTableByIid[iidStr.replace(/[{}]/g, "").toLowerCase()];
+        if (!vtableKey) return obj.queryInterface(iidStr, ppvObject, mem);
+
+        const vtableAddr = context.vtables[vtableKey]?.address;
+        if (!vtableAddr) {
+            Logger.warn(LogCategory.COM, `IDirect3DMaterial_QueryInterface: no vtable for ${vtableKey}`);
+            return E_NOINTERFACE;
+        }
+
+        obj.addRef();
+        if (vtableAddr === obj.vtableAddress) {
+            new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(ppvObject, thisPtr, true);
+            return D3D_OK;
+        }
+
+        // One address per (material, version): QueryInterface is idempotent in COM and a
+        // game may compare the pointers it gets back, so a fresh block per call is wrong.
+        let cache = materialTearOffs.get(obj);
+        if (!cache) {
+            cache = new Map();
+            materialTearOffs.set(obj, cache);
+        }
+        let objAddr = cache.get(vtableKey) ?? 0;
+        if (!objAddr) {
+            objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
+            if (!objAddr) {
+                obj.release();
+                return E_FAIL;
+            }
+            cache.set(vtableKey, objAddr);
+            resourceProvider.mapAddressToHandle(objAddr, obj.handle);
+            Logger.log(LogCategory.COM,
+                `IDirect3DMaterial_QueryInterface -> ${vtableKey} at 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
+        }
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(ppvObject, objAddr, true);
+        return D3D_OK;
     };
 
     exports["IDirect3DMaterial3_AddRef"] = (ctx, mem, args) => {
@@ -225,7 +281,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpMat = args[1];
 
-        if (!lpMat) return D3DERR_INVALIDCALL;
+        if (!lpMat || !isValidAddress(mem, lpMat, MAT_SIZE, "r")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DMaterial3Object | null;
         if (!obj) return 0x80004002;
@@ -253,7 +309,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpMat = args[1];
 
-        if (!lpMat) return D3DERR_INVALIDCALL;
+        if (!lpMat || !isValidAddress(mem, lpMat, MAT_SIZE, "rw")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DMaterial3Object | null;
         if (!obj) return 0x80004002;
@@ -261,7 +317,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const data = obj.getMaterialData();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        view.setUint32(lpMat + MAT_OFF.dwSize, 76, true);
+        view.setUint32(lpMat + MAT_OFF.dwSize, MAT_SIZE, true);
         writeColorValue(view, lpMat + MAT_OFF.diffuse, data.diffuse);
         writeColorValue(view, lpMat + MAT_OFF.ambient, data.ambient);
         writeColorValue(view, lpMat + MAT_OFF.specular, data.specular);
@@ -276,7 +332,7 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         const thisPtr = args[0];
         const lpHandle = args[2];
 
-        if (!lpHandle) return D3DERR_INVALIDCALL;
+        if (!lpHandle || !isValidAddress(mem, lpHandle, 4, "rw")) return D3DERR_INVALIDCALL;
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DMaterial3Object | null;
         if (!obj) return 0x80004002;
@@ -289,6 +345,21 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
 
         return D3D_OK;
     };
+
+    // IDirect3DMaterial (v1) and IDirect3DMaterial2 — identical semantics; v1 sits one
+    // slot lower from Initialize on, which the descriptors already encode.
+    const materialSharedMethods = ["QueryInterface", "AddRef", "Release", "SetMaterial", "GetMaterial", "GetHandle"];
+    for (const method of materialSharedMethods) {
+        const m3key = `IDirect3DMaterial3_${method}`;
+        if (!exports[m3key]) continue;
+        exports[`IDirect3DMaterial_${method}`] = exports[m3key];
+        exports[`IDirect3DMaterial2_${method}`] = exports[m3key];
+    }
+    // Initialize on an already-created material is a legacy no-op (DDERR_ALREADYINITIALIZED).
+    exports["IDirect3DMaterial_Initialize"] = () => DDERR_ALREADYINITIALIZED;
+    // Reserve/Unreserve were never implemented by DirectX itself.
+    exports["IDirect3DMaterial_Reserve"] = () => DDERR_UNSUPPORTED;
+    exports["IDirect3DMaterial_Unreserve"] = () => DDERR_UNSUPPORTED;
 
     return exports;
 };

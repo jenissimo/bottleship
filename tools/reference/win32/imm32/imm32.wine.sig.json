@@ -1,0 +1,379 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.897Z",
+  "module": "imm32",
+  "functions": [
+    {
+      "name": "__wine_ime_wnd_proc",
+      "argCount": 5
+    },
+    {
+      "name": "CtfImmHideToolbarWnd",
+      "argCount": 0
+    },
+    {
+      "name": "CtfImmIsCiceroEnabled",
+      "argCount": 0
+    },
+    {
+      "name": "CtfImmRestoreToolbarWnd",
+      "argCount": 1
+    },
+    {
+      "name": "ImmActivateLayout",
+      "argCount": 1
+    },
+    {
+      "name": "ImmAssociateContext",
+      "argCount": 2
+    },
+    {
+      "name": "ImmAssociateContextEx",
+      "argCount": 3
+    },
+    {
+      "name": "ImmConfigureIMEA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmConfigureIMEW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmCreateContext",
+      "argCount": 0
+    },
+    {
+      "name": "ImmCreateIMCC",
+      "argCount": 1
+    },
+    {
+      "name": "ImmCreateSoftKeyboard",
+      "argCount": 4
+    },
+    {
+      "name": "ImmDestroyContext",
+      "argCount": 1
+    },
+    {
+      "name": "ImmDestroyIMCC",
+      "argCount": 1
+    },
+    {
+      "name": "ImmDestroySoftKeyboard",
+      "argCount": 1
+    },
+    {
+      "name": "ImmDisableIme",
+      "argCount": 1
+    },
+    {
+      "name": "ImmDisableIME",
+      "argCount": 1
+    },
+    {
+      "name": "ImmDisableLegacyIME",
+      "argCount": 0
+    },
+    {
+      "name": "ImmDisableTextFrameService",
+      "argCount": 1
+    },
+    {
+      "name": "ImmEnumInputContext",
+      "argCount": 3
+    },
+    {
+      "name": "ImmEnumRegisterWordA",
+      "argCount": 6
+    },
+    {
+      "name": "ImmEnumRegisterWordW",
+      "argCount": 6
+    },
+    {
+      "name": "ImmEscapeA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmEscapeW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmFreeLayout",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGenerateMessage",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetCandidateListA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetCandidateListCountA",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetCandidateListCountW",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetCandidateListW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetCandidateWindow",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetCompositionFontA",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetCompositionFontW",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetCompositionString",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetCompositionStringA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetCompositionStringW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetCompositionWindow",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetContext",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetConversionListA",
+      "argCount": 6
+    },
+    {
+      "name": "ImmGetConversionListW",
+      "argCount": 6
+    },
+    {
+      "name": "ImmGetConversionStatus",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetDefaultIMEWnd",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetDescriptionA",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetDescriptionW",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetGuideLineA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetGuideLineW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetHotKey",
+      "argCount": 4
+    },
+    {
+      "name": "ImmGetIMCCLockCount",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetIMCCSize",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetIMCLockCount",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetIMEFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetIMEFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetImeMenuItemsA",
+      "argCount": 6
+    },
+    {
+      "name": "ImmGetImeMenuItemsW",
+      "argCount": 6
+    },
+    {
+      "name": "ImmGetOpenStatus",
+      "argCount": 1
+    },
+    {
+      "name": "ImmGetProperty",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetRegisterWordStyleA",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetRegisterWordStyleW",
+      "argCount": 3
+    },
+    {
+      "name": "ImmGetStatusWindowPos",
+      "argCount": 2
+    },
+    {
+      "name": "ImmGetVirtualKey",
+      "argCount": 1
+    },
+    {
+      "name": "ImmInstallIMEA",
+      "argCount": 2
+    },
+    {
+      "name": "ImmInstallIMEW",
+      "argCount": 2
+    },
+    {
+      "name": "ImmIsIME",
+      "argCount": 1
+    },
+    {
+      "name": "ImmIsUIMessageA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmIsUIMessageW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmLoadIME",
+      "argCount": 1
+    },
+    {
+      "name": "ImmLockIMC",
+      "argCount": 1
+    },
+    {
+      "name": "ImmLockIMCC",
+      "argCount": 1
+    },
+    {
+      "name": "ImmNotifyIME",
+      "argCount": 4
+    },
+    {
+      "name": "ImmProcessKey",
+      "argCount": 5
+    },
+    {
+      "name": "ImmRegisterWordA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmRegisterWordW",
+      "argCount": 4
+    },
+    {
+      "name": "ImmReleaseContext",
+      "argCount": 2
+    },
+    {
+      "name": "ImmRequestMessageA",
+      "argCount": 3
+    },
+    {
+      "name": "ImmRequestMessageW",
+      "argCount": 3
+    },
+    {
+      "name": "ImmReSizeIMCC",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSetActiveContext",
+      "argCount": 3
+    },
+    {
+      "name": "ImmSetCandidateWindow",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSetCompositionFontA",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSetCompositionFontW",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSetCompositionStringA",
+      "argCount": 6
+    },
+    {
+      "name": "ImmSetCompositionStringW",
+      "argCount": 6
+    },
+    {
+      "name": "ImmSetCompositionWindow",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSetConversionStatus",
+      "argCount": 3
+    },
+    {
+      "name": "ImmSetOpenStatus",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSetStatusWindowPos",
+      "argCount": 2
+    },
+    {
+      "name": "ImmShowSoftKeyboard",
+      "argCount": 2
+    },
+    {
+      "name": "ImmSimulateHotKey",
+      "argCount": 2
+    },
+    {
+      "name": "ImmTranslateMessage",
+      "argCount": 4
+    },
+    {
+      "name": "ImmUnlockIMC",
+      "argCount": 1
+    },
+    {
+      "name": "ImmUnlockIMCC",
+      "argCount": 1
+    },
+    {
+      "name": "ImmUnregisterWordA",
+      "argCount": 4
+    },
+    {
+      "name": "ImmUnregisterWordW",
+      "argCount": 4
+    }
+  ]
+}

@@ -1,0 +1,851 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.879Z",
+  "module": "crypt32",
+  "functions": [
+    {
+      "name": "CertAddCertificateContextToStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertAddCertificateLinkToStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertAddCRLContextToStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertAddCTLContextToStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertAddEncodedCertificateToStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertAddEncodedCertificateToSystemStoreA",
+      "argCount": 3
+    },
+    {
+      "name": "CertAddEncodedCertificateToSystemStoreW",
+      "argCount": 3
+    },
+    {
+      "name": "CertAddEncodedCRLToStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertAddEncodedCTLToStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertAddEnhancedKeyUsageIdentifier",
+      "argCount": 2
+    },
+    {
+      "name": "CertAddSerializedElementToStore",
+      "argCount": 8
+    },
+    {
+      "name": "CertAddStoreToCollection",
+      "argCount": 4
+    },
+    {
+      "name": "CertAlgIdToOID",
+      "argCount": 1
+    },
+    {
+      "name": "CertCloseStore",
+      "argCount": 2
+    },
+    {
+      "name": "CertCompareCertificate",
+      "argCount": 3
+    },
+    {
+      "name": "CertCompareCertificateName",
+      "argCount": 3
+    },
+    {
+      "name": "CertCompareIntegerBlob",
+      "argCount": 2
+    },
+    {
+      "name": "CertComparePublicKeyInfo",
+      "argCount": 3
+    },
+    {
+      "name": "CertControlStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertCreateCertificateChainEngine",
+      "argCount": 2
+    },
+    {
+      "name": "CertCreateCertificateContext",
+      "argCount": 3
+    },
+    {
+      "name": "CertCreateContext",
+      "argCount": 6
+    },
+    {
+      "name": "CertCreateCRLContext",
+      "argCount": 3
+    },
+    {
+      "name": "CertCreateCTLContext",
+      "argCount": 3
+    },
+    {
+      "name": "CertCreateSelfSignCertificate",
+      "argCount": 8
+    },
+    {
+      "name": "CertDeleteCertificateFromStore",
+      "argCount": 1
+    },
+    {
+      "name": "CertDeleteCRLFromStore",
+      "argCount": 1
+    },
+    {
+      "name": "CertDeleteCTLFromStore",
+      "argCount": 1
+    },
+    {
+      "name": "CertDuplicateCertificateChain",
+      "argCount": 1
+    },
+    {
+      "name": "CertDuplicateCertificateContext",
+      "argCount": 1
+    },
+    {
+      "name": "CertDuplicateCRLContext",
+      "argCount": 1
+    },
+    {
+      "name": "CertDuplicateCTLContext",
+      "argCount": 1
+    },
+    {
+      "name": "CertDuplicateStore",
+      "argCount": 1
+    },
+    {
+      "name": "CertEnumCertificateContextProperties",
+      "argCount": 2
+    },
+    {
+      "name": "CertEnumCertificatesInStore",
+      "argCount": 2
+    },
+    {
+      "name": "CertEnumCRLContextProperties",
+      "argCount": 2
+    },
+    {
+      "name": "CertEnumCRLsInStore",
+      "argCount": 2
+    },
+    {
+      "name": "CertEnumCTLContextProperties",
+      "argCount": 2
+    },
+    {
+      "name": "CertEnumCTLsInStore",
+      "argCount": 2
+    },
+    {
+      "name": "CertEnumPhysicalStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertEnumSystemStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertFindAttribute",
+      "argCount": 3
+    },
+    {
+      "name": "CertFindCertificateInCRL",
+      "argCount": 5
+    },
+    {
+      "name": "CertFindCertificateInStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertFindChainInStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertFindCRLInStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertFindCTLInStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertFindExtension",
+      "argCount": 3
+    },
+    {
+      "name": "CertFindRDNAttr",
+      "argCount": 2
+    },
+    {
+      "name": "CertFreeCertificateChain",
+      "argCount": 1
+    },
+    {
+      "name": "CertFreeCertificateChainEngine",
+      "argCount": 1
+    },
+    {
+      "name": "CertFreeCertificateContext",
+      "argCount": 1
+    },
+    {
+      "name": "CertFreeCRLContext",
+      "argCount": 1
+    },
+    {
+      "name": "CertFreeCTLContext",
+      "argCount": 1
+    },
+    {
+      "name": "CertGetCertificateChain",
+      "argCount": 8
+    },
+    {
+      "name": "CertGetCertificateContextProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetCRLContextProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetCRLFromStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetCTLContextProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetEnhancedKeyUsage",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetIntendedKeyUsage",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetIssuerCertificateFromStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetNameStringA",
+      "argCount": 6
+    },
+    {
+      "name": "CertGetNameStringW",
+      "argCount": 6
+    },
+    {
+      "name": "CertGetPublicKeyLength",
+      "argCount": 2
+    },
+    {
+      "name": "CertGetStoreProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertGetSubjectCertificateFromStore",
+      "argCount": 3
+    },
+    {
+      "name": "CertGetValidUsages",
+      "argCount": 5
+    },
+    {
+      "name": "CertIsRDNAttrsInCertificateName",
+      "argCount": 4
+    },
+    {
+      "name": "CertIsValidCRLForCertificate",
+      "argCount": 4
+    },
+    {
+      "name": "CertNameToStrA",
+      "argCount": 5
+    },
+    {
+      "name": "CertNameToStrW",
+      "argCount": 5
+    },
+    {
+      "name": "CertOIDToAlgId",
+      "argCount": 1
+    },
+    {
+      "name": "CertOpenStore",
+      "argCount": 5
+    },
+    {
+      "name": "CertOpenSystemStoreA",
+      "argCount": 2
+    },
+    {
+      "name": "CertOpenSystemStoreW",
+      "argCount": 2
+    },
+    {
+      "name": "CertRDNValueToStrA",
+      "argCount": 4
+    },
+    {
+      "name": "CertRDNValueToStrW",
+      "argCount": 4
+    },
+    {
+      "name": "CertRegisterPhysicalStore",
+      "argCount": 5
+    },
+    {
+      "name": "CertRegisterSystemStore",
+      "argCount": 4
+    },
+    {
+      "name": "CertRemoveEnhancedKeyUsageIdentifier",
+      "argCount": 2
+    },
+    {
+      "name": "CertRemoveStoreFromCollection",
+      "argCount": 2
+    },
+    {
+      "name": "CertSaveStore",
+      "argCount": 6
+    },
+    {
+      "name": "CertSerializeCertificateStoreElement",
+      "argCount": 4
+    },
+    {
+      "name": "CertSerializeCRLStoreElement",
+      "argCount": 4
+    },
+    {
+      "name": "CertSerializeCTLStoreElement",
+      "argCount": 4
+    },
+    {
+      "name": "CertSetCertificateContextProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertSetCRLContextProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertSetCTLContextProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertSetEnhancedKeyUsage",
+      "argCount": 2
+    },
+    {
+      "name": "CertSetStoreProperty",
+      "argCount": 4
+    },
+    {
+      "name": "CertStrToNameA",
+      "argCount": 7
+    },
+    {
+      "name": "CertStrToNameW",
+      "argCount": 7
+    },
+    {
+      "name": "CertUnregisterPhysicalStore",
+      "argCount": 3
+    },
+    {
+      "name": "CertUnregisterSystemStore",
+      "argCount": 2
+    },
+    {
+      "name": "CertVerifyCertificateChainPolicy",
+      "argCount": 4
+    },
+    {
+      "name": "CertVerifyCRLRevocation",
+      "argCount": 4
+    },
+    {
+      "name": "CertVerifyCRLTimeValidity",
+      "argCount": 2
+    },
+    {
+      "name": "CertVerifyCTLUsage",
+      "argCount": 7
+    },
+    {
+      "name": "CertVerifyRevocation",
+      "argCount": 7
+    },
+    {
+      "name": "CertVerifySubjectCertificateContext",
+      "argCount": 3
+    },
+    {
+      "name": "CertVerifyTimeValidity",
+      "argCount": 2
+    },
+    {
+      "name": "CertVerifyValidityNesting",
+      "argCount": 2
+    },
+    {
+      "name": "CreateFileU",
+      "argCount": 7
+    },
+    {
+      "name": "CryptAcquireCertificatePrivateKey",
+      "argCount": 6
+    },
+    {
+      "name": "CryptAcquireContextU",
+      "argCount": 5
+    },
+    {
+      "name": "CryptBinaryToStringA",
+      "argCount": 5
+    },
+    {
+      "name": "CryptBinaryToStringW",
+      "argCount": 5
+    },
+    {
+      "name": "CryptDecodeObject",
+      "argCount": 7
+    },
+    {
+      "name": "CryptDecodeObjectEx",
+      "argCount": 8
+    },
+    {
+      "name": "CryptEncodeObject",
+      "argCount": 5
+    },
+    {
+      "name": "CryptEncodeObjectEx",
+      "argCount": 7
+    },
+    {
+      "name": "CryptEncryptMessage",
+      "argCount": 7
+    },
+    {
+      "name": "CryptEnumOIDInfo",
+      "argCount": 4
+    },
+    {
+      "name": "CryptExportPublicKeyInfo",
+      "argCount": 5
+    },
+    {
+      "name": "CryptExportPublicKeyInfoEx",
+      "argCount": 8
+    },
+    {
+      "name": "CryptFindCertificateKeyProvInfo",
+      "argCount": 3
+    },
+    {
+      "name": "CryptFindLocalizedName",
+      "argCount": 1
+    },
+    {
+      "name": "CryptFindOIDInfo",
+      "argCount": 3
+    },
+    {
+      "name": "CryptFormatObject",
+      "argCount": 9
+    },
+    {
+      "name": "CryptFreeOIDFunctionAddress",
+      "argCount": 2
+    },
+    {
+      "name": "CryptGetDefaultOIDDllList",
+      "argCount": 4
+    },
+    {
+      "name": "CryptGetDefaultOIDFunctionAddress",
+      "argCount": 6
+    },
+    {
+      "name": "CryptGetMessageCertificates",
+      "argCount": 5
+    },
+    {
+      "name": "CryptGetMessageSignerCount",
+      "argCount": 3
+    },
+    {
+      "name": "CryptGetOIDFunctionAddress",
+      "argCount": 6
+    },
+    {
+      "name": "CryptGetOIDFunctionValue",
+      "argCount": 7
+    },
+    {
+      "name": "CryptHashCertificate",
+      "argCount": 7
+    },
+    {
+      "name": "CryptHashCertificate2",
+      "argCount": 7
+    },
+    {
+      "name": "CryptHashMessage",
+      "argCount": 9
+    },
+    {
+      "name": "CryptHashPublicKeyInfo",
+      "argCount": 7
+    },
+    {
+      "name": "CryptHashToBeSigned",
+      "argCount": 6
+    },
+    {
+      "name": "CryptImportPublicKeyInfo",
+      "argCount": 4
+    },
+    {
+      "name": "CryptImportPublicKeyInfoEx",
+      "argCount": 7
+    },
+    {
+      "name": "CryptImportPublicKeyInfoEx2",
+      "argCount": 5
+    },
+    {
+      "name": "CryptInitOIDFunctionSet",
+      "argCount": 2
+    },
+    {
+      "name": "CryptInstallOIDFunctionAddress",
+      "argCount": 6
+    },
+    {
+      "name": "CryptMemAlloc",
+      "argCount": 1
+    },
+    {
+      "name": "CryptMemFree",
+      "argCount": 1
+    },
+    {
+      "name": "CryptMemRealloc",
+      "argCount": 2
+    },
+    {
+      "name": "CryptMsgClose",
+      "argCount": 1
+    },
+    {
+      "name": "CryptMsgControl",
+      "argCount": 4
+    },
+    {
+      "name": "CryptMsgDuplicate",
+      "argCount": 1
+    },
+    {
+      "name": "CryptMsgEncodeAndSignCTL",
+      "argCount": 6
+    },
+    {
+      "name": "CryptMsgGetAndVerifySigner",
+      "argCount": 6
+    },
+    {
+      "name": "CryptMsgGetParam",
+      "argCount": 5
+    },
+    {
+      "name": "CryptMsgOpenToDecode",
+      "argCount": 6
+    },
+    {
+      "name": "CryptMsgOpenToEncode",
+      "argCount": 6
+    },
+    {
+      "name": "CryptMsgSignCTL",
+      "argCount": 7
+    },
+    {
+      "name": "CryptMsgUpdate",
+      "argCount": 4
+    },
+    {
+      "name": "CryptMsgVerifyCountersignatureEncoded",
+      "argCount": 7
+    },
+    {
+      "name": "CryptMsgVerifyCountersignatureEncodedEx",
+      "argCount": 10
+    },
+    {
+      "name": "CryptProtectData",
+      "argCount": 7
+    },
+    {
+      "name": "CryptProtectMemory",
+      "argCount": 3
+    },
+    {
+      "name": "CryptQueryObject",
+      "argCount": 11
+    },
+    {
+      "name": "CryptRegisterDefaultOIDFunction",
+      "argCount": 4
+    },
+    {
+      "name": "CryptRegisterOIDFunction",
+      "argCount": 5
+    },
+    {
+      "name": "CryptRegisterOIDInfo",
+      "argCount": 2
+    },
+    {
+      "name": "CryptSetKeyIdentifierProperty",
+      "argCount": 6
+    },
+    {
+      "name": "CryptSetOIDFunctionValue",
+      "argCount": 7
+    },
+    {
+      "name": "CryptSignAndEncodeCertificate",
+      "argCount": 9
+    },
+    {
+      "name": "CryptSignCertificate",
+      "argCount": 9
+    },
+    {
+      "name": "CryptSignMessage",
+      "argCount": 7
+    },
+    {
+      "name": "CryptSIPAddProvider",
+      "argCount": 1
+    },
+    {
+      "name": "CryptSIPCreateIndirectData",
+      "argCount": 3
+    },
+    {
+      "name": "CryptSIPGetSignedDataMsg",
+      "argCount": 5
+    },
+    {
+      "name": "CryptSIPLoad",
+      "argCount": 3
+    },
+    {
+      "name": "CryptSIPPutSignedDataMsg",
+      "argCount": 5
+    },
+    {
+      "name": "CryptSIPRemoveProvider",
+      "argCount": 1
+    },
+    {
+      "name": "CryptSIPRemoveSignedDataMsg",
+      "argCount": 2
+    },
+    {
+      "name": "CryptSIPRetrieveSubjectGuid",
+      "argCount": 3
+    },
+    {
+      "name": "CryptSIPRetrieveSubjectGuidForCatalogFile",
+      "argCount": 3
+    },
+    {
+      "name": "CryptSIPVerifyIndirectData",
+      "argCount": 2
+    },
+    {
+      "name": "CryptStringToBinaryA",
+      "argCount": 7
+    },
+    {
+      "name": "CryptStringToBinaryW",
+      "argCount": 7
+    },
+    {
+      "name": "CryptUnprotectData",
+      "argCount": 7
+    },
+    {
+      "name": "CryptUnprotectMemory",
+      "argCount": 3
+    },
+    {
+      "name": "CryptUnregisterDefaultOIDFunction",
+      "argCount": 3
+    },
+    {
+      "name": "CryptUnregisterOIDFunction",
+      "argCount": 3
+    },
+    {
+      "name": "CryptUnregisterOIDInfo",
+      "argCount": 1
+    },
+    {
+      "name": "CryptVerifyCertificateSignature",
+      "argCount": 5
+    },
+    {
+      "name": "CryptVerifyCertificateSignatureEx",
+      "argCount": 8
+    },
+    {
+      "name": "CryptVerifyDetachedMessageHash",
+      "argCount": 8
+    },
+    {
+      "name": "CryptVerifyDetachedMessageSignature",
+      "argCount": 8
+    },
+    {
+      "name": "CryptVerifyMessageHash",
+      "argCount": 7
+    },
+    {
+      "name": "CryptVerifyMessageSignature",
+      "argCount": 7
+    },
+    {
+      "name": "I_CertUpdateStore",
+      "argCount": 4
+    },
+    {
+      "name": "I_CryptAllocTls",
+      "argCount": 0
+    },
+    {
+      "name": "I_CryptCreateLruCache",
+      "argCount": 2
+    },
+    {
+      "name": "I_CryptCreateLruEntry",
+      "argCount": 3
+    },
+    {
+      "name": "I_CryptDetachTls",
+      "argCount": 1
+    },
+    {
+      "name": "I_CryptFindLruEntry",
+      "argCount": 2
+    },
+    {
+      "name": "I_CryptFindLruEntryData",
+      "argCount": 3
+    },
+    {
+      "name": "I_CryptFlushLruCache",
+      "argCount": 3
+    },
+    {
+      "name": "I_CryptFreeLruCache",
+      "argCount": 3
+    },
+    {
+      "name": "I_CryptFreeTls",
+      "argCount": 2
+    },
+    {
+      "name": "I_CryptGetAsn1Decoder",
+      "argCount": 1
+    },
+    {
+      "name": "I_CryptGetAsn1Encoder",
+      "argCount": 1
+    },
+    {
+      "name": "I_CryptGetDefaultCryptProv",
+      "argCount": 1
+    },
+    {
+      "name": "I_CryptGetOssGlobal",
+      "argCount": 1
+    },
+    {
+      "name": "I_CryptGetTls",
+      "argCount": 1
+    },
+    {
+      "name": "I_CryptInstallAsn1Module",
+      "argCount": 3
+    },
+    {
+      "name": "I_CryptInstallOssGlobal",
+      "argCount": 3
+    },
+    {
+      "name": "I_CryptReadTrustedPublisherDWORDValueFromRegistry",
+      "argCount": 2
+    },
+    {
+      "name": "I_CryptSetTls",
+      "argCount": 2
+    },
+    {
+      "name": "I_CryptUninstallAsn1Module",
+      "argCount": 1
+    },
+    {
+      "name": "PFXExportCertStore",
+      "argCount": 4
+    },
+    {
+      "name": "PFXExportCertStoreEx",
+      "argCount": 5
+    },
+    {
+      "name": "PFXImportCertStore",
+      "argCount": 3
+    },
+    {
+      "name": "PFXIsPFXBlob",
+      "argCount": 1
+    },
+    {
+      "name": "PFXVerifyPassword",
+      "argCount": 3
+    }
+  ]
+}

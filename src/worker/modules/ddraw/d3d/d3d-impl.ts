@@ -3,9 +3,11 @@
  */
 import { Logger, LogCategory } from "../../../core/logger";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
+import { allocateComObject, COM_OBJECT_SIZE } from "../../../core/com/com-memory";
 import { Marshaler } from "../../../core/memory/marshaler";
 import { DDrawContext } from "../context";
 import { bytesToGuid } from "../helpers";
+import { resolveDDrawTearOff } from "../com-tearoff";
 import {
     IID_IDirect3DDevice3,
     IID_IDirect3DDevice3V5,
@@ -14,12 +16,21 @@ import {
     IID_IDirect3DLight,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
-    allocateComObject,
-    COM_OBJECT_SIZE,
     DDPF_ZBUFFER,
+    DDPF_STENCILBUFFER,
+    DDPIXELFORMAT_Z_OFFSETS,
 } from "../constants";
-import { Direct3DDevice3Object, Direct3DDevice7Object, Direct3DVertexBufferObject, Direct3DLightObject, Direct3DMaterial3Object } from "../com-objects";
-import { D3DExports, D3D_OK, D3DERR_INVALIDCALL } from "./types";
+import {
+    Direct3DDevice3Object,
+    Direct3DDevice7Object,
+    Direct3DVertexBufferObject,
+    Direct3DViewport3Object,
+    Direct3DLightObject,
+    Direct3DMaterial3Object,
+} from "../com-objects";
+import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, D3DColorValue } from "./types";
+import { processVertices } from "./process-vertices";
+import { D3DRENDERSTATE_LIGHTING } from "../constants";
 import {
     fillDeviceDesc,
     fillDeviceDesc7,
@@ -33,34 +44,105 @@ import {
 import { computeFvfStride } from "../../../backends/webgpu/ddraw/compute/vertex-converter";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { initReturnPtr } from "../../../backends/webgpu/shared/dx-com-helpers";
+import { isValidAddress } from "../../../core/memory/address-guard";
+
+/** D3DFINDDEVICERESULT: dwSize + GUID + two D3DDEVICEDESCs (252 each). */
+const FIND_DEVICE_RESULT_SIZE = 20 + 252 + 252;
+
+// ddraw.h aliases these onto the standard COM codes, not MAKE_DDHRESULT values.
+const DDERR_INVALIDPARAMS = 0x80070057; // E_INVALIDARG
+const DDERR_UNSUPPORTED = 0x80004001;   // E_NOTIMPL
+
+/** D3DCOLORVALUE (0..1 floats) -> D3DCOLOR (0xAARRGGBB), the FVF colour encoding. */
+const colorValueToArgb = (c?: D3DColorValue): number => {
+    if (!c) return 0xffffffff;
+    const q = (v: number) => Math.max(0, Math.min(255, Math.round(v * 255)));
+    return ((q(c.a) << 24) | (q(c.r) << 16) | (q(c.g) << 8) | q(c.b)) >>> 0;
+};
+
+/**
+ * Depth formats EnumZBufferFormats offers, in the order real drivers list them (wine
+ * ddraw.c d3d7_EnumZBufferFormats) — 16-bit first, because an app that accepts the first
+ * usable entry must not be pushed onto a 32-bit buffer it did not want.
+ *
+ * Only formats the ddraw executor's depth24plus-stencil8 attachment genuinely backs are
+ * listed. That leaves out S1_UINT_D15 and S4X4_UINT_D24, whose 1- and 4-bit stencils are a
+ * stencil width we do not have; D24S8 is in, and without it the stencil ops advertised in
+ * dwStencilCaps are unreachable, since a game can only get stencil by picking a format that
+ * carries it.
+ *
+ * dwZBufferBitDepth names the DEPTH, not the surface width — and drivers disagreed on it for
+ * X8D24: some said 24, some 32, and the pitch is a 32-bpp pitch either way. Vista and newer
+ * enumerate BOTH spellings (wine bug 22434), so the trailing entry repeats X8D24 with 24 for
+ * an app that only accepts a "24-bit" depth buffer. readPixelFormat is what keeps its surface
+ * 32 bpp wide.
+ */
+const Z_BUFFER_FORMATS: ReadonlyArray<{
+    bitDepth: number;
+    stencilBitDepth: number;
+    zBitMask: number;
+    stencilBitMask: number;
+}> = [
+    { bitDepth: 16, stencilBitDepth: 0, zBitMask: 0x0000ffff, stencilBitMask: 0x00000000 }, // D16
+    { bitDepth: 32, stencilBitDepth: 0, zBitMask: 0x00ffffff, stencilBitMask: 0x00000000 }, // X8D24
+    { bitDepth: 32, stencilBitDepth: 8, zBitMask: 0x00ffffff, stencilBitMask: 0xff000000 }, // D24S8
+    { bitDepth: 24, stencilBitDepth: 0, zBitMask: 0x00ffffff, stencilBitMask: 0x00000000 }, // X8D24, 24-bit spelling
+];
+
+/** dwZBitMask/dwStencilBitMask are union members over dwGBitMask/dwBBitMask — an app that
+ *  computes its DDBLT_DEPTHFILL value from dwZBitMask reads them there. */
+const writeZBufferFormat = (view: DataView, addr: number, index: number): void => {
+    const f = Z_BUFFER_FORMATS[index];
+    const O = DDPIXELFORMAT_Z_OFFSETS;
+    view.setUint32(addr + 4, f.stencilBitDepth ? DDPF_ZBUFFER | DDPF_STENCILBUFFER : DDPF_ZBUFFER, true);
+    view.setUint32(addr + O.zBufferBitDepth, f.bitDepth, true);
+    view.setUint32(addr + O.stencilBitDepth, f.stencilBitDepth, true);
+    view.setUint32(addr + O.zBitMask, f.zBitMask, true);
+    view.setUint32(addr + O.stencilBitMask, f.stencilBitMask, true);
+};
 
 export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => {
     const exports: D3DExports = {};
     const resourceProvider = context.resourceProvider;
 
-    // --- IDirect3D (v1) ---
-
-    exports["IDirect3D_QueryInterface"] = (ctx, mem, args) => {
+    /**
+     * IDirect3D* is an interface ON the DirectDraw object, so it must resolve the whole
+     * DirectDraw/Direct3D family — notably back to IDirectDraw7, which is how a DX7 app
+     * recovers the DirectDraw it needs to create texture surfaces (GetDirect3D, QI, Release).
+     */
+    const d3dQueryInterface = (iface: string, mem: Uint8Array, args: number[]): number => {
         const thisPtr = args[0];
         const riidPtr = args[1];
         const ppvObject = args[2];
+
         const obj = resourceProvider.getComObjectByAddress(thisPtr);
         const iidBytes = new Uint8Array(16);
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return 0x80004003;
         for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
         const iidStr = bytesToGuid(iidBytes);
-        Logger.log(LogCategory.COM, `IDirect3D_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr}`);
+
+        Logger.log(LogCategory.COM, `${iface}_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr} obj=${obj ? obj.constructor.name : "null"}`);
         if (!obj) return 0x80004002;
+        if (!ppvObject) return 0x80004003;
+
+        const tearOff = resolveDDrawTearOff(context, obj, iidStr.replace(/[{}]/g, "").toLowerCase(), ppvObject, mem);
+        if (tearOff !== null) return tearOff;
+
         return obj.queryInterface(iidStr, ppvObject, mem);
     };
 
+    // --- IDirect3D (v1) ---
+
+    exports["IDirect3D_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D", mem, args);
+
     exports["IDirect3D_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D_Initialize"] = () => D3D_OK;
@@ -69,12 +151,15 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         return exports["IDirect3D3_EnumDevices"]!(ctx, mem, args);
     };
 
-    exports["IDirect3D_CreateViewport"] = () => D3D_OK;
+    exports["IDirect3D_CreateViewport"] = (ctx, mem, args) => {
+        return exports["IDirect3D3_CreateViewport"]!(ctx, mem, args);
+    };
     exports["IDirect3D_CreateLight"] = (ctx, mem, args) => {
         return exports["IDirect3D3_CreateLight"]!(ctx, mem, args);
     };
+    // v1 gets the v1 material vtable — Material3's layout is one slot short (no Initialize).
     exports["IDirect3D_CreateMaterial"] = (ctx, mem, args) => {
-        return exports["IDirect3D3_CreateMaterial"]!(ctx, mem, args);
+        return createMaterial(mem, args[1], "IDirect3DMaterial");
     };
     exports["IDirect3D_FindDevice"] = (ctx, mem, args) => {
         return exports["IDirect3D3_FindDevice"]!(ctx, mem, args);
@@ -82,27 +167,16 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     // --- IDirect3D2 ---
 
-    exports["IDirect3D2_QueryInterface"] = (ctx, mem, args) => {
-        const thisPtr = args[0];
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-        const obj = resourceProvider.getComObjectByAddress(thisPtr);
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) iidBytes[i] = mem[riidPtr + i];
-        const iidStr = bytesToGuid(iidBytes);
-        Logger.log(LogCategory.COM, `IDirect3D2_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr}`);
-        if (!obj) return 0x80004002;
-        return obj.queryInterface(iidStr, ppvObject, mem);
-    };
+    exports["IDirect3D2_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D2", mem, args);
 
     exports["IDirect3D2_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D2_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D2_EnumDevices"] = (ctx, mem, args) => {
@@ -117,7 +191,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         // present the Device2 vtable layout to the guest.
         const lpDDS = args[2];
         const lplpD3DDevice = args[3];
-        if (!lplpD3DDevice) return 0x80004003;
+        // initReturnPtr writes through this pointer, so the guard has to precede it.
+        if (!lplpD3DDevice || !isValidAddress(mem, lplpD3DDevice, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpD3DDevice);
 
         const vtableAddr = context.vtables.IDirect3DDevice2?.address;
@@ -133,6 +208,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         obj.setParentD3(args[0]);
         obj.setRenderTarget(lpDDS);
+        // Device holds a reference on its render target from creation (released in destroy).
+        if (lpDDS) resourceProvider.getComObjectByAddress(lpDDS)?.addRef();
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -157,43 +234,16 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     // --- IDirect3D3 ---
 
-    exports["IDirect3D3_QueryInterface"] = (ctx, mem, args) => {
-        const thisPtr = args[0];
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-
-        const obj = resourceProvider.getComObjectByAddress(thisPtr);
-
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) {
-            iidBytes[i] = mem[riidPtr + i];
-        }
-        const iidStr = bytesToGuid(iidBytes);
-
-        Logger.log(LogCategory.COM, `IDirect3D3_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr} ppvObject=0x${ppvObject.toString(16)} obj=${obj ? obj.constructor.name : 'null'}`);
-
-        if (!obj) {
-            Logger.warn(LogCategory.COM, `IDirect3D3_QueryInterface: Object not found for thisPtr=0x${thisPtr.toString(16)}`);
-            return 0x80004002;
-        }
-
-        const result = obj.queryInterface(iidStr, ppvObject, mem);
-        if (ppvObject) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const returnedAddr = view.getUint32(ppvObject, true);
-            Logger.log(LogCategory.COM, `IDirect3D3_QueryInterface: result=0x${result.toString(16)} returnedAddr=0x${returnedAddr.toString(16)}`);
-        }
-        return result;
-    };
+    exports["IDirect3D3_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D3", mem, args);
 
     exports["IDirect3D3_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D3_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D3_CreateViewport"] = (ctx, mem, args) => {
@@ -201,7 +251,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const lplpViewport = args[1];
         Logger.log(LogCategory.SYSTEM, `IDirect3D3_CreateViewport called: this=0x${thisPtr.toString(16)}, out=0x${lplpViewport.toString(16)}`);
 
-        if (!lplpViewport) return 0x80004003;
+        if (!lplpViewport || !isValidAddress(mem, lplpViewport, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpViewport);
 
         const vtableAddr = context.vtables.IDirect3DViewport3?.address;
@@ -227,7 +277,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     exports["IDirect3D3_CreateDevice"] = (ctx, mem, args) => {
         const lpDDS = args[2];
         const lplpD3DDevice = args[3];
-        if (!lplpD3DDevice) return 0x80004003;
+        // initReturnPtr writes through this pointer, so the guard has to precede it.
+        if (!lplpD3DDevice || !isValidAddress(mem, lplpD3DDevice, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpD3DDevice);
 
         const vtableAddr = context.vtables.IDirect3DDevice3?.address;
@@ -238,6 +289,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         obj.setParentD3(args[0]);
         obj.setRenderTarget(lpDDS);
+        // Device holds a reference on its render target from creation (released in destroy).
+        if (lpDDS) resourceProvider.getComObjectByAddress(lpDDS)?.addRef();
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -259,12 +312,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         mem.fill(0, formatAddr, formatAddr + pixelFormatSize);
         view.setUint32(formatAddr, pixelFormatSize, true);
-        view.setUint32(formatAddr + 4, DDPF_ZBUFFER, true);
-        
-        // RE-VOLT FIX: Offer only 16-bit Z-Buffer
-        // Old games (1999 era) often crash if given 24/32-bit Z-buffer with 16-bit color depth
-        // 16-bit Z-buffer (DDBD_16) is the golden standard for that era
-        const depths = [16];
+        // IDirect3D3 and IDirect3D7 enumerate the SAME set — the interface version never
+        // changed which depth buffers the hardware had.
+        const depths = Z_BUFFER_FORMATS;
         let index = 0;
 
         const callbackManager = context.process.dispatcher.callbackManager;
@@ -277,21 +327,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
                 return;
             }
 
-            const depth = depths[index];
-            view.setUint32(formatAddr + 12, depth, true); // dwZBufferBitDepth
-            
-            // Offset 24: dwZBitMask, Offset 28: dwStencilBitMask
-            if (depth === 16) {
-                view.setUint32(formatAddr + 24, 0xFFFF, true);
-                view.setUint32(formatAddr + 28, 0x0000, true);
-            } else if (depth === 24) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x00000000, true);
-            } else if (depth === 32) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x000000FF, true);
-            }
-            
+            writeZBufferFormat(view, formatAddr, index);
             index++;
 
             const { callbackId } = callbackManager.invokeCallback(
@@ -451,7 +487,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     // IDirect3D3::CreateLight(this, lplpLight, pUnkOuter)
     exports["IDirect3D3_CreateLight"] = (ctx, mem, args) => {
         const lplpLight = args[1];
-        if (!lplpLight) return 0x80004003; // E_POINTER
+        if (!lplpLight || !isValidAddress(mem, lplpLight, 4, "rw")) return 0x80004003; // E_POINTER
         initReturnPtr(lplpLight);
 
         const vtableAddr = context.vtables.IDirect3DLight?.address;
@@ -473,14 +509,14 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
     };
 
     // IDirect3D3::CreateMaterial(this, lplpMaterial, pUnkOuter)
-    exports["IDirect3D3_CreateMaterial"] = (ctx, mem, args) => {
-        const lplpMaterial = args[1];
+    /** Shared by every IDirect3D*::CreateMaterial — only the vtable layout differs. */
+    const createMaterial = (mem: Uint8Array, lplpMaterial: number, vtableKey: "IDirect3DMaterial" | "IDirect3DMaterial3"): number => {
         if (!lplpMaterial) return 0x80004003; // E_POINTER
         initReturnPtr(lplpMaterial);
 
-        const vtableAddr = context.vtables.IDirect3DMaterial3?.address;
+        const vtableAddr = context.vtables[vtableKey]?.address;
         if (!vtableAddr) {
-            Logger.error(LogCategory.SYSTEM, `IDirect3D3_CreateMaterial: IDirect3DMaterial3 vtable not found!`);
+            Logger.error(LogCategory.SYSTEM, `CreateMaterial: ${vtableKey} vtable not found!`);
             return 0x80004002;
         }
 
@@ -495,8 +531,12 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         view.setUint32(lplpMaterial, objAddr, true);
         resourceProvider.mapAddressToHandle(objAddr, obj.handle);
 
-        Logger.log(LogCategory.SYSTEM, `IDirect3D3_CreateMaterial -> 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
+        Logger.log(LogCategory.SYSTEM, `CreateMaterial(${vtableKey}) -> 0x${objAddr.toString(16)} (handle=0x${obj.handle.toString(16)})`);
         return D3D_OK;
+    };
+
+    exports["IDirect3D3_CreateMaterial"] = (ctx, mem, args) => {
+        return createMaterial(mem, args[1], "IDirect3DMaterial3");
     };
 
     // IDirect3D3::FindDevice(this, lpD3DFDS, lpD3DFDR)
@@ -518,7 +558,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
                 `IDirect3D3_FindDevice: flags=0x${searchFlags.toString(16)} bHardware=${bHardware}`);
         }
 
-        // Fill result size
+        // The result carries two D3DDEVICEDESCs after a 20-byte head; validate the whole
+        // thing before the fills below start writing it.
+        if (!isValidAddress(mem, lpD3DFDR, FIND_DEVICE_RESULT_SIZE, "rw")) return 0x80004003;
         const resultSize = view.getUint32(lpD3DFDR, true);
         Logger.log(LogCategory.DDRAW, `IDirect3D3_FindDevice: resultSize=${resultSize}`);
 
@@ -582,7 +624,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         if (!obj) return 0x80004005;
 
         obj.setBufferInfo(dataPtr, dwFVF, dwNumVertices, dwCaps, vertexSize);
+        obj.setInterfaceVersion(3);
 
+        if (!isValidAddress(mem, lplpVB, 4, "rw")) return 0x80004003;
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpVB, objAddr, true);
         resourceProvider.mapAddressToHandle(objAddr, obj.handle);
@@ -619,27 +663,115 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
         if (!obj || !lplpData) return 0x80004003;
 
+        if (!lplpData || !isValidAddress(mem, lplpData, 4, "rw")) return 0x80004003;
+        if (lpdwSize && !isValidAddress(mem, lpdwSize, 4, "rw")) return 0x80004003;
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint32(lplpData, obj.getDataPtr(), true);
         if (lpdwSize) {
             view.setUint32(lpdwSize, obj.getNumVertices() * obj.getVertexSize(), true);
         }
+        obj.beginLock();
 
-        Logger.verbose(LogCategory.SYSTEM,
-            `IDirect3DVertexBuffer_Lock: this=0x${thisPtr.toString(16)} -> data=0x${obj.getDataPtr().toString(16)}`);
+        // Eager template + two toString(16) allocations, ~91x per frame, for a message that
+        // is almost never emitted. verboseLazy defers the whole thing behind the level check.
+        Logger.verboseLazy(LogCategory.SYSTEM,
+            () => `IDirect3DVertexBuffer_Lock: this=0x${thisPtr.toString(16)} -> data=0x${obj.getDataPtr().toString(16)}`);
         return D3D_OK;
     };
 
-    exports["IDirect3DVertexBuffer_Unlock"] = () => D3D_OK;
+    // Lock/Unlock bracket the guest's own writes into the buffer. The draw path reads the
+    // vertex bytes straight out of guest memory at submit time, so there is no host-side
+    // copy to flush here — what Unlock owes is the lock bookkeeping itself, so that a
+    // double Unlock or an Unlock of a foreign pointer is reported rather than swallowed.
+    exports["IDirect3DVertexBuffer_Unlock"] = (ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DVertexBufferObject | null;
+        if (!obj) return DDERR_INVALIDPARAMS;
+        obj.endLock();
+        return D3D_OK;
+    };
 
-    exports["IDirect3DVertexBuffer_ProcessVertices"] = () => D3D_OK;
+    /** Current world×view×projection + viewport + lighting inputs for either device version. */
+    const vertexPipelineState = (devAddr: number) => {
+        const dev = resourceProvider.getComObjectByAddress(devAddr) as
+            (Direct3DDevice3Object | Direct3DDevice7Object) | null;
+        if (!dev) return null;
+        const mvp = dev.getCachedMVP();
+        if (!mvp) return null;
+
+        let viewport: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number } | null = null;
+        // IDENTITY_CLIP_SPACE unless a legacy D3DVIEWPORT2 asked for a non-default clipping
+        // volume / depth range. D3DVIEWPORT7 (device-level SetViewport) has neither: its
+        // dvMinZ/dvMaxZ ARE the rasterizer range, so it keeps the identity remap.
+        let clipSpace = { sx: 1, sy: 1, sz: 1, ox: 0, oy: 0, oz: 0 };
+        if (dev instanceof Direct3DDevice7Object) {
+            viewport = dev.getViewportData();
+        } else {
+            const vpAddr = dev.getCurrentViewport();
+            const vpObj = vpAddr ? resourceProvider.getComObjectByAddress(vpAddr) as Direct3DViewport3Object | null : null;
+            if (vpObj) {
+                const v = vpObj.getViewport();
+                clipSpace = vpObj.getClipSpace();
+                // The remap already consumed dvMinZ/dvMaxZ; what remains for the rasterizer is [0,1].
+                viewport = { x: v.x, y: v.y, width: v.width, height: v.height, minZ: 0, maxZ: 1 };
+            }
+        }
+        if (!viewport || viewport.width <= 0 || viewport.height <= 0) {
+            viewport = { x: 0, y: 0, width: context.display.width || 640, height: context.display.height || 480, minZ: 0, maxZ: 1 };
+        }
+
+        const material = dev.getMaterial();
+        return {
+            mvp,
+            viewport,
+            clipSpace,
+            lightingRenderState: dev.getRenderState(D3DRENDERSTATE_LIGHTING) !== 0,
+            hasMaterial: dev.isMaterialSet(),
+            materialDiffuseArgb: colorValueToArgb(material?.diffuse),
+            materialSpecularArgb: colorValueToArgb(material?.specular),
+        };
+    };
+
+    // IDirect3DVertexBuffer::ProcessVertices(this, dwVertexOp, dwDestIndex, dwCount,
+    //                                        lpSrcBuffer, dwSrcIndex, lpD3DDevice, dwFlags)
+    // dwFlags (D3DPV_DONOTCOPYDATA) only asks to skip copying unchanged non-position data;
+    // copying it unconditionally is always a valid superset, so it is not branched on.
+    exports["IDirect3DVertexBuffer_ProcessVertices"] = (ctx, mem, args) => {
+        const dstObj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DVertexBufferObject | null;
+        const srcObj = resourceProvider.getComObjectByAddress(args[4]) as Direct3DVertexBufferObject | null;
+        if (!dstObj || !srcObj) return DDERR_INVALIDPARAMS;
+
+        const state = vertexPipelineState(args[6]);
+        if (!state) {
+            Logger.warn(LogCategory.DDRAW,
+                `IDirect3DVertexBuffer_ProcessVertices: no device state for 0x${args[6].toString(16)}`);
+            return D3DERR_INVALIDCALL;
+        }
+
+        return processVertices(mem, {
+            vertexOp: args[1] >>> 0,
+            destIndex: args[2] >>> 0,
+            srcIndex: args[5] >>> 0,
+            count: args[3] >>> 0,
+            dstAddr: dstObj.getDataPtr(),
+            dstFvf: dstObj.getFVF(),
+            dstStride: dstObj.getVertexSize(),
+            dstNumVertices: dstObj.getNumVertices(),
+            srcAddr: srcObj.getDataPtr(),
+            srcFvf: srcObj.getFVF(),
+            srcStride: srcObj.getVertexSize(),
+            srcNumVertices: srcObj.getNumVertices(),
+            // The DX6 buffer lights off the material; the DX7 one off D3DRENDERSTATE_LIGHTING.
+            legacyV3: dstObj.getInterfaceVersion() === 3,
+            ...state,
+        });
+    };
 
     exports["IDirect3DVertexBuffer_GetVertexBufferDesc"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lpDesc = args[1];
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
-        if (!obj || !lpDesc) return 0x80004003;
+        if (!obj || !lpDesc || !isValidAddress(mem, lpDesc, 16, "rw")) return 0x80004003;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint32(lpDesc + 0, 16, true);           // dwSize
@@ -652,52 +784,59 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
     exports["IDirect3DVertexBuffer_Optimize"] = () => D3D_OK;
 
+    // --- IDirect3DVertexBuffer7 ---
+    // Slots 0-7 are the DX6 buffer verbatim; only the ProcessVerticesStrided tail is new.
+    const vertexBuffer7SharedMethods = [
+        "QueryInterface", "AddRef", "Release", "Lock", "Unlock",
+        "ProcessVertices", "GetVertexBufferDesc", "Optimize",
+    ];
+    for (const method of vertexBuffer7SharedMethods) {
+        const v6key = `IDirect3DVertexBuffer_${method}`;
+        if (exports[v6key]) exports[`IDirect3DVertexBuffer7_${method}`] = exports[v6key];
+    }
+
+    // ProcessVerticesStrided(this, dwVertexOp, dwDestIndex, dwCount, lpStrideData,
+    //                        dwVertexTypeDesc, lpD3DDevice, dwFlags)
+    // Gathering the strided arrays is only half the contract — D3DVOP_TRANSFORM et al.
+    // must also run the FFP into the destination FVF, and we have no vertex-processing
+    // stage on this path. Report it unimplemented rather than returning D3D_OK over a
+    // destination buffer we never wrote.
+    exports["IDirect3DVertexBuffer7_ProcessVerticesStrided"] = (ctx, mem, args) => {
+        const thisPtr = args[0];
+        const dwDestIndex = args[2];
+        const dwCount = args[3];
+        const lpStrideData = args[4];
+
+        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DVertexBufferObject | null;
+        if (!obj || !lpStrideData) return DDERR_INVALIDPARAMS;
+        if (dwDestIndex + dwCount > obj.getNumVertices()) return DDERR_INVALIDPARAMS;
+
+        Logger.warn(LogCategory.SYSTEM,
+            `IDirect3DVertexBuffer7_ProcessVerticesStrided: op=0x${args[1].toString(16)} dest=${dwDestIndex} ` +
+            `count=${dwCount} fvf=0x${args[5].toString(16)} -> DDERR_UNSUPPORTED (no vertex-processing stage)`);
+        return DDERR_UNSUPPORTED;
+    };
+
     // --- IDirect3D7 ---
 
-    exports["IDirect3D7_QueryInterface"] = (ctx, mem, args) => {
-        const thisPtr = args[0];
-        const riidPtr = args[1];
-        const ppvObject = args[2];
-
-        const obj = resourceProvider.getComObjectByAddress(thisPtr);
-
-        const iidBytes = new Uint8Array(16);
-        for (let i = 0; i < 16; i++) {
-            iidBytes[i] = mem[riidPtr + i];
-        }
-        const iidStr = bytesToGuid(iidBytes);
-
-        Logger.log(LogCategory.COM, `IDirect3D7_QueryInterface: this=0x${thisPtr.toString(16)} iid=${iidStr} ppvObject=0x${ppvObject.toString(16)} obj=${obj ? obj.constructor.name : 'null'}`);
-
-        if (!obj) {
-            Logger.warn(LogCategory.COM, `IDirect3D7_QueryInterface: Object not found for thisPtr=0x${thisPtr.toString(16)}`);
-            return 0x80004002;
-        }
-
-        const result = obj.queryInterface(iidStr, ppvObject, mem);
-        if (ppvObject) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const returnedAddr = view.getUint32(ppvObject, true);
-            Logger.log(LogCategory.COM, `IDirect3D7_QueryInterface: result=0x${result.toString(16)} returnedAddr=0x${returnedAddr.toString(16)}`);
-        }
-        return result;
-    };
+    exports["IDirect3D7_QueryInterface"] = (ctx, mem, args) => d3dQueryInterface("IDirect3D7", mem, args);
 
     exports["IDirect3D7_AddRef"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirect3D7_Release"] = (ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirect3D7_CreateDevice"] = (ctx, mem, args) => {
         const rclsid = args[1];
         const lpDDS = args[2];
         const lplpD3DDevice = args[3];
-        if (!lplpD3DDevice) return 0x80004003;
+        // initReturnPtr writes through this pointer, so the guard has to precede it.
+        if (!lplpD3DDevice || !isValidAddress(mem, lplpD3DDevice, 4, "rw")) return 0x80004003;
         initReturnPtr(lplpD3DDevice);
 
         const vtableAddr = context.vtables.IDirect3DDevice7?.address;
@@ -715,6 +854,8 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
 
         obj.setParentD3(args[0]);
         if (lpDDS) obj.setRenderTarget(lpDDS);
+        // Device holds a reference on its render target from creation (released in destroy).
+        if (lpDDS) resourceProvider.getComObjectByAddress(lpDDS)?.addRef();
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -736,8 +877,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         mem.fill(0, formatAddr, formatAddr + pixelFormatSize);
         view.setUint32(formatAddr, pixelFormatSize, true);
-        view.setUint32(formatAddr + 4, DDPF_ZBUFFER, true);
-        const depths = [16, 24, 32];
+        const depths = Z_BUFFER_FORMATS;
         let index = 0;
 
         const callbackManager = context.process.dispatcher.callbackManager;
@@ -750,21 +890,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
                 return;
             }
 
-            const depth = depths[index];
-            view.setUint32(formatAddr + 12, depth, true); // dwZBufferBitDepth
-            
-            // Offset 24: dwZBitMask, Offset 28: dwStencilBitMask
-            if (depth === 16) {
-                view.setUint32(formatAddr + 24, 0xFFFF, true);
-                view.setUint32(formatAddr + 28, 0x0000, true);
-            } else if (depth === 24) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x00000000, true);
-            } else if (depth === 32) {
-                view.setUint32(formatAddr + 24, 0xFFFFFF00, true);
-                view.setUint32(formatAddr + 28, 0x000000FF, true);
-            }
-            
+            writeZBufferFormat(view, formatAddr, index);
             index++;
 
             const { callbackId } = callbackManager.invokeCallback(
@@ -957,10 +1083,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
             return 0x8876017c; // DDERR_OUTOFMEMORY
         }
 
-        // Reuse the DX6 IDirect3DVertexBuffer vtable — methods are identical
-        const vtableAddr = context.vtables.IDirect3DVertexBuffer?.address;
+        const vtableAddr = context.vtables.IDirect3DVertexBuffer7?.address;
         if (!vtableAddr) {
-            Logger.error(LogCategory.SYSTEM, `IDirect3D7_CreateVertexBuffer: no vtable for IDirect3DVertexBuffer`);
+            Logger.error(LogCategory.SYSTEM, `IDirect3D7_CreateVertexBuffer: no vtable for IDirect3DVertexBuffer7`);
             return 0x80004002;
         }
 
@@ -968,7 +1093,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         if (!obj) return 0x80004005;
 
         obj.setBufferInfo(dataPtr, dwFVF, dwNumVertices, dwCaps, vertexSize);
+        obj.setInterfaceVersion(7);
 
+        if (!isValidAddress(mem, lplpVB, 4, "rw")) return 0x80004003;
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpVB, objAddr, true);
         resourceProvider.mapAddressToHandle(objAddr, obj.handle);

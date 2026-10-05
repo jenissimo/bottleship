@@ -1,0 +1,1513 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.937Z",
+  "module": "setupapi",
+  "functions": [
+    {
+      "name": "AssertFail",
+      "argCount": 3
+    },
+    {
+      "name": "CaptureAndConvertAnsiArg",
+      "argCount": 2
+    },
+    {
+      "name": "CaptureStringArg",
+      "argCount": 2
+    },
+    {
+      "name": "CM_Connect_MachineA",
+      "argCount": 2
+    },
+    {
+      "name": "CM_Connect_MachineW",
+      "argCount": 2
+    },
+    {
+      "name": "CM_Create_DevNodeA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Create_DevNodeW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Disconnect_Machine",
+      "argCount": 1
+    },
+    {
+      "name": "CM_Enumerate_Classes",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Enumerate_Classes_Ex",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Enumerate_Enumerators_ExA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Enumerate_Enumerators_ExW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Enumerate_EnumeratorsA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Enumerate_EnumeratorsW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Child",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Get_Child_Ex",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Class_Key_Name_ExA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Class_Key_Name_ExW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Class_Key_NameA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Class_Key_NameW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Class_Registry_PropertyA",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Get_Class_Registry_PropertyW",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Get_Device_ID_ExA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_ID_ExW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_ID_List_ExA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_ID_List_ExW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_ID_List_Size_ExA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_ID_List_Size_ExW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_ID_List_SizeA",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Get_Device_ID_List_SizeW",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Get_Device_ID_ListA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_ID_ListW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_ID_Size",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Get_Device_ID_Size_Ex",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_IDA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_IDW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_Interface_AliasA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_Interface_AliasW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_Interface_List_ExA",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Get_Device_Interface_List_ExW",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Get_Device_Interface_List_Size_ExA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_Interface_List_Size_ExW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_Interface_List_SizeA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_Interface_List_SizeW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Device_Interface_ListA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Device_Interface_ListW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_DevNode_Property_ExW",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Get_DevNode_PropertyW",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Get_DevNode_Registry_Property_ExA",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Get_DevNode_Registry_Property_ExW",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Get_DevNode_Registry_PropertyA",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Get_DevNode_Registry_PropertyW",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Get_DevNode_Status",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_DevNode_Status_Ex",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Get_Parent",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Get_Parent_Ex",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Sibling",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Get_Sibling_Ex",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Get_Version",
+      "argCount": 0
+    },
+    {
+      "name": "CM_Locate_DevNode_ExA",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Locate_DevNode_ExW",
+      "argCount": 4
+    },
+    {
+      "name": "CM_Locate_DevNodeA",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Locate_DevNodeW",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Open_Class_Key_ExA",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Open_Class_Key_ExW",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Open_Class_KeyA",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Open_Class_KeyW",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Open_DevNode_Key",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Open_DevNode_Key_Ex",
+      "argCount": 7
+    },
+    {
+      "name": "CM_Reenumerate_DevNode",
+      "argCount": 2
+    },
+    {
+      "name": "CM_Reenumerate_DevNode_Ex",
+      "argCount": 3
+    },
+    {
+      "name": "CM_Request_Device_EjectA",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Request_Device_EjectW",
+      "argCount": 5
+    },
+    {
+      "name": "CM_Set_Class_Registry_PropertyA",
+      "argCount": 6
+    },
+    {
+      "name": "CM_Set_Class_Registry_PropertyW",
+      "argCount": 6
+    },
+    {
+      "name": "CMP_WaitNoPendingInstallEvents",
+      "argCount": 1
+    },
+    {
+      "name": "DelayedMove",
+      "argCount": 2
+    },
+    {
+      "name": "DoesUserHavePrivilege",
+      "argCount": 1
+    },
+    {
+      "name": "DriverStoreAddDriverPackageA",
+      "argCount": 6
+    },
+    {
+      "name": "DriverStoreAddDriverPackageW",
+      "argCount": 6
+    },
+    {
+      "name": "DriverStoreDeleteDriverPackageA",
+      "argCount": 3
+    },
+    {
+      "name": "DriverStoreDeleteDriverPackageW",
+      "argCount": 3
+    },
+    {
+      "name": "DriverStoreFindDriverPackageA",
+      "argCount": 7
+    },
+    {
+      "name": "DriverStoreFindDriverPackageW",
+      "argCount": 7
+    },
+    {
+      "name": "DuplicateString",
+      "argCount": 1
+    },
+    {
+      "name": "EnablePrivilege",
+      "argCount": 2
+    },
+    {
+      "name": "FileExists",
+      "argCount": 2
+    },
+    {
+      "name": "InstallCatalog",
+      "argCount": 3
+    },
+    {
+      "name": "InstallHinfSection",
+      "argCount": 4
+    },
+    {
+      "name": "InstallHinfSectionA",
+      "argCount": 4
+    },
+    {
+      "name": "InstallHinfSectionW",
+      "argCount": 4
+    },
+    {
+      "name": "IsUserAdmin",
+      "argCount": 0
+    },
+    {
+      "name": "MultiByteToUnicode",
+      "argCount": 2
+    },
+    {
+      "name": "MyFree",
+      "argCount": 1
+    },
+    {
+      "name": "MyMalloc",
+      "argCount": 1
+    },
+    {
+      "name": "MyRealloc",
+      "argCount": 2
+    },
+    {
+      "name": "OpenAndMapFileForRead",
+      "argCount": 5
+    },
+    {
+      "name": "pSetupFree",
+      "argCount": 1
+    },
+    {
+      "name": "pSetupGetField",
+      "argCount": 2
+    },
+    {
+      "name": "pSetupGetGlobalFlags",
+      "argCount": 0
+    },
+    {
+      "name": "pSetupGetQueueFlags",
+      "argCount": 1
+    },
+    {
+      "name": "pSetupInstallCatalog",
+      "argCount": 3
+    },
+    {
+      "name": "pSetupIsUserAdmin",
+      "argCount": 0
+    },
+    {
+      "name": "pSetupMalloc",
+      "argCount": 1
+    },
+    {
+      "name": "pSetupRealloc",
+      "argCount": 2
+    },
+    {
+      "name": "pSetupSetGlobalFlags",
+      "argCount": 1
+    },
+    {
+      "name": "pSetupSetQueueFlags",
+      "argCount": 2
+    },
+    {
+      "name": "pSetupStringTableAddString",
+      "argCount": 3
+    },
+    {
+      "name": "pSetupStringTableAddStringEx",
+      "argCount": 5
+    },
+    {
+      "name": "pSetupStringTableDestroy",
+      "argCount": 1
+    },
+    {
+      "name": "pSetupStringTableDuplicate",
+      "argCount": 1
+    },
+    {
+      "name": "pSetupStringTableGetExtraData",
+      "argCount": 4
+    },
+    {
+      "name": "pSetupStringTableInitialize",
+      "argCount": 0
+    },
+    {
+      "name": "pSetupStringTableInitializeEx",
+      "argCount": 2
+    },
+    {
+      "name": "pSetupStringTableLookUpString",
+      "argCount": 3
+    },
+    {
+      "name": "pSetupStringTableLookUpStringEx",
+      "argCount": 5
+    },
+    {
+      "name": "pSetupStringTableSetExtraData",
+      "argCount": 4
+    },
+    {
+      "name": "QueryRegistryValue",
+      "argCount": 5
+    },
+    {
+      "name": "RegistryDelnode",
+      "argCount": 2
+    },
+    {
+      "name": "RetreiveFileSecurity",
+      "argCount": 2
+    },
+    {
+      "name": "SetupAddInstallSectionToDiskSpaceListA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupAddToDiskSpaceListA",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetupAddToDiskSpaceListW",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetupAddToSourceListA",
+      "argCount": 2
+    },
+    {
+      "name": "SetupAddToSourceListW",
+      "argCount": 2
+    },
+    {
+      "name": "SetupCloseFileQueue",
+      "argCount": 1
+    },
+    {
+      "name": "SetupCloseInfFile",
+      "argCount": 1
+    },
+    {
+      "name": "SetupCloseLog",
+      "argCount": 0
+    },
+    {
+      "name": "SetupCommitFileQueue",
+      "argCount": 4
+    },
+    {
+      "name": "SetupCommitFileQueueA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupCommitFileQueueW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupCopyErrorA",
+      "argCount": 11
+    },
+    {
+      "name": "SetupCopyErrorW",
+      "argCount": 11
+    },
+    {
+      "name": "SetupCopyOEMInfA",
+      "argCount": 8
+    },
+    {
+      "name": "SetupCopyOEMInfW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupCreateDiskSpaceListA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupCreateDiskSpaceListW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDecompressOrCopyFileA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDecompressOrCopyFileW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDefaultQueueCallbackA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDefaultQueueCallbackW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDeleteErrorA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDeleteErrorW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDestroyDiskSpaceList",
+      "argCount": 1
+    },
+    {
+      "name": "SetupDiBuildClassInfoList",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiBuildClassInfoListExA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiBuildClassInfoListExW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiBuildDriverInfoList",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiCallClassInstaller",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiClassGuidsFromNameA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiClassGuidsFromNameExA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiClassGuidsFromNameExW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiClassGuidsFromNameW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiClassNameFromGuidA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiClassNameFromGuidExA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiClassNameFromGuidExW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiClassNameFromGuidW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiCreateDeviceInfoA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiCreateDeviceInfoList",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiCreateDeviceInfoListExA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiCreateDeviceInfoListExW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiCreateDeviceInfoW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiCreateDeviceInterfaceA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiCreateDeviceInterfaceRegKeyA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiCreateDeviceInterfaceRegKeyW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiCreateDeviceInterfaceW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiCreateDevRegKeyA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiCreateDevRegKeyW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiDeleteDeviceInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiDeleteDeviceInterfaceData",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiDeleteDeviceInterfaceRegKey",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiDeleteDevRegKey",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiDestroyClassImageList",
+      "argCount": 1
+    },
+    {
+      "name": "SetupDiDestroyDeviceInfoList",
+      "argCount": 1
+    },
+    {
+      "name": "SetupDiDestroyDriverInfoList",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiDrawMiniIcon",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiEnumDeviceInfo",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiEnumDeviceInterfaces",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiEnumDriverInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiEnumDriverInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiGetActualSectionToInstallA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetActualSectionToInstallExA",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetActualSectionToInstallExW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetActualSectionToInstallW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetClassBitmapIndex",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiGetClassDescriptionA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiGetClassDescriptionExA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetClassDescriptionExW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetClassDescriptionW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiGetClassDevsA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiGetClassDevsExA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiGetClassDevsExW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiGetClassDevsW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiGetClassImageIndex",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiGetClassImageList",
+      "argCount": 1
+    },
+    {
+      "name": "SetupDiGetClassRegistryPropertyW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetCustomDevicePropertyA",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetCustomDevicePropertyW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetDeviceInfoListDetailA",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiGetDeviceInfoListDetailW",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiGetDeviceInstallParamsA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiGetDeviceInstallParamsW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiGetDeviceInstanceIdA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiGetDeviceInstanceIdW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiGetDeviceInterfaceDetailA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetDeviceInterfaceDetailW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetDeviceInterfacePropertyKeys",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetDeviceInterfacePropertyW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetDevicePropertyKeys",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetDevicePropertyW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupDiGetDeviceRegistryPropertyA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiGetDeviceRegistryPropertyW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiGetDriverInfoDetailA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetDriverInfoDetailW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiGetINFClassA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiGetINFClassW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiGetSelectedDriverA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiGetSelectedDriverW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiInstallClassA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiInstallClassW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiInstallDevice",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiInstallDeviceInterfaces",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiInstallDriverFiles",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiLoadClassIcon",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiOpenClassRegKey",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiOpenClassRegKeyExA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiOpenClassRegKeyExW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiOpenDeviceInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiOpenDeviceInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiOpenDeviceInterfaceA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiOpenDeviceInterfaceRegKey",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiOpenDeviceInterfaceW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiOpenDevRegKey",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiRegisterCoDeviceInstallers",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiRegisterDeviceInfo",
+      "argCount": 6
+    },
+    {
+      "name": "SetupDiRemoveDevice",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiRemoveDeviceInterface",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiSelectBestCompatDrv",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDiSetClassInstallParamsA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiSetClassInstallParamsW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDiSetDeviceInstallParamsA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiSetDeviceInstallParamsW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupDiSetDeviceInterfacePropertyW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiSetDevicePropertyW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupDiSetDeviceRegistryPropertyA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiSetDeviceRegistryPropertyW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupDiSetSelectedDevice",
+      "argCount": 2
+    },
+    {
+      "name": "SetupDuplicateDiskSpaceListA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupDuplicateDiskSpaceListW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupEnumInfSectionsA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupEnumInfSectionsW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupFindFirstLineA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupFindFirstLineW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupFindNextLine",
+      "argCount": 2
+    },
+    {
+      "name": "SetupFindNextMatchLineA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupFindNextMatchLineW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupGetBinaryField",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetFieldCount",
+      "argCount": 1
+    },
+    {
+      "name": "SetupGetFileCompressionInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetFileCompressionInfoExA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupGetFileCompressionInfoExW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupGetFileCompressionInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetFileQueueCount",
+      "argCount": 3
+    },
+    {
+      "name": "SetupGetFileQueueFlags",
+      "argCount": 2
+    },
+    {
+      "name": "SetupGetInfDriverStoreLocationW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupGetInfFileListA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetInfFileListW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetInfInformationA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetInfInformationW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetIntField",
+      "argCount": 3
+    },
+    {
+      "name": "SetupGetLineByIndexA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupGetLineByIndexW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupGetLineCountA",
+      "argCount": 2
+    },
+    {
+      "name": "SetupGetLineCountW",
+      "argCount": 2
+    },
+    {
+      "name": "SetupGetLineTextA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupGetLineTextW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupGetMultiSzFieldA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetMultiSzFieldW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetNonInteractiveMode",
+      "argCount": 0
+    },
+    {
+      "name": "SetupGetSourceFileLocationA",
+      "argCount": 7
+    },
+    {
+      "name": "SetupGetSourceFileLocationW",
+      "argCount": 7
+    },
+    {
+      "name": "SetupGetSourceInfoA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupGetSourceInfoW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupGetStringFieldA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetStringFieldW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupGetTargetPathA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupGetTargetPathW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupInitDefaultQueueCallback",
+      "argCount": 1
+    },
+    {
+      "name": "SetupInitDefaultQueueCallbackEx",
+      "argCount": 5
+    },
+    {
+      "name": "SetupInitializeFileLogA",
+      "argCount": 2
+    },
+    {
+      "name": "SetupInitializeFileLogW",
+      "argCount": 2
+    },
+    {
+      "name": "SetupInstallFileA",
+      "argCount": 8
+    },
+    {
+      "name": "SetupInstallFileExA",
+      "argCount": 9
+    },
+    {
+      "name": "SetupInstallFileExW",
+      "argCount": 9
+    },
+    {
+      "name": "SetupInstallFilesFromInfSectionA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupInstallFilesFromInfSectionW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupInstallFileW",
+      "argCount": 8
+    },
+    {
+      "name": "SetupInstallFromInfSectionA",
+      "argCount": 11
+    },
+    {
+      "name": "SetupInstallFromInfSectionW",
+      "argCount": 11
+    },
+    {
+      "name": "SetupInstallServicesFromInfSectionA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupInstallServicesFromInfSectionW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupIterateCabinetA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupIterateCabinetW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupLogErrorA",
+      "argCount": 2
+    },
+    {
+      "name": "SetupLogErrorW",
+      "argCount": 2
+    },
+    {
+      "name": "SetupLogFileA",
+      "argCount": 9
+    },
+    {
+      "name": "SetupLogFileW",
+      "argCount": 9
+    },
+    {
+      "name": "SetupOpenAppendInfFileA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupOpenAppendInfFileW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupOpenFileQueue",
+      "argCount": 0
+    },
+    {
+      "name": "SetupOpenInfFileA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupOpenInfFileW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupOpenLog",
+      "argCount": 1
+    },
+    {
+      "name": "SetupOpenMasterInf",
+      "argCount": 0
+    },
+    {
+      "name": "SetupPromptForDiskA",
+      "argCount": 10
+    },
+    {
+      "name": "SetupPromptForDiskW",
+      "argCount": 10
+    },
+    {
+      "name": "SetupPromptReboot",
+      "argCount": 3
+    },
+    {
+      "name": "SetupQueryDrivesInDiskSpaceListA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueryDrivesInDiskSpaceListW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueryInfFileInformationA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupQueryInfFileInformationW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupQueryInfOriginalFileInformationA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueryInfOriginalFileInformationW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueryInfVersionInformationA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupQueryInfVersionInformationW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupQuerySpaceRequiredOnDriveA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupQuerySpaceRequiredOnDriveW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupQueueCopyA",
+      "argCount": 9
+    },
+    {
+      "name": "SetupQueueCopyIndirectA",
+      "argCount": 1
+    },
+    {
+      "name": "SetupQueueCopyIndirectW",
+      "argCount": 1
+    },
+    {
+      "name": "SetupQueueCopySectionA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupQueueCopySectionW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupQueueCopyW",
+      "argCount": 9
+    },
+    {
+      "name": "SetupQueueDefaultCopyA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupQueueDefaultCopyW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupQueueDeleteA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupQueueDeleteSectionA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueueDeleteSectionW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueueDeleteW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupQueueRenameA",
+      "argCount": 5
+    },
+    {
+      "name": "SetupQueueRenameSectionA",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueueRenameSectionW",
+      "argCount": 4
+    },
+    {
+      "name": "SetupQueueRenameW",
+      "argCount": 5
+    },
+    {
+      "name": "SetupRenameErrorA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupRenameErrorW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupScanFileQueueA",
+      "argCount": 6
+    },
+    {
+      "name": "SetupScanFileQueueW",
+      "argCount": 6
+    },
+    {
+      "name": "SetupSetDirectoryIdA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupSetDirectoryIdW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupSetFileQueueAlternatePlatformA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupSetFileQueueAlternatePlatformW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupSetFileQueueFlags",
+      "argCount": 3
+    },
+    {
+      "name": "SetupSetNonInteractiveMode",
+      "argCount": 1
+    },
+    {
+      "name": "SetupSetSourceListA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupSetSourceListW",
+      "argCount": 3
+    },
+    {
+      "name": "SetupTermDefaultQueueCallback",
+      "argCount": 1
+    },
+    {
+      "name": "SetupTerminateFileLog",
+      "argCount": 1
+    },
+    {
+      "name": "SetupUninstallOEMInfA",
+      "argCount": 3
+    },
+    {
+      "name": "SetupUninstallOEMInfW",
+      "argCount": 3
+    },
+    {
+      "name": "StampFileSecurity",
+      "argCount": 2
+    },
+    {
+      "name": "StringTableAddString",
+      "argCount": 3
+    },
+    {
+      "name": "StringTableAddStringEx",
+      "argCount": 5
+    },
+    {
+      "name": "StringTableDestroy",
+      "argCount": 1
+    },
+    {
+      "name": "StringTableDuplicate",
+      "argCount": 1
+    },
+    {
+      "name": "StringTableGetExtraData",
+      "argCount": 4
+    },
+    {
+      "name": "StringTableInitialize",
+      "argCount": 0
+    },
+    {
+      "name": "StringTableInitializeEx",
+      "argCount": 2
+    },
+    {
+      "name": "StringTableLookUpString",
+      "argCount": 3
+    },
+    {
+      "name": "StringTableLookUpStringEx",
+      "argCount": 5
+    },
+    {
+      "name": "StringTableSetExtraData",
+      "argCount": 4
+    },
+    {
+      "name": "StringTableStringFromId",
+      "argCount": 2
+    },
+    {
+      "name": "StringTableStringFromIdEx",
+      "argCount": 4
+    },
+    {
+      "name": "StringTableTrim",
+      "argCount": 1
+    },
+    {
+      "name": "TakeOwnershipOfFile",
+      "argCount": 1
+    },
+    {
+      "name": "UnicodeToMultiByte",
+      "argCount": 2
+    },
+    {
+      "name": "UnmapAndCloseFile",
+      "argCount": 3
+    }
+  ]
+}

@@ -1,5 +1,14 @@
-import { ModuleDescriptor, calculateStackCleanup } from "../api/types";
+import { ModuleDescriptor, UnimplementedReturn, calculateStackCleanup } from "../api/types";
 import { setupapiModule } from "../api/setupapi.api";
+import { hidModule } from "../api/hid.api";
+import { combaseModule } from "../api/combase.api";
+import { shcoreModule } from "../api/shcore.api";
+import { kernelbaseModule } from "../api/kernelbase.api";
+import { lgvidModule } from "../api/lgvid.api";
+import { oledlgModule } from "../api/oledlg.api";
+import { msiModule } from "../api/msi.api";
+import { xinput1_3Module } from "../api/xinput1_3.api";
+import { msvcp140Module } from "../api/msvcp140.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -24,6 +33,8 @@ export class APIRegistry {
     private callingConventionCache: Map<string, string> = new Map();
     /** baseName (dll:name without @N) -> full cache keys. For single-variant fallback and duplicate diagnostic. */
     private baseNameToKeys: Map<string, string[]> = new Map();
+    /** dll:func -> declared failure class, for exports that have no handler. */
+    private unimplementedReturnCache: Map<string, UnimplementedReturn> = new Map();
 
     private constructor() {
         this.loadFromApiFiles();
@@ -73,6 +84,15 @@ export class APIRegistry {
         // Static imports for modules added after the last Vite glob scan (import.meta.glob
         // is fixed at compile time — new *.api.ts files are invisible until rebuild).
         this.registerModule(setupapiModule);
+        this.registerModule(hidModule);
+        this.registerModule(combaseModule);
+        this.registerModule(shcoreModule);
+        this.registerModule(kernelbaseModule);
+        this.registerModule(lgvidModule);
+        this.registerModule(oledlgModule);
+        this.registerModule(msiModule);
+        this.registerModule(xinput1_3Module);
+        this.registerModule(msvcp140Module);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });
@@ -117,6 +137,7 @@ export class APIRegistry {
 
     private cacheFunction(moduleName: string, func: ModuleDescriptor["functions"][number]): void {
         const key = `${moduleName}:${func.name.toLowerCase()}`;
+        if (func.onUnimplemented) this.unimplementedReturnCache.set(key, func.onUnimplemented);
         const stackBytes = func.stackCleanupBytes ?? calculateStackCleanup(func.params);
         const dwordSlots = stackBytes >> 2;
         this.argCountCache.set(key, dwordSlots);
@@ -145,6 +166,8 @@ export class APIRegistry {
                     const methStackBytes = calculateStackCleanup(method.params);
                     this.argCountCache.set(key, methStackBytes >> 2);
                     this.callingConventionCache.set(key, method.callingConvention);
+                    // A vtable slot returns an HRESULT unless the descriptor says otherwise.
+                    this.unimplementedReturnCache.set(key, method.onUnimplemented ?? "hresult");
                 }
             }
         }
@@ -206,6 +229,28 @@ export class APIRegistry {
         }
 
         return undefined;
+    }
+
+    /**
+     * Re-point one export's RET N at what the DLL the BUNDLE SHIPS actually pops.
+     *
+     * A static descriptor cannot decide an ABI that differs per shipped build — Bink's
+     * `_BinkSetVolume@8` pops 8 up to SDK 1.0 and 12 from 1.5, under the one name — so
+     * the owning module reads the real DLL and reports it here. Must land BEFORE any
+     * stub for that export is generated: the RET N is emitted into guest code, so a
+     * later correction cannot reach a stub the guest already holds.
+     *
+     * Argument count moves with it. `cacheFunction` derives BOTH from one number
+     * (`dwordSlots = stackBytes >> 2`), so they are one fact in two spellings — and the
+     * readers that consume them together would otherwise disagree with themselves:
+     * `exception-context-dumper` computes `stackCleanupBytes ?? argCount * 4` to decide
+     * whether a stub's RET N is wrong, and would call the corrected stub the broken one.
+     */
+    public overrideStackCleanupBytes(dllName: string, functionName: string, stackBytes: number): void {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const key = `${dll}:${functionName.toLowerCase()}`;
+        this.stackCleanupCache.set(key, stackBytes);
+        this.argCountCache.set(key, stackBytes >> 2);
     }
 
     /**
@@ -296,23 +341,32 @@ export class APIRegistry {
      */
     public getArgCountByOrdinal(dllName: string, ordinal: number): number | undefined {
         const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const ordName = `ord_${ordinal}`.toLowerCase();
         const module = this.modules.get(dll);
-        if (!module) return undefined;
 
         // First try to find by ordinal
-        const func = module.functions.find(f => f.ordinal === ordinal);
+        const func = module?.functions.find(f => f.ordinal === ordinal);
         if (func) {
             return calculateStackCleanup(func.params) >> 2;
         }
 
         // Fallback: try to find by name "ord_${ordinal}"
-        const ordName = `ord_${ordinal}`.toLowerCase();
-        const funcByName = module.functions.find(f => f.name.toLowerCase() === ordName);
+        const funcByName = module?.functions.find(f => f.name.toLowerCase() === ordName);
         if (funcByName) {
             return calculateStackCleanup(funcByName.params) >> 2;
         }
 
-        return undefined;
+        // The win32 reference, which the descriptor sweep above cannot see. An import
+        // table that names nothing but ordinals (oleaut32, shlwapi, mfc) otherwise binds
+        // only the slots a descriptor happens to spell out, and one unlisted ordinal
+        // fails the whole PE load — the reference knows the arity for all of them.
+        return this.argCountCache.get(`${dll}:${ordName}`);
+    }
+
+    /** Resolve an imported ordinal to its canonical exported name, if declared. */
+    public getFunctionNameByOrdinal(dllName: string, ordinal: number): string | undefined {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        return this.modules.get(dll)?.functions.find(f => f.ordinal === ordinal)?.name;
     }
 
     /**
@@ -344,5 +398,40 @@ export class APIRegistry {
         if (!mod?.functions?.length) return false;
         const func = functionName.toLowerCase();
         return mod.functions.some((f) => f.name.toLowerCase() === func);
+    }
+
+    /**
+     * Declared failure class for a name with no handler. Undefined ⇒ the caller applies
+     * the default (see unimplemented-return.ts); this returns only what a descriptor said.
+     * A COM vtable slot arrives here as "module:iface_method" and is always answered.
+     */
+    public getUnimplementedReturnClass(dllName: string, functionName: string): UnimplementedReturn | undefined {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const func = functionName.toLowerCase();
+        const exact = this.unimplementedReturnCache.get(`${dll}:${func}`);
+        if (exact) return exact;
+        // Same undecoration the argCount lookup uses: an IAT name may carry _Foo@8.
+        const undecorated = func.replace(/^_+/, "").replace(/@\d+$/, "");
+        if (undecorated !== func) {
+            const hit = this.unimplementedReturnCache.get(`${dll}:${undecorated}`);
+            if (hit) return hit;
+        }
+        return undefined;
+    }
+
+    /** True when this module, rather than some other descriptor, owns the function signature. */
+    public hasModuleFunctionSignature(dllName: string, functionName: string): boolean {
+        const dll = dllName.toLowerCase().replace(/\.dll$/, "");
+        const func = functionName.toLowerCase();
+        if (this.argCountCache.has(`${dll}:${func}`)) return true;
+
+        const baseName = functionName.replace(/[WA]$/, "").toLowerCase();
+        if (this.argCountCache.has(`${dll}:${baseName}`)) return true;
+
+        if (!/@\d+$/i.test(functionName)) {
+            if (this.baseNameToKeys.get(`${dll}:${func}`)?.length === 1) return true;
+            if (this.baseNameToKeys.get(`${dll}:_${func}`)?.length === 1) return true;
+        }
+        return false;
     }
 }

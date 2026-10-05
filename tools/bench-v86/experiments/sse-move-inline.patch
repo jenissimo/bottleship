@@ -1,0 +1,29 @@
+diff --git a/src/rust/jit_instructions.rs b/src/rust/jit_instructions.rs
+index 385d9d4..78f80d4 100644
+--- a/src/rust/jit_instructions.rs
++++ b/src/rust/jit_instructions.rs
+@@ -6133,13 +6133,21 @@ pub fn instr_660F15_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+ }
+ 
+ pub fn instr_0F16_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+-    sse_read64_xmm_mem(ctx, "instr_0F16", modrm_byte, r);
++    // Same faulting read as the helper path; write only the high 64 bits after it succeeds.
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r) as i32 + 8);
++    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
++    ctx.builder.store_aligned_i64(0);
+ }
+ pub fn instr_0F16_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+-    sse_read64_xmm_xmm(ctx, "instr_0F16", r1, r2);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r2) as i32 + 8);
++    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
++    ctx.builder.load_aligned_i64(0);
++    ctx.builder.store_aligned_i64(0);
+ }
+ pub fn instr_660F16_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+-    sse_read64_xmm_mem(ctx, "instr_0F16", modrm_byte, r);
++    instr_0F16_mem_jit(ctx, modrm_byte, r);
+ }
+ pub fn instr_660F16_reg_jit(ctx: &mut JitContext, _r1: u32, _r2: u32) {
+     codegen::gen_trigger_ud(ctx);

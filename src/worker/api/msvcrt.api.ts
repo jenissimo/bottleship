@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -29,9 +30,121 @@ const makeThiscall = (
     ...overrides,
 });
 
+/**
+ * The entry points MSVC 2015+ ADDED when it split the CRT into
+ * api-ms-win-crt-* + ucrtbase + vcruntime140 (all of which alias to this module — see
+ * dll-aliases UCRT_APISET/UCRT_RUNTIME). Everything else that family exports kept its
+ * name and its shape and is already declared below.
+ *
+ * All __cdecl. The `__stdio_common_*` family leads with `unsigned __int64 options`,
+ * which occupies TWO stack slots — spelled `u64` so calculateStackCleanup sizes it,
+ * never as two u32 params.
+ */
+const ucrtFunctions: FunctionDescriptor[] = [
+    // --- api-ms-win-crt-runtime: startup, atexit, the __scrt SEH filters ---
+    makeFunc("_c_exit", 0, { returnType: "void" }),
+    makeFunc("_configure_narrow_argv", 1),
+    makeFunc("_initialize_narrow_environment", 0),
+    makeFunc("_get_narrow_winmain_command_line", 0),
+    makeFunc("_set_app_type", 1, { returnType: "void" }),
+    makeFunc("_crt_atexit", 1),
+    makeFunc("_crt_at_quick_exit", 1),
+    makeFunc("_initialize_onexit_table", 1),
+    makeFunc("_register_onexit_function", 2),
+    makeFunc("_execute_onexit_table", 1),
+    makeFunc("_register_thread_local_exe_atexit_callback", 1, { returnType: "void" }),
+    makeFunc("_invalid_parameter_noinfo_noreturn", 0, { returnType: "void" }),
+    makeFunc("_seh_filter_exe", 2),
+    makeFunc("_seh_filter_dll", 2),
+    makeFunc("terminate", 0, { returnType: "void" }),
+
+    // --- api-ms-win-crt-math ---
+    makeFunc("_CIsinh", 0),
+    makeFunc("_CIcosh", 0),
+    makeFunc("_CItanh", 0),
+    // double _except1(DWORD fpe, int op, double arg, double res, DWORD cw, void *unk)
+    makeFunc("_except1", 0, {
+        returnType: "f64",
+        params: [
+            { name: "fpe", type: "u32" }, { name: "op", type: "u32" },
+            { name: "arg", type: "f64" }, { name: "res", type: "f64" },
+            { name: "cw", type: "u32" }, { name: "unk", type: "ptr" },
+        ],
+    }),
+    makeFunc("_fpclass", 0, { params: [{ name: "x", type: "f64" }] }),
+    // The /arch:SSE2 math entry points: operands and result live in XMM0/XMM1, so the
+    // stack frame is EMPTY and the stub must pop nothing.
+    makeFunc("_libm_sse2_acos_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_atan_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_cos_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_exp_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_log_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_pow_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_sin_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_sqrt_precise", 0, { returnType: "void" }),
+    makeFunc("_libm_sse2_tan_precise", 0, { returnType: "void" }),
+
+    // --- api-ms-win-crt-stdio ---
+    makeFunc("__acrt_iob_func", 1),
+    makeFunc("_set_fmode", 1),
+    makeFunc("__stdio_common_vsprintf", 0, {
+        params: [
+            { name: "options", type: "u64" }, { name: "buffer", type: "ptr" },
+            { name: "len", type: "u32" }, { name: "format", type: "ptr" },
+            { name: "locale", type: "ptr" }, { name: "arglist", type: "ptr" },
+        ],
+    }),
+    makeFunc("__stdio_common_vswprintf", 0, {
+        params: [
+            { name: "options", type: "u64" }, { name: "buffer", type: "ptr" },
+            { name: "len", type: "u32" }, { name: "format", type: "ptr" },
+            { name: "locale", type: "ptr" }, { name: "arglist", type: "ptr" },
+        ],
+    }),
+    makeFunc("__stdio_common_vfprintf", 0, {
+        params: [
+            { name: "options", type: "u64" }, { name: "stream", type: "ptr" },
+            { name: "format", type: "ptr" }, { name: "locale", type: "ptr" },
+            { name: "arglist", type: "ptr" },
+        ],
+    }),
+    makeFunc("__stdio_common_vsscanf", 0, {
+        params: [
+            { name: "options", type: "u64" }, { name: "input", type: "ptr" },
+            { name: "len", type: "u32" }, { name: "format", type: "ptr" },
+            { name: "locale", type: "ptr" }, { name: "arglist", type: "ptr" },
+        ],
+    }),
+    makeFunc("__stdio_common_vswscanf", 0, {
+        params: [
+            { name: "options", type: "u64" }, { name: "input", type: "ptr" },
+            { name: "len", type: "u32" }, { name: "format", type: "ptr" },
+            { name: "locale", type: "ptr" }, { name: "arglist", type: "ptr" },
+        ],
+    }),
+
+    // --- api-ms-win-crt-heap ---
+    makeFunc("_callnewh", 1),
+    makeFunc("_set_new_mode", 1),
+    makeFunc("_recalloc", 3),
+
+    // --- api-ms-win-crt-time: the _time64_t forms are what VS2015+ links by default ---
+    makeFunc("_gmtime64", 1),
+    makeFunc("_mktime64", 1),
+    makeFunc("_utime64", 2),
+
+    // --- vcruntime140 ---
+    makeFunc("__CxxFrameHandler3", 4),
+    makeFunc("__std_exception_copy", 2, { returnType: "void" }),
+    makeFunc("__std_exception_destroy", 1, { returnType: "void" }),
+    makeFunc("__std_terminate", 0, { returnType: "void" }),
+    makeFunc("__std_type_info_destroy_list", 1, { returnType: "void" }),
+];
+
 export const msvcrtModule: ModuleDescriptor = {
     name: "msvcrt",
     functions: [
+        ...ucrtFunctions,
         makeFunc("malloc", 1),
         makeFunc("_malloc_dbg", 4),
         makeFunc("_malloc", 1),
@@ -61,6 +174,38 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_strnicmp", 3),
         makeFunc("strchr", 2),
         makeFunc("strrchr", 2),
+        // --- msvcr80 (VC8) additions. A 2005-era image imports these BY NAME, so a missing
+        // declaration is not a missing feature: the import cannot be bound and the whole
+        // image fails to load. The 64-bit values occupy two stack slots each.
+        makeFunc("wcsrchr", 2),
+        makeFunc("strcoll", 2),
+        makeFunc("towlower", 1),
+        makeFunc("towupper", 1),
+        makeFunc("iswalnum", 1),
+        makeFunc("_itow", 3),
+        makeFunc("_i64toa", 4),
+        makeFunc("_ui64toa", 4),
+        makeFunc("_i64tow", 4),
+        makeFunc("_strtoui64", 3),
+        makeFunc("_strtoi64", 3),
+        makeFunc("strcpy_s", 3),
+        makeFunc("strcat_s", 3),
+        makeFunc("strtok_s", 3),
+        makeFunc("vsprintf_s", 4),
+        makeFunc("sscanf_s", 16),
+        makeFunc("_aligned_malloc", 2),
+        makeFunc("_aligned_free", 1, { returnType: "void" }),
+        makeFunc("_aligned_realloc", 3),
+        makeFunc("_fpreset", 0, { returnType: "void" }),
+        makeFunc("_statusfp", 0),
+        makeFunc("_set_SSE2_enable", 1),
+        makeFunc("__iob_func", 0),
+        makeFunc("freopen", 3),
+        makeFunc("tmpnam", 1),
+        makeFunc("system", 1),
+        makeFunc("_mkgmtime", 1),
+        makeFunc("_mkgmtime64", 1),
+        makeFunc("_difftime64", 4, { returnType: "f64" }),
         makeFunc("_strlwr", 1),
         makeFunc("_strdup", 1),
         makeFunc("sprintf", 16),
@@ -119,6 +264,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_control87", 2),
         makeFunc("_clearfp", 0),
         makeFunc("_onexit", 1),
+        makeFunc("atexit", 1),
         makeFunc("__dllonexit", 3),
         makeFunc("_except_handler3", 4),
         makeFunc("_XcptFilter", 2),
@@ -158,9 +304,12 @@ export const msvcrtModule: ModuleDescriptor = {
         makeThiscall("??1type_info@@UAE@XZ", 0),
         makeThiscall("??8type_info@@QBEHABV0@@Z", 4),
         makeThiscall("?name@type_info@@QBEPBDXZ", 0),
+        makeThiscall("?raw_name@type_info@@QBEPBDXZ", 0),
         makeFunc("_open", 2),
         makeFunc("_sopen", 4),
         makeFunc("_close", 1),
+        makeFunc("_chsize", 2),
+        makeFunc("_chsize_s", 3),   // fd + __int64 size (two stack dwords)
         makeFunc("_read", 3),
         makeFunc("_write", 3),
         makeFunc("_lseek", 3),
@@ -181,6 +330,10 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_findfirst", 2),
         makeFunc("_findnext", 2),
         makeFunc("qsort", 4),
+        // Both resolve to native x86 (registerDataExport) so the guest comparator is called
+        // in guest space — but a data export only replaces a stub the descriptor asked for,
+        // so an undeclared name has no IAT entry to redirect and the native code is dead.
+        makeFunc("bsearch", 5),
         makeFunc("getenv", 1),
         makeFunc("_putenv", 1),
         makeFunc("_wputenv", 1),
@@ -193,6 +346,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_strupr", 1),
         makeFunc("strtok", 2),
         makeFunc("memcmp", 3),
+        makeFunc("_memicmp", 3),
 
         // Conversion functions
         makeFunc("strtol", 3),
@@ -207,6 +361,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("wcstombs", 3),
         makeFunc("wctomb", 2),
         makeFunc("setlocale", 2),
+        makeFunc("localeconv", 0),
 
         // Formatted output
         makeFunc("_vsnprintf", 4),
@@ -243,6 +398,9 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("atan", 2),
         makeFunc("atan2", 4),
         makeFunc("tan", 2),
+        makeFunc("sinh", 2),
+        makeFunc("cosh", 2),
+        makeFunc("tanh", 2),
         makeFunc("fmod", 4),
         makeFunc("fabs", 2),
         makeFunc("log", 2),
@@ -262,6 +420,8 @@ export const msvcrtModule: ModuleDescriptor = {
 
         // High-level file I/O (FILE* based)
         makeFunc("fopen", 2),
+        makeFunc("_fsopen", 3),
+        makeFunc("_wfsopen", 3),
         makeFunc("_wfopen", 2),
         makeFunc("wfopen", 2),
         makeFunc("fclose", 1),
@@ -274,6 +434,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("fflush", 1),
         makeFunc("fprintf", 16),
         makeFunc("feof", 1),
+        makeFunc("_filbuf", 1),
+        makeFunc("_flsbuf", 2),
         makeFunc("ferror", 1),
         makeFunc("rewind", 1),
         makeFunc("fgetpos", 2),
@@ -281,6 +443,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("fgetc", 1),
         makeFunc("getc", 1),
         makeFunc("fputc", 2),
+        makeFunc("putc", 2),
         makeFunc("ungetc", 2),
         makeFunc("strerror", 1),
 
@@ -357,7 +520,11 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_decode_pointer", 1),
         makeFunc("_lock", 1),
         makeFunc("_unlock", 1),
-        makeFunc("_except_handler4_common", 4),
+        // (cookie, check_cookie, rec, frame, context, dispatcher) — SIX, not the four of
+        // _except_handler3: the handler needs `context` to hand a filter its
+        // EXCEPTION_POINTERS, and a short declaration silently drops it.
+        makeFunc("_except_handler4_common", 6),
+        makeFunc("_local_unwind4", 3),
         makeFunc("sprintf_s", 16),
         makeFunc("_snprintf_s", 16),
         makeFunc("strncpy_s", 4),
@@ -371,6 +538,10 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_umask", 1),
         makeFunc("_stat64i32", 2),
         makeFunc("_fstat64i32", 2),
+        makeFunc("_stat64", 2),
+        makeFunc("_fstat64", 2),
+        makeFunc("_stati64", 2),
+        makeFunc("_fstati64", 2),
         makeFunc("_findfirst64i32", 2),
         makeFunc("_findnext64i32", 2),
         makeFunc("_findclose", 1),
@@ -380,15 +551,17 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("vfprintf", 3),
         makeFunc("fscanf", 16),
         makeFunc("setbuf", 2),
+        makeFunc("setvbuf", 4),
         makeFunc("_CIatan", 0),
         makeFunc("_controlfp_s", 3),
         makeFunc("memchr", 3),
         makeFunc("strcspn", 2),
-        makeFunc("_gcvt", 3),
+        makeFunc("strspn", 2),
+        makeFunc("_gcvt", 4),   // double occupies two stack dwords + ndec + buf
         makeFunc("_ismbblead", 1),
         makeFunc("localtime", 1),
+        makeFunc("ctime", 1),
         makeFunc("clearerr", 1),
-        makeFunc("_clearerr", 1),
         makeFunc("_open_osfhandle", 2),
         makeFunc("_fdopen", 2),
         makeFunc("__doserrno", 0),
@@ -398,6 +571,11 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_EH_prolog", 0),
         makeFunc("_mbctype", 0),
         makeFunc("_setmbcp", 1),
+        makeFunc("_getmbcp", 0),
+        makeFunc("_mbsicmp", 2),
+        makeFunc("_mbsnbcpy", 3),
+        makeFunc("_mbctolower", 1),
+        makeFunc("_mbctoupper", 1),
         makeFunc("_mbsnbicmp", 3),
         makeFunc("_mbsdec", 2),
         makeFunc("_ismbcspace", 1),

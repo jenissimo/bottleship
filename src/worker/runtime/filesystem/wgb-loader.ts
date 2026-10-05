@@ -17,6 +17,11 @@ import { WgbCache } from "./wgb-cache";
  *  - BufferSource / SyncAccessHandleSource: already cheap-sync (RAM / OPFS SAH) —
  *    returned untouched; caching would only duplicate already-fast bytes.
  */
+/** 256 KiB cache blocks per 1 MiB I/O-worker chunk — the unit the blocking read and
+ *  the speculative run below are both expressed in, so they follow the transport's
+ *  granularity instead of drifting from it. */
+const SAB_BLOCKS_PER_CHUNK = 4;
+
 function withBlockCache(source: ZipSource): ZipSource {
     // Cheap-sync sources (RAM BufferSource, OPFS SyncAccessHandleSource) are returned
     // untouched. BlobSource (FileReaderSync) and SyncHttpRangeSource (a sync-XHR round
@@ -45,18 +50,26 @@ function withBlockCache(source: ZipSource): ZipSource {
     // (refilled on hits, chained on completion), so the scan streams off RAM and
     // stops blocking on cold sync faults. Depth 4 = up to 4 concurrent range
     // fetches, leaving connection-pool room for the critical blocking sync read.
-    // Over a SabIoSource the I/O worker already fetches in parallel and prefetches
-    // ahead on its own free thread; a guest-side prefetch would only spam the SAB
-    // request channel and contend with real cold reads. So the guest keeps just
-    // readahead (coalesce a run into one SAB request) with prefetch OFF.
+    // Over a SabIoSource the two halves of that trade separate, because prefetch now
+    // runs on the ASYNC channel (postMessage + transferred response, no Atomics.wait)
+    // and is real background work. So the BLOCKING half is sized to the transport's
+    // own fetch granularity — one I/O-worker chunk, 1 MiB / SAB_BLOCKS_PER_CHUNK below
+    // — because a blocking read that spans more chunks than it needs waits on transfer
+    // it will not use, and a seek into a new file (a station switch) is the one read
+    // nobody can prefetch. The SPECULATIVE half stays ahead of the cursor on the async
+    // channel in runs of twice that, deep enough that one run lands while another is
+    // being consumed. This is also the layer that gets the cursor hint, so it is the
+    // only one that speculates: the I/O worker below reads ahead only inside the entry
+    // the hint names.
     const overSabIo = source instanceof SabIoSource;
-    const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number } }).__wgbTune;
+    const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number; blockKB?: number } }).__wgbTune;
     const cache = new CachedSource(source, {
         maxBytes: dev?.budgetMB ? dev.budgetMB * 1024 * 1024 : maxBytes,
         name,
-        syncReadaheadBlocks: dev?.readahead ?? 32,
-        prefetchAheadBlocks: overSabIo ? 0 : 32,
-        prefetchDepthRuns: overSabIo ? 1 : (dev?.depth ?? 4),
+        blockSize: dev?.blockKB ? dev.blockKB * 1024 : undefined,
+        syncReadaheadBlocks: dev?.readahead ?? (overSabIo ? SAB_BLOCKS_PER_CHUNK : 32),
+        prefetchAheadBlocks: overSabIo ? SAB_BLOCKS_PER_CHUNK * 2 : 32,
+        prefetchDepthRuns: overSabIo ? 2 : (dev?.depth ?? 4),
     });
     // Dev-only diagnostic handle: `worker-eval globalThis.__wgbBlockCache.stats()`
     // exposes the getc↔streaming interplay (blockingFaults vs syncHits/prefetchRuns).
@@ -177,15 +190,16 @@ export interface WgbManifest {
          * Supports names, paths and wildcard patterns ("opengl3z", "opengl3z.dll", "drivers/opengl3/*").
          */
         disabledDlls?: string[];
+        /**
+         * DLL names whose copy in the game directory must win over our HLE module, as
+         * Windows' search order does (application directory before System32). Needed by
+         * games that ship a wrapper/proxy DLL next to the exe — ASI loaders, Glide and
+         * ddraw wrappers — which never execute while the HLE answers first.
+         * Same rule syntax as disabledDlls ("ddraw", "ddraw.dll", wildcards).
+         */
+        appDirDlls?: string[];
         /** Glob patterns for files to eagerly prefetch during startup (e.g. ["*.dll", "data/sprites.vga"]) */
         prefetch?: string[];
-        /** Fake ShellExecuteA subprocess results: when parameters match `match`, create `createFiles` in VFS */
-        shellExecFake?: Array<{
-            match: string;
-            /** ifAbsent: only create if the target doesn't already exist (so a game-written
-             *  copy — e.g. a config with the user's resolution — survives across launches). */
-            createFiles: Array<{ path: string; content?: string; copyFrom?: string; ifAbsent?: boolean }>;
-        }>;
         /** VFS paths to delete from CoW overlay on every boot (e.g. crash-sentinel files like Running.ini) */
         deleteOnBoot?: string[];
         /**
@@ -211,6 +225,12 @@ export interface WgbManifest {
          */
         createDirs?: string[];
         /**
+         * Guest cwd at boot, when it is NOT the entrypoint's own folder — an engine module
+         * a launcher starts inherits the LAUNCHER's directory, and resolves its data paths
+         * against that. Example: "C:\\" for an exe that lives under Data\.
+         */
+        workingDir?: string;
+        /**
          * Persist/ephemeral policy (the ".gitignore" analog). Default is PERSIST: every guest
          * write survives unless its (overlay-relative, case-insensitive) path matches a global default
          * or one of these glob patterns — those are kept ephemeral (scratch / wiped, never written to
@@ -226,6 +246,18 @@ export interface WgbManifest {
         persistOnly?: boolean;
         /** Allowlist patterns when `persistOnly` is true. */
         persist?: string[];
+        /**
+         * Authored on-screen touch controls. `layout` is a preset id from
+         * src/input/controls/presets.ts or a full ControlLayout object (validated
+         * host-side by validateLayout — kept structural here so the worker carries no
+         * UI type). Host-only data: it rides `bundle_meta` and is deliberately NOT
+         * routed through EmulatorConfig.applyFromManifest, which the worker would then
+         * have to remember to clear in reset() (the cdPath precedent).
+         */
+        touch?: {
+            layout?: string | Record<string, unknown>;
+            mode?: "auto" | "direct" | "trackpad";
+        };
     };
 }
 
@@ -265,7 +297,12 @@ export class WgbLoader {
                 Logger.log(LogCategory.SYSTEM, `WGB: dev cache hit for "${url}" — OPFS sync handle`);
                 return this.fromSource(staged);
             }
-            try {
+            // `__wgbForceCache` skips the streaming source so the same bundle can be
+            // A/B'd against the OPFS-staged one — the two differ in their read/prefetch
+            // machinery, which is exactly what a wrong-offset bug hunt needs to isolate.
+            if ((globalThis as { __wgbForceCache?: unknown }).__wgbForceCache === true) {
+                Logger.log(LogCategory.SYSTEM, `WGB: __wgbForceCache — skipping dev sync-XHR, staging "${url}" to OPFS`);
+            } else try {
                 const sync = await SyncHttpRangeSource.create(url);
                 Logger.log(LogCategory.SYSTEM, `WGB: dev-streaming "${url}" via sync-XHR range (no OPFS copy)`);
                 return await this.fromSource(sync);

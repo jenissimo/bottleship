@@ -3,13 +3,30 @@
  * window text and the enable flag — plain reads/writes of WindowInfo fields on
  * the shared window map. Z-order / focus / capture core stays in window.ts.
  */
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
-import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
-import { windows } from './shared-state';
+import { windows, type WindowInfo } from './shared-state';
+import { applyDefaultSetText } from './dialog-control-messages';
+import { sendWindowGetText, sendWindowGetTextLength, sendWindowSetText } from './message';
 import { encodeAnsi } from '../codepage-utils';
+import { getDefDlgProcAddress } from './system-classes';
+
+/**
+ * What GWL_WNDPROC reports. For an un-subclassed `#32770` that is DefDlgProc, not the
+ * app's DlgProc: Win32 keeps the DlgProc in DWLP_DLGPROC and lets DefDlgProc call it.
+ * Our dispatch calls the DlgProc directly, but a subclasser (MFC's AfxWndProc, ATL, a
+ * raw SetWindowLong) stores this value and calls it for everything it does not handle —
+ * handing back the DlgProc makes that chain a no-op, because a DlgProc answers FALSE
+ * and does no default processing (no BeginPaint, hence no WM_ERASEBKGND/WM_DRAWITEM).
+ */
+function reportedWndProc(window: WindowInfo): number {
+    const wndProc = window.wndProc >>> 0;
+    if (window.nativeClassName !== '#32770' || !wndProc) return wndProc;
+    if (wndProc !== ((window.extraBytes?.[1] ?? 0) >>> 0)) return wndProc; // already subclassed
+    return getDefDlgProcAddress() || wndProc;
+}
 
 export function registerWindowPropExports(exports: Record<string, ThunkImplementation>): void {
     exports['SetWindowLongA'] = (ctx, mem, args) => {
@@ -21,6 +38,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         if (!window) return 0;
 
         const GWL_WNDPROC = -4;
+        const GWL_ID = -12;
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
@@ -53,7 +71,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
 
         switch (idx) {
             case GWL_WNDPROC:
-                prev = window.wndProc >>> 0;
+                prev = reportedWndProc(window);
                 window.wndProc = dwNewLong >>> 0;
                 // A system control given a guest wndProc is subclassed (e.g. MFC custom
                 // CStatic/CButton that paints itself). It now owns its own painting —
@@ -61,6 +79,10 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
                 if (window.isSystemControl && (dwNewLong >>> 0) !== 0) {
                     window.wndProcSubclassed = true;
                 }
+                break;
+            case GWL_ID:
+                prev = window.controlId ?? 0;
+                window.controlId = dwNewLong >>> 0;
                 break;
             case GWL_STYLE:
                 prev = window.style >>> 0;
@@ -95,6 +117,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         if (!window) return 0;
 
         const GWL_WNDPROC = -4;
+        const GWL_ID = -12;
         const GWL_STYLE = -16;
         const GWL_EXSTYLE = -20;
         const GWL_USERDATA = -21;
@@ -110,7 +133,9 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
 
         switch (idx) {
             case GWL_WNDPROC:
-                return window.wndProc >>> 0;
+                return reportedWndProc(window);
+            case GWL_ID:
+                return (window.controlId ?? 0) >>> 0;
             case GWL_STYLE:
                 return window.style >>> 0;
             case GWL_EXSTYLE:
@@ -132,21 +157,32 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         return 0;
     };
 
-    exports['GetWindowTextLengthA'] = (ctx, mem, args) => {
-        const hWnd = args[0];
+    // GetWindowText* SEND WM_GETTEXT/WM_GETTEXTLENGTH (Wine reads a window's stored text
+    // only when it belongs to another process). A subclass that keeps the string itself
+    // is the only thing that knows it, so asking our record instead answers stale.
+    const getWindowTextLengthImpl = (ctx: X86Context, mem: Uint8Array, args: number[], tag: string): number | ThunkResult => {
+        const hWnd = args[0] >>> 0;
+        const sent = sendWindowGetTextLength(ctx, mem, hWnd, 4, tag);
+        if (sent) return sent;
         const window = windows.get(hWnd);
         const length = window ? window.title.length : 0;
-        Logger.verbose(LogCategory.USER32, `GetWindowTextLengthA(0x${hWnd.toString(16)}) -> ${length}`);
+        Logger.verbose(LogCategory.USER32, `${tag}(0x${hWnd.toString(16)}) -> ${length}`);
         return length;
     };
 
-    exports['GetWindowTextLengthW'] = exports['GetWindowTextLengthA'];
+    exports['GetWindowTextLengthA'] = (ctx, mem, args) =>
+        getWindowTextLengthImpl(ctx, mem, args, 'GetWindowTextLengthA');
+    exports['GetWindowTextLengthW'] = (ctx, mem, args) =>
+        getWindowTextLengthImpl(ctx, mem, args, 'GetWindowTextLengthW');
 
     exports['GetWindowTextA'] = (ctx, mem, args) => {
         const hWnd = args[0] >>> 0;
         const lpString = args[1] >>> 0;
         const nMaxCount = args[2] | 0;
         if (!lpString || nMaxCount <= 0) return 0;
+
+        const sent = sendWindowGetText(ctx, mem, hWnd, nMaxCount, lpString, 12, 'GetWindowTextA');
+        if (sent) return sent;
 
         const window = windows.get(hWnd);
         if (!window) return 0;
@@ -169,6 +205,9 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         const nMaxCount = args[2] | 0;
         if (!lpString || nMaxCount <= 0) return 0;
 
+        const sent = sendWindowGetText(ctx, mem, hWnd, nMaxCount, lpString, 12, 'GetWindowTextW');
+        if (sent) return sent;
+
         const window = windows.get(hWnd);
         if (!window) return 0;
 
@@ -180,31 +219,29 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         return charCount;
     };
 
-    exports['SetWindowTextA'] = (ctx, mem, args) => {
+    // SetWindowText SENDS WM_SETTEXT (Wine: NtUserMessageCall), so a window whose
+    // procedure the guest owns hears about its own caption change; only the default
+    // handling stores the string.
+    const setWindowTextImpl = (
+        ctx: X86Context, mem: Uint8Array, args: number[], tag: string,
+        decode: (ptr: number) => string,
+    ): number | ThunkResult => {
         const hWnd = args[0];
         const lpString = args[1];
-        const text = lpString ? Marshaler.readString(mem, lpString) : '';
+        const sent = sendWindowSetText(ctx, mem, hWnd, lpString, 8, tag);
+        if (sent) return sent;
         const window = windows.get(hWnd);
-        if (window) {
-            window.title = text;
-            if (!window.parent) System.getInstance().notifyWindowTitle(text);
-        }
-        Logger.log(LogCategory.USER32, `SetWindowTextA(0x${hWnd.toString(16)}, "${text}")`);
+        const text = lpString ? decode(lpString) : '';
+        if (window) applyDefaultSetText(window, text);
+        Logger.log(LogCategory.USER32, `${tag}(0x${hWnd.toString(16)}, "${text}")`);
         return 1; // TRUE
     };
 
-    exports['SetWindowTextW'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        const lpString = args[1];
-        const text = lpString ? Marshaler.readWideString(mem, lpString) : '';
-        const window = windows.get(hWnd);
-        if (window) {
-            window.title = text;
-            if (!window.parent) System.getInstance().notifyWindowTitle(text);
-        }
-        Logger.log(LogCategory.USER32, `SetWindowTextW(0x${hWnd.toString(16)}, "${text}")`);
-        return 1; // TRUE
-    };
+    exports['SetWindowTextA'] = (ctx, mem, args) =>
+        setWindowTextImpl(ctx, mem, args, 'SetWindowTextA', (ptr) => Marshaler.readString(mem, ptr));
+
+    exports['SetWindowTextW'] = (ctx, mem, args) =>
+        setWindowTextImpl(ctx, mem, args, 'SetWindowTextW', (ptr) => Marshaler.readWideString(mem, ptr));
 
     exports['EnableWindow'] = (ctx, mem, args) => {
         const hWnd = args[0];

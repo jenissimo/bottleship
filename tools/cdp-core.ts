@@ -6,19 +6,37 @@
  * Map request loop, and the Target.setAutoAttach worker-session dance. This file
  * extracts all of it once.
  *
- * Exports: launchOrAttachChrome, findTab, findOrCreateTab, closeStaleTabs,
- * connect (-> CdpSession), pageEval, workerEval, screenshot, health.
+ * Exports: launchOrAttachChrome, findTab, findOrCreateTab, closeStaleTabs, listTargets,
+ * listSessionTabs, connect (-> CdpSession), pageEval, workerEval, screenshot,
+ * captureTrace, health.
+ *
+ * Target discovery is session-scoped (src/harness/session.ts): `BS_TAB=<name>` pins every
+ * lookup to the `?game=dev&bs=<name>` tab, so several agents can drive several tabs of one
+ * Chrome. Unset = the historical single-tab behaviour.
  *
  * Bun script (top-level await, Bun.spawnSync, global fetch/WebSocket).
  */
+import { createGzip } from "node:zlib";
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, rmSync, statSync } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
 
-export const DEFAULT_CDP_PORT = 9333;
-export const DEFAULT_DEV_URL = "http://localhost:5174/?game=dev";
+export const DEFAULT_CDP_PORT = Number(process.env.BS_CDP_PORT ?? 9333);
+/** BS_DEV_URL / BS_SIDECAR_PORT point the tools at a SECOND dev stack (an isolated
+ *  worktree, a test rig) so it never drives or writes into the first one's. */
+export const DEFAULT_DEV_URL = process.env.BS_DEV_URL ?? "http://localhost:5174/?game=dev";
+export const SIDECAR_PORT = Number(process.env.BS_SIDECAR_PORT ?? 3001);
 export const GAME_DEV_FILTER = "game=dev";
 const IS_MAC = process.platform === "darwin";
+const IS_WIN = process.platform === "win32";
 const CHROME_PATH = IS_MAC
     ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     : "C:/Program Files/Google/Chrome/Application/chrome.exe";
+/** Where a detached Chrome's stdout/stderr land — see launchChrome. */
+export const CHROME_STDIO_DIR = `${process.cwd()}/logs/chrome`;
 const DEFAULT_PROFILE = IS_MAC
     ? `${process.env.HOME}/.bottleship-cdp-profile`
     : `${process.cwd()}/tmp/cdp-profile`;
@@ -37,6 +55,59 @@ async function fetchJson(port: number, path: string): Promise<any> {
     return r.json();
 }
 
+/** The session this process drives (`BS_TAB`); "" = the default single-tab session. */
+export function cdpSession(): string {
+    return sessionFromEnv(process.env);
+}
+
+/**
+ * Cross-process guard so two concurrent `harness up` runs don't each launch Chrome on
+ * the same port. Machine-global (os tmpdir, keyed by port) — parallel agents work from
+ * separate git worktrees, so anything under cwd would not be shared. A lock older than
+ * the launch timeout is stolen: a crashed launcher must not wedge the port forever.
+ */
+const LAUNCH_LOCK_TTL_MS = 45_000;
+
+function acquireLaunchLock(port: number, kind = "cdp", ttlMs = LAUNCH_LOCK_TTL_MS): (() => void) | null {
+    const path = join(tmpdir(), `bottleship-${kind}-launch-${port}.lock`);
+    return acquireLockAt(path, ttlMs);
+}
+
+/**
+ * `null` = someone else holds the lock, and the caller then WAITS for their launch. So only
+ * EEXIST may return null: on a read-only tmpdir or a bad path every attempt failed with
+ * EPERM/ENOENT, the caller waited out the full launch timeout, and nothing had ever started.
+ * Anything that is not contention is rethrown.
+ */
+function acquireLockAt(path: string, ttlMs: number): (() => void) | null {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            closeSync(openSync(path, "wx"));
+            return () => { try { rmSync(path); } catch { /* already gone */ } };
+        } catch (e: any) {
+            if (e?.code !== "EEXIST") {
+                throw new Error(`cannot create the launch lock ${path}: ${e?.code ?? e}`);
+            }
+            try {
+                if (Date.now() - statSync(path).mtimeMs > ttlMs) { rmSync(path); continue; }
+            } catch { continue; }   // the holder released it between our open and our stat
+            return null;
+        }
+    }
+    return null;
+}
+
+async function waitForChrome(port: number, tries: number): Promise<any> {
+    for (let i = 0; i < tries; i++) {
+        try {
+            return await fetchJson(port, "/json/version");
+        } catch {
+            await Bun.sleep(300);
+        }
+    }
+    throw new Error(`Chrome did not come up on :${port} within ${Math.round(tries * 0.3)}s`);
+}
+
 /** Probe Chrome's debug endpoint; launch a DETACHED instance if it's down. */
 export async function launchOrAttachChrome(opts: { port?: number; profile?: string; autoplay?: boolean } = {}): Promise<any> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
@@ -47,14 +118,48 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
     } catch {
         /* not running — launch below */
     }
+    const release = acquireLaunchLock(port);
+    // Someone else is already launching this port: wait for THEIR Chrome instead of
+    // racing a second one onto the same profile directory.
+    if (!release) return waitForChrome(port, 100);
+    try {
+        return await launchChrome(port, profile, autoplay);
+    } finally {
+        release();
+    }
+}
+
+async function launchChrome(port: number, profile: string, autoplay: boolean): Promise<any> {
+    // Re-probe under the lock — the winner may have finished between our probe and here.
+    try {
+        return await fetchJson(port, "/json/version");
+    } catch {
+        /* still down — launch */
+    }
     const args = [
         `--remote-debugging-port=${port}`,
         `--user-data-dir=${profile}`,
         "--no-first-run",
         "--no-default-browser-check",
-        "--disable-features=Translate",
+        // CalculateNativeWinOcclusion: Windows stops producing frames for a window another
+        // window fully covers — which is EVERY agent-driven run, since the terminal sits on
+        // top. `document.visibilityState` stays "visible" throughout, so nothing in the page
+        // can tell; the guest simply stops advancing the moment it waits on a frame slot,
+        // and every measurement taken across that window is of a stopped emulator.
+        // (One --disable-features flag only: a second occurrence replaces the first.)
+        "--disable-features=Translate,CalculateNativeWinOcclusion",
+        "--disable-backgrounding-occluded-windows",
+        // Touch feature detection ('ontouchstart' in window, maxTouchPoints > 0) at
+        // page load — before any Emulation override — so startup-time capability
+        // checks see a touch device in automation.
+        "--touch-events=enabled",
         ...(autoplay ? ["--autoplay-policy=no-user-gesture-required"] : []),
         "--window-size=1400,1050",
+        // Escape hatch for measurement runs that need engine flags the default launch
+        // must not carry, e.g. BS_CHROME_FLAGS="--js-flags=--allow-natives-syntax" to
+        // classify JIT modules by V8 tier. Space-separated; only honored on a cold
+        // launch, so kill a running instance first for it to take effect.
+        ...(process.env.BS_CHROME_FLAGS ? process.env.BS_CHROME_FLAGS.split(" ").filter(Boolean) : []),
         "about:blank",
     ];
     if (IS_MAC) {
@@ -67,42 +172,59 @@ export async function launchOrAttachChrome(opts: { port?: number; profile?: stri
     } else {
         // Detached via PowerShell Start-Process so Chrome outlives this bun process
         // (a plain Bun.spawn child dies with bun on Windows).
+        //
+        // stdout/stderr are redirected to disk because renderer subprocesses inherit these
+        // handles, and a V8 fatal-OOM banner or a sandbox abort is printed there and NOWHERE
+        // else — not in the trace, not in the page, not in any CDP event. Without this a
+        // renderer or worker that dies of memory pressure leaves no evidence at all.
+        mkdirSync(CHROME_STDIO_DIR, { recursive: true });
         const psArgs = args.map((a) => `'${a}'`).join(",");
-        Bun.spawnSync(["powershell", "-NoProfile", "-Command", `Start-Process -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}`]);
+        Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+            `Start-Process -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}` +
+            ` -RedirectStandardOutput '${CHROME_STDIO_DIR}/stdout.log'` +
+            ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`]);
     }
-    for (let i = 0; i < 50; i++) {
-        try {
-            return await fetchJson(port, "/json/version");
-        } catch {
-            await Bun.sleep(300);
-        }
-    }
-    throw new Error(`Chrome did not come up on :${port} within 15s`);
+    return waitForChrome(port, 50);
 }
 
-/** Find the first target matching a url substring + type (default page/game=dev).
- *  Multi-agent isolation: when env `BS_TAB` is set, the match additionally requires the url to
- *  contain that marker — so two agents can each pin their own `?game=dev&<marker>` tab without
- *  stealing each other's. With BS_TAB unset the behaviour is unchanged (first game=dev tab). */
+/** Every target Chrome reports (page, worker, iframe…). */
+export async function listTargets(opts: { port?: number } = {}): Promise<CdpTarget[]> {
+    return fetchJson(opts.port ?? DEFAULT_CDP_PORT, "/json/list");
+}
+
+/** The `?game=dev` page tabs, one per harness session that has one open. */
+export async function listSessionTabs(opts: { port?: number } = {}): Promise<CdpTarget[]> {
+    const list = await listTargets(opts);
+    return list.filter((t) => t.type === "page" && t.url.includes(GAME_DEV_FILTER));
+}
+
+/** Find the target this session drives (default page/game=dev).
+ *  Multi-agent isolation: with `BS_TAB=<name>` set, only a tab carrying the matching
+ *  `?bs=<name>` token matches. With BS_TAB unset only an UNMARKED tab matches — never a
+ *  named sibling's, not even as a last resort: one dropped prefix would otherwise load a
+ *  bundle into another agent's live guest. No match throws, and the message lists the tabs. */
 export async function findTab(urlMatch = GAME_DEV_FILTER, opts: { type?: string; port?: number } = {}): Promise<CdpTarget> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const type = opts.type ?? "page";
-    const marker = (process.env.BS_TAB ?? "").trim();
+    const session = cdpSession();
     const list: CdpTarget[] = await fetchJson(port, "/json/list");
-    const hit = list.find((t) => t.type === type && t.url.includes(urlMatch) && (!marker || t.url.includes(marker)));
+    const hit = pickSessionTab(list, session, { type, urlMatch });
     if (!hit) {
         const avail = list.map((t) => `${t.type}:${t.url.slice(-60)}`).join("\n  ");
-        throw new Error(`no ${type} tab matching '${urlMatch}'${marker ? ` + BS_TAB '${marker}'` : ""}. Open tabs:\n  ${avail}`);
+        throw new Error(`no ${type} tab matching '${urlMatch}'${session ? ` + BS_TAB '${session}'` : ""}. Open tabs:\n  ${avail}`);
     }
     return hit;
 }
 
+/** Close this session's game=dev tabs. Tabs belonging to another session are left
+ *  alone — a sibling agent's guest must survive our teardown. */
 export async function closeStaleTabs(urlMatch = GAME_DEV_FILTER, opts: { port?: number } = {}): Promise<number> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
+    const session = cdpSession();
     const list: CdpTarget[] = await fetchJson(port, "/json/list");
     let closed = 0;
     for (const t of list) {
-        if (t.type === "page" && t.url.includes(urlMatch)) {
+        if (t.type === "page" && t.url.includes(urlMatch) && sessionOwnsUrl(t.url, session)) {
             try {
                 await fetch(`http://localhost:${port}/json/close/${t.id}`);
                 closed++;
@@ -112,18 +234,20 @@ export async function closeStaleTabs(urlMatch = GAME_DEV_FILTER, opts: { port?: 
     return closed;
 }
 
-/** Find an existing game=dev tab, or open one at `url` (PUT then GET fallback). */
+/** Find this session's game=dev tab, or open one at `url` (PUT then GET fallback).
+ *  Rather open our own tab than adopt one another session owns. */
 export async function findOrCreateTab(url = DEFAULT_DEV_URL, opts: { port?: number } = {}): Promise<CdpTarget> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     try {
         return await findTab(GAME_DEV_FILTER, { port });
     } catch { /* create below */ }
-    const newUrl = `http://localhost:${port}/json/new?${encodeURIComponent(url)}`;
+    const target = sessionUrl(url, cdpSession());
+    const newUrl = `http://localhost:${port}/json/new?${encodeURIComponent(target)}`;
     for (const method of ["PUT", "GET"]) {
         const r = await fetch(newUrl, { method });
         if (r.ok) return r.json();
     }
-    throw new Error(`failed to open tab ${url} (PUT and GET both rejected)`);
+    throw new Error(`failed to open tab ${target} (PUT and GET both rejected)`);
 }
 
 /** A live CDP WebSocket session with id-correlated requests + event fan-out. */
@@ -159,12 +283,26 @@ export class CdpSession {
         });
     }
 
-    send(method: string, params: any = {}, sessionId?: string): Promise<any> {
+    /** `timeoutMs` is opt-in: CDP has no deadline of its own, and several commands here
+     *  (Tracing, navigation) are legitimately unbounded. Give it to any command that can
+     *  wait on the RENDERER — a request that never settles spends wall-clock silently. */
+    send(method: string, params: any = {}, sessionId?: string, opts?: { timeoutMs?: number }): Promise<any> {
         const id = this.nextId++;
         const payload: any = { id, method, params };
         if (sessionId) payload.sessionId = sessionId;
         this.ws.send(JSON.stringify(payload));
-        return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+        return new Promise((resolve, reject) => {
+            this.pending.set(id, { resolve, reject });
+            const ms = opts?.timeoutMs;
+            if (!ms) return;
+            const timer = setTimeout(() => {
+                if (!this.pending.delete(id)) return;
+                reject(new Error(`CDP ${method} did not answer within ${ms}ms`));
+            }, ms);
+            const entry = this.pending.get(id)!;
+            const settle = (fn: (v: any) => void) => (v: any) => { clearTimeout(timer); fn(v); };
+            this.pending.set(id, { resolve: settle(entry.resolve), reject: settle(entry.reject) });
+        });
     }
 
     on(method: string, cb: (params: any, sessionId?: string) => void): void {
@@ -178,6 +316,121 @@ export class CdpSession {
     }
 }
 
+/**
+ * Capture a Chrome performance trace and write it gzipped for tools/analyze-trace.ts.
+ *
+ * Tracing is a BROWSER-level domain (not per-page), so this opens its own session on the
+ * browser endpoint rather than reusing a page session. The v8.cpu_profiler category is the
+ * load-bearing one — without it the trace has no Profile/ProfileChunk events and the
+ * analyzer reports nothing.
+ */
+/** The default recording set — exported so a caller can bisect it (see harness trace --without). */
+export const DEFAULT_TRACE_CATEGORIES = [
+    "disabled-by-default-v8.cpu_profiler",
+    "v8", "v8.execute", "devtools.timeline", "blink.user_timing", "toplevel",
+    "gpu", "disabled-by-default-gpu.dawn",
+];
+
+export async function captureTrace(
+    outFile: string,
+    seconds: number,
+    opts: {
+        port?: number;
+        categories?: string[];
+        during?: (elapsedMs: number) => Promise<void>;
+        /** Runs the instant recording starts, so t=0 of the artifact is the instant the work
+         *  begins. `during` fires a third of the way in and is therefore useless for anything
+         *  whose FIRST milliseconds are the subject (a cold boot). Keep it short — the window
+         *  is already running while it awaits. */
+        onStarted?: () => Promise<void>;
+        /** Chrome's TraceLog buffer policy. "recordAsMuchAsPossible" grows until the buffer
+         *  cap; "recordContinuously" is a bounded RING that overwrites the oldest events and
+         *  therefore never grows. Use the ring for long windows where only the tail matters. */
+        recordMode?: "recordAsMuchAsPossible" | "recordContinuously" | "recordUntilFull";
+    } = {},
+): Promise<{ file: string; events: number; bytes: number; maxPercentFull: number; bufferFull: boolean }> {
+    const port = opts.port ?? DEFAULT_CDP_PORT;
+    const version = await fetchJson(port, "/json/version");
+    const session = await CdpSession.connect(version.webSocketDebuggerUrl);
+    // The v8.cpu_profiler category is the load-bearing one for the JS/wasm side.
+    //
+    // The `gpu` pair is here because WITHOUT it a trace is silent about the GPU process and an
+    // analysis of it can only ever be a guess. `toplevel` alone gives CrGpuMain's task
+    // durations — i.e. how long the GPU process was BUSY on the CPU — and says nothing about
+    // what the hardware did. `disabled-by-default-gpu.dawn` is the one that carries the
+    // WebGPU/Dawn work items, which is the only place a "the GPU is the second wall" claim can
+    // come from. Recording them costs trace size, not runtime: they are emitted by the GPU
+    // process, not by the worker under measurement.
+    const categories = opts.categories ?? DEFAULT_TRACE_CATEGORIES;
+    const events: any[] = [];
+    // Not `push(...batch)`: the spread passes every element as an ARGUMENT, and Chrome sends
+    // batches well past the engine's argument limit on a busy trace — a RangeError thrown
+    // inside the event callback, losing the recording.
+    session.on("Tracing.dataCollected", (p) => { if (p?.value) for (const e of p.value) events.push(e); });
+    const complete = new Promise<void>((resolve) => session.on("Tracing.tracingComplete", () => resolve()));
+
+    // Buffer telemetry. Chrome's trace buffer is FINITE, and when it fills the recording keeps
+    // running while silently dropping events — the artifact then looks complete and every
+    // count read off it is wrong. `bufferUsage` is the only signal that this happened, so it
+    // is always on and always reported.
+    let maxPercentFull = 0;
+    let lastEventCount = 0;
+    session.on("Tracing.bufferUsage", (p) => {
+        if (typeof p?.percentFull === "number") maxPercentFull = Math.max(maxPercentFull, p.percentFull);
+        if (typeof p?.value === "number") maxPercentFull = Math.max(maxPercentFull, p.value);
+        if (typeof p?.eventCount === "number") lastEventCount = p.eventCount;
+    });
+
+    await session.send("Tracing.start", {
+        traceConfig: { includedCategories: categories, recordMode: opts.recordMode ?? "recordAsMuchAsPossible" },
+        transferMode: "ReportEvents",
+        bufferUsageReportingInterval: 1000,
+    });
+    // `during` runs INSIDE the recording window (a third of the way in, so its own sampling
+    // interval finishes comfortably before Tracing.end). This is how the bottleship.hotblocks
+    // mark gets into the trace — blink.user_timing is already recorded, so a mark emitted here
+    // lands in the artifact and analyze-trace can resolve wasm frames to module:rva. Without
+    // it a trace looks complete and analyses shallow.
+    const totalMs = seconds * 1000;
+    const t0 = Date.now();
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    if (opts.onStarted) {
+        try { await opts.onStarted(); } catch (e) { console.warn(`[captureTrace] onStarted hook failed: ${e}`); }
+    }
+    if (opts.during) {
+        await sleep(Math.min(Math.max(500, totalMs / 3), Math.max(0, totalMs - 500)));
+        try { await opts.during(Date.now() - t0); } catch (e) { console.warn(`[captureTrace] during-window hook failed: ${e}`); }
+    }
+    const remaining = totalMs - (Date.now() - t0);
+    if (remaining > 0) await sleep(remaining);
+    await session.send("Tracing.end");
+    await Promise.race([complete, new Promise((r) => setTimeout(r, 120_000))]);
+    session.close();
+
+    // Serialized one event at a time straight into the gzip stream. A whole-document
+    // JSON.stringify + Buffer.from + gzipSync holds the event array, a multi-hundred-MB string
+    // and the compressed buffer at once — a 30 s trace of a busy worker is enough to run the
+    // process out of heap after the recording succeeded.
+    await pipeline(
+        Readable.from((function* () {
+            yield '{"traceEvents":[';
+            for (let i = 0; i < events.length; i++) yield (i ? "," : "") + JSON.stringify(events[i]);
+            yield "]}";
+        })()),
+        createGzip(),
+        createWriteStream(outFile),
+    );
+    return {
+        file: outFile,
+        events: events.length,
+        bytes: statSync(outFile).size,
+        maxPercentFull,
+        // Chrome reports percentFull as a 0..1 fraction; anything at the cap means the
+        // recording dropped events and the artifact is a SAMPLE, not the window.
+        bufferFull: maxPercentFull >= 0.99 || (lastEventCount > 0 && maxPercentFull >= 0.99),
+    };
+}
+
 /** Connect to the game=dev page target. */
 export async function connect(opts: { port?: number; urlMatch?: string } = {}): Promise<{ session: CdpSession; target: CdpTarget }> {
     const target = await findTab(opts.urlMatch ?? GAME_DEV_FILTER, { port: opts.port });
@@ -186,13 +439,16 @@ export async function connect(opts: { port?: number; urlMatch?: string } = {}): 
 }
 
 /** Evaluate an expression in the PAGE context; returns the deserialized value. */
-export async function pageEval(session: CdpSession, expr: string, opts: { timeoutMs?: number; awaitPromise?: boolean; returnByValue?: boolean } = {}): Promise<any> {
+export async function pageEval(session: CdpSession, expr: string, opts: { timeoutMs?: number; awaitPromise?: boolean; returnByValue?: boolean; userGesture?: boolean } = {}): Promise<any> {
     const timeoutMs = opts.timeoutMs ?? 30_000;
     const r = await Promise.race([
         session.send("Runtime.evaluate", {
             expression: expr,
             awaitPromise: opts.awaitPromise ?? true,
             returnByValue: opts.returnByValue ?? true,
+            // Gesture-gated APIs (requestPointerLock, requestFullscreen, AudioContext.resume)
+            // reject without user activation, which no harness verb can otherwise grant.
+            userGesture: opts.userGesture ?? false,
         }),
         Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
     ]);
@@ -202,6 +458,32 @@ export async function pageEval(session: CdpSession, expr: string, opts: { timeou
         throw new Error(`page eval exception: ${res.exceptionDetails.text} ${res.exceptionDetails.exception?.description ?? ""}`);
     }
     return res?.result?.value ?? res?.result;
+}
+
+/**
+ * Engage or release Pointer Lock — the transport a guest gets whenever it asks for a
+ * relative mouse (ShowCursor(FALSE), ClipCursor, exclusive DirectInput, a warp burst).
+ * Neither half is reachable from the page: the browser demands user activation AND a
+ * focused document, and a background tab has neither. Everything downstream of the lock
+ * (relative deltas, honored SetCursorPos warps, the host-drawn cursor) is untestable
+ * without it.
+ */
+export async function setPointerLock(session: CdpSession, engage: boolean, opts: { timeoutMs?: number } = {}): Promise<{ locked: boolean; error: string | null }> {
+    if (engage) await session.send("Page.bringToFront", {}).catch(() => { /* already front */ });
+    const expr = `(async () => {
+        const c = document.querySelector('canvas');
+        if (!c) return { locked: false, error: 'no canvas' };
+        let error = null;
+        try {
+            if (${engage}) await c.requestPointerLock(); else document.exitPointerLock();
+        } catch (e) { error = String((e && e.message) || e); }
+        const deadline = Date.now() + 2000;
+        while (!!document.pointerLockElement !== ${engage} && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 32));
+        }
+        return { locked: !!document.pointerLockElement, error };
+    })()`;
+    return await pageEval(session, expr, { userGesture: true, timeoutMs: opts.timeoutMs ?? 15_000 });
 }
 
 /** Evaluate an expression in the WORKER context via the flattened auto-attach dance. */
@@ -332,17 +614,199 @@ export async function workerStack(
     return out;
 }
 
+export interface HeapSampleSite {
+    functionName: string;
+    url: string;
+    line: number;
+    /** Sampled bytes attributed to this frame itself, extrapolated to a per-second rate. */
+    bytesPerSec: number;
+    /** Share of all sampled bytes in the window. */
+    pct: number;
+}
+
+/**
+ * Sample the WORKER's JS allocations for `seconds` (HeapProfiler.startSampling) and rank the
+ * allocating frames by bytes/s. Answers "who feeds the GC": a worker that minor-GCs a dozen
+ * times a second, or takes a memory-reducer MajorGC mid-game, stalls every guest thread for the
+ * collection — no guest-side counter can see it. Sampled bytes include objects already dead
+ * at stop (includeObjectsCollectedBy*), because garbage is exactly what is being measured;
+ * `majorOnly` narrows that to objects promoted before dying, the ones that pace full GCs.
+ */
+export async function workerHeapSample(
+    session: CdpSession,
+    opts: { seconds?: number; intervalBytes?: number; top?: number; majorOnly?: boolean } = {},
+): Promise<{ totalBytesPerSec: number; heapUsedMB: number | null; heapTotalMB: number | null; sites: HeapSampleSite[] }> {
+    const seconds = opts.seconds ?? 5;
+    const sessionId = await attachWorkerSession(session);
+    await session.send("HeapProfiler.enable", {}, sessionId);
+    await session.send("HeapProfiler.startSampling", {
+        samplingInterval: opts.intervalBytes ?? 16_384,
+        includeObjectsCollectedByMajorGC: true,
+        // majorOnly drops what the scavenger reclaims, leaving objects that outlived the young
+        // generation and died in old space — exactly the population that paces full GCs.
+        includeObjectsCollectedByMinorGC: !opts.majorOnly,
+    }, sessionId);
+    await Bun.sleep(seconds * 1000);
+    const r = await session.send("HeapProfiler.stopSampling", {}, sessionId);
+    await session.send("HeapProfiler.disable", {}, sessionId).catch(() => { /* */ });
+    const profile = r.result?.profile;
+    // The live heap is what a mark-compact has to walk: its size, not the allocation rate,
+    // sets how long each full GC holds the thread.
+    const usage = await session.send("Runtime.getHeapUsage", {}, sessionId).catch(() => null);
+    const bySite = new Map<string, { f: any; bytes: number }>();
+    const sizeOf = new Map<number, number>();
+    for (const s of profile?.samples ?? []) sizeOf.set(s.nodeId, (sizeOf.get(s.nodeId) ?? 0) + s.size);
+    let total = 0;
+    // A builtin (Map.set, subarray, a getter) has no URL of its own; charge it to the nearest
+    // caller that has one, or "Map.delete" names a mechanism instead of an owner.
+    const walk = (n: any, owner: any): void => {
+        const cf = n.callFrame ?? {};
+        const bytes = sizeOf.get(n.id) ?? n.selfSize ?? 0;
+        if (bytes > 0) {
+            const site = cf.url || !owner ? cf : { ...owner, functionName: `${cf.functionName || "<builtin>"} <- ${owner.functionName}` };
+            const key = `${site.functionName}|${site.url}|${site.lineNumber}`;
+            const e = bySite.get(key) ?? { f: site, bytes: 0 };
+            e.bytes += bytes; bySite.set(key, e); total += bytes;
+        }
+        for (const c of n.children ?? []) walk(c, cf.url ? cf : owner);
+    };
+    if (profile?.head) walk(profile.head, null);
+    const sites = [...bySite.values()].sort((a, b) => b.bytes - a.bytes).slice(0, opts.top ?? 25).map((e) => ({
+        functionName: e.f.functionName || "<anonymous>",
+        url: String(e.f.url ?? "").replace(/^.*\//, "").replace(/\?.*$/, ""),
+        line: (e.f.lineNumber ?? 0) + 1,
+        bytesPerSec: Math.round(e.bytes / seconds),
+        pct: total > 0 ? Math.round((1000 * e.bytes) / total) / 10 : 0,
+    }));
+    const mb = (b: unknown) => (typeof b === "number" ? Math.round(b / 1048576) : null);
+    return {
+        totalBytesPerSec: Math.round(total / seconds),
+        heapUsedMB: mb(usage?.result?.usedSize), heapTotalMB: mb(usage?.result?.totalSize),
+        sites,
+    };
+}
+
+/**
+ * Take a heap snapshot of the WORKER and summarise it by (node type, constructor name): count
+ * and self bytes. A full GC's atomic pause scales with the live heap it has to mark and
+ * evacuate, so "what is resident" is the question once the pause itself is the problem.
+ */
+export async function workerHeapSnapshotSummary(
+    session: CdpSession,
+    opts: { top?: number } = {},
+): Promise<{ totalMB: number; rows: Array<{ type: string; name: string; count: number; selfMB: number }>;
+    stringPrefixes: Array<{ prefix: string; count: number; MB: number }> }> {
+    const sessionId = await attachWorkerSession(session);
+    await session.send("HeapProfiler.enable", {}, sessionId);
+    const chunks: string[] = [];
+    session.on("HeapProfiler.addHeapSnapshotChunk", (params, sid) => {
+        if (sid === sessionId) chunks.push(params.chunk);
+    });
+    await session.send("HeapProfiler.takeHeapSnapshot", { reportProgress: false }, sessionId, { timeoutMs: 180_000 });
+    await session.send("HeapProfiler.disable", {}, sessionId).catch(() => { /* */ });
+    const snap = JSON.parse(chunks.join(""));
+    const meta = snap.snapshot.meta;
+    const fields: string[] = meta.node_fields;
+    const types: string[] = meta.node_types[0];
+    const stride = fields.length;
+    const iType = fields.indexOf("type"), iName = fields.indexOf("name"), iSize = fields.indexOf("self_size");
+    const nodes: number[] = snap.nodes;
+    const strings: string[] = snap.strings;
+    const agg = new Map<string, { type: string; name: string; count: number; bytes: number }>();
+    let total = 0;
+    // Strings are grouped by a short prefix too: "39 MB of (string)" names nothing, while
+    // "120k strings starting with `[THUNK]`" names the owner.
+    const prefixes = new Map<string, { count: number; bytes: number }>();
+    for (let i = 0; i < nodes.length; i += stride) {
+        const type = types[nodes[i + iType]];
+        const name = type === "string" || type === "concatenated string" || type === "sliced string"
+            ? "(string)" : type === "number" ? "(heap number)" : strings[nodes[i + iName]];
+        const size = nodes[i + iSize];
+        total += size;
+        if (name === "(string)") {
+            const prefix = String(strings[nodes[i + iName]] ?? "").slice(0, 24).replace(/[0-9a-fA-F]{3,}/g, "#");
+            const p = prefixes.get(prefix) ?? { count: 0, bytes: 0 };
+            p.count++; p.bytes += size; prefixes.set(prefix, p);
+        }
+        const key = `${type}|${name}`;
+        const e = agg.get(key) ?? { type, name, count: 0, bytes: 0 };
+        e.count++; e.bytes += size; agg.set(key, e);
+    }
+    const rows = [...agg.values()].sort((a, b) => b.bytes - a.bytes).slice(0, opts.top ?? 30)
+        .map((e) => ({ type: e.type, name: e.name.slice(0, 80), count: e.count, selfMB: Math.round(e.bytes / 10485.76) / 100 }));
+    const stringPrefixes = [...prefixes].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, opts.top ?? 30)
+        .map(([prefix, v]) => ({ prefix, count: v.count, MB: Math.round(v.bytes / 10485.76) / 100 }));
+    return { totalMB: Math.round(total / 10485.76) / 100, rows, stringPrefixes };
+}
+
+/**
+ * Record what actually reaches the speakers — the final mix after masterGain and the limiter —
+ * for `seconds`, as 16-bit PCM. A tap AudioWorklet is connected in parallel to the engine's
+ * output node, so what it hears is exactly the signal the destination gets. Every in-emulator
+ * audio counter describes an intermediate stage; this is the one that describes the result.
+ */
+export async function captureAudioOutput(
+    session: CdpSession, seconds: number,
+): Promise<{ rate: number; frames: number; clippedFrames: number; baseLatency: number; outputLatency: number; pcm: Buffer }> {
+    const expr = `(async () => {
+  const eng = window.__BS__?.audioEngine;
+  const ctx = eng?.context, tap = eng?.masterLimiterNode;
+  if (!ctx || !tap) return { err: 'no audio engine / output node (is a game with audio running?)', state: ctx?.state };
+  const code = "class R extends AudioWorkletProcessor{constructor(){super();this.on=true;this.port.onmessage=()=>{this.on=false}}process(i){const c=i[0];if(this.on&&c&&c.length){this.port.postMessage([c[0].slice(),(c[1]||c[0]).slice()])}return this.on}}registerProcessor('bs-capture-tap',R)";
+  if (!window.__bsCaptureTapLoaded) { await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'application/javascript' }))); window.__bsCaptureTapLoaded = true; }
+  const node = new AudioWorkletNode(ctx, 'bs-capture-tap', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+  const sink = ctx.createGain(); sink.gain.value = 0;
+  const L = [], R = []; let n = 0; const want = Math.round(ctx.sampleRate * ${seconds});
+  const done = new Promise(res => { node.port.onmessage = (e) => { L.push(e.data[0]); R.push(e.data[1]); n += e.data[0].length; if (n >= want) res(); }; });
+  tap.connect(node); node.connect(sink); sink.connect(ctx.destination);
+  await Promise.race([done, new Promise(r => setTimeout(r, ${seconds} * 1000 + 5000))]);
+  node.port.postMessage(0); tap.disconnect(node); node.disconnect(); sink.disconnect();
+  const frames = Math.min(n, want); const pcm = new Int16Array(frames * 2); let k = 0, clip = 0;
+  outer: for (let b = 0; b < L.length; b++) for (let i = 0; i < L[b].length; i++) { if (k >= frames) break outer;
+    const l = L[b][i], r = R[b][i]; if (Math.abs(l) >= 1 || Math.abs(r) >= 1) clip++;
+    pcm[2*k] = Math.max(-32768, Math.min(32767, Math.round(l * 32767))); pcm[2*k+1] = Math.max(-32768, Math.min(32767, Math.round(r * 32767))); k++; }
+  const bytes = new Uint8Array(pcm.buffer); let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return { rate: ctx.sampleRate, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency, frames, clip, b64: btoa(bin) };
+})()`;
+    const r = await pageEval(session, expr, { timeoutMs: (seconds + 30) * 1000 });
+    if (!r || r.err) throw new Error(`audiocapture: ${r?.err ?? "no result"}${r?.state ? ` (context ${r.state})` : ""}`);
+    return { rate: r.rate, frames: r.frames, clippedFrames: r.clip, baseLatency: r.baseLatency, outputLatency: r.outputLatency, pcm: Buffer.from(r.b64, "base64") };
+}
+
 /** Capture a page screenshot (PNG base64). */
-export async function screenshot(session: CdpSession): Promise<string> {
-    const r = await session.send("Page.captureScreenshot", { format: "png" });
-    return r.result?.data ?? "";
+/**
+ * Page.captureScreenshot waits for the next COMPOSITOR frame and Chrome puts no deadline
+ * on it: with a guest saturating the renderer it can sit for minutes, during which the
+ * emulator keeps running. A capture that silently lets wall-clock pass invalidates every
+ * timing-sensitive observation bracketed by it — a minute-long intro can start and finish
+ * between the click and the picture of it. So it is bounded and fails loudly; the worker's
+ * own `shot` verb reads the present mirror and does not depend on the compositor.
+ */
+export async function screenshot(session: CdpSession, opts: { timeoutMs?: number } = {}): Promise<string> {
+    const timeoutMs = opts.timeoutMs ?? 20_000;
+    try {
+        const r = await session.send("Page.captureScreenshot", { format: "png" }, undefined, { timeoutMs });
+        return r.result?.data ?? "";
+    } catch (e) {
+        throw new Error(
+            `${(e as Error).message} — the tab produced no compositor frame in time (a busy or ` +
+            "backgrounded guest does this). Wall-clock passed with the guest running: treat any " +
+            "timing-sensitive observation around this call as void, and use the harness `shot` " +
+            "verb (present mirror) rather than the CDP capture.",
+        );
+    }
 }
 
 export interface HealthReport {
     vite: boolean;
+    /** Vite still TRANSFORMS source, not just serves cached static replies. */
+    viteTransform: boolean;
     logServer: boolean;
     chrome: boolean;
     devTab: boolean;
+    /** The sidecar answering /health says nothing about whether it can WRITE. Present only
+     *  when the archive is degraded — a session losing log lines must not read as green. */
+    logArchive?: { droppedLines: number; writeErrors: number; bufferedMB: number; lastError: string | null };
 }
 
 /** Hard-reload the ?game=dev tab (cache bypass) and poll until harness + loadApp are ready. */
@@ -375,16 +839,216 @@ export async function reloadDevPage(opts: { url?: string; port?: number; settleM
     throw new Error("harness not ready after page reload");
 }
 
-/** Probe all three services (Vite has no /health — GET the dev URL instead). */
+/** A module Vite must run through its transform pipeline to answer — the root and
+ *  index.html come back from a static/cached path even when the transform pipeline
+ *  is wedged, so `vite: true` alone cannot distinguish "serving" from "working". */
+const VITE_TRANSFORM_PROBE = "/src/app/App.tsx";
+
+/** Probe all three services (Vite has no /health — GET the dev URL instead).
+ *  `viteTransform` is the load-bearing one: a wedged Vite still answers 200 on the
+ *  root while every real module request hangs, which presents as "the page loads but
+ *  nothing renders / the guest never boots" and sends you hunting inside the game. */
+/**
+ * Vite's cold start in this project is ~2 minutes (measured: 116 s cold, 89 s warm), which
+ * is long enough that a live server is repeatedly mistaken for a hung one and killed.
+ * Everything below exists so nobody has to make that judgement by eye.
+ */
+const VITE_COLD_START_MS = 300_000;
+/** Long TTL for the same reason: stealing this lock mid-cold-start starts a second Vite. */
+const VITE_LOCK_TTL_MS = 360_000;
+
+async function viteTransformOk(timeoutMs = 20_000): Promise<boolean> {
+    try {
+        const origin = new URL(DEFAULT_DEV_URL).origin;
+        return (await fetch(`${origin}${VITE_TRANSFORM_PROBE}`, { signal: AbortSignal.timeout(timeoutMs) })).ok;
+    } catch { return false; }
+}
+
+/** `.vite-temp` untouched for this long is a leftover, not an optimizer mid-run. */
+const VITE_TEMP_STALE_MS = 120_000;
+
+/**
+ * Vite pre-bundles deps into `node_modules/.vite-temp` and renames it to `.vite/deps`.
+ * When that rename does not happen — which it does under concurrent starts — every dep
+ * request 504s forever and no amount of waiting recovers it.
+ *
+ * `.vite-temp` present and `.vite/deps` absent is ALSO the normal state of an optimizer that
+ * is simply still running, so that pair alone is not the failure — deleting on it destroys a
+ * healthy cold start. The failure needs a second witness: nothing is listening on the dev
+ * port (so no optimizer can be writing), or the directory has not been touched in minutes.
+ */
+function repairViteDepCache(listening: boolean): boolean {
+    const temp = join(process.cwd(), "node_modules", ".vite-temp");
+    const deps = join(process.cwd(), "node_modules", ".vite", "deps");
+    if (!existsSync(temp) || existsSync(deps)) return false;
+    if (listening) {
+        let age = 0;
+        try { age = Date.now() - statSync(temp).mtimeMs; } catch { return false; }
+        if (age < VITE_TEMP_STALE_MS) return false;   // an optimizer is still working
+    }
+    rmSync(temp, { recursive: true, force: true });
+    rmSync(join(process.cwd(), "node_modules", ".vite"), { recursive: true, force: true });
+    return true;
+}
+
+/** Detached `bun run dev`, so it outlives this process on every platform. */
+function spawnVite(): void {
+    if (!IS_WIN) {
+        Bun.spawn(["bun", "run", "dev"], {
+            cwd: process.cwd(), stdin: "ignore", stdout: "ignore", stderr: "ignore",
+        }).unref();
+        return;
+    }
+    // A plain Bun.spawn child dies with bun on Windows, hence Start-Process. PowerShell
+    // single-quoted literals escape a quote by doubling it — a repo path containing one
+    // would otherwise terminate the string and change the command.
+    const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
+    Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+        `Start-Process -FilePath 'bun' -ArgumentList 'run','dev' -WorkingDirectory ${q(process.cwd())} -WindowStyle Hidden`]);
+}
+
+function killWedgedVite(): void {
+    if (!IS_WIN) { Bun.spawnSync(["pkill", "-f", "vite"]); return; }
+    // By PID via the listening socket — matching 'vite' on the command line kills every
+    // Vite on the machine, including other agents' and other checkouts'.
+    const port = new URL(DEFAULT_DEV_URL).port || "5174";
+    Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+        `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ` +
+        `ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }`]);
+}
+
+/**
+ * Make sure exactly one healthy Vite is serving, starting or repairing it if not.
+ *
+ * The lock is the point: several agents each running `harness up` used to start several
+ * Vites, and they share one dep-optimizer cache directory — which is how the rename above
+ * gets lost in the first place. A loser of the lock waits for the winner instead of
+ * starting a competitor.
+ */
+export async function ensureVite(): Promise<{ ok: boolean; action: string }> {
+    if (await viteTransformOk(8_000)) return { ok: true, action: "already-serving" };
+
+    const port = Number(new URL(DEFAULT_DEV_URL).port || 5174);
+    const release = acquireLaunchLock(port, "vite", VITE_LOCK_TTL_MS);
+    if (!release) {
+        // Someone else is starting it; a cold start is minutes, so wait rather than race.
+        const deadline = Date.now() + VITE_COLD_START_MS;
+        while (Date.now() < deadline) {
+            if (await viteTransformOk(10_000)) return { ok: true, action: "waited-for-other-starter" };
+            await Bun.sleep(3_000);
+        }
+        return { ok: false, action: "timed-out-waiting-for-other-starter" };
+    }
+
+    try {
+        const listening = await (async () => { try { return (await fetch(new URL(DEFAULT_DEV_URL).origin, { signal: AbortSignal.timeout(5_000) })).ok; } catch { return false; } })();
+        // Serving static but not transforming = wedged, and it will never recover on its own —
+        // but the tmpdir lock does not cover a hand-started `bun run dev`, so this process
+        // cannot tell "wedged" from "another agent's, mid-cold-start". Killing it on a guess is
+        // indistinguishable from sabotage in a parallel session, so say what is wrong and let
+        // the owner decide.
+        if (listening && !process.env.BS_VITE_FORCE_RESTART) {
+            console.error(`[ensureVite] :${port} is serving but not transforming, and this process did not start it.`);
+            console.error("  Restart it yourself, or set BS_VITE_FORCE_RESTART=1 to let the harness do it.");
+            return { ok: false, action: "wedged-but-not-ours" };
+        }
+        if (listening) {
+            killWedgedVite();
+            for (let i = 0; i < 30 && await portInUse(port); i++) await Bun.sleep(1_000);
+        }
+        const repaired = repairViteDepCache(false);
+        spawnVite();
+        const deadline = Date.now() + VITE_COLD_START_MS;
+        while (Date.now() < deadline) {
+            if (await viteTransformOk(10_000)) {
+                return { ok: true, action: repaired ? "repaired-and-restarted" : "started" };
+            }
+            await Bun.sleep(3_000);
+        }
+        return { ok: false, action: "started-but-not-ready" };
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Make sure the dev sidecar is serving, starting a DETACHED one if not.
+ *
+ * It must be up before the page loads: `src/utils/bundle-url.ts` probes :3001 once per page
+ * and caches the answer, so a tab opened while the sidecar is down streams every bundle for
+ * its whole life through Vite's fallback route — the slow path the sidecar exists to avoid.
+ *
+ * Its stdout goes to a FILE, never to an inherited pipe with nobody draining it: a detached
+ * daemon writing into a pipe no one reads is a stall waiting to happen, and the file is also
+ * where a degraded-archive report can be read after the fact.
+ */
+export async function ensureSidecar(): Promise<{ ok: boolean; action: string }> {
+    const healthy = async (timeoutMs: number) => {
+        try {
+            const r = await fetch(`http://localhost:${SIDECAR_PORT}/health`, { signal: AbortSignal.timeout(timeoutMs) });
+            return (await r.text()).trim() === "OK";
+        } catch { return false; }
+    };
+    if (await healthy(2_000)) return { ok: true, action: "already-serving" };
+
+    const release = acquireLaunchLock(SIDECAR_PORT, "sidecar", 20_000);
+    if (!release) {
+        for (let i = 0; i < 20; i++) {
+            if (await healthy(1_000)) return { ok: true, action: "waited-for-other-starter" };
+            await Bun.sleep(500);
+        }
+        return { ok: false, action: "timed-out-waiting-for-other-starter" };
+    }
+    try {
+        if (await healthy(1_000)) return { ok: true, action: "already-serving" };
+        const script = join(process.cwd(), "tools", "dev-sidecar", "dev-sidecar.ts");
+        const logDir = join(process.cwd(), "logs");
+        mkdirSync(logDir, { recursive: true });
+        const out = join(logDir, "dev-sidecar.out.log");
+        const err = join(logDir, "dev-sidecar.err.log");
+        if (IS_WIN) {
+            const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
+            Bun.spawnSync(["powershell", "-NoProfile", "-Command",
+                `Start-Process -FilePath 'bun' -ArgumentList 'run',${q(script)} -WorkingDirectory ${q(process.cwd())} ` +
+                `-WindowStyle Hidden -RedirectStandardOutput ${q(out)} -RedirectStandardError ${q(err)}`]);
+        } else {
+            Bun.spawn(["bun", "run", script], {
+                cwd: process.cwd(), stdin: "ignore",
+                stdout: openSync(out, "a"), stderr: openSync(err, "a"),
+            }).unref();
+        }
+        for (let i = 0; i < 40; i++) {
+            if (await healthy(1_000)) return { ok: true, action: "started" };
+            await Bun.sleep(250);
+        }
+        return { ok: false, action: `started-but-not-answering (see ${err})` };
+    } finally {
+        release();
+    }
+}
+
+async function portInUse(port: number): Promise<boolean> {
+    try { await fetch(`http://localhost:${port}/`, { signal: AbortSignal.timeout(2_000) }); return true; } catch { return false; }
+}
+
 export async function health(opts: { port?: number } = {}): Promise<HealthReport> {
     const port = opts.port ?? DEFAULT_CDP_PORT;
     const probe = async (url: string, init?: RequestInit) => {
         try { return (await fetch(url, init)).ok; } catch { return false; }
     };
-    const vite = (await probe("http://localhost:5174/health")) || (await probe(DEFAULT_DEV_URL));
-    const logServer = await (async () => {
-        try { return (await (await fetch("http://localhost:3001/health")).text()).trim() === "OK"; } catch { return false; }
+    const viteOrigin = new URL(DEFAULT_DEV_URL).origin;
+    const vite = (await probe(`${viteOrigin}/health`)) || (await probe(DEFAULT_DEV_URL));
+    // Needs its own deadline: the wedged mode HANGS rather than erroring.
+    const viteTransform = await (async () => {
+        try {
+            const r = await fetch(`${viteOrigin}${VITE_TRANSFORM_PROBE}`, { signal: AbortSignal.timeout(15_000) });
+            return r.ok;
+        } catch { return false; }
     })();
+    const logServer = await (async () => {
+        try { return (await (await fetch(`http://localhost:${SIDECAR_PORT}/health`)).text()).trim() === "OK"; } catch { return false; }
+    })();
+    const logArchive = logServer ? await sidecarArchiveHealth() : undefined;
     let chrome = false, devTab = false;
     try {
         await fetchJson(port, "/json/version");
@@ -392,5 +1056,28 @@ export async function health(opts: { port?: number } = {}): Promise<HealthReport
         await findTab(GAME_DEV_FILTER, { port });
         devTab = true;
     } catch { /* */ }
-    return { vite, logServer, chrome, devTab };
+    return { vite, viteTransform, logServer, chrome, devTab, ...(logArchive ? { logArchive } : {}) };
+}
+
+interface SidecarStats {
+    sessions: Array<{ bufferedChars: number; droppedLines: number; writeErrors: number; lastError: string | null }>;
+}
+
+/** Summed over sessions; undefined when the archive is healthy, so `health()` stays terse. */
+async function sidecarArchiveHealth(): Promise<HealthReport["logArchive"]> {
+    try {
+        const s = await (await fetch(`http://localhost:${SIDECAR_PORT}/stats`,
+            { signal: AbortSignal.timeout(3_000) })).json() as SidecarStats;
+        const sum = (pick: (x: SidecarStats["sessions"][number]) => number) =>
+            s.sessions.reduce((a, x) => a + pick(x), 0);
+        const droppedLines = sum((x) => x.droppedLines);
+        const writeErrors = sum((x) => x.writeErrors);
+        if (!droppedLines && !writeErrors) return undefined;
+        return {
+            droppedLines,
+            writeErrors,
+            bufferedMB: Math.round(sum((x) => x.bufferedChars) / 1e5) / 10,
+            lastError: s.sessions.find((x) => x.lastError)?.lastError ?? null,
+        };
+    } catch { return undefined; }   // an older sidecar has no /stats
 }

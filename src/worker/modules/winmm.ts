@@ -1,7 +1,7 @@
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
-import { registerWinmmJoystickExports } from "./winmm-joystick";
+import { type HleDispatcher, ThunkImplementation } from "../core/thunking/thunk-dispatcher";
+import { registerWinmmJoystickExports, resetWinmmJoystick } from "./winmm-joystick";
 import { registerWinmmCapsExports } from "./winmm-caps";
 import { registerWinmmMciExports } from "./winmm-mci";
 import type { WinmmMci } from "./winmm-mci";
@@ -12,6 +12,7 @@ import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
 import { TimerKind } from "../core/scheduler/types";
 import { findResourceInPE } from "./kernel32/resource";
+import { probeAudioAt } from "@bottleship/formats/audio";
 import {
     createAudioRingBuffer,
     writeRingData,
@@ -33,11 +34,20 @@ import {
     FLAG_STREAMING,
 } from "../../audio/audio-ring-buffer";
 import { ensureAudioStatsSab } from "./audio-stats-sab";
+import type { VfsFileHandle, VirtualFileSystem } from "../runtime/filesystem/vfs";
 
 const MMSYSERR_NOERROR = 0;
 const MMSYSERR_BADDEVICEID = 2;
 const MMSYSERR_INVALPARAM = 11;
 const MMSYSERR_ERROR = 1;
+const MMSYSERR_NOTENABLED = 3;
+const MMSYSERR_ALLOCATED = 4;
+const MMSYSERR_INVALHANDLE = 5;
+const MMSYSERR_NODRIVER = 6;
+const MMSYSERR_NOMEM = 7;
+const MMSYSERR_NOTSUPPORTED = 8;
+const MMSYSERR_BADERRNUM = 9;
+const MMSYSERR_INVALFLAG = 10;
 const TIME_ONESHOT = 0x0000;
 const TIME_PERIODIC = 0x0001;
 const TIME_CALLBACK_FUNCTION = 0x0000;
@@ -46,6 +56,14 @@ const TIME_CALLBACK_EVENT_PULSE = 0x0020;
 const TIME_CALLBACK_TYPEMASK = 0x0030;
 const TIME_KILL_SYNCHRONOUS = 0x0100;
 const DEBUG_WINMM_TIMER = true;
+// Installable-driver messages (mmsystem.h) answered by DefDriverProc.
+const DRV_LOAD = 0x0001;
+const DRV_ENABLE = 0x0002;
+const DRV_DISABLE = 0x0005;
+const DRV_FREE = 0x0006;
+const DRV_INSTALL = 0x0009;
+const DRV_REMOVE = 0x000a;
+const DRV_SUCCESS = 0x0001;
 const JOYERR_NOERROR = 0;
 const JOYERR_UNPLUGGED = 167;
 
@@ -62,6 +80,7 @@ const MMIO_READ = 0x00000000;
 const MMIO_WRITE = 0x00000001;
 const MMIO_READWRITE = 0x00000002;
 const MMIO_ALLOCBUF = 0x00010000;
+const MMIO_CREATE = 0x00001000;
 const MMIOERR_FILENOTFOUND = 257;
 const MMIOERR_CANNOTOPEN = 259;
 const MMIOERR_CANNOTREAD = 260;
@@ -92,31 +111,109 @@ const MMIOINFO_SIZE       = 72;   // sizeof(MMIOINFO)
 // Windows uses an internal 8KB buffer; a larger window cuts mmioAdvance churn.
 const MMIO_GUEST_BUFSIZE  = 64 * 1024;
 const FCC_DOS = 0x20534f44; // 'DOS ' — fccIOProc for a plain disk file
+const FCC_MEM = 0x204d454d; // 'MEM ' — fccIOProc for a memory file
+
+/**
+ * Does this mmioOpen select the MEMORY I/O proc? MMIOINFO decides: fccIOProc, else pIOProc,
+ * and ONLY when both are absent does mmioOpen parse the name (Wine MMIO_Open). So 'MEM ' is a
+ * memory file whatever szFilename says — mmioMemIOProc ignores the name — and a caller that
+ * passes the asset's own name alongside its buffer (THPS2 does, for every sound it has already
+ * read out of its .pkr) must not be sent to the disk path, where that name does not exist.
+ */
+export function mmioSelectsMemoryIoProc(
+    hasInfo: boolean, fccIOProc: number, pIOProc: number, filename: string,
+): boolean {
+    if (!hasInfo) return false;
+    if (fccIOProc === FCC_MEM) return true;
+    return !filename && !fccIOProc && !pIOProc;
+}
+
+/** A file's bytes, read by range. */
+export interface MmioByteSource {
+    readonly size: number;
+    /** Up to `length` bytes at `offset` — short only at EOF — or null when unreadable. */
+    read(offset: number, length: number): Uint8Array | null;
+}
+
+const EMPTY_BYTES = new Uint8Array(0);
+
+export function mmioArraySource(data: Uint8Array): MmioByteSource {
+    return {
+        size: data.length,
+        read: (offset, length) => {
+            const from = Math.max(0, Math.min(offset, data.length));
+            return data.subarray(from, Math.min(data.length, from + Math.max(0, length)));
+        },
+    };
+}
+
+/**
+ * A disk file read on demand through mmio's own file object, as mmioDosIOProc reads it: the
+ * size of the file is never the size of a read, so an archive of hundreds of MB opens as
+ * cheaply as a lone WAV. Holds one read-ahead window so a chunk walk (12-byte headers) does
+ * not cross the VFS once per header.
+ */
+export class VfsMmioSource implements MmioByteSource {
+    private winStart = 0;
+    private win: Uint8Array = EMPTY_BYTES;
+
+    constructor(
+        private readonly handle: VfsFileHandle,
+        readonly size: number,
+        private readonly vfs: Pick<VirtualFileSystem, "setPosition" | "readSync"> = System.getInstance().fileSystem,
+    ) {}
+
+    read(offset: number, length: number): Uint8Array | null {
+        const from = Math.max(0, Math.min(offset, this.size));
+        const to = Math.min(this.size, from + Math.max(0, length));
+        if (to <= from) return EMPTY_BYTES;
+        if (from >= this.winStart && to <= this.winStart + this.win.length) {
+            return this.win.subarray(from - this.winStart, to - this.winStart);
+        }
+        const want = Math.min(this.size - from, Math.max(to - from, MMIO_GUEST_BUFSIZE));
+        const out = new Uint8Array(want);
+        let filled = 0;
+        this.vfs.setPosition(this.handle, from, 0 /* FILE_BEGIN */);
+        while (filled < want) {
+            const chunk = this.vfs.readSync(this.handle, want - filled);
+            if (!chunk || chunk.length === 0) break;
+            out.set(chunk, filled);
+            filled += chunk.length;
+        }
+        // Short of the request mid-file is a failed read, not a short file.
+        if (filled < to - from) return null;
+        this.winStart = from;
+        this.win = out.subarray(0, filled);
+        return this.win.subarray(0, to - from);
+    }
+}
 
 /** The MMIO direct-I/O buffering state an MMIOHandle carries (subset used by the
  *  pure helpers below). Kept structural so it's testable without the WinMM class. */
 export interface MmioBufState {
-    data: Uint8Array | null;
+    /** A disk file's bytes; null for a memory file, whose bytes are the guest's. */
+    source: MmioByteSource | null;
     position: number;
     guestBuffer?: number;
     guestBufferSize?: number;
     bufFileOffset?: number;
     bufFilled?: number;
+    /** Memory file: guestBuffer aliases the caller's own block (see MMIOHandle). */
+    memoryBase?: number;
 }
 
 /**
- * Copy a window of `state.data` starting at `state.position` into the already-allocated
+ * Copy a window of the disk file starting at `state.position` into the already-allocated
  * guest buffer, recording how many bytes are live (bufFilled) and where the window starts
- * in the file (bufFileOffset). Returns the byte count (0 at EOF). Pure aside from Mem writes.
+ * in the file (bufFileOffset). Returns the byte count (0 at EOF or on a failed read).
  */
 export function mmioFillGuestWindow(state: MmioBufState): number {
-    if (!state.data || !state.guestBuffer) return 0;
+    if (!state.source || !state.guestBuffer) return 0;
     const cap = state.guestBufferSize ?? MMIO_GUEST_BUFSIZE;
-    const start = Math.max(0, Math.min(state.position, state.data.length));
-    const n = Math.min(cap, state.data.length - start);
-    if (n > 0) {
-        Mem.writeBytes(state.guestBuffer, state.data.subarray(start, start + n));
-    }
+    const start = Math.max(0, Math.min(state.position, state.source.size));
+    const bytes = state.source.read(start, cap);
+    const n = bytes?.length ?? 0;
+    if (n > 0) Mem.writeBytes(state.guestBuffer, bytes!);
     state.bufFileOffset = start;
     state.bufFilled = n;
     return n;
@@ -126,18 +223,44 @@ export function mmioFillGuestWindow(state: MmioBufState): number {
  * Write the MMIOINFO direct-I/O fields (buffer pointers + offsets) for `state`, assuming
  * its guest buffer is currently filled starting at state.bufFileOffset.
  */
+/**
+ * The bytes an MMIO handle reads from, given the CURRENT guest memory.
+ *
+ * For a MEMORY file the bytes ARE the guest's block, so this must be re-derived on every
+ * use (§3.1): a plain view stored across turns detaches the instant WASM memory grows, and
+ * a detached view answers length 0 — the file would then report EOF instead of failing, and
+ * the caller's sound or video would simply go quiet with nothing logged. A disk file's
+ * source owns no guest view and is returned unchanged.
+ */
+export function mmioResolveSource(state: MmioBufState, mem: Uint8Array | null): MmioByteSource | null {
+    if (!state.memoryBase) return state.source;
+    if (!mem) return null;
+    const size = state.guestBufferSize ?? 0;
+    if (state.memoryBase + size > mem.length) return null;
+    return mmioArraySource(mem.subarray(state.memoryBase, state.memoryBase + size));
+}
+
 export function mmioWriteInfoStruct(lpmmioinfo: number, hmmio: number, state: MmioBufState): void {
     const base = state.guestBuffer ?? 0;
     const filled = state.bufFilled ?? 0;
     const bufOff = state.bufFileOffset ?? 0;
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_DWFLAGS,    MMIO_READ | MMIO_ALLOCBUF);
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_FCCIOPROC,  FCC_DOS);
+    // A memory file's buffer is the caller's, so neither ALLOCBUF nor the disk IOProc apply.
+    const isMem = !!state.memoryBase;
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_DWFLAGS,    isMem ? MMIO_READ : (MMIO_READ | MMIO_ALLOCBUF));
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_FCCIOPROC,  isMem ? FCC_MEM : FCC_DOS);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PIOPROC,    0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET,  0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_HTASK,      0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_CCHBUFFER,  state.guestBufferSize ?? 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHBUFFER,  base);
-    Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHNEXT,    base);
+    // pchNext is the READ CURSOR, not the buffer start: it must land on the current file
+    // position within the window. Handing back `base` rewinds the caller to offset 0, and
+    // a caller that reads its data through the buffer (rather than through mmioRead) then
+    // consumes the file from the beginning — for a WAV that means decoding the letters
+    // "RIFF" as audio, which is heard as loud, structured, saturating garbage rather than
+    // reported as an error.
+    const cursor = Math.max(0, Math.min((state.position ?? 0) - bufOff, filled));
+    Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHNEXT,    (base + cursor) >>> 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHENDREAD, (base + filled) >>> 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_PCHENDWRITE,(base + filled) >>> 0);
     Mem.writeUint32(lpmmioinfo + MMIOINFO_LBUFOFFSET, bufOff);
@@ -180,6 +303,10 @@ const WHDR_INQUEUE = 0x00000010;
 const WAVE_FORMAT_QUERY  = 0x0001;
 const WAVE_FORMAT_DIRECT = 0x0008;
 
+// Target queued-ahead depth (ms of audio in the SAB ring past the play cursor)
+// maintained by early-completing interior buffers — see checkCompletions.
+const WAVEOUT_DEVICE_LEAD_MS = 60;
+
 const TIME_MS = 0x0001;
 const TIME_SAMPLES = 0x0002;
 const TIME_BYTES = 0x0004;
@@ -187,9 +314,9 @@ const TIME_BYTES = 0x0004;
 interface MMIOHandle {
     filename: string;
     position: number;
-    data: Uint8Array | null;
+    source: MmioByteSource | null;
     /** Guest-side I/O buffer for direct memory access (pchBuffer/pchNext/pchEndRead).
-     *  Allocated lazily on first mmioGetInfo. Holds a rotating window of `data`. */
+     *  Allocated lazily on first mmioGetInfo. Holds a rotating window of the file. */
     guestBuffer?: number;
     /** Capacity of guestBuffer in bytes. */
     guestBufferSize?: number;
@@ -197,6 +324,9 @@ interface MMIOHandle {
     bufFileOffset?: number;
     /** Valid bytes currently held in guestBuffer (pchEndRead - pchBuffer). */
     bufFilled?: number;
+    /** Set for a MEMORY file (mmioOpen with a NULL name): the caller's own buffer IS the
+     *  file, so guestBuffer aliases it and must never be freed or refilled by us. */
+    memoryBase?: number;
 }
 
 type TimerCallbackMode = "function" | "event_set" | "event_pulse";
@@ -225,6 +355,8 @@ export interface PendingTimerCallback {
     sourceTimer?: WinMMTimer;
     /** If set, use these args directly instead of [timerId, 0, dwUser, 0, 0] */
     args?: number[];
+    /** Runs once the guest callback has returned (a thread-pool callback instance ending). */
+    onReturn?: () => void;
 }
 
 interface WaveFormat {
@@ -294,6 +426,14 @@ export class WinMM implements IModule {
     /** MCI subsystem (device registry + AVI playback) — see winmm-mci.ts. Created in initialize(). */
     private mci: WinmmMci | null = null;
     private periodRefCounts: Map<number, number> = new Map();
+
+    private publishTimerResolution(): void {
+        let finest: number | null = null;
+        for (const period of this.periodRefCounts.keys()) {
+            if (finest === null || period < finest) finest = period;
+        }
+        TimeService.getInstance().setTimerResolutionMs(finest);
+    }
     private waveOutDevices: Map<number, WaveOutDevice> = new Map();
     private nextWaveOutId = 0x20000000;
 
@@ -307,6 +447,8 @@ export class WinMM implements IModule {
     private timerThreadHandle: number = 0;
     public timerWakeEvent: number = 0;
     private pendingTimerCallbacks: PendingTimerCallback[] = [];
+    /** The posted callback now running on the pump, while it carries an onReturn. */
+    private dispatchingPosted: PendingTimerCallback | null = null;
     /** Head index for O(1) dequeue — avoids Array.shift() on every timer callback (~100Hz). */
     private pendingTimerHead = 0;
     private dispatchingTimerCallback: WinMMTimer | null = null;
@@ -347,8 +489,17 @@ export class WinMM implements IModule {
      * can read audio bytes directly via pchBuffer..pchEndRead (mmioGetInfo/mmioAdvance).
      * Returns the number of bytes loaded (0 at EOF / on failure).
      */
+    /** The handle's bytes, re-derived from the CURRENT guest memory — see mmioResolveSource. */
+    private mmioSource(mmio: MMIOHandle): MmioByteSource | null {
+        return mmioResolveSource(mmio, System.getInstance().process?.getCurrentMemory() ?? null);
+    }
+
     private mmioRefillGuestBuffer(mmio: MMIOHandle): number {
-        if (!mmio.data) return 0;
+        const source = this.mmioSource(mmio);
+        if (!source) return 0;
+        // A memory file has no window to slide: the caller's whole block is already the file,
+        // and copying it over itself would be both pointless and destructive of guest writes.
+        if (mmio.memoryBase) return Math.max(0, source.size - mmio.position);
         if (!mmio.guestBuffer) {
             const mem = System.getInstance().process?.memory;
             const cap = MMIO_GUEST_BUFSIZE;
@@ -395,6 +546,7 @@ export class WinMM implements IModule {
         if (this.pendingTimerHead > 32 && this.pendingTimerHead > (this.pendingTimerCallbacks.length >> 1)) {
             this.compactPendingQueue();
         }
+        this.dispatchingPosted = cb?.onReturn ? cb : null;
         if (cb?.sourceTimer) {
             this.dispatchingTimerCallback = cb.sourceTimer;
         } else if (cb) {
@@ -551,11 +703,10 @@ export class WinMM implements IModule {
      * Fast-path timeSetEvent: self-rearm refresh only (NFSU FUN_0063eaa0 hot path).
      * Returns timer id on success, null to fall through to full export.
      */
-    fastPathTimeSetEvent(cpu: { reg32: number[] }, view: DataView): number | null {
+    fastPathTimeSetEvent(esp: number, view: DataView): number | null {
         // A/B kill-switch: fall through to the full export so the self-rearm collapse can be
         // bisected out of a timer/audio regression. `dbgFlag('__noFastTimeSetEvent', true)`.
         if ((globalThis as any).__noFastTimeSetEvent) return null;
-        const esp = cpu.reg32[4] >>> 0;
         const uDelay = view.getUint32(esp + 4, true);
         const fuEvent = view.getUint32(esp + 20, true);
         const callbackType = fuEvent & TIME_CALLBACK_TYPEMASK;
@@ -583,14 +734,13 @@ export class WinMM implements IModule {
         return newTimerId;
     }
 
-    registerFastPathTimerFunctions(dispatcher: any): void {
+    registerFastPathTimerFunctions(dispatcher: HleDispatcher): void {
         if (!dispatcher?.registerFastPath) return;
         const mod = this;
         dispatcher.registerFastPath(
             'winmm',
             'timeSetEvent',
-            (cpu: { reg32: number[] }, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView) =>
-                mod.fastPathTimeSetEvent(cpu, view),
+            (esp: number, view: DataView) => mod.fastPathTimeSetEvent(esp, view),
             { trivial: true },
         );
     }
@@ -631,18 +781,22 @@ export class WinMM implements IModule {
 
         this.updatePlayedBytes(device);
 
-        // Look-ahead: complete buffers slightly before the play cursor reaches their
-        // exact end. waveOutWrite already copied data to the ring, so WHDR_DONE just
-        // means "you can reuse your guest buffer." The look-ahead compensates for the
-        // ~5ms poller interval — without it, each buffer's completion is delayed by
-        // 0-5ms, and over 16 buffers this causes ~10% audio underrun.
-        // 5ms of audio data at the device's byte rate matches the poller interval.
+        // WHDR_DONE = mixer-consumed (WDM contract), clocked by the real play cursor.
+        // A buffer with a queued successor may complete up to WAVEOUT_DEVICE_LEAD_MS
+        // early to absorb our completion-delivery latency; the LAST pending buffer
+        // completes only at true playback end, so drain semantics stay exact.
+        const ringBytes = getCtrl(device.sab, CTRL_BUFFER_BYTES);
         const lookAheadBytes = Math.ceil(device.format.avgBytesPerSec * 0.005);
+        const leadBytes = Math.min(
+            Math.ceil(device.format.avgBytesPerSec * (WAVEOUT_DEVICE_LEAD_MS / 1000)),
+            ringBytes >> 2,
+        );
 
         while (device.pendingBuffers.length > 0) {
             const pending = device.pendingBuffers[0];
-            const completionThreshold = Math.max(0, pending.endOffset - lookAheadBytes);
-            if (device.playedBytes >= completionThreshold) {
+            const unplayedThroughEnd = pending.endOffset - device.playedBytes;
+            const threshold = device.pendingBuffers.length > 1 ? leadBytes : lookAheadBytes;
+            if (unplayedThroughEnd <= threshold) {
                 device.pendingBuffers.shift();
 
                 // Set WHDR_DONE, clear WHDR_INQUEUE in guest memory
@@ -809,11 +963,39 @@ export class WinMM implements IModule {
      * The callback is self-cleaning stdcall (dispatch passes callerCleanup=0). No-op if the
      * pump could not be created.
      */
-    postGuestCallback(callbackAddr: number, args: number[]): void {
-        if (!callbackAddr) return;
+    postGuestCallback(callbackAddr: number, args: number[], onReturn?: () => void): boolean {
+        if (!callbackAddr) return false;
         this.ensureTimerThread();
-        if (this.timerThreadId === 0) return;
-        this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: 0, args });
+        if (this.timerThreadId === 0) return false;
+        this.enqueueTimerCallback({ callbackAddr, timerId: 0, dwUser: 0, args, onReturn });
+        return true;
+    }
+
+    /**
+     * Drop posted callbacks that have not started, e.g. a thread-pool object's pending
+     * callbacks cancelled by WaitForThreadpool*Callbacks(fCancelPendingCallbacks). Returns
+     * the entries removed; one already dispatched is not in the queue and is unaffected.
+     */
+    cancelPostedGuestCallbacks(match: (cb: PendingTimerCallback) => boolean): PendingTimerCallback[] {
+        const removed: PendingTimerCallback[] = [];
+        const kept: PendingTimerCallback[] = [];
+        for (let i = this.pendingTimerHead; i < this.pendingTimerCallbacks.length; i++) {
+            const cb = this.pendingTimerCallbacks[i];
+            (!cb.sourceTimer && match(cb) ? removed : kept).push(cb);
+        }
+        if (removed.length > 0) {
+            this.pendingTimerCallbacks = kept;
+            this.pendingTimerHead = 0;
+        }
+        return removed;
+    }
+
+    /** The timer-pump callback that just returned: finish a posted callback's instance. */
+    notePostedCallbackReturned(callbackAddr: number): void {
+        const cb = this.dispatchingPosted;
+        if (!cb || cb.callbackAddr !== (callbackAddr >>> 0)) return;
+        this.dispatchingPosted = null;
+        cb.onReturn?.();
     }
 
     /**
@@ -922,6 +1104,17 @@ export class WinMM implements IModule {
         return Mem.writeBytes(ptr + copyLen, new Uint8Array([0])) === 1;
     }
 
+    private readWideString(ptr: number, maxLen: number): string {
+        if (!ptr || maxLen <= 0) return "";
+        let out = "";
+        for (let i = 0; i < maxLen; i++) {
+            const ch = Mem.readUint16(ptr + i * 2);
+            if (ch == null || ch === 0) break;
+            out += String.fromCharCode(ch);
+        }
+        return out;
+    }
+
     private writeWideString(ptr: number, cch: number, value: string): boolean {
         if (!ptr) return true;
         if (cch <= 0) return false;
@@ -932,74 +1125,56 @@ export class WinMM implements IModule {
         return Mem.writeUint16(ptr + copyLen * 2, 0);
     }
 
-    private waveOutErrorText(mmrError: number): string {
+    /**
+     * MMRESULT description text. One table, because Windows has one: waveIn, waveOut,
+     * midiIn, midiOut and mixer all return the same MMSYSERR_* codes and their six
+     * GetErrorText entry points read the same strings out of winmm's resources.
+     */
+    private mmErrorText(mmrError: number): string {
         const known: Record<number, string> = {
             [MMSYSERR_NOERROR]: "No error",
             [MMSYSERR_ERROR]: "Unspecified error",
             [MMSYSERR_BADDEVICEID]: "The specified device identifier is out of range.",
+            [MMSYSERR_NOTENABLED]: "The driver was not enabled.",
+            [MMSYSERR_ALLOCATED]: "The specified device is already in use. Wait until it is free, and then try again.",
+            [MMSYSERR_INVALHANDLE]: "The specified device handle is invalid.",
+            [MMSYSERR_NODRIVER]: "There is no driver installed on your system.",
+            [MMSYSERR_NOMEM]: "There is not enough memory available for this task. Quit one or more applications to increase available memory, and then try again.",
+            [MMSYSERR_NOTSUPPORTED]: "The specified device is not supported.",
+            [MMSYSERR_BADERRNUM]: "The specified error number is out of range.",
+            [MMSYSERR_INVALFLAG]: "An invalid flag was passed.",
             [MMSYSERR_INVALPARAM]: "The specified parameter is invalid.",
         };
-        return known[mmrError] ?? `Wave output error ${mmrError}`;
+        return known[mmrError] ?? `Unrecognized error value ${mmrError}`;
     }
 
     /**
-     * Parse a RIFF/WAV header from guest memory.
-     * Returns format info and data offset/size, or null on failure.
+     * Parse a RIFF/WAV header from guest memory. Returns null for anything the
+     * PlaySound path cannot feed the device directly — it hands raw samples to the
+     * ring, so a non-PCM payload must be refused rather than played as noise.
      */
     private parseWavFromMemory(mem: Uint8Array, ptr: number, maxLen: number): {
         channels: number; sampleRate: number; bitsPerSample: number; blockAlign: number;
         dataOffset: number; dataSize: number;
     } | null {
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         if (maxLen < 44) return null;
-
-        // RIFF header
-        const riffId = (view.getUint8(ptr) << 24) | (view.getUint8(ptr + 1) << 16) |
-                       (view.getUint8(ptr + 2) << 8) | view.getUint8(ptr + 3);
-        if (riffId !== 0x52494646) return null; // "RIFF"
-
-        const waveId = (view.getUint8(ptr + 8) << 24) | (view.getUint8(ptr + 9) << 16) |
-                       (view.getUint8(ptr + 10) << 8) | view.getUint8(ptr + 11);
-        if (waveId !== 0x57415645) return null; // "WAVE"
-
-        // Walk chunks starting at offset 12
-        let off = ptr + 12;
-        const end = ptr + maxLen;
-        let channels = 0, sampleRate = 0, bitsPerSample = 0, blockAlign = 0;
-        let dataOffset = 0, dataSize = 0;
-        let foundFmt = false;
-
-        while (off + 8 <= end) {
-            const chunkId = (view.getUint8(off) << 24) | (view.getUint8(off + 1) << 16) |
-                            (view.getUint8(off + 2) << 8) | view.getUint8(off + 3);
-            const chunkSize = view.getUint32(off + 4, true);
-
-            if (chunkId === 0x666D7420) { // "fmt "
-                if (chunkSize < 16 || off + 8 + 16 > end) return null;
-                const format = view.getUint16(off + 8, true);
-                if (format !== WAVE_FORMAT_PCM) {
-                    Logger.warn(LogCategory.SYSTEM, `PlaySound: unsupported WAV format ${format} (only PCM)`);
-                    return null;
-                }
-                channels = view.getUint16(off + 10, true);
-                sampleRate = view.getUint32(off + 12, true);
-                blockAlign = view.getUint16(off + 20, true);
-                bitsPerSample = view.getUint16(off + 22, true);
-                foundFmt = true;
-            } else if (chunkId === 0x64617461) { // "data"
-                dataOffset = off + 8;
-                dataSize = chunkSize;
-            }
-
-            // Advance to next chunk (pad to even boundary)
-            off += 8 + ((chunkSize + 1) & ~1);
+        const probe = probeAudioAt(mem, ptr, maxLen);
+        if (!probe || probe.format !== "wav") return null;
+        if (probe.formatTag !== WAVE_FORMAT_PCM) {
+            Logger.warn(LogCategory.SYSTEM, `PlaySound: unsupported WAV format ${probe.formatTag} (only PCM)`);
+            return null;
         }
+        const dataSize = probe.dataEnd - probe.dataStart;
+        if (dataSize === 0) return null;
 
-        if (!foundFmt || dataSize === 0 || dataOffset === 0) return null;
-        // Clamp data to available memory
-        if (dataOffset + dataSize > end) dataSize = end - dataOffset;
-
-        return { channels, sampleRate, bitsPerSample, blockAlign, dataOffset, dataSize };
+        return {
+            channels: probe.channels,
+            sampleRate: probe.sampleRate,
+            bitsPerSample: probe.bitsPerSample,
+            blockAlign: probe.blockAlign,
+            dataOffset: ptr + probe.dataStart,
+            dataSize,
+        };
     }
 
     /**
@@ -1145,6 +1320,7 @@ export class WinMM implements IModule {
                 return MMSYSERR_INVALPARAM;
             }
             this.periodRefCounts.set(uPeriod, (this.periodRefCounts.get(uPeriod) ?? 0) + 1);
+            this.publishTimerResolution();
             this.timerDebug(`timeBeginPeriod(${uPeriod}) -> MMSYSERR_NOERROR`);
             return MMSYSERR_NOERROR;
         };
@@ -1165,6 +1341,7 @@ export class WinMM implements IModule {
             } else {
                 this.periodRefCounts.set(uPeriod, refCount - 1);
             }
+            this.publishTimerResolution();
             this.timerDebug(`timeEndPeriod(${uPeriod}) -> MMSYSERR_NOERROR`);
             return MMSYSERR_NOERROR;
         };
@@ -1641,33 +1818,52 @@ export class WinMM implements IModule {
             return MMSYSERR_NOERROR;
         };
 
-        this.exports["waveOutGetErrorTextA"] = (_ctx, _mem, args) => {
+        // (mmrError, pszText, cchText) — the shape all six entry points share.
+        const getErrorText = (wide: boolean): ThunkImplementation => (_ctx, _mem, args) => {
             const mmrError = args[0] >>> 0;
             const pszText = args[1] >>> 0;
             const cchText = args[2] >>> 0;
             if (!pszText || cchText === 0) return MMSYSERR_INVALPARAM;
-            if (!this.writeAnsiString(pszText, cchText, this.waveOutErrorText(mmrError))) {
-                return MMSYSERR_ERROR;
-            }
-            return MMSYSERR_NOERROR;
+            const text = this.mmErrorText(mmrError);
+            const written = wide
+                ? this.writeWideString(pszText, cchText, text)
+                : this.writeAnsiString(pszText, cchText, text);
+            return written ? MMSYSERR_NOERROR : MMSYSERR_ERROR;
         };
 
-        this.exports["waveOutGetErrorTextW"] = (_ctx, _mem, args) => {
-            const mmrError = args[0] >>> 0;
-            const pszText = args[1] >>> 0;
-            const cchText = args[2] >>> 0;
-            if (!pszText || cchText === 0) return MMSYSERR_INVALPARAM;
-            if (!this.writeWideString(pszText, cchText, this.waveOutErrorText(mmrError))) {
-                return MMSYSERR_ERROR;
-            }
-            return MMSYSERR_NOERROR;
-        };
+        for (const family of ["waveOut", "waveIn", "midiOut", "midiIn"]) {
+            this.exports[`${family}GetErrorTextA`] = getErrorText(false);
+            this.exports[`${family}GetErrorTextW`] = getErrorText(true);
+        }
 
         // waveIn / midiIn / mixer / aux device-caps and stub handlers live in
         // winmm-caps.ts (same wiring pattern as winmm-joystick).
         registerWinmmCapsExports(this.exports);
 
         registerWinmmJoystickExports(this.exports);
+
+        // ==================== Installable drivers ====================
+
+        // DefDriverProc(dwDriverId, hDrv, msg, lParam1, lParam2) — the default handler an
+        // installable driver's DriverProc tail-calls for the messages it doesn't answer.
+        // Every VfW codec DLL loaded in-process (ir50_32, ir41_32, …) resolves it by name,
+        // and a NULL there is called straight through to EIP 0.
+        const defDriverProc = (_ctx: unknown, _mem: unknown, args: number[]): number => {
+            switch (args[2] ?? 0) {
+                case DRV_LOAD:
+                case DRV_ENABLE:
+                case DRV_DISABLE:
+                case DRV_FREE:
+                    return 1;
+                case DRV_INSTALL:
+                case DRV_REMOVE:
+                    return DRV_SUCCESS;
+                default:
+                    return 0;
+            }
+        };
+        this.exports["DefDriverProc"] = defDriverProc;
+        this.exports["DrvDefDriverProc"] = defDriverProc;
 
         // ==================== MCI Functions ====================
 
@@ -1678,6 +1874,8 @@ export class WinMM implements IModule {
         this.mci = registerWinmmMciExports(this.exports, {
             readAnsiString: (ptr, maxLen) => this.readAnsiString(ptr, maxLen),
             writeAnsiString: (ptr, cch, value) => this.writeAnsiString(ptr, cch, value),
+            readWideString: (ptr, maxLen) => this.readWideString(ptr, maxLen),
+            writeWideString: (ptr, cch, value) => this.writeWideString(ptr, cch, value),
         });
 
         // ==================== Sound Functions ====================
@@ -1732,33 +1930,89 @@ export class WinMM implements IModule {
                 }
             }
 
-            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: file="${filename}", flags=0x${dwOpenFlags.toString(16)} (stub)`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: file="${filename}", flags=0x${dwOpenFlags.toString(16)}`);
 
-            if (!filename) {
-                return 0; // NULL handle
+            // MEMORY file: MMIOINFO describes a block of the CALLER's memory that is to be read
+            // as if it were a file. Engines that load a container themselves and then want mmio's
+            // RIFF walker over it open this way (the Dark engine for its AVI cutscenes; THPS2 for
+            // every sound it has already pulled out of its .pkr).
+            //
+            // The I/O proc is selected by the MMIOINFO — fccIOProc / pIOProc — and only falls back
+            // to parsing the name when BOTH are absent (Wine MMIO_Open). fccIOProc 'MEM ' is
+            // therefore a memory file whatever szFilename says, and mmioMemIOProc ignores the name
+            // outright. Reading the name instead sends a caller that passed both (the documented
+            // shape is a NULL name, but passing the asset's name is legal and common) down the disk
+            // path, where the file does not exist because the caller just read it out of an archive.
+            const fccIOProc = lpmmioinfo ? ((Mem.readUint32(lpmmioinfo + MMIOINFO_FCCIOPROC) ?? 0) >>> 0) : 0;
+            const pIOProc = lpmmioinfo ? ((Mem.readUint32(lpmmioinfo + MMIOINFO_PIOPROC) ?? 0) >>> 0) : 0;
+            if (mmioSelectsMemoryIoProc(!!lpmmioinfo, fccIOProc, pIOProc, filename)) {
+                const pchBuffer = (Mem.readUint32(lpmmioinfo + MMIOINFO_PCHBUFFER) ?? 0) >>> 0;
+                const cchBuffer = (Mem.readUint32(lpmmioinfo + MMIOINFO_CCHBUFFER) ?? 0) >>> 0;
+                if (!pchBuffer || !cchBuffer || pchBuffer + cchBuffer > mem.length) {
+                    Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, MMIOERR_CANNOTOPEN);
+                    return 0;
+                }
+                const handle = this.nextMMIOHandle++;
+                // The block stays the GUEST's and anything it writes there is what the next
+                // mmioRead must see, so this is a view — derived per use by mmioSource() from
+                // memoryBase/guestBufferSize. Storing the view itself would detach it on the
+                // next WASM memory growth and turn the file into a silent EOF.
+                this.mmioHandles.set(handle, {
+                    filename, position: 0,
+                    source: null,
+                    memoryBase: pchBuffer,
+                    guestBuffer: pchBuffer,
+                    guestBufferSize: cchBuffer,
+                    bufFileOffset: 0,
+                    bufFilled: cchBuffer,
+                });
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, 0);
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_HMMIO, handle);
+                Logger.verbose(LogCategory.SYSTEM,
+                    `mmioOpenA: MEMORY file at 0x${pchBuffer.toString(16)} size=${cchBuffer} -> handle ${handle}`);
+                return handle;
             }
 
-            const handle = this.nextMMIOHandle++;
-
-            // Read the file synchronously from VFS so mmioDescend/mmioRead work correctly.
-            let data: Uint8Array | null = null;
+            // The file is read on demand, never copied whole. The first window is read here so
+            // a file that cannot be read synchronously still fails the OPEN, as it always has.
+            let source: MmioByteSource | null = null;
+            let failure = MMIOERR_FILENOTFOUND;
             try {
                 const vfs = System.getInstance().fileSystem;
-                const fileSize = vfs.getFileSize(filename);
-                if (fileSize > 0 && fileSize <= 32 * 1024 * 1024) {
-                    const GENERIC_READ = 0x80000000;
-                    const OPEN_EXISTING = 3;
-                    const fh = vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING);
-                    if (fh) {
-                        data = vfs.readSync(fh, fileSize);
-                    }
+                const GENERIC_READ = 0x80000000;
+                const OPEN_EXISTING = 3;
+                const fh = vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING);
+                if (fh) {
+                    const disk = new VfsMmioSource(fh, Math.max(0, vfs.getFileSize(filename)));
+                    if (disk.read(0, MMIO_GUEST_BUFSIZE)) source = disk;
+                    else failure = MMIOERR_CANNOTREAD;
                 }
             } catch (e) {
+                failure = MMIOERR_CANNOTREAD;
                 Logger.warn(LogCategory.SYSTEM, `mmioOpenA: failed to read "${filename}": ${e}`);
             }
 
-            this.mmioHandles.set(handle, { filename, position: 0, data });
-            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: opened "${filename}" as handle ${handle}, size=${data?.length ?? 0}`);
+            // A file we cannot read is an OPEN FAILURE (Wine mmioDosIOProc MMIOM_OPEN →
+            // MMIOERR_FILENOTFOUND, MMIO_Open then returns a NULL handle). Handing back a
+            // live HMMIO over no bytes is a lie the caller cannot detect: mmioDescend finds
+            // no RIFF and the game reports its own "cannot load" instead of taking the
+            // fallback the failure was supposed to select — THPS2 loads every sound effect
+            // from its .pkr only after mmioOpen says the loose file is not there.
+            // MMIO_CREATE asks to create the file, which this read-only mmio cannot do.
+            if (!source) {
+                if (lpmmioinfo) Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, failure);
+                Logger.verbose(LogCategory.SYSTEM,
+                    `mmioOpenA: "${filename}" not opened (err=${failure}${(dwOpenFlags & MMIO_CREATE) ? ", MMIO_CREATE unsupported" : ""})`);
+                return 0;
+            }
+
+            const handle = this.nextMMIOHandle++;
+            this.mmioHandles.set(handle, { filename, position: 0, source });
+            if (lpmmioinfo) {
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_WERRORRET, 0);
+                Mem.writeUint32(lpmmioinfo + MMIOINFO_HMMIO, handle);
+            }
+            Logger.verbose(LogCategory.SYSTEM, `mmioOpenA: opened "${filename}" as handle ${handle}, size=${source.size}`);
             return handle;
         };
 
@@ -1766,12 +2020,13 @@ export class WinMM implements IModule {
             const hmmio = args[0];
             const uFlags = args[1];
 
-            Logger.verbose(LogCategory.SYSTEM, `mmioClose: handle=${hmmio}, flags=0x${uFlags.toString(16)} (stub)`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioClose: handle=${hmmio}, flags=0x${uFlags.toString(16)}`);
 
             const mmio = this.mmioHandles.get(hmmio);
             if (!mmio) return MMIOERR_CANNOTOPEN;
 
-            if (mmio.guestBuffer) {
+            // Only free a window WE allocated — a memory file's buffer belongs to the guest.
+            if (mmio.guestBuffer && !mmio.memoryBase) {
                 System.getInstance().process?.memory?.free(mmio.guestBuffer);
                 mmio.guestBuffer = 0;
             }
@@ -1791,14 +2046,15 @@ export class WinMM implements IModule {
 
             if (!pch || cch <= 0) return 0;
 
-            if (!mmio.data) return 0; // no data (file not found)
+            const source = this.mmioSource(mmio);
+            if (!source) return 0;
 
-            const available = mmio.data.length - mmio.position;
-            if (available <= 0) return 0;
-            const toRead = Math.min(cch >>> 0, available);
-            Mem.writeBytes(pch, mmio.data.subarray(mmio.position, mmio.position + toRead));
-            mmio.position += toRead;
-            return toRead;
+            if (source.size - mmio.position <= 0) return 0;
+            const bytes = source.read(mmio.position, cch >>> 0);
+            if (!bytes) return -1;
+            Mem.writeBytes(pch, bytes);
+            mmio.position += bytes.length;
+            return bytes.length;
         };
 
         this.exports["mmioSeek"] = (ctx, mem, args) => {
@@ -1806,7 +2062,7 @@ export class WinMM implements IModule {
             const lOffset = args[1] | 0; // signed
             const iOrigin = args[2];
 
-            Logger.verbose(LogCategory.SYSTEM, `mmioSeek: handle=${hmmio}, offset=${lOffset}, origin=${iOrigin} (stub)`);
+            Logger.verbose(LogCategory.SYSTEM, `mmioSeek: handle=${hmmio}, offset=${lOffset}, origin=${iOrigin}`);
 
             const mmio = this.mmioHandles.get(hmmio);
             if (!mmio) return -1;
@@ -1820,7 +2076,7 @@ export class WinMM implements IModule {
                     newPos = mmio.position + lOffset;
                     break;
                 case SEEK_END:
-                    newPos = (mmio.data?.length ?? 0) + lOffset;
+                    newPos = (this.mmioSource(mmio)?.size ?? 0) + lOffset;
                     break;
                 default:
                     return -1;
@@ -1895,13 +2151,13 @@ export class WinMM implements IModule {
             const MMIO_FINDRIFF  = 0x0020;
             const MMIO_FINDLIST  = 0x0040;
 
-            const data = mmio.data;
-            if (!data) return MMIOERR_CANNOTOPEN;
+            const source = this.mmioSource(mmio);
+            if (!source) return MMIOERR_CANNOTOPEN;
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
             // Determine end of search region (parent chunk bounds, or entire file)
-            let searchEnd = data.length;
+            let searchEnd = source.size;
             if (lpckParent) {
                 const parentDataOffset = view.getUint32(lpckParent + 12, true);
                 const parentCkSize     = view.getUint32(lpckParent + 4,  true);
@@ -1917,12 +2173,14 @@ export class WinMM implements IModule {
             const listId   = 0x5453494c; // 'LIST'
 
             let pos = mmio.position;
-            while (pos + 8 <= searchEnd && pos + 8 <= data.length) {
-                const ckid   = (data[pos] | (data[pos+1]<<8) | (data[pos+2]<<16) | (data[pos+3]<<24)) >>> 0;
-                const cksize = (data[pos+4] | (data[pos+5]<<8) | (data[pos+6]<<16) | (data[pos+7]<<24)) >>> 0;
+            while (pos + 8 <= searchEnd && pos + 8 <= source.size) {
+                const hdr = source.read(pos, 12);
+                if (!hdr || hdr.length < 8) return MMIOERR_CANNOTREAD;
+                const ckid   = (hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24)) >>> 0;
+                const cksize = (hdr[4] | (hdr[5]<<8) | (hdr[6]<<16) | (hdr[7]<<24)) >>> 0;
                 const isContainer = (ckid === riffId || ckid === listId);
-                const fccType = isContainer && pos + 12 <= data.length
-                    ? (data[pos+8] | (data[pos+9]<<8) | (data[pos+10]<<16) | (data[pos+11]<<24)) >>> 0
+                const fccType = isContainer && hdr.length >= 12
+                    ? (hdr[8] | (hdr[9]<<8) | (hdr[10]<<16) | (hdr[11]<<24)) >>> 0
                     : 0;
 
                 let matched = false;
@@ -1937,13 +2195,20 @@ export class WinMM implements IModule {
                 }
 
                 if (matched) {
-                    const dataOffset = isContainer ? pos + 12 : pos + 8;
+                    // MMCKINFO.dwDataOffset is ALWAYS chunkStart+8, including for RIFF and
+                    // LIST — the form type is part of the data, not of the header. Only the
+                    // FILE POSITION skips it. Reporting +12 for a container breaks the
+                    // canonical WAV reader verbatim: it seeks to
+                    // `ckRIFF.dwDataOffset + sizeof(FOURCC)`, which then lands 4 bytes inside
+                    // the first chunk's header and no chunk is ever found again. It also
+                    // pushes a parent-bounded search 4 bytes past EOF.
+                    const dataOffset = pos + 8;
                     view.setUint32(lpck,      ckid,       true);
                     view.setUint32(lpck + 4,  cksize,     true);
                     view.setUint32(lpck + 8,  fccType,    true);
                     view.setUint32(lpck + 12, dataOffset, true);
                     view.setUint32(lpck + 16, 0,          true);
-                    mmio.position = dataOffset;
+                    mmio.position = isContainer ? dataOffset + 4 : dataOffset;
                     Logger.verbose(LogCategory.SYSTEM,
                         `mmioDescend: found ckid=${String.fromCharCode(ckid&0xff,(ckid>>8)&0xff,(ckid>>16)&0xff,(ckid>>24)&0xff)} ` +
                         `cksize=${cksize} fccType=${fccType ? String.fromCharCode(fccType&0xff,(fccType>>8)&0xff,(fccType>>16)&0xff,(fccType>>24)&0xff) : ''} ` +
@@ -2028,20 +2293,24 @@ export class WinMM implements IModule {
             }
         }
         // Stop any per-device waveOut completion pollers (wheel entries) so a reset
-        // doesn't leak a poller bound to a stale device.
+        // doesn't leak a poller bound to a stale device, then drop the devices —
+        // handle tables recycle and a stale WaveOutDevice would alias the next open.
         for (const device of this.waveOutDevices.values()) {
             this.stopCompletionPoller(device);
         }
+        this.waveOutDevices.clear();
         this.timers.clear();
         this.pendingTimerCallbacks.length = 0;
         this.pendingTimerHead = 0;
         this.timerCallbackDrainCount = 0;
         this.dispatchingTimerCallback = null;
+        this.dispatchingPosted = null;
         this.timerThreadId = 0;
         this.timerThreadHandle = 0;
         this.timerWakeEvent = 0;
         scheduler?.notifyWinmmTimerThread(0, 0);
         this.periodRefCounts.clear();
+        this.publishTimerResolution();
 
         // Clear MMIO handles, freeing any guest-side I/O buffers.
         const mem = System.getInstance().process?.memory;
@@ -2049,7 +2318,9 @@ export class WinMM implements IModule {
             if (mmio.guestBuffer) mem?.free(mmio.guestBuffer);
         }
         this.mmioHandles.clear();
+        this.stopPlaySound();
         this.mci?.reset();
+        resetWinmmJoystick();
     }
 
     /** Diagnostic snapshot for paint-time guest-state logging. */

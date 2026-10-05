@@ -22,6 +22,12 @@ export class DirectDrawObject extends BaseComObject {
         super(IID_IDirectDraw7, vtableAddress);
     }
 
+    // IDirectDraw/2/4/7 and IDirect3D/2/3/7 are tear-offs of this one driver object, and
+    // DirectDraw gives each its own refcount (see BaseComObject.perInterfaceRefs).
+    protected override get perInterfaceRefs(): boolean {
+        return true;
+    }
+
     protected destroy(): void {
         const resourceProvider = SystemResourceProvider.getInstance();
         const allCom = resourceProvider.getAllComObjects();
@@ -29,8 +35,25 @@ export class DirectDrawObject extends BaseComObject {
         let releasedSurfaces = 0;
         let releasedAux = 0;
 
+        // A DirectDraw object owns only what was created THROUGH it. Games routinely keep several
+        // alive at once (driver/mode enumeration builds and drops throwaway instances while the
+        // real one already serves the renderer), so releasing one must not reach into another's
+        // surfaces, devices or context state — that silently wipes a live scene's textures.
+        // Surfaces carry their creator; the rest cannot be attributed, so they are only swept
+        // when this is the last DirectDraw standing.
+        const siblings = allCom.filter((o) =>
+            o !== this && o.constructor.name === "DirectDrawObject" && o.refCount > 0);
+        const isLast = siblings.length === 0;
+        const siblingHandles = new Set(siblings.map((o) => o.handle));
+        const ownedByASibling = (obj: BaseComObject): boolean => {
+            const ownerAddr = (obj as { getDDrawOwnerAddr?: () => number }).getDDrawOwnerAddr?.() ?? 0;
+            if (!ownerAddr) return false;
+            const ownerHandle = resourceProvider.getComObjectByAddress(ownerAddr)?.handle;
+            return ownerHandle !== undefined && siblingHandles.has(ownerHandle);
+        };
+
         // Phase 1: Destroy D3D devices first (they hold texture/RT refs)
-        for (const obj of allCom) {
+        for (const obj of isLast ? allCom : []) {
             if (obj.constructor.name.includes("Direct3DDevice")) {
                 try {
                     obj.forceRelease();
@@ -44,7 +67,7 @@ export class DirectDrawObject extends BaseComObject {
         // Phase 2: Destroy surfaces (re-scan since getAllComObjects returns snapshot)
         const afterDevices = resourceProvider.getAllComObjects();
         for (const obj of afterDevices) {
-            if (obj.constructor.name === "DirectDrawSurfaceObject") {
+            if (obj.constructor.name === "DirectDrawSurfaceObject" && !ownedByASibling(obj)) {
                 try {
                     obj.forceRelease();
                     releasedSurfaces++;
@@ -52,6 +75,13 @@ export class DirectDrawObject extends BaseComObject {
                     Logger.warn(LogCategory.COM, `DirectDraw cascade: error releasing surface: ${e}`);
                 }
             }
+        }
+
+        if (!isLast) {
+            Logger.log(LogCategory.COM,
+                `DirectDrawObject destroy (handle=0x${this.handle.toString(16)}): ${siblings.length} sibling(s) live — ` +
+                `released ${releasedSurfaces} own surfaces, left their objects and the shared context alone`);
+            return;
         }
 
         // Phase 3: Destroy auxiliaries (clippers, palettes, viewports, materials, lights, textures)

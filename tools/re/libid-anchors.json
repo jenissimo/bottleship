@@ -1,0 +1,66 @@
+{
+  "schema": "libid-anchors/1",
+  "comment": "Anchors — addresses whose owner is known from independent analysis (Codex/Ghidra/docs). selftest compares the tool's answer against them: a mismatch means the tool broke, not the image.",
+  "images": [
+    {
+      "image": "Speed.exe",
+      "note": "NFSU, addresses from docs/performance/library-hle-catalog-audit-2026-09-12.md (Ghidra FID Single Match)",
+      "anchors": [
+        {
+          "addr": "0x00672fc8",
+          "verdict": "library",
+          "lib": "msvc-crt",
+          "note": "__ftol"
+        },
+        {
+          "addr": "0x00678d30",
+          "verdict": "library",
+          "lib": "msvc-crt",
+          "note": "_memcpy"
+        },
+        {
+          "addr": "0x0067ef80",
+          "verdict": "library",
+          "lib": "msvc-crt",
+          "note": "_memset"
+        },
+        {
+          "addr": "0x00674c30",
+          "verdict": "library",
+          "lib": "msvc-crt",
+          "note": "_strlen"
+        },
+        {
+          "addr": "0x0067121a",
+          "verdict": "library",
+          "lib": "msvc-crt",
+          "note": "_malloc"
+        },
+        {
+          "addr": "0x00671102",
+          "verdict": "library",
+          "lib": "msvc-crt",
+          "note": "_free"
+        }
+      ]
+    },
+    {
+      "image": "SPEED2.EXE",
+      "note": "NFSU2, addresses from docs/performance/nfsu2-eagl-re-2026-09-12.md (Codex analysis)",
+      "anchors": [
+        {
+          "addr": "0x00669296",
+          "verdict": "library",
+          "lib": "d3dx9",
+          "note": "D3DX Effect runtime state dispatcher"
+        },
+        {
+          "addr": "0x0066404c",
+          "verdict": "library",
+          "lib": "d3dx9",
+          "note": "effect helper called from Begin"
+        }
+      ]
+    }
+  ]
+}

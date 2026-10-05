@@ -9,24 +9,31 @@ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
+import { WAIT_BLOCKED_NO_SWITCH } from "../core/scheduler/types";
 import {
     SOCKET_ERROR,
     WSAEFAULT,
     WsaSocketTable,
     makeSocketExports,
     makeWsaStartup,
+    makeWsaCleanup,
+    wsaStartupCount,
     inetAddr,
     createDnsStubs,
     createProtoServStubs,
+    createAddrInfoStubs,
     createAsyncLookupStubs,
     makeSelect,
     makeFdIsSet,
     WSAENOTSOCK,
+    WSAENOTCONN,
+    WSAEWOULDBLOCK,
 } from "./wsa-stub-shared";
 
 const WSA_INVALID_EVENT = 0xffffffff;
 const WSANOTINITIALISED = 10093;
 const WSAEINVAL = 10022;
+const WSAEOPNOTSUPP = 10045;
 const WSA_WAIT_TIMEOUT = 258;
 const WSA_WAIT_FAILED = 0xffffffff;
 
@@ -34,7 +41,7 @@ export class Ws2_32 implements IModule {
     name = "ws2_32";
     exports: Record<string, ThunkImplementation> = {};
     private socketTable = new WsaSocketTable();
-    private wsaStarted = false;
+    private resetAddrInfo: (() => void) | null = null;
 
     initialize(process: Process): void {
         let wsaLastError = 0;
@@ -65,27 +72,20 @@ export class Ws2_32 implements IModule {
         const socketExports = makeSocketExports(this.socketTable, setError);
         const dns = createDnsStubs(process, setError);
         const protoServ = createProtoServStubs(process, setError);
+        const addrInfo = createAddrInfoStubs(process, setError);
+        this.resetAddrInfo = addrInfo.reset;
         const asyncLookup = createAsyncLookupStubs(setError);
         const selectImpl = makeSelect(this.socketTable, setError);
         const fdIsSet = makeFdIsSet();
 
         const requireStarted = (): boolean => {
-            if (this.wsaStarted) return true;
+            if (wsaStartupCount.started) return true;
             setError(WSANOTINITIALISED);
             return false;
         };
 
-        this.exports["WSAStartup"] = (ctx, mem, args) => {
-            const result = startup(ctx, mem, args);
-            if (typeof result === "number" && result === 0) {
-                this.wsaStarted = true;
-            }
-            return result;
-        };
-        this.exports["WSACleanup"] = () => {
-            this.wsaStarted = false;
-            return 0;
-        };
+        this.exports["WSAStartup"] = startup;
+        this.exports["WSACleanup"] = makeWsaCleanup(wsaStartupCount, setError);
         this.exports["WSAGetLastError"] = getLastError;
         this.exports["WSASetLastError"] = setLastError;
         Object.assign(this.exports, socketExports);
@@ -102,6 +102,9 @@ export class Ws2_32 implements IModule {
         this.exports["getprotobynumber"] = protoServ.getprotobynumber;
         this.exports["getservbyname"] = protoServ.getservbyname;
         this.exports["getservbyport"] = protoServ.getservbyport;
+        this.exports["getaddrinfo"] = addrInfo.getaddrinfo;
+        this.exports["freeaddrinfo"] = addrInfo.freeaddrinfo;
+        this.exports["getnameinfo"] = addrInfo.getnameinfo;
         this.exports["select"] = selectImpl;
         this.exports["__WSAFDIsSet"] = fdIsSet;
         this.exports["WSAAsyncSelect"] = (_ctx, _mem, args) => {
@@ -177,9 +180,7 @@ export class Ws2_32 implements IModule {
         this.exports["ord_114"] = ok;        // WSAIsBlocking
         this.exports["ord_115"] = this.exports["WSAStartup"]!;
         this.exports["ord_116"] = this.exports["WSACleanup"]!;
-        // ord_151 diverges from wsock32 here: real ws2_32.dll assigns 151 to WSASocketA,
-        // not __WSAFDIsSet (which ws2_32 only exports by name, no fixed ordinal).
-        this.exports["ord_151"] = socketExports.WSASocketA!;
+        this.exports["ord_151"] = fdIsSet;    // __WSAFDIsSet, same slot as wsock32
 
         this.exports["WSACreateEvent"] = () => {
             if (!requireStarted()) return WSA_INVALID_EVENT;
@@ -219,32 +220,44 @@ export class Ws2_32 implements IModule {
             return 1;
         };
 
-        this.exports["WSAWaitForMultipleEvents"] = (_ctx, _mem, args) => {
+        /**
+         * A real wait, not a poll. Returning WSA_WAIT_EVENT_0 when nothing is signalled tells
+         * the caller an event fired: it resets the event and waits again, and the thread spins
+         * at full speed forever — 16 million round trips before this was a wait. The result
+         * codes coincide with the Win32 ones (EVENT_0 = OBJECT_0 = 0, TIMEOUT = 258,
+         * FAILED = 0xFFFFFFFF), so the scheduler's answer is returned unchanged.
+         */
+        this.exports["WSAWaitForMultipleEvents"] = (ctx, mem, args) => {
             if (!requireStarted()) return WSA_WAIT_FAILED;
             const count = args[0] >>> 0;
             const handlesPtr = args[1] >>> 0;
             const waitAll = (args[2] >>> 0) !== 0;
             const timeout = args[3] >>> 0;
-            if (count === 0 || !handlesPtr) {
+            if (count === 0 || !handlesPtr || handlesPtr + count * 4 > mem.length) {
                 setError(WSAEINVAL);
                 return WSA_WAIT_FAILED;
             }
+            const handles: number[] = [];
+            for (let i = 0; i < count; i++) handles.push((Mem.readUint32(handlesPtr + i * 4) ?? 0) >>> 0);
+
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const returnAddr = view.getUint32(ctx.esp, true);
+            // 4 (return address) + 5 args
+            const postReturnEsp = ctx.esp + 24;
+
             const sched = System.getInstance().scheduler;
-            const threadId = sched.getCurrentThreadId();
-            const threadLookup = () => null;
-            for (let i = 0; i < count; i++) {
-                const handle = Mem.readUint32(handlesPtr + i * 4) ?? 0;
-                if (sched.syncObjects.isSignaled(handle >>> 0, threadId, threadLookup)) {
-                    return i >>> 0;
-                }
+            const result = sched.waitForObjectsWithContext(
+                handles,
+                waitAll,
+                timeout,
+                returnAddr,
+                postReturnEsp,
+                { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+            );
+            if (result === WAIT_BLOCKED_NO_SWITCH) {
+                return { value: 0, blockedNoSwitch: true, stackCleanup: 20 };
             }
-            if (timeout === 0) {
-                return WSA_WAIT_TIMEOUT;
-            }
-            if (waitAll && count > 1) {
-                return WSA_WAIT_TIMEOUT;
-            }
-            return 0;
+            return result >>> 0;
         };
 
         this.exports["WSAEventSelect"] = (_ctx, _mem, args) => {
@@ -271,11 +284,75 @@ export class Ws2_32 implements IModule {
             return 0;
         };
 
+        // Winsock 2 scatter/gather over the same socket table as send/recv. The
+        // non-overlapped form is the whole contract we can honor; an OVERLAPPED request or
+        // completion routine is refused outright, because the alternative is a caller
+        // waiting forever on a completion nothing will ever post. Declared-but-unhandled
+        // is not an option here: that path returns 50, which is neither 0 nor SOCKET_ERROR.
+        const wsaBufTotal = (lpBuffers: number, count: number): number => {
+            let total = 0;
+            for (let i = 0; i < count; i++) total += (Mem.readUint32(lpBuffers + i * 8) ?? 0) >>> 0;
+            return total;
+        };
+        const wsaSend = (args: number[], overlappedIdx: number): number => {
+            if (!requireStarted()) return SOCKET_ERROR;
+            const s = args[0] | 0;
+            if (args[overlappedIdx] || args[overlappedIdx + 1]) {
+                setError(WSAEOPNOTSUPP);
+                return SOCKET_ERROR;
+            }
+            if (args[3]) Mem.writeUint32(args[3] >>> 0, 0);
+            if (!this.socketTable.isValid(s)) {
+                setError(WSAENOTSOCK);
+                return SOCKET_ERROR;
+            }
+            if (!args[1] || !args[2]) {
+                setError(WSAEFAULT);
+                return SOCKET_ERROR;
+            }
+            const sent = this.socketTable.send(s, wsaBufTotal(args[1] >>> 0, args[2] >>> 0));
+            if (sent === SOCKET_ERROR) {
+                setError(WSAENOTCONN);
+                return SOCKET_ERROR;
+            }
+            if (args[3]) Mem.writeUint32(args[3] >>> 0, sent >>> 0);
+            setError(0);
+            return 0;
+        };
+        const wsaRecv = (args: number[], overlappedIdx: number): number => {
+            if (!requireStarted()) return SOCKET_ERROR;
+            const s = args[0] | 0;
+            if (args[overlappedIdx] || args[overlappedIdx + 1]) {
+                setError(WSAEOPNOTSUPP);
+                return SOCKET_ERROR;
+            }
+            if (args[3]) Mem.writeUint32(args[3] >>> 0, 0);
+            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);
+            if (!this.socketTable.isValid(s)) {
+                setError(WSAENOTSOCK);
+                return SOCKET_ERROR;
+            }
+            // The table never has data pending, so a recv is always "would block".
+            setError(this.socketTable.recv(s) === SOCKET_ERROR ? WSAEWOULDBLOCK : 0);
+            return SOCKET_ERROR;
+        };
+        this.exports["WSASend"] = (_ctx, _mem, args) => wsaSend(args, 5);
+        this.exports["WSASendTo"] = (_ctx, _mem, args) => wsaSend(args, 7);
+        this.exports["WSARecv"] = (_ctx, _mem, args) => wsaRecv(args, 5);
+        this.exports["WSARecvFrom"] = (_ctx, _mem, args) => wsaRecv(args, 7);
+        this.exports["WSAGetOverlappedResult"] = (_ctx, _mem, args) => {
+            if (args[2]) Mem.writeUint32(args[2] >>> 0, 0);
+            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);
+            setError(WSAEOPNOTSUPP);
+            return 0;   // FALSE — no overlapped request was ever accepted
+        };
+
         this.exports["inet_pton"] = () => 0;
     }
 
     reset(): void {
         this.socketTable.reset();
-        this.wsaStarted = false;
+        this.resetAddrInfo?.();
+        wsaStartupCount.reset();
     }
 }

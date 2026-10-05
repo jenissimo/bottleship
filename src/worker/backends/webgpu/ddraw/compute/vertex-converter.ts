@@ -25,6 +25,7 @@ import {
     D3DFVF_XYZB4,
     D3DFVF_XYZB5,
 } from "../../../../modules/ddraw/constants";
+import { D3D_PIXEL_CENTER_OFFSET_PX } from "../../pixel-center";
 
 // Track warned FVF values to avoid log spam
 const warnedFVFs = new Set<number>();
@@ -211,22 +212,36 @@ function generateVertexConverterShader(config: VertexFormatConfig): string {
     // rhw = 1/w, so w = 1/rhw (avoid division by zero)
     // NOTE: We must multiply X,Y,Z by w for clip-space (WebGPU does perspective division: clip/w -> NDC)
     // This preserves perspective-correct interpolation for textures/colors.
-    // D3D clamps Z to [0,1] for pre-transformed (XYZRHW) vertices.
-    // Without clamping, out-of-range Z (e.g. 300.0) causes WebGPU to clip the triangle.
+    // Z is passed through, NOT clamped. D3D CLIPS a pre-transformed primitive against the
+    // viewport's z range; it does not pin each vertex into [0,1]. Clamping keeps a polygon
+    // that lies beyond the far plane and pastes it flat at z=1, and it deforms one that
+    // straddles the plane — the far vertices move while the near ones do not — so the face
+    // pokes through whatever should occlude it along a straight polygon edge. Letting the
+    // value through hands the primitive to WebGPU's depth clipping, which is D3D's behaviour.
     let w = select(1.0, 1.0 / rhw, rhw != 0.0);
     // Half-pixel convention shift: legacy D3D (DX7-DX9) puts pixel centers at INTEGER
     // screen coordinates; WebGPU puts them at half-integers. +0.5 maps D3D pixel
     // centers onto WebGPU pixel centers so rasterization coverage and interpolated
-    // UVs reproduce D3D exactly. Games that pre-offset quads by -0.5 per MS's
+    // UVs reproduce D3D exactly. The same shift for TRANSFORMED geometry is folded into
+    // the MVP by webgpu/pixel-center.ts — read it for why the two are the same delta.
+    // Games that pre-offset quads by -0.5 per MS's
     // "Directly Mapping Texels to Pixels" (e.g. FMV tile quads) otherwise
     // shift by one pixel: boundary pixels flip to the next tile and sample u=0,
     // where WRAP+LINEAR blends in the tile's opposite edge (visible tile seams).
-    let posX_ndc = ((posX + 0.5) / params.viewportWidth) * 2.0 - 1.0;
-    let posY_ndc = 1.0 - ((posY + 0.5) / params.viewportHeight) * 2.0;
+    // Relative to the viewport ORIGIN, not the render target's. A pre-transformed vertex
+    // carries render-target screen coordinates, and D3D maps them into the viewport's NDC by
+    // subtracting the origin before dividing by the extent — the rasterizer's viewport then
+    // maps that NDC back onto the same pixel, so the vertex lands where the app put it and the
+    // viewport acts purely as a clip rect. Dropping the origin offsets every 2D draw by it,
+    // which stays invisible only while the viewport covers the whole target.
+    // (DXVK d3d9_fixed_function_vert.vert: pos * inverseExtent + inverseOffset, with
+    //  inverseOffset = -origin * inverseExtent + (-1, 1).)
+    let posX_ndc = ((posX - params.viewportX + ${D3D_PIXEL_CENTER_OFFSET_PX}) / params.viewportWidth) * 2.0 - 1.0;
+    let posY_ndc = 1.0 - ((posY - params.viewportY + ${D3D_PIXEL_CENTER_OFFSET_PX}) / params.viewportHeight) * 2.0;
     // Convert NDC to clip-space by multiplying by w (for perspective-correct interpolation)
     let posX_clip = posX_ndc * w;
     let posY_clip = posY_ndc * w;
-    let posZ_clip = clamp(posZ, 0.0, 1.0) * w;
+    let posZ_clip = posZ * w;
     let posW_clip = w;
     `
             : hasXYZW
@@ -250,11 +265,18 @@ function generateVertexConverterShader(config: VertexFormatConfig): string {
 // Converts D3D7 FVF format to unified 64-byte format
 // XYZRHW vertices are converted from screen space to NDC
 
+// srcByteBase / dstIndexBase let one bind group cover a whole frame's conversions: the
+// buffers are bound in full and each draw addresses its own sub-range through the params
+// instead of through a per-draw binding.
 struct Params {
     vertexCount: u32,
     srcStride: u32,
     viewportWidth: f32,
     viewportHeight: f32,
+    viewportX: f32,
+    viewportY: f32,
+    srcByteBase: u32,
+    dstIndexBase: u32,
 }
 
 struct StorageBuf {
@@ -267,13 +289,13 @@ struct StorageBuf {
 
 // Read float from byte offset
 fn readFloat(byteOffset: u32) -> f32 {
-    let wordOffset = byteOffset >> 2u;
+    let wordOffset = (params.srcByteBase + byteOffset) >> 2u;
     return bitcast<f32>(src.data[wordOffset]);
 }
 
 // Read u32 from byte offset
 fn readU32(byteOffset: u32) -> u32 {
-    let wordOffset = byteOffset >> 2u;
+    let wordOffset = (params.srcByteBase + byteOffset) >> 2u;
     return src.data[wordOffset];
 }
 
@@ -296,7 +318,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
 
     // Calculate source and destination offsets
     let srcBaseOffset = vertexIndex * params.srcStride;
-    let dstBaseIndex = vertexIndex * 16u; // 64 bytes = 16 u32s
+    let dstBaseIndex = params.dstIndexBase + vertexIndex * 16u; // 64 bytes = 16 u32s
 
     // ===== POSITION (bytes 0-15) =====
     let posX = readFloat(srcBaseOffset + ${posOffset}u);
@@ -420,15 +442,32 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
 `;
 }
 
+/** Kill switch: setWorkerFlag('__noVertexScratchPool', true) restores the per-draw
+ *  allocation path for a live A/B. */
+function scratchPoolEnabled(): boolean {
+    return (globalThis as { __noVertexScratchPool?: boolean }).__noVertexScratchPool !== true;
+}
+
 /**
  * GPU Vertex Converter
  * Converts D3D7 FVF vertex data to unified 64-byte format using compute shaders.
- * 
- * Uses temporary params buffers per call and global vertex buffer with offset
- * to prevent race conditions when batching multiple draw calls per frame.
+ *
+ * THE ORDERING INVARIANT. `queue.writeBuffer` is scheduled on the queue timeline at the
+ * moment it is called, while the dispatch that reads what it wrote is only recorded into
+ * an encoder and submitted much later. So a scratch range written for draw N and rewritten
+ * for draw N+1 before the frame's single submit hands BOTH dispatches draw N+1's bytes.
+ * The invariant is therefore: a range referenced by a RECORDED-but-unsubmitted command is
+ * never rewritten. Per-draw buffers satisfied it by never reusing anything; the pool
+ * satisfies it by bump-allocating a disjoint sub-range per draw and rewinding to zero only
+ * in startFrame(), which every caller reaches after queue.submit() — the same point at
+ * which globalVertexBuffer already rewinds.
  */
 export class VertexConverter {
     private static readonly MIN_GLOBAL_VERTEX_BUFFER_SIZE = 256 * 1024;
+    private static readonly MIN_SCRATCH_SRC_SIZE = 256 * 1024;
+    /** Params struct size — must match the WGSL `Params` layout above. */
+    private static readonly PARAMS_BYTES = 32;
+    private static readonly PARAMS_RING_SLOTS = 512;
 
     private device: GPUDevice;
     private queue: GPUQueue;
@@ -453,6 +492,40 @@ export class VertexConverter {
     // Pending temporary buffers to destroy after frame (params buffers)
     private pendingDestroyBuffers: GPUBuffer[] = [];
 
+    // Frame-scoped scratch pool (see the ordering invariant on the class).
+    // Source staging arena: guest vertex bytes for every conversion of the frame, one
+    // disjoint sub-range each; bound in full, addressed via Params.srcByteBase.
+    private scratchSrcBuffer: GPUBuffer | null = null;
+    private scratchSrcSize = 0;
+    private scratchSrcOffset = 0;
+    private readonly maxScratchSrcSize: number;
+
+    // Params ring: one dynamic-offset uniform slot per conversion, staged CPU-side and
+    // uploaded once per submit by flushParams().
+    private paramsRingBuffer: GPUBuffer | null = null;
+    private paramsRingSize = 0;
+    private paramsRingOffset = 0;
+    private paramsDirtyOffset = 0;
+    private paramsStaging: Uint8Array | null = null;
+    private paramsStagingView: DataView | null = null;
+    private readonly paramsAlignment: number;
+
+    // One bind group serves the whole frame: all three bindings cover a full buffer (params
+    // via a dynamic offset), so it only changes when one of those buffers is replaced.
+    private scratchBindGroup: GPUBindGroup | null = null;
+
+    /** Counters for the pooled path. `conversions` is what makes `gpuObjects` readable:
+     *  zero objects created is a claim about the pool only if conversions actually ran. */
+    private stats = {
+        conversions: 0,
+        pooled: 0,
+        perDraw: 0,
+        gpuObjects: 0,
+        srcGrows: 0,
+        paramsGrows: 0,
+        unflushedParams: 0,
+    };
+
     // CPU fallback scratch buffers
     private cpuScratchF32: Float32Array | null = null;
     private cpuScratchU8: Uint8Array | null = null;
@@ -472,9 +545,22 @@ export class VertexConverter {
         this.queue = queue;
         this.isLittleEndian = VertexConverter.detectLittleEndian();
         const reportedMaxBufferSize = Number(device.limits.maxBufferSize || 0);
-        this.maxGlobalVertexBufferSize = reportedMaxBufferSize > 0
-            ? Math.max(VertexConverter.MIN_GLOBAL_VERTEX_BUFFER_SIZE, reportedMaxBufferSize)
-            : 256 * 1024 * 1024;
+        // The global vertex buffer is also the compute dst, bound in full — so its ceiling is
+        // the storage-binding limit as well as maxBufferSize.
+        const maxStorageBinding = Number(device.limits.maxStorageBufferBindingSize || 0);
+        const bufferCeiling = Math.min(
+            reportedMaxBufferSize > 0 ? reportedMaxBufferSize : 256 * 1024 * 1024,
+            maxStorageBinding > 0 ? maxStorageBinding : 256 * 1024 * 1024
+        );
+        this.maxGlobalVertexBufferSize = Math.max(
+            VertexConverter.MIN_GLOBAL_VERTEX_BUFFER_SIZE,
+            bufferCeiling
+        );
+        this.maxScratchSrcSize = Math.max(VertexConverter.MIN_SCRATCH_SRC_SIZE, bufferCeiling);
+        this.paramsAlignment = Math.max(
+            VertexConverter.PARAMS_BYTES,
+            Number(device.limits.minUniformBufferOffsetAlignment) || 256
+        );
 
         // Create bind group layout
         this.bindGroupLayout = device.createBindGroupLayout({
@@ -482,7 +568,13 @@ export class VertexConverter {
                 {
                     binding: 0,
                     visibility: GPUShaderStage.COMPUTE,
-                    buffer: { type: "uniform" },
+                    // Dynamic offset so one bind group covers every conversion of the frame.
+                    // The per-draw path binds its own 32-byte buffer at dynamic offset 0.
+                    buffer: {
+                        type: "uniform",
+                        hasDynamicOffset: true,
+                        minBindingSize: VertexConverter.PARAMS_BYTES,
+                    },
                 },
                 {
                     binding: 1,
@@ -497,8 +589,6 @@ export class VertexConverter {
             ],
         });
 
-        // No shared params buffer - we create temporary buffers per call to avoid race conditions
-        // Initialize frame state
         this.startFrame();
     }
 
@@ -514,7 +604,10 @@ export class VertexConverter {
         }
         this.cachedMemBuffer = memory.buffer;
         this.cachedMemByteOffset = memory.byteOffset;
-        if ((memory.byteOffset & 3) === 0) {
+        // Whole-buffer word views: the byte LENGTH must be word-aligned too. Guest RAM always
+        // is, but a synthesized view (d3d8 interleaved decl scratch) need not be — and a throw
+        // here would take the whole draw down the catch path. Fall back to the DataView reader.
+        if ((memory.byteOffset & 3) === 0 && (memory.buffer.byteLength & 3) === 0) {
             this.cachedMemF32 = new Float32Array(memory.buffer);
             this.cachedMemU32 = new Uint32Array(memory.buffer);
         } else {
@@ -529,8 +622,130 @@ export class VertexConverter {
      */
     startFrame(): void {
         this.globalOffset = 0;
-        // Don't destroy buffers here - they may still be in use by GPU
-        // Destroy them after queue.submit() via destroyPendingAfterSubmit()
+        // Rewinding the scratch arenas is legal here and ONLY here: every caller reaches
+        // startFrame() after queue.submit(), so nothing recorded still references them.
+        if (this.paramsRingOffset !== this.paramsDirtyOffset) {
+            // Params were staged for a dispatch that has already been submitted without ever
+            // being uploaded — those draws read stale bytes. A submit path is missing its
+            // flushParams() call; say so instead of silently rewinding over the evidence.
+            this.stats.unflushedParams++;
+            Logger.error(
+                LogCategory.SYSTEM,
+                `VertexConverter: ${this.paramsRingOffset - this.paramsDirtyOffset} bytes of params ` +
+                    `were never flushed before submit (missing flushParams() on a submit path)`
+            );
+        }
+        this.scratchSrcOffset = 0;
+        this.paramsRingOffset = 0;
+        this.paramsDirtyOffset = 0;
+    }
+
+    /**
+     * Upload the params staged since the last flush. MUST run before every queue.submit()
+     * that carries conversions — writeBuffer is ordered on the queue timeline, so a write
+     * issued after the submit lands too late for the dispatch that reads it.
+     */
+    flushParams(): void {
+        if (!this.paramsRingBuffer || !this.paramsStaging) return;
+        if (this.paramsRingOffset <= this.paramsDirtyOffset) return;
+        this.queue.writeBuffer(
+            this.paramsRingBuffer,
+            this.paramsDirtyOffset,
+            this.paramsStaging.buffer,
+            this.paramsDirtyOffset,
+            this.paramsRingOffset - this.paramsDirtyOffset
+        );
+        this.paramsDirtyOffset = this.paramsRingOffset;
+    }
+
+    /**
+     * Pool counters. `conversions` is the denominator that makes the rest legible: a frame
+     * with gpuObjects=0 says nothing unless conversions>0, and perDraw>0 with the pool on
+     * means the pool ran out of room and fell back rather than that it was disabled.
+     */
+    getScratchStats(): { enabled: boolean } & typeof this.stats {
+        return { enabled: scratchPoolEnabled(), ...this.stats };
+    }
+
+    /** Bump-allocate `size` bytes of source staging. Returns -1 when the arena cannot hold it. */
+    private allocScratchSrc(size: number): number {
+        const aligned = (size + 15) & ~15;
+        if (this.scratchSrcBuffer && this.scratchSrcOffset + aligned <= this.scratchSrcSize) {
+            const offset = this.scratchSrcOffset;
+            this.scratchSrcOffset = offset + aligned;
+            return offset;
+        }
+        if (aligned > this.maxScratchSrcSize) return -1;
+
+        // Grow: the old arena is still referenced by recorded commands, so it is destroyed
+        // after submit, not now. The replacement starts empty — nothing points into it yet.
+        const newSize = Math.min(
+            this.maxScratchSrcSize,
+            Math.max(aligned, this.scratchSrcSize * 2, VertexConverter.MIN_SCRATCH_SRC_SIZE)
+        );
+        if (newSize < aligned) return -1;
+        if (this.scratchSrcBuffer) this.pendingDestroyBuffers.push(this.scratchSrcBuffer);
+        this.scratchSrcBuffer = this.device.createBuffer({
+            size: newSize,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+        });
+        this.stats.gpuObjects++;
+        this.stats.srcGrows++;
+        this.scratchSrcSize = newSize;
+        this.scratchSrcOffset = aligned;
+        this.scratchBindGroup = null;
+        return 0;
+    }
+
+    /** Bump-allocate one params slot. Returns -1 when the ring cannot hold it. */
+    private allocParamsSlot(): number {
+        if (this.paramsRingBuffer && this.paramsRingOffset + this.paramsAlignment <= this.paramsRingSize) {
+            const offset = this.paramsRingOffset;
+            this.paramsRingOffset = offset + this.paramsAlignment;
+            return offset;
+        }
+
+        // Grow. Staged-but-unwritten bytes still belong to the OLD buffer (that is what the
+        // recorded dispatches are bound to), so they must be uploaded before the swap.
+        this.flushParams();
+        const newSize = Math.max(
+            this.paramsRingSize * 2,
+            this.paramsAlignment * VertexConverter.PARAMS_RING_SLOTS
+        );
+        if (this.paramsRingBuffer) {
+            this.pendingDestroyBuffers.push(this.paramsRingBuffer);
+            this.stats.paramsGrows++;
+        }
+        this.paramsRingBuffer = this.device.createBuffer({
+            size: newSize,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        this.stats.gpuObjects++;
+        this.paramsRingSize = newSize;
+        this.paramsStaging = new Uint8Array(newSize);
+        this.paramsStagingView = new DataView(this.paramsStaging.buffer);
+        this.paramsRingOffset = this.paramsAlignment;
+        this.paramsDirtyOffset = 0;
+        this.scratchBindGroup = null;
+        return 0;
+    }
+
+    /** The frame-wide bind group: params ring (dynamic), source arena, global vertex buffer. */
+    private getScratchBindGroup(): GPUBindGroup {
+        if (this.scratchBindGroup) return this.scratchBindGroup;
+        this.scratchBindGroup = this.device.createBindGroup({
+            layout: this.bindGroupLayout,
+            entries: [
+                {
+                    binding: 0,
+                    resource: { buffer: this.paramsRingBuffer!, size: VertexConverter.PARAMS_BYTES },
+                },
+                { binding: 1, resource: { buffer: this.scratchSrcBuffer! } },
+                { binding: 2, resource: { buffer: this.globalVertexBuffer! } },
+            ],
+        });
+        this.stats.gpuObjects++;
+        return this.scratchBindGroup;
     }
 
     /**
@@ -779,10 +994,15 @@ export class VertexConverter {
             VertexConverter.MIN_GLOBAL_VERTEX_BUFFER_SIZE
         );
         this.globalVertexBufferSize = Math.min(requestedSize, this.maxGlobalVertexBufferSize);
+        // STORAGE: the pooled path has the compute shader write its output here directly,
+        // at Params.dstIndexBase, instead of into a per-draw buffer that is then copied in.
         this.globalVertexBuffer = this.device.createBuffer({
             size: this.globalVertexBufferSize,
-            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE |
+                GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
         });
+        this.stats.gpuObjects++;
+        this.scratchBindGroup = null;
     }
 
     /**
@@ -887,7 +1107,9 @@ export class VertexConverter {
         fvf: number,
         viewportWidth?: number,
         viewportHeight?: number,
-        sourceStride?: number
+        sourceStride?: number,
+        viewportX?: number,
+        viewportY?: number
     ): GpuVertexConversionResult | null {
         profiler.start("VertexConverter.convertToGpuBuffer");
 
@@ -909,62 +1131,111 @@ export class VertexConverter {
             const alignedDstSize = Math.ceil(dstSize / OUTPUT_VERTEX_BYTES) * OUTPUT_VERTEX_BYTES;
             this.ensureGlobalVertexBuffer(this.globalOffset + alignedDstSize);
 
-            // Per-call temp buffers to avoid writeBuffer/dispatch race (plan: texture_sync_race_fix).
-            const tempSrc = this.device.createBuffer({
-                size: srcSize,
-                usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
-            });
-            const tempDst = this.device.createBuffer({
-                size: dstSize,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-            });
-
-            this.queue.writeBuffer(
-                tempSrc,
-                0,
-                memory.buffer,
-                memory.byteOffset + srcAddr,
-                srcSize
-            );
-
-            const tempParamsBuffer = this.device.createBuffer({
-                size: 16,
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-                mappedAtCreation: true,
-            });
-            const paramsView = new DataView(tempParamsBuffer.getMappedRange());
-            paramsView.setUint32(0, vertexCount, true);
-            paramsView.setUint32(4, srcStride, true);
-            paramsView.setFloat32(8, (viewportWidth && viewportWidth > 0 ? viewportWidth : 640), true);
-            paramsView.setFloat32(12, (viewportHeight && viewportHeight > 0 ? viewportHeight : 480), true);
-            tempParamsBuffer.unmap();
-
             const pipeline = this.getOrCreatePipeline(config);
-            const bindGroup = this.device.createBindGroup({
-                layout: this.bindGroupLayout,
-                entries: [
-                    { binding: 0, resource: { buffer: tempParamsBuffer } },
-                    { binding: 1, resource: { buffer: tempSrc, size: srcSize } },
-                    { binding: 2, resource: { buffer: tempDst, size: dstSize } },
-                ],
-            });
+            const vpW = viewportWidth && viewportWidth > 0 ? viewportWidth : 640;
+            const vpH = viewportHeight && viewportHeight > 0 ? viewportHeight : 480;
+            const vpX = viewportX ?? 0;
+            const vpY = viewportY ?? 0;
 
-            const pass = encoder.beginComputePass();
-            pass.setPipeline(pipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.dispatchWorkgroups(Math.ceil(vertexCount / WORKGROUP_SIZE));
-            pass.end();
+            // Pooled path: sub-ranges of frame-scoped arenas, one bind group for the frame,
+            // and the compute shader writes straight into the global vertex buffer.
+            const srcBase = scratchPoolEnabled() ? this.allocScratchSrc(srcSize) : -1;
+            const paramsOffset = srcBase >= 0 ? this.allocParamsSlot() : -1;
 
-            encoder.copyBufferToBuffer(
-                tempDst,
-                0,
-                this.globalVertexBuffer!,
-                this.globalOffset,
-                dstSize
-            );
+            if (paramsOffset >= 0) {
+                this.queue.writeBuffer(
+                    this.scratchSrcBuffer!,
+                    srcBase,
+                    memory.buffer,
+                    memory.byteOffset + srcAddr,
+                    srcSize
+                );
 
-            // Lifecycle invariant: push only after commands are recorded.
-            this.pendingDestroyBuffers.push(tempParamsBuffer, tempSrc, tempDst);
+                const pv = this.paramsStagingView!;
+                pv.setUint32(paramsOffset + 0, vertexCount, true);
+                pv.setUint32(paramsOffset + 4, srcStride, true);
+                pv.setFloat32(paramsOffset + 8, vpW, true);
+                pv.setFloat32(paramsOffset + 12, vpH, true);
+                pv.setFloat32(paramsOffset + 16, vpX, true);
+                pv.setFloat32(paramsOffset + 20, vpY, true);
+                pv.setUint32(paramsOffset + 24, srcBase, true);
+                pv.setUint32(paramsOffset + 28, this.globalOffset / 4, true);
+
+                const pass = encoder.beginComputePass();
+                pass.setPipeline(pipeline);
+                pass.setBindGroup(0, this.getScratchBindGroup(), [paramsOffset]);
+                pass.dispatchWorkgroups(Math.ceil(vertexCount / WORKGROUP_SIZE));
+                pass.end();
+                this.stats.pooled++;
+            } else {
+                // Per-draw path: a fresh buffer per binding satisfies the ordering invariant by
+                // never reusing anything. Reached via the kill switch, or when an arena is at
+                // its device ceiling.
+                const tempSrc = this.device.createBuffer({
+                    size: srcSize,
+                    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.STORAGE,
+                });
+                const tempDst = this.device.createBuffer({
+                    size: dstSize,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+                });
+                this.stats.gpuObjects += 2;
+
+                this.queue.writeBuffer(
+                    tempSrc,
+                    0,
+                    memory.buffer,
+                    memory.byteOffset + srcAddr,
+                    srcSize
+                );
+
+                const tempParamsBuffer = this.device.createBuffer({
+                    size: VertexConverter.PARAMS_BYTES,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                    mappedAtCreation: true,
+                });
+                this.stats.gpuObjects++;
+                const paramsView = new DataView(tempParamsBuffer.getMappedRange());
+                paramsView.setUint32(0, vertexCount, true);
+                paramsView.setUint32(4, srcStride, true);
+                paramsView.setFloat32(8, vpW, true);
+                paramsView.setFloat32(12, vpH, true);
+                paramsView.setFloat32(16, vpX, true);
+                paramsView.setFloat32(20, vpY, true);
+                // Bases are zero: each binding starts at the range this draw owns.
+                paramsView.setUint32(24, 0, true);
+                paramsView.setUint32(28, 0, true);
+                tempParamsBuffer.unmap();
+
+                const bindGroup = this.device.createBindGroup({
+                    layout: this.bindGroupLayout,
+                    entries: [
+                        { binding: 0, resource: { buffer: tempParamsBuffer, size: VertexConverter.PARAMS_BYTES } },
+                        { binding: 1, resource: { buffer: tempSrc, size: srcSize } },
+                        { binding: 2, resource: { buffer: tempDst, size: dstSize } },
+                    ],
+                });
+                this.stats.gpuObjects++;
+
+                const pass = encoder.beginComputePass();
+                pass.setPipeline(pipeline);
+                pass.setBindGroup(0, bindGroup, [0]);
+                pass.dispatchWorkgroups(Math.ceil(vertexCount / WORKGROUP_SIZE));
+                pass.end();
+
+                encoder.copyBufferToBuffer(
+                    tempDst,
+                    0,
+                    this.globalVertexBuffer!,
+                    this.globalOffset,
+                    dstSize
+                );
+
+                // Lifecycle invariant: push only after commands are recorded.
+                this.pendingDestroyBuffers.push(tempParamsBuffer, tempSrc, tempDst);
+                this.stats.perDraw++;
+            }
+            this.stats.conversions++;
 
             const result: GpuVertexConversionResult = {
                 buffer: this.globalVertexBuffer!,
@@ -976,7 +1247,7 @@ export class VertexConverter {
 
             // Update frame snapshot counters
             const system = (globalThis as any).System?.getInstance?.();
-            const ddraw = system?.process?.getModule("ddraw") as any;
+            const ddraw = system?.process?.getModule?.("ddraw") as any;
             if (ddraw?.incrementFrameCounter) {
                 ddraw.incrementFrameCounter("vertexBytes", dstSize);
             }
@@ -1008,7 +1279,9 @@ export class VertexConverter {
         fvf: number,
         viewportWidth?: number,
         viewportHeight?: number,
-        sourceStride?: number
+        sourceStride?: number,
+        viewportX?: number,
+        viewportY?: number
     ): Promise<Uint8Array> {
         profiler.start("VertexConverter.convertGPU");
 
@@ -1032,11 +1305,12 @@ export class VertexConverter {
                     size: this.readbackBufferSize,
                     usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
                 });
+                this.stats.gpuObjects++;
             }
 
             // Use convertToGpuBuffer for the actual conversion
             const encoder = this.device.createCommandEncoder();
-            const result = this.convertToGpuBuffer(encoder, memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, srcStride);
+            const result = this.convertToGpuBuffer(encoder, memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, srcStride, viewportX, viewportY);
             
             if (!result) {
                 profiler.end("VertexConverter.convertGPU");
@@ -1045,6 +1319,7 @@ export class VertexConverter {
 
             // Copy from global vertex buffer at result.offset (data written by convertToGpuBuffer)
             encoder.copyBufferToBuffer(result.buffer, result.offset, this.readbackBuffer!, 0, dstSize);
+            this.flushParams();
             this.queue.submit([encoder.finish()]);
 
             // Read back result
@@ -1080,7 +1355,9 @@ export class VertexConverter {
         viewportWidth?: number,
         viewportHeight?: number,
         sourceStride?: number,
-        blend?: VertexBlendInput | null
+        blend?: VertexBlendInput | null,
+        viewportX?: number,
+        viewportY?: number
     ): Uint8Array {
         profiler.start("VertexConverter.convertCPU");
 
@@ -1105,6 +1382,8 @@ export class VertexConverter {
             // Viewport for XYZRHW conversion
             const vpW = viewportWidth && viewportWidth > 0 ? viewportWidth : 640;
             const vpH = viewportHeight && viewportHeight > 0 ? viewportHeight : 480;
+            const vpX = viewportX ?? 0;
+            const vpY = viewportY ?? 0;
             const scaleX = 2.0 / vpW;
             const scaleY = 2.0 / vpH;
 
@@ -1169,13 +1448,14 @@ export class VertexConverter {
                         let posW = 1.0;
 
                         if (config.hasXYZRHW) {
+                            // f32 at every step and in the WGSL's operation order — see the
+                            // matching branch below.
                             const rhw = memF32[srcIndex + 3];
-                            const w = rhw !== 0 ? 1.0 / rhw : 1.0;
+                            const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                             // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
-                            posX = ((posX + 0.5) * scaleX - 1.0) * w;
-                            posY = (1.0 - (posY + 0.5) * scaleY) * w;
-                            const zClamped = posZ < 0 ? 0 : posZ > 1 ? 1 : posZ;
-                            posZ = zClamped * w;
+                            posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + D3D_PIXEL_CENTER_OFFSET_PX) / vpW) * 2.0) - 1.0) * w);
+                            posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + D3D_PIXEL_CENTER_OFFSET_PX) / vpH) * 2.0)) * w);
+                            posZ = Math.fround(posZ * w);
                             posW = w;
                         } else if (config.hasXYZW) {
                             posW = memF32[srcIndex + 3];
@@ -1244,13 +1524,21 @@ export class VertexConverter {
                 let bnx = 0.0, bny = 0.0, bnz = 0.0;
 
                 if (config.hasXYZRHW) {
+                    // Round after EVERY step, exactly as the WGSL above does: f64 arithmetic
+                    // rounding once on the store computes a different f32, and D3D's own
+                    // rasteriser worked in f32 throughout. This does NOT buy bit-equality with
+                    // the GPU converter — WGSL specifies f32 division to 2.5 ULP, so `1/rhw`
+                    // alone puts the two apart — which is why a pre-transformed draw is pinned
+                    // to one converter (ddraw-backend-executor, rhwPinnedDraws) rather than
+                    // left to whichever the vertex count picks.
                     const rhw = srcView.getFloat32(srcBase + 12, true);
-                    const w = rhw !== 0 ? 1.0 / rhw : 1.0;
+                    const w = rhw !== 0 ? Math.fround(1.0 / rhw) : 1.0;
                     // +0.5: D3D integer pixel centers -> WebGPU half-integer centers (see WGSL above)
-                    posX = ((posX + 0.5) * scaleX - 1.0) * w;
-                    posY = (1.0 - (posY + 0.5) * scaleY) * w;
-                    const zClamped = posZ < 0 ? 0 : posZ > 1 ? 1 : posZ;
-                    posZ = zClamped * w;
+                    // Same operation ORDER as the WGSL too — (x+0.5)/vp then *2 then -1 is not
+                    // the same f32 value as (x+0.5)*(2/vp) - 1.
+                    posX = Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(Math.fround(posX - vpX) + D3D_PIXEL_CENTER_OFFSET_PX) / vpW) * 2.0) - 1.0) * w);
+                    posY = Math.fround(Math.fround(1.0 - Math.fround(Math.fround(Math.fround(Math.fround(posY - vpY) + D3D_PIXEL_CENTER_OFFSET_PX) / vpH) * 2.0)) * w);
+                    posZ = Math.fround(posZ * w);
                     posW = w;
                 } else if (config.hasXYZW) {
                     posW = srcView.getFloat32(srcBase + 12, true);
@@ -1346,7 +1634,7 @@ export class VertexConverter {
             
             // Update frame snapshot counters
             const system = (globalThis as any).System?.getInstance?.();
-            const ddraw = system?.process?.getModule("ddraw") as any;
+            const ddraw = system?.process?.getModule?.("ddraw") as any;
             if (ddraw?.incrementFrameCounter) {
                 ddraw.incrementFrameCounter("vertexBytes", dstSize);
             }
@@ -1374,12 +1662,14 @@ export class VertexConverter {
         outBuffer?: Uint8Array,
         viewportWidth?: number, 
         viewportHeight?: number,
-        sourceStride?: number
+        sourceStride?: number,
+        viewportX?: number,
+        viewportY?: number
     ): Promise<Uint8Array> {
         if (vertexCount < GPU_VERTEX_THRESHOLD) {
-            return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride);
+            return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride, null, viewportX, viewportY);
         }
-        return this.convertGPU(memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, sourceStride);
+        return this.convertGPU(memory, srcAddr, vertexCount, fvf, viewportWidth, viewportHeight, sourceStride, viewportX, viewportY);
     }
 
     /**
@@ -1394,9 +1684,11 @@ export class VertexConverter {
         viewportWidth?: number,
         viewportHeight?: number,
         sourceStride?: number,
-        blend?: VertexBlendInput | null
+        blend?: VertexBlendInput | null,
+        viewportX?: number,
+        viewportY?: number
     ): Uint8Array {
-        return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride, blend);
+        return this.convertCPU(memory, srcAddr, vertexCount, fvf, outBuffer, viewportWidth, viewportHeight, sourceStride, blend, viewportX, viewportY);
     }
 
     /**
@@ -1405,6 +1697,11 @@ export class VertexConverter {
     destroy(): void {
         if (this.globalVertexBuffer) this.globalVertexBuffer.destroy();
         if (this.readbackBuffer) this.readbackBuffer.destroy();
+        if (this.scratchSrcBuffer) this.scratchSrcBuffer.destroy();
+        if (this.paramsRingBuffer) this.paramsRingBuffer.destroy();
+        this.scratchSrcBuffer = null;
+        this.paramsRingBuffer = null;
+        this.scratchBindGroup = null;
         for (const buffer of this.pendingDestroyBuffers) {
             buffer.destroy();
         }

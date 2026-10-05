@@ -1,0 +1,1480 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.931Z",
+  "module": "opengl32",
+  "functions": [
+    {
+      "name": "glAccum",
+      "argCount": 2
+    },
+    {
+      "name": "glAlphaFunc",
+      "argCount": 2
+    },
+    {
+      "name": "glAreTexturesResident",
+      "argCount": 3
+    },
+    {
+      "name": "glArrayElement",
+      "argCount": 1
+    },
+    {
+      "name": "glBegin",
+      "argCount": 1
+    },
+    {
+      "name": "glBindTexture",
+      "argCount": 2
+    },
+    {
+      "name": "glBitmap",
+      "argCount": 7
+    },
+    {
+      "name": "glBlendFunc",
+      "argCount": 2
+    },
+    {
+      "name": "glCallList",
+      "argCount": 1
+    },
+    {
+      "name": "glCallLists",
+      "argCount": 3
+    },
+    {
+      "name": "glClear",
+      "argCount": 1
+    },
+    {
+      "name": "glClearAccum",
+      "argCount": 4
+    },
+    {
+      "name": "glClearColor",
+      "argCount": 4
+    },
+    {
+      "name": "glClearDepth",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "glClearIndex",
+      "argCount": 1
+    },
+    {
+      "name": "glClearStencil",
+      "argCount": 1
+    },
+    {
+      "name": "glClipPlane",
+      "argCount": 2
+    },
+    {
+      "name": "glColor3b",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3bv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3d",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glColor3dv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3f",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3fv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3i",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3iv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3s",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3sv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3ub",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3ubv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3ui",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3uiv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor3us",
+      "argCount": 3
+    },
+    {
+      "name": "glColor3usv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4b",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4bv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4d",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glColor4dv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4f",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4fv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4i",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4iv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4s",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4sv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4ub",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4ubv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4ui",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4uiv",
+      "argCount": 1
+    },
+    {
+      "name": "glColor4us",
+      "argCount": 4
+    },
+    {
+      "name": "glColor4usv",
+      "argCount": 1
+    },
+    {
+      "name": "glColorMask",
+      "argCount": 4
+    },
+    {
+      "name": "glColorMaterial",
+      "argCount": 2
+    },
+    {
+      "name": "glColorPointer",
+      "argCount": 4
+    },
+    {
+      "name": "glCopyPixels",
+      "argCount": 5
+    },
+    {
+      "name": "glCopyTexImage1D",
+      "argCount": 7
+    },
+    {
+      "name": "glCopyTexImage2D",
+      "argCount": 8
+    },
+    {
+      "name": "glCopyTexSubImage1D",
+      "argCount": 6
+    },
+    {
+      "name": "glCopyTexSubImage2D",
+      "argCount": 8
+    },
+    {
+      "name": "glCullFace",
+      "argCount": 1
+    },
+    {
+      "name": "glDebugEntry",
+      "argCount": 2
+    },
+    {
+      "name": "glDeleteLists",
+      "argCount": 2
+    },
+    {
+      "name": "glDeleteTextures",
+      "argCount": 2
+    },
+    {
+      "name": "glDepthFunc",
+      "argCount": 1
+    },
+    {
+      "name": "glDepthMask",
+      "argCount": 1
+    },
+    {
+      "name": "glDepthRange",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glDisable",
+      "argCount": 1
+    },
+    {
+      "name": "glDisableClientState",
+      "argCount": 1
+    },
+    {
+      "name": "glDrawArrays",
+      "argCount": 3
+    },
+    {
+      "name": "glDrawBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "glDrawElements",
+      "argCount": 4
+    },
+    {
+      "name": "glDrawPixels",
+      "argCount": 5
+    },
+    {
+      "name": "glEdgeFlag",
+      "argCount": 1
+    },
+    {
+      "name": "glEdgeFlagPointer",
+      "argCount": 2
+    },
+    {
+      "name": "glEdgeFlagv",
+      "argCount": 1
+    },
+    {
+      "name": "glEnable",
+      "argCount": 1
+    },
+    {
+      "name": "glEnableClientState",
+      "argCount": 1
+    },
+    {
+      "name": "glEnd",
+      "argCount": 0
+    },
+    {
+      "name": "glEndList",
+      "argCount": 0
+    },
+    {
+      "name": "glEvalCoord1d",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "glEvalCoord1dv",
+      "argCount": 1
+    },
+    {
+      "name": "glEvalCoord1f",
+      "argCount": 1
+    },
+    {
+      "name": "glEvalCoord1fv",
+      "argCount": 1
+    },
+    {
+      "name": "glEvalCoord2d",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glEvalCoord2dv",
+      "argCount": 1
+    },
+    {
+      "name": "glEvalCoord2f",
+      "argCount": 2
+    },
+    {
+      "name": "glEvalCoord2fv",
+      "argCount": 1
+    },
+    {
+      "name": "glEvalMesh1",
+      "argCount": 3
+    },
+    {
+      "name": "glEvalMesh2",
+      "argCount": 5
+    },
+    {
+      "name": "glEvalPoint1",
+      "argCount": 1
+    },
+    {
+      "name": "glEvalPoint2",
+      "argCount": 2
+    },
+    {
+      "name": "glFeedbackBuffer",
+      "argCount": 3
+    },
+    {
+      "name": "glFinish",
+      "argCount": 0
+    },
+    {
+      "name": "glFlush",
+      "argCount": 0
+    },
+    {
+      "name": "glFogf",
+      "argCount": 2
+    },
+    {
+      "name": "glFogfv",
+      "argCount": 2
+    },
+    {
+      "name": "glFogi",
+      "argCount": 2
+    },
+    {
+      "name": "glFogiv",
+      "argCount": 2
+    },
+    {
+      "name": "glFrontFace",
+      "argCount": 1
+    },
+    {
+      "name": "glFrustum",
+      "argCount": 12,
+      "note": "slot count exceeds parameter count (double, double, double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glGenLists",
+      "argCount": 1
+    },
+    {
+      "name": "glGenTextures",
+      "argCount": 2
+    },
+    {
+      "name": "glGetBooleanv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetClipPlane",
+      "argCount": 2
+    },
+    {
+      "name": "glGetDoublev",
+      "argCount": 2
+    },
+    {
+      "name": "glGetError",
+      "argCount": 0
+    },
+    {
+      "name": "glGetFloatv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetIntegerv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetLightfv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetLightiv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetMapdv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetMapfv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetMapiv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetMaterialfv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetMaterialiv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetPixelMapfv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetPixelMapuiv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetPixelMapusv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetPointerv",
+      "argCount": 2
+    },
+    {
+      "name": "glGetPolygonStipple",
+      "argCount": 1
+    },
+    {
+      "name": "glGetString",
+      "argCount": 1
+    },
+    {
+      "name": "glGetTexEnvfv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetTexEnviv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetTexGendv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetTexGenfv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetTexGeniv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetTexImage",
+      "argCount": 5
+    },
+    {
+      "name": "glGetTexLevelParameterfv",
+      "argCount": 4
+    },
+    {
+      "name": "glGetTexLevelParameteriv",
+      "argCount": 4
+    },
+    {
+      "name": "glGetTexParameterfv",
+      "argCount": 3
+    },
+    {
+      "name": "glGetTexParameteriv",
+      "argCount": 3
+    },
+    {
+      "name": "glHint",
+      "argCount": 2
+    },
+    {
+      "name": "glIndexd",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "glIndexdv",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexf",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexfv",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexi",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexiv",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexMask",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexPointer",
+      "argCount": 3
+    },
+    {
+      "name": "glIndexs",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexsv",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexub",
+      "argCount": 1
+    },
+    {
+      "name": "glIndexubv",
+      "argCount": 1
+    },
+    {
+      "name": "glInitNames",
+      "argCount": 0
+    },
+    {
+      "name": "glInterleavedArrays",
+      "argCount": 3
+    },
+    {
+      "name": "glIsEnabled",
+      "argCount": 1
+    },
+    {
+      "name": "glIsList",
+      "argCount": 1
+    },
+    {
+      "name": "glIsTexture",
+      "argCount": 1
+    },
+    {
+      "name": "glLightf",
+      "argCount": 3
+    },
+    {
+      "name": "glLightfv",
+      "argCount": 3
+    },
+    {
+      "name": "glLighti",
+      "argCount": 3
+    },
+    {
+      "name": "glLightiv",
+      "argCount": 3
+    },
+    {
+      "name": "glLightModelf",
+      "argCount": 2
+    },
+    {
+      "name": "glLightModelfv",
+      "argCount": 2
+    },
+    {
+      "name": "glLightModeli",
+      "argCount": 2
+    },
+    {
+      "name": "glLightModeliv",
+      "argCount": 2
+    },
+    {
+      "name": "glLineStipple",
+      "argCount": 2
+    },
+    {
+      "name": "glLineWidth",
+      "argCount": 1
+    },
+    {
+      "name": "glListBase",
+      "argCount": 1
+    },
+    {
+      "name": "glLoadIdentity",
+      "argCount": 0
+    },
+    {
+      "name": "glLoadMatrixd",
+      "argCount": 1
+    },
+    {
+      "name": "glLoadMatrixf",
+      "argCount": 1
+    },
+    {
+      "name": "glLoadName",
+      "argCount": 1
+    },
+    {
+      "name": "glLogicOp",
+      "argCount": 1
+    },
+    {
+      "name": "glMap1d",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glMap1f",
+      "argCount": 6
+    },
+    {
+      "name": "glMap2d",
+      "argCount": 14,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glMap2f",
+      "argCount": 10
+    },
+    {
+      "name": "glMapGrid1d",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glMapGrid1f",
+      "argCount": 3
+    },
+    {
+      "name": "glMapGrid2d",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glMapGrid2f",
+      "argCount": 6
+    },
+    {
+      "name": "glMaterialf",
+      "argCount": 3
+    },
+    {
+      "name": "glMaterialfv",
+      "argCount": 3
+    },
+    {
+      "name": "glMateriali",
+      "argCount": 3
+    },
+    {
+      "name": "glMaterialiv",
+      "argCount": 3
+    },
+    {
+      "name": "glMatrixMode",
+      "argCount": 1
+    },
+    {
+      "name": "glMultMatrixd",
+      "argCount": 1
+    },
+    {
+      "name": "glMultMatrixf",
+      "argCount": 1
+    },
+    {
+      "name": "glNewList",
+      "argCount": 2
+    },
+    {
+      "name": "glNormal3b",
+      "argCount": 3
+    },
+    {
+      "name": "glNormal3bv",
+      "argCount": 1
+    },
+    {
+      "name": "glNormal3d",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glNormal3dv",
+      "argCount": 1
+    },
+    {
+      "name": "glNormal3f",
+      "argCount": 3
+    },
+    {
+      "name": "glNormal3fv",
+      "argCount": 1
+    },
+    {
+      "name": "glNormal3i",
+      "argCount": 3
+    },
+    {
+      "name": "glNormal3iv",
+      "argCount": 1
+    },
+    {
+      "name": "glNormal3s",
+      "argCount": 3
+    },
+    {
+      "name": "glNormal3sv",
+      "argCount": 1
+    },
+    {
+      "name": "glNormalPointer",
+      "argCount": 3
+    },
+    {
+      "name": "glOrtho",
+      "argCount": 12,
+      "note": "slot count exceeds parameter count (double, double, double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glPassThrough",
+      "argCount": 1
+    },
+    {
+      "name": "glPixelMapfv",
+      "argCount": 3
+    },
+    {
+      "name": "glPixelMapuiv",
+      "argCount": 3
+    },
+    {
+      "name": "glPixelMapusv",
+      "argCount": 3
+    },
+    {
+      "name": "glPixelStoref",
+      "argCount": 2
+    },
+    {
+      "name": "glPixelStorei",
+      "argCount": 2
+    },
+    {
+      "name": "glPixelTransferf",
+      "argCount": 2
+    },
+    {
+      "name": "glPixelTransferi",
+      "argCount": 2
+    },
+    {
+      "name": "glPixelZoom",
+      "argCount": 2
+    },
+    {
+      "name": "glPointSize",
+      "argCount": 1
+    },
+    {
+      "name": "glPolygonMode",
+      "argCount": 2
+    },
+    {
+      "name": "glPolygonOffset",
+      "argCount": 2
+    },
+    {
+      "name": "glPolygonStipple",
+      "argCount": 1
+    },
+    {
+      "name": "glPopAttrib",
+      "argCount": 0
+    },
+    {
+      "name": "glPopClientAttrib",
+      "argCount": 0
+    },
+    {
+      "name": "glPopMatrix",
+      "argCount": 0
+    },
+    {
+      "name": "glPopName",
+      "argCount": 0
+    },
+    {
+      "name": "glPrioritizeTextures",
+      "argCount": 3
+    },
+    {
+      "name": "glPushAttrib",
+      "argCount": 1
+    },
+    {
+      "name": "glPushClientAttrib",
+      "argCount": 1
+    },
+    {
+      "name": "glPushMatrix",
+      "argCount": 0
+    },
+    {
+      "name": "glPushName",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos2d",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glRasterPos2dv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos2f",
+      "argCount": 2
+    },
+    {
+      "name": "glRasterPos2fv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos2i",
+      "argCount": 2
+    },
+    {
+      "name": "glRasterPos2iv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos2s",
+      "argCount": 2
+    },
+    {
+      "name": "glRasterPos2sv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos3d",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glRasterPos3dv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos3f",
+      "argCount": 3
+    },
+    {
+      "name": "glRasterPos3fv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos3i",
+      "argCount": 3
+    },
+    {
+      "name": "glRasterPos3iv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos3s",
+      "argCount": 3
+    },
+    {
+      "name": "glRasterPos3sv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos4d",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glRasterPos4dv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos4f",
+      "argCount": 4
+    },
+    {
+      "name": "glRasterPos4fv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos4i",
+      "argCount": 4
+    },
+    {
+      "name": "glRasterPos4iv",
+      "argCount": 1
+    },
+    {
+      "name": "glRasterPos4s",
+      "argCount": 4
+    },
+    {
+      "name": "glRasterPos4sv",
+      "argCount": 1
+    },
+    {
+      "name": "glReadBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "glReadPixels",
+      "argCount": 7
+    },
+    {
+      "name": "glRectd",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glRectdv",
+      "argCount": 2
+    },
+    {
+      "name": "glRectf",
+      "argCount": 4
+    },
+    {
+      "name": "glRectfv",
+      "argCount": 2
+    },
+    {
+      "name": "glRecti",
+      "argCount": 4
+    },
+    {
+      "name": "glRectiv",
+      "argCount": 2
+    },
+    {
+      "name": "glRects",
+      "argCount": 4
+    },
+    {
+      "name": "glRectsv",
+      "argCount": 2
+    },
+    {
+      "name": "glRenderMode",
+      "argCount": 1
+    },
+    {
+      "name": "glRotated",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glRotatef",
+      "argCount": 4
+    },
+    {
+      "name": "glScaled",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glScalef",
+      "argCount": 3
+    },
+    {
+      "name": "glScissor",
+      "argCount": 4
+    },
+    {
+      "name": "glSelectBuffer",
+      "argCount": 2
+    },
+    {
+      "name": "glShadeModel",
+      "argCount": 1
+    },
+    {
+      "name": "glStencilFunc",
+      "argCount": 3
+    },
+    {
+      "name": "glStencilMask",
+      "argCount": 1
+    },
+    {
+      "name": "glStencilOp",
+      "argCount": 3
+    },
+    {
+      "name": "glTexCoord1d",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "glTexCoord1dv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord1f",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord1fv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord1i",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord1iv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord1s",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord1sv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord2d",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glTexCoord2dv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord2f",
+      "argCount": 2
+    },
+    {
+      "name": "glTexCoord2fv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord2i",
+      "argCount": 2
+    },
+    {
+      "name": "glTexCoord2iv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord2s",
+      "argCount": 2
+    },
+    {
+      "name": "glTexCoord2sv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord3d",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glTexCoord3dv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord3f",
+      "argCount": 3
+    },
+    {
+      "name": "glTexCoord3fv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord3i",
+      "argCount": 3
+    },
+    {
+      "name": "glTexCoord3iv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord3s",
+      "argCount": 3
+    },
+    {
+      "name": "glTexCoord3sv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord4d",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glTexCoord4dv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord4f",
+      "argCount": 4
+    },
+    {
+      "name": "glTexCoord4fv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord4i",
+      "argCount": 4
+    },
+    {
+      "name": "glTexCoord4iv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoord4s",
+      "argCount": 4
+    },
+    {
+      "name": "glTexCoord4sv",
+      "argCount": 1
+    },
+    {
+      "name": "glTexCoordPointer",
+      "argCount": 4
+    },
+    {
+      "name": "glTexEnvf",
+      "argCount": 3
+    },
+    {
+      "name": "glTexEnvfv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexEnvi",
+      "argCount": 3
+    },
+    {
+      "name": "glTexEnviv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexGend",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double occupy two slots each)"
+    },
+    {
+      "name": "glTexGendv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexGenf",
+      "argCount": 3
+    },
+    {
+      "name": "glTexGenfv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexGeni",
+      "argCount": 3
+    },
+    {
+      "name": "glTexGeniv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexImage1D",
+      "argCount": 8
+    },
+    {
+      "name": "glTexImage2D",
+      "argCount": 9
+    },
+    {
+      "name": "glTexParameterf",
+      "argCount": 3
+    },
+    {
+      "name": "glTexParameterfv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexParameteri",
+      "argCount": 3
+    },
+    {
+      "name": "glTexParameteriv",
+      "argCount": 3
+    },
+    {
+      "name": "glTexSubImage1D",
+      "argCount": 7
+    },
+    {
+      "name": "glTexSubImage2D",
+      "argCount": 9
+    },
+    {
+      "name": "glTranslated",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glTranslatef",
+      "argCount": 3
+    },
+    {
+      "name": "glVertex2d",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (double, double occupy two slots each)"
+    },
+    {
+      "name": "glVertex2dv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex2f",
+      "argCount": 2
+    },
+    {
+      "name": "glVertex2fv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex2i",
+      "argCount": 2
+    },
+    {
+      "name": "glVertex2iv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex2s",
+      "argCount": 2
+    },
+    {
+      "name": "glVertex2sv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex3d",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glVertex3dv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex3f",
+      "argCount": 3
+    },
+    {
+      "name": "glVertex3fv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex3i",
+      "argCount": 3
+    },
+    {
+      "name": "glVertex3iv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex3s",
+      "argCount": 3
+    },
+    {
+      "name": "glVertex3sv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex4d",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (double, double, double, double occupy two slots each)"
+    },
+    {
+      "name": "glVertex4dv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex4f",
+      "argCount": 4
+    },
+    {
+      "name": "glVertex4fv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex4i",
+      "argCount": 4
+    },
+    {
+      "name": "glVertex4iv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertex4s",
+      "argCount": 4
+    },
+    {
+      "name": "glVertex4sv",
+      "argCount": 1
+    },
+    {
+      "name": "glVertexPointer",
+      "argCount": 4
+    },
+    {
+      "name": "glViewport",
+      "argCount": 4
+    },
+    {
+      "name": "wglChoosePixelFormat",
+      "argCount": 2
+    },
+    {
+      "name": "wglCopyContext",
+      "argCount": 3
+    },
+    {
+      "name": "wglCreateContext",
+      "argCount": 1
+    },
+    {
+      "name": "wglCreateLayerContext",
+      "argCount": 2
+    },
+    {
+      "name": "wglDeleteContext",
+      "argCount": 1
+    },
+    {
+      "name": "wglDescribeLayerPlane",
+      "argCount": 5
+    },
+    {
+      "name": "wglDescribePixelFormat",
+      "argCount": 4
+    },
+    {
+      "name": "wglGetCurrentContext",
+      "argCount": 0
+    },
+    {
+      "name": "wglGetCurrentDC",
+      "argCount": 0
+    },
+    {
+      "name": "wglGetDefaultProcAddress",
+      "argCount": 1
+    },
+    {
+      "name": "wglGetLayerPaletteEntries",
+      "argCount": 5
+    },
+    {
+      "name": "wglGetPixelFormat",
+      "argCount": 1
+    },
+    {
+      "name": "wglGetProcAddress",
+      "argCount": 1
+    },
+    {
+      "name": "wglMakeCurrent",
+      "argCount": 2
+    },
+    {
+      "name": "wglRealizeLayerPalette",
+      "argCount": 3
+    },
+    {
+      "name": "wglSetLayerPaletteEntries",
+      "argCount": 5
+    },
+    {
+      "name": "wglSetPixelFormat",
+      "argCount": 3
+    },
+    {
+      "name": "wglShareLists",
+      "argCount": 2
+    },
+    {
+      "name": "wglSwapBuffers",
+      "argCount": 1
+    },
+    {
+      "name": "wglSwapLayerBuffers",
+      "argCount": 2
+    },
+    {
+      "name": "wglUseFontBitmapsA",
+      "argCount": 4
+    },
+    {
+      "name": "wglUseFontBitmapsW",
+      "argCount": 4
+    },
+    {
+      "name": "wglUseFontOutlinesA",
+      "argCount": 8
+    },
+    {
+      "name": "wglUseFontOutlinesW",
+      "argCount": 8
+    }
+  ]
+}

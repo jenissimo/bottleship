@@ -1,4 +1,8 @@
-export const EMU_MEMORY_SIZE = 1024 * 1024 * 1024; // 1 GB (increased from 512 MB for large allocations)
+// Guest RAM. The fixed region layout below spans the first GB; everything past it is
+// HEAP_HIGH (see MEM_HEAP_HIGH_BASE), which is what lets a 32-bit title with a real
+// 400MB+ working set live inside a 512MB HEAP bucket. WASM memory is committed, not
+// resident, so the surplus costs commit charge and not RSS until the guest touches it.
+export const EMU_MEMORY_SIZE = 1536 * 1024 * 1024; // 1.5 GB
 export const EMU_VGA_MEMORY_SIZE = 8 * 1024 * 1024;
 // Largest single allocation the guest heap will accept. Purely a corrupted/garbage-size
 // guard — the real ceiling is the bucket's free space (an oversize request fails there →
@@ -16,9 +20,18 @@ export const MEM_LOWMEM_BASE = 0x00000000;
 export const MEM_LOWMEM_SIZE = 0x00100000;
 
 // HEAP: Main application heap for VirtualAlloc, HeapAlloc, etc.
-// Expanded to 512MB for memory-intensive games (Heroes 3, NFS, etc.)
-export const MEM_HEAP_BASE = 0x01000000;      // 16MB start
-export const MEM_HEAP_SIZE = 0x20000000;      // 512MB (was 176MB)
+//
+// The base is what separates the heap from the EXE WINDOW — the gap above low memory that
+// a PE mapped at its preferred ImageBase (0x00400000 for essentially every game) occupies.
+// That window has to fit the WHOLE image: the heap is used BEFORE the image is mapped (the
+// PEB/LDR block is allocated during process init), so an image reaching past the heap base
+// lands on top of live allocations, silently — the bump allocator's skip-over-foreign-regions
+// guard only works once the image region EXISTS. Same silent-and-lethal class as the
+// page-table collision below. 63MB of window fits any 32-bit game image.
+// The heap's END is unchanged (it still abuts MEM_THUNK_CODE_BASE); the window is bought
+// from the heap's low side, and HEAP_HIGH past the 1GB layout absorbs the difference.
+export const MEM_HEAP_BASE = 0x04000000;      // 64MB start — above any game image
+export const MEM_HEAP_SIZE = 0x1d000000;      // 464MB, ending at MEM_THUNK_CODE_BASE
 
 // THUNK_CODE: Executable thunk stubs (callbacks, API trampolines)
 // Must be RX-only and never overlap with writable regions
@@ -33,11 +46,32 @@ export const MEM_THUNK_DATA_SIZE = 0x01000000;  // 16MB
 // NOACCESS region to catch buffer overruns
 export const MEM_GUARD_BASE = 0x23000000;       // After THUNK_DATA
 export const MEM_GUARD_SIZE = 0x01000000;       // 16MB
+// (mirrored in Rust as FASTMEM_GUARD_BASE/SIZE — change both or fastmem refuses to arm)
+
+// PAGE_TABLES: x86 page directory (4KB) + 1024 page tables (4MB) for the identity map,
+// parked in the upper half of the red zone. It has to live somewhere no PE image can
+// reach: an EXE mapped at ImageBase 0x00400000 with a multi-MB BSS covers the whole low
+// gap, and an overlap is silent and lethal — the page walker's A/D-bit writes land in the
+// guest's globals and the guest's writes land in our PTEs. The red zone is already
+// NOACCESS, never allocated from, and excluded from the fastmem envelope.
+export const MEM_PAGETABLE_BASE = 0x23800000;
+export const MEM_PAGETABLE_SIZE = 0x00801000;   // PD + 1024 PTs
 
 // ROM/MODULES: PE executables and DLLs
 // Games typically load at 0x00400000 or 0x10000000+ ImageBase
 export const MEM_ROM_BASE = 0x24000000;         // After GUARD
 export const MEM_ROM_SIZE = 0x08000000;         // 128MB
+
+// HLE MODULE IMAGES: synthetic PE images for the DLLs we thunk (kernel32, ddraw, mss32…).
+// An HMODULE on Windows IS the ImageBase of a mapped PE, and guests act on that: pattern
+// scanners, mod loaders and dbghelp!ImageNtHeader all dereference the handle. Carved from
+// the TOP of ROM so ROM's start — the one number mirrored in Rust as the fastmem guard's
+// end — never moves; ModuleRegistry's real-DLL allocator stops at MEM_HLE_IMAGE_BASE.
+export const MEM_HLE_IMAGE_SIZE = 0x02000000;   // 32MB
+export const MEM_HLE_IMAGE_BASE = MEM_ROM_BASE + MEM_ROM_SIZE - MEM_HLE_IMAGE_SIZE;
+// One slot per module. 256KB is also the size VFS reports for these DLLs, so the stat
+// size and the image's SizeOfImage are the same constant and cannot drift apart.
+export const HLE_IMAGE_SLOT_SIZE = 0x40000;
 
 // SURFACE_PIXELS: DirectDraw surface pixel data — placed LAST so it can expand
 // freely via expandLayoutBucket up to the end of RAM. Texture-heavy hidden-object
@@ -45,6 +79,14 @@ export const MEM_ROM_SIZE = 0x08000000;         // 128MB
 // Default 320MB; layout clamps to actual RAM size (EMU_MEMORY_SIZE) at init.
 export const MEM_SURFACE_BASE = 0x2C000000;   // After ROM
 export const MEM_SURFACE_SIZE = 0x14000000;   // 320MB default — ends at 0x40000000 (= 1GB)
+
+// HEAP_HIGH: the HEAP bucket's overflow, everything above the 1GB layout up to end-of-RAM.
+// The fixed layout above ends exactly at 0x40000000, so a bundle that asks for more RAM than
+// that gets the surplus as heap and NOTHING BELOW MOVES — MEM_GUARD_BASE in particular, which
+// is mirrored in Rust as FASTMEM_GUARD_BASE and cannot change without rebuilding v86.
+// A 32-bit title on real Windows has a 2GB user space; 512MB of HEAP is our limit, not its.
+// The region exists whenever RAM exceeds the layout — which the default 1.5GB does.
+export const MEM_HEAP_HIGH_BASE = 0x40000000;
 
 // Threading and scheduling configuration
 // REDUCED: 1ms interval for highest resolution (clamped by browser to ~4ms)
@@ -525,7 +567,7 @@ export const EMU_D3D_DEFAULT_CAPS = {
 export const EMU_NATIVE_VIDEO_DLLS = false;
 
 // Names of video codec DLLs that are intercepted by HLE stubs when EMU_NATIVE_VIDEO_DLLS=false
-export const VIDEO_DLL_NAMES = new Set(['smackw32', 'binkw32']);
+export const VIDEO_DLL_NAMES = new Set(['smackw32', 'binkw32', 'lgvid']);
 
 // Default DDCAPS values — matches real HW (0x85D007C1)
 export const EMU_DDRAW_DEFAULT_CAPS = {
@@ -536,11 +578,14 @@ export const EMU_DDRAW_DEFAULT_CAPS = {
         DDCAPS_BLTFOURCC |
         DDCAPS_BLTSTRETCH |
         DDCAPS_GDI |
+        DDCAPS_PALETTE |          // CreatePalette + SetPalette + palettised present (ddraw/presenter.ts)
+        DDCAPS_READSCANLINE |     // GetScanLine answers from a real beam model (ddraw/raster-status.ts)
         DDCAPS_ZBLTS |
         DDCAPS_COLORKEY |
         DDCAPS_ALPHA |
         DDCAPS_COLORKEYHWASSIST |
         DDCAPS_BLTCOLORFILL |
+        DDCAPS_BLTDEPTHFILL |     // DDBLT_DEPTHFILL clears the depth attachment (ddraw/depth-fill.ts)
         DDCAPS_CANBLTSYSMEM,
     dwCaps2:
         DDCAPS2_CERTIFIED |

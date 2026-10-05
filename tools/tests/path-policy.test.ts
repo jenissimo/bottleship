@@ -24,7 +24,10 @@ describe("persist-by-default", () => {
         expect(p.isEphemeral("C:\\Game\\debug.log")).toBe(true);
         expect(p.isEphemeral("C:\\Game\\foo.tmp")).toBe(true);
         expect(p.isEphemeral("C:\\Game\\Temp\\scratch.bin")).toBe(true);
-        expect(p.isEphemeral("C:\\Game\\cache\\tex0.bin")).toBe(true);
+    });
+    test("a cache directory persists — its content is expensive, not disposable", () => {
+        expect(p.isEphemeral("C:\\Game\\cache\\tex0.bin")).toBe(false);
+        expect(p.isEphemeral("C:\\Game\\Shaders\\Cache\\CGPShaders\\a$b.cgps")).toBe(false);
     });
     test("*.log matches in any directory (basename rule)", () => {
         expect(p.isEphemeral("C:\\Game\\Logs\\Deep\\a.log")).toBe(true);

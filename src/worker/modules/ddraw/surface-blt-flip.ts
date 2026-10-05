@@ -6,18 +6,34 @@ import { Logger, LogCategory } from "../../core/logger";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { frameProfiler } from "../../core/frame-profiler";
-import { framePacer } from "../../core/frame-pacer";
+import { framePacer, PRESENT_INTERVAL_ONE } from "../../core/frame-pacer";
+import { lockCostProfiler } from "./lock-cost-profiler";
 import { DDrawContext } from "./context";
 import {
     DD_OK,
     E_FAIL,
     E_POINTER,
+    DDFLIP_INTERVAL2,
+    DDFLIP_INTERVAL3,
+    DDFLIP_INTERVAL4,
     DDSCAPS_PRIMARYSURFACE,
     DDSCAPS_FLIP,
+    DDSCAPS_FRONTBUFFER,
+    DDSCAPS_OVERLAY,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_3DDEVICE,
+    DDSCAPS_ZBUFFER,
     DDSCAPS_TEXTURE,
+    DDERR_NOTFLIPPABLE,
+    DDERR_SURFACEBUSY,
+    DDBLT_COLORFILL,
+    DDERR_INVALIDPARAMS,
     D3DCLEAR_TARGET,
+    D3DCLEAR_ZBUFFER,
+    D3DCLEAR_STENCIL,
+    DDBLT_DEPTHFILL,
+    DDCKEY_COLORSPACE,
+    DDERR_NOCOLORKEYHW,
     DDCKEY_SRCBLT,
     DDCKEY_DESTBLT,
     DDBLT_KEYSRC,
@@ -30,9 +46,9 @@ import {
     DDGFS_ISFLIPDONE,
     DDGFS_CANFLIP,
 } from "./constants";
-import { readRect, type Rect } from "./helpers";
+import { readRect, surfaceAt, type Rect } from "./helpers";
 import { absToRel } from "./helpers";
-import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, buildFullRect } from "./surface-helpers";
+import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect } from "./surface-helpers";
 import { RectPool } from "./rect-pool";
 import { DirectDrawSurfaceObject, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { convertRGBAToSurface, createGPUTexture, uploadToGPUTexture } from "./gpu-texture-utils";
@@ -41,18 +57,97 @@ import {
     getSurfaceFormatLayout,
 } from "../../backends/webgpu/shared/texture-formats";
 import type { DirectDrawSurfaceState } from "./com-objects";
-import { setAuthorityCpu, setAuthorityGpu, surfaceSyncManager, surfaceHasActiveWriteLease } from "./surface-sync";
+import {
+    setAuthorityCpu,
+    setAuthorityGpu,
+    surfaceSyncManager,
+    surfaceHasActiveWriteLease,
+    unionSurfaceDirtyRegion,
+} from "./surface-sync";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { isValidAddress } from "../../core/memory/address-guard";
+import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { markGpuSyncedFromCpu } from "./surface-sync";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
+import { recordSurfaceOp } from "./surface-op-log";
+import { clearDepthForZSurface, fillZSurfaceMemory, isZBufferSurface } from "./depth-fill";
+import { collectFlipChain, findFlipBlockingLease, flipStorageCompatible, rotateFlipChain } from "./flip-chain";
 
 // Module-level rect pool to reduce allocations in hot paths
 const rectPool = new RectPool(8);
 
-// Diagnostic counter for GPU Flip error scopes (first 5 only)
-let flipGpuCopyDiagCount = 0;
 const missingFormatWarnedSurfacePtrs = new Set<number>();
+
+/**
+ * ColorFill of a rect in a surface's CPU pixel memory.
+ *
+ * The guest RAM a thunk is handed is v86's Proxy, where a per-byte store costs ~40x a
+ * word store through a plain view — a full-screen fill at that rate starves the audio
+ * pump long before it reads as a slow frame. So: one row is written through a 32-bit
+ * view (or, when the layout defeats a word view, one pixel grown by doubling memmoves),
+ * and the remaining rows are replicated with copyWithin. Rows are pitch-strided, not
+ * contiguous, so each one is its own copy.
+ *
+ * The extent is bounded against the view rather than the region map, matching
+ * fillZSurfaceMemory: surfacePtr is our own SURFACE allocation, not a borrowed pointer,
+ * and a rect that runs past the end fills the rows that fit — as it did before.
+ */
+export function fillSurfaceRectCpu(
+    mem: Uint8Array,
+    dstState: DirectDrawSurfaceState,
+    rect: Rect,
+    width: number,
+    height: number,
+    bytesPerPixel: number,
+    color: number,
+): void {
+    const plain = toPlainGuestMemory(mem);
+    const pitch = dstState.pitch;
+    const rowBytes = width * bytesPerPixel;
+    const firstRow = absToRel(plain, dstState.surfacePtr + rect.top * pitch + rect.left * bytesPerPixel);
+    if (firstRow < 0 || firstRow + rowBytes > plain.length) return;
+
+    // Trailing rows that fall outside the view are dropped, not clamped mid-row.
+    let rows = height;
+    if (pitch > 0) {
+        const fit = Math.floor((plain.length - firstRow - rowBytes) / pitch) + 1;
+        if (fit < rows) rows = fit;
+    } else if (rows > 1) {
+        rows = 1;
+    }
+    if (rows <= 0) return;
+
+    const wordBase = plain.byteOffset + firstRow;
+    if (bytesPerPixel === 1) {
+        plain.fill(color & 0xff, firstRow, firstRow + rowBytes);
+    } else if (bytesPerPixel === 4 && (wordBase & 3) === 0) {
+        new Uint32Array(plain.buffer, wordBase, width).fill(color >>> 0);
+    } else if (bytesPerPixel === 2 && (wordBase & 3) === 0) {
+        const c16 = color & 0xffff;
+        const pairs = width >>> 1;
+        if (pairs > 0) new Uint32Array(plain.buffer, wordBase, pairs).fill(((c16 << 16) | c16) >>> 0);
+        if (width & 1) {
+            const tail = firstRow + pairs * 4;
+            plain[tail] = c16 & 0xff;
+            plain[tail + 1] = c16 >>> 8;
+        }
+    } else {
+        // 24 bpp, or a start address a word view cannot address: write one pixel, then
+        // double it across the row. log2(width) memmoves instead of width*bpp stores.
+        for (let b = 0; b < bytesPerPixel; b++) plain[firstRow + b] = (color >>> (b * 8)) & 0xff;
+        let filled = bytesPerPixel;
+        while (filled < rowBytes) {
+            const n = Math.min(filled, rowBytes - filled);
+            plain.copyWithin(firstRow + filled, firstRow, firstRow + n);
+            filled += n;
+        }
+    }
+
+    for (let y = 1; y < rows; y++) {
+        const off = firstRow + y * pitch;
+        plain.copyWithin(off, firstRow, firstRow + rowBytes);
+    }
+}
 
 /**
  * Lazy GPU Promotion: Create GPU texture for surface on-demand when needed for GPU Blt.
@@ -269,6 +364,25 @@ function clampRectsForBlt(
     return { src: resultSrc, dst: resultDst, width: dstW, height: dstH };
 }
 
+/**
+ * Flip's dwFlags → refreshes to hold the flip for. The INTERVALn flags are DirectDraw's
+ * spelling of D3DPRESENT_INTERVAL_TWO/THREE/FOUR and are honored.
+ *
+ * DDFLIP_NOVSYNC is deliberately NOT mapped to IMMEDIATE yet. Its faithful reading is "do
+ * not wait for the retrace", but Flip is the only frame throttle a great many DDraw-era
+ * titles have, and this backend carries most of the library: releasing it lets guest logic
+ * run at the IMMEDIATE backstop (8x refresh) on the same worker thread the guest CPU and the
+ * audio pump share, and a title whose simulation is tied to its frame loop then runs fast.
+ * That is a change to every existing DDraw bundle and wants its own regression pass, not a
+ * ride-along with the d3d paths. `__forcePresentInterval` 0 exercises it meanwhile.
+ */
+function flipPresentInterval(dwFlags: number): number {
+    if (dwFlags & DDFLIP_INTERVAL4) return 4;
+    if (dwFlags & DDFLIP_INTERVAL3) return 3;
+    if (dwFlags & DDFLIP_INTERVAL2) return 2;
+    return PRESENT_INTERVAL_ONE;
+}
+
 export function createSurfaceBltFlipExports(context: DDrawContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -278,8 +392,12 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
     exports["IDirectDrawSurface7_Flip"] = (ctx, mem, args): number | Promise<number> => {
         const thisPtr = args[0];
         const lpDDSurfaceTargetOverride = args[1];
+        const presentInterval = flipPresentInterval(args[2] >>> 0);
+        // The frame denominator for lockCost. A Blt-presenting title never flips, and its
+        // report then says `flips: 0` / `locksPerFrame: null` rather than inventing one.
+        lockCostProfiler.countFlip();
         profiler.start('Flip:lookup');
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
         const state = obj.getState();
 
@@ -295,7 +413,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         for (const sPtr of surfacesToSync) {
             const hdc = gdiContext.getHDCBySurface(sPtr);
             if (hdc && gdiContext.isDirty(hdc)) {
-                const sObj = context.resourceProvider.getComObjectByAddress(sPtr) as DirectDrawSurfaceObject | null;
+                const sObj = surfaceAt(context.resourceProvider, sPtr);
                 if (!sObj) continue;
                 Logger.log(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: Force syncing active GDI HDC 0x${hdc.toString(16)} on surface 0x${sPtr.toString(16)}`);
                 try {
@@ -307,6 +425,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                         const pitch = sState.pitch || (width * Math.max(1, sState.format.bpp / 8));
                         convertRGBAToSurface(imageData.data, mem, sState.surfacePtr, width, height, pitch, sState.format, { clearAlphaBit: true });
                         setAuthorityCpu(sState);
+                        unionSurfaceDirtyRegion(sState, { left: 0, top: 0, right: width, bottom: height });
                         gdiContext.clearDirty(hdc);
                     }
                 } catch (e) {
@@ -316,45 +435,77 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         }
         profiler.end('Flip:gdiSync');
 
+        // Flip renames storage around a chain whose FRONT is `this`. Wine
+        // (ddraw_surface1_Flip) refuses anything else outright — a back buffer, a
+        // non-flippable surface, or an override that is this very surface.
         profiler.start('Flip:resolve');
-        let srcState = state;
-        let dstState = state;
-        let attachedAddr = state.attachedSurfaceAddr;
-
-        if (!attachedAddr && (state.caps & DDSCAPS_PRIMARYSURFACE) && (state.caps & DDSCAPS_FLIP)) {
-            attachedAddr = context.surfaces.backBuffer;
+        const isFront = (state.caps & (DDSCAPS_PRIMARYSURFACE | DDSCAPS_FRONTBUFFER | DDSCAPS_OVERLAY)) !== 0;
+        if (!isFront || (state.caps & DDSCAPS_FLIP) === 0
+            || (lpDDSurfaceTargetOverride && (lpDDSurfaceTargetOverride >>> 0) === (thisPtr >>> 0))) {
+            profiler.end('Flip:resolve');
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_Flip: surface 0x${thisPtr.toString(16)} caps=0x${state.caps.toString(16)} ` +
+                `is not the front buffer of a flip chain -> DDERR_NOTFLIPPABLE`);
+            return DDERR_NOTFLIPPABLE;
         }
 
-        if (attachedAddr) {
-            const attached = context.resourceProvider.getComObjectByAddress(attachedAddr) as DirectDrawSurfaceObject | null;
-            if (attached) {
-                const attachedState = attached.getState();
+        const ring = collectFlipChain(thisPtr, (a) =>
+            surfaceAt(context.resourceProvider, a));
 
-                if (state.caps & DDSCAPS_PRIMARYSURFACE) {
-                    srcState = attachedState;
-                    dstState = state;
-                } else if (state.caps & DDSCAPS_BACKBUFFER) {
-                    srcState = state;
-                    dstState = attachedState;
-                } else {
-                    srcState = attachedState;
-                    dstState = state;
-                }
-            }
-        } else if (lpDDSurfaceTargetOverride) {
-            const overrideObj = context.resourceProvider.getComObjectByAddress(lpDDSurfaceTargetOverride) as DirectDrawSurfaceObject | null;
-            if (overrideObj) {
-                srcState = overrideObj.getState();
-                dstState = state;
+        // The links do not close into a ring only when the back buffer reached us
+        // through context.surfaces rather than an attachment; pair with it directly.
+        let chain = ring;
+        if (!chain) {
+            const bbAddr = context.surfaces.backBuffer;
+            const bbObj = bbAddr && bbAddr !== thisPtr
+                ? surfaceAt(context.resourceProvider, bbAddr)
+                : null;
+            const bbState = bbObj?.getState();
+            if (bbState && flipStorageCompatible(state, bbState)) {
+                chain = [{ addr: thisPtr >>> 0, state }, { addr: bbAddr >>> 0, state: bbState }];
             }
         }
+        if (!chain || chain.length < 2) {
+            profiler.end('Flip:resolve');
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_Flip: no flip target for surface 0x${thisPtr.toString(16)} -> DDERR_NOTFLIPPABLE`);
+            return DDERR_NOTFLIPPABLE;
+        }
+
+        // Flip(target) renames front and target and leaves the surfaces between them
+        // untouched; without a target the whole ring rotates one position.
+        let rotateSpan = chain.map((e) => e.state);
+        if (lpDDSurfaceTargetOverride) {
+            const idx = chain.findIndex((e) => e.addr === (lpDDSurfaceTargetOverride >>> 0));
+            if (idx <= 0) {
+                profiler.end('Flip:resolve');
+                Logger.warn(LogCategory.DDRAW,
+                    `IDirectDrawSurface7_Flip: override 0x${lpDDSurfaceTargetOverride.toString(16)} is not on ` +
+                    `the flip chain of 0x${thisPtr.toString(16)} -> DDERR_NOTFLIPPABLE`);
+                return DDERR_NOTFLIPPABLE;
+            }
+            rotateSpan = [chain[0].state, chain[idx].state];
+        }
+
+        const busy = findFlipBlockingLease(rotateSpan);
+        if (busy) {
+            profiler.end('Flip:resolve');
+            Logger.warn(LogCategory.DDRAW,
+                `IDirectDrawSurface7_Flip: surface 0x${busy.surfacePtr.toString(16)} still holds a Lock lease ` +
+                `-> DDERR_SURFACEBUSY (the guest must Unlock before flipping)`);
+            return DDERR_SURFACEBUSY;
+        }
+
+        // The image about to reach the screen is the one the successor holds.
+        const srcState = rotateSpan[1];
+        const dstState = state;
         profiler.end('Flip:resolve');
 
         // Diagnostic: log flip resolution
         {
             const s = srcState as any;
             Logger.log(LogCategory.DDRAW,
-                `IDirectDrawSurface7_Flip: attachedAddr=0x${(attachedAddr || 0).toString(16)} src=0x${srcState.surfacePtr.toString(16)} dst=0x${dstState.surfacePtr.toString(16)} srcMode=${s.mode ?? '?'} srcGpuTex=${!!srcState.gpuTexture} dstGpuTex=${!!dstState.gpuTexture} srcGpuDirty=${s.gpuDirty ?? '?'} srcVer=${s.version ?? '?'} srcGpuWriteVer=${s.gpuWrittenVersion ?? '?'}`);
+                `IDirectDrawSurface7_Flip: chain=${chain.length} src=0x${srcState.surfacePtr.toString(16)} dst=0x${dstState.surfacePtr.toString(16)} srcMode=${s.mode ?? '?'} srcGpuTex=${!!srcState.gpuTexture} dstGpuTex=${!!dstState.gpuTexture} srcGpuDirty=${s.gpuDirty ?? '?'} srcVer=${s.version ?? '?'} srcGpuWriteVer=${s.gpuWrittenVersion ?? '?'}`);
         }
 
         // Helper: post-copy Flip tail — deferred uploads, frame pacing, present
@@ -379,11 +530,16 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (context.executor) context.executor.flush();
             profiler.end('Flip:flush');
 
+            // The rotation has settled and the pacer wait below is dead time: start the
+            // GPU→CPU copy for the chain members the guest read-Locks now, so the Lock
+            // that follows finds the pixels already in guest memory.
+            context.executor?.prefetchRotatedForReadback(rotateSpan);
+
             // Frame capture: finalize captured draw calls for this frame
             frameCaptureOnFrameEnd();
 
-            // Frame Pacer: wait for display refresh (pauses virtual time, compensates dt)
-            return framePacer.waitForFrameSlot().then(() => {
+            // Frame Pacer: hold for the interval this Flip asked for (default = one refresh).
+            return framePacer.waitForPresentInterval(presentInterval).then(() => {
                 // Mark frame END after pacer wait so frameMs includes real inter-frame interval.
                 frameProfiler.markFrame("ddraw");
 
@@ -405,127 +561,33 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             });
         };
 
-        // Copy phase
-        if (srcState.surfacePtr !== dstState.surfacePtr) {
-            const srcRect = buildFullRect(srcState);
-            const dstRect = buildFullRect(dstState);
-            const backend = context.backend;
-            const canGpuCopy = !!(backend && srcState.gpuTexture && dstState.gpuTexture);
+        // Flip phase — rotate storage around the chain (DirectDraw renames surfaces,
+        // it does not copy pixels; see flip-chain.ts).
+        profiler.start('Flip:rotate');
+        // A pending render pass still targets the pre-rotation texture.
+        if (context.executor) context.executor.flush();
 
-            // Check if GPU copy is appropriate: source has authoritative GPU data.
-            const srcHasGpuData = isRenderSurface(srcState) &&
-                srcState.gpuWrittenVersion === srcState.version && !srcState.gpuDirty;
-            const shouldUseGpuCopy = canGpuCopy && srcHasGpuData;
-
-            if (shouldUseGpuCopy) {
-                profiler.start('Flip:copy:gpu');
-                Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: [FAST] GPU Copy 0x${srcState.surfacePtr.toString(16)} -> 0x${dstState.surfacePtr.toString(16)}`);
-                if (context.executor) context.executor.flush();
-                const device = backend!.getDevice();
-                if (device) {
-                    const srcFormat = srcState.gpuTextureFormat ?? "rgba8unorm";
-                    const dstFormat = dstState.gpuTextureFormat ?? "rgba8unorm";
-                    const formatsMatch = srcFormat === dstFormat;
-
-                    if (formatsMatch) {
-                        const useFlipErrorScope = flipGpuCopyDiagCount < 5;
-                        if (useFlipErrorScope) {
-                            device.pushErrorScope("validation");
-                        }
-                        const encoder = device.createCommandEncoder();
-                        encoder.copyTextureToTexture(
-                            { texture: srcState.gpuTexture!, origin: { x: 0, y: 0, z: 0 } },
-                            { texture: dstState.gpuTexture!, origin: { x: 0, y: 0, z: 0 } },
-                            { width: srcState.width, height: srcState.height, depthOrArrayLayers: 1 }
-                        );
-                        backend!.getQueue()?.submit([encoder.finish()]);
-                        flipGpuCopyDiagCount++;
-                        if (useFlipErrorScope) {
-                            device.popErrorScope().then(err => {
-                                if (err) Logger.error(LogCategory.DDRAW, `[FLIP] GPU copy validation error: ${err.message}`);
-                            });
-                        }
-                    } else {
-                        Logger.verbose(LogCategory.DDRAW,
-                            `IDirectDrawSurface7_Flip: Format mismatch (src=${srcFormat}, dst=${dstFormat}), using shader copy`);
-                        if (context.executor) {
-                            const w = Math.min(srcState.width, dstState.width);
-                            const h = Math.min(srcState.height, dstState.height);
-                            context.executor.blitWithShaderCopy(
-                                srcState, dstState,
-                                { left: 0, top: 0, right: w, bottom: h },
-                                { left: 0, top: 0, right: w, bottom: h }
-                            );
-                            context.executor.flush();
-                        }
-                    }
-                    setAuthorityGpu(dstState);
-                }
-                profiler.end('Flip:copy:gpu');
-            } else {
-                profiler.start('Flip:copy:cpu');
-                const srcModeStr = isRenderSurface(srcState) ? srcState.mode : "bitmap_texture";
-                Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: [SLOW] CPU Copy 0x${srcState.surfacePtr.toString(16)} -> 0x${dstState.surfacePtr.toString(16)} (srcMode=${srcModeStr})`);
-
-                // Fix: If source has authoritative GPU data, readback before CPU copy
-                if (context.executor) {
-                    const readbackDecision = surfaceSyncManager.needsCPUSync(srcState);
-                    if (readbackDecision.needed) {
-                        if (context.executor.syncSurfaceToMemoryFromScratch(srcState, mem)) {
-                            Logger.verbose(LogCategory.DDRAW,
-                                `IDirectDrawSurface7_Flip: CPU path synchronized src=0x${srcState.surfacePtr.toString(16)} from cached rgbaScratch`);
-                        } else {
-                            const ds: any = dstState, ss: any = srcState;
-                            Logger.log(LogCategory.DDRAW,
-                                `READBACK-DIAG Flip-readback src=0x${srcState.surfacePtr.toString(16)} ` +
-                                `src(${ss.width}x${ss.height} caps=0x${ss.caps.toString(16)} mode=${ss.mode} gpuTex=${!!ss.gpuTexture} fmt=${ss.gpuTextureFormat}) ` +
-                                `dst=0x${dstState.surfacePtr.toString(16)} dst(caps=0x${ds.caps.toString(16)} mode=${ds.mode} gpuTex=${!!ds.gpuTexture} fmt=${ds.gpuTextureFormat} everLocked=${ds.everLocked})`);
-                            Logger.log(LogCategory.DDRAW,
-                                `IDirectDrawSurface7_Flip: CPU path requires GPU→CPU readback for src=0x${srcState.surfacePtr.toString(16)}`);
-                            // Async: readback then continue with CPU copy + finish
-                            return context.executor.syncSurfaceToMemory(srcState).then(() => {
-                                copySurfaceRegion(mem, srcState, dstState, srcRect, dstRect);
-                                setAuthorityCpu(dstState);
-
-                                if (isRenderSurface(dstState) && dstState.mode === "GPU_ONLY") {
-                                    dstState.mode = "CPU";
-                                    dstState.everLocked = true;
-                                    Logger.log(LogCategory.DDRAW,
-                                        `IDirectDrawSurface7_Flip: Demoted GPU_ONLY dst to CPU surface=0x${dstState.surfacePtr.toString(16)}`);
-                                }
-
-                                if (isBitmapTexture(srcState) && isRenderSurface(dstState)) {
-                                    dstState.rgbaScratch = new Uint8Array(srcState.rgbaScratch);
-                                    dstState.rgbaScratchVersion = dstState.version;
-                                }
-                                profiler.end('Flip:copy:cpu');
-                                return finishFlip();
-                            });
-                        }
-                    }
-                }
-
-                copySurfaceRegion(mem, srcState, dstState, srcRect, dstRect);
-                setAuthorityCpu(dstState);
-
-                if (isRenderSurface(dstState) && dstState.mode === "GPU_ONLY") {
-                    dstState.mode = "CPU";
-                    dstState.everLocked = true;
-                    Logger.log(LogCategory.DDRAW,
-                        `IDirectDrawSurface7_Flip: Demoted GPU_ONLY dst to CPU (CPU data written via Flip) ` +
-                        `surface=0x${dstState.surfacePtr.toString(16)}`);
-                }
-
-                if (isBitmapTexture(srcState) && isRenderSurface(dstState)) {
-                    dstState.rgbaScratch = new Uint8Array(srcState.rgbaScratch);
-                    dstState.rgbaScratchVersion = dstState.version;
-                }
-
-                profiler.end('Flip:copy:cpu');
-            }
-        } else {
-            Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_Flip: No-op flip detected (Src==Dst). Visual updates may fail.`);
+        // Two indexes are keyed by the storage that is about to move and would otherwise
+        // describe the wrong surface afterwards: the surfacePtr→handle map (sibling
+        // propagation reads it) and the deferred-upload batch.
+        const handleOf = new Map<DirectDrawSurfaceState, number>();
+        for (const e of chain) {
+            const obj = surfaceAt(context.resourceProvider, e.addr);
+            if (obj) handleOf.set(e.state, obj.handle);
         }
+        const wasPendingUpload = new Set(
+            rotateSpan.filter((s) => context.deferredUploadManager.isPendingUpload(s)));
+
+        rotateFlipChain(rotateSpan, rotateSpan.length, (move) => {
+            const handle = handleOf.get(move.to);
+            if (handle !== undefined && move.previousPtr !== move.to.surfacePtr) {
+                context.resourceProvider.unregisterSurfacePtr(handle, move.previousPtr);
+                context.resourceProvider.registerSurfacePtr(handle, move.to.surfacePtr);
+            }
+            context.deferredUploadManager.setPendingUpload(move.to, wasPendingUpload.has(move.from));
+        });
+        recordSurfaceOp("flip", `rotate:${rotateSpan.length}`, dstState, srcState, null, null);
+        profiler.end('Flip:rotate');
 
         return finishFlip();
     };
@@ -555,7 +617,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const dwFlags = args[1];
         const lpColorKey = args[2];
 
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
 
         const state = obj.getState();
@@ -586,7 +648,22 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const low = view.getUint32(lpColorKey, true);
-        const high = view.getUint32(lpColorKey + 4, true);
+        // A DirectDraw colour key is ALWAYS a single value. No hardware implemented the
+        // range form: with DDCKEY_COLORSPACE and low != high the call fails outright, and
+        // without the flag dwColorSpaceHighValue is ignored and the key collapses to low
+        // (games routinely leave it as stack garbage). Pinned by Wine's conformance tests
+        // (dlls/ddraw/tests/ddraw1.c) for both src and dest keys.
+        //
+        // Honouring a range instead is not a harmless extra: a title that asked for one
+        // got a refusal on hardware and took another path, while here it silently gets a
+        // key that rejects a whole band of colours.
+        if ((dwFlags & DDCKEY_COLORSPACE) !== 0 && view.getUint32(lpColorKey + 4, true) !== low) {
+            Logger.log(LogCategory.DDRAW,
+                `SetColorKey: range key 0x${low.toString(16)}-0x${view.getUint32(lpColorKey + 4, true).toString(16)} ` +
+                `refused (DDERR_NOCOLORKEYHW) — no DirectDraw hardware supports one`);
+            return DDERR_NOCOLORKEYHW;
+        }
+        const high = low;
 
         if (dwFlags & DDCKEY_SRCBLT) {
             state.srcColorKey = { low, high };
@@ -626,7 +703,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const dwFlags = args[1];
         const lpColorKey = args[2];
 
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         if (!obj) return E_FAIL;
         if (!lpColorKey || !isValidAddress(mem, lpColorKey, 8)) return E_POINTER;
 
@@ -664,12 +741,12 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const dwFlags = args[4];
         const lpDDBltFx = args[5];
 
-        const dstObj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const dstObj = surfaceAt(context.resourceProvider, thisPtr);
         if (!dstObj) return E_FAIL;
         const dstState = dstObj.getState();
 
         if ((dstState.caps & DDSCAPS_TEXTURE) !== 0) {
-            const srcObj = lpSrcSurface ? context.resourceProvider.getComObjectByAddress(lpSrcSurface) as DirectDrawSurfaceObject | null : null;
+            const srcObj = lpSrcSurface ? surfaceAt(context.resourceProvider, lpSrcSurface) : null;
             Logger.log(LogCategory.DDRAW, 
                 `Blt to TEXTURE: dst=0x${thisPtr.toString(16)} src=0x${(lpSrcSurface || 0).toString(16)} ` +
                 `flags=0x${dwFlags.toString(16)} dstSize=${dstState.width}x${dstState.height} ` +
@@ -680,10 +757,27 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         if (!dstRect) return DD_OK;
 
         if (!lpSrcSurface) {
-            let fillColor = 0;
+            // A source-less Blt is a fill, and a fill carries its value in DDBLTFX: without
+            // one of the fill flags, or without the struct, DirectDraw has nothing to write.
+            const isFill = (dwFlags & (DDBLT_COLORFILL | DDBLT_DEPTHFILL)) !== 0;
             const fillSize = DDBLTFX_OFFSETS.fillColor + 4;
-            if (lpDDBltFx && isValidAddress(mem, lpDDBltFx, fillSize)) {
-                fillColor = new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(lpDDBltFx + DDBLTFX_OFFSETS.fillColor, true);
+            const hasFx = !!lpDDBltFx && isValidAddress(mem, lpDDBltFx, fillSize);
+            if (!isFill || !hasFx) return DDERR_INVALIDPARAMS;
+            const fillColor = new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
+                .getUint32(lpDDBltFx + DDBLTFX_OFFSETS.fillColor, true);
+
+            // A source-less fill aimed at a z buffer is a DEPTH CLEAR. DDBLT_DEPTHFILL says so
+            // explicitly, but on real hardware the z surface IS the depth memory, so engines of
+            // this era clear it with a plain DDBLT_COLORFILL just as often — the destination's
+            // DDSCAPS_ZBUFFER is what decides, not the flag.
+            if ((dwFlags & DDBLT_DEPTHFILL) !== 0 || isZBufferSurface(dstState)) {
+                // The guest pixels ARE the depth memory as far as the app is concerned, and a
+                // later Lock reads them back to decide what to clear to, so write them too —
+                // the depth attachment behind them is our cache, not the app's view.
+                fillZSurfaceMemory(dstState, mem, dstRect, fillColor);
+                clearDepthForZSurface(context, thisPtr, dstState, dstRect, fillColor);
+                recordSurfaceOp("fill", "depth", dstState, null, dstRect, null);
+                return DD_OK;
             }
 
             // GPU_ONLY surfaces: use GPU-only clear (never Lock/Unlocked)
@@ -732,6 +826,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     height: dstRect.bottom - dstRect.top,
                 });
                 setAuthorityGpu(dstState);
+                recordSurfaceOp("fill", "gpu", dstState, null, dstRect, null);
                 return DD_OK;
             }
 
@@ -748,38 +843,21 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (surfaceHasActiveWriteLease(dstState)) {
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP ColorFill - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
+                recordSurfaceOp("fill", "skip:lease", dstState, null, dstRect, null);
                 return DD_OK;
             }
 
             if (rectWidth > 0 && rectHeight > 0) {
-                for (let y = 0; y < rectHeight; y++) {
-                    const rowAddr = dstState.surfacePtr + (dstRect.top + y) * dstState.pitch + dstRect.left * bytesPerPixel;
-                    const relRowAddr = absToRel(mem, rowAddr);
-                    if (relRowAddr >= 0 && relRowAddr + rectWidth * bytesPerPixel <= mem.length) {
-                        if (bytesPerPixel === 2) {
-                            for (let x = 0; x < rectWidth; x++) {
-                                mem[relRowAddr + x * 2] = fillColor & 0xff;
-                                mem[relRowAddr + x * 2 + 1] = (fillColor >> 8) & 0xff;
-                            }
-                        } else if (bytesPerPixel === 4) {
-                            for (let x = 0; x < rectWidth; x++) {
-                                mem[relRowAddr + x * 4] = fillColor & 0xff;
-                                mem[relRowAddr + x * 4 + 1] = (fillColor >> 8) & 0xff;
-                                mem[relRowAddr + x * 4 + 2] = (fillColor >> 16) & 0xff;
-                                mem[relRowAddr + x * 4 + 3] = (fillColor >> 24) & 0xff;
-                            }
-                        } else {
-                            mem.fill(fillColor & 0xff, relRowAddr, relRowAddr + rectWidth * bytesPerPixel);
-                        }
-                    }
-                }
+                fillSurfaceRectCpu(mem, dstState, dstRect, rectWidth, rectHeight, bytesPerPixel, fillColor);
                 setAuthorityCpu(dstState);
+                unionSurfaceDirtyRegion(dstState, dstRect);
             }
 
+            recordSurfaceOp("fill", "cpu", dstState, null, dstRect, null);
             return DD_OK;
         }
 
-        const srcObj = context.resourceProvider.getComObjectByAddress(lpSrcSurface) as DirectDrawSurfaceObject | null;
+        const srcObj = surfaceAt(context.resourceProvider, lpSrcSurface);
         if (!srcObj) return E_FAIL;
 
         const srcState = srcObj.getState();
@@ -926,6 +1004,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (surfaceHasActiveWriteLease(dstState)) {
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP CPU blit - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
+                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect, colorKey);
                 profiler.end("Blt:cpuPath");
                 return;
             }
@@ -935,7 +1014,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 `IDirectDrawSurface7_Blt: Using CPU DEFAULT PATH (src mode=${srcModeStr} dst mode=${dstModeStr} ` +
                 `useColorKey=${useColorKey} isStretch=${isStretch})`);
 
-            if (rop3 !== undefined) {
+            if (copyCompressedSurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect,
+                                            useColorKey ? colorKey : undefined)) {
+                // Block-compressed source — decompressed on the way in. A ROP against block
+                // storage is meaningless, so it is deliberately not honoured here.
+            } else if (rop3 !== undefined) {
                 copySurfaceRegionWithRop(mem, srcState, dstState, effSrcRect, effDstRect, rop3);
             } else if (useColorKey && colorKey) {
                 copySurfaceRegionWithColorKey(mem, srcState, dstState, effSrcRect, effDstRect, colorKey);
@@ -944,7 +1027,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
 
             setAuthorityCpu(dstState);
+            unionSurfaceDirtyRegion(dstState, effDstRect);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
+            recordSurfaceOp("blt",
+                rop3 !== undefined ? "cpu:rop" : useColorKey ? "cpu:colorkey" : isStretch ? "cpu:stretch" : "cpu",
+                dstState, srcState, effDstRect, effSrcRect, colorKey);
             profiler.end("Blt:cpuPath");
         };
 
@@ -980,6 +1067,9 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 profiler.end("Blt:gpuPath:copy");
                 setAuthorityGpu(dstState);
             }
+            recordSurfaceOp("blt",
+                useColorKey ? "gpu:colorkey" : formatMismatch ? "gpu:shadercopy" : "gpu",
+                dstState, srcState, effDstRect, effSrcRect, colorKey);
         };
 
         if (willUseGpu) {
@@ -1017,6 +1107,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 // Lease guard: CPU fallback writes dst pixels — skip while locked.
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP CPU fallback - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
+                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else {
                 if (useColorKey && colorKey) {
                     copySurfaceRegionWithColorKey(mem, srcState, dstState, effSrcRect, effDstRect, colorKey);
@@ -1024,7 +1115,9 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                     copySurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect);
                 }
                 setAuthorityCpu(dstState);
+                unionSurfaceDirtyRegion(dstState, effDstRect);
                 (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
+                recordSurfaceOp("blt", "cpu:nogpu", dstState, srcState, effDstRect, effSrcRect, colorKey);
             }
             profiler.end("Blt:gpuPath");
         } else if (isStretch && hasBackend && noRop && !useColorKey && context.executor) {
@@ -1044,14 +1137,18 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 context.executor.blitWithShaderCopy(srcState, dstState, effSrcRect, effDstRect);
                 context.executor.flush();
                 setAuthorityGpu(dstState);
+                recordSurfaceOp("blt", "gpu:stretch", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else if (surfaceHasActiveWriteLease(dstState)) {
                 // Lease guard: CPU nearest-neighbor writes dst pixels — skip while locked.
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_Blt: SKIP CPU stretch fallback - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
+                recordSurfaceOp("blt", "skip:lease", dstState, srcState, effDstRect, effSrcRect, colorKey);
             } else {
                 // Fallback to CPU nearest-neighbor if GPU promotion failed
                 copySurfaceRegion(mem, srcState, dstState, effSrcRect, effDstRect);
                 setAuthorityCpu(dstState);
+                unionSurfaceDirtyRegion(dstState, effDstRect);
+                recordSurfaceOp("blt", "cpu:stretch", dstState, srcState, effDstRect, effSrcRect, colorKey);
             }
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             profiler.end("Blt:gpuStretch");
@@ -1080,6 +1177,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                         }
                         context.executor!.flush();
                         setAuthorityGpu(dstState);
+                        recordSurfaceOp("blt", useColorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, effDstRect, effSrcRect, colorKey);
                         profiler.end("Blt:mixedGpuPath");
                         return finishBlt();
                     });
@@ -1094,6 +1192,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             }
             context.executor.flush();
             setAuthorityGpu(dstState);
+            recordSurfaceOp("blt", useColorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, effDstRect, effSrcRect, colorKey);
             profiler.end("Blt:mixedGpuPath");
         } else {
             profiler.start("Blt:cpuPath");
@@ -1151,11 +1250,11 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
         const lpSrcRect = args[4];
         const dwTrans = args[5] >>> 0;
 
-        const dstObj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const dstObj = surfaceAt(context.resourceProvider, thisPtr);
         if (!dstObj) return E_FAIL;
         const dstState = dstObj.getState();
 
-        const srcObj = context.resourceProvider.getComObjectByAddress(lpSrcSurface) as DirectDrawSurfaceObject | null;
+        const srcObj = surfaceAt(context.resourceProvider, lpSrcSurface);
         if (!srcObj) return E_FAIL;
 
         const srcState = srcObj.getState();
@@ -1188,6 +1287,7 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (surfaceHasActiveWriteLease(dstState)) {
                 Logger.warn(LogCategory.DDRAW,
                     `IDirectDrawSurface7_BltFast: SKIP - dst 0x${dstState.surfacePtr.toString(16)} is locked for writing (active write lease)`);
+                recordSurfaceOp("bltfast", "skip:lease", dstState, srcState, dstRect, srcRect, srcState.srcColorKey);
                 return DD_OK;
             }
             if (useColorKey && srcState.srcColorKey) {
@@ -1196,7 +1296,9 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 copySurfaceRegion(mem, srcState, dstState, srcRect, dstRect);
             }
             setAuthorityCpu(dstState);
+            unionSurfaceDirtyRegion(dstState, dstRect);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
+            recordSurfaceOp("bltfast", useColorKey ? "cpu:colorkey" : "cpu", dstState, srcState, dstRect, srcRect, useColorKey ? srcState.srcColorKey : undefined);
 
             // BltFast to primary triggers present (same as Blt to primary).
             // Many 2D games use BltFast exclusively for rendering.

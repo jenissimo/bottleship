@@ -21,11 +21,96 @@ import {
 
 export type ThreadLookupFn = (threadId: number) => { state: ThreadState } | null;
 
+/**
+ * Ring of signal/wait transitions on kernel sync objects.
+ *
+ * A deadlock's state — "T1 waits on an unsignalled event" — never says WHY: the signal may
+ * have been lost, consumed by the wrong waiter, or reset from under the waiter. Only the
+ * ORDER answers that, and by the time the hang is observable the order is gone. Costs one
+ * array store per recorded transition; the ring is fixed-size and never grows.
+ *
+ * NOT A COMPLETE HISTORY, and it says so in its own readout: SetEvent on an event with no
+ * waiters, and an auto-reset consume, are served entirely inside the WASM hypercall tier and
+ * never reach JS. That is exactly the lost-signal shape (signal before the waiter parks), so
+ * an ABSENT entry must never be read as "the signal was never sent". The same holds for
+ * mux-acq/mux-rel: an uncontended mutex is taken and dropped entirely in WASM, so a mutex
+ * with no entries here is the NORMAL case, not a leak. Read the owner from the mirror
+ * (describeAll) and use this ring only for the order of the ops JS did handle.
+ */
+export const SYNC_RING_NOTE =
+    "incomplete by construction: SetEvent with no waiters, auto-reset consumes and every "
+    + "UNCONTENDED mutex acquire/release are served in the WASM hypercall tier and never reach "
+    + "JS — a missing entry is not proof that the op did not happen";
+const SYNC_RING_SIZE = 512;
+interface SyncRingEntry { t: number; op: string; handle: number; tid: number; detail?: string; repeat?: number }
+const syncRing: SyncRingEntry[] = [];
+let syncRingWrite = 0;
+
+export function recordSyncEvent(op: string, handle: number, tid: number, detail?: string): void {
+    // Coalesce an immediately-repeating transition into a count. A guest that polls an event
+    // in a 10 Hz reset+timed-wait loop otherwise floods the ring within seconds and scrolls
+    // out the one submission that explains the hang — the repetition is the least
+    // informative part of the history and must not cost the most space.
+    const prevIdx = (syncRingWrite - 1 + SYNC_RING_SIZE) % SYNC_RING_SIZE;
+    const prev = syncRing.length > 0 ? syncRing[Math.min(prevIdx, syncRing.length - 1)] : undefined;
+    if (prev && prev.op === op && prev.handle === (handle >>> 0) && prev.tid === (tid >>> 0) && prev.detail === detail) {
+        prev.repeat = (prev.repeat ?? 1) + 1;
+        prev.t = performance.now();
+        return;
+    }
+    const entry: SyncRingEntry = { t: performance.now(), op, handle: handle >>> 0, tid: tid >>> 0, detail };
+    if (syncRing.length < SYNC_RING_SIZE) syncRing.push(entry);
+    else syncRing[syncRingWrite] = entry;
+    syncRingWrite = (syncRingWrite + 1) % SYNC_RING_SIZE;
+}
+
+/** Oldest-first copy of the sync ring. */
+export function describeSyncRing(limit = SYNC_RING_SIZE): SyncRingEntry[] {
+    const ordered = syncRing.length < SYNC_RING_SIZE
+        ? syncRing.slice()
+        : syncRing.slice(syncRingWrite).concat(syncRing.slice(0, syncRingWrite));
+    return ordered.slice(-limit);
+}
+
 export class SyncObjectManager {
     private resourceProvider = SystemResourceProvider.getInstance();
     private eventHandles = new Set<number>();
     private semaphoreHandles = new Set<number>();
     private mutexHandles = new Set<number>();
+
+    /**
+     * Every event/semaphore/mutex with its live state — the other half of a thread dump's
+     * waitHandles. A deadlock is only readable as the PAIR: who waits on which handle, and
+     * whether that handle is signalled.
+     */
+    describeAll(): Array<Record<string, unknown>> {
+        const out: Array<Record<string, unknown>> = [];
+        for (const h of this.eventHandles) {
+            const e = this._getEvent(h);
+            if (e) out.push({ handle: h, kind: "event", manualReset: e.manualReset, signaled: e.signaled, pendingWake: e.pendingWake ?? false });
+        }
+        for (const h of this.semaphoreHandles) {
+            const s = this._getSemaphore(h);
+            if (s) out.push({ handle: h, kind: "semaphore", count: s.count, max: s.max });
+        }
+        for (const h of this.mutexHandles) {
+            const m = this._getMutex(h);
+            if (!m) continue;
+            // The WASM tier serves every uncontended acquire/release, so `m.ownerThreadId`
+            // is only as fresh as the last op JS happened to handle. The mirror is the live
+            // state, and in a deadlock dump the owner is the entire answer.
+            const mirrored = hypercallDataManager.readMutexMirrorState(h);
+            out.push({
+                handle: h, kind: "mutex",
+                owner: mirrored ? mirrored.owner : m.ownerThreadId,
+                recursion: mirrored ? mirrored.recursion : m.recursion,
+                abandoned: this._mutexAbandoned(m, h),
+                hasWaiters: mirrored ? mirrored.hasWaiters : undefined,
+                source: mirrored ? "mirror" : "js",
+            });
+        }
+        return out;
+    }
 
     // ─── Events ─────────────────────────────────────────────────────────────
 
@@ -101,7 +186,10 @@ export class SyncObjectManager {
 
     releaseMutex(handle: number, ownerThreadId: number): boolean {
         const mutex = this._getMutex(handle);
-        if (!mutex) return false;
+        if (!mutex) {
+            recordSyncEvent("mux-rel", handle, ownerThreadId, "REFUSED no-such-mutex");
+            return false;
+        }
         const mirrored = hypercallDataManager.readMutexMirrorState(handle);
         // A valid mirror with owner === null means the mutex is FREE (e.g. a WASM
         // fast-path Release already ran) — `mirrored?.owner ?? ...` would misread
@@ -111,13 +199,21 @@ export class SyncObjectManager {
         if (owner !== ownerThreadId) {
             Logger.warn(LogCategory.KERNEL32,
                 `ReleaseMutex: T${ownerThreadId} not owner (owner=${owner === null ? 'none' : `T${owner}`})`);
+            recordSyncEvent("mux-rel", handle, ownerThreadId,
+                `REFUSED not-owner (owner=${owner === null ? "none" : `T${owner}`})`);
             return false;
         }
         const recursion = mirrored ? mirrored.recursion : mutex.recursion;
-        if (recursion > 0) mutex.recursion = recursion - 1;
-        else mutex.recursion = 0;
+        // Adopt the verified owner before writing back: the fast path takes and drops the
+        // mutex without touching this object, so its owner field can name whoever JS last
+        // granted it to — and a partial release would hand the mutex to that thread.
+        mutex.ownerThreadId = owner;
+        mutex.recursion = recursion > 0 ? recursion - 1 : 0;
         if (mutex.recursion === 0) mutex.ownerThreadId = null;
         hypercallDataManager.writeMutexMirror(handle, mutex.ownerThreadId, mutex.recursion);
+        // `rec` that does not continue the previous entry's means a WASM-tier op ran between
+        // the two — the only way to see the fast path's effect from here.
+        recordSyncEvent("mux-rel", handle, ownerThreadId, `rec=${recursion}->${mutex.recursion}`);
         return true;
     }
 
@@ -166,6 +262,7 @@ export class SyncObjectManager {
         for (const h of decision.consumeAutoReset) {
             const e = this._getEvent(h);
             if (e && !e.manualReset) {
+                recordSyncEvent("consume", h, threadId);
                 e.signaled = false;
                 hypercallDataManager.writeEventMirrorSignaled(h, false, false);
             }
@@ -190,9 +287,13 @@ export class SyncObjectManager {
                     m.recursion = mirrored.recursion;
                 }
                 m.abandoned = false;
+                const wasOwner = m.ownerThreadId;
+                const wasRec = m.recursion;
                 if (m.ownerThreadId === null) { m.ownerThreadId = threadId; m.recursion = 1; }
                 else if (m.ownerThreadId === threadId) m.recursion++;
                 hypercallDataManager.writeMutexMirror(h, m.ownerThreadId, m.recursion, undefined, false);
+                recordSyncEvent("mux-acq", h, threadId,
+                    `owner=${wasOwner ?? "none"} rec=${wasRec}->${m.recursion}`);
             }
         }
     }
@@ -215,7 +316,11 @@ export class SyncObjectManager {
         switch (obj.kind) {
             case 'event': { const e = obj as KernelEventObject; return `event(sig=${e.signaled ? 1 : 0},manual=${e.manualReset ? 1 : 0},wake=${e.pendingWake ? 1 : 0})`; }
             case 'semaphore': { const s = obj as KernelSemaphoreObject; return `sem(${s.count}/${s.max})`; }
-            case 'mutex': { const m = obj as KernelMutexObject; return `mutex(owner=${m.ownerThreadId ?? 'none'})`; }
+            case 'mutex': {
+                const m = obj as KernelMutexObject;
+                const owner = this._mutexOwner(m, handle);
+                return `mutex(owner=${owner ?? 'none'},rec=${hypercallDataManager.readMutexMirrorState(handle)?.recursion ?? m.recursion})`;
+            }
             case 'thread': return `thread(${(obj as KernelThreadObject).threadId})`;
         }
     }

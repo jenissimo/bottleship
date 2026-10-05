@@ -2,7 +2,12 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { GlideContext } from "./context";
-import { GR_CMP_ALWAYS, GR_DEPTHBUFFER_DISABLE } from "./constants";
+import {
+    GR_CMP_ALWAYS,
+    GR_DEPTHBUFFER_DISABLE,
+    GR_HINT_STWHINT,
+    swizzleGlideColor,
+} from "./constants";
 
 function shouldLogStateEntry(context: GlideContext): boolean {
     const fid = context.frameSnapshot.frameId;
@@ -21,11 +26,14 @@ function clampToByte(value: number): number {
     return Math.max(0, Math.min(255, value | 0));
 }
 
+/**
+ * grConstantColorValue4 takes floats on ONE scale: [0..255.0] (glide.h — "R, G, B,
+ * ([0..255.0])"). Sniffing the scale per component instead reads a legitimately DARK
+ * value (1.0 is 1/255 of full) as a normalised one and returns 255 — a near-black
+ * constant comes back at full brightness.
+ */
 function normalizeFloatColorComponent(value: number): number {
     if (!Number.isFinite(value)) return 0;
-    if (value >= 0 && value <= 1.0) {
-        return clampToByte(Math.round(value * 255));
-    }
     return clampToByte(Math.round(value));
 }
 
@@ -69,6 +77,10 @@ const GR_COLORCOMBINE_DIFF_SPEC_B = 0x0f;
 const GR_COLORCOMBINE_ONE = 0x10;
 
 function applyGuColorCombineFunction(context: GlideContext, fn: number): void {
+    // gu.c — EVERY guColorCombineFunction clears delta0 first; only the two DELTA0
+    // entries re-arm it. A direct grColorCombine does not touch the mode, so it is
+    // cleared here and nowhere else.
+    context.runtime.colorCombineDelta0 = false;
     switch (fn | 0) {
         case GR_COLORCOMBINE_ZERO:
             context.runtime.colorCombine = {
@@ -88,8 +100,10 @@ function applyGuColorCombineFunction(context: GlideContext, fn: number): void {
                 invert: 0,
             };
             return;
-        case GR_COLORCOMBINE_ITRGB:
         case GR_COLORCOMBINE_ITRGB_DELTA0:
+            context.runtime.colorCombineDelta0 = true;
+        // falls through — gu.c sets the same combine as ITRGB
+        case GR_COLORCOMBINE_ITRGB:
             context.runtime.colorCombine = {
                 function: GR_COMBINE_FUNCTION_LOCAL,
                 factor: GR_COMBINE_FACTOR_NONE,
@@ -116,8 +130,10 @@ function applyGuColorCombineFunction(context: GlideContext, fn: number): void {
                 invert: 0,
             };
             return;
-        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB:
         case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB_DELTA0:
+            context.runtime.colorCombineDelta0 = true;
+        // falls through — gu.c sets the same combine as TEXTURE_TIMES_ITRGB
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB:
             context.runtime.colorCombine = {
                 function: GR_COMBINE_FUNCTION_SCALE_OTHER,
                 factor: GR_COMBINE_FACTOR_LOCAL,
@@ -345,7 +361,7 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         },
 
         "_grFogColorValue@4": (_ctx, _mem, args) => {
-            context.runtime.fogColor = args[0] >>> 0;
+            context.runtime.fogColor = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             return 0;
         },
 
@@ -524,7 +540,7 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         },
 
         "_grChromakeyValue@4": (_ctx, _mem, args) => {
-            const newVal = args[0] >>> 0;
+            const newVal = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             if (newVal !== context.runtime.chromaKeyValue || shouldLogStateEntry(context)) {
                 Logger.log(LogCategory.SYSTEM, `[Glide] grChromakeyValue value=0x${newVal.toString(16)}`);
             }
@@ -534,7 +550,7 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         },
 
         "_grConstantColorValue@4": (_ctx, _mem, args) => {
-            context.runtime.constantColorValue = args[0] >>> 0;
+            context.runtime.constantColorValue = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             context.ffpState.setConstantColor(context.runtime.constantColorValue);
             return 0;
         },
@@ -551,6 +567,9 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
                 (b & 0xff)
             ) >>> 0;
             context.ffpState.setConstantColor(context.runtime.constantColorValue);
+            // gglide.c:1299 — this call is the ONLY writer of gc->state.r/g/b, which is
+            // what delta0 mode loads into the RGB iterators (gdraw.c).
+            context.runtime.delta0Rgb = (((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff)) >>> 0;
             return 0;
         },
 
@@ -562,6 +581,9 @@ export function createStateExports(context: GlideContext): Record<string, ThunkI
         "_grHints@8": (_ctx, _mem, args) => {
             context.apiState.lastHintType = args[0] | 0;
             context.apiState.lastHintMask = args[1] >>> 0;
+            if ((args[0] | 0) === GR_HINT_STWHINT) {
+                context.runtime.stwHint = args[1] >>> 0;
+            }
             context.apiState.glideStateVersion = (context.apiState.glideStateVersion + 1) >>> 0;
             return 0;
         },

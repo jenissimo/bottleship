@@ -7,6 +7,7 @@
  */
 
 import { TimeService } from '../../runtime/time';
+import { readRetiredInsns } from './cpu-views';
 import { Logger, LogCategory } from '../logger';
 import { System } from '../system';
 import { EMU_MEMORY_SIZE } from './emulator-config';
@@ -44,7 +45,14 @@ const OFF_HC_TEB_BASE = 0x028;
 const OFF_HC_INSN_AT_TIME_UPDATE = 0x02C;
 const OFF_HC_MIPS_ESTIMATE = 0x030;
 const OFF_HC_CURRENT_THREAD_ID = 0x034;
-const OFF_HC_FALLBACK_COUNTS = 0x0C0; // 68 bytes: per-handler fallback counters (must match hypercall.rs)
+// Per-handler_id accounting written by try_dispatch (must match hypercall.rs).
+// 256 slots each, u32, saturating — see getHandlerReport().
+const OFF_HC_HANDLER_CALLS = 0x2000;
+const OFF_HC_HANDLER_FALLBACKS = 0x2400;
+/** 32 slots of (thread handle, suspend count) — see publishThreadSuspendCounts. */
+const OFF_HC_THREAD_SUSPEND = 0x2800;
+const HC_THREAD_SUSPEND_SLOTS = 32;
+const HC_HANDLER_SLOTS = 256;
 const OFF_HC_CURSOR_X = 0x080;
 const OFF_HC_CURSOR_Y = 0x084;
 const OFF_HC_WINDOW_X = 0x088;
@@ -56,7 +64,15 @@ const OFF_HC_HAS_RUNNABLE_PEERS = 0x09C;  // 1 when other threads are READY/RUNN
 const OFF_HC_SLEEP_STARVATION_COUNTER = 0x0A0;
 const OFF_HC_SLEEP_STARVATION_LIMIT = 0x0A4;
 const OFF_HC_RAND_SEED = 0x0B0;
+// Mouse-capture owner (GetCapture). 0 is a LEGITIMATE answer, not an "unpublished"
+// sentinel, so the WASM handler cannot fall through on it — the page must therefore be
+// authoritative at all times: published at init, on every capture mutation, and on
+// buffer-change resync (rewriteState).
+const OFF_HC_CAPTURE_HWND = 0x0B4;
 const OFF_HC_DISPATCH_TABLE = 0x100;
+const OFF_HC_DISPATCH_TABLE_EXT = 0x4000;
+const HC_DISPATCH_LIMIT = 0x10000;
+const HC_DISPATCH_EXT_COUNT = HC_DISPATCH_LIMIT - 4096;
 const OFF_HC_FLS_ALLOCATED = 0x1100; // 129 bytes, one allocation flag per FLS slot (slot 0 unused)
 const OFF_HC_FLS_VALUES = 0x1184;    // 129 * u32 slot values
 // EAGL token-dispatch config pointer (handler 132) — must match hypercall.rs.
@@ -123,6 +139,14 @@ const HANDLER_STRCMP = 59;
 const HANDLER_STRCPY = 60;
 const HANDLER_STRICMP = 61;
 const HANDLER_MEMCMP = 62;
+// Bulk-memory leaves. These have no scalar body in Rust: a residency-guard miss falls
+// through to the JS implementation, so they are registered only once the engine reports
+// the matching ABI (see BULK_MEMORY_HANDLERS below).
+const HANDLER_MEMMOVE = 84;
+const HANDLER_MEMCHR = 85;
+const BULK_MEMORY_HANDLERS = new Set([HANDLER_MEMMOVE, HANDLER_MEMCHR]);
+/** Must match `get_bulk_memory_abi()` in vendor/v86/src/rust/cpu/bulk_memory.rs. */
+const BULK_MEMORY_ABI = 1;
 // Scheduler hypercalls (Tier 4)
 const HANDLER_SLEEP = 63;
 const HANDLER_TLS_GET_VALUE = 64;
@@ -147,6 +171,8 @@ const HANDLER_IS_BAD_READ_PTR = 78;
 const HANDLER_IS_BAD_WRITE_PTR = 79;
 const HANDLER_RELEASE_MUTEX = 80;
 const HANDLER_WAIT_FOR_SINGLE_OBJECT = 81;
+const HANDLER_GET_CAPTURE = 82;
+const HANDLER_RESUME_THREAD = 83;
 
 /**
  * Inner-loop HLE handler-id band (128..=255) — engine compute kernels, kept
@@ -174,6 +200,13 @@ export const OFF_HC_SLAB_ALLOC_COUNT = 0x1410;
 export const OFF_HC_SLAB_FREE_COUNT = 0x1414;
 const OFF_HC_SLAB_FALLBACK_COUNT = 0x1418;
 export const OFF_HC_SLAB_FREELIST = 0x1420; // 9 × u32
+// Byte gap from the free-list HEAD array to the large-bin FIFO TAIL array within the
+// guest-RAM control block (heads at rel 0x20, tails at rel 0x48; hypercall.rs
+// SLAB_REL_FREELIST_TAIL=0x48). NOT a hypercall-page field — it exists ONLY in the
+// 128-byte guest-RAM control block, so it is written as (…+OFF_HC_SLAB_FREELIST+gap),
+// never at page 0x1448 (which is hc_event_table). The WASM slab handler declines when
+// ctl_ptr == 0, so the FIFO tail is never touched in legacy page mode.
+const SLAB_FREELIST_TAIL_GAP = 0x48 - 0x20; // 0x28
 // Guest address of the slab control block (0 = legacy page mode). The WASM heap handler reads
 // this to find the guest-RAM control block; JS writes it in setSlabControlAddr / rewriteState.
 const OFF_HC_SLAB_CTL_PTR = 0x1444;
@@ -187,6 +220,13 @@ const OFF_HC_SLAB_CTL_PTR = 0x1444;
  * Interlocked, GetLastError, SetLastError stay in JS — too frequent,
  * starves onThunkComplete() and breaks thread scheduling.
  */
+/** Hypercall handlers that WRITE guest memory from Rust — the set the diagnostic
+ *  switch can force back to JS so a write trap can observe them. */
+const WASM_WRITE_HANDLERS = new Set<number>([
+    HANDLER_WCSCPY, HANDLER_WCSCAT, HANDLER_WCSNCPY,
+    HANDLER_MEMCPY, HANDLER_MEMSET, HANDLER_STRCPY,
+]);
+
 const HANDLER_MAP: Record<string, number> = {
     'kernel32.gettickcount': HANDLER_GET_TICK_COUNT,
     'kernel32.gettickcount64': HANDLER_GET_TICK_COUNT64,
@@ -205,12 +245,22 @@ const HANDLER_MAP: Record<string, number> = {
     // the correct per-HWND conversion (pt - win.x/win.y). Keep it on the JS path.
     // 'user32.screentoclient': HANDLER_SCREEN_TO_CLIENT,
     'user32.getcursorpos': HANDLER_GET_CURSOR_POS,
+    // GetCapture — pure page read of the capture owner (WindowManager publishes it on
+    // every mutation). No args, no scheduler state; onTickHook compensates the skipped
+    // onThunkComplete exactly as it does for GetLastError/GetCurrentThreadId. Games poll
+    // this per frame from their input loop.
+    'user32.getcapture': HANDLER_GET_CAPTURE,
     'user32.peekmessagea': HANDLER_PEEK_MESSAGE,
     'user32.peekmessagew': HANDLER_PEEK_MESSAGE,
     'kernel32.sleep': HANDLER_SLEEP,
     'kernel32.setevent': HANDLER_SET_EVENT,
     'kernel32.releasemutex': HANDLER_RELEASE_MUTEX,
     'kernel32.waitforsingleobject': HANDLER_WAIT_FOR_SINGLE_OBJECT,
+    // ResumeThread — the WASM handler answers ONLY a resume of a thread that is not suspended
+    // (returns 0, changes nothing); everything else falls through to the scheduler. Engines
+    // that kick a worker once per main-loop iteration make this one of the hottest thunks
+    // there is (Discworld Noir: ~270k calls/s, virtually all of them no-ops).
+    'kernel32.resumethread': HANDLER_RESUME_THREAD,
     // GetCurrentThreadId — pure read of the page's current-thread-id (republished on every
     // context switch). Read-only, no scheduler state touched; onTickHook compensates the
     // skipped onThunkComplete the same as GetLastError. Hot via the CRT's _getptd().
@@ -328,6 +378,9 @@ const HANDLER_MAP: Record<string, number> = {
     'crtdll._strcmpi': HANDLER_STRICMP,
     'msvcrt.memcmp': HANDLER_MEMCMP,
     'crtdll.memcmp': HANDLER_MEMCMP,
+    'msvcrt.memmove': HANDLER_MEMMOVE,
+    'crtdll.memmove': HANDLER_MEMMOVE,
+    'msvcrt.memchr': HANDLER_MEMCHR,
     // Narrow ANSI string leaves — _strnicmp (count==0 → equal, NARROW convention), strstr, atoi/atol
     'msvcrt._strnicmp': HANDLER_STRNICMP,
     'crtdll._strnicmp': HANDLER_STRNICMP,
@@ -377,6 +430,41 @@ const MAX_VIRTUAL_DELTA_MS = 4; // safety cap per tick
 // scheduler's Sleep-credit path (creditIdleMs) via TimeService — single source of truth
 // so no advance path can violate the ceiling the other paths assume.
 const MAX_AHEAD_MS = TimeService.MAX_AHEAD_MS;
+/** Shortest clock advance worth deriving an instruction rate from — below this the divide is
+ *  dominated by the microsecond quantization, not by how fast the guest is running.
+ *  Accumulated across publishes — one publish is far shorter than this. */
+const MIPS_SAMPLE_MIN_US = 2000;
+/** Hard bound on the published slope, and ONLY a bound — never a value the estimator is
+ *  expected to sit at. handle_get_tick_count computes `delta_insn / (mips * 1000)` with a u32
+ *  multiply, so `mips * 1000` must stay inside u32 (mips < 4_294_967); this keeps an order of
+ *  magnitude clear of that wrap. A slope ABOVE the true retire rate only costs sub-publish
+ *  resolution (monotonic, harmless); a slope BELOW it forces every publish to correct
+ *  downwards, and the correction is credited into virtual time — so a ceiling the host can
+ *  actually reach turns into a permanent, self-sustaining fast-forward. Hence a wrap guard,
+ *  not a tuning knob. */
+const MIPS_CEILING = 400_000;
+/** The slope to assume when the clock is not advancing AT ALL (held at MAX_AHEAD_MS while the
+ *  guest keeps retiring). No rate is measurable then; a steep slope makes the interpolation
+ *  contribute almost nothing, which is the correct answer — a stalled clock must not invent
+ *  time. Deliberately modest: the estimator decays back down over ~1 s, so parking it at the
+ *  wrap-guard ceiling would blind the interpolation long after the stall cleared. */
+const MIPS_STALLED_CLOCK = TARGET_MIPS_PER_US * 16;
+
+/**
+ * The largest clock value the guest can already have read since the last publish.
+ *
+ * WASM serves `base + (insn_now - insn_at_update) / mips` (hypercall.rs handle_qpc /
+ * handle_get_tick_count / virtual_time_us), so this reproduces that formula in the SAME
+ * integer arithmetic — a u32 wrapping subtract and a truncating divide. Publishing below
+ * this hands the guest a backwards clock; see HypercallDataManager.publishClock.
+ */
+export function interpolatedClockCeilingUs(
+    publishedBaseUs: number, publishedInsn: number, insnNow: number, mips: number,
+): number {
+    if (mips <= 0) return publishedBaseUs;
+    const deltaInsn = (insnNow - publishedInsn) >>> 0;
+    return publishedBaseUs + Math.floor(deltaInsn / mips);
+}
 
 export class HypercallDataManager {
     private hpBase = 0;
@@ -402,10 +490,47 @@ export class HypercallDataManager {
     // Instruction counter baseline (set when virtual time is enabled)
     private lastInsnSnapshot = 0;
     private lastWallSnapshot = 0;
+    /** The clock we last PUBLISHED, and the instruction count it was anchored to. The guest
+     *  reads `base + (insn_now - insn_at_update)/mips`, so these two are what let us compute
+     *  how far it may already have interpolated — see publishClock(). */
+    private publishedBaseUs = 0;
+    private publishedInsn = 0;
+    private publishedMips = TARGET_MIPS_PER_US;
+    private publishedValid = false;
+    /** Instructions per microsecond the interpolation is allowed to assume. TARGET_MIPS_PER_US
+     *  is a floor, not the value: it is a fixed guess that this machine beats, and an
+     *  interpolation slope steeper than reality is exactly what makes a publish have to correct
+     *  DOWNWARDS. Tracked as an upper bound of the observed rate — see publishClock. */
+    private mipsEstimate = TARGET_MIPS_PER_US;
+    private slopeInsnAcc = 0;
+    private slopeUsAcc = 0;
+    /** Diagnostics: how often, and by how much, a publish had to be raised to stay monotonic. */
+    private clockMonotonicFixups = 0;
+    private clockMonotonicMaxUs = 0;
+    private clockMonotonicExcessUs = 0;
+    /** Diagnostics: samples where the slope hit MIPS_CEILING. Pinned there means the estimator
+     *  is no longer measuring the host, so every publish under-interpolates and the floor pays
+     *  the difference — pinned WITH climbing fixups is the signature, either alone is not. */
+    private mipsCeilingHits = 0;
 
-    // Process-global FLS mirror used by WASM FlsGetValue hypercall.
+    // FLS mirror used by WASM FlsGetValue hypercall. Allocation bitmap is
+    // process-global (indices are), but VALUES are per-thread (fiber-local ==
+    // thread-local without fibers): the UCRT stores each thread's _ptd in one
+    // shared slot index — a global value table hands thread A's _ptd to thread B.
+    // The page holds the CURRENT thread's values; syncThreadData swaps them.
     private readonly flsAllocatedShadow = new Uint8Array(HC_FLS_SLOT_COUNT);
-    private readonly flsValuesShadow = new Uint32Array(HC_FLS_SLOT_COUNT);
+    private readonly flsValuesByThread = new Map<number, Uint32Array>();
+    private flsCurrentTid = 0;
+    // Last capture owner published to the page. Needed because the page is a Rust static
+    // that v86.restart() zeroes: without a shadow, a buffer change would silently drop a
+    // held capture to 0 and the WASM handler would keep answering 0 forever.
+    private captureHwndShadow = 0;
+
+    private flsValuesFor(tid: number): Uint32Array {
+        let v = this.flsValuesByThread.get(tid);
+        if (!v) { v = new Uint32Array(HC_FLS_SLOT_COUNT); this.flsValuesByThread.set(tid, v); }
+        return v;
+    }
     // Kernel event mirror for WASM SetEvent fast path (indexed by handle slot).
     private readonly eventMirrorShadow = new Uint8Array(EVENT_TABLE_SLOTS);
     // Mutex mirror lives in guest RAM (2048 × u32); pointer stored at OFF_HC_MUTEX_MIRROR_PTR.
@@ -417,6 +542,13 @@ export class HypercallDataManager {
     // Registration tracking — Map stores functionId → handlerId for dispatch table rebuild
     // after WASM memory buffer changes (e.g., v86.restart() zeroes HYPERCALL_PAGE statics)
     private registeredEntries = new Map<number, number>();
+    // Diagnostic: while true, the write-capable string/mem handlers are forced to their JS
+    // fallbacks. Must be honoured by BOTH registerFunction and the dispatch-table rebuild,
+    // or a WASM-buffer change would silently re-enable them mid-run and the write trap
+    // would report a clean range it never actually covered.
+    private wasmStringWritersOff = false;
+    /** thread handle -> slot index in the shared suspend table (packed from the front). */
+    private readonly threadSuspendSlots = new Map<number, number>();
 
     initialize(cpu: any, hpBase: number): void {
         this.cpu = cpu;
@@ -438,6 +570,8 @@ export class HypercallDataManager {
 
         // Initialize rand seed to 1 (matches MSVCRT default)
         this.view.setUint32(this.hpBase + OFF_HC_RAND_SEED, 1, true);
+
+        this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
 
         this.writeFlsSharedState();
         this.writeEventMirrorState();
@@ -485,6 +619,21 @@ export class HypercallDataManager {
         }
     }
 
+    private dispatchEntryOffset(functionId: number): number {
+        return functionId < 4096
+            ? OFF_HC_DISPATCH_TABLE + functionId
+            : OFF_HC_DISPATCH_TABLE_EXT + functionId - 4096;
+    }
+
+    /** Diagnostic write used by hcoff/hcon as well as the normal registration path. */
+    setDispatchEntry(functionId: number, handlerId: number): boolean {
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT || handlerId < 0 || handlerId > 255) return false;
+        this.refreshViews();
+        if (!this.view) return false;
+        this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), handlerId);
+        return true;
+    }
+
     /** Re-write all JS-owned state into HYPERCALL_PAGE after buffer change. */
     private rewriteState(): void {
         if (!this.view) return;
@@ -495,7 +644,8 @@ export class HypercallDataManager {
 
         // Dispatch table entries
         for (const [functionId, handlerId] of this.registeredEntries) {
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, handlerId);
+            const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), suppressed ? 0 : handlerId);
         }
 
         // Slab control-block pointer (the slab control fields themselves live in guest RAM,
@@ -507,7 +657,7 @@ export class HypercallDataManager {
         // Mutex mirror table pointer — same contract as slab: guest table survives, page pointer does not.
         if (this.mutexMirrorAddr !== 0) {
             this.view.setUint32(this.hpBase + OFF_HC_MUTEX_MIRROR_PTR, this.mutexMirrorAddr, true);
-            this.writeMutexMirrorState();
+            this.writeMutexMirrorState(true);
         }
 
         // EAGL token-dispatch config pointer — same contract (guest block survives).
@@ -515,14 +665,18 @@ export class HypercallDataManager {
             this.view.setUint32(this.hpBase + OFF_HC_EAGL_TOKEN_CFG_PTR, this.eaglTokenCfgAddr, true);
         }
 
+        // Capture owner — JS-owned, WASM never writes it, so the shadow is authoritative.
+        this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
+
         this.writeFlsSharedState();
         this.writeEventMirrorState(true); // preserve WASM-set signal bits across buffer-change resync
+        this.resyncPublishedClockAfterBufferChange();
 
         // Re-set hc_enabled if we were enabled before buffer change
         if (this.enabled) {
             this.view.setUint32(this.hpBase + OFF_HC_ENABLED, 1, true);
             // Re-snapshot instruction counter and wall-clock — it may also have been reset
-            this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
+            this.lastInsnSnapshot = readRetiredInsns(this.cpu);
             this.lastWallSnapshot = performance.now();
             Logger.log(LogCategory.SYSTEM,
                 `[HYPERCALL] Re-synced state after buffer change ` +
@@ -532,27 +686,63 @@ export class HypercallDataManager {
 
     private writeFlsSharedState(): void {
         if (!this.view) return;
+        const values = this.flsValuesFor(this.flsCurrentTid);
         for (let i = 0; i < HC_FLS_SLOT_COUNT; i++) {
             this.view.setUint8(this.hpBase + OFF_HC_FLS_ALLOCATED + i, this.flsAllocatedShadow[i]);
-            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, this.flsValuesShadow[i] >>> 0, true);
+            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, values[i] >>> 0, true);
         }
     }
 
-    setFlsSlot(index: number, allocated: boolean, value: number): void {
+    setFlsSlot(index: number, allocated: boolean, value: number, tid = this.flsCurrentTid): void {
         if (index < 0 || index >= HC_FLS_SLOT_COUNT) return;
 
         this.flsAllocatedShadow[index] = allocated ? 1 : 0;
-        this.flsValuesShadow[index] = value >>> 0;
+        if (allocated) {
+            this.flsValuesFor(tid)[index] = value >>> 0;
+        } else {
+            for (const values of this.flsValuesByThread.values()) values[index] = 0;
+        }
 
         this.refreshViews();
         if (!this.view || this.hpBase === 0) return;
         this.view.setUint8(this.hpBase + OFF_HC_FLS_ALLOCATED + index, this.flsAllocatedShadow[index]);
-        this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + index * 4, this.flsValuesShadow[index] >>> 0, true);
+        if (tid === this.flsCurrentTid || !allocated) {
+            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + index * 4,
+                this.flsValuesFor(this.flsCurrentTid)[index] >>> 0, true);
+        }
+    }
+
+    /**
+     * Adopt `tid` as the thread whose FLS values the guest page holds. Normally
+     * syncThreadData does this on context switch, but a single-threaded process
+     * may never switch — leaving flsCurrentTid at its initial 0 so every
+     * setFlsSlot(tid=1) skips the guest-page write and the WASM FlsGetValue
+     * hypercall reads 0 forever (CRT then rebuilds its per-thread data on every
+     * _getptd call and loses all state stored in it).
+     */
+    ensureFlsCurrentThread(tid: number): void {
+        if (tid === this.flsCurrentTid) return;
+        Logger.warn(LogCategory.SYSTEM,
+            `FLS: adopting thread ${tid} as page-resident (was ${this.flsCurrentTid}, no context switch seen)`);
+        this.flsCurrentTid = tid;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        const values = this.flsValuesFor(tid);
+        for (let i = 0; i < HC_FLS_SLOT_COUNT; i++) {
+            this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, values[i] >>> 0, true);
+        }
+    }
+
+    getFlsSlot(index: number, tid = this.flsCurrentTid): number {
+        if (index < 0 || index >= HC_FLS_SLOT_COUNT) return 0;
+        if (!this.flsAllocatedShadow[index]) return 0;
+        return this.flsValuesFor(tid)[index] >>> 0;
     }
 
     clearFlsSlots(): void {
         this.flsAllocatedShadow.fill(0);
-        this.flsValuesShadow.fill(0);
+        this.flsValuesByThread.clear();
+        this.flsCurrentTid = 0;
 
         this.refreshViews();
         if (!this.view || this.hpBase === 0) return;
@@ -621,27 +811,50 @@ export class HypercallDataManager {
         return addr;
     }
 
-    private writeMutexMirrorState(): void {
-        if (!this.mutexMirrorAddr || !this.wasmMemory) return;
-        const base = this.mutexMirrorAddr;
-        const u32 = new Uint32Array(this.wasmMemory);
+    private mutexMirrorView(): Uint32Array | null {
+        // `wasmMemory` detaches on grow, and a view over a detached buffer throws rather
+        // than writing — so every derivation re-bases first (refreshViews updates the cache
+        // before it resyncs, so the nested call here sees no change).
+        this.refreshViews();
+        if (!this.mutexMirrorAddr || !this.wasmMemory) return null;
+        const memBase = this.guestMemBase();
+        if (memBase === null) return null;
+        return new Uint32Array(this.wasmMemory, memBase + this.mutexMirrorAddr, EVENT_TABLE_SLOTS);
+    }
+
+    /**
+     * Flush the JS-owned shadow into the mirror table.
+     *
+     * @param preserveLive when true (buffer-change resync), a slot the live table still
+     * reports VALID is left alone and the shadow is refreshed FROM it. WASM owns the whole
+     * mutex word — handle_wait_for_single_object / handle_release_mutex take and drop
+     * ownership without JS ever seeing it, so the shadow is only as fresh as the last
+     * contended op JS handled. Rewriting a live slot from it resurrects a long-dead owner,
+     * and a mutex nobody holds then blocks every waiter forever. The table lives in guest
+     * RAM, which survives a grow; only a restart zeroes it, and that is the VALID-clear
+     * case this still republishes.
+     */
+    private writeMutexMirrorState(preserveLive = false): void {
+        const u32 = this.mutexMirrorView();
+        if (!u32) return;
         for (let slot = 0; slot < EVENT_TABLE_SLOTS; slot++) {
-            u32[(base >>> 2) + slot] = this.mutexMirrorShadow[slot]!;
+            if (preserveLive && (u32[slot]! & MUX_VALID) !== 0) {
+                this.mutexMirrorShadow[slot] = u32[slot]!;
+                continue;
+            }
+            u32[slot] = this.mutexMirrorShadow[slot]!;
         }
     }
 
     private writeMutexMirrorSlot(slot: number): void {
-        if (!this.mutexMirrorAddr || !this.wasmMemory) return;
-        const u32 = new Uint32Array(this.wasmMemory);
-        u32[(this.mutexMirrorAddr >>> 2) + slot] = this.mutexMirrorShadow[slot]!;
+        const u32 = this.mutexMirrorView();
+        if (u32) u32[slot] = this.mutexMirrorShadow[slot]!;
     }
 
     private liveMutexWord(slot: number): number {
         this.refreshViews();
-        if (this.mutexMirrorAddr && this.wasmMemory) {
-            const u32 = new Uint32Array(this.wasmMemory);
-            return u32[(this.mutexMirrorAddr >>> 2) + slot]!;
-        }
+        const u32 = this.mutexMirrorView();
+        if (u32) return u32[slot]!;
         return this.mutexMirrorShadow[slot] ?? 0;
     }
 
@@ -835,25 +1048,36 @@ export class HypercallDataManager {
         this.view.setUint32(this.hpBase + OFF_HC_EVENT_STARVATION_LIMIT, limit >>> 0, true);
     }
 
+    /** The engine's bulk-memory ABI, or 0 when this build has no bulk kernels. */
+    private bulkMemoryAbi(): number {
+        const probe = (this.cpu as any)?.wm?.exports?.get_bulk_memory_abi;
+        return typeof probe === "function" ? Number(probe()) : 0;
+    }
+
     /**
      * Register a function for WASM handling.
      * Called after stubs are generated so functionId is known.
      */
     registerFunction(dllName: string, functionName: string, functionId: number): void {
         if (!this.initialized || !this.view) return;
-        if (functionId <= 0 || functionId >= 4096) return;
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT) return;
 
         const key = `${dllName.toLowerCase()}.${functionName.toLowerCase()}`;
         const handlerId = HANDLER_MAP[key];
         if (!handlerId) return;
+        // A v86 built before these kernels has no handler behind the id, and an unhandled
+        // dispatch answers with an untouched EAX rather than declining. Registering only
+        // when the engine reports the ABI keeps such a build on its JS fallbacks.
+        if (BULK_MEMORY_HANDLERS.has(handlerId) && this.bulkMemoryAbi() !== BULK_MEMORY_ABI) return;
 
         this.refreshViews();
         if (!this.view) return;
 
         // Write handler_id into dispatch_table[functionId]
-        const offset = this.hpBase + OFF_HC_DISPATCH_TABLE + functionId;
+        const offset = this.hpBase + this.dispatchEntryOffset(functionId);
         // Use setUint8 since dispatch table entries are single bytes
-        this.view.setUint8(offset, handlerId);
+        const suppressed = this.wasmStringWritersOff && WASM_WRITE_HANDLERS.has(handlerId);
+        this.view.setUint8(offset, suppressed ? 0 : handlerId);
         this.registeredEntries.set(functionId, handlerId);
 
         Logger.verbose(LogCategory.SYSTEM,
@@ -870,7 +1094,7 @@ export class HypercallDataManager {
      * Idempotent; survives dispatch-table rebuild via registeredEntries.
      */
     registerRawHandler(functionId: number, handlerId: number): void {
-        if (functionId <= 0 || functionId >= 4096) {
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT) {
             Logger.warn(LogCategory.SYSTEM,
                 `[HYPERCALL] registerRawHandler: functionId ${functionId} out of dispatch-table range`);
             return;
@@ -883,19 +1107,53 @@ export class HypercallDataManager {
         this.registeredEntries.set(functionId, handlerId);
         this.refreshViews();
         if (this.view) {
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, handlerId);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), handlerId);
         }
         Logger.log(LogCategory.SYSTEM,
             `[HYPERCALL] Registered raw funcId=${functionId} → handler ${handlerId} (inner-loop HLE)`);
     }
 
+    /**
+     * Route the WASM string/memory handlers that WRITE guest memory back to their JS
+     * fallbacks (`on = false`), or restore them (`on = true`). Live — no reload needed.
+     *
+     * Diagnostic seam, not a perf knob. A Rust hypercall writes guest memory through a
+     * raw pointer: it raises no #PF (so MemWriteTrap cannot see it) and never touches
+     * `Mem` (so the JS write trap cannot see it either). Forcing these six to JS is what
+     * makes a memory-corruption hunt able to observe them at all, and doubles as the A/B
+     * that convicts or clears the WASM implementations. The heap-slab handlers are NOT in
+     * this set — `__noHeapSlab` owns that switch.
+     */
+    setWasmStringWritersEnabled(on: boolean): { enabled: boolean; affected: number[] } {
+        const writers = WASM_WRITE_HANDLERS;
+        this.wasmStringWritersOff = !on;
+        this.refreshViews();
+        const affected: number[] = [];
+        for (const [functionId, handlerId] of this.registeredEntries) {
+            if (!writers.has(handlerId)) continue;
+            affected.push(functionId);
+            if (this.view) {
+                this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), on ? handlerId : 0);
+            }
+        }
+        Logger.log(LogCategory.SYSTEM,
+            `[HYPERCALL] WASM string/mem WRITERS ${on ? "enabled" : "DISABLED (JS fallback)"} ` +
+            `for ${affected.length} functionIds`);
+        return { enabled: on, affected };
+    }
+
+    /** True while the write-capable string/mem handlers are forced to JS. */
+    areWasmStringWritersOff(): boolean {
+        return this.wasmStringWritersOff;
+    }
+
     /** Remove a raw dispatch-table binding (inner-loop hook unpatch). */
     unregisterRawHandler(functionId: number): void {
-        if (functionId <= 0 || functionId >= 4096) return;
+        if (functionId <= 0 || functionId >= HC_DISPATCH_LIMIT) return;
         this.registeredEntries.delete(functionId);
         this.refreshViews();
         if (this.view) {
-            this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + functionId, 0);
+            this.view.setUint8(this.hpBase + this.dispatchEntryOffset(functionId), 0);
         }
     }
 
@@ -947,15 +1205,15 @@ export class HypercallDataManager {
         // Only snapshot the instruction-counter baseline on the FIRST enable (must seed once).
         // Re-enable after buffer change (rewriteState) already re-snapshots.
         if (!this.enabled) {
-            this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
+            this.lastInsnSnapshot = readRetiredInsns(this.cpu);
             this.lastWallSnapshot = performance.now();
         }
         this.enabled = true;
 
         // Dump dispatch table entries for string/memory handlers (51+) for diagnostics
         const activeHandlers: string[] = [];
-        for (let fid = 0; fid < 4096; fid++) {
-            const hid = this.view.getUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + fid);
+        for (const fid of this.registeredEntries.keys()) {
+            const hid = this.view.getUint8(this.hpBase + this.dispatchEntryOffset(fid));
             if (hid >= 51) {
                 activeHandlers.push(`${fid}→${hid}`);
             }
@@ -982,9 +1240,8 @@ export class HypercallDataManager {
     resetDispatchTable(): void {
         this.refreshViews();
         if (this.view && this.hpBase !== 0) {
-            for (let i = 0; i < 4096; i++) {
-                this.view.setUint8(this.hpBase + OFF_HC_DISPATCH_TABLE + i, 0);
-            }
+            new Uint8Array(this.view.buffer, this.hpBase + OFF_HC_DISPATCH_TABLE, 4096).fill(0);
+            new Uint8Array(this.view.buffer, this.hpBase + OFF_HC_DISPATCH_TABLE_EXT, HC_DISPATCH_EXT_COUNT).fill(0);
             this.view.setUint32(this.hpBase + OFF_HC_ENABLED, 0, true);
         }
         this.registeredEntries.clear();
@@ -995,8 +1252,9 @@ export class HypercallDataManager {
 
     /** Reset instruction baseline after pause/resume to prevent stale delta. */
     resetInsnBaseline(): void {
-        this.lastInsnSnapshot = this.cpu?.instruction_counter?.[0] ?? 0;
+        this.lastInsnSnapshot = readRetiredInsns(this.cpu);
         this.lastWallSnapshot = performance.now();
+        this.resetPublishedClock();
     }
 
     /**
@@ -1017,7 +1275,7 @@ export class HypercallDataManager {
         const timeService = TimeService.getInstance();
 
         // --- Compute instruction-based virtual delta ---
-        const insnNow = this.cpu?.instruction_counter?.[0] ?? 0;
+        const insnNow = readRetiredInsns(this.cpu);
         const insnDelta = (insnNow - this.lastInsnSnapshot) >>> 0;
         let virtualDeltaMs = insnDelta / TARGET_INSN_PER_MS;
 
@@ -1051,27 +1309,157 @@ export class HypercallDataManager {
         timeService.advanceVirtualTime(virtualDeltaMs);
 
         // --- Write to HYPERCALL_PAGE ---
-        const nowMs = timeService.nowMs();
-        const nowMicros = Math.floor(nowMs * 1000);
+        this.publishClock(timeService, insnNow);
 
-        // Tick count (truncated to 32-bit ms)
-        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, nowMs >>> 0, true);
+        this.lastInsnSnapshot = insnNow;
+        this.lastWallSnapshot = wallNow;
+    }
 
-        // Performance counter = microseconds
+    /**
+     * Publish the guest clock (tick count / QPC / the base RDTSC derives from) and re-anchor
+     * the WASM interpolation, MONOTONICALLY.
+     *
+     * WASM serves every clock read as `base + (insn_now - insn_at_update) / mips`
+     * (hypercall.rs handle_qpc / handle_get_tick_count / virtual_time_us). That is monotonic
+     * only BETWEEN publishes: the instruction counter climbs while `base` stands still. Across
+     * a publish it is not, because the interpolation is unbounded while the new base is
+     * clamped (MAX_AHEAD_MS, the catch-up limiter, MAX_VIRTUAL_DELTA_MS). Whenever the guest
+     * out-runs TARGET_MIPS_PER_US the interpolated value passes the value the next publish
+     * wants to install, and the guest's clock steps BACKWARDS.
+     *
+     * Windows guarantees QPC, GetTickCount and the TSC are monotonic, and a guest computing an
+     * UNSIGNED delta across the step reads ~2^32 ticks, not a small negative — a millisecond of
+     * regression becomes an enormous elapsed time that nothing downstream can distinguish from
+     * a real one.
+     *
+     * So a publish never lowers the clock: the floor is exactly the largest value the guest
+     * could already have read. When that floor bites, the excess is pushed INTO virtual time
+     * as well — otherwise the page and TimeService drift apart and the next publish reproduces
+     * the same step. That is self-limiting rather than a ratchet: virtual time now leads wall,
+     * so updateTimeData's `maxAllowed` clamp holds the clock still until wall catches up.
+     */
+    private publishClock(timeService: TimeService, insnNow: number): void {
+        if (!this.view) return;
+        let nowMs = timeService.nowMs();
+        let nowMicros = Math.floor(nowMs * 1000);
+
+        if (this.publishedValid) {
+            const deltaInsn = (insnNow - this.publishedInsn) >>> 0;
+            const clockDeltaUs = nowMicros - this.publishedBaseUs;
+
+            // Keep the slope an UPPER bound of what the guest actually retires: rise to a faster
+            // observed rate at once, fall back towards it with a ~1 s time constant. Too steep
+            // and the publish has to correct downwards (the bug); too shallow only costs
+            // sub-publish resolution, which is monotonic and harmless.
+            this.slopeInsnAcc += deltaInsn;
+            this.slopeUsAcc += Math.max(0, clockDeltaUs);
+            // Publishes land far below the sampling window (a tick is well under a millisecond),
+            // so the rate has to be ACCUMULATED. Measuring one publish at a time only ever sees
+            // microsecond quantization, which is why a per-publish test never moved the slope.
+            // The insn escape hatch covers a clock that is not advancing at all: instructions
+            // still pile up, and the slope must go to the ceiling rather than sit stale.
+            if (this.slopeUsAcc >= MIPS_SAMPLE_MIN_US || this.slopeInsnAcc >= MIPS_SAMPLE_MIN_US * MIPS_STALLED_CLOCK) {
+                const observed = this.slopeUsAcc > 0 ? this.slopeInsnAcc / this.slopeUsAcc : MIPS_STALLED_CLOCK;
+                this.mipsEstimate = observed > this.mipsEstimate
+                    ? observed
+                    : this.mipsEstimate + (observed - this.mipsEstimate) * Math.min(1, this.slopeUsAcc / 1_000_000);
+                this.mipsEstimate = Math.min(MIPS_CEILING, Math.max(TARGET_MIPS_PER_US, this.mipsEstimate));
+                if (this.mipsEstimate >= MIPS_CEILING) this.mipsCeilingHits++;
+                this.slopeInsnAcc = 0;
+                this.slopeUsAcc = 0;
+            }
+
+            // Floor: the largest value the guest can already have read, computed with the slope
+            // WASM was actually serving (publishedMips), not the one we are about to install.
+            const ceilingUs = interpolatedClockCeilingUs(
+                this.publishedBaseUs, this.publishedInsn, insnNow, this.publishedMips);
+            if (nowMicros < ceilingUs) {
+                const excessUs = ceilingUs - nowMicros;
+                this.clockMonotonicFixups++;
+                this.clockMonotonicExcessUs += excessUs;
+                if (excessUs > this.clockMonotonicMaxUs) this.clockMonotonicMaxUs = excessUs;
+                nowMicros = ceilingUs;
+                // Push it into virtual time too: the page and TimeService must stay ONE clock,
+                // or the next publish recomputes the same regression from a stale TimeService.
+                // The raw primitive is required here (not creditIdleMs): this amount has
+                // ALREADY been served to the guest, so clamping it to the wall leash would
+                // re-open the backwards step. See advanceVirtualTime's carve-out.
+                timeService.advanceVirtualTime(excessUs / 1000);
+                nowMs = timeService.nowMs();
+            }
+        }
+        const mips = Math.max(1, Math.round(this.mipsEstimate));
+
+        // Tick count (truncated to 32-bit ms) — derived from the SAME microseconds as QPC, so
+        // the two clocks cannot disagree about whether time went backwards.
+        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, Math.floor(nowMicros / 1000) >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, nowMicros & 0xFFFFFFFF, true);
         this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI,
             Math.floor(nowMicros / 0x100000000), true);
 
-        // WASM interpolation: constant MIPS since time is instruction-based.
-        // WASM formula: interpolated = base + (insn_now - insn_at_update) / mips
+        // WASM interpolation anchor + slope.
         // (This drives QPC/GetTickCount AND RDTSC — v86 read_tsc derives the TSC from this
         // same interpolated base ×4294.967296 ticks/µs, so their ratio is constant and guest
         // cross-clock calibration (UE1 GSecondsPerCycle) is exact by construction.)
         this.view.setUint32(this.hpBase + OFF_HC_INSN_AT_TIME_UPDATE, insnNow >>> 0, true);
-        this.view.setUint32(this.hpBase + OFF_HC_MIPS_ESTIMATE, TARGET_MIPS_PER_US, true);
+        this.view.setUint32(this.hpBase + OFF_HC_MIPS_ESTIMATE, mips, true);
 
-        this.lastInsnSnapshot = insnNow;
-        this.lastWallSnapshot = wallNow;
+        this.publishedBaseUs = nowMicros;
+        this.publishedInsn = insnNow >>> 0;
+        this.publishedMips = mips;
+        this.publishedValid = true;
+    }
+
+    /** Diagnostics: how often a publish had to be raised to keep the guest clock monotonic,
+     *  and the largest backwards step that was suppressed. A non-zero `maxUs` here is the
+     *  amount a guest would otherwise have read as a ~2^32-tick jump.
+     *  `mipsPinned` with `fixups` climbing means the slope has stopped tracking the host and
+     *  the floor has become the clock's only advance path — see MIPS_CEILING. */
+    getClockMonotonicStats(): {
+        fixups: number; maxSuppressedUs: number; totalSuppressedMs: number;
+        mipsEstimate: number; mipsCeiling: number; mipsPinned: boolean; mipsCeilingHits: number;
+    } {
+        return {
+            fixups: this.clockMonotonicFixups,
+            maxSuppressedUs: this.clockMonotonicMaxUs,
+            totalSuppressedMs: +(this.clockMonotonicExcessUs / 1000).toFixed(1),
+            mipsEstimate: +this.mipsEstimate.toFixed(1),
+            mipsCeiling: MIPS_CEILING,
+            mipsPinned: this.mipsEstimate >= MIPS_CEILING,
+            mipsCeilingHits: this.mipsCeilingHits,
+        };
+    }
+
+    /** Drop the published-clock anchor (pause/resume, game switch): the instruction counter it
+     *  refers to is no longer meaningful, and a stale anchor would compute a bogus
+     *  interpolation ceiling. NOT for a WASM buffer change — see
+     *  resyncPublishedClockAfterBufferChange, which keeps the anchor when it is still live. */
+    resetPublishedClock(): void {
+        this.publishedValid = false;
+    }
+
+    /**
+     * Decide whether the published-clock anchor survived a WASM buffer change.
+     *
+     * The two causes look identical from JS and are opposite here. A `memory.grow` preserves
+     * page contents and does not touch instruction_counter: WASM keeps interpolating from the
+     * anchor we published, so dropping it would let the next publish skip the monotonicity
+     * floor and install a value BELOW one the guest has already read — the exact hole
+     * publishClock exists to close, re-opened by any mid-gameplay allocation that grows memory.
+     * A v86.restart() zeroes HYPERCALL_PAGE (a Rust static) and restarts the counter, so the
+     * anchor is meaningless and must go. The page itself is the discriminator: only the grow
+     * still carries the values we last wrote.
+     */
+    private resyncPublishedClockAfterBufferChange(): void {
+        if (!this.publishedValid) return;
+        if (!this.view) { this.publishedValid = false; return; }
+        const baseLo = this.view.getUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, true);
+        const baseHi = this.view.getUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI, true);
+        const pageBaseUs = baseHi * 0x100000000 + baseLo;
+        const intact = pageBaseUs === this.publishedBaseUs
+            && this.view.getUint32(this.hpBase + OFF_HC_INSN_AT_TIME_UPDATE, true) === this.publishedInsn
+            && this.view.getUint32(this.hpBase + OFF_HC_MIPS_ESTIMATE, true) === this.publishedMips;
+        if (!intact) this.publishedValid = false;
     }
 
     /**
@@ -1087,15 +1475,10 @@ export class HypercallDataManager {
         this.refreshViews();
         if (!this.view) return;
 
-        const nowMs = TimeService.getInstance().nowMs();
-        const nowMicros = Math.floor(nowMs * 1000);
-        const insnNow = (cpu?.instruction_counter?.[0] ?? 0) >>> 0;
-
-        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, nowMs >>> 0, true);
-        this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, nowMicros & 0xFFFFFFFF, true);
-        this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI,
-            Math.floor(nowMicros / 0x100000000), true);
-        this.view.setUint32(this.hpBase + OFF_HC_INSN_AT_TIME_UPDATE, insnNow, true);
+        // Same publish primitive as updateTimeData: this is a re-anchor of the very same
+        // interpolation, so it carries the same monotonicity obligation. One publisher is the
+        // invariant — a second one writing the fields directly bypasses the floor.
+        this.publishClock(TimeService.getInstance(), readRetiredInsns(cpu));
     }
 
     /**
@@ -1110,6 +1493,16 @@ export class HypercallDataManager {
         this.view.setUint32(this.hpBase + OFF_HC_LAST_ERROR, lastError >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_TEB_BASE, tebBase >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_CURRENT_THREAD_ID, threadId >>> 0, true);
+
+        // FLS values are per-thread — swap the page-resident table (read by the
+        // WASM FlsGetValue fast path) to the incoming thread's set.
+        if (threadId !== this.flsCurrentTid) {
+            this.flsCurrentTid = threadId;
+            const values = this.flsValuesFor(threadId);
+            for (let i = 0; i < HC_FLS_SLOT_COUNT; i++) {
+                this.view.setUint32(this.hpBase + OFF_HC_FLS_VALUES + i * 4, values[i] >>> 0, true);
+            }
+        }
     }
 
     /** Read lastError back from WASM (WASM may have modified via SetLastError) */
@@ -1153,7 +1546,8 @@ export class HypercallDataManager {
     /** Point the JS/inline-stub slab control block at a guest-RAM address. When set,
      * all slab field reads/writes target guest RAM (so the inline x86 stub, which can
      * only address guest RAM, shares one physical control block with JS). Must be a
-     * zero-initialised THUNK_DATA block ≥ (OFF_HC_SLAB_FREELIST-OFF_HC_SLAB_BASE)+36 B. */
+     * zero-initialised THUNK_DATA block ≥ (OFF_HC_SLAB_FREELIST_TAIL-OFF_HC_SLAB_BASE)+36 B
+     * = 0x6C B (heads at 0x20, large-bin FIFO tails at 0x48, each 9×u32). */
     setSlabControlAddr(guestAddr: number): void {
         this.slabControlAddr = guestAddr >>> 0;
         // Publish the guest address into the page so the WASM heap handler can find the
@@ -1175,12 +1569,22 @@ export class HypercallDataManager {
      */
     private slabBlockBase(): number {
         if (this.slabControlAddr !== 0) {
-            const memBase = this.cpu?.mem8?.byteOffset;
-            if (typeof memBase === 'number') {
+            const memBase = this.guestMemBase();
+            if (memBase !== null) {
                 return memBase + this.slabControlAddr - OFF_HC_SLAB_BASE;
             }
         }
         return this.hpBase;
+    }
+
+    /**
+     * Offset of guest RAM inside the WASM buffer. Addresses published through the
+     * hypercall page are GUEST addresses (Rust uses memory::read32); JS indexes the
+     * buffer, where guest RAM starts after the CPU/runtime data.
+     */
+    private guestMemBase(): number | null {
+        const memBase = this.cpu?.mem8?.byteOffset;
+        return typeof memBase === 'number' ? memBase : null;
     }
 
     /** Initialize a heap slab for HeapAlloc/HeapFree (inline stub + JS share the block). */
@@ -1197,6 +1601,14 @@ export class HypercallDataManager {
         this.view.setUint32(B + OFF_HC_SLAB_FALLBACK_COUNT, 0, true);
         for (let i = 0; i < 9; i++) {
             this.view.setUint32(B + OFF_HC_SLAB_FREELIST + i * 4, 0, true);
+        }
+        // Clear the large-bin FIFO tails alongside the heads — only in guest-RAM mode,
+        // where the tail lives in the control block (in the legacy page 0x1448 is the
+        // event table; the WASM handler never runs the FIFO there — see the constant).
+        if (this.slabControlAddr !== 0) {
+            for (let i = 0; i < 9; i++) {
+                this.view.setUint32(B + OFF_HC_SLAB_FREELIST + SLAB_FREELIST_TAIL_GAP + i * 4, 0, true);
+            }
         }
         const gen = this.view.getUint32(B + OFF_HC_SLAB_GENERATION, true);
         this.view.setUint32(B + OFF_HC_SLAB_GENERATION, gen + 1, true);
@@ -1265,6 +1677,22 @@ export class HypercallDataManager {
     }
 
     /**
+     * Publish the mouse-capture owner (GetCapture) into the shared page.
+     *
+     * Event-driven, NOT per tick: capture changes on SetCapture/ReleaseCapture/window
+     * destroy, while games poll GetCapture every frame. Must be called from the single
+     * owner of the capture slot (WindowManager) so no path can leave the page stale —
+     * a stale value here is not a slow answer, it is a WRONG one the guest cannot detect.
+     */
+    updateCaptureHwnd(hwnd: number): void {
+        this.captureHwndShadow = hwnd >>> 0;
+        if (!this.initialized) return;
+        this.refreshViews();
+        if (!this.view || this.hpBase === 0) return;
+        this.view.setUint32(this.hpBase + OFF_HC_CAPTURE_HWND, this.captureHwndShadow, true);
+    }
+
+    /**
      * Update main window offset in shared page.
      * Called when window position changes.
      */
@@ -1309,6 +1737,69 @@ export class HypercallDataManager {
         this.refreshViews();
         if (!this.view) return;
         this.view.setUint32(this.hpBase + OFF_HC_SLEEP_STARVATION_LIMIT, limit >>> 0, true);
+    }
+
+    /**
+     * Publish one thread's suspend count for the WASM ResumeThread handler.
+     *
+     * The handler answers only "this thread is NOT suspended, so the resume is a no-op", so the
+     * table must never claim 0 for a thread that IS suspended — every count change publishes,
+     * and a terminated thread is removed (its handle can come back on a new thread). A handle
+     * that is absent, or a full table, simply means the JS scheduler answers as it always did.
+     */
+    setThreadSuspendCount(handle: number, suspendCount: number): void {
+        if (!this.initialized || !this.view) return;
+        const h = handle >>> 0;
+        if (h === 0) return;
+        let slot = this.threadSuspendSlots.get(h);
+        if (slot === undefined) {
+            if (this.threadSuspendSlots.size >= HC_THREAD_SUSPEND_SLOTS) return;
+            slot = this.threadSuspendSlots.size;
+            this.threadSuspendSlots.set(h, slot);
+        }
+        this.refreshViews();
+        if (!this.view) return;
+        const base = this.hpBase + OFF_HC_THREAD_SUSPEND + slot * 8;
+        this.view.setUint32(base, h, true);
+        this.view.setUint32(base + 4, suspendCount >>> 0, true);
+    }
+
+    /** Drop a thread from the table (termination). Slots stay packed from the front: the
+     *  handler stops scanning at the first empty one. */
+    forgetThreadSuspendCount(handle: number): void {
+        if (!this.initialized || !this.view) return;
+        const h = handle >>> 0;
+        const slot = this.threadSuspendSlots.get(h);
+        if (slot === undefined) return;
+        this.threadSuspendSlots.delete(h);
+        this.refreshViews();
+        if (!this.view) return;
+        const lastSlot = this.threadSuspendSlots.size; // index of the now-surplus tail entry
+        if (slot !== lastSlot) {
+            // Move the tail entry into the hole so the scan never sees a gap.
+            const from = this.hpBase + OFF_HC_THREAD_SUSPEND + lastSlot * 8;
+            const to = this.hpBase + OFF_HC_THREAD_SUSPEND + slot * 8;
+            const movedHandle = this.view.getUint32(from, true);
+            this.view.setUint32(to, movedHandle, true);
+            this.view.setUint32(to + 4, this.view.getUint32(from + 4, true), true);
+            if (movedHandle !== 0) this.threadSuspendSlots.set(movedHandle >>> 0, slot);
+        }
+        const tail = this.hpBase + OFF_HC_THREAD_SUSPEND + lastSlot * 8;
+        this.view.setUint32(tail, 0, true);
+        this.view.setUint32(tail + 4, 0, true);
+    }
+
+    /** Process reset — the next run's threads are not this one's. */
+    resetThreadSuspendTable(): void {
+        this.threadSuspendSlots.clear();
+        if (!this.initialized) return;
+        this.refreshViews();
+        if (!this.view) return;
+        for (let i = 0; i < HC_THREAD_SUSPEND_SLOTS; i++) {
+            const off = this.hpBase + OFF_HC_THREAD_SUSPEND + i * 8;
+            this.view.setUint32(off, 0, true);
+            this.view.setUint32(off + 4, 0, true);
+        }
     }
 
     /**
@@ -1387,24 +1878,61 @@ export class HypercallDataManager {
     }
 
     /**
-     * Read per-handler fallback counters from HYPERCALL_PAGE.
-     * Returns a Map from handler ID to fallback count (only non-zero entries).
-     * A fallback means the WASM handler returned false → JS handled the call.
+     * Per-handler_id accounting from HYPERCALL_PAGE — the answer to "which hypercall",
+     * which the single wrapping hc_call_count cannot give.
+     *
+     * `served` = calls the WASM handler completed; `fellBack` = calls it declined
+     * (returned false), which then cost a full JS thunk round-trip. A fast path with a
+     * high fallback ratio is not a fast path — that ratio is the number worth reading.
+     * Counters saturate rather than wrap, so `saturated: true` is reported explicitly
+     * instead of a lapped value passing for a small one.
+     *
+     * Cumulative since page init (and reset by v86.restart(), which zeroes the static) —
+     * take two readings and subtract for a windowed measurement.
      */
-    getFallbackReport(): Map<number, number> {
-        const result = new Map<number, number>();
-        if (!this.initialized || !this.view) return result;
+    getHandlerReport(): Array<{
+        handlerId: number;
+        names: string[];
+        served: number;
+        fellBack: number;
+        saturated: boolean;
+    }> {
+        const result: Array<{
+            handlerId: number; names: string[]; served: number; fellBack: number; saturated: boolean;
+        }> = [];
+        if (!this.initialized) return result;
         this.refreshViews();
-        if (!this.view) return result;
+        if (!this.view || this.hpBase === 0) return result;
 
-        for (let i = 0; i < 68; i++) {
-            const count = this.view.getUint8(this.hpBase + OFF_HC_FALLBACK_COUNTS + i);
-            if (count > 0) {
-                result.set(i, count);
-            }
+        for (let id = 0; id < HC_HANDLER_SLOTS; id++) {
+            const served = this.view.getUint32(this.hpBase + OFF_HC_HANDLER_CALLS + id * 4, true);
+            const fellBack = this.view.getUint32(this.hpBase + OFF_HC_HANDLER_FALLBACKS + id * 4, true);
+            if (served === 0 && fellBack === 0) continue;
+            result.push({
+                handlerId: id,
+                names: namesForHandlerId(id),
+                served,
+                fellBack,
+                saturated: served === 0xFFFFFFFF || fellBack === 0xFFFFFFFF,
+            });
         }
+        result.sort((a, b) => (b.served + b.fellBack) - (a.served + a.fellBack));
         return result;
     }
+}
+
+/** handler_id → the WinAPI/CRT names bound to it (several names share one handler). */
+let handlerIdNames: Map<number, string[]> | null = null;
+function namesForHandlerId(id: number): string[] {
+    if (handlerIdNames === null) {
+        handlerIdNames = new Map();
+        for (const [key, handlerId] of Object.entries(HANDLER_MAP)) {
+            const list = handlerIdNames.get(handlerId);
+            if (list) list.push(key);
+            else handlerIdNames.set(handlerId, [key]);
+        }
+    }
+    return handlerIdNames.get(id) ?? [];
 }
 
 export const hypercallDataManager = new HypercallDataManager();

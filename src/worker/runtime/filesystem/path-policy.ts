@@ -14,7 +14,16 @@
  * with `/` matches the full relative path. `**` matches across `/`, `*`/`?` do not.
  */
 
-/** Default globs treated as ephemeral when in persist-by-default mode. */
+/**
+ * Default globs treated as ephemeral when in persist-by-default mode.
+ *
+ * A directory named `cache` is deliberately NOT here. What an application caches on disk is
+ * what it found expensive to compute — a shader cache, a converted asset, precomputed
+ * lighting — and dropping it means paying that cost on every launch, or, when the thing that
+ * built it cannot run again, never having it at all (CryEngine builds its shader cache by
+ * spawning a compiler). These names are the ones whose CONTENT is disposable by convention:
+ * logs, crash dumps, editor backups, and the temp directories the OS itself treats that way.
+ */
 export const DEFAULT_EPHEMERAL_GLOBS = [
     "*.log",
     "*.tmp",
@@ -24,7 +33,6 @@ export const DEFAULT_EPHEMERAL_GLOBS = [
     "*.pyc",
     "temp/**",
     "tmp/**",
-    "cache/**",
 ];
 
 /** Default globs treated as persistent when in allowlist (persistOnly) mode. */

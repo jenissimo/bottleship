@@ -18,6 +18,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -74,37 +75,37 @@ const WS2_ORDINALS: Array<{ name: string; ordinal: number; argCount: number }> =
     { name: "ord_114", ordinal: 114, argCount: 0 }, // WSAIsBlocking
     { name: "ord_115", ordinal: 115, argCount: 2 }, // WSAStartup
     { name: "ord_116", ordinal: 116, argCount: 0 }, // WSACleanup
-    // ord_151 diverges from wsock32.dll here: real ws2_32.dll assigns 151 to WSASocketA,
-    // not __WSAFDIsSet (which ws2_32 only exports by name, no fixed ordinal — see below).
-    { name: "ord_151", ordinal: 151, argCount: 6 }, // WSASocketA
+    // Same slot as wsock32.dll: XP's own ws2_32.src pins @151 to __WSAFDIsSet, and
+    // WSASocketA carries no fixed ordinal at all.
+    { name: "ord_151", ordinal: 151, argCount: 2 }, // __WSAFDIsSet
 ];
 
 export const ws2_32Module: ModuleDescriptor = {
     name: "ws2_32",
     functions: [
-        makeFunc("accept", 3),
-        makeFunc("bind", 3),
-        makeFunc("closesocket", 1),
-        makeFunc("connect", 3),
-        makeFunc("getpeername", 3),
-        makeFunc("getsockname", 3),
-        makeFunc("getsockopt", 5),
+        makeFunc("accept", 3, { onUnimplemented: "invalidHandle" }),
+        makeFunc("bind", 3, { onUnimplemented: "minusOne" }),
+        makeFunc("closesocket", 1, { onUnimplemented: "minusOne" }),
+        makeFunc("connect", 3, { onUnimplemented: "minusOne" }),
+        makeFunc("getpeername", 3, { onUnimplemented: "minusOne" }),
+        makeFunc("getsockname", 3, { onUnimplemented: "minusOne" }),
+        makeFunc("getsockopt", 5, { onUnimplemented: "minusOne" }),
         makeFunc("htonl", 1),
         makeFunc("htons", 1),
-        makeFunc("ioctlsocket", 3),
+        makeFunc("ioctlsocket", 3, { onUnimplemented: "minusOne" }),
         makeFunc("inet_addr", 1),
         makeFunc("inet_ntoa", 1),
-        makeFunc("listen", 2),
+        makeFunc("listen", 2, { onUnimplemented: "minusOne" }),
         makeFunc("ntohl", 1),
         makeFunc("ntohs", 1),
-        makeFunc("recv", 4),
-        makeFunc("recvfrom", 6),
-        makeFunc("select", 5),
-        makeFunc("send", 4),
-        makeFunc("sendto", 6),
-        makeFunc("setsockopt", 5),
-        makeFunc("shutdown", 2),
-        makeFunc("socket", 3),
+        makeFunc("recv", 4, { onUnimplemented: "minusOne" }),
+        makeFunc("recvfrom", 6, { onUnimplemented: "minusOne" }),
+        makeFunc("select", 5, { onUnimplemented: "minusOne" }),
+        makeFunc("send", 4, { onUnimplemented: "minusOne" }),
+        makeFunc("sendto", 6, { onUnimplemented: "minusOne" }),
+        makeFunc("setsockopt", 5, { onUnimplemented: "minusOne" }),
+        makeFunc("shutdown", 2, { onUnimplemented: "minusOne" }),
+        makeFunc("socket", 3, { onUnimplemented: "invalidHandle" }),
         makeFunc("gethostbyaddr", 3),
         makeFunc("gethostbyname", 1),
         makeFunc("getprotobyname", 1),
@@ -112,6 +113,9 @@ export const ws2_32Module: ModuleDescriptor = {
         makeFunc("getservbyname", 2),
         makeFunc("getservbyport", 2),
         makeFunc("gethostname", 2),
+        makeFunc("getaddrinfo", 4),
+        makeFunc("freeaddrinfo", 1),
+        makeFunc("getnameinfo", 7),
         makeFunc("WSAAsyncSelect", 4),
         makeFunc("WSAAsyncGetHostByAddr", 7),
         makeFunc("WSAAsyncGetHostByName", 5),
@@ -128,7 +132,7 @@ export const ws2_32Module: ModuleDescriptor = {
         makeFunc("WSAIsBlocking", 0),
         makeFunc("WSAStartup", 2),
         makeFunc("WSACleanup", 0),
-        makeFunc("WSASocketA", 6),
+        makeFunc("WSASocketA", 6, { onUnimplemented: "invalidHandle" }),
         makeFunc("__WSAFDIsSet", 2),
         ...WS2_ORDINALS.map(({ name, ordinal, argCount }) => ({ ...makeFunc(name, argCount), ordinal })),
         makeFunc("WSAAccept", 5),
@@ -142,5 +146,12 @@ export const ws2_32Module: ModuleDescriptor = {
         makeFunc("WSAWaitForMultipleEvents", 5),
         makeFunc("WSAEventSelect", 3),
         makeFunc("WSAEnumNetworkEvents", 3),
+        // Overlapped I/O — the Winsock 2 scatter/gather calls. Anything built against a
+        // modern SDK links these instead of send/recv (Ultimate ASI Loader does).
+        makeFunc("WSAGetOverlappedResult", 5), // s, lpOverlapped, lpcbTransfer, fWait, lpdwFlags
+        makeFunc("WSASend", 7),     // s, buffers, count, lpNumberOfBytesSent, flags, overlapped, completion
+        makeFunc("WSASendTo", 9),   // ... + lpTo, iTolen
+        makeFunc("WSARecv", 7),     // s, buffers, count, lpNumberOfBytesRecvd, lpFlags, overlapped, completion
+        makeFunc("WSARecvFrom", 9), // ... + lpFrom, lpFromlen
     ],
 };

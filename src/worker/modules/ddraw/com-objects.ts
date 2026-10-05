@@ -3,6 +3,7 @@ import { BaseComObject } from "../../core/com/base-com-object";
 import { System } from "../../core/system";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { leaseRegistry } from "../../core/memory/lease-registry";
+import { runSurfaceTeardownHooks } from "./surface-teardown";
 import {
     IID_IDirect3D,
     IID_IDirect3D2,
@@ -10,6 +11,7 @@ import {
     IID_IDirect3D7,
     IID_IDirect3DDevice,
     IID_IDirect3DDevice2,
+    IID_IDirect3DExecuteBuffer,
     IID_IDirect3DDevice3,
     IID_IDirect3DDevice3V5,
     IID_IDirect3DDevice7,
@@ -27,8 +29,6 @@ import {
     IID_IDirect3DLight,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
-    DDSCAPS_FLIP,
-    DDSCAPS_PRIMARYSURFACE,
     D3DRENDERSTATE_LIGHTING,
     D3DRENDERSTATE_AMBIENT,
     D3DRENDERSTATE_DIFFUSEMATERIALSOURCE,
@@ -119,7 +119,23 @@ export type SurfaceFormat = {
     gMask: number;
     bMask: number;
     aMask: number;
+    /** DDPF_ZBUFFER surfaces only: the raw dwZBitMask / dwStencilBitMask the app declared.
+     *  They alias gMask/bMask in DDPIXELFORMAT, but those go through RGB fallbacks that
+     *  would corrupt a depth value, so the depth interpretation reads these instead. */
+    zBitMask?: number;
+    stencilBitMask?: number;
 };
+
+/** Device-held COM reference swap: AddRef the incoming object, Release the one it
+ *  replaces. Devices cache guest addresses (parent D3, current viewport); the real
+ *  device holds a reference on each, so a compliant guest Release can never free
+ *  an object the device still points at. */
+function swapDeviceComRef(oldAddr: number, newAddr: number): void {
+    if (oldAddr === newAddr) return;
+    const rp = SystemResourceProvider.getInstance();
+    if (newAddr) rp.getComObjectByAddress(newAddr)?.addRef();
+    if (oldAddr) rp.getComObjectByAddress(oldAddr)?.release();
+}
 
 // ============================================================================
 // SURFACE TYPE SYSTEM - Big Bang Architectural Refactor
@@ -139,7 +155,28 @@ export interface BaseSurfaceState {
     caps4?: number;            // DDSCAPS2.dwCaps4 / dwVolumeDepth (union)
     surfacePtr: number;
     format: SurfaceFormat;
+    /** The FLIP-CHAIN link: the successor in the attachment ring a Flip rotates around.
+     *  DirectDraw keeps a LIST of attachments, so this is only the chain member; a depth
+     *  buffer or mip level attached to the same surface goes in `attachedSurfaceAddrs`
+     *  and must never overwrite this, or Flip loses its target. */
     attachedSurfaceAddr: number;
+    /** Every surface attached to this one (the flip link included), in attach order —
+     *  what GetAttachedSurface/EnumAttachedSurfaces enumerate. */
+    attachedSurfaceAddrs?: number[];
+    /** Created BY DirectDraw as part of a complex surface (flip-chain back buffer, mip
+     *  sublevel) rather than handed to AddAttachedSurface by the app. DirectDraw owns these:
+     *  they carry no attachment reference, they die with the root, and DeleteAttachedSurface
+     *  refuses them with DDERR_CANNOTDETACHSURFACE. */
+    implicitChainMember?: boolean;
+    /** The surface this one is attached to and holds ONE reference for — the reference
+     *  AddAttachedSurface takes, dropped by DeleteAttachedSurface or by the owner's
+     *  destruction. DirectDraw keeps exactly one such slot per surface, so an already-attached
+     *  surface never takes a second reference. 0/undefined = holds none. */
+    attachRefOwner?: number;
+    /** DDSCAPS_ZBUFFER surfaces only: guest addresses of the render targets this depth
+     *  buffer was attached to. Our depth attachments are keyed by render target, so a
+     *  DDBLT_DEPTHFILL aimed at the z surface has to be resolved back to them. */
+    zOwnerSurfaces?: number[];
     gpuTexture?: GPUTexture;
     /** Single-mip (level 0) view — used for render attachments, clears, uploads, and sampling
      *  when there is no mip chain. */
@@ -195,6 +232,35 @@ export interface BaseSurfaceState {
     lastLoadSourceGeneration?: number;
     /** surfacePtr of the source used in last Load() (for multi-source invalidation). */
     lastLoadSourcePtr?: number;
+    /** GUID-keyed application data attached with SetPrivateData. Per-surface and
+     *  opaque to us: engines round-trip their own bookkeeping (source image size,
+     *  mip level, wrapper object) through it, so dropping it silently corrupts
+     *  whatever they read back. Freed with the surface. */
+    privateData?: Map<string, PrivateDataEntry>;
+
+    /** Executor bookkeeping for the copy→draw→copy→draw hazard: the encoderEpoch of the
+     *  command buffer that last recorded a draw sampling this surface, and the content
+     *  version those draws were recorded against. A guest that rewrites a texture between
+     *  draws would otherwise have every draw in the buffer sample the LAST upload, because
+     *  queue.writeTexture runs ahead of the single submit. See
+     *  DDrawWebGPUExecutor.encoderEpoch / prepareStageTexture. */
+    sampledEncoderEpoch?: number;
+    sampledContentVersion?: number;
+
+    /** Set when a device loss took the surface's ONLY copy (a GPU_ONLY render target); cleared
+     *  by Restore()/RestoreAllSurfaces(). Lives here rather than in an address-keyed table
+     *  because COM blocks are recycled — see gpu-device-loss-contract.ts. */
+    surfaceLost?: boolean;
+}
+
+/** One SetPrivateData entry: either a byte blob or a (ref-counted) IUnknown pointer. */
+export interface PrivateDataEntry {
+    /** dwSize as the app set it — GetPrivateData reports exactly this. */
+    size: number;
+    /** Blob payload (absent for DDSPD_IUNKNOWNPOINTER entries). */
+    bytes?: Uint8Array;
+    /** Guest IUnknown pointer for DDSPD_IUNKNOWNPOINTER entries (we hold one ref). */
+    unknownPtr?: number;
 }
 
 /**
@@ -219,6 +285,14 @@ export interface BitmapTextureSurface extends BaseSurfaceState {
 
     /** Simple upload flag - true if GPU texture needs upload from rgbaScratch. */
     gpuNeedsUpload: boolean;
+
+    /** Bumped every time the guest rewrites this texture's pixels (CopyRects, Unlock,
+     *  UpdateTexture). One GPU texture backs all draws that sample this surface, so a
+     *  batch spanning a content change would render every draw with the LAST upload —
+     *  the draw batcher compares this to break the batch, exactly as it does with a
+     *  render surface's `version`. A game using one texture as a scratch tile buffer
+     *  (copy tile → draw quad → copy next tile → draw) depends on it. */
+    contentVersion?: number;
 
     /** D3D8/D3D9 format enum/FourCC used to decode guest texture memory. */
     d3dFormat?: number;
@@ -280,6 +354,8 @@ export interface RenderSurface extends BaseSurfaceState {
     gpuWrittenVersion?: number;
     /** True if surface was ever Lock()'d (permanent CPU mode). */
     everLocked: boolean;
+    /** The last Lock was D3DLOCK_READONLY — Unlock must not claim CPU authority for it. */
+    lastLockReadOnly?: boolean;
     /** Version of last CPU→GPU upload (for debugging). */
     lastUploadVersion: number;
     /** Bounding box of dirty region (for partial upload optimization - Phase 2). */
@@ -289,6 +365,14 @@ export interface RenderSurface extends BaseSurfaceState {
     rgbaScratch?: Uint8Array;
     /** Version of data currently in rgbaScratch. */
     rgbaScratchVersion?: number;
+
+    /** Version whose GPU content is already present in guest memory at surfacePtr
+     *  (set when a GPU→CPU readback completes). needsCPUSync returns false while it
+     *  matches `version`, so N Locks between two GPU writes cost ONE round trip.
+     *  Every writer bumps `version`, which invalidates this by construction; the paths
+     *  that assign `version` across surfaces (flip rotation, sibling propagation) must
+     *  carry or clear it explicitly. */
+    cpuSyncedVersion?: number;
 }
 
 /**
@@ -325,6 +409,12 @@ export class DirectDrawSurfaceObject extends BaseComObject {
     // Cache for texture interface objects (COM Identity: same surface -> same texture interface)
     private cachedTexture2Handle: number = 0;
     private cachedTextureHandle: number = 0;
+    /**
+     * Guest address of the IDirectDraw interface this surface was created through.
+     * GetDDInterface must return that exact interface version — a surface made via
+     * IDirectDraw::CreateSurface hands back an IDirectDraw, never an IDirectDraw7.
+     */
+    private ddrawOwnerAddr: number = 0;
 
     constructor(vtableAddress: number, state: DirectDrawSurfaceState) {
         super(IID_IDirectDrawSurface7, vtableAddress);
@@ -355,37 +445,90 @@ export class DirectDrawSurfaceObject extends BaseComObject {
         this.cachedTextureHandle = handle;
     }
 
-    /**
-     * Releasing the primary of a flipping chain also releases attached chain members
-     * (MSDN IDirectDrawSurface::Release). Without this, backbuffers stay at refCount=1
-     * until IDirectDraw cascade forceRelease - wrong teardown order for ref_soft/Q2 VID_restart.
-     */
-    private releaseFlipChainAttached(): void {
-        const caps = this.state.caps >>> 0;
-        if ((caps & DDSCAPS_PRIMARYSURFACE) === 0 || (caps & DDSCAPS_FLIP) === 0) {
-            return;
-        }
+    getDDrawOwnerAddr(): number {
+        return this.ddrawOwnerAddr;
+    }
 
+    setDDrawOwnerAddr(addr: number): void {
+        this.ddrawOwnerAddr = addr;
+    }
+
+    /**
+     * Drop the reference AddAttachedSurface took on every surface EXPLICITLY attached to
+     * this one. DirectDraw detaches before it destroys the root, and detaching is what
+     * releases the attachment (Wine ddraw_surface_cleanup → ddraw_surface_delete_attached_surface).
+     * Without this the reference is a leak, and a leaked reference on a primary or a
+     * flip-chain member keeps a dead screen resolvable long after the app dropped it.
+     */
+    private releaseAttachRefs(): void {
+        const attached = this.state.attachedSurfaceAddrs;
+        if (!attached || attached.length === 0) return;
         const resourceProvider = SystemResourceProvider.getInstance();
-        const myAddr = resourceProvider.getAddressForHandle(this.handle);
+        const myAddr = (resourceProvider.getAddressForHandle(this.handle) ?? 0) >>> 0;
         if (!myAddr) return;
 
-        let currentAddr = this.state.attachedSurfaceAddr >>> 0;
-        const visited = new Set<number>();
+        for (const addr of [...attached]) {
+            const resolved = resourceProvider.getComObjectByAddress(addr);
+            if (!(resolved instanceof DirectDrawSurfaceObject)) continue;
+            const state = resolved.getState();
+            if (((state.attachRefOwner ?? 0) >>> 0) !== myAddr) continue;
+            // Clear the slot BEFORE releasing: the surface may go away inside release().
+            state.attachRefOwner = 0;
+            resolved.release();
+        }
+    }
 
-        while (currentAddr && currentAddr !== myAddr && !visited.has(currentAddr)) {
-            visited.add(currentAddr);
-            const attached = resourceProvider.getComObjectByAddress(currentAddr) as DirectDrawSurfaceObject | null;
-            if (!attached) break;
-            const nextAddr = attached.getState().attachedSurfaceAddr >>> 0;
-            attached.release();
-            currentAddr = nextAddr;
+    /**
+     * A surface DirectDraw created as part of a complex one — a mip sublevel, a back buffer
+     * of a DDSD_BACKBUFFERCOUNT chain — belongs to the root, not to the app: the app's
+     * Release may take its count to zero, and DirectDraw IGNORES that. It dies with the root
+     * (Wine surface.c ddraw_surface_release_iface: `if (This->is_implicit) ... return;`,
+     * and ddraw_surface_cleanup destroys the complex members regardless of their count).
+     *
+     * NFS Porsche's dx7z walks a mip chain per texture update — GetAttachedSurface, use the
+     * level, Release it — so destroying a level at zero hands the next iteration a freed COM
+     * block, and the block pool then dispatches the guest through whatever reused it.
+     */
+    protected get leakOnZeroRef(): boolean {
+        return this.state.implicitChainMember === true;
+    }
+
+    /** The complex root reaps its members (destroyImplicitMembers) — that is the whole
+     *  point of keeping them past zero, so the root's teardown must be able to. */
+    protected get reapableAtZero(): boolean {
+        return this.state.implicitChainMember === true;
+    }
+
+    /**
+     * Destroy the complex members this surface owns. Both chains DirectDraw builds itself
+     * are followed: the flip ring (attachedSurfaceAddr, circular back to this) and the mip
+     * chain. Implicit members only — a surface the app attached itself holds its own
+     * reference and only loses the attachment one (releaseAttachRefs).
+     */
+    private destroyImplicitMembers(): void {
+        const resourceProvider = SystemResourceProvider.getInstance();
+        const myAddr = (resourceProvider.getAddressForHandle(this.handle) ?? 0) >>> 0;
+        const visited = new Set<number>([myAddr]);
+        const queue: number[] = [this.state.attachedSurfaceAddr >>> 0,
+                                 ...(this.state.attachedSurfaceAddrs ?? [])];
+
+        while (queue.length) {
+            const addr = queue.shift()! >>> 0;
+            if (!addr || visited.has(addr)) continue;
+            visited.add(addr);
+            const resolved = resourceProvider.getComObjectByAddress(addr);
+            // A released member's COM block can already hold a device/texture.
+            if (!(resolved instanceof DirectDrawSurfaceObject)) continue;
+            const state = resolved.getState();
+            if (!state.implicitChainMember) continue;
+            queue.push(state.attachedSurfaceAddr >>> 0, ...(state.attachedSurfaceAddrs ?? []));
+            resolved.forceRelease();
         }
     }
 
     release(): number {
         if (this.refCount === 1) {
-            this.releaseFlipChainAttached();
+            this.releaseAttachRefs();
         }
 
         const newRefCount = super.release();
@@ -423,6 +566,8 @@ export class DirectDrawSurfaceObject extends BaseComObject {
     }
 
     protected destroy(): void {
+        this.destroyImplicitMembers();
+
         const depthSurfacePtr =
             this.state.surfacePtrAllocated && this.state.surfacePtr > 0
                 ? (this.state.surfacePtr >>> 0)
@@ -434,6 +579,15 @@ export class DirectDrawSurfaceObject extends BaseComObject {
                 `Surface destroyed while locked! Auto-revoking lease ${this.state.activeLeaseId}`);
             leaseRegistry.revokeLease(this.state.activeLeaseId);
             this.state.activeLeaseId = undefined;
+        }
+
+        // SetPrivateData entries die with the surface, releasing any IUnknown they hold.
+        if (this.state.privateData) {
+            const provider = System.getInstance().resourceProvider as any;
+            for (const entry of this.state.privateData.values()) {
+                if (entry.unknownPtr) provider?.getComObjectByAddress?.(entry.unknownPtr)?.release?.();
+            }
+            this.state.privateData = undefined;
         }
 
         // Unbind this surface from all active devices before destroying GPU resources
@@ -449,6 +603,21 @@ export class DirectDrawSurfaceObject extends BaseComObject {
             executor.invalidateSurfaceCache(this.state);
         }
 
+        // Drop the context's cached primary/back-buffer addresses if they point at THIS object.
+        // The system object pool deliberately recycles same-size COM blocks, so an app that
+        // releases its primary and creates a new DirectDraw gets the block back — and every
+        // reader of the cached address then resolves it to whatever now lives there (a
+        // DirectDrawObject), which is not a surface. Only the whole-DirectDraw cascade cleared
+        // these; a lone Release of the primary did not.
+        const surfaces = ddrawModule?.context?.surfaces;
+        if (surfaces) {
+            const self = (system.resourceProvider as any)?.getAddressForHandle?.(this.handle) >>> 0;
+            if (self) {
+                if ((surfaces.primary >>> 0) === self) surfaces.primary = 0;
+                if ((surfaces.backBuffer >>> 0) === self) surfaces.backBuffer = 0;
+            }
+        }
+
         // Remove from deferred upload batch BEFORE freeing memory.
         // Without this, flushAll() reads from freed/reused surfacePtr → wrong pixel data
         // (wrong pixel data uploaded from freed/reused surfacePtr).
@@ -456,6 +625,8 @@ export class DirectDrawSurfaceObject extends BaseComObject {
         if (deferredMgr) {
             deferredMgr.removeDirty(this.state);
         }
+
+        runSurfaceTeardownHooks(this.state);
 
         // Deferred destruction of GPU resources
         // WebGPU commands are asynchronous - if we destroy texture immediately,
@@ -603,13 +774,38 @@ export class DirectDrawSurfaceObject extends BaseComObject {
         return null;
     }
 
+    /** Set the FLIP-CHAIN link. Use addAttachment() for attachments in general. */
     setAttachedSurface(addr: number): void {
         const oldAddr = this.state.attachedSurfaceAddr;
         this.state.attachedSurfaceAddr = addr;
-        Logger.verbose(LogCategory.DDRAW, 
+        this.addAttachment(addr);
+        Logger.verbose(LogCategory.DDRAW,
             `DirectDrawSurfaceObject.setAttachedSurface: handle=0x${this.handle.toString(16)} ` +
             `old=0x${oldAddr.toString(16)} new=0x${addr.toString(16)}`
         );
+    }
+
+    /** Record `addr` in the attachment list without touching the flip-chain link. */
+    addAttachment(addr: number): void {
+        const a = addr >>> 0;
+        if (!a) return;
+        const list = this.state.attachedSurfaceAddrs ?? (this.state.attachedSurfaceAddrs = []);
+        if (!list.includes(a)) list.push(a);
+    }
+
+    /** Drop `addr` from the attachment list, and from the flip link if it was the link. */
+    removeAttachment(addr: number): void {
+        const a = addr >>> 0;
+        const list = this.state.attachedSurfaceAddrs;
+        if (list) {
+            const i = list.indexOf(a);
+            if (i >= 0) list.splice(i, 1);
+        }
+        if ((this.state.attachedSurfaceAddr >>> 0) === a) {
+            // Promote whatever else is attached; a chain of one is not a chain, and Flip
+            // rejects it the same way DirectDraw does.
+            this.state.attachedSurfaceAddr = list?.[0] ?? 0;
+        }
     }
 }
 
@@ -710,6 +906,8 @@ export class Direct3DDevice3Object extends BaseComObject {
 
     // Lighting system state
     private material: D3DMaterial7Data = createDefaultMaterial();
+    /** SetMaterial was called at least once — the DX6 ProcessVertices D3DVOP_LIGHT gate. */
+    private materialSet: boolean = false;
     private lights: Map<number, D3DLight7Data> = new Map();
     private lightsEnabled: Set<number> = new Set();
 
@@ -730,6 +928,11 @@ export class Direct3DDevice3Object extends BaseComObject {
 
     setMaterial(mat: D3DMaterial7Data): void {
         this.material = mat;
+        this.materialSet = true;
+    }
+
+    isMaterialSet(): boolean {
+        return this.materialSet;
     }
 
     getMaterial(): D3DMaterial7Data {
@@ -911,6 +1114,7 @@ export class Direct3DDevice3Object extends BaseComObject {
     }
 
     setParentD3(addr: number): void {
+        swapDeviceComRef(this.parentD3Addr, addr);
         this.parentD3Addr = addr;
     }
 
@@ -927,6 +1131,7 @@ export class Direct3DDevice3Object extends BaseComObject {
     }
 
     setCurrentViewport(addr: number): void {
+        swapDeviceComRef(this.currentViewportAddr, addr);
         this.currentViewportAddr = addr;
     }
 
@@ -1133,6 +1338,16 @@ export class Direct3DDevice3Object extends BaseComObject {
             this.renderTargetAddr = 0;
         }
 
+        // Release device-held refs on the current viewport and parent D3
+        if (this.currentViewportAddr) {
+            resourceProvider.getComObjectByAddress(this.currentViewportAddr)?.release();
+            this.currentViewportAddr = 0;
+        }
+        if (this.parentD3Addr) {
+            resourceProvider.getComObjectByAddress(this.parentD3Addr)?.release();
+            this.parentD3Addr = 0;
+        }
+
         Logger.log(LogCategory.COM, "Direct3DDevice3Object cascade destroy complete");
     }
 }
@@ -1160,10 +1375,34 @@ export class Direct3DViewport3Object extends BaseComObject {
         minZ: 0,
         maxZ: 1,
     };
+    /** D3DVIEWPORT2 clipping volume (dvClipX/Y/Width/Height); D3D's default is the -1..1 cube. */
+    private clipVolume = { x: -1, y: 1, width: 2, height: 2 };
+    /**
+     * Post-projection clip-space scale/bias this viewport contributes (ddraw viewport_activate).
+     * A D3DVIEWPORT's clipping volume / dvScale / dvMinZ..dvMaxZ remap clip space; they never
+     * change the rasterizer's own [0,1] depth range. Identity for a default viewport.
+     */
+    private clipSpace = { sx: 1, sy: 1, sz: 1, ox: 0, oy: 0, oz: 0 };
     private viewport2Address: number = 0; // Address for IDirect3DViewport2 vtable (if mapped)
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DViewport3, vtableAddress);
+    }
+
+    setClipVolume(x: number, y: number, width: number, height: number): void {
+        this.clipVolume = { x, y, width, height };
+    }
+
+    getClipVolume() {
+        return this.clipVolume;
+    }
+
+    setClipSpace(sx: number, sy: number, sz: number, ox: number, oy: number, oz: number): void {
+        this.clipSpace = { sx, sy, sz, ox, oy, oz };
+    }
+
+    getClipSpace() {
+        return this.clipSpace;
     }
 
     setDevice(addr: number): void {
@@ -1402,6 +1641,8 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
 
     // Lighting system state
     private material: D3DMaterial7Data = createDefaultMaterial();
+    /** SetMaterial was called at least once — the DX6 ProcessVertices D3DVOP_LIGHT gate. */
+    private materialSet: boolean = false;
     private lights: Map<number, D3DLight7Data> = new Map();
     private lightsEnabled: Set<number> = new Set();
 
@@ -1471,6 +1712,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setParentD3(addr: number): void {
+        swapDeviceComRef(this.parentD3Addr, addr);
         this.parentD3Addr = addr;
     }
 
@@ -1487,6 +1729,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setCurrentViewport(addr: number): void {
+        swapDeviceComRef(this.currentViewportAddr, addr);
         this.currentViewportAddr = addr;
     }
 
@@ -1654,6 +1897,11 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
 
     setMaterial(mat: D3DMaterial7Data): void {
         this.material = mat;
+        this.materialSet = true;
+    }
+
+    isMaterialSet(): boolean {
+        return this.materialSet;
     }
 
     getMaterial(): D3DMaterial7Data {
@@ -1901,6 +2149,60 @@ export class Direct3DDeviceObject extends BaseComObject {
     }
 }
 
+/** D3DEXECUTEDATA — where the vertices and the instruction stream sit inside the buffer. */
+export interface ExecuteData {
+    vertexOffset: number;
+    vertexCount: number;
+    instructionOffset: number;
+    instructionLength: number;
+    hVertexOffset: number;
+    /** D3DSTATUS the interpreter branches on; D3DOP_SETSTATUS writes it and
+     *  GetExecuteData hands it back to the app. */
+    statusFlags: number;
+    status: number;
+    statusExtent: { left: number; top: number; right: number; bottom: number };
+}
+
+/**
+ * Direct3DExecuteBuffer COM object — a guest-visible byte buffer plus the
+ * D3DEXECUTEDATA describing it. The guest Locks it, writes vertices and an
+ * opcode stream, then hands it to IDirect3DDevice::Execute.
+ */
+export class Direct3DExecuteBufferObject extends BaseComObject {
+    private dataAddr = 0;
+    private dataSize = 0;
+    private locked = false;
+    private execData: ExecuteData = {
+        vertexOffset: 0, vertexCount: 0, instructionOffset: 0, instructionLength: 0, hVertexOffset: 0,
+        statusFlags: 0, status: 0, statusExtent: { left: 0, top: 0, right: 0, bottom: 0 },
+    };
+
+    constructor(vtableAddress: number) {
+        super(IID_IDirect3DExecuteBuffer, vtableAddress);
+    }
+
+    setData(addr: number, size: number): void {
+        this.dataAddr = addr;
+        this.dataSize = size;
+    }
+    getDataAddr(): number { return this.dataAddr; }
+    getDataSize(): number { return this.dataSize; }
+
+    setLocked(v: boolean): void { this.locked = v; }
+    isLocked(): boolean { return this.locked; }
+
+    setExecuteData(d: ExecuteData): void { this.execData = d; }
+    getExecuteData(): ExecuteData { return this.execData; }
+
+    protected destroy(): void {
+        if (this.dataAddr) {
+            System.getInstance().process?.memory?.free(this.dataAddr);
+            this.dataAddr = 0;
+        }
+        Logger.verbose(LogCategory.COM, "Direct3DExecuteBufferObject destroyed");
+    }
+}
+
 /**
  * Direct3DTexture COM object — thin wrapper delegating IUnknown to parent surface (COM identity).
  */
@@ -1916,28 +2218,31 @@ export class Direct3DTextureObject extends BaseComObject {
         }
     }
 
-    addRef(): number {
+    // `ifacePtr` must be forwarded, not dropped: the base tracks per-interface references by
+    // the pointer the guest holds, and an arity-0 override silently discards it — which
+    // TypeScript accepts. Delegation goes to the parent surface, so the pointer travels there.
+    addRef(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.addRef();
+                return surfaceObj.addRef(ifacePtr);
             }
         }
         // Fallback: increment our own refcount if surface not found (shouldn't happen)
-        return super.addRef();
+        return super.addRef(ifacePtr);
     }
 
-    release(): number {
+    release(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.release();
+                return surfaceObj.release(ifacePtr);
             }
         }
         // Fallback: decrement our own refcount if surface not found (shouldn't happen)
-        return super.release();
+        return super.release(ifacePtr);
     }
 
     queryInterface(riid: string, ppvObject: number, memory: Uint8Array): number {
@@ -2006,28 +2311,31 @@ export class Direct3DTexture2Object extends BaseComObject {
         }
     }
 
-    addRef(): number {
+    // `ifacePtr` must be forwarded, not dropped: the base tracks per-interface references by
+    // the pointer the guest holds, and an arity-0 override silently discards it — which
+    // TypeScript accepts. Delegation goes to the parent surface, so the pointer travels there.
+    addRef(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.addRef();
+                return surfaceObj.addRef(ifacePtr);
             }
         }
         // Fallback: increment our own refcount if surface not found (shouldn't happen)
-        return super.addRef();
+        return super.addRef(ifacePtr);
     }
 
-    release(): number {
+    release(ifacePtr = 0): number {
         if (this.surfaceHandle) {
             const resourceProvider = SystemResourceProvider.getInstance();
             const surfaceObj = resourceProvider.getComObject(this.surfaceHandle);
             if (surfaceObj) {
-                return surfaceObj.release();
+                return surfaceObj.release(ifacePtr);
             }
         }
         // Fallback: decrement our own refcount if surface not found (shouldn't happen)
-        return super.release();
+        return super.release(ifacePtr);
     }
 
     queryInterface(riid: string, ppvObject: number, memory: Uint8Array): number {
@@ -2113,6 +2421,9 @@ export class Direct3DVertexBufferObject extends BaseComObject {
     private numVertices: number = 0;
     private caps: number = 0;
     private vertexSize: number = 0;
+    private locked: boolean = false;
+    /** 3 for IDirect3D3::CreateVertexBuffer, 7 for IDirect3D7 — ProcessVertices lights differently. */
+    private interfaceVersion: 3 | 7 = 3;
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DVertexBuffer, vtableAddress);
@@ -2125,6 +2436,18 @@ export class Direct3DVertexBufferObject extends BaseComObject {
         this.caps = caps;
         this.vertexSize = vertexSize;
     }
+
+    setInterfaceVersion(v: 3 | 7): void { this.interfaceVersion = v; }
+    getInterfaceVersion(): 3 | 7 { return this.interfaceVersion; }
+
+    beginLock(): void { this.locked = true; }
+    /** Returns false for an Unlock with no matching Lock (real ddraw still reports D3D_OK). */
+    endLock(): boolean {
+        const wasLocked = this.locked;
+        this.locked = false;
+        return wasLocked;
+    }
+    isLocked(): boolean { return this.locked; }
 
     getDataPtr(): number { return this.dataPtr; }
     getFVF(): number { return this.fvf; }

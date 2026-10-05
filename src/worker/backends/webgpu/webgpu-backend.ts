@@ -1,8 +1,24 @@
 import { RenderBackend } from "../../runtime/runtime-services";
 import { Logger, LogCategory } from "../../core/logger";
+import { recordGpuError } from "../../core/gpu-error-log";
+import { gpuDeviceLifecycle } from "../../core/gpu/gpu-device-lifecycle";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { PostFxChain } from "./postfx/post-fx-chain";
 import { desktopBackground } from "../../runtime/desktop-background";
+import { probeD3D9WebGpuCapabilities } from "./shared/capability-probe";
+import { setD3D9FloatCapabilityContract } from "./shared/float-format-policy";
+import { setD3D9VolumeCapabilityContract } from "./shared/volume-policy";
+import { setD3D9MsaaCapabilityContract } from "./d3d9/multisample";
+import { setD3D9WebGpuCapabilityLimits } from "./shared/webgpu-capability-limits";
+import { coversTarget, overlayDestRect, publishComputedPresentRect } from "./shared/present-geometry";
+
+/** Backoff between requestDevice attempts while recovering, in ms. The list also fixes how
+ *  many attempts there are: a GPU that has not come back by ~4s is gone, and retrying past
+ *  that only keeps the guest polling a device that will never arrive. */
+const RECREATE_BACKOFF_MS = [0, 100, 250, 500, 1000, 2000];
+
+/** Reused scratch for the positioned overlay quad (6 verts x [x,y,u,v]). */
+const OVERLAY_DEST_SCRATCH = new Float32Array(24);
 
 export class WebGPUBackend implements RenderBackend {
     readonly kind = "webgpu";
@@ -11,6 +27,8 @@ export class WebGPUBackend implements RenderBackend {
     private context: GPUCanvasContext | null = null;
     private format: GPUTextureFormat | null = null;
     private bcSupported = false;
+    /** Readable copy of the last presented canvas image (see mirrorPresentedFrame). */
+    private screenMirror: GPUTexture | null = null;
 
     // Compositing resources
     private overlayPipeline: GPURenderPipeline | null = null;
@@ -22,9 +40,13 @@ export class WebGPUBackend implements RenderBackend {
     private overlayNearestSampler: GPUSampler | null = null;
     private overlayVertexBuffer: GPUBuffer | null = null;
     private overlayBindGroup: GPUBindGroup | null = null;
+    /** Positioned quad for an overlay plane that does not cover the whole target. */
+    private overlayDestVertexBuffer: GPUBuffer | null = null;
+    /** The rect the quad above currently holds — it only moves on a resize/mode change. */
+    private overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1 };
+    /** getCanvasSize result, reused: it is read several times per frame. */
+    private canvasSize = { width: 0, height: 0 };
     
-    // Rect compositing resources (positioned quad for video subregions)
-    private rectVertexBuffer: GPUBuffer | null = null;
     // Growable vertex buffer for blitRects (N sub-rect quads per call)
     private rectsVertexBuffer: GPUBuffer | null = null;
     private rectsVertexBufferCapacity = 0;
@@ -48,11 +70,41 @@ export class WebGPUBackend implements RenderBackend {
     private postFx: PostFxChain | null = null;
 
 
+    /** Set while a replacement device is being requested — the retry is single-flight. */
+    private recreating: Promise<boolean> | null = null;
+    /** Set while a harness-forced destroy is in flight, so the loss can be labelled as ours. */
+    private forcingLoss = false;
+
     async initialize(canvas: OffscreenCanvas): Promise<void> {
         if (!("gpu" in navigator)) {
             throw new Error("WebGPU unavailable: navigator.gpu is absent — this browser/worker does not expose the WebGPU API.");
         }
+        const device = await this.requestDevice();
+        await this.adoptDevice(device);
 
+        this.context = canvas.getContext("webgpu") as GPUCanvasContext | null;
+        if (!this.context) {
+            throw new Error("WebGPU unavailable: OffscreenCanvas.getContext('webgpu') returned null despite a valid device.");
+        }
+
+        this.format = navigator.gpu.getPreferredCanvasFormat();
+        this.configureContext();
+        this.createDeviceResources();
+    }
+
+    /** Replace only the presentation surface: textures, pipelines and guest state survive. */
+    attachCanvas(canvas: OffscreenCanvas): void {
+        const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
+        if (!context || !this.device) throw new Error('Cannot attach child display without a WebGPU context/device');
+        this.context?.unconfigure();
+        this.context = context;
+        this.configureContext();
+        this.screenMirror?.destroy();
+        this.screenMirror = null;
+    }
+
+    /** requestAdapter + requestDevice. Throws with the reason a caller can act on. */
+    private async requestDevice(): Promise<GPUDevice> {
         const adapter = await navigator.gpu.requestAdapter();
         if (!adapter) {
             throw new Error("WebGPU unavailable: requestAdapter() returned no adapter — no usable GPU (hardware acceleration disabled, GPU blocklisted, or VM/Remote Desktop with no GPU).");
@@ -66,37 +118,191 @@ export class WebGPUBackend implements RenderBackend {
         if (adapter.features.has("texture-compression-bc")) {
             requiredFeatures.push("texture-compression-bc");
         }
-        this.device = await adapter.requestDevice({ requiredFeatures });
-        this.bcSupported = this.device.features.has("texture-compression-bc");
-        this.queue = this.device.queue;
+        // 32-bit float textures are filterable on the SM3 hardware D3D9 games were written
+        // against; without this feature WebGPU would only allow a non-filtering sampler for
+        // them, which is a different bind-group layout and a different picture. Enabling it
+        // keeps r32float/rgba32float on exactly the same sampling path as every other format.
+        if (adapter.features.has("float32-filterable")) {
+            requiredFeatures.push("float32-filterable");
+        }
+        return await adapter.requestDevice({ requiredFeatures });
+    }
 
-        // Monitor device loss — after this fires, all GPU ops are no-ops (black screen)
-        this.device.lost.then((info) => {
-            Logger.error(LogCategory.SYSTEM,
-                `[WEBGPU] Device LOST! reason=${info.reason} message="${info.message}"`);
+    /** Take ownership of a device: capabilities, queue, and the two error channels. */
+    private async adoptDevice(device: GPUDevice): Promise<void> {
+        this.device = device;
+        this.bcSupported = device.features.has("texture-compression-bc");
+        this.queue = device.queue;
+
+        // Capability answers start conservative for every new device.  The
+        // asynchronous probe publishes a contract only after the actual
+        // texture/upload/readback operations succeed; bind the identity so a
+        // late result from a lost device cannot bless its replacement.
+        setD3D9MsaaCapabilityContract(null);
+        setD3D9FloatCapabilityContract(null);
+        setD3D9VolumeCapabilityContract(null);
+        setD3D9WebGpuCapabilityLimits({
+            maxTextureDimension2D: device.limits.maxTextureDimension2D,
+            maxTextureDimension3D: device.limits.maxTextureDimension3D,
         });
 
-        // DIAGNOSTIC: Catch WebGPU validation errors that silently drop draw calls
-        this.device.onuncapturederror = (event: GPUUncapturedErrorEvent) => {
+        // `lost` resolves once per device and never rejects. Bind the device it belongs to so
+        // a late resolution from a PREVIOUS device cannot tear down the current one.
+        void device.lost.then((info) => this.handleDeviceLost(device, info));
+
+        // Async validation errors never throw, so this is the only thing standing between a
+        // silently dropped draw call and nobody knowing. Counted as well as logged: the log
+        // ring is far too short to still hold it by the time a picture looks wrong.
+        device.onuncapturederror = (event: GPUUncapturedErrorEvent) => {
+            recordGpuError("uncaptured", "device", event.error.message);
             Logger.error(LogCategory.DDRAW,
                 `[WEBGPU] Uncaptured error: ${event.error.message}`);
         };
 
-        this.context = canvas.getContext("webgpu") as GPUCanvasContext | null;
-        if (!this.context) {
-            throw new Error("WebGPU unavailable: OffscreenCanvas.getContext('webgpu') returned null despite a valid device.");
-        }
+        // Do not expose D3D9 creation/caps entry points until the device-specific
+        // contracts have been measured. Before this await the only honest answer
+        // is refusal, which would make a title cache a permanently false result.
+        await probeD3D9WebGpuCapabilities(device, () => this.device === device);
+    }
 
-        this.format = navigator.gpu.getPreferredCanvasFormat();
+    private configureContext(): void {
+        if (!this.context || !this.device || !this.format) return;
         this.context.configure({
             device: this.device,
             format: this.format,
             alphaMode: "opaque",
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+            // COPY_SRC so the presented frame can be mirrored into a readable texture:
+            // once presented, the canvas image belongs to the compositor and is no longer
+            // reliably readable (see mirrorPresentedFrame).
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
         });
+    }
 
+    /** The backend's own eagerly-built resources. Everything else here is lazy. */
+    private createDeviceResources(): void {
+        if (!this.device || !this.format) return;
         this.postFx = new PostFxChain(this.device, () => EmulatorConfig.getInstance().quality);
         this.postFx.setFormat(this.format);
+    }
+
+    /**
+     * Every handle this class holds is derived from the device, so on loss they are all
+     * dead references. Nulled rather than destroyed — destroy() on a lost device's resource
+     * is meaningless, and the getters below recreate lazily from these nulls.
+     */
+    private dropDeviceResources(): void {
+        this.device = null;
+        this.queue = null;
+        this.screenMirror = null;
+        this.overlayPipeline = null;
+        this.overlayPipelineOpaque = null;
+        this.overlayPipelineFormat = null;
+        this.overlayTexture = null;
+        this.overlayTextureView = null;
+        this.overlaySampler = null;
+        this.overlayNearestSampler = null;
+        this.overlayVertexBuffer = null;
+        this.overlayBindGroup = null;
+        this.overlayDestVertexBuffer = null;
+        this.overlayDestVertexRect = { x: -1, y: -1, w: -1, h: -1, outW: -1, outH: -1 };
+        this.rectsVertexBuffer = null;
+        this.rectsVertexBufferCapacity = 0;
+        this.statsTexture = null;
+        this.statsTextureView = null;
+        this.statsBindGroup = null;
+        this.statsVertexBuffer = null;
+        this.bindGroupCache = new WeakMap();
+        this.nearestBindGroupCache = new WeakMap();
+        this.rgb565Pipeline = null;
+        this.rgb565BindGroupCache = new WeakMap();
+        this.postFx = null;
+        setD3D9MsaaCapabilityContract(null);
+        setD3D9FloatCapabilityContract(null);
+        setD3D9VolumeCapabilityContract(null);
+        setD3D9WebGpuCapabilityLimits(null);
+    }
+
+    /**
+     * The device died. Drop everything derived from it, tell every other cache to do the
+     * same, then go get another one.
+     *
+     * Ordering matters: the invalidation fan-out runs SYNCHRONOUSLY here, before any await,
+     * so no stale handle can be used by a frame that starts while we are asking for the
+     * replacement.
+     */
+    private handleDeviceLost(device: GPUDevice, info: GPUDeviceLostInfo): void {
+        if (device !== this.device) return;           // a previous device, already replaced
+        const forced = this.forcingLoss;
+        this.forcingLoss = false;
+
+        recordGpuError("deviceLost", "device", `reason=${info.reason} ${info.message}`);
+        Logger.error(LogCategory.SYSTEM,
+            `[WEBGPU] Device LOST! reason=${info.reason} forced=${forced} message="${info.message}"`);
+
+        this.dropDeviceResources();
+        gpuDeviceLifecycle.notifyLost(forced ? "forced" : info.reason, info.message);
+        void this.recreateDevice();
+    }
+
+    /**
+     * Ask for a replacement device and republish it. Single-flight: a second loss while a
+     * recreation is in flight joins the one already running rather than racing it.
+     */
+    private recreateDevice(): Promise<boolean> {
+        if (this.recreating) return this.recreating;
+        this.recreating = (async () => {
+            for (let attempt = 0; attempt < RECREATE_BACKOFF_MS.length; attempt++) {
+                const wait = RECREATE_BACKOFF_MS[attempt]!;
+                if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+                try {
+                    const device = await this.requestDevice();
+                    await this.adoptDevice(device);
+                    // The canvas configuration belongs to the OLD device; a swap chain is not
+                    // transferable, so it has to be configured again before getCurrentTexture.
+                    this.configureContext();
+                    this.createDeviceResources();
+                    gpuDeviceLifecycle.notifyRecreated(device);
+                    return true;
+                } catch (err) {
+                    gpuDeviceLifecycle.countFailedAttempt();
+                    Logger.warn(LogCategory.SYSTEM,
+                        `[WEBGPU] device recreation attempt ${attempt + 1}/${RECREATE_BACKOFF_MS.length} failed: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }
+            gpuDeviceLifecycle.notifyUnavailable(
+                `requestDevice failed ${RECREATE_BACKOFF_MS.length}x — the adapter is gone`);
+            return false;
+        })().finally(() => { this.recreating = null; });
+        return this.recreating;
+    }
+
+    /**
+     * Lose the device on purpose (harness `gpuLoseDevice`). destroy() resolves `lost` with
+     * reason "destroyed" and everything downstream is the code path a real loss takes; the flag
+     * only lets the census label the loss as ours instead of the driver's.
+     */
+    async forceDeviceLoss(): Promise<boolean> {
+        const device = this.device;
+        if (!device) return false;
+        this.forcingLoss = true;
+        device.destroy();
+        // `lost` resolves a task later, so the caller has to wait for it or it observes the
+        // state from BEFORE the loss and reads a successful destroy as "nothing happened".
+        // handleDeviceLost is registered on this same promise first, so it has already run
+        // (synchronously, through the invalidation fan-out) when this await resumes.
+        await device.lost;
+        return await this.whenDeviceReady();
+    }
+
+    /** True while a device exists. Every GPU path's one question. */
+    isDeviceUsable(): boolean {
+        return this.device !== null && gpuDeviceLifecycle.isUsable();
+    }
+
+    /** Resolves once the in-flight recreation settles; true when a device is live. */
+    async whenDeviceReady(): Promise<boolean> {
+        if (this.recreating) return await this.recreating;
+        return this.device !== null;
     }
 
     /**
@@ -112,7 +318,10 @@ export class WebGPUBackend implements RenderBackend {
             device: this.device,
             format: this.format,
             alphaMode: "opaque",
-            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+            // COPY_SRC so the presented frame can be mirrored into a readable texture:
+            // once presented, the canvas image belongs to the compositor and is no longer
+            // reliably readable (see mirrorPresentedFrame).
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
         });
         // Invalidate bind group caches — old texture views are now stale
         this.bindGroupCache = new WeakMap();
@@ -130,6 +339,93 @@ export class WebGPUBackend implements RenderBackend {
 
     getContext(): GPUCanvasContext | null {
         return this.context;
+    }
+
+    getScreenCanvas(): OffscreenCanvas | null {
+        return (this.context?.canvas as OffscreenCanvas | undefined) ?? null;
+    }
+
+    /**
+     * Copy the frame just submitted to the canvas into a mirror texture we own.
+     *
+     * A presented WebGPU canvas is NOT reliably readable: once the compositor takes the
+     * swap image, createImageBitmap() yields a 0x0 bitmap and convertToBlob() throws
+     * "Readback of the source image has failed" — measured on a static GDI screen and on
+     * every paused frame. This copy, encoded while the texture is still the current one,
+     * is the only exact record of what the user saw. Called from RenderService.notifyPresent
+     * (every present path funnels through it) and only while a screenshot consumer has
+     * armed it, so a normal run pays nothing.
+     */
+    mirrorPresentedFrame(): boolean {
+        // Returns whether a copy actually happened. The caller stamps the mirror's serial from
+        // this: stamping unconditionally makes a stale mirror claim to be the current frame,
+        // and `shot()` then hands back the previous frame labelled as the latest.
+        const device = this.device, queue = this.queue, ctx = this.context, format = this.format;
+        if (!device || !queue || !ctx || !format) return false;
+        let tex: GPUTexture;
+        try {
+            tex = ctx.getCurrentTexture();
+        } catch {
+            return false; // canvas unconfigured this frame
+        }
+        if (!tex.width || !tex.height) return false;
+        if (!this.screenMirror || this.screenMirror.width !== tex.width || this.screenMirror.height !== tex.height) {
+            this.screenMirror?.destroy();
+            this.screenMirror = device.createTexture({
+                size: { width: tex.width, height: tex.height, depthOrArrayLayers: 1 },
+                format,
+                usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+        }
+        const encoder = device.createCommandEncoder();
+        encoder.copyTextureToTexture(
+            { texture: tex }, { texture: this.screenMirror },
+            { width: tex.width, height: tex.height, depthOrArrayLayers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        return true;
+    }
+
+    /** PNG of the mirrored frame (see mirrorPresentedFrame); null until one was mirrored. */
+    async captureMirroredFrame(): Promise<Blob | null> {
+        const device = this.device, queue = this.queue, mirror = this.screenMirror;
+        if (!device || !queue || !mirror) return null;
+        const width = mirror.width, height = mirror.height;
+        const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+        const readback = device.createBuffer({
+            size: bytesPerRow * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer(
+                { texture: mirror }, { buffer: readback, bytesPerRow },
+                { width, height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await queue.onSubmittedWorkDone();
+            await readback.mapAsync(GPUMapMode.READ);
+            const mapped = new Uint8Array(readback.getMappedRange());
+            const pixels = new Uint8ClampedArray(width * height * 4);
+            const swapRB = this.format === "bgra8unorm";
+            for (let y = 0; y < height; y++) {
+                let s = y * bytesPerRow, d = y * width * 4;
+                for (let x = 0; x < width; x++, s += 4, d += 4) {
+                    pixels[d] = mapped[s + (swapRB ? 2 : 0)]!;
+                    pixels[d + 1] = mapped[s + 1]!;
+                    pixels[d + 2] = mapped[s + (swapRB ? 0 : 2)]!;
+                    pixels[d + 3] = 255; // the canvas is alphaMode:"opaque"
+                }
+            }
+            readback.unmap();
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx2d = canvas.getContext("2d");
+            if (!ctx2d) return null;
+            ctx2d.putImageData(new ImageData(pixels, width, height), 0, 0);
+            return await canvas.convertToBlob({ type: "image/png" });
+        } finally {
+            readback.destroy();
+        }
     }
 
     getFormat(): GPUTextureFormat | null {
@@ -217,101 +513,13 @@ export class WebGPUBackend implements RenderBackend {
     }
 
     /**
-     * Composite an overlay canvas into a specific pixel rect on screen.
-     * Converts pixel coordinates to NDC and renders a positioned quad.
-     */
-    compositeRect(
-        overlay: OffscreenCanvas,
-        dstX: number, dstY: number,
-        dstW: number, dstH: number,
-        screenW: number, screenH: number,
-        clearScreen: boolean = false,
-    ): void {
-        if (!this.device || !this.context || !this.queue || screenW <= 0 || screenH <= 0) return;
-
-        // Upload overlay to texture
-        this.updateOverlayTexture(overlay);
-        if (!this.overlayTextureView) return;
-
-        // Ensure pipeline exists
-        if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {
-            this.createOverlayPipeline();
-            this.overlayPipelineFormat = this.format;
-            this.overlayBindGroup = null;
-        }
-
-        // Pixel rect → NDC
-        // NDC: x=-1 left, x=+1 right, y=-1 bottom, y=+1 top
-        // Pixel origin: top-left (0,0)
-        const x0 = (dstX / screenW) * 2 - 1;
-        const x1 = ((dstX + dstW) / screenW) * 2 - 1;
-        const y1 = 1 - (dstY / screenH) * 2;           // top edge
-        const y0 = 1 - ((dstY + dstH) / screenH) * 2;  // bottom edge
-
-        const vertices = new Float32Array([
-            x0, y0, 0, 1,   // bottom-left
-            x1, y0, 1, 1,   // bottom-right
-            x1, y1, 1, 0,   // top-right
-            x0, y0, 0, 1,   // bottom-left
-            x1, y1, 1, 0,   // top-right
-            x0, y1, 0, 0,   // top-left
-        ]);
-
-        if (!this.rectVertexBuffer) {
-            this.rectVertexBuffer = this.device.createBuffer({
-                size: vertices.byteLength,
-                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-            });
-        }
-        this.queue.writeBuffer(this.rectVertexBuffer, 0, vertices);
-
-        const encoder = this.device.createCommandEncoder();
-        const targetView = this.context.getCurrentTexture().createView();
-
-        if (clearScreen) {
-            const clearPass = encoder.beginRenderPass({
-                colorAttachments: [{
-                    view: targetView,
-                    clearValue: desktopBackground.getClearColor(),
-                    loadOp: "clear",
-                    storeOp: "store",
-                }],
-            });
-            clearPass.end();
-        }
-
-        if (!this.overlayBindGroup) {
-            this.overlayBindGroup = this.device.createBindGroup({
-                layout: this.overlayPipeline!.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: this.getSampler() },
-                    { binding: 1, resource: this.overlayTextureView },
-                ],
-            });
-        }
-
-        const renderPass = encoder.beginRenderPass({
-            colorAttachments: [{
-                view: targetView,
-                loadOp: "load",
-                storeOp: "store",
-            }],
-        });
-
-        renderPass.setPipeline(this.overlayPipeline!);
-        renderPass.setBindGroup(0, this.overlayBindGroup);
-        renderPass.setVertexBuffer(0, this.rectVertexBuffer);
-        renderPass.draw(6, 1, 0, 0);
-        renderPass.end();
-
-        this.queue.submit([encoder.finish()]);
-    }
-
-    /**
-     * Composite specific sub-rects of an overlay canvas onto a target, 1:1 in
-     * overlay pixel space (src rect == dst rect). Used for live native dialogs
-     * over a DDraw flip chain: only the dialog windows' rects are composited so
+     * Composite specific sub-rects of an overlay canvas onto a target. Used for live native
+     * dialogs over a DDraw flip chain: only the dialog windows' rects are composited so
      * stale GDI overlay content elsewhere never bleeds over the game frame.
+     *
+     * The rects arrive in GUEST window coordinates, which is also the overlay plane's own
+     * space — the DESTINATION is the content rect the frame was presented into, so a rect
+     * lands over the pixels it was drawn for whatever the host canvas size is.
      *
      * Appends to an existing encoder (presenter frame path).
      */
@@ -326,6 +534,12 @@ export class WebGPUBackend implements RenderBackend {
         const screenW = overlay.width;
         const screenH = overlay.height;
         if (screenW <= 0 || screenH <= 0) return;
+
+        const { width: outW, height: outH } = this.getCanvasSize();
+        if (outW <= 0 || outH <= 0) return;
+        const dest = overlayDestRect(outW, outH);
+        const sx = dest.w / screenW;
+        const sy = dest.h / screenH;
 
         this.updateOverlayTexture(overlay);
         if (!this.overlayTextureView) return;
@@ -346,10 +560,10 @@ export class WebGPUBackend implements RenderBackend {
             const y2 = Math.max(y, Math.min(r.y + r.h, screenH));
             if (x2 - x <= 0 || y2 - y <= 0) continue;
 
-            const nx0 = (x / screenW) * 2 - 1;
-            const nx1 = (x2 / screenW) * 2 - 1;
-            const ny1 = 1 - (y / screenH) * 2;   // top edge
-            const ny0 = 1 - (y2 / screenH) * 2;  // bottom edge
+            const nx0 = ((dest.x + x * sx) / outW) * 2 - 1;
+            const nx1 = ((dest.x + x2 * sx) / outW) * 2 - 1;
+            const ny1 = 1 - ((dest.y + y * sy) / outH) * 2;   // top edge
+            const ny0 = 1 - ((dest.y + y2 * sy) / outH) * 2;  // bottom edge
             const u0 = x / screenW;
             const u1 = x2 / screenW;
             const v0 = y / screenH;   // top
@@ -451,13 +665,41 @@ export class WebGPUBackend implements RenderBackend {
     }
 
     /**
+     * Publish where a `srcW x srcH` guest picture lands on the canvas. GDI-only titles never
+     * run a 3D present, so the window plane is the only thing that knows the guest size —
+     * every other backend publishes from PostFxChain.present.
+     */
+    publishGuestPresentRect(srcW: number, srcH: number): void {
+        const { width, height } = this.getCanvasSize();
+        if (width <= 0 || height <= 0) return;
+        publishComputedPresentRect(srcW, srcH, width, height, EmulatorConfig.getInstance().quality);
+    }
+
+    /** Backing-buffer size of the canvas this backend presents to. Callers must not retain
+     *  the object: it is one reused record (read several times per frame). */
+    getCanvasSize(): { width: number; height: number } {
+        const canvas = this.context?.canvas as OffscreenCanvas | undefined;
+        this.canvasSize.width = canvas?.width ?? 0;
+        this.canvasSize.height = canvas?.height ?? 0;
+        return this.canvasSize;
+    }
+
+    /**
      * Render the overlay texture onto a target.
      * Should be called after updateOverlayTexture in the same frame.
+     *
+     * The overlay planes (GDI/window output, the video plane) are GUEST-space images, so they
+     * are placed in the same content rect the presented frame went to — not stretched over the
+     * whole host canvas, which is sized from the host container and is a different space.
      */
     renderOverlay(target: GPUTextureView, encoder: GPUCommandEncoder): void {
         if (!this.device || !this.overlayTextureView) {
             return;
         }
+
+        const { width: outW, height: outH } = this.getCanvasSize();
+        const dest = overlayDestRect(outW, outH);
+        const full = coversTarget(dest, outW, outH);
 
         // Ensure pipeline exists (recreate if format changed)
         if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {
@@ -487,9 +729,40 @@ export class WebGPUBackend implements RenderBackend {
             });
         }
         renderPass.setBindGroup(0, this.overlayBindGroup);
-        renderPass.setVertexBuffer(0, this.getVertexBuffer());
+        renderPass.setVertexBuffer(0, full ? this.getVertexBuffer() : this.getOverlayDestVertexBuffer(dest, outW, outH));
         renderPass.draw(6, 1, 0, 0);
         renderPass.end();
+    }
+
+    /** A full-quad-UV quad positioned at `dest` (pixels) inside a `outW x outH` target. */
+    private getOverlayDestVertexBuffer(
+        dest: { x: number; y: number; w: number; h: number }, outW: number, outH: number,
+    ): GPUBuffer {
+        const x0 = (dest.x / outW) * 2 - 1;
+        const x1 = ((dest.x + dest.w) / outW) * 2 - 1;
+        const y1 = 1 - (dest.y / outH) * 2;
+        const y0 = 1 - ((dest.y + dest.h) / outH) * 2;
+        const c = this.overlayDestVertexRect;
+        if (this.overlayDestVertexBuffer && c.x === dest.x && c.y === dest.y &&
+            c.w === dest.w && c.h === dest.h && c.outW === outW && c.outH === outH) {
+            return this.overlayDestVertexBuffer;
+        }
+        const verts = OVERLAY_DEST_SCRATCH;
+        verts[0] = x0; verts[1] = y0; verts[2] = 0; verts[3] = 1;
+        verts[4] = x1; verts[5] = y0; verts[6] = 1; verts[7] = 1;
+        verts[8] = x1; verts[9] = y1; verts[10] = 1; verts[11] = 0;
+        verts[12] = x0; verts[13] = y0; verts[14] = 0; verts[15] = 1;
+        verts[16] = x1; verts[17] = y1; verts[18] = 1; verts[19] = 0;
+        verts[20] = x0; verts[21] = y1; verts[22] = 0; verts[23] = 0;
+        if (!this.overlayDestVertexBuffer) {
+            this.overlayDestVertexBuffer = this.device!.createBuffer({
+                size: verts.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+        }
+        this.queue!.writeBuffer(this.overlayDestVertexBuffer, 0, verts);
+        this.overlayDestVertexRect = { x: dest.x, y: dest.y, w: dest.w, h: dest.h, outW, outH };
+        return this.overlayDestVertexBuffer;
     }
 
     /**
@@ -514,7 +787,7 @@ export class WebGPUBackend implements RenderBackend {
         viewportHeight?: number,
         clearColor?: GPUColor,
         useNearestFilter?: boolean,
-        present?: { srcW?: number; srcH?: number; outW?: number; outH?: number }
+        present?: { srcW?: number; srcH?: number; outW?: number; outH?: number; toCanvas?: boolean }
     ): void {
         if (!this.device || !this.format) return;
         Logger.verbose(LogCategory.SYSTEM, `WebGPUBackend: drawTexture opaque=${opaque}`);
@@ -526,6 +799,20 @@ export class WebGPUBackend implements RenderBackend {
         // a single passthrough pass, byte-identical to the legacy present. This is the one
         // present path shared by EVERY backend's "blit final frame" (ddraw/d3d8/opengl/glide).
         if (opaque && this.postFx) {
+            // Only THE CANVAS PRESENT defines where the guest picture landed. drawTexture(opaque)
+            // is also an off-canvas blit (readback capture, Glide's LFB upscale into its own
+            // offscreen), and publishing from those made the rect alternate between two spaces.
+            // Opt-in, and cross-checked against the canvas: a flag on a target that is not the
+            // canvas publishes nothing, which degrades to the full-canvas fallback.
+            if (present?.toCanvas) {
+                const canvas = this.getCanvasSize();
+                if (present.outW === canvas.width && present.outH === canvas.height) {
+                    publishComputedPresentRect(
+                        present.srcW ?? 0, present.srcH ?? 0, canvas.width, canvas.height,
+                        EmulatorConfig.getInstance().quality,
+                    );
+                }
+            }
             this.postFx.present(textureView, target, encoder, {
                 clearColor,
                 nearest: useNearestFilter,
@@ -616,12 +903,9 @@ export class WebGPUBackend implements RenderBackend {
     /**
      * Render the stats overlay at the top-right corner of the target.
      */
-    renderStatsOverlay(
-        target: GPUTextureView,
-        encoder: GPUCommandEncoder,
-        canvasWidth: number,
-        canvasHeight: number
-    ): void {
+    renderStatsOverlay(target: GPUTextureView, encoder: GPUCommandEncoder): void {
+        // Sized in HOST pixels: it is a debug HUD, not part of the guest picture.
+        const { width: canvasWidth, height: canvasHeight } = this.getCanvasSize();
         if (!this.device || !this.statsTextureView || !canvasWidth || !canvasHeight) return;
 
         if (!this.overlayPipeline || this.overlayPipelineFormat !== this.format) {

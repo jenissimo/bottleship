@@ -10,11 +10,36 @@ import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { WindowInfo, windows, buttonCheckStates, getOrCreateListState, getOrCreateTrackbarState, controlImageHandles } from './shared-state';
 import { handleAnimateMessage } from './animate-control';
-import { paintSystemControl, clampListTopIndex } from './controls';
-import { repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
+import { handleEditMessage, isEditContentMessage, isEditControl, setEditControlText } from './edit-control';
+import {
+    handleRichEditMessage,
+    isRichEditContentMessage,
+    isRichEditControl,
+    setRichEditContent,
+} from './rich-edit-control';
+import {
+    handleListViewMessage,
+    isListViewContentMessage,
+    isListViewControl,
+} from './list-view-control';
+import {
+    handleTabMessage,
+    isTabContentMessage,
+    isTabControl,
+} from './tab-control';
+import { setScrollPos, getScrollPos, setScrollRange, getScrollRange, applyScrollInfo, readScrollInfo } from './scroll-state';
+import {
+    paintSystemControl,
+    clampListTopIndexOf,
+    listVisibleCountOf,
+    applyComboBoxClosedHeight,
+    comboDropTopIndex,
+    comboBoxItemHeight,
+} from './controls';
+import { eraseControlOverlayRect, repaintDialogAfterContentChange, restampOwnedPopupsAbove } from './dialog-paint';
 import { closeOpenComboboxes } from './control-interaction';
 import { getBitmapObjectDimensions, getIconObjectDimensions } from '../gdi32/bitmap-resolve';
-import { encodeAnsi } from '../codepage-utils';
+import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
 
 const SS_TYPEMASK = 0x001F;
 const SS_BITMAP = 0x000E;
@@ -33,6 +58,48 @@ const BS_AUTORADIOBUTTON = 0x0009;
 const WS_DISABLED = 0x08000000;
 
 const WM_PAINT = 0x000F;
+
+/** Return whether a control message changes what `child` shows (the caller then
+ *  erases and restamps the control set, so a false positive costs a full repaint of
+ *  the dialog on the message-pump hot path). */
+export function isContentChangingMessage(child: WindowInfo, msg: number): boolean {
+    const WM_SETTEXT = 0x000C;
+    const CB_ADDSTRING = 0x0143;
+    const CB_DELETESTRING = 0x0144;
+    const CB_INSERTSTRING = 0x014A;
+    const CB_RESETCONTENT = 0x014B;
+    const CB_SETCURSEL = 0x014E;
+    const CB_SHOWDROPDOWN = 0x014F;
+    const LB_ADDSTRING = 0x0180;
+    const LB_INSERTSTRING = 0x0181;
+    const LB_DELETESTRING = 0x0182;
+    const LB_RESETCONTENT = 0x0184;
+    const LB_SETCURSEL = 0x0186;
+    const LB_SELECTSTRING = 0x018C;
+    const LB_SETTOPINDEX = 0x0197;
+    const BM_SETCHECK = 0x00F1;
+    const BM_SETIMAGE = 0x00F7;
+    const STM_SETIMAGE = 0x0172;
+    const TBM_SETPOS = 0x0405;
+    const TBM_SETRANGE = 0x0406;
+    const TBM_SETRANGEMAX = 0x0408;
+
+    const TBM_SETTICFREQ = 0x0414;
+
+    return msg === WM_SETTEXT || msg === BM_SETCHECK || msg === STM_SETIMAGE || msg === BM_SETIMAGE
+        || msg === TBM_SETTICFREQ
+        || msg === LB_SELECTSTRING
+        || msg === LB_SETTOPINDEX
+        || msg === CB_SHOWDROPDOWN
+        || (msg >= CB_ADDSTRING && msg <= CB_SETCURSEL)
+        || (msg >= LB_ADDSTRING && msg <= LB_SETCURSEL)
+        || (msg >= TBM_SETPOS && msg <= TBM_SETRANGEMAX)
+        || (msg >= 0x0401 && msg <= 0x0406)
+        || (isEditControl(child) && isEditContentMessage(msg))
+        || (isRichEditControl(child) && (isEditContentMessage(msg) || isRichEditContentMessage(msg)))
+        || (isListViewControl(child) && isListViewContentMessage(msg))
+        || (isTabControl(child) && isTabContentMessage(msg));
+}
 
 /**
  * Win32 SS_BITMAP / SS_ICON: a static with an image resizes itself to the image's
@@ -69,42 +136,82 @@ export function applyStaticSetImageAutoSize(child: WindowInfo, imageType: number
 }
 
 /**
+ * WM_SETTEXT with the string already decoded by the caller. SetWindowText and
+ * SetDlgItemText ARE SendMessage(WM_SETTEXT) on Win32, so they must land in the
+ * control class's handler — on an EDIT, assigning the title instead silently drops
+ * EN_UPDATE/EN_CHANGE, the case styles, the caret reset and the modify flag.
+ */
+export function applyControlSetText(win: WindowInfo, text: string): void {
+    if (!win.isSystemControl) { win.title = text; return; }
+    // Plain text replaces a Rich Edit's streamed runs — setRichEditContent drops them
+    // and then goes through the same EDIT path.
+    if (isRichEditControl(win)) setRichEditContent(win, text, []);
+    else if (isEditControl(win)) setEditControlText(win, text);
+    else win.title = text;
+}
+
+/**
+ * DefWindowProc's WM_SETTEXT: store the caption and repair the pixels it changes.
+ * The class procedure is the ONLY thing that stores a window's text on Win32 — the
+ * API entry points just send the message — so every path that reaches the default
+ * handling (DefWindowProc, and the entry points when no guest procedure owns the
+ * window) must land here and nowhere else.
+ *
+ * The erase drops the control's OLD pixels: on a guest-painted parent the repaint
+ * below can only STAMP the control, not restore what was under it, so without this a
+ * changed caption renders on top of the previous one and both stay readable.
+ */
+export function applyDefaultSetText(win: WindowInfo, text: string): void {
+    const changed = win.title !== text;
+    if (changed) eraseControlOverlayRect(win);
+    applyControlSetText(win, text);
+    if (!win.parent) System.getInstance().notifyWindowTitle(text, 'WM_SETTEXT', win.visible);
+    else if (changed) repaintDialogAfterContentChange(win.parent);
+}
+
+/**
  * Handle a message sent to a system control (Button, Static, Edit, etc.).
  * Returns the LRESULT.
  */
 export function handleSystemControlMessage(
     child: WindowInfo, msg: number, wParam: number, lParam: number, mem: Uint8Array,
+    /** Text width of the A/W entry the message came through, when known — see handleEditMessage. */
+    textWidth?: 'ansi' | 'wide',
 ): number {
     const anim = handleAnimateMessage(child.handle, msg, wParam, lParam, mem);
     if (anim !== null) return anim;
 
-    const readAnsiOrWideString = (ptr: number): string => {
-        if (!ptr) return '';
-        const maxProbeChars = 16;
-        let probed = 0;
-        let zeroHighBytes = 0;
+    // Rich Edit is a superset of EDIT and falls through to it internally.
+    if (isRichEditControl(child)) {
+        const richResult = handleRichEditMessage(child, msg, wParam, lParam, mem, textWidth);
+        if (richResult !== null) return richResult;
+    }
 
-        for (let i = 0; i < maxProbeChars; i++) {
-            const loIdx = ptr + i * 2;
-            const hiIdx = loIdx + 1;
-            if (hiIdx >= mem.length) break;
-            const lo = mem[loIdx];
-            const hi = mem[hiIdx];
-            if (lo === 0 && hi === 0) break;
-            probed++;
-            if (hi === 0) zeroHighBytes++;
-        }
+    // EDIT owns EM_* plus text-editing WM_SETTEXT/WM_CHAR/WM_KEYDOWN semantics.
+    if (isEditControl(child)) {
+        const editResult = handleEditMessage(child, msg, wParam, lParam, mem, textWidth);
+        if (editResult !== null) return editResult;
+    }
 
-        const looksWide = probed > 0 && (zeroHighBytes / probed) >= 0.75;
-        return looksWide
-            ? Marshaler.readWideString(mem, ptr)
-            : Marshaler.readString(mem, ptr);
-    };
+    // SysListView32 owns LVM_* (0x1000+); must run before the WM_USER trackbar gate.
+    if (isListViewControl(child)) {
+        const lvResult = handleListViewMessage(child, msg, wParam, lParam, mem);
+        if (lvResult !== null) return lvResult;
+    }
+
+    // SysTabControl32 owns TCM_* (0x1300+); same gate reasoning as the listview.
+    if (isTabControl(child)) {
+        const tabResult = handleTabMessage(child, msg, wParam, lParam, mem);
+        if (tabResult !== null) return tabResult;
+    }
+
+    const readAnsiOrWideString = (ptr: number): string => readAnsiOrWideFromGuest(mem, ptr, textWidth);
 
     const WM_SETTEXT = 0x000C;
     const WM_GETTEXT = 0x000D;
     const WM_GETTEXTLENGTH = 0x000E;
     const WM_ENABLE = 0x000A;
+    const WM_SIZE = 0x0005;
     const WM_SHOWWINDOW = 0x0018;
     const WM_SETFONT = 0x0030;
     const WM_GETFONT = 0x0031;
@@ -143,6 +250,8 @@ export function handleSystemControlMessage(
         const CB_SHOWDROPDOWN   = 0x014F;
         const CB_GETITEMDATA    = 0x0150;
     const CB_SETITEMDATA    = 0x0151;
+    const CB_SETITEMHEIGHT  = 0x0153;
+    const CB_GETITEMHEIGHT  = 0x0154;
     const CB_FINDSTRINGEXACT = 0x0158;
 
     // Listbox messages
@@ -158,8 +267,11 @@ export function handleSystemControlMessage(
     const LB_SETCURSEL      = 0x0186;
     const LB_GETITEMDATA    = 0x0199;
     const LB_SETITEMDATA    = 0x019A;
+    const LB_SETCARETINDEX  = 0x019E;
+    const LB_GETCARETINDEX  = 0x019F;
 
     const CB_ERR = -1 >>> 0; // 0xFFFFFFFF
+    const LB_ERR = CB_ERR;
 
     const controlDlgCode = (): number => {
         const cls = (child.systemControlClass ?? '').toLowerCase();
@@ -179,7 +291,7 @@ export function handleSystemControlMessage(
                     return DLGC_BUTTON;
             }
         }
-        if (cls === 'edit') return DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_HASSETSEL;
+        if (cls === 'edit' || cls === 'richedit') return DLGC_WANTCHARS | DLGC_WANTARROWS | DLGC_HASSETSEL;
         if (cls === 'static') return DLGC_STATIC;
         return 0;
     };
@@ -210,15 +322,33 @@ export function handleSystemControlMessage(
         if (cls === 'msctls_progress32') return handleProgressMessage(child, msg, wParam, lParam);
     }
 
+    // SBM_* (0x00E0..0x00EA) on a ScrollBar-class control (SB_CTL protocol).
+    if (msg >= 0x00E0 && msg <= 0x00EA
+        && (child.systemControlClass ?? '').trim().toLowerCase() === 'scrollbar') {
+        return handleScrollBarControlMessage(child, msg, wParam, lParam, mem);
+    }
+
     const LB_GETTOPINDEX = 0x018E;
     const LB_SETTOPINDEX = 0x0197;
 
     switch (msg) {
         case WM_GETDLGCODE:
             return controlDlgCode();
-        case WM_SETFONT:
+        case WM_SETFONT: {
             child.fontHandle = wParam >>> 0;
-            if (lParam && child.parent) repaintDialogAfterContentChange(child.parent);
+            // The selection field is text-sized, so a font change re-sizes the window
+            // (Wine combo.c COMBO_Font → CBCalcPlacement + SetWindowPos).
+            const resized = applyComboBoxClosedHeight(child);
+            if ((lParam || resized) && child.parent) repaintDialogAfterContentChange(child.parent);
+            return 0;
+        }
+        case WM_SIZE:
+            // A combobox answers every size change by shrinking itself back to the
+            // closed height — that is where the app's "height includes the list"
+            // argument is discarded (Wine combo.c COMBO_Size).
+            if (applyComboBoxClosedHeight(child) && child.parent) {
+                repaintDialogAfterContentChange(child.parent);
+            }
             return 0;
         case WM_GETFONT: {
             const parent = child.parent !== undefined ? windows.get(child.parent) : undefined;
@@ -230,6 +360,9 @@ export function handleSystemControlMessage(
                 const wmWin = System.getInstance().windowManager.getWindow(child.handle);
                 if (wmWin) wmWin.visible = child.visible;
             }
+            // The show is a SetWindowPos, so a combobox sizes itself here too — a control
+            // created hidden gets no WM_SIZE until then.
+            applyComboBoxClosedHeight(child);
             if (child.parent) repaintDialogAfterContentChange(child.parent);
             return 0;
         case WM_PRINTCLIENT:
@@ -274,8 +407,32 @@ export function handleSystemControlMessage(
         case LB_SETTOPINDEX: {
             const state = getOrCreateListState(child.handle);
             state.topIndex = wParam | 0;
-            clampListTopIndex(state, child.height);
+            clampListTopIndexOf(state, child);
             return 0;
+        }
+        case LB_GETCARETINDEX:
+            return getOrCreateListState(child.handle).caretIndex;
+        case LB_SETCARETINDEX: {
+            const state = getOrCreateListState(child.handle);
+            const idx = wParam | 0;
+            const LBS_MULTIPLESEL = 0x0008;
+            const LBS_EXTENDEDSEL = 0x0800;
+            const multiSelect = (child.style & (LBS_MULTIPLESEL | LBS_EXTENDEDSEL)) !== 0;
+
+            // NT5 lb1.c / Wine listbox.c: reject an invalid caret. A single-select list
+            // that ALREADY has a selection rejects this message too — there the caret is
+            // the selection, and LB_SETCURSEL has moved iSelBase with it.
+            if (idx < 0 || idx >= state.items.length || (!multiSelect && state.selectedIndex !== -1)) {
+                return LB_ERR;
+            }
+            state.caretIndex = idx;
+            if (!lParam) {
+                const visible = listVisibleCountOf(child);
+                if (idx < state.topIndex) state.topIndex = idx;
+                else if (idx >= state.topIndex + visible) state.topIndex = idx - visible + 1;
+                clampListTopIndexOf(state, child);
+            }
+            return 0; // LB_OKAY
         }
         case WM_SETTEXT:
             if (lParam) {
@@ -330,6 +487,19 @@ export function handleSystemControlMessage(
             return controlImageHandles.get(child.handle) ?? 0;
 
         // --- Combobox messages ---
+        case CB_SETITEMHEIGHT: {
+            // wParam -1 addresses the selection field, any other index the list rows;
+            // we keep one height for both, as the classic non-owner-draw combo does.
+            const h = lParam & 0xFFFF;
+            if (h <= 0) return CB_ERR;
+            getOrCreateListState(child.handle).itemHeight = h;
+            if (applyComboBoxClosedHeight(child) && child.parent) {
+                repaintDialogAfterContentChange(child.parent);
+            }
+            return 0;
+        }
+        case CB_GETITEMHEIGHT:
+            return comboBoxItemHeight(child);
         case CB_ADDSTRING:
         case LB_ADDSTRING: {
             const state = getOrCreateListState(child.handle);
@@ -348,6 +518,7 @@ export function handleSystemControlMessage(
             let index = wParam | 0;
             if (index < 0 || index > state.items.length) index = state.items.length;
             state.items.splice(index, 0, { text, data: 0 });
+            if (state.items.length > 1 && index <= state.caretIndex) state.caretIndex++;
             Logger.log(LogCategory.USER32,
                 `handleSysCtrlMsg ${msg === CB_INSERTSTRING ? 'CB_INSERTSTRING' : 'LB_INSERTSTRING'}: ` +
                 `hwnd=0x${child.handle.toString(16)} id=${child.controlId ?? '?'} index=${index} text="${text}"`);
@@ -361,6 +532,9 @@ export function handleSystemControlMessage(
             state.items.splice(idx, 1);
             if (state.selectedIndex === idx) state.selectedIndex = -1;
             else if (state.selectedIndex > idx) state.selectedIndex--;
+            if (state.items.length === 0) state.caretIndex = 0;
+            else if (state.caretIndex > idx) state.caretIndex--;
+            else if (state.caretIndex >= state.items.length) state.caretIndex = state.items.length - 1;
             return state.items.length;
         }
         case CB_RESETCONTENT:
@@ -368,6 +542,8 @@ export function handleSystemControlMessage(
             const state = getOrCreateListState(child.handle);
             state.items.length = 0;
             state.selectedIndex = -1;
+            state.caretIndex = 0;
+            state.topIndex = 0;
             return 0;
         }
         case CB_GETCOUNT:
@@ -392,6 +568,7 @@ export function handleSystemControlMessage(
                 return CB_ERR;
             }
             state.selectedIndex = idx;
+            state.caretIndex = idx;
             // A combobox's WM_GETTEXT/GetDlgItemText reads child.title, not the list
             // state — without this, a CB_SETCURSEL'd combo shows the right item visually
             // but GetDlgItemText returns "" (e.g. TLJ's Player-Name combo: renders
@@ -412,10 +589,7 @@ export function handleSystemControlMessage(
                 const host = child.parent ?? child.handle;
                 closeOpenComboboxes(host, child.handle);
                 state.dropdownOpen = true;
-                const visibleCount = Math.max(1, Math.min(8, state.items.length));
-                const sel = state.selectedIndex < 0 ? 0 : state.selectedIndex;
-                const maxTop = Math.max(0, state.items.length - visibleCount);
-                state.topIndex = Math.max(0, Math.min(sel - visibleCount + 1, maxTop));
+                state.topIndex = comboDropTopIndex(state.items.length, state.selectedIndex);
             } else if (state.dropdownOpen) {
                 state.dropdownOpen = false;
             }
@@ -479,6 +653,7 @@ export function handleSystemControlMessage(
                 return CB_ERR;
             }
             state.selectedIndex = idx;
+            state.caretIndex = idx;
             if ((child.systemControlClass ?? '').toLowerCase() === 'combobox') {
                 child.title = state.items[idx].text;
             }
@@ -561,6 +736,54 @@ function handleTrackbarMessage(child: WindowInfo, msg: number, wParam: number, l
         }
         case TBM_GETLINESIZE:
             return state.lineSize;
+        default:
+            return 0;
+    }
+}
+
+/** ScrollBar-class control SBM_* handler (state keyed as SB_CTL on the control's hwnd). */
+function handleScrollBarControlMessage(
+    child: WindowInfo, msg: number, wParam: number, lParam: number, mem: Uint8Array,
+): number {
+    const SB_CTL = 2;
+    const SBM_SETPOS = 0x00E0;
+    const SBM_GETPOS = 0x00E1;
+    const SBM_SETRANGE = 0x00E2;
+    const SBM_GETRANGE = 0x00E3;
+    const SBM_ENABLE_ARROWS = 0x00E4;
+    const SBM_SETRANGEREDRAW = 0x00E6;
+    const SBM_SETSCROLLINFO = 0x00E9;
+    const SBM_GETSCROLLINFO = 0x00EA;
+
+    const repaint = () => {
+        if (child.parent) repaintDialogAfterContentChange(child.parent);
+    };
+
+    switch (msg) {
+        case SBM_SETPOS: {
+            const prev = setScrollPos(child.handle, SB_CTL, wParam | 0);
+            if (lParam) repaint();
+            return prev;
+        }
+        case SBM_GETPOS:
+            return getScrollPos(child.handle, SB_CTL);
+        case SBM_SETRANGE:
+        case SBM_SETRANGEREDRAW:
+            setScrollRange(child.handle, SB_CTL, wParam | 0, lParam | 0);
+            if (msg === SBM_SETRANGEREDRAW) repaint();
+            return 0;
+        case SBM_GETRANGE:
+            getScrollRange(mem, child.handle, SB_CTL, wParam, lParam);
+            return 0;
+        case SBM_ENABLE_ARROWS:
+            return 1;
+        case SBM_SETSCROLLINFO: {
+            const prev = applyScrollInfo(mem, child.handle, SB_CTL, lParam);
+            if (wParam) repaint();
+            return prev;
+        }
+        case SBM_GETSCROLLINFO:
+            return readScrollInfo(mem, child.handle, SB_CTL, lParam) ? 1 : 0;
         default:
             return 0;
     }

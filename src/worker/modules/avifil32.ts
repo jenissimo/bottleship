@@ -33,6 +33,7 @@
  *    must match the values written into AVISTREAMINFOA (+20/+24).
  */
 
+import { toPlainGuestMemory } from "../core/memory/guest-memory";
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
@@ -120,7 +121,7 @@ export class Avifil32 implements IModule {
 
     private getMemory(): Uint8Array {
         const v86 = this.process.v86;
-        return v86["mem8"] || (v86["v86"] && v86["v86"]["cpu"]["mem8"]);
+        return toPlainGuestMemory(v86["mem8"] || (v86["v86"] && v86["v86"]["cpu"]["mem8"]));
     }
 
     private normalizeVfsPath(filePath: string): string {
@@ -198,6 +199,31 @@ export class Avifil32 implements IModule {
     }
 
     /** Create a stream session that owns its VideoEngine handle. */
+    /**
+     * Tell the router a frame was produced. AVIStreamRead/GetFrame hand the DIB to the GUEST,
+     * which blits it itself (its own StretchDIBits, at whatever rect it chose) — so the sink
+     * is app-managed and the plane must not rescue this session. Registering anyway is what
+     * makes the player visible to `state(["video"]).routing`: without it an AVI title looks
+     * to the router exactly like a decode that never happened.
+     */
+    private noteRoutedFrame(s: AviSession, bgra: Uint8Array): void {
+        System.getInstance().videoRouting.onFrameDecoded({
+            codec: "avi",
+            guestHandle: s.engineHandle,
+            frame: {
+                width: s.width,
+                height: s.height,
+                frameIndex: s.decodedFrame,
+                frameDurationMs: s.dwRate > 0 ? (1000 * s.dwScale) / s.dwRate : 66,
+                decodedAtMs: performance.now(),
+                bgra,
+            },
+            hasAppManagedSink: true,
+            playerOwnsPresentation: true,
+            targetHint: { kind: "app_buffer", valid: true, note: "avistream_dib" },
+        });
+    }
+
     private createOwnedStreamSession(
         engineHandle: number,
         width: number,
@@ -263,6 +289,7 @@ export class Avifil32 implements IModule {
                 file.refCount--;
             }
         } else {
+            System.getInstance().videoRouting.closeSession("avi", s.engineHandle);
             videoEngine.close(s.engineHandle);
         }
 
@@ -288,6 +315,7 @@ export class Avifil32 implements IModule {
         for (const streamHandle of file.streamHandles) {
             this.sessions.delete(streamHandle);
         }
+        System.getInstance().videoRouting.closeSession("avi", file.engineHandle);
         videoEngine.close(file.engineHandle);
         this.fileSessions.delete(handle);
         Logger.log(LogCategory.SYSTEM,
@@ -616,6 +644,7 @@ export class Avifil32 implements IModule {
 
                 const bgra = videoEngine.getFrameBgra(s.engineHandle);
                 if (bgra) {
+                    this.noteRoutedFrame(s, bgra);
                     const dstOff = lpBuffer + i * frameSize;
                     // Flip rows for bottom-up DIB (most games expect this via AVIStreamRead)
                     const rowBytes = s.width * 4;
@@ -691,6 +720,23 @@ export class Avifil32 implements IModule {
             return 0x8004406F; // AVIERR_READONLY
         };
 
+        // ── AVI authoring ────────────────────────────────────────────────────
+        // Every file this module hands out is opened for reading, so the whole write
+        // side answers AVIERR_READONLY — the same code real avifil32 returns for a
+        // write against a read-mode file, and the one a caller already handles.
+        const AVIERR_READONLY = 0x8004406F;
+        const AVIERR_NOCOMPRESSOR = 0x80044071;
+        for (const name of ["AVIFileCreateStreamA", "AVIFileCreateStreamW",
+                            "AVIStreamSetFormat", "AVIStreamWrite", "AVIFileWriteData"]) {
+            this.exports[name] = () => AVIERR_READONLY;
+        }
+        // No VCM compressor is installed (see msvfw32), so there is nothing to make a
+        // compressed stream with.
+        this.exports["AVIMakeCompressedStream"] = () => AVIERR_NOCOMPRESSOR;
+        // The compression-options dialog is cancelled, which leaves nothing to free.
+        this.exports["AVISaveOptions"] = () => 0;
+        this.exports["AVISaveOptionsFree"] = () => 0;
+
         // ── AVIStreamFindSample(pavi, lPos, lFlags) ──────────────────────────
         this.exports["AVIStreamFindSample"] = (_ctx, _mem, args) => {
             const handle = args[0];
@@ -742,6 +788,7 @@ export class Avifil32 implements IModule {
 
             const bgra = videoEngine.getFrameBgra(s.engineHandle);
             if (!bgra) return 0;
+            this.noteRoutedFrame(s, bgra);
 
             const shouldSample = s.diagSamples < 5 || (s.diagSamples < 20 && lPos % 30 === 0);
             if (shouldSample) {

@@ -1,0 +1,40 @@
+diff --git a/src/rust/jit_instructions.rs b/src/rust/jit_instructions.rs
+--- a/src/rust/jit_instructions.rs
++++ b/src/rust/jit_instructions.rs
+@@ -6498,9 +6498,25 @@
+ pub fn instr_660F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+-    sse_read128_xmm_mem(ctx, "instr_660F59", modrm_byte, r);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    let src = global_pointers::sse_scratch_register as u32;
++    // Read all 128 bits before modifying either destination lane.
++    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, src);
++    mulpd_inline_simd(ctx, src, global_pointers::get_reg_xmm_offset(r));
+ }
+ pub fn instr_660F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+-    sse_read128_xmm_xmm(ctx, "instr_660F59", r1, r2);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    mulpd_inline_simd(ctx, global_pointers::get_reg_xmm_offset(r1), global_pointers::get_reg_xmm_offset(r2));
+ }
++fn mulpd_inline_simd(ctx: &mut JitContext, src: u32, dst: u32) {
++    // Match the shipped helper's SIMD operation and destination/source order.
++    // Load both complete inputs before the store, including aliases.
++    ctx.builder.const_i32(dst as i32);
++    ctx.builder.const_i32(dst as i32);
++    ctx.builder.load_aligned_v128(0);
++    ctx.builder.const_i32(src as i32);
++    ctx.builder.load_aligned_v128(0);
++    ctx.builder.mul_f64x2();
++    ctx.builder.store_aligned_v128(0);
++}
+ pub fn instr_F20F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+     sse_read64_xmm_mem(ctx, "instr_F20F59", modrm_byte, r);
+ }
+diff --git a/src/rust/wasmgen/wasm_builder.rs b/src/rust/wasmgen/wasm_builder.rs
+--- a/src/rust/wasmgen/wasm_builder.rs
++++ b/src/rust/wasmgen/wasm_builder.rs
+@@ -1066,3 +1066,5 @@
+     pub fn andnot_v128(&mut self) { self.simd_op(op::SIMD_V128_ANDNOT); }
++    // Standard SIMD f64x2.mul: 0xfd followed by ULEB128(0xf2).
++    pub fn mul_f64x2(&mut self) { self.simd_op(0xf2); }
+     pub fn add_sat_s_i16x8(&mut self) { self.simd_op(op::SIMD_I16X8_ADD_SAT_S); }
+     pub fn mul_i16x8(&mut self) { self.simd_op(op::SIMD_I16X8_MUL); }

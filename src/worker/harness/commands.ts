@@ -11,21 +11,56 @@
 
 import { harnessService } from "./service";
 import { registerStateCommands } from "./cmds/state";
+import { registerDInputCommands } from "./cmds/dinput";
 import { registerInputCommands } from "./cmds/input";
 import { registerTimeCommands } from "./cmds/time";
+import {
+    registerAbiAuditCommand,
+    registerImportCommands,
+    registerStubCleanupAuditCommand,
+    registerTrapImportCommand,
+} from "./cmds/imports";
 import { registerLogCommands } from "./cmds/logs";
 import { registerScreenCommands } from "./cmds/screen";
+import { registerSceneCommands } from "./cmds/scene";
+import { registerCodeSceneCommands } from "./cmds/code-scene";
 import { registerBreakpointCommands } from "./cmds/breakpoints";
 import { registerTextureCommands } from "./cmds/textures";
+import { registerGdiCommands } from "./cmds/gdi";
+import { registerGlCommands } from "./cmds/gl";
+import { registerGlideCommands } from "./cmds/glide";
 import { registerFsCommands } from "./cmds/fs";
+import { registerIoCommands } from "./cmds/io";
+import { registerIdleCommands } from "./cmds/idle";
+import { registerDispatchCommands } from "./cmds/dispatch";
+import { registerCensusCommands } from "./cmds/census";
+import { registerCrossingCommands } from "./cmds/crossings";
+import { registerHleCommands } from "./cmds/hle";
+import { registerPacingCommands } from "./cmds/pacing";
+import { registerFixtureCommands } from "./cmds/fixture";
 import { registerRegistryCommands } from "./cmds/reg";
+import { registerWmTraceCommands } from "./cmds/wm-trace";
+import { registerPaintTraceCommands } from "./cmds/paint-trace";
 import { registerAssertCommands } from "./cmds/assert";
 import { registerRecordCommands } from "./cmds/record";
 import { registerMemTrapCommands } from "./cmds/memtrap";
 import { registerPerfCommands } from "./cmds/perf";
+import { registerLfbUnpackCommands } from "./cmds/lfb-unpack";
 import { registerFadeProbeCommands } from "./cmds/fadeprobe";
 import { registerAudioCommands } from "./cmds/audio";
+import { registerOpenAlCommands } from "./cmds/openal";
 import { registerDbgCommands } from "./cmds/dbg";
+import { registerFpuCommands } from "./cmds/fpu";
+import { registerCodegenCommands } from "./cmds/codegen";
+import { registerResourceCommands } from "./cmds/resources";
+import { registerHeapCommands } from "./cmds/heap";
+import { registerGpuCommands } from "./cmds/gpu";
+import { registerReferenceCommands } from "./cmds/reference";
+import { registerDDrawConformanceCommands } from "./cmds/ddraw-conformance";
+import { registerD3D9ConformanceCommands } from "./cmds/d3d9-conformance";
+import { registerShaderCommands } from "./cmds/shader";
+import { registerEffectCommands, registerD3dxTextureCommands } from "./cmds/effects";
+import { registerRenderBoundaryCommands } from "./cmds/render-boundary";
 
 let installed = false;
 
@@ -34,21 +69,55 @@ export function installHarnessCommands(): void {
     if (installed) return;
     installed = true;
     registerStateCommands(harnessService);
+    registerDInputCommands(harnessService);
     registerInputCommands(harnessService);
     registerTimeCommands(harnessService);
+    registerImportCommands(harnessService);
+    registerAbiAuditCommand(harnessService);
+    registerTrapImportCommand(harnessService);
+    registerStubCleanupAuditCommand(harnessService);
     registerLogCommands(harnessService);
     registerScreenCommands(harnessService);
+    registerSceneCommands(harnessService);
+    registerCodeSceneCommands(harnessService);
     registerBreakpointCommands(harnessService);
     registerTextureCommands(harnessService);
+    registerGdiCommands(harnessService);
+    registerGlCommands(harnessService);
+    registerGlideCommands(harnessService);
+    registerGpuCommands(harnessService);
     registerFsCommands(harnessService);
+    registerIoCommands(harnessService);
+    registerIdleCommands(harnessService);
+    registerDispatchCommands(harnessService);
+    registerCensusCommands(harnessService);
+    registerCrossingCommands(harnessService);
+    registerHleCommands(harnessService);
+    registerPacingCommands(harnessService);
+    registerFixtureCommands(harnessService);
     registerRegistryCommands(harnessService);
+    registerWmTraceCommands(harnessService);
+    registerPaintTraceCommands(harnessService);
     registerAssertCommands(harnessService);
     registerRecordCommands(harnessService);
     registerMemTrapCommands(harnessService);
     registerPerfCommands(harnessService);
+    registerLfbUnpackCommands(harnessService);
     registerFadeProbeCommands(harnessService);
     registerAudioCommands(harnessService);
+    registerOpenAlCommands(harnessService);
     registerDbgCommands(harnessService);
+    registerFpuCommands(harnessService);
+    registerCodegenCommands(harnessService);
+    registerResourceCommands(harnessService);
+    registerHeapCommands(harnessService);
+    registerReferenceCommands(harnessService);
+    registerDDrawConformanceCommands(harnessService);
+    registerD3D9ConformanceCommands(harnessService);
+    registerShaderCommands(harnessService);
+    registerEffectCommands(harnessService);
+    registerD3dxTextureCommands(harnessService);
+    registerRenderBoundaryCommands(harnessService);
 }
 
 // Install on import so a bare `import './harness/commands'` is sufficient.

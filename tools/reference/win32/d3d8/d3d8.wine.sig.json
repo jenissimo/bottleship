@@ -1,0 +1,27 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.880Z",
+  "module": "d3d8",
+  "functions": [
+    {
+      "name": "D3D8GetSWInfo",
+      "argCount": 0
+    },
+    {
+      "name": "DebugSetMute",
+      "argCount": 0
+    },
+    {
+      "name": "Direct3DCreate8",
+      "argCount": 1
+    },
+    {
+      "name": "ValidatePixelShader",
+      "argCount": 4
+    },
+    {
+      "name": "ValidateVertexShader",
+      "argCount": 5
+    }
+  ]
+}

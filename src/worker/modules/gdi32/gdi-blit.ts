@@ -14,8 +14,162 @@ import { convertRGBAToSurface } from "../ddraw/gpu-texture-utils";
 import { setAuthorityCpu, surfaceHasActiveWriteLease } from "../ddraw/surface-sync";
 import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_PRIMARYSURFACE, DDSCAPS_BACKBUFFER } from "../ddraw/constants";
 import { applyRopCode } from './gdi-raster';
-import { DEFAULT_BITMAP_HANDLE } from './gdi-objects';
+import { DEFAULT_BITMAP_HANDLE, cssToColor } from './gdi-objects';
+import { resolveDibSectionRectRgba, writeBackDibSectionRect } from './bitmap-resolve';
 import type { GDIContext } from './context';
+
+/**
+ * DIBSection bits live in guest memory and are written by the app directly
+ * (no API call to observe) — re-mirror the blitted source rect into the source
+ * DC canvas before the blit reads it. Rect-limited: full-bitmap conversion per
+ * blit would dominate frame time on DIB-backbuffer engines. No-op for
+ * non-DIBSection sources.
+ */
+function syncDibSourceDc(
+    gdi: GDIContext,
+    hdcSrc: number,
+    srcCtx: OffscreenCanvasRenderingContext2D | undefined,
+    srcState: { hBitmap?: number } | undefined,
+    xSrc: number,
+    ySrc: number,
+    width: number,
+    height: number,
+): void {
+    const hBmp = srcState?.hBitmap;
+    if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE || !srcCtx) return;
+    const mem = System.getInstance().process?.getCurrentMemory?.();
+    if (!mem) return;
+    const fresh = resolveDibSectionRectRgba(hBmp, mem, xSrc, ySrc, width, height);
+    if (!fresh) return;
+    srcCtx.putImageData(new (ImageData as any)(fresh.data, fresh.width, fresh.height), fresh.x, fresh.y);
+    gdi.invalidateImageDataCache(hdcSrc);
+}
+
+/** DC color CSS → [r,g,b] via the shared parser (COLORREF is 0x00BBGGRR). */
+function cssToRgb(css: string | undefined, fallback: string): [number, number, number] {
+    const c = cssToColor(css ?? fallback);
+    return [c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff];
+}
+
+/**
+ * Real GDI color→mono (nt5src ylateobj.cxx): a source pixel equal to the
+ * SOURCE DC's background color maps to 1 (white); all others map to 0 (black).
+ * Our 1bpp bitmaps are RGBA canvases, so the conversion is emulated in RGB.
+ */
+function blitColorToMono(
+    destCtx: OffscreenCanvasRenderingContext2D,
+    srcCtx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+    xSrc: number, ySrc: number,
+    srcBk: [number, number, number],
+): boolean {
+    try {
+        const src = srcCtx.getImageData(xSrc, ySrc, width, height);
+        const out = new ImageData(width, height);
+        const s = src.data, d = out.data;
+        for (let i = 0; i < s.length; i += 4) {
+            const white = s[i] === srcBk[0] && s[i + 1] === srcBk[1] && s[i + 2] === srcBk[2];
+            const v = white ? 255 : 0;
+            d[i] = d[i + 1] = d[i + 2] = v;
+            d[i + 3] = 255;
+        }
+        destCtx.putImageData(out, x, y);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Real GDI mono→color (nt5src ylateobj.cxx, the icon/mask path): a source 0 bit
+ * (black) becomes the DESTINATION DC's text color and a 1 bit (white) its background
+ * color. Copying the mono canvas through verbatim renders every masked sprite as hard
+ * black/white whatever SetTextColor/SetBkColor said.
+ */
+function blitMonoToColor(
+    destCtx: OffscreenCanvasRenderingContext2D,
+    srcCtx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+    xSrc: number, ySrc: number,
+    fg: [number, number, number],
+    bg: [number, number, number],
+): boolean {
+    try {
+        const src = srcCtx.getImageData(xSrc, ySrc, width, height);
+        const out = new ImageData(width, height);
+        const s = src.data, d = out.data;
+        for (let i = 0; i < s.length; i += 4) {
+            // The mono canvas stores 0/1 as black/white; anything not black is a 1 bit.
+            const one = s[i] !== 0 || s[i + 1] !== 0 || s[i + 2] !== 0;
+            const c = one ? bg : fg;
+            d[i] = c[0]; d[i + 1] = c[1]; d[i + 2] = c[2];
+            d[i + 3] = 255;
+        }
+        destCtx.putImageData(out, x, y);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** DSTINVERT over the DC's clip: invert each admitted rect in place (putImageData). */
+function invertDestRegion(
+    gdi: GDIContext,
+    hdcDest: number,
+    destCtx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+): void {
+    gdi.forEachClipPart(hdcDest, x, y, width, height, (px, py, pw, ph) => {
+        const imageData = destCtx.getImageData(px, py, pw, ph);
+        const data = imageData.data;
+        for (let i = 0; i < data.length; i += 4) {
+            data[i] = 255 - data[i];
+            data[i + 1] = 255 - data[i + 1];
+            data[i + 2] = 255 - data[i + 2];
+        }
+        destCtx.putImageData(imageData, px, py);
+    });
+}
+
+/** Mirror a drawn rect of a DC into the DIBSection selected into it (see
+ *  writeBackDibSectionRect); no-op for anything else. */
+function writeBackDib32(
+    gdi: GDIContext,
+    hdcDest: number,
+    destCtx: OffscreenCanvasRenderingContext2D,
+    destState: { hBitmap?: number } | undefined,
+    x: number, y: number, width: number, height: number,
+): void {
+    const hBmp = destState?.hBitmap;
+    if (!hBmp || hBmp === DEFAULT_BITMAP_HANDLE) return;
+    const r = gdi.clipCopyRect(hdcDest, x, y, width, height);
+    if (!r) return;
+    writeBackDibSectionRect(hBmp, destCtx, r.x, r.y, r.w, r.h);
+}
+
+/**
+ * Keep the DC's selected-bitmap canvas in step with a rect the DC just drew. Copying the
+ * result back out of the DC canvas — rather than replaying the operation with its own
+ * ROP/mono/pattern logic — makes the mirror obey the DC's clip for free: pixels the
+ * region excluded are unchanged there, so the clip's bounding box is enough.
+ */
+function mirrorToSelectedBitmap(
+    gdi: GDIContext,
+    hdcDest: number,
+    destCtx: OffscreenCanvasRenderingContext2D,
+    x: number, y: number, width: number, height: number,
+): void {
+    const linked = (destCtx.canvas as { __bitmapCanvas?: OffscreenCanvas }).__bitmapCanvas;
+    if (!linked) return;
+    const bitmapCtx = linked.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
+    if (!bitmapCtx) return;
+    const r = gdi.clipCopyRect(hdcDest, x, y, width, height);
+    if (!r) return;
+    try {
+        bitmapCtx.clearRect(r.x, r.y, r.w, r.h);
+        bitmapCtx.drawImage(destCtx.canvas, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+    } catch { /* mismatched/zero-sized canvases: nothing to mirror */ }
+}
 
 export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, width: number, height: number,
        hdcSrc: number, xSrc: number, ySrc: number, rop: number): boolean {
@@ -46,46 +200,59 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
 
     const destState = gdi.hdcStates.get(hdcDest);
     const srcState = gdi.hdcStates.get(hdcSrc);
-    // HL launcher: WM_PAINT BitBlt from fresh CreateCompatibleBitmap (all white, no art).
-    const sourceHasSelectedBitmap = !!srcState?.hBitmap && srcState.hBitmap !== DEFAULT_BITMAP_HANDLE;
+    if (needsSource) syncDibSourceDc(gdi, hdcSrc, srcCtx, srcState, xSrc, ySrc, width, height);
+    // Skip only a never-drawn compatible source → window DC (WM_PAINT that BitBlts a
+    // fresh CreateCompatibleBitmap and would whitewash guest art). A pristine flag left
+    // on a DC that already holds real pixels must NOT no-op — menu slide transitions
+    // restore the backdrop with SRCCOPY from an offscreen snapshot into a window DC.
     if (rop === SRCCOPY && srcState?.pristine && destState?.windowBlit) {
-        const wb = destState.windowBlit;
-        if (width >= wb.width && height >= wb.height) {
-            destState.skipOverlayFlush = true;
+        const srcBmp = srcState.hBitmap ?? 0;
+        const noRealBitmap = !srcBmp || srcBmp === DEFAULT_BITMAP_HANDLE;
+        let emptyCompatible = false;
+        if (!noRealBitmap) {
+            const bmpObj = SystemResourceProvider.getInstance().getUserObject(srcBmp) as
+                { compatibleEmpty?: boolean } | undefined;
+            emptyCompatible = !!bmpObj?.compatibleEmpty;
         }
-        Logger.verbose(LogCategory.GDI32,
-            `bitBlt: skip pristine src 0x${hdcSrc.toString(16)} -> window 0x${hdcDest.toString(16)} ` +
-            `(${width}x${height}) selBmp=${sourceHasSelectedBitmap ? 1 : 0}`);
-        return true;
+        if (noRealBitmap || emptyCompatible) {
+            const wb = destState.windowBlit;
+            if (width >= wb.width && height >= wb.height) {
+                destState.skipOverlayFlush = true;
+            }
+            Logger.verbose(LogCategory.GDI32,
+                `bitBlt: skip pristine src 0x${hdcSrc.toString(16)} -> window 0x${hdcDest.toString(16)} ` +
+                `(${width}x${height}) emptyCompat=${emptyCompatible ? 1 : 0}`);
+            return true;
+        }
     }
+
+    // A destination fully outside the DC's clip is a successful no-paint, exactly as a
+    // zero-area blit is; nothing below has to re-test it.
+    const destClip = gdi.clipCopyRect(hdcDest, x, y, width, height);
+    if (!destClip) return true;
 
     // Handle source-less ROPs early if no source context
     if (!srcCtx) {
-        if (rop === BLACKNESS) {
-            destCtx.fillStyle = '#000000';
+        if (rop === BLACKNESS || rop === WHITENESS) {
+            destCtx.fillStyle = rop === BLACKNESS ? '#000000' : '#FFFFFF';
+            const clipped = gdi.beginClipOn(hdcDest, destCtx);
             destCtx.fillRect(x, y, width, height);
-            gdi.expandDirtyRect(hdcDest, x, y, width, height);
-            gdi.markDirty(hdcDest);
-            gdi.invalidateImageDataCache(hdcDest);
-            return true;
-        } else if (rop === WHITENESS) {
-            destCtx.fillStyle = '#FFFFFF';
-            destCtx.fillRect(x, y, width, height);
+            if (clipped) destCtx.restore();
+            writeBackDib32(gdi, hdcDest, destCtx, destState, x, y, width, height);
+            mirrorToSelectedBitmap(gdi, hdcDest, destCtx, x, y, width, height);
             gdi.expandDirtyRect(hdcDest, x, y, width, height);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
             return true;
         } else if (rop === DSTINVERT) {
             try {
-                const imageData = destCtx.getImageData(x, y, width, height);
-                const data = imageData.data;
-                for (let i = 0; i < data.length; i += 4) {
-                    data[i] = 255 - data[i];
-                    data[i + 1] = 255 - data[i + 1];
-                    data[i + 2] = 255 - data[i + 2];
-                }
-                destCtx.putImageData(imageData, x, y);
-                gdi.expandDirtyRect(hdcDest, x, y, width, height);
+                // putImageData ignores the canvas clip, so this path inverts the clip's
+                // own rects; the bounding box would reach into an excluded hole.
+                const { x: ix, y: iy, w: iw, h: ih } = destClip;
+                invertDestRegion(gdi, hdcDest, destCtx, x, y, width, height);
+                writeBackDib32(gdi, hdcDest, destCtx, destState, ix, iy, iw, ih);
+                mirrorToSelectedBitmap(gdi, hdcDest, destCtx, ix, iy, iw, ih);
+                gdi.expandDirtyRect(hdcDest, ix, iy, iw, ih);
                 gdi.markDirty(hdcDest);
                 gdi.invalidateImageDataCache(hdcDest);
                 return true;
@@ -108,7 +275,37 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         // Save current composite operation
         const savedCompositeOp = destCtx.globalCompositeOperation;
 
-        if (rop === SRCCOPY) {
+        // Format conversion, both directions: GDI translates through the DC colors
+        // whenever exactly one side is 1bpp (CreateBitmap planes=1).
+        const provider = SystemResourceProvider.getInstance();
+        const destBmp = destState?.hBitmap ? provider.getUserObject(destState.hBitmap) : null;
+        const srcBmp = srcState?.hBitmap ? provider.getUserObject(srcState.hBitmap) : null;
+        const destIsMono = destBmp?.type === 'BITMAP' && destBmp.bmBpp === 1;
+        const srcIsMono = srcBmp?.type === 'BITMAP' && srcBmp.bmBpp === 1;
+
+        // The mono conversions and the bitwise ROPs go through putImageData, the one
+        // canvas primitive a clip does not reach — so they are issued once per CLIP RECT,
+        // with the source origin shifted by the same amount as the destination.
+        const toMono = rop === SRCCOPY && destIsMono && !srcIsMono;
+        const fromMono = rop === SRCCOPY && srcIsMono && !destIsMono;
+        let monoConverted = toMono || fromMono;
+        if (monoConverted) {
+            const srcBk = cssToRgb(srcState?.bkColor, '#ffffff');
+            const destFg = cssToRgb(destState?.textColor, '#000000');
+            const destBk = cssToRgb(destState?.bkColor, '#ffffff');
+            gdi.forEachClipPart(hdcDest, x, y, width, height, (px, py, pw, ph) => {
+                const psx = xSrc + (px - x), psy = ySrc + (py - y);
+                const ok = toMono
+                    ? blitColorToMono(destCtx, srcCtx, px, py, pw, ph, psx, psy, srcBk)
+                    : blitMonoToColor(destCtx, srcCtx, px, py, pw, ph, psx, psy, destFg, destBk);
+                if (!ok) monoConverted = false;
+            });
+        }
+
+        const clipped = gdi.beginClipOn(hdcDest, destCtx);
+        if (monoConverted) {
+            // handled above
+        } else if (rop === SRCCOPY) {
             // Simple copy (default behavior)
             destCtx.drawImage(
                 srcCanvas,
@@ -117,31 +314,33 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
             );
         } else if (rop === SRCINVERT || rop === SRCAND || rop === SRCPAINT) {
             // Use pixel-perfect bitwise operations for critical ROP codes
-            const clamped = clampRectPairForCanvas(srcCtx, destCtx, {
-                xSrc,
-                ySrc,
-                wSrc: width,
-                hSrc: height,
-                xDest: x,
-                yDest: y,
-                wDest: width,
-                hDest: height,
+            gdi.forEachClipPart(hdcDest, x, y, width, height, (px, py, pw, ph) => {
+                const clamped = clampRectPairForCanvas(srcCtx, destCtx, {
+                    xSrc: xSrc + (px - x),
+                    ySrc: ySrc + (py - y),
+                    wSrc: pw,
+                    hSrc: ph,
+                    xDest: px,
+                    yDest: py,
+                    wDest: pw,
+                    hDest: ph,
+                });
+                if (clamped) {
+                    applyRopCode(
+                        destCtx,
+                        srcCtx,
+                        rop,
+                        clamped.xDest,
+                        clamped.yDest,
+                        clamped.wDest,
+                        clamped.hDest,
+                        clamped.xSrc,
+                        clamped.ySrc,
+                        clamped.wSrc,
+                        clamped.hSrc
+                    );
+                }
             });
-            if (clamped) {
-                applyRopCode(
-                    destCtx,
-                    srcCtx,
-                    rop,
-                    clamped.xDest,
-                    clamped.yDest,
-                    clamped.wDest,
-                    clamped.hDest,
-                    clamped.xSrc,
-                    clamped.ySrc,
-                    clamped.wSrc,
-                    clamped.hSrc
-                );
-            }
         } else if (rop === BLACKNESS) {
             // Fill with black
             destCtx.fillStyle = '#000000';
@@ -159,6 +358,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
                 x, y, width, height
             );
         }
+        if (clipped) destCtx.restore();
 
         // Mark overlay as dirty if we're drawing to it
         if (isOverlayDest) {
@@ -168,31 +368,8 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
         // Invalidate image data cache after drawing
         gdi.invalidateImageDataCache(hdcDest);
 
-        // If dest is a memory DC with linked bitmap, update the bitmap canvas
-        const linkedBitmap = (destCtx.canvas as any).__bitmapCanvas;
-        if (linkedBitmap) {
-            const bitmapCtx = linkedBitmap.getContext('2d');
-            if (bitmapCtx) {
-                // Apply same operation to bitmap canvas
-                if (rop === SRCCOPY) {
-                    bitmapCtx.drawImage(srcCanvas, xSrc, ySrc, width, height, x, y, width, height);
-                } else if (rop === SRCINVERT || rop === SRCAND || rop === SRCPAINT) {
-                    applyRopCode(
-                        bitmapCtx as OffscreenCanvasRenderingContext2D,
-                        srcCtx,
-                        rop,
-                        x, y, width, height,
-                        xSrc, ySrc, width, height
-                    );
-                } else if (rop === BLACKNESS) {
-                    bitmapCtx.fillStyle = '#000000';
-                    bitmapCtx.fillRect(x, y, width, height);
-                } else if (rop === WHITENESS) {
-                    bitmapCtx.fillStyle = '#FFFFFF';
-                    bitmapCtx.fillRect(x, y, width, height);
-                }
-            }
-        }
+        writeBackDib32(gdi, hdcDest, destCtx, destState, x, y, width, height);
+        mirrorToSelectedBitmap(gdi, hdcDest, destCtx, x, y, width, height);
 
         // Mark as dirty for ReleaseDC optimization
         gdi.expandDirtyRect(hdcDest, x, y, width, height);
@@ -257,7 +434,10 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
             Logger.warn(LogCategory.GDI32,
                 `stretchBlt: WORKAROUND - hdcSrc=0 with SRCCOPY, filling dest with black`);
             destCtx.fillStyle = '#000000';
+            const clipped = gdi.beginClipOn(hdcDest, destCtx);
             destCtx.fillRect(xDest, yDest, wDest, hDest);
+            if (clipped) destCtx.restore();
+            writeBackDib32(gdi, hdcDest, destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
             return true; // Pretend success to unblock the game
@@ -266,32 +446,31 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         return false;
     }
 
+    if (needsSource) syncDibSourceDc(gdi, hdcSrc, srcCtx, gdi.hdcStates.get(hdcSrc), xSrc, ySrc, wSrc, hSrc);
+
     // Handle source-less ROPs early if no source context
     if (!srcCtx) {
-        if (rop === BLACKNESS) {
-            destCtx.fillStyle = '#000000';
+        const srcLessClip = gdi.clipCopyRect(hdcDest, xDest, yDest, wDest, hDest);
+        if (!srcLessClip) return true; // wholly outside the DC's clip: a successful no-paint
+        if (rop === BLACKNESS || rop === WHITENESS) {
+            destCtx.fillStyle = rop === BLACKNESS ? '#000000' : '#FFFFFF';
+            const clipped = gdi.beginClipOn(hdcDest, destCtx);
             destCtx.fillRect(xDest, yDest, wDest, hDest);
-            gdi.markDirty(hdcDest);
-            gdi.invalidateImageDataCache(hdcDest);
-            return true;
-        } else if (rop === WHITENESS) {
-            destCtx.fillStyle = '#FFFFFF';
-            destCtx.fillRect(xDest, yDest, wDest, hDest);
+            if (clipped) destCtx.restore();
+            writeBackDib32(gdi, hdcDest, destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
+            mirrorToSelectedBitmap(gdi, hdcDest, destCtx, xDest, yDest, wDest, hDest);
             gdi.markDirty(hdcDest);
             gdi.invalidateImageDataCache(hdcDest);
             return true;
         } else if (rop === DSTINVERT) {
             // Invert destination - need to read, invert, write
             try {
-                const imageData = destCtx.getImageData(xDest, yDest, wDest, hDest);
-                const data = imageData.data;
-                for (let i = 0; i < data.length; i += 4) {
-                    data[i] = 255 - data[i];       // R
-                    data[i + 1] = 255 - data[i + 1]; // G
-                    data[i + 2] = 255 - data[i + 2]; // B
-                    // Alpha stays the same
-                }
-                destCtx.putImageData(imageData, xDest, yDest);
+                // putImageData ignores the canvas clip, so this path inverts the clip's
+                // own rects; the bounding box would reach into an excluded hole.
+                const { x: ix, y: iy, w: iw, h: ih } = srcLessClip;
+                invertDestRegion(gdi, hdcDest, destCtx, xDest, yDest, wDest, hDest);
+                writeBackDib32(gdi, hdcDest, destCtx, gdi.hdcStates.get(hdcDest), ix, iy, iw, ih);
+                mirrorToSelectedBitmap(gdi, hdcDest, destCtx, ix, iy, iw, ih);
                 gdi.markDirty(hdcDest);
                 gdi.invalidateImageDataCache(hdcDest);
                 return true;
@@ -511,6 +690,15 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         // Save current composite operation
         const savedCompositeOp = destCtx.globalCompositeOperation;
 
+        // A destination fully outside the DC's clip is a successful no-paint.
+        const destClip = gdi.clipCopyRect(hdcDest, xDest, yDest, wDest, hDest);
+        if (!destClip) return true;
+        // The bitwise ROPs go through putImageData, the one canvas primitive a clip does
+        // not reach: they are issued per CLIP RECT, with the source window scaled to match.
+        const sScaleX = wDest !== 0 ? wSrc / wDest : 1;
+        const sScaleY = hDest !== 0 ? hSrc / hDest : 1;
+        const clipped = gdi.beginClipOn(hdcDest, destCtx);
+
         if (rop === SRCCOPY) {
             // Simple copy (default behavior)
             destCtx.drawImage(
@@ -521,31 +709,33 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
 
         } else if (rop === SRCINVERT || rop === SRCAND || rop === SRCPAINT) {
             // Use pixel-perfect bitwise operations for critical ROP codes
-            const clamped = clampRectPairForCanvas(srcCtx, destCtx, {
-                xSrc,
-                ySrc,
-                wSrc,
-                hSrc,
-                xDest,
-                yDest,
-                wDest,
-                hDest,
+            gdi.forEachClipPart(hdcDest, xDest, yDest, wDest, hDest, (px, py, pw, ph) => {
+                const clamped = clampRectPairForCanvas(srcCtx, destCtx, {
+                    xSrc: xSrc + (px - xDest) * sScaleX,
+                    ySrc: ySrc + (py - yDest) * sScaleY,
+                    wSrc: pw * sScaleX,
+                    hSrc: ph * sScaleY,
+                    xDest: px,
+                    yDest: py,
+                    wDest: pw,
+                    hDest: ph,
+                });
+                if (clamped) {
+                    applyRopCode(
+                        destCtx,
+                        srcCtx,
+                        rop,
+                        clamped.xDest,
+                        clamped.yDest,
+                        clamped.wDest,
+                        clamped.hDest,
+                        clamped.xSrc,
+                        clamped.ySrc,
+                        clamped.wSrc,
+                        clamped.hSrc
+                    );
+                }
             });
-            if (clamped) {
-                applyRopCode(
-                    destCtx,
-                    srcCtx,
-                    rop,
-                    clamped.xDest,
-                    clamped.yDest,
-                    clamped.wDest,
-                    clamped.hDest,
-                    clamped.xSrc,
-                    clamped.ySrc,
-                    clamped.wSrc,
-                    clamped.hSrc
-                );
-            }
         } else if (rop === BLACKNESS) {
             // Fill with black
             destCtx.fillStyle = '#000000';
@@ -563,11 +753,14 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
                 xDest, yDest, wDest, hDest
             );
         }
+        if (clipped) destCtx.restore();
 
         // Mark overlay as dirty if we're drawing to it
         if (isOverlayDest) {
             gdi.setOverlayDirty(true);
         }
+
+        writeBackDib32(gdi, hdcDest, destCtx, gdi.hdcStates.get(hdcDest), xDest, yDest, wDest, hDest);
 
         // Mark as dirty for ReleaseDC optimization
         gdi.expandDirtyRect(hdcDest, xDest, yDest, wDest, hDest);
@@ -576,31 +769,7 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         // Invalidate image data cache after drawing
         gdi.invalidateImageDataCache(hdcDest);
 
-        // If dest is a memory DC with linked bitmap, update the bitmap canvas
-        const linkedBitmap = (destCtx.canvas as any).__bitmapCanvas;
-        if (linkedBitmap) {
-            const bitmapCtx = linkedBitmap.getContext('2d');
-            if (bitmapCtx) {
-                // Apply same operation to bitmap canvas
-                if (rop === SRCCOPY) {
-                    bitmapCtx.drawImage(srcCanvas, xSrc, ySrc, wSrc, hSrc, xDest, yDest, wDest, hDest);
-                } else if (rop === SRCINVERT || rop === SRCAND || rop === SRCPAINT) {
-                    applyRopCode(
-                        bitmapCtx as OffscreenCanvasRenderingContext2D,
-                        srcCtx,
-                        rop,
-                        xDest, yDest, wDest, hDest,
-                        xSrc, ySrc, wSrc, hSrc
-                    );
-                } else if (rop === BLACKNESS) {
-                    bitmapCtx.fillStyle = '#000000';
-                    bitmapCtx.fillRect(xDest, yDest, wDest, hDest);
-                } else if (rop === WHITENESS) {
-                    bitmapCtx.fillStyle = '#FFFFFF';
-                    bitmapCtx.fillRect(xDest, yDest, wDest, hDest);
-                }
-            }
-        }
+        mirrorToSelectedBitmap(gdi, hdcDest, destCtx, xDest, yDest, wDest, hDest);
 
         const fallbackTime = performance.now() - fallbackStartTime;
         Logger.log(LogCategory.GDI32,

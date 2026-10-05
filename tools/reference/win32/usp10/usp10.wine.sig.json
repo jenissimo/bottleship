@@ -1,0 +1,183 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.948Z",
+  "module": "usp10",
+  "functions": [
+    {
+      "name": "LpkPresent",
+      "argCount": 0
+    },
+    {
+      "name": "ScriptApplyDigitSubstitution",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptApplyLogicalWidth",
+      "argCount": 9
+    },
+    {
+      "name": "ScriptBreak",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptCacheGetHeight",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptCPtoX",
+      "argCount": 9
+    },
+    {
+      "name": "ScriptFreeCache",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptGetCMap",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptGetFontAlternateGlyphs",
+      "argCount": 10
+    },
+    {
+      "name": "ScriptGetFontFeatureTags",
+      "argCount": 8
+    },
+    {
+      "name": "ScriptGetFontLanguageTags",
+      "argCount": 7
+    },
+    {
+      "name": "ScriptGetFontProperties",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptGetFontScriptTags",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptGetGlyphABCWidth",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptGetLogicalWidths",
+      "argCount": 7
+    },
+    {
+      "name": "ScriptGetProperties",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptIsComplex",
+      "argCount": 3
+    },
+    {
+      "name": "ScriptItemize",
+      "argCount": 7
+    },
+    {
+      "name": "ScriptItemizeOpenType",
+      "argCount": 8
+    },
+    {
+      "name": "ScriptJustify",
+      "argCount": 6
+    },
+    {
+      "name": "ScriptLayout",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptPlace",
+      "argCount": 9
+    },
+    {
+      "name": "ScriptPlaceOpenType",
+      "argCount": 18
+    },
+    {
+      "name": "ScriptPositionSingleGlyph",
+      "argCount": 0
+    },
+    {
+      "name": "ScriptRecordDigitSubstitution",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptShape",
+      "argCount": 10
+    },
+    {
+      "name": "ScriptShapeOpenType",
+      "argCount": 16
+    },
+    {
+      "name": "ScriptString_pcOutChars",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptString_pLogAttr",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptString_pSize",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptStringAnalyse",
+      "argCount": 13
+    },
+    {
+      "name": "ScriptStringCPtoX",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptStringFree",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptStringGetLogicalWidths",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptStringGetOrder",
+      "argCount": 2
+    },
+    {
+      "name": "ScriptStringOut",
+      "argCount": 8
+    },
+    {
+      "name": "ScriptStringValidate",
+      "argCount": 1
+    },
+    {
+      "name": "ScriptStringXtoCP",
+      "argCount": 4
+    },
+    {
+      "name": "ScriptSubstituteSingleGlyph",
+      "argCount": 0
+    },
+    {
+      "name": "ScriptTextOut",
+      "argCount": 14
+    },
+    {
+      "name": "ScriptXtoCP",
+      "argCount": 9
+    },
+    {
+      "name": "UspAllocCache",
+      "argCount": 0
+    },
+    {
+      "name": "UspAllocTemp",
+      "argCount": 0
+    },
+    {
+      "name": "UspFreeMem",
+      "argCount": 0
+    }
+  ]
+}

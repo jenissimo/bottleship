@@ -23,11 +23,14 @@
  */
 
 import { ThunkResult } from './thunking/thunk-dispatcher';
+import { invalidateGuestCode } from './memory/guest-code';
 import { Logger, LogCategory } from './logger';
 import { System } from './system';
 import { debugSession } from './debug/debug-session';
 import { recordSehFrame, repairSehSelfLoop } from './tools/seh-chain-repair';
+import { captureCxxThrow } from '../modules/kernel32/exception';
 import { guardStackWrite } from './memory/stack-write-guard';
+import { isValidAddress } from './memory/address-guard';
 
 /**
  * EBP offset (from the SEH registration record's own address, `sehHead`) for any frame
@@ -38,19 +41,9 @@ import { guardStackWrite } from './memory/stack-write-guard';
  * shapes below, since both go through this one prolog. Do NOT copy this as a bare literal —
  * a stray `+ 16` here (the real, undocumented Windows `_except_handler3` record IS 16 bytes,
  * with a genuine "handler" field we don't emit) is what caused the msvcirt.dll static-init
- * crash (this+0x38 computed from the wrong EBP). Unrelated to FINALLY_SCOPE_EBP_DELTA below,
- * which covers inline-compiled __try/__finally frames that never call our prolog stub.
+ * crash (this+0x38 computed from the wrong EBP).
  */
 const EH_PROLOG_EBP_DELTA = 12;
-
-/**
- * EBP offset for genuine __try/__finally-only scope-table frames (dispatchFinallyUnwind).
- * These are typically compiler-INLINED (push -1; push scopetable; push _except_handler3;
- * push fs:[0]; ...) rather than routed through our shared `_EH_prolog`, so they carry a
- * real 4th "handler" field and the full 16-byte record — do not conflate with
- * EH_PROLOG_EBP_DELTA above.
- */
-const FINALLY_SCOPE_EBP_DELTA = 16;
 
 /**
  * FuncInfo unwind-map field offsets (read by both readUnwindActions() and
@@ -113,7 +106,7 @@ export interface CxxExceptionRecord {
     throwEip: number;
     throwModule: string;    // module label of the throw site
     isRethrow: boolean;     // true for `throw;` (pObj=0)
-    outcome: 'pending' | 'caught' | 'unhandled';
+    outcome: 'pending' | 'caught' | 'unhandled' | 'deferred-x86';
     caughtBy: string;       // module label of the catching frame (when outcome=caught)
 }
 const cxxExceptionRing: CxxExceptionRecord[] = [];
@@ -159,6 +152,26 @@ function recordSehDispatchTrace(line: string, win?: SehDispatchWindow): void {
 /** Recent catch dispatches (newest last) for the crash report / `report()`. */
 export function getSehDispatchTrace(): string[] {
     return sehDispatchTrace.slice();
+}
+
+// One line per RtlUnwind and per frame it classified. The unwind pass is a DECISION the
+// log firehose cannot carry (a per-frame VERBOSE line is dropped by the log socket long
+// before a late crash fires), yet "which frames got their handler and which were skipped,
+// and why" is the whole answer when a non-MSVC runtime's teardown does not run. Bounded,
+// allocation-light, read via harness `sehTrace`.
+const sehUnwindTrace: string[] = [];
+const SEH_UNWIND_TRACE_MAX = 512;
+
+export function recordSehUnwindTrace(line: string): void {
+    if (sehUnwindTrace.length >= SEH_UNWIND_TRACE_MAX) sehUnwindTrace.shift();
+    sehUnwindTrace.push(line);
+}
+
+/** Recent RtlUnwind frame decisions (newest last). `clear` empties the ring. */
+export function getSehUnwindTrace(clear = false): string[] {
+    const out = sehUnwindTrace.slice();
+    if (clear) sehUnwindTrace.length = 0;
+    return out;
 }
 
 /** Does addr fall inside a recently used dispatch descent window? (crash forensics) */
@@ -222,6 +235,7 @@ export function resetSehDispatchState(): void {
     cxxSeq = 0;
     sehDispatchTrace.length = 0;
     sehDispatchWindows.length = 0;
+    sehUnwindTrace.length = 0;
 }
 
 /**
@@ -389,6 +403,9 @@ class X86Emit {
     jmpAbs(target: number): void { this.dv.setUint8(this.off, 0xE9); this.dv.setInt32(this.off + 1, (target - (this.off + 5)) | 0, true); this.off += 5; }
     jmpEax(): void { this.dv.setUint8(this.off, 0xFF); this.dv.setUint8(this.off + 1, 0xE0); this.off += 2; }
     size(): number { return this.off - this.base; }
+    /** Publish the emitted bytes: these trampolines live on the guest stack, so the same
+     *  address carries different code on every dispatch — v86 must drop the old block. */
+    commit(): number { invalidateGuestCode(this.base, this.off - this.base); return this.size(); }
 }
 
 /** Emit the action sequence (inside a PUSHAD/POPAD window when non-empty). */
@@ -1212,6 +1229,7 @@ function emitCatchDispatch(
             e.jmpAbs(d.target);
         }
     }
+    e.commit();
 
     // Thunk RET N lands here: EIP = [retSlot] = codeBase, ESP = retSlot+4+N (< codeBase,
     // irrelevant — the first trampoline instruction re-bases ESP).
@@ -1265,6 +1283,23 @@ export function sehOnCatchCompletion(cpu: any): void {
         dv.setUint32((rec.pRN - 4) >>> 0, rec.savedTryEsp >>> 0, true);
     }
 
+    // RELINK the catching frame. Catch entry sets FS:[0] to the frame's `next` so a throw
+    // from INSIDE the catch body resumes above it (__CxxFrameHandler gets that from the
+    // frame's state, we get it by unlinking). That unlink is only valid for the duration of
+    // the catch body: the function keeps running afterwards, and MSVC never removes a live
+    // frame's registration. Leaving it out means every LATER throw from another try block of
+    // the same function finds no handler — Serious Sam caught its Controls/ConsoleHistory
+    // opens and then died on the next one because CGame::InitInternal was no longer on the
+    // chain. Only undo OUR OWN unlink: relink when the head is still exactly this frame's
+    // next, so a try registered deeper since is never clobbered.
+    if (rec.pRN >= 0x1000 && rec.pRN + 4 <= mem.length) {
+        const frameNext = dv.getUint32(rec.pRN, true) >>> 0;
+        const head = dv.getUint32(tebAddr, true) >>> 0;
+        if (head === frameNext) {
+            dv.setUint32(tebAddr, rec.pRN >>> 0, true);
+        }
+    }
+
     if ((globalThis as Record<string, unknown>).__sehNoObjDtor) return;
     const pmfnUnwind = readThrowInfoUnwindFunc(dv, mem, rec.pThrowInfo);
     if (!pmfnUnwind || !rec.pExceptionObject || !rec.stubHome || !rec.scratchEsp) return;
@@ -1294,6 +1329,7 @@ export function sehOnCatchCompletion(cpu: any): void {
     e.movEbpImm(rec.catchEbp);
     e.movEaxImm(continuation);
     e.jmpEax();
+    e.commit();
     guardStackWrite(esp, 4, 'seh:completionEaxPatch', rec.stubHome);
     dv.setUint32(esp, rec.stubHome >>> 0, true); // gadget pops this into EAX → jmp stub
 
@@ -1448,28 +1484,37 @@ export function evaluateSimpleFilter(
 }
 
 /**
- * Walk the SEH chain from FS:[0] to targetFrame and call all __finally blocks
- * via an x86 trampoline on the dead stack. Used by RtlUnwind.
+ * The unwind pass of RtlUnwind: walk the SEH chain from FS:[0] to targetFrame and call
+ * EVERY frame's registered handler with EH_UNWINDING, via an x86 trampoline on the dead
+ * stack below the RtlUnwind frame.
  *
- * __finally blocks are scope table entries where filterAddr == 0.
- * They are called as void funclets with EBP = sehHead + 16 (the frame's EBP).
+ * "Every frame's handler" is the whole contract (Wine __regs_RtlUnwind, NT RtlUnwind) and
+ * the reason we do not classify frames here. An EXCEPTION_REGISTRATION_RECORD is exactly
+ * two fields; everything from +8 on belongs to whoever registered it, so reading a scope
+ * table and a trylevel out of those words only ever produces a GUESS — and two saved
+ * callee-saved registers satisfy that guess as readily as a real scope table. Running the
+ * __finally funclets ourselves for frames that pass it means the frame's real handler never
+ * runs, which is invisible for MSVC (we imitate what _except_handler3 would have done) and
+ * fatal for anyone else: LuaJIT registers lj_err_unwind_win on every cframe and pops its
+ * internal C frames ONLY on this pass, so a skipped frame leaves the VM running on frames
+ * that no longer exist. Calling _except_handler3 — the app's own or our HLE one — does the
+ * local unwind for MSVC frames anyway, so there is nothing to imitate.
  *
- * Trampoline layout (written into dead stack above callerEsp):
- *   MOV ESP, sehStackTop       ; 5  — switch to safe stack for CALL return addrs
- *   { MOV EBP, frameEbp        ; 5  } × N
- *   { CALL handlerAddr         ; 5  }
- *   MOV [tebAddr], targetFrame ; 10 — update FS:[0] after all handlers
+ * Trampoline layout (dead stack below ctx_esp):
+ *   MOV ESP, sehStackTop       ; 5  — safe stack so CALL return addrs stay off the guest's
+ *   { PUSH 0 / ctx / frame / rec ; CALL handler ; ADD ESP,16 ; MOV [teb],frame->next } × N
+ *   MOV [tebAddr], finalHead   ; 10 — re-confirm the end state
  *   MOV EAX, returnValue       ; 5
  *   MOV ESP, callerEsp         ; 5  — restore caller's ESP (after stdcall cleanup)
  *   JMP retAddr                ; 5  — rel32 jump to return address
  *
- * Returns ThunkResult with skipStackCheck=true if trampoline was generated,
- * or null if no __finally blocks found (caller returns normally).
+ * Returns ThunkResult with skipStackCheck=true if a trampoline was generated, or null when
+ * there is nothing between FS:[0] and targetFrame (caller returns normally).
  *
  * @param ctx_esp   ESP captured at thunk entry (ctx.esp from ThunkImplementation)
  * @param thunkCleanupBytes  RET N value for this thunk's stub (16 for RtlUnwind)
  */
-export function dispatchFinallyUnwind(
+export function dispatchUnwindPass(
     mem: Uint8Array,
     cpu: any,
     ctx_esp: number,
@@ -1477,79 +1522,110 @@ export function dispatchFinallyUnwind(
     targetFrame: number,
     returnValue: number,
     thunkCleanupBytes: number,
+    excRecPtr: number = 0,
 ): ThunkResult | null {
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-    // RtlUnwind removes frames up to AND INCLUDING targetFrame — any catch funclet
-    // registered on a frame at/below it can never complete; clean its record up.
+    // Every frame strictly below targetFrame is gone once this pass completes, so a catch
+    // funclet registered on one of them can never complete — drop its record. The boundary
+    // covers targetFrame's own records too: RtlUnwind is called BY the catching handler, so
+    // the funclet that is about to run pushes its record after this point, not before it.
     if (targetFrame !== 0 && targetFrame !== 0xFFFFFFFF) {
         sweepCatchRecordsBelowFrame(dv, mem, tebAddr, (targetFrame + 1) >>> 0);
     }
 
-    // Collect __finally handlers in unwind order (innermost → outermost)
-    const handlers: Array<{ handler: number; frameEbp: number }> = [];
+    // Unwind-order work list (innermost → outermost): one entry per frame, each of which
+    // gets its own registered handler called with EH_UNWINDING. See the header comment for
+    // why there is no second, "we know better than the frame" shape here.
+    interface UnwindStep { handler: number; frame: number; next: number }
+    const steps: UnwindStep[] = [];
 
     let frame = dv.getUint32(tebAddr, true) >>> 0;
     let frameCount = 0;
+    /** Set when the walk stopped on something wrong with the chain rather than on the
+     *  target. `frame` is then a cycle member, an out-of-bounds pointer or a frame past
+     *  the target — none of which may become the new FS:[0]. */
+    let aborted = false;
     const visitedFrames = new Set<number>();
+    recordSehUnwindTrace(`unwind head=0x${frame.toString(16)} target=0x${targetFrame.toString(16)} ` +
+        `excRec=0x${excRecPtr.toString(16)}`);
     while (frame !== 0xFFFFFFFF && frame !== 0 && frame !== targetFrame && frameCount < 64) {
         if (visitedFrames.has(frame)) {
             Logger.error(LogCategory.SYSTEM,
-                `[SEH-FINALLY] cycle detected at frame 0x${frame.toString(16)} — breaking`);
+                `[SEH-UNWIND] cycle detected at frame 0x${frame.toString(16)} — breaking`);
+            aborted = true;
             break;
         }
         visitedFrames.add(frame);
         frameCount++;
-        if (frame + 16 > mem.length) break;
+        if (frame + 16 > mem.length) { aborted = true; break; }
+
+        // Stacks grow down, so an outer frame always sits at a HIGHER address. Walking past
+        // the target means the target was never on this chain — Windows raises
+        // STATUS_INVALID_UNWIND_TARGET rather than unwinding everything. Stop instead of
+        // raising (a bad guess here would kill the process), but say so: silently unwinding
+        // the whole chain is how a wrong target turns into a corruption nobody can trace.
+        if (targetFrame !== 0 && targetFrame !== 0xFFFFFFFF && frame > targetFrame) {
+            recordSehUnwindTrace(`  => STOPPED: frame 0x${frame.toString(16)} is past ` +
+                `target 0x${targetFrame.toString(16)} (invalid unwind target)`);
+            Logger.warn(LogCategory.SYSTEM,
+                `[SEH-UNWIND] frame 0x${frame.toString(16)} is past target ` +
+                `0x${targetFrame.toString(16)} — stopping, target is not on this chain`);
+            aborted = true;
+            break;
+        }
 
         const next = dv.getUint32(frame, true) >>> 0;
-        const scopeTable = dv.getUint32(frame + 8, true) >>> 0;
-        const trylevel = dv.getInt32(frame + 12, true);
-        const frameEbp = frame + FINALLY_SCOPE_EBP_DELTA;
-
-        // Only process __except_handler3 frames (scopeTable is a valid pointer, trylevel >= 0)
-        if (scopeTable >= 0x10000 && trylevel >= 0) {
-            let level = trylevel;
-            let safety = 0;
-            while (level >= 0 && level < 256 && safety < 64) {
-                safety++;
-                const entryBase = scopeTable + level * 12;
-                if (entryBase + 12 > mem.length) break;
-
-                const prevLevel = dv.getInt32(entryBase, true);
-                const filterAddr = dv.getUint32(entryBase + 4, true) >>> 0;
-                const handlerAddr = dv.getUint32(entryBase + 8, true) >>> 0;
-
-                if (filterAddr === 0 && handlerAddr >= 0x10000 && handlerAddr < mem.length) {
-                    handlers.push({ handler: handlerAddr, frameEbp });
-                    Logger.log(LogCategory.SYSTEM,
-                        `[SEH-FINALLY] frame=0x${frame.toString(16)} level=${level} ` +
-                        `handler=0x${handlerAddr.toString(16)}${identifyModule(handlerAddr)}`);
-                }
-
-                level = prevLevel;
-            }
-
-            // Mark frame as fully unwound
-            dv.setInt32(frame + 12, -1, true);
+        const handlerWord = dv.getUint32(frame + 4, true) >>> 0;
+        // A BOUNDS test, not an executability one — and it cannot be more than that: PE
+        // images are registered "r" in the region map (THUNK_CODE is the only "rx"
+        // bucket), so asking isValidAddress for 'rx' would reject the game's own
+        // __except_handler3 and disable SEH wholesale. Say what is actually checked.
+        const usable = handlerWord >= 0x10000 && handlerWord < mem.length;
+        recordSehUnwindTrace(`  frame=0x${frame.toString(16)} handler=0x${handlerWord.toString(16)}` +
+            `${identifyModule(handlerWord)} => ${usable ? "unwind pass" : "UNUSABLE handler (out of range) — skipped"}`);
+        if (usable) {
+            steps.push({ handler: handlerWord, frame, next });
+            Logger.log(LogCategory.SYSTEM,
+                `[SEH-UNWIND] frame=0x${frame.toString(16)} handler=0x${handlerWord.toString(16)}` +
+                `${identifyModule(handlerWord)} — unwind pass`);
+        } else {
+            Logger.warn(LogCategory.SYSTEM,
+                `[SEH-UNWIND] frame=0x${frame.toString(16)} handler=0x${handlerWord.toString(16)} ` +
+                `out of range — skipping its unwind pass`);
         }
 
         frame = next;
     }
-
-    // Update FS:[0] = targetFrame->next — RtlUnwind removes frames up to AND INCLUDING target.
-    // Setting FS:[0] = targetFrame would leave it in the chain, causing self-loop when
-    // the game reuses that stack address for a new __try block.
-    if (targetFrame !== 0) {
-        const targetNext = (targetFrame + 4 <= mem.length)
-            ? dv.getUint32(targetFrame, true) >>> 0
-            : 0xFFFFFFFF;
-        dv.setUint32(tebAddr, targetNext, true);
+    if (frameCount >= 64 && frame !== targetFrame) {
+        recordSehUnwindTrace(`  => TRUNCATED at 64 frames, target 0x${targetFrame.toString(16)} not reached`);
+        Logger.warn(LogCategory.SYSTEM,
+            `[SEH-UNWIND] chain walk hit the 64-frame cap before target ` +
+            `0x${targetFrame.toString(16)} — the rest of the chain keeps its handlers unrun`);
     }
 
-    if (handlers.length === 0) {
+    // End state: FS:[0] is the frame the walk stopped at. Wine pops each frame as it goes
+    // and exits the loop on `frame == pEndFrame`, so the TARGET FRAME STAYS on the chain —
+    // it is the catching frame, and for _except_handler3 (one registration per function,
+    // shared across its __try blocks via trylevel) the function keeps running into its
+    // __except block still relying on its own registration being live. This value and the
+    // no-steps path in RtlUnwind must agree; they used to disagree, one unlinking the very
+    // frame the other kept.
+    //
+    // An ABNORMAL stop is the exception: `frame` is then the very thing we just rejected —
+    // a cycle member, an out-of-bounds pointer, or a frame past the target — and writing it
+    // back republishes the damage the walk exists to detect (the next throw walks the same
+    // loop again). Fall back to the target, which is the frame the caller is unwinding TO
+    // and the one it keeps.
+    const truncated = frameCount >= 64 && frame !== targetFrame;
+    const targetUsable = targetFrame !== 0 && targetFrame !== 0xFFFFFFFF;
+    const finalHead = (aborted || truncated) && targetUsable ? targetFrame : frame;
+    dv.setUint32(tebAddr, finalHead, true);
+
+    if (steps.length === 0) {
+        recordSehUnwindTrace(`  => NO STEPS in ${frameCount} frame(s) — nothing runs`);
         Logger.log(LogCategory.SYSTEM,
-            `[SEH-FINALLY] No __finally blocks in ${frameCount} frame(s), returning normally`);
+            `[SEH-UNWIND] Nothing to unwind in ${frameCount} frame(s), returning normally`);
         return null;
     }
 
@@ -1557,26 +1633,73 @@ export function dispatchFinallyUnwind(
     // After stdcall RET thunkCleanupBytes: ESP = ctx_esp + 4 + thunkCleanupBytes
     const callerEsp = (ctx_esp + 4 + thunkCleanupBytes) >>> 0;
 
-    // Place trampoline in dead stack, just above callerEsp (4-byte aligned)
-    const trampolineAddr = (callerEsp + 3) & ~3;
+    // Place the trampoline BELOW the RtlUnwind frame, not above callerEsp. "Above the
+    // caller's stack pointer" is not reliably dead: lj_vm_rtlunwind parks the unwinder
+    // address and errcode there on purpose and pops them with the RET that follows
+    // RtlUnwind, so a trampoline written at callerEsp ate its continuation. Everything
+    // below ctx_esp is genuinely free — the trampoline's first instruction moves ESP to
+    // the SEH scratch stack, so no handler call ever pushes into the guest stack.
+    //
+    // Per step: 4 pushes (2+5+5+5) + MOV EAX,imm32 + CALL EAX + ADD ESP,16 +
+    // MOV [teb],imm32 (5+2+3+10) = 37. Prologue 5 + epilogue 25. The first 32 bytes of the
+    // block hold a synthesized EXCEPTION_RECORD when the caller passed none, so the depth
+    // is derived from the step count rather than a fixed reservation that a deep chain
+    // would silently overrun.
+    // sizeof(EXCEPTION_RECORD) on 32-bit: 5 DWORDs + ExceptionInformation[15] = 0x50.
+    // Under-reserving it puts the trampoline's own bytes inside the record a handler is
+    // entitled to read in full.
+    const RECORD_SLOT = 0x50;
+    // The trampoline's return slot gets its own word BELOW the code and ABOVE the record.
+    // Folding it into the record's tail would write machine code into
+    // ExceptionInformation, which is only invisible while NumberParameters is 0.
+    const RET_SLOT = 4;
+    const trampolineSize = 30 + steps.length * 37;
+    const scratchBase = ((ctx_esp - (RECORD_SLOT + RET_SLOT + trampolineSize + 16)) & ~3) >>> 0;
+    const trampolineAddr = (scratchBase + RECORD_SLOT + RET_SLOT) >>> 0;
 
-    // Trampoline size: 5 + N*10 + 10 + 5 + 5 + 5 = 30 + N*10
-    const trampolineSize = 30 + handlers.length * 10;
-
-    // Dead stack available: from trampolineAddr to targetFrame
-    const deadSpace = targetFrame - trampolineAddr;
-    if (deadSpace < trampolineSize + 16) {
+    // The block must be writable guest memory the region map agrees about, not merely
+    // in-bounds. ctx_esp is the RtlUnwind caller's stack in the normal case, but a handler
+    // called from a previous trampoline runs on the SEH scratch stack, and a nested unwind
+    // from there would place this block below that stack — off the end of the region.
+    if (scratchBase < 0x10000 || scratchBase >= ctx_esp || (ctx_esp - scratchBase) > 0x2000
+        || trampolineAddr + trampolineSize > mem.length
+        || !isValidAddress(mem, scratchBase, RECORD_SLOT + RET_SLOT + trampolineSize, 'rw')) {
         Logger.warn(LogCategory.SYSTEM,
-            `[SEH-FINALLY] Dead stack too small: need ${trampolineSize + 16}, have ${deadSpace} ` +
-            `(trampolineAddr=0x${trampolineAddr.toString(16)} targetFrame=0x${targetFrame.toString(16)})`);
+            `[SEH-UNWIND] No room below the frame for a ${trampolineSize}-byte trampoline ` +
+            `(scratchBase=0x${scratchBase.toString(16)} ctx_esp=0x${ctx_esp.toString(16)})`);
         return null;
     }
 
     const sehStackTop = getSehStackTop();
     if (!sehStackTop) {
-        Logger.warn(LogCategory.SYSTEM, `[SEH-FINALLY] No SEH scratch stack — cannot generate trampoline`);
+        Logger.warn(LogCategory.SYSTEM, `[SEH-UNWIND] No SEH scratch stack — cannot generate trampoline`);
         return null;
     }
+
+    // Windows never calls a handler with a NULL ExceptionRecord: RtlUnwind builds a
+    // STATUS_UNWIND record on its own stack when the caller passes none, and an exit unwind
+    // (no target frame) is marked as such. Handing the handler a NULL instead makes an
+    // ordinary field read fault inside somebody's runtime.
+    let recordPtr = excRecPtr;
+    if (recordPtr === 0) {
+        const STATUS_UNWIND = 0xC0000027;
+        const EH_UNWINDING = 0x02, EH_EXIT_UNWIND = 0x04;
+        recordPtr = scratchBase;
+        dv.setUint32(recordPtr, STATUS_UNWIND, true);                                  // ExceptionCode
+        dv.setUint32(recordPtr + 4, EH_UNWINDING | (targetFrame ? 0 : EH_EXIT_UNWIND), true);
+        dv.setUint32(recordPtr + 8, 0, true);                                          // ExceptionRecord
+        dv.setUint32(recordPtr + 12, dv.getUint32(ctx_esp, true), true);               // ExceptionAddress
+        dv.setUint32(recordPtr + 16, 0, true);                                         // NumberParameters
+        recordSehUnwindTrace(`  synthesized STATUS_UNWIND record at 0x${recordPtr.toString(16)}`);
+    }
+
+    // ContextRecord/DispatcherContext for the unwind pass. Windows hands the UNWINDER's
+    // captured context here, not the fault's, and neither _except_handler3 nor a VM
+    // runtime reads it on this pass — RtlUnwind's contract is "run your teardown". We
+    // have no captured context at this point, so pass NULL rather than a pointer to
+    // something that is not one; a handler that dereferences it faults visibly instead of
+    // reading another dispatch's registers as its own.
+    const contextPtr = 0;
 
     // Generate trampoline
     let off = trampolineAddr;
@@ -1584,19 +1707,28 @@ export function dispatchFinallyUnwind(
     // MOV ESP, sehStackTop — switch to safe stack so CALL return addrs don't corrupt dead stack
     dv.setUint8(off, 0xBC); dv.setUint32(off + 1, sehStackTop, true); off += 5;
 
-    // For each __finally handler: MOV EBP, frameEbp; CALL handler
-    for (const { handler, frameEbp } of handlers) {
-        dv.setUint8(off, 0xBD); dv.setUint32(off + 1, frameEbp, true); off += 5;
-        dv.setUint8(off, 0xE8); dv.setInt32(off + 1, handler - (off + 5), true); off += 5;
+    for (const st of steps) {
+        // handler(ExceptionRecord, EstablisherFrame, ContextRecord, DispatcherContext), cdecl.
+        // Pushed in reverse. The record already carries EH_UNWINDING (set by the caller).
+        dv.setUint8(off, 0x6A); dv.setUint8(off + 1, 0x00); off += 2;               // PUSH 0 (dispatcher)
+        dv.setUint8(off, 0x68); dv.setUint32(off + 1, contextPtr, true); off += 5;  // PUSH ContextRecord
+        dv.setUint8(off, 0x68); dv.setUint32(off + 1, st.frame, true); off += 5;    // PUSH EstablisherFrame
+        dv.setUint8(off, 0x68); dv.setUint32(off + 1, recordPtr, true); off += 5;   // PUSH ExceptionRecord
+        dv.setUint8(off, 0xB8); dv.setUint32(off + 1, st.handler, true); off += 5;  // MOV EAX, handler
+        dv.setUint8(off, 0xFF); dv.setUint8(off + 1, 0xD0); off += 2;               // CALL EAX
+        dv.setUint8(off, 0x83); dv.setUint8(off + 1, 0xC4); dv.setUint8(off + 2, 0x10); off += 3; // ADD ESP,16
+        // Pop the frame only after its handler ran — Windows unlinks in that order, and a
+        // handler that walks FS:[0] must still see itself on the chain.
+        dv.setUint8(off, 0xC7); dv.setUint8(off + 1, 0x05);
+        dv.setUint32(off + 2, tebAddr, true); dv.setUint32(off + 6, st.next, true);
+        off += 10;
     }
 
-    // MOV DWORD PTR [tebAddr], targetNext — re-confirm FS:[0] update (C7 05 addr32 imm32)
-    // Must use targetFrame->next (not targetFrame itself) to fully unlink the handled frame.
-    const trampolineTargetNext = (targetFrame + 4 <= mem.length)
-        ? dv.getUint32(targetFrame, true) >>> 0
-        : 0xFFFFFFFF;
+    // MOV DWORD PTR [tebAddr], finalHead — re-confirm the end state (C7 05 addr32 imm32).
+    // Same value the per-step pops arrive at; the store makes it true even if a handler
+    // left the chain somewhere else.
     dv.setUint8(off, 0xC7); dv.setUint8(off + 1, 0x05);
-    dv.setUint32(off + 2, tebAddr, true); dv.setUint32(off + 6, trampolineTargetNext, true);
+    dv.setUint32(off + 2, tebAddr, true); dv.setUint32(off + 6, finalHead, true);
     off += 10;
 
     // MOV EAX, returnValue
@@ -1607,15 +1739,17 @@ export function dispatchFinallyUnwind(
 
     // JMP retAddr (rel32) — return to caller of RtlUnwind
     dv.setUint8(off, 0xE9); dv.setInt32(off + 1, retAddr - (off + 5), true); off += 5;
+    invalidateGuestCode(trampolineAddr, off - trampolineAddr);
 
     Logger.warn(LogCategory.SYSTEM,
-        `[SEH-FINALLY] Trampoline at 0x${trampolineAddr.toString(16)} size=${off - trampolineAddr} ` +
-        `handlers=${handlers.length} retAddr=0x${retAddr.toString(16)} callerEsp=0x${callerEsp.toString(16)}`);
+        `[SEH-UNWIND] Trampoline at 0x${trampolineAddr.toString(16)} size=${off - trampolineAddr} ` +
+        `steps=${steps.length} retAddr=0x${retAddr.toString(16)} callerEsp=0x${callerEsp.toString(16)}`);
 
     // Set up CPU so the thunk stub's RET N lands at trampolineAddr.
     // RET N: EIP = [ESP]; ESP += 4 + N
     // We place trampolineAddr at [trampolineAddr - 4] and set ESP = trampolineAddr - 4.
-    // trampolineAddr - 4 sits in the dead stack (within the RtlUnwind arg area).
+    // That word is RET_SLOT — its own reservation between the record and the code, so
+    // neither the handler's view of the record nor the trampoline's first byte overlaps it.
     dv.setUint32(trampolineAddr - 4, trampolineAddr, true);
     cpu.reg32[4] = trampolineAddr - 4;
 
@@ -1635,7 +1769,7 @@ export function dispatchFinallyUnwind(
  * frames being unwound between the current SEH head and that Registration frame, then
  * return normally (the caller performs the actual longjmp() afterwards).
  *
- * Unlike RtlUnwind/dispatchFinallyUnwind (which only understands trylevel/scopetable
+ * Unlike RtlUnwind/dispatchUnwindPass (which only understands trylevel/scopetable
  * __finally frames), this walks BOTH VC5/6 (__except_handler3 FuncInfo) and VC7+
  * (__CxxFrameHandler3 funclet) EH frames — mirroring dispatchCxxException's frame
  * recognition — and fully unwinds each frame's own unwind map (every destructor reachable
@@ -1773,6 +1907,7 @@ export function dispatchLongjmpUnwind(
     dv.setUint8(off, 0xBC); dv.setUint32(off + 1, callerEsp, true); off += 5;
     // JMP retAddr — resume the caller (which will perform the actual longjmp).
     dv.setUint8(off, 0xE9); dv.setInt32(off + 1, retAddr - (off + 5), true); off += 5;
+    invalidateGuestCode(trampolineAddr, off - trampolineAddr);
 
     Logger.warn(LogCategory.SYSTEM,
         `[CXX-LONGJMP] Trampoline at 0x${trampolineAddr.toString(16)} size=${off - trampolineAddr} ` +
@@ -1796,7 +1931,155 @@ export function dispatchLongjmpUnwind(
 }
 
 /**
+ * Returned when the JS walk hits a registration it cannot parse as MSVC C++ EH
+ * (e.g. a __try/__except frame via _except_handler4) BEFORE finding a catch.
+ * Windows RtlDispatchException calls EVERY handler in chain order — such a frame's
+ * filter may claim the exception, so the caller must re-dispatch the whole
+ * exception through x86 SEH (guest handlers) instead of trusting the JS scan.
+ * Carries the rethrow-resolved object/throwInfo so the x86 record can be
+ * completed when the active exception was tracked only on the JS side.
+ */
+export interface CxxDispatchDefer {
+    deferToX86: true;
+    pExceptionObject: number;
+    pThrowInfo: number;
+}
+
+/** How a registration in the FS:[0] chain parses as an MSVC C++ EH frame. */
+interface CxxFrameShape {
+    funcInfoPtr: number;
+    state: number;
+    /** Byte offset of the try-level field inside the registration record. */
+    stateOffset: number;
+    isVC7: boolean;
+    frameEbp: number;
+}
+
+/**
+ * Classify one FS:[0] registration. THE single definition of "is this ours" — the read-only
+ * search pass and the mutating walk both go through it, so the pass that decides to defer
+ * cannot disagree with the pass that would have caught.
+ */
+export function classifyCxxFrame(dv: DataView, mem: Uint8Array, sehHead: number, handlerAddr: number): CxxFrameShape | null {
+    const frameEbp = sehHead + EH_PROLOG_EBP_DELTA;
+
+    // VC5/6: FuncInfo* at [+8], try-level at [+12].
+    const field8 = dv.getUint32(sehHead + 8, true);
+    const field12 = dv.getInt32(sehHead + 12, true);
+    if (field8 >= 0x10000 && field8 + 20 < mem.length && field12 >= -1 && field12 < 256) {
+        let magic = 0;
+        try { magic = dv.getUint32(field8, true); } catch { /* */ }
+        if (isMsvcEhMagic(magic)) {
+            return { funcInfoPtr: field8, state: field12, stateOffset: 12, isVC7: false, frameEbp };
+        }
+    }
+
+    // VC7+: try-level at [+8], FuncInfo* extracted from the handler thunk.
+    const vc7State = dv.getInt32(sehHead + 8, true);
+    if (vc7State >= -1 && vc7State < 256) {
+        const funcInfo = extractFuncInfoFromThunk(mem, handlerAddr);
+        if (funcInfo >= 0x10000 && funcInfo + 20 < mem.length) {
+            let magic = 0;
+            try { magic = dv.getUint32(funcInfo, true); } catch { /* */ }
+            if (isMsvcEhMagic(magic)) {
+                return { funcInfoPtr: funcInfo, state: vc7State, stateOffset: 8, isVC7: true, frameEbp };
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Read-only half of tryMatchCatch: would this FuncInfo catch this throw at `trylevel`?
+ * Extracted so the defer decision can be taken BEFORE any frame state is written; the
+ * matching rules must stay identical to tryMatchCatch's, which is why both read the same
+ * TryBlockMap fields in the same order.
+ */
+export function frameCatchesThrow(
+    dv: DataView,
+    mem: Uint8Array,
+    funcInfoPtr: number,
+    trylevel: number,
+    pThrowInfo: number,
+    innerOfCatch?: { tryHighAbove: number; catchHighMax: number },
+): boolean {
+    const nTryBlocks = dv.getUint32(funcInfoPtr + 12, true);
+    const pTryBlockMap = dv.getUint32(funcInfoPtr + 16, true);
+    if (nTryBlocks === 0 || pTryBlockMap < 0x10000) return false;
+
+    for (let i = 0; i < nTryBlocks && i < 32; i++) {
+        const tBase = pTryBlockMap + i * 20;
+        if (tBase + 20 > mem.length) break;
+        const tryLow = dv.getInt32(tBase, true);
+        const tryHigh = dv.getInt32(tBase + 4, true);
+        const nCatches = dv.getInt32(tBase + 12, true);
+        const pHandlerArray = dv.getUint32(tBase + 16, true);
+        if (trylevel < tryLow || trylevel > tryHigh) continue;
+        if (nCatches <= 0 || pHandlerArray < 0x10000) continue;
+        if (innerOfCatch &&
+            !(tryLow > innerOfCatch.tryHighAbove && tryHigh <= innerOfCatch.catchHighMax)) {
+            continue;
+        }
+        for (let j = 0; j < nCatches && j < 16; j++) {
+            const hBase = pHandlerArray + j * 16;
+            if (hBase + 16 > mem.length) break;
+            const pType = dv.getUint32(hBase + 4, true);
+            const catchAddr = dv.getUint32(hBase + 12, true);
+            if (catchAddr < 0x10000 || catchAddr >= mem.length) continue;
+            if (matchesThrowType(dv, mem, pType, pThrowInfo)) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * SEARCH PHASE, read-only. Windows' RtlDispatchException calls EVERY handler in chain order,
+ * so a registration we cannot parse (typically __except_handler3/4, whose filter may well
+ * claim a C++ throw) must run natively when it stands BEFORE any catch we could serve.
+ *
+ * This runs before the dispatch mutates anything. Deciding later — after the catch-funclet
+ * exit loop has written the try-level, restored PRN_STACK and popped the record + active
+ * exception — would drop the exception object's pmfnUnwind and every catch-body local
+ * destructor, and leave a later bare `throw;` with no active exception to resolve.
+ */
+function chainDefersToX86(
+    dv: DataView,
+    mem: Uint8Array,
+    tebAddr: number,
+    pThrowInfo: number,
+): number | null {
+    // Active catch funclets first: the exit loop consults them ahead of the FS:[0] walk.
+    const records = activeCatchRecords.get(tebAddr) ?? [];
+    for (let r = records.length - 1; r >= 0; r--) {
+        const R = records[r];
+        if (R.pRN + R.stateOffset + 4 > mem.length || R.pRN < 4) continue;
+        const liveState = dv.getInt32(R.pRN + R.stateOffset, true);
+        if (frameCatchesThrow(dv, mem, R.funcInfoPtr, liveState, pThrowInfo,
+            { tryHighAbove: R.tryHigh, catchHighMax: R.catchHigh })) return null;
+        const exitTarget = computeCatchExitTargetState(dv, mem, R.funcInfoPtr, liveState);
+        if (frameCatchesThrow(dv, mem, R.funcInfoPtr, exitTarget, pThrowInfo)) return null;
+    }
+
+    let head = dv.getUint32(tebAddr, true) >>> 0;
+    const visited = new Set<number>();
+    for (let n = 0; n < 64 && head !== 0xFFFFFFFF && head !== 0; n++) {
+        if (visited.has(head) || head + 16 >= mem.length) break;
+        visited.add(head);
+        const handlerAddr = dv.getUint32(head + 4, true);
+        const shape = classifyCxxFrame(dv, mem, head, handlerAddr);
+        if (!shape) return head; // unparseable registration reached first — x86 owns this throw
+        if (frameCatchesThrow(dv, mem, shape.funcInfoPtr, shape.state, pThrowInfo)) return null;
+        head = dv.getUint32(head, true) >>> 0;
+    }
+    return null;
+}
+
+/**
  * Walk the SEH chain and dispatch a C++ exception to the first matching catch block.
+ *
+ * `allowDeferToX86: false` suppresses the defer verdict — for a caller whose x86 re-dispatch
+ * refused (nesting depth, no stub), so the JS walk keeps going past the unparseable frame and
+ * a catch further up is still found rather than the throw going unhandled.
  */
 export function dispatchCxxException(
     mem: Uint8Array,
@@ -1804,10 +2087,20 @@ export function dispatchCxxException(
     pExceptionObject: number,
     pThrowInfo: number,
     thunkCleanupBytes: number,
-): ThunkResult | null {
+    opts?: { allowDeferToX86?: boolean },
+): ThunkResult | CxxDispatchDefer | null {
     const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const tebAddr = cpu.segment_offsets[4];
     let sehHead = dv.getUint32(tebAddr, true);
+
+    // Snapshot a NEW throw into the harness ring (cxxThrows) — this is the single choke
+    // point every C++ exception passes through, whatever raised it (RaiseException thunk,
+    // an app's static _CxxThrowException, a rethrow's re-entry all funnel here). A heuristic
+    // stack scan from the current ESP recovers the guest raiser past the FPO CRT frames an
+    // EBP walk can't, before the stack unwinds and a fatal MessageBox pauses the guest.
+    if ((pExceptionObject >>> 0) !== 0 && (pThrowInfo >>> 0) !== 0) {
+        captureCxxThrow(mem, cpu.reg32[4] >>> 0, pExceptionObject >>> 0, pThrowInfo >>> 0);
+    }
 
     // Re-throw support: `throw;` passes pObj=0, pThrow=0 — resolve from the stored
     // exception. NOTE the lifecycle (matches CRT CallCatchBlock, NOT the old model):
@@ -1881,6 +2174,21 @@ export function dispatchCxxException(
         `ESP=0x${throwEsp.toString(16)} objPtr=0x${pExceptionObject.toString(16)}` +
         (typeName ? ` type="${typeName}"` : '') +
         (thrownStr ? ` thrown="${thrownStr}"` : ''));
+
+    // SEARCH PHASE — decide before anything is written (see chainDefersToX86).
+    if (opts?.allowDeferToX86 !== false) {
+        const deferFrame = chainDefersToX86(dv, mem, tebAddr, pThrowInfo);
+        if (deferFrame !== null) {
+            Logger.warn(LogCategory.SYSTEM,
+                `SEH dispatch: frame 0x${deferFrame.toString(16)} ` +
+                `(handler=0x${(dv.getUint32(deferFrame + 4, true) >>> 0).toString(16)}) is not MSVC C++ EH and ` +
+                `precedes any catch we could serve — deferring dispatch to x86 SEH so its filter runs faithfully`);
+            if (currentThrowRecord && currentThrowRecord.outcome === 'pending') {
+                currentThrowRecord.outcome = 'deferred-x86';
+            }
+            return { deferToX86: true, pExceptionObject, pThrowInfo };
+        }
+    }
 
     let frameCount = 0;
     const skippedFrames: SkippedFrameInfo[] = [];
@@ -2008,80 +2316,44 @@ export function dispatchCxxException(
             `SEH frame #${frameCount}: addr=0x${sehHead.toString(16)} next=0x${(next >>> 0).toString(16)} ` +
             `handler=0x${handlerAddr.toString(16)} [+8]=0x${field8.toString(16)} [+12]=0x${(field12 >>> 0).toString(16)}`);
 
-        // === Try VC5/6 layout first ===
-        if (field8 >= 0x10000 && field8 + 20 < mem.length && field12 >= -1 && field12 < 256) {
-            let magic = 0;
-            try { magic = dv.getUint32(field8, true); } catch { /* */ }
-            if (isMsvcEhMagic(magic)) {
-                Logger.log(LogCategory.SYSTEM,
-                    `  -> VC5/6 layout: FuncInfo=0x${field8.toString(16)} magic=0x${magic.toString(16)} trylevel=${field12} EBP=0x${(sehHead + EH_PROLOG_EBP_DELTA).toString(16)}`);
-                if (isImplausibleFrameEbp(sehHead + EH_PROLOG_EBP_DELTA, mem.length)) {
-                    Logger.error(LogCategory.SYSTEM,
-                        `SEH walk: implausible VC5/6 frame EBP=0x${(sehHead + EH_PROLOG_EBP_DELTA).toString(16)} ` +
-                        `(pRN=0x${sehHead.toString(16)}, handler=0x${handlerAddr.toString(16)}) — stale/garbage record?`);
-                    recordSehDispatchTrace(
-                        `WILD-EBP vc56 pRN=0x${sehHead.toString(16)} ebp=0x${(sehHead + EH_PROLOG_EBP_DELTA).toString(16)} handler=0x${handlerAddr.toString(16)}`);
-                }
-                const result = tryMatchCatch(
-                    dv, mem, field8, field12,
-                    sehHead + EH_PROLOG_EBP_DELTA, sehHead, 12, tebAddr, next,
-                    pExceptionObject, pThrowInfo, cpu, thunkCleanupBytes, false,
-                    skippedFrames, throwEsp, isRethrow, pendingExitActions,
-                );
-                if (result) {
-                    return result;
-                }
-                // No catch match — record as skipped with unwind info
-                const vc56Actions = readUnwindActions(dv, mem, field8, field12);
-                skippedFrames.push({
-                    sehHead, handlerAddr, state: field12, isVC7: false,
-                    funcInfoPtr: field8, frameEbp: sehHead + EH_PROLOG_EBP_DELTA, unwindActions: vc56Actions,
-                });
-                sehHead = next;
-                continue;
-            }
+        const shape = classifyCxxFrame(dv, mem, sehHead, handlerAddr);
+        if (!shape) {
+            // Not a recognizable C++ EH frame — a __try/__except registration
+            // (__except_handler4: shared handler, cookie-XORed scope table). Whether its
+            // filter gets to run was already settled by the search phase; here it can only
+            // be skipped, so an outer catch stays reachable.
+            Logger.log(LogCategory.SYSTEM,
+                `  -> frame handler=0x${handlerAddr.toString(16)} is not MSVC C++ EH — skipping`);
+            sehHead = next;
+            continue;
         }
 
-        // === Try VC7+ layout ===
-        const vc7State = dv.getInt32(sehHead + 8, true);
-        if (vc7State >= -1 && vc7State < 256) {
-            const funcInfoFromThunk = extractFuncInfoFromThunk(mem, handlerAddr);
-            if (funcInfoFromThunk >= 0x10000 && funcInfoFromThunk + 20 < mem.length) {
-                let magic = 0;
-                try { magic = dv.getUint32(funcInfoFromThunk, true); } catch { /* */ }
-                if (isMsvcEhMagic(magic)) {
-                    const frameEbp = sehHead + EH_PROLOG_EBP_DELTA;
-                    Logger.log(LogCategory.SYSTEM,
-                        `  -> VC7+ layout: FuncInfo=0x${funcInfoFromThunk.toString(16)} magic=0x${magic.toString(16)} state=${vc7State} EBP=0x${frameEbp.toString(16)}`);
-                    if (isImplausibleFrameEbp(frameEbp, mem.length)) {
-                        Logger.error(LogCategory.SYSTEM,
-                            `SEH walk: implausible VC7+ frame EBP=0x${frameEbp.toString(16)} ` +
-                            `(pRN=0x${sehHead.toString(16)}, handler=0x${handlerAddr.toString(16)}) — stale/garbage record?`);
-                        recordSehDispatchTrace(
-                            `WILD-EBP vc7 pRN=0x${sehHead.toString(16)} ebp=0x${frameEbp.toString(16)} handler=0x${handlerAddr.toString(16)}`);
-                    }
-                    const result = tryMatchCatch(
-                        dv, mem, funcInfoFromThunk, vc7State,
-                        frameEbp, sehHead, 8, tebAddr, next,
-                        pExceptionObject, pThrowInfo, cpu, thunkCleanupBytes, true,
-                        skippedFrames, throwEsp, isRethrow, pendingExitActions,
-                    );
-                    if (result) {
-                        return result;
-                    }
-                    // No catch match — record as skipped with unwind info
-                    const vc7Actions = readUnwindActions(dv, mem, funcInfoFromThunk, vc7State);
-                    skippedFrames.push({
-                        sehHead, handlerAddr, state: vc7State, isVC7: true,
-                        funcInfoPtr: funcInfoFromThunk, frameEbp, unwindActions: vc7Actions,
-                    });
-                    sehHead = next;
-                    continue;
-                }
-            }
+        Logger.log(LogCategory.SYSTEM,
+            `  -> ${shape.isVC7 ? 'VC7+' : 'VC5/6'} layout: FuncInfo=0x${shape.funcInfoPtr.toString(16)} ` +
+            `state=${shape.state} EBP=0x${shape.frameEbp.toString(16)}`);
+        if (isImplausibleFrameEbp(shape.frameEbp, mem.length)) {
+            Logger.error(LogCategory.SYSTEM,
+                `SEH walk: implausible ${shape.isVC7 ? 'VC7+' : 'VC5/6'} frame EBP=0x${shape.frameEbp.toString(16)} ` +
+                `(pRN=0x${sehHead.toString(16)}, handler=0x${handlerAddr.toString(16)}) — stale/garbage record?`);
+            recordSehDispatchTrace(
+                `WILD-EBP ${shape.isVC7 ? 'vc7' : 'vc56'} pRN=0x${sehHead.toString(16)} ` +
+                `ebp=0x${shape.frameEbp.toString(16)} handler=0x${handlerAddr.toString(16)}`);
         }
-
-        Logger.log(LogCategory.SYSTEM, `  -> skipped (no MSVC FuncInfo found)`);
+        const result = tryMatchCatch(
+            dv, mem, shape.funcInfoPtr, shape.state,
+            shape.frameEbp, sehHead, shape.stateOffset, tebAddr, next,
+            pExceptionObject, pThrowInfo, cpu, thunkCleanupBytes, shape.isVC7,
+            skippedFrames, throwEsp, isRethrow, pendingExitActions,
+        );
+        if (result) {
+            return result;
+        }
+        // No catch match — record as skipped with unwind info
+        skippedFrames.push({
+            sehHead, handlerAddr, state: shape.state, isVC7: shape.isVC7,
+            funcInfoPtr: shape.funcInfoPtr, frameEbp: shape.frameEbp,
+            unwindActions: readUnwindActions(dv, mem, shape.funcInfoPtr, shape.state),
+        });
         sehHead = next;
     }
 

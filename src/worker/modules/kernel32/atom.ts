@@ -14,6 +14,11 @@ import { encodeAnsi } from '../codepage-utils';
 const atomTable: Map<number, string> = new Map();
 let nextAtomId = 0xC000; // Start from user-defined atom range
 
+export function resetAtomTable(): void {
+    atomTable.clear();
+    nextAtomId = 0xC000;
+}
+
 export const exports: Record<string, ThunkImplementation> = {
     /**
      * GlobalAddAtomA - Adds a character string to the global atom table

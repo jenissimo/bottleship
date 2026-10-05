@@ -14,6 +14,7 @@
  */
 
 import type { LoadedPEModule } from '../module-registry';
+import { writeGuestCode } from '../memory/guest-code';
 import type { ThunkDispatcher, ThunkImplementation, X86Context } from '../thunking/thunk-dispatcher';
 import type { ThunkGenerator } from '../thunking/thunk-generator';
 import { applyPatch, type PatchContext } from '../hle-lib/lib-patcher';
@@ -23,8 +24,6 @@ import type { HookSpec, HookInvocation, HookStats } from './types';
 interface HookRegistryInit {
     dispatcher: ThunkDispatcher;
     thunkGenerator: ThunkGenerator;
-    /** Late-bound so we grab a fresh cpu handle at patch time (jit_dirty_cache). */
-    getCpu: () => any;
     getMemory: () => Uint8Array | null;
 }
 
@@ -109,7 +108,6 @@ class HookRegistry {
         const patchCtx: PatchContext = {
             dispatcher: this.init.dispatcher,
             thunkGenerator: this.init.thunkGenerator,
-            cpu: this.init.getCpu(),
             getMemory: this.init.getMemory,
         };
 
@@ -263,15 +261,7 @@ class HookRegistry {
             console.warn(`[hooks] unpatch: guest memory unavailable for ${id}`);
             return false;
         }
-        mem.set(handle.originalBytes, handle.targetAddress);
-        try {
-            const cpu = this.init?.getCpu();
-            if (cpu && cpu['jit_dirty_cache']) {
-                cpu['jit_dirty_cache'](handle.targetAddress, handle.targetAddress + handle.originalBytes.length);
-            }
-        } catch (e) {
-            console.warn(`[hooks] unpatch: jit_dirty_cache threw: ${e}`);
-        }
+        writeGuestCode(mem, handle.originalBytes, handle.targetAddress);
         this.patches.delete(id);
         const st = this.stats.get(id);
         if (st) st.patched = false;

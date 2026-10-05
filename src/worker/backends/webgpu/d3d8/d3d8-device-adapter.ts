@@ -11,21 +11,26 @@ import type { DirectDrawSurfaceState, RenderSurface, BitmapTextureSurface } from
 import { surfaceSyncManager } from '../../../modules/ddraw/surface-sync';
 import type { Viewport } from '../ddraw/types';
 import { sanitizeViewport } from '../ddraw/types';
+import { recordGpuError } from '../../../core/gpu-error-log';
+import { registerGpuDeviceObserver } from '../../../core/gpu/gpu-device-lifecycle';
+import { registerDDrawSurfaceSource } from '../../../modules/ddraw/surface-device-loss';
 import type { RenderActive } from '../../../runtime/runtime-services';
 import { createRenderTarget } from '../shared/surface-factory';
 import { decodeD3DTextureToRgba8, getD3DTextureLayout, D3DFMT_P8, D3DFMT_A8P8 } from '../shared/texture-formats';
 import { TexturePaletteStore } from '../shared/texture-palette-store';
+import { D3DTEXF_NONE, D3DTEXF_POINT } from './d3d8-sampler';
 import { Logger, LogCategory } from '../../../core/logger';
 import * as frameCapture from '../../../modules/ddraw/frame-capture';
 import { System } from '../../../core/system';
-import { framePacer } from '../../../core/frame-pacer';
+import { framePacer, decodeD3DPresentInterval, PRESENT_INTERVAL_ONE } from '../../../core/frame-pacer';
 import { frameProfiler } from '../../../core/frame-profiler';
 import { profiler } from '../../../core/profiler';
 import { statsOverlay } from '../../../core/stats-overlay';
 import { WebGPUBackend } from '../webgpu-backend';
+import { alignUploadRange, noteBufferUpload, noteGuestBufferWrite } from '../buffer-upload';
 import { EmulatorConfig } from '../../../core/emulator-config-manager';
-import { shouldSuppress3DGdiOverlay } from '../../../modules/ddraw/gdi-visibility';
-import { hasLiveDialogOverlay, getLiveDialogOverlayRects } from '../../../modules/user32/dialog-overlay';
+import { getOverlayCompositePlan } from '../../../modules/user32/dialog-overlay';
+import { getVideoPlanePlan, notifyVideoPlaneComposited } from '../../../video/video-plane-policy';
 import {
     D3DRENDERSTATE_ALPHABLENDENABLE,
     D3DRENDERSTATE_ALPHAFUNC,
@@ -47,9 +52,19 @@ import {
     D3DRENDERSTATE_POINTSIZE,
     D3DRENDERSTATE_POINTSIZE_MIN,
     D3DRENDERSTATE_POINTSIZE_MAX,
+    D3DRENDERSTATE_POINTSCALE_A,
     D3DRENDERSTATE_SHADEMODE,
     D3DRENDERSTATE_SPECULARENABLE,
     D3DRENDERSTATE_SRCBLEND,
+    D3DRENDERSTATE_STENCILMASK,
+    D3DRENDERSTATE_STENCILENABLE,
+    D3DRENDERSTATE_STENCILFAIL,
+    D3DRENDERSTATE_STENCILZFAIL,
+    D3DRENDERSTATE_STENCILPASS,
+    D3DRENDERSTATE_STENCILFUNC,
+    D3DRENDERSTATE_STENCILREF,
+    D3DSTENCILOP_KEEP,
+    D3DRENDERSTATE_STENCILWRITEMASK,
     D3DRENDERSTATE_TEXTUREFACTOR,
     D3DRENDERSTATE_ZENABLE,
     D3DRENDERSTATE_ZFUNC,
@@ -62,6 +77,7 @@ import {
     D3DRENDERSTATE_LOCALVIEWER,
     D3DTADDRESS_WRAP,
     D3DTA_DIFFUSE,
+    D3DTA_CURRENT,
     D3DTA_TEXTURE,
     D3DBLEND_ONE,
     D3DBLEND_ZERO,
@@ -71,18 +87,17 @@ import {
     D3DFILL_SOLID,
     D3DFOG_NONE,
     D3DSHADE_GOURAUD,
-    D3DTFG_POINT,
-    D3DTFN_POINT,
-    D3DTFP_NONE,
     D3DTOP_DISABLE,
     D3DTOP_MODULATE,
     D3DTOP_SELECTARG1,
     D3DTSS_ADDRESSU,
     D3DTSS_ADDRESSV,
     D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAARG0,
     D3DTSS_ALPHAARG2,
     D3DTSS_ALPHAOP,
     D3DTSS_COLORARG1,
+    D3DTSS_COLORARG0,
     D3DTSS_COLORARG2,
     D3DTSS_COLOROP,
     D3DTSS_MAGFILTER,
@@ -105,9 +120,9 @@ import {
     D3DFVF_XYZB5,
     D3DFVF_LASTBETA_UBYTE4,
     D3DVBF_0WEIGHTS,
-    D3DMULTISAMPLE_2_SAMPLES,
-    D3DMULTISAMPLE_4_SAMPLES,
 } from '../../../modules/ddraw/constants';
+import { resolveDxMsaaPolicy } from '../shared/msaa-policy';
+import { D3DERR_NOTAVAILABLE } from '../shared/dx-format-support';
 import { FFPLightingSource, FFPLightingState } from '../../../modules/ddraw/d3d/ffp-lighting';
 import { D3DMaterial7Data, D3DLight7Data, createDefaultMaterial } from '../../../modules/ddraw/d3d/types';
 import { RGBA } from '../ddraw/types';
@@ -128,7 +143,8 @@ import {
     refreshD3D8CapturedEntries,
 } from './d3d8-state-block';
 import { declToSyntheticFvf, DeclStreamCopy } from './decl-to-ffp';
-import type { StreamVertexBinding } from '../d3d9/d3d9-command-recorder';
+import { isValidAddress } from '../../../core/memory/address-guard';
+import { collectExtraStreamBindings, type StreamVertexBinding } from '../shared/vertex-streams';
 
 // D3D transform types
 const D3DTS_VIEW       = 2;
@@ -136,8 +152,152 @@ const D3DTS_PROJECTION = 3;
 const D3DTS_WORLD      = 256; // 0x100
 const D3DTS_TEXTURE0   = 16;  // D3DTS_TEXTURE0..7 = 16..23
 
+// D3D8-only render states (d3d8types.h) — D3D7's enum stops at 152, so they have no
+// entry in the shared ddraw constants the rest of this adapter imports.
+const D3DRENDERSTATE_COLORWRITEENABLE = 168;
+const D3DRENDERSTATE_BLENDOP          = 171;
+
+/**
+ * Pure D3D8 default render-state table — extracted so it can be pinned by a unit test without
+ * constructing a full D3D8DeviceAdapter (which needs a live WebGPU/guest-memory context). Keep
+ * D3D8 defaults aligned with the DX7 executor defaults (createDefaultRenderStates in
+ * modules/ddraw/d3d/types.ts): the renderer consumes a single shared render-state namespace, so
+ * mismatched indices here can silently turn on invalid states (e.g. ZFUNC=NEVER).
+ */
+export function createD3D8DefaultRenderStates(): Int32Array {
+    const rs = new Int32Array(256);
+    // Keep D3D8 defaults aligned with DX7 executor defaults.
+    // The renderer consumes a single shared render-state namespace, so mismatched
+    // indices here can silently turn on invalid states (e.g. ZFUNC=NEVER).
+        rs[D3DRENDERSTATE_ZENABLE] = D3DZB_TRUE;
+        rs[D3DRENDERSTATE_ZWRITEENABLE] = 1;
+        rs[D3DRENDERSTATE_ZFUNC] = D3DCMP_LESSEQUAL;
+        rs[D3DRENDERSTATE_FILLMODE] = D3DFILL_SOLID;
+        rs[D3DRENDERSTATE_SHADEMODE] = D3DSHADE_GOURAUD;
+        rs[D3DRENDERSTATE_ALPHATESTENABLE] = 0;
+        rs[D3DRENDERSTATE_ALPHAREF] = 0;
+        rs[D3DRENDERSTATE_ALPHAFUNC] = D3DCMP_ALWAYS;
+        rs[D3DRENDERSTATE_ALPHABLENDENABLE] = 0;
+        rs[D3DRENDERSTATE_SRCBLEND] = D3DBLEND_ONE;
+        rs[D3DRENDERSTATE_DESTBLEND] = D3DBLEND_ZERO;
+        rs[D3DRENDERSTATE_CULLMODE] = D3DCULL_CCW;
+        rs[D3DRENDERSTATE_DITHERENABLE] = 0;
+        rs[D3DRENDERSTATE_FOGENABLE] = 0;
+        rs[D3DRENDERSTATE_FOGTABLEMODE] = D3DFOG_NONE;
+        rs[D3DRENDERSTATE_FOGVERTEXMODE] = D3DFOG_NONE;
+        // Float-as-DWORD fog params, D3D defaults (start=0.0, end=1.0, density=1.0).
+        rs[D3DRENDERSTATE_FOGSTART] = 0x00000000;
+        rs[D3DRENDERSTATE_FOGEND] = 0x3F800000;
+        rs[D3DRENDERSTATE_FOGDENSITY] = 0x3F800000;
+        rs[D3DRENDERSTATE_COLORKEYENABLE] = 0;
+        // KNOWN DEVIATION, shared with the D3D7 backend: D3D8's documented default is TRUE,
+        // exactly as in D3D9 — and the D3D9 state tracker does seed TRUE. Seeding FALSE here
+        // keeps the two legacy backends' lighting behaviour identical until this path reaches
+        // parity, at the cost of a title routed through a d3d8→d3d9 wrapper being lit while
+        // the same title on native d3d8 is not. Explicit SetRenderState(LIGHTING, TRUE) works
+        // either way. Close this by flipping it to 1, not by reverting the D3D9 tracker.
+        rs[D3DRENDERSTATE_LIGHTING] = 0;
+        rs[D3DRENDERSTATE_AMBIENT] = 0;
+        rs[D3DRENDERSTATE_SPECULARENABLE] = 0;
+        rs[D3DRENDERSTATE_TEXTUREFACTOR] = 0xffffffff;
+        // D3D FFP colour-source defaults: DIFFUSE=COLOR1, SPECULAR=COLOR2, AMBIENT/EMISSIVE=MATERIAL.
+        // Matches the D3D9 state-tracker defaults; the executor resolves these against COLORVERTEX
+        // and the per-draw FVF so a source naming an absent vertex colour falls back to MATERIAL.
+        rs[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE] = 1; // D3DMCS_COLOR1
+        rs[D3DRENDERSTATE_AMBIENTMATERIALSOURCE] = 0; // D3DMCS_MATERIAL
+        rs[D3DRENDERSTATE_SPECULARMATERIALSOURCE] = 2; // D3DMCS_COLOR2
+        rs[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE] = 0; // D3DMCS_MATERIAL
+        // COLORVERTEX/LOCALVIEWER default TRUE per D3D. renderStates is an Int32Array, so an
+        // unseeded slot reads 0 — the executor would treat that as an explicit FALSE and
+        // collapse every material source to MATERIAL (white ambient×ambient), turning e.g.
+        // translucent black vertex-colored UI panels opaque white (Morrowind main menu).
+        rs[D3DRENDERSTATE_COLORVERTEX] = 1;
+        rs[D3DRENDERSTATE_LOCALVIEWER] = 1;
+        // Point-sprite size render states are FLOATS bit-cast into the DWORD. Seed the D3D
+        // defaults so an explicit 0.0f (points suppressed / no lower clamp) is distinguishable
+        // from "never set" — the point-sprite path reads these directly via rsFloat.
+        rs[D3DRENDERSTATE_POINTSIZE] = 0x3F800000;     // 1.0f
+        rs[D3DRENDERSTATE_POINTSIZE_MIN] = 0x3F800000; // 1.0f
+        rs[D3DRENDERSTATE_POINTSIZE_MAX] = 0x46000000; // 8192.0f (advertised MaxPointSize)
+        // D3DRS_POINTSCALE_A defaults to 1.0f (B/C default to 0.0f, which an unseeded slot
+        // already gives correctly). Left at 0.0f, the attenuation formula
+        // size/sqrt(A+B·De+C·De²) divides by zero the moment a title enables
+        // POINTSCALEENABLE without setting all three constants.
+        rs[D3DRENDERSTATE_POINTSCALE_A] = 0x3F800000; // 1.0f
+
+        // COLORWRITEENABLE's D3D default is ALL channels and BLENDOP's is ADD, and an
+        // unseeded slot reads 0 — which for COLORWRITEENABLE is the LEGAL value "write no
+        // colour", so the difference between "app asked for a depth-only pass" and "app
+        // never touched the state" is not recoverable from the array. Seed both, the way
+        // d3d9-state-tracker does; GetRenderState then reports the D3D defaults too.
+        rs[D3DRENDERSTATE_COLORWRITEENABLE] = 0xF;
+        rs[D3DRENDERSTATE_BLENDOP] = 1; // D3DBLENDOP_ADD
+
+        // Same trap for the stencil masks: 0 is the legal mask "no bits", so a title that
+        // enables stencil without setting them tests against nothing and writes nothing.
+        // All bits of the stencil8 attachment we allocate is 0xff (matches the D3D7 defaults).
+        rs[D3DRENDERSTATE_STENCILMASK] = 0xff;
+        rs[D3DRENDERSTATE_STENCILWRITEMASK] = 0xff;
+        // ...and the same trap once more for the stencil OPS and the compare, where 0 is not
+        // even a legal D3DSTENCILOP/D3DCMP — both enumerations start at 1. A title that enables
+        // stencil without setting them (XIII does, for its shadow passes) reads back nonsense
+        // from GetRenderState and captures nonsense into a state block. The draw path defends
+        // itself with its own fallbacks, so seeding these changes no pixel today; it makes the
+        // state the game can OBSERVE match D3D. Defaults per wined3d stateblock.c.
+        rs[D3DRENDERSTATE_STENCILENABLE] = 0;
+        rs[D3DRENDERSTATE_STENCILFAIL] = D3DSTENCILOP_KEEP;
+        rs[D3DRENDERSTATE_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+        rs[D3DRENDERSTATE_STENCILPASS] = D3DSTENCILOP_KEEP;
+        rs[D3DRENDERSTATE_STENCILFUNC] = D3DCMP_ALWAYS;
+        rs[D3DRENDERSTATE_STENCILREF] = 0;
+
+    return rs;
+}
+
+/** Pure D3D8 default texture-stage-state table — see createD3D8DefaultRenderStates. */
+export function createD3D8DefaultTextureStates(): Int32Array {
+    const states = new Int32Array(256); // 8 stages × 32 TSS types
+        // Stage 0: modulate texture with diffuse, alpha from texture.
+        states[0 * 32 + D3DTSS_COLOROP] = D3DTOP_MODULATE;
+        states[0 * 32 + D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+        states[0 * 32 + D3DTSS_COLORARG2] = D3DTA_DIFFUSE;
+        states[0 * 32 + D3DTSS_ALPHAOP] = D3DTOP_SELECTARG1;
+        states[0 * 32 + D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+        states[0 * 32 + D3DTSS_ALPHAARG2] = D3DTA_DIFFUSE;
+
+        for (let stage = 0; stage < 8; stage++) {
+            const offset = stage * 32;
+            // Seed defaults even on disabled stages: zero is an explicit DIFFUSE selector.
+            states[offset + D3DTSS_COLORARG0] = D3DTA_CURRENT;
+            states[offset + D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
+            states[offset + D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+            states[offset + D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+            states[offset + D3DTSS_COLORARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
+            states[offset + D3DTSS_ALPHAARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
+            states[offset + D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP;
+            states[offset + D3DTSS_ADDRESSV] = D3DTADDRESS_WRAP;
+            states[offset + D3DTSS_TEXCOORDINDEX] = stage;
+            states[offset + D3DTSS_MINFILTER] = D3DTEXF_POINT;
+            states[offset + D3DTSS_MAGFILTER] = D3DTEXF_POINT;
+            states[offset + D3DTSS_MIPFILTER] = D3DTEXF_NONE;
+            if (stage > 0) {
+                states[offset + D3DTSS_COLOROP] = D3DTOP_DISABLE;
+                states[offset + D3DTSS_ALPHAOP] = D3DTOP_DISABLE;
+            }
+        }
+
+    return states;
+}
+
 export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     readonly suppressGdiOverlay = true;
+
+    /** D3DPRESENT_PARAMETERS.Windowed, from CreateDevice and every Reset. */
+    private deviceIsWindowed = true;
+    setWindowed(windowed: boolean): void { this.deviceIsWindowed = windowed; }
+    /** RenderActive: a fullscreen device owns the display like a DDraw flip chain. */
+    get presentsExclusiveFullscreen(): boolean { return !this.deviceIsWindowed; }
+
     // State arrays — passed to FFPRenderer per draw call
     readonly renderStates = new Int32Array(256);
     readonly textureStates = new Int32Array(256); // 8 stages × 32 TSS types
@@ -180,6 +340,16 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private programmable: D3D8ProgrammableRenderer | null = null;
     private vbGpuBuffers = new Map<number, GPUBuffer>();
     private ibGpuBuffers = new Map<number, GPUBuffer>();
+    /**
+     * Byte range of each retained buffer the guest has rewritten since its last upload.
+     * D3D8 hands the guest a raw pointer into the buffer's guest memory and its Unlock is a
+     * no-op, so without this every draw re-uploaded every bound buffer whole. Writing to a
+     * vertex buffer outside a Lock/Unlock bracket is undefined behaviour in D3D8, which is
+     * what makes Lock the faithful "it changed" signal; the mark is taken at Lock rather than
+     * Unlock because the upload happens at draw time, strictly after both.
+     */
+    private vbDirty = new Map<number, { start: number; end: number }>();
+    private ibDirty = new Map<number, { start: number; end: number }>();
     private syntheticDeclFvf = 0;
     private syntheticDeclStride = 0;
     /** Multi-stream decl-only shaders: copy plan into the canonical FVF layout
@@ -189,6 +359,25 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private declStreamStrides: number[] = [];
     /** Reusable interleave scratch (vertices + appended index range). */
     private declScratch = new Uint8Array(0);
+
+    // D3DPT_TRIANGLEFAN expansion scratch: the gathered original indices and the emitted
+    // triangle-list, in both index widths. Grown, never shrunk — a fan draw is per-frame work
+    // and must not allocate three arrays each time (§3.1).
+    private fanGather = new Uint32Array(0);
+    private fanOut16 = new Uint16Array(0);
+    private fanOut32 = new Uint32Array(0);
+    private fanGatherScratch(count: number): Uint32Array {
+        if (this.fanGather.length < count) this.fanGather = new Uint32Array(Math.max(count, 1024));
+        return this.fanGather;
+    }
+    private fanIndexScratch16(count: number): Uint16Array {
+        if (this.fanOut16.length < count) this.fanOut16 = new Uint16Array(Math.max(count, 1024));
+        return this.fanOut16;
+    }
+    private fanIndexScratch32(count: number): Uint32Array {
+        if (this.fanOut32.length < count) this.fanOut32 = new Uint32Array(Math.max(count, 1024));
+        return this.fanOut32;
+    }
 
     // Bound depth-stencil surface COM ptr (0 = none)
     depthStencilSurfacePtr = 0;
@@ -224,7 +413,6 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
     constructor(
         readonly renderer: DDrawWebGPUExecutor,
-        private memory: Uint8Array,
         width: number,
         height: number,
         backend?: WebGPUBackend,
@@ -232,9 +420,33 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.renderTarget = createRenderTarget(width, height);
         this.viewport = { x: 0, y: 0, width, height };
         this.initDefaultStates();
+        // D3D8 writes D3D9's D3DTEXF_* numbering into TSS; the shared executor defaults to
+        // D3D7's, where MIPFILTER's values differ. Declaring it here is what makes a D3D8
+        // title's MIPFILTER request survive the shared path.
+        this.renderer.setFfpFilterVocabulary("d3d9");
         if (backend) {
             this.programmable = new D3D8ProgrammableRenderer(backend);
         }
+        // The two buffer maps are the only device-derived state this adapter owns directly;
+        // both are refilled from guest memory by uploadVb/uploadIb on the next draw.
+        registerGpuDeviceObserver("d3d8-adapter", {
+            onDeviceLost: () => {
+                this.vbGpuBuffers.clear();
+                this.ibGpuBuffers.clear();
+                this.programmable?.onDeviceLost();
+            },
+        });
+        // A D3D8 texture's surface state is NOT a ddraw COM object, so the COM walk never sees
+        // it — this device's own texture map and its render target are the only route to them.
+        registerDDrawSurfaceSource(`d3d8-device-${D3D8DeviceAdapter.nextSourceId++}`, () => this.ownedSurfaces());
+    }
+
+    private static nextSourceId = 0;
+
+    private *ownedSurfaces(): Iterable<{ state: DirectDrawSurfaceState }> {
+        yield { state: this.renderTarget };
+        if (this.rtOverride) yield { state: this.rtOverride };
+        for (const surf of this.texSurfaces.values()) yield { state: surf };
     }
 
     /** Surface all draws/clears target right now (SetRenderTarget override or back buffer). */
@@ -281,12 +493,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return this.stageTexturesScratch;
     }
 
+    /** Guest RAM, re-derived per use — a stored view detaches on WASM growth and the
+     *  adapter outlives any number of growths. */
     private getMemoryView(): Uint8Array {
-        const latest = System.getInstance().process?.getCurrentMemory();
-        if (latest) {
-            this.memory = latest;
-        }
-        return this.memory;
+        return System.getInstance().process!.getCurrentMemory();
     }
 
     setStreamSource(streamNumber: number, vbPtr: number, stride: number): void {
@@ -365,6 +575,26 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return null;
     }
 
+    /** Mark a retained buffer's rewritten range; `size` 0 means "to the end" (D3D8 Lock). */
+    markBufferDirty(kind: "vb" | "ib", ptr: number, offset: number, size: number, totalSize: number): void {
+        const end = size > 0 ? Math.min(offset + size, totalSize) : totalSize;
+        if (end <= offset) return;
+        noteGuestBufferWrite("d3d8", end - offset);
+        const map = kind === "vb" ? this.vbDirty : this.ibDirty;
+        const cur = map.get(ptr);
+        if (cur && cur.end > cur.start) {
+            cur.start = Math.min(cur.start, offset);
+            cur.end = Math.max(cur.end, end);
+        } else {
+            map.set(ptr, { start: offset, end });
+        }
+    }
+
+    /** Buffer created or re-created: nothing on the GPU corresponds to it yet. */
+    markBufferAllDirty(kind: "vb" | "ib", ptr: number, totalSize: number): void {
+        (kind === "vb" ? this.vbDirty : this.ibDirty).set(ptr, { start: 0, end: totalSize });
+    }
+
     private ensureVbGpuBuffer(vbPtr: number, size: number): GPUBuffer | null {
         const device = this.getGpuDevice();
         if (!device) return null;
@@ -372,11 +602,12 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!buf || size > ((buf as GPUBuffer & { __size?: number }).__size ?? 0)) {
             buf?.destroy();
             buf = device.createBuffer({
-                size: Math.max(16, size),
+                size: Math.max(16, (size + 3) & ~3),
                 usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
             });
             (buf as GPUBuffer & { __size?: number }).__size = size;
             this.vbGpuBuffers.set(vbPtr, buf);
+            this.markBufferAllDirty("vb", vbPtr, size);
         }
         return buf;
     }
@@ -388,29 +619,74 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         if (!buf || size > ((buf as GPUBuffer & { __size?: number }).__size ?? 0)) {
             buf?.destroy();
             buf = device.createBuffer({
-                size: Math.max(16, size),
+                size: Math.max(16, (size + 3) & ~3),
                 usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
             });
             (buf as GPUBuffer & { __size?: number }).__size = size;
             this.ibGpuBuffers.set(ibPtr, buf);
+            this.markBufferAllDirty("ib", ibPtr, size);
         }
         return buf;
+    }
+
+    /**
+     * Copy the rewritten range of a retained buffer out of guest memory. Callers invoke this
+     * once per draw per bound buffer, so an unchanged buffer must cost nothing: the range is
+     * consumed here and only a fresh Lock refills it.
+     */
+    private uploadRetained(
+        kind: "vb" | "ib", buf: GPUBuffer, ptr: number, guestPtr: number, size: number, mem: Uint8Array,
+    ): void {
+        const device = this.getGpuDevice();
+        if (!device) return;
+        const map = kind === "vb" ? this.vbDirty : this.ibDirty;
+        const dirty = map.get(ptr);
+        if (!dirty || dirty.end <= dirty.start) return;
+        const { offset, length } = alignUploadRange(dirty.start, Math.min(dirty.end, size), buf.size);
+        dirty.start = 0;
+        dirty.end = 0;
+        if (length === 0) return;
+        // Rounding the range up to a 4-byte boundary can reach past the guest allocation by
+        // up to 3 bytes; those are padding the GPU buffer has room for but guest memory may
+        // not, so copy what exists and zero the rest rather than reading out of bounds.
+        const available = Math.max(0, Math.min(length, mem.length - (guestPtr + offset)));
+        if (available === length) {
+            device.queue.writeBuffer(buf, offset, mem.buffer, mem.byteOffset + guestPtr + offset, length);
+        } else {
+            const padded = new Uint8Array(length);
+            if (available > 0) padded.set(mem.subarray(guestPtr + offset, guestPtr + offset + available));
+            device.queue.writeBuffer(buf, offset, padded);
+        }
+        noteBufferUpload("d3d8", length, offset === 0 && length >= size);
     }
 
     private uploadVb(vbPtr: number, guestPtr: number, size: number, mem: Uint8Array): GPUBuffer | null {
         const buf = this.ensureVbGpuBuffer(vbPtr, size);
         if (!buf) return null;
-        const device = this.getGpuDevice();
-        device?.queue.writeBuffer(buf, 0, mem.buffer, mem.byteOffset + guestPtr, size);
+        this.uploadRetained("vb", buf, vbPtr, guestPtr, size, mem);
         return buf;
     }
 
     private uploadIb(ibPtr: number, guestPtr: number, size: number, mem: Uint8Array): GPUBuffer | null {
         const buf = this.ensureIbGpuBuffer(ibPtr, size);
         if (!buf) return null;
-        const device = this.getGpuDevice();
-        device?.queue.writeBuffer(buf, 0, mem.buffer, mem.byteOffset + guestPtr, size);
+        this.uploadRetained("ib", buf, ibPtr, guestPtr, size, mem);
         return buf;
+    }
+
+    /** Transient index buffer for CPU-expanded D3DPT_TRIANGLEFAN draws (see resolveD3D8Topology /
+     *  buildFanIndices). Not retained across draws — caller must registerPooledBuffer it on the
+     *  frame that consumes it, same convention as the *UP draw paths' scratch VB/IB buffers. */
+    private createTransientIndexBuffer(data: Uint16Array | Uint32Array): GPUBuffer | null {
+        const device = this.getGpuDevice();
+        if (!device) return null;
+        const byteLen = data.byteLength;
+        const buffer = device.createBuffer({
+            size: Math.max(16, (byteLen + 3) & ~3),
+            usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+        });
+        device.queue.writeBuffer(buffer, 0, data.buffer as ArrayBuffer, data.byteOffset, byteLen);
+        return buffer;
     }
 
     private resolveDrawFVF(vbFvf: number): number {
@@ -463,78 +739,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     }
 
     private initDefaultStates(): void {
-        // Keep D3D8 defaults aligned with DX7 executor defaults.
-        // The renderer consumes a single shared render-state namespace, so mismatched
-        // indices here can silently turn on invalid states (e.g. ZFUNC=NEVER).
-        this.renderStates[D3DRENDERSTATE_ZENABLE] = D3DZB_TRUE;
-        this.renderStates[D3DRENDERSTATE_ZWRITEENABLE] = 1;
-        this.renderStates[D3DRENDERSTATE_ZFUNC] = D3DCMP_LESSEQUAL;
-        this.renderStates[D3DRENDERSTATE_FILLMODE] = D3DFILL_SOLID;
-        this.renderStates[D3DRENDERSTATE_SHADEMODE] = D3DSHADE_GOURAUD;
-        this.renderStates[D3DRENDERSTATE_ALPHATESTENABLE] = 0;
-        this.renderStates[D3DRENDERSTATE_ALPHAREF] = 0;
-        this.renderStates[D3DRENDERSTATE_ALPHAFUNC] = D3DCMP_ALWAYS;
-        this.renderStates[D3DRENDERSTATE_ALPHABLENDENABLE] = 0;
-        this.renderStates[D3DRENDERSTATE_SRCBLEND] = D3DBLEND_ONE;
-        this.renderStates[D3DRENDERSTATE_DESTBLEND] = D3DBLEND_ZERO;
-        this.renderStates[D3DRENDERSTATE_CULLMODE] = D3DCULL_CCW;
-        this.renderStates[D3DRENDERSTATE_DITHERENABLE] = 0;
-        this.renderStates[D3DRENDERSTATE_FOGENABLE] = 0;
-        this.renderStates[D3DRENDERSTATE_FOGTABLEMODE] = D3DFOG_NONE;
-        this.renderStates[D3DRENDERSTATE_FOGVERTEXMODE] = D3DFOG_NONE;
-        // Float-as-DWORD fog params, D3D defaults (start=0.0, end=1.0, density=1.0).
-        this.renderStates[D3DRENDERSTATE_FOGSTART] = 0x00000000;
-        this.renderStates[D3DRENDERSTATE_FOGEND] = 0x3F800000;
-        this.renderStates[D3DRENDERSTATE_FOGDENSITY] = 0x3F800000;
-        this.renderStates[D3DRENDERSTATE_COLORKEYENABLE] = 0;
-        // Keep the default aligned with the D3D7 backend until the lighting path
-        // reaches feature parity. Explicit SetRenderState(LIGHTING, TRUE) still works.
-        this.renderStates[D3DRENDERSTATE_LIGHTING] = 0;
-        this.renderStates[D3DRENDERSTATE_AMBIENT] = 0;
-        this.renderStates[D3DRENDERSTATE_SPECULARENABLE] = 0;
-        this.renderStates[D3DRENDERSTATE_TEXTUREFACTOR] = 0xffffffff;
-        // D3D FFP colour-source defaults: DIFFUSE=COLOR1, SPECULAR=COLOR2, AMBIENT/EMISSIVE=MATERIAL.
-        // Matches the D3D9 state-tracker defaults; the executor resolves these against COLORVERTEX
-        // and the per-draw FVF so a source naming an absent vertex colour falls back to MATERIAL.
-        this.renderStates[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE] = 1; // D3DMCS_COLOR1
-        this.renderStates[D3DRENDERSTATE_AMBIENTMATERIALSOURCE] = 0; // D3DMCS_MATERIAL
-        this.renderStates[D3DRENDERSTATE_SPECULARMATERIALSOURCE] = 2; // D3DMCS_COLOR2
-        this.renderStates[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE] = 0; // D3DMCS_MATERIAL
-        // COLORVERTEX/LOCALVIEWER default TRUE per D3D. renderStates is an Int32Array, so an
-        // unseeded slot reads 0 — the executor would treat that as an explicit FALSE and
-        // collapse every material source to MATERIAL (white ambient×ambient), turning e.g.
-        // translucent black vertex-colored UI panels opaque white (Morrowind main menu).
-        this.renderStates[D3DRENDERSTATE_COLORVERTEX] = 1;
-        this.renderStates[D3DRENDERSTATE_LOCALVIEWER] = 1;
-        // Point-sprite size render states are FLOATS bit-cast into the DWORD. Seed the D3D
-        // defaults so an explicit 0.0f (points suppressed / no lower clamp) is distinguishable
-        // from "never set" — the point-sprite path reads these directly via rsFloat.
-        this.renderStates[D3DRENDERSTATE_POINTSIZE] = 0x3F800000;     // 1.0f
-        this.renderStates[D3DRENDERSTATE_POINTSIZE_MIN] = 0x3F800000; // 1.0f
-        this.renderStates[D3DRENDERSTATE_POINTSIZE_MAX] = 0x46000000; // 8192.0f (advertised MaxPointSize)
-
-        // Stage 0: modulate texture with diffuse, alpha from texture.
-        this.textureStates[0 * 32 + D3DTSS_COLOROP] = D3DTOP_MODULATE;
-        this.textureStates[0 * 32 + D3DTSS_COLORARG1] = D3DTA_TEXTURE;
-        this.textureStates[0 * 32 + D3DTSS_COLORARG2] = D3DTA_DIFFUSE;
-        this.textureStates[0 * 32 + D3DTSS_ALPHAOP] = D3DTOP_SELECTARG1;
-        this.textureStates[0 * 32 + D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
-        this.textureStates[0 * 32 + D3DTSS_ALPHAARG2] = D3DTA_DIFFUSE;
-
-        for (let stage = 0; stage < 8; stage++) {
-            const offset = stage * 32;
-            this.textureStates[offset + D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP;
-            this.textureStates[offset + D3DTSS_ADDRESSV] = D3DTADDRESS_WRAP;
-            this.textureStates[offset + D3DTSS_TEXCOORDINDEX] = stage;
-            this.textureStates[offset + D3DTSS_MINFILTER] = D3DTFN_POINT;
-            this.textureStates[offset + D3DTSS_MAGFILTER] = D3DTFG_POINT;
-            this.textureStates[offset + D3DTSS_MIPFILTER] = D3DTFP_NONE;
-            if (stage > 0) {
-                this.textureStates[offset + D3DTSS_COLOROP] = D3DTOP_DISABLE;
-                this.textureStates[offset + D3DTSS_ALPHAOP] = D3DTOP_DISABLE;
-            }
-        }
+        this.renderStates.set(createD3D8DefaultRenderStates());
+        this.textureStates.set(createD3D8DefaultTextureStates());
     }
+
 
     // ---------------------------------------------------------------
     // State setters
@@ -681,6 +889,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             palette: pal,
         });
         bmp.gpuNeedsUpload = true;
+        bmp.contentVersion = (bmp.contentVersion ?? 0) + 1;
     }
 
     // NOTE (perf): setPixelShader/setVertexShader/setFVF must NOT invalidate the programmable
@@ -723,16 +932,34 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     }
 
     /**
-     * Map a D3DPRESENT_PARAMETERS MultiSampleType (D3DMULTISAMPLE_TYPE) to a supported sample
-     * count (2 or 4, else 1) and push it to the shared executor. The executor folds it as
+     * Map a D3DPRESENT_PARAMETERS MultiSampleType to the shared executor only when the
+     * D3D8 policy accepts it. WebGPU has no portable two-sample attachment, so 2x is
+     * refused instead of being silently forwarded to MsaaColorManager/DepthManager.
+     * The executor folds an accepted count as
      * max(quality.msaa, guest-requested) at the next frame boundary, so a game that asks for
      * back-buffer MSAA gets it even when quality.msaa is 1. NONE/NONMASKABLE/other → 1 keeps
      * the guest-NONE default byte-identical. Device-global (matches our single-count backend).
      */
-    applyPresentMultiSampleType(multiSampleType: number): void {
+    applyPresentMultiSampleType(multiSampleType: number): boolean {
         const t = multiSampleType >>> 0;
-        const count = t === D3DMULTISAMPLE_4_SAMPLES ? 4 : t === D3DMULTISAMPLE_2_SAMPLES ? 2 : 1;
-        this.renderer.setGuestRequestedMsaa(count);
+        const policy = resolveDxMsaaPolicy(8, t);
+        if (!policy.supported) {
+            this.renderer.setGuestRequestedMsaa(1);
+            return false;
+        }
+        this.renderer.setGuestRequestedMsaa(policy.sampleCount);
+        return true;
+    }
+
+    /**
+     * D3DPRESENT_PARAMETERS.FullScreen_PresentationInterval, as refreshes to hold each
+     * Present. Same encoding as d3d9's PresentationInterval; windowed mode is required to
+     * pass DEFAULT, which decodes to ONE, so no mode-dependent branch is needed.
+     */
+    private presentInterval = PRESENT_INTERVAL_ONE;
+
+    setPresentationInterval(rawInterval: number): void {
+        this.presentInterval = decodeD3DPresentInterval(rawInterval);
     }
 
     reset(pPresentationParameters: number, mem: Uint8Array): number {
@@ -742,12 +969,20 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const width = Math.max(1, view.getUint32(pPresentationParameters + 0, true) || 800);
         const height = Math.max(1, view.getUint32(pPresentationParameters + 4, true) || 600);
         // D3DPRESENT_PARAMETERS.MultiSampleType is at offset +16 (D3D8 has no MultiSampleQuality).
-        this.applyPresentMultiSampleType(view.getUint32(pPresentationParameters + 16, true));
+        if (!this.applyPresentMultiSampleType(view.getUint32(pPresentationParameters + 16, true))) {
+            return D3DERR_NOTAVAILABLE;
+        }
+        // FullScreen_PresentationInterval @ +48 — re-declared by every Reset.
+        this.setPresentationInterval(view.getUint32(pPresentationParameters + 48, true));
 
-        Logger.log(LogCategory.SYSTEM, `D3D8 Reset(${width}x${height})`);
+        Logger.log(LogCategory.SYSTEM, `D3D8 Reset(${width}x${height}, interval=${this.presentInterval})`);
 
         this.flushProgrammablePending();
-        System.getInstance().requestHostResize(width, height);
+        // Windowed @ +28 (d3d8): only a fullscreen Reset sets the display mode.
+        this.setWindowed(view.getUint32(pPresentationParameters + 28, true) !== 0);
+        System.getInstance().requestHostResize(width, height, {
+            modeSet: this.presentsExclusiveFullscreen,
+        });
         this.renderTarget = createRenderTarget(width, height);
         this.rtOverride = null;
         this.viewport = sanitizeViewport({ x: 0, y: 0, width, height, minZ: 0, maxZ: 1 }, width, height);
@@ -771,6 +1006,37 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             return false;
         }
         return true;
+    }
+
+    /**
+     * Start the GPU→CPU readback for render surfaces the guest read-Locks, so the copy
+     * can overlap guest work instead of stalling the Lock that asks for it.
+     *
+     * OPT-IN (`__d3d8LockPrefetch`), because hiding a round trip needs a GAP between the
+     * moment the pixels are final and the Lock that reads them, and whether one exists is
+     * a property of the title, not of this code. Warcraft III has none — it locks
+     * immediately after EndScene, so the kick lands microseconds early and the Lock still
+     * blocks for the full trip. Measured there: `fromPrefetch` 239/239 and `memoHits` 0,
+     * i.e. every readback relocated and none hidden, p50 25.5→27.0 ms. Reach for this
+     * when `readbackStats` shows a title whose Lock is NOT adjacent to its EndScene.
+     *
+     * Two kick points, because which one can pay depends on where the title locks:
+     * EndScene is the earliest moment the frame's pixels are final and covers a title that
+     * reads the finished frame before presenting it; Present covers one that locks after.
+     *
+     * The row that tells them apart is `readbackStats.memoHits` (the Lock never entered
+     * syncToCPU at all — hidden) against `readbackPrefetch.awaitedInflight` (it did, and
+     * blocked — merely moved). Reading `fromPrefetch` alone cannot distinguish the two.
+     */
+    pumpLockReadbackPrefetch(phase: "endScene" | "present"): void {
+        const g = globalThis as Record<string, unknown>;
+        if (g["__d3d8LockPrefetch"] !== true) return;
+        const off = phase === "endScene"
+            ? "__noD3D8EndScenePrefetch"
+            : "__noD3D8PresentPrefetch";
+        if (g[off] === true) return;
+        this.renderer.flush();
+        this.renderer.pumpLockReadbackPrefetch();
     }
 
     /** GPU→CPU readback of the device render target, then row-copy into dest. */
@@ -863,6 +1129,23 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             specular: { ...m.specular },
             emissive: { ...m.emissive },
             power: m.power,
+        };
+    }
+
+    /** Harness draw bisect. The shared DDraw executor supports a cumulative upper cut. */
+    setDrawScrub(min: number, max: number): void {
+        if ((min | 0) !== 0 && (max | 0) >= 0) {
+            throw new Error("D3D8 draw scrub currently supports min=0 only");
+        }
+        this.renderer.setDebugToggle("drawScrubMax", (max | 0) >= 0, max | 0);
+    }
+
+    getDrawScrub(): { min: number; max: number; lastFrameDraws: number } {
+        const flags = this.renderer.getDebugFlags();
+        return {
+            min: 0,
+            max: flags.drawScrubMax,
+            lastFrameDraws: flags.scrubLastFrameDraws,
         };
     }
 
@@ -1014,10 +1297,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             worldMatrix: this.transforms.get(D3DTS_WORLD) ?? identityMatrix(),
             worldViewMatrix: this.getWorldViewMatrix(),
             viewMatrix: this.transforms.get(D3DTS_VIEW) ?? identityMatrix(),
-            diffuseSource: this.renderStates[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE] ?? 0,
-            ambientSource: this.renderStates[D3DRENDERSTATE_AMBIENTMATERIALSOURCE] ?? 0,
-            specularSource: this.renderStates[D3DRENDERSTATE_SPECULARMATERIALSOURCE] ?? 0,
-            emissiveSource: this.renderStates[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE] ?? 0,
+            diffuseSource: this.renderStates[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE],
+            ambientSource: this.renderStates[D3DRENDERSTATE_AMBIENTMATERIALSOURCE],
+            specularSource: this.renderStates[D3DRENDERSTATE_SPECULARMATERIALSOURCE],
+            emissiveSource: this.renderStates[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE],
         };
     }
 
@@ -1039,7 +1322,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     private readonly blendPaletteScratch: (Float32Array | null)[] = [null, null, null, null];
 
     // Indexed-blend palette cap. Real HW (DXVK D3D9MaxVertexBlendTransformsHw / the
-    // MaxVertexBlendMatrixIndex=8 we advertise) exposes 8 world matrices D3DTS_WORLDMATRIX(0..7);
+    // MaxVertexBlendMatrixIndex=7 (the highest advertised index) exposes 8 world matrices
+    // D3DTS_WORLDMATRIX(0..7);
     // the per-vertex UBYTE4 selects an index into this palette. SWVP's 256 is out of scope for the
     // FFP path — 8 covers the practical fixed-function skinning set. Documented cap.
     private static readonly MAX_INDEXED_BLEND_MATRICES = 8;
@@ -1229,11 +1513,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             : "LIGHT[null]";
         const rs = this.renderStates;
         const stateTag =
-            `LIGHTING=${rs[D3DRENDERSTATE_LIGHTING] ?? 0} ` +
-            `aBlend=${rs[D3DRENDERSTATE_ALPHABLENDENABLE] ?? 0} src=${rs[D3DRENDERSTATE_SRCBLEND] ?? 0} dst=${rs[D3DRENDERSTATE_DESTBLEND] ?? 0} ` +
-            `aTest=${rs[D3DRENDERSTATE_ALPHATESTENABLE] ?? 0} aRef=${rs[D3DRENDERSTATE_ALPHAREF] ?? 0} aFunc=${rs[D3DRENDERSTATE_ALPHAFUNC] ?? 0} ` +
+            `LIGHTING=${rs[D3DRENDERSTATE_LIGHTING]} ` +
+            `aBlend=${rs[D3DRENDERSTATE_ALPHABLENDENABLE]} src=${rs[D3DRENDERSTATE_SRCBLEND]} dst=${rs[D3DRENDERSTATE_DESTBLEND]} ` +
+            `aTest=${rs[D3DRENDERSTATE_ALPHATESTENABLE]} aRef=${rs[D3DRENDERSTATE_ALPHAREF]} aFunc=${rs[D3DRENDERSTATE_ALPHAFUNC]} ` +
             `texF=0x${(rs[D3DRENDERSTATE_TEXTUREFACTOR] >>> 0).toString(16)} ` +
-            `cOp=${this.textureStates[0 * 32 + D3DTSS_COLOROP] ?? 0} aOp=${this.textureStates[0 * 32 + D3DTSS_ALPHAOP] ?? 0}`;
+            `cOp=${this.textureStates[0 * 32 + D3DTSS_COLOROP]} aOp=${this.textureStates[0 * 32 + D3DTSS_ALPHAOP]}`;
 
         const line =
             `#${this.drawDiagCount} ${kind} fvf=0x${fvf.toString(16)}(${fvfType}) stride=${stride} ` +
@@ -1258,14 +1542,19 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
     /** Harness CaptureBus producer for D3D8. D3D8 bypasses draw-handler.ts
      *  but its renderStates/textureStates/textures are the SAME layout the FFP
      *  recordDrawCall consumes — so it feeds the one schema with backend:"d3d8".
-     *  Gated by isCapturing() → zero cost when not capturing. */
-    private captureDrawIfArmed(primitiveType: number, vertexType: number, lpVertices: number, count: number, isIndexed: boolean, lpIndices: number, iCount: number, mem: Uint8Array, sourceStride: number): void {
+     *  Gated by isCapturing() → zero cost when not capturing.
+     *  `vertexSourceValid` defaults to `lpVertices > 0` (a real guest pointer never
+     *  legitimately sits at NULL) but the decl-interleave path passes `mem` as a local
+     *  scratch buffer with vertices starting at offset 0 — a legitimate address that the
+     *  default gate would otherwise read as "no vertex buffer". */
+    private captureDrawIfArmed(primitiveType: number, vertexType: number, lpVertices: number, count: number, isIndexed: boolean, lpIndices: number, iCount: number, mem: Uint8Array, sourceStride: number, vertexSourceValid = lpVertices > 0): void {
         if (!frameCapture.isCapturing()) return;
         frameCapture.recordDrawCall({
-            primitiveType, vertexType, lpVertices, count, lpIndices, iCount, mem, isIndexed,
+            primitiveType, vertexType, lpVertices, count, lpIndices, iCount, mem, isIndexed, vertexSourceValid,
             rtState: this.activeRenderTarget,
             texStateObj: this.textures[0] ?? null,
             texStateObj1: this.textures[1] ?? null,
+            stageTextures: this.textures,
             renderStates: this.renderStates,
             texStates: this.textureStates,
             backend: "d3d8",
@@ -1276,50 +1565,42 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 width: this.viewport.width, height: this.viewport.height,
                 minZ: this.viewport.minZ ?? 0, maxZ: this.viewport.maxZ ?? 1,
             },
+            lighting: this.getFFPLightingState(),
             executionDiagnostics: (this.renderer as any).getLastDrawDiagnostics?.() ?? null,
         });
     }
 
     /** Gather + upload the GPU bindings for streams ≥ 1 referenced by the active decl.
-     *  Offsets follow stream 0's convention: firstVertex × per-stream stride. Returns
-     *  [] for single-stream decls, null when a referenced stream is unbound/out of bounds. */
+     *  Offsets follow stream 0's convention: firstVertex × per-stream stride, and the size
+     *  runs from that offset — the same origin the executor's vertex-range guard compares
+     *  against, which is why a stream too SHORT for the draw is not rejected here: the guard
+     *  owns that rule for every backend and substitutes zeros the way hardware does. Returns
+     *  [] for single-stream decls, null when a referenced stream is unbound/unsized. */
     private collectExtraStreamBindings(
         vsObj: D3D8VsObject,
         firstVertex: number,
-        vertexCount: number,
         mem: Uint8Array,
     ): StreamVertexBinding[] | null {
-        let maxStream = 0;
-        for (const e of vsObj.decl) if (e.stream > maxStream) maxStream = e.stream;
-        if (maxStream === 0) return [];
-
-        const extras: StreamVertexBinding[] = [];
-        for (let s = 1; s <= maxStream; s++) {
-            if (!vsObj.decl.some(e => e.stream === s)) continue;
+        const { bindings, missing } = collectExtraStreamBindings(vsObj.decl, (s) => {
             const src = this.streamSources[s];
             const vb = this.vbData.get(src.vb);
-            if (!vb) {
-                Logger.warn(LogCategory.SYSTEM, `D3D8 draw: decl references stream ${s} but no VB bound`);
-                return null;
-            }
+            if (!vb) return null;
             const stride = src.stride > 0 ? src.stride : (vsObj.streamStrides[s] ?? 0);
-            if (stride <= 0) {
-                Logger.warn(LogCategory.SYSTEM, `D3D8 draw: stream ${s} has no resolvable stride`);
-                return null;
-            }
-            const offset = firstVertex * stride;
-            if (offset < 0 || offset + vertexCount * stride > vb.size) {
-                Logger.warn(
-                    LogCategory.SYSTEM,
-                    `D3D8 draw: stream ${s} range out of bounds first=${firstVertex} count=${vertexCount} stride=${stride} size=${vb.size}`
-                );
-                return null;
-            }
+            if (stride <= 0) return null;
             const gpu = this.uploadVb(src.vb, vb.guestPtr, vb.size, mem);
             if (!gpu) return null;
-            extras.push({ slot: s, buffer: gpu, offset, size: vb.size - offset });
+            return { buffer: gpu, offset: 0, size: vb.size, stride };
+        }, firstVertex);
+
+        // D3D8's programmable path indexes streams through a shader-declared register map, so
+        // an unresolvable stream leaves a register with no source at all: abort rather than
+        // feed the shader something arbitrary. (D3D9 substitutes an empty binding instead —
+        // see D3D9Device.resolveDrawStreams.)
+        if (missing.length > 0) {
+            Logger.warn(LogCategory.SYSTEM, `D3D8 draw: decl references unbound/unsized stream(s) ${missing.join(",")}`);
+            return null;
         }
-        return extras;
+        return bindings;
     }
 
     /** Interleave vertices [firstVertex, firstVertex+vertexCount) of every stream the
@@ -1336,7 +1617,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const plan = this.declInterleave!;
         const dstStride = this.syntheticDeclStride;
         const vertexBytes = vertexCount * dstStride;
-        const total = vertexBytes + extraBytes;
+        // The scratch stands in for a guest memory view downstream, and the vertex converter
+        // takes whole-buffer u32/f32 views over it — so its LENGTH must be word-aligned, which
+        // the appended index block (16-bit indices, odd count) otherwise breaks.
+        const total = (vertexBytes + extraBytes + 3) & ~3;
         if (this.declScratch.length < total) {
             this.declScratch = new Uint8Array(Math.max(total, this.declScratch.length * 2, 4096));
         }
@@ -1375,17 +1659,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             strides[c.stream] = stride;
         }
 
-        for (const c of plan) {
-            const srcStride = strides[c.stream];
-            let src = bases[c.stream] + firstVertex * srcStride + c.srcOffset;
-            let dst = c.dstOffset;
-            const size = c.size;
-            if (src < 0 || src + (vertexCount - 1) * srcStride + size > mem.length) return null;
-            for (let v = 0; v < vertexCount; v++) {
-                for (let b = 0; b < size; b++) scratch[dst + b] = mem[src + b];
-                src += srcStride;
-                dst += dstStride;
-            }
+        if (!interleaveDeclVertices(plan, scratch, dstStride, firstVertex, vertexCount, mem, bases, strides)) {
+            return null;
         }
         return scratch;
     }
@@ -1422,7 +1697,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             this.syntheticDeclStride,
             this.getWorldViewMatrix() // point-sprite attenuation (D3DRS_POINTSCALEENABLE)
         );
-        this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexCount, false, 0, 0, scratch, this.syntheticDeclStride);
+        this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexCount, false, 0, 0, scratch, this.syntheticDeclStride, true);
         return 0;
     }
 
@@ -1500,7 +1775,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             this.syntheticDeclStride,
             indexIsUint32
         );
-        this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexRangeCount, true, indicesOffset, indexCount, scratch, this.syntheticDeclStride);
+        this.captureDrawIfArmed(primitiveType, this.syntheticDeclFvf, 0, vertexRangeCount, true, indicesOffset, indexCount, scratch, this.syntheticDeclStride, true);
         return 0;
     }
 
@@ -1542,28 +1817,50 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const mem = this.getMemoryView();
 
         if (this.isProgrammable() && this.programmable) {
+            if (this.renderer.scrubDraw()) return 0;
             const gpuBuffer = this.uploadVb(this.streamSources[0].vb, vb.guestPtr, vb.size, mem);
             if (!gpuBuffer) return 0x8876086c;
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, startVertex, vertexCount, mem,
+                this.shaders.getActiveVs()!, startVertex, mem,
             );
             if (extraStreams === null) return 0x8876086c;
-            const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
+            const { topology, needsFanExpansion, isLineOrPoint } = resolveD3D8Topology(primitiveType);
             const pipelineId = this.programmable.resolveProgrammablePipeline(
-                this, this.shaders, topology, false, sourceStride,
+                this, this.shaders, topology, isLineOrPoint, sourceStride,
             );
             if (pipelineId < 0) return 0x8876086c;
             const bindStateIndex = this.programmable.captureDrawState(this, this.shaders, this.renderer);
-            this.programmable.getCommandRecorder().recordDraw({
-                pipelineId,
-                gpuBuffer,
-                bufferOffset: vertexByteOffset,
-                bufferSize: vb.size - vertexByteOffset,
-                vertexCount,
-                startVertex: 0,
-                bindStateIndex,
-                extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
-            });
+            if (needsFanExpansion) {
+                const fanIndices = buildFanIndices(
+                    primitiveCount, undefined, this.fanIndexScratch16(primitiveCount * 3), undefined);
+                const ibGpu = this.createTransientIndexBuffer(fanIndices);
+                if (!ibGpu) return 0x8876086c;
+                this.programmable.getCommandRecorder().recordDrawIndexed({
+                    pipelineId,
+                    vbGpuBuffer: gpuBuffer,
+                    vbOffset: vertexByteOffset,
+                    vbSize: vb.size - vertexByteOffset,
+                    ibGpuBuffer: ibGpu,
+                    ibFormat: fanIndices instanceof Uint32Array ? "uint32" : "uint16",
+                    indexCount: primitiveCount * 3,
+                    startIndex: 0,
+                    baseVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+                this.programmable.getCommandRecorder().registerPooledBuffer(ibGpu);
+            } else {
+                this.programmable.getCommandRecorder().recordDraw({
+                    pipelineId,
+                    gpuBuffer,
+                    bufferOffset: vertexByteOffset,
+                    bufferSize: vb.size - vertexByteOffset,
+                    vertexCount,
+                    startVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+            }
             this.drawDiagLog("DP-prog", vb.guestPtr + vertexByteOffset, vertexCount, sourceStride, activeFvf);
             return 0;
         }
@@ -1621,6 +1918,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         }
 
         if (this.isProgrammable() && this.programmable) {
+            if (this.renderer.scrubDraw()) return 0;
             const device = this.getGpuDevice();
             if (!device) return 0x8876086c;
             const byteSize = vertexCount * effectiveStride;
@@ -1630,26 +1928,48 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             });
             device.queue.writeBuffer(gpuBuffer, 0, mem.buffer, mem.byteOffset + dataPtr, byteSize);
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, 0, vertexCount, mem,
+                this.shaders.getActiveVs()!, 0, mem,
             );
             if (extraStreams === null) { gpuBuffer.destroy(); return 0x8876086c; }
-            const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
+            const { topology, needsFanExpansion } = resolveD3D8Topology(primitiveType);
+            // UP draws force cull-none regardless of topology (pre-existing behavior).
             const pipelineId = this.programmable.resolveProgrammablePipeline(
                 this, this.shaders, topology, true, effectiveStride,
             );
             if (pipelineId < 0) { gpuBuffer.destroy(); return 0x8876086c; }
             const bindStateIndex = this.programmable.captureDrawState(this, this.shaders, this.renderer);
-            this.programmable.getCommandRecorder().recordDraw({
-                pipelineId,
-                gpuBuffer,
-                bufferOffset: 0,
-                bufferSize: byteSize,
-                vertexCount,
-                startVertex: 0,
-                bindStateIndex,
-                extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
-            });
             this.programmable.getCommandRecorder().registerPooledBuffer(gpuBuffer);
+            if (needsFanExpansion) {
+                const fanIndices = buildFanIndices(
+                    primitiveCount, undefined, this.fanIndexScratch16(primitiveCount * 3), undefined);
+                const ibGpu = this.createTransientIndexBuffer(fanIndices);
+                if (!ibGpu) return 0x8876086c;
+                this.programmable.getCommandRecorder().recordDrawIndexed({
+                    pipelineId,
+                    vbGpuBuffer: gpuBuffer,
+                    vbOffset: 0,
+                    vbSize: byteSize,
+                    ibGpuBuffer: ibGpu,
+                    ibFormat: fanIndices instanceof Uint32Array ? "uint32" : "uint16",
+                    indexCount: primitiveCount * 3,
+                    startIndex: 0,
+                    baseVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+                this.programmable.getCommandRecorder().registerPooledBuffer(ibGpu);
+            } else {
+                this.programmable.getCommandRecorder().recordDraw({
+                    pipelineId,
+                    gpuBuffer,
+                    bufferOffset: 0,
+                    bufferSize: byteSize,
+                    vertexCount,
+                    startVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+            }
             return 0;
         }
 
@@ -1729,32 +2049,63 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const mem = this.getMemoryView();
 
         if (this.isProgrammable() && this.programmable) {
+            if (this.renderer.scrubDraw()) return 0;
             const vbGpu = this.uploadVb(this.streamSources[0].vb, vb.guestPtr, vb.size, mem);
             const ibGpu = this.uploadIb(this.indexIB, ib.guestPtr, ib.size, mem);
             if (!vbGpu || !ibGpu) return 0x8876086c;
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, this.baseVertexIndex, vertexRangeCount, mem,
+                this.shaders.getActiveVs()!, this.baseVertexIndex, mem,
             );
             if (extraStreams === null) return 0x8876086c;
-            const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
+            const { topology, needsFanExpansion, isLineOrPoint } = resolveD3D8Topology(primitiveType);
             const pipelineId = this.programmable.resolveProgrammablePipeline(
-                this, this.shaders, topology, false, sourceStride,
+                this, this.shaders, topology, isLineOrPoint, sourceStride,
+                indexIsUint32 ? "uint32" : "uint16",
             );
             if (pipelineId < 0) return 0x8876086c;
             const bindStateIndex = this.programmable.captureDrawState(this, this.shaders, this.renderer);
-            this.programmable.getCommandRecorder().recordDrawIndexed({
-                pipelineId,
-                vbGpuBuffer: vbGpu,
-                vbOffset: baseVertexByteOffset,
-                vbSize: vb.size - baseVertexByteOffset,
-                ibGpuBuffer: ibGpu,
-                ibFormat: indexIsUint32 ? "uint32" : "uint16",
-                indexCount,
-                startIndex,
-                baseVertex: 0,
-                bindStateIndex,
-                extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
-            });
+            if (needsFanExpansion) {
+                // TRIANGLEFAN over an existing index buffer: gather the real (already-indexed)
+                // vertex indices, not synthetic 0-based ones, then expand those into a
+                // triangle-list index array — the original index values still address the VB.
+                const originalIndices = readGuestIndices(
+                    mem, ib.guestPtr + indexByteOffset, indexCount, indexIsUint32,
+                    this.fanGatherScratch(indexCount));
+                if (!originalIndices) return 0x8876086c;
+                const fanIndices = buildFanIndices(
+                    primitiveCount, originalIndices,
+                    this.fanIndexScratch16(primitiveCount * 3), this.fanIndexScratch32(primitiveCount * 3));
+                const fanIbGpu = this.createTransientIndexBuffer(fanIndices);
+                if (!fanIbGpu) return 0x8876086c;
+                this.programmable.getCommandRecorder().recordDrawIndexed({
+                    pipelineId,
+                    vbGpuBuffer: vbGpu,
+                    vbOffset: baseVertexByteOffset,
+                    vbSize: vb.size - baseVertexByteOffset,
+                    ibGpuBuffer: fanIbGpu,
+                    ibFormat: fanIndices instanceof Uint32Array ? "uint32" : "uint16",
+                    indexCount: primitiveCount * 3,
+                    startIndex: 0,
+                    baseVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+                this.programmable.getCommandRecorder().registerPooledBuffer(fanIbGpu);
+            } else {
+                this.programmable.getCommandRecorder().recordDrawIndexed({
+                    pipelineId,
+                    vbGpuBuffer: vbGpu,
+                    vbOffset: baseVertexByteOffset,
+                    vbSize: vb.size - baseVertexByteOffset,
+                    ibGpuBuffer: ibGpu,
+                    ibFormat: indexIsUint32 ? "uint32" : "uint16",
+                    indexCount,
+                    startIndex,
+                    baseVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+            }
             return 0;
         }
 
@@ -1833,6 +2184,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         }
 
         if (this.isProgrammable() && this.programmable) {
+            if (this.renderer.scrubDraw()) return 0;
             const device = this.getGpuDevice();
             if (!device) return 0x8876086c;
             const vertexBytes = vertexRangeCount * effectiveStride;
@@ -1848,30 +2200,59 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             });
             device.queue.writeBuffer(ibGpu, 0, mem.buffer, mem.byteOffset + indexPtr, indexBytes);
             const extraStreams = this.collectExtraStreamBindings(
-                this.shaders.getActiveVs()!, 0, vertexRangeCount, mem,
+                this.shaders.getActiveVs()!, 0, mem,
             );
             if (extraStreams === null) { vbGpu.destroy(); ibGpu.destroy(); return 0x8876086c; }
-            const topology = primitiveType === 2 || primitiveType === 3 ? "line-list" : "triangle-list";
+            const { topology, needsFanExpansion } = resolveD3D8Topology(primitiveType);
+            // UP draws force cull-none regardless of topology (pre-existing behavior).
             const pipelineId = this.programmable.resolveProgrammablePipeline(
                 this, this.shaders, topology, true, effectiveStride,
+                indexIsUint32 ? "uint32" : "uint16",
             );
             if (pipelineId < 0) { vbGpu.destroy(); ibGpu.destroy(); return 0x8876086c; }
             const bindStateIndex = this.programmable.captureDrawState(this, this.shaders, this.renderer);
-            this.programmable.getCommandRecorder().recordDrawIndexed({
-                pipelineId,
-                vbGpuBuffer: vbGpu,
-                vbOffset: 0,
-                vbSize: vertexBytes,
-                ibGpuBuffer: ibGpu,
-                ibFormat: indexIsUint32 ? "uint32" : "uint16",
-                indexCount,
-                startIndex: 0,
-                baseVertex: 0,
-                bindStateIndex,
-                extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
-            });
             this.programmable.getCommandRecorder().registerPooledBuffer(vbGpu);
             this.programmable.getCommandRecorder().registerPooledBuffer(ibGpu);
+            if (needsFanExpansion) {
+                // Same real-index gather as drawIndexedPrimitive: the UP index data already
+                // addresses the UP vertex data directly (no BaseVertexIndex for this entry point).
+                const originalIndices = readGuestIndices(
+                    mem, indexPtr, indexCount, indexIsUint32, this.fanGatherScratch(indexCount));
+                if (!originalIndices) return 0x8876086c;
+                const fanIndices = buildFanIndices(
+                    primitiveCount, originalIndices,
+                    this.fanIndexScratch16(primitiveCount * 3), this.fanIndexScratch32(primitiveCount * 3));
+                const fanIbGpu = this.createTransientIndexBuffer(fanIndices);
+                if (!fanIbGpu) return 0x8876086c;
+                this.programmable.getCommandRecorder().recordDrawIndexed({
+                    pipelineId,
+                    vbGpuBuffer: vbGpu,
+                    vbOffset: 0,
+                    vbSize: vertexBytes,
+                    ibGpuBuffer: fanIbGpu,
+                    ibFormat: fanIndices instanceof Uint32Array ? "uint32" : "uint16",
+                    indexCount: primitiveCount * 3,
+                    startIndex: 0,
+                    baseVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+                this.programmable.getCommandRecorder().registerPooledBuffer(fanIbGpu);
+            } else {
+                this.programmable.getCommandRecorder().recordDrawIndexed({
+                    pipelineId,
+                    vbGpuBuffer: vbGpu,
+                    vbOffset: 0,
+                    vbSize: vertexBytes,
+                    ibGpuBuffer: ibGpu,
+                    ibFormat: indexIsUint32 ? "uint32" : "uint16",
+                    indexCount,
+                    startIndex: 0,
+                    baseVertex: 0,
+                    bindStateIndex,
+                    extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                });
+            }
             return 0;
         }
 
@@ -1925,7 +2306,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
         profiler.start("present");
         const presentStart = frameProfiler.startTimer();
-        await framePacer.waitForFrameSlot({ nonBlocking: true });
+        // Present is an unambiguous frame boundary (unlike DDraw's many-Blts-per-frame
+        // primary), so it paces on the interval the device declared, exactly like d3d9.
+        await framePacer.waitForPresentInterval(this.presentInterval);
         framePacer.reserveFrameSlot();
 
         try {
@@ -1980,7 +2363,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
             // Reuse the draw encoder if available, otherwise create a new one
             const encoder = drawEncoder ?? device.createCommandEncoder();
-            const targetView = context.getCurrentTexture().createView();
+            const canvasTex = context.getCurrentTexture();
+            const targetView = canvasTex.createView();
             const clearColor = EmulatorConfig.getInstance().screenBackgroundColor;
             webgpu.drawTexture(
                 sourceView,
@@ -1990,23 +2374,25 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 undefined,
                 undefined,
                 clearColor,
-                true // nearest-neighbor: pixel-perfect present (no bilinear stretch)
+                true, // nearest-neighbor: pixel-perfect present (no bilinear stretch)
+                // The render target is guest-sized and the canvas is host-sized; without both
+                // the post-fx chain reads src===out and aspect/integer scaling silently vanish.
+                { srcW: this.renderTarget.width, srcH: this.renderTarget.height,
+                  outW: canvasTex.width, outH: canvasTex.height, toCanvas: true },
             );
 
-            // Composite GDI overlay (cursor / text / dialogs drawn via GDI on top of D3D8).
-            // When this 3D renderer owns the screen, GDI windows BEHIND the opaque fullscreen
-            // device window are occluded on real Windows (e.g. a UE2 loading-splash #32770 left
-            // visible after the engine switches to D3D). Composite ONLY live dialogs shown OVER
-            // the running game (flagged overlayOnFlipScreen), never the whole overlay, so a
-            // leftover splash cannot cover the frame. Mirrors the gdiPresentLoop screen3DOwned
-            // branch (emulator.worker.ts) and the DDraw presenter's getOverlayCompositePlan.
+            // Composite GDI overlay (cursor / text / dialogs drawn via GDI on top of D3D8)
+            // per the single shared policy (getOverlayCompositePlan): when this 3D renderer
+            // owns the screen, GDI windows behind the opaque fullscreen device window are
+            // occluded on real Windows (e.g. a UE2 loading-splash #32770), so only live modal
+            // dialog rects composite ('rects'), never the whole overlay ('none'); windowed →
+            // whole overlay ('full'). Passing `this` keys the 3D-owned check off this device.
             const overlay = system.gdiContext.getOverlayCanvas();
             if (overlay && system.gdiContext.hasOverlayContent()) {
-                const ddrawCtx = (system.process?.getModule('ddraw') as any)?.context;
-                if (shouldSuppress3DGdiOverlay(this, ddrawCtx)) {
-                    const rects = hasLiveDialogOverlay() ? getLiveDialogOverlayRects() : [];
-                    if (rects.length) webgpu.blitRects(overlay, targetView, encoder, rects);
-                } else {
+                const plan = getOverlayCompositePlan(this);
+                if (plan.mode === 'rects') {
+                    webgpu.blitRects(overlay, targetView, encoder, plan.rects);
+                } else if (plan.mode === 'full') {
                     webgpu.blit(overlay, targetView, encoder);
                 }
                 if (system.gdiContext.isOverlayDirty()) {
@@ -2014,12 +2400,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 }
             }
 
-            // Composite video overlay
-            const videoOverlayService = system.videoRouting.getOverlayService();
-            const videoOverlay = videoOverlayService.getCanvas();
-            if (videoOverlay && videoOverlayService.hasContent()) {
-                webgpu.blit(videoOverlay, targetView, encoder);
-                videoOverlayService.consumeDirty();
+            // Composite the video plane per its single shared policy (getVideoPlanePlan).
+            const videoPlan = getVideoPlanePlan();
+            if (videoPlan.onScreen) {
+                webgpu.blit(videoPlan.canvas!, targetView, encoder);
+                notifyVideoPlaneComposited(videoPlan);
             }
 
             // Composite stats overlay (worker-side FPS display)
@@ -2030,10 +2415,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                         webgpu.updateStatsTexture(statsCanvas);
                         statsOverlay.clearDirty();
                     }
-                    webgpu.renderStatsOverlay(targetView, encoder, this.renderTarget.width, this.renderTarget.height);
+                    webgpu.renderStatsOverlay(targetView, encoder);
                 }
             }
 
+            this.renderer.flushVertexParams();
             this.renderer.ringBufferManager.flushUniforms();
             this.renderer.ringBufferManager.flushStorageBuffer();
 
@@ -2050,10 +2436,14 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             if (useErrorScopes) {
                 const frameNum = this.presentCount;
                 device.popErrorScope().then(err => {
-                    if (err) Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] Validation error frame=${frameNum}: ${err.message}`);
+                    if (!err) return;
+                    recordGpuError("scope", "d3d8Present.validation", err.message);
+                    Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] Validation error frame=${frameNum}: ${err.message}`);
                 });
                 device.popErrorScope().then(err => {
-                    if (err) Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] OOM error frame=${frameNum}: ${err.message}`);
+                    if (!err) return;
+                    recordGpuError("scope", "d3d8Present.oom", err.message);
+                    Logger.error(LogCategory.SYSTEM, `[D3D8 PRESENT] OOM error frame=${frameNum}: ${err.message}`);
                 });
             }
 
@@ -2077,7 +2467,10 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             };
             this.frameSnapshot.drawCalls = 0;
             system.services.render.notifyPresent("d3d8");
-            frameCapture.onFrameEnd(); // harness CaptureBus frame boundary (D3D8)
+            frameCapture.onFrameEnd("d3d8"); // harness CaptureBus frame boundary (D3D8)
+            // Complementary to the EndScene kick: covers a title that read-Locks the
+            // frame it has just presented rather than the one it is about to.
+            this.pumpLockReadbackPrefetch("present");
 
             const now = performance.now();
             if (this.prevPresentTime > 0) {
@@ -2094,24 +2487,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         }
     }
 
-    /**
-     * Screenshot the composited D3D8 frame as a PNG (harness `shot`).
-     * Mirrors the DDraw presenter: the on-screen OffscreenCanvas is captured via
-     * convertToBlob(), which snapshots the LAST presented frame — so it works
-     * while the emulator is paused (pause-and-inspect), and it captures the final
-     * composited screen (RT + GDI/video/stats overlays), not just the raw RT.
-     * The WebGPU swapchain texture is configured without COPY_SRC, so a
-     * copyTextureToBuffer readback is unavailable; convertToBlob is the correct
-     * canvas-capture path and needs no COPY_SRC.
-     */
+    /** PNG of the screen — the canvas, i.e. the final composite (RT + GDI/video/stats
+     *  overlays), snapshotted from the last present so it works while paused. */
     async captureFrame(): Promise<Blob> {
-        const empty = new Blob([], { type: "image/png" });
-        const backend = System.getInstance().services.render.getBackend();
-        if (!backend || backend.kind !== "webgpu") return empty;
-        const context = (backend as WebGPUBackend).getContext();
-        const canvas = context?.canvas as OffscreenCanvas | undefined;
-        if (!canvas || typeof canvas.convertToBlob !== "function") return empty;
-        return canvas.convertToBlob({ type: "image/png" });
+        return (await System.getInstance().services.render.tryCaptureScreen())
+            ?? new Blob([], { type: "image/png" });
     }
 
     getCounters(): Record<string, number> {
@@ -2188,7 +2568,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 // Helpers
 // ---------------------------------------------------------------
 
-function primCountToVertexCount(type: number, primCount: number): number {
+export function primCountToVertexCount(type: number, primCount: number): number {
     switch (type) {
         case 1: return primCount;          // POINTLIST
         case 2: return primCount * 2;      // LINELIST
@@ -2198,6 +2578,133 @@ function primCountToVertexCount(type: number, primCount: number): number {
         case 6: return primCount + 2;      // TRIANGLEFAN
         default: return primCount * 3;
     }
+}
+
+/** D3DPRIMITIVETYPE → WebGPU topology for the programmable-VS draw paths. WebGPU has native
+ *  point-list/line-strip/triangle-strip topologies, so only D3DPT_TRIANGLEFAN (no WebGPU
+ *  equivalent) needs CPU-side expansion — via a synthetic triangle-list index buffer, mirroring
+ *  d3d9-device.ts's fan conversion but at the index level instead of duplicating vertex data. */
+export function resolveD3D8Topology(primitiveType: number): {
+    topology: GPUPrimitiveTopology;
+    needsFanExpansion: boolean;
+    isLineOrPoint: boolean;
+} {
+    switch (primitiveType) {
+        case 1: return { topology: "point-list", needsFanExpansion: false, isLineOrPoint: true };
+        case 2: return { topology: "line-list", needsFanExpansion: false, isLineOrPoint: true };
+        case 3: return { topology: "line-strip", needsFanExpansion: false, isLineOrPoint: true };
+        case 5: return { topology: "triangle-strip", needsFanExpansion: false, isLineOrPoint: false };
+        case 6: return { topology: "triangle-list", needsFanExpansion: true, isLineOrPoint: false };
+        case 4:
+        default: return { topology: "triangle-list", needsFanExpansion: false, isLineOrPoint: false };
+    }
+}
+
+/** Copy one decl-only interleave plan's elements for vertices [firstVertex, +vertexCount) out of
+ *  guest memory into `scratch` at the canonical FVF layout. False (nothing usable written) when a
+ *  stream's extent leaves guest memory. Exported for tests — the destination is a scratch buffer
+ *  reused across draws, so every byte of a canonical slot must be written, not just the copied
+ *  ones (see DeclStreamCopy.slotSize). */
+export function interleaveDeclVertices(
+    plan: readonly DeclStreamCopy[],
+    scratch: Uint8Array,
+    dstStride: number,
+    firstVertex: number,
+    vertexCount: number,
+    mem: Uint8Array,
+    bases: readonly number[],
+    strides: readonly number[],
+): boolean {
+    for (const c of plan) {
+        const srcStride = strides[c.stream];
+        let src = bases[c.stream] + firstVertex * srcStride + c.srcOffset;
+        let dst = c.dstOffset;
+        const size = c.size;
+        if (src < 0 || src + (vertexCount - 1) * srcStride + size > mem.length) return false;
+        if (c.swizzleColorBytes) {
+            // D3DVSDT_UBYTE4-typed COLOR register (memory order R,G,B,A) landing in the
+            // canonical D3DCOLOR slot the FFP renderer assumes (memory order B,G,R,A) —
+            // swap bytes 0 and 2 (R<->B) per vertex; G (byte 1) and A (byte 3) are unchanged.
+            for (let v = 0; v < vertexCount; v++) {
+                scratch[dst + 0] = mem[src + 2]!;
+                scratch[dst + 1] = mem[src + 1]!;
+                scratch[dst + 2] = mem[src + 0]!;
+                scratch[dst + 3] = mem[src + 3]!;
+                src += srcStride;
+                dst += dstStride;
+            }
+        } else {
+            // A degraded texcoord (FLOAT1 into the 8-byte UV slot) copies fewer bytes than the
+            // slot holds; D3D reads the missing components as 0, so clear the remainder instead
+            // of inheriting the previous draw's bytes at that offset.
+            const slotSize = c.slotSize;
+            for (let v = 0; v < vertexCount; v++) {
+                for (let b = 0; b < size; b++) scratch[dst + b] = mem[src + b];
+                for (let b = size; b < slotSize; b++) scratch[dst + b] = 0;
+                src += srcStride;
+                dst += dstStride;
+            }
+        }
+    }
+    return true;
+}
+
+/** Read `count` guest index values (16- or 32-bit) starting at byte `ptr` into a plain array,
+ *  used only for the (rare) D3DPT_TRIANGLEFAN-on-an-index-buffer case — DataView-based rather
+ *  than an aliased typed-array view because `ptr` is not guaranteed 4-byte aligned.
+ *  The WHOLE extent is validated at this boundary (§3.1): a guest-supplied index count that
+ *  runs off the buffer would otherwise throw a RangeError out of the middle of a draw. Null
+ *  means "refuse the draw" (D3DERR_INVALIDCALL), never a partially-read array.
+ *  `scratch`, when it fits, is filled and returned as a subarray so a fan draw allocates
+ *  nothing per call. */
+export function readGuestIndices(
+    mem: Uint8Array,
+    ptr: number,
+    count: number,
+    is32: boolean,
+    scratch?: Uint32Array,
+): Uint32Array | null {
+    if (count < 0) return null;
+    const bytes = count * (is32 ? 4 : 2);
+    if (ptr < 0 || ptr + bytes > mem.length) return null;
+    if (!isValidAddress(mem, ptr, bytes, "r")) return null;
+    const out = scratch && scratch.length >= count ? scratch.subarray(0, count) : new Uint32Array(count);
+    const dv = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    if (is32) {
+        for (let i = 0; i < count; i++) out[i] = dv.getUint32(ptr + i * 4, true);
+    } else {
+        for (let i = 0; i < count; i++) out[i] = dv.getUint16(ptr + i * 2, true);
+    }
+    return out;
+}
+
+/** Build a triangle-list index array for a fan of `primCount` triangles: (v0, v[i+1], v[i+2]).
+ *  `gather`, when given, supplies the ORIGINAL index values (already-indexed draw); omitted, the
+ *  fan is over a flat non-indexed vertex range and indices are simply 0, i+1, i+2. */
+export function buildFanIndices(
+    primCount: number,
+    gather?: Uint32Array,
+    /** Reusable destinations (see §3.1 zero-alloc hot paths); either may be too small or absent,
+     *  in which case that call allocates. Width is chosen by the largest index, so both are
+     *  offered and exactly one is used. */
+    scratch16?: Uint16Array,
+    scratch32?: Uint32Array,
+): Uint16Array | Uint32Array {
+    const count = primCount * 3;
+    let maxIndex = primCount + 1;
+    if (gather) {
+        maxIndex = 0;
+        for (let i = 0; i < gather.length; i++) if (gather[i] > maxIndex) maxIndex = gather[i];
+    }
+    const out: Uint16Array | Uint32Array = maxIndex > 0xffff
+        ? (scratch32 && scratch32.length >= count ? scratch32.subarray(0, count) : new Uint32Array(count))
+        : (scratch16 && scratch16.length >= count ? scratch16.subarray(0, count) : new Uint16Array(count));
+    for (let i = 0; i < primCount; i++) {
+        out[i * 3 + 0] = gather ? gather[0] : 0;
+        out[i * 3 + 1] = gather ? gather[i + 1] : i + 1;
+        out[i * 3 + 2] = gather ? gather[i + 2] : i + 2;
+    }
+    return out;
 }
 
 function identityMatrix(): Float32Array {

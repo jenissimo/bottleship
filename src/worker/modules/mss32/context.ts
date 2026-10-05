@@ -2,14 +2,21 @@ import { Process } from "../../core/process";
 import { VfsFileHandle } from "../../runtime/filesystem/vfs";
 import { MSSSample, MSSStream, MSSWaveOut, RedbookHandle, MSSTimer, MSSSequence, MSSListener3D } from "./types";
 
+/** A provider registered through Miles' Resource Interface Broker (RIB). */
+export interface MSSRibProvider {
+    module: number;
+    interfaces: Map<string, { entryCount: number; entries: number[] }>;
+}
+
 export const SMP_FREE = 1;
 export const SMP_DONE = 2;
 export const SMP_PLAYING = 4;
 export const SMP_STOPPED = 8;
+/** Released while still audible — the mixer still owns the voice (AIL_active_sample_count counts it). */
+export const SMP_PLAYINGBUTRELEASED = 16;
 
 export interface MSSContext {
     process: Process;
-    memory: Uint8Array;
 
     samples: Map<number, MSSSample>;
     samplesById: Map<number, MSSSample>;
@@ -20,6 +27,8 @@ export interface MSSContext {
     redbookHandles: Map<number, RedbookHandle>;
     timers: Map<number, MSSTimer>;
     sequences: Map<number, MSSSequence>;
+    /** Opaque HPROVIDERs allocated for .m3d/.flt/.asi RIB_Main entry points. */
+    ribProviders: Map<number, MSSRibProvider>;
 
     nextSampleId: number;
     nextStreamId: number;
@@ -27,11 +36,12 @@ export interface MSSContext {
     nextFileHandleId: number;
     nextTimerId: number;
     nextRedbookId: number;
-    nextRedbookAudioId: number;
     nextSequenceId: number;
 
     initialized: boolean;
     digitalDriverHandle: number;
+    /** Window the app named for a DirectSound driver (AIL_set_DirectSound_HWND). */
+    directSoundHwnd: number;
     driverDummyBuffer: number;
     driverWaveFormat: number;
     driverNoopStub: number;
@@ -50,8 +60,10 @@ export interface MSSContext {
     driverAuxBuffer1: number;
     driverAuxBuffer2: number;
     driverAuxBuffer3: number;
-    /** Guest-memory string for fake 3D provider name — returned by _AIL_enumerate_3D_providers */
-    provider3DNamePtr: number;
+    /** Guest-memory copies of the 3D provider names, one per PROVIDERS_3D entry.
+     *  Engines keep the pointer past the enumerating call, so these live for the
+     *  life of the process. */
+    provider3DNamePtrs: number[];
     /** Miles 3D listener (created by _AIL_open_3D_listener). Distinct handle from sample handles. */
     listener3D: MSSListener3D | null;
     /** Global listener SAB shared with the audio worklet (LCTRL_* layout). */
@@ -65,6 +77,8 @@ export interface MSSContext {
     midiDriverHandle: number;
     midiMasterVolume: number;
     updateInterval: any;
+    /** The heartbeat's tick, kept so it can be re-armed after a driver close. */
+    heartbeatTick: (() => void) | null;
     startupTime: number;
     lastErrorPtr: number;
     lastErrorStr: string;
@@ -75,18 +89,38 @@ export interface MSSContext {
     pendingTimerCallbacks: Array<{ callback: number; user: number }>;
     /** Queue of pending EOS callbacks - processed during _AIL_serve to avoid corrupting CPU state */
     pendingEOSCallbacks: Array<{ callback: number; handle: number; user: number }>;
+    /** Stream callbacks (AIL_register_stream_callback) an incremental stream hit the end
+     *  of source on. One arg, HSTREAM — drained in _AIL_serve like the EOS queue. */
+    pendingStreamCallbacks: Array<{ callback: number; handle: number }>;
     /** Flag to track if we're inside _AIL_serve (safe to invoke callbacks) */
     insideAilServe: boolean;
     /** H3 Async: reentrancy depth of _AIL_serve (nested serve = possible stack/callback conflict) */
     serveDepth: number;
     /** WAV format tag keyed by guest data-chunk pointer (set by AIL_WAV_info for ADPCM decode). */
     wavFormatByDataPtr: Map<number, number>;
+    /**
+     * The app's own file I/O for Miles (AIL_set_file_callbacks). A title whose
+     * assets live inside an archive — Warcraft III's war3.mpq — installs these so
+     * Miles reads through ITS reader instead of the file system — our own VFS
+     * cannot serve those names at all, because they are not files.
+     */
+    fileCallbacks: { open: number; close: number; seek: number; read: number } | null;
+    /** The app's allocator for Miles (AIL_mem_use_malloc/free). */
+    memCallbacks: { malloc: number; free: number };
+    /** Per-stream user data slots (AIL_set_stream_user_data), keyed by stream handle. */
+    streamUserData: Map<number, number[]>;
+    /** Per-stream data-pump callback (AIL_register_stream_callback), keyed by stream handle. */
+    streamCallbacks: Map<number, number>;
+    /** Per-sequence user data slots and callback (the MIDI twins of the stream pair). */
+    sequenceUserData: Map<number, number[]>;
+    sequenceCallbacks: Map<number, number>;
+    /** 3D distance factor (AIL_set_3D_distance_factor), metres per world unit. */
+    distanceFactor3D: number;
 }
 
-export function createMSSContext(process: Process, memory: Uint8Array): MSSContext {
+export function createMSSContext(process: Process): MSSContext {
     return {
         process,
-        memory,
 
         samples: new Map(),
         samplesById: new Map(),
@@ -97,6 +131,7 @@ export function createMSSContext(process: Process, memory: Uint8Array): MSSConte
         redbookHandles: new Map(),
         timers: new Map(),
         sequences: new Map(),
+        ribProviders: new Map(),
 
         nextSampleId: 1,
         nextStreamId: 0x00010001,
@@ -104,11 +139,11 @@ export function createMSSContext(process: Process, memory: Uint8Array): MSSConte
         nextFileHandleId: 0x50000000,
         nextTimerId: 1,
         nextRedbookId: 0x52420001,
-        nextRedbookAudioId: 0x00CD0001,
         nextSequenceId: 1,
 
         initialized: false,
         digitalDriverHandle: 0,
+        directSoundHwnd: 0,
         driverDummyBuffer: 0,
         driverWaveFormat: 0,
         driverNoopStub: 0,
@@ -123,7 +158,7 @@ export function createMSSContext(process: Process, memory: Uint8Array): MSSConte
         driverAuxBuffer1: 0,
         driverAuxBuffer2: 0,
         driverAuxBuffer3: 0,
-        provider3DNamePtr: 0,
+        provider3DNamePtrs: [],
         listener3D: null,
         listenerSab: null,
         speakerType3D: 0,
@@ -147,6 +182,7 @@ export function createMSSContext(process: Process, memory: Uint8Array): MSSConte
         midiDriverHandle: 0,
         midiMasterVolume: 127,
         updateInterval: null,
+        heartbeatTick: null,
         startupTime: 0,
         lastErrorPtr: 0,
         lastErrorStr: "",
@@ -154,8 +190,16 @@ export function createMSSContext(process: Process, memory: Uint8Array): MSSConte
         memAllocatedByMss: new Set(),
         pendingTimerCallbacks: [],
         pendingEOSCallbacks: [],
+        pendingStreamCallbacks: [],
         insideAilServe: false,
         serveDepth: 0,
         wavFormatByDataPtr: new Map(),
+        fileCallbacks: null,
+        memCallbacks: { malloc: 0, free: 0 },
+        streamUserData: new Map(),
+        streamCallbacks: new Map(),
+        sequenceUserData: new Map(),
+        sequenceCallbacks: new Map(),
+        distanceFactor3D: 1.0,
     };
 }

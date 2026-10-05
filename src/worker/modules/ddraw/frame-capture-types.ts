@@ -8,10 +8,19 @@ export type CapturedDrawCall = {
     backend?: string;
     /** D3D9 programmable draws set this (no FFP render-state arrays available). */
     programmable?: boolean;
+    /** D3D9 shader handles and VS outputs at draw time. A null PS with a custom VS is
+     *  the legal hybrid VS+fixed-function-pixel path, not an untextured shader. */
+    vertexShader?: number;
+    pixelShader?: number;
+    vsWritesColor?: boolean[];
+    vsWritesTexcoord?: number[];
     // Geometry
     primitiveType: number;
     primitiveTypeName: string;
-    vertexType: number;       // FVF
+    vertexType: number;       // FVF — 0 while a vertex declaration owns the layout
+    /** Active D3D9 vertex declaration, 0 for none. Non-zero means IT decides the layout,
+     *  not `vertexType`, and the FVF decode fields below are withheld rather than guessed. */
+    vertexDecl?: number;
     vertexCount: number;
     indexCount: number;
     isRHW: boolean;
@@ -26,16 +35,33 @@ export type CapturedDrawCall = {
     // For INDEXED draws these are buffer[0..3] (often unused/stale) — use
     // indexedVertices below for the vertices the draw actually references.
     firstVertices: Array<{x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number}>;  // max 4
+    /** Why `firstVertices` is absent. Set instead of decoding when the FVF does not describe
+     *  these bytes — a wrong-layout decode reports plausible numbers for components the vertex
+     *  never had, which reads as a data bug in whatever consumes it. */
+    firstVerticesUnavailable?: string;
     // First raw index values (indexed draws only); 16-bit WORD indices (D3D7).
     firstIndices?: number[];
     // Vertices the draw ACTUALLY references — dereferenced through the first few
     // distinct indices. This is what reveals whether indexed geometry is in
     // screen space (valid XYZRHW: 0<=z<=1, w>0) or object/view space (the bug).
     indexedVertices?: Array<{idx: number; x: number; y: number; z: number; w?: number; u?: number; v?: number; diffuse?: number}>;
+    /** Why `indexedVertices` is absent for an INDEXED draw — no VB/IB bound, an index or
+     *  vertex address out of range, or an unsupported stride. Mirrors
+     *  `firstVerticesUnavailable`; unset for a non-indexed draw. */
+    indexedVerticesUnavailable?: string;
+    /** The distinct-vertex sample size actually used to build `indexedVertices` this
+     *  capture (`captureFrame({maxIndexedVerts})`, default 6). Sampled positions spread
+     *  across the whole index range, not just the first few — report it so a caller can
+     *  tell "this mesh has fewer than N distinct vertices" from "the option was ignored". */
+    indexedVertexSampleN?: number;
     // Render target
     rtSurfacePtr: number;
     rtWidth: number;
     rtHeight: number;
+    /** Actual WebGPU format of the attachment this draw renders into. FFP pipelines are
+     *  partitioned by it; a draw whose pipeline was built for another format is rejected
+     *  and takes the whole command buffer with it, so a capture must show it. */
+    rtFormat?: string | null;
     // Texture 0
     tex0: {
         surfacePtr: number;
@@ -73,9 +99,45 @@ export type CapturedDrawCall = {
     colorKeyRenderState: number;
     zEnable: number;
     zWrite: number;
+    /** The compare, without which zEnable says nothing about what gets rejected. */
+    zFunc?: number;
     cullMode: number;
     lightingEnabled: number;
     fogEnabled: number;
+    /** D3DRS_CLIPPLANEENABLE bitmask. A wrongly-applied FFP user clip plane slices
+     *  geometry along a straight screen line — indistinguishable from missing draws
+     *  unless the capture can say whether any plane was armed. 0 = none. */
+    clipPlaneEnable?: number;
+    /** D3DRS_COLORWRITEENABLE mask. Zero means the draw wrote depth only — no pixels, no
+     *  warning, and indistinguishable from a draw that never happened. */
+    colorWriteEnable?: number;
+    /** Per-stage combiner arguments plus the texture each stage samples. The op alone cannot
+     *  say where a channel's value came from, and for an alpha-blended draw that is precisely
+     *  what decides whether it is visible. `alphalessFormat` says whether the sampled alpha is
+     *  the texture's own or the 1.0 we substitute for formats that carry none. */
+    stages?: Array<Record<string, number | string | boolean | null>>;
+    /** Every BOUND sampler slot, which for a programmable draw is the only record of what it
+     *  sampled: `stages` walks the fixed-function stage count, and a pixel shader reads
+     *  samplers 0..15 no matter what that count is. Each row carries the guest handle, so it
+     *  leads straight to dumpTexture. */
+    samplers?: Array<Record<string, number | string | boolean | null>>;
+    /** The operands FFP lighting computes from — material, light count, ambient, and the
+     *  RESOLVED colour sources. For a mesh whose FVF carries no vertex colour these are the
+     *  only source of its colour, so "black" is decidable here and nowhere else. */
+    lighting?: Record<string, unknown>;
+    /** Full fog state. A whole scene resolving to one flat colour is the signature of
+     *  fogFactor==1 everywhere, so the raw modes AND the float-decoded range must be
+     *  visible side by side (the range states are float bits in a DWORD). */
+    fog?: {
+        enable: number;
+        tableMode: number;
+        vertexMode: number;
+        colorArgb: number;
+        start: number;
+        end: number;
+        density: number;
+        specularEnable: number;
+    };
     // Texture stage states (stage 0)
     colorOp: number;
     alphaOp: number;
@@ -110,9 +172,7 @@ export type CapturedDrawCall = {
         addressV: number;
         maxAnisotropy: number;
     } | null;
-    pointUvBiasApplied: boolean | null;
     forcePointFilter: boolean;
-    disablePointUvBias: boolean;
     // Derived state (what the executor actually uses)
     derivedColorKeyEnabled: boolean;
     derivedUseTexture: boolean;
@@ -120,6 +180,9 @@ export type CapturedDrawCall = {
     derivedShouldBlend: boolean;
     // Diagnostics
     warnings: string[];
+    /** Fields this producer did NOT measure — their values are schema defaults, not readings.
+     *  Absent means every field was measured (the DDraw/D3D7/D3D8 FFP path). */
+    unmeasured?: string[];
     // Draw-time MVP (16 floats as handed to the executor). Lets a capture diff
     // transforms across draws/frames — e.g. a skinned body part rendered with a
     // stale world matrix has an MVP wildly different from its sibling parts.
@@ -151,6 +214,16 @@ export type CapturedFrame = {
     timestamp: number;
     /** Producer backend (single shared draw-call schema across backends). DDraw/D3D7/D3D8 today. */
     backend?: string;
+    /** Which render path's frame boundary ended the capture. Differs from `backend` when the
+     *  frame recorded nothing — that is the tell for "we captured the wrong path's frame". */
+    producer?: string;
+    /** Empty frame boundaries waited through before this one. >0 means another path is also
+     *  presenting; pass a backend to captureFrame to pin the one you mean. */
+    skippedEmptyFrameEnds?: number;
     drawCalls: CapturedDrawCall[];
     clears: CapturedClear[];
+    /** The `firstVertices`/`indexedVertices` sample sizes armed for this capture
+     *  (`captureFrame({maxVerts, maxIndexedVerts})`, defaults 4/6). Reported so a caller
+     *  can tell an intentionally small sample from the option being silently ignored. */
+    captureConfig?: { maxVerts: number; maxIndexedVerts: number };
 };

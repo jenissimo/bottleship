@@ -3,6 +3,7 @@ import { FrameDebugSnapshot } from "./index";
 import { Process } from "../../core/process";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
+import { recordGpuError } from "../../core/gpu-error-log";
 import { DirectDrawSurfaceState, isRenderSurface } from "./com-objects";
 import { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
 import { FrameInterpolator } from "../../backends/webgpu/frame-interpolator";
@@ -22,14 +23,18 @@ import {
 } from "../../backends/webgpu/shared/texture-formats";
 import { DDSCAPS_TEXTURE } from "./constants";
 import { getOverlayCompositePlan } from "../user32/dialog-overlay";
+import { getVideoPlanePlan, notifyVideoPlaneComposited } from "../../video/video-plane-policy";
 import { markGpuSyncedFromCpu, surfaceSyncManager } from "./surface-sync";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { statsOverlay } from "../../core/stats-overlay";
+import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
 
 export class DDrawPresenter implements RenderActive {
     private process: Process;
     private canvas: OffscreenCanvas | null = null;
+    /** Last frame handed to the canvas — the source captureFrame() reads back. */
+    private lastPresented: { view: GPUTextureView; width: number; height: number } | null = null;
     private ctx: OffscreenCanvasRenderingContext2D | null = null;
     private counters: Record<string, number> = { frames: 0 };
     private lastPresentLog = 0;
@@ -54,6 +59,16 @@ export class DDrawPresenter implements RenderActive {
 
     constructor(process: Process) {
         this.process = process;
+        // `lastPresented` is a view onto a texture the dead device owned; keeping it would let
+        // repaintLastFrame / captureFrame present a handle that can never render again.
+        registerGpuDeviceObserver("ddraw-presenter", {
+            onDeviceLost: () => {
+                this.lastPresented = null;
+                this.interpolator = null;
+                this.lastBlendWidth = 0;
+                this.lastBlendHeight = 0;
+            },
+        });
     }
 
     /**
@@ -86,6 +101,7 @@ export class DDrawPresenter implements RenderActive {
         );
         this.canvas = null;
         this.ctx = null;
+        this.lastPresented = null;
         this.counters = { frames: 0 };
         // Reset diagnostic counters as well
         this.lastPresentLog = 0;
@@ -119,11 +135,104 @@ export class DDrawPresenter implements RenderActive {
         };
     }
 
+    /**
+     * True once a DirectDraw frame has actually reached the canvas. An existing primary
+     * surface only means DirectDraw *could* display something; until a frame is presented
+     * the primary holds nothing, which is what separates a game rendering fullscreen from
+     * an app that took exclusive mode for the display mode and draws with GDI.
+     */
+    hasPresentedFrame(): boolean {
+        return (this.counters.frames ?? 0) > 0;
+    }
+
+    /**
+     * PNG of the screen. The canvas is the only source that includes the overlays
+     * compositeFrameOverlays() blits on AFTER lastPresented is recorded (video plane,
+     * live GDI dialog rects, stats) — capturing lastPresented shows the game layer
+     * with a dialog missing, which reads as a plausible but wrong screenshot.
+     *
+     * Fallbacks, in order: the presented GPU texture (game layer only, alpha forced
+     * opaque — the guest primary is an RGB565/555 mode with no alpha), then the CPU
+     * path's 2D scratch canvas, which is blank for any GPU_ONLY (3D DDraw) title.
+     */
     async captureFrame(): Promise<Blob> {
+        const screen = await System.getInstance().services.render.tryCaptureScreen();
+        if (screen) return screen;
+        const layer = await this.capturePresentedLayer();
+        if (layer) return layer;
         if (!this.canvas) {
             return new Blob();
         }
         return this.canvas.convertToBlob();
+    }
+
+    /** The presented guest surface alone — no video plane, no GDI dialog rects, no stats. */
+    async capturePresentedLayer(): Promise<Blob | null> {
+        return this.lastPresented ? this.captureFromGpu(this.lastPresented) : null;
+    }
+
+    private async captureFromGpu(src: { view: GPUTextureView; width: number; height: number }): Promise<Blob | null> {
+        const backend = System.getInstance().services?.render?.getBackend?.() as WebGPUBackend | undefined;
+        const device = backend?.getDevice?.();
+        const queue = backend?.getQueue?.();
+        const format = backend?.getFormat?.();
+        if (!device || !queue || !format) return null;
+
+        const { width, height } = src;
+        if (!width || !height) return null;
+
+        // Blit through the same present path (post-fx included) into a copyable
+        // target — the canvas texture itself is not readable after present.
+        const target = device.createTexture({
+            size: { width, height, depthOrArrayLayers: 1 },
+            format,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+        });
+        const bytesPerRow = Math.ceil((width * 4) / 256) * 256;
+        const readback = device.createBuffer({
+            size: bytesPerRow * height,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+        });
+        try {
+            const encoder = device.createCommandEncoder();
+            backend!.drawTexture(src.view, target.createView(), encoder, true, undefined, undefined, undefined, undefined,
+                { srcW: width, srcH: height, outW: width, outH: height });
+            encoder.copyTextureToBuffer(
+                { texture: target },
+                { buffer: readback, bytesPerRow },
+                { width, height, depthOrArrayLayers: 1 },
+            );
+            queue.submit([encoder.finish()]);
+            await queue.onSubmittedWorkDone();
+            await readback.mapAsync(GPUMapMode.READ);
+
+            const mapped = new Uint8Array(readback.getMappedRange());
+            const pixels = new Uint8ClampedArray(width * height * 4);
+            const swapRB = format === "bgra8unorm";
+            for (let y = 0; y < height; y++) {
+                let s = y * bytesPerRow;
+                let d = y * width * 4;
+                for (let x = 0; x < width; x++, s += 4, d += 4) {
+                    pixels[d] = mapped[s + (swapRB ? 2 : 0)]!;
+                    pixels[d + 1] = mapped[s + 1]!;
+                    pixels[d + 2] = mapped[s + (swapRB ? 0 : 2)]!;
+                    pixels[d + 3] = 255;
+                }
+            }
+            readback.unmap();
+
+            const canvas = new OffscreenCanvas(width, height);
+            const ctx = canvas.getContext("2d");
+            if (!ctx) return null;
+            ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+            return await canvas.convertToBlob({ type: "image/png" });
+        } catch (err) {
+            Logger.warn(LogCategory.SYSTEM, `DDrawPresenter.captureFrame: GPU readback failed — ${(err as Error).message}`);
+            return null;
+        } finally {
+            readback.destroy();
+            target.destroy();
+        }
     }
 
     async present(surface: DirectDrawSurfaceState, mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
@@ -191,7 +300,6 @@ export class DDrawPresenter implements RenderActive {
         try {
             const now = performance.now();
             const prevPresentTime = this.lastPresentTime;
-            this.lastPresentTime = now;
 
             // Check for early returns (no throttle – we're not presenting)
             if (!surface.surfacePtr || surface.width <= 0 || surface.height <= 0) {
@@ -210,19 +318,14 @@ export class DDrawPresenter implements RenderActive {
 
             const system = System.getInstance();
             const backend = system.services.render.getBackend();
-            const videoOverlayService = system.videoRouting.getOverlayService();
-            const videoOverlay = videoOverlayService.getCanvas();
 
             // Exclusive-fullscreen screen ownership (real Windows): in DDSCL_EXCLUSIVE|
             // FULLSCREEN, DirectDraw owns the screen and GDI windows are NOT visible —
-            // EXCEPT live native modal dialogs shown over the game (TS "Select Campaign",
-            // BOD Setup), which real Windows composites over the primary. Only their rects
-            // are composited (not the whole overlay), so stale pre-dialog/menu GDI cannot
-            // cover the game. See getOverlayCompositePlan: this is intentionally NOT gated
-            // on gdiSurfaceVisible (a single-buffered primary never Flips, so that flag
-            // sticks `true` after FlipToGDISurface and used to leave a ghost over video).
-            const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-            const plan = getOverlayCompositePlan(ddrawCtx);
+            // EXCEPT live native modal dialogs over a primary GDI still paints into
+            // (TS "Select Campaign", BOD Setup). Only their rects are composited, never
+            // the whole overlay, so stale pre-dialog/menu GDI cannot cover the game.
+            // getOverlayCompositePlan owns the decision (see dialogOverlayComposites).
+            const plan = getOverlayCompositePlan(this);
             const dialogRects = plan.mode === 'rects' ? plan.rects : null;
             const overlay = plan.mode === 'none' ? null : system.gdiContext.getOverlayCanvas();
 
@@ -376,8 +479,9 @@ export class DDrawPresenter implements RenderActive {
                         undefined,
                         // Source (guest) + output (canvas) dims → post-fx chain does
                         // integer/aspect scaling + FXAA texel sizing.
-                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height }
+                        { srcW: surface.width, srcH: surface.height, outW: canvasTex.width, outH: canvasTex.height, toCanvas: true }
                     );
+                    this.lastPresented = { view: presentTextureView, width: surface.width, height: surface.height };
 
                     // Composite overlays (video plane → GDI → worker FPS). Shared with presentBlend.
                     this.compositeFrameOverlays(webgpu, targetView, encoder, surface.width, surface.height);
@@ -392,10 +496,14 @@ export class DDrawPresenter implements RenderActive {
                     if (useErrorScopes) {
                         const frameNum = this.counters.frames;
                         device.popErrorScope().then(err => {
-                            if (err) Logger.error(LogCategory.DDRAW, `[PRESENT] Validation error frame=${frameNum}: ${err.message}`);
+                            if (!err) return;
+                            recordGpuError("scope", "ddrawPresent.validation", err.message);
+                            Logger.error(LogCategory.DDRAW, `[PRESENT] Validation error frame=${frameNum}: ${err.message}`);
                         });
                         device.popErrorScope().then(err => {
-                            if (err) Logger.error(LogCategory.DDRAW, `[PRESENT] OOM error frame=${frameNum}: ${err.message}`);
+                            if (!err) return;
+                            recordGpuError("scope", "ddrawPresent.oom", err.message);
+                            Logger.error(LogCategory.DDRAW, `[PRESENT] OOM error frame=${frameNum}: ${err.message}`);
                         });
                     }
 
@@ -420,10 +528,13 @@ export class DDrawPresenter implements RenderActive {
                     system.services.render.notifyPresent("ddraw");
                     didPresent = true;
 
-                    // Feed frame time to stats overlay
+                    // Inter-present interval. The clock is stamped HERE, not at entry:
+                    // drawFrame has several early returns that present nothing, and resetting
+                    // it there shortens the next interval and over-reports fps.
                     if (prevPresentTime > 0) {
                         statsOverlay.updateMetrics(now - prevPresentTime);
                     }
+                    this.lastPresentTime = now;
 
                     // Frame capture: finalize captured draw calls
                     frameCaptureOnFrameEnd();
@@ -465,21 +576,32 @@ export class DDrawPresenter implements RenderActive {
             const imageData = this.surfaceToImageData(surface, mem);
             this.ctx.putImageData(imageData, 0, 0);
 
-            if (videoOverlay && videoOverlayService.hasContent()) {
-                this.ctx.drawImage(videoOverlay, 0, 0);
-                videoOverlayService.consumeDirty();
+            // Asked HERE, not at the top of present(): the GPU path returns long before this
+            // and asks for itself, and a plan taken for a composite that never happens counts
+            // a frame the plane did not actually cover.
+            const videoPlan = getVideoPlanePlan();
+            if (videoPlan.onScreen) {
+                // The video plane covers the screen, same as on the GPU path — drawn 1:1 it
+                // would sit in a corner whenever the movie is smaller than the mode.
+                this.ctx.drawImage(videoPlan.canvas!, 0, 0, this.canvas!.width, this.canvas!.height);
+                notifyVideoPlaneComposited(videoPlan);
             }
 
             if (overlay) {
+                // The overlay plane is guest-space and the scratch is the surface, so both
+                // branches place it the same way: scaled from plane space into the scratch.
+                const ox = this.canvas!.width / Math.max(1, overlay.width);
+                const oy = this.canvas!.height / Math.max(1, overlay.height);
                 if (dialogRects?.length) {
                     // Flip chain owns the screen: composite only live dialog rects.
                     for (const r of dialogRects) {
                         if (r.w > 0 && r.h > 0) {
-                            this.ctx.drawImage(overlay, r.x, r.y, r.w, r.h, r.x, r.y, r.w, r.h);
+                            this.ctx.drawImage(overlay, r.x, r.y, r.w, r.h,
+                                r.x * ox, r.y * oy, r.w * ox, r.h * oy);
                         }
                     }
                 } else {
-                    this.ctx.drawImage(overlay, 0, 0);
+                    this.ctx.drawImage(overlay, 0, 0, this.canvas!.width, this.canvas!.height);
                 }
                 if (system.gdiContext.isOverlayDirty()) {
                     system.gdiContext.clearOverlayDirty();
@@ -491,7 +613,10 @@ export class DDrawPresenter implements RenderActive {
             } else if (this.process.canvas) {
                 const screenCtx = this.process.canvas.getContext("2d");
                 if (screenCtx) {
-                    screenCtx.drawImage(this.canvas, 0, 0);
+                    // No WebGPU: this 2D path is the present, so it owes the same stretch the
+                    // GPU one does — the canvas is host-sized and the scratch is guest-sized.
+                    screenCtx.drawImage(
+                        this.canvas, 0, 0, this.process.canvas.width, this.process.canvas.height);
                 }
             }
 
@@ -556,17 +681,15 @@ export class DDrawPresenter implements RenderActive {
         height: number,
     ): void {
         const system = System.getInstance();
-        const videoOverlayService = system.videoRouting.getOverlayService();
-        const videoOverlay = videoOverlayService.getCanvas();
-        const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-        const plan = getOverlayCompositePlan(ddrawCtx);
+        const videoPlan = getVideoPlanePlan();
+        const plan = getOverlayCompositePlan(this);
         const dialogRects = plan.mode === 'rects' ? plan.rects : null;
         const overlay = plan.mode === 'none' ? null : system.gdiContext.getOverlayCanvas();
 
         // 1. Video overlay plane (fallback sink).
-        if (videoOverlay && videoOverlayService.hasContent()) {
-            webgpu.blit(videoOverlay, targetView, encoder);
-            videoOverlayService.consumeDirty();
+        if (videoPlan.onScreen) {
+            webgpu.blit(videoPlan.canvas!, targetView, encoder);
+            notifyVideoPlaneComposited(videoPlan);
         }
 
         // 2. GDI overlay on top (whole overlay, or only live dialog rects when the flip chain owns screen).
@@ -589,7 +712,7 @@ export class DDrawPresenter implements RenderActive {
                     webgpu.updateStatsTexture(statsCanvas);
                     statsOverlay.clearDirty();
                 }
-                webgpu.renderStatsOverlay(targetView, encoder, width, height);
+                webgpu.renderStatsOverlay(targetView, encoder);
             }
         }
     }
@@ -750,8 +873,12 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
+            // Keep COPY_SRC: this REPLACES a render target created with it (directdraw.ts
+            // CreateSurface), and the rest of the system may still copy out of the surface
+            // (present-path readback, GetDIBits, dumpSurface). Dropping a usage flag while
+            // swapping the texture silently downgrades the surface.
             const result = createGPUTexture(device, queue, width, height,
-                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
                 "rgba8unorm");
             if (!result) {
                 Logger.error(LogCategory.DDRAW, "Failed to create RGBA texture for PALETTE8");
@@ -866,8 +993,9 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
+            // Keep COPY_SRC — see the PALETTE8 path above.
             const result = createGPUTexture(device, queue, width, height,
-                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+                GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
                 "rgba8unorm");
             if (!result) {
                 Logger.error(LogCategory.DDRAW, "Failed to create RGBA texture");

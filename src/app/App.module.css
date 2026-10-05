@@ -6,13 +6,19 @@
   --fullscreen-integer-h: 480px;
   display: flex;
   flex-direction: column;
-  height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  overscroll-behavior: none;
 }
 
 .app__panel {
   flex: 1;
   position: relative;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
   min-height: 0;
   background: #000;
   display: flex;
@@ -26,10 +32,18 @@
   max-height: 100%;
   width: auto;
   height: auto;
+  /* Flex items default to min-*: auto, which floors them at the canvas's intrinsic
+     size — the height then clamps alone and the picture stretches. */
+  min-width: 0;
+  min-height: 0;
   background: #000;
   touch-action: none;
   position: relative;
   z-index: 1;
+  /* The guest's pointer is drawn by us (see app/guest-cursor.ts), so the OS one is
+     never wanted over the canvas — and Pointer Lock would hide it anyway. It still
+     takes over the moment the pointer leaves. */
+  cursor: none;
   /* The canvas is programmatically focused (tabIndex -1) to capture keyboard input;
      suppress the browser focus ring — it's just visual noise around the game. */
   outline: none;
@@ -41,6 +55,19 @@
 
 .app__canvas--pixelated {
   image-rendering: pixelated;
+}
+
+/* The guest's pointer. Rasterized at device resolution by the renderer and moved by
+   transform only, so a mouse move costs a compositor update and no layout. */
+.app__cursor {
+  display: none;
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 20;
+  pointer-events: none;
+  image-rendering: pixelated;
+  will-change: transform;
 }
 
 .app__warning {
@@ -58,6 +85,18 @@
 }
 
 /* Fullscreen */
+.app--immersive .app__panel {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.app--immersive .emu-topbar,
+.app--immersive .emu-info-strip {
+  display: none;
+}
+
+.app--immersive .app__panel,
 .app__panel:fullscreen,
 .app__panel:-webkit-full-screen {
   padding: 0;
@@ -69,6 +108,7 @@
   justify-content: center;
 }
 
+.app--immersive.app--fullscreen-aspect-lock .app__panel .app__canvas,
 .app--fullscreen-aspect-lock .app__panel:fullscreen .app__canvas,
 .app--fullscreen-aspect-lock .app__panel:-webkit-full-screen .app__canvas {
   width: min(100vw, calc(100dvh * (var(--fullscreen-aspect-w) / var(--fullscreen-aspect-h)))) !important;
@@ -77,6 +117,7 @@
   border-radius: 0;
 }
 
+.app--immersive.app--fullscreen-aspect-free .app__panel .app__canvas,
 .app--fullscreen-aspect-free .app__panel:fullscreen .app__canvas,
 .app--fullscreen-aspect-free .app__panel:-webkit-full-screen .app__canvas {
   width: 100vw !important;
@@ -85,12 +126,14 @@
   border-radius: 0;
 }
 
+.app--immersive.app--fullscreen-integer .app__panel .app__canvas,
 .app--fullscreen-integer .app__panel:fullscreen .app__canvas,
 .app--fullscreen-integer .app__panel:-webkit-full-screen .app__canvas {
   width: var(--fullscreen-integer-w) !important;
   height: var(--fullscreen-integer-h) !important;
 }
 
+.app--immersive .app__warning,
 .app__panel:fullscreen .app__warning,
 .app__panel:-webkit-full-screen .app__warning {
   display: none;
@@ -416,6 +459,22 @@
   text-decoration: underline;
 }
 
+.gog-upgrade {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line-1);
+  background: var(--surf-amber);
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+.gog-upgrade > div { flex: 1; min-width: 220px; }
+.gog-upgrade small { display: block; color: var(--fg-2); margin-top: 4px; }
+.app--immersive .gog-upgrade { display: none; }
+.app__panel:fullscreen ~ .gog-upgrade,
+.app__panel:-webkit-full-screen ~ .gog-upgrade { display: none; }
+
 /* Hide info strip in fullscreen */
 .app__panel:fullscreen ~ .emu-info-strip,
 .app__panel:-webkit-full-screen ~ .emu-info-strip {
@@ -446,7 +505,7 @@
   font-weight: 600;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 720px) and (orientation: portrait) {
   .app {
     padding-bottom: max(12px, env(safe-area-inset-bottom));
   }
@@ -454,6 +513,25 @@
   .app__canvas {
     height: 52dvh;
     min-height: 220px;
+  }
+}
+
+@media (max-height: 560px) and (orientation: landscape) {
+  .app__panel {
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  .app__canvas {
+    max-height: 100%;
+  }
+}
+
+/* A fixed, full-screen background repaints on every scroll/resize on mobile and
+   steals compositor budget from the frame loop. */
+@media (pointer: coarse) {
+  .app {
+    background-attachment: scroll;
   }
 }
 

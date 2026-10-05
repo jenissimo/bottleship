@@ -10,7 +10,13 @@ import { allocateComObject } from "../core/com/com-memory";
 import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
 import { tryInprocCoCreateInstance, startInprocFromFactory } from "../core/com/inproc-com";
 import { Mem } from "../core/memory/mem-accessor";
+import { isValidAddress } from "../core/memory/address-guard";
+import { readGuidFromMem } from "../core/com/typelib/typelib-types";
+import { writeGuestCode } from "../core/memory/guest-code";
 import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from "../core/cpu/emulator-config";
+import { windows, registerWindowDestroyObserver } from "./user32/shared-state";
+import { DragDropRegistry } from "./ole32-dragdrop";
+import { comApartments, ComApartments } from "../core/com/apartment";
 
 // COM error codes
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -20,12 +26,14 @@ const S_FALSE = 0x00000001;
 const E_POINTER = 0x80004003;
 const E_INVALIDARG = 0x80070057;
 const CO_E_NOTLOADED = 0x800401f0;
+const E_NOINTERFACE = 0x80004002;
+
+// The only two interfaces the task allocator answers for (readGuidFromMem spelling).
+const IID_IUNKNOWN = "00000000-0000-0000-c000-000000000046";
+const IID_IMALLOC = "00000002-0000-0000-c000-000000000046";
 
 // BLOWFISH.DLL IBlockCipher::Submit_Key — stdcall, max 56-byte key (Ghidra @ 0x11002011)
 const BF_MAX_KEY_LEN = 0x38;
-
-// Thread-local storage for COM initialization state
-const comInitialized = new Map<number, boolean>(); // Thread ID -> initialized
 
 export class Ole32 implements IModule {
     name = "ole32";
@@ -36,9 +44,20 @@ export class Ole32 implements IModule {
     private guidCounter = 1;
     private blowfishInstances: Map<number, BlowfishState> = new Map(); // objAddr -> state
     private blowfishVtableAddr = 0;
+    private mallocObjAddr = 0;                          // the process-wide IMalloc singleton
+    private taskMemSizes = new Map<number, number>();   // task-allocator block sizes (GetSize/DidAlloc/Realloc)
     private classRegistrations = new Map<number, { clsid: string; punk: number; flags: number }>();
     private nextClassRegistration = 0x1000;
     private messageFilter = 0;
+    private dragDropRegistrations = new DragDropRegistry({
+        isOleInitialized: () => comApartments.isOleInitialized(System.getInstance().scheduler.getCurrentThreadId()),
+        isWindowValid: (hwnd) => {
+            const window = windows.get(hwnd >>> 0);
+            return !!window && !window.pendingDestroy;
+        },
+        addRef: (dropTarget) => this.addRefGuestUnknown(dropTarget),
+        release: (dropTarget) => this.releaseGuestUnknown(dropTarget),
+    });
 
     // Map: object address in memory -> BaseComObject instance
     // This allows IUnknown methods to find the object by its memory address
@@ -48,6 +67,8 @@ export class Ole32 implements IModule {
         this.process = process;
         const system = System.getInstance();
         const interfaceRegistry = InterfaceRegistry.getInstance();
+
+        registerWindowDestroyObserver(hwnd => this.dragDropRegistrations.windowDestroyed(hwnd));
 
         // Register standard DirectX interfaces
         registerStandardDirectXInterfaces();
@@ -62,10 +83,7 @@ export class Ole32 implements IModule {
             Logger.log(LogCategory.COM, `CoInitialize called: pvReserved=0x${pvReserved.toString(16)}`);
 
             const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            comInitialized.set(threadId, true);
-
-            Logger.verbose(LogCategory.COM, `CoInitialize: Thread ${threadId} initialized`);
-            return S_OK;
+            return comApartments.enter(threadId, "sta");
         };
 
         // CoInitializeEx - initialize COM library with threading model
@@ -76,22 +94,14 @@ export class Ole32 implements IModule {
             Logger.log(LogCategory.COM, `CoInitializeEx called: pvReserved=0x${pvReserved.toString(16)}, coInit=0x${coInit.toString(16)}`);
 
             const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            if (comInitialized.get(threadId)) {
-                return S_FALSE; // already initialized on this thread
-            }
-            comInitialized.set(threadId, true);
-            return S_OK;
+            return comApartments.enter(threadId, ComApartments.modelFromCoInit(coInit >>> 0));
         };
 
         // CoUninitialize - uninitialize COM library
         this.exports["CoUninitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, 'CoUninitialize called');
 
-            const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            if (comInitialized.delete(threadId)) {
-                Logger.verbose(LogCategory.COM, `CoUninitialize: Thread ${threadId} uninitialized`);
-            }
-
+            comApartments.leave(System.getInstance().scheduler.getCurrentThreadId());
             return 0; // Return 0 for void function (COM convention)
         };
 
@@ -189,6 +199,14 @@ export class Ole32 implements IModule {
             return this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized);
         }) as ThunkImplementation;
 
+        // CoSetProxyBlanket - set authentication on a proxy. Everything here is
+        // in-process, so there is no proxy to configure and no security to set;
+        // Windows returns S_OK for an in-proc object too.
+        this.exports["CoSetProxyBlanket"] = (ctx, mem, args) => {
+            Logger.verbose(LogCategory.COM, `CoSetProxyBlanket(pProxy=0x${args[0].toString(16)})`);
+            return S_OK;
+        };
+
         // CoCreateGuid - create a new GUID
         this.exports["CoCreateGuid"] = (ctx, mem, args) => {
             const pguid = args[0] >>> 0;
@@ -267,12 +285,58 @@ export class Ole32 implements IModule {
             return S_OK;
         };
 
+        // HRESULT CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID lpclsid)
+        // The registry IS the lookup: HKCR\<ProgID>\CLSID's default value holds the
+        // string form, which the same parser as CLSIDFromString then turns into bytes.
+        this.exports["CLSIDFromProgID"] = (ctx, mem, args) => {
+            const lpszProgID = args[0] >>> 0;
+            const pclsid = args[1] >>> 0;
+            // The region map, not a bounds test: 16 bytes are about to be written through a
+            // guest-supplied pointer (CLAUDE.md 3.1).
+            if (!lpszProgID || !pclsid || !isValidAddress(mem, pclsid, 16, "rw")) return 0x80004003; // E_POINTER
+
+            const progId = this.readWide(mem, lpszProgID).trim();
+            const store = System.getInstance().registry;
+            const key = progId && store ? store.open("HKEY_CLASSES_ROOT", `${progId}\\CLSID`) : null;
+            const val = key ? store!.getValue(key, "") : null;
+            const clsidStr = val && val.type === "REG_SZ" ? String(val.data).trim() : "";
+            if (!clsidStr) {
+                Logger.log(LogCategory.COM, `CLSIDFromProgID("${progId}") -> CO_E_CLASSSTRING (not registered)`);
+                return CO_E_CLASSSTRING;
+            }
+
+            const text = this.normalizeGuid(clsidStr);
+            if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(text)) {
+                return CO_E_CLASSSTRING;
+            }
+
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const parts = text.split("-");
+            view.setUint32(pclsid + 0, parseInt(parts[0], 16) >>> 0, true);
+            view.setUint16(pclsid + 4, parseInt(parts[1], 16) & 0xffff, true);
+            view.setUint16(pclsid + 6, parseInt(parts[2], 16) & 0xffff, true);
+            const tail = parts[3] + parts[4];
+            for (let i = 0; i < 8; i++) {
+                mem[pclsid + 8 + i] = parseInt(tail.slice(i * 2, i * 2 + 2), 16) & 0xff;
+            }
+            return S_OK;
+        };
+
         // LPVOID CoTaskMemAlloc(SIZE_T cb)
-        this.exports["CoTaskMemAlloc"] = (ctx, mem, args) => {
-            const cb = args[0] >>> 0;
-            if (cb === 0) return 0;
-            const ptr = System.getInstance().process?.memory?.alloc(cb);
-            return ptr ? (ptr >>> 0) : 0;
+        this.exports["CoTaskMemAlloc"] = (ctx, mem, args) => this.taskMemAlloc(args[0] >>> 0);
+
+        // HRESULT CoGetMalloc(DWORD dwMemContext, LPMALLOC *ppMalloc)
+        // The task allocator IS the one behind CoTaskMemAlloc, so a caller that
+        // takes this interface and one that calls the flat API share memory.
+        this.exports["CoGetMalloc"] = (ctx, mem, args) => {
+            const dwMemContext = args[0] >>> 0;
+            const ppMalloc = args[1] >>> 0;
+            if (!ppMalloc) return E_INVALIDARG;
+            if (dwMemContext !== 1 /* MEMCTX_TASK */) return E_INVALIDARG;
+            const obj = this.ensureTaskMalloc(mem);
+            if (!obj) return 0x8007000e; // E_OUTOFMEMORY
+            Mem.writeUint32(ppMalloc, obj);
+            return S_OK;
         };
 
         // void CoTaskMemFree(LPVOID pv)
@@ -281,20 +345,64 @@ export class Ole32 implements IModule {
             return 0;
         };
 
+        // BOOL IsEqualGUID(REFGUID, REFGUID) — usually an inline, but ole32 exports it too.
+        this.exports["IsEqualGUID"] = (ctx, mem, args) => {
+            const a = args[0] >>> 0;
+            const b = args[1] >>> 0;
+            if (!a || !b) return a === b ? 1 : 0;
+            const lhs = Mem.readBytes(a, 16);
+            const rhs = Mem.readBytes(b, 16);
+            if (!lhs || !rhs) return 0;
+            for (let i = 0; i < 16; i++) if (lhs[i] !== rhs[i]) return 0;
+            return 1;
+        };
+
         // HRESULT OleInitialize(LPVOID pvReserved)
         this.exports["OleInitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, `OleInitialize called`);
-            const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            comInitialized.set(threadId, true);
-            return S_OK;
+            return comApartments.enterOle(System.getInstance().scheduler.getCurrentThreadId());
         };
 
         // void OleUninitialize()
         this.exports["OleUninitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, `OleUninitialize called`);
-            const threadId = System.getInstance().scheduler.getCurrentThreadId();
-            comInitialized.delete(threadId);
+            comApartments.leaveOle(System.getInstance().scheduler.getCurrentThreadId());
             return 0;
+        };
+
+        // HRESULT OleFlushClipboard(void) — carries an OLE-clipboard data object to a
+        // static copy so it survives the source closing. We keep no OLE clipboard, so the
+        // faithful answer is S_OK (nothing to flush succeeds).
+        this.exports["OleFlushClipboard"] = () => {
+            Logger.verbose(LogCategory.COM, "OleFlushClipboard() - no OLE clipboard, S_OK");
+            return S_OK;
+        };
+
+        // HRESULT OleIsCurrentClipboard(IDataObject *pDataObject) — S_OK if pDataObject is
+        // the one currently on the OLE clipboard, S_FALSE otherwise. We never put a data
+        // object on the clipboard, so it is never current: S_FALSE (or E_INVALIDARG on NULL).
+        this.exports["OleIsCurrentClipboard"] = (ctx, mem, args) => {
+            const pDataObject = args[0] >>> 0;
+            if (pDataObject === 0) return 0x80070057; // E_INVALIDARG
+            return S_FALSE;
+        };
+
+        // HRESULT RegisterDragDrop(HWND hwnd, LPDROPTARGET pDropTarget)
+        this.exports["RegisterDragDrop"] = (ctx, mem, args) => {
+            const hwnd = args[0] >>> 0;
+            const dropTarget = args[1] >>> 0;
+            const result = this.dragDropRegistrations.register(hwnd, dropTarget);
+            Logger.verbose(LogCategory.COM,
+                `RegisterDragDrop(hwnd=0x${hwnd.toString(16)}, pDropTarget=0x${dropTarget.toString(16)}) -> 0x${result.toString(16)}`);
+            return result;
+        };
+
+        // HRESULT RevokeDragDrop(HWND hwnd)
+        this.exports["RevokeDragDrop"] = (ctx, mem, args) => {
+            const hwnd = args[0] >>> 0;
+            const result = this.dragDropRegistrations.revoke(hwnd);
+            Logger.verbose(LogCategory.COM, `RevokeDragDrop(hwnd=0x${hwnd.toString(16)}) -> 0x${result.toString(16)}`);
+            return result;
         };
 
         // HRESULT CoRegisterMessageFilter(LPMESSAGEFILTER lpMessageFilter, LPMESSAGEFILTER *lplpMessageFilter)
@@ -555,6 +663,102 @@ export class Ole32 implements IModule {
         };
     }
 
+    /** The task allocator behind both CoTaskMemAlloc and IMalloc::Alloc. */
+    private taskMemAlloc(cb: number): number {
+        if (cb === 0) return 0;
+        const ptr = System.getInstance().process?.memory?.alloc(cb);
+        if (!ptr) return 0;
+        this.taskMemSizes.set(ptr >>> 0, cb);
+        return ptr >>> 0;
+    }
+
+    /**
+     * The process-wide IMalloc (CoGetMalloc / SHGetMalloc). One singleton, as on
+     * Windows: callers compare the pointer, and DidAlloc must be able to answer
+     * for anything this allocator handed out.
+     */
+    private ensureTaskMalloc(mem: Uint8Array): number {
+        if (this.mallocObjAddr) return this.mallocObjAddr;
+
+        const handlers: Record<string, ThunkImplementation> = {
+            Malloc_QueryInterface: (ctx, mem, args) => {
+                const riid = args[1] >>> 0;
+                const ppv = args[2] >>> 0;
+                if (!ppv) return E_POINTER;
+                // IUnknown and IMalloc are the only interfaces this object has, and both
+                // are answered by the same pointer. Answering S_OK for anything else hands
+                // back an IMalloc vtable under another interface's name — the caller then
+                // calls slot N of an interface this object does not implement.
+                const iid = riid ? readGuidFromMem(mem, riid) : "";
+                if (iid !== IID_IUNKNOWN && iid !== IID_IMALLOC) {
+                    Mem.writeUint32(ppv, 0);
+                    return E_NOINTERFACE;
+                }
+                Mem.writeUint32(ppv, this.mallocObjAddr);
+                return S_OK;
+            },
+            // A process-lifetime singleton: refcounting it would let a guest's
+            // last Release free the allocator every other caller still holds.
+            Malloc_AddRef: () => 1,
+            Malloc_Release: () => 1,
+            Malloc_Alloc: (ctx, mem, args) => this.taskMemAlloc(args[1] >>> 0),
+            Malloc_Realloc: (ctx, mem, args) => {
+                const pv = args[1] >>> 0;
+                const cb = args[2] >>> 0;
+                if (!pv) return this.taskMemAlloc(cb);
+                if (cb === 0) return 0; // Realloc(pv, 0) frees and returns NULL
+                const oldSize = this.taskMemSizes.get(pv);
+                if (oldSize !== undefined && oldSize >= cb) return pv;
+                const next = this.taskMemAlloc(cb);
+                if (!next) return 0;
+                // An UNTRACKED block (handed out by another path, e.g. a PIDL) has no known
+                // size: copy the full new size rather than nothing. Realloc must preserve
+                // the old contents; bytes past the old end are indeterminate either way,
+                // whereas copying zero bytes silently empties the caller's data.
+                const bytes = Mem.readBytes(pv, oldSize === undefined ? cb : Math.min(oldSize, cb));
+                if (bytes) Mem.writeBytes(next, bytes);
+                return next;
+            },
+            // Free is a no-op for the same reason CoTaskMemFree is: the allocator
+            // does not track individual small blocks for reuse.
+            Malloc_Free: () => 0,
+            Malloc_GetSize: (ctx, mem, args) => {
+                const pv = args[1] >>> 0;
+                const size = this.taskMemSizes.get(pv);
+                return size === undefined ? 0xffffffff : size; // (SIZE_T)-1 == unknown
+            },
+            Malloc_DidAlloc: (ctx, mem, args) => {
+                const pv = args[1] >>> 0;
+                if (!pv) return 0xffffffff; // -1 == cannot tell
+                return this.taskMemSizes.has(pv) ? 1 : 0;
+            },
+            Malloc_HeapMinimize: () => 0,
+        };
+
+        const methods: ComVtableMethod[] = [
+            { name: "Malloc_QueryInterface", argCount: 3, stackCleanupBytes: 12 },
+            { name: "Malloc_AddRef", argCount: 1, stackCleanupBytes: 4 },
+            { name: "Malloc_Release", argCount: 1, stackCleanupBytes: 4 },
+            { name: "Malloc_Alloc", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_Realloc", argCount: 3, stackCleanupBytes: 12 },
+            { name: "Malloc_Free", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_GetSize", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_DidAlloc", argCount: 2, stackCleanupBytes: 8 },
+            { name: "Malloc_HeapMinimize", argCount: 1, stackCleanupBytes: 4 },
+        ];
+
+        const installed = installComVtable(this.process, {
+            moduleName: "ole32_imalloc",
+            methods,
+            handlers,
+            logLabel: "IMalloc",
+        });
+        if (!installed) return 0;
+
+        this.mallocObjAddr = allocateComObject(this.process.memory, mem, installed.vtableAddr);
+        return this.mallocObjAddr;
+    }
+
     /**
      * Create universal IUnknown stubs that can be used by any COM object
      * These stubs will look up the object by address and call methods on BaseComObject
@@ -607,7 +811,9 @@ export class Ole32 implements IModule {
                 return 0;
             }
 
-            return obj.addRef();
+            // thisPtr IS the interface pointer the guest called through — pass it, or a
+            // per-interface object credits the reference to the wrong bucket.
+            return obj.addRef(thisPtr >>> 0);
         };
 
         // COM_IUnknown_Release - universal Release implementation
@@ -622,7 +828,7 @@ export class Ole32 implements IModule {
                 return 0;
             }
 
-            return obj.release();
+            return obj.release(thisPtr >>> 0);
         };
 
         // Register these methods in dispatcher and create thunk stubs
@@ -642,7 +848,14 @@ export class Ole32 implements IModule {
         // Allocate memory for stub code
         const stubAddress = this.process.memory.alloc(stubDll.stubCode.length);
         const currentMemory = this.process.getCurrentMemory();
-        currentMemory.set(stubDll.stubCode, stubAddress);
+        if (!writeGuestCode(currentMemory, stubDll.stubCode, stubAddress)) {
+            // Silently not writing them leaves every IUnknown vtable slot pointing at
+            // whatever bytes happen to live there.
+            Logger.error(LogCategory.COM,
+                `OLE32: IUnknown stub write at 0x${stubAddress.toString(16)} overruns guest memory — ` +
+                `IUnknown vtables would be unbacked; aborting stub registration`);
+            return;
+        }
 
         Logger.verbose(LogCategory.COM, `OLE32: Allocated ${stubDll.stubCode.length} bytes for IUnknown stubs at 0x${stubAddress.toString(16)}`);
 
@@ -741,6 +954,24 @@ export class Ole32 implements IModule {
             return REGDB_E_CLASSNOTREG;
         } else if (clsidNormalized === "5959df60-2911-11d1-b049-0020af30269a") {
             Logger.warn(LogCategory.COM, `CoCreateInstance: Immersion TouchSense CLSID ${clsidStr} not supported, returning REGDB_E_CLASSNOTREG`);
+            if (ppv) view.setUint32(ppv, 0, true);
+            return REGDB_E_CLASSNOTREG;
+        } else if (clsidNormalized === "d2ac2892-b39b-11d1-8704-00600893b1bd"
+                || clsidNormalized === "d2ac2891-b39b-11d1-8704-00600893b1bd") {
+            // CLSID_DirectMusicLoader (and its DX7 spelling). ZenGin treats a failure here
+            // as fatal for the whole music system and re-raises an error box forever.
+            const dm = this.process.modules.get("dmusic") as { createLoader?: (pp: number) => number } | undefined;
+            if (dm?.createLoader) return dm.createLoader(ppv);
+            if (ppv) view.setUint32(ppv, 0, true);
+            return REGDB_E_CLASSNOTREG;
+        } else if (clsidNormalized === "d2ac2881-b39b-11d1-8704-00600893b1bd") {
+            const dm = this.process.modules.get("dmusic") as { createPerformance?: (pp: number) => number } | undefined;
+            if (dm?.createPerformance) return dm.createPerformance(ppv);
+            if (ppv) view.setUint32(ppv, 0, true);
+            return REGDB_E_CLASSNOTREG;
+        } else if (clsidNormalized === "d2ac2890-b39b-11d1-8704-00600893b1bd") {
+            const dm = this.process.modules.get("dmusic") as { createComposer?: (pp: number) => number } | undefined;
+            if (dm?.createComposer) return dm.createComposer(ppv);
             if (ppv) view.setUint32(ppv, 0, true);
             return REGDB_E_CLASSNOTREG;
         } else if (clsidNormalized === "e436ebb3-524f-11ce-9f53-0020af0ba770") {
@@ -905,11 +1136,11 @@ export class Ole32 implements IModule {
         return 0;
     }
 
-    /** Best-effort AddRef for a guest IUnknown* passed to CoRegisterClassObject. */
+    /** Best-effort AddRef for an HLE-managed guest IUnknown*. */
     private addRefGuestUnknown(punk: number): void {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(punk);
         if (obj) {
-            obj.addRef();
+            obj.addRef(punk);
             return;
         }
         const mem = this.process.getCurrentMemory();
@@ -919,17 +1150,17 @@ export class Ole32 implements IModule {
         if (vtable + 8 > mem.length) return;
         const addRefAddr = view.getUint32(vtable + 4, true) >>> 0;
         if (addRefAddr < 0x10000) return;
-        Logger.verbose(LogCategory.COM, `CoRegisterClassObject: guest AddRef skipped for punk=0x${punk.toString(16)} (stub at 0x${addRefAddr.toString(16)})`);
+        Logger.verbose(LogCategory.COM, `OLE32: guest AddRef skipped for punk=0x${punk.toString(16)} (stub at 0x${addRefAddr.toString(16)})`);
     }
 
     /** Best-effort Release paired with addRefGuestUnknown. */
     private releaseGuestUnknown(punk: number): void {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(punk);
         if (obj) {
-            obj.release();
+            obj.release(punk);
             return;
         }
-        Logger.verbose(LogCategory.COM, `CoRevokeClassObject: guest Release skipped for punk=0x${punk.toString(16)}`);
+        Logger.verbose(LogCategory.COM, `OLE32: guest Release skipped for punk=0x${punk.toString(16)}`);
     }
 
     private readWide(mem: Uint8Array, addr: number): string {
@@ -1099,7 +1330,7 @@ export class Ole32 implements IModule {
         }
 
         // Allocate COM object: [vtablePtr]
-        const objAddr = allocateComObject(process.memory, mem, this.blowfishVtableAddr, 'THUNK_DATA');
+        const objAddr = allocateComObject(process.memory, mem, this.blowfishVtableAddr);
 
         // Create Blowfish state
         this.blowfishInstances.set(objAddr, { refCount: 1, cipher: new BlowfishCipher() });
@@ -1113,6 +1344,33 @@ export class Ole32 implements IModule {
 
         Logger.log(LogCategory.COM, `Blowfish: created object at 0x${objAddr.toString(16)}`);
         return objAddr;
+    }
+
+    /**
+     * Drop process-scoped COM apartment / object maps before Process.reset() rewinds
+     * THUNK_CODE. Stubs are regenerated in recreateVTables() after the new layout exists.
+     */
+    reset(): void {
+        comApartments.reset();
+        this.dragDropRegistrations.reset();
+        this.objectAddressMap.clear();
+        this.classRegistrations.clear();
+        this.nextClassRegistration = 0x1000;
+        this.blowfishInstances.clear();
+        this.blowfishVtableAddr = 0;
+        // The IMalloc singleton lives in THUNK_CODE/heap that reset rewinds; keeping its
+        // address would hand the next process a vtable pointer into rewound memory, and
+        // the block sizes would answer GetSize/DidAlloc for a dead address space.
+        this.mallocObjAddr = 0;
+        this.taskMemSizes.clear();
+        this.messageFilter = 0;
+        this.iunknownStubs = null;
+        this.guidState = 0xa341316c;
+        this.guidCounter = 1;
+    }
+
+    recreateVTables(): void {
+        this.createIUnknownStubs();
     }
 }
 

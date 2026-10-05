@@ -14,7 +14,6 @@
 import { describe, expect, test, beforeEach } from "bun:test";
 import { WindowManager } from "../../src/worker/runtime/windowing/window-manager";
 import type { Message } from "../../src/worker/runtime/windowing/message-queue";
-import { setCapture, getCapture, releaseCapture } from "../../src/worker/modules/user32/shared-state";
 
 // Window style bits used by the harness.
 const WS_VISIBLE = 0x10000000;
@@ -59,6 +58,13 @@ function mkChild(
     return wm.createWindow("TestChild", "child", style, 0, x, y, w, h, parent, 0, 0, 0);
 }
 
+function mkOwned(wm: WindowManager, owner: number): number {
+    return wm.createWindow(
+        "TestOwned", "owned", WS_POPUP | WS_VISIBLE, 0,
+        0, 0, 100, 100, owner, 0, 0, 0,
+    );
+}
+
 /** Drain the message queue and return all messages targeting `hwnd`. */
 function drainFor(wm: WindowManager, hwnd: number): Message[] {
     const out: Message[] = [];
@@ -80,7 +86,7 @@ function drainAll(wm: WindowManager): Message[] {
 
 describe("WindowManager Z-order", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("new visible top-level windows insert at the top (front of Z-order)", () => {
         const a = mkTopLevel(wm, 0, 0, 100, 100);
@@ -136,19 +142,19 @@ describe("WindowManager Z-order", () => {
         expect(wm.getZOrder()).toEqual([t, b, a]);
     });
 
-    test("ShowWindow visibility change reorders (shown → front, hidden → back)", () => {
+    test("visibility alone preserves Z-order", () => {
         const a = mkTopLevel(wm, 0, 0, 100, 100);
         const b = mkTopLevel(wm, 0, 0, 100, 100); // z: [b,a]
-        wm.onWindowVisibilityChanged(b, false); // hide b → back
-        expect(wm.getZOrder()).toEqual([a, b]);
-        wm.onWindowVisibilityChanged(b, true); // show b → front
+        wm.getWindow(b)!.visible = false;
+        expect(wm.getZOrder()).toEqual([b, a]);
+        wm.getWindow(b)!.visible = true;
         expect(wm.getZOrder()).toEqual([b, a]);
     });
 });
 
 describe("WindowManager WindowFromPoint", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("overlap: the frontmost containing top-level wins", () => {
         const back = mkTopLevel(wm, 0, 0, 200, 200);
@@ -171,6 +177,24 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(10, 10)).toBe(top);
     });
 
+    test("activating an owner keeps its owned top-level window in front", () => {
+        const owner = mkTopLevel(wm, 0, 0, 100, 100);
+        const owned = mkOwned(wm, owner);
+        const unrelated = mkTopLevel(wm, 0, 0, 100, 100);
+
+        wm.setActiveWindow(owner);
+
+        expect(wm.getZOrder()).toEqual([owned, owner, unrelated]);
+        expect(wm.windowFromPoint(50, 50)).toBe(owned);
+    });
+
+    test("new child is inserted at HWND_BOTTOM for hit-testing", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const front = mkChild(wm, top, 25, 25, 100, 100);
+        mkChild(wm, top, 25, 25, 100, 100);
+        expect(wm.windowFromPoint(50, 50)).toBe(front);
+    });
+
     test("nested children: deepest containing child wins", () => {
         const top = mkTopLevel(wm, 0, 0, 400, 400);
         const child = mkChild(wm, top, 50, 50, 200, 200);
@@ -178,10 +202,14 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(80, 80)).toBe(grandchild);
     });
 
-    test("WS_DISABLED top-level is skipped (window behind it is hit)", () => {
-        const back = mkTopLevel(wm, 0, 0, 200, 200);
-        mkTopLevel(wm, 0, 0, 200, 200, { disabled: true }); // covers back, but disabled
-        expect(wm.windowFromPoint(50, 50)).toBe(back);
+    // WindowFromPoint does NOT filter on WS_DISABLED (Wine NtUserWindowFromPoint calls
+    // window_from_point with no style filter; only ChildWindowFromPointEx skips disabled,
+    // and only when asked via CWP_SKIPDISABLED). A modal dialog disables its owner and
+    // Windows still routes clicks on the owner TO the owner, which ignores them.
+    test("WS_DISABLED top-level still answers (Windows does not skip it)", () => {
+        mkTopLevel(wm, 0, 0, 200, 200);
+        const disabled = mkTopLevel(wm, 0, 0, 200, 200, { disabled: true });
+        expect(wm.windowFromPoint(50, 50)).toBe(disabled);
     });
 
     test("hidden top-level is skipped", () => {
@@ -190,16 +218,45 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(50, 50)).toBe(back);
     });
 
-    test("disabled / hidden child is skipped → resolves to parent", () => {
+    test("hidden child is skipped → resolves to parent", () => {
         const top = mkTopLevel(wm, 0, 0, 300, 300);
-        mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
+        mkChild(wm, top, 50, 50, 100, 100, { visible: false });
         expect(wm.windowFromPoint(75, 75)).toBe(top);
+    });
+
+    test("disabled child still answers (same no-filter rule as a top-level)", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const child = mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
+        expect(wm.windowFromPoint(75, 75)).toBe(child);
+    });
+
+    // The sibling list lives in user32 and SetWindowPos reorders it there; a child raised
+    // over an earlier-created sibling (comctl32 puts a property-sheet PAGE over the tab
+    // control that way) must win the hit test, or it is painted on top and clicked through.
+    test("registered sibling Z-order beats creation order", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const first = mkChild(wm, top, 25, 25, 100, 100);
+        const raised = mkChild(wm, top, 25, 25, 100, 100);
+        expect(wm.windowFromPoint(50, 50)).toBe(first); // creation order, no provider
+
+        const order = new Map<number, number[]>([[top, [raised, first]]]);
+        wm.registerChildZOrderProvider((parent) => order.get(parent) ?? (parent === first || parent === raised ? [] : undefined));
+        expect(wm.windowFromPoint(50, 50)).toBe(raised);
+    });
+
+    // "user32 does not know this window" must not read as "it has no children": a subtree
+    // the provider cannot describe still has to be hit-testable.
+    test("a parent the provider does not know falls back to creation order", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300);
+        const child = mkChild(wm, top, 50, 50, 100, 100);
+        wm.registerChildZOrderProvider(() => undefined);
+        expect(wm.windowFromPoint(75, 75)).toBe(child);
     });
 });
 
 describe("WindowManager focus vs active", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("SetFocus on a child sets focus but does NOT change active/foreground", () => {
         const top = mkTopLevel(wm, 0, 0, 300, 300);
@@ -246,14 +303,14 @@ describe("WindowManager focus vs active", () => {
 
 describe("WindowManager capture + destroy", () => {
     let wm: WindowManager;
-    beforeEach(() => { wm = new WindowManager(); releaseCapture(); });
+    beforeEach(() => { wm = new WindowManager(); });
 
     test("destroying the capture window releases capture + posts WM_CAPTURECHANGED", () => {
         const top = mkTopLevel(wm, 0, 0, 200, 200);
-        setCapture(top);
-        expect(getCapture()).toBe(top);
+        wm.setCapture(top);
+        expect(wm.getCaptureHwnd()).toBe(top);
         wm.destroyWindow(top);
-        expect(getCapture()).toBe(0);
+        expect(wm.getCaptureHwnd()).toBe(0);
         // WM_CAPTURECHANGED must have been queued to the losing window.
         const all = drainAll(wm);
         expect(all.some(m => m.hwnd === top && m.message === WM_CAPTURECHANGED)).toBe(true);
@@ -262,9 +319,9 @@ describe("WindowManager capture + destroy", () => {
     test("destroying a window whose CHILD holds capture also releases it", () => {
         const top = mkTopLevel(wm, 0, 0, 200, 200);
         const child = mkChild(wm, top, 0, 0, 50, 50);
-        setCapture(child);
+        wm.setCapture(child);
         wm.destroyWindow(top); // dies with its subtree → capture (held by child) released
-        expect(getCapture()).toBe(0);
+        expect(wm.getCaptureHwnd()).toBe(0);
     });
 
     test("destroying the active top-level activates the next in Z-order with full chain", () => {

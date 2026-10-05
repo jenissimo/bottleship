@@ -5,9 +5,17 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
+import { Mem } from '../../core/memory/mem-accessor';
 import { encodeAnsi } from '../codepage-utils';
+import { addFontResource, removeFontResource } from './font-resource';
+import { PS_STYLE_MASK } from './gdi-objects';
+import { DEFAULT_CHARSET, fontSignature, systemDefaultCharset } from './font-charset';
 
 let nextMetafileHandle = 0x50000;
+
+/** ExtCreatePen pen-type bits: cosmetic (0) vs geometric (PS_GEOMETRIC). */
+const PS_TYPE_MASK = 0x000F0000;
+const PS_GEOMETRIC = 0x00010000;
 
 export function registerPaintingMiscExports(exports: Record<string, ThunkImplementation>): void {
     // int EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lpFontFamProc, LPARAM lParam)
@@ -25,18 +33,21 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         return 1;
     };
 
-    // int EnumFontFamiliesExA(HDC hdc, LPLOGFONTA lpLogfont, FONTENUMPROCA lpCallback, LPARAM lParam, DWORD dwFlags)
-    exports['EnumFontFamiliesExA'] = (ctx, mem, args): number => {
+    // int EnumFontFamiliesEx{A,W}(HDC, LPLOGFONT, FONTENUMPROC, LPARAM, DWORD dwFlags)
+    // The LOGFONT is only read for logging, so A and W share one body.
+    const enumFontFamiliesEx = (name: string): ThunkImplementation => (ctx, mem, args): number => {
         const hdc = args[0];
         const lpCallback = args[2];
         const dwFlags = args[4] >>> 0;
         Logger.verbose(
             LogCategory.GDI32,
-            `EnumFontFamiliesExA(hdc=0x${hdc.toString(16)}, proc=0x${lpCallback.toString(16)}, flags=0x${dwFlags.toString(16)})`,
+            `${name}(hdc=0x${hdc.toString(16)}, proc=0x${lpCallback.toString(16)}, flags=0x${dwFlags.toString(16)})`,
         );
         if (!lpCallback) return 0;
         return 1;
     };
+    exports['EnumFontFamiliesExA'] = enumFontFamiliesEx('EnumFontFamiliesExA');
+    exports['EnumFontFamiliesExW'] = enumFontFamiliesEx('EnumFontFamiliesExW');
 
     // int GetTextFaceA(HDC hdc, int c, LPSTR lpName)
     exports['GetTextFaceA'] = (ctx, mem, args): number => {
@@ -56,6 +67,41 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
     };
 
     // COLORREF GetNearestColor(HDC hdc, COLORREF crColor)
+    /**
+     * DWORD GetTextCharsetInfo(HDC hdc, LPFONTSIGNATURE lpSig, DWORD dwFlags)
+     *
+     * The charset of the font currently selected into hdc, plus — when asked — that
+     * charset's FONTSIGNATURE. This is how an app decides which code page to encode its
+     * own 8-bit strings in before handing them to TextOut, so a constant answer would
+     * silently re-encode every non-Latin build.
+     *
+     * DEFAULT_CHARSET is the DOCUMENTED FAILURE value, so it must never be returned for a
+     * font that realised: a DC whose font asked for DEFAULT_CHARSET reports the system
+     * charset it actually became (see font-charset.ts).
+     */
+    const textCharsetInfo = (hdc: number, lpSig: number): number => {
+        const charset = System.getInstance().gdiContext.getSelectedFontCharset(hdc);
+        if (charset === null) {
+            Logger.verbose(LogCategory.GDI32, `GetTextCharsetInfo: hdc=0x${hdc.toString(16)} has no font — DEFAULT_CHARSET`);
+            return DEFAULT_CHARSET;
+        }
+        const realised = charset === DEFAULT_CHARSET ? systemDefaultCharset() : charset;
+        if (lpSig) {
+            // FONTSIGNATURE { DWORD fsUsb[4]; DWORD fsCsb[2]; } — 24 bytes.
+            const sig = fontSignature(realised);
+            for (let i = 0; i < sig.length; i++) {
+                if (!Mem.writeUint32(lpSig + i * 4, sig[i]!)) return DEFAULT_CHARSET;
+            }
+        }
+        return realised;
+    };
+
+    exports['GetTextCharsetInfo'] = (ctx, mem, args): number =>
+        textCharsetInfo(args[0], args[1] >>> 0);
+
+    // GetTextCharset(hdc) is defined as GetTextCharsetInfo(hdc, NULL, 0).
+    exports['GetTextCharset'] = (ctx, mem, args): number => textCharsetInfo(args[0], 0);
+
     exports['GetNearestColor'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const color = args[1] >>> 0;
@@ -82,7 +128,14 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
             color = view.getUint32(plbrush + 4, true);
         }
 
-        return System.getInstance().gdiContext.createPen(cWidth || 1, color);
+        // A cosmetic ext pen is always one device pixel wide regardless of cWidth
+        // (dibdrv_SelectPen); only PS_GEOMETRIC honours the width.
+        const geometric = (iPenStyle & PS_TYPE_MASK) === PS_GEOMETRIC;
+        return System.getInstance().gdiContext.createPen(
+            iPenStyle & PS_STYLE_MASK,
+            geometric ? (cWidth || 1) : 1,
+            color,
+        );
     };
 
     // HMETAFILE CloseMetaFile(HDC hdc)
@@ -139,31 +192,69 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         return 1;
     };
 
-    // int AddFontResourceA(LPCSTR pszFilename)
-    exports['AddFontResourceA'] = (ctx, mem, args): number => {
-        const path = args[0] ? Marshaler.readString(mem, args[0]) : '';
-        Logger.verbose(LogCategory.GDI32, `AddFontResourceA("${path}")`);
+    // int AddFontResource{A,W}(LPCTSTR pszFilename) — the two differ only in how
+    // the filename is decoded, so both names share one body.
+    const addFontResourceByPath = (api: string, path: string): number | Promise<number> => {
+        Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
 
         if (!path) return 0;
 
         const vfs = System.getInstance().fileSystem;
         const resolved = vfs.resolvePath(path);
-        const exists = vfs.hasRomFile(resolved) || (vfs as any).overlay?.hasFile(resolved);
-        if (!exists) {
-            Logger.verbose(LogCategory.GDI32, `AddFontResourceA: file not found "${path}"`);
+        const size = vfs.getFileSize(resolved);
+        if (size <= 0) {
+            Logger.verbose(LogCategory.GDI32, `${api}: file not found "${path}"`);
             return 0;
         }
 
-        // Browser uses bundled web fonts; report one font added so callers proceed.
-        return 1;
+        // Async thunk: blocks the calling guest thread until the FontFace is
+        // installed — faithful to AddFontResource returning with the font usable.
+        return (async (): Promise<number> => {
+            try {
+                const GENERIC_READ = 0x80000000;
+                const OPEN_EXISTING = 3;
+                const handle = await vfs.open(resolved, GENERIC_READ, OPEN_EXISTING);
+                if (!handle) return 0;
+                const data = await vfs.read(handle, size);
+                return await addFontResource(resolved, data);
+            } catch (e) {
+                Logger.warn(LogCategory.GDI32, `${api}: read failed for "${path}": ${e}`);
+                return 0;
+            }
+        })();
     };
 
-    // BOOL RemoveFontResourceA(LPCSTR pszFilename)
-    exports['RemoveFontResourceA'] = (ctx, mem, args): number => {
-        const path = args[0] ? Marshaler.readString(mem, args[0]) : '';
-        Logger.verbose(LogCategory.GDI32, `RemoveFontResourceA("${path}")`);
-        return 1;
+    const removeFontResourceByPath = (api: string, path: string): number => {
+        Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
+        if (!path) return 0;
+        const vfs = System.getInstance().fileSystem;
+        return removeFontResource(vfs.resolvePath(path)) ? 1 : 0;
     };
+
+    // int AddFontResourceA(LPCSTR pszFilename)
+    exports['AddFontResourceA'] = (ctx, mem, args): number | Promise<number> =>
+        addFontResourceByPath('AddFontResourceA', args[0] ? Marshaler.readString(mem, args[0]) : '');
+
+    // int AddFontResourceW(LPCWSTR pszFilename)
+    exports['AddFontResourceW'] = (ctx, mem, args): number | Promise<number> =>
+        addFontResourceByPath(
+            'AddFontResourceW',
+            args[0] ? Marshaler.readWideString(mem, args[0]) : '',
+        );
+
+    // BOOL RemoveFontResourceA(LPCSTR pszFilename)
+    exports['RemoveFontResourceA'] = (ctx, mem, args): number =>
+        removeFontResourceByPath(
+            'RemoveFontResourceA',
+            args[0] ? Marshaler.readString(mem, args[0]) : '',
+        );
+
+    // BOOL RemoveFontResourceW(LPCWSTR pszFilename)
+    exports['RemoveFontResourceW'] = (ctx, mem, args): number =>
+        removeFontResourceByPath(
+            'RemoveFontResourceW',
+            args[0] ? Marshaler.readWideString(mem, args[0]) : '',
+        );
 
     // BOOL GetICMProfileW(HDC hdc, LPDWORD pBufSize, LPWSTR pszFilename)
     //

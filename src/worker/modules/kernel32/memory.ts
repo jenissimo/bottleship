@@ -4,14 +4,19 @@
  * Atomic implementation for memory operations
  */
 
-import { FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, FastPathImplementation, ThunkImplementation, type X86Context } from '../../core/thunking/thunk-dispatcher';
 import type { ThunkMemoryRegions } from '../../core/thunking/thunk-memory-manager';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
-import { bumpFastmemGeneration, type RegionPerms } from '../../core/memory/address-space';
+import { MemoryManager } from '../../core/process';
+import type { PESection } from '../../core/module-registry';
+import { type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
 import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit';
+import { profiler } from '../../core/profiler';
+import { GUEST_PROCESSOR_TYPE, GUEST_PROCESSOR_LEVEL, GUEST_PROCESSOR_REVISION } from '../../core/guest-cpu-identity';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
+import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import {
     MEM_HEAP_BASE,
     MEM_THUNK_DATA_BASE,
@@ -22,12 +27,15 @@ import {
     MAX_ALLOC_BYTES,
 } from '../../core/cpu/emulator-config';
 const HEAP_ZERO_MEMORY_FLAG = 0x00000008;
+const HEAP_REALLOC_IN_PLACE_ONLY = 0x00000010;
 const HEAP_OOM_ERROR = 8;
+const ERR_INVALID_PARAMETER = 87;
+/** HeapSize's (SIZE_T)-1: "not a heap block", which is NOT the same as a zero-sized one. */
+const HEAP_SIZE_INVALID = 0xFFFFFFFF;
 const HEAP_FAST_PATH_MAX_ALLOC = 0x20000000;
 const DEBUG_FORCE_ZERO_HEAP_FAST_PATH = false;
 export const HEAP_SMALL_ALLOC_MAX = 0x1000; // 4KB — the slab fast path covers blocks up to this
 const HEAP_ALLOC_GRANULARITY = 16;   // small allocs rounded up (Win32 heap granularity)
-const FASTMEM_BUMP_ADDRESS_SPACE_PROTECT = 3;
 
 const alignSmallAlloc = (size: number): number =>
     (size + (HEAP_ALLOC_GRANULARITY - 1)) & ~(HEAP_ALLOC_GRANULARITY - 1);
@@ -53,6 +61,16 @@ const PROCESS_HEAP_HANDLE_CONST = 0x12345678;
 const HEAP_CREATE_HANDLE_BASE = 0x12345679;
 const createdHeaps = new Set<number>();
 let nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
+/**
+ * HeapCompatibilityInformation per heap handle: 0 standard, 1 lookaside, 2 LFH. Ours is
+ * one allocator whichever is selected — the class is a Windows-internal front end, not a
+ * contract about behaviour — but the value must be REMEMBERED, because HeapQueryInformation
+ * is documented to read back what HeapSetInformation accepted and a CRT that sets LFH and
+ * then verifies it reads a mismatch as a hooked/corrupted heap.
+ */
+const heapCompatibility = new Map<number, number>();
+/** HeapEnableTerminationOnCorruption, once set, cannot be turned off (documented). */
+let terminationOnCorruption = false;
 let heapManagerOwnerProcess: any = null;
 
 // HeapWalk is stateful: the caller zeroes the entry, calls once to get the first
@@ -71,6 +89,8 @@ const ensureHeapManagerProcess = (): void => {
     if (currentProcess === heapManagerOwnerProcess) return;
     heapManagerOwnerProcess = currentProcess;
     createdHeaps.clear();
+    heapCompatibility.clear();
+    terminationOnCorruption = false;
     nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
     heapWalkState = null;
 };
@@ -116,6 +136,12 @@ const HEAP_SLAB_INITIAL_SIZE = 4 * 1024 * 1024;    // 4 MB
 const HEAP_SLAB_MAX_SIZE     = 64 * 1024 * 1024;   // 64 MB per slab
 const HEAP_SLAB_TOTAL_MAX    = 256 * 1024 * 1024;  // 256 MB total across all generations
 const HEAP_SLAB_GROW_HEADROOM = 256 * 1024;        // grow when < 256 KB remaining in active slab
+// The arena and the guest's own large allocations share ONE bucket, and the arena grows
+// DOWN from the top while the bump frontier grows UP — so an absolute total cap is not a
+// bound on what the guest is left with. This is the share of the HEAP bucket the arena may
+// never take: cross it and a 400 MB-working-set title dies of std::bad_alloc while a
+// quarter of its heap is arena that only ever serves sub-4KB blocks.
+const HEAP_SLAB_BUMP_RESERVE_FRACTION = 0.25;
 const SLAB_BIN_SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 const SLAB_MAGIC = 0x534C4100; // BUSY slab block ('SLA'); low nibble = bin
 
@@ -135,7 +161,97 @@ let totalSlabBytes = 0;
 let nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
 let slabGrowLastAttempt = 0; // performance.now() of last grow attempt (throttle)
 
+/**
+ * base -> size, plus a sorted stabbing index over the same entries.
+ *
+ * VirtualQuery and HeapSize both ask "which interval contains this address?" — a
+ * pointer-validity probe loop asks it hundreds of thousands of times per boot, while the
+ * intervals themselves change only on VirtualAlloc/VirtualFree/decommit. Owning the
+ * mutations here is what keeps the index from answering out of a stale membership: there
+ * is no separate invalidation call to forget.
+ */
+class IntervalMap {
+    private readonly map = new Map<number, number>();
+    private sorted: Array<{ base: number; size: number }> | null = null;
+
+    get size(): number { return this.map.size; }
+    has(base: number): boolean { return this.map.has(base >>> 0); }
+    get(base: number): number | undefined { return this.map.get(base >>> 0); }
+    set(base: number, size: number): void { this.map.set(base >>> 0, size); this.sorted = null; }
+    delete(base: number): boolean {
+        const removed = this.map.delete(base >>> 0);
+        if (removed) this.sorted = null;
+        return removed;
+    }
+    clear(): void { this.map.clear(); this.sorted = null; }
+    [Symbol.iterator](): IterableIterator<[number, number]> { return this.map[Symbol.iterator](); }
+
+    /** The interval containing `addr`, or null. Entries are disjoint by construction. */
+    find(addr: number): { base: number; size: number } | null {
+        const a = addr >>> 0;
+        let spans = this.sorted;
+        if (!spans) {
+            spans = [];
+            for (const [base, size] of this.map) if (size > 0) spans.push({ base, size });
+            spans.sort((x, y) => x.base - y.base);
+            this.sorted = spans;
+        }
+        let lo = 0, hi = spans.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (spans[mid]!.base <= a) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (last < 0) return null;
+        const s = spans[last]!;
+        return a < s.base + s.size ? s : null;
+    }
+}
+
+// VirtualAlloc roots (base -> size). Same MemoryManager bucket as HeapAlloc, but they
+// are NOT heap blocks: HeapSize must return (SIZE_T)-1 and HeapWalk must omit them,
+// or third-party heaps (SmartHeap) treat a VirtualAlloc pool as HeapAlloc memory,
+// HeapFree the pool base, and reuse sub-allocations still held by the CRT (_piob UAF).
+const virtualAllocRegions = new IntervalMap();
+
+// Decommitted page ranges within reserved regions.
+// Storm.dll's SBH allocator depends on the decommit/recommit cycle:
+//   1. VirtualAlloc(MEM_RESERVE) — reserve 64KB block
+//   2. VirtualAlloc(MEM_COMMIT) — commit pages on demand (zeroed)
+//   3. VirtualFree(MEM_DECOMMIT) — decommit freed pages
+//   4. VirtualAlloc(MEM_COMMIT) — recommit = re-zero pages
+// Without tracking, decommit is a no-op and recommit skips zeroing, leaving stale
+// heap metadata that causes heap corruption. VirtualQuery reports these MEM_RESERVE.
+const decommittedPages = new IntervalMap();
+
+function isVirtualAllocBase(ptr: number): boolean {
+    return virtualAllocRegions.has(ptr >>> 0);
+}
+
+function isInVirtualAllocRegion(ptr: number): boolean {
+    return virtualAllocRegions.find(ptr) !== null;
+}
+
 /** Low-level: allocate one slab of `size` bytes and install it as the active one. */
+/**
+ * How much of the HEAP bucket the arena may still take, given the reserve the guest's own
+ * bump allocations must keep. Negative/zero means the arena is already at or past its share.
+ */
+function slabGrowBudget(): number | null {
+    const stats = System.getInstance().process?.memory?.getBucketStats?.();
+    const heap = stats?.find((b) => b.kind === "HEAP");
+    if (!heap) return null;
+    // HEAP_HIGH is the arena's preferred home (see allocSlabArena) and it competes with
+    // nothing there, so its headroom is spendable in full. Only the LOW heap needs the
+    // reserve, because there the arena's growth is taken straight out of the guest's.
+    const high = stats?.find((b) => b.kind === "HEAP_HIGH");
+    if (high && high.free > 0) return high.free;
+    const reserve = (heap.limit - heap.base) * HEAP_SLAB_BUMP_RESERVE_FRACTION;
+    // `free` is slab-aware (slabTop - next), i.e. exactly the gap the two frontiers share.
+    return heap.free - reserve;
+}
+
+let slabBudgetRefusalLogged = false;
+
 function installNewSlab(size: number): boolean {
     const process = System.getInstance().process;
     if (!process) return false;
@@ -144,6 +260,28 @@ function installNewSlab(size: number): boolean {
             `Heap slab grow refused: would exceed total cap ${HEAP_SLAB_TOTAL_MAX / 1024 / 1024}MB ` +
             `(current=${totalSlabBytes / 1024 / 1024}MB, requested=+${size / 1024 / 1024}MB)`);
         return false;
+    }
+    const budget = slabGrowBudget();
+    if (budget !== null && size > budget) {
+        // Shrink to what the reserve allows rather than refuse outright — a smaller arena
+        // still serves the inline stub; no arena drops every small alloc to the JS thunk.
+        let fitted = size;
+        while (fitted > HEAP_SLAB_INITIAL_SIZE && fitted > budget) fitted = Math.floor(fitted / 2);
+        if (fitted > budget) {
+            if (!slabBudgetRefusalLogged) {
+                slabBudgetRefusalLogged = true;
+                Logger.warn(LogCategory.KERNEL32,
+                    `Heap slab grow refused: the guest's bump reserve is exhausted ` +
+                    `(arena=${(totalSlabBytes / 1048576).toFixed(1)}MB, budget=${(budget / 1048576).toFixed(1)}MB, ` +
+                    `wanted=${(size / 1048576).toFixed(1)}MB). Sub-4KB allocations now fall back to the ` +
+                    `JS HeapAlloc thunk — SLOW but alive; the alternative is std::bad_alloc in the guest.`);
+            }
+            return false;
+        }
+        Logger.log(LogCategory.KERNEL32,
+            `Heap slab grow clamped ${(size / 1048576).toFixed(1)}MB -> ${(fitted / 1048576).toFixed(1)}MB ` +
+            `by the guest's bump reserve`);
+        size = fitted;
     }
     let addr: number;
     try {
@@ -220,16 +358,19 @@ function isInAnySlab(ptr: number): boolean {
 // handle_heap_alloc: a block is [16-byte header zone][size_class data]; the user
 // pointer is blockStart+16, the magic header (SLAB_MAGIC|bin) sits at user-4
 // (= blockStart+12), and the bump advances by 16+size_class. handle_heap_free
-// links the per-bin free list through the freed block's first DATA word (at the
-// user pointer). The inline free stub flips the header's busy/free byte
+// links the per-bin free list through the header zone at user-8 (SLAB_LINK):
+// a freed block's user data stays intact, as under the real heap's LFH — a title
+// that touches a freed object before its owner forgets it reads what it wrote,
+// not our link. The inline free stub flips the header's busy/free byte
 // ('A'->'F') but keeps the bin nibble, so a linear header walk (via isSlabHeader,
 // which accepts BUSY and FREE) still traverses every block with no chain breaks.
 const SLAB_HEADER_ZONE = 16;
+const SLAB_LINK = 8;
 
 interface HeapBlock { addr: number; size: number; busy: boolean; }
 
 /** Gather currently-free slab user-pointers by following the 9 per-bin free
- *  lists (each linked through the freed block's first data word). */
+ *  lists (each linked through the freed block's header zone at user-SLAB_LINK). */
 function collectSlabFreeSet(view: DataView): Set<number> {
     const free = new Set<number>();
     const heads = hypercallDataManager.getSlabFreelistHeads();
@@ -239,7 +380,7 @@ function collectSlabFreeSet(view: DataView): Set<number> {
         for (let guard = 0; p !== 0 && guard < (1 << 21); guard++) {
             if (free.has(p) || p + 4 > view.byteLength) break;
             free.add(p);
-            p = view.getUint32(p, true) >>> 0; // next link lives in the freed block's data
+            p = view.getUint32(p - SLAB_LINK, true) >>> 0;
         }
     }
     return free;
@@ -281,9 +422,11 @@ function buildHeapWalkSnapshot(view: DataView): HeapBlock[] {
         }
     }
 
-    // 2) Standalone HEAP allocations (newest-first), minus the slab arena roots.
+    // 2) Standalone HEAP allocations (newest-first), minus the slab arena roots
+    //    and VirtualAlloc regions (those are not HeapAlloc blocks — see virtualAllocRegions).
     const standalone = process.memory.snapshotHeapAllocations();
     for (const b of standalone) {
+        if (isVirtualAllocBase(b.addr)) continue;
         if (!isInAnySlab(b.addr)) out.push({ addr: b.addr, size: b.size, busy: true });
     }
     return out;
@@ -295,11 +438,16 @@ export function resetHeapSlab(): void {
     totalSlabBytes = 0;
     nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
     slabGrowLastAttempt = 0;
+    virtualAllocRegions.clear();
     hypercallDataManager.resetHeapSlab();
     createdHeaps.clear();
+    heapCompatibility.clear();
+    terminationOnCorruption = false;
     nextCreatedHeapHandle = HEAP_CREATE_HANDLE_BASE;
     heapWalkState = null;
     heapManagerOwnerProcess = null;
+    // The audit's scratch block belongs to the process that is going away.
+    vqAuditBuf = 0;
 }
 
 /**
@@ -314,6 +462,11 @@ export function resetHeapSlab(): void {
  * "SURFACE bucket overflow" crashes — compares used/free for HEAP, SURFACE,
  * THUNK_CODE, etc. and counts free-list blocks (nonzero = frees happening).
  */
+(globalThis as any).getHighHeapReport = () => {
+    const process = System.getInstance().process;
+    return process?.memory?.getHighHeapReport?.() ?? null;
+};
+
 (globalThis as any).getMemReport = () => {
     const process = System.getInstance().process;
     if (!process) return null;
@@ -334,19 +487,16 @@ export function resetHeapSlab(): void {
     });
 };
 
+
 /**
  * DevTools diagnostic: audit the 9 per-bin slab free-lists for corruption.
  * Call from the worker console as `slabFreelistAudit()`.
  *
- * The slab free-list is INTRUSIVE (a freed block's first user word = next free
- * pointer; see handle_heap_free in hypercall.rs) and UNGUARDED — there is no
- * per-block FREE bit, so a double-free (or an app UAF write into a still-free
- * block's word0) silently poisons the list. The classic failure is a double-free
- * of the current head H: `write32(H, old_head=H)` makes `H.next == H` (a 1-cycle),
- * after which every alloc of that bin returns H forever, and once H's owner writes
- * its word0 (e.g. a list node's `next = some LIVE node`) the free list inherits a
- * pointer to a LIVE allocation → that live block gets handed out again → corruption
- * of a still-live object (NFSU audio callback-list crash, 2026-06-22).
+ * The slab free-list is INTRUSIVE (the link sits in the freed block's header zone
+ * at user-SLAB_LINK; see handle_heap_free in hypercall.rs). A double-free of the
+ * current head H makes `H.next == H` (a 1-cycle), after which every alloc of that
+ * bin returns H forever and the same block is handed to two owners; a guest
+ * buffer underflow into the header zone poisons the link the same way.
  *
  * This walks each bin's chain and flags the independent corruption signatures
  * (no busy-set needed — they're all header/topology based):
@@ -380,7 +530,7 @@ export function resetHeapSlab(): void {
             const hdrBin = header & 0x0F;
             const bad = !validMagic || hdrBin !== bin;
             if (bad) badHeader++;
-            const next = p + 4 <= mem.length ? (view.getUint32(p, true) >>> 0) : 0;
+            const next = p + 4 <= mem.length ? (view.getUint32(p - SLAB_LINK, true) >>> 0) : 0;
             const self = next === p;
             if (self) selfPtr = true;
             const outOfBounds = next !== 0 && !inSlab(next);
@@ -435,10 +585,21 @@ export function resetHeapSlab(): void {
 (globalThis as any).largeAllocHistory = (addr: number, radius?: number) => {
     const process = System.getInstance().process;
     if (!process) return null;
-    return process.memory.getLargeAllocHistory?.(addr >>> 0, radius ?? 0x20000) ?? null;
+    const events = process.memory.getLargeAllocHistory?.(addr >>> 0, radius ?? 0x20000) ?? null;
+    if (!events) return null;
+    // Say WHY every `bt` is empty when attribution is off — an unlabelled event list
+    // otherwise reads as "the caller could not be reconstructed".
+    return { backtraces: MemoryManager.largeAllocBacktraces, events };
 };
 
-(globalThis as any).getSlabReport = () => {
+/** Turn per-event caller attribution in the large-alloc ring on/off (off by default:
+ *  the stack scan costs more than the ring for a guest that VirtualAllocs per frame). */
+(globalThis as any).largeAllocBacktraces = (on = true) => {
+    MemoryManager.largeAllocBacktraces = !!on;
+    return { backtraces: MemoryManager.largeAllocBacktraces };
+};
+
+export function slabReport() {
     const live = hypercallDataManager.getSlabStats();
     return {
         current: {
@@ -461,33 +622,46 @@ export function resetHeapSlab(): void {
         totalCap: HEAP_SLAB_TOTAL_MAX,
         nextSlabSizeKB: nextSlabSize / 1024,
     };
-};
+}
+
+(globalThis as any).getSlabReport = slabReport;
+
+/** True if ptr addresses a sub-allocation inside some slab generation. */
+function inSlabRange(ptr: number): boolean {
+    for (const range of slabRanges) {
+        if (ptr >= range.base + 16 && ptr < range.end) return true;
+    }
+    return false;
+}
 
 /** If ptr is within a slab, return its size class. Used by HeapSize/HeapReAlloc. */
 export function getSlabSizeForPtr(ptr: number): number | undefined {
-    for (const range of slabRanges) {
-        if (ptr >= range.base + 16 && ptr < range.end) {
-            const mem = System.getInstance().process?.getCurrentMemory();
-            if (!mem) return undefined;
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const header = view.getUint32(ptr - 4, true) >>> 0;
-            // Accept ONLY BUSY (0x534C41xx). A FREE-marked block (0x534C46xx) is currently
-            // on a per-bin free list — NOT a live allocation: every alloc-pop path (WASM
-            // handle_heap_alloc, inline writeHeapSlabStubs / writeCrtSlabStubs) re-stamps BUSY,
-            // so no live block ever carries the FREE marker. Reporting a free-listed block as a
-            // sized, live allocation made HeapSize/HeapReAlloc-in-place/realloc/_msize hand the
-            // SAME free-listed block back to its old owner while the next malloc popped it for a
-            // new owner → two owners, one block (D2: a Storm MPQ handle stomped the Fog region
-            // table → elemSize=0 → 0/0 #DE). isSlabHeader (BUSY|FREE) stays correct for the
-            // linear header-WALK consumers (buildHeapWalkEntries / analyzeSlabFreelist), which
-            // legitimately traverse free blocks.
-            if ((header & 0xFFFFFF00) !== SLAB_MAGIC) return undefined;
-            const bin = header & 0x0F;
-            if (bin > 8) return undefined;
-            return SLAB_BIN_SIZES[bin];
-        }
-    }
-    return undefined;
+    if (!inSlabRange(ptr)) return undefined;
+    const mem = System.getInstance().process?.getCurrentMemory();
+    if (!mem) return undefined;
+    return slabSizeFromHeader(ptr, new DataView(mem.buffer, mem.byteOffset, mem.byteLength));
+}
+
+/**
+ * The size class of a slab block, read from its header through a caller-supplied view —
+ * the fast-path tier already holds one over guest memory and must not build another.
+ */
+function slabSizeFromHeader(ptr: number, view: DataView): number | undefined {
+    const header = view.getUint32(ptr - 4, true) >>> 0;
+    // Accept ONLY BUSY (0x534C41xx). A FREE-marked block (0x534C46xx) is currently
+    // on a per-bin free list — NOT a live allocation: every alloc-pop path (WASM
+    // handle_heap_alloc, inline writeHeapSlabStubs / writeCrtSlabStubs) re-stamps BUSY,
+    // so no live block ever carries the FREE marker. Reporting a free-listed block as a
+    // sized, live allocation made HeapSize/HeapReAlloc-in-place/realloc/_msize hand the
+    // SAME free-listed block back to its old owner while the next malloc popped it for a
+    // new owner → two owners, one block (D2: a Storm MPQ handle stomped the Fog region
+    // table → elemSize=0 → 0/0 #DE). isSlabHeader (BUSY|FREE) stays correct for the
+    // linear header-WALK consumers (buildHeapWalkEntries / analyzeSlabFreelist), which
+    // legitimately traverse free blocks.
+    if ((header & 0xFFFFFF00) !== SLAB_MAGIC) return undefined;
+    const bin = header & 0x0F;
+    if (bin > 8) return undefined;
+    return SLAB_BIN_SIZES[bin];
 }
 
 const formatCallSite = (
@@ -606,20 +780,54 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // Track reserved pages (address -> size in bytes)
     const reservedPages: Map<number, number> = new Map();
 
-    // Track VirtualAlloc root regions (base -> size), regardless of RESERVE/COMMIT mix.
-    // VirtualFree validation must use this map (exact base for MEM_RELEASE, range containment for MEM_DECOMMIT).
-    const virtualAllocRegions: Map<number, number> = new Map();
+    // ── VirtualAlloc block recycler ──────────────────────────────────────────────
+    // A guest that allocates and releases one allocation-granularity block per frame
+    // (UE1's FMallocWindows does exactly that) makes us commit, then un-protect, the same
+    // pages forever — and BOTH ends flush the WHOLE software TLB. v86's full_clear_tlb
+    // also drops the per-page dispatch metadata and bumps the RET-cache epoch, so twice a
+    // frame the entire return-target memo dies and can never amortise. The compiled code
+    // survives, which is why this is invisible to every "is the JIT alive" check.
+    //
+    // Recycle the block instead: a released RESERVE|COMMIT / PAGE_READWRITE block whose
+    // pages are still exactly as we committed them goes on an exact-size LIFO, and the
+    // next identical request takes it back with its PTEs untouched — no commit, no
+    // protection change, no flush. Windows' own low-fragmentation front end recycles VA
+    // the same way, and a released range is never promised a fresh address.
+    //
+    // The guest-visible contract that must NOT move: the block still reads as all zeroes
+    // (we fill it on handout, exactly as commit does), and anything that could have
+    // changed the page state — a VirtualProtect, a MEM_DECOMMIT, a non-RW protection,
+    // MEM_TOP_DOWN, a size that is not the block's own — refuses the cache outright and
+    // falls through to the real free. What it DOES give up is the stale-touch #PF on a
+    // use-after-free of these blocks; that is the price of any pooled allocator, and it is
+    // bounded to RW heap blocks the guest itself released.
+    const VA_CACHE_MAX_BLOCK = 0x100000;        // 1 MB — beyond this one flush is amortised
+    const VA_CACHE_MAX_PER_SIZE = 8;
+    const VA_CACHE_MAX_BYTES = 4 * 0x100000;    // total parked bytes
+    const vaFreeCache: Map<number, number[]> = new Map();
+    let vaCacheBytes = 0;
+    /** Bases whose page state we can no longer vouch for (VirtualProtect / MEM_DECOMMIT). */
+    const vaProtectionTouched: Set<number> = new Set();
+    const vaCacheShapes: Map<string, number> = new Map();
+    const vaCacheStats = { hits: 0, misses: 0, parked: 0, dropped: 0, refusedTouched: 0, refusedFull: 0, refusedShape: 0 };
+    // Runtime switch so the A/B runs in ONE session on ONE scene: a frame-time
+    // comparison across two boots of a cutscene is scene drift, not a measurement.
+    let vaCacheEnabled = true;
+    (globalThis as any).vaCacheEnable = (on = true) => {
+        vaCacheEnabled = !!on;
+        if (!vaCacheEnabled) { vaFreeCache.clear(); vaCacheBytes = 0; }   // parked blocks would leak
+        return { enabled: vaCacheEnabled };
+    };
+    (globalThis as any).vaCacheReport = () => ({
+        enabled: vaCacheEnabled,
+        ...vaCacheStats,
+        parkedBytes: vaCacheBytes,
+        shapes: [...vaCacheShapes].sort((a, b) => b[1] - a[1]).slice(0, 12),
+        sizes: [...vaFreeCache].map(([size, list]) => ({ size, count: list.length })).filter((r) => r.count > 0),
+    });
 
-    // Track decommitted page ranges within reserved regions.
-    // Key = page-aligned address, Value = size in bytes.
-    // Storm.dll SBH allocator depends on decommit/recommit cycle:
-    //   1. VirtualAlloc(MEM_RESERVE) — reserve 64KB block
-    //   2. VirtualAlloc(MEM_COMMIT) — commit pages on demand (zeroed)
-    //   3. VirtualFree(MEM_DECOMMIT) — decommit freed pages
-    //   4. VirtualAlloc(MEM_COMMIT) — recommit = re-zero pages
-    // Without tracking, decommit is a no-op and recommit skips zeroing,
-    // leaving stale heap metadata that causes heap corruption.
-    const decommittedPages: Map<number, number> = new Map();
+    // virtualAllocRegions / decommittedPages are module-scoped: the fast-path tier
+    // and HeapWalk/HeapSize read the same interval indexes.
 
     // Remove a committed range from decommittedPages, handling partial overlaps.
     // Storm often decommits a multi-page range then recommits individual pages.
@@ -656,6 +864,69 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     registerGuestCommitNotifier(clearDecommittedRange);
 
+    /**
+     * Take a page range out of the committed set: clear Present so a guest touch
+     * raises #PF (which the SEH path turns into EXCEPTION_ACCESS_VIOLATION), and
+     * record it so VirtualQuery answers MEM_RESERVE. Shared by VirtualFree's
+     * MEM_DECOMMIT and by a MEM_RESERVE that carries no MEM_COMMIT — reserved-but-
+     * uncommitted pages that quietly read back as zeros are the difference between
+     * a demand-paging fault handler running and a game silently parsing zeros.
+     */
+    function markDecommitted(alignedAddress: number, alignedSize: number): void {
+        const proc = System.getInstance().process;
+        if (!proc) return;
+        const ptm = proc.pageTableManager;
+        if (ptm?.isPagingEnabled()) {
+            ptm.decommitPages(alignedAddress, alignedSize);
+        } else {
+            // Fallback: poison bytes (pre-paging or paging disabled)
+            proc.addressSpace.fill(alignedAddress, alignedSize, 0xFE);
+        }
+
+        // Merge with existing decommitted entries to keep the map compact.
+        let mergeBase = alignedAddress;
+        let mergeEnd = alignedAddress + alignedSize;
+        const toRemove: number[] = [];
+        for (const [dcBase, dcSize] of decommittedPages) {
+            const dcEnd = dcBase + dcSize;
+            if (dcEnd >= mergeBase && dcBase <= mergeEnd) {
+                mergeBase = Math.min(mergeBase, dcBase);
+                mergeEnd = Math.max(mergeEnd, dcEnd);
+                toRemove.push(dcBase);
+            }
+        }
+        for (const key of toRemove) decommittedPages.delete(key);
+        decommittedPages.set(mergeBase, mergeEnd - mergeBase);
+    }
+
+    /**
+     * MEM_COMMIT over a range that may already be committed. Win32: "if the memory is
+     * already committed, the function does not change its contents" — only pages that
+     * were never committed (or were decommitted) come back zeroed. Blanket-zeroing here
+     * destroys live data for the very common allocator shape that re-commits its whole
+     * arena from the base on every bump (Quake II's Hunk_Alloc: each allocation wipes
+     * everything loaded before it), while the decommit→recommit cycle storm.dll's SBH
+     * depends on still re-zeroes.
+     */
+    function commitPreservingCommitted(base: number, size: number): void {
+        const proc = System.getInstance().process;
+        if (!proc) return;
+        const ptm = proc.pageTableManager;
+        if (ptm?.isPagingEnabled()) {
+            ptm.ensurePagesCommitted(base, size);   // zeroes only non-present pages
+            return;
+        }
+        // No page tables to consult: the decommit map is the only record of which pages
+        // lost their contents. Reserved-but-never-committed memory is already zero (the
+        // allocator hands out zeroed blocks), so zeroing the rest would only destroy data.
+        const end = base + size;
+        for (const [dcBase, dcSize] of decommittedPages) {
+            const from = Math.max(base, dcBase);
+            const to = Math.min(end, dcBase + dcSize);
+            if (from < to) proc.addressSpace.fill(from, to - from, 0);
+        }
+    }
+
     function findTrackedAllocRange(address: number, size: number): [number, number] | null {
         const end = address + size;
         for (const [base, regionSize] of virtualAllocRegions) {
@@ -672,7 +943,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     const ERROR_INVALID_PARAMETER = 87;
     const ERROR_INVALID_HANDLE = 6;
     const ERROR_INVALID_ADDRESS = 487;
+    const ERROR_GEN_FAILURE = 31;
     const THUNK_GENERATOR_REGION_SIZE = 1024 * 1024;
+    /** Highest user-mode address + 1 on 32-bit Windows: above it VirtualQuery fails. */
+    const USER_SPACE_LIMIT = 0x7FFF0000;
     const PAGE_NOACCESS = 0x01;
     const PAGE_READONLY = 0x02;
     const PAGE_READWRITE = 0x04;
@@ -1022,6 +1296,68 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return perms as RegionPerms;
     };
 
+    // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE}
+    const SCN_EXECUTE = 0x20000000, SCN_READ = 0x40000000, SCN_WRITE = 0x80000000;
+
+    type ImageSpan = { start: number; end: number; protect: number };
+    const imageSpanCache = new WeakMap<object, ImageSpan[]>();
+
+    function sectionProtect(characteristics: number): number {
+        const x = (characteristics & SCN_EXECUTE) !== 0;
+        const w = (characteristics & SCN_WRITE) !== 0;
+        const r = (characteristics & SCN_READ) !== 0;
+        if (x) return w ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+        if (w) return PAGE_READWRITE;
+        return r ? PAGE_READONLY : PAGE_NOACCESS;
+    }
+
+    /**
+     * The [start, end) run of same-protection pages inside a loaded image that contains
+     * `pageBase`, and that protection — Windows' MEMORY_BASIC_INFORMATION granularity for
+     * MEM_IMAGE. Adjacent sections with equal protection coalesce, as they do on Windows.
+     * The PE headers (before the first section) are read-only. An image whose sections we
+     * did not record falls back to the whole span as PAGE_EXECUTE_READ.
+     */
+    function imageProtectionRun(mod: { baseAddress: number; size: number; sections?: PESection[] },
+                                pageBase: number): { end: number; protect: number } {
+        const imageEnd = mod.baseAddress + mod.size;
+        const sections = mod.sections;
+        if (!sections?.length) return { end: imageEnd, protect: PAGE_EXECUTE_READ };
+
+        // Section bounds in ascending address order, page-aligned as the loader mapped them.
+        // A module's sections and base are fixed at load, so the derived spans are cached
+        // against the module object itself — a query storm otherwise re-maps and re-sorts
+        // the whole section array per call. The entry dies with the module.
+        let spans = imageSpanCache.get(mod);
+        if (!spans) {
+            spans = sections
+                .map((s) => ({
+                    start: (mod.baseAddress + s.virtualAddress) & ~0xFFF,
+                    end: (mod.baseAddress + s.virtualAddress + Math.max(s.virtualSize, s.rawSize) + 0xFFF) & ~0xFFF,
+                    protect: sectionProtect(s.characteristics),
+                }))
+                .sort((a, b) => a.start - b.start);
+            imageSpanCache.set(mod, spans);
+        }
+
+        const first = spans[0]!;
+        if (pageBase < first.start) return { end: first.start, protect: PAGE_READONLY }; // PE headers
+
+        let i = spans.findIndex((s) => pageBase >= s.start && pageBase < s.end);
+        if (i < 0) {
+            // A gap between sections (or past the last one): report to the next section start.
+            const next = spans.find((s) => s.start > pageBase);
+            return { end: next ? next.start : imageEnd, protect: PAGE_NOACCESS };
+        }
+        const protect = spans[i]!.protect;
+        let end = spans[i]!.end;
+        while (i + 1 < spans.length && spans[i + 1]!.start === end && spans[i + 1]!.protect === protect) {
+            i++;
+            end = spans[i]!.end;
+        }
+        return { end: Math.min(end, imageEnd) || imageEnd, protect };
+    }
+
     exports['VirtualQuery'] = (ctx, mem, args) => {
         const lpAddress = args[0] >>> 0;
         const lpBuffer = args[1];
@@ -1036,11 +1372,37 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000, MEM_FREE = 0x10000;
             const MEM_PRIVATE = 0x20000, MEM_IMAGE = 0x01000000;
             const PAGE_EXECUTE_READ_C = 0x20;
-            // Upper bound of usable user address space (matches GetSystemInfo).
-            const MAX_APP_ADDR = 0x7FFF0000;
+            // FREE-coalesce ceiling = backed guest RAM. GetSystemInfo still reports
+            // 0x7FFEFFFF (Win32 userspace), but advertising MEM_FREE for the unbacked
+            // hole [mem.length .. 0x7FFF0000) made SmartHeap MemPoolPreAllocate that
+            // entire remnant (~800MB TOP_DOWN VirtualAlloc) and MessageBox OOM.
+            const memLen = mem.length >>> 0;
+            const MAX_APP_ADDR = memLen;
 
             const pageBase = (lpAddress & ~0xFFF) >>> 0;
+            if (pageBase >= memLen) {
+                // Above backed RAM the address space still EXISTS as far as a Win32 process
+                // is concerned, and Wine describes exactly this case (fill_basic_memory_info's
+                // fake_reserved): MEM_RESERVE | PAGE_NOACCESS. Both other answers break a
+                // caller. MEM_FREE invites an allocator to take the whole remnant, which is
+                // how SmartHeap's MemPoolPreAllocate came to VirtualAlloc ~800MB it cannot
+                // have and MessageBox OOM. A hard failure gives the canonical walk
+                // (p = BaseAddress + RegionSize) no size to advance by, so it re-asks the same
+                // address for ever — Blade of Darkness spun 33.8M times on 0x60000000, the
+                // first page past 1.5GB of RAM. Only above the user-space limit does
+                // VirtualQuery fail, which is where Windows fails too.
+                if (pageBase >= USER_SPACE_LIMIT) return 0;
+                view.setUint32(lpBuffer, pageBase, true);                          // BaseAddress
+                view.setUint32(lpBuffer + 4, memLen, true);                        // AllocationBase
+                view.setUint32(lpBuffer + 8, PAGE_NOACCESS, true);                 // AllocationProtect
+                view.setUint32(lpBuffer + 12, USER_SPACE_LIMIT - pageBase, true);  // RegionSize
+                view.setUint32(lpBuffer + 16, MEM_RESERVE, true);                  // State
+                view.setUint32(lpBuffer + 20, PAGE_NOACCESS, true);                // Protect
+                view.setUint32(lpBuffer + 24, MEM_PRIVATE, true);                  // Type
+                return 28;
+            }
 
+            let baseAddress = pageBase;
             let allocationBase = pageBase;
             let regionSize = 0x1000;
             let protect = PAGE_READWRITE;
@@ -1053,24 +1415,69 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // and comparing AllocationBase/Type against their pool registry; coalescing the whole
             // heap into one region with AllocationBase=HEAP_BASE makes SmartHeap reject every
             // pointer as MEM_BAD_POINTER. We ONLY coalesce *free* gaps (see below).
+            //
+            // SURFACE is a large reserved pool (320MB) of which only the bump arena below the
+            // frontier is real pixel memory; the virgin tail must NOT report per-page COMMIT or
+            // a walker (addr = BaseAddress + RegionSize) storms every 4KB page of the pool. Only
+            // pages below the SURFACE frontier are backed — the rest fall through to the free-gap
+            // coalescing and are skipped in one MEM_FREE step (ROM stays whole-span: PE images
+            // there are already coalesced by the MEM_IMAGE branch above).
+            const surfaceEnd = MEM_SURFACE_BASE + MEM_SURFACE_SIZE;
+            const surfaceFrontier = system.process?.memory?.getBucketFrontier('SURFACE') ?? surfaceEnd;
             const isBackedInterval = (a: number): boolean =>
                 (a >= MEM_HEAP_BASE && a < MEM_THUNK_DATA_BASE + MEM_THUNK_DATA_SIZE) ||
-                (a >= MEM_ROM_BASE && a < MEM_SURFACE_BASE + MEM_SURFACE_SIZE);
+                (a >= MEM_ROM_BASE && a < MEM_SURFACE_BASE) ||
+                (a >= MEM_SURFACE_BASE && a < surfaceFrontier);
 
-            // 1) PE module image — report the whole image as one MEM_IMAGE region.
-            const mod = moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null;
-            if (mod) {
+            // 1) PE module image. AllocationBase is the image base, but the REGION is the run
+            //    of pages sharing one protection — for an image that means per-SECTION, which
+            //    is what Windows reports. Handing back the whole image as one PAGE_EXECUTE_READ
+            //    span is not a harmless simplification: the query-protect-patch-restore dance
+            //    every exe patcher performs (ASI loaders, SilentPatch, packers) then restores
+            //    RX over .data and .bss too, and the game's next global write takes an access
+            //    violation far from the patcher.
+            const stack = system.scheduler?.findStackReservation(pageBase) ?? null;
+            const mod = stack ? null : (moduleRegistry?.getModuleContainingAddress(lpAddress) ?? null);
+            if (stack) {
+                // 0) Thread stack. Windows describes a stack by its RESERVATION, and every
+                //    stack-bounds helper reads it that way: bottom = AllocationBase, top from
+                //    TEB StackBase. Answering page-granular (AllocationBase = the queried page,
+                //    RegionSize = 0x1000) hands them inverted or 4KB-wide bounds. We commit the
+                //    whole stack up front, so the committed run IS the reservation — no guard
+                //    page, no reserved tail to describe. This precedes the generic
+                //    backed-interval branch, whose page-granular answer stays load-bearing for
+                //    SmartHeap-style pointer validation of HEAP pointers.
+                baseAddress = stack.base;
+                allocationBase = stack.base;
+                regionSize = stack.top - stack.base;
+                memType = MEM_PRIVATE;
+                protect = PAGE_READWRITE;
+                state = MEM_COMMIT;
+            } else if (mod) {
                 allocationBase = mod.baseAddress;
-                regionSize = mod.size - (pageBase - mod.baseAddress);
-                protect = PAGE_EXECUTE_READ_C;
                 memType = MEM_IMAGE;
                 state = MEM_COMMIT;
+                const run = imageProtectionRun(mod, pageBase);
+                protect = run.protect;
+                regionSize = run.end - pageBase;
             } else if (lpAddress >= 0x00400000 && lpAddress < 0x00500000) {
                 // 2) Main EXE range (kept for parity with the old classifier).
                 allocationBase = 0x00400000;
                 memType = MEM_IMAGE;
                 protect = PAGE_EXECUTE_READ_C;
                 state = MEM_COMMIT;
+            } else if (pageBase >= surfaceFrontier && pageBase < surfaceEnd) {
+                // Virgin SURFACE tail: MEM_RESERVE (bucket reserved for pixels), not MEM_FREE.
+                // Advertising it as FREE let SmartHeap MemPoolPreAllocate hundreds of MB via
+                // MEM_TOP_DOWN VirtualAlloc and collide with the surface bump / OOM.
+                // BaseAddress = frontier (region start), not pageBase — Win32 walkers step
+                // Base+RegionSize; page-granular Base made TOP_DOWN walks crawl 4KB at a time.
+                baseAddress = surfaceFrontier & ~0xFFF;
+                allocationBase = MEM_SURFACE_BASE;
+                regionSize = surfaceEnd - baseAddress;
+                memType = MEM_PRIVATE;
+                protect = PAGE_NOACCESS;
+                state = MEM_RESERVE;
             } else {
                 // 3) Generic memory. A backed page (heap/thunk/rom/surface bucket OR a tracked
                 // VirtualAlloc region) stays page-granular COMMIT — exactly what it was before.
@@ -1079,14 +1486,22 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // old behaviour) made guest address-space walkers (addr = BaseAddress + RegionSize)
                 // advance 4KB at a time and never see MEM_FREE, scanning the entire 4GB one page at
                 // a time — the BoD VirtualQuery storm (19k+ calls), 2026-06-12.
-                let inVaRegion = false;
-                for (const [base, size] of virtualAllocRegions) {
-                    if (pageBase >= base && pageBase < base + size) { inVaRegion = true; break; }
-                }
+                // Tracked VirtualAlloc regions: Win32 reports AllocationBase = the
+                // original VirtualAlloc base for every page in the reservation.
+                // SmartHeap/Shw32 validates interior pointers against that base; page-
+                // granular AllocationBase made every sub-page look like its own alloc.
+                const va = virtualAllocRegions.find(pageBase);
 
-                if (isBackedInterval(pageBase) || inVaRegion) {
-                    // Page-granular COMMIT, AllocationBase = the page itself (old semantics —
-                    // SmartHeap tolerated this through the whole boot/launcher/map-load path).
+                if (va) {
+                    allocationBase = va.base;
+                    regionSize = va.base + va.size - pageBase;
+                    memType = MEM_PRIVATE;
+                    protect = PAGE_READWRITE;
+                    state = MEM_COMMIT;
+                } else if (isBackedInterval(pageBase)) {
+                    // Page-granular COMMIT for the rest of the HEAP/thunk/rom buckets —
+                    // coalescing the whole HEAP into AllocationBase=HEAP_BASE made
+                    // SmartHeap reject every pointer as MEM_BAD_POINTER.
                     allocationBase = pageBase;
                     regionSize = 0x1000;
                     memType = MEM_PRIVATE;
@@ -1099,6 +1514,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     consider(0x00400000);
                     consider(MEM_HEAP_BASE);
                     consider(MEM_ROM_BASE);
+                    consider(MEM_SURFACE_BASE);
                     for (const [base] of virtualAllocRegions) consider(base);
                     allocationBase = 0;
                     regionSize = Math.max(0x1000, nextBase - pageBase);
@@ -1110,18 +1526,16 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
             // Decommitted pages within a reserved/committed region read back as MEM_RESERVE.
             if (state === MEM_COMMIT) {
-                for (const [dcBase, dcSize] of decommittedPages) {
-                    if (pageBase >= dcBase && pageBase < dcBase + dcSize) {
-                        state = MEM_RESERVE;
-                        // Clip region to the decommitted run so the walker sees the boundary.
-                        regionSize = Math.min(regionSize, dcBase + dcSize - pageBase);
-                        break;
-                    }
+                const dc = decommittedPages.find(pageBase);
+                if (dc) {
+                    state = MEM_RESERVE;
+                    // Clip region to the decommitted run so the walker sees the boundary.
+                    regionSize = Math.min(regionSize, dc.base + dc.size - pageBase);
                 }
             }
 
             const reportProtect = (state === MEM_RESERVE || state === MEM_FREE) ? PAGE_NOACCESS : protect;
-            view.setUint32(lpBuffer, pageBase, true);                 // BaseAddress
+            view.setUint32(lpBuffer, baseAddress, true);              // BaseAddress
             view.setUint32(lpBuffer + 4, allocationBase, true);       // AllocationBase
             view.setUint32(lpBuffer + 8, state === MEM_FREE ? 0 : protect, true); // AllocationProtect
             view.setUint32(lpBuffer + 12, regionSize, true);          // RegionSize
@@ -1129,9 +1543,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             view.setUint32(lpBuffer + 20, reportProtect, true);       // Protect
             view.setUint32(lpBuffer + 24, memType, true);             // Type
 
-            const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : 'COMMIT';
-            Logger.verbose(LogCategory.KERNEL32,
-                `VirtualQuery(0x${lpAddress.toString(16)}) -> base=0x${allocationBase.toString(16)} size=0x${regionSize.toString(16)} state=${stateName} type=0x${memType.toString(16)}`);
+            Logger.verboseLazy(LogCategory.KERNEL32, () => {
+                const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : 'COMMIT';
+                return `VirtualQuery(0x${lpAddress.toString(16)}) -> base=0x${baseAddress.toString(16)} alloc=0x${allocationBase.toString(16)} size=0x${regionSize.toString(16)} state=${stateName} type=0x${memType.toString(16)}`;
+            });
 
             return 28; // sizeof(MEMORY_BASIC_INFORMATION)
         }
@@ -1164,18 +1579,26 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0;
         }
 
+        // Cap lpMaximumApplicationAddress to backed guest RAM. Reporting the full
+        // Win32 2GB userspace (0x7FFEFFFF) while VirtualQuery refuses / cannot back
+        // [mem.length..2GB) made SmartHeap (MEM_TOP_DOWN walk / MemPoolPreAllocate)
+        // VirtualAlloc a ~800MB phantom free remnant and MessageBox OOM.
+        const maxAppAddr = mem.length > 0 ? ((mem.length - 1) >>> 0) : 0x7FFEFFFF;
+
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setUint16(lpSystemInfo + 0, 0, true); // wProcessorArchitecture (x86)
         view.setUint16(lpSystemInfo + 2, 0, true); // wReserved
         view.setUint32(lpSystemInfo + 4, 0x1000, true); // dwPageSize
         view.setUint32(lpSystemInfo + 8, 0x00010000, true); // lpMinimumApplicationAddress
-        view.setUint32(lpSystemInfo + 12, 0x7FFEFFFF, true); // lpMaximumApplicationAddress
+        view.setUint32(lpSystemInfo + 12, maxAppAddr, true); // lpMaximumApplicationAddress
         view.setUint32(lpSystemInfo + 16, 1, true); // dwActiveProcessorMask
         view.setUint32(lpSystemInfo + 20, 1, true); // dwNumberOfProcessors
-        view.setUint32(lpSystemInfo + 24, 586, true); // dwProcessorType (Pentium)
+        view.setUint32(lpSystemInfo + 24, GUEST_PROCESSOR_TYPE, true); // dwProcessorType
         view.setUint32(lpSystemInfo + 28, 0x10000, true); // dwAllocationGranularity
-        view.setUint16(lpSystemInfo + 32, 5, true); // wProcessorLevel
-        view.setUint16(lpSystemInfo + 34, 0, true); // wProcessorRevision
+        // Both derived from the same family/model/stepping CPUID reports, the way NT derives
+        // them — a level of 5 against a CPUID family of 6 sends engines down their P5 path.
+        view.setUint16(lpSystemInfo + 32, GUEST_PROCESSOR_LEVEL, true); // wProcessorLevel
+        view.setUint16(lpSystemInfo + 34, GUEST_PROCESSOR_REVISION, true); // wProcessorRevision
         return 0;
     };
 
@@ -1194,6 +1617,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 1;
     };
 
+    // Size of the 32-bit user-mode address space. On Win32 this is an architectural constant
+    // (2GB minus the 64KB no-access boundary), NOT a function of installed RAM — a title that
+    // sizes its address-space budget from dwTotalVirtual reads a RAM figure as an address-space
+    // limit and picks its small-world code path.
+    const USER_VIRTUAL_TOTAL_BYTES = 0x7FFE0000;
+
     exports['GlobalMemoryStatus'] = (ctx, mem, args) => {
         const lpBuffer = args[0];
         if (!lpBuffer || lpBuffer + 32 > mem.length) {
@@ -1211,8 +1640,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         view.setUint32(lpBuffer + 12, avail >>> 0, true); // dwAvailPhys
         view.setUint32(lpBuffer + 16, total >>> 0, true); // dwTotalPageFile
         view.setUint32(lpBuffer + 20, avail >>> 0, true); // dwAvailPageFile
-        view.setUint32(lpBuffer + 24, total >>> 0, true); // dwTotalVirtual
-        view.setUint32(lpBuffer + 28, avail >>> 0, true); // dwAvailVirtual
+        view.setUint32(lpBuffer + 24, USER_VIRTUAL_TOTAL_BYTES, true); // dwTotalVirtual
+        view.setUint32(lpBuffer + 28, Math.min(avail, USER_VIRTUAL_TOTAL_BYTES) >>> 0, true); // dwAvailVirtual
 
         return 0;
     };
@@ -1242,8 +1671,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         view.setBigUint64(lpBuffer + 16, avail64, true); // ullAvailPhys
         view.setBigUint64(lpBuffer + 24, total64, true); // ullTotalPageFile
         view.setBigUint64(lpBuffer + 32, avail64, true); // ullAvailPageFile
-        view.setBigUint64(lpBuffer + 40, total64, true); // ullTotalVirtual
-        view.setBigUint64(lpBuffer + 48, avail64, true); // ullAvailVirtual
+        view.setBigUint64(lpBuffer + 40, BigInt(USER_VIRTUAL_TOTAL_BYTES), true); // ullTotalVirtual
+        view.setBigUint64(lpBuffer + 48, BigInt(Math.min(avail, USER_VIRTUAL_TOTAL_BYTES) >>> 0), true); // ullAvailVirtual
         view.setBigUint64(lpBuffer + 56, 0n, true); // ullAvailExtendedVirtual
 
         return 1;
@@ -1354,19 +1783,29 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const process = system.process;
         if (process && lpMem) {
             heapWatch('free', ctx, mem, [lpMem]);
+            const p = lpMem >>> 0;
+            // VirtualAlloc roots are not HeapAlloc blocks. Freeing them here would tear
+            // down a SmartHeap/CRT pool while interior owners still hold pointers.
+            if (isInVirtualAllocRegion(p)) {
+                system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                Logger.warn(LogCategory.KERNEL32,
+                    `HeapFree(0x${p.toString(16)}): refusing VirtualAlloc region (use VirtualFree)`);
+                return 0;
+            }
             // Retired-slab blocks: the inline stub validates against the *active* slab
             // only, so frees targeting a previous generation fall here. Treat as no-op
             // (the bytes stay "reserved" inside the retired slab until process reset).
             // Must run BEFORE process.memory.free — the pointer is an interior slab
             // offset, not a root allocation, and free would either throw or mistarget
             // the enclosing slab arena.
-            if (isInAnySlab(lpMem >>> 0)) {
+            if (isInAnySlab(p)) {
                 // DIAG: a slab pointer reaching JS HeapFree was rejected by the WASM/inline
                 // fast path. A FREE-marked header (0x534C46xx) means a DOUBLE-FREE — capture
                 // the guest caller to find the load-bearing double-free source.
                 const p = lpMem >>> 0;
-                if (p >= 4 && p + 0 <= mem.length) {
-                    const hdr = (mem[p - 4] | mem[p - 3] << 8 | mem[p - 2] << 16 | mem[p - 1] << 24) >>> 0;
+                const plain = toPlainGuestMemory(mem);
+                if (p >= 4 && p + 0 <= plain.length) {
+                    const hdr = (plain[p - 4] | plain[p - 3] << 8 | plain[p - 2] << 16 | plain[p - 1] << 24) >>> 0;
                     if ((hdr & 0xFFFFFF00) === SLAB_MAGIC_FREE && _dblFreeLogCount < 40) {
                         _dblFreeLogCount++;
                         let bt = '';
@@ -1532,7 +1971,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const lpMem = args[2];
         const dwBytes = args[3] >>> 0;
 
-        Logger.verbose(LogCategory.KERNEL32, `HeapReAlloc(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)}, ${dwBytes})`);
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapReAlloc(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)}, ${dwBytes})`);
 
         // Simplified implementation - allocate new memory and copy
         const system = System.getInstance();
@@ -1577,18 +2017,24 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // tracked allocation size. process.memory rounds every alloc up to >=8 and
             // HeapAlloc pre-rounds small sizes to 16, so getSize() IS the usable
             // capacity — dwBytes <= capacity is safe to satisfy in place.
+            // HEAP_ZERO_MEMORY is this tier's alone: the fast path declines it, because
+            // honouring it means zeroing the grown tail on the relocation below and that is
+            // machinery the fast tier does not carry.
+            const zeroMemory = (dwFlags & HEAP_ZERO_MEMORY_FLAG) !== 0;
             if (lpMem) {
-                let capacity = getSlabSizeForPtr(lpMem);
+                const slabCapacity = getSlabSizeForPtr(lpMem);
+                let capacity = slabCapacity;
                 if (capacity === undefined) capacity = process.memory.getSize(lpMem);
                 if (capacity !== undefined && dwBytes <= capacity) {
+                    if (zeroMemory) noteZeroGrowInPlace(dwBytes, capacity, slabCapacity !== undefined, ctx, mem);
                     heapWatch('realloc-inplace', ctx, mem, [lpMem], `size=${dwBytes} cap=${capacity}`);
                     Logger.verboseLazy(LogCategory.KERNEL32,
                         () => `HeapReAlloc in-place 0x${lpMem.toString(16)} (size=${dwBytes} <= cap=${capacity})`);
                     return lpMem >>> 0;
                 }
-                // HEAP_REALLOC_IN_PLACE_ONLY (0x10): caller forbids relocation. If we
-                // know the block can't grow in place, fail rather than move it.
-                if ((dwFlags & 0x10) && capacity !== undefined) {
+                // HEAP_REALLOC_IN_PLACE_ONLY: caller forbids relocation. If we know the
+                // block can't grow in place, fail rather than move it.
+                if ((dwFlags & HEAP_REALLOC_IN_PLACE_ONLY) && capacity !== undefined) {
                     system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
                     Logger.verbose(LogCategory.KERNEL32,
                         `HeapReAlloc IN_PLACE_ONLY can't grow 0x${lpMem.toString(16)} (size=${dwBytes} > cap=${capacity})`);
@@ -1608,10 +2054,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     if (oldSize === undefined) {
                         oldSize = process.memory.getSize(lpMem);
                     }
-                    if (oldSize === undefined) {
-                        const region = process.addressSpace.getRegion(lpMem);
-                        if (region) oldSize = region.size - (lpMem - region.base);
-                    }
+                    // Do NOT fall back to AddressSpace layout-bucket size: the HEAP bucket
+                    // is hundreds of MB and would copy / "relocate" unrelated VirtualAlloc
+                    // pool contents. Unknown size → copy nothing (same as a failed probe).
                     if (oldSize === undefined) {
                         Logger.warn(LogCategory.KERNEL32,
                             `HeapReAlloc DATA LOSS: size unknown for 0x${lpMem.toString(16)}! newSize=${dwBytes} newAddr=0x${newAddress.toString(16)} ${formatCallSite(ctx, mem, 4, [0x38, 0x44], [lpMem])}`);
@@ -1620,6 +2065,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     const copySize = Math.min(oldSize, dwBytes);
                     if (copySize > 0) {
                         mem.copyWithin(newAddress, lpMem, lpMem + copySize);
+                    }
+                    // The grown tail. MemoryManager already hands out zeroed memory, but the
+                    // HEAP_ZERO_MEMORY guarantee is this call's, not the allocator's.
+                    if (zeroMemory && dwBytes > copySize) {
+                        mem.fill(0, newAddress + copySize, newAddress + dwBytes);
                     }
 
                     // HEAP_REALLOC_IN_PLACE_ONLY = 0x00000010
@@ -1647,9 +2097,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     exports['HeapSize'] = (ctx, mem, args) => {
         const hHeap = args[0];
         const dwFlags = args[1];
-        const lpMem = args[2];
+        const lpMem = args[2] >>> 0;
 
-        Logger.verbose(LogCategory.KERNEL32, `HeapSize(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)})`);
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapSize(0x${hHeap.toString(16)}, 0x${dwFlags.toString(16)}, 0x${lpMem.toString(16)})`);
+
+        // VirtualAlloc memory is not a heap block — Win32 returns (SIZE_T)-1.
+        if (!lpMem || isInVirtualAllocRegion(lpMem)) return HEAP_SIZE_INVALID;
 
         // Check WASM slab first (most common for small allocations)
         const slabSize = getSlabSizeForPtr(lpMem);
@@ -1659,14 +2113,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (process) {
             const size = process.memory.getSize(lpMem);
             if (size !== undefined) return size;
-
-            // Fallback: check address space regions
-            const region = process.addressSpace.getRegion(lpMem);
-            if (region) return region.size;
         }
 
-        // Return a dummy size if not found
-        return 1024; // 1KB
+        // Exact HeapAlloc base only. Layout-bucket / dummy sizes lied to SmartHeap:
+        // a VirtualAlloc pool base looked like a live HeapAlloc block → HeapFree of the
+        // pool while CRT still held interior pointers (_piob).
+        return HEAP_SIZE_INVALID;
     };
 
     // UINT HeapCompact(HANDLE hHeap, DWORD dwFlags)
@@ -1693,9 +2145,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const returnLength = args[4];
 
         if (heapInfoClass === 0 && heapInfo && heapInfoLength >= 4) {
-            // HeapCompatibilityInformation: return 0 (standard heap)
+            // HeapCompatibilityInformation — whatever HeapSetInformation last accepted for
+            // this heap, defaulting to 0 (standard). Answering a constant would contradict
+            // a successful set, which a heap-integrity check reads as tampering.
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(heapInfo, 0, true);
+            view.setUint32(heapInfo, heapCompatibility.get(args[0] >>> 0) ?? 0, true);
             if (returnLength) view.setUint32(returnLength, 4, true);
             return 1; // TRUE
         }
@@ -1705,6 +2159,63 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 0;
     };
 
+    /**
+     * BOOL HeapSetInformation(HANDLE HeapHandle, HEAP_INFORMATION_CLASS HeapInformationClass,
+     *                         PVOID HeapInformation, SIZE_T HeapInformationLength)
+     *
+     * Two classes exist on the Windows versions we present, and both are settings a heap
+     * ACCEPTS rather than work it performs:
+     *   0 HeapCompatibilityInformation      — front-end selection (standard/lookaside/LFH)
+     *   1 HeapEnableTerminationOnCorruption — abort instead of limping on a bad block
+     * Ours is one allocator, so accepting either changes nothing observable except what
+     * HeapQueryInformation reads back — which is exactly what the caller checks.
+     *
+     * Anything else must FAIL. A CRT that probes an unknown class and is told TRUE
+     * concludes the feature is armed, and the "heap is hardened" branch it then takes is
+     * one we never implemented.
+     */
+    exports['HeapSetInformation'] = (ctx, mem, args) => {
+        const hHeap = args[0] >>> 0;
+        const heapInfoClass = args[1] >>> 0;
+        const heapInfo = args[2] >>> 0;
+        const heapInfoLength = args[3] >>> 0;
+        const fail = (code: number): number => {
+            System.getInstance().scheduler.setLastError(code);
+            return 0;
+        };
+
+        if (heapInfoClass === 0) {
+            // Per-heap, so a heap handle is required and must be one we handed out.
+            if (!isRecognizedHeapHandle(hHeap)) return fail(ERROR_INVALID_PARAMETER);
+            if (!heapInfo || heapInfoLength < 4) return fail(ERROR_INVALID_PARAMETER);
+            const value = Mem.readUint32(heapInfo);
+            if (value === null || value > 2) return fail(ERROR_INVALID_PARAMETER);
+            const current = heapCompatibility.get(hHeap) ?? 0;
+            // Documented: once a heap is LFH it cannot be moved back off it.
+            if (current === 2 && value !== 2) return fail(ERROR_GEN_FAILURE);
+            heapCompatibility.set(hHeap, value);
+            Logger.verbose(LogCategory.KERNEL32,
+                `HeapSetInformation(0x${hHeap.toString(16)}, HeapCompatibilityInformation, ${value})`);
+            return 1;
+        }
+
+        if (heapInfoClass === 1) {
+            // Process-wide: HeapHandle must be NULL and there is no payload.
+            if (hHeap !== 0) return fail(ERROR_INVALID_PARAMETER);
+            if (heapInfo !== 0 || heapInfoLength !== 0) return fail(ERROR_INVALID_PARAMETER);
+            if (!terminationOnCorruption) {
+                terminationOnCorruption = true;
+                Logger.log(LogCategory.KERNEL32,
+                    'HeapSetInformation: termination-on-corruption enabled (our allocator already refuses a corrupt free)');
+            }
+            return 1;
+        }
+
+        Logger.warn(LogCategory.KERNEL32,
+            `HeapSetInformation: unsupported class ${heapInfoClass} — FALSE/ERROR_INVALID_PARAMETER`);
+        return fail(ERROR_INVALID_PARAMETER);
+    };
+
     // VirtualAlloc - allocate virtual memory
     exports['VirtualAlloc'] = (ctx, mem, args) => {
         const lpAddress = args[0];
@@ -1712,7 +2223,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const flAllocationType = args[2];
         const flProtect = args[3];
 
-        Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc(lpAddr=0x${lpAddress.toString(16)}, size=${dwSize}, type=0x${flAllocationType.toString(16)}, prot=0x${flProtect.toString(16)})`);
+        const fail = (why: string): 0 => {
+            Logger.warn(LogCategory.KERNEL32,
+                `VirtualAlloc FAIL ${why} (lpAddr=0x${(lpAddress >>> 0).toString(16)}, size=0x${(dwSize >>> 0).toString(16)}, type=0x${(flAllocationType >>> 0).toString(16)}, prot=0x${(flProtect >>> 0).toString(16)})`);
+            return 0;
+        };
+
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc(lpAddr=0x${lpAddress.toString(16)}, size=${dwSize}, type=0x${flAllocationType.toString(16)}, prot=0x${flProtect.toString(16)})`);
 
         const MEM_COMMIT = 0x1000;
         const MEM_RESERVE = 0x2000;
@@ -1720,8 +2237,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const ALLOC_GRANULARITY = 0x10000; // 64KB — Windows allocation granularity
 
         if (!(flAllocationType & MEM_COMMIT) && !(flAllocationType & MEM_RESERVE)) {
-            Logger.warn(LogCategory.KERNEL32, 'VirtualAlloc: Invalid allocation type');
-            return 0;
+            return fail('invalid allocation type');
         }
 
         const alignedSize = Math.ceil(dwSize / PAGE_SIZE) * PAGE_SIZE;
@@ -1730,8 +2246,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         if (effectiveAddress !== 0 && overlapsThunkRegion(effectiveAddress, alignedSize)) {
             System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: Address 0x${effectiveAddress.toString(16)} overlaps thunk regions`);
-            return 0;
+            return fail(`address overlaps thunk regions`);
         }
 
         const process = System.getInstance().process;
@@ -1742,44 +2257,86 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         const perms = mapProtectToPerms(flProtect);
         let address = effectiveAddress;
+        const MEM_TOP_DOWN = 0x00100000;
+        const ERROR_NOT_ENOUGH_MEMORY = 8;
 
         // MEM_COMMIT-only with specific address: commit pages within an already reserved region.
         // When lpAddress=0, Windows implicitly reserves+commits — fall through to the allocation path.
         const commitOnly = (flAllocationType & MEM_COMMIT) && !(flAllocationType & MEM_RESERVE) && effectiveAddress !== 0;
         if (commitOnly) {
-            const inReserved = Array.from(reservedPages.entries()).some(
-                ([base, size]) => effectiveAddress >= base && effectiveAddress < base + size
-            );
+            profiler.start("VirtualAlloc:reserveScan");
+            let inReserved = false;
+            for (const [base, size] of reservedPages) {
+                if (effectiveAddress >= base && effectiveAddress < base + size) { inReserved = true; break; }
+            }
+            profiler.end("VirtualAlloc:reserveScan");
             if (inReserved) {
-                const ptm = process.pageTableManager;
-                if (ptm?.isPagingEnabled()) {
-                    ptm.commitPages(effectiveAddress, alignedSize);
-                } else {
-                    process.addressSpace.fill(effectiveAddress, alignedSize, 0);
-                }
+                profiler.start("VirtualAlloc:commitInReserved");
+                commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
-                Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
+                profiler.end("VirtualAlloc:commitInReserved");
+                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
                 return effectiveAddress;
             }
             // Fallback: region may already be mapped by a prior RESERVE|COMMIT (reservedPages can be out of sync).
             const region = process.addressSpace.getRegion(effectiveAddress);
-            if (region && region.kind === 'HEAP' && effectiveAddress + alignedSize <= region.base + region.size) {
-                const ptm = process.pageTableManager;
-                if (ptm?.isPagingEnabled()) {
-                    ptm.commitPages(effectiveAddress, alignedSize);
-                } else {
-                    process.addressSpace.fill(effectiveAddress, alignedSize, 0);
-                }
+            if (region && (region.kind === 'HEAP' || region.kind === 'HEAP_HIGH') && effectiveAddress + alignedSize <= region.base + region.size) {
+                commitPreservingCommitted(effectiveAddress, alignedSize);
                 clearDecommittedRange(effectiveAddress, alignedSize);
-                Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);
+                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);
                 return effectiveAddress;
             }
             // Committing without prior reserve is invalid
             System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: MEM_COMMIT at 0x${effectiveAddress.toString(16)} not within reserved region`);
-            return 0;
+            return fail(`MEM_COMMIT not within reserved region`);
         }
 
+        // Which call shapes actually arrive — a recycler with zero hits and zero misses is
+        // a recycler whose gate never ran, and only the shape census can say which clause
+        // rejected them.
+        {
+            const k = `${address === 0 ? 'anon' : 'fixed'}/type0x${(flAllocationType >>> 0).toString(16)}/prot0x${(flProtect >>> 0).toString(16)}`;
+            vaCacheShapes.set(k, (vaCacheShapes.get(k) ?? 0) + 1);
+        }
+
+        // Recycled block? Only for the exact shape we parked (see the recycler comment):
+        // an anonymous RESERVE|COMMIT of plain read-write memory, bottom-up.
+        const vaCacheKey = Math.ceil(alignedSize / ALLOC_GRANULARITY) * ALLOC_GRANULARITY;
+        // lpAddress === 0 with MEM_COMMIT is an IMPLICIT reserve+commit on Windows, and that
+        // is the shape UE1 actually uses (MEM_RESERVE is not set) — demanding the flag here
+        // is what made the recycler park blocks it could never hand back.
+        if (vaCacheEnabled && address === 0
+            && (flAllocationType & MEM_COMMIT)
+            && !(flAllocationType & MEM_TOP_DOWN)
+            && flProtect === PAGE_READWRITE
+            && vaCacheKey <= VA_CACHE_MAX_BLOCK) {
+            const bucket = vaFreeCache.get(vaCacheKey);
+            // Only a block the CURRENT MemoryManager still owns may be handed back. The
+            // cache is module state and outlives a process teardown (a game switch, a
+            // launcher re-exec in the same worker), so without this it would eventually
+            // return an address belonging to a dead allocator — one whose size no longer
+            // resolves, which is exactly what the heap fast tier reads to decide capacity.
+            let reuse: number | undefined;
+            while (bucket && bucket.length > 0) {
+                const cand = bucket.pop()!;
+                vaCacheBytes -= vaCacheKey;
+                if (process.memory.getSize(cand) === vaCacheKey) { reuse = cand; break; }
+                vaCacheStats.dropped++;
+            }
+            if (reuse !== undefined) {
+                vaCacheStats.hits++;
+                // Win32 hands out zeroed pages on commit. With the PTEs already present
+                // and RW this native fill is the entire cost of the reuse.
+                process.addressSpace.fill(reuse, vaCacheKey, 0);
+                reservedPages.set(reuse, vaCacheKey);
+                virtualAllocRegions.set(reuse, vaCacheKey);
+                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${reuse.toString(16)} (recycled, size=${vaCacheKey})`);
+                return reuse;
+            }
+            vaCacheStats.misses++;
+        }
+
+        profiler.start("VirtualAlloc:alloc");
         try {
             if (address === 0) {
                 // Align to 64KB allocation granularity (not just 4KB page).
@@ -1788,37 +2345,61 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // If two pools share the same >> 16 index (within same 64KB chunk),
                 // Free() decrements the WRONG pool's Taken counter → premature VirtualFree
                 // → use-after-free of GNames/other critical data.
-                address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
+                //
+                // MEM_TOP_DOWN (SmartHeap/Shw32, FastMM, …): highest available VA — share
+                // the HEAP high frontier with the slab arena so pools stay segregated from
+                // bottom-up HeapAlloc. Ignoring it handed low addresses and SmartHeap's
+                // pool math eventually VirtualAlloc'd a multi-hundred-MB bogus size.
+                if (flAllocationType & MEM_TOP_DOWN) {
+                    address = process.memory.allocTopDown(alignedSize, ALLOC_GRANULARITY, perms);
+                } else {
+                    address = process.memory.alloc(alignedSize, 'HEAP', perms, ALLOC_GRANULARITY);
+                }
             } else {
                 process.memory.allocAt(address, alignedSize, 'HEAP', perms);
             }
         } catch (error) {
-            System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32, `VirtualAlloc: Allocation failed: ${error}`);
-            return 0;
+            profiler.end("VirtualAlloc:alloc");
+            System.getInstance().scheduler.setLastError(ERROR_NOT_ENOUGH_MEMORY);
+            const high = process.memory.getHighHeapReport?.();
+            return fail(
+                `Allocation failed: ${error}` +
+                (high ? ` high={next=0x${high.next.toString(16)} slabTop=0x${high.slabTop.toString(16)} freeMB=${high.freeHighMB}}` : ''),
+            );
         }
+        profiler.end("VirtualAlloc:alloc");
+
+        // allocFromHigh/alloc may round up to 64KB granularity — track the live block size.
+        const committedSize = process.memory.getSize(address) ?? alignedSize;
 
         if (flAllocationType & MEM_RESERVE) {
-            reservedPages.set(address, alignedSize);
-            Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Reserved ${alignedSize} bytes at 0x${address.toString(16)}`);
+            reservedPages.set(address, committedSize);
+            // Reserve WITHOUT commit hands back address space, not memory. Leaving the
+            // pages present makes a demand-paging design (reserve a window, commit each
+            // page from the access-violation filter) never fault, so the app reads zeros
+            // where it expected the bytes its handler would have paged in.
+            if (!(flAllocationType & MEM_COMMIT)) markDecommitted(address, committedSize);
+            Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Reserved ${committedSize} bytes at 0x${address.toString(16)}`);
         }
 
         const trackedSize = virtualAllocRegions.get(address) ?? 0;
-        if (alignedSize > trackedSize) {
-            virtualAllocRegions.set(address, alignedSize);
+        if (committedSize > trackedSize) {
+            virtualAllocRegions.set(address, committedSize);
         }
 
         if (flAllocationType & MEM_COMMIT) {
+            profiler.start("VirtualAlloc:commit");
             const ptm = process.pageTableManager;
             if (ptm?.isPagingEnabled()) {
                 ptm.commitPages(address, alignedSize);
             } else {
                 process.addressSpace.fill(address, alignedSize, 0);
             }
-            Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
+            profiler.end("VirtualAlloc:commit");
+            Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
         }
 
-        Logger.verbose(LogCategory.KERNEL32, `VirtualAlloc -> 0x${address.toString(16)} (size=${alignedSize})`);
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${address.toString(16)} (size=${alignedSize})`);
         return address;
     };
 
@@ -1837,7 +2418,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const dwSize = args[1];
         const dwFreeType = args[2];
 
-        Logger.verbose(LogCategory.KERNEL32, `VirtualFree(0x${lpAddress.toString(16)}, ${dwSize}, 0x${dwFreeType.toString(16)})`);
+        Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualFree(0x${lpAddress.toString(16)}, ${dwSize}, 0x${dwFreeType.toString(16)})`);
 
         const MEM_RELEASE = 0x8000;
         const MEM_DECOMMIT = 0x4000;
@@ -1878,11 +2459,53 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 return 0; // FALSE
             }
 
+            // Asked BEFORE clearDecommittedRange wipes the evidence: a block any part of
+            // which was decommitted has page state we did not put there, so it can never
+            // be recycled with its PTEs left alone.
+            const hadDecommitted = (() => {
+                const end = lpAddress + trackedSize;
+                for (const [dcBase, dcSize] of decommittedPages) {
+                    if (dcBase < end && dcBase + dcSize > lpAddress) return true;
+                }
+                return false;
+            })();
+
             clearDecommittedRange(lpAddress, trackedSize);
             reservedPages.delete(lpAddress);
             virtualAllocRegions.delete(lpAddress);
+            // Park it instead of freeing it, when its pages are still exactly what we
+            // committed — then neither this release nor the next allocation of the same
+            // size touches the page tables (see the recycler comment above).
+            const blockSize = process.memory.getSize(lpAddress);
+            const touched = vaProtectionTouched.delete(lpAddress);
+            if (vaCacheEnabled && blockSize !== undefined && blockSize === trackedSize && blockSize <= VA_CACHE_MAX_BLOCK
+                && !hadDecommitted && !touched) {
+                let bucket = vaFreeCache.get(blockSize);
+                if (!bucket) { bucket = []; vaFreeCache.set(blockSize, bucket); }
+                if (bucket.length < VA_CACHE_MAX_PER_SIZE && vaCacheBytes + blockSize <= VA_CACHE_MAX_BYTES) {
+                    bucket.push(lpAddress);
+                    vaCacheBytes += blockSize;
+                    vaCacheStats.parked++;
+                    Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualFree: parked 0x${lpAddress.toString(16)} (${blockSize} bytes)`);
+                    return 1; // TRUE
+                }
+                vaCacheStats.refusedFull++;
+            } else if (touched || hadDecommitted) {
+                vaCacheStats.refusedTouched++;
+            } else {
+                vaCacheStats.refusedShape++;
+            }
 
-            const allocSize = process.memory.getSize(lpAddress);
+            // Released VA goes back to the allocator, so any protection the app applied
+            // to it dies with the reservation. Leaving a PAGE_READONLY page behind hands
+            // the next owner memory it cannot write — and the recommit-on-handout path
+            // only revives NOT-PRESENT pages, so a read-only one stays read-only forever.
+            {
+                const ptm = process.pageTableManager;
+                if (ptm?.isPagingEnabled()) ptm.setProtection(lpAddress, trackedSize, PAGE_READWRITE);
+            }
+
+            const allocSize = blockSize;
             if (allocSize === undefined) {
                 Logger.warn(LogCategory.KERNEL32,
                     `VirtualFree(MEM_RELEASE): 0x${lpAddress.toString(16)} missing from allocations map`);
@@ -1912,31 +2535,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 0; // FALSE
         }
 
-        const ptm = process.pageTableManager;
-        if (ptm?.isPagingEnabled()) {
-            // Clear Present bit in PTEs; access will fault via #PF.
-            ptm.decommitPages(alignedAddress, alignedSize);
-        } else {
-            // Fallback: poison bytes (pre-paging or paging disabled)
-            process.addressSpace.fill(alignedAddress, alignedSize, 0xFE);
-        }
-
-        // Merge with existing decommitted entries to keep the map compact.
-        // Remove any existing entries that overlap, then add the union range.
-        let mergeBase = alignedAddress;
-        let mergeEnd = alignedAddress + alignedSize;
-        const toRemove: number[] = [];
-        for (const [dcBase, dcSize] of decommittedPages) {
-            const dcEnd = dcBase + dcSize;
-            // Check if adjacent or overlapping
-            if (dcEnd >= mergeBase && dcBase <= mergeEnd) {
-                mergeBase = Math.min(mergeBase, dcBase);
-                mergeEnd = Math.max(mergeEnd, dcEnd);
-                toRemove.push(dcBase);
-            }
-        }
-        for (const key of toRemove) decommittedPages.delete(key);
-        decommittedPages.set(mergeBase, mergeEnd - mergeBase);
+        markDecommitted(alignedAddress, alignedSize);
 
         Logger.verbose(LogCategory.KERNEL32,
             `VirtualFree: Decommitted ${alignedSize} bytes at 0x${alignedAddress.toString(16)}`);
@@ -1987,6 +2586,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // Map new protect to perms using existing helper
         const newPerms = mapProtectToPerms(flNewProtect);
 
+        // The recycler may only hand a block back with its PTEs untouched, so a block the
+        // app has re-protected is disqualified for good — recorded here rather than
+        // re-derived at release, where the original protection is no longer visible.
+        {
+            const owner = virtualAllocRegions.find(alignedAddr);
+            if (owner) vaProtectionTouched.add(owner.base);
+        }
+
         // Apply protection. protect() requires exact (base, size) match; PE sub-pages
         // (e.g. 0x41f000 inside module at 0x400000) don't match, so it fails.
         const success = process.addressSpace.protect(alignedAddr, alignedSize, newPerms);
@@ -1994,8 +2601,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const ptm = process.pageTableManager;
             if (ptm?.isPagingEnabled()) {
                 ptm.setProtection(alignedAddr, alignedSize, flNewProtect);
-            } else {
-                bumpFastmemGeneration(FASTMEM_BUMP_ADDRESS_SPACE_PROTECT);
             }
             // Fake success for sub-region (e.g. page inside PE). App expects TRUE;
             // otherwise CRT aborts via INT 0x29. We already wrote lpflOldProtect.
@@ -2004,12 +2609,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return 1;
         }
 
-        // Also update PTEs if paging is active. addressSpace.protect() already
-        // bumped the fastmem generation for this VirtualProtect, so suppress the
-        // PTE-level bump here — one syscall = one generation bump.
+        // Also update PTEs if paging is active. The read map is updated by the
+        // PTE-level operation itself.
         const ptm = process.pageTableManager;
         if (ptm?.isPagingEnabled()) {
-            ptm.setProtection(alignedAddr, alignedSize, flNewProtect, false);
+            ptm.setProtection(alignedAddr, alignedSize, flNewProtect);
         }
 
         Logger.verbose(LogCategory.KERNEL32,
@@ -2396,6 +3000,20 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return false;
     };
 
+    /**
+     * The REGION MAP is what makes an IsBad* answerable. The address space is identity-mapped,
+     * so every linear address is inside `mem` — a bound of mem.length can only ever answer
+     * "good", which is not a check at all. A caller acts on the answer: a stack walker told
+     * every frame pointer is valid walks garbage until something else stops it, and RA3's
+     * crash reporter did exactly that for 144 million calls without terminating.
+     */
+    const rangeHasPerms = (addr: number, size: number, perms: RegionPerms): boolean => {
+        const space = System.getInstance().process?.addressSpace;
+        // No address space yet (very early boot): nothing to answer from, so do not refuse.
+        if (!space) return true;
+        return space.validateRange(addr, size, perms);
+    };
+
     // IsBadReadPtr - test whether the calling process has read access to a memory range
     // Returns FALSE (0) if readable, TRUE (non-zero) if not
     exports['IsBadReadPtr'] = (ctx, mem, args) => {
@@ -2406,8 +3024,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         if (ucb === 0) return 0;
         // NULL pointer with non-zero size is bad
         if (lp === 0) return 1;
-        // Check bounds against guest memory
-        if (lp + ucb > mem.length) return 1;
+        if (!rangeHasPerms(lp, ucb, 'r')) return 1;
         // Decommitted pages are inaccessible on real Windows
         if (isInDecommittedRange(lp, ucb)) return 1;
 
@@ -2421,7 +3038,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         if (ucb === 0) return 0;
         if (lp === 0) return 1;
-        if (lp + ucb > mem.length) return 1;
+        if (!rangeHasPerms(lp, ucb, 'rw')) return 1;
         // Decommitted pages are inaccessible on real Windows
         if (isInDecommittedRange(lp, ucb)) return 1;
 
@@ -2432,12 +3049,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     exports['IsBadHugeReadPtr'] = exports['IsBadReadPtr'];
     exports['IsBadHugeWritePtr'] = exports['IsBadWritePtr'];
 
-    // IsBadCodePtr - test whether the calling process has read access to the specified address
+    // IsBadCodePtr - test whether the specified address is executable. A data pointer is a BAD
+    // code pointer: that distinction is the whole point of the call.
     exports['IsBadCodePtr'] = (ctx, mem, args) => {
         const lp = args[0] >>> 0;
 
         if (lp === 0) return 1;
-        if (lp >= mem.length) return 1;
+        if (!rangeHasPerms(lp, 1, 'rx')) return 1;
 
         return 0; // Valid code pointer
     };
@@ -2449,11 +3067,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const ucchMax = args[1] >>> 0;
 
         if (lpsz === 0) return 1; // Bad pointer
-        if (lpsz >= mem.length) return 1;
-
-        // Check that we can read up to ucchMax chars or null terminator
-        const end = Math.min(lpsz + ucchMax, mem.length);
-        if (end > mem.length) return 1;
+        // Only the first byte can be checked: the read stops at the terminator, so a legal
+        // short string in a small region must not be refused for the whole ucchMax window.
+        if (!rangeHasPerms(lpsz, 1, 'r')) return 1;
+        if (ucchMax === 0) return 0;
 
         return 0; // Valid string pointer
     };
@@ -2464,10 +3081,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const ucchMax = args[1] >>> 0;
 
         if (lpsz === 0) return 1;
-        if (lpsz >= mem.length) return 1;
-
-        const end = Math.min(lpsz + ucchMax * 2, mem.length);
-        if (end > mem.length) return 1;
+        if (!rangeHasPerms(lpsz, 2, 'r')) return 1;
+        if (ucchMax === 0) return 0;
 
         return 0;
     };
@@ -2612,14 +3227,254 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 })();
 
 /**
+ * What the GUEST is told about one address — the real VirtualQuery, decoded.
+ *
+ * getVaMap below answers a fixed set of probes, which is the wrong shape when the
+ * question is about ONE address: a thread stack, a borrowed lpSurface, the pointer a
+ * heap manager just rejected. Reading region state off our own AddressSpace instead
+ * answers a different question than the guest asked, and the two have disagreed before.
+ * Backs the `vaQuery` harness verb.
+ */
+export function queryVirtualMemory(addr: number): Record<string, unknown> | null {
+    const process = System.getInstance().process;
+    const vq = exports['VirtualQuery'];
+    if (!process || typeof vq !== 'function') return null;
+    const mem = process.getCurrentMemory();
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const buf = process.memory.alloc(0x1000, 'HEAP');
+    const ctx: X86Context = {
+        eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 0,
+    };
+    try {
+        const rc = vq(ctx, mem, [addr >>> 0, buf, 28]) as number;
+        if (!rc) return { addr: `0x${(addr >>> 0).toString(16)}`, rc: 0 };
+        const state = view.getUint32(buf + 16, true) >>> 0;
+        return {
+            addr: `0x${(addr >>> 0).toString(16)}`,
+            rc,
+            baseAddress: `0x${(view.getUint32(buf + 0, true) >>> 0).toString(16)}`,
+            allocationBase: `0x${(view.getUint32(buf + 4, true) >>> 0).toString(16)}`,
+            allocationProtect: `0x${(view.getUint32(buf + 8, true) >>> 0).toString(16)}`,
+            regionSize: view.getUint32(buf + 12, true) >>> 0,
+            state: state === 0x10000 ? 'FREE' : state === 0x2000 ? 'RESERVE' : state === 0x1000 ? 'COMMIT' : `0x${state.toString(16)}`,
+            protect: `0x${(view.getUint32(buf + 20, true) >>> 0).toString(16)}`,
+            type: `0x${(view.getUint32(buf + 24, true) >>> 0).toString(16)}`,
+        };
+    } finally {
+        try { process.memory.free(buf); } catch { /* ignore */ }
+    }
+}
+
+/**
+ * DevTools/harness: walk VirtualQuery the way SmartHeap does (addr += RegionSize)
+ * and report GetSystemInfo max + largest FREE/RESERVE. Diagnoses phantom TOP_DOWN
+ * MemPoolPreAllocate sizes (BoD ~807MB OOM).
+ */
+(globalThis as any).getVaMap = () => {
+    const process = System.getInstance().process;
+    if (!process) return null;
+    const mem = process.getCurrentMemory();
+    const memLen = mem.length >>> 0;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const buf = process.memory.alloc(0x1000, 'HEAP');
+    const ctx: X86Context = {
+        eax: 0, ecx: 0, edx: 0, ebx: 0,
+        esp: 0, ebp: 0, esi: 0, edi: 0,
+        eip: 0, eflags: 0,
+    };
+    try {
+        const gsi = exports['GetSystemInfo'];
+        const vq = exports['VirtualQuery'];
+        if (typeof gsi === 'function') gsi(ctx, mem, [buf]);
+        const minApp = view.getUint32(buf + 8, true) >>> 0;
+        const maxApp = view.getUint32(buf + 12, true) >>> 0;
+
+        const MEM_FREE = 0x10000, MEM_RESERVE = 0x2000, MEM_COMMIT = 0x1000;
+        const row = () => {
+            const base = view.getUint32(buf + 0, true) >>> 0;
+            const allocBase = view.getUint32(buf + 4, true) >>> 0;
+            const regionSize = view.getUint32(buf + 12, true) >>> 0;
+            const state = view.getUint32(buf + 16, true) >>> 0;
+            const type = view.getUint32(buf + 24, true) >>> 0;
+            const stateName = state === MEM_FREE ? 'FREE' : state === MEM_RESERVE ? 'RESERVE' : state === MEM_COMMIT ? 'COMMIT' : `0x${state.toString(16)}`;
+            return {
+                base: `0x${base.toString(16)}`,
+                allocBase: `0x${allocBase.toString(16)}`,
+                size: regionSize,
+                sizeHex: `0x${regionSize.toString(16)}`,
+                sizeMB: +(regionSize / 1048576).toFixed(2),
+                state: stateName,
+                type: `0x${type.toString(16)}`,
+            };
+        };
+        const probe = (a: number) => {
+            const rc = typeof vq === 'function' ? (vq(ctx, mem, [a, buf, 28]) as number) : 0;
+            if (!rc) return { addr: `0x${a.toString(16)}`, rc: 0 };
+            return { addr: `0x${a.toString(16)}`, rc, ...row() };
+        };
+        // TOP_DOWN walk (SmartHeap MemPoolPreAllocate style): start at maxApp, step by RegionSize down.
+        const topDown: Array<Record<string, unknown>> = [];
+        let addr = maxApp >>> 0;
+        let steps = 0;
+        while (steps < 4096) {
+            steps++;
+            const rc = typeof vq === 'function' ? (vq(ctx, mem, [addr, buf, 28]) as number) : 0;
+            if (!rc) {
+                topDown.push({ addr: `0x${addr.toString(16)}`, rc: 0 });
+                // Skip into backed RAM if we're still above memLen
+                if (addr >= memLen) {
+                    addr = memLen > 0 ? ((memLen - 1) >>> 0) : 0;
+                    continue;
+                }
+                break;
+            }
+            const r = row();
+            topDown.push({ addr: `0x${addr.toString(16)}`, ...r });
+            const base = parseInt(String(r.base).slice(2), 16) >>> 0;
+            if (base === 0) break;
+            addr = (base - 1) >>> 0;
+            if (addr >= 0x90000000) break; // wrapped
+        }
+        const freeish = topDown
+            .filter((r) => r.state === 'FREE' || r.state === 'RESERVE')
+            .slice()
+            .sort((a, b) => (b.size as number) - (a.size as number));
+        return {
+            memLen,
+            memLenHex: `0x${memLen.toString(16)}`,
+            minApp: `0x${minApp.toString(16)}`,
+            maxApp: `0x${maxApp.toString(16)}`,
+            high: process.memory.getHighHeapReport?.() ?? null,
+            steps,
+            topDownHead: topDown.slice(0, 24),
+            topFreeOrReserve: freeish.slice(0, 16),
+            largestFreeMB: freeish.find((r) => r.state === 'FREE')?.sizeMB ?? 0,
+            largestReserveMB: freeish.find((r) => r.state === 'RESERVE')?.sizeMB ?? 0,
+            probes: {
+                atMemLen: probe(memLen),
+                atMemLenMinusPage: probe(memLen > 0x1000 ? memLen - 0x1000 : 0),
+                at2GB: probe(0x7FFE0000),
+                atSurface: probe(MEM_SURFACE_BASE),
+                atSurfacePlus8M: probe(MEM_SURFACE_BASE + 0x800000),
+                at0x0D904000: probe(0x0D904000),
+            },
+        };
+    } finally {
+        try { process.memory.free(buf); } catch { /* ignore */ }
+    }
+};
+
+// HeapSize mirrors exports['HeapSize'] in full: every branch it has is a constant
+// compare, an O(log n) interval probe or a Map get, and none of them has a side
+// effect, so there is nothing left for the slow tier to own.
+export const heapSizeFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+    if (esp + 16 > mem8.length) return null;
+    const lpMem = view.getUint32(esp + 12, true) >>> 0;
+
+    // VirtualAlloc memory is not a heap block — Win32 returns (SIZE_T)-1.
+    if (!lpMem || isInVirtualAllocRegion(lpMem)) return HEAP_SIZE_INVALID;
+
+    if (inSlabRange(lpMem)) {
+        const slabSize = slabSizeFromHeader(lpMem, view);
+        if (slabSize !== undefined) return slabSize;
+    }
+    const process = System.getInstance().process;
+    if (!process) return null;
+    const size = process.memory.getSize(lpMem);
+    return size !== undefined ? size : HEAP_SIZE_INVALID;
+};
+
+// HeapReAlloc serves only the cases that keep the block put. A grow that must move
+// is a real allocation, and a refusal (size 0 / oversize) is what the guest turns
+// into bad_alloc — both stay on the slow tier, which owns the copy, the free funnel
+// and the call-site diagnostics that name the caller.
+export const heapReAllocFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+    if (esp + 20 > mem8.length) return null;
+    const dwFlags = view.getUint32(esp + 8, true) >>> 0;
+    const lpMem = view.getUint32(esp + 12, true) >>> 0;
+    const dwBytes = view.getUint32(esp + 16, true) >>> 0;
+
+    const system = System.getInstance();
+    const process = system.process;
+    if (!process || !lpMem) return null;
+    if (dwBytes === 0 || dwBytes > mem8.length || dwBytes > HEAP_FAST_PATH_MAX_ALLOC) return null;
+
+    let capacity = inSlabRange(lpMem) ? slabSizeFromHeader(lpMem, view) : undefined;
+    if (capacity === undefined) capacity = process.memory.getSize(lpMem);
+    if (capacity === undefined) return null;
+
+    // The zeroing contract needs the caller's PREVIOUS requested size, which no tier here
+    // holds — `capacity` is the rounded allocation. A tier that cannot honour it must not
+    // answer: the slow tier relocates and zeroes the tail explicitly.
+    if (dwFlags & HEAP_ZERO_MEMORY_FLAG) return null;
+
+    if (dwBytes <= capacity) {
+        if ((globalThis as any).__heapWatch) {
+            heapWatch('realloc-inplace', { esp }, mem8, [lpMem], `size=${dwBytes} cap=${capacity}`);
+        }
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapReAlloc in-place 0x${lpMem.toString(16)} (size=${dwBytes} <= cap=${capacity})`);
+        return lpMem;
+    }
+    if (dwFlags & HEAP_REALLOC_IN_PLACE_ONLY) {
+        system.scheduler.setLastError(ERR_INVALID_PARAMETER);
+        Logger.verboseLazy(LogCategory.KERNEL32,
+            () => `HeapReAlloc IN_PLACE_ONLY can't grow 0x${lpMem.toString(16)} (size=${dwBytes} > cap=${capacity})`);
+        return 0;
+    }
+    return null;
+};
+
+/**
  * Register fast-path implementations for high-frequency heap operations.
  * Keeps heap bookkeeping in JS AddressSpace/MemoryManager, but bypasses full thunk marshalling.
+ *
+ * These run INSTEAD of exports['HeapAlloc'/'HeapFree'], so every slab invariant those
+ * carry has to be honoured here as well or it is silently gone: the fast path is the
+ * tier that actually serves a slab fallthrough.
  */
-export function registerFastPathHeapFunctions(dispatcher: any): void {
+export function registerFastPathHeapFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
-    const heapAllocFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-        const esp = cpu.reg32[4] >>> 0;
+    // A refused allocation is what the guest turns into std::bad_alloc, so it must be
+    // as loud here as in the slow path — the fast path is the tier that actually serves
+    // the call, and a silent 0 leaves the resulting crash with no cause in the log.
+    let refusalLogCount = 0;
+    const reportFastPathAllocFailure = (dwBytes: number, why: string, view: DataView, esp: number): void => {
+        if (refusalLogCount >= 40) return;
+        refusalLogCount++;
+        // [ESP] is the guest return address — the only thing that names WHICH code asked
+        // for the size. The thunk stub's own EIP is the same for every caller.
+        let caller = 0;
+        try { caller = view.getUint32(esp, true) >>> 0; } catch { /* torn stack */ }
+        const process = System.getInstance().process;
+        const registry: any = process?.moduleRegistry;
+        const sym = registry?.resolveAddress?.(caller) ?? "";
+        // The immediate caller is always the CRT allocator, and the frame-pointer walk is
+        // unreliable over FPO code (it invents repeated frames). Scan raw stack words
+        // instead and keep the ones that land in a loaded module — those are the real
+        // return addresses, in order.
+        const chain: string[] = [];
+        try {
+            for (let off = 0; off < 0x200 && chain.length < 14; off += 4) {
+                const w = view.getUint32(esp + off, true) >>> 0;
+                const s = registry?.resolveAddress?.(w);
+                if (s) chain.push(`+0x${off.toString(16)}:${s}`);
+            }
+        } catch { /* torn stack */ }
+        // The size came from an API the guest called just before; the ring names which.
+        let recent = "";
+        try {
+            const d: any = (process as any)?.dispatcher;
+            recent = (d?.getLastWinApiCalls?.(24) ?? []).join(" | ");
+        } catch { /* best-effort */ }
+        Logger.warn(LogCategory.KERNEL32,
+            `HeapAlloc (fast path) refused ${dwBytes} bytes (0x${dwBytes.toString(16)}, ${why}) ` +
+            `caller=0x${caller.toString(16)}${sym ? ` ${sym}` : ""}\n  stack: ${chain.join(" | ")}` +
+            `\n  recent: ${recent}`);
+    };
+
+    const heapAllocFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         if (esp + 16 > mem8.length) return null;
 
         const dwFlags = view.getUint32(esp + 8, true) >>> 0;
@@ -2633,10 +3488,16 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
             return 0;
         }
 
+        // A sub-4KB alloc reaching JS at all means the inline stub and the WASM hypercall
+        // both fell through, i.e. the arena is full. This is the ONLY signal the arena has
+        // to grow, and it arrives here — not at the slow path below us.
+        if (dwBytes <= HEAP_SMALL_ALLOC_MAX) maybeGrowHeapSlab();
+
         const zeroMemory = (dwFlags & HEAP_ZERO_MEMORY_FLAG) !== 0 || DEBUG_FORCE_ZERO_HEAP_FAST_PATH;
         const memSize = process.getCurrentMemory().length >>> 0;
         if (dwBytes > memSize || dwBytes > HEAP_FAST_PATH_MAX_ALLOC) {
             system.scheduler.setLastError(HEAP_OOM_ERROR);
+            reportFastPathAllocFailure(dwBytes, "size", view, esp);
             return 0;
         }
 
@@ -2647,21 +3508,26 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
                 mem8.fill(0, address, address + allocBytes);
             }
             return address;
-        } catch {
+        } catch (e) {
             system.scheduler.setLastError(HEAP_OOM_ERROR);
+            reportFastPathAllocFailure(dwBytes, `alloc: ${e}`, view, esp);
             return 0;
         }
     };
 
-    const heapFreeFastPath: FastPathImplementation = (cpu, mem8, _mem32, view) => {
-        const esp = cpu.reg32[4] >>> 0;
+    const heapFreeFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
         const system = System.getInstance();
         const process = system.process;
         if (!process) return null;
         if (esp + 16 > mem8.length) return null;
 
         const lpMem = view.getUint32(esp + 12, true) >>> 0;
+        // A slab-resident pointer is an interior offset, not a root allocation:
+        // process.memory.free would mistarget the enclosing arena. The slow path owns
+        // that case (retired-generation no-op + double-free diagnostics) — defer to it.
+        // VirtualAlloc regions also need the slow path (refuse with ERROR_INVALID_PARAMETER).
         if (lpMem !== 0) {
+            if (isInAnySlab(lpMem) || isInVirtualAllocRegion(lpMem)) return null;
             process.memory.free(lpMem);
         }
         return 1;
@@ -2669,6 +3535,199 @@ export function registerFastPathHeapFunctions(dispatcher: any): void {
 
     dispatcher.registerFastPath('kernel32', 'HeapAlloc', heapAllocFastPath, { trivial: true });
     dispatcher.registerFastPath('kernel32', 'HeapFree', heapFreeFastPath, { trivial: true });
+    dispatcher.registerFastPath('kernel32', 'HeapSize', heapSizeFastPath, { trivial: true });
+    dispatcher.registerFastPath('kernel32', 'HeapReAlloc', heapReAllocFastPath, { trivial: true });
     Logger.log(LogCategory.KERNEL32, 'Registered fast path for heap functions');
 }
 
+// ---------------------------------------------------------------------------
+// VirtualQuery fast path.
+//
+// A pointer-validity probe loop asks VirtualQuery hundreds of thousands of times per
+// boot, and every one of those answers is the same shape: a committed, page-granular
+// private page inside the HEAP/THUNK_DATA span (branch 4b of exports['VirtualQuery']).
+// Windows answers from a VAD tree; we answer that ONE branch here.
+//
+// Serving a branch means PROVING no earlier branch would have claimed the page and that
+// no later step would have altered the record — so this tier is a chain of negative
+// checks, each of which must be a constant compare or an O(log n) index probe. Re-running
+// the branch's own sweeps here would relocate the cost, not remove it:
+//   - being inside [HEAP, THUNK_DATA end) already rules out the EXE range (below it) and
+//     the ROM / SURFACE-reserve branches (above it), at no cost at all;
+//   - thread stacks and PE images answer from the sorted span indexes their owners keep;
+//   - VirtualAlloc roots and decommitted runs answer from IntervalMap's stabbing index.
+// Anything not proven defers to the full body, which stays the single definition of what
+// the other branches mean.
+// ---------------------------------------------------------------------------
+const MBI_MEM_COMMIT = 0x1000;
+const MBI_MEM_PRIVATE = 0x20000;
+const MBI_PAGE_READWRITE = 0x04;
+const MBI_SIZE = 28;
+const BACKED_HEAP_SPAN_END = MEM_THUNK_DATA_BASE + MEM_THUNK_DATA_SIZE;
+
+let vqFastHits = 0;
+let vqFastDefers = 0;
+let vqAuditChecked = 0;
+let vqAuditMismatches = 0;
+let vqAuditWarnBudget = 20;
+let vqAuditBuf = 0;
+const vqAuditCtx: X86Context = {
+    eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0, ebp: 0, esi: 0, edi: 0, eip: 0, eflags: 0,
+};
+
+/**
+ * Differential check for the fast path, armed with
+ * `setWorkerFlag('__virtualQueryFastAudit', true)`.
+ *
+ * A fast path that silently answers a case it was not entitled to is exactly the class of
+ * bug that reads as a plausible number for the whole session, so the audit runs the FULL
+ * body over the same address and compares all seven MEMORY_BASIC_INFORMATION fields.
+ */
+function auditVirtualQueryFast(lpAddress: number, lpBuffer: number, mem: Uint8Array, view: DataView): void {
+    const process = System.getInstance().process;
+    const slow = exports['VirtualQuery'];
+    if (!process || typeof slow !== 'function') return;
+    if (!vqAuditBuf) {
+        try { vqAuditBuf = process.memory.alloc(0x1000) >>> 0; } catch { return; }
+    }
+    const rc = slow(vqAuditCtx, mem, [lpAddress, vqAuditBuf, MBI_SIZE]) as number;
+    vqAuditChecked++;
+    let bad = rc !== MBI_SIZE;
+    for (let off = 0; !bad && off < MBI_SIZE; off += 4) {
+        if (view.getUint32(lpBuffer + off, true) !== view.getUint32(vqAuditBuf + off, true)) bad = true;
+    }
+    if (!bad) return;
+    vqAuditMismatches++;
+    if (vqAuditWarnBudget-- <= 0) return;
+    const dump = (base: number): string => {
+        const w: string[] = [];
+        for (let off = 0; off < MBI_SIZE; off += 4) w.push(`0x${(view.getUint32(base + off, true) >>> 0).toString(16)}`);
+        return `[${w.join(', ')}]`;
+    };
+    Logger.warn(LogCategory.KERNEL32,
+        `[VQ-AUDIT] MISMATCH at 0x${lpAddress.toString(16)} (rc=${rc}): ` +
+        `fast=${dump(lpBuffer)} slow=${dump(vqAuditBuf)} ` +
+        `(Base, AllocationBase, AllocationProtect, RegionSize, State, Protect, Type)`);
+}
+
+const virtualQueryFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+    if (esp + 16 > mem8.length) { vqFastDefers++; return null; }
+
+    const lpAddress = view.getUint32(esp + 4, true) >>> 0;
+    const lpBuffer = view.getUint32(esp + 8, true) >>> 0;
+    const dwLength = view.getUint32(esp + 12, true) >>> 0;
+    if (!lpBuffer || dwLength < MBI_SIZE || lpBuffer + MBI_SIZE > mem8.length) { vqFastDefers++; return null; }
+
+    const pageBase = (lpAddress & ~0xFFF) >>> 0;
+    if (pageBase < MEM_HEAP_BASE || pageBase >= BACKED_HEAP_SPAN_END) { vqFastDefers++; return null; }
+    if (pageBase >= mem8.length) { vqFastDefers++; return null; }
+
+    const system = System.getInstance();
+    const process = system.process;
+    if (!process) { vqFastDefers++; return null; }
+    if (system.scheduler?.findStackReservation(pageBase)) { vqFastDefers++; return null; }
+    if (process.moduleRegistry?.getModuleContainingAddress(lpAddress)) { vqFastDefers++; return null; }
+    if (virtualAllocRegions.find(pageBase)) { vqFastDefers++; return null; }
+    if (decommittedPages.find(pageBase)) { vqFastDefers++; return null; }
+
+    view.setUint32(lpBuffer, pageBase, true);                     // BaseAddress
+    view.setUint32(lpBuffer + 4, pageBase, true);                 // AllocationBase
+    view.setUint32(lpBuffer + 8, MBI_PAGE_READWRITE, true);       // AllocationProtect
+    view.setUint32(lpBuffer + 12, 0x1000, true);                  // RegionSize
+    view.setUint32(lpBuffer + 16, MBI_MEM_COMMIT, true);          // State
+    view.setUint32(lpBuffer + 20, MBI_PAGE_READWRITE, true);      // Protect
+    view.setUint32(lpBuffer + 24, MBI_MEM_PRIVATE, true);         // Type
+
+    vqFastHits++;
+    if ((globalThis as { __virtualQueryFastAudit?: boolean }).__virtualQueryFastAudit) {
+        auditVirtualQueryFast(lpAddress, lpBuffer, mem8, view);
+    }
+    return MBI_SIZE;
+};
+
+/**
+ * HeapReAlloc(HEAP_ZERO_MEMORY) satisfied WITHOUT moving the block.
+ *
+ * The caller is entitled to zeros over [previously requested size, dwBytes). No tier holds
+ * the previously REQUESTED size -- capacity is what the allocator handed out (a slab bin, or
+ * the request rounded up) -- so when the new size still fits, the block is returned unchanged
+ * and that window keeps the previous tenant's bytes.
+ *
+ * Fixing it means the guest-side slab allocator recording the request, which is a Rust and
+ * inline-stub change plus a wasm rebuild. This counts the case instead, because "how often
+ * does a title actually take it" is the number that decides whether to pay for that, and
+ * `slab` is the half that matters: a tracked allocation's window is at most the 8/16-byte
+ * rounding, while a slab bin's is up to the bin.
+ */
+const zeroGrowInPlace = {
+    slab: 0,
+    tracked: 0,
+    /** Largest request served this way, and the capacity behind it. */
+    maxBytes: 0,
+    maxCapacity: 0,
+    /** First caller seen, so a non-zero count can be traced back to real code. */
+    firstCaller: "" as string,
+};
+
+function noteZeroGrowInPlace(
+    dwBytes: number, capacity: number, fromSlab: boolean, ctx: X86Context, mem: Uint8Array,
+): void {
+    if (fromSlab) zeroGrowInPlace.slab++; else zeroGrowInPlace.tracked++;
+    if (dwBytes > zeroGrowInPlace.maxBytes) {
+        zeroGrowInPlace.maxBytes = dwBytes;
+        zeroGrowInPlace.maxCapacity = capacity;
+    }
+    if (!zeroGrowInPlace.firstCaller) {
+        zeroGrowInPlace.firstCaller = formatCallSite(ctx, mem, 4, [], []);
+    }
+}
+
+/** Harness: how often a zero-initialising realloc was served in place -- see zeroGrowInPlace. */
+export function heapZeroGrowStats(): Record<string, unknown> {
+    return {
+        slab: zeroGrowInPlace.slab,
+        tracked: zeroGrowInPlace.tracked,
+        total: zeroGrowInPlace.slab + zeroGrowInPlace.tracked,
+        maxBytes: zeroGrowInPlace.maxBytes,
+        maxCapacity: zeroGrowInPlace.maxCapacity,
+        firstCaller: zeroGrowInPlace.firstCaller,
+    };
+}
+
+export function resetHeapZeroGrowStats(): void {
+    zeroGrowInPlace.slab = 0;
+    zeroGrowInPlace.tracked = 0;
+    zeroGrowInPlace.maxBytes = 0;
+    zeroGrowInPlace.maxCapacity = 0;
+    zeroGrowInPlace.firstCaller = "";
+}
+
+/** Harness: did the fast tier actually serve the calls, and does the audit agree? */
+export function virtualQueryFastStats(): Record<string, unknown> {
+    return {
+        hits: vqFastHits,
+        defers: vqFastDefers,
+        hitPct: vqFastHits + vqFastDefers > 0
+            ? +((100 * vqFastHits) / (vqFastHits + vqFastDefers)).toFixed(1) : 0,
+        auditArmed: Boolean((globalThis as { __virtualQueryFastAudit?: boolean }).__virtualQueryFastAudit),
+        auditChecked: vqAuditChecked,
+        auditMismatches: vqAuditMismatches,
+    };
+}
+
+export function resetVirtualQueryFastStats(): void {
+    vqFastHits = 0;
+    vqFastDefers = 0;
+    vqAuditChecked = 0;
+    vqAuditMismatches = 0;
+    vqAuditWarnBudget = 20;
+}
+
+/** Test seam: the fast-path implementation, so a differential test can drive it directly. */
+export const __virtualQueryFastPathForTests = virtualQueryFastPath;
+
+export function registerFastPathVirtualQuery(dispatcher: HleDispatcher): void {
+    if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+    dispatcher.registerFastPath('kernel32', 'VirtualQuery', virtualQueryFastPath, { trivial: true });
+    Logger.log(LogCategory.KERNEL32, 'Registered fast path for VirtualQuery');
+}

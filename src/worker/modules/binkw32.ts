@@ -4,13 +4,10 @@
  * Decodes .BIK video files via the FFmpeg WASM video engine.
  * Falls back to stub (return 0) when the WASM module is unavailable.
  *
- * BinkHandle struct layout in guest memory (at alloc'd ptr):
- *   +0   Width        DWORD
- *   +4   Height       DWORD
- *   +8   Frames       DWORD   ← games check this to decide whether to play
- *   +12  FrameNum     DWORD   ← current frame, updated by BinkNextFrame
- *   +16  FrameRate    DWORD   ← fps numerator (e.g. 15)
- *   +20  FrameRateDiv DWORD   ← fps denominator (usually 1)
+ * The HBINK struct handed to the guest follows the ABI of the binkw32.dll the title
+ * ships (bink-struct.ts): RAD moved Frames/FrameNum/rects between SDK releases, and
+ * the guest reads them at the offsets its own header declared. The layout is resolved
+ * once per session from that DLL's version resource.
  *
  * Allocation is oversized (2048 bytes, zero-filled) because games read internal
  * fields at higher offsets (rect pointers, frame buffers, etc.).  Without enough
@@ -29,17 +26,184 @@ import { CTRL_PLAY_CURSOR, CTRL_BUFFER_BYTES, CTRL_BLOCK_ALIGN, CTRL_SAMPLE_RATE
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, isRenderSurface, type BitmapTextureSurface } from "./ddraw/com-objects";
 import { setAuthorityCpu } from "./ddraw/surface-sync";
 import { resolveD3D8TextureSurface } from "./d3d8/shared-state";
+import { resolveD3D9LockedTextureTarget, d3d9TextureUploadSeq } from "./d3d9/shared-state";
 import { readAnsiFromGuest } from "./codepage-utils";
 import { Mem } from "../core/memory/mem-accessor";
 import { overlapsThunkCode } from "../core/memory/address-guard";
 import { Glide2x } from "./glide2x";
 import { VideoFrameViews } from "../video/video-routing-types";
+import { readPeVersionString, readPeFixedFileVersion } from "../core/pe-version";
+import { readStdcallRetBytes } from "@bottleship/formats/pe";
+import { APIRegistry } from "../core/api-registry";
+import {
+    BinkStructLayout, BINK_LAYOUT_DEFAULT, BINK_SET_VOLUME_DECORATED_POPS,
+    binkBuildFor, selectBinkBuild,
+} from "./bink-struct";
+import {
+    BFB, BinkPlane, BINKFRAMEBUFFERS_SIZE, BINK_FLAG_ALPHA,
+    BINK_HEADER_VIDEOFLAGS_OFFSET, bgraToBinkPlanes, binkPlaneGeometry, planeOffset,
+    type BinkPlaneGeometry,
+} from "./bink-frame-buffers";
+
+/** The one export whose argument list RAD changed without changing its decorated name. */
+const BINK_SET_VOLUME_EXPORT = "_BinkSetVolume@8";
 
 // Real HBINK structs are 300-500+ bytes depending on SDK version.  Games read
 // internal fields (rect pointers, frame buffer ptrs) at offsets well beyond our
 // populated header.  Allocate generously and zero-fill so all pointer fields
 // are NULL and all counts are 0 — prevents games from dereferencing garbage.
 const BINK_HANDLE_SIZE = 2048;
+/** Bink container header: 'BIK'+version, size, frames, …, width@20, height@24, fps@28/32. */
+const BINK_HEADER_BYTES = 44;
+/** Copy→upload has to be one frame apart to be evidence the upload took those pixels. */
+const SAME_FRAME_MS = 34;
+/** Consecutive same-frame uploads before an app is believed to publish the movie itself.
+ *  One coincidence is not cadence; a real per-frame upload path clears this immediately. */
+const UPLOAD_CADENCE_FRAMES = 3;
+/** …and how many frames without one before the belief expires. A clip that stops feeding
+ *  the app's own upload path (a seek, a second clip on the same handle) must get the
+ *  overlay back; a latch with no way down is a permanent decision from a transient one. */
+const UPLOAD_LATCH_DECAY_FRAMES = 30;
+
+/** What the "the app publishes these pixels itself" latch reads, and what it carries. */
+export interface UploadLatchState {
+    latched: boolean;
+    inStep: number;
+    framesWithoutMatch: number;
+    lastUploadSeq: number;
+}
+
+/**
+ * One frame's step of the latch that suppresses our video overlay.
+ *
+ * The upload counter is PROCESS-WIDE, so "an upload happened" is not evidence on its own —
+ * a HUD atlas upload mid-clip would latch it for the session. Evidence is CAUSAL: this
+ * session's copy went into a D3D9 lock staging buffer AND an upload landed in the same
+ * frame, repeatedly. Pure so the cadence and the decay are testable without a device.
+ *
+ * Deliberately conservative, and therefore NOT the whole answer: an app that copies into a
+ * private buffer and uploads FROM it offers no pointer link at all, so this can never speak
+ * for it. What keeps the plane off that app's UI is the composite policy, which declines to
+ * cover a frame the guest drew a scene into (video/video-plane-policy.ts).
+ */
+export function stepUploadLatch(prev: UploadLatchState, obs: {
+    uploadSeq: number;
+    /** This session's copy destination resolved to a D3D9 texture lock — the causal link. */
+    hasLockTarget: boolean;
+    msSinceCopy: number;
+}): UploadLatchState {
+    // The first sample only establishes a baseline; it cannot itself be a change.
+    const uploaded = prev.lastUploadSeq !== -1 && prev.lastUploadSeq !== obs.uploadSeq;
+    const matched = uploaded && obs.hasLockTarget && obs.msSinceCopy <= SAME_FRAME_MS;
+    if (matched) {
+        const inStep = prev.inStep + 1;
+        return {
+            latched: prev.latched || inStep >= UPLOAD_CADENCE_FRAMES,
+            inStep,
+            framesWithoutMatch: 0,
+            lastUploadSeq: obs.uploadSeq,
+        };
+    }
+    const framesWithoutMatch = prev.framesWithoutMatch + 1;
+    return {
+        latched: prev.latched && framesWithoutMatch < UPLOAD_LATCH_DECAY_FRAMES,
+        inStep: 0,
+        framesWithoutMatch,
+        lastUploadSeq: obs.uploadSeq,
+    };
+}
+
+/** The anchors BinkWait paces against. */
+export interface BinkPacingState {
+    audioBaselineMs: number;
+    frameDecodeCount: number;
+    lastPlayCursor: number;
+    audioWrapCount: number;
+    lastFrameMs: number;
+}
+
+/** Where BinkWait expects the audio clock to be before frame `frameDecodeCount` may run. */
+export function binkWaitTargetMs(s: BinkPacingState, msPerFrame: number): number {
+    return s.audioBaselineMs + s.frameDecodeCount * msPerFrame;
+}
+
+/**
+ * Put the pacing anchors back where a clip that just started has them.
+ *
+ * A loop wrap or a BinkGoto moves the video timeline but not these, so every frame after
+ * one is paced against a baseline taken at frame 0 of the previous pass — the target sits
+ * far in the past and BinkWait answers "ready" for every frame. The audio ring's own
+ * wrap accounting has to go with it, or the re-established baseline lands in a clock the
+ * following reads do not use.
+ */
+export function rebaseBinkPacing(s: BinkPacingState): void {
+    s.audioBaselineMs = -1;   // re-sampled by the next decode with active audio
+    s.frameDecodeCount = 0;
+    s.lastPlayCursor = 0;
+    s.audioWrapCount = 0;
+    s.lastFrameMs = 0;
+}
+
+/**
+ * BINKSURFACE* — the destination pixel format, named by the GAME in the low nibble
+ * (BINKSURFACEMASK) of the `flags` argument to BinkCopyToBuffer/BinkCopyToBufferRect.
+ *
+ * This is the only authoritative source for the format: the destination is a bare
+ * pointer + pitch, so nothing about its layout can be derived, and a title that never
+ * calls BinkDDSurfaceType/BinkBufferOpen declares its format here and nowhere else.
+ * Guessing bytes-per-pixel from `pitch / width` is a fallback for the flags==8P case
+ * only (see binkSurfaceFromFlags).
+ */
+export const enum BinkSurface {
+    P8       = 0,   // 8-bit palette indices
+    BGR24    = 1,   // BINKSURFACE24
+    RGB24    = 2,   // BINKSURFACE24R
+    BGRA32   = 3,   // BINKSURFACE32
+    RGBA32   = 4,   // BINKSURFACE32R
+    BGRA32A  = 5,   // BINKSURFACE32A
+    RGBA32A  = 6,   // BINKSURFACE32RA
+    ARGB4444 = 7,
+    ARGB1555 = 8,   // BINKSURFACE5551
+    XRGB1555 = 9,   // BINKSURFACE555
+    RGB565   = 10,
+    RGB655   = 11,
+    RGB664   = 12,
+    YUY2     = 13,
+    UYVY     = 14,
+    YV12     = 15,
+}
+const BINKSURFACE_MASK = 0xF;
+
+/** Bytes per pixel per BINKSURFACE type; 0 = a packed/planar YUV we do not emit. */
+const BINK_SURFACE_BPP: readonly number[] = [1, 3, 3, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 0, 0, 0];
+
+function binkSurfaceBpp(surf: BinkSurface): number {
+    return BINK_SURFACE_BPP[surf] || 4;
+}
+
+/**
+ * Destination format the game declared, or -1 when it declared nothing usable.
+ *
+ * BINKSURFACE8P is 0, which is indistinguishable from "passed no flags at all" — and
+ * our BinkDDSurfaceType hands back 0 precisely because we cannot know the caller's SDK
+ * constants — so 0 stays with the pitch/surface heuristic rather than forcing 8bpp
+ * palettized output. The YUV types have no BGRA-sourced packer here.
+ */
+function binkSurfaceFromFlags(flags: number): BinkSurface | -1 {
+    const surf = (flags & BINKSURFACE_MASK) as BinkSurface;
+    if (surf === BinkSurface.P8) return -1;
+    return BINK_SURFACE_BPP[surf] > 0 ? surf : -1;
+}
+
+/** The BINKSURFACE type the legacy bytes-per-pixel heuristic stands for. */
+function binkSurfaceFromBpp(bpp: number): BinkSurface {
+    switch (bpp) {
+        case 1:  return BinkSurface.P8;
+        case 2:  return BinkSurface.RGB565;
+        case 3:  return BinkSurface.BGR24;
+        default: return BinkSurface.BGRA32;
+    }
+}
 
 /**
  * Detect destination bytes-per-pixel from pitch and destination row width in pixels.
@@ -72,58 +236,134 @@ function isGpuVideoPresenterActive(): boolean {
     return !!System.getInstance().services.render.getActive()?.suppressGdiOverlay;
 }
 
+/** Pack one BGRA pixel into the 16-bit layout `surf` names. */
+export function pack16(surf: BinkSurface, b: number, g: number, r: number, a: number): number {
+    switch (surf) {
+        case BinkSurface.ARGB4444: return ((a & 0xF0) << 8) | ((r & 0xF0) << 4) | (g & 0xF0) | (b >> 4);
+        case BinkSurface.ARGB1555: return (a >= 0x80 ? 0x8000 : 0) | ((r & 0xF8) << 7) | ((g & 0xF8) << 2) | (b >> 3);
+        case BinkSurface.XRGB1555: return ((r & 0xF8) << 7) | ((g & 0xF8) << 2) | (b >> 3);
+        case BinkSurface.RGB655:   return ((r & 0xFC) << 8) | ((g & 0xF8) << 2) | (b >> 3);
+        case BinkSurface.RGB664:   return ((r & 0xFC) << 8) | ((g & 0xFC) << 2) | (b >> 4);
+        default:                   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3); // RGB565
+    }
+}
+
+/** 4x4 Bayer thresholds, 0..15 — the same pattern the WASM RGB565 packer uses. */
+const BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+
 /**
- * Copy one row of decoded 32bpp pixels to a destination with the given bpp.
- * BGRA byte order: [B, G, R, A]. As little-endian u32: A<<24 | R<<16 | G<<8 | B.
+ * Ordered-dithered quantization of an 8-bit channel to n bits, in the quantizer's own
+ * domain: k = floor(v·(2ⁿ−1)/255 + t/16). Dithering v>>(8−n) instead sits half a step high
+ * once the surface is expanded back ((k<<3)|(k>>2)). `t` is the 0..15 Bayer threshold.
+ */
+export function quant(v: number, n: number, t: number): number {
+    const levels = (1 << n) - 1;
+    return ((v * levels * 16 + t * 255) / 4080) | 0;
+}
+
+/** pack16 with the Bayer threshold `t` applied to every colour channel. */
+export function pack16Dithered(surf: BinkSurface, b: number, g: number, r: number, a: number, t: number): number {
+    switch (surf) {
+        case BinkSurface.ARGB4444: return ((a & 0xF0) << 8) | (quant(r, 4, t) << 8) | (quant(g, 4, t) << 4) | quant(b, 4, t);
+        case BinkSurface.ARGB1555: return (a >= 0x80 ? 0x8000 : 0) | (quant(r, 5, t) << 10) | (quant(g, 5, t) << 5) | quant(b, 5, t);
+        case BinkSurface.XRGB1555: return (quant(r, 5, t) << 10) | (quant(g, 5, t) << 5) | quant(b, 5, t);
+        case BinkSurface.RGB655:   return (quant(r, 6, t) << 10) | (quant(g, 5, t) << 5) | quant(b, 5, t);
+        case BinkSurface.RGB664:   return (quant(r, 6, t) << 10) | (quant(g, 6, t) << 4) | quant(b, 4, t);
+        default:                   return (quant(r, 5, t) << 11) | (quant(g, 6, t) << 5) | quant(b, 5, t); // RGB565
+    }
+}
+
+/**
+ * Copy one row of decoded pixels into the destination format the game declared.
+ * The decoder emits BGRA: [B, G, R, A], i.e. little-endian u32 A<<24|R<<16|G<<8|B.
  *
- * For 16bpp: uses Uint32Array/Uint16Array views for ~3-5x speedup over byte-level.
- * For 32bpp: direct memcpy (already in native BGRA order for DDraw).
+ * The 16bpp packers use Uint32Array/Uint16Array views where alignment allows
+ * (~3-5x over byte-at-a-time); BINKSURFACE32 is already native DDraw order (memcpy).
+ * `ditherRow` >= 0 orders-dithers the 16bpp packing with that row's Bayer phase
+ * (quality.videoDither); -1 truncates, which is what the game's own blitter did.
  */
 function copyDecodedRow(
     src: Uint8Array, srcOff: number,
     dst: Uint8Array, dstOff: number,
-    width: number, destBpp: number,
+    width: number, surf: BinkSurface,
+    ditherRow = -1,
 ): void {
-    if (destBpp === 1) {
-        // 8-bit: BGRA → luminance as palette index (rough approximation)
-        for (let x = 0; x < width; x++) {
-            const si = srcOff + x * 4;
-            dst[dstOff + x] = (src[si + 2] * 77 + src[si + 1] * 150 + src[si] * 29) >> 8;
-        }
-    } else if (destBpp === 2) {
-        // BGRA → RGB565 via typed array views (bulk u32 read + u16 write)
-        const srcAbs = src.byteOffset + srcOff;
-        const dstAbs = dst.byteOffset + dstOff;
-        if ((srcAbs & 3) === 0 && (dstAbs & 1) === 0) {
-            const src32 = new Uint32Array(src.buffer, srcAbs, width);
-            const dst16 = new Uint16Array(dst.buffer, dstAbs, width);
-            for (let x = 0; x < width; x++) {
-                const px = src32[x];
-                // BGRA u32: A<<24|R<<16|G<<8|B → RGB565
-                dst16[x] = ((px & 0x00F80000) >>> 8) | ((px & 0x0000FC00) >> 5) | ((px & 0x000000F8) >> 3);
-            }
-        } else {
-            // Fallback for rare unaligned destinations
+    switch (surf) {
+        case BinkSurface.P8:
+            // BGRA → luminance as palette index (rough approximation)
             for (let x = 0; x < width; x++) {
                 const si = srcOff + x * 4;
-                const b0 = src[si], b1 = src[si + 1], b2 = src[si + 2];
-                const rgb565 = ((b2 >> 3) << 11) | ((b1 >> 2) << 5) | (b0 >> 3);
-                const di = dstOff + x * 2;
-                dst[di]     = rgb565 & 0xFF;
-                dst[di + 1] = (rgb565 >> 8) & 0xFF;
+                dst[dstOff + x] = (src[si + 2] * 77 + src[si + 1] * 150 + src[si] * 29) >> 8;
             }
+            return;
+
+        case BinkSurface.BGR24:
+            for (let x = 0; x < width; x++) {
+                const si = srcOff + x * 4;
+                const di = dstOff + x * 3;
+                dst[di] = src[si];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si + 2];
+            }
+            return;
+
+        case BinkSurface.RGB24:
+            for (let x = 0; x < width; x++) {
+                const si = srcOff + x * 4;
+                const di = dstOff + x * 3;
+                dst[di] = src[si + 2];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si];
+            }
+            return;
+
+        case BinkSurface.RGBA32:
+        case BinkSurface.RGBA32A:
+            for (let x = 0; x < width; x++) {
+                const si = srcOff + x * 4;
+                const di = dstOff + x * 4;
+                dst[di] = src[si + 2];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si];
+                dst[di + 3] = src[si + 3];
+            }
+            return;
+
+        case BinkSurface.BGRA32:
+        case BinkSurface.BGRA32A:
+            dst.set(src.subarray(srcOff, srcOff + width * 4), dstOff);
+            return;
+
+        default: {
+            const srcAbs = src.byteOffset + srcOff;
+            const dstAbs = dst.byteOffset + dstOff;
+            if (ditherRow >= 0) {
+                const th = (ditherRow & 3) * 4;
+                for (let x = 0; x < width; x++) {
+                    const si = srcOff + x * 4;
+                    const v = pack16Dithered(surf, src[si], src[si + 1], src[si + 2], src[si + 3], BAYER4[th + (x & 3)]);
+                    const di = dstOff + x * 2;
+                    dst[di]     = v & 0xFF;
+                    dst[di + 1] = (v >> 8) & 0xFF;
+                }
+            } else if ((srcAbs & 3) === 0 && (dstAbs & 1) === 0) {
+                const src32 = new Uint32Array(src.buffer, srcAbs, width);
+                const dst16 = new Uint16Array(dst.buffer, dstAbs, width);
+                for (let x = 0; x < width; x++) {
+                    const px = src32[x];
+                    dst16[x] = pack16(surf, px & 0xFF, (px >>> 8) & 0xFF, (px >>> 16) & 0xFF, (px >>> 24) & 0xFF);
+                }
+            } else {
+                for (let x = 0; x < width; x++) {
+                    const si = srcOff + x * 4;
+                    const v = pack16(surf, src[si], src[si + 1], src[si + 2], src[si + 3]);
+                    const di = dstOff + x * 2;
+                    dst[di]     = v & 0xFF;
+                    dst[di + 1] = (v >> 8) & 0xFF;
+                }
+            }
+            return;
         }
-    } else if (destBpp === 3) {
-        for (let x = 0; x < width; x++) {
-            const si = srcOff + x * 4;
-            const di = dstOff + x * 3;
-            dst[di] = src[si];
-            dst[di + 1] = src[si + 1];
-            dst[di + 2] = src[si + 2];
-        }
-    } else {
-        const bytes = width * 4;
-        dst.set(src.subarray(srcOff, srcOff + bytes), dstOff);
     }
 }
 
@@ -146,7 +386,6 @@ interface BinkSession {
     audioWrapCount:  number;
     audioBaselineMs: number;   // -1 = not set
     frameDecodeCount: number;
-    lastWaitYieldMs: number;   // throttles the cooperative yield in BinkWait
     destPtr: number;
     destPitch: number;
     destHeight: number;
@@ -155,11 +394,48 @@ interface BinkSession {
     destBpp: number;
     explicitDdrawSurface: DirectDrawSurfaceState | null;
     explicitGlideSurfacePtr: number;
+    /** Geometry of the D3D9 texture lock the last copy destination fell inside, if any.
+     *  Sampled at COPY time — the guest unlocks right after, and by the time the sink is
+     *  chosen the lock is gone. */
+    d3d9LockTarget: { pitch: number; width: number; height: number } | null;
+    /** Last observed value of the global D3D9 texture-upload counter, sampled per copy.
+     *  -1 until the first sample: the first observation establishes a baseline and cannot
+     *  itself be a change. */
+    lastTextureUploadSeq: number;
+    /** The app was SEEN uploading a texture between two of its own BinkCopyToBuffer calls.
+     *  That is the only observation that catches an app which copies into a private buffer
+     *  and locks its texture afterwards — the pointer tests never see the two coincide. */
+    appUploadsItsOwnFrames: boolean;
+    /** How many consecutive copies were followed by a texture upload in the same frame. */
+    uploadsInStepWithCopy: number;
+    /** Consecutive latch steps with no matching upload; the latch decays after this many. */
+    framesWithoutMatchingUpload: number;
+    /** frameDecodeCount the latch was last stepped for — the hint is asked twice per frame
+     *  (DoFrame and NextFrame) and a per-frame observation must not be counted twice. */
+    latchSteppedForFrame: number;
     lastCopyAtMs: number;
     hasBufferApiHint: boolean;
     hasPointerFault: boolean;
     videoOn: boolean;   // BinkSetVideoOnOff — mutes video path only, audio/timing keep running
     ioSize:  number;    // IO buffer size hint set by BinkSetIOSize before BinkOpen
+    /** videoflags from the 44-byte file header — the stream's own answer to "has alpha". */
+    videoFlags: number;
+    /** Guest-visible YUV planes, allocated on the first BinkGetFrameBuffersInfo. */
+    framePlanes: BinkFramePlanes | null;
+}
+
+/**
+ * The planes `BinkGetFrameBuffersInfo` publishes. Allocated once per session, on demand:
+ * a title that only ever calls BinkCopyToBuffer never pays for them.
+ */
+interface BinkFramePlanes {
+    /** Guest base address of the whole Y+cR+cB(+A) block. */
+    base: number;
+    geom: BinkPlaneGeometry;
+    /** Host-side staging for one conversion — blitted into guest memory in one write. */
+    scratch: Uint8Array;
+    /** frameDecodeCount the planes currently hold; -1 when never filled. */
+    filledForFrame: number;
 }
 
 interface BinkBufferSession {
@@ -183,6 +459,13 @@ export class BinkW32 implements IModule {
 
     /** Surface bpp determined by BinkDDSurfaceType (0 = not yet called) */
     private lastSurfaceBpp: number = 0;
+
+    /** HBINK field offsets for the binkw32.dll this title ships (see bink-struct.ts). */
+    private layout: BinkStructLayout = BINK_LAYOUT_DEFAULT;
+    /** In-flight or completed build resolution; null before the first load. A boolean
+     *  flag set at entry would let a BinkOpen arriving during the file read see
+     *  "resolved" and use the PREVIOUS game's layout. */
+    private buildResolution: Promise<void> | null = null;
     private nextBufferHandle = 0x7800;
     private binkBuffers = new Map<number, BinkBufferSession>();
 
@@ -208,7 +491,7 @@ export class BinkW32 implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     private writeU32(mem: Uint8Array, addr: number, value: number): void {
@@ -276,6 +559,10 @@ export class BinkW32 implements IModule {
 
     private updateExplicitSinkHints(s: BinkSession, surfacePtr: number): void {
         const bitmap = this.resolveBitmapTextureTarget(surfacePtr);
+        if (!bitmap) {
+            const locked = resolveD3D9LockedTextureTarget(surfacePtr);
+            if (locked) s.d3d9LockTarget = locked;
+        }
         s.explicitDdrawSurface = bitmap;
         if (bitmap && isRenderSurface(bitmap)) {
             setAuthorityCpu(bitmap);
@@ -291,17 +578,22 @@ export class BinkW32 implements IModule {
         destX: number,
         destY: number,
         storedBpp: number,
-    ): { destBpp: number; copyWidth: number; rows: number; destSurface: BitmapTextureSurface | null } {
+        flags: number,
+    ): { surf: BinkSurface; destBpp: number; copyWidth: number; rows: number; destSurface: BitmapTextureSurface | null } {
         const destSurface = this.resolveBitmapTextureTarget(destPtr);
+        const declared = binkSurfaceFromFlags(flags);
         const destRowPixels = inferDestRowPixels(pitch, storedBpp, destSurface);
-        const destBpp = storedBpp || detectDestBpp(pitch, destRowPixels || s.width);
+        const surf = declared !== -1
+            ? declared
+            : binkSurfaceFromBpp(storedBpp || detectDestBpp(pitch, destRowPixels || s.width));
+        const destBpp = binkSurfaceBpp(surf);
         const maxWidth = destRowPixels > 0 ? Math.max(0, destRowPixels - destX) : s.width;
         const maxHeight = destSurface
             ? Math.max(0, destSurface.height - destY)
             : Math.max(0, destH - destY);
         const copyWidth = Math.min(s.width, maxWidth);
         const rows = Math.min(s.height, destH - destY, maxHeight);
-        return { destBpp, copyWidth, rows, destSurface };
+        return { surf, destBpp, copyWidth, rows, destSurface };
     }
 
     private hasAppManagedSink(s: BinkSession): boolean {
@@ -315,7 +607,7 @@ export class BinkW32 implements IModule {
         return true;
     }
 
-    private getRoutingTargetHint(s: BinkSession): { kind: "none" | "ddraw_surface" | "glide_lfb" | "app_buffer"; valid: boolean; surfacePtr?: number; pitch?: number; width?: number; height?: number } {
+    private getRoutingTargetHint(s: BinkSession): { kind: "none" | "ddraw_surface" | "glide_lfb" | "app_buffer"; valid: boolean; surfacePtr?: number; pitch?: number; width?: number; height?: number; note?: string } {
         if (s.explicitDdrawSurface?.surfacePtr) {
             return {
                 kind: "ddraw_surface",
@@ -339,16 +631,111 @@ export class BinkW32 implements IModule {
         if (s.destPtr || s.hasBufferApiHint) {
             const gpuPresenter = isGpuVideoPresenterActive();
             const resolvedSurface = s.destPtr ? this.resolveBitmapTextureTarget(s.destPtr) : null;
+            // Real Bink presents NOTHING: BinkCopyToBuffer fills the app's buffer and stops
+            // there. Our video overlay exists only for the shape where the app's own upload
+            // path loses those pixels (Morrowind's D3D8 custom upload) — so the moment we can
+            // see that path running, the overlay is wrong: it composites the movie OVER the
+            // frame the app just drew, hiding the UI on top of it (Far Cry's menu, whose
+            // backdrop loop is copied into the game's own texture every frame).
+            // A D3D9 LockRect staging buffer is uploaded by the guest's own UnlockRect, so
+            // it stays visible under a GPU presenter — without this the sink falls back to
+            // the video overlay, which presents the movie OVER the game's own frame and
+            // hides the UI a menu draws on top of its background loop.
+            const lockedTexture = resolvedSurface
+                ? null
+                : (s.destPtr ? resolveD3D9LockedTextureTarget(s.destPtr) : null) ?? s.d3d9LockTarget;
+            // Asked twice per frame (DoFrame and NextFrame); the observation is per-frame.
+            if (s.latchSteppedForFrame !== s.frameDecodeCount) {
+                s.latchSteppedForFrame = s.frameDecodeCount;
+                const next = stepUploadLatch({
+                    latched: s.appUploadsItsOwnFrames,
+                    inStep: s.uploadsInStepWithCopy,
+                    framesWithoutMatch: s.framesWithoutMatchingUpload,
+                    lastUploadSeq: s.lastTextureUploadSeq,
+                }, {
+                    uploadSeq: d3d9TextureUploadSeq(),
+                    hasLockTarget: !!lockedTexture,
+                    msSinceCopy: performance.now() - s.lastCopyAtMs,
+                });
+                s.appUploadsItsOwnFrames = next.latched;
+                s.uploadsInStepWithCopy = next.inStep;
+                s.framesWithoutMatchingUpload = next.framesWithoutMatch;
+                s.lastTextureUploadSeq = next.lastUploadSeq;
+            }
             return {
                 kind: "app_buffer",
-                valid: !gpuPresenter || !!resolvedSurface,
+                valid: !gpuPresenter || !!resolvedSurface || !!lockedTexture || s.appUploadsItsOwnFrames,
+                // ALWAYS a string: the hint is merged field-by-field into the session, so an
+                // absent note leaves the previous one standing and the state then explains
+                // this decision with the reason for an older one.
+                note: !gpuPresenter ? "no gpu presenter"
+                    : resolvedSurface ? "resolved bitmap texture"
+                    : lockedTexture ? "d3d9 lock staging buffer"
+                    : s.appUploadsItsOwnFrames ? "app uploads in step with the copy"
+                    // Both halves: how far the cadence got, and how long it has been getting
+                    // nowhere. A detector that has never once matched reads exactly like one
+                    // that is merely mid-cadence unless the second number is printed too.
+                    : `no resolvable sink: uploadsInStep=${s.uploadsInStepWithCopy}/${UPLOAD_CADENCE_FRAMES}`
+                        + ` framesWithoutMatch=${s.framesWithoutMatchingUpload}`,
                 surfacePtr: s.destPtr || undefined,
-                pitch: s.destPitch || undefined,
-                width: resolvedSurface?.width ?? s.width,
-                height: resolvedSurface?.height ?? s.height,
+                pitch: s.destPitch || lockedTexture?.pitch || undefined,
+                width: resolvedSurface?.width ?? lockedTexture?.width ?? s.width,
+                height: resolvedSurface?.height ?? lockedTexture?.height ?? s.height,
             };
         }
         return { kind: "none", valid: false };
+    }
+
+    /**
+     * Allocate the guest-visible plane block for this session, once.
+     *
+     * Real Bink allocates the frame buffers inside BinkOpen (unless the app passed
+     * BINKNOFRAMEBUFFERS and registers its own), so by the time the app asks for them the
+     * pointers are already valid — which is exactly what it reads out of the struct. We
+     * defer the allocation to the first ask because most titles never take this path.
+     */
+    private ensureFramePlanes(s: BinkSession): BinkFramePlanes | null {
+        if (s.framePlanes) return s.framePlanes;
+        const geom = binkPlaneGeometry(s.width, s.height, !!(s.videoFlags & BINK_FLAG_ALPHA));
+        const base = this.process.memory.alloc(geom.totalBytes);
+        if (!base) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[BINK] frame buffers: cannot allocate ${geom.totalBytes} bytes for ${s.width}x${s.height}`);
+            return null;
+        }
+        const m = this.getMemory();
+        // Neutral YUV, not zero: an app that samples the planes before the first decode
+        // would otherwise get bright green (Y=0,cR=cB=0) rather than black.
+        m.fill(16, base + geom.yOffset, base + geom.cROffset);
+        m.fill(128, base + geom.cROffset, base + geom.aOffset);
+        if (geom.hasAlpha) m.fill(255, base + geom.aOffset, base + geom.totalBytes);
+        s.framePlanes = { base, geom, scratch: new Uint8Array(geom.totalBytes), filledForFrame: -1 };
+        Logger.log(LogCategory.SYSTEM,
+            `[BINK] frame buffers for 0x${s.guestPtr.toString(16)}: Y ${geom.yWidth}x${geom.yHeight}, ` +
+            `cRcB ${geom.cWidth}x${geom.cHeight}${geom.hasAlpha ? ", +A" : ""} @0x${base.toString(16)}`);
+        return s.framePlanes;
+    }
+
+    /**
+     * Convert the frame the decoder just produced into the published planes.
+     *
+     * Built host-side and blitted in ONE write: a per-byte store through the guest view
+     * costs ~40x, which at 1024x768 is the difference between a pass and a stall.
+     */
+    private fillFramePlanes(s: BinkSession): void {
+        const fp = s.framePlanes;
+        if (!fp || fp.filledForFrame === s.frameDecodeCount) return;
+        const bgra = videoEngine.getFrameBgra(s.engineHandle);
+        if (!bgra) return;
+        bgraToBinkPlanes(bgra, s.width, s.height, fp.scratch, fp.geom);
+        this.getMemory().set(fp.scratch, fp.base);
+        fp.filledForFrame = s.frameDecodeCount;
+    }
+
+    private releaseFramePlanes(s: BinkSession): void {
+        if (!s.framePlanes) return;
+        this.process.memory.free(s.framePlanes.base);
+        s.framePlanes = null;
     }
 
     private buildFrameViews(s: BinkSession): VideoFrameViews {
@@ -382,23 +769,6 @@ export class BinkW32 implements IModule {
      * Derive absolute audio playback time (ms) from the ring buffer's play cursor.
      * Detects wraps by checking if cursor jumped backward by more than half the buffer.
      */
-    /**
-     * Return the "not ready" code from BinkWait while cooperatively yielding the
-     * thread so DDraw present / audio / other threads can run instead of the
-     * guest JIT-grinding its poll loop. The yield is throttled to ≤1×/ms so the
-     * request itself stays cheap. (Mirrors SmackW32.markVideoWaitNotReady — this
-     * is a cooperative requestSwitch, NOT a busy-wait, so it frees the JS thread
-     * rather than stalling DDraw Blt the way an async/spin BinkWait would.)
-     */
-    private markVideoWaitNotReady(s: BinkSession): number {
-        const now = performance.now();
-        if (now - s.lastWaitYieldMs >= 1) {
-            s.lastWaitYieldMs = now;
-            System.getInstance().scheduler.requestSwitch();
-        }
-        return 1;
-    }
-
     private _getAudioTimeMs(s: BinkSession): number {
         if (!s.audioCtrl) return -1;
 
@@ -428,6 +798,7 @@ export class BinkW32 implements IModule {
      * DDraw Blt/BltFast handles all presentation — game controls position and order.
      */
     private _decodeFrame(s: BinkSession, bink: number): void {
+        if (s.engineHandle < 0) return;
         const ok = videoEngine.doFrame(s.engineHandle);
         s.lastFrameMs = performance.now();
         s.frameDecodeCount++;
@@ -438,25 +809,23 @@ export class BinkW32 implements IModule {
             if (t >= 0) s.audioBaselineMs = t;
         }
 
+        const L = this.layout;
         if (!ok) {
             s.eof = true;
             const m = this.getMemory();
-            const frames = this.readU32(m, bink + 8);
-            this.writeU32(m, bink + 12, frames);
+            const frames = this.readU32(m, bink + L.frames);
+            this.writeU32(m, bink + L.frameNum, frames);
             console.log(`[BINK] BinkDoFrame(0x${bink.toString(16)}): EOF (set FrameNum=${frames})`);
         } else {
-            // Populate dirty rects in HBINK struct so the game knows what changed.
-            // HoMM3's FUN_005979d0 calls BinkGetRects then reads:
-            //   +0x30 (48): rect X      +0x34 (52): rect Y
-            //   +0x38 (56): rect Width  +0x3C (60): rect Height
-            //   +0xB0 (176): rect count
-            // With zeros, the game blits a 0x0 region → video invisible.
+            // Publish one whole-frame dirty rect (BINKRECT {Left,Top,Width,Height}) plus
+            // NumRects. Games call BinkGetRects and blit exactly this region — left zero,
+            // they blit a 0x0 area and the video is invisible.
             const m = this.getMemory();
-            this.writeU32(m, bink + 48, 0);          // rect X
-            this.writeU32(m, bink + 52, 0);          // rect Y
-            this.writeU32(m, bink + 56, s.width);    // rect Width
-            this.writeU32(m, bink + 60, s.height);   // rect Height
-            this.writeU32(m, bink + 176, 1);         // 1 dirty rect
+            this.writeU32(m, bink + L.frameRects + 0, 0);
+            this.writeU32(m, bink + L.frameRects + 4, 0);
+            this.writeU32(m, bink + L.frameRects + 8, s.width);
+            this.writeU32(m, bink + L.frameRects + 12, s.height);
+            this.writeU32(m, bink + L.numRects, 1);
         }
     }
 
@@ -464,38 +833,33 @@ export class BinkW32 implements IModule {
      * Zero out the dirty-rect fields written by _decodeFrame so the game sees
      * no changed region and skips the blit — the video-off equivalent of
      * "nothing decoded this frame".
-     * Layout written by _decodeFrame:
-     *   +48  rect X    +52  rect Y    +56  rect W    +60  rect H    +176  count
      */
     private clearBinkDirtyRects(bink: number): void {
         const m = this.getMemory();
-        this.writeU32(m, bink + 48, 0);
-        this.writeU32(m, bink + 52, 0);
-        this.writeU32(m, bink + 56, 0);
-        this.writeU32(m, bink + 60, 0);
-        this.writeU32(m, bink + 176, 0);
+        const L = this.layout;
+        this.writeU32(m, bink + L.frameRects + 0, 0);
+        this.writeU32(m, bink + L.frameRects + 4, 0);
+        this.writeU32(m, bink + L.frameRects + 8, 0);
+        this.writeU32(m, bink + L.frameRects + 12, 0);
+        this.writeU32(m, bink + L.numRects, 0);
     }
 
     /**
      * Sync the native-ABI compat fields in the guest HBINK struct that real
-     * Bink sets when BinkSetVideoOnOff / BinkSetIOSize change state.
-     *
-     * Real HBINK layout (confirmed across SDK versions via reversing):
-     *   +32  flags   bit 0x20000 = video-disabled flag
-     *
-     * We write the flag into the flags word so games that read it directly
-     * (e.g. to decide whether to call CopyToBuffer) get the right value.
+     * Bink sets when BinkSetVideoOnOff / BinkSetIOSize change state: bit 0x20000
+     * of OpenFlags is the video-disabled flag. Games that read it directly (e.g.
+     * to decide whether to call CopyToBuffer) then see the right value.
      */
     private writeBinkCompatState(bink: number, s: BinkSession): void {
         const m = this.getMemory();
-        let flags = this.readU32(m, bink + 32);
+        let flags = this.readU32(m, bink + this.layout.openFlags);
         const VIDEO_OFF_FLAG = 0x00020000;
         if (s.videoOn) {
             flags &= ~VIDEO_OFF_FLAG;
         } else {
             flags |= VIDEO_OFF_FLAG;
         }
-        this.writeU32(m, bink + 32, flags);
+        this.writeU32(m, bink + this.layout.openFlags, flags);
     }
 
     private readCString(mem: Uint8Array, ptr: number, maxLen = 520): string {
@@ -530,6 +894,219 @@ export class BinkW32 implements IModule {
             Logger.error(LogCategory.SYSTEM, `[BinkW32] readVfsFile("${path}") error: ${e}`);
             return null;
         }
+    }
+
+    /**
+     * Read the first `count` bytes of a VFS file — enough for a container header, without
+     * pulling a 100 MB clip into memory to learn its dimensions.
+     */
+    private async readVfsHeader(path: string, count: number): Promise<Uint8Array | null> {
+        try {
+            const vfs = System.getInstance().fileSystem;
+            if (vfs.getFileSize(path) < count) return null;
+            const handle = await vfs.open(path, 0x80000000 /* GENERIC_READ */, 3 /* OPEN_EXISTING */);
+            if (!handle) return null;
+            const data = await vfs.read(handle, count);
+            return data.length >= count ? data : null;
+        } catch (e) {
+            Logger.error(LogCategory.SYSTEM, `[BinkW32] readVfsHeader("${path}") error: ${e}`);
+            return null;
+        }
+    }
+
+    /**
+     * skipVideo's BinkOpen: a real, already-finished stream.
+     *
+     * The file still has to EXIST and still has to be Bink — skipping playback is not a
+     * licence to answer for a clip the bundle does not carry, and a guest that handles a
+     * genuinely missing video must keep seeing that. What it gets instead of decoded
+     * frames is an HBINK whose FrameNum already equals Frames, so the guest's own loop
+     * observes end-of-stream on its next poll and completes normally.
+     *
+     * Dimensions come from the 44-byte Bink header rather than being invented: a guest
+     * sizes its video panel from HBINK before the first frame.
+     */
+    private async openSkippedBink(mem: Uint8Array, namePtr: number, flags: number): Promise<number> {
+        await this.ensureLayout();
+        const isFileHandle = !!(flags & 0x00800000);
+
+        let header: Uint8Array | null = null;
+        let label: string;
+        if (isFileHandle) {
+            const sys = System.getInstance();
+            const wrapper = sys.resourceProvider.getFileHandle(namePtr);
+            if (!wrapper || !wrapper.vfsHandle) return 0;
+            label = `HANDLE=0x${namePtr.toString(16)} (${wrapper.vfsHandle.path})`;
+            const vfs = sys.fileSystem;
+            // Duplicate the actual VFS handle rather than reopening by path. The path can
+            // resolve to a different overlay/archive member after the guest has advanced the
+            // original handle, while Win32 DuplicateHandle preserves the backing object and
+            // starts the duplicate at the requested cursor.
+            const temp = vfs.duplicateHandle(wrapper.vfsHandle, wrapper.position);
+            const data = await vfs.read(temp, BINK_HEADER_BYTES);
+            header = data.length >= BINK_HEADER_BYTES ? data : null;
+        } else {
+            const rawName = this.readCString(mem, namePtr);
+            if (!rawName) return 0;
+            label = `"${rawName}"`;
+            header = await this.readVfsHeader(rawName, BINK_HEADER_BYTES);
+        }
+
+        if (!header || header[0] !== 0x42 /* 'B' */ || header[1] !== 0x49 /* 'I' */ || header[2] !== 0x4B /* 'K' */) {
+            Logger.warn(LogCategory.SYSTEM,
+                `BinkOpen(${label}): skipVideo, but the file is missing or not Bink — failing the open honestly`);
+            return 0;
+        }
+
+        const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+        const frames = view.getUint32(8, true);
+        const width = view.getUint32(20, true);
+        const height = view.getUint32(24, true);
+        const fpsDividend = view.getUint32(28, true);
+        const fpsDivisor = view.getUint32(32, true) || 1;
+        const fps = fpsDividend / fpsDivisor;
+        const videoFlags = view.getUint32(BINK_HEADER_VIDEOFLAGS_OFFSET, true);
+
+        const L = this.layout;
+        const guestPtr = this.process.memory.alloc(BINK_HANDLE_SIZE);
+        const m = this.getMemory();
+        m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
+        this.writeU32(m, guestPtr + L.width, width);
+        this.writeU32(m, guestPtr + L.height, height);
+        if (L.widthAlt !== null) this.writeU32(m, guestPtr + L.widthAlt, width);
+        if (L.heightAlt !== null) this.writeU32(m, guestPtr + L.heightAlt, height);
+        this.writeU32(m, guestPtr + L.frames, frames);
+        // Already at the end — this is what makes the skip a COMPLETION, not a failure.
+        this.writeU32(m, guestPtr + L.frameNum, frames);
+        if (L.lastFrameNum !== null) this.writeU32(m, guestPtr + L.lastFrameNum, frames);
+        this.writeU32(m, guestPtr + L.frameRate, Math.round(fps) || 1);
+        this.writeU32(m, guestPtr + L.frameRateDiv, 1);
+
+        this.sessions.set(guestPtr, {
+            guestPtr, engineHandle: -1,
+            width, height, frameCount: frames, fps,
+            lastFrameMs: 0, paused: false, loggedCopy: false, eof: true,
+            audioCtrl: null, lastPlayCursor: 0,
+            audioWrapCount: 0, audioBaselineMs: -1,
+            frameDecodeCount: 0,
+            destPtr: 0, destPitch: 0, destHeight: 0, destX: 0, destY: 0, destBpp: 0,
+            explicitDdrawSurface: null, explicitGlideSurfacePtr: 0,
+            d3d9LockTarget: null, lastTextureUploadSeq: -1, appUploadsItsOwnFrames: false,
+            uploadsInStepWithCopy: 0, framesWithoutMatchingUpload: 0, latchSteppedForFrame: -1,
+            lastCopyAtMs: 0,
+            hasBufferApiHint: false, hasPointerFault: false,
+            videoOn: false,
+            ioSize: this.pendingIoSize,
+            videoFlags,
+            framePlanes: null,
+        });
+        Logger.log(LogCategory.SYSTEM,
+            `BinkOpen(${label}) → 0x${guestPtr.toString(16)} SKIPPED as a finished stream ` +
+            `(${width}×${height} ${frames}f)`);
+        return guestPtr;
+    }
+
+    /**
+     * Resolve everything that depends on WHICH binkw32.dll the bundle ships, before the
+     * guest can observe any of it.
+     *
+     * Must be awaited before the executable's imports are bound: {@link resolveCallAbi}
+     * fixes a RET N that gets emitted into guest code at stub-generation time, and a
+     * correction after that cannot reach a stub the guest already holds. The struct
+     * layout would tolerate being late; keeping both on one read of one file is what
+     * stops the two answers coming from different sources.
+     */
+    async prepareForBundle(): Promise<void> {
+        // Re-resolve per load: this module instance outlives a game switch, and carrying
+        // one title's Bink generation into the next is the same wrong answer, silently.
+        this.buildResolution = null;
+        await this.ensureLayout();
+    }
+
+    /**
+     * Resolve the SDK release the bundle ships, and with it everything the guest can
+     * observe about Bink: where it reads Frames/FrameNum/dirty rects, and how many bytes
+     * `_BinkSetVolume@8` pops. We stand in for that DLL, so its release — not the .bik
+     * file — decides both.
+     */
+    private async ensureLayout(): Promise<void> {
+        if (!this.buildResolution) this.buildResolution = this.resolveBuild();
+        await this.buildResolution;
+    }
+
+    private async resolveBuild(): Promise<void> {
+        const path = System.getInstance().process?.loader?.findDllPath("binkw32");
+        if (!path) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[BinkW32] binkw32.dll not found in the bundle — assuming Bink ${this.layout.id} struct ` +
+                `layout and the decorated ${BINK_SET_VOLUME_DECORATED_POPS}-byte BinkSetVolume cleanup. ` +
+                `A title on the 1.5+ ABI drifts its stack by 4 bytes per call.`);
+            return;
+        }
+        const image = await this.readVfsFile(path);
+        const version = image ? readPeVersionString(image, "FileVersion") : null;
+        // StringFileInfo is localizable text a build may omit; VS_FIXEDFILEINFO is the
+        // binary version every versioned image carries.
+        const fixed = image ? readPeFixedFileVersion(image) : null;
+        const build = selectBinkBuild(version)
+            ?? (fixed ? binkBuildFor(fixed.major, fixed.minor) : null);
+        // The export's own RET is evidence about THIS build, independent of the table.
+        const observedPops = image
+            ? readStdcallRetBytes(image, BINK_SET_VOLUME_EXPORT)
+            : null;
+
+        if (!build) {
+            Logger.error(LogCategory.SYSTEM,
+                `[BinkW32] ${path}: no readable version (FileVersion="${version ?? ""}", no VS_FIXEDFILEINFO) — ` +
+                `GUESSING HBINK layout ${this.layout.id}. If this DLL is 0.8x, Frames/FrameNum land 8 bytes ` +
+                `off and the guest's "video finished" test never fires.`);
+            // The body read is the only evidence left, so it decides the ABI alone.
+            this.applySetVolumePops(observedPops, path, "the export's own RET (no version)");
+            return;
+        }
+        this.layout = build.layout;
+        Logger.log(LogCategory.SYSTEM,
+            `[BinkW32] ${path}: FileVersion="${version ?? "?"}"` +
+            `${fixed ? ` fixed=${fixed.major}.${fixed.minor}.${fixed.build}.${fixed.revision}` : ""}` +
+            ` → Bink ${build.id} (Frames@0x${this.layout.frames.toString(16)} ` +
+            `FrameNum@0x${this.layout.frameNum.toString(16)} rects@0x${this.layout.frameRects.toString(16)})`);
+
+        // The table decides for a release we have disassembled; the body read is the
+        // cross-check, and a disagreement means one of the two is wrong about a real DLL
+        // — it must never pass quietly. Outside the measured releases the table is
+        // interpolation, so the evidence wins and says that it did.
+        if (build.measured) {
+            if (observedPops !== null && observedPops !== build.setVolumePops) {
+                Logger.error(LogCategory.SYSTEM,
+                    `[BinkW32] ${path}: ${BINK_SET_VOLUME_EXPORT} RET ${observedPops}, but Bink ${build.id} ` +
+                    `is recorded as popping ${build.setVolumePops} — the table is wrong about a shipped DLL, ` +
+                    `or the return was misread. Using the table; fix bink-struct.ts.`);
+            }
+            this.applySetVolumePops(build.setVolumePops, path, `the Bink ${build.id} table`);
+            return;
+        }
+        Logger.warn(LogCategory.SYSTEM,
+            `[BinkW32] ${path}: Bink ${build.id} is outside the releases we have disassembled — ` +
+            `${observedPops !== null
+                ? `taking ${BINK_SET_VOLUME_EXPORT}'s own RET ${observedPops}`
+                : `and its RET is unreadable, so falling back to ${build.setVolumePops}`}.`);
+        this.applySetVolumePops(observedPops ?? build.setVolumePops, path,
+            observedPops !== null ? "the export's own RET (unmeasured release)" : "an unmeasured table entry");
+    }
+
+    /** Publish the BinkSetVolume cleanup, unless it is what the descriptor already declares. */
+    private applySetVolumePops(pops: number | null, path: string, source: string): void {
+        if (pops === null) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[BinkW32] ${path}: ${BINK_SET_VOLUME_EXPORT}'s cleanup is unknown — keeping the decorated ` +
+                `${BINK_SET_VOLUME_DECORATED_POPS} bytes. A 1.5+ caller pushes 12 and drifts by 4.`);
+            return;
+        }
+        if (pops === BINK_SET_VOLUME_DECORATED_POPS) return;
+        APIRegistry.getInstance().overrideStackCleanupBytes("binkw32", BINK_SET_VOLUME_EXPORT, pops);
+        Logger.log(LogCategory.SYSTEM,
+            `[BinkW32] ${path}: ${BINK_SET_VOLUME_EXPORT} pops ${pops} (not the decorated ` +
+            `${BINK_SET_VOLUME_DECORATED_POPS}), per ${source} — stub cleanup overridden`);
     }
 
     initialize(process: Process): void {
@@ -600,9 +1177,20 @@ export class BinkW32 implements IModule {
             return 0;
         };
 
-        // BinkSetVolume — no-op
+        // BinkSetVolume — no-op. Two ABI generations ship under this name: pre-1.9
+        // BinkSetVolume(HBINK, S32 volume) and 1.9+ BinkSetVolume(HBINK, U32 trackid,
+        // S32 volume). Both must be DECLARED: with only one, the registry's
+        // single-variant base-name fallback sizes the other from it, and the stub's
+        // RET N then differs from what the caller pushed. A 4-byte ESP drift moves every
+        // local in the caller's frame, so the fault lands far away with nothing pointing
+        // back here; matching the decorated ABI keeps the caller's stack frame intact.
         this.exports["_BinkSetVolume@12"] = (_ctx, _mem, args) => {
             console.log(`[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, track=${args[1]}, vol=${args[2]})`);
+            return 0;
+        };
+        this.exports["_BinkSetVolume@8"] = (_ctx, _mem, args) => {
+            Logger.verbose(LogCategory.SYSTEM,
+                `[BINK] BinkSetVolume(bink=0x${args[0].toString(16)}, vol=${args[1]})`);
             return 0;
         };
 
@@ -675,16 +1263,18 @@ export class BinkW32 implements IModule {
             const namePtr = args[0];
             const flags   = args[1];
 
-            // skipVideo: return 0 (stub) to skip video playback entirely
+            // skipVideo must preserve the successful-open contract: a NULL HBINK would route
+            // the guest through an error path, while an already-complete stream lets normal
+            // completion handling run without exposing a decodable video frame.
             if (EmulatorConfig.getInstance().skipVideo) {
-                console.log(`[BINK] BinkOpen: SKIPPED (skipVideo=true)`);
-                return 0;
+                return await this.openSkippedBink(mem, namePtr, flags);
             }
 
-            // BINKFILEHANDLE: arg0 is a Win32 HANDLE, not a string pointer.
-            // Different Bink SDK versions use different flag bits:
-            //   Bink 1.x: 0x00800000, some versions: 0x08000000
-            const isFileHandle = !!(flags & (0x00800000 | 0x08000000));
+            await this.ensureLayout();
+
+            // BINKFILEHANDLE is the only flag that changes arg0 from a filename pointer to a
+            // Win32 HANDLE; the neighbouring I/O flags do not change its argument type.
+            const isFileHandle = !!(flags & 0x00800000);
 
             let bytes: Uint8Array | null = null;
             let label: string;
@@ -780,15 +1370,20 @@ export class BinkW32 implements IModule {
                 if (!info) { videoEngine.close(engineHandle); return 0; }
 
                 /* Allocate guest BinkHandle struct */
+                const L = this.layout;
                 const guestPtr = process.memory.alloc(BINK_HANDLE_SIZE);
                 const m = this.getMemory();
                 m.fill(0, guestPtr, guestPtr + BINK_HANDLE_SIZE);
-                this.writeU32(m, guestPtr +  0, info.width);
-                this.writeU32(m, guestPtr +  4, info.height);
-                this.writeU32(m, guestPtr +  8, info.frameCount);
-                this.writeU32(m, guestPtr + 12, info.currentFrame);
-                this.writeU32(m, guestPtr + 16, Math.round(info.fps));
-                this.writeU32(m, guestPtr + 20, 1);
+                this.writeU32(m, guestPtr + L.width, info.width);
+                this.writeU32(m, guestPtr + L.height, info.height);
+                if (L.widthAlt !== null) this.writeU32(m, guestPtr + L.widthAlt, info.width);
+                if (L.heightAlt !== null) this.writeU32(m, guestPtr + L.heightAlt, info.height);
+                this.writeU32(m, guestPtr + L.frames, info.frameCount);
+                this.writeU32(m, guestPtr + L.frameNum, info.currentFrame);
+                if (L.lastFrameNum !== null) this.writeU32(m, guestPtr + L.lastFrameNum, info.currentFrame);
+                this.writeU32(m, guestPtr + L.frameRate, Math.round(info.fps));
+                this.writeU32(m, guestPtr + L.frameRateDiv, 1);
+                this.writeU32(m, guestPtr + L.size, bytes.length);
 
                 const session: BinkSession = {
                     guestPtr, engineHandle,
@@ -798,7 +1393,6 @@ export class BinkW32 implements IModule {
                     audioCtrl: null, lastPlayCursor: 0,
                     audioWrapCount: 0, audioBaselineMs: -1,
                     frameDecodeCount: 0,
-                    lastWaitYieldMs: 0,
                     destPtr: 0,
                     destPitch: 0,
                     destHeight: 0,
@@ -807,11 +1401,22 @@ export class BinkW32 implements IModule {
                     destBpp: 0,
                     explicitDdrawSurface: null,
                     explicitGlideSurfacePtr: 0,
+                    d3d9LockTarget: null,
+                    lastTextureUploadSeq: -1,
+                    appUploadsItsOwnFrames: false,
+                    uploadsInStepWithCopy: 0,
+                    framesWithoutMatchingUpload: 0,
+                    latchSteppedForFrame: -1,
                     lastCopyAtMs: 0,
                     hasBufferApiHint: false,
                     hasPointerFault: false,
                     videoOn: true,
                     ioSize:  this.pendingIoSize,
+                    videoFlags: bytes.length > BINK_HEADER_VIDEOFLAGS_OFFSET + 4
+                        ? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+                            .getUint32(BINK_HEADER_VIDEOFLAGS_OFFSET, true)
+                        : 0,
+                    framePlanes: null,
                 };
 
                 // Wire up audio SAB for sync pacing
@@ -852,12 +1457,13 @@ export class BinkW32 implements IModule {
         this.exports["_BinkDoFrame@4"] = (_ctx, _mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
-            if (!s) return 0;
+            if (!s || s.engineHandle < 0) return 0;
             this._logApi(bink, "DoFrame", `paused=${s.paused} eof=${s.eof}`);
 
             if (s.paused || s.eof) return 0;
 
             this._decodeFrame(s, bink);
+            if (!s.eof) this.fillFramePlanes(s);
             if (!s.eof && s.videoOn) {
                 System.getInstance().videoRouting.onFrameDecoded({
                     codec: "bink",
@@ -873,6 +1479,82 @@ export class BinkW32 implements IModule {
             return 0;
         };
 
+        // ── BinkGetFrameBuffersInfo(HBINK, BINKFRAMEBUFFERS*) ───────────────────
+        // Publishes the plane geometry AND the plane pointers. A title that converts
+        // YUV→RGB itself reads both out of this struct, so answering without writing it
+        // hands the caller uninitialised stack to dereference.
+        this.exports["_BinkGetFrameBuffersInfo@8"] = (_ctx, _mem, args) => {
+            const bink = args[0];
+            const out  = args[1];
+            const s = this.sessions.get(bink);
+            if (!s) return 0;
+            if (!this.validateWritableSpan(out, BINKFRAMEBUFFERS_SIZE)) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `[BINK] BinkGetFrameBuffersInfo(0x${bink.toString(16)}): unwritable target 0x${out.toString(16)}`);
+                return 0;
+            }
+            this._logApi(bink, "GetFrameBuffersInfo", `out=0x${out.toString(16)}`);
+
+            const fp = this.ensureFramePlanes(s);
+            const m = this.getMemory();
+            m.fill(0, out, out + BINKFRAMEBUFFERS_SIZE);
+            if (!fp) return 0;
+            const g = fp.geom;
+
+            // One buffer set: we decode into a single frame's planes, so FrameNum — the set
+            // the last decode landed in — is always 0. Claiming two would promise the caller
+            // a second set that never changes.
+            this.writeU32(m, out + BFB.TotalFrames, 1);
+            this.writeU32(m, out + BFB.YABufferWidth, g.yWidth);
+            this.writeU32(m, out + BFB.YABufferHeight, g.yHeight);
+            this.writeU32(m, out + BFB.cRcBBufferWidth, g.cWidth);
+            this.writeU32(m, out + BFB.cRcBBufferHeight, g.cHeight);
+            this.writeU32(m, out + BFB.FrameNum, 0);
+
+            // Allocate=0 says "Bink owns this buffer, here it is" — the answer for a stream
+            // opened WITHOUT BINKNOFRAMEBUFFERS, which is the only shape we serve.
+            const plane = (p: BinkPlane, ptr: number, pitch: number) => {
+                const o = out + planeOffset(0, p);
+                this.writeU32(m, o + 0, 0);
+                this.writeU32(m, o + 4, ptr);
+                this.writeU32(m, o + 8, pitch);
+            };
+            plane(BinkPlane.Y,  fp.base + g.yOffset,  g.yWidth);
+            plane(BinkPlane.cR, fp.base + g.cROffset, g.cWidth);
+            plane(BinkPlane.cB, fp.base + g.cBOffset, g.cWidth);
+            if (g.hasAlpha) plane(BinkPlane.A, fp.base + g.aOffset, g.yWidth);
+
+            // A stream already decoded past (skipVideo, or a mid-playback query) must not
+            // publish planes that no decode will ever fill.
+            this.fillFramePlanes(s);
+            return 1;
+        };
+
+        // ── BinkShouldSkip(HBINK) ───────────────────────────────────────────────
+        // "Is playback far enough behind that this frame should be decoded but not
+        // shown?" Real Bink answers from the audio clock; so do we. A stream with no
+        // audio has no clock to fall behind, and a finished one has nothing to skip.
+        this.exports["_BinkShouldSkip@4"] = (_ctx, _mem, args) => {
+            const bink = args[0];
+            const s = this.sessions.get(bink);
+            if (!s || s.eof || s.paused || s.engineHandle < 0) return 0;
+            if (!s.audioCtrl || s.audioBaselineMs < 0 || s.fps <= 0) return 0;
+            const audioMs = this._getAudioTimeMs(s);
+            if (audioMs < 0) return 0;
+            const frameMs = 1000 / s.fps;
+            const videoMs = s.frameDecodeCount * frameMs;
+            // One whole frame behind is the point past which showing it is worse than
+            // dropping it — the same threshold Bink's own pacing uses.
+            return (audioMs - s.audioBaselineMs) - videoMs > frameMs ? 1 : 0;
+        };
+
+        // ── BinkOpenDirectSound(LPDIRECTSOUND) ──────────────────────────────────
+        // Passed to BinkSetSoundSystem as a FUNCTION POINTER; Bink calls it at open time
+        // to bind the track to DirectSound. Our audio path already owns output, so binding
+        // succeeds with nothing to do — but it must say so, because 0 means "no sound
+        // system" and the guest then plays the movie mute.
+        this.exports["_BinkOpenDirectSound@4"] = (_ctx, _mem, _args) => 1;
+
         // в”Ђв”Ђ BinkCopyToBuffer(HBINK, void* buf, pitch, h, x, y, flags) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         this.exports["_BinkCopyToBuffer@28"] = (_ctx, _mem, args) => {
             const bink    = args[0];
@@ -884,17 +1566,17 @@ export class BinkW32 implements IModule {
             const rawFlags = args[6];
 
             const s = this.sessions.get(bink);
-            if (!s || !destPtr) return 0;
+            if (!s || s.engineHandle < 0 || !destPtr) return 0;
             this._logApi(bink, "CopyToBuffer", `dest=0x${destPtr.toString(16)} pitch=${pitch}`);
 
-            const { destBpp, copyWidth, rows, destSurface } = this.getCopyGeometry(
-                s, destPtr, pitch, destH, destX, destY, this.lastSurfaceBpp,
+            const { surf, destBpp, copyWidth, rows, destSurface } = this.getCopyGeometry(
+                s, destPtr, pitch, destH, destX, destY, this.lastSurfaceBpp, rawFlags,
             );
             if (!s.loggedCopy) {
                 s.loggedCopy = true;
-                console.log(`[BINK] BinkCopyToBuffer: bink=0x${bink.toString(16)} dest=0x${destPtr.toString(16)} ` +
+                Logger.log(LogCategory.SYSTEM, `[BINK] BinkCopyToBuffer: bink=0x${bink.toString(16)} dest=0x${destPtr.toString(16)} ` +
                     `pitch=${pitch} destH=${destH} destX=${destX} destY=${destY} flags=0x${rawFlags.toString(16)} ` +
-                    `video=${s.width}x${s.height} copy=${copyWidth}x${rows} destBpp=${destBpp} ` +
+                    `video=${s.width}x${s.height} copy=${copyWidth}x${rows} surf=${surf} destBpp=${destBpp} ` +
                     `storedBpp=${this.lastSurfaceBpp} d3d8=${destSurface ? `${destSurface.width}x${destSurface.height}` : "no"}`);
             }
 
@@ -925,7 +1607,7 @@ export class BinkW32 implements IModule {
             };
 
             // 8bpp: use PAL8 indices directly if available
-            if (destBpp === 1) {
+            if (surf === BinkSurface.P8) {
                 const pal8 = videoEngine.getFramePal8(s.engineHandle);
                 if (pal8) {
                     for (let row = 0; row < rows; row++) {
@@ -959,8 +1641,9 @@ export class BinkW32 implements IModule {
                 return 0;
             }
 
-            // 16bpp: prefer WASM-side RGB565 (memcpy per row, ~8-15x faster)
-            if (destBpp === 2) {
+            // RGB565 only: the WASM-side packer emits exactly that layout (memcpy per row,
+            // ~8-15x faster). Every other 16bpp BINKSURFACE goes through pack16.
+            if (surf === BinkSurface.RGB565) {
                 const rgb565 = videoEngine.getFrameRgb565(s.engineHandle);
                 if (rgb565) {
                     const srcPitch = s.width * 2;
@@ -979,16 +1662,16 @@ export class BinkW32 implements IModule {
                 // Fallthrough: use JS-side typed array conversion (Tier 1)
             }
 
-            // 16bpp (fallback) / 32bpp: use BGRA frame
             const bgra = videoEngine.getFrameBgra(s.engineHandle);
             if (!bgra) return 0;
 
             const srcPitch = s.width * 4;
             const rowScratch = new Uint8Array(copyWidth * destBpp);
+            const dither = destBpp === 2 && EmulatorConfig.getInstance().quality.videoDither;
             for (let row = 0; row < rows; row++) {
                 const srcOff = row * srcPitch;
                 const dstOff = destPtr + (destY + row) * pitch + destX * destBpp;
-                copyDecodedRow(bgra, srcOff, rowScratch, 0, copyWidth, destBpp);
+                copyDecodedRow(bgra, srcOff, rowScratch, 0, copyWidth, surf, dither ? row : -1);
                 if (!this.writeBytesChecked(dstOff, rowScratch)) {
                     markPointerFault();
                     return 0;
@@ -1010,16 +1693,32 @@ export class BinkW32 implements IModule {
             const srcT    = args[7];
             const srcW    = args[8];
             const srcH2   = args[9];
+            const rawFlags = args[10];
 
             const s = this.sessions.get(bink);
-            if (!s || !destPtr) return 0;
+            if (!s || s.engineHandle < 0 || !destPtr) return 0;
             this._logApi(bink, "CopyToBufferRect", `dest=0x${destPtr.toString(16)} pitch=${pitch}`);
 
             const clipH = Math.min(srcH2, destH - destY, s.height - srcT);
             const clipW = Math.min(srcW, s.width - srcL);
             if (clipH <= 0 || clipW <= 0) return 0;
 
-            const destBpp = this.lastSurfaceBpp || detectDestBpp(pitch, clipW || inferDestRowPixels(pitch, this.lastSurfaceBpp, this.resolveBitmapTextureTarget(destPtr)));
+            const declared = binkSurfaceFromFlags(rawFlags);
+            const destSurface = this.resolveBitmapTextureTarget(destPtr);
+            // The heuristic needs the DESTINATION row width; clipW is the source rect's.
+            const surf = declared !== -1
+                ? declared
+                : binkSurfaceFromBpp(
+                    this.lastSurfaceBpp
+                    || detectDestBpp(pitch, inferDestRowPixels(pitch, this.lastSurfaceBpp, destSurface) || s.width));
+            const destBpp = binkSurfaceBpp(surf);
+            if (!s.loggedCopy) {
+                s.loggedCopy = true;
+                Logger.log(LogCategory.SYSTEM, `[BINK] BinkCopyToBufferRect: bink=0x${bink.toString(16)} dest=0x${destPtr.toString(16)} ` +
+                    `pitch=${pitch} destH=${destH} destX=${destX} destY=${destY} flags=0x${rawFlags.toString(16)} ` +
+                    `video=${s.width}x${s.height} copy=${clipW}x${clipH} surf=${surf} destBpp=${destBpp} ` +
+                    `storedBpp=${this.lastSurfaceBpp} d3d8=${destSurface ? `${destSurface.width}x${destSurface.height}` : "no"}`);
+            }
             s.destPtr = destPtr;
             s.destPitch = pitch;
             s.destHeight = destH;
@@ -1044,8 +1743,8 @@ export class BinkW32 implements IModule {
                 s.explicitGlideSurfacePtr = 0;
             };
 
-            // 16bpp: prefer WASM-side RGB565 (memcpy per row)
-            if (destBpp === 2) {
+            // RGB565 only — see BinkCopyToBuffer.
+            if (surf === BinkSurface.RGB565) {
                 const rgb565 = videoEngine.getFrameRgb565(s.engineHandle);
                 if (rgb565) {
                     const fullSrcPitch = s.width * 2;
@@ -1067,10 +1766,11 @@ export class BinkW32 implements IModule {
 
             const fullSrcPitch = s.width * 4;
             const rowScratch = new Uint8Array(clipW * destBpp);
+            const dither = destBpp === 2 && EmulatorConfig.getInstance().quality.videoDither;
             for (let row = 0; row < clipH; row++) {
                 const srcOff = (srcT + row) * fullSrcPitch + srcL * 4;
                 const dstOff = destPtr + (destY + row) * pitch + destX * destBpp;
-                copyDecodedRow(bgra, srcOff, rowScratch, 0, clipW, destBpp);
+                copyDecodedRow(bgra, srcOff, rowScratch, 0, clipW, surf, dither ? srcT + row : -1);
                 if (!this.writeBytesChecked(dstOff, rowScratch)) {
                     markPointerFault();
                     return 0;
@@ -1083,7 +1783,7 @@ export class BinkW32 implements IModule {
         this.exports["_BinkNextFrame@4"] = (_ctx, _mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
-            if (!s) return 0;
+            if (!s || s.engineHandle < 0) return 0;
             this._logApi(bink, "NextFrame");
             if (!s.paused && !s.eof) {
                 System.getInstance().videoRouting.onFrameFinalize({
@@ -1096,24 +1796,43 @@ export class BinkW32 implements IModule {
                     explicitGlideSink: null,
                 });
             }
+            const m0 = this.getMemory();
+            const prevFrame = this.readU32(m0, bink + this.layout.frameNum);
+            const frames = this.readU32(m0, bink + this.layout.frames);
+            // Bink LOOPS: BinkNextFrame on the last frame returns to frame 1. A backdrop loop
+            // is written as decode → copy → BinkNextFrame with no seek of its own, so the wrap
+            // has to happen here or the menu freezes on the closing frame for ever. Advancing
+            // the guest counter alone is not the wrap: the DECODER stays parked at EOF, and
+            // `eof` then makes BinkDoFrame return before decoding anything again.
+            if (s.eof || (frames > 0 && prevFrame >= frames)) {
+                videoEngine.gotoFrame(s.engineHandle, 0);
+                s.eof = false;
+                rebaseBinkPacing(s);
+                Logger.log(LogCategory.SYSTEM,
+                    `[BinkW32] BinkNextFrame(0x${bink.toString(16)}): wrap ${prevFrame}/${frames} -> 1`);
+                this.writeU32(m0, bink + this.layout.frameNum, 1);
+                if (this.layout.lastFrameNum !== null) {
+                    this.writeU32(m0, bink + this.layout.lastFrameNum, prevFrame);
+                }
+                return 0;
+            }
             videoEngine.nextFrame(s.engineHandle);
-            /* Update FrameNum in guest struct */
+            /* Update FrameNum / LastFrameNum in guest struct */
             const info = videoEngine.getInfo(s.engineHandle);
             if (info) {
                 const m = this.getMemory();
-                this.writeU32(m, bink + 12, info.currentFrame);
+                this.writeU32(m, bink + this.layout.frameNum, info.currentFrame);
+                if (this.layout.lastFrameNum !== null) {
+                    this.writeU32(m, bink + this.layout.lastFrameNum, prevFrame);
+                }
             }
             return 0;
         };
 
         // в”Ђв”Ђ BinkWait(HBINK) → 0 = ready, 1 = not ready в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
-        // MUST be sync — games poll BinkWait in their own event loop:
-        //   while (bink_open) { pump_messages(); if (!BinkWait(h)) { DoFrame(); CopyToBuffer(); render(); } }
-        // HoMM3 decompilation (FUN_0044dd20) confirms: BinkWait is called inside
-        // FUN_0044daa0, result stored in DAT_00694ce0, then the OUTER loop calls
-        // FUN_005979d0 (DDraw Unlock→Blt→Lock) only when DAT_00694ce0==1.
-        // An async BinkWait would block FUN_0044daa0, preventing the outer loop
-        // from ever reaching the DDraw render call.
+        // A non-blocking poll, as in the SDK: callers poll BinkWait from their own loop and
+        // keep rendering/pumping between frames, so "not yet" must return at once — holding
+        // the thread to the frame deadline throttles the whole loop to the video's fps.
         this.exports["_BinkWait@4"] = (_ctx, _mem, args) => {
             const bink = args[0];
             const s = this.sessions.get(bink);
@@ -1124,21 +1843,14 @@ export class BinkW32 implements IModule {
 
             const msPerFrame = 1000 / s.fps;
 
-            // Audio-synced pacing (preferred): pace frames to the audio clock via
-            // a fixed-timestep target (baseline + frameCount*msPerFrame) instead of
-            // re-anchoring to now() each frame, so decode time doesn't leak in and
-            // video stays locked to audio over long clips. The 3x-wall-clock safety
-            // valve forces ready if the audio clock stalls/lags — this is the guard
-            // the earlier wall-clock-only version lacked (which is why a naive
-            // audio-sync attempt could throttle to ~5fps permanently).
+            // Anchor to the audio baseline and decoded-frame count; a bounded wall-clock
+            // fallback prevents a stalled audio clock from blocking playback.
             if (s.audioBaselineMs >= 0 && s.audioCtrl) {
-                const targetAudioMs = s.audioBaselineMs + s.frameDecodeCount * msPerFrame;
+                const targetAudioMs = binkWaitTargetMs(s, msPerFrame);
                 const audioMs = this._getAudioTimeMs(s);
                 if (audioMs >= 0 && audioMs < targetAudioMs) {
                     const wallElapsed = performance.now() - s.lastFrameMs;
-                    if (wallElapsed < msPerFrame * 3) {
-                        return this.markVideoWaitNotReady(s);
-                    }
+                    if (wallElapsed < msPerFrame * 3) return 1;
                 }
                 return 0; // ready
             }
@@ -1146,7 +1858,7 @@ export class BinkW32 implements IModule {
             // Fallback: wall-clock pacing (no active audio to sync against).
             const elapsed = performance.now() - s.lastFrameMs;
             if (elapsed < msPerFrame - 2) {
-                return this.markVideoWaitNotReady(s);
+                return 1;
             }
             return 0; // ready
         };
@@ -1156,11 +1868,15 @@ export class BinkW32 implements IModule {
             const bink  = args[0];
             const frame = args[1];
             const s = this.sessions.get(bink);
-            if (!s) return 0;
-            videoEngine.gotoFrame(s.engineHandle, frame);
+            if (!s || s.engineHandle < 0) return 0;
+            // Bink numbers frames from 1; the decoder indexes from 0 (its `current_frame`
+            // becomes 1 only after the first frame is decoded). Passing the guest's number
+            // through unconverted seeks one frame past the requested one.
+            videoEngine.gotoFrame(s.engineHandle, Math.max(0, frame - 1));
             s.eof = false; // seeking resets EOF state
+            rebaseBinkPacing(s); // the timeline moved; BinkWait's anchors must move with it
             const m = this.getMemory();
-            this.writeU32(m, bink + 12, frame);
+            this.writeU32(m, bink + this.layout.frameNum, frame);
             return 0;
         };
 
@@ -1173,6 +1889,7 @@ export class BinkW32 implements IModule {
                 Logger.verbose(LogCategory.SYSTEM, `BinkClose(0x${bink.toString(16)}): unknown handle`);
                 return 0;
             }
+            this.releaseFramePlanes(s);
             videoEngine.close(s.engineHandle);
             (self as any).postMessage({ type: 'video_end' });
             System.getInstance().videoRouting.closeSession("bink", bink);
@@ -1287,5 +2004,17 @@ export class BinkW32 implements IModule {
         };
         this.exports["_BinkGetError@0"]      = (_ctx, _mem, _args) => { console.log(`[BINK] BinkGetError() → null`); return 0; };
         this.exports["_BinkLogoAddress@0"]   = (_ctx, _mem, _args) => 0;
+    }
+
+    reset(): void {
+        // Engines already closed by System.reset → videoEngine.closeAll().
+        this.sessions.clear();
+        this.binkBuffers.clear();
+        this.apiCallLog.clear();
+        this.lastSurfaceBpp = 0;
+        this.layout = BINK_LAYOUT_DEFAULT;
+        this.buildResolution = null;
+        this.nextBufferHandle = 0x7800;
+        this.pendingIoSize = 0;
     }
 }

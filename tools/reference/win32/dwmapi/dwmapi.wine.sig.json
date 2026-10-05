@@ -1,0 +1,115 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.888Z",
+  "module": "dwmapi",
+  "functions": [
+    {
+      "name": "DwmAttachMilContent",
+      "argCount": 1
+    },
+    {
+      "name": "DwmDefWindowProc",
+      "argCount": 5
+    },
+    {
+      "name": "DwmDetachMilContent",
+      "argCount": 1
+    },
+    {
+      "name": "DwmEnableBlurBehindWindow",
+      "argCount": 2
+    },
+    {
+      "name": "DwmEnableComposition",
+      "argCount": 1
+    },
+    {
+      "name": "DwmEnableMMCSS",
+      "argCount": 1
+    },
+    {
+      "name": "DwmExtendFrameIntoClientArea",
+      "argCount": 2
+    },
+    {
+      "name": "DwmFlush",
+      "argCount": 0
+    },
+    {
+      "name": "DwmGetColorizationColor",
+      "argCount": 2
+    },
+    {
+      "name": "DwmGetCompositionTimingInfo",
+      "argCount": 2
+    },
+    {
+      "name": "DwmGetGraphicsStreamClient",
+      "argCount": 2
+    },
+    {
+      "name": "DwmGetGraphicsStreamTransformHint",
+      "argCount": 2
+    },
+    {
+      "name": "DwmGetTransportAttributes",
+      "argCount": 3
+    },
+    {
+      "name": "DwmGetWindowAttribute",
+      "argCount": 4
+    },
+    {
+      "name": "DwmInvalidateIconicBitmaps",
+      "argCount": 1
+    },
+    {
+      "name": "DwmIsCompositionEnabled",
+      "argCount": 1
+    },
+    {
+      "name": "DwmpGetColorizationParameters",
+      "argCount": 1
+    },
+    {
+      "name": "DwmRegisterThumbnail",
+      "argCount": 3
+    },
+    {
+      "name": "DwmSetIconicLivePreviewBitmap",
+      "argCount": 4
+    },
+    {
+      "name": "DwmSetIconicThumbnail",
+      "argCount": 3
+    },
+    {
+      "name": "DwmSetPresentParameters",
+      "argCount": 2
+    },
+    {
+      "name": "DwmSetWindowAttribute",
+      "argCount": 4
+    },
+    {
+      "name": "DwmShowContact",
+      "argCount": 2
+    },
+    {
+      "name": "DwmUnregisterThumbnail",
+      "argCount": 1
+    },
+    {
+      "name": "DwmUpdateThumbnailProperties",
+      "argCount": 2
+    },
+    {
+      "name": "ord_102",
+      "argCount": 1
+    },
+    {
+      "name": "ord_127",
+      "argCount": 1
+    }
+  ]
+}

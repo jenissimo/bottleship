@@ -1,6 +1,6 @@
 import { IModule } from "../../core/module";
 import { Process } from "../../core/process";
-import { ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, ThunkResult, X86Context } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { createVTablesFromDescriptor, VTableInfo } from "../../api/adapters/module-adapter";
 import { dsoundModule } from "../../api/dsound.api";
@@ -15,6 +15,8 @@ import {
     getCtrl,
     CTRL_PLAY_CURSOR,
     CTRL_WRITE_CURSOR,
+    CTRL_SAMPLE_RATE,
+    CTRL_BLOCK_ALIGN,
     CTRL_STATE,
     CTRL_LOOP_MODE,
     CTRL_VOLUME,
@@ -26,7 +28,7 @@ import {
     CTRL_RESERVED,
     CTRL_BLOCK_BYTES,
     FLAG_CIRCULAR,
-    FLAG_LOOP_STREAM,
+    FLAG_STREAMING,
     STATE_STOPPED,
     STATE_PLAYING,
     STATE_PAUSED,
@@ -67,6 +69,8 @@ import {
     LCTRL_DOPPLER_FACTOR,
 } from "../../../audio/audio-ring-buffer";
 import { ensureAudioStatsSab } from "../audio-stats-sab";
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 
 const DS_OK = 0;
 const DSERR_INVALIDPARAM = 0x88780007;
@@ -91,11 +95,22 @@ const DSBCAPS_CTRLPOSITIONNOTIFY = 0x00000100;
 const DSERR_UNSUPPORTED = 0x80004001;
 const DSERR_INVALIDCALL = 0x88780032;
 const DSERR_CONTROLUNAVAIL = 0x8878001e;
+/** DSFXR_* (dsound.h): PRESENT=0 … UNKNOWN=5. Zero is the SUCCESS value here. */
+const DSFXR_UNKNOWN = 5;
 const DSERR_BADFORMAT = 0x88780064;
 const DSERR_NODRIVER = 0x88780078;
 const DSERR_BUFFERLOST_HR = 0x88780096;
 const DSERR_ALREADYINITIALIZED = 0x88780082;
 const DSERR_OBJECTNOTFOUND = 0x88781161;
+/** CLASS_E_NOAGGREGATION. */
+const DSERR_NOAGGREGATION = 0x80040110;
+const E_INVALIDARG = 0x80070057;
+/** Data1 of the IIDs IDirectSoundFullDuplex::QueryInterface answers for. */
+const IID_IUNKNOWN_D1 = 0x00000000;
+const IID_IDIRECTSOUNDFULLDUPLEX_D1 = 0xEDCB4C7A;
+const IID_IDIRECTSOUND_D1 = 0x279AFA83;
+const IID_IDIRECTSOUND8_D1 = 0xC50A7E93;
+const IID_IDIRECTSOUNDCAPTURE_D1 = 0xB0210781;
 const DSBVOLUME_MIN = -10000;
 const DSBVOLUME_MAX = 0;
 const WAVE_FORMAT_PCM = 0x0001;
@@ -143,7 +158,8 @@ type DSoundObjectType =
     | "IDirectSoundCapture"
     | "IDirectSoundCaptureBuffer8"
     | "IDirectSound3DListener"
-    | "IDirectSound3DBuffer";
+    | "IDirectSound3DBuffer"
+    | "IDirectSoundFullDuplex";
 
 type SoundFormat = {
     channels: number;
@@ -175,15 +191,59 @@ function defaultDs3dState(): Ds3dState {
     };
 }
 
-/** Software-mixer premix block duration (ms). Windows' software mixer consumed app
- *  buffers ahead of playback in 10 ms mix blocks; the DSound write cursor of a
- *  LOCSOFTWARE buffer is that consumption frontier, so the write-cursor lead over
- *  play moves in these quanta. */
-const MIX_QUANTUM_MS = 10;
-/** Initial premix queue depth (write lead = depth × MIX_QUANTUM_MS = 30 ms). */
-const MIX_QUANTA_START = 3;
-/** Premix queue depth ceiling under starvation (80 ms lead). */
-const MIX_QUANTA_MAX = 8;
+// Software-mixer premix depth. On a LOCSOFTWARE buffer the reported write cursor leads
+// play by exactly the premixed region — GetCurrentPosition derives the secondary's write
+// cursor from the distance between the primary's write cursor and the mixer's next-mix
+// position (nt5 dsound CGrace::GetBytePosition, "the region from the write cursor to the
+// mix cursor is the premixed region"). So these bounds ARE the write-cursor lead.
+//
+// The mixer thread (nt5 dsound CNaGrace::MixThread) ramps that depth on a timer:
+// MIXER_MINPREMIX after a remix, then `premix += step; step += 2` per refresh up to
+// MIXER_MAXPREMIX — 45, 47, 51, 57, 65, 75, 87, 101, 117, 135, 155, 177, 200. Sleep
+// between refreshes is min(premixed/2, nextNotify) clamped to [MIN/2, MAX/2].
+const PREMIX_MIN_MS = 45;
+const PREMIX_MAX_MS = 200;
+/** Ramp increment growth per refresh: step starts here and grows by the same amount. */
+const PREMIX_STEP_MS = 2;
+/** Play-cursor ramp speed relative to the nominal byte rate (see smoothedPlayCursor). */
+const SMOOTH_RAMP_SPEEDUP = 1.1;
+/** Extra ramp speed while draining a lag larger than half the write-cursor lead. */
+const SMOOTH_CATCHUP_SPEEDUP = 2;
+/** Queries closer than this are one poll, not a cadence (see capCursorStep). */
+const CURSOR_QUERY_BURST_MS = 0.2;
+/** How many typical query gaps the reported cursor may advance in one step. */
+const CURSOR_STEP_TYPICAL_GAPS = 3;
+/** Query gaps the typical gap is the median of. */
+const CURSOR_GAP_WINDOW = 16;
+/** Lock sizes the app's write granularity is the median of. */
+const CURSOR_LOCK_WINDOW = 8;
+/** Output latency behind the reported play cursor on a looping buffer (see hostLatencyBytes). */
+const HOST_LATENCY_MS = 120;
+/** Buffers up to this size get a multi-lap host ring (see ringBytesFor). */
+const RING_LAPS_MAX_BYTES = 1 << 20;
+
+/**
+ * Host ring size for a buffer: whole laps of it, enough to queue the host latency on top of
+ * the one lap the app may write ahead. A multiple of the buffer, so a ring position modulo
+ * the buffer size is the buffer position. A large buffer keeps one lap: its premix lead
+ * already outlasts a host pause.
+ */
+function ringBytesFor(bytes: number, format: SoundFormat): number {
+    if (bytes <= 0 || bytes > RING_LAPS_MAX_BYTES) return bytes;
+    const latency = Math.round((format.sampleRate * HOST_LATENCY_MS) / 1000) * Math.max(1, format.blockAlign);
+    return (Math.floor((bytes + latency) / bytes) + 1) * bytes;
+}
+
+/** Median of the first `n` values of `values`, sorted in `scratch` (no allocation). */
+function medianOf(values: Float64Array, n: number, scratch: Float64Array): number {
+    for (let i = 0; i < n; i++) {
+        const v = values[i];
+        let j = i - 1;
+        while (j >= 0 && scratch[j] > v) { scratch[j + 1] = scratch[j]; j--; }
+        scratch[j + 1] = v;
+    }
+    return scratch[n >> 1];
+}
 
 type SoundBuffer = {
     id: number;
@@ -216,19 +276,41 @@ type SoundBuffer = {
      *  Used to classify a continuously-refilled STREAM (crosses the buffer size many
      *  times) apart from a write-once static loop (engine/ambience SFX). */
     cumulativeWritten?: number;
-    /** Classified as an actively-streamed looping buffer (FLAG_LOOP_STREAM): the SAB
-     *  write cursor carries the guest's committed frontier and the worklet MUTES when
-     *  that frontier goes stale and play sweeps past it (drained-mixer silence), so an
-     *  abandoned music loop (e.g. race→menu) stops droning its stale ring. Cursors keep
-     *  advancing so delta-driven refill pumps stay alive; a write-once static loop is
-     *  never classified and keeps looping its whole buffer. */
+    /** Classified as an actively-refilled looping buffer rather than a write-once static
+     *  loop. Diagnostics only — see updateStreamFrontier. */
     streamed?: boolean;
-    /** Software-mixer premix queue depth in MIX_QUANTUM_MS quanta; the write cursor
-     *  leads play by this much. Deepens when a guest write overlaps the play cursor
-     *  (pump losing the race); see dsoundLeadBytes. */
-    mixAheadQuanta?: number;
-    /** Host time (performance.now) of the last premix-depth bump — rate limiter. */
-    lastLeadBumpMs?: number;
+    /** Software-mixer premix depth in ms; the reported write cursor leads play by it.
+     *  Ramped on a timer and reset by a remix — see dsoundLeadBytes. */
+    premixMs?: number;
+    /** Current ramp increment (grows by PREMIX_STEP_MS per refresh). */
+    premixStepMs?: number;
+    /** Host time (performance.now) the ramp last advanced. */
+    premixAdvancedAtMs?: number;
+    /** Lead actually REPORTED as the write cursor, floored so the cursor cannot retract
+     *  when the ramp resets — see monotonicLeadBytes. Cleared while not playing. */
+    reportedLeadBytes?: number;
+    /** Play cursor at the last reported-lead update; its advance is the floor's decay. */
+    lastReportedPlayCursor?: number;
+    /** Play-cursor smoothing (see smoothedPlayCursor): the last raw worklet cursor seen,
+     *  when it was first seen, and the reported cursor the ramp toward it started from. */
+    smoothRawCursor?: number;
+    smoothRawAtMs?: number;
+    smoothFromCursor?: number;
+    /** capCursorStep: when and where the cursor was last reported, and the caller's
+     *  typical gap between queries. */
+    stepLastQueryAt?: number;
+    stepLastCursor?: number;
+    stepTypicalGapMs?: number;
+    /** Recent query gaps (a small ring) the typical gap is the median of. */
+    stepGaps?: Float64Array;
+    stepGapCount?: number;
+    /** Recent Lock sizes: the app's write granularity. */
+    stepLockSizes?: Float64Array;
+    stepLockCount?: number;
+    /** Host ring size: whole laps of the buffer (see ringBytesFor). Absent means one lap. */
+    ringBytes?: number;
+    /** Ring position the worklet had reached at the last trailRing. */
+    trailRaw?: number;
     // Ring buffer (SAB)
     sab: SharedArrayBuffer | null;
     registered: boolean;
@@ -263,6 +345,8 @@ type DSoundObject = {
      *  CreateSoundBuffer validation (3D buffers must be mono; CTRL3D+CTRLPAN forbidden)
      *  applies ONLY to the DS8 interface — the legacy IDirectSound path skips it. */
     isDs8?: boolean;
+    /** IDirectSoundFullDuplex: the render and capture devices it owns once initialized. */
+    duplex?: { ds: number; dsc: number };
 };
 
 export class DSound implements IModule {
@@ -270,7 +354,6 @@ export class DSound implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     private process!: Process;
-    private memory!: Uint8Array;
     private objects: Map<number, DSoundObject> = new Map();
     private vtables: Record<string, VTableInfo> = {};
     private nextBufferId = DSOUND_AUDIO_ID_BASE;
@@ -330,7 +413,6 @@ export class DSound implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
         this.vtables = createVTablesFromDescriptor(this.process, dsoundModule);
 
         // Log vtable addresses for debugging
@@ -370,24 +452,88 @@ export class DSound implements IModule {
         this.exports["ord_1"] = this.exports["directsoundcreate"];
         this.exports["ord_11"] = this.exports["directsoundcreate8"];
 
-        this.exports["directsoundcapturecreate"] = (ctx, mem, args) => {
+        // DirectSoundCaptureCreate[8](pcGuidDevice, ppDSC, pUnkOuter). IDirectSoundCapture8 IS
+        // IDirectSoundCapture (dsound.h #define), so both mint the same object; they differ
+        // only in whether refusing aggregation clears *ppDSC.
+        const createCaptureDevice = (args: number[], clearOnAggregation: boolean): number => {
             const ppDSC = args[1] >>> 0;
-            if (!ppDSC) {
-                return DSERR_INVALIDPARAM;
+            if (!ppDSC || !isValidAddress(ppDSC, 4, "rw")) return DSERR_INVALIDPARAM;
+            if (args[2] >>> 0) {
+                if (clearOnAggregation) Mem.writeUint32(ppDSC, 0);
+                return DSERR_NOAGGREGATION;
             }
-
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(ppDSC, 0, true);
-
+            const hr = this.checkCaptureDevice(args[0] >>> 0);
+            if (hr !== DS_OK) {
+                Mem.writeUint32(ppDSC, 0);
+                return hr;
+            }
             const dscPtr = this.createObject("IDirectSoundCapture", this.vtables.IDirectSoundCapture.address);
-            view.setUint32(ppDSC, dscPtr, true);
+            Mem.writeUint32(ppDSC, dscPtr);
             Logger.log(
                 LogCategory.SYSTEM,
                 `DirectSoundCaptureCreate -> 0x${dscPtr.toString(16)} (vtable=0x${this.vtables.IDirectSoundCapture.address.toString(16)})`
             );
             return DS_OK;
         };
+        this.exports["directsoundcapturecreate"] = (_ctx, _mem, args) => createCaptureDevice(args, false);
+        this.exports["directsoundcapturecreate8"] = (_ctx, _mem, args) => createCaptureDevice(args, true);
         this.exports["ord_6"] = this.exports["directsoundcapturecreate"];
+        this.exports["ord_12"] = this.exports["directsoundcapturecreate8"];
+
+        // DirectSoundFullDuplexCreate(pcGuidCaptureDevice, pcGuidRenderDevice, pcDSCBufferDesc,
+        //   pcDSBufferDesc, hWnd, dwLevel, ppDSFD, ppDSCBuffer8, ppDSBuffer8, pUnkOuter)
+        this.exports["directsoundfullduplexcreate"] = (ctx, mem, args) => {
+            const ppDSFD = args[6] >>> 0;
+            if (!ppDSFD || !isValidAddress(ppDSFD, 4, "rw")) return DSERR_INVALIDPARAM;
+            if (args[9] >>> 0) {
+                Mem.writeUint32(ppDSFD, 0);
+                return DSERR_NOAGGREGATION;
+            }
+            const dsfd = this.createObject("IDirectSoundFullDuplex", this.vtables.IDirectSoundFullDuplex.address);
+            const hr = this.initializeFullDuplex(ctx, mem, [dsfd, ...args.slice(0, 6), args[7] >>> 0, args[8] >>> 0]);
+            if (hr !== DS_OK) {
+                this.releaseFullDuplex(ctx, mem, dsfd);
+                Mem.writeUint32(ppDSFD, 0);
+                return hr;
+            }
+            Mem.writeUint32(ppDSFD, dsfd);
+            return DS_OK;
+        };
+        this.exports["ord_10"] = this.exports["directsoundfullduplexcreate"];
+
+        // IDirectSoundFullDuplex. The one object answers IUnknown and IDirectSoundFullDuplex
+        // itself, and hands IDirectSound[8]/IDirectSoundCapture queries to the devices it owns.
+        this.exports["IDirectSoundFullDuplex_QueryInterface"] = (ctx, mem, args) => {
+            const thisPtr = args[0] >>> 0;
+            const riid = args[1] >>> 0;
+            const ppv = args[2] >>> 0;
+            if (!ppv || !isValidAddress(ppv, 4, "rw")) return E_INVALIDARG;
+            const obj = this.objects.get(thisPtr);
+            const iid = riid && isValidAddress(riid, 16, "r") ? (Mem.readUint32(riid) ?? 0) : 0;
+            if (obj && (iid === IID_IUNKNOWN_D1 || iid === IID_IDIRECTSOUNDFULLDUPLEX_D1)) {
+                obj.refCount += 1;
+                Mem.writeUint32(ppv, thisPtr);
+                return DS_OK;
+            }
+            if (obj?.duplex && (iid === IID_IDIRECTSOUND_D1 || iid === IID_IDIRECTSOUND8_D1)) {
+                return this.exports["IDirectSound8_QueryInterface"]!(ctx, mem, [obj.duplex.ds, riid, ppv]) as number;
+            }
+            if (obj?.duplex && iid === IID_IDIRECTSOUNDCAPTURE_D1) {
+                return this.exports["IDirectSoundCapture_QueryInterface"]!(ctx, mem, [obj.duplex.dsc, riid, ppv]) as number;
+            }
+            Mem.writeUint32(ppv, 0);
+            return E_NOINTERFACE;
+        };
+        this.exports["IDirectSoundFullDuplex_AddRef"] = (_ctx, _mem, args) => {
+            const obj = this.objects.get(args[0] >>> 0);
+            if (!obj) return 0;
+            obj.refCount += 1;
+            return obj.refCount;
+        };
+        this.exports["IDirectSoundFullDuplex_Release"] = (ctx, mem, args) =>
+            this.releaseFullDuplex(ctx, mem, args[0] >>> 0);
+        this.exports["IDirectSoundFullDuplex_Initialize"] = (ctx, mem, args) =>
+            this.initializeFullDuplex(ctx, mem, args);
 
         // DirectSoundEnumerateA/W — enumerate audio playback devices.
         //
@@ -695,6 +841,10 @@ export class DSound implements IModule {
             const obj = this.objects.get(ptr);
             if (!obj) return 0;
             obj.refCount -= 1;
+            if (obj.buffer) {
+                this.recordLife("release", obj.buffer.id, undefined,
+                    `obj=${obj.refCount} buf=${obj.buffer.bufferRefCount} ptr=0x${(ptr >>> 0).toString(16)}`);
+            }
             if (obj.refCount <= 0) {
                 if (ptr === this.primaryBufferPtr) {
                     this.primaryBufferPtr = 0;
@@ -880,16 +1030,20 @@ export class DSound implements IModule {
             return DS_OK;
         };
         this.exports["idirectsound3dlistener_getorientation"] = (ctx, mem, args) => {
-            const outPtr = args[1];
-            if (outPtr) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                const ls = this.listenerState;
-                view.setFloat32(outPtr, ls.frontX, true);
-                view.setFloat32(outPtr + 4, ls.frontY, true);
-                view.setFloat32(outPtr + 8, ls.frontZ, true);
-                view.setFloat32(outPtr + 12, ls.topX, true);
-                view.setFloat32(outPtr + 16, ls.topY, true);
-                view.setFloat32(outPtr + 20, ls.topZ, true);
+            // Two independent D3DVECTOR out-pointers, not one 6-float block.
+            const frontPtr = args[1];
+            const topPtr = args[2];
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            const ls = this.listenerState;
+            if (frontPtr) {
+                view.setFloat32(frontPtr, ls.frontX, true);
+                view.setFloat32(frontPtr + 4, ls.frontY, true);
+                view.setFloat32(frontPtr + 8, ls.frontZ, true);
+            }
+            if (topPtr) {
+                view.setFloat32(topPtr, ls.topX, true);
+                view.setFloat32(topPtr + 4, ls.topY, true);
+                view.setFloat32(topPtr + 8, ls.topZ, true);
             }
             return DS_OK;
         };
@@ -1407,8 +1561,9 @@ export class DSound implements IModule {
 
             // Create SAB ring buffer for secondary buffers
             let sab: SharedArrayBuffer | null = null;
+            const ringBytes = ringBytesFor(bufferBytes, format);
             if (!isPrimary && bufferBytes > 0) {
-                sab = createAudioRingBuffer(bufferBytes, {
+                sab = createAudioRingBuffer(ringBytes, {
                     channels: format.channels,
                     sampleRate: format.sampleRate,
                     bitsPerSample: format.bitsPerSample,
@@ -1421,6 +1576,7 @@ export class DSound implements IModule {
             const buffer: SoundBuffer = {
                 id: this.nextBufferId++,
                 bytes: bufferBytes,
+                ringBytes,
                 format,
                 flags: normalizedFlags,
                 ptr,
@@ -1473,7 +1629,16 @@ export class DSound implements IModule {
             }
 
             this.recordLife("create", buffer.id, undefined, `${isPrimary ? "PRIMARY" : `${buffer.bytes}b`} flags=0x${normalizedFlags.toString(16)}`);
-            Logger.log(LogCategory.SYSTEM, `DirectSound: CreateSoundBuffer ${isPrimary ? "PRIMARY" : `${buffer.bytes}b`} flags=0x${normalizedFlags.toString(16)} @0x${bufPtr.toString(16)}`);
+            // Geometry belongs in this line: a buffer whose size, rate or alignment is
+            // wrong is heard as crackle rather than reported as an error.
+            const f = buffer.format;
+            Logger.log(LogCategory.SYSTEM,
+                `DirectSound: CreateSoundBuffer ${isPrimary ? "PRIMARY" : `${buffer.bytes}b`} ` +
+                // Both flag sets: we force LOCSOFTWARE, so printing only ours misreads as
+                // "the caller asked for a software buffer" when it asked for nothing of the kind.
+                `flags=0x${(desc.flags >>> 0).toString(16)}->0x${normalizedFlags.toString(16)} @0x${bufPtr.toString(16)} ` +
+                `pcm=0x${(buffer.ptr >>> 0).toString(16)} ` +
+                `${f.channels}ch ${f.sampleRate}Hz ${f.bitsPerSample}bit align=${f.blockAlign}`);
             return DS_OK;
         };
 
@@ -1503,10 +1668,18 @@ export class DSound implements IModule {
             view.setUint32(capsPtr + 4, dwFlags, true);
             view.setUint32(capsPtr + 8, DSBFREQUENCY_MIN, true);
             view.setUint32(capsPtr + 12, DSBFREQUENCY_MAX, true);
-            view.setUint32(capsPtr + 16, 1, true);
-            view.setUint32(capsPtr + 20, 1, true);
-            view.setUint32(capsPtr + 24, 1, true);
-            view.setUint32(capsPtr + 28, 1, true);
+            view.setUint32(capsPtr + 16, 1, true);   // dwPrimaryBuffers — exactly one primary mix
+
+            // dwMaxHwMixing{All,Static,Streaming} @20/24/28, dwFreeHwMixing* @32/36/40,
+            // dwMaxHw3D* @44/48/52, dwFreeHw3D* @56/60/64 — all zero. We mix natively, but not
+            // as a DSound HAL: CreateSoundBuffer refuses DSBCAPS_LOCHARDWARE, so a non-zero max
+            // over a zero free count advertises a voice that can never be taken and steers a
+            // caller's caps branch straight into the request we have to fail.
+            // The tail (hw memory @68/72/76, unlock transfer rate @80, sw CPU overhead @84,
+            // reserved @88/92) is likewise zero for a software mixer.
+            view.setUint32(capsPtr + 20, 0, true);
+            view.setUint32(capsPtr + 24, 0, true);
+            view.setUint32(capsPtr + 28, 0, true);
             view.setUint32(capsPtr + 32, 0, true);
             view.setUint32(capsPtr + 36, 0, true);
             view.setUint32(capsPtr + 40, 0, true);
@@ -1547,11 +1720,14 @@ export class DSound implements IModule {
             }
 
             const ptr = this.process.memory.alloc(srcBuffer.bytes);
+            // A duplicate plays the source's samples; the ring is rebuilt from these bytes.
+            if (ptr && srcBuffer.ptr) mem.copyWithin(ptr, srcBuffer.ptr, srcBuffer.ptr + srcBuffer.bytes);
 
             // Create new SAB for duplicate
             let sab: SharedArrayBuffer | null = null;
+            const dupRingBytes = ringBytesFor(srcBuffer.bytes, srcBuffer.format);
             if (srcBuffer.bytes > 0) {
-                sab = createAudioRingBuffer(srcBuffer.bytes, {
+                sab = createAudioRingBuffer(dupRingBytes, {
                     channels: srcBuffer.format.channels,
                     sampleRate: srcBuffer.format.sampleRate,
                     bitsPerSample: srcBuffer.format.bitsPerSample,
@@ -1559,7 +1735,7 @@ export class DSound implements IModule {
                 setCtrl(sab, CTRL_FREQUENCY, srcBuffer.frequency);
 
                 // Copy audio data from source SAB if it exists
-                if (srcBuffer.sab) {
+                if (srcBuffer.sab && srcBuffer.sab.byteLength === sab.byteLength) {
                     const srcData = new Uint8Array(srcBuffer.sab, CTRL_BLOCK_BYTES);
                     const dstData = new Uint8Array(sab, CTRL_BLOCK_BYTES);
                     dstData.set(srcData);
@@ -1569,6 +1745,7 @@ export class DSound implements IModule {
             const newBuffer: SoundBuffer = {
                 id: this.nextBufferId++,
                 bytes: srcBuffer.bytes,
+                ringBytes: dupRingBytes,
                 format: { ...srcBuffer.format },
                 flags: (srcBuffer.flags & ~DSBCAPS_LOCHARDWARE) | DSBCAPS_LOCSOFTWARE,
                 ptr: ptr,
@@ -1681,6 +1858,12 @@ export class DSound implements IModule {
             buffer.lockSecondSize = secondChunk;
             buffer.lockFlags = flags;
             buffer.lockRequestedBytes = originalBytesRequested;
+            if (targetBytes > 0 && (flags & DSBLOCK_ENTIREBUFFER) === 0) {
+                const ring = buffer.stepLockSizes ?? (buffer.stepLockSizes = new Float64Array(CURSOR_LOCK_WINDOW));
+                const count = buffer.stepLockCount ?? 0;
+                ring[count % CURSOR_LOCK_WINDOW] = targetBytes;
+                buffer.stepLockCount = count + 1;
+            }
 
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             if (ppAudio1) view.setUint32(ppAudio1, buffer.ptr + start, true);
@@ -1703,25 +1886,37 @@ export class DSound implements IModule {
             const audioPtr2 = args[3];
             const bytes2 = args[4] >>> 0;
 
-            const offset = buffer.lockOffset ?? 0;
-            const firstSize = buffer.lockFirstSize ?? 0;
-            const secondSize = buffer.lockSecondSize ?? 0;
+            // The API contract identifies the locked region by the POINTERS Lock handed
+            // out, not by call order: two producers may hold interleaved Lock/Unlock
+            // sequences on one buffer (UE1-Galaxy's music mixer and its level stream do),
+            // and a state slot shared across those calls misattributes every span after
+            // the first interleave. Derive both spans from the pointers; the remembered
+            // lock state stays only as a fallback for a pointer outside the buffer.
+            let offset: number;
+            let firstSize: number;
+            let secondSize: number;
+            if (audioPtr1 >= buffer.ptr && audioPtr1 < buffer.ptr + buffer.bytes) {
+                offset = audioPtr1 - buffer.ptr;
+                firstSize = Math.min(bytes1, buffer.bytes - offset);
+                // Part 2 is Lock's wrap segment at offset 0; the two spans of one Lock
+                // never cover more than the buffer.
+                secondSize = Math.min(bytes2, buffer.bytes - offset - firstSize);
+            } else {
+                offset = buffer.lockOffset ?? 0;
+                firstSize = buffer.lockFirstSize ?? 0;
+                secondSize = buffer.lockSecondSize ?? 0;
+            }
             const lockFlags = buffer.lockFlags ?? 0;
             const requestedBytes = buffer.lockRequestedBytes ?? 0;
 
             const copyBytes1 = Math.min(bytes1, firstSize);
             const copyBytes2 = Math.min(bytes2, secondSize);
 
-            // Copy from guest memory directly into SAB ring buffer
-            if (buffer.sab) {
-                if (audioPtr1 && copyBytes1 > 0) {
-                    const src = mem.subarray(audioPtr1, audioPtr1 + copyBytes1);
-                    writeRingData(buffer.sab, offset, src, copyBytes1);
-                }
-                if (audioPtr2 && copyBytes2 > 0) {
-                    const src = mem.subarray(audioPtr2, audioPtr2 + copyBytes2);
-                    writeRingData(buffer.sab, 0, src, copyBytes2);
-                }
+            // Lock handed out buffer.ptr + offset and buffer.ptr: the bytes are the buffer's own.
+            if (buffer.sab && buffer.ptr) {
+                this.trailRing(buffer);
+                if (audioPtr1 && copyBytes1 > 0) this.writeToLaps(buffer, mem, offset, copyBytes1);
+                if (audioPtr2 && copyBytes2 > 0) this.writeToLaps(buffer, mem, 0, copyBytes2);
             }
 
             buffer.lockOffset = undefined;
@@ -1740,28 +1935,10 @@ export class DSound implements IModule {
             }
 
             if (buffer.sab && buffer.bytes >= 4096 && totalWritten > 0) {
-                const { playCursor: play, writeCursor: apiWrite } = this.getApiCursors(buffer);
+                const { playCursor: play, writeCursor: apiWrite } = this.peekApiCursors(buffer);
                 const overlapPlay = buffer.isPlaying && this.cursorInRange(offset, totalWritten, play, buffer.bytes);
                 if (totalWritten >= buffer.bytes) this.dbgAudioCalls.fullUnlock++;
                 if (overlapPlay) this.dbgAudioCalls.overlapUnlock++;
-                if (overlapPlay && totalWritten < buffer.bytes) {
-                    // A partial write span containing the live play cursor means the
-                    // guest's streaming pump lost the race against playback. The real
-                    // software mixer's response to starvation was to deepen its premix
-                    // queue, which pushes the reported write cursor (and thus where the
-                    // app writes next) further ahead of play. Mirror that: one quantum
-                    // per event, rate-limited so a single stall's burst of late writes
-                    // doesn't overshoot the depth. Full-buffer rewrites are excluded —
-                    // they always overlap play and signal nothing about pump cadence.
-                    const nowHost = performance.now();
-                    const depth = buffer.mixAheadQuanta ?? MIX_QUANTA_START;
-                    if (depth < MIX_QUANTA_MAX && nowHost - (buffer.lastLeadBumpMs ?? -Infinity) >= 100) {
-                        buffer.mixAheadQuanta = depth + 1;
-                        buffer.lastLeadBumpMs = nowHost;
-                        Logger.log(LogCategory.SYSTEM,
-                            `dsound: premix depth ${depth + 1}×${MIX_QUANTUM_MS}ms on buffer id=${buffer.id} (late write overlapped play)`);
-                    }
-                }
                 this.dbgLockTrace.push({
                     t: Math.round(performance.now()),
                     off: offset,
@@ -1784,6 +1961,7 @@ export class DSound implements IModule {
             const buffer = this.getBuffer(args[0]);
             if (!buffer) return DSERR_INVALIDPARAM;
             const pos = Math.max(0, Math.min(args[1], buffer.bytes));
+            this.resyncRing(buffer);
             buffer.currentPosition = pos;
             buffer.lastUnlockCursor = pos;
             this.recordLife("setpos", buffer.id, undefined, `pos=${pos}`);
@@ -1795,7 +1973,10 @@ export class DSound implements IModule {
                 // overwritten on the next audio block; CTRL_RESERVED triggers rb.position sync.
                 setCtrl(buffer.sab, CTRL_PLAY_CURSOR, pos);
                 setCtrl(buffer.sab, CTRL_RESERVED, 1);
+                this.syncFrontierHold(buffer);
             }
+            buffer.smoothRawCursor = undefined;
+            buffer.stepLastCursor = undefined;
             return DS_OK;
         };
 
@@ -1807,8 +1988,12 @@ export class DSound implements IModule {
             const isLooping = (flags & DSBPLAY_LOOPING) !== 0;
 
             const wasStopped = !buffer.isPlaying;
+            if (wasStopped) this.resyncRing(buffer);
             buffer.isPlaying = true;
             buffer.isLooping = isLooping;
+            // A starting source premixes from MIXER_MINPREMIX like any remix does; a Play on
+            // an already-running buffer changes nothing about the premixed region.
+            if (wasStopped) this.signalRemix(buffer);
             this.recordLife("play", buffer.id, isLooping, `wasStopped=${wasStopped} bytes=${buffer.bytes}`);
 
             // §B#5 deterministic-audio anchor: pin the virtual-time baseline from which the
@@ -1833,15 +2018,23 @@ export class DSound implements IModule {
                     setCtrl(buffer.sab, CTRL_PLAY_CURSOR, 0);
                     setCtrl(buffer.sab, CTRL_RESERVED, 1);
                 }
+                // A restarted buffer's cursor is a new stream, not the continuation of the one
+                // the smoothing ramp was following; a Play on a running buffer changes nothing.
+                if (wasStopped) {
+                    buffer.smoothRawCursor = undefined;
+                    buffer.stepLastCursor = undefined;
+                }
                 // Set loop mode: -1 for infinite loop, 1 for play once
                 setCtrl(buffer.sab, CTRL_LOOP_MODE, isLooping ? -1 : 1);
                 // Set volume/pan/frequency from current state
                 setCtrl(buffer.sab, CTRL_VOLUME, buffer.volumeDb);
                 setCtrl(buffer.sab, CTRL_PAN, buffer.pan);
                 setCtrl(buffer.sab, CTRL_FREQUENCY, buffer.frequency);
-                setCtrl(buffer.sab, CTRL_DATA_LENGTH, buffer.bytes);
+                // A loop cycles through every lap of the host ring; a one-shot plays lap 0.
+                setCtrl(buffer.sab, CTRL_DATA_LENGTH, isLooping ? this.ringSize(buffer) : buffer.bytes);
                 // Start playback
                 setCtrl(buffer.sab, CTRL_STATE, STATE_PLAYING);
+                this.syncFrontierHold(buffer);
             }
             // Reset lastNotifyCursor for notification tracking
             if (buffer.notifications) {
@@ -1875,6 +2068,10 @@ export class DSound implements IModule {
             if (!(buffer.flags & DSBCAPS_CTRLVOLUME)) return DSERR_CONTROLUNAVAIL;
             const vol = args[1] | 0;
             if (vol > DSBVOLUME_MAX || vol < DSBVOLUME_MIN) return DSERR_INVALIDPARAM;
+            // A set to the value already in effect changes nothing in the mixer and
+            // raises no remix (nt5 dsound early-outs on it). Without that, a title
+            // re-asserting its volume every frame pins the premix ramp at its minimum.
+            const volumeChanged = buffer.volumeDb !== Math.max(-10000, Math.min(0, vol));
             buffer.volumeDb = Math.max(-10000, Math.min(0, vol));
             if (vol <= -10000) {
                 buffer.volume = 0;
@@ -1887,6 +2084,7 @@ export class DSound implements IModule {
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_VOLUME, buffer.volumeDb);
             }
+            if (volumeChanged) this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -1895,12 +2093,14 @@ export class DSound implements IModule {
             if (!buffer) return DSERR_INVALIDPARAM;
             if (!(buffer.flags & DSBCAPS_CTRLFREQUENCY)) return DSERR_CONTROLUNAVAIL;
             const freq = Math.max(1, args[1] | 0);
+            const freqChanged = buffer.frequency !== freq;
             buffer.frequency = freq;
             buffer.playbackRate = freq / buffer.format.sampleRate;
             // Instant update via Atomics
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_FREQUENCY, freq);
             }
+            if (freqChanged) this.signalRemix(buffer);
             return DS_OK;
         };
 
@@ -1960,8 +2160,7 @@ export class DSound implements IModule {
             };
             if (dispatcher?.registerFastPath) {
                 dispatcher.registerFastPath('dsound', 'idirectsoundbuffer8_getstatus',
-                    (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                        const esp = cpu.reg32[4];
+                    (esp: number, view: DataView): number => {
                         const buffer = this.getBuffer(view.getUint32(esp + 4, true));
                         const statusPtr = view.getUint32(esp + 8, true);
                         this.dbgAudioCalls.getStatus++;
@@ -1987,8 +2186,7 @@ export class DSound implements IModule {
                     }, { trivial: true });
 
                 dispatcher.registerFastPath('dsound', 'idirectsoundbuffer8_getcurrentposition',
-                    (cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, view: DataView): number => {
-                        const esp = cpu.reg32[4];
+                    (esp: number, view: DataView): number => {
                         const buffer = this.getBuffer(view.getUint32(esp + 4, true));
                         if (!buffer) return DSERR_INVALIDPARAM;
                         const playPtr = view.getUint32(esp + 8, true);
@@ -2072,7 +2270,19 @@ export class DSound implements IModule {
             const fmtPtr = args[1];
             if (!buffer || !fmtPtr) return DSERR_INVALIDPARAM;
             const parsed = this.parseWaveFormat(fmtPtr, true);
-            if (parsed.hr !== DS_OK || !parsed.format) return parsed.hr;
+            if (parsed.hr !== DS_OK || !parsed.format) {
+                // Only the SUCCESS path used to log, so a rejected format left no trace at
+                // all — while engines routinely treat a failed primary SetFormat as fatal to
+                // the whole sound system and go permanently, silently mute. Name the format
+                // we refused, or the next reader has a mute game and an empty log.
+                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                Logger.warn(LogCategory.SYSTEM,
+                    `IDirectSoundBuffer8::SetFormat REJECTED hr=0x${(parsed.hr >>> 0).toString(16)} — ` +
+                    `tag=${view.getUint16(fmtPtr, true)} ch=${view.getUint16(fmtPtr + 2, true)} ` +
+                    `rate=${view.getUint32(fmtPtr + 4, true)} bits=${view.getUint16(fmtPtr + 14, true)} ` +
+                    `align=${view.getUint16(fmtPtr + 12, true)}`);
+                return parsed.hr;
+            }
             buffer.format = parsed.format;
             buffer.frequency = buffer.format.sampleRate;
             buffer.playbackRate = 1.0;
@@ -2083,11 +2293,14 @@ export class DSound implements IModule {
             const buffer = this.getBuffer(args[0]);
             if (!buffer) return DSERR_INVALIDPARAM;
             if (!(buffer.flags & DSBCAPS_CTRLPAN) || (buffer.flags & DSBCAPS_CTRL3D)) return DSERR_CONTROLUNAVAIL;
-            buffer.pan = Math.max(-10000, Math.min(10000, args[1] | 0));
+            const pan = Math.max(-10000, Math.min(10000, args[1] | 0));
+            const panChanged = buffer.pan !== pan;
+            buffer.pan = pan;
             // Instant update via Atomics
             if (buffer.sab) {
                 setCtrl(buffer.sab, CTRL_PAN, buffer.pan);
             }
+            if (panChanged) this.signalRemix(buffer);
             return DS_OK;
         };
         this.exports["idirectsoundbuffer8_restore"] = (ctx, mem, args) => {
@@ -2097,9 +2310,41 @@ export class DSound implements IModule {
             buffer.bufferLost = false;
             return DS_OK;
         };
-        this.exports["idirectsoundbuffer8_setfx"] = () => DS_OK;
-        this.exports["idirectsoundbuffer8_acquireresources"] = () => DS_OK;
-        this.exports["idirectsoundbuffer8_getobjectinpath"] = () => DS_OK;
+        // The DMO effects chain (DSBCAPS_CTRLFX) is not implemented: CreateSoundBuffer
+        // never honours the flag, so no buffer here has an effects chain to configure.
+        // DS_OK would tell the app its reverb/echo is running and leave the per-effect
+        // result codes — which it reads to find out WHICH effect failed — untouched.
+        this.exports["idirectsoundbuffer8_setfx"] = (ctx, mem, args) => {
+            const dwEffectsCount = args[1] >>> 0;
+            const pdwResultCodes = args[3] >>> 0;
+            if (pdwResultCodes && dwEffectsCount && dwEffectsCount < 0x1000
+                && isValidAddress(mem, pdwResultCodes, dwEffectsCount * 4, "rw")) {
+                // DSFXR_UNKNOWN (5) — no effect was located, one entry per requested effect.
+                // NOT 0: that is DSFXR_PRESENT, which would tell a caller inspecting the array
+                // to find WHICH effect failed that all of them are in place.
+                for (let i = 0; i < dwEffectsCount; i++) Mem.writeUint32(pdwResultCodes + i * 4, DSFXR_UNKNOWN);
+            }
+            Logger.warn(LogCategory.SYSTEM, "dsound: SetFX -> DSERR_CONTROLUNAVAIL (no DMO effects chain)");
+            return DSERR_CONTROLUNAVAIL;
+        };
+        // AcquireResources carries the same per-effect out-array as SetFX and must fill it
+        // for the same reason.
+        this.exports["idirectsoundbuffer8_acquireresources"] = (ctx, mem, args) => {
+            const dwEffectsCount = args[2] >>> 0;
+            const pdwResultCodes = args[3] >>> 0;
+            if (pdwResultCodes && dwEffectsCount && dwEffectsCount < 0x1000
+                && isValidAddress(mem, pdwResultCodes, dwEffectsCount * 4, "rw")) {
+                for (let i = 0; i < dwEffectsCount; i++) Mem.writeUint32(pdwResultCodes + i * 4, DSFXR_UNKNOWN);
+            }
+            return DSERR_CONTROLUNAVAIL;
+        };
+        // GetObjectInPath hands back an effect/renderer interface pointer. There is no
+        // object in any path here, and the capture buffer's twin already says so.
+        this.exports["idirectsoundbuffer8_getobjectinpath"] = (ctx, mem, args) => {
+            const ppObject = args[4] >>> 0;
+            if (ppObject && isValidAddress(mem, ppObject, 4, "rw")) Mem.writeUint32(ppObject, 0);
+            return DSERR_OBJECTNOTFOUND;
+        };
 
         this.exports["idirectsoundcapture_createcapturebuffer"] = (ctx, mem, args) => {
             const descPtr = args[1] >>> 0;
@@ -2292,7 +2537,7 @@ export class DSound implements IModule {
                     sabState = getCtrl(b.sab, CTRL_STATE);
                     sabPlay = getCtrl(b.sab, CTRL_PLAY_CURSOR);
                     sabWrite = getCtrl(b.sab, CTRL_WRITE_CURSOR);
-                    const apiCursors = this.getApiCursors(b);
+                    const apiCursors = this.peekApiCursors(b);
                     apiPlay = apiCursors.playCursor;
                     apiWrite = apiCursors.writeCursor;
                 } catch { /* ignore */ }
@@ -2320,6 +2565,11 @@ export class DSound implements IModule {
                 sabState, sabPlay, sabWrite,
                 apiPlayCursor: apiPlay,
                 apiWriteCursor: apiWrite,
+                // Lifetime bookkeeping: an orphan surviving a guest Release shows up here
+                // as a live objRefCount/bufferRefCount pair with no matching lifeRing entry.
+                objRefCount: obj.refCount,
+                bufferRefCount: b.bufferRefCount,
+                streamed: !!b.streamed,
                 lastUnlockCursor: b.lastUnlockCursor ?? null,
                 notifyCount: b.notifications?.length ?? 0,
                 lastNotifyCursor: b.lastNotifyCursor ?? null,
@@ -2370,11 +2620,14 @@ export class DSound implements IModule {
         for (const obj of this.objects.values()) {
             if (obj.type !== "IDirectSoundBuffer8" || !obj.buffer) continue;
             const buffer = obj.buffer;
+            // Laps the worklet vacates must be refreshed even if the app stops asking.
+            if (buffer.isPlaying && buffer.sab) this.trailRing(buffer);
             if (!buffer.notifications || buffer.notifications.length === 0) continue;
-            if (!buffer.sab) continue;
+            if (!buffer.sab || buffer.bytes <= 0) continue;
 
             const sabState = getCtrl(buffer.sab, CTRL_STATE);
-            const currentCursor = getCtrl(buffer.sab, CTRL_PLAY_CURSOR);
+            const currentCursor = ((getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % this.ringSize(buffer))
+                + this.hostLatencyBytes(buffer)) % buffer.bytes;
 
             // Check OFFSETSTOP: worklet transitioned to stopped
             if (sabState === STATE_STOPPED && buffer.isPlaying) {
@@ -2427,50 +2680,375 @@ export class DSound implements IModule {
         return normalizedCursor >= normalizedStart || normalizedCursor < end;
     }
 
-    /** Update the loop-stream classification + committed write frontier after a guest
-     *  Unlock. A LOCSOFTWARE looping buffer the guest has refilled past twice its own
-     *  size is a genuine stream (a write-once static loop never gets there); once
-     *  classified, its SAB is flagged FLAG_LOOP_STREAM and CTRL_WRITE_CURSOR tracks the
-     *  guest's committed frontier. The worklet keeps cursors advancing (delta-driven
-     *  pumps size their next write from the play cursor — stalling it deadlocks them,
-     *  and frontier==play is ambiguous full/empty) but MUTES once the frontier goes
-     *  stale and play sweeps past it — the real mixer's drained-queue silence — instead
-     *  of looping the stale ring forever (the race→menu "stuck sample" drone). Static
-     *  loops (engine/ambience SFX) are never classified and keep whole-buffer looping. */
+    /** Classify a LOCSOFTWARE looping buffer the guest has refilled past twice its own
+     *  size as a genuine stream (a write-once static loop never gets there). The real
+     *  mixer treats both the same; only the host-stall hold (holdsAtFrontier) tells them
+     *  apart, because only a stream has a frontier the output can overtake. */
     private updateStreamFrontier(buffer: SoundBuffer, justWritten: number): void {
         if (!buffer.sab || buffer.bytes < 4096) return;
         buffer.cumulativeWritten = (buffer.cumulativeWritten ?? 0) + justWritten;
         if (!buffer.streamed && buffer.cumulativeWritten >= buffer.bytes * 2) {
             buffer.streamed = true;
-            setCtrl(buffer.sab, CTRL_FLAGS, getCtrl(buffer.sab, CTRL_FLAGS) | FLAG_LOOP_STREAM);
-            Logger.log(LogCategory.SYSTEM,
-                `dsound: buffer id=${buffer.id} classified LOOP_STREAM (mute on stale write frontier)`);
-        }
-        if (buffer.streamed && buffer.lastUnlockCursor !== undefined) {
-            // Committed frontier — the worklet's staleness signal. While the guest keeps
-            // feeding, this changes every pump tick and playback is untouched; when the
-            // guest abandons the buffer it freezes, and the worklet mutes after grace.
-            setCtrl(buffer.sab, CTRL_WRITE_CURSOR, buffer.lastUnlockCursor);
+            Logger.log(LogCategory.SYSTEM, `dsound: buffer id=${buffer.id} classified LOOP_STREAM`);
+            this.syncFrontierHold(buffer);
         }
     }
 
+    /**
+     * A host pause stops the app while the output keeps playing; one longer than the host
+     * latency lets the output reach ring space the app has not refilled for this lap, and the
+     * stale lap splices in as a click. A stream's output therefore holds at the furthest span
+     * the app has written for its lap (the worklet's streaming mode: fade out, wait, fade in),
+     * and the reported cursor holds with it, so the app sees no more time pass than was
+     * played. The pause is ours, not the app's, so concealing it here is not a behavior the
+     * app can observe beyond a cursor that pauses — which is exactly what a stalled mixer is.
+     */
+    private holdsAtFrontier(buffer: SoundBuffer): boolean {
+        return !!buffer.streamed && buffer.isLooping && this.ringSize(buffer) > buffer.bytes
+            && !(globalThis as { __noFrontierHold?: boolean }).__noFrontierHold;
+    }
+
+    /** Switch the worklet's hold on or off to match holdsAtFrontier. Switching on marks the
+     *  whole ring written: every lap was filled from the buffer when playback (re)started. */
+    private syncFrontierHold(buffer: SoundBuffer): void {
+        const sab = buffer.sab;
+        if (!sab) return;
+        const flags = getCtrl(sab, CTRL_FLAGS);
+        if (this.holdsAtFrontier(buffer)) {
+            const ring = this.ringSize(buffer);
+            const blockAlign = Math.max(1, buffer.format.blockAlign);
+            const raw = getCtrl(sab, CTRL_PLAY_CURSOR) % ring;
+            if ((flags & FLAG_STREAMING) === 0) {
+                setCtrl(sab, CTRL_WRITE_CURSOR, (raw + ring - blockAlign) % ring);
+                setCtrl(sab, CTRL_FLAGS, flags | FLAG_STREAMING);
+            }
+        } else if (flags & FLAG_STREAMING) {
+            setCtrl(sab, CTRL_FLAGS, flags & ~FLAG_STREAMING);
+        }
+    }
+
+    /**
+     * Advance the premix ramp to `now`. Time-driven, exactly like the mixer thread:
+     * the depth grows on its own refresh schedule whether or not the guest is late.
+     * (An earlier model only deepened when a write was caught overlapping play, so the
+     * lead could only grow AFTER the pump had already been starved once — the real mixer
+     * has no starvation feedback at all, it just ramps.) Advanced lazily from
+     * dsoundLeadBytes rather than on a timer: every cursor read is a refresh point, and
+     * a buffer nobody queries needs no depth.
+     */
+    private advancePremix(buffer: SoundBuffer, now: number): number {
+        let premix = buffer.premixMs ?? PREMIX_MIN_MS;
+        let step = buffer.premixStepMs ?? PREMIX_STEP_MS;
+        const last = buffer.premixAdvancedAtMs;
+        if (last === undefined) {
+            buffer.premixMs = premix;
+            buffer.premixStepMs = step;
+            buffer.premixAdvancedAtMs = now;
+            return premix;
+        }
+        // Refresh interval = min(premixed/2, nextNotify) clamped to [MIN/2, MAX/2]. We
+        // have no notify deadline to shorten it, so the premixed half-life is the term.
+        let elapsed = now - last;
+        let advancedAt = last;
+        while (premix < PREMIX_MAX_MS) {
+            const interval = Math.min(PREMIX_MAX_MS / 2, Math.max(PREMIX_MIN_MS / 2, premix / 2));
+            if (elapsed < interval) break;
+            elapsed -= interval;
+            advancedAt += interval;
+            premix = Math.min(PREMIX_MAX_MS, premix + step);
+            step += PREMIX_STEP_MS;
+        }
+        buffer.premixMs = premix;
+        buffer.premixStepMs = step;
+        // At the ceiling the schedule no longer matters; keep the clock current so a
+        // later reset restarts from now instead of replaying the whole idle gap.
+        buffer.premixAdvancedAtMs = premix >= PREMIX_MAX_MS ? now : advancedAt;
+        return premix;
+    }
+
+    /**
+     * A remix rewinds the mixer's next-mix position back to the write cursor and rebuilds
+     * the premixed region from PREMIX_MIN_MS (nt5 dsound CGrace::Refresh with fRemix, plus
+     * the MixThread branch that resets dtimePremix). The reported write cursor therefore
+     * dips back toward play and re-ramps. Raised by the same things the real one is:
+     * volume/pan/frequency changed on a PLAYING, unmuted buffer.
+     */
+    private signalRemix(buffer: SoundBuffer): void {
+        if (!buffer.isPlaying) return;
+        buffer.premixMs = PREMIX_MIN_MS;
+        buffer.premixStepMs = PREMIX_STEP_MS;
+        // Clearing the anchor rather than stamping it here keeps one clock owner: the next
+        // advancePremix re-seeds from whatever `now` it is given, so the ramp cannot see a
+        // reset stamped on a different time base than the one it measures against.
+        buffer.premixAdvancedAtMs = undefined;
+    }
+
     private dsoundLeadBytes(buffer: SoundBuffer): number {
-        // Software-mixer (KMixer) premix-queue lead. All our buffers report
-        // DSBSTATUS_LOCSOFTWARE, and on that path the real write cursor is the
-        // kernel mixer's CONSUMPTION frontier: how far it has already premixed the
-        // app's data into its queue of 10 ms mix blocks (play is derived backward
-        // from it by the premixed-but-unplayed backlog). The queue starts 3 blocks
-        // deep (30 ms) and deepens under starvation up to 8 (80 ms) — NOT the
-        // ~15 ms figure of the hardware-buffer path, which we never take.
-        // Streaming pumps calibrated against that mixer (write-anchored Lock +
-        // Sleep(50) cadence) need this headroom: at a 12 ms lead a 50 ms-period
-        // pump leaves the play cursor in already-consumed data ~40% of the time
-        // (audible ~19 Hz crackle). The adaptive bump lives in the Unlock handler
-        // (guest write span overlapping the live play cursor = pump lost the race).
+        // All our buffers report DSBSTATUS_LOCSOFTWARE, so the write cursor is the software
+        // mixer's premix frontier, NOT the ~15 ms figure of the hardware-buffer path we
+        // never take. Streaming pumps are calibrated against that frontier: at a 12 ms lead
+        // a 50 ms-period pump leaves the play cursor in already-consumed data ~40% of the
+        // time (audible ~19 Hz crackle), and a pump slower than the ceiling crackles no
+        // matter what it does — which is why the ceiling has to be the real 200 ms.
         const blockAlign = Math.max(1, buffer.format.blockAlign);
-        const quanta = Math.min(MIX_QUANTA_MAX, buffer.mixAheadQuanta ?? MIX_QUANTA_START);
-        const leadFrames = Math.max(64, Math.round((buffer.format.sampleRate * MIX_QUANTUM_MS * quanta) / 1000));
-        return Math.min(leadFrames * blockAlign, Math.floor(buffer.bytes / 4));
+        const premixMs = this.advancePremix(buffer, performance.now());
+        const leadFrames = Math.max(64, Math.round((buffer.format.sampleRate * premixMs) / 1000));
+        // A ring too short for the premix cannot hold it: the frontier takes at most half the
+        // ring and leaves the other half to the app. More starves the app's own half — a
+        // chunked pump then writes the chunk the mixer is reading. That lead is also the
+        // runway a write-cursor pump has when a host pause stalls it (see capCursorStep).
+        const half = Math.floor(buffer.bytes / 2);
+        return Math.min(leadFrames * blockAlign, half - (half % blockAlign));
+    }
+
+    private ringSize(buffer: SoundBuffer): number {
+        return buffer.ringBytes ?? buffer.bytes;
+    }
+
+    /**
+     * The play cursor an app reads is the mixer's, not the speaker's: on Windows the kernel
+     * mixer and the device queue sit behind it. Our output runs on another thread that keeps
+     * playing while a host pause (a V8 GC, a GPU-client stall) stops every guest thread, so
+     * the time the app has to refill before the output reaches unwritten data is all the
+     * slack there is. Reporting the play cursor this far ahead of the worklet adds the same
+     * kind of queue, held in the extra laps of the host ring (writeToLaps). Only a looping
+     * buffer has one; a one-shot's cursor must end with its data.
+     */
+    private hostLatencyBytes(buffer: SoundBuffer): number {
+        const ring = this.ringSize(buffer);
+        if (!buffer.isLooping || ring <= buffer.bytes
+            || (globalThis as { __noHostLatency?: boolean }).__noHostLatency) return 0;
+        const blockAlign = Math.max(1, buffer.format.blockAlign);
+        const hz = buffer.frequency > 0 ? buffer.frequency : buffer.format.sampleRate;
+        const latency = Math.round((hz * HOST_LATENCY_MS) / 1000) * blockAlign;
+        // The app may write a whole lap past the reported cursor; that lap must fit too.
+        return Math.min(latency, ring - buffer.bytes);
+    }
+
+    /**
+     * Copy an Unlocked span into the lap of the host ring it is meant for and every later
+     * lap already queued. The app places it relative to the play cursor it was shown, which
+     * leads the worklet by the host latency, so the span's own lap is where that cursor's
+     * lap puts it, not the worklet's. Later laps get it too: until the app writes them, a
+     * lap's best content is the newest the app has written (what a one-lap ring would hold).
+     */
+    private writeToLaps(buffer: SoundBuffer, mem: Uint8Array, pos: number, len: number): void {
+        const sab = buffer.sab!;
+        const size = buffer.bytes;
+        const ring = this.ringSize(buffer);
+        if (ring === size) {
+            writeRingData(sab, pos, mem.subarray(buffer.ptr + pos, buffer.ptr + pos + len), len);
+            return;
+        }
+        const raw = getCtrl(sab, CTRL_PLAY_CURSOR) % ring;
+        // Distance from the worklet to where the span belongs.
+        let start: number;
+        const shown = buffer.stepLastCursor;
+        if (buffer.isPlaying && shown !== undefined) {
+            // The shown cursor never leads the worklet by more than the host latency (it
+            // ramps toward raw + latency, never past it), so a larger lead is a lag.
+            let ahead = (Math.floor(shown) - raw + ring) % ring;
+            if (ahead > this.hostLatencyBytes(buffer)) ahead -= ring;
+            start = ahead + ((pos - (Math.floor(shown) % size) + size) % size);
+        } else {
+            start = (pos - (raw % size) + size) % size;
+        }
+        if (buffer.isPlaying && (getCtrl(sab, CTRL_FLAGS) & FLAG_STREAMING)) {
+            // The span's own lap moves the frontier; the later laps are placeholders.
+            const blockAlign = Math.max(1, buffer.format.blockAlign);
+            const end = Math.min(start + len, ring - blockAlign);
+            const cur = (getCtrl(sab, CTRL_WRITE_CURSOR) - raw + ring) % ring;
+            if (end > cur) setCtrl(sab, CTRL_WRITE_CURSOR, (raw + end) % ring);
+        }
+        for (let o = start; o < ring; o += size) {
+            const a = Math.max(0, o), b = Math.min(ring, o + len);
+            if (b <= a) continue;
+            const src = buffer.ptr + pos + (a - o);
+            writeRingData(sab, (raw + a) % ring, mem.subarray(src, src + (b - a)), b - a);
+        }
+    }
+
+    /**
+     * The span the worklet has just played becomes the ring's farthest lap. Refill it with
+     * the buffer's current bytes, so a lap the app never rewrites still plays what the app
+     * last wrote there, not what it held a ring's length ago.
+     */
+    private trailRing(buffer: SoundBuffer): void {
+        const size = buffer.bytes;
+        const ring = this.ringSize(buffer);
+        if (ring === size || !buffer.isPlaying || !buffer.sab || !buffer.ptr) {
+            buffer.trailRaw = undefined;
+            return;
+        }
+        const raw = getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring;
+        const prev = buffer.trailRaw;
+        buffer.trailRaw = raw;
+        if (prev === undefined) return;
+        let left = (raw - prev + ring) % ring;
+        if (left === 0) return;
+        const mem = this.getMemory();
+        let at = prev;
+        while (left > 0) {
+            const g = at % size;
+            const n = Math.min(left, size - g, ring - at);
+            writeRingData(buffer.sab, at, mem.subarray(buffer.ptr + g, buffer.ptr + g + n), n);
+            at = (at + n) % ring;
+            left -= n;
+        }
+    }
+
+    /** A (re)started or seeked buffer begins a new lap sequence: every lap is the buffer. */
+    private resyncRing(buffer: SoundBuffer): void {
+        buffer.trailRaw = undefined;
+        const ring = this.ringSize(buffer);
+        if (!buffer.sab || !buffer.ptr || ring === buffer.bytes) return;
+        const mem = this.getMemory();
+        const src = mem.subarray(buffer.ptr, buffer.ptr + buffer.bytes);
+        for (let at = 0; at < ring; at += buffer.bytes) writeRingData(buffer.sab, at, src, buffer.bytes);
+        // Every lap is now written: re-arm the hold from a full ring.
+        setCtrl(buffer.sab, CTRL_FLAGS, getCtrl(buffer.sab, CTRL_FLAGS) & ~FLAG_STREAMING);
+    }
+
+    /**
+     * The REPORTED write cursor never moves backward. A remix rewinds the mixer's
+     * next-mix position, not the app-visible cursor; a streaming pump sizing its refill
+     * from `(write - lastWrite + size) % size` reads a retraction as a nearly-full buffer
+     * and rewrites the region being mixed. The play cursor only advances, so flooring the
+     * LEAD by how far play moved since the last report is exactly a monotonic write
+     * cursor — and the lead still decays back onto the ramp's own value as play catches up.
+     */
+    private monotonicLeadBytes(buffer: SoundBuffer, playCursor: number, leadBytes: number): number {
+        const prevLead = buffer.reportedLeadBytes;
+        const prevPlay = buffer.lastReportedPlayCursor;
+        let lead = leadBytes;
+        if (prevLead !== undefined && prevPlay !== undefined) {
+            const advanced = (playCursor - prevPlay + buffer.bytes) % buffer.bytes;
+            lead = Math.max(leadBytes, prevLead - advanced);
+        }
+        buffer.reportedLeadBytes = lead;
+        buffer.lastReportedPlayCursor = playCursor;
+        return lead;
+    }
+
+    /**
+     * The worklet renders in bursts — Chrome on Windows runs 3-4 render quanta back to back
+     * every ~10 ms — so the raw SAB cursor jumps by several KB at a time. DirectSound on
+     * Vista+ reads IAudioClock, which advances smoothly, and chunked pumps depend on that: a
+     * 10 ms jump carries the write cursor over two 5 ms chunks and SDL fills only one. Report
+     * a ramp toward the raw cursor at the nominal byte rate instead. It trails the raw
+     * cursor, never leads it, so an app writing up to the play cursor cannot overwrite data
+     * not yet consumed; the lag is capped at the write-cursor lead so the write cursor never
+     * falls behind what was consumed.
+     */
+    private smoothedPlayCursor(buffer: SoundBuffer, raw: number, leadBytes: number, latencyBytes: number): number {
+        // Works in host-ring coordinates; the caller reduces the result to the buffer.
+        if ((globalThis as { __noCursorSmoothing?: boolean }).__noCursorSmoothing) {
+            buffer.smoothRawCursor = undefined;
+            buffer.stepLastCursor = raw;
+            return raw;
+        }
+        const size = this.ringSize(buffer);
+        const blockAlign = Math.max(1, buffer.format.blockAlign);
+        const hz = buffer.frequency > 0 ? buffer.frequency : buffer.format.sampleRate;
+        // A touch faster than nominal so the lag cannot random-walk up to the snap bound;
+        // the ramp still never passes the raw cursor.
+        const bytesPerMs = (hz * blockAlign * SMOOTH_RAMP_SPEEDUP) / 1000;
+        const now = performance.now();
+        const ramp = (): number => {
+            const from = buffer.smoothFromCursor!;
+            const gap = (buffer.smoothRawCursor! - from + size) % size;
+            // Lag left behind by a held-back step (capCursorStep) drains at twice the rate,
+            // so a second host pause does not stack on the first. capCursorStep still bounds
+            // each query's advance, so draining faster cannot become a jump.
+            const speed = gap > leadBytes / 2
+                && !(globalThis as { __noCursorCatchup?: boolean }).__noCursorCatchup
+                ? SMOOTH_CATCHUP_SPEEDUP : 1;
+            const moved = Math.min(gap, (now - buffer.smoothRawAtMs!) * bytesPerMs * speed);
+            return (from + moved) % size;
+        };
+        let cursor: number;
+        if (buffer.smoothRawCursor === undefined || bytesPerMs <= 0) {
+            // A starting stream opens its output latency by ramping, not by a jump.
+            buffer.smoothFromCursor = (raw - latencyBytes + size) % size;
+            buffer.smoothRawCursor = raw;
+            buffer.smoothRawAtMs = now;
+            cursor = buffer.smoothFromCursor;
+        } else if (raw !== buffer.smoothRawCursor) {
+            let from = ramp();
+            // The raw cursor only moves forward (a seek or a restart resets this state), so
+            // the modular distance is always a lag, however large; never read it as a seek.
+            // Past lead + latency the write cursor is behind the worklet: data is lost anyway.
+            const lag = (raw - from + size) % size;
+            const maxLag = leadBytes + latencyBytes;
+            if (lag > maxLag) from = (raw - maxLag + size) % size;
+            buffer.smoothFromCursor = from;
+            buffer.smoothRawCursor = raw;
+            buffer.smoothRawAtMs = now;
+            cursor = from;
+        } else {
+            cursor = ramp();
+        }
+        cursor = this.capCursorStep(buffer, cursor, now, (hz * blockAlign) / 1000);
+        return cursor - (cursor % blockAlign);
+    }
+
+    /**
+     * A caller polling every millisecond never sees the cursor leap ten on real hardware,
+     * because nothing stops it for ten: its thread is not descheduled that long. Here a host
+     * pause (a V8 GC, a GPU-client stall) stops every guest thread at once, and a pump that
+     * writes one chunk per wake then finds the cursor two chunks on and never writes the one
+     * between. So the advance a buffer shows between two queries is bounded by a few of its
+     * caller's typical query gaps. Holding the cursor back only spends the write-cursor lead
+     * (see dsoundLeadBytes) — it can never report bytes the mixer has not consumed — and it
+     * re-anchors the ramp so the lag drains over the next queries. The typical gap ignores
+     * back-to-back queries (<0.2ms), so a caller that polls in bursts is judged by its real
+     * period and is left alone.
+     */
+    private readonly stepGapScratch = new Float64Array(CURSOR_GAP_WINDOW);
+
+    private capCursorStep(buffer: SoundBuffer, cursor: number, now: number, nominalBytesPerMs: number): number {
+        const lastAt = buffer.stepLastQueryAt;
+        const last = buffer.stepLastCursor;
+        buffer.stepLastQueryAt = now;
+        if (lastAt === undefined || last === undefined
+            || (globalThis as { __noCursorStepCap?: boolean }).__noCursorStepCap) {
+            buffer.stepLastCursor = cursor;
+            return cursor;
+        }
+        const gap = now - lastAt;
+        if (gap >= CURSOR_QUERY_BURST_MS) {
+            // The median, not a mean: the gaps that matter here are exactly the outliers (a
+            // host pause), and a mean they pull up would loosen the bound they must be held to.
+            const ring = buffer.stepGaps ?? (buffer.stepGaps = new Float64Array(CURSOR_GAP_WINDOW));
+            const count = buffer.stepGapCount ?? 0;
+            ring[count % CURSOR_GAP_WINDOW] = gap;
+            buffer.stepGapCount = count + 1;
+            buffer.stepTypicalGapMs = medianOf(ring, Math.min(count + 1, CURSOR_GAP_WINDOW), this.stepGapScratch);
+        }
+        const typical = buffer.stepTypicalGapMs;
+        if (typical !== undefined) {
+            const size = this.ringSize(buffer);
+            const advance = (cursor - last + size) % size;
+            // An app that writes one Lock's worth per wake loses a whole block when the cursor
+            // moves a Lock's worth or more between two of its queries, so that is the bound;
+            // the query cadence only bounds apps whose Lock size is not yet known.
+            // Floored at one typical gap of playback: below that the bound caps the RATE, not
+            // a pause's jump, and a pump that sizes each Lock from the cursor delta feeds its
+            // shrinking Locks back into the bound until it streams a fraction of real time.
+            const lockCount = buffer.stepLockCount ?? 0;
+            const limit = lockCount > 0
+                ? Math.max(typical * nominalBytesPerMs,
+                    medianOf(buffer.stepLockSizes!, Math.min(lockCount, CURSOR_LOCK_WINDOW), this.stepGapScratch)
+                        - Math.max(1, buffer.format.blockAlign))
+                : Math.max(1, typical * CURSOR_STEP_TYPICAL_GAPS) * nominalBytesPerMs;
+            if (advance > limit) {
+                cursor = (last + Math.floor(limit)) % size;
+                buffer.smoothFromCursor = cursor;
+                buffer.smoothRawAtMs = now;
+            }
+        }
+        buffer.stepLastCursor = cursor;
+        return cursor;
     }
 
     private dsoundStoppedWriteCursor(buffer: SoundBuffer, playCursor: number): number {
@@ -2521,18 +3099,37 @@ export class DSound implements IModule {
         return cursor;
     }
 
+    /** The cursors last reported to the app, for diagnostics: a query advances the reported
+     *  cursor's state (capCursorStep counts every query as one of the app's steps). */
+    private peekApiCursors(buffer: SoundBuffer): { playCursor: number; writeCursor: number } {
+        if (!buffer.sab || buffer.bytes <= 0) return { playCursor: 0, writeCursor: 0 };
+        if (!buffer.isPlaying || buffer.stepLastCursor === undefined) {
+            const playCursor = (buffer.currentPosition ?? 0) % buffer.bytes;
+            return { playCursor, writeCursor: this.dsoundStoppedWriteCursor(buffer, playCursor) };
+        }
+        const blockAlign = Math.max(1, buffer.format.blockAlign);
+        let playCursor = Math.floor(buffer.stepLastCursor) % buffer.bytes;
+        playCursor -= playCursor % blockAlign;
+        return { playCursor, writeCursor: (playCursor + (buffer.reportedLeadBytes ?? 0)) % buffer.bytes };
+    }
+
     private getApiCursors(buffer: SoundBuffer): { playCursor: number; writeCursor: number } {
         if (!buffer.sab || buffer.bytes <= 0) {
             return { playCursor: 0, writeCursor: 0 };
         }
 
         if (buffer.isPlaying) {
-            const rawCursor = this.isDeterministicAudio()
-                ? this.deterministicPlayCursor(buffer)
-                : getCtrl(buffer.sab, CTRL_PLAY_CURSOR);
-            const playCursor = rawCursor % buffer.bytes;
+            const leadTarget = this.dsoundLeadBytes(buffer);
+            const latency = this.hostLatencyBytes(buffer);
+            const ring = this.ringSize(buffer);
+            this.trailRing(buffer);
+            this.syncFrontierHold(buffer);
+            const playCursor = this.isDeterministicAudio()
+                ? this.deterministicPlayCursor(buffer) % buffer.bytes
+                : this.smoothedPlayCursor(buffer,
+                    ((getCtrl(buffer.sab, CTRL_PLAY_CURSOR) % ring) + latency) % ring, leadTarget, latency) % buffer.bytes;
             // Faithful DSound: the write cursor LEADS the play cursor by the software
-            // mixer's premix-queue depth (30 ms, adaptive to 80 ms; see dsoundLeadBytes).
+            // mixer's premixed region (45 ms ramping to 200 ms; see dsoundLeadBytes).
             // The span [play, write) is committed to the mixer and unsafe to
             // overwrite; a streaming app writes AHEAD of
             // `write`. Write-cursor-driven mixers (UE1/Galaxy) splice at
@@ -2544,16 +3141,24 @@ export class DSound implements IModule {
             // write out-param of GetCurrentPosition is fetched and discarded — so
             // this lead choice is a no-op for that title and exists for correctness
             // toward the clients that DO read it.
-            const leadBytes = this.dsoundLeadBytes(buffer);
+            const leadBytes = this.monotonicLeadBytes(buffer, playCursor, leadTarget);
             return { playCursor, writeCursor: (playCursor + leadBytes) % buffer.bytes };
         }
 
+        buffer.reportedLeadBytes = undefined;
+        buffer.lastReportedPlayCursor = undefined;
+        buffer.smoothRawCursor = undefined;
+        buffer.stepLastCursor = undefined;
         const playCursor = (buffer.currentPosition ?? 0) % buffer.bytes;
         return { playCursor, writeCursor: this.dsoundStoppedWriteCursor(buffer, playCursor) };
     }
 
     private destroySoundBuffer(buffer: SoundBuffer): void {
         this.recordLife("destroy", buffer.id, undefined, `wasPlaying=${buffer.isPlaying} bytes=${buffer.bytes}`);
+        // A destroyed buffer is not playing: drop the state before the ring goes away so
+        // nothing (notification pump, debug snapshot) can read it back as live.
+        buffer.isPlaying = false;
+        buffer.isLooping = false;
         if (buffer.registered) {
             self.postMessage({ type: "audio_unregister", payload: { id: buffer.id } });
             buffer.registered = false;
@@ -2585,6 +3190,91 @@ export class DSound implements IModule {
         const obj = this.objects.get(ptr);
         if (!obj || obj.type !== "IDirectSoundCaptureBuffer8" || !obj.capture) return null;
         return obj.capture;
+    }
+
+    /**
+     * The capture half of DirectSoundCaptureDevice_Initialize: NULL/GUID_NULL and the two
+     * default-capture aliases name the one capture device DirectSoundCaptureEnumerate
+     * reports; a playback alias is DSERR_NODRIVER and any other GUID is unknown.
+     */
+    private checkCaptureDevice(guidPtr: number): number {
+        if (!guidPtr) return DS_OK;
+        if (!isValidAddress(guidPtr, 16, "r")) return DSERR_INVALIDPARAM;
+        const mem = this.getMemory();
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        let isNull = true;
+        for (let i = 0; i < 16; i += 4) if (view.getUint32(guidPtr + i, true) !== 0) isNull = false;
+        if (isNull) return DS_OK;
+        if (this.guidEquals(view, guidPtr, GUID_DEFAULT_CAPTURE) ||
+            this.guidEquals(view, guidPtr, GUID_DEFAULT_VOICE_CAPTURE)) return DS_OK;
+        if (this.guidEquals(view, guidPtr, GUID_DEFAULT_PLAYBACK) ||
+            this.guidEquals(view, guidPtr, GUID_DEFAULT_VOICE_PLAYBACK)) return DSERR_NODRIVER;
+        return DSERR_INVALIDPARAM;
+    }
+
+    /**
+     * IDirectSoundFullDuplex::Initialize (this, pCaptureGuid, pRendGuid, lpDscBufferDesc,
+     * lpDsBufferDesc, hWnd, dwLevel, lplpDscBuffer8, lplpDsBuffer8), as Wine duplex.c: a DS8
+     * render device and its buffer first, then the capture device and its buffer, and on any
+     * failure nothing survives.
+     */
+    private initializeFullDuplex(ctx: X86Context, mem: Uint8Array, args: number[]): number {
+        const obj = this.objects.get(args[0] >>> 0);
+        if (!obj || obj.type !== "IDirectSoundFullDuplex") return DSERR_INVALIDPARAM;
+        const ppDscb8 = args[7] >>> 0;
+        const ppDsb8 = args[8] >>> 0;
+        if (!ppDscb8 || !ppDsb8 || !isValidAddress(ppDscb8, 4, "rw") || !isValidAddress(ppDsb8, 4, "rw")) {
+            return E_INVALIDARG;
+        }
+        Mem.writeUint32(ppDscb8, 0);
+        Mem.writeUint32(ppDsb8, 0);
+        if (obj.duplex) return DSERR_ALREADYINITIALIZED;
+
+        const call = (name: string, callArgs: number[]): number => {
+            const ret = this.exports[name]!(ctx, mem, callArgs);
+            return typeof ret === "number" ? ret >>> 0 : DSERR_INVALIDPARAM;
+        };
+        const ds = this.createObject("IDirectSound8", this.vtables.IDirectSound8.address, undefined, undefined, true);
+        let dsc = 0;
+        let hr = call("idirectsound8_initialize", [ds, args[2] >>> 0]);
+        if (hr === DS_OK) {
+            call("idirectsound8_setcooperativelevel", [ds, args[5] >>> 0, args[6] >>> 0]);
+            hr = call("idirectsound8_createsoundbuffer", [ds, args[4] >>> 0, ppDsb8, 0]);
+        }
+        if (hr === DS_OK) hr = this.checkCaptureDevice(args[1] >>> 0);
+        if (hr === DS_OK) {
+            dsc = this.createObject("IDirectSoundCapture", this.vtables.IDirectSoundCapture.address);
+            hr = call("idirectsoundcapture_createcapturebuffer", [dsc, args[3] >>> 0, ppDscb8, 0]);
+        }
+        if (hr !== DS_OK) {
+            const dsb = Mem.readUint32(ppDsb8) ?? 0;
+            if (dsb) call("IDirectSoundBuffer8_Release", [dsb]);
+            const dscb = Mem.readUint32(ppDscb8) ?? 0;
+            if (dscb) call("IDirectSoundCaptureBuffer8_Release", [dscb]);
+            Mem.writeUint32(ppDsb8, 0);
+            Mem.writeUint32(ppDscb8, 0);
+            if (dsc) call("IDirectSoundCapture_Release", [dsc]);
+            call("IDirectSound8_Release", [ds]);
+            return hr;
+        }
+        obj.duplex = { ds, dsc };
+        return DS_OK;
+    }
+
+    /** The last reference takes the owned render and capture devices with it. */
+    private releaseFullDuplex(ctx: X86Context, mem: Uint8Array, ptr: number): number {
+        const obj = this.objects.get(ptr);
+        if (!obj || obj.type !== "IDirectSoundFullDuplex") return 0;
+        obj.refCount -= 1;
+        if (obj.refCount <= 0) {
+            if (obj.duplex) {
+                this.exports["IDirectSound8_Release"]!(ctx, mem, [obj.duplex.ds]);
+                this.exports["IDirectSoundCapture_Release"]!(ctx, mem, [obj.duplex.dsc]);
+            }
+            this.objects.delete(ptr);
+            freeComObject(this.process.memory, ptr);
+        }
+        return Math.max(0, obj.refCount);
     }
 
     private readBufferDesc(descPtr: number): {
@@ -2743,7 +3433,7 @@ export class DSound implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     reset(): void {
@@ -2764,11 +3454,19 @@ export class DSound implements IModule {
         this.primaryBufferPtr = 0;
         this.speakerConfig = DEFAULT_SPEAKER_CONFIG;
         this.nextBufferId = DSOUND_AUDIO_ID_BASE;
+        this.listenerState = {
+            posX: 0, posY: 0, posZ: 0,
+            velX: 0, velY: 0, velZ: 0,
+            frontX: 0, frontY: 0, frontZ: 1,
+            topX: 0, topY: 1, topZ: 0,
+            distanceFactor: 1.0, rolloffFactor: 1.0, dopplerFactor: 1.0,
+        };
+        this.deferredListenerState = null;
+        this.flushListenerToSab();
     }
 
     recreateVTables(): void {
         if (this.process) {
-            this.memory = this.getMemory();
             this.vtables = createVTablesFromDescriptor(this.process, dsoundModule);
             Logger.verbose(LogCategory.SYSTEM, `DirectSound: Recreated vtables after reset`);
 

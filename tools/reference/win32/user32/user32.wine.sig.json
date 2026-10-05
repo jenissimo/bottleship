@@ -1,0 +1,3136 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.946Z",
+  "module": "user32",
+  "functions": [
+    {
+      "name": "ActivateKeyboardLayout",
+      "argCount": 2
+    },
+    {
+      "name": "AddClipboardFormatListener",
+      "argCount": 1
+    },
+    {
+      "name": "AdjustWindowRect",
+      "argCount": 3
+    },
+    {
+      "name": "AdjustWindowRectEx",
+      "argCount": 4
+    },
+    {
+      "name": "AdjustWindowRectExForDpi",
+      "argCount": 5
+    },
+    {
+      "name": "AlignRects",
+      "argCount": 4
+    },
+    {
+      "name": "AllowSetForegroundWindow",
+      "argCount": 1
+    },
+    {
+      "name": "AnimateWindow",
+      "argCount": 3
+    },
+    {
+      "name": "AnyPopup",
+      "argCount": 0
+    },
+    {
+      "name": "AppendMenuA",
+      "argCount": 4
+    },
+    {
+      "name": "AppendMenuW",
+      "argCount": 4
+    },
+    {
+      "name": "AreDpiAwarenessContextsEqual",
+      "argCount": 2
+    },
+    {
+      "name": "ArrangeIconicWindows",
+      "argCount": 1
+    },
+    {
+      "name": "AttachThreadInput",
+      "argCount": 3
+    },
+    {
+      "name": "BeginDeferWindowPos",
+      "argCount": 1
+    },
+    {
+      "name": "BeginPaint",
+      "argCount": 2
+    },
+    {
+      "name": "BlockInput",
+      "argCount": 1
+    },
+    {
+      "name": "BringWindowToTop",
+      "argCount": 1
+    },
+    {
+      "name": "BroadcastSystemMessage",
+      "argCount": 5
+    },
+    {
+      "name": "BroadcastSystemMessageA",
+      "argCount": 5
+    },
+    {
+      "name": "BroadcastSystemMessageExA",
+      "argCount": 6
+    },
+    {
+      "name": "BroadcastSystemMessageExW",
+      "argCount": 6
+    },
+    {
+      "name": "BroadcastSystemMessageW",
+      "argCount": 5
+    },
+    {
+      "name": "CalcChildScroll",
+      "argCount": 2
+    },
+    {
+      "name": "CalcMenuBar",
+      "argCount": 5
+    },
+    {
+      "name": "CallMsgFilter",
+      "argCount": 2
+    },
+    {
+      "name": "CallMsgFilterA",
+      "argCount": 2
+    },
+    {
+      "name": "CallMsgFilterW",
+      "argCount": 2
+    },
+    {
+      "name": "CallNextHookEx",
+      "argCount": 4
+    },
+    {
+      "name": "CallWindowProcA",
+      "argCount": 5
+    },
+    {
+      "name": "CallWindowProcW",
+      "argCount": 5
+    },
+    {
+      "name": "CascadeChildWindows",
+      "argCount": 2
+    },
+    {
+      "name": "CascadeWindows",
+      "argCount": 5
+    },
+    {
+      "name": "ChangeClipboardChain",
+      "argCount": 2
+    },
+    {
+      "name": "ChangeDisplaySettingsA",
+      "argCount": 2
+    },
+    {
+      "name": "ChangeDisplaySettingsExA",
+      "argCount": 5
+    },
+    {
+      "name": "ChangeDisplaySettingsExW",
+      "argCount": 5
+    },
+    {
+      "name": "ChangeDisplaySettingsW",
+      "argCount": 2
+    },
+    {
+      "name": "ChangeMenuA",
+      "argCount": 5
+    },
+    {
+      "name": "ChangeMenuW",
+      "argCount": 5
+    },
+    {
+      "name": "ChangeWindowMessageFilter",
+      "argCount": 2
+    },
+    {
+      "name": "ChangeWindowMessageFilterEx",
+      "argCount": 4
+    },
+    {
+      "name": "CharLowerA",
+      "argCount": 1
+    },
+    {
+      "name": "CharLowerBuffA",
+      "argCount": 2
+    },
+    {
+      "name": "CharLowerBuffW",
+      "argCount": 2
+    },
+    {
+      "name": "CharLowerW",
+      "argCount": 1
+    },
+    {
+      "name": "CharNextA",
+      "argCount": 1
+    },
+    {
+      "name": "CharNextExA",
+      "argCount": 3
+    },
+    {
+      "name": "CharNextExW",
+      "argCount": 3
+    },
+    {
+      "name": "CharNextW",
+      "argCount": 1
+    },
+    {
+      "name": "CharPrevA",
+      "argCount": 2
+    },
+    {
+      "name": "CharPrevExA",
+      "argCount": 4
+    },
+    {
+      "name": "CharPrevExW",
+      "argCount": 4
+    },
+    {
+      "name": "CharPrevW",
+      "argCount": 2
+    },
+    {
+      "name": "CharToOemA",
+      "argCount": 2
+    },
+    {
+      "name": "CharToOemBuffA",
+      "argCount": 3
+    },
+    {
+      "name": "CharToOemBuffW",
+      "argCount": 3
+    },
+    {
+      "name": "CharToOemW",
+      "argCount": 2
+    },
+    {
+      "name": "CharUpperA",
+      "argCount": 1
+    },
+    {
+      "name": "CharUpperBuffA",
+      "argCount": 2
+    },
+    {
+      "name": "CharUpperBuffW",
+      "argCount": 2
+    },
+    {
+      "name": "CharUpperW",
+      "argCount": 1
+    },
+    {
+      "name": "CheckDlgButton",
+      "argCount": 3
+    },
+    {
+      "name": "CheckMenuItem",
+      "argCount": 3
+    },
+    {
+      "name": "CheckMenuRadioItem",
+      "argCount": 5
+    },
+    {
+      "name": "CheckRadioButton",
+      "argCount": 4
+    },
+    {
+      "name": "ChildWindowFromPoint",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ChildWindowFromPointEx",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ClientToScreen",
+      "argCount": 2
+    },
+    {
+      "name": "ClipCursor",
+      "argCount": 1
+    },
+    {
+      "name": "CloseClipboard",
+      "argCount": 0
+    },
+    {
+      "name": "CloseDesktop",
+      "argCount": 1
+    },
+    {
+      "name": "CloseGestureInfoHandle",
+      "argCount": 1
+    },
+    {
+      "name": "CloseTouchInputHandle",
+      "argCount": 1
+    },
+    {
+      "name": "CloseWindow",
+      "argCount": 1
+    },
+    {
+      "name": "CloseWindowStation",
+      "argCount": 1
+    },
+    {
+      "name": "CopyAcceleratorTableA",
+      "argCount": 3
+    },
+    {
+      "name": "CopyAcceleratorTableW",
+      "argCount": 3
+    },
+    {
+      "name": "CopyIcon",
+      "argCount": 1
+    },
+    {
+      "name": "CopyImage",
+      "argCount": 5
+    },
+    {
+      "name": "CopyRect",
+      "argCount": 2
+    },
+    {
+      "name": "CountClipboardFormats",
+      "argCount": 0
+    },
+    {
+      "name": "CreateAcceleratorTableA",
+      "argCount": 2
+    },
+    {
+      "name": "CreateAcceleratorTableW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateCaret",
+      "argCount": 4
+    },
+    {
+      "name": "CreateCursor",
+      "argCount": 7
+    },
+    {
+      "name": "CreateDesktopA",
+      "argCount": 6
+    },
+    {
+      "name": "CreateDesktopW",
+      "argCount": 6
+    },
+    {
+      "name": "CreateDialogIndirectParamA",
+      "argCount": 5
+    },
+    {
+      "name": "CreateDialogIndirectParamAorW",
+      "argCount": 6
+    },
+    {
+      "name": "CreateDialogIndirectParamW",
+      "argCount": 5
+    },
+    {
+      "name": "CreateDialogParamA",
+      "argCount": 5
+    },
+    {
+      "name": "CreateDialogParamW",
+      "argCount": 5
+    },
+    {
+      "name": "CreateIcon",
+      "argCount": 7
+    },
+    {
+      "name": "CreateIconFromResource",
+      "argCount": 4
+    },
+    {
+      "name": "CreateIconFromResourceEx",
+      "argCount": 7
+    },
+    {
+      "name": "CreateIconIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "CreateMDIWindowA",
+      "argCount": 10
+    },
+    {
+      "name": "CreateMDIWindowW",
+      "argCount": 10
+    },
+    {
+      "name": "CreateMenu",
+      "argCount": 0
+    },
+    {
+      "name": "CreatePopupMenu",
+      "argCount": 0
+    },
+    {
+      "name": "CreateSyntheticPointerDevice",
+      "argCount": 3
+    },
+    {
+      "name": "CreateWindowExA",
+      "argCount": 12
+    },
+    {
+      "name": "CreateWindowExW",
+      "argCount": 12
+    },
+    {
+      "name": "CreateWindowStationA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateWindowStationW",
+      "argCount": 4
+    },
+    {
+      "name": "DdeAbandonTransaction",
+      "argCount": 3
+    },
+    {
+      "name": "DdeAccessData",
+      "argCount": 2
+    },
+    {
+      "name": "DdeAddData",
+      "argCount": 4
+    },
+    {
+      "name": "DdeClientTransaction",
+      "argCount": 8
+    },
+    {
+      "name": "DdeCmpStringHandles",
+      "argCount": 2
+    },
+    {
+      "name": "DdeConnect",
+      "argCount": 4
+    },
+    {
+      "name": "DdeConnectList",
+      "argCount": 5
+    },
+    {
+      "name": "DdeCreateDataHandle",
+      "argCount": 7
+    },
+    {
+      "name": "DdeCreateStringHandleA",
+      "argCount": 3
+    },
+    {
+      "name": "DdeCreateStringHandleW",
+      "argCount": 3
+    },
+    {
+      "name": "DdeDisconnect",
+      "argCount": 1
+    },
+    {
+      "name": "DdeDisconnectList",
+      "argCount": 1
+    },
+    {
+      "name": "DdeEnableCallback",
+      "argCount": 3
+    },
+    {
+      "name": "DdeFreeDataHandle",
+      "argCount": 1
+    },
+    {
+      "name": "DdeFreeStringHandle",
+      "argCount": 2
+    },
+    {
+      "name": "DdeGetData",
+      "argCount": 4
+    },
+    {
+      "name": "DdeGetLastError",
+      "argCount": 1
+    },
+    {
+      "name": "DdeImpersonateClient",
+      "argCount": 1
+    },
+    {
+      "name": "DdeInitializeA",
+      "argCount": 4
+    },
+    {
+      "name": "DdeInitializeW",
+      "argCount": 4
+    },
+    {
+      "name": "DdeKeepStringHandle",
+      "argCount": 2
+    },
+    {
+      "name": "DdeNameService",
+      "argCount": 4
+    },
+    {
+      "name": "DdePostAdvise",
+      "argCount": 3
+    },
+    {
+      "name": "DdeQueryConvInfo",
+      "argCount": 3
+    },
+    {
+      "name": "DdeQueryNextServer",
+      "argCount": 2
+    },
+    {
+      "name": "DdeQueryStringA",
+      "argCount": 5
+    },
+    {
+      "name": "DdeQueryStringW",
+      "argCount": 5
+    },
+    {
+      "name": "DdeReconnect",
+      "argCount": 1
+    },
+    {
+      "name": "DdeSetQualityOfService",
+      "argCount": 3
+    },
+    {
+      "name": "DdeSetUserHandle",
+      "argCount": 3
+    },
+    {
+      "name": "DdeUnaccessData",
+      "argCount": 1
+    },
+    {
+      "name": "DdeUninitialize",
+      "argCount": 1
+    },
+    {
+      "name": "DefDlgProcA",
+      "argCount": 4
+    },
+    {
+      "name": "DefDlgProcW",
+      "argCount": 4
+    },
+    {
+      "name": "DeferWindowPos",
+      "argCount": 8
+    },
+    {
+      "name": "DefFrameProcA",
+      "argCount": 5
+    },
+    {
+      "name": "DefFrameProcW",
+      "argCount": 5
+    },
+    {
+      "name": "DefMDIChildProcA",
+      "argCount": 4
+    },
+    {
+      "name": "DefMDIChildProcW",
+      "argCount": 4
+    },
+    {
+      "name": "DefRawInputProc",
+      "argCount": 3
+    },
+    {
+      "name": "DefWindowProcA",
+      "argCount": 4
+    },
+    {
+      "name": "DefWindowProcW",
+      "argCount": 4
+    },
+    {
+      "name": "DelegateInput",
+      "argCount": 6
+    },
+    {
+      "name": "DeleteMenu",
+      "argCount": 3
+    },
+    {
+      "name": "DeregisterShellHookWindow",
+      "argCount": 1
+    },
+    {
+      "name": "DestroyAcceleratorTable",
+      "argCount": 1
+    },
+    {
+      "name": "DestroyCaret",
+      "argCount": 0
+    },
+    {
+      "name": "DestroyCursor",
+      "argCount": 1
+    },
+    {
+      "name": "DestroyIcon",
+      "argCount": 1
+    },
+    {
+      "name": "DestroyMenu",
+      "argCount": 1
+    },
+    {
+      "name": "DestroyWindow",
+      "argCount": 1
+    },
+    {
+      "name": "DialogBoxIndirectParamA",
+      "argCount": 5
+    },
+    {
+      "name": "DialogBoxIndirectParamAorW",
+      "argCount": 6
+    },
+    {
+      "name": "DialogBoxIndirectParamW",
+      "argCount": 5
+    },
+    {
+      "name": "DialogBoxParamA",
+      "argCount": 5
+    },
+    {
+      "name": "DialogBoxParamW",
+      "argCount": 5
+    },
+    {
+      "name": "DisableProcessWindowsGhosting",
+      "argCount": 0
+    },
+    {
+      "name": "DispatchMessageA",
+      "argCount": 1
+    },
+    {
+      "name": "DispatchMessageW",
+      "argCount": 1
+    },
+    {
+      "name": "DisplayConfigGetDeviceInfo",
+      "argCount": 1
+    },
+    {
+      "name": "DisplayConfigSetDeviceInfo",
+      "argCount": 1
+    },
+    {
+      "name": "DlgDirListA",
+      "argCount": 5
+    },
+    {
+      "name": "DlgDirListComboBoxA",
+      "argCount": 5
+    },
+    {
+      "name": "DlgDirListComboBoxW",
+      "argCount": 5
+    },
+    {
+      "name": "DlgDirListW",
+      "argCount": 5
+    },
+    {
+      "name": "DlgDirSelectComboBoxExA",
+      "argCount": 4
+    },
+    {
+      "name": "DlgDirSelectComboBoxExW",
+      "argCount": 4
+    },
+    {
+      "name": "DlgDirSelectExA",
+      "argCount": 4
+    },
+    {
+      "name": "DlgDirSelectExW",
+      "argCount": 4
+    },
+    {
+      "name": "DragDetect",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "DragObject",
+      "argCount": 5
+    },
+    {
+      "name": "DrawAnimatedRects",
+      "argCount": 4
+    },
+    {
+      "name": "DrawCaption",
+      "argCount": 4
+    },
+    {
+      "name": "DrawCaptionTempA",
+      "argCount": 7
+    },
+    {
+      "name": "DrawCaptionTempW",
+      "argCount": 7
+    },
+    {
+      "name": "DrawEdge",
+      "argCount": 4
+    },
+    {
+      "name": "DrawFocusRect",
+      "argCount": 2
+    },
+    {
+      "name": "DrawFrameControl",
+      "argCount": 4
+    },
+    {
+      "name": "DrawIcon",
+      "argCount": 4
+    },
+    {
+      "name": "DrawIconEx",
+      "argCount": 9
+    },
+    {
+      "name": "DrawMenuBar",
+      "argCount": 1
+    },
+    {
+      "name": "DrawMenuBarTemp",
+      "argCount": 5
+    },
+    {
+      "name": "DrawStateA",
+      "argCount": 10
+    },
+    {
+      "name": "DrawStateW",
+      "argCount": 10
+    },
+    {
+      "name": "DrawTextA",
+      "argCount": 5
+    },
+    {
+      "name": "DrawTextExA",
+      "argCount": 6
+    },
+    {
+      "name": "DrawTextExW",
+      "argCount": 6
+    },
+    {
+      "name": "DrawTextW",
+      "argCount": 5
+    },
+    {
+      "name": "EditWndProc",
+      "argCount": 4
+    },
+    {
+      "name": "EmptyClipboard",
+      "argCount": 0
+    },
+    {
+      "name": "EnableMenuItem",
+      "argCount": 3
+    },
+    {
+      "name": "EnableMouseInPointer",
+      "argCount": 1
+    },
+    {
+      "name": "EnableMouseInPointerForThread",
+      "argCount": 0
+    },
+    {
+      "name": "EnableNonClientDpiScaling",
+      "argCount": 1
+    },
+    {
+      "name": "EnableScrollBar",
+      "argCount": 3
+    },
+    {
+      "name": "EnableWindow",
+      "argCount": 2
+    },
+    {
+      "name": "EndDeferWindowPos",
+      "argCount": 1
+    },
+    {
+      "name": "EndDialog",
+      "argCount": 2
+    },
+    {
+      "name": "EndMenu",
+      "argCount": 0
+    },
+    {
+      "name": "EndPaint",
+      "argCount": 2
+    },
+    {
+      "name": "EnumChildWindows",
+      "argCount": 3
+    },
+    {
+      "name": "EnumClipboardFormats",
+      "argCount": 1
+    },
+    {
+      "name": "EnumDesktopsA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDesktopsW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDesktopWindows",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDisplayDevicesA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDisplayDevicesW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDisplayMonitors",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDisplaySettingsA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDisplaySettingsExA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDisplaySettingsExW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDisplaySettingsW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumPropsA",
+      "argCount": 2
+    },
+    {
+      "name": "EnumPropsExA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumPropsExW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumPropsW",
+      "argCount": 2
+    },
+    {
+      "name": "EnumThreadWindows",
+      "argCount": 3
+    },
+    {
+      "name": "EnumWindows",
+      "argCount": 2
+    },
+    {
+      "name": "EnumWindowStationsA",
+      "argCount": 2
+    },
+    {
+      "name": "EnumWindowStationsW",
+      "argCount": 2
+    },
+    {
+      "name": "EqualRect",
+      "argCount": 2
+    },
+    {
+      "name": "EvaluateProximityToRect",
+      "argCount": 3
+    },
+    {
+      "name": "ExcludeUpdateRgn",
+      "argCount": 2
+    },
+    {
+      "name": "ExitWindowsEx",
+      "argCount": 2
+    },
+    {
+      "name": "FillRect",
+      "argCount": 3
+    },
+    {
+      "name": "FindWindowA",
+      "argCount": 2
+    },
+    {
+      "name": "FindWindowExA",
+      "argCount": 4
+    },
+    {
+      "name": "FindWindowExW",
+      "argCount": 4
+    },
+    {
+      "name": "FindWindowW",
+      "argCount": 2
+    },
+    {
+      "name": "FlashWindow",
+      "argCount": 2
+    },
+    {
+      "name": "FlashWindowEx",
+      "argCount": 1
+    },
+    {
+      "name": "FrameRect",
+      "argCount": 3
+    },
+    {
+      "name": "FreeDDElParam",
+      "argCount": 2
+    },
+    {
+      "name": "GetActiveWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetAltTabInfo",
+      "argCount": 5
+    },
+    {
+      "name": "GetAltTabInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "GetAltTabInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "GetAncestor",
+      "argCount": 2
+    },
+    {
+      "name": "GetAppCompatFlags",
+      "argCount": 1
+    },
+    {
+      "name": "GetAppCompatFlags2",
+      "argCount": 1
+    },
+    {
+      "name": "GetAsyncKeyState",
+      "argCount": 1
+    },
+    {
+      "name": "GetAutoRotationState",
+      "argCount": 1
+    },
+    {
+      "name": "GetAwarenessFromDpiAwarenessContext",
+      "argCount": 1
+    },
+    {
+      "name": "GetCapture",
+      "argCount": 0
+    },
+    {
+      "name": "GetCaretBlinkTime",
+      "argCount": 0
+    },
+    {
+      "name": "GetCaretPos",
+      "argCount": 1
+    },
+    {
+      "name": "GetClassInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassInfoExA",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassInfoExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassLongA",
+      "argCount": 2
+    },
+    {
+      "name": "GetClassLongW",
+      "argCount": 2
+    },
+    {
+      "name": "GetClassNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClassWord",
+      "argCount": 2
+    },
+    {
+      "name": "GetClientRect",
+      "argCount": 2
+    },
+    {
+      "name": "GetClipboardData",
+      "argCount": 1
+    },
+    {
+      "name": "GetClipboardFormatNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetClipboardFormatNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetClipboardOwner",
+      "argCount": 0
+    },
+    {
+      "name": "GetClipboardSequenceNumber",
+      "argCount": 0
+    },
+    {
+      "name": "GetClipboardViewer",
+      "argCount": 0
+    },
+    {
+      "name": "GetClipCursor",
+      "argCount": 1
+    },
+    {
+      "name": "GetComboBoxInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentInputMessageSource",
+      "argCount": 1
+    },
+    {
+      "name": "GetCursor",
+      "argCount": 0
+    },
+    {
+      "name": "GetCursorFrameInfo",
+      "argCount": 5
+    },
+    {
+      "name": "GetCursorInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetCursorPos",
+      "argCount": 1
+    },
+    {
+      "name": "GetDC",
+      "argCount": 1
+    },
+    {
+      "name": "GetDCEx",
+      "argCount": 3
+    },
+    {
+      "name": "GetDesktopWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetDialogBaseUnits",
+      "argCount": 0
+    },
+    {
+      "name": "GetDisplayAutoRotationPreferences",
+      "argCount": 1
+    },
+    {
+      "name": "GetDisplayConfigBufferSizes",
+      "argCount": 3
+    },
+    {
+      "name": "GetDlgCtrlID",
+      "argCount": 1
+    },
+    {
+      "name": "GetDlgItem",
+      "argCount": 2
+    },
+    {
+      "name": "GetDlgItemInt",
+      "argCount": 4
+    },
+    {
+      "name": "GetDlgItemTextA",
+      "argCount": 4
+    },
+    {
+      "name": "GetDlgItemTextW",
+      "argCount": 4
+    },
+    {
+      "name": "GetDoubleClickTime",
+      "argCount": 0
+    },
+    {
+      "name": "GetDpiAwarenessContextForProcess",
+      "argCount": 1
+    },
+    {
+      "name": "GetDpiForMonitorInternal",
+      "argCount": 4
+    },
+    {
+      "name": "GetDpiForSystem",
+      "argCount": 0
+    },
+    {
+      "name": "GetDpiForWindow",
+      "argCount": 1
+    },
+    {
+      "name": "GetDpiFromDpiAwarenessContext",
+      "argCount": 1
+    },
+    {
+      "name": "GetFocus",
+      "argCount": 0
+    },
+    {
+      "name": "GetForegroundWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetGestureConfig",
+      "argCount": 6
+    },
+    {
+      "name": "GetGestureExtraArgs",
+      "argCount": 3
+    },
+    {
+      "name": "GetGestureInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetGuiResources",
+      "argCount": 2
+    },
+    {
+      "name": "GetGUIThreadInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetIconInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetIconInfoExA",
+      "argCount": 2
+    },
+    {
+      "name": "GetIconInfoExW",
+      "argCount": 2
+    },
+    {
+      "name": "GetInputState",
+      "argCount": 0
+    },
+    {
+      "name": "GetInternalWindowPos",
+      "argCount": 3
+    },
+    {
+      "name": "GetKBCodePage",
+      "argCount": 0
+    },
+    {
+      "name": "GetKeyboardLayout",
+      "argCount": 1
+    },
+    {
+      "name": "GetKeyboardLayoutList",
+      "argCount": 2
+    },
+    {
+      "name": "GetKeyboardLayoutNameA",
+      "argCount": 1
+    },
+    {
+      "name": "GetKeyboardLayoutNameW",
+      "argCount": 1
+    },
+    {
+      "name": "GetKeyboardState",
+      "argCount": 1
+    },
+    {
+      "name": "GetKeyboardType",
+      "argCount": 1
+    },
+    {
+      "name": "GetKeyNameTextA",
+      "argCount": 3
+    },
+    {
+      "name": "GetKeyNameTextW",
+      "argCount": 3
+    },
+    {
+      "name": "GetKeyState",
+      "argCount": 1
+    },
+    {
+      "name": "GetLastActivePopup",
+      "argCount": 1
+    },
+    {
+      "name": "GetLastInputInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetLayeredWindowAttributes",
+      "argCount": 4
+    },
+    {
+      "name": "GetListBoxInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetMenu",
+      "argCount": 1
+    },
+    {
+      "name": "GetMenuBarInfo",
+      "argCount": 4
+    },
+    {
+      "name": "GetMenuCheckMarkDimensions",
+      "argCount": 0
+    },
+    {
+      "name": "GetMenuContextHelpId",
+      "argCount": 1
+    },
+    {
+      "name": "GetMenuDefaultItem",
+      "argCount": 3
+    },
+    {
+      "name": "GetMenuInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetMenuItemCount",
+      "argCount": 1
+    },
+    {
+      "name": "GetMenuItemID",
+      "argCount": 2
+    },
+    {
+      "name": "GetMenuItemInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "GetMenuItemInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "GetMenuItemRect",
+      "argCount": 4
+    },
+    {
+      "name": "GetMenuState",
+      "argCount": 3
+    },
+    {
+      "name": "GetMenuStringA",
+      "argCount": 5
+    },
+    {
+      "name": "GetMenuStringW",
+      "argCount": 5
+    },
+    {
+      "name": "GetMessageA",
+      "argCount": 4
+    },
+    {
+      "name": "GetMessageExtraInfo",
+      "argCount": 0
+    },
+    {
+      "name": "GetMessagePos",
+      "argCount": 0
+    },
+    {
+      "name": "GetMessageTime",
+      "argCount": 0
+    },
+    {
+      "name": "GetMessageW",
+      "argCount": 4
+    },
+    {
+      "name": "GetMonitorInfoA",
+      "argCount": 2
+    },
+    {
+      "name": "GetMonitorInfoW",
+      "argCount": 2
+    },
+    {
+      "name": "GetMouseMovePointsEx",
+      "argCount": 5
+    },
+    {
+      "name": "GetNextDlgGroupItem",
+      "argCount": 3
+    },
+    {
+      "name": "GetNextDlgTabItem",
+      "argCount": 3
+    },
+    {
+      "name": "GetOpenClipboardWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetParent",
+      "argCount": 1
+    },
+    {
+      "name": "GetPhysicalCursorPos",
+      "argCount": 1
+    },
+    {
+      "name": "GetPointerDeviceProperties",
+      "argCount": 3
+    },
+    {
+      "name": "GetPointerDeviceRects",
+      "argCount": 3
+    },
+    {
+      "name": "GetPointerDevices",
+      "argCount": 2
+    },
+    {
+      "name": "GetPointerInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetPointerPenInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetPointerTouchInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetPointerTouchInfoHistory",
+      "argCount": 3
+    },
+    {
+      "name": "GetPointerType",
+      "argCount": 2
+    },
+    {
+      "name": "GetPriorityClipboardFormat",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessDefaultLayout",
+      "argCount": 1
+    },
+    {
+      "name": "GetProcessDpiAwarenessInternal",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessWindowStation",
+      "argCount": 0
+    },
+    {
+      "name": "GetProgmanWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetPropA",
+      "argCount": 2
+    },
+    {
+      "name": "GetPropW",
+      "argCount": 2
+    },
+    {
+      "name": "GetQueueStatus",
+      "argCount": 1
+    },
+    {
+      "name": "GetRawInputBuffer",
+      "argCount": 3
+    },
+    {
+      "name": "GetRawInputData",
+      "argCount": 5
+    },
+    {
+      "name": "GetRawInputDeviceInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "GetRawInputDeviceInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "GetRawInputDeviceList",
+      "argCount": 3
+    },
+    {
+      "name": "GetRawPointerDeviceData",
+      "argCount": 5
+    },
+    {
+      "name": "GetRegisteredRawInputDevices",
+      "argCount": 3
+    },
+    {
+      "name": "GetScrollBarInfo",
+      "argCount": 3
+    },
+    {
+      "name": "GetScrollInfo",
+      "argCount": 3
+    },
+    {
+      "name": "GetScrollPos",
+      "argCount": 2
+    },
+    {
+      "name": "GetScrollRange",
+      "argCount": 4
+    },
+    {
+      "name": "GetShellWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetSubMenu",
+      "argCount": 2
+    },
+    {
+      "name": "GetSysColor",
+      "argCount": 1
+    },
+    {
+      "name": "GetSysColorBrush",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemDpiForProcess",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemMenu",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemMetrics",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemMetricsForDpi",
+      "argCount": 2
+    },
+    {
+      "name": "GetTabbedTextExtentA",
+      "argCount": 5
+    },
+    {
+      "name": "GetTabbedTextExtentW",
+      "argCount": 5
+    },
+    {
+      "name": "GetTaskmanWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetThreadDesktop",
+      "argCount": 1
+    },
+    {
+      "name": "GetThreadDpiAwarenessContext",
+      "argCount": 0
+    },
+    {
+      "name": "GetThreadDpiHostingBehavior",
+      "argCount": 0
+    },
+    {
+      "name": "GetTitleBarInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetTopWindow",
+      "argCount": 1
+    },
+    {
+      "name": "GetTouchInputInfo",
+      "argCount": 4
+    },
+    {
+      "name": "GetUpdatedClipboardFormats",
+      "argCount": 3
+    },
+    {
+      "name": "GetUpdateRect",
+      "argCount": 3
+    },
+    {
+      "name": "GetUpdateRgn",
+      "argCount": 3
+    },
+    {
+      "name": "GetUserObjectInformationA",
+      "argCount": 5
+    },
+    {
+      "name": "GetUserObjectInformationW",
+      "argCount": 5
+    },
+    {
+      "name": "GetUserObjectSecurity",
+      "argCount": 5
+    },
+    {
+      "name": "GetWindow",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowContextHelpId",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowDC",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowDisplayAffinity",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowDpiAwarenessContext",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowDpiHostingBehavior",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowLongA",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowLongW",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowModuleFileName",
+      "argCount": 3
+    },
+    {
+      "name": "GetWindowModuleFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetWindowModuleFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetWindowPlacement",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowRect",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowRgn",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowRgnBox",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowTextA",
+      "argCount": 3
+    },
+    {
+      "name": "GetWindowTextLengthA",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowTextLengthW",
+      "argCount": 1
+    },
+    {
+      "name": "GetWindowTextW",
+      "argCount": 3
+    },
+    {
+      "name": "GetWindowThreadProcessId",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowWord",
+      "argCount": 2
+    },
+    {
+      "name": "GrayStringA",
+      "argCount": 9
+    },
+    {
+      "name": "GrayStringW",
+      "argCount": 9
+    },
+    {
+      "name": "HideCaret",
+      "argCount": 1
+    },
+    {
+      "name": "HiliteMenuItem",
+      "argCount": 4
+    },
+    {
+      "name": "ImpersonateDdeClientWindow",
+      "argCount": 2
+    },
+    {
+      "name": "InflateRect",
+      "argCount": 3
+    },
+    {
+      "name": "InitializeTouchInjection",
+      "argCount": 2
+    },
+    {
+      "name": "InSendMessage",
+      "argCount": 0
+    },
+    {
+      "name": "InSendMessageEx",
+      "argCount": 1
+    },
+    {
+      "name": "InsertMenuA",
+      "argCount": 5
+    },
+    {
+      "name": "InsertMenuItemA",
+      "argCount": 4
+    },
+    {
+      "name": "InsertMenuItemW",
+      "argCount": 4
+    },
+    {
+      "name": "InsertMenuW",
+      "argCount": 5
+    },
+    {
+      "name": "InternalGetWindowIcon",
+      "argCount": 2
+    },
+    {
+      "name": "InternalGetWindowText",
+      "argCount": 3
+    },
+    {
+      "name": "IntersectRect",
+      "argCount": 3
+    },
+    {
+      "name": "InvalidateRect",
+      "argCount": 3
+    },
+    {
+      "name": "InvalidateRgn",
+      "argCount": 3
+    },
+    {
+      "name": "InvertRect",
+      "argCount": 2
+    },
+    {
+      "name": "IsCharAlphaA",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharAlphaNumericA",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharAlphaNumericW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharAlphaW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharLowerA",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharLowerW",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharUpperA",
+      "argCount": 1
+    },
+    {
+      "name": "IsCharUpperW",
+      "argCount": 1
+    },
+    {
+      "name": "IsChild",
+      "argCount": 2
+    },
+    {
+      "name": "IsChildWindowDpiMessageEnabled",
+      "argCount": 1
+    },
+    {
+      "name": "IsClipboardFormatAvailable",
+      "argCount": 1
+    },
+    {
+      "name": "IsDialogMessage",
+      "argCount": 2
+    },
+    {
+      "name": "IsDialogMessageA",
+      "argCount": 2
+    },
+    {
+      "name": "IsDialogMessageW",
+      "argCount": 2
+    },
+    {
+      "name": "IsDlgButtonChecked",
+      "argCount": 2
+    },
+    {
+      "name": "IsGUIThread",
+      "argCount": 1
+    },
+    {
+      "name": "IsHungAppWindow",
+      "argCount": 1
+    },
+    {
+      "name": "IsIconic",
+      "argCount": 1
+    },
+    {
+      "name": "IsMenu",
+      "argCount": 1
+    },
+    {
+      "name": "IsMouseInPointerEnabled",
+      "argCount": 0
+    },
+    {
+      "name": "IsProcessDPIAware",
+      "argCount": 0
+    },
+    {
+      "name": "IsRectEmpty",
+      "argCount": 1
+    },
+    {
+      "name": "IsTouchWindow",
+      "argCount": 2
+    },
+    {
+      "name": "IsValidDpiAwarenessContext",
+      "argCount": 1
+    },
+    {
+      "name": "IsWindow",
+      "argCount": 1
+    },
+    {
+      "name": "IsWindowArranged",
+      "argCount": 1
+    },
+    {
+      "name": "IsWindowEnabled",
+      "argCount": 1
+    },
+    {
+      "name": "IsWindowRedirectedForPrint",
+      "argCount": 1
+    },
+    {
+      "name": "IsWindowUnicode",
+      "argCount": 1
+    },
+    {
+      "name": "IsWindowVisible",
+      "argCount": 1
+    },
+    {
+      "name": "IsWinEventHookInstalled",
+      "argCount": 1
+    },
+    {
+      "name": "IsZoomed",
+      "argCount": 1
+    },
+    {
+      "name": "keybd_event",
+      "argCount": 4
+    },
+    {
+      "name": "KillSystemTimer",
+      "argCount": 2
+    },
+    {
+      "name": "KillTimer",
+      "argCount": 2
+    },
+    {
+      "name": "LoadAcceleratorsA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadAcceleratorsW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadBitmapA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadBitmapW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadCursorA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadCursorFromFileA",
+      "argCount": 1
+    },
+    {
+      "name": "LoadCursorFromFileW",
+      "argCount": 1
+    },
+    {
+      "name": "LoadCursorW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadIconA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadIconW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadImageA",
+      "argCount": 6
+    },
+    {
+      "name": "LoadImageW",
+      "argCount": 6
+    },
+    {
+      "name": "LoadKeyboardLayoutA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadKeyboardLayoutEx",
+      "argCount": 3
+    },
+    {
+      "name": "LoadKeyboardLayoutW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadLocalFonts",
+      "argCount": 0
+    },
+    {
+      "name": "LoadMenuA",
+      "argCount": 2
+    },
+    {
+      "name": "LoadMenuIndirectA",
+      "argCount": 1
+    },
+    {
+      "name": "LoadMenuIndirectW",
+      "argCount": 1
+    },
+    {
+      "name": "LoadMenuW",
+      "argCount": 2
+    },
+    {
+      "name": "LoadStringA",
+      "argCount": 4
+    },
+    {
+      "name": "LoadStringW",
+      "argCount": 4
+    },
+    {
+      "name": "LockSetForegroundWindow",
+      "argCount": 1
+    },
+    {
+      "name": "LockWindowUpdate",
+      "argCount": 1
+    },
+    {
+      "name": "LockWorkStation",
+      "argCount": 0
+    },
+    {
+      "name": "LogicalToPhysicalPoint",
+      "argCount": 2
+    },
+    {
+      "name": "LogicalToPhysicalPointForPerMonitorDPI",
+      "argCount": 2
+    },
+    {
+      "name": "LookupIconIdFromDirectory",
+      "argCount": 2
+    },
+    {
+      "name": "LookupIconIdFromDirectoryEx",
+      "argCount": 5
+    },
+    {
+      "name": "MapDialogRect",
+      "argCount": 2
+    },
+    {
+      "name": "MapVirtualKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "MapVirtualKeyExA",
+      "argCount": 3
+    },
+    {
+      "name": "MapVirtualKeyExW",
+      "argCount": 3
+    },
+    {
+      "name": "MapVirtualKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "MapWindowPoints",
+      "argCount": 4
+    },
+    {
+      "name": "MenuItemFromPoint",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "MessageBeep",
+      "argCount": 1
+    },
+    {
+      "name": "MessageBoxA",
+      "argCount": 4
+    },
+    {
+      "name": "MessageBoxExA",
+      "argCount": 5
+    },
+    {
+      "name": "MessageBoxExW",
+      "argCount": 5
+    },
+    {
+      "name": "MessageBoxIndirectA",
+      "argCount": 1
+    },
+    {
+      "name": "MessageBoxIndirectW",
+      "argCount": 1
+    },
+    {
+      "name": "MessageBoxTimeoutA",
+      "argCount": 6
+    },
+    {
+      "name": "MessageBoxTimeoutW",
+      "argCount": 6
+    },
+    {
+      "name": "MessageBoxW",
+      "argCount": 4
+    },
+    {
+      "name": "ModifyMenuA",
+      "argCount": 5
+    },
+    {
+      "name": "ModifyMenuW",
+      "argCount": 5
+    },
+    {
+      "name": "MonitorFromPoint",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "MonitorFromRect",
+      "argCount": 2
+    },
+    {
+      "name": "MonitorFromWindow",
+      "argCount": 2
+    },
+    {
+      "name": "mouse_event",
+      "argCount": 5
+    },
+    {
+      "name": "MoveWindow",
+      "argCount": 6
+    },
+    {
+      "name": "MsgWaitForMultipleObjects",
+      "argCount": 5
+    },
+    {
+      "name": "MsgWaitForMultipleObjectsEx",
+      "argCount": 5
+    },
+    {
+      "name": "NotifyWinEvent",
+      "argCount": 4
+    },
+    {
+      "name": "OemKeyScan",
+      "argCount": 1
+    },
+    {
+      "name": "OemToCharA",
+      "argCount": 2
+    },
+    {
+      "name": "OemToCharBuffA",
+      "argCount": 3
+    },
+    {
+      "name": "OemToCharBuffW",
+      "argCount": 3
+    },
+    {
+      "name": "OemToCharW",
+      "argCount": 2
+    },
+    {
+      "name": "OffsetRect",
+      "argCount": 3
+    },
+    {
+      "name": "OpenClipboard",
+      "argCount": 1
+    },
+    {
+      "name": "OpenDesktopA",
+      "argCount": 4
+    },
+    {
+      "name": "OpenDesktopW",
+      "argCount": 4
+    },
+    {
+      "name": "OpenIcon",
+      "argCount": 1
+    },
+    {
+      "name": "OpenInputDesktop",
+      "argCount": 3
+    },
+    {
+      "name": "OpenWindowStationA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenWindowStationW",
+      "argCount": 3
+    },
+    {
+      "name": "ord_2503",
+      "argCount": 6
+    },
+    {
+      "name": "ord_2504",
+      "argCount": 2
+    },
+    {
+      "name": "ord_2546",
+      "argCount": 1
+    },
+    {
+      "name": "ord_2561",
+      "argCount": 0
+    },
+    {
+      "name": "ord_2582",
+      "argCount": 1
+    },
+    {
+      "name": "ord_2665",
+      "argCount": 3
+    },
+    {
+      "name": "ord_2705",
+      "argCount": 1
+    },
+    {
+      "name": "PackDDElParam",
+      "argCount": 3
+    },
+    {
+      "name": "PackTouchHitTestingProximityEvaluation",
+      "argCount": 2
+    },
+    {
+      "name": "PaintDesktop",
+      "argCount": 1
+    },
+    {
+      "name": "PeekMessageA",
+      "argCount": 5
+    },
+    {
+      "name": "PeekMessageW",
+      "argCount": 5
+    },
+    {
+      "name": "PhysicalToLogicalPoint",
+      "argCount": 2
+    },
+    {
+      "name": "PhysicalToLogicalPointForPerMonitorDPI",
+      "argCount": 2
+    },
+    {
+      "name": "PostMessageA",
+      "argCount": 4
+    },
+    {
+      "name": "PostMessageW",
+      "argCount": 4
+    },
+    {
+      "name": "PostQuitMessage",
+      "argCount": 1
+    },
+    {
+      "name": "PostThreadMessageA",
+      "argCount": 4
+    },
+    {
+      "name": "PostThreadMessageW",
+      "argCount": 4
+    },
+    {
+      "name": "PrintWindow",
+      "argCount": 3
+    },
+    {
+      "name": "PrivateExtractIconExA",
+      "argCount": 5
+    },
+    {
+      "name": "PrivateExtractIconExW",
+      "argCount": 5
+    },
+    {
+      "name": "PrivateExtractIconsA",
+      "argCount": 8
+    },
+    {
+      "name": "PrivateExtractIconsW",
+      "argCount": 8
+    },
+    {
+      "name": "PtInRect",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "QueryDisplayConfig",
+      "argCount": 6
+    },
+    {
+      "name": "RealChildWindowFromPoint",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RealGetWindowClass",
+      "argCount": 3
+    },
+    {
+      "name": "RealGetWindowClassA",
+      "argCount": 3
+    },
+    {
+      "name": "RealGetWindowClassW",
+      "argCount": 3
+    },
+    {
+      "name": "RedrawWindow",
+      "argCount": 4
+    },
+    {
+      "name": "RegisterClassA",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClassExA",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClassExW",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClassW",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClipboardFormatA",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterClipboardFormatW",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterDeviceNotificationA",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterDeviceNotificationW",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterHotKey",
+      "argCount": 4
+    },
+    {
+      "name": "RegisterLogonProcess",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterPointerDeviceNotifications",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterPowerSettingNotification",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterRawInputDevices",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterServicesProcess",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterShellHookWindow",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterSuspendResumeNotification",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterSystemThread",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterTasklist",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterTouchHitTestingWindow",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterTouchPadCapable",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterTouchWindow",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterUserApiHook",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterWindowMessageA",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterWindowMessageW",
+      "argCount": 1
+    },
+    {
+      "name": "ReleaseCapture",
+      "argCount": 0
+    },
+    {
+      "name": "ReleaseDC",
+      "argCount": 2
+    },
+    {
+      "name": "RemoveClipboardFormatListener",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveMenu",
+      "argCount": 3
+    },
+    {
+      "name": "RemovePropA",
+      "argCount": 2
+    },
+    {
+      "name": "RemovePropW",
+      "argCount": 2
+    },
+    {
+      "name": "ReplyMessage",
+      "argCount": 1
+    },
+    {
+      "name": "ReuseDDElParam",
+      "argCount": 5
+    },
+    {
+      "name": "ScheduleDispatchNotification",
+      "argCount": 1
+    },
+    {
+      "name": "ScreenToClient",
+      "argCount": 2
+    },
+    {
+      "name": "ScrollChildren",
+      "argCount": 4
+    },
+    {
+      "name": "ScrollDC",
+      "argCount": 7
+    },
+    {
+      "name": "ScrollWindow",
+      "argCount": 5
+    },
+    {
+      "name": "ScrollWindowEx",
+      "argCount": 8
+    },
+    {
+      "name": "SendDlgItemMessageA",
+      "argCount": 5
+    },
+    {
+      "name": "SendDlgItemMessageW",
+      "argCount": 5
+    },
+    {
+      "name": "SendIMEMessageExA",
+      "argCount": 2
+    },
+    {
+      "name": "SendIMEMessageExW",
+      "argCount": 2
+    },
+    {
+      "name": "SendInput",
+      "argCount": 3
+    },
+    {
+      "name": "SendMessageA",
+      "argCount": 4
+    },
+    {
+      "name": "SendMessageCallbackA",
+      "argCount": 6
+    },
+    {
+      "name": "SendMessageCallbackW",
+      "argCount": 6
+    },
+    {
+      "name": "SendMessageTimeoutA",
+      "argCount": 7
+    },
+    {
+      "name": "SendMessageTimeoutW",
+      "argCount": 7
+    },
+    {
+      "name": "SendMessageW",
+      "argCount": 4
+    },
+    {
+      "name": "SendNotifyMessageA",
+      "argCount": 4
+    },
+    {
+      "name": "SendNotifyMessageW",
+      "argCount": 4
+    },
+    {
+      "name": "SetActiveWindow",
+      "argCount": 1
+    },
+    {
+      "name": "SetAdditionalForegroundBoostProcesses",
+      "argCount": 3
+    },
+    {
+      "name": "SetCapture",
+      "argCount": 1
+    },
+    {
+      "name": "SetCaretBlinkTime",
+      "argCount": 1
+    },
+    {
+      "name": "SetCaretPos",
+      "argCount": 2
+    },
+    {
+      "name": "SetClassLongA",
+      "argCount": 3
+    },
+    {
+      "name": "SetClassLongW",
+      "argCount": 3
+    },
+    {
+      "name": "SetClassWord",
+      "argCount": 3
+    },
+    {
+      "name": "SetClipboardData",
+      "argCount": 2
+    },
+    {
+      "name": "SetClipboardViewer",
+      "argCount": 1
+    },
+    {
+      "name": "SetCoalescableTimer",
+      "argCount": 5
+    },
+    {
+      "name": "SetCursor",
+      "argCount": 1
+    },
+    {
+      "name": "SetCursorPos",
+      "argCount": 2
+    },
+    {
+      "name": "SetDebugErrorLevel",
+      "argCount": 1
+    },
+    {
+      "name": "SetDeskWallpaper",
+      "argCount": 1
+    },
+    {
+      "name": "SetDisplayAutoRotationPreferences",
+      "argCount": 1
+    },
+    {
+      "name": "SetDisplayConfig",
+      "argCount": 5
+    },
+    {
+      "name": "SetDlgItemInt",
+      "argCount": 4
+    },
+    {
+      "name": "SetDlgItemTextA",
+      "argCount": 3
+    },
+    {
+      "name": "SetDlgItemTextW",
+      "argCount": 3
+    },
+    {
+      "name": "SetDoubleClickTime",
+      "argCount": 1
+    },
+    {
+      "name": "SetFocus",
+      "argCount": 1
+    },
+    {
+      "name": "SetForegroundWindow",
+      "argCount": 1
+    },
+    {
+      "name": "SetGestureConfig",
+      "argCount": 5
+    },
+    {
+      "name": "SetInternalWindowPos",
+      "argCount": 4
+    },
+    {
+      "name": "SetKeyboardState",
+      "argCount": 1
+    },
+    {
+      "name": "SetLastErrorEx",
+      "argCount": 2
+    },
+    {
+      "name": "SetLayeredWindowAttributes",
+      "argCount": 4
+    },
+    {
+      "name": "SetLogonNotifyWindow",
+      "argCount": 2
+    },
+    {
+      "name": "SetMenu",
+      "argCount": 2
+    },
+    {
+      "name": "SetMenuContextHelpId",
+      "argCount": 2
+    },
+    {
+      "name": "SetMenuDefaultItem",
+      "argCount": 3
+    },
+    {
+      "name": "SetMenuInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SetMenuItemBitmaps",
+      "argCount": 5
+    },
+    {
+      "name": "SetMenuItemInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "SetMenuItemInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "SetMessageExtraInfo",
+      "argCount": 1
+    },
+    {
+      "name": "SetMessageQueue",
+      "argCount": 1
+    },
+    {
+      "name": "SetParent",
+      "argCount": 2
+    },
+    {
+      "name": "SetPhysicalCursorPos",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessDefaultLayout",
+      "argCount": 1
+    },
+    {
+      "name": "SetProcessDPIAware",
+      "argCount": 0
+    },
+    {
+      "name": "SetProcessDpiAwarenessContext",
+      "argCount": 1
+    },
+    {
+      "name": "SetProcessDpiAwarenessInternal",
+      "argCount": 1
+    },
+    {
+      "name": "SetProcessLaunchForegroundPolicy",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessWindowStation",
+      "argCount": 1
+    },
+    {
+      "name": "SetProgmanWindow",
+      "argCount": 1
+    },
+    {
+      "name": "SetPropA",
+      "argCount": 3
+    },
+    {
+      "name": "SetPropW",
+      "argCount": 3
+    },
+    {
+      "name": "SetRect",
+      "argCount": 5
+    },
+    {
+      "name": "SetRectEmpty",
+      "argCount": 1
+    },
+    {
+      "name": "SetScrollInfo",
+      "argCount": 4
+    },
+    {
+      "name": "SetScrollPos",
+      "argCount": 4
+    },
+    {
+      "name": "SetScrollRange",
+      "argCount": 5
+    },
+    {
+      "name": "SetShellWindow",
+      "argCount": 1
+    },
+    {
+      "name": "SetShellWindowEx",
+      "argCount": 2
+    },
+    {
+      "name": "SetSysColors",
+      "argCount": 3
+    },
+    {
+      "name": "SetSysColorsTemp",
+      "argCount": 3
+    },
+    {
+      "name": "SetSystemCursor",
+      "argCount": 2
+    },
+    {
+      "name": "SetSystemMenu",
+      "argCount": 2
+    },
+    {
+      "name": "SetSystemTimer",
+      "argCount": 4
+    },
+    {
+      "name": "SetTaskmanWindow",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadDesktop",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadDpiAwarenessContext",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadDpiHostingBehavior",
+      "argCount": 1
+    },
+    {
+      "name": "SetTimer",
+      "argCount": 4
+    },
+    {
+      "name": "SetUserObjectInformationA",
+      "argCount": 4
+    },
+    {
+      "name": "SetUserObjectInformationW",
+      "argCount": 4
+    },
+    {
+      "name": "SetUserObjectSecurity",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowCompositionAttribute",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowContextHelpId",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowDisplayAffinity",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowLongA",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowLongW",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowPlacement",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowPos",
+      "argCount": 7
+    },
+    {
+      "name": "SetWindowRgn",
+      "argCount": 3
+    },
+    {
+      "name": "SetWindowsHookA",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowsHookExA",
+      "argCount": 4
+    },
+    {
+      "name": "SetWindowsHookExW",
+      "argCount": 4
+    },
+    {
+      "name": "SetWindowsHookW",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowStationUser",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowTextA",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowTextW",
+      "argCount": 2
+    },
+    {
+      "name": "SetWindowWord",
+      "argCount": 3
+    },
+    {
+      "name": "SetWinEventHook",
+      "argCount": 7
+    },
+    {
+      "name": "ShowCaret",
+      "argCount": 1
+    },
+    {
+      "name": "ShowCursor",
+      "argCount": 1
+    },
+    {
+      "name": "ShowOwnedPopups",
+      "argCount": 2
+    },
+    {
+      "name": "ShowScrollBar",
+      "argCount": 3
+    },
+    {
+      "name": "ShowWindow",
+      "argCount": 2
+    },
+    {
+      "name": "ShowWindowAsync",
+      "argCount": 2
+    },
+    {
+      "name": "ShutdownBlockReasonCreate",
+      "argCount": 2
+    },
+    {
+      "name": "ShutdownBlockReasonDestroy",
+      "argCount": 1
+    },
+    {
+      "name": "SubtractRect",
+      "argCount": 3
+    },
+    {
+      "name": "SwapMouseButton",
+      "argCount": 1
+    },
+    {
+      "name": "SwitchDesktop",
+      "argCount": 1
+    },
+    {
+      "name": "SwitchToThisWindow",
+      "argCount": 2
+    },
+    {
+      "name": "SystemParametersInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "SystemParametersInfoForDpi",
+      "argCount": 5
+    },
+    {
+      "name": "SystemParametersInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "TabbedTextOutA",
+      "argCount": 8
+    },
+    {
+      "name": "TabbedTextOutW",
+      "argCount": 8
+    },
+    {
+      "name": "TileChildWindows",
+      "argCount": 2
+    },
+    {
+      "name": "TileWindows",
+      "argCount": 5
+    },
+    {
+      "name": "ToAscii",
+      "argCount": 5
+    },
+    {
+      "name": "ToAsciiEx",
+      "argCount": 6
+    },
+    {
+      "name": "ToUnicode",
+      "argCount": 6
+    },
+    {
+      "name": "ToUnicodeEx",
+      "argCount": 7
+    },
+    {
+      "name": "TrackMouseEvent",
+      "argCount": 1
+    },
+    {
+      "name": "TrackPopupMenu",
+      "argCount": 7
+    },
+    {
+      "name": "TrackPopupMenuEx",
+      "argCount": 6
+    },
+    {
+      "name": "TranslateAccelerator",
+      "argCount": 3
+    },
+    {
+      "name": "TranslateAcceleratorA",
+      "argCount": 3
+    },
+    {
+      "name": "TranslateAcceleratorW",
+      "argCount": 3
+    },
+    {
+      "name": "TranslateMDISysAccel",
+      "argCount": 2
+    },
+    {
+      "name": "TranslateMessage",
+      "argCount": 1
+    },
+    {
+      "name": "UndelegateInput",
+      "argCount": 2
+    },
+    {
+      "name": "UnhookWindowsHook",
+      "argCount": 2
+    },
+    {
+      "name": "UnhookWindowsHookEx",
+      "argCount": 1
+    },
+    {
+      "name": "UnhookWinEvent",
+      "argCount": 1
+    },
+    {
+      "name": "UnionRect",
+      "argCount": 3
+    },
+    {
+      "name": "UnloadKeyboardLayout",
+      "argCount": 1
+    },
+    {
+      "name": "UnpackDDElParam",
+      "argCount": 4
+    },
+    {
+      "name": "UnregisterClassA",
+      "argCount": 2
+    },
+    {
+      "name": "UnregisterClassW",
+      "argCount": 2
+    },
+    {
+      "name": "UnregisterDeviceNotification",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterHotKey",
+      "argCount": 2
+    },
+    {
+      "name": "UnregisterPowerSettingNotification",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterSuspendResumeNotification",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterTouchWindow",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterUserApiHook",
+      "argCount": 0
+    },
+    {
+      "name": "UpdateLayeredWindow",
+      "argCount": 9
+    },
+    {
+      "name": "UpdateLayeredWindowIndirect",
+      "argCount": 2
+    },
+    {
+      "name": "UpdateWindow",
+      "argCount": 1
+    },
+    {
+      "name": "User32InitializeImmEntryTable",
+      "argCount": 1
+    },
+    {
+      "name": "UserClientDllInitialize",
+      "argCount": 3
+    },
+    {
+      "name": "UserHandleGrantAccess",
+      "argCount": 3
+    },
+    {
+      "name": "UserRealizePalette",
+      "argCount": 1
+    },
+    {
+      "name": "UserRegisterWowHandlers",
+      "argCount": 2
+    },
+    {
+      "name": "UserSignalProc",
+      "argCount": 4
+    },
+    {
+      "name": "ValidateRect",
+      "argCount": 2
+    },
+    {
+      "name": "ValidateRgn",
+      "argCount": 2
+    },
+    {
+      "name": "VkKeyScanA",
+      "argCount": 1
+    },
+    {
+      "name": "VkKeyScanExA",
+      "argCount": 2
+    },
+    {
+      "name": "VkKeyScanExW",
+      "argCount": 2
+    },
+    {
+      "name": "VkKeyScanW",
+      "argCount": 1
+    },
+    {
+      "name": "WaitForInputIdle",
+      "argCount": 2
+    },
+    {
+      "name": "WaitMessage",
+      "argCount": 0
+    },
+    {
+      "name": "WindowFromDC",
+      "argCount": 1
+    },
+    {
+      "name": "WindowFromPhysicalPoint",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "WindowFromPoint",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "WinHelpA",
+      "argCount": 4
+    },
+    {
+      "name": "WinHelpW",
+      "argCount": 4
+    },
+    {
+      "name": "WINNLSEnableIME",
+      "argCount": 2
+    },
+    {
+      "name": "WINNLSGetEnableStatus",
+      "argCount": 1
+    },
+    {
+      "name": "WINNLSGetIMEHotkey",
+      "argCount": 1
+    },
+    {
+      "name": "wvsprintfA",
+      "argCount": 3
+    },
+    {
+      "name": "wvsprintfW",
+      "argCount": 3
+    }
+  ]
+}

@@ -26,6 +26,11 @@ export function resetSrwLock(lockPtr: number): void {
     Mem.writeUint32(lockPtr, 0);
 }
 
+/** Drop every host-side SRWLOCK record on game switch (guest memory is rewound). */
+export function resetAllSrwLocks(): void {
+    locks.clear();
+}
+
 function getOrCreate(lockPtr: number): SrwLockState {
     let st = locks.get(lockPtr);
     if (!st) {
@@ -41,6 +46,15 @@ export function ensureSrwWaitEvent(lockPtr: number, sched: SrwEventFactory): num
         st.waitEvent = sched.createEvent(false, false);
     }
     return st.waitEvent;
+}
+
+/**
+ * The lock's lazily-created wait event, or 0 when nothing has ever blocked on it.
+ * A release must consult this BEFORE applying itself — a release cannot be undone — to
+ * learn whether it also owes the scheduler a wake.
+ */
+export function srwWaitEvent(lockPtr: number): number {
+    return locks.get(lockPtr)?.waitEvent ?? 0;
 }
 
 export function tryAcquireSrwExclusive(lockPtr: number, threadId: number): boolean {

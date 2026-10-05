@@ -4,36 +4,48 @@
  * Atomic implementation for file operations
  */
 
-import { ThunkImplementation, ThunkResult, DeferredWrite } from '../../core/thunking/thunk-dispatcher';
-import { Logger, LogCategory } from '../../core/logger';
+import { type HleDispatcher, ThunkImplementation, ThunkResult, DeferredWrite } from '../../core/thunking/thunk-dispatcher';
+import { Logger, LogCategory, LogLevel } from '../../core/logger';
 import { registerFileIoCommExports } from './file-io-comm';
 import { registerFileIoConsoleExports, ConsoleDeviceHandle, isConsoleDeviceHandle, isWindowsDevice } from './file-io-console';
 import { registerFileIoFindExports } from './file-io-find';
 import { registerFileIoVolumeExports } from './file-io-volume';
 import { registerFileIoPathExports } from './file-io-path';
-import { readStringA, readStringW } from './file-io-strings';
+import { readStringA, readStringW, encodeFileApiString, setFileApisAnsi, areFileApisAnsi } from './file-io-strings';
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { Process } from '../../core/process';
 import { VfsFileHandle, VirtualFileSystem } from '../../runtime/filesystem/vfs';
+import { VFS_FILETIME } from '../../runtime/filesystem/file-time';
 import { noteBootFileActivity } from '../../runtime/boot-status';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
-import { encodeAnsi, getCodePageDecoder } from '../codepage-utils';
-import {
-    classifyUe1FirstRunFile,
-    dirOfWindowsPath,
-    baseOfWindowsPath,
-    pinUeEngineIni,
-    detectUe2PcPackages,
-} from '../../runtime/filesystem/ue1-firstrun';
-import { invalidateIniCache } from './profile';
+import { getCodePageDecoder } from '../codepage-utils';
 import { namedObjects } from './named-objects';
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from '../../core/diagnostics/large-io-trace';
 import { ioTraceRing } from '../../core/debug/io-trace-ring';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
+import { postFileIoCompletion, abandonIoCompletionWaiters, dissociateIoCompletionHandle } from './sync';
 
 const readFileFirstLogged = new Set<number>();
+let shortReadLogCount = 0;
+// A handle whose file position is driven from two threads is a race the guest can only
+// win by serialising itself: SetFilePointer and ReadFile are separate calls, and our
+// scheduler preempts between them. Reported once per handle — the pair reads the wrong
+// offset and the caller sees plausible-looking garbage, not an error.
+const readFileLastThread = new Map<number, number>();
+let sharedHandleLogCount = 0;
+function noteReadFileThread(hFile: number, path: string): void {
+    const tid = System.getInstance().scheduler.getCurrentThread()?.id ?? 0;
+    const prev = readFileLastThread.get(hFile);
+    if (prev === undefined) { readFileLastThread.set(hFile, tid); return; }
+    if (prev !== tid && sharedHandleLogCount < 20) {
+        sharedHandleLogCount++;
+        Logger.warn(LogCategory.KERNEL32,
+            `[SHAREDHANDLE] h=0x${hFile.toString(16)} "${path}" read from T${prev} and T${tid}`);
+    }
+    readFileLastThread.set(hFile, tid);
+}
 
 const RW_RASTER_NAMES: Record<number, string> = {
     0x0100: "1555",
@@ -67,6 +79,32 @@ function logCapsDatDwords(tag: string, mem: Uint8Array, bufOffset: number, byteL
         parts.push(`0x${v.toString(16)}(${rw})`);
     }
     Logger.log(LogCategory.KERNEL32, `CAPS.DAT ${tag}: [${parts.join(", ")}] (bake ref: 0x500, 0x600, 0x100, 0x500)`);
+}
+
+/**
+ * Mirror the CONTENT of a guest write to a log/error file into our own log.
+ *
+ * Gated on `isConsoleEnabled`, NOT `isEnabled`: the latter answers true whenever a log
+ * stream is attached, which the harness does for a whole session — so the slice + codepage
+ * decode would run per WriteFile in exactly the windows where the frame tail is measured
+ * (Far Cry appends Log.txt continuously). Explicit error files stay loud at NORMAL, routine
+ * .log/.txt content is VERBOSE.
+ */
+export function logGuestWriteContent(filename: string, mem: Uint8Array, lpBuffer: number, byteCount: number): void {
+    if (byteCount <= 0 || byteCount >= 32768) return;
+    const fnLower = filename.toLowerCase();
+    const isErrorText = fnLower.endsWith('.err') || fnLower.includes('blizzarderror');
+    if (!isErrorText && !fnLower.endsWith('.log') && !fnLower.endsWith('.txt')) return;
+    const contentLevel = isErrorText ? LogLevel.NORMAL : LogLevel.VERBOSE;
+    if (!Logger.isConsoleEnabled(LogCategory.KERNEL32, contentLevel)) return;
+    try {
+        const logData = mem.slice(lpBuffer, lpBuffer + byteCount);
+        const logText = getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(logData);
+        const label = fnLower.endsWith('.log') ? 'LOG' : fnLower.endsWith('.err') ? 'ERR' : 'TXT';
+        const message = `WriteFile ${label} content: "${logText.trimEnd()}"`;
+        if (isErrorText) Logger.log(LogCategory.KERNEL32, message);
+        else Logger.verbose(LogCategory.KERNEL32, message);
+    } catch { /* ignore decode errors */ }
 }
 
 /**
@@ -142,111 +180,16 @@ const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
 const OPEN_EXISTING = 3;
 const CREATE_ALWAYS = 2;
+const FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
 
-/**
- * Generic Unreal Engine 1 first-run handler — reactive layer at the file-open
- * boundary. UE1 games READ their render-detection output (Detected.ini) and
- * their lazily-copied active config (e.g. HP.ini / User.ini) with OPEN_EXISTING;
- * if either is missing the game stalls. The active-config directory is baked
- * into the exe (some titles redirect to C:\My Documents\<GameFolder>) — unknown at build
- * time — so we learn it from the game's own Detected.* request, then materialize
- * the missing files into the CoW overlay.
- *
- * Conservative by construction: only fires when (a) the bundle is UE1, (b) the
- * disposition is OPEN_EXISTING, (c) the access requests read, (d) the file is
- * genuinely MISSING, and (e) the basename matches our patterns. Returns true if
- * it materialized a file (the caller should then re-attempt the normal open,
- * which will now succeed). Never overwrites an existing file; never acts on
- * write dispositions (the engine/game owns those).
- *
- * Mirrors shell32 applyShellExecFake's overlay file-creation: ensureParentDirsSync
- * (mkdir -p), then open(GENERIC_WRITE, CREATE_ALWAYS) → write → flushFile, plus
- * invalidateIniCache for *.ini.
- */
-async function tryUe1FirstRunMaterialize(
-    filename: string,
-    dwDesiredAccess: number,
-    dwCreationDisposition: number,
-): Promise<boolean> {
-    const config = EmulatorConfig.getInstance();
-    if (!config.ue1) return false;
-    if ((dwCreationDisposition >>> 0) !== OPEN_EXISTING) return false;
-    if ((dwDesiredAccess & GENERIC_READ) === 0) return false;
-    if (!filename) return false;
-
-    const vfs = System.getInstance().fileSystem;
-
-    // Only act on a genuine miss — never clobber an existing file.
-    if (vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING) !== null) return false;
-
-    const full = vfs.resolvePath(filename);
-    const dir = dirOfWindowsPath(full);
-    const base = baseOfWindowsPath(full);
-    const inUserDir = config.ue1UserDir !== null && dir.toLowerCase() === config.ue1UserDir.toLowerCase();
-    const kind = classifyUe1FirstRunFile(base, inUserDir);
-    if (kind === null) return false;
-
-    const materialize = async (path: string, data: Uint8Array, sourceDesc: string): Promise<boolean> => {
-        try {
-            vfs.ensureParentDirsSync(path);
-            const h = await vfs.open(path, GENERIC_WRITE, CREATE_ALWAYS);
-            if (!h) {
-                Logger.warn(LogCategory.SYSTEM, `UE1: could not create "${path}" (parent missing?)`);
-                return false;
-            }
-            if (data.length > 0) await vfs.write(h, data);
-            await vfs.flushFile(h.path);
-            if (path.toLowerCase().endsWith('.ini')) invalidateIniCache(path);
-            Logger.log(LogCategory.SYSTEM, `UE1 first-run: materialized "${path}" (${data.length} bytes, source=${sourceDesc})`);
-            return true;
-        } catch (err) {
-            Logger.warn(LogCategory.SYSTEM, `UE1: materialize "${path}" failed: ${err}`);
-            return false;
-        }
-    };
-
-    const readSource = async (srcPath: string): Promise<Uint8Array | null> => {
-        const src = await vfs.open(srcPath, GENERIC_READ, OPEN_EXISTING);
-        if (!src) return null;
-        const size = vfs.getFileSize(srcPath);
-        return size > 0 ? await vfs.read(src, size) : new Uint8Array(0);
-    };
-
-    if (kind === 'detected') {
-        // Render-detection output the game reads but never finds: an empty file is
-        // enough to let the OPEN_EXISTING succeed and the game proceed. Learn the
-        // containing directory as the UE1 user dir for subsequent config seeding.
-        const ok = await materialize(full, new Uint8Array(0), 'empty');
-        if (ok && dir) {
-            config.ue1UserDir = dir;
-            Logger.log(LogCategory.SYSTEM, `UE1 first-run: learned user dir "${dir}" from "${base}"`);
-        }
-        return ok;
-    }
-
-    if (kind === 'user-ini') {
-        // Active key-bindings config — seed from the factory DefUser.ini template.
-        const data = await readSource('C:\\System\\DefUser.ini');
-        if (data === null) {
-            Logger.warn(LogCategory.SYSTEM, `UE1: cannot seed "${full}" — System\\DefUser.ini missing`);
-            return false;
-        }
-        return await materialize(full, data, 'System\\DefUser.ini');
-    }
-
-    // kind === 'ini': active settings config — seed from Default.ini, pinning our
-    // D3D render device (reproduces what the curated HP.ini did by hand).
-    const raw = await readSource('C:\\System\\Default.ini');
-    if (raw === null) {
-        Logger.warn(LogCategory.SYSTEM, `UE1: cannot seed "${full}" — System\\Default.ini missing`);
-        return false;
-    }
-    const hasPcPackages = detectUe2PcPackages((guestPath) => System.getInstance().fileSystem.getFileSize(guestPath) > 0);
-    const pinned = pinUeEngineIni(new TextDecoder('utf-8').decode(raw), { hasPcPackages });
-    return await materialize(full, new TextEncoder().encode(pinned), 'System\\Default.ini (engine-pinned)');
+/** Record the caller's declared access pattern on the file object. NT takes this at
+ *  face value and reads ahead on it; below us it is what tells the block cache that a
+ *  read run is a scan through one file rather than two adjacent unrelated reads. */
+function applyOpenFlags(handle: VfsFileHandle, dwFlagsAndAttributes: number): void {
+    if ((dwFlagsAndAttributes & FILE_FLAG_SEQUENTIAL_SCAN) !== 0) handle.sequentialFlag = true;
 }
 
-export const exports: Record<string, ThunkImplementation> = (() => {
+const fileIoModule = (() => {
     const exports: Record<string, ThunkImplementation> = {};
     const SET_FILE_POINTER_LOG_FIRST_N = 8;
     const SET_FILE_POINTER_LOG_SAMPLE_EVERY = 512;
@@ -279,6 +222,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     const ERROR_NO_MORE_FILES = 18;
     const ERROR_SEEK = 25;
     const ERROR_NOACCESS = 998;
+    const ERROR_IO_DEVICE = 1117;
+    const ERROR_NOT_FOUND = 1168;
     const INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF;
 
     const FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -288,7 +233,14 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     interface FileMappingObject {
         kind: 'file_mapping';
         size: number;
-        fileHandle: number | null;
+        /**
+         * The section's OWN reference to the backing file, not the caller's handle.
+         * Win32 lets the guest CloseHandle its file the moment CreateFileMapping
+         * returns — the section keeps the file object alive — and handle numbers are
+         * recycled, so re-resolving a stored handle number later can land on whatever
+         * file now owns that slot and write the mapped image over it.
+         */
+        file: VfsFileHandle | null;
         protect: number;
     }
 
@@ -298,7 +250,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // for the write-back: without them a mapped view is effectively read-only and
     // any data the guest writes through the view is silently lost (some titles save
     // profiles via CreateFileMapping+MapViewOfFile, no WriteFile).
-    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; fileHandle: number | null; writable: boolean }> = new Map();
+    const fileMappingViews: Map<number, { mappingHandle: number; size: number; offset: number; file: VfsFileHandle | null; writable: boolean }> = new Map();
 
     // MapViewOfFile dwDesiredAccess flags
     const FILE_MAP_COPY = 0x0001;
@@ -310,25 +262,22 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     // Write a mapped view's current guest-memory contents back to its backing VFS
     // file at the mapped offset. No-op for anonymous (pagefile-backed), read-only,
     // or copy-on-write views.
-    const flushMappedView = async (base: number, view: { size: number; offset: number; fileHandle: number | null; writable: boolean }): Promise<void> => {
-        if (!view.writable || view.fileHandle === null) return;
-        const resourceProvider = System.getInstance().resourceProvider;
-        const fileObj = resourceProvider.getFileHandle(view.fileHandle);
-        if (!fileObj || isConsoleDeviceHandle(fileObj)) return;
+    const flushMappedView = async (base: number, view: { size: number; offset: number; file: VfsFileHandle | null; writable: boolean }): Promise<void> => {
+        if (!view.writable || view.file === null) return;
         const data = Mem.readBytes(base, view.size);
         if (!data) return;
         const vfs = System.getInstance().fileSystem;
-        const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-        const originalPos = vfsHandle.position;
-        vfs.setPosition(vfsHandle, view.offset, 0);
+        // Write-back runs on its OWN cursor. FlushViewOfFile does not move the file
+        // pointer, and a save/restore around these awaits cannot emulate that: the guest
+        // may legitimately seek during the yield, and the restore then reverts its seek.
+        const viewHandle = vfs.duplicateHandle(view.file, view.offset);
         let off = 0;
         while (off < data.length) {
             const chunk = data.subarray(off, Math.min(off + 256 * 1024, data.length));
-            const written = await vfs.write(vfsHandle, chunk);
+            const written = await vfs.write(viewHandle, chunk);
             if (written <= 0) break;
             off += written;
         }
-        vfs.setPosition(vfsHandle, originalPos, 0);
     };
 
     const writeUint16 = (addr: number, value: number): void => {
@@ -379,6 +328,22 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         Logger.verbose(LogCategory.KERNEL32, `CancelIo(0x${hFile.toString(16)}) -> TRUE (no pending I/O)`);
         System.getInstance().scheduler.setLastError(0);
         return 1; // TRUE
+    };
+
+    // BOOL CancelIoEx(HANDLE hFile, LPOVERLAPPED lpOverlapped)
+    // Unlike CancelIo, finding nothing to cancel is a failure: ERROR_NOT_FOUND. Every
+    // operation here has completed before its issuing call returns, so that is the answer
+    // for any live handle.
+    exports['CancelIoEx'] = (_ctx, _mem, args) => {
+        const hFile = args[0] >>> 0;
+        const sched = System.getInstance().scheduler;
+        const isStd = hFile === 0 || hFile === 1 || hFile === 2;
+        if (!isStd && !System.getInstance().resourceProvider.getFileHandle(hFile)) {
+            sched.setLastError(ERROR_INVALID_HANDLE);
+            return { value: 0, stackCleanup: 8 };
+        }
+        sched.setLastError(ERROR_NOT_FOUND);
+        return { value: 0, stackCleanup: 8 };
     };
 
     exports['GetFileType'] = (ctx, mem, args) => {
@@ -505,6 +470,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // Fast path: try synchronous open first (avoids Promise overhead)
         const syncHandle = vfs.openSync(filename, dwDesiredAccess, dwCreationDisposition);
         if (syncHandle !== null) {
+            applyOpenFlags(syncHandle, dwFlagsAndAttributes);
             const handle = new FileHandleWrapper(syncHandle, vfs);
             const resourceProvider = System.getInstance().resourceProvider;
             const handleId = resourceProvider.registerFileHandle(handle);
@@ -539,31 +505,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const openFailure = vfs.classifyOpenFailure(filename, dwCreationDisposition);
         const disp = dwCreationDisposition >>> 0;
 
-        // Generic UE1 first-run: an OPEN_EXISTING read-miss on Detected.ini /
-        // a config-ini → materialize/seed it into the overlay, then retry the open.
-        // Gated on the ue1 flag (no-op for non-UE1 games). Async because it writes.
-        if (disp === 3 && EmulatorConfig.getInstance().ue1 && (dwDesiredAccess & GENERIC_READ) !== 0) {
-            return (async (): Promise<number> => {
-                const materialized = await tryUe1FirstRunMaterialize(filename, dwDesiredAccess, dwCreationDisposition);
-                if (materialized) {
-                    const vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
-                    if (vfsHandle) {
-                        const handle = new FileHandleWrapper(vfsHandle, vfs);
-                        const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
-                        System.getInstance().scheduler.setLastError(0);
-                        Logger.log(LogCategory.KERNEL32, `CreateFileA: OK (UE1 first-run) "${filename}" handle=0x${handleId.toString(16)}`);
-                        return handleId;
-                    }
-                }
-                let resolved = '';
-                try { resolved = vfs.resolvePath(filename); } catch { /* ignore */ }
-                Logger.log(LogCategory.KERNEL32,
-                    `CreateFileA: FAILED "${filename}" resolved="${resolved}" disposition=${dwCreationDisposition} err=${openFailure}`);
-                System.getInstance().scheduler.setLastError(openFailure);
-                return INVALID_HANDLE_VALUE;
-            })();
-        }
-
         if (
             disp === 3 ||
             openFailure === ERROR_PATH_NOT_FOUND ||
@@ -597,6 +538,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     return INVALID_HANDLE_VALUE;
                 }
 
+                applyOpenFlags(vfsHandle, dwFlagsAndAttributes);
                 const handle = new FileHandleWrapper(vfsHandle, vfs);
                 const resourceProvider = System.getInstance().resourceProvider;
                 const handleId = resourceProvider.registerFileHandle(handle);
@@ -630,7 +572,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             view.setUint16(lpReOpenBuff + 2, 0, true); // nErrCode
             view.setUint16(lpReOpenBuff + 4, 0, true);
             view.setUint16(lpReOpenBuff + 6, 0, true);
-            const pathBytes = encodeAnsi(filename + '\0');
+            const pathBytes = encodeFileApiString(filename + '\0');
             const max = Math.min(pathBytes.length, 128);
             mem.set(pathBytes.slice(0, max), lpReOpenBuff + 8);
         }
@@ -666,14 +608,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return exports['OpenFile']!(ctx, mem, [lpPathName, 0, iReadWrite]);
     };
 
-    exports['CreateFileW'] = async (ctx, mem, args) => {
+    exports['CreateFileW'] = (ctx, mem, args) => {
         const lpFileName = args[0];
         const dwDesiredAccess = args[1];
-        const dwShareMode = args[2];
-        const lpSecurityAttributes = args[3]; // unused
         const dwCreationDisposition = args[4];
         const dwFlagsAndAttributes = args[5];
-        const hTemplateFile = args[6]; // unused
 
         // For simplicity, convert wide string to ASCII
         const filename = lpFileName ? readStringW(mem, lpFileName) : '';
@@ -694,31 +633,50 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return handleId;
         }
 
-        try {
-            const vfs = System.getInstance().fileSystem;
-            let vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
+        const vfs = System.getInstance().fileSystem;
 
-            // Generic UE1 first-run: OPEN_EXISTING read-miss on Detected.ini / a
-            // config-ini → materialize/seed into the overlay, then retry (gated on ue1).
-            if (!vfsHandle && await tryUe1FirstRunMaterialize(filename, dwDesiredAccess, dwCreationDisposition)) {
-                vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
-            }
-
-            if (!vfsHandle) {
-                Logger.verbose(LogCategory.KERNEL32, `CreateFileW: file not found or cannot be opened`);
-                System.getInstance().scheduler.setLastError(ERROR_FILE_NOT_FOUND);
-                return INVALID_HANDLE_VALUE;
-            }
-
-            const handle = new FileHandleWrapper(vfsHandle, vfs);
-            const resourceProvider = System.getInstance().resourceProvider;
-            const handleId = resourceProvider.registerFileHandle(handle);
-            Logger.verbose(LogCategory.KERNEL32, `CreateFileW: opened file handle 0x${handleId.toString(16)}`);
+        // Fast path: resolve synchronously (matches CreateFileA and the synchronous
+        // Win32 CreateFile contract). Returning a Promise here would make the thunk
+        // ASYNC and park the thread mid-open — which corrupts the CRT's in-flight fd
+        // allocation (VC2005 __sopen allocates an fd BEFORE CreateFileW), leaving a
+        // FILE* with _file=-1 that later _close(-1)s → _invalid_parameter throw.
+        const syncHandle = vfs.openSync(filename, dwDesiredAccess, dwCreationDisposition);
+        if (syncHandle !== null) {
+            applyOpenFlags(syncHandle, dwFlagsAndAttributes);
+            const handle = new FileHandleWrapper(syncHandle, vfs);
+            const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
+            Logger.log(LogCategory.KERNEL32, `CreateFileW: OK "${filename}" handle=0x${handleId.toString(16)} (sync, source=${syncHandle.source})`);
+            System.getInstance().scheduler.setLastError(0);
             return handleId;
-        } catch (error) {
-            Logger.error(LogCategory.KERNEL32, `CreateFileW failed: ${error}`);
+        }
+
+        const openFailure = vfs.classifyOpenFailure(filename, dwCreationDisposition);
+        const disp = dwCreationDisposition >>> 0;
+        // OPEN_EXISTING miss / path-not-found: fail synchronously, exactly like CreateFileA.
+        if (disp === 3 || openFailure === ERROR_PATH_NOT_FOUND || (disp === 1 && openFailure === 0xB7 /* ERROR_ALREADY_EXISTS */)) {
+            Logger.verbose(LogCategory.KERNEL32, `CreateFileW: FAILED "${filename}" disposition=${disp} err=${openFailure}`);
+            System.getInstance().scheduler.setLastError(openFailure);
             return INVALID_HANDLE_VALUE;
         }
+
+        // Async path: overlay files / create dispositions that must write.
+        return (async () => {
+            try {
+                const vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
+                if (!vfsHandle) {
+                    System.getInstance().scheduler.setLastError(openFailure || ERROR_FILE_NOT_FOUND);
+                    return INVALID_HANDLE_VALUE;
+                }
+                applyOpenFlags(vfsHandle, dwFlagsAndAttributes);
+                const handle = new FileHandleWrapper(vfsHandle, vfs);
+                const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
+                Logger.verbose(LogCategory.KERNEL32, `CreateFileW: opened file handle 0x${handleId.toString(16)} source=${vfsHandle.source}`);
+                return handleId;
+            } catch (error) {
+                Logger.error(LogCategory.KERNEL32, `CreateFileW failed: ${error}`);
+                return INVALID_HANDLE_VALUE;
+            }
+        })();
     };
 
     const copyFileImpl = async (srcPath: string, dstPath: string, bFailIfExists: boolean): Promise<number> => {
@@ -927,6 +885,38 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return deleteResult;
     };
 
+    // MoveFileEx(lpExisting, lpNew, dwFlags). Unlike MoveFile it can overwrite an
+    // existing destination when MOVEFILE_REPLACE_EXISTING is set — several installers
+    // and self-test paths (Worms Armageddon's startup FS check) rely on the Ex form.
+    const MOVEFILE_REPLACE_EXISTING = 0x1;
+    const moveFileExImpl = async (srcPath: string, dstPath: string, dwFlags: number, tag: string): Promise<number> => {
+        const failIfExists = (dwFlags & MOVEFILE_REPLACE_EXISTING) === 0;
+        Logger.log(LogCategory.KERNEL32, `${tag}("${srcPath}" -> "${dstPath}", flags=0x${(dwFlags >>> 0).toString(16)})`);
+        await discardStaleRomRenameTemp(srcPath, dstPath);
+        const copyResult = await copyFileImpl(srcPath, dstPath, failIfExists);
+        if (!copyResult) {
+            Logger.log(LogCategory.KERNEL32, `${tag}: FAILED copy "${srcPath}" -> "${dstPath}" err=${System.getInstance().scheduler.getLastError()}`);
+            return 0;
+        }
+        const deleteResult = await deleteFileImpl(srcPath);
+        Logger.log(LogCategory.KERNEL32, deleteResult
+            ? `${tag}: OK "${srcPath}" -> "${dstPath}"`
+            : `${tag}: FAILED delete-source "${srcPath}" -> "${dstPath}" err=${System.getInstance().scheduler.getLastError()}`);
+        return deleteResult;
+    };
+
+    exports['MoveFileExA'] = async (ctx, mem, args) => {
+        const srcPath = args[0] ? readStringA(mem, args[0]) : '';
+        const dstPath = args[1] ? readStringA(mem, args[1]) : '';
+        return moveFileExImpl(srcPath, dstPath, args[2] >>> 0, 'MoveFileExA');
+    };
+
+    exports['MoveFileExW'] = async (ctx, mem, args) => {
+        const srcPath = args[0] ? readStringW(mem, args[0]) : '';
+        const dstPath = args[1] ? readStringW(mem, args[1]) : '';
+        return moveFileExImpl(srcPath, dstPath, args[2] >>> 0, 'MoveFileExW');
+    };
+
     exports['CreateFileMappingA'] = (ctx, mem, args) => {
         const hFile = args[0];
         const flProtect = args[2] >>> 0;
@@ -944,7 +934,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
 
         let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let fileHandle: number | null = null;
+        let mappingFile: VfsFileHandle | null = null;
+        const vfs0 = System.getInstance().fileSystem;
 
         if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
@@ -953,11 +944,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            fileHandle = hFile;
+            mappingFile = vfs0.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
             if (size === 0) {
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-                const vfs = System.getInstance().fileSystem;
-                size = vfs.getFileSize(vfsHandle.path);
+                size = vfs0.getFileSize(mappingFile.path);
             }
         }
 
@@ -968,7 +957,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const mapping: FileMappingObject = {
             kind: 'file_mapping',
             size,
-            fileHandle,
+            file: mappingFile,
             protect: flProtect,
         };
 
@@ -996,7 +985,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
 
         let size = dwMaxSizeHigh * 0x100000000 + dwMaxSizeLow;
-        let fileHandle: number | null = null;
+        let mappingFile: VfsFileHandle | null = null;
+        const vfs0 = System.getInstance().fileSystem;
 
         if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
@@ -1005,11 +995,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
                 return 0;
             }
-            fileHandle = hFile;
+            mappingFile = vfs0.duplicateHandle((fileObj as FileHandleWrapper).vfsHandle, 0);
             if (size === 0) {
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-                const vfs = System.getInstance().fileSystem;
-                size = vfs.getFileSize(vfsHandle.path);
+                size = vfs0.getFileSize(mappingFile.path);
             }
         }
 
@@ -1020,7 +1008,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const mapping: FileMappingObject = {
             kind: 'file_mapping',
             size,
-            fileHandle,
+            file: mappingFile,
             protect: flProtect,
         };
 
@@ -1087,14 +1075,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             Mem.writeBytes(base + wrote, zeroChunk.subarray(0, chunkSize));
         }
 
-        if (mapping.fileHandle !== null) {
-            const resourceProvider = System.getInstance().resourceProvider;
-            const fileObj = resourceProvider.getFileHandle(mapping.fileHandle);
-            if (fileObj && !isConsoleDeviceHandle(fileObj)) {
+        if (mapping.file !== null) {
+            {
                 const vfs = System.getInstance().fileSystem;
-                const vfsHandle = (fileObj as FileHandleWrapper).vfsHandle;
-                const originalPos = vfsHandle.position;
-                vfs.setPosition(vfsHandle, offset, 0);
+                // Populating the view runs on its OWN cursor: MapViewOfFile does not touch
+                // the file pointer at all, and save/restore around these awaits would clobber
+                // any seek the guest performs during the yield.
+                const viewHandle = vfs.duplicateHandle(mapping.file, offset);
 
                 const chunkSize = 256 * 1024;
                 let remaining = size;
@@ -1102,14 +1089,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
                 while (remaining > 0) {
                     const toRead = Math.min(chunkSize, remaining);
-                    const data = await vfs.read(vfsHandle, toRead);
+                    const data = await vfs.read(viewHandle, toRead);
                     if (data.length === 0) break;
                     Mem.writeBytes(dest, data);
                     dest += data.length;
                     remaining -= data.length;
                 }
-
-                vfs.setPosition(vfsHandle, originalPos, 0);
             }
         }
 
@@ -1119,9 +1104,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const mappingWritable = (mapping.protect & PAGE_WRITE_MASK) !== 0;
         const accessWrite = (dwDesiredAccess & (FILE_MAP_WRITE | FILE_MAP_ALL_ACCESS)) !== 0;
         const isCopy = (dwDesiredAccess & FILE_MAP_COPY) !== 0 && !accessWrite;
-        const writable = mapping.fileHandle !== null && mappingWritable && accessWrite && !isCopy;
+        const writable = mapping.file !== null && mappingWritable && accessWrite && !isCopy;
 
-        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, fileHandle: mapping.fileHandle, writable });
+        fileMappingViews.set(base, { mappingHandle: hFileMappingObject, size, offset, file: mapping.file, writable });
         return base;
     };
 
@@ -1166,6 +1151,89 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     exports['MapViewOfFileEx'] = (ctx, mem, args) => {
         // Forward to MapViewOfFile (ignoring the base address hint)
         return exports['MapViewOfFile']!(ctx, mem, args) as Promise<number>;
+    };
+
+    /**
+     * BOOL ReadFileEx(HANDLE, LPVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE)
+     *
+     * The APC form of an overlapped read: the completion routine — not an event, not a
+     * completion port — is what tells the ISSUING thread the request finished, and Windows
+     * runs it only while that thread sits in an alertable wait. We satisfy the read here
+     * and queue the routine; the alertable waits drain the queue. A stub instead leaves a
+     * streaming engine waiting on a completion that can never arrive (CryEngine hangs its
+     * whole level load on it), which looks like a deadlock nowhere near the read.
+     */
+    exports['ReadFileEx'] = (ctx, mem, args) => {
+        const hFile = args[0] >>> 0;
+        const lpBuffer = args[1] >>> 0;
+        const nNumberOfBytesToRead = args[2] >>> 0;
+        const lpOverlapped = args[3] >>> 0;
+        const lpCompletionRoutine = args[4] >>> 0;
+        const sched = System.getInstance().scheduler;
+
+        if (!lpOverlapped || lpOverlapped + 20 > mem.length) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const fileHandle = System.getInstance().resourceProvider.getFileHandle(hFile);
+        if (!fileHandle || isConsoleDeviceHandle(fileHandle)) {
+            sched.setLastError(ERROR_INVALID_HANDLE);
+            return 0;
+        }
+
+        // ReadFileEx ALWAYS takes its offset from OVERLAPPED and never advances the file
+        // pointer — the handle's own cursor belongs to whoever else is reading it, so the read
+        // runs over a DUPLICATE cursor (CLAUDE.md 3.2) rather than a save/restore that an await
+        // would tear.
+        const ovView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const offset = ovView.getUint32(lpOverlapped + 8, true);
+        const wrapper = fileHandle as FileHandleWrapper;
+        const vfs = System.getInstance().fileSystem;
+        const cursor = vfs.duplicateHandle(wrapper.vfsHandle, offset);
+
+        const complete = (bytesRead: number): number => {
+            const freshMem = Mem.getView() || mem;
+            const outView = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
+            outView.setUint32(lpOverlapped, 0, true);              // Internal = STATUS_SUCCESS
+            outView.setUint32(lpOverlapped + 4, bytesRead, true);   // InternalHigh = bytes transferred
+
+            const tid = sched.getCurrentThread()?.id ?? 0;
+            if (lpCompletionRoutine && tid) {
+                sched.queueIoCompletionApc(tid, lpCompletionRoutine, 0, bytesRead, lpOverlapped);
+            }
+            Logger.log(LogCategory.KERNEL32,
+                `ReadFileEx(h=0x${hFile.toString(16)}, size=${nNumberOfBytesToRead}, offset=${offset}) -> ` +
+                `${bytesRead} byte(s), APC=0x${lpCompletionRoutine.toString(16)} on T${tid}`);
+            sched.setLastError(0);
+            return 1;
+        };
+
+        // null from the sync attempt is "not available synchronously", NOT end of file. Reporting
+        // it as a 0-byte SUCCESS would hand the completion routine a truncated file — a wrong
+        // answer the caller cannot detect — so the miss goes to the async read instead.
+        if (lpBuffer && lpBuffer + nNumberOfBytesToRead <= mem.length) {
+            const sync = vfs.readIntoSync(cursor, mem, lpBuffer, nNumberOfBytesToRead);
+            if (sync !== null) return complete(sync);
+        } else {
+            const data = vfs.readSync(cursor, nNumberOfBytesToRead);
+            if (data !== null) return complete(MemoryGuard.writeBytes(mem, lpBuffer, data, "ReadFileEx"));
+        }
+
+        return (async (): Promise<ThunkResult> => {
+            let bytesRead = 0;
+            try {
+                const freshMem = Mem.getView();
+                if (freshMem && lpBuffer && lpBuffer + nNumberOfBytesToRead <= freshMem.length) {
+                    bytesRead = await vfs.readInto(cursor, freshMem, lpBuffer, nNumberOfBytesToRead);
+                } else {
+                    const data = await vfs.read(cursor, nNumberOfBytesToRead);
+                    bytesRead = MemoryGuard.writeBytes(Mem.getView() || mem, lpBuffer, data, "ReadFileEx");
+                }
+            } catch (e) {
+                Logger.warn(LogCategory.KERNEL32, `ReadFileEx async read failed: ${e}`);
+            }
+            return { value: complete(bytesRead), stackCleanup: 20 };
+        })();
     };
 
     exports['ReadFile'] = (ctx, mem, args) => {
@@ -1220,6 +1288,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             if (overlappedHEvent) {
                 System.getInstance().scheduler.setEvent(overlappedHEvent);
             }
+            // A handle bound to a completion port also gets a packet: that, not the
+            // event, is what an I/O worker pool is waiting on.
+            postFileIoCompletion(hFile, bytesRead, lpOverlapped);
         };
 
         const cleanup = () => {
@@ -1264,6 +1335,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     view.setUint32(lpNumberOfBytesRead, bytesReadSync, true);
                 }
                 const vfsHandle = (fileHandle as FileHandleWrapper).vfsHandle;
+                noteReadFileThread(hFile, vfsHandle?.path ?? "?");
                 if (vfsHandle?.path.toLowerCase().endsWith("casa.mmp")) {
                     Logger.log(LogCategory.KERNEL32, 
                         `ReadFile casa.mmp: h=0x${hFile.toString(16)} buf=0x${lpBuffer.toString(16)} ` +
@@ -1295,6 +1367,16 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                     Logger.warn(LogCategory.KERNEL32,
                         `[SHORTREAD] ${vfsHandle.path}: wanted=${nNumberOfBytesToRead} got=${bytesReadSync} ` +
                         `pos=${vfsHandle.position - bytesReadSync}`);
+                }
+                // A short read that the guest does not check leaves its buffer holding whatever
+                // was there before — the header it then parses is stale stack/heap bytes. The
+                // per-extension probes above only cover the titles that already cost us a day,
+                // so keep a generic one: any file, rate-limited.
+                if (vfsHandle && bytesReadSync < nNumberOfBytesToRead && shortReadLogCount < 40) {
+                    shortReadLogCount++;
+                    Logger.warn(LogCategory.KERNEL32,
+                        `[SHORTREAD] ${vfsHandle.path}: wanted=${nNumberOfBytesToRead} got=${bytesReadSync} ` +
+                        `pos=${vfsHandle.position - bytesReadSync} size=${fileHandle.size}`);
                 }
                 if (vfsHandle) {
                     if (LARGE_IO_TRACE_ENABLED) traceLargeRead(
@@ -1389,6 +1471,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 return { value: 1, stackCleanup: 20 };
             } catch (e) {
                 cleanup();
+                // A FALSE with a STALE last error is a wrong answer the caller cannot
+                // detect: a leftover ERROR_IO_PENDING reads as "overlapped, wait for it"
+                // and the guest waits for a completion this failure will never post.
+                Logger.error(LogCategory.KERNEL32, `ReadFile async failed: h=0x${hFile.toString(16)} ${e}`);
+                System.getInstance().scheduler.setLastError(ERROR_IO_DEVICE);
                 return { value: 0, stackCleanup: 20 };
             }
         })();
@@ -1400,7 +1487,26 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const lpBuffer = args[1];
         const nNumberOfBytesToWrite = args[2];
         const lpNumberOfBytesWritten = args[3];
-        const lpOverlapped = args[4]; // unused
+        const lpOverlapped = args[4];
+
+        /**
+         * Complete an overlapped write the way the OS does: the OVERLAPPED's status
+         * fields, then its event, then a packet on the completion port the handle is
+         * bound to. Leaving this out is invisible while GetQueuedCompletionStatus
+         * merely polls, and a deadlock once it properly blocks: a save hangs with the
+         * whole thread pool parked on a packet that never comes.
+         */
+        const completeOverlappedWrite = (bytesWritten: number): void => {
+            if (!lpOverlapped) return;
+            const freshMem = Mem.getView();
+            if (!freshMem || lpOverlapped + 20 > freshMem.length) return;
+            const ovView = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
+            ovView.setUint32(lpOverlapped, 0, true);                 // Internal = STATUS_SUCCESS
+            ovView.setUint32(lpOverlapped + 4, bytesWritten, true);  // InternalHigh = bytes transferred
+            const hEvent = ovView.getUint32(lpOverlapped + 16, true) >>> 0;
+            if (hEvent) System.getInstance().scheduler.setEvent(hEvent);
+            postFileIoCompletion(hFile, bytesWritten, lpOverlapped);
+        };
 
         // Handle standard file handles (stdin/stdout/stderr) - synchronous
         if (hFile === 1 || hFile === 2) {
@@ -1464,16 +1570,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             Logger.verbose(LogCategory.KERNEL32, `WriteFile(0x${hFile.toString(16)}, ${nNumberOfBytesToWrite} bytes)`);
         }
 
-        // Dump text content for log/error files to help diagnose game errors
-        const fnLower = filename.toLowerCase();
-        if ((fnLower.endsWith('.log') || fnLower.endsWith('.err') || fnLower.includes('blizzarderror') || fnLower.endsWith('.txt')) && nNumberOfBytesToWrite > 0 && nNumberOfBytesToWrite < 32768) {
-            try {
-                const logData = mem.slice(lpBuffer, lpBuffer + nNumberOfBytesToWrite);
-                const logText = getCodePageDecoder(EmulatorConfig.getInstance().ansiCodePage).decode(logData);
-                const label = fnLower.endsWith('.log') ? 'LOG' : fnLower.endsWith('.err') ? 'ERR' : 'TXT';
-                Logger.log(LogCategory.KERNEL32, `WriteFile ${label} content: "${logText.trimEnd()}"`);
-            } catch { /* ignore decode errors */ }
-        }
+        logGuestWriteContent(filename, mem, lpBuffer, nNumberOfBytesToWrite);
 
         const capturedLpNumberOfBytesWritten = lpNumberOfBytesWritten;
         const data = mem.slice(lpBuffer, lpBuffer + nNumberOfBytesToWrite);
@@ -1496,6 +1593,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
                 view.setUint32(capturedLpNumberOfBytesWritten, syncWritten, true);
             }
+            completeOverlappedWrite(syncWritten);
             return 1; // TRUE — stdcall cleanup applied from the registered WriteFile signature
         }
 
@@ -1516,6 +1614,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
                 // Use deferred writes - they're applied in _restoreAsyncContext BEFORE simulating RET
                 // This ensures writes happen when ESP is still at original position
+                completeOverlappedWrite(bytesWritten);
                 if (capturedLpNumberOfBytesWritten) {
                     return {
                         value: 1,
@@ -1531,6 +1630,8 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 return { value: 1, stackCleanup: 20 };
             } catch (error) {
                 Logger.error(LogCategory.KERNEL32, `WriteFile failed: ${error}`);
+                // Same reason as ReadFile's catch: never return FALSE on a stale error.
+                System.getInstance().scheduler.setLastError(ERROR_IO_DEVICE);
                 return { value: 0, stackCleanup: 20 }; // FALSE
             }
         })();
@@ -1746,6 +1847,33 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
     };
 
+    // BOOL GetFileSizeEx(HANDLE hFile, PLARGE_INTEGER lpFileSize)
+    // Unlike GetFileSize there is no in-band error value: the size goes entirely through the
+    // out-param and the BOOL is the only status, so a caller has no reason to sanity-check
+    // what it reads back — it sizes a buffer with it directly.
+    exports['GetFileSizeEx'] = (ctx, mem, args) => {
+        const hFile = args[0];
+        const lpFileSize = args[1] >>> 0;
+
+        const fileHandle = System.getInstance().resourceProvider.getFileHandle(hFile);
+        if (!fileHandle) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_HANDLE);
+            return 0; // FALSE
+        }
+        const size = fileHandle.size;
+        if (!lpFileSize
+            || !Mem.writeUint32(lpFileSize, size >>> 0)
+            || !Mem.writeUint32(lpFileSize + 4, Math.floor(size / 0x100000000) >>> 0)) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+
+        const vfsHandle = (fileHandle as FileHandleWrapper).vfsHandle;
+        Logger.verbose(LogCategory.KERNEL32,
+            `GetFileSizeEx(0x${hFile.toString(16)}, "${vfsHandle?.path ?? ''}") -> ${size}`);
+        return 1; // TRUE
+    };
+
     // All ANSI functions (ending with 'A') use UTF-8 encoding instead of system codepage (Windows-1251, Latin1, etc.)
     // This is a simplification for the emulator. Real Windows uses the current system ANSI codepage,
     // which may affect legacy applications with non-ASCII filenames.
@@ -1864,6 +1992,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         Logger.verbose(LogCategory.KERNEL32, `CloseHandle(0x${hObject.toString(16)})`);
         readFileFirstLogged.delete(hObject);
+        // Handle values are recycled: a completion-port binding must die with the handle
+        // that owns it, or the next file to get this value posts into someone else's port.
+        dissociateIoCompletionHandle(hObject);
 
         const resourceProvider = System.getInstance().resourceProvider;
         const resource = resourceProvider.getResource(hObject);
@@ -1920,6 +2051,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                         break;
                     }
                     const kernelObj = resourceProvider.getKernelObject(hObject);
+                    if (kernelObj?.kind === 'iocp') {
+                        // Threads parked in GetQueuedCompletionStatus on this port would
+                        // otherwise wait for a packet the closed port can never deliver.
+                        abandonIoCompletionWaiters(hObject);
+                    }
                     if (kernelObj?.kind === 'event') {
                         hypercallDataManager.unregisterEventMirror(hObject);
                     } else if (kernelObj?.kind === 'mutex') {
@@ -2044,6 +2180,42 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 1; // TRUE
     };
 
+    // BOOL LockFileEx(HANDLE hFile, DWORD dwFlags, DWORD dwReserved,
+    //   DWORD nNumberOfBytesToLockLow, DWORD nNumberOfBytesToLockHigh, LPOVERLAPPED lpOverlapped)
+    // One guest process owns the whole VFS, so a byte-range lock is never contended and
+    // always grants immediately — including LOCKFILE_FAIL_IMMEDIATELY, which only matters
+    // to a caller that would otherwise block. lpOverlapped carries the offset and is
+    // MANDATORY here (unlike LockFile): a caller that passes NULL gets the documented error
+    // rather than a lock over an offset we invented.
+    exports['LockFileEx'] = (ctx, mem, args) => {
+        const dwReserved = args[2] >>> 0;
+        const lpOverlapped = args[5] >>> 0;
+        if (dwReserved !== 0 || !lpOverlapped) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+        // Completed synchronously: Internal = STATUS_SUCCESS, InternalHigh = 0.
+        Mem.writeUint32(lpOverlapped, 0);
+        Mem.writeUint32(lpOverlapped + 4, 0);
+        Logger.verbose(LogCategory.KERNEL32, `LockFileEx(0x${args[0].toString(16)}) -> granted`);
+        return 1; // TRUE
+    };
+
+    // BOOL UnlockFileEx(HANDLE hFile, DWORD dwReserved, DWORD nNumberOfBytesToUnlockLow,
+    //   DWORD nNumberOfBytesToUnlockHigh, LPOVERLAPPED lpOverlapped)
+    exports['UnlockFileEx'] = (ctx, mem, args) => {
+        const dwReserved = args[1] >>> 0;
+        const lpOverlapped = args[4] >>> 0;
+        if (dwReserved !== 0 || !lpOverlapped) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+        Mem.writeUint32(lpOverlapped, 0);
+        Mem.writeUint32(lpOverlapped + 4, 0);
+        Logger.verbose(LogCategory.KERNEL32, `UnlockFileEx(0x${args[0].toString(16)}) -> released`);
+        return 1; // TRUE
+    };
+
     // BOOL CreatePipe(PHANDLE hReadPipe, PHANDLE hWritePipe, LPSECURITY_ATTRIBUTES lpPipeAttributes, DWORD nSize)
     // Stub — return failure, pipes not supported
     exports['CreatePipe'] = (ctx, mem, args) => {
@@ -2054,13 +2226,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     exports['SetStdHandle'] = (ctx, mem, args) => {
         return 1; // TRUE
-    };
-
-    exports['SetHandleCount'] = (ctx, mem, args) => {
-        const uNumber = args[0];
-        Logger.log(LogCategory.KERNEL32, `SetHandleCount called: uNumber=${uNumber}`);
-        // Legacy function, return default handle count
-        return 512;
     };
 
     // PeekNamedPipe - peeks at data available in a named pipe
@@ -2120,8 +2285,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         // +44: nFileIndexHigh (DWORD)
         // +48: nFileIndexLow (DWORD)
         view.setUint32(lpFileInformation + 0, 0x80, true);   // FILE_ATTRIBUTE_NORMAL
-        // Creation/access/write times: 2020-01-01 as FILETIME
-        const fakeTime = 132224352000000000n; // 2020-01-01 as FILETIME
+        const fakeTime = VFS_FILETIME;
         view.setBigUint64(lpFileInformation + 4, fakeTime, true);
         view.setBigUint64(lpFileInformation + 12, fakeTime, true);
         view.setBigUint64(lpFileInformation + 20, fakeTime, true);
@@ -2135,10 +2299,37 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 1; // TRUE
     };
 
-    exports['CreateSymbolicLinkW'] = () => {
-        System.getInstance().scheduler.setLastError(1314); // ERROR_PRIVILEGE_NOT_HELD
-        return 0;
+    // BOOLEAN CreateSymbolicLink{A,W}(LPCTSTR lpSymlinkFileName, LPCTSTR lpTargetFileName, DWORD dwFlags)
+    // The VFS has no reparse points, so the process holds no SeCreateSymbolicLinkPrivilege —
+    // the position of an unelevated process without Developer Mode, where
+    // SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE does not help. The checks Windows makes
+    // before it reaches the privilege (flags, an existing name, a missing parent) keep their
+    // own errors.
+    const createSymbolicLink = (link: string | null, target: string | null, flags: number): number => {
+        const fail = (code: number) => { System.getInstance().scheduler.setLastError(code); return 0; };
+        if (link === null || target === null || (flags & ~0x3)) return fail(ERROR_INVALID_PARAMETER);
+        if (!link) return fail(123); // ERROR_INVALID_NAME
+        const vfs = System.getInstance().fileSystem;
+        const resolved = vfs.resolvePath(link);
+        if (vfs.fileExists(resolved) || vfs.directoryExists(resolved)) return fail(ERROR_ALREADY_EXISTS);
+        const cut = resolved.replace(/\\+$/, '').lastIndexOf('\\');
+        const parent = cut > 2 ? resolved.slice(0, cut) : resolved.slice(0, 3);
+        if (!vfs.directoryExists(parent)) return fail(ERROR_PATH_NOT_FOUND);
+        Logger.log(LogCategory.KERNEL32, `CreateSymbolicLink("${link}" -> "${target}", 0x${flags.toString(16)}): ERROR_PRIVILEGE_NOT_HELD`);
+        return fail(1314); // ERROR_PRIVILEGE_NOT_HELD
     };
+
+    exports['CreateSymbolicLinkW'] = (_ctx, mem, args) => createSymbolicLink(
+        args[0] ? readStringW(mem, args[0]) : null, args[1] ? readStringW(mem, args[1]) : null, args[2]! >>> 0);
+
+    exports['CreateSymbolicLinkA'] = (_ctx, mem, args) => createSymbolicLink(
+        args[0] ? readStringA(mem, args[0]) : null, args[1] ? readStringA(mem, args[1]) : null, args[2]! >>> 0);
+
+    // SetFileApisToOEM / SetFileApisToANSI switch the code page of every A file API: the
+    // paths they read and the names they return.
+    exports['SetFileApisToANSI'] = (_ctx, _mem, _args) => { setFileApisAnsi(true); return 0; };
+    exports['SetFileApisToOEM'] = (_ctx, _mem, _args) => { setFileApisAnsi(false); return 0; };
+    exports['AreFileApisANSI'] = (_ctx, _mem, _args) => (areFileApisAnsi() ? 1 : 0);
 
     exports['GetFileInformationByHandleEx'] = (ctx, mem, args) => {
         const hFile = args[0] >>> 0;
@@ -2155,7 +2346,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const fileSize = fileHandle.size >>> 0;
-        const fakeTime = 132224352000000000n;
+        const fakeTime = VFS_FILETIME;
 
         // FileBasicInfo = 0 (40 bytes)
         if (infoClass === 0) {
@@ -2197,22 +2388,38 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return 0;
     };
 
-    return exports;
+    const reset = (): void => {
+        namedFileMappings.clear();
+        fileMappingViews.clear();
+        readFileFirstLogged.clear();
+        readFileLastThread.clear();
+        shortReadLogCount = 0;
+        sharedHandleLogCount = 0;
+        setFilePointerCallCounts.clear();
+    };
+
+    return { exports, reset };
 })();
+
+export const exports: Record<string, ThunkImplementation> = fileIoModule.exports;
+
+export function resetFileIoState(): void {
+    fileIoModule.reset();
+    setFileApisAnsi(true);
+}
 
 /**
  * Register fast-path implementations for high-frequency file I/O.
  * SetFilePointer: ~44K calls (169ms), ReadFile: ~33K calls (286ms) in UT99 demo.
  * Bypasses full thunk context deserialization for sync operations.
  */
-export function registerFastPathFileIOFunctions(dispatcher: any): void {
+export function registerFastPathFileIOFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // =========================================================================
     // SetFilePointer fast path — 44K calls, 169ms
     // =========================================================================
-    dispatcher.registerFastPath('kernel32', 'SetFilePointer', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('kernel32', 'SetFilePointer', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 20 > mem8.length) return null;
         const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
@@ -2261,8 +2468,7 @@ export function registerFastPathFileIOFunctions(dispatcher: any): void {
     // =========================================================================
     // ReadFile fast path — 33K calls, 286ms (sync ROM cache hits only)
     // =========================================================================
-    dispatcher.registerFastPath('kernel32', 'ReadFile', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    dispatcher.registerFastPath('kernel32', 'ReadFile', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 24 > mem8.length) return null;
         const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 

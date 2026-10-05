@@ -3,6 +3,11 @@ import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import {
     computeTextureDimensions,
+    glideIncludesMipLevel,
+    glideMipLevelPlan,
+    GR_MIPMAPLEVELMASK_BOTH,
+    GR_MIPMAPLEVELMASK_EVEN,
+    GR_MIPMAPLEVELMASK_ODD,
     parseNccTable,
     GLIDE_TEXFMT_P_8,
     GLIDE_TEXFMT_YIQ_422,
@@ -32,10 +37,10 @@ function dwordToFloat(value: number): number {
     return texFloatBitsView.getFloat32(0, true);
 }
 
-const GR_MIPMAPLEVELMASK_EVEN = 1;
-const GR_MIPMAPLEVELMASK_ODD = 2;
-const GR_MIPMAPLEVELMASK_BOTH = GR_MIPMAPLEVELMASK_EVEN | GR_MIPMAPLEVELMASK_ODD;
-const GR_NULL_MIPMAP_HANDLE = 0;
+// glide.h: `#define GR_NULL_MIPMAP_HANDLE ((GrMipMapId_t) -1)`. GrMipMapId_t is an
+// INDEX into gc->mm_table.data, so 0 is a perfectly valid mipmap — the sentinel has
+// to live outside the table, and it does.
+const GR_NULL_MIPMAP_HANDLE = 0xffffffff;
 
 // GrTexTable_t (grTexDownloadTable / grTexNCCTable)
 const GR_TEXTABLE_NCC0 = 0x0;
@@ -52,19 +57,6 @@ function getTmu(context: GlideContext, chip: number): GlideTMUState | null {
     return context.tmus[idx];
 }
 
-function shouldIncludeMipLevel(evenOdd: number, lod: number): boolean {
-    if (evenOdd === GR_MIPMAPLEVELMASK_BOTH) {
-        return true;
-    }
-    if (evenOdd === GR_MIPMAPLEVELMASK_EVEN) {
-        return (lod & 1) === 0;
-    }
-    if (evenOdd === GR_MIPMAPLEVELMASK_ODD) {
-        return (lod & 1) !== 0;
-    }
-    return false;
-}
-
 function estimateTextureMemRequiredBytes(context: GlideContext, evenOdd: number, info: ParsedGrTexInfo): number {
     // Glide 2.x: largeLod (e.g. 8=256x256) > smallLod (e.g. 0=1x1) numerically
     const minLod = Math.min(info.smallLod | 0, info.largeLod | 0);
@@ -78,7 +70,7 @@ function estimateTextureMemRequiredBytes(context: GlideContext, evenOdd: number,
 
     let total = 0;
     for (let lod = maxLod; lod >= minLod; lod--) {
-        if (shouldIncludeMipLevel(evenOdd, lod)) {
+        if (glideIncludesMipLevel(evenOdd, lod)) {
             const dims = computeTextureDimensions(lod, info.aspectRatio);
             total += estimateTextureSizeBytes(dims.width, dims.height, info.format);
         }
@@ -96,6 +88,7 @@ function uploadTexture(
     height: number,
     format: number,
     dataPtr: number,
+    declared?: { smallLod: number; largeLod: number; aspectRatio: number; evenOdd: number },
 ): GlideTextureRecord | null {
     const tmu = getTmu(context, tmuIndex);
     if (!tmu) return null;
@@ -104,46 +97,117 @@ function uploadTexture(
     const palette = format === GLIDE_TEXFMT_P_8 ? tmu.palette : null;
     const isYiq = format === GLIDE_TEXFMT_YIQ_422 || format === GLIDE_TEXFMT_AYIQ_8422;
     const ncc = isYiq ? (tmu.nccTables[tmu.activeNcc & 1] ?? null) : null;
-    const bytesNeeded = estimateTextureSizeBytes(width, height, format);
-    const texBytes = Mem.readBytes(dataPtr, bytesNeeded);
-    if (!texBytes) {
+    // grTexDownloadMipMap hands us the WHOLE chain the guest selected, largest LOD
+    // first. Decoding only level 0 leaves every minified surface sampling the full-res
+    // texture — the aliasing mipmaps exist to remove.
+    const plan = glideMipLevelPlan(
+        declared?.largeLod ?? -1,
+        declared?.smallLod ?? -1,
+        declared?.evenOdd ?? GR_MIPMAPLEVELMASK_BOTH,
+        declared?.aspectRatio ?? 3,
+        (w, h) => estimateTextureSizeBytes(w, h, format),
+    );
+    const levelPlan = plan.length > 0
+        ? plan
+        : [{ lod: 0, width, height, byteOffset: 0, byteSize: estimateTextureSizeBytes(width, height, format) }];
+
+    // With an ODD level mask the download STARTS at a smaller LOD than largeLod names,
+    // so the resident texture is the plan's first level, not the caller's guess.
+    const baseLevel = levelPlan[0]!;
+    const baseWidth = baseLevel.width;
+    const baseHeight = baseLevel.height;
+
+    const levels: Uint8Array[] = [];
+    let baseBytes: Uint8Array | null = null;
+    for (const level of levelPlan) {
+        const bytes = Mem.readBytes(dataPtr + level.byteOffset, level.byteSize);
+        if (!bytes) break;
+        baseBytes ??= bytes;
+        levels.push(decodeGlideTexture(bytes, 0, level.width, level.height, format, palette, ncc));
+    }
+    if (levels.length === 0 || !baseBytes) {
         setGlideError(context, 0x3004, `Texture upload failed: invalid data pointer 0x${dataPtr.toString(16)}`);
         return null;
     }
-    const rgba = decodeGlideTexture(texBytes, 0, width, height, format, palette, ncc);
+
+    // Retaining the undecoded source doubles a texture's resident cost and is only ever
+    // read by glideDumpTexture, so it is opt-in rather than paid by every title.
+    let sourceBytes = existing?.sourceBytes ?? null;
+    if ((globalThis as { __glideKeepTexSource?: boolean }).__glideKeepTexSource) {
+        if (!sourceBytes || sourceBytes.length !== baseBytes.length) {
+            sourceBytes = new Uint8Array(baseBytes.length);
+        }
+        sourceBytes.set(baseBytes);
+    }
 
     const handle = existing?.handle ?? context.nextTextureHandle++;
     if (context.executor) {
-        context.executor.uploadTexture(handle, width, height, format, rgba);
+        context.executor.uploadTexture(handle, baseWidth, baseHeight, format, levels);
     }
 
-    const bytes = estimateTextureSizeBytes(width, height, format);
+    // The resident footprint is the WHOLE chain: the overlap walk below compares
+    // extents, and a base-level-only size cannot see a download landing in an
+    // earlier texture's mip tail.
+    const bytes = levelPlan.reduce((n, l) => n + l.byteSize, 0);
     const record: GlideTextureRecord = {
         handle,
         tmu: tmuIndex,
         startAddress: startAddress >>> 0,
         dataPtr: dataPtr >>> 0,
-        width,
-        height,
+        width: baseWidth,
+        height: baseHeight,
         format: format | 0,
+        smallLod: declared?.smallLod ?? existing?.smallLod ?? -1,
+        largeLod: declared?.largeLod ?? existing?.largeLod ?? -1,
+        aspectRatio: declared?.aspectRatio ?? existing?.aspectRatio ?? -1,
+        evenOdd: declared?.evenOdd ?? existing?.evenOdd ?? -1,
         bytes,
         uploadedAt: context.executor ? performance.now() : 0,
         lastUsedFrame: context.frameSnapshot.frameId,
+        sourceBytes,
     };
 
-    tmu.texturesByAddress.set(startAddress >>> 0, record);
+    // TMU memory is one linear arena the guest allocates by hand. A download that
+    // lands across an EARLIER texture's extent overwrote those bytes on the hardware,
+    // so that texture no longer exists; keeping its record alive means a later
+    // grTexSource at its address serves content the TMU has not held since.
+    const newStart = startAddress >>> 0;
+    const newEnd = newStart + bytes;
+    for (const [addr, other] of tmu.texturesByAddress) {
+        if (addr === newStart) continue;
+        if (addr < newEnd && addr + other.bytes > newStart) {
+            tmu.texturesByAddress.delete(addr);
+            context.executor?.deleteTexture(other.handle);
+            context.diagnostics.push(
+                "texevict",
+                `tmu=${tmuIndex} addr=0x${addr.toString(16)} overwritten by 0x${newStart.toString(16)}`,
+            );
+        }
+    }
+
+    tmu.texturesByAddress.set(newStart, record);
     context.frameSnapshot.texDownloads++;
     context.frameSnapshot.frameCounters.uploads++;
     context.frameSnapshot.frameCounters.textureBytes += bytes;
-    context.diagnostics.push("texdownload", `tmu=${tmuIndex} addr=0x${startAddress.toString(16)} ${width}x${height} fmt=${format}`);
+    context.diagnostics.push("texdownload", `tmu=${tmuIndex} addr=0x${startAddress.toString(16)} ${baseWidth}x${baseHeight} fmt=${format}`);
     return record;
 }
 
+/**
+ * `capturedInfo` is the GrTexInfo the WBUF trampoline copied into the ring at CALL time;
+ * `infoPtr` is the guest pointer, read only when there is no capture. Real grTexSource
+ * (gtex.c) reads nothing but smallLod/largeLod/aspectRatio/format out of the struct — it
+ * never touches `info->data`, because the texels reached the TMU at grTexDownloadMipMap
+ * time. Our upload-on-miss is emulation slack for a title that sources an address it never
+ * downloaded to, which on real hardware samples whatever the TMU happened to hold.
+ */
 function ensureTextureForSource(
     context: GlideContext,
     tmuIndex: number,
     startAddress: number,
+    evenOdd: number,
     infoPtr: number,
+    capturedInfo: ParsedGrTexInfo | null,
 ): GlideTextureRecord | null {
     const tmu = getTmu(context, tmuIndex);
     if (!tmu) return null;
@@ -158,13 +222,19 @@ function ensureTextureForSource(
                 cached.height,
                 cached.format,
                 cached.dataPtr,
+                {
+                    smallLod: cached.smallLod,
+                    largeLod: cached.largeLod,
+                    aspectRatio: cached.aspectRatio,
+                    evenOdd: cached.evenOdd,
+                },
             );
         }
         return cached;
     }
-    if (!infoPtr) return null;
+    if (!capturedInfo && !infoPtr) return null;
 
-    const info = texInfoView.setPtr(infoPtr >>> 0).read();
+    const info = capturedInfo ?? texInfoView.setPtr(infoPtr >>> 0).read();
     if (!info) {
         setGlideError(context, 0x3002, "grTexSource: invalid GrTexInfo pointer");
         return null;
@@ -179,40 +249,83 @@ function ensureTextureForSource(
         dims.height,
         info.format,
         info.data,
+        { smallLod: info.smallLod, largeLod: info.largeLod, aspectRatio: info.aspectRatio, evenOdd },
     );
 }
+
+/** Reused across calls — guTexSource is a per-draw call and the result is read and
+ *  dropped by the caller. Returning a fresh object per call is what put ~120 short-lived
+ *  objects on the hot path for every one of them. */
+const guMmidResult: { tmuIndex: number; texture: GlideTextureRecord | null } = { tmuIndex: 0, texture: null };
+
+/**
+ * How guTexSource's mmid actually resolved. The keyed lookup is the whole point of this
+ * function's shape, and nothing outside could tell whether it HITS — a fallback walk on
+ * every call would look identical from the caller and cost O(textures) plus a sort.
+ * Surfaced by the `glideState` harness verb (FAST-PATH LEDGER RULE).
+ */
+export const guMmidResolveStats = { nullHandle: 0, keyed: 0, ordinalFallback: 0, recentFallback: 0, miss: 0 };
 
 function resolveTextureByGuMmid(
     context: GlideContext,
     mmid: number,
 ): { tmuIndex: number; texture: GlideTextureRecord } | null {
-    const exactMatches: Array<{ tmuIndex: number; texture: GlideTextureRecord }> = [];
-    const allTextures: Array<{ tmuIndex: number; texture: GlideTextureRecord }> = [];
+    // A guTex* mmid is normally the TMU address the texture was downloaded to, and
+    // texturesByAddress is keyed by exactly that — so the common case is a Map hit per
+    // TMU, not a walk. It used to materialise every resident texture into two arrays and
+    // sort them on EVERY call (~120 allocations plus a sort, thousands of objects a
+    // frame): O(textures) work and garbage for what the key already answers in O(TMUs).
+    const key = mmid >>> 0;
+    let bestTmu = -1;
+    let best: GlideTextureRecord | null = null;
+    for (let tmuIndex = 0; tmuIndex < context.tmus.length; tmuIndex++) {
+        const hit = context.tmus[tmuIndex]?.texturesByAddress.get(key);
+        // One record per address per TMU, so at most one candidate each: the tie between
+        // TMUs still goes to the most recently uploaded, as before.
+        if (hit && (!best || hit.uploadedAt > best.uploadedAt)) {
+            best = hit;
+            bestTmu = tmuIndex;
+        }
+    }
+    if (best) {
+        guMmidResolveStats.keyed++;
+        guMmidResult.tmuIndex = bestTmu;
+        guMmidResult.texture = best;
+        return guMmidResult as { tmuIndex: number; texture: GlideTextureRecord };
+    }
 
+    // Fallbacks only — a title whose mmid is NOT a TMU address. Counting and picking the
+    // newest is one allocation-free pass; only the ordinal branch actually needs the
+    // textures materialised in order, and it is the rarer of the two.
+    let count = 0;
+    let newest: GlideTextureRecord | null = null;
+    let newestTmu = -1;
     for (let tmuIndex = 0; tmuIndex < context.tmus.length; tmuIndex++) {
         const tmu = context.tmus[tmuIndex];
         if (!tmu) continue;
         for (const texture of tmu.texturesByAddress.values()) {
-            const entry = { tmuIndex, texture };
-            allTextures.push(entry);
-            if ((texture.startAddress >>> 0) === (mmid >>> 0)) {
-                exactMatches.push(entry);
+            count++;
+            if (!newest || texture.uploadedAt > newest.uploadedAt) {
+                newest = texture;
+                newestTmu = tmuIndex;
             }
         }
     }
-
-    if (exactMatches.length > 0) {
-        exactMatches.sort((a, b) => b.texture.uploadedAt - a.texture.uploadedAt);
-        return exactMatches[0] ?? null;
-    }
-
-    if (allTextures.length === 0) {
+    if (!newest) {
+        guMmidResolveStats.miss++;
         return null;
     }
 
     // Pragmatic fallback: legacy guTex* code often uses small sequential handles.
     // If mmid looks like a small positive handle, map it by allocation-like order.
-    if (mmid > 0 && mmid <= allTextures.length) {
+    if (mmid > 0 && mmid <= count) {
+        guMmidResolveStats.ordinalFallback++;
+        const allTextures: Array<{ tmuIndex: number; texture: GlideTextureRecord }> = [];
+        for (let tmuIndex = 0; tmuIndex < context.tmus.length; tmuIndex++) {
+            const tmu = context.tmus[tmuIndex];
+            if (!tmu) continue;
+            for (const texture of tmu.texturesByAddress.values()) allTextures.push({ tmuIndex, texture });
+        }
         allTextures.sort((a, b) => {
             if (a.tmuIndex !== b.tmuIndex) return a.tmuIndex - b.tmuIndex;
             return (a.texture.startAddress >>> 0) - (b.texture.startAddress >>> 0);
@@ -221,8 +334,46 @@ function resolveTextureByGuMmid(
     }
 
     // Last resort: keep rendering with the most recently uploaded texture.
-    allTextures.sort((a, b) => b.texture.uploadedAt - a.texture.uploadedAt);
-    return allTextures[0] ?? null;
+    guMmidResolveStats.recentFallback++;
+    guMmidResult.tmuIndex = newestTmu;
+    guMmidResult.texture = newest;
+    return guMmidResult as { tmuIndex: number; texture: GlideTextureRecord };
+}
+
+/**
+ * The WHOLE of grTexSource, shared verbatim by the OUT-trap handler and the WBUF drain
+ * handler. Two copies of this would drift silently — the ring path only runs under load,
+ * on whichever half someone edited once — and it is also what makes the two paths update
+ * the same ledgers (frameCounters.textureBinds, the diagnostics ring, lastUsedFrame) by
+ * construction rather than by a comparison somebody has to remember to run.
+ */
+export function applyGrTexSource(
+    context: GlideContext,
+    tmuIndex: number,
+    startAddress: number,
+    evenOdd: number,
+    infoPtr: number,
+    capturedInfo: ParsedGrTexInfo | null,
+): number {
+    if (shouldLogTexEntry(context)) {
+        Logger.log(
+            LogCategory.SYSTEM,
+            `[Glide] grTexSource tmu=${tmuIndex} addr=0x${startAddress.toString(16)} ` +
+            `evenOdd=${evenOdd} infoPtr=0x${infoPtr.toString(16)}`,
+        );
+    }
+    const tmu = getTmu(context, tmuIndex);
+    if (!tmu) return 0;
+
+    tmu.currentAddress = startAddress >>> 0;
+    const tex = ensureTextureForSource(context, tmuIndex, startAddress, evenOdd, infoPtr, capturedInfo);
+    context.ffpState.setTexture(!!tex, tex?.handle ?? 0);
+    if (tex) {
+        tex.lastUsedFrame = context.frameSnapshot.frameId;
+        context.frameSnapshot.frameCounters.textureBinds++;
+    }
+    context.diagnostics.push("texsource", `tmu=${tmuIndex} addr=0x${startAddress.toString(16)} handle=${tex?.handle ?? 0}`);
+    return 0;
 }
 
 export function createTextureExports(context: GlideContext): Record<string, ThunkImplementation> {
@@ -266,40 +417,22 @@ export function createTextureExports(context: GlideContext): Record<string, Thun
             return estimateTextureMemRequiredBytes(context, evenOdd, info);
         },
 
-        "_grTexSource@16": (_ctx, _mem, args) => {
-            const tmuIndex = args[0] | 0;
-            const startAddress = args[1] >>> 0;
-            const infoPtr = args[3] >>> 0;
-            if (shouldLogTexEntry(context)) {
-                Logger.log(
-                    LogCategory.SYSTEM,
-                    `[Glide] grTexSource tmu=${tmuIndex} addr=0x${startAddress.toString(16)} ` +
-                    `evenOdd=${args[2] | 0} infoPtr=0x${infoPtr.toString(16)}`,
-                );
-            }
-            const tmu = getTmu(context, tmuIndex);
-            if (!tmu) return 0;
-
-            tmu.currentAddress = startAddress >>> 0;
-            const tex = ensureTextureForSource(context, tmuIndex, startAddress, infoPtr);
-            context.ffpState.setTexture(!!tex, tex?.handle ?? 0);
-            if (tex) {
-                tex.lastUsedFrame = context.frameSnapshot.frameId;
-                context.frameSnapshot.frameCounters.textureBinds++;
-            }
-            context.diagnostics.push("texsource", `tmu=${tmuIndex} addr=0x${startAddress.toString(16)} handle=${tex?.handle ?? 0}`);
-            return 0;
-        },
+        "_grTexSource@16": (_ctx, _mem, args) =>
+            applyGrTexSource(context, args[0] | 0, args[1] >>> 0, args[2] | 0, args[3] >>> 0, null),
 
         "_guTexSource@4": (_ctx, _mem, args) => {
-            const mmid = args[0] | 0;
+            const mmid = args[0] >>> 0;
+            // gutex.c guTexSource: `if (mmid == GR_NULL_MIPMAP_HANDLE) return;` — a plain
+            // no-op that leaves the previously sourced mipmap bound. Neither a bind nor a
+            // texture-disable, and cheap: Carmageddon 2 issues nothing else through this
+            // entry point, so every one of these used to fall through to the resolver's
+            // fallback and re-bind whichever texture was uploaded last.
+            if (mmid === GR_NULL_MIPMAP_HANDLE) {
+                guMmidResolveStats.nullHandle++;
+                return 0;
+            }
             if (shouldLogTexEntry(context)) {
                 Logger.log(LogCategory.SYSTEM, `[Glide] guTexSource mmid=${mmid}`);
-            }
-            if (mmid === GR_NULL_MIPMAP_HANDLE) {
-                context.ffpState.setTexture(false, 0);
-                context.diagnostics.push("texsource", "guTexSource(NULL) -> texture disabled");
-                return 0;
             }
 
             const resolved = resolveTextureByGuMmid(context, mmid);
@@ -325,7 +458,6 @@ export function createTextureExports(context: GlideContext): Record<string, Thun
         "_grTexDownloadMipMap@16": (_ctx, _mem, args) => {
             const tmuIndex = args[0] | 0;
             const startAddress = args[1] >>> 0;
-            // args[2] = evenOdd (GR_MIPMAPLEVELMASK_*), currently unused
             const infoPtr = args[3] >>> 0;
             if (shouldLogTexEntry(context)) {
                 Logger.log(
@@ -358,6 +490,12 @@ export function createTextureExports(context: GlideContext): Record<string, Thun
                 dims.height,
                 info.format,
                 info.data,
+                {
+                    smallLod: info.smallLod,
+                    largeLod: info.largeLod,
+                    aspectRatio: info.aspectRatio,
+                    evenOdd: args[2] | 0,
+                },
             );
             return record ? FXTRUE : FXFALSE;
         },
@@ -525,3 +663,21 @@ export function createTextureExports(context: GlideContext): Record<string, Thun
     };
 }
 
+
+/**
+ * Decode one texture record straight from the guest bytes it was uploaded from,
+ * through the same decoder the upload path uses. Diagnostic only (glideDumpTexture).
+ */
+export function decodeTextureRecordToRgba(
+    context: GlideContext,
+    record: GlideTextureRecord,
+): Uint8Array | null {
+    const tmu = getTmu(context, record.tmu);
+    if (!tmu) return null;
+    const palette = record.format === GLIDE_TEXFMT_P_8 ? tmu.palette : null;
+    const isYiq = record.format === GLIDE_TEXFMT_YIQ_422 || record.format === GLIDE_TEXFMT_AYIQ_8422;
+    const ncc = isYiq ? (tmu.nccTables[tmu.activeNcc & 1] ?? null) : null;
+    const bytes = record.sourceBytes;
+    if (!bytes) return null;
+    return decodeGlideTexture(bytes, 0, record.width, record.height, record.format, palette, ncc);
+}

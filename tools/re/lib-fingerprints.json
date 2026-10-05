@@ -1,0 +1,396 @@
+{
+  "schema": "libid-fingerprints/1",
+  "comment": "Marks of known libraries inside a statically linked image. strings — substrings of the image's defined strings; nameRules — patterns over function names (FID/symbols); consts — little-endian byte windows in .text/.rdata. Every mark carries a weight: strong proves the library on its own, weak only counts together with the surrounding region.",
+  "libs": {
+    "msvc-crt": {
+      "title": "MSVC C/C++ runtime (statically linked)",
+      "strings": [
+        {
+          "s": "Microsoft Visual C++ Runtime Library",
+          "w": "strong"
+        },
+        {
+          "s": "R6002\r\n- floating point",
+          "w": "strong"
+        },
+        {
+          "s": "runtime error TLOSS",
+          "w": "strong"
+        },
+        {
+          "s": "- CRT not initialized",
+          "w": "strong"
+        },
+        {
+          "s": "_matherr",
+          "w": "strong"
+        },
+        {
+          "s": "CorExitProcess",
+          "w": "strong"
+        },
+        {
+          "s": "Runtime Error!\n\nProgram: ",
+          "w": "strong"
+        },
+        {
+          "s": "MSVCRT.DLL",
+          "w": "weak"
+        },
+        {
+          "s": "GetProcessWindowStation",
+          "w": "weak"
+        }
+      ],
+      "nameRules": [
+        "^__?(ftol|ftol2|CIpow|CIexp|CIlog|CIsqrt|CIsin|CIcos|CItan|CIatan|CIfmod)$",
+        "^_(mem(cpy|set|move|cmp|chr)|str(len|cpy|cat|cmp|ncmp|str|chr|rchr|tok)|w?cs[a-z]+|sprintf|_?snprintf|vsprintf|printf|fprintf|sscanf|atoi|atof|strtol|strtod|qsort|bsearch|malloc|calloc|realloc|free|_?msize|new|delete|fopen|fclose|fread|fwrite|fseek|ftell|time|clock|rand|srand|abort|exit|_?exit|setlocale|localeconv)$",
+        "^__(cr|C|s|a|f|i|m|initterm|except_handler|security|report_gsfailure|alloca_probe|chkstk)[A-Za-z0-9_]*$",
+        "^_?(pow|exp|log|log10|sqrt|sin|cos|tan|asin|acos|atan|atan2|fmod|ceil|floor|frexp|ldexp|modf)$"
+      ],
+      "consts": [
+        {
+          "bytes": "9a0999999999b93f",
+          "note": "0.1 as double — common in CRT printing",
+          "w": "weak"
+        }
+      ]
+    },
+    "mfc": {
+      "title": "MFC / ATL",
+      "strings": [
+        {
+          "s": "AfxFrameOrView",
+          "w": "strong"
+        },
+        {
+          "s": "Afx:",
+          "w": "strong"
+        },
+        {
+          "s": "MFC",
+          "w": "weak"
+        },
+        {
+          "s": "COleDataObject",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^\\?\\?[0-9A-Z]?C(Ole|Doc|Wnd|Win|Dialog|Frame|String|Archive|Object|Cmd|Global)[A-Za-z_]*@@",
+        "^\\?\\?[0-9A-Z]?_AFX_"
+      ],
+      "consts": []
+    },
+    "d3dx9": {
+      "title": "D3DX9 (statically linked D3DX runtime / effect compiler)",
+      "strings": [
+        {
+          "s": "D3DX Effect Compiler",
+          "w": "strong"
+        },
+        {
+          "s": "D3DX Shader Compiler",
+          "w": "strong"
+        },
+        {
+          "s": "D3DXCompileShader",
+          "w": "strong"
+        },
+        {
+          "s": "ID3DXEffect",
+          "w": "strong"
+        },
+        {
+          "s": "d3dx9",
+          "w": "strong"
+        },
+        {
+          "s": "D3DXMatrix",
+          "w": "strong"
+        },
+        {
+          "s": "vs_1_1",
+          "w": "weak"
+        },
+        {
+          "s": "ps_2_0",
+          "w": "weak"
+        },
+        {
+          "s": "technique",
+          "w": "weak"
+        },
+        {
+          "s": "PixelShader",
+          "w": "weak"
+        },
+        {
+          "s": "VertexShader",
+          "w": "weak"
+        }
+      ],
+      "nameRules": [
+        "^D3DX[A-Z]"
+      ],
+      "consts": []
+    },
+    "bink": {
+      "title": "Bink Video (RAD Game Tools)",
+      "strings": [
+        {
+          "s": "Bink",
+          "w": "strong"
+        },
+        {
+          "s": "RAD Game Tools",
+          "w": "strong"
+        },
+        {
+          "s": "binkw32",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^_?Bink[A-Z]"
+      ],
+      "consts": []
+    },
+    "miles": {
+      "title": "Miles Sound System (RAD)",
+      "strings": [
+        {
+          "s": "Miles Sound System",
+          "w": "strong"
+        },
+        {
+          "s": "MSS32",
+          "w": "strong"
+        },
+        {
+          "s": "mss32.dll",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^_?AIL_"
+      ],
+      "consts": []
+    },
+    "zlib": {
+      "title": "zlib",
+      "strings": [
+        {
+          "s": "inflate 1.",
+          "w": "strong"
+        },
+        {
+          "s": "deflate 1.",
+          "w": "strong"
+        },
+        {
+          "s": "incorrect header check",
+          "w": "strong"
+        },
+        {
+          "s": "invalid distance too far back",
+          "w": "strong"
+        },
+        {
+          "s": "need dictionary",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^_?(inflate|deflate|adler32|crc32|zlib|gz)[A-Za-z_]*$"
+      ],
+      "consts": [
+        {
+          "bytes": "2082b12c",
+          "note": "crc32 poly 0x2c82b120, head of the reversed table",
+          "w": "weak"
+        }
+      ]
+    },
+    "libpng": {
+      "title": "libpng",
+      "strings": [
+        {
+          "s": "libpng",
+          "w": "strong"
+        },
+        {
+          "s": "Application built with libpng",
+          "w": "strong"
+        },
+        {
+          "s": "IHDR",
+          "w": "weak"
+        }
+      ],
+      "nameRules": [
+        "^_?png_"
+      ],
+      "consts": []
+    },
+    "libjpeg": {
+      "title": "libjpeg (IJG)",
+      "strings": [
+        {
+          "s": "Independent JPEG Group",
+          "w": "strong"
+        },
+        {
+          "s": "JFIF",
+          "w": "weak"
+        }
+      ],
+      "nameRules": [
+        "^_?jpeg_",
+        "^_?jinit_"
+      ],
+      "consts": []
+    },
+    "vorbis": {
+      "title": "Ogg Vorbis",
+      "strings": [
+        {
+          "s": "Xiph.Org",
+          "w": "strong"
+        },
+        {
+          "s": "vorbis",
+          "w": "strong"
+        },
+        {
+          "s": "OggS",
+          "w": "weak"
+        }
+      ],
+      "nameRules": [
+        "^_?(ogg|vorbis)_"
+      ],
+      "consts": []
+    },
+    "fmod": {
+      "title": "FMOD",
+      "strings": [
+        {
+          "s": "FMOD",
+          "w": "strong"
+        },
+        {
+          "s": "fmod.dll",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^_?FSOUND_",
+        "^_?FMUSIC_"
+      ],
+      "consts": []
+    },
+    "lua": {
+      "title": "Lua",
+      "strings": [
+        {
+          "s": "Lua 5.",
+          "w": "strong"
+        },
+        {
+          "s": "attempt to index",
+          "w": "strong"
+        },
+        {
+          "s": "$Lua",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^_?lua[LB]?_"
+      ],
+      "consts": []
+    },
+    "stlport": {
+      "title": "STLport",
+      "strings": [
+        {
+          "s": "STLport",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "@stlp_std@@"
+      ],
+      "consts": []
+    },
+    "granny": {
+      "title": "Granny 3D (RAD)",
+      "strings": [
+        {
+          "s": "granny",
+          "w": "strong"
+        },
+        {
+          "s": "Granny",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^_?Granny"
+      ],
+      "consts": []
+    },
+    "havok": {
+      "title": "Havok",
+      "strings": [
+        {
+          "s": "Havok",
+          "w": "strong"
+        },
+        {
+          "s": "hkBase",
+          "w": "strong"
+        }
+      ],
+      "nameRules": [
+        "^\\?\\?[0-9A-Z]?hk"
+      ],
+      "consts": []
+    },
+    "directx-runtime": {
+      "title": "DirectX runtime called through imports (not code inside the image)",
+      "strings": [
+        {
+          "s": "Direct3DCreate9",
+          "w": "weak"
+        },
+        {
+          "s": "d3d9.dll",
+          "w": "weak"
+        }
+      ],
+      "nameRules": [
+        "^Direct3DCreate",
+        "^DirectInput",
+        "^DirectSound"
+      ],
+      "consts": []
+    }
+  },
+  "importLibs": {
+    "d3d9.dll": "directx-runtime",
+    "d3d8.dll": "directx-runtime",
+    "ddraw.dll": "directx-runtime",
+    "d3dx9_24.dll": "d3dx9",
+    "d3dx9_25.dll": "d3dx9",
+    "d3dx9_26.dll": "d3dx9",
+    "d3dx9_27.dll": "d3dx9",
+    "binkw32.dll": "bink",
+    "mss32.dll": "miles",
+    "msvcrt.dll": "msvc-crt",
+    "msvcr70.dll": "msvc-crt",
+    "msvcr71.dll": "msvc-crt",
+    "msvcp71.dll": "msvc-crt"
+  }
+}

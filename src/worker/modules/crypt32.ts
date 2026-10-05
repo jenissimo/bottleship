@@ -2,6 +2,7 @@ import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
+import { Mem } from "../core/memory/mem-accessor";
 
 export class Crypt32 implements IModule {
     name = "crypt32";
@@ -16,7 +17,7 @@ export class Crypt32 implements IModule {
         // PCCERT_CONTEXT CertFindCertificateInStore(HCERTSTORE hCertStore, DWORD dwCertEncodingType,
         //   DWORD dwFindFlags, DWORD dwFindType, const void *pvFindPara, PCCERT_CONTEXT pPrevCertContext)
         this.exports["CertFindCertificateInStore"] = (ctx, mem, args) => {
-            return { value: 0, stackCleanup: 20 }; // NULL — not found
+            return { value: 0, stackCleanup: 24 }; // NULL — not found
         };
 
         // BOOL CryptMsgGetParam(HCRYPTMSG hCryptMsg, DWORD dwParamType, DWORD dwIndex,
@@ -45,18 +46,20 @@ export class Crypt32 implements IModule {
 
         // DWORD CertGetNameStringA(PCCERT_CONTEXT pCertContext, DWORD dwType, DWORD dwFlags,
         //   void *pvTypePara, LPSTR pszNameString, DWORD cchNameString)
-        const certGetNameString = (ctx: any, mem: Uint8Array, args: number[]) => {
-            const pszNameString = args[3];
-            const cchNameString = args[4];
-            // Write empty string if buffer provided
+        const certGetNameString = (wide: boolean) => (ctx: any, mem: Uint8Array, args: number[]) => {
+            const pszNameString = args[4] >>> 0;
+            const cchNameString = args[5] >>> 0;
+            // Empty string. A wide terminator is TWO bytes — one leaves the caller reading
+            // whatever followed as the second half of a character.
             if (pszNameString && cchNameString > 0) {
-                mem[pszNameString] = 0;
+                Mem.writeUint8(pszNameString, 0);
+                if (wide) Mem.writeUint8(pszNameString + 1, 0);
             }
-            return { value: 1, stackCleanup: 20 }; // 1 char written (null terminator)
+            return { value: 1, stackCleanup: 24 }; // 1 char written (null terminator)
         };
 
-        this.exports["CertGetNameStringA"] = certGetNameString;
-        this.exports["CertGetNameStringW"] = certGetNameString;
-        this.exports["CertGetNameString"] = certGetNameString;
+        this.exports["CertGetNameStringA"] = certGetNameString(false);
+        this.exports["CertGetNameStringW"] = certGetNameString(true);
+        this.exports["CertGetNameString"] = certGetNameString(false);
     }
 }

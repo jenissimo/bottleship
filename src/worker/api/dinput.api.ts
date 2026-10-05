@@ -23,6 +23,7 @@ const makeFunc = (
     argCount: number,
     overrides: Partial<FunctionDescriptor> = {}
 ): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -53,12 +54,32 @@ export const IDirectInputA: InterfaceDescriptor = {
     inherits: "IUnknown",
     iid: "89521360-AA8A-11CF-BFC7-444553540000",
     methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        ...IUnknown.methods,
         makeMethod("CreateDevice", 4),
         makeMethod("EnumDevices", 5),
         makeMethod("GetDeviceStatus", 2),
         makeMethod("RunControlPanel", 3),
         makeMethod("Initialize", 3),
+    ],
+};
+
+// IDirectInput7A — what a DX7 title asks DirectInputCreateEx for. Extends IDirectInputA
+// with FindDevice (IDirectInput2, index 8) and CreateDeviceEx (IDirectInput7, index 9).
+// Handing back the shorter IDirectInputA vtable for this IID is the same defect the
+// IDirectInput8A comment below describes, one interface generation earlier.
+export const IDirectInput7A: InterfaceDescriptor = {
+    name: "IDirectInput7A",
+    inherits: "IUnknown",
+    iid: "9a4cb684-236d-11d3-8e9d-00c04f6844ae",
+    methods: [
+        ...IUnknown.methods,
+        makeMethod("CreateDevice", 4),
+        makeMethod("EnumDevices", 5),
+        makeMethod("GetDeviceStatus", 2),
+        makeMethod("RunControlPanel", 3),
+        makeMethod("Initialize", 3),
+        makeMethod("FindDevice", 4),
+        makeMethod("CreateDeviceEx", 5),
     ],
 };
 
@@ -72,7 +93,7 @@ export const IDirectInput8A: InterfaceDescriptor = {
     inherits: "IUnknown",
     iid: "bf798030-483a-4da2-aa99-5d64ed369700",
     methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        ...IUnknown.methods,
         makeMethod("CreateDevice", 4),
         makeMethod("EnumDevices", 5),
         makeMethod("GetDeviceStatus", 2),
@@ -99,7 +120,7 @@ export const IDirectInputDeviceA: InterfaceDescriptor = {
     inherits: "IUnknown",
     iid: "5944e680-c92e-11cf-bfc7-444553540000",
     methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
+        ...IUnknown.methods,
         makeMethod("GetCapabilities", 2),
         makeMethod("EnumObjects", 4),
         makeMethod("GetProperty", 3),
@@ -148,7 +169,7 @@ export const IDirectInputDevice2A: InterfaceDescriptor = {
 // gap). NFSU's keyboard setup is exactly Build×N + SetActionMap on this interface.
 export const IDirectInputDevice8A: InterfaceDescriptor = {
     name: "IDirectInputDevice8A",
-    inherits: "IDirectInputDevice2A",
+    inherits: "IDirectInputDevice7A",
     iid: "54d41080-dc15-4833-a41b-748f73a38179",
     methods: [
         ...IDirectInputDevice2A.methods.map(m => ({ ...m, name: m.name })),
@@ -161,9 +182,11 @@ export const IDirectInputDevice8A: InterfaceDescriptor = {
 };
 
 // IDirectInputDevice8W — returned by IDirectInput8W::CreateDevice / EnumDevicesBySemantics.
+// Vtable layout is identical to the A form; the ANSI/UNICODE families are separate inheritance
+// chains (…DeviceW → …Device2W → …Device7W → …Device8W), so the parent must stay W-side.
 export const IDirectInputDevice8W: InterfaceDescriptor = {
     name: "IDirectInputDevice8W",
-    inherits: "IDirectInputDevice2A",
+    inherits: "IDirectInputDevice7W",
     iid: "54d41081-dc15-4833-a41b-748f73a38179",
     methods: IDirectInputDevice8A.methods.map(m => ({ ...m, name: m.name })),
 };
@@ -211,6 +234,7 @@ export const dinputModule: ModuleDescriptor = {
     ],
     interfaces: [
         IDirectInputA,
+        IDirectInput7A,
         IDirectInput8A,
         IDirectInput8W,
         IDirectInputDeviceA,

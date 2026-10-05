@@ -1,7 +1,9 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
+import { assignStubsOnce } from "../../core/thunking/stub-merge";
 import { Marshaler } from "../../core/memory/marshaler";
 import { ComObjectFactory } from "../../core/com/base-com-object";
+import { allocateComObject, checkComGuard, COM_OBJECT_SIZE } from "../../core/com/com-memory";
 import { System } from "../../core/system";
 import { DDrawContext } from "./context";
 import { memoryWatch } from "../../core/memory/memory-watch";
@@ -14,15 +16,21 @@ import {
 import { EmulatorConfig } from "../../core/emulator-config-manager";
 import { framePacer } from "../../core/frame-pacer";
 import { initReturnPtr } from "../../backends/webgpu/shared/dx-com-helpers";
+import { getSurfaceFormatLayout } from "../../backends/webgpu/shared/texture-formats";
 import {
-    allocateComObject,
-    checkComGuard,
-    COM_OBJECT_SIZE,
+    DEFAULT_VENDOR_ID,
+    DEFAULT_DEVICE_ID,
+    DEFAULT_DRIVER_VERSION,
+    DEFAULT_DEVICE_DESC,
+    DEFAULT_DRIVER_DLL,
+} from "../../backends/webgpu/shared/dx-adapter-identifier";
+import {
     DD_OK,
     DDBD_16,
     DDBD_32,
     DDCAPS_OFFSETS,
     DDCAPS_SIZE_V7,
+    DDERR_SURFACELOST,
     DDSCAPS_COMBINED_3D,
     CKCAPS_COMBINED,
     DDFXCAPS_COMBINED,
@@ -31,9 +39,6 @@ import {
     DDDEVICEIDENTIFIER2_SIZE,
     DDDEVICEIDENTIFIER2_OFFSETS,
     DDDEVICEIDENTIFIER2_STRING_SIZE,
-    DEFAULT_VENDOR_ID_AMD,
-    DEFAULT_DEVICE_ID_FAKE,
-    DEFAULT_DRIVER_VERSION,
     DDSD_CAPS,
     DDSD_LPSURFACE,
     DDSD_PITCH,
@@ -59,12 +64,7 @@ import {
     E_POINTER,
     HIGH_MEMORY_COM_AREA,
     DDPF_ALPHAPIXELS,
-    IID_IDirect3D,
-    IID_IDirect3D2,
-    IID_IDirect3D3,
-    IID_IDirect3D7,
     IID_IDirectDraw,
-    IID_IDirectDraw2,
     IID_IDirectDraw4,
     IID_IDirectDraw7,
     IID_IDirectDrawClipper,
@@ -87,12 +87,22 @@ import {
     DDSCL_NORMAL,
     DDSCL_EXCLUSIVE,
     DDSCL_FULLSCREEN,
+    DDSURFACEDESC2_OFFSETS,
+    DDPIXELFORMAT_OFFSETS,
+    DDSCAPS_OFFSCREENPLAIN,
+    DDSCAPS_LOCALVIDMEM,
+    DDSCAPS_FRONTBUFFER,
+    DDERR_NOCOLORKEYHW,
 } from "./constants";
-import { bytesToGuid } from "./helpers";
+import { bytesToGuid, surfaceAt } from "./helpers";
+import { resolveDDrawTearOff } from "./com-tearoff";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { computePitch, normalizeSurfaceDesc, readSurfaceDesc, readSurfaceDescV1, writeDisplayModeDesc, writeDisplayModeDescV1, writeSurfaceDesc, writeSurfaceDescV1 } from "./structs";
+import { rasterStatusAt } from "./raster-status";
 import { DirectDrawSurfaceObject, DirectDrawSurfaceState, DirectDrawPaletteObject } from "./com-objects";
 import { createGPUTexture, convertRGBAToSurface } from "./gpu-texture-utils";
+import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
+import { restoreAllLostSurfaces } from "./surface-device-loss";
 import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext } from "./surface-sync";
 import { createDirectDrawStubsExports } from "./directdraw-stubs";
 import { createDirectDrawPaletteClipperExports } from "./directdraw-palette-clipper";
@@ -100,41 +110,39 @@ import { registerDirectDraw2Exports } from "./directdraw-v2";
 
 import { windows as sharedWindows } from "../user32/shared-state";
 import type { WindowInfo } from "../user32/shared-state";
-import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog";
+import { resizeFullscreenWindowToMode } from "../../runtime/windowing/fullscreen-window";
+import { repaintDialogOverlayIfVisible, requestGuestDialogPaint } from "../user32/dialog-paint";
 
 type DDEnumCallback = (lpGUID: number, lpDriverDescription: number, lpDriverName: number, lpContext: number) => number;
 
+/**
+ * One log line per distinct DDPIXELFORMAT shape a title ever ASKS CreateSurface for, read
+ * straight out of the guest descriptor. Deliberately upstream of readPixelFormat: a probe
+ * placed after normalization can only ever report the format we decided on, so it cannot
+ * distinguish "the title asked for RGB565" from "the title asked for DXT1 and we rewrote it".
+ * dwSize is printed because an engine legitimately leaves it zero.
+ */
+const seenPixelFormatRequests = new Set<number>();
+function notePixelFormatRequest(view: DataView, pfAddr: number): void {
+    const size = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, true);
+    const flags = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags, true);
+    const fourCC = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, true);
+    const bpp = view.getUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, true);
+    const key = ((flags ^ fourCC) >>> 0) * 65536 + ((bpp & 0xff) << 8) + (size & 0xff);
+    if (seenPixelFormatRequests.has(key)) return;
+    seenPixelFormatRequests.add(key);
+    const tag = fourCC
+        ? ` fourCC='${String.fromCharCode(fourCC & 0xff, (fourCC >>> 8) & 0xff, (fourCC >>> 16) & 0xff, (fourCC >>> 24) & 0xff)}'`
+        : "";
+    Logger.log(LogCategory.DDRAW,
+        `CreateSurface REQUESTED ddpf: dwSize=${size} dwFlags=0x${flags.toString(16)} ` +
+        `dwRGBBitCount=${bpp}${tag}`);
+}
+
 function resizeFullscreenWindow(system: System, width: number, height: number): void {
-    const ddraw = system.ddrawContext;
-    if (!ddraw) return;
-
-    const hwnd = ddraw.cooperative.hwnd;
+    const hwnd = system.ddrawContext?.cooperative.hwnd;
     if (!hwnd) return;
-
-    // Update WindowManager's WindowObject
-    const wm = system.windowManager;
-    const winObj = wm.getWindow(hwnd);
-    if (winObj) {
-        winObj.rect.w = width;
-        winObj.rect.h = height;
-        winObj.rect.x = 0;
-        winObj.rect.y = 0;
-        Logger.log(LogCategory.DDRAW,
-            `resizeFullscreenWindow: hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
-    }
-
-    // Update shared-state WindowInfo (used by GetClientRect, etc.)
-    const sharedWin = sharedWindows.get(hwnd);
-    if (sharedWin) {
-        sharedWin.width = width;
-        sharedWin.height = height;
-        sharedWin.x = 0;
-        sharedWin.y = 0;
-    }
-
-    // Post WM_SIZE so the game can update its viewport/projection (mirrors real Windows behavior)
-    system.windowManager.postMessage(hwnd, 0x0005 /* WM_SIZE */, 0 /* SIZE_RESTORED */,
-        ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) >>> 0);
+    resizeFullscreenWindowToMode(hwnd, width, height, "DDraw");
 }
 
 /**
@@ -173,7 +181,10 @@ function normalizeExclusiveCoopWindow(system: System, ddrawCtx: DDrawContext, wi
 
 /** Apply host resize + restore GDI launcher chrome after SetDisplayMode. */
 function applyDisplayModeChange(system: System, ddrawCtx: DDrawContext, width: number, height: number): void {
-    system.requestHostResize(width, height);
+    // SetDisplayMode IS a mode-set — this is the size SM_CXSCREEN must report from now on.
+    system.requestHostResize(width, height, {
+        modeSet: true, bpp: ddrawCtx.display.bpp, refreshRate: ddrawCtx.display.refresh,
+    });
     // In exclusive/fullscreen, normalize the coop window to borderless-fullscreen at the
     // new mode and bring it to top; otherwise just track the size (resizeFullscreenWindow).
     if (ddrawCtx.cooperative.exclusive) {
@@ -254,7 +265,10 @@ export function restoreDisplayModeToDesktop(system: System, ddrawCtx: DDrawConte
     ddrawCtx.display.bpp = ddrawCtx.desktopMode.bpp;
     ddrawCtx.display.refresh = ddrawCtx.desktopMode.refresh;
 
-    system.requestHostResize(ddrawCtx.display.width, ddrawCtx.display.height);
+    // RestoreDisplayMode returns the desktop mode — also a mode-set, back to the original.
+    system.requestHostResize(ddrawCtx.display.width, ddrawCtx.display.height, {
+        modeSet: true, bpp: ddrawCtx.desktopMode.bpp, refreshRate: ddrawCtx.desktopMode.refresh,
+    });
 
     const changed = ddrawCtx.display.width !== prevW
         || ddrawCtx.display.height !== prevH
@@ -284,68 +298,13 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         const iidStr = bytesToGuid(mem.slice(riidPtr, riidPtr + 16));
         const iidNorm = iidStr.replace(/[{}]/g, "").toLowerCase();
 
-        // Mapping DDraw versions (tear-off)
-        // Each version MUST have its own vtable — method counts differ!
-        // IDirectDraw=23 methods, IDirectDraw2=24, IDirectDraw4=25, IDirectDraw7=27
-        // Using wrong vtable causes OOB reads when game calls version-specific methods
-        const interfaceMap: Record<string, string> = {
-            [IID_IDirectDraw2.toLowerCase()]: "IDirectDraw2",
-            [IID_IDirectDraw4.toLowerCase()]: "IDirectDraw4",
-            [IID_IDirectDraw7.toLowerCase()]: "IDirectDraw7",
-        };
-
-        if (interfaceMap[iidNorm]) {
-            const vtable = getVTable(interfaceMap[iidNorm]);
-            if (!vtable) return E_NOINTERFACE;
-            const addr = allocateComObject(context.process.memory, mem, vtable);
-            new DataView(mem.buffer, mem.byteOffset).setUint32(ppvObject, addr, true);
-            context.resourceProvider.mapAddressToHandle(addr, obj.handle);
-            obj.addRef();
-            return DD_OK;
-        }
-
-        // Check D3D Interfaces (Common logic via helper)
-        const d3dResult = queryD3DInterface(iidNorm, ppvObject, mem);
-        if (d3dResult !== null) return d3dResult;
+        // Every DirectDraw generation and the Direct3D interface of that generation live on
+        // this one object; each needs its own vtable (method counts differ: IDirectDraw=23,
+        // IDirectDraw2=24, IDirectDraw4=25, IDirectDraw7=27) but the same identity.
+        const tearOff = resolveDDrawTearOff(context, obj, iidNorm, ppvObject, mem);
+        if (tearOff !== null) return tearOff;
 
         return obj.queryInterface(iidStr, ppvObject, mem);
-    };
-
-    // Helper function to handle common D3D interface queries (DRY principle)
-    // Returns DD_OK if handled, null if not a D3D interface
-    const queryD3DInterface = (
-        iidNormalized: string,
-        ppvObject: number,
-        mem: Uint8Array
-    ): number | null => {
-        const d3dInterfaces: Record<string, string> = {
-            [IID_IDirect3D.toLowerCase()]: "IDirect3D",
-            [IID_IDirect3D2.toLowerCase()]: "IDirect3D2",
-            [IID_IDirect3D3.toLowerCase()]: "IDirect3D3",
-            [IID_IDirect3D7.toLowerCase()]: "IDirect3D7",
-        };
-
-        if (d3dInterfaces[iidNormalized]) {
-            const name = d3dInterfaces[iidNormalized];
-            const vtableAddr = (context.vtables as any)[name]?.address;
-
-            if (!vtableAddr) {
-                Logger.warn(LogCategory.SYSTEM, `QueryInterface: requested ${name} but vtable not found`);
-                return E_NOINTERFACE;
-            }
-
-            const d3dObj = ComObjectFactory.create(iidNormalized, vtableAddr);
-            if (!d3dObj) return E_FAIL;
-
-            const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(ppvObject, objAddr, true);
-            context.resourceProvider.mapAddressToHandle(objAddr, d3dObj.handle);
-
-            Logger.log(LogCategory.SYSTEM, `QueryInterface -> Created ${name} at 0x${objAddr.toString(16)} (handle=0x${d3dObj.handle.toString(16)})`);
-            return DD_OK;
-        }
-        return null;
     };
 
     // --- Unified surface creation (v1-v7) ---
@@ -355,11 +314,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         lpDesc: number, 
         lplpSurf: number, 
         vtableName: string,
-        options?: { threadId?: number; enableDiagnostics?: boolean; surfaceIid?: string }
+        options?: { threadId?: number; enableDiagnostics?: boolean; surfaceIid?: string; ownerAddr?: number }
     ): number => {
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const threadId = options?.threadId ?? 0;
         const enableDiagnostics = options?.enableDiagnostics ?? false;
+        // Every surface of the chain remembers the IDirectDraw interface it came from,
+        // so GetDDInterface can hand back that same version.
+        const ownerAddr = options?.ownerAddr ?? 0;
 
         if (!lplpSurf || !isValidAddress(mem, lplpSurf, 4)) return E_POINTER;
         initReturnPtr(lplpSurf);
@@ -375,6 +337,23 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         if (!rawDesc) {
             view.setUint32(lplpSurf, 0, true);
             return E_INVALIDARG;
+        }
+
+        // A range colour key fails the CREATE on hardware — no surface, no handle — and a
+        // caller that asked for one has already been told to take another path. Answering
+        // DD_OK with a collapsed key hands it a surface it never got on the machine it was
+        // written for. (Wine dlls/ddraw/tests/ddraw1.c pins this for DDSCAPS_TEXTURE and
+        // DDSCAPS_OFFSCREENPLAIN alike.)
+        if (rawDesc.colorKeyRangeDeclared) {
+            Logger.log(LogCategory.DDRAW,
+                `CreateSurface: refused — DDSD_CK*BLT declared a range colour key ` +
+                `(DDERR_NOCOLORKEYHW); no DirectDraw hardware supports one`);
+            view.setUint32(lplpSurf, 0, true);
+            return DDERR_NOCOLORKEYHW;
+        }
+
+        if (lpDesc && (rawDesc.flags & DDSD_PIXELFORMAT) !== 0) {
+            notePixelFormatRequest(view, lpDesc + DDSURFACEDESC2_OFFSETS.pixelFormat);
         }
 
         const isTexture = (rawDesc.caps & DDSCAPS_TEXTURE) !== 0;
@@ -409,7 +388,31 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         let vidMemSize = 0;
         if (isVideoMemory && (isTexture || isPrimary || isBackBuffer || isD3dRenderTarget)) {
             const bytesPerPixel = Math.max(1, Math.floor((rawDesc.pixelFormat?.bpp || context.display.bpp) / 8));
-            const vramSurfaceSize = rawDesc.width * rawDesc.height * bytesPerPixel;
+            // A complex mipmap chain occupies the WHOLE chain in video memory, not just
+            // level 0 (base + 1/4 + 1/16 + … ≈ 1.333x the base). Charging only the base let
+            // the texture pool grow ~a third past what the advertised card could hold — and a
+            // guest that sizes its cache by CreateSurface FAILING (UE1's precache does exactly
+            // that) then never backs off where the hardware would. The implicit sublevels are
+            // created below without going through this entry point, so this is the only place
+            // that can charge them; the release path refunds the same recorded total.
+            let vramSurfaceSize = rawDesc.width * rawDesc.height * bytesPerPixel;
+            // Same omission, other implicit chain: a flip chain's back buffers are created
+            // below without passing through here, and on the card they are as real as the
+            // front buffer. (Wine subtracts the framebuffer from BOTH total and free in
+            // ddraw7_GetAvailableVidMem for the same reason.)
+            if ((rawDesc.backBufferCount ?? 0) > 0) {
+                vramSurfaceSize += rawDesc.backBufferCount * rawDesc.width * rawDesc.height * bytesPerPixel;
+            }
+            const chainLevels = rawDesc.mipMapCount ?? 0;
+            if (isTexture && chainLevels > 1
+                && (rawDesc.caps & DDSCAPS_MIPMAP) !== 0 && (rawDesc.caps & DDSCAPS_COMPLEX) !== 0) {
+                let w = rawDesc.width, h = rawDesc.height;
+                for (let level = 1; level < chainLevels; level++) {
+                    w = Math.max(1, w >> 1);
+                    h = Math.max(1, h >> 1);
+                    vramSurfaceSize += w * h * bytesPerPixel;
+                }
+            }
             const vidMemTotal = EmulatorConfig.getInstance().ddrawCaps.dwVidMemTotal;
 
             if (context.usedVidMem + vramSurfaceSize > vidMemTotal) {
@@ -803,39 +806,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             );
         }
 
-        // Write back to DDSURFACEDESC2
-        if (lpDesc) {
-            if (enableDiagnostics && isTexture) {
-                const originalSize = view.getUint32(lpDesc + 0, true);
-                Logger.log(LogCategory.DDRAW, 
-                    `CreateSurface DIAG: Before write - DDSURFACEDESC2 at 0x${lpDesc.toString(16)} ` +
-                    `originalSize=${originalSize} (needs >= 40 for lpSurface)`
-                );
-            }
-
-            const outDesc: any = {
-                ...normalizedDesc,
-                pitch: surfaceState.pitch,
-                caps: surfaceState.caps, // Use surfaceState.caps — includes FLIP|COMPLEX|VIDEOMEMORY additions
-            };
-
-            // Real DirectDraw behavior:
-            // - SYSMEM surfaces: lpSurface IS returned in CreateSurface (app-managed memory)
-            // - VIDMEM/primary/backbuffer: lpSurface is NOT returned — game must call Lock()
-            // Some engines check for DDSD_LPSURFACE and may reject surfaces that have it set
-            if (isSystemMemory) {
-                outDesc.surfacePtr = surfacePtr;
-                outDesc.flags = (outDesc.flags || 0) | DDSD_LPSURFACE | DDSD_PITCH | DDSD_PIXELFORMAT;
-                if (normalizedDesc.caps) {
-                    outDesc.flags |= DDSD_CAPS;
-                }
-            } else {
-                // VIDMEM surfaces: do NOT expose lpSurface in CreateSurface response
-                outDesc.surfacePtr = 0;
-            }
-
-            writeSurfaceDesc(mem, lpDesc, outDesc);
-        }
+        // lpDDSurfaceDesc is [in]: CreateSurface never writes it back. Apps reuse one desc for
+        // several creates, so an injected DDSD_LPSURFACE hands the next surface this one's pixels.
 
         // Use correct IID for surface version (Surface4 vs Surface7)
         // This prevents IID mismatch that can cause QueryInterface to fail or return wrong behavior
@@ -845,6 +817,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             view.setUint32(lplpSurf, 0, true);
             return E_FAIL;
         }
+        obj.setDDrawOwnerAddr(ownerAddr);
 
         const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
         view.setUint32(lplpSurf, objAddr, true);
@@ -882,8 +855,17 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             for (let level = 1; level < requestedMipLevels; level++) {
                 mipWidth = Math.max(1, mipWidth >> 1);
                 mipHeight = Math.max(1, mipHeight >> 1);
-                const mipPitch = Math.max(mipWidth * bytesPerPixel, computePitch(mipWidth, surfaceState.format.bpp));
-                const mipSize = Math.max(MIN_SURFACE_SIZE, mipPitch * mipHeight);
+                // A sublevel inherits the ROOT's pixel format, so its pitch has to come from
+                // that format's own layout: computePitch is a bits-per-pixel formula and a
+                // DDPF_FOURCC format has no bits per pixel, which would silently hand a
+                // block-compressed level a linear stride.
+                const mipLayout = getSurfaceFormatLayout(surfaceState.format, mipWidth, mipHeight);
+                const mipPitch = mipLayout.compressed
+                    ? mipLayout.pitch
+                    : Math.max(mipWidth * bytesPerPixel, computePitch(mipWidth, surfaceState.format.bpp));
+                const mipSize = Math.max(
+                    MIN_SURFACE_SIZE,
+                    mipLayout.compressed ? mipLayout.bytes : mipPitch * mipHeight);
                 let mipSurfacePtr = 0;
                 try {
                     mipSurfacePtr = context.process.allocateSurface(mipSize);
@@ -912,6 +894,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     surfacePtr: mipSurfacePtr,
                     surfacePtrAllocated: true,
                     attachedSurfaceAddr: 0,
+                    // DirectDraw made this level, not the app: it is not reference-counted as
+                    // an attachment and it cannot be detached.
+                    implicitChainMember: true,
+                    attachRefOwner: 0,
+                    // Own attachment/z-owner lists — the spread copies the ROOT's array by
+                    // reference, and a shared list would detach the root's members with this one.
+                    attachedSurfaceAddrs: undefined,
+                    zOwnerSurfaces: undefined,
                     mode: surfaceState.mode,
                     version: 0,
                     // Do not mark gpuDirty until guest writes — pre-Load bind must not upload zeros.
@@ -951,13 +941,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     Logger.warn(LogCategory.DDRAW, `CreateSurface: Failed to create COM object for mip level ${level}, stopping mip chain`);
                     break;
                 }
+                mipObj.setDDrawOwnerAddr(ownerAddr);
                 surfaceState.mipSublevels.push(mipState);
 
                 const mipAddr = allocateComObject(context.process.memory, mem, vtableAddr);
                 context.resourceProvider.mapAddressToHandle(mipAddr, mipObj.handle);
                 context.resourceProvider.registerSurfacePtr(mipObj.handle, mipSurfacePtr);
 
-                const prevObj = context.resourceProvider.getComObjectByAddress(prevAddr) as DirectDrawSurfaceObject | null;
+                const prevObj = surfaceAt(context.resourceProvider, prevAddr);
                 if (!prevObj) {
                     Logger.warn(LogCategory.DDRAW, `CreateSurface: Missing previous mip object at 0x${prevAddr.toString(16)}, stopping mip chain`);
                     break;
@@ -974,8 +965,17 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             context.surfaces.backBuffer = objAddr;
         }
 
-        // Create flipping chain for Primary + BackBuffers
-        if ((surfaceState.caps & DDSCAPS_PRIMARYSURFACE) && normalizedDesc.backBufferCount > 0) {
+        // dwBackBufferCount builds a flip chain, and DirectDraw does not reserve that for the
+        // primary: an app may create an OFFSCREENPLAIN|3DDEVICE|FLIP|COMPLEX chain and flip it
+        // off-screen (Wine ddraw7.c:20301 test_flip_3d does exactly that). The surface the app
+        // asked for becomes the FRONT buffer of the chain either way.
+        const buildsFlipChain = normalizedDesc.backBufferCount > 0
+            && ((surfaceState.caps & DDSCAPS_PRIMARYSURFACE) !== 0
+                || (surfaceState.caps & (DDSCAPS_FLIP | DDSCAPS_COMPLEX)) !== 0);
+        if (buildsFlipChain && (surfaceState.caps & DDSCAPS_PRIMARYSURFACE) === 0) {
+            surfaceState.caps |= DDSCAPS_FLIP | DDSCAPS_FRONTBUFFER;
+        }
+        if (buildsFlipChain) {
             let lastAddr = objAddr;
             let firstBackbufferAddr = 0;
 
@@ -997,10 +997,25 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 const backbufferState: DirectDrawSurfaceState = {
                     ...surfaceState,
                     surfaceType: "render_surface", // Explicit type (spread copies from primary)
-                    caps: DDSCAPS_BACKBUFFER | DDSCAPS_VIDEOMEMORY | (normalizedDesc.backBufferCount > 1 ? DDSCAPS_COMPLEX : 0) | DDSCAPS_FLIP | (surfaceState.caps & DDSCAPS_3DDEVICE),
+                    // A back buffer keeps the chain root's residency and purpose bits (an
+                    // off-screen 3D chain is not video memory just because a primary's is) and
+                    // never inherits the bits that name the root: PRIMARYSURFACE, FRONTBUFFER.
+                    caps: DDSCAPS_BACKBUFFER | DDSCAPS_FLIP
+                        | (normalizedDesc.backBufferCount > 1 ? DDSCAPS_COMPLEX : 0)
+                        | (surfaceState.caps & (DDSCAPS_3DDEVICE | DDSCAPS_OFFSCREENPLAIN
+                            | DDSCAPS_VIDEOMEMORY | DDSCAPS_SYSTEMMEMORY | DDSCAPS_LOCALVIDMEM))
+                        | ((surfaceState.caps & DDSCAPS_PRIMARYSURFACE) ? DDSCAPS_VIDEOMEMORY : 0),
                     surfacePtr: backbufferSurfacePtr,
                     surfacePtrAllocated: true,
                     attachedSurfaceAddr: 0,
+                    // A back buffer DirectDraw created for DDSD_BACKBUFFERCOUNT belongs to the
+                    // chain, not to the app: no attachment reference, and it dies with the root.
+                    implicitChainMember: true,
+                    attachRefOwner: 0,
+                    // Own attachment/z-owner lists — the spread copies the PRIMARY's array by
+                    // reference, and from the second back buffer on that array is non-empty.
+                    attachedSurfaceAddrs: undefined,
+                    zOwnerSurfaces: undefined,
                     // Backbuffer should inherit mode from primary for consistency
                     // If primary is GPU_ONLY, backbuffer should also be GPU_ONLY to avoid CPU↔GPU sync
                     mode: surfaceState.mode,  // Inherit from primary (GPU_ONLY or CPU)
@@ -1054,10 +1069,11 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 ) as DirectDrawSurfaceObject | null;
 
                 if (backbufferObj) {
+                    backbufferObj.setDDrawOwnerAddr(ownerAddr);
                     const backbufferAddr = allocateComObject(context.process.memory, mem, vtableAddr);
                     context.resourceProvider.mapAddressToHandle(backbufferAddr, backbufferObj.handle);
 
-                    const prevObj = context.resourceProvider.getComObjectByAddress(lastAddr) as DirectDrawSurfaceObject | null;
+                    const prevObj = surfaceAt(context.resourceProvider, lastAddr);
                     if (prevObj) {
                         prevObj.setAttachedSurface(backbufferAddr);
                     }
@@ -1268,14 +1284,16 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw_QueryInterface"] = (ctx, mem, args) => commonQueryInterface(args[0], args[1], args[2], mem);
 
+    // Each DirectDraw generation carries its OWN refcount on the shared driver object,
+    // so AddRef/Release must report the count of the interface they were called through.
     exports["IDirectDraw_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw_Compact"] = () => DD_OK;
@@ -1290,9 +1308,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw_CreateSurface"] = (ctx, mem, args) => {
         // v1: CreateSurface(this, lpDDSurfaceDesc, lplpDDSurface, pUnkOuter) - 4 args
-        // Uses DDSURFACEDESC (108 bytes) but internalCreateSurface handles dwSize
-        // Use IDirectDrawSurface7 vtable — same slot layout for first 36 methods,
-        // and IDirectDrawSurface7 has full method implementations
+        // Uses DDSURFACEDESC (108 bytes) but internalCreateSurface handles dwSize.
+        // The surface gets the v1 vtable, which also serves a QI to IDirectDrawSurface2/3.
         const lpDDSurfaceDesc = args[1];
         const lplpDDSurface = args[2];
         const threadId = System.getInstance().scheduler?.getCurrentThreadId?.() ?? 0;
@@ -1305,18 +1322,17 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface", {
             threadId,
             enableDiagnostics: true,
-            surfaceIid: IID_IDirectDrawSurface
+            surfaceIid: IID_IDirectDrawSurface,
+            ownerAddr: args[0]
         });
     };
-
-    exports["IDirectDraw_DuplicateSurface"] = () => DD_OK;
 
     exports["IDirectDraw_EnumDisplayModes"] = (ctx, mem, args) => {
         return enumDisplayModesImpl(ctx, mem, args, true);
     };
 
     exports["IDirectDraw_EnumSurfaces"] = (ctx, mem, args) => {
-        return exports["IDirectDraw7_EnumSurfaces"]?.(ctx, mem, args) ?? DD_OK;
+        return enumSurfacesImpl(ctx, mem, args, true);
     };
 
     exports["IDirectDraw_GetCaps"] = (ctx, mem, args) => {
@@ -1327,10 +1343,11 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return exports["IDirectDraw7_GetDisplayMode"]?.(ctx, mem, args) ?? DD_OK;
     };
 
-    exports["IDirectDraw_GetFourCCCodes"] = () => DD_OK;
-    exports["IDirectDraw_GetMonitorFrequency"] = () => DD_OK;
-    exports["IDirectDraw_GetScanLine"] = () => DD_OK;
-    exports["IDirectDraw_GetVerticalBlankStatus"] = () => DD_OK;
+    // GetFourCCCodes / GetMonitorFrequency / GetScanLine / GetVerticalBlankStatus /
+    // DuplicateSurface are NOT overridden here: v1 takes exactly the v7 parameters, so
+    // the delegation loop below routes them to the single v7 implementation. Overriding
+    // them with `() => DD_OK` left the out-parameters holding stack garbage — a caller
+    // spinning on GetVerticalBlankStatus then never sees the flag change.
     exports["IDirectDraw_Initialize"] = () => DD_OK;
 
     exports["IDirectDraw_RestoreDisplayMode"] = (ctx, mem, args) => {
@@ -1367,12 +1384,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw4_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw4_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw4_SetCooperativeLevel"] = (ctx, mem, args) => {
@@ -1403,7 +1420,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface4", {
             threadId,
             enableDiagnostics: false,
-            surfaceIid: IID_IDirectDrawSurface4
+            surfaceIid: IID_IDirectDrawSurface4,
+            ownerAddr: args[0]
         });
     };
 
@@ -1478,12 +1496,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
     exports["IDirectDraw7_AddRef"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.addRef() : 0;
+        return obj ? obj.addRef(args[0]) : 0;
     };
 
     exports["IDirectDraw7_Release"] = (ctx, mem, args) => {
         const obj = context.resourceProvider.getComObjectByAddress(args[0]);
-        return obj ? obj.release() : 0;
+        return obj ? obj.release(args[0]) : 0;
     };
 
     exports["IDirectDraw7_GetCaps"] = (ctx, mem, args) => {
@@ -1530,9 +1548,16 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             // Z-buffer bit depths
             w32(O.dwZBufferBitDepths, DDBD_16 | DDBD_32);
 
-            // Video memory
+            // Video memory. FREE is the CURRENT remainder, not a constant: real DirectDraw
+            // reports what is left right now, and DX6-era engines budget their texture uploads
+            // from it. Reporting a fixed number means the game never sees VRAM shrink, never
+            // backs off, and keeps creating surfaces until CreateSurface refuses with
+            // DDERR_OUTOFVIDEOMEMORY — which it then does not check, dereferencing the NULL
+            // it was handed. It also made GetCaps and GetAvailableVidMem, which already
+            // computed the remainder, answer the same question differently.
+            const vidMemFree = Math.max(0, defaultCaps.dwVidMemTotal - context.usedVidMem);
             w32(O.dwVidMemTotal, isHEL ? 0 : defaultCaps.dwVidMemTotal);
-            w32(O.dwVidMemFree, isHEL ? 0 : defaultCaps.dwVidMemFree);
+            w32(O.dwVidMemFree, isHEL ? 0 : vidMemFree);
 
             // ddsOldCaps (legacy DDSCAPS at offset 132)
             w32(O.ddsOldCaps, DDSCAPS_COMBINED_3D);
@@ -1616,7 +1641,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return internalCreateSurface(mem, lpDDSurfaceDesc, lplpDDSurface, "IDirectDrawSurface7", {
             threadId,
             enableDiagnostics: false,
-            surfaceIid: IID_IDirectDrawSurface7
+            surfaceIid: IID_IDirectDrawSurface7,
+            ownerAddr: args[0]
         });
     };
 
@@ -1723,13 +1749,33 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         if (!lpCallback) return E_POINTER;
 
         const emulatorConfig = EmulatorConfig.getInstance();
-        // Enumerate 16/32bpp first. Some legacy titles stop enumeration early and
-        // then require RenderBitDepth to match at least one collected mode.
+        // Enumerate every resolution at EVERY bit depth we can serve, not just the one the
+        // manifest names. A manifest's bpp is the DESKTOP depth; real DirectDraw reports one
+        // mode per (w,h,depth) combination the hardware supports, and era titles filter the
+        // enumeration by depth: HP CoS's D3DDrv keeps only dwRGBBitCount==16 when it builds
+        // the in-game resolution list, so a 32-bpp-only manifest left that list EMPTY (and
+        // the game unable to change resolution). applySetDisplayMode honours any depth, so
+        // everything advertised here can actually be set.
+        // 16 before 32: some legacy titles stop enumerating early and then require their
+        // RenderBitDepth to match a mode they collected. 8-bpp stays last, and only when the
+        // manifest asked for it — a palettised mode changes what a surface MEANS.
         const supportedModes = emulatorConfig.supportedResolutions;
-        let modes = [
-            ...supportedModes.filter((m) => m.bpp !== 8),
-            ...supportedModes.filter((m) => m.bpp === 8),
-        ];
+        const seen = new Set<string>();
+        const expanded: typeof supportedModes = [];
+        const push = (w: number, h: number, bpp: number, refreshRate: number): void => {
+            const key = `${w}x${h}x${bpp}`;
+            if (seen.has(key)) return;
+            seen.add(key);
+            expanded.push({ width: w, height: h, bpp, refreshRate });
+        };
+        for (const m of supportedModes) {
+            if (m.bpp === 8) continue;
+            for (const bpp of [16, 32]) push(m.width, m.height, bpp, m.refreshRate);
+        }
+        for (const m of supportedModes) {
+            if (m.bpp === 8) push(m.width, m.height, 8, m.refreshRate);
+        }
+        let modes = expanded;
 
         // Faithful: honor the caller's input descriptor filter. If lpDDSurfaceDesc sets
         // DDSD_WIDTH/DDSD_HEIGHT/DDSD_PIXELFORMAT, only matching modes are enumerated
@@ -1859,7 +1905,9 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
     // ========================================================================
     // IDirectDraw7::EnumSurfaces
     // ========================================================================
-    exports["IDirectDraw7_EnumSurfaces"] = (ctx, mem, args) => {
+    // useV1Desc=true for IDirectDraw/IDirectDraw2 (callback receives DDSURFACEDESC,
+    // 108 bytes), false for IDirectDraw4/IDirectDraw7 (DDSURFACEDESC2, 124 bytes).
+    const enumSurfacesImpl = (ctx: any, mem: Uint8Array, args: number[], useV1Desc: boolean) => {
         const thisPtr = args[0];
         const dwFlags = args[1];
         const lpDDSD2 = args[2];
@@ -1944,14 +1992,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                 if (index >= matchingSurfaces.length) return;
                 const { address: surfAddr, state } = matchingSurfaces[index++];
 
-                // Allocate and fill a DDSURFACEDESC2 for this surface
-                const descAddr = context.process.memory.alloc(DDSURFACEDESC2_SIZE);
+                const descSize = useV1Desc ? DDSURFACEDESC_SIZE : DDSURFACEDESC2_SIZE;
+                const descAddr = context.process.memory.alloc(descSize);
                 allocatedMemory.push(descAddr);
-                mem.fill(0, descAddr, descAddr + DDSURFACEDESC2_SIZE);
-                view.setUint32(descAddr, DDSURFACEDESC2_SIZE, true); // dwSize
+                mem.fill(0, descAddr, descAddr + descSize);
+                view.setUint32(descAddr, descSize, true); // dwSize
 
                 const surfDesc: import("./structs").SurfaceDesc = {
-                    size: DDSURFACEDESC2_SIZE,
+                    size: descSize,
                     flags: DDSD_CAPS | DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT,
                     width: state.width,
                     height: state.height,
@@ -1962,7 +2010,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
                     surfacePtr: state.surfacePtr,
                     pixelFormat: state.format,
                 };
-                writeSurfaceDesc(mem, descAddr, surfDesc);
+                if (useV1Desc) writeSurfaceDescV1(mem, descAddr, surfDesc);
+                else writeSurfaceDesc(mem, descAddr, surfDesc);
 
                 // NOTE: Not calling AddRef here — many games don't
                 // Release the surface in their EnumSurfaces callback, so AddRef would leak refs.
@@ -2049,6 +2098,8 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         };
     };
 
+    exports["IDirectDraw7_EnumSurfaces"] = (ctx, mem, args) => enumSurfacesImpl(ctx, mem, args, false);
+
     exports["IDirectDraw7_GetDisplayMode"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lpDDSurfaceDesc = args[1];
@@ -2079,7 +2130,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             return DDERR_NOTFOUND;
         }
 
-        const primaryObj = context.resourceProvider.getComObjectByAddress(primaryAddr) as DirectDrawSurfaceObject | null;
+        const primaryObj = surfaceAt(context.resourceProvider, primaryAddr);
         if (!primaryObj) {
             Logger.verbose(LogCategory.DDRAW, `FlipToGDISurface: primary missing at 0x${primaryAddr.toString(16)}`);
             return DDERR_NOTFOUND;
@@ -2122,7 +2173,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             return DDERR_NOTFOUND;
         }
 
-        const primaryObj = context.resourceProvider.getComObjectByAddress(primaryAddr) as DirectDrawSurfaceObject | null;
+        const primaryObj = surfaceAt(context.resourceProvider, primaryAddr);
         if (!primaryObj) {
             Logger.verbose(LogCategory.DDRAW, `FlipToGDISurface: primary missing at 0x${primaryAddr.toString(16)}`);
             return DDERR_NOTFOUND;
@@ -2236,8 +2287,32 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return DD_OK;
     };
 
-    // TestCooperativeLevel: apps check before Present/CreateSurface. In emu we always report success.
+    /**
+     * TestCooperativeLevel reports EXCLUSIVE-MODE ownership, not surface loss — that is
+     * DirectDraw's split, and it is why a lost device shows up through IsLost/Restore instead
+     * of here. Nothing else on this machine can take exclusive mode from us, so DD_OK is the
+     * faithful answer even while surfaces are lost.
+     */
     exports["IDirectDraw7_TestCooperativeLevel"] = (ctx, mem, args) => {
+        return DD_OK;
+    };
+
+    /**
+     * RestoreAllSurfaces: restore every lost surface owned by this DirectDraw object. Same
+     * contract as IDirectDrawSurface7::Restore applied wholesale — the surfaces come back
+     * valid with undefined (cleared) contents, and the call fails while there is still no
+     * device to restore onto.
+     */
+    exports["IDirectDraw7_RestoreAllSurfaces"] = (ctx, mem, args) => {
+        if (!gpuDeviceUsable()) {
+            Logger.warn(LogCategory.DDRAW, `RestoreAllSurfaces refused — no GPU device yet (still recovering)`);
+            return DDERR_SURFACELOST;
+        }
+        const restored = restoreAllLostSurfaces();
+        if (restored > 0) {
+            Logger.log(LogCategory.DDRAW,
+                `RestoreAllSurfaces: ${restored} surface(s) revalidated (contents undefined, per DirectDraw)`);
+        }
         return DD_OK;
     };
 
@@ -2284,18 +2359,24 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         // Zero the entire structure first
         mem.fill(0, lpdddi, lpdddi + DDDEVICEIDENTIFIER2_SIZE);
 
-        // Write device info
-        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDriver, "display", DDDEVICEIDENTIFIER2_STRING_SIZE);
-        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDescription, "BottleShip Display Driver", DDDEVICEIDENTIFIER2_STRING_SIZE);
+        // The SAME adapter D3D8/D3D9 report — see dx-adapter-identifier.ts. dwVendorId +
+        // dwDeviceId is what an app matches against its own table of known cards to switch
+        // work-arounds on and off; a pair that never shipped (the old ATI 0x1002 / 0x9999)
+        // matches nothing, and a period-correct card would be worse still — it would ARM
+        // work-arounds written for that silicon's bugs, which this renderer does not have.
+        // An adapter newer than the title is the case with real evidence behind it: it is
+        // exactly what these games get on a modern Windows machine, where they run.
+        // szDriver is the display driver's file name, not a category word.
+        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDriver, DEFAULT_DRIVER_DLL, DDDEVICEIDENTIFIER2_STRING_SIZE);
+        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDescription, DEFAULT_DEVICE_DESC, DDDEVICEIDENTIFIER2_STRING_SIZE);
 
-        // Set some reasonable GUID values
         // liDriverVersion (LARGE_INTEGER = 8 bytes)
         view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
 
         // dwVendorId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID_AMD, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID, true);
         // dwDeviceId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID_FAKE, true);
+        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID, true);
         // dwSubSysId
         view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwSubSysId, 0, true);
         // dwRevision
@@ -2317,14 +2398,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         const lpdwScanLine = args[1];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         if (lpdwScanLine && isValidAddress(mem, lpdwScanLine, 4)) {
-            // Synthetic scanline based on wall-clock position within frame.
-            // Games that poll scanline for timing get a reasonable progression.
-            const height = context.display.height || 480;
-            const frameDurationMs = 16.67; // ~60Hz
-            const now = performance.now();
-            const posInFrame = (now % frameDurationMs) / frameDurationMs;
-            const scanline = Math.floor(posInFrame * height);
-            view.setUint32(lpdwScanLine, scanline, true);
+            const status = rasterStatusAt(
+                performance.now(),
+                context.display.height,
+                context.display.refresh || 60,
+            );
+            view.setUint32(lpdwScanLine, status.scanLine, true);
         }
         const now = performance.now();
         scanlineCount += 1;
@@ -2344,13 +2423,12 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         const lpbIsInVB = args[1];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         if (lpbIsInVB && isValidAddress(mem, lpbIsInVB, 4)) {
-            // Emulate VBlank with alternating status to prevent infinite loops
-            // 60 FPS = 16.67ms per frame, VBlank typically lasts ~2ms
-            const frameTime = 16.67; // 60 FPS = 16.67ms per frame
-            const vblankDuration = 2; // ~2ms VBlank duration
-            const now = performance.now();
-            const inVBlank = (now % frameTime) < vblankDuration;
-            view.setUint32(lpbIsInVB, inVBlank ? 1 : 0, true);
+            const status = rasterStatusAt(
+                performance.now(),
+                context.display.height,
+                context.display.refresh || 60,
+            );
+            view.setUint32(lpbIsInVB, status.inVBlank ? 1 : 0, true);
         }
         const now = performance.now();
         vblankStatusCount += 1;
@@ -2388,7 +2466,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         return DD_OK;
     };
 
-    Object.assign(exports, createDirectDrawStubsExports(context));
+    assignStubsOnce(exports, createDirectDrawStubsExports(context), "ddraw stubs");
     Object.assign(exports, createDirectDrawPaletteClipperExports(context, commonQueryInterface));
 
     // IDirectDraw (v1) stub methods - delegate to v7 where possible
@@ -2417,6 +2495,6 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         }
     }
 
-    registerDirectDraw2Exports(exports, context, { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl });
+    registerDirectDraw2Exports(exports, context, { commonQueryInterface, internalCreateSurface, enumDisplayModesImpl, enumSurfacesImpl });
     return exports;
 };

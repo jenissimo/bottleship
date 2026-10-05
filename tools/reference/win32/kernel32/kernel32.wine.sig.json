@@ -1,0 +1,6000 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.901Z",
+  "module": "kernel32",
+  "functions": [
+    {
+      "name": "_CheckNotSysLevel",
+      "argCount": 1
+    },
+    {
+      "name": "_ConfirmSysLevel",
+      "argCount": 1
+    },
+    {
+      "name": "_ConfirmWin16Lock",
+      "argCount": 0
+    },
+    {
+      "name": "_EnterSysLevel",
+      "argCount": 1
+    },
+    {
+      "name": "_hread",
+      "argCount": 3
+    },
+    {
+      "name": "_hwrite",
+      "argCount": 3
+    },
+    {
+      "name": "_lclose",
+      "argCount": 1
+    },
+    {
+      "name": "_lcreat",
+      "argCount": 2
+    },
+    {
+      "name": "_LeaveSysLevel",
+      "argCount": 1
+    },
+    {
+      "name": "_llseek",
+      "argCount": 3
+    },
+    {
+      "name": "_lopen",
+      "argCount": 2
+    },
+    {
+      "name": "_lread",
+      "argCount": 3
+    },
+    {
+      "name": "_lwrite",
+      "argCount": 3
+    },
+    {
+      "name": "@",
+      "argCount": 1
+    },
+    {
+      "name": "@",
+      "argCount": 1
+    },
+    {
+      "name": "@",
+      "argCount": 3
+    },
+    {
+      "name": "AcquireSRWLockExclusive",
+      "argCount": 1
+    },
+    {
+      "name": "AcquireSRWLockShared",
+      "argCount": 1
+    },
+    {
+      "name": "ActivateActCtx",
+      "argCount": 2
+    },
+    {
+      "name": "AddAtomA",
+      "argCount": 1
+    },
+    {
+      "name": "AddAtomW",
+      "argCount": 1
+    },
+    {
+      "name": "AddConsoleAliasA",
+      "argCount": 3
+    },
+    {
+      "name": "AddConsoleAliasW",
+      "argCount": 3
+    },
+    {
+      "name": "AddDllDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "AddRefActCtx",
+      "argCount": 1
+    },
+    {
+      "name": "AddVectoredContinueHandler",
+      "argCount": 2
+    },
+    {
+      "name": "AddVectoredExceptionHandler",
+      "argCount": 2
+    },
+    {
+      "name": "AllocateUserPhysicalPages",
+      "argCount": 3
+    },
+    {
+      "name": "AllocateUserPhysicalPagesNuma",
+      "argCount": 4
+    },
+    {
+      "name": "AllocConsole",
+      "argCount": 0
+    },
+    {
+      "name": "AllocMappedBuffer",
+      "argCount": 0
+    },
+    {
+      "name": "AllocSLCallback",
+      "argCount": 2
+    },
+    {
+      "name": "ApplicationRecoveryFinished",
+      "argCount": 1
+    },
+    {
+      "name": "ApplicationRecoveryInProgress",
+      "argCount": 1
+    },
+    {
+      "name": "AppPolicyGetMediaFoundationCodecLoading",
+      "argCount": 2
+    },
+    {
+      "name": "AppPolicyGetWindowingModel",
+      "argCount": 2
+    },
+    {
+      "name": "AreFileApisANSI",
+      "argCount": 0
+    },
+    {
+      "name": "AssignProcessToJobObject",
+      "argCount": 2
+    },
+    {
+      "name": "AttachConsole",
+      "argCount": 1
+    },
+    {
+      "name": "BackupRead",
+      "argCount": 7
+    },
+    {
+      "name": "BackupSeek",
+      "argCount": 6
+    },
+    {
+      "name": "BackupWrite",
+      "argCount": 7
+    },
+    {
+      "name": "BaseFlushAppcompatCache",
+      "argCount": 0
+    },
+    {
+      "name": "BaseGetNamedObjectDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "BaseThreadInitThunk",
+      "argCount": 3
+    },
+    {
+      "name": "Beep",
+      "argCount": 2
+    },
+    {
+      "name": "BeginUpdateResourceA",
+      "argCount": 2
+    },
+    {
+      "name": "BeginUpdateResourceW",
+      "argCount": 2
+    },
+    {
+      "name": "BindIoCompletionCallback",
+      "argCount": 3
+    },
+    {
+      "name": "BuildCommDCBA",
+      "argCount": 2
+    },
+    {
+      "name": "BuildCommDCBAndTimeoutsA",
+      "argCount": 3
+    },
+    {
+      "name": "BuildCommDCBAndTimeoutsW",
+      "argCount": 3
+    },
+    {
+      "name": "BuildCommDCBW",
+      "argCount": 2
+    },
+    {
+      "name": "CallbackMayRunLong",
+      "argCount": 1
+    },
+    {
+      "name": "CallNamedPipeA",
+      "argCount": 7
+    },
+    {
+      "name": "CallNamedPipeW",
+      "argCount": 7
+    },
+    {
+      "name": "CancelIo",
+      "argCount": 1
+    },
+    {
+      "name": "CancelIoEx",
+      "argCount": 2
+    },
+    {
+      "name": "CancelSynchronousIo",
+      "argCount": 1
+    },
+    {
+      "name": "CancelThreadpoolIo",
+      "argCount": 1
+    },
+    {
+      "name": "CancelTimerQueueTimer",
+      "argCount": 2
+    },
+    {
+      "name": "CancelWaitableTimer",
+      "argCount": 1
+    },
+    {
+      "name": "ChangeTimerQueueTimer",
+      "argCount": 4
+    },
+    {
+      "name": "CheckNameLegalDOS8Dot3A",
+      "argCount": 5
+    },
+    {
+      "name": "CheckNameLegalDOS8Dot3W",
+      "argCount": 5
+    },
+    {
+      "name": "CheckRemoteDebuggerPresent",
+      "argCount": 2
+    },
+    {
+      "name": "ClearCommBreak",
+      "argCount": 1
+    },
+    {
+      "name": "ClearCommError",
+      "argCount": 3
+    },
+    {
+      "name": "CloseConsoleHandle",
+      "argCount": 1
+    },
+    {
+      "name": "CloseHandle",
+      "argCount": 1
+    },
+    {
+      "name": "CloseProfileUserMapping",
+      "argCount": 0
+    },
+    {
+      "name": "ClosePseudoConsole",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThreadpool",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThreadpoolCleanupGroup",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThreadpoolCleanupGroupMembers",
+      "argCount": 3
+    },
+    {
+      "name": "CloseThreadpoolIo",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThreadpoolTimer",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThreadpoolWait",
+      "argCount": 1
+    },
+    {
+      "name": "CloseThreadpoolWork",
+      "argCount": 1
+    },
+    {
+      "name": "CmdBatNotification",
+      "argCount": 1
+    },
+    {
+      "name": "CommConfigDialogA",
+      "argCount": 3
+    },
+    {
+      "name": "CommConfigDialogW",
+      "argCount": 3
+    },
+    {
+      "name": "Common32ThkLS",
+      "argCount": 0
+    },
+    {
+      "name": "CommonUnimpStub",
+      "argCount": 0
+    },
+    {
+      "name": "CompareFileTime",
+      "argCount": 2
+    },
+    {
+      "name": "CompareStringA",
+      "argCount": 6
+    },
+    {
+      "name": "CompareStringEx",
+      "argCount": 9
+    },
+    {
+      "name": "CompareStringOrdinal",
+      "argCount": 5
+    },
+    {
+      "name": "CompareStringW",
+      "argCount": 6
+    },
+    {
+      "name": "ConnectNamedPipe",
+      "argCount": 2
+    },
+    {
+      "name": "ContinueDebugEvent",
+      "argCount": 3
+    },
+    {
+      "name": "ConvertDefaultLocale",
+      "argCount": 1
+    },
+    {
+      "name": "ConvertFiberToThread",
+      "argCount": 0
+    },
+    {
+      "name": "ConvertThreadToFiber",
+      "argCount": 1
+    },
+    {
+      "name": "ConvertThreadToFiberEx",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertToGlobalHandle",
+      "argCount": 1
+    },
+    {
+      "name": "CopyContext",
+      "argCount": 3
+    },
+    {
+      "name": "CopyFile2",
+      "argCount": 3
+    },
+    {
+      "name": "CopyFileA",
+      "argCount": 3
+    },
+    {
+      "name": "CopyFileExA",
+      "argCount": 6
+    },
+    {
+      "name": "CopyFileExW",
+      "argCount": 6
+    },
+    {
+      "name": "CopyFileW",
+      "argCount": 3
+    },
+    {
+      "name": "CopyLZFile",
+      "argCount": 2
+    },
+    {
+      "name": "CreateActCtxA",
+      "argCount": 1
+    },
+    {
+      "name": "CreateActCtxW",
+      "argCount": 1
+    },
+    {
+      "name": "CreateBoundaryDescriptorA",
+      "argCount": 2
+    },
+    {
+      "name": "CreateBoundaryDescriptorW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateConsoleScreenBuffer",
+      "argCount": 5
+    },
+    {
+      "name": "CreateDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "CreateDirectoryExA",
+      "argCount": 3
+    },
+    {
+      "name": "CreateDirectoryExW",
+      "argCount": 3
+    },
+    {
+      "name": "CreateDirectoryTransactedA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateDirectoryTransactedW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateEventA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateEventExA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateEventExW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateEventW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateFiber",
+      "argCount": 3
+    },
+    {
+      "name": "CreateFiberEx",
+      "argCount": 5
+    },
+    {
+      "name": "CreateFile2",
+      "argCount": 5
+    },
+    {
+      "name": "CreateFileA",
+      "argCount": 7
+    },
+    {
+      "name": "CreateFileMappingA",
+      "argCount": 6
+    },
+    {
+      "name": "CreateFileMappingFromApp",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "CreateFileMappingNumaW",
+      "argCount": 7
+    },
+    {
+      "name": "CreateFileMappingW",
+      "argCount": 6
+    },
+    {
+      "name": "CreateFileTransactedA",
+      "argCount": 10
+    },
+    {
+      "name": "CreateFileTransactedW",
+      "argCount": 10
+    },
+    {
+      "name": "CreateFileW",
+      "argCount": 7
+    },
+    {
+      "name": "CreateHardLinkA",
+      "argCount": 3
+    },
+    {
+      "name": "CreateHardLinkTransactedA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateHardLinkTransactedW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateHardLinkW",
+      "argCount": 3
+    },
+    {
+      "name": "CreateIoCompletionPort",
+      "argCount": 4
+    },
+    {
+      "name": "CreateJobObjectA",
+      "argCount": 2
+    },
+    {
+      "name": "CreateJobObjectW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateMailslotA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMailslotW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMemoryResourceNotification",
+      "argCount": 1
+    },
+    {
+      "name": "CreateMutexA",
+      "argCount": 3
+    },
+    {
+      "name": "CreateMutexExA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMutexExW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateMutexW",
+      "argCount": 3
+    },
+    {
+      "name": "CreateNamedPipeA",
+      "argCount": 8
+    },
+    {
+      "name": "CreateNamedPipeW",
+      "argCount": 8
+    },
+    {
+      "name": "CreatePipe",
+      "argCount": 4
+    },
+    {
+      "name": "CreateProcessA",
+      "argCount": 10
+    },
+    {
+      "name": "CreateProcessAsUserA",
+      "argCount": 11
+    },
+    {
+      "name": "CreateProcessAsUserW",
+      "argCount": 11
+    },
+    {
+      "name": "CreateProcessInternalA",
+      "argCount": 12
+    },
+    {
+      "name": "CreateProcessInternalW",
+      "argCount": 12
+    },
+    {
+      "name": "CreateProcessW",
+      "argCount": 10
+    },
+    {
+      "name": "CreatePseudoConsole",
+      "argCount": 5
+    },
+    {
+      "name": "CreateRemoteThread",
+      "argCount": 7
+    },
+    {
+      "name": "CreateRemoteThreadEx",
+      "argCount": 8
+    },
+    {
+      "name": "CreateSemaphoreA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateSemaphoreExA",
+      "argCount": 6
+    },
+    {
+      "name": "CreateSemaphoreExW",
+      "argCount": 6
+    },
+    {
+      "name": "CreateSemaphoreW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateSocketHandle",
+      "argCount": 0
+    },
+    {
+      "name": "CreateSymbolicLinkA",
+      "argCount": 3
+    },
+    {
+      "name": "CreateSymbolicLinkW",
+      "argCount": 3
+    },
+    {
+      "name": "CreateTapePartition",
+      "argCount": 4
+    },
+    {
+      "name": "CreateThread",
+      "argCount": 6
+    },
+    {
+      "name": "CreateThreadpool",
+      "argCount": 1
+    },
+    {
+      "name": "CreateThreadpoolCleanupGroup",
+      "argCount": 0
+    },
+    {
+      "name": "CreateThreadpoolIo",
+      "argCount": 4
+    },
+    {
+      "name": "CreateThreadpoolTimer",
+      "argCount": 3
+    },
+    {
+      "name": "CreateThreadpoolWait",
+      "argCount": 3
+    },
+    {
+      "name": "CreateThreadpoolWork",
+      "argCount": 3
+    },
+    {
+      "name": "CreateTimerQueue",
+      "argCount": 0
+    },
+    {
+      "name": "CreateTimerQueueTimer",
+      "argCount": 7
+    },
+    {
+      "name": "CreateToolhelp32Snapshot",
+      "argCount": 2
+    },
+    {
+      "name": "CreateWaitableTimerA",
+      "argCount": 3
+    },
+    {
+      "name": "CreateWaitableTimerExA",
+      "argCount": 4
+    },
+    {
+      "name": "CreateWaitableTimerExW",
+      "argCount": 4
+    },
+    {
+      "name": "CreateWaitableTimerW",
+      "argCount": 3
+    },
+    {
+      "name": "CtrlRoutine",
+      "argCount": 1
+    },
+    {
+      "name": "DeactivateActCtx",
+      "argCount": 2
+    },
+    {
+      "name": "DebugActiveProcess",
+      "argCount": 1
+    },
+    {
+      "name": "DebugActiveProcessStop",
+      "argCount": 1
+    },
+    {
+      "name": "DebugBreak",
+      "argCount": 0
+    },
+    {
+      "name": "DebugBreakProcess",
+      "argCount": 1
+    },
+    {
+      "name": "DebugSetProcessKillOnExit",
+      "argCount": 1
+    },
+    {
+      "name": "DecodePointer",
+      "argCount": 1
+    },
+    {
+      "name": "DecodeSystemPointer",
+      "argCount": 1
+    },
+    {
+      "name": "DefineDosDeviceA",
+      "argCount": 3
+    },
+    {
+      "name": "DefineDosDeviceW",
+      "argCount": 3
+    },
+    {
+      "name": "DelayLoadFailureHook",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteAtom",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteFiber",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteFileA",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteFileTransactedA",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteFileTransactedW",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteFileW",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteProcThreadAttributeList",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteSynchronizationBarrier",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteTimerQueue",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteTimerQueueEx",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteTimerQueueTimer",
+      "argCount": 3
+    },
+    {
+      "name": "DeleteVolumeMountPointA",
+      "argCount": 1
+    },
+    {
+      "name": "DeleteVolumeMountPointW",
+      "argCount": 1
+    },
+    {
+      "name": "DeviceIoControl",
+      "argCount": 8
+    },
+    {
+      "name": "DisableThreadLibraryCalls",
+      "argCount": 1
+    },
+    {
+      "name": "DisassociateCurrentThreadFromCallback",
+      "argCount": 1
+    },
+    {
+      "name": "DiscardVirtualMemory",
+      "argCount": 2
+    },
+    {
+      "name": "DisconnectNamedPipe",
+      "argCount": 1
+    },
+    {
+      "name": "DisposeLZ32Handle",
+      "argCount": 1
+    },
+    {
+      "name": "DnsHostnameToComputerNameA",
+      "argCount": 3
+    },
+    {
+      "name": "DnsHostnameToComputerNameW",
+      "argCount": 3
+    },
+    {
+      "name": "DosDateTimeToFileTime",
+      "argCount": 3
+    },
+    {
+      "name": "DosFileHandleToWin32Handle",
+      "argCount": 1
+    },
+    {
+      "name": "DuplicateConsoleHandle",
+      "argCount": 4
+    },
+    {
+      "name": "DuplicateHandle",
+      "argCount": 7
+    },
+    {
+      "name": "EncodePointer",
+      "argCount": 1
+    },
+    {
+      "name": "EncodeSystemPointer",
+      "argCount": 1
+    },
+    {
+      "name": "EndUpdateResourceA",
+      "argCount": 2
+    },
+    {
+      "name": "EndUpdateResourceW",
+      "argCount": 2
+    },
+    {
+      "name": "EnterCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "EnterSynchronizationBarrier",
+      "argCount": 2
+    },
+    {
+      "name": "EnumCalendarInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumCalendarInfoExA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumCalendarInfoExEx",
+      "argCount": 6
+    },
+    {
+      "name": "EnumCalendarInfoExW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumCalendarInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDateFormatsA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDateFormatsExA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDateFormatsExEx",
+      "argCount": 4
+    },
+    {
+      "name": "EnumDateFormatsExW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumDateFormatsW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumLanguageGroupLocalesA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumLanguageGroupLocalesW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumResourceLanguagesA",
+      "argCount": 5
+    },
+    {
+      "name": "EnumResourceLanguagesExA",
+      "argCount": 7
+    },
+    {
+      "name": "EnumResourceLanguagesExW",
+      "argCount": 7
+    },
+    {
+      "name": "EnumResourceLanguagesW",
+      "argCount": 5
+    },
+    {
+      "name": "EnumResourceNamesA",
+      "argCount": 4
+    },
+    {
+      "name": "EnumResourceNamesExA",
+      "argCount": 6
+    },
+    {
+      "name": "EnumResourceNamesExW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumResourceNamesW",
+      "argCount": 4
+    },
+    {
+      "name": "EnumResourceTypesA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumResourceTypesExA",
+      "argCount": 5
+    },
+    {
+      "name": "EnumResourceTypesExW",
+      "argCount": 5
+    },
+    {
+      "name": "EnumResourceTypesW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumSystemCodePagesA",
+      "argCount": 2
+    },
+    {
+      "name": "EnumSystemCodePagesW",
+      "argCount": 2
+    },
+    {
+      "name": "EnumSystemFirmwareTables",
+      "argCount": 3
+    },
+    {
+      "name": "EnumSystemGeoID",
+      "argCount": 3
+    },
+    {
+      "name": "EnumSystemLanguageGroupsA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumSystemLanguageGroupsW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumSystemLocalesA",
+      "argCount": 2
+    },
+    {
+      "name": "EnumSystemLocalesEx",
+      "argCount": 4
+    },
+    {
+      "name": "EnumSystemLocalesW",
+      "argCount": 2
+    },
+    {
+      "name": "EnumTimeFormatsA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumTimeFormatsEx",
+      "argCount": 4
+    },
+    {
+      "name": "EnumTimeFormatsW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumUILanguagesA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumUILanguagesW",
+      "argCount": 3
+    },
+    {
+      "name": "EraseTape",
+      "argCount": 3
+    },
+    {
+      "name": "EscapeCommFunction",
+      "argCount": 2
+    },
+    {
+      "name": "ExitProcess",
+      "argCount": 1
+    },
+    {
+      "name": "ExitThread",
+      "argCount": 1
+    },
+    {
+      "name": "ExpandEnvironmentStringsA",
+      "argCount": 3
+    },
+    {
+      "name": "ExpandEnvironmentStringsW",
+      "argCount": 3
+    },
+    {
+      "name": "ExpungeConsoleCommandHistoryA",
+      "argCount": 1
+    },
+    {
+      "name": "ExpungeConsoleCommandHistoryW",
+      "argCount": 1
+    },
+    {
+      "name": "FatalAppExitA",
+      "argCount": 2
+    },
+    {
+      "name": "FatalAppExitW",
+      "argCount": 2
+    },
+    {
+      "name": "FatalExit",
+      "argCount": 1
+    },
+    {
+      "name": "FileTimeToDosDateTime",
+      "argCount": 3
+    },
+    {
+      "name": "FileTimeToLocalFileTime",
+      "argCount": 2
+    },
+    {
+      "name": "FileTimeToSystemTime",
+      "argCount": 2
+    },
+    {
+      "name": "FillConsoleOutputAttribute",
+      "argCount": 5
+    },
+    {
+      "name": "FillConsoleOutputCharacterA",
+      "argCount": 5
+    },
+    {
+      "name": "FillConsoleOutputCharacterW",
+      "argCount": 5
+    },
+    {
+      "name": "FindActCtxSectionGuid",
+      "argCount": 5
+    },
+    {
+      "name": "FindActCtxSectionStringA",
+      "argCount": 5
+    },
+    {
+      "name": "FindActCtxSectionStringW",
+      "argCount": 5
+    },
+    {
+      "name": "FindAtomA",
+      "argCount": 1
+    },
+    {
+      "name": "FindAtomW",
+      "argCount": 1
+    },
+    {
+      "name": "FindClose",
+      "argCount": 1
+    },
+    {
+      "name": "FindCloseChangeNotification",
+      "argCount": 1
+    },
+    {
+      "name": "FindFirstChangeNotificationA",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstChangeNotificationW",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstFileA",
+      "argCount": 2
+    },
+    {
+      "name": "FindFirstFileExA",
+      "argCount": 6
+    },
+    {
+      "name": "FindFirstFileExW",
+      "argCount": 6
+    },
+    {
+      "name": "FindFirstFileNameW",
+      "argCount": 4
+    },
+    {
+      "name": "FindFirstFileTransactedA",
+      "argCount": 7
+    },
+    {
+      "name": "FindFirstFileTransactedW",
+      "argCount": 7
+    },
+    {
+      "name": "FindFirstFileW",
+      "argCount": 2
+    },
+    {
+      "name": "FindFirstStreamW",
+      "argCount": 4
+    },
+    {
+      "name": "FindFirstVolumeA",
+      "argCount": 2
+    },
+    {
+      "name": "FindFirstVolumeMountPointA",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstVolumeMountPointW",
+      "argCount": 3
+    },
+    {
+      "name": "FindFirstVolumeW",
+      "argCount": 2
+    },
+    {
+      "name": "FindNextChangeNotification",
+      "argCount": 1
+    },
+    {
+      "name": "FindNextFileA",
+      "argCount": 2
+    },
+    {
+      "name": "FindNextFileW",
+      "argCount": 2
+    },
+    {
+      "name": "FindNextStreamW",
+      "argCount": 2
+    },
+    {
+      "name": "FindNextVolumeA",
+      "argCount": 3
+    },
+    {
+      "name": "FindNextVolumeW",
+      "argCount": 3
+    },
+    {
+      "name": "FindNLSString",
+      "argCount": 7
+    },
+    {
+      "name": "FindNLSStringEx",
+      "argCount": 10
+    },
+    {
+      "name": "FindResourceA",
+      "argCount": 3
+    },
+    {
+      "name": "FindResourceExA",
+      "argCount": 4
+    },
+    {
+      "name": "FindResourceExW",
+      "argCount": 4
+    },
+    {
+      "name": "FindResourceW",
+      "argCount": 3
+    },
+    {
+      "name": "FindStringOrdinal",
+      "argCount": 6
+    },
+    {
+      "name": "FindVolumeClose",
+      "argCount": 1
+    },
+    {
+      "name": "FindVolumeMountPointClose",
+      "argCount": 1
+    },
+    {
+      "name": "FlsAlloc",
+      "argCount": 1
+    },
+    {
+      "name": "FlsFree",
+      "argCount": 1
+    },
+    {
+      "name": "FlsGetValue",
+      "argCount": 1
+    },
+    {
+      "name": "FlsSetValue",
+      "argCount": 2
+    },
+    {
+      "name": "FlushConsoleInputBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "FlushFileBuffers",
+      "argCount": 1
+    },
+    {
+      "name": "FlushInstructionCache",
+      "argCount": 3
+    },
+    {
+      "name": "FlushProcessWriteBuffers",
+      "argCount": 0
+    },
+    {
+      "name": "FlushViewOfFile",
+      "argCount": 2
+    },
+    {
+      "name": "FoldStringA",
+      "argCount": 5
+    },
+    {
+      "name": "FoldStringW",
+      "argCount": 5
+    },
+    {
+      "name": "FormatMessageA",
+      "argCount": 7
+    },
+    {
+      "name": "FormatMessageW",
+      "argCount": 7
+    },
+    {
+      "name": "FreeConsole",
+      "argCount": 0
+    },
+    {
+      "name": "FreeEnvironmentStringsA",
+      "argCount": 1
+    },
+    {
+      "name": "FreeEnvironmentStringsW",
+      "argCount": 1
+    },
+    {
+      "name": "FreeLibrary",
+      "argCount": 1
+    },
+    {
+      "name": "FreeLibrary16",
+      "argCount": 1
+    },
+    {
+      "name": "FreeLibraryAndExitThread",
+      "argCount": 2
+    },
+    {
+      "name": "FreeLibraryWhenCallbackReturns",
+      "argCount": 2
+    },
+    {
+      "name": "FreeMappedBuffer",
+      "argCount": 0
+    },
+    {
+      "name": "FreeResource",
+      "argCount": 1
+    },
+    {
+      "name": "FreeSLCallback",
+      "argCount": 1
+    },
+    {
+      "name": "FreeUserPhysicalPages",
+      "argCount": 3
+    },
+    {
+      "name": "FT_Exit0",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit12",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit16",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit20",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit24",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit28",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit32",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit36",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit4",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit40",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit44",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit48",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit52",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit56",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Exit8",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Prolog",
+      "argCount": 0
+    },
+    {
+      "name": "FT_PrologPrime",
+      "argCount": 0
+    },
+    {
+      "name": "FT_Thunk",
+      "argCount": 0
+    },
+    {
+      "name": "GenerateConsoleCtrlEvent",
+      "argCount": 2
+    },
+    {
+      "name": "Get16DLLAddress",
+      "argCount": 2
+    },
+    {
+      "name": "GetACP",
+      "argCount": 0
+    },
+    {
+      "name": "GetActiveProcessorCount",
+      "argCount": 1
+    },
+    {
+      "name": "GetActiveProcessorGroupCount",
+      "argCount": 0
+    },
+    {
+      "name": "GetApplicationRestartSettings",
+      "argCount": 4
+    },
+    {
+      "name": "GetAtomNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetAtomNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetBinaryType",
+      "argCount": 2
+    },
+    {
+      "name": "GetBinaryTypeA",
+      "argCount": 2
+    },
+    {
+      "name": "GetBinaryTypeW",
+      "argCount": 2
+    },
+    {
+      "name": "GetCalendarInfoA",
+      "argCount": 6
+    },
+    {
+      "name": "GetCalendarInfoEx",
+      "argCount": 7
+    },
+    {
+      "name": "GetCalendarInfoW",
+      "argCount": 6
+    },
+    {
+      "name": "GetCommandLineA",
+      "argCount": 0
+    },
+    {
+      "name": "GetCommandLineW",
+      "argCount": 0
+    },
+    {
+      "name": "GetCommConfig",
+      "argCount": 3
+    },
+    {
+      "name": "GetCommMask",
+      "argCount": 2
+    },
+    {
+      "name": "GetCommModemStatus",
+      "argCount": 2
+    },
+    {
+      "name": "GetCommProperties",
+      "argCount": 2
+    },
+    {
+      "name": "GetCommState",
+      "argCount": 2
+    },
+    {
+      "name": "GetCommTimeouts",
+      "argCount": 2
+    },
+    {
+      "name": "GetCompressedFileSizeA",
+      "argCount": 2
+    },
+    {
+      "name": "GetCompressedFileSizeW",
+      "argCount": 2
+    },
+    {
+      "name": "GetComputerNameA",
+      "argCount": 2
+    },
+    {
+      "name": "GetComputerNameExA",
+      "argCount": 3
+    },
+    {
+      "name": "GetComputerNameExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetComputerNameW",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleAliasA",
+      "argCount": 4
+    },
+    {
+      "name": "GetConsoleAliasesLengthA",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleAliasesLengthW",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleAliasExesLengthA",
+      "argCount": 0
+    },
+    {
+      "name": "GetConsoleAliasExesLengthW",
+      "argCount": 0
+    },
+    {
+      "name": "GetConsoleAliasW",
+      "argCount": 4
+    },
+    {
+      "name": "GetConsoleCommandHistoryA",
+      "argCount": 3
+    },
+    {
+      "name": "GetConsoleCommandHistoryLengthA",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleCommandHistoryLengthW",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleCommandHistoryW",
+      "argCount": 3
+    },
+    {
+      "name": "GetConsoleCP",
+      "argCount": 0
+    },
+    {
+      "name": "GetConsoleCursorInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleDisplayMode",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleFontInfo",
+      "argCount": 4
+    },
+    {
+      "name": "GetConsoleFontSize",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleInputExeNameA",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleInputExeNameW",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleInputWaitHandle",
+      "argCount": 0
+    },
+    {
+      "name": "GetConsoleKeyboardLayoutNameA",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleKeyboardLayoutNameW",
+      "argCount": 1
+    },
+    {
+      "name": "GetConsoleMode",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleOriginalTitleA",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleOriginalTitleW",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleOutputCP",
+      "argCount": 0
+    },
+    {
+      "name": "GetConsoleProcessList",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleScreenBufferInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleScreenBufferInfoEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleTitleA",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleTitleW",
+      "argCount": 2
+    },
+    {
+      "name": "GetConsoleWindow",
+      "argCount": 0
+    },
+    {
+      "name": "GetCPInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetCPInfoExA",
+      "argCount": 3
+    },
+    {
+      "name": "GetCPInfoExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetCurrencyFormatA",
+      "argCount": 6
+    },
+    {
+      "name": "GetCurrencyFormatEx",
+      "argCount": 6
+    },
+    {
+      "name": "GetCurrencyFormatW",
+      "argCount": 6
+    },
+    {
+      "name": "GetCurrentActCtx",
+      "argCount": 1
+    },
+    {
+      "name": "GetCurrentApplicationUserModelId",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentConsoleFont",
+      "argCount": 3
+    },
+    {
+      "name": "GetCurrentConsoleFontEx",
+      "argCount": 3
+    },
+    {
+      "name": "GetCurrentDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentPackageFamilyName",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentPackageFullName",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentPackageId",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentPackageInfo",
+      "argCount": 4
+    },
+    {
+      "name": "GetCurrentPackagePath",
+      "argCount": 2
+    },
+    {
+      "name": "GetCurrentProcess",
+      "argCount": 0
+    },
+    {
+      "name": "GetCurrentProcessId",
+      "argCount": 0
+    },
+    {
+      "name": "GetCurrentProcessorNumber",
+      "argCount": 0
+    },
+    {
+      "name": "GetCurrentProcessorNumberEx",
+      "argCount": 1
+    },
+    {
+      "name": "GetCurrentThread",
+      "argCount": 0
+    },
+    {
+      "name": "GetCurrentThreadId",
+      "argCount": 0
+    },
+    {
+      "name": "GetCurrentThreadStackLimits",
+      "argCount": 2
+    },
+    {
+      "name": "GetDateFormatA",
+      "argCount": 6
+    },
+    {
+      "name": "GetDateFormatEx",
+      "argCount": 7
+    },
+    {
+      "name": "GetDateFormatW",
+      "argCount": 6
+    },
+    {
+      "name": "GetDaylightFlag",
+      "argCount": 0
+    },
+    {
+      "name": "GetDefaultCommConfigA",
+      "argCount": 3
+    },
+    {
+      "name": "GetDefaultCommConfigW",
+      "argCount": 3
+    },
+    {
+      "name": "GetDevicePowerState",
+      "argCount": 2
+    },
+    {
+      "name": "GetDiskFreeSpaceA",
+      "argCount": 5
+    },
+    {
+      "name": "GetDiskFreeSpaceExA",
+      "argCount": 4
+    },
+    {
+      "name": "GetDiskFreeSpaceExW",
+      "argCount": 4
+    },
+    {
+      "name": "GetDiskFreeSpaceW",
+      "argCount": 5
+    },
+    {
+      "name": "GetDiskSpaceInformationA",
+      "argCount": 2
+    },
+    {
+      "name": "GetDiskSpaceInformationW",
+      "argCount": 2
+    },
+    {
+      "name": "GetDllDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetDllDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetDriveTypeA",
+      "argCount": 1
+    },
+    {
+      "name": "GetDriveTypeW",
+      "argCount": 1
+    },
+    {
+      "name": "GetDynamicTimeZoneInformation",
+      "argCount": 1
+    },
+    {
+      "name": "GetDynamicTimeZoneInformationEffectiveYears",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnabledXStateFeatures",
+      "argCount": 0
+    },
+    {
+      "name": "GetEnvironmentStrings",
+      "argCount": 0
+    },
+    {
+      "name": "GetEnvironmentStringsA",
+      "argCount": 0
+    },
+    {
+      "name": "GetEnvironmentStringsW",
+      "argCount": 0
+    },
+    {
+      "name": "GetEnvironmentVariableA",
+      "argCount": 3
+    },
+    {
+      "name": "GetEnvironmentVariableW",
+      "argCount": 3
+    },
+    {
+      "name": "GetErrorMode",
+      "argCount": 0
+    },
+    {
+      "name": "GetExitCodeProcess",
+      "argCount": 2
+    },
+    {
+      "name": "GetExitCodeThread",
+      "argCount": 2
+    },
+    {
+      "name": "GetExpandedNameA",
+      "argCount": 2
+    },
+    {
+      "name": "GetExpandedNameW",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileAttributesA",
+      "argCount": 1
+    },
+    {
+      "name": "GetFileAttributesExA",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileAttributesExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileAttributesTransactedA",
+      "argCount": 4
+    },
+    {
+      "name": "GetFileAttributesTransactedW",
+      "argCount": 4
+    },
+    {
+      "name": "GetFileAttributesW",
+      "argCount": 1
+    },
+    {
+      "name": "GetFileInformationByHandle",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileInformationByHandleEx",
+      "argCount": 4
+    },
+    {
+      "name": "GetFileMUIInfo",
+      "argCount": 4
+    },
+    {
+      "name": "GetFileMUIPath",
+      "argCount": 7
+    },
+    {
+      "name": "GetFileSize",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileSizeEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileTime",
+      "argCount": 4
+    },
+    {
+      "name": "GetFileType",
+      "argCount": 1
+    },
+    {
+      "name": "GetFinalPathNameByHandleA",
+      "argCount": 4
+    },
+    {
+      "name": "GetFinalPathNameByHandleW",
+      "argCount": 4
+    },
+    {
+      "name": "GetFirmwareEnvironmentVariableA",
+      "argCount": 4
+    },
+    {
+      "name": "GetFirmwareEnvironmentVariableW",
+      "argCount": 4
+    },
+    {
+      "name": "GetFirmwareType",
+      "argCount": 1
+    },
+    {
+      "name": "GetFullPathNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetFullPathNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetGeoInfoA",
+      "argCount": 5
+    },
+    {
+      "name": "GetGeoInfoEx",
+      "argCount": 4
+    },
+    {
+      "name": "GetGeoInfoW",
+      "argCount": 5
+    },
+    {
+      "name": "GetHandleContext",
+      "argCount": 1
+    },
+    {
+      "name": "GetHandleInformation",
+      "argCount": 2
+    },
+    {
+      "name": "GetLargePageMinimum",
+      "argCount": 0
+    },
+    {
+      "name": "GetLargestConsoleWindowSize",
+      "argCount": 1
+    },
+    {
+      "name": "GetLastError",
+      "argCount": 0
+    },
+    {
+      "name": "GetLocaleInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "GetLocaleInfoEx",
+      "argCount": 4
+    },
+    {
+      "name": "GetLocaleInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "GetLocalTime",
+      "argCount": 1
+    },
+    {
+      "name": "GetLogicalDrives",
+      "argCount": 0
+    },
+    {
+      "name": "GetLogicalDriveStringsA",
+      "argCount": 2
+    },
+    {
+      "name": "GetLogicalDriveStringsW",
+      "argCount": 2
+    },
+    {
+      "name": "GetLogicalProcessorInformation",
+      "argCount": 2
+    },
+    {
+      "name": "GetLogicalProcessorInformationEx",
+      "argCount": 3
+    },
+    {
+      "name": "GetLongPathNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetLongPathNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetMachineTypeAttributes",
+      "argCount": 2
+    },
+    {
+      "name": "GetMailslotInfo",
+      "argCount": 5
+    },
+    {
+      "name": "GetMaximumProcessorCount",
+      "argCount": 1
+    },
+    {
+      "name": "GetMaximumProcessorGroupCount",
+      "argCount": 0
+    },
+    {
+      "name": "GetModuleFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetModuleFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetModuleHandleA",
+      "argCount": 1
+    },
+    {
+      "name": "GetModuleHandleExA",
+      "argCount": 3
+    },
+    {
+      "name": "GetModuleHandleExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetModuleHandleW",
+      "argCount": 1
+    },
+    {
+      "name": "GetNamedPipeClientProcessId",
+      "argCount": 2
+    },
+    {
+      "name": "GetNamedPipeClientSessionId",
+      "argCount": 2
+    },
+    {
+      "name": "GetNamedPipeHandleStateA",
+      "argCount": 7
+    },
+    {
+      "name": "GetNamedPipeHandleStateW",
+      "argCount": 7
+    },
+    {
+      "name": "GetNamedPipeInfo",
+      "argCount": 5
+    },
+    {
+      "name": "GetNamedPipeServerProcessId",
+      "argCount": 2
+    },
+    {
+      "name": "GetNamedPipeServerSessionId",
+      "argCount": 2
+    },
+    {
+      "name": "GetNativeSystemInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetNLSVersion",
+      "argCount": 3
+    },
+    {
+      "name": "GetNLSVersionEx",
+      "argCount": 3
+    },
+    {
+      "name": "GetNumaAvailableMemoryNode",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaAvailableMemoryNodeEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaHighestNodeNumber",
+      "argCount": 1
+    },
+    {
+      "name": "GetNumaNodeProcessorMask",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaNodeProcessorMaskEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaProcessorNode",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaProcessorNodeEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaProximityNode",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumaProximityNodeEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumberFormatA",
+      "argCount": 6
+    },
+    {
+      "name": "GetNumberFormatEx",
+      "argCount": 6
+    },
+    {
+      "name": "GetNumberFormatW",
+      "argCount": 6
+    },
+    {
+      "name": "GetNumberOfConsoleFonts",
+      "argCount": 0
+    },
+    {
+      "name": "GetNumberOfConsoleInputEvents",
+      "argCount": 2
+    },
+    {
+      "name": "GetNumberOfConsoleMouseButtons",
+      "argCount": 1
+    },
+    {
+      "name": "GetOEMCP",
+      "argCount": 0
+    },
+    {
+      "name": "GetOverlappedResult",
+      "argCount": 4
+    },
+    {
+      "name": "GetOverlappedResultEx",
+      "argCount": 5
+    },
+    {
+      "name": "GetPackageFamilyName",
+      "argCount": 3
+    },
+    {
+      "name": "GetPackageFullName",
+      "argCount": 3
+    },
+    {
+      "name": "GetPackagePathByFullName",
+      "argCount": 3
+    },
+    {
+      "name": "GetPackagesByPackageFamily",
+      "argCount": 5
+    },
+    {
+      "name": "GetPhysicallyInstalledSystemMemory",
+      "argCount": 1
+    },
+    {
+      "name": "GetPK16SysVar",
+      "argCount": 0
+    },
+    {
+      "name": "GetPriorityClass",
+      "argCount": 1
+    },
+    {
+      "name": "GetPrivateProfileIntA",
+      "argCount": 4
+    },
+    {
+      "name": "GetPrivateProfileIntW",
+      "argCount": 4
+    },
+    {
+      "name": "GetPrivateProfileSectionA",
+      "argCount": 4
+    },
+    {
+      "name": "GetPrivateProfileSectionNamesA",
+      "argCount": 3
+    },
+    {
+      "name": "GetPrivateProfileSectionNamesW",
+      "argCount": 3
+    },
+    {
+      "name": "GetPrivateProfileSectionW",
+      "argCount": 4
+    },
+    {
+      "name": "GetPrivateProfileStringA",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrivateProfileStringW",
+      "argCount": 6
+    },
+    {
+      "name": "GetPrivateProfileStructA",
+      "argCount": 5
+    },
+    {
+      "name": "GetPrivateProfileStructW",
+      "argCount": 5
+    },
+    {
+      "name": "GetProcAddress",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcAddress16",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessAffinityMask",
+      "argCount": 3
+    },
+    {
+      "name": "GetProcessDEPPolicy",
+      "argCount": 3
+    },
+    {
+      "name": "GetProcessDword",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessFlags",
+      "argCount": 1
+    },
+    {
+      "name": "GetProcessGroupAffinity",
+      "argCount": 3
+    },
+    {
+      "name": "GetProcessHandleCount",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessHeap",
+      "argCount": 0
+    },
+    {
+      "name": "GetProcessHeaps",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessId",
+      "argCount": 1
+    },
+    {
+      "name": "GetProcessIdOfThread",
+      "argCount": 1
+    },
+    {
+      "name": "GetProcessInformation",
+      "argCount": 4
+    },
+    {
+      "name": "GetProcessIoCounters",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessMitigationPolicy",
+      "argCount": 4
+    },
+    {
+      "name": "GetProcessPreferredUILanguages",
+      "argCount": 4
+    },
+    {
+      "name": "GetProcessPriorityBoost",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessShutdownParameters",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessTimes",
+      "argCount": 5
+    },
+    {
+      "name": "GetProcessVersion",
+      "argCount": 1
+    },
+    {
+      "name": "GetProcessWorkingSetSize",
+      "argCount": 3
+    },
+    {
+      "name": "GetProcessWorkingSetSizeEx",
+      "argCount": 4
+    },
+    {
+      "name": "GetProductInfo",
+      "argCount": 5
+    },
+    {
+      "name": "GetProfileIntA",
+      "argCount": 3
+    },
+    {
+      "name": "GetProfileIntW",
+      "argCount": 3
+    },
+    {
+      "name": "GetProfileSectionA",
+      "argCount": 3
+    },
+    {
+      "name": "GetProfileSectionW",
+      "argCount": 3
+    },
+    {
+      "name": "GetProfileStringA",
+      "argCount": 5
+    },
+    {
+      "name": "GetProfileStringW",
+      "argCount": 5
+    },
+    {
+      "name": "GetpWin16Lock",
+      "argCount": 1
+    },
+    {
+      "name": "GetQueuedCompletionStatus",
+      "argCount": 5
+    },
+    {
+      "name": "GetQueuedCompletionStatusEx",
+      "argCount": 6
+    },
+    {
+      "name": "GetShortPathNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetShortPathNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetStartupInfoA",
+      "argCount": 1
+    },
+    {
+      "name": "GetStartupInfoW",
+      "argCount": 1
+    },
+    {
+      "name": "GetStdHandle",
+      "argCount": 1
+    },
+    {
+      "name": "GetStringTypeA",
+      "argCount": 5
+    },
+    {
+      "name": "GetStringTypeExA",
+      "argCount": 5
+    },
+    {
+      "name": "GetStringTypeExW",
+      "argCount": 5
+    },
+    {
+      "name": "GetStringTypeW",
+      "argCount": 4
+    },
+    {
+      "name": "GetSystemCpuSetInformation",
+      "argCount": 5
+    },
+    {
+      "name": "GetSystemDefaultLangID",
+      "argCount": 0
+    },
+    {
+      "name": "GetSystemDefaultLCID",
+      "argCount": 0
+    },
+    {
+      "name": "GetSystemDefaultLocaleName",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemDefaultUILanguage",
+      "argCount": 0
+    },
+    {
+      "name": "GetSystemDEPPolicy",
+      "argCount": 0
+    },
+    {
+      "name": "GetSystemDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemFileCacheSize",
+      "argCount": 3
+    },
+    {
+      "name": "GetSystemFirmwareTable",
+      "argCount": 4
+    },
+    {
+      "name": "GetSystemInfo",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemPowerStatus",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemPreferredUILanguages",
+      "argCount": 4
+    },
+    {
+      "name": "GetSystemRegistryQuota",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemTime",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemTimeAdjustment",
+      "argCount": 3
+    },
+    {
+      "name": "GetSystemTimeAsFileTime",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemTimePreciseAsFileTime",
+      "argCount": 1
+    },
+    {
+      "name": "GetSystemTimes",
+      "argCount": 3
+    },
+    {
+      "name": "GetSystemWindowsDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemWindowsDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemWow64DirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetSystemWow64DirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetTapeParameters",
+      "argCount": 4
+    },
+    {
+      "name": "GetTapePosition",
+      "argCount": 5
+    },
+    {
+      "name": "GetTapeStatus",
+      "argCount": 1
+    },
+    {
+      "name": "GetTempFileNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetTempFileNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetTempPath2A",
+      "argCount": 2
+    },
+    {
+      "name": "GetTempPath2W",
+      "argCount": 2
+    },
+    {
+      "name": "GetTempPathA",
+      "argCount": 2
+    },
+    {
+      "name": "GetTempPathW",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadContext",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadDescription",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadErrorMode",
+      "argCount": 0
+    },
+    {
+      "name": "GetThreadGroupAffinity",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadId",
+      "argCount": 1
+    },
+    {
+      "name": "GetThreadIdealProcessorEx",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadIOPendingFlag",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadLocale",
+      "argCount": 0
+    },
+    {
+      "name": "GetThreadPreferredUILanguages",
+      "argCount": 4
+    },
+    {
+      "name": "GetThreadPriority",
+      "argCount": 1
+    },
+    {
+      "name": "GetThreadPriorityBoost",
+      "argCount": 2
+    },
+    {
+      "name": "GetThreadSelectorEntry",
+      "argCount": 3
+    },
+    {
+      "name": "GetThreadTimes",
+      "argCount": 5
+    },
+    {
+      "name": "GetThreadUILanguage",
+      "argCount": 0
+    },
+    {
+      "name": "GetThunkBuff",
+      "argCount": 0
+    },
+    {
+      "name": "GetThunkStuff",
+      "argCount": 2
+    },
+    {
+      "name": "GetTickCount",
+      "argCount": 0
+    },
+    {
+      "name": "GetTickCount64",
+      "argCount": 0
+    },
+    {
+      "name": "GetTimeFormatA",
+      "argCount": 6
+    },
+    {
+      "name": "GetTimeFormatEx",
+      "argCount": 6
+    },
+    {
+      "name": "GetTimeFormatW",
+      "argCount": 6
+    },
+    {
+      "name": "GetTimeZoneInformation",
+      "argCount": 1
+    },
+    {
+      "name": "GetTimeZoneInformationForYear",
+      "argCount": 3
+    },
+    {
+      "name": "GetUserDefaultGeoName",
+      "argCount": 2
+    },
+    {
+      "name": "GetUserDefaultLangID",
+      "argCount": 0
+    },
+    {
+      "name": "GetUserDefaultLCID",
+      "argCount": 0
+    },
+    {
+      "name": "GetUserDefaultLocaleName",
+      "argCount": 2
+    },
+    {
+      "name": "GetUserDefaultUILanguage",
+      "argCount": 0
+    },
+    {
+      "name": "GetUserGeoID",
+      "argCount": 1
+    },
+    {
+      "name": "GetUserPreferredUILanguages",
+      "argCount": 4
+    },
+    {
+      "name": "GetVersion",
+      "argCount": 0
+    },
+    {
+      "name": "GetVersionExA",
+      "argCount": 1
+    },
+    {
+      "name": "GetVersionExW",
+      "argCount": 1
+    },
+    {
+      "name": "GetVolumeInformationA",
+      "argCount": 8
+    },
+    {
+      "name": "GetVolumeInformationByHandleW",
+      "argCount": 8
+    },
+    {
+      "name": "GetVolumeInformationW",
+      "argCount": 8
+    },
+    {
+      "name": "GetVolumeNameForVolumeMountPointA",
+      "argCount": 3
+    },
+    {
+      "name": "GetVolumeNameForVolumeMountPointW",
+      "argCount": 3
+    },
+    {
+      "name": "GetVolumePathNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetVolumePathNamesForVolumeNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetVolumePathNamesForVolumeNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetVolumePathNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetWin16DOSEnv",
+      "argCount": 0
+    },
+    {
+      "name": "GetWindowsDirectoryA",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowsDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "GetWriteWatch",
+      "argCount": 6
+    },
+    {
+      "name": "GetXStateFeaturesMask",
+      "argCount": 2
+    },
+    {
+      "name": "GlobalAddAtomA",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalAddAtomW",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalAlloc",
+      "argCount": 2
+    },
+    {
+      "name": "GlobalAlloc16",
+      "argCount": 2
+    },
+    {
+      "name": "GlobalCompact",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalDeleteAtom",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFindAtomA",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFindAtomW",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFix",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFix16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFlags",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFree",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalFree16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalGetAtomNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GlobalGetAtomNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GlobalHandle",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalLock",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalLock16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalMemoryStatus",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalMemoryStatusEx",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalReAlloc",
+      "argCount": 3
+    },
+    {
+      "name": "GlobalSize",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalSize16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalUnfix",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalUnfix16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalUnlock",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalUnlock16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalUnWire",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalUnWire16",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalWire",
+      "argCount": 1
+    },
+    {
+      "name": "GlobalWire16",
+      "argCount": 1
+    },
+    {
+      "name": "Heap32ListFirst",
+      "argCount": 2
+    },
+    {
+      "name": "HeapAlloc",
+      "argCount": 3
+    },
+    {
+      "name": "HeapCompact",
+      "argCount": 2
+    },
+    {
+      "name": "HeapCreate",
+      "argCount": 3
+    },
+    {
+      "name": "HeapDestroy",
+      "argCount": 1
+    },
+    {
+      "name": "HeapFree",
+      "argCount": 3
+    },
+    {
+      "name": "HeapLock",
+      "argCount": 1
+    },
+    {
+      "name": "HeapQueryInformation",
+      "argCount": 5
+    },
+    {
+      "name": "HeapReAlloc",
+      "argCount": 4
+    },
+    {
+      "name": "HeapSetInformation",
+      "argCount": 4
+    },
+    {
+      "name": "HeapSize",
+      "argCount": 3
+    },
+    {
+      "name": "HeapSummary",
+      "argCount": 3
+    },
+    {
+      "name": "HeapUnlock",
+      "argCount": 1
+    },
+    {
+      "name": "HeapValidate",
+      "argCount": 3
+    },
+    {
+      "name": "HeapWalk",
+      "argCount": 2
+    },
+    {
+      "name": "HouseCleanLogicallyDeadHandles",
+      "argCount": 0
+    },
+    {
+      "name": "IdnToAscii",
+      "argCount": 5
+    },
+    {
+      "name": "IdnToNameprepUnicode",
+      "argCount": 5
+    },
+    {
+      "name": "IdnToUnicode",
+      "argCount": 5
+    },
+    {
+      "name": "InitAtomTable",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeConditionVariable",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeContext",
+      "argCount": 4
+    },
+    {
+      "name": "InitializeContext2",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "InitializeCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeCriticalSectionAndSpinCount",
+      "argCount": 2
+    },
+    {
+      "name": "InitializeCriticalSectionEx",
+      "argCount": 3
+    },
+    {
+      "name": "InitializeProcThreadAttributeList",
+      "argCount": 4
+    },
+    {
+      "name": "InitializeSListHead",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeSRWLock",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeSynchronizationBarrier",
+      "argCount": 3
+    },
+    {
+      "name": "InitOnceBeginInitialize",
+      "argCount": 4
+    },
+    {
+      "name": "InitOnceComplete",
+      "argCount": 3
+    },
+    {
+      "name": "InitOnceExecuteOnce",
+      "argCount": 4
+    },
+    {
+      "name": "InitOnceInitialize",
+      "argCount": 1
+    },
+    {
+      "name": "InterlockedCompareExchange",
+      "argCount": 3
+    },
+    {
+      "name": "InterlockedCompareExchange64",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "InterlockedDecrement",
+      "argCount": 1
+    },
+    {
+      "name": "InterlockedExchange",
+      "argCount": 2
+    },
+    {
+      "name": "InterlockedExchangeAdd",
+      "argCount": 2
+    },
+    {
+      "name": "InterlockedFlushSList",
+      "argCount": 1
+    },
+    {
+      "name": "InterlockedIncrement",
+      "argCount": 1
+    },
+    {
+      "name": "InterlockedPopEntrySList",
+      "argCount": 1
+    },
+    {
+      "name": "InterlockedPushEntrySList",
+      "argCount": 2
+    },
+    {
+      "name": "InterlockedPushListSList",
+      "argCount": 4
+    },
+    {
+      "name": "InterlockedPushListSListEx",
+      "argCount": 4
+    },
+    {
+      "name": "InvalidateNLSCache",
+      "argCount": 0
+    },
+    {
+      "name": "IsBadCodePtr",
+      "argCount": 1
+    },
+    {
+      "name": "IsBadHugeReadPtr",
+      "argCount": 2
+    },
+    {
+      "name": "IsBadHugeWritePtr",
+      "argCount": 2
+    },
+    {
+      "name": "IsBadReadPtr",
+      "argCount": 2
+    },
+    {
+      "name": "IsBadStringPtrA",
+      "argCount": 2
+    },
+    {
+      "name": "IsBadStringPtrW",
+      "argCount": 2
+    },
+    {
+      "name": "IsBadWritePtr",
+      "argCount": 2
+    },
+    {
+      "name": "IsDBCSLeadByte",
+      "argCount": 1
+    },
+    {
+      "name": "IsDBCSLeadByteEx",
+      "argCount": 2
+    },
+    {
+      "name": "IsDebuggerPresent",
+      "argCount": 0
+    },
+    {
+      "name": "IsNLSDefinedString",
+      "argCount": 5
+    },
+    {
+      "name": "IsNormalizedString",
+      "argCount": 3
+    },
+    {
+      "name": "IsProcessInJob",
+      "argCount": 3
+    },
+    {
+      "name": "IsProcessorFeaturePresent",
+      "argCount": 1
+    },
+    {
+      "name": "IsSystemResumeAutomatic",
+      "argCount": 0
+    },
+    {
+      "name": "IsThreadAFiber",
+      "argCount": 0
+    },
+    {
+      "name": "IsThreadpoolTimerSet",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidCodePage",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidLanguageGroup",
+      "argCount": 2
+    },
+    {
+      "name": "IsValidLocale",
+      "argCount": 2
+    },
+    {
+      "name": "IsValidLocaleName",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidNLSVersion",
+      "argCount": 3
+    },
+    {
+      "name": "IsWow64Process",
+      "argCount": 2
+    },
+    {
+      "name": "IsWow64Process2",
+      "argCount": 3
+    },
+    {
+      "name": "k32CharToOemA",
+      "argCount": 2
+    },
+    {
+      "name": "k32CharToOemBuffA",
+      "argCount": 3
+    },
+    {
+      "name": "K32EmptyWorkingSet",
+      "argCount": 1
+    },
+    {
+      "name": "K32EnumDeviceDrivers",
+      "argCount": 3
+    },
+    {
+      "name": "K32EnumPageFilesA",
+      "argCount": 2
+    },
+    {
+      "name": "K32EnumPageFilesW",
+      "argCount": 2
+    },
+    {
+      "name": "K32EnumProcesses",
+      "argCount": 3
+    },
+    {
+      "name": "K32EnumProcessModules",
+      "argCount": 4
+    },
+    {
+      "name": "K32EnumProcessModulesEx",
+      "argCount": 5
+    },
+    {
+      "name": "K32GetDeviceDriverBaseNameA",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetDeviceDriverBaseNameW",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetDeviceDriverFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetDeviceDriverFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetMappedFileNameA",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetMappedFileNameW",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetModuleBaseNameA",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetModuleBaseNameW",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetModuleFileNameExA",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetModuleFileNameExW",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetModuleInformation",
+      "argCount": 4
+    },
+    {
+      "name": "K32GetPerformanceInfo",
+      "argCount": 2
+    },
+    {
+      "name": "K32GetProcessImageFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetProcessImageFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetProcessMemoryInfo",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetWsChanges",
+      "argCount": 3
+    },
+    {
+      "name": "K32GetWsChangesEx",
+      "argCount": 3
+    },
+    {
+      "name": "K32InitializeProcessForWsWatch",
+      "argCount": 1
+    },
+    {
+      "name": "k32LoadStringA",
+      "argCount": 4
+    },
+    {
+      "name": "k32OemToCharA",
+      "argCount": 2
+    },
+    {
+      "name": "k32OemToCharBuffA",
+      "argCount": 3
+    },
+    {
+      "name": "K32QueryWorkingSet",
+      "argCount": 3
+    },
+    {
+      "name": "K32QueryWorkingSetEx",
+      "argCount": 3
+    },
+    {
+      "name": "K32RtlConvertLongToLargeInteger",
+      "argCount": 1
+    },
+    {
+      "name": "K32RtlConvertUlongToLargeInteger",
+      "argCount": 1
+    },
+    {
+      "name": "K32RtlEnlargedIntegerMultiply",
+      "argCount": 2
+    },
+    {
+      "name": "K32RtlEnlargedUnsignedDivide",
+      "argCount": 4
+    },
+    {
+      "name": "K32RtlEnlargedUnsignedMultiply",
+      "argCount": 2
+    },
+    {
+      "name": "K32RtlExtendedIntegerMultiply",
+      "argCount": 3
+    },
+    {
+      "name": "K32RtlExtendedLargeIntegerDivide",
+      "argCount": 4
+    },
+    {
+      "name": "K32RtlExtendedMagicDivide",
+      "argCount": 5
+    },
+    {
+      "name": "K32RtlLargeIntegerAdd",
+      "argCount": 4
+    },
+    {
+      "name": "K32RtlLargeIntegerArithmeticShift",
+      "argCount": 3
+    },
+    {
+      "name": "K32RtlLargeIntegerNegate",
+      "argCount": 2
+    },
+    {
+      "name": "K32RtlLargeIntegerShiftLeft",
+      "argCount": 3
+    },
+    {
+      "name": "K32RtlLargeIntegerShiftRight",
+      "argCount": 3
+    },
+    {
+      "name": "K32RtlLargeIntegerSubtract",
+      "argCount": 4
+    },
+    {
+      "name": "K32Thk1632Epilog",
+      "argCount": 0
+    },
+    {
+      "name": "K32Thk1632Prolog",
+      "argCount": 0
+    },
+    {
+      "name": "K32WOWCallback16",
+      "argCount": 2
+    },
+    {
+      "name": "K32WOWCallback16Ex",
+      "argCount": 5
+    },
+    {
+      "name": "K32WOWDirectedYield16",
+      "argCount": 1
+    },
+    {
+      "name": "K32WOWGetDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "K32WOWGetVDMPointer",
+      "argCount": 3
+    },
+    {
+      "name": "K32WOWGetVDMPointerFix",
+      "argCount": 3
+    },
+    {
+      "name": "K32WOWGetVDMPointerUnfix",
+      "argCount": 1
+    },
+    {
+      "name": "K32WOWGlobalAlloc16",
+      "argCount": 2
+    },
+    {
+      "name": "K32WOWGlobalAllocLock16",
+      "argCount": 3
+    },
+    {
+      "name": "K32WOWGlobalFree16",
+      "argCount": 1
+    },
+    {
+      "name": "K32WOWGlobalLock16",
+      "argCount": 1
+    },
+    {
+      "name": "K32WOWGlobalLockSize16",
+      "argCount": 2
+    },
+    {
+      "name": "K32WOWGlobalUnlock16",
+      "argCount": 1
+    },
+    {
+      "name": "K32WOWGlobalUnlockFree16",
+      "argCount": 1
+    },
+    {
+      "name": "K32WOWHandle16",
+      "argCount": 2
+    },
+    {
+      "name": "K32WOWHandle32",
+      "argCount": 2
+    },
+    {
+      "name": "K32WOWYield16",
+      "argCount": 0
+    },
+    {
+      "name": "k32wvsprintfA",
+      "argCount": 3
+    },
+    {
+      "name": "LCIDToLocaleName",
+      "argCount": 4
+    },
+    {
+      "name": "LCMapStringA",
+      "argCount": 6
+    },
+    {
+      "name": "LCMapStringEx",
+      "argCount": 9
+    },
+    {
+      "name": "LCMapStringW",
+      "argCount": 6
+    },
+    {
+      "name": "LeaveCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "LeaveCriticalSectionWhenCallbackReturns",
+      "argCount": 2
+    },
+    {
+      "name": "LoadAppInitDlls",
+      "argCount": 0
+    },
+    {
+      "name": "LoadLibrary16",
+      "argCount": 1
+    },
+    {
+      "name": "LoadLibraryA",
+      "argCount": 1
+    },
+    {
+      "name": "LoadLibraryExA",
+      "argCount": 3
+    },
+    {
+      "name": "LoadLibraryExW",
+      "argCount": 3
+    },
+    {
+      "name": "LoadLibraryW",
+      "argCount": 1
+    },
+    {
+      "name": "LoadModule",
+      "argCount": 2
+    },
+    {
+      "name": "LoadPackagedLibrary",
+      "argCount": 2
+    },
+    {
+      "name": "LoadResource",
+      "argCount": 2
+    },
+    {
+      "name": "LocalAlloc",
+      "argCount": 2
+    },
+    {
+      "name": "LocalCompact",
+      "argCount": 1
+    },
+    {
+      "name": "LocaleNameToLCID",
+      "argCount": 2
+    },
+    {
+      "name": "LocalFileTimeToFileTime",
+      "argCount": 2
+    },
+    {
+      "name": "LocalFlags",
+      "argCount": 1
+    },
+    {
+      "name": "LocalFree",
+      "argCount": 1
+    },
+    {
+      "name": "LocalHandle",
+      "argCount": 1
+    },
+    {
+      "name": "LocalLock",
+      "argCount": 1
+    },
+    {
+      "name": "LocalReAlloc",
+      "argCount": 3
+    },
+    {
+      "name": "LocalShrink",
+      "argCount": 2
+    },
+    {
+      "name": "LocalSize",
+      "argCount": 1
+    },
+    {
+      "name": "LocalUnlock",
+      "argCount": 1
+    },
+    {
+      "name": "LocateXStateFeature",
+      "argCount": 3
+    },
+    {
+      "name": "LockFile",
+      "argCount": 5
+    },
+    {
+      "name": "LockFileEx",
+      "argCount": 6
+    },
+    {
+      "name": "LockResource",
+      "argCount": 1
+    },
+    {
+      "name": "LogApiThkLSF",
+      "argCount": 1
+    },
+    {
+      "name": "LogApiThkSL",
+      "argCount": 1
+    },
+    {
+      "name": "LogCBThkSL",
+      "argCount": 1
+    },
+    {
+      "name": "lstrcat",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcatA",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcatW",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcmp",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcmpA",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcmpi",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcmpiA",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcmpiW",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcmpW",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcpy",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcpyA",
+      "argCount": 2
+    },
+    {
+      "name": "lstrcpyn",
+      "argCount": 3
+    },
+    {
+      "name": "lstrcpynA",
+      "argCount": 3
+    },
+    {
+      "name": "lstrcpynW",
+      "argCount": 3
+    },
+    {
+      "name": "lstrcpyW",
+      "argCount": 2
+    },
+    {
+      "name": "lstrlen",
+      "argCount": 1
+    },
+    {
+      "name": "lstrlenA",
+      "argCount": 1
+    },
+    {
+      "name": "lstrlenW",
+      "argCount": 1
+    },
+    {
+      "name": "LZClose",
+      "argCount": 1
+    },
+    {
+      "name": "LZCopy",
+      "argCount": 2
+    },
+    {
+      "name": "LZDone",
+      "argCount": 0
+    },
+    {
+      "name": "LZInit",
+      "argCount": 1
+    },
+    {
+      "name": "LZOpenFileA",
+      "argCount": 3
+    },
+    {
+      "name": "LZOpenFileW",
+      "argCount": 3
+    },
+    {
+      "name": "LZRead",
+      "argCount": 3
+    },
+    {
+      "name": "LZSeek",
+      "argCount": 3
+    },
+    {
+      "name": "LZStart",
+      "argCount": 0
+    },
+    {
+      "name": "MakeCriticalSectionGlobal",
+      "argCount": 1
+    },
+    {
+      "name": "MapHInstLS",
+      "argCount": 0
+    },
+    {
+      "name": "MapHInstLS_PN",
+      "argCount": 0
+    },
+    {
+      "name": "MapHInstSL",
+      "argCount": 0
+    },
+    {
+      "name": "MapHInstSL_PN",
+      "argCount": 0
+    },
+    {
+      "name": "MapHModuleLS",
+      "argCount": 1
+    },
+    {
+      "name": "MapHModuleSL",
+      "argCount": 1
+    },
+    {
+      "name": "MapLS",
+      "argCount": 1
+    },
+    {
+      "name": "MapSL",
+      "argCount": 1
+    },
+    {
+      "name": "MapSLFix",
+      "argCount": 1
+    },
+    {
+      "name": "MapUserPhysicalPages",
+      "argCount": 3
+    },
+    {
+      "name": "MapViewOfFile",
+      "argCount": 5
+    },
+    {
+      "name": "MapViewOfFileEx",
+      "argCount": 6
+    },
+    {
+      "name": "MapViewOfFileExNuma",
+      "argCount": 7
+    },
+    {
+      "name": "MapViewOfFileFromApp",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "Module32First",
+      "argCount": 2
+    },
+    {
+      "name": "Module32FirstW",
+      "argCount": 2
+    },
+    {
+      "name": "Module32Next",
+      "argCount": 2
+    },
+    {
+      "name": "Module32NextW",
+      "argCount": 2
+    },
+    {
+      "name": "MoveFileA",
+      "argCount": 2
+    },
+    {
+      "name": "MoveFileExA",
+      "argCount": 3
+    },
+    {
+      "name": "MoveFileExW",
+      "argCount": 3
+    },
+    {
+      "name": "MoveFileTransactedA",
+      "argCount": 6
+    },
+    {
+      "name": "MoveFileTransactedW",
+      "argCount": 6
+    },
+    {
+      "name": "MoveFileW",
+      "argCount": 2
+    },
+    {
+      "name": "MoveFileWithProgressA",
+      "argCount": 5
+    },
+    {
+      "name": "MoveFileWithProgressW",
+      "argCount": 5
+    },
+    {
+      "name": "MulDiv",
+      "argCount": 3
+    },
+    {
+      "name": "MultiByteToWideChar",
+      "argCount": 6
+    },
+    {
+      "name": "NeedCurrentDirectoryForExePathA",
+      "argCount": 1
+    },
+    {
+      "name": "NeedCurrentDirectoryForExePathW",
+      "argCount": 1
+    },
+    {
+      "name": "NormalizeString",
+      "argCount": 5
+    },
+    {
+      "name": "OpenConsoleW",
+      "argCount": 4
+    },
+    {
+      "name": "OpenEventA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenEventW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenFile",
+      "argCount": 3
+    },
+    {
+      "name": "OpenFileById",
+      "argCount": 6
+    },
+    {
+      "name": "OpenFileMappingA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenFileMappingW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenJobObjectA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenJobObjectW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenMutexA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenMutexW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenProcess",
+      "argCount": 3
+    },
+    {
+      "name": "OpenProcessToken",
+      "argCount": 3
+    },
+    {
+      "name": "OpenProfileUserMapping",
+      "argCount": 0
+    },
+    {
+      "name": "OpenSemaphoreA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenSemaphoreW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenThread",
+      "argCount": 3
+    },
+    {
+      "name": "OpenThreadToken",
+      "argCount": 4
+    },
+    {
+      "name": "OpenVxDHandle",
+      "argCount": 1
+    },
+    {
+      "name": "OpenWaitableTimerA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenWaitableTimerW",
+      "argCount": 3
+    },
+    {
+      "name": "ord_1",
+      "argCount": 0
+    },
+    {
+      "name": "ord_10",
+      "argCount": 2
+    },
+    {
+      "name": "ord_100",
+      "argCount": 3
+    },
+    {
+      "name": "ord_11",
+      "argCount": 3
+    },
+    {
+      "name": "ord_12",
+      "argCount": 2
+    },
+    {
+      "name": "ord_13",
+      "argCount": 3
+    },
+    {
+      "name": "ord_14",
+      "argCount": 4
+    },
+    {
+      "name": "ord_16",
+      "argCount": 3
+    },
+    {
+      "name": "ord_17",
+      "argCount": 0
+    },
+    {
+      "name": "ord_18",
+      "argCount": 2
+    },
+    {
+      "name": "ord_2",
+      "argCount": 0
+    },
+    {
+      "name": "ord_20",
+      "argCount": 1
+    },
+    {
+      "name": "ord_21",
+      "argCount": 1
+    },
+    {
+      "name": "ord_22",
+      "argCount": 1
+    },
+    {
+      "name": "ord_24",
+      "argCount": 2
+    },
+    {
+      "name": "ord_25",
+      "argCount": 1
+    },
+    {
+      "name": "ord_26",
+      "argCount": 1
+    },
+    {
+      "name": "ord_27",
+      "argCount": 1
+    },
+    {
+      "name": "ord_28",
+      "argCount": 1
+    },
+    {
+      "name": "ord_29",
+      "argCount": 1
+    },
+    {
+      "name": "ord_3",
+      "argCount": 0
+    },
+    {
+      "name": "ord_30",
+      "argCount": 1
+    },
+    {
+      "name": "ord_31",
+      "argCount": 1
+    },
+    {
+      "name": "ord_32",
+      "argCount": 1
+    },
+    {
+      "name": "ord_33",
+      "argCount": 0
+    },
+    {
+      "name": "ord_34",
+      "argCount": 0
+    },
+    {
+      "name": "ord_35",
+      "argCount": 1
+    },
+    {
+      "name": "ord_36",
+      "argCount": 1
+    },
+    {
+      "name": "ord_37",
+      "argCount": 2
+    },
+    {
+      "name": "ord_38",
+      "argCount": 0
+    },
+    {
+      "name": "ord_39",
+      "argCount": 0
+    },
+    {
+      "name": "ord_4",
+      "argCount": 0
+    },
+    {
+      "name": "ord_40",
+      "argCount": 0
+    },
+    {
+      "name": "ord_41",
+      "argCount": 5
+    },
+    {
+      "name": "ord_42",
+      "argCount": 1
+    },
+    {
+      "name": "ord_43",
+      "argCount": 5
+    },
+    {
+      "name": "ord_44",
+      "argCount": 1
+    },
+    {
+      "name": "ord_45",
+      "argCount": 0
+    },
+    {
+      "name": "ord_46",
+      "argCount": 5
+    },
+    {
+      "name": "ord_47",
+      "argCount": 1
+    },
+    {
+      "name": "ord_48",
+      "argCount": 1
+    },
+    {
+      "name": "ord_49",
+      "argCount": 1
+    },
+    {
+      "name": "ord_5",
+      "argCount": 0
+    },
+    {
+      "name": "ord_51",
+      "argCount": 0
+    },
+    {
+      "name": "ord_52",
+      "argCount": 0
+    },
+    {
+      "name": "ord_53",
+      "argCount": 2
+    },
+    {
+      "name": "ord_54",
+      "argCount": 2
+    },
+    {
+      "name": "ord_55",
+      "argCount": 5
+    },
+    {
+      "name": "ord_56",
+      "argCount": 3
+    },
+    {
+      "name": "ord_57",
+      "argCount": 2
+    },
+    {
+      "name": "ord_58",
+      "argCount": 2
+    },
+    {
+      "name": "ord_59",
+      "argCount": 2
+    },
+    {
+      "name": "ord_6",
+      "argCount": 0
+    },
+    {
+      "name": "ord_60",
+      "argCount": 1
+    },
+    {
+      "name": "ord_61",
+      "argCount": 1
+    },
+    {
+      "name": "ord_62",
+      "argCount": 1
+    },
+    {
+      "name": "ord_63",
+      "argCount": 3
+    },
+    {
+      "name": "ord_64",
+      "argCount": 1
+    },
+    {
+      "name": "ord_65",
+      "argCount": 2
+    },
+    {
+      "name": "ord_66",
+      "argCount": 0
+    },
+    {
+      "name": "ord_67",
+      "argCount": 1
+    },
+    {
+      "name": "ord_68",
+      "argCount": 3
+    },
+    {
+      "name": "ord_69",
+      "argCount": 1
+    },
+    {
+      "name": "ord_7",
+      "argCount": 0
+    },
+    {
+      "name": "ord_70",
+      "argCount": 2
+    },
+    {
+      "name": "ord_72",
+      "argCount": 4
+    },
+    {
+      "name": "ord_73",
+      "argCount": 2
+    },
+    {
+      "name": "ord_74",
+      "argCount": 2
+    },
+    {
+      "name": "ord_75",
+      "argCount": 4
+    },
+    {
+      "name": "ord_76",
+      "argCount": 4
+    },
+    {
+      "name": "ord_77",
+      "argCount": 5
+    },
+    {
+      "name": "ord_78",
+      "argCount": 3
+    },
+    {
+      "name": "ord_79",
+      "argCount": 3
+    },
+    {
+      "name": "ord_8",
+      "argCount": 0
+    },
+    {
+      "name": "ord_80",
+      "argCount": 3
+    },
+    {
+      "name": "ord_81",
+      "argCount": 3
+    },
+    {
+      "name": "ord_82",
+      "argCount": 2
+    },
+    {
+      "name": "ord_83",
+      "argCount": 4
+    },
+    {
+      "name": "ord_84",
+      "argCount": 1
+    },
+    {
+      "name": "ord_85",
+      "argCount": 1
+    },
+    {
+      "name": "ord_86",
+      "argCount": 1
+    },
+    {
+      "name": "ord_87",
+      "argCount": 0
+    },
+    {
+      "name": "ord_89",
+      "argCount": 0
+    },
+    {
+      "name": "ord_9",
+      "argCount": 0
+    },
+    {
+      "name": "ord_90",
+      "argCount": 0
+    },
+    {
+      "name": "ord_91",
+      "argCount": 1
+    },
+    {
+      "name": "ord_92",
+      "argCount": 0
+    },
+    {
+      "name": "ord_93",
+      "argCount": 1
+    },
+    {
+      "name": "ord_94",
+      "argCount": 1
+    },
+    {
+      "name": "ord_95",
+      "argCount": 1
+    },
+    {
+      "name": "ord_96",
+      "argCount": 0
+    },
+    {
+      "name": "ord_97",
+      "argCount": 1
+    },
+    {
+      "name": "ord_98",
+      "argCount": 1
+    },
+    {
+      "name": "ord_99",
+      "argCount": 1
+    },
+    {
+      "name": "OT_32ThkLSF",
+      "argCount": 0
+    },
+    {
+      "name": "OutputDebugStringA",
+      "argCount": 1
+    },
+    {
+      "name": "OutputDebugStringW",
+      "argCount": 1
+    },
+    {
+      "name": "PackageIdFromFullName",
+      "argCount": 4
+    },
+    {
+      "name": "PeekConsoleInputA",
+      "argCount": 4
+    },
+    {
+      "name": "PeekConsoleInputW",
+      "argCount": 4
+    },
+    {
+      "name": "PeekNamedPipe",
+      "argCount": 6
+    },
+    {
+      "name": "PK16FNF",
+      "argCount": 1
+    },
+    {
+      "name": "PostQueuedCompletionStatus",
+      "argCount": 4
+    },
+    {
+      "name": "PowerClearRequest",
+      "argCount": 2
+    },
+    {
+      "name": "PowerCreateRequest",
+      "argCount": 1
+    },
+    {
+      "name": "PowerSetRequest",
+      "argCount": 2
+    },
+    {
+      "name": "PrefetchVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "PrepareTape",
+      "argCount": 3
+    },
+    {
+      "name": "PrivateFreeLibrary",
+      "argCount": 1
+    },
+    {
+      "name": "PrivateLoadLibrary",
+      "argCount": 1
+    },
+    {
+      "name": "Process32First",
+      "argCount": 2
+    },
+    {
+      "name": "Process32FirstW",
+      "argCount": 2
+    },
+    {
+      "name": "Process32Next",
+      "argCount": 2
+    },
+    {
+      "name": "Process32NextW",
+      "argCount": 2
+    },
+    {
+      "name": "ProcessIdToSessionId",
+      "argCount": 2
+    },
+    {
+      "name": "PulseEvent",
+      "argCount": 1
+    },
+    {
+      "name": "PurgeComm",
+      "argCount": 2
+    },
+    {
+      "name": "QT_Thunk",
+      "argCount": 0
+    },
+    {
+      "name": "QT_ThunkPrime",
+      "argCount": 0
+    },
+    {
+      "name": "QueryActCtxSettingsW",
+      "argCount": 7
+    },
+    {
+      "name": "QueryActCtxW",
+      "argCount": 7
+    },
+    {
+      "name": "QueryDepthSList",
+      "argCount": 1
+    },
+    {
+      "name": "QueryDosDeviceA",
+      "argCount": 3
+    },
+    {
+      "name": "QueryDosDeviceW",
+      "argCount": 3
+    },
+    {
+      "name": "QueryFullProcessImageNameA",
+      "argCount": 4
+    },
+    {
+      "name": "QueryFullProcessImageNameW",
+      "argCount": 4
+    },
+    {
+      "name": "QueryIdleProcessorCycleTime",
+      "argCount": 2
+    },
+    {
+      "name": "QueryIdleProcessorCycleTimeEx",
+      "argCount": 3
+    },
+    {
+      "name": "QueryInformationJobObject",
+      "argCount": 5
+    },
+    {
+      "name": "QueryMemoryResourceNotification",
+      "argCount": 2
+    },
+    {
+      "name": "QueryPerformanceCounter",
+      "argCount": 1
+    },
+    {
+      "name": "QueryPerformanceFrequency",
+      "argCount": 1
+    },
+    {
+      "name": "QueryProcessCycleTime",
+      "argCount": 2
+    },
+    {
+      "name": "QueryThreadCycleTime",
+      "argCount": 2
+    },
+    {
+      "name": "QueryThreadpoolStackInformation",
+      "argCount": 2
+    },
+    {
+      "name": "QueryUnbiasedInterruptTime",
+      "argCount": 1
+    },
+    {
+      "name": "QueueUserAPC",
+      "argCount": 3
+    },
+    {
+      "name": "QueueUserAPC2",
+      "argCount": 4
+    },
+    {
+      "name": "QueueUserWorkItem",
+      "argCount": 3
+    },
+    {
+      "name": "RaiseException",
+      "argCount": 4
+    },
+    {
+      "name": "RaiseFailFastException",
+      "argCount": 3
+    },
+    {
+      "name": "ReadConsoleA",
+      "argCount": 5
+    },
+    {
+      "name": "ReadConsoleInputA",
+      "argCount": 4
+    },
+    {
+      "name": "ReadConsoleInputW",
+      "argCount": 4
+    },
+    {
+      "name": "ReadConsoleOutputA",
+      "argCount": 5
+    },
+    {
+      "name": "ReadConsoleOutputAttribute",
+      "argCount": 5
+    },
+    {
+      "name": "ReadConsoleOutputCharacterA",
+      "argCount": 5
+    },
+    {
+      "name": "ReadConsoleOutputCharacterW",
+      "argCount": 5
+    },
+    {
+      "name": "ReadConsoleOutputW",
+      "argCount": 5
+    },
+    {
+      "name": "ReadConsoleW",
+      "argCount": 5
+    },
+    {
+      "name": "ReadDirectoryChangesW",
+      "argCount": 8
+    },
+    {
+      "name": "ReadFile",
+      "argCount": 5
+    },
+    {
+      "name": "ReadFileEx",
+      "argCount": 5
+    },
+    {
+      "name": "ReadFileScatter",
+      "argCount": 5
+    },
+    {
+      "name": "ReadProcessMemory",
+      "argCount": 5
+    },
+    {
+      "name": "RegCloseKey",
+      "argCount": 1
+    },
+    {
+      "name": "RegCreateKeyExA",
+      "argCount": 9
+    },
+    {
+      "name": "RegCreateKeyExW",
+      "argCount": 9
+    },
+    {
+      "name": "RegDeleteKeyExA",
+      "argCount": 4
+    },
+    {
+      "name": "RegDeleteKeyExW",
+      "argCount": 4
+    },
+    {
+      "name": "RegDeleteTreeA",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteTreeW",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteValueA",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteValueW",
+      "argCount": 2
+    },
+    {
+      "name": "RegEnumKeyExA",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumKeyExW",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumValueA",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumValueW",
+      "argCount": 8
+    },
+    {
+      "name": "RegFlushKey",
+      "argCount": 1
+    },
+    {
+      "name": "RegGetKeySecurity",
+      "argCount": 4
+    },
+    {
+      "name": "RegGetValueA",
+      "argCount": 7
+    },
+    {
+      "name": "RegGetValueW",
+      "argCount": 7
+    },
+    {
+      "name": "RegisterApplicationRecoveryCallback",
+      "argCount": 4
+    },
+    {
+      "name": "RegisterApplicationRestart",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterServiceProcess",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterWaitForInputIdle",
+      "argCount": 1
+    },
+    {
+      "name": "RegisterWaitForSingleObject",
+      "argCount": 6
+    },
+    {
+      "name": "RegisterWaitForSingleObjectEx",
+      "argCount": 5
+    },
+    {
+      "name": "RegLoadKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegLoadKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegLoadMUIStringA",
+      "argCount": 7
+    },
+    {
+      "name": "RegLoadMUIStringW",
+      "argCount": 7
+    },
+    {
+      "name": "RegNotifyChangeKeyValue",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenCurrentUser",
+      "argCount": 2
+    },
+    {
+      "name": "RegOpenKeyExA",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenKeyExW",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenUserClassesRoot",
+      "argCount": 4
+    },
+    {
+      "name": "RegQueryInfoKeyA",
+      "argCount": 12
+    },
+    {
+      "name": "RegQueryInfoKeyW",
+      "argCount": 12
+    },
+    {
+      "name": "RegQueryValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "RegQueryValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "RegRestoreKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegRestoreKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegSaveKeyExA",
+      "argCount": 4
+    },
+    {
+      "name": "RegSaveKeyExW",
+      "argCount": 4
+    },
+    {
+      "name": "RegSetKeySecurity",
+      "argCount": 3
+    },
+    {
+      "name": "RegSetValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "RegSetValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "RegUnLoadKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "RegUnLoadKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "ReinitializeCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "ReleaseActCtx",
+      "argCount": 1
+    },
+    {
+      "name": "ReleaseMutex",
+      "argCount": 1
+    },
+    {
+      "name": "ReleaseMutexWhenCallbackReturns",
+      "argCount": 2
+    },
+    {
+      "name": "ReleaseSemaphore",
+      "argCount": 3
+    },
+    {
+      "name": "ReleaseSemaphoreWhenCallbackReturns",
+      "argCount": 3
+    },
+    {
+      "name": "ReleaseSRWLockExclusive",
+      "argCount": 1
+    },
+    {
+      "name": "ReleaseSRWLockShared",
+      "argCount": 1
+    },
+    {
+      "name": "ReleaseThunkLock",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveDirectoryA",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveDirectoryTransactedA",
+      "argCount": 2
+    },
+    {
+      "name": "RemoveDirectoryTransactedW",
+      "argCount": 2
+    },
+    {
+      "name": "RemoveDirectoryW",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveDllDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveVectoredContinueHandler",
+      "argCount": 1
+    },
+    {
+      "name": "RemoveVectoredExceptionHandler",
+      "argCount": 1
+    },
+    {
+      "name": "ReOpenFile",
+      "argCount": 4
+    },
+    {
+      "name": "ReplaceFile",
+      "argCount": 6
+    },
+    {
+      "name": "ReplaceFileA",
+      "argCount": 6
+    },
+    {
+      "name": "ReplaceFileW",
+      "argCount": 6
+    },
+    {
+      "name": "RequestDeviceWakeup",
+      "argCount": 1
+    },
+    {
+      "name": "RequestWakeupLatency",
+      "argCount": 1
+    },
+    {
+      "name": "ResetEvent",
+      "argCount": 1
+    },
+    {
+      "name": "ResetWriteWatch",
+      "argCount": 2
+    },
+    {
+      "name": "ResizePseudoConsole",
+      "argCount": 2
+    },
+    {
+      "name": "ResolveDelayLoadedAPI",
+      "argCount": 6
+    },
+    {
+      "name": "ResolveLocaleName",
+      "argCount": 3
+    },
+    {
+      "name": "RestoreLastError",
+      "argCount": 1
+    },
+    {
+      "name": "RestoreThunkLock",
+      "argCount": 1
+    },
+    {
+      "name": "ResumeThread",
+      "argCount": 1
+    },
+    {
+      "name": "RtlCaptureContext",
+      "argCount": 1
+    },
+    {
+      "name": "RtlCaptureStackBackTrace",
+      "argCount": 4
+    },
+    {
+      "name": "RtlFillMemory",
+      "argCount": 3
+    },
+    {
+      "name": "RtlMoveMemory",
+      "argCount": 3
+    },
+    {
+      "name": "RtlPcToFileHeader",
+      "argCount": 2
+    },
+    {
+      "name": "RtlUnwind",
+      "argCount": 4
+    },
+    {
+      "name": "RtlZeroMemory",
+      "argCount": 2
+    },
+    {
+      "name": "ScrollConsoleScreenBufferA",
+      "argCount": 5
+    },
+    {
+      "name": "ScrollConsoleScreenBufferW",
+      "argCount": 5
+    },
+    {
+      "name": "SearchPathA",
+      "argCount": 6
+    },
+    {
+      "name": "SearchPathW",
+      "argCount": 6
+    },
+    {
+      "name": "SetCachedSigningLevel",
+      "argCount": 4
+    },
+    {
+      "name": "SetCalendarInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "SetCalendarInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "SetCommBreak",
+      "argCount": 1
+    },
+    {
+      "name": "SetCommConfig",
+      "argCount": 3
+    },
+    {
+      "name": "SetCommMask",
+      "argCount": 2
+    },
+    {
+      "name": "SetCommState",
+      "argCount": 2
+    },
+    {
+      "name": "SetCommTimeouts",
+      "argCount": 2
+    },
+    {
+      "name": "SetComputerNameA",
+      "argCount": 1
+    },
+    {
+      "name": "SetComputerNameExA",
+      "argCount": 2
+    },
+    {
+      "name": "SetComputerNameExW",
+      "argCount": 2
+    },
+    {
+      "name": "SetComputerNameW",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleActiveScreenBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleCP",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleCtrlHandler",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleCursorInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleCursorPosition",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleDisplayMode",
+      "argCount": 3
+    },
+    {
+      "name": "SetConsoleFont",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleIcon",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleInputExeNameA",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleInputExeNameW",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleKeyShortcuts",
+      "argCount": 4
+    },
+    {
+      "name": "SetConsoleMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleOutputCP",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleScreenBufferInfoEx",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleScreenBufferSize",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleTextAttribute",
+      "argCount": 2
+    },
+    {
+      "name": "SetConsoleTitleA",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleTitleW",
+      "argCount": 1
+    },
+    {
+      "name": "SetConsoleWindowInfo",
+      "argCount": 3
+    },
+    {
+      "name": "SetCPGlobal",
+      "argCount": 1
+    },
+    {
+      "name": "SetCriticalSectionSpinCount",
+      "argCount": 2
+    },
+    {
+      "name": "SetCurrentConsoleFontEx",
+      "argCount": 3
+    },
+    {
+      "name": "SetCurrentDirectoryA",
+      "argCount": 1
+    },
+    {
+      "name": "SetCurrentDirectoryW",
+      "argCount": 1
+    },
+    {
+      "name": "SetDefaultCommConfigA",
+      "argCount": 3
+    },
+    {
+      "name": "SetDefaultCommConfigW",
+      "argCount": 3
+    },
+    {
+      "name": "SetDefaultDllDirectories",
+      "argCount": 1
+    },
+    {
+      "name": "SetDllDirectoryA",
+      "argCount": 1
+    },
+    {
+      "name": "SetDllDirectoryW",
+      "argCount": 1
+    },
+    {
+      "name": "SetEndOfFile",
+      "argCount": 1
+    },
+    {
+      "name": "SetEnvironmentStringsA",
+      "argCount": 1
+    },
+    {
+      "name": "SetEnvironmentStringsW",
+      "argCount": 1
+    },
+    {
+      "name": "SetEnvironmentVariableA",
+      "argCount": 2
+    },
+    {
+      "name": "SetEnvironmentVariableW",
+      "argCount": 2
+    },
+    {
+      "name": "SetErrorMode",
+      "argCount": 1
+    },
+    {
+      "name": "SetEvent",
+      "argCount": 1
+    },
+    {
+      "name": "SetEventWhenCallbackReturns",
+      "argCount": 2
+    },
+    {
+      "name": "SetFileApisToANSI",
+      "argCount": 0
+    },
+    {
+      "name": "SetFileApisToOEM",
+      "argCount": 0
+    },
+    {
+      "name": "SetFileAttributesA",
+      "argCount": 2
+    },
+    {
+      "name": "SetFileAttributesW",
+      "argCount": 2
+    },
+    {
+      "name": "SetFileCompletionNotificationModes",
+      "argCount": 2
+    },
+    {
+      "name": "SetFileInformationByHandle",
+      "argCount": 4
+    },
+    {
+      "name": "SetFilePointer",
+      "argCount": 4
+    },
+    {
+      "name": "SetFilePointerEx",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetFileTime",
+      "argCount": 4
+    },
+    {
+      "name": "SetFileValidData",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SetFirmwareEnvironmentVariableA",
+      "argCount": 4
+    },
+    {
+      "name": "SetFirmwareEnvironmentVariableW",
+      "argCount": 4
+    },
+    {
+      "name": "SetHandleContext",
+      "argCount": 2
+    },
+    {
+      "name": "SetHandleCount",
+      "argCount": 1
+    },
+    {
+      "name": "SetHandleInformation",
+      "argCount": 3
+    },
+    {
+      "name": "SetInformationJobObject",
+      "argCount": 4
+    },
+    {
+      "name": "SetLastError",
+      "argCount": 1
+    },
+    {
+      "name": "SetLocaleInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "SetLocaleInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "SetLocalTime",
+      "argCount": 1
+    },
+    {
+      "name": "SetMailslotInfo",
+      "argCount": 2
+    },
+    {
+      "name": "SetNamedPipeHandleState",
+      "argCount": 4
+    },
+    {
+      "name": "SetPriorityClass",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessAffinityMask",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessAffinityUpdateMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessDefaultCpuSets",
+      "argCount": 3
+    },
+    {
+      "name": "SetProcessDEPPolicy",
+      "argCount": 1
+    },
+    {
+      "name": "SetProcessInformation",
+      "argCount": 4
+    },
+    {
+      "name": "SetProcessMitigationPolicy",
+      "argCount": 3
+    },
+    {
+      "name": "SetProcessPreferredUILanguages",
+      "argCount": 3
+    },
+    {
+      "name": "SetProcessPriorityBoost",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessShutdownParameters",
+      "argCount": 2
+    },
+    {
+      "name": "SetProcessWorkingSetSize",
+      "argCount": 3
+    },
+    {
+      "name": "SetProcessWorkingSetSizeEx",
+      "argCount": 4
+    },
+    {
+      "name": "SetSearchPathMode",
+      "argCount": 1
+    },
+    {
+      "name": "SetStdHandle",
+      "argCount": 2
+    },
+    {
+      "name": "SetStdHandleEx",
+      "argCount": 3
+    },
+    {
+      "name": "SetSystemFileCacheSize",
+      "argCount": 3
+    },
+    {
+      "name": "SetSystemPowerState",
+      "argCount": 2
+    },
+    {
+      "name": "SetSystemTime",
+      "argCount": 1
+    },
+    {
+      "name": "SetSystemTimeAdjustment",
+      "argCount": 2
+    },
+    {
+      "name": "SetTapeParameters",
+      "argCount": 3
+    },
+    {
+      "name": "SetTapePosition",
+      "argCount": 6
+    },
+    {
+      "name": "SetTermsrvAppInstallMode",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadAffinityMask",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadContext",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadDescription",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadErrorMode",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadExecutionState",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadGroupAffinity",
+      "argCount": 3
+    },
+    {
+      "name": "SetThreadIdealProcessor",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadIdealProcessorEx",
+      "argCount": 3
+    },
+    {
+      "name": "SetThreadInformation",
+      "argCount": 4
+    },
+    {
+      "name": "SetThreadLocale",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadpoolStackInformation",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadpoolThreadMaximum",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadpoolThreadMinimum",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadpoolTimer",
+      "argCount": 4
+    },
+    {
+      "name": "SetThreadpoolWait",
+      "argCount": 3
+    },
+    {
+      "name": "SetThreadPreferredUILanguages",
+      "argCount": 3
+    },
+    {
+      "name": "SetThreadPriority",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadPriorityBoost",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadSelectedCpuSets",
+      "argCount": 3
+    },
+    {
+      "name": "SetThreadStackGuarantee",
+      "argCount": 1
+    },
+    {
+      "name": "SetThreadToken",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "SetTimeZoneInformation",
+      "argCount": 1
+    },
+    {
+      "name": "SetUnhandledExceptionFilter",
+      "argCount": 1
+    },
+    {
+      "name": "SetupComm",
+      "argCount": 3
+    },
+    {
+      "name": "SetUserGeoID",
+      "argCount": 1
+    },
+    {
+      "name": "SetUserGeoName",
+      "argCount": 1
+    },
+    {
+      "name": "SetVolumeLabelA",
+      "argCount": 2
+    },
+    {
+      "name": "SetVolumeLabelW",
+      "argCount": 2
+    },
+    {
+      "name": "SetVolumeMountPointA",
+      "argCount": 2
+    },
+    {
+      "name": "SetVolumeMountPointW",
+      "argCount": 2
+    },
+    {
+      "name": "SetWaitableTimer",
+      "argCount": 6
+    },
+    {
+      "name": "SetWaitableTimerEx",
+      "argCount": 7
+    },
+    {
+      "name": "SetXStateFeaturesMask",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SignalObjectAndWait",
+      "argCount": 4
+    },
+    {
+      "name": "SizeofResource",
+      "argCount": 2
+    },
+    {
+      "name": "Sleep",
+      "argCount": 1
+    },
+    {
+      "name": "SleepConditionVariableCS",
+      "argCount": 3
+    },
+    {
+      "name": "SleepConditionVariableSRW",
+      "argCount": 4
+    },
+    {
+      "name": "SleepEx",
+      "argCount": 2
+    },
+    {
+      "name": "SMapLS",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_12",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_16",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_20",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_24",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_28",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_32",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_36",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_40",
+      "argCount": 0
+    },
+    {
+      "name": "SMapLS_IP_EBP_8",
+      "argCount": 0
+    },
+    {
+      "name": "SSOnBigStack",
+      "argCount": 0
+    },
+    {
+      "name": "StartThreadpoolIo",
+      "argCount": 1
+    },
+    {
+      "name": "SubmitThreadpoolWork",
+      "argCount": 1
+    },
+    {
+      "name": "SUnMapLS",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_12",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_16",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_20",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_24",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_28",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_32",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_36",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_40",
+      "argCount": 0
+    },
+    {
+      "name": "SUnMapLS_IP_EBP_8",
+      "argCount": 0
+    },
+    {
+      "name": "SuspendThread",
+      "argCount": 1
+    },
+    {
+      "name": "SwitchToFiber",
+      "argCount": 1
+    },
+    {
+      "name": "SwitchToThread",
+      "argCount": 0
+    },
+    {
+      "name": "SystemTimeToFileTime",
+      "argCount": 2
+    },
+    {
+      "name": "SystemTimeToTzSpecificLocalTime",
+      "argCount": 3
+    },
+    {
+      "name": "TerminateJobObject",
+      "argCount": 2
+    },
+    {
+      "name": "TerminateProcess",
+      "argCount": 2
+    },
+    {
+      "name": "TerminateThread",
+      "argCount": 2
+    },
+    {
+      "name": "TermsrvAppInstallMode",
+      "argCount": 0
+    },
+    {
+      "name": "Thread32First",
+      "argCount": 2
+    },
+    {
+      "name": "Thread32Next",
+      "argCount": 2
+    },
+    {
+      "name": "ThunkConnect32",
+      "argCount": 6
+    },
+    {
+      "name": "ThunkInitLS",
+      "argCount": 5
+    },
+    {
+      "name": "ThunkInitLSF",
+      "argCount": 5
+    },
+    {
+      "name": "ThunkInitSL",
+      "argCount": 5
+    },
+    {
+      "name": "timeBeginPeriod",
+      "argCount": 1
+    },
+    {
+      "name": "timeEndPeriod",
+      "argCount": 1
+    },
+    {
+      "name": "timeGetDevCaps",
+      "argCount": 2
+    },
+    {
+      "name": "timeGetSystemTime",
+      "argCount": 2
+    },
+    {
+      "name": "timeGetTime",
+      "argCount": 0
+    },
+    {
+      "name": "TlsAlloc",
+      "argCount": 0
+    },
+    {
+      "name": "TlsAllocInternal",
+      "argCount": 0
+    },
+    {
+      "name": "TlsFree",
+      "argCount": 1
+    },
+    {
+      "name": "TlsFreeInternal",
+      "argCount": 1
+    },
+    {
+      "name": "TlsGetValue",
+      "argCount": 1
+    },
+    {
+      "name": "TlsSetValue",
+      "argCount": 2
+    },
+    {
+      "name": "Toolhelp32ReadProcessMemory",
+      "argCount": 5
+    },
+    {
+      "name": "TransactNamedPipe",
+      "argCount": 7
+    },
+    {
+      "name": "TransmitCommChar",
+      "argCount": 2
+    },
+    {
+      "name": "TryAcquireSRWLockExclusive",
+      "argCount": 1
+    },
+    {
+      "name": "TryAcquireSRWLockShared",
+      "argCount": 1
+    },
+    {
+      "name": "TryEnterCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "TrySubmitThreadpoolCallback",
+      "argCount": 3
+    },
+    {
+      "name": "TzSpecificLocalTimeToSystemTime",
+      "argCount": 3
+    },
+    {
+      "name": "UnhandledExceptionFilter",
+      "argCount": 1
+    },
+    {
+      "name": "UninitializeCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "UnlockFile",
+      "argCount": 5
+    },
+    {
+      "name": "UnlockFileEx",
+      "argCount": 5
+    },
+    {
+      "name": "UnMapLS",
+      "argCount": 1
+    },
+    {
+      "name": "UnMapSLFixArray",
+      "argCount": 2
+    },
+    {
+      "name": "UnmapViewOfFile",
+      "argCount": 1
+    },
+    {
+      "name": "UnmapViewOfFileEx",
+      "argCount": 2
+    },
+    {
+      "name": "UnregisterApplicationRestart",
+      "argCount": 0
+    },
+    {
+      "name": "UnregisterWait",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterWaitEx",
+      "argCount": 2
+    },
+    {
+      "name": "UpdateProcThreadAttribute",
+      "argCount": 7
+    },
+    {
+      "name": "UpdateResourceA",
+      "argCount": 6
+    },
+    {
+      "name": "UpdateResourceW",
+      "argCount": 6
+    },
+    {
+      "name": "UTRegister",
+      "argCount": 7
+    },
+    {
+      "name": "UTUnRegister",
+      "argCount": 1
+    },
+    {
+      "name": "VerifyConsoleIoHandle",
+      "argCount": 1
+    },
+    {
+      "name": "VerifyVersionInfoA",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VerifyVersionInfoW",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "VerLanguageNameA",
+      "argCount": 3
+    },
+    {
+      "name": "VerLanguageNameW",
+      "argCount": 3
+    },
+    {
+      "name": "VerSetConditionMask",
+      "argCount": 4
+    },
+    {
+      "name": "VirtualAlloc",
+      "argCount": 4
+    },
+    {
+      "name": "VirtualAllocEx",
+      "argCount": 5
+    },
+    {
+      "name": "VirtualAllocExNuma",
+      "argCount": 6
+    },
+    {
+      "name": "VirtualFree",
+      "argCount": 3
+    },
+    {
+      "name": "VirtualFreeEx",
+      "argCount": 4
+    },
+    {
+      "name": "VirtualLock",
+      "argCount": 2
+    },
+    {
+      "name": "VirtualProtect",
+      "argCount": 4
+    },
+    {
+      "name": "VirtualProtectEx",
+      "argCount": 5
+    },
+    {
+      "name": "VirtualQuery",
+      "argCount": 3
+    },
+    {
+      "name": "VirtualQueryEx",
+      "argCount": 4
+    },
+    {
+      "name": "VirtualUnlock",
+      "argCount": 2
+    },
+    {
+      "name": "VxDCall0",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall1",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall2",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall3",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall4",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall5",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall6",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall7",
+      "argCount": 0
+    },
+    {
+      "name": "VxDCall8",
+      "argCount": 0
+    },
+    {
+      "name": "W32S_BackTo32",
+      "argCount": 0
+    },
+    {
+      "name": "WaitCommEvent",
+      "argCount": 3
+    },
+    {
+      "name": "WaitForDebugEvent",
+      "argCount": 2
+    },
+    {
+      "name": "WaitForDebugEventEx",
+      "argCount": 2
+    },
+    {
+      "name": "WaitForMultipleObjects",
+      "argCount": 4
+    },
+    {
+      "name": "WaitForMultipleObjectsEx",
+      "argCount": 5
+    },
+    {
+      "name": "WaitForSingleObject",
+      "argCount": 2
+    },
+    {
+      "name": "WaitForSingleObjectEx",
+      "argCount": 3
+    },
+    {
+      "name": "WaitForThreadpoolIoCallbacks",
+      "argCount": 2
+    },
+    {
+      "name": "WaitForThreadpoolTimerCallbacks",
+      "argCount": 2
+    },
+    {
+      "name": "WaitForThreadpoolWaitCallbacks",
+      "argCount": 2
+    },
+    {
+      "name": "WaitForThreadpoolWorkCallbacks",
+      "argCount": 2
+    },
+    {
+      "name": "WaitNamedPipeA",
+      "argCount": 2
+    },
+    {
+      "name": "WaitNamedPipeW",
+      "argCount": 2
+    },
+    {
+      "name": "WakeAllConditionVariable",
+      "argCount": 1
+    },
+    {
+      "name": "WakeConditionVariable",
+      "argCount": 1
+    },
+    {
+      "name": "WerGetFlags",
+      "argCount": 2
+    },
+    {
+      "name": "WerRegisterCustomMetadata",
+      "argCount": 2
+    },
+    {
+      "name": "WerRegisterFile",
+      "argCount": 3
+    },
+    {
+      "name": "WerRegisterMemoryBlock",
+      "argCount": 2
+    },
+    {
+      "name": "WerRegisterRuntimeExceptionModule",
+      "argCount": 2
+    },
+    {
+      "name": "WerSetFlags",
+      "argCount": 1
+    },
+    {
+      "name": "WerUnregisterCustomMetadata",
+      "argCount": 1
+    },
+    {
+      "name": "WerUnregisterFile",
+      "argCount": 1
+    },
+    {
+      "name": "WerUnregisterMemoryBlock",
+      "argCount": 1
+    },
+    {
+      "name": "WerUnregisterRuntimeExceptionModule",
+      "argCount": 2
+    },
+    {
+      "name": "WideCharToMultiByte",
+      "argCount": 8
+    },
+    {
+      "name": "Win32HandleToDosFileHandle",
+      "argCount": 1
+    },
+    {
+      "name": "WinExec",
+      "argCount": 2
+    },
+    {
+      "name": "Wow64DisableWow64FsRedirection",
+      "argCount": 1
+    },
+    {
+      "name": "Wow64EnableWow64FsRedirection",
+      "argCount": 1
+    },
+    {
+      "name": "Wow64GetThreadContext",
+      "argCount": 2
+    },
+    {
+      "name": "Wow64GetThreadSelectorEntry",
+      "argCount": 3
+    },
+    {
+      "name": "Wow64RevertWow64FsRedirection",
+      "argCount": 1
+    },
+    {
+      "name": "Wow64SetThreadContext",
+      "argCount": 2
+    },
+    {
+      "name": "WriteConsoleA",
+      "argCount": 5
+    },
+    {
+      "name": "WriteConsoleInputA",
+      "argCount": 4
+    },
+    {
+      "name": "WriteConsoleInputW",
+      "argCount": 4
+    },
+    {
+      "name": "WriteConsoleOutputA",
+      "argCount": 5
+    },
+    {
+      "name": "WriteConsoleOutputAttribute",
+      "argCount": 5
+    },
+    {
+      "name": "WriteConsoleOutputCharacterA",
+      "argCount": 5
+    },
+    {
+      "name": "WriteConsoleOutputCharacterW",
+      "argCount": 5
+    },
+    {
+      "name": "WriteConsoleOutputW",
+      "argCount": 5
+    },
+    {
+      "name": "WriteConsoleW",
+      "argCount": 5
+    },
+    {
+      "name": "WriteFile",
+      "argCount": 5
+    },
+    {
+      "name": "WriteFileEx",
+      "argCount": 5
+    },
+    {
+      "name": "WriteFileGather",
+      "argCount": 5
+    },
+    {
+      "name": "WritePrivateProfileSectionA",
+      "argCount": 3
+    },
+    {
+      "name": "WritePrivateProfileSectionW",
+      "argCount": 3
+    },
+    {
+      "name": "WritePrivateProfileStringA",
+      "argCount": 4
+    },
+    {
+      "name": "WritePrivateProfileStringW",
+      "argCount": 4
+    },
+    {
+      "name": "WritePrivateProfileStructA",
+      "argCount": 5
+    },
+    {
+      "name": "WritePrivateProfileStructW",
+      "argCount": 5
+    },
+    {
+      "name": "WriteProcessMemory",
+      "argCount": 5
+    },
+    {
+      "name": "WriteProfileSectionA",
+      "argCount": 2
+    },
+    {
+      "name": "WriteProfileSectionW",
+      "argCount": 2
+    },
+    {
+      "name": "WriteProfileStringA",
+      "argCount": 3
+    },
+    {
+      "name": "WriteProfileStringW",
+      "argCount": 3
+    },
+    {
+      "name": "WriteTapemark",
+      "argCount": 4
+    },
+    {
+      "name": "WTSGetActiveConsoleSessionId",
+      "argCount": 0
+    },
+    {
+      "name": "ZombifyActCtx",
+      "argCount": 1
+    }
+  ]
+}

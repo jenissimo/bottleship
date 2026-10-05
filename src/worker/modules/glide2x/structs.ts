@@ -3,7 +3,14 @@ import {
     GR_HWCONFIG_NUM_SST_OFFSET,
     GR_HWCONFIG_SST0_FBIREV_OFFSET,
     GR_HWCONFIG_SST0_FBRAM_OFFSET,
+    GR_HWCONFIG_SST0_NTEXELFX_OFFSET,
+    GR_HWCONFIG_SST0_SLIDETECT_OFFSET,
+    GR_HWCONFIG_SST0_TMUCONFIG_OFFSET,
     GR_HWCONFIG_SST0_TYPE_OFFSET,
+    GR_SSTTYPE_VOODOO,
+    GR_TMUCONFIG_SIZE,
+    GR_TMUCONFIG_TMURAM_OFFSET,
+    GR_TMUCONFIG_TMUREV_OFFSET,
     GR_LFBINFO_LFBPTR_OFFSET,
     GR_LFBINFO_ORIGIN_OFFSET,
     GR_LFBINFO_SIZE_OFFSET,
@@ -149,12 +156,26 @@ export class GrHwConfigurationView {
         return this;
     }
 
-    writeSingleVoodoo(fbRamMb: number, fbiRev: number): boolean {
+    /**
+     * Fill SSTs[0] as a single Voodoo board. Every field of GrVoodooConfig_t is
+     * written — a partial fill leaves the guest reading ITS OWN uninitialized memory
+     * for nTexelfx and tmuConfig[], and the answer it most often gets (zero) means
+     * "no texture units, no texture RAM", which is a board a Glide title will either
+     * refuse or drive down an untextured / multi-pass path.
+     */
+    writeSingleVoodoo(fbRamMb: number, fbiRev: number, numTmu: number, tmuRamMb: number, tmuRev: number): boolean {
         if (!this.ptr) return false;
         if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_NUM_SST_OFFSET, 1)) return false;
-        if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_SST0_TYPE_OFFSET, 0)) return false;
+        if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_SST0_TYPE_OFFSET, GR_SSTTYPE_VOODOO)) return false;
         if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_SST0_FBRAM_OFFSET, fbRamMb >>> 0)) return false;
         if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_SST0_FBIREV_OFFSET, fbiRev >>> 0)) return false;
+        if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_SST0_NTEXELFX_OFFSET, numTmu >>> 0)) return false;
+        if (!Mem.writeUint32(this.ptr + GR_HWCONFIG_SST0_SLIDETECT_OFFSET, 0)) return false;
+        for (let i = 0; i < numTmu; i++) {
+            const tmu = this.ptr + GR_HWCONFIG_SST0_TMUCONFIG_OFFSET + i * GR_TMUCONFIG_SIZE;
+            if (!Mem.writeUint32(tmu + GR_TMUCONFIG_TMUREV_OFFSET, tmuRev >>> 0)) return false;
+            if (!Mem.writeUint32(tmu + GR_TMUCONFIG_TMURAM_OFFSET, tmuRamMb >>> 0)) return false;
+        }
         return true;
     }
 }

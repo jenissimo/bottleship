@@ -6,7 +6,9 @@
  *   bun tools/wgb.ts list     <archive.wgb>                        — list all entries
  *   bun tools/wgb.ts cat      <archive.wgb> <entry>                — print entry to stdout
  *   bun tools/wgb.ts extract  <archive.wgb> <entry> <output-path>  — extract entry to file
+ *   bun tools/wgb.ts extract-dir <archive.wgb> <prefix> <out-dir>   — extract a whole tree in one pass
  *   bun tools/wgb.ts replace  <archive.wgb> <entry> <input-path>   — replace entry from file
+ *   bun tools/wgb.ts add-dir  <archive.wgb> <prefix> <local-dir>   — add/overwrite a tree in one rewrite
  *   bun tools/wgb.ts manifest <archive.wgb>                        — pretty-print manifest.json
  *   bun tools/wgb.ts set-manifest <archive.wgb> <manifest.json>    — replace manifest from file
  *   bun tools/wgb.ts patch-manifest <archive.wgb> <json-path> <value> — set a single JSON path
@@ -22,18 +24,14 @@
  * to unsigned integer" — a >2GB Buffer length overflow).
  */
 
-import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync } from "fs";
+import { openSync, readSync, writeSync, closeSync, fstatSync, renameSync, unlinkSync, readdirSync, mkdirSync } from "fs";
+import { join, dirname } from "path";
 import { inflateRawSync } from "zlib";
-
-// ─── ZIP signatures ──────────────────────────────────────────────────────────
-const LFH_SIG = 0x04034b50;
-const CDH_SIG = 0x02014b50;
-const EOCD_SIG = 0x06054b50;
-const EOCD64_SIG = 0x06064b50;
-const EOCD64_LOC_SIG = 0x07064b50;
-const U32_MAX = 0xffffffff;
-const U16_MAX = 0xffff;
-const COPY_CHUNK = 16 * 1024 * 1024; // 16 MB streamed copy (bounded RAM)
+import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
+import {
+    crc32, lfhFor, cdhFor, type OutEntry,
+    LFH_SIG, CDH_SIG, EOCD_SIG, EOCD64_SIG, EOCD64_LOC_SIG, U32_MAX, U16_MAX, COPY_CHUNK,
+} from "./internal/zip-store-writer";
 
 // ─── Ranged file I/O (64-bit safe; never loads the whole file) ───────────────
 
@@ -176,77 +174,6 @@ function streamStoreData(fd: number, e: ZipEntry, sink: (chunk: Buffer) => void)
     }
 }
 
-function crc32(data: Buffer): number {
-    const table = crc32.table ?? (crc32.table = (() => {
-        const t = new Uint32Array(256);
-        for (let i = 0; i < 256; i++) {
-            let c = i;
-            for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
-            t[i] = c;
-        }
-        return t;
-    })());
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i++) crc = table[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
-    return (crc ^ 0xffffffff) >>> 0;
-}
-namespace crc32 { export let table: Uint32Array | undefined; }
-
-// ─── Streaming Store-only writer (ZIP64 when offsets/sizes exceed 32 bits) ───
-
-interface OutEntry { nameBuf: Buffer; size: number; crc: number; offset: number }
-
-function lfhFor(nameBuf: Buffer, size: number, crc: number): Buffer {
-    const needsZip64 = size > U32_MAX;
-    const extra = needsZip64 ? 20 : 0; // ZIP64 extra: header(4) + uncompressed(8) + compressed(8)
-    const lfh = Buffer.alloc(30 + nameBuf.length + extra);
-    lfh.writeUInt32LE(LFH_SIG, 0);
-    lfh.writeUInt16LE(needsZip64 ? 45 : 20, 4); // version needed (4.5 for ZIP64)
-    lfh.writeUInt16LE(0, 8);                      // Store
-    lfh.writeUInt32LE(crc, 14);
-    lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 18); // compressed
-    lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 22); // uncompressed
-    lfh.writeUInt16LE(nameBuf.length, 26);
-    lfh.writeUInt16LE(extra, 28);
-    nameBuf.copy(lfh, 30);
-    if (needsZip64) {
-        const e = 30 + nameBuf.length;
-        lfh.writeUInt16LE(0x0001, e);
-        lfh.writeUInt16LE(16, e + 2);
-        lfh.writeBigUInt64LE(BigInt(size), e + 4);
-        lfh.writeBigUInt64LE(BigInt(size), e + 12);
-    }
-    return lfh;
-}
-
-function cdhFor(e: OutEntry): Buffer {
-    const bigSize = e.size > U32_MAX;
-    const bigOff = e.offset > U32_MAX;
-    const zFields = (bigSize ? 16 : 0) + (bigOff ? 8 : 0);
-    const extra = zFields ? 4 + zFields : 0;
-    const cdh = Buffer.alloc(46 + e.nameBuf.length + extra);
-    cdh.writeUInt32LE(CDH_SIG, 0);
-    cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 4); // version made by
-    cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 6); // version needed
-    cdh.writeUInt16LE(0, 10); // Store
-    cdh.writeUInt32LE(e.crc, 16);
-    cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 20); // compressed
-    cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 24); // uncompressed
-    cdh.writeUInt16LE(e.nameBuf.length, 28);
-    cdh.writeUInt16LE(extra, 30);
-    cdh.writeUInt32LE(bigOff ? U32_MAX : e.offset, 42);
-    e.nameBuf.copy(cdh, 46);
-    if (extra) {
-        let p = 46 + e.nameBuf.length;
-        cdh.writeUInt16LE(0x0001, p);
-        cdh.writeUInt16LE(zFields, p + 2);
-        p += 4;
-        if (bigSize) { cdh.writeBigUInt64LE(BigInt(e.size), p); cdh.writeBigUInt64LE(BigInt(e.size), p + 8); p += 16; }
-        if (bigOff) { cdh.writeBigUInt64LE(BigInt(e.offset), p); p += 8; }
-    }
-    return cdh;
-}
-
 /**
  * Rebuild the archive as Store-only, streaming to a temp file then renaming over the source.
  * `dataFor(name)` returns an override Buffer for an entry, or null to copy the existing data.
@@ -380,6 +307,50 @@ function cmdExtract(wgbPath: string, entryName: string, outputPath: string) {
     });
 }
 
+/**
+ * Extract every entry under `prefix` in ONE pass over the central directory. The
+ * per-entry `extract` is a whole process launch per entry, for what is a single sequential
+ * read here.
+ */
+function cmdExtractDir(wgbPath: string, prefix: string, outDir: string) {
+    const norm = prefix.replace(/\\/g, "/").replace(/\/+$/, "");
+    withArchive(wgbPath, (fd, _size, entries) => {
+        let count = 0, bytes = 0, rejected = 0;
+        const warned = new Set<string>();
+        for (const entry of entries) {
+            if (norm && entry.name !== norm && !entry.name.startsWith(norm + "/")) continue;
+            // Strip EVERY separator the prefix left behind: `rom//a` would otherwise become
+            // "/a" and be refused as an absolute path for a spelling that is merely Unix.
+            const rel = !norm ? entry.name
+                : entry.name === norm ? norm.slice(norm.lastIndexOf("/") + 1)   // the prefix names a file
+                : entry.name.slice(norm.length).replace(/^\/+/, "");
+            const resolved = tryResolveArchiveExtractPath(outDir, rel);
+            // One bad name must not abandon the other entries; the directory entry that
+            // IS the prefix has nothing to write and is not worth a line.
+            if (!resolved.ok) {
+                if (resolved.reason === "empty") continue;
+                rejected++;
+                if (!warned.has(resolved.reason)) {
+                    warned.add(resolved.reason);
+                    console.warn(`  skipping entries rejected as ${resolved.reason} (first: ${entry.name})`);
+                }
+                continue;
+            }
+            const outPath = resolved.path;
+            if (entry.name.endsWith("/")) { mkdirSync(outPath, { recursive: true }); continue; }
+            mkdirSync(dirname(outPath), { recursive: true });
+            const outFd = openSync(outPath, "w");
+            try {
+                if (entry.compression === 0) streamStoreData(fd, entry, (c) => writeSync(outFd, c, 0, c.length));
+                else { const d = readEntryData(fd, entry); writeSync(outFd, d, 0, d.length); }
+            } finally { closeSync(outFd); }
+            count++; bytes += entry.size;
+        }
+        console.log(`Extracted ${count} entries (${bytes} bytes) under "${norm}" -> ${outDir}`
+            + (rejected ? `, ${rejected} rejected` : ""));
+    });
+}
+
 /** Rebuild `wgbPath` with `entryName` replaced/added by `newData`, streaming via a temp file. */
 function writeOverride(wgbPath: string, entryName: string, newData: Buffer, outputPath?: string, label = "Replaced") {
     const dest = outputPath ?? wgbPath;
@@ -398,6 +369,40 @@ function cmdReplace(wgbPath: string, entryName: string, inputPath: string, outpu
     let newData: Buffer;
     try { newData = readRange(ifd, 0, fstatSync(ifd).size); } finally { closeSync(ifd); }
     writeOverride(wgbPath, entryName, newData, outputPath);
+}
+
+/**
+ * Add every file under `localDir` to the archive as `<entryPrefix>/<relative path>`, in ONE
+ * rewrite. One-at-a-time `replace` would copy a multi-GB bundle once per file, which for a
+ * shader cache (hundreds of small entries) is the difference between minutes and hours.
+ * An entry that already exists is overwritten in place, so re-baking is idempotent.
+ */
+function cmdAddDir(wgbPath: string, entryPrefix: string, localDir: string) {
+    const prefix = entryPrefix.replace(/[/]+$/, "");
+    const files: { name: string; data: Buffer }[] = [];
+    const walk = (dir: string, rel: string) => {
+        for (const de of readdirSync(dir, { withFileTypes: true })) {
+            const child = `${dir}/${de.name}`;
+            const childRel = rel ? `${rel}/${de.name}` : de.name;
+            if (de.isDirectory()) { walk(child, childRel); continue; }
+            const fd = openSync(child, "r");
+            try { files.push({ name: `${prefix}/${childRel}`, data: readRange(fd, 0, fstatSync(fd).size) }); }
+            finally { closeSync(fd); }
+        }
+    };
+    walk(localDir, "");
+    if (files.length === 0) { console.error(`No files under ${localDir}`); process.exit(1); }
+
+    const tmp = `${wgbPath}.wgbtmp`;
+    const result = withArchive(wgbPath, (fd, _size, entries) => {
+        const byName = new Map(files.map(f => [f.name, f.data]));
+        const existing = new Set(entries.map(e => e.name));
+        const extra = files.filter(f => !existing.has(f.name));
+        return rebuildStreaming(fd, entries, tmp, (n) => byName.get(n) ?? null, extra);
+    });
+    renameSync(tmp, wgbPath);
+    const bytes = files.reduce((n, f) => n + f.data.length, 0);
+    console.log(`Added ${files.length} file(s) under ${prefix}/ (${bytes} bytes) -> ${wgbPath} [${result.entries} entries, ${result.bytes} bytes]`);
 }
 
 function cmdManifest(wgbPath: string) {
@@ -454,7 +459,17 @@ function cmdPatchManifest(wgbPath: string, jsonPath: string, valueStr: string) {
     });
 
     let value: unknown;
-    try { value = JSON.parse(valueStr); } catch { value = valueStr; }
+    try { value = JSON.parse(valueStr); } catch {
+        // Looks like JSON but doesn't parse — almost always shell quoting mangling
+        // (e.g. Git Bash on Windows collapsing \\ in argv). Storing it as a raw
+        // string would silently break array/object manifest fields at load time.
+        if (/^[[{"]/.test(valueStr.trim())) {
+            console.error(`Value looks like JSON but failed to parse: ${valueStr}\n` +
+                `Fix the shell quoting (tip: use forward slashes in paths) or pass a plain string.`);
+            process.exit(1);
+        }
+        value = valueStr;
+    }
 
     const keys = jsonPath.split(".");
     let obj = manifest;
@@ -477,6 +492,8 @@ Usage:
   bun tools/wgb.ts cat           <archive.wgb> <entry>
   bun tools/wgb.ts extract       <archive.wgb> <entry> <output>
   bun tools/wgb.ts replace       <archive.wgb> <entry> <input> [output]
+  bun tools/wgb.ts extract-dir   <archive.wgb> <prefix> <out-dir>          — extract a whole tree in one pass
+  bun tools/wgb.ts add-dir       <archive.wgb> <entry-prefix> <local-dir>  — add/overwrite a whole tree in one rewrite
   bun tools/wgb.ts repack        <archive.wgb>                    — rewrite as Store-only (decompress Deflate entries)
   bun tools/wgb.ts manifest      <archive.wgb>
   bun tools/wgb.ts set-manifest  <archive.wgb> <manifest.json>
@@ -502,9 +519,18 @@ switch (cmd) {
         if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts extract <archive> <entry> <output>"); process.exit(1); }
         cmdExtract(args[0], args[1], args[2]);
         break;
+    case "extract-dir":
+    case "xd":
+        if (!args[0] || args[1] === undefined || !args[2]) { console.error("Usage: wgb.ts extract-dir <archive> <prefix> <out-dir>"); process.exit(1); }
+        cmdExtractDir(args[0], args[1], args[2]);
+        break;
     case "replace":
         if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts replace <archive> <entry> <input> [output]"); process.exit(1); }
         cmdReplace(args[0], args[1], args[2], args[3]);
+        break;
+    case "add-dir":
+        if (!args[0] || !args[1] || !args[2]) { console.error("Usage: wgb.ts add-dir <archive> <entry-prefix> <local-dir>"); process.exit(1); }
+        cmdAddDir(args[0], args[1], args[2]);
         break;
     case "repack":
         if (!args[0]) { console.error("Usage: wgb.ts repack <archive>"); process.exit(1); }

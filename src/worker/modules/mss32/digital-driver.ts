@@ -28,6 +28,30 @@ export function createDigitalDriverExports(ctx: MSSContext): Record<string, Thun
         return driverHandle;
     };
 
+    /**
+     * _AIL_open_digital_driver@16 — MSS 6.x: (frequency, bits, channels, flags) -> HDIGDRIVER.
+     *
+     * A separate export, not a spelling of the @4 one: that variant takes a single
+     * HDIGDRIVER* out-parameter, so serving a @16 call with it reads the sample RATE as a
+     * pointer and writes the handle into low guest memory. The rate the app asks for is
+     * also the rate its samples are mixed against, so it is recorded here rather than
+     * discarded.
+     */
+    exports["_AIL_open_digital_driver@16"] = (ctxThunk, mem, args) => {
+        const frequency = args[0] >>> 0;
+        const bits = args[1] | 0;
+        const channels = args[2] | 0;
+        const flags = args[3] >>> 0;
+        if (frequency >= 8000 && frequency <= 192000) {
+            ctx.driverOutputRate = frequency;
+        }
+        const driverHandle = ensureDriverHandle(ctx, mem);
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_open_digital_driver@16(${frequency}Hz, ${bits}-bit, ${channels}ch, flags=0x${flags.toString(16)})`
+            + ` -> 0x${driverHandle.toString(16)}`);
+        return driverHandle;
+    };
+
     // _AIL_close_digital_driver@4
     exports["_AIL_close_digital_driver@4"] = (ctxThunk, mem, args) => {
         const dig = args[0];

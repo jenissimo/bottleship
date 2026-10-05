@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SessionWorker } from './session-worker';
+import { ChildSessionSurface } from './child-session-surface';
 import { cx } from "../ui/cx";
 import s from "./App.module.css";
 import OpfsTool from '../debug/OpfsTool';
+import WgbBrowser from '../debug/WgbBrowser';
 import StorageManagerModal from '../storage/StorageManagerModal';
 import RegistryTool from '../debug/RegistryTool';
 import DebugLogViewer from '../debug/DebugLogViewer';
@@ -11,7 +14,9 @@ import DebugGPUPanel from '../debug/DebugGPUPanel';
 import FrameAnalysisPanel from '../debug/FrameAnalysisPanel';
 import { InputStatusOverlay, type InputStatus } from './InputStatusOverlay';
 import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayload } from "../audio/audio-engine";
-import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile } from "../utils/log-client";
+import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile, logArtifactPath } from "../utils/log-client";
+import { bundleLogName } from "../utils/bundle-url";
+import { sessionFromLocation } from "../harness/session";
 import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
@@ -27,18 +32,44 @@ import ManifestEditorModal from "../wizard/ManifestEditorModal";
 import { listAddedGames, removeAddedGame, type AddedGame } from "../wgb-library";
 import { ensurePersistentStorageRequested } from "../storage-manager";
 import { loadGamesCatalog } from "../games-catalog";
-import { DEFAULT_QUALITY, mergeQuality } from "../worker/core/quality-config";
+import { browserPolicyBlock, loadDeploymentConfig } from "../deployment-config";
+import { DEFAULT_QUALITY, mergeQuality, parseStoredQuality, serializeStoredQuality } from "../worker/core/quality-config";
 import type { QualityConfig } from "../worker/core/quality-config";
+import {
+  clientToGuestPoint,
+  contentRectFromPresentRect,
+  type HostRect,
+  type PublishedPresentRect,
+} from "../worker/backends/webgpu/shared/present-geometry";
 import {
   DEFAULT_UI_SETTINGS,
   UI_SETTINGS_STORAGE_KEY,
   loadUiSettings,
 } from "../ui-settings";
 import type {
-  MouseCoordinateMode,
   PresentMode,
   UiSettings,
 } from "../ui-settings";
+import { INPUT_BUFFER_SIZE, INPUT_INDEX } from "../input/sab-layout";
+import { GuestCursorRenderer } from "./guest-cursor";
+import { inputDevice } from "../input/virtual-device";
+import { relativeIntent } from "../input/relative-intent";
+import { HostPointerTrack } from "../input/host-pointer-track";
+import { touchDriver } from "../input/touch/driver";
+import { TouchControlLayer, type TouchControlsHandle } from "./TouchControlLayer";
+import { TouchHud } from "./TouchHud";
+import { VirtualKeyboardSheet } from "./VirtualKeyboardSheet";
+import { useActiveLayout, type ManifestTouch } from "../input/controls/use-active-layout";
+import {
+  detectCoarsePrimary, shouldShowTouchHud, shouldShowTouchUi, type PointerKind,
+} from "../input/touch-ui-visibility";
+import {
+  getPointerKind, installPointerKindWatcher, kindOfPointerType, notePointerKind,
+  subscribePointerKind,
+} from "../input/pointer-kind";
+import { setHapticsEnabled } from "../input/haptics";
+import { TouchFirstRunHint } from "./TouchFirstRunHint";
+import type { HostAction } from "../input/bindings";
 
 async function writeOpfsFile(dir: FileSystemDirectoryHandle, name: string, blob: Blob): Promise<void> {
   const handle = await dir.getFileHandle(name, { create: true });
@@ -76,32 +107,6 @@ async function stageFilesAndLaunch(files: File[]): Promise<void> {
   window.location.assign(`?game=dev&ingest=1`);
 }
 
-const INPUT_BUFFER_SIZE = 1024;
-const INPUT_INDEX = {
-  seq: 0,
-  mouseX: 1,
-  mouseY: 2,
-  buttons: 3,
-  keyCode: 4,
-  keyState: 5,
-  gamepadConnected: 6,
-  gamepadButtons: 7,
-  gamepadAxis0: 8,
-  gamepadAxis1: 9,
-  gamepadAxis2: 10,
-  gamepadAxis3: 11,
-  mouseWheel: 12,
-  mouseInside: 13,  // 1 = cursor inside canvas, 0 = outside
-  dinputDX: 14,     // accumulated DInput raw movementX delta (Atomics.add / exchange)
-  dinputDY: 15,     // accumulated DInput raw movementY delta
-  // 16..23 reserved for the keyboard bitfield (KEY_BITFIELD_BASE)
-  guestGamepadSeq: 24  // worker bumps when the GAME reads the joystick/gamepad API
-} as const;
-
-// Keyboard bitfield: 256 virtual keys as 8 x Int32 = 256 bits
-const KEY_BITFIELD_BASE = 16;
-const KEY_BITFIELD_COUNT = 8;
-
 type WorkerStatus = "idle" | "ready" | "error";
 
 // CrashFault + formatGuestReport (the crash/exit report machinery) live in
@@ -121,6 +126,11 @@ type InputSample = {
   gamepadAxis2: number;
   gamepadAxis3: number;
   mouseWheel: number;
+  /** DirectInput device deltas contributed by this event. Absent in older recordings;
+   *  without them a relative-mouse title (pointer-locked, absolute slots frozen)
+   *  replays as a session where nothing moved. */
+  dinputDX?: number;
+  dinputDY?: number;
 };
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -142,12 +152,9 @@ const QUALITY_STORAGE_KEY = "bottleship.quality";
 function loadQuality(): QualityConfig {
   if (typeof window === "undefined") return { ...DEFAULT_QUALITY };
   try {
-    const raw = localStorage.getItem(QUALITY_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_QUALITY };
-    const parsed = JSON.parse(raw) as Partial<QualityConfig>;
-    // mergeQuality clamps/snaps every field onto DEFAULT_QUALITY → tolerant of stale/partial data.
-    return mergeQuality(DEFAULT_QUALITY, parsed);
+    return parseStoredQuality(localStorage.getItem(QUALITY_STORAGE_KEY));
   } catch {
+    // ignore localStorage errors in restricted contexts
     return { ...DEFAULT_QUALITY };
   }
 }
@@ -156,6 +163,17 @@ function loadQuality(): QualityConfig {
 // gate) live in ./browser-support.ts.
 
 // Persistent state outside the component scope to survive re-mounts
+/** sessionStorage key holding a pending self re-exec across the page reload it triggers. */
+const REEXEC_KEY = "bs_pending_reexec";
+/** sessionStorage key holding a bundle the dev browser asked us to open after a reload.
+ *  Separate from REEXEC_KEY on purpose: that one also replaces the manifest's boot args,
+ *  and an empty args string is not the same as "boot this bundle normally". */
+const PENDING_BUNDLE_KEY = "bs_pending_bundle";
+/** Chrome refuses requestPointerLock for ~1.25 s after a user-initiated exit; retries
+ *  inside that window are silently rejected, so gate them rather than burn the gesture. */
+const POINTER_LOCK_EXIT_COOLDOWN_MS = 1300;
+/** Bundle URL a pending re-exec must re-open once window.loadApp exists (dev/harness boots). */
+let reExecBundleUrl: string | null = null;
 let globalWorker: Worker | null = null;
 let globalSab: SharedArrayBuffer | null = null;
 let globalInputView: Int32Array | null = null;
@@ -168,36 +186,30 @@ let isRecording = false;
 let recordStart = 0;
 let recordedInputs: InputSample[] = [];
 
-// Track currently pressed keys as a Set; serialized to bitfield in SharedArrayBuffer
-const pressedKeys = new Set<number>();
-
-function syncKeyBitfield(inputView: Int32Array): void {
-    for (let word = 0; word < KEY_BITFIELD_COUNT; word++) {
-        let bits = 0;
-        const base = word * 32;
-        for (const vk of pressedKeys) {
-            if (vk >= base && vk < base + 32) bits |= (1 << (vk - base));
-        }
-        inputView[KEY_BITFIELD_BASE + word] = bits;
-    }
-}
-
-// --- SAB input seqlock (writer side) ---------------------------------------
-// The input record spans many Int32 slots but is published via the single `seq`
-// counter. Plain payload writes with only a trailing Atomics bump let the worker
-// reader observe a HALF-updated record (torn read). Bracket every payload update
-// in a seqlock: bump seq to ODD before touching payload (writer-in-progress),
-// write the payload slots, then bump seq to EVEN to publish. Atomics.add is a
-// sequentially-consistent RMW, so it fences the plain payload stores between the
-// two markers; the reader's paired Atomics.load(seq) acquire sees either an odd
-// value (retry/skip) or a stable even snapshot. seq stays even between updates,
-// so the reader's "changed since lastSeq" gate is unaffected (each update = +2).
-// Zero-alloc, hot-path cheap: two atomic increments per input event.
-function beginInputWrite(inputView: Int32Array): void {
-    Atomics.add(inputView, INPUT_INDEX.seq, 1); // even -> odd: writer in progress
-}
-function endInputWrite(inputView: Int32Array): void {
-    Atomics.add(inputView, INPUT_INDEX.seq, 1); // odd -> even: publish (release)
+/** Capture the published record for playRecording(). No-op unless recording.
+ *  dinputDX/DY are the deltas this event ADDED to the accumulators, not their running
+ *  total — the slots are monotonic counters the worker never drains. */
+function recordSample(
+    inputView: Int32Array, keyCode = 0, keyState = 0, dinputDX = 0, dinputDY = 0,
+): void {
+    if (!isRecording) return;
+    recordedInputs.push({
+        t: performance.now() - recordStart,
+        dinputDX,
+        dinputDY,
+        mouseX: inputView[INPUT_INDEX.mouseX],
+        mouseY: inputView[INPUT_INDEX.mouseY],
+        buttons: inputView[INPUT_INDEX.buttons],
+        keyCode,
+        keyState,
+        gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
+        gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
+        gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
+        gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
+        gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
+        gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
+        mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
+    });
 }
 
 // Win32 MessageBox button tables + the dev-mode modal live in ./MessageBoxModal.tsx.
@@ -230,6 +242,7 @@ function loadPhaseStatus(phase: string, gameName: string): string {
   }
 }
 
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -238,25 +251,19 @@ export default function App() {
     padLabel: null,
     guestActive: false,
   });
-  const handleDroppedFiles = useCallback((fileList: FileList | File[]) => {
-    const files = Array.from(fileList);
-    if (files.length === 0 || !globalWorker) return;
-    ensurePersistentStorageRequested();
-    canvasRef.current?.focus();
-    setIsLoadingApp(true);
-    setErrorMessage(null);
-    setBundleDisplayName(null);
-    setLoadingProgress({ phase: "loading", percent: 0, label: "" });
-    // One file → blob sniff path; several (setup.exe + setup-*.bin) → multi-part install.
-    globalWorker.postMessage(
-      files.length === 1
-        ? { type: "load_bundle", blob: files[0] }
-        : { type: "load_bundle", blobs: files },
-    );
-  }, []);
   const canvasRectRef = useRef<DOMRect | null>(null);
-  const cursorVisibleRef = useRef(true);
+  /** canvasRectRef narrowed to the presented picture (see toContentRect). The ONE rect every
+   *  host<->guest mapping uses; canvasRectRef stays the element's own box. */
+  const contentRectRef = useRef<HostRect | null>(null);
+  // The cursor element is positioned inside the panel, so its transforms are relative
+  // to this rect; cached alongside the canvas rect and invalidated by the same events.
+  const panelRectRef = useRef<DOMRect | null>(null);
+  const cursorCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const isCanvasHoveredRef = useRef(false);
+  /** Hit-tested against the canvas rect — the one input to whether we draw the pointer. */
+  const isPointerOverCanvasRef = useRef(false);
+  /** Sprite position of a SOFTWARE D3D device cursor; null = draw at the pointer. */
+  const deviceCursorPosRef = useRef<{ x: number; y: number } | null>(null);
   const [gamesCatalog, setGamesCatalog] = useState<GameEntry[] | null>(null);
   useEffect(() => {
     loadGamesCatalog().then(setGamesCatalog);
@@ -268,6 +275,15 @@ export default function App() {
   // is driven by one signal and a fresh load clears it. `crashed` distinguishes a
   // clean exit from an unhandled access violation (fault carries EIP/addr).
   const [exitInfo, setExitInfo] = useState<GuestExitInfo | null>(null);
+  // A load that DIED still has progress messages in flight behind the exit — a PE link
+  // failure reports the crash and the loader then posts its trailing "done". Read
+  // synchronously in the message handler (state lags a tick), so the dead load cannot
+  // raise the boot overlay back over the crash dialog.
+  // Mirrored in an effect, never during render: a render pass can be started, thrown away
+  // and replayed (StrictMode, a concurrent update), and a replay carrying the pre-crash
+  // snapshot would write `null` back over a ref the message handler has already set.
+  const exitInfoRef = useRef<GuestExitInfo | null>(null);
+  useEffect(() => { exitInfoRef.current = exitInfo; }, [exitInfo]);
   const [isBufferInitialized, setIsBufferInitialized] = useState(false);
   const [isLoadingApp, setIsLoadingApp] = useState(false);
   // Unified launch overlay model, covering the WHOLE journey click → first flip:
@@ -281,12 +297,57 @@ export default function App() {
   /** Display name from the loaded WGB manifest (title || name). Used so ?game=dev&load=…
    *  doesn't keep saying "Dev" / "Starting Dev" once the bundle is known. */
   const [bundleDisplayName, setBundleDisplayName] = useState<string | null>(null);
+  const [hasImportedBundle, setHasImportedBundle] = useState(false);
+  const userImportPendingRef = useRef(false);
+  const installerInputRef = useRef<HTMLInputElement>(null);
+  const handleDroppedFiles = useCallback((fileList: FileList | File[]) => {
+    const files = Array.from(fileList);
+    if (files.length === 0 || !globalWorker) return;
+    userImportPendingRef.current = true;
+    ensurePersistentStorageRequested();
+    canvasRef.current?.focus();
+    setIsLoadingApp(true);
+    setErrorMessage(null);
+    setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+    exitInfoRef.current = null;
+    setBundleDisplayName(null);
+    setLoadingProgress({ phase: "loading", percent: 0, label: "" });
+    // One file uses the blob sniff path; several files use multi-part install.
+    globalWorker.postMessage(
+      files.length === 1
+        ? { type: "load_bundle", blob: files[0] }
+        : { type: "load_bundle", blobs: files },
+    );
+  }, []);
   const loadingFadeTimerRef = useRef<number | null>(null);
   const [addGameOpen, setAddGameOpen] = useState(false);
   const [addedGames, setAddedGames] = useState<AddedGame[]>([]);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [opfsToolOpen, setOpfsToolOpen] = useState(false);
+  const [wgbBrowserOpen, setWgbBrowserOpen] = useState(false);
   const [storageOpen, setStorageOpen] = useState(false);
+  /** Chrome-free presentation where the Fullscreen API does not exist (iPhone Safari). */
+  const [immersive, setImmersive] = useState(false);
+  const [oskOpen, setOskOpen] = useState(false);
+  const [controlsHidden, setControlsHidden] = useState(false);
+  /** What last drove the app — decides whether the touch UI belongs on screen.
+   *  Seeded from the app-global latch, which the library screen has already been
+   *  feeding: by the time a game mounts, the launch tap is in. */
+  const [lastPointerKind, setLastPointerKind] = useState<PointerKind | null>(getPointerKind);
+  const [coarsePrimary] = useState(detectCoarsePrimary);
+  /** Manifest gameId — the per-game key for a saved control layout. */
+  const [gameId, setGameId] = useState<string | null>(null);
+  const [manifestTouch, setManifestTouch] = useState<ManifestTouch | null>(null);
+  const touchControlsRef = useRef<TouchControlsHandle | null>(null);
+  /** Guest pixels per CSS pixel — the widget layer scales relative motion by it. */
+  const guestPerCss = useCallback(() => {
+    const rect = contentRectRef.current;
+    const space = guestResolutionKnownRef.current
+      ? guestResolutionRef.current
+      : resolutionRef.current;
+    if (!rect || rect.width <= 0 || rect.height <= 0) return { x: 1, y: 1 };
+    return { x: space.width / rect.width, y: space.height / rect.height };
+  }, []);
   const [mainSettingsOpen, setMainSettingsOpen] = useState(false);
   const [registryToolOpen, setRegistryToolOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
@@ -296,13 +357,50 @@ export default function App() {
   const [frameAnalysisOpen, setFrameAnalysisOpen] = useState(false);
   const [statsOverlayEnabled, setStatsOverlayEnabled] = useState(false);
   const [fpuStrictEnabled, setFpuStrictEnabled] = useState(false);
+  // AOT code cache (docs/performance/sota-roadmap/05-A0-play-and-record.md). Recording is a
+  // two-step ritual whose failure mode is silent — a `stop` that never ran keeps nothing —
+  // so the panel shows the state rather than expecting it to be remembered.
+  const [aotRecording, setAotRecording] = useState(false);
+  const [aotAutoLoad, setAotAutoLoad] = useState(true);
+  const [aotStatus, setAotStatus] = useState<string>("");
   const [messageBox, setMessageBox] = useState<MessageBoxRequest | null>(null);
+
+  // Publish a dismisser for the prompt that is on screen. The harness's auto-answer is
+  // consulted once, BEFORE render, so a script that wants the prompt as a pause point
+  // (stop here, arm logging, continue) has nothing to answer it with afterwards.
+  useEffect(() => {
+    const harness = (window as any).__BS__?.harness;
+    if (!harness?.setLiveModal) return;
+    if (!messageBox) { harness.setLiveModal(null); return; }
+    harness.setLiveModal(
+      (result: number) => {
+        messageBox.worker.postMessage({ type: "message_box_result", id: messageBox.id, result });
+        setMessageBox(null);
+      },
+      { text: messageBox.text, caption: messageBox.caption },
+    );
+    return () => harness.setLiveModal(null);
+  }, [messageBox]);
   const [isPaused, setIsPaused] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
   const qualityRef = useRef<QualityConfig>(quality);
+  // Quality keys the ACTIVE graphics backend told us (via the set_quality ack) it does
+  // not implement — see shared/quality-capabilities.ts. Surfaced in QualityPanel so a
+  // knob that provably does nothing on this backend reads as such, not as "applied".
+  const [unsupportedQualityKeys, setUnsupportedQualityKeys] = useState<ReadonlySet<string>>(new Set());
+  // Keys where the worker's EFFECTIVE config differs from the preference we sent — i.e. the
+  // loaded game's manifest is overriding them. Derived from the ack rather than asked for
+  // separately: the ack already carries the effective config, and anything else could drift
+  // from it. Cleared naturally on the next ack, so unloading a game clears it too.
+  const [overriddenQualityKeys, setOverriddenQualityKeys] = useState<ReadonlySet<string>>(new Set());
   const [guestResolution, setGuestResolution] = useState({ width: 1024, height: 768 });
+  // Canvas physical-pixel backing size (clientWidth/Height × devicePixelRatio) — mirrors
+  // resolutionRef.current as React state so QualityPanel can show what "Internal
+  // resolution: Auto" is actually fitting to right now (resolveInternalScaleFactor takes
+  // the same two numbers the worker's own render path uses).
+  const [canvasRenderSize, setCanvasRenderSize] = useState({ width: 0, height: 0 });
   const [viewportSize, setViewportSize] = useState(() => ({
     width: typeof window !== "undefined" ? Math.max(1, window.innerWidth) : 1,
     height: typeof window !== "undefined" ? Math.max(1, window.innerHeight) : 1,
@@ -323,12 +421,68 @@ export default function App() {
     });
   }, []);
 
-  const mouseCoordinateModeRef = useRef<MouseCoordinateMode>(uiSettings.mouseCoordinateMode);
   const presentModeRef = useRef<PresentMode>(uiSettings.presentMode);
   const guestResolutionRef = useRef({ width: 1024, height: 768 });
+  // True once the guest has published its own resolution (the "app_resize" handler below).
+  // Pointer mapping is ALWAYS in guest-resolution space (SetCursorPos, GetCursorPos, DirectInput
+  // absolute axes are all guest-relative) — but guestResolutionRef starts at a 1024x768
+  // PLACEHOLDER indistinguishable from a real 1024x768 guest mode, so a boot-time pointer
+  // event before the first publish must fall back to the render size instead of trusting it.
+  const guestResolutionKnownRef = useRef(false);
   // Current UI settings, readable from non-React callbacks (e.g. the audio-engine
   // creation path, which may run after the settings-apply effect has fired).
   const uiSettingsRef = useRef<UiSettings>(uiSettings);
+  /**
+   * On a touch device the virtual pad is permanently available — it is simply not
+   * drawn yet. Titles of this era enumerate joysticks ONCE at startup, so waiting
+   * for the overlay to appear means the game has already taken its "no controller"
+   * branch and will never look again. Advertise it like a controller left plugged in.
+   */
+  const assertVirtualPad = useCallback(() => {
+    if (typeof navigator === "undefined") return;
+    // The same test that decides whether the pad is DRAWN, minus `hidden` — a
+    // collapsed overlay does not unplug it. Gating on touch hardware alone would
+    // advertise a joystick to every desktop with a touchscreen, and a game that
+    // finds one stops offering the keyboard.
+    if (!shouldShowTouchHud({
+      maxTouchPoints: navigator.maxTouchPoints,
+      coarsePrimary,
+      lastPointer: getPointerKind(),
+      mode: uiSettingsRef.current.touchMode,
+      hidden: false,
+    })) return;
+    inputDevice.publishPad({ connected: true, buttons: 0, axes: [0, 0, 0, 0] }, "touch");
+    inputDevice.commit({ immediate: true });
+  }, [coarsePrimary]);
+
+  // Mounted on every screen INCLUDING the library, which returns before the emulator
+  // exists: the launch tap is the evidence, and it has to be in before the guest
+  // enumerates its devices.
+  useEffect(() => {
+    const uninstall = installPointerKindWatcher();
+    const unsubscribe = subscribePointerKind((kind) => {
+      pointerSourceRef.current = kind;
+      setLastPointerKind(kind);
+      assertVirtualPad();
+    });
+    return () => { uninstall(); unsubscribe(); };
+  }, [assertVirtualPad]);
+
+  const touchUiSignals = {
+    maxTouchPoints: typeof navigator === "undefined" ? 0 : navigator.maxTouchPoints,
+    coarsePrimary,
+    lastPointer: lastPointerKind,
+    mode: uiSettings.touchMode,
+    hidden: controlsHidden,
+  };
+  const showTouchControls = shouldShowTouchUi(touchUiSignals);
+  const showTouchHud = shouldShowTouchHud(touchUiSignals);
+  const activeLayout = useActiveLayout(
+    gameId,
+    manifestTouch,
+    () => globalInputView,
+    workerStatus === "ready" && uiSettings.touchMode !== "off",
+  );
   // Live pause state for the long-lived I/O effect's callbacks. Read via ref so
   // toggling pause does NOT tear down and recreate the whole worker/input/audio
   // effect (see the core-I/O effect's deps) — only this cheap sync effect runs.
@@ -375,11 +529,23 @@ export default function App() {
   }, [gameIdFromUrl, selectedGame]);
   const gameDisplayName = bundleDisplayName ?? displayGame?.name ?? "Game";
   const browserSupport = useMemo(() => detectBrowserSupport(), []);
+  // A deployment may admit only the browser it was rehearsed on (see deployment-config).
+  // undefined = policy not loaded yet; null = allowed.
+  const [policyBlock, setPolicyBlock] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    loadDeploymentConfig().then(
+      (cfg) => { if (!cancelled) setPolicyBlock(browserPolicyBlock(cfg, browserSupport.detectedBrowser)); },
+      () => { if (!cancelled) setPolicyBlock(null); },
+    );
+    return () => { cancelled = true; };
+  }, [browserSupport.detectedBrowser]);
   const browserUnsupportedMessage = useMemo(() => {
+    if (policyBlock) return policyBlock;
     if (browserSupport.supported) return null;
     const missing = browserSupport.missing.join(", ");
     return `This browser is missing features required to run BottleShip: ${missing}. Detected browser: ${browserSupport.detectedBrowser}. Please use an up-to-date Google Chrome or Safari 26+.`;
-  }, [browserSupport]);
+  }, [browserSupport, policyBlock]);
 
   // WebGPU is the whole render backend, but detectBrowserSupport() only checks that the API is
   // *present*. The adapter can still fail to acquire (hardware accel off, GPU blocklisted, VM/RDP)
@@ -401,13 +567,15 @@ export default function App() {
   // (disableSelection) and float the same error card as a modal over it, so users learn up front
   // instead of picking a game and hitting a dead end. (browser-unsupported keeps its own banner.)
   const webgpuBlocked = webgpuProbe !== null && !webgpuProbe.ok;
-  const launchBlocked = !browserSupport.supported || webgpuBlocked;
+  // policyBlock === undefined means the deployment policy has not resolved yet — hold
+  // launching until it has, or a restricted browser gets a game started before we know.
+  const launchBlocked = !browserSupport.supported || webgpuBlocked || policyBlock !== null;
 
   // Auto-load game once worker is ready. Registered games load their wgbUrl; dev mode
   // stays manual UNLESS Add-Game handed us a bundle via ?load=<url> (BYO drop / URL).
   const autoLoadDoneRef = useRef(false);
   useEffect(() => {
-    if (!browserSupport.supported || (webgpuProbe !== null && !webgpuProbe.ok)) return;
+    if (launchBlocked) return;
     if (!selectedGame || workerStatus !== "ready" || autoLoadDoneRef.current) return;
     const params = new URLSearchParams(window.location.search);
     const loadParam = params.get("load");
@@ -419,7 +587,6 @@ export default function App() {
 
     if (selectedGame.id === "dev" && ingest) {
       // BYO installer(s) staged to OPFS _ingest/ by the Add-Game flow — read them back and
-      // feed the worker's blob sniff path (one file → {blob}; multi-part → {blobs}).
       (async () => {
         try {
           const root = await navigator.storage.getDirectory();
@@ -434,6 +601,8 @@ export default function App() {
           canvasRef.current?.focus();
           setIsLoadingApp(true);
           setErrorMessage(null);
+          setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+          exitInfoRef.current = null;
           setBundleDisplayName(null);
           setLoadingProgress({ phase: "loading", percent: 0, label: "" });
           globalWorker?.postMessage(
@@ -450,8 +619,14 @@ export default function App() {
       return;
     }
 
-    (window as any).loadApp?.(selectedGame.id === "dev" ? loadParam : selectedGame.wgbUrl);
-  }, [browserSupport.supported, selectedGame, workerStatus, webgpuProbe]);
+    (window as any).loadApp?.(
+      selectedGame.id === "dev" ? loadParam : selectedGame.wgbUrl,
+      { preload: selectedGame.preload === true },
+    );
+    // launchBlocked, not its inputs: the deployment policy resolves asynchronously and
+    // may be the LAST of them to arrive. Depending on the others only, the one run that
+    // saw a blocked launch would also be the last, and the game would never start.
+  }, [launchBlocked, selectedGame, workerStatus]);
 
   // Cover the worker/v86 boot phase too: before the worker posts "ready" there is no
   // load_bundle progress yet, so without this the user stares at a bare canvas while
@@ -484,42 +659,87 @@ export default function App() {
 
   // Pointer lock state for FPS-style relative mouse input
   const pointerLockedRef   = useRef(false);
-  const wantsPointerLockRef = useRef(false);
-  const virtualMouseRef    = useRef({ x: 0, y: 0 });
   // Cooldown after exitPointerLock — browser rejects re-acquire for ~1 frame after exit
   const pointerLockCooldownRef = useRef(false);
-  // Faithful relative-mouse engagement = (cursor hidden via ShowCursor) OR (ClipCursor confined)
-  // OR (DirectInput exclusive-mode mouse acquired). cursorVisibleRef tracks ShowCursor;
-  // cursorClippedRef tracks ClipCursor; mouseCapturedRef tracks exclusive DInput acquire.
-  const cursorClippedRef = useRef(false);
-  const mouseCapturedRef = useRef(false);
+  /** Which kind of pointer is driving us; decides how relative intent is delivered. */
+  const pointerSourceRef = useRef<PointerKind>(getPointerKind() ?? "mouse");
   // Right Ctrl deliberately released the lock — suppress auto re-acquire until the next
   // explicit re-engage gesture (a canvas click).
   const userReleasedLockRef = useRef(false);
   /** Host F11 fullscreen — ref so the mount-stable input effect can call it. */
   const toggleFullscreenRef = useRef<() => void>(() => {});
+  /** Reads the host pointer as motion whenever the guest has moved its own pointer out
+   *  from under it (SetCursorPos) — the no-Pointer-Lock half of the one-position rule. */
+  const hostPointerTrackRef = useRef(new HostPointerTrack());
 
   const requestPointerLockSafe = (canvas: HTMLCanvasElement) => {
     if (pointerLockCooldownRef.current) return;
-    Promise.resolve(canvas.requestPointerLock()).catch(() => {});
+    // Allow-list, not a !== "touch" deny-list: a pen reports "pen" and has neither
+    // Pointer Lock nor meaningful movementX/Y, so it belongs on the touch transport.
+    if (pointerSourceRef.current !== "mouse") return;
+    const req = canvas.requestPointerLock as (opts?: { unadjustedMovement?: boolean }) => Promise<void> | void;
+    Promise.resolve(req.call(canvas, { unadjustedMovement: true })).catch(() => {
+      // Options unsupported (older Chromium) — retry bare.
+      Promise.resolve(canvas.requestPointerLock()).catch(() => {});
+    });
   };
 
-  // Recompute the relative-mouse intent (OR of the two faithful signals) and engage/release
-  // pointer-lock to match. Engaging always requires a user gesture, so when not yet locked we
-  // only attempt an opportunistic acquire (succeeds inside a gesture, otherwise armed for the
-  // next click via handlePointerDown). Releasing happens immediately when intent drops.
+  // Exclusive DI / ShowCursor(hide) often arrives OUTSIDE a user gesture, so the
+  // opportunistic requestPointerLock in updatePointerLockIntent fails silently and
+  // the title keeps absolute edge-clamped mouse until the next canvas click. Arm a
+  // capture-phase window listener so the next trusted activation anywhere on the game
+  // stage (fire click, a click on a touch/status overlay) still engages lock — not only
+  // a pointerdown the canvas itself receives.
+  const pointerLockGestureHandlerRef = useRef<((e: PointerEvent) => void) | null>(null);
+  const armPointerLockGesture = () => {
+    if (pointerLockGestureHandlerRef.current) return;
+    // Stays armed until the lock actually engages. Disarming on the first activation
+    // assumed the request succeeds, and it often does not — the browser rejects a
+    // re-acquire for over a second after a user-initiated exit (ESC), which is exactly
+    // when this is armed. One rejected attempt would otherwise retire the gesture and
+    // leave a title steering by motion with an absolute cursor for the rest of the run.
+    const onActivate = (e: PointerEvent) => {
+      const c = canvasRef.current;
+      if (!c || userReleasedLockRef.current || pointerLockedRef.current) return;
+      if (!relativeIntent.get()) return;
+      // Scoped to the game stage (canvas + its overlays). Since this stays armed until
+      // the lock engages, an unscoped handler would grab the pointer on every click on
+      // the host shell's own buttons and menus and make them unusable mid-game.
+      const target = e.target as Node | null;
+      const stage = panelRef.current;
+      if (!target || !(target === c || stage?.contains(target))) return;
+      requestPointerLockSafe(c);
+    };
+    pointerLockGestureHandlerRef.current = onActivate;
+    window.addEventListener("pointerdown", onActivate, true);
+  };
+  const disarmPointerLockGesture = () => {
+    const handler = pointerLockGestureHandlerRef.current;
+    if (!handler) return;
+    pointerLockGestureHandlerRef.current = null;
+    window.removeEventListener("pointerdown", handler, true);
+  };
+
+  // Pointer Lock is the MOUSE transport for relative intent. Engaging always requires a
+  // user gesture, so when not yet locked we only attempt an opportunistic acquire
+  // (succeeds inside a gesture, otherwise armed for the next click via handlePointerDown).
+  // Releasing happens immediately when intent drops. The touch transport subscribes to
+  // the same store independently.
   const updatePointerLockIntent = () => {
-    const wants = !cursorVisibleRef.current || cursorClippedRef.current || mouseCapturedRef.current;
-    wantsPointerLockRef.current = wants;
+    const wants = relativeIntent.get();
     if (wants) {
       const c = canvasRef.current;
       if (c && document.hasFocus() && !pointerLockedRef.current && !userReleasedLockRef.current) {
         requestPointerLockSafe(c);
+        armPointerLockGesture();
       }
     } else if (document.pointerLockElement) {
       pointerLockCooldownRef.current = true;
       document.exitPointerLock();
       setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+      disarmPointerLockGesture();
+    } else {
+      disarmPointerLockGesture();
     }
   };
 
@@ -537,9 +757,22 @@ export default function App() {
   }, [browserSupport.supported, sabAvailable, isolated, workerStatus]);
 
   const resolutionRef = useRef({ width: 0, height: 0 });
+  /**
+   * Where the guest picture actually sits inside the canvas BACKING BUFFER, published by
+   * the worker (present-geometry). Under aspectMode pillarbox/integer the picture is a
+   * sub-rect with bars around it, so every host<->guest coordinate mapping has to go
+   * through this rather than assuming the buffer IS the guest screen.
+   */
+  const presentRectRef = useRef<PublishedPresentRect | null>(null);
+  /** The canvas element's CSS rect narrowed to the presented picture — the worker's own
+   *  inverse, measured against the backing size THIS side last asked for. */
+  const toContentRect = useCallback((rect: HostRect | null): HostRect | null => (
+    contentRectFromPresentRect(rect, presentRectRef.current,
+      resolutionRef.current.width, resolutionRef.current.height)
+  ), []);
 
   useEffect(() => {
-    mouseCoordinateModeRef.current = uiSettings.mouseCoordinateMode;
+    setHapticsEnabled(uiSettings.touchHaptics);
     presentModeRef.current = uiSettings.presentMode;
     uiSettingsRef.current = uiSettings;
     // Apply audio output prefs live (the engine stores them even if its graph isn't built yet).
@@ -551,6 +784,19 @@ export default function App() {
       // ignore localStorage errors in restricted contexts
     }
   }, [uiSettings]);
+
+  // `assertVirtualPad` intentionally survives a collapsed touch overlay so games
+  // that enumerate once still see a controller. "Off" is different: it is an
+  // explicit unplug request and must clear that source even when no control layer
+  // is mounted to perform its normal detach cleanup.
+  useEffect(() => {
+    if (uiSettings.touchMode === "off") {
+      inputDevice.releaseSource("touch");
+      inputDevice.commit({ immediate: true });
+      return;
+    }
+    assertVirtualPad();
+  }, [assertVirtualPad, uiSettings.touchMode]);
 
   // Keep the pause ref current for the core-I/O effect's callbacks (audio-resume
   // gating). Isolated so pause/resume toggles this cheap effect instead of
@@ -598,7 +844,7 @@ export default function App() {
   useEffect(() => {
     qualityRef.current = quality;
     try {
-      localStorage.setItem(QUALITY_STORAGE_KEY, JSON.stringify(quality));
+      localStorage.setItem(QUALITY_STORAGE_KEY, serializeStoredQuality(quality));
     } catch {
       // ignore localStorage errors in restricted contexts
     }
@@ -653,47 +899,183 @@ export default function App() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const updateCanvasCursor = (forceHovered?: boolean) => {
-      const hovered = forceHovered ?? isCanvasHoveredRef.current;
-      if (!cursorVisibleRef.current && hovered) {
-        canvas.style.cursor = "none";
-      } else {
-        canvas.style.cursor = "";
+    // The guest pointer has exactly one renderer (see ./guest-cursor). Position comes
+    // from the SAB the GUEST reads, not from inputDevice's copy: touch, harness injection
+    // and guest warps all publish there, and the drawn pointer must sit where the game
+    // believes the pointer is, whoever moved it.
+    const guestCursor = new GuestCursorRenderer({
+      getPosition: () => {
+        // A software D3D device cursor is a sprite the runtime moves on its own; the OS
+        // pointer never followed it, so the worker has to tell us where it is.
+        const sprite = deviceCursorPosRef.current;
+        if (sprite) return sprite;
+        const view = globalInputView;
+        return view ? { x: view[INPUT_INDEX.mouseX]!, y: view[INPUT_INDEX.mouseY]! } : null;
+      },
+      getGeometry: () => {
+        const rect = liveContentRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+        const origin = panelRectRef.current;
+        const space =
+          guestResolutionKnownRef.current
+            ? guestResolutionRef.current
+            : resolutionRef.current;
+        return {
+          left: rect.left,
+          top: rect.top,
+          width: rect.width,
+          height: rect.height,
+          originLeft: origin?.left ?? 0,
+          originTop: origin?.top ?? 0,
+          spaceWidth: space.width,
+          spaceHeight: space.height,
+        };
+      },
+    });
+    guestCursor.attach(cursorCanvasRef.current);
+    ((window as any).__BS__ ??= {}).cursorOverlay = guestCursor.status;
+    // Why the pointer is (not) locked, in one read. The decision spans three layers —
+    // the guest's claim, this store, and the browser's gesture rules — and a screenshot
+    // shows none of them: a title steering by motion with no lock looks exactly like one
+    // whose camera is broken.
+    ((window as any).__BS__ ??= {}).relativeMouse = () => ({
+      intent: relativeIntent.get(),
+      reasons: relativeIntent.reasons(),
+      locked: !!document.pointerLockElement,
+      userReleased: userReleasedLockRef.current,
+      focus: document.hasFocus(),
+    });
+
+    // Pointer Lock fires no enter/leave and confines the pointer to the canvas by
+    // definition, so it counts as inside — that is a statement about the HOST pointer's
+    // whereabouts, not a branch in the drawing path.
+    // The guest's pointer is drawn over the guest's screen and nowhere else; the letterbox
+    // gets the host's own pointer back. Presence is a HIT TEST, not an enter/leave flag:
+    // pointerleave does not arrive when the mouse crosses the border fast or with a button
+    // held (the canvas keeps pointer capture), and a stale flag leaves our pointer painted
+    // on the picture while the OS one is already out on the black — two cursors at once.
+    const syncCursorPresence = () => {
+      guestCursor.setPointerInside(isPointerOverCanvasRef.current || pointerLockedRef.current);
+    };
+
+    // The ONLY layout read in the pointer path. Everything downstream (mouse mapping,
+    // touch driver, cursor renderer) reads these cached rects, so they must be re-taken
+    // on every event that can move the canvas: window/visualViewport resize, viewport
+    // pan, fullscreen, the canvas ResizeObserver, and a guest resolution change.
+    const measureRects = () => {
+      canvasRectRef.current = canvas.getBoundingClientRect();
+      contentRectRef.current = toContentRect(canvasRectRef.current);
+      panelRectRef.current = panelRef.current?.getBoundingClientRect() ?? null;
+    };
+    // Self-checking cache: a guest mode switch (800x600 → 640x480) resizes the canvas
+    // between the events that refresh the rects, and a stale rect silently rescales every
+    // mapped position — the pointer then tracks a screen the guest no longer has.
+    // clientWidth costs nothing unless layout is already dirty, which is exactly when the
+    // cached value is wrong; getBoundingClientRect would FORCE that flush every time.
+    const liveCanvasRect = (): DOMRect | null => {
+      const rect = canvasRectRef.current;
+      if (!rect
+          || Math.abs(rect.width - canvas.clientWidth) > 0.5
+          || Math.abs(rect.height - canvas.clientHeight) > 0.5) {
+        measureRects();
+        return canvasRectRef.current;
       }
+      return rect;
+    };
+    /** liveCanvasRect narrowed to the presented picture — the mapping space. */
+    const liveContentRect = () => {
+      const rect = liveCanvasRect();
+      if (!rect) return null;
+      return contentRectRef.current ?? rect;
+    };
+    // The guest is addressed in this space, and the device clamps every publication
+    // against it. Established here, not on the first pointer event: a guest SetCursorPos
+    // can arrive before the user has touched anything, and 1x1 bounds warp it to (0,0).
+    const syncPointerBounds = () => {
+      const space =
+        guestResolutionKnownRef.current
+          ? guestResolutionRef.current
+          : resolutionRef.current;
+      inputDevice.setPointerBounds(Math.max(1, space.width), Math.max(1, space.height));
+    };
+    const captureRects = () => {
+      measureRects();
+      syncPointerBounds();
+      guestCursor.sync();
     };
 
     // 1. Initialize Worker (only once)
     if (!globalWorker) {
-      globalWorker = new Worker(
+      globalWorker = new SessionWorker(new Worker(
         new URL("../worker/emulator.worker.ts", import.meta.url),
         { type: "module" }
-      );
+      ));
 
       // Expose worker to console for debugging
       (window as any).worker = globalWorker;
 
+      // Harness session of this tab (?bs=<name>): the worker returns disk paths for the
+      // dumps it emits, and those must name the session's own directory — an agent sent
+      // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
+      globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
+
+      // A self re-exec asked us to reload (see the "reexec" message). Hand the worker the
+      // launcher's command line BEFORE any bundle load — it replaces the manifest's `args`
+      // for exactly this boot. Consumed here so a later manual F5 boots normally again.
+      try {
+        const pendingReExec = sessionStorage.getItem(REEXEC_KEY);
+        if (pendingReExec) {
+          sessionStorage.removeItem(REEXEC_KEY);
+          const { args, url, image, patches, inherited } = JSON.parse(pendingReExec) as
+            { args: string; url: string | null; image?: string | null; patches?: unknown[] | null; inherited?: unknown[] | null };
+          globalWorker.postMessage({
+            type: "set_boot_args", args, image: image ?? null,
+            patches: patches ?? null, inherited: inherited ?? null,
+          });
+          console.info("[bs] re-exec boot:", image ?? "(manifest entrypoint)", args, url ? `(url ${url})` : "");
+          if (url) reExecBundleUrl = url;
+        }
+      } catch { /* corrupt/no pending re-exec */ }
+
       // Persisted debug flags (e.g. __noHeapSlab to A/B the WASM heap slab). Replayed to
       // the worker on EVERY page load BEFORE any game loads, so a toggle survives F5.
       // Set from the console: dbgFlag('__noHeapSlab', true)  → persists + applies live.
+      // localStorage is origin-wide, so a flag set for one ?bs=<name> tab would otherwise
+      // leak into every parallel agent's tab. Session-scoped flags win over global ones.
+      const session = sessionFromLocation(window.location.search);
+      const flagKeys = session ? ["bs_debug_flags", `bs_debug_flags:${session}`] : ["bs_debug_flags"];
       try {
-        const flags = JSON.parse(localStorage.getItem("bs_debug_flags") || "{}");
-        for (const [key, value] of Object.entries(flags)) {
+        const merged: Record<string, unknown> = {};
+        for (const [index, k] of flagKeys.entries()) {
+          const flags = JSON.parse(localStorage.getItem(k) || "{}") as Record<string, unknown>;
+          // Host-tool execution is a per-harness-session capability. Never replay a stale
+          // origin-wide value, including when this page has no session at all.
+          if (index === 0) delete flags.__hostTools;
+          Object.assign(merged, flags);
+        }
+        for (const [key, value] of Object.entries(merged)) {
           globalWorker.postMessage({ type: "set_debug_flag", key, value });
         }
-        if (Object.keys(flags).length) console.info("[bs] replayed debug flags:", flags);
+        if (Object.keys(merged).length) console.info("[bs] replayed debug flags:", merged);
       } catch { /* corrupt/no flags */ }
-      (window as any).dbgFlag = (key: string, value: unknown) => {
-        const flags = JSON.parse(localStorage.getItem("bs_debug_flags") || "{}");
+      (window as any).dbgFlag = (key: string, value: unknown, opts?: { scope?: "session" | "global" }) => {
+        if (key === "__hostTools" && !session) {
+          throw new Error("dbgFlag('__hostTools', ...): a ?bs=<session> URL is required");
+        }
+        const store = key === "__hostTools"
+          ? `bs_debug_flags:${session}`
+          : (opts?.scope === "session" && session ? `bs_debug_flags:${session}` : "bs_debug_flags");
+        const flags = JSON.parse(localStorage.getItem(store) || "{}");
         if (value === undefined || value === null) delete flags[key]; else flags[key] = value;
-        localStorage.setItem("bs_debug_flags", JSON.stringify(flags));
+        localStorage.setItem(store, JSON.stringify(flags));
         globalWorker?.postMessage({ type: "set_debug_flag", key, value });
-        return { [key]: value, note: "persisted; takes effect on next game load" };
+        return { [key]: value, store, note: "persisted; takes effect on next game load" };
       };
 
       // AI-agent harness facade: window.__BS__.harness. Thin page-side
       // forwarder over harness_rpc + the normalized event bus; logic lives in the
       // worker HarnessService. Coexists with the legacy window.dbg Proxy below.
-      installHarnessFacade(globalWorker);
+      installHarnessFacade(globalWorker, () => globalInputView);
 
       // Guest debugger bridge: window.dbg.<cmd>(...args) -> worker {type:"dbg"} ->
       // handleDbgCommand() -> wasm dbg_* primitives. Output flows back via console.
@@ -803,6 +1185,7 @@ export default function App() {
       getLogClient().enable();
     }
     const worker = globalWorker;
+    const childSurface = new ChildSessionSurface(canvas, captureRects);
 
     // 2. Initialize SharedArrayBuffer (only once)
     if (!globalSab) {
@@ -812,12 +1195,22 @@ export default function App() {
       setIsBufferInitialized(true);
     }
     const inputBuffer = globalSab;
+    // Redraw on publication, not only on the renderer's own frame: a motion commit is
+    // itself rAF-coalesced and lands after our tick has already run, which would leave
+    // the pointer a whole frame behind the position the guest was just handed.
+    inputDevice.attach(globalInputView!, () => {
+      globalWorker?.postMessage({ type: "input_tick" });
+      guestCursor.sync();
+    });
+    assertVirtualPad();
     if (!audioEngine) {
       audioEngine = new AudioEngine();
       // Apply the persisted output prefs to the fresh engine (volume/mute are stored
       // and take effect when ensureReady() builds the master gain).
       audioEngine.setMasterVolume(uiSettingsRef.current.masterVolume);
       audioEngine.setMuted(uiSettingsRef.current.muted);
+      // Diagnostics: the harness `audiocapture` taps the final mix through this.
+      ((window as any).__BS__ ??= {}).audioEngine = audioEngine;
     }
     // Resume the AudioContext on the first user gesture anywhere on the page (and
     // auto-recover from later browser suspensions). Without this the context stays
@@ -846,23 +1239,60 @@ export default function App() {
 
     const resize = () => {
       const devicePixelRatio = window.devicePixelRatio || 1;
-      const renderWidth = Math.max(1, Math.floor(canvas.clientWidth * devicePixelRatio));
-      const renderHeight = Math.max(1, Math.floor(canvas.clientHeight * devicePixelRatio));
+      // Measure the CONTAINER, never the canvas itself. The canvas is laid out
+      // `width/height: auto` (App.module.css), so its used CSS size IS its backing
+      // buffer's size: sizing the buffer from `canvas.clientWidth` feeds the element's
+      // own output back into its input and the pair collapses — observed settling at
+      // 300x225 for a 640x480 guest. The container's box is decided by the layout and
+      // owes nothing to the buffer, so it is the only stable input.
+      const box = canvas.parentElement ?? canvas;
+      const guest = guestResolutionRef.current;
+      const aspect = guest.height > 0 ? guest.width / guest.height : 4 / 3;
+      const availW = Math.max(1, box.clientWidth);
+      const availH = Math.max(1, box.clientHeight);
+      // Fit the guest's aspect inside the container, exactly as the CSS aspect-ratio
+      // box does, so the buffer matches what is actually painted — a mismatch would
+      // resample the frame a second time.
+      const fitW = Math.min(availW, availH * aspect);
+      const fitH = Math.min(availH, availW / aspect);
+      const renderWidth = Math.max(1, Math.floor(fitW * devicePixelRatio));
+      const renderHeight = Math.max(1, Math.floor(fitH * devicePixelRatio));
+      childSurface.fit(renderWidth / devicePixelRatio, renderHeight / devicePixelRatio);
 
       // Update ref for event calculations (cannot set canvas.width/height anymore)
       resolutionRef.current = { width: renderWidth, height: renderHeight };
-      canvasRectRef.current = canvas.getBoundingClientRect();
+      captureRects();
+      setCanvasRenderSize((prev) =>
+        prev.width === renderWidth && prev.height === renderHeight ? prev : { width: renderWidth, height: renderHeight });
 
-      const useGuestCoords = mouseCoordinateModeRef.current === "guest";
-      const target = useGuestCoords
-        ? guestResolutionRef.current
-        : { width: renderWidth, height: renderHeight };
-
-      worker.postMessage({ type: "resize", width: target.width, height: target.height });
+      // The canvas BACKING BUFFER always follows the display area, not the guest's
+      // logical resolution — pointer mapping (guestPerCss / syncPointerBounds / the
+      // pointer-event handlers below) is the ONLY thing addressed in guest space, and it
+      // reads guestResolutionRef directly. Conflating the two used to pin the backing
+      // buffer to the guest's resolution whenever "guest" pointer mode was selected,
+      // which made quality.internalScale's "Auto" fit a canvas that was already
+      // guest-sized — an unconditional no-op regardless of the setting.
+      worker.postMessage({ type: "resize", width: renderWidth, height: renderHeight });
     };
 
     // 3. Setup Worker Message Handling
     worker.onmessage = (event: MessageEvent) => {
+      if (event.data?.type === 'child_session') {
+        audioEngine?.stopAll();
+        setExitInfo(null); exitInfoRef.current = null;
+        const { width, height } = resolutionRef.current;
+        const surface = childSurface.create(width, height);
+        worker.postMessage({ type: 'child_surface', canvas: surface, inputBuffer }, [surface]);
+        return;
+      }
+      if (event.data?.type === 'child_session_reset') {
+        childSurface.clear();
+        if (event.data.resumeParent) {
+          audioEngine?.stopAll();
+          setExitInfo(null); exitInfoRef.current = null;
+        }
+        return;
+      }
       //console.log('BottleShip: Worker message received:', event.data?.type);
       
       // Forward logs to server (if enabled)
@@ -900,18 +1330,19 @@ export default function App() {
           const manifestOk = writeDebugFile(`${base}.json`, JSON.stringify(manifest, null, 2));
           const dumpOk = writeDebugFileBase64(`${base}.bin`, bytesToBase64(new Uint8Array(bytes)));
           if (manifestOk && dumpOk) {
-            console.log(`BottleShip: SEH runtime dump saved -> logs/${base}.{json,bin}`);
+            console.log(`BottleShip: SEH runtime dump saved -> ${logArtifactPath(base)}.{json,bin}`);
           } else {
             console.warn(`BottleShip: SEH runtime dump not persisted (log server disconnected?) -> ${base}`);
           }
         }
       } else if (event.data?.type === "debug_png_dump") {
-        // Worker-side bitmap dump for visual debugging: base64 PNG -> logs/debug/<name>.png
+        // Worker-side bitmap dump for visual debugging: base64 PNG -> logs/[<session>/]debug/<name>.png
         const name = typeof event.data?.name === "string" ? event.data.name : "dump";
         const base64 = typeof event.data?.base64 === "string" ? event.data.base64 : "";
         if (base64) {
-          const ok = writeDebugFileBase64(`debug/${name}.png`, base64);
-          console.log(`BottleShip: debug PNG ${ok ? "saved" : "NOT saved (log server?)"} -> logs/debug/${name}.png`);
+          const rel = `debug/${name}.png`;
+          const ok = writeDebugFileBase64(rel, base64);
+          console.log(`BottleShip: debug PNG ${ok ? "saved" : "NOT saved (log server?)"} -> ${logArtifactPath(rel)}`);
         }
       }
 
@@ -925,6 +1356,7 @@ export default function App() {
         setFpuStrictEnabled(!!event.data.strict);
       }
       if (event.data?.type === "error") {
+        userImportPendingRef.current = false;
         setWorkerStatus("error");
         setErrorMessage(event.data.message ?? "Worker error");
         // Tear down the launch overlay so the error surfaces instead of a stuck "booting".
@@ -935,11 +1367,13 @@ export default function App() {
         // The guest process called ExitProcess (or crashed → SEH → ExitProcess).
         // The emulator has torn down all threads; reflect a clean exit instead of
         // leaving the last (now stale) frame on screen.
-        setExitInfo({
+        const info: GuestExitInfo = {
           code: typeof event.data.exitCode === "number" ? event.data.exitCode : 0,
           crashed: !!event.data.crashed,
           fault: event.data.fault ?? undefined,
-        });
+        };
+        exitInfoRef.current = info;
+        setExitInfo(info);
         // The worker is gone but the worklet keeps rendering whatever ring/legacy
         // sources were still PLAYING — a looping/circular buffer drones the stale
         // ring forever. Silence everything on guest exit.
@@ -947,14 +1381,49 @@ export default function App() {
         setLoadingProgress(null);
         setIsLoadingApp(false);
       }
+      if (event.data?.type === "reexec") {
+        // A guest launcher relaunched its own image (worker: requestSelfReExec). We restart
+        // it the only way that is genuinely a fresh process — reload the page — and hand the
+        // new worker the launcher's command line before it loads the bundle. sessionStorage,
+        // not localStorage: a pending restart belongs to THIS tab and must not leak into a
+        // parallel agent's tab, and it must not survive the tab being closed.
+        try {
+          sessionStorage.setItem(REEXEC_KEY, JSON.stringify({
+            args: String(event.data.args ?? ""),
+            url: typeof event.data.url === "string" ? event.data.url : null,
+            // Set when the launcher started a DIFFERENT image from the same bundle: the
+            // new worker boots that entry point instead of the manifest's.
+            image: typeof event.data.image === "string" ? event.data.image : null,
+            // What the launcher wrote into the child while it was suspended (decrypted
+            // code, for the encrypt-on-disk launchers). Without it the restart runs the
+            // untouched, still-encrypted image.
+            patches: Array.isArray(event.data.patches) ? event.data.patches : null,
+            // Named kernel objects the launcher holds open. It keeps running on real
+            // Windows while the game boots, so the game must still see them.
+            inherited: Array.isArray(event.data.inherited) ? event.data.inherited : null,
+          }));
+          window.location.reload();
+        } catch (e) {
+          console.error("[bs] re-exec restart failed:", e);
+        }
+        return;
+      }
       if (event.data?.type === "bundle_meta") {
+        if (userImportPendingRef.current) {
+          setHasImportedBundle(true);
+          userImportPendingRef.current = false;
+        }
         const name = typeof event.data.name === "string" ? event.data.name.trim() : "";
         if (name) setBundleDisplayName(name);
+        setGameId(typeof event.data.gameId === "string" ? event.data.gameId : null);
+        setManifestTouch((event.data.touch as ManifestTouch | null) ?? null);
       }
       if (event.data?.type === "loading_progress") {
         const { phase, percent, label } = event.data;
-        // A fresh load clears any prior "game exited" state.
-        setExitInfo(null);
+        // Progress belonging to a load that already died is stale — a fresh load clears
+        // exitInfo at its own start, so anything arriving while one is set is the corpse
+        // of the previous one talking.
+        if (exitInfoRef.current) return;
         if (phase === "done") {
           // PE is loaded but the guest hasn't drawn yet. DON'T hide the overlay here —
           // switch it to an indeterminate "booting" state and keep it up until the worker
@@ -988,6 +1457,9 @@ export default function App() {
         }, 450);
       }
       if (event.data?.type === "install_progress") {
+        // Same rule as loading_progress: progress from a load that already died must not
+        // raise the launch overlay back over the exit/crash dialog.
+        if (exitInfoRef.current) return;
         const { phase, doneBytes, totalBytes } = event.data;
         const doneMb = (doneBytes / 1024 / 1024).toFixed(0);
         const totalMb = totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(0) : "?";
@@ -1004,6 +1476,7 @@ export default function App() {
         }
       }
       if (event.data?.type === "installer_unsupported") {
+        userImportPendingRef.current = false;
         setIsLoadingApp(false);
         setLoadingProgress(null);
         setErrorMessage(event.data.message ?? "This installer format is not supported.");
@@ -1131,43 +1604,84 @@ export default function App() {
         const sab = event.data?.payload?.sab as SharedArrayBuffer | undefined;
         if (sab) audioEngine?.registerStatsSab(sab);
       }
+      if (event.data?.type === "audio_master_stats_sab") {
+        const sab = event.data?.payload?.sab as SharedArrayBuffer | undefined;
+        if (sab) audioEngine?.registerMasterStatsSab(sab);
+      }
       // video_frame and video_end are handled in the worker via WebGPU compositor (smackw32.ts → backend.composite)
       if (event.data?.type === "cursor_visibility") {
         const visible = event.data?.visible !== false;
-        cursorVisibleRef.current = visible;
-        updateCanvasCursor();
-        // Engage/release pointer-lock on the faithful relative signal (hidden OR clipped).
+        guestCursor.setVisible(visible);
+        relativeIntent.set("cursorHidden", !visible);
         updatePointerLockIntent();
       }
+      if (event.data?.type === "cursor_image") {
+        // Guest installed a cursor shape: null pixels = system shape, which the renderer
+        // covers with its built-in arrow.
+        guestCursor.setShape(
+          (event.data?.pixels as ArrayBuffer | null) ?? null,
+          Number(event.data?.width) | 0,
+          Number(event.data?.height) | 0,
+          Number(event.data?.hotspotX) | 0,
+          Number(event.data?.hotspotY) | 0,
+        );
+      }
       if (event.data?.type === "clip_cursor") {
-        // Guest ClipCursor(rect) confines the cursor (relative/captured mouse, e.g. Unreal
-        // SetMouseCapture); ClipCursor(NULL) releases it. Feed it into the same intent as
-        // ShowCursor so confined-but-visible games also engage pointer-lock.
-        cursorClippedRef.current = event.data?.clip === true;
+        // Guest ClipCursor(rect) confines the cursor; ClipCursor(NULL) releases it. It says
+        // nothing about visibility — confining a VISIBLE pointer to a window's client area
+        // is its commonest use — so it feeds the same intent as ShowCursor and Pointer Lock
+        // is the transport either way (the canvas draws no host pointer of its own).
+        // The rect also arms the host's own confinement, which is what the guest sees while
+        // the lock is not held; the worker only sends one when it actually confines.
+        const clipped = event.data?.clip === true;
+        const rect = clipped ? (event.data?.rect ?? null) : null;
+        hostPointerTrackRef.current.setConfine(rect);
+        relativeIntent.set("clipped", clipped);
         updatePointerLockIntent();
       }
       if (event.data?.type === "mouse_capture") {
         // Guest acquired/released an exclusive-mode DirectInput mouse. On real Windows this
         // implicitly captures the cursor (relative mode) with no ShowCursor/ClipCursor call,
         // so feed it into the same intent to engage/release pointer-lock.
-        mouseCapturedRef.current = event.data?.capture === true;
+        relativeIntent.set("captured", event.data?.capture === true);
+        updatePointerLockIntent();
+      }
+      if (event.data?.type === "cursor_warp") {
+        // Guest is warp-bursting SetCursorPos (relative-mouse emulation) — SetCursorPos can
+        // only be honored under pointer lock, so treat it as a capture signal.
+        relativeIntent.set("warping", event.data?.active === true);
+        updatePointerLockIntent();
+      }
+      if (event.data?.type === "input_reset") {
+        // Game switch: the worker's key/button diff baselines are back to zero, so a
+        // level we are still holding would arrive in the next game as a fresh press.
+        inputDevice.releaseAllSources();
+        // No flush until the pad is re-asserted — see handleBlur.
+        touchControlsRef.current?.releaseAll(false);
+        touchDriver.reset();
+        assertVirtualPad();
+        inputDevice.commit({ immediate: true });
+        relativeIntent.reset();
+        hostPointerTrackRef.current.lose();
+        hostPointerTrackRef.current.setConfine(null);
         updatePointerLockIntent();
       }
       if (event.data?.type === "set_cursor_pos") {
-        // Guest called SetCursorPos — update virtual cursor so next movement continues from here
-        const x = Number(event.data.x) | 0;
-        const y = Number(event.data.y) | 0;
-        virtualMouseRef.current = { x, y };
-        if (pointerLockedRef.current && globalInputView) {
-          beginInputWrite(globalInputView);
-          globalInputView[INPUT_INDEX.mouseX] = x;
-          globalInputView[INPUT_INDEX.mouseY] = y;
-          endInputWrite(globalInputView);
-        }
+        // SetCursorPos moves the GUEST's cursor, so it applies whatever transport the host
+        // happens to be using: Pointer Lock must not be observable by the guest, and gating
+        // the warp on it would make a WinAPI contract depend on a host decision.
+        inputDevice.setPointerAbsolute(Number(event.data.x) | 0, Number(event.data.y) | 0);
+        inputDevice.commit({ immediate: true });
+      }
+      if (event.data?.type === "device_cursor_pos") {
+        const x = event.data.x;
+        deviceCursorPosRef.current = x === null || x === undefined
+          ? null
+          : { x: Number(x) | 0, y: Number(event.data.y) | 0 };
       }
       if (event.data?.type === "show_message_box") {
         const { id, text, caption, uType } = event.data;
-        const targetWorker = event.target as Worker;
+        const targetWorker = worker instanceof SessionWorker ? worker.replyTarget(event) : event.target as Worker;
         const isDevMode = new URLSearchParams(window.location.search).get("game") === "dev";
         const typeMask = (Number(uType) || 0) & 0xf;
         // Harness auto-modal: consult the single resolver. If it returns a
@@ -1186,33 +1700,56 @@ export default function App() {
           targetWorker.postMessage({ type: "message_box_result", id, result: 1 });
         }
       }
+      if (event.data?.type === "present_rect") {
+        const d = event.data;
+        presentRectRef.current = {
+          x: Number(d.x) || 0, y: Number(d.y) || 0,
+          w: Number(d.w) || 0, h: Number(d.h) || 0,
+          outW: Number(d.outW) || 0, outH: Number(d.outH) || 0,
+          srcW: 0, srcH: 0,
+        };
+        contentRectRef.current = toContentRect(canvasRectRef.current);
+        ((window as any).__BS__ ??= {}).presentRect = presentRectRef.current;
+      }
       if (event.data?.type === "app_resize") {
         const width = Math.max(1, Number(event.data.width) || 1);
         const height = Math.max(1, Number(event.data.height) || 1);
         guestResolutionRef.current = { width, height };
+        guestResolutionKnownRef.current = true;
         setGuestResolution({ width, height });
         // Expose for the harness UI-overlay tool (gridShot): maps guest pixels —
         // the space clickAt() injects into — onto the on-screen canvas rect.
         ((window as any).__BS__ ??= {}).guestResolution = { width, height };
         if (canvas) {
-          canvas.style.width = `${width}px`;
-          canvas.style.height = `${height}px`;
-          canvasRectRef.current = canvas.getBoundingClientRect();
-          if (mouseCoordinateModeRef.current === "guest") {
-            worker.postMessage({ type: "resize", width, height });
-          } else {
-            resize();
-          }
+          // No inline size: the canvas ATTRIBUTES already carry the guest resolution, so
+          // width/height:auto resolve to it and max-*:100% fits it into the panel with
+          // the aspect ratio intact. A definite inline size makes the clamp one-sided —
+          // the short axis shrinks, the long one stays, and the picture stretches.
+          canvas.style.width = "";
+          canvas.style.height = "";
+          captureRects();
+          // The backing buffer follows the display area, not this guest resolution (see
+          // resize()) — but the CSS aspect-ratio just changed above, so the display area
+          // itself may now be a different size (e.g. a 4:3 guest mode in a fixed-height
+          // panel gets narrower). Recompute unconditionally.
+          resize();
           // The rect captured above is PRE-reflow: setGuestResolution() schedules a
           // React re-render that updates style.aspectRatio, and the flex-centered canvas
           // shifts position once that render + layout settles. A size-only ResizeObserver
           // does NOT fire on a position-only shift, so canvasRectRef would keep a stale
           // left/top offset → absolute mouse coords get shifted (e.g. menu at top-left
           // maps to clamped 0,0). Re-capture after layout settles (double rAF = after paint).
-          requestAnimationFrame(() => requestAnimationFrame(() => {
-            if (canvasRef.current) canvasRectRef.current = canvasRef.current.getBoundingClientRect();
-          }));
+          requestAnimationFrame(() => requestAnimationFrame(captureRects));
         }
+      }
+      if (event.data?.type === "set_quality") {
+        const unsupported = Array.isArray(event.data.unsupported) ? event.data.unsupported : [];
+        setUnsupportedQualityKeys(new Set(unsupported));
+        const effective = event.data.quality as Partial<QualityConfig> | undefined;
+        const pref = qualityRef.current as unknown as Record<string, unknown>;
+        setOverriddenQualityKeys(effective
+          ? new Set(Object.keys(effective).filter((k) => (effective as Record<string, unknown>)[k] !== pref[k]))
+          : new Set());
       }
       if (event.data?.type === "window_title") {
         const title = String(event.data.title || "");
@@ -1239,8 +1776,13 @@ export default function App() {
     };
 
     worker.onerror = (event: ErrorEvent) => {
+      userImportPendingRef.current = false;
       setWorkerStatus("error");
-      setErrorMessage(event.message);
+      setErrorMessage(event.message || "Worker error");
+      // Same teardown as the worker's own `error` message: leave the launch overlay up
+      // and the error dialog sits behind a screen that still says the game is starting.
+      setLoadingProgress(null);
+      setIsLoadingApp(false);
     };
 
     // 4. Initialize Offscreen Control (only once)
@@ -1284,12 +1826,34 @@ export default function App() {
     resize();
     window.addEventListener("resize", resize);
     window.visualViewport?.addEventListener("resize", resize);
+    // A pinch-pan moves the visual viewport without resizing it, and every mapped
+    // coordinate is measured against the canvas rect — stale rect, wrong cursor.
+    window.visualViewport?.addEventListener("scroll", resize);
     document.addEventListener("fullscreenchange", resize);
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(canvas);
 
+    const detachTouch = panelRef.current
+      ? touchDriver.attach(panelRef.current, {
+          getCanvasRect: () => contentRectRef.current ?? canvas.getBoundingClientRect(),
+          getPointerSpace: () =>
+            guestResolutionKnownRef.current
+              ? guestResolutionRef.current
+              : resolutionRef.current,
+          getSettings: () => uiSettingsRef.current,
+          hitTest: (x, y, id, phase) => touchControlsRef.current?.hitTest(x, y, id, phase) ?? false,
+        })
+      : () => {};
+
     // 5. Input Handlers
+    // The canvas handlers are the MOUSE path only. Touch and pen belong to the touch
+    // driver on the panel; letting both consume the same contact publishes two
+    // contradictory records per event.
+
     const writePointer = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
+      // Latch back to mouse: a tablet with a Bluetooth mouse switches both ways.
+      notePointerKind("mouse");
       const inputView = globalInputView;
       if (!inputView) return;
 
@@ -1299,7 +1863,7 @@ export default function App() {
       // reliable path is the canvas click in handlePointerDown. Guarded so a rejection is silent.
       if (
         !pointerLockedRef.current &&
-        wantsPointerLockRef.current &&
+        relativeIntent.get() &&
         !userReleasedLockRef.current &&
         !pointerLockCooldownRef.current &&
         document.hasFocus()
@@ -1307,37 +1871,35 @@ export default function App() {
         try { requestPointerLockSafe(canvas); } catch { /* not a valid gesture in this browser */ }
       }
 
+      const pointerSpace =
+        guestResolutionKnownRef.current
+          ? guestResolutionRef.current
+          : resolutionRef.current;
+      const width  = Math.max(1, pointerSpace.width);
+      const height = Math.max(1, pointerSpace.height);
+      inputDevice.setPointerBounds(width, height);
+      const rect = contentRectRef.current ?? canvas.getBoundingClientRect();
+
       // --- Pointer Lock mode: use relative movementX/Y, skip canvas bounds check ---
       if (pointerLockedRef.current) {
-        const pointerSpace =
-          mouseCoordinateModeRef.current === "guest"
-            ? guestResolutionRef.current
-            : resolutionRef.current;
-        const width  = Math.max(1, pointerSpace.width);
-        const height = Math.max(1, pointerSpace.height);
-        const rect   = canvasRectRef.current ?? canvas.getBoundingClientRect();
         const scaleX = width  / Math.max(1, rect.width);
         const scaleY = height / Math.max(1, rect.height);
-        const virt   = virtualMouseRef.current;
-        virt.x = Math.max(0, Math.min(width  - 1, virt.x + event.movementX * scaleX));
-        virt.y = Math.max(0, Math.min(height - 1, virt.y + event.movementY * scaleY));
-        beginInputWrite(inputView);
-        inputView[INPUT_INDEX.mouseX]  = Math.round(virt.x);
-        inputView[INPUT_INDEX.mouseY]  = Math.round(virt.y);
-        inputView[INPUT_INDEX.buttons] = event.buttons;
-        // DirectInput reports RAW device deltas (relative axes), NOT canvas-scaled — feed the
-        // accumulator unscaled movementX/Y. The virtual cursor above stays scaled (CSS→guest).
-        // (dinputDX/DY are independent atomic accumulators, not part of the seqlock snapshot.)
-        Atomics.add(inputView, INPUT_INDEX.dinputDX, Math.round(event.movementX));
-        Atomics.add(inputView, INPUT_INDEX.dinputDY, Math.round(event.movementY));
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
+        // DirectInput reports RAW device deltas (relative axes), NOT canvas-scaled;
+        // the virtual cursor stays scaled (CSS→guest). Same delta, two consumers.
+        inputDevice.addPointerRelative(
+          event.movementX * scaleX, event.movementY * scaleY,
+          event.movementX, event.movementY,
+        );
+        inputDevice.setButtonsMask(event.buttons, "hw-mouse");
+        inputDevice.commit();
+        recordSample(inputView, 0, 0, event.movementX, event.movementY);
+        // The lock supplies motion directly; nothing here tracks an absolute host
+        // position, so releasing it must re-seat rather than resume an old one.
+        hostPointerTrackRef.current.lose();
         return;
       }
 
       // --- Normal absolute mode ---
-      const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
-
       // When pointer is captured (button held), process events even outside canvas
       const hasCaptured = canvas.hasPointerCapture(event.pointerId);
       const insideCanvas = event.clientX >= rect.left &&
@@ -1345,102 +1907,65 @@ export default function App() {
         event.clientY >= rect.top &&
         event.clientY <= rect.bottom;
       if (!insideCanvas && !hasCaptured) {
+        hostPointerTrackRef.current.lose();
         if (isCanvasHoveredRef.current) {
           handlePointerLeave(event);
         }
         return;
       }
 
-      const pointerSpace =
-        mouseCoordinateModeRef.current === "guest"
-          ? guestResolutionRef.current
-          : resolutionRef.current;
-      const width = Math.max(1, pointerSpace.width);
-      const height = Math.max(1, pointerSpace.height);
-
       // Coordinate scaling: mouse events are in client/CSS pixels
       // We map them to the virtual resolution [0..width/height]
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
-      const x = Math.max(0, Math.min(width, (event.clientX - rect.left) * scaleX));
-      const y = Math.max(0, Math.min(height, (event.clientY - rect.top) * scaleY));
-
-      beginInputWrite(inputView);
-      inputView[INPUT_INDEX.mouseX] = Math.round(x);
-      inputView[INPUT_INDEX.mouseY] = Math.round(y);
-      inputView[INPUT_INDEX.buttons] = event.buttons;
-      Atomics.add(inputView, INPUT_INDEX.dinputDX, Math.round(event.movementX * scaleX));
-      Atomics.add(inputView, INPUT_INDEX.dinputDY, Math.round(event.movementY * scaleY));
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: inputView[INPUT_INDEX.keyCode],
-          keyState: inputView[INPUT_INDEX.keyState],
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
-        });
-      }
+      const guest = clientToGuestPoint(rect, event.clientX, event.clientY, width, height);
+      // SetCursorPos moved the guest's pointer and the physical one did not follow, so
+      // the host position is stale by that warp — apply what it MOVED (see
+      // HostPointerTrack). Identical to publishing `guest` while nothing has warped.
+      const target = hostPointerTrackRef.current.next(
+        guest, inputDevice.getCursor(), { x: width, y: height },
+      );
+      inputDevice.setPointerAbsolute(target.x, target.y);
+      inputDevice.setButtonsMask(event.buttons, "hw-mouse");
+      const dinputDX = Math.round(event.movementX * scaleX);
+      const dinputDY = Math.round(event.movementY * scaleY);
+      Atomics.add(inputView, INPUT_INDEX.dinputDX, dinputDX);
+      Atomics.add(inputView, INPUT_INDEX.dinputDY, dinputDY);
+      inputDevice.commit();
+      recordSample(inputView, 0, 0, dinputDX, dinputDY);
     };
 
-    const handlePointerEnter = () => {
+    const handlePointerEnter = (event?: PointerEvent) => {
+      if (event && event.pointerType !== "mouse") return;
       isCanvasHoveredRef.current = true;
-      updateCanvasCursor(true);
-      const inputView = globalInputView;
-      if (inputView && inputView[INPUT_INDEX.mouseInside] === 0) {
-        beginInputWrite(inputView);
-        inputView[INPUT_INDEX.mouseInside] = 1;
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
-      }
+      inputDevice.setMouseInside(true, "hw-mouse");
+      inputDevice.commit();
+      // Publish the entry position before showing the pointer, or the first frame draws
+      // it at wherever the cursor was when it last left.
+      if (event) writePointer(event);
+      // pointerenter does not bubble to the panel, so hit-test here too: entering the
+      // picture directly from the page chrome must light the pointer up immediately.
+      if (event) updatePointerOverCanvas(event); else syncCursorPresence();
     };
 
     const handlePointerLeave = (event?: PointerEvent) => {
+      if (event && event.pointerType !== "mouse") return;
       if (!isCanvasHoveredRef.current) return;
       // Don't leave if pointer is captured (button held down while moving outside)
       if (event && canvas.hasPointerCapture(event.pointerId)) return;
 
       isCanvasHoveredRef.current = false;
-      updateCanvasCursor(false);
+      hostPointerTrackRef.current.lose();
+      syncCursorPresence();
       const inputView = globalInputView;
       if (!inputView) return;
 
-      // Always signal mouse-outside so InputManager can fire WM_MOUSELEAVE
-      const insideChanged  = inputView[INPUT_INDEX.mouseInside] !== 0;
-      const buttonsChanged = inputView[INPUT_INDEX.buttons] !== 0;
-      if (insideChanged || buttonsChanged) {
-        beginInputWrite(inputView);
-        if (insideChanged)  inputView[INPUT_INDEX.mouseInside] = 0;
-        if (buttonsChanged) inputView[INPUT_INDEX.buttons] = 0;
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
-      }
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: inputView[INPUT_INDEX.keyCode],
-          keyState: inputView[INPUT_INDEX.keyState],
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
-        });
-      }
+      // Always signal mouse-outside so InputManager can fire WM_MOUSELEAVE, and drop
+      // the buttons with it — a press that ends off-canvas has no up event to release it.
+      inputDevice.setMouseInside(false, "hw-mouse");
+      inputDevice.setButtonsMask(0, "hw-mouse");
+      inputDevice.commit();
+      recordSample(inputView);
     };
 
     const handleKey = (event: KeyboardEvent, state: number) => {
@@ -1467,7 +1992,7 @@ export default function App() {
           userReleasedLockRef.current = true;
           pointerLockCooldownRef.current = true;
           document.exitPointerLock();
-          setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+          setTimeout(() => { pointerLockCooldownRef.current = false; }, POINTER_LOCK_EXIT_COOLDOWN_MS);
           event.preventDefault();
           event.stopPropagation();
           return;
@@ -1489,39 +2014,10 @@ export default function App() {
         void audioEngine?.resume();
       }
 
-      // Update pressed keys set and serialize to bitfield
       const vk = event.keyCode & 0xff;
-      if (state === 1) {
-        pressedKeys.add(vk);
-      } else {
-        pressedKeys.delete(vk);
-      }
-      beginInputWrite(inputView);
-      syncKeyBitfield(inputView);
-
-      // Clear legacy single-event slots (deprecated)
-      inputView[INPUT_INDEX.keyCode] = 0;
-      inputView[INPUT_INDEX.keyState] = 0;
-
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: vk,
-          keyState: state,
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel] ?? 0,
-        });
-      }
+      inputDevice.setKey(vk, state === 1, "hw-key");
+      inputDevice.commit();
+      recordSample(inputView, vk, state);
     };
 
 
@@ -1529,6 +2025,8 @@ export default function App() {
     const handleKeyUp = (event: KeyboardEvent) => handleKey(event, 0);
 
     const handlePointerDown = (event: PointerEvent) => {
+      notePointerKind(kindOfPointerType(event.pointerType));
+      if (event.pointerType !== "mouse") return;
       // Capture pointer to receive events even when cursor leaves canvas.
       // Guarded: throws InvalidStateError if the pointer was released before
       // this handler ran (fast tap, synthetic events, etc.) — safe to ignore.
@@ -1536,8 +2034,12 @@ export default function App() {
       // A deliberate click on the canvas is the re-engage gesture: clear the Right-Ctrl
       // host-release suppression so lock can be re-acquired.
       userReleasedLockRef.current = false;
+      // Arm before requesting: this click may land inside the browser's post-exit refusal
+      // window (Right Ctrl / ESC release), where the request is silently rejected. Armed,
+      // the next gesture retries instead of the click being lost.
+      armPointerLockGesture();
       // If cursor is hidden by guest, request pointer lock (user click = valid gesture)
-      if (wantsPointerLockRef.current && !pointerLockedRef.current) {
+      if (relativeIntent.get() && !pointerLockedRef.current) {
         requestPointerLockSafe(canvas);
         // Still forward this click — before pointer lock is acquired, absolute coords
         // are still valid (pointermove has been syncing them). Without forwarding,
@@ -1552,6 +2054,7 @@ export default function App() {
     };
 
     const handlePointerUp = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse") return;
       // Release capture (usually automatic, but be explicit)
       if (canvas.hasPointerCapture(event.pointerId)) {
         canvas.releasePointerCapture(event.pointerId);
@@ -1569,9 +2072,41 @@ export default function App() {
     canvas.addEventListener("pointerenter", handlePointerEnter);
     canvas.addEventListener("pointerleave", handlePointerLeave);
     canvas.addEventListener("contextmenu", handleContextMenu);
+
+    const panel = panelRef.current;
+    /** Is this client point on the guest screen? */
+    const updatePointerOverCanvas = (event: PointerEvent | null) => {
+      let over = false;
+      if (event) {
+        const rect = liveCanvasRect();
+        over = !!rect && rect.width > 0 && rect.height > 0
+          && event.clientX >= rect.left && event.clientX < rect.right
+          && event.clientY >= rect.top && event.clientY < rect.bottom;
+      }
+      if (isPointerOverCanvasRef.current === over) return;
+      isPointerOverCanvasRef.current = over;
+      syncCursorPresence();
+    };
+    // On the PANEL, so a move across the letterbox is seen even though the canvas — which
+    // is what we are hit-testing against — receives nothing out there.
+    // Touch counts too: a contact IS the pointer, and it is the only thing that puts a
+    // pointer on the picture on a device with no mouse — without it the guest's cursor is
+    // never drawn there and the fingertip offset has nothing to offset.
+    const handlePanelPointer = (event: PointerEvent) => {
+      updatePointerOverCanvas(event);
+    };
+    const handlePanelLeave = (event: PointerEvent) => {
+      // Touch leaves on every lift, and the guest's cursor stays where the finger put it;
+      // only a real hovering pointer can be somewhere else.
+      if (event.pointerType !== "mouse") return;
+      updatePointerOverCanvas(null);
+    };
+    panel?.addEventListener("pointerdown", handlePanelPointer);
+    panel?.addEventListener("pointermove", handlePanelPointer);
+    panel?.addEventListener("pointerleave", handlePanelLeave);
     
     const handleWheel = (event: WheelEvent) => {
-      const rect = canvasRectRef.current ?? canvas.getBoundingClientRect();
+      const rect = contentRectRef.current ?? canvas.getBoundingClientRect();
       const inputView = globalInputView;
       if (!inputView) return;
 
@@ -1582,7 +2117,7 @@ export default function App() {
       if (!insideCanvas) return;
 
       const pointerSpace =
-        mouseCoordinateModeRef.current === "guest"
+        guestResolutionKnownRef.current
           ? guestResolutionRef.current
           : resolutionRef.current;
       const width = Math.max(1, pointerSpace.width);
@@ -1590,12 +2125,14 @@ export default function App() {
 
       const scaleX = width / rect.width;
       const scaleY = height / rect.height;
-      const x = Math.max(0, Math.min(width, (event.clientX - rect.left) * scaleX));
-      const y = Math.max(0, Math.min(height, (event.clientY - rect.top) * scaleY));
-
-      beginInputWrite(inputView);
-      inputView[INPUT_INDEX.mouseX] = Math.round(x);
-      inputView[INPUT_INDEX.mouseY] = Math.round(y);
+      inputDevice.setPointerBounds(width, height);
+      // Same host pointer as writePointer's, so the same track: a wheel notch must not
+      // republish a stale absolute position over a pointer the guest has warped.
+      const wheelTarget = hostPointerTrackRef.current.next(
+        { x: (event.clientX - rect.left) * scaleX, y: (event.clientY - rect.top) * scaleY },
+        inputDevice.getCursor(), { x: width, y: height },
+      );
+      inputDevice.setPointerAbsolute(wheelTarget.x, wheelTarget.y);
       // Normalize deltaY to CSS pixel equivalent regardless of deltaMode:
       //   DOM_DELTA_PIXEL (0): use as-is (~100px per notch → InputManager * 1.2 ≈ 120 WHEEL_DELTA)
       //   DOM_DELTA_LINE  (1): ~33px per line; 3 lines/notch → 99px → * 1.2 ≈ 120
@@ -1606,27 +2143,10 @@ export default function App() {
         case 2: pixelDelta = event.deltaY * 500; break; // DOM_DELTA_PAGE
         default: pixelDelta = event.deltaY;              // DOM_DELTA_PIXEL
       }
-      inputView[INPUT_INDEX.mouseWheel] = Math.round(pixelDelta);
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
-      if (isRecording) {
-        recordedInputs.push({
-          t: performance.now() - recordStart,
-          mouseX: inputView[INPUT_INDEX.mouseX],
-          mouseY: inputView[INPUT_INDEX.mouseY],
-          buttons: inputView[INPUT_INDEX.buttons],
-          keyCode: inputView[INPUT_INDEX.keyCode],
-          keyState: inputView[INPUT_INDEX.keyState],
-          gamepadConnected: inputView[INPUT_INDEX.gamepadConnected],
-          gamepadButtons: inputView[INPUT_INDEX.gamepadButtons],
-          gamepadAxis0: inputView[INPUT_INDEX.gamepadAxis0],
-          gamepadAxis1: inputView[INPUT_INDEX.gamepadAxis1],
-          gamepadAxis2: inputView[INPUT_INDEX.gamepadAxis2],
-          gamepadAxis3: inputView[INPUT_INDEX.gamepadAxis3],
-          mouseWheel: inputView[INPUT_INDEX.mouseWheel],
-        });
-      }
-      
+      inputDevice.addWheel(pixelDelta);
+      inputDevice.commit({ immediate: true });
+      recordSample(inputView);
+
       // Prevent default scrolling behavior when over canvas
       event.preventDefault();
     };
@@ -1645,33 +2165,26 @@ export default function App() {
     // center would make LBUTTONUP jump to (width/2, height/2) mid-click (drag mismatch).
     const handlePointerLockChange = () => {
       pointerLockedRef.current = document.pointerLockElement === canvas;
+      syncCursorPresence();
       if (pointerLockedRef.current) {
-        const iv = globalInputView;
-        if (iv) {
-          // Seed from the last absolute position already in the SAB
-          virtualMouseRef.current = {
-            x: iv[INPUT_INDEX.mouseX],
-            y: iv[INPUT_INDEX.mouseY],
-          };
-        } else {
-          // Fallback: center of guest resolution
-          const guest = guestResolutionRef.current;
-          virtualMouseRef.current = {
-            x: Math.round(guest.width / 2),
-            y: Math.round(guest.height / 2),
-          };
-        }
-        // No SAB write needed — position hasn't changed
+        disarmPointerLockGesture();
+        // The device already holds the last absolute position, which is exactly the
+        // seed we want; nothing to publish because the position has not changed.
       } else {
         // Lock was lost (commonly ESC, which is also Unreal's menu key — the browser
         // force-exits lock on ESC). If the guest still wants relative mouse and the user did
         // NOT deliberately release via Right Ctrl, arm a re-acquire. handlePointerDown
         // re-requests on the next click (the reliable gesture); we also opportunistically
         // attempt on the next pointermove via writePointer.
-        if (wantsPointerLockRef.current && !userReleasedLockRef.current) {
-          // ESC force-exit briefly rejects re-acquire; cooldown gates the click/move retries.
+        if (relativeIntent.get() && !userReleasedLockRef.current) {
+          // A browser-initiated exit rejects re-acquire for over a second, so the retry
+          // cannot be a one-shot: arm the gesture listener as well, so the next trusted
+          // pointerdown ANYWHERE re-engages rather than only a click that happens to land
+          // on the canvas. ESC is a menu key in most of these titles, so this path runs
+          // every time the player opens and closes the menu.
           pointerLockCooldownRef.current = true;
-          setTimeout(() => { pointerLockCooldownRef.current = false; }, 32);
+          setTimeout(() => { pointerLockCooldownRef.current = false; }, POINTER_LOCK_EXIT_COOLDOWN_MS);
+          armPointerLockGesture();
         }
       }
     };
@@ -1683,19 +2196,21 @@ export default function App() {
     };
     window.addEventListener("pointerdown", unlockAudio, { passive: true });
 
-    // Clear all pressed keys on focus loss to prevent stuck keys
+    // Nothing any producer holds may survive focus loss — a key or button still down
+    // when the tab goes away has no release event coming.
     const handleBlur = () => {
-      pressedKeys.clear();
-      const inputView = globalInputView;
-      if (inputView) {
-        beginInputWrite(inputView);
-        syncKeyBitfield(inputView); // all zeros
-        inputView[INPUT_INDEX.buttons] = 0; // mouse buttons too
-        inputView[INPUT_INDEX.keyCode] = 0;
-        inputView[INPUT_INDEX.keyState] = 0;
-        endInputWrite(inputView);
-        globalWorker?.postMessage({ type: "input_tick" });
-      }
+      inputDevice.releaseAllSources();
+      // Do NOT let the presser publish here: its own immediate commit would ship the
+      // frame where the pad is released but not yet re-asserted, which reads as a
+      // controller unplug on every tab hide.
+      touchControlsRef.current?.releaseAll(false);
+      // The gesture state machine has to forget the contact too — zeroing the source
+      // level while the recognizer still believes its button is down leaves an edge
+      // emitter with nothing to emit, and the drag stays dead until the finger lifts.
+      touchDriver.reset();
+      // Losing focus releases what was held; it does not unplug the controller.
+      assertVirtualPad();
+      inputDevice.commit({ immediate: true });
     };
     const handleVisibilityChange = () => {
       if (document.hidden) handleBlur();
@@ -1713,9 +2228,11 @@ export default function App() {
     (window as any).enableHleAndLoad = async (path: string, logOnly = false, galaxyHleMixer = true) => {
       if (!globalWorker) { console.error("BottleShip: Worker not initialized"); return; }
       console.log(`BottleShip: enableHleAndLoad logOnly=${logOnly} mixer=${galaxyHleMixer} → ${path}`);
-      rotateLogFile((path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game") + "-hle");
+      rotateLogFile(bundleLogName(path) + "-hle");
       setIsLoadingApp(true);
       setErrorMessage(null);
+      setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+      exitInfoRef.current = null;
       setBundleDisplayName(null);
       canvasRef.current?.focus();
       const lower = path.toLowerCase();
@@ -1730,14 +2247,24 @@ export default function App() {
       return (window as any).loadApp(path);
     };
 
-    (window as any).loadApp = async (path: string) => {
+    // opts.preload: download the whole bundle to OPFS before starting instead of
+    // streaming it on demand (catalog entry `preload`) — see the worker's URL path.
+    (window as any).loadApp = async (path: string, opts?: { preload?: boolean; args?: string }) => {
       console.log(`BottleShip: Loading App from ${path}`);
-      rotateLogFile(path.split(/[\\/]/).pop()?.replace(/\.wgb$/i, "") || "game");
+      rotateLogFile(bundleLogName(path));
       ensurePersistentStorageRequested();
       setIsLoadingApp(true);
       setErrorMessage(null); // Clear any previous errors
       setExitInfo(null); // Fresh load supersedes a prior exit/crash overlay
+      exitInfoRef.current = null;
       setBundleDisplayName(null);
+      document.title = "BottleShip";
+      // Drop the previous PE's favicon until the next window_icon arrives.
+      const iconLink = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+      if (iconLink) {
+        if (iconLink.href.startsWith("blob:")) URL.revokeObjectURL(iconLink.href);
+        iconLink.removeAttribute("href");
+      }
       audioEngine?.stopAll(); // Silence stale ring buffers from the previous game
       if (!globalWorker) {
         console.error("BottleShip: Worker not initialized");
@@ -1748,7 +2275,7 @@ export default function App() {
       const lower = path.toLowerCase();
       if (lower.endsWith(".wgb")) {
         setLoadingProgress({ phase: "loading", percent: 0, label: "" });
-        globalWorker.postMessage({ type: "load_bundle", url: path });
+        globalWorker.postMessage({ type: "load_bundle", url: path, preload: opts?.preload === true, args: opts?.args });
         return;
       }
       try {
@@ -1771,24 +2298,44 @@ export default function App() {
       }
     };
 
+    // A self re-exec from a loadApp(url) session (dev / harness / "?game=dev"): the reload
+    // lands on a page that boots no game by itself, so replay the URL now that loadApp
+    // exists. The worker already holds the launcher's command line (set_boot_args above);
+    // a registered `?game=<id>` boot needs nothing here — its normal path picks the args up.
+    if (reExecBundleUrl) {
+      const url = reExecBundleUrl;
+      reExecBundleUrl = null;
+      void (window as any).loadApp(url);
+    } else {
+      // The dev bundle browser launches through a reload (see handleLaunchBundle): a fresh
+      // page is the only teardown that is genuinely complete, so back-to-back regression
+      // runs can't inherit the previous game's worker state.
+      try {
+        const pending = sessionStorage.getItem(PENDING_BUNDLE_KEY);
+        if (pending) {
+          sessionStorage.removeItem(PENDING_BUNDLE_KEY);
+          void (window as any).loadApp(pending);
+        }
+      } catch { /* no pending bundle */ }
+    }
+
     const applyInputSample = (sample: InputSample) => {
-      const inputView = globalInputView;
-      if (!inputView) return;
-      beginInputWrite(inputView);
-      inputView[INPUT_INDEX.mouseX] = sample.mouseX;
-      inputView[INPUT_INDEX.mouseY] = sample.mouseY;
-      inputView[INPUT_INDEX.buttons] = sample.buttons;
-      inputView[INPUT_INDEX.keyCode] = sample.keyCode;
-      inputView[INPUT_INDEX.keyState] = sample.keyState;
-      inputView[INPUT_INDEX.gamepadConnected] = sample.gamepadConnected;
-      inputView[INPUT_INDEX.gamepadButtons] = sample.gamepadButtons;
-      inputView[INPUT_INDEX.gamepadAxis0] = sample.gamepadAxis0;
-      inputView[INPUT_INDEX.gamepadAxis1] = sample.gamepadAxis1;
-      inputView[INPUT_INDEX.gamepadAxis2] = sample.gamepadAxis2;
-      inputView[INPUT_INDEX.gamepadAxis3] = sample.gamepadAxis3;
-      inputView[INPUT_INDEX.mouseWheel] = sample.mouseWheel ?? 0;
-      endInputWrite(inputView);
-      globalWorker?.postMessage({ type: "input_tick" });
+      if (!globalInputView) return;
+      inputDevice.setPointerAbsolute(sample.mouseX, sample.mouseY);
+      // The absolute position is authoritative on replay, so feed the device deltas
+      // through the RAW channel only — a relative-mouse title reads nothing else.
+      if (sample.dinputDX || sample.dinputDY) {
+        inputDevice.addPointerRelative(0, 0, sample.dinputDX ?? 0, sample.dinputDY ?? 0);
+      }
+      inputDevice.setButtonsMask(sample.buttons, "replay");
+      if (sample.keyCode) inputDevice.setKey(sample.keyCode, sample.keyState === 1, "replay");
+      inputDevice.publishPad({
+        connected: sample.gamepadConnected === 1,
+        buttons: sample.gamepadButtons,
+        axes: [sample.gamepadAxis0, sample.gamepadAxis1, sample.gamepadAxis2, sample.gamepadAxis3],
+      }, "replay");
+      if (sample.mouseWheel) inputDevice.addWheel(sample.mouseWheel);
+      inputDevice.commit({ immediate: true });
     };
 
     (window as any).startRecording = () => {
@@ -2016,13 +2563,18 @@ export default function App() {
     return () => {
       window.removeEventListener("resize", resize);
       window.visualViewport?.removeEventListener("resize", resize);
+      window.visualViewport?.removeEventListener("scroll", resize);
       document.removeEventListener("fullscreenchange", resize);
       resizeObserver.disconnect();
+      detachTouch();
       canvas.removeEventListener("pointermove", writePointer);
       canvas.removeEventListener("pointerdown", handlePointerDown);
       canvas.removeEventListener("pointerup", handlePointerUp);
       canvas.removeEventListener("pointerenter", handlePointerEnter);
       canvas.removeEventListener("pointerleave", handlePointerLeave);
+      panel?.removeEventListener("pointerdown", handlePanelPointer);
+      panel?.removeEventListener("pointermove", handlePanelPointer);
+      panel?.removeEventListener("pointerleave", handlePanelLeave);
       canvas.removeEventListener("contextmenu", handleContextMenu);
       window.removeEventListener("keydown", handleKeyDown, true);
       window.removeEventListener("keyup", handleKeyUp, true);
@@ -2030,6 +2582,11 @@ export default function App() {
       window.removeEventListener("blur", handleBlur);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.removeEventListener("pointerlockchange", handlePointerLockChange);
+      // The armed capture-phase listener outlives this effect otherwise, and would keep
+      // requesting lock against a stale canvasRef after unmount/remount.
+      disarmPointerLockGesture();
+      guestCursor.dispose();
+      childSurface.dispose();
       // Keep loadApp exposed for buttons
     };
     // Deps are mount-stable only. Pause/load/worker-ready are read via refs
@@ -2096,14 +2653,12 @@ export default function App() {
           axes[3] !== lastGamepadAxes[3];
 
         if (changed) {
-          beginInputWrite(inputView);
-          inputView[INPUT_INDEX.gamepadConnected] = connected;
-          inputView[INPUT_INDEX.gamepadButtons] = buttonsMask;
-          inputView[INPUT_INDEX.gamepadAxis0] = axes[0];
-          inputView[INPUT_INDEX.gamepadAxis1] = axes[1];
-          inputView[INPUT_INDEX.gamepadAxis2] = axes[2];
-          inputView[INPUT_INDEX.gamepadAxis3] = axes[3];
-          endInputWrite(inputView);
+          inputDevice.publishPad({
+            connected: connected === 1,
+            buttons: buttonsMask,
+            axes: [axes[0], axes[1], axes[2], axes[3]],
+          }, "hw-pad");
+          inputDevice.commit({ immediate: true });
           lastGamepadConnected = connected;
           lastGamepadButtons = buttonsMask;
           lastGamepadAxes = axes;
@@ -2154,8 +2709,14 @@ export default function App() {
       const doc = document as Document & { webkitFullscreenElement?: Element | null };
       const fs = Boolean(doc.fullscreenElement || doc.webkitFullscreenElement);
       setIsFullscreen(fs);
-      // Unsupported / not granted → ESC keeps exiting fullscreen, same as before.
-      if (fs) kb?.lock?.(["Escape"]).catch(() => { /* best-effort */ });
+      // Lock the WHOLE keyboard, not a key list. A guest binds what it likes — Far Cry's
+      // crouch-walk is Ctrl+W, which is also "close tab" — and a UA shortcut cannot be
+      // preventDefault'ed, so an un-locked combination takes the tab down mid-game. Naming
+      // keys here would mean enumerating every combination every game might bind.
+      // The user is not trapped: with the keyboard locked the UA still exits fullscreen on
+      // a HELD Escape, and a short Escape reaches the guest as its menu key.
+      // Unsupported / not granted → unchanged behaviour, the reserved keys stay the UA's.
+      if (fs) kb?.lock?.().catch(() => { /* best-effort */ });
       else kb?.unlock?.();
     };
 
@@ -2209,6 +2770,52 @@ export default function App() {
     }
   }, [isPaused]);
 
+  // A running game is not user activity as far as the OS is concerned, so the screen
+  // dims mid-session on a phone or tablet. The lock is dropped by the browser on tab
+  // hide and must be re-taken when we come back.
+  useEffect(() => {
+    if (workerStatus !== "ready" || isPaused) return;
+    const nav = navigator as Navigator & {
+      wakeLock?: { request: (type: "screen") => Promise<{ release: () => Promise<void> }> };
+    };
+    if (!nav.wakeLock) return;
+
+    let sentinel: { release: () => Promise<void> } | null = null;
+    let cancelled = false;
+    const acquire = () => {
+      if (cancelled || document.hidden) return;
+      nav.wakeLock!.request("screen")
+        .then((s) => { if (cancelled) void s.release(); else sentinel = s; })
+        .catch(() => { /* denied (battery saver, no gesture yet) — not worth surfacing */ });
+    };
+    acquire();
+    const onVisible = () => { if (!document.hidden) acquire(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      void sentinel?.release().catch(() => {});
+    };
+  }, [workerStatus, isPaused]);
+
+  const handleHostAction = useCallback((action: HostAction) => {
+    switch (action) {
+      case "fullscreen": toggleFullscreenRef.current(); break;
+      // The real toggle: the HUD is the only pause affordance on a keyboard-less
+      // device, and flipping the flag alone leaves the emulator running with audio
+      // that can never resume (isPausedRef then suppresses every resume attempt).
+      case "pause": void togglePause(); break;
+      case "keyboard": setOskOpen((v) => !v); break;
+      case "toggleControls": setControlsHidden((v) => !v); break;
+      case "releaseRelative":
+        // The touch equivalent of Right Ctrl: give the cursor back without a keyboard.
+        userReleasedLockRef.current = true;
+        if (document.pointerLockElement) document.exitPointerLock();
+        break;
+      case "editLayout": break;
+    }
+  }, [togglePause]);
+
   const toggleFullscreen = useCallback(async () => {
     const panel = panelRef.current;
     const target = panel ?? canvasRef.current;
@@ -2221,6 +2828,13 @@ export default function App() {
     const element = target as HTMLElement & {
       webkitRequestFullscreen?: () => Promise<void> | void;
     };
+
+    // iPhone Safari has no element Fullscreen API at all. Fall back to an immersive
+    // CSS mode rather than resolving to undefined and appearing to do nothing.
+    if (!target.requestFullscreen && !element.webkitRequestFullscreen) {
+      setImmersive((v) => !v);
+      return;
+    }
 
     try {
       if (doc.fullscreenElement || doc.webkitFullscreenElement) {
@@ -2237,6 +2851,12 @@ export default function App() {
       } else {
         await element.webkitRequestFullscreen?.();
       }
+      // These games are landscape. Best-effort: unimplemented on iOS Safari and
+      // rejected on Android outside real fullscreen, and neither is an error here.
+      const orientation = screen.orientation as ScreenOrientation & {
+        lock?: (o: string) => Promise<void>;
+      };
+      void orientation?.lock?.("landscape").catch(() => {});
     } catch (err) {
       setErrorMessage(`Fullscreen failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2255,12 +2875,76 @@ export default function App() {
     setIsLoadingApp(true);
     setErrorMessage(null);
     setExitInfo(null);
+    exitInfoRef.current = null;
     setBundleDisplayName(null);
     audioEngine?.stopAll();
     setLoadingProgress({ phase: "loading", percent: 0, label: "" });
     globalWorker.postMessage({ type: "load_bundle", blob: file });
     return true;
   }, []);
+
+  /** Dev bundle browser: open a bundle through a page reload rather than in place, so a
+   *  regression pass never carries the previous game's state into the next one. */
+  const handleLaunchBundle = useCallback((url: string) => {
+    try {
+      sessionStorage.setItem(PENDING_BUNDLE_KEY, url);
+      window.location.reload();
+    } catch {
+      void (window as any).loadApp?.(url); // sessionStorage unavailable — load in place
+    }
+  }, []);
+
+  /** One request/reply round-trip to the worker's aot_cmd channel. */
+  const aotCmd = useCallback((cmd: string, extra: Record<string, unknown> = {}) => {
+    return new Promise<any>((resolve) => {
+      if (!globalWorker) { resolve(null); return; }
+      const handler = (e: MessageEvent) => {
+        if (e.data?.type !== "aot_result" || e.data.cmd !== cmd) return;
+        globalWorker!.removeEventListener("message", handler);
+        resolve(e.data);
+      };
+      globalWorker.addEventListener("message", handler);
+      globalWorker.postMessage({ type: "aot_cmd", cmd, ...extra });
+    });
+  }, []);
+
+  const describeAot = useCallback((r: any): string => {
+    if (!r) return "no worker";
+    if (!r.ok) return `error: ${r.result}`;
+    const s = r.result ?? {};
+    if (s.saved) {
+      const saved = s.saved?.saved ?? s.saved?.error ?? "?";
+      return `saved ${saved} unit(s) from ${s.captured?.modules ?? 0} module(s)`;
+    }
+    const e = s.entered;
+    const rec = s.recording;
+    const parts: string[] = [];
+    if (rec?.armed) parts.push(`recording ${rec.modules} module(s)${rec.dropped ? `, ${rec.dropped} dropped` : ""}`);
+    if (s.units) parts.push(`${s.units} unit(s) loaded`);
+    if (e && e.units) parts.push(`${e.enteredUnits}/${e.alive} entered`);
+    return parts.join(" · ") || "idle";
+  }, []);
+
+  const handleAotRecord = useCallback(async () => {
+    const next = !aotRecording;
+    const r = await aotCmd(next ? "start" : "stop");
+    setAotRecording(next && !!r?.ok);
+    setAotStatus(describeAot(r));
+    // A stop that failed must not leave the button reading "recording": the whole point of
+    // showing state is that the ritual's silent failure becomes visible.
+    if (!next && r?.ok) setAotRecording(false);
+  }, [aotRecording, aotCmd, describeAot]);
+
+  const handleAotAutoLoad = useCallback(async () => {
+    const next = !aotAutoLoad;
+    const r = await aotCmd("autoload", { enabled: next });
+    setAotAutoLoad(next);
+    setAotStatus(describeAot(r));
+  }, [aotAutoLoad, aotCmd, describeAot]);
+
+  const handleAotStatus = useCallback(async () => {
+    setAotStatus(describeAot(await aotCmd("status")));
+  }, [aotCmd, describeAot]);
 
   const handleToggleFpuStrict = useCallback((strict: boolean) => {
     setFpuStrictEnabled(strict);
@@ -2275,6 +2959,8 @@ export default function App() {
       onClose={() => setMainSettingsOpen(false)}
       quality={quality}
       onChange={handleQualityChange}
+      unsupportedQualityKeys={unsupportedQualityKeys}
+      overriddenQualityKeys={overriddenQualityKeys}
       uiSettings={uiSettings}
       onUiChange={handleUiChange}
       statsOverlay={statsOverlayEnabled}
@@ -2283,6 +2969,7 @@ export default function App() {
       onToggleLogStreaming={handleToggleLogStreaming}
       onResetDefaults={handleResetSettings}
       guestResolution={guestResolution}
+      renderSize={canvasRenderSize}
       integerScale={integerScaleSize.scale}
       onOpenDevConsole={() => {
         if (browserSupport.supported) window.location.assign("?game=dev");
@@ -2320,6 +3007,7 @@ export default function App() {
           unsupportedMessage={browserUnsupportedMessage}
         />
         {settingsDrawer}
+        <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
         <WgbWizardModal
           isOpen={addGameOpen}
@@ -2412,7 +3100,7 @@ export default function App() {
     );
   }
 
-  if (!browserSupport.supported) {
+  if (!browserSupport.supported || policyBlock) {
     return (
       <div style={{
         minHeight: "100vh",
@@ -2436,30 +3124,47 @@ export default function App() {
           flexDirection: "column",
           gap: "14px",
         }}>
-          <h1 style={{ margin: 0, fontSize: "1.3rem", color: "#ff8f8f" }}>
-            Unsupported browser
-          </h1>
-          <p style={{ margin: 0, color: "#d3c2c2", lineHeight: 1.45 }}>
+          {/* Our own heading would put a second language on a screen whose only sentence
+              the operator wrote for their audience. */}
+          {!policyBlock && (
+            <h1 style={{ margin: 0, fontSize: "1.3rem", color: "#ff8f8f" }}>
+              Unsupported browser
+            </h1>
+          )}
+          <p style={{
+            margin: 0,
+            color: policyBlock ? "#f0e2e2" : "#d3c2c2",
+            fontSize: policyBlock ? "1.05rem" : undefined,
+            lineHeight: 1.45,
+          }}>
             {browserUnsupportedMessage}
           </p>
-          <p style={{ margin: 0, color: "#9f8c8c", fontSize: "0.92rem" }}>
-            Launching games is disabled in this browser. Open the page in an up-to-date Google Chrome or Safari 26+ and try again.
-          </p>
-          <button
-            onClick={() => window.location.assign("/")}
-            style={{
-              marginTop: "8px",
-              alignSelf: "flex-start",
-              border: "1px solid #5f3b3b",
-              backgroundColor: "#241616",
-              color: "#f4d8d8",
-              borderRadius: "8px",
-              padding: "8px 14px",
-              cursor: "pointer",
-            }}
-          >
-            Back to library
-          </button>
+          {/* A policy message is written by the operator for their own audience and already
+              says what to do — anything we add here is a second voice, in our language. */}
+          {!policyBlock && (
+            <p style={{ margin: 0, color: "#9f8c8c", fontSize: "0.92rem" }}>
+              Launching games is disabled in this browser. Open the page in an up-to-date Google Chrome or Safari 26+ and try again.
+            </p>
+          )}
+          {/* Under a policy block the library is the same blocked page — offering it back
+              is a dead end. */}
+          {!policyBlock && (
+            <button
+              onClick={() => window.location.assign("/")}
+              style={{
+                marginTop: "8px",
+                alignSelf: "flex-start",
+                border: "1px solid #5f3b3b",
+                backgroundColor: "#241616",
+                color: "#f4d8d8",
+                borderRadius: "8px",
+                padding: "8px 14px",
+                cursor: "pointer",
+              }}
+            >
+              Back to library
+            </button>
+          )}
         </div>
       </div>
     );
@@ -2473,7 +3178,7 @@ export default function App() {
 
   return (
     <div
-      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer")}
+      className={cx(s, "app", uiSettings.lockFullscreenAspect ? "app--fullscreen-aspect-lock" : "app--fullscreen-aspect-free", uiSettings.integerScaling && "app--fullscreen-integer", immersive && "app--immersive")}
       style={
         {
           ["--fullscreen-aspect-w" as string]: String(fullscreenAspect.w),
@@ -2498,7 +3203,7 @@ export default function App() {
           {(displayGame!.id !== "dev" || bundleDisplayName) && (
             <>
               <span className={s["emu-game-name"]}>{gameDisplayName}</span>
-              {displayGame!.id !== "dev" && displayGame!.subtitle && (
+              {!hasImportedBundle && displayGame!.id !== "dev" && displayGame!.subtitle && (
                 <span className={s["emu-game-subtitle"]}>{displayGame!.subtitle}</span>
               )}
             </>
@@ -2552,10 +3257,17 @@ export default function App() {
           onOpenDebugGpu={() => setDebugGpuOpen(true)}
           onOpenFrameAnalysis={() => setFrameAnalysisOpen(true)}
           onOpenStorage={() => setStorageOpen(true)}
+          onOpenBundles={import.meta.env.DEV ? () => setWgbBrowserOpen(true) : undefined}
           onOpenOpfsTool={() => setOpfsToolOpen(true)}
           onOpenRegistryTool={() => setRegistryToolOpen(true)}
           fpuStrictEnabled={fpuStrictEnabled}
           onToggleFpuStrict={handleToggleFpuStrict}
+          aotRecording={aotRecording}
+          aotAutoLoad={aotAutoLoad}
+          aotStatus={aotStatus}
+          onAotRecord={handleAotRecord}
+          onAotAutoLoad={handleAotAutoLoad}
+          onAotStatus={handleAotStatus}
           loggingEnabled={loggingEnabled}
           onToggleLogging={toggleLogging}
         />
@@ -2572,7 +3284,31 @@ export default function App() {
           className={cx(s, "app__canvas", uiSettings.canvasFiltering === "pixelated" && "app__canvas--pixelated")}
           style={{ aspectRatio: `${guestResolution.width} / ${guestResolution.height}` }}
         />
+        {/* The guest's pointer — the canvas hides the OS one unconditionally. See ./guest-cursor. */}
+        <canvas ref={cursorCanvasRef} className={s["app__cursor"]} aria-hidden />
+        {workerStatus === "ready" && showTouchControls && (
+          <TouchControlLayer
+            ref={touchControlsRef}
+            layout={activeLayout.layout}
+            getPointerScale={guestPerCss}
+            sensitivity={uiSettings.touchSensitivity}
+            idleFade={uiSettings.touchIdleFade}
+            onHostAction={handleHostAction}
+          />
+        )}
         {workerStatus === "ready" && <InputStatusOverlay status={inputStatus} />}
+        {workerStatus === "ready" && showTouchHud && (
+          <TouchHud onHostAction={handleHostAction} />
+        )}
+        {workerStatus === "ready" && (
+          <TouchFirstRunHint
+            active={showTouchControls}
+            trackpad={activeLayout.mode === "trackpad"}
+          />
+        )}
+        {/* The HUD's keyboard action only exists on this screen, so the sheet has to be
+            mounted here too — not only in the library return. */}
+        <VirtualKeyboardSheet open={oskOpen} onClose={() => setOskOpen(false)} />
         {loadingProgress && !errorMessage && !exitInfo && (() => {
           const activeStage = loadPhaseStageIndex(loadingProgress.phase);
           const status = loadPhaseStatus(loadingProgress.phase, gameDisplayName);
@@ -2633,24 +3369,28 @@ export default function App() {
         <div className={s["emu-info-strip"]}>
           <span className={s["emu-info-name"]}>
             {gameDisplayName}
-            {displayGame!.id !== "dev" && displayGame!.subtitle && (
+            {!hasImportedBundle && displayGame!.id !== "dev" && displayGame!.subtitle && (
               <span className={s["emu-info-subtitle"]}>&nbsp;{displayGame!.subtitle}</span>
             )}
           </span>
           <span className={s["emu-info-desc"]}>
-            {displayGame!.id !== "dev" ? displayGame!.description : ""}
+            {!hasImportedBundle && displayGame!.id !== "dev" ? displayGame!.description : ""}
           </span>
-          {displayGame!.id !== "dev" && displayGame!.gogUrl && (
-            <a
-              className={s["emu-info-gog"]}
-              href={displayGame!.gogUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Own it? Get it on GOG →
-            </a>
-          )}
           <span className={s["emu-info-hints"]}>F11 · Fullscreen</span>
+        </div>
+      )}
+
+      {displayGame!.id !== "dev" && displayGame!.gogUrl && !hasImportedBundle && (
+        <div className={s["gog-upgrade"]}>
+          <div><strong>Own the full game on GOG?</strong> Drop your offline installer here and play your copy.
+            <small>Include setup.exe and every setup-*.bin part. Download your WGB or free cached files in Settings → Storage.</small>
+          </div>
+          <button className={s["emu-topbar-btn"]} disabled={isLoadingApp} onClick={() => installerInputRef.current?.click()}>Import full game</button>
+          <a className={s["emu-info-gog"]} href={displayGame!.gogUrl} target="_blank" rel="noopener noreferrer">Get it on GOG →</a>
+          <input ref={installerInputRef} type="file" accept=".exe,.bin" multiple hidden onChange={(e) => {
+            if (e.target.files?.length) handleDroppedFiles(e.target.files);
+            e.target.value = "";
+          }} />
         </div>
       )}
 
@@ -2661,6 +3401,13 @@ export default function App() {
 
       {settingsDrawer}
       <OpfsTool isOpen={opfsToolOpen} onClose={() => setOpfsToolOpen(false)} />
+      {import.meta.env.DEV && (
+        <WgbBrowser
+          isOpen={wgbBrowserOpen}
+          onClose={() => setWgbBrowserOpen(false)}
+          onLaunch={handleLaunchBundle}
+        />
+      )}
       <StorageManagerModal isOpen={storageOpen} onClose={() => setStorageOpen(false)} />
       <RegistryTool isOpen={registryToolOpen} onClose={() => setRegistryToolOpen(false)} worker={globalWorker} />
       <DebugLogViewer isOpen={logViewerOpen} onClose={() => setLogViewerOpen(false)} worker={globalWorker} />

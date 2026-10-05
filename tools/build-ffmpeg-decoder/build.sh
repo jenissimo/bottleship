@@ -8,6 +8,8 @@
 #     Linux:    emsdk install latest && emsdk activate latest
 #   - Standard build tools: make, git, pkg-config
 #   - nasm / yasm are NOT needed (--disable-x86asm)
+#   - A Windows checkout with core.autocrlf=true CRLF-ifies this file, and bash then rejects
+#     line 1 of `set -euo pipefail`; run a `tr -d '\r'` copy, or check out with LF.
 #
 # Output: public/video-decoder.wasm   (+ public/video-decoder.js glue)
 #
@@ -17,9 +19,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BUILD_DIR="$PROJECT_ROOT/.build-ffmpeg"
+# Build/output locations are overridable so a candidate build can be staged and A/B'd
+# without overwriting the shipped public/ artifact that a running emulator is loading.
+BUILD_DIR="${BS_FFMPEG_BUILD_DIR:-$PROJECT_ROOT/.build-ffmpeg}"
 FFMPEG_DIR="$BUILD_DIR/ffmpeg"
-OUTPUT_DIR="$PROJECT_ROOT/public"
+OUTPUT_DIR="${BS_FFMPEG_OUT_DIR:-$PROJECT_ROOT/public}"
+
+# WASM SIMD (simd128), OPT-IN. FFmpeg's hand-written DSP is disabled below (--disable-x86asm /
+# --disable-inline-asm), so every codec and swscale's YUV->BGRA converter runs the pure-C path,
+# and -msimd128 is what would let LLVM auto-vectorize it. MEASURED: it does vectorize (79k SIMD
+# instructions vs 0) and decodes bit-identical pixels, but a full decode of a real 640x100/110f
+# AVI is 15.3ms vs 14.9ms scalar -- no gain, and +20% binary (3.76MB vs 3.13MB). Decode is
+# ~0.14ms/frame either way, so this is simply not where video time goes; do not enable it
+# without a profile that puts a decoder loop on the hot path. Set BS_FFMPEG_SIMD=1 to build it.
+if [[ "${BS_FFMPEG_SIMD:-0}" == "1" ]]; then
+    SIMD_FLAGS="-msimd128"
+else
+    SIMD_FLAGS=""
+fi
 
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
@@ -76,11 +93,11 @@ echo "[build] Configuring FFmpeg (curated legacy-game video set) …"
 emconfigure ./configure \
     --prefix="$FFMPEG_INSTALL" \
     --disable-everything \
-    --enable-demuxer=bink,smacker,avi,mov,asf,flv,ogg,mpegps,mpegvideo,mpegts,roq,vmd,flic,dv,wav,idcin,fourxm,str \
+    --enable-demuxer=bink,smacker,avi,mov,asf,flv,ogg,mpegps,mpegvideo,mpegts,roq,vmd,flic,dv,wav,idcin,fourxm,str,rpl \
     --enable-decoder=bink,smacker,cinepak,indeo2,indeo3,indeo4,indeo5,msvideo1,msrle,rawvideo,mjpeg,mjpegb \
     --enable-decoder=mpeg1video,mpeg2video,mpeg4,msmpeg4v1,msmpeg4v2,msmpeg4v3,h263,h263i,h263p \
     --enable-decoder=wmv1,wmv2,wmv3,vc1,flv,vp3,vp5,vp6,vp6a,vp6f,svq1,svq3,rpza,qtrle,smc,qdraw,qpeg,tscc,tscc2 \
-    --enable-decoder=roq,truemotion1,truemotion2,dvvideo,flic,idcin,interplay_video,mdec,fourxm,cdgraphics,theora \
+    --enable-decoder=roq,truemotion1,truemotion2,dvvideo,flic,idcin,interplay_video,mdec,fourxm,cdgraphics,theora,escape124,escape130 \
     --enable-decoder=mp2,mp2float,mp3,mp3float,wmav1,wmav2,vorbis,smackaud,binkaudio_dct,binkaudio_rdft \
     --enable-decoder=roq_dpcm,vmdaudio,nellymoser,qdm2,truespeech,interplay_dpcm,xan_dpcm \
     --enable-decoder=pcm_u8,pcm_s8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s32le,pcm_f32le,pcm_alaw,pcm_mulaw \
@@ -106,7 +123,7 @@ emconfigure ./configure \
     --cxx=em++ \
     --ar=emar \
     --ranlib=emranlib \
-    --extra-cflags="-O2" \
+    --extra-cflags="-O2 $SIMD_FLAGS" \
     --disable-autodetect \
     --disable-iconv \
     --disable-zlib \
@@ -154,6 +171,12 @@ EXPORTED_FUNCTIONS=(
     "_decoder_get_video_codec_name"
     "_decoder_get_video_fourcc"
     "_decoder_get_video_pix_fmt"
+    "_decoder_set_enhance"
+    "_decoder_get_enhance"
+    "_decoder_get_frame_interlaced"
+    "_decoder_get_interlaced_frames"
+    "_decoder_get_video_color_range"
+    "_decoder_get_video_colorspace"
 )
 
 # Build JSON array of exported function names
@@ -170,7 +193,7 @@ emcc tools/build-ffmpeg-decoder/decoder_api.c \
     -s EXPORTED_FUNCTIONS="$EXPORT_JSON" \
     -s ERROR_ON_UNDEFINED_SYMBOLS=0 \
     -s INITIAL_MEMORY=67108864 \
-    -O2 \
+    -O2 $SIMD_FLAGS \
     -o "$OUTPUT_DIR/video-decoder.wasm"
 
 echo "[build] Done: $OUTPUT_DIR/video-decoder.wasm"

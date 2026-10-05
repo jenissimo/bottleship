@@ -1,17 +1,24 @@
-import { ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from "../../core/thunking/thunk-dispatcher";
+import type { FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from "../../core/logger";
+import { assignStubsOnce } from "../../core/thunking/stub-merge";
 import { System } from "../../core/system";
 import { profiler } from "../../core/profiler";
 import { frameVarianceDiagnostics } from "../../core/frame-variance-diagnostics";
 import { DDrawContext } from "./context";
+import { gpuDeviceUsable } from "../../core/gpu/gpu-device-lifecycle";
+import { isSurfaceLost, markSurfaceRestored } from "../../core/gpu/gpu-device-loss-contract";
 import { registerSurfaceV1Exports } from "./surface-v1";
 import {
     DD_OK,
     DDERR_NOTFOUND,
     DDERR_INVALIDPARAMS,
-    DDERR_NOCLIPPER,
+    DDERR_NOCLIPPERATTACHED,
+    DDERR_SURFACELOST,
     DDSCAPS_BACKBUFFER,
     DDSCAPS_FLIP,
+    DDSCAPS_FRONTBUFFER,
+    DDSCAPS_OVERLAY,
     DDSCAPS_PRIMARYSURFACE,
     DDSCAPS_SYSTEMMEMORY,
     DDSCAPS_VIDEOMEMORY,
@@ -19,8 +26,6 @@ import {
     DDSCAPS_ZBUFFER,
     DDSCAPS_MIPMAP,
     DDSD_LPSURFACE,
-    allocateComObject,
-    checkComGuard,
     D3DCLEAR_TARGET,
     DDSURFACEDESC2_OFFSETS,
     DDSURFACEDESC_OFFSETS,
@@ -36,27 +41,42 @@ import {
     DDCKEY_DESTBLT,
     DDPF_ALPHAPIXELS,
     DDLOCK_READONLY,
-    DDLOCK_WRITEONLY,
     DDLOCK_DISCARDCONTENTS,
     IID_IDirectDrawGammaControl,
+    IID_IDirect3DDevice3,
+    IID_IDirect3DHALDevice,
+    IID_IDirect3DRGBDevice,
+    IID_IDirect3DRampDevice,
+    IID_IDirect3DMMXDevice,
+    D3DRENDERSTATE_COLORKEYENABLE,
+    DDERR_CANNOTDETACHSURFACE, DDERR_SURFACENOTATTACHED, DDERR_INVALIDOBJECT, DDERR_SURFACEBUSY,
+    DDERR_WASSTILLDRAWING,
 } from "./constants";
-import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs } from "./helpers";
+import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs, surfaceAt } from "./helpers";
 import { writeSurfaceDescV1 } from "./structs";
-import { DirectDrawSurfaceObject, DirectDrawSurfaceState, Direct3DTextureObject, Direct3DTexture2Object, DirectDrawGammaControlObject, DirectDrawClipperObject, isBitmapTexture, isRenderSurface } from "./com-objects";
+import { DirectDrawSurfaceObject, DirectDrawSurfaceState, Direct3DTextureObject, Direct3DTexture2Object, DirectDrawGammaControlObject, DirectDrawClipperObject, Direct3DDevice3Object, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { writePixelFormat, writeSurfaceDesc } from "./structs";
 import { isValidAddress, isSafeSurfaceAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { ComObjectFactory } from "../../core/com/base-com-object";
+import { allocateComObject, checkComGuard } from "../../core/com/com-memory";
 
 import { convertRGBAToSurface, uploadToGPUTexture, convertSurfaceToRGBA } from "./gpu-texture-utils";
-import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
+import { setAuthorityCpu, setAuthorityGpu, markCpuSyncedFromGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager, logSurfaceState, demoteSurfaceToCpu } from "./surface-sync";
+import { noteReadLockCandidate } from "./surface-readback-prefetch";
+import { lockCostProfiler, LP, LC, type LockClass } from "./lock-cost-profiler";
+import { decideLockSync, lockMustNotBlock, noteReadLockServedStale } from "./lock-flags";
+import { recordSurfaceOp, surfaceOpsArmed } from "./surface-op-log";
+import { isZBufferSurface, syncZBufferWriteToDepth } from "./depth-fill";
 import { propagateSurfaceStateToRegistry } from "./d3d/texture-manager";
 import { thunkChecksumManager } from "../../core/memory/thunk-checksum";
 import { leaseRegistry } from "../../core/memory/lease-registry";
+import { toPlainGuestMemory } from "../../core/memory/guest-memory";
 import { Mem } from "../../core/memory/mem-accessor";
 import { lockTracker } from "../../core/lock-tracker";
 import { getLastGetDIBitsBuffer } from "../gdi32/painting";
 import { clipRect } from "./surface-helpers";
 import { createSurfaceStubsExports } from "./surface-stubs";
+import { createSurfacePrivateDataExports } from "./surface-private-data";
 import { createSurfaceBltFlipExports } from "./surface-blt-flip";
 
 // Performance: Texture diagnostics are expensive (scan 1000+ pixels per Unlock).
@@ -84,6 +104,7 @@ const captureActiveLeaseSnapshot = (
     clearActiveLeaseSnapshot(state);
     const lease = leaseRegistry.validateLease(leaseId);
     if (!lease || lease.perms === "r") return;
+    mem = toPlainGuestMemory(mem);
     if (lease.base < 0 || lease.size <= 0 || lease.base + lease.size > mem.length) return;
 
     const snapshot = new Uint8Array(lease.size);
@@ -91,6 +112,54 @@ const captureActiveLeaseSnapshot = (
     state.activeLeaseSnapshot = snapshot;
     state.activeLeaseSnapshotBase = lease.base;
     state.activeLeaseSnapshotSize = lease.size;
+};
+
+/**
+ * Byte-identical? Word-wide where alignment allows. A staging-texture lease is the
+ * whole surface (256×256×32bpp = 256 KiB is typical), and the loop only exits early
+ * when it finds a difference — a sprite whose leading rows stay transparent is scanned
+ * in full. Both operands must be plain views: per-element reads through v86's guest
+ * Proxy cost ~200ns each (guest-memory.ts), which is what made this the whole cost of
+ * Unlock. The scan is synchronous and executes no guest code, so the plain view of
+ * `mem` cannot go stale under it.
+ */
+const leaseRegionUnchanged = (
+    mem: Uint8Array,
+    base: number,
+    snapshot: Uint8Array,
+    size: number
+): boolean => {
+    const byteBase = mem.byteOffset + base;
+    if ((byteBase & 3) === 0 && (snapshot.byteOffset & 3) === 0) {
+        const words = size >>> 2;
+        const src32 = new Uint32Array(mem.buffer, byteBase, words);
+        const snap32 = new Uint32Array(snapshot.buffer, snapshot.byteOffset, words);
+        for (let i = 0; i < words; i++) {
+            if (src32[i] !== snap32[i]) return false;
+        }
+        for (let i = words << 2; i < size; i++) {
+            if (mem[base + i] !== snapshot[i]) return false;
+        }
+        return true;
+    }
+    for (let i = 0; i < size; i++) {
+        if (mem[base + i] !== snapshot[i]) return false;
+    }
+    return true;
+};
+
+/**
+ * A surface already handed out a Lock pointer, so a second Lock is refused —
+ * DirectDraw maps one sub-resource at a time regardless of the rects asked for
+ * (Wine surface.c:1138-1141 maps the wined3d "already mapped" error to this, and
+ * ddraw7.c:14292-14300 asserts it for two whole-surface READONLY|WAIT locks).
+ */
+const surfaceAlreadyLocked = (state: DirectDrawSurfaceState): boolean => {
+    if (state.activeLeaseId === undefined) return false;
+    if (leaseRegistry.validateLease(state.activeLeaseId)) return true;
+    // A revoked lease is not a lock: drop the stale id rather than refuse forever.
+    state.activeLeaseId = undefined;
+    return false;
 };
 
 const consumeActiveLeaseWriteState = (
@@ -112,35 +181,79 @@ const consumeActiveLeaseWriteState = (
         return { hadLease: true, wasReadOnly: true, changed: false };
     }
 
-    // Exact byte comparison is only needed for texture staging surfaces, where a
-    // writable Lock may be followed by no actual texel writes and a false dirty
-    // bit can upload zero-filled implementation storage. Backbuffers/primaries
-    // are hot render paths; DirectDraw treats writable locks as CPU write intent.
-    if ((state.caps & DDSCAPS_TEXTURE) === 0) {
-        clearActiveLeaseSnapshot(state);
-        return { hadLease: true, wasReadOnly: false, changed: true };
-    }
-
     const snapshot = state.activeLeaseSnapshot;
     const base = state.activeLeaseSnapshotBase;
     const size = state.activeLeaseSnapshotSize;
+    mem = toPlainGuestMemory(mem);
     if (!snapshot || base === undefined || size === undefined ||
         base !== lease.base || size !== lease.size ||
         base < 0 || size <= 0 || base + size > mem.length) {
+        // No snapshot: textures used to false-dirty on empty writes; backbuffers
+        // without a skip-readback snapshot still mean "writable lock = write intent".
         clearActiveLeaseSnapshot(state);
         return { hadLease: true, wasReadOnly: false, changed: true };
     }
 
-    let changed = false;
-    for (let i = 0; i < size; i++) {
-        if (mem[base + i] !== snapshot[i]) {
-            changed = true;
-            break;
+    const changed = !leaseRegionUnchanged(mem, base, snapshot, size);
+    // When we skipped GPU→CPU on WRITEONLY, shrink dirtyRegion to the guest's
+    // actual writes so a later upload cannot stomp still-correct GPU pixels.
+    if (changed && isRenderSurface(state) && state.width > 0 && state.height > 0) {
+        const bpp = Math.max(1, Math.floor(state.format.bpp / 8));
+        const pitch = Math.max(state.pitch, state.width * bpp);
+        // Only a writable lease reaches here, so the class is never in doubt.
+        const lcDirty = lockCostProfiler.now();
+        const box = dirtyBoxFromLeaseDiff(mem, base, snapshot, pitch, bpp, state.width, state.height);
+        lockCostProfiler.add(LP.udirty, lcDirty, LC.write);
+        if (box) {
+            state.dirtyRegion = box;
         }
     }
     clearActiveLeaseSnapshot(state);
     return { hadLease: true, wasReadOnly: false, changed };
 };
+
+/** Bounding box of bytes that differ from the pre-Lock snapshot (pitch-aware). */
+function dirtyBoxFromLeaseDiff(
+    mem: Uint8Array,
+    base: number,
+    snapshot: Uint8Array,
+    pitch: number,
+    bpp: number,
+    width: number,
+    height: number
+): Rect | null {
+    const rowBytes = width * bpp;
+    let top = -1;
+    let bottom = 0;
+    let left = width;
+    let right = 0;
+    for (let y = 0; y < height; y++) {
+        const rowOff = y * pitch;
+        if (rowOff + rowBytes > snapshot.length) break;
+        let rowLeft = -1;
+        let rowRight = 0;
+        for (let x = 0; x < width; x++) {
+            const p = rowOff + x * bpp;
+            let diff = false;
+            for (let b = 0; b < bpp; b++) {
+                if (mem[base + p + b] !== snapshot[p + b]) {
+                    diff = true;
+                    break;
+                }
+            }
+            if (!diff) continue;
+            if (rowLeft < 0) rowLeft = x;
+            rowRight = x + 1;
+        }
+        if (rowLeft < 0) continue;
+        if (top < 0) top = y;
+        bottom = y + 1;
+        if (rowLeft < left) left = rowLeft;
+        if (rowRight > right) right = rowRight;
+    }
+    if (top < 0) return null;
+    return { left, top, right, bottom };
+}
 
 /** True when attached surface caps satisfy requested DDSCAPS (DirectDraw semantics). */
 function attachedCapsMatch(attachedCaps: number, requestedCaps: number): boolean {
@@ -164,17 +277,22 @@ function resolveGetAttachedSurfaceTarget(
     const obj = lookup(thisPtr);
     if (!obj) return 0;
 
-    let currentAddr = obj.getState().attachedSurfaceAddr;
-    const visited = new Set<number>();
-    while (currentAddr && !visited.has(currentAddr)) {
+    // Every surface attached to `this` is a candidate — a depth buffer and the flip
+    // successor hang off the same surface — and only then do we follow the chain on.
+    const visited = new Set<number>([thisPtr >>> 0]);
+    const queue: number[] = [...(obj.getState().attachedSurfaceAddrs ?? []),
+                             obj.getState().attachedSurfaceAddr];
+    while (queue.length) {
+        const currentAddr = queue.shift()! >>> 0;
+        if (!currentAddr || visited.has(currentAddr)) continue;
         visited.add(currentAddr);
         const attachedObj = lookup(currentAddr);
-        if (!attachedObj) break;
-        const attachedCaps = attachedObj.getState().caps >>> 0;
-        if (attachedCapsMatch(attachedCaps, requestedCaps)) {
+        if (!attachedObj) continue;
+        const attachedState = attachedObj.getState();
+        if (attachedCapsMatch(attachedState.caps >>> 0, requestedCaps)) {
             return currentAddr;
         }
-        currentAddr = attachedObj.getState().attachedSurfaceAddr;
+        queue.push(...(attachedState.attachedSurfaceAddrs ?? []), attachedState.attachedSurfaceAddr);
     }
 
     if (requestedCaps & DDSCAPS_BACKBUFFER) {
@@ -214,6 +332,10 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const ppvObject = args[2];
 
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+
+        // Both borrowed, and every branch below writes the out-param — validate once here.
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return E_POINTER;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
 
         const iidBytes = new Uint8Array(16);
         for (let i = 0; i < 16; i++) {
@@ -404,6 +526,10 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
 
+        // Both borrowed, and every branch below writes the out-param — validate once here.
+        if (!riidPtr || !isValidAddress(mem, riidPtr, 16, "r")) return E_POINTER;
+        if (!ppvObject || !isValidAddress(mem, ppvObject, 4, "rw")) return E_POINTER;
+
         const iidBytes = new Uint8Array(16);
         for (let i = 0; i < 16; i++) {
             iidBytes[i] = mem[riidPtr + i];
@@ -472,13 +598,18 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
 
             // Create new texture interface object
-            // Pass surfaceHandle directly to constructor to avoid initialization race
-            // Constructor will immediately set surfaceHandle and call addRef() on Surface
-            // This ensures object is never in an uninitialized state
+            // Pass surfaceHandle directly to constructor to avoid initialization race,
+            // so the object is never in an uninitialized state.
             const texObj = ComObjectFactory.create(normalizedIid, vtableAddr, obj.handle);
             if (!texObj) {
                 return E_FAIL;
             }
+            // QueryInterface AddRefs what it hands out, and the texture interface shares the
+            // surface's refcount (Direct3DTexture*Object delegates). Without this the app's
+            // own balanced Release of the surface interface destroys the object while it still
+            // holds the texture — the next QI back to IID_IDirectDrawSurface4 then finds
+            // nothing and returns E_NOINTERFACE.
+            obj.addRef();
 
             // Verify that surfaceHandle was set correctly in constructor
             if (texObj instanceof Direct3DTextureObject || texObj instanceof Direct3DTexture2Object) {
@@ -525,6 +656,45 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
             Logger.log(LogCategory.DDRAW,
                 `IDirectDrawSurface7_QueryInterface -> Created IDirectDrawGammaControl at 0x${objAddr.toString(16)}`);
+            return DD_OK;
+        }
+
+        // Device GUID on a surface = the DX2/3 way to create a D3D device, with THIS
+        // surface as the render target (IDirect3D::CreateDevice only arrived in DX5).
+        // Every rasterizer GUID lands on the same device; we have one renderer.
+        if (
+            normalizedIid === IID_IDirect3DHALDevice.toLowerCase() ||
+            normalizedIid === IID_IDirect3DRGBDevice.toLowerCase() ||
+            normalizedIid === IID_IDirect3DRampDevice.toLowerCase() ||
+            normalizedIid === IID_IDirect3DMMXDevice.toLowerCase()
+        ) {
+            if (!ppvObject || !isValidAddress(mem, ppvObject, 4)) return E_POINTER;
+
+            const vtableAddr = context.vtables.IDirect3DDevice?.address;
+            if (!vtableAddr) return E_NOINTERFACE;
+
+            // Device3Object for the full state (transforms/render states/viewport),
+            // presented over the v1 vtable — same split as IDirect3D2_CreateDevice.
+            const devObj = ComObjectFactory.create(IID_IDirect3DDevice3, vtableAddr) as Direct3DDevice3Object | null;
+            if (!devObj) return E_FAIL;
+
+            devObj.setRenderTarget(thisPtr);
+            obj.addRef(); // the device holds a reference on its render target
+
+            // D3DRENDERSTATE_COLORKEYENABLE did not exist before DX5: on a v1 device a
+            // texture that carries a source colour key IS keyed, with no state to turn
+            // that off. Gating on the render state (default 0) makes every keyed sprite
+            // of an execute-buffer title paint its key colour as an opaque block.
+            devObj.setRenderState(D3DRENDERSTATE_COLORKEYENABLE, 1);
+
+            const objAddr = allocateComObject(context.process.memory, mem, vtableAddr);
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setUint32(ppvObject, objAddr, true);
+            context.resourceProvider.mapAddressToHandle(objAddr, devObj.handle);
+
+            Logger.log(LogCategory.DDRAW,
+                `IDirectDrawSurface7_QueryInterface -> Created IDirect3DDevice (v1) at 0x${objAddr.toString(16)} ` +
+                `rt=0x${thisPtr.toString(16)} iid=${iidStr}`);
             return DD_OK;
         }
 
@@ -599,12 +769,36 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         if (!isValidAddress(mem, lpDDSurfaceDesc, 4)) return E_POINTER;
 
         const state = obj.getState();
+        if (surfaceAlreadyLocked(state)) return DDERR_SURFACEBUSY;
 
         // SYNC: If GPU has current content and CPU doesn't, readback before game reads/writes pixels
-        const isWriteOnly = (dwFlags & DDLOCK_WRITEONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
-        const learnedWriteOnly = lockTracker.shouldSkipReadback(thisPtr);
-        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed;
+        const isReadOnlyFlags = (dwFlags & DDLOCK_READONLY) !== 0;
+        // A depth buffer has no colour representation: the GPU side is a depth attachment,
+        // not this surface's (unused) colour texture. Reading that back over the guest's
+        // depth words replaces the app's own clear value with zeros — the app then appears
+        // to clear depth to "near" and every later draw z-fails.
+        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
+        const sync = decideLockSync(
+            { width: state.width, height: state.height, splitStorage: isRenderSurface(state) },
+            dwFlags,
+            lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null
+        );
+        const needsAsyncReadback = needsReadback && !!context.executor && sync.read;
+        const snapshotSkippedReadback = needsReadback && !needsAsyncReadback && !isReadOnlyFlags && !isDiscard;
+
+        // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
+        // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
+        // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
+        if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
+            const zRect = lpDestRect ? readRect(mem, lpDestRect) : null;
+            syncZBufferWriteToDepth(context, thisPtr, state, mem,
+                zRect ? clipRect(zRect, state.width, state.height) : null);
+        }
+
+        if (sync.read && isRenderSurface(state)) {
+            noteReadLockCandidate(state);
+        }
 
         // Helper: completes Lock after optional readback
         const completeLock = (didReadback: boolean, readbackTime: number): number => {
@@ -696,8 +890,20 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 }
             );
             state.activeLeaseId = leaseId;
-            if (leaseId !== 0 && !isReadOnly && (state.caps & DDSCAPS_TEXTURE) !== 0) {
+            if (leaseId !== 0 && !isReadOnly &&
+                ((state.caps & DDSCAPS_TEXTURE) !== 0 || snapshotSkippedReadback)) {
                 captureActiveLeaseSnapshot(mem, state, leaseId);
+            }
+
+            // A writable legacy Lock exposes the render surface's CPU pixels just like
+            // Surface7::Lock. Keep the slot in CPU mode from this point on: Unlock marks
+            // gpuDirty, and DeferredUploadManager deliberately ignores GPU_ONLY surfaces
+            // because their texture is normally authoritative. Leaving v4 in GPU_ONLY
+            // therefore drops direct pixel writes (classic software cursors are a common
+            // case) at the next Flip.
+            if (!isReadOnly && isRenderSurface(state)) {
+                state.everLocked = true;
+                if (state.mode === "GPU_ONLY") state.mode = "CPU";
             }
 
             // Primary front-buffer writes may be visible while locked on old renderers.
@@ -712,32 +918,28 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             return DD_OK;
         };
 
-        // Same RT readback fix as Surface7 — WRITEONLY is advisory on real hardware
-        const isRT = isRenderSurface(state);
-        const forceReadbackForRT = isRT && needsReadback && !isDiscard;
-        if (needsReadback && context.executor) {
-            if (!forceReadbackForRT && (isWriteOnly || isDiscard || learnedWriteOnly)) {
-                Logger.log(LogCategory.DDRAW,
-                    `IDirectDrawSurface4_Lock: SKIP GPU→CPU readback for surface 0x${thisPtr.toString(16)} ` +
-                    `(WRITEONLY=${isWriteOnly} DISCARD=${isDiscard} learned=${learnedWriteOnly})`
-                );
-            } else {
-                if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) {
-                    return completeLock(true, 0);
-                }
-                // Async path: GPU readback needed — return Promise
-                Logger.log(LogCategory.DDRAW,
-                    `IDirectDrawSurface4_Lock: Syncing GPU -> CPU for surface 0x${thisPtr.toString(16)} (authority=gpu)`
-                );
-                const before = performance.now();
-                return context.executor.syncSurfaceToMemory(state).then((): number => {
-                    const readbackTime = performance.now() - before;
-                    return completeLock(true, readbackTime);
-                });
+        if (needsAsyncReadback && context.executor) {
+            if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) {
+                return completeLock(true, 0);
             }
+            if (sync.serveStale && isRenderSurface(state)) {
+                noteReadLockServedStale(state, state.version);
+                void context.executor.syncSurfaceToMemory(state, sync.box).catch((e) =>
+                    Logger.warn(LogCategory.DDRAW, `read-lock divergence readback failed: ${e}`));
+                return completeLock(false, 0);
+            }
+            if (lockMustNotBlock(sync, dwFlags)) return DDERR_WASSTILLDRAWING;
+            Logger.log(LogCategory.DDRAW,
+                `IDirectDrawSurface4_Lock: Syncing GPU -> CPU for surface 0x${thisPtr.toString(16)} (authority=gpu)`
+            );
+            const before = performance.now();
+            return context.executor.syncSurfaceToMemory(state, sync.box).then((): number => {
+                const readbackTime = performance.now() - before;
+                return completeLock(true, readbackTime);
+            });
         }
 
-        // Sync fast path (common case: SYSMEM surfaces, no GPU readback)
+        // Sync fast path (common case: SYSMEM surfaces, no GPU readback / WRITEONLY skip)
         return completeLock(false, 0);
     };
 
@@ -755,12 +957,36 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         if (!isValidAddress(mem, lpDDSurfaceDesc, 4)) return E_POINTER;
 
         const state = obj.getState();
+        if (surfaceAlreadyLocked(state)) return DDERR_SURFACEBUSY;
 
         // SYNC: If GPU has current content and CPU doesn't, readback before game reads/writes pixels
-        const isWriteOnly = (dwFlags & DDLOCK_WRITEONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
-        const learnedWriteOnly = lockTracker.shouldSkipReadback(thisPtr);
-        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed;
+        const isReadOnlyFlags = (dwFlags & DDLOCK_READONLY) !== 0;
+        // A depth buffer has no colour representation: the GPU side is a depth attachment,
+        // not this surface's (unused) colour texture. Reading that back over the guest's
+        // depth words replaces the app's own clear value with zeros — the app then appears
+        // to clear depth to "near" and every later draw z-fails.
+        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
+        const sync = decideLockSync(
+            { width: state.width, height: state.height, splitStorage: isRenderSurface(state) },
+            dwFlags,
+            lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null
+        );
+        const needsAsyncReadback = needsReadback && !!context.executor && sync.read;
+        const snapshotSkippedReadback = needsReadback && !needsAsyncReadback && !isReadOnlyFlags && !isDiscard;
+
+        // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
+        // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
+        // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
+        if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
+            const zRect = lpDestRect ? readRect(mem, lpDestRect) : null;
+            syncZBufferWriteToDepth(context, thisPtr, state, mem,
+                zRect ? clipRect(zRect, state.width, state.height) : null);
+        }
+
+        if (sync.read && isRenderSurface(state)) {
+            noteReadLockCandidate(state);
+        }
 
         // Helper: completes Lock after optional readback
         const completeLock = (didReadback: boolean, readbackTime: number): number => {
@@ -856,8 +1082,17 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 }
             );
             state.activeLeaseId = leaseId;
-            if (leaseId !== 0 && !isReadOnly && (state.caps & DDSCAPS_TEXTURE) !== 0) {
+            if (leaseId !== 0 && !isReadOnly &&
+                ((state.caps & DDSCAPS_TEXTURE) !== 0 || snapshotSkippedReadback)) {
                 captureActiveLeaseSnapshot(mem, state, leaseId);
+            }
+
+            // Match Surface7's permanent writable-Lock demotion. Unlock can only flag
+            // the guest pixels for upload; a GPU_ONLY slot is intentionally skipped by
+            // the deferred uploader, which otherwise loses v1 CPU drawing before Flip.
+            if (!isReadOnly && isRenderSurface(state)) {
+                state.everLocked = true;
+                if (state.mode === "GPU_ONLY") state.mode = "CPU";
             }
 
             // Primary front-buffer writes may be visible while locked on old renderers.
@@ -872,32 +1107,28 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             return DD_OK;
         };
 
-        // Same RT readback fix — WRITEONLY is advisory on real hardware
-        const isRT_v1 = isRenderSurface(state);
-        const forceReadbackForRT_v1 = isRT_v1 && needsReadback && !isDiscard;
-        if (needsReadback && context.executor) {
-            if (!forceReadbackForRT_v1 && (isWriteOnly || isDiscard || learnedWriteOnly)) {
-                Logger.log(LogCategory.DDRAW,
-                    `IDirectDrawSurface_Lock: SKIP GPU→CPU readback for surface 0x${thisPtr.toString(16)} ` +
-                    `(WRITEONLY=${isWriteOnly} DISCARD=${isDiscard} learned=${learnedWriteOnly})`
-                );
-            } else {
-                if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) {
-                    return completeLock(true, 0);
-                }
-                // Async path: GPU readback needed — return Promise
-                Logger.log(LogCategory.DDRAW,
-                    `IDirectDrawSurface_Lock: Syncing GPU -> CPU for surface 0x${thisPtr.toString(16)} (authority=gpu)`
-                );
-                const before = performance.now();
-                return context.executor.syncSurfaceToMemory(state).then((): number => {
-                    const readbackTime = performance.now() - before;
-                    return completeLock(true, readbackTime);
-                });
+        if (needsAsyncReadback && context.executor) {
+            if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) {
+                return completeLock(true, 0);
             }
+            if (sync.serveStale && isRenderSurface(state)) {
+                noteReadLockServedStale(state, state.version);
+                void context.executor.syncSurfaceToMemory(state, sync.box).catch((e) =>
+                    Logger.warn(LogCategory.DDRAW, `read-lock divergence readback failed: ${e}`));
+                return completeLock(false, 0);
+            }
+            if (lockMustNotBlock(sync, dwFlags)) return DDERR_WASSTILLDRAWING;
+            Logger.log(LogCategory.DDRAW,
+                `IDirectDrawSurface_Lock: Syncing GPU -> CPU for surface 0x${thisPtr.toString(16)} (authority=gpu)`
+            );
+            const before = performance.now();
+            return context.executor.syncSurfaceToMemory(state, sync.box).then((): number => {
+                const readbackTime = performance.now() - before;
+                return completeLock(true, readbackTime);
+            });
         }
 
-        // Sync fast path (common case: SYSMEM surfaces, no GPU readback)
+        // Sync fast path (common case: SYSMEM surfaces, no GPU readback / WRITEONLY skip)
         return completeLock(false, 0);
     };
 
@@ -910,7 +1141,11 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
     // and IDirect3DTexture_Load.
     exports["IDirectDrawSurface7_Lock"] = (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
         const lockStart = performance.now();
-        profiler.start("Lock");
+        const lcSetup = lockCostProfiler.now();
+        // Token span: this handler returns a Promise when a GPU readback is needed, so two
+        // Locks overlap across the await and a Map-keyed start/end would attribute one
+        // lock's start time to the other's end.
+        const lockToken = profiler.startToken("Lock");
         profiler.start("Lock:setup");
 
         const thisPtr = args[0];
@@ -930,29 +1165,43 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
         if (!obj) {
             profiler.end("Lock:setup");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
+        }
+        // The op ring must show CPU writes too: "which surface did the guest fill itself"
+        // is the same question as "which rect did a Blt move", and a surface whose pixels
+        // only ever change through Lock is invisible in a Blt-only ring.
+        if (surfaceOpsArmed()) {
+            recordSurfaceOp("lock", `flags:0x${(dwFlags >>> 0).toString(16)}`, obj.getState(), null,
+                lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null, null);
         }
         if (!lpDDSurfaceDesc) {
             profiler.end("Lock:setup");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_POINTER, stackCleanup: 20 };
         }
         if (!isValidAddress(mem, lpDDSurfaceDesc, 4)) {
             profiler.end("Lock:setup");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_POINTER, stackCleanup: 20 };
         }
 
         const state = obj.getState();
+        if (surfaceAlreadyLocked(state)) return { value: DDERR_SURFACEBUSY };
         profiler.end("Lock:setup");
         const isTexture = (state.caps & DDSCAPS_TEXTURE) !== 0;
 
         // Extract lock flags once at the beginning
         const isReadOnly = (dwFlags & DDLOCK_READONLY) !== 0;
-        const isWriteOnly = (dwFlags & DDLOCK_WRITEONLY) !== 0;
         const isDiscard = (dwFlags & DDLOCK_DISCARDCONTENTS) !== 0;
 
+        const lcClass: LockClass = isReadOnly ? LC.read : LC.write;
+        lockCostProfiler.add(LP.setup, lcSetup, lcClass);
+        lockCostProfiler.countLock(lcClass);
+
+        profiler.start("Lock:gdiSync");
+        const lcGdi = lockCostProfiler.now();
+        lockCostProfiler.activeClass = lcClass;
         const system = System.getInstance();
         const gdiContext = system.gdiContext;
         const hdc = gdiContext.getHDCBySurface(thisPtr);
@@ -961,21 +1210,43 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             syncActiveGdiContext(state, thisPtr, mem);
             gdiContext.clearDirty(hdc);
         }
+        lockCostProfiler.activeClass = LC.other;
+        lockCostProfiler.add(LP.gdi, lcGdi, lcClass);
         profiler.end("Lock:gdiSync");
+        const lcDecide = lockCostProfiler.now();
 
         // Check if GPU has authoritative data that needs readback before game accesses guest memory.
         // This covers BOTH GPU_ONLY and CPU-mode surfaces where D3D rendered after a previous Lock
         // (e.g., EndScene writes to backbuffer GPU texture, then game Locks backbuffer for GDI text).
-        const learnedWriteOnly = lockTracker.shouldSkipReadback(thisPtr);
-        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed;
+        // A depth buffer has no colour representation: the GPU side is a depth attachment,
+        // not this surface's (unused) colour texture. Reading that back over the guest's
+        // depth words replaces the app's own clear value with zeros — the app then appears
+        // to clear depth to "near" and every later draw z-fails.
+        const needsReadback = surfaceSyncManager.needsCPUSync(state).needed && !isZBufferSurface(state);
 
-        // On real hardware, WRITEONLY is advisory — the lock buffer still
-        // contains GPU-rendered pixels. In our emulation GPU/CPU memory are separate, so for
-        // render targets we must always readback (except DISCARDCONTENTS which explicitly opts out).
+        // DirectDraw has no depth API: a writable Lock on a z surface is how the app clears
+        // depth. Sync the depth attachment from the guest's words HERE, at Lock, because the
+        // fill often lands after Unlock has returned (see syncZBufferWriteToDepth).
+        if (isZBufferSurface(state) && (dwFlags & DDLOCK_READONLY) === 0) {
+            const zRect = lpDestRect ? readRect(mem, lpDestRect) : null;
+            syncZBufferWriteToDepth(context, thisPtr, state, mem,
+                zRect ? clipRect(zRect, state.width, state.height) : null);
+        }
+
         const isRT = isRenderSurface(state);
-        const forceReadbackForRT = isRT && needsReadback && !isDiscard;
-        const needsAsyncReadback = needsReadback && !!context.executor &&
-            (forceReadbackForRT || (!isWriteOnly && !isDiscard && !learnedWriteOnly));
+        const sync = decideLockSync(
+            { width: state.width, height: state.height, splitStorage: isRT },
+            dwFlags,
+            lpDestRect && isValidAddress(mem, lpDestRect, 16) ? readRect(mem, lpDestRect) : null
+        );
+        const needsAsyncReadback = needsReadback && !!context.executor && sync.read;
+        // Stale CPU + WRITEONLY skip: snapshot so Unlock can dirty-box guest writes.
+        const snapshotSkippedReadback = needsReadback && !needsAsyncReadback && !isReadOnly && !isDiscard;
+
+        if (sync.read && isRT) {
+            noteReadLockCandidate(state);
+        }
+        lockCostProfiler.add(LP.decide, lcDecide, lcClass);
 
         // Tail of the Lock operation — runs after optional GPU readback. Updates surface
         // authority state, validates the pointer, writes DDSURFACEDESC2, and registers the
@@ -1032,6 +1303,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         // The massive validation/writeDesc/lease/return block stays inline (it closes over
         // many locals), wrapped in a thunk-returning function so both paths share it.
         const finalizeLock = (): ThunkResult => {
+        const lcValidate = lockCostProfiler.now();
         profiler.start("Lock:validation");
         // Read caller's dwSize to preserve it (caller fills it before call)
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1059,7 +1331,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `size=0x${estimatedSize.toString(16)} is not safe for surface use! ` +
                 `This would allow game to corrupt protected memory. surface=0x${thisPtr.toString(16)} size=${state.width}x${state.height}`);
             profiler.end("Lock:validation");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
 
@@ -1069,7 +1341,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `IDirectDrawSurface7_Lock: CORRUPTED surfacePtr=0x${state.surfacePtr.toString(16)} detected, refusing to expose to game`
             );
             profiler.end("Lock:validation");
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
         profiler.end("Lock:validation");
@@ -1105,6 +1377,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `🚨 IDirectDrawSurface7_Lock: integer overflow in rect offset calculation! ` +
                     `rect.top=${rect.top} rect.left=${rect.left} pitch=${state.pitch} bpp=${bytesPerPixel} ` +
                     `offsetTop=0x${offsetTop.toString(16)} offsetLeft=0x${offsetLeft.toString(16)}`);
+                profiler.end("Lock:rectCalc");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
 
@@ -1116,6 +1390,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `🚨 IDirectDrawSurface7_Lock: pointer addition overflow! ` +
                     `base=0x${state.surfacePtr.toString(16)} offsetTop=0x${offsetTop.toString(16)} ` +
                     `offsetLeft=0x${offsetLeft.toString(16)} result=0x${calculatedPtr.toString(16)}`);
+                profiler.end("Lock:rectCalc");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
 
@@ -1128,7 +1404,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `size=0x${adjustedSize.toString(16)} is not safe for surface use! ` +
                     `base=0x${state.surfacePtr.toString(16)} rect=(${rect.left},${rect.top},${rect.right},${rect.bottom})`);
                 profiler.end("Lock:rectCalc");
-                profiler.end("Lock");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
 
@@ -1141,7 +1417,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `IDirectDrawSurface7_Lock: adjusted surfacePtr overlaps protected region`
                 );
                 profiler.end("Lock:rectCalc");
-                profiler.end("Lock");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
         }
@@ -1163,12 +1439,14 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     `IDirectDrawSurface7_Lock: surfacePtr overlaps thunk region`
                 );
                 profiler.end("Lock:regions");
-                profiler.end("Lock");
+                profiler.endToken(lockToken);
                 return { value: E_FAIL, stackCleanup: 20 };
             }
         }
         profiler.end("Lock:regions");
+        lockCostProfiler.add(LP.validate, lcValidate, lcClass);
 
+        const lcDesc = lockCostProfiler.now();
         profiler.start("Lock:writeDesc");
         writeSurfaceDesc(mem, lpDDSurfaceDesc, desc);
         profiler.end("Lock:writeDesc");
@@ -1185,10 +1463,13 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `This is a BUG in writeSurfaceDesc or desc.surfacePtr calculation! ` +
                 `surface=0x${thisPtr.toString(16)} lpDDSurfaceDesc=0x${lpDDSurfaceDesc.toString(16)} ` +
                 `desc.surfacePtr=0x${desc.surfacePtr.toString(16)} writtenLpSurface=0x${writtenLpSurface.toString(16)}`);
-            profiler.end("Lock");
+            profiler.endToken(lockToken);
             return { value: E_FAIL, stackCleanup: 20 };
         }
 
+        lockCostProfiler.add(LP.desc, lcDesc, lcClass);
+
+        const lcLease = lockCostProfiler.now();
         profiler.start("Lock:lease");
         const leaseId = leaseRegistry.createLease(
             desc.surfacePtr,
@@ -1202,8 +1483,13 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
         );
         state.activeLeaseId = leaseId;
-        if (leaseId !== 0 && !isReadOnly && (state.caps & DDSCAPS_TEXTURE) !== 0) {
+        // Textures: always snapshot writable locks (false-dirty guard).
+        // WRITEONLY skip-readback: snapshot backbuffers too so Unlock can dirty-box.
+        if (leaseId !== 0 && !isReadOnly &&
+            ((state.caps & DDSCAPS_TEXTURE) !== 0 || snapshotSkippedReadback)) {
+            const lcSnap = lockCostProfiler.now();
             captureActiveLeaseSnapshot(mem, state, leaseId);
+            lockCostProfiler.add(LP.snap, lcSnap, lcClass);
         }
 
         // Primary front-buffer writes may be visible while locked on old renderers.
@@ -1250,23 +1536,24 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         }
 
         profiler.end("Lock:lease");
+        lockCostProfiler.add(LP.lease, lcLease, lcClass);
 
         // DIAGNOSTIC: Validate thunk code integrity after Lock (EXPENSIVE: ~1ms per call!)
         // Disabled in production (ENABLE_LOCK_THUNK_VALIDATION = false) — dead code below.
         // Kept for parity with the other _Unlock validation gates. Runs fire-and-forget so
         // this handler stays synchronous; violations still log an error.
         if (ENABLE_LOCK_THUNK_VALIDATION) {
-            profiler.start("Lock:thunkValidation");
+            const validationToken = profiler.startToken("Lock:thunkValidation");
             void Promise.resolve(thunkChecksumManager.validateThunkRegion(mem, "IDirectDrawSurface7_Lock"))
                 .then((valid) => {
-                    profiler.end("Lock:thunkValidation");
+                    profiler.endToken(validationToken);
                     if (!valid) {
                         Logger.error(LogCategory.DDRAW, "🚨 Thunk corruption detected AFTER Lock!");
                     }
                 });
         }
 
-        profiler.end("Lock");
+        profiler.endToken(lockToken);
 
         // Record lock event for variance diagnostics
         if (frameVarianceDiagnostics.isEnabled()) {
@@ -1284,8 +1571,23 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         // Dispatch: sync when no GPU readback is needed, Promise chain otherwise.
         if (needsAsyncReadback) {
-            if (context.executor!.syncSurfaceToMemoryFromScratch(state, mem)) {
+            const lcScratch = lockCostProfiler.now();
+            lockCostProfiler.activeClass = lcClass;
+            const servedFromScratch = context.executor!.syncSurfaceToMemoryFromScratch(state, mem);
+            lockCostProfiler.activeClass = LC.other;
+            lockCostProfiler.add(LP.scratch, lcScratch, lcClass);
+            if (servedFromScratch) {
                 return finalize(true, 0);
+            }
+            if (sync.serveStale && isRenderSurface(state)) {
+                noteReadLockServedStale(state, state.version);
+                void context.executor!.syncSurfaceToMemory(state, sync.box).catch((e) =>
+                    Logger.warn(LogCategory.DDRAW, `read-lock divergence readback failed: ${e}`));
+                return finalize(false, 0);
+            }
+            if (lockMustNotBlock(sync, dwFlags)) {
+                profiler.endToken(lockToken);
+                return { value: DDERR_WASSTILLDRAWING, stackCleanup: 20 };
             }
             const modeStr = isRenderSurface(state) ? state.mode : "bitmap";
             Logger.log(LogCategory.DDRAW,
@@ -1293,7 +1595,11 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 `(${state.width}x${state.height}) mode=${modeStr}`
             );
             const before = performance.now();
-            return context.executor!.syncSurfaceToMemory(state).then((): ThunkResult => {
+            const lcReadback = lockCostProfiler.now();
+            lockCostProfiler.activeClass = lcClass;
+            return context.executor!.syncSurfaceToMemory(state, sync.box).then((): ThunkResult => {
+                lockCostProfiler.add(LP.readback, lcReadback, lcClass);
+                lockCostProfiler.activeClass = LC.other;
                 return finalize(true, performance.now() - before);
             });
         }
@@ -1317,11 +1623,20 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         if (obj) {
             const state = obj.getState();
             const isTexture = (state.caps & DDSCAPS_TEXTURE) !== 0;
+            profiler.start("Unlock:leaseCompare");
+            const lcCompare = lockCostProfiler.now();
             const leaseWriteState = consumeActiveLeaseWriteState(mem, state);
+            profiler.end("Unlock:leaseCompare");
             const wasReadOnly = leaseWriteState.wasReadOnly;
+            const ucClass: LockClass = wasReadOnly ? LC.read : LC.write;
+            lockCostProfiler.countUnlock(ucClass);
+            lockCostProfiler.add(LP.ucompare, lcCompare, ucClass);
+            const lcState = lockCostProfiler.now();
             const didWritePixels = leaseWriteState.changed;
             const previousSurfaceEverWritten = state.surfaceEverWritten;
             const previousWriteGeneration = state.writeGeneration;
+            recordSurfaceOp("unlock", wasReadOnly ? "readonly" : didWritePixels ? "wrote" : "nochange",
+                state, null, null, null);
             if (!leaseWriteState.hadLease) {
                 Logger.warn(LogCategory.DDRAW,
                     `Unlock: surface=0x${thisPtr.toString(16)} without active Lock lease; ignoring CPU write commit`);
@@ -1489,7 +1804,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     // directly to the primary via Lock/Unlock without calling Flip.
                     const isPrimary = (state.caps & DDSCAPS_PRIMARYSURFACE) !== 0;
                     if (isPrimary && context.presenter && !context.suppressPresent) {
+                        const lcPresent = lockCostProfiler.now();
                         void context.presenter.present(state, mem, { throttle: true });
+                        lockCostProfiler.add(LP.upresent, lcPresent, ucClass);
                     }
                 } else {
                     // BitmapTexture path (shouldn't be locked for writes, but handle gracefully)
@@ -1501,6 +1818,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                     if (!isTexture) {
                         state.everLocked = true;
                     }
+                    // Lock may have marked a full dirtyRegion; no guest writes → drop it.
+                    state.dirtyRegion = undefined;
                 }
                 Logger.verbose(LogCategory.DDRAW,
                     `Unlock: writable lock unchanged - preserving GPU sync state for 0x${thisPtr.toString(16)}`);
@@ -1521,6 +1840,8 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 leaseRegistry.revokeLease(state.activeLeaseId);
                 state.activeLeaseId = undefined;
             }
+            lockCostProfiler.add(LP.ustate, lcState, ucClass);
+            const lcUpload = lockCostProfiler.now();
 
             // Texture writes are committed by the dirty/version state above. Keep the
             // actual GPU upload out of the Unlock thunk; WebGPU conversion/pipeline work
@@ -1538,6 +1859,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 }
                 context.deferredUploadManager?.markDirty(state, false);
             }
+            lockCostProfiler.add(LP.uupload, lcUpload, ucClass);
 
             // Track Lock/Unlock pattern for optimization detection
             // dataAccessed = true for now (we don't have memory access tracking yet)
@@ -1690,12 +2012,17 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const lpContext = args[1];
         const lpCallback = args[2];
 
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(context.resourceProvider, thisPtr);
         const state = obj?.getState();
 
         // Collect attached surface addresses
         const attached: number[] = [];
-        if (state?.attachedSurfaceAddr) attached.push(state.attachedSurfaceAddr);
+        for (const a of state?.attachedSurfaceAddrs ?? []) {
+            if (a && !attached.includes(a)) attached.push(a);
+        }
+        if (state?.attachedSurfaceAddr && !attached.includes(state.attachedSurfaceAddr)) {
+            attached.push(state.attachedSurfaceAddr);
+        }
         if (state && (state.caps & DDSCAPS_PRIMARYSURFACE) && context.surfaces.backBuffer &&
                 !attached.includes(context.surfaces.backBuffer)) {
             attached.push(context.surfaces.backBuffer);
@@ -1727,7 +2054,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             }
 
             const surfaceAddr = attached[index];
-            const attachedObj = context.resourceProvider.getComObjectByAddress(surfaceAddr) as DirectDrawSurfaceObject | null;
+            const attachedObj = surfaceAt(context.resourceProvider, surfaceAddr);
             const attachedState = attachedObj?.getState();
             index++;
 
@@ -1804,7 +2131,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         return enumAttachedSurfacesImpl(ctx, mem, args, true);
     };
 
-    registerSurfaceV1Exports(exports, enumAttachedSurfacesImpl);
+    registerSurfaceV1Exports(exports, context, enumAttachedSurfacesImpl);
 
     exports["IDirectDrawSurface7_GetCaps"] = (ctx, mem, args) => {
         const thisPtr = args[0];
@@ -1863,7 +2190,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         const state = obj.getState();
         const targetAddr = resolveGetAttachedSurfaceTarget(
             context,
-            (addr) => context.resourceProvider.getComObjectByAddress(addr) as DirectDrawSurfaceObject | null,
+            (addr) => surfaceAt(context.resourceProvider, addr),
             thisPtr,
             requestedCaps,
         );
@@ -2053,6 +2380,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                         // Invalidate ephemeral rgbaScratch cache
                                         otherState.rgbaScratch = undefined;
                                         otherState.rgbaScratchVersion = undefined;
+                                        // version was ASSIGNED from a sibling, so it can land on a
+                                        // number this surface already read back — drop the memo.
+                                        invalidateCpuSyncedVersion(otherState);
                                     }
                                     if (gpuTex && otherState.gpuTexture !== gpuTex) {
                                         otherState.gpuTexture = gpuTex;
@@ -2125,6 +2455,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                             otherState.gpuDirty = true; // CPU writes, mark GPU as stale
                                             otherState.version = state.version;
                                             otherState.surfaceEverWritten = true;
+                                            invalidateCpuSyncedVersion(otherState);
                                         }
                                         // BitmapTextureSurface doesn't need authority updates (immutable)
                                     }
@@ -2335,19 +2666,19 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         const state = obj.getState();
         if (state.clipperHandle === undefined) {
-            return DDERR_NOCLIPPER;
+            return DDERR_NOCLIPPERATTACHED;
         }
 
         const clipperObj = context.resourceProvider.getComObject(state.clipperHandle);
         if (!clipperObj) {
             state.clipperHandle = undefined;
-            return DDERR_NOCLIPPER;
+            return DDERR_NOCLIPPERATTACHED;
         }
 
         const clipperAddr = context.resourceProvider.getAddressForHandle(state.clipperHandle);
         if (!clipperAddr) {
             state.clipperHandle = undefined;
-            return DDERR_NOCLIPPER;
+            return DDERR_NOCLIPPERATTACHED;
         }
 
         Mem.writeUint32(lplpDDClipper, clipperAddr);
@@ -2374,20 +2705,74 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             return E_FAIL;
         }
 
+        const thisState = thisObj.getState();
         const attachedState = attachedObj.getState();
         const isZBuffer = (attachedState.caps & DDSCAPS_ZBUFFER) !== 0;
 
-        thisObj.setAttachedSurface(lpDDSAttachedSurface);
+        // A depth buffer is attached TO a render target; DDBLT_DEPTHFILL then clears it
+        // through the z surface. Record the owner so that Blt can find the render target
+        // whose depth attachment the fill actually means.
+        if (isZBuffer) {
+            const owners = attachedState.zOwnerSurfaces ?? (attachedState.zOwnerSurfaces = []);
+            if (!owners.includes(thisPtr >>> 0)) owners.push(thisPtr >>> 0);
+        }
 
-        Logger.verbose(LogCategory.DDRAW,
+        thisObj.addAttachment(lpDDSAttachedSurface);
+
+        // DirectDraw takes ONE reference on an explicitly attached surface and holds it until
+        // the attachment is deleted or the surface it hangs off is destroyed — which is what
+        // lets an app create a z buffer, attach it, Release its own pointer and keep rendering.
+        // (Wine surface.c ddraw_surface7/4/3/2/1_AddAttachedSurface: attached_iface = attachment,
+        // AddRef; the matching Release is in ddraw_surface_delete_attached_surface.) There is one
+        // such slot per surface, so a surface already holding an attachment reference does not
+        // take a second; implicit chain members are DirectDraw's own and are never counted.
+        // Kill switch for A/B'ing surface lifetime: setWorkerFlag('__noAttachAddRef', true).
+        let attachRef = "none";
+        if (!(globalThis as { __noAttachAddRef?: boolean }).__noAttachAddRef
+            && !attachedState.implicitChainMember
+            && !attachedState.attachRefOwner) {
+            attachedState.attachRefOwner = thisPtr >>> 0;
+            attachRef = `taken(ref=${attachedObj.addRef()})`;
+        } else if (attachedState.implicitChainMember) {
+            attachRef = "implicit";
+        } else if (attachedState.attachRefOwner) {
+            attachRef = `held-by-0x${(attachedState.attachRefOwner >>> 0).toString(16)}`;
+        }
+
+        // Attaching a same-format offscreen surface BUILDS a flip chain: ddraw marks both
+        // surfaces DDSCAPS_FLIP, names the front and the back, and closes the ring — which
+        // is what makes the pair flippable at all (Flip refuses a surface without those).
+        const flippable = (attachedState.caps & (DDSCAPS_ZBUFFER | DDSCAPS_TEXTURE | DDSCAPS_OVERLAY)) === 0
+            && attachedState.width === thisState.width
+            && attachedState.height === thisState.height
+            && attachedState.format.bpp === thisState.format.bpp;
+        if (flippable) {
+            thisState.caps |= DDSCAPS_FLIP;
+            attachedState.caps |= DDSCAPS_FLIP;
+            if ((thisState.caps & (DDSCAPS_FRONTBUFFER | DDSCAPS_BACKBUFFER)) === 0) {
+                thisState.caps |= DDSCAPS_FRONTBUFFER;
+            }
+            attachedState.caps |= (thisState.caps & DDSCAPS_BACKBUFFER)
+                ? DDSCAPS_FRONTBUFFER : DDSCAPS_BACKBUFFER;
+            thisObj.setAttachedSurface(lpDDSAttachedSurface);
+            if (!attachedState.attachedSurfaceAddr) attachedObj.setAttachedSurface(thisPtr);
+        }
+
+        // Attachments are a handful of calls per title and they decide surface LIFETIME,
+        // so this is worth a normal-level line: without it "the attach reference was taken"
+        // is invisible until a freed COM block is dispatched through, hours away.
+        Logger.log(LogCategory.DDRAW,
             `IDirectDrawSurface7_AddAttachedSurface: this=0x${thisPtr.toString(16)} ` +
-            `attached=0x${lpDDSAttachedSurface.toString(16)} ${isZBuffer ? '[ZBUFFER]' : ''}`
+            `attached=0x${lpDDSAttachedSurface.toString(16)} ${isZBuffer ? '[ZBUFFER]' : ''}${flippable ? '[FLIP]' : ''} ` +
+            `attachRef=${attachRef}`
         );
 
         return DD_OK;
     };
 
-    // IsLost: report surface lost state (e.g. after Alt+Tab). We never lose surfaces in emu.
+    // IsLost: DD_OK = usable, DDERR_SURFACELOST = the video memory behind it is gone.
+    // Only a surface with no CPU copy can be lost here — see surface-device-loss.ts for why
+    // guest-memory-backed surfaces are system-memory surfaces and DirectDraw never loses those.
     exports["IDirectDrawSurface7_IsLost"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
@@ -2400,11 +2785,64 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             );
             return DD_OK; // Graceful degradation - pretend surface is fine
         }
-        // In emu we never lose surfaces; always return DD_OK (not lost)
-        return DD_OK;
+        return isSurfaceLost(obj.getState()) ? DDERR_SURFACELOST : DD_OK;
     };
 
-    // Restore: restore surface after loss. No-op in emu since we never lose.
+    // DeleteAttachedSurface(dwFlags, lpDDSAttachedSurface). A NULL surface detaches
+    // everything that was attached explicitly; DirectDraw refuses to detach an
+    // implicitly-created chain member (DDERR_CANNOTDETACHSURFACE), so those are skipped.
+    // Detaching releases the reference AddAttachedSurface took.
+    exports["IDirectDrawSurface7_DeleteAttachedSurface"] = (ctx, mem, args) => {
+        const thisPtr = args[0];
+        const lpDDSAttachedSurface = args[2];
+        const thisObj = surfaceAt(context.resourceProvider, thisPtr);
+        if (!thisObj) return DDERR_INVALIDOBJECT;
+        const state = thisObj.getState();
+        const targets = lpDDSAttachedSurface
+            ? [lpDDSAttachedSurface >>> 0]
+            : [...(state.attachedSurfaceAddrs ?? [])];
+        let detached = false;
+        for (const addr of targets) {
+            // A surface that is not on the list was never attached to this one, and
+            // DirectDraw says so rather than silently succeeding.
+            if (!(state.attachedSurfaceAddrs ?? []).includes(addr >>> 0)) continue;
+            const attachedObj = surfaceAt(context.resourceProvider, addr);
+            if (!attachedObj) {
+                // Already gone — drop the dangling link rather than keep it. It WAS
+                // attached, so the detach itself succeeded.
+                thisObj.removeAttachment(addr);
+                detached = true;
+                continue;
+            }
+            const attachedState = attachedObj.getState();
+            if (attachedState.implicitChainMember) {
+                // A member DirectDraw created as part of a complex surface belongs to
+                // DirectDraw and dies with the root, so it cannot be detached at all.
+                if (lpDDSAttachedSurface) return DDERR_CANNOTDETACHSURFACE;
+                continue;
+            }
+            const zOwners = attachedState.zOwnerSurfaces;
+            if (zOwners) {
+                const i = zOwners.indexOf(thisPtr >>> 0);
+                if (i >= 0) zOwners.splice(i, 1);
+            }
+            thisObj.removeAttachment(addr);
+            detached = true;
+            // Detaching drops the reference the attach took. Clear the slot first: the
+            // surface may be destroyed inside release().
+            if (((attachedState.attachRefOwner ?? 0) >>> 0) === (thisPtr >>> 0)) {
+                attachedState.attachRefOwner = 0;
+                attachedObj.release();
+            }
+        }
+        return (detached || !lpDDSAttachedSurface) ? DD_OK : DDERR_SURFACENOTATTACHED;
+    };
+
+    // Restore: re-validate a lost surface. Its GPU texture was already dropped at loss, so the
+    // reallocation is the next draw's lazy create — which is also why the contents come back
+    // CLEARED. DirectDraw documents exactly that: after Restore the contents are undefined and
+    // the app must redraw. Refused while there is still no device, so an app that restores in a
+    // loop is told the truth rather than handed a surface that cannot be drawn into.
     exports["IDirectDrawSurface7_Restore"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
@@ -2412,10 +2850,16 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
             Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_Restore: invalid this=0x${thisPtr.toString(16)}`);
             return DDERR_INVALIDPARAMS;
         }
+        const state = obj.getState();
+        if (!isSurfaceLost(state)) return DD_OK;
+        if (!gpuDeviceUsable()) return DDERR_SURFACELOST;
+        markSurfaceRestored(state);
+        Logger.log(LogCategory.DDRAW, `Restore: surface 0x${thisPtr.toString(16)} revalidated (contents undefined, per DirectDraw)`);
         return DD_OK;
     };
 
-    Object.assign(exports, createSurfaceStubsExports(context));
+    assignStubsOnce(exports, createSurfaceStubsExports(context), "ddraw surface stubs");
+    Object.assign(exports, createSurfacePrivateDataExports(context));
 
     // IDirectDrawSurface (v1) stub methods - delegate to v7 where possible
     // Note: QueryInterface, AddRef, Release, Lock, GetSurfaceDesc are already implemented
@@ -2493,19 +2937,19 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
  * GetAttachedSurface is called ~972K times in UT99 demo (3.6s total).
  * The result is deterministic per surface: source → attached is fixed for a flipping chain.
  */
-export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDrawContext): void {
+export function registerFastPathSurfaceFunctions(dispatcher: HleDispatcher, context: DDrawContext): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     const resourceProvider = context.resourceProvider;
 
-    // Cache: source surface address → { target address, target COM object }
-    // Populated on first call, invalidated only on surface destruction.
-    const attachedCache = new Map<string, { addr: number; obj: { addRef(): number } }>();
+    // Cache: source surface address → { source object, target address, target COM object }.
+    // COM iface addresses are pool-reused after Release, so a hit is valid only while BOTH
+    // addresses still resolve to the SAME objects (a recreated flip chain can land on the old
+    // primary's address — returning the old backbuffer then sends every frame to a zombie surface).
+    const attachedCache = new Map<string, { srcObj: unknown; addr: number; obj: { addRef(): number } }>();
 
-    const fastPathGetAttachedSurface = (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4];
+    const fastPathGetAttachedSurface: FastPathImplementation = (esp, view, mem8) => {
         if (esp + 16 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         // Stack layout (stdcall, args pushed right-to-left):
         // esp + 0  = return address
@@ -2521,23 +2965,26 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
 
         if (!lplpDDSurface || lplpDDSurface + 4 > mem8.length) return null;
 
-        // Fast path — no diagnostic logging (was TEMP DEBUG)
+        const obj = resourceProvider.getComObjectByAddressFast(thisPtr) as DirectDrawSurfaceObject | null;
 
-        // Check cache first
+        // Check cache first; a hit must still map to the same live objects at both addresses
         const cached = attachedCache.get(cacheKey);
         if (cached) {
-            cached.obj.addRef();
-            view.setUint32(lplpDDSurface, cached.addr, true);
-            return DD_OK;
+            if (obj === cached.srcObj
+                && resourceProvider.getComObjectByAddressFast(cached.addr) === cached.obj) {
+                cached.obj.addRef();
+                view.setUint32(lplpDDSurface, cached.addr, true);
+                return DD_OK;
+            }
+            attachedCache.delete(cacheKey);
         }
 
         // Cache miss — resolve and cache for future calls
-        const obj = resourceProvider.getComObjectByAddressFast(thisPtr) as DirectDrawSurfaceObject | null;
         if (!obj) return null; // fallthrough to slow path
 
         const targetAddr = resolveGetAttachedSurfaceTarget(
             context,
-            (addr) => resourceProvider.getComObjectByAddressFast(addr) as DirectDrawSurfaceObject | null,
+            (addr) => { const o = resourceProvider.getComObjectByAddressFast(addr); return o instanceof DirectDrawSurfaceObject ? o : null; },
             thisPtr,
             requestedCaps,
         );
@@ -2554,7 +3001,7 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
         }
 
         // Cache the mapping
-        attachedCache.set(cacheKey, { addr: targetAddr, obj: targetObj });
+        attachedCache.set(cacheKey, { srcObj: obj, addr: targetAddr, obj: targetObj });
 
         targetObj.addRef();
         view.setUint32(lplpDDSurface, targetAddr, true);
@@ -2566,6 +3013,4 @@ export function registerFastPathSurfaceFunctions(dispatcher: any, context: DDraw
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface_GetAttachedSurface', fastPathGetAttachedSurface);
     dispatcher.registerFastPath('ddraw', 'IDirectDrawSurface4_GetAttachedSurface', fastPathGetAttachedSurface);
 
-    // Expose cache invalidation for surface destruction
-    (context as any)._attachedSurfaceCache = attachedCache;
 }

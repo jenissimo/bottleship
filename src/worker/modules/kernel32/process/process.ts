@@ -1,9 +1,13 @@
 // Process-related functions for kernel32
 // GetCurrentProcessId, GetCurrentThreadId, ExitProcess, GetStartupInfo*, IsProcessorFeaturePresent
 
-import { ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
+import {
+    promoteChildSession, hasChildSession, pendingChildHandoff,
+    type ChildProcessRequest, type ChildProcessRecord,
+} from '../../../core/child-process';
 import { Logger, LogCategory } from '../../../core/logger';
-import { System } from '../../../core/system';
+import { System, type GuestImagePatch } from '../../../core/system';
 import {
     EmulatorConfig,
     VER_PLATFORM_WIN32_NT,
@@ -12,15 +16,20 @@ import {
 import { isValidAddress } from '../../../core/memory/address-guard';
 import { ThreadState } from '../../../core/scheduler/types';
 import { Mem } from '../../../core/memory/mem-accessor';
+import { invalidateGuestCode, invalidateAllGuestCode } from '../../../core/memory/guest-code';
 import { Marshaler } from '../../../core/memory/marshaler';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
 import { encodeAnsi } from '../../codepage-utils';
-import { applyShellExecFake, hasShellExecFakeMatch } from '../../shell32';
+import { isDifferentCommandLine } from '../../shell32';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
+import { hostToolsEnabled } from '../../../core/host-tool-bridge';
+import { startProcessRuntime } from './runtime-child';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
+import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
 
 const ERROR_INVALID_HANDLE = 6;
+const ERROR_ACCESS_DENIED = 5;
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_CALL_NOT_IMPLEMENTED = 120;
 const ERROR_PARTIAL_COPY = 299;
@@ -37,6 +46,16 @@ const ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000;
 const HIGH_PRIORITY_CLASS = 0x00000080;
 const REALTIME_PRIORITY_CLASS = 0x00000100;
 const INVALID_HANDLE_VALUE = 0xFFFFFFFF;
+const GENERIC_READ = 0x80000000;
+const OPEN_EXISTING = 3;
+const IMAGE_DOS_SIGNATURE = 0x5a4d;   // 'MZ'
+const IMAGE_NT_SIGNATURE = 0x00004550; // 'PE\0\0'
+const IMAGE_FILE_MACHINE_I386 = 0x014c;
+const IMAGE_FILE_DLL = 0x2000;
+// e_lfanew is a 32-bit offset, but a real image keeps its NT headers inside the first
+// page; a sniff that reads further would pay a second range read to reject junk.
+const PE_SNIFF_BYTES = 0x1000;
+const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
 
@@ -59,6 +78,13 @@ interface ToolhelpSnapshot {
 
 /** Active snapshots keyed by handle. Cleaned up on access if handle was closed. */
 const toolhelpSnapshots = new Map<number, ToolhelpSnapshot>();
+
+export function resetProcessApiState(): void {
+    currentPriorityClass = NORMAL_PRIORITY_CLASS;
+    threadExecutionState = 0x80000000;
+    toolhelpSnapshots.clear();
+    virtualProcessMemoryByPid.clear();
+}
 
 function getSnapshot(handle: number): ToolhelpSnapshot | null {
     const snap = toolhelpSnapshots.get(handle);
@@ -258,9 +284,41 @@ function module32WImpl(mem: Uint8Array, hSnapshot: number, lpme: number, isFirst
     return module32Impl(mem, hSnapshot, lpme, isFirst, true);
 }
 
-const shutdownProcess = (exitCode: number): ThunkResult => {
+/**
+ * Attach display/input to the existing child worker, preserving its CPU, memory and
+ * open files. The parent worker stays available as its VFS broker. Selection follows
+ * guest behavior: a titled top-level window, or a parent exit leaving a live child.
+ * A helper that computes and exits while its parent waits never claims the display.
+ */
+const handOffToChild = (system: System, child: ChildProcessRecord): boolean => {
+    // The self-launch loop guard the re-exec path has always needed: an image relaunching
+    // itself with the command line it is already running reaches the same launch and asks
+    // again, forever.
+    const isSelf = system.isSelfImage(child.imagePath);
+    if (isSelf && !isDifferentCommandLine(child.commandLine, system.executableArgs)) {
+        Logger.warn(LogCategory.SYSTEM,
+            `[KERNEL32] not handing off to "${child.imagePath}" — same image, same command line`);
+        return false;
+    }
+    if (!promoteChildSession(child)) return false;
+    Logger.log(LogCategory.SYSTEM,
+        `[KERNEL32] attached live child "${child.imagePath}" "${child.commandLine}" to the session ` +
+        `(${child.needsSession ?? "the parent exited while it was still running"})`);
+    return true;
+};
+
+export const shutdownProcess = (exitCode: number): ThunkResult => {
     const system = System.getInstance();
     Logger.log(LogCategory.KERNEL32, `ShutdownProcess code=${exitCode}`);
+
+    // Select the surviving child before terminating guest threads. The selected
+    // worker and the parent's VFS broker must outlive this guest's ExitProcess.
+    try {
+        const leftover = hasChildSession() ? null : pendingChildHandoff();
+        if (leftover) handOffToChild(system, leftover);
+    } catch (e) {
+        Logger.warn(LogCategory.KERNEL32, `ShutdownProcess: child hand-off failed: ${e}`);
+    }
 
     // Forensic call stack for ANY app close. ExitProcess is a clean thunk (no
     // WASM trap), so the worker fault-snapshot never fires — but a game
@@ -279,11 +337,6 @@ const shutdownProcess = (exitCode: number): ThunkResult => {
     } catch (e) {
         Logger.warn(LogCategory.KERNEL32, `ShutdownProcess: deferred surfacePtr flush failed: ${e}`);
     }
-
-    // Flush all pending VFS writes to OPFS before stopping
-    system.fileSystem.flushAll().catch(e => {
-        Logger.warn(LogCategory.KERNEL32, `ShutdownProcess: flushAll failed: ${e}`);
-    });
 
     system.isExiting = true;
 
@@ -305,14 +358,9 @@ const shutdownProcess = (exitCode: number): ThunkResult => {
     system.scheduler.terminateAllThreads(exitCode);
 
     // Notify the host so the UI can present a clean "game exited" state instead
-    // of a stale, frozen canvas (the game's window is gone, nothing repaints it).
-    try {
-        (self as unknown as { postMessage: (m: unknown) => void }).postMessage({
-            type: "process_exit",
-            exitCode: exitCode >>> 0,
-            fault: exitFault,
-        });
-    } catch { /* not in a worker context (tests) — ignore */ }
+    // of a stale, frozen canvas (the game's window is gone, nothing repaints it) —
+    // once the exit path's own writes are durable (postProcessExitWhenDurable).
+    system.postProcessExitWhenDurable({ exitCode: exitCode >>> 0, fault: exitFault });
 
     return { value: 0, terminated: true };
 };
@@ -345,6 +393,28 @@ const writeProcessInformation = (
 const readNullableProcessString = (memory: Uint8Array, ptr: number, isWide: boolean): string => {
     if (!ptr) return '';
     return isWide ? Marshaler.readWideString(memory, ptr) : Marshaler.readString(memory, ptr);
+};
+
+/** argv[0] of a Win32 command line: a quoted run, else up to the first space. */
+export const firstCommandLineToken = (commandLine: string): string => {
+    const s = commandLine.trimStart();
+    if (s.startsWith('"')) {
+        const end = s.indexOf('"', 1);
+        return end < 0 ? s.slice(1) : s.slice(1, end);
+    }
+    const sp = s.search(/\s/);
+    return sp < 0 ? s : s.slice(0, sp);
+};
+
+/** Everything after argv[0] — the arguments the re-executed image should receive. */
+export const stripFirstCommandLineToken = (commandLine: string): string => {
+    const s = commandLine.trimStart();
+    if (s.startsWith('"')) {
+        const end = s.indexOf('"', 1);
+        return end < 0 ? '' : s.slice(end + 1).trimStart();
+    }
+    const sp = s.search(/\s/);
+    return sp < 0 ? '' : s.slice(sp).trimStart();
 };
 
 const isCurrentProcessHandle = (handle: number): boolean => {
@@ -385,10 +455,81 @@ const getVirtualMemoryMapForPid = (pid: number): Map<number, number> => {
     return map;
 };
 
+/**
+ * A suspended child's mapped image, so ReadProcessMemory answers out of the CHILD's file
+ * rather than out of the parent's own address space.
+ *
+ * Reading the parent is not a degraded answer, it is a wrong one: a launcher that reads
+ * its child's PE headers to find the entry point gets its OWN header back, decrypts at an
+ * address that means nothing in the child, and writes the result there. Everything
+ * downstream then looks plausible and is off by a whole image.
+ */
+interface ChildImageMap {
+    file: Uint8Array;
+    imageBase: number;
+    /** RVA -> file offset for the section containing it, or -1 when it maps to no raw bytes. */
+    sections: Array<{ va: number; vsize: number; raw: number; rawSize: number }>;
+}
+const childImageByPid = new Map<number, ChildImageMap | null>();
+
+const loadChildImage = (path: string): ChildImageMap | null => {
+    const vfs = System.getInstance().fileSystem;
+    const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
+    if (!handle) return null;
+    const file = vfs.readSync(handle, vfs.getFileSize(handle.path));
+    if (!file || file.byteLength < 0x40) return null;
+
+    const view = new DataView(file.buffer, file.byteOffset, file.byteLength);
+    if (view.getUint16(0, true) !== IMAGE_DOS_SIGNATURE) return null;
+    const pe = view.getUint32(0x3c, true);
+    if (pe + 24 > file.byteLength || view.getUint32(pe, true) !== IMAGE_NT_SIGNATURE) return null;
+    const sectionCount = view.getUint16(pe + 6, true);
+    const optSize = view.getUint16(pe + 20, true);
+    const imageBase = view.getUint32(pe + 24 + 28, true);
+    const table = pe + 24 + optSize;
+
+    const sections: ChildImageMap["sections"] = [];
+    for (let i = 0; i < sectionCount; i++) {
+        const s = table + i * 40;
+        if (s + 40 > file.byteLength) break;
+        sections.push({
+            va: view.getUint32(s + 12, true),
+            vsize: view.getUint32(s + 8, true),
+            raw: view.getUint32(s + 20, true),
+            rawSize: view.getUint32(s + 16, true),
+        });
+    }
+    return { file, imageBase, sections };
+};
+
+const childImageForPid = (pid: number): ChildImageMap | null => {
+    const cached = childImageByPid.get(pid >>> 0);
+    if (cached !== undefined) return cached;
+    const pending = pendingSuspendedChildExec.get(pid >>> 0);
+    const image = pending ? loadChildImage(pending.imagePath) : null;
+    childImageByPid.set(pid >>> 0, image);
+    return image;
+};
+
+/** File offset backing a linear address in the child image, or -1 (headers, BSS, unmapped). */
+const childFileOffset = (image: ChildImageMap, address: number): number => {
+    const rva = (address >>> 0) - image.imageBase;
+    if (rva < 0) return -1;
+    for (const s of image.sections) {
+        if (rva >= s.va && rva < s.va + s.vsize) {
+            const off = s.raw + (rva - s.va);
+            return rva - s.va < s.rawSize && off < image.file.byteLength ? off : -1;
+        }
+    }
+    // Below the first section: the PE headers, which map 1:1 from offset 0.
+    return rva < (image.sections[0]?.va ?? 0) && rva < image.file.byteLength ? rva : -1;
+};
+
 const readVirtualProcessMemory = (pid: number, address: number, size: number): Uint8Array | null => {
     const base = address >>> 0;
     const store = virtualProcessMemoryByPid.get(pid >>> 0);
-    const fallback = Mem.readBytes(base, size);
+    const image = childImageForPid(pid);
+    const fallback = image ? null : Mem.readBytes(base, size);
     const out = new Uint8Array(size);
 
     for (let i = 0; i < size; i++) {
@@ -396,6 +537,14 @@ const readVirtualProcessMemory = (pid: number, address: number, size: number): U
         const written = store?.get(key);
         if (written !== undefined) {
             out[i] = written & 0xFF;
+            continue;
+        }
+
+        if (image) {
+            const off = childFileOffset(image, key);
+            // A section's uninitialised tail (VirtualSize past SizeOfRawData) is zero in a
+            // mapped image, which is exactly what a miss yields here.
+            out[i] = off >= 0 ? image.file[off]! : 0;
             continue;
         }
 
@@ -411,6 +560,36 @@ const readVirtualProcessMemory = (pid: number, address: number, size: number): U
     return out;
 };
 
+/**
+ * Everything written into a child's address space, coalesced into contiguous runs. The
+ * per-byte map is what WriteProcessMemory records; a restart needs the runs.
+ */
+const collectVirtualProcessWrites = (pid: number): GuestImagePatch[] => {
+    const store = virtualProcessMemoryByPid.get(pid >>> 0);
+    if (!store || store.size === 0) return [];
+
+    const addresses = [...store.keys()].sort((a, b) => a - b);
+    const patches: GuestImagePatch[] = [];
+    let runStart = addresses[0]!;
+    let bytes: number[] = [];
+    const flush = (): void => {
+        if (!bytes.length) return;
+        let binary = "";
+        for (const b of bytes) binary += String.fromCharCode(b);
+        patches.push({ address: runStart, data: btoa(binary) });
+        bytes = [];
+    };
+    for (const addr of addresses) {
+        if (bytes.length && addr !== runStart + bytes.length) {
+            flush();
+            runStart = addr;
+        }
+        bytes.push(store.get(addr)! & 0xff);
+    }
+    flush();
+    return patches;
+};
+
 const writeVirtualProcessMemory = (pid: number, address: number, data: Uint8Array): number => {
     const base = address >>> 0;
     const store = getVirtualMemoryMapForPid(pid >>> 0);
@@ -420,9 +599,60 @@ const writeVirtualProcessMemory = (pid: number, address: number, data: Uint8Arra
     return data.length;
 };
 
-const isUnrealBrowserProbe = (applicationName: string, commandLine: string): boolean => {
-    const probe = `${applicationName} ${commandLine}`.trim();
-    return /(?:^|\s)-b\s+false(?:\s|$)/i.test(probe);
+/**
+ * True when the file's own bytes are an i386 PE executable image. CreateProcess maps the
+ * file as a section and never consults the extension, so a wrapper that ships the real
+ * game under a private suffix (Reflexive's `.RWG`) is launchable exactly like an `.exe` —
+ * an extension test refuses it and the wrapper then exits having started nothing.
+ * A DLL is excluded: it is a PE, but not something CreateProcess will run.
+ */
+const hasPeExecutableHeader = (path: string): boolean => {
+    const vfs = System.getInstance().fileSystem;
+    const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
+    if (!handle) return false;
+    const head = vfs.readSync(handle, PE_SNIFF_BYTES);
+    if (!head || head.byteLength < 0x40) return false;
+
+    const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    if (view.getUint16(0, true) !== IMAGE_DOS_SIGNATURE) return false;
+    const peOffset = view.getUint32(0x3c, true);
+    if (peOffset + 24 > head.byteLength) return false;
+    if (view.getUint32(peOffset, true) !== IMAGE_NT_SIGNATURE) return false;
+    if (view.getUint16(peOffset + 4, true) !== IMAGE_FILE_MACHINE_I386) return false;
+    return (view.getUint16(peOffset + 22, true) & IMAGE_FILE_DLL) === 0;
+};
+
+/** Selects the optional console host-tool backend; GUI images can be headless helpers too. */
+const isConsoleSubsystemImage = (path: string): boolean => {
+    const vfs = System.getInstance().fileSystem;
+    const handle = vfs.openSync(path, GENERIC_READ, OPEN_EXISTING);
+    if (!handle) return false;
+    const head = vfs.readSync(handle, PE_SNIFF_BYTES);
+    if (!head || head.byteLength < 0x40) return false;
+
+    const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+    if (view.getUint16(0, true) !== IMAGE_DOS_SIGNATURE) return false;
+    const peOffset = view.getUint32(0x3c, true);
+    // NT signature (4) + file header (20) + Subsystem at optional-header offset 68.
+    if (peOffset + 24 + 70 > head.byteLength) return false;
+    if (view.getUint32(peOffset, true) !== IMAGE_NT_SIGNATURE) return false;
+    return view.getUint16(peOffset + 24 + 68, true) === IMAGE_SUBSYSTEM_WINDOWS_CUI;
+};
+
+/**
+ * A child needs a stored executable in the current VFS, not merely an executable name.
+ *
+ * The header decides; the extension is only the answer for a bundled file whose first
+ * bytes are not readable without going async (a compressed entry not yet cached), where
+ * refusing a plainly-named `.exe` would be a regression.
+ */
+const isBundledImage = (path: string): boolean => {
+    try {
+        if (!System.getInstance().fileSystem.fileExists(path)) return false;
+        return hasPeExecutableHeader(path) || /\.(exe|com)$/i.test(path);
+    } catch {
+        return false;
+    }
 };
 
 const failVirtualProcess = (
@@ -430,17 +660,31 @@ const failVirtualProcess = (
     applicationName: string,
     commandLine: string,
     currentDirectory: string,
-    isWide: boolean
+    isWide: boolean,
+    errorCode: number,
 ): ThunkResult => {
     writeProcessInformationZeroed(lpProcessInformation);
-    System.getInstance().scheduler.setLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    System.getInstance().scheduler.setLastError(errorCode);
     Logger.warn(
         LogCategory.KERNEL32,
         `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}") ` +
-        `-> FAILURE (no shellExecFake match; emulator cannot spawn real child processes)`
+        `-> FAILURE (child image unavailable or child execution failed)`
     );
     return { value: 0, stackCleanup: 40 };
 };
+
+const CREATE_SUSPENDED = 0x00000004;
+
+/**
+ * Children created SUSPENDED on an image we could actually run, keyed by pid, until the
+ * launcher resumes them.
+ *
+ * CREATE_SUSPENDED means "map it but do not start it yet" — the caller intends to modify
+ * the child before its first instruction, which for this family of launchers is the whole
+ * point: the on-disk image is encrypted and the parent WriteProcessMemory's the decrypted
+ * code over it. Running such an image at CreateProcess time executes ciphertext.
+ */
+const pendingSuspendedChildExec = new Map<number, { imagePath: string; commandLine: string }>();
 
 const finishVirtualProcess = (
     lpProcessInformation: number,
@@ -449,7 +693,11 @@ const finishVirtualProcess = (
     currentDirectory: string,
     dwCreationFlags: number,
     isWide: boolean,
-    noOpProbe: boolean
+    deferredExec?: { imagePath: string; commandLine: string },
+    /** Present when a headless child runtime is to run this process. Started here, after
+     *  the handles are published, and it owns the exit code from now on. */
+    childRequest?: ChildProcessRequest,
+    childBackend: 'worker' | 'host' = 'worker',
 ): ThunkResult => {
     const manager = getVirtualProcessManager();
     const proc = manager.createProcess({
@@ -457,6 +705,7 @@ const finishVirtualProcess = (
         commandLine,
         currentDirectory,
         creationFlags: dwCreationFlags,
+        runtimeBacked: !!childRequest,
     });
 
     if (!writeProcessInformation(
@@ -472,13 +721,21 @@ const finishVirtualProcess = (
         return { value: 0, stackCleanup: 40 };
     }
 
+    if (deferredExec) pendingSuspendedChildExec.set(proc.processId, deferredExec);
+
     Logger.log(
         LogCategory.KERNEL32,
         `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}", ` +
         `flags=0x${dwCreationFlags.toString(16)}) -> pid=${proc.processId} tid=${proc.threadId} ` +
         `hProcess=0x${proc.processHandle.toString(16)} hThread=0x${proc.threadHandle.toString(16)}` +
-        `${noOpProbe ? ' no-op-probe=1 sync=1' : ''}`
+        `${deferredExec ? ` suspended-exec="${deferredExec.imagePath}"` : ''}`
     );
+
+    if (childRequest) {
+        const system = System.getInstance();
+        startProcessRuntime(system.fileSystem, proc.processId, childRequest, childBackend,
+            record => handOffToChild(system, record));
+    }
 
     System.getInstance().scheduler.setLastError(0);
     return { value: 1, stackCleanup: 40 };
@@ -495,7 +752,7 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
     const commandLine = readNullableProcessString(memory, lpCommandLine, isWide);
     const currentDirectory = readNullableProcessString(memory, lpCurrentDirectory, isWide);
 
-    if (!lpProcessInformation) {
+    if (!lpProcessInformation || !isValidAddress(lpProcessInformation, 16, 'rw')) {
         System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
         return { value: 0, stackCleanup: 40 };
     }
@@ -506,45 +763,87 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         return { value: 0, stackCleanup: 40 };
     }
 
-    // Only fake a child process when an explicit shellExecFake rule matches, or
-    // for UE1's renderer/browser `-b false` probe. Most no-match launches still fail.
-    // For UT99, a hard failure on `-b false` can leave Core's native script
-    // dispatch with an uninitialized object pointer, so keep this case as a
-    // no-op virtual child that auto-exits.
-    const probeCommand = commandLine || applicationName;
-    const hasFakeRule = hasShellExecFakeMatch(probeCommand);
-    const noOpProbe = !hasFakeRule && isUnrealBrowserProbe(applicationName, commandLine);
-    if (!hasFakeRule && !noOpProbe) {
-        return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide);
-    }
-
-    // Keep the common no-match/no-op probe path synchronous. The async thunk
-    // machinery is only needed when a matched shellExecFake rule has to touch VFS.
-    if (hasFakeRule) {
-        return applyShellExecFake(probeCommand, "KERNEL32").then((faked) =>
-            faked
-                ? finishVirtualProcess(
-                    lpProcessInformation,
-                    applicationName,
-                    commandLine,
-                    currentDirectory,
-                    dwCreationFlags,
-                    isWide,
-                    false
-                )
-                : failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide)
+    // lpApplicationName may be NULL, in which case the image is argv[0] of the command
+    // line and the arguments are what follows it, the split CreateProcess itself performs.
+    const system = System.getInstance();
+    const argv0 = applicationName || firstCommandLineToken(commandLine || "");
+    const reExecArgs = applicationName
+        ? (commandLine || "")
+        : stripFirstCommandLineToken(commandLine || "");
+    const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
+    const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
+        || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
+    // Subsystem selects the optional host-tool backend, never permission to replace the parent.
+    const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
+    const execCandidate = !!imagePath && isBundledImage(imagePath);
+    if (execCandidate && deferExec) {
+        return finishVirtualProcess(
+            lpProcessInformation, applicationName, commandLine,
+            currentDirectory, dwCreationFlags, isWide,
+            { imagePath, commandLine: reExecArgs },
         );
     }
+    if (execCandidate && !deferExec) {
+        // Windows starts the child and RETURNS; it never blocks the caller, and nothing
+        // here can know which of our two single-session realizations this child needs.
+        // Blocking until it exits answered that question with the PE subsystem and got
+        // it wrong twice over: a GUI image can be a helper the parent waits on, and a
+        // console image can be the program the user is meant to end up in front of.
+        // So do what Windows does, and let the parent's own next move say it — a wait
+        // completes against the headless run, an exit hands the session over
+        // (pendingChildHandoff, consumed in shutdownProcess).
+        return finishVirtualProcess(
+            lpProcessInformation, applicationName, commandLine,
+            currentDirectory, dwCreationFlags, isWide, undefined,
+            {
+                imagePath, commandLine: reExecArgs,
+                currentDirectory: currentDirectory || system.fileSystem.currentDir,
+                rawCommandLine: commandLine || applicationName,
+                environment: system.process ? [...system.process.environment] : undefined,
+            },
+            isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
+        );
+    }
+    return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
+        imagePath && system.fileSystem.fileExists(imagePath) ? 193 : 2); // BAD_EXE_FORMAT / FILE_NOT_FOUND
+};
 
-    return finishVirtualProcess(
-        lpProcessInformation,
-        applicationName,
-        commandLine,
-        currentDirectory,
-        dwCreationFlags,
-        isWide,
-        noOpProbe
+/**
+ * The credentialed CreateProcess* variants. These MUST have real handlers even though
+ * they only ever fail: the UNIMPLEMENTED path leaves ERROR_NOT_SUPPORTED (50) in EAX,
+ * which as a BOOL is TRUE, and leaves lpProcessInformation untouched — so the guest
+ * reads handles out of uninitialised stack and propagates them into Wait/GetExitCode.
+ * Failing loudly with a zeroed PROCESS_INFORMATION is the only honest answer available:
+ * we are single-process, and impersonation/logon is not a thing we model at all.
+ */
+const refuseCredentialedProcess = (
+    mem: Uint8Array,
+    args: number[],
+    apiName: string,
+    argCount: number,
+    appNameIndex: number,
+    commandLineIndex: number,
+    processInfoIndex: number,
+    isWide: boolean
+): ThunkResult => {
+    // argCount is passed explicitly and must match kernel32.api.ts: `args` is the
+    // dispatcher's fixed-size reusable buffer, so args.length is NOT the arity and
+    // deriving RET N from it would corrupt the guest stack.
+    const stackCleanup = argCount * 4;
+    const lpProcessInformation = args[processInfoIndex] >>> 0;
+    writeProcessInformationZeroed(lpProcessInformation);
+
+    const applicationName = readNullableProcessString(mem, args[appNameIndex] >>> 0, isWide);
+    const commandLine = readNullableProcessString(mem, args[commandLineIndex] >>> 0, isWide);
+
+    System.getInstance().scheduler.setLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    Logger.warn(
+        LogCategory.KERNEL32,
+        `${apiName}("${applicationName}", "${commandLine}") -> FAILURE ` +
+        `(ERROR_CALL_NOT_IMPLEMENTED; no impersonation/logon model, and the emulator ` +
+        `cannot spawn real child processes)`
     );
+    return { value: 0, stackCleanup };
 };
 
 const OSVERSIONINFOA_SIZE = 148;
@@ -645,6 +944,11 @@ function fillVersionExW(mem: Uint8Array, lpVersionInfo: number, apiName: string)
     return 1;
 }
 
+let rpmCalls = 0;
+let lastRpmLog = 0;
+let rpmPartial = 0;
+let lastRpmPartialLog = 0;
+
 export const exports: Record<string, ThunkImplementation> = {
     ...createActCtxExports(),
 
@@ -661,6 +965,9 @@ export const exports: Record<string, ThunkImplementation> = {
             case 6:  // PF_XMMI_INSTRUCTIONS_AVAILABLE (SSE)
             case 8:  // PF_RDTSC_INSTRUCTION_AVAILABLE
             case 10: // PF_XMMI64_INSTRUCTIONS_AVAILABLE (SSE2)
+            case 13: // PF_SSE3_INSTRUCTIONS_AVAILABLE — CPUID.1:ECX[0] is set, so this must be
+                     // too: a runtime that dispatches on the pair takes the SSE3 path either way
+                     // and only the disagreement is observable.
                 supported = 1;
                 break;
             case 1:  // PF_FLOATING_POINT_EMULATED
@@ -687,7 +994,30 @@ export const exports: Record<string, ThunkImplementation> = {
         const hThread = args[0];
         const system = System.getInstance();
         const manager = getVirtualProcessManager();
+        // Resolve the owner BEFORE resuming: resumeThread can retire the record.
+        const childPid = manager.getProcessIdByThreadHandle(hThread);
         const virtualPrev = manager.resumeThread(hThread);
+
+        // The launcher has finished preparing the child (see pendingSuspendedChildExec):
+        // this is the point real Windows starts running it, and therefore ours too.
+        if (childPid !== null && virtualPrev === 1) {
+            const deferred = (globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec
+                ? undefined
+                : pendingSuspendedChildExec.get(childPid);
+            if (deferred) {
+                const patches = collectVirtualProcessWrites(childPid);
+                pendingSuspendedChildExec.delete(childPid);
+                childImageByPid.delete(childPid);
+                if (system.requestReExec(deferred.commandLine, deferred.imagePath, patches)) {
+                    const patchedBytes = patches.reduce((n, p) => n + ((p.data.length / 4) | 0) * 3, 0);
+                    Logger.log(LogCategory.SYSTEM,
+                        `[KERNEL32] ResumeThread(pid=${childPid}) -> exec "${deferred.imagePath}" ` +
+                        `(launcher resumed the child it created suspended; ` +
+                        `${patches.length} patch run(s), ~${patchedBytes} bytes)`);
+                    return { value: virtualPrev, stackCleanup: 4 };
+                }
+            }
+        }
         const prevSuspendCount = virtualPrev !== null
             ? virtualPrev
             : system.scheduler.resumeThread(hThread);
@@ -786,6 +1116,38 @@ export const exports: Record<string, ThunkImplementation> = {
     'CreateProcessW': (ctx, mem, args) => {
         return createVirtualProcess(mem, args, true);
     },
+
+    // UINT WinExec(LPCSTR lpCmdLine, UINT uCmdShow)
+    //
+    // MUST have a real handler even though it only ever fails: WinExec encodes failure as
+    // a return value BELOW 32, so the UNIMPLEMENTED path's ERROR_NOT_SUPPORTED (50) would
+    // read as SUCCESS and the guest would proceed believing it spawned a child.
+    'WinExec': (ctx, mem, args): ThunkResult => {
+        const commandLine = readNullableProcessString(mem, args[0] >>> 0, false);
+        System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
+        Logger.warn(
+            LogCategory.KERNEL32,
+            `WinExec("${commandLine}", show=${args[1] >>> 0}) -> ERROR_ACCESS_DENIED ` +
+            `(single-process HLE cannot spawn a real child)`
+        );
+        return { value: ERROR_ACCESS_DENIED, stackCleanup: 8 };
+    },
+
+    // CreateProcessAsUser* = CreateProcess* with hToken prepended (11 args).
+    'CreateProcessAsUserA': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessAsUserA', 11, 1, 2, 10, false),
+    'CreateProcessAsUserW': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessAsUserW', 11, 1, 2, 10, true),
+
+    // (lpUsername, lpDomain, lpPassword, dwLogonFlags, lpApplicationName, lpCommandLine,
+    //  dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation)
+    'CreateProcessWithLogonW': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessWithLogonW', 11, 4, 5, 10, true),
+
+    // (hToken, dwLogonFlags, lpApplicationName, lpCommandLine, dwCreationFlags,
+    //  lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation)
+    'CreateProcessWithTokenW': (ctx, mem, args) =>
+        refuseCredentialedProcess(mem, args, 'CreateProcessWithTokenW', 9, 2, 3, 8, true),
 
     'ExitThread': (ctx, mem, args) => {
         const exitCode = args[0] >>> 0;
@@ -953,6 +1315,31 @@ export const exports: Record<string, ThunkImplementation> = {
 
     'GetVersionExW': (ctx, mem, args) => fillVersionExW(mem, args[0], 'GetVersionExW'),
 
+    /**
+     * DWORD SetThreadIdealProcessor(HANDLE hThread, DWORD dwIdealProcessor)
+     *
+     * Returns the PREVIOUS ideal processor, not a BOOL — MAXIMUM_PROCESSORS when the thread had
+     * none, and (DWORD)-1 on failure. The unimplemented default answered 0, which reads as "the
+     * previous ideal processor was CPU 0" and is a plausible-looking lie; a pool that records it
+     * to restore later then pins every thread to one core. We are single-core, so the request is
+     * recorded and echoed back rather than acted on.
+     */
+    'SetThreadIdealProcessor': (ctx, mem, args) => {
+        const hThread = args[0] >>> 0;
+        const ideal = args[1] >>> 0;
+        const MAXIMUM_PROCESSORS = 32;
+        const scheduler = System.getInstance().scheduler as unknown as {
+            idealProcessors?: Map<number, number>;
+        };
+        if (!scheduler.idealProcessors) scheduler.idealProcessors = new Map<number, number>();
+        // MAXIMUM_PROCESSORS as the argument is a QUERY: it leaves the value unchanged.
+        const previous = scheduler.idealProcessors.get(hThread) ?? MAXIMUM_PROCESSORS;
+        if (ideal !== MAXIMUM_PROCESSORS) scheduler.idealProcessors.set(hThread, ideal);
+        Logger.verbose(LogCategory.KERNEL32,
+            `SetThreadIdealProcessor(hThread=0x${hThread.toString(16)}, ideal=${ideal}) -> ${previous}`);
+        return { value: previous >>> 0, stackCleanup: 8 };
+    },
+
     'SetThreadPriority': (ctx, mem, args) => {
         const hThread = args[0];
         const nPriority = args[1]; // Signed int
@@ -1035,14 +1422,15 @@ export const exports: Record<string, ThunkImplementation> = {
         const system = System.getInstance();
         const manager = getVirtualProcessManager();
         const virtualPrev = manager.suspendThread(hThread);
+        // Both suspend paths set their own last error on failure — INVALID_HANDLE for an
+        // unknown/terminated thread, SIGNAL_REFUSED at MAXIMUM_SUSPEND_COUNT — so the two
+        // cannot be told apart from the 0xFFFFFFFF return alone. Do not overwrite it here.
         const prevCount = virtualPrev !== null
             ? virtualPrev
             : system.scheduler.suspendThread(hThread);
-        if (prevCount === 0xFFFFFFFF) {
-            system.scheduler.setLastError(ERROR_INVALID_HANDLE);
-        }
         Logger.log(LogCategory.KERNEL32,
-            `SuspendThread(hThread=0x${hThread.toString(16)}) -> ${prevCount === 0xFFFFFFFF ? 'INVALID_HANDLE' : prevCount}`);
+            `SuspendThread(hThread=0x${hThread.toString(16)}) -> ` +
+            (prevCount === 0xFFFFFFFF ? `FAILED (lastError=${system.scheduler.getLastError()})` : String(prevCount)));
         return { value: prevCount, stackCleanup: 4 };
     },
 
@@ -1249,10 +1637,6 @@ export const exports: Record<string, ThunkImplementation> = {
         return versionDword >>> 0; // Unsigned 32-bit
     },
 
-    'AreFileApisANSI': () => {
-        return 1; // TRUE
-    },
-
     'SetProcessAffinityMask': (ctx, mem, args) => {
         return 1; // TRUE
     },
@@ -1270,18 +1654,19 @@ export const exports: Record<string, ThunkImplementation> = {
         const returnLengthPtr = args[1] >>> 0;
         const required = 24; // sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) on x86
 
-        if (returnLengthPtr) {
-            Mem.writeUint32(returnLengthPtr, required);
-        }
-
-        if (!bufferPtr) {
-            System.getInstance().process!.lastError = 122; // ERROR_INSUFFICIENT_BUFFER
+        if (!returnLengthPtr) {
+            System.getInstance().process!.lastError = 87; // ERROR_INVALID_PARAMETER
             return 0;
         }
 
+        // ReturnedLength is in/out: on entry it carries the caller's buffer size. Read it BEFORE
+        // writing the required size back, or the capacity check compares `required` with itself
+        // and a too-small buffer gets 24 bytes written over whatever follows it.
         const length = Mem.readUint32(returnLengthPtr) ?? 0;
-        if (length < required) {
-            System.getInstance().process!.lastError = 122;
+        Mem.writeUint32(returnLengthPtr, required);
+
+        if (!bufferPtr || length < required) {
+            System.getInstance().process!.lastError = 122; // ERROR_INSUFFICIENT_BUFFER
             return 0;
         }
 
@@ -1349,7 +1734,16 @@ export const exports: Record<string, ThunkImplementation> = {
 
     ...versionVerifyExports,
 
+    // BOOL FlushInstructionCache(HANDLE hProcess, LPCVOID lpBaseAddress, SIZE_T dwSize)
+    // A no-op on real x86 (the pipeline is coherent), but here it is the guest telling us
+    // exactly which bytes it just rewrote — and v86's block cache is not coherent with a
+    // write it did not see (a JS-side patch, or a store through an alias). Honour it.
+    // dwSize 0 / NULL base means "the whole process" per the SDK.
     'FlushInstructionCache': (ctx, mem, args) => {
+        const lpBaseAddress = args[1] >>> 0;
+        const dwSize = args[2] >>> 0;
+        if (lpBaseAddress && dwSize) invalidateGuestCode(lpBaseAddress, dwSize);
+        else invalidateAllGuestCode();
         return 1; // TRUE
     },
 
@@ -1443,11 +1837,25 @@ export const exports: Record<string, ThunkImplementation> = {
         return winDir.length;
     },
 
+    // BOOL IsWow64Process(HANDLE hProcess, PBOOL Wow64Process)
+    // A 32-bit process on a 32-bit Windows: never under WOW64. Callers branch on this to
+    // pick which registry view / Program Files path to use, so answering FALSE (rather
+    // than failing) is what keeps them on the 32-bit view we actually provide.
+    'IsWow64Process': (ctx, mem, args) => {
+        const wow64Ptr = args[1] >>> 0;
+        if (!wow64Ptr) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0; // FALSE
+        }
+        if (!Mem.writeUint32(wow64Ptr, 0)) return 0;
+        return 1; // TRUE — the call succeeded; *Wow64Process is the answer
+    },
+
     'GetComputerNameA': (ctx, mem, args) => {
         const lpBuffer = args[0];
         const lpnSize = args[1];
 
-        const name = 'BOTTLESHIP';
+        const name = GUEST_COMPUTER_NAME;
 
         if (!lpBuffer || !lpnSize) {
             return 0; // FALSE
@@ -1475,7 +1883,7 @@ export const exports: Record<string, ThunkImplementation> = {
         const lpBuffer = args[0];
         const lpnSize = args[1];
 
-        const name = 'BOTTLESHIP';
+        const name = GUEST_COMPUTER_NAME;
 
         if (!lpBuffer || !lpnSize) {
             return 0; // FALSE
@@ -1698,10 +2106,20 @@ export const exports: Record<string, ThunkImplementation> = {
         const lpBuffer = args[2] >>> 0;
         const nSize = args[3] >>> 0;
         const lpNumberOfBytesRead = args[4] >>> 0;
-        Logger.verbose(
-            LogCategory.KERNEL32,
-            `ReadProcessMemory(hProcess=0x${hProcess.toString(16)}, base=0x${lpBaseAddress.toString(16)}, size=${nSize})`
-        );
+        // Summary, not a line per call. A crash handler's stack scanner calls this millions
+        // of times, and one line each does not merely fill the log — it evicts the boot the
+        // reader came to look at, so the failure that CAUSED the crash is the part missing.
+        rpmCalls++;
+        const nowMs = performance.now();
+        if (nowMs - lastRpmLog >= 1000) {
+            Logger.verbose(
+                LogCategory.KERNEL32,
+                `ReadProcessMemory: calls=${rpmCalls} last(hProcess=0x${hProcess.toString(16)}, ` +
+                `base=0x${lpBaseAddress.toString(16)}, size=${nSize})`
+            );
+            lastRpmLog = nowMs;
+            rpmCalls = 0;
+        }
 
         if (!isKnownProcessHandle(hProcess)) {
             Logger.warn(
@@ -1754,10 +2172,21 @@ export const exports: Record<string, ThunkImplementation> = {
         const snapshot = new Uint8Array(source);
         const copied = Mem.writeBytes(lpBuffer, snapshot);
         if (copied !== nSize) {
-            Logger.warn(
-                LogCategory.KERNEL32,
-                `ReadProcessMemory partial copy copied=${copied} expected=${nSize} dst=0x${lpBuffer.toString(16)}`
-            );
+            // A probing caller (a crash handler scanning the stack for return addresses)
+            // expects most of these to fail — that refusal is how its walk terminates. One
+            // warning per attempt drowns the boot that led to the crash, so this is the same
+            // once-a-second summary the call itself gets.
+            rpmPartial++;
+            const partialNow = performance.now();
+            if (partialNow - lastRpmPartialLog >= 1000) {
+                Logger.warn(
+                    LogCategory.KERNEL32,
+                    `ReadProcessMemory: ${rpmPartial} partial copy/copies, last copied=${copied} ` +
+                    `expected=${nSize} dst=0x${lpBuffer.toString(16)}`
+                );
+                lastRpmPartialLog = partialNow;
+                rpmPartial = 0;
+            }
             if (lpNumberOfBytesRead) {
                 Mem.writeUint32(lpNumberOfBytesRead, copied >>> 0);
             }
@@ -1953,9 +2382,24 @@ export const exports: Record<string, ThunkImplementation> = {
         }
 
         const isVirtualChild = isVirtualChildProcessHandle(hProcess) && pid !== null;
-        const copied = isVirtualChild
-            ? writeVirtualProcessMemory(pid, lpBaseAddress, source)
-            : Mem.writeBytes(lpBaseAddress, new Uint8Array(source));
+        let copied: number;
+        if (isVirtualChild) {
+            copied = writeVirtualProcessMemory(pid, lpBaseAddress, source);
+        } else {
+            // Self-write: the canonical use of WriteProcessMemory is patching live code
+            // (import hooks, entry-point detours, allocator interposition). This is a JS
+            // write, which v86 cannot observe, so the range must be invalidated in the same
+            // turn or the CPU keeps running the blocks it compiled from the pre-patch bytes
+            // (§3.1 guest-code coherence).
+            copied = Mem.writeBytes(lpBaseAddress, new Uint8Array(source));
+            if (copied > 0) invalidateGuestCode(lpBaseAddress, copied);
+            // Low volume and always interesting: a self-patch names the detour being installed.
+            Logger.log(
+                LogCategory.KERNEL32,
+                `WriteProcessMemory self-patch dst=0x${lpBaseAddress.toString(16)} size=${copied} ` +
+                `bytes=${Array.from(new Uint8Array(source).subarray(0, 8)).map(b => b.toString(16).padStart(2, '0')).join(' ')}`
+            );
+        }
         if (isVirtualChild) {
             Logger.verbose(
                 LogCategory.KERNEL32,
@@ -1995,12 +2439,11 @@ export const exports: Record<string, ThunkImplementation> = {
  * Faithful: the suspend count still flips and the scheduler still skips a suspended
  * thread — only the dispatch overhead is removed.
  */
-export function registerFastPathProcessFunctions(dispatcher: any): void {
+export function registerFastPathProcessFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     // DWORD SuspendThread(HANDLE hThread) — stdcall, RET 4. Returns prev suspend count.
-    dispatcher.registerFastPath('kernel32', 'SuspendThread', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    dispatcher.registerFastPath('kernel32', 'SuspendThread', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 8 > mem8.length) return null;
         const sched = System.getInstance().scheduler;
         if (!sched) return null;
@@ -2012,8 +2455,7 @@ export function registerFastPathProcessFunctions(dispatcher: any): void {
     });
 
     // DWORD ResumeThread(HANDLE hThread) — stdcall, RET 4. Returns prev suspend count.
-    dispatcher.registerFastPath('kernel32', 'ResumeThread', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = cpu.reg32[4] >>> 0;
+    dispatcher.registerFastPath('kernel32', 'ResumeThread', (esp: number, _view: DataView, mem8: Uint8Array): number | null => {
         if (esp + 8 > mem8.length) return null;
         const sched = System.getInstance().scheduler;
         if (!sched) return null;
@@ -2022,4 +2464,3 @@ export function registerFastPathProcessFunctions(dispatcher: any): void {
         return prev === null ? null : (prev >>> 0);
     }, { trivial: true });
 }
-

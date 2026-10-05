@@ -1,0 +1,17 @@
+[package]
+name = "bottleship-opt-compiler"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Pure semantic IR and verifier for BottleShip's experimental user-mode optimizing translator"
+license = "UNLICENSED"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"
+strip = true

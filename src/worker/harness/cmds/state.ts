@@ -15,11 +15,26 @@ import { STATE_SECTIONS, serializeCpu, serializeThreads, sys, proc, symbolize } 
 import { buildHarnessReport } from "../build-report";
 import { getCxxExceptionRing, getActiveCatchRecords } from "../../core/seh-dispatch";
 import { faultRecorder } from "../../core/memory/fault-recorder";
+import { describeSyncRing, SYNC_RING_NOTE } from "../../core/scheduler/sync-objects";
 import { stubRegistry } from "../../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../../core/diagnostics/get-proc-address-registry";
 import { apiCensus } from "../../core/diagnostics/api-census";
+import { childProcessHistory, runChildProcess } from "../../core/child-process";
 
 export function registerStateCommands(svc: HarnessService): void {
+    // A clean ExitProcess sets isExiting and emits nothing. Without this the service
+    // cannot tell "the guest is busy" from "the guest is gone", and every live-guest
+    // verb after an exit pays out its full timeout instead of saying so.
+    svc.setGuestExitProbe(() => !!sys()?.isExiting);
+    svc.register("childProcesses", () => ({ processes: childProcessHistory.map(record => ({ ...record })) }));
+    svc.register("runChildProcess", async args => {
+        const imagePath = sys().fileSystem.resolvePath(String(args[0]));
+        const exitCode = await runChildProcess(sys().fileSystem, {
+            imagePath, commandLine: String(args[1] ?? ''),
+            currentDirectory: String(args[2] ?? sys().fileSystem.currentDir),
+        });
+        return { exitCode };
+    });
     /** Health probe: confirms the worker harness is wired and a process is (or isn't) loaded. */
     svc.register("ping", () => ({
         ok: true,
@@ -177,6 +192,7 @@ export function registerStateCommands(svc: HarnessService): void {
         const d = proc()?.dispatcher as {
             getActiveAsyncThunks?: () => Array<{ functionId: number; functionName?: string; startTime: number; threadId?: number; esp?: number; returnAddr?: number }>;
             getPendingAsyncRestores?: () => Array<{ threadId?: number; completionName: string; returnAddr?: number; esp?: number }>;
+            getDeferredFrameCompletions?: () => Array<{ threadId: number; frameId: number; source: string; value: number }>;
         } | undefined;
         if (!d?.getActiveAsyncThunks) {
             throw new HarnessError("dispatcher unavailable (no process loaded?)", HarnessErrorCode.BAD_ARGS);
@@ -253,7 +269,25 @@ export function registerStateCommands(svc: HarnessService): void {
                 : pending.length
                     ? `${pending.length} resolved restore(s) not applied — safe-point apply not reached`
                     : "no stuck async parks";
-        return { now: Math.round(now), parkedTids, inFlight, pending, orphanParkedTids, hint };
+        // A frame completion deferred to its owner thread (JS-driven pump whose terminal
+        // step landed on a sibling). Stuck here = the owner never reached its safe point,
+        // which looks exactly like a spin-loop hang from the outside.
+        const deferredCompletions = (d.getDeferredFrameCompletions?.() ?? []);
+        const deferredHint = deferredCompletions.length
+            ? `${deferredCompletions.length} deferred frame completion(s) awaiting owner ` +
+              `(tids ${deferredCompletions.map((c) => c.threadId).join(",")}) — owner not at a safe point`
+            : null;
+        // The scheduler's park/complete/restore ring. A STALL needs this as much as a fault
+        // does (it is only dumped on a fatal guard otherwise): when a thread sits at the spin
+        // loop with no in-flight async and no pending restore, these lines are the only
+        // record of which thunk parked it and whether its completion ever fired.
+        const sched = sys().scheduler as unknown as { getAsyncRestoreTrace?: () => string[] };
+        const asyncTrace = sched?.getAsyncRestoreTrace?.().slice(-24) ?? [];
+        return {
+            now: Math.round(now), parkedTids, inFlight, pending, orphanParkedTids,
+            deferredCompletions, asyncTrace,
+            hint: deferredHint ?? hint,
+        };
     });
 
     /**
@@ -278,6 +312,24 @@ export function registerStateCommands(svc: HarnessService): void {
      * getProcMisses() — GetProcAddress lookups that returned NULL (ERROR_PROC_NOT_FOUND),
      * deduped with hit count + guest caller. Shorthand for report().getProcMisses.
      */
+    /**
+     * getProcStubbed() — GetProcAddress lookups answered with an UNIMPLEMENTED or silent stub,
+     * in full (report() keeps only the top 12). This is the list that reads as success to the
+     * caller: a runtime feature probe (UCRT/msvcp140 winapi thunks, SDL's SetThreadDescription)
+     * gets a callable address, so it uses it instead of falling back.
+     */
+    svc.register("getProcStubbed", () => {
+        return getProcAddressRegistry.unsatisfied()
+            .filter((h) => h.kind !== "null")
+            .map((h) => ({
+                module: h.dll ?? "0x" + h.hModule.toString(16),
+                proc: h.procName,
+                kind: h.kind,
+                count: h.count,
+                lastCallerSym: symbolize(h.lastCaller),
+            }));
+    });
+
     svc.register("getProcMisses", () => {
         return getProcAddressRegistry.misses().map((h) => ({
             module: "0x" + h.hModule.toString(16),
@@ -291,6 +343,89 @@ export function registerStateCommands(svc: HarnessService): void {
     });
 
     /**
+     * apiCoverage() — the RUNTIME half of the pre-flight census, in one POJO: what this
+     * session actually reached for, and how much of it we really answered.
+     *
+     * The static census (`bun tools/api-census.ts <bundle.wgb>`) reads the import tables
+     * and says what a title links against. Two whole classes of use are invisible there
+     * and only observable here:
+     *   - GetProcAddress — a dynamic resolution appears in no import table, and legacy
+     *     titles hide their optional/versioned behaviour behind exactly that. `dynamic`
+     *     reports each distinct lookup with what the returned address LEADS to, and
+     *     `unsatisfied` is the subset the guest could not use (NULL / stub / silent).
+     *   - COM vtable slots — never imports at all. They arrive through the same thunk
+     *     dispatch as flat exports ("d3d9:IDirect3DDevice9_DrawPrimitive"), so `com`
+     *     counts them out of the call census and `missing` picks up the unimplemented
+     *     slots from the stub registry.
+     *
+     * Ranked by call count, so the output is a work order rather than a wall of names.
+     * `silent` is listed separately and first on purpose: a handler that returns success
+     * without doing the work is worse than a missing one — the guest is told it worked.
+     */
+    /**
+     * apiFailures(limit?) — every COM/DX call that answered FAILURE, with the guest caller.
+     *
+     * The complement of `apiCoverage`: that names what we did not implement or faked, this
+     * names what we implemented and REFUSED. A refusal is invisible at the crash site — the
+     * guest keeps the NULL out-param and derefs it later, in its own code — so this is the
+     * list to read first when a title dies with a null pointer some seconds after a load.
+     */
+    svc.register("apiFailures", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 40;
+        const hex = (v: number): string => "0x" + (v >>> 0).toString(16);
+        const all = apiCensus.failureList();
+        return {
+            total: all.length,
+            failures: all.slice(0, limit).map((f) => ({
+                api: f.name, hr: hex(f.hr), count: f.count,
+                lastCaller: hex(f.lastCaller), lastCallerSym: symbolize(f.lastCaller),
+            })),
+        };
+    });
+
+    svc.register("apiCoverage", (args) => {
+        const limit = typeof args[0] === "number" ? Math.max(1, args[0] as number) : 25;
+        const hex = (v: number): string => "0x" + (v >>> 0).toString(16);
+
+        const called = apiCensus.list();
+        const com = called.filter((c) => c.name.includes("_"));
+        const dynamic = getProcAddressRegistry.list();
+
+        return {
+            byKind: getProcAddressRegistry.byKind(),
+            totals: {
+                apisCalled: called.length,
+                comMethodsCalled: com.length,
+                dynamicLookups: dynamic.length,
+                silentStubsCalled: apiCensus.suspectStubs().length,
+                unimplementedHit: stubRegistry.list().length,
+            },
+            /** Handlers that ran, reported success, and did nothing. Fix these first. */
+            silent: apiCensus.suspectStubs().slice(0, limit).map((s) => ({
+                api: s.name, count: s.count, arity: s.arity,
+                lastCaller: hex(s.lastCaller), lastCallerSym: symbolize(s.lastCaller),
+            })),
+            /** Called with no handler at all — includes COM vtable slots. */
+            missing: stubRegistry.list()
+                .sort((a, b) => b.count - a.count).slice(0, limit)
+                .map((s) => ({
+                    api: s.key, count: s.count,
+                    lastCaller: hex(s.lastCaller), lastCallerSym: symbolize(s.lastCaller),
+                })),
+            /** GetProcAddress results the guest cannot use, most-requested first. */
+            unsatisfied: getProcAddressRegistry.unsatisfied().slice(0, limit).map((h) => ({
+                proc: h.procName, dll: h.dll ?? hex(h.hModule), kind: h.kind, count: h.count,
+                lastCaller: hex(h.lastCaller), lastCallerSym: symbolize(h.lastCaller),
+            })),
+            /** Every distinct dynamic resolution, with what the address leads to. */
+            dynamic: dynamic.slice(0, limit).map((h) => ({
+                proc: h.procName, dll: h.dll ?? hex(h.hModule), kind: h.kind,
+                addr: hex(h.address), count: h.count,
+            })),
+        };
+    });
+
+    /**
      * apiCensus() — EVERY unique DX/COM/WinAPI method the guest has called this session
      * (deduped, hit-count + last guest caller), newest-hit first. Unlike stubs() (no
      * handler) this lists what's ACTUALLY exercised — the triage list for "where is the
@@ -298,17 +433,122 @@ export function registerStateCommands(svc: HarnessService): void {
      * source. `suspect` marks likely SILENT stubs (handler ignores its args / curated).
      * Pass true to get only the suspect-stub subset (== report().silentStubs).
      */
+    /**
+     * apiCensus(sel?, {reset?, wbuf?}) — every API the guest actually called, across the
+     * dispatch tiers.
+     *
+     * The JS-dispatch census alone is a trap: every d3d8/d3d9/ddraw draw and render-state
+     * setter is served by the fast path, so asking this for a rendering question and reading
+     * a zero says "the guest issued no draw calls" when it issued thousands. `fastPathCount`
+     * is that tier, reported beside `count` rather than summed into it (a fast path that
+     * defers by returning null is counted on both). `wbufCount` is the deferred write-buffer
+     * ring — a THIRD tier that reaches no trap at all and so reads as zero on both of the
+     * others; it is opt-in (`{wbuf:true}`) because counting costs a walk of the ring per
+     * drain. `tiersNotCovered` names what is still invisible — including WBUF while it is
+     * off — so a zero here can never be read as "never called".
+     *
+     * Counts are cumulative since load; pass `{reset:true}` to zero both tiers, or diff two
+     * snapshots for a windowed answer. `module` filters by the `"<module>:"` prefix.
+     *
+     * Returns `{calls, tiersNotCovered}` — an OBJECT, not the bare array it used to be,
+     * because a non-index property on an array does not survive JSON serialization and the
+     * caveat would have arrived as `undefined` at every caller.
+     */
     svc.register("apiCensus", (args) => {
         const onlySuspect = args[0] === true || args[0] === "suspect";
+        const moduleFilter = typeof args[0] === "string" && args[0] !== "suspect" ? args[0].toLowerCase() : null;
+        const opts = (args[1] ?? (typeof args[0] === "object" ? args[0] : {})) as { reset?: boolean; wbuf?: boolean; wbufSequence?: number };
+        const dispatcher = proc()?.dispatcher as {
+            getFastPathCensus?: () => Array<{ name: string; count: number }>;
+            resetFastPathCensus?: () => void;
+            getWriteBufCensus?: () => Array<{ name: string; count: number }>;
+            resetWriteBufCensus?: () => void;
+            setWriteBufCensusEnabled?: (on: boolean) => void;
+            armWriteBufSequence?: (want: number) => void;
+            getWriteBufSequence?: () => { armed: boolean; want: number; ids: string[] } | null;
+            isWriteBufCensusEnabled?: () => boolean;
+        } | undefined;
+
+        if (opts?.reset) {
+            apiCensus.clear();
+            dispatcher?.resetFastPathCensus?.();
+            dispatcher?.resetWriteBufCensus?.();
+            return { reset: true };
+        }
+        // Opt-in third tier: counting costs a second walk of the ring per drain, so it is
+        // off until asked for. Counts therefore start HERE, not at load — which is why the
+        // enabling call answers with a marker instead of a zero that reads like "never called".
+        if (opts?.wbuf !== undefined) {
+            dispatcher?.setWriteBufCensusEnabled?.(!!opts.wbuf);
+            if (opts.wbuf) return { wbufCensus: "enabled", note: "counts start now; call again to read them" };
+        }
+        // Order capture is its own tier: a run detector is matched on SEQUENCE, and totals
+        // cannot answer that. Arming returns a marker for the same reason the census does.
+        if (opts?.wbufSequence !== undefined) {
+            dispatcher?.armWriteBufSequence?.(opts.wbufSequence);
+            if (opts.wbufSequence > 0) {
+                return { wbufSequence: "armed", want: opts.wbufSequence, note: "call again to read the captured order" };
+            }
+        }
+        const wbufSequence = dispatcher?.getWriteBufSequence?.() ?? null;
+
+        const fast = new Map((dispatcher?.getFastPathCensus?.() ?? []).map((r) => [r.name, r.count]));
+        // A DISABLED census must not answer 0 — that reads exactly like "never called", and
+        // it is how a disabled instrument gets quoted as evidence. null is the honest answer:
+        // unknown until armed. (This bit me and then a colleague, on the same day.)
+        const wbufArmed = dispatcher?.isWriteBufCensusEnabled?.() ?? false;
+        const wbufRows = wbufArmed ? (dispatcher?.getWriteBufCensus?.() ?? []) : [];
+        const wbuf = new Map(wbufRows.map((r) => [r.name, r.count]));
+        const wbufCountFor = (name: string): number | null => (wbufArmed ? (wbuf.get(name) ?? 0) : null);
         const rows = onlySuspect ? apiCensus.suspectStubs() : apiCensus.list();
-        return rows.map((s) => ({
+        const out = rows.map((s) => ({
             api: s.name,
             count: s.count,
+            fastPathCount: fast.get(s.name) ?? 0,
+            wbufCount: wbufCountFor(s.name),
             arity: s.arity,
             suspect: s.suspectStub,
             lastCaller: "0x" + s.lastCaller.toString(16),
             lastCallerSym: symbolize(s.lastCaller),
         }));
+        // Anything served ONLY by the fast path has no JS-dispatch row at all, and those are
+        // exactly the calls this verb used to lose.
+        if (!onlySuspect) {
+            const seen = new Set(rows.map((r) => r.name));
+            for (const [name, count] of fast) {
+                if (!seen.has(name)) {
+                    seen.add(name);
+                    out.push({
+                        api: name, count: 0, fastPathCount: count, wbufCount: wbufCountFor(name),
+                        arity: -1, suspect: false, lastCaller: "0x0", lastCallerSym: null,
+                    });
+                }
+            }
+            // A WBUF-only call reaches NEITHER of the other two tiers, so without this it has
+            // no row at all — the exact shape of the miss this verb keeps being caught by.
+            for (const [name, count] of wbuf) {
+                if (!seen.has(name)) {
+                    out.push({
+                        api: name, count: 0, fastPathCount: 0, wbufCount: count,
+                        arity: -1, suspect: false, lastCaller: "0x0", lastCallerSym: null,
+                    });
+                }
+            }
+        }
+        const calls = moduleFilter ? out.filter((r) => r.api.toLowerCase().startsWith(`${moduleFilter}:`)) : out;
+        return {
+            calls,
+            total: calls.length,
+            wbufSequence,
+            tiersNotCovered: [
+                "wasm hypercall (io_port_write32 0xB077): time, sync, string/memory, FPU/math",
+                ...(wbufArmed
+                    ? []
+                    : ["write buffer (deferred ring): draws + render-state setters — a WBUF call "
+                       + "never hits the OUT trap, so it is 0 on BOTH tiers above. "
+                       + "Enable with apiCensus(null, {wbuf:true}), then re-read."]),
+            ],
+        };
     });
 
     /** silentStubs() — shorthand for apiCensus(true): only the called methods flagged
@@ -317,6 +557,89 @@ export function registerStateCommands(svc: HarnessService): void {
         api: s.name, count: s.count, arity: s.arity,
         lastCaller: "0x" + s.lastCaller.toString(16), lastCallerSym: symbolize(s.lastCaller),
     })));
+
+    /**
+     * syncObjects() — every event/semaphore/mutex with its live state. Pair it with a
+     * thread dump's `waitHandles`: a hang where nobody runs is only diagnosable as
+     * "T1 waits on handle H" AND "H is not signalled, and nobody is left to signal it".
+     * `ringNote` travels with the ring because the ring cannot see hypercall-served signals.
+     */
+    /**
+     * waitGraph() — every blocked thread joined to the object it waits on, its holder,
+     * and whether the WaitEngine can still reach it.
+     *
+     * `syncObjects` says an object is owned and a thread dump says a thread waits; neither
+     * says whether the two are connected. `registered` is that link: a waiter absent from
+     * the handle index gets no wake, so an INFINITE wait there can never end — which a
+     * dump of either side alone reads as ordinary contention. `satisfiable` re-runs the
+     * scheduler's own checkWait: true while the thread is still WAITING is a LOST WAKE,
+     * the object became available and nobody delivered it.
+     */
+    svc.register("waitGraph", () => {
+        const scheduler = sys().scheduler as any;
+        if (!scheduler?.syncObjects || !scheduler?.waitEngine) {
+            throw new HarnessError("no scheduler", HarnessErrorCode.NO_PROCESS);
+        }
+        const syncObjects = scheduler.syncObjects;
+        const waitEngine = scheduler.waitEngine;
+        const threads: Map<number, any> = scheduler.threads;
+        const lookup = (tid: number) => threads.get(tid) ?? null;
+
+        const waiters = [];
+        for (const t of threads.values()) {
+            const info = t.waitInfo;
+            if (!info || t.state !== 3 /* WAITING */) continue;
+            const handles = (info.handles ?? []).map((h: number) => ({
+                handle: h,
+                hex: "0x" + (h >>> 0).toString(16),
+                object: syncObjects.describeHandle(h),
+                registered: waitEngine.getHandleWaiters(h).includes(t.id),
+                otherWaiters: waitEngine.getHandleWaiters(h).filter((id: number) => id !== t.id),
+            }));
+            let satisfiable: boolean | null = null;
+            if (handles.length > 0) {
+                satisfiable = syncObjects.checkWait(info.handles, !!info.waitAll, t.id, lookup).ready;
+            }
+            waiters.push({
+                tid: t.id,
+                eip: "0x" + (t.eip >>> 0).toString(16),
+                eipSym: symbolize(t.eip),
+                reason: info.reason,
+                timed: (t.waitTimeoutTimerId ?? 0) !== 0,
+                handles,
+                satisfiable,
+                lostWake: satisfiable === true,
+                unreachable: handles.length > 0 && handles.every((h: any) => !h.registered),
+            });
+        }
+        return {
+            waiters,
+            objects: syncObjects.describeAll(),
+            runQueue: scheduler.runQueue ?? [],
+        };
+    });
+
+    svc.register("syncObjects", (args) => {
+        const scheduler = sys().scheduler as any;
+        if (!scheduler?.syncObjects) throw new HarnessError("no scheduler", HarnessErrorCode.NO_PROCESS);
+        return {
+            objects: scheduler.syncObjects.describeAll(),
+            ring: describeSyncRing(Number((args as unknown[])?.[0] ?? 120)),
+            ringNote: SYNC_RING_NOTE,
+        };
+    });
+
+    /**
+     * reExecs() — every guest restart request this worker session saw (image, command
+     * line, caller), newest last. A restart is a page reload, so a re-exec LOOP wipes
+     * the log stream and every ring once per iteration; pair this with
+     * `setWorkerFlag('__noReExec', true)`, which refuses the restart and leaves the
+     * guest standing at the call that asked for it.
+     */
+    svc.register("reExecs", () => {
+        const ring = (globalThis as { __bsReExecRequests?: unknown[] }).__bsReExecRequests;
+        return { armed: !!(globalThis as { __noReExec?: boolean }).__noReExec, requests: ring ?? [] };
+    });
 
     /**
      * backtrace(esp?) — on-demand guest call-stack reconstruction (module-labelled,
@@ -383,6 +706,24 @@ export function registerStateCommands(svc: HarnessService): void {
      * zero-perturbation — the go-to verb when the emulator "froze": it shows where
      * a thread derailed (near-NULL deref / wild jump) instead of leaving a hang.
      */
+    /**
+     * cxxThrows({clear?}) — every C++ exception (RaiseException 0xe06d7363) the guest
+     * raised, newest last, with a heuristic (FPO-tolerant) guest backtrace snapshot at
+     * the raise site. breakOnApi/sehLog cannot see a C++ throw the app's own
+     * __CxxFrameHandler catches, and the throw stack is gone once a fatal MessageBox
+     * pauses the guest; this ring is captured at the raise and survives even the UEF's
+     * module-walk log flood. Use it to find WHICH guest code raised (e.g. a CRT
+     * _invalid_parameter behind an FPO frame) when a game dies with "encountered an error".
+     */
+    svc.register("cxxThrows", async (args) => {
+        const opts = (args[0] ?? {}) as { clear?: boolean };
+        const ex = await import("../../modules/kernel32/exception");
+        const ring = ex.getCxxThrowRing();
+        const out = ring.map((r) => ({ ...r, code: "0x" + r.code.toString(16), valuePtr: "0x" + r.valuePtr.toString(16), eip: "0x" + r.eip.toString(16) }));
+        if (opts.clear) ex.resetCxxThrowRing();
+        return { count: out.length, throws: out };
+    });
+
     svc.register("faults", (args) => {
         const n = typeof args[0] === "number" ? (args[0] as number) : 16;
         const hx = (v: number) => "0x" + (v >>> 0).toString(16);
@@ -395,8 +736,26 @@ export function registerStateCommands(svc: HarnessService): void {
             threadId: f.threadId,
             lastThunk: f.lastThunk,
             kind: f.kind,
+            // false ⇒ no instruction at `eip` addresses CR2; the jit only materializes
+            // eip's low 12 bits, so read CR2/cr2Candidates instead of chasing that EIP.
+            eipTrusted: f.eipTrusted,
+            // The block the CPU ENTERED before faulting. On a wild EIP this is the only
+            // survivor that still names a real code address — without it the record says
+            // where control ended up and nothing about where it came from.
+            previousEip: f.previousEip !== undefined ? hx(f.previousEip) : undefined,
+            // true ⇒ eip/errorCode are placeholders, not measurements.
+            frameUnread: f.frameUnread,
+            cr2Candidates: f.cr2Candidates,
+            badCall: f.badCall,
+            // "ret" ⇒ a SLOT held the wrong address (a smashed frame / mis-cleaned stack);
+            // "call" ⇒ a bad target was fetched at the named call site.
+            transfer: f.transfer,
+            outcome: f.outcome,
             regs: {
-                ecx: hx(f.regs.ecx), ebx: hx(f.regs.ebx), esp: hx(f.regs.esp),
+                eax: f.regs.eax !== undefined ? hx(f.regs.eax) : undefined,
+                ecx: hx(f.regs.ecx),
+                edx: f.regs.edx !== undefined ? hx(f.regs.edx) : undefined,
+                ebx: hx(f.regs.ebx), esp: hx(f.regs.esp),
                 ebp: hx(f.regs.ebp), esi: hx(f.regs.esi), edi: hx(f.regs.edi),
             },
             recentCalls: f.recentCalls,

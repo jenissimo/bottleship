@@ -1,0 +1,363 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.954Z",
+  "module": "wintrust",
+  "functions": [
+    {
+      "name": "CryptCATAdminAcquireContext",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATAdminAcquireContext2",
+      "argCount": 5
+    },
+    {
+      "name": "CryptCATAdminAddCatalog",
+      "argCount": 4
+    },
+    {
+      "name": "CryptCATAdminCalcHashFromFileHandle",
+      "argCount": 4
+    },
+    {
+      "name": "CryptCATAdminCalcHashFromFileHandle2",
+      "argCount": 5
+    },
+    {
+      "name": "CryptCATAdminEnumCatalogFromHash",
+      "argCount": 5
+    },
+    {
+      "name": "CryptCATAdminReleaseCatalogContext",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATAdminReleaseContext",
+      "argCount": 2
+    },
+    {
+      "name": "CryptCATAdminRemoveCatalog",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATAdminResolveCatalogPath",
+      "argCount": 4
+    },
+    {
+      "name": "CryptCATCatalogInfoFromContext",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATCDFClose",
+      "argCount": 1
+    },
+    {
+      "name": "CryptCATCDFEnumCatAttributes",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATCDFEnumMembersByCDFTagEx",
+      "argCount": 6
+    },
+    {
+      "name": "CryptCATCDFOpen",
+      "argCount": 2
+    },
+    {
+      "name": "CryptCATClose",
+      "argCount": 1
+    },
+    {
+      "name": "CryptCATEnumerateAttr",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATEnumerateCatAttr",
+      "argCount": 2
+    },
+    {
+      "name": "CryptCATEnumerateMember",
+      "argCount": 2
+    },
+    {
+      "name": "CryptCATGetAttrInfo",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCATGetCatAttrInfo",
+      "argCount": 2
+    },
+    {
+      "name": "CryptCATGetMemberInfo",
+      "argCount": 2
+    },
+    {
+      "name": "CryptCATOpen",
+      "argCount": 5
+    },
+    {
+      "name": "CryptCATPersistStore",
+      "argCount": 1
+    },
+    {
+      "name": "CryptCATPutAttrInfo",
+      "argCount": 6
+    },
+    {
+      "name": "CryptCATPutCatAttrInfo",
+      "argCount": 5
+    },
+    {
+      "name": "CryptCATPutMemberInfo",
+      "argCount": 7
+    },
+    {
+      "name": "CryptSIPCreateIndirectData",
+      "argCount": 3
+    },
+    {
+      "name": "CryptSIPGetSignedDataMsg",
+      "argCount": 5
+    },
+    {
+      "name": "CryptSIPPutSignedDataMsg",
+      "argCount": 5
+    },
+    {
+      "name": "CryptSIPRemoveSignedDataMsg",
+      "argCount": 2
+    },
+    {
+      "name": "CryptSIPVerifyIndirectData",
+      "argCount": 2
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DriverCleanupPolicy",
+      "argCount": 1
+    },
+    {
+      "name": "DriverFinalPolicy",
+      "argCount": 1
+    },
+    {
+      "name": "DriverInitializePolicy",
+      "argCount": 1
+    },
+    {
+      "name": "FindCertsByIssuer",
+      "argCount": 7
+    },
+    {
+      "name": "GenericChainCertificateTrust",
+      "argCount": 1
+    },
+    {
+      "name": "GenericChainFinalProv",
+      "argCount": 1
+    },
+    {
+      "name": "HTTPSCertificateTrust",
+      "argCount": 1
+    },
+    {
+      "name": "HTTPSFinalProv",
+      "argCount": 1
+    },
+    {
+      "name": "IsCatalogFile",
+      "argCount": 2
+    },
+    {
+      "name": "mscat32DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "mscat32DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "mssip32DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "mssip32DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "OpenPersonalTrustDBDialog",
+      "argCount": 1
+    },
+    {
+      "name": "SoftpubAuthenticode",
+      "argCount": 1
+    },
+    {
+      "name": "SoftpubCheckCert",
+      "argCount": 4
+    },
+    {
+      "name": "SoftpubCleanup",
+      "argCount": 1
+    },
+    {
+      "name": "SoftpubDefCertInit",
+      "argCount": 1
+    },
+    {
+      "name": "SoftpubDllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "SoftpubDllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "SoftpubInitialize",
+      "argCount": 1
+    },
+    {
+      "name": "SoftpubLoadMessage",
+      "argCount": 1
+    },
+    {
+      "name": "SoftpubLoadSignature",
+      "argCount": 1
+    },
+    {
+      "name": "TrustIsCertificateSelfSigned",
+      "argCount": 1
+    },
+    {
+      "name": "WintrustAddActionID",
+      "argCount": 3
+    },
+    {
+      "name": "WintrustAddDefaultForUsage",
+      "argCount": 2
+    },
+    {
+      "name": "WintrustCertificateTrust",
+      "argCount": 1
+    },
+    {
+      "name": "WintrustGetRegPolicyFlags",
+      "argCount": 1
+    },
+    {
+      "name": "WintrustLoadFunctionPointers",
+      "argCount": 2
+    },
+    {
+      "name": "WintrustRemoveActionID",
+      "argCount": 1
+    },
+    {
+      "name": "WintrustSetRegPolicyFlags",
+      "argCount": 1
+    },
+    {
+      "name": "WinVerifyTrust",
+      "argCount": 3
+    },
+    {
+      "name": "WinVerifyTrustEx",
+      "argCount": 3
+    },
+    {
+      "name": "WTHelperCertCheckValidSignature",
+      "argCount": 1
+    },
+    {
+      "name": "WTHelperGetFileHandle",
+      "argCount": 1
+    },
+    {
+      "name": "WTHelperGetFileName",
+      "argCount": 1
+    },
+    {
+      "name": "WTHelperGetKnownUsages",
+      "argCount": 2
+    },
+    {
+      "name": "WTHelperGetProvCertFromChain",
+      "argCount": 2
+    },
+    {
+      "name": "WTHelperGetProvPrivateDataFromChain",
+      "argCount": 2
+    },
+    {
+      "name": "WTHelperGetProvSignerFromChain",
+      "argCount": 4
+    },
+    {
+      "name": "WTHelperProvDataFromStateData",
+      "argCount": 1
+    },
+    {
+      "name": "WVTAsn1CatMemberInfoDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1CatMemberInfoEncode",
+      "argCount": 5
+    },
+    {
+      "name": "WVTAsn1CatNameValueDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1CatNameValueEncode",
+      "argCount": 5
+    },
+    {
+      "name": "WVTAsn1SpcFinancialCriteriaInfoDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1SpcFinancialCriteriaInfoEncode",
+      "argCount": 5
+    },
+    {
+      "name": "WVTAsn1SpcIndirectDataContentDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1SpcIndirectDataContentEncode",
+      "argCount": 5
+    },
+    {
+      "name": "WVTAsn1SpcLinkDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1SpcLinkEncode",
+      "argCount": 5
+    },
+    {
+      "name": "WVTAsn1SpcPeImageDataDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1SpcPeImageDataEncode",
+      "argCount": 5
+    },
+    {
+      "name": "WVTAsn1SpcSpOpusInfoDecode",
+      "argCount": 7
+    },
+    {
+      "name": "WVTAsn1SpcSpOpusInfoEncode",
+      "argCount": 5
+    }
+  ]
+}

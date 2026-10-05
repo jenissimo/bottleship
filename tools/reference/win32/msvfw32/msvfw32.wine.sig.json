@@ -1,0 +1,159 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.919Z",
+  "module": "msvfw32",
+  "functions": [
+    {
+      "name": "DrawDibBegin",
+      "argCount": 8
+    },
+    {
+      "name": "DrawDibChangePalette",
+      "argCount": 4
+    },
+    {
+      "name": "DrawDibClose",
+      "argCount": 1
+    },
+    {
+      "name": "DrawDibDraw",
+      "argCount": 13
+    },
+    {
+      "name": "DrawDibEnd",
+      "argCount": 1
+    },
+    {
+      "name": "DrawDibGetBuffer",
+      "argCount": 4
+    },
+    {
+      "name": "DrawDibGetPalette",
+      "argCount": 1
+    },
+    {
+      "name": "DrawDibOpen",
+      "argCount": 0
+    },
+    {
+      "name": "DrawDibProfileDisplay",
+      "argCount": 1
+    },
+    {
+      "name": "DrawDibRealize",
+      "argCount": 3
+    },
+    {
+      "name": "DrawDibSetPalette",
+      "argCount": 2
+    },
+    {
+      "name": "DrawDibStart",
+      "argCount": 2
+    },
+    {
+      "name": "DrawDibStop",
+      "argCount": 1
+    },
+    {
+      "name": "DrawDibTime",
+      "argCount": 2
+    },
+    {
+      "name": "GetOpenFileNamePreview",
+      "argCount": 1
+    },
+    {
+      "name": "GetOpenFileNamePreviewA",
+      "argCount": 1
+    },
+    {
+      "name": "GetOpenFileNamePreviewW",
+      "argCount": 1
+    },
+    {
+      "name": "GetSaveFileNamePreviewA",
+      "argCount": 1
+    },
+    {
+      "name": "GetSaveFileNamePreviewW",
+      "argCount": 1
+    },
+    {
+      "name": "ICClose",
+      "argCount": 1
+    },
+    {
+      "name": "ICCompressorChoose",
+      "argCount": 6
+    },
+    {
+      "name": "ICCompressorFree",
+      "argCount": 1
+    },
+    {
+      "name": "ICGetDisplayFormat",
+      "argCount": 6
+    },
+    {
+      "name": "ICGetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "ICImageCompress",
+      "argCount": 7
+    },
+    {
+      "name": "ICImageDecompress",
+      "argCount": 5
+    },
+    {
+      "name": "ICInfo",
+      "argCount": 3
+    },
+    {
+      "name": "ICInstall",
+      "argCount": 5
+    },
+    {
+      "name": "ICLocate",
+      "argCount": 5
+    },
+    {
+      "name": "ICOpen",
+      "argCount": 3
+    },
+    {
+      "name": "ICOpenFunction",
+      "argCount": 4
+    },
+    {
+      "name": "ICRemove",
+      "argCount": 3
+    },
+    {
+      "name": "ICSendMessage",
+      "argCount": 4
+    },
+    {
+      "name": "ICSeqCompressFrame",
+      "argCount": 5
+    },
+    {
+      "name": "ICSeqCompressFrameEnd",
+      "argCount": 1
+    },
+    {
+      "name": "ICSeqCompressFrameStart",
+      "argCount": 2
+    },
+    {
+      "name": "ord_2",
+      "argCount": 0
+    },
+    {
+      "name": "VideoForWindowsVersion",
+      "argCount": 0
+    }
+  ]
+}

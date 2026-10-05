@@ -7,7 +7,7 @@
 import { LruCache } from "../../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../../core/logger";
 import { System } from "../../../core/system";
-import { DxSamplerCache } from "../shared/dx-sampler";
+import { DxSamplerCache, type DxSamplerAddressMode, type SamplerSpec } from "../shared/dx-sampler";
 import {
     D3DTFN_POINT,
     D3DTFN_LINEAR,
@@ -34,6 +34,12 @@ export const FFP_CLIP_PLANES_BYTES = 6 * 16;
 const STORAGE_BUFFER_SIZE = DEFAULT_STORAGE_BUFFER_CONFIG.bufferSize;
 const STORAGE_SLOT_SIZE = DEFAULT_STORAGE_BUFFER_CONFIG.slotSize;
 
+// D3DTSS_MIPMAPLODBIAS is a DWORD carrying IEEE-754 float bits (same bit-cast d3d9-sampler.ts
+// uses). This decode runs once per stage per draw, not per-vertex/pixel, so it sits outside the
+// zero-alloc hot-path rule; reusing one pair of views is free anyway.
+const lodBiasBitsScratch = new Uint32Array(1);
+const lodBiasFloatScratch = new Float32Array(lodBiasBitsScratch.buffer);
+
 /**
  * Map D3D filter enum to WebGPU filter. 0 or uninitialized → linear.
  * Anisotropic mode maps to linear (actual anisotropy is controlled by maxAnisotropy parameter).
@@ -47,13 +53,20 @@ function toWebGPUFilter(d3d: number, isMag: boolean): GPUFilterMode {
     return "linear"; // Default
 }
 
-/** Map D3D address mode to WebGPU address mode. Default: clamp-to-edge. */
-function toWebGPUAddressMode(d3d: number): GPUAddressMode {
+/**
+ * Map D3D address mode to a (possibly shader-emulated) sampler address mode. Default: clamp-to-edge.
+ * BORDER is preserved as the explicit "d3d9-border" tag (same as d3d9-sampler.ts/d3d8-sampler.ts) so
+ * the SamplerSpec carries real intent even though the FFP WGSL emitter (shader-generator.ts, outside
+ * this module's ownership) does not yet substitute the border colour — DxSamplerCache still falls back
+ * to a native clamp-to-edge sampler for it, so this is a no-op today and a decode-correctness fix for
+ * whenever the shader side is wired (see docs/d3d8-parity/02-samplers.md F2).
+ */
+function toWebGPUAddressMode(d3d: number): DxSamplerAddressMode {
     switch (d3d) {
         case D3DTADDRESS_WRAP: return "repeat";
         case D3DTADDRESS_MIRROR: return "mirror-repeat";
         case D3DTADDRESS_CLAMP: return "clamp-to-edge";
-        case D3DTADDRESS_BORDER: return "clamp-to-edge"; // WebGPU has no clamp-to-border; approximate with clamp-to-edge
+        case D3DTADDRESS_BORDER: return "d3d9-border";
         default: return "clamp-to-edge"; // Default for uninitialized (DX7 default is WRAP, but clamp is safer)
     }
 }
@@ -100,10 +113,14 @@ export class BindGroupManager {
     }
 
     /**
-     * Get or create the faithful sampler for D3D7 texture-stage filter/address/anisotropy state.
-     * Decodes the D3D7 enums (note: D3D7 mip-filter is NONE=1/POINT=2/LINEAR=3) and delegates
-     * descriptor construction + quality overrides + LOD clamping + caching to the shared
-     * DxSamplerCache, which is also used by the D3D9 backend so behavior can't drift.
+     * Get or create the faithful sampler for D3D7-numbered texture-stage filter/address/
+     * anisotropy state (D3DTFN_x / D3DTFG_x / D3DTFP_x — mip-filter NONE=1/POINT=2/LINEAR=3).
+     * D3D8 draws already went through FfpStagesState.resolve()'s vocabulary-aware decode
+     * (FfpFilterVocabulary — see ffp-stages.ts) BEFORE reaching here, so every caller of this
+     * method, D3D7 or D3D8, hands it values already normalized to this D3D7 encoding; this
+     * method itself never needs to know which title produced them. Delegates descriptor
+     * construction + quality overrides + LOD clamping + caching to the shared DxSamplerCache,
+     * which is also used by the D3D9 backend so behavior can't drift.
      */
     getOrCreateSampler(
         minFilter: number,
@@ -111,10 +128,17 @@ export class BindGroupManager {
         mipFilter: number = D3DTFP_NONE,
         addressU: number = D3DTADDRESS_CLAMP,
         addressV: number = D3DTADDRESS_CLAMP,
-        maxAnisotropy: number = 1
+        maxAnisotropy: number = 1,
+        /** D3DTSS_MIPMAPLODBIAS raw DWORD (IEEE-754 float bits). */
+        mipLodBiasBits: number = 0,
+        /** D3DTSS_MAXMIPLEVEL raw DWORD. */
+        maxMipLevel: number = 0,
+        /** D3DTSS_BORDERCOLOR raw packed ARGB DWORD. */
+        borderColor: number = 0,
     ): GPUSampler {
         const gameAnisotropic = (minFilter === D3DTFN_ANISOTROPIC || magFilter === D3DTFG_ANISOTROPIC);
-        return this.samplers.acquire({
+        lodBiasBitsScratch[0] = mipLodBiasBits >>> 0;
+        const spec: SamplerSpec = {
             min: toWebGPUFilter(minFilter, false),
             mag: toWebGPUFilter(magFilter, true),
             mip: toWebGPUMipmapFilter(mipFilter),
@@ -124,12 +148,20 @@ export class BindGroupManager {
             addressU: toWebGPUAddressMode(addressU),
             addressV: toWebGPUAddressMode(addressV),
             gameAnisotropy: gameAnisotropic ? maxAnisotropy : 1,
-        });
+            maxMipLevel,
+            borderColor,
+            mipLodBias: lodBiasFloatScratch[0],
+            mipLodBiasBits: mipLodBiasBits >>> 0,
+        };
+        return this.samplers.acquire(spec);
     }
 
     /** Resolve the per-stage sampler from a StageSamplerState record. */
     getOrCreateStageSampler(s: StageSamplerState): GPUSampler {
-        return this.getOrCreateSampler(s.minFilter, s.magFilter, s.mipFilter, s.addressU, s.addressV, s.maxAnisotropy);
+        return this.getOrCreateSampler(
+            s.minFilter, s.magFilter, s.mipFilter, s.addressU, s.addressV, s.maxAnisotropy,
+            s.mipLodBiasBits ?? 0, s.maxMipLevel ?? 0, s.borderColor ?? 0,
+        );
     }
 
     /**

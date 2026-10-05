@@ -1,115 +1,60 @@
 // Locale and string conversion functions for kernel32
 // GetACP, GetOEMCP, WideCharToMultiByte, MultiByteToWideChar, etc.
 
-import { ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
+import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
-import { EmulatorConfig, getCodePageDecoder, encodeAnsiString } from '../../core/emulator-config-manager';
+import { EmulatorConfig, getCodePageDecoder, encodeAnsiString, isSingleByteCodePage } from '../../core/emulator-config-manager';
 import { encodeAnsi } from '../codepage-utils';
 import { asBufferSource } from '../../../dom-buffer';
-
-// US English locale data lookup (shared between GetLocaleInfoA and GetLocaleInfoW)
-const US_LOCALE_DATA: Record<number, string> = {
-    0x0001: "0409",            // LOCALE_ILANGUAGE
-    0x0002: "English (United States)", // LOCALE_SLANGUAGE
-    0x0003: "ENU",             // LOCALE_SABBREVLANGNAME
-    0x0004: "English",         // LOCALE_SNATIVELANGNAME
-    0x0005: "1",               // LOCALE_ICOUNTRY
-    0x0006: "United States",   // LOCALE_SCOUNTRY
-    0x0007: "USA",             // LOCALE_SABBREVCTRYNAME
-    0x0008: "United States",   // LOCALE_SNATIVECTRYNAME
-    0x0009: "0409",            // LOCALE_IDEFAULTLANGUAGE
-    0x000A: "1",               // LOCALE_IDEFAULTCOUNTRY
-    0x000B: "437",             // LOCALE_IDEFAULTCODEPAGE
-    0x000C: ",",               // LOCALE_SLIST
-    0x000D: "0",               // LOCALE_IMEASURE
-    0x000E: ".",               // LOCALE_SDECIMAL
-    0x000F: ",",               // LOCALE_STHOUSAND
-    0x0010: "3;0",             // LOCALE_SGROUPING
-    0x0011: "2",               // LOCALE_IDIGITS
-    0x0012: "1",               // LOCALE_ILZERO
-    0x0013: "0123456789",      // LOCALE_SNATIVEDIGITS
-    0x0014: "$",               // LOCALE_SCURRENCY
-    0x0015: "USD",             // LOCALE_SINTLSYMBOL
-    0x0016: ".",               // LOCALE_SMONDECIMALSEP
-    0x0017: ",",               // LOCALE_SMONTHOUSANDSEP
-    0x0018: "3;0",             // LOCALE_SMONGROUPING
-    0x0019: "0",               // LOCALE_ICURRDIGITS
-    0x001A: "0",               // LOCALE_IINTLCURRDIGITS
-    0x001B: "0",               // LOCALE_ICURRENCY
-    0x001C: "0",               // LOCALE_INEGCURR
-    0x001D: "M/d/yyyy",        // LOCALE_SSHORTDATE
-    0x001E: "dddd, MMMM dd, yyyy", // LOCALE_SLONGDATE
-    0x001F: "h:mm:ss tt",      // LOCALE_STIMEFORMAT
-    0x0020: "AM",              // LOCALE_S1159
-    0x0021: "PM",              // LOCALE_S2359
-    0x0023: ":",               // LOCALE_STIME (time separator)
-    0x0024: "/",               // LOCALE_SDATE (date separator)
-    0x0025: "0",               // LOCALE_IDATE (MDY order)
-    0x0028: "0",               // LOCALE_ITIME (12-hour)
-    0x0029: "0",               // LOCALE_ITIMEMARKPOSN
-    0x002C: "0",               // LOCALE_IDAYLZERO
-    0x002D: "0",               // LOCALE_IMONLZERO
-    0x0037: "1",               // LOCALE_INEGNUMBER
-    0x0059: "en",              // LOCALE_SISO639LANGNAME
-    0x005A: "US",              // LOCALE_SISO3166CTRYNAME
-    0x1001: "English",         // LOCALE_SENGLANGUAGE
-    0x1002: "United States",   // LOCALE_SENGCOUNTRY
-    0x1004: "1252",            // LOCALE_IDEFAULTANSICODEPAGE
-    0x1010: "1",               // LOCALE_INEGNUMBER
-    0x1011: "10000",           // LOCALE_IDEFAULTMACCODEPAGE
-};
-
-// Dynamic locale value lookup — overrides static table for codepage-dependent fields
-function getLocaleValue(cleanType: number): string | undefined {
-    const config = EmulatorConfig.getInstance();
-    // LOCALE_IDEFAULTCODEPAGE (0x000B) — OEM code page
-    if (cleanType === 0x000B) return String(config.oemCodePage);
-    // LOCALE_IDEFAULTANSICODEPAGE (0x1004) — ANSI code page
-    if (cleanType === 0x1004) return String(config.ansiCodePage);
-    return US_LOCALE_DATA[cleanType];
-}
-
-// Gregorian calendar info strings (US English) keyed by CALTYPE.
-const GREGORIAN_CAL_INFO: Record<number, string> = {
-    0x00001001: "1",           // CAL_ICALINTYPE
-    0x0000000b: "2029",        // CAL_ITWODIGITYEARMAX
-    0x0000000c: "29",          // CAL_ITWODIGITYEARMIN
-    0x0000000d: "Sunday",      // CAL_SDAYNAME1
-    0x0000000e: "Monday",
-    0x0000000f: "Tuesday",
-    0x00000010: "Wednesday",
-    0x00000011: "Thursday",
-    0x00000012: "Friday",
-    0x00000013: "Saturday",    // CAL_SDAYNAME7
-    0x00000014: "Sun",         // CAL_SABBREVDAYNAME1
-    0x00000015: "Mon",
-    0x00000016: "Tue",
-    0x00000017: "Wed",
-    0x00000018: "Thu",
-    0x00000019: "Fri",
-    0x0000001a: "Sat",         // CAL_SABBREVDAYNAME7
-    0x0000001d: "January",     // CAL_SMONTHNAME1
-    0x0000001e: "February",
-    0x0000001f: "March",
-    0x00000020: "April",
-    0x00000021: "May",
-    0x00000022: "June",
-    0x00000023: "July",
-    0x00000024: "August",
-    0x00000025: "September",
-    0x00000026: "October",
-    0x00000027: "November",
-    0x00000028: "December",    // CAL_SMONTHNAME12
-};
+import { borrowGuestMemory } from '../../core/memory/guest-memory';
+import {
+    type LocaleEntry, LOCALE_ALLOW_NEUTRAL_NAMES, LOCALE_SYSTEM_DEFAULT, LOCALE_USER_DEFAULT, localeFromLcid, localeFromName,
+} from './locale-names';
+import {
+    LOCALE_CACHE_SIZE, LOCALE_FONTSIGNATURE, LOCALE_RETURN_GENITIVE_NAMES, LOCALE_RETURN_NUMBER, LOCALE_SSHORTTIME,
+    encodeLocaleAnsi, ensureLocaleCache, localeAnsiCodePage, localeInfo, localeText, localeWideData,
+    _localeACache, _localeFastLcids, _localeIsNumber, _localeWCache, _localeWNumCache,
+} from './locale-data';
+// The same tables the trap-free MultiByteToWideChar/WideCharToMultiByte stubs are
+// serialised from, so both tiers translate a byte identically by construction.
+import { codePageToUnicodeLut, codePageToByteLut } from './codepage-lut';
+import { localeString } from './locale-db';
+import { LocaleField } from './locale-db-schema';
 
 const GREGORIAN_CALENDAR_IDS = new Set([0, 1, 2, 9, 10, 11, 12]);
 
-function resolveCalendarInfoString(calendar: number, calType: number): string | undefined {
-    const cleanType = calType & 0x0fffffff;
+/** CAL_ITWODIGITYEARMAX of the Gregorian calendars. */
+const TWO_DIGIT_YEAR_MAX = '2029';
+
+/**
+ * get_calendar_info for the Gregorian calendars: every name and picture is the locale's
+ * own, so each CALTYPE maps onto the LCTYPE GetLocaleInfoW answers it with.
+ */
+function resolveCalendarInfoString(entry: LocaleEntry, calendar: number, calType: number): string | undefined {
     if (!GREGORIAN_CALENDAR_IDS.has(calendar)) return undefined;
-    return GREGORIAN_CAL_INFO[cleanType];
+    const genitive = calType & LOCALE_RETURN_GENITIVE_NAMES;
+    const t = calType & 0xffff;
+    let lctype: number;
+    if (t === 0x01) return String(calendar);                   // CAL_ICALINTVALUE
+    else if (t === 0x30) return TWO_DIGIT_YEAR_MAX;            // CAL_ITWODIGITYEARMAX
+    else if (t === 0x04) return localeString(entry.locale, LocaleField.SEraString);
+    else if (t === 0x39) return localeString(entry.locale, LocaleField.SAbbrevEraString);
+    else if (t === 0x05) lctype = 0x001f;                      // CAL_SSHORTDATE
+    else if (t === 0x06) lctype = 0x0020;                      // CAL_SLONGDATE
+    else if (t >= 0x07 && t <= 0x0d) lctype = 0x002a + t - 0x07;   // CAL_SDAYNAME1..7
+    else if (t >= 0x0e && t <= 0x14) lctype = 0x0031 + t - 0x0e;   // CAL_SABBREVDAYNAME1..7
+    else if (t >= 0x15 && t <= 0x20) lctype = 0x0038 + t - 0x15;   // CAL_SMONTHNAME1..12
+    else if (t === 0x21) lctype = 0x100e;                           // CAL_SMONTHNAME13
+    else if (t >= 0x22 && t <= 0x2d) lctype = 0x0044 + t - 0x22;   // CAL_SABBREVMONTHNAME1..12
+    else if (t === 0x2e) lctype = 0x100f;                           // CAL_SABBREVMONTHNAME13
+    else if (t === 0x2f) lctype = 0x1006;                           // CAL_SYEARMONTH
+    else if (t >= 0x31 && t <= 0x37) lctype = 0x0060 + t - 0x31;   // CAL_SSHORTESTDAYNAME1..7
+    else if (t === 0x38) lctype = 0x0078;                           // CAL_SMONTHDAY
+    else return undefined;
+    return localeText(entry, lctype | genitive);
 }
 
 function enumCalendarInfo(
@@ -124,9 +69,13 @@ function enumCalendarInfo(
     const calType = args[3];
     const label = wide ? "EnumCalendarInfoW" : "EnumCalendarInfoA";
 
-    if (!lpCalInfoEnumProc) return 0;
+    const entry = localeFromLcid(locale);
+    if (!lpCalInfoEnumProc || !entry) {
+        setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
 
-    const info = resolveCalendarInfoString(calendar, calType);
+    const info = resolveCalendarInfoString(entry, calendar, calType);
     if (info === undefined) {
         Logger.verbose(LogCategory.KERNEL32,
             `${label}(locale=0x${locale.toString(16)}, calendar=${calendar}, calType=0x${calType.toString(16)}) — no data`);
@@ -242,127 +191,82 @@ export const exports: Record<string, ThunkImplementation> = {
         return (cp === 1252 || cp === 437 || cp === 65001) ? 1 : 0;
     },
 
-    'IsValidLocale': (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        // Stub: treat LOCALE_INVARIANT (0x007f) and English (0x0409) as valid
-        return (locale === 0x007f || locale === 0x0409) ? 1 : 0;
+    // The default pseudo-LCIDs are not locales; anything else is valid when it names one,
+    // neutral LCIDs included.
+    'IsValidLocale': (_ctx, _mem, args) => {
+        const lcid = args[0]! >>> 0;
+        if (lcid === 0 || lcid === LOCALE_USER_DEFAULT || lcid === LOCALE_SYSTEM_DEFAULT) return 0;
+        return localeFromLcid(lcid, LOCALE_ALLOW_NEUTRAL_NAMES) ? 1 : 0;
     },
 
-    'GetLocaleInfoA': (ctx, mem, args) => {
-        const locale = args[0];
-        const lcType = args[1];
-        const lpLCData = args[2];
-        const cchData = args[3];
-
-        // Strip LOCALE_NOUSEROVERRIDE (0x80000000) and LOCALE_RETURN_NUMBER (0x20000000)
-        const LOCALE_RETURN_NUMBER = 0x20000000;
-        const returnNumber = (lcType & LOCALE_RETURN_NUMBER) !== 0;
-        const cleanType = lcType & 0x0000FFFF;
-
-        const value = getLocaleValue(cleanType);
-        if (value === undefined) {
-            Logger.verbose(LogCategory.KERNEL32,
-                `GetLocaleInfoA(locale=0x${locale.toString(16)}, lcType=0x${cleanType.toString(16)}) — unknown, returning empty`);
-            if (!lpLCData || cchData <= 0) return 0;
-            mem[lpLCData] = 0;
-            return 1;
-        }
-
-        // LOCALE_RETURN_NUMBER: write as DWORD, return sizeof(DWORD)/sizeof(char) = 4
-        if (returnNumber) {
-            if (cchData === 0) return 4;
-            if (!lpLCData) return 0;
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpLCData, parseInt(value, 10) || 0, true);
-            return 4;
-        }
-
-        const required = value.length + 1; // include null terminator
-        if (cchData === 0) return required;
-        if (!lpLCData) return 0;
-
-        const toWrite = Math.min(required, cchData);
-        const valueBytes = encodeAnsi(value);
-        mem.set(valueBytes.subarray(0, toWrite - 1), lpLCData);
-        mem[lpLCData + toWrite - 1] = 0; // null terminator
-        return toWrite;
-    },
-
-    'GetLocaleInfoW': (ctx, mem, args) => {
-        const locale = args[0];
-        const lcType = args[1];
-        const lpLCData = args[2];
-        const cchData = args[3];
-
-        const LOCALE_RETURN_NUMBER = 0x20000000;
-        const returnNumber = (lcType & LOCALE_RETURN_NUMBER) !== 0;
-        const cleanType = lcType & 0x0000FFFF;
-
-        const value = getLocaleValue(cleanType);
-        if (value === undefined) {
-            Logger.verbose(LogCategory.KERNEL32,
-                `GetLocaleInfoW(locale=0x${locale.toString(16)}, lcType=0x${cleanType.toString(16)}) — unknown, returning empty`);
-            if (!lpLCData || cchData <= 0) return 0;
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint16(lpLCData, 0, true);
-            return 1;
-        }
-
-        // LOCALE_RETURN_NUMBER: write as DWORD, return sizeof(DWORD)/sizeof(WCHAR) = 2
-        if (returnNumber) {
-            if (cchData === 0) return 2;
-            if (!lpLCData) return 0;
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpLCData, parseInt(value, 10) || 0, true);
-            return 2;
-        }
-
-        const required = value.length + 1; // WCHARs including null
-        if (cchData === 0) return required;
-        if (!lpLCData) return 0;
-
-        const toWrite = Math.min(required, cchData);
-        return Marshaler.writeWideString(mem, lpLCData, value, toWrite) / 2;
-    },
-
-    'GetLocaleInfoEx': (ctx, mem, args) => {
-        const lpLocaleName = args[0];
-        const lcType = args[1] >>> 0;
-        const lpLCData = args[2];
-        const cchData = args[3] | 0;
-
-        // Minimal practical responses for common LCType queries.
-        const value = (() => {
-            switch (lcType) {
-                case 0x0000005c: return "en-US"; // LOCALE_SNAME
-                case 0x00000002: return ".";     // LOCALE_SDECIMAL
-                case 0x00000003: return ",";     // LOCALE_STHOUSAND
-                default: return "";
-            }
-        })();
-
-        if (cchData === 0) {
-            return value.length + 1; // Required WCHAR count including null.
-        }
-        if (!lpLCData || cchData <= 0) {
+    // GetLocaleInfoA is GetLocaleInfoW followed by a WideCharToMultiByte through the
+    // locale's own ANSI page, which is why a too-small buffer is FILLED here and left
+    // untouched by the W form. RETURN_NUMBER and FONTSIGNATURE skip the conversion: the
+    // W answer lands in the buffer as-is and the count is scaled to bytes.
+    'GetLocaleInfoA': (_ctx, mem, args) => {
+        const [lcid, lcType, lpLCData] = args as [number, number, number];
+        const cchData = args[3]! | 0;
+        const cleanType = lcType & 0xffff;
+        if (cchData < 0 || (cchData > 0 && !lpLCData)) {
+            setLastError(ERROR_INVALID_PARAMETER);
             return 0;
         }
-
-        const bytesWritten = Marshaler.writeWideString(mem, lpLCData, value, cchData);
-        return Math.max(1, (bytesWritten / 2) | 0);
+        if (cleanType === LOCALE_SSHORTTIME || (lcType & LOCALE_RETURN_GENITIVE_NAMES)) {
+            setLastError(ERROR_INVALID_FLAGS);
+            return 0;
+        }
+        const entry = localeFromLcid(lcid);
+        if (!entry) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        if (cleanType === LOCALE_FONTSIGNATURE || (lcType & LOCALE_RETURN_NUMBER)) {
+            return getLocaleInfoWFor(mem, entry, lcType, lpLCData, cchData >> 1) * 2;
+        }
+        const value = localeInfo(entry, lcType);
+        if (value === undefined) {
+            setLastError(ERROR_INVALID_FLAGS);
+            return 0;
+        }
+        const encoded = encodeLocaleAnsi(localeWideData(lcType, value), localeAnsiCodePage(entry, lcType));
+        if (cchData === 0) return encoded.length;
+        mem.set(cchData < encoded.length ? encoded.subarray(0, cchData) : encoded, lpLCData);
+        if (encoded.length > cchData) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+        return encoded.length;
     },
 
-    'EnumSystemLocalesA': (ctx, mem, args) => {
-        const lpLocaleEnumProc = args[0];
-        const dwFlags = args[1];
-        // Stub: return TRUE without calling callback (no locales enumerated)
-        return 1;
+    // The kernelbase contract, in order: a negative count or a sized call with no buffer is
+    // ERROR_INVALID_PARAMETER, as is an LCID that names no locale; an LCTYPE off the end of
+    // get_locale_info's switch is ERROR_INVALID_FLAGS; a buffer that cannot hold the answer
+    // is ERROR_INSUFFICIENT_BUFFER and NOTHING is written. Each is a case the inline stub
+    // declines to JS precisely because JS owns last-error.
+    'GetLocaleInfoW': (_ctx, mem, args) => {
+        const [lcid, lcType, lpLCData] = args as [number, number, number];
+        const cchData = args[3]! | 0;
+        if (cchData < 0 || (cchData > 0 && !lpLCData)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const entry = localeFromLcid(lcid);
+        if (!entry) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        return getLocaleInfoWFor(mem, entry, lcType, lpLCData, cchData);
     },
 
-    'EnumSystemLocalesW': (ctx, mem, args) => {
-        // Conservative stub: report success without callback invocation.
-        return 1;
+    // GetLocaleInfoW keyed by name: the named locale's own row answers, a neutral's too.
+    'GetLocaleInfoEx': (_ctx, mem, args) => {
+        const lpLocaleName = args[0]!;
+        const lcType = args[1]! >>> 0;
+        const lpLCData = args[2]!;
+        const cchData = args[3]! | 0;
+        const entry = localeFromName(lpLocaleName ? Marshaler.readStringW(mem, lpLocaleName) : null);
+        if (!entry || cchData < 0 || (cchData > 0 && !lpLCData)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        return getLocaleInfoWFor(mem, entry, lcType, lpLCData, cchData);
     },
 
     'EnumCalendarInfoA': (ctx, mem, args) => enumCalendarInfo(ctx, mem, args, false),
@@ -379,7 +283,11 @@ export const exports: Record<string, ThunkImplementation> = {
         const lpDefaultChar = args[6];
         const lpUsedDefaultChar = args[7];
 
-        if (lpWideCharStr === 0) return 0;
+        // The kernelbase parameter contract, before anything is read or written.
+        if (!lpWideCharStr || cchWideChar === 0 || (!lpMultiByteStr && cbMultiByte) || cbMultiByte < 0) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
 
         const wideStr = (cchWideChar === -1) ? 
             Marshaler.readWideString(mem, lpWideCharStr) : 
@@ -399,20 +307,62 @@ export const exports: Record<string, ThunkImplementation> = {
         const strToEncode = wideStr + (cchWideChar === -1 ? "\0" : "");
         const encoded = encodeAnsiString(strToEncode, effectiveCp);
         
+        // lpDefaultChar / lpUsedDefaultChar are OUT-of-band contract, not decoration:
+        // encodeAnsiString silently substitutes '?', and a caller that passes an LPBOOL and
+        // reads it back was, until this wrote it, reading its own uninitialised stack.
+        // Win32 forbids both for UTF-7/UTF-8 and fails the call rather than ignoring them.
+        if (lpDefaultChar !== 0 || lpUsedDefaultChar !== 0) {
+            if (effectiveCp === 65000 || effectiveCp === 65001) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            const rev = codePageToByteLut(effectiveCp);
+            const defaultByte = (lpDefaultChar > 0 && lpDefaultChar < mem.length) ? mem[lpDefaultChar]! : 0x3F;
+            let usedDefault = false;
+            if (rev) {
+                // A reverse LUT exists only for a single-byte page, where one code point is
+                // one byte — which is what makes the char index a valid byte index here.
+                for (let i = 0; i < strToEncode.length && i < encoded.length; i++) {
+                    if (rev[strToEncode.charCodeAt(i)] === 0xffff) {
+                        usedDefault = true;
+                        encoded[i] = defaultByte;
+                    }
+                }
+            } else {
+                // A multi-byte page has no reverse LUT to test a code point against, and
+                // writing FALSE from a path that cannot know is a positive claim we have no
+                // basis for — encodeAnsiString has already substituted. Decode what it
+                // actually produced and compare: a round trip that differs IS a substitution.
+                usedDefault = getCodePageDecoder(effectiveCp).decode(asBufferSource(encoded)) !== strToEncode;
+            }
+            if (validGuestDword(mem, lpUsedDefaultChar)) {
+                new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
+                    .setUint32(lpUsedDefaultChar, usedDefault ? 1 : 0, true);
+            }
+        }
+
         if (cbMultiByte === 0) {
             return encoded.length;
         }
 
+        // Win32 fills the destination up to cbMultiByte and then FAILS: 0 plus
+        // ERROR_INSUFFICIENT_BUFFER (wcstombs_sbcs). Returning the truncated length instead
+        // reports success for a string the caller never got — and it is the case both the
+        // inline stub and the fast path decline INTO this tier.
         const toWrite = Math.min(encoded.length, cbMultiByte);
-        mem.set(encoded.slice(0, toWrite), lpMultiByteStr);
+        mem.set(encoded.subarray(0, toWrite), lpMultiByteStr);
 
         Logger.verbose(LogCategory.KERNEL32,
             `WideCharToMultiByte(cp=${CodePage}, wstr=0x${lpWideCharStr.toString(16)}) "${wideStr.slice(0, 120)}" -> ANSI len=${toWrite}`);
 
+        if (encoded.length > cbMultiByte) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
         return toWrite;
     },
 
     'MultiByteToWideChar': (ctx, mem, args) => {
+        // Counted HERE, not only at the fast path's bail sites: a call that never reaches the
+        // fast-path table at all (an unbound stub) would otherwise be invisible to both.
+        localeFastPathStats.mbtwcThunk++;
         const CodePage = args[0];
         const dwFlags = args[1];
         const lpMultiByteStr = args[2];
@@ -420,7 +370,11 @@ export const exports: Record<string, ThunkImplementation> = {
         const lpWideCharStr = args[4];
         const cchWideChar = args[5] | 0;
 
-        if (lpMultiByteStr === 0) return 0;
+        // The kernelbase parameter contract, before anything is read or written.
+        if (!lpMultiByteStr || cbMultiByte === 0 || (!lpWideCharStr && cchWideChar) || cchWideChar < 0) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
 
         // Use requested code page (CP_ACP=0 → system ANSI, CP_OEMCP=1 → system OEM)
         const config = EmulatorConfig.getInstance();
@@ -449,6 +403,10 @@ export const exports: Record<string, ThunkImplementation> = {
                 view.setUint16(lpWideCharStr + i * 2, wideStr.charCodeAt(i), true);
             }
         }
+        // Win32 fills up to cchWideChar and then FAILS: 0 plus ERROR_INSUFFICIENT_BUFFER
+        // (mbstowcs_sbcs). A truncated string reported as a success is a different program,
+        // and this is the tier the inline stub and the fast path decline INTO.
+        if (wideStr.length > cchWideChar) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
         return toWrite;
     },
 
@@ -499,38 +457,8 @@ export const exports: Record<string, ThunkImplementation> = {
         return 1; // TRUE
     },
 
-    'GetStringTypeW': (ctx, mem, args) => {
-        const dwInfoType = args[0];
-        const lpSrcStr = args[1];
-        const cchSrc = args[2] | 0;
-        const lpCharType = args[3];
-
-        if (lpSrcStr === 0 || lpCharType === 0) return 0;
-
-        const count = (cchSrc === -1) ? Marshaler.readWideString(mem, lpSrcStr).length + 1 : cchSrc;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
-        for (let i = 0; i < count; i++) {
-            const addr = lpSrcStr + i * 2;
-            if (addr + 1 >= mem.length) break;
-            const charCode = view.getUint16(addr, true);
-            let type = 0;
-
-            if (dwInfoType === 1) { // CT_CTYPE1
-                if (charCode >= 0x30 && charCode <= 0x39) type |= 0x0004; // C1_DIGIT
-                if ((charCode >= 0x41 && charCode <= 0x5A) || (charCode >= 0x61 && charCode <= 0x7A)) type |= 0x0003; // C1_ALPHA
-                if (charCode === 0x20 || (charCode >= 0x09 && charCode <= 0x0D)) type |= 0x0008; // C1_SPACE
-            }
-            // Add more types as needed, but this is often enough for CRT init
-            
-            const dstAddr = lpCharType + i * 2;
-            if (dstAddr + 1 < mem.length) {
-                view.setUint16(dstAddr, type, true);
-            }
-        }
-
-        return 1; // TRUE
-    },
+    // BOOL GetStringTypeW(DWORD dwInfoType, LPCWSTR lpSrcStr, int cchSrc, LPWORD lpCharType)
+    'GetStringTypeW': (_ctx, mem, args) => stringTypeW(mem, args[0]!, args[1]!, args[2]! | 0, args[3]!),
 
     'LCMapStringW': (ctx, mem, args) => {
         const Locale = args[0];
@@ -579,9 +507,9 @@ export const exports: Record<string, ThunkImplementation> = {
 
         let result = src;
         if (dwMapFlags & 0x00000100) { // LCMAP_LOWERCASE
-            result = src.toLowerCase();
+            result = mapCaseSimple(src, false);
         } else if (dwMapFlags & 0x00000200) { // LCMAP_UPPERCASE
-            result = src.toUpperCase();
+            result = mapCaseSimple(src, true);
         }
 
         if (cchDest === 0) {
@@ -716,25 +644,11 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     'GetCPInfo': (ctx, mem, args) => {
-        const CodePage = args[0];
-        const lpCPInfo = args[1];
-
-        if (lpCPInfo && lpCPInfo + 18 <= mem.length) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            // CPINFO structure: MaxCharSize depends on codepage
-            // DBCS codepages (932=Shift-JIS, 936=GBK, 949=EUC-KR, 950=Big5) use 2
-            // All single-byte codepages (1252, 437, 850, 28591, etc.) use 1
-            const dbcsCodePages = new Set([932, 936, 949, 950]);
-            const maxCharSize = dbcsCodePages.has(CodePage) ? 2 : 1;
-            view.setUint32(lpCPInfo, maxCharSize, true); // MaxCharSize
-            // DefaultChar (2 bytes)
-            view.setUint8(lpCPInfo + 4, 0x3F); // '?'
-            view.setUint8(lpCPInfo + 5, 0);
-            // LeadByte (12 bytes) — empty for single-byte codepages
-            mem.fill(0, lpCPInfo + 6, lpCPInfo + 18);
-            return 1;
-        }
-        return 0;
+        const lpCPInfo = args[1] >>> 0;
+        if (!lpCPInfo || lpCPInfo + CPINFO_SIZE > mem.length) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        writeCPInfo(view, mem, lpCPInfo, args[0] >>> 0);
+        return 1;
     },
 
     // ==================== String Functions ====================
@@ -1103,71 +1017,8 @@ export const exports: Record<string, ThunkImplementation> = {
     // ==================== Profile (INI file) Functions ====================
     // Moved to kernel32/profile.ts with full INI parsing implementation
 
-    // GetStringTypeExA - retrieves character type information for characters in a string
-    'GetStringTypeExA': (ctx, mem, args) => {
-        const locale = args[0];      // LCID - locale identifier
-        const dwInfoType = args[1];  // DWORD - type of character type information
-        const lpSrcStr = args[2];    // LPCSTR - source string
-        const cchSrc = args[3];      // int - number of characters
-        const lpCharType = args[4];  // LPWORD - buffer for character types
-
-        Logger.verbose(LogCategory.KERNEL32,
-            `GetStringTypeExA(locale=0x${locale.toString(16)}, infoType=${dwInfoType}, str=0x${lpSrcStr.toString(16)}, count=${cchSrc})`);
-
-        if (!lpSrcStr || !lpCharType || cchSrc <= 0) {
-            return 0; // FALSE
-        }
-
-        // Constants for dwInfoType
-        const CT_CTYPE1 = 1; // Character types (letter, digit, space, etc.)
-        const CT_CTYPE2 = 2; // Text layout (left-to-right, right-to-left)
-        const CT_CTYPE3 = 4; // Text processing (symbol, alpha, etc.)
-
-        // CT_CTYPE1 flags
-        const C1_UPPER = 0x0001;   // Uppercase
-        const C1_LOWER = 0x0002;   // Lowercase
-        const C1_DIGIT = 0x0004;   // Digit
-        const C1_SPACE = 0x0008;   // Space
-        const C1_PUNCT = 0x0010;   // Punctuation
-        const C1_CNTRL = 0x0020;   // Control character
-        const C1_BLANK = 0x0040;   // Blank
-        const C1_XDIGIT = 0x0080;  // Hexadecimal digit
-        const C1_ALPHA = 0x0100;   // Alphabetic
-
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
-        for (let i = 0; i < cchSrc; i++) {
-            if (lpSrcStr + i >= mem.length || lpCharType + i * 2 + 1 >= mem.length) {
-                break;
-            }
-
-            const ch = mem[lpSrcStr + i];
-            let charType = 0;
-
-            if (dwInfoType === CT_CTYPE1) {
-                // Basic character type classification
-                if (ch >= 0x41 && ch <= 0x5A) charType |= C1_UPPER | C1_ALPHA;  // A-Z
-                if (ch >= 0x61 && ch <= 0x7A) charType |= C1_LOWER | C1_ALPHA;  // a-z
-                if (ch >= 0x30 && ch <= 0x39) charType |= C1_DIGIT | C1_XDIGIT; // 0-9
-                if (ch >= 0x41 && ch <= 0x46) charType |= C1_XDIGIT;            // A-F
-                if (ch >= 0x61 && ch <= 0x66) charType |= C1_XDIGIT;            // a-f
-                if (ch === 0x20 || ch === 0x09) charType |= C1_SPACE | C1_BLANK; // Space, tab
-                if (ch === 0x0A || ch === 0x0D) charType |= C1_SPACE;            // LF, CR
-                if (ch < 0x20) charType |= C1_CNTRL;                             // Control chars
-                if ((ch >= 0x21 && ch <= 0x2F) || (ch >= 0x3A && ch <= 0x40) ||
-                    (ch >= 0x5B && ch <= 0x60) || (ch >= 0x7B && ch <= 0x7E)) {
-                    charType |= C1_PUNCT; // Punctuation
-                }
-            } else {
-                // For CT_CTYPE2 and CT_CTYPE3, return minimal info
-                charType = 0;
-            }
-
-            view.setUint16(lpCharType + i * 2, charType, true);
-        }
-
-        return 1; // TRUE
-    },
+    // BOOL GetStringTypeExA(LCID, DWORD, LPCSTR, int, LPWORD) is GetStringTypeA itself.
+    'GetStringTypeExA': (ctx, mem, args) => exports['GetStringTypeA']!(ctx, mem, args),
 
     // GetPrivateProfileSectionA - retrieves all key/value pairs from a section of an INI file
     'GetPrivateProfileSectionA': (ctx, mem, args) => {
@@ -1263,63 +1114,9 @@ export const exports: Record<string, ThunkImplementation> = {
         return lpString1;
     },
 
-    // GetStringTypeExW - retrieves character type information for a Unicode string
-    // BOOL GetStringTypeExW(LCID Locale, DWORD dwInfoType, LPCWSTR lpSrcStr, int cchSrc, LPWORD lpCharType)
-    //
-    // This is a thin wrapper: it ignores Locale and delegates to GetStringTypeW with the
-    // remaining four arguments unchanged. Windows itself implements it exactly this way —
-    // the Locale parameter is documented as unused for the W variant.
-    'GetStringTypeExW': (ctx, mem, args) => {
-        const locale     = args[0]; // LCID   - ignored (Unicode classification is locale-independent)
-        const dwInfoType = args[1]; // DWORD  - CT_CTYPE1 / CT_CTYPE2 / CT_CTYPE3
-        const lpSrcStr   = args[2]; // LPCWSTR
-        const cchSrc     = args[3]; // int    - character count, or -1 for null-terminated
-        const lpCharType = args[4]; // LPWORD - output buffer
-
-        Logger.verbose(LogCategory.KERNEL32,
-            `GetStringTypeExW(locale=0x${locale.toString(16)}, infoType=${dwInfoType}, str=0x${lpSrcStr.toString(16)}, count=${cchSrc})`);
-
-        if (lpSrcStr === 0 || lpCharType === 0) return 0;
-
-        // Reuse the LUT-backed fast classification already built for GetStringTypeW.
-        // cchSrc === -1 means null-terminated wide string.
-        const count = (cchSrc === -1)
-            ? Marshaler.readWideString(mem, lpSrcStr).length + 1  // +1 for terminator, matching GetStringTypeW contract
-            : cchSrc;
-
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
-        for (let i = 0; i < count; i++) {
-            const addr = lpSrcStr + i * 2;
-            if (addr + 1 >= mem.length) break;
-            const charCode = view.getUint16(addr, true);
-            let type = 0;
-
-            if (dwInfoType === 1) { // CT_CTYPE1 — use the pre-built LUT for accuracy
-                type = _ctype1LUT[charCode < 65536 ? charCode : 0];
-            } else if (dwInfoType === 2) { // CT_CTYPE2 — bidirectional layout type
-                // Minimal: left-to-right for standard Latin/ASCII, undefined (0) for others
-                if (charCode >= 0x0041 && charCode <= 0x007A) type = 0x0001; // C2_LEFTTORIGHT
-                else if (charCode >= 0x0030 && charCode <= 0x0039) type = 0x0003; // C2_EUROPENUMBER
-                else if (charCode < 0x0020) type = 0x000B; // C2_OTHERNEUTRAL (control chars)
-                else if (charCode === 0x0020) type = 0x000A; // C2_WHITESPACE
-            } else if (dwInfoType === 4) { // CT_CTYPE3 — text processing
-                // Minimal: mark known symbol/punctuation/alpha ranges
-                if ((charCode >= 0x0041 && charCode <= 0x005A) ||
-                    (charCode >= 0x0061 && charCode <= 0x007A) ||
-                    (charCode >= 0x00C0 && charCode <= 0x00FF)) {
-                    type = 0x8000; // C3_ALPHA
-                }
-            }
-
-            const dstAddr = lpCharType + i * 2;
-            if (dstAddr + 1 < mem.length) {
-                view.setUint16(dstAddr, type, true);
-            }
-        }
-
-        return 1; // TRUE
-    },
+    // BOOL GetStringTypeExW(LCID, DWORD, LPCWSTR, int, LPWORD): GetStringTypeW; Unicode
+    // classification does not depend on the locale.
+    'GetStringTypeExW': (_ctx, mem, args) => stringTypeW(mem, args[1]!, args[2]!, args[3]! | 0, args[4]!),
 };
 
 // ============================================================================
@@ -1352,57 +1149,237 @@ const _ctype1LUT: Uint16Array = (() => {
     return t;
 })();
 
-// CP1252 → Unicode LUT for 256 codepoints (chars 0x80-0x9F have special mappings)
-const _cp1252ToUnicode: Uint16Array = (() => {
-    const t = new Uint16Array(256);
-    for (let i = 0; i < 256; i++) t[i] = i; // identity for 0x00-0x7F and 0xA0-0xFF
-    // CP1252 special range 0x80-0x9F
-    const specials: Record<number, number> = {
-        0x80: 0x20AC, 0x82: 0x201A, 0x83: 0x0192, 0x84: 0x201E, 0x85: 0x2026,
-        0x86: 0x2020, 0x87: 0x2021, 0x88: 0x02C6, 0x89: 0x2030, 0x8A: 0x0160,
-        0x8B: 0x2039, 0x8C: 0x0152, 0x8E: 0x017D, 0x91: 0x2018, 0x92: 0x2019,
-        0x93: 0x201C, 0x94: 0x201D, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014,
-        0x98: 0x02DC, 0x99: 0x2122, 0x9A: 0x0161, 0x9B: 0x203A, 0x9C: 0x0153,
-        0x9E: 0x017E, 0x9F: 0x0178,
-    };
-    for (const [b, u] of Object.entries(specials)) t[Number(b)] = u as number;
-    return t;
-})();
-
-// Pre-built UTF-16LE byte buffers for GetLocaleInfoW (keyed by cleanType)
-// Built lazily on first call to registerFastPathLocaleFunctions so EmulatorConfig is ready.
-let _localeWCache: Map<number, Uint8Array> | null = null;
-let _localeWNumCache: Uint16Array | null = null; // RETURN_NUMBER values by cleanType (max type ~0x1011)
-const LOCALE_CACHE_SIZE = 0x1100;
-
-function ensureLocaleCache(): void {
-    if (_localeWCache) return;
-    _localeWCache = new Map();
-    _localeWNumCache = new Uint16Array(LOCALE_CACHE_SIZE);
-    const config = EmulatorConfig.getInstance();
-    const entries: Record<number, string> = { ...US_LOCALE_DATA };
-    entries[0x000B] = String(config.oemCodePage);
-    entries[0x1004] = String(config.ansiCodePage);
-    for (const [typeStr, value] of Object.entries(entries)) {
-        const cleanType = parseInt(typeStr);
-        const len = value.length + 1; // including null
-        const buf = new Uint8Array(len * 2); // UTF-16LE
-        for (let i = 0; i < value.length; i++) {
-            buf[i * 2] = value.charCodeAt(i) & 0xFF;
-            buf[i * 2 + 1] = 0; // ASCII locale strings are all BMP < 0x100
+/**
+ * GetStringTypeW: one WORD of CT_CTYPE1/2/3 bits per source character; -1 counts through
+ * the terminator. CT_CTYPE1 is the same LUT the fast path answers from, so the two tiers
+ * cannot classify a character differently.
+ */
+function stringTypeW(mem: Uint8Array, infoType: number, src: number, cch: number, dst: number): number {
+    if (!src) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
+    if (infoType !== 1 && infoType !== 2 && infoType !== 4) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
+    const count = cch === -1 ? Marshaler.readWideString(mem, src).length + 1 : cch;
+    if (count <= 0) return 1;
+    if (!dst) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
+    const types = new Uint8Array(count * 2);
+    for (let i = 0; i < count; i++) {
+        const c = Mem.readUint16(src + i * 2) ?? 0;
+        let type = 0;
+        if (infoType === 1) {
+            type = _ctype1LUT[c]!;
+        } else if (infoType === 2) {
+            if ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) type = 0x0001; // C2_LEFTTORIGHT
+            else if (c >= 0x30 && c <= 0x39) type = 0x0003;                          // C2_EUROPENUMBER
+            else if (c === 0x20) type = 0x000a;                                       // C2_WHITESPACE
+            else if (c < 0x20) type = 0x000b;                                         // C2_OTHERNEUTRAL
+        } else if ((c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0xc0 && c <= 0xff)) {
+            type = 0x8000;                                                            // C3_ALPHA
         }
-        // null terminator is already 0
-        _localeWCache.set(cleanType, buf);
-        if (cleanType < LOCALE_CACHE_SIZE) {
-            _localeWNumCache[cleanType] = parseInt(value, 10) || 0;
-        }
+        types[i * 2] = type & 0xff;
+        types[i * 2 + 1] = type >> 8;
     }
+    Mem.writeBytes(dst, types);
+    return 1;
+}
+
+const ERROR_INVALID_PARAMETER = 87;
+const ERROR_INSUFFICIENT_BUFFER = 122;
+const ERROR_INVALID_FLAGS = 1004;
+
+/** The three tiers of these functions (thunk, JS fast path, inline x86 stub) must agree on
+ *  the FAILURE contract as well as the answer: the stub declines a too-small buffer because
+ *  last-error is JS-side state, and a tier that then truncates and reports success turns
+ *  that decline into a silent divergence. */
+function setLastError(code: number): void {
+    System.getInstance().scheduler.setLastError(code);
+}
+
+/** get_locale_info's copy-out for a resolved locale, W form: `cch` counts WCHARs. */
+function getLocaleInfoWFor(mem: Uint8Array, entry: LocaleEntry, lcType: number, buf: number, cch: number): number {
+    const value = localeInfo(entry, lcType);
+    if (value === undefined) {
+        Logger.verbose(LogCategory.KERNEL32,
+            `GetLocaleInfo(${entry.name || 'invariant'}, lcType=0x${lcType.toString(16)}) — no such LCTYPE`);
+        setLastError(ERROR_INVALID_FLAGS);
+        return 0;
+    }
+    if (lcType & LOCALE_RETURN_NUMBER) {
+        // locale_return_data refuses RETURN_NUMBER: only numeric types have a DWORD form.
+        if (typeof value !== 'number') { setLastError(ERROR_INVALID_FLAGS); return 0; }
+        if (cch === 0) return 2;
+        if (cch < 2) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(buf, value >>> 0, true);
+        return 2;
+    }
+    const data = localeWideData(lcType, value);
+    if (cch === 0) return data.length;
+    if (data.length > cch) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    const bytes = new Uint8Array(data.length * 2);
+    for (let i = 0; i < data.length; i++) {
+        const c = data.charCodeAt(i);
+        bytes[i * 2] = c & 0xff;
+        bytes[i * 2 + 1] = c >> 8;
+    }
+    mem.set(bytes, buf);
+    return data.length;
+}
+
+/** A 4-byte LPBOOL destination must sit wholly inside guest RAM before anything writes it. */
+function validGuestDword(mem8: Uint8Array, ptr: number): boolean {
+    return ptr > 0 && ptr + 4 <= mem8.length;
+}
+
+
+/**
+ * Win32 case mapping is SIMPLE case mapping: one code point in, one out, length preserved.
+ * JS `toUpperCase`/`toLowerCase` implement Unicode FULL case mapping, which expands
+ * ß → "SS", ﬁ → "FI", ŉ → "ʼN". LCMapString/CharUpper do none of that — a caller that
+ * sized its destination from the source length is entitled to have it fit.
+ *
+ * So: take the JS mapping where it is one character, and where it is not, fall back to the
+ * code point itself. That fallback IS the simple mapping for every code point whose full
+ * mapping expands — except the one below, where the simple mapping is a different single
+ * character that JS never exposes.
+ */
+const SIMPLE_CASE_EXCEPTIONS: ReadonlyArray<readonly [number, number, number]> = [
+    // [code point, simple lowercase, simple uppercase]
+    [0x0130, 0x0069, 0x0130],  // LATIN CAPITAL LETTER I WITH DOT ABOVE
+];
+
+const _caseLut: (Uint16Array | null)[] = [null, null];
+
+function caseMapLut(upper: boolean): Uint16Array {
+    const idx = upper ? 1 : 0;
+    let lut = _caseLut[idx];
+    if (lut) return lut;
+    lut = new Uint16Array(65536);
+    for (let c = 0; c < 65536; c++) {
+        const ch = String.fromCharCode(c);
+        const m = upper ? ch.toUpperCase() : ch.toLowerCase();
+        lut[c] = m.length === 1 ? m.charCodeAt(0) : c;
+    }
+    for (const [cp, lower, upperCp] of SIMPLE_CASE_EXCEPTIONS) lut[cp] = upper ? upperCp : lower;
+    _caseLut[idx] = lut;
+    return lut;
+}
+
+/** The one definition of Win32 case mapping, shared by the thunk and its fast path. */
+function mapCaseSimple(src: string, upper: boolean): string {
+    const lut = caseMapLut(upper);
+    let out = "";
+    for (let i = 0; i < src.length; i++) out += String.fromCharCode(lut[src.charCodeAt(i)]!);
+    return out;
+}
+
+/** Why the MultiByteToWideChar fast path handed a call back to the full thunk. A thunk
+ *  whose fast path silently never fires looks exactly like one that is inherently slow;
+ *  these counters tell the two apart. Read via the `localeFastPath` harness verb. */
+export const localeFastPathStats = {
+    mbtwcFast: 0,
+    mbtwcSlow: 0,
+    /** Characters converted, and the length distribution. Cost per call is proportional to
+     *  length, so "many short strings" (a per-call overhead problem, fixable only by moving
+     *  the boundary) and "few long strings" (a loop problem, fixable by moving the loop into
+     *  WASM) need opposite work — and a profiler's per-call average cannot tell them apart. */
+    mbtwcChars: 0,
+    mbtwcMaxChars: 0,
+    /** Conversions whose destination could not hold the result. Win32 fails these with
+     *  ERROR_INSUFFICIENT_BUFFER; a silently truncated string is a different program. */
+    mbtwcTruncated: 0,
+    /** Buckets: <=8, <=32, <=128, <=512, <=4096, more. */
+    mbtwcLenHist: new Uint32Array(6),
+    /** Return addresses seen at the fast path, counted. Armed on demand: a Map write per
+     *  call is not something a hot path carries for free. */
+    callerCensus: null as Map<number, number> | null,
+    /** Full-thunk entries. mbtwcThunk - mbtwcSlow = calls that never reached the fast path. */
+    mbtwcThunk: 0,
+    /** Bail counts by reason. */
+    mbtwcBail: { multiByteCodePage: 0, badRange: 0, negativeLength: 0 } as Record<string, number>,
+    lastCodePage: 0,
+    /** WideCharToMultiByte declines by reason. The fast path covers only the plainly
+     *  representable case, so a large decline count is not a broken tier — but which
+     *  reason dominates decides whether the fix is a wider LUT or a wider contract. */
+    wctmbFast: 0,
+    wctmbBail: { flagsOrDefaultChar: 0, badLength: 0, noCodePageLut: 0, unrepresentable: 0, badDest: 0 } as Record<string, number>,
+    lcmapFast: 0,
+    lcmapDeclined: 0,
+    /** LCMapStringW declines past the flag check, by reason. `lcmapDeclined` alone says
+     *  only that the FLAGS were servable, which is a different question from why the rest
+     *  still reach the thunk. */
+    lcmapBail: { badLength: 0, srcOutOfRange: 0 } as Record<string, number>,
+    /** LCTYPE words seen at GetLocaleInfoW, counted. A call COUNT says the guest asks a lot;
+     *  only the type distribution says whether it is re-reading one fixed set per operation
+     *  (a caller-side cache that is not working) or genuinely asking different questions. */
+    glinfoTypes: new Map<number, number>(),
+    glinfoCalls: 0,
+    /** Flag words seen at LCMapStringW, counted — the fast path covers only plain
+     *  lower/upper, and guessing which combination the CRT actually passes is how a fast
+     *  path ends up never firing while looking implemented. */
+    lcmapFlags: new Map<number, number>(),
+    reset(): void {
+        this.mbtwcFast = 0;
+        this.mbtwcSlow = 0;
+        this.mbtwcThunk = 0;
+        this.mbtwcChars = 0;
+        this.mbtwcMaxChars = 0;
+        this.mbtwcTruncated = 0;
+        this.mbtwcLenHist.fill(0);
+        this.wctmbFast = 0;
+        for (const k of Object.keys(this.wctmbBail)) this.wctmbBail[k] = 0;
+        this.lcmapFast = 0;
+        this.lcmapDeclined = 0;
+        for (const k of Object.keys(this.lcmapBail)) this.lcmapBail[k] = 0;
+        this.glinfoTypes.clear();
+        this.glinfoCalls = 0;
+        this.lcmapFlags.clear();
+        this.callerCensus?.clear();
+        for (const k of Object.keys(this.mbtwcBail)) this.mbtwcBail[k] = 0;
+    },
+};
+
+/**
+ * CPINFO: DWORD MaxCharSize, BYTE DefaultChar[2], BYTE LeadByte[12].
+ * MaxCharSize is what a caller sizes its conversion buffers by, so answering 1 for a
+ * multi-byte page is not conservative — it makes the caller allocate too little.
+ */
+const CPINFO_SIZE = 18;
+const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
+
+/** CP_ACP/CP_OEMCP/CP_THREAD_ACP are indirections, not code pages; resolve them first. */
+function resolveCodePage(codePage: number): number {
+    const config = EmulatorConfig.getInstance();
+    switch (codePage) {
+        case 0: /* CP_ACP */
+        case 3: /* CP_THREAD_ACP */
+            return config.ansiCodePage;
+        case 1: /* CP_OEMCP */
+            return config.oemCodePage;
+        default:
+            return codePage;
+    }
+}
+
+function maxCharSizeFor(codePage: number): number {
+    if (DBCS_CODE_PAGES.has(codePage)) return 2;
+    if (codePage === 65001) return 4; // CP_UTF8
+    if (codePage === 65000) return 5; // CP_UTF7
+    if (codePage === 54936) return 4; // GB18030
+    return 1;
+}
+
+/** Writes the whole 18-byte CPINFO. The caller owns the bounds check. */
+function writeCPInfo(view: DataView, mem: Uint8Array, lpCPInfo: number, codePage: number): void {
+    view.setUint32(lpCPInfo, maxCharSizeFor(resolveCodePage(codePage)), true);
+    // DefaultChar '?', no lead-byte ranges: we convert DBCS through a whole-string decoder
+    // rather than a lead-byte table, so advertising ranges we do not honour would be a lie.
+    view.setUint8(lpCPInfo + 4, 0x3F);
+    view.setUint8(lpCPInfo + 5, 0);
+    mem.fill(0, lpCPInfo + 6, lpCPInfo + CPINFO_SIZE);
 }
 
 // ============================================================================
 // Fast path registrations for high-call-rate locale/string functions
 // ============================================================================
-export function registerFastPathLocaleFunctions(dispatcher: any): void {
+export function registerFastPathLocaleFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     ensureLocaleCache();
@@ -1411,91 +1388,123 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // GetLocaleInfoW — 850K calls/session (CRT reads ANSI CP, decimal sep, etc.)
     // Stack (stdcall @16): [esp+4]=locale [esp+8]=lcType [esp+12]=lpLCData [esp+16]=cchData
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoW', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = (cpu.reg32[4]) >>> 0;
+    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoW', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
+        const mem8 = borrowGuestMemory(rawMem8);
         if (esp + 20 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        if (_localeWCache === null) ensureLocaleCache();
 
+        // The cache holds the process locale; any other LCID is the thunk's.
+        if (!_localeFastLcids!.has(view.getUint32(esp + 4, true))) return null;
         const lcType   = view.getUint32(esp + 8, true);
         const lpLCData = view.getUint32(esp + 12, true);
         const cchData  = view.getInt32(esp + 16, true);
+        // Genitive month names are not cached.
+        if (lcType & LOCALE_RETURN_GENITIVE_NAMES) return null;
 
-        const LOCALE_RETURN_NUMBER = 0x20000000;
-        const returnNumber = (lcType & LOCALE_RETURN_NUMBER) !== 0;
-        const cleanType = lcType & 0xFFFF;
-
-        if (returnNumber) {
-            if (cchData === 0) return 2;
-            if (!lpLCData || lpLCData + 4 > mem8.length) return 0;
-            const numVal = (cleanType < LOCALE_CACHE_SIZE) ? _localeWNumCache![cleanType] : 0;
-            view.setUint32(lpLCData, numVal, true);
-            return 2;
+        localeFastPathStats.glinfoCalls++;
+        {
+            const m = localeFastPathStats.glinfoTypes;
+            if (m.size < 128 || m.has(lcType)) m.set(lcType, (m.get(lcType) ?? 0) + 1);
         }
 
-        const cached = _localeWCache!.get(cleanType);
+        const cleanType = lcType & 0xFFFF;
+
+        // The failure half of the contract, identical to the thunk's: a negative count is
+        // ERROR_INVALID_PARAMETER (and `Math.min(required, -1)` is a NEGATIVE byte count,
+        // which subarray reads as "all but the last two bytes" — a write into an unsized
+        // buffer), an unknown LCTYPE is ERROR_INVALID_FLAGS, a short buffer is
+        // ERROR_INSUFFICIENT_BUFFER with nothing written.
+        if (cchData < 0 || (cchData > 0 && !lpLCData)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const cached = cleanType < LOCALE_CACHE_SIZE ? _localeWCache!.get(cleanType) : undefined;
         if (cached === undefined) {
-            // Unknown type: return empty string
-            if (!lpLCData || cchData <= 0) return 0;
-            if (lpLCData + 2 > mem8.length) return null;
-            view.setUint16(lpLCData, 0, true);
-            return 1;
+            setLastError(ERROR_INVALID_FLAGS);
+            return 0;
+        }
+
+        if (lcType & LOCALE_RETURN_NUMBER) {
+            if (!_localeIsNumber![cleanType]) { setLastError(ERROR_INVALID_FLAGS); return 0; }
+            if (cchData === 0) return 2;
+            if (cchData < 2) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+            if (lpLCData + 4 > mem8.length) return null;
+            view.setUint32(lpLCData, _localeWNumCache![cleanType]!, true);
+            return 2;
         }
 
         const requiredChars = cached.length >>> 1; // WCHARs incl. null
         if (cchData === 0) return requiredChars;
-        if (!lpLCData) return 0;
+        if (requiredChars > cchData) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
 
-        const toWriteChars = Math.min(requiredChars, cchData);
-        const toWriteBytes = toWriteChars << 1;
+        const toWriteBytes = requiredChars << 1;
         if (lpLCData + toWriteBytes > mem8.length) return null;
-        mem8.set(cached.subarray(0, toWriteBytes), lpLCData);
-        return toWriteChars;
+        mem8.set(cached, lpLCData);
+        return requiredChars;
     }, { trivial: true });
 
     // -------------------------------------------------------------------------
-    // GetLocaleInfoA — same as W but writes ANSI bytes
+    // GetLocaleInfoA — the W answer in the process ANSI page, pre-encoded
     // Stack (stdcall @16): [esp+4]=locale [esp+8]=lcType [esp+12]=lpLCData [esp+16]=cchData
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoA', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = (cpu.reg32[4]) >>> 0;
+    dispatcher.registerFastPath('kernel32', 'GetLocaleInfoA', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
+        const mem8 = borrowGuestMemory(rawMem8);
         if (esp + 20 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        if (_localeWCache === null) ensureLocaleCache();
 
+        // The cache holds the process locale; any other LCID is the thunk's.
+        if (!_localeFastLcids!.has(view.getUint32(esp + 4, true))) return null;
         const lcType   = view.getUint32(esp + 8, true);
         const lpLCData = view.getUint32(esp + 12, true);
         const cchData  = view.getInt32(esp + 16, true);
-
-        const LOCALE_RETURN_NUMBER = 0x20000000;
-        const returnNumber = (lcType & LOCALE_RETURN_NUMBER) !== 0;
         const cleanType = lcType & 0xFFFF;
+        // Genitive names (refused by A) and the binary FONTSIGNATURE copy stay JS-side.
+        if ((lcType & LOCALE_RETURN_GENITIVE_NAMES) || cleanType === LOCALE_FONTSIGNATURE) return null;
 
-        if (returnNumber) {
-            if (cchData === 0) return 4;
-            if (!lpLCData || lpLCData + 4 > mem8.length) return 0;
-            const numVal = (cleanType < LOCALE_CACHE_SIZE) ? _localeWNumCache![cleanType] : 0;
-            view.setUint32(lpLCData, numVal, true);
+        // Same contract as the thunk (see exports['GetLocaleInfoA']).
+        if (cchData < 0 || (cchData > 0 && !lpLCData)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+
+        if (lcType & LOCALE_RETURN_NUMBER) {
+            if (cleanType >= LOCALE_CACHE_SIZE || !_localeIsNumber![cleanType] || cleanType === LOCALE_SSHORTTIME) {
+                setLastError(ERROR_INVALID_FLAGS);
+                return 0;
+            }
+            const lenW = cchData >> 1;
+            if (lenW === 0) return 4;
+            if (lenW < 2) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+            if (lpLCData + 4 > mem8.length) return null;
+            view.setUint32(lpLCData, _localeWNumCache![cleanType]!, true);
             return 4;
         }
 
-        const cached = _localeWCache!.get(cleanType);
+        const cached = cleanType < LOCALE_CACHE_SIZE ? _localeACache!.get(cleanType) : undefined;
         if (cached === undefined) {
-            if (!lpLCData || cchData <= 0) return 0;
-            if (lpLCData >= mem8.length) return null;
-            mem8[lpLCData] = 0;
-            return 1;
+            setLastError(ERROR_INVALID_FLAGS);
+            return 0;
         }
-
-        // Reuse cached UTF-16LE buffer — every char is ASCII so low byte = ANSI char
-        const strLen = (cached.length >>> 1) - 1; // excludes null
-        const required = strLen + 1;
+        const required = cached.length; // bytes incl. NUL
         if (cchData === 0) return required;
-        if (!lpLCData) return 0;
 
+        // WideCharToMultiByte fills what fits, then fails.
         const toWrite = Math.min(required, cchData);
         if (lpLCData + toWrite > mem8.length) return null;
-        for (let i = 0; i < toWrite - 1; i++) mem8[lpLCData + i] = cached[i * 2]; // low byte = ANSI
-        mem8[lpLCData + toWrite - 1] = 0;
-        return toWrite;
+        if (toWrite === required) mem8.set(cached, lpLCData);
+        else for (let i = 0; i < toWrite; i++) mem8[lpLCData + i] = cached[i]!;
+        if (required > cchData) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+        return required;
     }, { trivial: true });
 
     // -------------------------------------------------------------------------
@@ -1503,10 +1512,14 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     // Stack (stdcall @12): [esp+4]=dwInfoType [esp+8]=lpSrcStr [esp+12]=cchSrc [esp+16]=lpCharType
     // Note: 4 args = stdcall @16
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'GetStringTypeW', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = (cpu.reg32[4]) >>> 0;
+    dispatcher.registerFastPath('kernel32', 'GetStringTypeW', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
+        const mem8 = borrowGuestMemory(rawMem8);
         if (esp + 20 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         const dwInfoType = view.getUint32(esp + 4, true);
         const lpSrcStr   = view.getUint32(esp + 8, true);
@@ -1536,15 +1549,66 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
         return 1; // TRUE
     }, { trivial: true });
 
+
+    // -------------------------------------------------------------------------
+    // LCMapStringW — the middle of the CRT's __crtLCMapStringA sandwich (A->W, map, W->A).
+    // Only plain LCMAP_LOWERCASE / LCMAP_UPPERCASE, only where every character maps 1:1;
+    // sort keys, normalisation and anything else go to the thunk.
+    // -------------------------------------------------------------------------
+    dispatcher.registerFastPath('kernel32', 'LCMapStringW', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        const mem8 = borrowGuestMemory(rawMem8);
+        if (esp + 28 > mem8.length) return null;
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+
+        const dwMapFlags = view.getUint32(esp + 8, true);
+        const lpSrcStr = view.getUint32(esp + 12, true);
+        const cchSrc = view.getInt32(esp + 16, true);
+        const lpDestStr = view.getUint32(esp + 20, true);
+        const cchDest = view.getInt32(esp + 24, true);
+
+        if (!lpSrcStr) return 0;
+        localeFastPathStats.lcmapFlags.set(dwMapFlags, (localeFastPathStats.lcmapFlags.get(dwMapFlags) ?? 0) + 1);
+        const LCMAP_LOWERCASE = 0x100, LCMAP_UPPERCASE = 0x200;
+        if (dwMapFlags !== LCMAP_LOWERCASE && dwMapFlags !== LCMAP_UPPERCASE) { localeFastPathStats.lcmapDeclined++; return null; }
+        if (cchSrc < -1 || cchDest < 0) { localeFastPathStats.lcmapBail.badLength++; return null; }
+
+        let srcLen: number;
+        if (cchSrc === -1) {
+            srcLen = 0;
+            while (lpSrcStr + srcLen * 2 + 1 < mem8.length && view.getUint16(lpSrcStr + srcLen * 2, true) !== 0) srcLen++;
+        } else {
+            srcLen = Math.min(cchSrc, ((mem8.length - lpSrcStr) / 2) | 0);
+        }
+        if (lpSrcStr + srcLen * 2 > mem8.length) { localeFastPathStats.lcmapBail.srcOutOfRange++; return null; }
+
+        const lut = caseMapLut(dwMapFlags === LCMAP_UPPERCASE);
+
+        // Mirrors the thunk exactly, including writeWideString reserving a terminator slot.
+        if (cchDest === 0) return srcLen + (cchSrc === -1 ? 1 : 0);
+        if (lpDestStr <= 0 || lpDestStr >= mem8.length) return 0;
+        const toWrite = Math.min(srcLen, cchDest - 1);
+        if (toWrite < 0 || lpDestStr + (toWrite + 1) * 2 > mem8.length) return null;
+        for (let i = 0; i < toWrite; i++) {
+            view.setUint16(lpDestStr + i * 2, lut[view.getUint16(lpSrcStr + i * 2, true)]!, true);
+        }
+        view.setUint16(lpDestStr + toWrite * 2, 0, true);
+        localeFastPathStats.lcmapFast++;
+        return toWrite + 1;
+    }, { trivial: true });
+
     // -------------------------------------------------------------------------
     // MultiByteToWideChar — 226K calls/session
     // Stack (stdcall @24): [+4]=CodePage [+8]=dwFlags [+12]=lpMB [+16]=cbMB [+20]=lpWC [+24]=cchWC
     // Fast path covers CP_ACP/CP_OEMCP/1252 with cbMB=-1 (null-terminated) or positive length.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'MultiByteToWideChar', (cpu: any, mem8: Uint8Array): number | null => {
-        const esp = (cpu.reg32[4]) >>> 0;
+    dispatcher.registerFastPath('kernel32', 'MultiByteToWideChar', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The fast-path tier is handed a plain view already (ThunkDispatcher.cachedMem8Plain),
+        // so this no longer unwraps anything — it registers the borrow with the stale-view
+        // guard, which is what `dbg.memGuard(true)` reads. These loops walk tens of millions
+        // of bytes over a load, and per-BYTE through v86's Proxy is ~13x slower.
+        const mem8 = borrowGuestMemory(rawMem8);
         if (esp + 28 > mem8.length) return null;
-        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
 
         const codePage  = view.getUint32(esp + 4, true);
         // dwFlags at esp+8 — we don't act on them in fast path
@@ -1553,14 +1617,25 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
         const lpWC      = view.getUint32(esp + 20, true);
         const cchWC     = view.getInt32(esp + 24, true);
 
-        if (!lpMB) return 0;
+        if (!lpMB || cbMB === 0 || (!lpWC && cchWC) || cchWC < 0) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
 
-        // Only fast-path CP_ACP(0), CP_OEMCP(1), CP_UTF8(65001 — ASCII subset only), or 1252
+        // Any single-byte code page is a 256-entry table (built once from that page's own
+        // decoder); UTF-8 keeps its ASCII-subset path below. Naming individual pages here
+        // is what left every non-Western title on the allocating slow path.
         const config = EmulatorConfig.getInstance();
         const effectiveCp = codePage === 0 ? config.ansiCodePage
                           : codePage === 1 ? config.oemCodePage
                           : codePage;
-        if (effectiveCp !== 1252 && effectiveCp !== 437 && effectiveCp !== 65001) return null;
+        localeFastPathStats.lastCodePage = effectiveCp;
+        const cpLut = effectiveCp === 65001 ? null : codePageToUnicodeLut(effectiveCp);
+        if (!cpLut && effectiveCp !== 65001) {
+            localeFastPathStats.mbtwcBail.multiByteCodePage++;
+            localeFastPathStats.mbtwcSlow++;
+            return null;
+        }
 
         // Determine byte count
         let byteLen: number;
@@ -1570,30 +1645,45 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
             while (lpMB + byteLen < mem8.length && mem8[lpMB + byteLen] !== 0) byteLen++;
             byteLen++; // include null
         } else {
-            if (cbMB < 0) return null;
+            if (cbMB < 0) { localeFastPathStats.mbtwcBail.negativeLength++; localeFastPathStats.mbtwcSlow++; return null; }
             byteLen = Math.min(cbMB, mem8.length - lpMB);
         }
 
         const outLen = byteLen; // for single-byte CPs, 1 byte → 1 wchar
-        if (cchWC === 0) return outLen;
-        if (!lpWC) return 0;
+        if (cchWC === 0) { localeFastPathStats.mbtwcFast++; return outLen; }
 
+        if (outLen > cchWC) { localeFastPathStats.mbtwcTruncated++; }
         const toWrite = Math.min(outLen, cchWC);
-        if (lpWC + toWrite * 2 > mem8.length) return null;
+        if (lpWC + toWrite * 2 > mem8.length) {
+            localeFastPathStats.mbtwcBail.badRange++; localeFastPathStats.mbtwcSlow++; return null;
+        }
 
-        if (effectiveCp === 65001) {
-            // UTF-8: only fast-path pure ASCII subset
+        if (cpLut) {
             for (let i = 0; i < toWrite; i++) {
-                const b = mem8[lpMB + i];
-                if (b >= 0x80) return null; // non-ASCII, fall to slow path
-                view.setUint16(lpWC + i * 2, b, true);
+                view.setUint16(lpWC + i * 2, cpLut[mem8[lpMB + i]!]!, true);
             }
         } else {
-            // CP1252 / CP437: use LUT
-            const lut = _cp1252ToUnicode;
+            // UTF-8: only fast-path pure ASCII subset
             for (let i = 0; i < toWrite; i++) {
-                view.setUint16(lpWC + i * 2, lut[mem8[lpMB + i]], true);
+                const b = mem8[lpMB + i]!;
+                if (b >= 0x80) { localeFastPathStats.mbtwcSlow++; return null; } // non-ASCII, fall to slow path
+                view.setUint16(lpWC + i * 2, b, true);
             }
+        }
+        // Win32 fills what fits and then FAILS (mbstowcs_sbcs) — the count is not a
+        // success. The stub declines this case to here; answering it with a truncated
+        // length would make the decline a silent divergence instead of a hand-off.
+        if (outLen > cchWC) { setLastError(ERROR_INSUFFICIENT_BUFFER); localeFastPathStats.mbtwcFast++; return 0; }
+        localeFastPathStats.mbtwcFast++;
+        localeFastPathStats.mbtwcChars += toWrite;
+        if (toWrite > localeFastPathStats.mbtwcMaxChars) localeFastPathStats.mbtwcMaxChars = toWrite;
+        localeFastPathStats.mbtwcLenHist[
+            toWrite <= 8 ? 0 : toWrite <= 32 ? 1 : toWrite <= 128 ? 2 : toWrite <= 512 ? 3 : toWrite <= 4096 ? 4 : 5
+        ]!++;
+        const census = localeFastPathStats.callerCensus;
+        if (census !== null) {
+            const ret = view.getUint32(esp, true);
+            census.set(ret, (census.get(ret) ?? 0) + 1);
         }
         return toWrite;
     }, { trivial: true });
@@ -1604,11 +1694,88 @@ export function registerFastPathLocaleFunctions(dispatcher: any): void {
     //                       [+28]=lpDefaultChar [+32]=lpUsedDefaultChar
     // Fast path: ASCII-only strings (all codepoints < 0x80), CP1252/OEMCP/ACP.
     // -------------------------------------------------------------------------
-    dispatcher.registerFastPath('kernel32', 'WideCharToMultiByte', (_cpu: any, _mem8: Uint8Array): number | null => {
-        // Temporarily disable this fast path while bisecting the UT99 Render.dll
-        // regression. The slow path is the source of truth for null-termination
-        // and code page semantics, and the failure signature points at the
-        // WCTMB -> LoadLibraryA chain.
-        return null;
+    dispatcher.registerFastPath('kernel32', 'WideCharToMultiByte', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        // The slow path stays the source of truth for null-termination and code-page
+        // semantics: this handles ONLY the plainly-representable case and hands back
+        // anything else — a default char, a flag, or a code point the page cannot encode —
+        // so it can never be the one that decides a subtle case.
+        const mem8 = borrowGuestMemory(rawMem8);
+        if (esp + 36 > mem8.length) return null;
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+
+        const codePage = view.getUint32(esp + 4, true);
+        const dwFlags = view.getUint32(esp + 8, true);
+        const lpWC = view.getUint32(esp + 12, true);
+        const cchWC = view.getInt32(esp + 16, true);
+        const lpMB = view.getUint32(esp + 20, true);
+        const cbMB = view.getInt32(esp + 24, true);
+        const lpDefaultChar = view.getUint32(esp + 28, true);
+        const lpUsedDefaultChar = view.getUint32(esp + 32, true);
+
+        if (!lpWC || cchWC === 0 || (!lpMB && cbMB) || cbMB < 0) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        if (dwFlags !== 0) { localeFastPathStats.wctmbBail.flagsOrDefaultChar++; return null; }
+        // lpDefaultChar/lpUsedDefaultChar are servable here precisely BECAUSE this path
+        // proves every code point is representable below: no substitution can occur, so
+        // the default char is unused and the flag is FALSE. The write happens after that
+        // proof, never before.
+        if (lpUsedDefaultChar !== 0 && !validGuestDword(mem8, lpUsedDefaultChar)) {
+            localeFastPathStats.wctmbBail.badDest++;
+            return null;
+        }
+        if (cchWC < 0 && cchWC !== -1) { localeFastPathStats.wctmbBail.badLength++; return null; }
+
+        const config = EmulatorConfig.getInstance();
+        const effectiveCp = codePage === 0 ? config.ansiCodePage
+                          : codePage === 1 ? config.oemCodePage
+                          : codePage;
+        const rev = codePageToByteLut(effectiveCp);
+        if (!rev) { localeFastPathStats.wctmbBail.noCodePageLut++; return null; }
+
+        // Source length in wchars, including the terminator when the guest passed -1.
+        let count: number;
+        if (cchWC === -1) {
+            count = 0;
+            while (lpWC + count * 2 + 1 < mem8.length && view.getUint16(lpWC + count * 2, true) !== 0) count++;
+            count++; // the terminator is part of the conversion
+        } else {
+            count = cchWC;
+        }
+        if (lpWC + count * 2 > mem8.length) { localeFastPathStats.wctmbBail.badLength++; return null; }
+
+        // Every code point must be representable, or the default-char rules apply and this
+        // is not our case. Checked before writing anything.
+        for (let i = 0; i < count; i++) {
+            if (rev[view.getUint16(lpWC + i * 2, true)] === 0xffff) { localeFastPathStats.wctmbBail.unrepresentable++; return null; }
+        }
+        if (lpUsedDefaultChar !== 0) view.setUint32(lpUsedDefaultChar, 0, true);
+        if (cbMB === 0) { localeFastPathStats.wctmbFast++; return count; }   // size query: single-byte page ⇒ one byte per wchar
+
+        const toWrite = Math.min(count, cbMB);
+        if (lpMB + toWrite > mem8.length) { localeFastPathStats.wctmbBail.badDest++; return null; }
+        for (let i = 0; i < toWrite; i++) {
+            mem8[lpMB + i] = rev[view.getUint16(lpWC + i * 2, true)]!;
+        }
+        localeFastPathStats.wctmbFast++;
+        // Filled to cbMB, then failed: the Win32 contract (wcstombs_sbcs), and the case
+        // the inline stub declines to this tier rather than fake last-error.
+        if (count > cbMB) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+        return toWrite;
+    }, { trivial: true });
+
+    // -------------------------------------------------------------------------
+    // GetCPInfo — a pure function of the code page, re-asked per conversion by the CRT.
+    // Stack (stdcall @8): [esp+4]=CodePage [esp+8]=lpCPInfo
+    // -------------------------------------------------------------------------
+    dispatcher.registerFastPath('kernel32', 'GetCPInfo', (esp: number, dv: DataView, rawMem8: Uint8Array): number | null => {
+        const mem8 = borrowGuestMemory(rawMem8);
+        if (esp + 12 > mem8.length) return null;
+        const view = dv ?? new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+        const lpCPInfo = view.getUint32(esp + 8, true);
+        if (!lpCPInfo || lpCPInfo + CPINFO_SIZE > mem8.length) return null;
+        writeCPInfo(view, mem8, lpCPInfo, view.getUint32(esp + 4, true));
+        return 1;
     }, { trivial: true });
 }

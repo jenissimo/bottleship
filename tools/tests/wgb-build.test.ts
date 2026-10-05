@@ -13,12 +13,38 @@ import {
     collectExeDetections,
     mergeManifest,
     unzipStored,
+    readDirectoryFiles,
     type BuildSource,
 } from "../../src/worker/runtime/filesystem/wgb-build";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 import { ZipArchive, BufferSource } from "@bottleship/formats/zip";
 
 const enc = (s: string) => new TextEncoder().encode(s);
+
+describe("directory handles", () => {
+    const fileHandle = (name: string) => ({ name, kind: "file", getFile: async () => ({
+        name, size: 5_000_000_000, arrayBuffer() { throw new Error("Whole-file read during enumeration"); },
+    }) });
+    const directory = (name: string, entries: Array<[string, unknown]>) => ({ name, kind: "directory",
+        async *entries() { for (const entry of entries) yield entry; } }) as unknown as FileSystemDirectoryHandle;
+
+    test("game folders enumerate nested snapshots and detect exes without reading payloads", async () => {
+        const child = directory("data", [["huge.dat", fileHandle("huge.dat")]]);
+        const root = directory("My Game", [["game.exe", fileHandle("game.exe")], ["data", child]]);
+        const files = await readDirectoryFiles(root);
+        expect([...files.keys()]).toEqual(["game.exe", "data/huge.dat"]);
+        expect(files.get("data/huge.dat")!.size).toBe(5_000_000_000);
+        expect(await detectSource({ directory: root, directoryMode: "installed" })).toMatchObject({
+            kind: "game-folder", exeCandidates: ["game.exe"], suggestedEntrypoint: "game.exe",
+        });
+    });
+    test("empty folders and folders containing several GOG installers explain how to select", async () => {
+        await expect(readDirectoryFiles(directory("Empty", []))).rejects.toThrow("empty");
+        await expect(detectSource({ directory: directory("Downloads", [
+            ["setup_a.exe", fileHandle("setup_a.exe")], ["setup_b.exe", fileHandle("setup_b.exe")],
+        ]), directoryMode: "gog-installer" })).rejects.toThrow("Choose files");
+    });
+});
 
 // --- detectFromBytes / looksLikeWgb ----------------------------------------------
 

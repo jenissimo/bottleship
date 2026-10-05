@@ -11,7 +11,9 @@
 import { ResourceTable } from '../resource-table';
 import { BaseComObject } from '../com/base-com-object';
 import { Logger, LogCategory } from '../logger';
-import { checkComGuard } from '../../modules/ddraw/constants';
+// Import from core directly: routing this through ddraw/constants would re-enter the
+// constants module while COM memory is initializing.
+import { checkComGuard, freeComObject } from '../com/com-memory';
 import { System } from '../system';
 
 export enum ResourceType {
@@ -44,6 +46,11 @@ export class SystemResourceProvider {
     // Mapping from emulator memory address to handle
     private addressToHandle: Map<number, number> = new Map();
     private handleToAddress: Map<number, number> = new Map();
+    // The FIRST address a handle was mapped at — the object's own identity. handleToAddress
+    // holds the LAST one, and QueryInterface tear-offs remap the same handle onto a fresh
+    // guest block, so anything that means "this object's own interface pointer" (per-interface
+    // refcounting) must read this instead.
+    private handleToPrimaryAddress: Map<number, number> = new Map();
 
     // OPTIMIZATION: Index for fast lookup of surfaces by surfacePtr
     // Maps surfacePtr -> Set of COM object handles that share this surfacePtr
@@ -70,10 +77,14 @@ export class SystemResourceProvider {
     private nextUserHandle   = 0x40000;
     private nextFileHandle   = 0x50000;
 
-    // Free lists for handle recycling (COM objects are created/destroyed frequently).
+    // Free lists for handle recycling.
     // Holds RAW slot values (not the generation-tagged handle). FIFO (push/shift) so reuse
     // is spread across all freed slots → a single slot's generation wraps slowly.
     private freeComHandles: number[] = [];
+    /** Freed USER handle SLOTS (generation stripped), reused FIFO (see registerUserObject). */
+    private freeUserHandles: number[] = [];
+    /** Closed FILE handle slots, reused FIFO like the Win32 process handle table. */
+    private freeFileHandles: number[] = [];
 
     // Generation tagging for COM handles. COM is the only recycled handle class, and a guest
     // that caches a D3DTEXTUREHANDLE across a destroy+recreate (UE1 level load) would otherwise
@@ -95,6 +106,14 @@ export class SystemResourceProvider {
     /** Raw COM handle slot (generation stripped). Used by ddraw texture-registry slot recycle. */
     static readonly COM_SLOT_MASK = 0x7FFFF;
     private comSlotGeneration: Map<number, number> = new Map(); // raw slot -> current generation
+
+    // Generation tagging for USER handles — same hazard, same answer as COM: the slot comes
+    // back on DeleteObject/DestroyIcon/DestroyWindow, and a guest holding the stale HBITMAP
+    // would otherwise operate on whatever unrelated object took the slot. The generation
+    // lives in bits 0..1 (slots step by 4, so those bits are free), which keeps the tagged
+    // handle inside 0x40000-0x4FFFF and therefore inside getResource's USER range.
+    private static readonly USER_GEN_MASK = 0x3;
+    private userSlotGeneration: Map<number, number> = new Map(); // raw slot -> current generation
 
     static getInstance(): SystemResourceProvider {
         if (!SystemResourceProvider.instance) {
@@ -137,6 +156,7 @@ export class SystemResourceProvider {
         Logger.log(LogCategory.RESOURCE, `mapAddressToHandle: 0x${address.toString(16)} -> handle=0x${handle.toString(16)}`);
         this.addressToHandle.set(address, handle);
         this.handleToAddress.set(handle, address);
+        if (!this.handleToPrimaryAddress.has(handle)) this.handleToPrimaryAddress.set(handle, address);
     }
 
     /**
@@ -172,6 +192,16 @@ export class SystemResourceProvider {
      */
     getAddressForHandle(handle: number): number | null {
         return this.handleToAddress.get(handle) ?? null;
+    }
+
+    /**
+     * The address the object was FIRST published at — its own interface pointer, stable for
+     * the object's whole life. Use this (not getAddressForHandle) wherever "the pointer this
+     * object was created as" is meant: a tear-off remaps the handle and would otherwise
+     * silently become the answer.
+     */
+    getPrimaryAddressForHandle(handle: number): number | null {
+        return this.handleToPrimaryAddress.get(handle) ?? null;
     }
 
     /**
@@ -246,14 +276,19 @@ export class SystemResourceProvider {
     unregisterComObject(handle: number): BaseComObject | null {
         const obj = this.comObjects.release(handle);
         if (obj) {
-            // Also cleanup address mapping
+            // Drop ALL address mappings for this handle (QueryInterface tear-offs and
+            // sub-objects map extra guest blocks to the same handle) and return each
+            // backing block to the system-object pool — real COM frees the object
+            // memory on final Release.
+            const memory = System.getInstance().process?.memory;
             for (const [addr, h] of this.addressToHandle.entries()) {
                 if (h === handle) {
                     this.addressToHandle.delete(addr);
-                    this.handleToAddress.delete(handle);
-                    break;
+                    if (memory) freeComObject(memory, addr);
                 }
             }
+            this.handleToAddress.delete(handle);
+            this.handleToPrimaryAddress.delete(handle);
 
             // OPTIMIZATION: Cleanup surfacePtr index (O(1) using reverse mapping)
             const surfacePtr = this.handleToSurfacePtr.get(handle);
@@ -331,15 +366,34 @@ export class SystemResourceProvider {
     }
 
     /**
-     * Register a user object (windows, etc.)
+     * Register a user object (windows, bitmaps, icons, cursors).
+     *
+     * Handles are RECYCLED. The user range holds 16384 handles; a launcher that rebuilds its
+     * buttons from a compatible bitmap per repaint burns six of them a frame, so a monotonic
+     * allocator runs off the end of the range within a couple of minutes — and the handles it
+     * then hands out fall inside the FILE and GDI ranges, where getResource() dispatches them
+     * to the wrong table. Windows survives that workload because its handle slots come back on
+     * DeleteObject/DestroyIcon, not because its space is unbounded.
+     *
+     * Recycling ALIASES, so the slot is generation-tagged (see USER_GEN_MASK): a stale
+     * HBITMAP resolves to null instead of silently naming whatever icon/cursor/window took
+     * the slot next.
      */
     registerUserObject(obj: any): number {
-        const handle = this.nextUserHandle;
-        if (handle >= 0x50000) {
-            Logger.error(LogCategory.RESOURCE, `User handle range exhausted! handle=0x${handle.toString(16)}`);
+        let slot: number;
+        if (this.freeUserHandles.length > 0) {
+            slot = this.freeUserHandles.shift()!; // FIFO — delay reuse of any one slot
+        } else {
+            slot = this.nextUserHandle;
+            if (slot >= 0x50000) {
+                Logger.error(LogCategory.RESOURCE, `User handle range exhausted! handle=0x${slot.toString(16)}`);
+            }
+            this.nextUserHandle += 4;
         }
+        const gen = (((this.userSlotGeneration.get(slot) ?? -1) + 1) & SystemResourceProvider.USER_GEN_MASK) >>> 0;
+        this.userSlotGeneration.set(slot, gen);
+        const handle = (slot | gen) >>> 0;
         this.userObjects.create(handle, obj);
-        this.nextUserHandle += 4;
 
         Logger.log(LogCategory.RESOURCE, `Registered user object handle=0x${handle.toString(16)} type=${obj?.type || '?'}`);
         return handle;
@@ -353,22 +407,33 @@ export class SystemResourceProvider {
     }
 
     /**
-     * Unregister a user object
+     * Unregister a user object and return its slot to the free list.
      */
     unregisterUserObject(handle: number): any {
-        return this.userObjects.release(handle);
+        const obj = this.userObjects.release(handle);
+        if (obj !== null && obj !== undefined) {
+            // Recycle the RAW slot; the generation is bumped on the next reuse, so the
+            // recycled handle differs from this one.
+            this.freeUserHandles.push((handle & ~SystemResourceProvider.USER_GEN_MASK) >>> 0);
+        }
+        return obj;
     }
 
     /**
      * Register a file handle
      */
     registerFileHandle(obj: any): number {
-        const handle = this.nextFileHandle;
-        if (handle >= 0x60000) {
-            Logger.error(LogCategory.RESOURCE, `File handle range exhausted! handle=0x${handle.toString(16)}`);
+        let handle: number;
+        if (this.freeFileHandles.length > 0) {
+            handle = this.freeFileHandles.shift()!;
+        } else {
+            handle = this.nextFileHandle;
+            if (handle >= 0x60000) {
+                Logger.error(LogCategory.RESOURCE, `File handle range exhausted! handle=0x${handle.toString(16)}`);
+            }
+            this.nextFileHandle += 4;
         }
         this.fileHandles.create(handle, obj);
-        this.nextFileHandle += 4;
 
         Logger.verbose(LogCategory.RESOURCE, `Registered file handle=0x${handle.toString(16)}`);
         return handle;
@@ -385,7 +450,11 @@ export class SystemResourceProvider {
      * Unregister a file handle
      */
     unregisterFileHandle(handle: number): any {
-        return this.fileHandles.release(handle);
+        const obj = this.fileHandles.release(handle);
+        if (obj !== null && obj !== undefined) {
+            this.freeFileHandles.push(handle >>> 0);
+        }
+        return obj;
     }
 
     /**
@@ -510,6 +579,7 @@ export class SystemResourceProvider {
         // Clear address mappings
         this.addressToHandle.clear();
         this.handleToAddress.clear();
+        this.handleToPrimaryAddress.clear();
 
         // Clear surfacePtr index
         this.surfacePtrIndex.clear();
@@ -522,7 +592,10 @@ export class SystemResourceProvider {
         this.nextUserHandle   = 0x40000;
         this.nextFileHandle   = 0x50000;
         this.freeComHandles   = [];
+        this.freeUserHandles  = [];
+        this.freeFileHandles  = [];
         this.comSlotGeneration.clear();
+        this.userSlotGeneration.clear();
     }
 }
 
@@ -535,12 +608,12 @@ declare module '../resource-table' {
     }
 }
 
-// Add statistics method to ResourceTable
+// Add statistics method to ResourceTable.
+// `count` is the true live-object count. `peak` is a high-water mark across OBSERVATIONS
+// (it can only rise when someone calls this) — it is not a continuously tracked maximum, so
+// never read it as "the most handles this table ever held".
 (ResourceTable.prototype as any).getStatistics = function () {
-    // This is a simplified implementation
-    // In a real implementation, ResourceTable would track these metrics
-    return {
-        count: 0, // Would need to track active items
-        peak: 0   // Would need to track peak usage
-    };
+    const count = this.getAllItems().length;
+    this.__peakObserved = Math.max(this.__peakObserved ?? 0, count);
+    return { count, peak: this.__peakObserved };
 };

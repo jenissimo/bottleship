@@ -19,7 +19,8 @@ import { EmulatorConfig } from "../core/emulator-config-manager";
 import { asBufferSource } from "../../dom-buffer";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from "../core/diagnostics/large-io-trace";
-import { ensureNativeQsort, resetNativeQsort } from "./crt-qsort";
+import { ensureNativeQsort } from "./crt-qsort";
+import { fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
 
 const formatUnknownError = (err: unknown): string => {
     const forceString = (value: unknown): string => {
@@ -228,8 +229,11 @@ export class Crtdll implements IModule {
         this.mbCurMaxAddr = 0;
         this.localeAddr = 0;
         this.adjustFdivAddr = 0;
+        // NOT resetNativeQsort(): the shared code address is keyed on
+        // process.resetGeneration, so clearing it from one module's re-registration
+        // would hand a DIFFERENT address to whichever CRT flavour re-registers after
+        // us — and each flavour publishes its own IAT binding.
         this.qsortCodeAddr = 0;
-        resetNativeQsort();
 
         this.ensureRuntimeStorage();
         this.registerDataExports();
@@ -1079,10 +1083,8 @@ export class Crtdll implements IModule {
             this.setErrno(2); // ENOENT
             return -1;
         }
-        // struct _stat (32-bit CRT): zero 48 bytes, st_mode at +4, st_size at +20.
-        for (let off = 0; off < 48; off += 4) Mem.writeUint32(structPtr + off, 0);
-        Mem.writeUint32(structPtr + 4, (isDir ? 0x4000 : 0x8000) | 0x0100); // _S_IFDIR/_S_IFREG | read
-        Mem.writeUint32(structPtr + 20, isFile ? vfs.getFileSize(resolved) : 0);
+        fillStatStruct(structPtr, STAT32_OFFSETS, 36, isFile ? vfs.getFileSize(resolved) : 0, isDir,
+            (p, v, n) => { for (let off = 0; off < n; off += 4) Mem.writeUint32(p + off, v); });
         return 0;
     }
 

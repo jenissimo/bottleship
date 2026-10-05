@@ -1,0 +1,39 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.951Z",
+  "module": "w32skrnl",
+  "functions": [
+    {
+      "name": "_kGetWin32sDirectory@0",
+      "argCount": 0
+    },
+    {
+      "name": "_RtlNtStatusToDosError",
+      "argCount": 1
+    },
+    {
+      "name": "GetCurrentTask32",
+      "argCount": 0
+    },
+    {
+      "name": "ord_14",
+      "argCount": 0
+    },
+    {
+      "name": "ord_17",
+      "argCount": 0
+    },
+    {
+      "name": "ord_3",
+      "argCount": 0
+    },
+    {
+      "name": "ord_30",
+      "argCount": 1
+    },
+    {
+      "name": "W32S_BackTo32",
+      "argCount": 0
+    }
+  ]
+}

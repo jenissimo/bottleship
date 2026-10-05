@@ -598,4 +598,13 @@ export class GdiPlus implements IModule {
             return Ok;
         };
     }
+
+    reset(): void {
+        for (const img of this.gpImages.values()) {
+            try { img.imageBitmap?.close(); } catch { /* ignore */ }
+        }
+        this.gpImages.clear();
+        this.gpGraphics.clear();
+        this.nextHandle = 0x70000;
+    }
 }

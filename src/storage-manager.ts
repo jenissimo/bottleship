@@ -16,6 +16,28 @@ import { ZipArchive, BufferSource } from "@bottleship/formats/zip";
 import { asWriteChunk } from "./dom-buffer";
 
 const WGB_CACHE_DIR = "wgb-cache";
+const TEMP_DIRS = ["_imports", "_wizard", "_ingest"];
+
+export async function temporaryImportBytes(): Promise<number> {
+    const root = await opfsBottleship();
+    if (!root) return 0;
+    let bytes = 0;
+    for (const name of TEMP_DIRS) {
+        try { bytes += await dirSize(await root.getDirectoryHandle(name)); }
+        catch (err) { if ((err as DOMException).name !== "NotFoundError") throw err; }
+    }
+    return bytes;
+}
+
+/** Reclaim abandoned import/export workspaces; saves and library bundles are separate. */
+export async function clearTemporaryImports(): Promise<void> {
+    const root = await opfsBottleship();
+    if (!root) return;
+    for (const name of TEMP_DIRS) {
+        try { await root.removeEntry(name, { recursive: true }); }
+        catch (err) { if ((err as DOMException).name !== "NotFoundError") throw err; }
+    }
+}
 
 /** Container-root files that belong to the persistent (exportable) layer, besides overlay/**. */
 const ROOT_PERSIST_FILES = ["registry.json", "meta.json"];

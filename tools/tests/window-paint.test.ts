@@ -14,13 +14,22 @@ import {
 } from '../../src/worker/modules/user32/paint-region';
 import {
     windows,
+    controlImageHandles,
     reorderChildInParent,
+    isWindowPosZOrderRequestValid,
+    shouldSeedPaintFromParent,
+    isCoveredByGuestChild,
+    isFullyCoveredByGuestChild,
     getChildZOrderSibling,
     getChildrenInPaintOrder,
+    getGroupSiblingRange,
     setLockWindowUpdate,
+    tryLockWindowUpdate,
+    getLockWindowUpdate,
     isWindowUpdateLocked,
     type WindowInfo,
 } from '../../src/worker/modules/user32/shared-state';
+import { isWindowInActiveTree } from '../../src/worker/modules/user32/owner-draw';
 
 function mkWin(handle: number, w = 100, h = 80): WindowInfo {
     return {
@@ -36,6 +45,29 @@ function mkWin(handle: number, w = 100, h = 80): WindowInfo {
         wndProc: 0,
     };
 }
+
+describe('owner-draw active subtree guard', () => {
+    const ROOT = 0x10001;
+    const SUBMENU = 0x1001e;
+    const SUBMENU_BUTTON = 0x10020;
+    const ROOT_BUTTON = 0x10003;
+
+    beforeEach(() => {
+        windows.clear();
+        windows.set(ROOT, { ...mkWin(ROOT), children: [ROOT_BUTTON, SUBMENU] });
+        windows.set(ROOT_BUTTON, { ...mkWin(ROOT_BUTTON), parent: ROOT });
+        windows.set(SUBMENU, { ...mkWin(SUBMENU), parent: ROOT, children: [SUBMENU_BUTTON] });
+        windows.set(SUBMENU_BUTTON, { ...mkWin(SUBMENU_BUTTON), parent: SUBMENU });
+    });
+
+    test('allows a button in an active nested dialog', () => {
+        expect(isWindowInActiveTree(windows.get(SUBMENU_BUTTON)!, SUBMENU)).toBe(true);
+    });
+
+    test('suppresses a root button underneath an active nested dialog', () => {
+        expect(isWindowInActiveTree(windows.get(ROOT_BUTTON)!, SUBMENU)).toBe(false);
+    });
+});
 
 describe('paint-region invalid areas', () => {
     const HWND = 0x10001;
@@ -100,8 +132,12 @@ describe('child Z-order helpers', () => {
         windows.set(C, { ...mkWin(C), parent: PARENT });
     });
 
-    test('paint order is back to front', () => {
-        expect(getChildrenInPaintOrder(PARENT)).toEqual([C, B, A]);
+    // Windows sends WM_PAINT down the sibling list from the head (Wine server
+    // find_child_to_repaint), so the TOPMOST child paints first and the bottom-most
+    // last — which is what decides an overlap between siblings that do not carry
+    // WS_CLIPSIBLINGS.
+    test('paint order is the sibling list, topmost first', () => {
+        expect(getChildrenInPaintOrder(PARENT)).toEqual([A, B, C]);
     });
 
     test('SetWindowPos Z-order reorder', () => {
@@ -111,9 +147,131 @@ describe('child Z-order helpers', () => {
         expect(getChildZOrderSibling(A, 'next')).toBe(C);
     });
 
+    test('SetWindowPos rejects TOPMOST/NOTOPMOST for child windows before applying the request', () => {
+        const child = { ...windows.get(A)!, style: 0x40000000 }; // WS_CHILD
+        expect(isWindowPosZOrderRequestValid(child, -1, 0)).toBe(false);
+        expect(isWindowPosZOrderRequestValid(child, -2, 0)).toBe(false);
+        expect(isWindowPosZOrderRequestValid(child, 0, 0)).toBe(true);
+        expect(isWindowPosZOrderRequestValid(child, -1, 0x0004)).toBe(true); // SWP_NOZORDER
+        windows.get(B)!.style |= 0x40000000;
+        expect(isWindowPosZOrderRequestValid(child, B, 0)).toBe(true);
+        expect(isWindowPosZOrderRequestValid(child, 0xdead, 0)).toBe(false);
+
+        const topLevel = mkWin(0x20000);
+        expect(isWindowPosZOrderRequestValid(topLevel, -1, 0)).toBe(true);
+    });
+
     test('HWND_TOP moves child to front', () => {
         reorderChildInParent(A, 0);
+        expect(windows.get(PARENT)!.children[0]).toBe(A);
         expect(getChildrenInPaintOrder(PARENT)[0]).toBe(A);
+    });
+
+    test('HWND_BOTTOM moves child to back', () => {
+        reorderChildInParent(A, 1);
+        expect(windows.get(PARENT)!.children.at(-1)).toBe(A);
+        expect(getChildrenInPaintOrder(PARENT).at(-1)).toBe(A);
+    });
+});
+
+describe('WS_GROUP ranges over the sibling list', () => {
+    const PARENT = 0x11000;
+    const WS_GROUP = 0x00020000;
+    // Creation order, which is also the sibling order: a label, group A (three items),
+    // group B (two items) — control_zoo's radio row.
+    const [LABEL, A1, A2, A3, B1, B2] = [0x11001, 0x11002, 0x11003, 0x11004, 0x11005, 0x11006];
+    const group = (h: number) => getGroupSiblingRange(PARENT, h).map((w) => w.handle);
+
+    beforeEach(() => {
+        windows.clear();
+        const kids = [LABEL, A1, A2, A3, B1, B2];
+        windows.set(PARENT, { ...mkWin(PARENT), children: [...kids] });
+        for (const h of kids) {
+            windows.set(h, {
+                ...mkWin(h), parent: PARENT,
+                style: (h === A1 || h === B1) ? WS_GROUP : 0,
+            });
+        }
+    });
+
+    test('a group runs from its WS_GROUP opener to the next one', () => {
+        expect(group(A1)).toEqual([A1, A2, A3]);
+        expect(group(A3)).toEqual([A1, A2, A3]);
+    });
+
+    test('the last group runs to the end of the list', () => {
+        expect(group(B2)).toEqual([B1, B2]);
+    });
+
+    test('controls before the first WS_GROUP form their own range', () => {
+        expect(group(LABEL)).toEqual([LABEL]);
+    });
+
+    test('an unknown control has no range', () => {
+        expect(group(0xdead)).toEqual([]);
+    });
+
+    // The bug this exists for: with the list reversed, A3's range picks up B1 (the
+    // WS_GROUP that now precedes it) and loses A1.
+    test('a reversed sibling list is what a wrong range looks like', () => {
+        windows.get(PARENT)!.children.reverse();
+        expect(group(A3)).toEqual([B1, A3, A2]);
+    });
+});
+
+describe('control paint backing', () => {
+    test('subclassed STATIC starts from its parent instead of accumulated glyph pixels', () => {
+        const parent = mkWin(0x30000);
+        const child = {
+            ...mkWin(0x30001),
+            parent: parent.handle,
+            isSystemControl: true,
+            systemControlClass: 'Static',
+            wndProcSubclassed: true,
+        };
+        expect(shouldSeedPaintFromParent(child)).toBe(true);
+        expect(shouldSeedPaintFromParent({ ...child, wndProcSubclassed: false })).toBe(false);
+        expect(shouldSeedPaintFromParent({ ...child, systemControlClass: 'Button' })).toBe(false);
+    });
+
+    test('guest child covering a STATIC suppresses the placeholder chrome', () => {
+        const top = { ...mkWin(0x31000), children: [0x31001] };
+        const placeholder = {
+            ...mkWin(0x31001), parent: top.handle, children: [0x31002],
+            x: 10, y: 20, width: 100, height: 80,
+            style: 0x0007,
+            isSystemControl: true, systemControlClass: 'Static',
+        };
+        const page = {
+            ...mkWin(0x31002), parent: placeholder.handle,
+            width: 120, height: 100,
+        };
+        windows.set(top.handle, top);
+        windows.set(placeholder.handle, placeholder);
+        windows.set(page.handle, page);
+
+        expect(isFullyCoveredByGuestChild(placeholder.handle)).toBe(true);
+        page.width = 90;
+        expect(isFullyCoveredByGuestChild(placeholder.handle)).toBe(false);
+        page.x = 10;
+        page.width = 98;
+        expect(isCoveredByGuestChild(placeholder.handle, 2)).toBe(true);
+    });
+
+    test('page hosted by an image STATIC seeds its paint DC from the parent', () => {
+        const host = {
+            ...mkWin(0x32000), children: [0x32001],
+            isSystemControl: true, systemControlClass: 'Static',
+        };
+        const page = { ...mkWin(0x32001), parent: host.handle };
+        windows.set(host.handle, host);
+        windows.set(page.handle, page);
+        controlImageHandles.set(host.handle, 0x40000);
+        try {
+            expect(shouldSeedPaintFromParent(page)).toBe(true);
+        } finally {
+            controlImageHandles.delete(host.handle);
+        }
     });
 });
 
@@ -135,5 +293,16 @@ describe('LockWindowUpdate', () => {
         expect(isWindowUpdateLocked(0x99999)).toBe(false);
         setLockWindowUpdate(0);
         expect(isWindowUpdateLocked(ROOT)).toBe(false);
+    });
+
+    test('tryLockWindowUpdate: second lock fails until unlock', () => {
+        expect(tryLockWindowUpdate(ROOT)).toBe(true);
+        expect(getLockWindowUpdate()).toBe(ROOT);
+        expect(tryLockWindowUpdate(CHILD)).toBe(false);
+        expect(getLockWindowUpdate()).toBe(ROOT);
+        expect(tryLockWindowUpdate(0)).toBe(true);
+        expect(getLockWindowUpdate()).toBe(0);
+        expect(tryLockWindowUpdate(CHILD)).toBe(true);
+        expect(tryLockWindowUpdate(0)).toBe(true);
     });
 });

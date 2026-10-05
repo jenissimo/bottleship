@@ -57,6 +57,10 @@ function writeWideString(ptr: number, value: string): void {
     Mem.writeUint16(ptr + value.length * 2, 0); // wide null terminator
 }
 
+function writeNarrowOrWide(ptr: number, value: string, wide: boolean): void {
+    if (wide) writeWideString(ptr, value); else writeNarrowString(ptr, value);
+}
+
 function writeInteger(ptr: number, big: bigint, sizeBytes: number): void {
     if (!ptr) return;
     switch (sizeBytes) {
@@ -81,7 +85,21 @@ function writeDouble(ptr: number, val: number): void {
 /** Length-modifier → integer write size in bytes. */
 const enum IntSize { Char = 1, Short = 2, Int = 4, Long8 = 8 }
 
-export function scanfCore(input: string, format: string, args: number[], argStart: number): ScanfResult {
+/**
+ * `secure` selects the `*_s` family's argument shape: every %s, %c and %[ is followed by a
+ * buffer SIZE in characters. Consuming it is not optional — skip it and every argument after
+ * the first string conversion is read one slot early, so the caller's ints land in whatever
+ * the size happened to be. The size also bounds the write, which is the whole point of the
+ * form: a field that does not fit empties the buffer and ends the scan, as the CRT does when
+ * its invalid-parameter handler returns.
+ */
+export function scanfCore(
+    input: string,
+    format: string,
+    args: number[],
+    argStart: number,
+    secure = false,
+): ScanfResult {
     let ip = 0;
     let assigned = 0;
     let argIndex = argStart;
@@ -162,6 +180,8 @@ export function scanfCore(input: string, format: string, args: number[], argStar
         }
 
         const outPtr = suppress ? 0 : (args[argIndex++] ?? 0);
+        const takesSize = secure && !suppress && (spec === "s" || spec === "c" || spec === "[");
+        const bufChars = takesSize ? ((args[argIndex++] ?? 0) >>> 0) : Infinity;
 
         // ---- Integer conversions ----
         if (spec === "d" || spec === "i" || spec === "u" || spec === "x" || spec === "X" || spec === "o" || spec === "p") {
@@ -250,6 +270,7 @@ export function scanfCore(input: string, format: string, args: number[], argStar
             let s = ""; let n = 0;
             while (ip < input.length && !isSpace(input[ip]) && n < max) { s += input[ip++]; n++; }
             if (s.length === 0) { eof = assigned === 0 && ip >= input.length; break; }
+            if (s.length + 1 > bufChars) { if (outPtr) writeNarrowOrWide(outPtr, "", wide); break; }
             if (wide) writeWideString(outPtr, s); else writeNarrowString(outPtr, s);
             if (!suppress) assigned++;
             continue;
@@ -259,6 +280,7 @@ export function scanfCore(input: string, format: string, args: number[], argStar
         if (spec === "c") {
             const want = hasWidth ? width : 1;
             if (ip + want > input.length) { eof = assigned === 0; ip = input.length; break; }
+            if (want > bufChars) break;
             for (let n = 0; n < want; n++) {
                 if (outPtr) {
                     if (wide) Mem.writeUint16(outPtr + n * 2, input.charCodeAt(ip) & 0xffff);
@@ -296,6 +318,7 @@ export function scanfCore(input: string, format: string, args: number[], argStar
                 s += input[ip++]; n++;
             }
             if (s.length === 0) { eof = assigned === 0 && ip >= input.length; break; }
+            if (s.length + 1 > bufChars) { if (outPtr) writeNarrowOrWide(outPtr, "", wide); break; }
             if (wide) writeWideString(outPtr, s); else writeNarrowString(outPtr, s);
             if (!suppress) assigned++;
             continue;

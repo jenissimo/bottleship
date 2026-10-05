@@ -17,6 +17,23 @@
 import type { HarnessService } from "../service";
 import { frameProfiler, type BadFrameCapture, type FrameSample } from "../../core/frame-profiler";
 import { profiler } from "../../core/profiler";
+import { readbackCounters } from "../../modules/ddraw/surface-sync";
+import { readLockDivergenceCounters } from "../../modules/ddraw/lock-flags";
+import { d3d8LockCounters } from "../../modules/d3d8/lock-flags";
+import { d3d9LockCounters, d3d9ReadbackCounters } from "../../modules/d3d9/lock-stats";
+import { prefetchCounters } from "../../modules/ddraw/surface-readback-prefetch";
+import { drawCostProfiler } from "../../backends/webgpu/ddraw/draw-cost-profiler";
+import { lockCostProfiler } from "../../modules/ddraw/lock-cost-profiler";
+import { getBufferUploadCensus, resetBufferUploadCensus } from "../../backends/webgpu/buffer-upload";
+import { cpu, sys, symbolize, proc } from "../serialize";
+import { HarnessError, HarnessErrorCode } from "../rpc";
+import { type FrameTail } from "../../core/frame-time-distribution";
+import { dbg, type FastmemStats } from "../../core/debug/dbg-commands";
+import { guestCodeInvalidationStats } from "../../core/memory/guest-code";
+import { getWasmGrowthStats } from "../../core/cpu/cpu-views";
+import { hypercallDataManager } from "../../core/cpu/hypercall-data";
+import { compareScenes, probeScene, type SceneProbe } from "./scene";
+import type { SplitReplayStats } from "../../backends/webgpu/d3d9/split-replay";
 
 /** Compact a category record to ms (drop zero buckets) for terse output. */
 function categoriesMs(categories: Record<string, number>): Record<string, number> {
@@ -48,6 +65,836 @@ function summarizeSample(s: FrameSample | undefined) {
         frameMs: Math.round(s.frameMs * 100) / 100,
         fps: Math.round(s.fps * 10) / 10,
         categories: categoriesMs(s.categories),
+    };
+}
+
+/* ── window identity (the join seam to the trace) ──────────────────────────── */
+
+const WINDOW_BEGIN_MARK = "bottleship.perfwindow.begin";
+const WINDOW_END_MARK = "bottleship.perfwindow.end";
+
+/** UserTiming marks are already in the trace category set (`blink.user_timing`), so a mark
+ *  emitted here lands in a `bun tools/harness.ts trace` capture — that is the whole join. */
+function mark(name: string): void {
+    try { performance.mark(name); } catch { /* diagnostics must never break a read */ }
+}
+
+type RenderLike = {
+    getFlipCadence?: (refreshMs?: number) => Record<string, unknown>;
+    resetFlipCadence?: () => void;
+    getPresentSerial?: () => number;
+};
+
+/** What the live depth structurally cannot see. Enumerated so a reader never concludes the
+ *  absence of a cause from an instrument that never looked for it. */
+const LIVE_BLIND_SPOTS: string[] = [
+    "GC pauses: invisible worker-side. Only a trace shows them ('(garbage collector)' JS node in the worker profile).",
+    "stack attribution (JS vs wasm vs v86 internals, bad codegen): trace-only — V86_ANNOTATIONS, high cpu::cycle_internal self-time = interpreting, wasm-function[N] = compiled blocks.",
+    "which guest code: needs sampling, so it cannot be applied retroactively to a spike that already happened — run guestBlocks() while the behaviour is live.",
+    "hypercall COST: the per-id table counts calls served vs fallen back, not time. A cheap handler called a million times and an expensive one called a thousand look the same here — only a trace splits that.",
+    "thunk time is summed ACROSS guest threads into the frame it landed in, so a parked audio thread inflates a frame's thunk category (park thunks are excluded from blame, not from the category).",
+];
+
+/**
+ * The fastmem fields the frame window reports, projected out of `dbg.fastmemStats()`.
+ *
+ * Exported and typed so the projection is checked rather than cast: a field the engine no
+ * longer exports must fail the typecheck, not be published as `NaN` under its name.
+ */
+export type FastmemCounters = {
+    writesEnabled: boolean;
+    /** Compile-site count, cumulative since boot: differenced over the window. */
+    speculatedStoresCompiled: number;
+    /** Pages the JIT will take the fast store path on; a level, not a rate. */
+    writeMapAcceptPages: number | null;
+};
+
+export function projectFastmem(f: FastmemStats | null): FastmemCounters | null {
+    if (!f) return null;
+    return {
+        writesEnabled: f.writesEnabled,
+        speculatedStoresCompiled: f.speculatedStoresCompiled,
+        writeMapAcceptPages: f.writeMap?.acceptPages ?? null,
+    };
+}
+
+type CounterSnapshot = {
+    atMs: number;
+    presentSerial: number | null;
+    sched: Record<string, number> | null;
+    fastmem: FastmemCounters | null;
+    tier2: Record<string, number> | null;
+    codeInvalidations: { wired: boolean; ranges: number; bytes: number; deferred: number };
+    /** WASM buffer-identity changes. This is the safety margin of every cached-view
+     *  decision in the worker: v86's `view()` Proxy re-resolves on EVERY access to guard
+     *  against exactly this event, so how often it actually happens says whether that
+     *  guard is earning its cost. A session that grows 0-2 times after boot is one where
+     *  it is not. */
+    wasmGrowths: number;
+    hypercalls: number;
+    handlers: ReturnType<typeof hypercallDataManager.getHandlerReport>;
+};
+
+let windowBaseline: CounterSnapshot | null = null;
+
+function snapshotCounters(render: RenderLike | undefined): CounterSnapshot {
+    const sched = sys().scheduler as unknown as {
+        roundTripStats?: Record<string, number>; pinStarvationForced?: number;
+    } | undefined;
+    let fastmem: CounterSnapshot["fastmem"] = null;
+    let tier2: CounterSnapshot["tier2"] = null;
+    try {
+        fastmem = projectFastmem(dbg.fastmemStats?.() ?? null);
+    } catch { /* wasm debug exports absent in this build */ }
+    try {
+        tier2 = (dbg.tier2Stats?.() as unknown as Record<string, number> | null) ?? null;
+    } catch { /* same */ }
+    return {
+        atMs: Math.round(performance.now()),
+        presentSerial: render?.getPresentSerial?.() ?? null,
+        sched: sched?.roundTripStats
+            ? { ...sched.roundTripStats, pinStarvationForced: sched.pinStarvationForced ?? -1 }
+            : null,
+        fastmem,
+        tier2,
+        codeInvalidations: guestCodeInvalidationStats(),
+        wasmGrowths: getWasmGrowthStats().growths,
+        hypercalls: hypercallDataManager.getCallCount(),
+        handlers: hypercallDataManager.getHandlerReport(),
+    };
+}
+
+/** Per-handler served/fellBack deltas over the window, busiest first. */
+function diffHandlers(base: CounterSnapshot["handlers"], now: CounterSnapshot["handlers"]) {
+    const byId = new Map(base.map(h => [h.handlerId, h]));
+    const out = now.map(h => {
+        const b = byId.get(h.handlerId);
+        return {
+            handlerId: h.handlerId,
+            names: h.names,
+            served: h.served - (b?.served ?? 0),
+            fellBack: h.fellBack - (b?.fellBack ?? 0),
+            // A saturated counter makes its own delta meaningless — say so rather than
+            // let a clamped subtraction read as "traffic stopped".
+            ...(h.saturated ? { saturated: true as const } : {}),
+        };
+    }).filter(h => h.served !== 0 || h.fellBack !== 0);
+    out.sort((a, b) => (b.served + b.fellBack) - (a.served + a.fellBack));
+    return out;
+}
+
+const diffNumbers = (a: Record<string, number> | null, b: Record<string, number> | null) => {
+    if (!a || !b) return null;
+    const out: Record<string, number> = {};
+    for (const k of Object.keys(b)) out[k] = (b[k] ?? 0) - (a[k] ?? 0);
+    return out;
+};
+
+function counterDelta(base: CounterSnapshot | null, now: CounterSnapshot) {
+    if (!base) {
+        return {
+            available: false as const,
+            note: "no baseline — call frameReport({reset:true}) to arm one; a delta over an unknown window is not a measurement",
+            current: { fastmemWriteMapAcceptPages: now.fastmem?.writeMapAcceptPages ?? null },
+        };
+    }
+    const notes: string[] = [];
+    const sched = diffNumbers(base.sched, now.sched);
+    if (sched && sched.realSwitch === 0 && (sched.ticks ?? 0) > 0) {
+        notes.push("scheduler made 0 REAL context switches over the window while ticking — the freeze signature (a pinned callback or an empty run queue).");
+    }
+    // 32-bit wrapping counter: a naive subtraction reads as 0 or negative. One wrap is
+    // recoverable, more than one is not distinguishable — say so rather than imply precision.
+    const hcDelta = (now.hypercalls - base.hypercalls) >>> 0;
+    return {
+        available: true as const,
+        windowMs: now.atMs - base.atMs,
+        presents: now.presentSerial !== null && base.presentSerial !== null ? now.presentSerial - base.presentSerial : null,
+        sched,
+        fastmem: {
+            writesEnabled: now.fastmem?.writesEnabled ?? null,
+            speculatedStoresCompiled: now.fastmem && base.fastmem
+                ? now.fastmem.speculatedStoresCompiled - base.fastmem.speculatedStoresCompiled : null,
+            // A level, not a delta: the map is rebuilt wholesale, so a difference of two
+            // populations describes nothing.
+            writeMapAcceptPages: now.fastmem?.writeMapAcceptPages ?? null,
+        },
+        tier2: diffNumbers(base.tier2, now.tier2),
+        codeInvalidations: {
+            ranges: now.codeInvalidations.ranges - base.codeInvalidations.ranges,
+            bytes: now.codeInvalidations.bytes - base.codeInvalidations.bytes,
+            wired: now.codeInvalidations.wired,
+        },
+        wasmGrowths: now.wasmGrowths - base.wasmGrowths,
+        hypercalls: {
+            delta: hcDelta,
+            wrapCaveat: "32-bit wrapping total; delta is computed unsigned so ONE wrap is recovered.",
+            // Per-handler_id breakdown — `served` handled in WASM, `fellBack` declined and
+            // cost a JS thunk round-trip. A hot id with a high fellBack ratio is a fast path
+            // that isn't one.
+            byHandler: diffHandlers(base.handlers, now.handlers),
+        },
+        ...(notes.length ? { notes } : {}),
+    };
+}
+
+function joinInfo(render: RenderLike | undefined, base: CounterSnapshot | null, now: CounterSnapshot | null) {
+    return {
+        clock: "worker performance.now() ms. The trace's `ts` is a different base, which is why the window is published as UserTiming MARKS rather than numbers to compare.",
+        markBegin: WINDOW_BEGIN_MARK,
+        markEnd: WINDOW_END_MARK,
+        beginNowMs: base?.atMs ?? null,
+        endNowMs: now?.atMs ?? null,
+        presentSerialBegin: base?.presentSerial ?? null,
+        presentSerialEnd: (now ?? base)?.presentSerial ?? render?.getPresentSerial?.() ?? null,
+        howTo: "record with `bun tools/harness.ts trace <sec>` ACROSS this window (it arms the bottleship.hotblocks mark itself), "
+            + "then `bun tools/analyze-trace.ts <file> --thread worker` — it reports the perfwindow marks and the same p50/p95/p99 definition.",
+    };
+}
+
+/** The independent instrument over the same window. Mean is compared because it is free of
+ *  rank conventions; the percentile comparison allows for our bucket quantization and for
+ *  getFlipCadence's one-rank-higher convention. Every check is published separately so a
+ *  disagreement names itself instead of being averaged into a verdict. */
+function crossCheckFlipCadence(render: RenderLike | undefined, tail: FrameTail, refreshMs: number) {
+    const cadence = render?.getFlipCadence?.(refreshMs);
+    if (!cadence) return { available: false, note: "render service unavailable (no game loaded?)" };
+    if (!tail.ok) {
+        return { available: false, note: `tail is ${tail.status}; nothing to compare against`, flipCadence: cadence };
+    }
+    const c = cadence as { count: number; avgMs: number; p50Ms: number; p99Ms: number; maxMs: number; vsyncHistogram: Record<string, number> };
+    // `agrees: null` = WITHHELD, not disagreed: we refuse a percentile whose rank has no
+    // observation behind it while getFlipCadence publishes one regardless. That is a policy
+    // difference, not a measurement conflict, so it must not read as either "agrees" or "the
+    // instruments disagree".
+    const checks: Record<string, { ours: number | null; theirs: number; tolerance: number; agrees: boolean | null }> = {};
+    const cmp = (key: string, ours: number | null, theirs: number, tolerance: number) => {
+        checks[key] = { ours, theirs, tolerance, agrees: ours === null ? null : Math.abs(ours - theirs) <= tolerance };
+    };
+    cmp("count", tail.sampleCount, c.count, Math.max(2, c.count * 0.02));
+    cmp("meanMs", tail.meanMs, c.avgMs, Math.max(0.5, c.avgMs * 0.02));
+    cmp("p50Ms", tail.p50Ms, c.p50Ms, (tail.resolutionMs.p50 ?? 0.25) + 1);
+    cmp("p99Ms", tail.p99Ms, c.p99Ms, (tail.resolutionMs.p99 ?? 0.25) + Math.max(1, c.p99Ms * 0.05));
+    const disagreements = Object.entries(checks).filter(([, v]) => v.agrees === false).map(([k]) => k);
+    const withheld = Object.entries(checks).filter(([, v]) => v.agrees === null).map(([k]) => k);
+    const notes: string[] = [];
+    if (withheld.length) {
+        notes.push(
+            `${withheld.join(", ")} withheld here (too few samples for the rank) while getFlipCadence still prints a value — `
+            + "at n below 1/(1-p) its percentile IS the max. Not a disagreement between measurements.",
+        );
+    }
+    if (c.count >= 1200) notes.push("flip-cadence ring is SATURATED at its 1200-interval cap: it describes the tail of the window, ours describes all of it.");
+    if (disagreements.includes("count")) notes.push("interval counts differ: the cadence ring drops any gap >= 2000ms (we keep it), and either window may have been reset independently.");
+    if (disagreements.includes("p99Ms")) notes.push("getFlipCadence indexes percentiles one rank higher (floor(n*p) 0-based), so at small n its p99 IS the max; ours is a bucket upper bound.");
+    return {
+        available: true,
+        agrees: disagreements.length === 0,
+        disagreements,
+        withheld,
+        checks,
+        vsyncHistogram: c.vsyncHistogram,
+        histogramReading: "clean {2,3} split = structural sub-refresh pulldown; spread across {2,3,4,5} = CPU jitter; rare huge buckets = micro-stalls.",
+        ...(notes.length ? { notes } : {}),
+    };
+}
+
+const boundariesAgree = (presents: number, marks: number) =>
+    presents === 0 || marks === 0 ? false : Math.abs(presents - marks) <= Math.max(2, marks * 0.02);
+
+/* ── guest-code attribution: two channels, labelled by what they weight ─────── */
+
+type SampledBlocks = {
+    available: boolean;
+    note?: string;
+    weighting?: string;
+    runningSamples?: number;
+    rows?: Array<{ block: string; module: string; samples: number; pct: string }>;
+    topEips?: Array<{ eip: string; module: string; samples: number; pct: string }>;
+};
+
+async function sampledGuestBlocks(ms: number, intervalMs: number, top: number): Promise<SampledBlocks> {
+    const fn = (globalThis as { dumpHotJitBlocks?: (a: number, b: number, c: number) => Promise<unknown> }).dumpHotJitBlocks;
+    if (typeof fn !== "function") {
+        return { available: false, note: "dumpHotJitBlocks unavailable (diagnostics-commands not loaded)" };
+    }
+    const rows = (await fn(ms, intervalMs, 99_999)) as (Array<{ wasm_fn: string; phys_addr: string; samples: number; pct: string; module: string }> & { topEips?: Array<{ eip: string; samples: number; pct: string; module: string }> }) | undefined;
+    if (!rows || !Array.isArray(rows) || rows.length === 0) {
+        return {
+            available: false,
+            note: "no rows: the JIT cache is empty or v86's snapshot exports are missing (rebuild vendor/v86). "
+                + "Guest attribution is UNAVAILABLE — the wasm-function[N] -> guest-address mapping is established by sampling and is never computed.",
+        };
+    }
+    const withSamples = rows.filter((r) => (r.samples ?? 0) > 0);
+    return {
+        available: true,
+        weighting: "TIME-weighted (EIP samples): where the guest was when we looked. Sensitive to CPU contention.",
+        runningSamples: withSamples.reduce((s, r) => s + r.samples, 0),
+        rows: withSamples
+            .sort((a, b) => b.samples - a.samples)
+            .slice(0, top)
+            .map((r) => ({ block: r.wasm_fn, module: r.module || r.phys_addr, samples: r.samples, pct: r.pct })),
+        topEips: (rows.topEips ?? []).slice(0, top).map((e) => ({ eip: e.eip, module: e.module, samples: e.samples, pct: e.pct })),
+    };
+}
+
+type TraceExports = Record<string, (...a: number[]) => number>;
+
+/** A census is only a measurement if THIS process zeroed the recorder and knows when. The
+ *  window is owned here rather than inferred, because a disarmed recorder still answers
+ *  trace2_block_snapshot() with whatever it last held — a frozen ranking that reads as live. */
+type CountedWindow = {
+    armedAtMs: number;
+    presentSerialBegin: number | null;
+    watchedPages: number;
+    /** Split, because a REQUESTED page is usually not tier-2: charging it to tier-2 coverage
+     *  makes `tier2Total - watched` non-positive and silences the selection warning while most
+     *  of the tier-2 set is in fact uninstrumented. */
+    watchedRequested: number;
+    watchedTier2: number;
+    tier2Total: number;
+    requestedPages: number;
+    /** Requested pages that got no slot (table full) or that v86 refused. */
+    requestedDropped: string[];
+    armedRequested: string[];
+    /** Retired guest instructions over the window, accumulated by the ticker below. */
+    retired: RetiredAccumulator;
+};
+
+/**
+ * The DENOMINATOR the counted channel could not previously state. trace2 only instruments
+ * the armed pages, so a `sharePct` is a share of an arbitrary subset — the difference between
+ * that and a share of all guest work was an unbounded caveat in prose. `cpu.instruction_counter`
+ * counts every retired instruction, in the SAME unit trace2 weights blocks by, so the two
+ * divide into a measured coverage figure.
+ *
+ * It is a 32-bit counter that wraps (~17s at full guest speed), so the window is accumulated
+ * from periodic deltas rather than from one end-to-end subtraction — a single subtraction
+ * across a wrap yields a plausible small number, which is exactly the failure this project
+ * keeps rediscovering.
+ */
+export type RetiredAccumulator = {
+    total: number; last: number; timer: number | null; wraps: number; read: () => number | null;
+};
+
+/** Wrap-safe delta of the 32-bit retired-instruction counter. A plain `now - prev` across a
+ *  wrap yields a large NEGATIVE number, and clamping it to 0 would silently drop ~4.3e9
+ *  instructions from a denominator — a plausible answer to the wrong question. */
+export function retiredDelta(prev: number, now: number): number {
+    const d = now - prev;
+    return d < 0 ? d + 0x1_0000_0000 : d;
+}
+
+const readInsnCounter = (): number | null => {
+    const c = cpu() as { instruction_counter?: Int32Array } | null;
+    return c?.instruction_counter ? c.instruction_counter[0] >>> 0 : null;
+};
+
+export function startRetiredAccumulator(read: () => number | null = readInsnCounter): RetiredAccumulator {
+    const acc: RetiredAccumulator = { total: 0, last: read() ?? 0, timer: null, wraps: 0, read };
+    // 1s is far inside the wrap period (~17s at full guest speed), so no single delta can
+    // span two wraps.
+    acc.timer = setInterval(() => peekRetiredTotal(acc), 1000) as unknown as number;
+    return acc;
+}
+
+/** Fold the counter's current value in and return the running total, leaving the ticker
+ *  RUNNING. A read against a still-armed window must not stop it: with the ticker dead the
+ *  next read has only one end-to-end subtraction to work from, which is exactly the
+ *  wrap-unsafe number this accumulator exists to replace. */
+export function peekRetiredTotal(acc: RetiredAccumulator): number {
+    const now = acc.read();
+    if (now !== null) {
+        if (now < acc.last) acc.wraps++;
+        acc.total += retiredDelta(acc.last, now);
+        acc.last = now;
+    }
+    return acc.total;
+}
+
+export function stopRetiredAccumulator(acc: RetiredAccumulator): number {
+    const total = peekRetiredTotal(acc);
+    if (acc.timer !== null) { clearInterval(acc.timer); acc.timer = null; }
+    return total;
+}
+
+let countedWindow: CountedWindow | null = null;
+/** Ranges the ARMED window covers, so `phase:'read'` rolls up against exactly the spans
+ *  whose pages `phase:'arm'` guaranteed a slot to. */
+let countedRanges: { resolved: ResolvedRange[]; unresolved: string[] } = { resolved: [], unresolved: [] };
+
+const traceExports = (): TraceExports | undefined =>
+    (globalThis as { preemption?: { getWasmExports?: () => TraceExports | null } }).preemption?.getWasmExports?.() ?? undefined;
+
+type ArmResult = { ok: true; window: CountedWindow } | { ok: false; reason: string };
+
+/**
+ * Zero the recorder, then instrument pages. `trace2_reset` is the only zeroing primitive
+ * (it clears BLOCK_EXEC_COUNTS and de-instruments), and `trace2_watch_page` is what flips
+ * ENABLED — so arming after resetting is the only order that yields a known-empty,
+ * known-recording census.
+ *
+ * `requested` pages are armed FIRST so a named suspect is never crowded out. The remaining
+ * pages come from `jit_get_tier2_page_at`, which is address-sorted for reproducibility. With
+ * more than 64 active pages the census is therefore deterministic but biased toward lower
+ * addresses, not a frequency-ranked sample; `coverage` reports that limitation.
+ */
+function armCountedRecorder(render: RenderLike | undefined, maxPages: number, requested: number[]): ArmResult {
+    const w = traceExports();
+    if (!w?.trace2_reset || !w?.trace2_watch_page || !w?.trace2_enabled) {
+        return { ok: false, reason: "trace2 control exports missing — rebuild vendor/v86 (build-wasm.sh)" };
+    }
+    if (!w.jit_get_tier2_page_at || !w.jit_get_tier2_page_count) {
+        return { ok: false, reason: "tier2 page-enumeration exports missing — rebuild vendor/v86 (build-wasm.sh)" };
+    }
+    w.trace2_reset();
+    let watched = 0;
+    let watchedRequested = 0;
+    let watchedTier2 = 0;
+    const armedRequested: string[] = [];
+    const requestedDropped: string[] = [];
+    for (const addr of requested) {
+        const page = "0x" + ((addr >>> 0) & ~0xfff).toString(16);
+        // A page the caller NAMED and did not get is the difference between "did not run" and
+        // "was never watched", so it is recorded rather than dropped on the floor.
+        if (watched >= maxPages) { requestedDropped.push(page); continue; }
+        if (w.trace2_watch_page(addr >>> 0) >>> 0) { watched++; watchedRequested++; armedRequested.push(page); }
+        else requestedDropped.push(page);
+    }
+    const tier2Total = w.jit_get_tier2_page_count() >>> 0;
+    for (let i = 0; i < tier2Total && watched < maxPages; i++) {
+        const addr = w.jit_get_tier2_page_at(i) >>> 0;
+        if (!addr) break;
+        if (w.trace2_watch_page(addr) >>> 0) { watched++; watchedTier2++; }
+    }
+    if (watched === 0) {
+        return {
+            ok: false,
+            reason: `armed 0 pages (${tier2Total} tier-2 pages exist): the recorder only instruments tier-2-promoted pages, so `
+                + "a cold or freshly-cleared JIT has nothing to record. Let the title run a few seconds of the behaviour you "
+                + "want attributed, THEN call this — or name the pages you care about with {pages:[addr,…]}.",
+        };
+    }
+    if ((w.trace2_enabled() >>> 0) !== 1) {
+        return { ok: false, reason: `watched ${watched} pages but trace2_enabled()==0 — the recorder did not start; census would be stale` };
+    }
+    return {
+        ok: true,
+        window: {
+            armedAtMs: performance.now(), presentSerialBegin: render?.getPresentSerial?.() ?? null,
+            watchedPages: watched, watchedRequested, watchedTier2,
+            tier2Total, requestedPages: requested.length, requestedDropped, armedRequested,
+            retired: startRetiredAccumulator(),
+        },
+    };
+}
+
+function disarmCountedRecorder(): boolean {
+    const w = traceExports();
+    if (!w?.trace2_unwatch_all) return false;
+    w.trace2_unwatch_all();   // stops recording + de-instruments; keeps the counters we just read
+    return true;
+}
+
+/** End the window: the retired-instruction ticker belongs to it, so it stops HERE and nowhere
+ *  else — a read leaves it running (see peekRetiredTotal). */
+function tearDownCountedWindow(): void {
+    if (countedWindow) stopRetiredAccumulator(countedWindow.retired);
+    disarmCountedRecorder();
+    countedWindow = null;
+    countedRanges = { resolved: [], unresolved: [] };
+}
+
+type CountedBlocks = {
+    available: boolean;
+    note?: string;
+    weighting?: string;
+    window?: Record<string, unknown>;
+    blocks?: number;
+    totalWeightedIns?: number;
+    saturated?: string[];
+    retiredIns?: number;
+    countedCoveragePct?: number | null;
+    rows?: Array<{ addr: string; module: string | null; exec: number; ins: number; weightedIns: number; sharePct: number; kind: string }>;
+    ranges?: CountedRanges;
+};
+
+/** A named guest address span to roll counted blocks into. `from`/`to` accept a raw address
+ *  or `module+0xRVA`; `to` is exclusive. */
+export type GuestRangeSpec = { name: string; from: number | string; to: number | string };
+
+export type ResolvedRange = { name: string; from: number; to: number };
+
+type CountedRanges = {
+    rows: Array<{ name: string; from: string; to: string; blocks: number; exec: number; weightedIns: number; sharePct: number; sharePctOfGuest: number | null }>;
+    /** Counted work that fell in none of the named ranges — present so a share reads as a
+     *  share of a whole rather than of an unstated remainder. */
+    unattributed: { weightedIns: number; sharePct: number };
+    unresolved?: string[];
+    /** Ranges an EARLIER range overlaps. First-match-wins means their rows are charged short —
+     *  possibly to 0 — which is indistinguishable from "did not run" unless it is said here. */
+    shadowed?: string[];
+    note: string;
+};
+
+/** Resolve `module+0xRVA` (or a raw address) against the LIVE module registry. */
+function resolveGuestAddr(spec: number | string): number | null {
+    if (typeof spec === "number") return spec >>> 0;
+    const s = String(spec).trim();
+    const plus = s.indexOf("+");
+    if (plus > 0) {
+        // Extension kept: getByName deliberately refuses to answer "hl.dll" with the main EXE,
+        // and stripping it resolves the range against the wrong image — whose blocks then read
+        // as 0, i.e. "did not run", for code that ran.
+        const name = s.slice(0, plus).trim();
+        const mreg = (sys().process as { moduleRegistry?: { getByName?: (n: string) => { baseAddress: number } | null | undefined } } | null)?.moduleRegistry;
+        const mod = mreg?.getByName?.(name);
+        if (!mod) return null;
+        const rvaStr = s.slice(plus + 1).trim();
+        const rva = rvaStr.startsWith("0x") || rvaStr.startsWith("0X") ? Number.parseInt(rvaStr.slice(2), 16) : Number.parseInt(rvaStr, 16);
+        if (!Number.isFinite(rva)) return null;
+        return (mod.baseAddress + rva) >>> 0;
+    }
+    const v = s.startsWith("0x") || s.startsWith("0X") ? Number.parseInt(s.slice(2), 16) : Number.parseInt(s, 16);
+    return Number.isFinite(v) ? v >>> 0 : null;
+}
+
+function resolveRanges(specs: GuestRangeSpec[]): { resolved: ResolvedRange[]; unresolved: string[] } {
+    const resolved: ResolvedRange[] = [];
+    const unresolved: string[] = [];
+    for (const s of specs) {
+        const from = resolveGuestAddr(s.from);
+        const to = resolveGuestAddr(s.to);
+        if (from === null || to === null || to <= from) { unresolved.push(`${s.name} (${s.from}..${s.to})`); continue; }
+        resolved.push({ name: s.name, from, to });
+    }
+    return { resolved, unresolved };
+}
+
+/** Every 4 KiB page any resolved range touches — armed first so a named suspect is never
+ *  crowded out of v86's 64-entry watch table by an unrelated tier-2 page. The table is still
+ *  64 entries: ranges spanning more than that lose the surplus, which the window reports as
+ *  `requestedPagesDropped` rather than leaving it to read as "did not run". */
+export function pagesForRanges(ranges: ResolvedRange[]): number[] {
+    const pages = new Set<number>();
+    for (const r of ranges) for (let p = r.from & ~0xfff; p < r.to; p += 0x1000) pages.add(p >>> 0);
+    return [...pages];
+}
+
+export type CountedBlockSample = { addr: number; exec: number; ins: number };
+
+/**
+ * Sum counted blocks into named spans. Pure, so the attribution rule below is testable
+ * without a live guest.
+ *
+ * A block is attributed by its ENTRY address: trace2 counts a block once, at entry, so the
+ * entry is the only address whose count is defined. A block entered before a range and
+ * running into it is therefore charged OUTSIDE it — which under-, never over-, states a
+ * range. First matching range wins, so overlapping spans never double-count.
+ */
+export function rollUpRanges(
+    blocks: CountedBlockSample[],
+    ranges: ResolvedRange[],
+    total: number,
+    retiredIns: number,
+    unresolvedRanges: string[] = [],
+): CountedRanges {
+    const acc = ranges.map((r) => ({ ...r, blocks: 0, exec: 0, weightedIns: 0 }));
+    // First-match-wins is what stops overlaps double-counting, but it also charges a shadowed
+    // range short — to 0 when the overlap is total. That is byte-identical to "never ran", so
+    // it has to be named rather than inferred from the caller remembering its own ordering.
+    const shadowed = ranges
+        .filter((r, i) => ranges.slice(0, i).some((e) => e.from < r.to && r.from < e.to))
+        .map((r) => r.name);
+    let attributed = 0;
+    for (const b of blocks) {
+        const weighted = b.exec * b.ins;
+        for (const a of acc) {
+            if (b.addr >= a.from && b.addr < a.to) { a.blocks++; a.exec += b.exec; a.weightedIns += weighted; attributed += weighted; break; }
+        }
+    }
+    return {
+        rows: acc.map((a) => ({
+            name: a.name,
+            from: "0x" + a.from.toString(16),
+            to: "0x" + a.to.toString(16),
+            blocks: a.blocks,
+            exec: a.exec,
+            weightedIns: a.weightedIns,
+            sharePct: total > 0 ? Math.round((a.weightedIns / total) * 1000) / 10 : 0,
+            sharePctOfGuest: retiredIns > 0 ? Math.round((a.weightedIns / retiredIns) * 1000) / 10 : null,
+        })),
+        unattributed: {
+            weightedIns: total - attributed,
+            sharePct: total > 0 ? Math.round(((total - attributed) / total) * 1000) / 10 : 0,
+        },
+        ...(unresolvedRanges.length ? { unresolved: unresolvedRanges } : {}),
+        ...(shadowed.length ? { shadowed } : {}),
+        note: "sharePct is of the COUNTED total (the armed pages); sharePctOfGuest divides by the CPU's own retired-instruction "
+            + "counter over the same window, which is the share of ALL guest work and the number a go/no-go should quote. "
+            + "A range with blocks:0 either did not execute or sits on a page that was not armed; ranges arm their own "
+            + "pages first, so with no selectionWarning and requestedPagesDropped:0 above, blocks:0 means it did not run — "
+            + "UNLESS the range is listed in `shadowed`, where an earlier range took its blocks and 0 means nothing at all.",
+    };
+}
+
+/**
+ * trace2's per-block census ranked by `exec * instructions` — retired guest instructions per
+ * block, which is the share of guest work a block owns. Count-weighted, so it is immune to the
+ * CPU contention that makes every timing on a busy machine untrustworthy.
+ *
+ * REFUSES rather than reporting a ranking it cannot date: without a window this process armed
+ * (`countedWindow`) the counters may predate anything the caller did, and without
+ * `trace2_enabled()` still set at read time the window ended early. Both failure modes look
+ * exactly like a valid answer in the numbers alone, so they are checked, never assumed.
+ */
+function countedGuestBlocks(top: number, window: CountedWindow | null, render: RenderLike | undefined, ranges: ResolvedRange[] = [], unresolvedRanges: string[] = []): CountedBlocks {
+    const w = traceExports();
+    if (!w?.trace2_block_snapshot) {
+        return { available: false, note: "trace2 snapshot exports missing — rebuild vendor/v86 (build-wasm.sh)" };
+    }
+    if (!window) {
+        return {
+            available: false,
+            note: "REFUSED: no window this call armed. The recorder answers a snapshot request whether or not it is recording, "
+                + "so counts without a known zero point are not a measurement. Use guestBlocks() (arms, waits, reads) or the "
+                + "explicit pair guestBlocks({phase:'arm'}) -> drive the scene -> guestBlocks({phase:'read'}).",
+        };
+    }
+    const stillRecording = w.trace2_enabled ? (w.trace2_enabled() >>> 0) === 1 : false;
+    const watchedNow = w.trace2_watched_page_count ? w.trace2_watched_page_count() >>> 0 : -1;
+    if (!stillRecording) {
+        stopRetiredAccumulator(window.retired);
+        return {
+            available: false,
+            note: `REFUSED: recorder is disarmed at read time (trace2_enabled=0, watched=${watchedNow}) — something reset or `
+                + "unwatched it mid-window (dbg.trace2Reset/trace2UnwatchAll, jitRegions, or a game switch), so these counts "
+                + "cover an unknown prefix of the window rather than the window.",
+            window: { ...window, disarmedMidWindow: true },
+        };
+    }
+    const n = w.trace2_block_snapshot() >>> 0;
+    const retiredIns = peekRetiredTotal(window.retired);
+    const readAtMs = performance.now();
+    const presentSerialEnd = render?.getPresentSerial?.() ?? null;
+    // Tier-2 coverage is measured against the pages armed FROM the tier-2 set only. Counting
+    // the caller's requested pages here (they are usually not tier-2) hides a census that
+    // instrumented almost none of it behind a non-positive difference.
+    const uncovered = Math.max(0, window.tier2Total - window.watchedTier2);
+    const windowOut = {
+        armedAtMs: Math.round(window.armedAtMs),
+        readAtMs: Math.round(readAtMs),
+        elapsedMs: Math.round(readAtMs - window.armedAtMs),
+        presents: presentSerialEnd !== null && window.presentSerialBegin !== null ? presentSerialEnd - window.presentSerialBegin : null,
+        presentSerialBegin: window.presentSerialBegin,
+        presentSerialEnd,
+        watchedPages: window.watchedPages,
+        watchedRequestedPages: window.watchedRequested,
+        watchedTier2Pages: window.watchedTier2,
+        watchedPagesNow: watchedNow,
+        retiredIns,
+        ...(window.retired.wraps ? { retiredCounterWraps: window.retired.wraps } : {}),
+        tier2Total: window.tier2Total,
+        tier2PagesUnwatched: uncovered,
+        requestedPages: window.requestedPages,
+        armedRequestedPages: window.armedRequested,
+        requestedPagesDropped: window.requestedDropped.length,
+        ...(window.requestedDropped.length
+            ? {
+                requestedPagesDroppedWarning:
+                    `${window.requestedDropped.length} of ${window.requestedPages} REQUESTED page(s) were never armed `
+                    + `(${window.requestedDropped.slice(0, 8).join(", ")}${window.requestedDropped.length > 8 ? ", …" : ""}) — `
+                    + "v86's watch table holds 64. Anything on them, INCLUDING a named range, is absent from this census: "
+                    + "`blocks: 0` for such a range means 'never instrumented', not 'did not run'. Ask for fewer pages.",
+                requestedPagesDroppedList: window.requestedDropped,
+            }
+            : {}),
+        zeroedByThisCall: true,
+        slotOverflow: w.trace2_slot_overflow ? w.trace2_slot_overflow() >>> 0 : null,
+        coverage: `only the ${window.watchedPages} armed page(s) are counted; guest work anywhere else (interpreted code, `
+            + "tier-1-only pages, pages promoted DURING the window) is absent, not zero. Shares are of the COUNTED total, "
+            + "never of all guest instructions.",
+        // The recorder holds 64 pages. Enumeration is address-sorted and reproducible, but
+        // past 64 pages the selected prefix is not a hotness sample; absence still says only
+        // "not armed", never "cold".
+        ...(uncovered > 0
+            ? {
+                selectionWarning:
+                    `${uncovered} of ${window.tier2Total} tier-2 pages could NOT be armed (v86's watch table holds 64). `
+                    + "The armed automatic subset is the lowest-address prefix, not the hottest pages. Consequences: "
+                    + "(1) a `sharePct` here is a share of this address-selected subset, so it can be several times the block's share of all guest work; (2) a block's "
+                    + "ABSENCE is not evidence that it is cold; (3) the ranking is not reproducible across boots. To ask about "
+                    + "specific code, name it: guestBlocks({pages:[0x…]}) arms those pages first and lists them in "
+                    + "armedRequestedPages.",
+            }
+            : {}),
+    };
+    if (n === 0) {
+        return {
+            available: false,
+            note: "recorder was armed and recording but observed 0 blocks: the armed pages did not execute during the window "
+                + "(wrong scene, or the JIT re-promoted different pages after arming). Not a ranking — nothing ran.",
+            window: windowOut,
+        };
+    }
+    const kinds = ["normal", "cond", "indirect", "exit"];
+    const mreg = (sys().process as { moduleRegistry?: { getModuleContainingAddress?: (a: number) => { name: string; baseAddress: number } | null } } | null)?.moduleRegistry;
+    const rows: NonNullable<CountedBlocks["rows"]> = [];
+    const saturated: string[] = [];
+    let total = 0;
+    for (let i = 0; i < n; i++) {
+        const addr = w.trace2_block_addr(i) >>> 0;
+        const exec = w.trace2_block_exec(i) >>> 0;
+        const ins = w.trace2_block_instructions(i) >>> 0;
+        // trace2_block_exec SATURATES at u32::MAX rather than wrapping: a pegged counter is an
+        // under-count of unknown size, so it is named instead of silently ranked.
+        if (exec === 0xffffffff) saturated.push("0x" + addr.toString(16));
+        const weightedIns = exec * ins;
+        total += weightedIns;
+        let module: string | null = null;
+        try {
+            const mod = mreg?.getModuleContainingAddress?.(addr);
+            if (mod) module = `${mod.name}+0x${(addr - mod.baseAddress).toString(16)}`;
+        } catch { /* unmapped address: report the raw one */ }
+        rows.push({ addr: "0x" + addr.toString(16), module, exec, ins, weightedIns, sharePct: 0, kind: kinds[w.trace2_block_kind(i) >>> 0] ?? "?" });
+    }
+    rows.sort((a, b) => b.weightedIns - a.weightedIns);
+    for (const r of rows) r.sharePct = total > 0 ? Math.round((r.weightedIns / total) * 1000) / 10 : 0;
+
+    // The roll-up exists because a top-N ranking structurally CANNOT size a function: a
+    // 1.6 KB inner loop is a dozen blocks, each individually below the cut, and their sum
+    // is the only number that answers "how much is this function worth".
+    let rangesOut: CountedRanges | undefined;
+    if (ranges.length || unresolvedRanges.length) {
+        const observed: CountedBlockSample[] = [];
+        for (let i = 0; i < n; i++) {
+            observed.push({ addr: w.trace2_block_addr(i) >>> 0, exec: w.trace2_block_exec(i) >>> 0, ins: w.trace2_block_instructions(i) >>> 0 });
+        }
+        rangesOut = rollUpRanges(observed, ranges, total, retiredIns, unresolvedRanges);
+    }
+
+    return {
+        available: true,
+        weighting: "COUNT-weighted (exec x static instructions = retired guest instructions): survives a noisy machine because it never looks at time.",
+        window: windowOut,
+        blocks: n,
+        totalWeightedIns: total,
+        retiredIns,
+        // What fraction of all retired guest instructions this census actually saw. Without it a
+        // sharePct is a share of an unstated subset; with it the subset has a measured size, and
+        // a value near or above 100 is the census contradicting itself rather than a good result.
+        countedCoveragePct: retiredIns > 0 ? Math.round((total / retiredIns) * 1000) / 10 : null,
+        ...(saturated.length ? { saturated } : {}),
+        rows: rows.slice(0, top),
+        ...(rangesOut ? { ranges: rangesOut } : {}),
+    };
+}
+
+/** The two channels answer different questions; when their top guest block differs that is a
+ *  finding (time in few instructions = a slow op or a cache miss; instructions with little
+ *  time = a cheap hot loop), so it is reported rather than reconciled. */
+function crossCheckGuestChannels(sampled: SampledBlocks, counted: CountedBlocks) {
+    if (!sampled.available || !counted.available) {
+        return {
+            comparable: false,
+            note: `only ${sampled.available ? "the time-weighted" : counted.available ? "the count-weighted" : "neither"} channel produced data`,
+        };
+    }
+    const topSampledModule = sampled.topEips?.[0]?.module || sampled.rows?.[0]?.module || null;
+    const topCountedModule = counted.rows?.[0]?.module ?? null;
+    const sameModule = !!topSampledModule && !!topCountedModule
+        && topSampledModule.split("+")[0] === topCountedModule.split("+")[0];
+    return {
+        comparable: true,
+        topTimeWeighted: topSampledModule,
+        topCountWeighted: topCountedModule,
+        sameModule,
+        note: sameModule
+            ? "both channels point at the same module — the ranking is not an artifact of either weighting"
+            : "channels DISAGREE on the hottest module: time-weighted vs count-weighted are different questions "
+              + "(few instructions costing much time vs many cheap instructions). Do not conclude 'the JIT is fine' from one axis.",
+    };
+}
+
+type FrameWindowOptions = {
+    budgetMs?: number; refreshMs?: number; top?: number; maxBuckets?: number; captureOverMs?: number;
+};
+
+/**
+ * Arm a frame-timing window: frame profiler, flip cadence and the counter baseline all
+ * start here. Split out of `frameReport` because `measureWindow` must open and close the
+ * SAME window rather than a second definition of one.
+ */
+function armFrameWindow(opts: FrameWindowOptions): Record<string, unknown> {
+    const render = sys().services?.render as RenderLike | undefined;
+    // Arm the classifier at the budget so it sees EVERY over-budget frame, not just
+    // the ones past the (30fps-shaped) capture threshold.
+    //
+    // classifyOverMs alone only widens which captured frames get coalesced; a frame
+    // below captureThresholdMs is never captured, so it cannot be classified at any
+    // budget. That is what the coverage note means when it says to "re-arm with
+    // captureOverMs" — without this pass-through the report asks for something the
+    // harness could not do, and a title whose misses are all just over a 16.7ms
+    // budget reports 0 classes while losing seconds per minute.
+    if (opts.budgetMs && opts.budgetMs > 0) frameProfiler.configureCapture({ classifyOverMs: opts.budgetMs });
+    if (opts.captureOverMs && opts.captureOverMs > 0) {
+        frameProfiler.configureCapture({
+            captureOverMs: opts.captureOverMs,
+            classifyOverMs: opts.budgetMs && opts.budgetMs > 0 ? opts.budgetMs : opts.captureOverMs,
+        });
+    }
+    frameProfiler.setEnabled(true);
+    frameProfiler.reset();
+    profiler.setEnabled(true);
+    profiler.reset();
+    render?.resetFlipCadence?.();
+    windowBaseline = snapshotCounters(render);
+    mark(WINDOW_BEGIN_MARK);
+    return {
+        armed: true,
+        join: joinInfo(render, windowBaseline, null),
+        note: "window armed: frame profiler, flip cadence and counter baseline all start here. "
+            + "Take a Chrome trace across this window for the deep depth (GC / stacks / guest blocks).",
+    };
+}
+
+/** Close the window armed by `armFrameWindow` and report it. */
+function readFrameWindow(opts: FrameWindowOptions): Record<string, unknown> {
+    const render = sys().services?.render as RenderLike | undefined;
+    const tail = frameProfiler.getTail({ budgetMs: opts.budgetMs, maxBuckets: opts.maxBuckets });
+    const budgetMs = opts.budgetMs ?? (tail.ok && tail.budget ? tail.budget.ms : undefined);
+    const spikes = frameProfiler.getSpikeClasses({ budgetMs, top: opts.top ?? 8 });
+    const now = snapshotCounters(render);
+    mark(WINDOW_END_MARK);
+
+    const presentFrames = frameProfiler.getPresentFrameCount();
+    const markFrames = frameProfiler.getMarkFrameCount();
+    return {
+        boundary: {
+            tail: "present (RenderService.notifyPresent — the same event as the bottleship.flip trace mark and getFlipCadence)",
+            spikes: "markFrame (presenter-labelled; ddraw Flip's frameAlreadyMarked can skip it)",
+            presentFrames,
+            markFrames,
+            agree: boundariesAgree(presentFrames, markFrames),
+            note: boundariesAgree(presentFrames, markFrames)
+                ? undefined
+                : "the two frame boundaries saw different counts — spike-class coverage is relative to markFrame frames, "
+                  + "while the tail/budget verdict is relative to presents",
+        },
+        tail,
+        spikes: {
+            ...spikes,
+            drill: {
+                thunks: "perfThunks({filter}) — session-wide per-call cost; avgUs is the contention-robust figure, frame counts are not",
+                subPhases: "profilerStats({filter}) — named-bucket sub-phase timings (maxMs = worst single call)",
+                guestCode: "guestBlocks() — sampled (time-weighted) + trace2 (count-weighted) guest-block attribution",
+            },
+        },
+        counters: counterDelta(windowBaseline, now),
+        crossCheck: crossCheckFlipCadence(render, tail, opts.refreshMs ?? 16.67),
+        join: joinInfo(render, windowBaseline, now),
+        blindSpots: LIVE_BLIND_SPOTS,
     };
 }
 
@@ -107,16 +954,725 @@ export function registerPerfCommands(svc: HarnessService): void {
         };
     });
 
-    /** perfStats() — latest + average frame sample (no per-frame thunk detail). */
+    /** perfThunks({top?=20, filter?}) — session-wide per-thunk cost (totalMs, avgUs,
+     *  msPerFrame, share of the thunk slice), accumulated over every profiled frame
+     *  rather than the 5-frame worst-frame ring. The instrument for an A/B on ONE
+     *  thunk's cost: per-call figures survive CPU contention that makes FPS useless.
+     *  `noBorrowMs`/`noBorrowAvgUs` isolate the calls that never took a plain guest-memory
+     *  view — a big, slow noBorrow row is the signature of a leaf indexing v86's Proxy
+     *  per element (guest-memory.ts), the ~140x class. Heuristic, not proof: sync thunks
+     *  only, and one Mem.read* anywhere in the call clears the flag — it under-reports
+     *  rather than cries wolf. Confirm a suspect with `dbg.memProxyBench` (A/B both arms in
+     *  one session) and price the loop with `dbg.memBench` (ns per Proxy access here).
+     *
+     *  There is no `reset` here: the session aggregates AND `sessionFrames` (the msPerFrame
+     *  divisor) are cleared together by frameProfiler.reset(), i.e. by perfProfile({reset:true}),
+     *  which is how a window is opened. An ignored option would report the whole session under
+     *  a name that promised a window, so unknown keys are refused. */
+    svc.register("perfThunks", (args) => {
+        const opts = (args[0] ?? {}) as { top?: number; filter?: string };
+        const unknown = Object.keys(opts).filter((k) => k !== "top" && k !== "filter");
+        if (unknown.length > 0) {
+            throw new HarnessError(
+                `perfThunks: unknown option(s) ${unknown.map((k) => `'${k}'`).join(", ")} — takes only {top, filter}`
+                + (unknown.includes("reset") ? "; window it with perfProfile({reset:true}) before the drive" : ""),
+                HarnessErrorCode.BAD_ARGS);
+        }
+        return frameProfiler.getThunkReport(opts.top ?? 20, opts.filter);
+    });
+
+    /**
+     * slowPathThunks({enable?, reset?, top?=20}) — per-thunk hit counts for the
+     * dispatcher's SLOW path (_handlePortWriteSlow), i.e. every call with no fast-path
+     * or Tier-0 write-buffer registration. This is the COUNT-based instrument for
+     * "which thunk should get a fast path next", and the honest before/after for one:
+     * `perfThunks` prices fast-pathed and slow-pathed calls alike, so a registration
+     * shows up there as a cost change (noise-prone) but here as a hit count that must
+     * go to ZERO.
+     *
+     * `enabled` is reported so a zero-row answer cannot be misread as "nothing hit the
+     * slow path" when collection was simply never armed — the counting costs one
+     * Map.set per slow-path call and is off by default.
+     *
+     * Flow: slowPathThunks({enable:true, reset:true}) → drive → slowPathThunks().
+     */
+    svc.register("slowPathThunks", (args) => {
+        const opts = (args[0] ?? {}) as { enable?: boolean; reset?: boolean; top?: number };
+        const d: any = proc()?.dispatcher;
+        if (!d?.getSlowPathReport) {
+            return { available: false, reason: "no process / dispatcher lacks getSlowPathReport" };
+        }
+        if (opts.enable === true) d.enableSlowPathProfile?.();
+        else if (opts.enable === false) d.disableSlowPathProfile?.();
+        if (opts.reset) d.resetSlowPathStats?.();
+        const rows = d.getSlowPathReport() as Array<{ name: string; hits: number }>;
+        const total = rows.reduce((a, r) => a + r.hits, 0);
+        return {
+            available: true,
+            enabled: !!d.profileSlowPathEnabled,
+            total,
+            rows: rows.slice(0, opts.top ?? 20),
+        };
+    });
+
+    /** readbackStats({reset?}) — GPU→CPU surface readback accounting. Duration hides the
+     *  cost model; the honest metric is `roundTrips` (one full CPU/GPU serialisation each)
+     *  measured against `calls` (locks that wanted the pixels). `memoHits` counts the ones
+     *  the cpuSyncedVersion memo removed; `redundant` MUST be 0 — it means two readbacks of
+     *  the same surface at the same version both reached the GPU, i.e. the memo eroded.
+     *  Per-frame rate: readbackStats({reset:true}) → tickFrames(N) → readbackStats(). */
+    svc.register("readbackStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const snapshot = {
+            calls: readbackCounters.calls,
+            callsFromPrefetch: readbackCounters.callsFromPrefetch,
+            // Round trips a Lock STARTED. Zero here does NOT mean no Lock waited — pair it
+            // with readbackPrefetch().awaitedInflight, which counts the Locks that blocked
+            // on a prefetch already in flight.
+            roundTripsStartedByLock: readbackCounters.calls - readbackCounters.callsFromPrefetch,
+            roundTrips: readbackCounters.roundTrips,
+            // Of `roundTrips`: how many pulled the whole surface (the only kind that can
+            // memoise) versus a Lock's rect. `pixelsAvoided` is the saving the box buys;
+            // partialRoundTrips>0 with pixelsAvoided≈0 means the rects cover the surface
+            // anyway and the box is buying nothing.
+            fullRoundTrips: readbackCounters.fullRoundTrips,
+            partialRoundTrips: readbackCounters.partialRoundTrips,
+            pixelsDownloaded: readbackCounters.pixelsDownloaded,
+            pixelsAvoided: readbackCounters.pixelsAvoided,
+            memoHits: readbackCounters.memoHits,
+            scratchHits: readbackCounters.scratchHits,
+            redundant: readbackCounters.redundant,
+        };
+        if (opts.reset) readbackCounters.reset();
+        return snapshot;
+    });
+
+    /** d3d8LockStats({reset?}) — the D3D8 LockRect census, recorded at the decision point.
+     *  `requestedPixels/surfacePixels` is the ceiling on what scoping the download to the
+     *  app's rect can save; equal totals mean the locks cover the surface anyway and the
+     *  box buys nothing. `locks: 0` while readbackStats counts round trips means this
+     *  census is not wired, which is a different statement from "no locks happened".
+     *  `discardStripped` counts the DISCARD locks that used to wipe a whole surface. */
+    svc.register("d3d8LockStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const c = d3d8LockCounters;
+        const snapshot = {
+            locks: c.locks,
+            renderSurfaceLocks: c.renderSurfaceLocks,
+            partialRectLocks: c.partialRectLocks,
+            readLocks: c.readLocks,
+            scopableLocks: c.scopableLocks,
+            requestedPixels: c.requestedPixels,
+            surfacePixels: c.surfacePixels,
+            requestedFraction: c.surfacePixels > 0
+                ? c.requestedPixels / c.surfacePixels
+                : null,
+            discardRequested: c.discardRequested,
+            discardStripped: c.discardStripped,
+            invalidCombos: c.invalidCombos,
+        };
+        if (opts.reset) c.reset();
+        return snapshot;
+    });
+
+    /** d3d9LockStats({reset?}) — the D3D9 LockRect census and what serving a lock cost.
+     *  `publishes` is the CPU→guest memcpy a lock needed because the CPU copy had moved;
+     *  `lockReadbacks` is the GPU round trip a lock of a renderable image needed. They price
+     *  very differently, so a single "locks got slower" number could not tell them apart.
+     *  `downloads: 0` while a game visibly reads its own frame means the readback is not
+     *  wired — a different statement from "nothing asked for one". */
+    svc.register("d3d9LockStats", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const c = d3d9LockCounters;
+        const r = d3d9ReadbackCounters;
+        const snapshot = {
+            locks: c.locks,
+            renderSurfaceLocks: c.renderSurfaceLocks,
+            partialRectLocks: c.partialRectLocks,
+            readLocks: c.readLocks,
+            requestedPixels: c.requestedPixels,
+            surfacePixels: c.surfacePixels,
+            requestedFraction: c.surfacePixels > 0 ? c.requestedPixels / c.surfacePixels : null,
+            discardRequested: c.discardRequested,
+            discardStripped: c.discardStripped,
+            invalidCombos: c.invalidCombos,
+            downloads: r.downloads,
+            downloadedPixels: r.downloadedPixels,
+            getRenderTargetData: r.getRenderTargetData,
+            lockReadbacks: r.lockReadbacks,
+            publishes: r.publishes,
+        };
+        if (opts.reset) { c.reset(); r.reset(); }
+        return snapshot;
+    });
+
+    /**
+     * readLockDivergence({reset?}) — how wrong would we be if a READONLY Lock were served
+     * from the CPU bytes we already hold, instead of paying the GPU→CPU round trip?
+     *
+     * Arm with setWorkerFlag('__noReadLockReadback', true): the Lock returns at once, the
+     * readback still runs, and when it lands the bytes we served are compared against it.
+     * `enabled:false` ⇒ nothing is served stale and every row below is a structural zero.
+     * Read `readbacksCompared` FIRST: `framesDiverged: 0` is evidence of agreement only
+     * when it is non-zero, and `comparisonsSkipped` counts the serves whose readback came
+     * back on a path that cannot compare (CPU slow path — RGBA, not surface format).
+     */
+    svc.register("readLockDivergence", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const snapshot = {
+            enabled: (globalThis as { __noReadLockReadback?: boolean }).__noReadLockReadback === true,
+            locksServedStale: readLockDivergenceCounters.locksServedStale,
+            readbacksCompared: readLockDivergenceCounters.readbacksCompared,
+            comparisonsSkipped: readLockDivergenceCounters.comparisonsSkipped,
+            framesDiverged: readLockDivergenceCounters.framesDiverged,
+            pixelsDiverged: readLockDivergenceCounters.pixelsDiverged,
+            maxChannelDelta: readLockDivergenceCounters.maxChannelDelta,
+        };
+        if (opts.reset) readLockDivergenceCounters.reset();
+        return snapshot;
+    });
+
+    /**
+     * bufferUploads({reset?}) — retained VB/IB upload census for D3D9 and D3D8.
+     *
+     * `amplification` is the number that matters: bytes uploaded per byte the guest actually
+     * wrote through Lock/Unlock. ~1 is healthy; a large value is the whole-buffer-per-lock
+     * defect, and it is invisible in fps until the frame is already lost to writeBuffer.
+     * null means no guest writes were seen in the window — read `observed` before believing
+     * any of it. Flow: bufferUploads({reset:true}) → tickFrames(N) → bufferUploads().
+     */
+    /** readbackPrefetch — is the endFrame prefetch actually hiding Lock readbacks?
+     *  `servedFresh` is the only success row; a window with started>0 and servedFresh=0
+     *  means the work was done and thrown away, and the skipped* rows name the gate. */
+    svc.register("readbackPrefetch", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        const snapshot = { ...prefetchCounters } as Record<string, unknown>;
+        delete snapshot.reset;
+        if (opts.reset) prefetchCounters.reset();
+        return snapshot;
+    });
+    svc.register("bufferUploads", (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean };
+        if (opts.reset) { resetBufferUploadCensus(); return getBufferUploadCensus(); }
+        return getBufferUploadCensus();
+    });
+
+    /**
+     * drawCost({enable?, reset?}) — per-draw CPU breakdown inside the ddraw draw handler
+     * (resolve / prepare / vconvert / ringup / submit / tail), off by default and zero-cost
+     * while off. `perfThunks` prices a draw thunk as one number; this says WHICH phase of it
+     * is expensive, which is the difference between "the guest draws a lot" and "our
+     * per-draw resolve work is the cost". Flow: drawCost({enable:true,reset:true}) →
+     * tickFrames(N) → drawCost().
+     */
+    svc.register("drawCost", (args) => {
+        const opts = (args[0] ?? {}) as { enable?: boolean; reset?: boolean };
+        if (opts.enable === true) drawCostProfiler.enable();
+        else if (opts.enable === false) drawCostProfiler.disable();
+        else if (opts.reset) drawCostProfiler.reset();
+        return { enabled: drawCostProfiler.isEnabled(), ...drawCostProfiler.report() };
+    });
+
+    /**
+     * lockCost({enable?, reset?}) — per-Lock/Unlock CPU breakdown inside the ddraw surface
+     * handlers, off by default and zero-cost while off. Same shape as `drawCost`, but rows
+     * are split by lock class (`write` / `read` / `other`) because a writable and a
+     * read-only Lock take different branches; `other` is conversion work reached from
+     * outside a Lock (the readback prefetch, Flip's GDI sync), so that row growing while
+     * the Lock rows shrink is what "moved off the critical path" looks like.
+     *
+     * Each phase carries its own `calls`: a phase that was never wired reads `calls: 0`,
+     * not a plausible zero. `perCallUs` is per phase entry; the class-level `perCallUs`
+     * and `msPerFrame` price the whole Lock+Unlock pair. `fastPixelStore` echoes whether
+     * the word-wide RGBA→native store is on, so an A/B window is self-labelling.
+     *
+     * Flow: lockCost({enable:true,reset:true}) → tickFrames(N) → lockCost().
+     */
+    svc.register("lockCost", (args) => {
+        const opts = (args[0] ?? {}) as { enable?: boolean; reset?: boolean };
+        if (opts.enable === true) lockCostProfiler.enable();
+        else if (opts.enable === false) lockCostProfiler.disable();
+        else if (opts.reset) lockCostProfiler.reset();
+        return { enabled: lockCostProfiler.isEnabled(), ...lockCostProfiler.report() };
+    });
+
+    /** perfStats() — latest + average frame sample, plus the frame-time TAIL summary.
+     *  `averageWindow` is how many frames `average` covers (not the same as sampleCount);
+     *  `spikesSeen` is the true count of capture-worthy frames (`spikeCount` is capped at the
+     *  worst-N ring capacity). Use `frameReport` for the full budget verdict + spike classes. */
     svc.register("perfStats", () => {
         const snap = frameProfiler.getSnapshot();
+        const tail = frameProfiler.getTail();
         return {
             enabled: snap.enabled,
             source: snap.source,
             sampleCount: snap.sampleCount,
+            averageWindow: snap.averageWindow,
             latest: summarizeSample(snap.latest),
             average: summarizeSample(snap.average),
             spikeCount: (snap.badFrames ?? []).length,
+            spikesSeen: snap.badFramesSeen ?? 0,
+            tail: tail.ok
+                ? {
+                    samples: tail.sampleCount, p50Ms: tail.p50Ms, p95Ms: tail.p95Ms, p99Ms: tail.p99Ms,
+                    maxMs: tail.maxMs, budget: tail.budget,
+                }
+                : { status: tail.status, note: tail.note },
+        };
+    });
+
+    /**
+     * frameReport({budgetMs?, refreshMs?=16.67, top?=8, reset?, maxBuckets?}) — the frame
+     * instrument. One report, two depths.
+     *
+     * SHALLOW (this verb, always-on, cheap):
+     *   - `tail`: fixed-bucket distribution over the window — p50/p95/p99 (UPPER BOUNDS, with
+     *     the bucket width they came from), max, and frames over BUDGET. The budget is yours or
+     *     is derived from the cadence the window observed; 16.7 is never assumed. A window that
+     *     was not really measured returns a STATE (`disabled` / `no-samples` /
+     *     `disarmed-mid-window` / `source-switched-mid-window`) and no percentiles at all.
+     *   - `spikes`: every budget-missing frame COALESCED into (dominant category x top
+     *     contributor) classes ranked by TOTAL MS LOST — 40 x 8ms beats one 120ms stall — each
+     *     with one representative frame in full for drilling. `coverage` says whether the
+     *     classes actually cover all over-budget frames.
+     *   - `counters`: window deltas for the axes that need no new counters — scheduler
+     *     round-trips, fastmem/JIT (generation bumps by source, deopt recompiles, thrash),
+     *     tier-2, code invalidations, hypercall total. Needs a baseline: `{reset:true}` first.
+     *   - `crossCheck`: the same window as read by the INDEPENDENT flip-cadence instrument.
+     *   - `blindSpots`: what this depth structurally cannot see, enumerated so nobody reads
+     *     "GC was not the cause" out of a tool that never looked.
+     *
+     * DEEP (trace): `join` carries the window identity as UserTiming marks, so a trace taken
+     * across the window can be sliced to exactly it. GC, JS-vs-wasm and v86-internal
+     * attribution live there; `guestBlocks` names the guest code.
+     *
+     * Flow: frameReport({reset:true, budgetMs:33.34}) -> play/tickFrames -> frameReport().
+     */
+    svc.register("frameReport", (args) => {
+        const opts = (args[0] ?? {}) as FrameWindowOptions & { reset?: boolean };
+        if (opts.reset) return armFrameWindow(opts);
+        return readFrameWindow(opts);
+    });
+
+    /**
+     * measureWindow({ms?=15000, budgetMs?, samples?, gapMs?}) — a frameReport window that
+     * brackets ITSELF with a scene probe.
+     *
+     * A timing window is void if the scene changed under it, and nothing inside the numbers
+     * says so: a race that ENDS mid-window leaves an animating results screen, so motion
+     * stays high and every percentile stays plausible. This verb probes before arming and
+     * again after reading, compares the two, and reports `usable:false` with the reason when
+     * they diverge — the report is still returned, labelled, rather than quietly quoted.
+     *
+     * The probes sit OUTSIDE the armed window (each is several screen captures), so they
+     * cost the measurement nothing.
+     */
+    svc.register("measureWindow", async (args) => {
+        const opts = (args[0] ?? {}) as {
+            ms?: number; budgetMs?: number; captureOverMs?: number; top?: number;
+            samples?: number; gapMs?: number;
+        };
+        const ms = Math.max(1000, Math.min(opts.ms ?? 15000, 120000));
+
+        let before: SceneProbe | null = null;
+        let after: SceneProbe | null = null;
+        let probeError: string | undefined;
+        try {
+            before = await probeScene({ samples: opts.samples, gapMs: opts.gapMs });
+        } catch (e) {
+            probeError = String((e as Error)?.message ?? e);
+        }
+
+        armFrameWindow(opts);
+        const t0 = performance.now();
+        await new Promise((r) => setTimeout(r, ms));
+        const elapsedMs = performance.now() - t0;
+        const report = readFrameWindow(opts);
+
+        if (before && !probeError) {
+            try {
+                after = await probeScene({ samples: opts.samples, gapMs: opts.gapMs });
+            } catch (e) {
+                probeError = String((e as Error)?.message ?? e);
+            }
+        }
+
+        const scene = before && after ? compareScenes(before, after) : null;
+        const usable = !!scene && scene.verdict !== "different-scene";
+        return {
+            usable,
+            reason: usable
+                ? undefined
+                : scene
+                    ? `the scene changed under the window (${scene.verdict}, distance ${scene.distance}) — these percentiles compare two different workloads`
+                    : `no scene probe (${probeError ?? "unavailable"}), so nothing checked that the window measured one workload`,
+            elapsedMs: +elapsedMs.toFixed(1),
+            scene,
+            sceneBefore: before,
+            sceneAfter: after,
+            report,
+        };
+    });
+
+    /**
+     * wbufTransport({on?, defer?, sites?, reset?}) — threaded-D3D9 P1: drain the WBUF ring from
+     * a COPY (`__wbufTransport`), the way a consumer on another worker would have to, and with
+     * `defer` (`__wbufDefer`) run the copied entries only at fences. Reports the
+     * drains and bytes that went through the copy and the guest-memory views the handlers still
+     * took inside them (each one a read that consumer could not make); `sites:true` samples
+     * where they come from. Runtime-switchable, so both arms run inside one boot.
+     */
+    svc.setVerbFence(() => {
+        (proc()?.dispatcher as { executeWbufQueue?: () => void } | undefined)?.executeWbufQueue?.();
+    });
+    svc.register("wbufTransport", (args) => {
+        const opts = (args[0] ?? {}) as { on?: boolean; defer?: boolean; sites?: boolean; reset?: boolean };
+        const dispatcher = proc()?.dispatcher as {
+            getWbufTransportStats?: (reset?: boolean) => Record<string, unknown>;
+            getWbufDeferStats?: (reset?: boolean) => Record<string, unknown>;
+            wbufTransportSites?: Map<string, number> | null;
+        } | undefined;
+        if (!dispatcher?.getWbufTransportStats) {
+            throw new HarnessError("wbufTransport: no dispatcher", HarnessErrorCode.NO_PROCESS);
+        }
+        const g = globalThis as { __wbufTransport?: boolean; __wbufDefer?: boolean };
+        if (opts.on !== undefined) g.__wbufTransport = !!opts.on;
+        if (opts.defer !== undefined) g.__wbufDefer = !!opts.defer;
+        const sites = dispatcher.wbufTransportSites;
+        const siteRows = sites
+            ? [...sites].sort((a, b) => b[1] - a[1]).slice(0, 40).map(([site, samples]) => ({ site, samples }))
+            : null;
+        if (opts.sites !== undefined) dispatcher.wbufTransportSites = opts.sites ? new Map() : null;
+        else if (opts.reset && sites) sites.clear();
+        return {
+            ...dispatcher.getWbufTransportStats(!!opts.reset),
+            defer: dispatcher.getWbufDeferStats?.(!!opts.reset) ?? null,
+            sites: siteRows,
+            note: siteRows ? "sites are sampled 1 in 16 borrows" : undefined,
+        };
+    });
+
+    /**
+     * d3d9Split({reset?, audit?, sites?}) — the split D3D9 call stream (`__d3d9Split`, boot-time):
+     * calls recorded / replayed, fences, DIVERGENCES (front and twin answered differently),
+     * calls the twin cannot perform yet, encode/replay errors, twin paths that reached the front,
+     * and the queue's guest-memory reads during replay. `audit:true` brings the twin current and
+     * compares its state with the front's getter by getter. Render worker only: `queries` is the
+     * front's query-result table (generations awaited / answered from the worker), `gpu` the
+     * worker device's lifecycle as the fronts see it; `loseWorkerDevice:true` loses that device
+     * through its real loss path first.
+     */
+    svc.register("d3d9Split", async (args) => {
+        const opts = (args[0] ?? {}) as { reset?: boolean; audit?: boolean; sites?: boolean; capture?: string; loseWorkerDevice?: boolean };
+        const split = await import("../../modules/d3d9/split");
+        const { devices } = await import("../../modules/d3d9/shared-state");
+        const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+        const client = getD3D9RenderClient();
+        const lostWorkerDevice = opts.loseWorkerDevice && client ? await client.request("loseDevice") : undefined;
+        // The front's side is read BEFORE awaiting the worker: the guest keeps recording across
+        // the await, and a later read counts calls the worker's answer cannot include. The flush
+        // ships what the front holds, so the answer (in stream order) covers every record counted.
+        split.d3d9SplitFlush();
+        const { emptyReplayStats } = await import("../../backends/webgpu/d3d9/split-replay");
+        const front = split.d3d9SplitStats(!!opts.reset, client ? emptyReplayStats() : undefined);
+        const report = client ? await client.request("stats", { reset: !!opts.reset }) as { replay?: SplitReplayStats | null } | null : null;
+        const stream = front && report?.replay ? { ...front, ...report.replay } : front;
+        const renderWorker = client
+            ? {
+                counters: { ...client.counters }, lastError: client.lastError, orphanFrames: client.orphanFrames,
+                screens: client.screenStats(), report,
+                queries: { ...client.queryResults.counters, outstanding: client.queryResults.outstanding() },
+                gpu: {
+                    status: client.gpuLifecycle.status(), generation: client.gpuLifecycle.generation(),
+                    losses: client.gpuLifecycle.losses, recreations: client.gpuLifecycle.recreations,
+                    forcedLoss: lostWorkerDevice,
+                },
+            }
+            : null;
+        let captured: string | null = null;
+        if (opts.capture && client) {
+            const png = await client.request("capture", { slot: 0 }) as Uint8Array | null;
+            if (png && png.length) {
+                const { bytesToBase64, debugDumpPath } = await import("./screen");
+                (self as unknown as Worker).postMessage({ type: "debug_png_dump", name: opts.capture, base64: bytesToBase64(png) });
+                captured = debugDumpPath(opts.capture);
+            }
+        }
+        const dispatcher = proc()?.dispatcher as {
+            getWbufDeferStats?: (reset?: boolean) => Record<string, unknown>;
+            wbufTransportSites?: Map<string, number> | null;
+        } | undefined;
+        const audit = opts.audit ? split.d3d9SplitAudit(devices.values()) : undefined;
+        const sites = dispatcher?.wbufTransportSites;
+        const siteRows = sites
+            ? [...sites].sort((a, b) => b[1] - a[1]).slice(0, 30).map(([site, samples]) => ({ site, samples }))
+            : null;
+        if (dispatcher && opts.sites !== undefined) dispatcher.wbufTransportSites = opts.sites ? new Map() : null;
+        else if (opts.reset && sites) sites.clear();
+        return {
+            wanted: split.d3d9SplitWanted(),
+            stream,
+            queue: dispatcher?.getWbufDeferStats?.(!!opts.reset) ?? null,
+            audit,
+            sites: siteRows,
+            renderWorker,
+            captured,
+        };
+    });
+
+    /**
+     * threadWork({ms?=10000}) — per guest thread, retired guest instructions and worker ms
+     * per presented frame over one window. Instructions do not depend on host speed, so they
+     * answer "whose work is it" where wall time cannot. Run it twice at different frame
+     * lengths (`__forcePresentInterval`): a thread whose instructions/frame stay put does
+     * per-frame work; one whose instructions/SECOND stay put is time-driven (a fixed-step
+     * sim, a timer callback, a mixer). `cpuMs` is wall time while the thread was current —
+     * it includes the thunks it called and idle spent parked while it was current.
+     */
+    svc.register("threadWork", async (args) => {
+        const opts = (args[0] ?? {}) as { ms?: number };
+        const ms = Math.max(500, Math.min(opts.ms ?? 10000, 120000));
+        const sched = sys().scheduler as any;
+        const render = sys().services?.render as RenderLike | undefined;
+        if (!sched?.getThreadRetiredInsns || !render?.getPresentSerial) {
+            throw new HarnessError("threadWork: no scheduler or render service", HarnessErrorCode.NO_PROCESS);
+        }
+        const read = () => ({
+            t: performance.now(), serial: render.getPresentSerial!(),
+            insns: sched.getThreadRetiredInsns() as Record<number, number>,
+            cpuMs: sched.getThreadCpuMs() as Record<number, number>,
+        });
+        const a = read();
+        await new Promise((r) => setTimeout(r, ms));
+        const b = read();
+        const frames = b.serial - a.serial;
+        const elapsedMs = b.t - a.t;
+        const ids = [...new Set([...Object.keys(a.insns), ...Object.keys(b.insns)])].map(Number).sort((x, y) => x - y);
+        let totalInsns = 0;
+        const threads = ids.map((id) => {
+            const insns = (b.insns[id] ?? 0) - (a.insns[id] ?? 0);
+            const cpuMs = (b.cpuMs[id] ?? 0) - (a.cpuMs[id] ?? 0);
+            totalInsns += insns;
+            return {
+                id, insns, cpuMs: +cpuMs.toFixed(2),
+                insnsPerSec: Math.round(insns * 1000 / elapsedMs),
+                insnsPerFrame: frames > 0 ? Math.round(insns / frames) : null,
+                cpuMsPerFrame: frames > 0 ? +(cpuMs / frames).toFixed(2) : null,
+            };
+        });
+        return {
+            elapsedMs: +elapsedMs.toFixed(1), frames,
+            frameMs: frames > 0 ? +(elapsedMs / frames).toFixed(2) : null,
+            totalInsnsPerFrame: frames > 0 ? Math.round(totalInsns / frames) : null,
+            mips: +(totalInsns / elapsedMs / 1000).toFixed(1),
+            threads: threads.filter((t) => t.insns > 0 || t.cpuMs > 0),
+            note: frames > 0 ? undefined : "no presents in the window — per-frame figures are unavailable, not zero",
+        };
+    });
+
+    /**
+     * guestBlocks({ms?=2000, intervalMs?=5, top?=15, phase?, maxPages?=64, keepArmed?}) — WHICH
+     * GUEST CODE, by two independent channels, labelled by what they weight:
+     *
+     *   - `sampled` (TIME-weighted): dumpHotJitBlocks' EIP sampling correlated to
+     *     `module+rva`. This is the only sound wasm-function[N] -> guest-address route:
+     *     v86's table indices do NOT match Chrome's numbering, so the mapping is established
+     *     by sampling, never computed. No rows => attribution unavailable, said plainly.
+     *   - `counted` (COUNT-weighted): the trace2 recorder's per-block `exec * static
+     *     instructions`, resolved to `module+rva` — the ranking that survives a noisy machine
+     *     because it never looks at time.
+     *
+     * The counted channel OWNS its window: this verb zeroes the recorder (trace2_reset), arms
+     * the tier-2 pages, and publishes the window it covers (`counted.window`: elapsedMs,
+     * presents, armed page count, slot overflow). If it cannot do that — no exports, 0 tier-2
+     * pages, or the recorder disarmed mid-window — it REFUSES with the reason instead of
+     * ranking counters of unknown age, because a stale census is numerically indistinguishable
+     * from a live one.
+     *
+     * `ranges:[{name,from,to}]` rolls the counted census into named guest spans (`from`/`to`
+     * take `mod+0xRVA`), because a top-N block ranking structurally cannot size a FUNCTION:
+     * a 1.6 KB inner loop is a dozen blocks each below the cut. Named ranges arm their own
+     * pages first, and the roll-up reports the unattributed remainder, so a share is a share
+     * of a stated whole and `blocks: 0` means "did not run", not "was never instrumented".
+     *
+     * `phase` splits the window when the scene must be driven by hand:
+     * `{phase:'arm'}` zeroes+arms and returns immediately, `{phase:'read'}` reads the census
+     * against that window (and leaves it running unless `keepArmed:false`). Default (no phase)
+     * is arm -> wait `ms` -> read -> disarm.
+     *
+     * TIMING BIAS: while armed, every block on an armed page pays a trace2_record_* increment,
+     * so the guest is measurably slower. Take `frameReport`/`trace` numbers from a CLEAN
+     * (disarmed) window and the counts from the armed one — never quote a tail measured under
+     * arming.
+     *
+     * They answer subtly different questions, so a disagreement in the top block is REPORTED,
+     * not reconciled. From an address: `bun tools/re/re.ts resolve <eip> --base <liveBase>`
+     * and `tools/pe-disas.py func|range`.
+     */
+    svc.register("guestBlocks", async (args) => {
+        const opts = (args[0] ?? {}) as {
+            ms?: number; intervalMs?: number; top?: number; phase?: "arm" | "read";
+            maxPages?: number; keepArmed?: boolean; pages?: Array<number | string>;
+            ranges?: GuestRangeSpec[];
+        };
+        const ms = Math.max(200, Math.min(30_000, opts.ms ?? 2000));
+        const intervalMs = Math.max(1, opts.intervalMs ?? 5);
+        const top = opts.top ?? 15;
+        const maxPages = Math.max(1, Math.min(64, opts.maxPages ?? 64));
+        const specs = opts.ranges ?? [];
+        const ranges = resolveRanges(specs);
+        // A named range arms its own pages, so "the range is absent" can never mean "its page
+        // never got a slot in the 64-entry watch table".
+        const pages = [
+            ...pagesForRanges(ranges.resolved),
+            ...(opts.pages ?? [])
+                .map((p) => (typeof p === "string" ? Number.parseInt(p, 16) : p) >>> 0)
+                .filter((p) => p > 0),
+        ];
+        const render = sys().services?.render as RenderLike | undefined;
+
+        const BIAS = "trace2 arming instruments every block on the armed pages (trace2_record_*), which SLOWS the guest. "
+            + "Counts come from this armed window; any p50/p95/p99 or A/B timing must come from a disarmed one.";
+        const RESET_NOTE = "trace2_reset also drops the indirect-target histograms that dbg.jitRegions consumes — re-collect "
+            + "them if you were mid region-formation.";
+
+        if (opts.phase === "arm") {
+            tearDownCountedWindow();   // a previous window's ticker would otherwise run forever
+            const arm = armCountedRecorder(render, maxPages, pages);
+            countedWindow = arm.ok ? arm.window : null;
+            countedRanges = ranges;
+            return arm.ok
+                ? {
+                    phase: "arm", armed: true, window: { ...arm.window, armedAtMs: Math.round(arm.window.armedAtMs) },
+                    biasCaveat: BIAS, note: `${RESET_NOTE} Drive the scene, then guestBlocks({phase:'read'}).`,
+                }
+                : { phase: "arm", armed: false, refused: arm.reason };
+        }
+
+        if (opts.phase === "read") {
+            const rr = specs.length ? resolveRanges(specs) : countedRanges;
+            const counted = countedGuestBlocks(top, countedWindow, render, rr.resolved, rr.unresolved);
+            if (opts.keepArmed === false) tearDownCountedWindow();
+            return {
+                phase: "read",
+                sampled: { available: false, note: "phase:'read' reads the counted census only — the time-weighted channel needs its own live sampling window (call guestBlocks() with no phase, disarmed, for that)." },
+                counted,
+                stillArmed: opts.keepArmed !== false,
+                biasCaveat: BIAS,
+            };
+        }
+
+        tearDownCountedWindow();
+        const arm = armCountedRecorder(render, maxPages, pages);
+        countedWindow = arm.ok ? arm.window : null;
+        countedRanges = ranges;
+        // Both channels observe the same wall-clock window: the sampler's own duration IS the
+        // counted window, so a disagreement between them cannot be blamed on different spans.
+        const sampled = await sampledGuestBlocks(ms, intervalMs, top);
+        const counted = countedGuestBlocks(top, countedWindow, render, ranges.resolved, ranges.unresolved);
+        if (opts.keepArmed !== true) tearDownCountedWindow();
+        return {
+            window: { ms, intervalMs },
+            armed: arm.ok,
+            ...(arm.ok ? {} : { armRefused: arm.reason }),
+            stillArmed: opts.keepArmed === true,
+            biasCaveat: arm.ok
+                ? `${BIAS} The \`sampled\` rows below were themselves collected under arming, so treat them as attribution, not cost. ${RESET_NOTE}`
+                : BIAS,
+            sampled,
+            counted,
+            crossCheck: crossCheckGuestChannels(sampled, counted),
+        };
+    });
+
+    /**
+     * hotBlocksMark({ms?=3000, intervalMs?=5}) — emit the `bottleship.hotblocks` UserTiming
+     * mark INSIDE an active trace recording, which is what lets `analyze-trace.ts` resolve
+     * `wasm-function[N]` frames to `module:rva` with no --map and no sidecar. `bun
+     * tools/harness.ts trace` calls this automatically partway through its window; call it
+     * directly only when driving Tracing yourself.
+     */
+    svc.register("hotBlocksMark", async (args) => {
+        const opts = (args[0] ?? {}) as { ms?: number; intervalMs?: number };
+        const ms = Math.max(200, Math.min(30_000, opts.ms ?? 3000));
+        const intervalMs = Math.max(1, opts.intervalMs ?? 5);
+        const fn = (globalThis as { captureHotBlocksMark?: (a: number, b: number) => Promise<number> }).captureHotBlocksMark;
+        if (typeof fn !== "function") {
+            throw new HarnessError("captureHotBlocksMark unavailable (diagnostics-commands not loaded)", HarnessErrorCode.INTERNAL);
+        }
+        const blocks = await fn(ms, intervalMs);
+        return {
+            blocks,
+            marked: blocks > 0,
+            mark: "bottleship.hotblocks",
+            note: blocks > 0
+                ? "mark emitted — analyze-trace will resolve wasm frames to module:rva from it"
+                : "NO mark emitted (JIT cache empty or v86 snapshot exports missing): a trace taken now analyses shallow",
+        };
+    });
+
+    /**
+     * eipProfile({ms?=3000, intervalMs?=5, top?=15}) — where the GUEST burns CPU, as data.
+     *
+     * The frame/thunk profilers only see OUR side; when a stall is guest code (a level
+     * load, a decode loop) they report a few hundred ms out of several seconds and the
+     * Chrome trace attributes JIT blocks to opaque `wasm-function[N]`. This samples
+     * cpu.instruction_pointer and symbolizes it against the loaded PE modules, so the
+     * answer is "module+rva", which `re decompile` takes directly.
+     *
+     * `stoppedPct` is the instrument's own blind spot, reported rather than hidden: while
+     * v86 is stopped (async park / intentional yield) the register holds the LAST executed
+     * address, so those samples are counted separately instead of being charged to whatever
+     * EIP happened to be frozen there. A high stoppedPct means the guest was NOT burning
+     * CPU — read that before reading the histogram.
+     */
+    svc.register("eipProfile", async (args) => {
+        const opts = (args[0] ?? {}) as { ms?: number; intervalMs?: number; top?: number };
+        const durationMs = Math.max(50, Math.min(60_000, opts.ms ?? 3000));
+        const intervalMs = Math.max(1, opts.intervalMs ?? 5);
+        const top = opts.top ?? 15;
+
+        const c = cpu();
+        const ip = c?.instruction_pointer;
+        if (!ip) throw new HarnessError("no guest CPU (load a game first)", HarnessErrorCode.NO_PROCESS);
+        const scheduler: any = sys().scheduler;
+        const v86: any = (sys().process as any)?.v86;
+
+        const exact = new Map<number, number>();
+        const pages = new Map<number, number>();
+        let running = 0, stopped = 0;
+
+        await new Promise<void>((resolve) => {
+            const id = setInterval(() => {
+                if (scheduler?.intentionalYield || v86?.running === false) { stopped++; return; }
+                running++;
+                const eip = ip[0] >>> 0;
+                exact.set(eip, (exact.get(eip) ?? 0) + 1);
+                const page = eip & ~0xfff;
+                pages.set(page, (pages.get(page) ?? 0) + 1);
+            }, intervalMs) as unknown as number;
+            setTimeout(() => { clearInterval(id); resolve(); }, durationMs);
+        });
+
+        const rank = (m: Map<number, number>, denom: number) =>
+            Array.from(m.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, top)
+                .map(([addr, n]) => ({
+                    addr: "0x" + addr.toString(16),
+                    sym: symbolize(addr),
+                    count: n,
+                    pct: denom > 0 ? Math.round((n / denom) * 1000) / 10 : 0,
+                }));
+
+        const total = running + stopped;
+        return {
+            durationMs, intervalMs,
+            samples: total,
+            runningSamples: running,
+            stoppedPct: total > 0 ? Math.round((stopped / total) * 1000) / 10 : 0,
+            topPages: rank(pages, running),
+            topEips: rank(exact, running),
         };
     });
 }

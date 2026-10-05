@@ -8,7 +8,7 @@ import { System } from '../../core/system';
 import { WebGPUBackend } from '../../backends/webgpu/webgpu-backend';
 import { FFPRenderer } from '../../backends/webgpu/shared';
 import { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
-import { getVTables, createComObject, devices, deviceCreationParams, resourceToDevice } from './shared-state';
+import { getVTables, createComObject, devices, deviceCreationParams, deviceWindowed, resourceToDevice } from './shared-state';
 import { bindAutoDepthStencil, resizeFullscreenDeviceWindow } from './device-lifecycle';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import {
@@ -21,10 +21,13 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { writeDeviceCaps8 } from './caps';
 import { logDxCheckDeviceFormat, setDxCheckFormatVerboseLogging } from '../../backends/webgpu/shared/dx-format-check-log';
 import {
-    DEFAULT_DEVICE_ID,
-    DEFAULT_VENDOR_ID,
+    adapterDeviceId,
+    adapterVendorId,
     writeAdapterIdentifier8,
 } from '../../backends/webgpu/shared/dx-adapter-identifier';
+import { registerLossTrackedDevice } from '../../core/gpu/gpu-device-loss-contract';
+import { D3DERR_NOTAVAILABLE } from '../../backends/webgpu/shared/dx-format-support';
+import { applyD3dCreateDeviceFpuMode } from '../../core/fpu-helper';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
@@ -123,8 +126,8 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             loggedD3D8AdapterIdentifier = true;
             Logger.log(
                 LogCategory.D3D9,
-                `D3D8 GetAdapterIdentifier: VendorId=0x${DEFAULT_VENDOR_ID.toString(16)} ` +
-                    `DeviceId=0x${DEFAULT_DEVICE_ID.toString(16)} (GTA3 cache key)`,
+                `D3D8 GetAdapterIdentifier: VendorId=0x${adapterVendorId().toString(16)} ` +
+                    `DeviceId=0x${adapterDeviceId().toString(16)} (GTA3 cache key)`,
             );
         }
         return writeAdapterIdentifier8(mem, pIdentifier, flags) ? D3D_OK : D3DERR_INVALIDCALL;
@@ -218,7 +221,11 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         if (!pMode) return D3DERR_INVALIDCALL;
 
         const modes = getD3D8Modes();
-        const mode = modes[modeIdx] ?? modes[modes.length - 1];
+        // Out of range MUST fail: an app is entitled to enumerate until D3D8 refuses
+        // rather than call GetAdapterModeCount first, and answering D3D_OK with the
+        // last mode forever is an infinite loop it can never leave. Matches d3d9's.
+        const mode = modes[modeIdx];
+        if (!mode) return D3DERR_INVALIDCALL;
 
         const ok =
             Mem.writeUint32(pMode + 0, mode.width) &&
@@ -243,6 +250,14 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
         try {
             const system = System.getInstance();
             const process = system.process;
+
+            // Same documented side effect as D3D9: single precision, exceptions
+            // masked, unless D3DCREATE_FPU_PRESERVE was passed.
+            const fpuControlWord = applyD3dCreateDeviceFpuMode(process?.v86, BehaviorFlags);
+            if (fpuControlWord !== null) {
+                Logger.log(LogCategory.SYSTEM,
+                    `CreateDevice: x87 control word -> 0x${fpuControlWord.toString(16)} (single precision)`);
+            }
             if (!process || !process.canvas) {
                 Logger.error(LogCategory.SYSTEM, 'D3D8 CreateDevice: no process/canvas');
                 return D3DERR_INVALIDCALL;
@@ -278,14 +293,25 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
             }
 
             // Create D3D8 device adapter
-            const device = new D3D8DeviceAdapter(renderer, process.getCurrentMemory(), bbWidth, bbHeight, backend);
+            const device = new D3D8DeviceAdapter(renderer, bbWidth, bbHeight, backend);
 
             // Honor the requested back-buffer MSAA (D3DPRESENT_PARAMETERS.MultiSampleType @ +16):
             // fold it into the executor's effective sample count so in-engine AA works.
-            device.applyPresentMultiSampleType(view.getUint32(pPresParams + 16, true));
+            if (!device.applyPresentMultiSampleType(view.getUint32(pPresParams + 16, true))) {
+                Logger.warn(LogCategory.SYSTEM, 'D3D8 CreateDevice: requested multisample type is not backed by WebGPU');
+                return D3DERR_NOTAVAILABLE;
+            }
 
-            // Resize canvas to match backbuffer (like DDraw SetDisplayMode does)
-            system.requestHostResize(bbWidth, bbHeight);
+            // The swap interval the app asked for (FullScreen_PresentationInterval @ +48).
+            // D3DCAPS8.PresentationIntervals advertises IMMEDIATE|ONE, so Present must honor it.
+            device.setPresentationInterval(view.getUint32(pPresParams + 48, true));
+
+            // Resize canvas to match backbuffer (like DDraw SetDisplayMode does). Only a
+            // FULLSCREEN device is a mode-set — a windowed backbuffer lives inside the
+            // desktop and must not become SM_CXSCREEN. (Windowed @ +28 in d3d8.)
+            system.requestHostResize(bbWidth, bbHeight, {
+                modeSet: view.getUint32(pPresParams + 28, true) === 0,
+            });
 
             // FULLSCREEN device: also resize the focus/device window's tracked client rect to
             // the back-buffer size, like real D3D8 does. Apps GetClientRect() the now-fullscreen
@@ -308,6 +334,11 @@ export function createFactoryExports(): Record<string, ThunkImplementation> {
 
             const devicePtr = createComObject(vtableAddr);
             devices.set(devicePtr, device);
+            registerLossTrackedDevice(devicePtr);
+            // The cursor kind depends on it, and a device that never Resets would otherwise
+            // be read as fullscreen.
+            deviceWindowed.set(devicePtr, !!windowedFlag);
+            device.setWindowed(!!windowedFlag);
             // Remembered for GetCreationParameters (faithful echo of the game's own flags).
             deviceCreationParams.set(devicePtr, {
                 adapter: Adapter,

@@ -5,6 +5,7 @@
  */
 
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
+import { normalizePortableWebGpuSampleCount } from "../shared/msaa-policy";
 
 /**
  * Depth texture entry for a specific render target
@@ -49,8 +50,34 @@ export class DepthManager {
     private device: GPUDevice;
     private queue: GPUQueue;
 
-    // Depth textures per surface (key = surfacePtr)
+    // Depth textures per render target. The key is the target's surfacePtr where it HAS one
+    // (a DDraw surface), and a synthetic per-object id otherwise.
+    //
+    // A D3D8 render target has NO guest surface, so every one of them reports surfacePtr 0 and
+    // they all collided on key 0: a title that alternates render targets within a frame failed
+    // the size check on every switch, and the entry was destroyed and rebuilt. Coming back to
+    // the first target therefore handed it a FRESH depth buffer — every depth value written
+    // before the excursion was gone, so geometry drawn earlier stopped occluding geometry
+    // drawn later. Object identity cannot collide; surfacePtr is kept as the key where it
+    // exists so removeDepthForSurface() still finds a real surface's entry.
     private depthBySurface = new Map<number, DepthEntry>();
+
+    /** Synthetic keys for targets with no guest surface (D3D8 render targets). Negative so they
+     *  can never collide with a real surfacePtr, and WeakMap-held so a dead target's key dies
+     *  with it. */
+    private syntheticKeys = new WeakMap<DirectDrawSurfaceState, number>();
+    private nextSyntheticKey = -1;
+
+    private depthKeyFor(target: DirectDrawSurfaceState): number {
+        const ptr = target.surfacePtr >>> 0;
+        if (ptr !== 0) return ptr;
+        let key = this.syntheticKeys.get(target);
+        if (key === undefined) {
+            key = this.nextSyntheticKey--;
+            this.syntheticKeys.set(target, key);
+        }
+        return key;
+    }
 
     // Garbage list for textures to be destroyed after queue.submit()
     private garbageList: GPUTexture[] = [];
@@ -77,12 +104,12 @@ export class DepthManager {
     }
 
     /**
-     * Set the MSAA sample count (from quality.msaa). Clamps to {1,2,4}. On change, all existing
+     * Set the MSAA sample count (from quality.msaa). Clamps to {1,4}. On change, all existing
      * depth textures are retired (they carry the old sampleCount) so the next ensure rebuilds
      * them to match the new color attachment. Returns true if the count actually changed.
      */
     setSampleCount(n: number): boolean {
-        const clamped = n >= 4 ? 4 : n >= 2 ? 2 : 1;
+        const clamped = normalizePortableWebGpuSampleCount(n);
         if (clamped === this.sampleCount) return false;
         this.sampleCount = clamped;
         for (const entry of this.depthBySurface.values()) {
@@ -104,7 +131,7 @@ export class DepthManager {
      * @returns true if texture was created or recreated
      */
     ensureDepthForTarget(target: DirectDrawSurfaceState): boolean {
-        const surfacePtr = target.surfacePtr;
+        const surfacePtr = this.depthKeyFor(target);
         const entry = this.depthBySurface.get(surfacePtr);
 
         // Check if existing entry matches required size and format
@@ -168,7 +195,7 @@ export class DepthManager {
     getDepthViewForTarget(
         target: DirectDrawSurfaceState
     ): GPUTextureView | null {
-        const entry = this.depthBySurface.get(target.surfacePtr);
+        const entry = this.depthBySurface.get(this.depthKeyFor(target));
         return entry ? entry.view : null;
     }
 
@@ -176,7 +203,7 @@ export class DepthManager {
      * Check if depth texture exists for the given target
      */
     hasDepthForTarget(target: DirectDrawSurfaceState): boolean {
-        return this.depthBySurface.has(target.surfacePtr);
+        return this.depthBySurface.has(this.depthKeyFor(target));
     }
 
     /**
@@ -200,7 +227,7 @@ export class DepthManager {
         depthClearValue?: number,
         stencilClearValue?: number
     ): GPURenderPassDepthStencilAttachment | undefined {
-        const entry = this.depthBySurface.get(target.surfacePtr);
+        const entry = this.depthBySurface.get(this.depthKeyFor(target));
         if (!entry) {
             return undefined;
         }
@@ -276,7 +303,7 @@ export class DepthManager {
      * @param depthValue - Depth clear value (default: 1.0)
      */
     setNeedsClear(target: DirectDrawSurfaceState, depthValue: number = 1.0): void {
-        const entry = this.depthBySurface.get(target.surfacePtr);
+        const entry = this.depthBySurface.get(this.depthKeyFor(target));
         if (entry) {
             entry.needsClear = true;
             entry.lastClearDepth = depthValue;
@@ -290,7 +317,7 @@ export class DepthManager {
      * @param stencilValue - Stencil clear value (default: 0)
      */
     setNeedsStencilClear(target: DirectDrawSurfaceState, stencilValue: number = 0): void {
-        const entry = this.depthBySurface.get(target.surfacePtr);
+        const entry = this.depthBySurface.get(this.depthKeyFor(target));
         if (entry) {
             entry.needsStencilClear = true;
             entry.lastClearStencil = stencilValue;
@@ -302,7 +329,7 @@ export class DepthManager {
      * Resets needsClear/needsStencilClear so subsequent passes use load, not clear.
      */
     markExplicitClearDone(target: DirectDrawSurfaceState): void {
-        const entry = this.depthBySurface.get(target.surfacePtr);
+        const entry = this.depthBySurface.get(this.depthKeyFor(target));
         if (entry) {
             entry.needsClear = false;
             entry.needsStencilClear = false;
@@ -313,7 +340,7 @@ export class DepthManager {
      * Mark that depth buffer was used in current frame (e.g., after Clear() or render pass).
      */
     markUsedThisFrame(target: DirectDrawSurfaceState): void {
-        const entry = this.depthBySurface.get(target.surfacePtr);
+        const entry = this.depthBySurface.get(this.depthKeyFor(target));
         if (entry) {
             entry.frameDirty = true;
         }

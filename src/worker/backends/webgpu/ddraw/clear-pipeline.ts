@@ -11,6 +11,7 @@ import {
     D3DCLEAR_STENCIL,
 } from "../../../modules/ddraw/constants";
 import { ClearConfig } from "./types";
+import { normalizePortableWebGpuSampleCount } from "../shared/msaa-policy";
 
 /** Color pipelines: partial clear with color attachment (D3DCLEAR_TARGET). Format-specific. */
 type ClearPipelineSet = {
@@ -92,13 +93,13 @@ export class ClearPipeline {
     }
 
     /**
-     * Set the MSAA sample count (from quality.msaa). Clamps to {1,2,4}. On change, all cached
+     * Set the MSAA sample count (from quality.msaa). Clamps to {1,4}. On change, all cached
      * clear pipelines are dropped (they baked the old sampleCount). Returns true if it changed.
      * Only take effect once the executor also supplies MSAA color/depth attachments; sampleCount===1
      * keeps the pre-MSAA single-sample pipelines.
      */
     setSampleCount(n: number): boolean {
-        const clamped = n >= 4 ? 4 : n >= 2 ? 2 : 1;
+        const clamped = normalizePortableWebGpuSampleCount(n);
         if (clamped === this.sampleCount) return false;
         this.sampleCount = clamped;
         this.pipelines.clear();

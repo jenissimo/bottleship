@@ -1,11 +1,14 @@
+import { surfaceAt } from "./helpers";
 import { IModule } from '../../core/module';
 import { Process } from '../../core/process';
 import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
+import { recordGpuError } from '../../core/gpu-error-log';
 import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/module-adapter';
 import { ddrawModule } from '../../api/ddraw.api';
 import { InterfaceRegistry } from '../../core/com/interface-registry';
 import { ComObjectFactory } from '../../core/com/base-com-object';
+import { allocateComObject } from '../../core/com/com-memory';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
 import { System } from '../../core/system';
 import { DDrawContext } from './context';
@@ -38,6 +41,7 @@ import {
     IID_IDirect3D7,
     IID_IDirect3DDevice,
     IID_IDirect3DDevice2,
+    IID_IDirect3DExecuteBuffer,
     IID_IDirect3DDevice3,
     IID_IDirect3DDevice7,
     IID_IDirect3DTexture,
@@ -47,9 +51,9 @@ import {
     IID_IDirect3DViewport3,
     IID_IDirectDrawGammaControl,
     IID_IDirect3DLight,
+    IID_IDirect3DMaterial,
     IID_IDirect3DMaterial3,
     IID_IDirect3DVertexBuffer,
-    allocateComObject,
 } from './constants';
 import {
     Direct3DObject,
@@ -72,6 +76,7 @@ import {
     DirectDrawGammaControlObject,
     Direct3DLightObject,
     Direct3DMaterial3Object,
+    Direct3DExecuteBufferObject,
     Direct3DVertexBufferObject,
     DirectDrawSurfaceState,
     SurfaceFormat,
@@ -81,6 +86,7 @@ import {
 import { createDirectDrawExports } from './directdraw';
 import { createSurfaceExports, registerFastPathSurfaceFunctions } from './surface';
 import { createD3DExports, registerFastPathD3DFunctions } from './d3d/index';
+import { freeExecuteBufferScratch } from './d3d/execute-buffer-impl';
 import { createGPUTexture, convertRGBAToSurface, FormatInfo, readSurfaceStateRGBA } from './gpu-texture-utils';
 import { resolveBitmapRgba, bitmapHasPixelSource } from '../gdi32/bitmap-resolve';
 import { setAuthorityCpu } from './surface-sync';
@@ -161,7 +167,6 @@ export class DDraw implements IModule {
     exports: Record<string, ThunkImplementation> = {};
     vtables: Record<string, VTableInfo> = {};
     private process!: Process;
-    private memory!: Uint8Array;
     private context!: DDrawContext;
     private bitmapToSurfaceCache: Map<number, number> = new Map(); // HBITMAP -> Surface address
     private thrashAutoPresenterUnregister: (() => void) | null = null;
@@ -371,7 +376,7 @@ export class DDraw implements IModule {
             return created;
         }
 
-        const surfaceObj = this.context.resourceProvider.getComObjectByAddress(cached) as DirectDrawSurfaceObject | null;
+        const surfaceObj = surfaceAt(this.context.resourceProvider, cached);
         if (!surfaceObj) {
             Logger.warn(LogCategory.DDRAW, `updateTextureFromBitmap: Cached surface 0x${cached.toString(16)} not found, recreating`);
             return this.createTextureFromBitmap(bitmapHandle, gdiObj);
@@ -503,7 +508,11 @@ export class DDraw implements IModule {
         );
         queue.submit([enc.finish()]);
         const verr = await device.popErrorScope();
-        if (verr) { buf.destroy(); return { err: `validation: ${verr.message}` }; }
+        if (verr) {
+            recordGpuError("scope", "ddrawSurfaceProbe", verr.message);
+            buf.destroy();
+            return { err: `validation: ${verr.message}` };
+        }
         await buf.mapAsync(GPUMapMode.READ);
         const data = new Uint8Array(buf.getMappedRange());
         let min = 255, max = 0, nonBlack = 0;
@@ -545,7 +554,7 @@ export class DDraw implements IModule {
      *  the authoritative CPU rgbaScratch (zero GPU work, for bitmap textures), else
      *  GPU-reads the texture, de-pads rows, and applies the bgra->rgba swizzle so
      *  the bytes are straight top-down RGBA8 ready for PNG encoding. */
-    async readSurfaceRGBA(ptrLike: number | string): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
+    async readSurfaceRGBA(ptrLike: number | string, from: "auto" | "gpu" | "scratch" = "auto"): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
         const want = (typeof ptrLike === "string" ? parseInt(ptrLike, 16) : ptrLike) >>> 0;
         if (!this.context) return { err: "no ddraw context" };
         let state: DirectDrawSurfaceState | null = null;
@@ -556,12 +565,11 @@ export class DDraw implements IModule {
             if (s && (s.surfacePtr >>> 0) === want) { state = s; break; }
         }
         if (!state) return { err: `surface 0x${want.toString(16)} not found` };
-        return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush());
+        return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush(), from);
     }
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
 
         const interfaceRegistry = InterfaceRegistry.getInstance();
         interfaceRegistry.registerFromModuleDescriptor(ddrawModule);
@@ -578,7 +586,6 @@ export class DDraw implements IModule {
         
         this.context = {
             process: this.process,
-            memory: this.memory,
             vtables: this.vtables,
             resourceProvider,
             presenter: new DDrawPresenter(this.process),
@@ -646,7 +653,9 @@ export class DDraw implements IModule {
         ComObjectFactory.register(IID_IDirect3DDevice7, Direct3DDevice7Object);
         ComObjectFactory.register(IID_IDirectDrawGammaControl, DirectDrawGammaControlObject);
         ComObjectFactory.register(IID_IDirect3DLight, Direct3DLightObject);
+        ComObjectFactory.register(IID_IDirect3DMaterial, Direct3DMaterial3Object); // v1 material — same state, different vtable
         ComObjectFactory.register(IID_IDirect3DMaterial3, Direct3DMaterial3Object);
+        ComObjectFactory.register(IID_IDirect3DExecuteBuffer, Direct3DExecuteBufferObject);
         ComObjectFactory.register(IID_IDirect3DVertexBuffer, Direct3DVertexBufferObject);
 
 
@@ -674,7 +683,7 @@ export class DDraw implements IModule {
             if (!ctx) return;
             const primaryAddr = ctx.surfaces.primary;
             if (!primaryAddr) return;
-            const primaryObj = ctx.resourceProvider.getComObjectByAddress(primaryAddr) as DirectDrawSurfaceObject | null;
+            const primaryObj = surfaceAt(ctx.resourceProvider, primaryAddr);
             if (!primaryObj) return;
             const state = primaryObj.getState();
             // Gate on write-lock: normal games release the lock before Flip
@@ -824,6 +833,7 @@ export class DDraw implements IModule {
 
         if (this.context) {
             this.flushDeferredSurfacePtrFrees();
+            freeExecuteBufferScratch(this.context.process.memory);
 
             // Reset primary/backbuffer surfaces
             this.context.surfaces.primary = 0;
@@ -847,17 +857,28 @@ export class DDraw implements IModule {
             }
             this.context.nextTextureHandle = this.context.defaults.nextTextureHandleStart;
             
-            // Reset executor state if present (cleanup depth buffers, etc.)
+            // Rebuild the GPU executor — pipeline/depth/texture caches are keyed for one
+            // title's working set and must not survive an in-worker game switch.
             if (this.context.executor) {
-                // Executor cleanup is handled by its own destroy/reset methods if needed
-                // For now, just log - executor state is usually tied to surfaces which are reset above
-                Logger.verbose(LogCategory.DDRAW, 'DDraw.reset: Executor state should be reset via surface cleanup');
+                const backend = this.context.backend;
+                try {
+                    this.context.executor.destroy();
+                } catch (e) {
+                    Logger.warn(LogCategory.DDRAW, `DDraw.reset: executor.destroy failed: ${e}`);
+                }
+                this.context.executor = backend ? new DDrawWebGPUExecutor(backend) : undefined;
             }
             
             // Reset cooperative level
             this.context.cooperative.hwnd = 0;
             this.context.cooperative.flags = 0;
             this.context.cooperative.exclusive = false;
+
+            this.context.deferredUploadManager.clear();
+            this.context.ddraw7ObjectAddr = 0;
+            this.context.gdiSurfaceVisible = true;
+            this.context.suppressPresent = false;
+            delete this.context.gammaRamp;
         }
         
         // Clear texture cache on reset
@@ -886,13 +907,15 @@ export class DDraw implements IModule {
             LogCategory.DDRAW,
             `DDraw: display updated from config -> ${this.context.display.width}x${this.context.display.height} @ ${this.context.display.bpp}bpp ${this.context.display.refresh}Hz`
         );
-        System.getInstance().requestHostResize(this.context.display.width, this.context.display.height);
+        // Boot/manifest baseline — the desktop mode until a game sets its own.
+        System.getInstance().requestHostResize(this.context.display.width, this.context.display.height, {
+            modeSet: true, bpp: this.context.display.bpp, refreshRate: this.context.display.refresh,
+        });
     }
 
     recreateVTables(): void {
         if (this.process) {
-            this.memory = this.getMemory();
-            this.vtables = createVTablesFromDescriptor(this.process, ddrawModule); if (this.context) { this.context.vtables = this.vtables; this.context.memory = this.memory; }
+            this.vtables = createVTablesFromDescriptor(this.process, ddrawModule); if (this.context) { this.context.vtables = this.vtables; }
             Logger.verbose(LogCategory.SYSTEM, 'DirectDraw: Recreated vtables after reset');
 
             for (const [name, info] of Object.entries(this.vtables)) {
@@ -902,7 +925,7 @@ export class DDraw implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     /**
@@ -1107,8 +1130,11 @@ export class DDraw implements IModule {
                 const visited = new Set<number>();
                 while (currentAddr && !visited.has(currentAddr)) {
                     visited.add(currentAddr);
-                    const currentObj = resourceProvider.getComObjectByAddress(currentAddr) as DirectDrawSurfaceObject | null;
-                    if (!currentObj) break;
+                    // A released surface's slot can be reused by any COM object, so a
+                    // stale attachedSurfaceAddr may resolve to a device / execute buffer —
+                    // check the type instead of assuming (the backward walk below does too).
+                    const currentObj = resourceProvider.getComObjectByAddress(currentAddr);
+                    if (!(currentObj instanceof DirectDrawSurfaceObject)) break;
                     const currentState = currentObj.getState();
                     if (currentState.attachedSurfaceAddr === primaryAddr || currentState.attachedSurfaceAddr === backBufferAddr) {
                         isPrimaryChain = true;
@@ -1140,8 +1166,8 @@ export class DDraw implements IModule {
                                     isPrimaryChain = true;
                                     break;
                                 }
-                                const checkObj = resourceProvider.getComObjectByAddress(checkAddr) as DirectDrawSurfaceObject | null;
-                                if (!checkObj) break;
+                                const checkObj = resourceProvider.getComObjectByAddress(checkAddr);
+                                if (!(checkObj instanceof DirectDrawSurfaceObject)) break;
                                 const checkState = checkObj.getState();
                                 if (checkState.attachedSurfaceAddr === 0) break;
                                 checkAddr = checkState.attachedSurfaceAddr;
@@ -1198,7 +1224,7 @@ export class DDraw implements IModule {
     async getSurfacePreview(surfaceAddr: number, maxSize: number = 512): Promise<{ data: string; width: number; height: number } | null> {
         if (!this.context) return null;
         
-        const obj = this.context.resourceProvider.getComObjectByAddress(surfaceAddr) as DirectDrawSurfaceObject | null;
+        const obj = surfaceAt(this.context.resourceProvider, surfaceAddr);
         if (!obj) return null;
         
         const state = obj.getState();

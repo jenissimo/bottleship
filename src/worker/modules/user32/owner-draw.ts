@@ -18,7 +18,16 @@ import { System } from '../../core/system';
 import type { Process } from '../../core/process';
 import type { ThunkResult } from '../../core/thunking/thunk-dispatcher';
 import { windows, buttonCheckStates, type WindowInfo } from './shared-state';
-import { isButtonSystemControl } from './controls';
+import { paintTraceEnabled, logOwnerDrawChain, logPaintRequest } from './paint-trace';
+import { isButtonSystemControl, repaintChildControls } from './controls';
+import { isAppRegisteredClass } from './class';
+import { invalidateWindow, clearWindowUpdate } from './paint-region';
+import {
+    enumerateCtlColorChildren,
+    ctlColorMessageFor,
+    presetCtlColorDC,
+    captureCtlColorResult,
+} from './control-colors';
 
 const WM_DRAWITEM = 0x002B;
 const WM_PAINT = 0x000F;
@@ -41,24 +50,25 @@ export function resetOwnerDrawScratch(): void {
     drawItemScratchPtr = 0;
 }
 
-/** Walk a window up to its top-level (non-child) ancestor. */
-function topLevelOf(win: WindowInfo): WindowInfo {
+/** True when a window belongs to the active window's child/owned subtree. */
+export function isWindowInActiveTree(win: WindowInfo, activeHwnd: number): boolean {
     let cur = win;
     let guard = 0;
-    while (cur.parent !== undefined && guard++ < 32) {
+    while (guard++ < 32) {
+        if (cur.handle === activeHwnd) return true;
+        if (cur.parent === undefined) break;
         const p = windows.get(cur.parent);
         if (!p) break;
         cur = p;
     }
-    return cur;
+    return false;
 }
 
-/** True if the button's top-level dialog is the currently active window. Used to suppress
- *  stale hover-timer repaints from an occluded menu (a modal submenu drawn on top). */
-function isButtonOnActiveTopLevel(button: WindowInfo): boolean {
+/** Suppress stale hover-timer repaints from an occluded menu. */
+function isButtonOnActiveWindowTree(button: WindowInfo): boolean {
     const active = System.getInstance().windowManager.getActiveHwnd();
     if (!active) return true; // no active window tracked — don't over-suppress
-    return topLevelOf(button).handle === active;
+    return isWindowInActiveTree(button, active);
 }
 
 function getDrawItemScratchPtr(process: Process): number {
@@ -68,6 +78,12 @@ function getDrawItemScratchPtr(process: Process): number {
     return drawItemScratchPtr;
 }
 
+/** A BS_OWNERDRAW button: the one control class whose pixels come from the PARENT's
+ *  WM_DRAWITEM, so nothing we draw ourselves can produce them. */
+export function isOwnerDrawButton(win: WindowInfo | undefined): boolean {
+    return !!win && isButtonSystemControl(win) && (win.style & BS_TYPEMASK) === BS_OWNERDRAW;
+}
+
 export function enumerateOwnerDrawChildren(parentHwnd: number): WindowInfo[] {
     const parent = windows.get(parentHwnd);
     if (!parent) return [];
@@ -75,30 +91,69 @@ export function enumerateOwnerDrawChildren(parentHwnd: number): WindowInfo[] {
     for (const childHwnd of parent.children) {
         const child = windows.get(childHwnd);
         if (!child || !child.visible) continue;
-        if (!isButtonSystemControl(child)) continue;
-        if ((child.style & BS_TYPEMASK) !== BS_OWNERDRAW) continue;
+        if (!isOwnerDrawButton(child)) continue;
         out.push(child);
     }
     return out;
 }
 
 /**
- * Subclassed non-button system controls (e.g. an MFC custom CStatic that paints
- * itself). Windows runs each control's own window proc to paint it; we mirror that
- * by delivering WM_PAINT so the guest draws its real content (text, colours) into a
- * client DC seeded from the overlay. Buttons are excluded — owner-draw buttons take
- * the WM_DRAWITEM path above, and non-owner-draw buttons paint as default chrome.
+ * The queued half of Wine's `OB_Paint`: ask USER for the button's WM_PAINT instead of
+ * running the WM_DRAWITEM here. Reaching the guest needs a callback, which a hot
+ * synchronous API (InvalidateRect) cannot return, so the invalidation is delivered the
+ * way USER delivers one — mark the client invalid, post WM_PAINT (coalesced to one per
+ * hwnd, lowest priority) and let the pump hand it to the button's class proc.
  */
+export function requestOwnerDrawButtonPaint(button: WindowInfo | undefined): boolean {
+    if (!isOwnerDrawButton(button)) return false;
+    // A/B lever: with this set an invalidate marks the button and asks for nothing, which
+    // is what the tile-repaint regressions must fail on.
+    if ((globalThis as Record<string, unknown>)['__noOwnerDrawPaintRequest']) {
+        if (paintTraceEnabled) {
+            logPaintRequest(button!.handle, false, 'owner-draw button: __noOwnerDrawPaintRequest');
+        }
+        return false;
+    }
+    if (!button!.visible) {
+        if (paintTraceEnabled) logPaintRequest(button!.handle, false, 'owner-draw button hidden');
+        return false;
+    }
+    const system = System.getInstance();
+    system.windowManager.postMessage(button!.handle, WM_PAINT, 0, 0);
+    system.scheduler.wakeMessageWaiters();
+    if (paintTraceEnabled) logPaintRequest(button!.handle, true, 'owner-draw button invalidated');
+    return true;
+}
+
+/**
+ * Child controls whose pixels only the GUEST can produce. Windows runs each control's own
+ * window proc to paint it; we mirror that by delivering WM_PAINT so the guest draws its
+ * real content into a client DC seeded from the overlay. Two cases:
+ *
+ *   • a subclassed system control (MFC custom CStatic that took over WM_PAINT), and
+ *   • a control of a class the APP registered — a custom control. This one has no
+ *     fallback at all: there is no default chrome for an app class, so a custom control
+ *     we never send WM_PAINT to is simply invisible for the life of the dialog (HL's
+ *     CODSliderCls sliders: created, sized, clickable, and blank).
+ *
+ * Buttons are excluded — owner-draw buttons take the WM_DRAWITEM path above, and
+ * non-owner-draw buttons paint as default chrome.
+ */
+export function isGuestPaintedControl(child: WindowInfo | undefined): boolean {
+    if (!child || !child.visible || !child.wndProc) return false;
+    if (isButtonSystemControl(child)) return false;
+    if (child.externalPaintManaged) return false;
+    const custom = !child.isSystemControl && isAppRegisteredClass(child.nativeClassName);
+    return !!child.wndProcSubclassed || custom;
+}
+
 export function enumerateGuestPaintedControls(parentHwnd: number): WindowInfo[] {
     const parent = windows.get(parentHwnd);
     if (!parent) return [];
     const out: WindowInfo[] = [];
     for (const childHwnd of parent.children) {
         const child = windows.get(childHwnd);
-        if (!child || !child.visible) continue;
-        if (!child.wndProcSubclassed || !child.wndProc) continue;
-        if (isButtonSystemControl(child)) continue;
-        out.push(child);
+        if (isGuestPaintedControl(child)) out.push(child!);
     }
     return out;
 }
@@ -143,12 +198,17 @@ export interface OwnerDrawDeps {
     createChildDC: (childHwnd: number) => number;
     /** Composite the child DC onto the overlay (on top of the background) + release it. */
     flushChildDC: (childDc: number) => void;
+    /** Release a child DC WITHOUT compositing it. */
+    discardChildDC: (childDc: number) => void;
+    /** Called after the complete owner-draw sequence has landed on the overlay. */
+    onComplete?: () => void;
 }
 
-/** One guest-paint task: an owner-draw button (WM_DRAWITEM into a DC we supply) or a
- *  subclassed control (WM_PAINT to its own proc, which BeginPaint/EndPaints itself). */
+/** One guest-paint task: an owner-draw button (WM_DRAWITEM into a DC we supply), a
+ *  subclassed control (WM_PAINT to its own proc, which BeginPaint/EndPaints itself),
+ *  or a WM_CTLCOLOR* color query to the parent (result cached, control repainted). */
 interface PaintTask {
-    kind: 'drawitem' | 'paint';
+    kind: 'drawitem' | 'paint' | 'ctlcolor';
     child: WindowInfo;
 }
 
@@ -156,6 +216,13 @@ interface PaintTask {
 interface DrawItemTarget {
     hwnd: number;
     wndProc: number;
+}
+
+/** Resume point for a thunk that was itself invoked from a callback stub (CallWindowProc
+ *  reaching DefDlgProc): it returns through its own RET N, not an outer suspended frame. */
+export interface DirectThunkReturn {
+    returnAddr: number;
+    postEsp: number;
 }
 
 /**
@@ -176,6 +243,8 @@ function runGuestPaintChain(
     deps: OwnerDrawDeps,
     thunkName: string,
     stackCleanup: number,
+    existingFrameId?: number,
+    directReturn?: DirectThunkReturn,
 ): ThunkResult | null {
     if (tasks.length === 0) return null;
 
@@ -184,37 +253,97 @@ function runGuestPaintChain(
     const callbackManager = process?.dispatcher?.callbackManager;
     if (!callbackManager || !process) return null;
 
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const thunkReturnAddr = view.getUint32(ctx.esp, true);
-    const frameId = callbackManager.saveSuspendedThunkContext(
-        { ...ctx, returnAddr: thunkReturnAddr },
-        stackCleanup,
-        thunkName,
-    );
-    if (frameId === 0) return null;
+    // Three ways to get back here after a task's guest callback:
+    //  • directReturn — the calling thunk was itself invoked from a callback stub, so it
+    //    resumes through its own RET N rather than consuming an outer suspended frame;
+    //  • existingFrameId — an earlier step of the same paint (the default WM_PAINT sends
+    //    WM_ERASEBKGND first) already saved a frame, and ctx.esp now belongs to it;
+    //  • otherwise save one from this thunk's own stack.
+    let frameId = existingFrameId ?? 0;
+    if (!frameId && !directReturn) {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const thunkReturnAddr = view.getUint32(ctx.esp, true);
+        frameId = callbackManager.saveSuspendedThunkContext(
+            { ...ctx, returnAddr: thunkReturnAddr },
+            stackCleanup,
+            thunkName,
+        );
+    }
+    if (frameId === 0 && !directReturn) return null;
+
+    const invokeTask = (target: number, cbArgs: number[], label: string): { callbackId: number } =>
+        directReturn
+            ? callbackManager.invokeCallback(
+                target, cbArgs, 0, undefined, false, label, undefined,
+                { directThunkReturn: { ...directReturn, complete: onTaskComplete } })
+            : callbackManager.invokeCallback(
+                target, cbArgs, 0, onTaskComplete, false, label, frameId);
 
     const scratchPtr = getDrawItemScratchPtr(process);
     let taskIndex = 0;
     let pendingDc = 0; // DC of the owner-draw button whose WM_DRAWITEM is in flight
+    let pendingCtlColor: WindowInfo | null = null; // control whose WM_CTLCOLOR* is in flight
+    let ctlColorsChanged = false;
+    let holdReleased = false;
+
+    // The chain owns ONE publish hold and every exit path has to give it back exactly
+    // once — completion, a throw out of a guest callback, or a page teardown that
+    // destroys the controls mid-sequence. A hold left standing withholds the plane until
+    // the fail-open deadline, i.e. the erase reaches the screen and the repaint does not.
+    const releaseHold = (): void => {
+        if (holdReleased) return;
+        holdReleased = true;
+        system.gdiContext.endOverlayPublish();
+    };
 
     // Returns the invokeCallback callbackId (non-zero) if a task was dispatched, or 0 if
     // no further task could be dispatched (chain finished).
     const dispatchNext = (): number => {
         while (taskIndex < tasks.length) {
+            // The task list was enumerated before any guest code ran, and every callback
+            // since then is a chance for the guest to tear the page down. Dispatching to
+            // a destroyed control sends WM_PAINT to a wndProc whose window is gone.
+            if (!windows.has(drawItemTarget.hwnd)) return 0;
             const { kind, child } = tasks[taskIndex++];
+            if (!windows.has(child.handle)) continue;
+
+            if (kind === 'ctlcolor') {
+                const msg = ctlColorMessageFor(child);
+                if (msg === null) continue;
+                const queryDc = deps.createChildDC(child.handle);
+                if (!queryDc) continue;
+                presetCtlColorDC(child, queryDc, msg);
+                pendingDc = queryDc;
+                pendingCtlColor = child;
+                const inv = invokeTask(
+                    drawItemTarget.wndProc,
+                    [drawItemTarget.hwnd, msg, queryDc, child.handle],
+                    `${thunkName}-WM_CTLCOLOR`,
+                );
+                if (inv.callbackId !== 0) return inv.callbackId;
+                deps.discardChildDC(pendingDc);
+                pendingDc = 0;
+                pendingCtlColor = null;
+                continue;
+            }
 
             if (kind === 'paint') {
                 // The control paints itself: deliver WM_PAINT to its own wndProc. The
                 // guest's BeginPaint returns a client DC seeded from the overlay and its
                 // EndPaint composites the result back — no DC plumbing needed here.
-                const inv = callbackManager.invokeCallback(
+                // This direct delivery satisfies any coalesced WM_PAINT already waiting
+                // for the control; leaving it queued paints transparent glyphs twice.
+                // The parent just repainted the ground under this control, so its whole
+                // client is invalid AND needs erasing — the same state Win32 leaves after
+                // a parent's erase runs under a non-WS_CLIPCHILDREN child. Without the
+                // invalidate the paint arrives with fErase FALSE and the control draws
+                // over its own previous output (glyphs thicken with every repaint).
+                invalidateWindow(child.handle, null, true);
+                System.getInstance().windowManager.clearPaintMessage(child.handle);
+                const inv = invokeTask(
                     child.wndProc,
                     [child.handle, WM_PAINT, 0, 0],
-                    0,
-                    onTaskComplete,
-                    false,
                     `${thunkName}-WM_PAINT`,
-                    frameId,
                 );
                 if (inv.callbackId !== 0) return inv.callbackId;
                 continue;
@@ -230,14 +359,10 @@ function runGuestPaintChain(
             pendingDc = childDc;
             writeDrawItemStruct(mem, scratchPtr, child, childDc);
             const ctlId = (child.controlId ?? 0) & 0xFFFF;
-            const inv = callbackManager.invokeCallback(
+            const inv = invokeTask(
                 drawItemTarget.wndProc,
                 [drawItemTarget.hwnd, WM_DRAWITEM, ctlId, scratchPtr],
-                0,
-                onTaskComplete,
-                false,
                 `${thunkName}-WM_DRAWITEM`,
-                frameId,
             );
             if (inv.callbackId !== 0) return inv.callbackId;
             // Dispatch failed: flush whatever (empty) DC and try the next task.
@@ -247,18 +372,54 @@ function runGuestPaintChain(
         return 0;
     };
 
-    const onTaskComplete = (_ret: number): number | null => {
-        // Composite the owner-draw button's DC (no-op for self-painting controls).
-        if (pendingDc) {
-            deps.flushChildDC(pendingDc);
-            pendingDc = 0;
+    const onTaskComplete = (ret: number): number | null => {
+        try {
+            // WM_CTLCOLOR* answer: cache the DC's text/bk colors + returned HBRUSH. The
+            // query DC is DISCARDED, never composited — it is seeded from an ancestor's
+            // retained client backing (createWindowClientDC), so flushing it would stamp
+            // that backdrop over the control's current pixels once per query.
+            if (pendingCtlColor) {
+                if (captureCtlColorResult(pendingCtlColor, pendingDc, ret >>> 0)) {
+                    ctlColorsChanged = true;
+                }
+                pendingCtlColor = null;
+                if (pendingDc) {
+                    deps.discardChildDC(pendingDc);
+                    pendingDc = 0;
+                }
+            }
+            // Composite the owner-draw button's DC (no-op for self-painting controls).
+            if (pendingDc) {
+                deps.flushChildDC(pendingDc);
+                pendingDc = 0;
+            }
+            if (dispatchNext() !== 0) return null; // suspended for the next task; hold stays
+            // Apply freshly-captured guest colors in the same paint sequence.
+            if (ctlColorsChanged) repaintChildControls(drawItemTarget.hwnd);
+            deps.onComplete?.();
+        } catch (err) {
+            Logger.error(LogCategory.USER32, `${thunkName}: guest-paint chain aborted — ${err}`);
         }
-        if (dispatchNext() !== 0) return null; // suspended for the next task
-        return 1; // all tasks done — calling thunk returns TRUE
+        // Sequence over (finished, or abandoned mid-flight) — publish the plane either
+        // way; withholding it past this point can only show the screen a stale erase.
+        releaseHold();
+        return 1; // calling thunk returns TRUE
     };
 
-    const firstCallbackId = dispatchNext();
-    if (firstCallbackId === 0) return null; // nothing dispatched; caller finalizes
+    // Hold publication across the whole chain: each task is a guest callback, so the
+    // states between them (background painted, controls not yet) span display frames and
+    // would otherwise be composited as a flash of missing controls.
+    system.gdiContext.beginOverlayPublish();
+    let firstCallbackId = 0;
+    try {
+        firstCallbackId = dispatchNext();
+    } catch (err) {
+        Logger.error(LogCategory.USER32, `${thunkName}: guest-paint chain failed to start — ${err}`);
+    }
+    if (firstCallbackId === 0) {
+        releaseHold();
+        return null; // nothing dispatched; caller finalizes
+    }
 
     Logger.log(LogCategory.USER32,
         `${thunkName}: guest-paint chain tasks=${tasks.length} drawItemTarget=0x${drawItemTarget.hwnd.toString(16)}`);
@@ -283,27 +444,45 @@ export function tryEndPaintOwnerDrawChain(
     hWnd: number,
     window: WindowInfo,
     deps: OwnerDrawDeps,
+    stackCleanup = 8, // EndPaint(hWnd, lpPaint) — 2 stdcall args
+    existingFrameId?: number,
+    directReturn?: DirectThunkReturn,
 ): ThunkResult | null {
-    if (!window.wndProc) return null;
+    if (!window.wndProc) {
+        if (paintTraceEnabled) logOwnerDrawChain(hWnd, { ctlcolor: 0, drawitem: 0, paint: 0 }, 'no-wndProc');
+        return null;
+    }
+    const ctlColor = enumerateCtlColorChildren(hWnd);
+    const drawItem = enumerateOwnerDrawChildren(hWnd);
+    const guestPainted = enumerateGuestPaintedControls(hWnd);
     const tasks: PaintTask[] = [
-        ...enumerateOwnerDrawChildren(hWnd).map((child): PaintTask => ({ kind: 'drawitem', child })),
-        ...enumerateGuestPaintedControls(hWnd).map((child): PaintTask => ({ kind: 'paint', child })),
+        ...ctlColor.map((child): PaintTask => ({ kind: 'ctlcolor', child })),
+        ...drawItem.map((child): PaintTask => ({ kind: 'drawitem', child })),
+        ...guestPainted.map((child): PaintTask => ({ kind: 'paint', child })),
     ];
-    const stackCleanup = 8; // EndPaint(hWnd, lpPaint) — 2 stdcall args
-    return runGuestPaintChain(
+    const result = runGuestPaintChain(
         ctx, mem, tasks,
         { hwnd: hWnd, wndProc: window.wndProc },
-        deps, 'EndPaint', stackCleanup,
+        deps, 'EndPaint', stackCleanup, existingFrameId, directReturn,
     );
+    if (paintTraceEnabled) {
+        logOwnerDrawChain(
+            hWnd,
+            { ctlcolor: ctlColor.length, drawitem: drawItem.length, paint: guestPainted.length },
+            result ? 'dispatched' : (tasks.length === 0 ? 'no-tasks' : 'not-dispatched'),
+        );
+    }
+    return result;
 }
 
 /**
- * Re-render ONE owner-draw button on demand (e.g. when its own RedrawWindow fires from a
- * hover-glow timer). Sends a single WM_DRAWITEM to the button's PARENT wndProc, into a
- * client DC seeded from the overlay (so the background shows through), then composites it
- * on top — exactly one iteration of the EndPaint chain. The guest computes any hover-glow
- * blend itself from the button object's own timing state. Returns a suspended-thunk result
- * (the calling thunk returns TRUE once the repaint finishes), or null to finalize normally.
+ * Wine's `OB_Paint` (dlls/user32/button.c): the BUTTON class answers a BS_OWNERDRAW
+ * repaint by sending ONE WM_DRAWITEM to the button's PARENT — here into a client DC
+ * seeded from the overlay (so the background shows through), composited on top when the
+ * guest returns. Exactly one iteration of the EndPaint chain. Reached from the class
+ * proc's WM_PAINT and from RedrawWindow's paint-now branch; the guest computes any
+ * hover/pressed blend itself. Returns a suspended-thunk result (the calling thunk returns
+ * TRUE once the repaint finishes), or null to finalize normally.
  */
 export function tryRepaintOwnerDrawButton(
     ctx: { esp: number },
@@ -312,20 +491,37 @@ export function tryRepaintOwnerDrawButton(
     deps: OwnerDrawDeps,
     thunkName: string,
     stackCleanup: number,
+    directReturn?: DirectThunkReturn,
 ): ThunkResult | null {
-    if (!button.visible || button.parent === undefined) return null;
-    if (!isButtonSystemControl(button)) return null;
-    if ((button.style & BS_TYPEMASK) !== BS_OWNERDRAW) return null;
     // Guard against ghosts: a hover timer on a now-occluded menu (e.g. after a modal
     // submenu opened on top) must NOT composite its button onto the flat overlay over
-    // the dialog drawn above it. Only repaint buttons whose top-level dialog is active.
-    if (!isButtonOnActiveTopLevel(button)) return null;
-    const parent = windows.get(button.parent);
-    if (!parent?.wndProc) return null;
-    return runGuestPaintChain(
+    // the dialog drawn above it. Nested dialogs may themselves be the active HWND.
+    const parent = button.parent !== undefined ? windows.get(button.parent) : undefined;
+    const bail = !isOwnerDrawButton(button) ? 'not-owner-draw'
+        : !button.visible ? 'hidden'
+        : !isButtonOnActiveWindowTree(button) ? 'occluded'
+        : !parent?.wndProc ? 'no-parent-wndProc'
+        : null;
+    if (bail) {
+        if (paintTraceEnabled) {
+            logOwnerDrawChain(button.handle, { ctlcolor: 0, drawitem: 1, paint: 0 },
+                `${thunkName} ${bail}`);
+        }
+        return null;
+    }
+    const chain = runGuestPaintChain(
         ctx, mem,
         [{ kind: 'drawitem', child: button }],
-        { hwnd: parent.handle, wndProc: parent.wndProc },
-        deps, thunkName, stackCleanup,
+        { hwnd: parent!.handle, wndProc: parent!.wndProc },
+        deps, thunkName, stackCleanup, undefined, directReturn,
     );
+    // BeginPaint's half of the contract: the paint that just went out validates the
+    // client, or the button stays "still invalid" for GetUpdateRect and every later
+    // UpdateWindow re-posts a paint nobody asked for.
+    if (chain) clearWindowUpdate(button.handle);
+    if (paintTraceEnabled) {
+        logOwnerDrawChain(button.handle, { ctlcolor: 0, drawitem: 1, paint: 0 },
+            `${thunkName} ${chain ? 'dispatched' : 'not-dispatched'}`);
+    }
+    return chain;
 }

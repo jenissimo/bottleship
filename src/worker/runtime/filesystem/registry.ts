@@ -1,5 +1,6 @@
 import { RegistryPersistence, RegistryAccessLogEntry, PersistedRegistryState } from "./registry-persistence";
 import { Logger, LogCategory } from "../../core/logger";
+import { EmulatorConfig } from "../../core/emulator-config-manager";
 
 export type RegistryValueType = "REG_SZ" | "REG_DWORD" | "REG_BINARY" | "REG_MULTI_SZ";
 
@@ -8,6 +9,23 @@ const IMPLICIT_EMPTY_KEYS = new Set<string>([
     "hkcu\\software",
     "hklm\\software",
 ]);
+
+/** A predefined hive has ONE key space whichever spelling names it; advapi32 speaks the short
+ *  form, so the long names fold onto it. */
+const ROOT_ALIASES: Record<string, string> = {
+    HKEY_CLASSES_ROOT: "HKCR",
+    HKEY_CURRENT_USER: "HKCU",
+    HKEY_LOCAL_MACHINE: "HKLM",
+    HKEY_USERS: "HKU",
+    HKEY_CURRENT_CONFIG: "HKCC",
+    HKEY_PERFORMANCE_DATA: "HKPD",
+    HKEY_DYN_DATA: "HKDD",
+};
+
+function canonicalRoot(root: string): string {
+    const upper = root.toUpperCase();
+    return ROOT_ALIASES[upper] ?? upper;
+}
 
 function validateRegType(type: string): RegistryValueType {
     if (!VALID_REG_TYPES.has(type)) {
@@ -28,18 +46,151 @@ export interface RegistrySeed {
     values: RegistryValue[];
 }
 
+/**
+ * One guest-visible registry write, in the vocabulary of the API that produced it.
+ *
+ * The Windows registry is system-wide: a child process writing HKCU writes the hive its
+ * parent reads, and persistence belongs to the system, not to whichever process happened
+ * to call RegSetValueEx. A child runs in its own worker with its own RegistryStore, so its
+ * writes are forwarded up to the process that owns persistence (see setMutationSink).
+ */
+export type RegistryMutation =
+    | { op: "setValue"; key: string; name: string; value: RegistryValue }
+    | { op: "createKey"; root: string; path: string }
+    | { op: "deleteKey"; key: string; subKey?: string }
+    | { op: "deleteValue"; key: string; name: string };
+
+/**
+ * Which neighbour on the process tree a replayed mutation arrived from.
+ *
+ * The hive is one object shared by the whole tree, so a write has to reach every process
+ * in it, not just the one that owns persistence. Each store relays an applied mutation to
+ * every neighbour EXCEPT its origin; a process tree has no cycles, so that terminates —
+ * without the exclusion a parent and its child trade one write forever.
+ */
+export type RegistryOrigin = { from: "owner" } | { from: "child"; id?: number };
+
+/** VER_PLATFORM_WIN32_WINDOWS — the Win9x branch of EmulatorConfig.osVersion. */
+const PLATFORM_WIN32_WINDOWS = 1;
+
+function sz(name: string, data: string): RegistryValue {
+    return { name, type: "REG_SZ", data };
+}
+
+/**
+ * The keys a Windows install ALWAYS has, which no bundle should have to ship.
+ *
+ * A launcher that reads HKLM\SOFTWARE\Microsoft\DirectX\Version and finds nothing does
+ * not conclude "unknown" — it concludes DirectX is absent and refuses to start, or
+ * offers to install it. Writing that into every bundle's registry.json would be a
+ * per-game crutch for a fact about the SYSTEM, so the system provides it.
+ *
+ * Built on first READ, never at seed time: the manifest's osVersion is applied after
+ * boot seeding, and these values must describe the OS we actually report to
+ * GetVersionEx. They live outside the key store, so a bundle seed or a value the game
+ * writes shadows them, and nothing here is ever persisted as if the game had written it.
+ */
+function buildSystemDefaults(osVersion: {
+    major: number; minor: number; build: number; platformId: number;
+}): RegistrySeed[] {
+    const { major, minor, build, platformId } = osVersion;
+    const isWin9x = platformId === PLATFORM_WIN32_WINDOWS;
+    const productName = isWin9x
+        ? (minor >= 90 ? "Microsoft Windows Me" : minor >= 10 ? "Microsoft Windows 98" : "Microsoft Windows 95")
+        : (major === 5 && minor === 0 ? "Microsoft Windows 2000" : "Microsoft Windows XP");
+
+    // The shared HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion values every installer
+    // reads, plus the OS identity in the place THIS platform keeps it: Win9x under
+    // Windows\CurrentVersion, NT under Windows NT\CurrentVersion.
+    const commonCurrentVersion: RegistryValue[] = [
+        sz("ProgramFilesDir", "C:\\Program Files"),
+        sz("CommonFilesDir", "C:\\Program Files\\Common Files"),
+        sz("SystemRoot", "C:\\WINDOWS"),
+        sz("DevicePath", "C:\\WINDOWS\\INF"),
+    ];
+    const osIdentity: RegistryValue[] = isWin9x
+        ? [
+            sz("Version", productName.replace("Microsoft ", "")),
+            sz("VersionNumber", `${major}.${minor}.${build}`),
+            sz("SubVersionNumber", ""),
+            sz("ProductName", productName),
+        ]
+        : [
+            sz("CurrentVersion", `${major}.${minor}`),
+            sz("CurrentBuildNumber", String(build)),
+            sz("CurrentBuild", String(build)),
+            sz("ProductName", productName),
+            sz("CSDVersion", ""),
+            sz("SystemRoot", "C:\\WINDOWS"),
+        ];
+
+    const seeds: RegistrySeed[] = [
+        {
+            root: "HKLM", path: "Software\\Microsoft\\Windows\\CurrentVersion",
+            values: isWin9x ? [...commonCurrentVersion, ...osIdentity] : commonCurrentVersion,
+        },
+        // DirectX 9.0c — the highest version we implement (ddraw/d3d7/d3d8/d3d9). The
+        // string form is what the DX runtime writes and what launchers compare against.
+        {
+            root: "HKLM", path: "Software\\Microsoft\\DirectX",
+            values: [sz("Version", "4.09.00.0904")],
+        },
+    ];
+    if (!isWin9x) {
+        seeds.push({
+            root: "HKLM", path: "Software\\Microsoft\\Windows NT\\CurrentVersion",
+            values: osIdentity,
+        });
+    }
+    return seeds;
+}
+
 export class RegistryStore {
     private keys: Map<string, Map<string, RegistryValue>> = new Map();
+    /** Lazily built system baseline (see buildSystemDefaults); null until first read. */
+    private systemDefaults: Map<string, Map<string, RegistryValue>> | null = null;
     private gameId: string = "";
     private accessLogBuffer: RegistryAccessLogEntry[] = [];
     private onChangeCallback: (() => void) | null = null;
+    private mutationSink: ((mutation: RegistryMutation) => void) | null = null;
+    private downstreamSink: ((mutation: RegistryMutation, exceptChildId?: number) => void) | null = null;
+    private replayOrigin: RegistryOrigin | null = null;
     private readonly MAX_LOG_BUFFER_SIZE = 1000;
 
     reset(): void {
         this.keys.clear();
+        this.systemDefaults = null;
         this.accessLogBuffer = [];
         this.gameId = "";
         this.onChangeCallback = null;
+        this.mutationSink = null;
+        this.downstreamSink = null;
+        this.replayOrigin = null;
+    }
+
+    /** The system baseline, built on first use so it reflects the manifest's osVersion
+     *  (applied after boot seeding) rather than the pre-manifest default. */
+    private defaults(): Map<string, Map<string, RegistryValue>> {
+        if (this.systemDefaults) return this.systemDefaults;
+        const map = new Map<string, Map<string, RegistryValue>>();
+        for (const seed of buildSystemDefaults(EmulatorConfig.getInstance().osVersion)) {
+            const values = new Map<string, RegistryValue>();
+            for (const value of seed.values) values.set(value.name.toLowerCase(), value);
+            map.set(this.normalizeKey(seed.root, seed.path), values);
+        }
+        this.systemDefaults = map;
+        return map;
+    }
+
+    /** Stored values shadow the baseline, name by name. */
+    private mergedValues(keyHandle: string): Map<string, RegistryValue> | null {
+        const stored = this.keys.get(keyHandle);
+        const base = this.defaults().get(keyHandle);
+        if (!base) return stored ?? null;
+        if (!stored) return base;
+        const merged = new Map(base);
+        for (const [name, value] of stored) merged.set(name, value);
+        return merged;
     }
 
     seed(seed: RegistrySeed | RegistrySeed[] | any): void {
@@ -108,10 +259,11 @@ export class RegistryStore {
         const key = this.normalizeKey(root, path);
         if (this.keys.has(key)) return key;
         if (IMPLICIT_EMPTY_KEYS.has(key)) return key;
+        if (this.defaults().has(key)) return key;
         // Support opening intermediate keys: if any stored key starts with this prefix,
         // the intermediate key implicitly exists (Windows registry semantics).
         const prefix = key + "\\";
-        for (const k of this.keys.keys()) {
+        for (const k of [...this.keys.keys(), ...this.defaults().keys()]) {
             if (k.startsWith(prefix)) {
                 // Create the intermediate key so future lookups are O(1)
                 this.keys.set(key, new Map());
@@ -122,7 +274,7 @@ export class RegistryStore {
     }
 
     getValue(keyHandle: string, valueName: string): RegistryValue | null {
-        const values = this.keys.get(keyHandle);
+        const values = this.mergedValues(keyHandle);
         const value = values ? values.get(valueName.toLowerCase()) ?? null : null;
 
         // Log access
@@ -156,6 +308,7 @@ export class RegistryStore {
             data: value.data,
         });
 
+        this.emit({ op: "setValue", key: keyHandle, name: valueName, value });
         // Notify change
         this.notifyChange();
     }
@@ -175,6 +328,7 @@ export class RegistryStore {
                 result: "success",
             });
 
+            this.emit({ op: "createKey", root, path });
             // Notify change
             this.notifyChange();
         }
@@ -212,6 +366,7 @@ export class RegistryStore {
             result: "success",
         });
 
+        this.emit({ op: "deleteKey", key: baseKey, subKey });
         this.notifyChange();
         return true;
     }
@@ -240,19 +395,20 @@ export class RegistryStore {
         });
 
         if (deleted) {
+            this.emit({ op: "deleteValue", key: baseKey, name: valueName });
             this.notifyChange();
         }
         return deleted;
     }
 
     enumValues(keyHandle: string): RegistryValue[] {
-        const values = this.keys.get(keyHandle);
+        const values = this.mergedValues(keyHandle);
         if (!values) return [];
         return Array.from(values.values());
     }
 
     getKeyInfo(keyHandle: string): { valueCount: number; maxValueNameLen: number; maxValueDataLen: number } {
-        const values = this.keys.get(keyHandle);
+        const values = this.mergedValues(keyHandle);
         if (!values) return { valueCount: 0, maxValueNameLen: 0, maxValueDataLen: 0 };
 
         let maxNameLen = 0;
@@ -276,7 +432,7 @@ export class RegistryStore {
         const prefix = `${fullKey}\\`;
         const names = new Set<string>();
 
-        for (const key of this.keys.keys()) {
+        for (const key of [...this.keys.keys(), ...this.defaults().keys()]) {
             if (!key.startsWith(prefix)) continue;
             const remainder = key.slice(prefix.length);
             const next = remainder.split("\\")[0];
@@ -298,7 +454,7 @@ export class RegistryStore {
     }
 
     private normalizeKey(root: string, path: string): string {
-        const cleanRoot = root.toUpperCase();
+        const cleanRoot = canonicalRoot(root);
         const cleanPath = path.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
         return `${cleanRoot}\\${cleanPath}`.toLowerCase();
     }
@@ -326,6 +482,77 @@ export class RegistryStore {
      */
     setOnChange(callback: (() => void) | null): void {
         this.onChangeCallback = callback;
+    }
+
+    /**
+     * Forward every guest write to the process that owns persistence.
+     *
+     * A child process gets its own worker and its own store, so without this its writes
+     * live and die inside that worker: nothing there holds the gameId or the autosave the
+     * root boot installed, and the settings a configurator writes on its way out are gone
+     * before anyone could save them. The sink is the registry's half of what
+     * createChildVfsClient already does for files.
+     */
+    setMutationSink(sink: ((mutation: RegistryMutation) => void) | null): void {
+        this.mutationSink = sink;
+    }
+
+    /**
+     * Forward every guest write DOWN to the live children of this process.
+     *
+     * The upward sink alone makes the hive one-way: a parent that writes while its child
+     * runs is invisible to that child's copy, which on Windows is not a thing that can
+     * happen. `exceptChildId` is the origin exclusion that keeps the relay finite.
+     */
+    setDownstreamSink(sink: ((mutation: RegistryMutation, exceptChildId?: number) => void) | null): void {
+        this.downstreamSink = sink;
+    }
+
+    /** Replay a mutation forwarded from another process, as if this store's API produced it. */
+    // A mutation with no stated origin came from below — that is the direction that
+    // composes, so it keeps travelling up. An id-less child cannot be excluded from the
+    // downward relay; the message route always supplies one.
+    applyMutation(mutation: RegistryMutation, origin: RegistryOrigin = { from: "child" }): void {
+        // Read back inside emit(), which the setters below reach synchronously.
+        const outer = this.replayOrigin;
+        this.replayOrigin = origin;
+        try {
+            switch (mutation.op) {
+                case "setValue":
+                    this.setValue(mutation.key, mutation.name, mutation.value);
+                    break;
+                case "createKey":
+                    this.createKey(mutation.root, mutation.path);
+                    break;
+                case "deleteKey":
+                    this.deleteKey(mutation.key, mutation.subKey);
+                    break;
+                case "deleteValue":
+                    this.deleteValue(mutation.key, mutation.name);
+                    break;
+            }
+        } finally {
+            this.replayOrigin = outer;
+        }
+    }
+
+    /** Sink failures must not fail the guest's write — the local store is already correct. */
+    private emit(mutation: RegistryMutation): void {
+        const origin = this.replayOrigin;
+        if (this.mutationSink && origin?.from !== "owner") {
+            try {
+                this.mutationSink(mutation);
+            } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `Registry mutation forward failed: ${e}`);
+            }
+        }
+        if (this.downstreamSink) {
+            try {
+                this.downstreamSink(mutation, origin?.from === "child" ? origin.id : undefined);
+            } catch (e) {
+                Logger.warn(LogCategory.SYSTEM, `Registry mutation relay to children failed: ${e}`);
+            }
+        }
     }
 
     /**
@@ -367,7 +594,11 @@ export class RegistryStore {
                     data: valueData.data,
                 });
             }
-            this.keys.set(keyPath, values);
+            const sep = keyPath.indexOf("\\");
+            const key = sep < 0 ? keyPath : this.normalizeKey(keyPath.slice(0, sep), keyPath.slice(sep + 1));
+            const existing = this.keys.get(key);
+            if (existing) for (const [n, v] of values) existing.set(n, v);
+            else this.keys.set(key, values);
         }
     }
 
@@ -389,6 +620,20 @@ export class RegistryStore {
         if (this.onChangeCallback) {
             this.onChangeCallback();
         }
+    }
+
+    /**
+     * Commit this store to its container NOW.
+     *
+     * The autosave is debounced, so a process that writes its settings and calls
+     * ExitProcess in the same breath exits inside that window — the durability barrier
+     * awaits this so the write lands before the host is told the process is gone. A store
+     * with no gameId owns no container: that is a child's copy, and its writes reach disk
+     * through the owner it forwards them to, not from here.
+     */
+    async flush(): Promise<void> {
+        if (!this.gameId) return;
+        await RegistryPersistence.save(this.gameId, this.serialize());
     }
 
     /**

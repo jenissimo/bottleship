@@ -4,14 +4,23 @@ export const E_FAIL = 0x80004005;
 export const E_NOINTERFACE = 0x80004002;
 export const E_INVALIDARG = 0x80070057;
 
-// DirectDraw error codes
+// DirectDraw error codes. MAKE_DDHRESULT(n) = 0x88760000 | n; a few DDERR_* names
+// are plain aliases of the COM codes in ddraw.h and must keep those exact values.
 export const DDERR_NOTFOUND = 0x887600FF;
 export const DDERR_OUTOFVIDEOMEMORY = 0x887600E1;
-export const DDERR_INVALIDPARAMS = 0x88760006;
+export const DDERR_INVALIDPARAMS = 0x80070057; // alias of E_INVALIDARG
 export const DDERR_SURFACELOST = 0x887601C2;
 export const DDERR_NOEXCLUSIVEMODE = 0x887601B6;
 export const DDERR_WASSTILLDRAWING = 0x8876021C;
-export const DDERR_NOCLIPPER = 0x88760249;
+export const DDERR_NOCLIPPERATTACHED = 0x88760238;  // MAKE_DDHRESULT(568)
+export const DDERR_NOPALETTEATTACHED = 0x8876023C;  // MAKE_DDHRESULT(572)
+export const DDERR_CANTDUPLICATE = 0x88760247;      // MAKE_DDHRESULT(583)
+export const DDERR_SURFACEBUSY = 0x887601AE;        // MAKE_DDHRESULT(430)
+export const DDERR_NOTFLIPPABLE = 0x88760246;       // MAKE_DDHRESULT(582)
+export const DDERR_NOCOLORKEYHW = 0x887600DC;       // MAKE_DDHRESULT(220)
+export const DDERR_CANNOTDETACHSURFACE = 0x88760014; // MAKE_DDHRESULT(20)
+export const DDERR_INVALIDOBJECT = 0x88760082;       // MAKE_DDHRESULT(130)
+export const DDERR_SURFACENOTATTACHED = 0x887600D2;  // MAKE_DDHRESULT(210)
 
 // SetCooperativeLevel flags (DDSCL_* from ddraw.h)
 export const DDSCL_FULLSCREEN     = 0x00000001;
@@ -35,9 +44,25 @@ export const DDGFS_ISFLIPDONE = 0x00000002;
 
 export const DDPF_ALPHAPIXELS = 0x00000001;
 export const DDPF_FOURCC = 0x00000004;
+export const DDPF_PALETTEINDEXED4 = 0x00000008;
+export const DDPF_PALETTEINDEXEDTO8 = 0x00000010;
 export const DDPF_PALETTEINDEXED8 = 0x00000020;
 export const DDPF_RGB = 0x00000040;
+export const DDPF_PALETTEINDEXED1 = 0x00000800;
+export const DDPF_PALETTEINDEXED2 = 0x00001000;
+/** Any "the texel is a palette index" flag — the index width lives in dwRGBBitCount. */
+export const DDPF_PALETTEINDEXED_ANY =
+    DDPF_PALETTEINDEXED1 | DDPF_PALETTEINDEXED2 | DDPF_PALETTEINDEXED4 | DDPF_PALETTEINDEXED8;
 export const DDPF_ZBUFFER = 0x00000400;
+export const DDPF_STENCILBUFFER = 0x00004000;
+
+/** FourCC codes we genuinely decode (backends/webgpu/shared/dxt.ts isDxtFormat) — the answer
+ *  to IDirectDraw::GetFourCCCodes and the compressed tail of EnumTextureFormats. */
+const fourCC = (s: string): number =>
+    (s.charCodeAt(0) | (s.charCodeAt(1) << 8) | (s.charCodeAt(2) << 16) | (s.charCodeAt(3) << 24)) >>> 0;
+export const SUPPORTED_FOURCC_CODES: ReadonlyArray<number> = [
+    fourCC("DXT1"), fourCC("DXT2"), fourCC("DXT3"), fourCC("DXT4"), fourCC("DXT5"),
+];
 
 export const DDBD_8  = 0x00000800;
 export const DDBD_16 = 0x00000400;
@@ -48,6 +73,9 @@ export const DDSCAPS_PRIMARYSURFACE = 0x00000200;
 export const DDSCAPS_BACKBUFFER = 0x00000004;
 export const DDSCAPS_COMPLEX = 0x00000008;
 export const DDSCAPS_FLIP = 0x00000010;
+export const DDSCAPS_FRONTBUFFER = 0x00000020;
+export const DDSCAPS_OVERLAY = 0x00000080;
+export const DDSCAPS_OFFSCREENPLAIN = 0x00000040;
 export const DDSCAPS_SYSTEMMEMORY = 0x00000800;
 export const DDSCAPS_VIDEOMEMORY = 0x00004000;
 export const DDSCAPS_LOCALVIDMEM = 0x10000000;
@@ -62,6 +90,8 @@ export const DDSD_HEIGHT = 0x00000002;
 export const DDSD_WIDTH = 0x00000004;
 export const DDSD_PITCH = 0x00000008;
 export const DDSD_BACKBUFFERCOUNT = 0x00000020;
+/** DDSURFACEDESC only — the pre-DX6 depth request, in the union at offset 24. */
+export const DDSD_ZBUFFERBITDEPTH = 0x00000040;
 export const DDSD_PIXELFORMAT = 0x00001000;
 export const DDSD_LPSURFACE = 0x00000800;
 export const DDSD_CKDESTOVERLAY = 0x00002000; // ddckCKDestOverlay is valid
@@ -92,6 +122,7 @@ export const DDBLT_KEYDEST = 0x00002000;
 export const DDBLT_KEYSRCOVERRIDE = 0x00010000;
 export const DDBLT_KEYDESTOVERRIDE = 0x00004000;
 export const DDBLT_ROP = 0x00020000;
+export const DDBLT_DEPTHFILL = 0x02000000;
 export const DDBLT_WAIT = 0x01000000;
 
 // DDBLTFX structure (ddraw.h) - used for Blt override fields
@@ -226,6 +257,7 @@ export const DDCKEYCAPS_NOCOSTOVERLAY       = 0x00040000;
 export const CKCAPS_COMBINED = DDCKEYCAPS_SRCBLT; // 0x00000200
 
 // DDCKEY flags for SetColorKey/GetColorKey
+export const DDCKEY_COLORSPACE = 0x00000001;
 export const DDCKEY_DESTBLT = 0x00000002;
 export const DDCKEY_DESTOVERLAY = 0x00000004;
 export const DDCKEY_SRCBLT = 0x00000008;
@@ -248,9 +280,14 @@ export const DDFXCAPS_COMBINED =
     DDFXCAPS_BLTSTRETCHX |
     DDFXCAPS_BLTSTRETCHY;
 
+export const DDPCAPS_8BITENTRIES = 0x00000002; // entries index a destination palette (1/2/4-bit palettes)
 export const DDPCAPS_8BIT = 0x00000004;
-export const DDPCAPS_ALLOW256 = 0x00000002;
-export const DDPCAPS_COMBINED = DDPCAPS_8BIT | DDPCAPS_ALLOW256; // 0x00000006
+export const DDPCAPS_PRIMARYSURFACE = 0x00000010;
+export const DDPCAPS_ALLOW256 = 0x00000040;
+// What the palette implementation actually holds: 256-entry 8-bit palettes (setEntries
+// accepts all 256, index 0 and 255 included) attachable to the primary. NOT 8BITENTRIES —
+// there is no sub-8-bit palette whose entries could index another palette.
+export const DDPCAPS_COMBINED = DDPCAPS_8BIT | DDPCAPS_ALLOW256 | DDPCAPS_PRIMARYSURFACE; // 0x00000054
 
 export const DDSCAPS_COMBINED_3D = DDSCAPS_3DDEVICE | DDSCAPS_TEXTURE | DDSCAPS_ZBUFFER | DDSCAPS_VIDEOMEMORY | DDSCAPS_LOCALVIDMEM; // 0x10022000
 
@@ -259,8 +296,9 @@ export const DDSCAPS_COMBINED_3D = DDSCAPS_3DDEVICE | DDSCAPS_TEXTURE | DDSCAPS_
 export const DDDEVICEIDENTIFIER_SIZE = 1064;
 
 // DDDEVICEIDENTIFIER2 structure size and offsets (DX7, IDirectDraw7::GetDeviceIdentifier)
-// 512+512+8+4+4+4+4+16+4 = 1068 bytes
-export const DDDEVICEIDENTIFIER2_SIZE = 1068;
+// Fields sum to 1068, but LARGE_INTEGER liDriverVersion gives the struct 8-byte alignment,
+// so sizeof() rounds to 1072 — and sizeof() is what the guest's own memset/copy uses.
+export const DDDEVICEIDENTIFIER2_SIZE = 1072;
 
 export const DDDEVICEIDENTIFIER2_OFFSETS = {
     szDriver: 0,
@@ -298,10 +336,9 @@ export const HIGH_MEMORY_COM_AREA = 0x10000000; // COM/thunk allocation area
 // Debug/test constants
 export const RGB565_MAGENTA = 0xF81F; // Magenta color in RGB565 format for debug fills
 
-// Default device identifiers
-export const DEFAULT_VENDOR_ID_AMD = 0x1002;
-export const DEFAULT_DEVICE_ID_FAKE = 0x9999;
-export const DEFAULT_DRIVER_VERSION = 0x0006000400020001n; // Version 6.4.2.1
+// Adapter identity is NOT defined here — GetDeviceIdentifier answers "what card is this",
+// and the process may ask the same question through D3D8/D3D9 in the same breath. The one
+// answer lives in backends/webgpu/shared/dx-adapter-identifier.ts.
 
 export const DDPIXELFORMAT_OFFSETS = {
     size: 0,
@@ -314,13 +351,15 @@ export const DDPIXELFORMAT_OFFSETS = {
     aMask: 28,
 };
 
-export {
-    COM_OBJECT_SIZE,
-    COM_GUARD_SIZE,
-    COM_GUARD_VALUE,
-    allocateComObject,
-    checkComGuard
-} from '../../core/com/com-memory';
+// DDPIXELFORMAT unions the depth-buffer members onto the RGB ones: dwZBufferBitDepth
+// over dwRGBBitCount, dwStencilBitDepth over dwRBitMask, dwZBitMask over dwGBitMask,
+// dwStencilBitMask over dwBBitMask. Same bytes, different names when DDPF_ZBUFFER is set.
+export const DDPIXELFORMAT_Z_OFFSETS = {
+    zBufferBitDepth: DDPIXELFORMAT_OFFSETS.rgbBitCount,
+    stencilBitDepth: DDPIXELFORMAT_OFFSETS.rMask,
+    zBitMask: DDPIXELFORMAT_OFFSETS.gMask,
+    stencilBitMask: DDPIXELFORMAT_OFFSETS.bMask,
+};
 
 export const D3DRENDERSTATE_TEXTUREHANDLE = 1;
 export const D3DRENDERSTATE_ZENABLE = 7;
@@ -367,6 +406,15 @@ export const D3DRENDERSTATE_COLORKEYENABLE = 41;
 // Depth bias for z-fighting prevention (D3DRENDERSTATE_ZBIAS)
 // Range: 0-16, where 0 = no bias, higher values push geometry toward camera
 export const D3DRENDERSTATE_ZBIAS = 47;
+
+// D3DPRIMCAPS.dwMiscCaps
+export const D3DPMISCCAPS_MASKPLANES = 0x00000001;
+export const D3DPMISCCAPS_MASKZ = 0x00000002;
+export const D3DPMISCCAPS_LINEPATTERNREP = 0x00000004;
+export const D3DPMISCCAPS_CONFORMANT = 0x00000008;
+export const D3DPMISCCAPS_CULLNONE = 0x00000010;
+export const D3DPMISCCAPS_CULLCW = 0x00000020;
+export const D3DPMISCCAPS_CULLCCW = 0x00000040;
 
 // Stencil render states (D3DRS_STENCIL*)
 export const D3DRENDERSTATE_STENCILENABLE = 52;
@@ -525,6 +573,8 @@ export const D3DTSS_ALPHAOP = 4;
 export const D3DTSS_ALPHAARG1 = 5;
 export const D3DTSS_ALPHAARG2 = 6;
 export const D3DTSS_TEXTURETRANSFORMFLAGS = 24;
+export const D3DTSS_COLORARG0 = 26;
+export const D3DTSS_ALPHAARG0 = 27;
 
 // Texture coordinate transform flags (value of D3DTSS_TEXTURETRANSFORMFLAGS).
 // COUNTn = number of output coordinates produced by the stage's texture matrix;
@@ -586,10 +636,19 @@ export const D3DTOP_SUBTRACT = 10;    // Output = arg1 - arg2
 // They were previously mis-numbered (TEXTUREALPHA=11/FACTORALPHA=12/DIFFUSEALPHA=13), so a game sending
 // 13 (BLENDTEXTUREALPHA) was rendered as BLENDDIFFUSEALPHA. The shader-generator keys off the symbolic
 // names, so correcting the values here fixes the WGSL combine automatically.
-export const D3DTOP_ADDSMOOTH = 11;          // Output = arg1 + arg2 - arg1*arg2 (no WGSL impl yet → MODULATE fallback)
+export const D3DTOP_ADDSMOOTH = 11;          // Output = arg1 + arg2*(1 - arg1)
 export const D3DTOP_BLENDDIFFUSEALPHA = 12;  // Output = arg1 * diffuse.a + arg2 * (1 - diffuse.a)
 export const D3DTOP_BLENDTEXTUREALPHA = 13;  // Output = arg1 * tex.a     + arg2 * (1 - tex.a)
 export const D3DTOP_BLENDFACTORALPHA = 14;   // Output = arg1 * factor.a  + arg2 * (1 - factor.a)
+export const D3DTOP_BLENDTEXTUREALPHAPM = 15; // Output = arg1 + arg2 * (1 - tex.a); arg1 is premultiplied
+export const D3DTOP_BLENDCURRENTALPHA = 16;  // Output = arg1 * current.a + arg2 * (1 - current.a)
+export const D3DTOP_MODULATEALPHA_ADDCOLOR = 18;    // Output = arg1 + arg1.a * arg2
+export const D3DTOP_MODULATECOLOR_ADDALPHA = 19;    // Output = arg1 * arg2 + arg1.a
+export const D3DTOP_MODULATEINVALPHA_ADDCOLOR = 20; // Output = arg1 + (1 - arg1.a) * arg2
+export const D3DTOP_MODULATEINVCOLOR_ADDALPHA = 21; // Output = (1 - arg1) * arg2 + arg1.a
+export const D3DTOP_DOTPRODUCT3 = 24;        // Output = 4 * dot(arg1.rgb - 0.5, arg2.rgb - 0.5), replicated
+export const D3DTOP_MULTIPLYADD = 25;        // Output = arg1 * arg2 + arg0
+export const D3DTOP_LERP = 26;               // Output = arg1 * arg0 + arg2 * (1 - arg0)
 
 // Texture argument flags (D3DTA_*)
 export const D3DTA_SELECTMASK = 0x0000000f;  // Mask for argument selection
@@ -597,8 +656,20 @@ export const D3DTA_DIFFUSE = 0x00000000;     // Use diffuse color
 export const D3DTA_CURRENT = 0x00000001;     // Use current stage output
 export const D3DTA_TEXTURE = 0x00000002;    // Use texture color
 export const D3DTA_TFACTOR = 0x00000003;     // Use texture factor (D3DRENDERSTATE_TEXTUREFACTOR)
+export const D3DTA_SPECULAR = 0x00000004;    // Use vertex specular color (COLOR1)
+export const D3DTA_TEMP = 0x00000005;        // Use the D3DTSS_RESULTARG scratch register
 export const D3DTA_COMPLEMENT = 0x00000010;  // Complement modifier (1.0 - value)
 export const D3DTA_ALPHAREPLICATE = 0x00000020; // Replicate alpha channel to RGB
+
+// D3DTSS_RESULTARG: selects D3DTA_CURRENT (default) or D3DTA_TEMP as the stage's write target.
+// Captured generically by the device layer (stage*32+type) but not yet threaded through
+// ffp-stages.ts's per-stage packing, so D3DTA_TEMP currently reads its D3D-documented
+// (0,0,0,0) initial value for the whole cascade rather than a stage's actual RESULTARG write.
+export const D3DTSS_RESULTARG = 28;
+
+// D3DRENDERSTATE_RANGEFOGENABLE: exists identically from D3D3 through D3D9 (same value, 48),
+// not a D3D9-only addition.
+export const D3DRENDERSTATE_RANGEFOGENABLE = 48;
 
 // Clear flags
 export const D3DCLEAR_TARGET = 1;
@@ -627,9 +698,13 @@ export const DDCAPS2_PRIMARYGAMMA = 0x00020000;
 export const DDSGR_CALIBRATE = 0x00000001;
 export const DDGAMMARAMP_SIZE = 1536; // 256 * 2 * 3 (red[256], green[256], blue[256] as WORD arrays)
 
-// DDFLIP flags
+// DDFLIP flags. NOVSYNC and INTERVAL2/3/4 are DirectDraw's spelling of a present
+// interval — the same request D3DPRESENT_INTERVAL_* makes (see frame-pacer).
 export const DDFLIP_WAIT = 0x00000001;
 export const DDFLIP_NOVSYNC = 0x00000008;
+export const DDFLIP_INTERVAL2 = 0x02000000;
+export const DDFLIP_INTERVAL3 = 0x04000000;
+export const DDFLIP_INTERVAL4 = 0x08000000;
 
 export const IID_IDirect3D = "3bba0080-2421-11cf-a31a-00aa00b93356";
 export const IID_IDirect3D2 = "6aae1ec1-662a-11d0-889d-00aa00bbb76a";
@@ -648,7 +723,10 @@ export const IID_IDirect3DTexture2 = "93281502-8cf8-11d0-89ab-00a0c9054129";
 // Device GUIDs for EnumDevices/CreateDevice
 export const IID_IDirect3DRGBDevice = "a4665c60-2673-11cf-a31a-00aa00b93356";
 export const IID_IDirect3DHALDevice = "84e63de0-46aa-11cf-816f-0000c020156e";
+export const IID_IDirect3DRampDevice = "f2086b20-259f-11cf-a31a-00aa00b93356";
+export const IID_IDirect3DMMXDevice = "881949a1-d6f3-11d0-89ab-00a0c9054129";
 export const IID_IDirect3DTnLHalDevice = "f5049e78-4861-11d2-a407-00a0c90629a8";
+export const IID_IDirect3DExecuteBuffer = "4417c145-33ad-11cf-816f-0000c020156e";
 export const IID_IDirect3DLight = "4417c142-33ad-11cf-816f-0000c020156e";
 export const IID_IDirect3DMaterial = "4417c144-33ad-11cf-816f-0000c020156e";
 export const IID_IDirect3DMaterial2 = "93281503-8cf8-11d0-89ab-00a0c9054129";
@@ -720,6 +798,20 @@ export const D3DLIGHT7_OFFSETS = {
     attenuation2: 92,   // float - quadratic attenuation
     theta: 96,          // float - spot inner cone angle (radians)
     phi: 100,           // float - spot outer cone angle (radians)
+};
+
+// D3DVIEWPORT7 structure (24 bytes total).
+// Unlike D3DVIEWPORT and D3DVIEWPORT2 it has NO leading dwSize member — it starts at dwX
+// (d3dtypes.h). Reading one as if it did shifts every field by a DWORD and yields a 0x0
+// viewport for the common x=0 case.
+export const D3DVIEWPORT7_SIZE = 24;
+export const D3DVIEWPORT7_OFFSETS = {
+    x: 0,       // dwX (DWORD)
+    y: 4,       // dwY (DWORD)
+    width: 8,   // dwWidth (DWORD)
+    height: 12, // dwHeight (DWORD)
+    minZ: 16,   // dvMinZ (float)
+    maxZ: 20,   // dvMaxZ (float)
 };
 
 // D3D7 supports up to 8 hardware lights (typically)

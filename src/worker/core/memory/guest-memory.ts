@@ -24,20 +24,98 @@
 
 let _lastBuffer: ArrayBufferLike | null = null;
 let _lastPlain: Uint8Array | null = null;
+/** The exact object `_lastPlain` was derived from — see the fast path in toPlainGuestMemory. */
+let _lastRaw: Uint8Array | null = null;
+
+/** Bumped on every borrow. The dispatcher samples it around each thunk to tell a slow
+ *  thunk that DID ask for a fast view from one that indexed the Proxy per element —
+ *  see FrameProfiler.recordThunk's `noBorrow` columns. */
+let _borrows = 0;
+
+/** Monotonic count of toPlainGuestMemory/borrowGuestMemory calls (diagnostic only). */
+export function guestMemoryBorrowCount(): number {
+    return _borrows;
+}
+
+let _borrowProbe: (() => void) | null = null;
+/** Diagnostic hook run on every borrow while set — how the threaded-D3D9 transport census
+ *  names the sites that still read guest memory from inside a drain. */
+export function setGuestMemoryBorrowProbe(probe: (() => void) | null): void {
+    _borrowProbe = probe;
+}
+
+/** Dev A/B switch — see setGuestMemoryBorrowBypass. */
+let _bypass = false;
+
+/**
+ * Hand back v86's raw Proxy instead of a plain view, restoring the ~140x-slower
+ * per-element trap everywhere at once. The only way to A/B an unwrap HONESTLY: both
+ * arms then run in ONE session on ONE scene, so the µs/call comparison isn't confounded
+ * by a different game state (and, unlike FPS, survives CPU contention). Never on in
+ * normal operation. `dbg.memProxyBench(true)`.
+ */
+export function setGuestMemoryBorrowBypass(enabled: boolean): void {
+    _bypass = enabled;
+    if (enabled) { _lastBuffer = null; _lastPlain = null; _lastRaw = null; }
+}
+
+export function isGuestMemoryBorrowBypassed(): boolean {
+    return _bypass;
+}
+
+/**
+ * True for a real typed-array view, false for v86's `view()` Proxy.
+ *
+ * `ArrayBuffer.isView` reads an internal slot, so it answers WITHOUT entering the Proxy —
+ * which a Proxy over a plain object does not have. Declared as a plain boolean (not a type
+ * predicate) so it discriminates without narrowing the caller's generic to `never`.
+ */
+function isRealView(v: unknown): boolean {
+    return ArrayBuffer.isView(v);
+}
+
+/** Whether a plain view still covers live memory. `ArrayBuffer.detached` answers with a
+ *  boolean; `byteLength` answers with a number past the Smi range for a multi-GB guest,
+ *  which boxes a HeapNumber on every call of the busiest guest-memory entry point. */
+function isAttached(buffer: ArrayBufferLike | null, plain: Uint8Array): boolean {
+    const detached = (buffer as { detached?: boolean } | null)?.detached;
+    return detached === undefined ? plain.byteLength !== 0 : !detached;
+}
 
 export function toPlainGuestMemory<T extends Uint8Array | null | undefined>(raw: T): T {
+    _borrows++;
+    if (_borrowProbe !== null) _borrowProbe();
+    if (_bypass) return raw;
     if (!raw) return raw;
-    // Already a canonical Uint8Array (non-proxy / post-fix steady state) — nothing to do.
-    if (raw.constructor === Uint8Array) return raw;
+    // FAST PATH — no proxy trap. Both property reads below are `get` traps (and
+    // `.constructor` allocates a fresh `Uint8Array.bind(view)` per call), which on the
+    // busiest guest-memory entry point in the worker is the cost this module exists to
+    // remove. Identity alone proves nothing — the proxy outlives growth — so the freshness
+    // test is whether the PLAIN view's buffer is still attached (isAttached, trap-free):
+    // growth detaches the old (non-shared) ArrayBuffer, so "still attached" is the
+    // buffer-identity test the slow path performs.
+    if (raw === _lastRaw && _lastPlain !== null && isAttached(_lastBuffer, _lastPlain)) return _lastPlain as T;
+    // Already a real typed-array view (non-proxy / post-fix steady state) — nothing to do.
+    // `ArrayBuffer.isView` reads an internal slot, so it answers without entering the
+    // Proxy at all; `raw.constructor` was a `get` trap that, because the property is a
+    // function, handed back a freshly allocated `Uint8Array.bind(view)` every time the
+    // identity fast path above missed.
+    if (isRealView(raw)) return raw;
     const buffer = raw.buffer; // proxy get → the CURRENT (possibly just-grown) ArrayBuffer
     if (!buffer) return raw;
-    if (buffer === _lastBuffer && _lastPlain) return _lastPlain as T;
+    // Buffer identity alone does NOT identify a view: two subviews of one ArrayBuffer differ
+    // only in offset/length, and answering with the wrong one silently reads the wrong bytes.
+    if (buffer === _lastBuffer && _lastPlain &&
+        raw.byteOffset === _lastPlain.byteOffset && raw.length === _lastPlain.length) return _lastPlain as T;
     // NB: read `raw.length` (whitelisted in v86's view() Proxy get-trap), NOT
     // `raw.byteLength` (absent from the whitelist → trips dbg_assert in a DEBUG
     // v86 build). For a Uint8Array the two are identical.
     const plain = new Uint8Array(buffer, raw.byteOffset, raw.length);
     _lastBuffer = buffer;
     _lastPlain = plain;
+    // Armed only where the view is derived: the fast path above then answers for exactly
+    // the object whose offset/length `plain` was built from.
+    _lastRaw = raw;
     return plain as T;
 }
 
@@ -89,11 +167,14 @@ function makeStaleGuard(view: Uint8Array): Uint8Array {
         }
     };
     return new Proxy(view, {
-        get(target, prop, receiver) {
+        get(target, prop) {
             if (typeof prop === "string" && (prop === "buffer" || prop === "byteLength" || /^\d+$/.test(prop))) {
                 assertLive(prop);
             }
-            const x = Reflect.get(target, prop, receiver);
+            // Receiver must be the TYPED ARRAY, not the Proxy: buffer/byteLength/length are
+            // prototype accessors that ValidateTypedArray(this), and a Proxy has no
+            // [[TypedArrayName]] slot — forwarding the proxy makes every one of them TypeError.
+            const x = Reflect.get(target, prop, target);
             return typeof x === "function" ? x.bind(target) : x;
         },
         set(target, prop, value) {

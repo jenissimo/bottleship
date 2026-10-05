@@ -2,7 +2,28 @@
  * Shared guest-string helpers for the kernel32 file-io module family.
  * Sibling submodules (console/find/volume/path) reuse these without a cycle.
  */
-import { decodeAnsiString, EmulatorConfig } from '../../core/emulator-config-manager';
+import { decodeAnsiString, encodeAnsiString, EmulatorConfig } from '../../core/emulator-config-manager';
+
+/** SetFileApisToOEM / SetFileApisToANSI: the code page every A file API speaks. */
+let fileApisAnsi = true;
+
+export function setFileApisAnsi(ansi: boolean): void {
+    fileApisAnsi = ansi;
+}
+
+export function areFileApisAnsi(): boolean {
+    return fileApisAnsi;
+}
+
+export function fileApiCodePage(): number {
+    const config = EmulatorConfig.getInstance();
+    return fileApisAnsi ? config.ansiCodePage : config.oemCodePage;
+}
+
+/** A file-API string out to the guest, NUL included, in the file-API code page. */
+export function encodeFileApiString(str: string): Uint8Array {
+    return encodeAnsiString(str, fileApiCodePage());
+}
 
 // Windows MAX_PATH constant (260 characters)
 export const MAX_PATH = 260;
@@ -20,7 +41,7 @@ export const readStringA = (mem: Uint8Array, addr: number, maxLen: number = MAX_
         }
     }
     const strEnd = nullPos !== -1 ? nullPos : maxEnd;
-    return decodeAnsiString(mem, addr, strEnd - addr, EmulatorConfig.getInstance().ansiCodePage);
+    return decodeAnsiString(mem, addr, strEnd - addr, fileApiCodePage());
 };
 
 export const readStringW = (mem: Uint8Array, addr: number, maxChars: number = MAX_PATH): string => {

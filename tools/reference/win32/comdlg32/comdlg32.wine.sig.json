@@ -1,0 +1,103 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.877Z",
+  "module": "comdlg32",
+  "functions": [
+    {
+      "name": "ChooseColorA",
+      "argCount": 1
+    },
+    {
+      "name": "ChooseColorW",
+      "argCount": 1
+    },
+    {
+      "name": "ChooseFontA",
+      "argCount": 1
+    },
+    {
+      "name": "ChooseFontW",
+      "argCount": 1
+    },
+    {
+      "name": "CommDlgExtendedError",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "FindTextA",
+      "argCount": 1
+    },
+    {
+      "name": "FindTextW",
+      "argCount": 1
+    },
+    {
+      "name": "GetFileTitleA",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileTitleW",
+      "argCount": 3
+    },
+    {
+      "name": "GetOpenFileNameA",
+      "argCount": 1
+    },
+    {
+      "name": "GetOpenFileNameW",
+      "argCount": 1
+    },
+    {
+      "name": "GetSaveFileNameA",
+      "argCount": 1
+    },
+    {
+      "name": "GetSaveFileNameW",
+      "argCount": 1
+    },
+    {
+      "name": "PageSetupDlgA",
+      "argCount": 1
+    },
+    {
+      "name": "PageSetupDlgW",
+      "argCount": 1
+    },
+    {
+      "name": "PrintDlgA",
+      "argCount": 1
+    },
+    {
+      "name": "PrintDlgExA",
+      "argCount": 1
+    },
+    {
+      "name": "PrintDlgExW",
+      "argCount": 1
+    },
+    {
+      "name": "PrintDlgW",
+      "argCount": 1
+    },
+    {
+      "name": "ReplaceTextA",
+      "argCount": 1
+    },
+    {
+      "name": "ReplaceTextW",
+      "argCount": 1
+    }
+  ]
+}

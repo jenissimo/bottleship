@@ -4,13 +4,58 @@
  * Atomic implementation for input operations
  */
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, FastPathImplementation, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
-import { getWindowByHandle } from './window';
-import { getCapture, setCursorClipped, windows } from './shared-state';
+import {
+    clampToCursorClip, getCapture, getCursorClipRect, getVirtualScreenRect, setCursorClipRect, warpGuestCursorTo, windows,
+    getWindowByHandle,
+} from './shared-state';
+import { GUEST_INPUT_FLAG } from '../../../input/sab-layout';
+
+// The three polled key readers are the hottest thunks any title issues (a per-frame
+// input poll, millions of calls over a session), so each has a fast path. The bodies
+// live here, once, so the two tiers cannot answer differently.
+
+/** GetAsyncKeyState: SAB level + the poll()-maintained pressed-since edge bit. */
+function readAsyncKeyState(vKey: number): number {
+    const inputManager = System.getInstance().inputManager;
+    // Level read straight from the SAB bitfield (fresh-at-call, no poll() lag);
+    // the pressed-since edge bit stays poll()-maintained.
+    const isPressed = inputManager.readKeyLevelFromSab(vKey);
+    const wasPressedSince = inputManager.consumeKeyPressedSince(vKey);
+    const result = (isPressed ? 0x8000 : 0) | (wasPressedSince ? 0x0001 : 0);
+
+    inputManager.noteGuestKeyRead(vKey, isPressed);
+    return result;
+}
+
+/** GetKeyState: synchronous level + toggle bit. */
+function readKeyState(nVirtKey: number): number {
+    const inputManager = System.getInstance().inputManager;
+    const result = inputManager.getKeyState(nVirtKey);
+    inputManager.noteGuestKeyRead(nVirtKey, (result & 0x8000) !== 0);
+    return result;
+}
+
+// Reused across calls: the packed table is host-side scratch handed straight to
+// Mem.writeBytes, never retained by anyone.
+const packedKeyboardState = new Uint8Array(256);
+
+/** GetKeyboardState: 256 packed VK bytes into a guest buffer. Returns BOOL. */
+function readKeyboardState(lpKeyState: number): number {
+    const inputManager = System.getInstance().inputManager;
+    for (let vk = 0; vk < 256; vk++) {
+        const state = inputManager.getKeyState(vk);
+        packedKeyboardState[vk] = ((state & 0x8000) ? 0x80 : 0) | (state & 0x01);
+    }
+
+    inputManager.noteGuestInputFlag(GUEST_INPUT_FLAG.bulkKeyboard);
+    const written = Mem.writeBytes(lpKeyState, packedKeyboardState);
+    return written === packedKeyboardState.length ? 1 : 0;
+}
 
 export function createInputExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -51,45 +96,24 @@ export function createInputExports(): Record<string, ThunkImplementation> {
 
     exports['GetAsyncKeyState'] = (ctx, mem, args) => {
         const vKey = args[0] & 0xFF;
-
-        Logger.verbose(LogCategory.USER32, `GetAsyncKeyState(${vKey})`);
-
-        const inputManager = System.getInstance().inputManager;
-        // Level read straight from the SAB bitfield (fresh-at-call, no poll() lag);
-        // the pressed-since edge bit stays poll()-maintained.
-        const isPressed = inputManager.readKeyLevelFromSab(vKey);
-        const wasPressedSince = inputManager.consumeKeyPressedSince(vKey);
-        const result = (isPressed ? 0x8000 : 0) | (wasPressedSince ? 0x0001 : 0);
-
-        return result;
+        Logger.verboseLazy(LogCategory.USER32, () => `GetAsyncKeyState(${vKey})`);
+        return readAsyncKeyState(vKey);
     };
 
     exports['GetKeyState'] = (ctx, mem, args) => {
         const nVirtKey = args[0] & 0xFF;
-
-        Logger.verbose(LogCategory.USER32, `GetKeyState(${nVirtKey})`);
-
-        const result = System.getInstance().inputManager.getKeyState(nVirtKey);
-        return result;
+        Logger.verboseLazy(LogCategory.USER32, () => `GetKeyState(${nVirtKey})`);
+        return readKeyState(nVirtKey);
     };
 
     exports['GetKeyboardState'] = (_ctx, _mem, args) => {
         const lpKeyState = args[0] >>> 0;
-        Logger.verbose(LogCategory.USER32, `GetKeyboardState(0x${lpKeyState.toString(16)})`);
+        Logger.verboseLazy(LogCategory.USER32, () => `GetKeyboardState(0x${lpKeyState.toString(16)})`);
 
         if (!lpKeyState) {
             return 0;
         }
-
-        const inputManager = System.getInstance().inputManager;
-        const packed = new Uint8Array(256);
-        for (let vk = 0; vk < 256; vk++) {
-            const state = inputManager.getKeyState(vk);
-            packed[vk] = ((state & 0x8000) ? 0x80 : 0) | (state & 0x01);
-        }
-
-        const written = Mem.writeBytes(lpKeyState, packed);
-        return written === packed.length ? 1 : 0;
+        return readKeyboardState(lpKeyState);
     };
 
     exports['SetKeyboardState'] = (_ctx, mem, args) => {
@@ -152,23 +176,48 @@ export function createInputExports(): Record<string, ThunkImplementation> {
         return vk !== undefined ? vk : -1;
     };
 
+    // JS fallback for the Tier 1 hypercall (HANDLER_GET_CAPTURE) — a pure read of
+    // the capture owner, which WindowManager mirrors into HYPERCALL_PAGE.
     exports['GetCapture'] = (ctx, mem, args) => {
         const hwnd = getCapture();
-        Logger.verbose(LogCategory.USER32, `GetCapture() -> 0x${hwnd.toString(16)}`);
+        Logger.verboseLazy(LogCategory.USER32, () => `GetCapture() -> 0x${hwnd.toString(16)}`);
         return hwnd;
     };
 
+    // BOOL ClipCursor(const RECT *lpRect) — confines the pointer to lpRect (NULL
+    // releases). The rect is clamped to the virtual screen and an inverted one is
+    // rejected, as in wineserver set_clip_rectangle / NtUserClipCursor; a pointer
+    // already outside the new rect is warped into it there and then.
     exports['ClipCursor'] = (ctx, mem, args) => {
-        const lpRect = args[0];
-        // A non-NULL rect confines the cursor (relative/captured mouse, e.g. Unreal
-        // SetMouseCapture); NULL releases the confinement. Mirror ShowCursor's host
-        // notification (see window.ts requestHostCursorVisible) so the host can engage
-        // pointer-lock on the faithful relative-mouse signal. Track in shared-state.
-        const clip = lpRect !== 0;
-        setCursorClipped(clip);
-        self.postMessage({ type: "clip_cursor", clip });
-        Logger.verbose(LogCategory.USER32, `ClipCursor(0x${lpRect.toString(16)}) -> clip=${clip}`);
-        return 1; // TRUE
+        const lpRect = args[0] >>> 0;
+        if (!lpRect) {
+            setCursorClipRect(null);
+            Logger.verbose(LogCategory.USER32, `ClipCursor(NULL)`);
+            return 1;
+        }
+        if (lpRect + 16 > mem.length) return 0;
+        const left = Mem.readInt32(lpRect);
+        const top = Mem.readInt32(lpRect + 4);
+        const right = Mem.readInt32(lpRect + 8);
+        const bottom = Mem.readInt32(lpRect + 12);
+        if (left === null || top === null || right === null || bottom === null) return 0;
+        if (left > right || top > bottom) return 0;
+        const screen = getVirtualScreenRect();
+        const rect = {
+            left: Math.max(left, screen.left),
+            top: Math.max(top, screen.top),
+            right: Math.min(right, screen.right),
+            bottom: Math.min(bottom, screen.bottom),
+        };
+        setCursorClipRect(rect.left > rect.right || rect.top > rect.bottom ? screen : rect);
+        // wineserver set_clip_rectangle warps only when the new rect actually excludes
+        // the pointer — an unchanged confinement is not a mouse event.
+        const pos = System.getInstance().inputManager.getMouseState();
+        const confined = clampToCursorClip(pos.x, pos.y);
+        if (confined.x !== pos.x || confined.y !== pos.y) warpGuestCursorTo(confined.x, confined.y);
+        Logger.verbose(LogCategory.USER32,
+            `ClipCursor(${rect.left},${rect.top},${rect.right},${rect.bottom})`);
+        return 1;
     };
 
     exports['WindowFromPoint'] = (ctx, mem, args) => {
@@ -561,9 +610,14 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     };
 
     // BOOL RegisterRawInputDevices(PCRAWINPUTDEVICE, UINT uiNumDevices, UINT cbSize)
+    // Must FAIL: we never deliver WM_INPUT, and claiming success makes SDL2 (2.0.18+)
+    // switch focused-window mouse motion to the raw-input path and ignore
+    // WM_MOUSEMOVE coordinates — frozen in-game cursor. A failed registration is
+    // the honest contract; callers fall back to normal window messages.
     exports['RegisterRawInputDevices'] = (ctx, mem, args) => {
-        Logger.verbose(LogCategory.USER32, `RegisterRawInputDevices(uiNumDevices=${args[1] >>> 0})`);
-        return 1; // TRUE — accept the registration (we just don't deliver WM_INPUT)
+        Logger.verbose(LogCategory.USER32, `RegisterRawInputDevices(uiNumDevices=${args[1] >>> 0}) -> FALSE (no WM_INPUT delivery)`);
+        System.getInstance().scheduler.setLastError(120); // ERROR_CALL_NOT_IMPLEMENTED
+        return 0;
     };
 
     // UINT GetRegisteredRawInputDevices(PRAWINPUTDEVICE, PUINT puiNumDevices, UINT cbSize)
@@ -625,4 +679,57 @@ export function createInputExports(): Record<string, ThunkImplementation> {
     };
 
     return exports;
+}
+
+/** Fast no-op path for the identical ClipCursor rect reasserted by launcher idle loops. */
+export function registerFastPathInputFunctions(dispatcher: HleDispatcher): void {
+    if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+    const clipCursorNoop: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+        const ptr = view.getUint32(esp + 4, true);
+        const current = getCursorClipRect();
+        if (!ptr) return current === null ? 1 : null;
+        if (ptr + 16 > mem8.length) return 0;
+        const left = view.getInt32(ptr, true);
+        const top = view.getInt32(ptr + 4, true);
+        const right = view.getInt32(ptr + 8, true);
+        const bottom = view.getInt32(ptr + 12, true);
+        if (left > right || top > bottom) return 0;
+        const screen = getVirtualScreenRect();
+        const clipped = {
+            left: Math.max(left, screen.left), top: Math.max(top, screen.top),
+            right: Math.min(right, screen.right), bottom: Math.min(bottom, screen.bottom),
+        };
+        const next = clipped.left > clipped.right || clipped.top > clipped.bottom ? screen : clipped;
+        return current && current.left === next.left && current.top === next.top
+            && current.right === next.right && current.bottom === next.bottom ? 1 : null;
+    };
+    dispatcher.registerFastPath('user32', 'ClipCursor', clipCursorNoop, { trivial: true });
+
+    // The polled key readers. `trivial` is safe for all three: they only read the input
+    // SAB and OR bookkeeping bits into it — no wait, no acquire, no path that can park or
+    // switch a thread — and the busy-wait detector they skip tracks only the three time
+    // thunks, so no yield decision is lost.
+    const asyncKeyState: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+        if (esp + 8 > mem8.length) return null;
+        return readAsyncKeyState(view.getUint32(esp + 4, true) & 0xFF);
+    };
+    dispatcher.registerFastPath('user32', 'GetAsyncKeyState', asyncKeyState, { trivial: true });
+
+    const keyState: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+        if (esp + 8 > mem8.length) return null;
+        return readKeyState(view.getUint32(esp + 4, true) & 0xFF);
+    };
+    dispatcher.registerFastPath('user32', 'GetKeyState', keyState, { trivial: true });
+
+    const keyboardState: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+        if (esp + 8 > mem8.length) return null;
+        const lpKeyState = view.getUint32(esp + 4, true) >>> 0;
+        if (!lpKeyState) return 0;
+        // The whole 256-byte extent must fit before anything is observed: declining has
+        // to happen ahead of the bookkeeping bit readKeyboardState sets, or the slow path
+        // would set it a second time. The write itself is region-validated by Mem.
+        if (lpKeyState + 256 > mem8.length) return null;
+        return readKeyboardState(lpKeyState);
+    };
+    dispatcher.registerFastPath('user32', 'GetKeyboardState', keyboardState, { trivial: true });
 }

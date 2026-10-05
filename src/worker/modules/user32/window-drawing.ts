@@ -8,9 +8,47 @@ import { System } from '../../core/system';
 import { Marshaler } from '../../core/memory/marshaler';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
-import { resolveBitmapRgba, resolveIconRgba } from '../gdi32/bitmap-resolve';
+import { resolveBitmapRgba, resolveIconRgba, resolveDib32RawAlphaRgba } from '../gdi32/bitmap-resolve';
 import { desktopBackground } from '../../runtime/desktop-background';
+import { getSystemColorBrush } from './system';
 import { asArrayBufferView } from '../../../dom-buffer';
+
+const DT_CALCRECT = 0x00000400;
+const DT_SINGLELINE = 0x00000020;
+
+/** Highest COLOR_* index; bounds the sys-color-plus-one pseudo-brush encoding. */
+const COLOR_ENDCOLORS = 24;
+
+/**
+ * Shared body of DrawTextA/W and DrawTextEx*: read the RECT, lay the text out, and give
+ * the API its documented return value (the height of the drawn text). DT_CALCRECT writes
+ * the measured extent back into the caller's RECT and draws nothing — a guest that sizes
+ * a control or a dialog from that call gets a garbage layout if the RECT is not updated.
+ */
+function drawTextCommon(hdc: number, text: string, mem: Uint8Array, lpRect: number, format: number): number {
+    let rect: { left: number; top: number; right: number; bottom: number } | undefined;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    if (lpRect && lpRect + 16 <= mem.length) {
+        rect = {
+            left: view.getInt32(lpRect, true),
+            top: view.getInt32(lpRect + 4, true),
+            right: view.getInt32(lpRect + 8, true),
+            bottom: view.getInt32(lpRect + 12, true),
+        };
+    }
+
+    const layout = System.getInstance().gdiContext.drawText(hdc, text, rect, format);
+    if (!layout) return 0;
+
+    if (rect && lpRect && (format & DT_CALCRECT) !== 0) {
+        // A wrapped calc keeps the caller's width (it is the wrap limit); an unwrapped one
+        // reports the widest line.
+        const wrapped = (format & 0x10 /* DT_WORDBREAK */) !== 0 && (format & DT_SINGLELINE) === 0;
+        if (!wrapped) view.setInt32(lpRect + 8, rect.left + layout.width, true);
+        view.setInt32(lpRect + 12, rect.top + layout.height, true);
+    }
+    return layout.height;
+}
 
 function drawIconToHdc(
     hdc: number,
@@ -53,20 +91,38 @@ function composeIconFromBitmaps(
     hbmColor: number,
     hbmMask: number,
 ): { width: number; height: number; pixels: Uint8Array } | null {
+    // XP+ per-pixel-alpha cursor (nt5src curseng.cxx): a 32bpp color DIBSection
+    // whose guest bits carry any nonzero alpha is drawn alpha-blended, mask
+    // ignored (apps write the alpha into the bits directly over GDI-blitted RGB).
+    if (hbmColor) {
+        const alphaCursor = resolveDib32RawAlphaRgba(hbmColor, mem);
+        if (alphaCursor) {
+            return {
+                width: alphaCursor.width,
+                height: alphaCursor.height,
+                pixels: new Uint8Array(alphaCursor.data.buffer, alphaCursor.data.byteOffset, alphaCursor.data.byteLength),
+            };
+        }
+    }
+
     const color = hbmColor ? resolveBitmapRgba(hbmColor, mem) : null;
     const mask = hbmMask ? resolveBitmapRgba(hbmMask, mem) : null;
 
     if (color) {
         const pixels = new Uint8Array(color.data);
-        if (mask && mask.height >= color.height * 2 && mask.width >= color.width) {
+        // AND-mask semantics (nt5src sprite.cxx): screen = (screen AND mask) XOR
+        // color — mask 1 (white) keeps the screen (transparent), 0 shows the
+        // color pixel. A double-height mask stacks AND on TOP, XOR below
+        // (ICONINFO layout); a same-size mask is the AND plane alone.
+        const isDouble = !!mask && mask.height >= color.height * 2 && mask.width >= color.width;
+        if (mask && (isDouble || (mask.width >= color.width && mask.height >= color.height))) {
             const w = color.width;
             const h = color.height;
-            const andStart = mask.height / 2;
             for (let y = 0; y < h; y++) {
                 for (let x = 0; x < w; x++) {
-                    const mi = ((andStart + y) * mask.width + x) * 4;
+                    const mi = (y * mask.width + x) * 4;
                     const pi = (y * w + x) * 4;
-                    if (mask.data[mi] < 128) pixels[pi + 3] = 0;
+                    if (mask.data[mi] >= 128) pixels[pi + 3] = 0;
                 }
             }
         }
@@ -74,23 +130,24 @@ function composeIconFromBitmaps(
     }
 
     if (mask && mask.height >= 2 && mask.width > 0) {
+        // B/W icon: double-height 1bpp mask, AND on TOP, XOR below (ICONINFO).
+        // and=1,xor=0 → transparent; and=1,xor=1 → screen-invert (approximated
+        // opaque black); and=0 → xor value paints white/black directly.
         const w = mask.width;
         const h = Math.floor(mask.height / 2);
         const pixels = new Uint8Array(w * h * 4);
         for (let y = 0; y < h; y++) {
             for (let x = 0; x < w; x++) {
-                const xorI = (y * w + x) * 4;
-                const andI = ((h + y) * w + x) * 4;
+                const andI = (y * w + x) * 4;
+                const xorI = ((h + y) * w + x) * 4;
                 const pi = (y * w + x) * 4;
-                const xorOn = mask.data[xorI] > 128;
                 const andOn = mask.data[andI] > 128;
-                if (andOn) {
+                const xorOn = mask.data[xorI] > 128;
+                if (andOn && !xorOn) {
                     pixels[pi + 3] = 0;
-                } else if (xorOn) {
-                    pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = 0;
-                    pixels[pi + 3] = 255;
                 } else {
-                    pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = 255;
+                    const v = !andOn && xorOn ? 255 : 0;
+                    pixels[pi] = pixels[pi + 1] = pixels[pi + 2] = v;
                     pixels[pi + 3] = 255;
                 }
             }
@@ -101,48 +158,41 @@ function composeIconFromBitmaps(
     return null;
 }
 
+/**
+ * A brush value that may be the COLOR_* + 1 pseudo-brush Win32 accepts wherever a
+ * background brush is stored (WNDCLASS.hbrBackground, FillRect) → a real HBRUSH.
+ * Small integers can only be the encoding: no GDI handle we hand out lives there.
+ */
+export function resolveBrushHandle(hbr: number): number {
+    if (hbr === 0) return 0;
+    if (hbr > 0 && hbr <= COLOR_ENDCOLORS + 1) return getSystemColorBrush((hbr - 1) | 0);
+    return hbr;
+}
+
+/**
+ * DefWindowProc's WM_ERASEBKGND: fill `rect` (the update region's bounds) of the window's
+ * client with the class background brush. Returns false when the class has no brush —
+ * Win32 then leaves the pixels alone and DefWindowProc answers 0, which is how a window
+ * that paints its own background (games, custom-drawn frames) avoids a flash.
+ */
+export function eraseWindowBackgroundWithClassBrush(
+    hdc: number,
+    hbrBackground: number,
+    rect: { left: number; top: number; right: number; bottom: number },
+): boolean {
+    const brush = resolveBrushHandle(hbrBackground >>> 0);
+    if (!brush) return false;
+    const gdi = System.getInstance().gdiContext;
+    if (!gdi.getDC(hdc)) return false;
+    const previous = gdi.selectObject(hdc, brush);
+    const filled = gdi.fillRect(hdc, rect.left, rect.top, rect.right, rect.bottom);
+    if (previous) gdi.selectObject(hdc, previous);
+    return filled;
+}
+
 export function registerWindowDrawingExports(exports: Record<string, ThunkImplementation>): void {
     let desktopBrush = 0;
     let desktopBrushColorRef = 0;
-
-    // COLOR_* → COLORREF (0x00BBGGRR), aligned with user32/system.ts defaults.
-    const systemColors: Record<number, number> = {
-        0: 0x00C0C0C0,  // COLOR_SCROLLBAR
-        1: 0x00C0DCC0,  // COLOR_BACKGROUND
-        5: 0x00000080,  // COLOR_WINDOW
-        15: 0x00C0C0C0, // COLOR_BTNFACE
-        16: 0x00808080, // COLOR_BTNSHADOW
-    };
-    const systemBrushCache = new Map<number, number>();
-
-    function getSysColor(colorIndex: number): number {
-        return systemColors[colorIndex] ?? 0x00FFFFFF;
-    }
-
-    function resolveBrushHandle(hbr: number): number {
-        if (hbr === 0) return 0;
-
-        // Win32 FillRect accepts COLOR_* + 1 pseudo-brush values.
-        let colorIndex: number | null = null;
-        if (hbr > 0 && hbr <= 0x1F) {
-            colorIndex = (hbr - 1) | 0;
-        } else if (hbr >= 0x1000 && hbr <= 0x101F) {
-            // Compatibility with our current GetSysColorBrush stub handles.
-            colorIndex = (hbr - 0x1000) | 0;
-        }
-
-        if (colorIndex === null) return hbr;
-
-        const cached = systemBrushCache.get(colorIndex);
-        if (cached) return cached;
-
-        const brush = System.getInstance().gdiContext.createSolidBrush(getSysColor(colorIndex));
-        if (brush) {
-            systemBrushCache.set(colorIndex, brush);
-            return brush;
-        }
-        return hbr;
-    }
 
     exports['EqualRect'] = (ctx, mem, args) => {
         const lprc1 = args[0];
@@ -220,20 +270,9 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
         let text = Marshaler.readString(mem, lpchText);
         if (cchText >= 0) text = text.substring(0, cchText);
 
-        let rect: { left: number; top: number; right: number; bottom: number } | undefined;
-        if (lprc) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            rect = {
-                left: view.getInt32(lprc, true),
-                top: view.getInt32(lprc + 4, true),
-                right: view.getInt32(lprc + 8, true),
-                bottom: view.getInt32(lprc + 12, true),
-            };
-        }
-
-        Logger.verbose(LogCategory.USER32, `DrawTextExA(0x${hdc.toString(16)}, "${text}")`);
-        System.getInstance().gdiContext.drawText(hdc, text, rect, format);
-        return rect ? rect.bottom - rect.top : 20;
+        Logger.verbose(LogCategory.USER32,
+            `DrawTextExA(0x${hdc.toString(16)}, fmt=0x${(format >>> 0).toString(16)}, "${text}")`);
+        return drawTextCommon(hdc, text, mem, lprc, format);
     };
 
     exports['TabbedTextOutA'] = (ctx, mem, args) => {
@@ -357,8 +396,13 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
             ...(fIcon ? {} : { xHotspot, yHotspot }),
         });
 
-        Logger.verbose(LogCategory.USER32,
-            `CreateIconIndirect(${fIcon ? 'icon' : 'cursor'}, ${width}x${height}) -> 0x${handle.toString(16)}`);
+        Logger.verboseLazy(LogCategory.USER32, () => {
+            let opaque = 0, lit = 0;
+            for (let i = 0; i < pixels.length; i += 4) {
+                if (pixels[i + 3] > 0) { opaque++; if (pixels[i] | pixels[i + 1] | pixels[i + 2]) lit++; }
+            }
+            return `CreateIconIndirect(${fIcon ? 'icon' : 'cursor'}, ${width}x${height}, color=0x${hbmColor.toString(16)}, mask=0x${hbmMask.toString(16)}, hot=${xHotspot},${yHotspot}, composed=${!!composed}, opaque=${opaque}, lit=${lit}) -> 0x${handle.toString(16)}`;
+        });
         return handle;
     };
 
@@ -454,70 +498,31 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
     exports['DrawTextW'] = (ctx, mem, args) => {
         const hdc = args[0];
         const lpString = args[1];
-        const cchText = args[2];
+        const cchText = args[2] | 0;
         const lpRect = args[3];
         const uFormat = args[4];
 
-        // Read wide string from memory
-        const text = Marshaler.readWideString(mem, lpString);
+        let text = Marshaler.readWideString(mem, lpString);
+        if (cchText >= 0) text = text.substring(0, cchText);
 
-        // Read RECT structure
-        let rect: { left: number; top: number; right: number; bottom: number } | undefined;
-        if (lpRect) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            rect = {
-                left: view.getInt32(lpRect, true),
-                top: view.getInt32(lpRect + 4, true),
-                right: view.getInt32(lpRect + 8, true),
-                bottom: view.getInt32(lpRect + 12, true)
-            };
-        }
-
-        // Use GDI context to draw text
-        const success = System.getInstance().gdiContext.drawText(hdc, text, rect, uFormat);
-
-        if (success && lpRect) {
-            // DrawText returns the height of the drawn text
-            // For simplicity, return approximate height based on font
-            const height = rect ? rect.bottom - rect.top : 20; // Approximate
-            return Math.min(height, text.length * 15); // Rough estimate
-        }
-
-        return 0;
+        Logger.verbose(LogCategory.USER32,
+            `DrawTextW(0x${hdc.toString(16)}, fmt=0x${(uFormat >>> 0).toString(16)}, "${text}")`);
+        return drawTextCommon(hdc, text, mem, lpRect, uFormat);
     };
 
     exports['DrawTextA'] = (ctx, mem, args) => {
         const hdc = args[0];
         const lpString = args[1];
-        const cchText = args[2];
+        const cchText = args[2] | 0;
         const lpRect = args[3];
         const uFormat = args[4];
 
-        // Read ANSI string from memory
-        const text = Marshaler.readString(mem, lpString);
+        let text = Marshaler.readString(mem, lpString);
+        if (cchText >= 0) text = text.substring(0, cchText);
 
-        // Read RECT structure
-        let rect: { left: number; top: number; right: number; bottom: number } | undefined;
-        if (lpRect) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            rect = {
-                left: view.getInt32(lpRect, true),
-                top: view.getInt32(lpRect + 4, true),
-                right: view.getInt32(lpRect + 8, true),
-                bottom: view.getInt32(lpRect + 12, true)
-            };
-        }
-
-        // Use GDI context to draw text
-        const success = System.getInstance().gdiContext.drawText(hdc, text, rect, uFormat);
-
-        if (success && lpRect) {
-            // DrawText returns the height of the drawn text
-            const height = rect ? rect.bottom - rect.top : 20; // Approximate
-            return Math.min(height, text.length * 15); // Rough estimate
-        }
-
-        return 0;
+        Logger.verbose(LogCategory.USER32,
+            `DrawTextA(0x${hdc.toString(16)}, fmt=0x${(uFormat >>> 0).toString(16)}, "${text}")`);
+        return drawTextCommon(hdc, text, mem, lpRect, uFormat);
     };
 
     exports['FillRect'] = (ctx, mem, args) => {
@@ -559,7 +564,28 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
         return res ? 1 : 0;
     };
 
-    exports['CopyImage'] = (ctx, mem, args) => args[0] >>> 0;
+    // HANDLE CopyImage(HANDLE h, UINT type, int cx, int cy, UINT flags). An icon or cursor
+    // copy is a NEW handle — DestroyIcon on either must leave the other alive. Bitmaps
+    // still alias their source.
+    exports['CopyImage'] = (ctx, mem, args) => {
+        const LR_COPYRETURNORG = 0x4;
+        const LR_COPYDELETEORG = 0x8;
+        const hImage = args[0] >>> 0;
+        const cx = args[2] | 0;
+        const cy = args[3] | 0;
+        const flags = args[4] >>> 0;
+        const provider = System.getInstance().resourceProvider;
+        const src = hImage ? provider.getUserObject(hImage) : null;
+        if (!src || (src.type !== 'ICON' && src.type !== 'CURSOR')) return hImage;
+        const sameSize = (cx === 0 || cx === src.width) && (cy === 0 || cy === src.height);
+        if ((flags & LR_COPYRETURNORG) && sameSize) return hImage;
+        const { shared: _shared, systemCursorId: _systemCursorId, ...rest } = src;
+        const copy = provider.registerUserObject({ ...rest });
+        if ((flags & LR_COPYDELETEORG) && !src.shared && src.systemCursorId === undefined) {
+            provider.unregisterUserObject(hImage);
+        }
+        return copy;
+    };
     exports['GetIconInfo'] = (ctx, mem, args) => {
         const piconinfo = args[1] >>> 0;
         if (piconinfo && piconinfo + 20 <= mem.length) {

@@ -4,6 +4,7 @@
  * for big sections.
  */
 
+import { Logger, LogCategory } from '../logger';
 import { Mem } from '../memory/mem-accessor';
 import type { LoadedPEModule, PESection } from '../module-registry';
 import type {
@@ -87,35 +88,94 @@ function scanU32Table(module: LoadedPEModule, section: PESection, values: number
  * Scan for a masked byte pattern. `mask` must be same length as `pattern`;
  * 'x' means exact match, any other char (typically '?') is a wildcard.
  */
+/**
+ * Why the last scanBytes() call failed — the longest prefix it got and where.
+ *
+ * A byte-exact prologue probe that misses is otherwise a silent no-op: the hook
+ * simply never installs, and nothing downstream can tell "this build differs" from
+ * "these bytes were already patched" from "the pattern is wrong". The near-miss
+ * address plus expected-vs-actual bytes distinguishes all three at a glance, and
+ * costs one comparison per candidate position on a scan that runs once per module.
+ */
+export interface ScanMiss {
+    bestLen: number;
+    bestAddr: number;
+    expected: Uint8Array;
+    actual: Uint8Array | null;
+    /** The section itself could not be read (paging) — not a pattern mismatch at all. */
+    unreadable?: boolean;
+}
+
+let lastScanMiss: ScanMiss | null = null;
+
+const hex = (b: Uint8Array | null) =>
+    b ? Array.from(b).map(v => v.toString(16).padStart(2, '0')).join(' ') : '<unreadable>';
+
+/** Render a near-miss as evidence. Shared so the signature and function stages cannot drift. */
+function describeScanMiss(miss: ScanMiss): string {
+    if (miss.unreadable) {
+        return `SECTION UNREADABLE at 0x${miss.bestAddr.toString(16)} — nothing was compared ` +
+            `(paging/ordering, not a build difference)`;
+    }
+    return `best match ${miss.bestLen}/${miss.expected.length} bytes at 0x${miss.bestAddr.toString(16)}` +
+        `\n    expected: ${hex(miss.expected)}\n    actual:   ${hex(miss.actual)}`;
+}
+
 function scanBytes(module: LoadedPEModule, section: PESection, pattern: Uint8Array, mask: string): number {
+    lastScanMiss = null;
     if (pattern.length !== mask.length) {
-        console.error('[HLE-lib] scanBytes: pattern/mask length mismatch');
+        Logger.error(LogCategory.SYSTEM, '[HLE-lib] scanBytes: pattern/mask length mismatch');
         return -1;
     }
     const base = module.baseAddress + section.virtualAddress;
     const size = section.virtualSize;
     const bytes = Mem.readBytes(base, size);
-    if (!bytes) return -1;
+    if (!bytes) {
+        // Distinct from a pattern mismatch: nothing was compared at all. Silently
+        // treating this as "function absent" is how a paging/ordering hiccup turns
+        // into a permanently missing hook.
+        lastScanMiss = { bestLen: -1, bestAddr: base, expected: pattern, actual: null, unreadable: true };
+        return -1;
+    }
 
     const plen = pattern.length;
     const limit = size - plen;
+    let bestLen = -1;
+    let bestIdx = -1;
     for (let i = 0; i <= limit; i++) {
-        let match = true;
-        for (let j = 0; j < plen; j++) {
-            if (mask[j] === 'x' && bytes[i + j] !== pattern[j]) {
-                match = false;
-                break;
-            }
+        let j = 0;
+        for (; j < plen; j++) {
+            if (mask[j] === 'x' && bytes[i + j] !== pattern[j]) break;
         }
-        if (match) return base + i;
+        if (j === plen) return base + i;
+        if (j > bestLen) { bestLen = j; bestIdx = i; }
     }
+    lastScanMiss = {
+        bestLen,
+        bestAddr: bestIdx >= 0 ? base + bestIdx : 0,
+        expected: pattern,
+        actual: bestIdx >= 0 ? bytes.slice(bestIdx, bestIdx + plen) : null,
+    };
     return -1;
 }
 
-function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): SignatureHit | null {
+/** Consume the near-miss record left by the most recent failed prologue scan. */
+export function takeLastScanMiss(): ScanMiss | null {
+    const m = lastScanMiss;
+    lastScanMiss = null;
+    return m;
+}
+
+interface SignatureEvaluation {
+    hit: SignatureHit | null;
+    /** Near-miss evidence, when the signature was a byte scan that recorded one. */
+    miss: ScanMiss | null;
+}
+
+function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): SignatureEvaluation {
     const sectionName = (sig as any).section ?? (sig.kind === 'prologue' ? '.text' : '.rdata');
     const section = getSection(module, sectionName);
-    if (!section) return null;
+    if (!section) return { hit: null, miss: null };
 
     let address = -1;
     switch (sig.kind) {
@@ -132,8 +192,12 @@ function evaluateSignature(module: LoadedPEModule, id: string, sig: Signature): 
             address = scanBytes(module, section, sig.pattern, sig.mask);
             break;
     }
-    if (address < 0) return null;
-    return { signatureId: id, address, weight: sig.weight };
+    if (address >= 0) return { hit: { signatureId: id, address, weight: sig.weight }, miss: null };
+    // Only a byte scan leaves a record, and consuming it HERE also keeps one
+    // signature's miss from being read as another signature's — or as a function
+    // probe's — later in the run.
+    const scanned = sig.kind === 'bytes' || sig.kind === 'prologue';
+    return { hit: null, miss: scanned ? takeLastScanMiss() : null };
 }
 
 /**
@@ -192,6 +256,13 @@ export function findDirectCallsInText(module: LoadedPEModule, section: PESection
  * From a guest address inside a function body, walk backward until we hit
  * a byte sequence that looks like the start of a function.
  *
+ * ONE backward scan over all recognized prologue shapes, so the NEAREST preceding function
+ * start wins. Preferring the EBP-frame shape across the whole window instead would step over
+ * a frameless callee — zlib's `uncompress` opens `SUB ESP,0x38` with no frame pointer — and
+ * return the PREVIOUS function's entry, which the caller's body-shape window can still
+ * accept. Only the "exactly one candidate" rule stood between that and a hook on the wrong
+ * function.
+ *
  * Returns the absolute address of the prologue start, or -1 on failure.
  */
 export function backtrackToPrologue(module: LoadedPEModule, section: PESection, xrefAddr: number, maxBacktrack: number): number {
@@ -207,34 +278,25 @@ export function backtrackToPrologue(module: LoadedPEModule, section: PESection, 
     for (let i = xrefOff; i >= stop; i--) {
         const b = bytes[i];
         const b1 = bytes[i + 1];
-        const b2 = bytes[i + 2];
-        const b3 = bytes[i + 3];
-        const b4 = bytes[i + 4];
-        if (b === 0x8b && b1 === 0xff && b2 === 0x55 && b3 === 0x8b && b4 === 0xec) {
-            return base + i;
-        }
-        if (b === 0x55 && b1 === 0x8b && b2 === 0xec) {
-            return base + i;
-        }
-    }
-
-    for (let i = xrefOff; i >= stop; i--) {
-        const b = bytes[i];
-        const b1 = bytes[i + 1];
-        if ((b === 0x83 && b1 === 0xec) || (b === 0x81 && b1 === 0xec)) {
-            const prev = i > 0 ? bytes[i - 1] : 0;
-            if (prev === 0xc3 || prev === 0xc2 || prev === 0xcc || prev === 0x90) {
-                return base + i;
-            }
-        }
-    }
-
-    // Fallback for small wrappers that start with preserved-register pushes
-    // instead of an EBP frame, e.g. `push esi; mov esi, [esp+8]`.
-    for (let i = xrefOff; i >= stop; i--) {
-        const b = bytes[i];
-        const b1 = bytes[i + 1];
         const prev = i > 0 ? bytes[i - 1] : 0;
+
+        // EBP frame, with or without the /hotpatch `mov edi,edi` lead-in.
+        if (b === 0x8b && b1 === 0xff && bytes[i + 2] === 0x55 && bytes[i + 3] === 0x8b && bytes[i + 4] === 0xec) {
+            return base + i;
+        }
+        if (b === 0x55 && b1 === 0x8b && bytes[i + 2] === 0xec) {
+            return base + i;
+        }
+
+        // Everything below is only a function start when the previous byte ENDS one
+        // (ret / int3 / alignment nop) — the byte pair alone occurs mid-body.
+        const afterFunctionEnd = prev === 0xc3 || prev === 0xc2 || prev === 0xcc || prev === 0x90;
+        if (!afterFunctionEnd) continue;
+
+        // Frameless: `sub esp, imm8/imm32`.
+        if ((b === 0x83 && b1 === 0xec) || (b === 0x81 && b1 === 0xec)) return base + i;
+
+        // Small wrappers that start with preserved-register pushes, e.g. `push esi; mov esi,[esp+8]`.
         const startsWithPush = b === 0x53 || b === 0x56 || b === 0x57;
         const plausibleNext =
             b1 === 0x8b || // mov
@@ -243,11 +305,7 @@ export function backtrackToPrologue(module: LoadedPEModule, section: PESection, 
             b1 === 0x85 || // test
             b1 === 0x53 || b1 === 0x56 || b1 === 0x57 || // more pushes
             b1 === 0x6a || b1 === 0x68; // push imm8/imm32
-        if (startsWithPush && plausibleNext) {
-            if (prev === 0xc3 || prev === 0xc2 || prev === 0xcc || prev === 0x90) {
-                return base + i;
-            }
-        }
+        if (startsWithPush && plausibleNext) return base + i;
     }
     return -1;
 }
@@ -408,7 +466,7 @@ function resolveXrefCallerEntry(
             `0x${c.entry.toString(16)} score=${c.score} callers=${c.incomingCalls} ` +
             `args=[${c.usage.arg1 ? '1' : ''}${c.usage.arg2 ? '2' : ''}${c.usage.arg3 ? '3' : ''}${c.usage.arg4 ? '4' : ''}]`,
         ).join(' | ');
-        console.log(`[HLE-lib] xrefCaller candidates for 0x${signatureAddr.toString(16)}: ${summary}`);
+        Logger.log(LogCategory.SYSTEM, `[HLE-lib] xrefCaller candidates for 0x${signatureAddr.toString(16)}: ${summary}`);
     }
 
     return candidates[0].entry;
@@ -447,12 +505,31 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
     if (!module.sections || module.sections.length === 0) return null;
 
     const signatureHits: SignatureHit[] = [];
+    const nearMisses: Array<{ id: string; sig: Signature; miss: ScanMiss }> = [];
     let confidence = 0;
     for (const [id, sig] of Object.entries(descriptor.signatures)) {
-        const hit = evaluateSignature(module, id, sig);
+        const { hit, miss } = evaluateSignature(module, id, sig);
         if (hit) {
             signatureHits.push(hit);
             confidence += hit.weight;
+        } else if (miss) {
+            nearMisses.push({ id, sig, miss });
+        }
+    }
+
+    // A near-miss is only evidence once SOMETHING of this library is already in this
+    // module. With zero hits the "longest prefix" is just whichever unrelated bytes
+    // came closest, in a section that never held the library — and every module load
+    // would print one. With a hit it names the exact signature a different build
+    // moved, which is the whole difference between a patch and an RE session.
+    // scanBytes keeps only the best position, so this is one line per missed
+    // signature, not per scan position.
+    if (confidence > 0) {
+        for (const { id, sig, miss } of nearMisses) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[HLE-lib] ${descriptor.id} (${descriptor.displayName}): signature '${id}' ` +
+                `(${sig.kind}, worth +${sig.weight}) NOT MATCHED in ${module.name} — ` +
+                `confidence ${confidence}/${descriptor.minConfidence} without it; ${describeScanMiss(miss)}`);
         }
     }
 
@@ -473,12 +550,16 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
             functionMatches.push({ name, address: addr });
         } else {
             missingFunctions.push(name);
-            if (decl.required) {
-                console.warn(
-                    `[HLE-lib] ${descriptor.id}: required function '${name}' not found in ${module.name} - aborting`,
-                );
-                return null;
-            }
+            // A miss silently removes a hook that may carry a large share of guest
+            // exec-weight, so it must never be an invisible state — name it with the
+            // evidence needed to tell a build difference from an already-patched
+            // prologue (CLAUDE.md §3.4 observability).
+            const miss = takeLastScanMiss();
+            Logger.warn(LogCategory.SYSTEM,
+                `[HLE-lib] ${descriptor.id}: function '${name}' NOT FOUND in ${module.name}` +
+                `${decl.required ? ' (required — aborting)' : ' (optional — hook will NOT install)'}` +
+                (miss ? `; ${describeScanMiss(miss)}` : ''));
+            if (decl.required) return null;
         }
     }
 
@@ -491,13 +572,13 @@ export function runDetector(descriptor: LibDescriptor, module: LoadedPEModule): 
                 getSection: (name: string) => getSection(module, name),
             });
         } catch (e) {
-            console.warn(`[HLE-lib] ${descriptor.id}.resolveAdditionalFunctions threw: ${e}`);
+            Logger.warn(LogCategory.SYSTEM, `[HLE-lib] ${descriptor.id}.resolveAdditionalFunctions threw: ${e}`);
         }
         const already = new Set(functionMatches.map(m => m.name));
         for (const m of extras) {
             if (already.has(m.name)) continue;
             if (!descriptor.functions[m.name]) {
-                console.warn(
+                Logger.warn(LogCategory.SYSTEM,
                     `[HLE-lib] ${descriptor.id}: resolver produced '${m.name}' but it is not declared in functions{}`,
                 );
                 continue;

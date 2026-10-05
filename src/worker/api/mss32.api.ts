@@ -19,6 +19,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -55,6 +56,8 @@ export const mss32Module: ModuleDescriptor = {
         // Sample file operations
         makeFunc("_AIL_set_sample_file@12", 3),          // @12 = 3 args
         makeFunc("_AIL_set_named_sample_file@20", 5),    // @20 = 5 args
+        // Memory-image configuration: AILSOUNDINFO* instead of a file to parse.
+        makeFunc("_AIL_set_sample_info@8", 2),
         
         // Sample properties
         makeFunc("_AIL_set_sample_volume@8", 2),         // @8 = 2 args
@@ -62,8 +65,15 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_set_sample_playback_rate@8", 2),   // @8 = 2 args
         makeFunc("_AIL_set_sample_loop_count@8", 2),     // @8 = 2 args
         
+        // Application-supplied I/O and allocator hooks. Miles routes EVERY file it touches
+        // (samples, streams, XMI) through the callbacks installed here, so a title that
+        // reads its audio out of a pack file has no other way in.
+        makeFunc("_AIL_set_file_callbacks@16", 4),       // (open, close, seek, read)
+
         // Memory management
         makeFunc("_AIL_mem_free_lock@4", 1),             // @4 = 1 arg
+        makeFunc("_AIL_mem_use_malloc@4", 1),            // (void *fn)
+        makeFunc("_AIL_mem_use_free@4", 1),
         
         // System initialization
         makeFunc("_AIL_startup@0", 0),                    // @0 = 0 args
@@ -71,6 +81,7 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_quick_startup@20", 5),
         makeFunc("_AIL_quick_shutdown@0", 0),
         makeFunc("_AIL_set_preference@8", 2),            // @8 = 2 args
+        makeFunc("_AIL_MSS_version@8", 2),               // (C8 *buff, U32 buff_size)
         makeFunc("_MemSetPatching@4", 1),
         makeFunc("MemPoolInit", 0),
         
@@ -80,7 +91,15 @@ export const mss32Module: ModuleDescriptor = {
         
         // Digital driver
         makeFunc("_AIL_open_digital_driver@4", 1),       // @4 = 1 arg
-        
+        // MSS 3.x spells it (frequency, bits, channels, flags). The decorated name carries
+        // the byte count, so both versions coexist — but WITHOUT this entry the @16 import
+        // falls back to the @4 row and returns with RET 4, drifting the caller's stack.
+        makeFunc("_AIL_open_digital_driver@16", 4),
+        // Mixer-chain filter slots (DIG_DRIVER_STAGE): what an .asi/.flt provider is
+        // installed into once RIB has published it.
+        makeFunc("_AIL_set_digital_driver_processor@12", 3),  // (dig, stage, provider)
+        makeFunc("_AIL_digital_driver_processor@8", 2),       // (dig, stage)
+
         // Wave output
         makeFunc("_AIL_waveOutOpen@16", 4),              // @16 = 4 args
         makeFunc("_AIL_waveOutClose@4", 1),
@@ -94,14 +113,24 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_get_preference@4", 1),
         makeFunc("_AIL_close_stream@4", 1),
         makeFunc("_AIL_open_stream@12", 3),
+        // MSS 6.x: void AIL_stream_info(HSTREAM, S32*, S32*, S32*, S32*).
+        makeFunc("_AIL_stream_info@20", 5),
         makeFunc("_AIL_stream_info@8", 2),
         makeFunc("_AIL_set_stream_loop_count@8", 2),
         makeFunc("_AIL_stream_position@4", 1),
         makeFunc("_AIL_pause_stream@4", 1),
         makeFunc("_AIL_resume_stream@4", 1),
         makeFunc("_AIL_stream_position_ms@4", 1),
+        makeFunc("_AIL_stream_ms_position@12", 3),
         makeFunc("_AIL_set_stream_position@8", 2),
+        makeFunc("_AIL_set_stream_ms_position@8", 2),
+        makeFunc("_AIL_stream_ms_position@4", 1),
         makeFunc("_AIL_set_stream_playback_rate@8", 2),
+        makeFunc("_AIL_stream_playback_rate@4", 1),
+        makeFunc("_AIL_set_stream_pan@8", 2),
+        makeFunc("_AIL_set_stream_user_data@12", 3),      // (S, index, value)
+        makeFunc("_AIL_stream_user_data@8", 2),
+        makeFunc("_AIL_register_stream_callback@8", 2),
         makeFunc("_AIL_stream_status@4", 1),
         makeFunc("_AIL_load_sample_buffer@16", 4),
         makeFunc("_AIL_minimum_sample_buffer_size@12", 3),
@@ -109,6 +138,7 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_sample_buffer_ready@4", 1),
         makeFunc("_AIL_sample_buffer_info@20", 5),
         makeFunc("_AIL_set_sample_user_data@12", 3),
+        makeFunc("_AIL_register_EOS_callback@8", 2),     // (HSAMPLE, AILSAMPLECB)
         // Digital driver config / service / HWND (often used by Bink/MSS)
         makeFunc("_AIL_digital_configuration@16", 4),
         makeFunc("_AIL_HWND@0", 0),
@@ -128,20 +158,52 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_redbook_pause@4", 1),
         makeFunc("_AIL_redbook_resume@4", 1),
         makeFunc("_AIL_redbook_position@4", 1),
+        makeFunc("_AIL_redbook_track@4", 1),
+        makeFunc("_AIL_redbook_id@4", 1),
+        makeFunc("_AIL_redbook_eject@4", 1),
+        makeFunc("_AIL_redbook_retract@4", 1),
         // 3D provider enumeration
         makeFunc("_AIL_enumerate_3D_providers@12", 3),
+        makeFunc("_AIL_enumerate_filters@12", 3),
+        makeFunc("_AIL_open_filter@8", 2),
+        makeFunc("_AIL_set_filter_sample_preference@12", 3),
+        makeFunc("_AIL_set_sample_processor@12", 3),
+        makeFunc("_AIL_sample_ms_position@12", 3),
+        makeFunc("_AIL_set_sample_ms_position@8", 2),
+        makeFunc("_AIL_set_sample_position@8", 2),
+        makeFunc("_AIL_sample_granularity@4", 1),
+        makeFunc("_AIL_active_sample_count@4", 1),
+        makeFunc("_AIL_digital_CPU_percent@4", 1),
+        makeFunc("_AIL_set_sample_loop_block@12", 3),
+        makeFunc("_AIL_set_3D_sample_loop_block@12", 3),
+        makeFunc("_AIL_set_3D_sample_obstruction@8", 2),
+        makeFunc("_AIL_set_3D_sample_occlusion@8", 2),
+        makeFunc("_AIL_set_3D_sample_preference@12", 3),
+        makeFunc("_AIL_3D_sample_cone@16", 4),
+        makeFunc("_AIL_3D_provider_attribute@12", 3),
+        makeFunc("_AIL_3D_sample_attribute@12", 3),
+        makeFunc("_AIL_3D_sample_length@4", 1),
+        makeFunc("_AIL_3D_sample_offset@4", 1),
+        makeFunc("_AIL_set_3D_sample_offset@8", 2),
         // 3D audio provider stubs
         makeFunc("_AIL_open_3D_provider@4", 1),
         makeFunc("_AIL_close_3D_provider@4", 1),
         makeFunc("_AIL_allocate_3D_sample_handle@4", 1),
         makeFunc("_AIL_release_3D_sample_handle@4", 1),
         makeFunc("_AIL_set_3D_sample_file@8", 2),
+        makeFunc("_AIL_set_3D_sample_info@8", 2),
         makeFunc("_AIL_start_3D_sample@4", 1),
         makeFunc("_AIL_stop_3D_sample@4", 1),
         makeFunc("_AIL_set_3D_position@16", 4),
         makeFunc("_AIL_set_3D_velocity@20", 5),
         makeFunc("_AIL_set_3D_velocity_vector@16", 4),
         makeFunc("_AIL_set_3D_orientation@28", 7),
+        // 3D getters — out-parameter twins of the setters above. An engine that
+        // keeps no copy of what it set reads these back every frame.
+        makeFunc("_AIL_3D_position@16", 4),
+        makeFunc("_AIL_3D_velocity@16", 4),
+        makeFunc("_AIL_3D_orientation@28", 7),
+        makeFunc("_AIL_3D_sample_distances@12", 3),
         makeFunc("_AIL_set_3D_sample_volume@8", 2),
         makeFunc("_AIL_set_3D_sample_distances@12", 3),
         makeFunc("_AIL_set_3D_sample_cone@16", 4),
@@ -162,6 +224,8 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_3D_speaker_type@4", 1),
         makeFunc("_AIL_set_3D_speaker_type@8", 2),
         makeFunc("_AIL_set_3D_provider_preference@12", 3),
+        makeFunc("_AIL_set_3D_distance_factor@8", 2),
+        makeFunc("_AIL_DLS_open@28", 7),
         makeFunc("_AIL_quick_handles@12", 3),
         // Redist directory
         makeFunc("_AIL_set_redist_directory@4", 1),
@@ -170,6 +234,7 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_digital_handle_reacquire@4", 1),
         // Raw sample data
         makeFunc("_AIL_set_sample_address@8", 2),
+        makeFunc("_AIL_set_sample_address@12", 3),      // (S, start, len)
         // CPU features
         makeFunc("_AIL_MMX_available@0", 0),
         // Timer API (Miles 4.x often uses these)
@@ -213,6 +278,11 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_sequence_loop_count@4", 1),
         makeFunc("_AIL_set_sequence_tempo@12", 3),
         makeFunc("_AIL_sequence_position@12", 3),
+        makeFunc("_AIL_sequence_ms_position@12", 3),      // (S, S32 *total_ms, S32 *cur_ms)
+        makeFunc("_AIL_set_sequence_user_data@12", 3),    // (S, index, value)
+        makeFunc("_AIL_sequence_user_data@8", 2),
+        makeFunc("_AIL_register_sequence_callback@8", 2),
+        makeFunc("_AIL_MIDI_to_XMI@20", 5),               // (MIDI, MIDI_size, XMI*, XMI_size*, flags)
         // MIDI driver stubs
         makeFunc("_AIL_install_MDI_driver_file@8", 2),
         makeFunc("_AIL_open_XMIDI_driver@4", 1),
@@ -221,12 +291,44 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("_AIL_MDI_driver_type@4", 1),
         makeFunc("_AIL_set_XMIDI_master_volume@8", 2),
         makeFunc("_AIL_XMIDI_master_volume@4", 1),
-        // Digital master volume
+        // Digital master volume. MSS 5 spells it S32 0–127, MSS 6 adds the F32
+        // 0.0–1.0 `_level` pair; a shipped DLL exports both and they share a field.
         makeFunc("_AIL_set_digital_master_volume@8", 2),
         makeFunc("_AIL_digital_master_volume@4", 1),
+        makeFunc("_AIL_set_digital_master_volume_level@8", 2),
+        makeFunc("_AIL_digital_master_volume_level@4", 1),
+        // MSS 6 F32 per-voice volume: a left/right level pair, or a volume/pan pair.
+        // An F32 argument still occupies one stdcall slot, so the @N is unsurprising.
+        makeFunc("_AIL_set_sample_volume_levels@12", 3),
+        makeFunc("_AIL_sample_volume_levels@12", 3),
+        makeFunc("_AIL_set_sample_volume_pan@12", 3),
+        makeFunc("_AIL_sample_volume_pan@12", 3),
+        makeFunc("_AIL_set_stream_volume_levels@12", 3),
+        makeFunc("_AIL_stream_volume_levels@12", 3),
+        makeFunc("_AIL_set_stream_volume_pan@12", 3),
+        makeFunc("_AIL_stream_volume_pan@12", 3),
+        makeFunc("_AIL_sample_user_data@8", 2),
+        makeFunc("_AIL_set_DirectSound_HWND@8", 2),
 
         // Auto-generated from reference signatures
         makeFunc("AIL_allocate_sample_handle", 1),
+        // RIB (Miles' Resource Interchange Broker) — every provider the engine loads
+        // (.m3d/.flt/.asi decoders and 3D drivers) imports these two from mss32 to publish
+        // its own entry points, so one missing name fails the whole provider's load.
+        makeFunc("RIB_alloc_provider_handle", 1), // HPROVIDER (U32 module)
+        makeFunc("_RIB_alloc_provider_handle@4", 1),
+        makeFunc("RIB_free_provider_handle", 1),
+        makeFunc("_RIB_free_provider_handle@4", 1),
+        makeFunc("RIB_register_interface", 4),   // provider, interface_name, entry_count, entries
+        makeFunc("_RIB_register_interface@16", 4),
+        makeFunc("RIB_unregister_interface", 4),
+        makeFunc("_RIB_unregister_interface@16", 4),
+        // Provider enumeration/lookup — the other half of RIB. A provider .asi/.m3d is
+        // loaded through load_application_providers, then walked with enumerate_providers.
+        makeFunc("_RIB_enumerate_providers@12", 3),     // (name, before, HPROENUM*)
+        makeFunc("_RIB_provider_system_data@8", 2),     // (HPROVIDER, index)
+        makeFunc("_RIB_provider_user_data@8", 2),
+        makeFunc("_RIB_load_application_providers@4", 1), // (C8 *filespec)
         makeFunc("AIL_close_digital_driver", 1),
         makeFunc("AIL_close_stream", 1),
         makeFunc("AIL_delay", 1),
@@ -275,6 +377,8 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("AIL_set_preference", 2),
         makeFunc("AIL_set_sample_address", 2),
         makeFunc("AIL_set_sample_file", 3),
+        makeFunc("AIL_set_sample_info", 2),
+        makeFunc("AIL_set_3D_sample_info", 2),
         makeFunc("AIL_set_sample_loop_count", 2),
         makeFunc("AIL_set_sample_pan", 2),
         makeFunc("AIL_set_sample_playback_rate", 2),
@@ -297,7 +401,9 @@ export const mss32Module: ModuleDescriptor = {
         makeFunc("AIL_startup", 0),
         makeFunc("AIL_stop_sample", 1),
         makeFunc("AIL_stop_timer", 1),
-        makeFunc("AIL_stream_info", 2),
+        // MSS 5/6 ABI: (HSTREAM, S32 *datarate, S32 *sndtype, S32 *length, S32 *memory).
+        // The 2-arg @8 export is a separate legacy entry point, not this one.
+        makeFunc("AIL_stream_info", 5),
         makeFunc("AIL_stream_position", 1),
         makeFunc("AIL_stream_position_ms", 1),
         makeFunc("AIL_stream_status", 1),

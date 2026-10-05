@@ -35,8 +35,8 @@ import {
     parseInnoHeader,
     type InnoParseResult,
 } from "@bottleship/formats/inno";
-import { UnpackDecoder } from "@bottleship/formats/unpack";
-import { extractInstallShield, detectInstallShieldStem } from "@bottleship/formats/installshield";
+import { UnpackDecoder, Md5 } from "@bottleship/formats/unpack";
+import { extractInstallShield, detectInstallShieldStem, parseInstallShieldHeader, resolveInstallPath, FILE_INVALID } from "@bottleship/formats/installshield";
 import { findCabinet, parseCabHeader, extractCabToMap, type CabInflateBlock } from "@bottleship/formats/cab";
 import { detectFreeArc, extractFreeArcToMap, FreeArcUnsupportedError } from "@bottleship/formats/freearc";
 import { unzipToMap } from "@bottleship/formats/zip";
@@ -154,7 +154,16 @@ function collectInstallShieldVolumes(
 
     let best: Group | null = null;
     for (const g of groups.values()) {
-        if (!g.header || g.volumes.size === 0) continue;
+        if (g.volumes.size === 0) continue;
+        if (!g.header) {
+            const primary = g.volumes.get(1);
+            if (!primary || primary.length < 20 || new DataView(primary.buffer, primary.byteOffset).getUint32(0, true) !== 0x28635349) continue;
+            const info = parseInstallShieldHeader(primary);
+            if (info.major > 5) continue;
+            g.header = primary; // IS5 may embed its descriptor in the first cabinet.
+        }
+        const info = parseInstallShieldHeader(g.header);
+        if (!info.files.some(f => !(f.flags & FILE_INVALID) && f.name && resolveInstallPath(f, info) !== null)) continue;
         if (!best || g.cabBytes > best.cabBytes) best = g;
     }
     if (!best) return null;
@@ -282,38 +291,74 @@ const installShieldFormat: InstallerFormat<{ header: Uint8Array; volumes: Map<nu
     label: "InstallShield cabinet",
     detect(files) {
         const { stem } = detectInstallShield(files.keys());
-        if (!stem) return null;
-        return collectInstallShieldVolumes(files, stem);
+        if (stem) return collectInstallShieldVolumes(files, stem);
+        let best: ReturnType<typeof collectInstallShieldVolumes> = null;
+        let bestSize = 0;
+        for (const rel of files.keys()) {
+            const candidate = /(?:^|[\\/])([^_\\/][^\\/]*)1\.cab$/i.exec(rel)?.[1];
+            if (!candidate) continue;
+            const vols = collectInstallShieldVolumes(files, candidate);
+            if (!vols) continue;
+            const size = [...vols.volumes.values()].reduce((sum, bytes) => sum + bytes.length, 0);
+            if (size > bestSize) { best = vols; bestSize = size; }
+        }
+        return best;
     },
     async extract(files, vols, ctx) {
         // Basename index of the container, for resolving EXTERNAL files the cabinet
         // references but doesn't pack (dataOffset=0). The browser passes the whole
         // disc in `files`, so the loose payload (Max Payne's Levels/x_level*.ras) is
         // here; the streaming CLI instead supplies ctx.resolveExternalFile.
-        const byBase = new Map<string, Uint8Array>();
-        for (const [rel, data] of files) {
-            const b = (rel.split(/[\\/]/).pop() ?? rel).toLowerCase();
-            if (!byBase.has(b)) byBase.set(b, data);
-        }
+        const resolveLoose = createInstallShieldExternalResolver(files);
         const gameFiles = await extractInstallShield(vols.header, vols.volumes, {
             verifySize: true,
             verifyMd5: true,
             inflateRaw: ctx.inflateRaw,
-            resolveExternal: async (fd) => {
+            resolveExternal: async (fd, outPath) => {
                 if (ctx.resolveExternalFile) {
                     const ext = await ctx.resolveExternalFile(fd.name, fd.expanded);
                     if (ext) return ext;
                 }
-                return byBase.get(fd.name.toLowerCase()) ?? null;
+                return resolveLoose(fd.name, fd.expanded, outPath, fd.md5 ?? undefined);
             },
             onProgress: (done, total, name) => {
                 const pct = total > 0 ? Math.round((done / total) * 100) : 0;
                 ctx.onProgress?.(pct, `Extracting ${name}`);
             },
         });
+        if (gameFiles.size === 0) throw new Error('InstallShield cabinet contains no available game payload');
         return { gameFiles, note: "InstallShield cabinet" };
     },
 };
+
+/** Resolve loose media files without confusing equal basenames in different directories. */
+export function createInstallShieldExternalResolver(files: Map<string, Uint8Array>) {
+    const byBase = new Map<string, Array<{ path: string; data: Uint8Array }>>();
+    for (const [rel, data] of files) {
+        const path = normSlash(rel).toLowerCase();
+        const base = path.split('/').pop()!;
+        const candidates = byBase.get(base) ?? [];
+        candidates.push({ path, data });
+        byBase.set(base, candidates);
+    }
+    return (name: string, size: number, installPath: string, md5?: Uint8Array): Uint8Array | null => {
+        let candidates = (byBase.get(name.toLowerCase()) ?? []).filter(c => c.data.length === size);
+        if (candidates.length > 1 && md5?.some(byte => byte !== 0)) {
+            candidates = candidates.filter(c => {
+                const hash = new Md5(); hash.update(c.data);
+                return hash.finalize().every((byte, i) => byte === md5[i]);
+            });
+            if (!candidates.length) throw new Error(`No checksum-matching InstallShield external file: ${installPath}`);
+        }
+        const wanted = normSlash(installPath).toLowerCase();
+        const exact = candidates.filter(c => c.path === wanted || c.path.endsWith(`/${wanted}`));
+        const matches = exact.length ? exact : candidates;
+        if (matches.length > 1 && matches.some(c => c.data.some((byte, i) => byte !== matches[0]!.data[i]))) {
+            throw new Error(`Ambiguous InstallShield external file: ${installPath} (${size} bytes)`);
+        }
+        return matches[0]?.data ?? null;
+    };
+}
 
 const freeArcFormat: InstallerFormat<{ name: string; data: Uint8Array }[]> = {
     id: "freearc",

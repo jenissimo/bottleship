@@ -12,6 +12,7 @@
 
 import type { RawVertexElement } from "../d3d9/shader";
 import { declTypeSize } from "./vsd-parser";
+import { D3DVSDT_D3DCOLOR, D3DVSDT_UBYTE4 } from "./vsd-constants";
 import { Logger, LogCategory } from "../../../core/logger";
 
 // D3DFVF flags (subset used for decl synthesis)
@@ -43,6 +44,23 @@ export interface DeclStreamCopy {
     srcOffset: number;
     dstOffset: number;
     size: number;
+    /** Bytes the canonical FVF slot occupies. `size` is smaller only for a degraded texcoord
+     *  (FLOAT1 into the 8-byte UV slot); the interleaver must ZERO the remainder per vertex —
+     *  D3D reads a missing component as 0, and the scratch buffer is reused across draws, so
+     *  leaving it uncopied hands the FFP whatever the previous draw wrote there. */
+    slotSize: number;
+    /** True when the source element is a raw D3DVSDT_UBYTE4-typed COLOR register (component
+     *  order R,G,B,A in memory) landing in the canonical D3DCOLOR slot the FFP renderer always
+     *  assumes (B,G,R,A in memory) — the copy must swap bytes 0 and 2 (R<->B), or R/B render
+     *  swapped on screen with no warning (see Finding 1, docs/d3d8-parity/04-vertex-pipeline.md). */
+    swizzleColorBytes?: boolean;
+}
+
+/** D3DVSDT_D3DCOLOR and D3DVSDT_UBYTE4 are both 4 bytes but different component order;
+ *  `declTypeSize` alone can't tell them apart. Only these two types can ever satisfy a
+ *  canonical COLOR slot (both size 4) — this decides whether a byte-swizzle copy is needed. */
+function colorElementSwizzle(usage: number, type: number): boolean {
+    return usage === D3DDECLUSAGE_COLOR && type === D3DVSDT_UBYTE4;
 }
 
 export interface DeclFfpMapping {
@@ -141,16 +159,36 @@ export function declToSyntheticFvf(elements: RawVertexElement[], declStride: num
     }
 
     if (maxStream > 0) {
-        // Multi-stream: build a canonical interleave plan. Each element must fill its
-        // canonical FVF slot exactly (size match), otherwise the FFP layout cannot
-        // represent it and the draw would read garbage — bail to the unfaithful path.
+        // Multi-stream: build a canonical interleave plan. A POSITION/NORMAL/COLOR element
+        // that can't fill its canonical slot still bails the WHOLE plan (those corrupt the
+        // rest of the vertex if misread); a non-FLOAT2 TEXCOORD degrades PER-ELEMENT instead
+        // (Finding 2, docs/d3d8-parity/04-vertex-pipeline.md) — position/normal/color that
+        // were perfectly representable must not be thrown away over one texcoord's size.
         const copies: DeclStreamCopy[] = [];
         let mappable = faithful;
+        let degraded = false;
         for (const e of elements) {
             const dstOffset = canonicalFvfOffset(fvf, e.usage, e.usageIndex);
             const slotSize = canonicalFvfSlotSize(fvf, e.usage, e.usageIndex);
             const size = declTypeSize(e.type);
-            if (dstOffset === null || slotSize === null || size !== slotSize) {
+            if (dstOffset === null || slotSize === null) {
+                mappable = false;
+                break;
+            }
+            if (size !== slotSize) {
+                if (e.usage === D3DDECLUSAGE_TEXCOORD) {
+                    // FLOAT1/FLOAT3/FLOAT4: components are stored in order, so the leading
+                    // min(size, slotSize) bytes are still valid (u[,v]) — copy just those and
+                    // drop the rest, rather than discarding this element (or the whole plan).
+                    Logger.warn(
+                        LogCategory.SYSTEM,
+                        `D3D8 decl-only multi-stream: texcoord idx=${e.usageIndex} type=${e.type} ` +
+                        `is not FLOAT2 (canonical slot=8B, element=${size}B) — copying leading ${Math.min(size, slotSize)}B only`,
+                    );
+                    copies.push({ stream: e.stream, srcOffset: e.offset, dstOffset, size: Math.min(size, slotSize), slotSize });
+                    degraded = true;
+                    continue;
+                }
                 Logger.warn(
                     LogCategory.SYSTEM,
                     `D3D8 decl-only multi-stream: element usage=${e.usage} idx=${e.usageIndex} type=${e.type} ` +
@@ -159,42 +197,62 @@ export function declToSyntheticFvf(elements: RawVertexElement[], declStride: num
                 mappable = false;
                 break;
             }
-            copies.push({ stream: e.stream, srcOffset: e.offset, dstOffset, size });
+            copies.push({
+                stream: e.stream, srcOffset: e.offset, dstOffset, size, slotSize,
+                swizzleColorBytes: colorElementSwizzle(e.usage, e.type) || undefined,
+            });
         }
         if (mappable) {
-            return { fvf, stride: canonicalFvfStride(fvf), faithful: true, interleave: copies };
+            return { fvf, stride: canonicalFvfStride(fvf), faithful: !degraded, interleave: copies };
         }
         return { fvf, stride: declStride, faithful: false };
     }
 
-    // Single-stream: if every element already sits at its canonical FVF offset, the
-    // guest VB is consumed as-is. Otherwise remap each element into a canonical
-    // FVF-ordered vertex (the same interleave mechanism the multi-stream path uses)
-    // rather than reading the guest layout at the wrong offsets — a mismatched offset
-    // would otherwise feed the FFP renderer garbage (e.g. UVs read as positions).
+    // Single-stream: if every element already sits at its canonical FVF offset AND needs no
+    // byte-level conversion, the guest VB is consumed as-is. Otherwise remap each element into
+    // a canonical FVF-ordered vertex (the same interleave mechanism the multi-stream path
+    // uses) rather than reading the guest layout at the wrong offsets — a mismatched offset
+    // would otherwise feed the FFP renderer garbage (e.g. UVs read as positions). A non-FLOAT2
+    // texcoord degrades per-element here too (Finding 2), same as the multi-stream path.
     const copies: DeclStreamCopy[] = [];
     let needsRemap = false;
     let remappable = faithful;
+    let degraded = false;
     for (const e of elements) {
         const dstOffset = canonicalFvfOffset(fvf, e.usage, e.usageIndex);
         const slotSize = canonicalFvfSlotSize(fvf, e.usage, e.usageIndex);
         const size = declTypeSize(e.type);
-        if (dstOffset === null || slotSize === null || size !== slotSize) {
-            // Element can't be represented in a canonical FVF slot (e.g. a FLOAT3
-            // texcoord where FVF only carries FLOAT2) — remap can't preserve it.
+        if (dstOffset === null || slotSize === null) {
             remappable = false;
             break;
         }
-        if (dstOffset !== e.offset) needsRemap = true;
-        copies.push({ stream: e.stream, srcOffset: e.offset, dstOffset, size });
+        if (size !== slotSize) {
+            if (e.usage === D3DDECLUSAGE_TEXCOORD) {
+                Logger.warn(
+                    LogCategory.SYSTEM,
+                    `D3D8 decl-only single-stream: texcoord idx=${e.usageIndex} type=${e.type} ` +
+                    `is not FLOAT2 (canonical slot=8B, element=${size}B) — copying leading ${Math.min(size, slotSize)}B only`,
+                );
+                copies.push({ stream: e.stream, srcOffset: e.offset, dstOffset, size: Math.min(size, slotSize), slotSize });
+                needsRemap = true;
+                degraded = true;
+                continue;
+            }
+            // Element can't be represented in a canonical FVF slot — remap can't preserve it.
+            remappable = false;
+            break;
+        }
+        const swizzleColorBytes = colorElementSwizzle(e.usage, e.type);
+        if (dstOffset !== e.offset || swizzleColorBytes) needsRemap = true;
+        copies.push({ stream: e.stream, srcOffset: e.offset, dstOffset, size, slotSize, swizzleColorBytes: swizzleColorBytes || undefined });
     }
 
     if (!needsRemap) {
-        // Offsets already canonical — consume the guest VB directly.
+        // Offsets already canonical and no byte conversion needed — consume the guest VB as-is.
         return { fvf, stride: declStride, faithful };
     }
     if (remappable) {
-        return { fvf, stride: canonicalFvfStride(fvf), faithful: true, interleave: copies };
+        return { fvf, stride: canonicalFvfStride(fvf), faithful: faithful && !degraded, interleave: copies };
     }
 
     Logger.warn(

@@ -9,13 +9,46 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
-import { getWindowByHandle } from './window';
+import { getWindowByHandle } from './shared-state';
 import { encodeAnsi } from '../codepage-utils';
+import { getBuiltinSystemClass, getDefDlgProcAddress, getDefWindowProcAddress, resetDefWindowProcCache } from './system-classes';
+import { getSystemCursorHandle, IDC_ARROW } from './system-cursors';
 
 // Store for registered window classes
 const windowClasses: Map<number, any> = new Map();
 const windowClassesByName: Map<string, number> = new Map();
 let nextClassId = 1;
+
+/**
+ * Classes the APP registered itself (RegisterClass*), as opposed to the OS classes we
+ * materialize (Button/Static/#32770) and the comctl32 classes we implement in JS.
+ *
+ * A window of an app class has no default appearance at all: Windows paints it solely by
+ * running the app's own wndProc, so if we never deliver WM_PAINT to it, it is invisible
+ * forever — no chrome, no fallback. That is the distinction our paint paths need, and it
+ * is not derivable from the class NAME.
+ */
+const appRegisteredClasses = new Set<string>();
+
+/** True if `className` was registered by the guest, not materialized by us. */
+export function isAppRegisteredClass(className: string | undefined): boolean {
+    return !!className && appRegisteredClasses.has(className.toLowerCase());
+}
+
+/**
+ * Bundle-switch reset: app classes carry WNDPROC pointers into the old process
+ * image, and the builtin materialization cache holds cursor handles / the
+ * DefWindowProc thunk address from the old layout — all stale after an
+ * in-worker game switch.
+ */
+export function resetUser32Classes(): void {
+    windowClasses.clear();
+    windowClassesByName.clear();
+    appRegisteredClasses.clear();
+    nextClassId = 1;
+    builtinClassInfoCache.clear();
+    resetDefWindowProcCache();
+}
 
 /**
  * Internal helper to register a window class
@@ -25,6 +58,9 @@ function registerClassInternal(className: string, classInfo: any): number {
     const classId = nextClassId++;
     windowClasses.set(classId, classInfo);
     windowClassesByName.set(className.toLowerCase(), classId);
+    // Everything routed here that is not a builtin materialization came from the app's
+    // own RegisterClass* — see appRegisteredClasses.
+    if (classInfo?.appRegistered) appRegisteredClasses.add(className.toLowerCase());
 
     // Also register in system WindowManager
     System.getInstance().windowManager.registerClass({
@@ -38,7 +74,15 @@ function registerClassInternal(className: string, classInfo: any): number {
     return classId;
 }
 
-/** Register a built-in class if not already present (comctl32 common controls). */
+/**
+ * Register a built-in class if not already present (comctl32 common controls).
+ *
+ * hCursor defaults to IDC_ARROW because that is what the DLLs that own these classes
+ * pass to RegisterClass — every comctl32 class but the hotkey and rebar ones, which
+ * register a NULL cursor and must say so explicitly. A class cursor is not decoration:
+ * DefWindowProc's WM_SETCURSOR is the only thing that re-shows a pointer after an app
+ * SetCursor(NULL), and it does nothing at all when the class cursor is NULL.
+ */
 export function registerBuiltinClass(className: string, classInfo: Partial<{
     style: number;
     lpfnWndProc: number;
@@ -46,6 +90,11 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
     cbWndExtra: number;
     hInstance: number;
     hbrBackground: number;
+    hCursor: number;
+    /** When set, CreateWindowEx marks the window as a JS system control. */
+    controlClass?: string;
+    /** A dedicated HLE subsystem owns this class's pixels. */
+    externalPaintManaged?: boolean;
 }>): void {
     if (windowClassesByName.has(className.toLowerCase())) return;
     registerClassInternal(className, {
@@ -56,9 +105,11 @@ export function registerBuiltinClass(className: string, classInfo: Partial<{
         cbWndExtra: classInfo.cbWndExtra ?? 0,
         hInstance: classInfo.hInstance ?? 0,
         hIcon: 0,
-        hCursor: 0,
+        hCursor: classInfo.hCursor ?? getSystemCursorHandle(IDC_ARROW),
         hbrBackground: classInfo.hbrBackground ?? 0,
         lpszMenuName: 0,
+        controlClass: classInfo.controlClass,
+        externalPaintManaged: classInfo.externalPaintManaged,
     });
     Logger.log(LogCategory.USER32, `registerBuiltinClass: "${className}"`);
 }
@@ -102,7 +153,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -148,7 +200,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -224,7 +277,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -300,7 +354,8 @@ export function createClassExports(): Record<string, ThunkImplementation> {
                 hIcon,
                 hCursor,
                 hbrBackground,
-                lpszMenuName
+                lpszMenuName,
+                appRegistered: true,
             };
 
             const classId = registerClassInternal(className, classInfo);
@@ -633,7 +688,9 @@ export function createClassExports(): Record<string, ThunkImplementation> {
         if (win.classId !== undefined) {
             return getWindowClass(win.classId) ?? null;
         }
-        return getWindowClassByName(win.title) ?? null;
+        // CreateWindowEx records classId only when the app passed an ATOM, so the name is
+        // the only key most windows have — and it is the class NAME, never the caption.
+        return getWindowClassByName(resolveWindowClassName(hWnd) ?? '') ?? null;
     }
 
     exports['GetClassLongA'] = (ctx, mem, args) => {
@@ -787,10 +844,68 @@ const SYSTEM_CLASS_STUB = Object.freeze({
     className: '',
 });
 
+// Materialized descriptors for built-in user32 classes (Button/Static/Edit/...).
+// Cached so SetClassLong mutations stick, like the real per-process global class.
+const builtinClassInfoCache = new Map<string, any>();
+
+function getBuiltinClassInfo(nameLower: string): any | undefined {
+    const cached = builtinClassInfoCache.get(nameLower);
+    if (cached) return cached;
+    const descr = getBuiltinSystemClass(nameLower);
+    if (!descr) return undefined;
+    const info = {
+        className: descr.name,
+        style: descr.style,
+        lpfnWndProc: descr.classProc === 'DefDlgProcA'
+            ? getDefDlgProcAddress()
+            : getDefWindowProcAddress(),
+        cbClsExtra: 0,
+        cbWndExtra: descr.cbWndExtra,
+        hInstance: 0,
+        hIcon: 0,
+        hCursor: getSystemCursorHandle(descr.idcCursor),
+        hbrBackground: 0,
+        lpszMenuName: 0,
+        isBuiltinSystemClass: true,
+    };
+    builtinClassInfoCache.set(nameLower, info);
+    // Mirror it into the WindowManager as well. Materializing it only here left
+    // createWindow to fall back on its "unknown class" stub, which registers style 0 —
+    // so every class-style behaviour of a system control (CS_DBLCLKS, CS_VREDRAW,
+    // CS_PARENTDC, CS_SAVEBITS) silently evaporated, and a listbox never produced a
+    // double-click.
+    //
+    // Correct that stub IN PLACE rather than replacing the map entry: a WindowObject
+    // captured the class object at creation, and the dialog manager creates a `#32770`
+    // straight through WindowManager.createWindow — long before anything asks user32
+    // for the class. A fresh registration would leave every existing dialog holding the
+    // style-0 stub, which is a half-registration with no symptom until someone
+    // double-clicks.
+    const wm = System.getInstance().windowManager;
+    const existing = wm.getClass(descr.name);
+    if (existing) {
+        existing.wndProc = info.lpfnWndProc;
+        existing.style = descr.style;
+    } else {
+        wm.registerClass({
+            name: descr.name,
+            wndProc: info.lpfnWndProc,
+            hInstance: 0,
+            style: descr.style,
+            hbrBackground: 0,
+        });
+    }
+    return info;
+}
+
 export function getWindowClassByName(name: string) {
     const nameLower = name.toLowerCase();
     const classId = windowClassesByName.get(nameLower);
     if (classId) return windowClasses.get(classId);
+    // Built-in user32 control classes — pre-registered by the real OS, an
+    // app-registered class of the same name shadows them (checked above).
+    const builtin = getBuiltinClassInfo(nameLower);
+    if (builtin) return builtin;
     // Built-in common controls (registered lazily by comctl32 / CreateWindowEx)
     if (nameLower === 'sysanimate32' || nameLower === 'sysanimate32_class') {
         return SYSTEM_CLASS_STUB;

@@ -27,6 +27,14 @@ export const DRAW_COST_PHASES = [
     "ringup",
     "submit",
     "tail",
+    "iscan",
+    "p_tex",
+    "p_uni",
+    "p_pipe",
+    "p_hash",
+    "p_sync",
+    "s_idx",
+    "s_pipe",
 ] as const;
 export type DrawCostPhase = typeof DRAW_COST_PHASES[number];
 
@@ -38,7 +46,29 @@ export const DC = {
     ringup: 3,
     submit: 4,
     tail: 5,
+    /** Indexed draws: everything before `prepare` — index min/max scan, range validation,
+     *  and the ring-space check (which can force a mid-frame flush). */
+    iscan: 6,
+    /** NESTED inside `prepare`: per-stage texture ensure/sync/content-hash. */
+    p_tex: 7,
+    /** NESTED inside `prepare`: uniform + storage slot writes. */
+    p_uni: 8,
+    /** NESTED inside `prepare`: pipeline lookup/creation. */
+    p_pipe: 9,
+    /** NESTED inside `p_tex`: the guest-memory content-hash scan alone. */
+    p_hash: 10,
+    /** NESTED inside `p_tex`: syncSurfaceFromMemory + mip upload (the consequence of a
+     *  dirty texture). Splitting it from p_hash separates "the scan costs" from
+     *  "the scan keeps deciding to re-upload". */
+    p_sync: 11,
+    /** NESTED inside `submit`: index fan-expand / rebase marshal + index-ring upload. */
+    s_idx: 12,
+    /** NESTED inside `submit`: the MegaBatch pipeline lookup. */
+    s_pipe: 13,
 } as const;
+
+/** Phases whose time is already counted inside another phase — excluded from the total. */
+const NESTED = new Set<number>([DC.p_tex, DC.p_uni, DC.p_pipe, DC.p_hash, DC.p_sync, DC.s_idx, DC.s_pipe]);
 
 const N = DRAW_COST_PHASES.length;
 
@@ -98,11 +128,14 @@ class DrawCostProfiler {
     report() {
         const draws = this.draws || 1;
         const windowMs = performance.now() - this.windowStart;
+        // Nested phases are a breakdown OF `prepare`, not additional time: counting them
+        // in the denominator would make every percentage a share of an inflated total.
         let totalMs = 0;
-        for (let i = 0; i < N; i++) totalMs += this.sum[i];
+        for (let i = 0; i < N; i++) if (!NESTED.has(i)) totalMs += this.sum[i];
 
         const phases = DRAW_COST_PHASES.map((name, i) => ({
             phase: name,
+            nested: NESTED.has(i) || undefined,
             totalMs: +this.sum[i].toFixed(2),
             perDrawUs: +((this.sum[i] / draws) * 1000).toFixed(2),
             maxUs: +(this.max[i] * 1000).toFixed(2),

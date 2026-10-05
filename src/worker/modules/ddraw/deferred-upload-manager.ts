@@ -314,6 +314,17 @@ export class DeferredUploadManager {
         this.dirtySurfaces.delete(surface);
     }
 
+    /** Membership describes the IMAGE, so a Flip must carry it with the storage it
+     *  renames — otherwise the batch uploads whichever buffer now sits in that slot. */
+    isPendingUpload(surface: DirectDrawSurfaceState): boolean {
+        return this.dirtySurfaces.has(surface);
+    }
+
+    setPendingUpload(surface: DirectDrawSurfaceState, pending: boolean): void {
+        if (pending) this.dirtySurfaces.add(surface);
+        else this.dirtySurfaces.delete(surface);
+    }
+
     /**
      * Clear all pending uploads without uploading (for emergency cleanup).
      */

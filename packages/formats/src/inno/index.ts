@@ -29,6 +29,7 @@ export {
     EmbeddedSliceReader,
     MultiSliceReader,
     parseSliceFile,
+    parseSliceSource,
     SLICE_HEADER_SIZE,
     chunkMapKey,
     decompressChunkStream,
@@ -43,6 +44,7 @@ export {
     normalizeInnoDestination,
     type ExtractOptions,
     type ExtractSink,
+    type AssemblyStore,
 } from "./extractor";
 export { filterExtractableFiles, handleCollision } from "./collisions";
 export { localesOfCheck, checkAllowsLanguage, detectInstallerLanguages, defaultLanguage } from "./check-lang";

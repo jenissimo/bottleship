@@ -4,9 +4,24 @@
  */
 
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
-import { OpenGLContext, GLDrawCommandType, GLDrawCommand, GLTexGenState, mat4Multiply } from "./context";
 import {
-    GL_RGBA, GL_UNSIGNED_BYTE, GL_QUADS,
+    OpenGLContext, GLDrawCommandType, GLTexGenState, mat4Multiply, VERT_FLOATS,
+    CMD_I32, CMD_F32, CI_TYPE,
+    CI_MODE, CI_VERT_OFFSET, CI_VERT_COUNT, CI_FLAGS, CI_DEPTH_FUNC, CI_BLEND_SRC, CI_BLEND_DST,
+    CI_ALPHA_FUNC, CI_CULL_FACE, CI_FRONT_FACE, CI_TEX_ID0, CI_TEX_ID1, CI_TEXENV0, CI_TEXENV1,
+    CI_SHADE_MODEL, CI_FOG_MODE, CI_POLYGON_MODE, CI_STENCIL_FUNC, CI_STENCIL_REF, CI_STENCIL_MASK,
+    CI_STENCIL_FAIL, CI_STENCIL_ZFAIL, CI_STENCIL_ZPASS, CI_STENCIL_WRITE_MASK,
+    CI_SCISSOR_X, CI_SCISSOR_Y, CI_SCISSOR_W, CI_SCISSOR_H, CI_VP_X, CI_VP_Y, CI_VP_W, CI_VP_H,
+    CI_CLEAR_MASK, CI_CLEAR_STENCIL,
+    CF_ALPHA_REF, CF_FOG_R, CF_FOG_G, CF_FOG_B, CF_FOG_A, CF_FOG_DENSITY, CF_FOG_START, CF_FOG_END,
+    CF_DEPTH_RANGE_NEAR, CF_DEPTH_RANGE_FAR,
+    CI_COMBINE0_RGB, CI_COMBINE0_ALPHA, CI_COMBINE1_RGB, CI_COMBINE1_ALPHA,
+    CF_ENV_COLOR0, CF_ENV_COLOR1, COMBINER_WORD_DEFAULT,
+    CF_CLEAR_R, CF_CLEAR_G, CF_CLEAR_B, CF_CLEAR_A, CF_CLEAR_DEPTH,
+    DF_BLEND, DF_COLOR_MASK_R, DF_COLOR_MASK_G, DF_COLOR_MASK_B, DF_COLOR_MASK_A, DF_SCISSOR,
+} from "./context";
+import {
+    GL_RGBA, GL_RGB, GL_BGR, GL_BGRA, GL_UNSIGNED_BYTE, GL_QUADS, GL_COLOR_BUFFER_BIT, GL_TRIANGLES,
     GL_NO_ERROR, GL_INVALID_ENUM, GL_INVALID_VALUE,
     GL_DEPTH_TEST, GL_BLEND, GL_ALPHA_TEST, GL_CULL_FACE, GL_TEXTURE_2D,
     GL_FOG, GL_SCISSOR_TEST, GL_LIGHTING, GL_LIGHT0,
@@ -23,10 +38,17 @@ import {
     GL_SHININESS, GL_EMISSION, GL_AMBIENT_AND_DIFFUSE,
     GL_FRONT, GL_BACK, GL_FRONT_AND_BACK,
     GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_TEXTURE_ENV_COLOR,
+    GL_COMBINE_RGB, GL_COMBINE_ALPHA, GL_RGB_SCALE, GL_ALPHA_SCALE,
+    GL_SOURCE0_RGB, GL_SOURCE1_RGB, GL_SOURCE2_RGB,
+    GL_SOURCE0_ALPHA, GL_SOURCE1_ALPHA, GL_SOURCE2_ALPHA,
+    GL_OPERAND0_RGB, GL_OPERAND1_RGB, GL_OPERAND2_RGB,
+    GL_OPERAND0_ALPHA, GL_OPERAND1_ALPHA, GL_OPERAND2_ALPHA,
     GL_COLOR_LOGIC_OP, GL_LINE_STIPPLE, GL_RESCALE_NORMAL,
     GL_TEXTURE_GEN_S, GL_TEXTURE_GEN_T, GL_TEXTURE_GEN_R, GL_TEXTURE_GEN_Q,
     GL_SAMPLE_ALPHA_TO_COVERAGE, GL_SAMPLE_COVERAGE,
-    GL_RENDER,
+    GL_RENDER, GL_SELECT, GL_FEEDBACK, GL_INVALID_OPERATION,
+    GL_STACK_OVERFLOW, GL_STACK_UNDERFLOW, NAME_STACK_MAX_DEPTH,
+    GL_CLIP_PLANE0, GL_CLIP_PLANE5,
     GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS,
     GL_UNPACK_SKIP_ROWS, GL_PACK_ALIGNMENT,
     GL_S, GL_T, GL_R, GL_Q,
@@ -35,7 +57,10 @@ import {
     GL_NORMAL_MAP, GL_REFLECTION_MAP,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { convertPixelsToRGBA8 } from "./texture";
+import { arenaReserve } from "./immediate";
 
 // ---- Helpers ----
 
@@ -63,6 +88,37 @@ function stubWarn(name: string): number {
         Logger.warn(LogCategory.GDI32, `OpenGL stub: ${name}`);
     }
     return 0;
+}
+
+/**
+ * One scalar glTexEnv{i,f} parameter. The float and integer entry points differ only
+ * in how the guest spelled the value, so both land here: an enum is the truncated
+ * value, a scale is the value itself.
+ */
+function setTexEnvParam(ctx: OpenGLContext, target: number, pname: number, value: number): void {
+    if (target !== GL_TEXTURE_ENV) return;
+    const unit = ctx.textureUnits[ctx.activeTextureUnit];
+    const e = value | 0;
+    switch (pname) {
+        case GL_TEXTURE_ENV_MODE: unit.texEnvMode = e; break;
+        case GL_COMBINE_RGB: unit.combineRgb = e; break;
+        case GL_COMBINE_ALPHA: unit.combineAlpha = e; break;
+        case GL_SOURCE0_RGB: unit.srcRgb[0] = e; break;
+        case GL_SOURCE1_RGB: unit.srcRgb[1] = e; break;
+        case GL_SOURCE2_RGB: unit.srcRgb[2] = e; break;
+        case GL_SOURCE0_ALPHA: unit.srcAlpha[0] = e; break;
+        case GL_SOURCE1_ALPHA: unit.srcAlpha[1] = e; break;
+        case GL_SOURCE2_ALPHA: unit.srcAlpha[2] = e; break;
+        case GL_OPERAND0_RGB: unit.opRgb[0] = e; break;
+        case GL_OPERAND1_RGB: unit.opRgb[1] = e; break;
+        case GL_OPERAND2_RGB: unit.opRgb[2] = e; break;
+        case GL_OPERAND0_ALPHA: unit.opAlpha[0] = e; break;
+        case GL_OPERAND1_ALPHA: unit.opAlpha[1] = e; break;
+        case GL_OPERAND2_ALPHA: unit.opAlpha[2] = e; break;
+        case GL_RGB_SCALE: unit.rgbScale = value; break;
+        case GL_ALPHA_SCALE: unit.alphaScale = value; break;
+        default: break;
+    }
 }
 
 function readF32(mem: Uint8Array, ptr: number): number {
@@ -118,6 +174,65 @@ for (let i = 0; i < 8; i++) KNOWN_CAPS.add(GL_LIGHT0 + i);
 
 // ---- Export factory ----
 
+/**
+ * A scissored glClear(GL_COLOR_BUFFER_BIT) as a solid quad over the scissor rect.
+ * WebGPU can only clear a whole attachment via loadOp, so the region has to be drawn.
+ * The quad carries the CLEAR's semantics, not the app's current draw state: no blending,
+ * no depth test or write, no alpha test, no cull, no texture — only the colour mask,
+ * which glClear does honour. Viewport = the scissor rect, so clip-space -1..1 covers
+ * exactly the region GL would have cleared.
+ */
+function emitScissorColorClear(ctx: OpenGLContext): void {
+    // Same rule pushGLDrawCommand applies: nothing rasterizes outside GL_RENDER.
+    if (ctx.renderMode !== GL_RENDER) return;
+    const base = arenaReserve(ctx, 6);
+    const arena = ctx.vertArena;
+    const d = arena.data;
+    const r = ctx.clearR, g = ctx.clearG, b = ctx.clearB, a = ctx.clearA;
+    const xy = [-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1];
+    for (let v = 0; v < 6; v++) {
+        const o = base + v * VERT_FLOATS;
+        d[o] = xy[v * 2]; d[o + 1] = xy[v * 2 + 1]; d[o + 2] = 0; d[o + 3] = 1;
+        d[o + 4] = r; d[o + 5] = g; d[o + 6] = b; d[o + 7] = a;
+        d[o + 8] = 0; d[o + 9] = 0; d[o + 10] = 1;
+        d[o + 11] = 0; d[o + 12] = 0; d[o + 13] = 0; d[o + 14] = 0;
+    }
+    arena.used = base + 6 * VERT_FLOATS;
+
+    let flags = DF_SCISSOR;
+    if (ctx.colorMaskR) flags |= DF_COLOR_MASK_R;
+    if (ctx.colorMaskG) flags |= DF_COLOR_MASK_G;
+    if (ctx.colorMaskB) flags |= DF_COLOR_MASK_B;
+    if (ctx.colorMaskA) flags |= DF_COLOR_MASK_A;
+
+    const stream = ctx.commands;
+    const idx = stream.alloc(GLDrawCommandType.DRAW);
+    const I = stream.i32;
+    const i = idx * CMD_I32;
+    // alloc() does not clear the record — it hands back a recycled ring slot and expects the
+    // emitter to write every field its command type reads. This one writes far fewer fields
+    // than a real draw, so anything left over would come from whatever draw held the slot last
+    // frame: a stale CI_TEX_ID0 samples the clear through that texture, a stale
+    // CI_POLYGON_MODE turns it into a wireframe X. Zero first, then write what a clear means.
+    I.fill(0, i, i + CMD_I32);
+    stream.f32.fill(0, idx * CMD_F32, (idx + 1) * CMD_F32);
+    I[i + CI_TYPE] = GLDrawCommandType.DRAW;
+    I[i + CI_MODE] = GL_TRIANGLES;
+    I[i + CI_VERT_OFFSET] = base;
+    I[i + CI_VERT_COUNT] = 6;
+    I[i + CI_FLAGS] = flags;
+    I[i + CI_SCISSOR_X] = ctx.scissorX;
+    I[i + CI_SCISSOR_Y] = ctx.scissorY;
+    I[i + CI_SCISSOR_W] = ctx.scissorW;
+    I[i + CI_SCISSOR_H] = ctx.scissorH;
+    I[i + CI_VP_X] = ctx.scissorX;
+    I[i + CI_VP_Y] = ctx.scissorY;
+    I[i + CI_VP_W] = ctx.scissorW;
+    I[i + CI_VP_H] = ctx.scissorH;
+    ctx.frameSnapshot.drawCalls++;
+    ctx.frameSnapshot.vertexCount += 6;
+}
+
 export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
     const getMem = () => ctx.process.getCurrentMemory();
 
@@ -127,6 +242,14 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             ctx.enableFlags.add(cap);
             if (cap === GL_TEXTURE_2D) {
                 ctx.textureUnits[ctx.activeTextureUnit].enabled2d = true;
+            }
+            // We publish GL_MAX_CLIP_PLANES = 6 because GL 1.3 forbids anything less,
+            // but nothing clips. The error is toward drawing MORE (a mirror/water pass
+            // shows geometry it should have cut), which is visible but not corrupting —
+            // still, say so the first time one is actually turned on rather than let the
+            // gap stay silent.
+            if (cap >= GL_CLIP_PLANE0 && cap <= GL_CLIP_PLANE5) {
+                stubWarn(`glEnable(GL_CLIP_PLANE${cap - GL_CLIP_PLANE0}): user clip planes are not applied`);
             }
             return 0;
         },
@@ -189,22 +312,44 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             ctx.viewportY = args[1] | 0;
             ctx.viewportW = args[2] | 0;
             ctx.viewportH = args[3] | 0;
-            ctx.commands.push({
-                type: GLDrawCommandType.VIEWPORT,
-                x: ctx.viewportX, y: ctx.viewportY,
-                w: ctx.viewportW, h: ctx.viewportH,
-            });
+            {
+                const stream = ctx.commands;
+                const i = stream.alloc(GLDrawCommandType.VIEWPORT) * CMD_I32;
+                stream.i32[i + CI_VP_X] = ctx.viewportX;
+                stream.i32[i + CI_VP_Y] = ctx.viewportY;
+                stream.i32[i + CI_VP_W] = ctx.viewportW;
+                stream.i32[i + CI_VP_H] = ctx.viewportH;
+            }
             return 0;
         },
 
         // Clear
         glClear: (_c, _m, args) => {
-            ctx.commands.push({
-                type: GLDrawCommandType.CLEAR,
-                mask: args[0] >>> 0,
-                r: ctx.clearR, g: ctx.clearG, b: ctx.clearB, a: ctx.clearA,
-                depth: ctx.clearDepth, stencil: ctx.clearStencil,
-            });
+            // GL clears only the SCISSOR BOX when GL_SCISSOR_TEST is on; WebGPU's loadOp
+            // clears the whole attachment. A mid-frame panel clear then wipes everything
+            // drawn before it — Serious Sam's NETRICSA briefing came out as one flat green
+            // screen because its LAST panel clear erased the whole frame. Emit the colour
+            // part as a solid quad over the scissor rect instead; depth/stencil bits (if
+            // any) still go through the plain clear below.
+            const clearMask = args[0] | 0;
+            if ((clearMask & GL_COLOR_BUFFER_BIT) !== 0 && ctx.enableFlags.has(GL_SCISSOR_TEST)
+                && ctx.scissorW > 0 && ctx.scissorH > 0) {
+                emitScissorColorClear(ctx);
+                const rest = clearMask & ~GL_COLOR_BUFFER_BIT;
+                if (rest === 0) return 0;
+                args = [rest, ...args.slice(1)];
+            }
+            const stream = ctx.commands;
+            const idx = stream.alloc(GLDrawCommandType.CLEAR);
+            const i = idx * CMD_I32;
+            const f = idx * CMD_F32;
+            stream.i32[i + CI_CLEAR_MASK] = args[0] | 0;
+            stream.i32[i + CI_CLEAR_STENCIL] = ctx.clearStencil | 0;
+            stream.f32[f + CF_CLEAR_R] = ctx.clearR;
+            stream.f32[f + CF_CLEAR_G] = ctx.clearG;
+            stream.f32[f + CF_CLEAR_B] = ctx.clearB;
+            stream.f32[f + CF_CLEAR_A] = ctx.clearA;
+            stream.f32[f + CF_CLEAR_DEPTH] = ctx.clearDepth;
             ctx.frameSnapshot.clearCalls++;
             return 0;
         },
@@ -529,22 +674,19 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             return 0;
         },
 
-        // Texture environment
+        // Texture environment.
+        //
+        // Every pname of ARB/EXT_texture_env_combine lands here. A combiner parameter
+        // that is silently dropped is worse than an unsupported extension: the engine
+        // already COLLAPSED its multi-pass lightmap path into the one pass it thinks we
+        // are about to combine for it, and that pass then renders as plain MODULATE.
         glTexEnvf: (_c, _m, args) => {
-            const target = args[0] >>> 0;
-            const pname = args[1] >>> 0;
-            if (target === GL_TEXTURE_ENV && pname === GL_TEXTURE_ENV_MODE) {
-                ctx.textureUnits[ctx.activeTextureUnit].texEnvMode = bitsToF32(args[2]) | 0;
-            }
+            setTexEnvParam(ctx, args[0] >>> 0, args[1] >>> 0, bitsToF32(args[2]));
             return 0;
         },
 
         glTexEnvi: (_c, _m, args) => {
-            const target = args[0] >>> 0;
-            const pname = args[1] >>> 0;
-            if (target === GL_TEXTURE_ENV && pname === GL_TEXTURE_ENV_MODE) {
-                ctx.textureUnits[ctx.activeTextureUnit].texEnvMode = args[2] | 0;
-            }
+            setTexEnvParam(ctx, args[0] >>> 0, args[1] >>> 0, args[2] | 0);
             return 0;
         },
 
@@ -552,9 +694,13 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             const target = args[0] >>> 0;
             const pname = args[1] >>> 0;
             const ptr = args[2] >>> 0;
-            if (target === GL_TEXTURE_ENV && pname === GL_TEXTURE_ENV_MODE) {
-                ctx.textureUnits[ctx.activeTextureUnit].texEnvMode = readF32(getMem(), ptr) | 0;
+            if (target === GL_TEXTURE_ENV && pname === GL_TEXTURE_ENV_COLOR) {
+                const mem = getMem();
+                const env = ctx.textureUnits[ctx.activeTextureUnit].envColor;
+                for (let i = 0; i < 4; i++) env[i] = readF32(mem, ptr + i * 4);
+                return 0;
             }
+            setTexEnvParam(ctx, target, pname, readF32(getMem(), ptr));
             return 0;
         },
 
@@ -562,9 +708,14 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             const target = args[0] >>> 0;
             const pname = args[1] >>> 0;
             const ptr = args[2] >>> 0;
-            if (target === GL_TEXTURE_ENV && pname === GL_TEXTURE_ENV_MODE) {
-                ctx.textureUnits[ctx.activeTextureUnit].texEnvMode = readU32(getMem(), ptr) | 0;
+            if (target === GL_TEXTURE_ENV && pname === GL_TEXTURE_ENV_COLOR) {
+                const mem = getMem();
+                const env = ctx.textureUnits[ctx.activeTextureUnit].envColor;
+                // Integer colour components are scaled from the full int range (GL 1.3 §2.13).
+                for (let i = 0; i < 4; i++) env[i] = (readU32(mem, ptr + i * 4) | 0) / 2147483647;
+                return 0;
             }
+            setTexEnvParam(ctx, target, pname, readU32(getMem(), ptr) | 0);
             return 0;
         },
 
@@ -649,16 +800,67 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         glAccum: () => stubWarn("glAccum"),
         glClearAccum: () => stubWarn("glClearAccum"),
 
-        // Render mode
-        glRenderMode: () => GL_RENDER,
+        // ---- Render mode / selection ----
+        //
+        // The return value is the number of records the mode being LEFT produced, and a
+        // picking caller walks exactly that many records out of its own buffer. Answering
+        // with the GL_RENDER enum (7680) told every caller "7680 hits" over a buffer
+        // nothing had written — it then parses uninitialized memory as hit records and
+        // either picks a wrong object or walks off the end of its array.
+        //
+        // We record no hits, so selection fails CLOSED (0 hits = nothing under the
+        // cursor) instead of failing wild.
+        glRenderMode: (_c, _m, args) => {
+            const mode = args[0] >>> 0;
+            const previous = ctx.renderMode;
+            if (mode !== GL_RENDER && mode !== GL_SELECT && mode !== GL_FEEDBACK) {
+                ctx.error = GL_INVALID_ENUM;
+                return 0;
+            }
+            ctx.renderMode = mode;
+            if (previous === GL_SELECT) {
+                stubWarn("glRenderMode: leaving GL_SELECT with 0 hits (selection not implemented)");
+                return 0;
+            }
+            if (previous === GL_FEEDBACK) {
+                stubWarn("glRenderMode: leaving GL_FEEDBACK with 0 values (feedback not implemented)");
+                return 0;
+            }
+            return 0;
+        },
 
-        // Selection / feedback (stubs)
-        glSelectBuffer: () => stubWarn("glSelectBuffer"),
-        glFeedbackBuffer: () => stubWarn("glFeedbackBuffer"),
-        glInitNames: () => 0,
-        glPushName: () => 0,
-        glPopName: () => 0,
-        glLoadName: () => 0,
+        // Remembered so the buffers can be filled if selection is ever implemented, and
+        // so nothing else pretends they were consumed.
+        glSelectBuffer: (_c, _m, args) => {
+            ctx.selectBufferSize = args[0] | 0;
+            ctx.selectBufferPtr = args[1] >>> 0;
+            return 0;
+        },
+        glFeedbackBuffer: (_c, _m, args) => {
+            ctx.feedbackBufferSize = args[0] | 0;
+            ctx.feedbackBufferType = args[1] >>> 0;
+            ctx.feedbackBufferPtr = args[2] >>> 0;
+            return 0;
+        },
+
+        // The name stack is real state independent of whether hits are recorded, and
+        // GL_MAX_NAME_STACK_DEPTH is published from the same constant.
+        glInitNames: () => { ctx.nameStackTop = -1; return 0; },
+        glPushName: (_c, _m, args) => {
+            if (ctx.nameStackTop + 1 >= NAME_STACK_MAX_DEPTH) { ctx.error = GL_STACK_OVERFLOW; return 0; }
+            ctx.nameStack[++ctx.nameStackTop] = args[0] | 0;
+            return 0;
+        },
+        glPopName: () => {
+            if (ctx.nameStackTop < 0) { ctx.error = GL_STACK_UNDERFLOW; return 0; }
+            ctx.nameStackTop--;
+            return 0;
+        },
+        glLoadName: (_c, _m, args) => {
+            if (ctx.nameStackTop < 0) { ctx.error = GL_INVALID_OPERATION; return 0; }
+            ctx.nameStack[ctx.nameStackTop] = args[0] | 0;
+            return 0;
+        },
 
         // Attrib stack (stubs)
         glPushAttrib: () => stubWarn("glPushAttrib"),
@@ -666,9 +868,26 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         glPushClientAttrib: () => stubWarn("glPushClientAttrib"),
         glPopClientAttrib: () => stubWarn("glPopClientAttrib"),
 
-        // Clip planes (stubs)
-        glClipPlane: () => stubWarn("glClipPlane"),
-        glGetClipPlane: () => stubWarn("glGetClipPlane"),
+        // Clip planes: the plane equations are real state even though nothing clips yet,
+        // so a caller that reads one back gets what it set instead of its own stack.
+        glClipPlane: (_c, _m, args) => {
+            const index = (args[0] >>> 0) - GL_CLIP_PLANE0;
+            const ptr = args[1] >>> 0;
+            if (index < 0 || index >= 6) { ctx.error = GL_INVALID_ENUM; return 0; }
+            if (!ptr) return 0;
+            const view = new DataView(getMem().buffer, getMem().byteOffset);
+            for (let i = 0; i < 4; i++) ctx.clipPlanes[index * 4 + i] = view.getFloat64(ptr + i * 8, true);
+            return 0;
+        },
+        glGetClipPlane: (_c, _m, args) => {
+            const index = (args[0] >>> 0) - GL_CLIP_PLANE0;
+            const ptr = args[1] >>> 0;
+            if (index < 0 || index >= 6) { ctx.error = GL_INVALID_ENUM; return 0; }
+            if (!ptr) return 0;
+            const view = new DataView(getMem().buffer, getMem().byteOffset);
+            for (let i = 0; i < 4; i++) view.setFloat64(ptr + i * 8, ctx.clipPlanes[index * 4 + i], true);
+            return 0;
+        },
 
         // Pixel copy / draw / read / bitmap
         glCopyPixels: () => stubWarn("glCopyPixels"),
@@ -726,8 +945,12 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
 
             // Two triangles forming a quad — convert window-space to clip-space
             // since the shader now expects clip-space and GPU does viewport transform.
-            const VF = 15;
-            const vertData = new Float32Array(6 * VF);
+            const VF = VERT_FLOATS;
+            const arena = ctx.vertArena;
+            arena.reserve(6);
+            const vertBase = arena.used;
+            const vertData = arena.data;
+            arena.used = vertBase + 6 * VF;
             const zv = ctx.rasterPosZ;
             const vpX = ctx.viewportX, vpY = ctx.viewportY;
             const vpW = ctx.viewportW, vpH = ctx.viewportH;
@@ -747,7 +970,7 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                 [rX,       rY + h,   u0, v1],
             ];
             for (let vi = 0; vi < 6; vi++) {
-                const b = vi * VF;
+                const b = vertBase + vi * VF;
                 const qv = quadverts[vi];
                 vertData[b]    = toClipX(qv[0]); vertData[b+1] = toClipY(qv[1]); vertData[b+2] = clipZ; vertData[b+3] = 1;
                 vertData[b+4]  = 1;     vertData[b+5]  = 1;     vertData[b+6]  = 1;  vertData[b+7]  = 1;
@@ -755,61 +978,71 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
                 vertData[b+11] = qv[2]; vertData[b+12] = qv[3]; vertData[b+13] = 0;  vertData[b+14] = 0;
             }
 
-            const cmd: GLDrawCommand = {
-                type: GLDrawCommandType.DRAW,
-                mode: GL_QUADS,
-                vertData,
-                vertCount: 6,
-                depthTest: false,
-                depthFunc: ctx.depthFunc,
-                depthMask: false,
-                blendEnabled: ctx.enableFlags.has(0x0BE2), // GL_BLEND
-                blendSrc: ctx.blendSrc,
-                blendDst: ctx.blendDst,
-                alphaTest: false,
-                alphaFunc: ctx.alphaFunc,
-                alphaRef: ctx.alphaRef,
-                cullEnabled: false,
-                cullFace: ctx.cullFace,
-                frontFace: ctx.frontFace,
-                textureId0: DRAWPIXELS_TEX_ID,
-                textureId1: 0,
-                texEnvMode0: 0x1E01, // GL_REPLACE
-                texEnvMode1: 0,
-                shadeModel: ctx.shadeModel,
-                fogEnabled: false,
-                fogMode: ctx.fogMode,
-                fogR: ctx.fogColor[0], fogG: ctx.fogColor[1], fogB: ctx.fogColor[2], fogA: ctx.fogColor[3],
-                fogDensity: ctx.fogDensity,
-                fogStart: ctx.fogStart,
-                fogEnd: ctx.fogEnd,
-                polygonMode: 0x1B02, // GL_FILL
-                colorMaskR: ctx.colorMaskR,
-                colorMaskG: ctx.colorMaskG,
-                colorMaskB: ctx.colorMaskB,
-                colorMaskA: ctx.colorMaskA,
-                stencilTest: false,
-                stencilFunc: ctx.stencilFunc,
-                stencilRef: ctx.stencilRef,
-                stencilMask: ctx.stencilMask,
-                stencilFail: ctx.stencilFail,
-                stencilZFail: ctx.stencilZFail,
-                stencilZPass: ctx.stencilZPass,
-                stencilWriteMask: ctx.stencilWriteMask,
-                scissorEnabled: ctx.enableFlags.has(0x0C11), // GL_SCISSOR_TEST
-                scissorX: ctx.scissorX,
-                scissorY: ctx.scissorY,
-                scissorW: ctx.scissorW,
-                scissorH: ctx.scissorH,
-                vpX: ctx.viewportX,
-                vpY: ctx.viewportY,
-                vpW: ctx.viewportW,
-                vpH: ctx.viewportH,
-                depthRangeNear: ctx.depthRangeNear,
-                depthRangeFar: ctx.depthRangeFar,
-            };
+            // Depth/alpha/stencil test and culling stay OFF for the raster quad, so
+            // only the flags glDrawPixels actually honours are set.
+            let flags = 0;
+            if (ctx.enableFlags.has(0x0BE2)) flags |= DF_BLEND;       // GL_BLEND
+            if (ctx.enableFlags.has(0x0C11)) flags |= DF_SCISSOR;     // GL_SCISSOR_TEST
+            if (ctx.colorMaskR) flags |= DF_COLOR_MASK_R;
+            if (ctx.colorMaskG) flags |= DF_COLOR_MASK_G;
+            if (ctx.colorMaskB) flags |= DF_COLOR_MASK_B;
+            if (ctx.colorMaskA) flags |= DF_COLOR_MASK_A;
 
-            ctx.commands.push(cmd);
+            const stream = ctx.commands;
+            const cmdIdx = stream.alloc(GLDrawCommandType.DRAW);
+            const ci = cmdIdx * CMD_I32;
+            const cf = cmdIdx * CMD_F32;
+            const I = stream.i32, F = stream.f32;
+            I[ci + CI_MODE] = GL_QUADS;
+            I[ci + CI_VERT_OFFSET] = vertBase;
+            I[ci + CI_VERT_COUNT] = 6;
+            I[ci + CI_FLAGS] = flags;
+            I[ci + CI_DEPTH_FUNC] = ctx.depthFunc;
+            I[ci + CI_BLEND_SRC] = ctx.blendSrc;
+            I[ci + CI_BLEND_DST] = ctx.blendDst;
+            I[ci + CI_ALPHA_FUNC] = ctx.alphaFunc;
+            I[ci + CI_CULL_FACE] = ctx.cullFace;
+            I[ci + CI_FRONT_FACE] = ctx.frontFace;
+            I[ci + CI_TEX_ID0] = DRAWPIXELS_TEX_ID;
+            I[ci + CI_TEX_ID1] = 0;
+            I[ci + CI_TEXENV0] = 0x1E01; // GL_REPLACE
+            I[ci + CI_TEXENV1] = 0;
+            // The raster quad never combines, but alloc() does not clear slots — leaving
+            // these would inherit the previous record's combiner.
+            I[ci + CI_COMBINE0_RGB] = COMBINER_WORD_DEFAULT;
+            I[ci + CI_COMBINE0_ALPHA] = COMBINER_WORD_DEFAULT;
+            I[ci + CI_COMBINE1_RGB] = COMBINER_WORD_DEFAULT;
+            I[ci + CI_COMBINE1_ALPHA] = COMBINER_WORD_DEFAULT;
+            for (let k = 0; k < 4; k++) { F[cf + CF_ENV_COLOR0 + k] = 0; F[cf + CF_ENV_COLOR1 + k] = 0; }
+            I[ci + CI_SHADE_MODEL] = ctx.shadeModel;
+            I[ci + CI_FOG_MODE] = ctx.fogMode;
+            I[ci + CI_POLYGON_MODE] = 0x1B02; // GL_FILL
+            I[ci + CI_STENCIL_FUNC] = ctx.stencilFunc;
+            I[ci + CI_STENCIL_REF] = ctx.stencilRef;
+            I[ci + CI_STENCIL_MASK] = ctx.stencilMask;
+            I[ci + CI_STENCIL_FAIL] = ctx.stencilFail;
+            I[ci + CI_STENCIL_ZFAIL] = ctx.stencilZFail;
+            I[ci + CI_STENCIL_ZPASS] = ctx.stencilZPass;
+            I[ci + CI_STENCIL_WRITE_MASK] = ctx.stencilWriteMask;
+            I[ci + CI_SCISSOR_X] = ctx.scissorX;
+            I[ci + CI_SCISSOR_Y] = ctx.scissorY;
+            I[ci + CI_SCISSOR_W] = ctx.scissorW;
+            I[ci + CI_SCISSOR_H] = ctx.scissorH;
+            I[ci + CI_VP_X] = ctx.viewportX;
+            I[ci + CI_VP_Y] = ctx.viewportY;
+            I[ci + CI_VP_W] = ctx.viewportW;
+            I[ci + CI_VP_H] = ctx.viewportH;
+            F[cf + CF_ALPHA_REF] = ctx.alphaRef;
+            F[cf + CF_FOG_R] = ctx.fogColor[0];
+            F[cf + CF_FOG_G] = ctx.fogColor[1];
+            F[cf + CF_FOG_B] = ctx.fogColor[2];
+            F[cf + CF_FOG_A] = ctx.fogColor[3];
+            F[cf + CF_FOG_DENSITY] = ctx.fogDensity;
+            F[cf + CF_FOG_START] = ctx.fogStart;
+            F[cf + CF_FOG_END] = ctx.fogEnd;
+            F[cf + CF_DEPTH_RANGE_NEAR] = ctx.depthRangeNear;
+            F[cf + CF_DEPTH_RANGE_FAR] = ctx.depthRangeFar;
+
             ctx.frameSnapshot.drawCalls++;
             ctx.frameSnapshot.vertexCount += 6;
             ctx.frameSnapshot.texUploads++;
@@ -821,7 +1054,64 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
             return 0;
         },
 
-        glReadPixels: () => stubWarn("glReadPixels"),
+        /**
+         * glReadPixels — a real readback of the colour buffer.
+         *
+         * A stub here is not a lost feature: the caller allocated a buffer, we returned
+         * without writing a byte of it, and the in-game screenshot / render-to-texture
+         * effect then encodes whatever the guest heap happened to hold. When we cannot
+         * serve the read we zero the destination instead, so the answer is at least
+         * defined and visibly wrong rather than random.
+         */
+        glReadPixels: (_c, _m, args): number | Promise<number> => {
+            const x = args[0] | 0, y = args[1] | 0;
+            const width = args[2] | 0, height = args[3] | 0;
+            const format = args[4] >>> 0, type = args[5] >>> 0;
+            const dst = args[6] >>> 0;
+            if (!dst || width <= 0 || height <= 0) return 0;
+
+            const components = format === GL_RGB || format === GL_BGR ? 3
+                : format === GL_RGBA || format === GL_BGRA ? 4 : 0;
+            const alignment = ctx.packAlignment > 0 ? ctx.packAlignment : 1;
+            const rowBytes = width * components;
+            const stride = components > 0 ? (rowBytes + alignment - 1) & ~(alignment - 1) : 0;
+
+            if (components === 0 || type !== GL_UNSIGNED_BYTE) {
+                stubWarn(`glReadPixels format=0x${format.toString(16)} type=0x${type.toString(16)} unsupported`);
+                return 0;
+            }
+            // Validate the WHOLE extent once, at the boundary, before any write.
+            if (!isValidAddress(ctx.process.getCurrentMemory(), dst, stride * height, "rw")) {
+                ctx.error = GL_INVALID_OPERATION;
+                return 0;
+            }
+
+            const executor = ctx.executor;
+            const zeroFill = (): number => {
+                Mem.writeBytes(dst, new Uint8Array(stride * height));
+                return 0;
+            };
+            if (!executor) { stubWarn("glReadPixels with no GL executor"); return zeroFill(); }
+
+            return executor.readPixels(x, y, width, height).then((rgba: Uint8Array | null) => {
+                if (!rgba) { stubWarn("glReadPixels: nothing rendered yet"); return zeroFill(); }
+                const swapRb = format === GL_BGR || format === GL_BGRA;
+                const out = new Uint8Array(stride * height);
+                for (let row = 0; row < height; row++) {
+                    const src = row * width * 4;
+                    const d = row * stride;
+                    for (let px = 0; px < width; px++) {
+                        const s = src + px * 4, o = d + px * components;
+                        out[o] = rgba[s + (swapRb ? 2 : 0)];
+                        out[o + 1] = rgba[s + 1];
+                        out[o + 2] = rgba[s + (swapRb ? 0 : 2)];
+                        if (components === 4) out[o + 3] = rgba[s + 3];
+                    }
+                }
+                Mem.writeBytes(dst, out);
+                return 0;
+            });
+        },
         glBitmap: () => stubWarn("glBitmap"),
 
         // Pixel map (stubs)

@@ -9,14 +9,7 @@ const buildParams = (count: number) => {
     return params;
 };
 
-/** VC9 C++ frame handler — same 4-arg layout as __CxxFrameHandler for bring-up. */
 const vc9Extras: FunctionDescriptor[] = [
-    {
-        name: "__CxxFrameHandler3",
-        params: buildParams(4),
-        returnType: "u32",
-        callingConvention: "cdecl",
-    },
     {
         name: "__CppXcptFilter",
         params: buildParams(2),

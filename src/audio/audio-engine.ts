@@ -1,3 +1,6 @@
+import { BufferSource } from "@bottleship/formats/unpack/source";
+import { probeAudio, sniffAudioContainer } from "@bottleship/formats/audio";
+
 export type AudioPlayPayload = {
   id: number;
   data: Float32Array;
@@ -18,6 +21,17 @@ export type AudioPlayEncodedPayload = {
   volume: number;
   pan?: number;
   loopCount?: number;
+  /** Begin at this offset into the stream (CD "play from"). Loops restart here too. */
+  startOffsetMs?: number;
+  /** End playback here instead of at the stream's end (CD "play to"). */
+  endOffsetMs?: number;
+  /** Force the streaming path regardless of container — for sources that must not
+   *  be decoded into a PCM buffer (a CD track is tens of MB decoded). */
+  stream?: boolean;
+  /** Unit for the position reports this source emits: element time is multiplied by
+   *  it. Defaults to the decoded sample rate (frames); 1000 reports milliseconds, for
+   *  callers that never learn the host's sample rate. */
+  positionRateHz?: number;
 };
 
 export type AudioUpdatePayload = {
@@ -47,6 +61,19 @@ type DecodedAudio = {
 const MAX_CACHE_BYTES = 8 * 1024 * 1024;
 const STREAMING_THRESHOLD_BYTES = 512 * 1024;
 
+// Must match WORKLET_MODULE_VERSION in bottleship-audio-worklet.ts. Both the
+// cache-busting `?v=` query param AND the expected handshake version below are
+// derived from this ONE constant, so there is nothing left to drift WITHIN this
+// file; the remaining risk (this constant vs. the one baked into the worklet
+// source) is what verifyWorkletReady() checks at runtime instead of leaving it
+// to be discovered as "the counters are all zero for no visible reason" —
+// AudioContext caches a worklet module by exact URL, so an unbumped `v` after
+// an edit serves the OLD module (old code, old baked-in version) silently.
+const AUDIO_WORKLET_VERSION = 10;
+/** How long to wait for a worklet's "ready" handshake before treating a missing
+ *  one as a stale-module load worth a loud console.error rather than silence. */
+const WORKLET_READY_TIMEOUT_MS = 3000;
+
 type EncodedSource = {
   element: HTMLAudioElement;
   url: string;
@@ -54,8 +81,16 @@ type EncodedSource = {
   gainNode: GainNode;
   panNode: StereoPannerNode;
   loopsRemaining: number;
+  /** Multiplier applied to element time for position reports (payload.positionRateHz,
+   *  else the decoded sample rate — i.e. frames). */
   sampleRate?: number;
   positionHandler?: () => void;
+  /** Loop/seek origin in seconds (payload.startOffsetMs). */
+  startTime: number;
+  /** The startTime seek has been attempted; element time is meaningful from here on. */
+  startApplied?: boolean;
+  /** Stop here instead of at the stream's end; null = play to the end. */
+  endTime: number | null;
 };
 
 class LruCache<K, V> {
@@ -93,6 +128,14 @@ export class AudioEngine {
    *  connects here, so a single gain controls overall volume / mute. Created lazily
    *  in ensureReady(); volume/mute set before that are stored and applied on creation. */
   private masterGain: GainNode | null = null;
+  /** The ONE limiter, downstream of masterGain: every source (DirectSound/waveOut
+   *  ring mix from `node`, plus music/CD tracks connected directly to masterGain)
+   *  is summed by the audio graph before it reaches this node's single input, so
+   *  it is the only place a limiter can see — and therefore bound — the full mix. */
+  private masterLimiterNode: AudioWorkletNode | null = null;
+  /** Which processors' "ready" handshake (see checkWorkletVersion) has arrived —
+   *  the set membership IS the check; armWorkletReadyTimeout reads absence from it. */
+  private workletReadyReceived: Set<"ring" | "master"> = new Set();
   private masterVolume = 1;
   private muted = false;
   private ready: Promise<void> | null = null;
@@ -166,14 +209,19 @@ export class AudioEngine {
     const context = this.ensureContext();
     this.ready = (async () => {
       const moduleUrl = new URL("./bottleship-audio-worklet.js", import.meta.url);
-      moduleUrl.searchParams.set("v", "5");
+      moduleUrl.searchParams.set("v", String(AUDIO_WORKLET_VERSION));
       await context.audioWorklet.addModule(moduleUrl);
+
       this.node = new AudioWorkletNode(context, "bottleship-audio", {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [2],
       });
       this.node.port.onmessage = (event) => {
+        if (event.data?.type === "ready") {
+          this.checkWorkletVersion("ring", event.data?.version);
+          return;
+        }
         if (event.data?.type === "ended") {
           const id = Number(event.data?.id ?? 0);
           if (id) {
@@ -192,12 +240,61 @@ export class AudioEngine {
           }
         }
       };
+      this.armWorkletReadyTimeout("ring");
+
+      // numberOfInputs:1 — this is the target every source sums into (see
+      // masterLimiterNode's field comment); it produces nothing of its own.
+      this.masterLimiterNode = new AudioWorkletNode(context, "bottleship-audio-master", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [2],
+      });
+      this.masterLimiterNode.port.onmessage = (event) => {
+        if (event.data?.type === "ready") {
+          this.checkWorkletVersion("master", event.data?.version);
+        }
+      };
+      this.armWorkletReadyTimeout("master");
+
       this.masterGain = context.createGain();
       this.masterGain.gain.value = this.muted ? 0 : this.masterVolume;
-      this.masterGain.connect(context.destination);
+      // sources → masterGain (volume/mute) → masterLimiterNode (the one limiter,
+      // over the whole summed mix) → destination. Volume is applied BEFORE the
+      // limiter so turning the game down also relieves the limiter, matching how
+      // a hardware master fader sits upstream of a brickwall limiter.
       this.node.connect(this.masterGain);
+      this.masterGain.connect(this.masterLimiterNode);
+      this.masterLimiterNode.connect(context.destination);
     })();
     return this.ready;
+  }
+
+  /** Missing/mismatched "ready" handshake ⇒ the AudioContext served a STALE
+   *  cached worklet module (see AUDIO_WORKLET_VERSION above) rather than the one
+   *  on disk. Loud by design: the alternative is a worklet silently running old
+   *  code while every counter reads zero and nothing else in the app notices. */
+  private checkWorkletVersion(proc: "ring" | "master", version: unknown): void {
+    this.workletReadyReceived.add(proc);
+    if (version !== AUDIO_WORKLET_VERSION) {
+      console.error(
+        `BottleShip: audio worklet '${proc}' processor reported version ${JSON.stringify(version)}, ` +
+        `expected ${AUDIO_WORKLET_VERSION} — the browser is running a STALE cached ` +
+        `bottleship-audio-worklet.js. Bump AUDIO_WORKLET_VERSION (audio-engine.ts) and ` +
+        `WORKLET_MODULE_VERSION (bottleship-audio-worklet.ts) together and reload.`
+      );
+    }
+  }
+
+  private armWorkletReadyTimeout(proc: "ring" | "master"): void {
+    setTimeout(() => {
+      if (!this.workletReadyReceived.has(proc)) {
+        console.error(
+          `BottleShip: audio worklet '${proc}' processor never sent its "ready" handshake ` +
+          `within ${WORKLET_READY_TIMEOUT_MS}ms — the module likely failed to load or is ` +
+          `running code from before this build. Signal stats from it cannot be trusted.`
+        );
+      }
+    }, WORKLET_READY_TIMEOUT_MS);
   }
 
   /** Set the master output volume (linear 0..1). Stored even if the audio graph
@@ -322,7 +419,7 @@ export class AudioEngine {
       try {
         await this.play({
           id: payload.id,
-          data: cached.data.slice(),
+          data: this.applyEncodedOffsets(cached, payload).slice(),
           channels: cached.channels,
           sampleRate: cached.sampleRate,
           playbackRate,
@@ -361,9 +458,10 @@ export class AudioEngine {
       this.pendingDecodes.delete(payload.id);
       const playbackRate = this.resolvePlaybackRate(payload, decoded.sampleRate);
       const decodedBytes = decoded.data.byteLength;
+      const shaped = this.applyEncodedOffsets(decoded, payload);
       await this.play({
         id: payload.id,
-        data: decodedBytes <= MAX_CACHE_BYTES ? decoded.data.slice() : decoded.data,
+        data: shaped === decoded.data && decodedBytes > MAX_CACHE_BYTES ? decoded.data : shaped.slice(),
         channels: decoded.channels,
         sampleRate: decoded.sampleRate,
         playbackRate,
@@ -434,10 +532,19 @@ export class AudioEngine {
     this.node.port.postMessage({ type: "register_listener", sab });
   }
 
+  /** Ring-stage stats (pre-mix; see bottleship-audio-worklet.ts's stats comment). */
   async registerStatsSab(sab: SharedArrayBuffer): Promise<void> {
     await this.ensureReady();
     if (!this.node) return;
     this.node.port.postMessage({ type: "register_stats", sab });
+  }
+
+  /** Master-stage stats — the numbers that describe what the user actually hears
+   *  (post-mix, post-limiter). See BottleShipMasterProcessor. */
+  async registerMasterStatsSab(sab: SharedArrayBuffer): Promise<void> {
+    await this.ensureReady();
+    if (!this.masterLimiterNode) return;
+    this.masterLimiterNode.port.postMessage({ type: "register_master_stats", sab });
   }
 
   stop(id: number): void {
@@ -589,6 +696,24 @@ export class AudioEngine {
     }
   }
 
+  /** Trim a decoded buffer to the payload's start/end offsets (the worklet path has
+   *  no transport of its own, so the window is baked into the samples it gets). */
+  private applyEncodedOffsets(decoded: DecodedAudio, payload: AudioPlayEncodedPayload): Float32Array {
+    const startMs = payload.startOffsetMs ?? 0;
+    const endMs = payload.endOffsetMs;
+    if (startMs <= 0 && endMs == null) return decoded.data;
+
+    const channels = Math.max(1, decoded.channels);
+    const totalFrames = Math.floor(decoded.data.length / channels);
+    const toFrame = (ms: number): number =>
+      Math.max(0, Math.min(totalFrames, Math.round((ms * decoded.sampleRate) / 1000)));
+
+    const from = toFrame(startMs);
+    const to = endMs != null && endMs > startMs ? toFrame(endMs) : totalFrames;
+    if (to <= from) return new Float32Array(0);
+    return decoded.data.subarray(from * channels, to * channels);
+  }
+
   private resolvePlaybackRate(payload: AudioPlayEncodedPayload, sampleRate: number): number {
     if (payload.playbackRateHz && sampleRate > 0) {
       return payload.playbackRateHz / sampleRate;
@@ -622,6 +747,7 @@ export class AudioEngine {
   }
 
   private shouldStreamEncoded(payload: AudioPlayEncodedPayload): boolean {
+    if (payload.stream) return true;
     const mime = (payload.mimeType ?? "").toLowerCase();
     if (mime.includes("audio/mpeg") || mime.includes("audio/mp3")) {
       return true;
@@ -629,9 +755,8 @@ export class AudioEngine {
     if (mime.includes("audio/ogg") || mime.includes("audio/vorbis")) {
       return true;
     }
-    if (this.isMp3(payload.data)) return true;
-    if (this.isOgg(payload.data)) return true;
-    return false;
+    const container = sniffAudioContainer(new BufferSource(payload.data));
+    return container === "mp3" || container === "ogg";
   }
 
   private async playEncodedStreaming(payload: AudioPlayEncodedPayload): Promise<void> {
@@ -639,12 +764,14 @@ export class AudioEngine {
     this.stop(payload.id);
 
     const mimeType = payload.mimeType ?? "audio/mpeg";
-    // Ensure we have a regular ArrayBuffer (not SharedArrayBuffer) for Blob
-    // Create a copy with regular ArrayBuffer to satisfy Blob API
-    const regularBuffer = new ArrayBuffer(payload.data.byteLength);
-    const dataCopy = new Uint8Array(regularBuffer);
-    dataCopy.set(payload.data);
-    const blob = new Blob([dataCopy], { type: mimeType });
+    // Blob takes an ArrayBufferView directly and copies once internally. Only a
+    // SharedArrayBuffer-backed view needs a detour — a CD track is tens of MB, and an
+    // extra transient copy per track change lands on the main thread exactly where the
+    // frame loop can least afford the GC spike.
+    const blobSource: BlobPart = payload.data.buffer instanceof SharedArrayBuffer
+      ? new Uint8Array(this.cloneArrayBuffer(payload.data))
+      : (payload.data as unknown as BlobPart);
+    const blob = new Blob([blobSource], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const element = new Audio();
     element.preload = "auto";
@@ -661,17 +788,33 @@ export class AudioEngine {
     const loopsRemaining = loopCount <= 0 ? Infinity : Math.max(1, loopCount);
     element.loop = loopsRemaining === Infinity;
 
-    const sampleRate = this.getMp3SampleRate(payload.data);
+    const sampleRate = this.encodedSampleRate(payload.data);
     if (payload.playbackRateHz && sampleRate) {
       element.playbackRate = payload.playbackRateHz / sampleRate;
     } else {
       element.playbackRate = payload.playbackRate ?? 1;
     }
 
+    const startTime = Math.max(0, (payload.startOffsetMs ?? 0) / 1000);
+    const endTime = typeof payload.endOffsetMs === "number"
+      && payload.endOffsetMs > (payload.startOffsetMs ?? 0)
+      ? payload.endOffsetMs / 1000
+      : null;
+
     const reportPosition = () => {
-      const rate = this.encodedSources.get(payload.id)?.sampleRate ?? this.context?.sampleRate ?? 44100;
+      const source = this.encodedSources.get(payload.id);
+      // Until the start offset has been attempted, element time says nothing about where
+      // playback will actually begin — reporting it would tell the caller "0" for a
+      // mid-track start that is about to succeed.
+      if (source && source.startTime > 0 && !source.startApplied) return;
+      const rate = source?.sampleRate ?? this.context?.sampleRate ?? 44100;
       if (this.onPosition && Number.isFinite(element.currentTime)) {
         this.onPosition(payload.id, Math.floor(element.currentTime * rate));
+      }
+      // A "play to" boundary inside the stream is the end of playback as far as
+      // the caller is concerned — the element itself would keep going.
+      if (source?.endTime != null && element.currentTime >= source.endTime) {
+        this.handleEncodedEnded(payload.id);
       }
     };
 
@@ -682,8 +825,10 @@ export class AudioEngine {
       gainNode,
       panNode,
       loopsRemaining,
-      sampleRate: sampleRate ?? undefined,
+      sampleRate: payload.positionRateHz ?? sampleRate ?? undefined,
       positionHandler: reportPosition,
+      startTime,
+      endTime,
     });
 
     element.addEventListener("ended", () => {
@@ -691,6 +836,38 @@ export class AudioEngine {
     });
     element.addEventListener("timeupdate", reportPosition);
     element.addEventListener("seeking", reportPosition);
+    element.addEventListener("seeked", reportPosition);
+    // A container the browser accepts into a Blob but cannot decode fires `error` and
+    // never `ended`, and element.play() does not reject for it — without these the
+    // caller waits for a completion that can never arrive.
+    element.addEventListener("error", () => {
+      const err = element.error;
+      this.failEncodedSource(payload.id, err ? `media error ${err.code}: ${err.message}` : "media error");
+    });
+    // There is no network behind a blob: URL, so a stall with nothing buffered at all is
+    // the same dead end rather than a recoverable hiccup.
+    element.addEventListener("stalled", () => {
+      if (element.readyState === HTMLMediaElement.HAVE_NOTHING) {
+        this.failEncodedSource(payload.id, "media stalled with no data");
+      }
+    });
+
+    if (startTime > 0) {
+      const applyStartOffset = () => {
+        try {
+          element.currentTime = startTime;
+        } catch {
+          // Seek before the browser has a seekable range — the media is played from 0.
+        }
+        // Either way the offset is now settled: unblock position reporting so the caller
+        // learns the offset that was actually ACHIEVED and can retime its own transport.
+        const source = this.encodedSources.get(payload.id);
+        if (source) source.startApplied = true;
+        reportPosition();
+      };
+      if (element.readyState >= HTMLMediaElement.HAVE_METADATA) applyStartOffset();
+      else element.addEventListener("loadedmetadata", applyStartOffset, { once: true });
+    }
 
     // Resume AudioContext if suspended (user likely already clicked to start the game).
     // Without this the browser logs "AudioContext was not allowed to start" and element.play()
@@ -716,13 +893,21 @@ export class AudioEngine {
     }
   }
 
+  /** Tear down a stream that failed after it started and tell the caller once. */
+  private failEncodedSource(id: number, error: string): void {
+    if (!this.encodedSources.has(id)) return;
+    console.error("BottleShip: Audio stream failed", { id, error });
+    this.cleanupEncodedSource(id);
+    this.onStatusChange?.(id, "error", error);
+  }
+
   private handleEncodedEnded(id: number): void {
     const source = this.encodedSources.get(id);
     if (!source) return;
     if (source.loopsRemaining === Infinity) return;
     if (source.loopsRemaining > 1) {
       source.loopsRemaining -= 1;
-      source.element.currentTime = 0;
+      source.element.currentTime = source.startTime;
       void source.element.play();
       return;
     }
@@ -738,15 +923,18 @@ export class AudioEngine {
     if (source.positionHandler) {
       source.element.removeEventListener("timeupdate", source.positionHandler);
       source.element.removeEventListener("seeking", source.positionHandler);
+      source.element.removeEventListener("seeked", source.positionHandler);
     }
+    // Drop the map entry before tearing the element down: clearing src can queue an
+    // `error` event, and the membership check is what stops it re-entering here.
+    this.encodedSources.delete(id);
+    this.pausedEncodedSources.delete(id);
     source.element.pause();
     source.element.src = "";
     URL.revokeObjectURL(source.url);
     source.sourceNode.disconnect();
     source.gainNode.disconnect();
     source.panNode.disconnect();
-    this.encodedSources.delete(id);
-    this.pausedEncodedSources.delete(id);
   }
 
   private buildDecodeKey(payload: AudioPlayEncodedPayload): string {
@@ -821,46 +1009,9 @@ export class AudioEngine {
     return (hash >>> 0).toString(16);
   }
 
-  private isOgg(data: Uint8Array): boolean {
-    if (data.length < 4) return false;
-    // OggS magic bytes
-    return data[0] === 0x4f && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53;
-  }
-
-  private isMp3(data: Uint8Array): boolean {
-    if (data.length < 3) return false;
-    if (data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) {
-      return true;
-    }
-    if (data[0] === 0xff && (data[1] & 0xe0) === 0xe0) {
-      return true;
-    }
-    return false;
-  }
-
-  private getMp3SampleRate(data: Uint8Array): number | null {
-    const maxScan = Math.min(data.length - 4, 4096);
-    for (let i = 0; i < maxScan; i++) {
-      const b0 = data[i];
-      const b1 = data[i + 1];
-      if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) {
-        continue;
-      }
-      const b2 = data[i + 2];
-      const versionId = (b1 >> 3) & 0x03;
-      const sampleRateIndex = (b2 >> 2) & 0x03;
-      if (sampleRateIndex === 3 || versionId === 1) {
-        return null;
-      }
-      const rates = [44100, 48000, 32000];
-      let baseRate = rates[sampleRateIndex];
-      if (versionId === 2) {
-        baseRate = baseRate / 2;
-      } else if (versionId === 0) {
-        baseRate = baseRate / 4;
-      }
-      return baseRate;
-    }
-    return null;
+  /** Source rate from the stream's own headers — never the device's; a position
+   *  reported against the wrong rate drifts by exactly their ratio. */
+  private encodedSampleRate(data: Uint8Array): number | null {
+    return probeAudio(new BufferSource(data))?.sampleRate || null;
   }
 }

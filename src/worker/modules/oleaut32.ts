@@ -4,6 +4,7 @@ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../core/logger";
 import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
+import { isValidAddress } from "../core/memory/address-guard";
 import { TypeLibRuntime } from "../core/com/typelib/typelib-objects";
 import { createSafeArrayExports } from "./oleaut32-safearray";
 import { createVariantOpExports } from "./oleaut32-variant-ops";
@@ -146,6 +147,44 @@ export class Oleaut32 implements IModule {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             return view.getUint32(bstr - 4, true) / 2;
         };
+        this.exports["SysStringLen"] = this.exports["ord_7"];
+
+        // UINT SysStringByteLen(BSTR) — OLEAUT32 ordinal 149. The prefix DWORD IS the
+        // byte count, so this is the raw value SysStringLen halves.
+        this.exports["ord_149"] = (ctx, mem, args) => {
+            const bstr = args[0] >>> 0;
+            if (!bstr || bstr < 4) return 0;
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            return view.getUint32(bstr - 4, true);
+        };
+        this.exports["SysStringByteLen"] = this.exports["ord_149"];
+
+        // BSTR SysAllocStringByteLen(LPCSTR psz, UINT len) — OLEAUT32 ordinal 150.
+        // Unlike SysAllocStringLen, len is a byte count and the source may be binary
+        // (including embedded NULs). A null psz deliberately leaves the payload untouched.
+        const sysAllocStringByteLen: ThunkImplementation = (_ctx, mem, args) => {
+            const psz = args[0] >>> 0;
+            const len = args[1] >>> 0;
+            // DWORD BSTR byte prefix + mandatory OLECHAR terminator must not overflow.
+            if (len >= 0xfffffff9) return 0;
+
+            const block = alloc(4 + len + 2);
+            if (!block) return 0;
+
+            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            view.setUint32(block, len, true);
+            if (psz) {
+                if (!isValidAddress(mem, psz, len, "r")) {
+                    System.getInstance().process?.memory?.free(block);
+                    return 0;
+                }
+                mem.copyWithin(block + 4, psz, psz + len);
+            }
+            view.setUint16(block + 4 + len, 0, true);
+            return block + 4;
+        };
+        this.exports["ord_150"] = sysAllocStringByteLen;
+        this.exports["SysAllocStringByteLen"] = sysAllocStringByteLen;
 
         // ---- VARIANT functions ----
 
@@ -174,28 +213,49 @@ export class Oleaut32 implements IModule {
         };
         this.exports["VariantCopy"] = this.exports["ord_10"];
 
-        const variantChangeType = (ctx: unknown, mem: Uint8Array, args: number[]) => {
+        // HRESULT VariantCopyInd(VARIANTARG* pvargDest, const VARIANTARG* pvargSrc)
+        // Same as VariantCopy except a VT_BYREF source is dereferenced first, so the
+        // destination owns a value rather than a pointer into the caller's storage.
+        this.exports["ord_11"] = (ctx, mem, args) => {
             const pvargDest = args[0] >>> 0;
             const pvargSrc = args[1] >>> 0;
-            const vtNew = args[2] & VT_TYPEMASK;
             if (!pvargDest || !pvargSrc) return E_INVALIDARG;
             if (pvargDest + 16 > mem.length || pvargSrc + 16 > mem.length) return E_INVALIDARG;
-            return this.variantChangeType(mem, pvargDest, pvargSrc, vtNew);
+            return this.variantCopyInd(mem, pvargDest, pvargSrc);
         };
-        this.exports["ord_12"] = variantChangeType;
-        this.exports["VariantChangeType"] = variantChangeType;
+        this.exports["VariantCopyInd"] = this.exports["ord_11"];
+
+        // VariantChangeType(pvargDest, pvargSrc, wFlags, vt) — the TARGET TYPE is the LAST
+        // argument in both spellings, and wFlags sits between it and pvargSrc. Reading the
+        // flags as the type converts the overwhelmingly common `wFlags == 0` call to VT_EMPTY,
+        // and the caller then reads an empty variant as a missing value.
+        const variantChangeType = (mem: Uint8Array, dest: number, src: number, vt: number) => {
+            const pvargDest = dest >>> 0;
+            const pvargSrc = src >>> 0;
+            if (!pvargDest || !pvargSrc) return E_INVALIDARG;
+            if (pvargDest + 16 > mem.length || pvargSrc + 16 > mem.length) return E_INVALIDARG;
+            return this.variantChangeType(mem, pvargDest, pvargSrc, vt & VT_TYPEMASK);
+        };
+        this.exports["ord_12"] = (ctx, mem, args) => variantChangeType(mem, args[0], args[1], args[3]);
+        this.exports["VariantChangeType"] = this.exports["ord_12"];
+        // VariantChangeTypeEx(pvargDest, pvargSrc, lcid, wFlags, vt) — one more argument, and
+        // the LCID only matters for locale-sensitive string conversions we do not do.
         this.exports["VariantChangeTypeEx"] = (ctx, mem, args) =>
-            variantChangeType(ctx, mem, [args[0], args[1], args[3]]);
+            variantChangeType(mem, args[0], args[1], args[4]);
 
         // ---- Active Object Registration ----
 
+        // HRESULT RegisterActiveObject(IUnknown*, REFCLSID, DWORD, DWORD* pdwRegister)
         this.exports["ord_33"] = (ctx, mem, args) => {
             const pdwRegister = args[3] >>> 0;
             if (pdwRegister) Mem.writeUint32(pdwRegister, 0x2000);
             return S_OK;
         };
 
+        // HRESULT RevokeActiveObject(DWORD dwRegister, void* pvReserved)
         this.exports["ord_34"] = () => S_OK;
+        this.exports["RegisterActiveObject"] = this.exports["ord_33"];
+        this.exports["RevokeActiveObject"] = this.exports["ord_34"];
 
         // ---- Type Library ----
 
@@ -215,36 +275,44 @@ export class Oleaut32 implements IModule {
             return loadTypeLibImpl(ctx, mem, [args[0], args[2]]);
         };
 
+        // 162 is LoadRegTypeLib and 163 is RegisterTypeLib, per the export table —
+        // they are adjacent and easy to transpose, and a transposed pair both calls
+        // the wrong function AND cleans up the wrong number of stack bytes.
         this.exports["ord_162"] = (ctx, mem, args) => {
+            const pptlib = args[4] >>> 0;
+            if (!pptlib) return E_POINTER;
+            return this.typeLibRuntime.loadRegTypeLib(args[0] >>> 0, mem, pptlib);
+        };
+        this.exports["LoadRegTypeLib"] = this.exports["ord_162"];
+
+        this.exports["ord_163"] = (ctx, mem, args) => {
             const ptlib = args[0] >>> 0;
             const szFullPath = args[1] >>> 0;
             const path = szFullPath ? this.readOleString(mem, szFullPath) : "";
             return this.typeLibRuntime.registerTypeLib(ptlib, path);
         };
-        this.exports["RegisterTypeLib"] = this.exports["ord_162"];
-
-        this.exports["ord_163"] = (ctx, mem, args) => {
-            const pptlib = args[4] >>> 0;
-            if (!pptlib) return E_POINTER;
-            return this.typeLibRuntime.loadRegTypeLib(args[0] >>> 0, mem, pptlib);
-        };
-        this.exports["LoadRegTypeLib"] = this.exports["ord_163"];
+        this.exports["RegisterTypeLib"] = this.exports["ord_163"];
 
         // ---- Error Info ----
 
+        // HRESULT GetErrorInfo(ULONG dwReserved, IErrorInfo** pperrinfo)
         this.exports["ord_200"] = (ctx, mem, args) => {
-            const pperrinfo = args[0] >>> 0;
+            const pperrinfo = args[1] >>> 0;
             if (pperrinfo) Mem.writeUint32(pperrinfo, 0);
-            return 0x00000001;
+            return 0x00000001; // S_FALSE — no error object on this thread
         };
+        this.exports["GetErrorInfo"] = this.exports["ord_200"];
 
+        // HRESULT SetErrorInfo(ULONG dwReserved, IErrorInfo* perrinfo)
         this.exports["ord_201"] = () => S_OK;
+        this.exports["SetErrorInfo"] = this.exports["ord_201"];
 
-        this.exports["ord_202"] = (ctx, mem, args) => {
+        this.exports["CreateErrorInfo"] = (ctx, mem, args) => {
             const pperrinfo = args[0] >>> 0;
             if (pperrinfo) Mem.writeUint32(pperrinfo, 0);
             return 0x80004001;
         };
+        this.exports["ord_202"] = this.exports["CreateErrorInfo"];
 
         Object.assign(this.exports, this.safeArray.exports);
         Object.assign(this.exports, createVariantOpExports());
@@ -324,6 +392,41 @@ export class Oleaut32 implements IModule {
         }
         mem.set(mem.subarray(src + 2, src + 16), dest + 2);
         return S_OK;
+    }
+
+    /** VariantCopy after resolving one level of VT_BYREF indirection on the source. */
+    private variantCopyInd(mem: Uint8Array, dest: number, src: number): number {
+        const srcVt = this.readVariantType(mem, src);
+        if (!(srcVt & VT_BYREF)) return this.variantCopy(mem, dest, src);
+
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const vt = srcVt & VT_TYPEMASK;
+        const ref = view.getUint32(src + 8, true) >>> 0;
+        if (!ref) return E_INVALIDARG;
+
+        this.variantClear(mem, dest);
+        view.setUint16(dest, vt, true);
+        switch (vt) {
+            case VT_I2: view.setInt16(dest + 8, view.getInt16(ref, true), true); return S_OK;
+            case VT_I4:
+            case VT_UI4: view.setUint32(dest + 8, view.getUint32(ref, true), true); return S_OK;
+            case VT_R4: view.setFloat32(dest + 8, view.getFloat32(ref, true), true); return S_OK;
+            case VT_R8: view.setFloat64(dest + 8, view.getFloat64(ref, true), true); return S_OK;
+            case VT_BOOL: view.setInt16(dest + 8, view.getInt16(ref, true), true); return S_OK;
+            case VT_BSTR:
+                // A BYREF BSTR points at the BSTR variable, not at the characters.
+                view.setUint32(dest + 8, this.copyBstr(mem, view.getUint32(ref, true) >>> 0), true);
+                return S_OK;
+            case VT_EMPTY:
+            case VT_NULL: return S_OK;
+            default:
+                // VT_VARIANT|VT_BYREF and the interface types need a second indirection or
+                // an AddRef we cannot fake; failing is safer than handing back a pointer
+                // the caller will free as a value.
+                view.setUint16(dest, VT_EMPTY, true);
+                Logger.warn(LogCategory.SYSTEM, `VariantCopyInd: unsupported byref type vt=0x${vt.toString(16)}`);
+                return E_INVALIDARG;
+        }
     }
 
     private variantChangeType(mem: Uint8Array, dest: number, src: number, vtNew: number): number {

@@ -76,21 +76,6 @@ export function skipTaskEntry(r: BinaryReader, ctx: ParseContext): void {
     fr.finalize();
 }
 
-/** setup/directory.cpp */
-export function skipDirectoryEntry(r: BinaryReader, ctx: ParseContext): void {
-    const v = ctx.version;
-    const bits = v.bits();
-    if (v.value < 0x01030000) r.u32();
-    r.encodedString(ctx.codepage);
-    loadConditionData(r, ctx);
-    if (v.atLeast(4, 0, 11) && v.value < 0x04010000) r.skipBinaryString();
-    if (v.atLeast(2, 0, 11)) r.u32();
-    loadVersionData(r, ctx);
-    if (v.atLeast(4, 1, 0)) r.i16();
-    if (v.atLeast(5, 2, 0)) r.storedFlags([1, 2, 4, 8, 16], bits);
-    else r.storedFlags([1, 2, 4], bits);
-}
-
 /** setup/ini.cpp */
 export function skipIniEntry(r: BinaryReader, ctx: ParseContext): void {
     const bits = ctx.version.bits();

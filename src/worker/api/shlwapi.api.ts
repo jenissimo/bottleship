@@ -9,6 +9,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -26,6 +27,8 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("PathAppendW", 2),
         makeFunc("PathCanonicalizeA", 2),
         makeFunc("PathCanonicalizeW", 2),
+        makeFunc("PathCombineA", 3),
+        makeFunc("PathCombineW", 3),
         makeFunc("PathAddBackslashA", 1),
         makeFunc("PathAddBackslashW", 1),
         makeFunc("PathRemoveFileSpecA", 1),
@@ -44,7 +47,14 @@ export const shlwapiModule: ModuleDescriptor = {
         makeFunc("PathRelativePathToW", 5),
         makeFunc("PathRemoveExtensionA", 1),
         makeFunc("PathRemoveExtensionW", 1),
-        makeFunc("UrlUnescapeA", 4),
-        makeFunc("UrlUnescapeW", 4),
+        makeFunc("PathRenameExtensionA", 2), // pszPath, pszExt
+        makeFunc("PathRenameExtensionW", 2),
+        makeFunc("UrlUnescapeA", 4, { onUnimplemented: "hresult" }),
+        makeFunc("UrlUnescapeW", 4, { onUnimplemented: "hresult" }),
+        makeFunc("SHDeleteKeyW", 2, { onUnimplemented: "win32Status" }),
+        makeFunc("PathMatchSpecA", 2), // pszFile, pszSpec -> BOOL
+        makeFunc("PathMatchSpecW", 2),
+        makeFunc("ColorHLSToRGB", 3),  // wHue, wLuminance, wSaturation -> COLORREF
+        makeFunc("ColorRGBToHLS", 4),  // clrRGB, pwHue, pwLuminance, pwSaturation -> void
     ],
 };

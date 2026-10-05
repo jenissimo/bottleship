@@ -11,6 +11,10 @@
 export type AspectMode = "stretch" | "pillarbox" | "integer";
 export type PostAA = "off" | "fxaa";
 export type ToneMap = "off" | "aces";
+/** nearest = 4:2:0 chroma replicated 2x2 (what period software players drew); smooth = filtered up. */
+export type VideoChroma = "nearest" | "smooth";
+/** auto = only frames the decoder flags interlaced; always = every frame (fields baked into the picture). */
+export type VideoDeinterlace = "off" | "auto" | "always";
 
 export interface QualityConfig {
     // --- Sampler overrides (safe side of the seam — GPU-resident only) ---
@@ -48,12 +52,24 @@ export interface QualityConfig {
     // --- GPU-resident precision / AA (config reserved, staged impl) ---
     /** Multi-sample AA for 3D geometry edges: 1/2/4. */
     msaa: number;
-    /** Internal-resolution supersample factor for GPU-resident 3D: 1/2/4. */
+    /**
+     * Internal-resolution factor for GPU-resident 3D: 0/1/2/4. 0 ("Auto", the default)
+     * tracks the canvas's own physical-pixel size; 1 ("Native") forces exactly the guest's
+     * own resolution (no supersample, the compatibility/low-power fallback); 2/4 are a
+     * fixed multiplier of the guest's resolution regardless of canvas size — see
+     * backends/webgpu/shared/internal-resolution.ts for the split.
+     */
     internalScale: number;
     /** Auto-generate mip chains on texture upload (prereq for trilinear/AF to bite). */
     autoMipmap: boolean;
-    /** Map SDR → extended-range output on an HDR canvas. */
-    hdr: boolean;
+
+    // --- Movie decode (video/video-engine.ts — the frames a title's cutscene/intro player gets) ---
+    /** How 4:2:0 chroma is brought to full resolution before the frame reaches the game. */
+    videoChroma: VideoChroma;
+    /** Ordered dither when a frame is packed to a 16-bit surface (the bands in every fade). */
+    videoDither: boolean;
+    /** Field rebuild for interlaced frames. */
+    videoDeinterlace: VideoDeinterlace;
 }
 
 export const DEFAULT_QUALITY: QualityConfig = {
@@ -70,9 +86,11 @@ export const DEFAULT_QUALITY: QualityConfig = {
     scanlines: false,
     crt: false,
     msaa: 1,
-    internalScale: 1,
+    internalScale: 0,
     autoMipmap: false,
-    hdr: false,
+    videoChroma: "nearest",
+    videoDither: false,
+    videoDeinterlace: "off",
 };
 
 function clampNum(v: unknown, lo: number, hi: number, dflt: number): number {
@@ -96,9 +114,13 @@ function snapTo(v: unknown, allowed: readonly number[], dflt: number): number {
 
 const ANISO_STEPS = [1, 2, 4, 8, 16] as const;
 const SAMPLE_STEPS = [1, 2, 4] as const;
+/** internalScale's own steps: 0 ("Auto") is a valid value here but never for msaa. */
+const INTERNAL_SCALE_STEPS = [0, 1, 2, 4] as const;
 const ASPECT_MODES: readonly AspectMode[] = ["stretch", "pillarbox", "integer"];
 const POST_AA: readonly PostAA[] = ["off", "fxaa"];
 const TONEMAPS: readonly ToneMap[] = ["off", "aces"];
+const VIDEO_CHROMA: readonly VideoChroma[] = ["nearest", "smooth"];
+const VIDEO_DEINTERLACE: readonly VideoDeinterlace[] = ["off", "auto", "always"];
 
 /**
  * Validate + clamp an untrusted partial (from manifest JSON, host UI, or dbg console)
@@ -122,9 +144,11 @@ export function mergeQuality(base: QualityConfig, partial: Partial<QualityConfig
     if ("scanlines" in partial) out.scanlines = !!partial.scanlines;
     if ("crt" in partial) out.crt = !!partial.crt;
     if ("msaa" in partial) out.msaa = snapTo(partial.msaa, SAMPLE_STEPS, base.msaa);
-    if ("internalScale" in partial) out.internalScale = snapTo(partial.internalScale, SAMPLE_STEPS, base.internalScale);
+    if ("internalScale" in partial) out.internalScale = snapTo(partial.internalScale, INTERNAL_SCALE_STEPS, base.internalScale);
     if ("autoMipmap" in partial) out.autoMipmap = !!partial.autoMipmap;
-    if ("hdr" in partial) out.hdr = !!partial.hdr;
+    if ("videoChroma" in partial) out.videoChroma = VIDEO_CHROMA.includes(partial.videoChroma as VideoChroma) ? partial.videoChroma as VideoChroma : base.videoChroma;
+    if ("videoDither" in partial) out.videoDither = !!partial.videoDither;
+    if ("videoDeinterlace" in partial) out.videoDeinterlace = VIDEO_DEINTERLACE.includes(partial.videoDeinterlace as VideoDeinterlace) ? partial.videoDeinterlace as VideoDeinterlace : base.videoDeinterlace;
 
     // integerScale and aspectMode:'integer' are two spellings of the same intent — keep them coherent.
     if (out.aspectMode === "integer") out.integerScale = true;
@@ -144,4 +168,39 @@ export function colorGradeActive(q: QualityConfig): boolean {
         || q.postAA !== "off"
         || q.tonemap !== "off"
         || q.vignette > 0.0;
+}
+
+/** Bumped when a stored value's MEANING changes, not its range — see parseStoredQuality. */
+export const QUALITY_SCHEMA = 2;
+
+/** What the host writes to localStorage: the config plus the marker parseStoredQuality reads. */
+export function serializeStoredQuality(q: QualityConfig): string {
+    return JSON.stringify({ ...q, schema: QUALITY_SCHEMA });
+}
+
+/**
+ * Decode the host's persisted quality blob. Lives here, next to mergeQuality, so the
+ * meaning of a stored value is defined in ONE place and stays testable without the host.
+ *
+ * internalScale === 1 used to be the default and did nothing; it now means an explicit
+ * "Native, never upscale". Carrying the number forward would pin every existing user to
+ * the one value that opts OUT of the feature. A stored 1 written BEFORE this schema
+ * existed cannot have been a deliberate choice, so it is dropped back to the default;
+ * the marker is what distinguishes it from a Native chosen since.
+ */
+export function parseStoredQuality(raw: string | null | undefined): QualityConfig {
+    if (!raw) return { ...DEFAULT_QUALITY };
+    let parsed: (Partial<QualityConfig> & { schema?: unknown }) | null;
+    try {
+        parsed = JSON.parse(raw) as Partial<QualityConfig> & { schema?: unknown };
+    } catch {
+        return { ...DEFAULT_QUALITY };
+    }
+    if (!parsed || typeof parsed !== "object") return { ...DEFAULT_QUALITY };
+    // Each migration is scoped to the version that introduced it: a later bump must not
+    // re-run an earlier one over a value that HAS since been chosen deliberately.
+    const stored = Number(parsed.schema);
+    const schema = Number.isFinite(stored) ? stored : 0;
+    if (schema < 2 && parsed.internalScale === 1) delete parsed.internalScale;
+    return mergeQuality(DEFAULT_QUALITY, parsed);
 }

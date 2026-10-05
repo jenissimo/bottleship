@@ -7,6 +7,9 @@
 
 import { describe, it, expect } from 'bun:test';
 import { ThunkDispatcher } from '../../src/worker/core/thunking/thunk-dispatcher';
+import { Logger } from '../../src/worker/core/logger';
+import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
+import { System } from '../../src/worker/core/system';
 
 const SPIN_ADDR = 0xdead0000;
 
@@ -23,12 +26,150 @@ function bindMemory(d: any, size = 0x10000): { mem: Uint8Array; dv: DataView } {
     d.cachedDataView = dv;
     d.memLength = mem.length;
     d.spinLoopAddress = SPIN_ADDR;
+    // The dispatcher's cache-validity test reads the CPU-state views, not the
+    // memory Proxy (isDataViewValid) — a fixture that binds only mem8/DataView
+    // models half a cache and reads back as detached.
+    d.cachedWasmBuffer = mem.buffer;
+    d.cachedReg32Raw = new Int32Array(mem.buffer, 64, 8);
+    d.cachedFlagsRaw = new Int32Array(mem.buffer, 120, 1);
+    d.cachedIpRaw = new Int32Array(mem.buffer, 556, 1);
+    d.cachedSegOffsetsRaw = new Int32Array(mem.buffer, 736, 8);
+    d.cachedMem32 = new Uint32Array(mem.buffer, 0, size >>> 2);
     return { mem, dv };
 }
 
 describe('ThunkDispatcher — instantiation', () => {
     it('constructs in isolation with a fake v86 (no WASM/DOM)', () => {
         expect(mkDispatcher()).toBeTruthy();
+    });
+});
+
+describe('ThunkDispatcher — WBUF dynarec lifecycle', () => {
+    it('clears stale descriptors on reset and re-registers VS/PS/barrier hot slots', () => {
+        let generation = 0;
+        const names = [
+            'IDirect3DDevice9_SetVertexShaderConstantF',
+            'IDirect3DDevice9_SetPixelShaderConstantF',
+            'IDirect3DDevice9_DrawIndexedPrimitive',
+        ];
+        const makeStubs = () => names.map((functionName, i) => ({
+            dllName: 'd3d9', functionName,
+            functionId: 100 + generation * 10 + i,
+            address: 0x1000 + generation * 0x300 + i * 0x20,
+            argCount: i < 2 ? 4 : 7,
+            stackCleanupBytes: i < 2 ? 16 : 28,
+        }));
+        let stubs = makeStubs();
+        const generator = {
+            findStubsByName: (dll: string, fn: string) => stubs.filter(s =>
+                s.dllName.toLowerCase() === dll.toLowerCase() && s.functionName.toLowerCase() === fn.toLowerCase()),
+            getAllStubs: () => stubs,
+            getStubById: (id: number) => stubs.find(s => s.functionId === id),
+        };
+        const registrations: number[][] = [];
+        const hot: number[][] = [];
+        let clears = 0;
+        const exports = {
+            jit_dirty_cache: () => {},
+            jit_wbuf_intrinsic_set_enabled: () => {},
+            jit_wbuf_intrinsic_register: (...args: number[]) => { registrations.push(args); return 1; },
+            jit_wbuf_intrinsic_mark_hot: (...args: number[]) => { hot.push(args); return 1; },
+            jit_wbuf_intrinsic_clear_registry: () => { clears++; },
+        };
+        const pm = preemptionManager as any;
+        const oldExports = pm.wasmExports;
+        pm.wasmExports = exports;
+        try {
+            const d = new ThunkDispatcher({ add_listener: () => {} } as any, generator as any) as any;
+            bindMemory(d, 0x10000);
+            d.writeBufControlAddr = 0x3000;
+            d.writeBufDataBase = 0x4000;
+            d.writeBufCapacity = 0x2000;
+            d.writeBufTrampolineAddrs[12] = 0x2800; // seven-arg stdcall barrier
+            d.writeBufTrampolineAddrs[20] = 0x2900; // shader constants
+            const handler = () => {};
+
+            d.registerShaderConstantWriteBufferFunction('d3d9', names[0], handler);
+            d.registerShaderConstantWriteBufferFunction('d3d9', names[1], handler);
+            d.registerWriteBufferFunction('d3d9', names[2], 7, handler, true, 0, { barrier: true });
+            expect(hot.map(args => args[0])).toEqual([0, 1, 2]);
+
+            d.reset();
+            expect(clears).toBe(1);
+            generation++;
+            stubs = makeStubs();
+            d.applyPendingRegistrations();
+
+            expect(registrations.slice(-3).map(args => [args[0], args[1]])).toEqual(
+                stubs.map(s => [s.address, s.functionId]),
+            );
+            expect(hot.slice(-3).map(args => args[0])).toEqual([0, 1, 2]);
+        } finally {
+            pm.wasmExports = oldExports;
+        }
+    });
+});
+
+describe('ThunkDispatcher — cache validity is Proxy-free', () => {
+    /** v86's memory view (vendor/v86/src/lib.js): every property read is a trap. */
+    function proxyMem(memory: WebAssembly.Memory): { view: Uint8Array; gets: () => number } {
+        let n = 0, cached: Uint8Array | null = null, cachedBuffer: ArrayBufferLike | null = null;
+        const resolve = () => {
+            if (cachedBuffer !== memory.buffer) {
+                cachedBuffer = memory.buffer;
+                cached = new Uint8Array(cachedBuffer);
+            }
+            return cached!;
+        };
+        const view = new Proxy({} as Uint8Array, {
+            get(_t, prop) {
+                n++;
+                const b = resolve();
+                const x = (b as any)[prop];
+                return typeof x === 'function' ? x.bind(b) : x;
+            },
+            set(_t, prop, value) { (resolve() as any)[prop] = value; return true; },
+        });
+        return { view, gets: () => n };
+    }
+
+    function bindWasm(d: any, memory: WebAssembly.Memory, view: Uint8Array): void {
+        const buf = memory.buffer;
+        d.cachedMem8 = view;
+        d.cachedDataView = new DataView(buf);
+        d.memLength = buf.byteLength;
+        d.cachedWasmBuffer = buf;
+        d.cachedReg32Raw = new Int32Array(buf, 64, 8);
+        d.cachedMem32 = new Uint32Array(buf, 0, buf.byteLength >>> 2);
+    }
+
+    it('answers without touching v86 memory Proxy', () => {
+        const memory = new WebAssembly.Memory({ initial: 2 });
+        const { view, gets } = proxyMem(memory);
+        const d = mkDispatcher() as any;
+        bindWasm(d, memory, view);
+        const before = gets();
+        for (let i = 0; i < 1000; i++) expect(d.isDataViewValid()).toBe(true);
+        expect(gets() - before).toBe(0);
+    });
+
+    it('reports invalid once a wasm grow detaches the cached buffer', () => {
+        const memory = new WebAssembly.Memory({ initial: 2 });
+        const { view } = proxyMem(memory);
+        const d = mkDispatcher() as any;
+        bindWasm(d, memory, view);
+        expect(d.isDataViewValid()).toBe(true);
+        memory.grow(1);                       // detaches the ArrayBuffer the views sit on
+        expect(d.isDataViewValid()).toBe(false);
+    });
+
+    it('reports invalid when the DataView and the CPU views disagree on a buffer', () => {
+        const memory = new WebAssembly.Memory({ initial: 2 });
+        const { view } = proxyMem(memory);
+        const d = mkDispatcher() as any;
+        bindWasm(d, memory, view);
+        d.cachedDataView = new DataView(new ArrayBuffer(0x1000)); // half-refreshed cache
+        expect(d.isDataViewValid()).toBe(false);
     });
 });
 
@@ -253,11 +394,72 @@ describe('ThunkDispatcher.reconcileAsyncRestoreEsp (async-restore ESP invariant)
         expect(r.esp).toBe((parkEsp + 4 + 20) >>> 0);
         expect(r.mismatch).toBe(false);
     });
+
+    // A live ESP that cannot be a RET N from parkEsp belongs to ANOTHER thread: the completion
+    // is applied from a peer's slice (the modal dialog pump dispatches callbacks while its peers
+    // are parked), so the shared register file holds the peer's ESP. Adopting it gave the resumed
+    // thread a foreign stack, whose next park recorded a saved ESP inside the peer's live frame;
+    // the pump's next invokeCallback then overwrote the peer's return address and the peer RET'd
+    // into the bootloader (HP CoS: EIP=0x7c07, "parked-stack write violation").
+    it('ignores a live ESP below parkEsp (another thread stack) and keeps the recorded cleanup', () => {
+        const t3ParkEsp = 0x170ffb0; // T3 parked in its own stack [0x1610000,0x1710000)
+        const t1LiveEsp = 0x10fefc4; // T1's ESP — a different stack entirely
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(t3ParkEsp, 16, t1LiveEsp);
+        expect(r.esp).toBe((t3ParkEsp + 4 + 16) >>> 0);
+        expect(r.mismatch).toBe(false);
+    });
+
+    it('ignores a live ESP implausibly far ABOVE parkEsp', () => {
+        const liveEsp = (parkEsp + 0x10000) >>> 0; // no stdcall stub pops 64 KiB
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(parkEsp, 12, liveEsp);
+        expect(r.esp).toBe((parkEsp + 4 + 12) >>> 0);
+        expect(r.mismatch).toBe(false);
+    });
+
+    it('ignores a misaligned live ESP (a RET N moves ESP in dword steps)', () => {
+        const liveEsp = (parkEsp + 4 + 9) >>> 0;
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(parkEsp, 12, liveEsp);
+        expect(r.esp).toBe((parkEsp + 4 + 12) >>> 0);
+        expect(r.mismatch).toBe(false);
+    });
+
+    it('still trusts a divergent RET N at the top of the plausible range', () => {
+        const liveEsp = (parkEsp + 4 + ThunkDispatcher.MAX_STUB_CLEANUP_BYTES) >>> 0;
+        const r = ThunkDispatcher.reconcileAsyncRestoreEsp(parkEsp, 12, liveEsp);
+        expect(r.esp).toBe(liveEsp);
+        expect(r.mismatch).toBe(true);
+    });
 });
 
 // EBP-sanity tripwire — a guest frame pointer outside the thread stack pointing at non-writable
 // memory is the fingerprint of the Re-Volt mac wedge (EBP=0x2130d16 while the real saved-EBP
 // chain stayed on the stack). Diagnostic-only: it records a note, never throws. Mirrors
+// The park instruction is `JMP $` (EB FE) at spinLoopAddress and nothing else; the bytes after
+// it are live SEH machinery (+2 the `JMP EAX` catch-funclet gadget, +4 the hardware-exception
+// dispatch stub). Every caller of this predicate goes on to overwrite EIP/ESP/EAX, so treating
+// a thread that is mid-unwind as "parked" destroys its continuation.
+describe('ThunkDispatcher.isParkedAtSpinLoop (park vs SEH machinery)', () => {
+    it('accepts only the exact park address', () => {
+        const d = mkDispatcher();
+        bindMemory(d);
+        expect(d.isParkedAtSpinLoop(SPIN_ADDR)).toBe(true);
+    });
+
+    it('rejects the SEH stubs sharing the spin-loop page', () => {
+        const d = mkDispatcher();
+        bindMemory(d);
+        for (const off of [1, 2, 3, 4, 0x200]) {
+            expect(d.isParkedAtSpinLoop(SPIN_ADDR + off)).toBe(false);
+        }
+    });
+
+    it('rejects everything while the spin loop is unallocated', () => {
+        const d = mkDispatcher();
+        d.spinLoopAddress = 0;
+        expect(d.isParkedAtSpinLoop(0)).toBe(false);
+    });
+});
+
 // checkEspSanity (stack bounds + FPO/alt-stack tolerance). No addressSpace is wired in the test,
 // so an out-of-stack EBP is treated as not-writable → flagged.
 describe('ThunkDispatcher.checkEbpSanity (frame-pointer tripwire)', () => {
@@ -306,5 +508,291 @@ describe('ThunkDispatcher.checkEbpSanity (frame-pointer tripwire)', () => {
         expect(d.getLastWildEbpNote()).toBeNull();
         d.checkEbpSanity(0x21047930, 'd3d8:IDirect3DSurface8_Release');
         expect(d.getLastWildEbpNote()).toBeNull();
+    });
+});
+
+describe('ThunkDispatcher.drainWriteBuffer — prefix-fusion consumer that throws', () => {
+    const F = 10;   // first-constant id that opens a pair run
+    const M = 11;   // ordinary setter between the constant and the prefix draw
+    const D = 12;   // draw id (the pair run's second half, and the prefix draw)
+    const CONTROL = 0x3000;
+    const DATA = 0x4000;
+
+    /** Ring: F, M, D(prefix draw), then the exact F/D pair run the consumer is offered. */
+    function layout(mem32: Uint32Array): number {
+        const at = (offset: number) => (DATA + offset) >> 2;
+        const ids = [F, M, D, F, D, F, D];
+        ids.forEach((id, i) => { mem32[at(i * 8)] = id; });
+        return ids.length * 8;
+    }
+
+    function setup(pairRunHandler: any) {
+        const d = mkDispatcher();
+        const mem = new Uint8Array(0x10000);
+        const mem32 = new Uint32Array(mem.buffer);
+        d.cachedMem8 = mem;
+        d.cachedMem32 = mem32;
+        d.memLength = mem.length;
+        d.writeBufControlAddr = CONTROL;
+        d.writeBufDataBase = DATA;
+        d.writeBufCapacity = 0x2000;
+
+        const calls: Array<{ id: number; offset: number }> = [];
+        for (const id of [F, M, D]) {
+            d.writeBufArgCountTable[id] = 1;
+            d.writeBufHandlerTable[id] = (_m8: Uint8Array, _m32: Uint32Array, addr: number) => {
+                calls.push({ id, offset: addr - 4 - DATA });
+            };
+        }
+        d.writeBufBarrierTable[D] = 1;
+        d.writeBufPairRunByFirst[F] = [{ secondIds: new Set([D]), handler: pairRunHandler }];
+
+        const head = layout(mem32);
+        mem32[CONTROL >> 2] = head;
+        return { d, mem32, calls, head };
+    }
+
+    it('declines to the ordinary path instead of replaying the applied prefix entries', () => {
+        // The consumer is offered the fused run first (7 args) and throws; the constant and the
+        // middle setter it has already applied must not be applied a second time.
+        const offers: number[] = [];
+        const { d, mem32, calls, head } = setup((...args: any[]) => {
+            offers.push(args.length);
+            if (args.length > 5) throw new Error('consumer blew up mid-run');
+            return false;
+        });
+
+        d.drainWriteBuffer();
+
+        expect(offers[0]).toBe(7);
+        // Every ring entry applied exactly once, in ring order.
+        expect(calls).toEqual([
+            { id: F, offset: 0 },
+            { id: M, offset: 8 },
+            { id: D, offset: 16 },
+            { id: F, offset: 24 },
+            { id: D, offset: 32 },
+            { id: F, offset: 40 },
+            { id: D, offset: 48 },
+        ]);
+        // Fully drained: the head reset only fires when wbufTail reached the segment end.
+        expect(mem32[CONTROL >> 2]).toBe(0);
+        expect(d.wbufTail).toBe(0);
+        expect(d.getWbufStats().fusedConsumerThrows).toBe(1);
+        expect(head).toBe(56);
+    });
+
+    it('consumes the fused run when the consumer accepts it', () => {
+        const { d, mem32, calls } = setup(() => true);
+
+        d.drainWriteBuffer();
+
+        // The consumer owns the prefix draw and the whole tail run; only the constant and the
+        // middle setter reach ordinary handlers.
+        expect(calls).toEqual([
+            { id: F, offset: 0 },
+            { id: M, offset: 8 },
+        ]);
+        expect(mem32[CONTROL >> 2]).toBe(0);
+        expect(d.getWbufStats().fusedConsumerThrows).toBe(0);
+    });
+
+    // The census answers "what the guest called", so it must be independent of how the drain
+    // chose to consume the ring. The accepted-fusion case above runs 2 handlers for 7 entries:
+    // a census counted at the handlers would report 2, which is the whole failure it exists to
+    // avoid — a batched renderer's draws reading as "never called".
+    it('counts every ring entry whether or not fusion swallowed it', () => {
+        const names = { [F]: 'fake:First', [M]: 'fake:Middle', [D]: 'fake:Draw' };
+
+        const census = (accept: boolean) => {
+            const { d, calls } = setup(() => accept);
+            Object.assign(d.namesTable, names);
+            d.setWriteBufCensusEnabled(true);
+            d.drainWriteBuffer();
+            return { rows: d.getWriteBufCensus(), handlerCalls: calls.length };
+        };
+
+        const fused = census(true);
+        const declined = census(false);
+
+        // Identical ring ⇒ identical census, though the drain ran 2 handlers versus 7.
+        const expected = [
+            { name: 'fake:First', count: 3 },
+            { name: 'fake:Draw', count: 3 },
+            { name: 'fake:Middle', count: 1 },
+        ];
+        expect(fused.rows).toEqual(expected);
+        expect(declined.rows).toEqual(expected);
+        expect(fused.handlerCalls).toBe(2);
+        expect(declined.handlerCalls).toBe(7);
+    });
+
+    it('stays off — and reports nothing — until it is enabled', () => {
+        const { d } = setup(() => false);
+        d.drainWriteBuffer();
+        // An empty array, not zeros: a zeroed row would read exactly like "called zero times".
+        expect(d.getWriteBufCensus()).toEqual([]);
+        // And it must SAY it is off, so a reader cannot mistake the silence for a count.
+        expect(d.isWriteBufCensusEnabled()).toBe(false);
+        d.setWriteBufCensusEnabled(true);
+        expect(d.isWriteBufCensusEnabled()).toBe(true);
+    });
+
+    it('reset zeroes the counts without disabling the census', () => {
+        const { d, mem32, head } = setup(() => false);
+        d.setWriteBufCensusEnabled(true);
+        d.drainWriteBuffer();
+        expect(d.getWriteBufCensus().length).toBe(3);
+
+        d.resetWriteBufCensus();
+        expect(d.getWriteBufCensus()).toEqual([]);
+
+        // Still armed: a second drain of the same ring counts again.
+        d.wbufTail = 0;
+        mem32[CONTROL >> 2] = head;
+        d.drainWriteBuffer();
+        expect(d.getWriteBufCensus().length).toBe(3);
+    });
+});
+
+describe('ThunkDispatcher — plain CPU-state views cannot be read stale', () => {
+    // The per-thunk X86Context is assembled from `cachedReg32Raw`, a PLAIN Int32Array over
+    // the WASM buffer. A grow detaches it, and a detached typed array reads `undefined`
+    // rather than throwing — ctx.eax would silently become NaN. The whole safety argument
+    // is that `isDataViewValid()` sees the detachment and sends the caller through
+    // updateMemoryCache() BEFORE the context is built, which is what this pins.
+    it('isDataViewValid() reports a detached register view as invalid', () => {
+        const d = mkDispatcher();
+        const { mem } = bindMemory(d);
+        expect(d.isDataViewValid()).toBe(true);
+
+        // ArrayBuffer.transfer() detaches the original, exactly as WebAssembly.Memory.grow does.
+        (mem.buffer as ArrayBuffer).transfer();
+
+        expect(d.cachedReg32Raw.length).toBe(0);
+        expect(d.isDataViewValid()).toBe(false);
+    });
+
+    it('a half-bound cache (memory views only) also reads as invalid', () => {
+        const d = mkDispatcher();
+        const mem = new Uint8Array(0x10000);
+        d.cachedMem8 = mem;
+        d.cachedDataView = new DataView(mem.buffer);
+        d.memLength = mem.length;
+        // No CPU-state views bound: answering "valid" here would let the slow path build a
+        // context out of whatever `cachedReg32` still points at.
+        expect(d.isDataViewValid()).toBe(false);
+    });
+});
+
+describe('ThunkDispatcher — fast-path calling convention', () => {
+    // The fast-path signature is (esp, dataView, mem8, mem32, cpu). Nothing in the type
+    // system pinned it until `registerFastPath` stopped being reached through a
+    // `dispatcher: any` — so the order is pinned HERE too, at the real dispatch site,
+    // because a silently reordered argument is a wrong pointer, not a crash.
+    it('passes (esp, dataView, mem8, mem32, cpu) with the live ESP first', () => {
+        const d = mkDispatcher();
+        const { mem, dv } = bindMemory(d);
+        const ESP = 0x2000;
+        d.cachedReg32Raw[4] = ESP;
+
+        const cpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw };
+        d.cachedCpu = cpu;
+        d.cachedScheduler = { onThunkEnter: () => {}, onThunkBoundary: () => {} };
+
+        const seen: any[] = [];
+        const FID = 77;
+        d.fastPathTable[FID] = (...args: any[]) => { seen.push(args); return 0x1234; };
+        d.namesTable[FID] = 'test:FastPathProbe';
+
+        // TWO call sites dispatch a fast path — the frame-profiled one fires on every 32nd
+        // call, the plain one on the rest — and they pass the arguments independently. One
+        // call exercises only the plain branch, which is how a planted reorder in the
+        // profiled branch went undetected the first time this test was written.
+        for (let i = 0; i < 33; i++) d.handlePortWrite(FID);
+
+        expect(seen.length).toBe(33);
+        for (const [esp, dataView, mem8, mem32, gotCpu] of seen) {
+            expect(esp).toBe(ESP);
+            expect(dataView).toBe(dv);
+            expect(mem8).toBe(mem);
+            expect(mem32).toBe(d.cachedMem32);
+            expect(gotCpu).toBe(cpu);
+        }
+        // The answer lands in EAX.
+        expect(d.cachedReg32Raw[0] >>> 0).toBe(0x1234);
+    });
+});
+
+describe('ThunkDispatcher — a trap that outruns a pause completes', () => {
+    // v86 honours stop() at the next tick, so the guest can still reach an OUT after a pause.
+    // The OUT has retired: dropping the trap leaves the function id in EAX as the "result"
+    // (CreateThread answered with its own id and created nothing).
+    it('dispatches the call, answers in EAX and stops the inner engine', () => {
+        const d = mkDispatcher();
+        bindMemory(d);
+        d.cachedReg32Raw[4] = 0x2000;
+        d.cachedCpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw };
+        d.cachedScheduler = { onThunkEnter: () => {}, onThunkBoundary: () => {} };
+        let stops = 0;
+        d.v86 = { v86: { stop: () => { stops++; } }, stop: () => { throw new Error('starter stop() used'); } };
+
+        const FID = 79;
+        d.namesTable[FID] = 'test:DuringPause';
+        d.fastPathTable[FID] = () => 0x30010;
+        d.cachedReg32Raw[0] = FID;
+
+        const sys = System.getInstance();
+        const wasPaused = sys.isPaused;
+        const warn = (Logger as any).warn;
+        (Logger as any).warn = () => {};
+        sys.isPaused = true;
+        try {
+            d.handlePortWrite(FID);
+        } finally {
+            sys.isPaused = wasPaused;
+            (Logger as any).warn = warn;
+        }
+
+        expect(d.cachedReg32Raw[0] >>> 0).toBe(0x30010);
+        expect(stops).toBe(1);
+        expect(d.pausedTraps).toBe(1);
+    });
+});
+
+describe('ThunkDispatcher — a fast path that grows guest memory is caught, not tolerated', () => {
+    // The fast-path tier is handed a PLAIN guest view, which is only sound because a fast
+    // path may not allocate. If one does, the view detaches and every later read in that
+    // handler yields `undefined` while its writes vanish — silently. This pins the detector.
+    it('names the offending export and refreshes the cache', () => {
+        const d = mkDispatcher();
+        const { mem } = bindMemory(d);
+        d.cachedReg32Raw[4] = 0x2000;
+        d.cachedCpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw };
+        d.cachedScheduler = { onThunkEnter: () => {}, onThunkBoundary: () => {} };
+
+        const errors: string[] = [];
+        const spy = (Logger as any).error;
+        (Logger as any).error = (_cat: unknown, msg: string) => { errors.push(msg); };
+
+        const FID = 78;
+        d.namesTable[FID] = 'test:GrowsMemory';
+        d.fastPathTable[FID] = (_esp: number, _dv: DataView, mem8: Uint8Array) => {
+            (mem8.buffer as ArrayBuffer).transfer(); // what a WASM grow does to this view
+            return 0;
+        };
+        // getMemory() is what updateMemoryCache re-reads from after the detach.
+        const replacement = new Uint8Array(0x10000);
+        d.getMemory = () => replacement;
+
+        try {
+            d.handlePortWrite(FID);
+        } finally {
+            (Logger as any).error = spy;
+        }
+
+        expect(errors.some(e => e.includes('FAST PATH GREW GUEST MEMORY') && e.includes('test:GrowsMemory'))).toBe(true);
+        // And the cache is re-derived, so the NEXT dispatch is not handed the dead view.
+        expect(d.cachedMem8!.length).toBe(replacement.length);
     });
 });

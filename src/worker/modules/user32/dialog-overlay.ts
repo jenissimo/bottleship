@@ -1,11 +1,12 @@
 /**
  * Native Win32 dialogs over an exclusive-fullscreen DirectDraw flip chain.
  *
- * Real Windows composites visible GDI windows OVER the DirectDraw primary even
- * in DDSCL_EXCLUSIVE|FULLSCREEN. Our presenter cannot composite the whole GDI
- * overlay there (gdiSurfaceVisible=false hides it) because windows left visible
- * from BEFORE the flip chain took the screen would bleed over the game (the
- * exclusive-fullscreen screen-ownership model; see gdi-visibility.ts).
+ * In DDSCL_EXCLUSIVE|FULLSCREEN a GDI window shows over the DirectDraw primary only
+ * while the GDI surface is the buffer on screen: true for a single-buffered primary
+ * (GDI paints straight into the displayed memory), false once the app Flips its
+ * primary chain (see gdi-visibility.ts and dialogOverlayComposites). Even then our
+ * presenter cannot composite the WHOLE GDI overlay, because windows left visible from
+ * BEFORE the game took the screen would bleed over it.
  *
  * Generic discriminator between those two cases: WHEN the dialog became visible.
  * A dialog shown WHILE the flip chain owns the screen is live UI the game is
@@ -19,16 +20,20 @@
  */
 
 import { System } from '../../core/system';
-import { isGdiSurfaceHidden, isDDrawExclusiveFullscreen, shouldSuppress3DGdiOverlay } from '../ddraw/gdi-visibility';
+import type { RenderActive } from '../../runtime/runtime-services';
+import { isGdiSurfaceHidden, ddrawOwnsScreen, ddrawShowsContent, shouldSuppress3DGdiOverlay } from '../ddraw/gdi-visibility';
 import {
     windows,
     WindowInfo,
     getAbsoluteWindowPosition,
     listControlStates,
     isWindowUpdateLocked,
+    hasSystemControlChildren,
+    isEffectivelyVisible,
 } from './shared-state';
 import { getComboDropdownRect } from './controls';
 import { invokeOverlayRepairRepaint } from './control-interaction';
+import { paintTraceEnabled, logOverlayMutation } from './paint-trace';
 
 const WS_CHILD = 0x40000000;
 
@@ -48,12 +53,50 @@ export function isFlipScreenOwned(): boolean {
  * beyond DDraw: a dialog shown WHILE the game owns the screen is live UI composited
  * over the frame; one visible from BEFORE (a UE2 loading splash) is occluded by the
  * opaque fullscreen game window on real Windows, so it must not cover our frame.
+ *
+ * The DDraw arm is ddrawOwnsScreen, not the cooperative level alone: exclusive-fullscreen
+ * rights with no primary surface leave the desktop on screen (see gdi-visibility.ts).
  */
-export function isGameScreenOwned(): boolean {
+export function isGameScreenOwned(renderActive?: RenderActive | null): boolean {
     const ddrawCtx = getDDrawContext();
-    if (isDDrawExclusiveFullscreen(ddrawCtx)) return true;
-    const renderActive = System.getInstance().services.render.getActive();
-    return shouldSuppress3DGdiOverlay(renderActive, ddrawCtx);
+    if (ddrawOwnsScreen(ddrawCtx)) return true;
+    const active = renderActive ?? System.getInstance().services.render.getActive();
+    return shouldSuppress3DGdiOverlay(active, ddrawCtx);
+}
+
+/**
+ * True while what the game RENDERED is actually on the display — isGameScreenOwned plus,
+ * for the DirectDraw arm, the requirement that a frame was presented. Suppressing the GDI
+ * overlay is only correct when there is a rendered frame underneath it to reveal; an app
+ * that takes exclusive fullscreen and creates a primary but paints its UI with GDI (a
+ * launcher that switches the desktop to its game resolution and hands the primary to the
+ * engine later) has an EMPTY primary, so suppressing the overlay shows a blank screen
+ * instead of its entire UI. A 3D presenter is only "active" once it renders, so its arm
+ * needs no extra test.
+ */
+function isGameContentOnScreen(renderActive?: RenderActive | null): boolean {
+    const ddrawCtx = getDDrawContext();
+    const active = renderActive ?? System.getInstance().services.render.getActive();
+    if (shouldSuppress3DGdiOverlay(active, ddrawCtx)) return true;
+    return ddrawShowsContent(ddrawCtx);
+}
+
+/**
+ * True for the window that OWNS the screen — the one passed to
+ * SetCooperativeLevel(DDSCL_EXCLUSIVE|DDSCL_FULLSCREEN). In exclusive fullscreen its
+ * client area IS the primary surface: GDI painting of that window lands in the primary
+ * the game renders into, it is not a plane layered over the frame. So it can never be
+ * an overlay composited on top of the game — it is the game. Games whose fullscreen
+ * window happens to host a system-control child (a Static/Button the engine parents to
+ * the main window) would otherwise be mistaken for live UI, and their WM_ERASEBKGND
+ * background fill would cover every frame.
+ */
+export function isScreenOwnerWindow(hwnd: number): boolean {
+    const ddrawCtx = getDDrawContext();
+    // No primary surface ⇒ nothing of DirectDraw is on screen, so this window's client
+    // area is not "the primary" and its GDI paints are ordinary window output.
+    if (!hwnd || !ddrawOwnsScreen(ddrawCtx)) return false;
+    return (ddrawCtx?.cooperative?.hwnd ?? 0) === hwnd;
 }
 
 /**
@@ -77,7 +120,11 @@ export function isGameScreenOwned(): boolean {
  */
 export function noteDialogOverlayCandidate(win: WindowInfo | undefined): void {
     if (!win || !win.visible || win.pendingDestroy) return;
-    if (win.nativeClassName !== '#32770') return;
+    // #32770 dialogs, plus plain windows hosting JS system controls (a launcher /
+    // options window built via CreateWindowEx("BUTTON"...) is real UI, not a stray
+    // helper window) — both must composite over a game-owned screen.
+    if (win.nativeClassName !== '#32770' && !hasSystemControlChildren(win)) return;
+    if (isScreenOwnerWindow(win.handle)) return;
     if (!isGameScreenOwned()) return;
     if (!win.overlayOnFlipScreen) {
         win.overlayOnFlipScreen = true;
@@ -105,7 +152,15 @@ export function getWindowVisualBounds(hwnd: number): DialogOverlayRect | null {
     if (!root) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     const visited = new Set<number>();
-    const visit = (h: number): void => {
+    /**
+     * `clip` is the intersection of the client rects of the ancestors BELOW the root —
+     * the Win32 clip a descendant is already painted with (see getAncestorClipRect).
+     * A nested child dialog therefore cannot stretch these bounds past the root, while
+     * the root's OWN controls stay unclipped (clip=null at the first level): those are
+     * the ones our approximate DLU→px can push a few pixels past the root's rect, and
+     * they are genuinely drawn there, so the fill/erase must still cover them.
+     */
+    const visit = (h: number, clip: DialogOverlayRect | null): void => {
         if (visited.has(h)) return;
         visited.add(h);
         const w = windows.get(h);
@@ -121,10 +176,15 @@ export function getWindowVisualBounds(hwnd: number): DialogOverlayRect | null {
         // or a plain empty rect is left oversized until the next unrelated full repaint.
         if (h !== hwnd && (!w.visible || w.pendingDestroy)) return;
         const { x, y } = getAbsoluteWindowPosition(w);
-        minX = Math.min(minX, x);
-        minY = Math.min(minY, y);
-        maxX = Math.max(maxX, x + w.width);
-        maxY = Math.max(maxY, y + w.height);
+        const own: DialogOverlayRect = { x, y, w: w.width, h: w.height };
+        const drawn = clip ? intersectOverlayRects(own, clip) : own;
+        if (drawn.w > 0 && drawn.h > 0) {
+            minX = Math.min(minX, drawn.x);
+            minY = Math.min(minY, drawn.y);
+            maxX = Math.max(maxX, drawn.x + drawn.w);
+            maxY = Math.max(maxY, drawn.y + drawn.h);
+        }
+        // An open drop-down is its own ComboLBox popup — never clipped by the parent.
         if (w.isSystemControl
             && (w.systemControlClass ?? '').toLowerCase() === 'combobox'
             && listControlStates.get(w.handle)?.dropdownOpen) {
@@ -132,11 +192,23 @@ export function getWindowVisualBounds(hwnd: number): DialogOverlayRect | null {
             maxX = Math.max(maxX, r.x + r.w);
             maxY = Math.max(maxY, r.y + r.h);
         }
-        for (const c of w.children) visit(c);
+        const childClip = h === hwnd ? null : (clip ? intersectOverlayRects(own, clip) : own);
+        for (const c of w.children) visit(c, childClip);
     };
-    visit(hwnd);
+    visit(hwnd, null);
     if (!isFinite(minX)) return null;
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/** Rect intersection; a non-positive w/h means "empty". */
+function intersectOverlayRects(a: DialogOverlayRect, b: DialogOverlayRect): DialogOverlayRect {
+    const x = Math.max(a.x, b.x);
+    const y = Math.max(a.y, b.y);
+    return {
+        x, y,
+        w: Math.min(a.x + a.w, b.x + b.w) - x,
+        h: Math.min(a.y + a.h, b.y + b.h) - y,
+    };
 }
 
 function overlayRectsOverlap(a: DialogOverlayRect, b: DialogOverlayRect): boolean {
@@ -154,11 +226,11 @@ function getOverlayWindowZRank(hwnd: number): number {
         if (!win) break;
         if (!win.parent) {
             const zIdx = wm.getZOrder().indexOf(cur);
-            rank += (zIdx >= 0 ? zIdx : 0) * 1_000_000;
+            rank -= (zIdx >= 0 ? zIdx : 0) * 1_000_000;
         } else {
             const parent = windows.get(win.parent);
             const childIdx = parent?.children.indexOf(cur) ?? 0;
-            rank += childIdx * (10_000 ** depth);
+            rank -= childIdx * (10_000 ** depth);
         }
         depth++;
         cur = win.parent ?? 0;
@@ -167,10 +239,46 @@ function getOverlayWindowZRank(hwnd: number): number {
 }
 
 function needsOverlayRepaint(win: WindowInfo): boolean {
-    if (!win.visible || win.pendingDestroy) return false;
+    // Ancestor-aware: a child of a hidden page keeps WS_VISIBLE, and repainting it here
+    // would redraw a page that was switched away (see isEffectivelyVisible).
+    if (!isEffectivelyVisible(win) || win.pendingDestroy) return false;
     if (isWindowUpdateLocked(win.handle)) return false;
     if (win.nativeClassName === '#32770') return true;
     if (win.guestCustomPaint && !win.isSystemControl) return true;
+    if (hasSystemControlChildren(win)) return true;
+    return false;
+}
+
+/**
+ * The overlay is flat, so repainting a lower full-screen owner would leak its controls
+ * through transparent areas of an owned popup. Native USER clips that DC against windows
+ * above it. For the common fully-covered case, omitting the lower repaint is equivalent
+ * and avoids destructive overdraw.
+ */
+export function isWindowFullyCoveredByHigherTopLevel(
+    win: WindowInfo,
+    bounds: DialogOverlayRect | null = getWindowVisualBounds(win.handle),
+    excludeHwnd = 0,
+): boolean {
+    if (!bounds) return false;
+    if ((win.style & WS_CHILD) !== 0) return false;
+    const wm = System.getInstance().windowManager;
+    const zOrder = wm.getZOrder();
+    const index = zOrder.indexOf(win.handle);
+    if (index <= 0) return false;
+    for (let i = 0; i < index; i++) {
+        const higherHwnd = zOrder[i];
+        if (higherHwnd === excludeHwnd) continue;
+        const higher = windows.get(higherHwnd);
+        if (!higher || (higher.style & WS_CHILD) !== 0 || !isEffectivelyVisible(higher) || higher.pendingDestroy) continue;
+        const b = getWindowVisualBounds(higherHwnd);
+        if (!b) continue;
+        if (b.x <= bounds.x && b.y <= bounds.y
+            && b.x + b.w >= bounds.x + bounds.w
+            && b.y + b.h >= bounds.y + bounds.h) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -180,16 +288,34 @@ function needsOverlayRepaint(win: WindowInfo): boolean {
 function repaintOverlayWindowsOverlappingRect(rect: DialogOverlayRect, excludeHwnd: number): void {
     const candidates: Array<{ hwnd: number; rank: number }> = [];
     for (const win of windows.values()) {
-        if (win.handle === excludeHwnd) continue;
+        if (excludeHwnd) {
+            let cur: WindowInfo | undefined = win;
+            let excluded = false;
+            const visited = new Set<number>();
+            while (cur && !visited.has(cur.handle)) {
+                if (cur.handle === excludeHwnd) { excluded = true; break; }
+                visited.add(cur.handle);
+                cur = cur.parent ? windows.get(cur.parent) : undefined;
+            }
+            if (excluded) continue;
+        }
         if (!needsOverlayRepaint(win)) continue;
         const b = getWindowVisualBounds(win.handle);
         if (!b || !overlayRectsOverlap(rect, b)) continue;
+        if (isWindowFullyCoveredByHigherTopLevel(win, b, excludeHwnd)) continue;
         candidates.push({ hwnd: win.handle, rank: getOverlayWindowZRank(win.handle) });
     }
     candidates.sort((a, b) => a.rank - b.rank);
     for (const c of candidates) {
         invokeOverlayRepairRepaint(c.hwnd);
     }
+}
+
+export function repairOverlayWindowsOverlappingRect(
+    rect: DialogOverlayRect,
+    excludeHwnd: number = 0,
+): void {
+    repaintOverlayWindowsOverlappingRect(rect, excludeHwnd);
 }
 
 /**
@@ -231,6 +357,10 @@ export function eraseDialogOverlay(hwnd: number): void {
     };
     // excludeRepairHwnd: erase runs while the window is still visible — repair must
     // not repaint it (that was the "clearing doesn't happen" regression).
+    if (paintTraceEnabled) {
+        logOverlayMutation('eraseDialogOverlay', hwnd,
+            `${eraseRect.x},${eraseRect.y} ${eraseRect.w}x${eraseRect.h}`);
+    }
     gdi.clearOverlayRect(eraseRect.x, eraseRect.y, eraseRect.w, eraseRect.h, {
         excludeRepairHwnd: hwnd,
     });
@@ -238,7 +368,12 @@ export function eraseDialogOverlay(hwnd: number): void {
     // Explicit parent repaint: launcher menu behind a modal child (e.g. BOD Setup).
     const parentHwnd = win?.parent;
     if (parentHwnd) {
-        invokeOverlayRepairRepaint(parentHwnd);
+        const parent = windows.get(parentHwnd);
+        const parentBounds = parent ? getWindowVisualBounds(parentHwnd) : null;
+        if (parent && parentBounds
+            && !isWindowFullyCoveredByHigherTopLevel(parent, parentBounds, hwnd)) {
+            invokeOverlayRepairRepaint(parentHwnd);
+        }
     }
 }
 
@@ -248,22 +383,30 @@ export type OverlayCompositePlan =
     | { mode: 'rects'; rects: DialogOverlayRect[] };
 
 /**
- * Decide how the GDI overlay composites over a DDraw present. Single source of
- * truth for both the normal present (drawFrame) and the phase-blend present.
+ * Decide how the GDI overlay composites over the game frame. THE single source of
+ * truth for EVERY GDI-over-frame compositor: the DDraw presenter (drawFrame, 2D
+ * fallback, phase-blend), the standalone rAF gdiPresentLoop, and the D3D8/D3D9/Glide
+ * present paths. They differ only in the low-level draw primitive (own-encoder blit
+ * vs. blitRects into a shared encoder); the DECISION lives here, once.
  *
- *  - Exclusive fullscreen: DirectDraw owns the screen. Composite ONLY the rects of
- *    live modal dialogs flagged overlayOnFlipScreen (TS "Select Campaign", BOD Setup)
- *    — never the whole overlay. This is deliberately INDEPENDENT of gdiSurfaceVisible:
- *    a single-buffered primary presents via Blt (not Flip), so gdiSurfaceVisible never
- *    gets cleared and stays stuck `true` after FlipToGDISurface. Gating the whole-overlay
- *    path on that flag (the old isGdiSurfaceHidden heuristic) left the closed dialog's
- *    pixels + the menu background composited opaquely over the game's video. With no
- *    live dialog, the overlay is not composited at all and the DDraw frame shows through.
+ *  - Game content is on the screen (a presented DDraw exclusive-fullscreen frame OR a
+ *    hardware-3D renderer presenting to the canvas — isGameContentOnScreen): the
+ *    fullscreen presentation owns
+ *    the display, so the whole overlay is never composited — stale pre-fullscreen GDI
+ *    would cover the game. Only the rects of live dialogs survive, and only those the
+ *    DirectDraw ownership model says are actually on screen (dialogOverlayComposites);
+ *    with none, `none` and the game frame shows through. WHICH dialogs is decided
+ *    there; whether to consider any at all is decided here.
  *  - Windowed / GDI desktop owns the screen: composite the whole overlay as usual.
+ *
+ * Pass the presenting renderActive (the device calling present) so the 3D-owned check
+ * keys off the right presenter; omit it to fall back to the globally-active presenter
+ * (correct for the DDraw presenter, whose case is caught by isDDrawExclusiveFullscreen
+ * regardless).
  */
-export function getOverlayCompositePlan(ddrawCtx: unknown): OverlayCompositePlan {
-    if (isDDrawExclusiveFullscreen(ddrawCtx as any)) {
-        const rects = hasLiveDialogOverlay() ? getLiveDialogOverlayRects() : [];
+export function getOverlayCompositePlan(renderActive?: RenderActive | null): OverlayCompositePlan {
+    if (isGameContentOnScreen(renderActive)) {
+        const rects = getLiveDialogOverlayRects(renderActive);
         return rects.length ? { mode: 'rects', rects } : { mode: 'none' };
     }
     return { mode: 'full' };
@@ -271,50 +414,196 @@ export function getOverlayCompositePlan(ddrawCtx: unknown): OverlayCompositePlan
 
 /** True if any live dialog must be composited over the flip-chain frame. */
 export function hasLiveDialogOverlay(): boolean {
-    for (const win of windows.values()) {
-        if (win.overlayOnFlipScreen && win.visible && !win.pendingDestroy) return true;
+    return getLiveDialogOverlayRects().length > 0;
+}
+
+/**
+ * The dialog root a control belongs to: climb while the parent is itself part of
+ * the dialog (another overlay window or a #32770). Stops at the game's own
+ * top-level window (e.g. the DDraw Afx main window), which is the parent of the
+ * dialog but not part of it.
+ */
+function getDialogRoot(hwnd: number): number {
+    let cur = hwnd;
+    const seen = new Set<number>();
+    while (!seen.has(cur)) {
+        seen.add(cur);
+        const p = windows.get(cur)?.parent ?? 0;
+        const pw = p ? windows.get(p) : undefined;
+        if (!pw || (pw.nativeClassName !== '#32770' && !pw.overlayOnFlipScreen)) return cur;
+        cur = p;
+    }
+    return cur;
+}
+
+const WS_CAPTION = 0x00c00000;
+
+/**
+ * True if the overlay actually holds pixels for this dialog group: an OS-drawn
+ * control, guest GDI output flushed into the overlay, or a caption bar we draw.
+ *
+ * A #32770 with none of those is a message-routing shell — a window the game
+ * creates for focus/modality while painting the visuals itself into the game's
+ * own surface (TLJ's "#dialog"). All our overlay render can contribute there is
+ * the invented dialog face, so compositing it over a game-owned screen is pure
+ * occlusion: it hides the frame and shows an empty gray box.
+ */
+function dialogGroupHasOverlayContent(root: number): boolean {
+    const stack = [root];
+    const seen = new Set<number>();
+    while (stack.length) {
+        const h = stack.pop()!;
+        if (seen.has(h)) continue;
+        seen.add(h);
+        const w = windows.get(h);
+        if (!w) continue;
+        if (w.isSystemControl || w.guestCustomPaint) return true;
+        if ((w.style & WS_CAPTION) === WS_CAPTION) return true;
+        for (const c of w.children) stack.push(c);
     }
     return false;
+}
+
+/** What the composite decision needs to know about one live dialog group. */
+export interface DialogOverlayFacts {
+    /**
+     * GDI window output reaches the display. False while a DirectDraw flip chain or
+     * an exclusive-fullscreen 3D device owns the screen — see isGdiOutputOnScreen.
+     */
+    gdiOutputOnScreen: boolean;
+    /** This window is the DDSCL_EXCLUSIVE|FULLSCREEN cooperative-level window. */
+    isScreenOwnerWindow: boolean;
+    /** This window is the root of its dialog group (not a descendant control). */
+    isDialogRoot: boolean;
+    /** The overlay plane holds real pixels for this group (control / guest paint / caption). */
+    hasOverlayContent: boolean;
+}
+
+/**
+ * Whether a live dialog group's GDI pixels are composited over the game frame.
+ * The whole rule in one place, in terms of the Win32/DirectDraw contract:
+ *
+ *  1. GDI output must reach the display at all. In DDSCL_EXCLUSIVE|FULLSCREEN a
+ *     Flip of the primary chain puts the flip chain on screen and GDI keeps
+ *     painting into the GDI surface, which is now an OFF-SCREEN buffer — no
+ *     window, dialog included, is visible until FlipToGDISurface / RestoreDisplayMode
+ *     / DDSCL_NORMAL. A single-buffered primary never Flips: there is no separate
+ *     GDI surface, GDI paints land in the memory being displayed, so its output
+ *     is on screen (TS shows its "Select Campaign" modal exactly this way).
+ *     A 3D device presenting in EXCLUSIVE FULLSCREEN takes the display the same
+ *     way; a WINDOWED one does not.
+ *  2. The screen-owner window is never an overlay — in exclusive fullscreen its
+ *     client area IS the primary, so it is the game, not a plane above it.
+ *  3. Only the group ROOT contributes a rect; its visual bounds already cover
+ *     every descendant, and compositing a child separately would blit our render
+ *     of a control over the game's own render of it.
+ *  4. The overlay must actually hold pixels for the group — a control-less,
+ *     caption-less #32770 with no guest GDI paint is a focus/modality shell whose
+ *     visuals the game draws itself, so our render is pure occlusion.
+ */
+export function dialogOverlayComposites(f: DialogOverlayFacts): boolean {
+    return f.gdiOutputOnScreen && !f.isScreenOwnerWindow && f.isDialogRoot && f.hasOverlayContent;
+}
+
+/**
+ * True while GDI window output reaches the display (rule 1 above). Two ways an app
+ * can take the display away from GDI, and both must answer here or the rule is
+ * vacuously true for half the titles we run:
+ *
+ *  - DirectDraw: `gdiSurfaceVisible`, cleared ONLY by a primary-chain Flip and
+ *    restored by FlipToGDISurface (isFlipScreenOwned).
+ *  - A 3D device in EXCLUSIVE FULLSCREEN (Windowed=FALSE). That IS the same display
+ *    ownership — the swap chain is the front buffer and GDI paints into an off-screen
+ *    surface — so a dialog over it is as invisible as one behind a DDraw flip chain
+ *    (Worms World Party Remastered leaves a 640x480 #32770 of placeholder statics
+ *    visible over its D3D9 menu). A WINDOWED device does not: its present is clipped
+ *    to the window and a modal over it is genuinely on screen.
+ */
+export function isGdiOutputOnScreen(renderActive?: RenderActive | null): boolean {
+    const active = renderActive ?? System.getInstance().services.render.getActive();
+    return gdiOutputReachesDisplay({
+        flipScreenOwned: isFlipScreenOwned(),
+        // Ownership first: a 3D presenter layered over a WINDOWED DDraw primary does not
+        // own the screen at all, whatever its own present mode says.
+        threeDOwnsScreen: shouldSuppress3DGdiOverlay(active, getDDrawContext()),
+        threeDExclusiveFullscreen: !!active?.presentsExclusiveFullscreen,
+    });
+}
+
+/** The display-ownership half of rule 1, as a truth table (see isGdiOutputOnScreen). */
+export interface GdiDisplayFacts {
+    /** A DirectDraw flip chain is the buffer on screen (gdiSurfaceVisible === false). */
+    flipScreenOwned: boolean;
+    /** A hardware-3D presenter owns the screen (shouldSuppress3DGdiOverlay). */
+    threeDOwnsScreen: boolean;
+    /** ...and holds it in exclusive fullscreen (D3DPRESENT_PARAMETERS.Windowed === FALSE). */
+    threeDExclusiveFullscreen: boolean;
+}
+
+export function gdiOutputReachesDisplay(f: GdiDisplayFacts): boolean {
+    if (f.flipScreenOwned) return false;
+    return !(f.threeDOwnsScreen && f.threeDExclusiveFullscreen);
 }
 
 /**
  * Visual-bounds rects of live overlay dialogs (composited from the GDI overlay
  * canvas onto a DDraw flip frame). Sorted back→front for correct stacking.
  */
-export function getLiveDialogOverlayRects(): DialogOverlayRect[] {
-    const entries: Array<{ rect: DialogOverlayRect; rank: number }> = [];
+export function getLiveDialogOverlayRects(renderActive?: RenderActive | null): DialogOverlayRect[] {
+    return getLiveDialogOverlays(renderActive).map(e => e.rect);
+}
+
+/** getLiveDialogOverlayRects with the owning window — the diagnostic form (harness `overlay`). */
+export function getLiveDialogOverlays(renderActive?: RenderActive | null): Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect }> {
+    const gdiOutputOnScreen = isGdiOutputOnScreen(renderActive);
+    const entries: Array<{ hwnd: number; title: string; cls: string; rect: DialogOverlayRect; rank: number }> = [];
     for (const win of windows.values()) {
         if (!win.overlayOnFlipScreen || !win.visible || win.pendingDestroy) continue;
+        // A window flagged before the app took exclusive fullscreen can become the
+        // screen owner afterwards; re-check here, the one place the rects are consumed.
+        if (!dialogOverlayComposites({
+            gdiOutputOnScreen,
+            isScreenOwnerWindow: isScreenOwnerWindow(win.handle),
+            isDialogRoot: getDialogRoot(win.handle) === win.handle,
+            hasOverlayContent: dialogGroupHasOverlayContent(win.handle),
+        })) continue;
         const b = getWindowVisualBounds(win.handle);
         if (!b) continue;
-        entries.push({ rect: b, rank: getOverlayWindowZRank(win.handle) });
+        entries.push({
+            hwnd: win.handle,
+            title: win.title ?? '',
+            cls: win.nativeClassName ?? '',
+            rect: b,
+            rank: getOverlayWindowZRank(win.handle),
+        });
     }
     entries.sort((a, b) => a.rank - b.rank);
-    return entries.map(e => e.rect);
+    return entries.map(({ hwnd, title, cls, rect }) => ({ hwnd, title, cls, rect }));
 }
 
 /**
  * True when this dialog needs point-based mouse routing (InputManager asks the
  * resolver instead of always posting to the active window).
  *
- * NOT every visible #32770 qualifies: a launcher menu left visible=true after
- * exclusive fullscreen (HP/UE1) is stale desktop state — routing clicks to it
- * breaks in-game mouse while the flip chain owns the screen. Only live UI the
- * player is interacting with should participate.
+ * Visibility is the whole test for a #32770: Win32 hit-tests the window tree, not
+ * the display owner, so being covered by an exclusive-fullscreen presenter does not
+ * withhold the mouse. A window still flagged visible after it left the screen is a
+ * bug in our own window bookkeeping, to be fixed there rather than compensated here.
  */
 export function dialogNeedsPointMouseRouting(win: WindowInfo): boolean {
-    if (!win.visible || win.pendingDestroy || win.nativeClassName !== '#32770') return false;
+    if (!win.visible || win.pendingDestroy) return false;
+    if (win.nativeClassName !== '#32770') {
+        // Plain window hosting system controls: point-route only while it's the
+        // live overlay over a game-owned screen (windowed mode routes normally).
+        return !!win.overlayOnFlipScreen && hasSystemControlChildren(win);
+    }
 
-    if (win.overlayOnFlipScreen) return true;
-    if (win.dialogInitInProgress) return true;
-
-    const gdiHidden = isGdiSurfaceHidden(getDDrawContext());
-
-    // Non-launcher modals (TS "Select Campaign"): windowed GDI or live flip overlay.
-    if (!gdiHidden) return true;
-    if (isFlipScreenOwned()) return true;
-
-    return false;
+    // Every other visible #32770 point-routes. Being hidden behind an exclusive-fullscreen
+    // presenter is NOT a reason to withhold the mouse: Win32 hit-tests the window tree, not
+    // the display owner, and the guest's own dialog proc is what handles the click (measured
+    // on WWP Remastered — its title screen advances from a click delivered to the dialog
+    // that our composite rule correctly refuses to draw).
+    return true;
 }
 
 function hasPointRoutedDialog(): boolean {

@@ -11,11 +11,32 @@ import { describe, expect, test } from "bun:test";
 import {
     detectInstallShield,
     extractInstallerFromFiles,
+    createInstallShieldExternalResolver,
 } from "@bottleship/repack/container-extract";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
+import { createHash } from 'node:crypto';
 
 const enc = (s: string) => new TextEncoder().encode(s);
 const mz = (extra = "") => enc("MZ" + extra);
+
+test('loose cabinet files resolve by directory and size when basenames collide', () => {
+    const first = enc('wrong-ini'), second = enc('right-ini');
+    const resolve = createInstallShieldExternalResolver(new Map([
+        ['Disc1/Scripts/Default.ini', first],
+        ['Disc1/Scripts/GLSettings/Default.ini', second],
+        ['other/Default.ini', enc('short')],
+    ]));
+    expect(resolve('DEFAULT.INI', second.length, 'Scripts\\GLSettings\\Default.ini')).toBe(second);
+    expect(resolve('Default.ini', 5, 'missing/Default.ini')).toEqual(enc('short'));
+    expect(resolve('Default.ini', second.length, 'missing/Default.ini',
+        createHash('md5').update(second).digest())).toBe(second);
+    expect(() => resolve('Default.ini', first.length, 'missing/Default.ini')).toThrow('Ambiguous');
+    expect(resolve('absent.exe', 12, 'absent.exe')).toBeNull();
+    const copies = createInstallShieldExternalResolver(new Map([
+        ['Disk1/Controls/default.ini', first], ['Disk2/Controls/default.ini', first.slice()],
+    ]));
+    expect(copies('default.ini', first.length, 'Controls/default.ini')).toEqual(first);
+});
 
 describe("detectInstallShield", () => {
     test("finds the cabinet stem from a data1.hdr / data1.cab pair", () => {

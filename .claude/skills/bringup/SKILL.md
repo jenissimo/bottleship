@@ -19,9 +19,30 @@ bun tools/harness.ts up
 Launches/attaches Chrome with `--autoplay-policy=no-user-gesture-required` (so
 **audio unlocks with no gesture** — no canvas click needed in automation), opens
 `http://localhost:5174/?game=dev`, arms log streaming, and probes Vite(:5174
-`/health`) + log-server(:3001 `/health`) + Chrome(:9333). Bring the dev servers
-up first: `bun run dev` and `bun run dev:logs` (start the log
+`/health`) + dev-sidecar(:3001 `/health`) + Chrome(:9333). Bring the dev servers
+up first: `bun run dev` and `bun run dev:sidecar` (`dev:logs` still works; start the
 server BEFORE streaming). `bun tools/harness.ts health` re-probes.
+
+### Parallel bring-up — one tab per agent
+
+Set `BS_TAB=<name>` (once, for every harness command you run) when another agent is
+already using the emulator:
+
+```
+BS_TAB=alpha bun tools/harness.ts up     # opens/claims ?game=dev&bs=alpha
+BS_TAB=alpha bun tools/harness.ts run my.harness.ts
+BS_TAB=alpha bun tools/harness.ts report
+```
+
+The name picks that tab and ONLY that tab, and re-roots this run's evidence under
+`logs/alpha/` — screenshots, `run-N.harness.ts` journals, `dumpSurface`/`shot({save})`
+PNGs, and the sidecar's log archive. Never read `logs/` at the top level while a
+session is set; that is somebody else's guest.
+
+Rules: pick a name nobody else is using; never close a tab you did not open; and
+**do not measure** — parallel guests share the CPU, so `trace` refuses to run while
+a second guest tab is open, and A/B timing needs a single tab. With `BS_TAB` unset
+everything behaves exactly as it always has.
 
 ## 2. Drive
 
@@ -32,7 +53,7 @@ console `await window.__BS__.harness.chain()....run()`):
 import { harness } from "../harness";
 await harness()
   .streamLogs(["SYSTEM","DDRAW"])
-  .openWgb("blade-of-darkness")            // /apps/external-wgb/<id>.wgb (local WGB drop-folder)
+  .openWgb(process.env.WGB ?? "/apps/external-wgb/<id>.wgb") // abs path (streamed off disk) or drop-folder URL — take it from env, don't hardcode local paths
   .waitForEvent("dialogShow")              // event-driven wait (HarnessEventBus)
   .click("Play Game")                      // faithful click by label (global coords)
   .tickFrames(120)                         // wait N presents after the click
@@ -45,13 +66,51 @@ await harness()
 Skip intros with the bundle's `skipVideo`. `audioGesture()` exists **only** for a
 manually-opened browser; automation uses the autoplay flag.
 
+Touch/mobile runs the same way — `.device('phone-landscape'|'tablet-landscape'|'desktop')`
+then `.tap(x,y)` / `.touchDrag(x0,y0,x1,y1,ms)` / `.longPress(x,y,ms)` / `.twoFingerTap(x,y)` /
+`.pinch(x,y,scale)`, all in GUEST px. These execute CDP-side, so keep `.device()` and its
+gestures in ONE chain: the emulation override is owned by the CDP session and a separate
+CLI invocation reconnects without it.
+
 ## 3. Observe
 
 - `state([...])` — windows/surfaces/memory/threads/rings/audio/video/modules/cpu/screen as one POJO.
-- `shot({save})` — PNG of the on-screen frame (the canvas is an OffscreenCanvas —
-  a screenshot is ground truth; the main thread can't read it).
+- `shot({save})` — PNG of the SCREEN: the frame that reached the canvas, every overlay
+  (video plane, live GDI dialog rects, stats) composited, read from the mirror the present
+  path keeps. `shot({source:'layer'})` asks for the presenter's pre-composite game layer
+  instead — the split between "which layer holds the pixels" and "does the composite show
+  it" — and is always labelled `composited:false`. A capture that cannot see the screen
+  errors out; it never returns a plausible substitute.
+- `bun tools/harness.ts shot [file] --verify` — the browser's own capture of the canvas,
+  plus a cross-check of every worker-side route against it (with the screen's own churn as
+  the noise floor). Run it when a screenshot and the tab seem to disagree.
+- `screenPixels({x,y,w,h,legend})` — a rect as one string per row, colours quantised to
+  `legend`; anything outside it reads `?` and is tallied, so a chrome-geometry assertion
+  (is the etched line present HERE and absent THERE) cannot pass on pixels it did not
+  recognise.
+- `screenMark()` … `screenChangeSince({allow})` — WHICH pixels a transition touched.
+  Mark from a REPAIRED screen: a mark taken over an already-damaged one reports "nothing
+  changed" and the scope assertion then passes on the very bug it exists to catch.
+  `outside.changed` answers "what repainted that had no business repainting" (an
+  over-wide invalidate, a stamp with nothing erased under it); each `allow` rect's own
+  count is the positive control, so a run where the click missed fails instead of
+  passing. Both sides are ours, so it is exact — no reference image, nothing to tune.
 - `textures()` + `dumpSurface(ptr|'primary')` — gallery + per-surface PNG to `logs/debug/`.
 - `surfacePixels(sel)` / `expectSurfaceNonBlack(sel)` — cheap liveness from a subsampled readback.
+- Dump PNGs preserve ALPHA: an area that looks WHITE in a viewer but BLACK on the canvas is
+  transparent (a=0), not white — sample the RGBA (readSurfaceRGBA) before concluding a color.
+- A Win32 FRONT-END presents nothing — its dialogs run before the render device does. Gate on
+  `waitForControl("New Game")`, never `tickFrames`, or you wait on presents that never come and
+  it reads exactly like a hang.
+- DEAD control (the click does nothing) → `hitTest(x,y)` before anything else. It prints the
+  window a mouse message is ADDRESSED to next to the control the container hit-test finds, and
+  `agrees:false` is a routing bug the pixels cannot show: every control we drive ourselves keeps
+  working off the container hit-test, while one the guest SUBCLASSED needs the address and gets
+  nothing. `wmTrace` then confirms it on the wire (the `hwnd` on WM_LBUTTONDOWN).
+- BLANK control / unpainted dialog → `paintTrace("start")` … `paintTrace("read")`. The chain has
+  many links (posted → pump filter → dispatched → BeginPaint/EndPaint+flush → owner-draw chain
+  with its task counts → per-flush child-window exclusions) and the pixels look identical
+  whichever one dropped it; the trace names the link and its reason.
 
 ## 4. Diagnose
 
@@ -62,8 +121,28 @@ manually-opened browser; automation uses the autoplay flag.
   `breakOn(eip)` — all require **JIT OFF** (auto-enabled; **perf collapses while
   armed** — `clearBreaks()` to restore). Addresses inside the async-park spin loop
   are refused (CLAUDE.md §3.5).
+- "WHO calls this guest function, and with what?" — arm the function ENTRY and read
+  `callsite` off the hit: `retAddr` + `retAddrSym`, a `retAddrTrust` verdict, the
+  module-labelled backtrace, a stack window, and `capture.reads`
+  (`{reg:'esi',offset:12,size:4}` — add `deref` to follow the pointer). Present in EVERY
+  mode, continuous included. Trust the caller only on `verdict:"verified"` (the E8 before
+  `[ESP]` targets the armed eip); `untrusted`/`unreadable` means the armed address is not a
+  function entry and `retAddr` names nobody.
+- Hits also land in a WORKER-side ring — read them with `breakEvents({since,limit})`, from
+  any process, at any later time. Never accumulate hits in a script and print at the end: a
+  60s `pageEval`/RPC timeout takes the whole run's evidence with it, the ring does not. It
+  reports `evicted`/`gap` instead of silently returning a shorter list, and says out loud
+  that 0 events is not evidence the code did not run (block-entry rule).
 - Read the streamed log; `events(n)` shows recent harness events; on a WASM trap a
   `fault` event carries the fault-grade snapshot.
+- The ring holds a fixed number of ENTRIES, so on a ddraw/d3d title the per-frame spam
+  overwrites init-time evidence in ~20s and it is gone before a late crash fires. Quiet the
+  firehose category first — `logLevel("DDRAW","WARN")` (`logLevel()` resets) — rather than
+  just enlarging the ring, which only postpones losing the same lines.
+- A guest blocked on a **MessageBox** looks exactly like a freeze: the host draws it as DOM,
+  so no canvas capture shows it and the one string naming the problem is invisible.
+  `report().pendingModals` lists them (text, caption, how long it has waited);
+  `dismissModal()` / `onModal()` answer them.
 
 ## 5. Hypothesis from DATA, not reasoning
 
@@ -75,13 +154,17 @@ canvas-vs-selected-bitmap distinction and multi-DC composites are easy to mis-mo
 ## 6. Fix → re-run → keep tools, drop probes
 
 Every `.run()` writes a re-runnable `logs/harness/run-N.harness.ts` (journal). Turn
-the winning chain into a checked-in `*.harness.ts` regression script. **Remove
-one-off probes**; keep only reusable harness verbs.
+the winning chain into a checked-in `*.harness.ts` regression script under
+`tools/harness/regression/` **only if it self-judges** (throws/sets exitCode with
+a stated reason, not "look at the screenshot") **and** isn't tied to one closed bug
+(see `tools/harness/README.md`). **Remove one-off probes**; keep only reusable
+harness verbs.
 
 ## Hard rules (don't relearn these)
 
 - **Quality gate order** (CLAUDE.md): `bun tools/generate-index.ts` →
   `bun tools/validate-signatures.ts` → `bun tools/validate-struct-offsets.ts` →
+  `bun tools/validate-guest-code-writes.ts` → `bun tools/validate-stub-tables.ts` →
   `bun run typecheck`.
 - **Reload, not HMR**, after editing `src/worker` (HMR doesn't reload the worker
   entry and hangs the game). The harness ships in the worker bundle — iterate via
@@ -96,5 +179,7 @@ one-off probes**; keep only reusable harness verbs.
 The **skill** = workflow/checklist; the **harness** (`src/worker/harness/`,
 `src/harness/`, `tools/harness.ts`) = capability/verbs; **CLAUDE.md** = invariants.
 
-Bundled examples: `tools/examples/bringup.harness.ts` (template),
-`tools/examples/diagnose-eip.harness.ts` (API-breakpoint + waitUntil).
+Templates: `tools/harness/templates/bringup.harness.ts` (bring-up starting point),
+`tools/harness/templates/diagnose-eip.harness.ts` (API-breakpoint + waitUntil). Checked-in
+per-game regression scenarios live in `tools/harness/regression/` (run the whole batch with
+`bun tools/harness.ts regress`); see `tools/harness/README.md` for what earns a spot there.

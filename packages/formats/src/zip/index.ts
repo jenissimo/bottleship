@@ -1,13 +1,54 @@
 import { asBlobPart } from "../dom-buffer";
 
+// Synchronous inflate — usable where DecompressionStream is not (guest traps).
+export { adler32, inflateRawSync, inflateZlibSync } from "./inflate";
+export type { InflateOutcome, InflateStatus } from "./inflate";
+
 const EOCD_SIGNATURE = 0x06054b50;
+const EOCD64_SIGNATURE = 0x06064b50;
+const EOCD64_LOC_SIGNATURE = 0x07064b50;
 const CEN_SIGNATURE = 0x02014b50;
 const LOC_SIGNATURE = 0x04034b50;
 const MAX_EOCD_SEARCH = 0x10000 + 22;
+const U32_MAX = 0xffffffff;
+const U16_MAX = 0xffff;
+
+/** A ZIP64 64-bit field. Sizes here are file offsets, so Number (2^53) is the honest type. */
+function readU64(view: DataView, off: number): number {
+    return Number(view.getBigUint64(off, true));
+}
+
+/**
+ * What the layer that holds the FILE knows and the layers below it cannot infer:
+ * which entry this read belongs to, where its cursor is, and whether the caller is
+ * scanning. Everything below `ZipArchive` sees archive offsets only, so it cannot
+ * tell "sequential through a 50 MB entry" from "two unrelated adjacent reads" —
+ * which is the difference between a readahead that lands and one that evicts live
+ * data. Mirrors NT's per-file shared cache map: `CcScheduleReadAhead` reads ahead
+ * inside the file's extent, on the file object's own sequential state.
+ *
+ * All offsets are ARCHIVE offsets (the entry's data start, not 0), because that is
+ * the coordinate space every consumer of this hint already works in.
+ */
+export interface ReadHint {
+    /** Archive offset of the entry's first data byte. */
+    entryStart: number;
+    /** Archive offset one past the entry's last data byte. Readahead must not cross it. */
+    entryEnd: number;
+    /** Archive offset this read starts at (the file object's cursor). */
+    cursor: number;
+    /** FILE_FLAG_SEQUENTIAL_SCAN, or NT's heuristic: two consecutive contiguous
+     *  requests on the same file object. Only a sequential caller is speculated on. */
+    sequential: boolean;
+    /** This read is itself readahead — nobody is waiting on it. Without the
+     *  distinction a transport serves speculation and a caller's blocking read from
+     *  the same connection budget, and the blocking one waits behind the guesses. */
+    speculative?: boolean;
+}
 
 export interface ZipSource {
     size: number;
-    readRange(start: number, end: number): Promise<Uint8Array>;
+    readRange(start: number, end: number, hint?: ReadHint): Promise<Uint8Array>;
     /**
      * Optional sync range read. Returns the bytes when they can be served
      * synchronously (BufferSource / SAH always can), or `null` when a sync read
@@ -15,7 +56,12 @@ export interface ZipSource {
      * must then fall back to the async `readRange`. Existing always-sync sources
      * never return null, so this widening is behavior-preserving for them.
      */
-    readRangeSync?(start: number, end: number): Uint8Array | null;
+    readRangeSync?(start: number, end: number, hint?: ReadHint): Uint8Array | null;
+    /** False when `readRangeSync` exists but cannot fault a cold range in — a block
+     *  cache over an async-only transport. Absent/true means a sync read can always be
+     *  satisfied. Callers deciding whether an entry needs a RAM copy to be readable
+     *  without awaiting must consult this, not the method's presence. */
+    syncFaultCapable?: boolean;
 }
 
 export interface ZipEntry {
@@ -294,7 +340,8 @@ export class ZipArchive {
     async init(): Promise<void> {
         const size = this.source.size;
         const tailSize = Math.min(size, MAX_EOCD_SEARCH);
-        const tail = await this.source.readRange(size - tailSize, size);
+        const tailBase = size - tailSize;
+        const tail = await this.source.readRange(tailBase, size);
         const view = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
 
         let eocdOffset = -1;
@@ -308,15 +355,42 @@ export class ZipArchive {
             throw new Error("EOCD not found");
         }
 
-        const cdSize = view.getUint32(eocdOffset + 12, true);
-        const cdOffset = view.getUint32(eocdOffset + 16, true);
+        let cdSize = view.getUint32(eocdOffset + 12, true);
+        let cdOffset = view.getUint32(eocdOffset + 16, true);
+        const entryCount = view.getUint16(eocdOffset + 10, true);
 
-        // Recover the SFX prefix: the central directory always ends right where the EOCD
-        // begins, so its true file offset is `eocdFileOffset - cdSize`. For a plain zip that
-        // equals the stored `cdOffset` (delta 0); for a self-extractor it is larger by the
-        // stub size. Negative (malformed) → fall back to 0 so we degrade to the old behavior.
-        const eocdFileOffset = size - tailSize + eocdOffset;
-        const delta = eocdFileOffset - cdSize - cdOffset;
+        // Where the central directory actually ENDS — ground truth for the SFX prefix below.
+        // In a plain archive the EOCD follows it; in a ZIP64 one the ZIP64 EOCD record does.
+        let cdEndFileOffset = tailBase + eocdOffset;
+
+        // ZIP64: any sentinel in the 32-bit EOCD means the real values live in the ZIP64 EOCD
+        // record, which the locator (immediately before the EOCD) points at.
+        if (cdSize === U32_MAX || cdOffset === U32_MAX || entryCount === U16_MAX) {
+            const locRel = eocdOffset - 20;
+            if (locRel < 0 || view.getUint32(locRel, true) !== EOCD64_LOC_SIGNATURE) {
+                throw new Error("ZIP64 EOCD locator not found");
+            }
+            // The locator's stored offset is archive-relative, so an SFX prefix would skew it
+            // exactly like the CD offset — and it is the value we would need to MEASURE that
+            // prefix. Take the record's position from the bytes we already hold instead: it
+            // ends where the locator begins.
+            let z64Rel = locRel - 56;
+            if (z64Rel < 0 || view.getUint32(z64Rel, true) !== EOCD64_SIGNATURE) {
+                z64Rel = -1;
+                for (let i = locRel - 4; i >= 0; i--) {
+                    if (view.getUint32(i, true) === EOCD64_SIGNATURE) { z64Rel = i; break; }
+                }
+            }
+            if (z64Rel < 0) throw new Error("ZIP64 EOCD record not found");
+            cdSize = readU64(view, z64Rel + 40);
+            cdOffset = readU64(view, z64Rel + 48);
+            cdEndFileOffset = tailBase + z64Rel;
+        }
+
+        // Recover the SFX prefix: WinZip/7z SFX write offsets relative to the START OF THE ZIP,
+        // not the file, so every stored offset is short by the stub size. For a plain zip the
+        // measured end matches the stored one (delta 0). Negative (malformed) → fall back to 0.
+        const delta = cdEndFileOffset - cdSize - cdOffset;
         this.prefixDelta = delta > 0 ? delta : 0;
 
         const cdStart = cdOffset + this.prefixDelta;
@@ -337,12 +411,32 @@ export class ZipArchive {
 
             const flags = view.getUint16(offset + 8, true);
             const compression = view.getUint16(offset + 10, true);
-            const compressedSize = view.getUint32(offset + 20, true);
-            const uncompressedSize = view.getUint32(offset + 24, true);
+            let compressedSize = view.getUint32(offset + 20, true);
+            let uncompressedSize = view.getUint32(offset + 24, true);
             const nameLen = view.getUint16(offset + 28, true);
             const extraLen = view.getUint16(offset + 30, true);
             const commentLen = view.getUint16(offset + 32, true);
-            const localHeaderOffset = view.getUint32(offset + 42, true);
+            let localHeaderOffset = view.getUint32(offset + 42, true);
+
+            // ZIP64 extended info (0x0001): the 64-bit values appear in this fixed order, but
+            // ONLY for the 32-bit fields that actually held the sentinel — reading all three
+            // unconditionally would shift every later field.
+            if (compressedSize === U32_MAX || uncompressedSize === U32_MAX || localHeaderOffset === U32_MAX) {
+                let ex = offset + 46 + nameLen;
+                const exEnd = ex + extraLen;
+                while (ex + 4 <= exEnd) {
+                    const id = view.getUint16(ex, true);
+                    const dlen = view.getUint16(ex + 2, true);
+                    if (id === 0x0001) {
+                        let dp = ex + 4;
+                        if (uncompressedSize === U32_MAX) { uncompressedSize = readU64(view, dp); dp += 8; }
+                        if (compressedSize === U32_MAX) { compressedSize = readU64(view, dp); dp += 8; }
+                        if (localHeaderOffset === U32_MAX) { localHeaderOffset = readU64(view, dp); dp += 8; }
+                        break;
+                    }
+                    ex += 4 + dlen;
+                }
+            }
 
             const nameBytes = cd.slice(offset + 46, offset + 46 + nameLen);
             const name = (flags & 0x0800) ? decoderUtf8.decode(nameBytes) : decoderUtf8.decode(nameBytes);
@@ -359,6 +453,25 @@ export class ZipArchive {
 
             offset += 46 + nameLen + extraLen + commentLen;
         }
+    }
+
+    /**
+     * Can this entry be served at any offset by {@link readEntryRangeSync}? True only
+     * for a STORED entry over a source with a synchronous range read.
+     *
+     * The distinction a speculative caller needs: such an entry is ALREADY
+     * sync-readable, so pulling its whole body into a second RAM cache buys no
+     * capability — it only duplicates bytes and forces the transport to move the
+     * entire file for reads the caller may never make.
+     */
+    canRangeReadSync(entry: ZipEntry): boolean {
+        if (entry.compression !== 0) return false;
+        if (typeof this.source.readRangeSync !== "function") return false;
+        // A decorator can EXPOSE readRangeSync and still fail it: a block cache over an
+        // async-only transport answers null for a block it has not faulted. Taking the
+        // method's presence as the answer would tell a caller a cold entry is
+        // sync-readable when the first read of it returns null, which reads as EOF.
+        return this.source.syncFaultCapable !== false;
     }
 
     async readEntry(entry: ZipEntry): Promise<Uint8Array> {
@@ -379,8 +492,8 @@ export class ZipArchive {
     /**
      * Reads an uncompressed (STORED) entry range without loading the whole file.
      */
-    async readEntryRange(entry: ZipEntry, offset: number, length: number): Promise<Uint8Array> {
-        const sync = this.readEntryRangeSync(entry, offset, length);
+    async readEntryRange(entry: ZipEntry, offset: number, length: number, sequential = false): Promise<Uint8Array> {
+        const sync = this.readEntryRangeSync(entry, offset, length, sequential);
         if (sync) return sync;
         if (entry.compression !== 0) {
             throw new Error(`Range read is supported only for STORED entries (${entry.name})`);
@@ -396,11 +509,18 @@ export class ZipArchive {
         }
 
         const dataStart = await this.getEntryDataStart(entry);
-        return this.source.readRange(dataStart + clampedOffset, dataStart + clampedEnd);
+        return this.source.readRange(dataStart + clampedOffset, dataStart + clampedEnd, {
+            entryStart: dataStart,
+            entryEnd: dataStart + entry.uncompressedSize,
+            cursor: dataStart + clampedOffset,
+            sequential,
+        });
     }
 
-    /** Sync range read for STORED entries when ZipSource supports readRangeSync. */
-    readEntryRangeSync(entry: ZipEntry, offset: number, length: number): Uint8Array | null {
+    /** Sync range read for STORED entries when ZipSource supports readRangeSync.
+     *  `sequential` is the caller's own read-pattern state (it owns the file object);
+     *  this is the layer that can turn it into an entry-bounded {@link ReadHint}. */
+    readEntryRangeSync(entry: ZipEntry, offset: number, length: number, sequential = false): Uint8Array | null {
         if (entry.compression !== 0 || !this.source.readRangeSync) return null;
         if (length <= 0 || offset >= entry.uncompressedSize) return new Uint8Array();
         const clampedOffset = Math.max(0, offset);
@@ -408,7 +528,13 @@ export class ZipArchive {
         if (clampedOffset >= clampedEnd) return new Uint8Array();
         const dataStart = this.getEntryDataStartSync(entry);
         if (dataStart === null) return null;
-        return this.source.readRangeSync(dataStart + clampedOffset, dataStart + clampedEnd);
+        const hint: ReadHint = {
+            entryStart: dataStart,
+            entryEnd: dataStart + entry.uncompressedSize,
+            cursor: dataStart + clampedOffset,
+            sequential,
+        };
+        return this.source.readRangeSync(dataStart + clampedOffset, dataStart + clampedEnd, hint);
     }
 
     private async getEntryDataStart(entry: ZipEntry): Promise<number> {

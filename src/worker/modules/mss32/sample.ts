@@ -1,19 +1,24 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
-import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING, SMP_STOPPED } from "./context";
+import { isValidAddress } from "../../core/memory/address-guard";
+import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING, SMP_PLAYINGBUTRELEASED, SMP_STOPPED } from "./context";
 import { MSSSample } from "./types";
 import {
     ensureDriverHandle, getBytesPerSecond, getMemory, makeView,
     setSampleStatus, updateSampleMemory, refreshSampleLenDone,
     readFilenameArg, isEncodedFormat, MSS_SAMPLE_STRUCT_SIZE,
-    computeSampleVolumes,
+    computeSampleVolumes, getPlaybackLengthBytes, writeSamplePosition,
 } from "./helpers";
-import { decodeAudioFile } from "./audio-decode";
-import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, applySample3D } from "./playback-engine";
+import {
+    AILSOUNDINFO_SIZE, DIG_F_16BITS_MASK, DIG_F_ADPCM_MASK, DIG_F_STEREO_MASK,
+    convertToFloat, decodeAudioFile, readAilSoundInfo,
+} from "./audio-decode";
+import { playSample, updateSamplePlayback, stopRingBuffer, resumeRingBuffer, seekRingBuffer, applySample3D } from "./playback-engine";
 import { System } from "../../core/system";
 import { i32ToFloat } from "../../../audio/audio-ring-buffer";
 import { ensureListener3D, writeListener3D } from "./spatial";
+import { clampLevel, f32Arg, levelsToVolumePan, pan127ToPanLevel, panLevelToPan127, volumePanToLevels } from "./volume-levels";
 
 export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -296,8 +301,21 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         const handle = args[0];
         const sampleObj = ctx.samples.get(handle);
         if (!sampleObj) {
-            Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_sample_status@4: handle=0x${handle.toString(16)} → 0 (not found)`);
-            return 0;
+            // A released (or never-allocated) slot is still a real HSAMPLE in the driver's
+            // sample array, and its status word lives at +0x08 — release_sample_handle stamps
+            // SMP_FREE there. 0 is NOT a Miles status, and answering it strands the documented
+            // teardown loop `end_sample; release_sample_handle; while (status != SMP_FREE);`
+            // (ZenGin's zCSndSys_MSS does exactly this) in an unbreakable spin.
+            const slotStatus = isValidAddress(mem, handle + 0x08, 4)
+                ? makeView(mem).getUint32(handle + 0x08, true)
+                : 0;
+            const status = (slotStatus === SMP_FREE || slotStatus === SMP_DONE
+                || slotStatus === SMP_PLAYING || slotStatus === SMP_STOPPED)
+                ? slotStatus
+                : SMP_FREE;
+            Logger.log(LogCategory.SYSTEM,
+                `MSS32: _AIL_sample_status@4: handle=0x${handle.toString(16)} → ${status} (slot, no JS sample)`);
+            return status;
         }
         const status = sampleObj.isStopped ? SMP_STOPPED : (sampleObj.isPlaying || sampleObj.pendingStart) ? SMP_PLAYING : SMP_DONE;
         Logger.log(LogCategory.SYSTEM, `MSS32: _AIL_sample_status@4: handle=0x${handle.toString(16)} → ${status} (${status === SMP_DONE ? 'DONE' : status === SMP_PLAYING ? 'PLAYING' : 'STOPPED'})`);
@@ -334,6 +352,54 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         MemoryGuard.writeUint32(m, view, s.handle + 0x60, s.pan >>> 0, "MSS32:set_pan:real");
         computeSampleVolumes(view, s.handle, ctx.digitalDriverHandle);
         if (s.isPlaying) updateSamplePlayback(ctx, s);
+        return 0;
+    };
+
+    // ---- MSS 6 F32 volume API ----------------------------------------------
+    // The same volume and pan fields the S32 pair above owns, spelled as floats.
+    // Delegating keeps the struct dual-writes and the playback kick in one place;
+    // a second copy of them would drift the moment either offset moved.
+    const setVolumePan127 = (ctxThunk: Parameters<ThunkImplementation>[0], mem: Uint8Array,
+                             handle: number, volume: number, pan: number): number => {
+        exports["_AIL_set_sample_volume@8"]!(ctxThunk, mem, [handle, volume]);
+        exports["_AIL_set_sample_pan@8"]!(ctxThunk, mem, [handle, pan]);
+        return 0;
+    };
+
+    /** Write an optional F32 out-parameter; Miles treats a NULL as "not wanted". */
+    const writeOptionalF32 = (mem: Uint8Array, pointer: number, value: number): void => {
+        if (!pointer || !MemoryGuard.isValidRange(mem, pointer, 4)) return;
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setFloat32(pointer, value, true);
+    };
+
+    exports["_AIL_set_sample_volume_pan@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        return setVolumePan127(ctxThunk, mem, args[0],
+            Math.round(clampLevel(f32Arg(args[1])) * 127), panLevelToPan127(f32Arg(args[2])));
+    };
+
+    exports["_AIL_sample_volume_pan@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        writeOptionalF32(mem, args[1], clampLevel(sample.volume / 127));
+        writeOptionalF32(mem, args[2], pan127ToPanLevel(sample.pan));
+        return 0;
+    };
+
+    exports["_AIL_set_sample_volume_levels@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        const { volume, pan } = levelsToVolumePan(f32Arg(args[1]), f32Arg(args[2]));
+        return setVolumePan127(ctxThunk, mem, args[0], volume, pan);
+    };
+
+    exports["_AIL_sample_volume_levels@12"] = (ctxThunk, mem, args) => {
+        const sample = ctx.samples.get(args[0]);
+        if (!sample) return 0;
+        const { left, right } = volumePanToLevels(sample.volume, sample.pan);
+        writeOptionalF32(mem, args[1], left);
+        writeOptionalF32(mem, args[2], right);
         return 0;
     };
 
@@ -425,6 +491,15 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             sampleObj.fileDataAddress = filePtr;
             updateSampleMemory(ctx, sampleObj, filePtr, detectedSize);
             decodeAudioFile(ctx, sampleObj);
+            // "0 if the file format is not supported" (mss.h). Answering 1 over an image we
+            // could not parse is a false success the caller cannot detect: it starts the voice
+            // and then polls a sample that will never leave SMP_PLAYING, because there is no
+            // data to reach the end of. A honest 0 lets it pick its own fallback.
+            if (sampleObj.fileFormat === "unknown") {
+                Logger.warn(LogCategory.SYSTEM,
+                    `MSS32: _AIL_set_sample_file@12: unsupported image at 0x${filePtr.toString(16)} → 0`);
+                return 0;
+            }
         }
         return 1;
     };
@@ -472,6 +547,101 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         return 1;
     };
 
+    // S32 AIL_set_sample_info(HSAMPLE S, AILSOUNDINFO const *info)
+    //
+    // The memory-image twin of AIL_set_sample_file: rather than a file to parse, the app
+    // hands Miles a buffer it has already described — format, data pointer, length, rate,
+    // bits, channels, block size. A title that loads one bank into memory once and plays
+    // slices out of it never calls set_sample_file at all, so a missing set_sample_info
+    // leaves the voice allocated, "configured" into nothing, and silent while every status
+    // the guest can read says PLAYING.
+    //
+    // `format` is the DIG_F_* bitmask AIL_WAV_info emits (this module's own convention,
+    // and what _AIL_decompress_ADPCM@12 already reads); WAVE_FORMAT_IMA_ADPCM (17) is
+    // accepted too since it cannot collide with a DIG_F value (0..7). DIG_F says only
+    // "ADPCM or not" — which ADPCM flavour comes from the AIL_WAV_info that described
+    // this same buffer, exactly as decompress_ADPCM resolves it.
+    const setSampleInfo: ThunkImplementation = (ctxThunk, mem, args) => {
+        const handle = args[0];
+        const infoPtr = args[1];
+
+        const sampleObj = ctx.samples.get(handle);
+        if (!sampleObj) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: invalid sample handle 0x${handle.toString(16)}`);
+            return 0;
+        }
+        if (!infoPtr || !isValidAddress(mem, infoPtr, AILSOUNDINFO_SIZE, "r")) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: unreadable AILSOUNDINFO at 0x${infoPtr.toString(16)}`);
+            return 0;
+        }
+        const info = readAilSoundInfo(mem, infoPtr);
+        if (!info) return 0;
+
+        if (!info.dataPtr || info.dataLen <= 0) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: empty sound image (ptr=0x${info.dataPtr.toString(16)} len=${info.dataLen})`);
+            return 0;
+        }
+        // Whole extent up front, against the region map — the app owns this buffer and it
+        // is the only thing standing between a bogus data_len and a read off a live region.
+        if (!isValidAddress(mem, info.dataPtr, info.dataLen, "r")) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: sound image out of bounds ptr=0x${info.dataPtr.toString(16)} len=${info.dataLen}`);
+            return 0;
+        }
+
+        const isAdpcm = (info.format & DIG_F_ADPCM_MASK) !== 0 || info.format === 17;
+        const channels = info.channels > 0 ? info.channels : ((info.format & DIG_F_STEREO_MASK) ? 2 : 1);
+        const bits = info.bits > 0 ? info.bits : (isAdpcm ? 4 : ((info.format & DIG_F_16BITS_MASK) ? 16 : 8));
+        const formatTag = isAdpcm
+            ? (ctx.wavFormatByDataPtr.get(info.dataPtr) ?? 17)
+            : (bits === 32 ? 3 : 1);
+        // block_size describes an ADPCM block and is meaningless for PCM, where the frame
+        // size is fixed by channels x bits. Apps leave it uninitialized on the PCM path —
+        // GTA III's carries a leftover stack address — so reading it there turns a good
+        // sample into a fraction of itself or into nothing at all.
+        const blockAlign = isAdpcm && info.blockSize > 0
+            ? info.blockSize
+            : channels * Math.max(1, bits >> 3);
+
+        // Real Miles auto-inits the sample here, same as set_sample_file — loop state goes
+        // back to the one-shot default, or a reused voice inherits the last sound's looping.
+        resetSampleLoopState(sampleObj);
+        sampleObj.isStopped = false;
+
+        sampleObj.fileData = mem.slice(info.dataPtr, info.dataPtr + info.dataLen);
+        sampleObj.fileDataAllocated = false;
+        sampleObj.fileDataAddress = info.dataPtr;
+        sampleObj.fileFormat = "wav";
+        sampleObj.sampleRate = info.rate > 0 ? info.rate : 22050;
+        sampleObj.channels = channels;
+        sampleObj.bitsPerSample = bits;
+        sampleObj.formatTag = formatTag;
+        sampleObj.blockAlign = blockAlign;
+        sampleObj.encodedDurationMs = undefined;
+        sampleObj.decodedData = convertToFloat(sampleObj.fileData, channels, bits, formatTag, blockAlign);
+        // len/done are SOURCE bytes — what the app seeks in — not decoded floats.
+        sampleObj.pcmBytes = info.dataLen;
+
+        updateSampleMemory(ctx, sampleObj, info.dataPtr, info.dataLen);
+        refreshSampleLenDone(ctx, sampleObj);
+
+        Logger.log(
+            LogCategory.SYSTEM,
+            `MSS32: AIL_set_sample_info: sample=0x${handle.toString(16)} fmt=${info.format}${isAdpcm ? `(adpcm tag=${formatTag})` : ""} ` +
+            `${channels}ch ${sampleObj.sampleRate}Hz ${bits}bit data=0x${info.dataPtr.toString(16)} len=${info.dataLen} -> ${sampleObj.decodedData.length} floats`
+        );
+
+        if (sampleObj.decodedData.length === 0) {
+            Logger.warn(LogCategory.SYSTEM, `MSS32: AIL_set_sample_info: decoded 0 samples from ${info.dataLen} bytes (fmt=${info.format} ${bits}bit block=${blockAlign})`);
+            return 0;
+        }
+        if (sampleObj.pendingStart) {
+            playSample(ctx, sampleObj);
+        }
+        return 1;
+    };
+    exports["_AIL_set_sample_info@8"] = setSampleInfo;
+    exports["AIL_set_sample_info"] = setSampleInfo;
+
     // _AIL_set_sample_address@8
     exports["_AIL_set_sample_address@8"] = (ctxThunk, mem, args) => {
         const sample = args[0];
@@ -500,6 +670,41 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         if (sampleObj.pcmBytes !== undefined) {
             refreshSampleLenDone(ctx, sampleObj);
         }
+        return 1;
+    };
+
+    /**
+     * _AIL_set_sample_address@12 — (HSAMPLE, start, len). The @8 variant has no length
+     * and has to guess one from the voice's previous contents; here the app states it,
+     * so the sound image is exactly what it points at. Separate export, not a spelling:
+     * serving one with the other either invents a length or drops the app's.
+     */
+    exports["_AIL_set_sample_address@12"] = (ctxThunk, mem, args) => {
+        const sample = args[0];
+        const address = args[1] >>> 0;
+        const len = args[2] >>> 0;
+        const sampleObj = ctx.samples.get(sample);
+        if (!sampleObj || !address || !len) return 0;
+
+        const memRef = getMemory(ctx);
+        if (!MemoryGuard.isValidRange(memRef, address, len)) {
+            Logger.warn(LogCategory.SYSTEM,
+                `MSS32: _AIL_set_sample_address@12: sound image out of bounds ptr=0x${address.toString(16)} len=${len}`);
+            return 0;
+        }
+
+        sampleObj.fileDataAddress = address;
+        sampleObj.fileDataAllocated = false;
+        sampleObj.decodedData = null;
+        sampleObj.fileData = memRef.slice(address, address + len);
+        decodeAudioFile(ctx, sampleObj);
+
+        updateSampleMemory(ctx, sampleObj, address, sampleObj.pcmBytes ?? len);
+        if (sampleObj.pcmBytes !== undefined) {
+            refreshSampleLenDone(ctx, sampleObj);
+        }
+        Logger.verbose(LogCategory.SYSTEM,
+            `MSS32: _AIL_set_sample_address@12: sample=0x${sample.toString(16)} ptr=0x${address.toString(16)} len=${len}`);
         return 1;
     };
 
@@ -534,6 +739,116 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
     exports["_AIL_sample_position@4"] = (ctxThunk, mem, args) => {
         const sample = ctx.samples.get(args[0]);
         return sample ? sample.position : 0;
+    };
+
+    // S32 AIL_sample_granularity(HSAMPLE S) — the quantum AIL_sample_position and
+    // AIL_set_sample_position work in. Real mss32 maps the sample's DIG_F_* format to its
+    // frame size (mono8=1, mono16/stereo8=2, stereo16=4), returns the ADPCM block size for
+    // an ADPCM sample, and 1 when an ASI decoder owns the data. A WAV's blockAlign is
+    // exactly the first two of those; host-decoded MP3/OGG is our ASI-equivalent.
+    const sampleGranularity = (s: MSSSample): number => {
+        if (isEncodedFormat(s.fileFormat)) return 1;
+        return Math.max(1, s.blockAlign
+            || Math.max(1, s.channels) * Math.max(1, s.bitsPerSample >> 3));
+    };
+
+    exports["_AIL_sample_granularity@4"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        // Callers divide by this; real mss32 only ever answers 0 for a NULL handle.
+        if (!args[0]) return 0;
+        return s ? sampleGranularity(s) : 1;
+    };
+
+    // void AIL_set_sample_position(HSAMPLE S, S32 offset) — offset in bytes into the sample
+    // data. Real mss32 rounds to the nearest multiple of AIL_sample_granularity before
+    // storing, so a mid-frame seek cannot desync the mixer's frame stride.
+    exports["_AIL_set_sample_position@8"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        if (!s) return 0;
+        const gran = sampleGranularity(s);
+        const total = getPlaybackLengthBytes(s);
+        let pos = Math.max(0, args[1] | 0);
+        pos = Math.floor((pos + (gran >> 1)) / gran) * gran;
+        if (total > 0) pos = Math.min(pos, total);
+
+        s.position = pos;
+        writeSamplePosition(ctx, s, pos);
+        // The heartbeat derives position from startTime, so re-anchor it or the next tick
+        // reverts the seek.
+        const bytesPerSec = getBytesPerSecond(s) * (s.playbackRate || 1.0);
+        if (bytesPerSec > 0) s.startTime = performance.now() - (pos / bytesPerSec) * 1000.0;
+        s.lastAudioPositionTime = undefined;
+        s.lastAudioPositionBytes = undefined;
+        s.lastRingCursorBytes = undefined;
+        s.lastRingCursorTime = undefined;
+
+        if (!seekRingBuffer(s, pos) && s.isPlaying) {
+            // Host-decoded voices (MP3/OGG via audio_play_encoded) expose no seek; the
+            // reported position moves, the audible one does not.
+            Logger.warn(LogCategory.SYSTEM,
+                `MSS32: _AIL_set_sample_position@8: id=${s.id} seek to ${pos} not applied (no ring buffer)`);
+        }
+        Logger.log(LogCategory.SYSTEM,
+            `MSS32: _AIL_set_sample_position@8: handle=0x${args[0].toString(16)} → ${pos} (gran=${gran})`);
+        return 0;
+    };
+
+    // void AIL_set_sample_ms_position(HSAMPLE S, S32 milliseconds) — real mss32 converts
+    // with the sample's bytes-per-second and hands the byte offset to
+    // AIL_set_sample_position, which is where the granularity rounding happens.
+    exports["_AIL_set_sample_ms_position@8"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        if (!s) return 0;
+        const ms = args[1] | 0;
+        const bytes = Math.max(0, Math.round(getBytesPerSecond(s) * ms / 1000));
+        return exports["_AIL_set_sample_position@8"]!(ctxThunk, mem, [args[0], bytes]);
+    };
+
+    // S32 AIL_active_sample_count(HDIGDRIVER dig) — real mss32 walks the driver's sample
+    // array and counts slots whose status is SMP_PLAYING or SMP_PLAYINGBUTRELEASED, so a
+    // voice the game released while still audible keeps counting. Same array, same rule.
+    exports["_AIL_active_sample_count@4"] = (ctxThunk, mem, args) => {
+        let count = 0;
+        if (ctx.driverSampleArray) {
+            const view = makeView(mem);
+            for (let i = 0; i < ctx.driverMaxSamples; i++) {
+                const slot = ctx.driverSampleArray + i * MSS_SAMPLE_STRUCT_SIZE;
+                if (!isValidAddress(mem, slot + 0x08, 4)) break;
+                const status = view.getUint32(slot + 0x08, true);
+                if (status === SMP_PLAYING || status === SMP_PLAYINGBUTRELEASED) count++;
+            }
+        } else {
+            for (const s of ctx.samples.values()) {
+                if (s.isPlaying || s.pendingStart) count++;
+            }
+        }
+        return count;
+    };
+
+    // _AIL_register_EOS_callback@8(sample, EOS) -> previous callback.
+    // The callback lives in the GUEST's sample struct at +0x4C, which is where
+    // invokeEOSCallback reads it from — an app may set it either way, so the API
+    // has to write the same slot rather than keep a private copy.
+    exports["_AIL_register_EOS_callback@8"] = (ctxThunk, mem, args) => {
+        const sample = args[0] >>> 0;
+        const callback = args[1] >>> 0;
+        if (!MemoryGuard.isValidRange(mem, sample + 0x4C, 4)) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const previous = view.getUint32(sample + 0x4C, true);
+        view.setUint32(sample + 0x4C, callback, true);
+        return previous === 0xFFFFFFFF ? 0 : previous;
+    };
+
+    // _AIL_sample_user_data@8(sample, index) -> value. The slot lives in the GUEST
+    // sample struct at +0x40 + index*4, which an app may write directly, so read it
+    // back from there rather than from our own copy.
+    exports["_AIL_sample_user_data@8"] = (ctxThunk, mem, args) => {
+        const sample = args[0] >>> 0;
+        const index = args[1] | 0;
+        if (index < 0 || !ctx.samples.has(sample)) return 0;
+        const offset = sample + 0x40 + index * 4;
+        if (!MemoryGuard.isValidRange(mem, offset, 4)) return 0;
+        return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(offset, true);
     };
 
     // _AIL_set_sample_user_data@12
@@ -586,6 +901,11 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
     exports["_AIL_set_3D_sample_file@8"] = (ctxThunk, mem, args) =>
         exports["_AIL_set_sample_file@12"]!(ctxThunk, mem, [args[0], args[1], 0]);
 
+    // H3DSAMPLE is a sample handle from the same pool, and the AILSOUNDINFO contract is
+    // identical — the 3D variant only differs in which pool allocate_* drew the voice from.
+    exports["_AIL_set_3D_sample_info@8"] = setSampleInfo;
+    exports["AIL_set_3D_sample_info"] = setSampleInfo;
+
     exports["_AIL_start_3D_sample@4"] = (ctxThunk, mem, args) => {
         const r = exports["_AIL_start_sample@4"]!(ctxThunk, mem, args);
         const s = ctx.samples.get(args[0]);
@@ -622,6 +942,21 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
 
     exports["_AIL_3D_sample_loop_count@4"] = (ctxThunk, mem, args) =>
         exports["_AIL_sample_loop_count@4"]!(ctxThunk, mem, args);
+
+    // U32 AIL_3D_sample_length(H3DSAMPLE S) / AIL_(set_)3D_sample_offset — byte length and
+    // play cursor of the 3D voice's data. In real mss32 these dispatch straight into the
+    // provider (.m3d) that owns the voice; ours are the same voices as the 2D pool, so they
+    // answer from the same data.
+    exports["_AIL_3D_sample_length@4"] = (ctxThunk, mem, args) => {
+        const s = ctx.samples.get(args[0]);
+        return s ? getPlaybackLengthBytes(s) >>> 0 : 0;
+    };
+
+    exports["_AIL_3D_sample_offset@4"] = (ctxThunk, mem, args) =>
+        exports["_AIL_sample_position@4"]!(ctxThunk, mem, args);
+
+    exports["_AIL_set_3D_sample_offset@8"] = (ctxThunk, mem, args) =>
+        exports["_AIL_set_sample_position@8"]!(ctxThunk, mem, args);
 
     // Reverb/occlusion strength — no DSP for it yet; accept and ignore.
     exports["_AIL_set_3D_sample_effects_level@8"] = () => 0;
@@ -700,6 +1035,85 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
             s.minDist3D = i32ToFloat(args[2]);
             applySample3D(s);
         }
+        return 0;
+    };
+
+    // ---- 3D getters -------------------------------------------------------
+    // Out-parameter twins of the setters above; each writes back exactly what the
+    // matching setter stored. An engine that keeps no copy of its own spatial state
+    // reads these back per frame, and a handler that leaves the pointers untouched
+    // hands it whatever was on the stack — garbage distances and pans.
+
+    /** Write up to three F32 out-parameters, skipping the NULL ones MSS allows. */
+    const writeF32Outs = (mem: Uint8Array, ptrs: number[], values: number[]): void => {
+        const view = makeView(mem);
+        for (let i = 0; i < ptrs.length; i++) {
+            const p = ptrs[i] >>> 0;
+            if (!p || !MemoryGuard.isValidRange(mem, p, 4)) continue;
+            view.setFloat32(p, values[i], true);
+        }
+    };
+
+    /** Spatial state of a 3D object — a sample, or the listener. */
+    const spatialOf = (obj: number): {
+        pos: [number, number, number]; vel: [number, number, number];
+        front: [number, number, number]; top: [number, number, number];
+        maxDist: number; minDist: number;
+    } | null => {
+        if (isListener(obj)) {
+            const ls = ctx.listener3D!;
+            return {
+                pos: [ls.posX, ls.posY, ls.posZ],
+                vel: [ls.velX, ls.velY, ls.velZ],
+                front: [ls.frontX, ls.frontY, ls.frontZ],
+                top: [ls.topX, ls.topY, ls.topZ],
+                maxDist: 0, minDist: 0,
+            };
+        }
+        const s = ctx.samples.get(obj);
+        if (!s) return null;
+        const p = s.pos3D ?? { x: 0, y: 0, z: 0 };
+        const v = s.vel3D ?? { x: 0, y: 0, z: 0 };
+        const c = s.cone3D;
+        return {
+            pos: [p.x, p.y, p.z],
+            vel: [v.x, v.y, v.z],
+            // A sample's "face" vector is its sound cone's orientation; it has no up vector.
+            front: [c?.oriX ?? 0, c?.oriY ?? 0, c?.oriZ ?? 1],
+            top: [0, 1, 0],
+            maxDist: s.maxDist3D ?? 0,
+            minDist: s.minDist3D ?? 0,
+        };
+    };
+
+    // _AIL_3D_position@16(obj, F32* X, F32* Y, F32* Z)
+    exports["_AIL_3D_position@16"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        writeF32Outs(mem, [args[1], args[2], args[3]], sp ? sp.pos : [0, 0, 0]);
+        return 0;
+    };
+
+    // _AIL_3D_velocity@16(obj, F32* dX, F32* dY, F32* dZ)
+    exports["_AIL_3D_velocity@16"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        writeF32Outs(mem, [args[1], args[2], args[3]], sp ? sp.vel : [0, 0, 0]);
+        return 0;
+    };
+
+    // _AIL_3D_orientation@28(obj, F32* X_face, Y_face, Z_face, X_up, Y_up, Z_up)
+    exports["_AIL_3D_orientation@28"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        const f = sp ? sp.front : [0, 0, 1];
+        const u = sp ? sp.top : [0, 1, 0];
+        writeF32Outs(mem, [args[1], args[2], args[3], args[4], args[5], args[6]],
+            [f[0], f[1], f[2], u[0], u[1], u[2]]);
+        return 0;
+    };
+
+    // _AIL_3D_sample_distances@12(S3D, F32* max_dist, F32* min_dist)
+    exports["_AIL_3D_sample_distances@12"] = (ctxThunk, mem, args) => {
+        const sp = spatialOf(args[0]);
+        writeF32Outs(mem, [args[1], args[2]], sp ? [sp.maxDist, sp.minDist] : [0, 0]);
         return 0;
     };
 

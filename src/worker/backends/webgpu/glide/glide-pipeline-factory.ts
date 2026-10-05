@@ -61,18 +61,27 @@ function blendStateFromGlide(packed: number): GPUBlendState {
     };
 }
 
-function configKey(config: GlidePipelineConfig): string {
-    return [
-        config.topology,
-        config.useTexture ? 1 : 0,
-        config.blendEnabled ? 1 : 0,
-        config.blendEnabled ? (config.blend >>> 0) : 0,
-        config.depthTestEnabled ? 1 : 0,
-        config.depthWriteEnabled ? 1 : 0,
-        config.depthFunction | 0,
-        config.cullMode,
-        config.colorWriteMask & 0xf,
-    ].join("|");
+const TOPOLOGY_KEY_BITS: Record<string, number> = { "point-list": 0, "line-list": 1, "triangle-list": 2 };
+
+/**
+ * The pipeline identity as ONE number, exactly (not a hash).
+ *
+ * 15 bits of state plus the 32-bit packed blend is 47 bits, well inside a double's
+ * 53-bit integer range, so distinct configs stay distinct. This runs per draw —
+ * building an array and joining it into a string was two allocations a triangle.
+ */
+function configKey(config: GlidePipelineConfig): number {
+    const bits =
+        (TOPOLOGY_KEY_BITS[config.topology] ?? 2) |
+        ((config.useTexture ? 1 : 0) << 2) |
+        ((config.blendEnabled ? 1 : 0) << 3) |
+        ((config.depthTestEnabled ? 1 : 0) << 4) |
+        ((config.depthWriteEnabled ? 1 : 0) << 5) |
+        ((config.depthFunction & 0x7) << 6) |
+        ((config.cullMode & 0x3) << 9) |
+        ((config.colorWriteMask & 0xf) << 11);
+    const blend = config.blendEnabled ? (config.blend >>> 0) : 0;
+    return blend * 0x8000 + bits;
 }
 
 export class GlidePipelineFactory {
@@ -81,6 +90,9 @@ export class GlidePipelineFactory {
     constructor(
         private readonly device: GPUDevice,
         private readonly colorFormat: GPUTextureFormat,
+        // Explicit layout so group 0 binding 0 can carry a DYNAMIC offset: every draw
+        // needs its own uniform slice, and "auto" layouts cannot express that.
+        private readonly pipelineLayout: GPUPipelineLayout,
     ) {}
 
     getOrCreate(config: GlidePipelineConfig): GPURenderPipeline {
@@ -97,7 +109,7 @@ export class GlidePipelineFactory {
         });
 
         const pipeline = this.device.createRenderPipeline({
-            layout: "auto",
+            layout: this.pipelineLayout,
             vertex: {
                 module: shader,
                 entryPoint: "vs_main",

@@ -1,0 +1,205 @@
+/* On-screen controls — chrome only; geometry is written imperatively. */
+.touch-controls {
+  position: absolute;
+  /* The root IS the addressable panel: widget geometry resolves against this box,
+     so the notch never eats a thumb cluster in landscape. */
+  top: env(safe-area-inset-top, 0px);
+  right: env(safe-area-inset-right, 0px);
+  bottom: env(safe-area-inset-bottom, 0px);
+  left: env(safe-area-inset-left, 0px);
+  z-index: 3;
+  pointer-events: none;
+  contain: layout paint;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.widget {
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* Positioned by transform so a resize never reflows the panel. */
+  will-change: transform;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: var(--tc-opacity, 0.8);
+  transition: opacity var(--t-fast, 0.15s) ease, background var(--t-fast, 0.15s) ease;
+}
+
+/* Declared gameplay area and the look surface: addressable, never drawn. */
+.widget--touchArea,
+.widget--trackpad {
+  background: none;
+  border: none;
+}
+
+.widget--touchArea {
+  pointer-events: none;
+}
+
+/* --- button --- */
+.widget--button {
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid rgba(220, 235, 240, 0.28);
+  background: rgba(10, 19, 24, 0.42);
+  backdrop-filter: blur(3px);
+  color: var(--fg-1, #e9f4f4);
+}
+
+.widget--button.is-pressed,
+.widget--button.is-on {
+  background: rgba(70, 200, 216, 0.3);
+  border-color: var(--cyan, #46c8d8);
+  color: #fff;
+}
+
+.widget--button.is-on {
+  box-shadow: 0 0 0 1px rgba(70, 200, 216, 0.5) inset;
+}
+
+.widget__label {
+  font-family: var(--font-mono, monospace);
+  font-size: clamp(10px, 2.2vmin, 15px);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* --- dpad --- */
+.widget--dpad {
+  position: absolute;
+}
+
+.dpad__arm {
+  position: absolute;
+  background: rgba(10, 19, 24, 0.45);
+  border: 1px solid rgba(220, 235, 240, 0.24);
+  border-radius: var(--r-md, 10px);
+  backdrop-filter: blur(3px);
+}
+
+.dpad__arm--v {
+  left: 34%;
+  right: 34%;
+  top: 0;
+  bottom: 0;
+}
+
+.dpad__arm--h {
+  top: 34%;
+  bottom: 34%;
+  left: 0;
+  right: 0;
+}
+
+.dpad__hub {
+  position: absolute;
+  left: 36%;
+  right: 36%;
+  top: 36%;
+  bottom: 36%;
+  border-radius: 50%;
+  background: rgba(220, 235, 240, 0.12);
+}
+
+/* Direction feedback: a tinted wedge on the live side of each arm. */
+.widget--dpad::before,
+.widget--dpad::after {
+  content: "";
+  position: absolute;
+  border-radius: var(--r-md, 10px);
+  background: rgba(70, 200, 216, 0.32);
+  opacity: 0;
+  transition: opacity 0.08s linear;
+}
+
+.widget--dpad::before {
+  left: 35%;
+  right: 35%;
+  height: 33%;
+}
+
+.widget--dpad::after {
+  top: 35%;
+  bottom: 35%;
+  width: 33%;
+}
+
+.widget--dpad.is-up::before { opacity: 1; top: 0; }
+.widget--dpad.is-down::before { opacity: 1; bottom: 0; }
+.widget--dpad.is-left::after { opacity: 1; left: 0; }
+.widget--dpad.is-right::after { opacity: 1; right: 0; }
+
+/* --- stick --- */
+.widget--stick {
+  border-radius: 50%;
+  border: 1px solid rgba(220, 235, 240, 0.24);
+  background: radial-gradient(circle at 50% 50%, rgba(18, 32, 41, 0.5), rgba(7, 13, 17, 0.35));
+  backdrop-filter: blur(3px);
+}
+
+.widget--stick.is-active {
+  border-color: rgba(70, 200, 216, 0.6);
+}
+
+.stick__knob {
+  width: 42%;
+  height: 42%;
+  border-radius: 50%;
+  background: rgba(220, 235, 240, 0.32);
+  border: 1px solid rgba(220, 235, 240, 0.4);
+  will-change: transform;
+  pointer-events: none;
+}
+
+.widget--stick.is-active .stick__knob {
+  background: rgba(70, 200, 216, 0.45);
+}
+
+/* --- wheel strip --- */
+.widget--wheelStrip {
+  border-radius: var(--r-pill, 999px);
+  border: 1px solid rgba(220, 235, 240, 0.22);
+  background: rgba(10, 19, 24, 0.4);
+  backdrop-filter: blur(3px);
+}
+
+.wheel__ridges {
+  width: 46%;
+  height: 78%;
+  border-radius: var(--r-pill, 999px);
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    180deg,
+    rgba(220, 235, 240, 0.22) 0 2px,
+    transparent 2px 9px
+  );
+}
+
+/* A coarse pointer is the only one these are for; a mouse user gets the desktop
+   path and should not have thumb chrome over the game. */
+@media (pointer: fine) and (hover: hover) {
+  .touch-controls {
+    opacity: 0.55;
+  }
+}
+
+/* No letterbox bar was available, so this widget covers gameplay — make it cost
+   the player as little of the picture as possible. */
+.widget--over {
+  opacity: 0.45;
+}
+
+/* Nothing touched for a while: recede, but stay legible enough to aim at. */
+.layer--idle .widget {
+  opacity: 0.28;
+}
+
+.layer--idle .widget--over {
+  opacity: 0.16;
+}

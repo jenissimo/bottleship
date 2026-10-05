@@ -21,6 +21,7 @@ import {
     writeCommonUniforms,
 } from "./post-effect";
 import { getActiveEffects } from "./registry";
+import { computePresentDestRect, PresentRect } from "../shared/present-geometry";
 
 export interface PresentOptions {
     /** Clear the target before drawing (letterbox bars take this color). */
@@ -36,8 +37,6 @@ export interface PresentOptions {
     outputWidth?: number;
     outputHeight?: number;
 }
-
-interface Rect { x: number; y: number; w: number; h: number; }
 
 interface PipelineEntry { pipeline: GPURenderPipeline | null; valid: boolean; }
 
@@ -245,24 +244,6 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         return it;
     }
 
-    // ---- present geometry -----------------------------------------------------
-
-    private computeDestRect(srcW: number, srcH: number, outW: number, outH: number, q: QualityConfig): Rect | null {
-        if (srcW <= 0 || srcH <= 0 || outW <= 0 || outH <= 0) return null;
-        if (q.aspectMode === "stretch" && !q.integerScale) return null;
-
-        if (q.integerScale || q.aspectMode === "integer") {
-            const scale = Math.max(1, Math.floor(Math.min(outW / srcW, outH / srcH)));
-            const w = srcW * scale, h = srcH * scale;
-            return { x: Math.floor((outW - w) / 2), y: Math.floor((outH - h) / 2), w, h };
-        }
-        // pillarbox: preserve source AR, fit inside output.
-        const ar = srcW / srcH;
-        let w = outW, h = Math.round(outW / ar);
-        if (h > outH) { h = outH; w = Math.round(outH * ar); }
-        return { x: Math.floor((outW - w) / 2), y: Math.floor((outH - h) / 2), w, h };
-    }
-
     // ---- the present ----------------------------------------------------------
 
     /**
@@ -289,7 +270,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
         const outW = opts.outputWidth ?? opts.viewport?.width ?? 0;
         const outH = opts.outputHeight ?? opts.viewport?.height ?? 0;
         const outAspect = outH > 0 ? outW / outH : 1;
-        const destRect = this.computeDestRect(srcW, srcH, outW, outH, q);
+        const destRect = computePresentDestRect(srcW, srcH, outW, outH, q);
 
         const effects = getActiveEffects(q, this.hasGamma());
         const finalGeom = {
@@ -396,7 +377,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
     private runEffectPass(
         encoder: GPUCommandEncoder, effect: PostEffect, slot: number,
         inputView: GPUTextureView, target: GPUTextureView, targetFormat: GPUTextureFormat, nearest: boolean,
-        geom: { clearColor?: GPUColor; destRect?: Rect | null; viewport?: { width: number; height: number } },
+        geom: { clearColor?: GPUColor; destRect?: PresentRect | null; viewport?: { width: number; height: number } },
     ): void {
         const pe = this.getEffectPipeline(effect, targetFormat);
         const useEffect = pe.valid && !!pe.pipeline;
@@ -408,7 +389,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4f {
 
     private drawPass(
         encoder: GPUCommandEncoder, pipeline: GPURenderPipeline, bindGroup: GPUBindGroup, target: GPUTextureView,
-        geom: { clearColor?: GPUColor; destRect?: Rect | null; viewport?: { width: number; height: number } },
+        geom: { clearColor?: GPUColor; destRect?: PresentRect | null; viewport?: { width: number; height: number } },
     ): void {
         const pass = encoder.beginRenderPass({
             colorAttachments: [{

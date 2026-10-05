@@ -245,6 +245,32 @@ export function createSafeArrayExports(): {
         return S_OK;
     };
 
+    // UINT SafeArrayGetElemsize(SAFEARRAY*) — cbElements, the field every element walk needs.
+    exports["SafeArrayGetElemsize"] = (_ctx, mem, args) => {
+        const psa = args[0] >>> 0;
+        if (!psa || psa + 16 > mem.length) return 0;
+        return new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getUint32(psa + 4, true);
+    };
+
+    // HRESULT SafeArrayLock/Unlock — the same cLocks counter Access/UnaccessData maintains,
+    // without handing back the data pointer.
+    exports["SafeArrayLock"] = (_ctx, mem, args) => {
+        const psa = args[0] >>> 0;
+        if (!psa || psa + 16 > mem.length) return E_INVALIDARG;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        view.setUint32(psa + 8, view.getUint32(psa + 8, true) + 1, true);
+        return S_OK;
+    };
+    exports["SafeArrayUnlock"] = (_ctx, mem, args) => {
+        const psa = args[0] >>> 0;
+        if (!psa || psa + 16 > mem.length) return E_INVALIDARG;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const locks = view.getUint32(psa + 8, true);
+        if (!locks) return 0x8000ffff; // E_UNEXPECTED
+        view.setUint32(psa + 8, locks - 1, true);
+        return S_OK;
+    };
+
     const ptrOfIndexThunk: ThunkImplementation = (_ctx, mem, args) => {
         return ptrOfIndex(mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0);
     };
@@ -296,6 +322,26 @@ export function createSafeArrayExports(): {
         mem.set(mem.subarray(pv, pv + cbElements), elemPtr);
         return S_OK;
     };
+
+    // Ordinal aliases — most callers import SafeArray* by ordinal, and a name-only
+    // table binds none of them. Numbers are the oleaut32 export table's, not derived.
+    const ORDINALS: Record<number, string> = {
+        15: "SafeArrayCreate",
+        16: "SafeArrayDestroy",
+        17: "SafeArrayGetDim",
+        18: "SafeArrayGetElemsize",
+        19: "SafeArrayGetUBound",
+        20: "SafeArrayGetLBound",
+        21: "SafeArrayLock",
+        22: "SafeArrayUnlock",
+        23: "SafeArrayAccessData",
+        24: "SafeArrayUnaccessData",
+        25: "SafeArrayGetElement",
+        26: "SafeArrayPutElement",
+    };
+    for (const [ordinal, name] of Object.entries(ORDINALS)) {
+        if (exports[name]) exports[`ord_${ordinal}`] = exports[name];
+    }
 
     return {
         exports,

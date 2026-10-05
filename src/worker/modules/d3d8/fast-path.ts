@@ -21,20 +21,65 @@
  */
 
 import { Logger, LogCategory } from '../../core/logger';
+import type { HleDispatcher } from '../../core/thunking/thunk-dispatcher';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
-import { devices } from './shared-state';
+import { devices, resourceToDevice } from './shared-state';
+import { validateLockRange } from './resources';
+import { readD3DLight8 } from './state';
 import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
+import {
+    peekDxDepthStencilMatch,
+    peekDxDeviceFormat,
+    peekDxDeviceMultiSampleType,
+} from '../../backends/webgpu/shared/dx-format-support';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
+const D3DLIGHT8_SIZE = 104;
 
-export function registerFastPathD3D8Functions(dispatcher: any): void {
+export function registerFastPathD3D8Functions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
+
+    // Debug no-op of the D3D8 debug runtime; retail does nothing with it. A constant-return
+    // stub answers it in guest code with no trap at all. cdecl => the caller cleans the stack.
+    if (typeof dispatcher.registerConstantReturnStub === 'function') {
+        dispatcher.registerConstantReturnStub('d3d8', 'DebugSetMute', 0, 0);
+    }
+
+    // ── Capability queries (memo hits only) ──────────────────────────────────
+    // Pure in their args and the runtime capability contracts; Max Payne re-asks them ~5K
+    // times at boot. A MISS returns null so the first call for each key still takes the full
+    // thunk (which logs it). Kill-switch (A/B, boot-time): globalThis.__noCapsMemo.
+    if (!(globalThis as any).__noCapsMemo) {
+        // CheckDeviceFormat(this, Adapter, DeviceType, AdapterFormat, Usage, RType, CheckFormat)
+        dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDeviceFormat',
+            (esp: number, view: DataView): number | null => {
+                return peekDxDeviceFormat(8,
+                    view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                    view.getUint32(esp + 20, true), view.getUint32(esp + 24, true), view.getUint32(esp + 28, true));
+            }, { trivial: true });
+
+        // CheckDeviceMultiSampleType(this, Adapter, DeviceType, SurfaceFormat, Windowed,
+        //                            MultiSampleType) — D3D8 has no pQualityLevels out-param.
+        dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDeviceMultiSampleType',
+            (esp: number, view: DataView): number | null => {
+                return peekDxDeviceMultiSampleType(8,
+                    view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                    view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
+            }, { trivial: true });
+
+        // CheckDepthStencilMatch(this, Adapter, DeviceType, AdapterFormat, RTFormat, DSFormat)
+        dispatcher.registerFastPath('d3d8', 'IDirect3D8_CheckDepthStencilMatch',
+            (esp: number, view: DataView): number | null => {
+                return peekDxDepthStencilMatch(8,
+                    view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
+                    view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
+            }, { trivial: true });
+    }
 
     // IDirect3DDevice8_SetRenderState(this, State, Value)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetRenderState',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const state = view.getUint32(esp + 8, true), value = view.getUint32(esp + 12, true);
@@ -45,8 +90,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetTextureStageState(this, Stage, Type, Value)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetTextureStageState',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const stage = view.getUint32(esp + 8, true), type = view.getUint32(esp + 12, true), value = view.getUint32(esp + 16, true);
@@ -57,8 +101,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetTexture(this, Stage, pTexture) — resolve COM ptr → surface at call time.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetTexture',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const stage = view.getUint32(esp + 8, true), texPtr = view.getUint32(esp + 12, true);
@@ -70,8 +113,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_LightEnable(this, Index, Enable)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_LightEnable',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const index = view.getUint32(esp + 8, true), enable = view.getUint32(esp + 12, true) !== 0;
@@ -83,8 +125,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
     // IDirect3DDevice8_SetTransform(this, State, pMatrix[16 floats]) — capture-at-call
     // (pMatrix is guest scratch; copy the 16 floats out now).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetTransform',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const state = view.getUint32(esp + 8, true), pMatrix = view.getUint32(esp + 12, true) >>> 0;
@@ -98,8 +139,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetStreamSource(this, StreamNumber, pStreamData, Stride) — D3D8 has NO OffsetInBytes.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetStreamSource',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const streamNumber = view.getUint32(esp + 8, true) >>> 0;
@@ -117,8 +157,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetIndices(this, pIndexData, BaseVertexIndex) — D3D8 folds BaseVertexIndex here.
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetIndices',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const ibPtr = view.getUint32(esp + 8, true) >>> 0;
@@ -132,8 +171,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetVertexShader(this, Handle) — D3D8 quirk: FVF token (bit0 clear) or shader handle (bit0 set).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetVertexShader',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const token = view.getUint32(esp + 8, true) >>> 0;
@@ -148,8 +186,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_SetViewport(this, pViewport) — capture-at-call (sanitize vs active RT).
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetViewport',
-        (cpu: any, mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             const pVP = view.getUint32(esp + 8, true) >>> 0;
@@ -171,8 +208,7 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
     // ── Draws on the FastPath (kill the slow-path prologue; ring/barrier comes in Phase 2) ──
     // IDirect3DDevice8_DrawPrimitive(this, PrimitiveType, StartVertex, PrimitiveCount)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_DrawPrimitive',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             return device.drawPrimitive(view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true));
@@ -180,14 +216,86 @@ export function registerFastPathD3D8Functions(dispatcher: any): void {
 
     // IDirect3DDevice8_DrawIndexedPrimitive(this, PrimType, MinIndex, NumVertices, StartIndex, PrimCount)
     dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_DrawIndexedPrimitive',
-        (cpu: any, _mem: Uint8Array, _m32: Uint32Array, view: DataView): number | null => {
-            const esp = cpu.reg32[4];
+        (esp: number, view: DataView): number | null => {
             const device = devices.get(view.getUint32(esp + 4, true));
             if (!device) return D3DERR_INVALIDCALL;
             return device.drawIndexedPrimitive(
                 view.getUint32(esp + 8, true), view.getUint32(esp + 12, true), view.getUint32(esp + 16, true),
                 view.getUint32(esp + 20, true), view.getUint32(esp + 24, true));
         });
+
+    // ── per-DRAW buffer traffic ────────────────────────────────────────────────
+    // Lock/Unlock of a VB/IB is a per-draw call on every FVF title; both Unlocks are
+    // literally `return D3D_OK` thunks that were still paying the whole OUT-trap prologue.
+    // These are FastPath-only (no WBUF): Lock has an out-param the guest reads immediately.
+
+    // IDirect3DVertexBuffer8_Lock(this, Offset, Size, ppData, Flags)
+    dispatcher.registerFastPath('d3d8', 'IDirect3DVertexBuffer8_Lock',
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
+            const pVB = view.getUint32(esp + 4, true);
+            const offset = view.getUint32(esp + 8, true);
+            const size = view.getUint32(esp + 12, true);
+            const ppData = view.getUint32(esp + 16, true) >>> 0;
+            const device = resourceToDevice.get(pVB);
+            if (!device) return D3DERR_INVALIDCALL;
+            if (!ppData) return D3DERR_INVALIDCALL;
+            const vb = device.vbData.get(pVB);
+            if (!vb) return D3DERR_INVALIDCALL;
+            // Out of range, or an out-param we would have to validate against the region
+            // map, falls through to the slow thunk — it owns Mem.writeUint32 and the
+            // diagnostic. A raw view write past the end of guest memory would throw.
+            const vbLock = validateLockRange(vb.size, offset, size);
+            if (vbLock === null) return null;
+            if (ppData + 4 > mem.length) return null;
+            view.setUint32(ppData, (vb.guestPtr + offset) >>> 0, true);
+            // The upload path keys on this mark, so a fast path that skipped it would leave
+            // the buffer's new vertices on the CPU side and draw the previous frame's.
+            device.markBufferDirty("vb", pVB, offset, vbLock, vb.size);
+            return D3D_OK;
+        }, { trivial: true });
+
+    // IDirect3DIndexBuffer8_Lock(this, Offset, Size, ppData, Flags)
+    dispatcher.registerFastPath('d3d8', 'IDirect3DIndexBuffer8_Lock',
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
+            const pIB = view.getUint32(esp + 4, true);
+            const offset = view.getUint32(esp + 8, true);
+            const size = view.getUint32(esp + 12, true);
+            const ppData = view.getUint32(esp + 16, true) >>> 0;
+            const device = resourceToDevice.get(pIB);
+            if (!device) return D3DERR_INVALIDCALL;
+            if (!ppData) return D3DERR_INVALIDCALL;
+            const ib = device.ibData.get(pIB);
+            if (!ib) return D3DERR_INVALIDCALL;
+            const ibLock = validateLockRange(ib.size, offset, size);
+            if (ibLock === null) return null;
+            if (ppData + 4 > mem.length) return null;
+            view.setUint32(ppData, (ib.guestPtr + offset) >>> 0, true);
+            device.markBufferDirty("ib", pIB, offset, ibLock, ib.size);
+            return D3D_OK;
+        }, { trivial: true });
+
+    // Both Unlocks are no-ops in this implementation (the guest wrote straight into the
+    // buffer's own guest memory), so the fast path IS the whole contract.
+    dispatcher.registerFastPath('d3d8', 'IDirect3DVertexBuffer8_Unlock',
+        (): number | null => D3D_OK, { trivial: true });
+    dispatcher.registerFastPath('d3d8', 'IDirect3DIndexBuffer8_Unlock',
+        (): number | null => D3D_OK, { trivial: true });
+
+    // IDirect3DDevice8_SetLight(this, Index, pLight) — reads the guest D3DLIGHT8 through
+    // the same reader the thunk uses (state.ts readD3DLight8), so the two cannot drift.
+    dispatcher.registerFastPath('d3d8', 'IDirect3DDevice8_SetLight',
+        (esp: number, view: DataView, mem: Uint8Array): number | null => {
+            const device = devices.get(view.getUint32(esp + 4, true));
+            if (!device) return D3DERR_INVALIDCALL;
+            const index = view.getUint32(esp + 8, true);
+            const pLight = view.getUint32(esp + 12, true) >>> 0;
+            if (!pLight) return D3DERR_INVALIDCALL;
+            if (pLight + D3DLIGHT8_SIZE > mem.length) return null; // bad ptr → slow thunk
+            const light = readD3DLight8(view, pLight);
+            if (device.recordingStateBlock) { device.recordStateBlock({ op: 'light', index, light }); return D3D_OK; }
+            device.setLight(index, light);
+            return D3D_OK;
+        }, { trivial: true });
 
     // =========================================================================
     // Phase 2 — Tier-0 write-buffer (WBUF) trampolines. The OUT-trap stub is patched

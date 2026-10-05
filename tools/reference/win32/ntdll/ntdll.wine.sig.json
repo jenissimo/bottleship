@@ -1,0 +1,4782 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.923Z",
+  "module": "ntdll",
+  "functions": [
+    {
+      "name": "__wine_ctrl_routine",
+      "argCount": 1
+    },
+    {
+      "name": "__wine_dbg_write",
+      "argCount": 2
+    },
+    {
+      "name": "__wine_unix_spawnvp",
+      "argCount": 2
+    },
+    {
+      "name": "A_SHAFinal",
+      "argCount": 2
+    },
+    {
+      "name": "A_SHAInit",
+      "argCount": 1
+    },
+    {
+      "name": "A_SHAUpdate",
+      "argCount": 3
+    },
+    {
+      "name": "AlpcGetHeaderSize",
+      "argCount": 1
+    },
+    {
+      "name": "AlpcGetMessageAttribute",
+      "argCount": 2
+    },
+    {
+      "name": "AlpcInitializeMessageAttribute",
+      "argCount": 4
+    },
+    {
+      "name": "ApiSetQueryApiSetPresence",
+      "argCount": 2
+    },
+    {
+      "name": "ApiSetQueryApiSetPresenceEx",
+      "argCount": 3
+    },
+    {
+      "name": "DbgBreakPoint",
+      "argCount": 0
+    },
+    {
+      "name": "DbgUiConnectToDbg",
+      "argCount": 0
+    },
+    {
+      "name": "DbgUiContinue",
+      "argCount": 2
+    },
+    {
+      "name": "DbgUiConvertStateChangeStructure",
+      "argCount": 2
+    },
+    {
+      "name": "DbgUiDebugActiveProcess",
+      "argCount": 1
+    },
+    {
+      "name": "DbgUiGetThreadDebugObject",
+      "argCount": 0
+    },
+    {
+      "name": "DbgUiIssueRemoteBreakin",
+      "argCount": 1
+    },
+    {
+      "name": "DbgUiRemoteBreakin",
+      "argCount": 1
+    },
+    {
+      "name": "DbgUiSetThreadDebugObject",
+      "argCount": 1
+    },
+    {
+      "name": "DbgUiStopDebugging",
+      "argCount": 1
+    },
+    {
+      "name": "DbgUiWaitStateChange",
+      "argCount": 2
+    },
+    {
+      "name": "DbgUserBreakPoint",
+      "argCount": 0
+    },
+    {
+      "name": "EtwEventActivityIdControl",
+      "argCount": 2
+    },
+    {
+      "name": "EtwEventEnabled",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventProviderEnabled",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventRegister",
+      "argCount": 4
+    },
+    {
+      "name": "EtwEventSetInformation",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventUnregister",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventWrite",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventWriteEx",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventWriteString",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwEventWriteTransfer",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwGetTraceEnableFlags",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwGetTraceEnableLevel",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwGetTraceLoggerHandle",
+      "argCount": 1
+    },
+    {
+      "name": "EtwLogTraceEvent",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwRegisterTraceGuidsA",
+      "argCount": 8
+    },
+    {
+      "name": "EtwRegisterTraceGuidsW",
+      "argCount": 8
+    },
+    {
+      "name": "EtwTraceMessageVa",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EtwUnregisterTraceGuids",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "KiRaiseUserExceptionDispatcher",
+      "argCount": 0
+    },
+    {
+      "name": "KiUserApcDispatcher",
+      "argCount": 5
+    },
+    {
+      "name": "KiUserCallbackDispatcher",
+      "argCount": 3
+    },
+    {
+      "name": "KiUserExceptionDispatcher",
+      "argCount": 2
+    },
+    {
+      "name": "LdrAccessResource",
+      "argCount": 4
+    },
+    {
+      "name": "LdrAddDllDirectory",
+      "argCount": 2
+    },
+    {
+      "name": "LdrAddRefDll",
+      "argCount": 2
+    },
+    {
+      "name": "LdrDisableThreadCalloutsForDll",
+      "argCount": 1
+    },
+    {
+      "name": "LdrEnumerateLoadedModules",
+      "argCount": 3
+    },
+    {
+      "name": "LdrFindEntryForAddress",
+      "argCount": 2
+    },
+    {
+      "name": "LdrFindResource_U",
+      "argCount": 4
+    },
+    {
+      "name": "LdrFindResourceDirectory_U",
+      "argCount": 4
+    },
+    {
+      "name": "LdrGetDllDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "LdrGetDllFullName",
+      "argCount": 2
+    },
+    {
+      "name": "LdrGetDllHandle",
+      "argCount": 4
+    },
+    {
+      "name": "LdrGetDllHandleEx",
+      "argCount": 5
+    },
+    {
+      "name": "LdrGetDllPath",
+      "argCount": 4
+    },
+    {
+      "name": "LdrGetProcedureAddress",
+      "argCount": 4
+    },
+    {
+      "name": "LdrInitializeThunk",
+      "argCount": 4
+    },
+    {
+      "name": "LdrLoadDll",
+      "argCount": 4
+    },
+    {
+      "name": "LdrLockLoaderLock",
+      "argCount": 3
+    },
+    {
+      "name": "LdrProcessRelocationBlock",
+      "argCount": 4
+    },
+    {
+      "name": "LdrQueryImageFileExecutionOptions",
+      "argCount": 6
+    },
+    {
+      "name": "LdrQueryProcessModuleInformation",
+      "argCount": 3
+    },
+    {
+      "name": "LdrRegisterDllNotification",
+      "argCount": 4
+    },
+    {
+      "name": "LdrRemoveDllDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "LdrResolveDelayLoadedAPI",
+      "argCount": 6
+    },
+    {
+      "name": "LdrSetDefaultDllDirectories",
+      "argCount": 1
+    },
+    {
+      "name": "LdrSetDllDirectory",
+      "argCount": 1
+    },
+    {
+      "name": "LdrShutdownProcess",
+      "argCount": 0
+    },
+    {
+      "name": "LdrShutdownThread",
+      "argCount": 0
+    },
+    {
+      "name": "LdrUnloadDll",
+      "argCount": 1
+    },
+    {
+      "name": "LdrUnlockLoaderLock",
+      "argCount": 2
+    },
+    {
+      "name": "LdrUnregisterDllNotification",
+      "argCount": 1
+    },
+    {
+      "name": "MD4Final",
+      "argCount": 1
+    },
+    {
+      "name": "MD4Init",
+      "argCount": 1
+    },
+    {
+      "name": "MD4Update",
+      "argCount": 3
+    },
+    {
+      "name": "MD5Final",
+      "argCount": 1
+    },
+    {
+      "name": "MD5Init",
+      "argCount": 1
+    },
+    {
+      "name": "MD5Update",
+      "argCount": 3
+    },
+    {
+      "name": "NtAcceptConnectPort",
+      "argCount": 6
+    },
+    {
+      "name": "NtAccessCheck",
+      "argCount": 8
+    },
+    {
+      "name": "NtAccessCheckAndAuditAlarm",
+      "argCount": 11
+    },
+    {
+      "name": "NtAccessCheckByTypeAndAuditAlarm",
+      "argCount": 16
+    },
+    {
+      "name": "NtAddAtom",
+      "argCount": 3
+    },
+    {
+      "name": "NtAdjustGroupsToken",
+      "argCount": 6
+    },
+    {
+      "name": "NtAdjustPrivilegesToken",
+      "argCount": 6
+    },
+    {
+      "name": "NtAlertMultipleThreadByThreadId",
+      "argCount": 4
+    },
+    {
+      "name": "NtAlertResumeThread",
+      "argCount": 2
+    },
+    {
+      "name": "NtAlertThread",
+      "argCount": 1
+    },
+    {
+      "name": "NtAlertThreadByThreadId",
+      "argCount": 1
+    },
+    {
+      "name": "NtAllocateLocallyUniqueId",
+      "argCount": 1
+    },
+    {
+      "name": "NtAllocateReserveObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtAllocateUuids",
+      "argCount": 4
+    },
+    {
+      "name": "NtAllocateVirtualMemory",
+      "argCount": 6
+    },
+    {
+      "name": "NtAllocateVirtualMemoryEx",
+      "argCount": 7
+    },
+    {
+      "name": "NtAlpcAcceptConnectPort",
+      "argCount": 9
+    },
+    {
+      "name": "NtAlpcConnectPort",
+      "argCount": 11
+    },
+    {
+      "name": "NtAlpcCreatePort",
+      "argCount": 3
+    },
+    {
+      "name": "NtAlpcDisconnectPort",
+      "argCount": 2
+    },
+    {
+      "name": "NtAlpcImpersonateClientOfPort",
+      "argCount": 3
+    },
+    {
+      "name": "NtAlpcSendWaitReceivePort",
+      "argCount": 8
+    },
+    {
+      "name": "NtAreMappedFilesTheSame",
+      "argCount": 2
+    },
+    {
+      "name": "NtAssignProcessToJobObject",
+      "argCount": 2
+    },
+    {
+      "name": "NtCallbackReturn",
+      "argCount": 3
+    },
+    {
+      "name": "NtCancelIoFile",
+      "argCount": 2
+    },
+    {
+      "name": "NtCancelIoFileEx",
+      "argCount": 3
+    },
+    {
+      "name": "NtCancelSynchronousIoFile",
+      "argCount": 3
+    },
+    {
+      "name": "NtCancelTimer",
+      "argCount": 2
+    },
+    {
+      "name": "NtClearEvent",
+      "argCount": 1
+    },
+    {
+      "name": "NtClose",
+      "argCount": 1
+    },
+    {
+      "name": "NtCloseObjectAuditAlarm",
+      "argCount": 3
+    },
+    {
+      "name": "NtCommitTransaction",
+      "argCount": 2
+    },
+    {
+      "name": "NtCompareObjects",
+      "argCount": 2
+    },
+    {
+      "name": "NtCompareTokens",
+      "argCount": 3
+    },
+    {
+      "name": "NtCompleteConnectPort",
+      "argCount": 1
+    },
+    {
+      "name": "NtConnectPort",
+      "argCount": 8
+    },
+    {
+      "name": "NtContinue",
+      "argCount": 2
+    },
+    {
+      "name": "NtContinueEx",
+      "argCount": 2
+    },
+    {
+      "name": "NtConvertBetweenAuxiliaryCounterAndPerformanceCounter",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateDebugObject",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateDirectoryObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtCreateEvent",
+      "argCount": 5
+    },
+    {
+      "name": "NtCreateFile",
+      "argCount": 11
+    },
+    {
+      "name": "NtCreateIoCompletion",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateJobObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtCreateKey",
+      "argCount": 7
+    },
+    {
+      "name": "NtCreateKeyedEvent",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateKeyTransacted",
+      "argCount": 8
+    },
+    {
+      "name": "NtCreateLowBoxToken",
+      "argCount": 9
+    },
+    {
+      "name": "NtCreateMailslotFile",
+      "argCount": 8
+    },
+    {
+      "name": "NtCreateMutant",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateNamedPipeFile",
+      "argCount": 14
+    },
+    {
+      "name": "NtCreatePagingFile",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreatePort",
+      "argCount": 5
+    },
+    {
+      "name": "NtCreateSection",
+      "argCount": 7
+    },
+    {
+      "name": "NtCreateSectionEx",
+      "argCount": 9
+    },
+    {
+      "name": "NtCreateSemaphore",
+      "argCount": 5
+    },
+    {
+      "name": "NtCreateSymbolicLinkObject",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateThread",
+      "argCount": 8
+    },
+    {
+      "name": "NtCreateThreadEx",
+      "argCount": 11
+    },
+    {
+      "name": "NtCreateTimer",
+      "argCount": 4
+    },
+    {
+      "name": "NtCreateToken",
+      "argCount": 13
+    },
+    {
+      "name": "NtCreateTransaction",
+      "argCount": 10
+    },
+    {
+      "name": "NtCreateUserProcess",
+      "argCount": 11
+    },
+    {
+      "name": "NtCurrentTeb",
+      "argCount": 0
+    },
+    {
+      "name": "NtDebugActiveProcess",
+      "argCount": 2
+    },
+    {
+      "name": "NtDebugContinue",
+      "argCount": 3
+    },
+    {
+      "name": "NtDelayExecution",
+      "argCount": 2
+    },
+    {
+      "name": "NtDeleteAtom",
+      "argCount": 1
+    },
+    {
+      "name": "NtDeleteFile",
+      "argCount": 1
+    },
+    {
+      "name": "NtDeleteKey",
+      "argCount": 1
+    },
+    {
+      "name": "NtDeleteValueKey",
+      "argCount": 2
+    },
+    {
+      "name": "NtDeviceIoControlFile",
+      "argCount": 10
+    },
+    {
+      "name": "NtDisplayString",
+      "argCount": 1
+    },
+    {
+      "name": "NtdllDefWindowProc_A",
+      "argCount": 4
+    },
+    {
+      "name": "NtdllDefWindowProc_W",
+      "argCount": 4
+    },
+    {
+      "name": "NtdllDialogWndProc_A",
+      "argCount": 4
+    },
+    {
+      "name": "NtdllDialogWndProc_W",
+      "argCount": 4
+    },
+    {
+      "name": "NtDuplicateObject",
+      "argCount": 7
+    },
+    {
+      "name": "NtDuplicateToken",
+      "argCount": 6
+    },
+    {
+      "name": "NtEnumerateKey",
+      "argCount": 6
+    },
+    {
+      "name": "NtEnumerateValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "NtFilterToken",
+      "argCount": 6
+    },
+    {
+      "name": "NtFindAtom",
+      "argCount": 3
+    },
+    {
+      "name": "NtFlushBuffersFile",
+      "argCount": 2
+    },
+    {
+      "name": "NtFlushBuffersFileEx",
+      "argCount": 5
+    },
+    {
+      "name": "NtFlushInstructionCache",
+      "argCount": 3
+    },
+    {
+      "name": "NtFlushKey",
+      "argCount": 1
+    },
+    {
+      "name": "NtFlushProcessWriteBuffers",
+      "argCount": 0
+    },
+    {
+      "name": "NtFlushVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "NtFreeVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "NtFsControlFile",
+      "argCount": 10
+    },
+    {
+      "name": "NtGetContextThread",
+      "argCount": 2
+    },
+    {
+      "name": "NtGetCurrentProcessorNumber",
+      "argCount": 0
+    },
+    {
+      "name": "NtGetNextProcess",
+      "argCount": 5
+    },
+    {
+      "name": "NtGetNextThread",
+      "argCount": 6
+    },
+    {
+      "name": "NtGetNlsSectionPtr",
+      "argCount": 5
+    },
+    {
+      "name": "NtGetTickCount",
+      "argCount": 0
+    },
+    {
+      "name": "NtGetWriteWatch",
+      "argCount": 7
+    },
+    {
+      "name": "NtImpersonateAnonymousToken",
+      "argCount": 1
+    },
+    {
+      "name": "NtImpersonateClientOfPort",
+      "argCount": 2
+    },
+    {
+      "name": "NtInitializeNlsFiles",
+      "argCount": 3
+    },
+    {
+      "name": "NtInitiatePowerAction",
+      "argCount": 4
+    },
+    {
+      "name": "NtIsProcessInJob",
+      "argCount": 2
+    },
+    {
+      "name": "NtListenPort",
+      "argCount": 2
+    },
+    {
+      "name": "NtLoadDriver",
+      "argCount": 1
+    },
+    {
+      "name": "NtLoadKey",
+      "argCount": 2
+    },
+    {
+      "name": "NtLoadKey2",
+      "argCount": 3
+    },
+    {
+      "name": "NtLoadKeyEx",
+      "argCount": 8
+    },
+    {
+      "name": "NtLockFile",
+      "argCount": 10
+    },
+    {
+      "name": "NtLockVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "NtMakePermanentObject",
+      "argCount": 1
+    },
+    {
+      "name": "NtMakeTemporaryObject",
+      "argCount": 1
+    },
+    {
+      "name": "NtMapViewOfSection",
+      "argCount": 10
+    },
+    {
+      "name": "NtMapViewOfSectionEx",
+      "argCount": 9
+    },
+    {
+      "name": "NtNotifyChangeDirectoryFile",
+      "argCount": 9
+    },
+    {
+      "name": "NtNotifyChangeKey",
+      "argCount": 10
+    },
+    {
+      "name": "NtNotifyChangeMultipleKeys",
+      "argCount": 12
+    },
+    {
+      "name": "NtOpenDirectoryObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenEvent",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenFile",
+      "argCount": 6
+    },
+    {
+      "name": "NtOpenIoCompletion",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenJobObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenKey",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenKeyedEvent",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenKeyEx",
+      "argCount": 4
+    },
+    {
+      "name": "NtOpenKeyTransacted",
+      "argCount": 4
+    },
+    {
+      "name": "NtOpenKeyTransactedEx",
+      "argCount": 5
+    },
+    {
+      "name": "NtOpenMutant",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenProcess",
+      "argCount": 4
+    },
+    {
+      "name": "NtOpenProcessToken",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenProcessTokenEx",
+      "argCount": 4
+    },
+    {
+      "name": "NtOpenSection",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenSemaphore",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenSymbolicLinkObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtOpenThread",
+      "argCount": 4
+    },
+    {
+      "name": "NtOpenThreadToken",
+      "argCount": 4
+    },
+    {
+      "name": "NtOpenThreadTokenEx",
+      "argCount": 5
+    },
+    {
+      "name": "NtOpenTimer",
+      "argCount": 3
+    },
+    {
+      "name": "NtPowerInformation",
+      "argCount": 5
+    },
+    {
+      "name": "NtPrivilegeCheck",
+      "argCount": 3
+    },
+    {
+      "name": "NtProtectVirtualMemory",
+      "argCount": 5
+    },
+    {
+      "name": "NtPulseEvent",
+      "argCount": 2
+    },
+    {
+      "name": "NtQueryAttributesFile",
+      "argCount": 2
+    },
+    {
+      "name": "NtQueryDefaultLocale",
+      "argCount": 2
+    },
+    {
+      "name": "NtQueryDefaultUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "NtQueryDirectoryFile",
+      "argCount": 11
+    },
+    {
+      "name": "NtQueryDirectoryObject",
+      "argCount": 7
+    },
+    {
+      "name": "NtQueryEaFile",
+      "argCount": 9
+    },
+    {
+      "name": "NtQueryEvent",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryFullAttributesFile",
+      "argCount": 2
+    },
+    {
+      "name": "NtQueryInformationAtom",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryInformationJobObject",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryInformationProcess",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryInformationThread",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryInformationToken",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryInstallUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "NtQueryIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryKey",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryLicenseValue",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryMultipleValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "NtQueryMutant",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryObject",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryPerformanceCounter",
+      "argCount": 2
+    },
+    {
+      "name": "NtQuerySection",
+      "argCount": 5
+    },
+    {
+      "name": "NtQuerySecurityObject",
+      "argCount": 5
+    },
+    {
+      "name": "NtQuerySemaphore",
+      "argCount": 5
+    },
+    {
+      "name": "NtQuerySymbolicLinkObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtQuerySystemEnvironmentValue",
+      "argCount": 4
+    },
+    {
+      "name": "NtQuerySystemEnvironmentValueEx",
+      "argCount": 5
+    },
+    {
+      "name": "NtQuerySystemInformation",
+      "argCount": 4
+    },
+    {
+      "name": "NtQuerySystemInformationEx",
+      "argCount": 6
+    },
+    {
+      "name": "NtQuerySystemTime",
+      "argCount": 1
+    },
+    {
+      "name": "NtQueryTimer",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueryTimerResolution",
+      "argCount": 3
+    },
+    {
+      "name": "NtQueryValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "NtQueryVirtualMemory",
+      "argCount": 6
+    },
+    {
+      "name": "NtQueryVolumeInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueueApcThread",
+      "argCount": 5
+    },
+    {
+      "name": "NtQueueApcThreadEx",
+      "argCount": 6
+    },
+    {
+      "name": "NtQueueApcThreadEx2",
+      "argCount": 7
+    },
+    {
+      "name": "NtRaiseException",
+      "argCount": 3
+    },
+    {
+      "name": "NtRaiseHardError",
+      "argCount": 6
+    },
+    {
+      "name": "NtReadFile",
+      "argCount": 9
+    },
+    {
+      "name": "NtReadFileScatter",
+      "argCount": 9
+    },
+    {
+      "name": "NtReadRequestData",
+      "argCount": 6
+    },
+    {
+      "name": "NtReadVirtualMemory",
+      "argCount": 5
+    },
+    {
+      "name": "NtRegisterThreadTerminatePort",
+      "argCount": 1
+    },
+    {
+      "name": "NtReleaseKeyedEvent",
+      "argCount": 4
+    },
+    {
+      "name": "NtReleaseMutant",
+      "argCount": 2
+    },
+    {
+      "name": "NtReleaseSemaphore",
+      "argCount": 3
+    },
+    {
+      "name": "NtRemoveIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "NtRemoveIoCompletionEx",
+      "argCount": 6
+    },
+    {
+      "name": "NtRemoveProcessDebug",
+      "argCount": 2
+    },
+    {
+      "name": "NtRenameKey",
+      "argCount": 2
+    },
+    {
+      "name": "NtReplaceKey",
+      "argCount": 3
+    },
+    {
+      "name": "NtReplyPort",
+      "argCount": 2
+    },
+    {
+      "name": "NtReplyWaitReceivePort",
+      "argCount": 4
+    },
+    {
+      "name": "NtReplyWaitReceivePortEx",
+      "argCount": 5
+    },
+    {
+      "name": "NtRequestWaitReplyPort",
+      "argCount": 3
+    },
+    {
+      "name": "NtResetEvent",
+      "argCount": 2
+    },
+    {
+      "name": "NtResetWriteWatch",
+      "argCount": 3
+    },
+    {
+      "name": "NtRestoreKey",
+      "argCount": 3
+    },
+    {
+      "name": "NtResumeProcess",
+      "argCount": 1
+    },
+    {
+      "name": "NtResumeThread",
+      "argCount": 2
+    },
+    {
+      "name": "NtRollbackTransaction",
+      "argCount": 2
+    },
+    {
+      "name": "NtSaveKey",
+      "argCount": 2
+    },
+    {
+      "name": "NtSecureConnectPort",
+      "argCount": 9
+    },
+    {
+      "name": "NtSetContextThread",
+      "argCount": 2
+    },
+    {
+      "name": "NtSetDebugFilterState",
+      "argCount": 3
+    },
+    {
+      "name": "NtSetDefaultLocale",
+      "argCount": 2
+    },
+    {
+      "name": "NtSetDefaultUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "NtSetEaFile",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetEvent",
+      "argCount": 2
+    },
+    {
+      "name": "NtSetEventBoostPriority",
+      "argCount": 1
+    },
+    {
+      "name": "NtSetInformationDebugObject",
+      "argCount": 5
+    },
+    {
+      "name": "NtSetInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "NtSetInformationJobObject",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetInformationKey",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetInformationObject",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetInformationProcess",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetInformationThread",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetInformationToken",
+      "argCount": 4
+    },
+    {
+      "name": "NtSetInformationVirtualMemory",
+      "argCount": 6
+    },
+    {
+      "name": "NtSetIntervalProfile",
+      "argCount": 2
+    },
+    {
+      "name": "NtSetIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "NtSetIoCompletionEx",
+      "argCount": 6
+    },
+    {
+      "name": "NtSetLdtEntries",
+      "argCount": 6
+    },
+    {
+      "name": "NtSetSecurityObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtSetSystemInformation",
+      "argCount": 3
+    },
+    {
+      "name": "NtSetSystemTime",
+      "argCount": 2
+    },
+    {
+      "name": "NtSetThreadExecutionState",
+      "argCount": 2
+    },
+    {
+      "name": "NtSetTimer",
+      "argCount": 7
+    },
+    {
+      "name": "NtSetTimerResolution",
+      "argCount": 3
+    },
+    {
+      "name": "NtSetValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "NtSetVolumeInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "NtShutdownSystem",
+      "argCount": 1
+    },
+    {
+      "name": "NtSignalAndWaitForSingleObject",
+      "argCount": 4
+    },
+    {
+      "name": "NtSuspendProcess",
+      "argCount": 1
+    },
+    {
+      "name": "NtSuspendThread",
+      "argCount": 2
+    },
+    {
+      "name": "NtSystemDebugControl",
+      "argCount": 6
+    },
+    {
+      "name": "NtTerminateJobObject",
+      "argCount": 2
+    },
+    {
+      "name": "NtTerminateProcess",
+      "argCount": 2
+    },
+    {
+      "name": "NtTerminateThread",
+      "argCount": 2
+    },
+    {
+      "name": "NtTestAlert",
+      "argCount": 0
+    },
+    {
+      "name": "NtTraceControl",
+      "argCount": 6
+    },
+    {
+      "name": "NtUnloadDriver",
+      "argCount": 1
+    },
+    {
+      "name": "NtUnloadKey",
+      "argCount": 1
+    },
+    {
+      "name": "NtUnlockFile",
+      "argCount": 5
+    },
+    {
+      "name": "NtUnlockVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "NtUnmapViewOfSection",
+      "argCount": 2
+    },
+    {
+      "name": "NtUnmapViewOfSectionEx",
+      "argCount": 3
+    },
+    {
+      "name": "NtWaitForAlertByThreadId",
+      "argCount": 2
+    },
+    {
+      "name": "NtWaitForDebugEvent",
+      "argCount": 4
+    },
+    {
+      "name": "NtWaitForKeyedEvent",
+      "argCount": 4
+    },
+    {
+      "name": "NtWaitForMultipleObjects",
+      "argCount": 5
+    },
+    {
+      "name": "NtWaitForSingleObject",
+      "argCount": 3
+    },
+    {
+      "name": "NtWorkerFactoryWorkerReady",
+      "argCount": 1
+    },
+    {
+      "name": "NtWow64AllocateVirtualMemory64",
+      "argCount": 7
+    },
+    {
+      "name": "NtWow64GetNativeSystemInformation",
+      "argCount": 4
+    },
+    {
+      "name": "NtWow64IsProcessorFeaturePresent",
+      "argCount": 1
+    },
+    {
+      "name": "NtWow64QueryInformationProcess64",
+      "argCount": 5
+    },
+    {
+      "name": "NtWow64ReadVirtualMemory64",
+      "argCount": 7
+    },
+    {
+      "name": "NtWow64WriteVirtualMemory64",
+      "argCount": 7
+    },
+    {
+      "name": "NtWriteFile",
+      "argCount": 9
+    },
+    {
+      "name": "NtWriteFileGather",
+      "argCount": 9
+    },
+    {
+      "name": "NtWriteRequestData",
+      "argCount": 6
+    },
+    {
+      "name": "NtWriteVirtualMemory",
+      "argCount": 5
+    },
+    {
+      "name": "NtYieldExecution",
+      "argCount": 0
+    },
+    {
+      "name": "RtlAbsoluteToSelfRelativeSD",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAcquirePebLock",
+      "argCount": 0
+    },
+    {
+      "name": "RtlAcquireResourceExclusive",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAcquireResourceShared",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAcquireSRWLockExclusive",
+      "argCount": 1
+    },
+    {
+      "name": "RtlAcquireSRWLockShared",
+      "argCount": 1
+    },
+    {
+      "name": "RtlActivateActivationContext",
+      "argCount": 3
+    },
+    {
+      "name": "RtlActivateActivationContextEx",
+      "argCount": 4
+    },
+    {
+      "name": "RtlActivateActivationContextUnsafeFast",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAddAccessAllowedAce",
+      "argCount": 4
+    },
+    {
+      "name": "RtlAddAccessAllowedAceEx",
+      "argCount": 5
+    },
+    {
+      "name": "RtlAddAccessAllowedObjectAce",
+      "argCount": 7
+    },
+    {
+      "name": "RtlAddAccessDeniedAce",
+      "argCount": 4
+    },
+    {
+      "name": "RtlAddAccessDeniedAceEx",
+      "argCount": 5
+    },
+    {
+      "name": "RtlAddAccessDeniedObjectAce",
+      "argCount": 7
+    },
+    {
+      "name": "RtlAddAce",
+      "argCount": 5
+    },
+    {
+      "name": "RtlAddAtomToAtomTable",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAddAuditAccessAce",
+      "argCount": 6
+    },
+    {
+      "name": "RtlAddAuditAccessAceEx",
+      "argCount": 7
+    },
+    {
+      "name": "RtlAddAuditAccessObjectAce",
+      "argCount": 9
+    },
+    {
+      "name": "RtlAddMandatoryAce",
+      "argCount": 6
+    },
+    {
+      "name": "RtlAddProcessTrustLabelAce",
+      "argCount": 6
+    },
+    {
+      "name": "RtlAddRefActivationContext",
+      "argCount": 1
+    },
+    {
+      "name": "RtlAddressInSectionTable",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAddVectoredContinueHandler",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAddVectoredExceptionHandler",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAdjustPrivilege",
+      "argCount": 4
+    },
+    {
+      "name": "RtlAllocateAndInitializeSid",
+      "argCount": 11
+    },
+    {
+      "name": "RtlAllocateHandle",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAllocateHeap",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAnsiCharToUnicodeChar",
+      "argCount": 1
+    },
+    {
+      "name": "RtlAnsiStringToUnicodeSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlAnsiStringToUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAppendAsciizToString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAppendStringToString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAppendUnicodeStringToString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAppendUnicodeToString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAreAllAccessesGranted",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAreAnyAccessesGranted",
+      "argCount": 2
+    },
+    {
+      "name": "RtlAreBitsClear",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAreBitsSet",
+      "argCount": 3
+    },
+    {
+      "name": "RtlAssert",
+      "argCount": 4
+    },
+    {
+      "name": "RtlBarrier",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCaptureContext",
+      "argCount": 1
+    },
+    {
+      "name": "RtlCaptureStackBackTrace",
+      "argCount": 4
+    },
+    {
+      "name": "RtlCharToInteger",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCheckRegistryKey",
+      "argCount": 2
+    },
+    {
+      "name": "RtlClearAllBits",
+      "argCount": 1
+    },
+    {
+      "name": "RtlClearBits",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCompactHeap",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCompareMemory",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCompareMemoryUlong",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCompareString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCompareUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCompareUnicodeStrings",
+      "argCount": 5
+    },
+    {
+      "name": "RtlCompressBuffer",
+      "argCount": 8
+    },
+    {
+      "name": "RtlComputeCrc32",
+      "argCount": 3
+    },
+    {
+      "name": "RtlConvertDeviceFamilyInfoToString",
+      "argCount": 4
+    },
+    {
+      "name": "RtlConvertLongToLargeInteger",
+      "argCount": 1
+    },
+    {
+      "name": "RtlConvertSidToUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlConvertToAutoInheritSecurityObject",
+      "argCount": 6
+    },
+    {
+      "name": "RtlConvertUlongToLargeInteger",
+      "argCount": 1
+    },
+    {
+      "name": "RtlCopyContext",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCopyExtendedContext",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCopyLuid",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCopyLuidAndAttributesArray",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCopySecurityDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCopySid",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCopyString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCopyUnicodeString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateAcl",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCreateActivationContext",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateAtomTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateEnvironment",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateHeap",
+      "argCount": 6
+    },
+    {
+      "name": "RtlCreateProcessParameters",
+      "argCount": 10
+    },
+    {
+      "name": "RtlCreateProcessParametersEx",
+      "argCount": 11
+    },
+    {
+      "name": "RtlCreateQueryDebugBuffer",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateRegistryKey",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateSecurityDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateServiceSid",
+      "argCount": 3
+    },
+    {
+      "name": "RtlCreateTimer",
+      "argCount": 7
+    },
+    {
+      "name": "RtlCreateTimerQueue",
+      "argCount": 1
+    },
+    {
+      "name": "RtlCreateUnicodeString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateUnicodeStringFromAsciiz",
+      "argCount": 2
+    },
+    {
+      "name": "RtlCreateUserProcess",
+      "argCount": 10
+    },
+    {
+      "name": "RtlCreateUserStack",
+      "argCount": 6
+    },
+    {
+      "name": "RtlCreateUserThread",
+      "argCount": 10
+    },
+    {
+      "name": "RtlCustomCPToUnicodeN",
+      "argCount": 6
+    },
+    {
+      "name": "RtlDeactivateActivationContext",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeactivateActivationContextUnsafeFast",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDecodePointer",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDecodeSystemPointer",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDecompressBuffer",
+      "argCount": 6
+    },
+    {
+      "name": "RtlDecompressFragment",
+      "argCount": 8
+    },
+    {
+      "name": "RtlDefaultNpAcl",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDelete",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeleteAce",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeleteAtomFromAtomTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeleteBarrier",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeleteCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeleteElementGenericTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeleteNoSplay",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeleteRegistryValue",
+      "argCount": 3
+    },
+    {
+      "name": "RtlDeleteResource",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeleteSecurityObject",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeleteTimer",
+      "argCount": 3
+    },
+    {
+      "name": "RtlDeleteTimerQueueEx",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeNormalizeProcessParams",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeregisterWait",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDeregisterWaitEx",
+      "argCount": 2
+    },
+    {
+      "name": "RtlDeriveCapabilitySidsFromName",
+      "argCount": 3
+    },
+    {
+      "name": "RtlDestroyAtomTable",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDestroyEnvironment",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDestroyHandleTable",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDestroyHeap",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDestroyProcessParameters",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDestroyQueryDebugBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDetermineDosPathNameType_U",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDllShutdownInProgress",
+      "argCount": 0
+    },
+    {
+      "name": "RtlDoesFileExists_U",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDosPathNameToNtPathName_U",
+      "argCount": 4
+    },
+    {
+      "name": "RtlDosPathNameToNtPathName_U_WithStatus",
+      "argCount": 4
+    },
+    {
+      "name": "RtlDosPathNameToRelativeNtPathName_U",
+      "argCount": 4
+    },
+    {
+      "name": "RtlDosPathNameToRelativeNtPathName_U_WithStatus",
+      "argCount": 4
+    },
+    {
+      "name": "RtlDosSearchPath_U",
+      "argCount": 6
+    },
+    {
+      "name": "RtlDowncaseUnicodeChar",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDowncaseUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlDumpResource",
+      "argCount": 1
+    },
+    {
+      "name": "RtlDuplicateUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlEmptyAtomTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEncodePointer",
+      "argCount": 1
+    },
+    {
+      "name": "RtlEncodeSystemPointer",
+      "argCount": 1
+    },
+    {
+      "name": "RtlEnlargedIntegerMultiply",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEnlargedUnsignedDivide",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlEnlargedUnsignedMultiply",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEnterCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlEnumerateGenericTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEnumerateGenericTableWithoutSplaying",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEnumerateGenericTableWithoutSplayingAvl",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEqualComputerName",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEqualDomainName",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEqualLuid",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEqualPrefixSid",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEqualSid",
+      "argCount": 2
+    },
+    {
+      "name": "RtlEqualString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlEqualUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlEraseUnicodeString",
+      "argCount": 1
+    },
+    {
+      "name": "RtlExitUserProcess",
+      "argCount": 1
+    },
+    {
+      "name": "RtlExitUserThread",
+      "argCount": 1
+    },
+    {
+      "name": "RtlExpandEnvironmentStrings",
+      "argCount": 6
+    },
+    {
+      "name": "RtlExpandEnvironmentStrings_U",
+      "argCount": 4
+    },
+    {
+      "name": "RtlExtendedIntegerMultiply",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlExtendedLargeIntegerDivide",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlExtendedMagicDivide",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlFillMemory",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFillMemoryUlong",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindActivationContextSectionGuid",
+      "argCount": 5
+    },
+    {
+      "name": "RtlFindActivationContextSectionString",
+      "argCount": 5
+    },
+    {
+      "name": "RtlFindCharInUnicodeString",
+      "argCount": 4
+    },
+    {
+      "name": "RtlFindClearBits",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindClearBitsAndSet",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindClearRuns",
+      "argCount": 4
+    },
+    {
+      "name": "RtlFindExportedRoutineByName",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFindLastBackwardRunClear",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindLastBackwardRunSet",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindLeastSignificantBit",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlFindLongestRunClear",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFindLongestRunSet",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFindMessage",
+      "argCount": 5
+    },
+    {
+      "name": "RtlFindMostSignificantBit",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlFindNextForwardRunClear",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindNextForwardRunSet",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindSetBits",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindSetBitsAndClear",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFindSetRuns",
+      "argCount": 4
+    },
+    {
+      "name": "RtlFirstEntrySList",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFirstFreeAce",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFlsAlloc",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFlsFree",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFlsGetValue",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFlsSetValue",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFormatCurrentUserKeyPath",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFormatMessage",
+      "argCount": 9
+    },
+    {
+      "name": "RtlFormatMessageEx",
+      "argCount": 10
+    },
+    {
+      "name": "RtlFreeActivationContextStack",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFreeAnsiString",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFreeHandle",
+      "argCount": 2
+    },
+    {
+      "name": "RtlFreeHeap",
+      "argCount": 3
+    },
+    {
+      "name": "RtlFreeOemString",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFreeSid",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFreeThreadActivationContextStack",
+      "argCount": 0
+    },
+    {
+      "name": "RtlFreeUnicodeString",
+      "argCount": 1
+    },
+    {
+      "name": "RtlFreeUserStack",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGetAce",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetActiveActivationContext",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGetCallersAddress",
+      "argCount": 2
+    },
+    {
+      "name": "RtlGetCompressionWorkSpaceSize",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetControlSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetCurrentDirectory_U",
+      "argCount": 2
+    },
+    {
+      "name": "RtlGetCurrentPeb",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetCurrentProcessorNumberEx",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGetCurrentTransaction",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetDaclSecurityDescriptor",
+      "argCount": 4
+    },
+    {
+      "name": "RtlGetDeviceFamilyInfoEnum",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetElementGenericTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlGetEnabledExtendedFeatures",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlGetExePath",
+      "argCount": 2
+    },
+    {
+      "name": "RtlGetExtendedContextLength",
+      "argCount": 2
+    },
+    {
+      "name": "RtlGetExtendedContextLength2",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlGetExtendedFeaturesMask",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGetFrame",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetFullPathName_U",
+      "argCount": 4
+    },
+    {
+      "name": "RtlGetFullPathName_UEx",
+      "argCount": 5
+    },
+    {
+      "name": "RtlGetGroupSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetLastNtStatus",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetLastWin32Error",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetLocaleFileMappingAddress",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetLongestNtPathLength",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetNativeSystemInformation",
+      "argCount": 4
+    },
+    {
+      "name": "RtlGetNtGlobalFlags",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetNtProductType",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGetNtVersionNumbers",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetOwnerSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetProcessHeaps",
+      "argCount": 2
+    },
+    {
+      "name": "RtlGetProcessPreferredUILanguages",
+      "argCount": 4
+    },
+    {
+      "name": "RtlGetProductInfo",
+      "argCount": 5
+    },
+    {
+      "name": "RtlGetSaclSecurityDescriptor",
+      "argCount": 4
+    },
+    {
+      "name": "RtlGetSearchPath",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGetSystemPreferredUILanguages",
+      "argCount": 5
+    },
+    {
+      "name": "RtlGetSystemTimePrecise",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetThreadErrorMode",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetThreadPreferredUILanguages",
+      "argCount": 4
+    },
+    {
+      "name": "RtlGetUnloadEventTrace",
+      "argCount": 0
+    },
+    {
+      "name": "RtlGetUnloadEventTraceEx",
+      "argCount": 3
+    },
+    {
+      "name": "RtlGetUserInfoHeap",
+      "argCount": 5
+    },
+    {
+      "name": "RtlGetUserPreferredUILanguages",
+      "argCount": 5
+    },
+    {
+      "name": "RtlGetVersion",
+      "argCount": 1
+    },
+    {
+      "name": "RtlGUIDFromString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlHashUnicodeString",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIdentifierAuthoritySid",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIdnToAscii",
+      "argCount": 5
+    },
+    {
+      "name": "RtlIdnToNameprepUnicode",
+      "argCount": 5
+    },
+    {
+      "name": "RtlIdnToUnicode",
+      "argCount": 5
+    },
+    {
+      "name": "RtlImageDirectoryEntryToData",
+      "argCount": 4
+    },
+    {
+      "name": "RtlImageNtHeader",
+      "argCount": 1
+    },
+    {
+      "name": "RtlImageRvaToSection",
+      "argCount": 3
+    },
+    {
+      "name": "RtlImageRvaToVa",
+      "argCount": 4
+    },
+    {
+      "name": "RtlImpersonateSelf",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInitAnsiString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInitAnsiStringEx",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInitBarrier",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInitCodePageTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInitializeBitMap",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInitializeConditionVariable",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInitializeCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInitializeCriticalSectionAndSpinCount",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInitializeCriticalSectionEx",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInitializeExtendedContext",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInitializeExtendedContext2",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlInitializeGenericTable",
+      "argCount": 5
+    },
+    {
+      "name": "RtlInitializeGenericTableAvl",
+      "argCount": 5
+    },
+    {
+      "name": "RtlInitializeHandleTable",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInitializeNtUserPfn",
+      "argCount": 6
+    },
+    {
+      "name": "RtlInitializeResource",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInitializeSid",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInitializeSListHead",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInitializeSRWLock",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInitNlsTables",
+      "argCount": 4
+    },
+    {
+      "name": "RtlInitString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInitUnicodeString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInitUnicodeStringEx",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInsertElementGenericTable",
+      "argCount": 4
+    },
+    {
+      "name": "RtlInsertElementGenericTableAvl",
+      "argCount": 4
+    },
+    {
+      "name": "RtlInt64ToUnicodeString",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlIntegerToChar",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIntegerToUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlInterlockedCompareExchange64",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlInterlockedFlushSList",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInterlockedPopEntrySList",
+      "argCount": 1
+    },
+    {
+      "name": "RtlInterlockedPushEntrySList",
+      "argCount": 2
+    },
+    {
+      "name": "RtlInterlockedPushListSList",
+      "argCount": 4
+    },
+    {
+      "name": "RtlInterlockedPushListSListEx",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv4AddressToStringA",
+      "argCount": 2
+    },
+    {
+      "name": "RtlIpv4AddressToStringExA",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv4AddressToStringExW",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv4AddressToStringW",
+      "argCount": 2
+    },
+    {
+      "name": "RtlIpv4StringToAddressA",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv4StringToAddressExA",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv4StringToAddressExW",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv4StringToAddressW",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv6AddressToStringA",
+      "argCount": 2
+    },
+    {
+      "name": "RtlIpv6AddressToStringExA",
+      "argCount": 5
+    },
+    {
+      "name": "RtlIpv6AddressToStringExW",
+      "argCount": 5
+    },
+    {
+      "name": "RtlIpv6AddressToStringW",
+      "argCount": 2
+    },
+    {
+      "name": "RtlIpv6StringToAddressA",
+      "argCount": 3
+    },
+    {
+      "name": "RtlIpv6StringToAddressExA",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv6StringToAddressExW",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIpv6StringToAddressW",
+      "argCount": 3
+    },
+    {
+      "name": "RtlIsActivationContextActive",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsCriticalSectionLocked",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsCriticalSectionLockedByThread",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsCurrentProcess",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsCurrentThread",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsDosDeviceName_U",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsGenericTableEmpty",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsNameLegalDOS8Dot3",
+      "argCount": 3
+    },
+    {
+      "name": "RtlIsNormalizedString",
+      "argCount": 4
+    },
+    {
+      "name": "RtlIsProcessorFeaturePresent",
+      "argCount": 1
+    },
+    {
+      "name": "RtlIsTextUnicode",
+      "argCount": 3
+    },
+    {
+      "name": "RtlIsValidHandle",
+      "argCount": 2
+    },
+    {
+      "name": "RtlIsValidIndexHandle",
+      "argCount": 3
+    },
+    {
+      "name": "RtlIsValidLocaleName",
+      "argCount": 2
+    },
+    {
+      "name": "RtlLargeIntegerAdd",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerArithmeticShift",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerDivide",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerNegate",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerShiftLeft",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerShiftRight",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerSubtract",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlLargeIntegerToChar",
+      "argCount": 4
+    },
+    {
+      "name": "RtlLcidToLocaleName",
+      "argCount": 4
+    },
+    {
+      "name": "RtlLeaveCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlLengthRequiredSid",
+      "argCount": 1
+    },
+    {
+      "name": "RtlLengthSecurityDescriptor",
+      "argCount": 1
+    },
+    {
+      "name": "RtlLengthSid",
+      "argCount": 1
+    },
+    {
+      "name": "RtlLocaleNameToLcid",
+      "argCount": 3
+    },
+    {
+      "name": "RtlLocalTimeToSystemTime",
+      "argCount": 2
+    },
+    {
+      "name": "RtlLocateExtendedFeature",
+      "argCount": 3
+    },
+    {
+      "name": "RtlLocateExtendedFeature2",
+      "argCount": 4
+    },
+    {
+      "name": "RtlLocateLegacyContext",
+      "argCount": 2
+    },
+    {
+      "name": "RtlLockHeap",
+      "argCount": 1
+    },
+    {
+      "name": "RtlLookupAtomInAtomTable",
+      "argCount": 3
+    },
+    {
+      "name": "RtlLookupElementGenericTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlLookupElementGenericTableAvl",
+      "argCount": 2
+    },
+    {
+      "name": "RtlMakeSelfRelativeSD",
+      "argCount": 3
+    },
+    {
+      "name": "RtlMapGenericMask",
+      "argCount": 2
+    },
+    {
+      "name": "RtlMoveMemory",
+      "argCount": 3
+    },
+    {
+      "name": "RtlMultiByteToUnicodeN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlMultiByteToUnicodeSize",
+      "argCount": 3
+    },
+    {
+      "name": "RtlNewSecurityObject",
+      "argCount": 6
+    },
+    {
+      "name": "RtlNewSecurityObjectEx",
+      "argCount": 8
+    },
+    {
+      "name": "RtlNewSecurityObjectWithMultipleInheritance",
+      "argCount": 9
+    },
+    {
+      "name": "RtlNormalizeProcessParams",
+      "argCount": 1
+    },
+    {
+      "name": "RtlNormalizeString",
+      "argCount": 5
+    },
+    {
+      "name": "RtlNtStatusToDosError",
+      "argCount": 1
+    },
+    {
+      "name": "RtlNtStatusToDosErrorNoTeb",
+      "argCount": 1
+    },
+    {
+      "name": "RtlNumberGenericTableElements",
+      "argCount": 1
+    },
+    {
+      "name": "RtlNumberGenericTableElementsAvl",
+      "argCount": 1
+    },
+    {
+      "name": "RtlNumberOfClearBits",
+      "argCount": 1
+    },
+    {
+      "name": "RtlNumberOfSetBits",
+      "argCount": 1
+    },
+    {
+      "name": "RtlOemStringToUnicodeSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlOemStringToUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlOemToUnicodeN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlOpenCurrentUser",
+      "argCount": 2
+    },
+    {
+      "name": "RtlPcToFileHeader",
+      "argCount": 2
+    },
+    {
+      "name": "RtlPinAtomInAtomTable",
+      "argCount": 2
+    },
+    {
+      "name": "RtlpNtCreateKey",
+      "argCount": 7
+    },
+    {
+      "name": "RtlpNtEnumerateSubKey",
+      "argCount": 3
+    },
+    {
+      "name": "RtlpNtMakeTemporaryKey",
+      "argCount": 1
+    },
+    {
+      "name": "RtlpNtOpenKey",
+      "argCount": 3
+    },
+    {
+      "name": "RtlpNtQueryValueKey",
+      "argCount": 5
+    },
+    {
+      "name": "RtlpNtSetValueKey",
+      "argCount": 4
+    },
+    {
+      "name": "RtlPopFrame",
+      "argCount": 1
+    },
+    {
+      "name": "RtlPrefixString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlPrefixUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlProcessFlsData",
+      "argCount": 2
+    },
+    {
+      "name": "RtlpUnWaitCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlPushFrame",
+      "argCount": 1
+    },
+    {
+      "name": "RtlpWaitForCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryActivationContextApplicationSettings",
+      "argCount": 7
+    },
+    {
+      "name": "RtlQueryAtomInAtomTable",
+      "argCount": 6
+    },
+    {
+      "name": "RtlQueryDepthSList",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryDynamicTimeZoneInformation",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryEnvironmentVariable",
+      "argCount": 6
+    },
+    {
+      "name": "RtlQueryEnvironmentVariable_U",
+      "argCount": 3
+    },
+    {
+      "name": "RtlQueryHeapInformation",
+      "argCount": 5
+    },
+    {
+      "name": "RtlQueryInformationAcl",
+      "argCount": 4
+    },
+    {
+      "name": "RtlQueryInformationActivationContext",
+      "argCount": 7
+    },
+    {
+      "name": "RtlQueryInformationActiveActivationContext",
+      "argCount": 4
+    },
+    {
+      "name": "RtlQueryPackageIdentity",
+      "argCount": 6
+    },
+    {
+      "name": "RtlQueryPerformanceCounter",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryPerformanceFrequency",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryProcessDebugInformation",
+      "argCount": 3
+    },
+    {
+      "name": "RtlQueryProcessHeapInformation",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryProcessPlaceholderCompatibilityMode",
+      "argCount": 0
+    },
+    {
+      "name": "RtlQueryRegistryValues",
+      "argCount": 5
+    },
+    {
+      "name": "RtlQueryRegistryValuesEx",
+      "argCount": 5
+    },
+    {
+      "name": "RtlQueryTimeZoneInformation",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueryUnbiasedInterruptTime",
+      "argCount": 1
+    },
+    {
+      "name": "RtlQueueWorkItem",
+      "argCount": 3
+    },
+    {
+      "name": "RtlRaiseException",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRaiseStatus",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRandom",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRandomEx",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRbInsertNodeEx",
+      "argCount": 4
+    },
+    {
+      "name": "RtlRbRemoveNode",
+      "argCount": 2
+    },
+    {
+      "name": "RtlReAllocateHeap",
+      "argCount": 4
+    },
+    {
+      "name": "RtlRealPredecessor",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRealSuccessor",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRegisterWait",
+      "argCount": 6
+    },
+    {
+      "name": "RtlReleaseActivationContext",
+      "argCount": 1
+    },
+    {
+      "name": "RtlReleasePath",
+      "argCount": 1
+    },
+    {
+      "name": "RtlReleasePebLock",
+      "argCount": 0
+    },
+    {
+      "name": "RtlReleaseRelativeName",
+      "argCount": 1
+    },
+    {
+      "name": "RtlReleaseResource",
+      "argCount": 1
+    },
+    {
+      "name": "RtlReleaseSRWLockExclusive",
+      "argCount": 1
+    },
+    {
+      "name": "RtlReleaseSRWLockShared",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRemoveVectoredContinueHandler",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRemoveVectoredExceptionHandler",
+      "argCount": 1
+    },
+    {
+      "name": "RtlResetNtUserPfn",
+      "argCount": 0
+    },
+    {
+      "name": "RtlResetRtlTranslations",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRestoreLastWin32Error",
+      "argCount": 1
+    },
+    {
+      "name": "RtlRetrieveNtUserPfn",
+      "argCount": 3
+    },
+    {
+      "name": "RtlRunOnceBeginInitialize",
+      "argCount": 3
+    },
+    {
+      "name": "RtlRunOnceComplete",
+      "argCount": 3
+    },
+    {
+      "name": "RtlRunOnceExecuteOnce",
+      "argCount": 4
+    },
+    {
+      "name": "RtlRunOnceInitialize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSecondsSince1970ToTime",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSecondsSince1980ToTime",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSelfRelativeToAbsoluteSD",
+      "argCount": 11
+    },
+    {
+      "name": "RtlSetAllBits",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetBits",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetControlSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetCriticalSectionSpinCount",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSetCurrentDirectory_U",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetCurrentEnvironment",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSetCurrentTransaction",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetDaclSecurityDescriptor",
+      "argCount": 4
+    },
+    {
+      "name": "RtlSetEnvironmentVariable",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetExtendedFeaturesMask",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlSetGroupSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetHeapInformation",
+      "argCount": 4
+    },
+    {
+      "name": "RtlSetIoCompletionCallback",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetLastWin32Error",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetLastWin32ErrorAndNtStatusFromNtStatus",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetOwnerSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetProcessPreferredUILanguages",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetSaclSecurityDescriptor",
+      "argCount": 4
+    },
+    {
+      "name": "RtlSetSearchPathMode",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetThreadErrorMode",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSetThreadPreferredUILanguages",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSetTimeZoneInformation",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetUnhandledExceptionFilter",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSetUserFlagsHeap",
+      "argCount": 5
+    },
+    {
+      "name": "RtlSetUserValueHeap",
+      "argCount": 4
+    },
+    {
+      "name": "RtlSizeHeap",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSleepConditionVariableCS",
+      "argCount": 3
+    },
+    {
+      "name": "RtlSleepConditionVariableSRW",
+      "argCount": 4
+    },
+    {
+      "name": "RtlSplay",
+      "argCount": 1
+    },
+    {
+      "name": "RtlStringFromGUID",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSubAuthorityCountSid",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSubAuthoritySid",
+      "argCount": 2
+    },
+    {
+      "name": "RtlSubtreePredecessor",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSubtreeSuccessor",
+      "argCount": 1
+    },
+    {
+      "name": "RtlSystemTimeToLocalTime",
+      "argCount": 2
+    },
+    {
+      "name": "RtlTimeFieldsToTime",
+      "argCount": 2
+    },
+    {
+      "name": "RtlTimeToElapsedTimeFields",
+      "argCount": 2
+    },
+    {
+      "name": "RtlTimeToSecondsSince1970",
+      "argCount": 2
+    },
+    {
+      "name": "RtlTimeToSecondsSince1980",
+      "argCount": 2
+    },
+    {
+      "name": "RtlTimeToTimeFields",
+      "argCount": 2
+    },
+    {
+      "name": "RtlTryAcquireSRWLockExclusive",
+      "argCount": 1
+    },
+    {
+      "name": "RtlTryAcquireSRWLockShared",
+      "argCount": 1
+    },
+    {
+      "name": "RtlTryEnterCriticalSection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUlongByteSwap",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUlonglongByteSwap",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlUnicodeStringToAnsiSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUnicodeStringToAnsiString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUnicodeStringToInteger",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUnicodeStringToOemSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUnicodeStringToOemString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUnicodeToCustomCPN",
+      "argCount": 6
+    },
+    {
+      "name": "RtlUnicodeToMultiByteN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlUnicodeToMultiByteSize",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUnicodeToOemN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlUnicodeToUTF8N",
+      "argCount": 5
+    },
+    {
+      "name": "RtlUniform",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUnlockHeap",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUnwind",
+      "argCount": 4
+    },
+    {
+      "name": "RtlUpcaseUnicodeChar",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUpcaseUnicodeString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUpcaseUnicodeStringToAnsiString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUpcaseUnicodeStringToCountedOemString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUpcaseUnicodeStringToOemString",
+      "argCount": 3
+    },
+    {
+      "name": "RtlUpcaseUnicodeToCustomCPN",
+      "argCount": 6
+    },
+    {
+      "name": "RtlUpcaseUnicodeToMultiByteN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlUpcaseUnicodeToOemN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlUpdateTimer",
+      "argCount": 4
+    },
+    {
+      "name": "RtlUpperChar",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUpperString",
+      "argCount": 2
+    },
+    {
+      "name": "RtlUserThreadStart",
+      "argCount": 2
+    },
+    {
+      "name": "RtlUshortByteSwap",
+      "argCount": 1
+    },
+    {
+      "name": "RtlUTF8ToUnicodeN",
+      "argCount": 5
+    },
+    {
+      "name": "RtlValidAcl",
+      "argCount": 1
+    },
+    {
+      "name": "RtlValidateHeap",
+      "argCount": 3
+    },
+    {
+      "name": "RtlValidRelativeSecurityDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "RtlValidSecurityDescriptor",
+      "argCount": 1
+    },
+    {
+      "name": "RtlValidSid",
+      "argCount": 1
+    },
+    {
+      "name": "RtlVerifyVersionInfo",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "RtlWaitOnAddress",
+      "argCount": 4
+    },
+    {
+      "name": "RtlWakeAddressAll",
+      "argCount": 1
+    },
+    {
+      "name": "RtlWakeAddressSingle",
+      "argCount": 1
+    },
+    {
+      "name": "RtlWakeAllConditionVariable",
+      "argCount": 1
+    },
+    {
+      "name": "RtlWakeConditionVariable",
+      "argCount": 1
+    },
+    {
+      "name": "RtlWalkFrameChain",
+      "argCount": 3
+    },
+    {
+      "name": "RtlWalkHeap",
+      "argCount": 2
+    },
+    {
+      "name": "RtlWow64EnableFsRedirection",
+      "argCount": 1
+    },
+    {
+      "name": "RtlWow64EnableFsRedirectionEx",
+      "argCount": 2
+    },
+    {
+      "name": "RtlWow64GetCurrentMachine",
+      "argCount": 0
+    },
+    {
+      "name": "RtlWow64GetProcessMachines",
+      "argCount": 3
+    },
+    {
+      "name": "RtlWow64GetSharedInfoProcess",
+      "argCount": 3
+    },
+    {
+      "name": "RtlWow64IsWowGuestMachineSupported",
+      "argCount": 2
+    },
+    {
+      "name": "RtlWriteRegistryValue",
+      "argCount": 6
+    },
+    {
+      "name": "RtlxAnsiStringToUnicodeSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlxOemStringToUnicodeSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlxUnicodeStringToAnsiSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlxUnicodeStringToOemSize",
+      "argCount": 1
+    },
+    {
+      "name": "RtlZeroMemory",
+      "argCount": 2
+    },
+    {
+      "name": "RtlZombifyActivationContext",
+      "argCount": 1
+    },
+    {
+      "name": "TpAllocCleanupGroup",
+      "argCount": 1
+    },
+    {
+      "name": "TpAllocIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "TpAllocPool",
+      "argCount": 2
+    },
+    {
+      "name": "TpAllocTimer",
+      "argCount": 4
+    },
+    {
+      "name": "TpAllocWait",
+      "argCount": 4
+    },
+    {
+      "name": "TpAllocWork",
+      "argCount": 4
+    },
+    {
+      "name": "TpCallbackLeaveCriticalSectionOnCompletion",
+      "argCount": 2
+    },
+    {
+      "name": "TpCallbackMayRunLong",
+      "argCount": 1
+    },
+    {
+      "name": "TpCallbackReleaseMutexOnCompletion",
+      "argCount": 2
+    },
+    {
+      "name": "TpCallbackReleaseSemaphoreOnCompletion",
+      "argCount": 3
+    },
+    {
+      "name": "TpCallbackSetEventOnCompletion",
+      "argCount": 2
+    },
+    {
+      "name": "TpCallbackUnloadDllOnCompletion",
+      "argCount": 2
+    },
+    {
+      "name": "TpCancelAsyncIoOperation",
+      "argCount": 1
+    },
+    {
+      "name": "TpDisassociateCallback",
+      "argCount": 1
+    },
+    {
+      "name": "TpIsTimerSet",
+      "argCount": 1
+    },
+    {
+      "name": "TpPostWork",
+      "argCount": 1
+    },
+    {
+      "name": "TpQueryPoolStackInformation",
+      "argCount": 2
+    },
+    {
+      "name": "TpReleaseCleanupGroup",
+      "argCount": 1
+    },
+    {
+      "name": "TpReleaseCleanupGroupMembers",
+      "argCount": 3
+    },
+    {
+      "name": "TpReleaseIoCompletion",
+      "argCount": 1
+    },
+    {
+      "name": "TpReleasePool",
+      "argCount": 1
+    },
+    {
+      "name": "TpReleaseTimer",
+      "argCount": 1
+    },
+    {
+      "name": "TpReleaseWait",
+      "argCount": 1
+    },
+    {
+      "name": "TpReleaseWork",
+      "argCount": 1
+    },
+    {
+      "name": "TpSetPoolMaxThreads",
+      "argCount": 2
+    },
+    {
+      "name": "TpSetPoolMinThreads",
+      "argCount": 2
+    },
+    {
+      "name": "TpSetPoolStackInformation",
+      "argCount": 2
+    },
+    {
+      "name": "TpSetTimer",
+      "argCount": 4
+    },
+    {
+      "name": "TpSetWait",
+      "argCount": 3
+    },
+    {
+      "name": "TpSimpleTryPost",
+      "argCount": 3
+    },
+    {
+      "name": "TpStartAsyncIoOperation",
+      "argCount": 1
+    },
+    {
+      "name": "TpWaitForIoCompletion",
+      "argCount": 2
+    },
+    {
+      "name": "TpWaitForTimer",
+      "argCount": 2
+    },
+    {
+      "name": "TpWaitForWait",
+      "argCount": 2
+    },
+    {
+      "name": "TpWaitForWork",
+      "argCount": 2
+    },
+    {
+      "name": "vDbgPrintEx",
+      "argCount": 4
+    },
+    {
+      "name": "vDbgPrintExWithPrefix",
+      "argCount": 5
+    },
+    {
+      "name": "VerSetConditionMask",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "WinSqmEndSession",
+      "argCount": 1
+    },
+    {
+      "name": "WinSqmIncrementDWORD",
+      "argCount": 3
+    },
+    {
+      "name": "WinSqmIsOptedIn",
+      "argCount": 0
+    },
+    {
+      "name": "WinSqmSetDWORD",
+      "argCount": 3
+    },
+    {
+      "name": "WinSqmSetIfMaxDWORD",
+      "argCount": 3
+    },
+    {
+      "name": "WinSqmStartSession",
+      "argCount": 3
+    },
+    {
+      "name": "ZwAcceptConnectPort",
+      "argCount": 6
+    },
+    {
+      "name": "ZwAccessCheck",
+      "argCount": 8
+    },
+    {
+      "name": "ZwAccessCheckAndAuditAlarm",
+      "argCount": 11
+    },
+    {
+      "name": "ZwAccessCheckByTypeAndAuditAlarm",
+      "argCount": 16
+    },
+    {
+      "name": "ZwAddAtom",
+      "argCount": 3
+    },
+    {
+      "name": "ZwAdjustGroupsToken",
+      "argCount": 6
+    },
+    {
+      "name": "ZwAdjustPrivilegesToken",
+      "argCount": 6
+    },
+    {
+      "name": "ZwAlertMultipleThreadByThreadId",
+      "argCount": 4
+    },
+    {
+      "name": "ZwAlertResumeThread",
+      "argCount": 2
+    },
+    {
+      "name": "ZwAlertThread",
+      "argCount": 1
+    },
+    {
+      "name": "ZwAlertThreadByThreadId",
+      "argCount": 1
+    },
+    {
+      "name": "ZwAllocateLocallyUniqueId",
+      "argCount": 1
+    },
+    {
+      "name": "ZwAllocateReserveObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwAllocateUuids",
+      "argCount": 4
+    },
+    {
+      "name": "ZwAllocateVirtualMemory",
+      "argCount": 6
+    },
+    {
+      "name": "ZwAllocateVirtualMemoryEx",
+      "argCount": 7
+    },
+    {
+      "name": "ZwAlpcAcceptConnectPort",
+      "argCount": 9
+    },
+    {
+      "name": "ZwAlpcConnectPort",
+      "argCount": 11
+    },
+    {
+      "name": "ZwAlpcCreatePort",
+      "argCount": 3
+    },
+    {
+      "name": "ZwAlpcDisconnectPort",
+      "argCount": 2
+    },
+    {
+      "name": "ZwAlpcImpersonateClientOfPort",
+      "argCount": 3
+    },
+    {
+      "name": "ZwAlpcSendWaitReceivePort",
+      "argCount": 8
+    },
+    {
+      "name": "ZwApphelpCacheControl",
+      "argCount": 0
+    },
+    {
+      "name": "ZwAreMappedFilesTheSame",
+      "argCount": 2
+    },
+    {
+      "name": "ZwAssignProcessToJobObject",
+      "argCount": 2
+    },
+    {
+      "name": "ZwCallbackReturn",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCancelIoFile",
+      "argCount": 2
+    },
+    {
+      "name": "ZwCancelIoFileEx",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCancelSynchronousIoFile",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCancelTimer",
+      "argCount": 2
+    },
+    {
+      "name": "ZwClearEvent",
+      "argCount": 1
+    },
+    {
+      "name": "ZwClose",
+      "argCount": 1
+    },
+    {
+      "name": "ZwCloseObjectAuditAlarm",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCommitTransaction",
+      "argCount": 2
+    },
+    {
+      "name": "ZwCompareObjects",
+      "argCount": 2
+    },
+    {
+      "name": "ZwCompareTokens",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCompleteConnectPort",
+      "argCount": 1
+    },
+    {
+      "name": "ZwConnectPort",
+      "argCount": 8
+    },
+    {
+      "name": "ZwContinue",
+      "argCount": 2
+    },
+    {
+      "name": "ZwContinueEx",
+      "argCount": 2
+    },
+    {
+      "name": "ZwConvertBetweenAuxiliaryCounterAndPerformanceCounter",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateDebugObject",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateDirectoryObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCreateEvent",
+      "argCount": 5
+    },
+    {
+      "name": "ZwCreateFile",
+      "argCount": 11
+    },
+    {
+      "name": "ZwCreateIoCompletion",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateJobObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwCreateKey",
+      "argCount": 7
+    },
+    {
+      "name": "ZwCreateKeyedEvent",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateKeyTransacted",
+      "argCount": 8
+    },
+    {
+      "name": "ZwCreateLowBoxToken",
+      "argCount": 9
+    },
+    {
+      "name": "ZwCreateMailslotFile",
+      "argCount": 8
+    },
+    {
+      "name": "ZwCreateMutant",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateNamedPipeFile",
+      "argCount": 14
+    },
+    {
+      "name": "ZwCreatePagingFile",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreatePort",
+      "argCount": 5
+    },
+    {
+      "name": "ZwCreateProcessEx",
+      "argCount": 0
+    },
+    {
+      "name": "ZwCreateSection",
+      "argCount": 7
+    },
+    {
+      "name": "ZwCreateSectionEx",
+      "argCount": 9
+    },
+    {
+      "name": "ZwCreateSemaphore",
+      "argCount": 5
+    },
+    {
+      "name": "ZwCreateSymbolicLinkObject",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateThread",
+      "argCount": 8
+    },
+    {
+      "name": "ZwCreateThreadEx",
+      "argCount": 11
+    },
+    {
+      "name": "ZwCreateTimer",
+      "argCount": 4
+    },
+    {
+      "name": "ZwCreateToken",
+      "argCount": 13
+    },
+    {
+      "name": "ZwCreateTransaction",
+      "argCount": 10
+    },
+    {
+      "name": "ZwCreateUserProcess",
+      "argCount": 11
+    },
+    {
+      "name": "ZwDebugActiveProcess",
+      "argCount": 2
+    },
+    {
+      "name": "ZwDebugContinue",
+      "argCount": 3
+    },
+    {
+      "name": "ZwDelayExecution",
+      "argCount": 2
+    },
+    {
+      "name": "ZwDeleteAtom",
+      "argCount": 1
+    },
+    {
+      "name": "ZwDeleteFile",
+      "argCount": 1
+    },
+    {
+      "name": "ZwDeleteKey",
+      "argCount": 1
+    },
+    {
+      "name": "ZwDeleteValueKey",
+      "argCount": 2
+    },
+    {
+      "name": "ZwDeviceIoControlFile",
+      "argCount": 10
+    },
+    {
+      "name": "ZwDisplayString",
+      "argCount": 1
+    },
+    {
+      "name": "ZwDuplicateObject",
+      "argCount": 7
+    },
+    {
+      "name": "ZwDuplicateToken",
+      "argCount": 6
+    },
+    {
+      "name": "ZwEnumerateKey",
+      "argCount": 6
+    },
+    {
+      "name": "ZwEnumerateValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "ZwFilterToken",
+      "argCount": 6
+    },
+    {
+      "name": "ZwFindAtom",
+      "argCount": 3
+    },
+    {
+      "name": "ZwFlushBuffersFile",
+      "argCount": 2
+    },
+    {
+      "name": "ZwFlushBuffersFileEx",
+      "argCount": 5
+    },
+    {
+      "name": "ZwFlushInstructionCache",
+      "argCount": 3
+    },
+    {
+      "name": "ZwFlushKey",
+      "argCount": 1
+    },
+    {
+      "name": "ZwFlushProcessWriteBuffers",
+      "argCount": 0
+    },
+    {
+      "name": "ZwFlushVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "ZwFreeVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "ZwFsControlFile",
+      "argCount": 10
+    },
+    {
+      "name": "ZwGetContextThread",
+      "argCount": 2
+    },
+    {
+      "name": "ZwGetCurrentProcessorNumber",
+      "argCount": 0
+    },
+    {
+      "name": "ZwGetNextProcess",
+      "argCount": 5
+    },
+    {
+      "name": "ZwGetNextThread",
+      "argCount": 6
+    },
+    {
+      "name": "ZwGetNlsSectionPtr",
+      "argCount": 5
+    },
+    {
+      "name": "ZwGetWriteWatch",
+      "argCount": 7
+    },
+    {
+      "name": "ZwImpersonateAnonymousToken",
+      "argCount": 1
+    },
+    {
+      "name": "ZwImpersonateClientOfPort",
+      "argCount": 2
+    },
+    {
+      "name": "ZwInitializeNlsFiles",
+      "argCount": 3
+    },
+    {
+      "name": "ZwInitiatePowerAction",
+      "argCount": 4
+    },
+    {
+      "name": "ZwIsProcessInJob",
+      "argCount": 2
+    },
+    {
+      "name": "ZwListenPort",
+      "argCount": 2
+    },
+    {
+      "name": "ZwLoadDriver",
+      "argCount": 1
+    },
+    {
+      "name": "ZwLoadKey",
+      "argCount": 2
+    },
+    {
+      "name": "ZwLoadKey2",
+      "argCount": 3
+    },
+    {
+      "name": "ZwLoadKeyEx",
+      "argCount": 8
+    },
+    {
+      "name": "ZwLockFile",
+      "argCount": 10
+    },
+    {
+      "name": "ZwLockVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "ZwMakePermanentObject",
+      "argCount": 1
+    },
+    {
+      "name": "ZwMakeTemporaryObject",
+      "argCount": 1
+    },
+    {
+      "name": "ZwMapUserPhysicalPagesScatter",
+      "argCount": 0
+    },
+    {
+      "name": "ZwMapViewOfSection",
+      "argCount": 10
+    },
+    {
+      "name": "ZwMapViewOfSectionEx",
+      "argCount": 9
+    },
+    {
+      "name": "ZwNotifyChangeDirectoryFile",
+      "argCount": 9
+    },
+    {
+      "name": "ZwNotifyChangeKey",
+      "argCount": 10
+    },
+    {
+      "name": "ZwNotifyChangeMultipleKeys",
+      "argCount": 12
+    },
+    {
+      "name": "ZwOpenDirectoryObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenEvent",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenFile",
+      "argCount": 6
+    },
+    {
+      "name": "ZwOpenIoCompletion",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenJobObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenKey",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenKeyedEvent",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenKeyEx",
+      "argCount": 4
+    },
+    {
+      "name": "ZwOpenKeyTransacted",
+      "argCount": 4
+    },
+    {
+      "name": "ZwOpenKeyTransactedEx",
+      "argCount": 5
+    },
+    {
+      "name": "ZwOpenMutant",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenProcess",
+      "argCount": 4
+    },
+    {
+      "name": "ZwOpenProcessToken",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenProcessTokenEx",
+      "argCount": 4
+    },
+    {
+      "name": "ZwOpenSection",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenSemaphore",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenSymbolicLinkObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwOpenThread",
+      "argCount": 4
+    },
+    {
+      "name": "ZwOpenThreadToken",
+      "argCount": 4
+    },
+    {
+      "name": "ZwOpenThreadTokenEx",
+      "argCount": 5
+    },
+    {
+      "name": "ZwOpenTimer",
+      "argCount": 3
+    },
+    {
+      "name": "ZwPowerInformation",
+      "argCount": 5
+    },
+    {
+      "name": "ZwPrivilegeCheck",
+      "argCount": 3
+    },
+    {
+      "name": "ZwProtectVirtualMemory",
+      "argCount": 5
+    },
+    {
+      "name": "ZwPulseEvent",
+      "argCount": 2
+    },
+    {
+      "name": "ZwQueryAttributesFile",
+      "argCount": 2
+    },
+    {
+      "name": "ZwQueryDefaultLocale",
+      "argCount": 2
+    },
+    {
+      "name": "ZwQueryDefaultUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "ZwQueryDirectoryFile",
+      "argCount": 11
+    },
+    {
+      "name": "ZwQueryDirectoryObject",
+      "argCount": 7
+    },
+    {
+      "name": "ZwQueryEaFile",
+      "argCount": 9
+    },
+    {
+      "name": "ZwQueryEvent",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryFullAttributesFile",
+      "argCount": 2
+    },
+    {
+      "name": "ZwQueryInformationAtom",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryInformationJobObject",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryInformationProcess",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryInformationThread",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryInformationToken",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryInstallUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "ZwQueryIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryKey",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryLicenseValue",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryMultipleValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "ZwQueryMutant",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryObject",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryPerformanceCounter",
+      "argCount": 2
+    },
+    {
+      "name": "ZwQuerySection",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQuerySecurityObject",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQuerySemaphore",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQuerySymbolicLinkObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwQuerySystemEnvironmentValue",
+      "argCount": 4
+    },
+    {
+      "name": "ZwQuerySystemEnvironmentValueEx",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQuerySystemInformation",
+      "argCount": 4
+    },
+    {
+      "name": "ZwQuerySystemInformationEx",
+      "argCount": 6
+    },
+    {
+      "name": "ZwQuerySystemTime",
+      "argCount": 1
+    },
+    {
+      "name": "ZwQueryTimer",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueryTimerResolution",
+      "argCount": 3
+    },
+    {
+      "name": "ZwQueryValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "ZwQueryVirtualMemory",
+      "argCount": 6
+    },
+    {
+      "name": "ZwQueryVolumeInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueueApcThread",
+      "argCount": 5
+    },
+    {
+      "name": "ZwQueueApcThreadEx",
+      "argCount": 6
+    },
+    {
+      "name": "ZwQueueApcThreadEx2",
+      "argCount": 7
+    },
+    {
+      "name": "ZwRaiseException",
+      "argCount": 3
+    },
+    {
+      "name": "ZwRaiseHardError",
+      "argCount": 6
+    },
+    {
+      "name": "ZwReadFile",
+      "argCount": 9
+    },
+    {
+      "name": "ZwReadFileScatter",
+      "argCount": 9
+    },
+    {
+      "name": "ZwReadRequestData",
+      "argCount": 6
+    },
+    {
+      "name": "ZwReadVirtualMemory",
+      "argCount": 5
+    },
+    {
+      "name": "ZwRegisterThreadTerminatePort",
+      "argCount": 1
+    },
+    {
+      "name": "ZwReleaseKeyedEvent",
+      "argCount": 4
+    },
+    {
+      "name": "ZwReleaseMutant",
+      "argCount": 2
+    },
+    {
+      "name": "ZwReleaseSemaphore",
+      "argCount": 3
+    },
+    {
+      "name": "ZwRemoveIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "ZwRemoveIoCompletionEx",
+      "argCount": 6
+    },
+    {
+      "name": "ZwRemoveProcessDebug",
+      "argCount": 2
+    },
+    {
+      "name": "ZwRenameKey",
+      "argCount": 2
+    },
+    {
+      "name": "ZwReplaceKey",
+      "argCount": 3
+    },
+    {
+      "name": "ZwReplyPort",
+      "argCount": 2
+    },
+    {
+      "name": "ZwReplyWaitReceivePort",
+      "argCount": 4
+    },
+    {
+      "name": "ZwReplyWaitReceivePortEx",
+      "argCount": 5
+    },
+    {
+      "name": "ZwRequestWaitReplyPort",
+      "argCount": 3
+    },
+    {
+      "name": "ZwResetEvent",
+      "argCount": 2
+    },
+    {
+      "name": "ZwResetWriteWatch",
+      "argCount": 3
+    },
+    {
+      "name": "ZwRestoreKey",
+      "argCount": 3
+    },
+    {
+      "name": "ZwResumeProcess",
+      "argCount": 1
+    },
+    {
+      "name": "ZwResumeThread",
+      "argCount": 2
+    },
+    {
+      "name": "ZwRollbackTransaction",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSaveKey",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSecureConnectPort",
+      "argCount": 9
+    },
+    {
+      "name": "ZwSetContextThread",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSetDebugFilterState",
+      "argCount": 3
+    },
+    {
+      "name": "ZwSetDefaultLocale",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSetDefaultUILanguage",
+      "argCount": 1
+    },
+    {
+      "name": "ZwSetEaFile",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetEvent",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSetEventBoostPriority",
+      "argCount": 1
+    },
+    {
+      "name": "ZwSetInformationDebugObject",
+      "argCount": 5
+    },
+    {
+      "name": "ZwSetInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "ZwSetInformationJobObject",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetInformationKey",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetInformationObject",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetInformationProcess",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetInformationThread",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetInformationToken",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSetInformationVirtualMemory",
+      "argCount": 6
+    },
+    {
+      "name": "ZwSetIntervalProfile",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSetIoCompletion",
+      "argCount": 5
+    },
+    {
+      "name": "ZwSetIoCompletionEx",
+      "argCount": 6
+    },
+    {
+      "name": "ZwSetLdtEntries",
+      "argCount": 6
+    },
+    {
+      "name": "ZwSetSecurityObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwSetSystemInformation",
+      "argCount": 3
+    },
+    {
+      "name": "ZwSetSystemTime",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSetThreadExecutionState",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSetTimer",
+      "argCount": 7
+    },
+    {
+      "name": "ZwSetTimerResolution",
+      "argCount": 3
+    },
+    {
+      "name": "ZwSetValueKey",
+      "argCount": 6
+    },
+    {
+      "name": "ZwSetVolumeInformationFile",
+      "argCount": 5
+    },
+    {
+      "name": "ZwShutdownSystem",
+      "argCount": 1
+    },
+    {
+      "name": "ZwSignalAndWaitForSingleObject",
+      "argCount": 4
+    },
+    {
+      "name": "ZwSuspendProcess",
+      "argCount": 1
+    },
+    {
+      "name": "ZwSuspendThread",
+      "argCount": 2
+    },
+    {
+      "name": "ZwSystemDebugControl",
+      "argCount": 6
+    },
+    {
+      "name": "ZwTerminateJobObject",
+      "argCount": 2
+    },
+    {
+      "name": "ZwTerminateProcess",
+      "argCount": 2
+    },
+    {
+      "name": "ZwTerminateThread",
+      "argCount": 2
+    },
+    {
+      "name": "ZwTestAlert",
+      "argCount": 0
+    },
+    {
+      "name": "ZwTraceControl",
+      "argCount": 6
+    },
+    {
+      "name": "ZwTraceEvent",
+      "argCount": 0
+    },
+    {
+      "name": "ZwUnloadDriver",
+      "argCount": 1
+    },
+    {
+      "name": "ZwUnloadKey",
+      "argCount": 1
+    },
+    {
+      "name": "ZwUnlockFile",
+      "argCount": 5
+    },
+    {
+      "name": "ZwUnlockVirtualMemory",
+      "argCount": 4
+    },
+    {
+      "name": "ZwUnmapViewOfSection",
+      "argCount": 2
+    },
+    {
+      "name": "ZwUnmapViewOfSectionEx",
+      "argCount": 3
+    },
+    {
+      "name": "ZwWaitForAlertByThreadId",
+      "argCount": 2
+    },
+    {
+      "name": "ZwWaitForDebugEvent",
+      "argCount": 4
+    },
+    {
+      "name": "ZwWaitForKeyedEvent",
+      "argCount": 4
+    },
+    {
+      "name": "ZwWaitForMultipleObjects",
+      "argCount": 5
+    },
+    {
+      "name": "ZwWaitForMultipleObjects32",
+      "argCount": 0
+    },
+    {
+      "name": "ZwWaitForSingleObject",
+      "argCount": 3
+    },
+    {
+      "name": "ZwWorkerFactoryWorkerReady",
+      "argCount": 1
+    },
+    {
+      "name": "ZwWow64AllocateVirtualMemory64",
+      "argCount": 7
+    },
+    {
+      "name": "ZwWow64GetNativeSystemInformation",
+      "argCount": 4
+    },
+    {
+      "name": "ZwWow64IsProcessorFeaturePresent",
+      "argCount": 1
+    },
+    {
+      "name": "ZwWow64QueryInformationProcess64",
+      "argCount": 5
+    },
+    {
+      "name": "ZwWow64ReadVirtualMemory64",
+      "argCount": 7
+    },
+    {
+      "name": "ZwWow64WriteVirtualMemory64",
+      "argCount": 7
+    },
+    {
+      "name": "ZwWriteFile",
+      "argCount": 9
+    },
+    {
+      "name": "ZwWriteFileGather",
+      "argCount": 9
+    },
+    {
+      "name": "ZwWriteRequestData",
+      "argCount": 6
+    },
+    {
+      "name": "ZwWriteVirtualMemory",
+      "argCount": 5
+    },
+    {
+      "name": "ZwYieldExecution",
+      "argCount": 0
+    }
+  ]
+}

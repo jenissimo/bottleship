@@ -1,15 +1,20 @@
 import {
     DDPF_ALPHAPIXELS,
     DDPF_FOURCC,
+    DDPF_PALETTEINDEXED_ANY,
     DDPF_PALETTEINDEXED8,
     DDPF_RGB,
+    DDPF_ZBUFFER,
     DDSD_CAPS,
     DDSD_HEIGHT,
     DDSD_LPSURFACE,
+    DDSD_CKSRCBLT,
+    DDSD_CKDESTBLT,
     DDSD_PITCH,
     DDSD_PIXELFORMAT,
     DDSD_REFRESHRATE,
     DDSD_WIDTH,
+    DDSD_ZBUFFERBITDEPTH,
     DDSURFACEDESC_SIZE,
     DDSURFACEDESC_OFFSETS,
     DDSURFACEDESC2_SIZE,
@@ -43,6 +48,9 @@ export type SurfaceDesc = {
     surfacePtr: number;
     pixelFormat: SurfaceFormat | null;
     srcColorKey?: { low: number; high: number };  // ddckCKSrcBlt from DDSURFACEDESC2
+    /** The caller set DDSD_CK*BLT with low != high. No DirectDraw hardware supports a
+     *  range key, so CreateSurface must answer DDERR_NOCOLORKEYHW rather than create it. */
+    colorKeyRangeDeclared?: boolean;
     destColorKey?: { low: number; high: number }; // ddckCKDestBlt from DDSURFACEDESC2
     mipMapCount?: number;      // dwMipMapCount (for textures with mipmaps)
     textureStage?: number;     // dwTextureStage (for multi-texture rendering)
@@ -88,13 +96,16 @@ export const computePitch = (width: number, bpp: number): number => {
     return (rowBytes + 31) & ~31;
 };
 
+/**
+ * Read a DDPIXELFORMAT. dwSize is deliberately NOT consulted: DDPIXELFORMAT is an embedded
+ * fixed-size member of DDSURFACEDESC(2), so the OUTER dwSize is the version discriminator —
+ * the one readSurfaceDesc's `hasField(pixelFormat, 32)` already gates on. Real DDraw dispatches
+ * on dwFlags alone (Wine wined3dformat_from_ddrawformat never reads the member's dwSize), and
+ * an engine that memsets the descriptor and fills only dwFlags+dwFourCC is a legal caller.
+ * Defaulting on a zero dwSize turned every such descriptor into RGB565 silently.
+ */
 export const readPixelFormat = (mem: Uint8Array, address: number): SurfaceFormat => {
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const size = view.getUint32(address + DDPIXELFORMAT_OFFSETS.size, true);
-    if (size < 32) {
-        return createDefaultPixelFormat(16);
-    }
-
     const flags = view.getUint32(address + DDPIXELFORMAT_OFFSETS.flags, true);
     const fourCC = view.getUint32(address + DDPIXELFORMAT_OFFSETS.fourCC, true);
     const bpp = view.getUint32(address + DDPIXELFORMAT_OFFSETS.rgbBitCount, true);
@@ -102,6 +113,22 @@ export const readPixelFormat = (mem: Uint8Array, address: number): SurfaceFormat
     const gMask = view.getUint32(address + DDPIXELFORMAT_OFFSETS.gMask, true);
     const bMask = view.getUint32(address + DDPIXELFORMAT_OFFSETS.bMask, true);
     const rawAMask = view.getUint32(address + DDPIXELFORMAT_OFFSETS.aMask, true);
+
+    // DDPF_FOURCC: dwFourCC alone names the layout. dwRGBBitCount and the masks carry
+    // nothing by contract (a block format has no bits per pixel), so report them as the
+    // zeroes a real driver reports — getSurfaceFormatLayout/decodeSurfaceFormatToRgba8
+    // route off the FourCC, and detectPixelFormat short-circuits on the flag.
+    if ((flags & DDPF_FOURCC) !== 0) {
+        return { flags, fourCC, bpp, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+    }
+
+    // DDPF_PALETTEINDEXED*: the texel is an index and dwRGBBitCount is its width; the masks
+    // are not part of the format. (P8 is enumerated as PALETTEINDEXED8|RGB, so this must be
+    // tested before the RGB branch below.)
+    if ((flags & DDPF_PALETTEINDEXED_ANY) !== 0) {
+        return { flags, bpp: bpp || 8, rMask: 0, gMask: 0, bMask: 0, aMask: 0 };
+    }
+
     // Per DDraw spec, dwRGBAlphaBitMask is only valid when DDPF_ALPHAPIXELS is set.
     // Without this flag, the field is a union member for other purposes and may contain garbage.
     // Some games select XRGB1555 (no alpha) but the aMask field may read as 0x8000,
@@ -117,14 +144,56 @@ export const readPixelFormat = (mem: Uint8Array, address: number): SurfaceFormat
             `R=0x${rMask.toString(16)} G=0x${gMask.toString(16)} B=0x${bMask.toString(16)}`);
     }
 
+    // DDPF_ZBUFFER: every mask field is a different union member here — dwStencilBitDepth over
+    // dwRBitMask, dwZBitMask over dwGBitMask, dwStencilBitMask over dwBBitMask — so the RGB
+    // fallbacks below would fabricate colour masks over depth data.
+    // dwZBufferBitDepth is the DEPTH, not the surface width: a driver may name X8D24 with 24
+    // (which is why EnumZBufferFormats offers both spellings), and its pitch is a 32-bpp pitch
+    // either way. Anything deeper than 16 bits is therefore 4 bytes per pixel.
+    if ((flags & DDPF_ZBUFFER) !== 0) {
+        const zBits = bpp || (gMask > 0xffff ? 32 : 16);
+        return {
+            flags,
+            bpp: zBits <= 16 ? 16 : 32,
+            rMask,
+            gMask,
+            bMask,
+            aMask: 0,
+            zBitMask: gMask,
+            stencilBitMask: bMask,
+        };
+    }
+
+    // DDPF_RGB (and anything else that describes texels by masks). The mask fallbacks below
+    // stand in for a descriptor that claims RGB but leaves the masks zero; they are a guess,
+    // not a contract, and must never be reached by a format the flags already identify.
     return {
         flags,
-        fourCC: (flags & DDPF_FOURCC) !== 0 ? fourCC : undefined,
         bpp: bpp || 16,
         rMask: rMask || 0xf800,
         gMask: gMask || 0x07e0,
         bMask: bMask || 0x001f,
         aMask,
+    };
+};
+
+/**
+ * DDSD_ZBUFFERBITDEPTH is the pre-DX6 way to ask for a depth buffer: no DDPIXELFORMAT at all,
+ * just the depth in the union at offset 24. Real DDraw expands it into a DDPF_ZBUFFER format
+ * (wine utils.c DDSD_to_DDSD2) — without that expansion the descriptor names no pixel format
+ * and the surface is created at the display's COLOUR depth instead.
+ */
+const zBufferFormatFromBitDepth = (depth: number): SurfaceFormat => {
+    const zBitMask = depth >= 32 || depth <= 0 ? 0xffffffff : ((0xffffffff >>> (32 - depth)) >>> 0);
+    return {
+        flags: DDPF_ZBUFFER,
+        bpp: depth > 0 && depth <= 16 ? 16 : 32,
+        rMask: 0,
+        gMask: zBitMask,
+        bMask: 0,
+        aMask: 0,
+        zBitMask,
+        stencilBitMask: 0,
     };
 };
 
@@ -197,20 +266,41 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     const alphaBitDepth = hasField(DDSURFACEDESC2_OFFSETS.dwAlphaBitDepth) ? view.getUint32(address + DDSURFACEDESC2_OFFSETS.dwAlphaBitDepth, true) : undefined;
 
     const pixelFormatAddr = address + DDSURFACEDESC2_OFFSETS.pixelFormat;
-    const pixelFormat =
+    let pixelFormat =
         flags & DDSD_PIXELFORMAT && hasField(DDSURFACEDESC2_OFFSETS.pixelFormat, 32)
             ? readPixelFormat(mem, pixelFormatAddr)
             : null;
+    // A DDSURFACEDESC (v1) may ask for depth the pre-DX6 way — DDSD_ZBUFFERBITDEPTH and no
+    // DDPIXELFORMAT. dwSize is what tells the two structs apart; in a DDSURFACEDESC2 the same
+    // union is dwMipMapCount/dwSrcVBHandle and the flag has no meaning there.
+    if (!pixelFormat && size < DDSURFACEDESC2_SIZE && (flags & DDSD_ZBUFFERBITDEPTH)
+        && hasField(DDSURFACEDESC_OFFSETS.dwRefreshRate)) {
+        pixelFormat = zBufferFormatFromBitDepth(view.getUint32(address + DDSURFACEDESC_OFFSETS.dwRefreshRate, true));
+    }
 
     // Read colorkey fields if structure is large enough (DDCOLORKEY = 8 bytes each)
     let srcColorKey: { low: number; high: number } | undefined;
     let destColorKey: { low: number; high: number } | undefined;
+    /** The caller DECLARED a range key. Hardware fails the create; see below. */
+    let srcColorKeyRange = false;
+    let destColorKeyRange = false;
+    // DDSD_CK*BLT is what makes the field valid — and it is the ONLY way to state a
+    // BLACK key, which is the era's default for sprite sheets. Falling back to
+    // "nonzero means present" alone silently drops key=0x0, so a DX2/3 title that
+    // creates its UI textures with a black source key renders every keyed texel as
+    // an opaque black box. The nonzero fallback stays for descs that fill the field
+    // without setting the flag.
     if (hasField(DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt, 8)) {
         const srcLow = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt, true);
         const srcHigh = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKSrcBlt + 4, true);
-        // Only store if not zero (0x0-0x0 means "no colorkey")
-        if (srcLow !== 0 || srcHigh !== 0) {
-            srcColorKey = { low: srcLow, high: srcHigh };
+        if ((flags & DDSD_CKSRCBLT) !== 0 || srcLow !== 0 || srcHigh !== 0) {
+            // A colour key is a single value on every DirectDraw implementation, so the
+            // key we carry is always degenerate — see the range note in SetColorKey. The
+            // DECLARED range is kept separately because CreateSurface must refuse it, and
+            // only when the caller actually set the flag: the nonzero fallback above reads
+            // a field the caller never claimed, and stack garbage must not fail a create.
+            srcColorKey = { low: srcLow, high: srcHigh === srcLow ? srcHigh : srcLow };
+            if ((flags & DDSD_CKSRCBLT) !== 0 && srcHigh !== srcLow) srcColorKeyRange = true;
             Logger.verbose(LogCategory.DDRAW,
                 `readSurfaceDesc: Found srcColorKey 0x${srcLow.toString(16)}-0x${srcHigh.toString(16)}`
             );
@@ -219,8 +309,9 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
     if (hasField(DDSURFACEDESC2_OFFSETS.ddckCKDestBlt, 8)) {
         const destLow = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKDestBlt, true);
         const destHigh = view.getUint32(address + DDSURFACEDESC2_OFFSETS.ddckCKDestBlt + 4, true);
-        if (destLow !== 0 || destHigh !== 0) {
-            destColorKey = { low: destLow, high: destHigh };
+        if ((flags & DDSD_CKDESTBLT) !== 0 || destLow !== 0 || destHigh !== 0) {
+            destColorKey = { low: destLow, high: destHigh === destLow ? destHigh : destLow };
+            if ((flags & DDSD_CKDESTBLT) !== 0 && destHigh !== destLow) destColorKeyRange = true;
             Logger.verbose(LogCategory.DDRAW,
                 `readSurfaceDesc: Found destColorKey 0x${destLow.toString(16)}-0x${destHigh.toString(16)}`
             );
@@ -242,6 +333,7 @@ export const readSurfaceDesc = (mem: Uint8Array, address: number): SurfaceDesc |
         pixelFormat,
         srcColorKey,
         destColorKey,
+        colorKeyRangeDeclared: srcColorKeyRange || destColorKeyRange ? true : undefined,
         mipMapCount: mipMapCount !== undefined && mipMapCount !== 0 ? mipMapCount : undefined,
         textureStage: textureStage !== undefined ? textureStage : undefined,
         alphaBitDepth: alphaBitDepth !== undefined && alphaBitDepth !== 0 ? alphaBitDepth : undefined,
@@ -288,7 +380,6 @@ export const writeSurfaceDesc = (
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.size, targetSize, true);
     }
     // Build flags based on what we actually write (not what game sent)
-    // Old engines check flags strictly - if DDSD_LPSURFACE is set but DDSD_PITCH is missing, they won't write
     let flags = desc.flags ?? 0;
     
     // We always write these fields — flags must be set
@@ -302,13 +393,13 @@ export const writeSurfaceDesc = (
     // We write caps if provided
     if (desc.caps) flags |= DDSD_CAPS;
     
-    // If lpSurface is provided, MUST also have PITCH and other flags
+    // Windows fills lpSurface but never reports DDSD_LPSURFACE in a desc it returns (Wine
+    // ddraw4.c test_set_surface_desc). An app that feeds such a desc back into CreateSurface
+    // would otherwise ask for user memory aliasing the surface it came from.
+    flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_LPSURFACE;
-        flags |= DDSD_PITCH; // Absolutely required if lpSurface is set
-        flags |= DDSD_PIXELFORMAT; // Also required
+        flags |= DDSD_PITCH;
         if (desc.caps) flags |= DDSD_CAPS;
-        Logger.verbose(LogCategory.DDRAW, `writeSurfaceDesc: adding DDSD_LPSURFACE, flags=0x${flags.toString(16)}, surfacePtr=0x${desc.surfacePtr.toString(16)}, lpSurface_offset=${DDSURFACEDESC2_OFFSETS.lpSurface}`);
     }
     if (canWrite(DDSURFACEDESC2_OFFSETS.flags)) {
         view.setUint32(address + DDSURFACEDESC2_OFFSETS.flags, flags, true);
@@ -387,10 +478,15 @@ export const readSurfaceDescV1 = (mem: Uint8Array, address: number): SurfaceDesc
     // DDSCAPS is 4 bytes in v1 (vs 16 bytes DDSCAPS2 in v2), so we only read first 4 bytes
     const caps = hasField(DDSURFACEDESC_OFFSETS.caps) ? view.getUint32(address + DDSURFACEDESC_OFFSETS.caps, true) : 0;
     const pixelFormatAddr = address + DDSURFACEDESC_OFFSETS.pixelFormat;
-    const pixelFormat =
+    let pixelFormat =
         flags & DDSD_PIXELFORMAT && hasField(DDSURFACEDESC_OFFSETS.pixelFormat, 32)
             ? readPixelFormat(mem, pixelFormatAddr)
             : null;
+    // dwZBufferBitDepth shares the union at offset 24 with dwRefreshRate/dwMipMapCount, and
+    // DDSD_PIXELFORMAT is absent when an app asks for depth this way.
+    if (!pixelFormat && (flags & DDSD_ZBUFFERBITDEPTH) && hasField(DDSURFACEDESC_OFFSETS.dwRefreshRate)) {
+        pixelFormat = zBufferFormatFromBitDepth(view.getUint32(address + DDSURFACEDESC_OFFSETS.dwRefreshRate, true));
+    }
 
     return {
         size,
@@ -436,10 +532,9 @@ export const writeSurfaceDescV1 = (
     flags |= DDSD_PIXELFORMAT;
     if (desc.caps) flags |= DDSD_CAPS;
     
+    flags &= ~DDSD_LPSURFACE;
     if (desc.surfacePtr && desc.surfacePtr > 0) {
-        flags |= DDSD_LPSURFACE;
         flags |= DDSD_PITCH;
-        flags |= DDSD_PIXELFORMAT;
         if (desc.caps) flags |= DDSD_CAPS;
     }
     

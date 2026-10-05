@@ -17,10 +17,37 @@
  * use for the MVP. Up to FFP_MAX_LIGHTS enabled lights contribute.
  */
 
+import { pixelCenterOffsetPx, writeMvpWithPixelCenter } from "../pixel-center";
+
 // D3DLIGHTTYPE
 export const D3DLIGHT_POINT = 1;
 export const D3DLIGHT_SPOT = 2;
 export const D3DLIGHT_DIRECTIONAL = 3;
+
+/** D3DFORMATs with NO alpha channel — sampling one returns alpha 1.0 on real D3D, so the
+ *  stage's texture alpha must be forced to 1 rather than read off our RGBA copy. Shared by
+ *  the D3D9 and D3D8 hybrid (VS + fixed-function pixel) draw-state gathers, so a format's
+ *  alpha-less-ness cannot drift between the two backends.
+ *
+ *  D3DFMT_P8 (41) is NOT here: an 8-bit palettized texture carries alpha through
+ *  PALETTEENTRY.peFlags, and masking it makes every palettized texel opaque. */
+export const D3D_ALPHALESS_FORMATS = new Set([
+    20,  // R8G8B8
+    22,  // X8R8G8B8
+    23,  // R5G6B5
+    24,  // X1R5G5B5
+    27,  // R3G3B2
+    30,  // X4R4G4B4
+    33,  // X8B8G8R8
+    34,  // G16R16
+    50,  // L8
+    62,  // X8L8V8U8
+    81,  // L16
+    111, // R16F
+    112, // G16R16F
+    114, // R32F
+    115, // G32R32F
+]);
 
 // D3DMATERIALCOLORSOURCE
 export const D3DMCS_MATERIAL = 0;
@@ -40,10 +67,75 @@ const TAIL_START = HEADER_FLOATS + LIGHT_FLOATS * FFP_MAX_LIGHTS; // 292
 const OFF_WORLD = TAIL_START;      // mat4x4 — WORLD only (D3DTS_WORLD), for world-space clipping
 const OFF_CLIP_PLANES = OFF_WORLD + 16; // 308: array<vec4, 6> = 24 floats (raw plane equations)
 const CLIP_PLANE_COUNT = 6;
-export const FFP_UNIFORM_FLOATS = OFF_CLIP_PLANES + CLIP_PLANE_COUNT * 4; // 332
-export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4; // 1328
+// Texture stage 0 ops/args + TEXTUREFACTOR (D3DTSS_* / D3DRS_TEXTUREFACTOR).
+const OFF_TFACTOR = OFF_CLIP_PLANES + CLIP_PLANE_COUNT * 4; // 332: TEXTUREFACTOR rgba
+/**
+ * Texture blend stages. D3DCAPS9 advertises MaxTextureBlendStages = 8 (caps.ts ships a real
+ * hardware dump), so the FFP must be able to honor 8 — same reasoning that pinned
+ * MaxActiveLights to FFP_MAX_LIGHTS. Each stage is two vec4:
+ *   a = colorOp, colorArg1, colorArg2, alphaOp
+ *   b = alphaArg1, alphaArg2, texOpaqueAlpha, packedArg0
+ * `packedArg0` carries D3DTSS_COLORARG0 | ALPHAARG0 << 8 | (RESULTARG == D3DTA_TEMP) << 16.
+ * Three fields in one word because a D3DTA selector is 6 bits and a float32 holds an integer
+ * of that width exactly — widening FfpStage to a third vec4 would move ffpStageOffset, which
+ * callers index directly.
+ * A shader is generated for only as many stages as the draw actually uses (D3D's cascade
+ * stops at the first COLOROP=DISABLE), so the tail of this array is simply never read.
+ */
+export const FFP_MAX_STAGES = 8;
+/** D3DTA_* argument selector: low 4 bits pick the register, the bits above are modifiers. */
+export const D3DTA_SELECTMASK = 0xf;
+export const D3DTA_TEMP = 5;
+const STAGE_FLOATS = 8;
+const OFF_STAGES = OFF_TFACTOR + 4;                        // 336
+/** Float index of stage `s`'s first vec4 (a); its second vec4 (b) is +4. */
+export const ffpStageOffset = (stage: number): number => OFF_STAGES + stage * STAGE_FLOATS;
+// Fog: colour + (start, end, density, mode) — see ffp-fog.ts for the mode encoding.
+const OFF_FOG_COLOR = OFF_STAGES + FFP_MAX_STAGES * STAGE_FLOATS; // 400
+const OFF_FOG_PARAMS = OFF_FOG_COLOR + 4;                         // 404
+// Normal matrix: the inverse-transpose of worldView (upper-left 3×3), so a non-uniform world
+// scale rotates normals correctly instead of shearing them. Appended last for the same reason
+// the tail block is: nothing before it (notably ffpStageOffset) may shift.
+const OFF_NORMAL_MATRIX = OFF_FOG_PARAMS + 4;                     // 408
+/**
+ * Per-stage texture-coordinate generation: one vec4 holding the RAW D3DTSS_TEXCOORDINDEX and
+ * D3DTSS_TEXTURETRANSFORMFLAGS. They live here rather than in FfpStage because FfpStage is the
+ * fragment-side combiner and these are consumed by the vertex stage — and because widening
+ * FfpStage would move ffpStageOffset, which callers index directly.
+ */
+const OFF_TEXGEN = OFF_NORMAL_MATRIX + 16;                        // 424
+const TEXGEN_FLOATS = 4;
+/**
+ * D3DTS_TEXTURE0..7. One matrix per blend stage, unlike the DDraw backend's three: that cap is
+ * a legacy uniform-slot budget, whereas this block is sized from FFP_MAX_STAGES, so no stage can
+ * silently lose its transform. The cost is 512 bytes per FFP draw state.
+ */
+export const FFP_MAX_TEX_MATRICES = FFP_MAX_STAGES;
+const OFF_TEX_MATRICES = OFF_TEXGEN + FFP_MAX_STAGES * TEXGEN_FLOATS; // 456
+const OFF_STAGE_CONSTANTS = OFF_TEX_MATRICES + FFP_MAX_TEX_MATRICES * 16;
+export const FFP_STAGE_CONSTANT_FLOATS = FFP_MAX_STAGES * 4;
+/** World-matrix palette used by D3DRS_VERTEXBLEND / D3DRS_INDEXEDVERTEXBLENDENABLE. */
+export const FFP_MAX_BLEND_MATRICES = 8;
+const OFF_BLEND_MATRICES = OFF_STAGE_CONSTANTS + FFP_STAGE_CONSTANT_FLOATS;
+/** x = D3DRS_VERTEXBLEND, y = indexed-enable, z = D3DRS_TWEENFACTOR, w = matrix count. */
+const OFF_BLEND_CONTROL = OFF_BLEND_MATRICES + FFP_MAX_BLEND_MATRICES * 16;
+// Both totals are derived; ffp-lighting.test.ts pins them against the WGSL struct's own
+// layout, which is the check a written-down number here would only pretend to be.
+export const FFP_UNIFORM_FLOATS = OFF_BLEND_CONTROL + 4;
 
-const OFF_VIEWPORT = 0;        // vec4: w, h, 0, 0
+/** Float index of stage `s`'s texgen vec4 (rawTexCoordIndex, textureTransformFlags, 0, 0). */
+export const ffpTexGenOffset = (stage: number): number => OFF_TEXGEN + stage * TEXGEN_FLOATS;
+/** Float index of stage `s`'s 4×4 texture matrix. */
+export const ffpTexMatrixOffset = (stage: number): number => OFF_TEX_MATRICES + stage * 16;
+/** Float index of stage `s`'s D3DTSS_CONSTANT colour. */
+export const ffpStageConstantOffset = (stage: number): number => OFF_STAGE_CONSTANTS + stage * 4;
+/** Float offset of world-matrix palette entry `index` (D3DTS_WORLDMATRIX(index)). */
+export const ffpBlendMatrixOffset = (index: number): number => OFF_BLEND_MATRICES + index * 16;
+/** Float offset of the vertex-blend control vec4. */
+export const ffpBlendControlOffset = (): number => OFF_BLEND_CONTROL;
+export const FFP_UNIFORM_BYTES = FFP_UNIFORM_FLOATS * 4;
+
+const OFF_VIEWPORT = 0;        // vec4: w, h, pixelCentreOffsetPx, 0
 const OFF_MVP = 4;             // mat4x4
 const OFF_WORLDVIEW = 20;      // mat4x4
 const OFF_MAT_DIFFUSE = 36;    // vec4
@@ -53,7 +145,7 @@ const OFF_MAT_EMISSIVE = 48;   // vec4
 const OFF_GLOBAL_AMBIENT = 52; // vec4
 const OFF_CTRL0 = 56;          // power, lightingEnabled, specularEnable, localViewer
 const OFF_CTRL1 = 60;          // diffuseSrc, ambientSrc, specularSrc, emissiveSrc
-const OFF_CTRL2 = 64;          // numLights, hasNormal, clipPlaneEnable, 0
+const OFF_CTRL2 = 64;          // numLights, hasNormal, clipPlaneEnable, normalizeNormals
 
 // Per-light float offsets within a 28-float slot.
 const L_DIFFUSE = 0;    // vec4
@@ -65,6 +157,26 @@ const L_ATTEN = 20;     // vec4: c_att, l_att, q_att, type
 const L_SPOT = 24;      // vec4: cos(theta/2), cos(phi/2), 0, 0
 
 export interface FfpColor { r: number; g: number; b: number; a: number; }
+
+/** A zeroed colour record, for the pools the per-draw gather reuses. */
+export function newFfpColor(): FfpColor { return { r: 0, g: 0, b: 0, a: 0 }; }
+
+/** Read one float RGBA quad at `off` into `c` (D3D order: r,g,b,a, little-endian). */
+export function readFfpColor(dv: DataView, off: number, c: FfpColor): void {
+    c.r = dv.getFloat32(off, true);
+    c.g = dv.getFloat32(off + 4, true);
+    c.b = dv.getFloat32(off + 8, true);
+    c.a = dv.getFloat32(off + 12, true);
+}
+
+/** Unpack a D3DCOLOR (0xAARRGGBB) into `c` as floats. */
+export function unpackD3dColor(argb: number, c: FfpColor): FfpColor {
+    c.r = ((argb >> 16) & 0xff) / 255;
+    c.g = ((argb >> 8) & 0xff) / 255;
+    c.b = (argb & 0xff) / 255;
+    c.a = ((argb >>> 24) & 0xff) / 255;
+    return c;
+}
 
 export interface FfpMaterial {
     diffuse: FfpColor;
@@ -96,10 +208,16 @@ export interface FfpLightInput {
 export interface FfpUniformParams {
     viewportW: number;
     viewportH: number;
+    /** Physical samples per guest pixel for the target this draw lands on; the pixel-centre
+     *  offset is half a PHYSICAL pixel and the viewport above is guest-space. */
+    renderScale?: number;
     /** world × view × projection (D3D row-major, as uploaded for the MVP). */
     mvp: Float32Array;
     /** world × view (D3D row-major). */
     worldView: Float32Array;
+    /** Inverse-transpose of worldView's upper-left 3×3, widened to 4×4 (D3D row-major).
+     *  Normals are transformed by this, not by worldView (DXVK D3D9FixedFunctionVS::NormalMatrix). */
+    normalMatrix: Float32Array;
     /** view (D3D row-major) — used to transform lights world→view. */
     view: Float32Array;
     /** WORLD only (D3DTS_WORLD, D3D row-major) — used to evaluate FFP user clip planes in
@@ -121,8 +239,74 @@ export interface FfpUniformParams {
     specularSrc: number;
     emissiveSrc: number;
     hasNormal: boolean;
+    /** D3DRS_NORMALIZENORMALS. When false the transformed normal keeps its length, which
+     *  scales the diffuse/specular term — games encode brightness that way. */
+    normalizeNormals: boolean;
     /** Enabled lights, in ascending index order; only the first FFP_MAX_LIGHTS are used. */
     lights: FfpLightInput[];
+    /** Texture stage 0 combiner (D3DTSS_COLOROP/COLORARG1/COLORARG2/ALPHAOP/ALPHAARG1/ALPHAARG2).
+     *  The caller resolves the D3D stage-0 defaults. */
+    /** Active texture blend stages, stage 0 first. Only these are written; the shader is
+     *  generated for exactly this many stages, so the rest of the array is never read.
+     *  `texCoordIndex` / `texTransformFlags` are the RAW D3DTSS_TEXCOORDINDEX and
+     *  D3DTSS_TEXTURETRANSFORMFLAGS — the shader decodes the TCI_* generator and the
+     *  D3DTTFF count/PROJECTED bits, so no CPU-side pre-resolution can lose information. */
+    stages: Array<{
+        colorOp: number; colorArg1: number; colorArg2: number;
+        alphaOp: number; alphaArg1: number; alphaArg2: number;
+        /** D3DTSS_COLORARG0 / D3DTSS_ALPHAARG0 — the third operand of MULTIPLYADD and LERP. */
+        colorArg0: number; alphaArg0: number;
+        /** D3DTSS_RESULTARG: D3DTA_CURRENT (default) or D3DTA_TEMP. */
+        resultArg: number;
+        texCoordIndex: number; texTransformFlags: number;
+        /** D3DTSS_CONSTANT, selected by D3DTA_CONSTANT (base selector 6). */
+        constant?: FfpColor;
+    }>;
+    /** D3DTS_TEXTURE0..7 as one flat run of FFP_MAX_TEX_MATRICES × 16 floats (D3D row-major). */
+    texMatrices: Float32Array;
+    /** D3DRS_TEXTUREFACTOR, resolved to rgba. */
+    tfactor: FfpColor;
+    /** D3DRS_FOGCOLOR, resolved to rgb (alpha is never fogged). */
+    fogColor: FfpColor;
+    /** FOGSTART / FOGEND / FOGDENSITY as floats, plus the resolveFfpFogMode encoding. */
+    fogStart: number;
+    fogEnd: number;
+    fogDensity: number;
+    fogMode: number;
+    /** D3DTS_WORLDMATRIX(0..7), row-major. Optional until the draw enables vertex blending. */
+    blendMatrices?: Float32Array;
+    /** D3DRS_VERTEXBLEND (x), indexed-enable (y), TWEENFACTOR (z), active matrix count (w). */
+    blendVertexMode?: number;
+    blendIndexed?: boolean;
+    blendTweenFactor?: number;
+    blendMatrixCount?: number;
+}
+
+/** A params record with every field present, for the per-draw gather to overwrite in place.
+ *  Every value here is replaced before packFfpUniforms sees it. */
+export function makeFfpParams(): FfpUniformParams {
+    const m = new Float32Array(16);
+    const blendMatrices = new Float32Array(FFP_MAX_BLEND_MATRICES * 16);
+    for (let i = 0; i < FFP_MAX_BLEND_MATRICES; i++) {
+        const b = i * 16;
+        blendMatrices[b] = blendMatrices[b + 5] = blendMatrices[b + 10] = blendMatrices[b + 15] = 1;
+    }
+    return {
+        viewportW: 0, viewportH: 0, renderScale: 1,
+        mvp: m, worldView: m, normalMatrix: m, view: m, world: m,
+        clipPlanes: new Float32Array(24), clipPlaneEnable: 0,
+        material: { diffuse: newFfpColor(), ambient: newFfpColor(), specular: newFfpColor(), emissive: newFfpColor(), power: 0 },
+        globalAmbient: newFfpColor(),
+        lightingEnabled: false, specularEnable: false, localViewer: false,
+        diffuseSrc: 0, ambientSrc: 0, specularSrc: 0, emissiveSrc: 0,
+        hasNormal: false, normalizeNormals: false,
+        lights: [], stages: [],
+        texMatrices: new Float32Array(FFP_MAX_TEX_MATRICES * 16),
+        tfactor: newFfpColor(), fogColor: newFfpColor(),
+        fogStart: 0, fogEnd: 0, fogDensity: 0, fogMode: 0,
+        blendMatrices,
+        blendVertexMode: 0, blendIndexed: false, blendTweenFactor: 0, blendMatrixCount: 1,
+    };
 }
 
 /** Transform a world-space point by a D3D row-major matrix (row-vector × matrix). */
@@ -153,7 +337,11 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
 
     out[OFF_VIEWPORT] = p.viewportW;
     out[OFF_VIEWPORT + 1] = p.viewportH;
-    out.set(p.mvp.subarray(0, 16), OFF_MVP);
+    // viewport.z carries the pixel-centre offset in PIXELS for the pre-transformed branch
+    // of the FFP vertex shader; the transformed branch gets the same shift folded into the
+    // matrix below. Both come from webgpu/pixel-center.ts — see it for the equivalence.
+    out[OFF_VIEWPORT + 2] = pixelCenterOffsetPx(p.renderScale ?? 1);
+    writeMvpWithPixelCenter(out, OFF_MVP, p.mvp, p.viewportW, p.viewportH, p.renderScale ?? 1);
     out.set(p.worldView.subarray(0, 16), OFF_WORLDVIEW);
 
     const m = p.material;
@@ -178,6 +366,7 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     out[OFF_CTRL2 + 1] = p.hasNormal ? 1 : 0;
     // clipPlaneEnable rides ctrl2.z (a formerly-spare word) so no vec4 is added for it.
     out[OFF_CTRL2 + 2] = p.clipPlaneEnable >>> 0;
+    out[OFF_CTRL2 + 3] = p.normalizeNormals ? 1 : 0;
 
     for (let i = 0; i < count; i++) {
         writeLightInto(out, OFF_LIGHTS + i * LIGHT_FLOATS, p.lights[i], p.view);
@@ -187,6 +376,56 @@ export function packFfpUniforms(out: Float32Array, p: FfpUniformParams): void {
     // shader reads them only when clipPlaneEnable != 0, so an all-zero default stays inert.
     out.set(p.world.subarray(0, 16), OFF_WORLD);
     out.set(p.clipPlanes.subarray(0, CLIP_PLANE_COUNT * 4), OFF_CLIP_PLANES);
+
+    writeColor(out, OFF_TFACTOR, p.tfactor);
+
+    writeColor(out, OFF_FOG_COLOR, p.fogColor);
+    out[OFF_FOG_PARAMS] = p.fogStart;
+    out[OFF_FOG_PARAMS + 1] = p.fogEnd;
+    out[OFF_FOG_PARAMS + 2] = p.fogDensity;
+    out[OFF_FOG_PARAMS + 3] = p.fogMode;
+
+    out.set(p.normalMatrix.subarray(0, 16), OFF_NORMAL_MATRIX);
+    out.set(p.texMatrices.subarray(0, FFP_MAX_TEX_MATRICES * 16), OFF_TEX_MATRICES);
+
+    // D3DTSS_CONSTANT is a per-stage D3DCOLOR. Keep this after the historical
+    // matrix tail so ffpStageOffset and all existing frame snapshots remain stable.
+    const defaultConstant = { r: 0, g: 0, b: 0, a: 0 };
+    for (let s = 0; s < FFP_MAX_STAGES; s++) {
+        const c = p.stages[s]?.constant ?? defaultConstant;
+        writeColor(out, ffpStageConstantOffset(s), c);
+    }
+
+    // Texture blend stages (the .z of each b — the alpha-less-format flag — is set by the
+    // per-draw writer, which is the only place that knows the bound texture's D3D format).
+    const n = Math.min(p.stages.length, FFP_MAX_STAGES);
+    for (let s = 0; s < n; s++) {
+        const st = p.stages[s];
+        const a = ffpStageOffset(s), b = a + 4;
+        out[a] = st.colorOp;
+        out[a + 1] = st.colorArg1;
+        out[a + 2] = st.colorArg2;
+        out[a + 3] = st.alphaOp;
+        out[b] = st.alphaArg1;
+        out[b + 1] = st.alphaArg2;
+        // b.z (texOpaqueAlpha) is written by the per-draw writer, which is the only place that
+        // knows the bound texture's D3D format.
+        out[b + 3] = (st.colorArg0 & 0xff) | ((st.alphaArg0 & 0xff) << 8)
+            | ((st.resultArg & D3DTA_SELECTMASK) === D3DTA_TEMP ? 1 << 16 : 0);
+        const g = ffpTexGenOffset(s);
+        out[g] = st.texCoordIndex;
+        out[g + 1] = st.texTransformFlags;
+    }
+
+    // Keep palette data after all historical members so existing offsets remain stable. The
+    // zero/identity default is intentionally harmless when the blend control is disabled.
+    if (p.blendMatrices) {
+        out.set(p.blendMatrices.subarray(0, FFP_MAX_BLEND_MATRICES * 16), OFF_BLEND_MATRICES);
+    }
+    out[OFF_BLEND_CONTROL] = p.blendVertexMode ?? 0;
+    out[OFF_BLEND_CONTROL + 1] = p.blendIndexed ? 1 : 0;
+    out[OFF_BLEND_CONTROL + 2] = p.blendTweenFactor ?? 0;
+    out[OFF_BLEND_CONTROL + 3] = p.blendMatrixCount ?? 1;
 }
 
 const IDENTITY4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
@@ -277,7 +516,13 @@ struct FfpLight {
 export const FFP_UNIFORM_STRUCT_WGSL = `
 ${FFP_LIGHT_STRUCT_WGSL}
 
+struct FfpStage {
+    a: vec4<f32>,      // colorOp, colorArg1, colorArg2, alphaOp
+    b: vec4<f32>,      // alphaArg1, alphaArg2, texOpaqueAlpha, colorArg0 | alphaArg0<<8 | resultIsTemp<<16
+}
+
 struct Uniforms {
+    // x,y = viewport width/height; z = pixel-centre offset in pixels (see pixel-center.ts).
     viewport: vec4<f32>,
     mvp: mat4x4<f32>,
     worldView: mat4x4<f32>,
@@ -288,13 +533,111 @@ struct Uniforms {
     globalAmbient: vec4<f32>,
     ctrl0: vec4<f32>,      // power, lightingEnabled, specularEnable, localViewer
     ctrl1: vec4<f32>,      // diffuseSrc, ambientSrc, specularSrc, emissiveSrc
-    ctrl2: vec4<f32>,      // numLights, hasNormal, clipPlaneEnable, 0
+    ctrl2: vec4<f32>,      // numLights, hasNormal, clipPlaneEnable, normalizeNormals
     lights: array<FfpLight, ${FFP_MAX_LIGHTS}>,
     // Tail block (appended after the light array so light offsets never shift):
     world: mat4x4<f32>,                 // WORLD only — FFP clip planes evaluate in world space
     clipPlanes: array<vec4<f32>, ${CLIP_PLANE_COUNT}>, // raw world-space plane equations
+    tfactor: vec4<f32>,    // D3DRS_TEXTUREFACTOR rgba
+    stages: array<FfpStage, ${FFP_MAX_STAGES}>,
+    fogColor: vec4<f32>,   // D3DRS_FOGCOLOR rgb
+    fogParams: vec4<f32>,  // start, end, density, mode (ffp-fog.ts encoding)
+    normalMatrix: mat4x4<f32>, // inverse-transpose of worldView (3×3 part), for normals
+    texGen: array<vec4<f32>, ${FFP_MAX_STAGES}>,          // raw TEXCOORDINDEX, raw TEXTURETRANSFORMFLAGS
+    texMatrices: array<mat4x4<f32>, ${FFP_MAX_TEX_MATRICES}>, // D3DTS_TEXTURE0..7
+    stageConstants: array<vec4<f32>, ${FFP_MAX_STAGES}>, // D3DTSS_CONSTANT per stage
+    blendMatrices: array<mat4x4<f32>, ${FFP_MAX_BLEND_MATRICES}>, // D3DTS_WORLDMATRIX(0..7)
+    blendCtrl: vec4<f32>, // vertex blend mode, indexed enable, tween factor, matrix count
 }
 `;
+
+/**
+ * Fixed-function texture-coordinate generation + transform, evaluated in the vertex stage.
+ *
+ * `ffpTexCoordSrc` picks a stage's PRE-matrix coordinate from the raw D3DTSS_TEXCOORDINDEX:
+ * the high 16 bits are a D3DTSS_TCI_* generator, the low 16 pick one of the eight vertex UV
+ * sets otherwise. The FFP declaration path supplies absent sets as zero vectors.
+ *   0 PASSTHRU               → vertex UV as (u, v, 1, 0)
+ *   1 CAMERASPACENORMAL      → view-space normal,             (x, y, z, 1)
+ *   2 CAMERASPACEPOSITION    → view-space position,           (x, y, z, 1)
+ *   3 CAMERASPACEREFLECTION  → view-space eye-reflection,     (x, y, z, 1)
+ *   4 SPHEREMAP              → sphere-map UV already in [0,1] range
+ * A generated 3-vector pads w with 1 so the matrix's translation row applies (env-map bias);
+ * passthrough keeps the (u, v, 1, 0) convention, which is what makes a 2D texture matrix's
+ * third row behave as the translation D3D documents.
+ *
+ * `ffpTexTransform` applies D3DTSS_TEXTURETRANSFORMFLAGS + the stage's D3DTS_TEXTURE matrix.
+ * The transform runs only for D3DTTFF_COUNT2..COUNT4 — DISABLE and COUNT1 leave the coordinate
+ * alone (DXVK `applyTransform = flags > D3DTTFF_COUNT1 && flags <= D3DTTFF_COUNT4`). Our
+ * mat4x4 uniforms hold the D3D row-major bytes read column-major by WGSL, so `m * v` is exactly
+ * the row-vector product D3D specifies, same convention as `mvp`.
+ *
+ * D3DTTFF_PROJECTED marks the transformed coordinate as projective. Keep all four components
+ * in the varying: the FFP fragment path performs the divide after interpolation, which is the
+ * point at which fixed-function hardware applies it. Cube/volume sampling is refused by the
+ * D3D9 device until the corresponding sampler ABI exists.
+ */
+export const FFP_TEXGEN_WGSL = `
+fn ffpTexCoordSrc(raw: u32,
+                  uv0: vec4<f32>, uv1: vec4<f32>, uv2: vec4<f32>, uv3: vec4<f32>,
+                  uv4: vec4<f32>, uv5: vec4<f32>, uv6: vec4<f32>, uv7: vec4<f32>,
+                  ecPos: vec3<f32>, ecNormal: vec3<f32>) -> vec4<f32> {
+    let mode = (raw >> 16u) & 0xffffu;
+    if (mode == 1u) { return vec4<f32>(ecNormal, 1.0); }
+    if (mode == 2u) { return vec4<f32>(ecPos, 1.0); }
+    if (mode == 3u) { return vec4<f32>(reflect(normalize(ecPos), ecNormal), 1.0); }
+    if (mode == 4u) {
+        let r = reflect(normalize(ecPos), ecNormal);
+        let m = length(r + vec3<f32>(0.0, 0.0, 1.0)) * 2.0;
+        return vec4<f32>(r.x / m + 0.5, r.y / m + 0.5, 0.0, 1.0);
+    }
+    // D3D9 exposes eight independent FFP coordinate sets. The old path carried only sets
+    // zero and one and silently aliased higher TEXCOORDINDEX values to set zero. Keep the
+    // selection explicit so declaration-based FFP draws can bind every set; absent sets are
+    // supplied as zero vectors by the layout builder, matching D3D's missing-stream value.
+    // NOT named 'set': that is a RESERVED WORD in WGSL, and using it makes the whole
+    // shader module invalid — which invalidates its pipeline, its command buffer, and so
+    // every draw in the frame. The only report is the GPU error scope; the screen just
+    // goes black.
+    let uvSet = raw & 0xffffu;
+    if (uvSet == 1u) { return uv1; }
+    if (uvSet == 2u) { return uv2; }
+    if (uvSet == 3u) { return uv3; }
+    if (uvSet == 4u) { return uv4; }
+    if (uvSet == 5u) { return uv5; }
+    if (uvSet == 6u) { return uv6; }
+    if (uvSet == 7u) { return uv7; }
+    return uv0;
+}
+
+fn ffpTexTransform(src: vec4<f32>, m: mat4x4<f32>, flags: u32) -> vec4<f32> {
+    let count = flags & 0x7u;
+    if (count < 2u || count > 4u) { return src; }
+    let v = m * src;
+    return v;
+}
+
+// D3DTTFF_PROJECTED divides by the LAST component of the D3DTTFF_COUNT, not always by w
+// (wined3d compute_texture_matrix copies column COUNT into column 4 for exactly this).
+// COUNT2 -> y, COUNT3 -> z, COUNT4 (and a disabled/COUNT1 transform) -> w.
+fn ffpProjectTexcoord(tc: vec4<f32>, flags: u32) -> vec2<f32> {
+    if ((flags & 256u) == 0u) { return tc.xy; }
+    let count = flags & 0x7u;
+    var q = tc.w;
+    if (count == 2u) { q = tc.y; }
+    else if (count == 3u) { q = tc.z; }
+    return tc.xy / select(1.0, q, abs(q) > 1e-6);
+}
+
+// Cube stages take the coordinate set as a DIRECTION (u,v,w); the face and the 2-D position
+// inside it are the hardware's business, so no address mode applies. Projection still divides
+// by the COUNT's last component, which for a 3-component set is already the direction's w.
+fn ffpProjectTexcoord3(tc: vec4<f32>, flags: u32) -> vec3<f32> {
+    if ((flags & 256u) == 0u) { return tc.xyz; }
+    let count = flags & 0x7u;
+    if (count != 4u) { return tc.xyz; }
+    return tc.xyz / select(1.0, tc.w, abs(tc.w) > 1e-6);
+}`;
 
 /**
  * The DDraw/D3D8 shared light-set uniform struct (matches packFfpLightSet). Includes FfpLight.
@@ -331,10 +674,13 @@ fn ffpSelectColor(src: f32, matCol: vec4<f32>, vDiff: vec4<f32>, vSpec: vec4<f32
  */
 export function emitFfpComputeLighting(lightsExpr: string): string {
     return `
+const FFP_FLOAT_MAX: f32 = 3.4028234e38;
+
 fn ffpComputeLighting(
     ecPos: vec3<f32>, ecNormalIn: vec3<f32>,
     matDiffuse: vec4<f32>, matAmbient: vec4<f32>, matSpecular: vec4<f32>, matEmissive: vec4<f32>,
     power: f32, specEnable: bool, localViewer: bool, hasNormal: bool,
+    normalizeNormals: bool,
     diffuseSrc: f32, ambientSrc: f32, specularSrc: f32, emissiveSrc: f32,
     globalAmbient: vec3<f32>, numLights: i32,
     vDiffuse: vec4<f32>, vSpecular: vec4<f32>
@@ -344,7 +690,13 @@ fn ffpComputeLighting(
     let matSpc = ffpSelectColor(specularSrc, matSpecular, vDiffuse, vSpecular);
     let matEms = ffpSelectColor(emissiveSrc, matEmissive, vDiffuse, vSpecular);
 
-    let n = select(vec3<f32>(0.0, 0.0, 1.0), normalize(ecNormalIn), hasNormal);
+    // D3DRS_NORMALIZENORMALS off means the normal keeps whatever length the world/view
+    // transform gave it, and the saturated N·L then scales with it. A zero normal is left
+    // alone rather than normalized into NaN.
+    var n = ecNormalIn;
+    if (normalizeNormals && any(n != vec3<f32>(0.0))) {
+        n = normalize(n);
+    }
 
     var ambient = globalAmbient;
     var diffuse = vec3<f32>(0.0);
@@ -365,19 +717,27 @@ fn ffpComputeLighting(
             let d = length(toLight);
             if (d > L.position.w) { continue; }
             dir = toLight / max(d, 1e-6);
+            // 1 / (att0 + att1·d + att2·d²). An all-zero attenuation is a legal D3DLIGHT9 and
+            // means "no falloff": the reciprocal is +inf on hardware, so take the finite max and
+            // let the saturating multiply below land on full brightness instead of NaN.
             let denom = L.atten.x + L.atten.y * d + L.atten.z * d * d;
-            att = 1.0 / max(denom, 1e-6);
+            att = FFP_FLOAT_MAX;
+            if (denom != 0.0) { att = min(1.0 / denom, FFP_FLOAT_MAX); }
             if (ltype == 2.0) {
+                // Spot cone: full inside cos(theta/2), zero outside cos(phi/2), (rho-cosPhi)/
+                // (cosTheta-cosPhi) raised to Falloff between them. Clamping the ratio before
+                // pow() keeps the base non-negative (pow of a negative base is undefined) and
+                // is what makes a degenerate theta == phi a hard-edged cone rather than a NaN.
                 let rho = dot(-dir, L.direction.xyz);
                 let cosHTheta = L.spot.x;
                 let cosHPhi = L.spot.y;
-                var spot: f32;
-                if (rho > cosHTheta) {
-                    spot = 1.0;
-                } else if (rho <= cosHPhi) {
+                var spot = 1.0;
+                if (rho <= cosHPhi) {
                     spot = 0.0;
-                } else {
-                    spot = pow((rho - cosHPhi) / max(cosHTheta - cosHPhi, 1e-6), L.direction.w);
+                } else if (rho <= cosHTheta) {
+                    let width = cosHTheta - cosHPhi;
+                    let t = select(1.0, clamp((rho - cosHPhi) / width, 0.0, 1.0), width > 0.0);
+                    spot = pow(t, L.direction.w);
                 }
                 att = att * spot;
             }
@@ -387,15 +747,19 @@ fn ffpComputeLighting(
         if (hasNormal) {
             let ndotl = clamp(dot(dir, n), 0.0, 1.0);
             diffuse = diffuse + ndotl * L.diffuse.xyz * att;
-            if (specEnable && power > 0.0) {
+            // No power > 0 guard: D3DMATERIAL9.Power == 0 is legal and means pow(x, 0) == 1,
+            // i.e. a flat specular term over the whole lit hemisphere.
+            if (specEnable) {
                 var halfDir: vec3<f32>;
                 if (localViewer) {
                     halfDir = normalize(dir - normalize(ecPos));
                 } else {
                     halfDir = normalize(dir + vec3<f32>(0.0, 0.0, -1.0));
                 }
-                let t = dot(n, halfDir);
-                if (dot(dir, n) > 0.0 && t > 0.0) {
+                // Saturated before pow(): with NORMALIZENORMALS off the normal may be longer
+                // than unit, and an unclamped base raised to a large Power runs away.
+                let t = clamp(dot(n, halfDir), 0.0, 1.0);
+                if (ndotl > 0.0 && t > 0.0) {
                     specular = specular + pow(t, power) * L.specular.xyz * att;
                 }
             }
@@ -408,4 +772,22 @@ fn ffpComputeLighting(
     out[1] = vec4<f32>(clamp(matSpc.xyz * specular, vec3<f32>(0.0), vec3<f32>(1.0)), 0.0);
     return out;
 }`;
+}
+
+/**
+ * Whether the FFP vertex stage lights this draw.
+ *
+ * A PRE-TRANSFORMED declaration (D3DFVF_XYZRHW / D3DDECLUSAGE_POSITIONT) is never lit,
+ * whatever D3DRS_LIGHTING holds: the vertices are already in screen space and carry their
+ * own colour. Wine returns from `wined3d_ffp_get_vs_settings` before it reads
+ * WINED3D_RS_LIGHTING (utils.c, `if (vdecl->position_transformed)`), leaving
+ * `settings->lighting` at the memset zero; DXVK gates the same way on `HasPositionT`.
+ *
+ * The state defaults to TRUE, so reading it unconditionally lights every screen-space
+ * composite quad an engine draws without ever touching lighting state — by zero lights with
+ * no material, i.e. black. The scene behind it is intact, which is why nothing else reports
+ * a problem.
+ */
+export function ffpLightingEnabled(preTransformed: boolean, renderStateLighting: number): boolean {
+    return !preTransformed && renderStateLighting !== 0;
 }

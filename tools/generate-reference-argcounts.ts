@@ -23,7 +23,12 @@ function collect(): RefMap {
     const dirs = fs.readdirSync(REFERENCE_DIR, { withFileTypes: true }).filter((d) => d.isDirectory());
     for (const dir of dirs) {
         const subPath = path.join(REFERENCE_DIR, dir.name);
-        const files = fs.readdirSync(subPath).filter((f) => f.endsWith(".sig.json"));
+        // `*.wine.sig.json` is the bulk-derived floor; a curated sig.json is hand-checked
+        // and must win where the two disagree, so it is applied LAST. Without the explicit
+        // order this is readdir order — i.e. which one wins depends on the filesystem.
+        const files = fs.readdirSync(subPath)
+            .filter((f) => f.endsWith(".sig.json"))
+            .sort((a, b) => Number(b.endsWith(".wine.sig.json")) - Number(a.endsWith(".wine.sig.json")) || a.localeCompare(b));
         for (const file of files) {
             const fullPath = path.join(subPath, file);
             const data = JSON.parse(fs.readFileSync(fullPath, "utf-8"));
@@ -36,6 +41,20 @@ function collect(): RefMap {
                 out[moduleName][norm] = f.argCount;
             }
         }
+    }
+    return out;
+}
+
+/**
+ * Emit order must not depend on readdir order, or every contributor's filesystem
+ * reshuffles the generated file and the diff drowns the real change.
+ */
+function sortMap(map: RefMap): RefMap {
+    const out: RefMap = {};
+    for (const mod of Object.keys(map).sort()) {
+        const fns: Record<string, number> = {};
+        for (const fn of Object.keys(map[mod]).sort()) fns[fn] = map[mod][fn];
+        out[mod] = fns;
     }
     return out;
 }
@@ -54,7 +73,7 @@ function emit(map: RefMap): string {
 }
 
 function main(): void {
-    const map = collect();
+    const map = sortMap(collect());
     fs.writeFileSync(OUT_PATH, emit(map), "utf-8");
     const total = Object.values(map).reduce((s, m) => s + Object.keys(m).length, 0);
     console.log(`[generate-reference-argcounts] Wrote ${OUT_PATH} (${Object.keys(map).length} modules, ${total} functions)`);

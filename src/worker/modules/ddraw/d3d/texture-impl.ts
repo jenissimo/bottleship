@@ -4,7 +4,7 @@
 import { Logger, LogCategory, LogLevel } from "../../../core/logger";
 import { System } from "../../../core/system";
 import { DDrawContext } from "../context";
-import { bytesToGuid } from "../helpers";
+import { bytesToGuid, surfaceAt } from "../helpers";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import {
     DirectDrawSurfaceObject,
@@ -13,15 +13,19 @@ import {
     isRenderSurface,
     isBitmapTexture,
 } from "../com-objects";
-import { DDSCAPS_SYSTEMMEMORY } from "../constants";
-import { setAuthorityCpu, setAuthorityGpu, syncActiveGdiContext, surfaceSyncManager } from "../surface-sync";
+import { DDSCAPS_SYSTEMMEMORY, DDSCAPS_ALLOCONLOAD } from "../constants";
+import { setAuthorityCpu, setAuthorityGpu, invalidateCpuSyncedVersion, syncActiveGdiContext, surfaceSyncManager } from "../surface-sync";
 import { propagateSurfaceStateToRegistry } from "./texture-manager";
 import { D3DExports, D3D_OK, D3DERR_INVALIDCALL, TextureManager } from "./types";
+
+const DDERR_UNSUPPORTED = 0x80004001; // ddraw.h: DDERR_UNSUPPORTED == E_NOTIMPL
 import { convertRGBAToSurface } from "../gpu-texture-utils";
 import {
     decodeSurfaceFormatToRgba8,
     getSurfaceFormatLayout,
+    isBlockCompressedFormat,
 } from "../../../backends/webgpu/shared/texture-formats";
+import { recordSurfaceOp, surfaceOpsArmed } from "../surface-op-log";
 
 export const createTextureExports = (
     context: DDrawContext,
@@ -66,16 +70,67 @@ export const createTextureExports = (
 
         // Helper: pixel copy + finalization + mipmap recursion (all sync except mipmap may return Promise)
         const doCopyAndFinalize = (): void | Promise<void> => {
-            const formatMismatch = srcState.format.bpp !== dstState.format.bpp ||
+            const srcFourCC = srcState.format.fourCC;
+            const dstFourCC = dstState.format.fourCC;
+            const srcCompressed = srcFourCC !== undefined && isBlockCompressedFormat(srcFourCC);
+            // FourCC first: a DDPF_FOURCC surface carries no meaningful masks, and
+            // readPixelFormat fills the absent ones with the RGB565 defaults — so DXT1 and
+            // RGB565 compare EQUAL on bpp+masks alone and the raw-copy branch below hands
+            // block data to a surface everything downstream then reads as pixels.
+            let formatMismatch = srcFourCC !== dstFourCC ||
+                srcState.format.bpp !== dstState.format.bpp ||
                 srcState.format.rMask !== dstState.format.rMask ||
                 srcState.format.gMask !== dstState.format.gMask ||
                 srcState.format.bMask !== dstState.format.bMask ||
                 srcState.format.aMask !== dstState.format.aMask;
 
+            // D3D6 ALLOCONLOAD semantics: a DDSCAPS_ALLOCONLOAD texture has no storage of
+            // its own until Texture::Load — the load allocates it with the SOURCE's
+            // attributes, including pixel format. Games create the VIDMEM dest with no
+            // DDSD_PIXELFORMAT (it transiently inherits the display format) and an
+            // explicit-format SYSMEM source (e.g. an inverted-alpha ARGB4444 font atlas);
+            // converting to the inherited format would silently drop the alpha channel.
+            // Adopt the source format and copy bits raw. Real DDraw clears the flag on
+            // the first Load.
+            if (formatMismatch && (dstState.caps & DDSCAPS_ALLOCONLOAD) !== 0) {
+                // A compressed source is adoptable regardless of bpp: DDPF_FOURCC leaves
+                // dwRGBBitCount undefined, so comparing it decides nothing. What must hold is
+                // that the block layout fits the storage already reserved for this surface —
+                // it always does for DXT (4/8 bits per texel against the inherited 16).
+                const adopted = getSurfaceFormatLayout(srcState.format, dstState.width, dstState.height);
+                const reserved = dstState.pitch * dstState.height;
+                if (srcCompressed ? adopted.bytes <= reserved : srcState.format.bpp === dstState.format.bpp) {
+                    Logger.log(LogCategory.DDRAW,
+                        `Texture Load${tag}: ALLOCONLOAD dest 0x${dstState.surfacePtr.toString(16)} adopts source format ` +
+                        `(bpp=${srcState.format.bpp} fourCC=0x${(srcFourCC ?? 0).toString(16)} ` +
+                        `A=0x${srcState.format.aMask.toString(16)} R=0x${srcState.format.rMask.toString(16)} ` +
+                        `G=0x${srcState.format.gMask.toString(16)} B=0x${srcState.format.bMask.toString(16)}; ` +
+                        `was A=0x${dstState.format.aMask.toString(16)} R=0x${dstState.format.rMask.toString(16)}` +
+                        `${srcCompressed ? `, pitch ${dstState.pitch}→${adopted.pitch}` : ""})`);
+                    dstState.format = { ...srcState.format };
+                    if (srcCompressed) dstState.pitch = adopted.pitch;
+                    formatMismatch = false;
+                } else {
+                    Logger.warn(LogCategory.DDRAW,
+                        `Texture Load${tag}: ALLOCONLOAD dest 0x${dstState.surfacePtr.toString(16)} cannot adopt source ` +
+                        `(src bpp=${srcState.format.bpp} fourCC=0x${(srcFourCC ?? 0).toString(16)} needs ${adopted.bytes}B, ` +
+                        `dst bpp=${dstState.format.bpp} reserved ${reserved}B) — falling back to format conversion`);
+                }
+            }
+            dstState.caps &= ~DDSCAPS_ALLOCONLOAD;
+
             const height = Math.min(srcState.height, dstState.height);
             const width = Math.min(srcState.width, dstState.width);
 
-            if (formatMismatch) {
+            const dstCompressedNow = dstState.format.fourCC !== undefined &&
+                isBlockCompressedFormat(dstState.format.fourCC);
+            if (formatMismatch && dstCompressedNow) {
+                // We have no block encoder. convertRGBAToSurface would lay linear pixels over
+                // block storage, which reads back as noise — say so instead of producing it.
+                Logger.warn(LogCategory.DDRAW,
+                    `Texture Load${tag}: cannot convert into block-compressed dest 0x${dstState.surfacePtr.toString(16)} ` +
+                    `(fourCC=0x${dstState.format.fourCC!.toString(16)}) from bpp=${srcState.format.bpp} source — leaving dest unchanged`);
+            } else if (formatMismatch) {
                 // Use format converter for mismatched formats
                 // 1. If source is BitmapTextureSurface with rgbaScratch, use it directly
                 if (srcState.rgbaScratch) {
@@ -114,20 +169,25 @@ export const createTextureExports = (
                     );
                 }
             } else {
-                // Formats match - direct byte copy
-                const srcBytesPerPixel = Math.max(1, Math.floor(srcState.format.bpp / 8));
-                const dstBytesPerPixel = Math.max(1, Math.floor(dstState.format.bpp / 8));
+                // Formats match - direct byte copy.
+                // Rows are LAYOUT rows, not pixel rows: a block-compressed surface stores one
+                // row per 4 texel rows, so width*bpp/8 x height would both under-copy each row
+                // and run three quarters of the way past the end of the surface.
+                const srcLayout = getSurfaceFormatLayout(srcState.format, width, height);
+                const dstLayout = getSurfaceFormatLayout(dstState.format, width, height);
                 const rowBytes = Math.min(
-                    width * Math.min(srcBytesPerPixel, dstBytesPerPixel),
+                    srcLayout.pitch,
+                    dstLayout.pitch,
                     srcState.pitch,
                     dstState.pitch
                 );
+                const rows = Math.min(srcLayout.rows, dstLayout.rows);
 
                 // OPTIMIZATION: Single-copy for aligned surfaces (common case for D2)
                 // If pitches match, copy entire surface in one operation instead of row-by-row
                 if (srcState.pitch === dstState.pitch && srcState.pitch === rowBytes) {
                     // Fast path: no padding, direct block copy
-                    const totalBytes = rowBytes * height;
+                    const totalBytes = rowBytes * rows;
                     const srcStart = srcState.surfacePtr;
                     const dstStart = dstState.surfacePtr;
                     if (srcStart >= 0 && dstStart >= 0 &&
@@ -136,7 +196,7 @@ export const createTextureExports = (
                     }
                 } else {
                     // Slow path: row-by-row copy for padded surfaces
-                    for (let y = 0; y < height; y++) {
+                    for (let y = 0; y < rows; y++) {
                         const srcOffset = srcState.surfacePtr + y * srcState.pitch;
                         const dstOffset = dstState.surfacePtr + y * dstState.pitch;
                         if (srcOffset >= 0 && dstOffset >= 0 &&
@@ -187,8 +247,8 @@ export const createTextureExports = (
 
             // 3. Handle Mipmaps: Recursively copy attached surfaces if they exist
             if (srcState.attachedSurfaceAddr && dstState.attachedSurfaceAddr) {
-                const srcAttached = resourceProvider.getComObjectByAddress(srcState.attachedSurfaceAddr) as DirectDrawSurfaceObject | null;
-                const dstAttached = resourceProvider.getComObjectByAddress(dstState.attachedSurfaceAddr) as DirectDrawSurfaceObject | null;
+                const srcAttached = surfaceAt(resourceProvider, srcState.attachedSurfaceAddr);
+                const dstAttached = surfaceAt(resourceProvider, dstState.attachedSurfaceAddr);
 
                 if (srcAttached && dstAttached) {
                     return copyTexture2Data(srcAttached, dstAttached, mem, _threadId, `${tag}[MIP]`);
@@ -387,9 +447,15 @@ export const createTextureExports = (
         // Load() calls, causing "textures swap to foreign ones" artifacts.
 
         const markDirtyAndFinish = (): number => {
+            if (surfaceOpsArmed()) recordSurfaceOp("load", "v1", dstState, srcState, null, null);
             // Mark destination as dirty so GPU upload will happen.
             if (isRenderSurface(dstState)) {
-                dstState.gpuDirty = true;
+                // Load() replaced the CONTENT, so the content version must move with the dirty
+                // flag — that pair is what setAuthorityCpu means. Setting gpuDirty alone leaves
+                // version === lastUploadVersion, and needsGPUSync then reads the flag as a
+                // leftover ("dirty flag stale") and skips the upload for good: the texture keeps
+                // whatever reached the GPU on its first upload.
+                setAuthorityCpu(dstState);
             } else if (isBitmapTexture(dstState)) {
                 dstState.gpuNeedsUpload = true;
             }
@@ -409,6 +475,11 @@ export const createTextureExports = (
         }
         return markDirtyAndFinish();
     };
+
+    // Slot 7 of IDirect3DTexture — the DX5 SDK documents it as never implemented, and the
+    // retail driver returns DDERR_UNSUPPORTED. Games call it when tearing textures down for a
+    // mode change, so the slot must exist even though it does nothing.
+    exports["IDirect3DTexture_Unload"] = () => DDERR_UNSUPPORTED;
 
     // --- IDirect3DTexture2 ---
 
@@ -593,6 +664,10 @@ export const createTextureExports = (
         }
 
         const runLoadTail = (): number => {
+            // Load is how a D3D6/7 title publishes texture pixels without ever Locking the
+            // video surface, so it is invisible to the Blt/Lock ring — and a masked texture
+            // that arrives transparent and leaves opaque has exactly one suspect.
+            if (surfaceOpsArmed()) recordSurfaceOp("load", loadBranch, dstState, srcState, null, null);
             propagateSurfaceStateToRegistry(context, dstState);
             if (dstState.gpuTexture && dstState.surfacePtr > 0) {
                 const gpuTex = dstState.gpuTexture;
@@ -619,6 +694,9 @@ export const createTextureExports = (
                     if (isRenderSurface(otherState)) {
                         otherState.gpuDirty = isRenderSurface(dstState) ? dstState.gpuDirty : true;
                         otherState.version = versionAfter;
+                        // version was ASSIGNED, not incremented — the readback memo keys on
+                        // this surface's own version numbering and must be dropped.
+                        invalidateCpuSyncedVersion(otherState);
                         // lastUploadVersion stays as-is until markGpuSyncedFromCpu
                     }
                 }
@@ -636,7 +714,12 @@ export const createTextureExports = (
             // Without this, needsGPUSync returns false (gpuDirty=false) and the texture
             // data never reaches the GPU — causing invisible textures.
             if (isRenderSurface(dstState)) {
-                dstState.gpuDirty = true;
+                // Load() replaced the CONTENT, so the content version must move with the dirty
+                // flag — that pair is what setAuthorityCpu means. Setting gpuDirty alone leaves
+                // version === lastUploadVersion, and needsGPUSync then reads the flag as a
+                // leftover ("dirty flag stale") and skips the upload for good: the texture keeps
+                // whatever reached the GPU on its first upload.
+                setAuthorityCpu(dstState);
             } else if (isBitmapTexture(dstState)) {
                 dstState.gpuNeedsUpload = true;
             }

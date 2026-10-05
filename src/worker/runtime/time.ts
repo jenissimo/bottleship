@@ -1,3 +1,5 @@
+import type { FastPathImplementation } from '../core/thunking/thunk-dispatcher';
+
 export type TimeMode = "realtime" | "manual";
 
 export class TimeService {
@@ -73,6 +75,13 @@ export class TimeService {
      * pump's wall delta) are self-bounded by real time and use this directly. Callers
      * that credit a *requested* amount not tied to elapsed wall (sole-runnable Sleep)
      * MUST use creditIdleMs() instead — see the runaway note there.
+     *
+     * ONE carve-out from that rule: the monotonicity floor in HypercallDataManager's
+     * publishClock() credits an amount that is not wall-derived either, and still must use
+     * this primitive. That amount has already been SERVED to the guest by the WASM
+     * interpolation; clamping it to the wall leash would leave TimeService below the page and
+     * make the next publish recompute the same backwards step. It is self-limiting: virtual
+     * then leads wall, so updateTimeData's own clamp holds the clock still until wall catches up.
      */
     advanceVirtualTime(deltaMs: number): void {
         if (!this.virtualTimeActive) return;
@@ -114,9 +123,7 @@ export class TimeService {
      * accelerated catch-up on resume.
      */
     notifyPauseResume(): void {
-        if (!this.virtualTimeActive) return;
-        this.virtualTimeMs = performance.now();
-        this.lastReturnedMs = this.virtualTimeMs;
+        this.reanchorForward();
     }
 
     /**
@@ -126,9 +133,19 @@ export class TimeService {
      * Prevents catch-up acceleration (death spiral) after slow JS implementations.
      */
     reanchorToWallClock(): void {
+        this.reanchorForward();
+    }
+
+    /**
+     * Close a virtual-behind-wall deficit — and only ever forwards. In steady state virtual
+     * LEADS wall by up to MAX_AHEAD_MS, so a plain `= performance.now()` is a backwards step
+     * of the clock every guest elapsed-time API reads; an unsigned DWORD delta over that reads
+     * as ~2^32 ms. Anchoring to the max of the two keeps the catch-up these callers want
+     * without ever un-serving a value the guest could already have observed.
+     */
+    private reanchorForward(): void {
         if (!this.virtualTimeActive) return;
-        this.virtualTimeMs = performance.now();
-        this.lastReturnedMs = this.virtualTimeMs;
+        this.virtualTimeMs = Math.max(this.virtualTimeMs, this.lastReturnedMs, performance.now());
     }
 
     isVirtualTimeActive(): boolean {
@@ -159,6 +176,18 @@ export class TimeService {
     // Must stay in sync with hypercall-data.ts's MAX_AHEAD_MS (updateTimeData's clamp).
     static readonly MAX_AHEAD_MS = 2;
 
+    /** NT's default clock-interrupt interval. A process that never calls timeBeginPeriod
+     *  sees Sleep/wait timeouts rounded to it. */
+    static readonly DEFAULT_TIMER_RESOLUTION_MS = 15.625;
+    private _timerResolutionMs = TimeService.DEFAULT_TIMER_RESOLUTION_MS;
+
+    /** Effective timer resolution: the finest period requested via timeBeginPeriod, else
+     *  the NT default. Bounds how long the CPU may run before a due timer is noticed. */
+    get timerResolutionMs(): number { return this._timerResolutionMs; }
+    setTimerResolutionMs(ms: number | null): void {
+        this._timerResolutionMs = ms !== null && ms > 0 ? ms : TimeService.DEFAULT_TIMER_RESOLUTION_MS;
+    }
+
     nowMs(): number {
         let currentMs: number;
         if (this.mode === "manual") {
@@ -187,6 +216,19 @@ export class TimeService {
             }
         }
 
+        // Monotonic floor. Everything the guest reads as ELAPSED time comes through here —
+        // the GetTickCount/timeGetTime/QPC fast paths, CRT clock(), GetMessageTime, every
+        // timer deadline — and every one of those is compared with an unsigned subtract by
+        // the guest, so a backwards step of a millisecond reads as ~2^32 units rather than a
+        // small negative. Placing the floor at the single accessor is what makes it
+        // unbypassable; the WASM tier enforces the same invariant on its own representation
+        // in HypercallDataManager.publishClock. Manual mode is exempt: the harness sets the
+        // clock deliberately and is entitled to rewind it.
+        if (this.mode !== "manual" && currentMs < this.lastReturnedMs) {
+            currentMs = this.lastReturnedMs;
+            if (this.virtualTimeActive) this.virtualTimeMs = currentMs;
+        }
+
         this.lastReturnedMs = currentMs;
         return currentMs;
     }
@@ -212,19 +254,19 @@ export class TimeService {
 
     /**
      * Fast path implementations for high-frequency time functions
-     * These bypass the normal thunk marshaling for better performance
+     * These bypass the normal thunk marshaling for better performance.
+     *
+     * They are the tier BELOW the WASM hypercalls, which serve the same four APIs from
+     * HYPERCALL_PAGE as `base + retired-insn interpolation`. These read the published base
+     * only, so a value served here can trail the WASM answer by up to one publish interval —
+     * they must not be the primary tier for a clock the WASM tier is also serving.
      */
 
-    static fastPathGetTickCount(cpu: any, memory: Uint8Array): number {
-        const timeService = TimeService.getInstance();
-        return timeService.nowMs() | 0;
-    }
+    static fastPathGetTickCount: FastPathImplementation = () => {
+        return TimeService.getInstance().nowMs() | 0;
+    };
 
-    static fastPathQueryPerformanceCounter(cpu: any, memory: Uint8Array): number {
-        const timeService = TimeService.getInstance();
-        const esp = cpu.reg32[4]; // ESP register
-        const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
-
+    static fastPathQueryPerformanceCounter: FastPathImplementation = (esp, view, memory) => {
         // Read argument from stack (first argument at ESP + 4)
         let lpPerformanceCount = 0;
         if (esp + 4 + 4 <= memory.length) {
@@ -232,16 +274,13 @@ export class TimeService {
         }
 
         if (lpPerformanceCount !== 0 && lpPerformanceCount + 8 <= memory.length) {
-            const now = BigInt(timeService.nowMicros());
+            const now = BigInt(TimeService.getInstance().nowMicros());
             view.setBigUint64(lpPerformanceCount, now, true);
         }
         return 1; // TRUE
-    }
+    };
 
-    static fastPathQueryPerformanceFrequency(cpu: any, memory: Uint8Array): number {
-        const esp = cpu.reg32[4]; // ESP register
-        const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
-
+    static fastPathQueryPerformanceFrequency: FastPathImplementation = (esp, view, memory) => {
         // Read argument from stack (first argument at ESP + 4)
         let lpFrequency = 0;
         if (esp + 4 + 4 <= memory.length) {
@@ -253,5 +292,5 @@ export class TimeService {
             view.setBigUint64(lpFrequency, freq, true);
         }
         return 1; // TRUE
-    }
+    };
 }

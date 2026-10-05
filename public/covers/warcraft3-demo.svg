@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 500" role="img" aria-label="Warcraft III Demo">
+  <defs><linearGradient id="bg" x2=".5" y2="1"><stop stop-color="#14252e"/><stop offset="1" stop-color="#080e14"/></linearGradient></defs>
+  <rect width="360" height="500" fill="url(#bg)"/>
+  <rect x="16" y="16" width="328" height="468" rx="4" fill="none" stroke="#a58341" stroke-width="2"/>
+  <path d="M180 85 265 125 253 255 180 325 107 255 95 125Z" fill="#243b35" stroke="#aa8c4e" stroke-width="3"/>
+  <path d="M153 135v127m27-145v162m27-144v127" stroke="#c6ad71" stroke-width="15"/>
+  <text x="180" y="373" text-anchor="middle" fill="#e5cd94" font-family="Georgia,serif" font-size="35" font-weight="bold">WARCRAFT III</text>
+  <text x="180" y="422" text-anchor="middle" fill="#c8d5ce" font-family="Arial,sans-serif" font-size="19" letter-spacing="7">DEMO</text>
+</svg>

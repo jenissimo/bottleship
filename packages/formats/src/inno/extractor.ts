@@ -2,7 +2,7 @@
  * Inno Setup file extractor — ported from innoextract cli/extract.cpp chunk loop (1122-1280).
  */
 
-import { inflate } from "pako";
+import { Inflate } from "pako";
 import { filterExtractableFiles } from "./collisions";
 import { checkAllowsLanguage } from "./check-lang";
 import { createChecksumHasher, verifyChecksum } from "../unpack/checksums";
@@ -43,6 +43,13 @@ export interface ExtractOptions {
      *  language instead of last-write-wins. Files with no language Check always install.
      *  Omit to keep the legacy behaviour (extract every variant). */
     language?: string;
+    /** Optional disk-backed workspace for GOG Galaxy files assembled from segments. */
+    createAssemblyStore?(size: number): AssemblyStore;
+}
+
+export interface AssemblyStore extends RandomAccessSource {
+    writeAt(bytes: Uint8Array, offset: number): void;
+    close(): void;
 }
 
 interface PlannedOutput {
@@ -63,7 +70,8 @@ interface PlannedOutput {
 interface AssemblyState {
     /** Every destination sharing this assembled data (Inno dedups identical bytes across paths). */
     relPaths: string[];
-    buffer: Uint8Array;
+    size: number;
+    store?: AssemblyStore;
     hasher: ReturnType<typeof createChecksumHasher>;
     expectedMd5: Uint8Array | null;
     segmentsLeft: number;
@@ -84,32 +92,12 @@ interface ActiveWrite {
     outputSize: number;
     assemblyKey: string | null;
     isLastSegment: boolean;
-    compressedChunks: Uint8Array[];
+    galaxyInflate?: Inflate;
+    outputWritten: number;
 }
 
 function copyBytes(bytes: Uint8Array): Uint8Array {
     return new Uint8Array(bytes);
-}
-
-function concatChunks(chunks: Uint8Array[]): Uint8Array {
-    const total = chunks.reduce((s, c) => s + c.byteLength, 0);
-    const out = new Uint8Array(total);
-    let off = 0;
-    for (const c of chunks) {
-        out.set(c, off);
-        off += c.byteLength;
-    }
-    return out;
-}
-
-function inflateGalaxyPart(compressed: Uint8Array, expectedSize: number): Uint8Array {
-    const inflated = inflate(compressed);
-    if (inflated.byteLength !== expectedSize) {
-        throw new InnoFormatError(
-            `GOG Galaxy zlib part size mismatch (got ${inflated.byteLength}, expected ${expectedSize})`,
-        );
-    }
-    return inflated;
 }
 
 function isAssemblyFile(file: FileEntry, dataEntries: DataEntry[]): boolean {
@@ -180,7 +168,7 @@ function replanWithHeaderCompression(
             if (assemblies.has(assemblyKey)) continue;
             assemblies.set(assemblyKey, {
                 relPaths: assemblyDests.get(assemblyKey)!.relPaths,
-                buffer: new Uint8Array(assemblyTotal),
+                size: assemblyTotal,
                 hasher: createChecksumHasher("md5"),
                 expectedMd5: file.galaxyChecksumType === "md5" && file.galaxyChecksum.byteLength === 16
                     ? file.galaxyChecksum
@@ -288,26 +276,24 @@ function finishAssemblySegment(
     active: ActiveWrite,
     assemblies: Map<string, AssemblyState>,
     sinkFactory: (relPath: string) => ExtractSink,
+    createStore: (size: number) => AssemblyStore,
 ): void {
     const key = active.assemblyKey;
     if (!key) return;
     const assembly = assemblies.get(key);
     if (!assembly) return;
 
-    let segmentBytes: Uint8Array;
-    if (active.zlibFilter) {
-        segmentBytes = inflateGalaxyPart(concatChunks(active.compressedChunks), active.outputSize);
-    } else {
-        segmentBytes = concatChunks(active.compressedChunks);
-    }
-
-    assembly.buffer.set(segmentBytes, active.outputOffset);
-    assembly.hasher.update(segmentBytes);
+    const store = assembly.store ??= createStore(assembly.size);
+    if (active.outputWritten !== active.outputSize) throw new InnoFormatError("GOG Galaxy segment size mismatch");
+    if (active.galaxyInflate && (active.galaxyInflate.err || !active.galaxyInflate.ended)) throw new InnoFormatError("Incomplete GOG Galaxy zlib segment");
     assembly.segmentsLeft--;
 
     if (!assembly.finalized && assembly.segmentsLeft === 0) {
         assembly.finalized = true;
         const expected = assembly.expectedMd5;
+        for (let at = 0; at < store.size; at += 256 * 1024) {
+            assembly.hasher.update(store.readRangeSync(at, Math.min(store.size, at + 256 * 1024)));
+        }
         const ok = !expected || verifyChecksum(assembly.hasher.digest(), expected, "md5");
         if (!ok) {
             throw new InnoFormatError(
@@ -317,10 +303,14 @@ function finishAssemblySegment(
         // Fan the assembled buffer out to every destination that shares this data (Inno dedup).
         for (const rel of assembly.relPaths) {
             const sink = sinkFactory(rel);
-            sink.begin(rel, assembly.buffer.byteLength);
-            sink.data(assembly.buffer);
+            sink.begin(rel, store.size);
+            for (let at = 0; at < store.size; at += 256 * 1024) {
+                sink.data(store.readRangeSync(at, Math.min(store.size, at + 256 * 1024)));
+            }
             sink.end(true);
         }
+        store.close();
+        assembly.store = undefined;
     }
 }
 
@@ -332,6 +322,7 @@ function processChunkGroup(
     sinkFactory: (relPath: string) => ExtractSink,
     assemblies: Map<string, AssemblyState>,
     reportProgress: (n: number) => void,
+    createStore: (size: number) => AssemblyStore,
 ): void {
     let streamPos = 0;
     let fileIdx = 0;
@@ -340,9 +331,10 @@ function processChunkGroup(
 
     const finishActive = () => {
         if (!active) return;
+        if (active.remaining !== 0) throw new InnoFormatError("truncated file data in installer chunk");
 
         if (active.assemblyKey) {
-            finishAssemblySegment(active, assemblies, sinkFactory);
+            finishAssemblySegment(active, assemblies, sinkFactory, createStore);
             streamPos += active.remaining === 0 ? active.fileSize : 0;
             active = null;
             return;
@@ -401,7 +393,7 @@ function processChunkGroup(
                         outputSize: planned.outputSize,
                         assemblyKey: planned.assemblyKey,
                         isLastSegment: planned.isLastSegment,
-                        compressedChunks: [],
+                        outputWritten: 0,
                     };
                 } else {
                     const sinks = planned.relPaths.map((rel) => {
@@ -423,7 +415,7 @@ function processChunkGroup(
                         outputSize: planned.fileSize,
                         assemblyKey: null,
                         isLastSegment: true,
-                        compressedChunks: [],
+                        outputWritten: 0,
                     };
                 }
             } else {
@@ -440,7 +432,21 @@ function processChunkGroup(
                 let sliceBytes = copyBytes(bytes.subarray(off, off + take));
 
                 if (active.assemblyKey) {
-                    active.compressedChunks.push(sliceBytes);
+                    const write = (bytes: Uint8Array) => {
+                        const assembly = assemblies.get(active!.assemblyKey!)!;
+                        const store = assembly.store ??= createStore(assembly.size);
+                        if (active!.outputWritten + bytes.length > active!.outputSize) throw new InnoFormatError("Galaxy segment exceeds declared size");
+                        store.writeAt(bytes, active!.outputOffset + active!.outputWritten);
+                        active!.outputWritten += bytes.length;
+                    };
+                    if (active.zlibFilter) {
+                        if (!active.galaxyInflate) {
+                            active.galaxyInflate = new Inflate({ chunkSize: 64 * 1024 });
+                            active.galaxyInflate.onData = write;
+                        }
+                        active.galaxyInflate.push(sliceBytes, active.remaining === take);
+                        if (active.galaxyInflate.err) throw new InnoFormatError("GOG Galaxy zlib decode failed");
+                    } else write(sliceBytes);
                 } else {
                     if (active.exeFilter) {
                         sliceBytes = active.exeFilter.push(sliceBytes);
@@ -505,14 +511,15 @@ export async function extractInno(
         );
     }
 
-    let selected = filterExtractableFiles(info.files, info.dataEntries);
     // Language-aware filter: drop per-language file variants whose Inno Check excludes the
     // chosen locale, so multi-language installers don't collapse to a last-write-wins (wrong)
     // language. No-op when language is unset or the file has no language Check.
-    if (opts.language) {
-        const lang = opts.language;
-        selected = selected.filter((s) => checkAllowsLanguage(s.file.check, lang));
-    }
+    const lang = opts.language;
+    const selected = filterExtractableFiles(
+        info.files,
+        info.dataEntries,
+        lang ? (file) => checkAllowsLanguage(file.check, lang) : undefined,
+    );
     const { chunks, totalBytes, assemblies } = replanWithHeaderCompression(
         selected,
         info.dataEntries,
@@ -536,8 +543,20 @@ export async function extractInno(
         return a.chunk.sortOffset - b.chunk.sortOffset;
     });
 
-    for (const group of sortedChunks) {
-        processChunkGroup(group, info, slice, lzma, sinkFactory, assemblies, reportProgress);
+    const createStore = opts.createAssemblyStore ?? ((size: number): AssemblyStore => {
+        const bytes = new Uint8Array(size);
+        return { size, readRangeSync: (start, end) => bytes.subarray(start, end),
+            writeAt: (data, offset) => bytes.set(data, offset), close() {} };
+    });
+    try {
+        for (const group of sortedChunks) {
+            processChunkGroup(group, info, slice, lzma, sinkFactory, assemblies, reportProgress, createStore);
+        }
+        if ([...assemblies.values()].some((a) => a.store && !a.finalized)) {
+            throw new InnoFormatError("incomplete assembled installer file");
+        }
+    } finally {
+        for (const assembly of assemblies.values()) assembly.store?.close();
     }
 
     opts.onProgress?.(doneBytes, totalBytes);

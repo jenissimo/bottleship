@@ -6,9 +6,13 @@
  */
 
 import { Logger, LogCategory } from "../../core/logger";
+import { recordGpuError } from "../../core/gpu-error-log";
 import { System } from "../../core/system";
-import { overlapsThunkCode } from "../../core/memory/address-guard";
+import { isValidAddress, overlapsThunkCode } from "../../core/memory/address-guard";
 import { toPlainGuestMemory } from "../../core/memory/guest-memory";
+import { tryConvertPixelKernel } from "../../backends/webgpu/shared/dxt-kernel";
+import { DDPF_FOURCC } from "./constants";
+import { lockCostProfiler, LP } from "./lock-cost-profiler";
 import type { DirectDrawSurfaceState } from "./com-objects";
 
 // ============================================================================
@@ -32,6 +36,12 @@ export const RGB555_TO_RGBA = new Uint32Array(32768);
  * Format: 0xAABBGGRR
  */
 export const ARGB1555_TO_RGBA = new Uint32Array(65536);
+
+/**
+ * ARGB4444 to RGBA8888 lookup table (65536 entries × 4 bytes = 256KB)
+ * Format: 0xAABBGGRR
+ */
+export const ARGB4444_TO_RGBA = new Uint32Array(65536);
 
 /**
  * REVERSE LOOKUPS: RGBA8888 to Surface Formats
@@ -104,6 +114,15 @@ const EXPAND_6_TO_8 = new Uint8Array(64);
 
         ARGB1555_TO_RGBA[pixel] = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
     }
+
+    // ARGB4444: AAAARRRRGGGGBBBB — each nibble expanded to 8 bits (n*17 = n*255/15).
+    for (let pixel = 0; pixel < 65536; pixel++) {
+        const a8 = ((pixel >> 12) & 0xF) * 17;
+        const r8 = ((pixel >> 8) & 0xF) * 17;
+        const g8 = ((pixel >> 4) & 0xF) * 17;
+        const b8 = (pixel & 0xF) * 17;
+        ARGB4444_TO_RGBA[pixel] = (a8 << 24) | (b8 << 16) | (g8 << 8) | r8;
+    }
 })();
 
 // ============================================================================
@@ -137,6 +156,15 @@ export interface FormatInfo {
  */
 export function detectPixelFormat(format: FormatInfo): PixelFormat {
     const { bpp, rMask, gMask, bMask, aMask, flags = 0 } = format;
+
+    // DDPF_FOURCC: the masks and dwRGBBitCount are meaningless by contract, and the guest
+    // leaves them 0 — which readPixelFormat then substitutes with the RGB565 defaults. The
+    // mask tests below would call a DXT1 surface "RGB565", and every consumer gating on this
+    // classifier would read 4x4 blocks as pixels. Only getSurfaceFormatLayout /
+    // decodeSurfaceFormatToRgba8 know the layout, so say UNKNOWN and route callers there.
+    if (flags & DDPF_FOURCC) {
+        return PixelFormat.UNKNOWN;
+    }
 
     if (bpp === 8) {
         // Check for DDPF_PALETTEINDEXED8 (0x20)
@@ -436,6 +464,19 @@ export function colorKeyChanged(
 // OPTIMIZED CONVERTERS (format-specific, no per-pixel branching)
 // ============================================================================
 
+/**
+ * Whether the word-wide read fast paths below are legal for this source layout.
+ *
+ * A `new Uint16Array(buffer, byteStart, n)` THROWS on a misaligned byteStart, and the guest
+ * supplies both terms: an app-provided lpSurface may sit at any address and a Blt honours the
+ * app's lPitch verbatim. Extent validation says nothing about alignment, so the read leg needs
+ * this the same way `alignedDstView` guards the write leg. Only 2/4 bpp have a mask to fail.
+ */
+function srcFastPathOk(mem: Uint8Array, offset: number, pitch: number, bytesPerPixel: number): boolean {
+    const mask = bytesPerPixel - 1;
+    return ((mem.byteOffset + offset) & mask) === 0 && (pitch & mask) === 0;
+}
+
 /** RGB565 → RGBA (internal, used by convertSurfaceToRGBA) */
 function convertRGB565ToRGBA(
     src: Uint8Array,
@@ -481,8 +522,9 @@ function convertRGB565ToRGBA(
         return;
     }
 
-    // SLOW PATH: Bounds-checked byte-by-byte
-    Logger.warn(LogCategory.DDRAW,
+    // SLOW PATH: Bounds-checked byte-by-byte. A misaligned guest layout lands here on every
+    // conversion of that surface, so this cannot be a warn.
+    Logger.verbose(LogCategory.DDRAW,
         `🐌 convertRGB565ToRGBA SLOW PATH (bounds check): ${width}x${height} skipBoundsCheck=${skipBoundsCheck}`
     );
     let dstIdx = 0;
@@ -575,6 +617,30 @@ function convertARGB1555ToRGBA(
             if (pixelOffset >= 0 && pixelOffset + 1 < src.length) {
                 const pixel = src[pixelOffset] | (src[pixelOffset + 1] << 8);
                 dst[dstIdx++] = ARGB1555_TO_RGBA[pixel];
+            } else {
+                dst[dstIdx++] = 0xFF000000;
+            }
+        }
+    }
+}
+
+/** ARGB4444 → RGBA (internal). Alpha nibble drives transparency (fonts: 0 bg / f glyph). */
+function convertARGB4444ToRGBA(
+    src: Uint8Array,
+    srcOffset: number,
+    srcPitch: number,
+    dst: Uint32Array,
+    width: number,
+    height: number,
+    skipBoundsCheck: boolean = false
+): void {
+    let dstIdx = 0;
+    for (let y = 0; y < height; y++) {
+        const rowOffset = srcOffset + y * srcPitch;
+        for (let x = 0; x < width; x++) {
+            const pixelOffset = rowOffset + x * 2;
+            if (skipBoundsCheck || (pixelOffset >= 0 && pixelOffset + 1 < src.length)) {
+                dst[dstIdx++] = ARGB4444_TO_RGBA[src[pixelOffset] | (src[pixelOffset + 1] << 8)];
             } else {
                 dst[dstIdx++] = 0xFF000000;
             }
@@ -742,8 +808,9 @@ function convertXRGB8888ToRGBA(
         return;
     }
 
-    // SLOW PATH: Bounds-checked byte-by-byte
-    Logger.warn(LogCategory.DDRAW,
+    // SLOW PATH: Bounds-checked byte-by-byte. A misaligned guest layout lands here on every
+    // conversion of that surface, so this cannot be a warn.
+    Logger.verbose(LogCategory.DDRAW,
         `🐌 convertXRGB8888ToRGBA SLOW PATH (bounds check): ${width}x${height} skipBoundsCheck=${skipBoundsCheck}`
     );
     let dstIdx = 0;
@@ -768,6 +835,55 @@ function convertXRGB8888ToRGBA(
 // ============================================================================
 
 /**
+ * The read leg (surface→RGBA) has always swizzled whole words; the write leg below stores
+ * 2–4 separate bytes per pixel, which on a full-screen GPU→CPU sync is the dominant cost of
+ * a Lock. These helpers give the write leg the same word-wide treatment: one typed view over
+ * the whole destination span (not per row — that would allocate per row), used only when the
+ * caller has already validated the extent and the guest pitch keeps every row aligned.
+ *
+ * `setWorkerFlag('__noFastPixelStore', true)` forces the byte loops back for an A/B.
+ */
+function fastPixelStoreEnabled(): boolean {
+    return !(globalThis as { __noFastPixelStore?: boolean }).__noFastPixelStore;
+}
+
+/** Whole-span destination view, or null when alignment/bounds rule it out. */
+function alignedDstView(
+    dst: Uint8Array, dstOffset: number, dstPitch: number,
+    width: number, height: number, bytesPerPixel: 2): Uint16Array | null;
+function alignedDstView(
+    dst: Uint8Array, dstOffset: number, dstPitch: number,
+    width: number, height: number, bytesPerPixel: 4): Uint32Array | null;
+function alignedDstView(
+    dst: Uint8Array,
+    dstOffset: number,
+    dstPitch: number,
+    width: number,
+    height: number,
+    bytesPerPixel: 2 | 4
+): Uint16Array | Uint32Array | null {
+    const byteStart = dst.byteOffset + dstOffset;
+    const mask = bytesPerPixel - 1;
+    if ((byteStart & mask) !== 0 || (dstPitch & mask) !== 0) return null;
+    const span = (height - 1) * dstPitch + width * bytesPerPixel;
+    if (span <= 0 || dstOffset < 0 || dstOffset + span > dst.length) return null;
+    const elements = span / bytesPerPixel;
+    return bytesPerPixel === 2
+        ? new Uint16Array(dst.buffer, byteStart, elements)
+        : new Uint32Array(dst.buffer, byteStart, elements);
+}
+
+/** RGBA source as words, or null when it is not 4-aligned. */
+function rgbaAsWords(rgbaData: Uint8ClampedArray): Uint32Array | null {
+    if (rgbaData.byteOffset % 4 !== 0 || rgbaData.length % 4 !== 0) return null;
+    try {
+        return new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.length / 4);
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Convert RGBA8888 (from GDI canvas) to RGB565 surface
  */
 export function convertRGBAToRGB565(
@@ -780,16 +896,26 @@ export function convertRGBAToRGB565(
     skipBoundsCheck: boolean = false
 ): void {
     const relativeDstOffset = dstOffset;
-    const canUseUint32 = rgbaData.byteOffset % 4 === 0 && rgbaData.length % 4 === 0;
-    let rgba32: Uint32Array | null = null;
-    
-    if (canUseUint32) {
-        try {
-            rgba32 = new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.length / 4);
-        } catch (e) {
-            rgba32 = null;
+    const rgba32: Uint32Array | null = rgbaAsWords(rgbaData);
+
+    if (skipBoundsCheck && rgba32 && fastPixelStoreEnabled()) {
+        const d16 = alignedDstView(dst, relativeDstOffset, dstPitch, width, height, 2);
+        if (d16) {
+            // Source word is 0xAABBGGRR; pack R5 G6 B5 straight out of it.
+            const pitch16 = dstPitch >> 1;
+            for (let y = 0; y < height; y++) {
+                const dstRow = y * pitch16;
+                const srcRow = y * width;
+                for (let x = 0; x < width; x++) {
+                    const p = rgba32[srcRow + x];
+                    d16[dstRow + x] =
+                        ((p & 0xF8) << 8) | ((p & 0xFC00) >> 5) | ((p & 0xF80000) >> 19);
+                }
+            }
+            return;
         }
     }
+
     if (skipBoundsCheck) {
         for (let y = 0; y < height; y++) {
             let dstIdx = relativeDstOffset + y * dstPitch;
@@ -854,13 +980,22 @@ export function convertRGBAToRGB555(
     skipBoundsCheck: boolean = false
 ): void {
     const relativeDstOffset = dstOffset;
-    const canUseUint32 = rgbaData.byteOffset % 4 === 0 && rgbaData.length % 4 === 0;
-    let rgba32: Uint32Array | null = null;
-    if (canUseUint32) {
-        try {
-            rgba32 = new Uint32Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.length / 4);
-        } catch (e) {
-            rgba32 = null;
+    const rgba32: Uint32Array | null = rgbaAsWords(rgbaData);
+
+    if (skipBoundsCheck && rgba32 && fastPixelStoreEnabled()) {
+        const d16 = alignedDstView(dst, relativeDstOffset, dstPitch, width, height, 2);
+        if (d16) {
+            const pitch16 = dstPitch >> 1;
+            for (let y = 0; y < height; y++) {
+                const dstRow = y * pitch16;
+                const srcRow = y * width;
+                for (let x = 0; x < width; x++) {
+                    const p = rgba32[srcRow + x];
+                    d16[dstRow + x] =
+                        ((p & 0xF8) << 7) | ((p & 0xF800) >> 6) | ((p & 0xF80000) >> 19);
+                }
+            }
+            return;
         }
     }
 
@@ -929,6 +1064,26 @@ export function convertRGBAToARGB8888(
 ): void {
     const relativeDstOffset = dstOffset;
 
+    if (skipBoundsCheck && fastPixelStoreEnabled()) {
+        const rgba32 = rgbaAsWords(rgbaData);
+        const d32 = rgba32
+            ? alignedDstView(dst, relativeDstOffset, dstPitch, width, height, 4)
+            : null;
+        if (rgba32 && d32) {
+            // 0xAABBGGRR → 0xAARRGGBB: keep A and G, swap R and B.
+            const pitch32 = dstPitch >> 2;
+            for (let y = 0; y < height; y++) {
+                const dstRow = y * pitch32;
+                const srcRow = y * width;
+                for (let x = 0; x < width; x++) {
+                    const p = rgba32[srcRow + x];
+                    d32[dstRow + x] = (p & 0xFF00FF00) | ((p & 0xFF) << 16) | ((p >>> 16) & 0xFF);
+                }
+            }
+            return;
+        }
+    }
+
     if (skipBoundsCheck) {
         for (let y = 0; y < height; y++) {
             let dstIdx = relativeDstOffset + y * dstPitch;
@@ -967,10 +1122,15 @@ export function convertRGBAToARGB8888(
 /**
  * Convert surface pixels to RGBA8888 using the optimal method for the format.
  * Returns the RGBA buffer ready for GPU upload.
- * 
+ *
+ * Handles every format and every layout, including out-of-bounds and misaligned
+ * ones; `convertSurfaceToRGBA` routes bulk work to the WASM kernel and falls
+ * back here. Exported so a differential test can drive both paths over one
+ * implementation instead of a duplicated oracle.
+ *
  * @param surfacePtr Absolute guest address of the surface memory
  */
-export function convertSurfaceToRGBA(
+export function convertSurfaceToRGBACpu(
     mem: Uint8Array,
     surfacePtr: number,
     width: number,
@@ -989,7 +1149,11 @@ export function convertSurfaceToRGBA(
 
     const pixelCount = width * height;
     const requiredBytes = pixelCount * 4;
-    const rgbaBuffer = outBuffer && outBuffer.length >= requiredBytes ? outBuffer : new Uint8Array(requiredBytes);
+    // Every branch writes RGBA through `rgba32`, whose construction throws unless the caller's
+    // buffer starts on a word boundary. A caller handing us a pooled subarray is entitled to any
+    // byteOffset, so convert into a scratch and copy back rather than refuse the layout.
+    const canWriteInPlace = !!outBuffer && outBuffer.length >= requiredBytes && (outBuffer.byteOffset & 3) === 0;
+    const rgbaBuffer = canWriteInPlace ? outBuffer! : new Uint8Array(requiredBytes);
     const rgba32 = new Uint32Array(rgbaBuffer.buffer, rgbaBuffer.byteOffset, pixelCount);
 
     const pixelFormat = detectPixelFormat(format);
@@ -997,6 +1161,12 @@ export function convertSurfaceToRGBA(
     const relativeSurfacePtr = surfacePtr;
     const lastOffset = relativeSurfacePtr + (height - 1) * pitch + width * bytesPerPixel - 1;
     const inBounds = width > 0 && height > 0 && relativeSurfacePtr >= 0 && lastOffset < mem.length;
+    // The 2/4-bpp converters read the source through Uint16Array/Uint32Array views; the
+    // byte-indexing converters and the bounds-checked slow paths do not care about alignment.
+    const fastSrc = inBounds
+        && (bytesPerPixel === 2 || bytesPerPixel === 4
+            ? srcFastPathOk(mem, relativeSurfacePtr, pitch, bytesPerPixel)
+            : true);
 
 
     switch (pixelFormat) {
@@ -1016,7 +1186,7 @@ export function convertSurfaceToRGBA(
             break;
 
         case PixelFormat.RGB565:
-            convertRGB565ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
+            convertRGB565ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, fastSrc);
             break;
 
         case PixelFormat.RGB555:
@@ -1027,16 +1197,20 @@ export function convertSurfaceToRGBA(
             convertARGB1555ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
             break;
 
+        case PixelFormat.ARGB4444:
+            convertARGB4444ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
+            break;
+
         case PixelFormat.RGB888:
             convertRGB888ToRGBA(mem, surfacePtr, pitch, rgbaBuffer, width, height, inBounds);
             break;
 
         case PixelFormat.ARGB8888:
-            convertARGB8888ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
+            convertARGB8888ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, fastSrc);
             break;
 
         case PixelFormat.XRGB8888:
-            convertXRGB8888ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, inBounds);
+            convertXRGB8888ToRGBA(mem, surfacePtr, pitch, rgba32, width, height, fastSrc);
             break;
 
         case PixelFormat.LUMINANCE8: {
@@ -1063,6 +1237,16 @@ export function convertSurfaceToRGBA(
         const bytesPerPixel = Math.max(1, format.bpp >> 3);
         // LEGACY: classic DirectDraw treats black (0x0000) as transparent under any colorkey.
 
+        // Keying clears ALPHA ONLY and preserves RGB — never `= 0`. SetColorKey does not
+        // modify a surface's pixels; the key is a per-OPERATION modifier, and every consumer
+        // applies it by comparing the SAMPLED COLOUR against the key: the colour-key Blt
+        // shader (generateColorKeyBlitShaderCode) and the D3D COLORKEYENABLE path
+        // (prepareDraw). Zeroing RGB here overwrites exactly the texels those comparisons
+        // need, so the key can never match again and the "transparent" region is blitted as
+        // OPAQUE BLACK. It also corrupts guest pixels, because this buffer is cached as
+        // rgbaScratch and written BACK through syncToCPUFromScratch.
+        // Matches applyColorKeyToRGBA and the compute converter, which already do this.
+
         // PERF: read the source through a plain typed-array VIEW over the underlying buffer.
         // Guest `mem` is a "bound Uint8Array" whose indexed reads are deoptimized ~50× — the
         // old per-pixel `mem[off]` byte loop here cost ~225ms on an 800×600 colorkeyed surface
@@ -1080,7 +1264,7 @@ export function convertSurfaceToRGBA(
                 for (let x = 0; x < width; x++) {
                     const pv = src16[ro + x];
                     const pm = pv & ckMask;
-                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] = 0;
+                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] &= 0x00FFFFFF;
                 }
             }
         } else if (regionInBounds && bytesPerPixel === 4 && (byteBase & 3) === 0 && (pitch & 3) === 0) {
@@ -1092,7 +1276,7 @@ export function convertSurfaceToRGBA(
                 for (let x = 0; x < width; x++) {
                     const pv = src32[ro + x] >>> 0;
                     const pm = (pv & ckMask) >>> 0;
-                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] = 0;
+                    if ((pm >= ckLowM && pm <= ckHighM) || pv === 0) rgba32[rr + x] &= 0x00FFFFFF;
                 }
             }
         } else {
@@ -1109,13 +1293,55 @@ export function convertSurfaceToRGBA(
                     else if (bytesPerPixel === 4) pixelValue = (mem[pixelOffset] | (mem[pixelOffset + 1] << 8) | (mem[pixelOffset + 2] << 16) | (mem[pixelOffset + 3] << 24)) >>> 0;
                     else pixelValue = mem[pixelOffset];
                     const pixelM = (pixelValue & ckMask) >>> 0;
-                    if ((pixelM >= ckLowM && pixelM <= ckHighM) || pixelValue === 0) rgba32[rgbaRowOffset + x] = 0;
+                    if ((pixelM >= ckLowM && pixelM <= ckHighM) || pixelValue === 0) rgba32[rgbaRowOffset + x] &= 0x00FFFFFF;
                 }
             }
         }
     }
 
+    if (outBuffer && !canWriteInPlace && outBuffer.length >= requiredBytes) {
+        outBuffer.set(rgbaBuffer.subarray(0, requiredBytes));
+        return outBuffer;
+    }
     return rgbaBuffer;
+}
+
+/**
+ * Bulk boundary for surface → RGBA8888. The WASM kernel fuses conversion and
+ * colour keying into one pass; anything it declines (format it has no arm for,
+ * a surface too small to amortise its two staging copies, an out-of-bounds or
+ * degenerate span) falls through to the complete TypeScript converter.
+ *
+ * Unkeyed RGB565 is deliberately NOT routed: it is already a single
+ * lookup-table pass, and the kernel's copy-in/copy-out costs more than its
+ * inner loop saves. That is a measured result, pinned by
+ * `tools/tests/pixel-routing.test.ts` — keyed RGB565 still goes to the kernel,
+ * because there the alternative is two passes over the surface.
+ */
+export function convertSurfaceToRGBA(
+    mem: Uint8Array,
+    surfacePtr: number,
+    width: number,
+    height: number,
+    pitch: number,
+    format: FormatInfo,
+    outBuffer?: Uint8Array,
+    colorkey?: { low: number; high: number },
+    palette?: Uint32Array
+): Uint8Array {
+    const pixelFormat = detectPixelFormat(format);
+    if (pixelFormat !== PixelFormat.RGB565 || colorkey) {
+        const requiredBytes = width * height * 4;
+        if (requiredBytes > 0 && Number.isSafeInteger(requiredBytes)) {
+            const plain = toPlainGuestMemory(mem);
+            const out = outBuffer && outBuffer.length >= requiredBytes ? outBuffer : new Uint8Array(requiredBytes);
+            // The kernel stages the source into its own memory before writing,
+            // so an output aliasing the guest surface is safe here.
+            if (tryConvertPixelKernel(pixelFormat, plain, surfacePtr, pitch, width, height, out, colorkey)) return out;
+            return convertSurfaceToRGBACpu(plain, surfacePtr, width, height, pitch, format, out, colorkey, palette);
+        }
+    }
+    return convertSurfaceToRGBACpu(mem, surfacePtr, width, height, pitch, format, outBuffer, colorkey, palette);
 }
 
 /**
@@ -1133,6 +1359,10 @@ export function convertRGBAToSurface(
     format: FormatInfo,
     options?: { clearAlphaBit?: boolean }
 ): void {
+    // Write leg of convertSurfaceToRGBA — same argument, same fix: every branch below
+    // stores `mem[i]` per pixel (2–4 Proxy set-traps per texel), and the loops execute
+    // no guest code, so the plain view cannot be invalidated under them.
+    mem = toPlainGuestMemory(mem);
     const pixelFormat = detectPixelFormat(format);
     const bytesPerPixel = Math.max(1, Math.floor(format.bpp / 8));
     const totalSize = pitch * height;
@@ -1150,6 +1380,7 @@ export function convertRGBAToSurface(
         return; // ABORT write to prevent corruption
     }
 
+    const lcConvert = lockCostProfiler.now();
     switch (pixelFormat) {
         case PixelFormat.RGB565:
             convertRGBAToRGB565(rgbaData, mem, surfacePtr, pitch, width, height, inBounds);
@@ -1165,6 +1396,7 @@ export function convertRGBAToSurface(
             convertGenericRGBAToSurface(rgbaData, mem, surfacePtr, width, height, pitch, format, options?.clearAlphaBit);
             break;
     }
+    lockCostProfiler.add(LP.convert, lcConvert);
 }
 
 function convertGenericRGBAToSurface(
@@ -1178,6 +1410,14 @@ function convertGenericRGBAToSurface(
     clearAlphaBit?: boolean
 ): void {
     // NOTE: surfacePtr maps directly to mem[] index — no byteOffset adjustment needed.
+    // A surface's pixels can be a BORROWED pointer (app-supplied lpSurface), so validate the
+    // full extent once here — the per-pixel loop below is the hot path and stays unguarded.
+    const span = Math.max(0, (height - 1)) * pitch + width * Math.max(1, format.bpp >> 3);
+    if (span > 0 && !isValidAddress(mem, surfacePtr, span, "rw")) {
+        Logger.warn(LogCategory.DDRAW,
+            `convertGenericRGBAToSurface: refusing 0x${surfacePtr.toString(16)}+0x${span.toString(16)} (${width}x${height} pitch=${pitch})`);
+        return;
+    }
     const bytesPerPixel = Math.max(1, format.bpp >> 3);
 
     const getMaskInfo = (mask: number) => {
@@ -1370,13 +1610,17 @@ export async function readSurfaceStateRGBA(
     state: DirectDrawSurfaceState,
     backend: { getDevice(): GPUDevice | null; getQueue(): GPUQueue | null } | null,
     flush?: () => void,
+    from: "auto" | "gpu" | "scratch" = "auto",
 ): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
     const w = state.width, h = state.height;
     if (!(w > 0 && h > 0)) return { err: `bad surface dims ${w}x${h}` };
     const scratch = (state as { rgbaScratch?: Uint8Array }).rgbaScratch;
-    if (scratch && scratch.length >= w * h * 4) {
+    // `from` forces which representation is read. The pair is the diagnostic: a surface
+    // whose CPU copy is full while the texture we actually sample is blank blits black.
+    if (from !== "gpu" && scratch && scratch.length >= w * h * 4) {
         return { w, h, rgba: scratch.slice(0, w * h * 4), source: "scratch" };
     }
+    if (from === "scratch") return { err: "no rgbaScratch" };
     if (!state.gpuTexture || !backend) return { err: "no gpuTexture and no rgbaScratch" };
     const device = backend.getDevice();
     const queue = backend.getQueue();
@@ -1389,7 +1633,11 @@ export async function readSurfaceStateRGBA(
     enc.copyTextureToBuffer({ texture: state.gpuTexture }, { buffer: buf, bytesPerRow }, { width: w, height: h, depthOrArrayLayers: 1 });
     queue.submit([enc.finish()]);
     const verr = await device.popErrorScope();
-    if (verr) { buf.destroy(); return { err: `validation: ${verr.message}` }; }
+    if (verr) {
+        recordGpuError("scope", "ddrawTextureReadback", verr.message);
+        buf.destroy();
+        return { err: `validation: ${verr.message}` };
+    }
     await buf.mapAsync(GPUMapMode.READ);
     const padded = new Uint8Array(buf.getMappedRange());
     const rgba = new Uint8Array(w * h * 4);

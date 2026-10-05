@@ -10,12 +10,24 @@
 
 import { System } from "../core/system";
 import { HarnessError, HarnessErrorCode } from "./rpc";
-import { windows, getAbsoluteWindowPosition } from "../modules/user32/shared-state";
+import {
+    windows,
+    getAbsoluteWindowPosition,
+    getCurrentCursorHandle,
+    getCursorDisplayCount,
+    isCursorClipped,
+    isGuestCursorVisible,
+} from "../modules/user32/shared-state";
+import { getWindowClass, getWindowClassByName } from "../modules/user32/class";
+import { getActiveDeviceCursor, isDeviceCursorVisible } from "../core/device-cursor";
+import { describePointerPolicy } from "../core/pointer-policy";
 import { leaseRegistry } from "../core/memory/lease-registry";
 import { memoryEventBuffer } from "../core/memory/memory-event-buffer";
 import { THREAD_STATE_NAMES, WAIT_REASON_NAMES } from "../core/scheduler/types";
 import { videoEngine } from "../../video/video-engine";
+import { getFfmpegHleStats } from "../modules/ffmpeg/native-patch";
 import { Logger, LogCategory } from "../core/logger";
+import { getSurfaceFormatLayout } from "../backends/webgpu/shared/texture-formats";
 
 /* ───────────────────────── low-level access helpers ───────────────────────── */
 
@@ -64,6 +76,101 @@ export function symbolize(addr: number): string | null {
 
 /* ───────────────────────────── section serializers ───────────────────────── */
 
+/** What to read AT a breakpoint hit: address = reg + offset, or *(reg + offset) with `deref`. */
+export interface RegisterRead {
+    reg: string;
+    offset?: number;
+    size?: number;
+    deref?: boolean;
+    /**
+     * Follow a POINTER CHAIN from the first address: each entry is dereferenced, then the next
+     * offset is added. `{reg:'esp', offset:0x14, chain:[0x10, 0x4c, 0]}` is `[[[[esp+0x14]+0x10]+0x4c]]`.
+     *
+     * A material's texture slot is three or four hops from anything a register holds, and a
+     * chain walked AFTER the guest resumes reads a different object — the giveaway being a link
+     * that comes back as executable code. The whole walk has to settle at the hit, and the
+     * result names WHICH link was null instead of leaving the reader to guess.
+     */
+    chain?: number[];
+    label?: string;
+}
+
+const REG_INDEX: Record<string, number> = { eax: 0, ecx: 1, edx: 2, ebx: 3, esp: 4, ebp: 5, esi: 6, edi: 7 };
+
+/**
+ * Settle register-relative reads at the instant of a hit. Deliberately not an expression
+ * language: the point is that the value is read WHILE the frame is still the caller's, since
+ * anything read after the guest resumes describes a later moment and cannot be told apart from
+ * a wrong offset. An unknown register or an unreadable address is an ERROR entry, never a zero.
+ *
+ * Shared by the EIP and the API breakpoint paths so the two cannot answer differently.
+ */
+export function settleRegisterReads(cpuState: { reg32: Int32Array | Uint32Array }, specs: readonly RegisterRead[]): unknown[] {
+    const mem = guestMem();
+    const out: unknown[] = [];
+    // An empty array reads as "nothing was asked for". A request that could not be served
+    // has to say so, or a hit with no guest memory is indistinguishable from a hit with no
+    // reads configured.
+    if (!mem) {
+        for (const spec of specs.slice(0, 32)) {
+            out.push({ label: spec.label ?? spec.reg, error: "no guest memory in this realm — nothing was read" });
+        }
+        return out;
+    }
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const hx = (n: number): string => "0x" + (n >>> 0).toString(16);
+    const readU32 = (at: number): number | null =>
+        at >= 0 && at + 4 <= mem.length ? view.getUint32(at, true) >>> 0 : null;
+
+    for (const spec of specs.slice(0, 32)) {
+        const label = spec.label ?? `${spec.reg}+0x${(spec.offset ?? 0).toString(16)}${spec.deref ? "*" : ""}`;
+        const ri = REG_INDEX[String(spec.reg).toLowerCase()];
+        if (ri === undefined) {
+            out.push({ label, error: `unknown register '${spec.reg}' (eax/ecx/edx/ebx/esp/ebp/esi/edi)` });
+            continue;
+        }
+        const base = ((cpuState.reg32[ri]! >>> 0) + ((spec.offset ?? 0) | 0)) >>> 0;
+        let addr = base;
+        let via: string | undefined;
+        if (spec.chain && spec.chain.length) {
+            const hops: string[] = [hx(base)];
+            let cur = base;
+            let broke = false;
+            for (let i = 0; i < Math.min(spec.chain.length, 8); i++) {
+                const p = readU32(cur);
+                if (p === null) {
+                    out.push({ label, hops, error: `link ${i} at ${hx(cur)} is outside guest memory` });
+                    broke = true;
+                    break;
+                }
+                if (p === 0) {
+                    // The answer this exists for: name the hop that is null, not the symptom.
+                    out.push({ label, hops, nullAtLink: i, error: `link ${i} (read at ${hx(cur)}) is NULL` });
+                    broke = true;
+                    break;
+                }
+                cur = (p + (spec.chain[i]! | 0)) >>> 0;
+                hops.push(`*${hx(p)}+0x${(spec.chain[i]! | 0).toString(16)}=${hx(cur)}`);
+            }
+            if (broke) continue;
+            via = hops.join(" -> ");
+            addr = cur;
+        } else if (spec.deref) {
+            const p = readU32(base);
+            if (p === null) { out.push({ label, base: hx(base), error: "deref source out of guest range" }); continue; }
+            if (p === 0) { out.push({ label, base: hx(base), ptr: "0x0", error: "pointer is NULL — not read" }); continue; }
+            via = hx(base);
+            addr = p;
+        }
+        const size = Math.min(Math.max((spec.size ?? 4) | 0, 1), 4096);
+        if (addr < 4 || addr + size > mem.length) { out.push({ label, addr: hx(addr), via, error: "out of guest range" }); continue; }
+        let hex = "";
+        for (let i = 0; i < size; i++) hex += mem[addr + i]!.toString(16).padStart(2, "0");
+        out.push({ label, addr: hx(addr), via, size, hex, u32: size === 4 ? hx(view.getUint32(addr, true) >>> 0) : undefined });
+    }
+    return out;
+}
+
 export function serializeCpu(): unknown {
     const c = cpu();
     if (!c) return null;
@@ -93,6 +200,8 @@ export function serializeThreads(): unknown {
     const runQueue: number[] = Array.isArray(sched.runQueue) ? [...sched.runQueue] : [];
     const liveCpu = cpu();
     const threads: unknown[] = [];
+    const retired: Record<number, number> = sched.getThreadRetiredInsns?.() ?? {};
+    const cpuMs: Record<number, number> = sched.getThreadCpuMs?.() ?? {};
     if (threadsMap) {
         for (const [, t] of threadsMap) {
             const isRunning = t.id === currentThreadId;
@@ -107,6 +216,13 @@ export function serializeThreads(): unknown {
                 stateName: (THREAD_STATE_NAMES as Record<number, string>)[t.state] ?? String(t.state),
                 waitReason: t.waitInfo?.reason ?? null,
                 waitReasonName: t.waitInfo?.reason != null ? ((WAIT_REASON_NAMES as Record<number, string>)[t.waitInfo.reason] ?? null) : null,
+                // WHAT the thread is blocked on, not just that it is blocked — a deadlock
+                // reads as "everyone WAITING" without it, and the handles are what pair a
+                // stuck waiter with whoever should have signalled.
+                waitHandles: (t.waitInfo?.handles ?? []).map((h: number) => u32(h)),
+                waitAll: t.waitInfo?.waitAll ?? false,
+                waitCsAddress: u32(t.waitInfo?.csAddress ?? 0),
+                waitTimeoutTimerId: u32(t.waitInfo?.timeoutTimerId ?? 0),
                 eip,
                 eipSym: symbolize(eip),
                 esp,
@@ -114,10 +230,22 @@ export function serializeThreads(): unknown {
                 suspendCount: t.suspendCount ?? 0,
                 priority: t.priority ?? 0,
                 running: isRunning,
+                startAddress: u32(t.startAddress),
+                retiredInsns: retired[t.id] ?? 0,
+                cpuMs: cpuMs[t.id] ?? 0,
             });
         }
     }
-    return { currentThreadId, runQueue, count: threads.length, threads };
+    // Suspend-vs-wait census: WAITING+suspendCount>0 is a legal, transient shape and a
+    // point-sampled thread list cannot show whether it ever happened. These cumulative
+    // counters can — `suspendOnWaiting: 0` means the suspend/wait interaction never arose.
+    return {
+        currentThreadId, runQueue, count: threads.length, threads,
+        suspendWait: sched.suspendWaitStats ? { ...sched.suspendWaitStats } : null,
+        // Stack footprint + release ledger: a thread-churn leak is invisible in a point
+        // sample of the thread list, and `stats.held*` names whatever is refusing release.
+        stacks: sched.getStackFootprint?.() ?? null,
+    };
 }
 
 /** Enumerate all surface-like COM objects backend-agnostically (DDraw/D3D7/D3D8). */
@@ -132,18 +260,52 @@ export function serializeSurfaces(): unknown {
     for (const o of objs) {
         const st = o?.getState?.();
         if (!st || typeof st.surfacePtr !== "number" || typeof st.width !== "number") continue;
+        // The guest COM address, so a breakOnApi this-ptr can be named. Without it a
+        // break snapshot's args and this list share no key and cannot be joined at all.
+        let comAddr = 0;
+        try { comAddr = u32(provider?.getAddressForHandle?.(o._handle ?? o.handle)); } catch { /* not registered */ }
         out.push({
             ptr: st.surfacePtr >>> 0,
             ptrHex: "0x" + (st.surfacePtr >>> 0).toString(16),
+            comAddrHex: comAddr ? "0x" + comAddr.toString(16) : null,
+            attachedSurfaceAddrHex: st.attachedSurfaceAddr ? "0x" + u32(st.attachedSurfaceAddr).toString(16) : null,
+            // The whole attachment picture, so surface LIFETIME is inspectable: who is
+            // attached to whom, which members DirectDraw owns (implicit, never counted),
+            // which surface holds the one reference AddAttachedSurface takes, and the
+            // resulting refcount. "The attach ref leaked" is otherwise invisible until a
+            // freed COM block is dispatched through.
+            attachedSurfaceAddrs: st.attachedSurfaceAddrs?.map((a: number) => "0x" + u32(a).toString(16)) ?? null,
+            implicitChainMember: st.implicitChainMember ?? false,
+            attachRefOwnerHex: st.attachRefOwner ? "0x" + u32(st.attachRefOwner).toString(16) : null,
+            refCount: typeof o?.refCount === "number" ? o.refCount : null,
+            zOwnerSurfaces: st.zOwnerSurfaces?.map((a: number) => "0x" + u32(a).toString(16)) ?? null,
             width: st.width,
             height: st.height,
             pitch: st.pitch ?? 0,
             bpp: st.format?.bpp ?? 0,
+            // A DDPF_FOURCC surface carries NO bit count and no masks by contract, so bpp
+            // alone renders a DXT surface indistinguishable from an RGB one in this dump —
+            // and "the pitch is linear where it should be blocked" is exactly the bug shape
+            // that hides there. expectedPitch is what the format's own layout demands.
+            fourCC: st.format?.fourCC
+                ? String.fromCharCode(
+                    st.format.fourCC & 0xff, (st.format.fourCC >>> 8) & 0xff,
+                    (st.format.fourCC >>> 16) & 0xff, (st.format.fourCC >>> 24) & 0xff)
+                : null,
+            expectedPitch: st.format
+                ? getSurfaceFormatLayout(st.format, st.width, st.height).pitch
+                : null,
             caps: u32(st.caps),
             surfaceType: st.surfaceType ?? null,
             mode: st.mode ?? null,
             version: st.version ?? null,
             gpuDirty: st.gpuDirty ?? null,
+            lastUploadVersion: st.lastUploadVersion ?? null,
+            // A source colour key changes what a Blt of this surface MEANS; without it
+            // "the texture is black" and "the texture is fully keyed" look identical.
+            srcColorKey: st.srcColorKey
+                ? "0x" + u32(st.srcColorKey.low).toString(16) + "-0x" + u32(st.srcColorKey.high).toString(16)
+                : null,
             hasGpuTexture: !!st.gpuTexture,
             gpuTextureFormat: st.gpuTextureFormat ?? null,
             mipMapCount: st.mipMapCount ?? null,
@@ -155,8 +317,19 @@ export function serializeSurfaces(): unknown {
     return out;
 }
 
+/** The registered class behind a window, by atom when we have one and by name otherwise. */
+function windowClassInfo(w: { classId?: number; nativeClassName?: string }): { hCursor?: number } | undefined {
+    if (w.classId !== undefined) return getWindowClass(w.classId);
+    return w.nativeClassName ? getWindowClassByName(w.nativeClassName) : undefined;
+}
+
 export function serializeWindows(): unknown {
     const out: unknown[] = [];
+    const wm = sys().windowManager;
+    const activeHwnd = wm.getActiveHwnd();
+    const focusHwnd = wm.getFocusHwnd();
+    const foregroundHwnd = wm.getForegroundHwnd();
+    const zOrder = wm.getZOrder();
     for (const [hwnd, w] of windows) {
         const abs = getAbsoluteWindowPosition(w);
         const width = w.width ?? 0, height = w.height ?? 0;
@@ -168,10 +341,51 @@ export function serializeWindows(): unknown {
             x: abs.x, y: abs.y, w: width, h: height,
             cx: abs.x + (width >> 1), cy: abs.y + (height >> 1),
             visible: !!w.visible,
+            // ACTIVE, FOCUS and FOREGROUND are three different answers in Win32, and a game
+            // that polls GetFocus()/GetActiveWindow() every frame to decide whether to render
+            // reads whichever one we get wrong. Reporting only `active` left a zero focus
+            // invisible — which reads as "the window is fine" while the guest sees otherwise.
+            active: hwnd === activeHwnd,
+            focused: hwnd === focusHwnd,
+            foreground: hwnd === foregroundHwnd,
+            zIndex: zOrder.indexOf(hwnd),
             parent: w.parent ?? null,
             childCount: w.children?.length ?? 0,
             style: u32(w.style),
+            // VCL/MFC associate a native HWND with its component object through these
+            // fields. A window that paints but routes every message to the framework
+            // default is otherwise indistinguishable from one whose event bindings work.
+            userData: u32(w.userData),
+            userDataHex: "0x" + u32(w.userData).toString(16),
+            createParam: u32(w.createParam),
+            createParamHex: "0x" + u32(w.createParam).toString(16),
+            extraBytes: w.extraBytes ? Array.from(w.extraBytes, u32) : [],
+            // Keeping the address in the harness view makes a guest window that is
+            // idle in its message loop directly debuggable without reaching into
+            // private user32 state from the probe.
+            wndProc: u32(w.wndProc),
+            wndProcHex: "0x" + u32(w.wndProc).toString(16),
+            // A form can look active in the host model while its initial activation callback
+            // was deferred or lost during CreateWindowEx. Keep the delivery fact visible so
+            // an OnActivate-dependent launcher is diagnosable without inferred message order.
+            activationDelivered: !!w.activationDelivered,
+            createInProgress: !!w.createInProgress,
+            createSyncVisibleDelivered: !!w.createSyncVisibleDelivered,
+            createSyncActivationDelivered: !!w.createSyncActivationDelivered,
             customPaint: !!w.guestCustomPaint,
+            // Which proc will see a message: a subclassed control's guest proc runs first
+            // and reaches the class behaviour only through CallWindowProc.
+            subclassed: !!w.wndProcSubclassed,
+            // The pointer Windows shows over a window is its CLASS cursor, applied by
+            // DefWindowProc's WM_SETCURSOR — an app that wants no pointer registers the
+            // class with hCursor NULL and never calls ShowCursor. Without this fact the
+            // only way to see it is to decode an MFC-synthesised class NAME.
+            //
+            // Resolved by name as well as by atom: CreateWindowEx only records classId
+            // when the app passed an ATOM, so a class-cursor read keyed on classId alone
+            // answers 0 for nearly every window — indistinguishable from a real NULL.
+            classCursor: u32(windowClassInfo(w)?.hCursor),
+            classKnown: !!windowClassInfo(w),
         });
     }
     return out;
@@ -229,9 +443,78 @@ export function serializeAudio(): unknown {
 }
 
 export function serializeVideo(): unknown {
-    // VideoEngine doesn't expose "which session is active"; report load state and
-    // let callers drill into a specific handle via the video.info verb.
-    return { loaded: !!videoEngine?.isLoaded?.() };
+    // VideoEngine doesn't expose "which session is active", so the answer to "where
+    // do the decoded frames actually go" lives in VideoRoutingService: the resolved
+    // sink per session, the target hint the codec published, and the overlay plane's
+    // own size. Without it a mis-sized or mis-routed video looks identical to a
+    // decode failure from the outside.
+    const routing: any = sys().videoRouting;
+    const info = routing?.getDebugInfo?.() ?? null;
+    return {
+        loaded: !!videoEngine?.isLoaded?.(),
+        // The composite verdict, hoisted out of `routing` because it is the first question
+        // asked when the screen is wrong: is the video plane on top of this frame, and why.
+        // `reason` names the rule (video/video-plane-policy.ts), never just "no".
+        plane: info ? { ...info.plane, overlay: info.overlay } : null,
+        routing: info,
+        // Separates "we replaced the guest's ffmpeg decode" from "we declined and it is still
+        // running its own": `served` counts frames we published, `declined` calls handed back.
+        ffmpegHle: getFfmpegHleStats(),
+        // The video quality knobs (videoChroma/videoDither/videoDeinterlace) only touch frames
+        // WE decode. `sessions` empty while a movie is visibly playing means the title runs
+        // its own player DLL on the CPU and no knob can reach that picture.
+        enhance: videoEngine?.getEnhancementState?.() ?? null,
+    };
+}
+
+/**
+ * Guest pointer state — the whole "why is there no cursor" question in one POJO.
+ * A game hides the system pointer either with SetCursor(NULL) (handle 0) or by
+ * driving the display count negative, and is then expected to draw its own; the
+ * shape the host renders comes from the CURSOR user object behind the handle.
+ * `visible` is READ from core/pointer-policy — the decision the host actually acts
+ * on — next to the guest facts it was derived from, so "we hid it", "something
+ * outranks it" and "we kept it but the shape never arrived" stay distinguishable.
+ */
+export function serializeCursor(): unknown {
+    const handle = getCurrentCursorHandle();
+    const obj: any = sys().resourceProvider?.getUserObject?.(handle);
+    const hasPixels = obj?.type === "CURSOR"
+        && obj.pixels instanceof Uint8Array
+        && obj.width > 0 && obj.height > 0;
+    const device = getActiveDeviceCursor();
+    const policy = describePointerPolicy();
+    return {
+        // READ from the policy, never re-derived: core/pointer-policy is what the host
+        // acts on, and a second derivation here reports a pointer the host was never
+        // asked for (an acquired exclusive-mode DI mouse hides it with no Win32 call).
+        visible: policy.outputs.pointerShown,
+        // The Win32 half on its own, so "we hid it" and "something else outranks it"
+        // stay distinguishable.
+        win32Visible: isGuestCursorVisible(),
+        pointerPolicy: policy,
+        displayCount: getCursorDisplayCount(),
+        handle,
+        handleHex: "0x" + handle.toString(16),
+        clipped: isCursorClipped(),
+        image: hasPixels
+            ? { width: obj.width, height: obj.height, hotspotX: obj.xHotspot ?? 0, hotspotY: obj.yHotspot ?? 0 }
+            : null,
+        objType: obj?.type ?? null,
+        deviceCursor: device
+            ? { width: device.width, height: device.height, hotspotX: device.hotspotX, hotspotY: device.hotspotY }
+            : null,
+        deviceCursorVisible: isDeviceCursorVisible(),
+    };
+}
+
+/**
+ * Buffered-DirectInput production trail. A DI game that ignores our synthetic input
+ * looks identical from the WM side (wmTrace shows a perfect sequence) whether the
+ * DI queue got the event or not — this is the other half of that question.
+ */
+export function serializeDInput(): unknown {
+    return sys().inputManager?.getDInputDiagnostics?.() ?? null;
 }
 
 export function serializeScreen(): unknown {
@@ -243,11 +526,18 @@ export function serializeScreen(): unknown {
         h = ctx?.display?.height ?? 0;
     } catch { /* */ }
     const render: any = sys().services?.render;
+    // The CANVAS size is a separate fact from the DDraw display mode above, and a
+    // mismatch is exactly the bug class that reads as "cropped/squished pixels" — so
+    // report both rather than letting `width/height` stand in for "the resolution".
+    const canvas: any = (sys().process as any)?.canvas;
     return {
         primaryPtr,
         primaryPtrHex: "0x" + primaryPtr.toString(16),
+        /** DDraw display mode (SetDisplayMode/ChangeDisplaySettings), NOT the canvas. */
         width: w,
         height: h,
+        canvasWidth: canvas?.width ?? 0,
+        canvasHeight: canvas?.height ?? 0,
         presenter: render?.getLastPresenterKind?.() ?? null,
         presentSerial: render?.getPresentSerial?.() ?? 0,
     };
@@ -286,7 +576,46 @@ export function faultSnapshot(): unknown {
     return { eip, eipSym: symbolize(eip), esp, bytes, stack, recent, logTail, cpu: serializeCpu(), threads: serializeThreads() };
 }
 
-/** Read up to 4 stack args (esp+4..esp+0x10) + return address (esp) — for apiBreak. */
+/**
+ * A pointer argument decoded as text, or null. Most bring-up questions about a
+ * call are "WHICH one" — which file, which resource name, which class — and the
+ * answer is behind the pointer, not in the number. The stack is gone by the time
+ * a script could read it back (apiBreak does not pause the guest), so decode at
+ * the hit instant. ANSI first, then UTF-16LE; anything not fully printable and
+ * NUL-terminated inside the window is reported as null rather than guessed at.
+ */
+function decodeStringArg(mem: Uint8Array | null, ptr: number): string | null {
+    const p = ptr >>> 0;
+    if (!mem || p < 0x1000 || p + 2 > mem.length) return null;
+    const printable = (c: number): boolean => c === 9 || (c >= 0x20 && c !== 0x7f);
+    const limit = Math.min(mem.length, p + 260);
+    // ANSI
+    let ansi = "";
+    for (let a = p; a < limit; a++) {
+        const c = mem[a]!;
+        if (c === 0) break;
+        if (!printable(c)) { ansi = ""; break; }
+        ansi += String.fromCharCode(c);
+    }
+    if (ansi.length >= 2) return ansi;
+    // UTF-16LE (mem[p+1] === 0 with a printable lead byte is the giveaway)
+    let wide = "";
+    for (let a = p; a + 1 < limit; a += 2) {
+        const c = mem[a]! | (mem[a + 1]! << 8);
+        if (c === 0) break;
+        if (c > 0xff || !printable(c)) { wide = ""; break; }
+        wide += String.fromCharCode(c);
+    }
+    if (wide.length >= 2) return wide;
+    return ansi.length ? ansi : null;
+}
+
+/** Read up to 8 stack args (esp+4..esp+0x20) + return address (esp) — for apiBreak.
+ *  Eight, not four: COM methods routinely take 6-7 (IDirect3D9::CreateDevice's
+ *  pPresentationParameters is arg 5), and a snapshot that silently stops at 4 hands the
+ *  reader a `0` that is indistinguishable from a real NULL pointer. */
+const ARG_OFFSETS = [4, 8, 12, 16, 20, 24, 28, 32];
+
 export function readCallSnapshot(name: string, eip: number, esp: number): unknown {
     const mem = guestMem();
     const r = (off: number): number => {
@@ -313,6 +642,29 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
             }));
         }
     } catch { /* */ }
+    let es = -1;
+    let regs: Record<string, number> | undefined;
+    try {
+        const c = cpu() as any;
+        if (c?.sreg) es = c.sreg[0] & 0xffff;
+        // General-purpose regs at the hit instant — many WA methods are register-based
+        // (this=ESI/ECX, index=EDI), so the caller-of-interest's context often lives here.
+        if (c?.reg32) {
+            regs = {
+                eax: c.reg32[0] >>> 0, ecx: c.reg32[1] >>> 0, edx: c.reg32[2] >>> 0, ebx: c.reg32[3] >>> 0,
+                esp: c.reg32[4] >>> 0, ebp: c.reg32[5] >>> 0, esi: c.reg32[6] >>> 0, edi: c.reg32[7] >>> 0,
+            };
+        }
+    } catch { /* */ }
+    // Raw window around ESP — the caller's saved registers and ITS return slot sit
+    // just past the arguments, which is where stack-corruption bugs show up (a
+    // clobbered return address is invisible to the symbolized backtrace, since the
+    // walker skips words that don't look like code).
+    const stackWords: string[] = [];
+    for (let off = -8; off <= 40; off += 4) {
+        stackWords.push(`[ESP${off < 0 ? "-" : "+"}0x${Math.abs(off).toString(16)}]=0x${r(off).toString(16)}`);
+    }
+
     return {
         name,
         eip: eip >>> 0,
@@ -320,8 +672,12 @@ export function readCallSnapshot(name: string, eip: number, esp: number): unknow
         esp: esp >>> 0,
         caller: r(0),
         callerSym: symbolize(r(0)),
-        args: [r(4), r(8), r(12), r(16)],
+        args: ARG_OFFSETS.map(r),
+        argStrings: ARG_OFFSETS.map(r).map((a) => decodeStringArg(mem, a)),
+        stackWords,
         threadId,
+        es,
+        regs,
         lastThunks: recent,
         backtrace,
     };
@@ -339,4 +695,6 @@ export const STATE_SECTIONS: Record<string, () => unknown> = {
     audio: serializeAudio,
     video: serializeVideo,
     screen: serializeScreen,
+    cursor: serializeCursor,
+    dinput: serializeDInput,
 };

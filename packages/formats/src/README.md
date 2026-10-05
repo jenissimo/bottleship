@@ -19,6 +19,7 @@ inno/         Inno Setup installer reader        → unpack (+ pako)
 freearc/      FreeArc .arc / repack reader       → unpack
 iso/          ISO9660 / BIN+CUE disc images      → unpack
 installshield/ InstallShield 5/6 cabinets        → unpack
+rtf/          Rich Text Format documents        → (nothing)
 ```
 
 Every reader depends only on `unpack` (the core) and, for `inno`, the `pako` npm package.
@@ -43,6 +44,7 @@ The srep + LZMA decode is verified byte-exact against references compiled with M
 - `freearc`: `detectFreeArc`, `readFreeArcListing`, `extractFreeArc`, `extractFreeArcToMap`.
 - `iso`: `IsoImage`, `parseIso9660`, `extractIsoToMap`, `parseCue`.
 - `installshield`: `detectInstallShieldStem`, `extractInstallShield`.
+- `rtf`: `isRtf`, `parseRtf` (styled runs; pass `decode` to supply code-page tables).
 
 ## Extraction-readiness checklist (for a separate repo)
 

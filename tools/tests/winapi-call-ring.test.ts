@@ -19,15 +19,15 @@ describe('WinApiCallRing', () => {
         ring.record(2, 0x1004, 0, 0);
 
         expect(ring.getCalls(8)).toEqual([
-            '0x1:kernel32:GetTickCount(ESP=0x1000)',
-            '0x2:user32:GetMessageA(ESP=0x1004)',
+            '0x1:kernel32:GetTickCount(ESP=0x1000) -> (in flight)',
+            '0x2:user32:GetMessageA(ESP=0x1004) -> (in flight)',
         ]);
     });
 
     it('unknown ids resolve to "unknown" in getCalls/getCallsRich', () => {
         const ring = new WinApiCallRing(makeNames({}));
         ring.record(7, 0x2000, 0, 0);
-        expect(ring.getCalls(8)).toEqual(['0x7:unknown(ESP=0x2000)']);
+        expect(ring.getCalls(8)).toEqual(['0x7:unknown(ESP=0x2000) -> (in flight)']);
         expect(ring.getCallsRich(8)[0].name).toBe('unknown');
     });
 
@@ -37,10 +37,10 @@ describe('WinApiCallRing', () => {
         ring.record(1, 0x10, 0, 0); // noisy
         ring.record(2, 0x20, 0, 0); // benign
 
-        expect(ring.getCalls(8)).toEqual(['0x2:kernel32:GetTickCount(ESP=0x20)']);
+        expect(ring.getCalls(8)).toEqual(['0x2:kernel32:GetTickCount(ESP=0x20) -> (in flight)']);
         expect(ring.getCalls(8, { includeNoisy: true })).toEqual([
-            '0x1:gdi32:BitBlt(ESP=0x10)',
-            '0x2:kernel32:GetTickCount(ESP=0x20)',
+            '0x1:gdi32:BitBlt(ESP=0x10) -> (in flight)',
+            '0x2:kernel32:GetTickCount(ESP=0x20) -> (in flight)',
         ]);
     });
 
@@ -48,7 +48,7 @@ describe('WinApiCallRing', () => {
         const ring = new WinApiCallRing(makeNames({ 1: 'd3d9:DrawPrimitive' }));
         ring.record(1, 0x40, 0, 0);
         // Only a noisy call exists → non-empty result via includeNoisy retry.
-        expect(ring.getCalls(8)).toEqual(['0x1:d3d9:DrawPrimitive(ESP=0x40)']);
+        expect(ring.getCalls(8)).toEqual(['0x1:d3d9:DrawPrimitive(ESP=0x40) -> (in flight)']);
     });
 
     it('recordReturnValue fills EAX of the most recent call (seen by getTrace)', () => {
@@ -69,7 +69,7 @@ describe('WinApiCallRing', () => {
         expect(ring.getCrashTraceLines(50)).toEqual([]); // empty ring → empty, unlike getTrace
         ring.record(9, 0x80, 0x1, 0);
         ring.recordReturnValue(0x7);
-        expect(ring.getCrashTraceLines(50)).toEqual(['  [0] winmm:timeGetTime(arg0=0x1) -> 0x7']);
+        expect(ring.getCrashTraceLines(50)).toEqual(['  [0] winmm:timeGetTime(arg0=0x1) esp=0x80 ret=0x0 -> 0x7']);
     });
 
     it('keeps only the newest HISTORY_SIZE entries and wraps correctly', () => {
@@ -81,7 +81,40 @@ describe('WinApiCallRing', () => {
         const calls = ring.getCalls(1000, { includeNoisy: true });
         expect(calls.length).toBe(256);          // capacity, not 300
         // Newest entry is the last recorded (id 299).
-        expect(calls[calls.length - 1]).toBe(`0x${(299).toString(16)}:dll:fn299(ESP=0x${(0x1000 + 299).toString(16)})`);
+        expect(calls[calls.length - 1]).toBe(`0x${(299).toString(16)}:dll:fn299(ESP=0x${(0x1000 + 299).toString(16)}) -> (in flight)`);
+    });
+
+    it('tells "returned zero" apart from "never returned"', () => {
+        const names = makeNames({ 1: 'kernel32:GetLastError', 2: 'kernel32:GetTickCount' });
+        const ring = new WinApiCallRing(names);
+        ring.record(1, 0x10, 0, 0);
+        ring.recordReturnValue(0);
+        ring.record(2, 0x20, 0, 0);
+
+        expect(ring.getCalls(8, { includeNoisy: true })).toEqual([
+            '0x1:kernel32:GetLastError(ESP=0x10) -> 0x0',
+            '0x2:kernel32:GetTickCount(ESP=0x20) -> (in flight)',
+        ]);
+    });
+
+    it('recordAsyncReturnByName credits the parked call, not the newest entry', () => {
+        const names = makeNames({ 1: 'kernel32:WaitForSingleObject', 2: 'kernel32:GetTickCount' });
+        const ring = new WinApiCallRing(names);
+        ring.record(1, 0x10, 0, 0);          // parks
+        ring.record(2, 0x20, 0, 0);          // another thread runs meanwhile
+        ring.recordReturnValue(0x1234);      // ...and completes
+        expect(ring.recordAsyncReturnByName('kernel32:WaitForSingleObject', 0x102)).toBe(true);
+
+        expect(ring.getCalls(8, { includeNoisy: true })).toEqual([
+            '0x1:kernel32:WaitForSingleObject(ESP=0x10) -> 0x102',
+            '0x2:kernel32:GetTickCount(ESP=0x20) -> 0x1234',
+        ]);
+    });
+
+    it('recordAsyncReturnByName reports failure once the call has been evicted', () => {
+        const ring = new WinApiCallRing(makeNames({ 1: 'kernel32:GetTickCount' }));
+        ring.record(1, 0x10, 0, 0);
+        expect(ring.recordAsyncReturnByName('kernel32:Unrecorded', 7)).toBe(false);
     });
 
     it('reset clears the ring', () => {
@@ -102,15 +135,15 @@ describe('WinApiCallRing', () => {
             ring.record(3, 0x3f6418e8, 0, 0x8662, 1); // T1's wild-ESP call
 
             expect(ring.getThreadTail(1, 24)).toEqual([
-                '0x1:kernel32:Foo(esp=0x10ffa0,[esp]=0x401000)',
-                '0x3:kernel32:Bar(esp=0x3f6418e8,[esp]=0x8662)',
+                '0x1:kernel32:Foo(esp=0x10ffa0,[esp]=0x401000) -> (in flight)',
+                '0x3:kernel32:Bar(esp=0x3f6418e8,[esp]=0x8662) -> (in flight)',
             ]);
         });
 
         it('does NOT noise-filter — a thread\'s render-loop tail is preserved', () => {
             const ring = new WinApiCallRing(makeNames({ 2: 'ddraw:Flip' }));
             ring.record(2, 0x100, 0, 0, 3);
-            expect(ring.getThreadTail(3, 8)).toEqual(['0x2:ddraw:Flip(esp=0x100,[esp]=0x0)']);
+            expect(ring.getThreadTail(3, 8)).toEqual(['0x2:ddraw:Flip(esp=0x100,[esp]=0x0) -> (in flight)']);
         });
 
         it('returns empty for a thread with no recorded calls', () => {
@@ -126,7 +159,7 @@ describe('WinApiCallRing', () => {
             for (let i = 0; i < 10; i++) ring.record(i, 0x1000 + i, 0, 0, 2);
             const tail = ring.getThreadTail(2, 3);
             expect(tail.length).toBe(3);
-            expect(tail[2]).toBe(`0x9:dll:fn9(esp=0x${(0x1000 + 9).toString(16)},[esp]=0x0)`);
+            expect(tail[2]).toBe(`0x9:dll:fn9(esp=0x${(0x1000 + 9).toString(16)},[esp]=0x0) -> (in flight)`);
         });
     });
 });

@@ -4,6 +4,22 @@
 
 import type { StageSamplerState } from "./ffp-stages";
 
+/** The vertex shader's `isRHW` slot is a BITFIELD, not a bool — bit 0 says the vertex is
+ *  pre-transformed (skip the MVP), bit 1 says clamp its depth instead of letting the
+ *  clipper reject it. Widening it in place keeps both uniform layouts (and their offset
+ *  tables) untouched; every reader must mask, never compare against 1. */
+export const RHW_PRETRANSFORMED = 1;
+/** Depth CLAMP instead of depth CLIP for this draw. A pre-transformed vertex carries device
+ *  coordinates, and with D3DRS_ZENABLE=FALSE its z is read by nothing: no depth test, no
+ *  depth write (see pipeline-factory — both are forced off). Real hardware still rasterizes
+ *  such a quad whatever z holds, and games leave that field stale in the vertex buffer they
+ *  reuse for HUD sprites. WebGPU clips against the view volume unconditionally unless the
+ *  optional `depth-clip-control` feature is enabled, so an out-of-range z silently deletes
+ *  the primitive — and a quad whose vertices straddle the plane loses part of itself, which
+ *  looks exactly like an invisible plane cutting the HUD. Clamping in the shader reproduces
+ *  `unclippedDepth` without depending on an optional feature. */
+export const RHW_DEPTH_CLAMP = 2;
+
 /**
  * Debug flags for active diagnostics (3D blank-screen debugging)
  */
@@ -14,8 +30,15 @@ export interface DebugFlags {
     debugView: "normal" | "uv" | "vertexcolor" | "alpha" | "solid";
     /** Force disable alpha blending */
     forceDisableAlphaBlend: boolean;
+    /** Force FFP lighting off while preserving material, texture, and vertex inputs. */
+    forceDisableLighting: boolean;
     /** Force disable Z test */
     forceDisableZTest: boolean;
+    /** DIAG: keep the depth TEST but let no draw WRITE depth. Splits forceDisableZTest into
+     *  its two halves: geometry that reappears under this one is being rejected by depth a
+     *  DRAW wrote, while geometry still missing is rejected by the clear value or by its own
+     *  z, with no draw to blame. */
+    forceDisableZWrite: boolean;
     /** Force wireframe color mode */
     forceWireColor: boolean;
     /** Force Z = 0.5*w in clip space to isolate NDC/minZ/maxZ/projection issues */
@@ -29,19 +52,63 @@ export interface DebugFlags {
     /** Force POINT sampling on all draws without changing UV coordinates */
     forcePointFilter: boolean;
     /** Disable the POINT-filter UV bias without changing sampler state */
-    disablePointUvBias: boolean;
     /** Disable the contained-UV WRAP->CLAMP seam suppression (XYZRHW draws with UVs in [0,1]) */
     disableContainedUvClamp: boolean;
     /** Texture converter debug mode: 0=normal, 1=show format (red=32bit, green=16bit, blue=8bit), 2=show read errors */
     textureConverterDebugMode: number;
-    /** Disable MegaBatch accumulation — every draw flushes as its own batch */
+    /** Disable the MegaBatch path entirely — legacy uniform slot AND no accumulation */
     disableMegaBatch: boolean;
+    /** DIAG: keep the MegaBatch shader/storage path but never ACCUMULATE — one draw per
+     *  batch. Splits `disableMegaBatch` into its two halves, so a picture that only comes
+     *  back under this one blames the grouping, and one that needs the full flag blames
+     *  the storage/shader path. */
+    disableMegaBatchAccumulate: boolean;
+    /** DIAG: restore one queue.writeBuffer call per CPU vertex/index allocation. */
+    disableGeometryStaging: boolean;
+    /** DIAG: skip the guest-memory content hash that detects texel writes a game made
+     *  through a cached lpSurface (see prepareStageTexture). Off = hashing on. */
+    disableCpuTextureHash: boolean;
+    /** DIAG: stop submitting mid-frame when a texture already sampled by recorded draws is
+     *  overwritten. On = the copy→draw→copy→draw pattern renders every draw with the LAST
+     *  upload. */
+    disableTextureOverwriteSubmit: boolean;
     /** DIAG: accumulate batches normally but DROP them at flush (render nothing) */
     skipMegaBatchDrawsRender: boolean;
     /** DIAG: with skipMegaBatchDrawsRender, drop only draws with indexCount >= this (0 = all) */
     skipMegaBatchMinIdx: number;
     /** Force the CPU vertex-conversion path for all draws, bypassing the GPU compute converter */
     forceCpuVertexPath: boolean;
+    /** DIAG: override D3DRS_COLORWRITEENABLE for every draw (-1 = off, use the app's mask).
+     *  0 is the positive control for the write mask itself: with the plumbing live the
+     *  frame must lose all colour writes while still clearing/depth-testing, which is the
+     *  only way to tell "the mask is applied" from "the mask is never consulted". */
+    forceColorWriteMask: number;
+    /** DIAG: stop clamping depth for pre-transformed draws that have depth testing off
+     *  (RHW_DEPTH_CLAMP), i.e. hand their z back to WebGPU's unconditional depth CLIP.
+     *  The A/B for "is this primitive being deleted by the clipper?": with the flag on, a
+     *  HUD quad whose stale z sits outside [0,1] disappears again, and one whose vertices
+     *  straddle the plane loses the far half. Takes effect on the next draw — the bit rides
+     *  a uniform, so no pipeline or shader is rebuilt. */
+    disableRhwDepthClamp: boolean;
+    /** DIAG: let a PRE-TRANSFORMED (XYZRHW) draw pick its vertex converter by count again,
+     *  the way every other draw does. Off by default because the two converters compute the
+     *  clip-space position differently in the last bits, so a base pass and its coplanar
+     *  overlay landing on opposite sides of the threshold disagree on depth. This is the
+     *  positive control for that pin: with it on, the dither grid comes back and the
+     *  converter's GPU conversion counter starts moving again. */
+    disableRhwCpuPin: boolean;
+    /** DIAG: render only the first N+1 draws of every frame (-1 = off, render all).
+     *  The frame capture numbers draws in the same order, so bisecting this NAMES the draw
+     *  that first covers a region — the only way to find which draw wrote the depth (or the
+     *  pixels) that hides everything issued after it. */
+    drawScrubMax: number;
+    /** DIAG: render every draw EXCEPT [drawSkipFrom, drawSkipTo] (-1 = off). The complement
+     *  of drawScrubMax: a prefix cut also removes the post-process blit a render-to-texture
+     *  title presents with, so the screen goes black for every cut and the bisect measures
+     *  nothing. Skipping a WINDOW keeps the blit and answers the question the cut cannot:
+     *  does removing exactly this draw remove the artifact? */
+    drawSkipFrom: number;
+    drawSkipTo: number;
 }
 
 /**
@@ -51,20 +118,31 @@ export const DEFAULT_DEBUG_FLAGS: DebugFlags = {
     forceMissingTextureMagenta: false,
     debugView: "normal",
     forceDisableAlphaBlend: false,
+    forceDisableLighting: false,
     forceDisableZTest: false,
+    forceDisableZWrite: false,
     forceWireColor: false,
     forceZMidpoint: false,
     forceCullNone: false,
     forceDisableAlphaTest: false,
     forceTextureResync: false,
     forcePointFilter: false,
-    disablePointUvBias: false,
     disableContainedUvClamp: false,
     textureConverterDebugMode: 0,
     disableMegaBatch: false,
+    disableMegaBatchAccumulate: false,
+    disableGeometryStaging: false,
+    disableCpuTextureHash: false,
+    disableTextureOverwriteSubmit: false,
     skipMegaBatchDrawsRender: false,
     skipMegaBatchMinIdx: 0,
     forceCpuVertexPath: false,
+    forceColorWriteMask: -1,
+    disableRhwDepthClamp: false,
+    disableRhwCpuPin: false,
+    drawScrubMax: -1,
+    drawSkipFrom: -1,
+    drawSkipTo: -1,
 };
 
 /**
@@ -146,9 +224,7 @@ export interface DrawExecutionDiagnostics {
     addressU: number;
     addressV: number;
     maxAnisotropy: number;
-    pointUvBiasApplied: boolean;
     forcePointFilter: boolean;
-    disablePointUvBias: boolean;
 }
 
 /**
@@ -171,15 +247,42 @@ function finiteOr(value: number, fallback: number): number {
     return Number.isFinite(value) ? value : fallback;
 }
 
+export type SanitizedViewport = Viewport & { minZ: number; maxZ: number };
+
 /**
  * Clamp a D3D viewport to render-target bounds and WebGPU limits.
  * Rejects garbage dimensions (null pointer reads, unset fields, float bit patterns).
+ *
+ * Allocating wrapper for cold callers; per-draw paths use sanitizeViewportInto.
  */
 export function sanitizeViewport(
     viewport: Viewport,
     targetWidth: number,
     targetHeight: number,
-): Viewport & { minZ: number; maxZ: number } {
+): SanitizedViewport {
+    return sanitizeViewportInto({ x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 }, viewport, targetWidth, targetHeight);
+}
+
+/**
+ * The D3D9 SetRenderTarget contract resets the viewport to cover the newly
+ * selected target.  Keep that rule next to the target-bound sanitizer so D3D
+ * backends do not accidentally inherit a viewport from a differently sized RT.
+ */
+export function fullTargetViewport(targetWidth: number, targetHeight: number): SanitizedViewport {
+    return sanitizeViewport({ x: 0, y: 0, width: targetWidth, height: targetHeight, minZ: 0, maxZ: 1 }, targetWidth, targetHeight);
+}
+
+/**
+ * As sanitizeViewport, but writes into a caller-owned struct so a per-draw call site
+ * allocates nothing (CLAUDE.md 3.1 zero-alloc hot paths). Every field of `viewport` is
+ * read before any field of `out` is written, so `out` may alias `viewport`.
+ */
+export function sanitizeViewportInto(
+    out: SanitizedViewport,
+    viewport: Viewport,
+    targetWidth: number,
+    targetHeight: number,
+): SanitizedViewport {
     const tw = Math.max(1, targetWidth | 0);
     const th = Math.max(1, targetHeight | 0);
     const maxDim = WEBGPU_MAX_VIEWPORT_DIM;
@@ -188,8 +291,13 @@ export function sanitizeViewport(
     let height = Math.trunc(finiteOr(viewport.height, th));
     let x = Math.trunc(finiteOr(viewport.x, 0));
     let y = Math.trunc(finiteOr(viewport.y, 0));
-    const minZ = finiteOr(viewport.minZ ?? 0, 0);
-    const maxZ = finiteOr(viewport.maxZ ?? 1, 1);
+    // The rasterizer depth range is [0,1] on every D3D generation — a D3DVIEWPORT's
+    // dvMinZ/dvMaxZ scale z INTO that range, they never widen it. WebGPU rejects
+    // anything outside [0,1] with minDepth <= maxDepth, and one rejected setViewport
+    // invalidates the whole command buffer, so an app (or a struct mis-read) offering
+    // e.g. -1..1 would silently drop every draw in the frame.
+    const minZ = Math.min(1, Math.max(0, finiteOr(viewport.minZ ?? 0, 0)));
+    const maxZ = Math.min(1, Math.max(minZ, finiteOr(viewport.maxZ ?? 1, 1)));
 
     const implausible =
         width <= 0 ||
@@ -211,7 +319,13 @@ export function sanitizeViewport(
     x = Math.max(0, Math.min(x, Math.max(0, tw - 1)));
     y = Math.max(0, Math.min(y, Math.max(0, th - 1)));
 
-    return { x, y, width, height, minZ, maxZ };
+    out.x = x;
+    out.y = y;
+    out.width = width;
+    out.height = height;
+    out.minZ = minZ;
+    out.maxZ = maxZ;
+    return out;
 }
 
 /**
@@ -262,18 +376,27 @@ export interface PipelineKeyConfig {
     primitiveType: number;
     sampledMask: number; // Bit N = stage N samples a texture (affects shader: bindings)
     stageCount: number; // Cascade stage blocks emitted (1 + highest enabled stage)
-    pointSampleMask: number; // Bit N = stage N uses legacy POINT texel selection in shader
     missingTexture: boolean; // Affects shader: fallback texture handling
     cullMode: number;
     zEnable: number;
     zFunc: number;
     zWrite: number;
     zBias: number; // D3DRENDERSTATE_ZBIAS (0-16) for z-fighting prevention
+    // The draw asked for EQUAL with depth writes off — a coplanar second pass. zFunc is
+    // rewritten to LESSEQUAL for it, so the request is not recoverable from the other
+    // fields, and it selects a depth bias: it must be part of the key.
+    coplanarPass: number;
     alphaBlend: number;
     alphaTest: number;
     srcBlend: number;
     dstBlend: number;
+    // D3DRS_BLENDOP (add/subtract/reverse-subtract/min/max), 0 when blending is off.
+    blendOp: number;
     alphaFunc: number;
+    // D3DRS_COLORWRITEENABLE as a 4-bit RGBA mask. It is baked into the colour target
+    // state, so it MUST be keyed: without it the first pipeline built for a state wins and
+    // every later draw sharing that state inherits a foreign write mask.
+    colorWriteMask: number;
     colorKeyEnabled: number; // Affects shader: color key discard block
     // Stencil states (affect pipeline: depthStencil.stencilFront/Back)
     stencilEnable: number;
@@ -288,10 +411,30 @@ export interface PipelineKeyConfig {
     forceZMidpoint: boolean; // Affects shader: Z remap block
     forceCullNone: boolean;
     forceDisableZTest: boolean;
+    forceDisableZWrite: boolean;
     debugView: "normal" | "uv" | "vertexcolor" | "alpha" | "solid"; // Affects shader: output mode
+    forceWireColor: boolean; // Affects shader: flat diagnostic colour override
     flatShading: boolean; // D3DSHADE_FLAT: flat @interpolate on color/specular varyings (affects shader)
     // NOTE: colorOp, alphaOp, lightingEnabled, fogMode, colorOp1, alphaOp1 are NOT in key
     // because they are handled via uniforms in universal shader, not shader code generation
+}
+
+/**
+ * A zeroed key config for use as reusable scratch. The field order matches the interface
+ * so a scratch filled field-by-field keeps the same hidden class as a fresh literal.
+ */
+export function makeEmptyPipelineKeyConfig(): PipelineKeyConfig {
+    return {
+        vertexType: 0, primitiveType: 0, sampledMask: 0, stageCount: 0,
+        missingTexture: false, cullMode: 0, zEnable: 0, zFunc: 0, zWrite: 0, zBias: 0,
+        coplanarPass: 0,
+        alphaBlend: 0, alphaTest: 0, srcBlend: 0, dstBlend: 0, blendOp: 0, alphaFunc: 0,
+        colorWriteMask: 0xf, colorKeyEnabled: 0,
+        stencilEnable: 0, stencilFunc: 0, stencilFail: 0, stencilZFail: 0, stencilPass: 0,
+        stencilRef: 0, stencilMask: 0, stencilWriteMask: 0,
+        forceZMidpoint: false, forceCullNone: false, forceDisableZTest: false, forceDisableZWrite: false,
+        debugView: "normal", forceWireColor: false, flatShading: false,
+    };
 }
 
 /**
@@ -303,18 +446,20 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `pt:${config.primitiveType}`,
         `sm:${config.sampledMask}`,
         `sc:${config.stageCount}`,
-        `psm:${config.pointSampleMask}`,
         `miss:${config.missingTexture ? 1 : 0}`,
         `cull:${config.cullMode}`,
         `z:${config.zEnable}`,
         `zf:${config.zFunc}`,
         `zw:${config.zWrite}`,
         `zb:${config.zBias}`,
+        `cop:${config.coplanarPass}`,
         `abl:${config.alphaBlend}`,
         `at:${config.alphaTest}`,
         `sb:${config.srcBlend}`,
         `db:${config.dstBlend}`,
+        `bop:${config.blendOp}`,
         `af:${config.alphaFunc}`,
+        `cwm:${config.colorWriteMask}`,
         `ck:${config.colorKeyEnabled}`,
         `se:${config.stencilEnable}`,
         `sf:${config.stencilFunc}`,
@@ -327,7 +472,9 @@ export function generatePipelineKey(config: PipelineKeyConfig): string {
         `fzm:${config.forceZMidpoint ? 1 : 0}`,
         `fcn:${config.forceCullNone ? 1 : 0}`,
         `fzt:${config.forceDisableZTest ? 1 : 0}`,
+        `fzw:${config.forceDisableZWrite ? 1 : 0}`,
         `dv:${config.debugView}`,
+        `fwc:${config.forceWireColor ? 1 : 0}`,
         `flat:${config.flatShading ? 1 : 0}`,
     ].join("|");
 }
@@ -343,17 +490,19 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `pt:${config.primitiveType}`,
         `sm:${config.sampledMask}`,
         `sc:${config.stageCount}`,
-        `psm:${config.pointSampleMask}`,
         `miss:${config.missingTexture ? 1 : 0}`,
         `cull:${config.cullMode}`,
         `z:${config.zEnable}`,
         `zf:${config.zFunc}`,
         `zw:${config.zWrite}`,
         `zb:${config.zBias}`,
+        `cop:${config.coplanarPass}`,
         `abl:${config.alphaBlend}`,
         // NOTE: alphaTest (at) and alphaFunc (af) are EXCLUDED - they're dynamic uniforms now
         `sb:${config.srcBlend}`,
         `db:${config.dstBlend}`,
+        `bop:${config.blendOp}`,
+        `cwm:${config.colorWriteMask}`,
         `ck:${config.colorKeyEnabled}`,
         `se:${config.stencilEnable}`,
         `sf:${config.stencilFunc}`,
@@ -366,7 +515,9 @@ export function generateMegaBatchPipelineKey(config: PipelineKeyConfig): string 
         `fzm:${config.forceZMidpoint ? 1 : 0}`,
         `fcn:${config.forceCullNone ? 1 : 0}`,
         `fzt:${config.forceDisableZTest ? 1 : 0}`,
+        `fzw:${config.forceDisableZWrite ? 1 : 0}`,
         `dv:${config.debugView}`,
+        `fwc:${config.forceWireColor ? 1 : 0}`,
         `flat:${config.flatShading ? 1 : 0}`,
     ].join("|");
 }
@@ -380,18 +531,20 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.primitiveType === b.primitiveType &&
         a.sampledMask === b.sampledMask &&
         a.stageCount === b.stageCount &&
-        a.pointSampleMask === b.pointSampleMask &&
         a.missingTexture === b.missingTexture &&
         a.cullMode === b.cullMode &&
         a.zEnable === b.zEnable &&
         a.zFunc === b.zFunc &&
         a.zWrite === b.zWrite &&
         a.zBias === b.zBias &&
+        a.coplanarPass === b.coplanarPass &&
         a.alphaBlend === b.alphaBlend &&
         a.alphaTest === b.alphaTest &&
         a.srcBlend === b.srcBlend &&
         a.dstBlend === b.dstBlend &&
+        a.blendOp === b.blendOp &&
         a.alphaFunc === b.alphaFunc &&
+        a.colorWriteMask === b.colorWriteMask &&
         a.colorKeyEnabled === b.colorKeyEnabled &&
         a.stencilEnable === b.stencilEnable &&
         a.stencilFunc === b.stencilFunc &&
@@ -404,7 +557,9 @@ export function pipelineKeyConfigsEqual(a: PipelineKeyConfig, b: PipelineKeyConf
         a.forceZMidpoint === b.forceZMidpoint &&
         a.forceCullNone === b.forceCullNone &&
         a.forceDisableZTest === b.forceDisableZTest &&
+        a.forceDisableZWrite === b.forceDisableZWrite &&
         a.debugView === b.debugView &&
+        a.forceWireColor === b.forceWireColor &&
         a.flatShading === b.flatShading;
 }
 
@@ -416,16 +571,18 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.primitiveType === b.primitiveType &&
         a.sampledMask === b.sampledMask &&
         a.stageCount === b.stageCount &&
-        a.pointSampleMask === b.pointSampleMask &&
         a.missingTexture === b.missingTexture &&
         a.cullMode === b.cullMode &&
         a.zEnable === b.zEnable &&
         a.zFunc === b.zFunc &&
         a.zWrite === b.zWrite &&
         a.zBias === b.zBias &&
+        a.coplanarPass === b.coplanarPass &&
         a.alphaBlend === b.alphaBlend &&
         a.srcBlend === b.srcBlend &&
         a.dstBlend === b.dstBlend &&
+        a.blendOp === b.blendOp &&
+        a.colorWriteMask === b.colorWriteMask &&
         a.colorKeyEnabled === b.colorKeyEnabled &&
         a.stencilEnable === b.stencilEnable &&
         a.stencilFunc === b.stencilFunc &&
@@ -438,7 +595,9 @@ export function megaBatchPipelineKeyConfigsEqual(a: PipelineKeyConfig, b: Pipeli
         a.forceZMidpoint === b.forceZMidpoint &&
         a.forceCullNone === b.forceCullNone &&
         a.forceDisableZTest === b.forceDisableZTest &&
+        a.forceDisableZWrite === b.forceDisableZWrite &&
         a.debugView === b.debugView &&
+        a.forceWireColor === b.forceWireColor &&
         a.flatShading === b.flatShading;
 }
 
@@ -487,6 +646,7 @@ export interface UniformSlotData {
     alphaRef255: number; // u32: D3DRENDERSTATE_ALPHAREF (0..255), stored as u32 in uniform buffer
     colorOp: number; // u32
     alphaOp: number; // u32
+    /** RHW_PRETRANSFORMED | RHW_DEPTH_CLAMP bitfield */
     isRHW: number; // u32
     lightingEnabled: number; // u32
     colorKeyEnabled: number; // u32
@@ -624,7 +784,7 @@ export interface DrawUniforms {
     alphaOp: number;
     /** Alpha reference (0-255) */
     alphaRef255: number;
-    /** Is RHW vertex format (pre-transformed) */
+    /** RHW_PRETRANSFORMED | RHW_DEPTH_CLAMP bitfield */
     isRHW: number;
     /** Lighting enabled flag */
     lightingEnabled: number;
@@ -759,4 +919,3 @@ export interface DrawUniformsAllocation {
 
 // Import for MegaBatch interface (circular dependency prevention)
 import type { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
-

@@ -8,15 +8,24 @@ import { Logger, LogCategory } from '../../core/logger';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { sanitizeViewport } from '../../backends/webgpu/ddraw/types';
-import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceCreationParams, deviceRenderTargetOverride, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
+import { addComRef, createComObject, devices, deviceBoundDepthStencil, deviceClipStatus, deviceCreationParams, deviceRenderTargetOverride, deviceWindowed, getVTables, releaseComRef, resourceToDevice, surfaceInfo, textureD3DFormat, isComObjectLive } from './shared-state';
 import { bindAutoDepthStencil, invalidateDevicePresentationSurfaces, resizeFullscreenDeviceWindow } from './device-lifecycle';
 import { isBitmapTexture } from '../ddraw/com-objects';
 import { D3DMaterial7Data, D3DLight7Data } from '../ddraw/d3d/types';
 import { gammaService } from '../../core/gamma-service';
+import { acknowledgeDeviceReset } from '../../core/gpu/gpu-device-loss-contract';
+import {
+    isHardwareDeviceCursor, releaseDeviceCursor, setDeviceCursorImage,
+    setDeviceCursorPosition, showDeviceCursor,
+} from '../../core/device-cursor';
+import { decodeSurfaceFormatToRgba8 } from '../../backends/webgpu/shared/texture-formats';
+import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { D3D8_MAX_STREAMS } from '../../backends/webgpu/d3d8/vsd-constants';
 
 const D3D_OK = 0;
+const D3DFMT_A8R8G8B8 = 21;
 const D3DERR_INVALIDCALL = 0x8876086c;
+const D3DERR_DEVICELOST = 0x88760868;
 const E_NOTIMPL = 0x80004001;
 
 // Render state name lookup for diagnostics
@@ -77,6 +86,107 @@ function readConstantsForRecording(mem: Uint8Array, dataPtr: number, count: numb
 
 function writeRequiredUint32(ptr: number, value: number): boolean {
     return ptr !== 0 && Mem.writeUint32(ptr, value);
+}
+
+/**
+ * Read a guest D3DLIGHT8 (104 bytes). Shared with the FastPath registration so the
+ * struct layout has ONE definition — a divergence here would only ever surface as a
+ * wrongly-lit scene.
+ */
+export function readD3DLight8(view: DataView, pLight: number): D3DLight7Data {
+    const light: D3DLight7Data = {
+        type: view.getUint32(pLight + 0, true),
+        diffuse: {
+            r: view.getFloat32(pLight + 4, true),
+            g: view.getFloat32(pLight + 8, true),
+            b: view.getFloat32(pLight + 12, true),
+            a: view.getFloat32(pLight + 16, true),
+        },
+        specular: {
+            r: view.getFloat32(pLight + 20, true),
+            g: view.getFloat32(pLight + 24, true),
+            b: view.getFloat32(pLight + 28, true),
+            a: view.getFloat32(pLight + 32, true),
+        },
+        ambient: {
+            r: view.getFloat32(pLight + 36, true),
+            g: view.getFloat32(pLight + 40, true),
+            b: view.getFloat32(pLight + 44, true),
+            a: view.getFloat32(pLight + 48, true),
+        },
+        position: {
+            x: view.getFloat32(pLight + 52, true),
+            y: view.getFloat32(pLight + 56, true),
+            z: view.getFloat32(pLight + 60, true),
+        },
+        direction: {
+            x: view.getFloat32(pLight + 64, true),
+            y: view.getFloat32(pLight + 68, true),
+            z: view.getFloat32(pLight + 72, true),
+        },
+        range: view.getFloat32(pLight + 76, true),
+        falloff: view.getFloat32(pLight + 80, true),
+        attenuation0: view.getFloat32(pLight + 84, true),
+        attenuation1: view.getFloat32(pLight + 88, true),
+        attenuation2: view.getFloat32(pLight + 92, true),
+        theta: view.getFloat32(pLight + 96, true),
+        phi: view.getFloat32(pLight + 100, true),
+    };
+    return light;
+}
+
+/** One-shot: SetViewport now faithfully rejects a viewport that doesn't fit the active
+ *  render target (see the handler below) instead of silently clamping it. That can newly
+ *  surface a guest-side assert that expected native's D3DERR_INVALIDCALL here — this flag
+ *  makes sure the FIRST occurrence is loud instead of the guest just asserting cold. */
+let loggedViewportOverflow = false;
+
+/**
+ * The generic COM triple (QueryInterface/AddRef/Release) for every D3D8 interface.
+ *
+ * Merged with `assignStubsOnce` so a resource that owns its own lifetime — a texture whose
+ * Release must free its storage, a sub-surface whose refcount lives on the parent texture —
+ * wins regardless of merge order. As a plain `Object.assign` this loop silently replaced
+ * four of those with the generic pair whenever it happened to be merged last.
+ */
+export function createComTripleStubs(): Record<string, ThunkImplementation> {
+    const exports: Record<string, ThunkImplementation> = {};
+
+    // COM stubs for all D3D8 interfaces
+    const comPrefixes = [
+        'IDirect3D8', 'IDirect3DDevice8',
+        'IDirect3DTexture8', 'IDirect3DSurface8',
+        'IDirect3DVertexBuffer8', 'IDirect3DIndexBuffer8',
+    ];
+
+    for (const prefix of comPrefixes) {
+        // QueryInterface MUST write the interface pointer into *ppvObject (out-param) and AddRef.
+        // Returning S_OK without writing it left the caller with a garbage pointer it then derefs.
+        // Our D3D8 interfaces are a single fat object, so every accepted IID maps back to `this`.
+        exports[`${prefix}_QueryInterface`] = (_ctx, mem, args) => {
+            const thisPtr = args[0] >>> 0;
+            const ppvObject = args[2] >>> 0;
+            if (ppvObject && isValidAddress(mem, ppvObject, 4)) {
+                Mem.writeUint32(ppvObject, thisPtr);
+                addComRef(thisPtr);
+            }
+            return D3D_OK;
+        };
+        exports[`${prefix}_AddRef`] = (_ctx, _mem, args) => {
+            const refCount = addComRef(args[0]);
+            return refCount ?? 2;
+        };
+        exports[`${prefix}_Release`] = (_ctx, _mem, args) => {
+            const ptr = args[0] >>> 0;
+            const refCount = releaseComRef(ptr);
+            // Final Release of a device: its cursor dies with it (wined3d_device_uninit_3d
+            // drops cursor_texture), so the host must stop being told to draw it.
+            if (refCount === 0 && devices.has(ptr)) releaseDeviceCursor(ptr);
+            return refCount ?? 1;
+        };
+    }
+
+    return exports;
 }
 
 export function createStateExports(): Record<string, ThunkImplementation> {
@@ -313,14 +423,32 @@ export function createStateExports(): Record<string, ThunkImplementation> {
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const rt = device.activeRenderTarget;
-        const vp = sanitizeViewport({
+        const raw = {
             x: view.getUint32(pVP + 0, true),
             y: view.getUint32(pVP + 4, true),
             width: view.getUint32(pVP + 8, true),
             height: view.getUint32(pVP + 12, true),
             minZ: view.getFloat32(pVP + 16, true),
             maxZ: view.getFloat32(pVP + 20, true),
-        }, rt.width, rt.height);
+        };
+
+        // Wine dlls/d3d8/device.c:1782-1807 — a viewport that doesn't fit the active
+        // render target is D3DERR_INVALIDCALL on real D3D8, not silently clamped onto it
+        // (sanitizeViewport below is for internal callers — BeginScene/Reset/render-target
+        // switch — that legitimately want a forced-valid viewport, not this guest call).
+        if (raw.x > rt.width || raw.width > rt.width - raw.x ||
+            raw.y > rt.height || raw.height > rt.height - raw.y) {
+            if (!loggedViewportOverflow) {
+                loggedViewportOverflow = true;
+                Logger.error(LogCategory.SYSTEM,
+                    `D3D8 SetViewport(${raw.x},${raw.y} ${raw.width}x${raw.height}) does not fit ` +
+                    `render target ${rt.width}x${rt.height} -> D3DERR_INVALIDCALL ` +
+                    `(further occurrences of this diagnostic are suppressed)`);
+            }
+            return D3DERR_INVALIDCALL;
+        }
+
+        const vp = sanitizeViewport(raw, rt.width, rt.height);
         if (device.recordingStateBlock) {
             device.recordStateBlock({ op: 'viewport', vp });
             return D3D_OK;
@@ -380,26 +508,76 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // Cursor
-    exports['IDirect3DDevice8_SetCursorProperties'] = () => D3D_OK;
-    exports['IDirect3DDevice8_SetCursorPosition'] = () => D3D_OK;
-    exports['IDirect3DDevice8_ShowCursor'] = () => 0; // Return previous visibility (FALSE)
+    // Cursor — the device cursor is the pointer for a game that hides the Win32 one
+    // (see core/device-cursor). Validation mirrors wined3d: 2D A8R8G8B8, both extents
+    // powers of two, and (d3d8 layer) no larger than the display mode.
+    exports['IDirect3DDevice8_SetCursorProperties'] = (_ctx, mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const xHotSpot = args[1] >>> 0;
+        const yHotSpot = args[2] >>> 0;
+        const pCursorBitmap = args[3] >>> 0;
+
+        if (!devices.has(pDevice) || !pCursorBitmap) return D3DERR_INVALIDCALL;
+        const info = surfaceInfo.get(pCursorBitmap);
+        if (!info || info.d3dFormat !== D3DFMT_A8R8G8B8) return D3DERR_INVALIDCALL;
+
+        const surface = info.surface;
+        const { width, height } = surface;
+        if (!width || !height) return D3DERR_INVALIDCALL;
+        if ((width & (width - 1)) !== 0 || (height & (height - 1)) !== 0) return D3DERR_INVALIDCALL;
+        const mode = EmulatorConfig.getInstance().screenResolution;
+        if (width > mode.width || height > mode.height) return D3DERR_INVALIDCALL;
+
+        // Snapshot the pixels: real D3D does not addref the surface, so the app is free
+        // to release or reuse it the moment this returns.
+        const rgba = decodeSurfaceFormatToRgba8(mem, surface.surfacePtr, width, height, surface.pitch, surface.format);
+        const windowed = deviceWindowed.get(pDevice) ?? false;
+        setDeviceCursorImage(pDevice,
+            { width, height, pixels: new Uint8Array(rgba), hotspotX: xHotSpot, hotspotY: yHotSpot }, windowed);
+        Logger.log(LogCategory.D3D9,
+            `D3D8 SetCursorProperties(${width}x${height}, hotspot ${xHotSpot},${yHotSpot}) ` +
+            `kind=${isHardwareDeviceCursor(width, height, windowed) ? 'hardware' : 'software'} windowed=${windowed}`);
+        return D3D_OK;
+    };
+
+    // STDMETHOD_(void, ...) — the guest ignores the return value.
+    exports['IDirect3DDevice8_SetCursorPosition'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        if (!devices.has(pDevice)) return 0;
+        setDeviceCursorPosition(pDevice, args[1] | 0, args[2] | 0);
+        return 0;
+    };
+
+    exports['IDirect3DDevice8_ShowCursor'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        if (!devices.has(pDevice)) return 0;
+        return showDeviceCursor(pDevice, !!args[1]) ? 1 : 0;
+    };
 
     // Swap chain / reset
     exports['IDirect3DDevice8_CreateAdditionalSwapChain'] = () => D3DERR_INVALIDCALL;
     exports['IDirect3DDevice8_Reset'] = (_ctx, mem, args) => {
+        const devicePtr = args[0] >>> 0;
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
+        // No GPU device yet: a Reset cannot succeed, and real D3D8 says so rather than
+        // pretending — that answer is what keeps the app's poll loop honest.
+        if (!acknowledgeDeviceReset(devicePtr)) return D3DERR_DEVICELOST;
         const hr = device.reset(args[1], mem);
         if (hr !== D3D_OK) return hr;
         invalidateDevicePresentationSurfaces(args[0]);
         bindAutoDepthStencil(args[0], mem, args[1]);
+        // The device cursor does not survive a Reset (wined3d_device_reset drops
+        // cursor_texture) — the app must re-SetCursorProperties.
+        releaseDeviceCursor(devicePtr);
         // Match real D3D8: a Reset into fullscreen re-sizes the device window to the new mode
         // so GetClientRect reports the back-buffer size (see resizeFullscreenDeviceWindow).
         const pp = args[1];
         if (pp) {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            if (!view.getUint32(pp + 28, true)) {
+            const windowed = view.getUint32(pp + 28, true) !== 0;
+            deviceWindowed.set(devicePtr, windowed);
+            if (!windowed) {
                 resizeFullscreenDeviceWindow(
                     view.getUint32(pp + 24, true) >>> 0,
                     view.getUint32(pp + 0, true) >>> 0,
@@ -429,9 +607,17 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // Resource creation stubs (volume/cube textures not needed for Montezuma)
-    exports['IDirect3DDevice8_CreateVolumeTexture'] = () => D3DERR_INVALIDCALL;
-    exports['IDirect3DDevice8_CreateCubeTexture'] = () => D3DERR_INVALIDCALL;
+    // Volume/cube textures are not implemented, and D3DCAPS8 says so (caps.ts clears
+    // VOLUMEMAP/CUBEMAP). Refuse with the out-param NULLed the way a real Create* does on
+    // failure — a caller that ignores the HRESULT then derefs NULL instead of stack garbage.
+    exports['IDirect3DDevice8_CreateVolumeTexture'] = (_ctx, _mem, args) => {
+        if (args[8]) Mem.writeUint32(args[8], 0);
+        return D3DERR_INVALIDCALL;
+    };
+    exports['IDirect3DDevice8_CreateCubeTexture'] = (_ctx, _mem, args) => {
+        if (args[6]) Mem.writeUint32(args[6], 0);
+        return D3DERR_INVALIDCALL;
+    };
 
     // Front buffer
     exports['IDirect3DDevice8_GetFrontBuffer'] = async (_ctx, _mem, args) => {
@@ -522,44 +708,7 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         if (!device) return D3DERR_INVALIDCALL;
         const index = args[1], pLight = args[2];
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const light: D3DLight7Data = {
-            type: view.getUint32(pLight + 0, true),
-            diffuse: {
-                r: view.getFloat32(pLight + 4, true),
-                g: view.getFloat32(pLight + 8, true),
-                b: view.getFloat32(pLight + 12, true),
-                a: view.getFloat32(pLight + 16, true),
-            },
-            specular: {
-                r: view.getFloat32(pLight + 20, true),
-                g: view.getFloat32(pLight + 24, true),
-                b: view.getFloat32(pLight + 28, true),
-                a: view.getFloat32(pLight + 32, true),
-            },
-            ambient: {
-                r: view.getFloat32(pLight + 36, true),
-                g: view.getFloat32(pLight + 40, true),
-                b: view.getFloat32(pLight + 44, true),
-                a: view.getFloat32(pLight + 48, true),
-            },
-            position: {
-                x: view.getFloat32(pLight + 52, true),
-                y: view.getFloat32(pLight + 56, true),
-                z: view.getFloat32(pLight + 60, true),
-            },
-            direction: {
-                x: view.getFloat32(pLight + 64, true),
-                y: view.getFloat32(pLight + 68, true),
-                z: view.getFloat32(pLight + 72, true),
-            },
-            range: view.getFloat32(pLight + 76, true),
-            falloff: view.getFloat32(pLight + 80, true),
-            attenuation0: view.getFloat32(pLight + 84, true),
-            attenuation1: view.getFloat32(pLight + 88, true),
-            attenuation2: view.getFloat32(pLight + 92, true),
-            theta: view.getFloat32(pLight + 96, true),
-            phi: view.getFloat32(pLight + 100, true),
-        };
+        const light = readD3DLight8(view, pLight);
         if (device.recordingStateBlock) {
             device.recordStateBlock({ op: 'light', index, light });
             return D3D_OK;
@@ -690,6 +839,25 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         const pRenderTarget = args[1] >>> 0;
         const pZStencil = args[2] >>> 0;
 
+        // Wine dlls/d3d8/device.c:1531-1609 — a depth-stencil smaller than the render
+        // target it will be paired with is rejected before either is bound. Resolve the
+        // target dims BEFORE the RT switch below: pRenderTarget==0 means the color target
+        // is left unchanged, so the check must run against whichever RT is about to be live.
+        if (pZStencil !== 0) {
+            const dsInfo = surfaceInfo.get(pZStencil);
+            if (!dsInfo) return D3DERR_INVALIDCALL;
+            const rtDims = pRenderTarget !== 0
+                ? (surfaceInfo.get(pRenderTarget)?.surface ?? device.activeRenderTarget)
+                : device.activeRenderTarget;
+            if (dsInfo.surface.width < rtDims.width || dsInfo.surface.height < rtDims.height) {
+                Logger.warn(LogCategory.SYSTEM,
+                    `D3D8 SetRenderTarget: depth-stencil 0x${pZStencil.toString(16)} ` +
+                    `${dsInfo.surface.width}x${dsInfo.surface.height} is smaller than render ` +
+                    `target ${rtDims.width}x${rtDims.height} -> D3DERR_INVALIDCALL`);
+                return D3DERR_INVALIDCALL;
+            }
+        }
+
         if (pRenderTarget !== 0) {
             const info = surfaceInfo.get(pRenderTarget);
             if (!info) return D3DERR_INVALIDCALL;
@@ -766,9 +934,29 @@ export function createStateExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    // Clip status
-    exports['IDirect3DDevice8_SetClipStatus'] = () => D3D_OK;
-    exports['IDirect3DDevice8_GetClipStatus'] = () => D3D_OK;
+    // Clip status — D3DCLIPSTATUS8 {DWORD ClipUnion; DWORD ClipIntersection;}. Reporting
+    // success while leaving the app's struct untouched hands it whatever was on the stack;
+    // store what was written and answer with the "nothing clipped / full extents" default
+    // until something is. Matches DXVK's D3D9 contract (identical struct in D3D8).
+    exports['IDirect3DDevice8_SetClipStatus'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pClipStatus = args[1];
+        if (!devices.has(pDevice) || !pClipStatus) return D3DERR_INVALIDCALL;
+        const clipUnion = Mem.readUint32(pClipStatus);
+        const clipIntersection = Mem.readUint32(pClipStatus + 4);
+        if (clipUnion === null || clipIntersection === null) return D3DERR_INVALIDCALL;
+        deviceClipStatus.set(pDevice, { clipUnion, clipIntersection });
+        return D3D_OK;
+    };
+    exports['IDirect3DDevice8_GetClipStatus'] = (_ctx, _mem, args) => {
+        const pDevice = args[0] >>> 0;
+        const pClipStatus = args[1];
+        if (!devices.has(pDevice) || !pClipStatus) return D3DERR_INVALIDCALL;
+        const status = deviceClipStatus.get(pDevice);
+        if (!Mem.writeUint32(pClipStatus, status ? status.clipUnion : 0)) return D3DERR_INVALIDCALL;
+        if (!Mem.writeUint32(pClipStatus + 4, status ? status.clipIntersection : 0xFFFFFFFF)) return D3DERR_INVALIDCALL;
+        return D3D_OK;
+    };
 
     // Validate
     exports['IDirect3DDevice8_ValidateDevice'] = (_ctx, mem, args) => {
@@ -916,36 +1104,6 @@ export function createStateExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice8_DrawRectPatch'] = () => D3D_OK;
     exports['IDirect3DDevice8_DrawTriPatch'] = () => D3D_OK;
     exports['IDirect3DDevice8_DeletePatch'] = () => D3D_OK;
-
-    // COM stubs for all D3D8 interfaces
-    const comPrefixes = [
-        'IDirect3D8', 'IDirect3DDevice8',
-        'IDirect3DTexture8', 'IDirect3DSurface8',
-        'IDirect3DVertexBuffer8', 'IDirect3DIndexBuffer8',
-    ];
-
-    for (const prefix of comPrefixes) {
-        // QueryInterface MUST write the interface pointer into *ppvObject (out-param) and AddRef.
-        // Returning S_OK without writing it left the caller with a garbage pointer it then derefs.
-        // Our D3D8 interfaces are a single fat object, so every accepted IID maps back to `this`.
-        exports[`${prefix}_QueryInterface`] = (_ctx, mem, args) => {
-            const thisPtr = args[0] >>> 0;
-            const ppvObject = args[2] >>> 0;
-            if (ppvObject && isValidAddress(mem, ppvObject, 4)) {
-                Mem.writeUint32(ppvObject, thisPtr);
-                addComRef(thisPtr);
-            }
-            return D3D_OK;
-        };
-        exports[`${prefix}_AddRef`] = (_ctx, _mem, args) => {
-            const refCount = addComRef(args[0]);
-            return refCount ?? 2;
-        };
-        exports[`${prefix}_Release`] = (_ctx, _mem, args) => {
-            const refCount = releaseComRef(args[0]);
-            return refCount ?? 1;
-        };
-    }
 
     return exports;
 }

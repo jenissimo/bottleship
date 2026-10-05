@@ -13,6 +13,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -37,6 +38,8 @@ export const binkw32Module: ModuleDescriptor = {
         makeFunc("_BinkPause@8", 2),              // handle, pause
         makeFunc("_BinkGetRects@8", 2),           // handle, flags
         makeFunc("_BinkGetSummary@8", 2),         // handle, summary ptr
+        makeFunc("_BinkShouldSkip@4", 1),         // handle
+        makeFunc("_BinkGetFrameBuffersInfo@8", 2),// handle, BINKFRAMEBUFFERS*
 
         // Buffer operations
         makeFunc("_BinkCopyToBuffer@28", 7),      // handle, buf, pitch, height, x, y, flags
@@ -50,7 +53,15 @@ export const binkw32Module: ModuleDescriptor = {
 
         // Sound control
         makeFunc("_BinkOpenMiles@4", 1),          // HDIGDRIVER
-        makeFunc("_BinkSetVolume@12", 3),         // handle, trackid, volume
+        makeFunc("_BinkOpenDirectSound@4", 1),    // LPDIRECTSOUND (0 = let Bink open one)
+        // Bink >= 1.9 gave BinkSetVolume a track parameter, and BOTH generations ship. The
+        // decoration is the contract either way — a stdcall export pops exactly what its
+        // `@N` says, and every real binkw32 we have (0.8i, 1.0v, 1.5v) exports `@8` and
+        // RET 8s. Overriding `@8` to pop 12 drifts ESP by 4 in a caller that pushed 8, and
+        // the caller's own RET then jumps into whatever dword the drift exposed: TLJ's
+        // dx_module landed in its heap data and died with no trace back to here.
+        makeFunc("_BinkSetVolume@12", 3),         // 1.9+: handle, trackid, volume
+        makeFunc("_BinkSetVolume@8", 2),          // pre-1.9: handle, volume
         makeFunc("_BinkSetPan@12", 3),            // handle, trackid, pan
         makeFunc("_BinkSetSoundOnOff@8", 2),      // handle, onoff
         makeFunc("_BinkSetSoundTrack@8", 2),      // tracks, trackIds

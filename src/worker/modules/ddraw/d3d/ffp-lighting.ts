@@ -1,5 +1,5 @@
-import { D3DMaterial7Data, D3DLight7Data } from "./types";
-import { RGBA } from "../../../backends/webgpu/ddraw/types";
+import type { D3DMaterial7Data, D3DLight7Data } from "./types";
+import type { RGBA } from "../../../backends/webgpu/ddraw/types";
 
 /**
  * Encapsulates all state required for D3D Fixed-Function Lighting (FFP) emulation.

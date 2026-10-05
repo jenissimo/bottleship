@@ -9,7 +9,9 @@ import { d3d8Module } from '../../api/d3d8.api';
 import { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
 import { Logger, LogCategory } from '../../core/logger';
 import { allocateComObject as allocateGuardedComObject } from '../../core/com/com-memory';
+import { resetDeviceCursor } from '../../core/device-cursor';
 import type { BitmapTextureSurface, DirectDrawSurfaceState } from '../../modules/ddraw/com-objects';
+import { registerDDrawSurfaceSource } from '../../modules/ddraw/surface-device-loss';
 
 let vtables: Record<string, VTableInfo> | null = null;
 
@@ -53,13 +55,27 @@ export interface D3D8SurfaceInfo {
     d3dFormat: number;
     /** When set, resolveLockSurface() follows the live device back buffer. */
     role?: D3D8SurfaceRole;
+    /** D3DPOOL for a standalone surface (texturePtr==0) that isn't the back buffer —
+     *  e.g. CreateImageSurface's D3DPOOL_SYSTEMMEM. Texture-owned surfaces get their
+     *  pool from textureMeta instead; GetDesc falls back to this only when there's no
+     *  owning texture. */
+    pool?: number;
 }
 
 /** Device COM ptr -> cached IDirect3DSurface8 back-buffer wrapper. */
 export const deviceBackBufferSurfaces: Map<number, number> = new Map();
 
+/** Device COM ptr -> D3DPRESENT_PARAMETERS.Windowed, as last declared by CreateDevice/Reset.
+ *  Absent = fullscreen, which is what a device that never declared otherwise runs as. */
+export const deviceWindowed: Map<number, boolean> = new Map();
+
 /** Device COM ptr -> explicit SetRenderTarget color surface (0 = use back buffer). */
 export const deviceRenderTargetOverride: Map<number, number> = new Map();
+
+/** Device COM ptr -> D3DCLIPSTATUS8 {ClipUnion, ClipIntersection}, as last written by
+ *  SetClipStatus. Absent = the device default "nothing was clipped, full extents"
+ *  (0 / 0xFFFFFFFF). Same contract as the D3D9 path — see modules/d3d9/shared-state.ts. */
+export const deviceClipStatus: Map<number, { clipUnion: number; clipIntersection: number }> = new Map();
 
 /** Resolve the live surface backing a LockRect/GetDesc call. */
 export function resolveLockSurface(info: D3D8SurfaceInfo, device: D3D8DeviceAdapter | undefined): DirectDrawSurfaceState {
@@ -71,6 +87,12 @@ export function resolveLockSurface(info: D3D8SurfaceInfo, device: D3D8DeviceAdap
 
 /** Surface COM ptr -> surface info */
 export const surfaceInfo: Map<number, D3D8SurfaceInfo> = new Map();
+
+// Device loss: these surface states are reachable from nowhere else (a D3D8 surface is not a
+// ddraw COM object), so they need their own source or they keep a dead GPU texture.
+registerDDrawSurfaceSource("d3d8-surfaces", function* () {
+    for (const [comAddr, info] of surfaceInfo) yield { state: info.surface, comAddr };
+});
 
 /** Texture COM ptr -> original D3DFMT (for GetDesc on texture-owned surfaces) */
 export const textureD3DFormat: Map<number, number> = new Map();
@@ -203,6 +225,7 @@ export function resolveD3D8TextureSurface(addr: number): BitmapTextureSurface | 
 }
 
 export function resetD3D8SharedState(): void {
+    resetDeviceCursor();
     vtables = null;
     devices.clear();
     resourceToDevice.clear();
@@ -214,5 +237,8 @@ export function resetD3D8SharedState(): void {
     implicitDepthStencils.clear();
     deviceBackBufferSurfaces.clear();
     deviceRenderTargetOverride.clear();
+    deviceClipStatus.clear();
+    deviceWindowed.clear();
+    deviceCreationParams.clear();
     comRefCounts.clear();
 }

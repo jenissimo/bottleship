@@ -1,0 +1,71 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.887Z",
+  "module": "dplayx",
+  "functions": [
+    {
+      "name": "DirectPlayCreate",
+      "argCount": 3
+    },
+    {
+      "name": "DirectPlayEnumerate",
+      "argCount": 2
+    },
+    {
+      "name": "DirectPlayEnumerateA",
+      "argCount": 2
+    },
+    {
+      "name": "DirectPlayEnumerateW",
+      "argCount": 2
+    },
+    {
+      "name": "DirectPlayLobbyCreateA",
+      "argCount": 5
+    },
+    {
+      "name": "DirectPlayLobbyCreateW",
+      "argCount": 5
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "ord_1",
+      "argCount": 3
+    },
+    {
+      "name": "ord_2",
+      "argCount": 2
+    },
+    {
+      "name": "ord_3",
+      "argCount": 2
+    },
+    {
+      "name": "ord_4",
+      "argCount": 5
+    },
+    {
+      "name": "ord_5",
+      "argCount": 5
+    },
+    {
+      "name": "ord_9",
+      "argCount": 2
+    }
+  ]
+}

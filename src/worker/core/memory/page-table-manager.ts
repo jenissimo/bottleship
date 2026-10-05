@@ -12,24 +12,21 @@
  * beyond the configured size (e.g., reading uninitialized pointers). Without full
  * mapping, these accesses would #PF — but before paging they silently succeeded.
  *
- * Guest memory layout (in the 15MB gap between LOW_MEM and HEAP):
- *   Page Directory: 0x00B00000 (4KB, 1024 PDEs)
- *   Page Tables:    0x00B01000 (~4MB for 1024 PTs covering full 4GB)
- *   Total:          ~4.004MB (0x00B00000 - 0x00F01000)
- *
- * Must NOT overlap with PE image region (0x00400000 + sizeOfImage).
- * The old location (0x00100000) overlapped with typical PE loads at 0x00400000,
- * causing page table initialization to overwrite game code/data → #GP on startup.
+ * Tables live at MEM_PAGETABLE_BASE (inside the NOACCESS red zone), never in the low
+ * gap below HEAP: that gap is PE-image territory — an EXE at ImageBase 0x00400000 with
+ * a multi-MB BSS reaches well past 11MB, and an overlap is silent and lethal (the
+ * walker's A/D-bit writes land in the guest's globals, the guest's writes in our PTEs).
+ * Layout: page directory 4KB, then 1024 page tables (4MB) covering the full 4GB.
  */
 
 import { Logger, LogCategory } from '../logger';
 import { setWriteMapBase } from './address-space';
-import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE } from '../cpu/emulator-config';
+import { invalidateGuestCode } from './guest-code';
+import { MEM_THUNK_CODE_BASE, MEM_THUNK_CODE_SIZE, MEM_PAGETABLE_BASE, MEM_PAGETABLE_SIZE, MEM_GUARD_BASE, MEM_GUARD_SIZE } from '../cpu/emulator-config';
 
 // Page table constants
-// Placed at 11MB (still below HEAP at 16MB) to avoid overlap with larger PE images.
-const PAGE_DIR_ADDR = 0x00B00000;
-const PAGE_TABLES_ADDR = 0x00B01000;
+const PAGE_DIR_ADDR = MEM_PAGETABLE_BASE;
+const PAGE_TABLES_ADDR = MEM_PAGETABLE_BASE + 0x1000;
 const PAGE_SIZE = 0x1000; // 4KB
 const ENTRIES_PER_TABLE = 1024;
 const PAGES_PER_TABLE = 1024; // Each PT covers 4MB
@@ -40,26 +37,22 @@ const PTE_PRESENT = 0x01;
 const PTE_RW = 0x02;
 const PTE_USER = 0x04;
 const PTE_DEFAULT = PTE_PRESENT | PTE_RW | PTE_USER; // 0x07
-const FASTMEM_BUMP_PAGE_TABLE_DECOMMIT = 5;
-const FASTMEM_BUMP_PAGE_TABLE_COMMIT = 6;
-const FASTMEM_BUMP_PAGE_TABLE_PROTECT = 7;
-
+// Accessed + Dirty. The walker sets these to describe USE, not mapping or
+// permission — rewriting a PTE that differs only here is not a remap.
+const PTE_ACCESSED_DIRTY = 0x60;
 // CR0 bits
 const CR0_PG = 0x80000000; // Paging enable (bit 31)
 const CR0_WP = 0x00010000; // Write protect (bit 16)
 
 export class PageTableManager {
     private pagingEnabled = false;
+    private totalMemoryBytes = 0;
     private getMemory: () => Uint8Array;
     private getWasmExports: () => any;
 
     constructor(getMemory: () => Uint8Array, getWasmExports: () => any) {
         this.getMemory = getMemory;
         this.getWasmExports = getWasmExports;
-    }
-
-    private bumpFastmemGeneration(source: number): void {
-        this.getWasmExports()?.fastmem_bump_generation?.(source >>> 0);
     }
 
     /**
@@ -69,8 +62,18 @@ export class PageTableManager {
      * memory accesses go directly to the WASM backing store.
      */
     initialize(totalMemoryBytes: number, win9x = false): void {
+        this.totalMemoryBytes = totalMemoryBytes;
         const mem = this.getMemory();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+
+        // The tables must stay inside their reserved window: anything else means the
+        // layout moved under us and the PTEs would land in some other region's memory.
+        const ptEnd = PAGE_TABLES_ADDR + FULL_PD_ENTRIES * PAGE_SIZE;
+        if (PAGE_DIR_ADDR < MEM_PAGETABLE_BASE || ptEnd > MEM_PAGETABLE_BASE + MEM_PAGETABLE_SIZE) {
+            throw new Error(
+                `PageTableManager: tables 0x${PAGE_DIR_ADDR.toString(16)}-0x${ptEnd.toString(16)} ` +
+                `outside reserved window 0x${MEM_PAGETABLE_BASE.toString(16)}+0x${MEM_PAGETABLE_SIZE.toString(16)}`);
+        }
 
         // Zero page directory (4KB)
         mem.fill(0, PAGE_DIR_ADDR, PAGE_DIR_ADDR + PAGE_SIZE);
@@ -96,7 +99,15 @@ export class PageTableManager {
         // games that legitimately write to low addresses (e.g. Reflexive Arcade).
         // We guard up to page 6 max because the bootloader/GDT/IDT/handlers
         // live at 0x7C00-0x8700+ (pages 7-8) and must remain present.
-        const NULL_GUARD_PAGES = win9x ? 0 : 7;
+        //
+        // `__forceNullGuard` (harness setWorkerFlag, before load_bundle) overrides the Win9x
+        // exemption. Without the guard a jump through a NULL pointer does not fault: it
+        // executes `add [eax],al` across thousands of zero bytes until it reaches the
+        // bootloader, and the crash then reports 0x7c07 with every register and the whole
+        // call site long gone. Forcing it converts that into a fault at the offending
+        // instruction with the caller's frame still on the stack.
+        const forceNullGuard = (globalThis as Record<string, unknown>).__forceNullGuard === true;
+        const NULL_GUARD_PAGES = (win9x && !forceNullGuard) ? 0 : 7;
         const pt0Base = PAGE_TABLES_ADDR; // First page table covers 0x00000000-0x003FFFFF
         for (let i = 0; i < NULL_GUARD_PAGES; i++) {
             view.setUint32(pt0Base + i * 4, 0, true); // Clear Present bit
@@ -123,10 +134,7 @@ export class PageTableManager {
         // Set CR0.PG (paging) + CR0.WP (write protect for ring 0)
         cpu.cr[0] = (cpu.cr[0] | CR0_PG | CR0_WP) >>> 0;
 
-        // Flush TLB. Paging-enable installs the identity map (all pages present) —
-        // a commit-class mapping change, not a decommit.
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_COMMIT);
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
@@ -155,9 +163,7 @@ export class PageTableManager {
             view.setUint32(pteOffset, pte & ~PTE_PRESENT, true);
         }
 
-        // Flush TLB
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_DECOMMIT);
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
@@ -170,7 +176,9 @@ export class PageTableManager {
 
     /**
      * Set Present + RW + User for pages in range, then zero the memory.
-     * Used by VirtualAlloc(MEM_COMMIT) for recommitting decommitted pages.
+     * For a range being allocated fresh — VirtualAlloc(MEM_RESERVE|MEM_COMMIT) and
+     * paging-enable. A commit over pages that may ALREADY be committed must go through
+     * `ensurePagesCommitted`, which leaves present pages (and their protection) alone.
      */
     commitPages(baseAddr: number, sizeBytes: number): void {
         const startPage = (baseAddr >>> 12);
@@ -178,25 +186,49 @@ export class PageTableManager {
         const mem = this.getMemory();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
+        // A page that is already present and NOT writable is being promoted RO → RW here.
+        // That is a protect-class change, not a commit: `setWriteMapBase(.., true)` below
+        // marks the whole span base-writable, and that map is consulted per store with no
+        // generation guard — so a speculated store would start bypassing the slow path on
+        // a page the guest asked to be read-only. Detect it and say so, rather than trusting
+        // every future caller to honour the fresh-range contract above.
+        let protectionRaised = false;
+        let mappingChanged = false;
         for (let page = startPage; page < endPage; page++) {
             const physAddr = page * PAGE_SIZE;
             const pteOffset = this._getPteOffset(page);
-            view.setUint32(pteOffset, physAddr | PTE_DEFAULT, true);
+            const pte = view.getUint32(pteOffset, true);
+            if ((pte & PTE_PRESENT) !== 0 && (pte & PTE_RW) === 0) protectionRaised = true;
+            const next = (physAddr | PTE_DEFAULT) >>> 0;
+            if (((pte & ~PTE_ACCESSED_DIRTY) >>> 0) === next) continue;
+            view.setUint32(pteOffset, next, true);
+            mappingChanged = true;
         }
 
-        // Flush TLB. full_clear_tlb no longer bumps the fastmem generation (routine
-        // churn), so commit must bump explicitly — a recommitted page changes read
-        // validity for any unit that speculated over it while decommitted.
+        // A present identity-mapped page becomes readable immediately. RO and RW
+        // both have READ_OK; write permission remains the write-map's concern.
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_COMMIT);
-        if (exports?.full_clear_tlb) {
+        if (protectionRaised) {
+            Logger.warn(LogCategory.SYSTEM,
+                `[PageTableManager] commitPages raised protection on a present read-only page ` +
+                `in 0x${baseAddr.toString(16)}+0x${sizeBytes.toString(16)} — caller should use ` +
+                `ensurePagesCommitted`);
+        }
+        // Only a real mapping change invalidates translations. A commit over pages
+        // that already carry exactly this PTE is the common case (MemoryManager
+        // commits HEAP eagerly), and a full_clear_tlb there is pure churn on a path
+        // a growing heap drives continuously.
+        if (mappingChanged && exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
         // Track 2b Phase W: committed pages are present + RW → mark base-writable (Rust
         // clamps to the identity-RAM envelope and skips the THUNK_CODE exclusion band).
         setWriteMapBase(baseAddr, sizeBytes, true);
 
-        // Zero memory — Windows guarantees clean pages on recommit
+        // Zero memory — Windows guarantees clean pages on recommit. The span may have
+        // held guest code before it was decommitted, and full_clear_tlb does not drop
+        // compiled blocks, so this JS write needs the §3.1 invalidation like any other.
+        invalidateGuestCode(baseAddr, sizeBytes);
         mem.fill(0, baseAddr, baseAddr + sizeBytes);
 
         Logger.verbose(LogCategory.SYSTEM,
@@ -236,7 +268,6 @@ export class PageTableManager {
         if (recommitted === 0) return;
 
         const exports = this.getWasmExports();
-        this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_COMMIT);
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
@@ -249,7 +280,7 @@ export class PageTableManager {
      * Update PTE flags based on Windows protection constants.
      * Used by VirtualProtect.
      */
-    setProtection(baseAddr: number, sizeBytes: number, protect: number, bumpGeneration = true): void {
+    setProtection(baseAddr: number, sizeBytes: number, protect: number): void {
         const PAGE_NOACCESS = 0x01;
         const PAGE_READONLY = 0x02;
         const PAGE_READWRITE = 0x04;
@@ -285,13 +316,7 @@ export class PageTableManager {
             }
         }
 
-        // Flush TLB. Callers that already bumped the fastmem generation for this
-        // same logical event (VirtualProtect success — AddressSpace.protect bumped)
-        // pass bumpGeneration=false so one syscall counts as one bump.
         const exports = this.getWasmExports();
-        if (bumpGeneration) {
-            this.bumpFastmemGeneration(FASTMEM_BUMP_PAGE_TABLE_PROTECT);
-        }
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }

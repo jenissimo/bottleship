@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>aot-oracle browser arm</title>
+<body>
+<pre id="log">running…</pre>
+<script type="module">
+import "./arm.mjs";
+const log = document.getElementById("log");
+const tick = setInterval(() => {
+    if (!window.__ORACLE_RESULT__) return;
+    clearInterval(tick);
+    log.textContent = JSON.stringify(window.__ORACLE_RESULT__, null, 1);
+}, 200);
+</script>
+</body>

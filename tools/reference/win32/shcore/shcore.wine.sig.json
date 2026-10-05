@@ -1,0 +1,303 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-23T14:58:51.056Z",
+  "module": "shcore",
+  "functions": [
+    {
+      "name": "CommandLineToArgvW",
+      "argCount": 2
+    },
+    {
+      "name": "CreateRandomAccessStreamOverStream",
+      "argCount": 4
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "GetCurrentProcessExplicitAppUserModelID",
+      "argCount": 1
+    },
+    {
+      "name": "GetDpiForMonitor",
+      "argCount": 4
+    },
+    {
+      "name": "GetFeatureEnabledState",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessDpiAwareness",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessReference",
+      "argCount": 1
+    },
+    {
+      "name": "GetScaleFactorForDevice",
+      "argCount": 1
+    },
+    {
+      "name": "GetScaleFactorForMonitor",
+      "argCount": 2
+    },
+    {
+      "name": "IsOS",
+      "argCount": 1
+    },
+    {
+      "name": "IStream_Read",
+      "argCount": 3
+    },
+    {
+      "name": "IStream_Reset",
+      "argCount": 1
+    },
+    {
+      "name": "IStream_Size",
+      "argCount": 2
+    },
+    {
+      "name": "IStream_Write",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_AtomicRelease",
+      "argCount": 1
+    },
+    {
+      "name": "IUnknown_GetSite",
+      "argCount": 3
+    },
+    {
+      "name": "IUnknown_QueryService",
+      "argCount": 4
+    },
+    {
+      "name": "IUnknown_Set",
+      "argCount": 2
+    },
+    {
+      "name": "IUnknown_SetSite",
+      "argCount": 2
+    },
+    {
+      "name": "RecordFeatureUsage",
+      "argCount": 4
+    },
+    {
+      "name": "RegisterScaleChangeEvent",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterScaleChangeNotifications",
+      "argCount": 4
+    },
+    {
+      "name": "SetCurrentProcessExplicitAppUserModelID",
+      "argCount": 1
+    },
+    {
+      "name": "SetProcessDpiAwareness",
+      "argCount": 1
+    },
+    {
+      "name": "SetProcessReference",
+      "argCount": 1
+    },
+    {
+      "name": "SHAnsiToAnsi",
+      "argCount": 3
+    },
+    {
+      "name": "SHAnsiToUnicode",
+      "argCount": 3
+    },
+    {
+      "name": "SHCopyKeyA",
+      "argCount": 4
+    },
+    {
+      "name": "SHCopyKeyW",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateMemStream",
+      "argCount": 2
+    },
+    {
+      "name": "SHCreateStreamOnFileA",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateStreamOnFileEx",
+      "argCount": 6
+    },
+    {
+      "name": "SHCreateStreamOnFileW",
+      "argCount": 3
+    },
+    {
+      "name": "SHCreateThread",
+      "argCount": 4
+    },
+    {
+      "name": "SHCreateThreadRef",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteEmptyKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteEmptyKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "SHDeleteValueA",
+      "argCount": 3
+    },
+    {
+      "name": "SHDeleteValueW",
+      "argCount": 3
+    },
+    {
+      "name": "SHEnumKeyExA",
+      "argCount": 4
+    },
+    {
+      "name": "SHEnumKeyExW",
+      "argCount": 4
+    },
+    {
+      "name": "SHEnumValueA",
+      "argCount": 7
+    },
+    {
+      "name": "SHEnumValueW",
+      "argCount": 7
+    },
+    {
+      "name": "SHGetThreadRef",
+      "argCount": 1
+    },
+    {
+      "name": "SHGetValueA",
+      "argCount": 6
+    },
+    {
+      "name": "SHGetValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SHOpenRegStream2A",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenRegStream2W",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenRegStreamA",
+      "argCount": 4
+    },
+    {
+      "name": "SHOpenRegStreamW",
+      "argCount": 4
+    },
+    {
+      "name": "SHQueryInfoKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "SHQueryInfoKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "SHQueryValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "SHQueryValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "SHRegDuplicateHKey",
+      "argCount": 1
+    },
+    {
+      "name": "SHRegGetIntW",
+      "argCount": 3
+    },
+    {
+      "name": "SHRegGetPathA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegGetPathW",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegGetValueA",
+      "argCount": 7
+    },
+    {
+      "name": "SHRegGetValueW",
+      "argCount": 7
+    },
+    {
+      "name": "SHRegSetPathA",
+      "argCount": 5
+    },
+    {
+      "name": "SHRegSetPathW",
+      "argCount": 5
+    },
+    {
+      "name": "SHReleaseThreadRef",
+      "argCount": 0
+    },
+    {
+      "name": "SHSetThreadRef",
+      "argCount": 1
+    },
+    {
+      "name": "SHSetValueA",
+      "argCount": 6
+    },
+    {
+      "name": "SHSetValueW",
+      "argCount": 6
+    },
+    {
+      "name": "SHStrDupA",
+      "argCount": 2
+    },
+    {
+      "name": "SHStrDupW",
+      "argCount": 2
+    },
+    {
+      "name": "SHUnicodeToAnsi",
+      "argCount": 3
+    },
+    {
+      "name": "SHUnicodeToUnicode",
+      "argCount": 3
+    },
+    {
+      "name": "SubscribeFeatureStateChangeNotification",
+      "argCount": 3
+    }
+  ]
+}

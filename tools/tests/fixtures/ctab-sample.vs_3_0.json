@@ -1,0 +1,140 @@
+{
+  "profile": "vs_3_0",
+  "bytecode": "0xfffe0300,0x008efffe,0x42415443,0x0000001c,0x00000203,0xfffe0300,0x0000000a,0x0000001c,0x00000100,0x000001fc,0x000000e4,0x00000000,0x00000002,0x000000ec,0x00000000,0x000000fc,0x00220002,0x00000001,0x00000108,0x00000000,0x00000118,0x00140002,0x00000006,0x00000124,0x00000000,0x00000134,0x001e0002,0x00000002,0x00000164,0x00000000,0x00000174,0x00000002,0x0000000c,0x0000017c,0x00000000,0x0000018c,0x001a0002,0x00000004,0x0000019c,0x00000000,0x000001ac,0x00000001,0x00000001,0x000001b4,0x00000000,0x000001c4,0x00210002,0x00000001,0x000001b4,0x00000000,0x000001ca,0x00200002,0x00000001,0x000001d4,0x00000000,0x000001e4,0x000c0002,0x00000008,0x000001ec,0x00000000,0x61724262,0x0068636e,0x00010000,0x00010001,0x00000002,0x00000000,0x696b5362,0x64656e6e,0xababab00,0x00010000,0x00010001,0x00000001,0x00000000,0x69655766,0x73746867,0xababab00,0x00030000,0x00010001,0x00000006,0x00000000,0x67694c67,0x70007468,0xab00736f,0x00030001,0x00040001,0x00000001,0x00000000,0x006c6f63,0x0000013b,0x00000140,0x00000150,0x00000140,0x00000005,0x00080001,0x00020001,0x00000154,0x6e6f426d,0xab007365,0x00030002,0x00030004,0x00000004,0x00000000,0x726f576d,0x6956646c,0x72507765,0xab006a6f,0x00030003,0x00040004,0x00000001,0x00000000,0x6f6f4c6e,0xabab0070,0x00020000,0x00010001,0x00000001,0x00000000,0x646f4d6e,0x43760065,0x726f6c6f,0xababab00,0x00030001,0x00040001,0x00000001,0x00000000,0x65745376,0xab007370,0x00030001,0x00040001,0x00000008,0x00000000,0x335f7376,0x4d00305f,0x6f726369,0x74666f73,0x29522820,0x534c4820,0x6853204c,0x72656461,0x6d6f4320,0x656c6970,0x2e392072,0x392e3932,0x332e3235,0x00313131,0x05000051,0xa00f0023,0x00000000,0x00000000,0x00000000,0x00000000,0x0200001f,0x80000000,0x900f0000,0x0200001f,0x80000000,0xe00f0000,0x03000009,0x80010000,0x90e40000,0xa0e4001a,0x03000009,0x80020000,0x90e40000,0xa0e4001b,0x03000009,0x80040000,0x90e40000,0xa0e4001c,0x03000009,0x80080000,0x90e40000,0xa0e4001d,0x03000005,0x80070001,0xa0e40009,0x90550000,0x04000004,0x80070001,0x90000000,0xa0e40008,0x80e40001,0x04000004,0x80070001,0x90aa0000,0xa0e4000a,0x80e40001,0x04000004,0x80070001,0x90ff0000,0xa0e4000b,0x80e40001,0x02000001,0x80010002,0xa0000014,0x03000002,0x80080001,0x80000002,0xa0000019,0x02000001,0x800f0002,0xa0000023,0x0200001b,0xf0e40800,0xf0e40000,0x04000002,0x800f0002,0x80e40002,0xa0e4200c,0xf0e40800,0x0000001d,0x01000028,0xe0e40800,0x03000002,0x800f0002,0x80e40002,0x80e40002,0x0000002b,0x01000028,0xe0e40801,0x03000002,0x800f0002,0x80e40002,0xa0e4001f,0x0000002b,0x03000005,0x80070000,0x80e40000,0xa0e40020,0x04000004,0x80070001,0x80e40001,0x80ff0001,0x80e40000,0x02000001,0x80080003,0xa0ff0020,0x04000004,0x80080001,0x80ff0000,0x80ff0003,0xa0000021,0x02000001,0x800f0000,0xa0e4001f,0x03000002,0x800f0003,0x81e40000,0xa0e4001e,0x04000004,0x800f0000,0xa0000022,0x80e40003,0x80e40000,0x03000002,0x800f0000,0x80e40000,0x80e40001,0x03000002,0xe00f0000,0x80e40002,0x80e40000,0x0000ffff",
+  "reference": {
+    "creator": "Microsoft (R) HLSL Shader Compiler 9.29.952.3111",
+    "version": 4294836992,
+    "constants": [
+      {
+        "name": "bBranch",
+        "registerSet": 0,
+        "registerIndex": 0,
+        "registerCount": 2,
+        "class": 0,
+        "type": 1,
+        "rows": 1,
+        "columns": 1,
+        "elements": 2,
+        "structMembers": 0,
+        "bytes": 8
+      },
+      {
+        "name": "bSkinned",
+        "registerSet": 2,
+        "registerIndex": 34,
+        "registerCount": 1,
+        "class": 0,
+        "type": 1,
+        "rows": 1,
+        "columns": 1,
+        "elements": 1,
+        "structMembers": 0,
+        "bytes": 4
+      },
+      {
+        "name": "fWeights",
+        "registerSet": 2,
+        "registerIndex": 20,
+        "registerCount": 6,
+        "class": 0,
+        "type": 3,
+        "rows": 1,
+        "columns": 1,
+        "elements": 6,
+        "structMembers": 0,
+        "bytes": 24
+      },
+      {
+        "name": "gLight",
+        "registerSet": 2,
+        "registerIndex": 30,
+        "registerCount": 2,
+        "class": 5,
+        "type": 0,
+        "rows": 1,
+        "columns": 8,
+        "elements": 1,
+        "structMembers": 2,
+        "bytes": 32
+      },
+      {
+        "name": "mBones",
+        "registerSet": 2,
+        "registerIndex": 0,
+        "registerCount": 12,
+        "class": 2,
+        "type": 3,
+        "rows": 4,
+        "columns": 3,
+        "elements": 4,
+        "structMembers": 0,
+        "bytes": 192
+      },
+      {
+        "name": "mWorldViewProj",
+        "registerSet": 2,
+        "registerIndex": 26,
+        "registerCount": 4,
+        "class": 3,
+        "type": 3,
+        "rows": 4,
+        "columns": 4,
+        "elements": 1,
+        "structMembers": 0,
+        "bytes": 64
+      },
+      {
+        "name": "nLoop",
+        "registerSet": 1,
+        "registerIndex": 0,
+        "registerCount": 1,
+        "class": 0,
+        "type": 2,
+        "rows": 1,
+        "columns": 1,
+        "elements": 1,
+        "structMembers": 0,
+        "bytes": 4
+      },
+      {
+        "name": "nMode",
+        "registerSet": 2,
+        "registerIndex": 33,
+        "registerCount": 1,
+        "class": 0,
+        "type": 2,
+        "rows": 1,
+        "columns": 1,
+        "elements": 1,
+        "structMembers": 0,
+        "bytes": 4
+      },
+      {
+        "name": "vColor",
+        "registerSet": 2,
+        "registerIndex": 32,
+        "registerCount": 1,
+        "class": 1,
+        "type": 3,
+        "rows": 1,
+        "columns": 4,
+        "elements": 1,
+        "structMembers": 0,
+        "bytes": 16
+      },
+      {
+        "name": "vSteps",
+        "registerSet": 2,
+        "registerIndex": 12,
+        "registerCount": 8,
+        "class": 1,
+        "type": 3,
+        "rows": 1,
+        "columns": 4,
+        "elements": 8,
+        "structMembers": 0,
+        "bytes": 128
+      }
+    ]
+  }
+}

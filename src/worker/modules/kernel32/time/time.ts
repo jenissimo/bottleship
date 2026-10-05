@@ -1,19 +1,25 @@
 // Time-related functions for kernel32
 // GetTickCount, GetSystemTimeAsFileTime, QueryPerformanceCounter, QueryPerformanceFrequency
 
-import { ThunkImplementation, FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { TimeService } from '../../../runtime/time';
+import { VFS_FILETIME } from '../../../runtime/filesystem/file-time';
 import { Logger, LogCategory } from '../../../core/logger';
 import { System } from '../../../core/system';
-import { Mem } from '../../../core/memory/mem-accessor';
 import { WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION } from '../../../core/scheduler/types';
-import { encodeAnsi } from '../../codepage-utils';
+import { deliverPendingApcs } from '../sync';
+import { cpuViews } from '../../../core/cpu/cpu-views';
+import { getCPU } from '../../../core/thunking/thunk-utils';
 
 
 export const exports: Record<string, ThunkImplementation> = {};
 let lastSleepLog = 0;
 let sleepCallCount = 0;
 let lastSleepMs = 0;
+// Sleep is the top thunk in spin-yield titles, and "how many" is useless without
+// "of what": a Sleep(0) yield and a Sleep(2) block are different bugs, and the
+// last-value-seen the line used to print names neither.
+const sleepArgHist = { zero: 0, one: 0, two: 0, more: 0 };
 let lastSleepExApcDepth = -1;
 let sleepExStormUnchangedTicks = 0;
 let lastSleepExStormWarnMs = 0;
@@ -21,7 +27,7 @@ let lastSleepExStormWarnMs = 0;
 /**
  * Register fast path implementations for high-frequency time functions
  */
-export function registerFastPathTimeFunctions(dispatcher: any): void {
+export function registerFastPathTimeFunctions(dispatcher: HleDispatcher): void {
     if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
         dispatcher.registerFastPath('kernel32', 'GetTickCount', TimeService.fastPathGetTickCount);
         dispatcher.registerFastPath('winmm', 'timeGetTime', TimeService.fastPathGetTickCount);
@@ -31,10 +37,7 @@ export function registerFastPathTimeFunctions(dispatcher: any): void {
         // Sleep(0) fast path: skip full thunk when no context switch is needed.
         // D2 calls Sleep(0) ~600K times in 20s. When no other thread is runnable,
         // this is a pure no-op — avoid UD2 trap → JS marshal → scheduler round-trip.
-        const fastPathSleep: FastPathImplementation = (
-            cpu: any, _mem8: Uint8Array, _mem32: Uint32Array, dataView: DataView
-        ): number | null => {
-            const esp = cpu.reg32[4]; // ESP
+        const fastPathSleep: FastPathImplementation = (esp: number, dataView: DataView): number | null => {
             const dwMilliseconds = dataView.getUint32(esp + 4, true);
 
             if (dwMilliseconds === 0) {
@@ -56,6 +59,15 @@ export function registerFastPathTimeFunctions(dispatcher: any): void {
 function initTimeFunctions(): void {
     exports['GetTickCount'] = (ctx, mem, args): number => {
         return TimeService.getInstance().nowMs() | 0;
+    };
+
+    // ULONGLONG GetTickCount64(void): the same clock, unwrapped; EDX:EAX. Its low dword is
+    // what GetTickCount answers at the same instant.
+    exports['GetTickCount64'] = (): number => {
+        const ms = Math.max(0, Math.floor(TimeService.getInstance().nowMs()));
+        const cpu = getCPU(System.getInstance().process?.v86);
+        if (cpu) cpuViews(cpu).reg32[2] = Math.floor(ms / 0x100000000) | 0;
+        return ms >>> 0;
     };
 
     const writeSystemTimeAsFileTime = (mem: Uint8Array, lpSystemTimeAsFileTime: number): void => {
@@ -177,13 +189,19 @@ function initTimeFunctions(): void {
         const now = performance.now();
         sleepCallCount += 1;
         lastSleepMs = dwMilliseconds;
+        if (dwMilliseconds === 0) sleepArgHist.zero++;
+        else if (dwMilliseconds === 1) sleepArgHist.one++;
+        else if (dwMilliseconds === 2) sleepArgHist.two++;
+        else sleepArgHist.more++;
         if (now - lastSleepLog >= 1000) {
             Logger.log(
                 LogCategory.KERNEL32,
-                `Sleep: calls=${sleepCallCount} lastMs=${lastSleepMs}`
+                `Sleep: calls=${sleepCallCount} lastMs=${lastSleepMs} ` +
+                `ms0=${sleepArgHist.zero} ms1=${sleepArgHist.one} ms2=${sleepArgHist.two} ms3+=${sleepArgHist.more}`
             );
             lastSleepLog = now;
             sleepCallCount = 0;
+            sleepArgHist.zero = sleepArgHist.one = sleepArgHist.two = sleepArgHist.more = 0;
         }
 
         const sched = System.getInstance().scheduler;
@@ -251,6 +269,11 @@ function initTimeFunctions(): void {
             sleepCallCount = 0;
         }
 
+        if (bAlertable) {
+            const apcResult = deliverPendingApcs(ctx, 'SleepEx:APC', 8);
+            if (apcResult) return apcResult;
+        }
+
         // Use post-return context path (same model as Sleep) because SleepEx is called from thunk code.
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const returnAddr = view.getUint32(ctx.esp, true);
@@ -303,135 +326,7 @@ function initTimeFunctions(): void {
         }
     };
 
-    // GetDateFormatA - format date as string
-    exports['GetDateFormatA'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpDate = args[2];      // SYSTEMTIME* or NULL for current
-        const lpFormat = args[3];    // format string or NULL for default
-        const lpDateStr = args[4];   // output buffer
-        const cchDate = args[5];     // buffer size
-
-        const now = lpDate ? readSystemTime(mem, lpDate) : new Date();
-
-        // Simple default format: MM/dd/yyyy
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        const day = String(now.getDate()).padStart(2, '0');
-        const year = now.getFullYear();
-        const dateStr = `${month}/${day}/${year}`;
-
-        if (cchDate === 0) {
-            // Return required buffer size
-            return dateStr.length + 1;
-        }
-
-        if (lpDateStr && cchDate > 0) {
-            const bytes = encodeAnsi(dateStr + '\0');
-            const toWrite = bytes.subarray(0, Math.min(bytes.length, cchDate));
-            Mem.writeBytes(lpDateStr, toWrite);
-            return toWrite.length - 1; // exclude null terminator from count
-        }
-
-        return 0;
-    };
-
-    exports['GetDateFormatW'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpDate = args[2];
-        const lpFormat = args[3];
-        const lpDateStr = args[4];
-        const cchDate = args[5];
-
-        const now = lpDate ? readSystemTime(mem, lpDate) : new Date();
-
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        const day = String(now.getDate()).padStart(2, '0');
-        const year = now.getFullYear();
-        const dateStr = `${month}/${day}/${year}`;
-
-        if (cchDate === 0) {
-            return dateStr.length + 1;
-        }
-
-        if (lpDateStr && cchDate > 0) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const len = Math.min(dateStr.length, cchDate - 1);
-            for (let i = 0; i < len; i++) {
-                view.setUint16(lpDateStr + i * 2, dateStr.charCodeAt(i), true);
-            }
-            view.setUint16(lpDateStr + len * 2, 0, true); // null terminator
-            return len;
-        }
-
-        return 0;
-    };
-
-    // GetTimeFormatA - format time as string
-    exports['GetTimeFormatA'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpTime = args[2];      // SYSTEMTIME* or NULL for current
-        const lpFormat = args[3];    // format string or NULL for default
-        const lpTimeStr = args[4];   // output buffer
-        const cchTime = args[5];     // buffer size
-
-        const now = lpTime ? readSystemTime(mem, lpTime) : new Date();
-
-        // Simple default format: HH:mm:ss
-        const hours = String(now.getHours()).padStart(2, '0');
-        const minutes = String(now.getMinutes()).padStart(2, '0');
-        const seconds = String(now.getSeconds()).padStart(2, '0');
-        const timeStr = `${hours}:${minutes}:${seconds}`;
-
-        if (cchTime === 0) {
-            return timeStr.length + 1;
-        }
-
-        if (lpTimeStr && cchTime > 0) {
-            const bytes = encodeAnsi(timeStr + '\0');
-            const toWrite = bytes.subarray(0, Math.min(bytes.length, cchTime));
-            Mem.writeBytes(lpTimeStr, toWrite);
-            return toWrite.length - 1;
-        }
-
-        return 0;
-    };
-
-    exports['GetTimeFormatW'] = (ctx, mem, args) => {
-        const locale = args[0];
-        const dwFlags = args[1];
-        const lpTime = args[2];
-        const lpFormat = args[3];
-        const lpTimeStr = args[4];
-        const cchTime = args[5];
-
-        const now = lpTime ? readSystemTime(mem, lpTime) : new Date();
-
-        const hours = String(now.getHours()).padStart(2, '0');
-        const minutes = String(now.getMinutes()).padStart(2, '0');
-        const seconds = String(now.getSeconds()).padStart(2, '0');
-        const timeStr = `${hours}:${minutes}:${seconds}`;
-
-        if (cchTime === 0) {
-            return timeStr.length + 1;
-        }
-
-        if (lpTimeStr && cchTime > 0) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            const len = Math.min(timeStr.length, cchTime - 1);
-            for (let i = 0; i < len; i++) {
-                view.setUint16(lpTimeStr + i * 2, timeStr.charCodeAt(i), true);
-            }
-            view.setUint16(lpTimeStr + len * 2, 0, true);
-            return len;
-        }
-
-        return 0;
-    };
-
     // BOOL GetFileTime(HANDLE hFile, LPFILETIME lpCreationTime, LPFILETIME lpLastAccessTime, LPFILETIME lpLastWriteTime)
-    // Stub: reports a fixed epoch timestamp for all three fields so callers get valid output.
     exports['GetFileTime'] = (ctx, mem, args) => {
         const hFile = args[0];
         const lpCreationTime  = args[1] >>> 0;
@@ -441,14 +336,10 @@ function initTimeFunctions(): void {
         Logger.verbose(LogCategory.KERNEL32,
             `GetFileTime(hFile=0x${hFile.toString(16)})`);
 
-        // Use a fixed epoch: 2000-01-01 00:00:00 UTC
-        const unixMs = BigInt(Date.UTC(2000, 0, 1));
-        const windowsTicks = (unixMs + 11644473600000n) * 10000n;
-
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         for (const ptr of [lpCreationTime, lpLastAccessTime, lpLastWriteTime]) {
             if (ptr && ptr + 8 <= mem.length) {
-                view.setBigUint64(ptr, windowsTicks, true);
+                view.setBigUint64(ptr, VFS_FILETIME, true);
             }
         }
 

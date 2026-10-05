@@ -18,7 +18,9 @@
  * the overwritten bytes.
  */
 
+import { Logger, LogCategory } from '../logger';
 import { Mem } from '../memory/mem-accessor';
+import { invalidateGuestCode, writeGuestCode } from '../memory/guest-code';
 import type { LoadedPEModule } from '../module-registry';
 import type { ThunkDispatcher, ThunkImplementation } from '../thunking/thunk-dispatcher';
 import type { ThunkGenerator } from '../thunking/thunk-generator';
@@ -27,14 +29,20 @@ import type { EntryFilterInfo, PatchHandle } from './types';
 export interface PatchContext {
     dispatcher: ThunkDispatcher;
     thunkGenerator: ThunkGenerator;
-    /** Fresh `cpu` handle (from `process.v86`) for `jit_dirty_cache`; may be null early. */
-    cpu: any;
     getMemory: () => Uint8Array | null;
 }
 
 export interface PatchRequest {
     libId: string;
     functionName: string;
+    /**
+     * PE module the patched copy lives in (see PatchHandle.moduleName). Required for any
+     * caller whose (libId, functionName) can occur in more than one module — that is every
+     * hle-lib descriptor. Omit only when the caller's own id is already module-unique
+     * (hook-registry keys on spec.id, galaxy on one module's exports); the patch then keeps
+     * the legacy single-module virtual module id.
+     */
+    moduleName?: string;
     /** Absolute guest address of the target function entry. */
     targetAddress: number;
     /** cdecl = caller cleans stack; stdcall = callee RET N. */
@@ -61,6 +69,26 @@ export interface PatchRequest {
      * A null return refuses the whole patch.
      */
     entryFilter?: (info: EntryFilterInfo) => number | null;
+}
+
+/**
+ * Follow up to 4 rel32 jmp thunks from an export entry to the real body. An incrementally
+ * linked DLL exports 5-byte `E9` thunks packed back to back — patching one clobbers its
+ * neighbours, so every caller patches the body the thunks jump to.
+ */
+export function resolveExportBodyRva(module: LoadedPEModule, exportRva: number): number {
+    const imageEnd = module.baseAddress + module.size;
+    let rva = exportRva;
+    for (let hop = 0; hop < 4; hop++) {
+        const addr = module.baseAddress + rva;
+        if ((Mem.readUint8(addr) ?? 0) !== 0xe9) break;
+        // Keep the last RVA that was inside the image: callers patch/read at what this
+        // returns, so accepting a hop that lands outside would aim them at another image.
+        const next = (rva + 5 + (Mem.readInt32(addr + 1) ?? 0)) >>> 0;
+        if (next === 0 || module.baseAddress + next >= imageEnd) break;
+        rva = next;
+    }
+    return rva;
 }
 
 /**
@@ -120,7 +148,7 @@ export function validatePrologueBytes(bytes: Uint8Array): string | null {
 export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | null {
     const mem = ctx.getMemory();
     if (!mem) {
-        console.warn(
+        Logger.warn(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: guest memory not yet available, skipping ${req.libId}:${req.functionName}`);
         return null;
     }
@@ -134,13 +162,17 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     // requests that violate the invariant. Checked FIRST — nothing is mutated yet.
     const overwriteBytes = req.overwriteBytes ?? (req.prologueLen !== undefined ? 5 : 11);
     if (req.prologueLen !== undefined && overwriteBytes > req.prologueLen) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: overwriteBytes ${overwriteBytes} > prologueLen ${req.prologueLen} ` +
             `for ${req.libId}:${req.functionName} — the trampoline would re-enter clobbered bytes; refusing`);
         return null;
     }
 
-    const virtualModuleId = `${req.libId}-hle`;
+    // Per MODULE, not just per lib: the dispatcher resolves a stub's handler by
+    // (virtualModuleId, functionName), so a lib linked into two modules would have the
+    // second registration replace the first's handler — and for a shadow hook that handler
+    // carries the module's own validation runtime and trampoline.
+    const virtualModuleId = req.moduleName ? `${req.libId}-hle@${req.moduleName}` : `${req.libId}-hle`;
 
     // 1. Allocate the callout stub. ThunkGenerator returns {address, code}.
     let stubAddress = 0;
@@ -156,18 +188,22 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         stubAddress = allocated.address;
         stubCode = allocated.code;
     } catch (e) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: allocateOneStub failed for ${req.libId}:${req.functionName}: ${e}`);
         return null;
     }
 
     // 2. Write stub bytes to guest memory.
     if (stubAddress + stubCode.length > mem.length) {
-        console.error(
+        Logger.error(LogCategory.SYSTEM,
             `[HLE-lib] applyPatch: stub 0x${stubAddress.toString(16)} overruns memory`);
         return null;
     }
-    mem.set(stubCode, stubAddress);
+    if (!writeGuestCode(mem, stubCode, stubAddress)) {
+        Logger.error(LogCategory.SYSTEM,
+            `[HLE-lib] applyPatch: stub write at 0x${stubAddress.toString(16)} overran memory`);
+        return null;
+    }
 
     // 3. Register handler under the virtual module id.
     ctx.dispatcher.register(virtualModuleId, req.functionName, req.handler);
@@ -187,23 +223,28 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         const prologue = originalBytes.slice(0, pl);
         const reason = validatePrologueBytes(prologue);
         if (reason) {
-            console.error(
+            Logger.error(LogCategory.SYSTEM,
                 `[HLE-lib] applyPatch: trampoline refused for ${req.libId}:${req.functionName}: ${reason} ` +
                 `(bytes: ${Array.from(prologue).map(x => x.toString(16).padStart(2, '0')).join(' ')})`);
             return null;
         }
         trampolineAddress = ctx.thunkGenerator.allocateRawCodeArea(pl + 5);
         if (trampolineAddress + pl + 5 > mem.length) {
-            console.error(`[HLE-lib] applyPatch: trampoline 0x${trampolineAddress.toString(16)} overruns memory`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-lib] applyPatch: trampoline 0x${trampolineAddress.toString(16)} overruns memory`);
             return null;
         }
-        mem.set(prologue, trampolineAddress);
+        if (!writeGuestCode(mem, prologue, trampolineAddress)) {
+            Logger.error(LogCategory.SYSTEM,
+                `[HLE-lib] applyPatch: trampoline write at 0x${trampolineAddress.toString(16)} overran memory`);
+            return null;
+        }
         const back = (req.targetAddress + pl - (trampolineAddress + pl + 5)) | 0;
         mem[trampolineAddress + pl]     = 0xE9;
         mem[trampolineAddress + pl + 1] = back & 0xFF;
         mem[trampolineAddress + pl + 2] = (back >> 8)  & 0xFF;
         mem[trampolineAddress + pl + 3] = (back >> 16) & 0xFF;
         mem[trampolineAddress + pl + 4] = (back >> 24) & 0xFF;
+        invalidateGuestCode(trampolineAddress, pl + 5);
     }
 
     // 4c. Guest-side entry filter (partial hooks): emit the classifier and
@@ -211,7 +252,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     let jmpTarget = stubAddress;
     if (req.entryFilter) {
         if (trampolineAddress === undefined) {
-            console.error(
+            Logger.error(LogCategory.SYSTEM,
                 `[HLE-lib] applyPatch: entryFilter for ${req.libId}:${req.functionName} requires prologueLen ` +
                 `(the trampoline is its decline path); refusing`);
             return null;
@@ -226,11 +267,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
                 allocCode: (size: number) => ctx.thunkGenerator.allocateRawCodeArea(size),
             });
         } catch (e) {
-            console.error(`[HLE-lib] applyPatch: entryFilter threw for ${req.libId}:${req.functionName}: ${e}`);
+            Logger.error(LogCategory.SYSTEM, `[HLE-lib] applyPatch: entryFilter threw for ${req.libId}:${req.functionName}: ${e}`);
             filterAddr = null;
         }
         if (filterAddr === null || filterAddr <= 0 || filterAddr >= mem.length) {
-            console.error(
+            Logger.error(LogCategory.SYSTEM,
                 `[HLE-lib] applyPatch: entryFilter refused/invalid for ${req.libId}:${req.functionName} — aborting patch`);
             return null;
         }
@@ -250,19 +291,11 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
         mem[req.targetAddress + i] = 0x90;
     }
 
-    // 6. Invalidate JIT cache for the patched prologue so v86 re-compiles from
-    //    new bytes rather than replaying the cached pre-patch block. Covering
-    //    the full 16-byte range is cheap and defensive.
-    try {
-        const cpu = ctx.cpu;
-        if (cpu && cpu["jit_dirty_cache"]) {
-            cpu["jit_dirty_cache"](req.targetAddress, req.targetAddress + 16);
-        } else {
-            console.warn(
-                `[HLE-lib] applyPatch: cpu not ready, JIT invalidation may be delayed for ${req.libId}:${req.functionName}`);
-        }
-    } catch (e) {
-        console.warn(`[HLE-lib] applyPatch: jit_dirty_cache threw: ${e}`);
+    // 6. Drop the cached pre-patch block for the rewritten prologue. Covering the full
+    //    16-byte range is cheap and defensive.
+    if (!invalidateGuestCode(req.targetAddress, 16)) {
+        Logger.warn(LogCategory.SYSTEM,
+            `[HLE-lib] applyPatch: no wasm instance, JIT invalidation deferred for ${req.libId}:${req.functionName}`);
     }
 
     const stubInfo = ctx.thunkGenerator.getStubByAddress?.(stubAddress);
@@ -271,6 +304,7 @@ export function applyPatch(ctx: PatchContext, req: PatchRequest): PatchHandle | 
     return {
         libId: req.libId,
         functionName: req.functionName,
+        moduleName: req.moduleName ?? '',
         targetAddress: req.targetAddress,
         stubAddress,
         originalBytes,

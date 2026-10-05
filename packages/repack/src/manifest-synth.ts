@@ -5,6 +5,7 @@
 import type { IconEntry } from "@bottleship/formats/inno/entries/icon";
 import type { RegistryEntry } from "@bottleship/formats/inno/entries/registry";
 import type { InnoParseResult } from "@bottleship/formats/inno";
+import { normalizeInnoDestination } from "@bottleship/formats/inno";
 import { detectExeFromPaths } from "./gog-filter";
 import { deriveGameId } from "@bottleship/formats/wgb/container-id";
 import type { GogOverrideEntry } from "./overrides";
@@ -279,6 +280,17 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
     // Container key (WGB v2): a GOG product id → gog:<id>; else derive app:<slug>/byo.
     const manifestGameId = gogInfo.gameId ? `gog:${gogInfo.gameId}` : deriveGameId({ name, entrypoint });
 
+    // Installer [Dirs] entries: a store-only ZIP has no entry for an empty directory,
+    // so installer-created dirs must be recreated at boot (worker createDirs) or the
+    // game's opens/writes into them fail with the WRONG error (PATH_NOT_FOUND instead
+    // of FILE_NOT_FOUND) vs a real install.
+    const createDirs = [...new Set(
+        (opts.parsed.directories ?? [])
+            .map((d) => normalizeInnoDestination(d.name))
+            .filter((rel): rel is string => !!rel)
+            .map((rel) => rel.replace(/\//g, "\\")),
+    )].sort();
+
     let manifest: Record<string, unknown> = {
         formatVersion: 2,
         gameId: manifestGameId,
@@ -291,6 +303,7 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
             screenResolution: { width, height, bpp },
             memory: { ram: ramMB * 1024 * 1024 },
             ...(cli.skipVideo ? { skipVideo: true } : {}),
+            ...(createDirs.length > 0 ? { createDirs } : {}),
         },
     };
     if (gameArgs) manifest.args = gameArgs;

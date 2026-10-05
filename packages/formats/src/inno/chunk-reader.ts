@@ -12,7 +12,7 @@ import {
     UNPACK_STORE,
     type UnpackDecoder,
 } from "../unpack";
-import type { RandomAccessSource } from "../unpack/source";
+import { BufferSource, type RandomAccessSource } from "../unpack/source";
 
 /** chunk.cpp:51 */
 export const CHUNK_MAGIC = new Uint8Array([0x7a, 0x6c, 0x62, 0x1a]); // 'zlb\x1a'
@@ -69,29 +69,34 @@ const SLICE_IDS: ReadonlyArray<ReadonlyArray<number>> = [
 export const SLICE_HEADER_SIZE = 12;
 
 export interface SliceData {
-    /** Full bytes of the `.bin` file. */
-    bytes: Uint8Array;
+    /** The `.bin` file's bytes — random-access so a slice never has to be resident. */
+    source: RandomAccessSource;
     /** Declared slice size from the header — valid data region is [SLICE_HEADER_SIZE, sliceSize). */
     sliceSize: number;
 }
 
 /** slice.cpp open_file — validate an external `.bin` slice header and its declared size. */
-export function parseSliceFile(bytes: Uint8Array): SliceData {
-    if (bytes.byteLength < SLICE_HEADER_SIZE) {
+export function parseSliceSource(source: RandomAccessSource): SliceData {
+    if (source.size < SLICE_HEADER_SIZE) {
         throw new InnoFormatError("slice file too small for header");
     }
-    const magicOk = SLICE_IDS.some((id) => id.every((b, i) => bytes[i] === b));
+    const head = source.readRangeSync(0, SLICE_HEADER_SIZE);
+    const magicOk = SLICE_IDS.some((id) => id.every((b, i) => head[i] === b));
     if (!magicOk) {
         throw new InnoFormatError("bad slice magic number (not an Inno .bin data slice)");
     }
-    const sliceSize = readU32At(bytes, 8);
-    if (sliceSize > bytes.byteLength) {
-        throw new InnoFormatError(`bad slice size: ${sliceSize} > file ${bytes.byteLength}`);
+    const sliceSize = readU32At(head, 8);
+    if (sliceSize > source.size) {
+        throw new InnoFormatError(`bad slice size: ${sliceSize} > file ${source.size}`);
     }
     if (sliceSize < SLICE_HEADER_SIZE) {
         throw new InnoFormatError(`bad slice size: ${sliceSize} < header ${SLICE_HEADER_SIZE}`);
     }
-    return { bytes, sliceSize };
+    return { source, sliceSize };
+}
+
+export function parseSliceFile(bytes: Uint8Array): SliceData {
+    return parseSliceSource(new BufferSource(bytes));
 }
 
 /**
@@ -124,7 +129,7 @@ export class MultiSliceReader implements SliceSource {
                 continue;
             }
             const take = Math.min(remaining, length - written);
-            out.set(s.bytes.subarray(pos, pos + take), written);
+            out.set(s.source.readRangeSync(pos, pos + take), written);
             written += take;
             pos += take;
         }
@@ -199,29 +204,32 @@ export function decompressChunkStream(
     const absBase = chunk.sortOffset;
     verifyMagic(slice.readSpan(chunk.firstSlice, chunk.sortOffset, 4), absBase);
 
-    const payload = slice.readSpan(chunk.firstSlice, chunk.sortOffset + 4, chunk.chunkSize);
-    if (payload.byteLength !== chunk.chunkSize) {
-        throw new InnoFormatError(
-            `truncated chunk payload (got ${payload.byteLength}, expected ${chunk.chunkSize})`,
-            absBase + 4,
-        );
-    }
+    const payloadSource = (skip = 0): RandomAccessSource => ({
+        size: chunk.chunkSize - skip,
+        readRangeSync(start, end) {
+            const bytes = slice.readSpan(chunk.firstSlice, chunk.sortOffset + 4 + skip + start, end - start);
+            if (bytes.length !== end - start) throw new InnoFormatError("truncated chunk payload", absBase + 4 + start);
+            return bytes;
+        },
+    });
 
     switch (chunk.compression) {
         case CompressionMethod.Stored: {
-            if (!onWrite(payload)) {
-                throw new InnoFormatError("output aborted during stored chunk decode", absBase);
+            const source = payloadSource();
+            for (let at = 0; at < source.size; at += 256 * 1024) {
+                if (!onWrite(source.readRangeSync(at, Math.min(source.size, at + 256 * 1024)))) {
+                    throw new InnoFormatError("output aborted during stored chunk decode", absBase);
+                }
             }
             break;
         }
         case CompressionMethod.LZMA1: {
-            if (payload.byteLength < 5) {
+            if (chunk.chunkSize < 5) {
                 throw new InnoFormatError("LZMA1 chunk header too short", absBase + 4);
             }
-            const props = payload.subarray(0, 5);
-            const compressed = payload.subarray(5);
+            const props = payloadSource().readRangeSync(0, 5);
             try {
-                lzma.decodeToCallback(UNPACK_LZMA1, compressed, onWrite, props);
+                lzma.decodeSourceToCallback(UNPACK_LZMA1, payloadSource(5), onWrite, props);
             } catch (e) {
                 throw new InnoFormatError(
                     `LZMA1 decode failed @ slice+0x${chunk.sortOffset.toString(16)}: ${e}`,
@@ -231,16 +239,15 @@ export function decompressChunkStream(
             break;
         }
         case CompressionMethod.LZMA2: {
-            if (payload.byteLength < 1) {
+            if (chunk.chunkSize < 1) {
                 throw new InnoFormatError("LZMA2 chunk header too short", absBase + 4);
             }
-            const prop = payload[0]!;
+            const prop = payloadSource().readRangeSync(0, 1)[0]!;
             const dictSize = lzma2DictSize(prop);
             const props = new Uint8Array(4);
             new DataView(props.buffer).setUint32(0, dictSize, true);
-            const compressed = payload.subarray(1);
             try {
-                lzma.decodeToCallback(UNPACK_LZMA2, compressed, onWrite, props);
+                lzma.decodeSourceToCallback(UNPACK_LZMA2, payloadSource(1), onWrite, props);
             } catch (e) {
                 throw new InnoFormatError(
                     `LZMA2 decode failed @ slice+0x${chunk.sortOffset.toString(16)}: ${e}`,

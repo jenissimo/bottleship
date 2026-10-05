@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "target": "native-d3d9",
+  "source": "IDirect3D9/IDirect3DDevice9Ex vtables via d3d9.dll",
+  "environment": "Windows=Microsoft Windows NT 10.0.26200.0; process=X64; adapters=1; ex-device=true",
+  "probes": {
+    "caps-layout-and-evidence": {
+      "adapterCount": 1,
+      "hresult": 0,
+      "caps": {
+        "size": 304,
+        "rawHex": "010000000000000000000200000002E0A00300000F00008001000000F0BE1B00F2CE2F0091217307FF000000FF3F0000FF3F0000FF00000008420800C5EC01000007030300030303000303033F0000003F0000001F000000004000000040000000080000002000000040000010000000F902155020BCBECC20BCBECC20BCBE4C20BCBE4C00000000FF01000008001800FFFFFE0308000000080000003B0100000800000008000000040000000000000000000046FFFFFF00FFFFFF0010000000FF0000000003FEFF000100000003FFFF00E07F475100000000000000000000000000000000000000010000000F0300000400000000030003010000001800000020000000040000001F0000001800000020000000040000000002000000070303FFFF0000FFFF00000010000000100000"
+      }
+    },
+    "caps-volume-filter-refusal": 50529024,
+    "check-device-format-cross-bpp": {
+      "supported": true,
+      "qualityLevels": 0
+    },
+    "check-device-format-unsupported-float-rt": {
+      "supported": true,
+      "qualityLevels": 0
+    },
+    "check-device-format-r16f-texture": {
+      "supported": true,
+      "qualityLevels": 0
+    },
+    "check-device-format-g16r16f-texture": {
+      "supported": true,
+      "qualityLevels": 0
+    },
+    "check-device-format-a16b16g16r16f-texture": {
+      "supported": true,
+      "qualityLevels": 0
+    },
+    "d3d9-msaa-none": {
+      "supported": true,
+      "qualityLevels": 1
+    },
+    "d3d9-msaa-2x-refusal": {
+      "supported": true,
+      "qualityLevels": 1
+    },
+    "ex-convolution-invalidcall": 2289436780,
+    "ex-compose-rects-compat-stub": 2289436780,
+    "ex-check-resource-residency-stub": 2289436780,
+    "ex-check-device-state-stub": 141953144
+  }
+}

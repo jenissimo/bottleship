@@ -2,13 +2,17 @@ import { Logger, LogCategory, LogLevel } from "../../core/logger";
 import { Marshaler } from "../../core/memory/marshaler";
 import { MemoryGuard } from "../../core/memory/mem-guard";
 import { System } from "../../core/system";
+import { TimerKind } from "../../core/scheduler/types";
+import { TimeService } from "../../runtime/time";
+import { BufferSource } from "@bottleship/formats/unpack/source";
+import { probeAudio, sniffAudioContainer } from "@bottleship/formats/audio";
 import { MSSContext, SMP_DONE, SMP_FREE, SMP_PLAYING } from "./context";
 import { MSSSample, MSSStream } from "./types";
 
 // ==================== Memory helpers ====================
 
 export function getMemory(ctx: MSSContext): Uint8Array {
-    return ctx.process.v86.mem8 || (ctx.process.v86.v86 && ctx.process.v86.v86.cpu.mem8);
+    return ctx.process.getCurrentMemory();
 }
 
 export function makeView(mem: Uint8Array): DataView {
@@ -300,6 +304,35 @@ export function reinitDriverFields(
 }
 
 /**
+ * The digital driver's master volume, 0–127.
+ *
+ * It lives in the GUEST driver struct at +0x10 — the field computeSampleVolumes
+ * already mixes into every voice — so that is the state, not a JS shadow of it.
+ * Miles exposes it under two decorations that differ by SDK version (MSS 5's S32
+ * 0–127 pair and MSS 6's F32 0.0–1.0 `_level` pair); both address this one field,
+ * and a title may read it out of the struct directly besides.
+ */
+export function getDigitalMasterVolume(ctx: MSSContext): number {
+    if (!ctx.digitalDriverHandle) return 127;
+    const mem = getMemory(ctx);
+    if (!MemoryGuard.isValidRange(mem, ctx.digitalDriverHandle + 0x10, 4)) return 127;
+    const raw = makeView(mem).getInt32(ctx.digitalDriverHandle + 0x10, true);
+    return Math.max(0, Math.min(127, raw));
+}
+
+/** Store the master volume and recompute the per-voice fields that derive from it. */
+export function setDigitalMasterVolume(ctx: MSSContext, volume127: number): void {
+    if (!ctx.digitalDriverHandle) return;
+    const clamped = Math.max(0, Math.min(127, Math.round(volume127)));
+    const mem = getMemory(ctx);
+    const view = makeView(mem);
+    MemoryGuard.writeUint32(mem, view, ctx.digitalDriverHandle + 0x10, clamped >>> 0, "MSS32:setDigitalMasterVolume");
+    for (const sample of ctx.samples.values()) {
+        computeSampleVolumes(view, sample.handle, ctx.digitalDriverHandle);
+    }
+}
+
+/**
  * Compute and write volL, volR, effectiveVol×16 fields into a SAMPLE struct.
  * Mirrors real MSS32 FUN_2100f2d0 (volume recalculation).
  *
@@ -489,9 +522,38 @@ export function ensureDriverHandle(ctx: MSSContext, mem: Uint8Array): number {
 
     reinitDriverFields(ctx, driverHandle, dummyBuffer, waveFormat, noopTable, 0, mem, 0);
 
+    // A driver exists again, so the playback heartbeat must be running again.
+    startHeartbeat(ctx);
+
     Logger.log(LogCategory.SYSTEM, `MSS32: ensureDriverHandle created driver at 0x${driverHandle.toString(16)}, noopStub=0x${noopStub.toString(16)}`);
     return driverHandle;
 }
+
+/**
+ * (Re)arm the 20 ms playback heartbeat: EOS detection, guest-visible position
+ * writeback, and the service point for incrementally fed streams.
+ *
+ * It is a property of "a digital driver is open", NOT of module construction —
+ * close_digital_driver / shutdown / waveOutClose all stop it, and a title that
+ * reopens its driver (changing an audio setting does exactly that) would otherwise
+ * run the rest of the session with no clock at all: positions frozen, samples never
+ * reaching DONE, and a streaming ring nobody refills.
+ */
+export function startHeartbeat(ctx: MSSContext): void {
+    if (ctx.updateInterval || !ctx.heartbeatTick) return;
+    const scheduler = System.getInstance().scheduler;
+    if (!scheduler) {
+        Logger.warn(LogCategory.SYSTEM, "MSS32: scheduler unavailable — playback heartbeat not armed");
+        return;
+    }
+    ctx.updateInterval = scheduler.timerWheel.add(
+        HEARTBEAT_MS, true, TimerKind.MSS_TIMER, ctx.heartbeatTick,
+        TimeService.getInstance().nowMs(),
+    );
+}
+
+/** Heartbeat period. 50 Hz: fine enough for EOS latency, coarse enough to be free. */
+export const HEARTBEAT_MS = 20;
 
 /** Stop the heartbeat timer; call on shutdown/close_driver to avoid writing to stale memory.
  *  updateInterval now holds a scheduler timer-wheel id (not a setInterval handle). */
@@ -604,9 +666,19 @@ export function refreshSampleLenDone(ctx: MSSContext, sample: MSSSample): void {
 export function setStreamStatus(ctx: MSSContext, stream: MSSStream, status: number): void {
     const mem = getMemory(ctx);
     const view = makeView(mem);
-    if (MemoryGuard.isValidRange(mem, stream.handle, 4)) {
-        view.setUint32(stream.handle + 0x00, status, true);
+    if (!MemoryGuard.isValidRange(mem, stream.handle, 4)) return;
+
+    // Miles notifies the registered stream callback when a stream reaches the end of
+    // its file, however it was fed. An incrementally served stream reaches that point
+    // in stream-engine's rollOver, which has its own once-guard; one played from a
+    // whole decoded buffer only ever reaches it here, at the PLAYING→DONE edge, and
+    // firing on the edge is what keeps a status rewritten every heartbeat to one call.
+    const previous = view.getUint32(stream.handle + 0x00, true);
+    if (status === SMP_DONE && previous === SMP_PLAYING && !stream.source) {
+        const callback = ctx.streamCallbacks.get(stream.handle) ?? 0;
+        if (callback) ctx.pendingStreamCallbacks.push({ callback, handle: stream.handle });
     }
+    view.setUint32(stream.handle + 0x00, status, true);
 }
 
 export function writeStreamPosition(ctx: MSSContext, stream: MSSStream, position: number): void {
@@ -714,54 +786,44 @@ export function defaultStreamBufferSize(sample: MSSSample): number {
     return (base + 511) & ~511;
 }
 
+/**
+ * Container sniffs over a HEADER SLICE, not the whole file — stream-engine hands
+ * these its first probe read, so they must answer from the magic bytes alone.
+ */
 export function isMp3(data: Uint8Array): boolean {
-    if (data.length < 3) return false;
-    if (data[0] === 0x49 && data[1] === 0x44 && data[2] === 0x33) {
-        return true; // ID3 tag
-    }
-    if (data[0] === 0xff && (data[1] & 0xe0) === 0xe0) {
-        return true; // MPEG frame sync
-    }
-    return false;
+    return sniffAudioContainer(new BufferSource(data)) === "mp3";
 }
 
 export function isOgg(data: Uint8Array): boolean {
-    if (data.length < 4) return false;
-    // OggS magic bytes
-    return data[0] === 0x4f && data[1] === 0x67 && data[2] === 0x67 && data[3] === 0x53;
+    return sniffAudioContainer(new BufferSource(data)) === "ogg";
 }
 
 export interface EncodedAudioInfo {
     sampleRate?: number;
     channels?: number;
     durationMs?: number;
-    bitrateKbps?: number;
 }
 
-const MPEG1_BITRATES_KBPS: Record<number, number[]> = {
-    1: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
-    2: [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
-    3: [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
-};
-
-const MPEG2_BITRATES_KBPS: Record<number, number[]> = {
-    1: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
-    2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
-    3: [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
-};
-
-/** Best-effort metadata for encoded audio that is decoded outside the worker. */
+/**
+ * Metadata for encoded audio that is decoded outside the worker. The rate MUST come
+ * from the source, never from the output device: everything Miles reports in bytes
+ * (position, length, SMP_DONE) is scaled by it, so substituting the device rate
+ * makes a game's own playback clock run fast by exactly that ratio.
+ */
 export function inspectEncodedAudio(data: Uint8Array, format?: "mp3" | "ogg"): EncodedAudioInfo {
-    if (format === "ogg" || isOgg(data)) {
-        return inspectOggVorbis(data);
-    }
-    if (format === "mp3" || isMp3(data)) {
-        return inspectMp3(data);
-    }
-    return {};
+    const probe = probeAudio(new BufferSource(data));
+    if (!probe || (format && probe.format !== format)) return {};
+    return {
+        sampleRate: probe.sampleRate || undefined,
+        channels: probe.channels || undefined,
+        durationMs: probe.durationMs || undefined,
+    };
 }
 
-// AILFILETYPE_* — Miles Sound System file sniffing (see tools/reference/mss32/mss.h)
+// AILFILETYPE_* — Miles Sound System file sniffing (see tools/reference/mss32/mss.h).
+// Deliberately NOT the shared probe: AIL_file_type classifies MIDI/XMIDI/DLS/VOC/BinkA
+// too, and must name a WAV variant from the format tag alone, for an image the decode
+// paths cannot take.
 export const AILFILETYPE_UNKNOWN = 0;
 export const AILFILETYPE_PCM_WAV = 1;
 export const AILFILETYPE_ADPCM_WAV = 2;
@@ -861,172 +923,6 @@ function skipId3v2(data: Uint8Array): number {
     if (data[0] !== 0x49 || data[1] !== 0x44 || data[2] !== 0x33) return 0;
     const size = ((data[6] & 0x7f) << 21) | ((data[7] & 0x7f) << 14) | ((data[8] & 0x7f) << 7) | (data[9] & 0x7f);
     return Math.min(data.length, 10 + size);
-}
-
-function inspectMp3(data: Uint8Array): EncodedAudioInfo {
-    const start = skipId3v2(data);
-    const maxScan = Math.min(data.length - 4, Math.max(start + 4096, 4096));
-    for (let offset = start; offset <= maxScan; offset++) {
-        const b0 = data[offset];
-        const b1 = data[offset + 1];
-        if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) {
-            continue;
-        }
-
-        const b2 = data[offset + 2];
-        const b3 = data[offset + 3];
-        const versionId = (b1 >> 3) & 0x03;
-        const layerBits = (b1 >> 1) & 0x03;
-        const bitrateIdx = (b2 >> 4) & 0x0f;
-        const sampleRateIdx = (b2 >> 2) & 0x03;
-        if (versionId === 1 || layerBits === 0 || bitrateIdx === 0 || bitrateIdx === 0x0f || sampleRateIdx === 3) {
-            continue;
-        }
-
-        const rates = [44100, 48000, 32000];
-        let sampleRate = rates[sampleRateIdx];
-        if (versionId === 2) {
-            sampleRate /= 2;
-        } else if (versionId === 0) {
-            sampleRate /= 4;
-        }
-
-        const bitrateTable = versionId === 3 ? MPEG1_BITRATES_KBPS : MPEG2_BITRATES_KBPS;
-        const bitrateKbps = bitrateTable[layerBits]?.[bitrateIdx] ?? 0;
-        const chanMode = (b3 >> 6) & 0x03;
-        const isMono = chanMode === 3;
-        const channels = isMono ? 1 : 2;
-        if (!sampleRate) {
-            return { sampleRate, channels };
-        }
-
-        // Layer III @ MPEG2/2.5 packs 576 samples/frame; everything else 1152 (Layer II)
-        // or 384 (Layer I). Needed to convert a Xing/VBRI frame count into a duration.
-        const samplesPerFrame = layerBits === 3 ? 384
-            : layerBits === 1 && versionId !== 3 ? 576
-            : 1152;
-
-        // Prefer the Xing/Info/VBRI frame count — accurate for VBR *and* CBR. The
-        // first-frame-bitrate × filesize estimate below is only correct for true CBR and
-        // runs short on VBR/padded streams, so only use it when no VBR header is present.
-        const frameCount = readMp3FrameCount(data, offset, versionId, isMono);
-        if (frameCount > 0) {
-            const durationMs = Math.max(1, Math.floor((frameCount * samplesPerFrame * 1000) / sampleRate));
-            return { sampleRate, channels, durationMs, bitrateKbps: bitrateKbps || undefined };
-        }
-
-        if (!bitrateKbps) {
-            return { sampleRate, channels };
-        }
-
-        // CBR fallback: strip a trailing 128-byte ID3v1 tag, then bytes·8 / bitrate.
-        let audioBytes = Math.max(0, data.length - offset);
-        if (audioBytes >= 128) {
-            const tagOffset = data.length - 128;
-            if (data[tagOffset] === 0x54 && data[tagOffset + 1] === 0x41 && data[tagOffset + 2] === 0x47) {
-                audioBytes -= 128;
-            }
-        }
-        const durationMs = Math.max(1, Math.floor((audioBytes * 8 * 1000) / (bitrateKbps * 1000)));
-        return { sampleRate, channels, durationMs, bitrateKbps };
-    }
-    return {};
-}
-
-/** Read big-endian u32 (unsigned). */
-function readU32BE(data: Uint8Array, p: number): number {
-    return ((data[p] << 24) | (data[p + 1] << 16) | (data[p + 2] << 8) | data[p + 3]) >>> 0;
-}
-
-/**
- * Total MPEG frame count from a Xing/Info (VBR/CBR LAME) or VBRI (Fraunhofer) header in the
- * first audio frame, or 0 if absent. Frame count × samples-per-frame / sample-rate gives an
- * exact duration regardless of VBR — unlike scaling filesize by the first frame's bitrate.
- */
-function readMp3FrameCount(data: Uint8Array, frameStart: number, versionId: number, isMono: boolean): number {
-    // Xing/Info sits after the 4-byte header + side-info block; its size depends on
-    // MPEG version and channel mode.
-    const sideInfo = versionId === 3
-        ? (isMono ? 17 : 32)   // MPEG1
-        : (isMono ? 9 : 17);   // MPEG2 / MPEG2.5
-    const xingOff = frameStart + 4 + sideInfo;
-    if (xingOff + 12 <= data.length) {
-        const tag = readU32BE(data, xingOff);
-        const isXing = tag === 0x58696e67; // "Xing"
-        const isInfo = tag === 0x496e666f; // "Info"
-        if (isXing || isInfo) {
-            const flags = readU32BE(data, xingOff + 4);
-            if (flags & 0x0001) {           // FRAMES_FLAG → frame count present
-                return readU32BE(data, xingOff + 8);
-            }
-        }
-    }
-
-    // VBRI is always 32 bytes past the header, independent of channel mode.
-    const vbriOff = frameStart + 4 + 32;
-    if (vbriOff + 18 <= data.length && readU32BE(data, vbriOff) === 0x56425249) { // "VBRI"
-        return readU32BE(data, vbriOff + 14);
-    }
-
-    return 0;
-}
-
-function inspectOggVorbis(data: Uint8Array): EncodedAudioInfo {
-    let sampleRate = 0;
-    const maxIdScan = Math.min(data.length - 16, 65536);
-    for (let i = 0; i <= maxIdScan; i++) {
-        if (
-            data[i] === 0x01 &&
-            data[i + 1] === 0x76 &&
-            data[i + 2] === 0x6f &&
-            data[i + 3] === 0x72 &&
-            data[i + 4] === 0x62 &&
-            data[i + 5] === 0x69 &&
-            data[i + 6] === 0x73
-        ) {
-            const view = new DataView(data.buffer, data.byteOffset + i, data.byteLength - i);
-            const channels = data[i + 11] || 2;
-            sampleRate = view.getUint32(12, true);
-            if (sampleRate > 0) {
-                const durationMs = getOggDurationMs(data, sampleRate);
-                return { sampleRate, channels, durationMs };
-            }
-            return { channels };
-        }
-    }
-    return {};
-}
-
-function getOggDurationMs(data: Uint8Array, sampleRate: number): number | undefined {
-    let offset = 0;
-    let lastGranule = -1;
-    while (offset + 27 <= data.length) {
-        if (data[offset] !== 0x4f || data[offset + 1] !== 0x67 || data[offset + 2] !== 0x67 || data[offset + 3] !== 0x53) {
-            offset++;
-            continue;
-        }
-
-        const segments = data[offset + 26];
-        const headerBytes = 27 + segments;
-        if (offset + headerBytes > data.length) break;
-
-        let bodyBytes = 0;
-        for (let i = 0; i < segments; i++) {
-            bodyBytes += data[offset + 27 + i];
-        }
-
-        const view = new DataView(data.buffer, data.byteOffset + offset, data.byteLength - offset);
-        const lo = view.getUint32(6, true);
-        const hi = view.getInt32(10, true);
-        if (hi >= 0) {
-            lastGranule = hi * 0x100000000 + lo;
-        }
-
-        offset += headerBytes + bodyBytes;
-    }
-
-    if (lastGranule <= 0 || sampleRate <= 0) return undefined;
-    return Math.max(1, Math.floor(lastGranule * 1000 / sampleRate));
 }
 
 function detectMpegAudioType(data: Uint8Array): number {

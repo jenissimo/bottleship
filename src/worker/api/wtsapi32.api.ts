@@ -14,6 +14,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -34,7 +35,7 @@ export const wtsapi32Module: ModuleDescriptor = {
         makeFunc("WTSOpenServerA", 1),
         makeFunc("WTSOpenServerW", 1),
         makeFunc("WTSCloseServer", 1),
-        makeFunc("WTSQueryUserToken", 3),
+        makeFunc("WTSQueryUserToken", 2),
         makeFunc("WTSDisconnectSession", 3),
         makeFunc("WTSWaitSystemEvent", 3),
         makeFunc("WTSEnumerateProcessesW", 5),

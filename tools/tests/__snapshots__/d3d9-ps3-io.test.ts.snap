@@ -1,0 +1,23 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`D3D9 PS3 I/O (W6) vPos/vFace/oDepth generate distinct PS input/output builtins 1`] = `
+"@fragment
+fn fs_main(in: PsInput) -> PsOutput {
+    var r0: vec4<f32> = vec4<f32>(0.0);
+    var oC0: vec4<f32> = vec4<f32>(0.0);
+    var oDepth: f32 = 0.0;
+    
+    // add
+    let _st0 = (vec4<f32>((in.pos).xy - vec2<f32>(0.5), (in.pos).zw) + select(vec4<f32>(-1.0), vec4<f32>(1.0), in.frontFacing));
+    r0 = vec4<f32>(_st0[0], _st0[1], _st0[2], _st0[3]);
+    // mov
+    let _st1 = vec4<f32>(r0);
+    oC0 = vec4<f32>(_st1[0], _st1[1], _st1[2], _st1[3]);
+    oDepth = min(max((vec4<f32>(r0)).x, 0.0), 1.0);
+    
+    var out: PsOutput;
+    out.color = oC0;
+    out.depth = oDepth;
+    return out;
+}"
+`;

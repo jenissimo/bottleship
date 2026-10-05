@@ -5,12 +5,24 @@
 
 import { serializeCpu, serializeThreads, proc, symbolize, guestMem } from "./serialize";
 import { faultRecorder } from "../core/memory/fault-recorder";
+import { getWasmGrowthStats, type WasmGrowthStats } from "../core/cpu/cpu-views";
 import { stubRegistry } from "../core/diagnostics/stub-registry";
 import { getProcAddressRegistry } from "../core/diagnostics/get-proc-address-registry";
+import { moduleHandleMissRegistry } from "../core/diagnostics/module-handle-miss-registry";
 import { apiCensus } from "../core/diagnostics/api-census";
 import { getCxxExceptionRing, getSehDispatchTrace } from "../core/seh-dispatch";
 import { getStackGuardViolations } from "../core/memory/stack-write-guard";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
+import { loadDiagnostics } from "../core/diagnostics/load-diagnostics";
+import { getGpuErrorReport, type GpuErrorReport } from "../core/gpu-error-log";
+import { gpuDeviceLifecycle, type GpuDeviceLifecycleReport } from "../core/gpu/gpu-device-lifecycle";
+import { pendingMessageBoxes } from "../runtime/dialog-bridge";
+import { type D3D9PerfSnapshot } from "../modules/d3d9/d3d9-perf";
+import { getD3D9PerfSnapshotWithDevices } from "../modules/d3d9/shared-state";
+import { d3dxConstantTableCensus } from "../modules/d3dx9/constant-table";
+import { collectShaderCensus, censusComplete } from "./shader-census";
+import { EmulatorConfig } from "../core/emulator-config-manager";
+import { activeQualityBackend, computeQualityGaps } from "../backends/webgpu/shared/quality-capabilities";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
 
@@ -26,23 +38,207 @@ export interface SerializedCpuSnapshot {
     fsBase: number;
 }
 
+interface HarnessD3D9Census {
+    /** False when a device's snapshot threw AND when there is no D3D9 device at all — a
+     *  DDraw/D3D8 title must not report a complete shader census. */
+    complete: boolean;
+    /** Live D3D9 devices the census walked; 0 explains an empty census. */
+    deviceCount: number;
+    /** Devices whose snapshot threw or exposed no instrumentation seam. */
+    snapshotFailures: number;
+    source: string;
+    unsupportedOps: string[];
+    unsupportedCount: number;
+    shaderCount: number;
+    pairCount: number;
+    drawsIssued: number;
+    programmableDraws: number;
+    unattributedDraws: number;
+}
+
+type HarnessD3D9Report = D3D9PerfSnapshot & {
+    /** Stable report spelling; `droppedDraws` remains for the existing dbg.d3d9Perf shape. */
+    dropDraws: Record<string, number>;
+    shaderBuildFailures: number;
+    gpuPipelineValidationFailures: number;
+    census: HarnessD3D9Census;
+};
+
+function numberOrZero(value: unknown): number {
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function buildD3D9Report(): HarnessD3D9Report {
+    const perf = getD3D9PerfSnapshotWithDevices();
+    // Same collector the shaderOps verb uses: a device torn down mid-query must not be
+    // swallowed into a census that then calls itself complete.
+    const collection = collectShaderCensus(false);
+    const snapshots = collection.snapshots;
+
+    const unsupportedOps = new Set<string>();
+    let shaderBuildFailures = 0;
+    let gpuPipelineValidationFailures = 0;
+    let shaderCount = 0;
+    let pairCount = 0;
+    let drawsIssued = 0;
+    let programmableDraws = 0;
+    let unattributedDraws = 0;
+    let complete = censusComplete(collection);
+    let source = "emitter-dispatch";
+    for (const snapshot of snapshots) {
+        shaderBuildFailures += numberOrZero(snapshot.shaderBuildFailures);
+        gpuPipelineValidationFailures += numberOrZero(snapshot.gpuPipelineValidationFailures);
+        const census = snapshot.census as { complete?: unknown; source?: unknown } | undefined;
+        if (census?.complete === false) complete = false;
+        if (typeof census?.source === "string") source = census.source;
+        const shaders = Array.isArray(snapshot.shaders) ? snapshot.shaders : [];
+        shaderCount += shaders.length;
+        for (const shader of shaders) {
+            const unsupported = (shader as { unsupported?: unknown }).unsupported;
+            if (Array.isArray(unsupported)) {
+                for (const op of unsupported) if (typeof op === "string") unsupportedOps.add(op);
+            }
+        }
+        pairCount += Array.isArray(snapshot.pairs) ? snapshot.pairs.length : 0;
+        drawsIssued += numberOrZero(snapshot.drawsIssued);
+        const attribution = snapshot.attribution as { programmableDraws?: unknown; unattributed?: unknown } | undefined;
+        programmableDraws += numberOrZero(attribution?.programmableDraws);
+        unattributedDraws += numberOrZero(attribution?.unattributed);
+    }
+
+    return {
+        ...perf,
+        dropDraws: { ...perf.droppedDraws },
+        shaderBuildFailures,
+        gpuPipelineValidationFailures,
+        census: {
+            complete,
+            deviceCount: collection.deviceCount,
+            snapshotFailures: collection.snapshotFailures,
+            source,
+            unsupportedOps: [...unsupportedOps].sort(),
+            unsupportedCount: unsupportedOps.size,
+            shaderCount,
+            pairCount,
+            drawsIssued,
+            programmableDraws,
+            unattributedDraws,
+        },
+    };
+}
+
 export interface HarnessReport {
     cpu: SerializedCpuSnapshot | null;
     lastThunk: string | null;
     backtrace: Array<{ i: number; ret: string; sym: string | null; isThunk: boolean }>;
     lastThunks: string[];
     stubs: Array<{ api: string; id: string; count: number; firstCaller: string; firstCallerSym: string | null }>;
+    /**
+     * A non-zero `gpuTotal` is never normal: WebGPU reports validation asynchronously and
+     * never throws for it, so the guest runs on believing it drew — the symptom is missing
+     * geometry or a frozen picture, not an exception. (`total` also counts guarded
+     * non-GPU callback throws.) Carried here because the log ring cannot hold the first one.
+     */
+    gpuErrors: GpuErrorReport;
+    /**
+     * How many times WASM linear memory actually changed identity (grew) this session, and
+     * where the guest was when it did.
+     *
+     * v86 hands the CPU state and guest RAM out as `view()` Proxies that re-resolve on
+     * EVERY access, purely to make this event transparent. That is a per-access tax paid
+     * against a per-session event, and nothing else in the worker reports how often the
+     * event happens — so a decision to cache a view (or not) had no evidence behind it.
+     * `events` is a head, not a ring: the useful question is when growth STOPS.
+     */
+    wasmGrowth: WasmGrowthStats;
+    /**
+     * The GPU device's own lifecycle: `status:"lost"` means every draw since is a no-op and
+     * the picture on screen is stale — a diagnosis no pixel or counter can express, and the
+     * one that separates "the guest stopped drawing" from "the GPU stopped listening".
+     */
+    gpuDevice: GpuDeviceLifecycleReport;
+    /**
+     * Which quality-settings knobs the active graphics backend actually honors right now.
+     * `unsupported` lists non-default QualityConfig keys the backend has NOT declared —
+     * a knob the UI lets you move that provably does nothing on this backend (see
+     * backends/webgpu/shared/quality-capabilities.ts). Empty is the healthy state.
+     */
+    quality: { backend: string | null; unsupported: string[] };
+    /** D3D9 drop-draw and feature census; empty droppedDraws is the healthy state. */
+    d3d9: HarnessD3D9Report;
+    /**
+     * D3DXGetShaderConstantTable outcomes. A title that ships precompiled shaders binds
+     * every uniform through here, so `built: 0` with a non-zero `noTable` says the
+     * shaders carry no reflection data — and `unresolvedHandles` says we published a
+     * table whose names do not match what the game asks for. Both look like bad art.
+     */
+    d3dxConstantTables: ReturnType<typeof d3dxConstantTableCensus>;
+    /**
+     * Message boxes the guest is blocked on. The host draws them as DOM, so no canvas
+     * capture can show one: without this, a guest waiting on an error box is indistinguishable
+     * from a freeze, and the text naming the actual problem is invisible.
+     */
+    pendingModals: Array<{ id: number; text: string; caption: string; uType: number; waitingMs: number }>;
     silentStubs: Array<{ api: string; count: number; arity: number; lastCaller: string; lastCallerSym: string | null }>;
+    /**
+     * COM/DX calls that answered FAILURE. The guest keeps the NULL out-param and derefs it
+     * later in its own code, so the crash site names nothing and this list does.
+     */
+    apiFailures: Array<{ api: string; hr: string; count: number; lastCaller: string; lastCallerSym: string | null }>;
     getProcMisses: Array<{
         module: string; proc: string; count: number;
         firstCaller: string; firstCallerSym: string | null;
         lastCaller: string; lastCallerSym: string | null;
     }>;
+    /**
+     * GetModuleHandle* lookups that answered NULL, by NAME. Usually the last fork before a
+     * guest gives up (a crash handler that cannot find its reporting DLL, an optional
+     * feature that disables itself) — and the only place the argument survives, since the
+     * thunk ring records the call, not the string it was given.
+     */
+    moduleHandleMisses: Array<{
+        name: string; api: string; count: number;
+        firstCaller: string; firstCallerSym: string | null;
+        lastCaller: string; lastCallerSym: string | null;
+    }>;
     recentGetProc: Array<{
-        module: string; proc: string; addr: string | null;
+        module: string; proc: string; addr: string | null; kind: string;
         caller: string; callerSym: string | null;
     }>;
-    faults: Array<{ eip: string; faultAddr: string; lastThunk: string; threadId: number | null }>;
+    /**
+     * GetProcAddress lookups that RESOLVED but to nothing usable — a stub with no
+     * handler, or a handler that ignores its arguments. Deliberately separate from
+     * `getProcMisses`: a NULL makes the guest take its fallback path, whereas one of
+     * these tells the guest it succeeded and then does nothing.
+     */
+    getProcStubbed: Array<{
+        module: string; proc: string; kind: string; count: number;
+        lastCaller: string; lastCallerSym: string | null;
+    }>;
+    /** `eipTrusted:false` ⇒ no instruction at `eip` addresses CR2 (the jit materializes only
+     *  eip's low 12 bits) — read `cr2Candidates`/`badCall` instead of chasing that EIP. */
+    faults: Array<{
+        /** How long ago this fault happened, in ms. The ring is not time-bounded, so an
+         *  entry near the top of the list is not thereby near the crash in time. */
+        ageMs: number;
+        eip: string; eipTrusted?: boolean; faultAddr: string; cr2Candidates?: string[];
+        /** Where the CPU entered the block — the only surviving pointer at the code when
+         *  `eipTrusted` is false. Symbolized, so it names a function rather than a number. */
+        transfer?: unknown;
+        previousEip?: string; previousEipSym?: string | null;
+        badCall?: { callSite: number; slotAddr: number; slotValue: number; operand: string };
+        lastThunk: string; threadId: number | null; outcome?: string;
+        /** Registers AT THE FAULT. The post-mortem dump in a crash report is taken at
+         *  ExitProcess — frames later — so reading a register value from there and calling
+         *  it "the value at the fault" is simply wrong. These are the recorded ones. */
+        regs?: Record<string, string>;
+        /** Guest ESP at the fault and the words above it: the return-address chain that says
+         *  WHICH call site a bad indirect call was actually reached from. */
+        gameEsp?: string;
+        stackDump?: string[];
+        /** WinAPI call ring leading into the fault (newest last). */
+        recentCalls?: string[];
+    }>;
     /** Recent C++ (0xe06d7363) exceptions: decoded type/message + caught/unhandled outcome.
      *  The usual root cause of an MSVC/UE "Runtime Error! terminate" is an `unhandled` entry. */
     cxxExceptions: Array<{ seq: number; threadId: number; type: string; thrown: string; throwModule: string; rethrow: boolean; outcome: string; caughtBy: string }>;
@@ -67,6 +263,13 @@ export interface HarnessReport {
     stackGuardViolations: string[];
     /** Recent SEH catch dispatches (newest last) with descent windows + WILD-EBP notes. */
     sehDispatchTrace: string[];
+    /** The crash that ended the run, INCLUDING one raised before any guest code ran
+     *  (PE link failure) — where every live-state field below is legitimately empty. */
+    crash: { reason: string; eip: string; faultAddr: string; threadId: number | null; lastThunk: string } | null;
+    /** Imports with no known arity. A fatal one aborts the link ("Stub requires
+     *  argCount..."); the rest are latent stack-cleanup corruption. Fix in the
+     *  module's `*.api.ts` (or tools/reference/win32) — see the crash reason. */
+    unknownArgCounts: Array<{ api: string; aliasedFrom: string | null; count: number }>;
 }
 
 function readStackWords(esp: number, count = 4): string[] {
@@ -128,6 +331,16 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             isThunk: f.isThunk,
         })),
         lastThunks: bt?.recent ?? [],
+        gpuErrors: getGpuErrorReport(),
+        wasmGrowth: getWasmGrowthStats(),
+        gpuDevice: gpuDeviceLifecycle.report(),
+        quality: {
+            backend: activeQualityBackend(),
+            unsupported: computeQualityGaps(EmulatorConfig.getInstance().quality),
+        },
+        d3d9: buildD3D9Report(),
+        d3dxConstantTables: d3dxConstantTableCensus(),
+        pendingModals: pendingMessageBoxes(),
         stubs: stubRegistry.list().map((s) => ({
             api: s.key,
             id: hx(s.functionId),
@@ -142,9 +355,25 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             lastCaller: hx(s.lastCaller),
             lastCallerSym: symbolize(s.lastCaller),
         })),
+        apiFailures: apiCensus.failureList().map((f) => ({
+            api: f.name,
+            hr: hx(f.hr),
+            count: f.count,
+            lastCaller: hx(f.lastCaller),
+            lastCallerSym: symbolize(f.lastCaller),
+        })),
         getProcMisses: getProcAddressRegistry.misses().map((h) => ({
             module: hx(h.hModule),
             proc: h.procName,
+            count: h.count,
+            firstCaller: hx(h.firstCaller),
+            firstCallerSym: symbolize(h.firstCaller),
+            lastCaller: hx(h.lastCaller),
+            lastCallerSym: symbolize(h.lastCaller),
+        })),
+        moduleHandleMisses: moduleHandleMissRegistry.list().map((h) => ({
+            name: h.name,
+            api: h.api,
             count: h.count,
             firstCaller: hx(h.firstCaller),
             firstCallerSym: symbolize(h.firstCaller),
@@ -155,14 +384,43 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             module: hx(h.hModule),
             proc: h.procName,
             addr: h.address !== 0 ? hx(h.address) : null,
+            kind: h.kind,
             caller: hx(h.caller),
             callerSym: symbolize(h.caller),
         })),
+        getProcStubbed: getProcAddressRegistry.unsatisfied()
+            .filter((h) => h.kind !== 'null')
+            .slice(0, 12)
+            .map((h) => ({
+                module: h.dll ?? hx(h.hModule),
+                proc: h.procName,
+                kind: h.kind,
+                count: h.count,
+                lastCaller: hx(h.lastCaller),
+                lastCallerSym: symbolize(h.lastCaller),
+            })),
         faults: faultRecorder.recent(8).map((f) => ({
+            // WHEN, not just what. "recent" is a ring of the last few faults with no
+            // relation to now: without an age, a fault from the loading screen sits next
+            // to a crash an hour later and reads as its cause.
+            ageMs: Math.max(0, Math.round(performance.now() - f.ts)),
             eip: hx(f.eip),
+            eipTrusted: f.eipTrusted,
+            transfer: f.transfer,
+            previousEip: f.previousEip === undefined ? undefined : "0x" + (f.previousEip >>> 0).toString(16),
+            previousEipSym: f.previousEip === undefined ? undefined : symbolize(f.previousEip >>> 0),
             faultAddr: hx(f.faultAddr),
+            cr2Candidates: f.cr2Candidates,
+            badCall: f.badCall,
             lastThunk: f.lastThunk,
             threadId: f.threadId,
+            outcome: f.outcome,
+            regs: f.regs
+                ? Object.fromEntries(Object.entries(f.regs).map(([k, v]) => [k, hx((v ?? 0) >>> 0)]))
+                : undefined,
+            gameEsp: hx(f.gameEsp >>> 0),
+            stackDump: (f.stackDump ?? []).map((w) => hx(w >>> 0)),
+            recentCalls: (f.recentCalls ?? []).slice(-10),
         })),
         cxxExceptions: getCxxExceptionRing().slice(-12).map((e) => ({
             seq: e.seq,
@@ -183,5 +441,20 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         slab: hypercallDataManager.getSlabStats(),
         stackGuardViolations: getStackGuardViolations(),
         sehDispatchTrace: getSehDispatchTrace(),
+        crash: (() => {
+            const f = loadDiagnostics.lastFailure();
+            return f && {
+                reason: f.reason,
+                eip: hx(f.eip),
+                faultAddr: hx(f.faultAddr),
+                threadId: f.threadId,
+                lastThunk: f.lastThunk,
+            };
+        })(),
+        unknownArgCounts: loadDiagnostics.list().map((u) => ({
+            api: u.key,
+            aliasedFrom: u.aliasedFrom,
+            count: u.count,
+        })),
     };
 }

@@ -1,8 +1,8 @@
 /**
  * Shared types for D3D module
  */
-import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
-import { DDrawContext } from "../context";
+import type { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
+import type { DDrawContext } from "../context";
 import type { DirectDrawSurfaceObject, DirectDrawSurfaceState } from "../com-objects";
 
 export type D3DExports = Record<string, ThunkImplementation>;
@@ -61,12 +61,19 @@ export interface D3DLight7Data {
 }
 
 /**
- * Create default material (white diffuse, no specular, no emissive)
+ * Create default material — all-zero. Real D3D has no non-zero material default: the device's
+ * material struct is zero-initialized (wined3d's `state` is calloc'd and `state_init_default`
+ * never touches `state->material`; the D3D9 path here independently gets this right because
+ * `materialData` is a zero-filled Uint8Array only ever written by SetMaterial). A white default
+ * would be pixel-visible only once a title turns D3DRENDERSTATE_LIGHTING on without having
+ * called SetMaterial yet — the D3D8/D3D7 paths default LIGHTING to FALSE (see that seed's own
+ * comment), so this mainly fixes what GetMaterial/state-block capture report before the app's
+ * first SetMaterial.
  */
 export function createDefaultMaterial(): D3DMaterial7Data {
     return {
-        diffuse: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-        ambient: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+        diffuse: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
+        ambient: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         specular: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         emissive: { r: 0.0, g: 0.0, b: 0.0, a: 0.0 },
         power: 0.0,
@@ -196,6 +203,14 @@ import {
     D3DRENDERSTATE_FOGDENSITY,
     D3DRENDERSTATE_SPECULARENABLE,
     D3DRENDERSTATE_COLORKEYENABLE,
+    D3DRENDERSTATE_STENCILENABLE,
+    D3DRENDERSTATE_STENCILFAIL,
+    D3DRENDERSTATE_STENCILZFAIL,
+    D3DRENDERSTATE_STENCILPASS,
+    D3DRENDERSTATE_STENCILFUNC,
+    D3DRENDERSTATE_STENCILREF,
+    D3DSTENCILOP_KEEP,
+    D3DRENDERSTATE_POINTSCALE_A,
     D3DRENDERSTATE_LIGHTING,
     D3DRENDERSTATE_AMBIENT,
     D3DRENDERSTATE_TEXTUREFACTOR,
@@ -231,6 +246,8 @@ import {
     D3DTOP_MODULATE,
     D3DTA_TEXTURE,
     D3DTA_CURRENT,
+    D3DTSS_COLORARG0,
+    D3DTSS_ALPHAARG0,
     D3DTADDRESS_WRAP,
     D3DTFN_POINT,
     D3DTFG_POINT,
@@ -319,6 +336,44 @@ function createDefaultRenderStates(): Int32Array {
     rs[D3DRENDERSTATE_SPECULARMATERIALSOURCE] = 2; // D3DMCS_COLOR2
     rs[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE] = 0; // D3DMCS_MATERIAL
 
+    // --- States above the D3D7 enum that the shared FFP pipeline still reads ---
+    // The D3D7 render-state enum stops at 152, but the pipeline factory is shared with D3D8
+    // and consults COLORWRITEENABLE and BLENDOP. Both have a falsy-zero trap: 0 is a LEGAL
+    // COLORWRITEENABLE meaning "write no channel at all", so an unseeded slot reads as a
+    // legitimate instruction to blacken every title that never touches the state, and 0 is
+    // not a valid D3DBLENDOP at all. Seed the API defaults, as d3d9-state-tracker does.
+    const D3DRS_COLORWRITEENABLE = 168, D3DRS_BLENDOP = 171;
+    const ALL_CHANNELS = 0xf, D3DBLENDOP_ADD = 1;
+    rs[D3DRS_COLORWRITEENABLE] = ALL_CHANNELS;
+    rs[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
+
+    // The stencil masks are the same trap one enum lower: 0 is a legal mask meaning "no
+    // bits", so a title that enables stencil without setting them would test against nothing
+    // and write nothing. The pipeline's `?? 0xff` cannot rescue it — an Int32Array element is
+    // never undefined, so the fallback is dead code and the seed is the only defence. All
+    // bits of the stencil8 attachment we actually allocate is 0xff.
+    const D3DRS_STENCILMASK = 58, D3DRS_STENCILWRITEMASK = 59, ALL_STENCIL_BITS = 0xff;
+    rs[D3DRS_STENCILMASK] = ALL_STENCIL_BITS;
+    rs[D3DRS_STENCILWRITEMASK] = ALL_STENCIL_BITS;
+
+    // ...and the same trap once more for the stencil OPS and the compare, where 0 is not even a
+    // legal D3DSTENCILOP/D3DCMP — both enumerations start at 1. A title that enables stencil
+    // without setting them reads back nonsense from GetRenderState and captures nonsense into a
+    // state block; the draw path's own fallbacks keep pixels correct today, so this only fixes
+    // what the game can OBSERVE. Defaults per wined3d stateblock.c (KEEP/KEEP/KEEP/ALWAYS/0).
+    rs[D3DRENDERSTATE_STENCILENABLE] = 0;
+    rs[D3DRENDERSTATE_STENCILFAIL] = D3DSTENCILOP_KEEP;
+    rs[D3DRENDERSTATE_STENCILZFAIL] = D3DSTENCILOP_KEEP;
+    rs[D3DRENDERSTATE_STENCILPASS] = D3DSTENCILOP_KEEP;
+    rs[D3DRENDERSTATE_STENCILFUNC] = D3DCMP_ALWAYS;
+    rs[D3DRENDERSTATE_STENCILREF] = 0;
+
+    // D3DRENDERSTATE_POINTSCALE_A defaults to 1.0f (B/C default to 0.0f, which an unseeded
+    // slot already gives correctly). Left at 0.0f, the shared attenuation formula
+    // size/sqrt(A+B·De+C·De²) divides by zero the moment a title enables
+    // POINTSCALEENABLE without setting all three constants.
+    rs[D3DRENDERSTATE_POINTSCALE_A] = 0x3F800000; // 1.0f
+
     return rs;
 }
 
@@ -364,6 +419,15 @@ function createDefaultTexStates(): Int32Array {
     // NOTE: D3DTFP_NONE = 1 (not 0), so this is valid
     for (let stage = 0; stage < 8; stage++) {
         const offset = stage * 32;
+
+        // The resolver preserves zero (D3DTA_DIFFUSE), so seed argument defaults here,
+        // including disabled stages that a later COLOROP write may enable.
+        states[offset + D3DTSS_COLORARG0] = D3DTA_CURRENT;
+        states[offset + D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
+        states[offset + D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+        states[offset + D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+        states[offset + D3DTSS_COLORARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
+        states[offset + D3DTSS_ALPHAARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
 
         // Address modes (WRAP is default, value = 1)
         states[offset + D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP; // 1

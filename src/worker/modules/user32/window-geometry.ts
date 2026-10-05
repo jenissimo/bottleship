@@ -8,9 +8,14 @@ import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
-import { WindowInfo, windows, getAbsoluteWindowPosition } from './shared-state';
+import { isValidAddress } from '../../core/memory/address-guard';
+import { WindowInfo, windows, getAbsoluteWindowPosition, getVirtualScreenRect } from './shared-state';
+import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 import { invalidateWindow } from './paint-region';
-import { repaintDialogOverlayIfVisible } from './dialog';
+import { repaintDialogOverlayIfVisible } from './dialog-paint';
+import { applyComboBoxClosedHeight } from './controls';
+import { USER_DEFAULT_SCREEN_DPI } from './monitor';
+import { systemMetricForDpi, SM_CXFRAME_INDEX, SM_CYCAPTION_INDEX, SM_CYMENU_INDEX } from './dpi-metrics';
 
 /** Callbacks back into window.ts (avoids an import cycle). */
 export interface WindowGeometryHost {
@@ -20,6 +25,13 @@ export interface WindowGeometryHost {
         moved: boolean,
         resized: boolean,
     ): void;
+    applyWindowPlacement(
+        ctx: any,
+        mem: Uint8Array,
+        hWnd: number,
+        showCmd: number,
+        normalRect: { left: number; top: number; right: number; bottom: number } | null,
+    ): any;
 }
 
 const WM_PAINT = 0x000F;
@@ -62,7 +74,55 @@ function writeRect(address: number, left: number, top: number, right: number, bo
     );
 }
 
-function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, bMenu: number, dwExStyle: number): number {
+/**
+ * Hoisted guest view, rebuilt only when the backing buffer identity changes.
+ *
+ * The rect queries below are per-frame calls (a game re-reads its window/client
+ * rect every frame), so both a `new DataView` per call and the byte-at-a-time
+ * `Mem.write*` path are the wrong shape: guest memory is v86's Proxy, where a
+ * per-byte store is an order of magnitude more expensive than a view write.
+ * §3.1's sanctioned form applies — validate the WHOLE extent once at the
+ * boundary (isValidAddress), then do the work through a hoisted view.
+ */
+let cachedGuestView: DataView | null = null;
+let cachedGuestBuffer: ArrayBufferLike | null = null;
+let cachedGuestOffset = -1;
+let cachedGuestLength = -1;
+
+function guestView(mem: Uint8Array): DataView {
+    if (
+        cachedGuestView === null ||
+        cachedGuestBuffer !== mem.buffer ||
+        cachedGuestOffset !== mem.byteOffset ||
+        cachedGuestLength !== mem.byteLength
+    ) {
+        cachedGuestView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        cachedGuestBuffer = mem.buffer;
+        cachedGuestOffset = mem.byteOffset;
+        cachedGuestLength = mem.byteLength;
+    }
+    return cachedGuestView;
+}
+
+/** Validate a guest RECT out-param and write it through the hoisted view. */
+function writeRectChecked(
+    mem: Uint8Array,
+    address: number,
+    left: number, top: number, right: number, bottom: number,
+): boolean {
+    if (!isValidAddress(mem, address, 16, 'rw')) return false;
+    const view = guestView(mem);
+    view.setInt32(address, left, true);
+    view.setInt32(address + 4, top, true);
+    view.setInt32(address + 8, right, true);
+    view.setInt32(address + 12, bottom, true);
+    return true;
+}
+
+export function adjustWindowRectCore(
+    mem: Uint8Array, lpRect: number, dwStyle: number, bMenu: number, dwExStyle: number,
+    dpi: number = USER_DEFAULT_SCREEN_DPI,
+): number {
     if (!lpRect || lpRect + 16 > mem.length) return 0;
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -87,9 +147,14 @@ function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, 
         return 1;
     }
 
-    const borderWidth = (dwStyle & WS_THICKFRAME) ? 4 : ((dwStyle & WS_BORDER) ? 1 : 0);
-    const captionHeight = (dwStyle & WS_CAPTION) ? 23 : 0;
-    const menuHeight = bMenu ? 19 : 0;
+    // Only the SPI-derived parts (sizing frame, caption, menu bar) follow the DPI; the
+    // 1px border and the 3D edges do not (win32u adjust_window_rect). At 96 DPI the
+    // deltas are zero and this is AdjustWindowRectEx exactly.
+    const at = (index: number): number =>
+        (systemMetricForDpi(index, dpi) ?? 0) - (systemMetricForDpi(index, USER_DEFAULT_SCREEN_DPI) ?? 0);
+    const borderWidth = (dwStyle & WS_THICKFRAME) ? 4 + at(SM_CXFRAME_INDEX) : ((dwStyle & WS_BORDER) ? 1 : 0);
+    const captionHeight = (dwStyle & WS_CAPTION) ? 23 + at(SM_CYCAPTION_INDEX) : 0;
+    const menuHeight = bMenu ? 19 + at(SM_CYMENU_INDEX) : 0;
     const exBorder =
         ((dwExStyle & WS_EX_CLIENTEDGE) ? 2 : 0) +
         ((dwExStyle & WS_EX_WINDOWEDGE) ? 1 : 0) +
@@ -107,7 +172,7 @@ function adjustWindowRectCore(mem: Uint8Array, lpRect: number, dwStyle: number, 
     return 1;
 }
 
-function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMenu: boolean): {
+export function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMenu: boolean): {
     padTop: number;
     padSide: number;
     padBottom: number;
@@ -148,6 +213,30 @@ function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMenu: bool
         padBottom,
         borderX: padSide,
         borderY: borderWidth + exBorder,
+    };
+}
+
+/**
+ * The client size inside a window of the given OUTER size — the exact inverse of what
+ * AdjustWindowRect adds, computed from the same frame metrics so the two cannot drift.
+ *
+ * CreateWindowEx is handed the outer size while WindowInfo.width/height is the client size
+ * (GetWindowInfo adds the frame back; SetWindowPos converts outer→client on every move), so
+ * this is the conversion that boundary owes. An app that does the correct thing — expand an
+ * exact client rect with AdjustWindowRect, create the window, then size its backbuffer and
+ * projection aspect from GetClientRect — must get back the client area it asked for.
+ */
+export function clientSizeFromWindowSize(
+    dwStyle: number,
+    dwExStyle: number,
+    hasMenu: boolean,
+    width: number,
+    height: number,
+): { width: number; height: number } {
+    const frame = getWindowFrameMetrics(dwStyle >>> 0, dwExStyle >>> 0, hasMenu);
+    return {
+        width: Math.max(1, width - frame.padSide * 2),
+        height: Math.max(1, height - frame.padTop - frame.padBottom),
     };
 }
 
@@ -256,6 +345,10 @@ export function registerWindowGeometryExports(
         }
         window.width = clientW;
         window.height = clientH;
+        // The combobox class proc answers a size change by shrinking back to its closed
+        // height, so a MoveWindow that budgets room for the dropped list must not leave
+        // a full-height sunken box behind (see applyComboBoxClosedHeight).
+        applyComboBoxClosedHeight(window);
 
         const wmWin = System.getInstance().windowManager.getWindow(hWnd);
         if (wmWin) {
@@ -278,22 +371,31 @@ export function registerWindowGeometryExports(
         }
     }
 
+    /**
+     * The desktop window is a real window on Windows and is how a great many programs read
+     * the screen size (GetDesktopWindow → GetWindowRect). It has no entry in `windows`, so
+     * without this both rect calls returned FALSE and left the caller's RECT untouched —
+     * i.e. stack garbage read as a resolution ("Cannot find 6016347x4x32 video mode").
+     * Both rects are the virtual screen: the desktop's client area has no non-client frame.
+     */
+    function writeDesktopRect(mem: Uint8Array, lpRect: number, screenCoords: boolean): number {
+        const screen = getVirtualScreenRect();
+        const ok = screenCoords
+            ? writeRectChecked(mem, lpRect, screen.left, screen.top, screen.right, screen.bottom)
+            : writeRectChecked(mem, lpRect, 0, 0, screen.right - screen.left, screen.bottom - screen.top);
+        return ok ? 1 : 0;
+    }
+
     exports['GetClientRect'] = (ctx, mem, args) => {
         const hWnd = args[0];
         const lpRect = args[1];
 
-        Logger.verbose(LogCategory.USER32, `GetClientRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)})`);
-
         if (lpRect) {
+            if (hWnd === DESKTOP_HWND) return writeDesktopRect(mem, lpRect, false);
             const window = windows.get(hWnd);
-            if (window) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setInt32(lpRect, 0, true);      // left
-                view.setInt32(lpRect + 4, 0, true);  // top
-                view.setInt32(lpRect + 8, window.width, true);  // right
-                view.setInt32(lpRect + 12, window.height, true); // bottom
-                Logger.verbose(LogCategory.USER32, `GetClientRect(0x${hWnd.toString(16)}) -> (0, 0, ${window.width}, ${window.height})`);
-
+            if (window && writeRectChecked(mem, lpRect, 0, 0, window.width, window.height)) {
+                Logger.verboseLazy(LogCategory.USER32, () =>
+                    `GetClientRect(0x${hWnd.toString(16)}) -> (0, 0, ${window.width}, ${window.height})`);
                 return 1; // TRUE
             }
         }
@@ -305,10 +407,8 @@ export function registerWindowGeometryExports(
         const hWnd = args[0];
         const lpRect = args[1];
 
-        Logger.verbose(LogCategory.USER32, `GetWindowRect(0x${hWnd.toString(16)}, 0x${lpRect.toString(16)})`);
-
         if (lpRect) {
-
+            if (hWnd === DESKTOP_HWND) return writeDesktopRect(mem, lpRect, true);
             const window = windows.get(hWnd);
             if (window) {
                 // GetWindowRect returns SCREEN coordinates (Win32 contract). For a child
@@ -317,13 +417,13 @@ export function registerWindowGeometryExports(
                 // common GetWindowRect → ScreenToClient → MoveWindow re-centering idiom
                 // subtract the parent offset twice, shifting child controls off-position.
                 const { x: absX, y: absY } = getAbsoluteWindowPosition(window);
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setInt32(lpRect, absX, true);                    // left
-                view.setInt32(lpRect + 4, absY, true);                // top
-                view.setInt32(lpRect + 8, absX + window.width, true);  // right
-                view.setInt32(lpRect + 12, absY + window.height, true); // bottom
-
-                return 1; // TRUE
+                if (writeRectChecked(mem, lpRect,
+                    absX, absY, absX + window.width, absY + window.height)) {
+                    Logger.verboseLazy(LogCategory.USER32, () =>
+                        `GetWindowRect(0x${hWnd.toString(16)}) -> ` +
+                        `(${absX}, ${absY}, ${absX + window.width}, ${absY + window.height})`);
+                    return 1; // TRUE
+                }
             }
         }
 
@@ -499,26 +599,20 @@ export function registerWindowGeometryExports(
             normalBottom,
         });
 
-        exports['ShowWindow'](ctx, mem, [hWnd, showCmd]);
-
         const applyNormalPosition =
             showCmd === SW_SHOWNORMAL ||
             showCmd === SW_RESTORE ||
             showCmd === SW_SHOW;
 
-        if (applyNormalPosition) {
-            applyOuterRectScreenToWindow(
-                hWnd,
-                window,
-                normalLeft,
-                normalTop,
-                normalRight,
-                normalBottom,
-                true,
-            );
-        }
-
-        return 1;
+        return host.applyWindowPlacement(
+            ctx,
+            mem,
+            hWnd,
+            showCmd,
+            applyNormalPosition
+                ? { left: normalLeft, top: normalTop, right: normalRight, bottom: normalBottom }
+                : null,
+        );
     };
 
     exports['ClientToScreen'] = (ctx, mem, args) => {
@@ -541,14 +635,20 @@ export function registerWindowGeometryExports(
             return 0;
         }
 
+        // Wine get_windows_offset: the client→screen offset accumulates EVERY ancestor's
+        // client origin, not just the window's own (parent-relative) x/y. Using the raw
+        // x/y drops the offset of every grandparent, so a nested control's own x/y of
+        // (0,0) mapped "to screen" stays (0,0) — and the standard
+        // ClientToScreen/ScreenToClient → SetWindowPos re-positioning idiom then places
+        // the window off by the grandparent chain's origin. GetWindowRect and
+        // MapWindowPoints already walk the chain; these two must agree with them.
+        const origin = getAbsoluteWindowPosition(window);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const cx = inX;
-        const cy = inY;
-        const ox = window.x + cx;
-        const oy = window.y + cy;
+        const ox = origin.x + inX;
+        const oy = origin.y + inY;
         view.setInt32(lpPoint, ox, true);
         view.setInt32(lpPoint + 4, oy, true);
-        Logger.verbose(LogCategory.USER32, `ClientToScreen(0x${hWnd.toString(16)}) (${cx},${cy}) + win(${window.x},${window.y}) -> (${ox},${oy})`);
+        Logger.verbose(LogCategory.USER32, `ClientToScreen(0x${hWnd.toString(16)}) (${inX},${inY}) + origin(${origin.x},${origin.y}) -> (${ox},${oy})`);
         return 1;
     };
 
@@ -566,12 +666,14 @@ export function registerWindowGeometryExports(
         if (!win) {
             return 0;
         }
-        const ox = sx - win.x;
-        const oy = sy - win.y;
+        // Same full-ancestor-chain origin as ClientToScreen (Wine get_windows_offset).
+        const origin = getAbsoluteWindowPosition(win);
+        const ox = sx - origin.x;
+        const oy = sy - origin.y;
         view.setInt32(lpPoint, ox, true);
         view.setInt32(lpPoint + 4, oy, true);
         Logger.verbose(LogCategory.USER32,
-            `ScreenToClient(0x${hWnd.toString(16)}) (${sx},${sy}) - win(${win.x},${win.y}) -> (${ox},${oy})`);
+            `ScreenToClient(0x${hWnd.toString(16)}) (${sx},${sy}) - origin(${origin.x},${origin.y}) -> (${ox},${oy})`);
         return 1;
     };
 

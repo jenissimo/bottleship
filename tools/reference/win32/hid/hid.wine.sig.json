@@ -1,0 +1,159 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.895Z",
+  "module": "hid",
+  "functions": [
+    {
+      "name": "HidD_FlushQueue",
+      "argCount": 1
+    },
+    {
+      "name": "HidD_FreePreparsedData",
+      "argCount": 1
+    },
+    {
+      "name": "HidD_GetAttributes",
+      "argCount": 2
+    },
+    {
+      "name": "HidD_GetFeature",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_GetHidGuid",
+      "argCount": 1
+    },
+    {
+      "name": "HidD_GetIndexedString",
+      "argCount": 4
+    },
+    {
+      "name": "HidD_GetInputReport",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_GetManufacturerString",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_GetNumInputBuffers",
+      "argCount": 2
+    },
+    {
+      "name": "HidD_GetPhysicalDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_GetPreparsedData",
+      "argCount": 2
+    },
+    {
+      "name": "HidD_GetProductString",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_GetSerialNumberString",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_SetFeature",
+      "argCount": 3
+    },
+    {
+      "name": "HidD_SetNumInputBuffers",
+      "argCount": 2
+    },
+    {
+      "name": "HidD_SetOutputReport",
+      "argCount": 3
+    },
+    {
+      "name": "HidP_GetButtonCaps",
+      "argCount": 4
+    },
+    {
+      "name": "HidP_GetCaps",
+      "argCount": 2
+    },
+    {
+      "name": "HidP_GetData",
+      "argCount": 6
+    },
+    {
+      "name": "HidP_GetLinkCollectionNodes",
+      "argCount": 3
+    },
+    {
+      "name": "HidP_GetScaledUsageValue",
+      "argCount": 8
+    },
+    {
+      "name": "HidP_GetSpecificButtonCaps",
+      "argCount": 7
+    },
+    {
+      "name": "HidP_GetSpecificValueCaps",
+      "argCount": 7
+    },
+    {
+      "name": "HidP_GetUsages",
+      "argCount": 8
+    },
+    {
+      "name": "HidP_GetUsagesEx",
+      "argCount": 7
+    },
+    {
+      "name": "HidP_GetUsageValue",
+      "argCount": 8
+    },
+    {
+      "name": "HidP_GetUsageValueArray",
+      "argCount": 9
+    },
+    {
+      "name": "HidP_GetValueCaps",
+      "argCount": 4
+    },
+    {
+      "name": "HidP_InitializeReportForID",
+      "argCount": 5
+    },
+    {
+      "name": "HidP_MaxDataListLength",
+      "argCount": 2
+    },
+    {
+      "name": "HidP_MaxUsageListLength",
+      "argCount": 3
+    },
+    {
+      "name": "HidP_SetData",
+      "argCount": 6
+    },
+    {
+      "name": "HidP_SetScaledUsageValue",
+      "argCount": 8
+    },
+    {
+      "name": "HidP_SetUsages",
+      "argCount": 8
+    },
+    {
+      "name": "HidP_SetUsageValue",
+      "argCount": 8
+    },
+    {
+      "name": "HidP_SetUsageValueArray",
+      "argCount": 9
+    },
+    {
+      "name": "HidP_TranslateUsagesToI8042ScanCodes",
+      "argCount": 6
+    },
+    {
+      "name": "HidP_UnsetUsages",
+      "argCount": 8
+    }
+  ]
+}

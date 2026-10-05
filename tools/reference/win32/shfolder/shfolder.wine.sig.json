@@ -1,0 +1,15 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.940Z",
+  "module": "shfolder",
+  "functions": [
+    {
+      "name": "SHGetFolderPathA",
+      "argCount": 5
+    },
+    {
+      "name": "SHGetFolderPathW",
+      "argCount": 5
+    }
+  ]
+}

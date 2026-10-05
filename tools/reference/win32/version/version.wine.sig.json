@@ -1,0 +1,71 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.950Z",
+  "module": "version",
+  "functions": [
+    {
+      "name": "GetFileVersionInfoA",
+      "argCount": 4
+    },
+    {
+      "name": "GetFileVersionInfoExA",
+      "argCount": 5
+    },
+    {
+      "name": "GetFileVersionInfoExW",
+      "argCount": 5
+    },
+    {
+      "name": "GetFileVersionInfoSizeA",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileVersionInfoSizeExA",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileVersionInfoSizeExW",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileVersionInfoSizeW",
+      "argCount": 2
+    },
+    {
+      "name": "GetFileVersionInfoW",
+      "argCount": 4
+    },
+    {
+      "name": "VerFindFileA",
+      "argCount": 8
+    },
+    {
+      "name": "VerFindFileW",
+      "argCount": 8
+    },
+    {
+      "name": "VerInstallFileA",
+      "argCount": 8
+    },
+    {
+      "name": "VerInstallFileW",
+      "argCount": 8
+    },
+    {
+      "name": "VerLanguageNameA",
+      "argCount": 3
+    },
+    {
+      "name": "VerLanguageNameW",
+      "argCount": 3
+    },
+    {
+      "name": "VerQueryValueA",
+      "argCount": 4
+    },
+    {
+      "name": "VerQueryValueW",
+      "argCount": 4
+    }
+  ]
+}

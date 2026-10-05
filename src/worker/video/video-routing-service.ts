@@ -1,9 +1,13 @@
 import { Logger, LogCategory } from "../core/logger";
 import { RenderService } from "../runtime/runtime-services";
+import { getVirtualScreenRect } from "../modules/user32/shared-state";
 import { VideoOverlayService } from "./video-overlay-service";
 import {
     VideoCodec,
+    VideoDestRect,
     VideoFrameViews,
+    VideoPlanePlan,
+    VideoPlaneReason,
     VideoRoutingEvent,
     VideoSessionState,
     VideoSinkAdapter,
@@ -14,6 +18,20 @@ import {
 const ROUTER_EVENT_CAPACITY = 256;
 const WARN_THROTTLE_FRAMES = 60;
 const FALLBACK_AFTER_CONSECUTIVE_MISSES = 3;
+/** Guest presents the plane may cover before it says so out loud. Roughly two seconds. */
+const PLANE_COVER_WARN_AT = 120;
+/**
+ * Draws a guest needs to put a MOVIE on screen: one full-screen quad, plus room for
+ * letterbox bars and a subtitle/logo quad over it. Above this the guest is rendering a scene
+ * of its own — a menu, a HUD — and the plane is a compensation layer for pixels that are not
+ * missing. The plane covers the whole frame, so being wrong in that direction hides the UI;
+ * being wrong the other way only shows the guest exactly what the guest drew.
+ *
+ * NOT a universal rule: only the D3D9 presenter reports a draw count, so on DDraw, Glide and
+ * D3D8 this threshold is never reached and the null-is-unknown fallback (the plane stays)
+ * IS the whole policy there.
+ */
+const VIDEO_BLIT_MAX_DRAWS = 4;
 
 export interface VideoSessionOpenOptions {
     codec: VideoCodec;
@@ -29,6 +47,14 @@ export interface VideoFrameDecodedOptions {
     guestHandle: number;
     frame: VideoFrameViews;
     hasAppManagedSink: boolean;
+    /**
+     * This player delivers its own frames (MCI and the Animate control draw into the window
+     * plane; avifil32 hands the DIB to the guest, which blits it). The plane is not a
+     * candidate for them, and the fallback chain must never run — but the session still
+     * belongs in the router, which is the only place that answers "where did the frames go".
+     * Without this the sink would resolve to DROP, which says the opposite of the truth.
+     */
+    playerOwnsPresentation?: boolean;
     targetHint?: Partial<VideoTargetHint> | null;
     legacyPrimarySink?: (() => boolean) | null;
     explicitDdrawSink?: (() => boolean) | null;
@@ -52,11 +78,102 @@ export class VideoRoutingService {
     private readonly events: VideoRoutingEvent[] = [];
     private readonly warnFrameByKey = new Map<string, number>();
     private nextEventId = 1;
+    private planeCoveredGuestPresents = 0;
+    private planeLastGuestSerial = -1;
 
     constructor(private readonly render: RenderService) {}
 
     getOverlayService(): VideoOverlayService {
         return this.overlay;
+    }
+
+    /**
+     * Why the plane is (not) on screen, without acting on it. Structural, not timed: a
+     * wall-clock window would blank a paused movie or one whose decode stalled, and the
+     * plane's own content flag cannot tell playing from finished on its own.
+     */
+    private evaluatePlane(): VideoPlaneReason {
+        if (!this.overlay.getCanvas()) return "no_canvas";
+        if (!this.overlay.hasContent()) return "no_content";
+        const owner = this.overlay.getOwnerSessionKey();
+        if (!owner) return "no_content";
+        const session = this.sessions.get(owner);
+        if (!session) return "owner_closed";
+        if (!session.sinkLockedToOverlay && session.sink !== "VIDEO_OVERLAY") return "owner_not_routed";
+        const composedFor = this.overlay.getSubmitPresenterKind();
+        const now = this.render.getLastPresenterKind();
+        // "video" is OUR own composite of this very plane, so it is never a change of screen.
+        if (composedFor && now && now !== "video" && now !== composedFor) return "presenter_changed";
+        if (this.appRendersItsOwnScene()) return "app_scene_observed";
+        return "live";
+    }
+
+    /**
+     * The single answer every present path composites from — see video-plane-policy.ts.
+     * Also the plane's lifetime: a reason that is not "live" and not merely "nothing here yet"
+     * means the pixels have outlived their owner, and they are dropped HERE rather than left
+     * to read as content for the next caller.
+     *
+     * That clear is what makes the REASON a one-shot: `onScreen` is stable across repeated
+     * calls in a frame, while a second call after a clearing reason reports `no_content`,
+     * the plane having no owner any more.
+     */
+    resolvePlanePlan(): VideoPlanePlan {
+        const reason = this.evaluatePlane();
+        const owner = this.overlay.getOwnerSessionKey();
+        if (reason === "owner_closed" || reason === "owner_not_routed" || reason === "presenter_changed") {
+            this.overlay.clear(reason);
+            return { onScreen: false, reason, canvas: null, ownerSessionKey: null };
+        }
+        if (reason !== "live") {
+            return { onScreen: false, reason, canvas: null, ownerSessionKey: owner };
+        }
+        this.notePlaneOnScreen(owner);
+        return { onScreen: true, reason, canvas: this.overlay.getCanvas(), ownerSessionKey: owner };
+    }
+
+    /**
+     * Is the guest drawing a scene of its own into the frame this plane would cover? Read
+     * every time the plane is asked for, not once at routing time: a movie whose session
+     * outlives the screen it played on (a menu loop the game keeps decoding) is exactly the
+     * case a decision taken once cannot revisit.
+     */
+    private appRendersItsOwnScene(): boolean {
+        const draws = this.render.getLastPresentDrawCount();
+        return draws !== null && draws > VIDEO_BLIT_MAX_DRAWS;
+    }
+
+    isPlaneDirty(): boolean {
+        return this.overlay.isDirty();
+    }
+
+    dropPlaneDirty(): void {
+        this.overlay.consumeDirty();
+    }
+
+    notePlaneComposited(): void {
+        this.overlay.noteComposited();
+        this.overlay.consumeDirty();
+    }
+
+    /**
+     * A plane on screen while the guest keeps presenting its OWN frames is the shape that
+     * hides a menu behind a finished movie. It is legitimate for the app whose upload path we
+     * cannot follow (the movie would otherwise vanish), so it is a census with one warning at
+     * a threshold, not a per-frame complaint — but it must never be silent again.
+     */
+    private notePlaneOnScreen(owner: string | null): void {
+        const serial = this.render.getGuestPresentSerial();
+        if (serial === this.planeLastGuestSerial) return;
+        this.planeLastGuestSerial = serial;
+        this.planeCoveredGuestPresents++;
+        if (this.planeCoveredGuestPresents !== PLANE_COVER_WARN_AT) return;
+        const session = owner ? this.sessions.get(owner) : undefined;
+        Logger.warn(LogCategory.SYSTEM,
+            `[VideoRouting] the video plane has covered ${PLANE_COVER_WARN_AT} guest presents `
+            + `(session=${owner ?? "none"} hint=${session?.targetHint.kind ?? "?"}:`
+            + `${session?.targetHint.valid ? "valid" : "invalid"} ${session?.targetHint.note ?? ""}). `
+            + `If the app draws the movie itself, this is covering its UI — state(["video"]).plane.`);
     }
 
     reset(): void {
@@ -70,7 +187,9 @@ export class VideoRoutingService {
         this.events.length = 0;
         this.warnFrameByKey.clear();
         this.nextEventId = 1;
-        this.overlay.clear();
+        this.planeCoveredGuestPresents = 0;
+        this.planeLastGuestSerial = -1;
+        this.overlay.clear("router_reset");
     }
 
     openSession(options: VideoSessionOpenOptions): void {
@@ -87,7 +206,7 @@ export class VideoRoutingService {
             return;
         }
 
-        const initialSerial = this.render.getPresentSerial();
+        const initialSerial = this.render.getGuestPresentSerial();
         const state: VideoSessionState = {
             sessionKey,
             codec: options.codec,
@@ -128,7 +247,7 @@ export class VideoRoutingService {
             this.pushEvent(sessionKey, "fallback_off", "close");
         }
         if (this.overlay.getOwnerSessionKey() === sessionKey) {
-            this.overlay.clear();
+            this.overlay.clear("session_close");
         }
         this.pushEvent(sessionKey, "session_close");
         this.sessions.delete(sessionKey);
@@ -157,6 +276,15 @@ export class VideoRoutingService {
         session.explicitDdrawSink = options.explicitDdrawSink ?? session.explicitDdrawSink;
         session.explicitGlideSink = options.explicitGlideSink ?? session.explicitGlideSink;
         this.applyTargetHint(session, options.targetHint);
+        if (options.playerOwnsPresentation) {
+            // Terminal for this session: no finalize, no miss counting, no fallback. The
+            // reason string is what keeps this distinguishable in the event log from a
+            // present we actually observed.
+            session.consecutiveMisses = 0;
+            session.lastObservedPresentAtMs = now;
+            this.updateSink(session, "APP_PRESENT_OBSERVED", "player_owns_presentation");
+            return session.sink;
+        }
         return session.sink;
     }
 
@@ -177,7 +305,10 @@ export class VideoRoutingService {
             return "DROP";
         }
 
-        const currentSerial = this.render.getPresentSerial();
+        // GUEST presents only. Our own video compositor also calls notifyPresent (the screen
+        // really is being updated), and counting that here would make the app look like it is
+        // presenting the movie itself — unlocking and clearing the overlay we just drew.
+        const currentSerial = this.render.getGuestPresentSerial();
         const appPresented = currentSerial > session.presentSerialAtDecode;
         if (appPresented) {
             session.lastObservedPresentSerial = currentSerial;
@@ -192,13 +323,13 @@ export class VideoRoutingService {
             if (appPresented && this.shouldTrustAppPresent(session)) {
                 session.sinkLockedToOverlay = false;
                 if (this.overlay.getOwnerSessionKey() === session.sessionKey) {
-                    this.overlay.clear();
+                    this.overlay.clear("app_presenting");
                 }
                 this.pushEvent(session.sessionKey, "fallback_off", "app_presenting");
                 // Fall through to normal sink resolution below
             } else {
                 const lockedSink = this.tryOverlaySink(session, "locked");
-                session.presentSerialAtDecode = this.render.getPresentSerial();
+                session.presentSerialAtDecode = this.render.getGuestPresentSerial();
                 return lockedSink;
             }
         }
@@ -210,7 +341,7 @@ export class VideoRoutingService {
         // not bare D3D8 Present while video still lives in a CPU buffer (Morrowind Bink).
         if (appPresented && this.shouldTrustAppPresent(session)) {
             this.updateSink(session, preferredObservedSink, "app_present_observed");
-            session.presentSerialAtDecode = this.render.getPresentSerial();
+            session.presentSerialAtDecode = this.render.getGuestPresentSerial();
             return session.sink;
         }
 
@@ -220,7 +351,7 @@ export class VideoRoutingService {
             const noPresentDeltaMs = performance.now() - session.lastObservedPresentAtMs;
             if (session.consecutiveMisses < FALLBACK_AFTER_CONSECUTIVE_MISSES && noPresentDeltaMs <= noPresentBudgetMs) {
                 this.updateSink(session, preferredObservedSink, `await_present miss=${session.consecutiveMisses}`);
-                session.presentSerialAtDecode = this.render.getPresentSerial();
+                session.presentSerialAtDecode = this.render.getGuestPresentSerial();
                 return session.sink;
             }
         } else {
@@ -239,14 +370,14 @@ export class VideoRoutingService {
                     session.sinkLockedToOverlay = true;
                     this.pushEvent(session.sessionKey, "fallback_on", "video_overlay_lock");
                 }
-                session.presentSerialAtDecode = this.render.getPresentSerial();
+                session.presentSerialAtDecode = this.render.getGuestPresentSerial();
                 return session.sink;
             }
         }
 
         this.warnThrottled(session, "drop", `[VideoRouting] sink=DROP session=${session.sessionKey} presenter=${this.render.getLastPresenterKind() ?? "none"}`);
         this.updateSink(session, "DROP", "no_sink");
-        session.presentSerialAtDecode = this.render.getPresentSerial();
+        session.presentSerialAtDecode = this.render.getGuestPresentSerial();
         return "DROP";
     }
 
@@ -258,6 +389,8 @@ export class VideoRoutingService {
             sessionKey: string;
             codec: VideoCodec;
             guestHandle: number;
+            width: number;
+            height: number;
             sink: VideoSinkKind;
             sinkLockedToOverlay: boolean;
             misses: number;
@@ -268,12 +401,18 @@ export class VideoRoutingService {
         }>;
         ring: VideoRoutingEvent[];
         overlay: ReturnType<VideoOverlayService["getDebugInfo"]>;
+        plane: { onScreen: boolean; reason: VideoPlaneReason; coveredGuestPresents: number };
     } {
-        const presentSerial = this.render.getPresentSerial();
+        const presentSerial = this.render.getGuestPresentSerial();
+        const planeReason = this.evaluatePlane();
         const sessions = Array.from(this.sessions.values()).map((s) => ({
             sessionKey: s.sessionKey,
             codec: s.codec,
             guestHandle: s.guestHandle,
+            // The movie's own size: the first thing asked of a session that looks wrong, and
+            // the number every consumer otherwise has to go find in a log line.
+            width: s.width,
+            height: s.height,
             sink: s.sink,
             sinkLockedToOverlay: s.sinkLockedToOverlay,
             misses: s.consecutiveMisses,
@@ -290,6 +429,13 @@ export class VideoRoutingService {
             sessions,
             ring: this.events.slice(-64),
             overlay: this.overlay.getDebugInfo(),
+            // The verdict the present paths act on, read WITHOUT acting on it: a debug read
+            // must not be the thing that clears a plane it is reporting.
+            plane: {
+                onScreen: planeReason === "live",
+                reason: planeReason,
+                coveredGuestPresents: this.planeCoveredGuestPresents,
+            },
         };
     }
 
@@ -312,6 +458,10 @@ export class VideoRoutingService {
         if (session.hasAppManagedSink) return true;
         if (session.targetHint.kind === "ddraw_surface" && session.targetHint.valid) return true;
         if (session.targetHint.kind === "glide_lfb" && session.targetHint.valid) return true;
+        // A VALID app_buffer is one the guest itself uploads (a D3D9 LockRect staging
+        // buffer, a GPU-backed bitmap texture). The invalid case — a bare CPU buffer under
+        // a GPU presenter — is the Morrowind-Bink shape this deliberately keeps distrusting.
+        if (session.targetHint.kind === "app_buffer" && session.targetHint.valid) return true;
         return false;
     }
 
@@ -411,7 +561,28 @@ export class VideoRoutingService {
             this.warnThrottled(session, "overlay_no_backend", `[VideoRouting] no backend, sink=DROP session=${session.sessionKey}`);
             return false;
         }
-        return this.overlay.submitFrame(session.sessionKey, frame);
+        const kind = this.render.getLastPresenterKind();
+        // The plane is a guest-space image: same authority the window plane is sized by, so
+        // the two cannot disagree about which screen they are drawn on.
+        const vs = getVirtualScreenRect();
+        const screenW = Math.max(1, Math.round(vs.right - vs.left));
+        const screenH = Math.max(1, Math.round(vs.bottom - vs.top));
+        return this.overlay.submitFrame(
+            session.sessionKey, frame, kind === "video" ? null : kind,
+            screenW, screenH, this.planeDestRect(session, screenW, screenH));
+    }
+
+    /**
+     * Where this session's movie goes on the guest screen. The app's own stated destination
+     * when there is one; otherwise null, which fills the screen — the compensation case.
+     * A rect that does not intersect the screen is treated as unknown rather than drawn
+     * off-screen: an invisible plane reads exactly like a decode that stopped.
+     */
+    private planeDestRect(session: VideoSessionState, screenW: number, screenH: number): VideoDestRect | null {
+        const r = session.targetHint.destRect;
+        if (!r || r.w <= 0 || r.h <= 0) return null;
+        if (r.x >= screenW || r.y >= screenH || r.x + r.w <= 0 || r.y + r.h <= 0) return null;
+        return r;
     }
 
     private applyTargetHint(session: VideoSessionState, hint?: Partial<VideoTargetHint> | null): void {
@@ -425,15 +596,22 @@ export class VideoRoutingService {
             pitch: hint.pitch ?? session.targetHint.pitch,
             width: hint.width ?? session.targetHint.width,
             height: hint.height ?? session.targetHint.height,
+            destRect: hint.destRect ?? session.targetHint.destRect,
             note: hint.note ?? session.targetHint.note,
         };
+        const prevRect = session.targetHint.destRect;
+        const nextRect = next.destRect;
+        const rectChanged = (!prevRect !== !nextRect) || (!!prevRect && !!nextRect && (
+            prevRect.x !== nextRect.x || prevRect.y !== nextRect.y ||
+            prevRect.w !== nextRect.w || prevRect.h !== nextRect.h));
         const changed =
             next.kind !== session.targetHint.kind ||
             next.valid !== session.targetHint.valid ||
             next.surfacePtr !== session.targetHint.surfacePtr ||
             next.pitch !== session.targetHint.pitch ||
             next.width !== session.targetHint.width ||
-            next.height !== session.targetHint.height;
+            next.height !== session.targetHint.height ||
+            rectChanged;
         session.targetHint = next;
         if (changed) {
             const detail = `${next.kind}:${next.valid ? "1" : "0"}${next.surfacePtr ? ` ptr=0x${next.surfacePtr.toString(16)}` : ""}`;
@@ -466,7 +644,7 @@ export class VideoRoutingService {
         // stale video content being composited over the game's own rendering.
         if (prevSink === "VIDEO_OVERLAY" && sink !== "VIDEO_OVERLAY") {
             if (this.overlay.getOwnerSessionKey() === session.sessionKey) {
-                this.overlay.clear();
+                this.overlay.clear("sink_changed");
             }
         }
         this.pushEvent(session.sessionKey, "sink_selected", `${sink}:${detail}`);

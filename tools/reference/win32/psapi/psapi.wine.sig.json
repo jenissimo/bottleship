@@ -1,0 +1,115 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.933Z",
+  "module": "psapi",
+  "functions": [
+    {
+      "name": "EmptyWorkingSet",
+      "argCount": 1
+    },
+    {
+      "name": "EnumDeviceDrivers",
+      "argCount": 3
+    },
+    {
+      "name": "EnumPageFilesA",
+      "argCount": 2
+    },
+    {
+      "name": "EnumPageFilesW",
+      "argCount": 2
+    },
+    {
+      "name": "EnumProcesses",
+      "argCount": 3
+    },
+    {
+      "name": "EnumProcessModules",
+      "argCount": 4
+    },
+    {
+      "name": "EnumProcessModulesEx",
+      "argCount": 5
+    },
+    {
+      "name": "GetDeviceDriverBaseNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetDeviceDriverBaseNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetDeviceDriverFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetDeviceDriverFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetMappedFileNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetMappedFileNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetModuleBaseNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetModuleBaseNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetModuleFileNameExA",
+      "argCount": 4
+    },
+    {
+      "name": "GetModuleFileNameExW",
+      "argCount": 4
+    },
+    {
+      "name": "GetModuleInformation",
+      "argCount": 4
+    },
+    {
+      "name": "GetPerformanceInfo",
+      "argCount": 2
+    },
+    {
+      "name": "GetProcessImageFileNameA",
+      "argCount": 3
+    },
+    {
+      "name": "GetProcessImageFileNameW",
+      "argCount": 3
+    },
+    {
+      "name": "GetProcessMemoryInfo",
+      "argCount": 3
+    },
+    {
+      "name": "GetWsChanges",
+      "argCount": 3
+    },
+    {
+      "name": "GetWsChangesEx",
+      "argCount": 3
+    },
+    {
+      "name": "InitializeProcessForWsWatch",
+      "argCount": 1
+    },
+    {
+      "name": "QueryWorkingSet",
+      "argCount": 3
+    },
+    {
+      "name": "QueryWorkingSetEx",
+      "argCount": 3
+    }
+  ]
+}

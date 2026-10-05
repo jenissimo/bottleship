@@ -299,11 +299,19 @@ class LoggerImpl {
     }
 
     /**
-     * Check if a log level is enabled for a category.
-     * Includes verbose storage/streaming for VERBOSE level.
+     * Would ANY sink capture an entry at this level — console, the IndexedDB verbose
+     * store, or an attached log stream?
+     *
+     * NOT a cheap-path gate. The harness attaches a stream for the whole session, so at
+     * VERBOSE this answers true in every harness run regardless of category levels: an
+     * `if (!Logger.isEnabled(cat, VERBOSE)) return;` guarding anything other than message
+     * construction is disabled exactly when we are measuring. Gate real work on
+     * `isConsoleEnabled` (or pass a closure to `verboseLazy`, which defers the string but
+     * still feeds every sink).
      */
     isEnabled(category: LogCategory, level: LogLevel): boolean {
         if (level === LogLevel.VERBOSE) {
+            if (this.verboseSuppressedByCategory(category)) return false;
             return (
                 this.getCategoryLevel(category) >= LogLevel.VERBOSE ||
                 this.verboseStore.isEnabled() ||
@@ -311,6 +319,30 @@ class LoggerImpl {
             );
         }
         return this.getCategoryLevel(category) >= level;
+    }
+
+    /**
+     * An EXPLICIT category level below VERBOSE silences that category for EVERY sink,
+     * stream included — the same "only a configured category filters" rule keepInRing
+     * uses. Without this an attached stream re-enabled every verbose entry, so the one
+     * documented way to quiet a firehose (harness `logLevel('D3D9','WARN')`) could not
+     * work: a per-draw-call title kept emitting ~30k entries/s into the stream, the
+     * socket reported CLIENT GAP, and the evidence a diagnosis needed was the thing
+     * being dropped. Nothing configured still means "the stream sees everything".
+     */
+    private verboseSuppressedByCategory(category: LogCategory): boolean {
+        const configured = this.categoryLevels.get(category);
+        return configured !== undefined && configured < LogLevel.VERBOSE;
+    }
+
+    /**
+     * Would this entry actually be WRITTEN to the console? Depends only on the kill switch
+     * and the configured level — no sink can turn it on behind the caller's back, which is
+     * what makes it safe to gate work on (the per-second console rate limiter is not
+     * consulted: it mutates its counters, so a predicate must not touch it).
+     */
+    isConsoleEnabled(category: LogCategory, level: LogLevel): boolean {
+        return this.globalEnabled && this.getCategoryLevel(category) >= level;
     }
 
     getCategoryLevel(category: LogCategory): LogLevel {
@@ -333,11 +365,24 @@ class LoggerImpl {
         this.setCategoryLevel(LogCategory.COM, LogLevel.WARN);     // COM operations
     }
 
+    /** Ring capacity — a reader that returns this many entries may have been TRUNCATED by it. */
+    getBufferSize(): number { return this.bufferSize; }
+
+    /**
+     * Resize the ring, CARRYING the entries it already holds (newest kept when the
+     * new capacity is smaller). A resize is not a clear — `clear()` is the spelling
+     * for that. The host replays a persisted `__logRingSize` mid-boot, so a
+     * discarding resize silently emptied exactly the window (module load, import
+     * binding, device init) the size was raised to capture.
+     */
     setBufferSize(size: number): void {
-        this.bufferSize = size;
-        this.buffer = [];
-        this.writeIndex = 0;
-        this.entryCount = 0;
+        const cap = Math.max(1, Math.floor(size));
+        const kept = this.getOrderedEntries().slice(-cap);
+        this.bufferSize = cap;
+        this.buffer = kept;
+        // A full ring reads as wrapped (getOrderedEntries keys off buffer.length),
+        // so writeIndex must be the oldest slot; a partial ring still appends.
+        this.writeIndex = kept.length % cap;
     }
 
     /**
@@ -346,6 +391,8 @@ class LoggerImpl {
      * The messageFn is only called if logging is actually enabled.
      */
     verboseLazy(category: LogCategory, messageFn: () => string): void {
+        // Ahead of messageFn(): a silenced category must not pay for the string either.
+        if (this.verboseSuppressedByCategory(category)) return;
         const isVerboseEnabled = this.globalEnabled && this.getCategoryLevel(category) >= LogLevel.VERBOSE;
         const isStoreEnabled = this.verboseStore.isEnabled();
         const isStreamEnabled = this.streamCallback !== null;
@@ -371,6 +418,7 @@ class LoggerImpl {
      * Log a verbose message (only shown in VERBOSE mode or when flushed)
      */
     verbose(category: LogCategory, message: string): void {
+        if (this.verboseSuppressedByCategory(category)) return;
         const isVerboseEnabled = this.globalEnabled && this.getCategoryLevel(category) >= LogLevel.VERBOSE;
         const isStoreEnabled = this.verboseStore.isEnabled();
         const isStreamEnabled = this.streamCallback !== null;
@@ -477,6 +525,19 @@ class LoggerImpl {
         this.verbose(LogCategory.THUNK, msg);
     }
 
+    /**
+     * Does this entry earn a RING slot? Only an EXPLICITLY configured category filters
+     * (setCategoryLevel / harness `logLevel`), so the ring's default contents never
+     * depend on console verbosity. ERROR is never dropped. This is the ring only —
+     * taps and streaming still see the entry, because the durable archive must not
+     * lose what the ring is being asked to make room for.
+     */
+    private keepInRing(category: LogCategory, level: LogLevel): boolean {
+        if (level <= LogLevel.ERROR) return true;
+        const configured = this.categoryLevels.get(category);
+        return configured === undefined || configured >= level;
+    }
+
     private addToBuffer(category: LogCategory, level: LogLevel, message: string): LogEntry {
         const entry: LogEntry = {
             timestamp: TimeService.getInstance().nowMs(),
@@ -485,14 +546,16 @@ class LoggerImpl {
             message,
         };
 
-        if (this.buffer.length < this.bufferSize) {
-            this.buffer.push(entry);
-        } else {
-            this.buffer[this.writeIndex] = entry;
-        }
+        if (this.keepInRing(category, level)) {
+            if (this.buffer.length < this.bufferSize) {
+                this.buffer.push(entry);
+            } else {
+                this.buffer[this.writeIndex] = entry;
+            }
 
-        this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
-        this.entryCount++;
+            this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
+            this.entryCount++;
+        }
 
         // Per-entry taps (harness log hub). Guarded so there's zero cost when none.
         if (this.taps.length) {
@@ -505,8 +568,10 @@ class LoggerImpl {
         if (this.streamCallback) {
             const shouldStream = !this.streamCategories || this.streamCategories.has(category);
             if (shouldStream) {
-                // Apply rate limiting for high-frequency categories
-                if (this.shouldSample(category)) {
+                // Apply rate limiting for high-frequency categories — but never to an
+                // error or warning: those are the lines a crash window is read for, and
+                // dropping them makes the archive claim a fault simply never happened.
+                if (level <= LogLevel.WARN || this.shouldSample(category)) {
                     this.addToStreamBatch(entry);
                 }
             }

@@ -1,10 +1,13 @@
 /**
  * Capped CheckDeviceFormat logging — boot-time caps probes (e.g. RenderWare / GTA III
  * CAPS.DAT) without a per-call firehose.
+ *
+ * The capability fast paths answer memo HITS without reaching here, so a repeated identical
+ * query logs once per distinct key by design; the call count lives in getDxFormatSupportCensus.
  */
 
 import { Logger, LogCategory } from "../../../core/logger";
-import { D3D_OK } from "./dx-format-support";
+import { D3DOK_NOAUTOGEN, D3D_OK } from "./dx-format-support";
 
 const D3DFMT_NAMES: Record<number, string> = {
     0: "UNKNOWN",
@@ -71,7 +74,10 @@ export function logDxCheckDeviceFormat(
     hr: number,
 ): void {
     totalCalls++;
-    const ok = hr === D3D_OK;
+    // D3DOK_NOAUTOGEN is a SUCCESS status ("supported, but I will not generate the mips").
+    // Printing it as NOTAVAILABLE reads as a refusal and sends the reader hunting for a
+    // capability gap that is not there.
+    const ok = hr === D3D_OK || hr === D3DOK_NOAUTOGEN;
     const key = `${adapterFormat >>> 0}:${usage >>> 0}:${rType}:${checkFormat >>> 0}`;
     const shouldLog =
         verboseEnabled ||
@@ -82,7 +88,9 @@ export function logDxCheckDeviceFormat(
     if (!shouldLog) return;
     if (ok) seenOkKeys.add(key);
 
-    const result = ok ? "OK" : "NOTAVAILABLE";
+    const result = hr === D3D_OK ? "OK"
+        : hr === D3DOK_NOAUTOGEN ? "OK (NOAUTOGEN)"
+        : `FAILED 0x${(hr >>> 0).toString(16)}`;
     Logger.log(
         LogCategory.D3D9,
         `CheckDeviceFormat(${api}): adapter=${fmtName(adapterFormat)} usage=0x${(usage >>> 0).toString(16)} ` +

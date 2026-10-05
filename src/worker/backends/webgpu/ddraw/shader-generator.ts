@@ -5,7 +5,7 @@
  * The FFP texture cascade is stage-count-generic: per-stage ops/args/TCI/transform-flags
  * travel in a packed `stages: array<vec4u, MAX_FFP_STAGES>` block (see ffp-stages.ts for
  * the packing), and the fragment cascade is loop-emitted per compiled variant from
- * (stageCount, sampledMask, pointSampleMask).
+ * (stageCount, sampledMask).
  */
 
 import {
@@ -19,17 +19,48 @@ import {
     D3DTOP_ADDSIGNED,
     D3DTOP_ADDSIGNED2X,
     D3DTOP_SUBTRACT,
+    D3DTOP_ADDSMOOTH,
     D3DTOP_BLENDTEXTUREALPHA,
     D3DTOP_BLENDFACTORALPHA,
     D3DTOP_BLENDDIFFUSEALPHA,
+    D3DTOP_BLENDTEXTUREALPHAPM,
+    D3DTOP_BLENDCURRENTALPHA,
+    D3DTOP_MODULATEALPHA_ADDCOLOR,
+    D3DTOP_MODULATECOLOR_ADDALPHA,
+    D3DTOP_MODULATEINVALPHA_ADDCOLOR,
+    D3DTOP_MODULATEINVCOLOR_ADDALPHA,
+    D3DTOP_DOTPRODUCT3,
+    D3DTOP_MULTIPLYADD,
+    D3DTOP_LERP,
     D3DTA_TEXTURE,
     D3DTA_DIFFUSE,
     D3DTA_TFACTOR,
     D3DTA_CURRENT,
+    D3DTA_SPECULAR,
+    D3DTA_TEMP,
     D3DTA_COMPLEMENT,
     D3DTA_ALPHAREPLICATE,
     D3DTA_SELECTMASK,
 } from "../../../modules/ddraw/constants";
+
+/**
+ * D3DTEXTUREOP values `applyStageOp` (below) evaluates. Mirrors the D3D9 FFP combiner's
+ * `FFP_IMPLEMENTED_OPS` (d3d9/ffp-combiner.ts) contract: this is the single source of truth
+ * both the shader and `d3d8/caps.ts`'s TextureOpCaps read from, so the advertised cap can
+ * never claim an op the shader has no branch for. DISABLE is handled by the stage cascade
+ * before this function runs, so it is intentionally not listed. 17 (PREMODULATE) and 22/23
+ * (BUMPENVMAP[LUMINANCE]) are genuinely unimplemented — they consume the NEXT stage's
+ * texture or bump-env matrix state, neither of which reaches a stage-local combiner here.
+ */
+export const FFP_D3D8_IMPLEMENTED_OPS: ReadonlySet<number> = new Set([
+    D3DTOP_SELECTARG1, D3DTOP_SELECTARG2, D3DTOP_MODULATE, D3DTOP_MODULATE2X, D3DTOP_MODULATE4X,
+    D3DTOP_ADD, D3DTOP_ADDSIGNED, D3DTOP_ADDSIGNED2X, D3DTOP_SUBTRACT, D3DTOP_ADDSMOOTH,
+    D3DTOP_BLENDDIFFUSEALPHA, D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDFACTORALPHA,
+    D3DTOP_BLENDTEXTUREALPHAPM, D3DTOP_BLENDCURRENTALPHA,
+    D3DTOP_MODULATEALPHA_ADDCOLOR, D3DTOP_MODULATECOLOR_ADDALPHA,
+    D3DTOP_MODULATEINVALPHA_ADDCOLOR, D3DTOP_MODULATEINVCOLOR_ADDALPHA,
+    D3DTOP_DOTPRODUCT3, D3DTOP_MULTIPLYADD, D3DTOP_LERP,
+]);
 import { DebugFlags } from "./types";
 import { MAX_FFP_STAGES, MAX_FFP_SAMPLED_STAGES, MAX_FFP_TEX_MATRICES } from "./ffp-stages";
 import {
@@ -37,17 +68,26 @@ import {
     FFP_SELECT_COLOR_WGSL,
     emitFfpComputeLighting,
 } from "../d3d9/ffp-lighting";
+import { FFP_FOG_WGSL } from "../d3d9/ffp-fog";
 
 /**
  * Per-sampled-stage GPU bind slots: [sampler, texture] for stages 0..3.
- * Binding 0 = uniforms/storage, binding 5 = FFP light set (legacy path only) —
- * the historical stage numbering skips over it.
+ *
+ * RESERVED, do not reuse: 0 = uniforms/storage, 5 = FFP light set, 6 = FFP user clip planes.
+ * The stage window therefore runs 1..4 and then resumes ABOVE the reserved pair. Stage 2's
+ * sampler used to sit on 6, which the clip-plane binding also claims: the duplicate made the
+ * whole BindGroupLayout invalid, and with it the pipeline, the bind group and every command
+ * buffer that referenced them — so a frame that sampled three stages was dropped entirely and
+ * the previous one stayed on screen. tools/tests/ffp-stage-bindings-disjoint.test.ts pins the
+ * invariant.
  */
+export const RESERVED_BINDINGS: readonly number[] = [0, 5, 6];
+
 export const STAGE_BINDINGS: ReadonlyArray<readonly [number, number]> = [
     [1, 2],
     [3, 4],
-    [6, 7],
-    [8, 9],
+    [7, 8],
+    [9, 10],
 ];
 
 /**
@@ -58,8 +98,6 @@ export interface ShaderConfig {
     sampledMask: number;
     /** Number of cascade stage blocks to emit (1 + highest enabled stage). */
     stageCount: number;
-    /** Bit N set = stage N uses POINT sampling and gets the tiny forward texel bias. */
-    pointSampleMask: number;
     /** D3DRENDERSTATE_SHADEMODE == D3DSHADE_FLAT: flat-shade the diffuse (COLOR0) and specular
      *  (COLOR1) varyings — the provoking (first) vertex's color is used for the whole primitive,
      *  matching real D3D. Games (e.g. Airfix Dogfighter's menu) set only the provoking vertex's
@@ -120,32 +158,74 @@ export function generateAlphaTestExpr(alphaFunc: number): string {
     }
 }
 
+/** Depth CLAMP for a pre-transformed draw whose depth state makes z inert (RHW_DEPTH_CLAMP).
+ *  WebGPU always clips against 0 <= z <= w — `depth-clip-control`/`unclippedDepth` is optional
+ *  and not requested — while real hardware rasterizes a TL quad whatever its z holds, and games
+ *  leave that field stale in the vertex buffer they reuse for HUD sprites. Pulling z inside the
+ *  volume is what unclippedDepth would do, minus the feature dependency; nothing reads the
+ *  result, since ZENABLE=FALSE forces the compare to ALWAYS and depth writes off. */
+const RHW_DEPTH_CLAMP_WGSL = `let clipPos = out.position;
+                        let zw = clipPos.w;
+                        let zNdc = select(0.0, clipPos.z / zw, zw != 0.0);
+                        out.position = vec4f(clipPos.xy, clamp(zNdc, 0.0, 1.0) * zw, zw);`;
+
 /**
- * Generate WGSL code for Z transformation block
+ * Generate WGSL code for Z transformation block.
+ *
+ * `out` is a `var`, so `out.position.z = …` is a writable component swizzle — the construct
+ * Dawn/Tint currently fails to lower ("swizzle view instruction still has usages after
+ * lowering"), taking the whole pipeline with it. Read the position into a `let` and assign
+ * the complete vec4 instead; the same discipline the D3D9 emitter uses for its registers.
  */
-function generateZBlock(forceZMidpoint: boolean): string {
+function generateZBlock(
+    forceZMidpoint: boolean,
+    minZ = "uniforms.minZ",
+    maxZ = "uniforms.maxZ",
+): string {
     if (forceZMidpoint) {
         return `// Debug: force Z = 0.5*w to isolate NDC/projection issues
-                    out.position.z = 0.5 * out.position.w;`;
+                    let zMidPos = out.position;
+                    out.position = vec4f(zMidPos.xy, 0.5 * zMidPos.w, zMidPos.w);`;
     }
-    return `let z_ndc = out.position.z / out.position.w;
-                    let z_ndc2 = z_ndc * (uniforms.maxZ - uniforms.minZ) + uniforms.minZ;
-                    out.position.z = z_ndc2 * out.position.w;`;
+    return `let zRemapPos = out.position;
+                    let z_ndc = zRemapPos.z / zRemapPos.w;
+                    let z_ndc2 = z_ndc * (${maxZ} - ${minZ}) + ${minZ};
+                    out.position = vec4f(zRemapPos.xy, z_ndc2 * zRemapPos.w, zRemapPos.w);`;
 }
 
-function generateTextureSample(textureName: string, samplerName: string, uvExpr: string, pointSample: boolean): string {
-    if (!pointSample) {
-        return `textureSample(${textureName}, ${samplerName}, ${uvExpr})`;
+/** debugView/forceWireColor are the last word on the fragment's colour: emitted right
+ *  before `return finalColor`, after fog/blend, so a picture change is unambiguous
+ *  evidence the draw reached this fragment stage with these vertex inputs — the question
+ *  a capture alone cannot answer. Baked at shader-generation time (not a uniform) so it
+ *  costs nothing when inert and needs no dynamic branch to disable. forceWireColor wins
+ *  over debugView — it exists to isolate geometry from EVERY other shading concern,
+ *  debugView included. */
+function generateDebugViewOverride(debugFlags: Pick<DebugFlags, "debugView" | "forceWireColor">): string {
+    if (debugFlags.forceWireColor) return `finalColor = vec4f(1.0, 0.5, 0.0, 1.0);`;
+    switch (debugFlags.debugView) {
+        case "uv": return `finalColor = vec4f(in.uv, 0.0, 1.0);`;
+        case "vertexcolor": return `finalColor = vec4f(in.color.rgb, 1.0);`;
+        case "alpha": return `finalColor = vec4f(vec3f(currentAlpha), 1.0);`;
+        case "solid": return `finalColor = vec4f(1.0, 1.0, 1.0, 1.0);`;
+        default: return "";
     }
+}
 
-    return `textureSample(${textureName}, ${samplerName}, ${uvExpr} + vec2f(0.000244140625) / max(vec2f(textureDimensions(${textureName}, 0)), vec2f(1.0)))`;
+/** D3DTEXF_POINT is a plain nearest fetch — no coordinate nudge. Real D3D (and Wine
+ *  and DXVK, which map D3DTEXF_POINT straight to VK_FILTER_NEAREST) bias nothing, and
+ *  a nudge shifts a glyph-atlas cell into its neighbour: Hitman's HUD strings came out
+ *  as fragments of the wrong letters. */
+function generateTextureSample(textureName: string, samplerName: string, uvExpr: string): string {
+    return `textureSample(${textureName}, ${samplerName}, ${uvExpr})`;
 }
 
 /**
  * Generate WGSL helper functions for color and alpha operations
  */
-function generateShaderHelpers(): string {
+export function generateShaderHelpers(): string {
     return `
+${FFP_FOG_WGSL}
+
 fn selectTexCoord(rawIndex: u32, uv0: vec2f, uv1: vec2f, uv2: vec2f) -> vec2f {
     let index = rawIndex & 0xffffu;
     if (index == 1u) {
@@ -157,96 +237,82 @@ fn selectTexCoord(rawIndex: u32, uv0: vec2f, uv1: vec2f, uv2: vec2f) -> vec2f {
     return uv0;
 }
 
-fn resolveColorArg(arg: u32, texColor: vec3f, currentColor: vec3f, diffuse: vec3f, textureFactor: vec3f, texAlpha: f32, currentAlpha: f32, diffuseAlpha: f32, factorAlpha: f32) -> vec3f {
-    let argType = arg & ${D3DTA_SELECTMASK}u;
-    var result: vec3f;
-    var sourceAlpha: f32;
-
+/**
+ * D3DTA_* argument resolution over a full vec4 (rgb+a) register — mirrors ffpStageArg
+ * (d3d9/ffp-combiner.ts) exactly: same selector table, same COMPLEMENT/ALPHAREPLICATE
+ * modifier order. Resolving both channels together (rather than a separate color/alpha
+ * function per selector byte) is what lets a color-channel op read "arg1's own alpha"
+ * (D3DTOP_MODULATEALPHA_ADDCOLOR and friends, below) without a second lookup.
+ *
+ * TEMP has no writer on this path: D3DTSS_RESULTARG is captured by the device layer but
+ * ffp-stages.ts's per-stage packing does not carry it here (see D3DTSS_RESULTARG in
+ * ddraw/constants.ts), so D3DTA_TEMP reads its D3D-documented (0,0,0,0) initial value for
+ * the whole cascade — correct for the common case (no stage ever wrote it), approximate
+ * only for a title that explicitly chains RESULTARG=TEMP across stages.
+ */
+fn resolveStageArg(sel: u32, texColor: vec4f, current: vec4f, diffuse: vec4f, specular: vec4f, temp: vec4f, textureFactor: vec4f) -> vec4f {
+    let argType = sel & ${D3DTA_SELECTMASK}u;
+    var result: vec4f;
     if (argType == ${D3DTA_TEXTURE}u) {
         result = texColor;
-        sourceAlpha = texAlpha;
     } else if (argType == ${D3DTA_TFACTOR}u) {
         result = textureFactor;
-        sourceAlpha = factorAlpha;
     } else if (argType == ${D3DTA_CURRENT}u) {
-        result = currentColor;
-        sourceAlpha = currentAlpha;
+        result = current;
+    } else if (argType == ${D3DTA_SPECULAR}u) {
+        result = specular;
+    } else if (argType == ${D3DTA_TEMP}u) {
+        result = temp;
     } else {
         result = diffuse;
-        sourceAlpha = diffuseAlpha;
     }
-
-    if ((arg & ${D3DTA_ALPHAREPLICATE}u) != 0u) {
-        result = vec3f(sourceAlpha);
+    if ((sel & ${D3DTA_ALPHAREPLICATE}u) != 0u) {
+        result = vec4f(result.a);
     }
-
-    if ((arg & ${D3DTA_COMPLEMENT}u) != 0u) {
-        result = vec3f(1.0) - result;
+    if ((sel & ${D3DTA_COMPLEMENT}u) != 0u) {
+        result = vec4f(1.0) - result;
     }
     return result;
 }
 
-fn resolveAlphaArg(arg: u32, texAlpha: f32, currentAlpha: f32, diffuseAlpha: f32, factorAlpha: f32) -> f32 {
-    let argType = arg & ${D3DTA_SELECTMASK}u;
-    var result: f32;
-    if (argType == ${D3DTA_TEXTURE}u) {
-        result = texAlpha;
-    } else if (argType == ${D3DTA_TFACTOR}u) {
-        result = factorAlpha;
-    } else if (argType == ${D3DTA_CURRENT}u) {
-        result = currentAlpha;
-    } else {
-        result = diffuseAlpha;
-    }
-    if ((arg & ${D3DTA_COMPLEMENT}u) != 0u) {
-        result = 1.0 - result;
-    }
-    return result;
-}
-
-fn applyColorOp(op: u32, arg1: vec3f, arg2: vec3f, texAlpha: f32, factorAlpha: f32, diffuseAlpha: f32) -> vec3f {
-    if (op == ${D3DTOP_SELECTARG1}u) { return arg1; }
-    if (op == ${D3DTOP_SELECTARG2}u) { return arg2; }
-    if (op == ${D3DTOP_MODULATE}u)   { return arg1 * arg2; }
-    if (op == ${D3DTOP_MODULATE2X}u) { return clamp(arg1 * arg2 * 2.0, vec3f(0.0), vec3f(1.0)); }
-    if (op == ${D3DTOP_MODULATE4X}u) { return clamp(arg1 * arg2 * 4.0, vec3f(0.0), vec3f(1.0)); }
-    if (op == ${D3DTOP_ADD}u)        { return clamp(arg1 + arg2, vec3f(0.0), vec3f(1.0)); }
-    if (op == ${D3DTOP_SUBTRACT}u)   { return clamp(arg1 - arg2, vec3f(0.0), vec3f(1.0)); }
-    if (op == ${D3DTOP_ADDSIGNED}u)  { return clamp(arg1 + arg2 - 0.5, vec3f(0.0), vec3f(1.0)); }
-    if (op == ${D3DTOP_ADDSIGNED2X}u){ return clamp((arg1 + arg2 - 0.5) * 2.0, vec3f(0.0), vec3f(1.0)); }
-    if (op == ${D3DTOP_BLENDDIFFUSEALPHA}u) {
-        return arg1 * diffuseAlpha + arg2 * (1.0 - diffuseAlpha);
-    }
-    if (op == ${D3DTOP_BLENDTEXTUREALPHA}u) {
-        return arg1 * texAlpha + arg2 * (1.0 - texAlpha);
-    }
-    if (op == ${D3DTOP_BLENDFACTORALPHA}u) {
-        return arg1 * factorAlpha + arg2 * (1.0 - factorAlpha);
-    }
-    return arg1 * arg2; // Default to MODULATE
-}
-
-fn applyAlphaOp(op: u32, currentAlpha: f32, a1: f32, a2: f32, texAlpha: f32, factorAlpha: f32, diffuseAlpha: f32) -> f32 {
-    if (op == ${D3DTOP_DISABLE}u)    { return currentAlpha; }
+/**
+ * One D3DTEXTUREOP evaluation, mirroring ffpStageOp (d3d9/ffp-combiner.ts) exactly —
+ * including the eight ops (ADDSMOOTH, BLENDTEXTUREALPHAPM, BLENDCURRENTALPHA,
+ * MODULATEALPHA_ADDCOLOR, MODULATECOLOR_ADDALPHA, MODULATEINVALPHA_ADDCOLOR,
+ * MODULATEINVCOLOR_ADDALPHA, DOTPRODUCT3) this file used to substitute with a silent
+ * MODULATE fallback. FFP_D3D8_IMPLEMENTED_OPS (above) is the exact op set with a branch
+ * here; an op outside it returns dst (the destination register, unchanged) rather than
+ * inventing a pixel value for a gap.
+ */
+fn applyStageOp(op: u32, a0: vec4f, a1: vec4f, a2: vec4f, texColor: vec4f, current: vec4f, diffuse: vec4f, textureFactor: vec4f, dst: vec4f) -> vec4f {
+    let one = vec4f(1.0);
+    let zero = vec4f(0.0);
     if (op == ${D3DTOP_SELECTARG1}u) { return a1; }
     if (op == ${D3DTOP_SELECTARG2}u) { return a2; }
     if (op == ${D3DTOP_MODULATE}u)   { return a1 * a2; }
-    if (op == ${D3DTOP_MODULATE2X}u) { return clamp(a1 * a2 * 2.0, 0.0, 1.0); }
-    if (op == ${D3DTOP_MODULATE4X}u) { return clamp(a1 * a2 * 4.0, 0.0, 1.0); }
-    if (op == ${D3DTOP_ADD}u)        { return clamp(a1 + a2, 0.0, 1.0); }
-    if (op == ${D3DTOP_SUBTRACT}u)   { return clamp(a1 - a2, 0.0, 1.0); }
-    if (op == ${D3DTOP_ADDSIGNED}u)  { return clamp(a1 + a2 - 0.5, 0.0, 1.0); }
-    if (op == ${D3DTOP_ADDSIGNED2X}u){ return clamp((a1 + a2 - 0.5) * 2.0, 0.0, 1.0); }
-    if (op == ${D3DTOP_BLENDDIFFUSEALPHA}u) {
-        return a1 * diffuseAlpha + a2 * (1.0 - diffuseAlpha);
-    }
-    if (op == ${D3DTOP_BLENDTEXTUREALPHA}u) {
-        return a1 * texAlpha + a2 * (1.0 - texAlpha);
-    }
-    if (op == ${D3DTOP_BLENDFACTORALPHA}u) {
-        return a1 * factorAlpha + a2 * (1.0 - factorAlpha);
-    }
-    return a1 * a2; // Default to MODULATE
+    if (op == ${D3DTOP_MODULATE2X}u) { return clamp(a1 * a2 * 2.0, zero, one); }
+    if (op == ${D3DTOP_MODULATE4X}u) { return clamp(a1 * a2 * 4.0, zero, one); }
+    if (op == ${D3DTOP_ADD}u)        { return clamp(a1 + a2, zero, one); }
+    if (op == ${D3DTOP_SUBTRACT}u)   { return clamp(a1 - a2, zero, one); }
+    if (op == ${D3DTOP_ADDSIGNED}u)  { return clamp(a1 + a2 - vec4f(0.5), zero, one); }
+    if (op == ${D3DTOP_ADDSIGNED2X}u){ return clamp((a1 + a2 - vec4f(0.5)) * 2.0, zero, one); }
+    if (op == ${D3DTOP_ADDSMOOTH}u)  { return clamp(a1 + a2 * (one - a1), zero, one); }
+    if (op == ${D3DTOP_BLENDDIFFUSEALPHA}u) { return mix(a2, a1, vec4f(diffuse.a)); }
+    // BLENDTEXTUREALPHA weighs by the STAGE'S TEXEL alpha, not by an argument's.
+    if (op == ${D3DTOP_BLENDTEXTUREALPHA}u) { return mix(a2, a1, vec4f(texColor.a)); }
+    if (op == ${D3DTOP_BLENDFACTORALPHA}u)  { return mix(a2, a1, vec4f(textureFactor.a)); }
+    // BLENDTEXTUREALPHAPM — arg1 is already premultiplied by the texel alpha.
+    if (op == ${D3DTOP_BLENDTEXTUREALPHAPM}u) { return clamp(a1 + a2 * (one - vec4f(texColor.a)), zero, one); }
+    if (op == ${D3DTOP_BLENDCURRENTALPHA}u)   { return mix(a2, a1, vec4f(current.a)); }
+    if (op == ${D3DTOP_MODULATEALPHA_ADDCOLOR}u)    { return clamp(a1 + vec4f(a1.a) * a2, zero, one); }
+    if (op == ${D3DTOP_MODULATECOLOR_ADDALPHA}u)    { return clamp(a1 * a2 + vec4f(a1.a), zero, one); }
+    if (op == ${D3DTOP_MODULATEINVALPHA_ADDCOLOR}u) { return clamp(a1 + (one - vec4f(a1.a)) * a2, zero, one); }
+    if (op == ${D3DTOP_MODULATEINVCOLOR_ADDALPHA}u) { return clamp((one - a1) * a2 + vec4f(a1.a), zero, one); }
+    // DOTPRODUCT3 — signed-expand both RGBs, dot, scale by 4, replicate to all four channels.
+    if (op == ${D3DTOP_DOTPRODUCT3}u) { return clamp(vec4f(dot(a1.rgb - vec3f(0.5), a2.rgb - vec3f(0.5)) * 4.0), zero, one); }
+    if (op == ${D3DTOP_MULTIPLYADD}u) { return clamp(a0 + a1 * a2, zero, one); }
+    if (op == ${D3DTOP_LERP}u) { return mix(a2, a1, a0); }
+    return dst;
 }
 `;
 }
@@ -268,35 +334,54 @@ function generateStageBindings(sampledMask: number): string {
  * Emit one FFP cascade stage block for the fragment shader.
  *
  * Ops/args are dynamic (read from the packed stages block), so the only compile-time
- * variation is whether the stage samples its texture (binding exists) and the POINT
- * bias. Stage 0 keeps its historical texColor fallback: with no texture bound the
- * "texture" input is the diffuse color (D3DTA_TEXTURE args were already remapped to
- * DIFFUSE by the resolver, so this only affects the colorkey path and texAlpha).
+ * variation is whether the stage samples its texture (binding exists). Stage 0 keeps its
+ * historical texColor fallback: with no texture bound the "texture" input is the diffuse
+ * color (D3DTA_TEXTURE args were already remapped to DIFFUSE by the resolver, so this
+ * only affects the colorkey path and texAlpha).
  */
-function emitStageBlock(s: number, prefix: string, sampled: boolean, pointSample: boolean): string {
+function emitStageBlock(s: number, prefix: string, sampled: boolean): string {
     const uvExpr = s === 0 ? "in.uv" : `in.uv${s}`;
     const texColorExpr = sampled
-        ? generateTextureSample(`tex${s}`, `tex${s}Sampler`, uvExpr, pointSample)
+        ? generateTextureSample(`tex${s}`, `tex${s}Sampler`, uvExpr)
         : (s === 0 ? "diffuse" : "vec4f(0.0, 0.0, 0.0, 1.0)");
+    // TEMP register: see resolveStageArg's comment — no RESULTARG writer on this path, so it
+    // stays at its documented (0,0,0,0) initial value for the whole cascade.
+    const tempReg = "vec4f(0.0, 0.0, 0.0, 0.0)";
     return `
                 // ---- FFP stage ${s} ----
                 let sp${s} = ${prefix}.stages[${s}];
-                let colorOp${s} = sp${s}.x & 0xffffu;
-                let alphaOp${s} = sp${s}.x >> 16u;
+                let colorOp${s} = sp${s}.x & 0xffu;
+                let alphaOp${s} = (sp${s}.x >> 8u) & 0xffu;
                 // Non-sampling stages never reference tex${s}Color: the resolver
                 // remaps/never-produces D3DTA_TEXTURE args for them.
                 var tex${s}Color = ${texColorExpr};
-                let tex${s}Alpha = tex${s}Color.a;
+                // Pre-stage CURRENT/DIFFUSE/SPECULAR (immutable snapshot): the color and alpha
+                // ops of ONE stage read the same "before this stage ran" values, matching real
+                // D3D FFP (they are not sequentially dependent within a stage).
+                let cur${s} = vec4f(currentColor, currentAlpha);
 
-                let cArg1_${s} = resolveColorArg(sp${s}.y & 0xffu, tex${s}Color.rgb, currentColor, diffuse.rgb, ${prefix}.textureFactor.rgb, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
-                let cArg2_${s} = resolveColorArg((sp${s}.y >> 8u) & 0xffu, tex${s}Color.rgb, currentColor, diffuse.rgb, ${prefix}.textureFactor.rgb, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
+                let a0_${s} = resolveStageArg((sp${s}.x >> 16u) & 0xffu, tex${s}Color, cur${s}, diffuse, in.specular, ${tempReg}, ${prefix}.textureFactor);
+                let cArg1_${s} = resolveStageArg(sp${s}.y & 0xffu, tex${s}Color, cur${s}, diffuse, in.specular, ${tempReg}, ${prefix}.textureFactor);
+                let cArg2_${s} = resolveStageArg((sp${s}.y >> 8u) & 0xffu, tex${s}Color, cur${s}, diffuse, in.specular, ${tempReg}, ${prefix}.textureFactor);
+                // DOTPRODUCT3 is a four-channel op: D3D replicates its signed dot-product into
+                // alpha even when the stage's ALPHAOP selects something else, so the alpha op
+                // below is skipped for it — mirrors d3d9-device.ts's programmable FFP path.
+                var alphaFromColorOp${s} = false;
                 if (colorOp${s} != ${D3DTOP_DISABLE}u) {
-                    currentColor = applyColorOp(colorOp${s}, cArg1_${s}, cArg2_${s}, tex${s}Alpha, factorAlpha, diffuse.a);
+                    let colorResult${s} = applyStageOp(colorOp${s}, a0_${s}, cArg1_${s}, cArg2_${s}, tex${s}Color, cur${s}, diffuse, ${prefix}.textureFactor, cur${s});
+                    currentColor = colorResult${s}.rgb;
+                    if (colorOp${s} == ${D3DTOP_DOTPRODUCT3}u) {
+                        currentAlpha = colorResult${s}.a;
+                        alphaFromColorOp${s} = true;
+                    }
                 }
 
-                let aArg1_${s} = resolveAlphaArg((sp${s}.y >> 16u) & 0xffu, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
-                let aArg2_${s} = resolveAlphaArg((sp${s}.y >> 24u) & 0xffu, tex${s}Alpha, currentAlpha, diffuse.a, factorAlpha);
-                currentAlpha = applyAlphaOp(alphaOp${s}, currentAlpha, aArg1_${s}, aArg2_${s}, tex${s}Alpha, factorAlpha, diffuse.a);
+                if (!alphaFromColorOp${s} && alphaOp${s} != ${D3DTOP_DISABLE}u) {
+                    let aArg0_${s} = resolveStageArg((sp${s}.x >> 24u) & 0xffu, tex${s}Color, cur${s}, diffuse, in.specular, ${tempReg}, ${prefix}.textureFactor);
+                    let aArg1_${s} = resolveStageArg((sp${s}.y >> 16u) & 0xffu, tex${s}Color, cur${s}, diffuse, in.specular, ${tempReg}, ${prefix}.textureFactor);
+                    let aArg2_${s} = resolveStageArg((sp${s}.y >> 24u) & 0xffu, tex${s}Color, cur${s}, diffuse, in.specular, ${tempReg}, ${prefix}.textureFactor);
+                    currentAlpha = applyStageOp(alphaOp${s}, aArg0_${s}, aArg1_${s}, aArg2_${s}, tex${s}Color, cur${s}, diffuse, ${prefix}.textureFactor, cur${s}).a;
+                }
 `;
 }
 
@@ -306,8 +391,7 @@ function emitStageCascade(config: ShaderConfig, prefix: string): string {
     const count = Math.max(1, Math.min(MAX_FFP_STAGES, config.stageCount));
     for (let s = 0; s < count; s++) {
         const sampled = (config.sampledMask & (1 << s)) !== 0 && s < MAX_FFP_SAMPLED_STAGES;
-        const point = (config.pointSampleMask & (1 << s)) !== 0;
-        out += emitStageBlock(s, prefix, sampled, point);
+        out += emitStageBlock(s, prefix, sampled);
     }
     return out;
 }
@@ -457,12 +541,15 @@ export function generateShaderCode(config: ShaderConfig): string {
 
                 // Apply UV flip if needed (for bottom-up BMP files); only ever the
                 // passthrough UV set — BMP-loaded textures are never texgen-sourced.
-                var src0 = genTexCoordSrc(uniforms.stages[0].z, uv, uv1, uv2, tcCamPos, tcCamNormal, tcCamReflect);
-                ${needsUVFlip ? 'src0 = vec4f(src0.x, 1.0 - src0.y, src0.z, src0.w);' : ''}
-                var adjustedUV = applyTexXform(src0, uniforms.texMat0, uniforms.stages[0].w);
+                let src0Raw = genTexCoordSrc(uniforms.stages[0].z, uv, uv1, uv2, tcCamPos, tcCamNormal, tcCamReflect);
+                let src0 = ${needsUVFlip ? 'vec4f(src0Raw.x, 1.0 - src0Raw.y, src0Raw.z, src0Raw.w)' : 'src0Raw'};
+                let adjustedUV = applyTexXform(src0, uniforms.texMat0, uniforms.stages[0].w);
 
-                if (uniforms.isRHW != 0u) {
+                if ((uniforms.isRHW & 1u) != 0u) {
                     out.position = pos;
+                    if ((uniforms.isRHW & 2u) != 0u) {
+                        ${RHW_DEPTH_CLAMP_WGSL}
+                    }
                 } else {
                     out.position = uniforms.mvp * vec4f(pos.xyz, 1.0);
                     ${zBlock}
@@ -478,7 +565,7 @@ export function generateShaderCode(config: ShaderConfig): string {
                 // Summing alphas produces 2×matAlpha (emissive + ambient*1.0 for a typical
                 // all-white material with global ambient alpha=1.0), which clamps to 1.0
                 // once matAlpha>=0.5 and turns smooth crossfades into binary flickers.
-                if (uniforms.lightingEnabled != 0u && uniforms.isRHW == 0u) {
+                if (uniforms.lightingEnabled != 0u && (uniforms.isRHW & 1u) == 0u) {
                     // Full D3D fixed-function lighting (all enabled lights from the shared light set,
                     // directional/point/spot + attenuation + spot cone + specular). Computed in VIEW
                     // space (worldView), matching the D3D9 reference path: the shared math's infinite
@@ -491,6 +578,9 @@ export function generateShaderCode(config: ShaderConfig): string {
                         ecPos, ecNormal,
                         uniforms.matDiffuse, uniforms.matAmbient, uniforms.matSpecular, uniforms.matEmissive,
                         uniforms.matPower, uniforms.specularEnable != 0u, uniforms.localViewer != 0u, uniforms.hasNormal != 0u,
+                        // The ddraw uniform block carries no D3DRENDERSTATE_NORMALIZENORMALS,
+                        // so this path cannot observe the state and always normalizes.
+                        true,
                         f32(uniforms.matDiffuseSrc), f32(uniforms.matAmbientSrc),
                         f32(uniforms.matSpecularSrc), f32(uniforms.matEmissiveSrc),
                         uniforms.ambientColor.rgb, i32(ffpLightSet.count.x),
@@ -510,40 +600,20 @@ export function generateShaderCode(config: ShaderConfig): string {
                 out.uv3 = genTexCoordSrc(uniforms.stages[3].z, uv, uv1, uv2, tcCamPos, tcCamNormal, tcCamReflect).xy;
                 out.normal = normal;
 
-                // Fog mode encoding (fogParams.w):
-                //   0.5   = pre-transformed vertex fog — app supplied factor in specular.a
-                //   1..3  = table (pixel) fog EXP/EXP2/LINEAR over device depth (z/w)
-                //   5..7  = T&L vertex fog EXP/EXP2/LINEAR over view-space depth (clip w)
-                if (uniforms.fogParams.w > 0.25 && uniforms.fogParams.w < 0.75) {
-                    out.fogFactor = 1.0 - vSpecular.a;
-                } else if (uniforms.fogParams.w >= 1.0) {
-                    var mode = uniforms.fogParams.w;
-                    var depth: f32;
-                    if (mode >= 4.5) {
-                        mode = mode - 4.0;
-                        depth = out.position.w;
-                    } else if (uniforms.isRHW != 0u) {
-                        depth = pos.z;
-                    } else {
-                        depth = clamp(out.position.z / out.position.w, 0.0, 1.0);
-                    }
-                    let start = uniforms.fogParams.x;
-                    let end = uniforms.fogParams.y;
-                    let density = uniforms.fogParams.z;
-                    var fogFactor: f32;
-                    if (mode <= 1.5) {
-                        fogFactor = 1.0 - exp(-density * depth);
-                    } else if (mode <= 2.5) {
-                        let d = density * depth;
-                        fogFactor = 1.0 - exp(-d * d);
-                    } else {
-                        let f = (end - depth) / max(end - start, 0.0001);
-                        fogFactor = 1.0 - clamp(f, 0.0, 1.0);
-                    }
-                    out.fogFactor = clamp(fogFactor, 0.0, 1.0);
-                } else {
-                    out.fogFactor = 0.0;
-                }
+                // Fog: mode encoding + formula live in ffp-fog.ts, shared with the D3D9 FFP.
+                // D3DRENDERSTATE_RANGEFOGENABLE (=48) is NOT D3D9-only — it exists identically
+                // from D3D3 through D3D9 (Wine d3dtypes.h/d3d9types.h agree) — so a range-fog
+                // mode (9..11) is a real value ffpFogFactor can receive here. The eyeDistance
+                // argument computes the genuine Euclidean eye-space distance rather than
+                // repeating clip W, so the formula is correct whenever that mode is selected.
+                // Reaching mode 9..11 still needs ddraw-backend-executor.ts's resolveFfpFogMode
+                // call to pass rangeFog=true from D3DRENDERSTATE_RANGEFOGENABLE — outside this
+                // file — so today mode never selects the range branch; this is the shader-side
+                // half of that fix, not a claim the state is wired end-to-end yet.
+                let eyeDistance = length(tcCamPos);
+                out.fogFactor = ffpFogFactor(uniforms.fogParams.w, uniforms.fogParams.x,
+                    uniforms.fogParams.y, uniforms.fogParams.z,
+                    out.position.z, out.position.w, vSpecular.a, eyeDistance);
 
                 // FFP user clip planes. D3D fixed-function evaluates the plane equations in
                 // WORLD space: DXVK's d3d9_fixed_function_vert.vert emitVsClipping() computes
@@ -554,7 +624,7 @@ export function generateShaderCode(config: ShaderConfig): string {
                 // for pre-transformed (XYZRHW) draws — those have no meaningful world transform.
                 var cpaClip = vec4f(1.0, 1.0, 1.0, 1.0);
                 var cpbClip = vec2f(1.0, 1.0);
-                if (uniforms.clipPlaneEnable != 0u && uniforms.isRHW == 0u) {
+                if (uniforms.clipPlaneEnable != 0u && (uniforms.isRHW & 1u) == 0u) {
                     let worldPos = uniforms.world * vec4f(pos.xyz, 1.0);
                     cpaClip = vec4f(
                         dot(worldPos, ffpClipPlanes.planes[0]),
@@ -592,7 +662,6 @@ export function generateShaderCode(config: ShaderConfig): string {
                 var diffuse = in.color;
                 var currentColor = diffuse.rgb;
                 var currentAlpha = diffuse.a;
-                let factorAlpha = uniforms.textureFactor.a;
 
                 ${emitStageCascade(config, "uniforms")}
 
@@ -629,8 +698,17 @@ export function generateShaderCode(config: ShaderConfig): string {
         : "";
 
     const fogBlock = `
+                // Table fog is PIXEL fog: evaluate it from the interpolated depth (DXVK FragCoord.z /
+                // FragCoord.w, as the D3D9 FFP does). A per-vertex factor is clamped before
+                // interpolation, which is wrong across a primitive that spans FOGSTART..FOGEND.
+                var fogFactor = in.fogFactor;
+                if (uniforms.fogParams.w >= 1.0 && uniforms.fogParams.w < 4.0) {
+                    let fragDepth = in.position.z / in.position.w;
+                    fogFactor = ffpFogFactor(uniforms.fogParams.w, uniforms.fogParams.x, uniforms.fogParams.y, uniforms.fogParams.z,
+                        fragDepth, fragDepth, in.specular.a, fragDepth);
+                }
                 if (uniforms.fogParams.w > 0.0) {
-                    finalColor = vec4f(mix(finalColor.rgb, uniforms.fogColor.rgb, in.fogFactor), finalColor.a);
+                    finalColor = vec4f(mix(finalColor.rgb, uniforms.fogColor.rgb, fogFactor), finalColor.a);
                 }`;
     const fragmentShader = `
             @fragment
@@ -643,6 +721,7 @@ export function generateShaderCode(config: ShaderConfig): string {
                 // from leaking into intermediate render targets.
                 finalColor = vec4f(finalColor.rgb, 1.0);
                 ` : ''}
+                ${generateDebugViewOverride(debugFlags)}
                 return finalColor;
             }`;
 
@@ -688,7 +767,7 @@ ${fragmentShader}`;
  *  112..128  fogColor: vec4f
  *  128..144  fogParams: vec4f (start, end, density, mode)
  *  144..160  viewport: vec4f (width, height, minZ, maxZ)
- *  160..176  misc: vec4u (alphaRef255, isRHW, lightingEnabled, colorKeyEnabled)
+ *  160..176  misc: vec4u (alphaRef255, rhwFlags, lightingEnabled, colorKeyEnabled)
  *  176..192  misc2: vec4u (premultiplyOutput, alphaTestEnabled, alphaFunc, specularEnable)
  *  192..320  stages: array<vec4u, MAX_FFP_STAGES>
  *  320..384  world: mat4x4<f32>
@@ -768,22 +847,18 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 out.drawIndex = drawId;
 
                 // Apply UV flip if needed
-                var adjustedUV = selectTexCoord(draw.stages[0].z, uv, uv1, uv2);
-                ${needsUVFlip ? 'adjustedUV.y = 1.0 - adjustedUV.y;' : ''}
+                let adjustedUVRaw = selectTexCoord(draw.stages[0].z, uv, uv1, uv2);
+                let adjustedUV = ${needsUVFlip ? 'vec2f(adjustedUVRaw.x, 1.0 - adjustedUVRaw.y)' : 'adjustedUVRaw'};
 
-                if (draw.misc.y != 0u) { // isRHW
+                if ((draw.misc.y & 1u) != 0u) { // isRHW
                     out.position = pos;
+                    if ((draw.misc.y & 2u) != 0u) {
+                        ${RHW_DEPTH_CLAMP_WGSL}
+                    }
                 } else {
                     out.position = draw.mvp * vec4f(pos.xyz, 1.0);
                     // Z remap
-                    let minZ = draw.viewport.z;
-                    let maxZ = draw.viewport.w;
-                    ${debugFlags.forceZMidpoint
-                        ? 'out.position.z = 0.5 * out.position.w;'
-                        : `let z_ndc = out.position.z / out.position.w;
-                    let z_ndc2 = z_ndc * (maxZ - minZ) + minZ;
-                    out.position.z = z_ndc2 * out.position.w;`
-                    }
+                    ${generateZBlock(debugFlags.forceZMidpoint, "draw.viewport.z", "draw.viewport.w")}
                 }
 
                 // Swizzle BGRA -> RGBA
@@ -794,7 +869,7 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 // source-selected diffuse alpha (matDiffuse.a for MATERIAL, vDiffuse.a
                 // for COLOR1). Summing alphas across emissive/ambient/lights produces
                 // 2×matAlpha and saturates fades to opaque past 0.5.
-                if (draw.misc.z != 0u && draw.misc.y == 0u) { // lightingEnabled && !isRHW
+                if (draw.misc.z != 0u && (draw.misc.y & 1u) == 0u) { // lightingEnabled && !isRHW
                     let worldNorm = normalize((draw.world * vec4f(normal, 0.0)).xyz);
 
                     let emissiveColor = select(draw.matEmissive.rgb, vDiffuse.rgb, draw.matSrcs.w == 1u);
@@ -822,39 +897,14 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 out.uv3 = selectTexCoord(draw.stages[3].z, uv, uv1, uv2);
                 out.normal = normal;
 
-                // Fog calculation — mode encoding matches the legacy path:
-                // 0.5 = specular.a (pre-transformed), 1..3 = table fog over device z,
-                // 5..7 = T&L vertex fog over view-space depth (clip w).
-                var fogMode = draw.fogParams.w;
-                if (fogMode > 0.25 && fogMode < 0.75) {
-                    out.fogFactor = 1.0 - vSpecular.a;
-                } else if (fogMode >= 1.0) {
-                    var depth: f32;
-                    if (fogMode >= 4.5) {
-                        fogMode = fogMode - 4.0;
-                        depth = out.position.w;
-                    } else if (draw.misc.y != 0u) {
-                        depth = pos.z;
-                    } else {
-                        depth = clamp(out.position.z / out.position.w, 0.0, 1.0);
-                    }
-                    let start = draw.fogParams.x;
-                    let end = draw.fogParams.y;
-                    let density = draw.fogParams.z;
-                    var fogFactor: f32;
-                    if (fogMode <= 1.5) {
-                        fogFactor = 1.0 - exp(-density * depth);
-                    } else if (fogMode <= 2.5) {
-                        let d = density * depth;
-                        fogFactor = 1.0 - exp(-d * d);
-                    } else {
-                        let f = (end - depth) / max(end - start, 0.0001);
-                        fogFactor = 1.0 - clamp(f, 0.0, 1.0);
-                    }
-                    out.fogFactor = clamp(fogFactor, 0.0, 1.0);
-                } else {
-                    out.fogFactor = 0.0;
-                }
+                // eyeDistance repeats clip W here (unlike the legacy uniform path's vs_main,
+                // which computes a true Euclidean eyeDistance): DrawUniforms carries world
+                // and mvp but no separate view matrix to derive eye-space position from.
+                // D3DRENDERSTATE_RANGEFOGENABLE is real (see the legacy path's comment) —
+                // this is a MegaBatch data-layout gap, not evidence the state doesn't exist.
+                out.fogFactor = ffpFogFactor(draw.fogParams.w, draw.fogParams.x,
+                    draw.fogParams.y, draw.fogParams.z,
+                    out.position.z, out.position.w, vSpecular.a, out.position.w);
 
                 return out;
             }`;
@@ -868,7 +918,6 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 var diffuse = in.color;
                 var currentColor = diffuse.rgb;
                 var currentAlpha = diffuse.a;
-                let factorAlpha = draw.textureFactor.a;
 
                 ${emitStageCascade(config, "draw")}
 
@@ -923,8 +972,17 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 }
 
                 // Fog
+                // Table fog is PIXEL fog: evaluate it from the interpolated depth (DXVK FragCoord.z /
+                // FragCoord.w, as the D3D9 FFP does). A per-vertex factor is clamped before
+                // interpolation, which is wrong across a primitive that spans FOGSTART..FOGEND.
+                var fogFactor = in.fogFactor;
+                if (draw.fogParams.w >= 1.0 && draw.fogParams.w < 4.0) {
+                    let fragDepth = in.position.z / in.position.w;
+                    fogFactor = ffpFogFactor(draw.fogParams.w, draw.fogParams.x, draw.fogParams.y, draw.fogParams.z,
+                        fragDepth, fragDepth, in.specular.a, fragDepth);
+                }
                 if (draw.fogParams.w > 0.0) {
-                    finalColor = vec4f(mix(finalColor.rgb, draw.fogColor.rgb, in.fogFactor), finalColor.a);
+                    finalColor = vec4f(mix(finalColor.rgb, draw.fogColor.rgb, fogFactor), finalColor.a);
                 }
 
                 ${!shouldEnableBlending ? `
@@ -933,6 +991,7 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                 // intermediate render targets or causing compositing artifacts.
                 finalColor = vec4f(finalColor.rgb, 1.0);
                 ` : ''}
+                ${generateDebugViewOverride(debugFlags)}
 
                 return finalColor;
             }`;

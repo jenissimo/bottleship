@@ -38,6 +38,7 @@ const makeFunc = (
 
 ): FunctionDescriptor => ({
 
+    ...overrides,
     name,
 
     params: overrides.params ?? buildParams(argCount),
@@ -62,7 +63,9 @@ const imageListFuncs = [
 
     makeFunc("ImageList_Add", 3),
 
-    makeFunc("ImageList_AddIcon", 3),
+    // A MACRO over ImageList_ReplaceIcon(himl, -1, hicon) in the SDK, but a real
+    // 2-argument stdcall export in the DLL: declaring 3 makes the stub RET 12.
+    makeFunc("ImageList_AddIcon", 2),
 
     makeFunc("ImageList_AddMasked", 3),
 
@@ -172,6 +175,10 @@ export const comctl32Module: ModuleDescriptor = {
 
         // Property Sheet
         makeFunc("PropertySheetA", 1),
+        makeFunc("PropertySheetW", 1),
+        // The sheet frame's DLGPROC. Not a real comctl32 export — it exists so the
+        // thunk generator hands out a code address for DWLP_DLGPROC (see propsheet.ts).
+        makeFunc("PropertySheetDlgProc", 4),
         makeFunc("CreatePropertySheetPageA", 1),
         makeFunc("CreatePropertySheetPageW", 1),
         makeFunc("DestroyPropertySheetPage", 1),

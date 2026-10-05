@@ -4,6 +4,11 @@
  * a new library directory sufficient — no manual import list anywhere (same
  * pattern as api-registry.ts's *.api.ts glob).
  *
+ * Adding a directory while `bun run dev` is ALREADY running needs this file touched (or
+ * the server restarted): the glob is expanded at transform time and the cached result
+ * does not know about a directory that did not exist when it was produced. A page reload
+ * is not enough, and the symptom is a descriptor that simply never detects.
+ *
  * The call MUST stay a literal `import.meta.glob(...)` — Vite transforms it at
  * compile time only in that exact form (assigning it to a variable defeats the
  * transform). Under bun test `import.meta.glob` is undefined and the call

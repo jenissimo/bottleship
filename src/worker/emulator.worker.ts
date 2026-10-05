@@ -1,10 +1,48 @@
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
-import { System } from "./core/system";
+import { System, type GuestImagePatch } from "./core/system";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot } from "./core/child-process";
+import { createChildVfsClient } from "./core/child-vfs";
+import type { RegistryMutation } from "./runtime/filesystem/registry";
+import { ChildSessionTransport } from './core/child-session';
+import { ChildFrameClock } from './core/child-frame-clock';
+
+let childBoot: ChildBoot | null = null;
+let childSessionTransport: ChildSessionTransport | null = null;
+/** Owner writes that reached this child before its store was restored. */
+const pendingRegistryDown: RegistryMutation[] = [];
+let childRegistryReady = false;
+let childFrameClock: ChildFrameClock | null = null;
+let childImageReady: Promise<void> | null = null;
+let resolveChildImageReady: (() => void) | null = null;
+const postToParent = (self as unknown as Worker).postMessage.bind(self);
+self.postMessage = ((message: any, options?: Transferable[] | StructuredSerializeOptions) => {
+  if (childSessionTransport) childSessionTransport.post(message, Array.isArray(options) ? options : options?.transfer);
+  else postToParent(message, options as Transferable[]);
+}) as typeof self.postMessage;
+setChildSessionPublisher((port, record) => {
+  System.getInstance().inputManager.setInputBuffer(null);
+  (self as unknown as Worker).postMessage({ type: 'child_session', port, imagePath: record.imagePath, record }, [port]);
+}, () => System.getInstance().releaseChildSessionBroker());
+setChildBootContext(() => ({
+  config: EmulatorConfig.getInstance().snapshotForChild(),
+  registry: System.getInstance().registry.serialize(),
+  namedObjects: namedObjects.snapshot(),
+}));
+setChildRegistrySink((mutation, childId) => System.getInstance().registry.applyMutation(mutation, { from: 'child', id: childId }));
+(globalThis as Record<string, unknown>).__childProcesses = childProcessHistory;
+
+// Which guest thread is driving a given VFS read — the shared-cursor question can only
+// be answered where every file API converges, not at one API's fast path.
+(globalThis as unknown as { __curTid?: () => number }).__curTid = () => {
+    try { return System.getInstance().scheduler.getCurrentThread()?.id ?? -1; } catch { return -1; }
+};
 import { APIRegistry } from "./core/api-registry";
 import { memoryWatch } from "./core/memory/memory-watch";
+import { memWriteTrap } from "./core/memory/mem-write-trap";
 import { Kernel32 } from "./modules/kernel32";
+import { adoptNamedObjects, namedObjects, type NamedObjectSpec } from "./modules/kernel32/named-objects";
 import { User32 } from "./modules/user32";
 import { GDI32 } from "./modules/gdi32";
 import { D3D9 } from "./modules/d3d9";
@@ -14,19 +52,25 @@ import { DSound } from "./modules/dsound";
 import { WinMM } from "./modules/winmm";
 import { Ole32 } from "./modules/ole32";
 import { Oleaut32 } from "./modules/oleaut32";
+import { Oledlg } from "./modules/oledlg";
 import { DDraw } from "./modules/ddraw";
-import { shouldSuppress3DGdiOverlay } from "./modules/ddraw/gdi-visibility";
-import { hasLiveDialogOverlay, getLiveDialogOverlayRects } from "./modules/user32/dialog-overlay";
+import { getOverlayCompositePlan } from "./modules/user32/dialog-overlay";
+import { dropVideoPlaneDirty, getVideoPlanePlan, isVideoPlaneDirty, notifyVideoPlaneComposited } from "./video/video-plane-policy";
+import { getVirtualScreenRect } from "./modules/user32/shared-state";
+import { setPresentRectListener } from "./backends/webgpu/shared/present-geometry";
+import { flushHeldWindowDCs } from "./modules/user32/window";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
 import { MSS32 } from "./modules/mss32";
 import { SmackW32 } from "./modules/smackw32";
 import { BinkW32 } from "./modules/binkw32";
+import { Lgvid } from "./modules/lgvid";
 import { Glide2x } from "./modules/glide2x";
 import { OpenGL32 } from "./modules/opengl32";
 import { Glu32 } from "./modules/glu32";
 import { Wsock32 } from "./modules/wsock32";
 import { Shell32 } from "./modules/shell32";
+import { Shfolder } from "./modules/shfolder";
 import { Shlwapi } from "./modules/shlwapi";
 import { Comdlg32 } from "./modules/comdlg32";
 import { Comctl32 } from "./modules/comctl32";
@@ -34,12 +78,14 @@ import { Version } from "./modules/version";
 import { W32skrnl } from "./modules/w32skrnl";
 import { Msvcrt } from "./modules/msvcrt";
 import { Msvcp90 } from "./modules/msvcp90";
+import { Msvcp140 } from "./modules/msvcp140";
 import { Msvcp60 } from "./modules/msvcp60";
 import { Crtdll } from "./modules/crtdll";
 import { Winspool } from "./modules/winspool";
 import { Dwmapi } from "./modules/dwmapi";
 import { Riched32 } from "./modules/riched32";
 import { Wtsapi32 } from "./modules/wtsapi32";
+import { Msacm32 } from "./modules/msacm32";
 import { Imm32 } from "./modules/imm32";
 import { Msimg32 } from "./modules/msimg32";
 import { Uxtheme } from "./modules/uxtheme";
@@ -50,6 +96,11 @@ import { Psapi } from "./modules/psapi";
 import { Iphlpapi } from "./modules/iphlpapi";
 import { Tapi32 } from "./modules/tapi32";
 import { Setupapi } from "./modules/setupapi";
+import { Hid } from "./modules/hid";
+import { Combase } from "./modules/combase";
+import { Shcore } from "./modules/shcore";
+import { Kernelbase } from "./modules/kernelbase";
+import { XInput1_3 } from "./modules/xinput1_3";
 import { Netapi32 } from "./modules/netapi32";
 import { ImageHlp } from "./modules/imagehlp";
 import { DbgHelp } from "./modules/dbghelp";
@@ -61,6 +112,7 @@ import { D3D8 } from "./modules/d3d8";
 import { D3dx9 } from "./modules/d3dx9";
 import { OpenAL, ALUT } from "./modules/openal/openal";
 import { Quartz } from "./modules/quartz";
+import { DMusic } from "./modules/dmusic";
 import { A3d } from "./modules/a3d";
 import { Avifil32 } from "./modules/avifil32";
 import { Rpcrt4 } from "./modules/rpcrt4";
@@ -75,32 +127,38 @@ import {
   EMU_AUDIO_SAMPLE_UPDATE_INTERVAL_MS,
   EMU_NATIVE_VIDEO_DLLS
 } from "./core/cpu/emulator-config";
-import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
+import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbManifest, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
 import { WgbCache } from "./runtime/filesystem/wgb-cache";
-import { detectFormat, sniffBlobHead } from "@bottleship/repack/detect";
-import { installerBytesToWgb } from "@bottleship/repack/installer-to-wgb";
-import { guessCacheKey } from "@bottleship/repack/manifest-synth";
-import { BufferSource, InnoFormatError, parseInnoHeader, MultiSliceReader, parseSliceFile, type SliceData } from "@bottleship/formats/inno";
+import { detectSourceFormat, sniffBlobHead } from "@bottleship/repack/detect";
+import { blobRandomAccess } from "./runtime/filesystem/installer-opfs";
+import { InnoFormatError } from "@bottleship/formats/inno";
 import { SyncHttpRangeSource } from "@bottleship/formats/zip";
 import { SabIoSource } from "./runtime/filesystem/sab-io-source";
-import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { RegistryPersistence } from "./runtime/filesystem/registry-persistence";
 import { resolveGameId, gameIdToContainerDir } from "@bottleship/formats/wgb/container-id";
+import { aotCache } from "./core/cpu/aot-cache";
 import { PathPolicy } from "./runtime/filesystem/path-policy";
-import { detectUe1, detectUe2PcPackages, pinUeEngineIni, UE1_RENDER_DEVICE as UE1_RENDER_DEVICE_NAME } from "./runtime/filesystem/ue1-firstrun";
 import { buildStagedBundle, inspectBundle, finalizeBundle, readStagedEntry, type BuildSource, type FinalizeDestination } from "./runtime/filesystem/wgb-build";
 import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
 import { Logger, LogLevel, LogCategory } from "./core/logger";
+import { createTickYield } from "./core/host-task";
+import { recordGpuError, resetGpuErrors } from "./core/gpu-error-log";
+import { resetDeviceLossContract } from "./core/gpu/gpu-device-loss-contract";
+import { createStreamingWasmLoader } from "./core/wasm-loader";
 import { WebGPUBackend } from "./backends/webgpu/webgpu-backend";
 import { profiler } from "./core/profiler";
 import { frameProfiler } from "./core/frame-profiler";
 import { frameVarianceDiagnostics } from "./core/frame-variance-diagnostics";
 import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
+import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged } from "./backends/webgpu/shared/quality-capabilities";
+import type { QualityConfig } from "./core/quality-config";
 import { videoEngine } from "../video/video-engine";
 import { preemptionManager } from "./core/cpu/preemption-manager";
+import { writeGuestCode } from "./core/memory/guest-code";
 import { statsOverlay } from "./core/stats-overlay";
+import { workerTime } from "./core/worker-time-accounting";
 import { hypercallDataManager } from "./core/cpu/hypercall-data";
 import { d3d9WasmArena } from "./backends/webgpu/d3d9/d3d9-wasm-arena";
 import { bootMark, dumpBootTimeline } from "./core/boot-timer";
@@ -111,12 +169,15 @@ import { hookRegistry } from "./core/hooks";
 import { Galaxy } from "./modules/galaxy";
 import { registerFastPathMessageFunctions } from "./modules/user32/message";
 import { registerFastPathFileIOFunctions } from "./modules/kernel32/file-io";
+import { registerFastPathSyncFunctions } from "./modules/kernel32/sync";
+import { registerFastPathTimeFunctions } from "./modules/kernel32/time/time";
 import { registerFastPathLocaleFunctions } from "./modules/kernel32/locale";
-import { registerFastPathHeapFunctions, allocateHeapSlab, resetHeapSlab } from "./modules/kernel32/memory";
+import { registerFastPathHeapFunctions, registerFastPathVirtualQuery, allocateHeapSlab, resetHeapSlab } from "./modules/kernel32/memory";
 import { registerFastPathMsvcrtFunctions } from "./modules/msvcrt";
 import { registerFastPathPointerFunctions } from "./modules/kernel32/exception";
 import { registerFastPathProcessFunctions } from "./modules/kernel32/process/process";
 import { prePopulateGetProcAddressCache, registerFastPathModuleFunctions, ensureGetProcAddressDynamicExports } from "./modules/kernel32/module/module";
+import { loadedHleModules, materializedHleModules, materializeHleModuleImages } from "./core/hle-module-images";
 import { KERNEL32_VISTA_WARMUP_EXPORTS } from "./api/kernel32-vista-supplement";
 // Load diagnostics commands (exposes frameDiagnostics to console)
 import "./core/diagnostics-commands";
@@ -125,6 +186,7 @@ import { debugSession } from "./core/debug/debug-session";
 import { harnessService } from "./harness/service";
 import { HARNESS_RPC, HARNESS_CANCEL } from "./harness/rpc";
 import "./harness/commands"; // side-effect: register all harness commands
+import { noteAppliedWorkerFlag } from "./harness/cmds/dbg";
 // onmessage handler families (static imports — worker bundled with inlineDynamicImports).
 import { handleAudioBridgeMessage } from "./worker-handlers/audio-bridge";
 import { handleLoggingMessage } from "./worker-handlers/logging";
@@ -235,19 +297,81 @@ const state: WorkerState = {
 };
 
 let placeholderActive = true;
+/**
+ * HLE-readiness gate. STRUCTURAL startup invariant: no guest instruction may execute
+ * before the HLE modules are registered in the dispatcher.
+ *
+ * `system.process` exists from the moment the Process is constructed, but module
+ * registration happens later — and `await backend.initialize(canvas)` sits in between. A
+ * bundle load that landed inside that await window started the guest against an EMPTY
+ * dispatch table, so every import returned ERROR_NOT_SUPPORTED (50); a DllMain that
+ * called the result as a function pointer then jumped to 0x32 and the process died with
+ * a wild EIP nowhere near the cause. Timing-dependent, so it reproduced roughly never
+ * and then killed a user's session once.
+ *
+ * Gating on `system.process` alone cannot express this; a promise the load paths await
+ * can, and the dispatcher asserts the same invariant from the other side
+ * (markHleRegistrationComplete) so a future reordering fails loudly instead of silently.
+ */
+let resolveHleReady: () => void = () => { /* replaced during init */ };
+let hleReady: Promise<void> = new Promise<void>((resolve) => { resolveHleReady = resolve; });
+/** True once HLE registration has completed for the current v86 instance. */
+let hleReadyResolved = false;
+
+/** Called after every dispatcher.registerModule — opens the gate. */
+const markHleReady = (): void => {
+  if (hleReadyResolved) return;
+  hleReadyResolved = true;
+  System.getInstance().process?.dispatcher?.markHleRegistrationComplete?.();
+  resolveHleReady();
+};
+
+/** Re-arm the gate when the emulator is torn down / restarted, so a load that arrives
+ *  during a rebuild waits for the NEW registration rather than the previous one. */
+const resetHleReady = (): void => {
+  hleReadyResolved = false;
+  hleReady = new Promise<void>((resolve) => { resolveHleReady = resolve; });
+};
+
 let pendingPeData: Uint8Array | null = null;
 let pendingBundle: { data?: Uint8Array; url?: string; blob?: Blob } | null = null;
 let heartbeatInterval: number | null = null;
 let schedulerInterval: number | null = null;
 let registryFlushInterval: number | null = null;
 let gdiPresentRafId: number | null = null;
+let gdiPresentKickPending = false;
 let gdiPresentDiagLogged = false;
+/** Guest present serial seen at the previous animation frame — see the repaint gate in
+ *  gdiPresentOnce. -1 means "no frame observed yet", which forces the first repaint. */
+let gdiLastGuestPresentSerial = -1;
 let isPaused = false;
 let _prefetchController: AbortController | null = null;
 /** Serializes load_bundle so a new game always waits for the previous switch teardown. */
 let loadBundleChain: Promise<void> = Promise.resolve();
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
+/** The payload that booted the current game — replayed verbatim by a self re-exec. */
+let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean } | null = null;
+/** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
+let pendingReExecArgs: string | null = null;
+/** Harness boot-args override (load_bundle `args`): replaces the manifest's args for one
+ *  load, so a diagnostic run can start at the scene instead of clicking through a menu. */
+let bootArgsOverride: string | null = null;
+/** VFS path of the image the next boot must run instead of the manifest's `entrypoint`
+ *  (a launcher starting the game — see requestSelfReExec). */
+let pendingReExecImage: string | null = null;
+/** Bytes a launcher wrote into the child it created suspended, replayed after the PE loads. */
+let pendingReExecPatches: GuestImagePatch[] | null = null;
+/** Named kernel objects the launcher held open when it started the game — see adoptNamedObjects. */
+let pendingInheritedObjects: NamedObjectSpec[] | null = null;
+/** How long a re-exec waits for the VFS to become durable before restarting regardless. */
+const REEXEC_FLUSH_BUDGET_MS = 3000;
+/** Restart requests seen in THIS worker session, newest last — see requestSelfReExec. */
+const reExecRequests: Array<{ n: number; image: string; commandLine: string; patches: number; caller: string[] }> = [];
+let reExecRequestCount = 0;
+// Parked on globalThis rather than exported: the harness cmd modules must not import the
+// worker ENTRY (a cycle), and this is the same channel __bsExecBoot already uses.
+(globalThis as Record<string, unknown>).__bsReExecRequests = reExecRequests;
 let registrySaveTimeout: number | null = null;
 let registrySaveGeneration = 0;
 /** do_tick liveness counter — incremented in the tick_hooks_before guard every v86 do_tick().
@@ -256,6 +380,15 @@ let registrySaveGeneration = 0;
 let tickBeforeCount = 0;
 /** Count of cycle-budget self-heals (RUNNING thread found with cycle_limit===0 and re-armed). */
 let tickHealCount = 0;
+// Dead-tick-loop watchdog state (see the scheduler interval): the window is in scheduler
+// intervals, long enough that a normal tick boundary never trips it.
+let lastLoopTick = -1;
+let lastLoopInsn = -1;
+let loopStallTicks = 0;
+let lastMainLoopDelay = -1;
+/** When that delay was observed, so the watchdog can tell "still asleep" from "stale". */
+let lastMainLoopDelayAtMs = 0;
+const DEAD_TICK_LOOP_TICKS = 64;
 
 // (Adaptive scheduler state removed — tick-boundary preemption handles context switching)
 
@@ -291,18 +424,23 @@ function installRegistryAutosave(gameId: string): void {
 }
 
 /**
+ * The GDI/window plane is a GUEST-space image, exactly like a DDraw primary surface: every
+ * paint into it uses raw guest screen coordinates. So it is sized by the guest DESKTOP mode
+ * and only ever re-sized when THAT changes, never by the host canvas.
+ */
+const syncOverlayToGuestScreen = () => {
+  const r = getVirtualScreenRect();
+  const w = Math.max(1, Math.round(r.right - r.left));
+  const h = Math.max(1, Math.round(r.bottom - r.top));
+  System.getInstance().gdiContext.resizeOverlay(w, h);
+};
+
+/**
  * GDI presentation loop - composites overlay to screen when dirty
  */
-const gdiPresentLoop = () => {
-  if (isPaused) {
-    gdiPresentRafId = null;
-    return;
-  }
-
+const gdiPresentOnce = () => {
   const system = System.getInstance();
   const gdi = system.gdiContext;
-  const videoOverlay = system.videoRouting.getOverlayService();
-
   // Composite GDI/video overlay to screen.
   // When a 3D renderer (OpenGL/Glide/D3D) is active, only composite if GDI
   // overlay has new content — this handles games that use GDI for video
@@ -310,39 +448,87 @@ const gdiPresentLoop = () => {
   const renderActive = system.services.render.getActive();
   const backend = system.services.render.getBackend();
   if (backend) {
-    const videoCanvas = videoOverlay.hasContent() ? videoOverlay.getCanvas() : null;
+    // The video plane's own single policy — see video/video-plane-policy.ts. Asked ONCE per
+    // composite so both branches below act on the same verdict.
+    const videoPlan = getVideoPlanePlan();
+
+    // This rAF loop is one of several GDI-over-frame compositors (alongside the DDraw
+    // presenter's drawFrame/2D/phase-blend paths and the D3D8/D3D9/Glide present paths).
+    // It applies the SAME single policy — getOverlayCompositePlan — so it can never
+    // diverge from them. When the game owns the screen (DDraw exclusive fullscreen OR a
+    // hardware-3D renderer presenting), GDI window output is NOT visible on real Windows,
+    // so plan.mode is 'none' (nothing) or 'rects' (only live modal dialogs); never the
+    // whole overlay. Without this, the loop would blit stale GDI over the game — e.g. WA
+    // renders its frontend via DDraw sprites, and its full-screen MFC host dialog's gray
+    // WM_ERASEBKGND would otherwise be composited over every frame.
+    const plan = getOverlayCompositePlan(renderActive);
+
+    // Held window DCs publish here, not on ReleaseDC: a software renderer that keeps its
+    // GetDC for the process lifetime never releases it, and on real GDI its BitBlt is on
+    // screen the moment it is drawn. Coalesced to one blit per composite, and only while
+    // GDI owns the screen — under any other plan that output is not visible on Windows
+    // either, so publishing it would just leak the game's window into the dialog rects.
+    if (plan.mode === 'full') flushHeldWindowDCs();
     const gdiDirty = gdi.isOverlayDirty();
 
-    // When a hardware 3D renderer owns exclusive fullscreen, GDI/video overlays are
-    // not visible — do not composite them over the 3D frame. Re-present the last 3D
-    // frame at display rate so the canvas does not go black between low-fps presents.
-    const ddrawCtx = (system.process?.getModule("ddraw") as any)?.context;
-    const screen3DOwned = shouldSuppress3DGdiOverlay(renderActive, ddrawCtx);
-
-    if (screen3DOwned) {
-      // Drop stale dirty flags so they don't accumulate and so a later composite
-      // (e.g. after returning to the launcher) starts clean. Then re-present the last
-      // 3D frame so the canvas keeps showing it at the display rate (the renderer
-      // presents at ~8-12fps and the WebGPU canvas otherwise goes black between
-      // presents). Nothing overlays the 3D frame in this mode — EXCEPT live native
-      // dialogs shown while the flip chain owns the screen (dialog-overlay.ts):
-      // their rects composite on top, exactly like the DDraw presenter path.
+    if (plan.mode !== 'full') {
+      // Game owns the screen. Drop stale dirty flags so a later composite (e.g. after
+      // returning to the launcher) starts clean, then keep the canvas showing the last
+      // frame at display rate (a 3D renderer presents at ~8-12fps and the WebGPU canvas
+      // otherwise goes black between presents; the DDraw presenter lacks repaintLastFrame
+      // and re-presents each Flip, so this is a no-op there). The only GDI that overlays
+      // the frame here is live modal dialog rects (plan.mode === 'rects').
       if (gdiDirty) gdi.clearOverlayDirty();
-      if (videoOverlay.isDirty()) videoOverlay.consumeDirty();
-      (renderActive as { repaintLastFrame?(): void }).repaintLastFrame?.();
-      if (backend.compositeRects && hasLiveDialogOverlay()) {
-        const overlayCanvas = gdi.getOverlayCanvas();
-        const rects = overlayCanvas ? getLiveDialogOverlayRects() : [];
-        if (overlayCanvas && rects.length) backend.compositeRects(overlayCanvas, rects);
+      if (isVideoPlaneDirty()) dropVideoPlaneDirty();
+
+      // Repaint only when the canvas would otherwise not hold a current frame. A repaint is
+      // a full canvas presentation, and two presentations per refresh on one swap chain
+      // serialize: a guest presenting AT display rate loses frames to its own repaint. The
+      // sparse-presenter case this loop exists for is untouched — that serial is unchanged
+      // on nearly every animation frame. Video and dialog rects force it regardless: both
+      // draw onto a fresh, blank swap texture and need the frame under them restored first.
+      const videoWillComposite = videoPlan.onScreen;
+      const rectsWillComposite = plan.mode === 'rects' && !!backend.compositeRects;
+      const guestPresentSerial = system.services.render.getGuestPresentSerial();
+      const guestPresentedSinceLastFrame = guestPresentSerial !== gdiLastGuestPresentSerial;
+      gdiLastGuestPresentSerial = guestPresentSerial;
+      if (videoWillComposite || rectsWillComposite || !guestPresentedSinceLastFrame) {
+        (renderActive as { repaintLastFrame?(): void } | null)?.repaintLastFrame?.();
       }
-      gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
+
+      // The video plane is NOT GDI window output, so the overlay plan does not govern it.
+      // A fullscreen movie is on screen on real Windows whether or not a 3D device exists,
+      // and while it plays the guest sits in its playback loop presenting nothing — so the
+      // paths that normally composite it never run. Re-composited every frame, not only when
+      // dirty: repaintLastFrame above would otherwise flip the screen back to the last game
+      // frame on the animation frames a 15 fps movie does not update.
+      if (videoWillComposite) {
+        backend.composite(videoPlan.canvas!, false);
+        notifyVideoPlaneComposited(videoPlan);
+        system.services.render.notifyPresent("video");
+      }
+
+      if (rectsWillComposite) {
+        const overlayCanvas = gdi.getOverlayCanvas();
+        if (overlayCanvas) backend.compositeRects!(overlayCanvas, plan.rects);
+      }
       return;
+    }
+
+    // GDI owns the screen: nothing else presents, so the guest DESKTOP MODE is what tells the
+    // compositors (and the host's pointer mapping) where the guest picture lands. Read from
+    // the same authority the plane itself is sized by — the plane's own dimensions are frozen
+    // for the duration of a held paint bracket and would answer for the previous mode.
+    if (backend.publishGuestPresentRect) {
+      const vs = getVirtualScreenRect();
+      backend.publishGuestPresentRect(
+        Math.max(1, Math.round(vs.right - vs.left)), Math.max(1, Math.round(vs.bottom - vs.top)));
     }
 
     // Include dirty clears (hasOverlayContent=false after clearOverlay) so the GPU
     // canvas is actually cleared instead of staying stale/black.
     const gdiCanvas = (gdi.hasOverlayContent() || gdiDirty) ? gdi.getOverlayCanvas() : null;
-    const videoDirty = videoOverlay.isDirty();
+    const videoDirty = isVideoPlaneDirty();
 
     // One-shot diagnostic for GDI present loop
     if (!gdiPresentDiagLogged && (gdiDirty || (gdiCanvas !== null))) {
@@ -360,9 +546,9 @@ const gdiPresentLoop = () => {
     if (shouldComposite) {
       let composedAny = false;
 
-      if (videoCanvas && (videoDirty || gdiDirty)) {
-        backend.composite(videoCanvas, shouldClear);
-        videoOverlay.consumeDirty();
+      if (videoPlan.onScreen && (videoDirty || gdiDirty)) {
+        backend.composite(videoPlan.canvas!, shouldClear);
+        notifyVideoPlaneComposited(videoPlan);
         composedAny = true;
       }
 
@@ -380,7 +566,44 @@ const gdiPresentLoop = () => {
     }
   }
 
+};
+
+/**
+ * The rAF chain. The re-arm below is the only thing keeping this loop alive, so a throw
+ * escaping gdiPresentOnce would freeze the screen for the rest of the session. A skipped
+ * frame is recoverable; a dead loop is not.
+ */
+const gdiPresentLoop = () => {
+  if (isPaused) {
+    gdiPresentRafId = null;
+    return;
+  }
+
+  try {
+    workerTime.measure("present", gdiPresentOnce);
+  } catch (e) {
+    recordGpuError("throw", "gdiPresentLoop", String(e));
+    Logger.error(LogCategory.SYSTEM, `[GDI-PRESENT] present loop threw — frame skipped: ${e}`);
+  }
+
   gdiPresentRafId = requestAnimationFrame(gdiPresentLoop);
+};
+
+/**
+ * A busy guest can publish GDI between worker animation frames. Queue a macrotask
+ * kick so a dirty overlay cannot wait indefinitely for a throttled/lost rAF. The
+ * old request is cancelled before the normal recurring loop is restarted.
+ */
+const kickGdiPresentLoop = () => {
+  if (isPaused || gdiPresentKickPending) return;
+  gdiPresentKickPending = true;
+  setTimeout(() => {
+    gdiPresentKickPending = false;
+    if (isPaused) return;
+    if (gdiPresentRafId !== null) cancelAnimationFrame(gdiPresentRafId);
+    gdiPresentRafId = null;
+    gdiPresentLoop();
+  }, 0);
 };
 
 /**
@@ -766,6 +989,46 @@ const startScheduler = (v86: any) => {
     // sound loop after a sibling thread exited). A RUNNING current thread with cycle_limit===0
     // is ALWAYS wrong (0 is valid only while the current thread is WAITING/async-parked), so
     // re-arm the budget and kick. Runs every ~1ms → near-instant recovery; no false positives.
+    // Dead-tick-loop self-heal. The two kicks above cover "v86 stopped" (is_running() false)
+    // and "budget stuck at 0". A third state exists and the watchdog already names it
+    // (tickDelta≈0): do_tick stopped rescheduling next_tick while is_running() stays true and
+    // the budget is healthy — the guest then retires NOTHING while the worker keeps servicing
+    // timers, so nothing here notices. Kick run() (idempotent, and it reschedules next_tick)
+    // once tick_counter AND instruction_counter have both stood still across the window while
+    // a thread is RUNNING; either counter moving resets it, so this cannot fire on a guest
+    // that is merely slow.
+    if (!system.scheduler.intentionalYield) {
+      const v86c = system.process.v86 as any;
+      const inner = v86c?.v86 ?? v86c;
+      const cpuC = v86c?.cpu ?? inner?.cpu;
+      const tickNow = (inner?.tick_counter ?? 0) >>> 0;
+      const insnNow = (cpuC?.instruction_counter?.[0] ?? 0) >>> 0;
+      const cur = system.scheduler.getCurrentThread?.();
+      if (tickNow !== lastLoopTick || insnNow !== lastLoopInsn) {
+        lastLoopTick = tickNow; lastLoopInsn = insnNow; loopStallTicks = 0;
+      } else if (cur && cur.state === ThreadState.RUNNING && (v86c?.is_running?.() ?? false)
+        // next_tick(t) parks the loop for t ms ON PURPOSE. Until that sleep is due, a
+        // frozen tick/instruction counter is the guest idling, not a lost callback —
+        // healing it converts an idle guest into a busy DEAD_TICK_LOOP_TICKS kick loop.
+        && !(lastMainLoopDelay > 0 && (performance.now() - lastMainLoopDelayAtMs) < lastMainLoopDelay)) {
+        if (++loopStallTicks >= DEAD_TICK_LOOP_TICKS) {
+          loopStallTicks = 0;
+          tickHealCount++;
+          const dispHeal = system.process.dispatcher as unknown as
+            { hasPendingAsyncRestores?: () => boolean } | undefined;
+          Logger.warn(LogCategory.SYSTEM,
+            `[TICK-LOOP HEAL] do_tick stopped while is_running() stayed true ` +
+            `(tick=${tickNow}, insn=${insnNow}, T${cur.id} RUNNING, eip=0x${((cpuC?.instruction_pointer?.[0] ?? 0) >>> 0).toString(16)}) ` +
+            `mainLoopDelay=${lastMainLoopDelay} runnable=${system.scheduler.hasRunnableThread()} ` +
+            `runningWork=${system.scheduler.hasRunningThread((cpuC?.instruction_pointer?.[0] ?? 0) >>> 0)} ` +
+            `pendingAsync=${dispHeal?.hasPendingAsyncRestores?.() ?? "n/a"} — restarting v86`);
+          v86c?.run?.();
+        }
+      } else {
+        loopStallTicks = 0;
+      }
+    }
+
     if (!system.scheduler.intentionalYield && preemptionManager.isInitialized()) {
       const cur = system.scheduler.getCurrentThread?.();
       if (cur && cur.state === ThreadState.RUNNING && preemptionManager.getCycleLimit() === 0) {
@@ -816,18 +1079,43 @@ const drawPlaceholder = () => {
   requestAnimationFrame(drawPlaceholder);
 };
 
-const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
+/** How a PE load ended. "failed" means the process is already torn down and reported —
+ *  the caller's boot sequence (progress "done", first-present arm, prefetch) must NOT run,
+ *  or the host is told the load succeeded and keeps its launch overlay up over the crash. */
+type PeLoadResult = "ok" | "queued" | "failed";
+
+const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promise<PeLoadResult> => {
   const system = System.getInstance();
   if (!system.process) {
     Logger.log(LogCategory.SYSTEM, "System not ready, queuing PE data");
     pendingPeData = peData;
-    return;
+    return "queued";
   }
+  // The Process exists but the dispatch table may still be empty (see hleReady).
+  await hleReady;
 
   // Reset system state before loading new application
   if (!skipReset) {
     await prepareFullGameSwitch();
   }
+
+  // Let every HLE module settle what depends on WHICH build of its DLL the bundle ships,
+  // before ANY stub for it exists: a stub's RET N is emitted into guest code, and the
+  // synthetic images published below already carry those bytes, so an answer that arrives
+  // later cannot reach a stub the guest holds. One module failing must not stop the load.
+  for (const module of system.process.modules.values()) {
+    if (!module?.prepareForBundle) continue;
+    try {
+      await module.prepareForBundle();
+    } catch (e) {
+      Logger.warn(LogCategory.SYSTEM, `prepareForBundle failed for module ${module.name}: ${e}`);
+    }
+  }
+
+  // Imports mark HLE modules as loaded while loadExecutable walks the import table.
+  // Publish the synthetic images first so those marks have process-local slots to target.
+  materializeHleModuleImages(system.process);
+  system.process.dispatcher.applyPendingRegistrations();
 
   // Restart placeholder drawing
   placeholderActive = true;
@@ -841,6 +1129,37 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
 
     // Update PEB ImageBaseAddress now that we know the actual EXE base
     system.scheduler?.tebManager.updatePebImageBase(module.baseAddress);
+
+    // Replay what the launcher wrote into this image while it was a suspended child. For
+    // the encrypt-on-disk launchers those bytes ARE the decrypted code, so this has to run
+    // after the image is mapped and before the first guest instruction. Addresses came from
+    // the launcher's view of the child at its preferred base; anything outside the image we
+    // actually mapped would be a relocation we cannot reproduce, so it is refused, loudly.
+    if (pendingReExecPatches?.length) {
+      const mem8 = system.process.getCurrentMemory();
+      const imageEnd = (module.baseAddress + module.size) >>> 0;
+      let applied = 0;
+      let skipped = 0;
+      for (const patch of pendingReExecPatches) {
+        const addr = patch.address >>> 0;
+        const binary = atob(patch.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i) & 0xff;
+        if (addr < module.baseAddress || addr + bytes.length > imageEnd) {
+          Logger.error(LogCategory.SYSTEM,
+            `[ReExec] patch 0x${addr.toString(16)}+${bytes.length} falls outside the mapped image ` +
+            `[0x${module.baseAddress.toString(16)}..0x${imageEnd.toString(16)}) — NOT applied`);
+          skipped++;
+          continue;
+        }
+        writeGuestCode(mem8, bytes, addr);
+        applied += bytes.length;
+      }
+      Logger.warn(LogCategory.SYSTEM,
+        `[ReExec] replayed launcher writes into the child image: ${applied} byte(s) in ` +
+        `${pendingReExecPatches.length - skipped} run(s)${skipped ? `, ${skipped} refused` : ""}`);
+      pendingReExecPatches = null;
+    }
 
     // Extract app icon from PE resources and send to host page for favicon
     try {
@@ -862,6 +1181,44 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     // JS implementations to stubs now that they exist.
     // (this also registers matching functions with hypercallDataManager)
     system.process.dispatcher.applyPendingRegistrations();
+    // Before the cache: it keys on the HMODULE, and the HMODULE is the image's base.
+    materializeHleModuleImages(system.process);
+    // The images allocate a fresh stub per declared export, so the pass above left them
+    // with no handler attached — a second pass binds them before anything can hand one out.
+    system.process.dispatcher.applyPendingRegistrations();
+    {
+      const nativeModules = system.process.moduleRegistry.getAllModules().map((m: any) => ({
+        name: m.isExecutable ? `${m.name}.exe` : `${m.name}.dll`, path: m.path,
+        base: m.baseAddress, size: m.size,
+        entryPoint: m.entryPoint ? (m.baseAddress + m.entryPoint) >>> 0 : 0,
+      }));
+      const hleModules = loadedHleModules().map(m => ({
+        name: m.name === 'kernel32' ? 'KERNEL32.DLL' : `${m.name}.dll`,
+        path: `C:\\Windows\\System32\\${m.name}.dll`,
+        base: m.base, size: m.size, entryPoint: 0,
+      }));
+      // ntdll is mapped by the OS bootstrap, not by the executable import table.
+      // Native startup code nevertheless finds it first in InInitializationOrder.
+      if (!hleModules.some(m => m.name.toLowerCase() === 'ntdll.dll')) {
+        const ntdll = materializedHleModules().find(m => m.name === 'ntdll');
+        if (ntdll) hleModules.push({
+          name: 'ntdll.dll', path: 'C:\\Windows\\System32\\ntdll.dll',
+          base: ntdll.base, size: ntdll.size, entryPoint: 0,
+        });
+      }
+      const allModules = [...nativeModules, ...hleModules];
+      const take = (predicate: (m: typeof allModules[number]) => boolean) => {
+        const i = allModules.findIndex(predicate);
+        return i >= 0 ? allModules.splice(i, 1)[0] : undefined;
+      };
+      const loaderOrder = [
+        take(m => m.name.toLowerCase().endsWith('.exe')),
+        take(m => m.name.toLowerCase() === 'ntdll.dll'),
+        take(m => m.name.toLowerCase() === 'kernel32.dll'),
+        ...allModules,
+      ].filter((m): m is typeof allModules[number] => !!m);
+      system.scheduler?.tebManager.syncLoaderData(loaderOrder);
+    }
     prePopulateGetProcAddressCache(system.process.dispatcher);
     ensureGetProcAddressDynamicExports(system.process.dispatcher, [
       { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -907,8 +1264,13 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     const mem8 = system.process.v86.mem8 || (system.process.v86.v86 && system.process.v86.v86.cpu.mem8);
 
     if (!cpu || !mem8) {
-      Logger.error(LogCategory.SYSTEM, "Could not find CPU or memory for bootloader setup");
-      return;
+      // Fatal and unrecoverable: route it through the single crash funnel like every
+      // other fatal class, or the host waits forever on a load that already died.
+      system.reportGuestCrash({
+        reason: "PE load failed: could not find CPU or memory for bootloader setup",
+        eip: 0, threadId: null,
+      });
+      return "failed";
     }
 
     // Create the bootloader that will switch to protected mode and jump to PE entry
@@ -918,6 +1280,8 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     // stacks (e.g., UT's recursive UObject deserialization during level loading).
     const peStackReserve = module.sizeOfStackReserve || 0;
     const mainStackSize = Math.max(peStackReserve, 0x100000); // At least 1MB
+    // Every CreateThread reserves the same, since dwStackSize only names the initial commit.
+    system.scheduler?.setImageStackReserve(mainStackSize);
     let stackPointer: number;
     if (system.process?.memory) {
       const stackBase = system.process.memory.alloc(mainStackSize, 'HEAP');
@@ -932,7 +1296,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     const { code: bootCode, loadAddress, startAddress } = createBootloader(module.entryPoint, stackPointer, pendingDllInits);
 
     // Write bootloader at 0x7C00 (includes code + boot sig + GDT at 0x7E00)
-    mem8.set(bootCode, loadAddress);
+    writeGuestCode(mem8, bootCode, loadAddress);
     Logger.log(LogCategory.SYSTEM, `Bootloader+GDT written at 0x${loadAddress.toString(16)}, size: ${bootCode.length}`);
 
     // Initialize page tables in guest memory (identity-mapped).
@@ -971,6 +1335,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     resumeEmulator();
     framePacer.start();
     gameSessionActive = true;
+    return "ok";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     Logger.error(LogCategory.SYSTEM, `PE load failed: ${message}`);
@@ -978,6 +1343,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false) => {
     // "game crashed" dialog with a copyable report (e.g. a missing HLE API
     // discovered while generating import thunks), instead of a silent worker log.
     system.reportGuestCrash({ reason: `PE load failed: ${message}`, eip: 0, threadId: null });
+    return "failed";
   }
 };
 
@@ -1053,57 +1419,6 @@ const applyManifestWriteFiles = async (): Promise<void> => {
   }
 };
 
-// Generic Unreal Engine 1 first-run setup. Detects a UE1 bundle (System/Core+Engine
-// packages) and, if so, sets the ue1 flag and pins our D3D render device in
-// System/Default.ini so any config the engine derives from it inherits D3DDrv
-// instead of falling back to a software/null device. The reactive Detected.ini /
-// config-ini materialization (kernel32 CreateFile*) also gates on this flag.
-// Non-UE1 games: detectUe1() returns false → this is a complete no-op.
-const pinGuestEngineIni = async (
-  vfs: ReturnType<typeof System.getInstance>["fileSystem"],
-  iniPath: string,
-  hasPcPackages: boolean,
-): Promise<void> => {
-  if (vfs.getFileSize(iniPath) <= 0) return;
-  try {
-    const handle = await vfs.open(iniPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
-    if (!handle) return;
-    const size = vfs.getFileSize(iniPath);
-    const bytes = size > 0 ? await vfs.read(handle, size) : new Uint8Array(0);
-    const text = new TextDecoder("utf-8").decode(bytes);
-    const pinned = pinUeEngineIni(text, { hasPcPackages });
-    if (pinned !== text) {
-      await writeVfsOverride(iniPath, new TextEncoder().encode(pinned));
-      Logger.log(LogCategory.SYSTEM, `UE1: pinned engine defaults in ${iniPath} (render=${UE1_RENDER_DEVICE_NAME})`);
-    } else {
-      Logger.log(LogCategory.SYSTEM, `UE1: ${iniPath} already has engine defaults`);
-    }
-  } catch (err) {
-    Logger.warn(LogCategory.SYSTEM, `UE1: failed to pin engine defaults in ${iniPath}: ${err}`);
-  }
-};
-
-const applyUe1FirstRunSetup = async (entrypointPath?: string): Promise<void> => {
-  const config = EmulatorConfig.getInstance();
-  const vfs = System.getInstance().fileSystem;
-  const exists = (guestPath: string): boolean => vfs.getFileSize(guestPath) > 0;
-  config.ue1 = detectUe1(exists);
-  if (!config.ue1) return;
-  Logger.log(LogCategory.SYSTEM, "UE1: detected Unreal Engine 1 bundle — enabling generic first-run handler");
-
-  const hasPcPackages = detectUe2PcPackages(exists);
-  // Pin D3D render device + UE2 WinDrv ForceFeedbackManager in factory and active configs.
-  const iniPaths = ["C:\\System\\Default.ini"];
-  if (entrypointPath) {
-    const exeName = entrypointPath.split(/[\\/]/).pop() ?? "";
-    const gameIni = exeName.replace(/\.[^.]+$/i, "");
-    if (gameIni) iniPaths.push(`C:\\System\\${gameIni}.ini`);
-  }
-  for (const iniPath of iniPaths) {
-    await pinGuestEngineIni(vfs, iniPath, hasPcPackages);
-  }
-};
-
 /** Recursively merge `src` into `target` (plain objects merged, everything else replaced). */
 const deepMergeInto = (target: Record<string, unknown>, src: Record<string, unknown>): void => {
   for (const k of Object.keys(src)) {
@@ -1117,42 +1432,26 @@ const deepMergeInto = (target: Record<string, unknown>, src: Record<string, unkn
   }
 };
 
-/** slice.cpp slice_filename — external slice file name for a given slice index. */
-const sliceFilename = (base: string, slice: number, slicesPerDisk: number): string => {
-  if (slicesPerDisk <= 1) return `${base}-${slice + 1}.bin`;
-  const major = Math.floor(slice / slicesPerDisk) + 1;
-  const minor = slice % slicesPerDisk;
-  return `${base}-${major}${String.fromCharCode(97 + minor)}.bin`;
-};
+async function importInstallerBundle(source: BuildSource) {
+  const staged = await buildStagedBundle(source, (phase, percent, label) => {
+    self.postMessage({ type: "loading_progress", phase, percent, label });
+  });
+  const result = await finalizeBundle({ stagedPath: staged.stagedPath, manifest: staged.manifest, destination: "library",
+    onProgress: (percent, label) => self.postMessage({ type: "loading_progress", phase: "packing", percent, label }) });
+  const cached = await WgbCache.openSyncSourceForUrl("/apps/byo/" + result.cacheKey);
+  if (!cached) throw new Error("Could not open imported game from browser storage");
+  return WgbLoader.fromSource(cached);
+}
 
-/** Natural slice ordinal from a `-<major>[<letter>].bin` suffix (fallback ordering). */
-const sliceOrdinal = (name: string): number => {
-  const m = name.toLowerCase().match(/-(\d+)([a-z])?\.bin$/);
-  if (!m) return 0;
-  return parseInt(m[1]!, 10) * 100 + (m[2] ? m[2].charCodeAt(0) - 97 : 0);
-};
-
-/** Order dropped `.bin` slices by slice index: try the Inno naming scheme, else natural sort. */
-const orderSliceFiles = (bins: File[], base: string, slicesPerDisk: number): File[] => {
-  const byName = new Map(bins.map((f) => [f.name.toLowerCase(), f]));
-  const ordered: File[] = [];
-  for (let i = 0; i < bins.length; i++) {
-    const f = byName.get(sliceFilename(base, i, slicesPerDisk).toLowerCase());
-    if (!f) { ordered.length = 0; break; }
-    ordered.push(f);
-  }
-  if (ordered.length === bins.length) return ordered;
-  return [...bins].sort((a, b) => sliceOrdinal(a.name) - sliceOrdinal(b.name));
-};
-
-/**
- * Authoritative teardown before loading a new game while another is (or was) running.
- * Pauses the guest loop first so the 1ms scheduler cannot restart v86 mid-reset.
- */
+/** Pause the scheduler before replacing guest state. */
 const prepareFullGameSwitch = async (): Promise<void> => {
+  stopChildProcesses();
   if (gameSessionActive) {
     Logger.log(LogCategory.SYSTEM, "[GameSwitch] full reset before loading new game");
   }
+  __wasmTrapReported = false;
+  gdiPresentDiagLogged = false;
+  gdiLastGuestPresentSerial = -1;
   _prefetchController?.abort();
   _prefetchController = null;
   WgbCache.releaseMountedSource();
@@ -1178,18 +1477,44 @@ const prepareFullGameSwitch = async (): Promise<void> => {
 
   resetHeapSlab();
   await system.reset();
+  if (state.inputBuffer) system.connectInput(state.inputBuffer);
   gameSessionActive = false;
   bootMark("system-reset-done");
 };
 
-const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[] }) => {
+/**
+ * The single host-facing "what bundle is this" post. Both load paths (load_bundle and
+ * the pendingBundle path inside initV86) go through here — the host keys per-game touch
+ * layouts on `gameId` and reads the authored `emulator.touch` tier from this message, so
+ * a site that posts one field and not the other silently substitutes auto-detect for an
+ * authored layout on that path.
+ */
+const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
+  const title = typeof manifest.title === "string" ? manifest.title.trim() : "";
+  const name = typeof manifest.name === "string" ? manifest.name.trim() : "";
+  self.postMessage({
+    type: "bundle_meta",
+    name: title || name,
+    gameId,
+    touch: manifest.emulator?.touch ?? null,
+  });
+};
+
+const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
   const system = System.getInstance();
   if (!system.process) {
     pendingBundle = payload;
     return;
   }
+  // The Process exists but the dispatch table may still be empty (see hleReady).
+  await hleReady;
 
   bootMark("load-bundle-start");
+  // Scope the GPU-error census to this run, so report().gpuErrors answers "this game",
+  // not "everything since the worker started".
+  resetGpuErrors();
+  // A previous run's lost devices/surfaces are not this run's state.
+  resetDeviceLossContract();
 
   await prepareFullGameSwitch();
 
@@ -1217,7 +1542,14 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // Pages sets COOP/COEP; the dev server too) and a Range-honoring origin (the R2
       // Pages Function serves 206). create() probes both, so any failure throws and we
       // fall through to the OPFS-download/staging path below, unchanged.
-      const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true;
+      // `preload` (catalog entry) opts a deployment out of on-demand streaming: one
+      // sequential download into OPFS beats hundreds of range round-trips wherever
+      // per-request latency is the cost (self-hosted stand behind a reverse proxy).
+      // `__noSabIo` forces the OPFS-staged path so the streaming transport can be A/B'd
+      // against a local synchronous pread — the ceiling for any transport change.
+      const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
+        && payload.preload !== true
+        && (globalThis as Record<string, unknown>).__noSabIo !== true;
       if (streamCapable) {
         try {
           // Preferred: serve the guest's synchronous reads from a dedicated I/O
@@ -1306,6 +1638,17 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // (Content-Range 0-EOF → the EOCD tail read lands on the file START).
       const loadFromRam = async () => {
         if (!downloadedBuffer) downloadedBuffer = await downloadToRam();
+        // Last resort, so this is where a URL that never served a bundle finally has to
+        // say so. A dev server answers a missing .wgb with 200 + its index page, and every
+        // layer downstream then reports the same useless "EOCD not found" — name the URL
+        // and what actually came back instead.
+        if (sniffBlobHead(downloadedBuffer) !== "wgb") {
+          const preview = new TextDecoder("utf-8", { fatal: false })
+            .decode(downloadedBuffer.subarray(0, 80)).replace(/\s+/g, " ").trim();
+          throw new Error(
+            `${url} did not return a WGB bundle — got ${downloadedBuffer.byteLength} bytes ` +
+            `starting with "${preview}". Check the bundle path.`);
+        }
         Logger.warn(LogCategory.SYSTEM, `WGB: loading from the in-RAM download (${(downloadedBuffer.byteLength / 1048576).toFixed(1)} MB) — OPFS cache unusable`);
         return WgbLoader.fromBuffer(downloadedBuffer);
       };
@@ -1322,59 +1665,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       }
       } // end if (!bundle) — dev sync-stream did not already produce a bundle
     } else if (payload.blobs && payload.blobs.length) {
-      // Multi-part installer: setup.exe (header + file list) + external setup-*.bin data slices.
-      const all = payload.blobs;
-      const bins = all.filter((f) => f.name.toLowerCase().endsWith(".bin"));
-      const exe = all.find((f) => !f.name.toLowerCase().endsWith(".bin"));
-      if (!exe) throw new Error("multi-part install: no setup.exe among the dropped files");
-      if (!bins.length) throw new Error("multi-part install: no setup-*.bin data slices dropped");
-
-      self.postMessage({ type: "loading_progress", phase: "loading", percent: 0, label: "Reading installer" });
-      const data = new Uint8Array(await exe.arrayBuffer());
-      const kind = detectFormat(data);
-      if (kind !== "inno") {
-        const msg = kind === "inno-unsupported"
-          ? "This Inno Setup version is not supported"
-          : "Dropped files aren't a supported multi-part GOG installer";
-        self.postMessage({ type: "installer_unsupported", message: msg });
-        throw new Error(msg);
-      }
-
-      const wasmResp = await fetch("/unpack-streaming.wasm");
-      const wasmBytes = await wasmResp.arrayBuffer();
-      const lzma = new UnpackDecoder();
-      await lzma.init(wasmBytes);
-      const parsed = await parseInnoHeader(new BufferSource(data), lzma);
-
-      const slicesPerDisk = Math.max(1, parsed.header.slicesPerDisk || 1);
-      const base = exe.name.replace(/\.exe$/i, "");
-      const ordered = orderSliceFiles(bins, base, slicesPerDisk);
-      const sliceData: SliceData[] = [];
-      for (const f of ordered) {
-        sliceData.push(parseSliceFile(new Uint8Array(await f.arrayBuffer())));
-      }
-
-      const cacheKey = guessCacheKey(parsed);
-      const cached = await WgbCache.getByKey(cacheKey);
-      if (cached) {
-        Logger.log(LogCategory.SYSTEM, `GOG import (multi-part): cache hit ${cacheKey}`);
-        self.postMessage({ type: "install_progress", phase: "starting", doneBytes: cached.byteLength, totalBytes: cached.byteLength });
-        bundle = await WgbLoader.fromBuffer(cached);
-      } else {
-        let installProgressLast = 0;
-        const result = await installerBytesToWgb(data, wasmBytes, {
-          parsed,
-          sliceSource: new MultiSliceReader(sliceData),
-          onProgress: (p) => {
-            const now = performance.now();
-            if (now - installProgressLast < 100) return;
-            installProgressLast = now;
-            self.postMessage({ type: "install_progress", phase: p.phase, doneBytes: p.doneBytes, totalBytes: p.totalBytes });
-          },
-        });
-        await WgbCache.put(result.cacheKey ?? cacheKey, result.wgb);
-        bundle = await WgbLoader.fromBuffer(result.wgb);
-      }
+      bundle = await importInstallerBundle({ blobs: payload.blobs });
     } else if (payload.blob) {
       const head = new Uint8Array(await payload.blob.slice(0, 64).arrayBuffer());
       const headKind = sniffBlobHead(head);
@@ -1395,11 +1686,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         self.postMessage({ type: "installer_unsupported", message: msg });
         throw new Error(msg);
       } else {
-        const data = new Uint8Array(await payload.blob.arrayBuffer());
-        const kind = detectFormat(data);
+        const kind = detectSourceFormat(blobRandomAccess(payload.blob));
 
         if (kind === "pe") {
-          await loadPeData(data);
+          await loadPeData(new Uint8Array(await payload.blob.arrayBuffer()));
           return;
         }
         if (kind === "unknown" || kind === "inno-unsupported") {
@@ -1410,40 +1700,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
           throw new Error(msg);
         }
         if (kind === "inno") {
-          let installProgressLast = 0;
-          const wasmResp = await fetch("/unpack-streaming.wasm");
-          const wasmBytes = await wasmResp.arrayBuffer();
-
-          const lzma = new UnpackDecoder();
-          await lzma.init(wasmBytes);
-          const parsed = await parseInnoHeader(new BufferSource(data), lzma);
-          const cacheKey = guessCacheKey(parsed);
-
-          const cached = await WgbCache.getByKey(cacheKey);
-          let wgbBuffer: Uint8Array;
-          if (cached) {
-            Logger.log(LogCategory.SYSTEM, `GOG import: cache hit ${cacheKey}`);
-            self.postMessage({ type: "install_progress", phase: "starting", doneBytes: cached.byteLength, totalBytes: cached.byteLength });
-            wgbBuffer = cached;
-          } else {
-            const result = await installerBytesToWgb(data, wasmBytes, {
-              parsed,
-              onProgress: (p) => {
-                const now = performance.now();
-                if (now - installProgressLast < 100) return;
-                installProgressLast = now;
-                self.postMessage({
-                  type: "install_progress",
-                  phase: p.phase,
-                  doneBytes: p.doneBytes,
-                  totalBytes: p.totalBytes,
-                });
-              },
-            });
-            wgbBuffer = result.wgb;
-            await WgbCache.put(result.cacheKey ?? cacheKey, wgbBuffer);
-          }
-          bundle = await WgbLoader.fromBuffer(wgbBuffer);
+          bundle = await importInstallerBundle({ blob: payload.blob });
         } else {
           bundle = await WgbLoader.fromBlob(payload.blob, onCacheProgress);
         }
@@ -1482,16 +1739,11 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     Logger.log(LogCategory.SYSTEM, `WGB: gameId="${gameId}" container="${gameIdToContainerDir(gameId)}"`);
     // Host overlay/title: surface the manifest display name as soon as we know it
     // (covers ?game=dev&load=… where the shell would otherwise keep saying "Dev").
-    {
-      const title = typeof bundle.manifest.title === "string" ? bundle.manifest.title.trim() : "";
-      const name = typeof bundle.manifest.name === "string" ? bundle.manifest.name.trim() : "";
-      const displayName = title || name;
-      if (displayName) {
-        self.postMessage({ type: "bundle_meta", name: displayName, gameId });
-      }
-    }
+    postBundleMeta(bundle.manifest, gameId);
     await system.fileSystem.initOverlay(gameId);
     await system.fileSystem.ensureOverlayIndex();
+    // Filled after manifest config is applied; AOT versioning depends on CPU flags.
+    let aotPrepared: Promise<{ loaded: number; key: string } | { error: string; key?: string }> | null = null;
     // Install the per-game persist/ephemeral policy (#12): ephemeral writes stay in memory, never OPFS.
     system.fileSystem.setPathPolicy(new PathPolicy({
         ephemeral: bundle.manifest.emulator?.ephemeral,
@@ -1513,13 +1765,20 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // read these via GetPrivateProfileString / msvcrt fgetc, which can't await a
     // CachedSource fault-in (see VirtualFileSystem.romPinned). E.g. Morrowind
     // aborts with "Font 0 not found in Morrowind.ini" if its INI reads as empty.
+    //
+    // Only the entries that need it: one the archive can already range-read
+    // synchronously is sync-readable WITHOUT a RAM copy, and pinning it just moves the
+    // whole file up front — on Far Cry's thousands of text files that was most of the
+    // mount, paid before the CPU is allowed to run.
     {
         const configExts = new Set(['ini', 'cfg', 'conf', 'txt', 'cnt', 'inf', 'reg', 'lst']);
         const configRels: string[] = [];
         for (const [rel, entry] of romIndex) {
             if (entry.isDirectory) continue;
             const ext = rel.split('.').pop()?.toLowerCase() ?? '';
-            if (configExts.has(ext)) configRels.push(rel);
+            if (!configExts.has(ext)) continue;
+            if (bundle.archive.canRangeReadSync(entry)) continue;
+            configRels.push(rel);
         }
         if (configRels.length > 0) {
             await system.fileSystem.pinRomFiles(configRels, 8);
@@ -1534,10 +1793,22 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         const criticalRels: string[] = [];
         const seen = new Set<string>();
 
+        // The image class (DLL/EXE) is here for LATENCY BATCHING: the PE loader reads each
+        // import serially, so pulling them in one parallel burst removes a chain of cold
+        // round trips from the critical path — a win that has nothing to do with caching.
+        //
+        // The "any small file" clause was a romCache warm-up, and it rests on a premise
+        // that does not hold: an entry the archive can already range-read synchronously
+        // gains no capability from being copied into romCache, so the burst just moves
+        // the file for reads the game may never make. Keep the ones that genuinely
+        // cannot be served synchronously.
+        const smallCap = (globalThis as Record<string, unknown>).__legacyRomPrefetch1 === true ? 256 * 1024 : 0;
         for (const [rel, entry] of romIndex) {
             if (entry.isDirectory) continue;
             const ext = rel.split('.').pop()?.toLowerCase() ?? '';
-            if (criticalExts.has(ext) || entry.uncompressedSize < 256 * 1024) {
+            const small = entry.uncompressedSize < smallCap
+                || (entry.uncompressedSize < 256 * 1024 && !bundle.archive.canRangeReadSync(entry));
+            if (criticalExts.has(ext) || small) {
                 if (!seen.has(rel)) { seen.add(rel); criticalRels.push(rel); }
             }
         }
@@ -1586,16 +1857,31 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         });
 
         // 3-second timeout — don't block startup on slow connections.
-        // In-flight requests continue in the background even after timeout.
-        await Promise.race([
-            system.fileSystem.prefetchRomFiles(criticalRels, 8, onPrefetchProgress),
-            new Promise<void>(r => setTimeout(r, 3000)),
-        ]);
+        _prefetchController?.abort();
+        const phase1Controller = new AbortController();
+        _prefetchController = phase1Controller;
+        let phase1Timeout: ReturnType<typeof setTimeout> | null = null;
+        try {
+            await Promise.race([
+                system.fileSystem.prefetchRomFiles(criticalRels, 8, onPrefetchProgress, phase1Controller.signal),
+                new Promise<void>(r => {
+                    phase1Timeout = setTimeout(() => {
+                        phase1Controller.abort();
+                        r();
+                    }, 3000);
+                }),
+            ]);
+        } finally {
+            if (phase1Timeout !== null) clearTimeout(phase1Timeout);
+            if (_prefetchController === phase1Controller) _prefetchController = null;
+        }
 
         Logger.log(LogCategory.SYSTEM, `WGB: phase1 done in ${(performance.now() - t1) | 0}ms`);
     }
     bootMark("prefetch-done");
 
+    // Video knobs come from the effective quality (user pref + manifest layer), read per frame.
+    videoEngine.setQualitySource(() => EmulatorConfig.getInstance().quality);
     if (!EmulatorConfig.getInstance().skipVideo) {
         void videoEngine.ensureLoaded().then(() => {
             Logger.log(LogCategory.SYSTEM, "[VideoEngine] preloaded at boot");
@@ -1650,6 +1936,17 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     const emulatorConfig = EmulatorConfig.getInstance();
     emulatorConfig.reset();
     emulatorConfig.applyFromManifest(bundle.manifest);
+    // The AOT cache key includes manifest-controlled CPU flags such as relaxed FPU,
+    // so prepare only after the current bundle config has been applied.
+    //
+    // The gate is "this game HAS saved units", not "a debug flag is set". A worker-local
+    // flag cannot survive the reload that starts the next session, so a recording made
+    // under one would have been loaded by nothing — the capture would look successful and
+    // never be used. `prepare` refuses on a version/engine mismatch anyway, so presence is
+    // the honest condition; `__aotNoAutoLoad` remains as the off switch for an A/B arm.
+    aotPrepared = (globalThis as Record<string, unknown>).__aotNoAutoLoad
+      ? null
+      : aotCache.prepare(gameId).catch((e) => ({ error: String(e) }));
 
     // Delete crash-sentinel and other stale files from CoW overlay before game starts
     if (emulatorConfig.deleteOnBoot.length > 0) {
@@ -1667,10 +1964,12 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
 
     // Generic UE1 first-run: detect engine + pin D3D render device in Default.ini.
     // After writeFiles so a manifest-shipped Default.ini override is the one we pin.
-    await applyUe1FirstRunSetup(bundle.manifest.entrypoint);
 
-    const { width, height } = emulatorConfig.screenResolution;
-    System.getInstance().requestHostResize(width, height);
+    // The boot publisher of the emulated display mode: until a game mode-sets, the bundle's
+    // declared resolution IS the desktop, and every SM_CXSCREEN/EnumDisplaySettings reader
+    // needs it. Without modeSet here emulatedDisplayMode stays null for the whole session.
+    const { width, height, bpp } = emulatorConfig.screenResolution;
+    System.getInstance().requestHostResize(width, height, { modeSet: true, bpp });
 
     // Update DDraw context display when module exists (e.g. preloaded)
     const ddraw = system.process?.getModule("ddraw") as { updateDisplayFromConfig?: () => void } | undefined;
@@ -1684,6 +1983,40 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         LogCategory.SYSTEM,
         `EmulatorConfig: RAM override specified in manifest (${(bundle.manifest.emulator.memory.ram / 1024 / 1024).toFixed(0)} MB) but v86 is already initialized. RAM can only be set at v86 initialization time.`
       );
+    }
+
+    // A launcher started another image from this bundle (requestSelfReExec with a VFS
+    // path): that image is the entry point for THIS boot. The VFS root is the bundle's
+    // romRoot, so the archive entry is romRoot + the path minus its drive.
+    if (pendingReExecImage) {
+      // A guest joining cwd + name yields doubled separators when cwd is a bare root
+      // ("C:\" + "\RF.exe"); the archive has no such entry, so normalize before lookup.
+      const rel = pendingReExecImage
+        .replace(/^[a-z]:/i, "").replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\//, "");
+      let candidate = romRoot ? `${romRoot.replace(/\/+$/, "")}/${rel}` : rel;
+      // Win32 paths are case-insensitive and a launcher spells its target however it
+      // likes ("war3demo.exe" for an archive entry named "War3Demo.exe"); the archive
+      // index is a case-SENSITIVE map, so match the entry the guest means.
+      if (!bundle.archive.getEntry(candidate)) {
+        const lower = candidate.toLowerCase();
+        const match = bundle.archive.listEntries().find((e) => e.name.toLowerCase() === lower);
+        if (match) candidate = match.name;
+      }
+      const found = !!bundle.archive.getEntry(candidate);
+      // Parked where a probe can read it: this decision is made during the load firehose,
+      // and log streaming does not survive the page reload that precedes it.
+      (globalThis as Record<string, unknown>).__bsExecBoot =
+        { image: pendingReExecImage, entry: candidate, romRoot, found };
+      if (found) {
+        Logger.log(LogCategory.SYSTEM,
+          `WGB: exec entrypoint "${bundle.manifest.entrypoint}" -> "${candidate}"`);
+        bundle.manifest.entrypoint = candidate;
+        bundle.entrypointBytes = await readEntrypointBytes(bundle.archive, candidate);
+      } else {
+        Logger.warn(LogCategory.SYSTEM,
+          `WGB: exec image "${pendingReExecImage}" (entry "${candidate}") not in the bundle — booting the manifest entrypoint`);
+      }
+      pendingReExecImage = null;
     }
 
     // Extract executable name and full VFS path from entrypoint
@@ -1703,19 +2036,76 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     }
     const executablePath = `C:\\${vfsRelPath}`;
 
+    // Re-installed per boot: system.reset() clears it, and a re-exec'd process must still
+    // be able to re-exec again (the front-end can be reached a second time).
+    system.onReExecRequest = requestSelfReExec;
     system.executableName = exeName;
     system.executablePath = executablePath;
-    system.executableArgs = bundle.manifest.args ?? "";
+    // A self re-exec supplies the command line the LAUNCHER chose; it outranks the
+    // manifest's boot args for exactly one boot, then the manifest applies again.
+    system.executableArgs = pendingReExecArgs ?? bootArgsOverride ?? bundle.manifest.args ?? "";
+    pendingReExecArgs = null;
+    bootArgsOverride = null;
+    // The launcher that started this image is, on real Windows, still running — republish the
+    // names it holds so the game's "was I started by the launcher?" check sees them.
+    if (pendingInheritedObjects?.length) {
+      const sched = system.scheduler;
+      const adopted = adoptNamedObjects(pendingInheritedObjects, {
+        event: (manualReset, initialState) => sched.createEvent(manualReset, initialState),
+        mutex: () => sched.createMutex(false),
+        semaphore: (initialCount, maximumCount) => sched.createSemaphore(initialCount, maximumCount),
+      });
+      Logger.log(LogCategory.SYSTEM,
+        `[ReExec] adopted ${adopted}/${pendingInheritedObjects.length} named object(s) from the launcher: ` +
+        pendingInheritedObjects.map((s) => `${s.kind}:${s.name}`).join(", "));
+      pendingInheritedObjects = null;
+    }
     const lastSlashIdx = executablePath.lastIndexOf("\\");
     const executableDir = lastSlashIdx > 2 ? executablePath.slice(0, lastSlashIdx + 1) : "C:\\";
-    system.fileSystem.setCurrentDirectory(executableDir);
+    system.fileSystem.setCurrentDirectory(EmulatorConfig.getInstance().workingDir || executableDir);
     Logger.log(LogCategory.SYSTEM, `Executable: name="${exeName}", path="${executablePath}", args="${system.executableArgs}"`);
 
-    await loadPeData(bundle.entrypointBytes, true);
+    // A failed load has already torn the process down and told the host (crash dialog).
+    // Everything below announces a SUCCESSFUL boot — the "done" progress post alone would
+    // put the launch overlay back over that dialog and read as a hang.
+    if (await loadPeData(bundle.entrypointBytes, true) === "failed") return;
     bootMark("pe-loaded");
+
+    // AOT units must be transaction-committed BEFORE the JIT claims their pages
+    // refuses a page the live JIT already owns (rc 2), and that is the whole ordering problem
+    // of the track. This is the earliest point where the image is in memory. Registration is
+    // gated on the per-page SHA-256, so a page that gets patched after this (hle-lib) simply
+    // fails the check and keeps the ordinary JIT path. Opt-in until measured.
+    //
+    // loadPeData has just called resumeEmulator(), and publishing awaits — so without the
+    // pause the 1 ms scheduler tick runs the guest through every await and the JIT takes
+    // pages out from under us (that is where the rc-2 refusals came from). v86.run() only
+    // schedules, so nothing has executed yet at this point in the microtask.
+    if (aotPrepared) {
+      try {
+        const t0 = performance.now();
+        pauseEmulator();
+        const loaded = await aotPrepared;
+        const replayed = "loaded" in loaded && loaded.loaded > 0 ? await aotCache.replay() : null;
+        const ms = (performance.now() - t0) | 0;
+        // Also parked where a probe can read it: this line is emitted during the load
+        // firehose and streaming does not reliably survive the reload that precedes it.
+        (globalThis as Record<string, unknown>).__aotBoot = { loaded, replayed, ms };
+        Logger.log(LogCategory.SYSTEM, `[AOT] boot: ${JSON.stringify(loaded)} ${JSON.stringify(replayed)} in ${ms}ms`);
+
+      } catch (e) {
+        Logger.warn(LogCategory.SYSTEM, `[AOT] boot load failed (falling back to JIT): ${e}`);
+      } finally {
+        resumeEmulator();
+      }
+    }
 
     // Signal host that loading is done and the game is starting
     self.postMessage({ type: "loading_progress", phase: "done", percent: 100, label: "" });
+    // A previous run's crash is not this run's state. Dropped HERE, not at load start:
+    // tearing the old process down runs its exit paths, and one of those re-arms the
+    // latch — so a clear taken any earlier is undone before the new guest exists.
+    harnessService.clearCrashLatch();
     // Arm the first-present hook HERE (not at load start): the host has just switched
     // the overlay to "booting", and the guest's first real composite happens strictly
     // after this point. This makes first_present arrive AFTER "done" so the one-shot
@@ -1739,16 +2129,129 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   }
 };
 
-const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[] }) => {
+const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
+  lastBundlePayload = payload;
   loadBundleChain = loadBundleChain
     .then(() => loadBundleImpl(payload))
     .catch(err => Logger.error(LogCategory.SYSTEM, `load_bundle failed: ${err}`));
   return loadBundleChain;
 };
 
+/**
+ * Restart the guest with a new command line — the single-process realization of a
+ * launcher re-execing its own image (System.isSelfImage / requestReExec).
+ *
+ * Replays the payload that booted this game, so the same bundle is remounted and the OPFS
+ * overlay (saves, configs) carries across exactly as it does for a real relaunch.
+ *
+ * Deferred to a MACROTASK, never started inline. The request arrives from inside the
+ * ShellExecute/CreateProcess thunk, and the teardown stops the very v86 instance that is
+ * mid-call: the scheduler then tries to save a main thread whose state is unsaveable and
+ * kills the process (fatal guard 0x4100). A host `load_bundle` message is itself a
+ * macrotask, so this is the same proven entry the normal path uses — by then the thunk has
+ * returned its SE_ERR_/PROCESS_INFORMATION value and the guest is at a clean boundary.
+ */
+const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]): boolean => {
+  // Every route that can restart the guest funnels through here, so this is where a
+  // request is recorded. A restart is a page reload, which wipes the log stream, the
+  // CDP session and every in-worker ring — so a re-exec LOOP erases its own evidence
+  // once per iteration. The ring is read live (harness `reExecs`); `__noReExec` refuses
+  // instead of restarting, which stops the loop on its first iteration and leaves the
+  // guest standing at the call for backtrace/report.
+  // Diagnostic only: a stack walk over a garbage ESP/EBP chain must not be able to turn the
+  // re-exec verdict into a thrown exception.
+  let bt: { frames?: Array<{ moduleName: string | null; moduleOffset: number; retAddr: number }> } | undefined;
+  try {
+    bt = System.getInstance().process?.dispatcher?.getGuestCallStack?.(undefined, 0x400, 12);
+  } catch { /* no backtrace for this request */ }
+  reExecRequests.push({
+    n: ++reExecRequestCount,
+    image: imagePath ?? "(self)",
+    commandLine,
+    patches: imagePatches?.length ?? 0,
+    caller: (bt?.frames ?? []).slice(0, 8).map((f) =>
+      f.moduleName ? `${f.moduleName}+0x${f.moduleOffset.toString(16)}` : `0x${f.retAddr.toString(16)}`),
+  });
+  if (reExecRequests.length > 32) reExecRequests.shift();
+  if ((globalThis as { __noReExec?: boolean }).__noReExec) {
+    Logger.warn(LogCategory.SYSTEM,
+      `[ReExec] REFUSED by __noReExec: image "${imagePath ?? "(self)"}" args "${commandLine}" ` +
+      `(request #${reExecRequestCount}) — the guest stays alive; read \`reExecs\` for the caller`);
+    return false;
+  }
+
+  // Returns whether the re-exec was ACCEPTED. A launcher that exits believing it started a
+  // child, when nothing was scheduled, is a silent vanish — shell32 reports our verdict.
+  if (!lastBundlePayload) {
+    Logger.warn(LogCategory.SYSTEM, `[ReExec] ignored "${commandLine}" — no bundle payload to replay`);
+    return false;
+  }
+  if (pendingReExecArgs !== null || pendingReExecImage !== null) return false; // already scheduled
+  if (imagePath && !/^[a-z]:\\/i.test(imagePath)) {
+    // Refuse rather than restart onto the CURRENT image: a launcher told "your child
+    // started" would exit, and the session would silently reboot into the launcher again.
+    Logger.warn(LogCategory.SYSTEM, `[ReExec] refused "${imagePath}" — not an absolute VFS path`);
+    return false;
+  }
+  pendingReExecArgs = commandLine;
+  pendingReExecImage = imagePath ?? null;
+  pendingReExecPatches = imagePatches?.length ? imagePatches : null;
+  // A launcher starting the GAME (a different image) is still running while the game boots
+  // on real Windows, so the names it holds open stay visible to the child. A SELF re-exec is
+  // the other pattern — the launcher hands its command line over and exits — so nothing of
+  // its namespace outlives it. Snapshot here: this is the CreateProcess call itself, the
+  // moment at which the parent provably still holds every handle it opened.
+  pendingInheritedObjects = imagePath ? namedObjects.snapshot() : null;
+  System.getInstance().isReExecPending = true;
+  const payload = lastBundlePayload;
+
+  // Ask the HOST to restart us by reloading the page. A re-exec has to land in a pristine
+  // process, and an in-worker teardown+reload is not that: the relaunched image boots into
+  // the heavy path (level load, DDraw device, tens of thousands of surfaces) over a worker
+  // that just hosted a full game, and wedges before its first present — while the very same
+  // command line on a cold boot runs. The host replies by reloading, which is the cold boot.
+  if (payload?.url) {
+    Logger.log(LogCategory.SYSTEM,
+      `[ReExec] requesting host page-reload restart, image "${pendingReExecImage ?? "(self)"}" args "${commandLine}"`);
+    // Drain the VFS FIRST. The reload is a teardown that drops buffered writes, and it is
+    // requested here — at CreateProcess — not at the launcher's ExitProcess, so the exit
+    // path's durability barrier never runs for it. A launcher's whole job is often to write
+    // something the game then reads (a detected-hardware profile, a settings file); handing
+    // the game a half-written file is worse than not writing it, because a short read looks
+    // like valid-but-empty data. Bounded: a stuck flush must not strand the restart.
+    const post = (): void => self.postMessage({
+      type: "reexec", args: commandLine, url: payload.url, image: pendingReExecImage,
+      patches: pendingReExecPatches, inherited: pendingInheritedObjects,
+    });
+    let posted = false;
+    const once = (): void => { if (!posted) { posted = true; post(); } };
+    const budget = setTimeout(() => {
+      Logger.warn(LogCategory.SYSTEM,
+        `[ReExec] flushAll did not drain within ${REEXEC_FLUSH_BUDGET_MS}ms — restarting anyway`);
+      once();
+    }, REEXEC_FLUSH_BUDGET_MS);
+    stopChildProcesses().then(() => System.getInstance().drainDurableState())
+      .catch((e) => Logger.warn(LogCategory.SYSTEM, `[ReExec] flushAll failed: ${e}`))
+      .then(() => { clearTimeout(budget); once(); });
+    return true;
+  }
+
+  // No URL to replay (a bundle handed over as a Blob by "Load File…") — a page reload could
+  // not find it again, so fall back to the in-worker restart. Deferred to a macrotask: the
+  // request comes from inside the ShellExecute/CreateProcess thunk, and tearing down the v86
+  // that is mid-call makes the scheduler kill an unsaveable main thread (fatal guard 0x4100).
+  Logger.log(LogCategory.SYSTEM,
+    `[ReExec] no replayable URL — in-worker restart with args "${commandLine}"`);
+  setTimeout(() => loadBundle(payload!), 0);
+  return true;
+};
+
 const initV86 = async (canvas: OffscreenCanvas) => {
+  // Arm the HLE gate for THIS emulator instance before anything can await it.
+  resetHleReady();
   // Try to apply RAM configuration from pending bundle if available
   let ramSize = EMU_MEMORY_SIZE;
+  if (childBoot?.config) ramSize = EmulatorConfig.getInstance().memory.ram;
   if (pendingBundle) {
     try {
       let bundle;
@@ -1769,18 +2272,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const emulatorConfig = EmulatorConfig.getInstance();
       emulatorConfig.reset();
       emulatorConfig.applyFromManifest(bundle.manifest);
-      {
-        const title = typeof bundle.manifest.title === "string" ? bundle.manifest.title.trim() : "";
-        const name = typeof bundle.manifest.name === "string" ? bundle.manifest.name.trim() : "";
-        const displayName = title || name;
-        if (displayName) {
-          self.postMessage({
-            type: "bundle_meta",
-            name: displayName,
-            gameId: resolveGameId(bundle.manifest),
-          });
-        }
-      }
+      postBundleMeta(bundle.manifest, resolveGameId(bundle.manifest));
       if (bundle.manifest.emulator?.memory?.ram !== undefined) {
         ramSize = emulatorConfig.memory.ram;
         Logger.log(
@@ -1794,13 +2286,44 @@ const initV86 = async (canvas: OffscreenCanvas) => {
     }
   }
 
+  // Streaming instantiation of the core module so V8's implicit wasm code cache can engage
+  // across cold starts (it is keyed by URL and only fires for the *Streaming entry points —
+  // v86's own loader uses the buffer form and therefore always recompiles). Falls back to the
+  // buffered path by itself, so this can never be load-bearing for correctness.
+  let wasmPath = import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm";
+  const labWasmPath = (globalThis as { __v86LabWasmPath?: string }).__v86LabWasmPath;
+  if (import.meta.env?.DEV && labWasmPath !== undefined) {
+    if (!/^\/apps\/source-pair-lab\/engines\/[a-f0-9]{64}\.wasm$/.test(labWasmPath)) {
+      throw new Error('Invalid content-addressed lab engine path');
+    }
+    wasmPath = labWasmPath;
+  }
+  const wasmLoader = createStreamingWasmLoader(wasmPath);
+  // Engine identity is what was actually INSTANTIATED, never what was asked for: a lab
+  // override that arrives after this point loads nothing and an A/B would compare a binary
+  // against itself while reporting two arms. Reported as a hash of the fetched bytes, and
+  // as an explicit failure when they could not be captured.
+  const engineLoad: {
+    requested: string; path: string; sha256: string | null; bytes: number | null; error: string | null;
+  } = { requested: labWasmPath ?? "/v86.wasm", path: wasmPath, sha256: null, bytes: null, error: null };
+  (globalThis as Record<string, unknown>).__v86EngineLoad = engineLoad;
+  void wasmLoader.sourceBytes.then(async (bytes) => {
+    if (!bytes) { engineLoad.error = "engine bytes not captured"; return; }
+    engineLoad.bytes = bytes.byteLength;
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    engineLoad.sha256 = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+  }).catch((e) => { engineLoad.error = String(e); });
+
   // v86 settings
   const settings = {
     canvas: canvas,
+    wasm_fn: wasmLoader.wasmFn,
     // DEV cache-bust: the worker's wasm fetch is NOT covered by a hard-reload's cache bypass,
     // so a rebuilt /v86.wasm would otherwise keep loading from the browser cache. Unique URL per
     // worker load forces a fresh fetch in dev. (Prod keeps the stable URL for HTTP caching.)
-    wasm_path: import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm",
+    // Kept for the fallback inside v86 (and any path that re-reads it); the actual fetch is
+    // performed by wasm_fn above.
+    wasm_path: wasmPath,
     memory_size: ramSize,
     vga_memory_size: EMU_VGA_MEMORY_SIZE,
     bios: { url: "/bios/seabios.bin" },
@@ -1812,6 +2335,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
   try {
     const v86 = new V86(settings);
     const thunkGenerator = new ThunkGenerator();
+
+    // v86 sets `wasm_source` itself only on its own loading path; with a custom wasm_fn it
+    // stays undefined. Restore it so the zstd helper-worker path keeps working.
+    wasmLoader.sourceBytes.then(bytes => { if (bytes) (v86 as unknown as { wasm_source?: ArrayBuffer }).wasm_source = bytes; });
 
     v86.add_listener("emulator-ready", async () => {
       bootMark("v86-emulator-ready");
@@ -1842,7 +2369,6 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       hookRegistry.initialize({
         dispatcher: process.dispatcher,
         thunkGenerator,
-        getCpu: () => v86?.cpu || v86?.v86?.cpu,
         getMemory: () => v86.mem8 || (v86.v86 && v86.v86.cpu.mem8) || null,
       });
 
@@ -1862,37 +2388,66 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       }
 
       system.gdiContext.setCanvas(canvas);
+      syncOverlayToGuestScreen();
+      // The host maps every pointer coordinate into guest space, so it needs the same
+      // content rect the overlay compositors use — under pillarbox/integer the picture is
+      // a sub-rect of the canvas and a linear canvas->guest map is off by the bars.
+      // Only the GEOMETRY travels: the guest pointer space is published separately by
+      // "app_resize", and the rect's own source size is the PRESENTED TEXTURE's (a
+      // supersampled Glide offscreen, say), which is not a coordinate space at all.
+      setPresentRectListener((r) => {
+        self.postMessage({
+          type: "present_rect",
+          x: r.x, y: r.y, w: r.w, h: r.h, outW: r.outW, outH: r.outH,
+        });
+      });
       system.setHostResizeCallback((width, height) => {
-        // Resize worker-side canvas + overlay immediately
-        // (host may not send "resize" back, e.g. non-guest coordinate mode)
-        const prevW = state.canvas?.width ?? 0;
-        const prevH = state.canvas?.height ?? 0;
-        if (state.canvas && (state.canvas.width !== width || state.canvas.height !== height)) {
-          // Note: Setting canvas.width/height to the SAME value still resets the OffscreenCanvas
-          // and invalidates the WebGPU context. Only resize if dimensions actually change.
-          state.canvas.width = width;
-          state.canvas.height = height;
-          // Reconfigure WebGPU context — canvas resize unconfigures it
-          const backend = system.services.render.getBackend();
-          if (backend?.kind === "webgpu") {
-            (backend as WebGPUBackend).reconfigure();
-          }
-        }
+        // The canvas BACKING BUFFER is the host's to size — it follows the display area, not
+        // the guest mode (the picture is stretched into it at present time). The host echoes a
+        // "resize" with the display-fit size, and that is its single writer.
         state.width = width;
         state.height = height;
-        system.gdiContext.resizeOverlay(width, height);
-        Logger.log(LogCategory.SYSTEM, `hostResize: ${prevW}x${prevH} -> ${width}x${height} (canvas=${!!state.canvas})`);
-        // Notify host to resize CSS element
+        syncOverlayToGuestScreen();
+        Logger.log(LogCategory.SYSTEM,
+          `hostResize: guest mode ${width}x${height} (canvas=${state.canvas?.width ?? 0}x${state.canvas?.height ?? 0})`);
         self.postMessage({ type: "app_resize", width, height });
       });
       system.setHostCursorVisibilityCallback((visible) => {
         self.postMessage({ type: "cursor_visibility", visible });
       });
+      system.setHostCursorImageCallback((image) => {
+        if (image) {
+          // Copy the pixels — the user object keeps owning its buffer.
+          const pixels = image.pixels.slice().buffer;
+          (self as unknown as Worker).postMessage({
+            type: "cursor_image",
+            width: image.width,
+            height: image.height,
+            hotspotX: image.hotspotX,
+            hotspotY: image.hotspotY,
+            pixels,
+          }, [pixels]);
+        } else {
+          self.postMessage({ type: "cursor_image", pixels: null });
+        }
+      });
+      system.setHostCursorPositionCallback((pos) => {
+        self.postMessage({ type: "device_cursor_pos", x: pos ? pos.x : null, y: pos ? pos.y : null });
+      });
       system.setHostMouseCaptureCallback((capture) => {
         self.postMessage({ type: "mouse_capture", capture });
       });
-      system.setHostWindowTitleCallback((title) => {
-        self.postMessage({ type: "window_title", title });
+      system.setHostCursorWarpModeCallback((active) => {
+        self.postMessage({ type: "cursor_warp", active });
+      });
+      system.setHostCursorClipSignalCallback((active, rect) => {
+        self.postMessage({ type: "clip_cursor", clip: active, rect });
+      });
+      system.setHostInputResetCallback(() => {
+        self.postMessage({ type: "input_reset" });
+      });
+      system.setHostWindowTitleCallback((title, visible) => {
+        self.postMessage({ type: "window_title", title, visible });
       });
 
       // Initialize WebGPU backend immediately if possible
@@ -1902,6 +2457,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           const backend = new WebGPUBackend();
           await backend.initialize(canvas);
           system.services.render.setBackend(backend);
+          system.gdiContext.registerOverlayDirtyNotifier(kickGdiPresentLoop);
           // Tell the host the moment the guest composites its FIRST real frame, so it can
           // tear down the loading screen exactly at the first flip (not at PE-load, which
           // left a black canvas during CRT/DirectX/asset init). One-shot per game load.
@@ -1929,13 +2485,16 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const winmm = new WinMM();
       const ole32 = new Ole32();
       const oleaut32 = new Oleaut32();
+      const oledlg = new Oledlg();
       const ddraw = new DDraw();
       const dinput = new DInput();
       const dplayx = new DPlayX();
       const mss32 = new MSS32();
       const smackw32 = new SmackW32();
       const binkw32 = new BinkW32();
+      const lgvid = new Lgvid();
       const quartz = new Quartz();
+      const dmusic = new DMusic();
       const a3d = new A3d();
       const avifil32 = new Avifil32();
       const rpcrt4 = new Rpcrt4();
@@ -1945,6 +2504,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const glu32 = new Glu32();
       const wsock32 = new Wsock32();
       const shell32 = new Shell32();
+      const shfolder = new Shfolder();
       const shlwapi = new Shlwapi();
       const comdlg32 = new Comdlg32();
       const comctl32 = new Comctl32();
@@ -1952,12 +2512,14 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const w32skrnl = new W32skrnl();
       const msvcrt = new Msvcrt();
       const msvcp90 = new Msvcp90();
+      const msvcp140 = new Msvcp140();
       const msvcp60 = new Msvcp60();
       const crtdll = new Crtdll();
       const winspool = new Winspool();
       const dwmapi = new Dwmapi();
       const riched32 = new Riched32();
       const wtsapi32 = new Wtsapi32();
+      const msacm32 = new Msacm32();
       const imm32 = new Imm32();
       const msimg32 = new Msimg32();
       const uxtheme = new Uxtheme();
@@ -1967,6 +2529,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const iphlpapi = new Iphlpapi();
       const tapi32 = new Tapi32();
       const setupapi = new Setupapi();
+      const hid = new Hid();
+      const combase = new Combase();
+      const shcore = new Shcore();
+      const kernelbase = new Kernelbase();
+      const xinput1_3 = new XInput1_3();
       const netapi32 = new Netapi32();
       const psapi = new Psapi();
       const imagehlp = new ImageHlp();
@@ -1980,48 +2547,6 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const alut = new ALUT();
       const wininet = new Wininet();
 
-      // Prewarm stub DLLs ONLY for thunked modules that lack a JS implementation
-      (() => {
-        const api = APIRegistry.getInstance();
-        const tg = process.thunkGenerator as any;
-        const mem = System.getInstance().process?.memory;
-        const memBytes = process.v86.mem8 || (process.v86.v86 && process.v86.v86.cpu.mem8);
-        if (!tg?.generateStubDll || !mem || !memBytes) return;
-
-        // Modules that already have JS implementations (registered below) should NOT be stubbed here
-        const implemented = new Set([
-          kernel32.name, ntdll.name, user32.name, gdi32.name, d3d9.name, d3dx9.name, advapi32.name,
-          dsound.name, winmm.name, ole32.name, ddraw.name, dinput.name,
-          dplayx.name, mss32.name, wsock32.name, shell32.name, shlwapi.name, comdlg32.name, comctl32.name,
-          dwmapi.name,
-          riched32.name,
-          wtsapi32.name,
-          imm32.name,
-          msimg32.name,
-          uxtheme.name,
-          wintrust.name,
-          crypt32.name,
-          ws2_32.name,
-          psapi.name,
-          imagehlp.name,
-          iphlpapi.name,
-          tapi32.name,
-          setupapi.name,
-          netapi32.name,
-          glu32.name,
-          "gdiplus",
-          "bass",
-          "galaxy",
-        ].map(n => n.toLowerCase()));
-
-        // TODO: Re-enable stub DLL prewarming when moduleRegistry is restored
-        // for (const mod of api.getModules()) {
-        //   const dllName = mod.name.toLowerCase();
-        //   if (implemented.has(dllName)) continue;
-        //   ...
-        // }
-      })();
-
       kernel32.initialize(process);
       ntdll.initialize(process);
       user32.initialize(process);
@@ -2033,6 +2558,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       winmm.initialize(process);
       ole32.initialize(process);
       oleaut32.initialize(process);
+      oledlg.initialize(process);
       ddraw.initialize(process);
       dinput.initialize(process);
       dplayx.initialize(process);
@@ -2040,8 +2566,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (!EMU_NATIVE_VIDEO_DLLS) {
         smackw32.initialize(process);
         binkw32.initialize(process);
+        lgvid.initialize(process);
       }
       quartz.initialize(process);
+      dmusic.initialize(process);
       a3d.initialize(process);
       avifil32.initialize(process);
       rpcrt4.initialize(process);
@@ -2051,6 +2579,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       glu32.initialize(process);
       wsock32.initialize(process);
       shell32.initialize(process);
+      shfolder.initialize(process);
       shlwapi.initialize(process);
       comdlg32.initialize(process);
       comctl32.initialize(process);
@@ -2059,6 +2588,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       msvcrt.initialize(process);
       msvcp90.setMsvcrt(msvcrt);
       msvcp90.initialize(process);
+      msvcp140.setMsvcrt(msvcrt);
+      msvcp140.initialize(process);
       msvcp60.setMsvcrt(msvcrt);
       msvcp60.initialize(process);
       crtdll.initialize(process);
@@ -2066,12 +2597,14 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       dwmapi.initialize(process);
       riched32.initialize(process);
       wtsapi32.initialize(process);
+      msacm32.initialize(process);
       imm32.initialize(process);
       msimg32.initialize(process);
       uxtheme.initialize(process);
       wintrust.initialize(process);
       crypt32.initialize(process);
       ws2_32.initialize(process);
+      iphlpapi.initialize(process);
       psapi.initialize(process);
       imagehlp.initialize(process);
       ifc20.initialize(process);
@@ -2084,6 +2617,12 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       wininet.initialize(process);
       tapi32.initialize(process);
       setupapi.initialize(process);
+      hid.initialize(process);
+      combase.initialize(process);
+      shcore.initialize(process);
+      kernelbase.setHosts([kernel32, advapi32, shlwapi]);
+      kernelbase.initialize(process);
+      xinput1_3.initialize(process);
       netapi32.initialize(process);
 
       process.registerModule(kernel32.name, kernel32);
@@ -2097,6 +2636,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(winmm.name, winmm);
       process.registerModule(ole32.name, ole32);
       process.registerModule(oleaut32.name, oleaut32);
+      process.registerModule(oledlg.name, oledlg);
       process.registerModule(ddraw.name, ddraw);
       process.registerModule(dinput.name, dinput);
       process.registerModule(dplayx.name, dplayx);
@@ -2104,8 +2644,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (!EMU_NATIVE_VIDEO_DLLS) {
         process.registerModule(smackw32.name, smackw32);
         process.registerModule(binkw32.name, binkw32);
+        process.registerModule(lgvid.name, lgvid);
       }
       process.registerModule(quartz.name, quartz);
+      process.registerModule(dmusic.name, dmusic);
       process.registerModule(a3d.name, a3d);
       process.registerModule(avifil32.name, avifil32);
       process.registerModule(rpcrt4.name, rpcrt4);
@@ -2115,6 +2657,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(glu32.name, glu32);
       process.registerModule(wsock32.name, wsock32);
       process.registerModule(shell32.name, shell32);
+      process.registerModule(shfolder.name, shfolder);
       process.registerModule(shlwapi.name, shlwapi);
       process.registerModule(comdlg32.name, comdlg32);
       process.registerModule(comctl32.name, comctl32);
@@ -2122,12 +2665,14 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(w32skrnl.name, w32skrnl);
       process.registerModule(msvcrt.name, msvcrt);
       process.registerModule(msvcp90.name, msvcp90);
+      process.registerModule(msvcp140.name, msvcp140);
       process.registerModule(msvcp60.name, msvcp60);
       process.registerModule(crtdll.name, crtdll);
       process.registerModule(winspool.name, winspool);
       process.registerModule(dwmapi.name, dwmapi);
       process.registerModule(riched32.name, riched32);
       process.registerModule(wtsapi32.name, wtsapi32);
+      process.registerModule(msacm32.name, msacm32);
       process.registerModule(imm32.name, imm32);
       process.registerModule(msimg32.name, msimg32);
       process.registerModule(uxtheme.name, uxtheme);
@@ -2138,6 +2683,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(iphlpapi.name, iphlpapi);
       process.registerModule(tapi32.name, tapi32);
       process.registerModule(setupapi.name, setupapi);
+      process.registerModule(hid.name, hid);
+      process.registerModule(combase.name, combase);
+      process.registerModule(shcore.name, shcore);
+      process.registerModule(kernelbase.name, kernelbase);
+      process.registerModule(xinput1_3.name, xinput1_3);
       process.registerModule(netapi32.name, netapi32);
       process.registerModule(imagehlp.name, imagehlp);
       const dbghelp = new DbgHelp(process);
@@ -2162,6 +2712,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(dsound.name, dsound.exports);
       process.dispatcher.registerModule(winmm.name, winmm.exports);
       process.dispatcher.registerModule(ole32.name, ole32.exports);
+      process.dispatcher.registerModule(oledlg.name, oledlg.exports);
       process.dispatcher.registerModule(ddraw.name, ddraw.exports);
       process.dispatcher.registerModule(dinput.name, dinput.exports);
       process.dispatcher.registerModule(dplayx.name, dplayx.exports);
@@ -2169,8 +2720,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       if (!EMU_NATIVE_VIDEO_DLLS) {
         process.dispatcher.registerModule(smackw32.name, smackw32.exports);
         process.dispatcher.registerModule(binkw32.name, binkw32.exports);
+        process.dispatcher.registerModule(lgvid.name, lgvid.exports);
       }
       process.dispatcher.registerModule(quartz.name, quartz.exports);
+      process.dispatcher.registerModule(dmusic.name, dmusic.exports);
       process.dispatcher.registerModule(a3d.name, a3d.exports);
       process.dispatcher.registerModule(avifil32.name, avifil32.exports);
       process.dispatcher.registerModule(rpcrt4.name, rpcrt4.exports);
@@ -2180,6 +2733,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(glu32.name, glu32.exports);
       process.dispatcher.registerModule(wsock32.name, wsock32.exports);
       process.dispatcher.registerModule(shell32.name, shell32.exports);
+      process.dispatcher.registerModule(shfolder.name, shfolder.exports);
       process.dispatcher.registerModule(shlwapi.name, shlwapi.exports);
       // shfolder.dll forwarding handled by ThunkDispatcher.DLL_FORWARDS
       process.dispatcher.registerModule(comdlg32.name, comdlg32.exports);
@@ -2188,12 +2742,14 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(w32skrnl.name, w32skrnl.exports);
       process.dispatcher.registerModule(msvcrt.name, msvcrt.exports);
       process.dispatcher.registerModule(msvcp90.name, msvcp90.exports);
+      process.dispatcher.registerModule(msvcp140.name, msvcp140.exports);
       process.dispatcher.registerModule(msvcp60.name, msvcp60.exports);
       process.dispatcher.registerModule(crtdll.name, crtdll.exports);
       process.dispatcher.registerModule(winspool.name, winspool.exports);
       process.dispatcher.registerModule(dwmapi.name, dwmapi.exports);
       process.dispatcher.registerModule(riched32.name, riched32.exports);
       process.dispatcher.registerModule(wtsapi32.name, wtsapi32.exports);
+      process.dispatcher.registerModule(msacm32.name, msacm32.exports);
       process.dispatcher.registerModule(imm32.name, imm32.exports);
       process.dispatcher.registerModule(msimg32.name, msimg32.exports);
       process.dispatcher.registerModule(uxtheme.name, uxtheme.exports);
@@ -2204,6 +2760,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(iphlpapi.name, iphlpapi.exports);
       process.dispatcher.registerModule(tapi32.name, tapi32.exports);
       process.dispatcher.registerModule(setupapi.name, setupapi.exports);
+      process.dispatcher.registerModule(hid.name, hid.exports);
+      process.dispatcher.registerModule(combase.name, combase.exports);
+      process.dispatcher.registerModule(shcore.name, shcore.exports);
+      process.dispatcher.registerModule(kernelbase.name, kernelbase.exports);
+      process.dispatcher.registerModule(xinput1_3.name, xinput1_3.exports);
       process.dispatcher.registerModule(netapi32.name, netapi32.exports);
       process.dispatcher.registerModule(imagehlp.name, imagehlp.exports);
       process.dispatcher.registerModule(dbghelp.name, dbghelp.exports);
@@ -2217,6 +2778,9 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(wininet.name, wininet.exports);
 
       bootMark("modules-registered");
+
+      // Every HLE module is now in the dispatch table — the guest may run.
+      markHleReady();
 
       // Initialize WASM hypercall infrastructure (page + managers).
       // NOTE: dispatch is NOT enabled yet (hc_enabled=0) — all thunks still go through JS.
@@ -2243,6 +2807,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // Apply pending registrations after modules are registered (JS impls) and stubs for external DLLs exist
       // (this also registers matching functions with hypercallDataManager)
       process.dispatcher.applyPendingRegistrations();
+      materializeHleModuleImages(process);
+      // The images allocate a fresh stub per declared export, so the pass above left them
+      // with no handler attached — a second pass binds them before anything can hand one out.
+      process.dispatcher.applyPendingRegistrations();
       prePopulateGetProcAddressCache(process.dispatcher);
       ensureGetProcAddressDynamicExports(process.dispatcher, [
         { dll: "d3d9", name: "Direct3DShaderValidatorCreate9" },
@@ -2254,19 +2822,19 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         ...KERNEL32_VISTA_WARMUP_EXPORTS,
       ]);
 
-      // Register fast path for time and sync functions if Kernel32 exports them
-      const k32 = kernel32 as any;
-      if (k32.registerFastPathTimeFunctions) {
-        k32.registerFastPathTimeFunctions(process.dispatcher);
-      }
-      if (k32.registerFastPathSyncFunctions) {
-        k32.registerFastPathSyncFunctions(process.dispatcher);
-      }
+      // Registered unconditionally, like every other registrar below. These two used to be
+      // called as `if (kernel32.registerFastPathX)` off the Kernel32 MODULE CLASS, which
+      // never carried either symbol — so both tiers silently never existed, and a fast path
+      // added to sync.ts registered nothing at all. An `if (fn)` guard around a tier cannot
+      // report its own absence; a direct import fails at build time instead.
+      registerFastPathTimeFunctions(process.dispatcher);
+      registerFastPathSyncFunctions(process.dispatcher);
       winmm.registerFastPathTimerFunctions(process.dispatcher);
       registerFastPathMessageFunctions(process.dispatcher);
       registerFastPathFileIOFunctions(process.dispatcher);
       registerFastPathLocaleFunctions(process.dispatcher);
       registerFastPathHeapFunctions(process.dispatcher);
+      registerFastPathVirtualQuery(process.dispatcher);
       registerFastPathMsvcrtFunctions(process.dispatcher);
       registerFastPathPointerFunctions(process.dispatcher);
       registerFastPathProcessFunctions(process.dispatcher);
@@ -2341,7 +2909,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           }
         };
 
-        v86Inner["tick_hooks_before"] = () => guardTickHook("before", () => {
+        // The tick bracket sits OUTSIDE guardTickHook so a throwing hook body still
+        // closes the interval — an unbalanced bracket would silently move a whole tick
+        // into the "idle" residual, which is exactly the number being measured.
+        v86Inner["tick_hooks_before"] = () => { workerTime.noteTickEnter(); guardTickHook("before", () => {
           // If the current guest thread is WAITING (async thunk parked at
           // spinLoopAddress), don't grant a full quantum — v86 would honestly
           // JIT-execute JMP $ for ~5 ms before tick_hooks_after can yield.
@@ -2349,7 +2920,15 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           const urgentExit = !!curThread && curThread.state === ThreadState.WAITING;
           system.scheduler.noteRoundTripTick(urgentExit);
           preemptionManager.prepareForExecution(cpu, urgentExit);
+          // AFTER the budget is set: an armed write trap narrows this slice to one
+          // block while it waits for a faulting store to retire, and re-protects the
+          // page the moment it has. No-op (one boolean) when nothing is armed.
+          memWriteTrap.onTickBoundary(cpu);
           hypercallDataManager.updateTimeData();
+          // After the clock advance, so the deadline is measured against this tick's now.
+          if (!urgentExit && !(globalThis as { __noTimerSliceCap?: boolean }).__noTimerSliceCap) {
+            preemptionManager.capSliceForTimerDeadline(system.scheduler.timerSliceBudgetInsns());
+          }
           // Robust unified-clock activation. The one-shot enable() gates in loadPeData
           // (~651) and the v86-init block (~1389) race with stub registration and v86
           // restarts (reset_cpu re-zeroes HYPERCALL_PAGE → hc_enabled=0), so enable() was
@@ -2375,10 +2954,15 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           hypercallDataManager.updateCursorData(mouseState.x, mouseState.y);
           // Sync message queue flag for WASM PeekMessage fast path
           hypercallDataManager.updateMessageQueueFlag(system.windowManager.hasMessages());
-        });
+        }); };
         let heapSlabAllocated = false;
         let ticksSinceStart = 0;
-        v86Inner["tick_hooks_after"] = () => guardTickHook("after", () => {
+        v86Inner["tick_hooks_after"] = (t?: number) => { guardTickHook("after", () => {
+          // v86 passes main_loop()'s return: the delay next_tick() will arm its yield
+          // with. A long one is the loop going to sleep on purpose, which the freeze
+          // diagnostics below cannot otherwise distinguish from a lost callback.
+          lastMainLoopDelay = typeof t === "number" ? t : -1;
+          lastMainLoopDelayAtMs = performance.now();
           // JIT-on guest-EIP sampler (opt-in via __eipSamp). Runs between v86 JIT
           // batches (~1ms) so it observes real full-speed behavior with no starvation;
           // streams the cumulative 4KB-page histogram to the main thread (the reliable
@@ -2410,14 +2994,17 @@ const initV86 = async (canvas: OffscreenCanvas) => {
               allocateHeapSlab();
             }
           }
-        });
+        }); workerTime.noteTickExit(typeof t === "number" ? t : 0); };
 
         // Replace yield-Worker with same-thread MessageChannel to eliminate cross-Worker
         // postMessage overhead (~14% CPU for Re-Volt at 1000 ticks/sec).
         // MessageChannel creates macrotasks (not microtasks) — rAF/setInterval work correctly.
         if (typeof v86Inner["register_yield_direct"] === "function") {
           v86Inner["register_yield_direct"]();
-          Logger.log(LogCategory.SYSTEM, "[HYPERCALL] yield-Worker replaced with MessageChannel");
+          // The next tick is queued as a host task rather than a MessagePort message
+          // (see postHostTask), one in flight at a time (see createTickYield).
+          v86Inner["yield"] = createTickYield((tick: number) => v86Inner["yield_callback"](tick));
+          Logger.log(LogCategory.SYSTEM, "[HYPERCALL] v86 ticks queued as host tasks");
         }
 
         Logger.log(LogCategory.SYSTEM,
@@ -2486,6 +3073,59 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       // Start registry access log flush
       startRegistryFlush();
 
+      // Every process can have children, so every store relays a write downward; the
+      // child branch below adds the upward half.
+      system.registry.setDownstreamSink(forwardRegistryToChildren);
+      if (childBoot) {
+        const boot = childBoot;
+        // Initialization may have created a provisional scheduler thread while v86
+        // was still in its BIOS state. Use the same clean boot boundary as a root
+        // image before restoring inherited objects; otherwise that stale TEB survives
+        // while the new bootloader resets FS, and CRT startup faults at fs:[0].
+        await prepareFullGameSwitch();
+        if (boot.registry) system.registry.restore(boot.registry);
+        // The hive is the parent's; this worker only holds a copy of it. postToParent, not
+        // the overridden self.postMessage: a child that owns the screen talks to the PAGE,
+        // and the page is not what persists the registry.
+        system.registry.setMutationSink(mutation => postToParent({ type: 'child_registry', mutation }));
+        // Writes the owner made while we were booting arrived before restore() and would
+        // have been overwritten by the snapshot it lays down; they apply now instead.
+        childRegistryReady = true;
+        for (const mutation of pendingRegistryDown.splice(0)) {
+          system.registry.applyMutation(mutation, { from: 'owner' });
+        }
+        if (boot.namedObjects) adoptNamedObjects(boot.namedObjects, {
+          event: (manualReset, initialState) => system.scheduler.createEvent(manualReset, initialState),
+          mutex: () => system.scheduler.createMutex(false),
+          semaphore: (initialCount, maximumCount) => system.scheduler.createSemaphore(initialCount, maximumCount),
+        });
+        system.fileSystem = createChildVfsClient(boot.io,
+          request => self.postMessage({ type: 'child_io', request }), boot.currentDirectory);
+        process.loader.setVfs(system.fileSystem);
+        system.onProcessExit = payload => {
+          // The process HAS exited, whatever the barrier managed to drain. Reporting the
+          // flush failure as `error` instead would substitute a crash for an exit: the
+          // guest's exit code is lost, and a parent that can no longer serve this child's
+          // VFS — the exact case this barrier fails in — reads as a child that crashed.
+          const report = (flushError?: unknown) => {
+            if (flushError !== undefined) {
+              Logger.warn(LogCategory.SYSTEM, `child exit: durability barrier failed: ${flushError}`);
+            }
+            self.postMessage({
+              type: 'process_exit', ...payload, logs: Logger.getRecentEntries(100),
+              flushError: flushError === undefined ? undefined : String(flushError),
+            });
+          };
+          void system.drainDurableState().then(() => report(), report);
+        };
+        system.executablePath = boot.imagePath;
+        system.executableName = boot.imagePath.split(/[\\/]/).pop() ?? 'child.exe';
+        system.executableArgs = boot.commandLine;
+        system.executableCommandLine = boot.rawCommandLine ?? null;
+        if (boot.environment) process.environment = new Map(boot.environment);
+        if (await loadPeData(boot.bytes, true) === 'ok') resolveChildImageReady?.();
+      }
+
       if (pendingPeData) {
         const buffered = pendingPeData;
         pendingPeData = null;
@@ -2511,6 +3151,16 @@ const initV86 = async (canvas: OffscreenCanvas) => {
  * v86.stop() is undone within ~1ms. The harness (tickFrames park, pause/resume,
  * breakpoint hits) routes through these via globalThis so a park/break actually holds.
  */
+/**
+ * The stop() a pauseEmulator() has asked for but not yet observed. v86.stop() settles a turn
+ * or more after pauseEmulator returns and is_running() stays TRUE for that whole window, so a
+ * resume landing inside it reads a running CPU, skips run(), and the late stop then leaves the
+ * guest halted with nothing to restart it: startScheduler's kick needs a runnable thread, and a
+ * guest stopped before its first instruction has none. resumeEmulator therefore re-kicks once
+ * the stop it raced settles.
+ */
+let pendingStop: Promise<void> | null = null;
+
 function pauseEmulator(): void {
   const system = System.getInstance();
   if (!system.process?.v86) return;
@@ -2520,8 +3170,11 @@ function pauseEmulator(): void {
   system.windowManager.wakeWaiters();
   const v86 = system.process.v86;
   if (v86.is_running?.() ?? false) {
-    v86.stop().then(() => Logger.log(LogCategory.SYSTEM, "[PAUSE] Emulator paused"))
+    const stop: Promise<void> = v86.stop()
+      .then(() => Logger.log(LogCategory.SYSTEM, "[PAUSE] Emulator paused"))
       .catch((err: unknown) => Logger.error(LogCategory.SYSTEM, `[PAUSE] Error pausing emulator: ${err}`));
+    pendingStop = stop;
+    void stop.then(() => { if (pendingStop === stop) pendingStop = null; });
   }
 }
 function resumeEmulator(): void {
@@ -2533,13 +3186,101 @@ function resumeEmulator(): void {
   TimeService.getInstance().notifyPauseResume();
   hypercallDataManager.resetInsnBaseline();
   const v86 = system.process.v86;
-  if (!(v86.is_running?.() ?? false)) { v86.run(); Logger.log(LogCategory.SYSTEM, "[RESUME] Emulator resumed"); }
+  const kick = (): void => {
+    if (isPaused) return;                                   // a newer pause owns the CPU now
+    if (System.getInstance().process?.v86 !== v86) return;   // process replaced under us
+    if (!(v86.is_running?.() ?? false)) { v86.run(); Logger.log(LogCategory.SYSTEM, "[RESUME] Emulator resumed"); return; }
+    // Seen from outside do_tick, running && !idle means the last tick threw out of main_loop:
+    // no tick is scheduled and no stop will ever be acknowledged, so the guard above would
+    // leave the CPU frozen for good. The core's run() reschedules the loop; a stale pending
+    // tick, if one existed, is superseded by v86's own tick_counter check.
+    const core = v86.v86;
+    if (core && core["running"] && core["idle"] === false) {
+      core["run"]();
+      Logger.warn(LogCategory.SYSTEM, "[RESUME] v86 tick loop was dead (a tick threw) — rescheduled");
+    }
+  };
+  const raced = pendingStop;
+  kick();
+  if (raced) void raced.then(kick, kick);
 }
 // Harness hooks (cmds/time.ts park, cmds/breakpoints.ts pause/resume, eip-breaks).
 (globalThis as any).__harnessPause = pauseEmulator;
 (globalThis as any).__harnessResume = resumeEmulator;
 
-self.onmessage = (event: MessageEvent) => {
+/**
+ * Tell the host the EFFECTIVE quality config and which of its keys the backend now driving
+ * the frame cannot honour. Sent on every set_quality AND whenever the active backend
+ * changes — the guest opens its graphics API long after the host's last set_quality, so a
+ * one-shot answer describes a backend that is no longer the one rendering.
+ */
+function postQualityState(q: QualityConfig): void {
+    const gaps = logQualityGapsOnce(q);
+    self.postMessage({ type: "set_quality", ok: true, quality: q, unsupported: gaps, backend: activeQualityBackend() });
+}
+
+onQualityBackendChanged(() => postQualityState(EmulatorConfig.getInstance().quality));
+
+const handleWorkerMessage = (event: MessageEvent): void => {
+  if (event.data?.type === 'child_boot') {
+    if (childBoot || System.getInstance().process) return;
+    childBoot = event.data as ChildBoot;
+    childImageReady = new Promise<void>(resolve => { resolveChildImageReady = resolve; });
+    childSessionTransport = new ChildSessionTransport((message, transfer = []) => postToParent(message, transfer), handleWorkerMessage);
+    childFrameClock = new ChildFrameClock(() => postToParent({ type: 'child_animation_request' }));
+    self.requestAnimationFrame = childFrameClock.request;
+    self.cancelAnimationFrame = childFrameClock.cancel;
+    if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
+    const canvas = new OffscreenCanvas(640, 480);
+    state.canvas = canvas;
+    void initV86(canvas).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    return;
+  }
+  if (event.data?.type === 'child_registry_down') {
+    // The hive is the owner's and it just changed. Queue until restore() has run, or the
+    // inherited snapshot lands on top of the newer value.
+    if (childRegistryReady) System.getInstance().registry.applyMutation(event.data.mutation, { from: 'owner' });
+    else pendingRegistryDown.push(event.data.mutation);
+    return;
+  }
+  if (event.data?.type === 'child_animation_frame') {
+    childFrameClock?.frame(event.data.time - performance.timeOrigin);
+    return;
+  }
+  if (event.data?.type === 'child_session') {
+    childSessionTransport?.attach(event.data.port);
+    return;
+  }
+  if (event.data?.type === 'resume_session') {
+    if (state.inputBuffer) System.getInstance().connectInput(state.inputBuffer);
+    System.getInstance().services.render.armFirstPresent();
+    System.getInstance().gdiContext.setOverlayDirty(true);
+    kickGdiPresentLoop();
+    return;
+  }
+  if (event.data?.type === 'child_surface') {
+    const message = event.data;
+    // An immediately exiting parent can offer the session before child boot starts.
+    // Attach after its clean reset and PE load, so reset cannot discard the new input/DCs.
+    void (childImageReady ?? hleReady).then(() => {
+      const system = System.getInstance();
+      const canvas = message.canvas as OffscreenCanvas;
+      const backend = system.services.render.getBackend();
+      if (backend?.kind !== 'webgpu') throw new Error('Child display attachment requires the WebGPU backend');
+      (backend as WebGPUBackend).attachCanvas(canvas);
+      state.canvas = canvas;
+      state.width = canvas.width; state.height = canvas.height;
+      system.process!.canvas = canvas;
+      system.gdiContext.attachScreenCanvas(canvas);
+      state.inputBuffer = message.inputBuffer;
+      system.connectInput(message.inputBuffer);
+      system.services.render.armFirstPresent();
+      system.gdiContext.setOverlayDirty(true);
+      kickGdiPresentLoop();
+      self.postMessage({ type: 'child_surface_ready', imagePath: system.executablePath });
+    }).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    return;
+  }
   const message = event.data;
 
   if (message?.type === "dbg") {
@@ -2552,7 +3293,41 @@ self.onmessage = (event: MessageEvent) => {
     // Persisted debug toggles seeded from the host (localStorage) BEFORE a game loads —
     // e.g. __noHeapSlab to A/B the WASM heap slab. Survives page F5 because the host
     // replays it on every worker init. Must arrive before load_bundle (PE-load reads it).
-    if (typeof message.key === "string") (globalThis as any)[message.key] = message.value;
+    if (typeof message.key === "string") {
+      (globalThis as any)[message.key] = message.value;
+      // Recorded so harness resetWorkerFlags can drop exactly the flags this session applied.
+      noteAppliedWorkerFlag(message.key);
+    }
+    // The log ring is normally armed by a harness call, which a page reload wipes — and a
+    // re-exec IS a page reload, so the boot that follows one is the single window the
+    // 50-entry default cannot cover. As a flag it is replayed before any bundle loads.
+    if (message.key === "__logRingSize" && typeof message.value === "number") {
+      Logger.setBufferSize(Math.max(50, Math.min(200000, message.value)));
+    }
+    return;
+  }
+
+  if (message?.type === "set_boot_args") {
+    // The command line a self re-exec chose, replayed by the host after the page reload it
+    // performed on our behalf. Must arrive BEFORE load_bundle — loadBundleImpl consumes it
+    // in place of the manifest's `args` for exactly one boot.
+    pendingReExecArgs = typeof message.args === "string" ? message.args : null;
+    pendingReExecImage = typeof message.image === "string" && message.image ? message.image : null;
+    pendingReExecPatches = Array.isArray(message.patches) && message.patches.length
+      ? (message.patches as GuestImagePatch[])
+      : null;
+    pendingInheritedObjects = Array.isArray(message.inherited) && message.inherited.length
+      ? (message.inherited as NamedObjectSpec[])
+      : null;
+    Logger.log(LogCategory.SYSTEM,
+      `[ReExec] boot from host: image "${pendingReExecImage ?? "(manifest)"}" args "${pendingReExecArgs ?? ""}"`);
+    return;
+  }
+
+  if (message?.type === "set_session") {
+    // This tab's harness session (?bs=<name>) — see src/harness/session.ts. Only used to
+    // report the real on-disk path of the dumps we emit; the host does the writing.
+    (globalThis as any).__bsSession = typeof message.session === "string" ? message.session : "";
     return;
   }
 
@@ -2614,7 +3389,9 @@ self.onmessage = (event: MessageEvent) => {
     const q = EmulatorConfig.getInstance().applyQuality(message.quality);
     Logger.log(LogCategory.SYSTEM,
       `[QUALITY] applied (aniso=${q.anisotropy} bright=${q.brightness} contrast=${q.contrast} sat=${q.saturation} aspect=${q.aspectMode} postAA=${q.postAA})`);
-    self.postMessage({ type: "set_quality", ok: true, quality: q });
+    // A knob the active backend cannot honor must be visible, not silently swallowed
+    // (see shared/quality-capabilities.ts) — logged here AND relayed to the UI.
+    postQualityState(q);
     return;
   }
 
@@ -2661,18 +3438,23 @@ self.onmessage = (event: MessageEvent) => {
   if (message?.type === "resize") {
     state.width = message.width ?? state.width;
     state.height = message.height ?? state.height;
-    // NOTE: Do NOT reconfigure WebGPU here. The worker's hostResize callback is the
-    // authoritative source — it already called reconfigure(). Re-doing it from the
-    // main-thread round-trip clears the canvas AFTER frames have been rendered → black screen.
+    const system = System.getInstance();
+    // The ONE writer of the canvas backing size: the host owns the display area, and the
+    // guest picture is stretched into it. canvas.width/height writes unconfigure the WebGPU
+    // context (even when written the same value), so a real change must reconfigure or the
+    // backend renders into a detached swap chain — hence the check.
     if (state.canvas && (state.canvas.width !== state.width || state.canvas.height !== state.height)) {
       state.canvas.width = state.width;
       state.canvas.height = state.height;
+      const backend = system.services.render.getBackend();
+      if (backend?.kind === "webgpu") {
+        (backend as WebGPUBackend).reconfigure();
+      }
     }
-    // Also resize GDI overlay canvas
-    System.getInstance().gdiContext.resizeOverlay(state.width, state.height);
+    // The window plane is guest-space, so a HOST resize must not touch it.
+    syncOverlayToGuestScreen();
 
     // Trigger repaint for all windows on resize
-    const system = System.getInstance();
     const WM_PAINT = 0x000F;
     for (const window of system.windowManager.getAllWindows()) {
       if (window.visible) {
@@ -2701,6 +3483,7 @@ self.onmessage = (event: MessageEvent) => {
       enable: cfg.enable,
       logOnly: cfg.logOnly,
       report: libHleManager.getReport(),
+      nativeLeaves: libHleManager.getNativeLeafSites(),
     });
     return;
   }
@@ -2726,7 +3509,11 @@ self.onmessage = (event: MessageEvent) => {
       cfg.logOnly = !!message.hleLogOnly;
       Logger.log(LogCategory.SYSTEM, `[HLE-lib] enabled via load_bundle (logOnly=${cfg.logOnly})`);
     }
-    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs });
+    // Boot straight into the scene a front-end would otherwise gate behind menu clicks.
+    // The launcher's own re-exec still outranks this (it is what the guest asked for);
+    // this only replaces the manifest's boot args, and only for this load.
+    bootArgsOverride = typeof message.args === "string" ? message.args : null;
+    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload });
   }
 
   // --- WGB wizard build service (Stage 1) — additive, separate from the boot path above. -----
@@ -2801,16 +3588,11 @@ self.onmessage = (event: MessageEvent) => {
         if (result.destination === "play") {
           // Hand the freshly-built bytes straight to the existing boot path.
           self.postMessage({ type: "wgb_finalize_done", destination, gameId: result.gameId, suggestedFilename: result.suggestedFilename });
-          loadBundle({ data: result.bytes });
+          loadBundle({ url: `/apps/byo/${result.cacheKey}` });
           return;
         }
-        if (result.destination === "download" && result.bytes) {
-          // Transfer the buffer so the host can save it (showSaveFilePicker / anchor download).
-          const buf = result.bytes.buffer;
-          (self as any).postMessage(
-            { type: "wgb_finalize_done", destination, gameId: result.gameId, suggestedFilename: result.suggestedFilename, bytes: result.bytes },
-            [buf],
-          );
+        if (result.destination === "download" && result.file) {
+          self.postMessage({ type: "wgb_finalize_done", destination, gameId: result.gameId, suggestedFilename: result.suggestedFilename, file: result.file });
           return;
         }
         // library
@@ -3003,3 +3785,7 @@ self.onmessage = (event: MessageEvent) => {
   // registry_clear also cancels the worker-owned debounced autosave via the context.
   if (handleRegistryMessage(message, { cancelRegistryAutosave })) return;
 };
+
+// Host messages run BETWEEN v86 ticks like the present chain does, so they are named
+// rather than left to swell the idle residual (idleReport, roadmap 08).
+self.onmessage = (event: MessageEvent) => { workerTime.measure("message", () => handleWorkerMessage(event)); };

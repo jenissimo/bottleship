@@ -36,3 +36,51 @@ export function effectiveMipLevels(
     while (n < declared && hasLevel(n)) n++;
     return n;
 }
+
+/**
+ * Describe the contiguous authored mip levels that a D3D texture upload can expose.
+ * Keeping the extent/layout calculation in one pure helper makes compressed uploads
+ * testable without constructing a GPUDevice; callers still decide whether to decode
+ * or upload the bytes natively.
+ */
+export interface D3DTextureMipUploadLevel {
+    level: number;
+    width: number;
+    height: number;
+}
+
+export function d3dTextureMipUploadPlan(
+    width: number,
+    height: number,
+    declaredLevels: number,
+    hasLevel: (level: number) => boolean,
+): D3DTextureMipUploadLevel[] {
+    const count = effectiveMipLevels(declaredLevels, width, height, hasLevel);
+    const result: D3DTextureMipUploadLevel[] = [];
+    for (let level = 0; level < count; level++) {
+        result.push({
+            level,
+            width: mipExtent(width, level),
+            height: mipExtent(height, level),
+        });
+    }
+    return result;
+}
+
+/**
+ * Cube textures expose a mip only when every one of their six faces has authored data for
+ * that level.  A partial face set must not become a sampler-visible black/transparent mip.
+ */
+export function effectiveCubeMipLevels(
+    declaredLevels: number,
+    width: number,
+    height: number,
+    hasFaceLevel: (face: number, level: number) => boolean,
+): number {
+    return effectiveMipLevels(declaredLevels, width, height, (level) => {
+        for (let face = 0; face < 6; face++) {
+            if (!hasFaceLevel(face, level)) return false;
+        }
+        return true;
+    });
+}

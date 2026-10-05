@@ -1,0 +1,623 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.884Z",
+  "module": "dbghelp",
+  "functions": [
+    {
+      "name": "EnumDirTree",
+      "argCount": 6
+    },
+    {
+      "name": "EnumDirTreeW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumerateLoadedModules",
+      "argCount": 3
+    },
+    {
+      "name": "EnumerateLoadedModules64",
+      "argCount": 3
+    },
+    {
+      "name": "EnumerateLoadedModulesEx",
+      "argCount": 3
+    },
+    {
+      "name": "EnumerateLoadedModulesExW",
+      "argCount": 3
+    },
+    {
+      "name": "EnumerateLoadedModulesW64",
+      "argCount": 3
+    },
+    {
+      "name": "ExtensionApiVersion",
+      "argCount": 0
+    },
+    {
+      "name": "FindDebugInfoFile",
+      "argCount": 3
+    },
+    {
+      "name": "FindDebugInfoFileEx",
+      "argCount": 5
+    },
+    {
+      "name": "FindExecutableImage",
+      "argCount": 3
+    },
+    {
+      "name": "FindExecutableImageEx",
+      "argCount": 5
+    },
+    {
+      "name": "FindExecutableImageExW",
+      "argCount": 5
+    },
+    {
+      "name": "GetTimestampForLoadedLibrary",
+      "argCount": 1
+    },
+    {
+      "name": "ImageDirectoryEntryToData",
+      "argCount": 4
+    },
+    {
+      "name": "ImageDirectoryEntryToDataEx",
+      "argCount": 5
+    },
+    {
+      "name": "ImagehlpApiVersion",
+      "argCount": 0
+    },
+    {
+      "name": "ImagehlpApiVersionEx",
+      "argCount": 1
+    },
+    {
+      "name": "ImageNtHeader",
+      "argCount": 1
+    },
+    {
+      "name": "ImageRvaToSection",
+      "argCount": 3
+    },
+    {
+      "name": "ImageRvaToVa",
+      "argCount": 4
+    },
+    {
+      "name": "MakeSureDirectoryPathExists",
+      "argCount": 1
+    },
+    {
+      "name": "MapDebugInformation",
+      "argCount": 4
+    },
+    {
+      "name": "MiniDumpReadDumpStream",
+      "argCount": 5
+    },
+    {
+      "name": "MiniDumpWriteDump",
+      "argCount": 7
+    },
+    {
+      "name": "SearchTreeForFile",
+      "argCount": 3
+    },
+    {
+      "name": "SearchTreeForFileW",
+      "argCount": 3
+    },
+    {
+      "name": "StackWalk",
+      "argCount": 9
+    },
+    {
+      "name": "StackWalk64",
+      "argCount": 9
+    },
+    {
+      "name": "StackWalkEx",
+      "argCount": 10
+    },
+    {
+      "name": "SymAddrIncludeInlineTrace",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymAddSymbol",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymAddSymbolW",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymCleanup",
+      "argCount": 1
+    },
+    {
+      "name": "SymEnumerateModules",
+      "argCount": 3
+    },
+    {
+      "name": "SymEnumerateModules64",
+      "argCount": 3
+    },
+    {
+      "name": "SymEnumerateModulesW64",
+      "argCount": 3
+    },
+    {
+      "name": "SymEnumerateSymbols",
+      "argCount": 4
+    },
+    {
+      "name": "SymEnumerateSymbols64",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumLines",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumSourceFiles",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumSourceFilesW",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumSourceLines",
+      "argCount": 9,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumSourceLinesW",
+      "argCount": 9,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumSymbols",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumSymbolsW",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumTypes",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumTypesByName",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumTypesByNameW",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymEnumTypesW",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFindFileInPath",
+      "argCount": 10
+    },
+    {
+      "name": "SymFindFileInPathW",
+      "argCount": 10
+    },
+    {
+      "name": "SymFromAddr",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFromAddrW",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFromIndex",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFromIndexW",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFromInlineContext",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFromInlineContextW",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymFromName",
+      "argCount": 3
+    },
+    {
+      "name": "SymFromNameW",
+      "argCount": 3
+    },
+    {
+      "name": "SymFunctionTableAccess",
+      "argCount": 2
+    },
+    {
+      "name": "SymFunctionTableAccess64",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetExtendedOption",
+      "argCount": 1
+    },
+    {
+      "name": "SymGetLineFromAddr",
+      "argCount": 4
+    },
+    {
+      "name": "SymGetLineFromAddr64",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetLineFromAddrW64",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetLineFromInlineContext",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetLineFromInlineContextW",
+      "argCount": 8,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetLineFromName",
+      "argCount": 6
+    },
+    {
+      "name": "SymGetLineFromName64",
+      "argCount": 6
+    },
+    {
+      "name": "SymGetLineFromNameW64",
+      "argCount": 6
+    },
+    {
+      "name": "SymGetLineNext",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetLineNext64",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetLineNextW64",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetLinePrev",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetLinePrev64",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetLinePrevW64",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetModuleBase",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetModuleBase64",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetModuleInfo",
+      "argCount": 3
+    },
+    {
+      "name": "SymGetModuleInfo64",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetModuleInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "SymGetModuleInfoW64",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetOptions",
+      "argCount": 0
+    },
+    {
+      "name": "SymGetSearchPath",
+      "argCount": 3
+    },
+    {
+      "name": "SymGetSearchPathW",
+      "argCount": 3
+    },
+    {
+      "name": "SymGetSourceFileToken",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetSourceFileTokenW",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetSymFromAddr",
+      "argCount": 4
+    },
+    {
+      "name": "SymGetSymFromAddr64",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetSymFromName",
+      "argCount": 3
+    },
+    {
+      "name": "SymGetSymFromName64",
+      "argCount": 3
+    },
+    {
+      "name": "SymGetSymNext",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetSymNext64",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetSymPrev",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetSymPrev64",
+      "argCount": 2
+    },
+    {
+      "name": "SymGetTypeFromName",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymGetTypeInfo",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymInitialize",
+      "argCount": 3
+    },
+    {
+      "name": "SymInitializeW",
+      "argCount": 3
+    },
+    {
+      "name": "SymLoadModule",
+      "argCount": 6
+    },
+    {
+      "name": "SymLoadModule64",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymLoadModuleEx",
+      "argCount": 9,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymLoadModuleExW",
+      "argCount": 9,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymMatchFileName",
+      "argCount": 4
+    },
+    {
+      "name": "SymMatchFileNameW",
+      "argCount": 4
+    },
+    {
+      "name": "SymMatchString",
+      "argCount": 3
+    },
+    {
+      "name": "SymMatchStringA",
+      "argCount": 3
+    },
+    {
+      "name": "SymMatchStringW",
+      "argCount": 3
+    },
+    {
+      "name": "SymQueryInlineTrace",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (int64, int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymRefreshModuleList",
+      "argCount": 1
+    },
+    {
+      "name": "SymRegisterCallback",
+      "argCount": 3
+    },
+    {
+      "name": "SymRegisterCallback64",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymRegisterCallbackW64",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymRegisterFunctionEntryCallback",
+      "argCount": 3
+    },
+    {
+      "name": "SymRegisterFunctionEntryCallback64",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymSearch",
+      "argCount": 11,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymSearchW",
+      "argCount": 11,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "SymSetContext",
+      "argCount": 3
+    },
+    {
+      "name": "SymSetExtendedOption",
+      "argCount": 2
+    },
+    {
+      "name": "SymSetHomeDirectory",
+      "argCount": 2
+    },
+    {
+      "name": "SymSetHomeDirectoryW",
+      "argCount": 2
+    },
+    {
+      "name": "SymSetOptions",
+      "argCount": 1
+    },
+    {
+      "name": "SymSetParentWindow",
+      "argCount": 1
+    },
+    {
+      "name": "SymSetScopeFromAddr",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymSetScopeFromIndex",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymSetScopeFromInlineContext",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SymSetSearchPath",
+      "argCount": 2
+    },
+    {
+      "name": "SymSetSearchPathW",
+      "argCount": 2
+    },
+    {
+      "name": "SymSrvGetFileIndexes",
+      "argCount": 5
+    },
+    {
+      "name": "SymSrvGetFileIndexesW",
+      "argCount": 5
+    },
+    {
+      "name": "SymSrvGetFileIndexInfo",
+      "argCount": 3
+    },
+    {
+      "name": "SymSrvGetFileIndexInfoW",
+      "argCount": 3
+    },
+    {
+      "name": "SymUnDName",
+      "argCount": 3
+    },
+    {
+      "name": "SymUnDName64",
+      "argCount": 3
+    },
+    {
+      "name": "SymUnloadModule",
+      "argCount": 2
+    },
+    {
+      "name": "SymUnloadModule64",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "UnDecorateSymbolName",
+      "argCount": 4
+    },
+    {
+      "name": "UnDecorateSymbolNameW",
+      "argCount": 4
+    },
+    {
+      "name": "UnmapDebugInformation",
+      "argCount": 1
+    },
+    {
+      "name": "WinDbgExtensionDllInit",
+      "argCount": 3
+    },
+    {
+      "name": "wine_get_module_information",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    }
+  ]
+}

@@ -3,11 +3,16 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { GlideBackendExecutor } from "../../backends/webgpu/glide/glide-backend-executor";
 import { System } from "../../core/system";
+import { framePacer } from "../../core/frame-pacer";
 import {
     FXFALSE,
     FXTRUE,
+    GLIDE_FBI_REV,
     GLIDE_FBRAM_MB,
+    GLIDE_TMU_COUNT,
     GLIDE_TMU_MEMORY_BYTES,
+    swizzleGlideColor,
+    GLIDE_TMU_REV,
     GLIDE_VERSION_STRING,
     GR_BUFFER_BACKBUFFER,
     GR_BUFFER_FRONTBUFFER,
@@ -122,17 +127,39 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
         "_grSstQueryHardware@4": (_ctx, _mem, args) => {
             const cfgPtr = args[0] >>> 0;
             if (!cfgPtr) return FXFALSE;
-            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(GLIDE_FBRAM_MB, 0);
-            context.diagnostics.push("init", `grSstQueryHardware cfg=0x${cfgPtr.toString(16)} ok=${ok ? 1 : 0}`);
+            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(
+                GLIDE_FBRAM_MB, GLIDE_FBI_REV, GLIDE_TMU_COUNT, GLIDE_TMU_MEMORY_BYTES >>> 20, GLIDE_TMU_REV);
+            context.diagnostics.push("init",
+                `grSstQueryHardware cfg=0x${cfgPtr.toString(16)} ok=${ok ? 1 : 0} ` +
+                `fbRam=${GLIDE_FBRAM_MB}MB nTexelfx=${GLIDE_TMU_COUNT} tmuRam=${GLIDE_TMU_MEMORY_BYTES >>> 20}MB`);
+            Logger.log(LogCategory.SYSTEM,
+                `[Glide] grSstQueryHardware -> 1 board, fbRam=${GLIDE_FBRAM_MB}MB fbiRev=${GLIDE_FBI_REV} ` +
+                `nTexelfx=${GLIDE_TMU_COUNT} tmuRev=${GLIDE_TMU_REV} tmuRam=${GLIDE_TMU_MEMORY_BYTES >>> 20}MB ok=${ok ? 1 : 0}`);
             return ok ? FXTRUE : FXFALSE;
         },
 
         "_grSstQueryBoards@4": (_ctx, _mem, args) => {
             const cfgPtr = args[0] >>> 0;
             if (!cfgPtr) return FXFALSE;
-            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(GLIDE_FBRAM_MB, 0);
+            const ok = hwConfigView.setPtr(cfgPtr).writeSingleVoodoo(
+                GLIDE_FBRAM_MB, GLIDE_FBI_REV, GLIDE_TMU_COUNT, GLIDE_TMU_MEMORY_BYTES >>> 20, GLIDE_TMU_REV);
             return ok ? FXTRUE : FXFALSE;
         },
+
+        // The resolution grSstWinOpen actually gave us. Titles read these instead of
+        // re-deriving the mode they asked for, and a garbage answer scales the HUD /
+        // sizes an LFB copy against the wrong stride.
+        "_grSstScreenWidth@0": () => context.width >>> 0,
+        "_grSstScreenHeight@0": () => context.height >>> 0,
+
+        // We render each Glide command synchronously, so the FIFO is never backed up;
+        // a title polling grSstIsBusy() before touching the LFB must see FXFALSE or it
+        // spins forever.
+        "_grSstIsBusy@0": () => FXFALSE,
+
+        // No beam: a title gating an LFB write on "are we in retrace" must be able to
+        // proceed, so the window is always open. FXFALSE here is the shape that hangs.
+        "_grSstVRetraceOn@0": () => FXTRUE,
 
         "_grSstSelect@4": (_ctx, _mem, args) => {
             context.selectedSst = args[0] | 0;
@@ -168,6 +195,18 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
                 System.getInstance().services.render.setActive(context.presenter);
             }
 
+            // A FULLSCREEN grSstWinOpen (hWnd == NULL) IS a mode set — the board takes the
+            // screen, so SM_CXSCREEN, window placement and the host's pointer mapping must
+            // follow it. With an hWnd the app is rendering into a window INSIDE the desktop,
+            // and publishing that as the mode would rewrite the desktop out from under it.
+            const sys = System.getInstance();
+            const fullscreen = (args[0] >>> 0) === 0;
+            if (fullscreen) {
+                const prev = sys.emulatedDisplayMode;
+                context.modeBeforeWinOpen = prev ? { ...prev } : null;
+            }
+            sys.requestHostResize(context.width, context.height, { modeSet: fullscreen });
+
             context.diagnostics.push("winopen", `${context.width}x${context.height} fmt=${context.colorFormat}`);
             Logger.log(
                 LogCategory.SYSTEM,
@@ -181,6 +220,15 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
             revokeAllLfbLeases(context);
             destroyLfbSurfaces(context);
             context.winOpen = false;
+            // The board releases the screen: the desktop mode it displaced comes back, or a
+            // launcher returning to DDraw/GDI inherits the Voodoo resolution as its desktop.
+            const prev = context.modeBeforeWinOpen;
+            context.modeBeforeWinOpen = null;
+            if (prev && prev.width > 0 && prev.height > 0) {
+                System.getInstance().requestHostResize(prev.width, prev.height, {
+                    modeSet: true, bpp: prev.bpp, refreshRate: prev.refreshRate,
+                });
+            }
             System.getInstance().services.render.setActive(null);
             context.stream.reset();
             context.diagnostics.push("winclose", "grSstWinClose");
@@ -209,7 +257,7 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
             return 0;
         },
 
-        "_grBufferSwap@4": (_ctx, _mem, args) => {
+        "_grBufferSwap@4": (_ctx, _mem, args): number | Promise<number> => {
             if (!context.winOpen || !context.presenter) {
                 return FXFALSE;
             }
@@ -219,11 +267,15 @@ export function createHardwareExports(context: GlideContext): Record<string, Thu
             const swapInterval = args[0] | 0;
             const ok = context.presenter.presentFrame(swapInterval);
             context.diagnostics.push("swap", `interval=${swapInterval} ok=${ok ? 1 : 0}`);
-            return ok ? FXTRUE : FXFALSE;
+            if (!ok) return FXFALSE;
+            // Glide: 0 swaps without waiting for a vertical retrace, N>0 waits N retraces.
+            // The swap itself runs first so the frame we read is the LFB as the guest left
+            // it at the call — the retrace hold must not straddle other threads' execution.
+            return framePacer.waitForPresentInterval(Math.max(0, swapInterval)).then(() => FXTRUE);
         },
 
         "_grBufferClear@12": (_ctx, _mem, args) => {
-            const color = args[0] >>> 0;
+            const color = swizzleGlideColor(args[0] >>> 0, context.colorFormat);
             const depth = args[2] & 0xffff;
             context.pendingClearColor = color;
             context.pendingClearDepth = depth;

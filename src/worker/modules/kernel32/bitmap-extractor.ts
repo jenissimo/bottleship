@@ -87,6 +87,10 @@ export function loadBitmapFromPeResource(
         isTopDown: boolean;
         loading: boolean;
         palette?: Uint32Array;
+        bitCount: number;
+        dibStride: number;
+        dibTopDown: boolean;
+        dibBits: Uint8Array;
     } = {
         type: 'BITMAP',
         name: resourceName,
@@ -95,6 +99,13 @@ export function loadBitmapFromPeResource(
         pixels,
         isTopDown: header.isTopDown,
         loading: false,
+        // An RT_BITMAP resource IS a DIB: keep its own depth, stride and rows so
+        // GetObject can report the real DIBSECTION a LR_CREATEDIBSECTION caller asked
+        // for. The 32bpp `pixels` above is the GPU-upload form, not the guest's view.
+        bitCount: header.bitsPerPixel,
+        dibStride: header.rowSize,
+        dibTopDown: header.isTopDown,
+        dibBits: bmpData.slice(header.offset, header.offset + header.rowSize * header.height),
     };
     if (header.palette) {
         resourceData.palette = header.palette;

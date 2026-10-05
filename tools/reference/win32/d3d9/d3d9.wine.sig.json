@@ -1,0 +1,55 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.880Z",
+  "module": "d3d9",
+  "functions": [
+    {
+      "name": "D3DPERF_BeginEvent",
+      "argCount": 2
+    },
+    {
+      "name": "D3DPERF_EndEvent",
+      "argCount": 0
+    },
+    {
+      "name": "D3DPERF_GetStatus",
+      "argCount": 0
+    },
+    {
+      "name": "D3DPERF_QueryRepeatFrame",
+      "argCount": 0
+    },
+    {
+      "name": "D3DPERF_SetMarker",
+      "argCount": 2
+    },
+    {
+      "name": "D3DPERF_SetOptions",
+      "argCount": 1
+    },
+    {
+      "name": "D3DPERF_SetRegion",
+      "argCount": 2
+    },
+    {
+      "name": "DebugSetMute",
+      "argCount": 0
+    },
+    {
+      "name": "Direct3DCreate9",
+      "argCount": 1
+    },
+    {
+      "name": "Direct3DCreate9Ex",
+      "argCount": 2
+    },
+    {
+      "name": "Direct3DCreate9On12",
+      "argCount": 3
+    },
+    {
+      "name": "Direct3DShaderValidatorCreate9",
+      "argCount": 0
+    }
+  ]
+}

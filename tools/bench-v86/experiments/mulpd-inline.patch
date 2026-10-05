@@ -1,0 +1,60 @@
+diff --git a/src/rust/jit_instructions.rs b/src/rust/jit_instructions.rs
+--- a/src/rust/jit_instructions.rs
++++ b/src/rust/jit_instructions.rs
+@@ -6498,9 +6498,54 @@
+ pub fn instr_660F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+-    sse_read128_xmm_mem(ctx, "instr_660F59", modrm_byte, r);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    let src = global_pointers::sse_scratch_register as u32;
++    // Complete the full faulting read before modifying either destination lane.
++    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, src);
++    mulpd_inline(ctx, src, r);
+ }
+ pub fn instr_660F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+-    sse_read128_xmm_xmm(ctx, "instr_660F59", r1, r2);
++    codegen::gen_mark_fpu_simd_dirty_once(ctx);
++    mulpd_inline(ctx, global_pointers::get_reg_xmm_offset(r1), r2);
+ }
++fn mulpd_inline(ctx: &mut JitContext, src: u32, r: u32) {
++    let dst = global_pointers::get_reg_xmm_offset(r);
++    // Retain the existing helper for every non-finite operand. NaN payload
++    // selection is not preserved by merely repeating the Rust operand order.
++    for (i, address) in [src + 4, src + 12, dst + 4, dst + 12].iter().enumerate() {
++        ctx.builder.load_fixed_i32(*address);
++        ctx.builder.const_i32(0x7ff00000);
++        ctx.builder.and_i32();
++        ctx.builder.const_i32(0x7ff00000);
++        ctx.builder.eq_i32();
++        if i != 0 { ctx.builder.or_i32(); }
++    }
++    ctx.builder.if_void();
++    let scratch = global_pointers::sse_scratch_register as u32;
++    if src != scratch {
++        // Same by-value copy as sse_read128_xmm_xmm, safe even for aliases.
++        for lane in [0, 8] {
++            ctx.builder.const_i32((scratch + lane) as i32);
++            ctx.builder.const_i32((src + lane) as i32);
++            ctx.builder.load_aligned_i64(0);
++            ctx.builder.store_aligned_i64(0);
++        }
++    }
++    ctx.builder.const_i32(scratch as i32);
++    ctx.builder.const_i32(r as i32);
++    ctx.builder.call_fn2("instr_660F59");
++    ctx.builder.else_();
++    // Match the helper's source * destination operand order. Each lane reads
++    // both operands before its store, including the r1 == r2 case.
++    for lane in [0, 8] {
++        ctx.builder.const_i32((dst + lane) as i32);
++        ctx.builder.const_i32((src + lane) as i32);
++        ctx.builder.load_aligned_f64(0);
++        ctx.builder.const_i32((dst + lane) as i32);
++        ctx.builder.load_aligned_f64(0);
++        ctx.builder.mul_f64();
++        ctx.builder.store_aligned_f64(0);
++    }
++    ctx.builder.block_end();
++}
+ pub fn instr_F20F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+     sse_read64_xmm_mem(ctx, "instr_F20F59", modrm_byte, r);
+ }

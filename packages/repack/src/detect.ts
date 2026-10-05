@@ -4,11 +4,11 @@
 
  *
 
- * Cheap head sniff (PK / MZ) is done in the worker before reading the full blob.
+ * Cheap head sniff (PK / MZ) precedes random-access installer detection.
 
  * MZ executables may embed Inno setup.0 at the end of the file; detection requires
 
- * the complete buffer (offsets table is not reachable from the first 64 KiB).
+ * bounded reads at the offsets table and version marker.
 
  */
 
@@ -25,6 +25,8 @@ import {
     readVersionAt,
 
     assertSupportedVersion,
+
+    type RandomAccessSource,
 
 } from "@bottleship/formats/inno";
 
@@ -66,6 +68,15 @@ export function sniffBlobHead(head: Uint8Array): BlobHeadKind {
 
 export function detectFormat(data: Uint8Array): DetectedFormat {
 
+    return detectSourceFormat(new BufferSource(data));
+
+}
+
+/** Range-based detection; the Inno offset table can be near EOF. */
+export function detectSourceFormat(source: RandomAccessSource): DetectedFormat {
+
+    const data = source.readRangeSync(0, Math.min(64, source.size));
+
     if (data.byteLength >= 4 &&
 
         data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04) {
@@ -85,8 +96,6 @@ export function detectFormat(data: Uint8Array): DetectedFormat {
 
 
     try {
-
-        const source = new BufferSource(data);
 
         const offsets = loadOffsets(source);
 

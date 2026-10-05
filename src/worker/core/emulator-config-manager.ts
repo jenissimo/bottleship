@@ -173,6 +173,25 @@ const decoderCache = new Map<number, CodePageDecoder>();
 const encoderCache = new Map<number, Map<number, number>>();
 
 /**
+ * Code pages whose encoding is multi-byte (DBCS/MBCS/UTF). Everything else getCodePageDecoder
+ * can answer with — the LUT decoders and every CP_TO_ENCODING label, plus the windows-1252
+ * fallback an unknown page lands on — maps one byte to one code unit.
+ *
+ * This is an explicit list because the property CANNOT be probed from a decoder: today an
+ * unlisted page falls back to windows-1252 and decodes byte-at-a-time, and even a real
+ * shift_jis decoder turns a lone lead byte into exactly one U+FFFD. A caller that builds a
+ * 256-entry table must ask here, not measure.
+ */
+const MULTIBYTE_CODEPAGES = new Set([
+    932, 936, 949, 950, 1361, 51932, 51936, 51949, 52936, 54936, 57002, 65000, 65001,
+]);
+
+/** May a 256-entry byte -> UTF-16 table stand in for getCodePageDecoder on this page? */
+export function isSingleByteCodePage(codePage: number): boolean {
+    return !MULTIBYTE_CODEPAGES.has(codePage);
+}
+
+/**
  * Get a decoder for the given Windows code page.
  * Falls back to windows-1252 for unknown code pages.
  * Uses a LUT-backed decoder for DOS code pages the browser doesn't support.
@@ -276,13 +295,32 @@ export class EmulatorConfig {
 
     // Graphics quality enhancements (AF, gamma/brightness/contrast/sat, scaling, post-FX).
     // NEUTRAL by default — a fresh config reproduces exact pre-feature behavior.
-    // Treated as a GLOBAL user preference (like hleLibs): the host pushes the user's
-    // saved settings via set_quality, and a per-game manifest.emulator.quality layers
-    // on top at load. Intentionally NOT cleared by reset() (see note there).
+    //
+    // Two layers, kept SEPARATE and re-derived, never merged in place. The host treats its
+    // settings as a global user preference and re-sends the whole object after every load
+    // (App.tsx, on the load-"done" message), so a manifest override merged into one shared
+    // value is overwritten by the very next message — which is what made
+    // manifest.emulator.quality inert. Effective = user pref, then manifest on top.
     public quality: QualityConfig = { ...DEFAULT_QUALITY };
+    /** The global user preference (set_quality / dbg.quality). Survives reset(). */
+    private qualityUserPref: QualityConfig = { ...DEFAULT_QUALITY };
+    /** The current game's manifest override. Per-game, so reset() MUST drop it. */
+    private qualityManifest: Partial<QualityConfig> | null = null;
 
     // Skip video playback (BinkOpen/SmackOpen return stubs)
-    public skipVideo = false;
+    private skipVideoRequested = false;
+
+    /**
+     * A game whose MENU is built on video (CryEngine's background loops) breaks under a
+     * skip that reports the open as FAILED, so `__forceVideoPlayback` overrides the
+     * manifest without repacking a multi-gigabyte bundle — the A/B that tells a video
+     * bug apart from a skip artefact.
+     */
+    public get skipVideo(): boolean {
+        if ((globalThis as { __forceVideoPlayback?: boolean }).__forceVideoPlayback) return false;
+        return this.skipVideoRequested;
+    }
+    public set skipVideo(value: boolean) { this.skipVideoRequested = value; }
 
     // Strict x87 FPU: boot with relaxed-FPU (f64 fast path) DISABLED so all FPU runs at
     // full 80-bit extended precision. For titles whose code is precision-sensitive at the
@@ -303,23 +341,12 @@ export class EmulatorConfig {
     // Per-game deny-list for LoadLibrary* (case-insensitive; wildcard allowed)
     public disabledDlls: string[] = [];
 
-    // Fake ShellExecuteA subprocess results
-    public shellExecFake: Array<{
-        match: string;
-        createFiles: Array<{ path: string; content?: string; copyFrom?: string; ifAbsent?: boolean }>;
-    }> = [];
-
-    // Unreal Engine 1 first-run support (set at bundle load by detectUe1()).
-    // Gates the generic UE1 config seeding (Default.ini D3D pin + reactive
-    // Detected.ini / config-ini materialization in CreateFile*). Detection keys
-    // on System/Core+Engine packages, so non-UE1 games leave this false and are
-    // completely unaffected. Reset to false on every boot (see reset()).
-    public ue1 = false;
-
-    // Learned UE1 "user dir" — the directory the game reads its active config and
-    // Detected.ini from (baked into the exe; e.g. C:\My Documents\Hp demo). Set
-    // reactively the first time Detected.ini/Detected.log is opened. null until learned.
-    public ue1UserDir: string | null = null;
+    // DLL names whose copy in the GAME DIRECTORY wins over our HLE module — Windows'
+    // real search order (the application directory precedes System32 for anything that
+    // is not a KnownDLL). Wrapper/proxy DLLs a game ships next to its exe (ASI loaders,
+    // Glide and ddraw wrappers) only run at all under this. Same rule syntax as
+    // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
+    public appDirDlls: string[] = [];
 
     // VFS paths to delete from CoW overlay on every boot
     public deleteOnBoot: string[] = [];
@@ -330,6 +357,16 @@ export class EmulatorConfig {
     // Directories mkdir-p'd in the VFS on every boot (installer-created empty dirs
     // that store-only ZIP packing loses; e.g. Max Payne's <install>\data tree)
     public createDirs: string[] = [];
+
+    /**
+     * Guest working directory at boot. Empty means "the entrypoint's own folder", which is
+     * right whenever the exe sits at the install root. It is NOT right for an image a
+     * launcher starts: CreateProcess gives the child the PARENT's directory, so an engine
+     * module under a subfolder runs with the install ROOT as its cwd and resolves every
+     * data path against it. Booting such an image directly without this doubles the
+     * subfolder into the path, and the engine reports its own data as unbuilt.
+     */
+    public workingDir = "";
 
     /**
      * Guarded Inner-Loop HLE — signature-detects known
@@ -369,6 +406,15 @@ export class EmulatorConfig {
             EmulatorConfig.instance = new EmulatorConfig();
         }
         return EmulatorConfig.instance;
+    }
+
+    /** Process creation inherits configuration, without replaying any boot file mutations. */
+    snapshotForChild(): Record<string, unknown> { return structuredClone({ ...this }) as unknown as Record<string, unknown>; }
+    restoreForChild(snapshot: Record<string, unknown>): void {
+        const fields = this as unknown as Record<string, unknown>;
+        for (const key of Object.keys(this)) {
+            if (Object.hasOwn(snapshot, key)) fields[key] = structuredClone(snapshot[key]);
+        }
     }
 
     /**
@@ -541,7 +587,8 @@ export class EmulatorConfig {
 
         // Apply per-game graphics quality override (layers on top of the global user pref)
         if (config.quality) {
-            this.quality = mergeQuality(this.quality, config.quality as Partial<QualityConfig>);
+            this.qualityManifest = config.quality as Partial<QualityConfig>;
+            this.recomputeQuality();
             Logger.log(
                 LogCategory.SYSTEM,
                 `EmulatorConfig: quality from manifest (aniso=${this.quality.anisotropy} bright=${this.quality.brightness} aspect=${this.quality.aspectMode})`
@@ -559,10 +606,15 @@ export class EmulatorConfig {
             );
         }
 
-        // Apply shellExecFake rules
-        if (config.shellExecFake && config.shellExecFake.length > 0) {
-            this.shellExecFake = config.shellExecFake;
-            Logger.log(LogCategory.SYSTEM, `EmulatorConfig: ${this.shellExecFake.length} shellExecFake rule(s) loaded`);
+        // Apply the app-directory-wins list (game-shipped wrapper/proxy DLLs)
+        if (config.appDirDlls && config.appDirDlls.length > 0) {
+            this.appDirDlls = config.appDirDlls
+                .map((rule) => typeof rule === "string" ? rule.trim() : "")
+                .filter((rule) => rule.length > 0);
+            Logger.log(
+                LogCategory.SYSTEM,
+                `EmulatorConfig: appDirDlls loaded (${this.appDirDlls.length}): ${this.appDirDlls.join(", ")}`
+            );
         }
 
         // Apply deleteOnBoot list
@@ -586,8 +638,16 @@ export class EmulatorConfig {
             );
         }
 
+        if (typeof config.workingDir === "string" && config.workingDir.trim().length > 0) {
+            this.workingDir = config.workingDir.trim();
+            Logger.log(LogCategory.SYSTEM, `EmulatorConfig: workingDir = "${this.workingDir}"`);
+        }
+
         // Apply createDirs list (installer-created empty dirs lost by ZIP packing)
-        if (config.createDirs && config.createDirs.length > 0) {
+        if (config.createDirs && !Array.isArray(config.createDirs)) {
+            Logger.error(LogCategory.SYSTEM,
+                `EmulatorConfig: createDirs must be an array of paths, got ${typeof config.createDirs} — ignored`);
+        } else if (config.createDirs && config.createDirs.length > 0) {
             this.createDirs = config.createDirs
                 .filter((d) => typeof d === "string" && d.trim().length > 0);
             Logger.log(
@@ -602,8 +662,16 @@ export class EmulatorConfig {
      * Validates + clamps + merges onto the current config. Returns the new effective config.
      */
     applyQuality(partial: Partial<QualityConfig> | null | undefined): QualityConfig {
-        this.quality = mergeQuality(this.quality, partial);
+        this.qualityUserPref = mergeQuality(this.qualityUserPref, partial);
+        this.recomputeQuality();
         return this.quality;
+    }
+
+    /** Effective config = the global user pref with the current game's manifest on top. */
+    private recomputeQuality(): void {
+        this.quality = this.qualityManifest
+            ? mergeQuality(this.qualityUserPref, this.qualityManifest)
+            : { ...this.qualityUserPref };
     }
 
     /**
@@ -623,17 +691,24 @@ export class EmulatorConfig {
         this.skipVideo = false;
         this.fpuStrict = false;
         this.disabledDlls = [];
-        this.shellExecFake = [];
+        this.appDirDlls = [];
         this.deleteOnBoot = [];
         this.writeFiles = [];
         this.createDirs = [];
-        this.ue1 = false;
-        this.ue1UserDir = null;
+        // Manifest-only when present: without this, a CP1251/non-US title leaves its
+        // ACP/OEMCP/LCID for the next Western title that omits those fields.
+        this.ansiCodePage = 1252;
+        this.oemCodePage = 437;
+        this.lcid = 0x0409;
         // hleLibs intentionally NOT reset — it's a dev/debug toggle that the
         // user flips once (hleEnable) and expects to persist across loadApp.
         // A per-game manifest could still opt-in via applyFromManifest later.
-        // quality intentionally NOT reset — global user preference (set via
-        // set_quality from host localStorage); manifest.quality layers on at load.
+        // The USER PREF layer is intentionally NOT reset — it is a global preference (set via
+        // set_quality from host localStorage). The MANIFEST layer is per-game and must go, or
+        // the previous title's override outlives it; reset() runs immediately before every
+        // applyFromManifest for exactly this reason.
+        this.qualityManifest = null;
+        this.recomputeQuality();
     }
 
     /**
@@ -644,9 +719,13 @@ export class EmulatorConfig {
     getVersionValue(): number {
         const { major, minor, build, platformId } = this.osVersion;
         if (platformId === VER_PLATFORM_WIN32_WINDOWS) {
-            // Win9x format: 0x80000000 | (build << 16) | (minor << 8) | major
-            // Note: Bit 31 is set for Win9x. Build is often just high word.
-            return 0x80000000 | ((build & 0x7fff) << 16) | ((minor & 0xff) << 8) | (major & 0xff);
+            // Win9x format: 0xC000|build in the high word, minor/major in the low word
+            // (Win95 4.0.950 -> 0xC3B60004, Win98 4.10.2222 -> 0xC8AE0A04).
+            // BOTH top bits must be set: bit31 alone (bit30 clear) is the Win32s
+            // encoding, and the era's runtimes test exactly that — a Watcom CRT
+            // reading 0x80000000 goes looking for W32SKRNL.DLL's module table
+            // instead of walking its own PE headers, then calls into garbage.
+            return (0xc0000000 | ((build & 0x3fff) << 16) | ((minor & 0xff) << 8) | (major & 0xff)) >>> 0;
         } else {
             // WinNT format: (build << 16) | (minor << 8) | major
             // Bit 31 is clear for NT. Low word is minor/major. High word is build.

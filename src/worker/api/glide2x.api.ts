@@ -15,6 +15,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -42,6 +43,10 @@ export const glide2xModule: ModuleDescriptor = {
         makeFunc("_grSstControl@4", 1),              // GR_CONTROL_ACTIVATE/DEACTIVATE -> FX_TRUE
         makeFunc("_grSstPerformSelfTest@0", 0),
         makeFunc("_grSstQueryMemory@8", 2),          // FxU32* fbRam, FxU32* texRam
+        makeFunc("_grSstScreenWidth@0", 0),          // FxU32 — resolution grSstWinOpen gave us
+        makeFunc("_grSstScreenHeight@0", 0),         // FxU32
+        makeFunc("_grSstIsBusy@0", 0),               // FxBool — FIFO backlog (never, we are synchronous)
+        makeFunc("_grSstVRetraceOn@0", 0),           // FxBool — inside vertical retrace
         makeFunc("_grDisableAllEffects@0", 0),
 
         // Error / callback

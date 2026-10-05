@@ -1,0 +1,167 @@
+.wgb-modal {
+  width: 720px;
+  max-width: 92vw;
+  height: 640px;
+  max-height: 88vh;
+}
+
+.wgb-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 24px 0;
+}
+
+.wgb-filter {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #1f2a3a;
+  background: #0b0f14;
+  color: #e6f0ff;
+  font-size: 13px;
+  outline: none;
+}
+
+.wgb-filter:focus {
+  border-color: #2f6f8a;
+}
+
+.wgb-route {
+  font-size: 11px;
+  color: #6f8296;
+  white-space: nowrap;
+}
+
+.wgb-route.warn {
+  color: #e3c98f;
+}
+
+.wgb-error,
+.wgb-warn {
+  margin: 12px 24px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.wgb-error {
+  background: #2c1518;
+  color: #f2b8be;
+}
+
+.wgb-error-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #c79aa1;
+}
+
+.wgb-warn {
+  background: #2c2417;
+  color: #e3c98f;
+}
+
+.wgb-empty {
+  color: #6f8296;
+  font-size: 13px;
+  padding: 8px 2px;
+}
+
+/* .modal-body is a non-scrolling flex column by default — the list is what scrolls. */
+.wgb-list {
+  display: block;
+  overflow-y: auto;
+  padding-top: 14px;
+}
+
+.wgb-section {
+  margin-bottom: 10px;
+}
+
+.wgb-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 4px 2px;
+  color: #94a4b8;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.wgb-section-head:hover {
+  color: #e6f0ff;
+}
+
+.wgb-caret {
+  width: 10px;
+}
+
+.wgb-section-label {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wgb-section-count {
+  color: #4d5f72;
+}
+
+.wgb-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #cfdcea;
+}
+
+.wgb-row.selected {
+  background: #16222f;
+  color: #e6f0ff;
+}
+
+.wgb-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wgb-meta {
+  font-size: 11px;
+  color: #6f8296;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wgb-copy {
+  background: none;
+  border: 1px solid #1f2a3a;
+  border-radius: 6px;
+  color: #6f8296;
+  font-size: 10px;
+  padding: 2px 6px;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.wgb-row:hover .wgb-copy,
+.wgb-row.selected .wgb-copy {
+  opacity: 1;
+}
+
+.wgb-copy:hover {
+  color: #e6f0ff;
+  border-color: #2f6f8a;
+}

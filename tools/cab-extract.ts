@@ -17,7 +17,8 @@
  */
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { inflateRawSync } from "zlib";
-import { dirname, resolve, sep } from "path";
+import { dirname, resolve } from "path";
+import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { findCabinet, parseCabHeader, extractCabToMap, type CabInflateBlock } from "@bottleship/formats/cab";
 
 const args = process.argv.slice(2);
@@ -65,12 +66,12 @@ mkdirSync(outDir, { recursive: true });
 const outRoot = resolve(outDir);
 let bytes = 0;
 for (const [name, data] of files) {
-    const dest = resolve(outRoot, name);
-    // Reject a cabinet entry whose name escapes the output dir (`..`, absolute).
-    if (dest !== outRoot && !dest.startsWith(outRoot + sep)) {
-        console.error(`Refusing to write outside ${outRoot}: ${name}`);
+    const resolved = tryResolveArchiveExtractPath(outRoot, name);
+    if (!resolved.ok) {
+        console.error(`Refusing to write outside ${outRoot} (${resolved.reason}): ${name}`);
         process.exit(1);
     }
+    const dest = resolved.path;
     mkdirSync(dirname(dest), { recursive: true });
     writeFileSync(dest, data);
     bytes += data.length;

@@ -40,4 +40,11 @@ export interface Legacy3DDrawCommand {
     alphaTestFunc: number; // GR_CMP_*
     fogMode: number; // GrFogMode_t
     fogColor: number; // 0x00RRGGBB
+    /** grTexMipMapMode != GR_MIPMAP_DISABLE — otherwise the TMU samples LOD 0 only. */
+    mipMapEnabled: boolean;
+    /** grClipWindow, in vertex screen space; the rasterizer must not touch pixels outside it. */
+    clipX0: number;
+    clipY0: number;
+    clipX1: number;
+    clipY1: number;
 }

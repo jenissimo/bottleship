@@ -1,0 +1,116 @@
+/* Corner handle + menu. Sits above the control layer (z 3) and the status chip (z 4). */
+.hud {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.hud--tl { top: calc(8px + env(safe-area-inset-top, 0px)); left: calc(8px + env(safe-area-inset-left, 0px)); align-items: flex-start; }
+.hud--tr { top: calc(8px + env(safe-area-inset-top, 0px)); right: calc(8px + env(safe-area-inset-right, 0px)); }
+.hud--bl { bottom: calc(8px + env(safe-area-inset-bottom, 0px)); left: calc(8px + env(safe-area-inset-left, 0px)); align-items: flex-start; flex-direction: column-reverse; }
+.hud--br { bottom: calc(8px + env(safe-area-inset-bottom, 0px)); right: calc(8px + env(safe-area-inset-right, 0px)); flex-direction: column-reverse; }
+
+.hud__handle {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--r-md, 10px);
+  border: 1px solid rgba(220, 235, 240, 0.2);
+  background: rgba(7, 13, 17, 0.5);
+  backdrop-filter: blur(3px);
+  color: var(--fg-2, #8eabb4);
+  opacity: 0.55;
+  transition: opacity var(--t-fast, 0.15s) ease, border-color var(--t-fast, 0.15s) ease;
+}
+
+.hud--open .hud__handle {
+  opacity: 1;
+  border-color: var(--cyan, #46c8d8);
+  color: var(--cyan-soft, #8fe6f0);
+}
+
+/* Three stacked bars, drawn rather than shipped as an icon font. */
+.hud__dots {
+  width: 16px;
+  height: 2px;
+  background: currentColor;
+  box-shadow: 0 -5px 0 currentColor, 0 5px 0 currentColor;
+}
+
+.hud__menu {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 180px;
+  max-height: calc(100dvh - 96px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  border-radius: var(--r-md, 10px);
+  border: 1px solid var(--line-2, #23404c);
+  background: rgba(7, 13, 17, 0.94);
+  backdrop-filter: blur(10px);
+  box-shadow: var(--sh-2, 0 12px 30px rgba(0, 0, 0, 0.5));
+}
+
+.hud__item {
+  min-height: 44px;
+  padding: 0 12px;
+  text-align: left;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-1, #e9f4f4);
+  font-size: var(--fs-sm, 0.82rem);
+}
+
+.hud__item:active {
+  background: rgba(70, 200, 216, 0.18);
+  border-color: rgba(70, 200, 216, 0.4);
+}
+
+.hud__group {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line-1, #182a33);
+}
+
+.hud__group-label {
+  display: block;
+  padding: 0 4px 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: var(--fs-2xs, 0.68rem);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-3, #5a767f);
+}
+
+.hud__segments {
+  display: flex;
+  gap: 2px;
+}
+
+.hud__segment {
+  flex: 1 1 0;
+  min-height: 38px;
+  border-radius: var(--r-sm, 6px);
+  border: 1px solid var(--line-1, #182a33);
+  background: rgba(18, 32, 41, 0.7);
+  color: var(--fg-2, #8eabb4);
+  font-size: var(--fs-2xs, 0.68rem);
+}
+
+.hud__segment.is-on {
+  background: rgba(70, 200, 216, 0.24);
+  border-color: var(--cyan, #46c8d8);
+  color: #fff;
+}

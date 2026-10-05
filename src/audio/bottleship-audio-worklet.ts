@@ -7,66 +7,38 @@ declare const sampleRate: number;
 declare const currentTime: number;
 declare function registerProcessor(name: string, ctor: typeof AudioWorkletProcessor): void;
 
-// ─── Inline ring buffer constants (duplicated from audio-ring-buffer.ts to avoid import issues in worklet scope) ───
+// The build bundles this file (vite.config.ts), so the control-block contract is
+// IMPORTED rather than re-declared: the worker writes these fields and this file
+// reads them, and a layout that drifted between the two is silent — the mixer just
+// misreads a format and drops the source.
 
-const CTRL_PLAY_CURSOR = 0;
-const CTRL_WRITE_CURSOR = 1;
-const CTRL_BUFFER_BYTES = 2;
-const CTRL_CHANNELS = 3;
-const CTRL_SAMPLE_RATE = 4;
-const CTRL_BITS_PER_SAMPLE = 5;
-const CTRL_BLOCK_ALIGN = 6;
-const CTRL_STATE = 7;
-const CTRL_LOOP_MODE = 8;
-const CTRL_VOLUME = 9;
-const CTRL_PAN = 10;
-const CTRL_FREQUENCY = 11;
-const CTRL_DATA_LENGTH = 12;
-const CTRL_STOP_REQUESTED = 13;
-const CTRL_FLAGS = 14;
-const CTRL_RESET_POSITION = 15;
-const CTRL_BLOCK_BYTES = 128;
-const STATE_PLAYING = 1;
-const FLAG_CIRCULAR = 1;
-const FLAG_STREAMING = 2;
-const FLAG_LOOP_STREAM = 4;
+import {
+    CTRL_PLAY_CURSOR, CTRL_WRITE_CURSOR, CTRL_BUFFER_BYTES, CTRL_CHANNELS,
+    CTRL_SAMPLE_RATE, CTRL_BITS_PER_SAMPLE, CTRL_BLOCK_ALIGN, CTRL_STATE,
+    CTRL_LOOP_MODE, CTRL_VOLUME, CTRL_PAN, CTRL_FREQUENCY, CTRL_DATA_LENGTH,
+    CTRL_STOP_REQUESTED, CTRL_FLAGS, CTRL_RESERVED, CTRL_BLOCK_BYTES, CTRL_SLOTS,
+    STATE_PLAYING, FLAG_CIRCULAR, FLAG_STREAMING,
+    CTRL_3D_POS_X, CTRL_3D_POS_Y, CTRL_3D_POS_Z,
+    CTRL_3D_VEL_X, CTRL_3D_VEL_Y, CTRL_3D_VEL_Z,
+    CTRL_3D_MIN_DIST, CTRL_3D_MAX_DIST, CTRL_3D_MODE,
+    CTRL_3D_CONE_INNER, CTRL_3D_CONE_OUTER,
+    CTRL_3D_CONE_ORI_X, CTRL_3D_CONE_ORI_Y, CTRL_3D_CONE_ORI_Z,
+    CTRL_3D_CONE_OUTVOL, CTRL_3D_FLAGS,
+    CTRL_3D_ROLLOFF, CTRL_3D_MIN_GAIN, CTRL_3D_MAX_GAIN,
+    FLAG3D_HAS_3D, FLAG3D_SOURCE_ROLLOFF,
+    LCTRL_POS_X, LCTRL_POS_Y, LCTRL_POS_Z,
+    LCTRL_VEL_X, LCTRL_VEL_Y, LCTRL_VEL_Z,
+    LCTRL_FRONT_X, LCTRL_FRONT_Y, LCTRL_FRONT_Z,
+    LCTRL_TOP_X, LCTRL_TOP_Y, LCTRL_TOP_Z,
+    LCTRL_DIST_FACTOR, LCTRL_ROLLOFF_FACTOR, LCTRL_DOPPLER_FACTOR,
+    LCTRL_GAIN, LCTRL_DISTANCE_MODEL, LCTRL_SPEED_OF_SOUND, LCTRL_FLAGS,
+    LFLAG_LEFT_HANDED, LISTENER_SLOTS,
+    i32ToFloat,
+} from "./audio-ring-buffer";
+import { spatialize, makeSpatialResult, type SpatialParams } from "./spatializer";
 
-// ─── 3D per-buffer control fields ───────────────────────────────────────────
-
-const CTRL_3D_POS_X = 16;
-const CTRL_3D_POS_Y = 17;
-const CTRL_3D_POS_Z = 18;
-const CTRL_3D_VEL_X = 19;
-const CTRL_3D_VEL_Y = 20;
-const CTRL_3D_VEL_Z = 21;
-const CTRL_3D_MIN_DIST = 22;
-const CTRL_3D_MAX_DIST = 23;
-const CTRL_3D_MODE = 24;
-const CTRL_3D_CONE_INNER = 25;
-const CTRL_3D_CONE_OUTER = 26;
-const CTRL_3D_CONE_ORI_X = 27;
-const CTRL_3D_CONE_ORI_Y = 28;
-const CTRL_3D_CONE_ORI_Z = 29;
-const CTRL_3D_CONE_OUTVOL = 30;
-const CTRL_3D_FLAGS = 31;
-
-// ─── Listener SAB fields ────────────────────────────────────────────────────
-
-const LCTRL_POS_X = 0;
-const LCTRL_POS_Y = 1;
-const LCTRL_POS_Z = 2;
-const LCTRL_VEL_X = 3;
-const LCTRL_VEL_Y = 4;
-const LCTRL_VEL_Z = 5;
-const LCTRL_FRONT_X = 6;
-const LCTRL_FRONT_Y = 7;
-const LCTRL_FRONT_Z = 8;
-const LCTRL_TOP_X = 9;
-const LCTRL_TOP_Y = 10;
-const LCTRL_TOP_Z = 11;
-const LCTRL_DIST_FACTOR = 12;
-const LCTRL_ROLLOFF_FACTOR = 13;
-const LCTRL_DOPPLER_FACTOR = 14;
+/** CTRL_RESERVED under the name this file uses it for: a producer-set seek request. */
+const CTRL_RESET_POSITION = CTRL_RESERVED;
 
 // ─── Signal-stats SAB fields (duplicated from audio-ring-buffer.ts) ─────────
 
@@ -81,13 +53,35 @@ const STATS_MAX_JUMP_MILLI = 7;
 const STATS_UNDERRUN_MID = 8;
 const STATS_STARVED_BLOCKS = 9;
 const STATS_ACTIVE_LEGACY = 10;
+// Loudest single source of the window, and how much of the block's level the sources
+// account for. The block peak alone cannot say WHO is loud: it is a max over a window
+// while a buffer listing is an instantaneous snapshot, so a one-shot that starts and
+// ends inside the window is invisible in the listing and unattributable in the peak.
+const STATS_TOP_SOURCE_ID = 11;
+const STATS_TOP_SOURCE_MILLI = 12;
+const STATS_SUM_SOURCE_MILLI = 13;
+const STATS_MAX_CONCURRENT = 14;
 const STATS_RESET = 15;
 
 // Output limiter: transparent below LIMIT_T, soft knee above. A mixed signal
 // from a single int16 source can never exceed 1.0, so the limiter only engages
-// when multiple sources genuinely sum past the threshold.
+// when multiple sources genuinely sum past the threshold. Applied ONCE, at the
+// MASTER stage (BottleShipMasterProcessor below) — the point where ring audio
+// (this processor's output) and encoded/media audio (music, CD tracks; they
+// never pass through this processor at all) are actually summed on the way to
+// destination. Limiting at the ring stage alone cannot see the music, and
+// limiting in both places would double-shape whatever passes through the ring.
 const LIMIT_T = 0.95;
 const LIMIT_K = 1 - LIMIT_T;
+
+// Bumped whenever this module's audio-rate behavior changes. AudioContext caches
+// a worklet module by URL; audio-engine.ts appends this as a `?v=` query param so
+// a stale cached module (old code, silently zero counters) cannot be mistaken for
+// a loaded new one. Each processor echoes it back over its port on construction —
+// audio-engine.ts verifies the echo and logs loudly on a mismatch or timeout,
+// because a cache hit that silently skips this whole file is worse than a version
+// bump you forgot: the failure otherwise looks identical to "nothing is wrong".
+const WORKLET_MODULE_VERSION = 10;
 
 // Discontinuity detector threshold: |s[n]−s[n−1]| above this between adjacent
 // output samples counts as a click/splice candidate.
@@ -100,30 +94,10 @@ const DISC_THRESHOLD = 0.5;
 // committing — set to 0 to disable.
 const CONCEAL_FADE_FRAMES = 64;
 
-// FLAG_LOOP_STREAM staleness grace: if the committed write frontier (CTRL_WRITE_CURSOR,
-// producer-owned for loop-stream buffers) hasn't moved for this long, the guest has
-// stopped feeding the loop — mute once play sweeps past the frozen frontier (the real
-// software mixer's drained-queue silence) instead of droning the stale ring. A healthy
-// refill pump commits every few tens of ms, so this never engages mid-stream.
-const STALE_FRONTIER_SEC = 0.25;
-
 // DS3D mode constants
 const DS3DMODE_NORMAL = 0;
 const DS3DMODE_HEAD_RELATIVE = 1;
 const DS3DMODE_DISABLE = 2;
-
-// Speed of sound in meters/sec (DirectSound default)
-const SPEED_OF_SOUND = 340.0;
-
-// ─── Float ↔ Int32 helper (inlined) ────────────────────────────────────────
-
-const _wf32 = new Float32Array(1);
-const _wi32 = new Int32Array(_wf32.buffer);
-
-function i32ToFloat(i: number): number {
-    _wi32[0] = i;
-    return _wf32[0];
-}
 
 // ─── Ring buffer source type ─────────────────────────────────────────────────
 
@@ -131,14 +105,18 @@ type RingBufferSource = {
   id: number;
   ctrl: Int32Array;     // SAB control block view (32 Int32 entries)
   data: DataView;       // SAB data region view (includes ctrl block — use CTRL_BLOCK_BYTES offset)
+  // The same SAB through width-typed views. The mixer reads two samples per output
+  // sample per channel; through `data` that is two DataView calls, through these it is
+  // two loads. Built once at registration (a per-block view would allocate inside the
+  // render quantum) and used only when the frame layout is aligned for the width.
+  u8: Uint8Array;
+  i16: Int16Array;
+  f32: Float32Array;
   position: number;     // Fractional frame position (float)
   loopsCompleted: number;
-  // FLAG_LOOP_STREAM state: last observed committed write frontier (bytes), when it
-  // last changed (worklet currentTime), and whether output is muted because play swept
-  // past a stale frontier. Muting never parks the cursors — see STALE_FRONTIER_SEC.
-  lastFrontier: number;
-  frontierChangedAt: number;
-  mutedPastFrontier: boolean;
+  /** Frames of fade-in left after a starved stretch: data resumes mid-waveform, and a
+   *  step from the silence the starve faded to is a click of its own. */
+  fadeIn: number;
 };
 
 class BottleShipAudioProcessor extends AudioWorkletProcessor {
@@ -168,8 +146,24 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
   // SAB ring buffer sources (zero-copy path)
   private ringBuffers: Map<number, RingBufferSource> = new Map();
 
-  // Listener SAB (global singleton, shared from dsound)
+  // Listener SAB (global singleton; whichever audio API the guest uses owns it)
   private listenerCtrl: Int32Array | null = null;
+
+  // Spatializer scratch — reused for every source of every block (no allocation
+  // inside the render quantum).
+  private spatialParams: SpatialParams = {
+    lPosX: 0, lPosY: 0, lPosZ: 0, lVelX: 0, lVelY: 0, lVelZ: 0,
+    lAtX: 0, lAtY: 0, lAtZ: 1, lUpX: 0, lUpY: 1, lUpZ: 0,
+    listenerGain: 1, distanceFactor: 1, dopplerFactor: 1,
+    speedOfSound: 340, distanceModel: 0, rightHanded: true,
+    sPosX: 0, sPosY: 0, sPosZ: 0, sVelX: 0, sVelY: 0, sVelZ: 0,
+    refDistance: 1, maxDistance: 1e9, rolloff: 1,
+    coneInner: 360, coneOuter: 360, coneOuterGain: 1,
+    dirX: 0, dirY: 0, dirZ: 0,
+    sourceGain: 1, minGain: 0, maxGain: 1,
+    relative: false,
+  };
+  private spatialOut = makeSpatialResult();
 
   // Signal-stats SAB (global singleton; worklet is the only counter writer)
   private statsCtrl: Int32Array | null = null;
@@ -178,13 +172,14 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
+    this.port.postMessage({ type: "ready", proc: "ring", version: WORKLET_MODULE_VERSION });
     this.port.onmessage = (event: MessageEvent) => {
       const msg = event.data;
       if (!msg || !msg.type) return;
 
       // ─── Listener SAB registration ───
       if (msg.type === "register_listener") {
-        this.listenerCtrl = new Int32Array(msg.sab, 0, 16);
+        this.listenerCtrl = new Int32Array(msg.sab, 0, LISTENER_SLOTS);
         return;
       }
 
@@ -200,18 +195,55 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         const id: number = msg.id;
         this.ringBuffers.set(id, {
           id,
-          ctrl: new Int32Array(sab, 0, 32),
+          ctrl: new Int32Array(sab, 0, CTRL_SLOTS),
           data: new DataView(sab),
+          // Explicit lengths: a SAB whose byteLength is not a multiple of the element
+          // size would make the 1-argument constructor throw.
+          u8: new Uint8Array(sab),
+          i16: new Int16Array(sab, 0, sab.byteLength >> 1),
+          f32: new Float32Array(sab, 0, sab.byteLength >> 2),
           position: 0,
           loopsCompleted: 0,
-          lastFrontier: -1,
-          frontierChangedAt: currentTime,
-          mutedPastFrontier: false,
+          fadeIn: 0,
         });
         return;
       }
       if (msg.type === "unregister") {
         this.ringBuffers.delete(msg.id);
+        return;
+      }
+      // ringDump: the worklet's eye view of every registered ring — its own read head,
+      // the last block's contribution peak, starve count, and the sample under the head.
+      // This is the only place those live (the SAB cursor block is shared with the
+      // producer's synthesized cursors), and "producer writes data, head reads zeros"
+      // is otherwise indistinguishable from "the mix is genuinely silent". Answered
+      // via port.postMessage; harness facade: harness().ringDump().
+      if (msg.type === "ringDump") {
+        const dump: any[] = [];
+        for (const [id, rb] of this.ringBuffers.entries()) {
+          const ctrl = rb.ctrl;
+          const d: any = (rb as any).dbg ?? {};
+          const state = Atomics.load(ctrl, CTRL_STATE);
+          const blockAlign = Math.max(1, Atomics.load(ctrl, CTRL_BLOCK_ALIGN) || 4);
+          const totalFrames = Math.max(1, Math.floor((Math.min(Atomics.load(ctrl, CTRL_DATA_LENGTH) > 0 ? Atomics.load(ctrl, CTRL_DATA_LENGTH) : Atomics.load(ctrl, CTRL_BUFFER_BYTES), Atomics.load(ctrl, CTRL_BUFFER_BYTES))) / blockAlign));
+          const frame = Math.floor((d.pos ?? 0)) % totalFrames;
+          const byteOff = CTRL_BLOCK_BYTES + frame * blockAlign;
+          dump.push({
+            id,
+            state,
+            pos: d.pos ?? null,
+            srcPeak: d.srcPeak ?? null,
+            play: Atomics.load(ctrl, CTRL_PLAY_CURSOR),
+            write: Atomics.load(ctrl, CTRL_WRITE_CURSOR),
+            bufBytes: Atomics.load(ctrl, CTRL_BUFFER_BYTES),
+            dataLen: Atomics.load(ctrl, CTRL_DATA_LENGTH),
+            sampleAtHead: rb.i16[byteOff >> 1],
+            sampleAtHeadP: rb.i16[(byteOff + 4) >> 1],
+            starves: d.starves ?? 0,
+            blocks: d.blocks ?? 0,
+          });
+        }
+        this.port.postMessage({ type: "ringDump", dump });
         return;
       }
 
@@ -414,6 +446,9 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
     let underrunMid = 0;
     let starvedBlocks = 0;
 
+    // Per-source contribution peaks for this block (see STATS_TOP_SOURCE_ID).
+    let blockTopId = 0, blockTopPeak = 0, blockSumPeak = 0, blockAudible = 0;
+
     // ─── Process SAB ring buffer sources ───
     for (const [id, rb] of this.ringBuffers.entries()) {
       const ctrl = rb.ctrl;
@@ -426,8 +461,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         Atomics.store(ctrl, CTRL_PLAY_CURSOR, 0);
         rb.position = 0;
         rb.loopsCompleted = 0;
-        rb.mutedPastFrontier = false;
-        rb.frontierChangedAt = currentTime;
         continue;
       }
 
@@ -451,10 +484,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         const seekFrame = Math.floor(seekBytes / blockAlignSeek) % totalFramesSeek;
         rb.position = seekFrame;
         rb.loopsCompleted = 0;
-        // Seek/replay: fresh staleness grace so a re-Played loop-stream isn't
-        // insta-muted before its pump commits the first write.
-        rb.frontierChangedAt = currentTime;
-        rb.mutedPastFrontier = false;
         if (bufferBytesSeek > 0) {
           Atomics.store(ctrl, CTRL_PLAY_CURSOR, (seekFrame * blockAlignSeek) % bufferBytesSeek);
         }
@@ -463,6 +492,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       const state = Atomics.load(ctrl, CTRL_STATE);
       if (state !== STATE_PLAYING) continue;
       activeRing++;
+      let srcPeak = 0;
 
       const bufferBytes = Atomics.load(ctrl, CTRL_BUFFER_BYTES);
       const channels = Atomics.load(ctrl, CTRL_CHANNELS) || 1;
@@ -482,7 +512,12 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       // Effective data size: for circular streaming (e.g. video audio), respect
       // dataLength until the ring buffer is fully populated to avoid reading
       // unwritten zeros as silence.
-      const effectiveBytes = Math.min(dataLength > 0 ? dataLength : bufferBytes, bufferBytes);
+      // Clamped to what the SAB actually holds: bufferBytes/dataLength come straight out of
+      // the ctrl block, and a bad one would send every read past the end. On the DataView
+      // path that is a RangeError thrown inside process(), which does not surface as an
+      // exception — it permanently disables the processor, i.e. silence for the session.
+      const declaredBytes = Math.min(dataLength > 0 ? dataLength : bufferBytes, bufferBytes);
+      const effectiveBytes = Math.min(declaredBytes, Math.max(0, rb.u8.length - CTRL_BLOCK_BYTES));
       if (effectiveBytes === 0) continue;
       const totalFrames = Math.floor(effectiveBytes / blockAlign);
       if (totalFrames === 0) continue;
@@ -491,15 +526,10 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       let rate = (frequency / sampleRate);
       if (rate <= 0) continue;
 
-      // Volume: centibels to linear
-      let linearVol: number;
-      if (volumeCb <= -10000) {
-        linearVol = 0;
-      } else if (volumeCb >= 0) {
-        linearVol = 1;
-      } else {
-        linearVol = Math.pow(10, volumeCb / 2000);
-      }
+      // Volume: centibels to linear. POSITIVE centibels are honoured as gain above
+      // 1.0 — DirectSound can never produce them (DSBVOLUME_MAX is 0), but OpenAL's
+      // AL_GAIN has no such ceiling and is carried through this same field.
+      const linearVol = volumeCb <= -10000 ? 0 : Math.pow(10, volumeCb / 2000);
 
       // Pan: centibels to L/R gain (app-level pan)
       let leftGain: number;
@@ -519,155 +549,65 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       }
 
       // ─── 3D spatialization ───
+      // Recomputed once per 128-frame block from whatever the control block currently
+      // holds. The setters on the guest side only store — an app that calls
+      // alSourcefv(AL_POSITION) thousands of times per second costs one Atomics.store
+      // each, and collapses into one evaluation here.
       const flags3d = Atomics.load(ctrl, CTRL_3D_FLAGS);
-      const has3D = (flags3d & 1) !== 0;
       const mode3d = Atomics.load(ctrl, CTRL_3D_MODE);
 
-      if (has3D && this.listenerCtrl && mode3d !== DS3DMODE_DISABLE) {
+      if ((flags3d & FLAG3D_HAS_3D) !== 0 && this.listenerCtrl && mode3d !== DS3DMODE_DISABLE) {
         const lctrl = this.listenerCtrl;
+        const p = this.spatialParams;
 
-        // Read listener state
-        const lPosX = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_X));
-        const lPosY = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Y));
-        const lPosZ = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Z));
-        const lVelX = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_X));
-        const lVelY = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Y));
-        const lVelZ = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Z));
-        const lFrontX = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_X));
-        const lFrontY = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Y));
-        const lFrontZ = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Z));
-        const lTopX = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_X));
-        const lTopY = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Y));
-        const lTopZ = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Z));
-        const distFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DIST_FACTOR));
-        const rolloff = i32ToFloat(Atomics.load(lctrl, LCTRL_ROLLOFF_FACTOR));
-        const dopplerFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DOPPLER_FACTOR));
+        p.lPosX = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_X));
+        p.lPosY = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Y));
+        p.lPosZ = i32ToFloat(Atomics.load(lctrl, LCTRL_POS_Z));
+        p.lVelX = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_X));
+        p.lVelY = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Y));
+        p.lVelZ = i32ToFloat(Atomics.load(lctrl, LCTRL_VEL_Z));
+        p.lAtX = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_X));
+        p.lAtY = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Y));
+        p.lAtZ = i32ToFloat(Atomics.load(lctrl, LCTRL_FRONT_Z));
+        p.lUpX = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_X));
+        p.lUpY = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Y));
+        p.lUpZ = i32ToFloat(Atomics.load(lctrl, LCTRL_TOP_Z));
+        p.listenerGain = i32ToFloat(Atomics.load(lctrl, LCTRL_GAIN));
+        p.distanceFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DIST_FACTOR));
+        p.dopplerFactor = i32ToFloat(Atomics.load(lctrl, LCTRL_DOPPLER_FACTOR));
+        p.speedOfSound = i32ToFloat(Atomics.load(lctrl, LCTRL_SPEED_OF_SOUND));
+        p.distanceModel = Atomics.load(lctrl, LCTRL_DISTANCE_MODEL);
+        p.rightHanded = (Atomics.load(lctrl, LCTRL_FLAGS) & LFLAG_LEFT_HANDED) === 0;
 
-        // Read source state
-        const sPosX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_X));
-        const sPosY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Y));
-        const sPosZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Z));
-        const sVelX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_X));
-        const sVelY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Y));
-        const sVelZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Z));
-        const minDist = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MIN_DIST));
-        const maxDist = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MAX_DIST));
-        const coneInner = Atomics.load(ctrl, CTRL_3D_CONE_INNER);
-        const coneOuter = Atomics.load(ctrl, CTRL_3D_CONE_OUTER);
-        const coneOriX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_X));
-        const coneOriY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Y));
-        const coneOriZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Z));
+        p.sPosX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_X));
+        p.sPosY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Y));
+        p.sPosZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_POS_Z));
+        p.sVelX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_X));
+        p.sVelY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Y));
+        p.sVelZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_VEL_Z));
+        p.refDistance = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MIN_DIST));
+        p.maxDistance = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MAX_DIST));
+        // Rolloff is a LISTENER property in DS3D and a SOURCE property in OpenAL.
+        p.rolloff = (flags3d & FLAG3D_SOURCE_ROLLOFF) !== 0
+          ? i32ToFloat(Atomics.load(ctrl, CTRL_3D_ROLLOFF))
+          : i32ToFloat(Atomics.load(lctrl, LCTRL_ROLLOFF_FACTOR));
+        p.coneInner = Atomics.load(ctrl, CTRL_3D_CONE_INNER);
+        p.coneOuter = Atomics.load(ctrl, CTRL_3D_CONE_OUTER);
         const coneOutVolCb = Atomics.load(ctrl, CTRL_3D_CONE_OUTVOL);
+        p.coneOuterGain = coneOutVolCb <= -10000 ? 0 : Math.min(1, Math.pow(10, coneOutVolCb / 2000));
+        p.dirX = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_X));
+        p.dirY = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Y));
+        p.dirZ = i32ToFloat(Atomics.load(ctrl, CTRL_3D_CONE_ORI_Z));
+        p.sourceGain = linearVol;
+        p.minGain = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MIN_GAIN));
+        p.maxGain = i32ToFloat(Atomics.load(ctrl, CTRL_3D_MAX_GAIN));
+        p.relative = mode3d === DS3DMODE_HEAD_RELATIVE;
 
-        // Direction vector from listener to source
-        let dx: number, dy: number, dz: number;
-        if (mode3d === DS3DMODE_HEAD_RELATIVE) {
-          dx = sPosX;
-          dy = sPosY;
-          dz = sPosZ;
-        } else {
-          dx = sPosX - lPosX;
-          dy = sPosY - lPosY;
-          dz = sPosZ - lPosZ;
-        }
-
-        const rawDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        const dist = rawDist * (distFactor > 0 ? distFactor : 1);
-
-        // Normalize direction
-        let dirX = 0, dirY = 0, dirZ = 1;
-        if (rawDist > 1e-7) {
-          const invDist = 1 / rawDist;
-          dirX = dx * invDist;
-          dirY = dy * invDist;
-          dirZ = dz * invDist;
-        }
-
-        // 1. Distance attenuation (DS3D inverse-distance model)
-        const safeMinDist = Math.max(minDist, 1e-7);
-        const clampedDist = Math.max(safeMinDist, Math.min(dist, maxDist));
-        const distAtten = safeMinDist / (safeMinDist + rolloff * (clampedDist - safeMinDist));
-
-        // 2. Stereo pan from azimuth
-        // Listener's right vector = cross(front, top)
-        const rightX = lFrontY * lTopZ - lFrontZ * lTopY;
-        const rightY = lFrontZ * lTopX - lFrontX * lTopZ;
-        const rightZ = lFrontX * lTopY - lFrontY * lTopX;
-        // Normalize right vector
-        const rightLen = Math.sqrt(rightX * rightX + rightY * rightY + rightZ * rightZ);
-        let nrX = 0, nrY = 0, nrZ = 0;
-        if (rightLen > 1e-7) {
-          const invR = 1 / rightLen;
-          nrX = rightX * invR;
-          nrY = rightY * invR;
-          nrZ = rightZ * invR;
-        }
-        // Pan value: dot(direction, right) in [-1, 1]
-        const panValue = dirX * nrX + dirY * nrY + dirZ * nrZ;
-        // Equal-power panning: theta = (panValue + 1) * PI/4
-        const theta = (panValue + 1) * 0.7853981633974483; // PI/4
-        const leftGain3d = Math.cos(theta);
-        const rightGain3d = Math.sin(theta);
-
-        // 3. Doppler pitch shift
-        if (dopplerFactor > 0) {
-          const c = SPEED_OF_SOUND;
-          // Velocity of listener projected onto direction
-          let vls: number, vss: number;
-          if (mode3d === DS3DMODE_HEAD_RELATIVE) {
-            vls = 0;
-            vss = sVelX * dirX + sVelY * dirY + sVelZ * dirZ;
-          } else {
-            vls = lVelX * dirX + lVelY * dirY + lVelZ * dirZ;
-            vss = sVelX * dirX + sVelY * dirY + sVelZ * dirZ;
-          }
-          const denom = c - dopplerFactor * vss;
-          if (Math.abs(denom) > 1e-7) {
-            const dopplerMul = (c - dopplerFactor * vls) / denom;
-            // Clamp to reasonable range
-            rate *= Math.max(0.1, Math.min(10, dopplerMul));
-          }
-        }
-
-        // 4. Cone attenuation
-        let coneAtten = 1.0;
-        if (coneInner < 360 || coneOuter < 360) {
-          // Normalize cone orientation
-          const coneLen = Math.sqrt(coneOriX * coneOriX + coneOriY * coneOriY + coneOriZ * coneOriZ);
-          if (coneLen > 1e-7) {
-            const invCone = 1 / coneLen;
-            const ncX = coneOriX * invCone;
-            const ncY = coneOriY * invCone;
-            const ncZ = coneOriZ * invCone;
-            // Angle between -direction and cone orientation
-            // (we want angle from source's perspective, looking at listener)
-            const dotCone = -(dirX * ncX + dirY * ncY + dirZ * ncZ);
-            const angleDeg = Math.acos(Math.max(-1, Math.min(1, dotCone))) * (180 / Math.PI);
-            const halfInner = coneInner * 0.5;
-            const halfOuter = coneOuter * 0.5;
-            if (angleDeg <= halfInner) {
-              coneAtten = 1.0;
-            } else if (angleDeg >= halfOuter) {
-              // Outside cone: apply cone outside volume
-              if (coneOutVolCb <= -10000) {
-                coneAtten = 0;
-              } else if (coneOutVolCb >= 0) {
-                coneAtten = 1;
-              } else {
-                coneAtten = Math.pow(10, coneOutVolCb / 2000);
-              }
-            } else {
-              // Interpolate between inner and outer
-              const outerGain = coneOutVolCb <= -10000 ? 0 : (coneOutVolCb >= 0 ? 1 : Math.pow(10, coneOutVolCb / 2000));
-              const t = (angleDeg - halfInner) / (halfOuter - halfInner);
-              coneAtten = 1.0 + t * (outerGain - 1.0);
-            }
-          }
-        }
-
-        // 5. Final gains: combine app-level with 3D
-        leftGain = linearVol * leftGain * distAtten * coneAtten * leftGain3d;
-        rightGain = linearVol * rightGain * distAtten * coneAtten * rightGain3d;
+        spatialize(p, this.spatialOut);
+        // The app-level pan still rides on top: a 3D source may also carry one.
+        leftGain *= this.spatialOut.leftGain;
+        rightGain *= this.spatialOut.rightGain;
+        rate *= this.spatialOut.rateMul;
       } else {
         // Non-3D: apply volume directly
         leftGain *= linearVol;
@@ -675,44 +615,47 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       }
 
       const isStreaming = (flags & FLAG_STREAMING) !== 0;
+      // The write-cursor hold below is for one-shot streams (video audio) that must END at
+      // the last written byte. A LOOPING buffer never holds: NT5's Grace mixer computes the
+      // play position from the primary's DAC position and mixes the ring unconditionally —
+      // an under-written lap replays its last content. Holding a looping stream would let
+      // the app's own pump decide whether the play cursor advances, and a pump that sizes
+      // each Lock from the cursor delta then deadlocks the moment it goes quiet.
+      const streamingHold = isStreaming && loopMode !== -1;
       const dataView = rb.data;
+      const bytesPerSample = bitsPerSample >> 3;
+      // Which typed view can address this source's samples. CTRL_BLOCK_BYTES is a
+      // multiple of 4, so only blockAlign can misalign a frame; a layout that no view
+      // can address (or that runs past the SAB) stays on the DataView path, whose
+      // out-of-range behaviour is a throw rather than a silent NaN.
+      let fastRead = bitsPerSample === 8 ? 1
+        : bitsPerSample === 16 && (blockAlign & 1) === 0 ? 2
+        : bitsPerSample === 32 && (blockAlign & 3) === 0 ? 3
+        : 0;
+      if (CTRL_BLOCK_BYTES + (totalFrames - 1) * blockAlign + channels * bytesPerSample > rb.u8.length) {
+        fastRead = 0;
+      }
+      const u8 = rb.u8;
+      const i16 = rb.i16;
+      const f32 = rb.f32;
       let pos = rb.position;
       let loopsCompleted = rb.loopsCompleted;
+      let fadeIn = rb.fadeIn;
       let alive = true;
       // Last per-channel contribution of THIS source, for underrun concealment.
       let concealLast0 = 0, concealLast1 = 0;
+      let starvedThisSource = 0;
 
       // For streaming sources, read write cursor once per process() call
       // writeCursorFrame = boundary up to which data has been written by the app
       const writeCursorBytes = isStreaming ? Atomics.load(ctrl, CTRL_WRITE_CURSOR) : 0;
       const writeCursorFrame = isStreaming ? Math.floor(writeCursorBytes / blockAlign) : 0;
 
-      // Loop-stream (dsound): track the committed write frontier + staleness. While
-      // the guest commits regularly the frontier changes every pump tick and playback
-      // is untouched. A frozen frontier = the guest abandoned this loop; once play
-      // sweeps past it, mute (drained-mixer silence) but KEEP the cursors advancing —
-      // delta-driven refill pumps size their next write from the play cursor, so
-      // parking it would deadlock them (and frontier==play is ambiguous full/empty,
-      // which is why the FLAG_STREAMING caught-up stall cannot be reused here).
-      const isLoopStream = (flags & FLAG_LOOP_STREAM) !== 0;
-      let frontierStale = false;
-      let muteAtPos = Infinity;
-      if (isLoopStream) {
-        const fr = Atomics.load(ctrl, CTRL_WRITE_CURSOR);
-        if (fr !== rb.lastFrontier) {
-          rb.lastFrontier = fr;
-          rb.frontierChangedAt = currentTime;
-          rb.mutedPastFrontier = false;
-        }
-        frontierStale = currentTime - rb.frontierChangedAt > STALE_FRONTIER_SEC;
-        if (!frontierStale) {
-          rb.mutedPastFrontier = false;
-        } else if (!rb.mutedPastFrontier) {
-          const frontierFrame = Math.floor(((fr >>> 0) % bufferBytes) / blockAlign) % totalFrames;
-          const playFrame = Math.floor(pos) % totalFrames;
-          muteAtPos = Math.floor(pos) + ((frontierFrame - playFrame + totalFrames) % totalFrames);
-        }
-      }
+      // A looping dsound buffer whose guest stopped refilling it keeps mixing the stale
+      // ring — that is what the real software mixer does. Its position math derives
+      // entirely from the primary buffer's cursor and it records nothing about how far
+      // the app has written (nt5 dsound CGrace::GetBytePosition), so there is no
+      // drained-queue silence to imitate and no legitimate pump cadence to misjudge.
 
       for (let i = 0; i < frames; i++) {
         // Handle end-of-data
@@ -748,34 +691,17 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         }
         if (!alive) break;
 
-        // Loop-stream mute: play swept past a stale committed frontier — the guest
-        // abandoned this loop. Silence from here on, cursors keep advancing.
-        if (isLoopStream && frontierStale && !rb.mutedPastFrontier && pos >= muteAtPos) {
-          rb.mutedPastFrontier = true;
-          if (CONCEAL_FADE_FRAMES > 0 && (concealLast0 !== 0 || concealLast1 !== 0)) {
-            const fade = Math.min(frames - i, CONCEAL_FADE_FRAMES);
-            for (let f = 0; f < fade; f++) {
-              const g = 1 - (f + 1) / fade;
-              output[0][i + f] += concealLast0 * g;
-              if (outChannels > 1) output[1][i + f] += concealLast1 * g;
-            }
-          }
-        }
-        if (rb.mutedPastFrontier) {
-          // Advance the rest of the block silently (wrap handled at loop top / next block).
-          pos += (frames - i) * rate;
-          break;
-        }
-
         // Streaming: check if play position has caught up to write cursor
         // Output silence (don't advance pos) until app writes more data
-        if (isStreaming) {
+        if (streamingHold) {
           const playFrame = Math.floor(pos) % totalFrames;
           // Check if we've caught up: available = (write - play + total) % total
           const available = (writeCursorFrame - playFrame + totalFrames) % totalFrames;
           if (available === 0) {
             // Play position caught up to write cursor — no more data this block.
             if (i === 0) starvedBlocks++; else underrunMid++;
+            starvedThisSource++; // TEMP PROBE
+            fadeIn = CONCEAL_FADE_FRAMES;
             // Concealment: ramp the last contributed sample to zero over a short
             // window instead of a hard step to silence (which clicks). When the
             // block is starved from frame 0, concealLast* is 0 → plain silence.
@@ -798,8 +724,7 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         for (let ch = 0; ch < outChannels; ch++) {
           const srcCh = Math.min(ch, channels - 1);
           // Current sample
-          const byteOff = CTRL_BLOCK_BYTES + (wrappedFrame * blockAlign) + (srcCh * (bitsPerSample >> 3));
-          const s0 = this.readSampleFloat(dataView, byteOff, bitsPerSample);
+          const byteOff = CTRL_BLOCK_BYTES + (wrappedFrame * blockAlign) + (srcCh * bytesPerSample);
 
           // Next sample for interpolation
           let nextFrame = wrappedFrame + 1;
@@ -808,8 +733,22 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           } else {
             nextFrame = Math.min(nextFrame, totalFrames - 1);
           }
-          const byteOffNext = CTRL_BLOCK_BYTES + (nextFrame * blockAlign) + (srcCh * (bitsPerSample >> 3));
-          const s1 = this.readSampleFloat(dataView, byteOffNext, bitsPerSample);
+          const byteOffNext = CTRL_BLOCK_BYTES + (nextFrame * blockAlign) + (srcCh * bytesPerSample);
+
+          let s0: number, s1: number;
+          if (fastRead === 2) {
+            s0 = i16[byteOff >> 1] / 32768;
+            s1 = i16[byteOffNext >> 1] / 32768;
+          } else if (fastRead === 1) {
+            s0 = (u8[byteOff] - 128) / 128;
+            s1 = (u8[byteOffNext] - 128) / 128;
+          } else if (fastRead === 3) {
+            s0 = f32[byteOff >> 2];
+            s1 = f32[byteOffNext >> 2];
+          } else {
+            s0 = this.readSampleFloat(dataView, byteOff, bitsPerSample);
+            s1 = this.readSampleFloat(dataView, byteOffNext, bitsPerSample);
+          }
 
           const sample = s0 * (1 - frac) + s1 * frac;
           let gain: number;
@@ -818,16 +757,34 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
           } else {
             gain = (leftGain + rightGain) * 0.5;
           }
-          const contrib = sample * gain;
+          const contrib = fadeIn > 0 ? sample * gain * (1 - fadeIn / CONCEAL_FADE_FRAMES) : sample * gain;
+          const ca = contrib < 0 ? -contrib : contrib;
+          if (ca > srcPeak) srcPeak = ca;
           output[ch][i] += contrib;
           if (ch === 0) concealLast0 = contrib; else if (ch === 1) concealLast1 = contrib;
         }
 
+        if (fadeIn > 0) fadeIn--;
         pos += rate;
+      }
+
+      if (srcPeak > 0) {
+        blockSumPeak += srcPeak;
+        if (srcPeak > 0.01) blockAudible++;
+        if (srcPeak > blockTopPeak) { blockTopPeak = srcPeak; blockTopId = id; }
       }
 
       rb.position = pos;
       rb.loopsCompleted = loopsCompleted;
+      rb.fadeIn = fadeIn;
+      // TEMP PROBE (ring read diagnosis) — remove after the no-sound regression is closed.
+      {
+        const d: any = (rb as any).dbg ?? ((rb as any).dbg = {});
+        d.pos = pos;
+        d.srcPeak = srcPeak;
+        d.blocks = (d.blocks ?? 0) + 1;
+        if (starvedThisSource) d.starves = (d.starves ?? 0) + starvedThisSource;
+      }
 
       // Write back play cursor (byte offset)
       if (alive) {
@@ -842,14 +799,12 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         // right as the play head swept the region, so ~half the bytes played were one
         // ring-pass stale → constant 20ms-periodic splices / audible crackle
         // (proven by dsound lockTrace: play_at_unlock == lockOff + bytes on every tick).
-        // Loop-stream buffers: CTRL_WRITE_CURSOR is the PRODUCER's committed frontier
-        // (the staleness signal) — never overwrite it here.
-        if (!isStreaming && !isLoopStream) {
-          // Match dsound GetCurrentPosition's initial software-mixer premix lead
-          // (30 ms at the buffer's source rate; see dsound.ts dsoundLeadBytes). The
-          // guest-visible cursor is computed there — this SAB copy is debug-only.
+        if (!isStreaming) {
+          // Match dsound GetCurrentPosition's premix lead at its floor (45 ms at the
+          // buffer's source rate; see dsound.ts dsoundLeadBytes, which ramps from there).
+          // The guest-visible cursor is computed there — this SAB copy is debug-only.
           const leadFrames = Math.min(
-            Math.max(64, Math.round(sourceSampleRate * 0.030)),
+            Math.max(64, Math.round(sourceSampleRate * 0.045)),
             Math.max(1, totalFrames - 1),
           );
           const writeCursorFrame2 = (Math.floor(pos) + leadFrames) % totalFrames;
@@ -917,13 +872,20 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       this.maybeReportPosition(id, source);
     }
 
-    // ─── Signal stats (pre-limiter) + output limiter ───
-    // The old always-on soft clip `s/(1+|s|)` waveshaped EVERY sample — constant
-    // harmonic distortion proportional to level (a 0.9 peak became 0.47). The
-    // limiter below is transparent up to LIMIT_T and only bends true oversums.
+    // ─── Signal stats (ring stage, pre-mix) — MEASUREMENT ONLY ───
+    // This is the DirectSound/waveOut ring mix alone, before it reaches masterGain
+    // and sums with encoded/media audio (music, CD tracks) that never passes
+    // through this processor. No limiting happens here any more — the old
+    // always-on soft clip `s/(1+|s|)` waveshaped EVERY sample (constant harmonic
+    // distortion proportional to level; a 0.9 peak became 0.47), and a per-ring
+    // limiter here could never see what the master stage sums it with anyway, so
+    // it protected against a clip that hadn't happened yet and missed the one
+    // that had. CLIP/LIMITED here name what this ring's own sum would have done
+    // to a limiter at ITS threshold — informational, not what the user hears;
+    // BottleShipMasterProcessor below is where the real limiter lives.
     const stats = this.statsCtrl;
     if (stats && Atomics.load(stats, STATS_RESET)) {
-      for (let f = 0; f <= 10; f++) Atomics.store(stats, f, 0);
+      for (let f = 0; f <= 14; f++) Atomics.store(stats, f, 0);
       Atomics.store(stats, STATS_RESET, 0);
       this.lastOut[0] = 0;
       this.lastOut[1] = 0;
@@ -947,9 +909,6 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         if (a > LIMIT_T) {
           limitedCount++;
           if (a > 1) clipCount++;
-          // Soft knee approaching 1.0 asymptotically
-          const t = (a - LIMIT_T) / LIMIT_K;
-          channel[i] = (s < 0 ? -1 : 1) * (LIMIT_T + LIMIT_K * Math.tanh(t));
         }
       }
       if (ch < this.lastOut.length) this.lastOut[ch] = prev;
@@ -963,6 +922,18 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
       if (limitedCount) Atomics.add(stats, STATS_LIMITED, limitedCount);
       if (discCount) Atomics.add(stats, STATS_DISC, discCount);
       if (underrunMid) Atomics.add(stats, STATS_UNDERRUN_MID, underrunMid);
+      const topMilli = Math.round(blockTopPeak * 1000);
+      if (topMilli > Atomics.load(stats, STATS_TOP_SOURCE_MILLI)) {
+        Atomics.store(stats, STATS_TOP_SOURCE_MILLI, topMilli);
+        Atomics.store(stats, STATS_TOP_SOURCE_ID, blockTopId | 0);
+      }
+      const sumMilli = Math.round(blockSumPeak * 1000);
+      if (sumMilli > Atomics.load(stats, STATS_SUM_SOURCE_MILLI)) {
+        Atomics.store(stats, STATS_SUM_SOURCE_MILLI, sumMilli);
+      }
+      if (blockAudible > Atomics.load(stats, STATS_MAX_CONCURRENT)) {
+        Atomics.store(stats, STATS_MAX_CONCURRENT, blockAudible);
+      }
       if (starvedBlocks) Atomics.add(stats, STATS_STARVED_BLOCKS, starvedBlocks);
       const peakMilli = Math.round(peak * 1000);
       if (peakMilli > Atomics.load(stats, STATS_PEAK_MILLI)) {
@@ -977,4 +948,101 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
   }
 }
 
+// ─── Master processor: the ONE limiter + the stats that mean "what the user
+// actually hears" ────────────────────────────────────────────────────────────
+//
+// Sits between masterGain and destination (audio-engine.ts). Its single input
+// is whatever the audio graph has summed into it — the ring mix from
+// BottleShipAudioProcessor above AND every encoded/media source (music, CD
+// tracks), which connect straight to masterGain and never pass through the ring
+// processor at all. Multiple connections into one AudioNode input sum by the
+// Web Audio spec, so no mixing code is needed here: this processor only needs
+// to limit and measure the samples it is handed, exactly once, at the one point
+// where the whole mix already exists.
+class BottleShipMasterProcessor extends AudioWorkletProcessor {
+  private statsCtrl: Int32Array | null = null;
+  private lastOut: number[] = [0, 0];
+
+  constructor() {
+    super();
+    this.port.postMessage({ type: "ready", proc: "master", version: WORKLET_MODULE_VERSION });
+    this.port.onmessage = (event: MessageEvent) => {
+      const msg = event.data;
+      if (msg?.type === "register_master_stats") {
+        this.statsCtrl = new Int32Array(msg.sab, 0, 16);
+      }
+    };
+  }
+
+  process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
+    const input = inputs[0];
+    const output = outputs[0];
+    if (!output || output.length === 0) return true;
+
+    // No active connection (e.g. the very first block before any source has
+    // started) — pass through silence rather than reading past an empty input.
+    const hasInput = !!input && input.length > 0 && input[0]!.length > 0;
+
+    const stats = this.statsCtrl;
+    if (stats && Atomics.load(stats, STATS_RESET)) {
+      for (let f = 0; f <= 14; f++) Atomics.store(stats, f, 0);
+      Atomics.store(stats, STATS_RESET, 0);
+      this.lastOut[0] = 0;
+      this.lastOut[1] = 0;
+    }
+
+    let clipCount = 0;
+    let limitedCount = 0;
+    let discCount = 0;
+    let peak = 0;
+    let maxJump = 0;
+    let frames = 0;
+
+    for (let ch = 0; ch < output.length; ch++) {
+      const outCh = output[ch];
+      const inCh = hasInput ? (input![Math.min(ch, input!.length - 1)] ?? null) : null;
+      frames = outCh.length;
+      let prev = this.lastOut[ch] ?? 0;
+      for (let i = 0; i < outCh.length; i++) {
+        const s = inCh ? inCh[i] ?? 0 : 0;
+        const a = Math.abs(s);
+        if (a > peak) peak = a;
+        const jump = Math.abs(s - prev);
+        if (jump > maxJump) maxJump = jump;
+        if (jump > DISC_THRESHOLD) discCount++;
+        let out = s;
+        if (a > LIMIT_T) {
+          limitedCount++;
+          if (a > 1) clipCount++;
+          // Soft knee approaching 1.0 asymptotically — the single point where the
+          // whole audible mix (ring + music) is protected from summing past 1.0.
+          const t = (a - LIMIT_T) / LIMIT_K;
+          out = (s < 0 ? -1 : 1) * (LIMIT_T + LIMIT_K * Math.tanh(t));
+        }
+        outCh[i] = out;
+        prev = out;
+      }
+      this.lastOut[ch] = prev;
+    }
+
+    if (stats) {
+      Atomics.add(stats, STATS_PROC, 1);
+      Atomics.add(stats, STATS_FRAMES, frames);
+      if (clipCount) Atomics.add(stats, STATS_CLIP, clipCount);
+      if (limitedCount) Atomics.add(stats, STATS_LIMITED, limitedCount);
+      if (discCount) Atomics.add(stats, STATS_DISC, discCount);
+      const peakMilli = Math.round(peak * 1000);
+      if (peakMilli > Atomics.load(stats, STATS_PEAK_MILLI)) {
+        Atomics.store(stats, STATS_PEAK_MILLI, peakMilli);
+      }
+      const jumpMilli = Math.round(maxJump * 1000);
+      if (jumpMilli > Atomics.load(stats, STATS_MAX_JUMP_MILLI)) {
+        Atomics.store(stats, STATS_MAX_JUMP_MILLI, jumpMilli);
+      }
+    }
+    return true;
+  }
+}
+
 registerProcessor("bottleship-audio", BottleShipAudioProcessor);
+registerProcessor("bottleship-audio-master", BottleShipMasterProcessor);

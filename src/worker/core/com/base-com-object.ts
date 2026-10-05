@@ -26,6 +26,10 @@ export abstract class BaseComObject implements IVTable {
     private _handle: number = 0;   // Handle in SystemResourceProvider
     private _iid: string;          // Interface ID (GUID)
     private _vtableAddress: number; // Address of VTable in memory
+    private _ifaceRefs: Map<number, number> | null = null; // interface ptr -> its own refcount
+    private _liveIfaces: number = 0;                       // interfaces whose count is > 0
+    private _destroyed: boolean = false;                   // destroy() has run; never run it twice
+    private _zeroRefKeptLogged: boolean = false;
 
     constructor(iid: string, vtableAddress: number) {
         this._iid = iid;
@@ -35,6 +39,17 @@ export abstract class BaseComObject implements IVTable {
         const resourceProvider = SystemResourceProvider.getInstance();
         this._handle = resourceProvider.registerComObject(this);
         Logger.verbose(LogCategory.COM, `Created COM object ${this.constructor.name} handle=0x${this._handle.toString(16)} iid=${iid}`);
+
+        // A per-interface object whose addRef/release was overridden loses the interface
+        // pointer the guest called through (TypeScript accepts an arity-0 override), and the
+        // symptom is a leak that never reaches destroy(). Say so at birth rather than never.
+        if (this.perInterfaceRefs) {
+            if (this.addRef !== BaseComObject.prototype.addRef || this.release !== BaseComObject.prototype.release) {
+                Logger.error(LogCategory.COM,
+                    `${this.constructor.name} uses per-interface refcounting but overrides addRef/release — ` +
+                    `the override must forward ifacePtr or the object can never reach zero`);
+            }
+        }
     }
 
     /**
@@ -66,59 +81,142 @@ export abstract class BaseComObject implements IVTable {
     }
 
     /**
-     * Increment reference count
+     * When true, references are counted PER INTERFACE POINTER instead of per object, and
+     * the object survives until every interface it handed out has reached zero. That is
+     * DirectDraw's actual model (IDirectDraw/2/4/7 and IDirect3D/2/3/7 are views of one
+     * driver object, each with its own count), and DX6/DX7 code depends on the observable
+     * consequence: create v1, QueryInterface v4, Release v1 -> 0 while v4 stays usable.
+     * Objects only ever handed out through a single pointer keep the shared count.
      */
-    addRef(): number {
+    protected get perInterfaceRefs(): boolean {
+        return false;
+    }
+
+    /**
+     * Increment reference count. `ifacePtr` is the interface pointer the guest called
+     * through; it only matters for perInterfaceRefs objects (0 = the object's own address).
+     */
+    addRef(ifacePtr: number = 0): number {
+        if (this.perInterfaceRefs) return this.addRefInterface(ifacePtr);
         this._refCount++;
         Logger.verbose(LogCategory.COM, `${this.constructor.name} AddRef: ${this._refCount} refs`);
         return this._refCount;
     }
 
     /**
-     * Decrement reference count
+     * Decrement reference count. Returns the count the guest must observe — for a
+     * perInterfaceRefs object that is the count of `ifacePtr` alone.
      */
-    release(): number {
+    release(ifacePtr: number = 0): number {
+        if (this.perInterfaceRefs) return this.releaseInterface(ifacePtr);
         this._refCount--;
         Logger.verbose(LogCategory.COM, `${this.constructor.name} Release: ${this._refCount} refs`);
+        if (this._refCount > 0) return this._refCount;
+        return this.onLastReferenceGone();
+    }
 
-        if (this._refCount <= 0 && this.leakOnZeroRef) {
-            // Some objects (D3D devices in Blade of Darkness) are over-released by the guest's
-            // cleanup-on-failure / enumeration churn yet kept in use afterwards. Destroying them
-            // here leaves the guest spinning on a dead pointer (`Object not found`) and later
-            // corrupts SmartHeap. Keep them registered (a bounded, harmless leak) so the guest's
-            // stale pointer keeps resolving. Report 0 to the caller as a real Release would.
+    private interfaceRefs(): Map<number, number> {
+        if (!this._ifaceRefs) {
+            // The object was born holding one reference on whichever interface it was
+            // created as, i.e. the address it is mapped at.
+            this._ifaceRefs = new Map([[this.primaryInterfaceAddr(), Math.max(1, this._refCount)]]);
+            this._liveIfaces = 1;
+        }
+        return this._ifaceRefs;
+    }
+
+    /**
+     * The pointer this object was BORN as. Deliberately not getAddressForHandle: that holds
+     * the last address mapped to the handle, and every QueryInterface tear-off remaps the
+     * handle before AddRef-ing its own pointer — so the birth reference would be credited to
+     * the tear-off's bucket and the original pointer's Release would find no reference,
+     * leaving _liveIfaces permanently above zero (destroy() never runs, surfaces never freed).
+     */
+    private primaryInterfaceAddr(): number {
+        const rp = SystemResourceProvider.getInstance();
+        return ((rp.getPrimaryAddressForHandle(this._handle) ?? rp.getAddressForHandle(this._handle) ?? 0)) >>> 0;
+    }
+
+    private interfaceKey(ifacePtr: number): number {
+        return (ifacePtr >>> 0) || this.primaryInterfaceAddr();
+    }
+
+    private addRefInterface(ifacePtr: number): number {
+        const refs = this.interfaceRefs();
+        const key = this.interfaceKey(ifacePtr);
+        const count = (refs.get(key) ?? 0) + 1;
+        refs.set(key, count);
+        if (count === 1) this._liveIfaces++;
+        this._refCount++;
+        Logger.verbose(LogCategory.COM,
+            `${this.constructor.name} AddRef iface=0x${key.toString(16)}: ${count} (${this._liveIfaces} live ifaces, ${this._refCount} total)`);
+        return count;
+    }
+
+    private releaseInterface(ifacePtr: number): number {
+        const refs = this.interfaceRefs();
+        const key = this.interfaceKey(ifacePtr);
+        const current = refs.get(key) ?? 0;
+        if (current <= 0) {
+            Logger.warn(LogCategory.COM,
+                `${this.constructor.name} Release on interface 0x${key.toString(16)} that holds no reference`);
+            return 0;
+        }
+        const count = current - 1;
+        refs.set(key, count);
+        this._refCount = Math.max(0, this._refCount - 1);
+        Logger.verbose(LogCategory.COM,
+            `${this.constructor.name} Release iface=0x${key.toString(16)}: ${count} (${this._liveIfaces} live ifaces, ${this._refCount} total)`);
+        if (count > 0) return count;
+        this._liveIfaces--;
+        if (this._liveIfaces > 0) return 0; // another interface still keeps the object alive
+        this.onLastReferenceGone();
+        return 0;
+    }
+
+    /** Refcount reached zero: either the leak guard keeps the object, or it is destroyed. */
+    private onLastReferenceGone(): number {
+        if (this.leakOnZeroRef) {
+            // Two reasons an object outlives its own zero: it is a complex sublevel whose
+            // lifetime belongs to its root (see DirectDrawSurfaceObject), or it is
+            // over-released by the guest's cleanup-on-failure / enumeration churn yet kept
+            // in use afterwards (D3D devices in Blade of Darkness). Either way, destroying
+            // here leaves the guest dispatching through a dead pointer. Stay registered and
+            // report 0 to the caller as a real Release would; the owner's teardown
+            // (forceRelease) is what actually destroys us.
             this._refCount = 0;
-            Logger.log(LogCategory.COM, `${this.constructor.name} reached 0 refs — kept registered (leak-on-zero-ref guard) handle=0x${this._handle.toString(16)}`);
+            // Routine for a mip chain the guest re-walks every frame, so say it once per object.
+            const line = `${this.constructor.name} reached 0 refs — kept registered (leak-on-zero-ref guard) handle=0x${this._handle.toString(16)}`;
+            if (this._zeroRefKeptLogged) Logger.verbose(LogCategory.COM, line);
+            else { this._zeroRefKeptLogged = true; Logger.log(LogCategory.COM, line); }
             return 0;
         }
 
-        if (this._refCount <= 0) {
-            const process = System.getInstance().process;
-            const cpu = process?.v86?.cpu || (process?.v86?.v86 && process?.v86?.v86.cpu);
-            const mem8 = process?.v86?.mem8 || (process?.v86?.v86 && process?.v86?.v86.cpu.mem8);
-            if (cpu && mem8) {
-                try {
-                    const esp = cpu.reg32?.[4] ?? 0;
-                    const cs = cpu.sreg?.[1] ?? 0;
-                    const eip = cpu.instruction_pointer?.[0] ?? 0;
-                    let retAddr = 0;
-                    if (esp >= 0 && esp + 4 <= mem8.length) {
-                        const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
-                        retAddr = view.getUint32(esp, true);
-                    }
-                    Logger.verbose(LogCategory.COM,
-                        `${this.constructor.name} Release stack: CS=0x${cs.toString(16)} EIP=0x${eip.toString(16)} ESP=0x${esp.toString(16)} RET=0x${retAddr.toString(16)}`);
-                } catch {}
-            }
-            Logger.log(LogCategory.COM, `Destroying COM object ${this.constructor.name} handle=0x${this._handle.toString(16)}`);
-            // Track COM release for cleanup detection
-            System.getInstance().trackComRelease();
-            this.destroy();
-            SystemResourceProvider.getInstance().unregisterComObject(this._handle);
-            return 0;
+        this._refCount = 0;
+        const process = System.getInstance().process;
+        const cpu = process?.v86?.cpu || (process?.v86?.v86 && process?.v86?.v86.cpu);
+        const mem8 = process?.getCurrentMemory();
+        if (cpu && mem8) {
+            try {
+                const esp = cpu.reg32?.[4] ?? 0;
+                const cs = cpu.sreg?.[1] ?? 0;
+                const eip = cpu.instruction_pointer?.[0] ?? 0;
+                let retAddr = 0;
+                if (esp >= 0 && esp + 4 <= mem8.length) {
+                    const view = new DataView(mem8.buffer, mem8.byteOffset, mem8.byteLength);
+                    retAddr = view.getUint32(esp, true);
+                }
+                Logger.verbose(LogCategory.COM,
+                    `${this.constructor.name} Release stack: CS=0x${cs.toString(16)} EIP=0x${eip.toString(16)} ESP=0x${esp.toString(16)} RET=0x${retAddr.toString(16)}`);
+            } catch {}
         }
-
-        return this._refCount;
+        Logger.log(LogCategory.COM, `Destroying COM object ${this.constructor.name} handle=0x${this._handle.toString(16)}`);
+        // Track COM release for cleanup detection
+        System.getInstance().trackComRelease();
+        this._destroyed = true;
+        this.destroy();
+        SystemResourceProvider.getInstance().unregisterComObject(this._handle);
+        return 0;
     }
 
     /**
@@ -137,13 +235,15 @@ export abstract class BaseComObject implements IVTable {
 
         // Check if this is the requested interface or IUnknown
         if (normalizedRiid === normalizedSelf || normalizedRiid === normalizedIUnknown) {
-            this.addRef();
             const address = SystemResourceProvider.getInstance().getAddressForHandle(this._handle);
             if (address === null) {
                 Logger.error(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid}: object not mapped to guest memory!`);
                 view.setUint32(ppvObject, 0, true);
                 return 0x80004005; // E_FAIL
             }
+            // Reference the pointer we are about to hand out, not "the object" — for a
+            // perInterfaceRefs object those are different buckets.
+            this.addRef(address >>> 0);
             view.setUint32(ppvObject, address >>> 0, true);
             Logger.verbose(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid} -> 0x${address.toString(16)}`);
             return 0; // S_OK
@@ -152,13 +252,13 @@ export abstract class BaseComObject implements IVTable {
         // Check if derived classes support additional interfaces
         const supportedIid = this.queryAdditionalInterfaces(normalizedRiid);
         if (supportedIid) {
-            this.addRef();
             const address = SystemResourceProvider.getInstance().getAddressForHandle(this._handle);
             if (address === null) {
                 Logger.error(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid} (additional): object not mapped to guest memory!`);
                 view.setUint32(ppvObject, 0, true);
                 return 0x80004005; // E_FAIL
             }
+            this.addRef(address >>> 0);
             view.setUint32(ppvObject, address >>> 0, true);
             Logger.verbose(LogCategory.COM, `${this.constructor.name} QueryInterface ${riid} -> 0x${address.toString(16)} (additional)`);
             return 0; // S_OK
@@ -187,17 +287,30 @@ export abstract class BaseComObject implements IVTable {
     }
 
     /**
+     * Whether an owner's teardown may destroy this object while it sits at zero refs.
+     * Only meaningful for a leakOnZeroRef object: the guard exists either because the
+     * object's lifetime belongs to an owner that will reap it (true), or because the
+     * guest over-releases it and keeps using the pointer, so nothing may reap it (false).
+     */
+    protected get reapableAtZero(): boolean {
+        return false;
+    }
+
+    /**
      * Force-release this COM object regardless of refcount.
-     * Called during shutdown to prevent leaks.
+     * Called during shutdown, and by an owner tearing down what it created.
      */
     forceRelease(): void {
-        if (this._refCount > 0) {
-            Logger.log(LogCategory.COM,
-                `Force-releasing ${this.constructor.name} handle=0x${this._handle.toString(16)} (refCount was ${this._refCount})`);
-            this._refCount = 0;
-            this.destroy();
-            SystemResourceProvider.getInstance().unregisterComObject(this._handle);
-        }
+        if (this._destroyed) return;
+        if (this._refCount === 0 && !this.reapableAtZero) return;
+        Logger.log(LogCategory.COM,
+            `Force-releasing ${this.constructor.name} handle=0x${this._handle.toString(16)} (refCount was ${this._refCount})`);
+        this._refCount = 0;
+        this._ifaceRefs?.clear();
+        this._liveIfaces = 0;
+        this._destroyed = true;
+        this.destroy();
+        SystemResourceProvider.getInstance().unregisterComObject(this._handle);
     }
 
     /**

@@ -1,5 +1,6 @@
 
 import { Process } from "./process";
+import { stopChildProcesses, hasChildSession } from "./child-process";
 import { WindowManager } from "../runtime/windowing/window-manager";
 import { GDIContext } from "../modules/gdi32/context";
 import { InputManager } from "../runtime/input/input-manager";
@@ -18,6 +19,7 @@ import { profiler, Profiler } from "./profiler";
 import { leaseRegistry } from "./memory/lease-registry";
 import { memoryEventBuffer } from "./memory/memory-event-buffer";
 import { faultRecorder } from "./memory/fault-recorder";
+import { loadDiagnostics } from "./diagnostics/load-diagnostics";
 import { serializeCpu } from "../harness/serialize";
 import { buildHarnessReport, type HarnessReport } from "../harness/build-report";
 import { frameProfiler } from "./frame-profiler";
@@ -29,6 +31,8 @@ import { libHleManager } from "./hle-lib/lib-hle-manager";
 import { hookRegistry } from "./hooks";
 import { resetSehDispatchState } from "./seh-dispatch";
 import { namedObjects } from "../modules/kernel32/named-objects";
+import { hypercallDataManager } from "./cpu/hypercall-data";
+import type { PointerClipRect } from "./pointer-policy";
 
 /**
  * The crash payload posted to the host (`process_exit{crashed:true, fault}`) and
@@ -73,6 +77,8 @@ export interface CrashFaultPayload {
      *  with ESP + [esp]. Isolated from a busy peer thread that floods the global ring;
      *  reveals a wild/corrupt ESP directly. */
     crashThreadCalls?: string[];
+    /** True for a process-fatal crash; absent for a per-thread fault the process survived. */
+    fatal?: boolean;
     /** Set when the crashing thread entered a thunk with ESP outside its stack
      *  (stack/control-flow corruption tripwire). */
     wildEsp?: string | null;
@@ -95,6 +101,34 @@ export interface CrashFaultPayload {
     sehDispatchTrace?: string[];
 }
 
+/** Guest cursor shape forwarded to the host (RGBA pixels + hotspot). */
+export interface HostCursorImage {
+    width: number;
+    height: number;
+    pixels: Uint8Array;
+    hotspotX: number;
+    hotspotY: number;
+}
+
+/**
+ * A run of bytes a launcher wrote into a child it had created SUSPENDED, to be replayed
+ * into the image once the restart has mapped it. `data` is base64 because this crosses the
+ * page reload through sessionStorage.
+ */
+export interface GuestImagePatch {
+    address: number;
+    data: string;
+}
+
+/** One module's static-TLS (`__declspec(thread)`) template, as the PE TLS directory declares it. */
+export interface ImplicitTlsEntry {
+    tlsIndex: number;
+    templateStart: number;  // guest VA of template data
+    templateSize: number;
+    zeroFillSize: number;
+    moduleName: string;
+}
+
 export class System {
     private static instance: System;
     public process: Process | null = null;
@@ -114,6 +148,9 @@ export class System {
     public scheduler: Scheduler;
     public profiler: Profiler = profiler;
     public isExiting: boolean = false;
+    /** A launcher's re-exec is scheduled: the image is being RESTARTED, so its exit
+     *  must not surface as "the game exited" (see postProcessExitWhenDurable). */
+    public isReExecPending: boolean = false;
     public isCleaningUp: boolean = false;  // Set when game is in cleanup mode
     public isPaused: boolean = false;  // Set when emulator is paused
     private _releaseCount: number = 0;
@@ -247,25 +284,107 @@ export class System {
     public executableName: string = "app.exe";  // Name of the main executable (from manifest)
     public executablePath: string = "C:\\app.exe";  // Full VFS path to the executable
     public executableArgs: string = "";  // Command-line arguments from manifest
+    public executableCommandLine: string | null = null;
+
+    /**
+     * Installed by the worker: restart the guest process with a new command line.
+     *
+     * Returns whether the restart was ACCEPTED. The worker refuses when it has no replayable
+     * bundle payload and when a re-exec is already scheduled, and a refusal must reach the
+     * caller: ShellExecute answering "launched" for a child that will never exist makes the
+     * launcher exit and the app simply vanish. `void` is read as acceptance only so a host
+     * that has not been updated keeps working.
+     */
+    public onReExecRequest: ((commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]) => boolean | void) | null = null;
+
+    /**
+     * True when `file` (optionally relative to `directory`) names the image THIS process
+     * was started from.
+     *
+     * A process launching its own image is a re-exec, not a child: the launcher hands the
+     * new command line over and exits. Single-process HLE cannot spawn a child, but it CAN
+     * reproduce a re-exec exactly — restart with those arguments. Common in front-end
+     * launchers that pick a map/save/renderer and relaunch (UE1's Game.exe re-running
+     * itself as `Game.exe <map> -SAVESLOT=n`).
+     */
+    public isSelfImage(file: string, directory: string = ""): boolean {
+        const target = this.resolveImagePath(file, directory);
+        if (!target) return false;
+        return target.toLowerCase() === this.executablePath.trim().replace(/\//g, "\\").toLowerCase();
+    }
+
+    /**
+     * `file` (optionally relative to `directory`) as a full VFS path, resolved the way
+     * CreateProcess/ShellExecute resolve it: an absolute path as given, otherwise against
+     * the stated working directory, otherwise against the image's own directory.
+     */
+    public resolveImagePath(file: string, directory: string = ""): string {
+        const clean = (s: string): string => s.trim().replace(/^"+|"+$/g, "").replace(/\//g, "\\");
+        let target = clean(file);
+        if (!target) return "";
+        if (!/^[a-z]:\\/i.test(target)) {
+            const self = clean(this.executablePath);
+            const base = clean(directory) || self.slice(0, self.lastIndexOf("\\") + 1);
+            target = (base.endsWith("\\") ? base : base + "\\") + target.replace(/^\\+/, "");
+        }
+        // Collapse "." / ".." and doubled separators the way Win32 canonicalizes a path
+        // before it opens the image. A launcher naming its child ".\setup.exe" is ordinary
+        // (Mafia's does), and an uncollapsed "C:\.\setup.exe" matches neither the running
+        // image nor a bundle entry — so the launch silently falls back to the manifest
+        // entrypoint, which for a self-launching game is the launcher again, forever.
+        const drive = /^[a-z]:/i.test(target) ? target.slice(0, 2) : "";
+        const parts: string[] = [];
+        for (const seg of target.slice(drive.length).split("\\")) {
+            if (!seg || seg === ".") continue;
+            if (seg === "..") parts.pop();
+            else parts.push(seg);
+        }
+        return `${drive}\\${parts.join("\\")}`;
+    }
+
+    /**
+     * Ask the worker to restart with `commandLine`, running `imagePath` instead of the
+     * current image when given. False if unsupported or refused.
+     *
+     * One process hosts one image, so a launcher starting the GAME is served the same way
+     * a launcher relaunching ITSELF is: restart, mounting the same bundle, with the new
+     * image as the entry point. The parent does not survive — which is what a launcher
+     * that exits right after CreateProcess does anyway, and the only single-process
+     * reading of "run this instead" available to us.
+     *
+     * `imagePatches` carry what the launcher wrote into the child while it was suspended —
+     * for the encrypt-on-disk launchers that is the decrypted code itself, so the restart
+     * has to replay it or the new process runs ciphertext.
+     */
+    public requestReExec(commandLine: string, imagePath?: string, imagePatches?: GuestImagePatch[]): boolean {
+        if (!this.onReExecRequest) return false;
+        const accepted = this.onReExecRequest(commandLine, imagePath, imagePatches) !== false;
+        if (!accepted) {
+            Logger.warn(LogCategory.SYSTEM,
+                `Re-exec refused by the host for "${imagePath ?? this.executablePath}" "${commandLine}"`);
+        }
+        return accepted;
+    }
 
     /**
      * Implicit TLS entries from PE modules using __declspec(thread).
      * Each entry records the TLS index and template data location so that
      * new threads (CreateThread) can initialize their own TLS data copies.
      */
-    public implicitTlsEntries: Array<{
-        tlsIndex: number;
-        templateStart: number;  // guest VA of template data
-        templateSize: number;
-        zeroFillSize: number;
-        moduleName: string;
-    }> = [];
+    public implicitTlsEntries: ImplicitTlsEntry[] = [];
     private hostResize: ((width: number, height: number) => void) | null = null;
     private hostCursorVisibility: ((visible: boolean) => void) | null = null;
     private hostCursorVisibleState: boolean | null = null;
+    private hostCursorImage: ((image: HostCursorImage | null) => void) | null = null;
+    private hostCursorPosition: ((pos: { x: number; y: number } | null) => void) | null = null;
+    private hostCursorPositionState: string | null = null;
+    private hostCursorWarpMode: ((active: boolean) => void) | null = null;
+    private hostCursorWarpModeState = false;
+    private hostCursorClipSignal: ((active: boolean, rect: PointerClipRect | null) => void) | null = null;
+    private hostCursorClipSignalState: string | null = null;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
     private hostMouseCaptureState: boolean | null = null;
-    private hostWindowTitle: ((title: string) => void) | null = null;
+    private hostWindowTitle: ((title: string, visible: boolean) => void) | null = null;
 
     private constructor() {
         this.windowManager = new WindowManager();
@@ -310,10 +429,17 @@ export class System {
             return dispatcher.threadOwnsSuspendedFrame(threadId);
         };
         this.scheduler.onUnhandledGuestFault = (threadId, eip) => {
-            // Faithful: an unhandled access violation terminates the PROCESS (not an
-            // infinite one-thread spin that freezes the whole emulator). The #PF
-            // handler already populated faultRecorder; reportGuestCrash merges it in.
-            this.reportGuestCrash({ reason: "Unhandled access violation", eip, threadId });
+            // Faithful: an unhandled exception on the main thread terminates the
+            // PROCESS (not an infinite one-thread spin that freezes the whole
+            // emulator). The fault handler already populated faultRecorder;
+            // reportGuestCrash merges it in.
+            const status = faultRecorder.last()?.errorCode ?? 0;
+            const reason = status === 0xC000001D
+                ? "Unhandled illegal instruction"
+                : status === 0xC0000005
+                    ? "Unhandled general protection fault"
+                    : "Unhandled access violation";
+            this.reportGuestCrash({ reason, eip, threadId });
         };
 
         Logger.log(LogCategory.SYSTEM, 'System initialized');
@@ -346,6 +472,89 @@ export class System {
         };
         this.enrichFaultReport(fault);
         return fault;
+    }
+
+    /** Ceiling on the exit-time durability barrier — a stuck OPFS writer must not
+     *  strand the host's exit dialog behind a promise that never settles. */
+    private static readonly EXIT_FLUSH_BUDGET_MS = 3000;
+    private exitNotified = false;
+    public onProcessExit: ((payload: Record<string, unknown>) => void) | null = null;
+
+    /**
+     * THE single process-exit notification. `process_exit` is the host's cue that the
+     * tab may be torn down, so it must not be posted while the guest's last writes are
+     * still buffered: the overlay's OPFS commit is DEBOUNCED, and a reload or a close
+     * inside that window drops whatever has not landed. The loss is per written RANGE,
+     * not a truncation, so a settings file saved on the way out comes back with a hole
+     * in it — and a config whose first byte is NUL reads as empty to the app that wrote
+     * it, which is exactly how "the game saved my settings and lost them" happens.
+     *
+     * The registry is the other half of that state and is debounced the same way, so it
+     * drains here too — a launcher that writes its config and exits is the common case,
+     * not the corner one.
+     *
+     * Idempotent: a process exits once, however many exit paths report it.
+     */
+    private brokerExit: Record<string, unknown> | null = null;
+
+    releaseChildSessionBroker(): void {
+        if (!this.brokerExit || hasChildSession()) return;
+        const payload = this.brokerExit;
+        this.brokerExit = null;
+        this.exitNotified = false;
+        this.postProcessExitWhenDurable(payload);
+    }
+
+    postProcessExitWhenDurable(payload: Record<string, unknown>): void {
+        if (this.exitNotified) return;
+        this.exitNotified = true;
+        if (hasChildSession()) {
+            this.brokerExit = payload;
+            // Guest threads have exited; this worker still owns the live child's VFS.
+            // The child reports its own final exit over the page's foreground port.
+            const notifyParent = this.onProcessExit;
+            void stopChildProcesses(true).then(() => this.drainDurableState())
+                .then(() => notifyParent?.({ ...payload, broker: true }))
+                .catch(error => Logger.warn(LogCategory.SYSTEM, `parent exit flush failed: ${error}`));
+            return;
+        }
+        const childrenStopped = stopChildProcesses();
+        if (this.onProcessExit) {
+            const onExit = this.onProcessExit;
+            void childrenStopped.then(() => onExit(payload));
+            return;
+        }
+        // A launcher exiting into its own re-exec is a restart, not an exit — but the
+        // page reload that serves it is exactly the teardown that drops buffered
+        // writes, so the barrier still runs; only the host dialog is suppressed.
+        const notifyHost = !this.isReExecPending;
+        let posted = false;
+        const post = (): void => {
+            if (posted || !notifyHost) return;
+            posted = true;
+            try {
+                (self as unknown as { postMessage: (m: unknown) => void })
+                    .postMessage({ type: "process_exit", ...payload });
+            } catch { /* not in a worker context (tests) — ignore */ }
+        };
+        const budget = setTimeout(() => {
+            Logger.warn(LogCategory.SYSTEM,
+                `process exit: flushAll did not drain within ${System.EXIT_FLUSH_BUDGET_MS}ms — notifying host anyway`);
+            post();
+        }, System.EXIT_FLUSH_BUDGET_MS) as unknown as number;
+        childrenStopped.then(() => this.drainDurableState())
+            .catch((e) => Logger.warn(LogCategory.SYSTEM, `process exit: flushAll failed: ${e}`))
+            .then(() => { clearTimeout(budget); post(); });
+    }
+
+    /** Everything the guest wrote that is still only in memory: the overlay's debounced
+     *  OPFS commits and the registry's debounced container write. */
+    async drainDurableState(): Promise<void> {
+        await Promise.all([
+            this.fileSystem.flushAll(),
+            this.registry.flush().catch((e) =>
+                Logger.warn(LogCategory.SYSTEM, `process exit: registry flush failed: ${e}`)),
+        ]);
     }
 
     /**
@@ -389,27 +598,68 @@ export class System {
 
         this.enrichFaultReport(fault);
 
+        // Outlives the teardown below so harness.report() can still name the cause
+        // even when the crash predates any guest execution (e.g. PE link failure).
+        loadDiagnostics.noteFailure({
+            reason: fault.reason,
+            eip: fault.eip,
+            faultAddr: fault.faultAddr,
+            threadId: fault.threadId,
+            lastThunk: fault.lastThunk,
+        });
+
         Logger.error(LogCategory.SYSTEM,
             `Process crash: ${fault.reason} — EIP=0x${fault.eip.toString(16)} ` +
             `addr=0x${fault.faultAddr.toString(16)} thread=T${fault.threadId ?? "?"} ` +
             `lastThunk=${fault.lastThunk || "unknown"}`);
 
         this.isExiting = true;
-        this.fileSystem.flushAll().catch(() => { /* best-effort */ });
         this.scheduler.terminateAllThreads(0xC0000005); // STATUS_ACCESS_VIOLATION
         try { this.process?.v86?.stop?.(); } catch { /* best-effort */ }
 
         // Host UI: full fault record → "The game crashed" dialog + copyable report.
-        try {
-            (self as unknown as { postMessage: (m: unknown) => void }).postMessage({
-                type: "process_exit",
-                exitCode: 0xC0000005,
-                crashed: true,
-                fault,
-            });
-        } catch { /* not in a worker context (tests) */ }
+        // Gated on the durability barrier: a game that crashes after writing its save
+        // deserves the same guarantee as one that exits cleanly.
+        this.postProcessExitWhenDurable({ exitCode: 0xC0000005, crashed: true, fault });
 
-        // Harness: one event for every crash class, not just #PF AVs.
+        // Harness: one event for every crash class, not just #PF AVs. `fatal`
+        // separates this from reportGuestThreadFault, whose process keeps running —
+        // only the fatal one may abort a script's waits.
+        try { harnessBus.emit('fault', { ...fault, fatal: true }); } catch { /* */ }
+    }
+
+    /**
+     * Non-fatal sibling of reportGuestCrash: an unhandled #GP/#UD on a WORKER
+     * thread terminated that thread but the process keeps running. Emits the same
+     * fault-grade payload on the harness bus (so `waitForEvent('fault')` and
+     * `faults()` see it) WITHOUT tearing the process down or notifying the host.
+     */
+    reportGuestThreadFault(opts: {
+        reason: string;
+        eip: number;
+        threadId: number | null;
+        exceptionCode: number;
+    }): void {
+        const rec = faultRecorder.last();
+        const fault: CrashFaultPayload = {
+            reason: opts.reason,
+            eip: opts.eip >>> 0,
+            faultAddr: (rec?.faultAddr ?? 0) >>> 0,
+            errorCode: opts.exceptionCode >>> 0,
+            threadId: opts.threadId ?? rec?.threadId ?? null,
+            lastThunk: rec?.lastThunk ?? "",
+            regs: rec?.regs ?? null,
+            recentCalls: rec?.recentCalls ?? [],
+            gameEsp: (rec?.gameEsp ?? 0) >>> 0,
+            stackDump: rec?.stackDump ?? [],
+        };
+        this.enrichFaultReport(fault);
+
+        Logger.error(LogCategory.SYSTEM,
+            `Thread fault (survivable): ${fault.reason} — EIP=0x${fault.eip.toString(16)} ` +
+            `status=0x${fault.errorCode.toString(16)} thread=T${fault.threadId ?? "?"} ` +
+            `lastThunk=${fault.lastThunk || "unknown"}`);
+
         try { harnessBus.emit('fault', fault); } catch { /* */ }
     }
 
@@ -468,22 +718,86 @@ export class System {
         this.hostResize = callback;
     }
 
-    requestHostResize(width: number, height: number): void {
+    /**
+     * The guest wants the host surface to be this size. Every mode-setting path funnels
+     * through here, so this is also where the EMULATED DISPLAY MODE is published.
+     *
+     * There is exactly ONE host canvas and it IS the emulated screen, so its size and the
+     * emulated display mode cannot legitimately disagree — and when they did, everything
+     * that reports the desktop size (GetSystemMetrics(SM_CXSCREEN), EnumDisplaySettings,
+     * where a fullscreen window gets placed, and therefore where a click lands) was reading
+     * a different number from the one on screen. A D3D9 fullscreen device left the mode at
+     * the manifest's, so an 800x600 client sat centred in a 1024x768 desktop and every click
+     * was off by the centring offset. Publishing here makes the two agree by construction.
+     *
+     * `modeSet` is OPT-IN and means "this width/height IS the screen": a real
+     * ChangeDisplaySettings / SetDisplayMode / a FULLSCREEN device. It must NOT be passed for
+     * a window size or for a WINDOWED backbuffer — those are sizes INSIDE the desktop, and
+     * publishing one as the mode makes SM_CXSCREEN/SM_CYSCREEN, EnumDisplaySettings and
+     * fullscreen placement report the window as the desktop (and silently rewrites
+     * ddrawContext.display without reallocating a single surface).
+     */
+    requestHostResize(
+        width: number,
+        height: number,
+        opts?: { modeSet?: boolean; bpp?: number; refreshRate?: number },
+    ): void {
+        if (opts?.modeSet === true && width > 0 && height > 0) {
+            const display = this.ddrawContext?.display;
+            if (display) {
+                display.width = width;
+                display.height = height;
+                if (opts?.bpp) display.bpp = opts.bpp;
+                if (opts?.refreshRate) display.refresh = opts.refreshRate;
+            }
+            const changed = this.emulatedDisplayMode?.width !== width || this.emulatedDisplayMode?.height !== height;
+            this.emulatedDisplayMode = {
+                width, height,
+                bpp: opts?.bpp ?? this.emulatedDisplayMode?.bpp ?? 0,
+                refreshRate: opts?.refreshRate ?? this.emulatedDisplayMode?.refreshRate ?? 0,
+            };
+            if (changed) {
+                Logger.log(LogCategory.SYSTEM,
+                    `[DISPLAY-MODE] ${width}x${height}${opts?.bpp ? `x${opts.bpp}` : ""} published as the emulated display mode`);
+            }
+        }
         if (this.hostResize) {
             this.hostResize(width, height);
         }
     }
 
+    /**
+     * The published emulated display mode, or null before any mode-set. The authoritative
+     * value for anything that must agree on "how big is the screen" — read this rather than
+     * a per-subsystem copy. `ddrawContext.display` is kept in step for the DDraw readers.
+     */
+    public emulatedDisplayMode: { width: number; height: number; bpp: number; refreshRate: number } | null = null;
+
     setHostCursorVisibilityCallback(callback: (visible: boolean) => void): void {
         this.hostCursorVisibility = callback;
     }
 
-    setHostWindowTitleCallback(callback: (title: string) => void): void {
+    setHostWindowTitleCallback(callback: (title: string, visible: boolean) => void): void {
         this.hostWindowTitle = callback;
     }
 
-    notifyWindowTitle(title: string): void {
-        if (this.hostWindowTitle) this.hostWindowTitle(title);
+    /** Digits/whitespace stripped — what stays constant while an engine rewrites its FPS. */
+    private lastWindowTitleSkeleton: string | null = null;
+
+    /** Single choke point for every top-level title change (CreateWindow, WM_SETTEXT,
+     *  SetWindowText). Logged because a whole class of engines reports fatal asserts by
+     *  rewriting the frame title — but a title that only differs in its NUMBERS is an FPS
+     *  counter, and logging that at every frame is a permanent per-frame line in the
+     *  firehose. Those still reach the ring at verbose. */
+    notifyWindowTitle(title: string, source = "?", visible = true): void {
+        const skeleton = title.replace(/[\d.,:\s]+/g, "");
+        if (skeleton !== this.lastWindowTitleSkeleton) {
+            this.lastWindowTitleSkeleton = skeleton;
+            Logger.log(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
+        } else {
+            Logger.verbose(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
+        }
+        if (this.hostWindowTitle) this.hostWindowTitle(title, visible);
     }
 
     requestHostCursorVisible(visible: boolean): void {
@@ -494,15 +808,81 @@ export class System {
         }
     }
 
+    setHostCursorImageCallback(callback: (image: HostCursorImage | null) => void): void {
+        this.hostCursorImage = callback;
+    }
+
+    setHostCursorWarpModeCallback(callback: (active: boolean) => void): void {
+        this.hostCursorWarpMode = callback;
+    }
+
+    /** Cursor-warp capture (user32 warp-burst detection) → host pointer-lock intent. */
+    requestHostCursorWarpMode(active: boolean): void {
+        if (this.hostCursorWarpModeState === active) return;
+        this.hostCursorWarpModeState = active;
+        if (this.hostCursorWarpMode) {
+            this.hostCursorWarpMode(active);
+        }
+    }
+
+    setHostCursorClipSignalCallback(callback: (active: boolean, rect: PointerClipRect | null) => void): void {
+        this.hostCursorClipSignal = callback;
+    }
+
+    /**
+     * ClipCursor confinement (see core/pointer-policy). We clamp guest-visible positions
+     * ourselves, but the HOST pointer is a second, unconfined pointer: without the rect it
+     * keeps travelling past the wall and the two diverge by exactly the drift. So the rect
+     * travels with the claim, the way Wine hands its driver the rect to grab against.
+     */
+    requestHostCursorClipSignal(active: boolean, rect: PointerClipRect | null): void {
+        const key = active && rect ? `${rect.left},${rect.top},${rect.right},${rect.bottom}` : String(active);
+        if (this.hostCursorClipSignalState === key) return;
+        this.hostCursorClipSignalState = key;
+        this.hostCursorClipSignal?.(active, rect);
+    }
+
+    /**
+     * Forward the installed cursor's image to the host so it renders the guest's
+     * pointer shape (real Windows: the system draws whatever SetCursor installed).
+     * Dedup lives with the cursor-state owner (user32 shared-state) — this is
+     * pure transport. null = no shape installed.
+     */
+    requestHostCursorImage(image: HostCursorImage | null): void {
+        if (this.hostCursorImage) {
+            this.hostCursorImage(image);
+        }
+    }
+
+    setHostCursorPositionCallback(callback: (pos: { x: number; y: number } | null) => void): void {
+        this.hostCursorPosition = callback;
+    }
+
+    /**
+     * Where the host must draw the pointer when that is NOT the pointer's own position:
+     * a SOFTWARE D3D device cursor is a sprite the runtime composites, and moving it never
+     * moved the OS pointer, so the host cannot infer it. null = the pointer position again.
+     */
+    requestHostCursorPosition(pos: { x: number; y: number } | null): void {
+        const key = pos ? `${pos.x},${pos.y}` : null;
+        if (this.hostCursorPositionState === key) return;
+        this.hostCursorPositionState = key;
+        this.hostCursorPosition?.(pos);
+    }
+
     setHostMouseCaptureCallback(callback: (capture: boolean) => void): void {
         this.hostMouseCapture = callback;
     }
 
+    /** Game switch: the host must release every input producer it owns. */
+    setHostInputResetCallback(callback: () => void): void {
+        this.inputManager.setHostInputResetCallback(callback);
+    }
+
     /**
      * Assert/release relative-mouse capture independently of ShowCursor/ClipCursor.
-     * Driven by DirectInput exclusive-mode mouse Acquire/Unacquire — on real Windows an
-     * exclusive-mode mouse acquisition implicitly hides and confines the cursor without the
-     * app touching ShowCursor, so this is a first-class pointer-lock trigger for the host.
+     * Transport only: the exclusive-DirectInput fact and the pointer suppression that
+     * comes with it are derived together in core/pointer-policy, the sole caller.
      */
     requestHostMouseCapture(capture: boolean): void {
         if (this.hostMouseCaptureState === capture) return;
@@ -531,6 +911,10 @@ export class System {
      * Reset all system state - clear all subsystems
      */
     async reset(): Promise<void> {
+        this.brokerExit = null;
+        await stopChildProcesses();
+        this.executableCommandLine = null;
+        this.onProcessExit = null;
         Logger.log(LogCategory.SYSTEM, 'Resetting system state');
 
         // Save registry state and flush access log before reset
@@ -557,7 +941,15 @@ export class System {
         videoEngine.closeAll();
         libHleManager.resetOnGameSwitch();
         hookRegistry.reset();
+        // Flush deferred destroys (return-to-pool), then wipe the pool — sizes/formats
+        // from game A must not be handed to game B. clear() alone would drop the pending
+        // queue without destroying those textures.
         this.gpuResourceManager?.flushPendingDestruction();
+        this.gpuResourceManager?.clear();
+        hypercallDataManager.resetDispatchTable();
+        hypercallDataManager.resetThreadSuspendTable();
+        // PE-loader TLS templates are guest VAs that die with Process.reset().
+        this.implicitTlsEntries = [];
 
         // Stop and restart v86 if running to fully reset CPU/MMU/JIT state
         if (this.process?.v86) {
@@ -591,11 +983,30 @@ export class System {
             }
         }
 
+        // Per-GAME host state. An in-worker game switch ("Load File…", no page reload) keeps
+        // this object, so a mode published without a bpp would fall back to the PREVIOUS
+        // title's — a 16-bit game reading 32bpp out of GetDeviceCaps/EnumDisplaySettings.
+        // Same for the cursor states, whose de-dup would swallow the new game's first call.
+        this.emulatedDisplayMode = null;
+        this.hostCursorPositionState = null;
+        this.hostCursorWarpModeState = false;
+        this.hostCursorVisibleState = null;
+        this.hostMouseCaptureState = null;
+        this.hostCursorClipSignalState = null;
+        this.lastWindowTitleSkeleton = null;
+
         this.isExiting = false;
         this.isPaused = false;
         this.isCleaningUp = false;
         this._releaseCount = 0;
         this._crashReported = false; // fresh game → allow a new crash report
+        // Both latches are per-PROCESS, not per-worker: an in-worker game switch
+        // ("Load File…", a launcher's in-worker re-exec) keeps this System alive, and a
+        // latch left standing silently disables the host's exit/crash dialog for every
+        // game loaded after the first — the failure looks like a hang, not an error.
+        this.exitNotified = false;
+        this.isReExecPending = false;
+        loadDiagnostics.reset();
 
         // Reset all subsystems
         this.windowManager.reset();
@@ -617,6 +1028,13 @@ export class System {
         // Reset process if exists
         if (this.process) {
             await this.process.reset();
+            // Process.reset() clears HEAP and rewinds its allocator. The old PEB/TEB
+            // addresses would otherwise be handed to the first guest allocation and
+            // silently overwritten while FS still points at them.
+            this.scheduler.tebManager.initProcess(
+                () => this.process!.getCurrentMemory(),
+                this.process.memory,
+            );
         }
 
         // Recreate vtables after memory reset (memory at 0x03000000+ gets zeroed)

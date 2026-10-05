@@ -13,6 +13,7 @@ const buildParams = (count: number): ParameterDescriptor[] => {
 };
 
 const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDescriptor> = {}): FunctionDescriptor => ({
+    ...overrides,
     name,
     params: overrides.params ?? buildParams(argCount),
     returnType: overrides.returnType ?? "u32",
@@ -22,6 +23,8 @@ const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDes
 export const netapi32Module: ModuleDescriptor = {
     name: "netapi32",
     functions: [
-        makeFunc("Netbios", 1), // PNCB pncb
+        makeFunc("Netbios", 1),          // PNCB pncb
+        makeFunc("NetWkstaGetInfo", 3),  // LMSTR servername, DWORD level, LPBYTE *bufptr
+        makeFunc("NetApiBufferFree", 1), // LPVOID Buffer
     ],
 };

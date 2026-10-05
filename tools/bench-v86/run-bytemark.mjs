@@ -1,0 +1,444 @@
+#!/usr/bin/env node
+// Headless BYTEmark (nbench) runner for v86 engines — stock upstream or the
+// BottleShip fork — using upstream's own tests/benchmark/arch-bytemark.js recipe:
+// resume the Arch Linux state image, run ~/nbench over serial, parse the scores.
+//
+// Usage:
+//   node run-bytemark.mjs --engine <v86-root> [--label name] [options]
+//
+//   --engine <dir>    v86 root containing build/libv86.mjs + build/v86.wasm
+//   --bios <dir>      BIOS dir (default: <engine>/bios, fallback: vendor/v86/bios)
+//   --images <dir>    images cache (default: tools/bench-v86/images)
+//   --boot fs|state   fs = fresh kernel boot from 9p (default; guest TSC self-
+//                     calibrates against the engine → comparable guest-timed scores).
+//                     state = resume arch_state (fast, but the state's tsc_khz was
+//                     calibrated on the SAVING engine — only valid if rates match).
+//   --state <file>    state image for --boot state (default: <images>/arch_state-v2.bin.zst)
+//   --flags "i=v,..." set_jit_config pairs applied at start (fork only)
+//   --relaxed 0|1     set_relaxed_fpu (fork only; default: leave engine default)
+//   --tests A,B       run only these nbench tests (DO* names); default: full suite
+//   --label <name>    config label for the result JSON
+//   --out <file>      result JSON path (default: results/<label>-<epoch>.json)
+//   --timeout <min>   abort after N minutes (default 90)
+//   --verbose         log serial output + mirror downloads
+//   --helper-census   count JIT→helper calls (perturbs execution; scores INVALID, exit 4)
+//   --flag-contract 0|1  set_flag_helper_contract (fork only; needs 21=1 in --flags to matter)
+//   --flag-sync-count    compile executed flag-sync counters into blocks (counts only; perturbs
+//                        timing, so the scores are recorded but judged INVALID)
+//
+// First run needs network (lazy-mirrors 9p chunks from i.copy.sh); later runs are offline.
+
+import fs from "node:fs";
+import path from "node:path";
+import url from "node:url";
+import { installLazyMirror } from "./fs-lazy-mirror.mjs";
+import { SHIPPING_CODEGEN_SWITCHES, applyCodegenSwitches, parseSwitches } from "../jit-config/shipping.mjs";
+
+const __dirname = url.fileURLToPath(new URL(".", import.meta.url));
+
+// ── args ────────────────────────────────────────────────────────────────────
+const args = {};
+for (let i = 2; i < process.argv.length; i++) {
+    const a = process.argv[i];
+    if (!a.startsWith("--")) continue;
+    const key = a.slice(2);
+    const next = process.argv[i + 1];
+    if (next !== undefined && !next.startsWith("--")) { args[key] = next; i++; }
+    else args[key] = "1";
+}
+
+const ALL_TESTS = ["DONUMSORT", "DOSTRINGSORT", "DOBITFIELD", "DOEMF", "DOFOUR",
+    "DOASSIGN", "DOIDEA", "DOHUFF", "DONNET", "DOLU"];
+
+if (!args.engine) {
+    console.error("--engine <v86-root> is required");
+    process.exit(2);
+}
+const engineRoot = path.resolve(args.engine);
+const libv86Path = path.join(engineRoot, "build", "libv86.mjs");
+const wasmPath = path.join(engineRoot, "build", "v86.wasm");
+if (!fs.existsSync(libv86Path) || !fs.existsSync(wasmPath)) {
+    console.error(`engine build not found: ${libv86Path} / ${wasmPath}`);
+    process.exit(2);
+}
+let biosDir = args.bios ? path.resolve(args.bios) : path.join(engineRoot, "bios");
+if (!fs.existsSync(path.join(biosDir, "seabios.bin"))) {
+    biosDir = path.resolve(__dirname, "../../vendor/v86/bios");
+}
+const imagesDir = path.resolve(args.images || path.join(__dirname, "images"));
+const bootMode = args.boot || "fs";
+const statePath = path.resolve(args.state || path.join(imagesDir, "arch_state-v2.bin.zst"));
+const fsJsonPath = path.join(imagesDir, "fs.json");
+if (bootMode === "state" && !fs.existsSync(statePath)) {
+    console.error(`state image missing: ${statePath}\nrun: node tools/bench-v86/fetch-images.mjs`);
+    process.exit(2);
+}
+if (bootMode === "fs" && !fs.existsSync(fsJsonPath)) {
+    console.error(`fs.json missing: ${fsJsonPath}\nrun: node tools/bench-v86/fetch-images.mjs`);
+    process.exit(2);
+}
+const label = args.label || path.basename(engineRoot);
+const timeoutMs = (Number(args.timeout) || 90) * 60_000;
+const verbose = !!args.verbose;
+const selectedTests = args.tests ? args.tests.split(",").map(s => s.trim().toUpperCase()) : null;
+if (selectedTests) {
+    for (const t of selectedTests) {
+        if (!ALL_TESTS.includes(t)) { console.error(`unknown test ${t}; valid: ${ALL_TESTS.join(",")}`); process.exit(2); }
+    }
+}
+const flagPairs = (args.flags || "").split(",").filter(Boolean).map(s => {
+    const [i, v] = s.split("=");
+    return [Number(i), Number(v)];
+});
+// Slot 9 (fastmem reads) is retired in the engine, and it could never have run here anyway:
+// the read shape loads `mem8 + LINEAR address`, which is sound only where VA == PA, and a
+// Linux guest does not identity-map.
+if (flagPairs.some(([i, v]) => i === 9 && v !== 0)) {
+    console.error("JIT config slot 9 (fastmem reads) is retired, and nbench boots Linux with non-identity paging.");
+    process.exit(2);
+}
+
+// ── lazy 9p mirror ──────────────────────────────────────────────────────────
+const mirrorStats = installLazyMirror({
+    mirrorRoot: path.join(imagesDir, "arch"),
+    cdnBase: "https://i.copy.sh/arch/",
+    verbose,
+});
+
+// ── boot ────────────────────────────────────────────────────────────────────
+const { V86 } = await import(url.pathToFileURL(libv86Path).href);
+
+const baseConfig = {
+    bios: { url: path.join(biosDir, "seabios.bin") },
+    vga_bios: { url: path.join(biosDir, "vgabios.bin") },
+    wasm_path: wasmPath,
+    autostart: true,
+    memory_size: 512 * 1024 * 1024,
+    vga_memory_size: 8 * 1024 * 1024,
+    net_device: { type: "virtio", relay_url: "<UNUSED>" },
+    log_level: 0,
+};
+const emulator = new V86(bootMode === "state"
+    ? {
+        ...baseConfig,
+        initial_state: { url: statePath },
+        filesystem: { baseurl: path.join(imagesDir, "arch") + path.sep },
+    }
+    : {
+        ...baseConfig,
+        bzimage_initrd_from_filesystem: true,
+        cmdline: "rw console=ttyS0 apm=off root=host9p rootfstype=9p rootflags=trans=virtio,cache=loose mitigations=off audit=0 tsc=reliable nowatchdog init=/usr/bin/init-openrc",
+        filesystem: {
+            basefs: { url: fsJsonPath },
+            baseurl: path.join(imagesDir, "arch") + path.sep,
+        },
+    });
+
+const result = {
+    label,
+    engine: engineRoot,
+    flags: Object.fromEntries(flagPairs),
+    jit_config_provenance: null,
+    relaxed: args.relaxed !== undefined ? Number(args.relaxed) : null,
+    tests_selected: selectedTests || "all",
+    node: process.version,
+    started_at: new Date().toISOString(),
+    clock: null,          // guest-vs-host skew check
+    scores: {},           // per-test iterations/sec (guest-clock based)
+    int_index: null,
+    fp_index: null,
+    memory_index: null,
+    wall_ms: null,        // host wall-clock, command sent → trademark line
+    test_wall_ms: {},     // host timestamps as each score line arrives
+    mirror: mirrorStats,
+};
+
+let serialText = "";
+let line = "";
+let benchStart = 0;
+let lastLineAt = 0;
+let phase = "boot"; // boot → clocksource → clock1 → clock2 → bench → done
+const clockMarks = [];
+let clockHostMarks = [];
+const helperCounts = Object.create(null);
+let censusInstalled = false;
+
+const watchdog = setTimeout(() => {
+    console.error(`\n[bench] TIMEOUT after ${timeoutMs / 60000} min (phase=${phase})`);
+    console.error(serialText.slice(-2000));
+    process.exit(3);
+}, timeoutMs);
+
+function applyEngineConfig() {
+    const exports = emulator?.v86?.cpu?.wm?.exports;
+    if (args.relaxed !== undefined) {
+        if (!exports?.set_relaxed_fpu) { console.error("--relaxed requested but set_relaxed_fpu export missing (stock engine?)"); process.exit(2); }
+        exports.set_relaxed_fpu(Number(args.relaxed));
+    }
+    if (args["flag-contract"] !== undefined || args["flag-sync-count"]) {
+        if (typeof exports?.set_flag_helper_contract !== "function") {
+            console.error("--flag-contract requested but set_flag_helper_contract export missing");
+            process.exit(2);
+        }
+        const mode = Number(args["flag-contract"] ?? 0);
+        exports.set_flag_helper_contract(mode);
+        exports.set_flag_sync_counting(args["flag-sync-count"] ? 1 : 0);
+        if ((exports.get_flag_helper_contract() >>> 0) !== mode) { console.error("flag contract readback mismatch"); process.exit(2); }
+        if (exports.get_flag_helper_contract_mutated()) { console.error("engine carries a MUTATED flag-contract table"); process.exit(2); }
+        result.flag_contract = mode;
+    }
+    if (flagPairs.length) {
+        const setConfig = exports?.["set_jit_config"];
+        const getConfig = exports?.["get_jit_config"];
+        if (typeof setConfig !== "function" || typeof getConfig !== "function") {
+            console.error("--flags requested but set_jit_config/get_jit_config provenance exports are missing");
+            process.exit(2);
+        }
+        const maskGetter = exports?.["jit_config_supported_mask"];
+        const abiGetter = exports?.["jit_config_abi_version"];
+        const supportedMask = typeof maskGetter === "function" ? maskGetter() >>> 0 : null;
+        const abiVersion = typeof abiGetter === "function" ? abiGetter() >>> 0 : null;
+        const readback = {};
+        for (const [i, v] of flagPairs) {
+            if (supportedMask !== null && (i >= 32 || !(supportedMask & (1 << i)))) {
+                console.error(`JIT config index ${i} is unsupported by mask 0x${supportedMask.toString(16)}`);
+                process.exit(2);
+            }
+            const status = setConfig(i, v);
+            if (supportedMask !== null && status !== 0) {
+                console.error(`set_jit_config(${i}, ${v}) failed with status ${status}`);
+                process.exit(2);
+            }
+            const actual = getConfig(i) >>> 0;
+            readback[i] = actual;
+            if (actual !== (v >>> 0)) {
+                console.error(`JIT config provenance mismatch at index ${i}: requested ${v >>> 0}, read back ${actual}`);
+                process.exit(2);
+            }
+        }
+        // Code-shaping switches outside the slot envelope. --flags describes a shipping-derived
+        // arm, so the shipping switches come with it unless --switches says otherwise (the
+        // bench-matrix reference arms pass the all-off set explicitly).
+        let switchReadback;
+        try {
+            switchReadback = applyCodegenSwitches(exports,
+                args.switches !== undefined ? parseSwitches(args.switches) : SHIPPING_CODEGEN_SWITCHES);
+        } catch (e) { console.error(String(e.message ?? e)); process.exit(2); }
+        result.jit_config_provenance = {
+            switches: switchReadback,
+            verified: true,
+            abiVersion,
+            supportedMask: supportedMask === null ? null : `0x${supportedMask.toString(16).padStart(8, "0")}`,
+            requested: Object.fromEntries(flagPairs),
+            readback,
+        };
+        console.error(`[bench] jit flags verified: ${Object.entries(readback).map(([i, v]) => `${i}=${v}`).join(",")}`);
+    }
+    if (exports?.get_relaxed_fpu) console.error(`[bench] relaxed_fpu=${exports.get_relaxed_fpu()}`);
+}
+
+function sendClockProbe() {
+    clockHostMarks.push(Date.now());
+    emulator.serial0_send("echo CLKMARK:$(date +%s%3N)\n");
+}
+
+function startBench() {
+    phase = "bench";
+    const excluded = selectedTests ? ALL_TESTS.filter(n => !selectedTests.includes(n)) : [];
+    const set = excluded.map(n => `echo ${n}=0 >> CMD`).join(" && ");
+    benchStart = Date.now();
+    emulator.serial0_send(
+        `echo 0 > /sys/class/graphics/fbcon/cursor_blink && cd nbench && touch CMD && ${set || "echo"} && ./nbench -cCMD\n`);
+}
+
+function beginProbes() {
+    phase = "clocksource";
+    emulator.serial0_send(
+        "echo CSRC:$(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)\n");
+}
+
+emulator.bus.register("emulator-started", () => {
+    console.error(`[bench] engine started: ${label} (boot=${bootMode})`);
+    applyEngineConfig(); // before guest code compiles — consistent codegen for the whole run
+    if (args['helper-census'] && !censusInstalled) {
+        const imports = emulator.v86.cpu.jit_imports;
+        if (!imports) throw Error('JIT imports unavailable for census');
+        for (const [name, fn] of Object.entries(imports)) if (typeof fn === 'function') {
+            imports[name] = (...a) => {
+                if (phase === 'bench') helperCounts[name] = (helperCounts[name] || 0) + 1;
+                return fn(...a);
+            };
+        }
+        censusInstalled = true;
+        console.error('[bench] DIAGNOSTIC helper census: scores are not performance evidence');
+    }
+    if (bootMode === "state") setTimeout(beginProbes, 1000);
+    // fs mode: wait for the login prompt (detected in the serial listener)
+});
+
+// Serial lines may carry terminal escape remnants (e.g. "[?2004l" bracketed-paste
+// with the ESC byte filtered out) — never anchor at line start.
+const SCORE_RE = /(NUMERIC SORT|STRING SORT|BITFIELD|FP EMULATION|FOURIER|ASSIGNMENT|IDEA|HUFFMAN|NEURAL NET|LU DECOMPOSITION)\s*:\s*([\d.eE+]+)\s*:/;
+
+function onLine(l) {
+    lastLineAt = Date.now();
+    if (verbose) console.error(`  | ${l}`);
+
+    const csrc = l.match(/CSRC:(\w+)/);
+    if (csrc && phase === "clocksource") {
+        result.clocksource = csrc[1];
+        console.error(`[bench] guest clocksource: ${csrc[1]}`);
+        phase = "clock1";
+        setTimeout(sendClockProbe, 500);
+        return;
+    }
+
+    const clk = l.match(/CLKMARK:(\d+)/);
+    if (clk && (phase === "clock1" || phase === "clock2")) {
+        clockMarks.push(Number(clk[1]));
+        if (phase === "clock1") {
+            phase = "clock2";
+            setTimeout(sendClockProbe, 4000); // 4s host gap; compare guest delta
+        } else {
+            const guestDelta = clockMarks[1] - clockMarks[0];
+            const hostDelta = clockHostMarks[1] - clockHostMarks[0];
+            result.clock = { guest_ms: guestDelta, host_ms: hostDelta, ratio: guestDelta / hostDelta };
+            const skew = Math.abs(1 - result.clock.ratio);
+            console.error(`[bench] clock check: guest ${guestDelta}ms / host ${hostDelta}ms (ratio ${result.clock.ratio.toFixed(4)})`);
+            if (skew > 0.03) console.error(`[bench] WARNING: guest clock skew ${(skew * 100).toFixed(1)}% — guest-timed scores are NOT trustworthy`);
+            startBench();
+        }
+        return;
+    }
+
+    const m = l.match(SCORE_RE);
+    if (m && phase === "bench") {
+        result.scores[m[1]] = Number(m[2]);
+        result.test_wall_ms[m[1]] = Date.now() - benchStart;
+        console.error(`[bench] ${m[1]}: ${m[2]} iter/s  (+${((Date.now() - benchStart) / 1000).toFixed(0)}s)`);
+        return;
+    }
+    let idx = l.match(/INTEGER INDEX\s*:\s*([\d.]+)/);
+    if (idx) { result.int_index = Number(idx[1]); return; }
+    idx = l.match(/FLOATING-POINT INDEX\s*:\s*([\d.]+)/);
+    if (idx) { result.fp_index = Number(idx[1]); return; }
+    idx = l.match(/MEMORY INDEX\s*:\s*([\d.]+)/);
+    if (idx) { result.memory_index = Number(idx[1]); return; }
+
+    if (l.includes("* Trademarks are property of their respective holder.")) {
+        finish();
+    }
+}
+
+/**
+ * Whether the feature under test was actually LIVE, sampled before the engine is destroyed.
+ *
+ * A flag readback only proves the flag was set; it does not prove the codegen ever emitted the
+ * shape, so an ablation column can otherwise report a confident percentage for a feature that
+ * never ran. `tier2Threshold` is read from the engine rather than from `--flags`, because the
+ * engine is the only thing that knows what it ended up running.
+ */
+function sampleEngineCounters() {
+    const e = emulator?.v86?.cpu?.wm?.exports;
+    if (!e) return null;
+    const num = (fn) => (typeof e[fn] === "function" ? e[fn]() >>> 0 : null);
+    const getConfig = e["get_jit_config"];
+    return {
+        tier2Threshold: typeof getConfig === "function" ? getConfig(15) >>> 0 : null,
+        speculatedStoresCompiled: num("fastmem_get_speculated_stores_compiled"),
+        tier2Promotions: num("jit_get_tier2_promotions"),
+        tier2Pages: num("jit_get_tier2_page_count"),
+        tier2Evictions: num("jit_get_tier2_evictions"),
+        tier2BlockedByCap: num("jit_get_tier2_blocked_by_cap"),
+        tier2PendingDropped: num("jit_get_tier2_pending_dropped"),
+        flagSync: typeof e["flag_sync_stat_get"] === "function"
+            ? Object.fromEntries(["calls", "contracted", "spillWords", "reloadWords", "spillElided", "reloadElided",
+                "execCalls", "execSpillWords", "execReloadWords"].map((n, i) => [n, e["flag_sync_stat_get"](i)]))
+            : null,
+    };
+}
+
+/**
+ * Judge — not merely report — what the counters say about the shape that ran.
+ *
+ * The tier-2 threshold is a two-sided claim and both sides can be wrong silently: on, with
+ * nothing promoted, means the column measured TIER-1 code under a tier-2 label; off, with
+ * promotions, means the engine promoted anyway and the "tier-2 off" reference is not one.
+ * Either way the scores describe a different experiment, so the run fails rather than
+ * publishing a number nobody can attribute.
+ * @returns {{id:string, ok:boolean, why:string}[]}
+ */
+function judgeEngineCounters(c) {
+    const out = [];
+    if (!c || c.tier2Threshold === null || c.tier2Promotions === null) {
+        // Stock upstream has neither the config ABI nor tiering, so there is no claim to
+        // check. A FORK run that asked for a shape and cannot report it is a different
+        // matter — applyEngineConfig already refuses that one before the guest boots.
+        out.push({ id: "tier2.observable", ok: flagPairs.length === 0,
+            why: "the engine exposes no get_jit_config/jit_get_tier2_promotions"
+                + (flagPairs.length === 0 ? " — no tier-2 claim to judge (stock upstream)"
+                    : " — this run cannot say which tier it measured") });
+        return out;
+    }
+    if (c.tier2Threshold > 0) {
+        out.push({ id: "tier2.promoted", ok: c.tier2Promotions > 0,
+            why: `threshold ${c.tier2Threshold} with ${c.tier2Promotions} promotions — 0 means TIER-1 code was measured under a tier-2 label` });
+    } else {
+        out.push({ id: "tier2.stayed_off", ok: c.tier2Promotions === 0,
+            why: `threshold 0 with ${c.tier2Promotions} promotions — a promotion with tiering off means this is not the tier-2-off reference it is labelled as` });
+    }
+    return out;
+}
+
+function finish() {
+    clearTimeout(watchdog);
+    result.wall_ms = Date.now() - benchStart;
+    result.finished_at = new Date().toISOString();
+    result.engine_counters = sampleEngineCounters();
+    result.judgements = judgeEngineCounters(result.engine_counters);
+    if (args['flag-sync-count']) {
+        result.judgements.push({id:'diagnostic.flag_sync_count',ok:false,why:'executed-sync counters are compiled into blocks; counts only, scores invalid'});
+    }
+    if (args['helper-census']) {
+        result.helper_census = Object.fromEntries(Object.entries(helperCounts).sort((a,b) => b[1]-a[1]));
+        result.judgements.push({id:'diagnostic.helper_census',ok:false,why:'JS import wrappers perturb execution; call counts only, scores invalid'});
+    }
+    if (result.engine_counters) {
+        const c = result.engine_counters;
+        console.error(`[bench] engine counters: tier2Threshold=${c.tier2Threshold} `
+            + `promotions=${c.tier2Promotions} pages=${c.tier2Pages} evictions=${c.tier2Evictions} `
+            + `blocked=${c.tier2BlockedByCap} pendingDropped=${c.tier2PendingDropped} `
+            + `speculatedStores=${c.speculatedStoresCompiled}`);
+    }
+    const failed = result.judgements.filter((j) => !j.ok);
+    for (const j of failed) console.error(`[bench] INVALID (${j.id}): ${j.why}`);
+    emulator.destroy();
+
+    const outPath = path.resolve(args.out ||
+        path.join(__dirname, "results", `${label}-${Date.now()}.json`));
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, JSON.stringify(result, null, 2));
+
+    console.error(`\n[bench] done in ${(result.wall_ms / 1000).toFixed(0)}s — ${outPath}`);
+    console.log(JSON.stringify(result));
+    // The JSON is written first: a refused run is evidence, and the exit code is what keeps
+    // bench-matrix from aggregating it into a median.
+    process.exit(failed.length ? 4 : 0);
+}
+
+emulator.add_listener("serial0-output-byte", (byte) => {
+    const chr = String.fromCharCode(byte);
+    if (chr < " " && chr !== "\n" && chr !== "\t" || chr > "~") return;
+    serialText += chr;
+    if (chr === "\n") { const l = line; line = ""; onLine(l); }
+    else {
+        line += chr;
+        // fs boot: fire on the first root prompt (may carry color-escape remnants)
+        if (phase === "boot" && bootMode === "fs" && chr === " " &&
+            /root@localhost[^\n]*# $/.test(line)) {
+            console.error(`[bench] boot prompt after ${((Date.now() - bootT0) / 1000).toFixed(0)}s`);
+            beginProbes();
+        }
+    }
+});
+const bootT0 = Date.now();

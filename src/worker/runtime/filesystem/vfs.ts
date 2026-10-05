@@ -28,16 +28,241 @@ export interface VfsFileHandle {
     buffer?: Uint8Array;
     /** File offset of buffer[0] */
     bufferOffset?: number;
+    /** Epoch `buffer` was filled under — see VirtualFileSystem.windowEpochs. */
+    bufferEpoch?: number;
+    /** This path's epoch cell, resolved on first use: comparing against it costs a property
+     *  read, so a per-path epoch is no dearer on the hot path than a global one was. */
+    epochRef?: { e: number };
     /** In-flight prefetch for next sequential chunk */
     prefetchPromise?: Promise<Uint8Array> | null;
     /** File offset where prefetched chunk starts */
     prefetchOffset?: number;
+    /** Epoch the in-flight prefetch was issued under. */
+    prefetchEpoch?: number;
+    /** Serialises async reads on this handle — see `read()`. */
+    io?: Promise<unknown>;
+    /** FILE_FLAG_SEQUENTIAL_SCAN as the opener passed it: the caller's own promise
+     *  that it will scan, which NT takes at face value. */
+    sequentialFlag?: boolean;
+    /** Where the previous read on this file object ended. A read starting exactly
+     *  here is the second of two contiguous requests — NT's own sequential test
+     *  (CcScheduleReadAhead). A seek moves `position` and leaves this behind, which
+     *  is what makes the pattern un-detect itself the instant the guest jumps. */
+    lastReadEnd?: number;
+}
+
+/**
+ * Direct children of one ROM directory, in ROM index order. Parallel arrays (DOD):
+ * `keys` is the romIndex key for a file or the lowercase directory path for a
+ * subdirectory (`isDir` selects which); `names` is the whole original-case rel path
+ * for a file and just the original-case segment for a subdirectory — which is exactly
+ * what each one's VfsEntry.path is built from.
+ */
+interface RomDirNode {
+    names: string[];
+    keys: string[];
+    isDir: boolean[];
+    /** An explicit ZIP directory entry (trailing "/") names this directory. */
+    selfEntry: boolean;
 }
 
 export interface VfsFindHandle {
     kind: "find";
     entries: VfsEntry[];
     index: number;
+}
+
+// Guest I/O trace, opt-in via __vfsTrace. Records (path,pos,len) for every read the
+// guest makes through any API, so "which path does this file go through" is answerable
+// without guessing which of kernel32/CRT the title happens to use.
+/** Win32 dwDesiredAccess bits — the only ones this layer branches on. */
+const GENERIC_READ = 0x80000000;
+const GENERIC_WRITE = 0x40000000;
+
+/** Grow the logical length of a byte view geometrically while keeping the exposed view
+ * exact-length. Repeated append-only guest writes then copy once per capacity growth,
+ * not once per WriteFile; callers still see `.length` as the real EOF/run length.
+ *
+ * GROW ONLY: the spare capacity past `.length` holds stale bytes, so a shrink must
+ * REALLOCATE (as truncateFileAt does) — re-`subarray`ing a shorter view over the same
+ * buffer would resurrect them on the next grow. */
+function growByteView(view: Uint8Array, length: number, maxCapacity = Number.MAX_SAFE_INTEGER): Uint8Array {
+    if (length <= view.length) return view;
+    const available = view.buffer.byteLength - view.byteOffset;
+    if (length <= available) return new Uint8Array(view.buffer, view.byteOffset, length);
+    // Silently returning a shorter view makes the caller record a length it never wrote.
+    if (length > maxCapacity) {
+        throw new RangeError(`growByteView: ${length} bytes requested past the ${maxCapacity}-byte cap`);
+    }
+
+    const floor = Math.max(4096, available);
+    const capacity = Math.min(maxCapacity, Math.max(length, Math.min(floor * 2, floor + 256 * 1024)));
+    const storage = new Uint8Array(capacity);
+    storage.set(view);
+    return storage.subarray(0, length);
+}
+
+const vfsTraceRecords: string[] = [];
+(globalThis as { getVfsTrace?: () => string[] }).getVfsTrace = () => vfsTraceRecords.slice();
+function vfsTrace(path: string, pos: number, len: number): void {
+    if ((globalThis as { __vfsTrace?: unknown }).__vfsTrace !== true) return;
+    if (vfsTraceRecords.length >= 20000) return;
+    const tid = (globalThis as { __curTid?: () => number }).__curTid?.() ?? -1;
+    vfsTraceRecords.push(`${path}|${pos}|${len}|T${tid}`);
+}
+
+/**
+ * Session-wide read census. The streamed-bundle counters (`ioReport`) only exist when a
+ * SabIoSource is armed, and the frame profiler only accumulates once frames are running —
+ * so the boot, which is almost entirely file I/O, had NO instrument at all. This one is
+ * always on and counts what the guest's reads actually cost us: which arm of the sync
+ * ladder served them, and how many fell through to the async park (the expensive answer,
+ * because it suspends the guest thread and marshals a context).
+ *
+ * `syncMs`/`asyncMs` bracket the VFS call itself, so they exclude the dispatcher's own
+ * park/resume — an async read costs strictly MORE than `asyncMs` says.
+ */
+export type VfsSyncArm = "hitHandleWindow" | "hitRomCache" | "hitRomRangeSync" | "hitOverlaySync";
+export interface VfsPathStat {
+    reads: number; bytes: number; sync: number; async: number; ms: number;
+    /** Handles opened on this path. A guest that re-opens one archive per asset shows up
+     *  here and nowhere else — `reads` alone cannot tell 1 open x N reads from N x 1. */
+    opens: number;
+    /** Reads landing in the last TAIL_BYTES of the file. A ZIP reader locating the EOCD
+     *  scans exactly that region on every open, so this is the re-open tax, separated
+     *  from the payload reads the guest actually wanted. Entries physically stored in the
+     *  tail are misfiled here; `tailUnsized` says when the split could not be made at all. */
+    tailReads: number; tailBytes: number;
+    /** File size at first read, cached. -1 = unknown → the tail split is not available. */
+    size: number;
+}
+export const vfsIoCensus = {
+    enabled: true,
+    /** Every readIntoSync/readSync entry, whichever arm answers. The async read path has
+     *  its own entry counter (`asyncReads`): a read is counted by exactly one of the two,
+     *  so the session total is `reads + asyncReads`. */
+    reads: 0,
+    /** Bytes delivered by BOTH arms (a sync fallback contributes none — the async read it
+     *  turns into does), so any bytes-per-read must divide by `reads + asyncReads`. */
+    bytes: 0,
+    /** File handles opened this session (the `opened()` chokepoint). */
+    opens: 0,
+    /** Reads whose file size was not obtainable, so they could be classified neither
+     *  tail nor payload. Non-zero means the per-path tail split understates. */
+    tailUnsized: 0,
+    /** Which arm of the sync ladder answered. They partition `reads - asyncFallbacks`. */
+    hitHandleWindow: 0,
+    hitRomCache: 0,
+    hitRomRangeSync: 0,
+    hitOverlaySync: 0,
+    /** Sync ladder returned null → the caller must park the guest thread and await. */
+    asyncFallbacks: 0,
+    /** Sync ROM reads that came back SHORT mid-file and were refused rather than answered.
+     *  A short answer is indistinguishable from the truth to a caller reading an archive
+     *  header, so these fall through to the blocking path; the count says how often. */
+    romSyncShortFalls: 0,
+    /** Served synchronously but by a branch that named no arm — a ladder branch the
+     *  census cannot see. MUST be 0; anything else means the arm split below is
+     *  under-counting and the rates built on it are wrong. */
+    armUnattributed: 0,
+    syncMs: 0,
+    asyncMs: 0,
+    asyncReads: 0,
+    asyncBytes: 0,
+    /** Overlay sync-handle warm-at-open (§4.2). `warmSkipped` is broken out by reason
+     *  because "no effect" and "never ran" are different answers and a single attempt
+     *  counter cannot tell them apart. `warmLanded` counts handles a warm actually
+     *  published; `warmRaced` counts the demand reads that still parked because the warm
+     *  had not finished. Every exit of prewarmSyncHandle is counted, so
+     *  `warmAttempted + warmSkipped*` reconciles with the opens that reached it — an
+     *  uncounted exit reads as a warm that never happened for no stated reason. */
+    warmAttempted: 0,
+    warmLanded: 0,
+    warmSkippedHandle: 0,
+    warmSkippedEphemeral: 0,
+    warmSkippedCached: 0,
+    warmSkippedNoFile: 0,
+    warmSkippedWriter: 0,
+    warmSkippedCapacity: 0,
+    /** Per-path detail, capped so a pathological guest cannot grow it without bound. */
+    perPath: new Map<string, VfsPathStat>(),
+    reset(): void {
+        this.reads = 0; this.bytes = 0; this.opens = 0; this.tailUnsized = 0;
+        this.hitHandleWindow = 0; this.hitRomCache = 0; this.hitRomRangeSync = 0;
+        this.hitOverlaySync = 0; this.asyncFallbacks = 0; this.armUnattributed = 0;
+        this.syncMs = 0; this.asyncMs = 0; this.asyncReads = 0; this.asyncBytes = 0;
+        this.warmAttempted = 0; this.warmLanded = 0; this.warmSkippedCached = 0;
+        this.warmSkippedNoFile = 0; this.warmSkippedWriter = 0; this.warmSkippedCapacity = 0;
+        this.warmSkippedHandle = 0; this.warmSkippedEphemeral = 0;
+        this.perPath.clear();
+    },
+};
+const VFS_CENSUS_MAX_PATHS = 4096;
+function censusPath(path: string): VfsPathStat | null {
+    let e = vfsIoCensus.perPath.get(path);
+    if (e) return e;
+    if (vfsIoCensus.perPath.size >= VFS_CENSUS_MAX_PATHS) return null;
+    e = { reads: 0, bytes: 0, sync: 0, async: 0, ms: 0, opens: 0, tailReads: 0, tailBytes: 0, size: -1 };
+    vfsIoCensus.perPath.set(path, e);
+    return e;
+}
+/** The window a ZIP/archive reader scans to find its trailer. minizip caps its backwards
+ *  EOCD hunt at 0xffff; round up to a page multiple so a reader that adds its own slack
+ *  still lands inside it. */
+const VFS_TAIL_BYTES = 0x10000;
+function censusOpen(path: string): void {
+    if (!vfsIoCensus.enabled) return;
+    vfsIoCensus.opens++;
+    const e = censusPath(path);
+    if (e) e.opens++;
+}
+/** Classify one read as trailer-scan or payload. `size` is resolved once per path by the
+ *  caller (which is the only layer that can), and a path we never sized is counted in
+ *  `tailUnsized` rather than silently filed as payload. */
+function censusTail(e: VfsPathStat | null, pos: number, bytes: number): void {
+    if (!e) return;
+    if (e.size < 0) { vfsIoCensus.tailUnsized++; return; }
+    if (pos >= e.size - VFS_TAIL_BYTES) { e.tailReads++; e.tailBytes += bytes; }
+}
+/** One accounting call per read. `arm` names which sync arm answered; null means the
+ *  ladder did not answer — which `served` then has to agree with. Keeping them separate
+ *  is what lets the report catch a ladder branch that returns bytes and names no arm;
+ *  with the arm alone standing in for both, such a branch is silently filed as an async
+ *  fallthrough and every rate reads plausible. */
+function censusSync(
+    path: string, bytes: number, ms: number, arm: VfsSyncArm | null, served: boolean,
+    pos: number, sizeOf: (p: string) => number,
+): void {
+    if (!vfsIoCensus.enabled) return;
+    vfsIoCensus.reads++;
+    vfsIoCensus.syncMs += ms;
+    const e = censusPath(path);
+    if (e) {
+        e.reads++; e.ms += ms;
+        if (e.size < 0) e.size = sizeOf(path) || -1;
+        if (served) censusTail(e, pos, bytes);
+    }
+    if (arm === null) {
+        if (served) { vfsIoCensus.armUnattributed++; vfsIoCensus.bytes += bytes; if (e) { e.bytes += bytes; e.sync++; } }
+        else { vfsIoCensus.asyncFallbacks++; if (e) e.async++; }
+        return;
+    }
+    vfsIoCensus[arm]++;
+    vfsIoCensus.bytes += bytes;
+    if (e) { e.bytes += bytes; e.sync++; }
+}
+function censusAsync(path: string, bytes: number, ms: number, pos: number, sizeOf: (p: string) => number): void {
+    if (!vfsIoCensus.enabled) return;
+    vfsIoCensus.asyncReads++;
+    vfsIoCensus.asyncBytes += bytes;
+    vfsIoCensus.asyncMs += ms;
+    vfsIoCensus.bytes += bytes;
+    const e = censusPath(path);
+    if (e) {
+        e.bytes += bytes; e.ms += ms;
+        if (e.size < 0) e.size = sizeOf(path) || -1;
+        censusTail(e, pos, bytes);
+    }
 }
 
 export class VirtualFileSystem {
@@ -53,12 +278,21 @@ export class VirtualFileSystem {
      * the hot path for GetFileAttributes / _access existence probes.
      */
     private romDirs: Set<string> = new Set();
+    /**
+     * dirLower → its direct children, built in the same mount pass as romDirs so
+     * listRomDirectory() is O(children) instead of a full index scan (with a regex
+     * de-prefixing per entry) on every wildcard FindFirstFile/_findfirst.
+     * ROM is immutable, so this index is too: whiteouts are applied at READ time —
+     * baking them in would resurrect a deleted file on the next enumeration.
+     */
+    private romChildren: Map<string, RomDirNode> = new Map();
     private romCache = new LruCache<string, Uint8Array>({
         maxBytes: this.ROM_CACHE_MAX_BYTES,
         sizeOf: (value) => value.byteLength,
     });
     private romWhiteouts: Set<string> = new Set();
-    private romLoadPromises: Map<string, Promise<Uint8Array>> = new Map();
+    private romLoadPromises: Map<string, { generation: number; promise: Promise<Uint8Array> }> = new Map();
+    private romGeneration = 0;
     /**
      * Un-evictable pin of small ROM files, consulted first by the sync read path.
      * Sync consumers (GetPrivateProfileString, msvcrt buffered fgetc) can't await,
@@ -83,6 +317,23 @@ export class VirtualFileSystem {
     /** Align ROM/OPFS range reads to 4KB pages for steadier I/O behavior */
     private static readonly IO_ALIGN = 4096;
 
+    /**
+     * Bumped whenever a file is truncated, deleted or re-created. Read windows live on
+     * the HANDLES, which the VFS does not own or track — a path-keyed truncate therefore
+     * has no way to reach the window another open cursor is holding, and that window can
+     * cover bytes that no longer exist. Stamping every window with the epoch and
+     * rejecting a stale stamp is the reach, at the cost of one integer compare per read.
+     *
+     * PER PATH, not global. A global counter means any file the game creates or truncates —
+     * a profile, a log, a shader cache, written continuously — discards the read window of
+     * every OTHER open handle, including the multi-gigabyte archive being streamed from. The
+     * per-read cost the global version avoided is paid once per handle instead: a handle
+     * holds its path's epoch cell, so the check stays a property compare.
+     */
+    private windowEpochs = new Map<string, { e: number }>();
+    /** Rate limit for the stale-window tripwire (see reportStaleWindow). */
+    private staleWindowReports = 0;
+
     currentDir = "C:\\";
     /** When set, D:\ (the CD-ROM drive) is redirected to this guest path. See manifest emulator.cdPath. */
     private cdRedirect: string | null = null;
@@ -103,9 +354,11 @@ export class VirtualFileSystem {
     }
 
     reset(): void {
+        this.romGeneration++;
         this.romArchive = null;
         this.romIndex.clear();
         this.romDirs.clear();
+        this.romChildren.clear();
         this.romCache.clear();
         this.romWhiteouts.clear();
         this.romLoadPromises.clear();
@@ -117,12 +370,14 @@ export class VirtualFileSystem {
     }
 
     mountRom(archive: ZipArchive, romPrefix: string, index: Map<string, ZipEntry>): void {
+        this.romGeneration++;
         this.romArchive = archive;
         this.romPrefix = romPrefix.replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
         
         // Build case-insensitive index
         this.romIndex.clear();
         this.romDirs.clear();
+        this.romChildren.clear();
         this.romWhiteouts.clear();
         this.romPinned.clear();
         this.romPinnedBytes = 0;
@@ -143,6 +398,7 @@ export class VirtualFileSystem {
                 const slash = dir.lastIndexOf("/");
                 dir = slash === -1 ? "" : dir.slice(0, slash);
             }
+            this.indexRomChildren(lowerKey, entry);
             if (!entry.isDirectory && entry.compression !== 0) {
                 compressedEntries++;
                 if (firstCompressedName === null) {
@@ -278,16 +534,16 @@ export class VirtualFileSystem {
             if (existsInRom && hasOverlay) {
                 const overlayPath = this.overlay!.resolveExistingPath(full) ?? full;
                 Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> overlay (overlay takes priority over ROM)`);
-                return { kind: "file" as const, path: overlayPath, position: 0, access, source: "overlay" };
+                return this.opened({ kind: "file" as const, path: overlayPath, position: 0, access, source: "overlay" });
             }
             if (hasOverlay) {
                 const overlayPath = this.overlay!.resolveExistingPath(full) ?? full;
                 Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> found in overlay`);
-                return { kind: "file" as const, path: overlayPath, position: 0, access, source: "overlay" };
+                return this.opened({ kind: "file" as const, path: overlayPath, position: 0, access, source: "overlay" });
             }
             if (existsInRom) {
                 Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> found in ROM as "${relRom}"`);
-                return { kind: "file" as const, path: full, position: 0, access, source: "rom" };
+                return this.opened({ kind: "file" as const, path: full, position: 0, access, source: "rom" });
             }
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> NOT found (relRom="${relRom}", existsInRom=${existsInRom})`);
             return null;
@@ -309,31 +565,31 @@ export class VirtualFileSystem {
                 return null;
             }
             this.clearRomWhiteout(full);
-            this.overlay.prepareCreateSync(full);
+            this.resetOverlayFileSync(full);
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> CREATE_NEW overlay`);
-            return { kind: "file" as const, path: full, position: 0, access, source: "overlay" };
+            return this.opened({ kind: "file" as const, path: full, position: 0, access, source: "overlay" });
         }
 
         if (createDisposition === 2) {
             this.clearRomWhiteout(full);
-            this.overlay.prepareCreateSync(full);
+            this.resetOverlayFileSync(full);
             // Truncation over a ROM file must mask it (empty read, overlay size). See shadowed set.
             if (existsInRom) this.overlay.markShadowed(full);
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> CREATE_ALWAYS overlay`);
-            return { kind: "file" as const, path: full, position: 0, access, source: "overlay" };
+            return this.opened({ kind: "file" as const, path: full, position: 0, access, source: "overlay" });
         }
 
         if (createDisposition === 4) {
             if (!hasOverlay && !existsInRom) {
                 this.clearRomWhiteout(full);
-                this.overlay.prepareCreateSync(full);
+                this.resetOverlayFileSync(full);
             }
             const source = hasOverlay ? "overlay" : (existsInRom ? "rom" : "overlay");
             const resolvedPath = source === "overlay"
                 ? (this.overlay.resolveExistingPath(full) ?? full)
                 : full;
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> OPEN_ALWAYS source=${source}`);
-            return { kind: "file" as const, path: resolvedPath, position: 0, access, source };
+            return this.opened({ kind: "file" as const, path: resolvedPath, position: 0, access, source });
         }
 
         if (createDisposition === 5) {
@@ -342,13 +598,47 @@ export class VirtualFileSystem {
                 return null;
             }
             this.clearRomWhiteout(full);
-            this.overlay.prepareCreateSync(full);
+            this.resetOverlayFileSync(full);
             if (existsInRom) this.overlay.markShadowed(full);
             Logger.verbose(LogCategory.SYSTEM, `VFS: openSync("${path}") -> TRUNCATE_EXISTING overlay`);
-            return { kind: "file" as const, path: full, position: 0, access, source: "overlay" };
+            return this.opened({ kind: "file" as const, path: full, position: 0, access, source: "overlay" });
         }
 
         return null;
+    }
+
+    /**
+     * Every exit of open/openSync that hands back a handle. An overlay file's sync access
+     * handle is opened ASYNCHRONOUSLY, so a first read that finds none has to park the
+     * guest thread — a cost the guest pays inside ReadFile, where the CRT's own opens have
+     * no async escape at all. Starting it here overlaps it with whatever the guest does
+     * between open and read; the read path is unchanged and still parks if it loses the
+     * race. READ-ONLY intent only: the handle is an exclusive lock, so warming one for an
+     * open that may also write (an "r+b" is GENERIC_READ|GENERIC_WRITE) just takes a lock
+     * the first write has to break — through createWritable's NoModificationAllowedError.
+     */
+    private opened(handle: VfsFileHandle): VfsFileHandle {
+        censusOpen(handle.path);
+        if (handle.source === "overlay"
+            && (handle.access & GENERIC_READ) !== 0 && (handle.access & GENERIC_WRITE) === 0) {
+            this.overlay?.prewarmSyncHandle(handle.path);
+        }
+        return handle;
+    }
+
+    /**
+     * The two content-reset chokepoints (create-fresh / truncate-to-zero). Both bump the
+     * window epoch: any read window another open handle holds on this path now describes
+     * a file that no longer exists, and the VFS cannot reach those handles directly.
+     */
+    private resetOverlayFileSync(full: string): void {
+        this.bumpWindowEpoch(full);
+        this.overlay!.prepareCreateSync(full);
+    }
+
+    private async resetOverlayFile(overlay: OpfsOverlay, full: string): Promise<void> {
+        this.bumpWindowEpoch(full);
+        await overlay.truncateFile(full);
     }
 
     /** Parent directory must exist before CreateFile (Windows does not mkdir implicitly). */
@@ -432,7 +722,7 @@ export class VirtualFileSystem {
     /**
      * mkdir -p for the PARENT directory of a file path: create the path's
      * directory and every missing ancestor. For EMULATOR-SIDE file injection
-     * only (shellExecFake createFiles, manifest writeFiles) — i.e. setup-time
+     * only (manifest writeFiles) — i.e. setup-time
      * conveniences that mirror what a real installer would do. The guest's own
      * CreateFile path stays faithful Win32 (ERROR_PATH_NOT_FOUND when a parent
      * dir is missing); do NOT route guest calls through here.
@@ -509,10 +799,10 @@ export class VirtualFileSystem {
                 }
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") CREATE_ALWAYS: calling truncateFile`);
                 this.clearRomWhiteout(full);
-                await overlay.truncateFile(full);
+                await this.resetOverlayFile(overlay, full);
                 if (existsInRom) overlay.markShadowed(full);
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") CREATE_ALWAYS: truncateFile completed`);
-                return { kind: "file", path: full, position: 0, access, source: "overlay" };
+                return this.opened({ kind: "file", path: full, position: 0, access, source: "overlay" });
             }
             if (createDisposition === 3) {
                 // OPEN_EXISTING - must exist
@@ -535,7 +825,7 @@ export class VirtualFileSystem {
                 const resolvedPath = source === "overlay"
                     ? (overlay?.resolveExistingPath(full) ?? full)
                     : full;
-                return { kind: "file", path: resolvedPath, position: 0, access, source };
+                return this.opened({ kind: "file", path: resolvedPath, position: 0, access, source });
             }
 
             if (createDisposition === 4) {
@@ -548,7 +838,7 @@ export class VirtualFileSystem {
                 if (!existsInOverlay && !existsInRom) {
                     Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") OPEN_ALWAYS: file doesn't exist, creating via truncateFile`);
                     this.clearRomWhiteout(full);
-                    await overlay.truncateFile(full);
+                    await this.resetOverlayFile(overlay, full);
                     Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") OPEN_ALWAYS: truncateFile completed`);
                 } else {
                     Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") OPEN_ALWAYS: file exists, opening without truncate`);
@@ -558,7 +848,7 @@ export class VirtualFileSystem {
                 const resolvedPath = source === "overlay"
                     ? (overlay.resolveExistingPath(full) ?? full)
                     : full;
-                return { kind: "file", path: resolvedPath, position: 0, access, source };
+                return this.opened({ kind: "file", path: resolvedPath, position: 0, access, source });
             }
             if (createDisposition === 5) {
                 // TRUNCATE_EXISTING - file must exist, truncate to 0
@@ -573,10 +863,10 @@ export class VirtualFileSystem {
                 }
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") TRUNCATE_EXISTING: calling truncateFile`);
                 this.clearRomWhiteout(full);
-                await overlay.truncateFile(full);
+                await this.resetOverlayFile(overlay, full);
                 if (existsInRom) overlay.markShadowed(full);
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") TRUNCATE_EXISTING: truncateFile completed`);
-                return { kind: "file", path: full, position: 0, access, source: "overlay" };
+                return this.opened({ kind: "file", path: full, position: 0, access, source: "overlay" });
             }
 
             // Default case (shouldn't reach here for valid dispositions)
@@ -585,13 +875,13 @@ export class VirtualFileSystem {
             if (source === "overlay" && overlay && !existsInOverlay) {
                 Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") default case: creating file via truncateFile`);
                 this.clearRomWhiteout(full);
-                await overlay.truncateFile(full);
+                await this.resetOverlayFile(overlay, full);
             }
             Logger.verbose(LogCategory.SYSTEM, `VFS: open("${path}") default case: returning handle, source=${source}`);
             const resolvedPath = source === "overlay"
                 ? (overlay?.resolveExistingPath(full) ?? full)
                 : full;
-            return { kind: "file", path: resolvedPath, position: 0, access, source };
+            return this.opened({ kind: "file", path: resolvedPath, position: 0, access, source });
         } catch (e) {
             Logger.error(LogCategory.SYSTEM, `VFS: open("${path}", access=0x${access.toString(16)}, disposition=0x${disposition.toString(16)}) failed: ${e}`);
             throw e;
@@ -602,53 +892,129 @@ export class VirtualFileSystem {
      * Synchronous version of read for fast-path scenarios (e.g. cached ROM files)
      */
     readSync(handle: VfsFileHandle, length: number): Uint8Array | null {
+        const t0 = performance.now();
+        const pos = handle.position;
+        const r = this.readSyncInner(handle, length);
+        censusSync(handle.path, r ? r.length : 0, performance.now() - t0, this.lastSyncArm, r !== null,
+            pos, this.censusSizeOf);
+        return r;
+    }
+
+    /** Bound once so the census can size a path without importing the VFS. */
+    private readonly censusSizeOf = (p: string): number => {
+        try { return this.getFileSize(p); } catch { return 0; }
+    };
+
+    private readSyncInner(handle: VfsFileHandle, length: number): Uint8Array | null {
+        this.lastSyncArm = null;
         const buffered = this.readFromHandleBuffer(handle, length);
         if (buffered !== null) {
             this.maybeSchedulePrefetch(handle);
+            this.lastSyncArm = "hitHandleWindow";
             return buffered;
         }
 
         if (handle.source === "rom") {
-            const rel = this.relRomPath(handle.path).toLowerCase();
-            const cached = this.romPinned.get(rel) ?? this.romCache.get(rel);
-            if (cached) {
-                const offset = handle.position;
-                const end = Math.min(cached.byteLength, offset + length);
-                if (offset >= cached.byteLength) return new Uint8Array();
-                const data = cached.subarray(offset, end);
-                handle.position += data.length;
-                handle.buffer = cached;
-                handle.bufferOffset = 0;
-                return data;
-            }
-
-            // Large uncached STORED ROM entries: sync range read (BufferSource WGB cache).
-            const entry = this.romIndex.get(rel);
-            if (entry && this.romArchive && entry.compression === 0) {
-                const data = this.romArchive.readEntryRangeSync(entry, handle.position, length);
-                if (data) {
-                    handle.position += data.length;
-                    return data;
-                }
-            }
+            const rom = this.readRomSync(handle, length);
+            if (rom !== null) return rom;
         }
 
         // Overlay: try cached sync handle
         if (handle.source === "overlay" && this.overlay) {
             const merged = this.readOverlayRomUnderlaySync(handle.path, handle.position, length);
             if (merged !== null) {
-                handle.position += merged.length;
+                this.advanceCursor(handle, merged.length);
+                this.lastSyncArm = "hitOverlaySync";
                 return merged;
             }
             const data = this.overlay.readFileSyncVia(handle.path, handle.position, length);
             if (data !== null) {
-                handle.position += data.length;
+                this.advanceCursor(handle, data.length);
+                this.lastSyncArm = "hitOverlaySync";
                 return data;
             }
         }
         return null;
     }
 
+    /**
+     * The ROM arm of the sync ladder, shared by readSync and readIntoSync so the two
+     * cannot drift (they had: only one of them installed a window, and only one of them
+     * treated an empty range read as the EOF it is). Returns the bytes for this read —
+     * empty at EOF — or null when nothing below can answer synchronously.
+     *
+     * Sets `lastSyncArm` itself, since it is the branch that knows which arm ran.
+     */
+    private readRomSync(handle: VfsFileHandle, length: number): Uint8Array | null {
+        const rel = this.relRomPath(handle.path).toLowerCase();
+        const cached = this.romPinned.get(rel) ?? this.romCache.get(rel);
+        if (cached) {
+            const offset = handle.position;
+            this.lastSyncArm = "hitRomCache";
+            if (offset >= cached.byteLength) return new Uint8Array();
+            const data = cached.subarray(offset, Math.min(cached.byteLength, offset + length));
+            this.advanceCursor(handle, data.length);
+            this.installWindow(handle, cached, 0, this.epochOf(handle));
+            return data;
+        }
+
+        // Large uncached STORED ROM entries: sync range read (BufferSource WGB cache).
+        const entry = this.romIndex.get(rel);
+        if (!entry || !this.romArchive || entry.compression !== 0) return null;
+
+        // A run of small sequential reads (a pak read record-by-record) would otherwise
+        // re-cross VFS → ZipArchive → source once per read. Widen to the readahead chunk
+        // and publish it as this handle's window, which is what the async path already
+        // does — the run's remaining reads are then served out of RAM by the window arm
+        // above, and that arm is also the only one that arms the async prefetch.
+        //
+        // Not for a handle that has DEMONSTRATED random access: widening a scattered read
+        // makes the transport below fault blocks past it that nobody will consume. A
+        // handle that has not read yet is not evidence of either pattern, and gating on
+        // that alone would leave the first read of every scan narrow — which is the
+        // mistake §4.3 of the perf plan records at the transport layer. The `sequential`
+        // HINT keeps NT's stricter two-contiguous-requests test, since that one steers
+        // speculation below this layer.
+        const sequential = this.isSequentialRead(handle);
+        const epoch = this.epochOf(handle);
+        // A/B kill-switch: globalThis.__noRomReadWindow restores the un-widened read.
+        const widen = !(globalThis as { __noRomReadWindow?: boolean }).__noRomReadWindow
+            && (sequential || handle.lastReadEnd === undefined);
+        const want = widen ? Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE) : length;
+        const data = this.romArchive.readEntryRangeSync(entry, handle.position, want, sequential);
+        if (!data) return null;
+        // A SHORT answer mid-file is not a small read, it is a MISS: the block cache below
+        // could not serve the whole range synchronously. Returning it anyway hands the guest
+        // fewer bytes than it asked for at a position where the file has more — which a
+        // caller reading an archive header cannot tell from the truth, and which surfaces
+        // much later as the game reporting its own assets missing. Fall through to the
+        // blocking path instead, which fetches what is not resident.
+        const endOfEntry = handle.position + data.byteLength >= entry.uncompressedSize;
+        if (data.byteLength < length && !endOfEntry) {
+            vfsIoCensus.romSyncShortFalls++;
+            return null;
+        }
+        this.lastSyncArm = "hitRomRangeSync";
+        // The window's extent is what came BACK: readEntryRangeSync clamps to the entry, and a
+        // window sized from the request would then serve bytes nobody read.
+        if (data.byteLength > length) this.installWindow(handle, data, handle.position, epoch);
+        const out = data.subarray(0, Math.min(length, data.byteLength));
+        this.advanceCursor(handle, out.length);
+        return out;
+    }
+
+    /**
+     * A handle's cursor, window and prefetch are shared mutable state, and the async
+     * path below yields twice while holding a pre-await snapshot of the position. Two
+     * guest threads on ONE handle (a loader on the level assets, an audio thread
+     * streaming music out of the same archive) then double-advance the cursor and every
+     * later read is served from further ahead — silently, at full length.
+     *
+     * NT makes this impossible: a synchronous file object serialises its I/O on the
+     * file-object lock and updates CurrentByteOffset under it. Reproduce that. The SYNC
+     * fast path stays outside the queue — it completes in one JS turn, so it cannot
+     * interleave, and serialising it would cost without buying anything.
+     */
     async read(handle: VfsFileHandle, length: number): Promise<Uint8Array> {
         if (length <= 0) {
             return new Uint8Array();
@@ -661,25 +1027,59 @@ export class VirtualFileSystem {
             return sync;
         }
 
+        const prior = handle.io ?? Promise.resolve();
+        const mine = prior.then(() => this.readLocked(handle, length), () => this.readLocked(handle, length));
+        handle.io = mine.catch(() => undefined);
+        // The census charges the async answer here, where the queue wait is included —
+        // `readLocked` alone would price the fetch and hide the serialisation behind it.
+        const t0 = performance.now();
+        const pos = handle.position;
+        return mine.then((d) => {
+            censusAsync(handle.path, d.length, performance.now() - t0, pos, this.censusSizeOf);
+            return d;
+        });
+    }
+
+    private async readLocked(handle: VfsFileHandle, length: number): Promise<Uint8Array> {
+        // Re-check the window: a read that queued behind another one may now be a hit.
+        // Deliberately the UNCENSUSED inner ladder — this read was already counted on the
+        // way in, and counting the re-check would make one guest read look like two.
+        const sync = this.readSyncInner(handle, length);
+        if (sync) return sync;
+
         try {
-            const offset = handle.position;
+            let offset = handle.position;
 
             if (handle.prefetchPromise && handle.prefetchOffset !== undefined && offset >= handle.prefetchOffset) {
-                const prefetched = await handle.prefetchPromise;
+                // The bytes come from the promise we had BEFORE the await; its offset must
+                // come from the same instant. Anything that ran during the yield may have
+                // invalidated the window and scheduled a different prefetch — installing
+                // these bytes under that one's offset makes the window lie, and a lying
+                // window is served silently at full length by readFromHandleBuffer.
+                const pending = handle.prefetchPromise;
                 const prefetchOffset = handle.prefetchOffset;
-                handle.prefetchPromise = null;
-                handle.prefetchOffset = undefined;
-                handle.buffer = prefetched;
-                handle.bufferOffset = prefetchOffset;
+                const prefetchEpoch = handle.prefetchEpoch ?? this.epochOf(handle);
+                const prefetched = await pending;
+                if (handle.prefetchPromise === pending) {
+                    handle.prefetchPromise = null;
+                    handle.prefetchOffset = undefined;
+                    handle.prefetchEpoch = undefined;
+                    // A truncate during the fetch makes these bytes stale; installWindow
+                    // refuses them and the read falls through to a fresh fetchRange below.
+                    const installed = this.installWindow(handle, prefetched, prefetchOffset, prefetchEpoch);
 
-                const buffered = this.readFromHandleBuffer(handle, length);
-                if (buffered !== null) {
-                    this.maybeSchedulePrefetch(handle);
-                    Logger.verbose(LogCategory.SYSTEM, `VFS: read("${handle.path}") completed from prefetched window, read ${buffered.length} bytes, new position=${handle.position}`);
-                    return buffered;
+                    const buffered = installed ? this.readFromHandleBuffer(handle, length) : null;
+                    if (buffered !== null) {
+                        this.maybeSchedulePrefetch(handle);
+                        Logger.verbose(LogCategory.SYSTEM, `VFS: read("${handle.path}") completed from prefetched window, read ${buffered.length} bytes, new position=${handle.position}`);
+                        return buffered;
+                    }
                 }
             }
 
+            // Re-read the cursor: the prefetch await above is a yield point, and the sync
+            // read path is deliberately not serialised, so it may have moved.
+            offset = handle.position;
             const fileSize = this.getFileSize(handle.path);
             const remaining = Math.max(0, fileSize - offset);
             if (remaining === 0) {
@@ -692,12 +1092,12 @@ export class VirtualFileSystem {
             const readSize = isWholeTailRead
                 ? remaining
                 : Math.max(length, VirtualFileSystem.PREFETCH_CHUNK_SIZE);
+            const readEpoch = this.epochOf(handle);
             const dataWindow = await this.fetchRange(handle, offset, readSize);
-            handle.buffer = dataWindow;
-            handle.bufferOffset = offset;
+            this.installWindow(handle, dataWindow, offset, readEpoch);
 
             const data = dataWindow.subarray(0, Math.min(length, dataWindow.byteLength));
-            handle.position += data.length;
+            this.advanceCursor(handle, data.length);
             this.maybeSchedulePrefetch(handle);
 
             Logger.verbose(
@@ -715,37 +1115,38 @@ export class VirtualFileSystem {
      * Synchronous read-into for fast-path (cached ROM): writes into target, returns bytes read or null if async needed.
      */
     readIntoSync(handle: VfsFileHandle, target: Uint8Array, targetOffset: number, length: number): number | null {
+        const t0 = performance.now();
+        const pos = handle.position;
+        const n = this.readIntoSyncInner(handle, target, targetOffset, length);
+        censusSync(handle.path, n ?? 0, performance.now() - t0, this.lastSyncArm, n !== null,
+            pos, this.censusSizeOf);
+        return n;
+    }
+
+    /** Which arm of the sync ladder answered the most recent readIntoSync/readSync;
+     *  null means it fell through to the async path. Written by the ladder itself, so
+     *  the census cannot drift from the branch that actually ran. */
+    private lastSyncArm: VfsSyncArm | null = null;
+
+    private readIntoSyncInner(handle: VfsFileHandle, target: Uint8Array, targetOffset: number, length: number): number | null {
+        this.lastSyncArm = null;
+        // Every file API the guest can use — kernel32 ReadFile and the CRT's fread alike —
+        // funnels through here, so this is the only place that sees ALL of a guest's I/O.
+        vfsTrace(handle.path, handle.position, length);
         // Check handle buffer first (works for both ROM and overlay)
         const buffered = this.readFromHandleBuffer(handle, length);
         if (buffered !== null) {
             target.set(buffered, targetOffset);
             this.maybeSchedulePrefetch(handle);
+            this.lastSyncArm = "hitHandleWindow";
             return buffered.length;
         }
 
         if (handle.source === "rom") {
-            const rel = this.relRomPath(handle.path).toLowerCase();
-            const cached = this.romPinned.get(rel) ?? this.romCache.get(rel);
-            if (cached) {
-                const offset = handle.position;
-                const end = Math.min(cached.byteLength, offset + length);
-                if (offset >= cached.byteLength) return 0;
-                const toCopy = end - offset;
-                target.set(cached.subarray(offset, end), targetOffset);
-                handle.position += toCopy;
-                handle.buffer = cached;
-                handle.bufferOffset = 0;
-                return toCopy;
-            }
-
-            const entry = this.romIndex.get(rel);
-            if (entry && this.romArchive && entry.compression === 0) {
-                const data = this.romArchive.readEntryRangeSync(entry, handle.position, length);
-                if (data && data.length > 0) {
-                    target.set(data, targetOffset);
-                    handle.position += data.length;
-                    return data.length;
-                }
+            const rom = this.readRomSync(handle, length);
+            if (rom !== null) {
+                target.set(rom, targetOffset);
+                return rom.length;
             }
         }
 
@@ -755,13 +1156,15 @@ export class VirtualFileSystem {
                 handle.path, handle.position, target, targetOffset, length,
             );
             if (merged !== null) {
-                handle.position += merged;
+                this.advanceCursor(handle, merged);
+                this.lastSyncArm = "hitOverlaySync";
                 return merged;
             }
             const data = this.overlay.readFileSyncVia(handle.path, handle.position, length);
             if (data !== null) {
                 target.set(data, targetOffset);
-                handle.position += data.length;
+                this.advanceCursor(handle, data.length);
+                this.lastSyncArm = "hitOverlaySync";
                 return data.length;
             }
         }
@@ -804,6 +1207,11 @@ export class VirtualFileSystem {
         if (!this.overlay || data.length === 0) {
             return data.length === 0 ? 0 : -1;
         }
+        // Same first move as the async twin: the window predates this write, so leaving
+        // it installed serves pre-write bytes to a read-after-write on this very handle
+        // (fopen "r+b" → fread → fseek → fwrite → fseek → fread). Flipping `source` to
+        // overlay under a still-installed whole-ROM-entry window is the same lie.
+        this.invalidateReadWindow(handle);
         if (handle.source === "rom") {
             handle.source = "overlay";
         }
@@ -812,7 +1220,7 @@ export class VirtualFileSystem {
             if (written < 0) return -1;
             // Harness fileWritten event (gated — this is the hot guest-write path).
             if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset: handle.position, length: written, sync: true });
-            handle.position += written;
+            this.advanceCursor(handle, written);
             return written;
         } catch (e) {
             Logger.error(LogCategory.SYSTEM, `VFS: writeSync("${handle.path}") failed: ${e}`);
@@ -832,7 +1240,7 @@ export class VirtualFileSystem {
             const written = await this.overlay.writeFile(handle.path, handle.position, data);
             const writeTime = performance.now() - writeStart;
             if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset: handle.position, length: written, sync: false });
-            handle.position += written;
+            this.advanceCursor(handle, written);
             // Promote source to overlay so subsequent reads from this handle see written data
             if (handle.source === "rom") handle.source = "overlay";
             Logger.verbose(LogCategory.SYSTEM, `VFS: write("${handle.path}") completed: wrote ${written} bytes in ${writeTime.toFixed(2)}ms, new position=${handle.position}`);
@@ -859,12 +1267,66 @@ export class VirtualFileSystem {
         const rel = this.relRomPath(full).toLowerCase();
         const romEntry = rel ? this.romIndex.get(rel) : undefined;
         const hasRomFile = !!romEntry && !romEntry.isDirectory && !this.romWhiteouts.has(rel);
+        this.bumpWindowEpoch(full); // windows on a deleted (or now whited-out) file describe nothing
         const deletedOverlay = await this.overlay.deleteFile(full);
         if (hasRomFile) {
             this.romWhiteouts.add(rel);
             return true;
         }
         return deletedOverlay;
+    }
+
+    /**
+     * Drop the user's copy-on-write copy of `path` and go back to the shipped ROM file.
+     *
+     * NOT the same as deleteFile, and the difference is load-bearing: a guest DeleteFile on a
+     * ROM-shadowed file must leave a whiteout, or the shipped file would reappear and the
+     * delete would be a lie. That is correct and stays. But "undo my override" is a different
+     * operation with no spelling until now, and reaching for deleteFile to perform it leaves
+     * the file GONE rather than shipped — which is silent, because the caller asked for a
+     * delete and got one. Every fixture reset (a game's own written config shadowing the
+     * bundle's) needs this, not that.
+     *
+     * Returns what actually happened, so a caller cannot mistake "nothing to revert" for
+     * "reverted".
+     */
+    async revertToRom(path: string, timeoutMs = 4000): Promise<{ reverted: boolean; hadOverlay: boolean; hadWhiteout: boolean; romExists: boolean; blocked?: string }> {
+        const full = normalizePath(this.resolvePath(path));
+        const rel = this.relRomPath(full).toLowerCase();
+        const romEntry = rel ? this.romIndex.get(rel) : undefined;
+        const romExists = !!romEntry && !romEntry.isDirectory;
+        const hadWhiteout = rel !== "" && this.romWhiteouts.has(rel);
+        this.bumpWindowEpoch(full);
+        // Settle the commit that may still be writing this file before removing it — a game
+        // whose config is mid-flush is exactly when a fixture reset gets asked for, and racing
+        // the commit leaves the delete waiting on a lock it cannot get.
+        // OPFS hands `createWritable` an EXCLUSIVE lock, so settling the in-flight commit for a
+        // file the RUNNING guest still holds — and then removing it — can wait indefinitely.
+        // Answering "blocked" beats never answering: a verb that hangs takes the whole harness
+        // chain with it and looks like a dead worker. The timeout covers BOTH steps, because the
+        // settle is the one that actually stalls.
+        let blocked: string | null = null;
+        const overlay = this.overlay;
+        const removal = overlay
+            ? (async () => {
+                await overlay.settlePendingFlush(full);
+                return await overlay.deleteFile(full);
+            })().catch((e: unknown) => {
+                // The running guest still has the file open, so OPFS refuses removeEntry.
+                blocked = String((e as { name?: string })?.name ?? e);
+                return false;
+            })
+            : Promise.resolve(false);
+        const hadOverlay = await Promise.race([
+            removal,
+            new Promise<boolean>((resolve) => setTimeout(() => { blocked = "timeout"; resolve(false); }, timeoutMs)),
+        ]);
+        if (hadWhiteout && !blocked) this.romWhiteouts.delete(rel);
+        return {
+            reverted: !blocked && romExists && (hadOverlay || hadWhiteout),
+            hadOverlay, hadWhiteout, romExists,
+            ...(blocked ? { blocked } : {}),
+        };
     }
 
     /**
@@ -907,7 +1369,7 @@ export class VirtualFileSystem {
         }
         try {
             // Ensure the file doesn't exist or is truncated
-            await this.overlay.truncateFile(filename);
+            await this.resetOverlayFile(this.overlay, filename);
             await this.overlay.writeFile(filename, 0, data);
             Logger.verbose(LogCategory.SYSTEM, `VFS: Stored executable "${filename}" (${data.length} bytes)`);
         } catch (e) {
@@ -921,23 +1383,77 @@ export class VirtualFileSystem {
     async truncateAt(path: string, size: number): Promise<void> {
         if (!this.overlay) throw new Error('VFS overlay not initialized');
         const full = this.resolvePath(path);
+        // Every window taken before now may cover bytes past the new EOF, including
+        // windows on handles this call cannot see. Bump BEFORE the await so a read that
+        // interleaves with the truncate cannot install bytes under the old epoch.
+        this.bumpWindowEpoch(normalizePath(full));
         await this.overlay.truncateFileAt(full, size);
         // SetEndOfFile sets the authoritative EOF; beyond it Windows reads zero, never ROM.
         // Once a ROM-backed file's end is set here, the overlay masks the ROM underlay.
         if (this.romUncompressedSize(normalizePath(full)) > 0) this.overlay.markShadowed(full);
     }
 
+    /**
+     * A second, INDEPENDENT cursor onto the same open file. Win32 operations that read a
+     * file without being a read on the file object — MapViewOfFile populating a view,
+     * FlushViewOfFile writing one back — must not disturb the guest's file pointer. The
+     * cursor is per-handle state, so those paths take their own handle instead of
+     * save/restoring the guest's around an await (during which the guest can legitimately
+     * seek, and the restore then silently reverts it).
+     */
+    /** The handle's current byte offset (Win32 CurrentByteOffset / C ftell). */
+    tell(handle: VfsFileHandle): number {
+        return handle.position;
+    }
+
+    /**
+     * The ONE cursor advance. Written as an explicit read-then-write because
+     * tools/validate-file-cursor.ts bans `position +=` outright: a compound assignment
+     * is a read-modify-write, and every double-advance bug in this file looked like one
+     * — two paths each crediting the same bytes, silently, at full length.
+     */
+    private advanceCursor(handle: VfsFileHandle, bytes: number): void {
+        handle.position = handle.position + bytes;
+        handle.lastReadEnd = handle.position;
+    }
+
+    /**
+     * Does this read continue the previous one on the same file object? That, or the
+     * opener's FILE_FLAG_SEQUENTIAL_SCAN, is the whole of NT's readahead trigger, and
+     * it is the only thing below this layer that can tell "streaming a 50 MB station"
+     * from "two unrelated reads that happen to be adjacent in the archive".
+     * Must be asked BEFORE the cursor advances for this read.
+     */
+    private isSequentialRead(handle: VfsFileHandle): boolean {
+        return handle.sequentialFlag === true || handle.lastReadEnd === handle.position;
+    }
+
+    duplicateHandle(handle: VfsFileHandle, position = 0): VfsFileHandle {
+        return {
+            kind: "file",
+            path: handle.path,
+            position,
+            access: handle.access,
+            source: handle.source,
+        };
+    }
+
     setPosition(handle: VfsFileHandle, offset: number, method: number): number {
+        vfsTrace(handle.path, offset, -1);
         const oldPosition = handle.position;
+        let next = oldPosition;
         if (method === 0) {
-            handle.position = offset;
+            next = offset;
         } else if (method === 1) {
-            handle.position += offset;
+            next = oldPosition + offset;
         } else if (method === 2) {
-            const size = this.getFileSize(handle.path);
-            handle.position = size + offset;
+            next = this.getFileSize(handle.path) + offset;
         }
-        if (handle.position < 0) handle.position = 0;
+        // Win32 would fail the call with ERROR_NEGATIVE_SEEK and leave the pointer
+        // alone; clamping is the pre-existing behaviour and changing it is a contract
+        // change across every seek caller (see the report accompanying this work).
+        if (next < 0) next = 0;
+        handle.position = next;
         if (handle.position !== oldPosition) {
             // Only invalidate if new position is outside the buffered range
             if (handle.buffer && handle.bufferOffset !== undefined) {
@@ -1016,6 +1532,7 @@ export class VirtualFileSystem {
         const toRead = Math.min(length, fileSize - offset);
         const out = new Uint8Array(toRead);
         const copied = this.fillOverlayRomUnderlay(path, offset, out, 0, toRead);
+        if (copied === null) return null; // not serviceable synchronously — caller goes async
         return out.subarray(0, copied);
     }
 
@@ -1034,14 +1551,24 @@ export class VirtualFileSystem {
         return this.fillOverlayRomUnderlay(path, offset, target, targetOffset, toRead);
     }
 
-    /** Copy up to `toRead` bytes from overlay then ROM underlay into `target`. */
+    /**
+     * Copy up to `toRead` bytes from overlay then ROM underlay into `target`. Returns the
+     * byte count, or null when the overlay cannot be served synchronously at all (the
+     * caller must retry on the async path — reporting 0 there would be a false EOF).
+     *
+     * The ROM underlay covers only the region PAST the overlay's EOF. A read that comes
+     * up short INSIDE the overlay's own extent is a short read, not an EOF — filling that
+     * gap from ROM hands back pre-write bytes in the middle of a file the guest already
+     * overwrote. So the fall-through is gated on the cursor actually having reached
+     * overlaySize, and a short overlay read returns short.
+     */
     private fillOverlayRomUnderlay(
         path: string,
         offset: number,
         target: Uint8Array,
         targetOffset: number,
         toRead: number,
-    ): number {
+    ): number | null {
         const full = this.resolvePath(path);
         const overlaySize = this.overlay!.getSize(full) ?? 0;
         let copied = 0;
@@ -1049,13 +1576,13 @@ export class VirtualFileSystem {
         if (offset < overlaySize) {
             const ovLen = Math.min(toRead, overlaySize - offset);
             const ov = this.overlay!.readFileSyncVia(full, offset, ovLen);
-            if (ov && ov.length > 0) {
-                const n = Math.min(ov.length, ovLen);
-                target.set(ov.subarray(0, n), targetOffset);
-                copied += n;
-            }
+            if (ov === null) return null; // cannot be served synchronously — caller falls back
+            const n = Math.min(ov.length, ovLen);
+            if (n > 0) target.set(ov.subarray(0, n), targetOffset);
+            copied += n;
+            if (n < ovLen) return copied;
         }
-        if (copied < toRead) {
+        if (copied < toRead && offset + copied >= overlaySize) {
             const romOff = offset + copied;
             const romLen = toRead - copied;
             const romBuf = new Uint8Array(romLen);
@@ -1087,13 +1614,13 @@ export class VirtualFileSystem {
         if (offset < overlaySize && this.overlay) {
             const ovLen = Math.min(toRead, overlaySize - offset);
             const ov = await this.overlay.readFile(full, offset, ovLen);
-            if (ov.length > 0) {
-                const n = Math.min(ov.length, ovLen);
-                out.set(ov.subarray(0, n), 0);
-                copied += n;
-            }
+            const n = Math.min(ov.length, ovLen);
+            if (n > 0) out.set(ov.subarray(0, n), 0);
+            copied += n;
+            // Short INSIDE the overlay extent — a short read, not an EOF for ROM to patch.
+            if (n < ovLen) return out.subarray(0, copied);
         }
-        if (copied < toRead) {
+        if (copied < toRead && offset + copied >= overlaySize) {
             const rom = await this.readRom(full, offset + copied, toRead - copied);
             out.set(rom.subarray(0, Math.min(rom.length, toRead - copied)), copied);
             copied += Math.min(rom.length, toRead - copied);
@@ -1264,43 +1791,116 @@ export class VirtualFileSystem {
         }
 
         const rel = this.relRomPath(path).toLowerCase();
+        const node = this.romChildren.get(rel);
+        if (!node) return [];
+
         const prefix = rel ? `${rel}/` : "";
         const dirEntries: Map<string, VfsEntry> = new Map();
+        // Whiteouts are the only mutable part of the ROM view, and they are normally
+        // empty — skip the filtering work entirely then.
+        const filtering = this.romWhiteouts.size > 0;
 
-        for (const [relPath, entry] of this.romIndex.entries()) {
-            if (prefix && !relPath.startsWith(prefix)) continue;
-            if (this.romWhiteouts.has(relPath)) continue;
-            // Derive names from the archive's original path, not the lowercased index
-            // key. Guests can be case-sensitive about returned names: Python 1.5's
-            // import check_case compares FindFirstFile's cFileName via strncmp, so a
-            // lowercased "bladex.dll" makes Blade of Darkness `import Bladex` fail.
-            const originalRel = this.romEntryOriginalRel(entry, relPath);
-            const remainder = originalRel.slice(prefix.length);
-            const parts = remainder.split("/");
-            const name = parts[0];
-            if (!name) continue;
-            if (parts.length === 1) {
+        // Names come from the archive's original path, not the lowercased index key.
+        // Guests can be case-sensitive about returned names: Python 1.5's import
+        // check_case compares FindFirstFile's cFileName via strncmp, so a lowercased
+        // "bladex.dll" makes Blade of Darkness `import Bladex` fail.
+        for (let i = 0; i < node.keys.length; i++) {
+            const name = node.names[i];
+            const key = node.keys[i];
+            if (node.isDir[i]) {
+                // A subdirectory exists only as long as something under it is visible.
+                if (filtering && !this.romDirHasVisibleEntry(key)) continue;
+                if (dirEntries.has(name.toLowerCase())) continue;
                 dirEntries.set(name.toLowerCase(), {
-                    path: this.romPathFromRel(originalRel),
+                    path: this.romPathFromRel(`${prefix}${name}`),
                     name,
-                    kind: "file",
-                    size: entry.uncompressedSize,
+                    kind: "dir",
+                    size: 0,
                     source: "rom",
                 });
-            } else {
-                if (!dirEntries.has(name.toLowerCase())) {
-                    dirEntries.set(name.toLowerCase(), {
-                        path: this.romPathFromRel(`${prefix}${name}`.replace(/\/+$/, "")),
-                        name,
-                        kind: "dir",
-                        size: 0,
-                        source: "rom",
-                    });
-                }
+                continue;
             }
+            if (filtering && this.romWhiteouts.has(key)) continue;
+            const entry = this.romIndex.get(key);
+            if (!entry) continue;
+            // `names[i]` is the whole original-case rel path for a file child.
+            const fileName = name.slice(name.lastIndexOf("/") + 1);
+            dirEntries.set(fileName.toLowerCase(), {
+                path: this.romPathFromRel(name),
+                name: fileName,
+                kind: "file",
+                size: entry.uncompressedSize,
+                source: "rom",
+            });
         }
 
         return Array.from(dirEntries.values());
+    }
+
+    /** Get-or-create the child list of a ROM directory (mount-time only). */
+    private romDirNode(dir: string): RomDirNode {
+        let node = this.romChildren.get(dir);
+        if (!node) {
+            node = { names: [], keys: [], isDir: [], selfEntry: false };
+            this.romChildren.set(dir, node);
+        }
+        return node;
+    }
+
+    /**
+     * Record one ROM index key as a child of each directory along its path. Called
+     * from the mount loop that already walks every entry, so the index is free.
+     */
+    private indexRomChildren(lowerKey: string, entry: ZipEntry): void {
+        const segs = lowerKey.split("/");
+        const originalRel = this.romEntryOriginalRel(entry, lowerKey);
+        // Reuse the key's own string when the case matches, so the common all-lowercase
+        // archive pays no extra memory for the original-case index.
+        const original = (originalRel === lowerKey ? lowerKey : originalRel).split("/");
+        const originalFull = originalRel === lowerKey ? lowerKey : originalRel;
+        let parent = "";
+        for (let i = 0; i < segs.length; i++) {
+            const seg = segs[i];
+            const last = i === segs.length - 1;
+            if (!seg) {
+                // Trailing "/" names `parent` itself; an interior empty segment is a
+                // malformed key whose tail no enumeration prefix can reach.
+                if (last) this.romDirNode(parent).selfEntry = true;
+                break;
+            }
+            const child = parent ? `${parent}/${seg}` : seg;
+            const node = this.romDirNode(parent);
+            if (last) {
+                // Files carry the whole original-case rel path: it is the entry's `path`.
+                node.names.push(originalFull);
+                node.keys.push(lowerKey);
+                node.isDir.push(false);
+            } else if (!this.romChildren.has(child)) {
+                node.names.push(original[i] ?? seg);
+                node.keys.push(child);
+                node.isDir.push(true);
+                this.romDirNode(child);
+            }
+            parent = child;
+        }
+    }
+
+    /**
+     * True while any non-whited-out entry still lives under `dirKey`. Only consulted
+     * when whiteouts exist, and short-circuits on the first survivor.
+     */
+    private romDirHasVisibleEntry(dirKey: string): boolean {
+        const node = this.romChildren.get(dirKey);
+        if (!node) return false;
+        if (node.selfEntry) return true;
+        for (let i = 0; i < node.keys.length; i++) {
+            if (node.isDir[i]) {
+                if (this.romDirHasVisibleEntry(node.keys[i])) return true;
+            } else if (!this.romWhiteouts.has(node.keys[i])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1360,11 +1960,17 @@ export class VirtualFileSystem {
 
             const pending = this.romLoadPromises.get(rel);
             if (pending) {
-                data = await pending;
+                data = await pending.promise;
             } else {
+                const generation = this.romGeneration;
                 const loadPromise = this.romArchive.readEntry(entry)
-                    .finally(() => this.romLoadPromises.delete(rel));
-                this.romLoadPromises.set(rel, loadPromise);
+                    .finally(() => {
+                        const current = this.romLoadPromises.get(rel);
+                        if (current?.generation === generation && current.promise === loadPromise) {
+                            this.romLoadPromises.delete(rel);
+                        }
+                    });
+                this.romLoadPromises.set(rel, { generation, promise: loadPromise });
                 data = await loadPromise;
             }
 
@@ -1396,22 +2002,33 @@ export class VirtualFileSystem {
      * Prefetch a single ROM entry into romCache with deduplication via romLoadPromises.
      * Skips files > MAX_CACHE_ENTRY_SIZE (served via range reads on demand).
      */
-    private async _prefetchEntry(rel: string, entry: ZipEntry): Promise<void> {
+    private async _prefetchEntry(rel: string, entry: ZipEntry, generation = this.romGeneration, signal?: AbortSignal): Promise<void> {
         const key = rel.toLowerCase();
+        if (signal?.aborted || generation !== this.romGeneration) return;
         if (this.romCache.has(key)) return;
         if (!this.romArchive) return;
 
         const existing = this.romLoadPromises.get(key);
-        if (existing) {
-            await existing;
+        if (existing && existing.generation === generation) {
+            await existing.promise;
             return;
         }
 
         const loadPromise = this.romArchive.readEntry(entry)
-            .then(data => { this.addRomCache(key, data); return data; })
-            .finally(() => this.romLoadPromises.delete(key));
+            .then(data => {
+                if (!signal?.aborted && generation === this.romGeneration) {
+                    this.addRomCache(key, data);
+                }
+                return data;
+            })
+            .finally(() => {
+                const current = this.romLoadPromises.get(key);
+                if (current?.generation === generation && current.promise === loadPromise) {
+                    this.romLoadPromises.delete(key);
+                }
+            });
 
-        this.romLoadPromises.set(key, loadPromise);
+        this.romLoadPromises.set(key, { generation, promise: loadPromise });
         await loadPromise;
     }
 
@@ -1427,20 +2044,23 @@ export class VirtualFileSystem {
         rels: string[],
         concurrency = 8,
         onProgress?: (processed: number, total: number) => void,
+        signal?: AbortSignal,
     ): Promise<number> {
         let prefetched = 0;
         let processed = 0;
         const total = rels.length;
         const queue = [...rels];
+        const generation = this.romGeneration;
         const workers = Array.from({ length: Math.min(concurrency, queue.length || 1) }, async () => {
             while (queue.length > 0) {
+                if (signal?.aborted || generation !== this.romGeneration) break;
                 const rel = queue.shift()!;
                 const key = rel.toLowerCase();
                 const entry = this.romIndex.get(key);
                 if (entry && !entry.isDirectory && entry.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE && !this.romCache.has(key)) {
                     try {
-                        await this._prefetchEntry(rel, entry);
-                        prefetched++;
+                        await this._prefetchEntry(rel, entry, generation, signal);
+                        if (!signal?.aborted && generation === this.romGeneration && this.romCache.has(key)) prefetched++;
                     } catch (_) { /* best-effort — range request issues are non-fatal */ }
                 }
                 onProgress?.(++processed, total);
@@ -1490,26 +2110,64 @@ export class VirtualFileSystem {
     }
 
     /**
-     * Phase 2 — background progressive prefetch of all remaining non-cached ROM files.
-     * Fire-and-forget; yields the event loop between each file so game I/O stays responsive.
+     * Phase 2 — background progressive prefetch of the ROM files romCache is the ONLY
+     * way to read synchronously.
+     *
+     * What it must not become is a download of the whole game. romCache exists so a
+     * caller that cannot await (GetPrivateProfileString, msvcrt fgetc) still gets
+     * bytes; an entry the archive can already range-read synchronously has that
+     * property WITHOUT being cached, so pulling its body in buys no capability and
+     * costs the transport the entire file. On a streamed bundle that is the whole
+     * point of streaming, undone: reaching Far Cry's main menu moved 2.6 GB to serve
+     * 37 MB of guest reads, and the guest paid for it directly because a STORED
+     * readEntry takes the BLOCKING sync range path.
+     *
+     * So: only entries that are not sync-range-readable, and only as many bytes as
+     * romCache can actually hold — prefetching past its budget evicts what was already
+     * fetched, which is work done twice and kept never.
      */
     startProgressivePrefetch(signal?: AbortSignal): void {
         this._runProgressivePrefetch(signal).catch(() => { /* best-effort */ });
     }
 
     private async _runProgressivePrefetch(signal?: AbortSignal): Promise<void> {
+        const generation = this.romGeneration;
+        const archive = this.romArchive;
+        if (!archive) return;
         // Sort by size ascending so small files fill cache quickly
-        const entries = Array.from(this.romIndex.entries())
-            .filter(([, e]) => !e.isDirectory && e.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE)
+        const all = Array.from(this.romIndex.entries())
+            .filter(([, e]) => !e.isDirectory && e.uncompressedSize <= this.MAX_CACHE_ENTRY_SIZE);
+        // `__legacyRomPrefetch2` restores the pull-everything policy this replaced, so a
+        // title that changes behaviour can be A/B'd against it without a rebuild.
+        const legacy = (globalThis as { __legacyRomPrefetch2?: unknown }).__legacyRomPrefetch2 === true;
+        const entries = all
+            .filter(([, e]) => legacy || !archive.canRangeReadSync(e))
             .sort(([, a], [, b]) => a.uncompressedSize - b.uncompressedSize);
 
-        Logger.log(LogCategory.SYSTEM, `VFS: starting progressive prefetch of ${entries.length} files`);
+        if (entries.length === 0) {
+            Logger.log(
+                LogCategory.SYSTEM,
+                `VFS: progressive prefetch skipped — all ${all.length} candidates are sync-range-readable already`,
+            );
+            return;
+        }
+        Logger.log(
+            LogCategory.SYSTEM,
+            `VFS: starting progressive prefetch of ${entries.length} files (${all.length - entries.length} skipped: sync-range-readable)`,
+        );
 
+        // The budget is what romCache can still HOLD, so it is read from the cache itself:
+        // entries phase-1 pinning already fetched, and demand reads landing while this loop
+        // yields, occupy it. A budget that only charged its own fetches would over-commit
+        // and evict exactly what phase 1 established.
+        const remaining = (): number =>
+            legacy ? Number.POSITIVE_INFINITY : this.ROM_CACHE_MAX_BYTES - this.romCache.byteSize;
         for (const [rel, entry] of entries) {
-            if (signal?.aborted) return;
+            if (signal?.aborted || generation !== this.romGeneration) return;
             if (this.romCache.has(rel)) continue;
+            if (entry.uncompressedSize > remaining()) break;   // ascending sizes: nothing after fits either
             try {
-                await this._prefetchEntry(rel, entry);
+                await this._prefetchEntry(rel, entry, generation, signal);
             } catch (_) { /* best-effort */ }
             // Yield event loop so game I/O gets priority
             await new Promise<void>(r => setTimeout(r, 0));
@@ -1521,8 +2179,72 @@ export class VirtualFileSystem {
     private invalidateReadWindow(handle: VfsFileHandle): void {
         handle.buffer = undefined;
         handle.bufferOffset = undefined;
+        handle.bufferEpoch = undefined;
         handle.prefetchPromise = null;
         handle.prefetchOffset = undefined;
+        handle.prefetchEpoch = undefined;
+    }
+
+    /** The epoch cell for a handle's path, resolved on first use and then held. */
+    private epochOf(handle: VfsFileHandle): number {
+        let ref = handle.epochRef;
+        if (!ref) {
+            ref = this.epochRefFor(handle.path);
+            handle.epochRef = ref;
+        }
+        return ref.e;
+    }
+
+    /**
+     * This path's epoch cell, created on demand. NORMALIZED, because the callers do not
+     * agree on a spelling — openSync holds an un-normalized `full`, truncate normalizes —
+     * and two spellings of one file would be two epochs, so a bump on one would not
+     * invalidate a window taken under the other.
+     */
+    private epochRefFor(full: string): { e: number } {
+        const key = normalizePath(full).toLowerCase();
+        let ref = this.windowEpochs.get(key);
+        if (!ref) {
+            ref = { e: 0 };
+            this.windowEpochs.set(key, ref);
+        }
+        return ref;
+    }
+
+    /** A truncate/delete/re-create invalidates every window on THAT path taken before now. */
+    private bumpWindowEpoch(full: string): void {
+        const ref = this.epochRefFor(full);
+        ref.e = (ref.e + 1) | 0;
+    }
+
+    /**
+     * Tripwire for the whole "window lies" class: a window that outlived its bytes
+     * would otherwise return plausible-looking stale data at full length, which is
+     * indistinguishable from a correct read at every layer above. Say so out loud.
+     */
+    private reportStaleWindow(handle: VfsFileHandle): void {
+        if (this.staleWindowReports >= 16) return;
+        this.staleWindowReports++;
+        Logger.warn(
+            LogCategory.SYSTEM,
+            `VFS: stale read window discarded for "${handle.path}" ` +
+            `(window epoch=${handle.bufferEpoch}, current=${this.epochOf(handle)}, ` +
+            `offset=${handle.bufferOffset}, position=${handle.position}) — ` +
+            `the file was truncated/replaced while this handle held a window`,
+        );
+    }
+
+    /**
+     * Publish `data` as the handle's read window. `epoch` is the epoch the bytes were
+     * READ under: a truncate that landed while the read was in flight makes them stale,
+     * so they are dropped rather than installed.
+     */
+    private installWindow(handle: VfsFileHandle, data: Uint8Array, offset: number, epoch: number): boolean {
+        if (epoch !== this.epochOf(handle)) return false;
+        handle.buffer = data;
+        handle.bufferOffset = offset;
+        handle.bufferEpoch = epoch;
+        return true;
     }
 
     private readFromHandleBuffer(handle: VfsFileHandle, length: number): Uint8Array | null {
@@ -1531,12 +2253,17 @@ export class VirtualFileSystem {
         if (!buffer || bufferOffset === undefined) {
             return null;
         }
+        if (handle.bufferEpoch !== this.epochOf(handle)) {
+            this.reportStaleWindow(handle);
+            this.invalidateReadWindow(handle);
+            return null;
+        }
         const relPos = handle.position - bufferOffset;
         if (relPos < 0 || relPos + length > buffer.byteLength) {
             return null;
         }
         const out = buffer.subarray(relPos, relPos + length);
-        handle.position += out.length;
+        this.advanceCursor(handle, out.length);
         return out;
     }
 
@@ -1556,6 +2283,7 @@ export class VirtualFileSystem {
         if (nextOffset >= fileSize) return;
 
         handle.prefetchOffset = nextOffset;
+        handle.prefetchEpoch = this.epochOf(handle);
         handle.prefetchPromise = this.fetchRange(handle, nextOffset, VirtualFileSystem.PREFETCH_CHUNK_SIZE)
             .catch(() => new Uint8Array(0));
     }
@@ -1592,12 +2320,14 @@ export class VirtualFileSystem {
         return raw.subarray(begin, end);
     }
 
+    // Arithmetic, not bitwise: `&` coerces to int32, so any offset at or past 2 GiB
+    // (reachable inside a single >2 GB ROM entry) would come back negative or wrapped.
     private alignDown(value: number, align: number): number {
-        return value & ~(align - 1);
+        return Math.floor(value / align) * align;
     }
 
     private alignUp(value: number, align: number): number {
-        return (value + (align - 1)) & ~(align - 1);
+        return Math.ceil(value / align) * align;
     }
 }
 
@@ -1644,6 +2374,11 @@ class OpfsOverlay {
     /** Cached FileSystemSyncAccessHandle instances for fast synchronous reads */
     private syncHandleCache = new Map<string, any /* FileSystemSyncAccessHandle */>();
     private syncHandleLru: string[] = [];
+    /** In-flight createSyncAccessHandle per path; see ensureSyncHandle. `create` is carried
+     *  because a joiner may only inherit a REFUSAL from an open at least as permissive. */
+    private syncHandleOpens = new Map<string, { create: boolean; promise: Promise<any> }>();
+    /** Per-path close counter, so an open in flight can see it was revoked mid-await. */
+    private syncHandleRevocations = new Map<string, number>();
     private readonly MAX_SYNC_HANDLES = 32;
     /**
      * In-flight commit promises keyed by file. CloseHandle drives flushFile() as a
@@ -1653,6 +2388,14 @@ class OpfsOverlay {
      * write→close→read ordering holds despite the async commit.
      */
     private pendingFlushes = new Map<string, Promise<void>>();
+    /**
+     * Paths whose pendingFlushes commit is currently ON THE STACK. That commit awaits the
+     * entry's flushInFlight, which reaches ensureWriter — whose lock-conflict recovery
+     * awaits pendingFlushes for the same path. Awaiting it there closes a cycle onto the
+     * caller, and the path's whole commit chain (and with it flushAll, the teardown
+     * barrier every child-process and guest exit runs through) never settles again.
+     */
+    private committingPaths = new Set<string>();
     /**
      * In-memory authoritative content for overlay files written this session. OPFS
      * exposes WritableFileStream and FileSystemSyncAccessHandle as mutually-exclusive,
@@ -1679,7 +2422,7 @@ class OpfsOverlay {
     private ephemeralWrite(key: string, path: string, offset: number, data: Uint8Array): number {
         let buf = this.ephemeralFiles.get(key) ?? new Uint8Array(0);
         const end = offset + data.length;
-        if (buf.length < end) { const grown = new Uint8Array(end); grown.set(buf, 0); buf = grown; }
+        if (buf.length < end) buf = growByteView(buf, end);
         buf.set(data, offset);
         this.ephemeralFiles.set(key, buf);
         const existing = this.entries.get(key);
@@ -1712,9 +2455,7 @@ class OpfsOverlay {
             return;
         }
         if (buf.length < end) {
-            const grown = new Uint8Array(end);
-            grown.set(buf, 0);
-            buf = grown;
+            buf = growByteView(buf, end, this.CONTENT_CACHE_MAX_FILE);
             this.contentCache.set(key, buf);
         }
         buf.set(data, offset);
@@ -1861,7 +2602,15 @@ class OpfsOverlay {
                 staleWriter.flushTimer = null;
             }
             if (staleWriter.writer) {
-                void staleWriter.writer.close().catch(() => { });
+                // close() is async and holds OPFS's exclusive lock until it settles, so
+                // it is registered as a pending commit rather than dropped: the next
+                // writer for this path awaits it instead of failing to open (ensureWriter).
+                const closing = staleWriter.writer.close().catch((e) => {
+                    Logger.warn(LogCategory.SYSTEM, `OPFS: closing stale writer for "${path}" failed: ${e}`);
+                });
+                this.pendingFlushes.set(key, closing);
+                const done = () => { if (this.pendingFlushes.get(key) === closing) this.pendingFlushes.delete(key); };
+                closing.then(done, done);
             }
         }
         this.entries.set(key, { size: 0, kind: "file", path: normalizePath(path) });
@@ -1907,10 +2656,13 @@ class OpfsOverlay {
 
         const isSequential = offset === cacheEntry.bufferOffset + cacheEntry.memoryBuffer.length;
         if (isSequential && cacheEntry.memoryBuffer.length + data.length < this.WRITE_BUFFER_THRESHOLD) {
-            const newBuffer = new Uint8Array(cacheEntry.memoryBuffer.length + data.length);
-            newBuffer.set(cacheEntry.memoryBuffer, 0);
-            newBuffer.set(data, cacheEntry.memoryBuffer.length);
-            cacheEntry.memoryBuffer = newBuffer;
+            const oldLength = cacheEntry.memoryBuffer.length;
+            cacheEntry.memoryBuffer = growByteView(
+                cacheEntry.memoryBuffer,
+                oldLength + data.length,
+                this.WRITE_BUFFER_THRESHOLD,
+            );
+            cacheEntry.memoryBuffer.set(data, oldLength);
             cacheEntry.lastUsed = performance.now();
             this.scheduleBufferFlush(cacheEntry, key);
 
@@ -1920,6 +2672,9 @@ class OpfsOverlay {
             return data.length;
         }
 
+        // Non-sequential write: the buffered run belongs to a different region and must be
+        // committed before this one replaces the buffer. flushWriteBuffer takes it in this
+        // same turn, so the overwrite below cannot race the commit.
         if (cacheEntry.memoryBuffer.length > 0) {
             void this.flushWriteBuffer(cacheEntry).catch((e) => {
                 Logger.error(LogCategory.SYSTEM, `OPFS: writeFileSync("${path}") pre-flush failed: ${e}`);
@@ -1965,20 +2720,27 @@ class OpfsOverlay {
 
     listDirectory(path: string): VfsEntry[] {
         const normalizedPrefix = normalizePath(path);
-        const prefix = toKey(normalizedPrefix);
-        const prefixParts = normalizedPrefix.split("\\");
+        // The drive root normalizes to "C:\" — a trailing separator no other path has, so
+        // both the prefix test and the depth test have to be built from segments rather
+        // than from the raw string (`"C:\" + "\"` matches nothing, and split() yields a
+        // phantom empty segment that makes every root child look too shallow). Getting
+        // this wrong hides every guest-created file in the root from FindFirstFile while
+        // statEntry still finds it.
+        const prefixKey = toKey(normalizedPrefix);
+        const prefix = prefixKey.endsWith("\\") ? prefixKey.slice(0, -1) : prefixKey;
+        const prefixDepth = normalizedPrefix.split("\\").filter(Boolean).length;
         const out: VfsEntry[] = [];
         const seen = new Set<string>();
 
         for (const [key, entry] of this.entries.entries()) {
             if (!(key.startsWith(`${prefix}\\`))) continue;
-            const entryParts = entry.path.split("\\");
-            if (entryParts.length <= prefixParts.length) continue;
-            const name = entryParts[prefixParts.length];
+            const entryParts = entry.path.split("\\").filter(Boolean);
+            if (entryParts.length <= prefixDepth) continue;
+            const name = entryParts[prefixDepth];
             const nameKey = name?.toLowerCase();
             if (!name || !nameKey || seen.has(nameKey)) continue;
             seen.add(nameKey);
-            const isDir = entryParts.length > prefixParts.length + 1 || entry.kind === "dir";
+            const isDir = entryParts.length > prefixDepth + 1 || entry.kind === "dir";
             out.push({
                 path: normalizePath(`${normalizedPrefix}\\${name}`),
                 name,
@@ -2082,7 +2844,9 @@ class OpfsOverlay {
             }
             this.closeSyncHandle(path);
             const handle = await this.getFileHandle(path, true);
-            const writer = await handle.createWritable();
+            // SetEndOfFile keeps everything below the new end; createWritable defaults to an
+            // EMPTY stage, so without this the truncate would commit `size` zero bytes.
+            const writer = await handle.createWritable({ keepExistingData: true });
             await writer.truncate(size);
             await writer.close();
             this.entries.set(toKey(path), { size, kind: "file", path: normalizePath(path) });
@@ -2145,7 +2909,7 @@ class OpfsOverlay {
         this.syncHandleLru.push(key);
 
         const buffer = new Uint8Array(length);
-        const bytesRead = handle.read(buffer, { at: offset });
+        const bytesRead = readSyncAccessHandle(handle, buffer, offset);
         return buffer.subarray(0, bytesRead);
     }
 
@@ -2155,16 +2919,54 @@ class OpfsOverlay {
      * (when create=false). A sync access handle is exclusive, so callers must ensure no
      * WritableFileStream is open for the same file first (writerCache empty / writer closed).
      */
-    private async ensureSyncHandle(path: string, create = false): Promise<any /* FileSystemSyncAccessHandle */ | null> {
+    private async ensureSyncHandle(path: string, create = false, speculative = false): Promise<any /* FileSystemSyncAccessHandle */ | null> {
         const key = toKey(path);
 
-        const existing = this.syncHandleCache.get(key);
-        if (existing) return existing;
+        // At most one extra pass: joining a less permissive open can leave this caller
+        // without the handle it was entitled to, and it then opens its own.
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const existing = this.syncHandleCache.get(key);
+            if (existing) return existing;
 
-        // Don't open if writer is active — a WritableFileStream and a sync access handle
-        // can't coexist on the same OPFS file (createSyncAccessHandle would throw).
-        if (this.writerCache.has(key)) return null;
+            // Don't open if writer is active — a WritableFileStream and a sync access handle
+            // can't coexist on the same OPFS file (createSyncAccessHandle would throw).
+            if (this.writerCache.has(key)) return null;
 
+            // The handle is an EXCLUSIVE lock, so a second open of the same path while the
+            // first is still in flight does not race — it fails. Speculative warms make that
+            // overlap the normal case (open, then read before the warm lands), and a demand
+            // read that opened its own would then take the failure AND still park. One
+            // in-flight open per path, shared by whoever asks next.
+            const inFlight = this.syncHandleOpens.get(key);
+            if (inFlight) {
+                const joined = await inFlight.promise;
+                // A handle is a handle whatever opened it. A null, though, may be nothing
+                // more than "create=false and the file did not exist" — a caller entitled to
+                // CREATE must not inherit that refusal, so it retries with its own open.
+                if (joined || inFlight.create || !create) return joined;
+                continue;
+            }
+
+            // A sync access handle is an exclusive lock on the file, so MAX_SYNC_HANDLES is a
+            // lock footprint, not a cache size. A SPECULATIVE warm may only fill spare
+            // capacity: letting it evict would let a title that opens hundreds of overlay
+            // files (shader cache, saves) throw away handles that demand reads established
+            // and are still being read through — trading one park for many.
+            if (speculative && this.syncHandleCache.size >= this.MAX_SYNC_HANDLES) return null;
+
+            const open = this.openSyncHandle(path, key, create);
+            this.syncHandleOpens.set(key, { create, promise: open });
+            try {
+                return await open;
+            } finally {
+                this.syncHandleOpens.delete(key);
+            }
+        }
+        return this.syncHandleCache.get(key) ?? null;
+    }
+
+    private async openSyncHandle(path: string, key: string, create: boolean): Promise<any | null> {
+        const revokedAt = this.syncHandleRevocations.get(key) ?? 0;
         try {
             // Evict LRU if at capacity
             while (this.syncHandleCache.size >= this.MAX_SYNC_HANDLES && this.syncHandleLru.length > 0) {
@@ -2178,8 +2980,20 @@ class OpfsOverlay {
 
             const fileHandle = await this.getFileHandle(path, create);
             const syncHandle = await (fileHandle as any).createSyncAccessHandle();
+            // A writer/delete/truncate path may have revoked this file's handle while the
+            // two awaits above ran. Publishing now would hand back a lock nobody asked to
+            // keep and block the writer that revoked it.
+            if ((this.syncHandleRevocations.get(key) ?? 0) !== revokedAt) {
+                try { syncHandle.close(); } catch { /* already gone */ }
+                return null;
+            }
             this.syncHandleCache.set(key, syncHandle);
             this.syncHandleLru.push(key);
+            // The counter has done its job for this path: nothing else can be mid-await on
+            // it (one open in flight per key), so drop it rather than keep a per-path entry
+            // for the session. A later revoke restarts it from 0, which still differs from
+            // the 0 a subsequent open captures only if it happened — which is the test.
+            this.syncHandleRevocations.delete(key);
             return syncHandle;
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `OPFS: ensureSyncHandle("${path}") failed: ${e}`);
@@ -2187,9 +3001,32 @@ class OpfsOverlay {
         }
     }
 
+    /**
+     * Start opening the read-side sync access handle for a file the guest has just
+     * opened, so the first read does not have to park waiting for it. Fire-and-forget by
+     * construction: ensureSyncHandle swallows its own failures, and losing the race just
+     * leaves that first read on the async path it takes today. Skipped where a sync
+     * handle would answer nothing (RAM-served content) or would take a lock away from a
+     * writer.
+     */
+    prewarmSyncHandle(path: string): void {
+        // A/B kill-switch: globalThis.__noOverlayWarm restores warm-at-first-read.
+        if ((globalThis as { __noOverlayWarm?: boolean }).__noOverlayWarm) return;
+        const key = toKey(path);
+        if (this.syncHandleCache.has(key)) { vfsIoCensus.warmSkippedHandle++; return; }
+        if (this.policy.isEphemeral(path)) { vfsIoCensus.warmSkippedEphemeral++; return; }
+        if (this.contentCache.has(key)) { vfsIoCensus.warmSkippedCached++; return; }
+        if (this.writerCache.has(key)) { vfsIoCensus.warmSkippedWriter++; return; }
+        if (!this.hasFile(path)) { vfsIoCensus.warmSkippedNoFile++; return; }
+        if (this.syncHandleCache.size >= this.MAX_SYNC_HANDLES) { vfsIoCensus.warmSkippedCapacity++; return; }
+        vfsIoCensus.warmAttempted++;
+        void this.ensureSyncHandle(path, false, true).then((h) => { if (h) vfsIoCensus.warmLanded++; });
+    }
+
     /** Close a cached sync handle (e.g. before opening a writer for the same file). */
     private closeSyncHandle(path: string): void {
         const key = toKey(path);
+        this.syncHandleRevocations.set(key, (this.syncHandleRevocations.get(key) ?? 0) + 1);
         const handle = this.syncHandleCache.get(key);
         if (handle) {
             handle.close();
@@ -2250,7 +3087,7 @@ class OpfsOverlay {
         const syncHandle = await this.ensureSyncHandle(path);
         if (syncHandle) {
             const buffer = new Uint8Array(length);
-            const bytesRead = syncHandle.read(buffer, { at: offset });
+            const bytesRead = readSyncAccessHandle(syncHandle, buffer, offset);
             Logger.verbose(LogCategory.SYSTEM, `OPFS: readFile("${path}") opened sync handle, read ${bytesRead} bytes`);
             return buffer.subarray(0, bytesRead);
         }
@@ -2293,10 +3130,13 @@ class OpfsOverlay {
             const isSequential = offset === cacheEntry.bufferOffset + cacheEntry.memoryBuffer.length;
 
             if (isSequential && cacheEntry.memoryBuffer.length + data.length < this.WRITE_BUFFER_THRESHOLD) {
-                const newBuffer = new Uint8Array(cacheEntry.memoryBuffer.length + data.length);
-                newBuffer.set(cacheEntry.memoryBuffer, 0);
-                newBuffer.set(data, cacheEntry.memoryBuffer.length);
-                cacheEntry.memoryBuffer = newBuffer;
+                const oldLength = cacheEntry.memoryBuffer.length;
+                cacheEntry.memoryBuffer = growByteView(
+                    cacheEntry.memoryBuffer,
+                    oldLength + data.length,
+                    this.WRITE_BUFFER_THRESHOLD,
+                );
+                cacheEntry.memoryBuffer.set(data, oldLength);
                 cacheEntry.lastUsed = performance.now();
                 this.scheduleBufferFlush(cacheEntry, key);
 
@@ -2306,7 +3146,13 @@ class OpfsOverlay {
                 return data.length;
             }
 
-            await this.flushWriteBuffer(cacheEntry);
+            // Take the buffered run and re-anchor BEFORE yielding. flushWriteBuffer has
+            // already emptied memoryBuffer synchronously; anything appended during the
+            // awaits below belongs to a later run and must survive them, so this is the
+            // only point at which the anchor may be moved.
+            const flush = this.flushWriteBuffer(cacheEntry);
+            cacheEntry.bufferOffset = offset + data.length;
+            await flush;
 
             await this.ensureWriter(cacheEntry);
             const buffer = new Uint8Array(data).buffer;
@@ -2318,9 +3164,6 @@ class OpfsOverlay {
 
             cacheEntry.queue = cacheEntry.queue.then(doWrite, doWrite);
             await cacheEntry.queue;
-
-            cacheEntry.bufferOffset = offset + data.length;
-            cacheEntry.memoryBuffer = new Uint8Array(0);
 
             this.scheduleWriterCleanup();
 
@@ -2334,44 +3177,123 @@ class OpfsOverlay {
         }
     }
 
+    /**
+     * Open the entry's WritableFileStream.
+     *
+     * OPFS gives `createWritable` an EXCLUSIVE lock, so it throws
+     * NoModificationAllowedError while any other writable or sync access handle on the
+     * same file is still open — including one of ours whose close() has not settled
+     * (prepareCreateSync/cleanupWriters retire entries without awaiting the close).
+     * A commit that gives up there loses the guest's bytes, so wait the conflict out
+     * once: settle whatever commit we already have in flight for this path and retry.
+     */
     private async ensureWriter(entry: WriterCacheEntry): Promise<void> {
         if (entry.writer) return;
         this.closeSyncHandle(entry.path);
-        const handle = await this.getFileHandle(entry.path, true);
         const keepExistingData = !entry.replaceExisting;
-        entry.writer = await handle.createWritable({ keepExistingData });
+        const open = async (): Promise<FileSystemWritableFileStream> => {
+            const handle = await this.getFileHandle(entry.path, true);
+            return handle.createWritable({ keepExistingData });
+        };
+        try {
+            entry.writer = await open();
+        } catch (e) {
+            if ((e as { name?: string })?.name !== "NoModificationAllowedError") throw e;
+            const key = toKey(entry.path);
+            // Only a commit we are NOT part of can still settle; the one that is awaiting
+            // this call cannot, and awaiting it wedges the path's chain permanently.
+            const pending = this.committingPaths.has(key) ? undefined : this.pendingFlushes.get(key);
+            if (pending) { try { await pending; } catch { /* its owner logs it */ } }
+            // A sync-handle open still in flight holds the same exclusive lock and is
+            // invisible to closeSyncHandle (which only bumps the revocation counter for
+            // it). Let it land first, then revoke it, or the retry hits the same conflict
+            // and the exception escapes with the guest's bytes unwritten.
+            const opening = this.syncHandleOpens.get(key);
+            if (opening) { try { await opening.promise; } catch { /* openSyncHandle logs it */ } }
+            this.closeSyncHandle(entry.path);
+            Logger.warn(LogCategory.SYSTEM,
+                `OPFS: ensureWriter("${entry.path}") lock conflict — retrying after in-flight commit`);
+            entry.writer = await open();
+        }
         entry.replaceExisting = false;
     }
 
+    /**
+     * Last-resort commit for a buffered run whose WritableFileStream cannot be opened:
+     * a sync access handle takes the same lock through a different door. Only usable
+     * once the entry is out of writerCache (ensureSyncHandle refuses otherwise), which
+     * is exactly the drain/cleanup case. Returns false if it could not commit.
+     */
+    private async commitBufferViaSyncHandle(path: string, offset: number, buf: Uint8Array): Promise<boolean> {
+        const sh = await this.ensureSyncHandle(path, true);
+        if (!sh) return false;
+        try {
+            sh.write(buf, { at: offset });
+            sh.flush();
+            return true;
+        } catch (e) {
+            Logger.error(LogCategory.SYSTEM,
+                `OPFS: sync-handle fallback for "${path}" (offset=${offset}, ${buf.length} bytes) failed: ${e}`);
+            return false;
+        }
+    }
+
+    /**
+     * Commit the entry's buffered run.
+     *
+     * The take-and-swap happens in THIS JS turn, before any await, and a flush already
+     * in flight is CHAINED onto rather than awaited-and-returned. Both matter: callers
+     * (writeFileSync's pre-flush, writeFile, readFile, drainWriters) assume that once
+     * this has been *called* the buffered bytes are spoken for, and then overwrite
+     * memoryBuffer/bufferOffset. An early return that left the buffer in place — which
+     * is exactly what the flushInFlight branch did — dropped that run silently.
+     */
     private async flushWriteBuffer(entry: WriterCacheEntry): Promise<void> {
-        if (entry.flushInFlight) {
-            await entry.flushInFlight;
-            return;
+        const bufferToWrite = entry.memoryBuffer;
+        const offsetToWrite = entry.bufferOffset;
+        if (bufferToWrite.length > 0) {
+            entry.bufferOffset = offsetToWrite + bufferToWrite.length;
+            entry.memoryBuffer = new Uint8Array(0);
+        }
+        if (entry.flushTimer !== null) {
+            clearTimeout(entry.flushTimer);
+            entry.flushTimer = null;
         }
 
+        const prior = entry.flushInFlight;
         const run = (async () => {
-            if (entry.memoryBuffer.length === 0) {
+            if (prior) {
+                try { await prior; } catch { /* the flush that owns it logs it */ }
+            }
+            if (bufferToWrite.length === 0) {
                 if (entry.replaceExisting) {
                     await this.ensureWriter(entry);
                 }
                 return;
             }
 
-            if (entry.flushTimer !== null) {
-                clearTimeout(entry.flushTimer);
-                entry.flushTimer = null;
+            try {
+                await this.ensureWriter(entry);
+            } catch (e) {
+                // The buffer has already been taken out of the entry, so giving up here
+                // DROPS guest bytes. Try the other door before losing them, and if that
+                // fails too, say so at error level — this is data loss, not a hiccup.
+                Logger.warn(LogCategory.SYSTEM,
+                    `OPFS: writer unavailable for "${entry.path}" (offset=${offsetToWrite}, ${bufferToWrite.length} bytes): ${e}`);
+                if (await this.commitBufferViaSyncHandle(entry.path, offsetToWrite, bufferToWrite)) return;
+                Logger.error(LogCategory.SYSTEM,
+                    `OPFS: LOST ${bufferToWrite.length} buffered bytes at offset ${offsetToWrite} of "${entry.path}" — no writable and no sync handle`);
+                throw e;
             }
-
-            const bufferToWrite = entry.memoryBuffer;
-            const offsetToWrite = entry.bufferOffset;
-
-            entry.bufferOffset += entry.memoryBuffer.length;
-            entry.memoryBuffer = new Uint8Array(0);
-
-            await this.ensureWriter(entry);
             const doFlush = async () => {
                 await entry.writer!.seek(offsetToWrite);
-                await entry.writer!.write(asArrayBuffer(bufferToWrite.buffer));
+                // growByteView hands back a subarray, so the buffer is the RIGHT one only when
+                // the view spans it exactly — byteOffset included, or a shifted view persists
+                // the wrong bytes at the wrong length.
+                const exact = bufferToWrite.byteOffset === 0 && bufferToWrite.length === bufferToWrite.buffer.byteLength
+                    ? bufferToWrite.buffer
+                    : new Uint8Array(bufferToWrite).buffer;
+                await entry.writer!.write(asArrayBuffer(exact));
                 entry.lastUsed = performance.now();
             };
             entry.queue = entry.queue.then(doFlush, doFlush);
@@ -2422,51 +3344,65 @@ class OpfsOverlay {
             if (prev) { try { await prev; } catch { /* ignore */ } }
             if (this.writerCache.get(key) !== cacheEntry) return; // superseded by a newer writer
 
-            if (cacheEntry.flushTimer !== null) {
-                clearTimeout(cacheEntry.flushTimer);
-                cacheEntry.flushTimer = null;
-            }
-            if (cacheEntry.flushInFlight) {
-                try {
-                    await cacheEntry.flushInFlight;
-                } catch (e) {
-                    Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") in-flight buffer flush failed: ${e}`);
-                }
-            }
-
-            const pending = cacheEntry.memoryBuffer;
-            const pendingOffset = cacheEntry.bufferOffset;
-            const replace = cacheEntry.replaceExisting;
-
-            // Drop the entry up front: ensureSyncHandle() refuses while a writer entry
-            // exists, and removing it lets the post-commit reader open a fresh sync handle.
-            this.writerCache.delete(key);
-
+            this.committingPaths.add(key);
             try {
-                if (cacheEntry.writer) {
-                    // A WritableFileStream was already opened for this file — finish through
-                    // it (it holds the exclusive lock) and close so the file is committed.
-                    if (pending.length > 0) {
-                        await cacheEntry.writer.seek(pendingOffset);
-                        // SAB-backed: cast at DOM boundary
-                        await cacheEntry.writer.write((pending.length === pending.buffer.byteLength ? pending.buffer : new Uint8Array(pending)) as unknown as FileSystemWriteChunkType);
-                    }
-                    await cacheEntry.queue;
-                    await cacheEntry.writer.close();
-                } else if (pending.length > 0) {
-                    // Lazy case (the common one): commit synchronously via a sync access
-                    // handle. createSyncAccessHandle requires the file to exist, so create it.
-                    // Reads are served from contentCache regardless, so a failure here only
-                    // costs cross-session persistence, not in-session read-after-write.
-                    const sh = await this.ensureSyncHandle(path, true);
-                    if (sh) {
-                        if (replace) sh.truncate(pendingOffset + pending.length);
-                        sh.write(pending, { at: pendingOffset });
-                        sh.flush();
+                if (cacheEntry.flushTimer !== null) {
+                    clearTimeout(cacheEntry.flushTimer);
+                    cacheEntry.flushTimer = null;
+                }
+                // Drop the entry up front: ensureSyncHandle() refuses while a writer entry
+                // exists, and removing it lets the post-commit reader open a fresh sync
+                // handle. It also gives the drain below an END: the write paths attach a
+                // buffered run to whatever writerCache holds for this key.
+                this.writerCache.delete(key);
+
+                // Draining once is not enough. A flush that starts while we are awaiting the
+                // previous one installs its own flushInFlight, and it has ALREADY taken its
+                // bytes out of memoryBuffer — so those bytes are in neither place we look,
+                // and its write lands in the stream closed below. Drain until quiescent.
+                while (cacheEntry.flushInFlight) {
+                    try {
+                        await cacheEntry.flushInFlight;
+                    } catch (e) {
+                        Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") in-flight buffer flush failed: ${e}`);
                     }
                 }
-            } catch (e) {
-                Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") commit failed: ${e}`);
+
+                const pending = cacheEntry.memoryBuffer;
+                const pendingOffset = cacheEntry.bufferOffset;
+                const replace = cacheEntry.replaceExisting;
+
+                try {
+                    if (cacheEntry.writer) {
+                        // A WritableFileStream was already opened for this file — finish through
+                        // it (it holds the exclusive lock) and close so the file is committed.
+                        if (pending.length > 0) {
+                            await cacheEntry.writer.seek(pendingOffset);
+                            // SAB-backed: cast at DOM boundary
+                            const exact = pending.byteOffset === 0 && pending.length === pending.buffer.byteLength
+                                ? pending.buffer
+                                : new Uint8Array(pending);
+                            await cacheEntry.writer.write(exact as unknown as FileSystemWriteChunkType);
+                        }
+                        await cacheEntry.queue;
+                        await cacheEntry.writer.close();
+                    } else if (pending.length > 0) {
+                        // Lazy case (the common one): commit synchronously via a sync access
+                        // handle. createSyncAccessHandle requires the file to exist, so create it.
+                        // Reads are served from contentCache regardless, so a failure here only
+                        // costs cross-session persistence, not in-session read-after-write.
+                        const sh = await this.ensureSyncHandle(path, true);
+                        if (sh) {
+                            if (replace) sh.truncate(pendingOffset + pending.length);
+                            sh.write(pending, { at: pendingOffset });
+                            sh.flush();
+                        }
+                    }
+                } catch (e) {
+                    Logger.warn(LogCategory.SYSTEM, `OPFS: flushFile("${path}") commit failed: ${e}`);
+                }
+            } finally {
+                this.committingPaths.delete(key);
             }
         })();
 
@@ -2488,14 +3424,21 @@ class OpfsOverlay {
      * the next run (the "create -> not found -> crash, relaunch, repeat" symptom).
      */
     async flushAll(): Promise<void> {
+        // Settle in-flight CloseHandle commits FIRST: flushFile holds a sync access
+        // handle, and OPFS refuses a WritableFileStream on a file one is open on — so
+        // draining first makes the drain fail on exactly the files a commit just touched.
+        await this.settlePendingFlushes();
         await this.drainWriters();
-        // Await any CloseHandle-driven commits (flushFile via sync access handle) still in flight.
-        const pending = Array.from(this.pendingFlushes.values());
-        for (const p of pending) {
-            try { await p; } catch { /* commit error already logged in flushFile */ }
-        }
+        // ...and again for anything the drain kicked off.
+        await this.settlePendingFlushes();
         // Persist CoW tombstones so a relaunch re-opens the truncated state, not stale ROM.
         await this.saveShadowIndex();
+    }
+
+    private async settlePendingFlushes(): Promise<void> {
+        for (const p of Array.from(this.pendingFlushes.values())) {
+            try { await p; } catch { /* commit error already logged in flushFile */ }
+        }
     }
 
     /** Flush each cached writer's buffer and CLOSE it so its bytes commit to OPFS. */
@@ -2516,9 +3459,19 @@ class OpfsOverlay {
                 await entry.queue;
                 await entry.writer?.close();
             } catch (e) {
-                Logger.warn(LogCategory.SYSTEM, `OPFS: drainWriters error for "${key}": ${e}`);
+                // Loud: the teardown barrier failing means the guest's last writes to
+                // this file did not reach OPFS (see flushWriteBuffer's fallback).
+                Logger.error(LogCategory.SYSTEM, `OPFS: drainWriters FAILED for "${key}" — writes may be lost: ${e}`);
             }
         }
+    }
+
+    /** Wait out an in-flight commit for one path (the read path does the same at
+     *  `pendingFlushes.get(key)`). A caller that is about to remove the file must not race the
+     *  commit that is still writing it. */
+    async settlePendingFlush(path: string): Promise<void> {
+        const inFlight = this.pendingFlushes.get(toKey(path));
+        if (inFlight) { try { await inFlight; } catch { /* commit error already logged */ } }
     }
 
     async deleteFile(path: string): Promise<boolean> {
@@ -2714,6 +3667,26 @@ class OpfsOverlay {
  * set across sessions. Lives OUTSIDE overlay/ so it is never surfaced to the guest via C:\.
  */
 const SHADOW_INDEX_FILE = "overlay-shadow.json";
+
+/**
+ * FileSystemSyncAccessHandle.read() is permitted to return fewer bytes than the buffer
+ * holds without being at EOF. A single un-looped call therefore reports a short read as
+ * an EOF, and every layer above turns that into a truncated file. Loop until filled or
+ * the handle genuinely stops producing (mirrors SyncAccessHandleSource.readRangeSync).
+ */
+function readSyncAccessHandle(
+    handle: { read(buffer: Uint8Array, opts: { at: number }): number },
+    buffer: Uint8Array,
+    at: number,
+): number {
+    let got = 0;
+    while (got < buffer.length) {
+        const n = handle.read(buffer.subarray(got), { at: at + got });
+        if (n <= 0) break;
+        got += n;
+    }
+    return got;
+}
 
 function normalizePath(path: string): string {
     const cleaned = path.replace(/\//g, "\\");

@@ -1,0 +1,14 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`D3D9 SM3 W14 predicate and centroid seams decodes dcl_centroid and emits a valid centroid fragment input qualifier 1`] = `
+"struct Interp {
+    @builtin(position) @invariant pos: vec4<f32>,
+    @location(2) @interpolate(perspective, centroid) tex0: vec4<f32>,
+}
+struct PsInput {
+    @builtin(position) pos: vec4<f32>,
+    @location(2) @interpolate(perspective, centroid) tex0: vec4<f32>,
+}
+
+"
+`;

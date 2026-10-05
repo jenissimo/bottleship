@@ -2,8 +2,11 @@
  * IDirect3DDevice3 and IDirect3DDevice7 implementations
  */
 import { Logger, LogCategory, LogLevel } from "../../../core/logger";
+import { assignStubsOnce } from "../../../core/thunking/stub-merge";
+import { ThunkImplementation } from "../../../core/thunking/thunk-dispatcher";
 import { System } from "../../../core/system";
 import { DDrawContext } from "../context";
+import { resolveDDrawTearOff } from "../com-tearoff";
 import { bytesToGuid } from "../helpers";
 import { isValidAddress } from "../../../core/memory/address-guard";
 import { initReturnPtr } from "../../../backends/webgpu/shared/dx-com-helpers";
@@ -11,6 +14,9 @@ import { asArrayBuffer } from "../../../../dom-buffer";
 import {
     DDPF_ALPHAPIXELS,
     DDPF_RGB,
+    DDPF_FOURCC,
+    DDPF_PALETTEINDEXED8,
+    SUPPORTED_FOURCC_CODES,
     DDPIXELFORMAT_OFFSETS,
     DDSCAPS_TEXTURE,
     DDSD_CAPS,
@@ -18,6 +24,8 @@ import {
     DDSURFACEDESC_OFFSETS,
     DDSURFACEDESC_SIZE,
     DDSURFACEDESC2_OFFSETS,
+    IID_IDirect3D,
+    IID_IDirect3D2,
     IID_IDirect3D7,
     IID_IDirect3D3,
     IID_IDirect3DDevice3,
@@ -36,9 +44,12 @@ import {
     D3DCOLORVALUE_OFFSETS,
     D3DVECTOR_OFFSETS,
     D3D_MAX_LIGHTS,
-    allocateComObject,
+    D3DVIEWPORT7_SIZE,
+    D3DVIEWPORT7_OFFSETS,
+    E_INVALIDARG,
 } from "../constants";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
+import { allocateComObject } from "../../../core/com/com-memory";
 import {
     DirectDrawSurfaceObject,
     DirectDrawSurfaceState,
@@ -61,8 +72,9 @@ import {
     D3DVector,
 } from "./types";
 import { setDeviceRenderTarget } from "./texture-manager";
-import { setAuthorityGpu, surfaceSyncManager, syncActiveGdiContextBeforeD3D } from "../surface-sync";
+import { surfaceSyncManager, syncActiveGdiContextBeforeD3D } from "../surface-sync";
 import { createDeviceStubsExports } from "./device-impl-stubs";
+import { frustumPlanesFromCombined, sphereVisibilityBits, clipBitsToD3dVis } from "./sphere-visibility";
 import {
     fillDeviceDesc,
     fillDeviceDesc7,
@@ -70,6 +82,63 @@ import {
     D3D7_HAL_DEVICE_GUID_BYTES,
     d3d7DeviceGuidForKind,
 } from "./d3d-caps-utils";
+
+interface EnumTextureFormat {
+    bpp: number;
+    r: number;
+    g: number;
+    b: number;
+    a: number;
+    flags: number;
+    fourCC?: number;
+}
+
+/**
+ * The uncompressed RGB formats EnumTextureFormats has always offered. ARGB1555 comes before
+ * XRGB1555 so games needing alpha (foliage, particles) get it; transparency for alpha=0 is
+ * then handled by blend state, and when blending is off the shader forces alpha=1.0 so black
+ * objects do not turn transparent. Thief needs ARGB1555 and RGB565 present to accept
+ * hardware mode. Order is load-bearing beyond that too: apps stop enumerating as soon as
+ * they find a format they like, so nothing may be inserted ABOVE these six.
+ */
+const ENUM_TEXTURE_FORMATS_RGB: ReadonlyArray<EnumTextureFormat> = [
+    { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                                            // RGB565
+    { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },                         // ARGB1555
+    { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                                            // XRGB1555
+    { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB },                            // X8R8G8B8
+    { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },                         // ARGB4444
+    { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },         // A8R8G8B8
+];
+
+/**
+ * Palettised 8-bit. The surface path handles it end to end — detectPixelFormat →
+ * PixelFormat.PALETTE8, a palette-aware decode, a GPU LUT upload, and colour-key compared as
+ * a palette INDEX. Never enumerating it told every palettised title the hardware had no such
+ * texture format, which costs it palette-cycling animation as a MECHANISM, not just a layout.
+ */
+const ENUM_TEXTURE_FORMAT_P8: EnumTextureFormat =
+    { bpp: 8, r: 0, g: 0, b: 0, a: 0, flags: DDPF_PALETTEINDEXED8 | DDPF_RGB };
+
+/**
+ * DXT1..DXT5 (DX6 and later — absent from the IDirect3DDevice2/DX5 list for that reason).
+ * A DDPF_FOURCC descriptor carries no masks and no bit count by contract; the block layout
+ * comes from the FourCC alone, and decodeSurfaceFormatToRgba8 routes it to the block decoder.
+ * Descriptor and ordering match a real driver's (Wine ddrawformat_from_wined3dformat:
+ * DDPF_FOURCC + dwFourCC, everything else zero; DXT last, after P8; absent from the DX5 list).
+ */
+const ENUM_TEXTURE_FORMATS_DXT: ReadonlyArray<EnumTextureFormat> = SUPPORTED_FOURCC_CODES.map(
+    (code) => ({ bpp: 0, r: 0, g: 0, b: 0, a: 0, flags: DDPF_FOURCC, fourCC: code })
+);
+
+/** DX6+ (IDirect3DDevice3 / IDirect3DDevice7). */
+const ENUM_TEXTURE_FORMATS: ReadonlyArray<EnumTextureFormat> = [
+    ...ENUM_TEXTURE_FORMATS_RGB, ENUM_TEXTURE_FORMAT_P8, ...ENUM_TEXTURE_FORMATS_DXT,
+];
+
+/** DX5 (IDirect3DDevice2) — no block-compressed formats existed yet. */
+const ENUM_TEXTURE_FORMATS_DX5: ReadonlyArray<EnumTextureFormat> = [
+    ...ENUM_TEXTURE_FORMATS_RGB, ENUM_TEXTURE_FORMAT_P8,
+];
 
 export const createDeviceExports = (
     context: DDrawContext,
@@ -276,15 +345,29 @@ export const createDeviceExports = (
         const lpViewport = args[1];
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         if (!obj) return D3D_OK;
-        if (!lpViewport || !isValidAddress(mem, lpViewport, 28)) return D3DERR_INVALIDCALL;
+        // D3DVIEWPORT7 is 24 bytes and has NO leading dwSize — unlike D3DVIEWPORT/D3DVIEWPORT2,
+        // which do (d3dtypes.h). Reading a size field here consumes dwX, shifts every field by
+        // one DWORD and hands back width/height of 0 for the overwhelmingly common x=0 viewport.
+        if (!lpViewport || !isValidAddress(mem, lpViewport, D3DVIEWPORT7_SIZE)) return D3DERR_INVALIDCALL;
         const view = getDataView(mem); // OPTIMIZED: Use cached DataView
-        const dwSize = Math.min(view.getUint32(lpViewport, true), 28);
-        const x = dwSize >= 8 ? view.getUint32(lpViewport + 4, true) : 0;
-        const y = dwSize >= 12 ? view.getUint32(lpViewport + 8, true) : 0;
-        const w = dwSize >= 16 ? view.getUint32(lpViewport + 12, true) : 0;
-        const h = dwSize >= 20 ? view.getUint32(lpViewport + 16, true) : 0;
-        const minZ = dwSize >= 24 ? view.getFloat32(lpViewport + 20, true) : 0;
-        const maxZ = dwSize >= 28 ? view.getFloat32(lpViewport + 24, true) : 1;
+        const x = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.x, true);
+        const y = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.y, true);
+        const w = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.width, true);
+        const h = view.getUint32(lpViewport + D3DVIEWPORT7_OFFSETS.height, true);
+        const minZ = view.getFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.minZ, true);
+        const maxZ = view.getFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.maxZ, true);
+        // The viewport must lie inside the render target; out of range leaves the previous
+        // viewport untouched (d3d_device7_SetViewport's wined3d_bound_range check).
+        const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
+        const rtState = rtAddr
+            ? (resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null)?.getState()
+            : null;
+        if (rtState && (x > rtState.width || w > rtState.width - x ||
+                        y > rtState.height || h > rtState.height - y)) {
+            Logger.warn(LogCategory.DDRAW,
+                `IDirect3DDevice7_SetViewport: out of range ${x},${y} ${w}x${h} for RT ${rtState.width}x${rtState.height}`);
+            return E_INVALIDARG;
+        }
         obj.setViewportData({ x, y, width: w, height: h, minZ, maxZ });
         Logger.verboseLazy(LogCategory.DDRAW, () => `IDirect3DDevice7_SetViewport: x=${x} y=${y} w=${w} h=${h}`);
         return D3D_OK;
@@ -295,18 +378,24 @@ export const createDeviceExports = (
         const lpViewport = args[1];
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         if (!obj) return D3DERR_INVALIDCALL;
-        if (!lpViewport || !isValidAddress(mem, lpViewport, 28)) return D3DERR_INVALIDCALL;
+        if (!lpViewport || !isValidAddress(mem, lpViewport, D3DVIEWPORT7_SIZE)) return D3DERR_INVALIDCALL;
         const vp = obj.getViewportData();
-        const x = vp?.x ?? 0, y = vp?.y ?? 0, w = vp?.width ?? 640, h = vp?.height ?? 480;
+        // Unset means the device still carries the viewport it was created with — the full
+        // render target, not a 640x480 guess.
+        const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
+        const rtState = rtAddr
+            ? (resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null)?.getState()
+            : null;
+        const x = vp?.x ?? 0, y = vp?.y ?? 0;
+        const w = vp?.width ?? rtState?.width ?? 0, h = vp?.height ?? rtState?.height ?? 0;
         const minZ = vp?.minZ ?? 0, maxZ = vp?.maxZ ?? 1;
         const view = getDataView(mem); // OPTIMIZED: Use cached DataView
-        view.setUint32(lpViewport, 28, true);
-        view.setUint32(lpViewport + 4, x, true);
-        view.setUint32(lpViewport + 8, y, true);
-        view.setUint32(lpViewport + 12, w, true);
-        view.setUint32(lpViewport + 16, h, true);
-        view.setFloat32(lpViewport + 20, minZ, true);
-        view.setFloat32(lpViewport + 24, maxZ, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.x, x, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.y, y, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.width, w, true);
+        view.setUint32(lpViewport + D3DVIEWPORT7_OFFSETS.height, h, true);
+        view.setFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.minZ, minZ, true);
+        view.setFloat32(lpViewport + D3DVIEWPORT7_OFFSETS.maxZ, maxZ, true);
         return D3D_OK;
     };
 
@@ -340,17 +429,26 @@ export const createDeviceExports = (
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         const rt = obj ? obj.getRenderTarget() : 0;
+        // GetRenderTarget increments the surface's reference count.
+        if (rt) resourceProvider.getComObjectByAddress(rt)?.addRef();
 
         const view = getDataView(mem); // OPTIMIZED: Use cached DataView
         view.setUint32(lplpRT, rt, true);
         return D3D_OK;
     };
 
-    type ParentD3Iface = "IDirect3D7" | "IDirect3D3";
+    type ParentD3Iface = "IDirect3D7" | "IDirect3D3" | "IDirect3D2" | "IDirect3D";
     const PARENT_D3_IID: Record<ParentD3Iface, string> = {
         IDirect3D7: IID_IDirect3D7,
         IDirect3D3: IID_IDirect3D3,
+        IDirect3D2: IID_IDirect3D2,
+        IDirect3D: IID_IDirect3D,
     };
+
+    /** Per device, the parent object handed out for each IDirect3D generation. IDirect3D v1
+     *  and IDirect3D3 are not an inheritance chain (v1 slot 7 is CreateViewport, v3 slot 7 is
+     *  FindDevice), so a device asked for both must return two different objects. */
+    const parentD3ByDevice = new WeakMap<object, Map<ParentD3Iface, number>>();
 
     const writeGetDirect3D = (
         deviceObj: Direct3DDevice7Object | Direct3DDevice3Object | null,
@@ -361,18 +459,68 @@ export const createDeviceExports = (
         if (!lplpDirect3D || !isValidAddress(mem, lplpDirect3D, 4)) return D3DERR_INVALIDCALL;
         initReturnPtr(lplpDirect3D);
 
-        let parentPtr = deviceObj?.getParentD3() ?? 0;
+        // Devices created from an IDirect3D tear-off keep the owning DirectDraw COM
+        // object as their parent. Resolve the requested D3D generation from that live
+        // owner instead of manufacturing a second object. Besides preserving COM
+        // identity, the owner holds the tear-off alive after the caller releases it.
+        //
+        // The old standalone cache stored only a guest address. Once the caller
+        // released that object, the allocator could reuse the address for an unrelated
+        // COM object; a later GetDirect3D then returned (and AddRef'd) that object.
+        const owningParentPtr = deviceObj?.getParentD3() ?? 0;
+        const owningParent = owningParentPtr
+            ? resourceProvider.getComObjectByAddress(owningParentPtr)
+            : null;
+        if (owningParent) {
+            const tearOffResult = resolveDDrawTearOff(
+                context,
+                owningParent,
+                PARENT_D3_IID[iface].toLowerCase(),
+                lplpDirect3D,
+                mem,
+            );
+            if (tearOffResult !== null) return tearOffResult;
+
+            const expectedVtable = context.vtables[iface]?.address;
+            if (expectedVtable && owningParent.vtableAddress === expectedVtable) {
+                owningParent.addRef(owningParentPtr);
+                getDataView(mem).setUint32(lplpDirect3D, owningParentPtr, true);
+                return D3D_OK;
+            }
+        }
+
+        let cache: Map<ParentD3Iface, number> | undefined;
+        if (deviceObj) {
+            cache = parentD3ByDevice.get(deviceObj);
+            if (!cache) {
+                cache = new Map();
+                parentD3ByDevice.set(deviceObj, cache);
+            }
+        }
+
+        let parentPtr = cache?.get(iface) ?? 0;
         if (parentPtr) {
             const parentObj = resourceProvider.getComObjectByAddress(parentPtr);
-            if (parentObj) parentObj.addRef();
-        } else {
+            const expectedVtable = context.vtables[iface]?.address;
+            if (parentObj && parentObj.vtableAddress === expectedVtable) {
+                parentObj.addRef(parentPtr);
+            } else {
+                // Never trust an address-only cache entry after its COM object died:
+                // guest COM allocations are reusable.
+                cache?.delete(iface);
+                parentPtr = 0;
+            }
+        }
+        if (!parentPtr) {
             const vtableAddr = context.vtables[iface]?.address;
             if (!vtableAddr) return D3DERR_INVALIDCALL;
             const parentObj = ComObjectFactory.create(PARENT_D3_IID[iface], vtableAddr);
             if (!parentObj) return D3DERR_INVALIDCALL;
             parentPtr = allocateComObject(context.process.memory, mem, vtableAddr);
             resourceProvider.mapAddressToHandle(parentPtr, parentObj.handle);
-            if (deviceObj) deviceObj.setParentD3(parentPtr);
+            cache?.set(iface, parentPtr);
+            // The device keeps a reference to whichever generation it produced first.
+            if (deviceObj && !deviceObj.getParentD3()) deviceObj.setParentD3(parentPtr);
         }
 
         getDataView(mem).setUint32(lplpDirect3D, parentPtr, true);
@@ -695,28 +843,12 @@ export const createDeviceExports = (
     exports["IDirect3DDevice7_EndScene"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         Logger.log(LogCategory.SYSTEM, `IDirect3DDevice7_EndScene: this=0x${thisPtr.toString(16)} - ending frame and resetting ring buffers`);
-        // If the game later calls Lock() on the RT (screenshots/postprocess on CPU), surface-sync must perform GPU->CPU sync so CPU reads current framebuffer.
-
-        // Mark render target as GPU dirty BEFORE endFrame to prevent next BeginScene from overwriting
-        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
-        if (obj) {
-            const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
-            if (rtAddr) {
-                const rtObj = resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null;
-                const state = rtObj?.getState();
-                if (state) {
-                    setAuthorityGpu(state, true);
-                    Logger.log(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: Marked RT 0x${rtAddr.toString(16)} modeStr=gpu`);
-                } else {
-                    Logger.warn(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: RT 0x${rtAddr.toString(16)} has no state!`);
-                }
-            } else {
-                Logger.warn(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: No RT found! getRenderTarget=${obj.getRenderTarget()} backBuffer=${context.surfaces.backBuffer} primary=${context.surfaces.primary}`);
-            }
-        } else {
-            Logger.warn(LogCategory.DDRAW, `IDirect3DDevice7_EndScene: Device object not found for this=0x${thisPtr.toString(16)}`);
-        }
-
+        // Do NOT setAuthorityGpu here. Real GPU writes already mark the RT
+        // (immediate draw / Clear / flushBatch when actualDrawCalls > 0). An
+        // unconditional bump on empty Begin/EndScene forces Lock into a full
+        // GPU→CPU readback of unchanged pixels and double-bumps scenes that drew.
+        // endFrame() flushes pending batches so authority is set before the guest
+        // can Lock after this call returns.
         if (context.executor) {
             context.executor.endFrame();
         }
@@ -1022,9 +1154,11 @@ export const createDeviceExports = (
             cur = identityMat4();
         }
 
-        // D3D row-vector convention: v' = v * M
-        // MultiplyTransform does: M = M * mul (current matrix multiplied by new matrix)
-        const res = multiplyMatrices(cur, mul);
+        // D3D row-vector convention (v' = v·M): the ARGUMENT is applied to the vertex
+        // first, then the matrix already in the state — M = mul · cur, not cur · mul.
+        // (Mirrors wined3d_stateblock_multiply_transform, and is what a GL wrapper's
+        // glMultMatrix maps to once transposed into D3D's row-vector form.)
+        const res = multiplyMatrices(mul, cur);
 
         obj.setTransform(state, res);
 
@@ -1335,22 +1469,7 @@ export const createDeviceExports = (
     exports["IDirect3DDevice3_EndScene"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_EndScene: this=0x${thisPtr.toString(16)} - ending frame and resetting ring buffers`);
-        // If the game later calls Lock() on the RT (screenshots/postprocess on CPU), surface-sync must perform GPU->CPU sync so CPU reads current framebuffer.
-
-        // Mark render target as GPU dirty BEFORE endFrame to prevent next BeginScene from overwriting
-        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
-        if (obj) {
-            const rtAddr = obj.getRenderTarget() || context.surfaces.backBuffer || context.surfaces.primary;
-            if (rtAddr) {
-                const rtObj = resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null;
-                const state = rtObj?.getState();
-                if (state) {
-                    setAuthorityGpu(state, true);
-                    Logger.verbose(LogCategory.DDRAW, `IDirect3DDevice3_EndScene: Marked RT 0x${rtAddr.toString(16)} modeStr=gpu`);
-                }
-            }
-        }
-
+        // Same as Device7: authority belongs to real GPU writes / flushBatch, not EndScene.
         if (context.executor) {
             context.executor.endFrame();
         }
@@ -1388,6 +1507,8 @@ export const createDeviceExports = (
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
         const rt = obj ? obj.getRenderTarget() : 0;
+        // GetRenderTarget increments the surface's reference count.
+        if (rt) resourceProvider.getComObjectByAddress(rt)?.addRef();
         const view = getDataView(mem);
         view.setUint32(lplpDDS, rt, true);
         return D3D_OK;
@@ -1411,6 +1532,8 @@ export const createDeviceExports = (
 
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
         const vp = obj ? obj.getCurrentViewport() : 0;
+        // GetCurrentViewport increments the viewport's reference count.
+        if (vp) resourceProvider.getComObjectByAddress(vp)?.addRef();
         const view = getDataView(mem);
         view.setUint32(lplpViewport, vp, true);
         return D3D_OK;
@@ -1492,8 +1615,8 @@ export const createDeviceExports = (
         }
 
         // D3D row-vector convention: v' = v * M
-        // MultiplyTransform does: M = M * mul
-        const res = multiplyMatrices(cur, mul);
+        // Argument first, then the stored matrix (see the Device7 note above).
+        const res = multiplyMatrices(mul, cur);
 
         obj.setTransform(state, res);
 
@@ -1800,12 +1923,29 @@ export const createDeviceExports = (
         const vpObj = resourceProvider.getComObjectByAddress(lpViewport) as Direct3DViewport3Object | null;
         if (vpObj) {
             vpObj.setDevice(thisPtr);
+            // The device's viewport list holds a reference until DeleteViewport.
+            vpObj.addRef();
         }
         Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_AddViewport: device=0x${thisPtr.toString(16)} vp=0x${lpViewport.toString(16)}`);
         return D3D_OK;
     };
 
-    Object.assign(exports, createDeviceStubsExports());
+    exports["IDirect3DDevice3_DeleteViewport"] = (ctx, mem, args) => {
+        const thisPtr = args[0];
+        const lpViewport = args[1];
+        const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
+        const vpObj = resourceProvider.getComObjectByAddress(lpViewport) as Direct3DViewport3Object | null;
+        if (!vpObj) return D3DERR_INVALIDCALL;
+        // Deleting the current viewport leaves the device with none (real behavior).
+        if (obj && obj.getCurrentViewport() === lpViewport) {
+            obj.setCurrentViewport(0);
+        }
+        vpObj.release();
+        Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_DeleteViewport: device=0x${thisPtr.toString(16)} vp=0x${lpViewport.toString(16)}`);
+        return D3D_OK;
+    };
+
+    assignStubsOnce(exports, createDeviceStubsExports(), "d3d device stubs");
 
     exports["IDirect3DDevice3_GetDirect3D"] = (_ctx, mem, args) => {
         const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
@@ -1883,18 +2023,7 @@ export const createDeviceExports = (
         const pfAddr = context.process.memory.alloc(pixelFormatSize);
         const view = getDataView(mem);
 
-        const formats = [
-            // ARGB1555 before XRGB1555: games needing alpha (foliage, particles) get it.
-            // Transparency for alpha=0 pixels is handled by blend state (SRCALPHA/INVSRCALPHA
-            // or additive ONE/ONE). When blending is disabled, the shader forces alpha=1.0
-            // to prevent black objects (tires) from appearing transparent.
-            { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // RGB565
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB1555
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // XRGB1555 (fallback if alpha rejected)
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB }, // X8R8G8B8
-            { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB4444
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // A8R8G8B8
-        ];
+        const formats = ENUM_TEXTURE_FORMATS;
 
         callbackManager.saveSuspendedThunkContext(ctx, 12);
         let index = 0;
@@ -1918,7 +2047,7 @@ export const createDeviceExports = (
             // DDPIXELFORMAT structure
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, pixelFormatSize, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags, f.flags, true);
-            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, 0, true);
+            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, f.fourCC ?? 0, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, f.bpp, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rMask, f.r, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.gMask, f.g, true);
@@ -1970,15 +2099,7 @@ export const createDeviceExports = (
         const pfAddr = context.process.memory.alloc(pixelFormatSize);
         const view = getDataView(mem);
 
-        const formats = [
-            // ARGB1555 before XRGB1555 — see Device3 comment for rationale.
-            { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // RGB565
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB1555
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB }, // XRGB1555 (fallback if alpha rejected)
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB }, // X8R8G8B8
-            { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // ARGB4444
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // A8R8G8B8
-        ];
+        const formats = ENUM_TEXTURE_FORMATS;
 
         callbackManager.saveSuspendedThunkContext(ctx, 12);
         let index = 0;
@@ -2002,7 +2123,7 @@ export const createDeviceExports = (
             // DDPIXELFORMAT structure
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size, pixelFormatSize, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags, f.flags, true);
-            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, 0, true);
+            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC, f.fourCC ?? 0, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, f.bpp, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rMask, f.r, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.gMask, f.g, true);
@@ -2039,8 +2160,129 @@ export const createDeviceExports = (
         return { value: 0, suspendedForCallback: true, callbackId: firstCallbackId || 0, stackCleanup: 12 };
     };
 
-    exports["IDirect3DDevice3_ValidateDevice"] = () => D3D_OK;
-    exports["IDirect3DDevice7_ValidateDevice"] = () => D3D_OK;
+    // ValidateDevice(LPDWORD lpdwPasses) — the pass count the CURRENT texture-stage setup
+    // would need. Our stage resolver evaluates every advertised D3DTOP in one shader
+    // (backends/webgpu/ddraw/ffp-stages.ts), so the answer is one pass — but it has to be
+    // WRITTEN: a D3D_OK over an untouched DWORD leaves the caller reading its own stack and
+    // deciding, from garbage, to split the material into passes it never needed.
+    const validateDevice: ThunkImplementation = (ctx, mem, args) => {
+        const lpdwPasses = args[1];
+        if (!lpdwPasses || !isValidAddress(mem, lpdwPasses, 4)) return D3DERR_INVALIDCALL;
+        getDataView(mem).setUint32(lpdwPasses, 1, true);
+        return D3D_OK;
+    };
+    exports["IDirect3DDevice3_ValidateDevice"] = validateDevice;
+    exports["IDirect3DDevice7_ValidateDevice"] = validateDevice;
+
+    // --- Clip status (D3DCLIPSTATUS: dwFlags, dwStatus, minx, maxx, miny, maxy, minz, maxz) ---
+    // SetClipStatus is a promise from the app about where its geometry lies; nothing in this
+    // renderer consumes it, so accepting it is faithful. GetClipStatus is the dangerous half:
+    // it is pure OUT, and the app reads the extents back to size its own 2D work.
+    const D3DCLIPSTATUS_SIZE = 32;
+    const D3DCLIPSTATUS_EXTENTS2 = 0x00000002;
+
+    const setClipStatus: ThunkImplementation = (ctx, mem, args) => {
+        const lpClipStatus = args[1];
+        if (!lpClipStatus || !isValidAddress(mem, lpClipStatus, D3DCLIPSTATUS_SIZE)) return D3DERR_INVALIDCALL;
+        return D3D_OK;
+    };
+
+    /** Screen extents of whatever viewport the device is currently rendering through. */
+    const deviceViewportExtents = (thisPtr: number): { x: number; y: number; w: number; h: number } => {
+        const obj = resourceProvider.getComObjectByAddress(thisPtr);
+        if (obj instanceof Direct3DDevice7Object) {
+            const vp = obj.getViewportData();
+            if (vp) return { x: vp.x, y: vp.y, w: vp.width, h: vp.height };
+        } else if (obj instanceof Direct3DDevice3Object) {
+            const vpAddr = obj.getCurrentViewport();
+            const vpObj = vpAddr
+                ? (resourceProvider.getComObjectByAddress(vpAddr) as Direct3DViewport3Object | null)
+                : null;
+            if (vpObj) {
+                const vp = vpObj.getViewport();
+                return { x: vp.x, y: vp.y, w: vp.width, h: vp.height };
+            }
+        }
+        const rtAddr = context.surfaces.backBuffer || context.surfaces.primary;
+        const rtState = rtAddr
+            ? (resourceProvider.getComObjectByAddress(rtAddr) as DirectDrawSurfaceObject | null)?.getState()
+            : null;
+        return { x: 0, y: 0, w: rtState?.width ?? 0, h: rtState?.height ?? 0 };
+    };
+
+    const getClipStatus: ThunkImplementation = (ctx, mem, args) => {
+        const lpClipStatus = args[1];
+        if (!lpClipStatus || !isValidAddress(mem, lpClipStatus, D3DCLIPSTATUS_SIZE)) return D3DERR_INVALIDCALL;
+        const { x, y, w, h } = deviceViewportExtents(args[0]);
+        const view = getDataView(mem);
+        // We do not accumulate per-draw clip results, so dwStatus is 0 (nothing was clipped)
+        // and the extents are the whole viewport — the widest honest answer, and the one that
+        // cannot make an app discard geometry it did draw.
+        view.setUint32(lpClipStatus + 0, D3DCLIPSTATUS_EXTENTS2, true);
+        view.setUint32(lpClipStatus + 4, 0, true);
+        view.setFloat32(lpClipStatus + 8, x, true);
+        view.setFloat32(lpClipStatus + 12, x + w, true);
+        view.setFloat32(lpClipStatus + 16, y, true);
+        view.setFloat32(lpClipStatus + 20, y + h, true);
+        view.setFloat32(lpClipStatus + 24, 0, true);
+        view.setFloat32(lpClipStatus + 28, 0, true);
+        return D3D_OK;
+    };
+
+    exports["IDirect3DDevice3_SetClipStatus"] = setClipStatus;
+    exports["IDirect3DDevice7_SetClipStatus"] = setClipStatus;
+    exports["IDirect3DDevice3_GetClipStatus"] = getClipStatus;
+    exports["IDirect3DDevice7_GetClipStatus"] = getClipStatus;
+
+    // --- ComputeSphereVisibility ---
+    // The DX6/DX7 visibility query: the app hands us bounding spheres in WORLD space and we
+    // classify each against the current frustum. It is pure OUT through lpdwReturnValues, and
+    // a D3D_OK over an untouched array is the worst shape of all — the engine reads its own
+    // stack as D3DVIS_OUTSIDE_* and drops objects that are on screen.
+    //
+    // The frustum planes come straight out of the combined world*view*projection matrix
+    // (a clip-space plane pulled back into world space is a row combination of that matrix),
+    // so the device already holds everything needed; no renderer state is involved.
+    const computeSphereVisibility = (
+        mem: Uint8Array, args: number[], legacyEncoding: boolean
+    ): number => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as
+            Direct3DDevice3Object | Direct3DDevice7Object | null;
+        const lpCenters = args[1];
+        const lpRadii = args[2];
+        const count = args[3] >>> 0;
+        const lpdwReturnValues = args[5];
+        if (!obj || !lpCenters || !lpRadii || !lpdwReturnValues) return D3DERR_INVALIDCALL;
+        if (count === 0) return D3D_OK;
+        if (!isValidAddress(mem, lpCenters, count * 12) ||
+            !isValidAddress(mem, lpRadii, count * 4) ||
+            !isValidAddress(mem, lpdwReturnValues, count * 4)) {
+            return D3DERR_INVALIDCALL;
+        }
+
+        const planes = frustumPlanesFromCombined(multiplyMatrices(
+            multiplyMatrices(obj.getWorldMatrix(), obj.getViewMatrix()),
+            obj.getProjMatrix()
+        ));
+        const view = getDataView(mem);
+        for (let s = 0; s < count; s++) {
+            const bits = sphereVisibilityBits(
+                planes,
+                view.getFloat32(lpCenters + s * 12, true),
+                view.getFloat32(lpCenters + s * 12 + 4, true),
+                view.getFloat32(lpCenters + s * 12 + 8, true),
+                view.getFloat32(lpRadii + s * 4, true),
+                legacyEncoding
+            );
+            view.setUint32(lpdwReturnValues + s * 4, legacyEncoding ? clipBitsToD3dVis(bits) : bits, true);
+        }
+        return D3D_OK;
+    };
+
+    exports["IDirect3DDevice3_ComputeSphereVisibility"] = (ctx, mem, args) =>
+        computeSphereVisibility(mem, args, true);
+    exports["IDirect3DDevice7_ComputeSphereVisibility"] = (ctx, mem, args) =>
+        computeSphereVisibility(mem, args, false);
 
     // --- IDirect3DDevice2 ---
     // Device2 vtable has SwapTextureHandles at index 4 (absent in Device3),
@@ -2052,7 +2294,7 @@ export const createDeviceExports = (
     // — the callback receives a full 108-byte DDSURFACEDESC with DDPIXELFORMAT embedded at offset 72.
     // DX6 IDirect3DDevice3::EnumTextureFormats callback: HRESULT CALLBACK(LPDDPIXELFORMAT, LPVOID)
     // — only the 32-byte pixel format struct is passed.
-    exports["IDirect3DDevice2_EnumTextureFormats"] = (ctx, mem, args) => {
+    const enumTextureFormatsDx5: ThunkImplementation = (ctx, mem, args) => {
         const lpCallback = args[1];
         const lpContext  = args[2];
 
@@ -2068,15 +2310,7 @@ export const createDeviceExports = (
         const sdAddr = context.process.memory.alloc(DDSURFACEDESC_SIZE);
         const view = getDataView(mem);
 
-        // Same format list as Device3 — Thief needs ARGB1555 and RGB565 to accept hardware mode.
-        const formats = [
-            { bpp: 16, r: 0xF800, g: 0x07E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                       // RGB565
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x8000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },    // ARGB1555
-            { bpp: 16, r: 0x7C00, g: 0x03E0, b: 0x001F, a: 0x0000, flags: DDPF_RGB },                       // XRGB1555
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0x00000000, flags: DDPF_RGB },        // X8R8G8B8
-            { bpp: 16, r: 0x0F00, g: 0x00F0, b: 0x000F, a: 0xF000, flags: DDPF_RGB | DDPF_ALPHAPIXELS },    // ARGB4444
-            { bpp: 32, r: 0x00FF0000, g: 0x0000FF00, b: 0x000000FF, a: 0xFF000000, flags: DDPF_RGB | DDPF_ALPHAPIXELS }, // A8R8G8B8
-        ];
+        const formats = ENUM_TEXTURE_FORMATS_DX5;
 
         callbackManager.saveSuspendedThunkContext(ctx, 12);
         let index = 0;
@@ -2105,7 +2339,7 @@ export const createDeviceExports = (
             const pfAddr = sdAddr + DDSURFACEDESC_OFFSETS.pixelFormat;
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.size,        32, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.flags,       f.flags, true);
-            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC,      0, true);
+            view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.fourCC,      f.fourCC ?? 0, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rgbBitCount, f.bpp, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.rMask,       f.r, true);
             view.setUint32(pfAddr + DDPIXELFORMAT_OFFSETS.gMask,       f.g, true);
@@ -2163,7 +2397,7 @@ export const createDeviceExports = (
     }
 
     const device2OnlyStubs = [
-        "GetStats", "DeleteViewport", "NextViewport", "GetDirect3D",
+        "GetStats", "DeleteViewport", "NextViewport",
         "Begin", "BeginIndexed", "Vertex", "Index", "End",
         "GetLightState", "SetLightState", "SetClipStatus", "GetClipStatus",
     ];
@@ -2176,6 +2410,38 @@ export const createDeviceExports = (
 
     // SwapTextureHandles (Device2-only, no Device3 equivalent) — stub
     exports["IDirect3DDevice2_SwapTextureHandles"] = () => D3D_OK;
+
+    // --- IDirect3DDevice (v1) ---
+    // The device a DX2/3-era title gets from IDirectDrawSurface::QueryInterface(IID_IDirect3D*Device).
+    // Backed by the same Device3 state object; only the vtable layout differs. Execute-buffer
+    // methods stay unregistered on purpose — an UNIMPLEMENTED stub names itself in stubs(),
+    // where a D3D_OK lie would send the guest off with a null buffer.
+    const device1Methods = [
+        "QueryInterface", "AddRef", "Release", "GetCaps",
+        "AddViewport", "DeleteViewport", "NextViewport",
+        "BeginScene", "EndScene",
+    ];
+    for (const method of device1Methods) {
+        const d3key = `IDirect3DDevice3_${method}`;
+        if (exports[d3key]) exports[`IDirect3DDevice_${method}`] = exports[d3key];
+    }
+    // GetDirect3D is NOT aliasable: a v1 device must hand back an IDirect3D, whose vtable
+    // is a different layout from IDirect3D3's, not merely a shorter prefix of it.
+    exports["IDirect3DDevice_GetDirect3D"] = (_ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
+        return writeGetDirect3D(obj, args[1], "IDirect3D", mem);
+    };
+    exports["IDirect3DDevice2_GetDirect3D"] = (_ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
+        return writeGetDirect3D(obj, args[1], "IDirect3D2", mem);
+    };
+    // v1 and Device2 share the DX5 LPDDSURFACEDESC enumeration callback.
+    exports["IDirect3DDevice2_EnumTextureFormats"] = enumTextureFormatsDx5;
+    exports["IDirect3DDevice_EnumTextureFormats"] = enumTextureFormatsDx5;
+    exports["IDirect3DDevice_SwapTextureHandles"] = () => D3D_OK;
+    exports["IDirect3DDevice_GetStats"] = () => D3D_OK;
+    // Initialize is a no-op for an already-created device (DDERR_ALREADYINITIALIZED).
+    exports["IDirect3DDevice_Initialize"] = () => 0x88760005; // MAKE_DDHRESULT(5)
 
     // Device2 draw calls take a D3DVERTEXTYPE enum (1=VERTEX, 2=LVERTEX, 3=TLVERTEX),
     // not an FVF. The Device3 handler would misread D3DVT_TLVERTEX=3 as FVF XYZ

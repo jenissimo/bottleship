@@ -408,6 +408,21 @@ export function registerMessageBoxExports(exports: Record<string, ThunkImplement
         return { value: result, stackCleanup: 16 };
     };
 
+    // MessageBoxEx* is MessageBox* with a trailing wLanguageId. We render one UI in the
+    // host's own locale, so the id only selects which resource strings USER would have
+    // used for the buttons — everything else, including the stack layout up to arg 3, is
+    // identical. Chain rather than duplicate: an unimplemented MessageBoxEx returns
+    // ERROR_NOT_SUPPORTED as if the user had clicked a button that does not exist.
+    exports['MessageBoxExA'] = async (ctx, mem, args) => {
+        const r = await (exports['MessageBoxA'] as (c: unknown, m: Uint8Array, a: number[]) => Promise<{ value: number }>)(ctx, mem, args);
+        return { value: r.value, stackCleanup: 20 };
+    };
+
+    exports['MessageBoxExW'] = async (ctx, mem, args) => {
+        const r = await (exports['MessageBoxW'] as (c: unknown, m: Uint8Array, a: number[]) => Promise<{ value: number }>)(ctx, mem, args);
+        return { value: r.value, stackCleanup: 20 };
+    };
+
     exports['MessageBoxIndirectA'] = async (ctx, mem, args) => {
         const lpmbp = args[0];
         if (!lpmbp || lpmbp + 40 > mem.length) {

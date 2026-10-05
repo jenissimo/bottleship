@@ -1,0 +1,2222 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.872Z",
+  "module": "advapi32",
+  "functions": [
+    {
+      "name": "A_SHAFinal",
+      "argCount": 2
+    },
+    {
+      "name": "A_SHAInit",
+      "argCount": 1
+    },
+    {
+      "name": "A_SHAUpdate",
+      "argCount": 3
+    },
+    {
+      "name": "AbortSystemShutdownA",
+      "argCount": 1
+    },
+    {
+      "name": "AbortSystemShutdownW",
+      "argCount": 1
+    },
+    {
+      "name": "AccessCheck",
+      "argCount": 8
+    },
+    {
+      "name": "AccessCheckAndAuditAlarmA",
+      "argCount": 11
+    },
+    {
+      "name": "AccessCheckAndAuditAlarmW",
+      "argCount": 11
+    },
+    {
+      "name": "AccessCheckByType",
+      "argCount": 11
+    },
+    {
+      "name": "AddAccessAllowedAce",
+      "argCount": 4
+    },
+    {
+      "name": "AddAccessAllowedAceEx",
+      "argCount": 5
+    },
+    {
+      "name": "AddAccessAllowedObjectAce",
+      "argCount": 7
+    },
+    {
+      "name": "AddAccessDeniedAce",
+      "argCount": 4
+    },
+    {
+      "name": "AddAccessDeniedAceEx",
+      "argCount": 5
+    },
+    {
+      "name": "AddAccessDeniedObjectAce",
+      "argCount": 7
+    },
+    {
+      "name": "AddAce",
+      "argCount": 5
+    },
+    {
+      "name": "AddAuditAccessAce",
+      "argCount": 6
+    },
+    {
+      "name": "AddAuditAccessAceEx",
+      "argCount": 7
+    },
+    {
+      "name": "AddAuditAccessObjectAce",
+      "argCount": 9
+    },
+    {
+      "name": "AddConditionalAce",
+      "argCount": 8
+    },
+    {
+      "name": "AddMandatoryAce",
+      "argCount": 5
+    },
+    {
+      "name": "AdjustTokenGroups",
+      "argCount": 6
+    },
+    {
+      "name": "AdjustTokenPrivileges",
+      "argCount": 6
+    },
+    {
+      "name": "AllocateAndInitializeSid",
+      "argCount": 11
+    },
+    {
+      "name": "AllocateLocallyUniqueId",
+      "argCount": 1
+    },
+    {
+      "name": "AreAllAccessesGranted",
+      "argCount": 2
+    },
+    {
+      "name": "AreAnyAccessesGranted",
+      "argCount": 2
+    },
+    {
+      "name": "AuditQuerySystemPolicy",
+      "argCount": 3
+    },
+    {
+      "name": "BackupEventLogA",
+      "argCount": 2
+    },
+    {
+      "name": "BackupEventLogW",
+      "argCount": 2
+    },
+    {
+      "name": "BuildExplicitAccessWithNameA",
+      "argCount": 5
+    },
+    {
+      "name": "BuildExplicitAccessWithNameW",
+      "argCount": 5
+    },
+    {
+      "name": "BuildSecurityDescriptorA",
+      "argCount": 9
+    },
+    {
+      "name": "BuildSecurityDescriptorW",
+      "argCount": 9
+    },
+    {
+      "name": "BuildTrusteeWithNameA",
+      "argCount": 2
+    },
+    {
+      "name": "BuildTrusteeWithNameW",
+      "argCount": 2
+    },
+    {
+      "name": "BuildTrusteeWithObjectsAndNameA",
+      "argCount": 6
+    },
+    {
+      "name": "BuildTrusteeWithObjectsAndNameW",
+      "argCount": 6
+    },
+    {
+      "name": "BuildTrusteeWithObjectsAndSidA",
+      "argCount": 5
+    },
+    {
+      "name": "BuildTrusteeWithObjectsAndSidW",
+      "argCount": 5
+    },
+    {
+      "name": "BuildTrusteeWithSidA",
+      "argCount": 2
+    },
+    {
+      "name": "BuildTrusteeWithSidW",
+      "argCount": 2
+    },
+    {
+      "name": "ChangeServiceConfig2A",
+      "argCount": 3
+    },
+    {
+      "name": "ChangeServiceConfig2W",
+      "argCount": 3
+    },
+    {
+      "name": "ChangeServiceConfigA",
+      "argCount": 11
+    },
+    {
+      "name": "ChangeServiceConfigW",
+      "argCount": 11
+    },
+    {
+      "name": "CheckTokenMembership",
+      "argCount": 3
+    },
+    {
+      "name": "ClearEventLogA",
+      "argCount": 2
+    },
+    {
+      "name": "ClearEventLogW",
+      "argCount": 2
+    },
+    {
+      "name": "CloseEncryptedFileRaw",
+      "argCount": 1
+    },
+    {
+      "name": "CloseEventLog",
+      "argCount": 1
+    },
+    {
+      "name": "CloseServiceHandle",
+      "argCount": 1
+    },
+    {
+      "name": "CloseTrace",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "CommandLineFromMsiDescriptor",
+      "argCount": 3
+    },
+    {
+      "name": "ControlService",
+      "argCount": 3
+    },
+    {
+      "name": "ControlTraceA",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ControlTraceW",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "ConvertSecurityDescriptorToStringSecurityDescriptorA",
+      "argCount": 5
+    },
+    {
+      "name": "ConvertSecurityDescriptorToStringSecurityDescriptorW",
+      "argCount": 5
+    },
+    {
+      "name": "ConvertSidToStringSidA",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertSidToStringSidW",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertStringSecurityDescriptorToSecurityDescriptorA",
+      "argCount": 4
+    },
+    {
+      "name": "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+      "argCount": 4
+    },
+    {
+      "name": "ConvertStringSidToSidA",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertStringSidToSidW",
+      "argCount": 2
+    },
+    {
+      "name": "ConvertToAutoInheritPrivateObjectSecurity",
+      "argCount": 6
+    },
+    {
+      "name": "CopySid",
+      "argCount": 3
+    },
+    {
+      "name": "CreatePrivateObjectSecurity",
+      "argCount": 6
+    },
+    {
+      "name": "CreatePrivateObjectSecurityEx",
+      "argCount": 8
+    },
+    {
+      "name": "CreatePrivateObjectSecurityWithMultipleInheritance",
+      "argCount": 9
+    },
+    {
+      "name": "CreateProcessAsUserA",
+      "argCount": 11
+    },
+    {
+      "name": "CreateProcessAsUserW",
+      "argCount": 11
+    },
+    {
+      "name": "CreateProcessWithLogonW",
+      "argCount": 11
+    },
+    {
+      "name": "CreateProcessWithTokenW",
+      "argCount": 9
+    },
+    {
+      "name": "CreateRestrictedToken",
+      "argCount": 9
+    },
+    {
+      "name": "CreateServiceA",
+      "argCount": 13
+    },
+    {
+      "name": "CreateServiceW",
+      "argCount": 13
+    },
+    {
+      "name": "CreateWellKnownSid",
+      "argCount": 4
+    },
+    {
+      "name": "CredDeleteA",
+      "argCount": 3
+    },
+    {
+      "name": "CredDeleteW",
+      "argCount": 3
+    },
+    {
+      "name": "CredEnumerateA",
+      "argCount": 4
+    },
+    {
+      "name": "CredEnumerateW",
+      "argCount": 4
+    },
+    {
+      "name": "CredFree",
+      "argCount": 1
+    },
+    {
+      "name": "CredGetSessionTypes",
+      "argCount": 2
+    },
+    {
+      "name": "CredIsMarshaledCredentialA",
+      "argCount": 1
+    },
+    {
+      "name": "CredIsMarshaledCredentialW",
+      "argCount": 1
+    },
+    {
+      "name": "CredMarshalCredentialA",
+      "argCount": 3
+    },
+    {
+      "name": "CredMarshalCredentialW",
+      "argCount": 3
+    },
+    {
+      "name": "CredReadA",
+      "argCount": 4
+    },
+    {
+      "name": "CredReadDomainCredentialsA",
+      "argCount": 4
+    },
+    {
+      "name": "CredReadDomainCredentialsW",
+      "argCount": 4
+    },
+    {
+      "name": "CredReadW",
+      "argCount": 4
+    },
+    {
+      "name": "CredUnmarshalCredentialA",
+      "argCount": 3
+    },
+    {
+      "name": "CredUnmarshalCredentialW",
+      "argCount": 3
+    },
+    {
+      "name": "CredWriteA",
+      "argCount": 2
+    },
+    {
+      "name": "CredWriteW",
+      "argCount": 2
+    },
+    {
+      "name": "CryptAcquireContextA",
+      "argCount": 5
+    },
+    {
+      "name": "CryptAcquireContextW",
+      "argCount": 5
+    },
+    {
+      "name": "CryptContextAddRef",
+      "argCount": 3
+    },
+    {
+      "name": "CryptCreateHash",
+      "argCount": 5
+    },
+    {
+      "name": "CryptDecrypt",
+      "argCount": 6
+    },
+    {
+      "name": "CryptDeriveKey",
+      "argCount": 5
+    },
+    {
+      "name": "CryptDestroyHash",
+      "argCount": 1
+    },
+    {
+      "name": "CryptDestroyKey",
+      "argCount": 1
+    },
+    {
+      "name": "CryptDuplicateHash",
+      "argCount": 4
+    },
+    {
+      "name": "CryptDuplicateKey",
+      "argCount": 4
+    },
+    {
+      "name": "CryptEncrypt",
+      "argCount": 7
+    },
+    {
+      "name": "CryptEnumProvidersA",
+      "argCount": 6
+    },
+    {
+      "name": "CryptEnumProvidersW",
+      "argCount": 6
+    },
+    {
+      "name": "CryptEnumProviderTypesA",
+      "argCount": 6
+    },
+    {
+      "name": "CryptEnumProviderTypesW",
+      "argCount": 6
+    },
+    {
+      "name": "CryptExportKey",
+      "argCount": 6
+    },
+    {
+      "name": "CryptGenKey",
+      "argCount": 4
+    },
+    {
+      "name": "CryptGenRandom",
+      "argCount": 3
+    },
+    {
+      "name": "CryptGetDefaultProviderA",
+      "argCount": 5
+    },
+    {
+      "name": "CryptGetDefaultProviderW",
+      "argCount": 5
+    },
+    {
+      "name": "CryptGetHashParam",
+      "argCount": 5
+    },
+    {
+      "name": "CryptGetKeyParam",
+      "argCount": 5
+    },
+    {
+      "name": "CryptGetProvParam",
+      "argCount": 5
+    },
+    {
+      "name": "CryptGetUserKey",
+      "argCount": 3
+    },
+    {
+      "name": "CryptHashData",
+      "argCount": 4
+    },
+    {
+      "name": "CryptHashSessionKey",
+      "argCount": 3
+    },
+    {
+      "name": "CryptImportKey",
+      "argCount": 6
+    },
+    {
+      "name": "CryptReleaseContext",
+      "argCount": 2
+    },
+    {
+      "name": "CryptSetHashParam",
+      "argCount": 4
+    },
+    {
+      "name": "CryptSetKeyParam",
+      "argCount": 4
+    },
+    {
+      "name": "CryptSetProviderA",
+      "argCount": 2
+    },
+    {
+      "name": "CryptSetProviderExA",
+      "argCount": 4
+    },
+    {
+      "name": "CryptSetProviderExW",
+      "argCount": 4
+    },
+    {
+      "name": "CryptSetProviderW",
+      "argCount": 2
+    },
+    {
+      "name": "CryptSetProvParam",
+      "argCount": 4
+    },
+    {
+      "name": "CryptSignHashA",
+      "argCount": 6
+    },
+    {
+      "name": "CryptSignHashW",
+      "argCount": 6
+    },
+    {
+      "name": "CryptVerifySignatureA",
+      "argCount": 6
+    },
+    {
+      "name": "CryptVerifySignatureW",
+      "argCount": 6
+    },
+    {
+      "name": "DecryptFileA",
+      "argCount": 2
+    },
+    {
+      "name": "DecryptFileW",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteAce",
+      "argCount": 2
+    },
+    {
+      "name": "DeleteService",
+      "argCount": 1
+    },
+    {
+      "name": "DeregisterEventSource",
+      "argCount": 1
+    },
+    {
+      "name": "DestroyPrivateObjectSecurity",
+      "argCount": 1
+    },
+    {
+      "name": "DuplicateToken",
+      "argCount": 3
+    },
+    {
+      "name": "DuplicateTokenEx",
+      "argCount": 6
+    },
+    {
+      "name": "EnableTrace",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EnableTraceEx",
+      "argCount": 12,
+      "note": "slot count exceeds parameter count (int64, int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EnableTraceEx2",
+      "argCount": 11,
+      "note": "slot count exceeds parameter count (int64, int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EncryptFileA",
+      "argCount": 1
+    },
+    {
+      "name": "EncryptFileW",
+      "argCount": 1
+    },
+    {
+      "name": "EnumDependentServicesA",
+      "argCount": 6
+    },
+    {
+      "name": "EnumDependentServicesW",
+      "argCount": 6
+    },
+    {
+      "name": "EnumDynamicTimeZoneInformation",
+      "argCount": 2
+    },
+    {
+      "name": "EnumerateTraceGuids",
+      "argCount": 3
+    },
+    {
+      "name": "EnumerateTraceGuidsEx",
+      "argCount": 6
+    },
+    {
+      "name": "EnumServicesStatusA",
+      "argCount": 8
+    },
+    {
+      "name": "EnumServicesStatusExA",
+      "argCount": 10
+    },
+    {
+      "name": "EnumServicesStatusExW",
+      "argCount": 10
+    },
+    {
+      "name": "EnumServicesStatusW",
+      "argCount": 8
+    },
+    {
+      "name": "EqualDomainSid",
+      "argCount": 3
+    },
+    {
+      "name": "EqualPrefixSid",
+      "argCount": 2
+    },
+    {
+      "name": "EqualSid",
+      "argCount": 2
+    },
+    {
+      "name": "EventActivityIdControl",
+      "argCount": 2
+    },
+    {
+      "name": "EventEnabled",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EventProviderEnabled",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EventRegister",
+      "argCount": 4
+    },
+    {
+      "name": "EventSetInformation",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EventUnregister",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EventWrite",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "EventWriteEx",
+      "argCount": 10,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EventWriteString",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64, int64 occupy two slots each)"
+    },
+    {
+      "name": "EventWriteTransfer",
+      "argCount": 7,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "FileEncryptionStatusA",
+      "argCount": 2
+    },
+    {
+      "name": "FileEncryptionStatusW",
+      "argCount": 2
+    },
+    {
+      "name": "FindFirstFreeAce",
+      "argCount": 2
+    },
+    {
+      "name": "FlushTraceA",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "FlushTraceW",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "FreeSid",
+      "argCount": 1
+    },
+    {
+      "name": "GetAce",
+      "argCount": 3
+    },
+    {
+      "name": "GetAclInformation",
+      "argCount": 4
+    },
+    {
+      "name": "GetAuditedPermissionsFromAclA",
+      "argCount": 4
+    },
+    {
+      "name": "GetAuditedPermissionsFromAclW",
+      "argCount": 4
+    },
+    {
+      "name": "GetCurrentHwProfileA",
+      "argCount": 1
+    },
+    {
+      "name": "GetCurrentHwProfileW",
+      "argCount": 1
+    },
+    {
+      "name": "GetDynamicTimeZoneInformationEffectiveYears",
+      "argCount": 3
+    },
+    {
+      "name": "GetEffectiveRightsFromAclA",
+      "argCount": 3
+    },
+    {
+      "name": "GetEffectiveRightsFromAclW",
+      "argCount": 3
+    },
+    {
+      "name": "GetEventLogInformation",
+      "argCount": 5
+    },
+    {
+      "name": "GetExplicitEntriesFromAclA",
+      "argCount": 3
+    },
+    {
+      "name": "GetExplicitEntriesFromAclW",
+      "argCount": 3
+    },
+    {
+      "name": "GetFileSecurityA",
+      "argCount": 5
+    },
+    {
+      "name": "GetFileSecurityW",
+      "argCount": 5
+    },
+    {
+      "name": "GetKernelObjectSecurity",
+      "argCount": 5
+    },
+    {
+      "name": "GetLengthSid",
+      "argCount": 1
+    },
+    {
+      "name": "GetNamedSecurityInfoA",
+      "argCount": 8
+    },
+    {
+      "name": "GetNamedSecurityInfoExA",
+      "argCount": 9
+    },
+    {
+      "name": "GetNamedSecurityInfoExW",
+      "argCount": 9
+    },
+    {
+      "name": "GetNamedSecurityInfoW",
+      "argCount": 8
+    },
+    {
+      "name": "GetNumberOfEventLogRecords",
+      "argCount": 2
+    },
+    {
+      "name": "GetOldestEventLogRecord",
+      "argCount": 2
+    },
+    {
+      "name": "GetPrivateObjectSecurity",
+      "argCount": 5
+    },
+    {
+      "name": "GetSecurityDescriptorControl",
+      "argCount": 3
+    },
+    {
+      "name": "GetSecurityDescriptorDacl",
+      "argCount": 4
+    },
+    {
+      "name": "GetSecurityDescriptorGroup",
+      "argCount": 3
+    },
+    {
+      "name": "GetSecurityDescriptorLength",
+      "argCount": 1
+    },
+    {
+      "name": "GetSecurityDescriptorOwner",
+      "argCount": 3
+    },
+    {
+      "name": "GetSecurityDescriptorSacl",
+      "argCount": 4
+    },
+    {
+      "name": "GetSecurityInfo",
+      "argCount": 8
+    },
+    {
+      "name": "GetSecurityInfoExA",
+      "argCount": 9
+    },
+    {
+      "name": "GetSecurityInfoExW",
+      "argCount": 9
+    },
+    {
+      "name": "GetServiceDisplayNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetServiceDisplayNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetServiceKeyNameA",
+      "argCount": 4
+    },
+    {
+      "name": "GetServiceKeyNameW",
+      "argCount": 4
+    },
+    {
+      "name": "GetSidIdentifierAuthority",
+      "argCount": 1
+    },
+    {
+      "name": "GetSidLengthRequired",
+      "argCount": 1
+    },
+    {
+      "name": "GetSidSubAuthority",
+      "argCount": 2
+    },
+    {
+      "name": "GetSidSubAuthorityCount",
+      "argCount": 1
+    },
+    {
+      "name": "GetThreadWaitChain",
+      "argCount": 7
+    },
+    {
+      "name": "GetTokenInformation",
+      "argCount": 5
+    },
+    {
+      "name": "GetTraceEnableFlags",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "GetTraceEnableLevel",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "GetTraceLoggerHandle",
+      "argCount": 1
+    },
+    {
+      "name": "GetTrusteeFormA",
+      "argCount": 1
+    },
+    {
+      "name": "GetTrusteeFormW",
+      "argCount": 1
+    },
+    {
+      "name": "GetTrusteeNameA",
+      "argCount": 1
+    },
+    {
+      "name": "GetTrusteeNameW",
+      "argCount": 1
+    },
+    {
+      "name": "GetTrusteeTypeA",
+      "argCount": 1
+    },
+    {
+      "name": "GetTrusteeTypeW",
+      "argCount": 1
+    },
+    {
+      "name": "GetUserNameA",
+      "argCount": 2
+    },
+    {
+      "name": "GetUserNameW",
+      "argCount": 2
+    },
+    {
+      "name": "GetWindowsAccountDomainSid",
+      "argCount": 3
+    },
+    {
+      "name": "ImpersonateAnonymousToken",
+      "argCount": 1
+    },
+    {
+      "name": "ImpersonateLoggedOnUser",
+      "argCount": 1
+    },
+    {
+      "name": "ImpersonateNamedPipeClient",
+      "argCount": 1
+    },
+    {
+      "name": "ImpersonateSelf",
+      "argCount": 1
+    },
+    {
+      "name": "InitializeAcl",
+      "argCount": 3
+    },
+    {
+      "name": "InitializeSecurityDescriptor",
+      "argCount": 2
+    },
+    {
+      "name": "InitializeSid",
+      "argCount": 3
+    },
+    {
+      "name": "InitiateShutdownA",
+      "argCount": 5
+    },
+    {
+      "name": "InitiateShutdownW",
+      "argCount": 5
+    },
+    {
+      "name": "InitiateSystemShutdownA",
+      "argCount": 5
+    },
+    {
+      "name": "InitiateSystemShutdownExA",
+      "argCount": 6
+    },
+    {
+      "name": "InitiateSystemShutdownExW",
+      "argCount": 6
+    },
+    {
+      "name": "InitiateSystemShutdownW",
+      "argCount": 5
+    },
+    {
+      "name": "IsTextUnicode",
+      "argCount": 3
+    },
+    {
+      "name": "IsTokenRestricted",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidAcl",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidSecurityDescriptor",
+      "argCount": 1
+    },
+    {
+      "name": "IsValidSid",
+      "argCount": 1
+    },
+    {
+      "name": "IsWellKnownSid",
+      "argCount": 2
+    },
+    {
+      "name": "LockServiceDatabase",
+      "argCount": 1
+    },
+    {
+      "name": "LogonUserA",
+      "argCount": 6
+    },
+    {
+      "name": "LogonUserW",
+      "argCount": 6
+    },
+    {
+      "name": "LookupAccountNameA",
+      "argCount": 7
+    },
+    {
+      "name": "LookupAccountNameW",
+      "argCount": 7
+    },
+    {
+      "name": "LookupAccountSidA",
+      "argCount": 7
+    },
+    {
+      "name": "LookupAccountSidLocalA",
+      "argCount": 6
+    },
+    {
+      "name": "LookupAccountSidLocalW",
+      "argCount": 6
+    },
+    {
+      "name": "LookupAccountSidW",
+      "argCount": 7
+    },
+    {
+      "name": "LookupPrivilegeDisplayNameA",
+      "argCount": 5
+    },
+    {
+      "name": "LookupPrivilegeDisplayNameW",
+      "argCount": 5
+    },
+    {
+      "name": "LookupPrivilegeNameA",
+      "argCount": 4
+    },
+    {
+      "name": "LookupPrivilegeNameW",
+      "argCount": 4
+    },
+    {
+      "name": "LookupPrivilegeValueA",
+      "argCount": 3
+    },
+    {
+      "name": "LookupPrivilegeValueW",
+      "argCount": 3
+    },
+    {
+      "name": "LookupSecurityDescriptorPartsA",
+      "argCount": 7
+    },
+    {
+      "name": "LookupSecurityDescriptorPartsW",
+      "argCount": 7
+    },
+    {
+      "name": "LsaAddAccountRights",
+      "argCount": 4
+    },
+    {
+      "name": "LsaClose",
+      "argCount": 1
+    },
+    {
+      "name": "LsaCreateTrustedDomainEx",
+      "argCount": 5
+    },
+    {
+      "name": "LsaDeleteTrustedDomain",
+      "argCount": 2
+    },
+    {
+      "name": "LsaEnumerateAccountRights",
+      "argCount": 4
+    },
+    {
+      "name": "LsaEnumerateAccounts",
+      "argCount": 5
+    },
+    {
+      "name": "LsaEnumerateAccountsWithUserRight",
+      "argCount": 4
+    },
+    {
+      "name": "LsaEnumerateTrustedDomains",
+      "argCount": 5
+    },
+    {
+      "name": "LsaEnumerateTrustedDomainsEx",
+      "argCount": 5
+    },
+    {
+      "name": "LsaFreeMemory",
+      "argCount": 1
+    },
+    {
+      "name": "LsaGetUserName",
+      "argCount": 2
+    },
+    {
+      "name": "LsaLookupNames",
+      "argCount": 5
+    },
+    {
+      "name": "LsaLookupNames2",
+      "argCount": 6
+    },
+    {
+      "name": "LsaLookupPrivilegeDisplayName",
+      "argCount": 4
+    },
+    {
+      "name": "LsaLookupPrivilegeName",
+      "argCount": 3
+    },
+    {
+      "name": "LsaLookupSids",
+      "argCount": 5
+    },
+    {
+      "name": "LsaNtStatusToWinError",
+      "argCount": 1
+    },
+    {
+      "name": "LsaOpenPolicy",
+      "argCount": 4
+    },
+    {
+      "name": "LsaOpenTrustedDomainByName",
+      "argCount": 4
+    },
+    {
+      "name": "LsaQueryInformationPolicy",
+      "argCount": 3
+    },
+    {
+      "name": "LsaQueryTrustedDomainInfo",
+      "argCount": 4
+    },
+    {
+      "name": "LsaQueryTrustedDomainInfoByName",
+      "argCount": 4
+    },
+    {
+      "name": "LsaRegisterPolicyChangeNotification",
+      "argCount": 2
+    },
+    {
+      "name": "LsaRemoveAccountRights",
+      "argCount": 5
+    },
+    {
+      "name": "LsaRetrievePrivateData",
+      "argCount": 3
+    },
+    {
+      "name": "LsaSetInformationPolicy",
+      "argCount": 3
+    },
+    {
+      "name": "LsaSetSecret",
+      "argCount": 3
+    },
+    {
+      "name": "LsaSetTrustedDomainInfoByName",
+      "argCount": 4
+    },
+    {
+      "name": "LsaSetTrustedDomainInformation",
+      "argCount": 4
+    },
+    {
+      "name": "LsaStorePrivateData",
+      "argCount": 3
+    },
+    {
+      "name": "LsaUnregisterPolicyChangeNotification",
+      "argCount": 2
+    },
+    {
+      "name": "MakeAbsoluteSD",
+      "argCount": 11
+    },
+    {
+      "name": "MakeSelfRelativeSD",
+      "argCount": 3
+    },
+    {
+      "name": "MapGenericMask",
+      "argCount": 2
+    },
+    {
+      "name": "MD4Final",
+      "argCount": 1
+    },
+    {
+      "name": "MD4Init",
+      "argCount": 1
+    },
+    {
+      "name": "MD4Update",
+      "argCount": 3
+    },
+    {
+      "name": "MD5Final",
+      "argCount": 1
+    },
+    {
+      "name": "MD5Init",
+      "argCount": 1
+    },
+    {
+      "name": "MD5Update",
+      "argCount": 3
+    },
+    {
+      "name": "NotifyBootConfigStatus",
+      "argCount": 1
+    },
+    {
+      "name": "NotifyChangeEventLog",
+      "argCount": 2
+    },
+    {
+      "name": "NotifyServiceStatusChangeW",
+      "argCount": 3
+    },
+    {
+      "name": "ObjectCloseAuditAlarmA",
+      "argCount": 3
+    },
+    {
+      "name": "ObjectCloseAuditAlarmW",
+      "argCount": 3
+    },
+    {
+      "name": "ObjectDeleteAuditAlarmW",
+      "argCount": 3
+    },
+    {
+      "name": "ObjectOpenAuditAlarmA",
+      "argCount": 12
+    },
+    {
+      "name": "ObjectOpenAuditAlarmW",
+      "argCount": 12
+    },
+    {
+      "name": "ObjectPrivilegeAuditAlarmA",
+      "argCount": 6
+    },
+    {
+      "name": "ObjectPrivilegeAuditAlarmW",
+      "argCount": 6
+    },
+    {
+      "name": "OpenBackupEventLogA",
+      "argCount": 2
+    },
+    {
+      "name": "OpenBackupEventLogW",
+      "argCount": 2
+    },
+    {
+      "name": "OpenEncryptedFileRawA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenEncryptedFileRawW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenEventLogA",
+      "argCount": 2
+    },
+    {
+      "name": "OpenEventLogW",
+      "argCount": 2
+    },
+    {
+      "name": "OpenProcessToken",
+      "argCount": 3
+    },
+    {
+      "name": "OpenSCManagerA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenSCManagerW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenServiceA",
+      "argCount": 3
+    },
+    {
+      "name": "OpenServiceW",
+      "argCount": 3
+    },
+    {
+      "name": "OpenThreadToken",
+      "argCount": 4
+    },
+    {
+      "name": "OpenThreadWaitChainSession",
+      "argCount": 2
+    },
+    {
+      "name": "OpenTraceA",
+      "argCount": 1
+    },
+    {
+      "name": "OpenTraceW",
+      "argCount": 1
+    },
+    {
+      "name": "PerfAddCounters",
+      "argCount": 3
+    },
+    {
+      "name": "PerfCloseQueryHandle",
+      "argCount": 1
+    },
+    {
+      "name": "PerfCreateInstance",
+      "argCount": 4
+    },
+    {
+      "name": "PerfDeleteInstance",
+      "argCount": 2
+    },
+    {
+      "name": "PerfOpenQueryHandle",
+      "argCount": 2
+    },
+    {
+      "name": "PerfQueryCounterData",
+      "argCount": 4
+    },
+    {
+      "name": "PerfSetCounterRefValue",
+      "argCount": 4
+    },
+    {
+      "name": "PerfSetCounterSetInfo",
+      "argCount": 3
+    },
+    {
+      "name": "PerfSetULongCounterValue",
+      "argCount": 4
+    },
+    {
+      "name": "PerfSetULongLongCounterValue",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "PerfStartProvider",
+      "argCount": 3
+    },
+    {
+      "name": "PerfStartProviderEx",
+      "argCount": 3
+    },
+    {
+      "name": "PerfStopProvider",
+      "argCount": 1
+    },
+    {
+      "name": "PrivilegeCheck",
+      "argCount": 3
+    },
+    {
+      "name": "PrivilegedServiceAuditAlarmA",
+      "argCount": 5
+    },
+    {
+      "name": "PrivilegedServiceAuditAlarmW",
+      "argCount": 5
+    },
+    {
+      "name": "ProcessTrace",
+      "argCount": 4
+    },
+    {
+      "name": "QueryAllTracesA",
+      "argCount": 3
+    },
+    {
+      "name": "QueryAllTracesW",
+      "argCount": 3
+    },
+    {
+      "name": "QueryServiceConfig2A",
+      "argCount": 5
+    },
+    {
+      "name": "QueryServiceConfig2W",
+      "argCount": 5
+    },
+    {
+      "name": "QueryServiceConfigA",
+      "argCount": 4
+    },
+    {
+      "name": "QueryServiceConfigW",
+      "argCount": 4
+    },
+    {
+      "name": "QueryServiceLockStatusA",
+      "argCount": 4
+    },
+    {
+      "name": "QueryServiceLockStatusW",
+      "argCount": 4
+    },
+    {
+      "name": "QueryServiceObjectSecurity",
+      "argCount": 5
+    },
+    {
+      "name": "QueryServiceStatus",
+      "argCount": 2
+    },
+    {
+      "name": "QueryServiceStatusEx",
+      "argCount": 5
+    },
+    {
+      "name": "QueryTraceA",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "QueryTraceW",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "QueryWindows31FilesMigration",
+      "argCount": 1
+    },
+    {
+      "name": "ReadEncryptedFileRaw",
+      "argCount": 3
+    },
+    {
+      "name": "ReadEventLogA",
+      "argCount": 7
+    },
+    {
+      "name": "ReadEventLogW",
+      "argCount": 7
+    },
+    {
+      "name": "RegCloseKey",
+      "argCount": 1
+    },
+    {
+      "name": "RegConnectRegistryA",
+      "argCount": 3
+    },
+    {
+      "name": "RegConnectRegistryW",
+      "argCount": 3
+    },
+    {
+      "name": "RegCopyTreeA",
+      "argCount": 3
+    },
+    {
+      "name": "RegCopyTreeW",
+      "argCount": 3
+    },
+    {
+      "name": "RegCreateKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegCreateKeyExA",
+      "argCount": 9
+    },
+    {
+      "name": "RegCreateKeyExW",
+      "argCount": 9
+    },
+    {
+      "name": "RegCreateKeyTransactedA",
+      "argCount": 11
+    },
+    {
+      "name": "RegCreateKeyTransactedW",
+      "argCount": 11
+    },
+    {
+      "name": "RegCreateKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegDeleteKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteKeyExA",
+      "argCount": 4
+    },
+    {
+      "name": "RegDeleteKeyExW",
+      "argCount": 4
+    },
+    {
+      "name": "RegDeleteKeyValueA",
+      "argCount": 3
+    },
+    {
+      "name": "RegDeleteKeyValueW",
+      "argCount": 3
+    },
+    {
+      "name": "RegDeleteKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteTreeA",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteTreeW",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteValueA",
+      "argCount": 2
+    },
+    {
+      "name": "RegDeleteValueW",
+      "argCount": 2
+    },
+    {
+      "name": "RegDisablePredefinedCache",
+      "argCount": 0
+    },
+    {
+      "name": "RegDisableReflectionKey",
+      "argCount": 1
+    },
+    {
+      "name": "RegEnableReflectionKey",
+      "argCount": 1
+    },
+    {
+      "name": "RegEnumKeyA",
+      "argCount": 4
+    },
+    {
+      "name": "RegEnumKeyExA",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumKeyExW",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumKeyW",
+      "argCount": 4
+    },
+    {
+      "name": "RegEnumValueA",
+      "argCount": 8
+    },
+    {
+      "name": "RegEnumValueW",
+      "argCount": 8
+    },
+    {
+      "name": "RegFlushKey",
+      "argCount": 1
+    },
+    {
+      "name": "RegGetKeySecurity",
+      "argCount": 4
+    },
+    {
+      "name": "RegGetValueA",
+      "argCount": 7
+    },
+    {
+      "name": "RegGetValueW",
+      "argCount": 7
+    },
+    {
+      "name": "RegisterEventSourceA",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterEventSourceW",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterServiceCtrlHandlerA",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterServiceCtrlHandlerExA",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterServiceCtrlHandlerExW",
+      "argCount": 3
+    },
+    {
+      "name": "RegisterServiceCtrlHandlerW",
+      "argCount": 2
+    },
+    {
+      "name": "RegisterTraceGuidsA",
+      "argCount": 8
+    },
+    {
+      "name": "RegisterTraceGuidsW",
+      "argCount": 8
+    },
+    {
+      "name": "RegisterWaitChainCOMCallback",
+      "argCount": 2
+    },
+    {
+      "name": "RegLoadAppKeyA",
+      "argCount": 5
+    },
+    {
+      "name": "RegLoadAppKeyW",
+      "argCount": 5
+    },
+    {
+      "name": "RegLoadKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegLoadKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegLoadMUIStringA",
+      "argCount": 7
+    },
+    {
+      "name": "RegLoadMUIStringW",
+      "argCount": 7
+    },
+    {
+      "name": "RegNotifyChangeKeyValue",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenCurrentUser",
+      "argCount": 2
+    },
+    {
+      "name": "RegOpenKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegOpenKeyExA",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenKeyExW",
+      "argCount": 5
+    },
+    {
+      "name": "RegOpenKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegOpenUserClassesRoot",
+      "argCount": 4
+    },
+    {
+      "name": "RegOverridePredefKey",
+      "argCount": 2
+    },
+    {
+      "name": "RegQueryInfoKeyA",
+      "argCount": 12
+    },
+    {
+      "name": "RegQueryInfoKeyW",
+      "argCount": 12
+    },
+    {
+      "name": "RegQueryMultipleValuesA",
+      "argCount": 5
+    },
+    {
+      "name": "RegQueryMultipleValuesW",
+      "argCount": 5
+    },
+    {
+      "name": "RegQueryReflectionKey",
+      "argCount": 2
+    },
+    {
+      "name": "RegQueryValueA",
+      "argCount": 4
+    },
+    {
+      "name": "RegQueryValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "RegQueryValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "RegQueryValueW",
+      "argCount": 4
+    },
+    {
+      "name": "RegRenameKey",
+      "argCount": 3
+    },
+    {
+      "name": "RegReplaceKeyA",
+      "argCount": 4
+    },
+    {
+      "name": "RegReplaceKeyW",
+      "argCount": 4
+    },
+    {
+      "name": "RegRestoreKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegRestoreKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegSaveKeyA",
+      "argCount": 3
+    },
+    {
+      "name": "RegSaveKeyExA",
+      "argCount": 4
+    },
+    {
+      "name": "RegSaveKeyExW",
+      "argCount": 4
+    },
+    {
+      "name": "RegSaveKeyW",
+      "argCount": 3
+    },
+    {
+      "name": "RegSetKeySecurity",
+      "argCount": 3
+    },
+    {
+      "name": "RegSetKeyValueA",
+      "argCount": 6
+    },
+    {
+      "name": "RegSetKeyValueW",
+      "argCount": 6
+    },
+    {
+      "name": "RegSetValueA",
+      "argCount": 5
+    },
+    {
+      "name": "RegSetValueExA",
+      "argCount": 6
+    },
+    {
+      "name": "RegSetValueExW",
+      "argCount": 6
+    },
+    {
+      "name": "RegSetValueW",
+      "argCount": 5
+    },
+    {
+      "name": "RegUnLoadKeyA",
+      "argCount": 2
+    },
+    {
+      "name": "RegUnLoadKeyW",
+      "argCount": 2
+    },
+    {
+      "name": "ReportEventA",
+      "argCount": 9
+    },
+    {
+      "name": "ReportEventW",
+      "argCount": 9
+    },
+    {
+      "name": "RevertToSelf",
+      "argCount": 0
+    },
+    {
+      "name": "SaferCloseLevel",
+      "argCount": 1
+    },
+    {
+      "name": "SaferComputeTokenFromLevel",
+      "argCount": 5
+    },
+    {
+      "name": "SaferCreateLevel",
+      "argCount": 5
+    },
+    {
+      "name": "SaferGetPolicyInformation",
+      "argCount": 6
+    },
+    {
+      "name": "SaferIdentifyLevel",
+      "argCount": 4
+    },
+    {
+      "name": "SaferiIsExecutableFileType",
+      "argCount": 2
+    },
+    {
+      "name": "SaferSetLevelInformation",
+      "argCount": 4
+    },
+    {
+      "name": "SetAclInformation",
+      "argCount": 4
+    },
+    {
+      "name": "SetEntriesInAclA",
+      "argCount": 4
+    },
+    {
+      "name": "SetEntriesInAclW",
+      "argCount": 4
+    },
+    {
+      "name": "SetFileSecurityA",
+      "argCount": 3
+    },
+    {
+      "name": "SetFileSecurityW",
+      "argCount": 3
+    },
+    {
+      "name": "SetKernelObjectSecurity",
+      "argCount": 3
+    },
+    {
+      "name": "SetNamedSecurityInfoA",
+      "argCount": 7
+    },
+    {
+      "name": "SetNamedSecurityInfoW",
+      "argCount": 7
+    },
+    {
+      "name": "SetPrivateObjectSecurity",
+      "argCount": 5
+    },
+    {
+      "name": "SetPrivateObjectSecurityEx",
+      "argCount": 6
+    },
+    {
+      "name": "SetSecurityDescriptorControl",
+      "argCount": 3
+    },
+    {
+      "name": "SetSecurityDescriptorDacl",
+      "argCount": 4
+    },
+    {
+      "name": "SetSecurityDescriptorGroup",
+      "argCount": 3
+    },
+    {
+      "name": "SetSecurityDescriptorOwner",
+      "argCount": 3
+    },
+    {
+      "name": "SetSecurityDescriptorSacl",
+      "argCount": 4
+    },
+    {
+      "name": "SetSecurityInfo",
+      "argCount": 7
+    },
+    {
+      "name": "SetServiceBits",
+      "argCount": 4
+    },
+    {
+      "name": "SetServiceObjectSecurity",
+      "argCount": 3
+    },
+    {
+      "name": "SetServiceStatus",
+      "argCount": 2
+    },
+    {
+      "name": "SetThreadToken",
+      "argCount": 2
+    },
+    {
+      "name": "SetTokenInformation",
+      "argCount": 4
+    },
+    {
+      "name": "StartServiceA",
+      "argCount": 3
+    },
+    {
+      "name": "StartServiceCtrlDispatcherA",
+      "argCount": 1
+    },
+    {
+      "name": "StartServiceCtrlDispatcherW",
+      "argCount": 1
+    },
+    {
+      "name": "StartServiceW",
+      "argCount": 3
+    },
+    {
+      "name": "StartTraceA",
+      "argCount": 3
+    },
+    {
+      "name": "StartTraceW",
+      "argCount": 3
+    },
+    {
+      "name": "StopTraceA",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "StopTraceW",
+      "argCount": 4,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "SynchronizeWindows31FilesAndWindowsNTRegistry",
+      "argCount": 4
+    },
+    {
+      "name": "SystemFunction001",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction002",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction003",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction004",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction005",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction006",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction007",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction008",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction009",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction010",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction011",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction012",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction013",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction014",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction015",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction016",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction017",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction018",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction019",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction020",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction021",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction022",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction023",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction024",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction025",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction026",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction027",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction030",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction031",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction032",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction035",
+      "argCount": 1
+    },
+    {
+      "name": "SystemFunction036",
+      "argCount": 2
+    },
+    {
+      "name": "SystemFunction040",
+      "argCount": 3
+    },
+    {
+      "name": "SystemFunction041",
+      "argCount": 3
+    },
+    {
+      "name": "TraceEvent",
+      "argCount": 3,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "TraceMessageVa",
+      "argCount": 6,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "TraceSetInformation",
+      "argCount": 5,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "TreeResetNamedSecurityInfoW",
+      "argCount": 11
+    },
+    {
+      "name": "TreeSetNamedSecurityInfoW",
+      "argCount": 11
+    },
+    {
+      "name": "UnlockServiceDatabase",
+      "argCount": 1
+    },
+    {
+      "name": "UnregisterTraceGuids",
+      "argCount": 2,
+      "note": "slot count exceeds parameter count (int64 occupy two slots each)"
+    },
+    {
+      "name": "WmiCloseBlock",
+      "argCount": 1
+    },
+    {
+      "name": "WmiExecuteMethodA",
+      "argCount": 7
+    },
+    {
+      "name": "WmiExecuteMethodW",
+      "argCount": 7
+    },
+    {
+      "name": "WmiFreeBuffer",
+      "argCount": 1
+    },
+    {
+      "name": "WmiMofEnumerateResourcesA",
+      "argCount": 3
+    },
+    {
+      "name": "WmiMofEnumerateResourcesW",
+      "argCount": 3
+    },
+    {
+      "name": "WmiNotificationRegistrationA",
+      "argCount": 5
+    },
+    {
+      "name": "WmiNotificationRegistrationW",
+      "argCount": 5
+    },
+    {
+      "name": "WmiOpenBlock",
+      "argCount": 3
+    },
+    {
+      "name": "WmiQueryAllDataA",
+      "argCount": 3
+    },
+    {
+      "name": "WmiQueryAllDataW",
+      "argCount": 3
+    },
+    {
+      "name": "WmiQueryGuidInformation",
+      "argCount": 2
+    },
+    {
+      "name": "WmiSetSingleInstanceA",
+      "argCount": 5
+    },
+    {
+      "name": "WmiSetSingleInstanceW",
+      "argCount": 5
+    },
+    {
+      "name": "WmiSetSingleItemA",
+      "argCount": 6
+    },
+    {
+      "name": "WmiSetSingleItemW",
+      "argCount": 6
+    },
+    {
+      "name": "WriteEncryptedFileRaw",
+      "argCount": 3
+    }
+  ]
+}

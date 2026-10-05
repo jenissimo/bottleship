@@ -1,11 +1,18 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Mem } from "../../core/memory/mem-accessor";
-import { OpenGLContext, GLTextureObject } from "./context";
+import { OpenGLContext, GLTextureObject, boundTextureStorageId } from "./context";
 import {
     GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D, GL_RGBA,
+    GL_PROXY_TEXTURE_2D, GL_IMPL_MAX_TEXTURE_SIZE,
     GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
     GL_INVALID_ENUM, GL_INVALID_VALUE,
     GL_REPEAT, GL_NEAREST,
+    GL_RGB, GL_R3_G3_B2, GL_RGB4, GL_RGB5, GL_RGB8, GL_RGB10, GL_RGB12, GL_RGB16,
+    GL_LUMINANCE, GL_LUMINANCE4, GL_LUMINANCE8, GL_LUMINANCE12, GL_LUMINANCE16,
+    GL_ALPHA, GL_ALPHA4, GL_ALPHA8, GL_ALPHA12, GL_ALPHA16,
+    GL_LUMINANCE_ALPHA, GL_LUMINANCE4_ALPHA4, GL_LUMINANCE6_ALPHA2, GL_LUMINANCE8_ALPHA8,
+    GL_LUMINANCE12_ALPHA4, GL_LUMINANCE12_ALPHA12, GL_LUMINANCE16_ALPHA16,
+    GL_INTENSITY, GL_INTENSITY4, GL_INTENSITY8, GL_INTENSITY12, GL_INTENSITY16,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
 import {
@@ -39,6 +46,87 @@ export function convertPixelsToRGBA8(
         unpackSkipPixels,
         unpackSkipRows,
     );
+}
+
+/** Base internal format a sized/legacy internal format resolves to (GL 1.x table 3.15). */
+const enum BaseFormat { ALPHA, LUMINANCE, LUMINANCE_ALPHA, INTENSITY, RGB, RGBA }
+
+/**
+ * The internal format — not the client format — decides which components the texture
+ * STORES; every component it does not store is substituted at sample time (GL 1.x
+ * §3.8.7 table 3.21): missing RGB reads 0, missing A reads 1, and LUMINANCE/INTENSITY
+ * replicate their single stored value.
+ *
+ * GL 1.0 also allows a bare component COUNT (1/2/3/4) in place of an enum.
+ */
+function baseInternalFormat(internalFormat: number): BaseFormat {
+    switch (internalFormat >>> 0) {
+        case 1: case GL_LUMINANCE: case GL_LUMINANCE4: case GL_LUMINANCE8:
+        case GL_LUMINANCE12: case GL_LUMINANCE16:
+            return BaseFormat.LUMINANCE;
+        case 2: case GL_LUMINANCE_ALPHA: case GL_LUMINANCE4_ALPHA4:
+        case GL_LUMINANCE6_ALPHA2: case GL_LUMINANCE8_ALPHA8:
+        case GL_LUMINANCE12_ALPHA4: case GL_LUMINANCE12_ALPHA12: case GL_LUMINANCE16_ALPHA16:
+            return BaseFormat.LUMINANCE_ALPHA;
+        case GL_ALPHA: case GL_ALPHA4: case GL_ALPHA8: case GL_ALPHA12: case GL_ALPHA16:
+            return BaseFormat.ALPHA;
+        case GL_INTENSITY: case GL_INTENSITY4: case GL_INTENSITY8:
+        case GL_INTENSITY12: case GL_INTENSITY16:
+            return BaseFormat.INTENSITY;
+        case 3: case GL_RGB: case GL_R3_G3_B2: case GL_RGB4: case GL_RGB5:
+        case GL_RGB8: case GL_RGB10: case GL_RGB12: case GL_RGB16:
+            return BaseFormat.RGB;
+        default:
+            return BaseFormat.RGBA;
+    }
+}
+
+/**
+ * Does this internal format keep an alpha component?
+ *
+ * Uploading GL_RGBA client pixels into a GL_RGB texture discards their alpha and
+ * sampling then yields A = 1.0. Engines rely on this to hand the driver a padded
+ * 4-byte-per-texel buffer whose 4th byte is meaningless: id Tech 3's RE_StretchRaw
+ * uploads every cinematic frame as `internalFormat = 3` (GL_RGB) with
+ * `format = GL_RGBA` and A = 0. Keeping that alpha renders the whole video invisible.
+ */
+export function internalFormatHasAlpha(internalFormat: number): boolean {
+    const base = baseInternalFormat(internalFormat);
+    return base !== BaseFormat.LUMINANCE && base !== BaseFormat.RGB;
+}
+
+/**
+ * Reduce decoded RGBA texels in place to the component set the internal format stores,
+ * substituting what GL substitutes for the rest. We sample the stored texture directly,
+ * so the substitution has to happen at upload or the client's spare components leak
+ * through (a GL_ALPHA mask uploaded from a GL_RGBA image would render in full colour).
+ */
+export function applyInternalFormatComponents(data: Uint8Array, internalFormat: number): void {
+    switch (baseInternalFormat(internalFormat)) {
+        case BaseFormat.RGBA:
+            return;
+        case BaseFormat.RGB:
+            for (let i = 3; i < data.length; i += 4) data[i] = 255;
+            return;
+        case BaseFormat.ALPHA:
+            for (let i = 0; i + 3 < data.length; i += 4) data[i] = data[i + 1] = data[i + 2] = 0;
+            return;
+        case BaseFormat.LUMINANCE:
+            for (let i = 0; i + 3 < data.length; i += 4) {
+                data[i + 1] = data[i + 2] = data[i];
+                data[i + 3] = 255;
+            }
+            return;
+        case BaseFormat.LUMINANCE_ALPHA:
+            for (let i = 0; i + 3 < data.length; i += 4) data[i + 1] = data[i + 2] = data[i];
+            return;
+        case BaseFormat.INTENSITY:
+            // One stored value feeds all four components; the client's red is it.
+            for (let i = 0; i + 3 < data.length; i += 4) {
+                data[i + 1] = data[i + 2] = data[i + 3] = data[i];
+            }
+            return;
+    }
 }
 
 export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
@@ -86,8 +174,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             return 0;
         }
 
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
         tex.width = width;
         tex.height = texHeight;
@@ -131,8 +218,8 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             return 0;
         }
 
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0 || data === 0 || imageSize <= 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
+        if (data === 0 || imageSize <= 0) return 0;
         const tex = ctx.textures.get(texId);
         if (!tex || !tex.data) return 0;
 
@@ -178,6 +265,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const ptr = args[1] >>> 0;
         for (let j = 0; j < n; j++) {
             const id = Mem.readUint32(ptr + j * 4)! >>> 0;
+            if (id === 0) continue; // the default object is not deletable
             ctx.textures.delete(id);
             for (const unit of ctx.textureUnits) {
                 if (unit.boundTexture === id) unit.boundTexture = 0;
@@ -190,8 +278,9 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const target = args[0] >>> 0;
         const texture = args[1] >>> 0;
         if (!isSupportedTextureTarget(target)) return 0;
-        ctx.textureUnits[ctx.activeTextureUnit].boundTexture = texture;
-        if (texture !== 0) ensureTexture(texture);
+        const unit = ctx.textureUnits[ctx.activeTextureUnit];
+        unit.boundTexture = texture;
+        ensureTexture(boundTextureStorageId(unit));
         return 0;
     };
 
@@ -206,10 +295,23 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const type = args[7] >>> 0;
         const pixels = args[8] >>> 0;
 
+        // GL_PROXY_TEXTURE_2D allocates nothing: it asks "would this image fit, in this
+        // format?" and the answer is READ BACK with glGetTexLevelParameter. Ignoring the
+        // call left that answer as whatever was in the caller's variable, so the same
+        // probe could pass or fail run to run.
+        if (target === GL_PROXY_TEXTURE_2D) {
+            const fits = level >= 0
+                && width > 0 && height > 0
+                && width <= GL_IMPL_MAX_TEXTURE_SIZE && height <= GL_IMPL_MAX_TEXTURE_SIZE;
+            ctx.proxyTextureWidth = fits ? width : 0;
+            ctx.proxyTextureHeight = fits ? height : 0;
+            ctx.proxyTextureInternalFormat = fits ? internalformat : 0;
+            return 0;
+        }
+
         if (target !== GL_TEXTURE_2D || level !== 0) return 0;
 
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
 
         tex.width = width;
@@ -222,6 +324,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
                 mem, pixels, width, height, format, type,
                 ctx.unpackAlignment, ctx.unpackRowLength, ctx.unpackSkipPixels, ctx.unpackSkipRows
             );
+            applyInternalFormatComponents(tex.data, internalformat);
             tex.dirty = true;
             tex.gpuVersion++;
             ctx.frameSnapshot.texUploads++;
@@ -241,6 +344,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             }
         } else {
             tex.data = new Uint8Array(width * height * 4);
+            applyInternalFormatComponents(tex.data, internalformat);
         }
         return 0;
     };
@@ -257,8 +361,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const pixels = args[8] >>> 0;
 
         if (target !== GL_TEXTURE_2D) return 0;
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ctx.textures.get(texId);
         if (!tex || !tex.data || pixels === 0) return 0;
 
@@ -267,6 +370,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
             mem, pixels, width, height, format, type,
             ctx.unpackAlignment, ctx.unpackRowLength, ctx.unpackSkipPixels, ctx.unpackSkipRows
         );
+        applyInternalFormatComponents(sub, tex.internalFormat);
 
         for (let y = 0; y < height; y++) {
             for (let x = 0; x < width; x++) {
@@ -303,8 +407,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const pname = args[1] >>> 0;
         const param = args[2] | 0;
         if (!isSupportedTextureTarget(target)) return 0;
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
         switch (pname) {
             case GL_TEXTURE_WRAP_S: tex.wrapS = param; break;
@@ -320,8 +423,7 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
         const pname = args[1] >>> 0;
         const param = bitsToF32(args[2]) | 0;
         if (!isSupportedTextureTarget(target)) return 0;
-        const texId = ctx.textureUnits[ctx.activeTextureUnit].boundTexture;
-        if (texId === 0) return 0;
+        const texId = boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]);
         const tex = ensureTexture(texId);
         switch (pname) {
             case GL_TEXTURE_WRAP_S: tex.wrapS = param; break;

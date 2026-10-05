@@ -18,7 +18,8 @@ const E_NOTIMPL = 0x80004001;
 const E_POINTER = 0x80004003;
 const E_INVALIDARG = 0x80070057;
 const DPERR_BUFFERTOOSMALL = 0x8877001e;
-const DPERR_NOTLOBBIED = 0x88770023;
+// MAKE_DPHRESULT(code) = 0x8877_0000 | code, with `code` the DECIMAL value from dplay.h.
+const DPERR_NOTLOBBIED = 0x8877042e; // MAKE_DPHRESULT(1070)
 const DPERR_NOMESSAGES = 0x887700BE;
 const DPERR_INVALIDOBJECT = 0x88770082;
 const DPERR_UNINITIALIZED = 0x88770140;
@@ -39,9 +40,11 @@ interface DPlayMessage {
 const IID_DPLAY_LOBBY3A = "2db72491-652c-11d1-a7a8-0000f803abfc";
 const IID_DPLAY_LOBBY_COMPAT = "5959df62-2911-11d1-b049-0020af30269a";
 const IID_DPLAY4A = "0ab1c531-4745-11d1-a7a1-0000f803abfc";
-const IID_DPLAY_LOBBY = "af461240-a3a1-11cf-8602-00a0245d918b";
-const IID_DPLAY = "279afa83-4981-11ce-a521-0020af0be560";
-const IID_DPLAY8_LOBBY_CLIENT = "819074a3-016c-11d3-ae14-006097b01411";
+const IID_DPLAY_LOBBY = "af465c71-9588-11cf-a020-00aa006157ac";
+// ANSI variant of IDirectPlayLobby — same vtable shape, so one object serves both.
+const IID_DPLAY_LOBBY_ANSI = "26c66a70-b367-11cf-a024-00aa006157ac";
+const IID_DPLAY = "5454e9a0-db65-11ce-921c-00aa006c4972";
+const IID_DPLAY8_LOBBY_CLIENT = "819074a2-016c-11d3-ae14-006097b01411";
 
 const GUID_SIZE = 16;
 const DPAID_SERVICE_PROVIDER_GUID = new Uint8Array([
@@ -93,6 +96,9 @@ class DirectPlayLobbyObjectV1 extends BaseComObject {
     constructor(vtableAddress: number) {
         super(IID_DPLAY_LOBBY, vtableAddress);
     }
+    protected queryAdditionalInterfaces(riid: string): string | null {
+        return riid === IID_DPLAY_LOBBY_ANSI ? riid : null;
+    }
     protected destroy(): void {
         Logger.verbose(LogCategory.COM, "DirectPlayLobbyObjectV1 destroyed");
     }
@@ -127,7 +133,6 @@ export class DPlayX implements IModule {
     name = "dplayx";
     exports: Record<string, ThunkImplementation> = {};
     private process!: Process;
-    private memory!: Uint8Array;
     private vtables: Record<string, VTableInfo> = {};
     private messageQueue: DPlayMessage[] = [];
     private localPlayerId: number = 0;
@@ -156,7 +161,6 @@ export class DPlayX implements IModule {
 
     initialize(process: Process): void {
         this.process = process;
-        this.memory = this.getMemory();
 
         const interfaceRegistry = InterfaceRegistry.getInstance();
         interfaceRegistry.registerFromModuleDescriptor(dplayxModule);
@@ -571,23 +575,17 @@ export class DPlayX implements IModule {
         this.exports["IDirectPlayLobby3A_ConnectEx"] = connectExImpl("IDirectPlayLobby3A");
         this.exports["IDirectPlayLobbyCompatA_ConnectEx"] = connectExImpl("IDirectPlayLobbyCompatA");
 
-        // GetConnectionSettings: return DPERR_NOTLOBBIED for non-lobby-launched games.
-        // Games launched directly (not via IDirectPlayLobby::RunApplication) are not
-        // lobby-aware. HoMM3's FUN_00498b70 checks for DPERR_BUFFERTOOSMALL to detect
-        // lobby launch — returning BUFFERTOOSMALL pushes the game into the network
-        // connection path → "Error connecting to host computer". Keep NOTLOBBIED.
-        // Campaign narration (Path B) does NOT check sess_connected — the issue is elsewhere.
+        // GetConnectionSettings(dwAppID, lpData, lpdwDataSize): the connection settings a
+        // lobby handed the app at launch. We never lobby-launch anything (RunApplication is
+        // not implemented), so every process we host is a direct launch and DPERR_NOTLOBBIED
+        // is the whole answer — no size is written, exactly as dplayx does when there is no
+        // lobby session to describe. Games gate their lobby path on THIS code (Re-Volt
+        // compares the HRESULT against DPERR_NOTLOBBIED literally), so its numeric value is
+        // load-bearing; anything else sends them into the size-query/connect path.
         const getConnectionSettingsImpl = (iface: string): ThunkImplementation => (ctx, mem, args) => {
             const dwAppID = args[1] >>> 0;
-            const lpdwDataSize = args[3] >>> 0;
-            // Zero out *lpdwDataSize so games that blindly read it after an error
-            // (e.g. Re-Volt) don't LocalAlloc with garbage → OOM crash.
-            if (lpdwDataSize) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(lpdwDataSize, 0, true);
-            }
             Logger.log(LogCategory.SYSTEM,
-                `${iface}_GetConnectionSettings: appID=${dwAppID} → DPERR_NOTLOBBIED (not lobby-launched)`);
+                `${iface}_GetConnectionSettings: appID=${dwAppID} → DPERR_NOTLOBBIED (0x${DPERR_NOTLOBBIED.toString(16)}, not lobby-launched)`);
             return DPERR_NOTLOBBIED;
         };
 
@@ -667,7 +665,8 @@ export class DPlayX implements IModule {
             registry.createKey("hklm", regPath);
             const keyHandle = registry.open("hklm", regPath);
             if (keyHandle) {
-                registry.setValue(keyHandle, "Guid", { name: "Guid", type: "REG_SZ", data: `{${guidStr}}` });
+                // bytesToGuid already brace-wraps.
+                registry.setValue(keyHandle, "Guid", { name: "Guid", type: "REG_SZ", data: guidStr });
                 if (filename) registry.setValue(keyHandle, "File", { name: "File", type: "REG_SZ", data: filename });
                 if (appPath) registry.setValue(keyHandle, "Path", { name: "Path", type: "REG_SZ", data: appPath });
                 if (cmdLine) registry.setValue(keyHandle, "CommandLine", { name: "CommandLine", type: "REG_SZ", data: cmdLine });
@@ -679,11 +678,47 @@ export class DPlayX implements IModule {
         this.exports["IDirectPlayLobby3A_RegisterApplication"] = registerAppImpl;
         this.exports["IDirectPlayLobbyCompatA_RegisterApplication"] = registerAppImpl;
 
+        // UnregisterApplication(dwFlags, REFGUID) — the registry keys RegisterApplication
+        // writes are named by application, so the GUID must be matched against their Guid value.
+        const unregisterAppImpl: ThunkImplementation = (_ctx, mem, args) => {
+            const lpGuid = args[2] >>> 0;
+
+            const guidBytes = this.readGuidBytes(mem, lpGuid);
+            if (!guidBytes) {
+                Logger.warn(LogCategory.SYSTEM, "UnregisterApplication: invalid GUID pointer");
+                return E_INVALIDARG;
+            }
+            const guidStr = this.bytesToGuid(guidBytes);
+
+            const registry = System.getInstance().registry;
+            const basePath = "Software\\Microsoft\\DirectPlay\\Applications";
+            const baseKey = registry.open("hklm", basePath);
+            if (!baseKey) {
+                Logger.log(LogCategory.SYSTEM, `UnregisterApplication: ${guidStr} not registered`);
+                return DP_OK;
+            }
+
+            for (const appName of registry.enumSubKeys(baseKey)) {
+                const appKey = registry.open("hklm", `${basePath}\\${appName}`);
+                if (!appKey) continue;
+                const value = registry.getValue(appKey, "Guid");
+                if (typeof value?.data !== "string" || value.data.toLowerCase() !== guidStr.toLowerCase()) continue;
+
+                registry.deleteKey(appKey);
+                Logger.log(LogCategory.SYSTEM, `UnregisterApplication: removed "${appName}" (${guidStr})`);
+                return DP_OK;
+            }
+
+            Logger.log(LogCategory.SYSTEM, `UnregisterApplication: ${guidStr} not registered`);
+            return DP_OK;
+        };
+        this.exports["IDirectPlayLobby3A_UnregisterApplication"] = unregisterAppImpl;
+        this.exports["IDirectPlayLobbyCompatA_UnregisterApplication"] = unregisterAppImpl;
+
         for (const method of lobbyStubMethods) {
-            if (method === "EnumLocalApplications" || method === "CreateAddress" || method === "Connect" || method === "GetConnectionSettings" || method === "CreateCompoundAddress" || method === "ConnectEx" || method === "RegisterApplication") {
+            if (method === "EnumLocalApplications" || method === "CreateAddress" || method === "Connect" || method === "GetConnectionSettings" || method === "CreateCompoundAddress" || method === "ConnectEx" || method === "RegisterApplication" || method === "UnregisterApplication") {
                 continue;
             }
-            const lobbyNoOpSuccess = method === "UnregisterApplication";
 
             this.exports[`IDirectPlayLobby3A_${method}`] = (ctx, mem, args) => {
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -694,8 +729,13 @@ export class DPlayX implements IModule {
                 if (method === "SetConnectionSettings") {
                     return DP_OK;
                 }
+                // Waiting for settings that a lobby would have supplied: same answer as
+                // GetConnectionSettings, and it must ANSWER rather than block forever.
+                if (method === "WaitForConnectionSettings") {
+                    return DPERR_NOTLOBBIED;
+                }
 
-                return lobbyNoOpSuccess ? DP_OK : E_NOTIMPL;
+                return E_NOTIMPL;
             };
 
             this.exports[`IDirectPlayLobbyCompatA_${method}`] = (ctx, mem, args) => {
@@ -706,8 +746,11 @@ export class DPlayX implements IModule {
                 if (method === "SetConnectionSettings") {
                     return DP_OK;
                 }
+                if (method === "WaitForConnectionSettings") {
+                    return DPERR_NOTLOBBIED;
+                }
 
-                return lobbyNoOpSuccess ? DP_OK : E_NOTIMPL;
+                return E_NOTIMPL;
             };
         }
 
@@ -1287,7 +1330,7 @@ export class DPlayX implements IModule {
     }
 
     private getMemory(): Uint8Array {
-        return this.process.v86.mem8 || (this.process.v86.v86 && this.process.v86.v86.cpu.mem8);
+        return this.process.getCurrentMemory();
     }
 
     reset(): void {
@@ -1300,7 +1343,6 @@ export class DPlayX implements IModule {
 
     recreateVTables(): void {
         if (this.process) {
-            this.memory = this.getMemory();
             this.vtables = createVTablesFromDescriptor(this.process, dplayxModule);
             Logger.verbose(LogCategory.SYSTEM, "DirectPlay: Recreated vtables after reset");
 

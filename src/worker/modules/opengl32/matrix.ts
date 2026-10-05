@@ -136,11 +136,12 @@ function transposeInPlace(m: Float32Array): void {
 
 // ---- Multiply current matrix by temp ----
 
+const _mulResult = new Float32Array(16);
+
 function multiplyCurrentByTemp(ctx: OpenGLContext, temp: Float32Array): void {
     const cur = ctx.currentMatrix();
-    const result = new Float32Array(16);
-    mat4Multiply(result, cur, temp);
-    cur.set(result);
+    mat4Multiply(_mulResult, cur, temp);
+    cur.set(_mulResult);
 }
 
 // ---- Stack helpers ----

@@ -24,10 +24,16 @@ Public dev/build tooling. Game-specific RE/debug one-offs live in
 - **cdp-trace.ts** — capture a browser-level performance trace (works even when the worker pump is starved) → feed analyze-trace.ts.
 - **cdp-pausestack.ts** — pause a hard-pinned worker via CDP and dump its JS call stack.
 - **analyze-trace.ts** — Chrome trace → per-thread self/total time, WASM/JIT breakdown, timeline. Primary perf tool.
-- **log-manager.ts** — manage the log-server archive (`logs`, `logs:clean`, `logs:stats`).
+- **log-manager.ts** — manage the dev-sidecar log archive (`logs`, `logs:clean`, `logs:stats`).
+- **dev-sidecar/sidecar-loadtest.ts** — pump the sidecar's log ingest at a target MB/s and plot its
+  memory against lines ingested; `--break-at` makes the archive writer fail mid-run (a full disk, a
+  deleted `logs/`), which is the case where a log buffer either stays bounded or eats the machine.
 - **re/** — warm RE service (Ghidra headless behind an HTTP daemon): decompile / resolve / exportSymbolMap.
 - **pe-disas.py** — lightweight PE disassembler/xref helper (capstone + pefile), Ghidra-down fallback.
-- **examples/** — harness script template (`bringup.harness.ts`) and a worked diagnostic example (`diagnose-eip.harness.ts`).
+- **harness/** — checked-in harness scripts: `templates/` (copy-and-adapt starting points), `regression/`
+  (self-judging per-game scenarios, run in a batch via `bun tools/harness.ts regress`), `perf/` (production
+  A/B instruments). See `tools/harness/README.md` for the admission rule. One-off probes belong in the
+  gitignored `tools/probes/` and die with the investigation, not here.
 
 ## Quality gate & codegen
 

@@ -4,7 +4,7 @@
 
 import { System } from '../../core/system';
 import { Logger, LogCategory } from '../../core/logger';
-import { windows as sharedWindows } from '../user32/shared-state';
+import { resizeFullscreenWindowToMode } from '../../runtime/windowing/fullscreen-window';
 import {
     createComObject,
     deviceBackBufferSurfaces,
@@ -84,50 +84,38 @@ function destroyImplicitDepthStencil(devicePtr: number): void {
 }
 
 /**
- * Resize the device's focus/device window to the back-buffer size for a FULLSCREEN device.
- *
- * Faithful to real D3D8: creating a device with Windowed==FALSE puts the focus window into
- * the device's display mode — Windows resizes the window's client area to the back-buffer
- * resolution. Apps rely on this (they create a small/default window, then GetClientRect /
- * GetWindowRect to read the now-fullscreen size). GTA III's RenderWare camera frame-buffer
- * raster create (_rwD3D8RasterCreate, rwRASTERTYPECAMERA) rejects a camera larger than the
- * client rect: GetClientRect(hwnd) < cameraSize -> RwRasterCreate FALSE -> CreateCamera fails
- * -> Initialise3D returns 0 -> the game DestroyWindow()s and ExitProcess(0)es at startup.
- *
- * We only resized the host canvas (requestHostResize) on CreateDevice, never the tracked
- * window rect that GetClientRect reads, so a fullscreen game's window stayed at its small
- * creation size. This mirrors DDraw's resizeFullscreenWindow (directdraw.ts): update the
- * WindowManager rect + the shared-state WindowInfo (read by GetClientRect) + post WM_SIZE.
- * Generic across every fullscreen D3D8 title — never a per-game branch.
+ * Creating a device with Windowed==FALSE puts the focus window into the device's display
+ * mode, and apps read that back (GetClientRect on the now-fullscreen window) to size their
+ * render targets. Shared with D3D9 and DDraw — see resizeFullscreenWindowToMode.
  */
 export function resizeFullscreenDeviceWindow(hwnd: number, width: number, height: number): void {
-    if (!hwnd || width <= 0 || height <= 0) return;
-    const system = System.getInstance();
+    resizeFullscreenWindowToMode(hwnd, width, height, "D3D8");
+}
 
-    const winObj = system.windowManager?.getWindow(hwnd);
-    if (winObj) {
-        winObj.rect.x = 0;
-        winObj.rect.y = 0;
-        winObj.rect.w = width;
-        winObj.rect.h = height;
-    }
+// BeginScene/EndScene pairing (wined3d dlls/wined3d/device.c:3718-3743): real D3D8
+// rejects a second BeginScene without an intervening EndScene, and an EndScene with no
+// open scene, both with D3DERR_INVALIDCALL. The actual thunk handlers live in device.ts
+// (owned by another agent for this pass) — these helpers are the complete mechanism;
+// device.ts's BeginScene/EndScene need a two-line call into them (see the parity report).
+const deviceInScene = new Map<number, boolean>();
 
-    // The map GetClientRect/GetWindowRect actually read (user32 shared-state WindowInfo).
-    const sharedWin = sharedWindows.get(hwnd);
-    if (sharedWin) {
-        sharedWin.x = 0;
-        sharedWin.y = 0;
-        sharedWin.width = width;
-        sharedWin.height = height;
-    }
+/** Returns false (D3DERR_INVALIDCALL) if a scene is already open for this device. */
+export function tryBeginScene(devicePtr: number): boolean {
+    if (deviceInScene.get(devicePtr) === true) return false;
+    deviceInScene.set(devicePtr, true);
+    return true;
+}
 
-    if (!winObj && !sharedWin) return;
+/** Returns false (D3DERR_INVALIDCALL) if no scene is open for this device. */
+export function tryEndScene(devicePtr: number): boolean {
+    if (deviceInScene.get(devicePtr) !== true) return false;
+    deviceInScene.set(devicePtr, false);
+    return true;
+}
 
-    // Let the game update its viewport/projection (mirrors real Windows fullscreen switch).
-    system.windowManager?.postMessage(hwnd, 0x0005 /* WM_SIZE */, 0 /* SIZE_RESTORED */,
-        ((width & 0xFFFF) | ((height & 0xFFFF) << 16)) >>> 0);
-    Logger.log(LogCategory.SYSTEM,
-        `D3D8 fullscreen window resize: hwnd=0x${hwnd.toString(16)} -> ${width}x${height}`);
+/** Device teardown: drop tracked scene state so a recycled COM pointer starts clean. */
+export function clearSceneState(devicePtr: number): void {
+    deviceInScene.delete(devicePtr);
 }
 
 /** Bind the implicit depth-stencil surface when EnableAutoDepthStencil is set. */

@@ -1,0 +1,175 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.929Z",
+  "module": "oledlg",
+  "functions": [
+    {
+      "name": "OleUIAddVerbMenuA",
+      "argCount": 9
+    },
+    {
+      "name": "OleUIAddVerbMenuW",
+      "argCount": 9
+    },
+    {
+      "name": "OleUIBusyA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIBusyW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUICanConvertOrActivateAs",
+      "argCount": 3
+    },
+    {
+      "name": "OleUIChangeIconA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIChangeIconW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIChangeSourceA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIChangeSourceW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIConvertA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIConvertW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIEditLinksA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIEditLinksW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIInsertObjectA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIInsertObjectW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIObjectPropertiesA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIObjectPropertiesW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIPasteSpecialA",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIPasteSpecialW",
+      "argCount": 1
+    },
+    {
+      "name": "OleUIUpdateLinksA",
+      "argCount": 4
+    },
+    {
+      "name": "OleUIUpdateLinksW",
+      "argCount": 4
+    },
+    {
+      "name": "ord_1",
+      "argCount": 9
+    },
+    {
+      "name": "ord_11",
+      "argCount": 1
+    },
+    {
+      "name": "ord_12",
+      "argCount": 1
+    },
+    {
+      "name": "ord_14",
+      "argCount": 9
+    },
+    {
+      "name": "ord_15",
+      "argCount": 1
+    },
+    {
+      "name": "ord_16",
+      "argCount": 1
+    },
+    {
+      "name": "ord_17",
+      "argCount": 1
+    },
+    {
+      "name": "ord_18",
+      "argCount": 1
+    },
+    {
+      "name": "ord_19",
+      "argCount": 1
+    },
+    {
+      "name": "ord_2",
+      "argCount": 3
+    },
+    {
+      "name": "ord_20",
+      "argCount": 1
+    },
+    {
+      "name": "ord_21",
+      "argCount": 1
+    },
+    {
+      "name": "ord_22",
+      "argCount": 1
+    },
+    {
+      "name": "ord_23",
+      "argCount": 4
+    },
+    {
+      "name": "ord_3",
+      "argCount": 1
+    },
+    {
+      "name": "ord_4",
+      "argCount": 1
+    },
+    {
+      "name": "ord_5",
+      "argCount": 1
+    },
+    {
+      "name": "ord_6",
+      "argCount": 1
+    },
+    {
+      "name": "ord_7",
+      "argCount": 1
+    },
+    {
+      "name": "ord_8",
+      "argCount": 1
+    },
+    {
+      "name": "ord_9",
+      "argCount": 4
+    }
+  ]
+}

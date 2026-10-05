@@ -9,6 +9,7 @@ import { Logger, LogCategory } from "../../core/logger";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
 import { resolveWindowsFontName } from './font-map';
+import { DEFAULT_CHARSET, resolveCharset } from './font-charset';
 import type { GDIContext, GDIObject } from './context';
 
 // Stock object IDs (Windows GDI constants)
@@ -32,6 +33,29 @@ export const STOCK_DEFAULT_GUI_FONT = 17;
 // Default 1x1 monochrome bitmap selected into fresh memory DCs (Windows behavior)
 export const STOCK_DEFAULT_BITMAP = 9;
 export const DEFAULT_BITMAP_HANDLE = 0x80000000 | STOCK_DEFAULT_BITMAP;
+
+// Pen styles (wingdi.h). PS_SOLID..PS_INSIDEFRAME are the CreatePen range; the
+// PS_USERSTYLE/PS_ALTERNATE styles above it are ExtCreatePen-only. The geometry that
+// consumes them lives in gdi-lines.ts.
+export const PS_SOLID = 0;
+export const PS_DASH = 1;
+export const PS_DOT = 2;
+export const PS_DASHDOT = 3;
+export const PS_DASHDOTDOT = 4;
+export const PS_NULL = 5;
+export const PS_INSIDEFRAME = 6;
+export const PS_STYLE_MASK = 0x0000000F;
+
+// LOGPEN { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor } — 16 bytes.
+// CreatePenIndirect reads it, GetObject(OBJ_PEN) writes it; checked in
+// tools/validate-struct-offsets.ts.
+export const LOGPEN_OFFSETS = {
+    lopnStyle: 0x00,
+    lopnWidth_x: 0x04,
+    lopnWidth_y: 0x08,
+    lopnColor: 0x0C,
+} as const;
+export const LOGPEN_SIZE = 0x10;
 
 export interface PatternBrushData {
     kind: 'pattern';
@@ -67,19 +91,43 @@ export function getStockObject(objectId: number): GDIObject | null {
         case STOCK_NULL_BRUSH:
             return { handle: objectId, type: 'BRUSH', data: 'transparent' };
         case STOCK_WHITE_PEN:
-            return { handle: objectId, type: 'PEN', data: '#FFFFFF' };
+            return { handle: objectId, type: 'PEN', data: '#FFFFFF', penStyle: PS_SOLID, penWidth: 1, penColor: 0x00FFFFFF };
         case STOCK_BLACK_PEN:
-            return { handle: objectId, type: 'PEN', data: '#000000' };
+            return { handle: objectId, type: 'PEN', data: '#000000', penStyle: PS_SOLID, penWidth: 1, penColor: 0 };
         case STOCK_NULL_PEN:
-            return { handle: objectId, type: 'PEN', data: 'transparent' };
-        case STOCK_SYSTEM_FONT:
-        case STOCK_DEFAULT_GUI_FONT:
+            return { handle: objectId, type: 'PEN', data: 'transparent', penStyle: PS_NULL, penWidth: 1, penColor: 0 };
         case STOCK_ANSI_VAR_FONT:
-            return { handle: objectId, type: 'FONT', data: '16px sans-serif' };
+            return {
+                handle: objectId, type: 'FONT',
+                data: '12px "Liberation Sans", sans-serif', fontSize: 12,
+                lfHeight: 12, lfWeight: 400, lfQuality: 0, faceName: 'MS Sans Serif',
+            };
+        case STOCK_SYSTEM_FONT:
+        case STOCK_DEVICE_DEFAULT_FONT:
+            return {
+                handle: objectId, type: 'FONT',
+                data: 'bold 16px "Liberation Sans", sans-serif', fontSize: 16,
+                lfHeight: 16, lfWeight: 700, lfQuality: 0, faceName: 'System',
+            };
+        case STOCK_DEFAULT_GUI_FONT:
+            return {
+                handle: objectId, type: 'FONT',
+                data: '11px "Microsoft Sans Serif", "Liberation Sans", sans-serif', fontSize: 11,
+                lfHeight: -11, lfWeight: 400, lfQuality: 0, faceName: 'MS Shell Dlg',
+            };
         case STOCK_ANSI_FIXED_FONT:
-        case STOCK_SYSTEM_FIXED_FONT:
         case STOCK_OEM_FIXED_FONT:
-            return { handle: objectId, type: 'FONT', data: '16px monospace' };
+            return {
+                handle: objectId, type: 'FONT',
+                data: '12px "Liberation Mono", monospace', fontSize: 12,
+                lfHeight: 12, lfWeight: 400, lfQuality: 0, faceName: 'Courier',
+            };
+        case STOCK_SYSTEM_FIXED_FONT:
+            return {
+                handle: objectId, type: 'FONT',
+                data: 'bold 16px "Liberation Mono", monospace', fontSize: 16,
+                lfHeight: 16, lfWeight: 700, lfQuality: 0, faceName: 'System Fixed Font',
+            };
         case STOCK_DEFAULT_BITMAP:
             return { handle: objectId, type: 'BITMAP', data: { width: 1, height: 1, pixels: null } };
         default:
@@ -152,20 +200,158 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
     if (!lpvObject || cbBuffer === 0) {
         // Return required size
         if (obj.type === 'BITMAP') {
-            return 24; // sizeof(BITMAP)
+            // A DIB section needs the whole DIBSECTION described, not just its BITMAP head.
+            return (obj.data?.dibBits || (obj.data?.bitsPtr && obj.data?.dibStride)) ? 0x54 : 24;
         } else if (obj.type === 'FONT') {
             return isUnicode ? 92 : 60; // sizeof(LOGFONTW) vs sizeof(LOGFONTA)
+        } else if (obj.type === 'PEN') {
+            return LOGPEN_SIZE;
         }
         return 0;
     }
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
+    if (obj.type === 'PEN' && cbBuffer >= LOGPEN_SIZE) {
+        // LOGPEN { UINT lopnStyle; POINT lopnWidth; COLORREF lopnColor }. lopnWidth.y is
+        // unused by GDI but must be written — callers round-trip the struct into
+        // CreatePenIndirect.
+        view.setUint32(lpvObject + LOGPEN_OFFSETS.lopnStyle, (obj.penStyle ?? PS_SOLID) >>> 0, true);
+        view.setInt32(lpvObject + LOGPEN_OFFSETS.lopnWidth_x, obj.penWidth ?? 1, true);
+        view.setInt32(lpvObject + LOGPEN_OFFSETS.lopnWidth_y, 0, true);
+        view.setUint32(lpvObject + LOGPEN_OFFSETS.lopnColor, (obj.penColor ?? 0) >>> 0, true);
+        return LOGPEN_SIZE;
+    }
+
+    // A CreateDIBSection bitmap already HAS its bits in guest memory, so both the
+    // BITMAP and the DIBSECTION view report them directly. Reporting the generic
+    // 32bpp/width*4/NULL-bits shape instead lies about a bitmap whose real stride and
+    // bits pointer we hold, and a guest that walks bmBits then dereferences NULL.
+    if (obj.type === 'BITMAP' && cbBuffer >= 24 && obj.data?.bitsPtr && obj.data?.dibStride) {
+        const width = obj.data.width || 0;
+        const height = obj.data.height || 0;
+        const bitCount = (obj.data.dibBpp as number) || 32;
+        const stride = obj.data.dibStride as number;
+        const bitsPtr = (obj.data.bitsPtr as number) >>> 0;
+        view.setUint32(lpvObject + 0x00, 0, true);           // bmType
+        view.setInt32(lpvObject + 0x04, width, true);        // bmWidth
+        view.setInt32(lpvObject + 0x08, height, true);       // bmHeight
+        view.setUint32(lpvObject + 0x0C, stride, true);      // bmWidthBytes
+        view.setUint16(lpvObject + 0x10, 1, true);           // bmPlanes
+        view.setUint16(lpvObject + 0x12, bitCount, true);    // bmBitsPixel
+        view.setUint32(lpvObject + 0x14, bitsPtr, true);     // bmBits
+        if (cbBuffer < 0x54) {
+            Logger.verbose(LogCategory.GDI32, `getObject BITMAP(DIBSection): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bitsPtr.toString(16)}`);
+            return 24;
+        }
+        const palette = obj.data.dibPalette as Uint32Array | undefined;
+        // biHeight sign is the row order the bits are stored in.
+        view.setUint32(lpvObject + 0x18, 40, true);          // dsBmih.biSize
+        view.setInt32(lpvObject + 0x1C, width, true);        // biWidth
+        view.setInt32(lpvObject + 0x20, obj.data.dibTopDown ? -height : height, true);
+        view.setUint16(lpvObject + 0x24, 1, true);           // biPlanes
+        view.setUint16(lpvObject + 0x26, bitCount, true);    // biBitCount
+        view.setUint32(lpvObject + 0x28, 0, true);           // biCompression = BI_RGB
+        view.setUint32(lpvObject + 0x2C, stride * height, true); // biSizeImage
+        view.setInt32(lpvObject + 0x30, 0, true);            // biXPelsPerMeter
+        view.setInt32(lpvObject + 0x34, 0, true);            // biYPelsPerMeter
+        view.setUint32(lpvObject + 0x38, palette ? palette.length : 0, true); // biClrUsed
+        view.setUint32(lpvObject + 0x3C, 0, true);           // biClrImportant
+        view.setUint32(lpvObject + 0x40, 0, true);           // dsBitfields[0]
+        view.setUint32(lpvObject + 0x44, 0, true);           // dsBitfields[1]
+        view.setUint32(lpvObject + 0x48, 0, true);           // dsBitfields[2]
+        view.setUint32(lpvObject + 0x4C, 0, true);           // dshSection
+        view.setUint32(lpvObject + 0x50, 0, true);           // dsOffset
+        Logger.verbose(LogCategory.GDI32, `getObject DIBSECTION(CreateDIBSection): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bitsPtr.toString(16)}`);
+        return 0x54;
+    }
+
+    // Bitmap loaded with LR_CREATEDIBSECTION: expose a real DIBSECTION so guest loaders
+    // read the source's own depth, stride, rows and colour count (biBitCount, biClrUsed,
+    // bmBits). GetObject(h, sizeof(DIBSECTION)=0x54) triggers this; GetObject(h,
+    // sizeof(BITMAP)=24) still gets the plain BITMAP below. Reporting only 24 bytes here
+    // leaves dsBmih as the caller's uninitialized stack, and a palette-building loader
+    // then branches on garbage.
+    if (obj.type === 'BITMAP' && cbBuffer >= 0x54 && obj.data?.dibBits) {
+        const width = obj.data.width || 0;
+        const height = obj.data.height || 0;
+        const bitCount = (obj.data.bitCount as number) || 32;
+        const stride = (obj.data.dibStride as number) || (((width * bitCount + 31) >> 5) << 2);
+        const dibBits = obj.data.dibBits as Uint8Array;
+        // Materialize the DIB bits into guest memory once (cached on the object).
+        let bmBitsPtr = obj.data.dibBitsPtr as number | undefined;
+        if (!bmBitsPtr) {
+            const proc = System.getInstance().process;
+            bmBitsPtr = proc?.memory.alloc(dibBits.length, "HEAP", "rw") ?? 0;
+            if (bmBitsPtr) {
+                mem.set(dibBits, bmBitsPtr);
+                obj.data.dibBitsPtr = bmBitsPtr;
+            }
+        }
+        // The file rows are bottom-up unless top-down; report biHeight sign to match
+        // so the loader walks rows in the right direction.
+        const biHeight = obj.data.dibTopDown ? -height : height;
+        // DIBSECTION: dsBm(24) + dsBmih(40) + dsBitfields(12) + dshSection(4) + dsOffset(4).
+        view.setUint32(lpvObject + 0x00, 0, true);           // dsBm.bmType
+        view.setInt32(lpvObject + 0x04, width, true);        // dsBm.bmWidth
+        view.setInt32(lpvObject + 0x08, height, true);       // dsBm.bmHeight (always +ve here)
+        view.setUint32(lpvObject + 0x0C, stride, true);      // dsBm.bmWidthBytes
+        view.setUint16(lpvObject + 0x10, 1, true);           // dsBm.bmPlanes
+        view.setUint16(lpvObject + 0x12, bitCount, true);    // dsBm.bmBitsPixel
+        view.setUint32(lpvObject + 0x14, bmBitsPtr >>> 0, true); // dsBm.bmBits
+        view.setUint32(lpvObject + 0x18, 40, true);          // dsBmih.biSize
+        view.setInt32(lpvObject + 0x1C, width, true);        // biWidth
+        view.setInt32(lpvObject + 0x20, biHeight, true);     // biHeight (sign = orientation)
+        view.setUint16(lpvObject + 0x24, 1, true);           // biPlanes
+        view.setUint16(lpvObject + 0x26, bitCount, true);    // biBitCount
+        view.setUint32(lpvObject + 0x28, 0, true);           // biCompression = BI_RGB
+        view.setUint32(lpvObject + 0x2C, stride * height, true); // biSizeImage
+        view.setInt32(lpvObject + 0x30, 0, true);            // biXPelsPerMeter
+        view.setInt32(lpvObject + 0x34, 0, true);            // biYPelsPerMeter
+        view.setUint32(lpvObject + 0x38, obj.data.palette ? (obj.data.palette as Uint32Array).length : 0, true); // biClrUsed
+        view.setUint32(lpvObject + 0x3C, 0, true);           // biClrImportant
+        view.setUint32(lpvObject + 0x40, 0, true);           // dsBitfields[0]
+        view.setUint32(lpvObject + 0x44, 0, true);           // dsBitfields[1]
+        view.setUint32(lpvObject + 0x48, 0, true);           // dsBitfields[2]
+        view.setUint32(lpvObject + 0x4C, 0, true);           // dshSection
+        view.setUint32(lpvObject + 0x50, 0, true);           // dsOffset
+        Logger.verbose(LogCategory.GDI32, `getObject DIBSECTION: ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bmBitsPtr.toString(16)}`);
+        return 0x54;
+    }
+
     if (obj.type === 'BITMAP' && cbBuffer >= 24) {
-        // Write BITMAP structure
-        // bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes, bmBitsPixel, bmBits
+        // Write BITMAP structure: bmType, bmWidth, bmHeight, bmWidthBytes, bmPlanes,
+        // bmBitsPixel, bmBits.
         const width = obj.data?.width || 0;
         const height = obj.data?.height || 0;
+        // A bitmap loaded as a DIBSECTION (LR_CREATEDIBSECTION) exposes its pixel bits:
+        // Win32 GetObject(hDib, sizeof(BITMAP)) fills bmBits with the DIB rows and reports
+        // the DIB's own depth (not a synthetic 32bpp). Sprite loaders that GetObject a DIB
+        // and memcpy bmBits (e.g. WA's FUN_004cf820) get a zero-filled → black sprite if
+        // bmBits is NULL. Materialize the palettized rows once (shared with the 0x54 path).
+        if (obj.data?.dibBits) {
+            const bitCount = (obj.data.bitCount as number) || 32;
+            const stride = (obj.data.dibStride as number) || (((width * bitCount + 31) >> 5) << 2);
+            const dibBits = obj.data.dibBits as Uint8Array;
+            let bmBitsPtr = obj.data.dibBitsPtr as number | undefined;
+            if (!bmBitsPtr) {
+                const proc = System.getInstance().process;
+                bmBitsPtr = proc?.memory.alloc(dibBits.length, "HEAP", "rw") ?? 0;
+                if (bmBitsPtr) {
+                    mem.set(dibBits, bmBitsPtr);
+                    obj.data.dibBitsPtr = bmBitsPtr;
+                }
+            }
+            view.setUint32(lpvObject, 0, true);                 // bmType
+            view.setInt32(lpvObject + 4, width, true);          // bmWidth
+            view.setInt32(lpvObject + 8, height, true);         // bmHeight
+            view.setUint32(lpvObject + 12, stride, true);       // bmWidthBytes
+            view.setUint16(lpvObject + 16, 1, true);            // bmPlanes
+            view.setUint16(lpvObject + 18, bitCount, true);     // bmBitsPixel
+            view.setUint32(lpvObject + 20, bmBitsPtr >>> 0, true); // bmBits
+            Logger.verbose(LogCategory.GDI32, `getObject BITMAP(DIB): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${(bmBitsPtr ?? 0).toString(16)}`);
+            return 24;
+        }
         const widthBytes = width * 4; // RGBA = 4 bytes per pixel
         view.setUint32(lpvObject, 0, true); // bmType = 0
         view.setUint32(lpvObject + 4, width, true); // bmWidth
@@ -194,10 +380,10 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         mem[lpvObject + 20] = lfItalic;                       // +20 lfItalic
         mem[lpvObject + 21] = 0;                              // +21 lfUnderline
         mem[lpvObject + 22] = 0;                              // +22 lfStrikeOut
-        mem[lpvObject + 23] = 0;                              // +23 lfCharSet (DEFAULT_CHARSET=1, ANSI=0)
+        mem[lpvObject + 23] = (obj.lfCharSet ?? DEFAULT_CHARSET) & 0xff; // +23 lfCharSet
         mem[lpvObject + 24] = 0;                              // +24 lfOutPrecision
         mem[lpvObject + 25] = 0;                              // +25 lfClipPrecision
-        mem[lpvObject + 26] = 0;                              // +26 lfQuality
+        mem[lpvObject + 26] = obj.lfQuality ?? 0;             // +26 lfQuality
         mem[lpvObject + 27] = 0;                              // +27 lfPitchAndFamily (DEFAULT_PITCH | FF_DONTCARE)
         // Face name area starts at +28. Both A and W zero the entire array first
         // (LOGFONTA uses 32 bytes, LOGFONTW uses 64 bytes), then write the name.
@@ -221,12 +407,35 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
 }
 
 export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
+    // DeleteObject on a stock object is a successful no-op on Windows. It matters now that
+    // CreatePen(PS_NULL) hands back the stock NULL_PEN: the guest deletes what it created
+    // and must not see a failure.
+    if (isStockObject(hgdiobj)) return true;
+
     const obj = gdi.objects.get(hgdiobj);
 
+    // An HBITMAP lives in the SystemResourceProvider's user table, and the ones minted by
+    // CreateCompatibleBitmap/CreateDIBSection/LoadBitmap have no gdi.objects entry at all —
+    // keying the teardown off gdi.objects alone leaks every one of them (handle slot, pixel
+    // buffer and guest DIB bits) for the life of the process.
+    const provider = System.getInstance().resourceProvider;
+    const bitmapUserObj = (obj?.type === 'BITMAP' ? obj.data : undefined)
+        ?? (obj ? undefined : provider.getUserObject(hgdiobj));
+    const isBitmap = obj?.type === 'BITMAP' || bitmapUserObj?.type === 'BITMAP';
+
     // Clear bitmap-related caches
-    if (obj && obj.type === 'BITMAP') {
+    if (isBitmap) {
+        // Win32 refuses to delete a bitmap that is still selected into a DC and keeps it
+        // alive. Apps routinely delete a back-buffer bitmap before restoring the old one;
+        // destroying it here also deletes the cached DC, losing every later draw into it.
+        if (gdi.isBitmapSelected(hgdiobj)) {
+            Logger.verbose(LogCategory.GDI32,
+                `deleteObject: HBITMAP 0x${hgdiobj.toString(16)} is selected into a DC — refused`);
+            return false;
+        }
+
         // Check if bitmap is still loading (userObj stored in data field)
-        const userObj = obj.data;
+        const userObj = bitmapUserObj;
         if (userObj && userObj.loading) {
             Logger.warn(LogCategory.GDI32,
                 `deleteObject: Deferred delete for loading HBITMAP 0x${hgdiobj.toString(16)}`);
@@ -236,6 +445,13 @@ export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
         // Remove from ImageBitmap caches
         gdi.bitmapImageBitmapCache.delete(hgdiobj);
         gdi.bitmapImageBitmapReady.delete(hgdiobj);
+        gdi.purgeBitmapDC(hgdiobj);
+
+        // Free the guest-heap bmBits materialization (GetObject DIBSECTION path)
+        if (userObj?.dibBitsPtr) {
+            System.getInstance().process?.memory.free(userObj.dibBitsPtr);
+            userObj.dibBitsPtr = 0;
+        }
 
         // Notify DDraw to invalidate bitmapToSurfaceCache
         const system = System.getInstance();
@@ -244,8 +460,11 @@ export function deleteObject(gdi: GDIContext, hgdiobj: number): boolean {
             ddraw.invalidateBitmapCache(hgdiobj);
         }
 
-        // Clear from SystemResourceProvider (prevent memory leak)
-        system.resourceProvider.unregisterUserObject(hgdiobj);
+        // Clear from SystemResourceProvider (frees the handle slot for reuse)
+        const removed = system.resourceProvider.unregisterUserObject(hgdiobj);
+        // A provider-only bitmap has no gdi.objects entry, so the delete below would report
+        // failure for a handle we did in fact destroy.
+        if (!obj) return removed !== null && removed !== undefined;
     }
 
     if (obj && obj.type === 'FONT') {
@@ -358,6 +577,8 @@ export function createCompatibleBitmap(gdi: GDIContext, hdc: number, cx: number,
         height: cy,
         loading: false,
         pixels: pixels,
+        // A DDB's rendered canvas remains authoritative after the first draw.
+        compatibleBitmap: true,
         compatibleEmpty: true,
     };
 
@@ -370,17 +591,32 @@ export function createCompatibleBitmap(gdi: GDIContext, hdc: number, cx: number,
     return handle;
 }
 
-export function createPen(gdi: GDIContext, width: number, color: number): number {
+/**
+ * CreatePen/ExtCreatePen pen object.
+ *
+ * Style handling is gdi32's: a style outside the CreatePen range degrades to PS_SOLID
+ * (gdi32/objects.c CreatePen) and PS_NULL resolves to the stock NULL_PEN rather than a
+ * new object (win32u/pen.c NtGdiCreatePen), so a PS_NULL pen is shareable and compares
+ * equal to GetStockObject(NULL_PEN). Width is |width| and 0 means one device pixel
+ * (get_pen_device_width).
+ */
+export function createPen(gdi: GDIContext, style: number, width: number, color: number): number {
+    const penStyle = (style | 0) & PS_STYLE_MASK;
+    if (penStyle === PS_NULL) return (0x80000000 | STOCK_NULL_PEN) >>> 0;
+
     const cssColor = colorToCss(gdi, color);
     const handle = gdi.nextHgdiobj++;
     gdi.objects.set(handle, {
         handle,
         type: 'PEN',
         data: cssColor,
+        penStyle: penStyle <= PS_INSIDEFRAME ? penStyle : PS_SOLID,
+        penWidth: Math.max(1, Math.abs(width | 0)),
+        penColor: color >>> 0,
     });
     Logger.verbose(
         LogCategory.GDI32,
-        `createPen(width=${width}, color=0x${(color >>> 0).toString(16)}) -> 0x${handle.toString(16)}`,
+        `createPen(style=${penStyle}, width=${width}, color=0x${(color >>> 0).toString(16)}) -> 0x${handle.toString(16)}`,
     );
     return handle;
 }
@@ -399,14 +635,34 @@ export function getSelectedFontFace(gdi: GDIContext, hdc: number): string {
     return 'System';
 }
 
-export function createFont(gdi: GDIContext, height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number): number {
+/**
+ * The REALISED charset of the font selected into hdc — what GetTextCharsetInfo reports.
+ * DEFAULT_CHARSET is resolved here, because that is what Windows does at realisation
+ * time: the query never answers "unspecified".
+ */
+export function getSelectedFontCharset(gdi: GDIContext, hdc: number): number | null {
+    const state = gdi.hdcStates.get(hdc);
+    if (!state) return null;
+    let obj = gdi.objects.get(state.hFont);
+    if (!obj && isStockObject(state.hFont)) {
+        obj = getStockObject(state.hFont) ?? undefined;
+    }
+    if (obj?.type !== 'FONT') return null;
+    return resolveCharset(obj.lfCharSet ?? DEFAULT_CHARSET);
+}
+
+export function createFont(gdi: GDIContext, height: number, width: number, weight: number, italic: boolean, faceName: string, escapement?: number, quality?: number, charSet?: number): number {
     // lfHeight/lfWidth are signed LONGs. CreateFontA/W pass the raw (unsigned) thunk
     // arg, so a negative em-height (e.g. -11) arrives as 0xFFFFFFF5 — coerce to signed
     // or `height < 0` fails and the size balloons to billions of px (off-canvas text).
     height = height | 0;
     width = width | 0;
     const resolvedName = resolveWindowsFontName(faceName);
-    const cacheKey = `${height}-${width}-${weight}-${italic}-${resolvedName}-${escapement || 0}`;
+    // lfCharSet is part of a font's identity, not a display attribute: two fonts that
+    // differ only in charset realise differently and GetTextCharsetInfo must be able to
+    // tell them apart, so it belongs in the key.
+    const lfCharSet = (charSet ?? DEFAULT_CHARSET) & 0xff;
+    const cacheKey = `${height}-${width}-${weight}-${italic}-${resolvedName}-${escapement || 0}-${quality || 0}-${lfCharSet}`;
 
     // Check cache with LRU tracking
     const cachedHandle = gdi.fontCache.get(cacheKey);
@@ -444,6 +700,8 @@ export function createFont(gdi: GDIContext, height: number, width: number, weigh
         lfWidth: width,
         lfWeight: weight,
         lfItalic: italic ? 1 : 0,
+        lfQuality: quality ?? 0,
+        lfCharSet,
         faceName: resolvedName,
     });
 

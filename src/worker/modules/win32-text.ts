@@ -89,6 +89,102 @@ export function measureMnemonicText(
     return ctx.measureText(parseMnemonicText(raw, processPrefix).display).width;
 }
 
+/** GDI TEXTMETRIC fields the control painters lay text out with. */
+export interface GdiTextMetrics {
+    /** tmAscent — baseline offset from the top of the text cell. */
+    ascent: number;
+    /** tmDescent. */
+    descent: number;
+    /** tmHeight — the cell DT_VCENTER centres and DrawText advances by per line. */
+    height: number;
+}
+
+const gdiMetricsCache = new Map<string, GdiTextMetrics>();
+
+/**
+ * Private 1x1 context the metric probe measures on. The painter's own context is
+ * never re-fonted for a measurement: it belongs to a DC whose font is guest state,
+ * and a throw between the probe and the restore would leave the guest's DC drawing
+ * at 100x.
+ */
+let metricProbeCtx: MnemonicTextContext | null | undefined;
+function probeContext(): MnemonicTextContext | null {
+    if (metricProbeCtx === undefined) {
+        metricProbeCtx = typeof OffscreenCanvas === 'undefined'
+            ? null
+            : (new OffscreenCanvas(1, 1).getContext('2d') as MnemonicTextContext | null);
+    }
+    return metricProbeCtx;
+}
+
+/**
+ * TEXTMETRIC of the context's current font, as GDI would report it.
+ *
+ * GDI derives tmAscent/tmDescent from the face's design ascent/descent scaled to
+ * the requested em height, then rounds the CELL up: tmHeight = ceil(ascent +
+ * descent), tmDescent = round(descent), tmAscent = the remainder. Canvas exposes
+ * the same design metrics, but Skia hands them back already rounded to whole
+ * pixels at UI sizes — 11px "Microsoft Sans Serif" reports 10 + 2 where GDI says
+ * 11 + 2 — so the fraction is recovered by measuring the same face 100x larger,
+ * where a rounding of the returned integer cannot hide it. Per font string, cached.
+ */
+export function gdiTextMetrics(ctx: MnemonicTextContext): GdiTextMetrics {
+    const font = ctx.font;
+    const cached = gdiMetricsCache.get(font);
+    if (cached) return cached;
+
+    const px = fontPixelSize(ctx);
+    let ascent = px * 0.92;
+    let descent = px * 0.21;
+    const probeCtx = probeContext();
+    const probe = font.replace(/(\d+(?:\.\d+)?)px/, (_m, n: string) => `${Number(n) * 100}px`);
+    if (probeCtx && probe !== font) {
+        probeCtx.font = probe;
+        if (probeCtx.font === probe) {
+            const m = probeCtx.measureText('x') as TextMetrics;
+            if (typeof m.fontBoundingBoxAscent === 'number' && m.fontBoundingBoxAscent > 0) {
+                ascent = m.fontBoundingBoxAscent / 100;
+                descent = m.fontBoundingBoxDescent / 100;
+            }
+        }
+    }
+
+    const height = Math.ceil(ascent + descent);
+    const tmDescent = Math.round(descent);
+    const metrics: GdiTextMetrics = { ascent: height - tmDescent, descent: tmDescent, height };
+    gdiMetricsCache.set(font, metrics);
+    return metrics;
+}
+
+/** tmHeight of the current font — DrawText's per-line advance. */
+export function textCellHeight(ctx: MnemonicTextContext): number {
+    return gdiTextMetrics(ctx).height;
+}
+
+/**
+ * Baseline for DT_TOP text whose cell starts at `y` — use with textBaseline
+ * "alphabetic".
+ *
+ * Canvas's "top" baseline is Skia's rounded ascent, which is not GDI's tmAscent
+ * (it is a pixel short for the stock GUI font), so every painter positions the
+ * ALPHABETIC baseline — the one place canvas measurement and canvas rendering
+ * agree by definition — and derives it from the TEXTMETRIC above.
+ */
+export function topTextBaseline(ctx: MnemonicTextContext, y: number): number {
+    return y + gdiTextMetrics(ctx).ascent;
+}
+
+/**
+ * Baseline for text vertically centred in a rect, Win32-style.
+ *
+ * DT_VCENTER centres the text CELL: `top + (height - tmHeight) / 2`, truncated,
+ * with the baseline tmAscent below that.
+ */
+export function vcenterTextBaseline(ctx: MnemonicTextContext, y: number, h: number): number {
+    const m = gdiTextMetrics(ctx);
+    return y + Math.floor((h - m.height) / 2) + m.ascent;
+}
+
 function fontPixelSize(ctx: MnemonicTextContext): number {
     const match = /(\d+(?:\.\d+)?)px\b/.exec(ctx.font);
     return match ? Number(match[1]) : 11;
@@ -166,4 +262,24 @@ export function fillTextWithMnemonic(
         drawMnemonicUnderline(ctx, parsed.display, parsed.underlineIndex, x, y);
     }
     return parsed;
+}
+
+/**
+ * DrawState(DSS_DISABLED) — the embossed grey label a BUTTON draws when disabled:
+ * a highlight-coloured copy offset one pixel down-right, then the shadow-coloured
+ * text over it. The STATIC class does not do this; it just recolours to GRAYTEXT.
+ */
+export function fillDisabledTextWithMnemonic(
+    ctx: MnemonicTextContext,
+    raw: string,
+    x: number,
+    y: number,
+    highlight: string,
+    shadow: string,
+    options?: boolean | DrawMnemonicTextOptions,
+): ParsedMnemonicText {
+    ctx.fillStyle = highlight;
+    fillTextWithMnemonic(ctx, raw, x + 1, y + 1, options);
+    ctx.fillStyle = shadow;
+    return fillTextWithMnemonic(ctx, raw, x, y, options);
 }

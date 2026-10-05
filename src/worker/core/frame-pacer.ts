@@ -12,6 +12,8 @@
  * - Fast path: if rAF already fired (game slower than display), returns immediately.
  * - Non-blocking mode: for Blt-to-primary games that issue many Blts per
  *   visual frame, yields at most once per rAF cycle (12ms cooldown).
+ * - waitForPresentInterval(n) is the PRESENT-side entry point: the swap interval the app
+ *   asked for, expressed as refreshes to hold (see PRESENT_INTERVAL_* below).
  *
  * Enabled by default. Adapts to any display refresh rate (60 Hz, 144 Hz, etc.)
  * with sub-millisecond precision (no setTimeout jitter).
@@ -20,6 +22,48 @@
 import { Logger, LogCategory } from "./logger";
 import { frameVarianceDiagnostics } from "./frame-variance-diagnostics";
 import { debugSession } from "./debug/debug-session";
+import { recordGpuError } from "./gpu-error-log";
+
+/**
+ * A present's swap interval, in display refreshes to hold it for. Every legacy API
+ * spells the same three requests differently — D3DPRESENT_INTERVAL_*,
+ * DDFLIP_NOVSYNC/DDFLIP_INTERVALn, grBufferSwap's argument — so they all reduce to
+ * this one number: 0 = "don't wait for a retrace", N = "wait N retraces".
+ */
+export const PRESENT_INTERVAL_IMMEDIATE = 0;
+export const PRESENT_INTERVAL_ONE = 1;
+
+/**
+ * D3DPRESENT_INTERVAL_* → refresh count. d3d8caps.h and d3d9types.h use the identical
+ * encoding, so one decoder serves both backends and they cannot drift. DEFAULT (0) means
+ * ONE, as it does on a real runtime; a value we never advertise falls back to ONE rather
+ * than inventing a cadence the app did not ask for.
+ */
+export function decodeD3DPresentInterval(raw: number): number {
+    const v = raw >>> 0;
+    if (v & 0x80000000) return PRESENT_INTERVAL_IMMEDIATE; // D3DPRESENT_INTERVAL_IMMEDIATE
+    switch (v) {
+        case 0x00000002: return 2; // D3DPRESENT_INTERVAL_TWO
+        case 0x00000004: return 3; // D3DPRESENT_INTERVAL_THREE
+        case 0x00000008: return 4; // D3DPRESENT_INTERVAL_FOUR
+        default: return PRESENT_INTERVAL_ONE; // DEFAULT (0) and ONE (1)
+    }
+}
+
+/**
+ * IMMEDIATE work bound: the compositor puts exactly one image on screen per refresh, so
+ * presents past this count inside a single refresh cannot be seen — they only consume the
+ * worker thread the guest CPU runs on. Far above any rate a period title's own logic gates
+ * on, so the bound is not guest-observable; `__noPresentBackstop` removes it entirely.
+ */
+const IMMEDIATE_PRESENTS_PER_REFRESH = 8;
+
+/**
+ * How long a frame-slot wait may hold when no rAF arrives. Far above any real refresh
+ * interval (so a foreground tab never reaches it and pacing is unchanged), far below the
+ * point where a stalled guest reads as a hang. See parkForPermit.
+ */
+const STALL_RELEASE_MS = 250;
 
 export type FramePacerStats = {
     enabled: boolean;
@@ -27,14 +71,29 @@ export type FramePacerStats = {
     totalWaits: number;
     totalWaitTimeMs: number;
     currentWaitStartMs: number;
+    /** Presents released without a retrace wait (interval IMMEDIATE). */
+    immediatePresents: number;
+    /** Extra refreshes held for interval >= TWO (does not count the first). */
+    heldRefreshes: number;
+    /** Permits the watchdog released because no frame arrived (hidden tab, occluded
+     *  window, stalled compositor). Nonzero means the display stopped, not the guest. */
+    stalledReleases: number;
 };
 
 class FramePacerImpl {
     private enabled = true;  // Enabled by default
     private running = false;
 
-    // Single-waiter queue: at most one Flip/Present awaits the next rAF permit.
-    private waiter: (() => void) | null = null;
+    /** Everyone parked on the next frame permit. A Blt-to-primary and the present it
+     *  triggers can be in flight together, so this is a QUEUE, not a slot: a second
+     *  waiter must neither strand the first (a permanent stall) nor release it early
+     *  (pacing silently off — the guest then free-runs at hundreds of "FPS" with the
+     *  spikes of an unpaced present loop). */
+    private waiters: Array<() => void> = [];
+    /** Watchdog for the parked waiters — see parkForPermit. */
+    private waiterWatchdog: ReturnType<typeof setTimeout> | null = null;
+    /** Permits released by the watchdog because no frame arrived (reported in stats). */
+    private stalledReleases = 0;
 
     // Per-frame callbacks: fired once per rAF, synchronized with display refresh.
     // Used by THRASH auto-presenter and other subsystems that need frame-boundary events.
@@ -62,6 +121,12 @@ class FramePacerImpl {
     private totalWaitTimeMs = 0;
     private currentWaitStartMs = 0;
     private slotBusy = false;
+    private immediatePresents = 0;
+    private heldRefreshes = 0;
+
+    // IMMEDIATE backstop bookkeeping: presents released inside the current vsync (rafTick).
+    private immediateTick = -1;
+    private immediateCount = 0;
 
     // Adaptive smooth-pacing (opt-in via setPacingMode('smooth')). A sub-refresh guest
     // (~23 FPS on 60 Hz) otherwise lands each frame at an arbitrary phase → held 2 or 3
@@ -91,11 +156,8 @@ class FramePacerImpl {
     /** Stop the rAF loop (e.g. on emulator teardown). */
     stop(): void {
         this.running = false;
-        // Release any blocked waiter so it doesn't hang forever
-        if (this.waiter) {
-            this.waiter();
-            this.waiter = null;
-        }
+        // Release anyone blocked so they don't hang forever
+        this.releaseWaiters();
     }
 
     setEnabled(enabled: boolean): void {
@@ -103,13 +165,8 @@ class FramePacerImpl {
         if (enabled && !this.running) {
             this.start();
         }
-        if (!enabled) {
-            // Release any blocked waiter
-            if (this.waiter) {
-                this.waiter();
-                this.waiter = null;
-            }
-        }
+        // Release anyone blocked — nothing will grant a permit once disabled.
+        if (!enabled) this.releaseWaiters();
     }
 
     isEnabled(): boolean {
@@ -195,9 +252,7 @@ class FramePacerImpl {
         this.totalWaits++;
 
         // Wait for the next rAF permit
-        await new Promise<void>(resolve => {
-            this.waiter = resolve;
-        });
+        await this.parkForPermit();
 
         const wallElapsed = performance.now() - wallBefore;
         this.totalWaitTimeMs += wallElapsed;
@@ -206,6 +261,57 @@ class FramePacerImpl {
 
         // Record display-bound idle for diagnostics.
         frameVarianceDiagnostics.recordIdleTime('raf_wait', wallElapsed);
+    }
+
+    /**
+     * Present-side pacing: hold this present for `refreshes` display refreshes.
+     *
+     * 1 (D3DPRESENT_INTERVAL_ONE/DEFAULT, a plain Flip, grBufferSwap(1)) IS the
+     * waitForFrameSlot() path verbatim; >1 holds that many further refreshes on top;
+     * 0 is IMMEDIATE (waitImmediate). `__forcePresentInterval` overrides every caller
+     * globally — the one escape hatch, never a per-title branch.
+     */
+    waitForPresentInterval(refreshes: number): Promise<void> {
+        if (!this.enabled || !this.running) return Promise.resolve();
+        const forced = (globalThis as Record<string, unknown>).__forcePresentInterval;
+        const n = Math.max(0, (typeof forced === 'number' ? forced : refreshes) | 0);
+        if (n === PRESENT_INTERVAL_IMMEDIATE) return this.waitImmediate();
+        // NOT `async`, and interval 1 RETURNS waitForFrameSlot rather than awaiting it.
+        // An async wrapper costs a microtask turn before the wait even begins, and a
+        // present that fits the refresh by a hair (this title clears it by ~0.7ms) then
+        // crosses the deadline and loses a WHOLE refresh — measured as a hard lock to
+        // half rate, with the worker idle half the time. The common path must add nothing.
+        if (n <= PRESENT_INTERVAL_ONE) return this.waitForFrameSlot();
+        return this.holdRefreshes(n);
+    }
+
+    private async holdRefreshes(n: number): Promise<void> {
+        await this.waitForFrameSlot();
+        for (let i = 1; i < n && this.enabled && this.running; i++) {
+            this.heldRefreshes++;
+            await this.awaitRafPermit();
+        }
+    }
+
+    /**
+     * IMMEDIATE: the app asked us not to wait for a retrace, so we don't — an unbounded
+     * rate is the contract. The only intervention is the invisible-work bound
+     * (IMMEDIATE_PRESENTS_PER_REFRESH), which degrades to a single-refresh wait. An
+     * explicitly selected pacing mode wins: 'vsync'/'smooth' exist to force a cadence.
+     */
+    private async waitImmediate(): Promise<void> {
+        this.immediatePresents++;
+        if (this.pacingMode !== 'off') return this.waitForFrameSlot();
+
+        if (this.immediateTick !== this.rafTick) {
+            this.immediateTick = this.rafTick;
+            this.immediateCount = 0;
+        }
+        if (++this.immediateCount <= IMMEDIATE_PRESENTS_PER_REFRESH ||
+            (globalThis as Record<string, unknown>).__noPresentBackstop) {
+            return;
+        }
+        await this.waitForFrameSlot();
     }
 
     setPacingMode(mode: 'off' | 'vsync' | 'smooth'): void {
@@ -234,7 +340,7 @@ class FramePacerImpl {
         this.slotBusy = true;
         const wallBefore = performance.now();
         this.currentWaitStartMs = wallBefore;
-        await new Promise<void>(resolve => { this.waiter = resolve; });
+        await this.parkForPermit();
         const wallElapsed = performance.now() - wallBefore;
         this.totalWaitTimeMs += wallElapsed;
         this.slotBusy = false;
@@ -245,7 +351,49 @@ class FramePacerImpl {
     /** Await exactly one rAF permit (fast-path the pre-queued one). */
     private awaitRafPermit(): Promise<void> {
         if (this.permitAvailable) { this.permitAvailable = false; return Promise.resolve(); }
-        return new Promise<void>(resolve => { this.waiter = resolve; });
+        return this.parkForPermit();
+    }
+
+    /**
+     * Park until the next frame — but never longer than STALL_RELEASE_MS.
+     *
+     * The permit comes from requestAnimationFrame, and rAF is DELIVERY-CONDITIONAL: a hidden
+     * tab, a window another window covers (Chrome's native occlusion), a compositor that
+     * stops for any other reason — and callbacks simply stop arriving, with
+     * `document.visibilityState` still reporting "visible". A pacer that only ever wakes on
+     * rAF then holds its waiter forever, and because a Blt/Flip to the primary is an ASYNC
+     * THUNK, the guest thread that issued it stays parked with it: the emulator does not slow
+     * down, it stops, and only starts again when someone looks at the tab. Pacing to a display
+     * that is not producing frames is meaningless anyway — releasing is the honest answer.
+     *
+     * Everyone parked here is waiting for the SAME thing — the next frame — so a frame
+     * releases all of them, and a late arrival joins the queue instead of displacing whoever
+     * is already in it.
+     */
+    private parkForPermit(): Promise<void> {
+        return new Promise<void>((resolve) => {
+            this.waiters.push(resolve);
+            if (this.waiterWatchdog === null) {
+                this.waiterWatchdog = setTimeout(() => {
+                    this.waiterWatchdog = null;
+                    if (!this.waiters.length) return;
+                    this.stalledReleases++;
+                    this.releaseWaiters();
+                }, STALL_RELEASE_MS);
+            }
+        });
+    }
+
+    /** Hand the permit to everyone parked (from rAF, the watchdog, or teardown). */
+    private releaseWaiters(): void {
+        if (this.waiterWatchdog !== null) {
+            clearTimeout(this.waiterWatchdog);
+            this.waiterWatchdog = null;
+        }
+        if (!this.waiters.length) return;
+        const pending = this.waiters;
+        this.waiters = [];
+        for (const resolve of pending) resolve();
     }
 
     /**
@@ -344,6 +492,9 @@ class FramePacerImpl {
             totalWaits: this.totalWaits,
             totalWaitTimeMs: this.totalWaitTimeMs,
             currentWaitStartMs: this.currentWaitStartMs,
+            immediatePresents: this.immediatePresents,
+            heldRefreshes: this.heldRefreshes,
+            stalledReleases: this.stalledReleases,
         };
     }
 
@@ -351,6 +502,9 @@ class FramePacerImpl {
         this.totalWaits = 0;
         this.totalWaitTimeMs = 0;
         this.currentWaitStartMs = 0;
+        this.immediatePresents = 0;
+        this.heldRefreshes = 0;
+        this.stalledReleases = 0;
     }
 
     // --- Internal ---
@@ -388,31 +542,42 @@ class FramePacerImpl {
         this.lastRafTime = now;
 
         // Grant the permit: release the waiting Flip/Present
-        if (this.waiter) {
-            const resolve = this.waiter;
-            this.waiter = null;
-
+        if (this.waiters.length) {
             // Record the actual wait time for diagnostics
             if (frameVarianceDiagnostics.isEnabled() && this.currentWaitStartMs > 0) {
                 const waitMs = now - this.currentWaitStartMs;
                 frameVarianceDiagnostics.recordRafWait(waitMs, now);
                 frameVarianceDiagnostics.recordEvent('frame_pacer_wait', undefined, waitMs);
             }
-
-            resolve();
+            this.releaseWaiters();
         } else {
             // No one waiting — queue one permit for next waitForFrameSlot().
             // Only one permit queued at a time (no accumulation).
             this.permitAvailable = true;
         }
 
-        // Fire per-frame callbacks (e.g. THRASH auto-presenter)
+        // Fire per-frame callbacks (e.g. THRASH auto-presenter). Guarded individually:
+        // scheduleNext() below is the ONLY thing that re-arms rAF, so a throw escaping here
+        // stops the pacer for the rest of the session with `running` still true — a freeze
+        // that reads as a guest hang and leaves no trace of what threw.
         for (const cb of this.frameCallbacks) {
-            cb();
+            try {
+                cb();
+            } catch (e) {
+                recordGpuError("callback", "framePacer.frameCallback", String(e));
+                Logger.error(LogCategory.SYSTEM, `[FRAME-PACER] frame callback threw: ${e}`);
+            }
         }
 
-        // Poll debug session memory watches (~60Hz, zero-cost when disabled)
-        debugSession.pollMemWatches();
+        // Poll debug session memory watches (~60Hz, zero-cost when disabled).
+        // A debug watch is user-provided code and must not be able to strand the
+        // pacer with `running === true`; scheduleNext() is the one re-arm point.
+        try {
+            debugSession.pollMemWatches();
+        } catch (e) {
+            recordGpuError("callback", "framePacer.pollMemWatches", String(e));
+            Logger.error(LogCategory.SYSTEM, `[FRAME-PACER] memory watch threw: ${e}`);
+        }
 
         this.scheduleNext();
     }

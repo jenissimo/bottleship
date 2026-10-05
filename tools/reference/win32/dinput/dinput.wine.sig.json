@@ -1,0 +1,35 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.885Z",
+  "module": "dinput",
+  "functions": [
+    {
+      "name": "DirectInputCreateA",
+      "argCount": 4
+    },
+    {
+      "name": "DirectInputCreateEx",
+      "argCount": 5
+    },
+    {
+      "name": "DirectInputCreateW",
+      "argCount": 4
+    },
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    }
+  ]
+}

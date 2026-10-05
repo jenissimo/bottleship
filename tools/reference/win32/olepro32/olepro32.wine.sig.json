@@ -1,0 +1,79 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.930Z",
+  "module": "olepro32",
+  "functions": [
+    {
+      "name": "DllCanUnloadNow",
+      "argCount": 0
+    },
+    {
+      "name": "DllGetClassObject",
+      "argCount": 3
+    },
+    {
+      "name": "DllRegisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "DllUnregisterServer",
+      "argCount": 0
+    },
+    {
+      "name": "OleCreateFontIndirect",
+      "argCount": 3
+    },
+    {
+      "name": "OleCreatePictureIndirect",
+      "argCount": 4
+    },
+    {
+      "name": "OleCreatePropertyFrame",
+      "argCount": 11
+    },
+    {
+      "name": "OleCreatePropertyFrameIndirect",
+      "argCount": 1
+    },
+    {
+      "name": "OleIconToCursor",
+      "argCount": 2
+    },
+    {
+      "name": "OleLoadPicture",
+      "argCount": 5
+    },
+    {
+      "name": "OleTranslateColor",
+      "argCount": 3
+    },
+    {
+      "name": "ord_248",
+      "argCount": 2
+    },
+    {
+      "name": "ord_249",
+      "argCount": 1
+    },
+    {
+      "name": "ord_250",
+      "argCount": 11
+    },
+    {
+      "name": "ord_251",
+      "argCount": 5
+    },
+    {
+      "name": "ord_252",
+      "argCount": 4
+    },
+    {
+      "name": "ord_253",
+      "argCount": 3
+    },
+    {
+      "name": "ord_254",
+      "argCount": 3
+    }
+  ]
+}

@@ -15,6 +15,7 @@ import { createWglExports } from "./wgl";
 import { createListExports } from "./lists";
 import { createArrayExports } from "./arrays";
 import { createMultitextureExports } from "./multitexture";
+import { registerWriteBufferGLStateFunctions } from "./wbuf-state";
 import { GL_COMPILE } from "./constants";
 
 export class OpenGL32 implements IModule {
@@ -75,6 +76,10 @@ export class OpenGL32 implements IModule {
         // Stubs may not exist yet (PE loading is deferred); registerWriteBufferGLFunctions
         // uses the pending-registration mechanism and will be applied at applyPendingRegistrations().
         registerWriteBufferGLFunctions(process.dispatcher, this.context);
+
+        // State / bind / array-pointer entrypoints drain through the table above, so this
+        // must run AFTER the display-list wrapper has replaced every entry.
+        registerWriteBufferGLStateFunctions(process.dispatcher, this.exports);
     }
 
     setBackend(backend: WebGPUBackend): void {

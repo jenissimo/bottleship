@@ -9,6 +9,10 @@
  *   bun tools/harness.ts repl               interactive: eval lines in the page
  *   bun tools/harness.ts health             probe Vite/log-server/Chrome
  *   bun tools/harness.ts eval <expr>        one-off page eval (debug)
+ *   bun tools/harness.ts heapsample [sec] [top] [--major]   rank the worker's JS allocation sites
+ *                                           (GC pressure; --major = only what full GCs reclaim)
+ *   bun tools/harness.ts heapsnap [top]     worker JS heap residents by constructor (GC pause size)
+ *   bun tools/harness.ts audiocapture [sec] [out.wav]  record the final audio mix to a WAV
  *
  * Scripts import the fluent builder from here:
  *     import { harness } from "../tools/harness";
@@ -17,26 +21,67 @@
  *                    .expectSurfaceNonBlack("primary").state(["surfaces"]).run();
  *
  * The builder is pure sugar over harness_rpc: `.run()` ships the serialized step
- * list to `window.__BS__.harness.__runSteps` in the page over a single CDP eval.
+ * list to `window.__BS__.harness.__runSteps` in the page over a single CDP eval —
+ * except the CDP_STEPS verbs (reload + the touch/device verbs), which the CLI runs
+ * itself against the browser and splices back into the same ordered result.
+ *
+ * Parallel agents: `BS_TAB=<name>` binds every command to the `?game=dev&bs=<name>` tab
+ * and re-roots this run's artifacts under `logs/<name>/`. Several agents can then bring up
+ * several games in one Chrome without reading each other's evidence. Unset = unchanged.
+ * Bring-up only — `trace` refuses to measure while a second guest is running.
  */
 
 import {
     launchOrAttachChrome,
+    ensureVite,
+    ensureSidecar,
+    reloadDevPage,
     findOrCreateTab,
+    listSessionTabs,
+    cdpSession,
     connect,
     pageEval,
     workerEval,
     workerStack,
+    workerHeapSample,
+    workerHeapSnapshotSummary,
+    captureAudioOutput,
     screenshot,
+    captureTrace,
     health,
     CdpSession,
     DEFAULT_DEV_URL,
+    setPointerLock,
 } from "./cdp-core";
+import { resolve as resolvePath, sep } from "node:path";
+import { readdirSync } from "node:fs";
+import { readCanvasGeometry } from "./cdp-geometry";
+import { watchWorkerHealth, formatWorkerHealth } from "./cdp-worker-health";
+import { listCrashes, formatCrash } from "./cdp-crashes";
+import { DEFAULT_TRACE_CATEGORIES } from "./cdp-core";
+import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
+import { hostClick, hostMove } from "./cdp-mouse";
 import { HarnessChain } from "../src/harness/dsl";
-import type { HarnessStep, HarnessRunResult } from "../src/harness/types";
+import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "../src/harness/types";
 import { runResultToJournal } from "../src/harness/journal";
+import { sessionArtifactPath } from "../src/harness/session";
 
 let _session: CdpSession | null = null;
+
+/** Release the CLI transport after an importing tool finishes its harness work. */
+export function closeHarnessConnection(): void {
+    _session?.close();
+    _session = null;
+}
+
+/** The tab this process drives (`BS_TAB`); "" = the default single-tab session. */
+const SESSION = cdpSession();
+
+/** Re-root a default artifact path under `logs/<session>/` so two tabs never overwrite
+ *  each other's evidence. An explicitly passed output path is left alone. */
+function artifact(path: string): string {
+    return sessionArtifactPath(path, SESSION);
+}
 
 async function ensureSession(): Promise<CdpSession> {
     if (_session) return _session;
@@ -70,60 +115,115 @@ async function waitForHarnessReady(session: CdpSession): Promise<void> {
     ).catch(() => {});
 }
 
-/** Hard-reload ?game=dev and wait for a fresh worker + harness facade. */
+/** Hard-reload ?game=dev and wait for a fresh worker + harness facade.
+ *  A marker on the pre-reload document distinguishes it from the fresh one —
+ *  polling readiness alone races navigation commit and can match the OLD page. */
 async function reloadPageAndWait(session: CdpSession): Promise<void> {
+    await pageEval(session, "window.__bs_pre_reload__ = 1, 'ok'", { timeoutMs: 5000 }).catch(() => {});
     await session.send("Page.reload", { ignoreCache: true });
+    for (let i = 0; i < 120; i++) {
+        const fresh = await pageEval(
+            session,
+            "!window.__bs_pre_reload__ && !!(window.__BS__ && window.__BS__.harness && window.loadApp)",
+            { timeoutMs: 5000 },
+        ).catch(() => false);
+        if (fresh) break;
+        await Bun.sleep(500);
+    }
     await waitForHarnessReady(session);
 }
 
 let _journalSeq = 0;
 
-/** CLI-side step executor: ship the step list to the page and return its POJO,
- *  then write a re-runnable journal artifact. */
-async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
-    const session = await ensureSession();
-    const pageSteps = steps.filter((s) => s.cmd !== "reload");
-    const preflight: HarnessRunResult = { ok: true, steps: [], named: {} };
+/** Verbs the CLI executes over CDP itself instead of shipping to the page: the
+ *  page can neither reload itself mid-chain nor synthesize trusted touch input. */
+const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "pointerLock", "evalPage", "hostClick", "hostMove"]);
 
-    if (steps.some((s) => s.cmd === "reload")) {
-        const t0 = Date.now();
-        try {
-            await reloadPageAndWait(session);
-            const sr = { cmd: "reload", ok: true as const, result: { reloaded: true }, ms: Date.now() - t0 };
-            preflight.steps.push(sr);
-            preflight.named.reload = sr.result;
-        } catch (err) {
-            const e = err as Error;
-            preflight.ok = false;
-            preflight.steps.push({
-                cmd: "reload",
-                ok: false,
-                error: { message: e.message },
-                ms: Date.now() - t0,
-            });
-            preflight.error = { message: e.message, atStep: 0, cmd: "reload" };
-            return preflight;
-        }
+async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unknown> {
+    const a = step.args as (number | string | undefined)[];
+    const n = (i: number) => Number(a[i]);
+    const opt = (i: number) => (a[i] === undefined || a[i] === null ? undefined : Number(a[i]));
+    switch (step.cmd) {
+        case "reload": await reloadPageAndWait(session); return { reloaded: true };
+        case "device": return applyDevice(session, String(a[0]));
+        case "tap": return tap(session, n(0), n(1));
+        case "touchDrag": return touchDrag(session, n(0), n(1), n(2), n(3), opt(4));
+        case "longPress": return longPress(session, n(0), n(1), opt(2));
+        case "twoFingerTap": return twoFingerTap(session, n(0), n(1), opt(2));
+        case "pinch": return pinch(session, n(0), n(1), n(2), { ms: opt(3) });
+        case "pointerLock": return setPointerLock(session, a[0] !== false && a[0] !== 0);
+        // The browser's own input stack — everything in front of the SAB that the
+        // worker-side injectors skip, Pointer Lock engagement included.
+        case "hostClick": return hostClick(session, (step.args[0] ?? {}) as Parameters<typeof hostClick>[1]);
+        case "hostMove": return hostMove(session, n(0), n(1), opt(2) ?? 1);
+        // Reading the CANVAS is a page-side act: the worker's own screenshot routes cannot see
+        // what the compositor put on screen, and a PNG round-trip through `shot` throws away
+        // the pixels a numeric assertion needs.
+        case "evalPage": return pageEval(session, String(a[0] ?? ""), { timeoutMs: Number(a[1] ?? 15000) });
     }
+    throw new Error(`no CDP handler for step '${step.cmd}'`);
+}
 
-    if (pageSteps.length === 0) return preflight;
-
+/** Ship a contiguous run of page steps to `__runSteps` in one eval. */
+async function runPageSteps(session: CdpSession, steps: HarnessStep[]): Promise<HarnessRunResult> {
     // Double-stringify so the steps reach the page as a string the page JSON.parses
     // (avoids brittle expression escaping).
-    const payload = JSON.stringify(JSON.stringify(pageSteps));
+    const payload = JSON.stringify(JSON.stringify(steps));
     const expr = `window.__BS__ && window.__BS__.harness ? window.__BS__.harness.__runSteps(JSON.parse(${payload})) : Promise.reject(new Error('harness facade not installed (open ?game=dev)'))`;
-    // Generous timeout: chains can include long waits (tickFrames, waitForEvent).
-    const result = (await pageEval(session, expr, { timeoutMs: 300_000 })) as HarnessRunResult;
-    if (preflight.steps.length > 0) {
-        result.steps = [...preflight.steps, ...result.steps];
-        result.named = { ...preflight.named, ...result.named };
-        if (preflight.error) {
+    // The batch outlives its slowest step, so the CLI budget is the SUM of the per-step
+    // budgets the chain asked for (tickFrames/waitUntil set theirs explicitly) plus slack.
+    // A flat cap would abandon the eval while the chain is still legitimately running — and
+    // the page keeps going, so the run reads as a timeout while the guest is mid-load.
+    const budget = steps.reduce((sum, s) => sum + (s.opts?.timeoutMs ?? 30_000), 0);
+    return (await pageEval(session, expr, { timeoutMs: Math.max(300_000, budget + 60_000) })) as HarnessRunResult;
+}
+
+/** CLI-side step executor: run CDP verbs here, batch everything else into the page,
+ *  splice both back into ONE ordered result, then write a re-runnable journal.
+ *  Order is preserved step-by-step — a chain may interleave the two freely
+ *  (`.device(..).openWgb(..).tap(..).state(..)`). */
+async function execViaCdp(steps: HarnessStep[]): Promise<HarnessRunResult> {
+    const session = await ensureSession();
+    const result: HarnessRunResult = { ok: true, steps: [], named: {} };
+
+    for (let i = 0; i < steps.length;) {
+        const step = steps[i];
+        if (CDP_STEPS.has(step.cmd)) {
+            const t0 = Date.now();
+            try {
+                const r = await runCdpStep(session, step);
+                const sr: HarnessStepResult = { cmd: step.cmd, label: step.label, ok: true, result: r, ms: Date.now() - t0 };
+                result.steps.push(sr);
+                result.named[step.cmd] = r;
+            } catch (err) {
+                const e = err as Error;
+                result.steps.push({ cmd: step.cmd, label: step.label, ok: false, error: { message: e.message }, ms: Date.now() - t0 });
+                result.ok = false;
+                result.error = { message: e.message, atStep: i, cmd: step.cmd };
+                break;
+            }
+            i++;
+            continue;
+        }
+        const start = i;
+        while (i < steps.length && !CDP_STEPS.has(steps[i].cmd)) i++;
+        const sub = await runPageSteps(session, steps.slice(start, i));
+        result.steps.push(...(sub.steps ?? []));
+        Object.assign(result.named, sub.named ?? {});
+        if (!sub.ok) {
             result.ok = false;
-            result.error = preflight.error;
+            // The page numbers steps within its batch; re-base onto the whole chain.
+            result.error = sub.error ? { ...sub.error, atStep: start + sub.error.atStep } : { message: "page batch failed", atStep: start, cmd: steps[start].cmd };
+            if (sub.faultSnapshot !== undefined) result.faultSnapshot = sub.faultSnapshot;
+            break;
         }
     }
+
     try {
-        const file = `logs/harness/run-${++_journalSeq}.harness.ts`;
+        // The PID is part of the name: `_journalSeq` is per-process, so two agents sharing one
+        // BS_TAB (or one agent running two scripts) both wrote run-1 and the second silently
+        // replaced the first's evidence.
+        const file = artifact(`logs/harness/run-${process.pid}-${++_journalSeq}.harness.ts`);
         await Bun.write(file, runResultToJournal(steps, result));
         console.log(`[harness] journal -> ${file} (${result.ok ? "ok" : "FAILED at step " + result.error?.atStep})`);
     } catch { /* logs/ may not exist; non-fatal */ }
@@ -139,6 +239,14 @@ export function harness(): HarnessChain {
 
 async function cmdUp(): Promise<void> {
     console.log("[harness up] probing services…");
+    // Before the page exists: the loader probes :3001 ONCE per page and caches it, so a tab
+    // opened while the sidecar is down streams every bundle through Vite for its whole life.
+    const s = await ensureSidecar();
+    console.log(`[harness up] sidecar: ${s.action}${s.ok ? "" : " — NOT SERVING"}`);
+    // Before Chrome: a wedged Vite makes every guest look broken, and several agents each
+    // starting their own Vite is what wedges it. ensureVite locks, repairs and waits.
+    const v = await ensureVite();
+    console.log(`[harness up] vite: ${v.action}${v.ok ? "" : " — NOT SERVING"}`);
     await launchOrAttachChrome({ autoplay: true });
     const tab = await findOrCreateTab(DEFAULT_DEV_URL);
     const session = await CdpSession.connect(tab.webSocketDebuggerUrl);
@@ -146,15 +254,52 @@ async function cmdUp(): Promise<void> {
     await waitForHarnessReady(session);
     const h = await health();
     console.log("[harness up] services:", JSON.stringify(h));
-    const ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
+    if (h.vite && !h.viteTransform) {
+        console.warn("[harness up] WARNING: Vite answers the root but will not transform modules — the page will load and render nothing. Restart the dev server (wait for :5174 to be released first); do not debug the guest until this is green.");
+    }
+    if (h.logArchive) {
+        console.warn(`[harness up] WARNING: the log archive is degraded — ${h.logArchive.droppedLines} lines dropped, ` +
+            `${h.logArchive.writeErrors} failed appends${h.logArchive.lastError ? ` (${h.logArchive.lastError})` : ""}. ` +
+            "logsSince/streamLogs will have holes; check disk space and logs/dev-sidecar.err.log.");
+    }
+    let ping = await pageEval(session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
+    // A tab opened while Vite was wedged holds a dead page forever: the module graph never
+    // loaded, so there is no harness facade and no worker — while `health()` still reports
+    // devTab true, because the tab EXISTS. Reload once rather than hand back a green report
+    // over a tab nothing can drive.
+    if ((ping as { error?: string }).error) {
+        console.log("[harness up] no harness in the tab — reloading it once");
+        await reloadDevPage();
+        const tab2 = await findOrCreateTab(DEFAULT_DEV_URL);
+        _session = await CdpSession.connect(tab2.webSocketDebuggerUrl);
+        await waitForHarnessReady(_session);
+        ping = await pageEval(_session, "window.__BS__.harness.ping()", { timeoutMs: 8000 }).catch((e) => ({ error: String(e) }));
+    }
     console.log("[harness up] worker ping:", JSON.stringify(ping));
     console.log(`[harness up] ready — tab ${tab.id} (${tab.url})`);
+    if (SESSION) console.log(`[harness up] session '${SESSION}' — artifacts under logs/${SESSION}/`);
 }
 
 async function cmdRun(scriptPath: string): Promise<void> {
     if (!scriptPath) throw new Error("usage: harness run <script.harness.ts>");
     const abs = scriptPath.startsWith("/") || /^[A-Za-z]:/.test(scriptPath) ? scriptPath : `${process.cwd()}/${scriptPath}`;
+    // A missing script must be an ERROR, not a quiet success: `run` on a path that does
+    // not exist otherwise prints the banner, exits 0, and reads exactly like a run whose
+    // assertions all passed.
+    if (!(await Bun.file(abs).exists())) {
+        throw new Error(`harness run: script not found: ${abs}`);
+    }
     console.log(`[harness run] ${abs}`);
+    // An absolute self-import re-enters this file as the process entry (see the CLI guard at
+    // the bottom). The guard stops the recursion; naming it here is what stops the next
+    // half-hour of confusion.
+    try {
+        const src = await Bun.file(abs).text();
+        if (/from\s+["'][A-Za-z]:[\/][^"']*\/tools\/harness["']/.test(src) || /from\s+["']\/[^"']*\/tools\/harness["']/.test(src)) {
+            console.warn("[harness run] this script imports tools/harness by ABSOLUTE path — that "
+                + "re-evaluates the CLI module. Use a relative import, or `harness eval`.");
+        }
+    } catch { /* unreadable source is the import's problem, not ours */ }
     // The script imports { harness } from this module and runs its chain(s) at
     // import time; we just await the module evaluation.
     await import(abs);
@@ -185,7 +330,9 @@ async function cmdHealth(): Promise<void> {
 
 async function cmdEval(expr: string): Promise<void> {
     const session = await ensureSession();
-    console.log(JSON.stringify(await pageEval(session, expr, { timeoutMs: 60_000 }), null, 2));
+    // Hand-typed evals stand in for a human at the keyboard: carry user activation so
+    // gesture-gated APIs (pointer lock, fullscreen) are reachable from the CLI.
+    console.log(JSON.stringify(await pageEval(session, expr, { timeoutMs: 60_000, userGesture: true }), null, 2));
 }
 
 /** worker-eval <expr> — eval in the WORKER context (replaces cdp-worker-eval). */
@@ -210,13 +357,232 @@ async function cmdStack(samplesArg?: string): Promise<void> {
     });
 }
 
-/** shot [out.png] — page screenshot to a file (replaces cdp-shot). */
-async function cmdShot(out: string): Promise<void> {
+/** heapsample [seconds] [top] — who feeds the worker's GC. A MajorGC or a dozen MinorGCs a
+ *  second stall every guest thread at once (an audio pump misses its deadline, a frame
+ *  hitches) and nothing guest-side can see it; this names the allocating frames by bytes/s. */
+async function cmdHeapSample(...args: string[]): Promise<void> {
+    const session = await ensureSession();
+    const majorOnly = args.includes("--major");
+    const [secondsArg, topArg] = args.filter((a) => !a.startsWith("--"));
+    const r = await workerHeapSample(session, {
+        seconds: secondsArg ? Number(secondsArg) : 5,
+        top: topArg ? Number(topArg) : 25,
+        majorOnly,
+    });
+    if (majorOnly) console.log("(objects that survived the young generation — what paces full GCs)");
+    console.log(`worker allocation ≈ ${(r.totalBytesPerSec / 1048576).toFixed(1)} MB/s (sampled); `
+        + `JS heap ${r.heapUsedMB ?? "?"} / ${r.heapTotalMB ?? "?"} MB used/total`);
+    for (const s of r.sites) {
+        console.log(`  ${String(s.pct).padStart(5)}%  ${(s.bytesPerSec / 1048576).toFixed(2).padStart(6)} MB/s  ${s.functionName} (${s.url}:${s.line})`);
+    }
+}
+
+/** heapsnap [top] — what is RESIDENT in the worker's JS heap, by constructor. A full GC's pause
+ *  scales with the live heap; heapsample names the churn, this names the residents. */
+async function cmdHeapSnap(topArg?: string): Promise<void> {
+    const session = await ensureSession();
+    const r = await workerHeapSnapshotSummary(session, { top: topArg ? Number(topArg) : 30 });
+    console.log(`worker JS heap snapshot: ${r.totalMB} MB self-size total`);
+    for (const x of r.rows) console.log(`  ${x.selfMB.toFixed(2).padStart(8)} MB  ${String(x.count).padStart(8)}  ${x.type}  ${x.name}`);
+    console.log("strings by prefix:");
+    for (const x of r.stringPrefixes) console.log(`  ${x.MB.toFixed(2).padStart(8)} MB  ${String(x.count).padStart(8)}  ${JSON.stringify(x.prefix)}`);
+}
+
+/** audiocapture [seconds] [out.wav] — record the FINAL audio mix (what the speakers get) to a
+ *  16-bit WAV and print its rate, latency and clipped-frame count. Ring and worklet counters
+ *  describe intermediate stages; this is the artifact to listen to or analyse. */
+async function cmdAudioCapture(secondsArg?: string, outArg?: string): Promise<void> {
+    const session = await ensureSession();
+    const r = await captureAudioOutput(session, secondsArg ? Number(secondsArg) : 10);
+    const out = outArg ?? artifact("logs/audio-capture.wav");
+    const hdr = Buffer.alloc(44);
+    hdr.write("RIFF", 0); hdr.writeUInt32LE(36 + r.pcm.length, 4); hdr.write("WAVE", 8); hdr.write("fmt ", 12);
+    hdr.writeUInt32LE(16, 16); hdr.writeUInt16LE(1, 20); hdr.writeUInt16LE(2, 22); hdr.writeUInt32LE(r.rate, 24);
+    hdr.writeUInt32LE(r.rate * 4, 28); hdr.writeUInt16LE(4, 32); hdr.writeUInt16LE(16, 34);
+    hdr.write("data", 36); hdr.writeUInt32LE(r.pcm.length, 40);
+    await Bun.write(out, Buffer.concat([hdr, r.pcm]));
+    console.log(JSON.stringify({ out, rate: r.rate, frames: r.frames, clippedFrames: r.clippedFrames,
+        baseLatency: r.baseLatency, outputLatency: r.outputLatency }));
+}
+
+/**
+ * fixture save|restore <name> [--container C] — a game's persisted profile (its
+ * OPFS CoW overlay) as a checked-in artifact.
+ *
+ * Why the disk half lives here and not in a harness verb: the worker can reach
+ * OPFS but not the filesystem, and the dev sidecar's writer is jailed to the log
+ * dir (resolveSafeLogPath), so it can neither address fixtures/ nor keep a path
+ * component containing a space.
+ *
+ * RESTORE BEFORE LOADING THE BUNDLE — a running game holds these files open.
+ */
+/**
+ * Join a container-relative path onto the fixture dir, refusing anything that leaves it.
+ * The path comes from the GUEST (a `containerList` entry), so a `..` component would have
+ * `fixture save` write over the checkout.
+ */
+function fixturePath(dir: string, p: string): string {
+    const root = resolvePath(dir);
+    const abs = resolvePath(root, p.replace(/^[\\/]+/, ""));
+    if (abs !== root && !abs.startsWith(root + sep)) {
+        throw new Error(`fixture entry "${p}" resolves outside ${dir}`);
+    }
+    return abs;
+}
+
+async function cmdFixture(mode: string, name: string, args: string[]): Promise<void> {
+    if (!name) throw new Error("usage: fixture <save|restore> <name> [--container <id>]");
+    if (/[\\/]/.test(name) || name === "." || name === "..") throw new Error(`bad fixture name "${name}"`);
+    const dir = `fixtures/${name}`;
+    const flagAt = args.indexOf("--container");
+    const flagContainer = flagAt >= 0 ? args[flagAt + 1] : "";
+    const manifestPath = `${dir}/manifest.json`;
+
+    if (mode === "save") {
+        const container = flagContainer
+            || (await Bun.file(manifestPath).exists() ? JSON.parse(await Bun.file(manifestPath).text()).container : "");
+        if (!container) throw new Error("fixture save needs --container <id> (no manifest to inherit it from)");
+        const listed = await harness().containerList(container).run();
+        if (!listed.ok) throw new Error(`containerList failed: ${listed.error?.message}`);
+        const files = (listed.named.containerList as { files: Array<{ path: string; size: number }> }).files;
+        const saved: Array<{ path: string; bytes: number }> = [];
+        for (const f of files) {
+            const r = await harness().containerRead(container, f.path).run();
+            if (!r.ok) throw new Error(`containerRead ${f.path} failed: ${r.error?.message}`);
+            const { content } = r.named.containerRead as { content: string };
+            await Bun.write(fixturePath(dir, f.path), Buffer.from(content, "base64"));
+            saved.push({ path: f.path, bytes: f.size });
+        }
+        const prior = await Bun.file(manifestPath).exists() ? JSON.parse(await Bun.file(manifestPath).text()) : {};
+        await Bun.write(manifestPath, JSON.stringify(
+            { container, files: files.map((f) => f.path), ...(prior.note ? { note: prior.note } : {}) }, null, 2,
+        ) + "\n");
+        console.log(JSON.stringify({ mode, container, dir, saved }, null, 2));
+        return;
+    }
+
+    if (mode === "restore") {
+        if (!(await Bun.file(manifestPath).exists())) throw new Error(`no fixture at ${manifestPath}`);
+        const man = JSON.parse(await Bun.file(manifestPath).text()) as { container: string; files: string[] };
+        const container = flagContainer || man.container;
+        const done: Array<{ path: string; written: number }> = [];
+        for (const p of man.files) {
+            const bytes = new Uint8Array(await Bun.file(fixturePath(dir, p)).arrayBuffer());
+            const r = await harness().containerWrite(container, p, Buffer.from(bytes).toString("base64")).run();
+            if (!r.ok) throw new Error(`containerWrite ${p} failed: ${r.error?.message}`);
+            done.push({ path: p, written: (r.named.containerWrite as { written: number }).written });
+        }
+        console.log(JSON.stringify({ mode, container, dir, done }, null, 2));
+        return;
+    }
+
+    throw new Error(`unknown fixture mode '${mode}' (save|restore)`);
+}
+
+/** shot [out.png] [--verify] — page screenshot to a file (browser-side ground truth).
+ *  With --verify it also pulls the worker's own `shot` (the canvas read from inside the
+ *  worker) and compares the two, so the screenshot verb can report its own failure
+ *  instead of handing back a plausible image. */
+async function cmdShot(out: string, ...flags: string[]): Promise<void> {
     const session = await ensureSession();
     const b64 = await screenshot(session);
-    const file = out || "logs/harness-shot.png";
+    const file = out && !out.startsWith("--") ? out : artifact("logs/harness-shot.png");
     await Bun.write(file, Buffer.from(b64, "base64"));
     console.log(`screenshot -> ${file} (${b64.length} b64 chars)`);
+    if (out?.startsWith("--") || flags.includes("--verify")) await verifyShot(session);
+}
+
+/** Mean/max per-CHANNEL |Δ| between two PNGs, both downscaled to a 32x32 grid in the page
+ *  (the browser is the only decoder on hand, and it decodes both the same way).
+ *
+ *  Per channel, not luma: R and B carry only 0.299 and 0.114 of luminance, so a
+ *  channel-swapped capture — the exact defect a capture route produces when it reads BGRA
+ *  as RGBA — lands within the tolerance of a luma compare and reports AGREE for an image
+ *  that is visibly the wrong colour. The difference is defined as the WORST channel at a
+ *  cell so a swap cannot average itself away against the green that did not move. */
+async function comparePngs(session: CdpSession, aB64: string, bB64: string): Promise<{ mean: number; max: number } | null> {
+    const r = (await pageEval(session, `(async () => {
+        const grid = async (b64) => {
+            const bin = atob(b64); const u8 = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+            const bmp = await createImageBitmap(new Blob([u8], { type: 'image/png' }));
+            const c = new OffscreenCanvas(32, 32); const x = c.getContext('2d');
+            x.drawImage(bmp, 0, 0, 32, 32);
+            return x.getImageData(0, 0, 32, 32).data;
+        };
+        const [a, b] = await Promise.all([grid(${JSON.stringify(aB64)}), grid(${JSON.stringify(bB64)})]);
+        let sum = 0, max = 0;
+        for (let i = 0; i < 1024; i++) {
+            const worst = Math.max(
+                Math.abs(a[i*4] - b[i*4]),
+                Math.abs(a[i*4+1] - b[i*4+1]),
+                Math.abs(a[i*4+2] - b[i*4+2]),
+            );
+            sum += worst; if (worst > max) max = worst;
+        }
+        return { mean: sum / 1024, max };
+    })()`, { timeoutMs: 20_000, awaitPromise: true })) as { mean: number; max: number; error?: string } | null;
+    return r && !r.error ? r : null;
+}
+
+/**
+ * Cross-check every route to "the screen" against the browser's own capture of the
+ * canvas: the worker `shot` (source 'screen') and, when the presenter has one, its
+ * pre-composite layer (source 'layer').
+ *
+ * Why it exists: the worker capture and the CDP capture are INDEPENDENT routes to the
+ * same pixels, so a disagreement means the worker route is not looking at the screen —
+ * the failure that let `shot()` show a game frame while the canvas held a grey dialog.
+ * The 'layer' line is the standing proof that the check can go red: a composited frame
+ * MUST show the layer disagreeing while the screen agrees.
+ */
+async function verifyShot(session: CdpSession): Promise<void> {
+    const geo = await readCanvasGeometry(session);
+    // Freeze the guest so every capture describes the SAME frame; a moving picture
+    // would produce a difference that says nothing about the capture route.
+    const paused = await execViaCdp([{ cmd: "pause", args: [] } as unknown as HarnessStep])
+        .then((r) => r.ok).catch(() => false);
+    try {
+        type Shot = { base64?: string; source?: string; width?: number; height?: number };
+        const runShot = async (args: Record<string, unknown>): Promise<Shot | string> => {
+            const r = await execViaCdp([{ cmd: "shot", args: [args] } as unknown as HarnessStep]);
+            return r.steps?.[0]?.ok ? (r.steps[0].result as Shot) : (r.steps?.[0]?.error?.message ?? "failed");
+        };
+        const screen = await runShot({});
+        const clip = { x: Math.max(0, geo.rect.x), y: Math.max(0, geo.rect.y), width: geo.rect.w, height: geo.rect.h, scale: 1 };
+        const shotPage = async () => (await session.send("Page.captureScreenshot", { format: "png", clip })).result?.data ?? "";
+        // Two CDP captures back to back measure how much the screen moves on its own
+        // (a paused guest can still re-present, and an animated overlay never stops). That
+        // churn is the noise floor: below it no comparison can decide anything, and an
+        // instrument that ignores it reports "DISAGREE" for a screen that merely moved.
+        const pageA = await shotPage();
+        const pageB64 = await shotPage();
+        if (!pageB64 || !pageA) { console.log("verify: CDP capture returned nothing"); return; }
+        const churn = (await comparePngs(session, pageA, pageB64)) ?? { mean: 0, max: 0 };
+        const moving = churn.mean >= 8 || churn.max >= 48;
+        console.log(`verify: screen churn between two CDP captures — mean|d|=${churn.mean.toFixed(1)} max|d|=${churn.max.toFixed(1)}` +
+            (moving ? " (screen is MOVING — comparisons below can only be inconclusive; pause presents for a decisive check)" : ""));
+
+        // mean 8/255 tolerates PNG/CSS rescaling of the whole frame; the max threshold is
+        // what catches a LOCALIZED difference — a composited dialog or panel covering a
+        // few cells barely moves the mean, and that is exactly the failure class here.
+        // Identical images measure 0.0 on both, so the headroom is large.
+        const line = async (label: string, shot: Shot | string) => {
+            if (typeof shot === "string" || !shot.base64) { console.log(`verify: ${label} — unavailable (${shot})`); return; }
+            const cmp = await comparePngs(session, shot.base64, pageB64);
+            if (!cmp) { console.log(`verify: ${label} — compare failed`); return; }
+            const agree = cmp.mean < 8 && cmp.max < 48;
+            const verdict = agree ? "AGREE"
+                : moving || cmp.mean <= churn.mean * 1.5 ? "INCONCLUSIVE (difference is within the screen's own churn)"
+                    : "DISAGREE (this is NOT what is on screen)";
+            console.log(`verify: ${label} (${shot.width}x${shot.height}) vs CDP canvas capture — ` +
+                `mean|d|=${cmp.mean.toFixed(1)} max|d|=${cmp.max.toFixed(1)} → ${verdict}`);
+        };
+        await line("shot() source=screen", screen);
+        await line("shot({source:'layer'}) pre-composite", await runShot({ source: "layer" }));
+    } finally {
+        if (paused) await execViaCdp([{ cmd: "resume", args: [] } as unknown as HarnessStep]).catch(() => {});
+    }
 }
 
 /**
@@ -230,29 +596,23 @@ async function cmdShot(out: string): Promise<void> {
 async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     const session = await ensureSession();
     const step = stepArg ? Number(stepArg) : 0;
+    // Same guest↔CSS mapping the touch verbs aim with (cdp-geometry) — the grid
+    // labels would otherwise be a second, drifting copy of it.
+    const geo = await readCanvasGeometry(session);
     const inject = `(() => {
-        const cv = document.querySelector('.app__canvas');
-        if (!cv) return { error: 'no .app__canvas element' };
-        const r = cv.getBoundingClientRect();
-        // Guest surface dims (the space clickAt injects into). Prefer the explicit
-        // global; fall back to the inline style.width/height App sets to guest px
-        // (a transferred OffscreenCanvas reports width=0 on the main thread).
-        const styW = parseFloat(cv.style.width) || 0, styH = parseFloat(cv.style.height) || 0;
-        const gr = (window.__BS__ && window.__BS__.guestResolution) || (styW && styH ? { width: styW, height: styH } : { width: cv.width || 1024, height: cv.height || 768 });
-        const gw = Math.max(1, gr.width), gh = Math.max(1, gr.height);
+        const r = ${JSON.stringify(geo.rect)}, sx = ${geo.scale.x}, sy = ${geo.scale.y};
+        const gw = ${geo.guest.w}, gh = ${geo.guest.h}, dpr = ${geo.dpr};
         const old = document.getElementById('__bs_grid_overlay'); if (old) old.remove();
         const niceStep = (n) => { const t = n / 12; for (const s of [10,20,25,50,100,200,250,500]) if (s >= t) return s; return 1000; };
         const stp = ${step} > 0 ? ${step} : niceStep(Math.max(gw, gh));
         const ov = document.createElement('canvas'); ov.id = '__bs_grid_overlay';
-        Object.assign(ov.style, { position:'fixed', left:r.left+'px', top:r.top+'px', width:r.width+'px', height:r.height+'px', pointerEvents:'none', zIndex:2147483647 });
-        const dpr = window.devicePixelRatio || 1;
-        ov.width = Math.round(r.width*dpr); ov.height = Math.round(r.height*dpr);
+        Object.assign(ov.style, { position:'fixed', left:r.x+'px', top:r.y+'px', width:r.w+'px', height:r.h+'px', pointerEvents:'none', zIndex:2147483647 });
+        ov.width = Math.round(r.w*dpr); ov.height = Math.round(r.h*dpr);
         const c = ov.getContext('2d'); c.scale(dpr, dpr);
-        const sx = r.width/gw, sy = r.height/gh;
         c.font = '11px monospace'; c.textBaseline = 'top'; c.lineWidth = 1;
-        for (let gx=0; gx<=gw; gx+=stp) { const px=gx*sx; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(px,0); c.lineTo(px,r.height); c.stroke();
+        for (let gx=0; gx<=gw; gx+=stp) { const px=gx*sx; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(px,0); c.lineTo(px,r.h); c.stroke();
             c.fillStyle='rgba(0,0,0,0.6)'; c.fillRect(px+1,0,String(gx).length*7+2,12); c.fillStyle='#0ef'; c.fillText(String(gx), px+2, 1); }
-        for (let gy=0; gy<=gh; gy+=stp) { const py=gy*sy; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(0,py); c.lineTo(r.width,py); c.stroke();
+        for (let gy=0; gy<=gh; gy+=stp) { const py=gy*sy; c.strokeStyle='rgba(0,234,255,0.30)'; c.beginPath(); c.moveTo(0,py); c.lineTo(r.w,py); c.stroke();
             c.fillStyle='rgba(0,0,0,0.6)'; c.fillRect(0,py+1,String(gy).length*7+2,12); c.fillStyle='#0ef'; c.fillText(String(gy), 1, py+2); }
         let controls = [];
         // dialogs() may be async (RPC) → only use a synchronously-available array.
@@ -267,7 +627,7 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
             c.fillStyle='#fd0'; c.beginPath(); c.arc(cx*sx, cy*sy, 3, 0, 7); c.fill();
         }
         document.body.appendChild(ov);
-        return { ok:true, rect:{ x:r.left, y:r.top, w:r.width, h:r.height }, guest:{ w:gw, h:gh }, step:stp, controls:controls.length };
+        return { ok:true, step:stp, controls:controls.length };
     })()`;
     const meta = (await pageEval(session, inject, { timeoutMs: 10_000 })) as any;
     if (!meta || meta.error) { console.error("gridShot:", meta?.error || "failed"); return; }
@@ -275,14 +635,273 @@ async function cmdGridShot(out: string, stepArg?: string): Promise<void> {
     // scale that brings the output up to ~guest resolution so the px labels stay
     // crisp even when the on-screen canvas is shrunk to fit the viewport.
     const pad = 14;
-    const scale = Math.max(1, Math.min(3, Math.round((meta.guest.w / Math.max(1, meta.rect.w)) * 10) / 10));
-    const clip = { x: Math.max(0, meta.rect.x), y: Math.max(0, meta.rect.y - pad), width: meta.rect.w, height: meta.rect.h + pad, scale };
+    const scale = Math.max(1, Math.min(3, Math.round((geo.guest.w / Math.max(1, geo.rect.w)) * 10) / 10));
+    const clip = { x: Math.max(0, geo.rect.x), y: Math.max(0, geo.rect.y - pad), width: geo.rect.w, height: geo.rect.h + pad, scale };
     const shot = await session.send("Page.captureScreenshot", { format: "png", clip });
-    const file = out || "logs/harness-gridshot.png";
+    const file = out || artifact("logs/harness-gridshot.png");
     await Bun.write(file, Buffer.from(shot.result?.data ?? "", "base64"));
     await pageEval(session, "(()=>{const o=document.getElementById('__bs_grid_overlay');if(o)o.remove();return 1})()", { timeoutMs: 5000 }).catch(() => {});
-    console.log(`gridShot -> ${file}  guest=${meta.guest.w}x${meta.guest.h} step=${meta.step}px controls=${meta.controls}`);
+    console.log(`gridShot -> ${file}  guest=${geo.guest.w}x${geo.guest.h} step=${meta.step}px controls=${meta.controls}`);
     console.log(`  read a feature's (x,y) off the grid (GUEST pixels), then: bun tools/harness.ts clickAt <x> <y>`);
+}
+
+/** trace <seconds> [out.json.gz] — capture a Chrome perf trace for tools/analyze-trace.ts.
+ *  Drive the game into the state you want FIRST; this only records.
+ *
+ *  Refuses to run while a second guest is open: tracing is a BROWSER-level domain (it
+ *  records every renderer), and two guests share the CPU, so both the trace contents and
+ *  any timing read off it describe a machine nobody was measuring. Parallel sessions are
+ *  a bring-up tool; measurement is single-tab. `BS_ALLOW_PARALLEL_TRACE=1` to override. */
+/** trace <sec> [out.json.gz] [--boot <wgb>]
+ *
+ *  `--boot` makes t=0 of the artifact the instant the bundle load starts: the page is
+ *  reloaded first (fresh worker), recording is armed, and only then is loadApp fired —
+ *  without awaiting it, because the whole point is to record the boot as it happens. This is
+ *  the only way to see the pre-first-present window; a trace armed after the fact has already
+ *  missed it. */
+async function cmdTrace(secondsArg?: string, out?: string, ...rest: string[]): Promise<void> {
+    const seconds = Number(secondsArg ?? 10);
+    const argv = [out, ...rest].filter((a): a is string => a !== undefined);
+    const bootIdx = argv.indexOf("--boot");
+    const bootBundle = bootIdx >= 0 ? argv[bootIdx + 1] : undefined;
+    if (bootIdx >= 0 && !bootBundle) throw new Error("trace --boot needs a bundle id or path");
+    const FLAGS_WITH_VALUE = new Set(["--boot", "--without", "--categories"]);
+    out = argv.find((a, i) => !a.startsWith("--") && !FLAGS_WITH_VALUE.has(argv[i - 1] ?? ""));
+    const tabs = await listSessionTabs().catch(() => []);
+    if (tabs.length > 1 && process.env.BS_ALLOW_PARALLEL_TRACE !== "1") {
+        throw new Error(
+            `refusing to trace: ${tabs.length} guest tabs are open (${tabs.map((t) => t.url.slice(-40)).join(", ")}).\n` +
+            "  A Chrome trace is browser-wide and parallel guests share the CPU — the numbers would be noise.\n" +
+            "  Close the other sessions' tabs, or set BS_ALLOW_PARALLEL_TRACE=1 if you really only want the trace shape.",
+        );
+    }
+    // Category surgery, for bisecting a trace that KILLS what it is measuring: `--without a,b`
+    // drops categories from the default set, `--categories a,b` replaces it outright, and
+    // `--no-mark` records without the in-window hotBlocksMark so the recording itself is the
+    // only variable. Without these, "is it the tracer?" can only be answered by editing code.
+    const listArg = (flag: string) => {
+        const i = argv.indexOf(flag);
+        return i >= 0 ? (argv[i + 1] ?? "").split(",").map((x) => x.trim()).filter(Boolean) : null;
+    };
+    const without = listArg("--without");
+    const only = listArg("--categories");
+    const noMark = argv.includes("--no-mark");
+    const file = out ?? artifact(`logs/trace-${seconds}s${bootBundle ? "-boot" : ""}.json.gz`);
+    // A cold boot needs a fresh worker, and the reload must be OUTSIDE the window — otherwise
+    // page teardown/startup is the first thing the trace shows instead of the boot itself.
+    let bootSession: Awaited<ReturnType<typeof ensureSession>> | null = null;
+    if (bootBundle) {
+        bootSession = await ensureSession();
+        await reloadPageAndWait(bootSession);
+        console.log(`page reloaded; recording ${seconds}s from the first byte of ${bootBundle} …`);
+    }
+    console.log(`tracing ${seconds}s -> ${file} …`);
+    // A trace that kills the worker used to surface as an unrelated 300 s pageEval timeout.
+    // Watching existence costs nothing and attaches nothing, so it is always on.
+    const workerWatch = await watchWorkerHealth({ processMemory: true, pageWsUrl: (await findOrCreateTab(DEFAULT_DEV_URL)).webSocketDebuggerUrl });
+    // Arm the guest-attribution mark INSIDE the window: without bottleship.hotblocks every
+    // wasm frame in the artifact stays an opaque wasm-function[N] (v86's table indices do not
+    // match Chrome's numbering, so the join is sampled, never computed) and the trace analyses
+    // shallow while looking complete.
+    let hotBlocks: { blocks?: number; marked?: boolean; note?: string } | null = null;
+    const sampleMs = Math.min(3000, Math.max(800, (seconds * 1000) / 4));
+    const categories = only ?? (without ? DEFAULT_TRACE_CATEGORIES.filter((c) => !without.includes(c)) : undefined);
+    if (categories) console.log(`  categories: ${categories.join(", ")}`);
+    const r = await captureTrace(file, seconds, {
+        categories,
+        onStarted: bootBundle && bootSession
+            // Deliberately NOT awaited: openWgb resolves only when the load completes, which
+            // is the very thing being measured.
+            ? async () => {
+                await pageEval(
+                    bootSession!,
+                    `(window.__BS__.harness.openWgb(${JSON.stringify(bootBundle)}), "started")`,
+                    { timeoutMs: 30_000, awaitPromise: false, userGesture: true },
+                );
+            }
+            : undefined,
+        during: noMark ? undefined : async () => {
+            try {
+                // Raced, because the page-batch budget has a 300 s floor: when the worker is
+                // dead this hook otherwise blocks for five minutes INSIDE the recording
+                // window, and a "25 s trace" quietly becomes a 300 s one.
+                const res = await Promise.race([
+                    execViaCdp([{ cmd: "hotBlocksMark", args: [{ ms: sampleMs }], opts: { timeoutMs: sampleMs + 30_000 } } as unknown as HarnessStep]),
+                    Bun.sleep(sampleMs + 20_000).then(() => { throw new Error(`no answer in ${(sampleMs + 20_000) / 1000}s — the worker is not responding`); }),
+                ]);
+                hotBlocks = (res.steps?.[0]?.result ?? null) as typeof hotBlocks;
+            } catch (e) {
+                console.warn(`  hotBlocksMark failed (guest attribution will be unavailable): ${e}`);
+            }
+        },
+    });
+    const health = await workerWatch.stop();
+    console.log(`  ${r.events} events, ${(r.bytes / 1024 / 1024).toFixed(1)} MB, buffer peak ${(r.maxPercentFull * 100).toFixed(0)}%`);
+    if (r.bufferFull) {
+        console.log("  BUFFER FULL — Chrome dropped events while still recording. Every count read");
+        console.log("  off this artifact is a lower bound, not a measurement. Shorten the window or");
+        console.log("  drop categories (--without) until the peak stays below 100%.");
+    }
+    console.log(formatWorkerHealth(health));
+    if (hotBlocks?.marked) console.log(`  bottleship.hotblocks: ${hotBlocks.blocks} blocks — wasm frames resolve to module:rva`);
+    else console.log(`  bottleship.hotblocks: NOT emitted${hotBlocks?.note ? ` (${hotBlocks.note})` : ""} — guest attribution will read UNAVAILABLE`);
+    console.log(`  analyze: bun tools/analyze-trace.ts ${file} --thread worker --top 40`);
+}
+
+/** crashes [minutes] — Chrome's own crash dumps for this profile, newest last.
+ *  A renderer crash is invisible from inside the tooling (the page target survives, the
+ *  workers vanish, nothing is logged), so "the worker died silently" is what it looks like
+ *  from every other verb. This is the one place that can say it was a crash and name it. */
+async function cmdCrashes(args: string[]): Promise<void> {
+    const minutes = Number(args[0] ?? 0);
+    const since = minutes > 0 ? new Date(Date.now() - minutes * 60_000) : undefined;
+    const list = listCrashes({ since });
+    if (!list.length) {
+        console.log(minutes ? `no crash dumps in the last ${minutes} min` : "no crash dumps in this Chrome profile");
+        return;
+    }
+    for (const c of list) console.log(formatCrash(c));
+    const byPrint = new Map<string, number>();
+    for (const c of list) byPrint.set(c.fingerprint, (byPrint.get(c.fingerprint) ?? 0) + 1);
+    if (byPrint.size < list.length) {
+        console.log("");
+        console.log("repeats (same faulting instruction):");
+        for (const [fp, n] of [...byPrint].filter(([, n]) => n > 1)) console.log(`  ${n}x ${fp}`);
+    }
+}
+
+/** workers <seconds> [--heap] — watch this session's worker targets and report whether they
+ *  survived the window. Use it around anything suspected of killing the emulator worker: a
+ *  dead worker is otherwise invisible until an unrelated verb times out minutes later.
+ *  `--heap` attaches a debugger session per worker to sample V8 heap usage — informative,
+ *  but it perturbs the isolate, so leave it off when instrumentation is the suspect. */
+async function cmdWorkers(args: string[]): Promise<void> {
+    const seconds = Number(args.find((a) => !a.startsWith("--")) ?? 30);
+    const heap = args.includes("--heap");
+    const tab = await findOrCreateTab(DEFAULT_DEV_URL);
+    const watch = await watchWorkerHealth({ heap, processMemory: true, pageWsUrl: tab.webSocketDebuggerUrl });
+    console.log(`watching worker targets for ${seconds}s${heap ? " (+heap)" : ""} …`);
+    await Bun.sleep(seconds * 1000);
+    const report = await watch.stop();
+    console.log(formatWorkerHealth(report));
+    console.log(JSON.stringify({ survived: report.survived, died: report.died, peakUsedMb: report.peakUsedMb }, null, 2));
+}
+
+const REGRESSION_DIR = resolvePath(import.meta.dir, "harness", "regression");
+
+function globToRegExp(glob: string): RegExp {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    return new RegExp(`^${escaped}$`, "i");
+}
+
+/** Stream a child's output live to our own stdout/stderr while also accumulating it,
+ *  so a multi-minute scenario shows progress AND leaves a tail line for the summary. */
+async function pipeAndCapture(stream: ReadableStream<Uint8Array> | null, sink: { write(s: string): unknown }): Promise<string> {
+    if (!stream) return "";
+    const decoder = new TextDecoder();
+    let acc = "";
+    for await (const chunk of stream) {
+        const text = decoder.decode(chunk as Uint8Array, { stream: true });
+        sink.write(text);
+        acc += text;
+    }
+    return acc;
+}
+
+/** regress [--only <glob>] [--scenario-timeout <sec>] — run every checked-in scenario in tools/harness/regression/
+ *  against the shared tab, one game at a time (a tab drives exactly one guest, so this
+ *  cannot fan out the way `parallel` bring-up does). Each scenario is its own
+ *  `harness run` subprocess: a script's thrown Error or explicit `process.exitCode`
+ *  then can't leak state (globals, the shared `_session`, a lingering CDP breakpoint)
+ *  into the next one. Bundle paths are each scenario's OWN concern — its `WGB` env var
+ *  / built-in default (drop-folder or a raw disk path) — this command holds none of
+ *  its own, so it runs unmodified regardless of where the caller's bundles live. */
+async function cmdRegress(rest: string[]): Promise<void> {
+    const onlyIdx = rest.indexOf("--only");
+    const onlyRaw = onlyIdx >= 0 ? rest[onlyIdx + 1] : rest.find((a) => a.startsWith("--only="))?.slice("--only=".length);
+    const onlyRe = onlyRaw ? globToRegExp(onlyRaw) : null;
+    // Generous by default: a real bring-up scenario legitimately spends minutes booting a
+    // multi-GB bundle and waiting for a menu, so this is a wedge detector, not a perf budget.
+    const timeoutIdx = rest.indexOf("--scenario-timeout");
+    const timeoutRaw = timeoutIdx >= 0 ? rest[timeoutIdx + 1] : rest.find((a) => a.startsWith("--scenario-timeout="))?.slice("--scenario-timeout=".length);
+    const scenarioTimeoutMs = Math.max(60, Number(timeoutRaw) || 900) * 1000;
+
+    const files = readdirSync(REGRESSION_DIR)
+        .filter((f) => f.endsWith(".harness.ts"))
+        .filter((f) => !onlyRe || onlyRe.test(f.replace(/\.harness\.ts$/, "")))
+        .sort();
+    if (!files.length) {
+        console.log(onlyRe ? `[regress] no scenario matches --only ${onlyRaw}` : "[regress] tools/harness/regression/ is empty");
+        return;
+    }
+    console.log(`[regress] ${files.length} scenario(s): ${files.map((f) => f.replace(/\.harness\.ts$/, "")).join(", ")}`);
+
+    const repoRoot = resolvePath(import.meta.dir, "..");
+    const rows: { name: string; ok: boolean; verdict: string; shot: string; ms: number }[] = [];
+
+    for (const file of files) {
+        const name = file.replace(/\.harness\.ts$/, "");
+        console.log(`\n[regress] === ${name} ===`);
+        const t0 = Date.now();
+        const proc = Bun.spawn(["bun", "tools/harness.ts", "run", `tools/harness/regression/${file}`], {
+            cwd: repoRoot,
+            env: process.env,
+            stdout: "pipe",
+            stderr: "pipe",
+        });
+        // Bound every scenario. A hung one used to take the WHOLE batch with it and report
+        // nothing — a bring-up chain waits on guest state, so "wedged" is a normal failure mode
+        // (a stale hover coordinate, a bundle that never finishes loading) and it must read as a
+        // failed scenario, not as an unattended machine. --scenario-timeout <sec> to override.
+        let timedOut = false;
+        const killTimer = setTimeout(() => {
+            timedOut = true;
+            console.error(`
+[regress] ${name}: TIMEOUT after ${Math.round(scenarioTimeoutMs / 1000)}s — killing`);
+            try { proc.kill(); } catch { /* already gone */ }
+        }, scenarioTimeoutMs);
+        const [outText, errText, exitCode] = await Promise.all([
+            pipeAndCapture(proc.stdout, process.stdout),
+            pipeAndCapture(proc.stderr, process.stderr),
+            proc.exited,
+        ]);
+        clearTimeout(killTimer);
+        const ms = Date.now() - t0;
+        const ok = exitCode === 0 && !timedOut;
+        const tail = (t: string) => t.trim().split("\n").filter(Boolean).pop() ?? "";
+        // A scenario fails two ways: a thrown Error (message lands on stderr via the
+        // CLI's own top-level catch) or an explicit process.exitCode with no throw
+        // (blackwell-legacy's style, reason already printed on stdout) — surface
+        // whichever the script actually gave, never invent a generic message.
+        const verdict = timedOut
+            ? `TIMEOUT after ${Math.round(scenarioTimeoutMs / 1000)}s (killed; last output: ${tail(outText) || "none"})`
+            : ok ? (tail(outText) || "OK") : (tail(errText) || tail(outText) || `exit ${exitCode}`);
+
+        let shot = "(capture failed)";
+        try {
+            const session = await ensureSession();
+            const b64 = await screenshot(session);
+            const shotPath = artifact(`logs/regress/${name}.png`);
+            await Bun.write(shotPath, Buffer.from(b64, "base64"));
+            shot = shotPath;
+        } catch (e) {
+            shot = `(capture failed: ${(e as Error).message})`;
+        }
+        rows.push({ name, ok, verdict, shot, ms });
+    }
+
+    console.log("\n[regress] ── summary ──────────────────────────────────────────────");
+    const nameW = Math.max(8, ...rows.map((r) => r.name.length));
+    for (const r of rows) {
+        console.log(`  ${r.ok ? "PASS" : "FAIL"}  ${r.name.padEnd(nameW)}  ${(r.ms / 1000).toFixed(1).padStart(6)}s  ${r.shot}`);
+        if (!r.ok || r.verdict !== "OK") console.log(`        ${r.verdict}`);
+    }
+    const failed = rows.filter((r) => !r.ok);
+    console.log(`\n[regress] ${rows.length - failed.length}/${rows.length} passed`);
+    if (failed.length) {
+        console.log(`[regress] FAILED: ${failed.map((r) => r.name).join(", ")}`);
+        process.exitCode = 1;
+    }
 }
 
 /** reload — hard-reload the page (replaces cdp-reload; HMR is off, so reload to pick up worker edits). */
@@ -295,13 +914,24 @@ async function cmdReload(): Promise<void> {
 /** Run a single harness cmd and pretty-print its result (report/stubs/backtrace).
  *  Numeric args (e.g. an esp) are parsed; everything else passes through. */
 async function cmdSingle(cmd: string, rest: string[]): Promise<void> {
-    const args = rest.map((a) => {
+    // `--parent` addresses the ROOT worker instead of a promoted child. A launcher that
+    // hands off (its child opens a MessageBox) moves the harness channel to the child's
+    // realm, and the parent's history — its childProcesses(), thunk ring, stubs, VFS —
+    // is then unreachable, not gone. The address belongs on the TRANSPORT, not on one
+    // verb: after a hand-off every parent-side verb is equally unreachable, so
+    // `report --parent` / `stubs --parent` / `fsIoReport --parent` all work the same way.
+    const parent = rest.includes("--parent");
+    const opts = parent ? { target: "root" as const } : undefined;
+    const args = rest.filter((a) => a !== "--parent").map((a) => {
         if (/^0x[0-9a-f]+$/i.test(a)) return parseInt(a, 16);
         if (/^\d+$/.test(a)) return Number(a);
+        // "false" must not arrive as a truthy string: `gpuToggle <flag> false` would
+        // then ENABLE the flag and the picture would silently measure the wrong thing.
+        if (a === "true" || a === "false") return a === "true";
         if (/^[[{]/.test(a)) { try { return JSON.parse(a); } catch { return a; } } // {"continuous":true} etc.
         return a;
     });
-    const result = await execViaCdp([{ cmd, args } as unknown as HarnessStep]);
+    const result = await execViaCdp([{ cmd, args, opts } as unknown as HarnessStep]);
     console.log(JSON.stringify(result.steps?.[0]?.result ?? result, null, 2));
 }
 
@@ -315,11 +945,19 @@ async function main(): Promise<void> {
         case "eval": await cmdEval(rest.join(" ")); break;
         case "worker-eval": await cmdWorkerEval(rest.join(" ")); break;
         case "stack": await cmdStack(rest[0]); break;
-        case "shot": await cmdShot(rest[0]); break;
+        case "heapsample": await cmdHeapSample(...rest); break;
+        case "heapsnap": await cmdHeapSnap(rest[0]); break;
+        case "audiocapture": await cmdAudioCapture(rest[0], rest[1]); break;
+        case "fixture": await cmdFixture(rest[0], rest[1], rest.slice(2)); break;
+        case "shot": await cmdShot(rest[0], ...rest.slice(1)); break;
         case "gridShot": case "gridshot": await cmdGridShot(rest[0], rest[1]); break;
+        case "trace": await cmdTrace(rest[0], rest[1], ...rest.slice(2)); break;
+        case "workers": await cmdWorkers(rest); break;
+        case "crashes": await cmdCrashes(rest); break;
         case "reload": await cmdReload(); break;
+        case "regress": await cmdRegress(rest); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|shot [out.png]|gridShot [out.png] [step]|reload|<any-harness-command> [args...]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...] [--parent]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,
@@ -330,6 +968,23 @@ async function main(): Promise<void> {
 }
 
 // Only run the CLI when invoked directly (not when imported by a .harness.ts script).
-if (import.meta.main) {
-    main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+//
+// The `once` guard is not belt-and-braces. `harness run <script>` imports the script, and a
+// script that imports THIS module by absolute path gets a second module record whose resolved
+// path still equals the process entry — so `import.meta.main` is true again, main() re-parses
+// the same argv, and the CLI re-enters `run` on the same script. That recursion looks like the
+// harness silently restarting. A module-instance-independent flag turns it into one line of
+// diagnosis.
+const HARNESS_CLI_ONCE = "__bsHarnessCliStarted";
+const cliGlobals = globalThis as Record<string, unknown>;
+if (import.meta.main && !cliGlobals[HARNESS_CLI_ONCE]) {
+    cliGlobals[HARNESS_CLI_ONCE] = true;
+    // process.exitCode (set by e.g. blackwell-legacy.harness.ts's non-throwing
+    // verdict, or cmdRegress on a failed scenario) must survive to the real exit —
+    // a hardcoded exit(0) here silently discards it.
+    main().then(() => process.exit(process.exitCode ?? 0)).catch((e) => { console.error(e); process.exit(1); });
+} else if (import.meta.main) {
+    console.warn("[harness] tools/harness.ts was evaluated a second time as the process entry — "
+        + "the CLI is NOT re-running. A script imported it by absolute path; import it relatively "
+        + "(`from \"../harness\"`) or drive the page with `harness eval` instead.");
 }

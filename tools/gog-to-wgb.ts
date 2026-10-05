@@ -6,8 +6,6 @@
  *   bun tools/gog-to-wgb.ts <gog-installer.exe> <output.wgb> [options]
  *
  * Options:
- *   --innoextract         Use the external innoextract tool (default: built-in WASM parser,
- *                         the same code path the browser UI uses)
  *   --native              Deprecated no-op alias (native WASM is now the default)
  *   --extract-only        Extract + filter only, don't pack
  *   ... see --help
@@ -15,21 +13,24 @@
 
 import {
     writeFileSync, readdirSync, statSync, readFileSync, existsSync,
-    mkdirSync, rmSync,
+    mkdirSync, rmSync, openSync, writeSync, closeSync,
 } from "fs";
 import { join, basename, extname, dirname } from "path";
-import { spawnSync } from "child_process";
 import { tmpdir } from "os";
 import { randomBytes } from "crypto";
 import {
     BufferSource,
-    extractInnoToMap,
+    extractInno,
     parseInnoHeader,
-    parseSliceFile,
+    parseSliceSource,
     MultiSliceReader,
     type SliceData,
+    type SliceSource,
+    type InnoParseResult,
 } from "@bottleship/formats/inno";
 import { UnpackDecoder } from "@bottleship/formats/unpack";
+import { FileSource } from "./internal/file-source";
+import { resolveArchiveExtractPath } from "./internal/archive-extract-path";
 import { isGogJunk, SKIP_DIRS, detectExeFromPaths } from "@bottleship/repack/gog-filter";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 import { OS_PRESETS } from "@bottleship/repack/manifest-synth";
@@ -77,7 +78,7 @@ function parseArgs(argv: string[]) {
 
     const flagsWithValue = new Set([
         "--name", "--exe", "--args", "--width", "--height", "--bpp", "--ram", "--os",
-        "--reg-hive", "--reg-path", "--reg-install", "--extract-dir", "--extract-tool",
+        "--reg-hive", "--reg-path", "--reg-install", "--extract-dir",
         "--language",
     ]);
     const positionals: string[] = [];
@@ -143,50 +144,85 @@ function collectGameFiles(
     }
 }
 
-function findInnoextract(explicitPath?: string): string | null {
-    if (explicitPath) return existsSync(explicitPath) ? explicitPath : null;
-    // innoextract is an optional external fallback (GPL); the default path is our
-    // built-in WASM Inno parser. Resolve it from PATH — install it yourself to use.
-    const cmd = process.platform === "win32" ? "innoextract.exe" : "innoextract";
-    const where = spawnSync(process.platform === "win32" ? "where" : "which", [cmd],
-        { encoding: "utf8", shell: true });
-    if (where.status === 0 && where.stdout.trim()) {
-        return where.stdout.trim().split("\n")[0]!.trim();
+/**
+ * A multi-part installer keeps its payload in sibling `setup-*.bin` slices (header dataOffset === 0).
+ * Both extraction paths need the same ordering, so gather them once.
+ */
+function gatherSlices(installerPath: string, parsed: InnoParseResult): SliceSource | undefined {
+    if (parsed.offsets.dataOffset) return undefined;
+    const dir = dirname(installerPath);
+    const base = basename(installerPath, extname(installerPath));
+    const slicesPerDisk = Math.max(1, parsed.header.slicesPerDisk || 1);
+    const sliceName = (i: number): string => {
+        if (slicesPerDisk <= 1) return `${base}-${i + 1}.bin`;
+        const major = Math.floor(i / slicesPerDisk) + 1;
+        const minor = i % slicesPerDisk;
+        return `${base}-${major}${String.fromCharCode(97 + minor)}.bin`;
+    };
+    const slices: SliceData[] = [];
+    for (let i = 0; ; i++) {
+        const p = join(dir, sliceName(i));
+        if (!existsSync(p)) break;
+        slices.push(parseSliceSource(new FileSource(p)));
     }
-    return null;
+    if (slices.length === 0) {
+        throw new Error(`multi-part installer — no slices found next to ${basename(installerPath)} (expected ${sliceName(0)})`);
+    }
+    console.log(`  slices: ${slices.length}`);
+    return new MultiSliceReader(slices);
 }
 
-function extractWithInnoextract(installerPath: string, outDir: string, innoPath: string): string {
-    console.log(`  tool:   ${innoPath}`);
-    const result = spawnSync(innoPath, ["--output-dir", outDir, "--extract", installerPath], { stdio: "inherit" });
-    if (result.status !== 0) throw new Error(`innoextract failed with exit code ${result.status}`);
-    const appDir = join(outDir, "app");
-    return existsSync(appDir) ? appDir : outDir;
-}
-
-async function extractNative(installerPath: string, outDir: string, keepGog: boolean): Promise<string> {
+async function extractNative(
+    installerPath: string, outDir: string, keepGog: boolean, language?: string,
+): Promise<string> {
     const data = new Uint8Array(readFileSync(installerPath));
     const wasmPath = join(import.meta.dir, "../public/unpack-streaming.wasm");
     const wasmBytes = readFileSync(wasmPath);
     const lzma = new UnpackDecoder();
     await lzma.init(wasmBytes.buffer.slice(wasmBytes.byteOffset, wasmBytes.byteOffset + wasmBytes.byteLength));
 
-    const filterGog = !keepGog;
-    const files = await extractInnoToMap(new BufferSource(data), {
-        wantFile: (rel) => !filterGog || !isGogJunk(rel),
-        onProgress: (done, total) => {
-            progress(`  ${progressBar(done, total)} extracting`);
-        },
-    }, lzma);
-    progressDone(`  extracted ${files.size} files`);
+    const source = new BufferSource(data);
+    const parsed = await parseInnoHeader(source, lzma);
+    const sliceSource = gatherSlices(installerPath, parsed);
 
     const appDir = join(outDir, "app");
     mkdirSync(appDir, { recursive: true });
-    for (const [rel, bytes] of files) {
-        const dest = join(appDir, rel.replace(/\//g, "\\"));
-        mkdirSync(dirname(dest), { recursive: true });
-        writeFileSync(dest, bytes);
+
+    // Stream each file straight to disk — a modern GOG payload is several GB, far past what a
+    // Map of Uint8Arrays can hold.
+    const filterGog = !keepGog;
+    let count = 0;
+    // The descriptor lives in the per-file sink, not in a shared variable: an exception mid
+    // file would otherwise leave it open and a truncated file on disk that packs looking whole.
+    let open: { fd: number; dest: string } | null = null;
+    try {
+        await extractInno(source, {
+            wantFile: (rel) => !filterGog || !isGogJunk(rel),
+            onProgress: (done, total) => { progress(`  ${progressBar(done, total)} extracting`); },
+            language,
+        }, (relPath) => {
+            const dest = resolveArchiveExtractPath(appDir, relPath);
+            return {
+                begin() {
+                    mkdirSync(dirname(dest), { recursive: true });
+                    open = { fd: openSync(dest, "w"), dest };
+                },
+                data(bytes) { if (open) writeSync(open.fd, bytes); },
+                end() {
+                    if (open) { closeSync(open.fd); open = null; }
+                    count++;
+                },
+            };
+        }, lzma, parsed, sliceSource);
+    } finally {
+        if (open) {
+            const stray = open as { fd: number; dest: string };
+            try { closeSync(stray.fd); } catch { /* already gone */ }
+            console.error(`  extraction stopped inside ${stray.dest} — that file is TRUNCATED`);
+        }
     }
+    progressDone(`  extracted ${count} files`);
+
     return appDir;
 }
 
@@ -199,13 +235,9 @@ if (!existsSync(installer)) {
 
 const extractOnly = has("--extract-only");
 const keepGog = has("--keep-gog");
-// Native WASM extraction is the default; `--innoextract` opts into the external tool. This keeps the
-// CLI and the browser UI on the ONE Inno code path (packages/formats/src/inno) so behavior can't drift.
-const useNative = !has("--innoextract");
-
 // Default path: run the exact shared pipeline the browser UI uses (installerBytesToWgb) with no
-// 1.5 GB on-disk roundtrip. `--innoextract` and `--extract-only` fall through to the legacy flow.
-if (useNative && !extractOnly) {
+// 1.5 GB on-disk roundtrip. `--extract-only` writes the unpacked files to disk.
+if (!extractOnly) {
     step(1, 1, `Extract + pack (native WASM) → ${output}`);
     const data = new Uint8Array(readFileSync(installer));
     const wasmPath = join(import.meta.dir, "../public/unpack-streaming.wasm");
@@ -219,29 +251,12 @@ if (useNative && !extractOnly) {
     const lzma = new UnpackDecoder();
     await lzma.init(wasmArrayBuf);
     const parsed = await parseInnoHeader(new BufferSource(data), lzma);
-    let sliceSource: MultiSliceReader | undefined;
-    if (!parsed.offsets.dataOffset) {
-        const dir = dirname(installer);
-        const base = basename(installer, extname(installer));
-        const slicesPerDisk = Math.max(1, parsed.header.slicesPerDisk || 1);
-        const sliceName = (i: number): string => {
-            if (slicesPerDisk <= 1) return `${base}-${i + 1}.bin`;
-            const major = Math.floor(i / slicesPerDisk) + 1;
-            const minor = i % slicesPerDisk;
-            return `${base}-${major}${String.fromCharCode(97 + minor)}.bin`;
-        };
-        const slices: SliceData[] = [];
-        for (let i = 0; ; i++) {
-            const p = join(dir, sliceName(i));
-            if (!existsSync(p)) break;
-            slices.push(parseSliceFile(new Uint8Array(readFileSync(p))));
-        }
-        if (slices.length === 0) {
-            console.error(`Error: multi-part installer — no slices found next to ${basename(installer)} (expected ${sliceName(0)})`);
-            process.exit(1);
-        }
-        sliceSource = new MultiSliceReader(slices);
-        console.log(`  slices: ${slices.length}`);
+    let sliceSource: SliceSource | undefined;
+    try {
+        sliceSource = gatherSlices(installer, parsed);
+    } catch (err: unknown) {
+        console.error(`Error: ${err instanceof Error ? err.message : err}`);
+        process.exit(1);
     }
 
     const num = (flag: string) => { const v = get(flag); return v !== undefined ? parseInt(v, 10) : undefined; };
@@ -289,21 +304,12 @@ if (!extractDir) {
 
 const TOTAL_STEPS = extractOnly ? 2 : 4;
 
-step(1, TOTAL_STEPS, useNative ? "Extracting installer (native)..." : "Extracting installer...");
+step(1, TOTAL_STEPS, "Extracting installer (native WASM)...");
 
 let appDir: string;
 
 try {
-    if (useNative) {
-        appDir = await extractNative(installer, extractDir, keepGog);
-    } else {
-        const innoPath = findInnoextract(get("--extract-tool") ?? undefined);
-        if (!innoPath) {
-            console.error("Error: innoextract not found. Use --native or install innoextract.");
-            process.exit(1);
-        }
-        appDir = extractWithInnoextract(installer, extractDir, innoPath);
-    }
+    appDir = await extractNative(installer, extractDir, keepGog, get("--language"));
 } catch (err: unknown) {
     console.error(`\nExtraction failed: ${err instanceof Error ? err.message : err}`);
     if (createdTmpDir) rmSync(extractDir, { recursive: true, force: true });
@@ -332,7 +338,7 @@ if (extractOnly) {
     process.exit(0);
 }
 
-// innoextract path — pack from extracted dir
+// Pack the extracted directory.
 const name = get("--name") ?? gogMeta.name ?? basename(installer, extname(installer));
 const osKey = get("--os") ?? "win98";
 const osVer = OS_PRESETS[osKey];

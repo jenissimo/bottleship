@@ -162,6 +162,10 @@ export function isConsoleDeviceHandle(handle: any): handle is ConsoleDeviceHandl
 
 const consoleModeByHandle = new Map<number, number>();
 
+export function resetConsoleModeState(): void {
+    consoleModeByHandle.clear();
+}
+
 const resolveConsoleOutputBuffer = (hConsoleOutput: number): ConsoleScreenBuffer => {
     const direct = consoleScreenBuffers.resolveOutputHandle(hConsoleOutput);
     if (direct) return direct;
@@ -205,6 +209,15 @@ export function registerFileIoConsoleExports(exports: Record<string, ThunkImplem
         );
         System.getInstance().scheduler.setLastError(0);
         return 1; // TRUE
+    };
+
+    // HWND GetConsoleWindow(void)
+    // Our console is log-backed and owns no window, so there is no HWND to hand out.
+    // NULL is the documented answer for a process with no console window, and callers
+    // (crash reporters hiding/raising the console) all test for it.
+    exports['GetConsoleWindow'] = () => {
+        Logger.verbose(LogCategory.KERNEL32, 'GetConsoleWindow() -> NULL (log-backed console has no window)');
+        return 0;
     };
 
     exports['GetConsoleMode'] = (ctx, mem, args) => {
@@ -277,17 +290,21 @@ export function registerFileIoConsoleExports(exports: Record<string, ThunkImplem
         return 1;
     };
     exports['GetLargestConsoleWindowSize'] = () => (25 << 16) | 80; // COORD {X=80,Y=25} packed
-    exports['FillConsoleOutputCharacterA'] = (ctx, mem, args) => {
-        const buf = resolveConsoleOutputBuffer(args[0]);
-        const ch = args[1] & 0xff;
-        const n = args[2] >>> 0;
-        const coord = readCoordFromMem(mem, args[3] >>> 0);
-        const written = buf.fillCharacter(ch, n, coord);
-        const lpWritten = args[4] >>> 0;
-        if (lpWritten) Mem.writeUint32(lpWritten, written);
-        return 1;
-    };
-    exports['FillConsoleOutputCharacterW'] = exports['FillConsoleOutputCharacterA'];
+    // The screen buffer stores UTF-16, so the W entry point must keep all 16 bits;
+    // only the A entry point's CHAR argument is one byte wide.
+    const fillConsoleOutputCharacter = (mask: number): ThunkImplementation =>
+        (ctx, mem, args) => {
+            const buf = resolveConsoleOutputBuffer(args[0]);
+            const ch = args[1] & mask;
+            const n = args[2] >>> 0;
+            const coord = readCoordFromMem(mem, args[3] >>> 0);
+            const written = buf.fillCharacter(ch, n, coord);
+            const lpWritten = args[4] >>> 0;
+            if (lpWritten) Mem.writeUint32(lpWritten, written);
+            return 1;
+        };
+    exports['FillConsoleOutputCharacterA'] = fillConsoleOutputCharacter(0xff);
+    exports['FillConsoleOutputCharacterW'] = fillConsoleOutputCharacter(0xffff);
     exports['FillConsoleOutputAttribute'] = (ctx, mem, args) => {
         const buf = resolveConsoleOutputBuffer(args[0]);
         const attr = args[1] & 0xffff;

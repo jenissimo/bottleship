@@ -12,15 +12,18 @@
  */
 
 import { Logger, LogCategory } from '../logger';
+import { invalidateGuestCode } from '../memory/guest-code';
 import { Process } from '../process';
 import { preemptionManager } from '../cpu/preemption-manager';
 import { MEM_THUNK_CODE_BASE, MEM_ROM_BASE } from '../cpu/emulator-config';
 import { hypercallDataManager } from '../cpu/hypercall-data';
-import { System } from '../system';
+import { System, type ImplicitTlsEntry } from '../system';
 import { SystemResourceProvider } from '../resources/system-resource-provider';
 import { TimeService } from '../../runtime/time';
 import { clearAllActiveExceptions } from '../seh-dispatch';
+import { cpuViews, readEip, readEsp, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { Mem } from '../memory/mem-accessor';
+import { ERROR_INVALID_HANDLE } from '../thunking/thunk-errors';
 import { setParkedStackProvider, guardStackWrite } from '../memory/stack-write-guard';
 import { TebManager } from '../teb-manager';
 import {
@@ -35,10 +38,12 @@ import {
     simdSnapshot,
 } from '../fpu-helper';
 import { TimerWheel } from './timer-wheel';
-import { SyncObjectManager } from './sync-objects';
+import { SyncObjectManager, recordSyncEvent } from './sync-objects';
 import { WaitEngine } from './wait-engine';
 import { CallbackCoordinator } from './callback-coord';
+import { postHostTask } from '../host-task';
 import { TARGET_INSN_PER_MS } from './timing';
+import { setFsBase } from './fs-base';
 import { framePacer } from '../frame-pacer';
 import { frameVarianceDiagnostics } from '../frame-variance-diagnostics';
 import {
@@ -50,7 +55,8 @@ import {
     KernelThreadObject,
     SchedulerConfig, DEFAULT_SCHEDULER_CONFIG,
     WAIT_OBJECT_0, WAIT_IO_COMPLETION, WAIT_TIMEOUT, WAIT_FAILED,
-    WAIT_BLOCKED_NO_SWITCH, INFINITE, CREATE_SUSPENDED,
+    WAIT_BLOCKED_NO_SWITCH, INFINITE, CREATE_SUSPENDED, threadStackReserve,
+    MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED, WaitCompletion,
 } from './types';
 import {
     isValidGuestEip,
@@ -69,7 +75,7 @@ import {
     buildYieldReport,
 } from './scheduler-diagnostics';
 import { PF_HALT_TARGET } from '../bootloader';
-import { grantSrwOnWake } from '../../modules/kernel32/srw-lock';
+import { grantSrwOnWake, ensureSrwWaitEvent } from '../../modules/kernel32/srw-lock';
 import type { WinMM } from '../../modules/winmm';
 
 // Max virtual-time advance per idle pollTimeouts() pump. Bounds the jump when the
@@ -79,14 +85,16 @@ const IDLE_PUMP_MAX_MS = 250;
 /** Sole-runnable Sleep(ms): credit+yield only for short pump sleeps; longer → blockThread. */
 const SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS = 50;
 
-// Fairness budget for the winmm timer thread before its queued callbacks are
-// deferred (vs the general minQuantumMs=1ms). The software audio mixer runs as a
-// timeSetEvent callback on this thread; a 1ms defer chops the mixer's per-tick
-// drain into pieces spread across many scheduler rounds → bursty PCM production →
-// SAB underrun → audible crackle in software audio mixers. A small extra budget
-// lets the mixer finish a tick before yielding, bounding game-thread starvation to
-// a few ms. Only applies to the winmm timer thread; other threads keep minQuantumMs.
-const WINMM_TIMER_QUANTUM_MS = 4;
+// Fairness budget for the winmm timer thread before its queued callbacks are deferred.
+// The software audio mixer runs as a timeSetEvent callback on this thread, and cutting it
+// short chops the per-tick drain across many scheduler rounds → bursty PCM production →
+// SAB underrun → audible crackle. It needs a few ms to finish one tick.
+//
+// DERIVED, never a bare constant: this budget must never fall BELOW the general quantum,
+// or the thread that needs the most headroom becomes the one preempted soonest. That is
+// what a bare 4 silently became when minQuantumMs moved 1 → 16 — the relation the budget
+// exists to express inverted while the number stayed put.
+const WINMM_TIMER_QUANTUM_MS = Math.max(4, DEFAULT_SCHEDULER_CONFIG.minQuantumMs);
 
 interface TimerNoFpuProfile {
     clean: number;
@@ -101,12 +109,26 @@ interface TimerFpuBorrow {
     previousOwnerThreadId: number;
 }
 
+/** One context switch, as the forensic ring stores it before anyone asks to read it. */
+interface SwitchTraceRecord {
+    seq: number;
+    eip: number;
+    esp: number;
+    threadId: number;
+    state: number;
+    kind: ThunkBoundaryKind;
+    cleanup: number;
+}
+
 export class Scheduler {
     private process: Process | null = null;
     public config: SchedulerConfig;
 
     // Thread storage
     private threads = new Map<number, Thread>();
+    /** Sorted [stackBase, stackTop) spans; null = rebuild on next query. Nulled at every
+     *  site that adds or removes a thread, so it cannot answer from a stale membership. */
+    private stackSpanIndex: Array<{ base: number; top: number }> | null = null;
     private currentThreadId: number | null = null;
     private nextThreadId = 1;
     private runQueue: number[] = [];
@@ -140,6 +162,48 @@ export class Scheduler {
     private threadExitStubAddr = 0;
     private readonly threadExitStubSize = 32;
     private readonly defaultStackSize = 1024 * 1024;
+    /** One unmapped page below each thread stack (Windows' PAGE_GUARD page). */
+    private static readonly STACK_GUARD = 0x1000;
+    /** The image's SizeOfStackReserve — what CreateThread reserves when the caller did not
+     *  ask for a reservation. Set at image load; 0 until then (falls back to the default). */
+    private imageStackReserve = 0;
+    /**
+     * Stack address space the scheduler currently holds — live stacks plus the idle ones
+     * parked in `stackPool`. The quantity that decides whether a large SizeOfStackReserve
+     * is affordable; reported when an allocation fails, so heap exhaustion names its cause.
+     * Decremented only where the VA genuinely goes back to MemoryManager (releaseStack's
+     * over-cap branch).
+     */
+    private stackBytesReserved = 0;
+    /**
+     * Idle thread stacks, keyed by exact reserve size; the value is each block's ALLOC
+     * base (guard page included), so a reuse re-derives the same stack/guard layout.
+     *
+     * Reuse is confined to thread stacks — the scheduler never hands a dead stack back to
+     * the general allocator — which is what makes releasing one safe at all: a stale
+     * pointer into a dead stack can then only ever land in another thread's stack, never
+     * in a live heap object, COM struct or surface. NT keeps a per-process stack cache for
+     * the same reason. Self-bounding: an entry exists only between a thread's death and
+     * the next CreateThread at that size, so the pool cannot exceed peak concurrency.
+     */
+    private stackPool = new Map<number, number[]>();
+    private stackBytesPooled = 0;
+    /** Stack bases the scheduler itself allocated. The main thread's stack comes from the
+     *  bootloader (setMainStackInfo), not from us — releasing VA we never owned would hand
+     *  the running process's own stack to the next CreateThread. */
+    private ownedStackBases = new Set<number>();
+    /** Ceiling on idle pooled VA. Past it a released stack goes back to MemoryManager
+     *  (guard page reset first) instead of being cached — so a title cycling through
+     *  ever-larger reserves cannot turn the cache into the leak it replaces. */
+    private static readonly STACK_POOL_MAX_BYTES = 16 * 1024 * 1024;
+    /** Stack lifecycle ledger. `held*` are the refusals: each one is a stack we chose to
+     *  leak because something could still point into it (see canReleaseStack). A climbing
+     *  `heldAsyncInFlight` with a growing footprint names the cause without a repro. */
+    public stackPoolStats = {
+        fresh: 0, reused: 0, pooled: 0, released: 0,
+        heldCurrent: 0, heldAsyncInFlight: 0, heldSuspendedFrame: 0,
+        heldForeignEsp: 0, heldLiveFsBase: 0,
+    };
 
     // Thunk region boundaries for context save
     private thunkStubBase = 0;
@@ -256,6 +320,17 @@ export class Scheduler {
      *    round-trip produced no switch. Recoverable waste.
      *  - realSwitch: performSwitch switched to a different thread (legitimate). noRunnable: nothing. */
     public roundTripStats = { ticks: 0, urgentTicks: 0, urgentNoReady: 0, selfReschedule: 0, realSwitch: 0, noRunnable: 0 };
+    /** Suspend-vs-wait interaction census. Every counter sits on a COLD branch (a suspend that
+     *  targets a waiter, a wake that lands on a suspended thread) — never on the ~1.4M/s
+     *  Suspend/Resume spin itself — so it costs nothing and makes an otherwise invisible,
+     *  non-deterministic class observable: `suspendOnWaiting` is the only input the
+     *  orthogonality rules change, so a zero there means a title cannot be affected by them.
+     *  Surfaced in the harness `threads` state (report(), state(["threads"])). */
+    public suspendWaitStats = {
+        suspendOnWaiting: 0, suspendOnAsyncPark: 0, suspendRefused: 0,
+        wakeWhileSuspended: 0, skippedSuspendedWaiter: 0,
+        reevalOnResume: 0, reevalSatisfied: 0,
+    };
     /** Per-thread wall-clock attribution: ms of worker time spent while each thread was
      *  the CURRENT thread (guest execution + its thunks' JS time). Accumulated on every
      *  performSwitch entry — the single switch primitive — so it covers all switch paths.
@@ -263,15 +338,30 @@ export class Scheduler {
      *  the EIP-sampler's yield-point bias. */
     private threadCpuMs = new Map<number, number>();
     private threadCpuMarkMs = 0;
+    /** Per-thread retired guest instructions, folded at the same points as threadCpuMs.
+     *  Wall time says which thread holds the worker; this says how much guest WORK each one
+     *  does, which a slower host cannot inflate. Totals are doubles fed by 32-bit deltas —
+     *  every fold happens well inside one counter wrap. */
+    private threadRetiredInsns = new Map<number, number>();
+    private threadInsnMark = -1;
 
-    /** Attribute wall time since the last mark to the outgoing current thread. */
+    /** Attribute wall time and retired instructions since the last mark to the outgoing current thread. */
     private accumThreadCpu(): void {
         const now = performance.now();
-        if (this.threadCpuMarkMs > 0 && this.currentThreadId !== null) {
+        const cpu = this.getCpu();
+        const insns = cpu ? readRetiredInsns(cpu) : -1;
+        if (this.currentThreadId !== null) {
             const id = this.currentThreadId;
-            this.threadCpuMs.set(id, (this.threadCpuMs.get(id) ?? 0) + (now - this.threadCpuMarkMs));
+            if (this.threadCpuMarkMs > 0) {
+                this.threadCpuMs.set(id, (this.threadCpuMs.get(id) ?? 0) + (now - this.threadCpuMarkMs));
+            }
+            if (this.threadInsnMark >= 0 && insns >= 0) {
+                const delta = (insns - this.threadInsnMark) >>> 0;
+                this.threadRetiredInsns.set(id, (this.threadRetiredInsns.get(id) ?? 0) + delta);
+            }
         }
         this.threadCpuMarkMs = now;
+        this.threadInsnMark = insns;
     }
 
     /** Snapshot of per-thread worker-time attribution (ms, monotonic totals). */
@@ -279,6 +369,14 @@ export class Scheduler {
         this.accumThreadCpu(); // fold in the in-progress slice
         const out: Record<number, number> = {};
         for (const [id, ms] of this.threadCpuMs) out[id] = Math.round(ms * 100) / 100;
+        return out;
+    }
+
+    /** Snapshot of per-thread retired guest instructions (monotonic totals). */
+    public getThreadRetiredInsns(): Record<number, number> {
+        this.accumThreadCpu();
+        const out: Record<number, number> = {};
+        for (const [id, n] of this.threadRetiredInsns) out[id] = n;
         return out;
     }
     public fpuSwitchStats = {
@@ -333,6 +431,69 @@ export class Scheduler {
 
     // Switch request flag
     private switchRequested = false;
+
+    /** Wall-clock bound on the callback pin's power to defer a switch (below). */
+    private static readonly PIN_STARVATION_MAX_MS = 8;
+    /** When the pin first refused a switch with peers already queued (0 = not deferring). */
+    private pinDeferSinceMs = 0;
+    private pinDeferCount = 0;
+    public pinStarvationForced = 0;
+    /** Why the last tick boundary did NOT switch. Numeric so the hot path stays a store.
+     *  1=asyncRestore 2=timerThread 3=yieldPending 4=allBlockedOrSpin 5=switched
+     *  6=pinDefer 7=quantumNotExpired 8=nonPreemptible 9=criticalDefer 10=noRunQueue */
+    lastTickExit = 0;
+
+    /**
+     * Does the callback pin justify skipping THIS switch?
+     *
+     * The pin exists so a JS-invoked guest callback (WndProc, EnumWindows, …) is not
+     * preempted mid-chain. It was never meant to stop OTHER threads: on Windows a
+     * synchronous callback runs on the calling thread, it does not make the machine
+     * single-threaded. UE1 runs its whole engine tick inside DispatchMessage, so the pin
+     * is held for the entire frame — and when guest code inside that callback waits on a
+     * peer (Core.dll's `while(lock) Sleep(0)` spinlock), deferring forever is a deadlock:
+     * the holder can never be scheduled to release it. Observed on Harry Potter CoS as a
+     * hard freeze with runQueue=[3,2] and ZERO context switches.
+     *
+     * So the deferral is BOUNDED, the same shape as the non-preemptible-stub valve below:
+     * a fast callback (microseconds) is never split, while a callback that starves queued
+     * peers past PIN_STARVATION_MAX_MS loses the privilege. The switch is safe at this
+     * point for the same reason it is safe for a pinned thread that blocked — per-thread
+     * context and the frame's own thread-keyed bookkeeping survive the round trip.
+     */
+    private pinDefersSwitch(current: Thread): boolean {
+        if (current.kernelPinCount <= 0 || current.state !== ThreadState.RUNNING) {
+            this.pinDeferSinceMs = 0;
+            this.pinDeferCount = 0;
+            return false;
+        }
+        const now = performance.now();
+        if (this.pinDeferSinceMs === 0) {
+            this.pinDeferSinceMs = now;
+            this.pinDeferCount = 1;
+            return true;
+        }
+        this.pinDeferCount++;
+        if (now - this.pinDeferSinceMs < Scheduler.PIN_STARVATION_MAX_MS) return true;
+
+        Logger.warn(LogCategory.THREAD,
+            `PIN_STARVATION: T${current.id} held the callback pin for ` +
+            `${(now - this.pinDeferSinceMs).toFixed(1)}ms over ${this.pinDeferCount} deferred switches ` +
+            `while ${this.runQueue.length} thread(s) were READY — forcing the switch`);
+        this.pinStarvationForced++;
+        this.pinDeferSinceMs = 0;
+        this.pinDeferCount = 0;
+        // REQUEST the switch, don't merely permit it. The caller's next test is
+        // `switchRequested || quantumExpired`, so returning false alone does nothing on a
+        // tick where the quantum has not expired — and this window has just been reset, so
+        // the pin defers for another full PIN_STARVATION_MAX_MS. A thread holding the pin
+        // continuously (a guest spin-wait inside a callback) then starves READY peers
+        // forever while this counter happily ticks up: the bound fires and nothing moves.
+        // Observed on HP CoS's boot — pinStarvationForced climbing ~28/5s with realSwitch
+        // frozen and window.dll READY the whole time.
+        this.switchRequested = true;
+        return false;
+    }
 
     /** New threads run until their first blocking wait so SetEvent cannot be missed. */
     private bootstrapUntilFirstWait = new Set<number>();
@@ -400,6 +561,32 @@ export class Scheduler {
     getDebugHeadWatchLog(): string[] { return this.debugHeadWatchLog; }
     getDebugHeadZeroSnaps(): string[] { return this.debugHeadZeroSnaps; }
 
+    private debugWordWatchAddr = 0;
+    private debugWordWatchPrev = -1;
+    private debugWordWatchLog: string[] = [];
+    setDebugWordWatch(addr: number): void {
+        this.debugWordWatchAddr = addr >>> 0;
+        this.debugWordWatchPrev = -1;
+        this.debugWordWatchLog = [];
+    }
+    getDebugWordWatchLog(): string[] { return this.debugWordWatchLog; }
+
+    private sampleDebugWordWatch(cpu: V86Cpu): void {
+        if (!this.debugWordWatchAddr) return;
+        const value = (Mem.readUint32(this.debugWordWatchAddr) ?? 0) >>> 0;
+        if (value === this.debugWordWatchPrev) return;
+        const prev = this.debugWordWatchPrev;
+        this.debugWordWatchPrev = value;
+        const eip = readEip(cpu);
+        const entry = `0x${(prev >>> 0).toString(16)}->0x${value.toString(16)} ` +
+            `T${this.currentThreadId ?? 0}@0x${eip.toString(16)} insn=${this.retiredInsns(cpu) >>> 0}`;
+        if (this.debugWordWatchLog.length < 4096) this.debugWordWatchLog.push(entry);
+        else {
+            this.debugWordWatchLog.copyWithin(0, 1);
+            this.debugWordWatchLog[4095] = entry;
+        }
+    }
+
     /** Per-tick head sample: record the EDGE where the guest list head flips to/from 0.
      *  The current thread + live EIP at the flip-to-0 IS the corrupting writer. Cheap
      *  (one dword read per ~100k-insn tick). Called at the TOP of preemptAtTickBoundary. */
@@ -410,7 +597,7 @@ export class Scheduler {
         const prev = this.debugHeadWatchPrevHead;
         this.debugHeadWatchPrevHead = head;
         if ((head === 0 || prev === 0) && this.debugHeadZeroSnaps.length < 2000) {
-            const eip = cpu.instruction_pointer[0] >>> 0;
+            const eip = readEip(cpu);
             this.debugHeadZeroSnaps.push(
                 `head 0x${(prev >>> 0).toString(16)}->0x${head.toString(16)} ` +
                 `cur=T${this.currentThreadId ?? 0}@0x${eip.toString(16)} insn=${this.retiredInsns(cpu) >>> 0}`);
@@ -424,8 +611,7 @@ export class Scheduler {
     private static readonly REAP_GRACE_MS = 5000;
     private static readonly REAP_THROTTLE_MS = 250;
 
-    // MessageChannel for sub-ms yields
-    private yieldPort: MessagePort | null = null;
+    // Sub-ms yields: one host task in flight at a time (see postHostTask)
     private yieldPortResolve: (() => void) | null = null;
     // In-flight setTimeout-based idle yield (allBlocked etc.) — tracked so an async
     // thunk completion can resume it early instead of waiting out the ~50ms timer.
@@ -448,22 +634,28 @@ export class Scheduler {
     private sehDeferredSwitchCount = 0;
     private sehDeniedRestoreCount = 0;
     private sehUnbalancedExitCount = 0;
-    private readonly asyncRestoreTrace: string[] = [];
+    /** Forensic ring for the async park/restore path. Entries are either a formatted line
+     *  (the rare, interesting events) or a compact record the hot context-switch path pushes
+     *  WITHOUT formatting: performSwitch runs tens of thousands of times a second on an engine
+     *  that hands the CPU back and forth (Discworld Noir: ~37k/s), and building five template
+     *  strings plus a performance.now() per switch cost more than the switch. Formatted on read
+     *  (getAsyncRestoreTrace / the dumps), which is where a human is the only consumer. */
+    private readonly asyncRestoreTrace: Array<string | SwitchTraceRecord> = [];
+    /** Ordering stamp for the compact records — a clock read per switch is what this avoids. */
+    private asyncTraceSeq = 0;
 
     constructor(config: Partial<SchedulerConfig> = {}) {
         this.config = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
 
-        // Pre-allocate MessageChannel for sub-ms yields (bypasses setTimeout 4ms floor)
-        const ch = new MessageChannel();
-        this.yieldPort = ch.port2;
-        ch.port1.onmessage = () => {
-            const resolve = this.yieldPortResolve;
-            if (resolve) {
-                this.yieldPortResolve = null;
-                resolve();
-            }
-        };
     }
+
+    private readonly onYieldTask = (): void => {
+        const resolve = this.yieldPortResolve;
+        if (resolve) {
+            this.yieldPortResolve = null;
+            resolve();
+        }
+    };
 
     // ═══════════════════════════════════════════════════════════════════════
     // Initialization
@@ -494,6 +686,18 @@ export class Scheduler {
                 if (lo < top && visit(t.id, lo, top, esp, THREAD_STATE_NAMES[t.state])) return;
             }
         }, () => this.currentThreadId ?? -1);
+
+        // Relaxed-FPU is a global tag convention over the SHARED x87 register file, so a
+        // live mode toggle must re-encode every thread's SAVED snapshot too — the wasm
+        // set_relaxed_fpu export reaches only the live registers. Includes the running
+        // thread's cached lastFpuState: a clean dirty-bit save promotes it to ctx.fpu
+        // without re-snapshotting.
+        preemptionManager.setSavedFpuStateProvider((visit) => {
+            for (const t of this.threads.values()) {
+                if (t.context?.fpu) visit(t.context.fpu);
+                if (t.lastFpuState) visit(t.lastFpuState);
+            }
+        });
 
         if (process.memory) {
             this.tebManager.initProcess(() => process.getCurrentMemory(), process.memory);
@@ -536,6 +740,7 @@ export class Scheduler {
         this.waitEngine.reset();
         this.callbackCoord.reset();
         this.threads.clear();
+        this.stackSpanIndex = null;
         this.runQueue = [];
         this.currentThreadId = null;
         this.mainThreadId = 0;
@@ -551,6 +756,12 @@ export class Scheduler {
         this.reapQueue.length = 0;
         this.reapHead = 0;
         this.lastReapCheckMs = 0;
+        // process.reset() rewinds the bump allocator, so every pooled base is about to
+        // belong to someone else. Drop the cache; the footprint goes with it.
+        this.stackPool.clear();
+        this.stackBytesPooled = 0;
+        this.stackBytesReserved = 0;
+        this.ownedStackBases.clear();
         this.activeCriticalRuntime = null;
         this.transientExecRanges.clear();
         // Stubs are regenerated after reset() (pe-loader re-runs writeHeapSlabStubs), which
@@ -587,7 +798,7 @@ export class Scheduler {
      * Returns true if the halt fired (the caller must return immediately).
      */
     private handleUnhandledFaultHalt(cpu: V86Cpu, source: string): boolean {
-        const eip0 = cpu.instruction_pointer[0] >>> 0;
+        const eip0 = readEip(cpu);
         if (this.unhandledFaultFired ||
             eip0 < (PF_HALT_TARGET >>> 0) || eip0 > ((PF_HALT_TARGET + 3) >>> 0)) {
             return false;
@@ -618,7 +829,8 @@ export class Scheduler {
     /** Retired guest instructions (v86 32-bit counter; wraps ~every 42 s at target MIPS, so
      *  callers must use an unsigned `>>> 0` delta over a sub-quantum window). */
     private retiredInsns(cpu: V86Cpu): number {
-        return (cpu?.instruction_counter?.[0] ?? 0) >>> 0;
+        if (PROXY_BASELINE.on) return (cpu?.instruction_counter?.[0] ?? 0) >>> 0;
+        return readRetiredInsns(cpu);
     }
 
     /** True once `thread` has retired a full quantum's worth of guest instructions since its last
@@ -637,12 +849,31 @@ export class Scheduler {
     }
 
     /**
+     * Guest instructions the next slice may retire before the earliest pending timer is due,
+     * rounded UP to the process's timer resolution; 0 = no timer, no cap. Timers are only
+     * polled at a boundary, so without this a thread running pure guest code holds every
+     * Sleep(1) for a whole slice even after the app asked for timeBeginPeriod(1). At the NT
+     * default (15.6ms) the result always exceeds the normal slice and changes nothing.
+     */
+    timerSliceBudgetInsns(): number {
+        const d = this.timerWheel.nextFireIn(this.timeService.nowMs());
+        if (!Number.isFinite(d)) return 0;
+        const res = this.timeService.timerResolutionMs;
+        const ms = Math.max(res, Math.ceil(d / res) * res);
+        return Math.ceil(ms * TARGET_INSN_PER_MS);
+    }
+
+    /**
      * True once `thread` has retired at least `fraction` of one minimum quantum's worth of
      * guest instructions since its last switch. This is the instruction-based (deterministic,
      * platform-independent) analogue of a `performance.now() - lastSwitchTime >= minQuantumMs`
      * wall-clock gate — used by the ThunkDispatcher time-poll force-switch. Measuring the gate
      * in retired instructions instead of wall-ms keeps the switch point a function of guest
      * state, not host speed (same rationale as quantumExpired / the Re-Volt mac fix).
+     *
+     * The budget is a FRACTION OF THE QUANTUM, so retuning minQuantumMs retunes every caller
+     * with it — a spin-waiter yields at half the quantum whatever that quantum is, which is
+     * the intended relation. Callers wanting an absolute latency bound must not use this.
      */
     insnQuantumFraction(thread: Thread, fraction: number): boolean {
         const cpu = this.getCpu();
@@ -675,13 +906,14 @@ export class Scheduler {
         }
 
         // 3a. Dispatch timer thread callback if we ARE the timer thread
-        if (this.tryDispatchTimerThreadCallbacks(cpu)) return;
+        if (this.tryDispatchTimerThreadCallbacks(cpu)) { this.lastTickExit = 2; return; }
 
         // 3b. Dispatch one queued callback if safe
         this.callbackCoord.dispatchOne();
 
         // 4. Check quantum expiry → request switch (retired-instruction quantum, not wall-clock)
-        if (!this.switchRequested && this.runQueue.length > 0) {
+        if (!this.switchRequested && this.runQueue.length > 0 &&
+            !(globalThis as { __noQuantumPreempt?: boolean }).__noQuantumPreempt) {
             const current = this.getCurrentThread();
             if (current && this.quantumExpired(current, cpu)) {
                 this.switchRequested = true;
@@ -699,9 +931,10 @@ export class Scheduler {
             // pinned WndProc deadlocks: the switch is deferred, WaitForSingleObject's
             // RET resumes guest code on the WAITING thread, and the read returns short
             // → D2 "File Read Error / Archive.cpp:143". Only defer while RUNNING.
-            if (current && current.kernelPinCount > 0 && current.state === ThreadState.RUNNING) {
-                // Pinned for callback chain — defer preemptive switch until chain completes.
-                // Same-thread async restores are handled at step 1 above.
+            if (current && this.pinDefersSwitch(current)) {
+                // Pinned for callback chain — defer preemptive switch until chain completes
+                // (bounded: see pinDefersSwitch). Same-thread async restores are handled at
+                // step 1 above.
                 return;
             }
             if (this.shouldDeferSwitchForCriticalRuntime(cpu, kind)) {
@@ -741,6 +974,7 @@ export class Scheduler {
         if (!this.process) return;
 
         if (this.debugHeadWatch) this.sampleDebugHeadWatch(cpu); // TEMP crash-hunt
+        this.sampleDebugWordWatch(cpu);
 
         if (this.handleUnhandledFaultHalt(cpu, "preemptAtTickBoundary")) return;
 
@@ -769,7 +1003,7 @@ export class Scheduler {
         {
             const cur = this.getCurrentThread();
             if (cur && cur.state === ThreadState.RUNNING) {
-                const eip = cpu.instruction_pointer[0] >>> 0;
+                const eip = readEip(cpu);
                 if (this.spinLoopBase > 0 && eip >= this.spinLoopBase && eip < this.spinLoopEnd) {
                     this.spinBoundaryHits.set(cur.id, (this.spinBoundaryHits.get(cur.id) ?? 0) + 1);
                 }
@@ -777,7 +1011,7 @@ export class Scheduler {
         }
 
         // 1. Process pending async restores (highest priority — unblocks spin-loop threads)
-        if (this.onPollAsyncRestores?.(cpu, "preemptAtTickBoundary")) return;
+        if (this.onPollAsyncRestores?.(cpu, "preemptAtTickBoundary")) { this.lastTickExit = 1; return; }
 
         // 2. Poll timers
         const now = this.timeService.nowMs();
@@ -796,6 +1030,7 @@ export class Scheduler {
         if (this.yieldToHostMs > 0) {
             const ms = this.yieldToHostMs;
             this.yieldToHostMs = 0;
+            this.lastTickExit = 3;
             this.yieldToHost(cpu, ms);
             return;
         }
@@ -831,7 +1066,7 @@ export class Scheduler {
             // Strict equality on spinLoopBase — SEH stubs live at +2/+4/+0x200
             // and must keep running, so the wider range check stays yield-only.
             if (current && current.state === ThreadState.RUNNING) {
-                const eip = cpu.instruction_pointer[0] >>> 0;
+                const eip = readEip(cpu);
                 if (this.spinLoopBase > 0 && eip === this.spinLoopBase) {
                     // A thread that owns a live suspended-thunk frame (dialog pump) lands
                     // here after EVERY intermediate callback return — park it WAITING; the
@@ -855,6 +1090,7 @@ export class Scheduler {
                             return;
                         }
                     }
+                    this.lastTickExit = 4;
                     this.yieldToHost(cpu, 1, "spinLoop");
                     return;
                 }
@@ -885,12 +1121,16 @@ export class Scheduler {
             // A non-RUNNING current has yielded the CPU and retires 0 instructions at the spin
             // loop, so the retired-instruction quantum below never expires — switch unconditionally
             // (peers are runnable, the parked thread's context is already saved). WAITING: async-
-            // parked / blocked (NFS Porsche: T-main in async GetMessageA starved READY peers).
+            // parked / blocked: a non-running current must not retain the CPU.
             // READY: the SOLE thread woken WAITING→READY via the wait-engine/timer-wheel path (no
             // async restore) is re-queued but still currentThreadId; with no peer, wakeThread skips
             // requestSwitch() and it's never promoted → frozen at the spin loop with is_running()
-            // stuck true (HoMM3-demo Sleep boot freeze). Async-restore wakes are handled at step 1.
-            if (current.state === ThreadState.WAITING || current.state === ThreadState.READY) {
+            // stuck true. Async-restore wakes are handled at step 1.
+            // SUSPENDED: same reasoning — a suspended thread must not be on the CPU at all, and
+            // whatever suspended it (a self-suspend, or a peer that suspended it between
+            // boundaries) has no other way to take it off.
+            if (current.state === ThreadState.WAITING || current.state === ThreadState.READY ||
+                current.state === ThreadState.SUSPENDED) {
                 this.switchRequested = false;
                 this.performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
                 this.tryDispatchTimerThreadCallbacks(cpu);
@@ -904,9 +1144,26 @@ export class Scheduler {
                 // handled at step 1 (onPollAsyncRestores) which runs before this check.
                 // Exception: a thread that voluntarily BLOCKED (WAITING) has yielded the CPU
                 // and cannot run — its peers must be allowed to proceed (see onThunkBoundary).
-                if (current.kernelPinCount > 0 && current.state === ThreadState.RUNNING) return;
+                // The deferral is bounded so a frame-long callback cannot starve them (see
+                // pinDefersSwitch).
+                if (this.pinDefersSwitch(current)) { this.lastTickExit = 6; return; }
                 // Retired-instruction quantum (deterministic), not wall-clock — see quantumExpired().
-                if (this.switchRequested || this.quantumExpired(current, cpu)) {
+                // The quantum is measured in RETIRED GUEST INSTRUCTIONS, and a thread sitting
+                // on the spin loop's `JMP $` advances cpu.instruction_counter by nothing the
+                // scheduler can see — so quantumExpired() is false forever. That is fine for a
+                // properly parked thread (WAITING, skipped entirely), but an ORPHAN left
+                // RUNNING at the park address (async park that lost its restore) then blocks
+                // EVERY switch while peers sit READY: the guest freezes with a non-empty run
+                // queue and `lastTickExit=7` on every tick. It is spinning, not working —
+                // request the switch so peers run. It stays runnable, so a late restore still
+                // resumes it. (HP CoS: froze at the boot splash with window.dll READY.)
+                if (this.spinLoopBase > 0 && readEip(cpu) === this.spinLoopBase) {
+                    this.switchRequested = true;
+                }
+                const quantumExpired = !(globalThis as { __noQuantumPreempt?: boolean }).__noQuantumPreempt &&
+                    this.quantumExpired(current, cpu);
+                if (!(this.switchRequested || quantumExpired)) this.lastTickExit = 7;
+                if (this.switchRequested || quantumExpired) {
                     if (this.shouldDeferSwitchForCriticalRuntime(cpu, ThunkBoundaryKind.GUEST_CODE)) {
                         this.switchRequested = true;
                         return;
@@ -916,7 +1173,7 @@ export class Scheduler {
                     // slab state) cannot be interleaved by another thread → "two owners, one
                     // block" (D2 Fog/Storm corruption). The stub is straight-line and exits
                     // within a few instructions, so the defer is bounded to the next tick.
-                    const eip = cpu.instruction_pointer[0] >>> 0;
+                    const eip = readEip(cpu);
                     if (this.isEipNonPreemptible(eip)) {
                         // Safety valve: a straight-line stub leaves the range within a handful
                         // of instructions, so a thread "stuck" at the same EIP across many
@@ -937,6 +1194,7 @@ export class Scheduler {
                         }
                     }
                     this.switchRequested = false;
+                    this.lastTickExit = 5;
                     this.performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
                     // 7b. If we just switched TO the timer thread, dispatch its callback immediately
                     this.tryDispatchTimerThreadCallbacks(cpu);
@@ -1017,7 +1275,7 @@ export class Scheduler {
 
         // During active SEH dispatch, allow only explicit transient/control boundaries.
         if (kind === ThunkBoundaryKind.GUEST_CODE || kind === ThunkBoundaryKind.THUNK_STUB) {
-            const eip = cpu.instruction_pointer[0] >>> 0;
+            const eip = readEip(cpu);
             this.sehDeferredSwitchCount++;
             const kindName = kind === ThunkBoundaryKind.GUEST_CODE ? 'GUEST_CODE' : 'THUNK_STUB';
             Logger.warn(LogCategory.THREAD,
@@ -1241,7 +1499,7 @@ export class Scheduler {
             case ThunkBoundaryKind.THUNK_STUB: {
                 // Between OUT and RET N → construct post-return context
                 const mem = this.process!.getCurrentMemory();
-                const esp = cpu.reg32[4] >>> 0;
+                const esp = readEsp(cpu);
                 if (esp < 4 || esp + 4 > mem.length) return this.saveCurrentThreadContext(cpu, 'thunk_stub');
 
                 const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -1266,7 +1524,7 @@ export class Scheduler {
 
             case ThunkBoundaryKind.GUEST_CODE: {
                 // Normal guest code — validate EIP range
-                const eip = cpu.instruction_pointer[0] >>> 0;
+                const eip = readEip(cpu);
                 if (isValidGuestEip(eip)) {
                     return this.saveCurrentThreadContext(cpu, 'guest');
                 }
@@ -1314,7 +1572,7 @@ export class Scheduler {
         }
 
         this.applyContextState(cpu, ctx, ctx.esp, ownerThreadId);
-        cpu.instruction_pointer[0] = ctx.eip;
+        cpuViews(cpu).instructionPointer[0] = ctx.eip;
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
 
         return true;
@@ -1329,28 +1587,40 @@ export class Scheduler {
      * the direct path writes EIP, the stack path lets RET N pop it off the stack.
      */
     private applyContextState(cpu: V86Cpu, ctx: CpuContext, esp: number, ownerThreadId?: number): void {
-        const reg = cpu.reg32;
+        if (PROXY_BASELINE.on) { this.applyContextStateViaProxy(cpu, ctx, esp, ownerThreadId); return; }
+        const v = cpuViews(cpu);
+        const reg = v.reg32;
         reg[0] = ctx.eax; reg[1] = ctx.ecx; reg[2] = ctx.edx; reg[3] = ctx.ebx;
         reg[4] = esp; reg[5] = ctx.ebp; reg[6] = ctx.esi; reg[7] = ctx.edi;
-        cpu.flags[0] = ctx.eflags;
+        v.flags[0] = ctx.eflags;
         // Mirror v86's update_eflags/popf: the written EFLAGS is authoritative —
         // clear the lazy-flags dirty mask so the resumed thread does NOT recompute
         // arithmetic flags from the OUTGOING thread's last ALU result (shared
         // register file, same hazard class as fpu/simd below).
+        if (v.flagsChanged.length !== 0) v.flagsChanged[0] = 0;
+        this.restoreFpuSimdState(cpu, ctx, ownerThreadId);
+    }
+
+    /** A/B arm only: the pre-conversion register-file write, through v86's Proxy. */
+    private applyContextStateViaProxy(cpu: V86Cpu, ctx: CpuContext, esp: number, ownerThreadId?: number): void {
+        const reg = cpu.reg32;
+        reg[0] = ctx.eax; reg[1] = ctx.ecx; reg[2] = ctx.edx; reg[3] = ctx.ebx;
+        reg[4] = esp; reg[5] = ctx.ebp; reg[6] = ctx.esi; reg[7] = ctx.edi;
+        cpu.flags[0] = ctx.eflags;
         if (cpu.flags_changed) cpu.flags_changed[0] = 0;
         this.restoreFpuSimdState(cpu, ctx, ownerThreadId);
     }
 
     private handleUnsaveableCurrentThread(thread: Thread, cpu: V86Cpu, kind: ThunkBoundaryKind, cleanup: number, source: string): boolean {
-        const eip = cpu.instruction_pointer[0] >>> 0;
-        const esp = cpu.reg32[4] >>> 0;
+        const eip = readEip(cpu);
+        const esp = readEsp(cpu);
         const detail =
             `cannot-save T${thread.id},state=${THREAD_STATE_NAMES[thread.state]},` +
             `eip=${hx(eip)},esp=${hx(esp)},cleanup=${cleanup}`;
         this.traceAsyncRestore(source, cpu, detail);
         this.dumpSchedulerAsyncState(source, cpu, kind, detail, 'error');
 
-        if (this.isMainThreadId(thread.id)) {
+        if (this.isMainThread(thread.id)) {
             Logger.error(LogCategory.THREAD,
                 `performSwitch: cannot save MAIN T${thread.id} at EIP=${hx(eip)} ESP=${hx(esp)}; fatal guard`);
             this.reportFatalGuard(0x4100, eip, thread.id);
@@ -1371,7 +1641,12 @@ export class Scheduler {
     private performSwitch(cpu: V86Cpu, kind: ThunkBoundaryKind, cleanup: number): boolean {
         this.accumThreadCpu();
         let current = this.getCurrentThread();
-        this.traceAsyncRestore("performSwitch", cpu, `boundary=${boundaryKindName(kind)},cleanup=${cleanup}`);
+        this.recordSwitchTrace(cpu, kind, cleanup);
+
+        if ((globalThis as { __pinRunningMainThread?: boolean }).__pinRunningMainThread &&
+            current?.id === this.mainThreadId && current.state === ThreadState.RUNNING) {
+            return false;
+        }
 
         // Save current thread context if RUNNING
         if (current && current.state === ThreadState.RUNNING) {
@@ -1414,7 +1689,7 @@ export class Scheduler {
         // `torn`. Build a string + push ONLY on the rare discriminating events (torn or
         // switching out mid-splice) — nothing on ordinary switches, so timing is undisturbed.
         if (this.debugHeadWatch) {
-            const outEip = (current?.context?.eip ?? cpu.instruction_pointer[0]) >>> 0;
+            const outEip = (current?.context?.eip ?? cpuViews(cpu).instructionPointer[0]) >>> 0;
             const midMutation = outEip >= this.debugHeadWatch.loEip && outEip < this.debugHeadWatch.hiEip;
             const head = (Mem.readUint32(this.debugHeadWatch.headAddr) ?? 0) >>> 0;
             if ((head === 0 || midMutation) && this.debugHeadWatchLog.length < 4000) {
@@ -1429,7 +1704,7 @@ export class Scheduler {
         // Self-restore optimization
         if (current && next.id === current.id) {
             // If at spin loop with saved context pointing elsewhere, must restore
-            const eip = cpu.instruction_pointer[0] >>> 0;
+            const eip = readEip(cpu);
             const atSpinLoop = this.spinLoopBase > 0 && eip >= this.spinLoopBase && eip < this.spinLoopEnd;
             if (atSpinLoop && next.context && next.context.eip !== eip) {
                 // Fall through to full restore
@@ -1454,11 +1729,12 @@ export class Scheduler {
         this.transitionTo(next, ThreadState.RUNNING, null, null);
 
         // Determine restore method based on current EIP location
-        const currentEip = cpu.instruction_pointer[0] >>> 0;
+        const currentEip = readEip(cpu);
         const inThunkRegion = (currentEip >= this.thunkStubBase && currentEip < this.thunkStubEnd) ||
             (this.callbackStubBase > 0 && currentEip >= this.callbackStubBase && currentEip < this.callbackStubEnd);
 
-        if (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB) {
+        if (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB &&
+            !(globalThis as { __noStackBasedRestore?: boolean }).__noStackBasedRestore) {
             // Stack-based restore: compute adjusted ESP, write target EIP, let RET N pop naturally
             this.stackBasedRestore(cpu, savedCtx, cleanup, next.id);
         } else {
@@ -1470,7 +1746,7 @@ export class Scheduler {
         // SAVED context GPRs against the LIVE cpu regs after restore — a mismatch is our
         // save/restore losing a register (esi=0 hypothesis). Method = which restore path ran.
         if (this.debugHeadWatch && savedCtx.eip >= this.debugHeadWatch.loEip && savedCtx.eip < this.debugHeadWatch.hiEip) {
-            const r = cpu.reg32;
+            const r = cpuViews(cpu).reg32;
             const method = (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB) ? "stack" : "direct";
             const mism = ((r[6] >>> 0) !== (savedCtx.esi >>> 0)) || ((r[4] >>> 0) !== (savedCtx.esp >>> 0)) ||
                          ((r[7] >>> 0) !== (savedCtx.edi >>> 0)) || ((r[3] >>> 0) !== (savedCtx.ebx >>> 0));
@@ -1484,8 +1760,8 @@ export class Scheduler {
         }
 
         // Update FS segment for new thread's TEB
-        if (next.tebAddress > 0 && cpu.segment_offsets) {
-            cpu.segment_offsets[4] = next.tebAddress;
+        if (next.tebAddress > 0) {
+            setFsBase(cpu, next.tebAddress);
         }
 
         // Sync thread data to WASM hypercall page
@@ -1501,6 +1777,9 @@ export class Scheduler {
 
         next.lastSwitchTime = performance.now();
         next.lastSwitchInsn = this.retiredInsns(cpu); // deterministic quantum baseline for the resumed thread
+        // An urgent exit requested for the outgoing thread must not starve the incoming one.
+        const park = this.spinLoopBase >>> 0;
+        if ((savedCtx.eip >>> 0) !== park && readEip(cpu) !== park) preemptionManager.resumeSliceForIncomingThread();
         return true;
     }
 
@@ -1545,6 +1824,174 @@ export class Scheduler {
     // Thread Lifecycle
     // ═══════════════════════════════════════════════════════════════════════
 
+    /** Make the page below a thread stack unmapped, so an overflow faults instead of
+     *  silently overwriting the neighbour. No-op before paging comes up — the page is
+     *  still reserved, so nothing else is handed that address either way. */
+    private protectStackGuardPage(guardBase: number): void {
+        const ptm = this.process?.pageTableManager;
+        if (!ptm?.isPagingEnabled?.()) return;
+        try {
+            ptm.setProtection(guardBase, Scheduler.STACK_GUARD, 0x01 /* PAGE_NOACCESS */);
+        } catch (e) {
+            Logger.warn(LogCategory.THREAD, `stack guard page at 0x${guardBase.toString(16)}: ${e}`);
+        }
+    }
+
+    /** Undo protectStackGuardPage, so a block leaving the stack pool does not carry a
+     *  not-present page into the middle of whatever the allocator hands it to next (the
+     *  region map would report that allocation `rw` while the PTE says otherwise). */
+    private unprotectStackGuardPage(guardBase: number): void {
+        const ptm = this.process?.pageTableManager;
+        if (!ptm?.isPagingEnabled?.()) return;
+        try {
+            ptm.setProtection(guardBase, Scheduler.STACK_GUARD, 0x04 /* PAGE_READWRITE */);
+        } catch (e) {
+            Logger.warn(LogCategory.THREAD, `stack guard page reset at 0x${guardBase.toString(16)}: ${e}`);
+        }
+    }
+
+    /**
+     * Guard-page-included alloc base for a stack of `size` bytes: a pooled block when one
+     * of that exact size is idle, otherwise fresh VA from MemoryManager (which may throw).
+     *
+     * A pooled block's guard page is still PAGE_NOACCESS from its previous tenant — that is
+     * the protection the next tenant wants at exactly that address, so it is deliberately
+     * left in place.
+     */
+    private acquireStack(size: number): { allocBase: number; reused: boolean } {
+        const total = size + Scheduler.STACK_GUARD;
+        const free = this.stackPool.get(size);
+        const pooled = free?.pop();
+        if (pooled !== undefined) {
+            if (free!.length === 0) this.stackPool.delete(size);
+            this.stackBytesPooled -= total;
+            this.ownedStackBases.add((pooled + Scheduler.STACK_GUARD) >>> 0);
+            this.stackPoolStats.reused++;
+            return { allocBase: pooled, reused: true };
+        }
+        const allocBase = this.process!.memory.alloc(total, undefined, undefined, Scheduler.STACK_GUARD);
+        this.protectStackGuardPage(allocBase);
+        this.stackBytesReserved += total;
+        this.ownedStackBases.add((allocBase + Scheduler.STACK_GUARD) >>> 0);
+        this.stackPoolStats.fresh++;
+        return { allocBase, reused: false };
+    }
+
+    /**
+     * May the reaper take `thread`'s stack back?
+     *
+     * Freeing a stack introduces address REUSE, and the leak it replaces was accidentally
+     * protective: nothing else could ever be handed those bytes. Every refusal below is a
+     * live reference we cannot prove dead, and each one costs exactly one leaked stack —
+     * which is the trade this whole path is built around.
+     */
+    private canReleaseStack(thread: Thread): boolean {
+        const s = this.stackPoolStats;
+        if (thread.id === this.currentThreadId) { s.heldCurrent++; return false; }
+
+        // An async thunk parked on this thread holds guest pointers INTO its frame (the
+        // out-params the handler will write) and completes on a later turn; termination
+        // does not cancel the in-flight JS work, only the restore that would have followed.
+        // Typed, not duck-typed: a rename on the dispatcher must be a compile error here,
+        // not a gate that silently stops holding anything.
+        if (this.process?.dispatcher?.hasActiveAsyncThunkForThread(thread.id)) {
+            s.heldAsyncInFlight++;
+            return false;
+        }
+
+        // A live suspended-thunk frame (a JS-driven pump) is resumed from its own saved
+        // ESP on this stack.
+        if (this.onThreadOwnsSuspendedFrame?.(thread.id)) { s.heldSuspendedFrame++; return false; }
+
+        const base = thread.stackBase >>> 0;
+        const top = thread.stackTop >>> 0;
+
+        // FS still selects this thread's TEB, whose StackBase/StackLimit name the range we
+        // are about to hand out — the guest has not left this context yet.
+        const cpu = this.getCpu();
+        const fsBase = cpu ? (cpuViews(cpu).segmentOffsets[4] ?? 0) >>> 0 : 0;
+        if (fsBase !== 0 && thread.tebAddress > 0 && fsBase === (thread.tebAddress >>> 0)) {
+            s.heldLiveFsBase++;
+            return false;
+        }
+
+        // Guests switch ESP onto stacks they did not allocate (fibers, coroutine runtimes).
+        // A surviving thread parked on the dead thread's stack must keep it. The RUNNING
+        // thread's ESP is in the register file, not in its saved context (which is stale
+        // while it runs), so it is read live rather than from the loop below.
+        const liveEsp = cpu ? readEsp(cpu) : 0;
+        if (liveEsp >= base && liveEsp < top) { s.heldForeignEsp++; return false; }
+        for (const other of this.threads.values()) {
+            if (other.id === thread.id || other.state === ThreadState.TERMINATED) continue;
+            const esp = (other.context?.esp ?? 0) >>> 0;
+            if (esp >= base && esp < top) { s.heldForeignEsp++; return false; }
+        }
+        return true;
+    }
+
+    /**
+     * Give a reaped thread's stack back — to the stack pool, or (past the pool ceiling)
+     * to MemoryManager. Windows deallocates the stack when the thread terminates; holding
+     * it forever is the deviation, and at 8 MB of SizeOfStackReserve a handful of dead
+     * threads exhaust the heap.
+     */
+    private releaseStack(thread: Thread): void {
+        const size = thread.stackSize >>> 0;
+        const base = thread.stackBase >>> 0;
+        if (size === 0 || !this.ownedStackBases.has(base)) return;
+        if (!this.canReleaseStack(thread)) return;
+
+        this.ownedStackBases.delete(base);
+        const allocBase = base - Scheduler.STACK_GUARD;
+        const total = size + Scheduler.STACK_GUARD;
+        if (this.stackBytesPooled + total > Scheduler.STACK_POOL_MAX_BYTES) {
+            this.unprotectStackGuardPage(allocBase);
+            // Leaving the pool means the general allocator may carve this VA for anything,
+            // and the next tenant is filled by a JS write the JIT cannot see. Drop the
+            // blocks v86 compiled from what ran on this stack here, where we still know
+            // the extent (§3.1 coherence) — MemoryManager.free does not.
+            invalidateGuestCode(allocBase, total);
+            this.process?.memory.free(allocBase);
+            this.stackBytesReserved -= total;
+            this.stackPoolStats.released++;
+            return;
+        }
+        let free = this.stackPool.get(size);
+        if (!free) { free = []; this.stackPool.set(size, free); }
+        free.push(allocBase);
+        this.stackBytesPooled += total;
+        this.stackPoolStats.pooled++;
+    }
+
+    /** Stack footprint + lifecycle ledger (harness `threads` state, CreateThread failures).
+     *  The three quantities partition `reservedBytes`: what threads that still exist hold,
+     *  what is idle in the pool, and what a refused release leaked (see canReleaseStack) —
+     *  summing live+pooled would otherwise bury the leak the refusals pay for. */
+    getStackFootprint(): {
+        reservedBytes: number; pooledBytes: number; liveBytes: number; heldBytes: number;
+        pooledBlocks: number; stats: Scheduler['stackPoolStats'];
+    } {
+        let pooledBlocks = 0;
+        for (const free of this.stackPool.values()) pooledBlocks += free.length;
+        let liveBytes = 0;
+        for (const t of this.threads.values()) {
+            if (this.ownedStackBases.has(t.stackBase >>> 0)) liveBytes += (t.stackSize >>> 0) + Scheduler.STACK_GUARD;
+        }
+        return {
+            reservedBytes: this.stackBytesReserved,
+            pooledBytes: this.stackBytesPooled,
+            liveBytes,
+            heldBytes: this.stackBytesReserved - this.stackBytesPooled - liveBytes,
+            pooledBlocks,
+            stats: { ...this.stackPoolStats },
+        };
+    }
+
+    /** Publish the image's SizeOfStackReserve (see the sizing rule in createThread). */
+    setImageStackReserve(bytes: number): void {
+        this.imageStackReserve = Math.max(0, bytes | 0);
+    }
+
     createThread(
         startAddress: number, parameter: number, stackSize: number,
         creationFlags: number, outThreadId: number, memory: Uint8Array
@@ -1552,17 +1999,34 @@ export class Scheduler {
         if (!this.process) return 0;
         this.writeThreadExitStub();
 
-        const size = stackSize > 0 ? stackSize : this.defaultStackSize;
+        const size = threadStackReserve(stackSize, creationFlags, this.imageStackReserve, this.defaultStackSize);
+        // Windows puts a PAGE_GUARD page below every thread stack, so an overflow raises
+        // STATUS_STACK_OVERFLOW at the moment it happens. Without one the overflow is
+        // silent and lands in whatever the allocator placed underneath — the corruption
+        // then detonates in an unrelated subsystem with nothing pointing back here.
         let stackBase: number;
+        let reusedStack: boolean;
         try {
-            stackBase = this.process.memory.alloc(size);
+            const acquired = this.acquireStack(size);
+            stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
+            reusedStack = acquired.reused;
         } catch (e) {
-            Logger.error(LogCategory.THREAD, `CreateThread failed: ${e}`);
+            const f = this.getStackFootprint();
+            Logger.error(LogCategory.THREAD,
+                `CreateThread failed: ${e} (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
+                `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
+                `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
+                `the stack pool, ${f.heldBytes} leaked by a refused release)`);
             return 0;
         }
 
         const stackTop = stackBase + size;
         memory.fill(0, stackBase, stackTop);
+        // Guests run code on their own stacks (the SEH trampoline this dispatcher writes
+        // into the dead zone below ESP is ours), so a recycled stack can still carry v86
+        // blocks compiled from its previous tenant. The zero-fill above is a JS write and
+        // is invisible to the JIT — same turn, no await between (see §3.1 coherence).
+        if (reusedStack) invalidateGuestCode(stackBase, size);
 
         // Set up stack: [parameter, exitStubAddr]
         const view = new DataView(memory.buffer, memory.byteOffset, memory.byteLength);
@@ -1600,6 +2064,8 @@ export class Scheduler {
         };
 
         this.threads.set(threadId, thread);
+        this.stackSpanIndex = null;
+        this.publishSuspendCount(thread);
         if (!isSuspended) this.runQueue.push(threadId);
 
         // Initialize implicit TLS data for the new thread.
@@ -1649,6 +2115,23 @@ export class Scheduler {
     }
 
     /**
+     * Unhandled CPU exception (#GP/#UD) on a worker thread: terminate ONLY the
+     * faulting thread (exit code = NT status) and reschedule. The dispatcher has
+     * already redirected the fault frame's IRET to the spin loop, so the dead
+     * thread never executes guest code again; performSwitch skips a TERMINATED
+     * current and picks the next runnable at the next boundary.
+     */
+    terminateCurrentThreadForFault(exitCode: number, detail: string): void {
+        const thread = this.getCurrentThread();
+        if (!thread || thread.state === ThreadState.TERMINATED) return;
+        Logger.error(LogCategory.THREAD,
+            `terminateCurrentThreadForFault: T${thread.id} ${detail} — ` +
+            `terminating with exit code 0x${(exitCode >>> 0).toString(16)}`);
+        this.terminateThread(thread.id, exitCode);
+        this.requestSwitch();
+    }
+
+    /**
      * Terminate EVERY thread of the process — the faithful Win32 ExitProcess
      * semantics. ExitProcess (unlike ExitThread) tears down the whole process:
      * all threads stop, not just the caller. Without this the worker-pool /
@@ -1676,6 +2159,9 @@ export class Scheduler {
         }
 
         const safeExitCode = exitCode >>> 0;
+        // A terminated thread leaves the shared table: its handle can be handed to a new
+        // thread, and the WASM handler must not answer for the dead one.
+        hypercallDataManager.forgetThreadSuspendCount(thread.handle >>> 0);
         this.setThreadState(thread, ThreadState.TERMINATED);
         thread.exitCode = safeExitCode;
         thread.waitInfo = null;
@@ -1729,7 +2215,14 @@ export class Scheduler {
             if (entry.threadId === this.currentThreadId) break;
             const thread = this.threads.get(entry.threadId);
             if (thread && thread.state === ThreadState.TERMINATED) {
+                // Release before the record goes: releaseStack reads stackBase/stackSize
+                // and the gate walks the live threads for a foreign ESP in this span.
+                // Reap time, not terminate time — the grace period is what puts thousands
+                // of context switches between the last instruction executed on this stack
+                // and the moment its address can be handed out again.
+                this.releaseStack(thread);
                 this.threads.delete(entry.threadId);
+                this.stackSpanIndex = null;
             }
             this.reapHead++;
         }
@@ -1806,28 +2299,32 @@ export class Scheduler {
         }
 
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            // Short sole-runnable Sleep: stay RUNNING, credit virtual time, yield to host.
-            // Virtual-time gap: no guest instructions during yield → updateTimeData() never ticks;
-            // timeGetTime-paced loops (NFSU audio pump EDI+=10) see a frozen clock without
-            // credit. Idle-pump in pollTimeouts() is gated off while any thread is RUNNING.
-            // A/B kill-switch: globalThis.__noSleepVirtualCredit = true
+            // A Sleep is an NT delay wait even when it is the last runnable thread, so the
+            // DEFAULT for every duration is blockThread + the timer wheel. That includes
+            // Sleep(INFINITE), which parks with no timeout and nothing left to wake it —
+            // faithful, since a sole thread sleeping forever is exactly what NT does.
             //
-            // Long sole-runnable Sleep(>50): blockThread + timer wheel — crediting full `ms`
-            // while host yield is capped at 50ms would fast-forward virtual time (menu/loading).
-            if (ms !== INFINITE && ms <= SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS) {
+            // Setting __noSoleRunnableSleepBlock takes the host-yield path for short sleeps
+            // instead: stay RUNNING, credit virtual time, yield. That credit exists because
+            // a yield retires no guest instructions, so updateTimeData() never ticks and a
+            // timeGetTime-paced loop sees a frozen clock; pollTimeouts()' idle pump is gated
+            // off while any thread is RUNNING. It is capped at SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS
+            // because crediting a full long `ms` against a host yield capped at 50ms would
+            // fast-forward virtual time.
+            // A/B kill-switches: __noSoleRunnableSleepBlock (path), __noSleepVirtualCredit (credit)
+            if (ms !== INFINITE && ms <= SOLE_RUNNABLE_SLEEP_CREDIT_MAX_MS
+                && (globalThis as { __noSoleRunnableSleepBlock?: boolean }).__noSoleRunnableSleepBlock) {
                 this.sleepPathStats.soleRunnableYield++;
                 this.creditVirtualTimeForSoleRunnableSleep(ms);
                 this.requestYieldToHost(ms, "sleepN");
                 return 0;
             }
-            if (ms !== INFINITE) {
-                const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
-                this.sleepPathStats.blockedWait++;
-                this.blockThread(thread, WaitReason.SLEEP, [], false, ms, alertable, 0, context);
-                this.requestYieldToHost(this.computeYieldMs(ms), "sleepNLong");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            return 0;
+            const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
+            this.sleepPathStats.blockedWait++;
+            this.blockThread(thread, WaitReason.SLEEP, [], false,
+                ms === INFINITE ? null : ms, alertable, 0, context);
+            this.requestYieldToHost(this.computeYieldMs(ms === INFINITE ? 50 : ms), "sleepNLong");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, 0);
@@ -1865,9 +2362,18 @@ export class Scheduler {
     wakeMessageWaiters(targetThreadId?: number): void {
         for (const thread of this.threads.values()) {
             if (thread.state !== ThreadState.WAITING) continue;
-            if (thread.waitInfo?.reason !== WaitReason.MESSAGE) continue;
+            const info = thread.waitInfo;
+            // WaitMessage parks with reason MESSAGE; MsgWaitForMultipleObjects parks on
+            // its handles with the queue as an extra slot, so its reason is a handle one.
+            if (!info || (info.reason !== WaitReason.MESSAGE && info.messageWakeResult === undefined)) continue;
             if (targetThreadId !== undefined && thread.id !== targetThreadId) continue;
-            this.wakeThread(thread, 1); // TRUE — WaitMessage return value
+            // bWaitAll means ALL the handles AND input; input alone does not end that wait.
+            if (info.waitAll && info.handles.length > 0) {
+                const decision = this.syncObjects.checkWait(
+                    info.handles, true, thread.id, (tid) => this.threads.get(tid) ?? null);
+                if (!decision.ready) continue;
+            }
+            this.wakeThread(thread, info.messageWakeResult ?? 1); // TRUE — WaitMessage return value
         }
     }
 
@@ -1900,7 +2406,8 @@ export class Scheduler {
         handles: number[], waitAll: boolean, timeoutMs: number,
         returnAddr: number, postReturnEsp: number,
         callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
-        alertable: boolean = false
+        alertable: boolean = false,
+        onWake?: WaitCompletion,
     ): number {
         const thread = this.getCurrentThread();
         if (!thread) return WAIT_FAILED;
@@ -1912,7 +2419,18 @@ export class Scheduler {
         if (decision.ready) { this.syncObjects.consumeWait(decision, thread.id); return decision.result; }
 
         if (alertable && thread.apcQueue.length > 0) return WAIT_IO_COMPLETION;
-        if (timeoutMs === 0) return WAIT_TIMEOUT;
+        if (timeoutMs === 0) {
+            // A zero-timeout wait is only a probe: preserve WAIT_TIMEOUT and never
+            // park the caller.  On Windows the polling thread is still preemptible,
+            // though.  In the emulator a tight loop of WFSO(event, 0) can otherwise
+            // cross thousands of thunk boundaries without retiring enough guest
+            // instructions to expire its quantum, starving the READY thread that is
+            // supposed to SetEvent (TLJ's loader/audio workers are one such pattern).
+            // Requesting the normal thunk-boundary switch restores that fairness; it
+            // does not consume/signals the object or change the observable result.
+            if (this.hasOtherRunnableThreads(thread.id)) this.requestSwitch();
+            return WAIT_TIMEOUT;
+        }
 
         // Debug: Log when a thread blocks on INFINITE wait (helps trace unsignaled events)
         if (timeoutMs === INFINITE) {
@@ -1935,24 +2453,83 @@ export class Scheduler {
 
         const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, WAIT_OBJECT_0);
 
+        // Nothing else can run: park on the timer wheel anyway. A finite timeout must be
+        // CONSUMED, not answered — WAIT_TIMEOUT before the deadline is guest-measurable.
+        // Blade of Darkness derives its whole game clock from the RDTSC delta across
+        // WaitForSingleObject(sem, 100) and scales every frame by it. While parked no
+        // thread is READY/RUNNING, so pollTimeouts' idle pump paces virtual time in wall
+        // time and the wheel entry blockThread registers delivers the WAIT_TIMEOUT.
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            const mustPark = timeoutMs === INFINITE || this.hasWaitingThreadsWithPendingTimeouts(thread.id);
-            if (mustPark) {
-                this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
-                    resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context);
-                this.requestYieldToHost(this.computeYieldMs(timeoutMs), "waitObj");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            this.requestYieldToHost(Math.min(timeoutMs, 50), "waitObjTO");
-            return WAIT_TIMEOUT;
+            this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
+                resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context,
+                false, false, false, undefined, onWake);
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "waitObj");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.blockThread(thread, waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT,
-            resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context);
+            resolved, waitAll, timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context,
+            false, false, false, undefined, onWake);
         this.requestSwitch();
         // Must NOT return WAIT_OBJECT_0 to the sync thunk — the thread is WAITING with a
         // saved post-return context; stub RET would resume guest code on a parked thread
         // (SS2 boot: T2 WFSO + T1 continues → stack corruption → 0x7c07).
+        return WAIT_BLOCKED_NO_SWITCH;
+    }
+
+    /**
+     * MsgWaitForMultipleObjects*: wait on `handles` OR on this thread's message queue,
+     * the queue being one more wait slot whose leg reports `messageResult`
+     * (WAIT_OBJECT_0 + nCount). Win32 models it exactly that way — the queue is a real
+     * waitable handle appended to the array — so the handle legs, the timeout and the
+     * return mapping stay identical to WaitForMultipleObjects.
+     *
+     * `handles` may be empty (the pure "wait for input" form), in which case the queue
+     * is the only slot and this degenerates into waitForMessage with a timeout.
+     */
+    waitForObjectsOrMessageWithContext(
+        handles: number[], waitAll: boolean, timeoutMs: number, messageResult: number,
+        returnAddr: number, postReturnEsp: number,
+        callerCtx: { ecx: number; edx: number; ebx: number; ebp: number; esi: number; edi: number; eflags: number },
+        alertable: boolean = false
+    ): number {
+        const thread = this.getCurrentThread();
+        if (!thread) return WAIT_FAILED;
+
+        let resolved: number[] = [];
+        if (handles.length > 0) {
+            resolved = this.resolveHandles(handles, thread);
+            if (!this.syncObjects.validateHandles(resolved)) return WAIT_FAILED;
+            const decision = this.syncObjects.checkWait(
+                resolved, waitAll, thread.id, (tid) => this.threads.get(tid) ?? null);
+            if (decision.ready) { this.syncObjects.consumeWait(decision, thread.id); return decision.result; }
+        }
+
+        if (alertable && thread.apcQueue.length > 0) return WAIT_IO_COMPLETION;
+        if (timeoutMs === 0) {
+            // Same as waitForObjectsWithContext: a zero timeout is a probe, never a park.
+            if (this.hasOtherRunnableThreads(thread.id)) this.requestSwitch();
+            return WAIT_TIMEOUT;
+        }
+
+        if (!isValidGuestEip(returnAddr)) {
+            Logger.error(LogCategory.THREAD,
+                `waitForObjectsOrMessageWithContext: invalid returnAddr=0x${returnAddr.toString(16)} T${thread.id} — returning WAIT_FAILED`);
+            return WAIT_FAILED;
+        }
+
+        const context = createPostReturnContext(returnAddr, postReturnEsp, callerCtx, WAIT_OBJECT_0);
+        const reason = resolved.length === 0
+            ? WaitReason.MESSAGE
+            : (waitAll ? WaitReason.MULTIPLE_OBJECTS : WaitReason.SINGLE_OBJECT);
+        this.blockThread(thread, reason, resolved, waitAll,
+            timeoutMs === INFINITE ? null : timeoutMs, alertable, 0, context,
+            false, false, false, messageResult);
+        if (this.hasOtherRunnableThreads(thread.id)) {
+            this.requestSwitch();
+        } else {
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "msgWaitObj");
+        }
         return WAIT_BLOCKED_NO_SWITCH;
     }
 
@@ -2097,10 +2674,10 @@ export class Scheduler {
         // Fairness guard: if other threads are runnable and this timer thread has
         // already consumed its budget, do not dispatch another timer callback on this
         // boundary. Let regular switch logic run first, otherwise repeated timer
-        // callbacks can starve the game thread. The budget is WINMM_TIMER_QUANTUM_MS
-        // (> the general minQuantumMs) so the software audio mixer can finish a tick's
-        // drain before yielding — a 1ms defer fragments mixer production into bursts
-        // and underruns the audio SAB (audible crackle).
+        // callbacks can starve the game thread. The budget is WINMM_TIMER_QUANTUM_MS,
+        // which is never below the general quantum, so the software audio mixer can
+        // finish a tick's drain before yielding — deferring mid-drain fragments PCM
+        // production into bursts and underruns the audio SAB (audible crackle).
         if (this.hasOtherRunnableThreads(currentThread.id)) {
             // Instruction-based budget (deterministic, platform-independent) — this gate steers
             // the T3-audio-timer vs game-thread interleaving, so a wall-clock (performance.now)
@@ -2128,7 +2705,7 @@ export class Scheduler {
         // Without this guard, tick boundaries fire timerWheel.poll() → onTimerFire
         // → dispatchTimerThreadCallbacks while a previous callback is still executing,
         // causing nested callbacks that defer the counter-incrementing epilogue.
-        const eip = cpu.instruction_pointer[0] >>> 0;
+        const eip = readEip(cpu);
         if (this.spinLoopBase > 0 && (eip < this.spinLoopBase || eip >= this.spinLoopEnd)) {
             this.timerDispatchStats.eipGuard++;
             return false;
@@ -2168,10 +2745,9 @@ export class Scheduler {
         // the in-flight callback — not for new timer work. Do not dispatch a new callback
         // on top of the parked frame, and above all do not re-block on the wake event:
         // that strands the restore — every thread goes WAITING, virtual time freezes, the
-        // next timer tick never fires, the wake event is never signaled again → permanent
-        // boot deadlock (e.g. intro splash freeze, T1 blocked on a mixer CS that the
-        // abandoned callback still owns). Reachable via the post-performSwitch dispatch
-        // call sites (5b/7b), which run before the next boundary's onPollAsyncRestores.
+        // next timer tick never fires, and the wake event is never signaled again. Reachable via
+        // the post-performSwitch dispatch call sites, before the next boundary's
+        // onPollAsyncRestores.
         // Returning false lets that step-1 apply the restore at the very next boundary —
         // canApply is unconditionally true at the spin loop, so unlike a reverted in-flight
         // guard this defer is bounded and cannot deadlock the timer subsystem.
@@ -2198,11 +2774,11 @@ export class Scheduler {
         this.timerDispatchStats.invoked++;
         this.traceTimerThread(
             `invoke#${this.timerDispatchStats.invoked} cb=0x${cb.callbackAddr.toString(16)} ` +
-            `esp=0x${(cpu.reg32[4] >>> 0).toString(16)} inFlight=${cbMgr.getWinmmInFlight?.() ?? 0}`);
+            `esp=0x${readEsp(cpu).toString(16)} inFlight=${cbMgr.getWinmmInFlight?.() ?? 0}`);
         this.timerDispatchStats.deferStreak = 0;
 
         Logger.verbose(LogCategory.THREAD,
-            `dispatchTimerCallback: T${currentThread.id} cb=0x${cb.callbackAddr.toString(16)} timerId=${cb.timerId} EIP=0x${(cpu.instruction_pointer[0] >>> 0).toString(16)} ESP=0x${(cpu.reg32[4] >>> 0).toString(16)}`);
+            `dispatchTimerCallback: T${currentThread.id} cb=0x${cb.callbackAddr.toString(16)} timerId=${cb.timerId} EIP=0x${readEip(cpu).toString(16)} ESP=0x${readEsp(cpu).toString(16)}`);
 
         // Track the peak in-flight winmm_timer count (cheap). With the atomic-execution pin
         // the previous callback always returns before we dispatch here, so this stays ~0-1;
@@ -2293,7 +2869,7 @@ export class Scheduler {
         const thread = this.getCurrentThread();
         if (!thread) return false;
 
-        const eip = cpu.instruction_pointer[0] >>> 0;
+        const eip = readEip(cpu);
         if (!this.isValidEipForRestore(eip)) return false;
         const context = this.saveCurrentThreadContext(cpu);
 
@@ -2391,13 +2967,12 @@ export class Scheduler {
         );
 
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            const mustPark = timeoutMs === INFINITE || this.hasWaitingThreadsWithPendingTimeouts(thread.id);
-            if (mustPark) {
-                this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCV");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            this.requestYieldToHost(Math.min(timeoutMs, 50), "sleepCVTO");
-            return 0;
+            // The thread is already parked (blockThread above) — the guest must NOT
+            // keep executing past the wait, or the eventual wake would rewind it onto
+            // a stack it has since overwritten. Always report the park; the timeout
+            // wheel delivers the timed-out wake.
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCV");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.requestSwitch();
@@ -2461,13 +3036,10 @@ export class Scheduler {
         );
 
         if (!this.hasOtherRunnableThreads(thread.id)) {
-            const mustPark = timeoutMs === INFINITE || this.hasWaitingThreadsWithPendingTimeouts(thread.id);
-            if (mustPark) {
-                this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCVcs");
-                return WAIT_BLOCKED_NO_SWITCH;
-            }
-            this.requestYieldToHost(Math.min(timeoutMs, 50), "sleepCVcsTO");
-            return 0;
+            // Same park contract as the SRW variant: the thread is already blocked,
+            // so the guest must not run past the wait.
+            this.requestYieldToHost(this.computeYieldMs(timeoutMs), "sleepCVcs");
+            return WAIT_BLOCKED_NO_SWITCH;
         }
 
         this.requestSwitch();
@@ -2508,10 +3080,10 @@ export class Scheduler {
      * onto the shared timer-pump thread so it runs as real guest code, decoupled from the
      * wheel-fire JS context. Reuses the WinMM timer thread + queue + dispatch machinery.
      */
-    postTimerCallback(callbackAddr: number, args: number[]): void {
-        if (!callbackAddr) return;
+    postTimerCallback(callbackAddr: number, args: number[], onReturn?: () => void): boolean {
+        if (!callbackAddr) return false;
         const winmm = this.process?.getModule('winmm') as WinMM | undefined;
-        winmm?.postGuestCallback(callbackAddr, args);
+        return winmm?.postGuestCallback(callbackAddr, args, onReturn) ?? false;
     }
 
     /** @deprecated Use setEvent on the CS LockSemaphore handle instead */
@@ -2567,7 +3139,9 @@ export class Scheduler {
 
     setEvent(handle: number): boolean {
         const ok = this.syncObjects.setEvent(handle);
-        if (ok && this.waitEngine.getHandleWaiters(handle).length > 0) {
+        const waiters = ok ? this.waitEngine.getHandleWaiters(handle) : [];
+        recordSyncEvent("setBy", handle, this.currentThreadId ?? 0, `ok=${ok} waiters=${waiters.length}`);
+        if (ok && waiters.length > 0) {
             this.wakeWaitingThreadsForHandle(handle);
         }
         return ok;
@@ -2585,6 +3159,20 @@ export class Scheduler {
             this.wakeWaitingThreadsForHandle(handle);
         }
         return this.syncObjects.resetEvent(handle);
+    }
+
+    /**
+     * Satisfy a wait on `handle` for `threadId` without parking anyone — a thread-pool wait
+     * object's check. Consumes the signal exactly as a real wait would (auto-reset, semaphore
+     * count, mutex ownership); null when the handle is not a waitable object.
+     */
+    tryConsumeWait(handle: number, threadId: number): boolean | null {
+        if (!this.syncObjects.validateHandles([handle >>> 0])) return null;
+        const decision = this.syncObjects.checkWait(
+            [handle >>> 0], false, threadId, (tid) => this.threads.get(tid) ?? null);
+        if (!decision.ready) return false;
+        this.syncObjects.consumeWait(decision, threadId);
+        return true;
     }
 
     /** Check if any threads are currently waiting on the given handle. */
@@ -2625,32 +3213,114 @@ export class Scheduler {
 
         const prev = thread.suspendCount;
         if (thread.suspendCount > 0) thread.suspendCount--;
+        if (prev !== thread.suspendCount) this.publishSuspendCount(thread);
+        if (thread.suspendCount > 0) return prev;
 
-        if (thread.suspendCount === 0 && thread.state === ThreadState.SUSPENDED) {
+        if (thread.state === ThreadState.SUSPENDED) {
+            // SUSPENDED means "nothing left to wait for" — either it never waited, or its
+            // wait was satisfied while suspended and wakeThread parked the result in EAX.
             this.setThreadState(thread, ThreadState.READY);
             if (!this.runQueue.includes(thread.id)) this.runQueue.push(thread.id);
+            // The same event wakeThread reports, and it asks for a switch for the same reason:
+            // the resumed thread is what the resumer just made runnable, and on real hardware it
+            // would already be running on another core. Only the transition asks — a resume of
+            // an ALREADY runnable thread is a no-op, and engines that call one per main-loop
+            // iteration (Discworld Noir, ~11k/frame) would otherwise switch on every one.
+            if (this.currentThreadId !== null && this.currentThreadId !== thread.id) {
+                this.requestSwitch();
+            }
+        } else if (thread.state === ThreadState.WAITING && prev > 0) {
+            // `prev > 0`: only a call that actually RELEASED the last suspend re-evaluates.
+            // A stray Resume on a thread that was never suspended must stay free (engines that
+            // spin Suspend/Resume issue millions of them).
+            this.reevaluateWaitAfterResume(thread);
         }
 
         return prev;
     }
 
+    /**
+     * Last resume of a thread whose wait is still outstanding. While suspended it was skipped
+     * by wakeWaitingThreadsForHandle, so a signal may have arrived and been taken by nobody;
+     * re-evaluate now — NT re-enters the wait when the suspend APC returns, which re-reads the
+     * object state. A wait with no object predicate (SLEEP/MESSAGE/ASYNC_THUNK) is left alone:
+     * its own waker (timer wheel / message post / async-restore FIFO) still owns it, and those
+     * wakes are delivered while suspended rather than skipped.
+     */
+    private reevaluateWaitAfterResume(thread: Thread): void {
+        const info = thread.waitInfo;
+        if (!info || info.handles.length === 0) return;
+        if (info.reason === WaitReason.SLEEP || info.reason === WaitReason.MESSAGE) return;
+
+        this.suspendWaitStats.reevalOnResume++;
+        const decision = this.syncObjects.checkWait(
+            info.handles, info.waitAll, thread.id, (tid) => this.threads.get(tid) ?? null);
+        if (!decision.ready) return;
+        this.suspendWaitStats.reevalSatisfied++;
+        this.syncObjects.consumeWait(decision, thread.id);
+        this.wakeThread(thread, decision.result);
+    }
+
+    /**
+     * Mirror one thread's suspend count into the hypercall page.
+     *
+     * The WASM ResumeThread handler answers the no-op case (target not suspended) from this
+     * table, so it must be republished on EVERY count change — a stale 0 would let a real
+     * resume be answered as a no-op and the thread would never wake. Everything the handler
+     * cannot answer falls through to this class, which stays the only owner of the state
+     * machine.
+     */
+    private publishSuspendCount(thread: Thread): void {
+        hypercallDataManager.setThreadSuspendCount(thread.handle >>> 0, thread.suspendCount);
+    }
+
+    /** Win32 SuspendThread: previous suspend count, or 0xFFFFFFFF on failure (last error set
+     *  here, since the caller cannot tell an invalid handle from a refused signal). */
     suspendThread(handle: number): number {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
-        if (!thread || thread.state === ThreadState.TERMINATED) return 0xFFFFFFFF;
+        if (!thread || thread.state === ThreadState.TERMINATED) {
+            this.setLastError(ERROR_INVALID_HANDLE);
+            return 0xFFFFFFFF;
+        }
 
         const prev = thread.suspendCount;
+        if (prev >= MAXIMUM_SUSPEND_COUNT) {
+            this.suspendWaitStats.suspendRefused++;
+            this.setLastError(ERROR_SIGNAL_REFUSED);
+            return 0xFFFFFFFF;
+        }
         thread.suspendCount++;
+        this.publishSuspendCount(thread);
 
         if (thread.state === ThreadState.READY || thread.state === ThreadState.RUNNING) {
             this.setThreadState(thread, ThreadState.SUSPENDED);
             const idx = this.runQueue.indexOf(thread.id);
             if (idx >= 0) this.runQueue.splice(idx, 1);
-        }
-        // WAITING → SUSPENDED is valid: thread stays suspended, when wait completes
-        // it will check suspendCount before going READY
-        else if (thread.state === ThreadState.WAITING) {
+            // Suspending YOURSELF yields the CPU at that instruction — NT parks the thread on
+            // its suspend semaphore inside the call and never returns until someone resumes it.
+            // Marking the state without asking for a switch leaves the thread running to the
+            // next quantum, and an engine that self-suspends as a handshake (Tin3/Discworld
+            // Noir: the worker yields to the driver thread this way) spends that whole quantum
+            // calling SuspendThread again — ~450k calls/s, the count ratchets to
+            // MAXIMUM_SUSPEND_COUNT, and from then on EVERY call is refused while the loop
+            // still spins. Measured: half the worker's time in a refused suspend, 3–15 FPS.
+            if (thread.id === this.currentThreadId) this.switchRequested = true;
+        } else if (thread.state === ThreadState.WAITING &&
+                   thread.waitInfo?.reason === WaitReason.ASYNC_THUNK) {
+            this.suspendWaitStats.suspendOnAsyncPark++;
+            // An async park is not a guest wait — it is resumed by the dispatcher's
+            // pendingAsyncRestores FIFO, which retries until the thread is runnable and so
+            // cannot lose a completion. Keep the historical flip; the FIFO's own guards
+            // (isThreadAsyncParked, canApplyCurrentThreadRestore) are written against it.
             this.setThreadState(thread, ThreadState.SUSPENDED);
+        } else if (thread.state === ThreadState.WAITING) {
+            this.suspendWaitStats.suspendOnWaiting++;
         }
+        // A real wait stays WAITING, with its waitInfo, its timeout timer and its WaitEngine
+        // registration intact: suspension is a SEPARATE condition from the wait (NT carries it
+        // on the suspend APC, and the object still satisfies the wait underneath). suspendCount
+        // alone keeps the thread off the CPU — wakeThread parks a satisfied wait in SUSPENDED,
+        // and resumeThread re-evaluates one that is still outstanding.
 
         return prev;
     }
@@ -2668,6 +3338,12 @@ export class Scheduler {
     suspendThreadFast(handle: number): number | null {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
         if (!thread || thread.state === ThreadState.TERMINATED) return null;
+        // A refusal at MAXIMUM_SUSPEND_COUNT is answered HERE, not deferred: suspendThread
+        // sets the last error itself and setLastError syncs the hypercall page GetLastError
+        // is served from, so nothing about the failure needs the slow path. Deferring it put
+        // an engine that spins Suspend/Resume — which is exactly the engine that saturates the
+        // count — permanently into the slow-dispatch swarm this fast path exists to avoid,
+        // at ~1.4M calls/s (Discworld Noir, with a NORMAL log line each).
         // Self-suspend (the Tin3 handshake: thread suspends ITSELF to yield to the driver
         // thread) is handled here too: suspendThread() flips the current thread RUNNING→
         // SUSPENDED, and the FastPath's NON-deferred thunk boundary then runs performSwitch,
@@ -2795,6 +3471,12 @@ export class Scheduler {
 
     getCurrentThreadHandle(): number { return 0xFFFFFFFE; }
 
+    /** Id of the live thread a handle (or the GetCurrentThread pseudo-handle) names; null if none. */
+    getThreadIdByHandle(handle: number): number | null {
+        const t = this.getThreadByHandle(this.resolveHandle(handle >>> 0));
+        return t ? t.id : null;
+    }
+
     getThreadStateById(threadId: number): { state: ThreadState; stateName: string } | null {
         const t = this.threads.get(threadId);
         if (!t) return null;
@@ -2831,6 +3513,10 @@ export class Scheduler {
         return t ? (t.tlsValues.get(index) ?? 0) : 0;
     }
 
+    tlsIsAllocated(index: number): boolean {
+        return this.tlsSlots.has(index);
+    }
+
     tlsSetValue(index: number, value: number): boolean {
         const t = this.getCurrentThread();
         if (!t || !this.tlsSlots.has(index)) return false;
@@ -2843,6 +3529,55 @@ export class Scheduler {
      * Initialize implicit TLS data for a new thread.
      * Copies TLS template data for each PE module that uses __declspec(thread).
      */
+    /** Give ONE thread its private copy of ONE module's TLS template. */
+    private materializeTlsEntry(
+        threadId: number,
+        thread: Thread,
+        entry: ImplicitTlsEntry,
+        memory: Uint8Array,
+        memManager: { alloc(size: number): number },
+    ): void {
+        const totalSize = entry.templateSize + entry.zeroFillSize;
+        const tlsDataAddr = memManager.alloc(Math.max(totalSize, 16));
+
+        // Copy template data
+        if (entry.templateSize > 0 && entry.templateStart > 0) {
+            memory.copyWithin(tlsDataAddr, entry.templateStart, entry.templateStart + entry.templateSize);
+        }
+        // Zero fill
+        if (entry.zeroFillSize > 0) {
+            memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
+        }
+
+        // Store in thread's TLS values and sync to guest memory
+        thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
+        this.tebManager.syncTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0);
+
+        Logger.log(LogCategory.THREAD,
+            `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
+            `(${totalSize} bytes, template@0x${entry.templateStart.toString(16)}) for T${threadId}`);
+    }
+
+    /**
+     * A module with static TLS just loaded — give every ALREADY-RUNNING thread its copy.
+     *
+     * Registering the entry only serves threads created later, and a DLL loaded through
+     * LoadLibrary (every mod/plugin DLL) arrives when the threads that will run its code
+     * already exist. Windows' loader allocates the block for all of them at load time; skip
+     * it and `ThreadLocalStoragePointer[index]` stays NULL, so the module's first
+     * `__declspec(thread)` access — which MSVC also emits for C++ magic statics, i.e. almost
+     * immediately — dereferences a small offset off zero.
+     */
+    initImplicitTlsEntryForExistingThreads(entry: ImplicitTlsEntry): void {
+        const memManager = System.getInstance().process?.memory;
+        const memory = System.getInstance().process?.getCurrentMemory?.();
+        if (!memManager || !memory) return;
+        for (const [threadId, thread] of this.threads) {
+            if (thread.tlsValues.has(entry.tlsIndex)) continue;
+            this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
+        }
+    }
+
     private initImplicitTlsForThread(threadId: number, thread: Thread, memory: Uint8Array): void {
         const system = System.getInstance();
         const entries = system.implicitTlsEntries;
@@ -2864,26 +3599,7 @@ export class Scheduler {
             `TEB=0x${(tebAddr ?? 0).toString(16)}, TLS array=0x${(tlsArrayAddr ?? 0).toString(16)}`);
 
         for (const entry of entries) {
-            const totalSize = entry.templateSize + entry.zeroFillSize;
-            const allocSize = Math.max(totalSize, 16);
-            const tlsDataAddr = memManager.alloc(allocSize);
-
-            // Copy template data
-            if (entry.templateSize > 0 && entry.templateStart > 0) {
-                memory.copyWithin(tlsDataAddr, entry.templateStart, entry.templateStart + entry.templateSize);
-            }
-            // Zero fill
-            if (entry.zeroFillSize > 0) {
-                memory.fill(0, tlsDataAddr + entry.templateSize, tlsDataAddr + totalSize);
-            }
-
-            // Store in thread's TLS values and sync to guest memory
-            thread.tlsValues.set(entry.tlsIndex, tlsDataAddr >>> 0);
-            this.tebManager.syncTlsSlot(threadId, entry.tlsIndex, tlsDataAddr >>> 0);
-
-            Logger.log(LogCategory.THREAD,
-                `  TLS slot ${entry.tlsIndex} (${entry.moduleName}): data=0x${tlsDataAddr.toString(16)} ` +
-                `(${totalSize} bytes, template@0x${entry.templateStart.toString(16)})`);
+            this.materializeTlsEntry(threadId, thread, entry, memory, memManager);
         }
 
         // Verify: read back FS:[0x2C] equivalent (TEB+0x2C) and TLS slot values
@@ -2927,6 +3643,16 @@ export class Scheduler {
         }
     }
 
+    /** Last error of a thread that may not be current: a wait completed at its wake. */
+    private setThreadLastError(t: Thread, code: number): void {
+        if (t.id === this.currentThreadId) {
+            this.setLastError(code);
+            return;
+        }
+        t.lastError = code >>> 0;
+        if (t.tebAddress > 0) this.tebManager.syncLastError(t.id, code >>> 0);
+    }
+
     getLastError(): number {
         const t = this.getCurrentThread();
         return t ? t.lastError >>> 0 : (this.process?.lastError ?? 0);
@@ -2939,6 +3665,16 @@ export class Scheduler {
 
     unpinCurrentThread(): void {
         const t = this.getCurrentThread();
+        if (t && t.kernelPinCount > 0) t.kernelPinCount--;
+    }
+
+    /** Release a pin taken by a specific thread. Callers that pin a thread and release the
+     *  pin later MUST use this: the current thread at release time is not necessarily the
+     *  one that was pinned (a pinned thread that blocks still switches away), and unpinning
+     *  "current" then leaves the owner pinned for the rest of its life — permanently
+     *  unpreemptible, which starves every peer. */
+    unpinThread(threadId: number): void {
+        const t = this.threads.get(threadId >>> 0);
         if (t && t.kernelPinCount > 0) t.kernelPinCount--;
     }
 
@@ -2977,6 +3713,35 @@ export class Scheduler {
         if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
         thread.apcQueue.push({ routine: routine >>> 0, arg0: arg0 >>> 0, arg1: 0, arg2: 0, kind: ApcKind.USER32_QUEUE_USER_APC });
         return true;
+    }
+
+    /**
+     * Queue a FILE_IO_COMPLETION_ROUTINE on the thread that issued the overlapped read.
+     * Windows runs it only while that thread is in an ALERTABLE wait, which is exactly
+     * where the caller then drains it. The routine carries the completion status and byte count
+     * back to the issuing code.
+     */
+    queueIoCompletionApc(threadId: number, routine: number, errorCode: number, bytes: number, lpOverlapped: number): boolean {
+        const thread = this.threads.get(threadId >>> 0);
+        if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
+        thread.apcQueue.push({
+            routine: routine >>> 0, arg0: errorCode >>> 0, arg1: bytes >>> 0, arg2: lpOverlapped >>> 0,
+            kind: ApcKind.IO_COMPLETION,
+        });
+        return true;
+    }
+
+    /** Put an APC back at the head of the queue — for a delivery that could not start. */
+    restorePendingApc(threadId: number, apc: PendingApc): void {
+        const thread = this.threads.get(threadId >>> 0);
+        if (thread) thread.apcQueue.unshift(apc);
+    }
+
+    /** Pop the next pending APC for a thread (null when the queue is empty). */
+    takePendingApc(threadId: number): PendingApc | null {
+        const thread = this.threads.get(threadId >>> 0);
+        if (!thread || thread.apcQueue.length === 0) return null;
+        return thread.apcQueue.shift() ?? null;
     }
 
     queueNtApcByHandle(threadHandle: number, routine: number, arg0: number, arg1: number, arg2: number): number {
@@ -3069,8 +3834,8 @@ export class Scheduler {
         if (threadId === this.getTimerThreadId()) {
             this.timerDispatchStats.asyncParkTimer++;
             this.traceTimerThread(
-                `asyncPark T${threadId} eip=0x${(cpu.instruction_pointer[0] >>> 0).toString(16)} ` +
-                `esp=0x${(cpu.reg32[4] >>> 0).toString(16)}`);
+                `asyncPark T${threadId} eip=0x${readEip(cpu).toString(16)} ` +
+                `esp=0x${readEsp(cpu).toString(16)}`);
         }
 
         const waitInfo: WaitInfo = {
@@ -3089,9 +3854,9 @@ export class Scheduler {
         // later restoreContext puts the CPU exactly where RET would have.
         // Skip when EIP is ALREADY at the spin loop (retro-park from the tick-boundary
         // safety net) — the RET has executed and ESP is final; +4 would skew it.
-        if (this.spinLoopBase > 0 && (cpu.instruction_pointer[0] >>> 0) !== this.spinLoopBase) {
+        if (this.spinLoopBase > 0 && readEip(cpu) !== this.spinLoopBase) {
             context.eip = this.spinLoopBase >>> 0;
-            context.esp = (cpu.reg32[4] + 4) >>> 0;
+            context.esp = (cpuViews(cpu).reg32[4] + 4) >>> 0;
         }
 
         const nextAsyncParkGeneration = (((thread.asyncParkGeneration >>> 0) + 1) >>> 0) || 1;
@@ -3109,15 +3874,6 @@ export class Scheduler {
         return true;
     }
 
-    /**
-     * Same-thread fast path for async restore. `wakeThreadForAsyncCompletion`
-     * flips WAITING → READY (adds to runQueue), but when the current thread
-     * is also the target, we don't want to go through performSwitch because
-     * CPU registers are already live and `applyAsyncRestoreCpuState` will
-     * overwrite EIP/ESP/EAX immediately. This brings the thread to RUNNING
-     * without a context restore, preserving the "RUNNING ⇔ context in CPU"
-     * invariant.
-     */
     /**
      * Wake the current thread from a pump park (spin-loop safety net parked it WAITING
      * while its suspended-thunk frame idled) so a callback can be dispatched onto its
@@ -3142,12 +3898,53 @@ export class Scheduler {
         return true;
     }
 
-    markThreadRunningAfterAsyncWake(threadId: number): boolean {
+    /** Times the async-wake resume found the live register file was NOT the resuming
+     *  thread's own — i.e. the "registers are still live" assumption had been violated and
+     *  the parked context repaired it. Stays 0 on a run where nothing ran in between. */
+    public asyncWakeRegisterRepairs = 0;
+    private lastAsyncWakeRepairWarnMs = 0;
+
+    /**
+     * Same-thread fast path for async restore. `wakeThreadForAsyncCompletion` first
+     * flips WAITING → READY; this brings the current thread to RUNNING and, when a
+     * CPU is supplied, restores its parked GPR/EFLAGS/FPU/SIMD state before the
+     * completion path overwrites EIP/ESP/EAX. Callback-chain and DllMain-chain
+     * consumers therefore start from the parked caller context, not from residue
+     * left in the shared CPU register file.
+     */
+    markThreadRunningAfterAsyncWake(threadId: number, cpu?: V86Cpu): boolean {
         const thread = this.threads.get(threadId);
         if (!thread) return false;
         if (thread.state !== ThreadState.READY) return false;
         if (this.currentThreadId !== thread.id) return false;
+        // Restore the parked context before patching completion registers; callee-saved lanes
+        // must match the waking thread rather than stale shared-CPU state.
+        const parked = thread.context;
         const result = this.transitionTo(thread, ThreadState.RUNNING, null, null);
+        if (result.success && cpu && parked) {
+            const reg = cpuViews(cpu).reg32;
+            const live = {
+                ebx: reg[3] >>> 0,
+                ebp: reg[5] >>> 0,
+                esi: reg[6] >>> 0,
+                edi: reg[7] >>> 0,
+            };
+            const diverged = live.ebx !== (parked.ebx >>> 0) || live.ebp !== (parked.ebp >>> 0)
+                || live.esi !== (parked.esi >>> 0) || live.edi !== (parked.edi >>> 0);
+            this.applyContextState(cpu, parked, parked.esp, thread.id);
+            if (diverged) {
+                this.asyncWakeRegisterRepairs++;
+                const now = performance.now();
+                if (now - this.lastAsyncWakeRepairWarnMs > 1000) {
+                    this.lastAsyncWakeRepairWarnMs = now;
+                    Logger.warn(LogCategory.THREAD,
+                        `async wake T${thread.id}: live registers were not this thread's ` +
+                        `(ebx/ebp/esi/edi ${hx(live.ebx)}/${hx(live.ebp)}/${hx(live.esi)}/${hx(live.edi)} ` +
+                        `→ ${hx(parked.ebx)}/${hx(parked.ebp)}/${hx(parked.esi)}/${hx(parked.edi)}); ` +
+                        `restored from the parked context (${this.asyncWakeRegisterRepairs} so far)`);
+                }
+            }
+        }
         return result.success;
     }
 
@@ -3190,11 +3987,14 @@ export class Scheduler {
 
         this.traceAsyncRestore(source, cpu,
             `apply eip=${hx(eip)},esp=${hx(esp)},eax=${hx(eax)},target=T${target?.threadId ?? this.currentThreadId ?? 0}/g${target?.asyncParkGeneration ?? 0}`);
-        cpu.reg32[0] = eax >>> 0;
-        cpu.reg32[4] = esp >>> 0;
+        const v = cpuViews(cpu);
+        v.reg32[0] = eax >>> 0;
+        v.reg32[4] = esp >>> 0;
         if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
-        cpu.instruction_pointer[0] = eip >>> 0;
+        v.instructionPointer[0] = eip >>> 0;
         if (target) this.consumeAsyncParkGeneration(target.threadId, target.asyncParkGeneration, source, cpu);
+        // The park's urgent exit is spent: the thread now resumes real code.
+        if ((eip >>> 0) !== (this.spinLoopBase >>> 0)) preemptionManager.resumeSliceForIncomingThread();
         return true;
     }
 
@@ -3211,7 +4011,7 @@ export class Scheduler {
         if (!thread || thread.state === ThreadState.TERMINATED) return;
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const esp = cpu.reg32[4] >>> 0;
+        const esp = readEsp(cpu);
         if (esp + 4 > mem.length) return;
 
         const exitCode = view.getUint32(esp, true);
@@ -3360,7 +4160,8 @@ export class Scheduler {
                 // notifyPauseResume()'s re-anchor; the deficit instead drains over a few pumps.
                 const elapsed = Math.min(wallNow - this.idleAnchorWallMs, IDLE_PUMP_MAX_MS);
                 if (elapsed > 0) {
-                    this.timeService.advanceVirtualTime(elapsed);
+                    if (this.onHasPendingAsyncRestores?.()) this.timeService.creditIdleMs(elapsed);
+                    else this.timeService.advanceVirtualTime(elapsed);
                     frameVarianceDiagnostics.recordIdleTime('hlt', elapsed);
                 }
                 // Re-anchor unconditionally so a stale anchor can't accumulate a later jump.
@@ -3387,9 +4188,12 @@ export class Scheduler {
      * Gates idle virtual-time pumping in pollTimeouts() — see there for the rationale.
      */
     private shouldPumpIdleVirtualTime(): boolean {
-        // Pending async restores will be woken by their JS promises; their wait path
-        // advances time itself and runs every frame. Don't credit wall-clock dt here.
-        if (this.onHasPendingAsyncRestores?.()) return false;
+        // A pending async restore (a Present held for vsync) does not stop time for the
+        // threads beside it: a Sleep(1) there must end after a millisecond, not when the
+        // Present returns a frame later. pollTimeouts credits that case clamped to wall,
+        // so the async path's own deficit credit cannot count the same time twice.
+        if ((globalThis as { __noAsyncIdlePump?: boolean }).__noAsyncIdlePump
+            && this.onHasPendingAsyncRestores?.()) return false;
         let needsIdlePump = false;
         let anyNonAsyncWaiter = false;
         for (const t of this.threads.values()) {
@@ -3438,7 +4242,7 @@ export class Scheduler {
         Logger.error(LogCategory.THREAD, `FATAL GUARD: code=0x${code.toString(16)} arg=0x${arg.toString(16)} thread=${threadId}`);
         const sys = System.getInstance();
         const cpu = this.getCpu();
-        const eip = (cpu?.instruction_pointer?.[0] ?? arg) >>> 0;
+        const eip = cpu ? readEip(cpu) : (arg >>> 0);
         this.dumpSchedulerAsyncState(`fatalGuard:0x${code.toString(16)}`, cpu, undefined,
             `code=${hx(code)},arg=${hx(arg)},thread=T${threadId}`, 'error');
         sys.reportGuestCrash({
@@ -3464,13 +4268,21 @@ export class Scheduler {
      *  SetRenderState → one-frame surface flicker) and desync the ring. The RUNNING
      *  thread is excluded: it is at an OUT trap and its stored context may be stale. */
     hasParkedThreadInRange(lo: number, hi: number): boolean {
-        for (const t of this.threads.values()) {
-            if (t.state === ThreadState.RUNNING || t.state === ThreadState.TERMINATED) continue;
-            const eip = t.context ? (t.context.eip >>> 0) : 0;
-            if (eip >= lo && eip < hi) return true;
-        }
-        return false;
+        // Asked on every drained WBUF ring: a Map iterator here was a per-drain allocation.
+        this.parkedProbeLo = lo;
+        this.parkedProbeHi = hi;
+        this.parkedProbeHit = false;
+        this.threads.forEach(this.parkedProbe);
+        return this.parkedProbeHit;
     }
+    private parkedProbeLo = 0;
+    private parkedProbeHi = 0;
+    private parkedProbeHit = false;
+    private readonly parkedProbe = (t: Thread): void => {
+        if (this.parkedProbeHit || t.state === ThreadState.RUNNING || t.state === ThreadState.TERMINATED) return;
+        const eip = t.context ? (t.context.eip >>> 0) : 0;
+        if (eip >= this.parkedProbeLo && eip < this.parkedProbeHi) this.parkedProbeHit = true;
+    };
 
     /** Stack bounds [base, top) for a thread, or null if unknown. Used by the thunk
      *  dispatcher's ESP-sanity tripwire (cached per thread switch, not hot-path). */
@@ -3480,35 +4292,89 @@ export class Scheduler {
         return { base: t.stackBase >>> 0, top: t.stackTop >>> 0 };
     }
 
+    /** The thread-stack reservation containing `addr`, or null. VirtualQuery needs this:
+     *  Win32 reports a stack as ONE region whose AllocationBase is the reservation base,
+     *  and stack-bounds helpers (Delphi's, a scanning GC's, a guard-page grower's) derive
+     *  their bounds from exactly those two fields. Called from a VirtualQuery storm, so it
+     *  answers from a sorted span index (reservations are disjoint) rather than a sweep. */
+    findStackReservation(addr: number): { base: number; top: number } | null {
+        const a = addr >>> 0;
+        let spans = this.stackSpanIndex;
+        if (!spans) {
+            spans = [];
+            for (const t of this.threads.values()) {
+                const base = t.stackBase >>> 0;
+                const top = t.stackTop >>> 0;
+                if (top > base) spans.push({ base, top });
+            }
+            spans.sort((x, y) => x.base - y.base);
+            this.stackSpanIndex = spans;
+        }
+        let lo = 0, hi = spans.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (spans[mid]!.base <= a) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (last < 0) return null;
+        const s = spans[last]!;
+        return a < s.top ? s : null;
+    }
+
     getDetailedThreadInfo(): string {
         return formatDetailedThreadInfo(
             this.threads, this.currentThreadId, this.runQueue, this.process?.getCurrentMemory());
     }
 
+    /** The hot half of traceAsyncRestore: same ring, no strings and no clock read. */
+    private recordSwitchTrace(cpu: V86Cpu | null, kind: ThunkBoundaryKind, cleanup: number): void {
+        const current = this.getCurrentThread();
+        this.pushTrace({
+            seq: ++this.asyncTraceSeq,
+            eip: cpu ? readEip(cpu) : 0,
+            esp: cpu ? readEsp(cpu) : 0,
+            threadId: current?.id ?? 0,
+            state: current?.state ?? -1,
+            kind,
+            cleanup,
+        });
+    }
+
+    private pushTrace(entry: string | SwitchTraceRecord): void {
+        this.asyncRestoreTrace.push(entry);
+        if (this.asyncRestoreTrace.length > 128) this.asyncRestoreTrace.splice(0, 64);
+    }
+
+    /** Compact record -> the line it always used to be. */
+    private formatTraceEntry(e: string | SwitchTraceRecord): string {
+        if (typeof e === 'string') return e;
+        return `#${e.seq} source=performSwitch liveEip=${hx(e.eip)},liveEsp=${hx(e.esp)} ` +
+            `T${e.threadId}:${THREAD_STATE_NAMES[e.state as ThreadState] ?? '?'} ` +
+            `boundary=${boundaryKindName(e.kind)},cleanup=${e.cleanup}`;
+    }
+
     traceAsyncRestore(source: string, cpu?: V86Cpu | null, detail: string = ''): void {
         const current = this.getCurrentThread();
         const live = cpu
-            ? `liveEip=${hx(cpu.instruction_pointer[0])},liveEsp=${hx(cpu.reg32[4])}`
+            ? `liveEip=${hx(cpuViews(cpu).instructionPointer[0])},liveEsp=${hx(cpuViews(cpu).reg32[4])}`
             : 'live=?';
         const entry = `t=${Math.round(performance.now())} source=${source} ${live} ${formatThreadSnapshot(current)} ${detail}`.trim();
-        this.asyncRestoreTrace.push(entry);
-        if (this.asyncRestoreTrace.length > 128) this.asyncRestoreTrace.splice(0, 64);
+        this.pushTrace(entry);
         Logger.verbose(LogCategory.THREAD, `[ASYNC-SCHED] ${entry}`);
     }
 
     getAsyncRestoreTrace(): string[] {
-        return this.asyncRestoreTrace.slice();
+        return this.asyncRestoreTrace.map((e) => this.formatTraceEntry(e));
     }
 
     private dumpSchedulerAsyncState(source: string, cpu: V86Cpu | null, kind?: ThunkBoundaryKind, detail: string = '', level: 'warn' | 'error' = 'error'): void {
         const current = this.getCurrentThread();
         const live = cpu
-            ? `liveEip=${hx(cpu.instruction_pointer[0])},liveEsp=${hx(cpu.reg32[4])}`
+            ? `liveEip=${hx(cpuViews(cpu).instructionPointer[0])},liveEsp=${hx(cpuViews(cpu).reg32[4])}`
             : 'live=?';
         const message =
             `[ASYNC-SCHED-DUMP] source=${source},boundary=${boundaryKindName(kind)},${live},` +
             `${formatThreadSnapshot(current)},detail=${detail},pending=${formatPendingAsyncRestoreQueue(this.process?.dispatcher)},` +
-            `threads=${this.getDetailedThreadInfo()},traceTail=${this.asyncRestoreTrace.slice(-8).join(' || ')}`;
+            `threads=${this.getDetailedThreadInfo()},traceTail=${this.asyncRestoreTrace.slice(-8).map((e) => this.formatTraceEntry(e)).join(' || ')}`;
         if (level === 'warn') Logger.warn(LogCategory.THREAD, message);
         else Logger.error(LogCategory.THREAD, message);
     }
@@ -3527,7 +4393,7 @@ export class Scheduler {
             `consume T${threadId}/g${expected}->g${thread.asyncParkGeneration >>> 0}`);
     }
 
-    private isMainThreadId(threadId: number): boolean {
+    isMainThread(threadId: number): boolean {
         return threadId === this.mainThreadId || (this.mainThreadId === 0 && threadId === 1);
     }
 
@@ -3596,7 +4462,7 @@ export class Scheduler {
         if (reason.startsWith('stale-generation') || reason.startsWith('terminated-thread')) return;
         if (thread.waitInfo?.reason !== WaitReason.ASYNC_THUNK && thread.state !== ThreadState.RUNNING) return;
 
-        if (this.isMainThreadId(thread.id)) {
+        if (this.isMainThread(thread.id)) {
             this.reportFatalGuard(0x4101, thread.id, thread.id);
             return;
         }
@@ -3638,6 +4504,8 @@ export class Scheduler {
         srwWantExclusive = false,
         boolReturn = false,
         cvReacquireCs = false,
+        messageWakeResult?: number,
+        onWake?: WaitCompletion,
     ): void {
         // Create timeout timer if needed
         let timerId = 0;
@@ -3659,6 +4527,8 @@ export class Scheduler {
             srwWantExclusive,
             boolReturn: boolReturn || undefined,
             cvReacquireCs: cvReacquireCs || undefined,
+            messageWakeResult,
+            onWake,
         };
 
         this.transitionTo(thread, ThreadState.WAITING, waitInfo, context);
@@ -3686,6 +4556,27 @@ export class Scheduler {
         }
     }
 
+    /** A woken thread whose SRW lock is contended stays WAITING, re-registered
+     *  on the lock's wait event; the eventual ReleaseSRWLock* wake retries the
+     *  grant. `pendingEax` preserves a CV BOOL result across the second wait. */
+    private requeueSrwWait(thread: Thread, lockPtr: number, exclusive: boolean, pendingEax?: number): void {
+        this.waitEngine.unregisterWait(thread);
+        const waitEvent = ensureSrwWaitEvent(lockPtr, this);
+        thread.waitInfo = {
+            reason: WaitReason.SRW_LOCK,
+            handles: [waitEvent],
+            waitAll: false,
+            timeoutTimerId: 0,
+            alertable: false,
+            csAddress: lockPtr,
+            srwWantExclusive: exclusive,
+            pendingEax: pendingEax ?? thread.waitInfo?.pendingEax,
+        };
+        this.waitEngine.registerWait(thread);
+        Logger.verbose(LogCategory.THREAD,
+            `wakeThread: SRW contended on wake — T${thread.id} requeued on lock=0x${lockPtr.toString(16)} (exclusive=${exclusive})`);
+    }
+
     private wakeThread(thread: Thread, result: number): void {
         if (!thread.context) {
             Logger.error(LogCategory.THREAD, `wakeThread: T${thread.id} has no context`);
@@ -3709,9 +4600,10 @@ export class Scheduler {
             const lockPtr = thread.waitInfo.csAddress;
             const exclusive = thread.waitInfo.srwWantExclusive;
             if (!grantSrwOnWake(lockPtr, thread.id, exclusive)) {
-                Logger.warn(LogCategory.THREAD,
-                    `wakeThread: SRW grant failed lock=0x${lockPtr.toString(16)} T${thread.id} exclusive=${exclusive}`);
+                this.requeueSrwWait(thread, lockPtr, exclusive);
+                return;
             }
+            if (thread.waitInfo.pendingEax !== undefined) result = thread.waitInfo.pendingEax;
         } else if (thread.waitInfo?.cvReacquireCs && thread.waitInfo?.csAddress) {
             // SleepConditionVariableCS wake: re-take the critical section (uncontended fast
             // path) and return TRUE on signal / FALSE on timeout.
@@ -3725,10 +4617,19 @@ export class Scheduler {
             const lockPtr = thread.waitInfo.csAddress;
             const exclusive = thread.waitInfo.srwWantExclusive;
             if (!grantSrwOnWake(lockPtr, thread.id, exclusive)) {
-                Logger.warn(LogCategory.THREAD,
-                    `wakeThread: CV-SRW re-acquire failed lock=0x${lockPtr.toString(16)} T${thread.id} exclusive=${exclusive}`);
+                // SleepConditionVariableSRW returns only WITH the lock re-taken:
+                // morph the CV wake into a contended SRW acquire, carrying the BOOL.
+                this.requeueSrwWait(thread, lockPtr, exclusive, result === WAIT_OBJECT_0 ? 1 : 0);
+                return;
             }
             result = result === WAIT_OBJECT_0 ? 1 : 0;
+        }
+
+        const onWake = thread.waitInfo?.onWake;
+        if (onWake) {
+            const done = onWake(result);
+            result = done.value;
+            if (done.lastError !== undefined) this.setThreadLastError(thread, done.lastError);
         }
 
         // Unregister from wait engine
@@ -3737,12 +4638,25 @@ export class Scheduler {
         // Set return value
         thread.context.eax = result >>> 0;
 
+        // A suspended thread's wait is satisfied exactly like anyone else's — it just does not
+        // get to run yet. Park it in SUSPENDED with the result already in EAX; the last
+        // ResumeThread releases it to READY. Nothing became runnable, so no switch is requested.
+        if (thread.suspendCount > 0) {
+            this.suspendWaitStats.wakeWhileSuspended++;
+            this.transitionTo(thread, ThreadState.SUSPENDED, null, thread.context);
+            Logger.verbose(LogCategory.THREAD,
+                `wakeThread: T${thread.id} ${reason !== undefined ? WAIT_REASON_NAMES[reason] : '?'} satisfied while suspended ` +
+                `(count=${thread.suspendCount}) -> SUSPENDED, result=0x${result.toString(16)}`);
+            return;
+        }
+
         this.transitionTo(thread, ThreadState.READY, null, thread.context);
 
         Logger.verbose(LogCategory.THREAD,
             `wakeThread: T${thread.id} ${reason !== undefined ? WAIT_REASON_NAMES[reason] : '?'} -> READY, result=0x${result.toString(16)}`);
 
-        if (this.currentThreadId !== null && this.currentThreadId !== thread.id) {
+        if (this.currentThreadId !== null && this.currentThreadId !== thread.id &&
+            !(globalThis as { __noWakePreempt?: boolean }).__noWakePreempt) {
             this.requestSwitch();
         }
         // If the worker is parked in a setTimeout idle-yield (all threads were blocked)
@@ -3759,6 +4673,11 @@ export class Scheduler {
             const thread = this.threads.get(threadId);
             if (!thread || thread.state !== ThreadState.WAITING || !thread.waitInfo) continue;
             if (thread.waitInfo.reason === WaitReason.SLEEP) continue;
+            // A suspended waiter cannot act on the signal, and these decisions CONSUME it
+            // (auto-reset event, semaphore count, mutex, CS lock semaphore). NT unlinks a
+            // suspended thread's wait block for exactly that reason, so the signal reaches a
+            // waiter that can use it; the last ResumeThread re-evaluates instead.
+            if (thread.suspendCount > 0) { this.suspendWaitStats.skippedSuspendedWaiter++; continue; }
 
             const decision = this.syncObjects.checkWait(
                 thread.waitInfo.handles, thread.waitInfo.waitAll, thread.id,
@@ -3834,31 +4753,45 @@ export class Scheduler {
         thread.state = newState;
     }
 
+    /** Runnable ⇔ READY *and* not suspended. suspendCount is the authority on whether a
+     *  thread may execute — state alone is not, now that a suspended thread can sit in
+     *  WAITING with a live wait (see suspendThread). */
+    private isRunnable(t: Thread | undefined): t is Thread {
+        return !!t && t.state === ThreadState.READY && t.suspendCount === 0;
+    }
+
     private pickNextRunnable(excludeId?: number): Thread | null {
         if (this.runQueue.length === 0) return null;
 
         // Bootstrap threads must reach their first wait before the creator can monopolize CPU
-        // during long thunks (e.g. MCI intro decode).
+        // during a long initialization thunk.
         for (const id of this.bootstrapUntilFirstWait) {
             if (id !== excludeId) {
                 const t = this.threads.get(id);
-                if (t && t.state === ThreadState.READY) return t;
+                if (this.isRunnable(t)) return t;
             }
         }
 
-        // Prefer a different thread than excludeId
+        // Prefer a different thread than excludeId: the highest priority, FIFO among equals.
+        // NT dispatches a readied TIME_CRITICAL audio thread ahead of the normal-priority
+        // threads queued before it; a latency-sensitive pump depends on exactly that.
+        const byPriority = !(globalThis as { __noPriorityPick?: boolean }).__noPriorityPick;
+        let best: Thread | null = null;
         for (let i = 0; i < this.runQueue.length; i++) {
             const id = this.runQueue[i];
             if (id !== excludeId) {
                 const t = this.threads.get(id);
-                if (t && t.state === ThreadState.READY) return t;
+                if (!this.isRunnable(t)) continue;
+                if (!byPriority) return t;
+                if (!best || t.priority > best.priority) best = t;
             }
         }
+        if (best) return best;
 
         // No different thread — return any ready thread
         for (let i = 0; i < this.runQueue.length; i++) {
             const t = this.threads.get(this.runQueue[i]);
-            if (t && t.state === ThreadState.READY) return t;
+            if (this.isRunnable(t)) return t;
         }
 
         return null;
@@ -3873,14 +4806,6 @@ export class Scheduler {
         for (const t of this.threads.values()) {
             if (t.id === excludeId) continue;
             if (t.state === ThreadState.READY || t.state === ThreadState.RUNNING) return true;
-        }
-        return false;
-    }
-
-    private hasWaitingThreadsWithPendingTimeouts(excludeId: number): boolean {
-        for (const t of this.threads.values()) {
-            if (t.id === excludeId || t.state !== ThreadState.WAITING) continue;
-            if (t.waitInfo?.timeoutTimerId) return true;
         }
         return false;
     }
@@ -3932,6 +4857,15 @@ export class Scheduler {
         preemptionManager.setMultiThread(alive > 1);
     }
 
+    // The yield in flight, read back by resumeFromYield. One resume function for every
+    // yield rather than a closure per call: yields run thousands of times a second, and a
+    // closure each is steady garbage for the worker's GC.
+    private yieldCpu: V86Cpu | null = null;
+    private yieldMs = 0;
+    private yieldStartMs = 0;
+    private yieldSourceName = "req";
+    private yieldEngine: any = null;
+
     private yieldToHost(cpu: V86Cpu, ms: number, source?: string): void {
         if (ms <= 0) return;
         const yieldSource = source ?? this.pendingYieldSource;
@@ -3948,56 +4882,18 @@ export class Scheduler {
         const v86 = starter?.v86 ?? starter;
         if (v86?.stop) v86.stop();
 
-        const resume = () => {
-            if (this.idleYieldResumeActive) {
-                this.traceAsyncRestore("wakeEarlyFromIdleYield", cpu, "resume re-entry suppressed");
-                return;
-            }
-            this.idleYieldResumeActive = true;
-            // Clear the yield flag BEFORE the diagnostics below (which could throw). If
-            // intentionalYield stayed true, the startScheduler restart backstop (gated on
-            // !intentionalYield) and the heartbeat "v86 not running" warn are permanently
-            // disabled → silent hang. A reYield re-sets it via the nested yieldToHost.
-            this.intentionalYield = false;
-            const actual = performance.now() - yieldStartMs;
-            try {
-                frameVarianceDiagnostics.recordIdleTime('yield', actual);
-                this.recordYield(yieldSource, actual, ms);
-                // Drain pending async restores BEFORE restarting v86. Without this,
-                // v86 resumes at spinLoopAddress and spins for a full quantum
-                // (~5 ms / 500K cycles) until tick_hooks_after eventually fires.
-                // Applying here moves EIP to returnAddr so resume is productive.
-                if (this.onPollAsyncRestores) {
-                    // May need multiple passes if several restores queued for current thread.
-                    // Cap the loop to avoid any unexpected reentry.
-                    for (let i = 0; i < 8; i++) {
-                        if (!this.onPollAsyncRestores(cpu, "yieldToHost.resume")) break;
-                    }
-                }
-                // If after draining the current thread is still WAITING and no
-                // other thread can run, re-yield instead of restarting v86 — its
-                // only runnable target would be the spin loop. Each iteration is
-                // scheduled via setTimeout/MessageChannel (a macrotask), so this
-                // cannot blow the stack.
-                const current = this.getCurrentThread();
-                if (current && current.state === ThreadState.WAITING && this.runQueue.length === 0) {
-                    // Clamp to ≥1: a 0 from computeYieldMs (overdue timer) would make the
-                    // nested yieldToHost early-return with v86 stopped and NO resume scheduled.
-                    this.yieldToHost(cpu, Math.max(1, this.computeYieldMs(4)), "reYield");
-                    return;
-                }
-                if (v86?.run && !System.getInstance().isExiting) v86.run();
-            } finally {
-                this.idleYieldResumeActive = false;
-            }
-        };
+        this.yieldCpu = cpu;
+        this.yieldMs = ms;
+        this.yieldStartMs = yieldStartMs;
+        this.yieldSourceName = yieldSource;
+        this.yieldEngine = v86;
+        const resume = this.resumeFromYield;
 
-        // For very short yields (≤1ms), use MessageChannel to bypass the
-        // browser's 4ms setTimeout floor. This reduces spin-loop yield
-        // overhead from ~4ms to ~0.1ms.
-        if (ms <= 1 && this.yieldPort && !this.yieldPortResolve) {
+        // Very short yields (≤1ms) go out as a host task, which has no 4ms
+        // setTimeout floor (see postHostTask).
+        if (ms <= 1 && !this.yieldPortResolve) {
             this.yieldPortResolve = resume;
-            this.yieldPort.postMessage(null);
+            postHostTask(this.onYieldTask);
         } else {
             // Track the timer + resume so an async-thunk completion (which queues a
             // restore that makes a thread runnable) can resume immediately instead of
@@ -4006,13 +4902,75 @@ export class Scheduler {
             // v86.stop() window can re-enter yieldToHost before the first resume fires).
             if (this.idleYieldTimer !== null) clearTimeout(this.idleYieldTimer);
             this.idleYieldResume = resume;
-            this.idleYieldTimer = setTimeout(() => {
-                this.idleYieldTimer = null;
-                this.idleYieldResume = null;
-                resume();
-            }, ms);
+            this.idleYieldTimer = setTimeout(this.onIdleYieldTimer, ms);
         }
     }
+
+    private readonly onIdleYieldTimer = (): void => {
+        this.idleYieldTimer = null;
+        this.idleYieldResume = null;
+        this.resumeFromYield();
+    };
+
+    private readonly resumeFromYield = (): void => {
+        const cpu = this.yieldCpu!;
+        const ms = this.yieldMs;
+        const yieldStartMs = this.yieldStartMs;
+        const yieldSource = this.yieldSourceName;
+        const v86 = this.yieldEngine;
+        if (this.idleYieldResumeActive) {
+            this.traceAsyncRestore("wakeEarlyFromIdleYield", cpu, "resume re-entry suppressed");
+            return;
+        }
+        this.idleYieldResumeActive = true;
+        // Clear the yield flag BEFORE the diagnostics below (which could throw). If
+        // intentionalYield stayed true, the startScheduler restart backstop (gated on
+        // !intentionalYield) and the heartbeat "v86 not running" warn are permanently
+        // disabled → silent hang. A reYield re-sets it via the nested yieldToHost.
+        this.intentionalYield = false;
+        const actual = performance.now() - yieldStartMs;
+        try {
+            // A pause taken during the yield owns the CPU and resumeEmulator restarts it.
+            // The engine was not running, so the pause had nothing to stop: restarting it
+            // here runs the guest while paused.
+            if (System.getInstance().isPaused) return;
+            frameVarianceDiagnostics.recordIdleTime('yield', actual);
+            this.recordYield(yieldSource, actual, ms);
+            // Drain pending async restores BEFORE restarting v86. Without this,
+            // v86 resumes at spinLoopAddress and spins for a full quantum
+            // (~5 ms / 500K cycles) until tick_hooks_after eventually fires.
+            // Applying here moves EIP to returnAddr so resume is productive.
+            if (this.onPollAsyncRestores) {
+                // May need multiple passes if several restores queued for current thread.
+                // Cap the loop to avoid any unexpected reentry.
+                for (let i = 0; i < 8; i++) {
+                    if (!this.onPollAsyncRestores(cpu, "yieldToHost.resume")) break;
+                }
+            }
+            // Time passes while the CPU idles: a thread asleep beside one parked in an
+            // async wait (a Present held for vsync) must still wake on its deadline.
+            // The host setInterval pump is clamped to ~4ms, which alone would hold
+            // every Sleep(1) until the parked thread returns.
+            if (!(globalThis as { __noYieldResumePoll?: boolean }).__noYieldResumePoll) {
+                this.pollTimeouts();
+            }
+            // If after draining the current thread is still WAITING and no
+            // other thread can run, re-yield instead of restarting v86 — its
+            // only runnable target would be the spin loop. Each iteration is
+            // scheduled via setTimeout or a host task (a macrotask), so this
+            // cannot blow the stack.
+            const current = this.getCurrentThread();
+            if (current && current.state === ThreadState.WAITING && this.runQueue.length === 0) {
+                // Clamp to ≥1: a 0 from computeYieldMs (overdue timer) would make the
+                // nested yieldToHost early-return with v86 stopped and NO resume scheduled.
+                this.yieldToHost(cpu, Math.max(1, this.computeYieldMs(4)), "reYield");
+                return;
+            }
+            if (v86?.run && !System.getInstance().isExiting) v86.run();
+        } finally {
+            this.idleYieldResumeActive = false;
+        }
+    };
 
     /**
      * Resume an in-flight setTimeout-based idle yield (e.g. "allBlocked") right now.
@@ -4025,7 +4983,7 @@ export class Scheduler {
      * stuck in ~50ms allBlocked yields → single-digit FPS). The dispatcher's
      * async-completion path calls this so the worker resumes within a microtask of
      * the Promise resolving.
-     * No-op (returns false) for the MessageChannel fast-path, which already resumes
+     * No-op (returns false) for the sub-ms host-task fast path, which already resumes
      * in ~0.1ms, or when no setTimeout yield is in flight.
      */
     wakeEarlyFromIdleYield(): boolean {
@@ -4102,13 +5060,13 @@ export class Scheduler {
 
         const stackBase = this.mainStackBase || 0;
         const stackSize = this.mainStackTop > 0 ? this.mainStackTop - stackBase : 0;
-        const stackTop = this.mainStackTop || (cpu.reg32[4] >>> 0);
+        const stackTop = this.mainStackTop || readEsp(cpu);
 
         let tebAddress = 0;
         if (this.process.memory && stackTop > 0) {
             tebAddress = this.tebManager.allocateTeb(threadId, stackBase, stackTop, this.process.memory);
-            if (tebAddress > 0 && cpu.segment_offsets) {
-                cpu.segment_offsets[4] = tebAddress;
+            if (tebAddress > 0) {
+                setFsBase(cpu, tebAddress);
             }
         }
 
@@ -4117,13 +5075,13 @@ export class Scheduler {
             state: ThreadState.RUNNING,
             context: null,
             stackBase, stackSize, stackTop,
-            startAddress: cpu.instruction_pointer[0] >>> 0,
+            startAddress: readEip(cpu),
             parameter: 0,
             waitInfo: null, exitCode: null,
             tlsValues: new Map(), lastError: 0,
             suspendCount: 0, priority: 0,
             lastSwitchTime: performance.now(),
-            lastSwitchInsn: (cpu?.instruction_counter?.[0] ?? 0) >>> 0,
+            lastSwitchInsn: readRetiredInsns(cpu),
             tebAddress, kernelPinCount: 0,
             apcQueue: [],
             quitPosted: false, quitExitCode: 0,
@@ -4131,6 +5089,7 @@ export class Scheduler {
         };
 
         this.threads.set(threadId, thread);
+        this.stackSpanIndex = null;
         this.currentThreadId = threadId;
         this.mainThreadId = threadId;
 
@@ -4189,5 +5148,6 @@ export class Scheduler {
         mem[this.threadExitStubAddr + off++] = 0x00;
         mem[this.threadExitStubAddr + off++] = 0xEF; // OUT DX, EAX
         while (off < this.threadExitStubSize) mem[this.threadExitStubAddr + off++] = 0x90; // NOP
+        invalidateGuestCode(this.threadExitStubAddr, this.threadExitStubSize);
     }
 }

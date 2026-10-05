@@ -10,16 +10,38 @@ export const GLIDE_MAX_SSTS = 1;
 export const GLIDE_FBRAM_MB = 4;
 export const GLIDE_TMU_COUNT = 2;
 export const GLIDE_TMU_MEMORY_BYTES = 4 * 1024 * 1024;
+/** Silicon revisions reported in GrVoodooConfig_t / GrTMUConfig_t. Retail Voodoo
+ *  Graphics: FBI rev 2, TREX rev 1 — 0 is the prototype stepping some titles reject. */
+export const GLIDE_FBI_REV = 2;
+export const GLIDE_TMU_REV = 1;
 
 export const GLIDE_EVENT_RING_CAPACITY = 256;
 export const GLIDE_LFB_GUARD_BYTES = 32;
 export const GLIDE_LFB_CANARY_VALUE = 0xa5;
 
-// GrHwConfiguration (minimal subset used by games/drivers)
+// GrHwConfiguration (glide.h):
+//   int num_sst;
+//   struct { GrSstType type; union { GrVoodooConfig_t VoodooConfig; ... } sstBoard; } SSTs[MAX_NUM_SST];
+// GrVoodooConfig_t = { int fbRam; int fbiRev; int nTexelfx; FxBool sliDetect;
+//                      GrTMUConfig_t tmuConfig[GLIDE_NUM_TMU]; }
+// GrTMUConfig_t    = { int tmuRev; int tmuRam; }
+// The board query is how a Glide title asks "what silicon is this?" — it sizes its
+// texture cache from tmuRam and picks single- vs multi-pass from nTexelfx, so the
+// tail of this struct is not optional detail: left zeroed it reads as a board with
+// no texture units and no texture memory.
 export const GR_HWCONFIG_NUM_SST_OFFSET = 0x00;
 export const GR_HWCONFIG_SST0_TYPE_OFFSET = 0x04;
 export const GR_HWCONFIG_SST0_FBRAM_OFFSET = 0x08;
 export const GR_HWCONFIG_SST0_FBIREV_OFFSET = 0x0c;
+export const GR_HWCONFIG_SST0_NTEXELFX_OFFSET = 0x10;
+export const GR_HWCONFIG_SST0_SLIDETECT_OFFSET = 0x14;
+export const GR_HWCONFIG_SST0_TMUCONFIG_OFFSET = 0x18;
+export const GR_TMUCONFIG_TMUREV_OFFSET = 0x00;
+export const GR_TMUCONFIG_TMURAM_OFFSET = 0x04;
+export const GR_TMUCONFIG_SIZE = 0x08;
+
+/** GrSstType: the board kind reported in SSTs[n].type. */
+export const GR_SSTTYPE_VOODOO = 0;
 
 // GrTexInfo
 export const GR_TEXINFO_SMALL_LOD_OFFSET = 0x00;
@@ -58,6 +80,12 @@ export const GR_VERTEX_OOW_OFFSET = 0x20;
 export const GR_VERTEX_SOW_OFFSET = 0x24;
 export const GR_VERTEX_TOW_OFFSET = 0x28;
 export const GR_VERTEX_TMU0_OOW_OFFSET = 0x2c;
+// grHints(GR_HINT_STWHINT, mask) — which per-TMU s/t/w the app actually supplies.
+export const GR_HINT_STWHINT = 0;
+export const GR_STWHINT_W_DIFF_FBI = 1 << 0;
+export const GR_STWHINT_W_DIFF_TMU0 = 1 << 1;
+export const GR_STWHINT_ST_DIFF_TMU0 = 1 << 2;
+
 export const GR_VERTEX_SIZE = 0x24 + (GLIDE_TMU_COUNT * 0x0c);
 
 export const GR_BUFFER_FRONTBUFFER = 0;
@@ -134,5 +162,30 @@ export function bytesPerPixelForLfbWriteMode(writeMode: number): number {
         case GR_LFBWRITEMODE_1555:
         default:
             return 2;
+    }
+}
+
+/**
+ * A packed GrColor_t is in the frame-buffer colour format the title opened the window
+ * with; the hardware normalises it to ARGB on the way in (_grSwizzleColor, diglide.c).
+ * Everything downstream of us — unpackColorU32, the WGSL combine — reads ARGB, so the
+ * swizzle has to happen here or an ABGR/RGBA title gets its channels transposed.
+ * Applies to the packed setters only: grConstantColorValue4 takes components, not a
+ * colour word, and grColorMask takes booleans (gglide.c: neither swizzles).
+ */
+export function swizzleGlideColor(color: number, colorFormat: number): number {
+    const c = color >>> 0;
+    switch (colorFormat | 0) {
+        case GR_COLORFORMAT_ARGB:
+            return c;
+        case GR_COLORFORMAT_ABGR:
+            return ((c & 0xff00ff00) | ((c & 0x000000ff) << 16) | ((c & 0x00ff0000) >>> 16)) >>> 0;
+        case GR_COLORFORMAT_RGBA:
+            return (((c & 0x000000ff) << 24) | ((c & 0xffffff00) >>> 8)) >>> 0;
+        case GR_COLORFORMAT_BGRA:
+            return (((c & 0x000000ff) << 24) | ((c & 0x0000ff00) << 8)
+                | ((c & 0x00ff0000) >>> 8) | ((c & 0xff000000) >>> 24)) >>> 0;
+        default:
+            return c;
     }
 }

@@ -1,0 +1,17 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Source Pair Lab</title>
+<style>body{font:16px system-ui;margin:24px;background:#15202b;color:#e6edf3}button{padding:10px 16px;margin-right:12px}pre{white-space:pre-wrap}iframe{width:640px;height:360px;border:1px solid #52616b}small{display:block;margin:12px 0}</style>
+<h1>C++ → PE → JIT-Wasm / Emscripten-Wasm</h1>
+<p>Correctness and artifact capture. Smoke timings are not performance results.</p>
+<button id="start">Run full smoke</button><button id="direct">Run direct Wasm only</button>
+<button id="paired">Measure offline rotate variant</button>
+<button id="shufps">Measure SHUFPS AOT in browser</button>
+<button id="game">Load isolated NFSU probe</button>
+<button id="capture-game">Capture game JIT (20 seconds)</button>
+<button id="game-shot">Save game screenshot</button>
+<button id="game-enter">Game: Enter</button><button id="game-escape">Game: Escape</button>
+<small id="status">Ready. Fixture: deterministic pixel updates with persistent state.</small>
+<pre id="output"></pre><div id="guest"></div>
+<script type="module" src="./browser.mjs"></script></html>
+<script type="module" src="./paired.mjs"></script>
+<script type="module" src="./shufps-browser.mjs"></script>
+<script type="module" src="./game-capture.mjs"></script>

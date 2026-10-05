@@ -31,6 +31,43 @@ export type ParameterType =
 
 export type ParameterDirection = "in" | "out" | "inout";
 
+/**
+ * What an export answers with when it is DECLARED here but no handler is registered.
+ *
+ * A declaration is an ABI promise (so the PE loader can emit a stack-correct stub), not
+ * a promise that the function works. When the stub runs with nothing behind it, the one
+ * thing it must never do is look like success — the caller then walks its success branch
+ * over out-params we never wrote.
+ *
+ * "zero" is the default and the only value that fails under every POINTER/HANDLE/BOOL/
+ * count convention at once. It is a *success* under the status-code conventions
+ * (HRESULT S_OK, MMSYSERR_NOERROR, MCI 0, ERROR_SUCCESS), which is exactly why an export
+ * that returns one of those must name its class here.
+ */
+export type UnimplementedReturn =
+    /** BOOL FALSE / NULL pointer / NULL handle / zero count. Win32's own failure value. */
+    | "zero"
+    /** INVALID_HANDLE_VALUE (-1) — the CreateFile/FindFirstFile family, where NULL reads as a handle. */
+    | "invalidHandle"
+    /** The bare -1 sentinel: SOCKET_ERROR / INVALID_SOCKET, INVALID_SET_FILE_POINTER, INVALID_FILE_SIZE. */
+    | "minusOne"
+    /** E_NOTIMPL. Any HRESULT return, including every COM vtable method. */
+    | "hresult"
+    /** MMSYSERR_NOTSUPPORTED (8) — winmm/msacm, where 0 is MMSYSERR_NOERROR. */
+    | "mmresult"
+    /** MCIERR_UNSUPPORTED_FUNCTION (274) — MCI commands, where 0 is success. */
+    | "mcierror"
+    /** ERROR_CALL_NOT_IMPLEMENTED (120) — LSTATUS/LONG returns carrying a Win32 code (Reg*). */
+    | "win32Status"
+    /**
+     * No value reads as failure — every bit pattern is a legal answer (GetTickCount64).
+     * Returning anything at all is a lie, so the export does not resolve: GetProcAddress
+     * hands back NULL, exactly as a Windows without the function does, and the caller
+     * takes the fallback path it already carries. An IAT import cannot be refused that
+     * way, so the stub still answers 0 — and says so.
+     */
+    | "unresolvable";
+
 export interface ParameterDescriptor {
     name: string;
     type: ParameterType;
@@ -49,6 +86,8 @@ export interface FunctionDescriptor {
     /** Bytes callee pops on RET (stdcall). Default: params.length * 4. Use when decoration is wrong (e.g. _AIL_file_read@8 takes 3 args but RET 8). */
     stackCleanupBytes?: number;
     async?: boolean;  // Returns a Promise
+    /** Failure value when this name has no handler. Default: "zero" (COM methods: "hresult"). */
+    onUnimplemented?: UnimplementedReturn;
     category?: string;  // For documentation/grouping
     description?: string;
 }

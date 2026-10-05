@@ -4,14 +4,18 @@
  *
  * Coupling to Msvcrt is only via CrtTimeHost: v86 handle (difftime returns via
  * the FPU), process allocator (gmtime's static struct-tm scratch), and the
- * string/word writers. The gmtime scratch buffer lives in this register call's
- * closure (one per registration). These CRT entry points are wall-clock
+ * string/word writers. The scratch buffers are module statics, reset with the
+ * process (resetCrtTimeStatics). These CRT entry points are wall-clock
  * (Date.now()/new Date()).
  */
 
 import { Mem } from "../core/memory/mem-accessor";
 import { fpuPush } from "../core/fpu-helper";
+import { getCPU } from "../core/thunking/thunk-utils";
+import { cpuViews } from "../core/cpu/cpu-views";
 import { TimeService } from "../runtime/time";
+import { System } from "../core/system";
+import { WAIT_BLOCKED_NO_SWITCH } from "../core/scheduler/types";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import type { Process } from "../core/process";
 
@@ -22,10 +26,47 @@ export interface CrtTimeHost {
     writeWString(ptr: number, value: string, maxChars?: number): void;
 }
 
-export function registerCrtTimeExports(exports: Record<string, ThunkImplementation>, host: CrtTimeHost): void {
-    // Lazily-allocated struct tm scratch returned by gmtime (per-registration).
-    let gmtimeBuf = 0;
+const WDAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
+/**
+ * asctime's fixed 26-character form: "Www Mmm dd hh:mm:ss yyyy\n\0". The
+ * weekday is part of it — callers that parse the result by COLUMN read garbage
+ * without it, and ctime is specified as asctime(localtime(t)).
+ */
+export function formatAsctime(
+    wday: number,
+    mon: number,
+    mday: number,
+    hour: number,
+    min: number,
+    sec: number,
+    year: number,
+): string {
+    const hh = String(hour).padStart(2, "0");
+    const mm = String(min).padStart(2, "0");
+    const ss = String(sec).padStart(2, "0");
+    return `${WDAY_NAMES[wday] ?? "???"} ${MONTH_NAMES[mon] ?? "???"} ${String(mday).padStart(2, " ")} ${hh}:${mm}:${ss} ${year}\n`;
+}
+
+/**
+ * The CRT's static scratch buffers (the struct tm gmtime/localtime return, the string
+ * ctime returns). They live in guest memory that Process.reset() rewinds, so they must
+ * be forgotten with it — a kept address would have the next process's ctime write into
+ * whatever now owns those bytes. Cleared via resetCrtTimeStatics from msvcrt's
+ * reregisterExports, since registration itself does not run again.
+ */
+let gmtimeBuf = 0;
+let localtimeBuf = 0;
+let ctimeBuf = 0;
+
+export function resetCrtTimeStatics(): void {
+    gmtimeBuf = 0;
+    localtimeBuf = 0;
+    ctimeBuf = 0;
+}
+
+export function registerCrtTimeExports(exports: Record<string, ThunkImplementation>, host: CrtTimeHost): void {
     exports["time"] = (_c, _m, a) => {
         const ptr = a[0] ?? 0;
         const seconds = Math.floor(Date.now() / 1000) >>> 0;
@@ -37,10 +78,22 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
     // Must advance with guest virtual time (same source as GetTickCount).
     exports["clock"] = () => TimeService.getInstance().nowMs() | 0;
 
-    exports["_sleep"] = (_c, _m, a) => {
-        const seconds = (a[0] ?? 0) >>> 0;
-        if (seconds > 0) {
-            TimeService.getInstance().advanceVirtualTime(seconds * 1000);
+    // _sleep(duration) — the CRT's alias for Sleep, and its argument is MILLISECONDS
+    // (msvcrt.spec: `cdecl _sleep(long)`; the CRT maps 0 to 1 so it always yields).
+    // cdecl, so the caller pops the argument: the resume ESP pops the return address only.
+    exports["_sleep"] = (ctx, mem, a) => {
+        const ms = ((a[0] ?? 0) >>> 0) || 1;
+        const sched = System.getInstance().scheduler;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const returnAddr = view.getUint32(ctx.esp, true);
+        const blocked = sched.sleepWithContext(
+            ms,
+            returnAddr,
+            ctx.esp + 4,
+            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+        );
+        if (blocked === WAIT_BLOCKED_NO_SWITCH) {
+            return { value: 0, blockedNoSwitch: true };
         }
         return 0;
     };
@@ -67,9 +120,6 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
         return 0;
     };
 
-    // Lazily-allocated struct tm scratch returned by localtime (per-registration).
-    let localtimeBuf = 0;
-
     exports["localtime"] = (_c, _m, a) => {
         const timePtr = a[0] ?? 0;
         if (!timePtr) return 0;
@@ -93,10 +143,25 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
         return buf >>> 0;
     };
 
-    exports["gmtime"] = (_c, _m, a) => {
+    // ctime's scratch is NOT the localtime struct-tm buffer: ctime is
+    // asctime(localtime(t)), so one shared buffer would have the text overwrite the
+    // tm it was formatted from.
+    exports["ctime"] = (_c, _m, a) => {
         const timePtr = a[0] ?? 0;
         if (!timePtr) return 0;
         const seconds = Mem.readUint32(timePtr) ?? 0;
+        const date = new Date(seconds * 1000);
+        if (Number.isNaN(date.getTime())) return 0;
+        if (!ctimeBuf) ctimeBuf = host.process.memory.alloc(32, "THUNK_DATA", "rw");
+        host.writeCString(
+            ctimeBuf,
+            formatAsctime(date.getDay(), date.getMonth(), date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds(), date.getFullYear()),
+        );
+        return ctimeBuf >>> 0;
+    };
+
+    /** Fill the shared `struct tm` from a UTC epoch-seconds value and return it. */
+    const writeGmtime = (seconds: number): number => {
         const date = new Date(seconds * 1000);
         if (!gmtimeBuf) {
             gmtimeBuf = host.process.memory.alloc(36, "THUNK_DATA", "rw");
@@ -117,9 +182,25 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
         return buf >>> 0;
     };
 
-    exports["mktime"] = (_c, _m, a) => {
-        const tmPtr = a[0] ?? 0;
-        if (!tmPtr) return -1;
+    exports["gmtime"] = (_c, _m, a) => {
+        const timePtr = a[0] ?? 0;
+        if (!timePtr) return 0;
+        return writeGmtime(Mem.readUint32(timePtr) ?? 0);
+    };
+
+    // VS2015+ links the __time64_t forms by default: same conversion, but the time_t
+    // argument is 64-bit, so reading only the low word dates every timestamp wrongly
+    // once the high word is in use.
+    exports["_gmtime64"] = (_c, _m, a) => {
+        const timePtr = a[0] ?? 0;
+        if (!timePtr) return 0;
+        const lo = Mem.readUint32(timePtr) ?? 0;
+        const hi = Mem.readUint32(timePtr + 4) ?? 0;
+        return writeGmtime(lo + hi * 0x100000000);
+    };
+
+    /** Local-time epoch seconds for a `struct tm`, or -1 when it is unrepresentable. */
+    const mktimeSeconds = (tmPtr: number): number => {
         const sec = Mem.readUint32(tmPtr + 0) ?? 0;
         const min = Mem.readUint32(tmPtr + 4) ?? 0;
         const hour = Mem.readUint32(tmPtr + 8) ?? 0;
@@ -127,7 +208,70 @@ export function registerCrtTimeExports(exports: Record<string, ThunkImplementati
         const mon = Mem.readUint32(tmPtr + 16) ?? 0;
         const year = (Mem.readUint32(tmPtr + 20) ?? 0) + 1900;
         const date = new Date(year, mon, mday, hour, min, sec);
-        return (Math.floor(date.getTime() / 1000)) >>> 0;
+        const ms = date.getTime();
+        return Number.isNaN(ms) ? -1 : Math.floor(ms / 1000);
+    };
+
+    exports["mktime"] = (_c, _m, a) => {
+        const tmPtr = a[0] ?? 0;
+        if (!tmPtr) return -1;
+        return mktimeSeconds(tmPtr) >>> 0;
+    };
+
+    /** __time64_t result: the low half in EAX, the high half in EDX. */
+    exports["_mktime64"] = (_c, _m, a) => {
+        const tmPtr = a[0] ?? 0;
+        const cpu = getCPU(host.process.v86);
+        if (!tmPtr) {
+            if (cpu?.reg32) cpu.reg32[2] = -1;
+            return 0xffffffff;
+        }
+        const seconds = mktimeSeconds(tmPtr);
+        if (cpu?.reg32) cpu.reg32[2] = seconds < 0 ? -1 : Math.floor(seconds / 0x100000000) | 0;
+        return seconds >>> 0;
+    };
+
+    /** Same fields, read as UTC rather than local time — that is the whole of _mkgmtime. */
+    const mkgmtimeSeconds = (tmPtr: number): number => {
+        const ms = Date.UTC(
+            (Mem.readUint32(tmPtr + 20) ?? 0) + 1900,
+            Mem.readUint32(tmPtr + 16) ?? 0,
+            Mem.readUint32(tmPtr + 12) ?? 0,
+            Mem.readUint32(tmPtr + 8) ?? 0,
+            Mem.readUint32(tmPtr + 4) ?? 0,
+            Mem.readUint32(tmPtr + 0) ?? 0,
+        );
+        return Number.isNaN(ms) ? -1 : Math.floor(ms / 1000);
+    };
+
+    exports["_mkgmtime"] = (_c, _m, a) => {
+        const tmPtr = a[0] ?? 0;
+        if (!tmPtr) return 0xffffffff;
+        return mkgmtimeSeconds(tmPtr) >>> 0;
+    };
+
+    exports["_mkgmtime64"] = (_c, _m, a) => {
+        const tmPtr = a[0] ?? 0;
+        const cpu = getCPU(host.process.v86);
+        const setHigh = (v: number): void => { if (cpu) cpuViews(cpu).reg32[2] = v; };
+        if (!tmPtr) {
+            setHigh(-1);
+            return 0xffffffff;
+        }
+        const seconds = mkgmtimeSeconds(tmPtr);
+        setHigh(seconds < 0 ? -1 : Math.floor(seconds / 0x100000000) | 0);
+        return seconds >>> 0;
+    };
+
+    /**
+     * difftime over __time64_t: each argument is a 64-bit value in TWO u32 slots, so the
+     * halves must be recombined — reading them as two time_t values (what the 32-bit form
+     * does) silently subtracts the wrong pair.
+     */
+    exports["_difftime64"] = (_c, _m, a) => {
+        const join = (lo: number, hi: number): number => (hi | 0) * 0x100000000 + ((lo ?? 0) >>> 0);
+        fpuPush(host.process.v86, join(a[0] ?? 0, a[1] ?? 0) - join(a[2] ?? 0, a[3] ?? 0));
+        return 0;
     };
 
     exports["_strdate"] = (_c, _m, a) => {

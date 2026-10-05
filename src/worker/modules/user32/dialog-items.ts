@@ -3,14 +3,17 @@
  * SendDlgItemMessage, …). Find a dialog's child control by id and read/write its
  * state.
  */
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { encodeAnsi } from '../codepage-utils';
-import { windows, buttonCheckStates } from './shared-state';
-import { findChildByControlId, repaintDialogAfterContentChange, handleSystemControlMessage, isContentChangingMessage } from './dialog';
+import { windows, buttonCheckStates, findChildByControlId } from './shared-state';
+import { applyControlSetText, applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { sendWindowGetText, sendWindowSetText } from './message';
+import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
+import { tryRichEditStreamMessage } from './rich-edit-stream';
 
 export function registerDialogItemExports(exports: Record<string, ThunkImplementation>): void {
     exports['GetDlgItem'] = (ctx, mem, args) => {
@@ -34,41 +37,36 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
     /**
      * SetDlgItemTextA - Sets the title or text of a control in a dialog box
      */
-    exports['SetDlgItemTextA'] = (ctx, mem, args) => {
+    // SetDlgItemText is SendMessage(hCtl, WM_SETTEXT) — same delivery rule as
+    // SetWindowText, so a subclassed control hears its own text change.
+    const setDlgItemTextImpl = (
+        ctx: X86Context, mem: Uint8Array, args: number[], tag: string,
+        decode: (ptr: number) => string,
+    ): number | ThunkResult => {
         const hDlg = args[0];
         const nIDDlgItem = args[1];
         const lpString = args[2];
 
-        const text = lpString ? Marshaler.readString(mem, lpString) : '';
-        Logger.log(LogCategory.USER32, `SetDlgItemTextA(0x${hDlg.toString(16)}, id=${nIDDlgItem}, "${text}")`);
-
         const child = findChildByControlId(hDlg, nIDDlgItem);
-        if (child) {
-            child.title = text;
-            repaintDialogAfterContentChange(hDlg);
-        } else {
-            Logger.warn(LogCategory.USER32, `SetDlgItemTextA: control id=${nIDDlgItem} not found in dialog 0x${hDlg.toString(16)}`);
+        if (!child) {
+            Logger.warn(LogCategory.USER32, `${tag}: control id=${nIDDlgItem} not found in dialog 0x${hDlg.toString(16)}`);
+            return 0; // FALSE — Win32 fails on a missing control
         }
 
+        const sent = sendWindowSetText(ctx, mem, child.handle, lpString, 12, tag);
+        if (sent) return sent;
+
+        const text = lpString ? decode(lpString) : '';
+        Logger.log(LogCategory.USER32, `${tag}(0x${hDlg.toString(16)}, id=${nIDDlgItem}, "${text}")`);
+        applyDefaultSetText(child, text);
         return 1; // TRUE
     };
 
-    exports['SetDlgItemTextW'] = (ctx, mem, args) => {
-        const hDlg = args[0];
-        const nIDDlgItem = args[1];
-        const lpString = args[2];
+    exports['SetDlgItemTextA'] = (ctx, mem, args) =>
+        setDlgItemTextImpl(ctx, mem, args, 'SetDlgItemTextA', (ptr) => Marshaler.readString(mem, ptr));
 
-        const text = lpString ? Marshaler.readWideString(mem, lpString) : '';
-        Logger.log(LogCategory.USER32, `SetDlgItemTextW(0x${hDlg.toString(16)}, id=${nIDDlgItem}, "${text}")`);
-
-        const child = findChildByControlId(hDlg, nIDDlgItem);
-        if (child) {
-            child.title = text;
-            repaintDialogAfterContentChange(hDlg);
-        }
-
-        return 1; // TRUE
-    };
+    exports['SetDlgItemTextW'] = (ctx, mem, args) =>
+        setDlgItemTextImpl(ctx, mem, args, 'SetDlgItemTextW', (ptr) => Marshaler.readWideString(mem, ptr));
 
     /**
      * GetDlgItemTextA - Retrieves the title or text of a control
@@ -82,6 +80,11 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         Logger.verbose(LogCategory.USER32, `GetDlgItemTextA(0x${hDlg.toString(16)}, ${nIDDlgItem}, buf, ${cchMax})`);
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
+        // GetDlgItemText is GetWindowText of the child — same delivery rule.
+        if (child && lpString && cchMax > 0) {
+            const sent = sendWindowGetText(ctx, mem, child.handle, cchMax, lpString, 16, 'GetDlgItemTextA');
+            if (sent) return sent;
+        }
         const text = child?.title ?? '';
 
         if (lpString && cchMax > 0) {
@@ -103,6 +106,10 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         Logger.verbose(LogCategory.USER32, `GetDlgItemTextW(0x${hDlg.toString(16)}, ${nIDDlgItem}, buf, ${cchMax})`);
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
+        if (child && lpString && cchMax > 0) {
+            const sent = sendWindowGetText(ctx, mem, child.handle, cchMax, lpString, 16, 'GetDlgItemTextW');
+            if (sent) return sent;
+        }
         const text = child?.title ?? '';
 
         if (lpString && cchMax > 0) {
@@ -249,13 +256,14 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         const child = findChildByControlId(hDlg, nIDDlgItem);
         if (child) {
-            child.title = text;
+            eraseControlOverlayRect(child);
+            applyControlSetText(child, text);
             repaintDialogAfterContentChange(hDlg);
         }
         return 1; // TRUE
     };
 
-    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number => {
+    const sendDlgItemMessage = (ctx: any, mem: Uint8Array, args: number[]): number | ThunkResult => {
         const hDlg = args[0];
         const nIDDlgItem = args[1];
         const Msg = args[2];
@@ -268,8 +276,11 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
 
         // JS-managed system controls: handle in-process (Wine routes via SendMessage → control WndProc).
         if (child.isSystemControl) {
-            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem);
-            if (isContentChangingMessage(Msg)) {
+            const stream = tryRichEditStreamMessage(
+                ctx, mem, child, Msg, wParam, lParam, 20, 'SendDlgItemMessageA');
+            if (stream) return stream;
+            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'ansi');
+            if (isContentChangingMessage(child, Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
             return result;
@@ -306,9 +317,13 @@ export function registerDialogItemExports(exports: Record<string, ThunkImplement
         const WM_SETTEXT = 0x000C;
         const WM_GETTEXT = 0x000D;
         if (child.isSystemControl) {
-            // Wide SETTEXT/GETTEXT: handleSystemControlMessage already accepts both via readAnsiOrWideString.
-            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem);
-            if (isContentChangingMessage(Msg)) {
+            const stream = tryRichEditStreamMessage(
+                ctx, mem, child, Msg, wParam, lParam, 20, 'SendDlgItemMessageW');
+            if (stream) return stream;
+            // The W entry KNOWS its strings are wide — pass that rather than re-probing bytes
+            // that a 1-char ANSI string is indistinguishable from.
+            const result = handleSystemControlMessage(child, Msg, wParam, lParam, mem, 'wide');
+            if (isContentChangingMessage(child, Msg)) {
                 repaintDialogAfterContentChange(hDlg);
             }
             return result;

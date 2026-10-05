@@ -22,6 +22,9 @@ const ERROR_OLD_WIN_VERSION = 1150;
 
 const OSVERSIONINFOW_SIZE = 276;
 const OSVERSIONINFOEXW_SIZE = 284;
+// The ANSI struct differs only in szCSDVersion being CHAR[128] instead of WCHAR[128].
+const OSVERSIONINFOA_SIZE = 148;
+const OSVERSIONINFOEXA_SIZE = 156;
 
 export const VER_MINORVERSION = 0x00000001;
 export const VER_MAJORVERSION = 0x00000002;
@@ -144,6 +147,36 @@ export function readOsVersionCriteriaW(mem: Uint8Array, ptr: number): OsVersionE
     return criteria;
 }
 
+export function readOsVersionCriteriaA(mem: Uint8Array, ptr: number): OsVersionExFields | null {
+    if (!ptr || !isValidAddress(ptr, OSVERSIONINFOA_SIZE, 'rw')) {
+        return null;
+    }
+    const dwSize = Mem.readUint32(ptr);
+    if (dwSize === null || dwSize < OSVERSIONINFOA_SIZE) {
+        return null;
+    }
+
+    const criteria: OsVersionExFields = {
+        dwMajorVersion: Mem.readUint32(ptr + 4) ?? 0,
+        dwMinorVersion: Mem.readUint32(ptr + 8) ?? 0,
+        dwBuildNumber: Mem.readUint32(ptr + 12) ?? 0,
+        dwPlatformId: Mem.readUint32(ptr + 16) ?? 0,
+        wServicePackMajor: 0,
+        wServicePackMinor: 0,
+        wSuiteMask: 0,
+        wProductType: 0,
+    };
+
+    if (dwSize >= OSVERSIONINFOEXA_SIZE) {
+        criteria.wServicePackMajor = Mem.readUint16(ptr + 148) ?? 0;
+        criteria.wServicePackMinor = Mem.readUint16(ptr + 150) ?? 0;
+        criteria.wSuiteMask = Mem.readUint16(ptr + 152) ?? 0;
+        criteria.wProductType = Mem.readUint8(ptr + 154) ?? 0;
+    }
+
+    return criteria;
+}
+
 /**
  * The version fields compared as ONE hierarchical value, most significant first
  * (documented VerifyVersionInfo behavior). Only fields flagged in typeMask
@@ -221,24 +254,23 @@ function setU64Return(lo: number, hi: number): number {
     return lo >>> 0;
 }
 
-export const versionVerifyExports: Record<string, ThunkImplementation> = {
-    'VerSetConditionMask': (_ctx, _mem, args) => {
-        const maskLo = args[0] >>> 0;
-        const maskHi = args[1] >>> 0;
-        const typeMask = args[2] >>> 0;
-        const condition = args[3] >>> 0;
-        const result = verSetConditionMask(maskLo, maskHi, typeMask, condition);
-        return setU64Return(result.lo, result.hi);
-    },
-
-    'VerifyVersionInfoW': (_ctx, mem, args) => {
+/**
+ * VerifyVersionInfo's A and W forms differ only in how the criteria struct is laid out
+ * (szCSDVersion CHAR[128] vs WCHAR[128]); the comparison is identical, so both spellings
+ * share one body and cannot answer differently for the same question.
+ */
+function makeVerifyVersionInfo(
+    readCriteria: (mem: Uint8Array, ptr: number) => OsVersionExFields | null,
+    apiName: string,
+): ThunkImplementation {
+    return (_ctx, mem, args) => {
         const infoPtr = args[0] >>> 0;
         const typeMask = args[1] >>> 0;
         const maskLo = args[2] >>> 0;
         const maskHi = args[3] >>> 0;
         const sched = System.getInstance().scheduler;
 
-        const criteria = readOsVersionCriteriaW(mem, infoPtr);
+        const criteria = readCriteria(mem, infoPtr);
         if (!criteria) {
             sched.setLastError(ERROR_BAD_ARGUMENTS);
             return 0;
@@ -250,12 +282,11 @@ export const versionVerifyExports: Record<string, ThunkImplementation> = {
         }
 
         const actual = getEmulatedOsVersionEx();
-        const ok = verifyVersionInfoEx(criteria, typeMask, maskLo, maskHi, actual);
-        if (!ok) {
+        if (!verifyVersionInfoEx(criteria, typeMask, maskLo, maskHi, actual)) {
             sched.setLastError(ERROR_OLD_WIN_VERSION);
             Logger.verbose(
                 LogCategory.KERNEL32,
-                `VerifyVersionInfoW: mismatch (want ${criteria.dwMajorVersion}.${criteria.dwMinorVersion} ` +
+                `${apiName}: mismatch (want ${criteria.dwMajorVersion}.${criteria.dwMinorVersion} ` +
                 `build ${criteria.dwBuildNumber} platform ${criteria.dwPlatformId}, ` +
                 `actual ${actual.dwMajorVersion}.${actual.dwMinorVersion} ` +
                 `build ${actual.dwBuildNumber} platform ${actual.dwPlatformId}, ` +
@@ -267,9 +298,24 @@ export const versionVerifyExports: Record<string, ThunkImplementation> = {
         sched.setLastError(0);
         Logger.verbose(
             LogCategory.KERNEL32,
-            `VerifyVersionInfoW: match ${actual.dwMajorVersion}.${actual.dwMinorVersion} ` +
+            `${apiName}: match ${actual.dwMajorVersion}.${actual.dwMinorVersion} ` +
             `(typeMask=0x${typeMask.toString(16)})`,
         );
         return 1;
+    };
+}
+
+export const versionVerifyExports: Record<string, ThunkImplementation> = {
+    'VerSetConditionMask': (_ctx, _mem, args) => {
+        const maskLo = args[0] >>> 0;
+        const maskHi = args[1] >>> 0;
+        const typeMask = args[2] >>> 0;
+        const condition = args[3] >>> 0;
+        const result = verSetConditionMask(maskLo, maskHi, typeMask, condition);
+        return setU64Return(result.lo, result.hi);
     },
+
+    'VerifyVersionInfoW': makeVerifyVersionInfo(readOsVersionCriteriaW, 'VerifyVersionInfoW'),
+
+    'VerifyVersionInfoA': makeVerifyVersionInfo(readOsVersionCriteriaA, 'VerifyVersionInfoA'),
 };

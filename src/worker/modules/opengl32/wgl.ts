@@ -4,10 +4,37 @@ import { Logger, LogCategory } from "../../core/logger";
 import { OpenGLBackendExecutor } from "../../backends/webgpu/opengl/opengl-backend-executor";
 import { System } from "../../core/system";
 import { gammaService } from "../../core/gamma-service";
+import { resolveHleExportAddress } from "../../core/thunking/export-resolver";
+import {
+    chooseWglPixelFormat,
+    describeWglPixelFormat,
+    getWglPixelFormat,
+    setWglPixelFormat,
+} from "../gdi32/painting";
 
 interface WGLContextBinding {
     hglrc: number;
     hdc: number;
+}
+
+/**
+ * A GL entry point address, but only when a JS handler is actually registered behind it.
+ *
+ * GetProcAddress may legitimately hand back a stub for a declared-but-unimplemented
+ * export; for wglGetProcAddress NULL is the DOCUMENTED "this extension is absent"
+ * answer, and an engine that gets a pointer concludes the extension is present, calls
+ * it, and takes the garbage return as truth. So the two agree on the registry they
+ * consult, and disagree — deliberately — on what an unimplemented name resolves to.
+ */
+function resolveImplementedEntryPoint(dispatcher: any, name: string): number {
+    const addr = resolveHleExportAddress(dispatcher, "opengl32", name) >>> 0;
+    if (!addr) return 0;
+    const stub = dispatcher?.thunkGenerator?.getStubByAddress?.(addr);
+    if (!stub || !dispatcher?.getImplementationInfo?.(stub.functionId)) {
+        Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0 (declared, not implemented)`);
+        return 0;
+    }
+    return addr;
 }
 
 export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
@@ -23,6 +50,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         const hdc = args[0] >>> 0;
         const hglrc = nextHglrc++;
         contexts.set(hglrc, { hdc });
+        if (!ctx.drawableDC) ctx.drawableDC = hdc;
         Logger.log(LogCategory.GDI32, `wglCreateContext(hdc=0x${hdc.toString(16)}) -> 0x${hglrc.toString(16)}`);
         return hglrc;
     };
@@ -60,6 +88,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         }
         currentHglrc = hglrc;
         currentHdc = hdc;
+        if (hdc) ctx.drawableDC = hdc;
 
         // Lazily initialize OpenGL executor once WebGPU backend is available.
         if (!ctx.executor && ctx.backend) {
@@ -92,8 +121,19 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         const name = new TextDecoder().decode(mem.subarray(namePtr, end));
         if (!name) return 0;
 
-        // Try to find in module registry
-        const addr = ctx.process.moduleRegistry?.getExportAddress("opengl32", name) ?? 0;
+        // No current context => NULL, per the WGL contract (an entry point is only
+        // meaningful for the pixel format/context it was queried against).
+        if (!currentHglrc) {
+            Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0 (no current context)`);
+            return 0;
+        }
+
+        // Our GL entry points are thunk stubs, not PE exports — resolve through the
+        // same registry GetProcAddress uses so the two can never disagree. Extension
+        // entry points are absent from the boot-time stub set, so this is also what
+        // creates them on demand.
+        const dispatcher = (ctx.process as any)?.dispatcher;
+        const addr = resolveImplementedEntryPoint(dispatcher, name);
         if (addr) {
             Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0x${addr.toString(16)}`);
             return addr;
@@ -116,14 +156,11 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
             'glCompressedTexSubImage2DARB': 'glCompressedTexSubImage2D',
             'glCompressedTexSubImage3DARB': 'glCompressedTexSubImage3D',
             'glGetCompressedTexImageARB': 'glGetCompressedTexImage',
-            'glLockArraysEXT': 'glLockArraysEXT',
-            'glUnlockArraysEXT': 'glUnlockArraysEXT',
-            'wglGetExtensionsStringARB': 'wglGetExtensionsStringARB',
         };
 
         const mapped = aliasMap[name];
-        if (mapped) {
-            const mappedAddr = ctx.process.moduleRegistry?.getExportAddress("opengl32", mapped) ?? 0;
+        if (mapped && mapped !== name) {
+            const mappedAddr = resolveImplementedEntryPoint(dispatcher, mapped);
             if (mappedAddr) {
                 Logger.verbose(LogCategory.GDI32, `wglGetProcAddress("${name}") -> 0x${mappedAddr.toString(16)} (alias: ${mapped})`);
                 return mappedAddr;
@@ -136,7 +173,7 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
 
     exports['wglSwapBuffers'] = (_c, _m, args): number => {
         const hdc = args[0] >>> 0;
-        Logger.log(LogCategory.GDI32, `wglSwapBuffers(hdc=0x${hdc.toString(16)}) cmds=${ctx.commands.length} texs=${ctx.textures.size}`);
+        Logger.verbose(LogCategory.GDI32, `wglSwapBuffers(hdc=0x${hdc.toString(16)}) cmds=${ctx.commands.count} texs=${ctx.textures.size}`);
         // Present the frame
         if (ctx.presenter && typeof ctx.presenter.present === 'function') {
             ctx.presenter.present();
@@ -152,40 +189,25 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
         return 1;
     };
 
-    exports['wglChoosePixelFormat'] = (_c, _m, args): number => {
-        return 1; // Return format index 1
+    // The wgl* pixel-format entry points are the SAME driver-side query gdi32's
+    // Choose/Describe/Set/GetPixelFormat forward to on real Windows, so they share the
+    // one implementation. Two copies of the PIXELFORMATDESCRIPTOR layout is exactly how
+    // this one rotted: the gdi32 twin wrote green/blue/alpha at their real offsets while
+    // this one dropped them into cAlphaShift/cAccumBits, publishing a 32-bit format with
+    // zero green and blue for any engine that scored the table.
+    exports['wglChoosePixelFormat'] = (_c, mem, args): number => {
+        return chooseWglPixelFormat(mem, args[1] >>> 0);
     };
 
-    exports['wglDescribePixelFormat'] = (_c, _m, args): number => {
-        const hdc = args[0] >>> 0;
-        const pixelFormat = args[1] | 0;
-        const nBytes = args[2] >>> 0;
-        const ppfd = args[3] >>> 0;
-
-        if (ppfd && nBytes >= 40) {
-            // PIXELFORMATDESCRIPTOR is 40 bytes
-            const mem = ctx.process.getCurrentMemory();
-            const view = new DataView(mem.buffer, mem.byteOffset);
-            view.setUint16(ppfd + 0, 40, true);      // nSize
-            view.setUint16(ppfd + 2, 1, true);        // nVersion
-            view.setUint32(ppfd + 4, 0x25, true);     // dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER
-            view.setUint8(ppfd + 8, 0);               // iPixelType: PFD_TYPE_RGBA
-            view.setUint8(ppfd + 9, 32);              // cColorBits
-            view.setUint8(ppfd + 10, 8);              // cRedBits
-            view.setUint8(ppfd + 17, 8);              // cGreenBits
-            view.setUint8(ppfd + 18, 8);              // cBlueBits
-            view.setUint8(ppfd + 19, 8);              // cAlphaBits
-            view.setUint8(ppfd + 23, 24);             // cDepthBits
-            view.setUint8(ppfd + 24, 8);              // cStencilBits
-        }
-        return 1; // Number of pixel formats
+    exports['wglDescribePixelFormat'] = (_c, mem, args): number => {
+        return describeWglPixelFormat(mem, args[1] | 0, args[2] >>> 0, args[3] >>> 0);
     };
 
     exports['wglSetPixelFormat'] = (_c, _m, args): number => {
-        return 1; // TRUE
+        return setWglPixelFormat(args[0] >>> 0, args[1] | 0) ? 1 : 0;
     };
 
-    exports['wglGetPixelFormat'] = (): number => 1;
+    exports['wglGetPixelFormat'] = (_c, _m, args): number => getWglPixelFormat(args[0] >>> 0);
 
     exports['wglCopyContext'] = (): number => 0;
     exports['wglCreateLayerContext'] = (_c, _m, args): number => {
@@ -208,7 +230,11 @@ export function createWglExports(ctx: OpenGLContext): Record<string, ThunkImplem
     };
 
     exports['wglGetExtensionsStringARB'] = (_c, _m, args): number => {
-        const str = "WGL_ARB_extensions_string WGL_ARB_multisample";
+        // Only what has an entry point behind it. WGL_ARB_multisample was listed here
+        // with no wglChoosePixelFormatARB/wglGetPixelFormatAttribivARB to query it and
+        // no multisampled pixel format to find — a lenient caller resolves NULL and
+        // calls address 0, a careful one enables an AA path we never render.
+        const str = "WGL_ARB_extensions_string";
         const addr = ctx.process.memory.alloc(str.length + 1);
         if (addr) {
             const bytes = new TextEncoder().encode(str + "\0");

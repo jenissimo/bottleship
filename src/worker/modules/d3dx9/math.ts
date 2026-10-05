@@ -30,6 +30,15 @@ function writeMatrix(addr: number, m: Float32Array): boolean {
     return true;
 }
 
+/** Reinterpret a stack dword as the FLOAT the caller pushed (cdecl passes it by value). */
+function f32FromBits(bits: number): number {
+    f32ScratchU32[0] = bits >>> 0;
+    return f32ScratchF32[0]!;
+}
+const f32ScratchBuffer = new ArrayBuffer(4);
+const f32ScratchU32 = new Uint32Array(f32ScratchBuffer);
+const f32ScratchF32 = new Float32Array(f32ScratchBuffer);
+
 function readVec3(addr: number): [number, number, number] | null {
     if (!addr) return null;
     const x = Mem.readFloat32(addr);
@@ -162,6 +171,35 @@ export function createMathExports(): Record<string, ThunkImplementation> {
             1,
         ]);
         return writeMatrix(pOut, m) ? pOut : 0;
+    };
+
+    /**
+     * Catmull-Rom spline through V1..V2 with V0/V3 as the outer control points, exactly as
+     * d3dx9 spells it. A title interpolating a camera or an animation track calls this per
+     * object per frame and uses the OUT-PARAM, not the return value — leaving it unwritten
+     * hands back whatever was on the caller's stack.
+     */
+    exports['D3DXVec3CatmullRom'] = (_ctx, _mem, args) => {
+        const pOut = args[0] >>> 0;
+        const v0 = readVec3(args[1] >>> 0);
+        const v1 = readVec3(args[2] >>> 0);
+        const v2 = readVec3(args[3] >>> 0);
+        const v3 = readVec3(args[4] >>> 0);
+        // The weight is a FLOAT argument; it arrives as the raw 32-bit pattern in the slot.
+        const s = f32FromBits(args[5] >>> 0);
+        if (!pOut || !v0 || !v1 || !v2 || !v3) return 0;
+        const s2 = s * s;
+        const s3 = s2 * s;
+        const out: [number, number, number] = [0, 0, 0];
+        for (let i = 0; i < 3; i++) {
+            out[i] = 0.5 * (
+                2 * v1[i]
+                + (-v0[i] + v2[i]) * s
+                + (2 * v0[i] - 5 * v1[i] + 4 * v2[i] - v3[i]) * s2
+                + (-v0[i] + 3 * v1[i] - 3 * v2[i] + v3[i]) * s3
+            );
+        }
+        return writeVec3(pOut, out[0], out[1], out[2]) ? pOut : 0;
     };
 
     exports['D3DXVec3Normalize'] = (_ctx, _mem, args) => {

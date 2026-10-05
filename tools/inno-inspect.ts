@@ -33,7 +33,7 @@ async function main(): Promise<void> {
     await lzma.init(wasmBytes.buffer.slice(wasmBytes.byteOffset, wasmBytes.byteOffset + wasmBytes.byteLength));
 
     const result = await parseInnoHeader(source, lzma);
-    const { version, header, files, icons, registryEntries, dataEntries, offsets } = result;
+    const { version, header, directories, files, icons, registryEntries, dataEntries, offsets } = result;
 
     const summary = {
         version: version.toString(),
@@ -49,6 +49,7 @@ async function main(): Promise<void> {
         iconCount: icons.length,
         registryCount: registryEntries.length,
         totalDataBytes: dataEntries.reduce((s, e) => s + Number(e.fileSize), 0),
+        directories: directories.map((d) => d.name),
         files: files.map((f) => ({
             source: f.source,
             destination: f.destination,
@@ -64,6 +65,8 @@ async function main(): Promise<void> {
     console.log(`Files: ${summary.fileCount} (header says ${summary.headerFileCount})`);
     console.log(`Data entries: ${summary.dataEntryCount}, total payload ${summary.totalDataBytes} bytes`);
     console.log(`Icons: ${summary.iconCount}, Registry: ${summary.registryCount}`);
+    console.log(`[Dirs]: ${directories.length}`);
+    for (const d of directories) console.log(`  ${d.name}`);
     console.log(`Offsets: header=0x${offsets.headerOffset.toString(16)} data=0x${offsets.dataOffset.toString(16)}`);
 
     if (jsonOut) {

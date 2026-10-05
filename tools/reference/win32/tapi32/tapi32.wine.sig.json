@@ -1,0 +1,731 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.944Z",
+  "module": "tapi32",
+  "functions": [
+    {
+      "name": "lineAccept",
+      "argCount": 3
+    },
+    {
+      "name": "lineAddProvider",
+      "argCount": 3
+    },
+    {
+      "name": "lineAddProviderA",
+      "argCount": 3
+    },
+    {
+      "name": "lineAddProviderW",
+      "argCount": 3
+    },
+    {
+      "name": "lineAddToConference",
+      "argCount": 2
+    },
+    {
+      "name": "lineAnswer",
+      "argCount": 3
+    },
+    {
+      "name": "lineBlindTransfer",
+      "argCount": 3
+    },
+    {
+      "name": "lineBlindTransferA",
+      "argCount": 3
+    },
+    {
+      "name": "lineClose",
+      "argCount": 1
+    },
+    {
+      "name": "lineCompleteCall",
+      "argCount": 4
+    },
+    {
+      "name": "lineCompleteTransfer",
+      "argCount": 4
+    },
+    {
+      "name": "lineConfigDialog",
+      "argCount": 3
+    },
+    {
+      "name": "lineConfigDialogA",
+      "argCount": 3
+    },
+    {
+      "name": "lineConfigDialogEdit",
+      "argCount": 6
+    },
+    {
+      "name": "lineConfigDialogEditA",
+      "argCount": 6
+    },
+    {
+      "name": "lineConfigDialogW",
+      "argCount": 3
+    },
+    {
+      "name": "lineConfigProvider",
+      "argCount": 2
+    },
+    {
+      "name": "lineDeallocateCall",
+      "argCount": 1
+    },
+    {
+      "name": "lineDevSpecific",
+      "argCount": 5
+    },
+    {
+      "name": "lineDevSpecificFeature",
+      "argCount": 4
+    },
+    {
+      "name": "lineDial",
+      "argCount": 3
+    },
+    {
+      "name": "lineDialA",
+      "argCount": 3
+    },
+    {
+      "name": "lineDialW",
+      "argCount": 3
+    },
+    {
+      "name": "lineDrop",
+      "argCount": 3
+    },
+    {
+      "name": "lineForward",
+      "argCount": 7
+    },
+    {
+      "name": "lineForwardA",
+      "argCount": 7
+    },
+    {
+      "name": "lineGatherDigits",
+      "argCount": 7
+    },
+    {
+      "name": "lineGatherDigitsA",
+      "argCount": 7
+    },
+    {
+      "name": "lineGenerateDigits",
+      "argCount": 4
+    },
+    {
+      "name": "lineGenerateDigitsA",
+      "argCount": 4
+    },
+    {
+      "name": "lineGenerateTone",
+      "argCount": 5
+    },
+    {
+      "name": "lineGetAddressCaps",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetAddressCapsA",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetAddressID",
+      "argCount": 5
+    },
+    {
+      "name": "lineGetAddressIDA",
+      "argCount": 5
+    },
+    {
+      "name": "lineGetAddressStatus",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetAddressStatusA",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetAppPriority",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetAppPriorityA",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetCallInfo",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetCallInfoA",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetCallInfoW",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetCallStatus",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetConfRelatedCalls",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetCountry",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetCountryA",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetCountryW",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetDevCaps",
+      "argCount": 5
+    },
+    {
+      "name": "lineGetDevCapsA",
+      "argCount": 5
+    },
+    {
+      "name": "lineGetDevCapsW",
+      "argCount": 5
+    },
+    {
+      "name": "lineGetDevConfig",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetDevConfigA",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetDevConfigW",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetIcon",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetIconA",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetIconW",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetID",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetIDA",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetIDW",
+      "argCount": 6
+    },
+    {
+      "name": "lineGetLineDevStatus",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetLineDevStatusA",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetMessage",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetNewCalls",
+      "argCount": 4
+    },
+    {
+      "name": "lineGetNumRings",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetProviderList",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetProviderListA",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetProviderListW",
+      "argCount": 2
+    },
+    {
+      "name": "lineGetRequest",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetRequestA",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetStatusMessages",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetTranslateCaps",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetTranslateCapsA",
+      "argCount": 3
+    },
+    {
+      "name": "lineGetTranslateCapsW",
+      "argCount": 3
+    },
+    {
+      "name": "lineHandoff",
+      "argCount": 3
+    },
+    {
+      "name": "lineHandoffA",
+      "argCount": 3
+    },
+    {
+      "name": "lineHold",
+      "argCount": 1
+    },
+    {
+      "name": "lineInitialize",
+      "argCount": 5
+    },
+    {
+      "name": "lineInitializeExA",
+      "argCount": 7
+    },
+    {
+      "name": "lineInitializeExW",
+      "argCount": 7
+    },
+    {
+      "name": "lineMakeCall",
+      "argCount": 5
+    },
+    {
+      "name": "lineMakeCallA",
+      "argCount": 5
+    },
+    {
+      "name": "lineMakeCallW",
+      "argCount": 5
+    },
+    {
+      "name": "lineMonitorDigits",
+      "argCount": 2
+    },
+    {
+      "name": "lineMonitorMedia",
+      "argCount": 2
+    },
+    {
+      "name": "lineMonitorTones",
+      "argCount": 3
+    },
+    {
+      "name": "lineNegotiateAPIVersion",
+      "argCount": 6
+    },
+    {
+      "name": "lineNegotiateExtVersion",
+      "argCount": 6
+    },
+    {
+      "name": "lineOpen",
+      "argCount": 9
+    },
+    {
+      "name": "lineOpenA",
+      "argCount": 9
+    },
+    {
+      "name": "lineOpenW",
+      "argCount": 9
+    },
+    {
+      "name": "linePark",
+      "argCount": 4
+    },
+    {
+      "name": "lineParkA",
+      "argCount": 4
+    },
+    {
+      "name": "linePickup",
+      "argCount": 5
+    },
+    {
+      "name": "linePickupA",
+      "argCount": 5
+    },
+    {
+      "name": "linePrepareAddToConference",
+      "argCount": 3
+    },
+    {
+      "name": "linePrepareAddToConferenceA",
+      "argCount": 3
+    },
+    {
+      "name": "lineRedirect",
+      "argCount": 3
+    },
+    {
+      "name": "lineRedirectA",
+      "argCount": 3
+    },
+    {
+      "name": "lineRegisterRequestRecipient",
+      "argCount": 4
+    },
+    {
+      "name": "lineReleaseUserUserInfo",
+      "argCount": 1
+    },
+    {
+      "name": "lineRemoveFromConference",
+      "argCount": 1
+    },
+    {
+      "name": "lineRemoveProvider",
+      "argCount": 2
+    },
+    {
+      "name": "lineSecureCall",
+      "argCount": 1
+    },
+    {
+      "name": "lineSendUserUserInfo",
+      "argCount": 3
+    },
+    {
+      "name": "lineSetAppPriority",
+      "argCount": 6
+    },
+    {
+      "name": "lineSetAppPriorityA",
+      "argCount": 6
+    },
+    {
+      "name": "lineSetAppSpecific",
+      "argCount": 2
+    },
+    {
+      "name": "lineSetCallParams",
+      "argCount": 5
+    },
+    {
+      "name": "lineSetCallPrivilege",
+      "argCount": 2
+    },
+    {
+      "name": "lineSetCurrentLocation",
+      "argCount": 2
+    },
+    {
+      "name": "lineSetDevConfig",
+      "argCount": 4
+    },
+    {
+      "name": "lineSetDevConfigA",
+      "argCount": 4
+    },
+    {
+      "name": "lineSetDevConfigW",
+      "argCount": 4
+    },
+    {
+      "name": "lineSetMediaControl",
+      "argCount": 12
+    },
+    {
+      "name": "lineSetMediaMode",
+      "argCount": 2
+    },
+    {
+      "name": "lineSetNumRings",
+      "argCount": 3
+    },
+    {
+      "name": "lineSetStatusMessages",
+      "argCount": 3
+    },
+    {
+      "name": "lineSetTerminal",
+      "argCount": 7
+    },
+    {
+      "name": "lineSetTollList",
+      "argCount": 4
+    },
+    {
+      "name": "lineSetTollListA",
+      "argCount": 4
+    },
+    {
+      "name": "lineSetupConference",
+      "argCount": 6
+    },
+    {
+      "name": "lineSetupConferenceA",
+      "argCount": 6
+    },
+    {
+      "name": "lineSetupTransfer",
+      "argCount": 3
+    },
+    {
+      "name": "lineSetupTransferA",
+      "argCount": 3
+    },
+    {
+      "name": "lineShutdown",
+      "argCount": 1
+    },
+    {
+      "name": "lineSwapHold",
+      "argCount": 2
+    },
+    {
+      "name": "lineTranslateAddress",
+      "argCount": 7
+    },
+    {
+      "name": "lineTranslateAddressA",
+      "argCount": 7
+    },
+    {
+      "name": "lineTranslateAddressW",
+      "argCount": 7
+    },
+    {
+      "name": "lineTranslateDialog",
+      "argCount": 5
+    },
+    {
+      "name": "lineTranslateDialogA",
+      "argCount": 5
+    },
+    {
+      "name": "lineTranslateDialogW",
+      "argCount": 5
+    },
+    {
+      "name": "lineUncompleteCall",
+      "argCount": 2
+    },
+    {
+      "name": "lineUnhold",
+      "argCount": 1
+    },
+    {
+      "name": "lineUnpark",
+      "argCount": 4
+    },
+    {
+      "name": "lineUnparkA",
+      "argCount": 4
+    },
+    {
+      "name": "phoneClose",
+      "argCount": 1
+    },
+    {
+      "name": "phoneConfigDialog",
+      "argCount": 3
+    },
+    {
+      "name": "phoneConfigDialogA",
+      "argCount": 3
+    },
+    {
+      "name": "phoneDevSpecific",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetButtonInfo",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetButtonInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetData",
+      "argCount": 4
+    },
+    {
+      "name": "phoneGetDevCaps",
+      "argCount": 5
+    },
+    {
+      "name": "phoneGetDevCapsA",
+      "argCount": 5
+    },
+    {
+      "name": "phoneGetDisplay",
+      "argCount": 2
+    },
+    {
+      "name": "phoneGetGain",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetHookSwitch",
+      "argCount": 2
+    },
+    {
+      "name": "phoneGetIcon",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetIconA",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetID",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetIDA",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetLamp",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetMessage",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetRing",
+      "argCount": 3
+    },
+    {
+      "name": "phoneGetStatus",
+      "argCount": 2
+    },
+    {
+      "name": "phoneGetStatusA",
+      "argCount": 2
+    },
+    {
+      "name": "phoneGetStatusMessages",
+      "argCount": 4
+    },
+    {
+      "name": "phoneGetVolume",
+      "argCount": 3
+    },
+    {
+      "name": "phoneInitialize",
+      "argCount": 5
+    },
+    {
+      "name": "phoneInitializeExA",
+      "argCount": 7
+    },
+    {
+      "name": "phoneInitializeExW",
+      "argCount": 7
+    },
+    {
+      "name": "phoneNegotiateAPIVersion",
+      "argCount": 6
+    },
+    {
+      "name": "phoneNegotiateExtVersion",
+      "argCount": 6
+    },
+    {
+      "name": "phoneOpen",
+      "argCount": 7
+    },
+    {
+      "name": "phoneSetButtonInfo",
+      "argCount": 3
+    },
+    {
+      "name": "phoneSetButtonInfoA",
+      "argCount": 3
+    },
+    {
+      "name": "phoneSetData",
+      "argCount": 4
+    },
+    {
+      "name": "phoneSetDisplay",
+      "argCount": 5
+    },
+    {
+      "name": "phoneSetGain",
+      "argCount": 3
+    },
+    {
+      "name": "phoneSetHookSwitch",
+      "argCount": 3
+    },
+    {
+      "name": "phoneSetLamp",
+      "argCount": 3
+    },
+    {
+      "name": "phoneSetRing",
+      "argCount": 3
+    },
+    {
+      "name": "phoneSetStatusMessages",
+      "argCount": 4
+    },
+    {
+      "name": "phoneSetVolume",
+      "argCount": 3
+    },
+    {
+      "name": "phoneShutdown",
+      "argCount": 1
+    },
+    {
+      "name": "tapiGetLocationInfo",
+      "argCount": 2
+    },
+    {
+      "name": "tapiGetLocationInfoA",
+      "argCount": 2
+    },
+    {
+      "name": "tapiGetLocationInfoW",
+      "argCount": 2
+    },
+    {
+      "name": "tapiRequestMakeCall",
+      "argCount": 4
+    },
+    {
+      "name": "tapiRequestMakeCallA",
+      "argCount": 4
+    }
+  ]
+}

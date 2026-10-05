@@ -7,7 +7,7 @@
 
 import { BaseComObject, ComObjectFactory } from './base-com-object';
 import { Logger, LogCategory } from '../logger';
-import { InterfaceDescriptor, ModuleDescriptor } from '../../api/types';
+import { ModuleDescriptor } from '../../api/types';
 
 export interface InterfaceMapping {
     iid: string;
@@ -15,6 +15,8 @@ export interface InterfaceMapping {
     moduleName: string;
     supportedInterfaces: string[]; // Additional IIDs this class supports
 }
+
+const IID_IUNKNOWN = "00000000-0000-0000-C000-000000000046";
 
 export class InterfaceRegistry {
     private static instance: InterfaceRegistry;
@@ -50,17 +52,18 @@ export class InterfaceRegistry {
     registerFromModuleDescriptor(module: ModuleDescriptor): void {
         if (!module.interfaces) return;
 
+        // `supportedInterfaces` is IUnknown only. QueryInterface never consults this registry
+        // — every object answers from its own IID plus queryAdditionalInterfaces, and ddraw
+        // has its own tear-off table — so deriving an inheritance chain here would decide
+        // nothing while emitting a warning per interface.
         for (const iface of module.interfaces) {
             if (!iface.iid) continue;
-
-            // Build supported interfaces list (inheritance chain)
-            const supportedInterfaces = this.buildSupportedInterfaces(iface);
 
             this.register({
                 iid: iface.iid,
                 className: iface.name,
                 moduleName: module.name,
-                supportedInterfaces
+                supportedInterfaces: [IID_IUNKNOWN],
             });
         }
     }
@@ -123,27 +126,6 @@ export class InterfaceRegistry {
      */
     getRegisteredIIDs(): string[] {
         return Array.from(this.mappings.keys());
-    }
-
-    /**
-     * Build the list of supported interfaces for an interface (inheritance chain)
-     */
-    private buildSupportedInterfaces(iface: InterfaceDescriptor): string[] {
-        const supported = new Set<string>();
-
-        // Add base IUnknown
-        supported.add("00000000-0000-0000-C000-000000000046"); // IUnknown
-
-        // Add inherited interfaces recursively
-        if (iface.inherits) {
-            const parentMapping = this.getMapping(iface.inherits);
-            if (parentMapping) {
-                supported.add(parentMapping.iid);
-                parentMapping.supportedInterfaces.forEach(iid => supported.add(iid));
-            }
-        }
-
-        return Array.from(supported);
     }
 
     private normalizeIid(iid: string): string {

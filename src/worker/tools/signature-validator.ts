@@ -10,6 +10,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as ts from 'typescript';
 
+/** `IFoo_Method` — a COM vtable slot, declared as an Interface/method pair rather than a flat export. */
+// Case-insensitive: the implementation table lowercases its keys while the descriptors
+// are written in the SDK's casing, so a case-sensitive test silently matches neither.
+const COM_METHOD_NAME = /^i[a-z0-9][a-z0-9]*_[a-z0-9_]+$/i;
+
 export interface ValidationResult {
     moduleName: string;
     valid: boolean;
@@ -372,6 +377,16 @@ export class SignatureValidator {
         let hasStackCleanup = false;
         let hasReturnValue = false;
 
+        /** A `return` belonging to a NESTED function is not this thunk's return value. The walk
+         *  must stop at every function boundary: a handler whose local helper returns
+         *  `{ addr, fvf }` is otherwise reported as a ThunkResult missing `stackCleanup`, and a
+         *  false positive here trains the reader to ignore the one real one. */
+        const isNestedFunction = (n: ts.Node): boolean =>
+            ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)
+            || ts.isArrowFunction(n) || ts.isMethodDeclaration(n)
+            || ts.isGetAccessor(n) || ts.isSetAccessor(n) || ts.isClassDeclaration(n)
+            || ts.isClassExpression(n);
+
         const checkReturn = (n: ts.Node) => {
             if (ts.isReturnStatement(n) && n.expression) {
                 hasReturnValue = true;
@@ -386,7 +401,10 @@ export class SignatureValidator {
                     }
                 }
             }
-            ts.forEachChild(n, checkReturn);
+            ts.forEachChild(n, (child) => {
+                if (isNestedFunction(child)) return;
+                checkReturn(child);
+            });
         };
 
         // Arrow functions might have an implicit return (no block)
@@ -403,7 +421,12 @@ export class SignatureValidator {
                 }
             }
         } else {
-            ts.forEachChild(node.body, checkReturn);
+            // Guarded entry, same rule as the recursion: a helper declared at the top of the
+            // body is still a nested function, and its returns are not this thunk's.
+            ts.forEachChild(node.body, (child) => {
+                if (isNestedFunction(child)) return;
+                checkReturn(child);
+            });
         }
 
         const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart());
@@ -579,6 +602,7 @@ export class SignatureValidator {
         const apiContent = fs.readFileSync(apiFile, 'utf-8');
         const apiFunctions = this.extractApiFunctions(apiFile, apiContent);
         const apiInterfaces = this.extractApiInterfaces(apiFile, apiContent);
+        let unverifiable = 0;
 
         // Build set of implemented function names (lowercase for case-insensitive check)
         const implementedNames = new Set(implemented.map(f => f.name.toLowerCase()));
@@ -601,13 +625,33 @@ export class SignatureValidator {
             }
 
             if (expectedArgs === undefined) {
-                // If it's a D3D9 method, it might be in a different format, skip for now
-                if (moduleName === 'd3d9' || moduleName === 'dsound') continue;
-
+                // Two very different things reach here, and reporting them as one is why this
+                // warning fired 297 times — the whole of the gate's warning output — and was
+                // silenced for two modules by NAME rather than by mechanism. A check that
+                // calls its entire input suspect says the same as a check that says nothing:
+                // the one real finding in that list (an implemented export absent from its
+                // .api.ts, and therefore unreachable) stayed invisible until a title went
+                // silent.
+                //
+                // A COM vtable method is declared as an Interface/method pair, and
+                // extractApiInterfaces openly cannot enumerate a method list built by a
+                // computed spread. So for those names this check is UNVERIFIABLE, not failing,
+                // and it must say so — the same vocabulary the export-binding section uses.
+                //
+                // A flat export missing from the descriptor is a real finding, but state it
+                // no harder than it is: APIRegistry.getArgCount ends in an `@N` parse, so a
+                // decorated stdcall name still binds — undeclared, its ABI is INFERRED from
+                // the name rather than stated. An undecorated one has nothing to infer from:
+                // a static import cannot be given a stub at all, and GetProcAddress hands out
+                // a RET-0 stub for what may be a stdcall export.
+                if (COM_METHOD_NAME.test(impl.name)) {
+                    unverifiable++;
+                    continue;
+                }
                 warnings.push({
                     type: 'incomplete_implementation',
                     functionName: impl.name,
-                    message: `Function implemented but not found in ${path.basename(apiFile)}`
+                    message: `implemented but NOT DECLARED in ${path.basename(apiFile)} — nothing states its ABI, so the loader must infer one from the name or refuse the import`
                 });
                 continue;
             }
@@ -761,9 +805,42 @@ export class SignatureValidator {
         return interfaces;
     }
 
-    private extractApiFunctions(apiFile: string, apiContent: string): Record<string, number> {
+    /**
+     * Name → argCount for everything an `*.api.ts` declares. By default this covers
+     * both `ModuleDescriptor.functions` (flat DLL exports) and `InterfaceDescriptor`
+     * methods (keyed `Iface_Method`); `modulesOnly` restricts it to the DLL exports,
+     * which is what a PE import table can actually name.
+     */
+    public extractApiFunctions(apiFile: string, apiContent: string, opts?: { modulesOnly?: boolean }): Record<string, number> {
         const apiFunctions: Record<string, number> = {};
         const sourceFile = ts.createSourceFile(apiFile, apiContent, ts.ScriptTarget.Latest, true);
+
+        // Which POSITION carries the arity, per locally declared helper. The generic
+        // helper rule below reads argument 1, but a helper may take the ordinal there
+        // (`ordinal("MsiGetPropertyW", 74, 4)`) — and then the ordinal is read as an
+        // arity of 74. The helper's own parameter names say which slot is the arity.
+        const helperArityIndex: Map<string, number> = new Map();
+        const ARITY_PARAM = /^(argcount|argc|nargs|paramcount|numargs)$/i;
+
+        const collectHelperShapes = (node: ts.Node) => {
+            let name: string | null = null;
+            let params: readonly ts.ParameterDeclaration[] | null = null;
+            if (ts.isVariableDeclaration(node) && node.initializer
+                && (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+                && ts.isIdentifier(node.name)) {
+                name = node.name.text;
+                params = node.initializer.parameters;
+            } else if (ts.isFunctionDeclaration(node) && node.name) {
+                name = node.name.text;
+                params = node.parameters;
+            }
+            if (name && params) {
+                const at = params.findIndex((p) => ts.isIdentifier(p.name) && ARITY_PARAM.test(p.name.text));
+                if (at > 0) helperArityIndex.set(name, at);
+            }
+            ts.forEachChild(node, collectHelperShapes);
+        };
+        collectHelperShapes(sourceFile);
 
         // Collect ordinal arrays like WSOCK_ORDINALS: Array<{ name: string; ordinal: number; argCount: number }>
         const ordinalArrays: Map<string, Array<{ name: string; argCount: number }>> = new Map();
@@ -799,6 +876,21 @@ export class SignatureValidator {
             ts.forEachChild(node, collectOrdinalArrays);
         };
         collectOrdinalArrays(sourceFile);
+
+        // Descriptors routinely keep groups of exports in a named array and spread it into
+        // `functions` (comctl32's image-list block, msvcrt's UCRT block). Without resolving
+        // the spread this scan reads those groups as absent, and every export in them then
+        // looks undeclared to the coverage index — silently, which is the worst way for a
+        // census to be wrong.
+        const namedArrays: Map<string, ts.ArrayLiteralExpression> = new Map();
+        const collectNamedArrays = (node: ts.Node) => {
+            if (ts.isVariableDeclaration(node) && node.initializer
+                && ts.isArrayLiteralExpression(node.initializer) && ts.isIdentifier(node.name)) {
+                namedArrays.set(node.name.text, node.initializer);
+            }
+            ts.forEachChild(node, collectNamedArrays);
+        };
+        collectNamedArrays(sourceFile);
 
         const addFunction = (name: string, argCount: number): void => {
             if (!name) return;
@@ -845,6 +937,7 @@ export class SignatureValidator {
             }
         };
 
+        const spreadArraysSeen = new Set<ts.ArrayLiteralExpression>();
         const extractFunctionsFromArray = (node: ts.Node): void => {
             if (!ts.isArrayLiteralExpression(node)) return;
             for (const element of node.elements) {
@@ -861,11 +954,12 @@ export class SignatureValidator {
                         // Generic helper pattern: anyHelper("funcName", [...params], ...)
                         // The second arg is a params array — count its elements
                         const funcName = getStringLiteral(element.arguments[0]);
-                        const paramsArg = element.arguments[1];
-                        if (funcName && ts.isArrayLiteralExpression(paramsArg)) {
+                        const arityAt = helperArityIndex.get(calleeName);
+                        const paramsArg = arityAt !== undefined ? element.arguments[arityAt] : element.arguments[1];
+                        if (funcName && paramsArg && ts.isArrayLiteralExpression(paramsArg)) {
                             addFunction(funcName, paramsArg.elements.length);
                         } else if (funcName) {
-                            const argCount = getNumberLiteral(element.arguments[1]);
+                            const argCount = getNumberLiteral(paramsArg);
                             if (argCount !== null) {
                                 addFunction(funcName, argCount);
                             }
@@ -876,6 +970,14 @@ export class SignatureValidator {
                 // Handle spread elements like ...WSOCK_ORDINALS.map(...)
                 if (ts.isSpreadElement(element)) {
                     const spreadExpr = element.expression;
+                    // `...localGroup` — a named array of descriptors declared in this file.
+                    if (ts.isIdentifier(spreadExpr)) {
+                        const group = namedArrays.get(spreadExpr.text);
+                        if (group && !spreadArraysSeen.has(group)) {
+                            spreadArraysSeen.add(group);
+                            extractFunctionsFromArray(group);
+                        }
+                    }
                     // Check for ARRAY.map(...) pattern
                     if (ts.isCallExpression(spreadExpr) &&
                         ts.isPropertyAccessExpression(spreadExpr.expression) &&
@@ -897,6 +999,7 @@ export class SignatureValidator {
                 if (!ts.isObjectLiteralExpression(element)) continue;
                 let funcName: string | null = null;
                 let paramCount: number | null = null;
+                let ordinal: number | null = null;
                 for (const prop of element.properties) {
                     if (!ts.isPropertyAssignment(prop)) continue;
                     const propName = ts.isIdentifier(prop.name) ? prop.name.text : null;
@@ -904,10 +1007,18 @@ export class SignatureValidator {
                         funcName = getStringLiteral(prop.initializer);
                     } else if (propName === 'params' && ts.isArrayLiteralExpression(prop.initializer)) {
                         paramCount = prop.initializer.elements.length;
+                    } else if (propName === 'ordinal') {
+                        ordinal = getNumberLiteral(prop.initializer);
                     }
                 }
                 if (funcName && paramCount !== null) {
                     addFunction(funcName, paramCount);
+                    // An `ordinal:` declaration makes the export reachable by ordinal ALONE —
+                    // dsound/dplayx ship most of theirs nameless. The loader resolves ordinal N
+                    // through this same descriptor, and modules register the handler under the
+                    // `ord_N` spelling the import table hands them. One declaration, two legal
+                    // names: register both, or every by-ordinal export reads as undeclared.
+                    if (ordinal !== null) addFunction(`ord_${ordinal}`, paramCount);
                 }
             }
         };
@@ -920,7 +1031,7 @@ export class SignatureValidator {
                         : null;
                 const varName = ts.isIdentifier(node.name) ? node.name.text : null;
 
-                if (typeName === 'InterfaceDescriptor') {
+                if (typeName === 'InterfaceDescriptor' && !opts?.modulesOnly) {
                     let interfaceName = varName ?? '';
                     for (const prop of node.initializer.properties) {
                         if (!ts.isPropertyAssignment(prop)) continue;
@@ -1014,7 +1125,10 @@ export function validateSignatures(apiDir: string = 'src/worker/api', modulesDir
 
         console.log(`\nModule: ${result.moduleName}`);
         console.log(`Status: ${result.valid ? '✅ PASS' : '❌ FAIL'}`);
-        console.log(`Functions: ${result.stats.totalFunctions} implemented`);
+        // "in its own files" is load-bearing: a module that merges another's table
+        // (imagehlp ← createDbgHelpExports) binds far more than this pass can see. The
+        // export-binding section of validate-signatures is what counts the real table.
+        console.log(`Functions: ${result.stats.totalFunctions} handlers in its own files`);
 
         if (result.errors.length > 0) {
             console.log('Errors:');

@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "name": "ps_1_4_texdepth",
+      "asm": "ps_1_4\ntexcrd r5.xyz, t0\nphase\ntexdepth r5\nmov r0, c0\n",
+      "tokens": [
+        "0xffff0104", "0x00000040", "0x80070005", "0xb0e40000", "0x0000fffd", "0x00000057",
+        "0x800f0005", "0x00000001", "0x800f0000", "0xa0e40000", "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_3_texm3x2depth",
+      "asm": "ps_1_3\ntex t0\ntexm3x2pad t1, t0\ntexm3x2depth t2, t0\nmov r0, c0\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000047", "0xb00f0001", "0xb0e40000",
+        "0x00000054", "0xb00f0002", "0xb0e40000", "0x00000001", "0x800f0000", "0xa0e40000",
+        "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_3_texm3x3",
+      "asm": "ps_1_3\ntex t0\ntexm3x3pad t1, t0\ntexm3x3pad t2, t0\ntexm3x3 t3, t0\nmov r0, t3\n",
+      "tokens": [
+        "0xffff0103", "0x00000042", "0xb00f0000", "0x00000049", "0xb00f0001", "0xb0e40000",
+        "0x00000049", "0xb00f0002", "0xb0e40000", "0x00000056", "0xb00f0003", "0xb0e40000",
+        "0x00000001", "0x800f0000", "0xb0e40003", "0x0000ffff"
+      ]
+    },
+    {
+      "name": "ps_1_4_bem",
+      "asm": "ps_1_4\ntexcrd r1.xyz, t0\ntexcrd r2.xyz, t1\nbem r3.rg, r1, r2\nphase\nmov r0.rg, r3\nmov r0.ba, c0\n",
+      "tokens": [
+        "0xffff0104", "0x00000040", "0x80070001", "0xb0e40000", "0x00000040", "0x80070002",
+        "0xb0e40001", "0x00000059", "0x80030003", "0x80e40001", "0x80e40002", "0x0000fffd",
+        "0x00000001", "0x80030000", "0x80e40003", "0x00000001", "0x800c0000", "0xa0e40000",
+        "0x0000ffff"
+      ]
+    }
+  ]
+}

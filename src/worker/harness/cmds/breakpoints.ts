@@ -9,20 +9,75 @@
  * require JIT OFF — breakOn auto-calls dbg.enable() and warns that perf
  * collapses while armed. API breakpoints do NOT need JIT off → prefer them for
  * bring-up. Addresses inside the async-park spin loop are refused.
+ *
+ * SECOND hard constraint, and the one that produces silent zeroes: an EIP breakpoint
+ * only fires when the address is a v86 BLOCK ENTRY (the wasm hook runs once per block,
+ * and blocks end at call/ret/out/far or page-crossing flow, not at jmp/jcc). A bp on a
+ * mid-function instruction never fires however often the code runs — with JIT off just
+ * the same as with `fast:true`. Arm the function ENTRY (breakOnExport/breakOnSymbol do
+ * this by construction) and use trapWrites for "who writes this address".
  */
 
 import type { HarnessService, HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import { sys, proc } from "../serialize";
+import { guestTrace } from "../guest-trace";
+import type { RegisterRead } from "../serialize";
+import { sys, proc, symbolize } from "../serialize";
 import { dbg } from "../../core/debug/dbg-commands";
 import { apiBreaks } from "../api-breaks";
-import { eipBreaks, type BreakWhen } from "../eip-breaks";
+import { eipBreaks, type BreakWhen, type BreakCapture } from "../eip-breaks";
+import { breakEvents } from "../break-events";
 import { symbolMap } from "../symbol-map";
+
+/**
+ * What the wasm holds AFTER a trace was armed. An instruction trace only exists on the
+ * INTERPRETER path — `dbg_on_instruction` is not emitted from JIT'd blocks — so a run with
+ * JIT still enabled reports "armed" and then captures nothing, which reads downstream as
+ * "the guest executed none of it". Returning the live knobs makes the two distinguishable.
+ */
+function traceArmReadback(exports: Record<string, unknown>): {
+    jitDisabled: number | null; stepRemaining: number | null; stepOnBp: number | null;
+} {
+    const num = (f: unknown, ...a: number[]): number | null =>
+        typeof f === "function" ? ((f as (...x: number[]) => number)(...a) >>> 0) : null;
+    return {
+        jitDisabled: num(exports.get_jit_config, 0),
+        stepRemaining: num(exports.dbg_step_remaining),
+        stepOnBp: num(exports.dbg_get_step_on_bp),
+    };
+}
 
 function toAddr(x: number | string): number {
     if (typeof x === "number") return x >>> 0;
     const s = String(x).trim();
     return (s.startsWith("0x") || s.startsWith("0X") ? parseInt(s.slice(2), 16) : parseInt(s, 16)) >>> 0;
+}
+
+/** Resolve a breakpoint target: a raw EIP, `module+0xRVA`, or `module!Export`. Module bases
+ *  come from the live registry, so a script written against one run works in the next. */
+function resolveGuestTarget(target: unknown): number {
+    if (typeof target === "number") return target >>> 0;
+    const s = String(target ?? "").trim();
+    if (!s) throw new HarnessError("reached expects an address, 'mod+0xRVA' or 'mod!Export'", HarnessErrorCode.BAD_ARGS);
+    const bang = s.indexOf("!");
+    if (bang > 0) {
+        // The extension is kept: getByName refuses to answer a ".dll" request with the main
+        // EXE (hl.dll vs hl.exe), and stripping it hands back the wrong image's export.
+        const mod = s.slice(0, bang);
+        const exp = s.slice(bang + 1);
+        const addr = (proc()?.moduleRegistry as any)?.getExportAddress?.(mod, exp);
+        if (addr === undefined) throw new HarnessError(`export ${mod}!${exp} not found (module loaded yet?)`, HarnessErrorCode.NOT_FOUND);
+        return addr >>> 0;
+    }
+    const plus = s.indexOf("+");
+    if (plus > 0) {
+        const name = s.slice(0, plus).trim();
+        const mod = (proc()?.moduleRegistry as any)?.getByName?.(name);
+        if (!mod) throw new HarnessError(`module '${name}' not loaded`, HarnessErrorCode.NOT_FOUND);
+        const rva = toAddr(s.slice(plus + 1).trim());
+        return (mod.baseAddress + rva) >>> 0;
+    }
+    return toAddr(s);
 }
 
 /** Refuse EIP breakpoints inside the async-park spin loop. */
@@ -37,7 +92,7 @@ function assertNotSpinLoop(addr: number): void {
 
 /** Arm an awaitable EIP breakpoint (auto JIT-off). Resolves on hit, or returns
  *  immediately when continuous. */
-function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pause?: boolean; when?: BreakWhen; fast?: boolean }, extra: Record<string, unknown>): Promise<unknown> {
+function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pause?: boolean; when?: BreakWhen; capture?: BreakCapture; fast?: boolean }, extra: Record<string, unknown>): Promise<unknown> {
     assertNotSpinLoop(addr);
     let warning: string;
     if (opts.fast) {
@@ -51,13 +106,27 @@ function armEip(addr: number, ctx: HarnessCtx, opts: { continuous?: boolean; pau
         dbg.bp(addr);        // arm the wasm interpreter breakpoint (persists across reloads via cfg)
         warning = "JIT is OFF while this breakpoint is armed — emulator perf collapses. clearBreaks() to restore.";
     }
+    warning += opts.pause === false
+        ? " pause:false — the guest keeps running through the hit."
+        : " THE GUEST IS PAUSED AT THE HIT and stays stopped until resume(): every later" +
+          " observation (frame counters, screenshots, other breakpoints) then reads a frozen" +
+          " game and reports nothing happening. Pass pause:false to just ask whether the" +
+          " address is reached.";
+    warning += " BLOCK ENTRIES ONLY: this fires only if the address is where v86 starts a block " +
+        "(function entry / after a call or ret). A mid-function instruction NEVER fires even while the " +
+        "code runs — 0 hits is not evidence it did not execute. For 'who writes X', use trapWrites." +
+        " Every hit carries `callsite` (retAddr + retAddrTrust + module-labelled backtrace + stack) and is " +
+        "recorded in the worker ring — read it with breakEvents(), which outlives whatever armed the break.";
     return new Promise((resolve) => {
         const id = eipBreaks.arm(addr, {
             runId: ctx.runId,
             once: !opts.continuous,
             pause: opts.pause !== false,
             when: opts.when,
-            onHit: opts.continuous ? undefined : (snap) => resolve({ hit: snap, addr: addr >>> 0, warning, ...extra }),
+            capture: opts.capture,
+            onHit: opts.continuous ? undefined : (snap) => resolve({
+                hit: snap, addr: addr >>> 0, paused: opts.pause !== false, warning, ...extra,
+            }),
         });
         if (opts.continuous) resolve({ armed: true, id, addr: addr >>> 0, continuous: true, warning, ...extra });
         ctx.signal.addEventListener("abort", () => eipBreaks.disarm(id), { once: true });
@@ -76,7 +145,7 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         const name = String(args[0] ?? "");
         const bang = name.indexOf("!");
         if (bang < 0) throw new HarnessError("breakOnExport expects 'module!Export'", HarnessErrorCode.BAD_ARGS);
-        const mod = name.slice(0, bang).replace(/\.dll$/i, "");
+        const mod = name.slice(0, bang);   // extension kept — see resolveGuestTarget
         const exp = name.slice(bang + 1);
         const mr: any = proc()?.moduleRegistry as any;
         const addr = mr?.getExportAddress?.(mod, exp);
@@ -92,20 +161,86 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return armEip(addr, ctx, (args[1] ?? {}) as any, { kind: "symbol", symbol: name });
     });
 
-    /** breakOnApi('d3d9.*' | '*DrawPrimitive*' | 'Direct3DCreate9') — JS layer, no JIT off. */
+    /** breakOnApi('d3d9.*' | '*DrawPrimitive*' | 'Direct3DCreate9') — JS layer, no JIT off.
+     *  `argEq: {index, value}` narrows to one call among many (`breakOnApi('user32:LoadStringA',
+     *  {argEq:{index:1, value:137}})` catches the one interesting string id out of 400).
+     *  `capture.reads` settles register-relative reads AT the hit — the caller's object is
+     *  usually in a REGISTER (`this` in ECX, an engine wrapper in ESI), and nothing read after
+     *  the thunk returns describes that frame any more. */
     svc.register("breakOnApi", (args, ctx) => {
         const pattern = String(args[0] ?? "");
         if (!pattern) throw new HarnessError("breakOnApi expects a pattern", HarnessErrorCode.BAD_ARGS);
-        const opts = (args[1] ?? {}) as { continuous?: boolean };
+        const opts = (args[1] ?? {}) as {
+            continuous?: boolean;
+            argEq?: { index: number; value: number };
+            capture?: { reads?: RegisterRead[] };
+        };
+        if (opts.argEq && (typeof opts.argEq.index !== "number" || typeof opts.argEq.value !== "number")) {
+            throw new HarnessError("breakOnApi argEq expects {index:number, value:number}", HarnessErrorCode.BAD_ARGS);
+        }
         return new Promise((resolve) => {
             const id = apiBreaks.arm(pattern, {
                 runId: ctx.runId,
                 continuous: !!opts.continuous,
+                argEq: opts.argEq,
+                reads: opts.capture?.reads,
                 onHit: opts.continuous ? undefined : (snap) => resolve({ hit: snap, pattern }),
             });
             if (opts.continuous) resolve({ armed: true, id, pattern, continuous: true });
             ctx.signal.addEventListener("abort", () => apiBreaks.disarm(id), { once: true });
         });
+    });
+
+    /**
+     * reached('mod+0xRVA' | 'mod!Export' | 0xEIP, {ms?=8000}) — did the guest execute this?
+     *
+     * The one-line form of "walk the guest's own control flow": arm a FAST, NON-PAUSING
+     * breakpoint, wait, and answer `reached: true|false`. Hand-rolling this over breakOn is
+     * how the answer goes wrong twice — `run()` RESOLVES with ok:false on a step timeout (so
+     * a bare await reads every address as reached), and breakOn's default PAUSES the guest on
+     * the hit, after which every subsequent probe reads a frozen game and reports "not
+     * reached". Both are settled here, and the verdict carries its own timeout so a miss is a
+     * miss and not a stall.
+     *
+     * Module-relative targets are resolved against the LIVE base, so the same call survives a
+     * reload. Same block-entry rule as breakOn: arm a function ENTRY.
+     */
+    svc.register("reached", async (args, ctx) => {
+        const target = args[0];
+        const opts = (args[1] ?? {}) as { ms?: number };
+        const ms = Math.max(1, Number(opts.ms ?? 8000));
+        const addr = resolveGuestTarget(target);
+        const t0 = Date.now();
+        // A refused arm makes every answer below "not reached" — i.e. "the guest never
+        // executed this" — for an address nothing was ever watching.
+        if (!dbg.bpFast(addr)) {
+            throw new HarnessError(
+                `cannot arm a fast breakpoint at 0x${addr.toString(16)} (v86 debug exports unavailable — no guest running, or a build without the page gate); ` +
+                "`reached:false` from an unarmed breakpoint would be indistinguishable from 'did not execute'",
+                HarnessErrorCode.UNSUPPORTED,
+            );
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const id = { v: -1 };
+        // eipBreaks.disarm clears the wasm bp (and its page gate) once the last JS entry
+        // goes, so a timeout does not leave this page interpreted for the session.
+        const cleanup = () => { if (id.v >= 0) { eipBreaks.disarm(id.v); id.v = -1; } };
+        const onAbort = () => { cleanup(); };
+        ctx.signal.addEventListener("abort", onAbort, { once: true });
+        const hit = await new Promise<boolean>((resolve) => {
+            timer = setTimeout(() => resolve(false), ms);
+            id.v = eipBreaks.arm(addr, {
+                runId: ctx.runId,
+                once: true,
+                pause: false,
+                onHit: () => resolve(true),
+            });
+        });
+        if (timer) clearTimeout(timer);
+        ctx.signal.removeEventListener("abort", onAbort);
+        cleanup();
+        return { target: typeof target === "number" ? `0x${(target >>> 0).toString(16)}` : String(target),
+            addr: addr >>> 0, addrHex: `0x${addr.toString(16)}`, reached: hit, waitedMs: Date.now() - t0, timeoutMs: ms };
     });
 
     /** watchMem(addr, {indirect?}) — arm a wasm memory watch (value logged in [DBG]
@@ -118,13 +253,14 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return { armed: true, addr, note: "watched value appears in [DBG] traces — use streamLogs(['SYSTEM']) to observe; JIT is OFF" };
     });
 
-    /** headWatch(headAddr, loEip, hiEip) — TEMP crash-hunt: snapshot a guest list head
+    /** headWatch(headAddr, loEip, hiEip, threadId?) — TEMP crash-hunt: snapshot a guest list head
      *  across context switches, log switch-outs mid-mutation and torn (0) states.
      *  JIT stays ON (deterministic-preserving). headWatch(0) disarms. */
     svc.register("headWatch", (args) => {
         const headAddr = toAddr(args[0] as number | string);
         const loEip = args[1] != null ? toAddr(args[1] as number | string) : 0;
         const hiEip = args[2] != null ? toAddr(args[2] as number | string) : 0;
+        const threadId = args[3] != null ? Number(args[3]) | 0 : 0;
         const sched: any = sys().scheduler as any;
         if (typeof sched?.setDebugHeadWatch !== "function") throw new HarnessError("scheduler.setDebugHeadWatch unavailable", HarnessErrorCode.BAD_ARGS);
         sched.setDebugHeadWatch(headAddr, loEip, hiEip);
@@ -132,8 +268,48 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         if (disp) {
             disp.hcWatchAddr = headAddr >>> 0;
             disp.hcRingEnabled = !!headAddr;            // arm/disarm the hot-path hypercall ring with the watch
+            disp.hcRingThreadFilter = threadId;
         }
-        return { armed: !!headAddr, headAddr, loEip, hiEip, note: "events captured to scheduler ring — read with `headWatchDump`; head sampled per-hypercall in report.lastHypercalls" };
+        return { armed: !!headAddr, headAddr, loEip, hiEip, threadId, note: "events captured to scheduler ring — read with `headWatchDump`; head sampled per-hypercall in report.lastHypercalls" };
+    });
+
+    /** wordWatch(addr) — sample one guest dword at scheduler tick boundaries with JIT on. */
+    svc.register("wordWatch", (args) => {
+        const addr = toAddr(args[0] as number | string);
+        const sched: any = sys().scheduler as any;
+        if (typeof sched?.setDebugWordWatch !== "function") throw new HarnessError("scheduler.setDebugWordWatch unavailable", HarnessErrorCode.BAD_ARGS);
+        sched.setDebugWordWatch(addr);
+        return { armed: !!addr, addr, note: "value transitions captured with TID/EIP; read with wordWatchDump" };
+    });
+
+    svc.register("wordWatchDump", () => {
+        const sched: any = sys().scheduler as any;
+        const events = typeof sched?.getDebugWordWatchLog === "function" ? sched.getDebugWordWatchLog() : [];
+        return { count: events.length, events };
+    });
+
+    /** writeWatch(addr, matchValue?, traceInstructions?) — exact last guest store to one dword using
+     *  v86's interpreted store path. A zero address disarms it. */
+    svc.register("writeWatch", (args) => {
+        const addr = toAddr(args[0] as number | string);
+        const matchValue = args[1] === undefined ? undefined : toAddr(args[1] as number | string);
+        const traceInstructions = args[2] === undefined ? 0 : toAddr(args[2] as number | string);
+        if (!dbg.writeWatch(addr, matchValue, traceInstructions)) throw new HarnessError("v86 write-watch exports unavailable", HarnessErrorCode.BAD_ARGS);
+        return { armed: !!addr, addr, matchValue, traceInstructions, note: "disable guest JIT for exact coverage; read with writeWatchReport" };
+    });
+
+    svc.register("writeWatchReport", () => {
+        const report = dbg.writeWatchReport();
+        if (!report) throw new HarnessError("v86 write-watch exports unavailable", HarnessErrorCode.BAD_ARGS);
+        return {
+            ...report,
+            lastEipSym: symbolize(report.lastEip),
+            lastPrevSym: symbolize(report.lastPrev),
+            zeroEipSym: symbolize(report.zeroEip),
+            zeroPrevSym: symbolize(report.zeroPrev),
+            matchEipSym: symbolize(report.matchEip),
+            matchPrevSym: symbolize(report.matchPrev),
+        };
     });
 
     /** xlate(vaddr) — compare physical (identity) read vs CPU paged translation of a guest
@@ -167,12 +343,72 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return { count: log.length, events: log, zeroFlips: zeros };
     });
 
-    /** step(n) — arm an interpreter trace of the next N instructions (-> [DBG] log). */
+    /** step(n) — arm an interpreter trace of the next N instructions, captured for guestTrace(). */
     svc.register("step", (args) => {
         const n = Math.max(1, Number(args[0] ?? 1) | 0);
+        // The wasm debug exports are a BUILD artifact: without them dbg.enable()/dbg.step() are
+        // silent no-ops and the verb would report a trace that was never armed.
+        const exports = (globalThis as { preemption?: { getWasmExports?: () => Record<string, unknown> | null } })
+            .preemption?.getWasmExports?.();
+        if (!exports?.dbg_arm_step) {
+            throw new HarnessError(
+                "wasm debug exports missing (dbg_arm_step) — rebuild vendor/v86 (build-wasm.sh); no trace was armed",
+                HarnessErrorCode.BAD_ARGS,
+            );
+        }
+        // Capture BEFORE arming: the wasm can emit its first line inside dbg.step().
+        guestTrace.start(Math.max(4096, n * 2));
+        guestTrace.noteRequested(n);
         dbg.enable();
         dbg.step(n);
-        return { armed: n, note: "instruction trace appears in [DBG] traces (console.error) — observe via streamLogs" };
+        return { armed: n, ...traceArmReadback(exports), note: "read the trace with guestTrace()" };
+    });
+
+    /**
+     * stepOnBp(n) — trace the next N instructions AFTER a breakpoint hits, armed inside the
+     * wasm rather than from JS.
+     *
+     * `step(n)` arms from the JS side, which means the guest must still be executing when the
+     * RPC lands; after an API break it often is not, and the trace comes back empty with no
+     * way to tell that from "the guest ran nothing interesting". This hands the arming to the
+     * breakpoint itself, and it also RESEATS the dbg config — `DBG_STEP_COUNTER` is what
+     * silences the hook once it passes DBG_MAX_DUMPS, and only a re-arm zeroes it.
+     */
+    svc.register("stepOnBp", (args) => {
+        const n = Math.max(1, Number(args[0] ?? 1) | 0);
+        const exports = (globalThis as { preemption?: { getWasmExports?: () => Record<string, unknown> | null } })
+            .preemption?.getWasmExports?.();
+        if (!exports?.dbg_set_step_on_bp) {
+            throw new HarnessError(
+                "wasm debug exports missing (dbg_set_step_on_bp) — rebuild vendor/v86; nothing was armed",
+                HarnessErrorCode.BAD_ARGS,
+            );
+        }
+        guestTrace.start(Math.max(8192, n * 4));
+        guestTrace.noteRequested(n);
+        // Deliberately NOT dbg.enable(): that turns the JIT off globally and the guest crawls
+        // for the whole boot. The hook only needs DBG_ENABLED, which the FAST breakpoint sets
+        // — so pair this with breakOn(addr, {fast:true}), whose page-gate interprets one page
+        // and leaves the rest at speed. Arm the count FIRST: a bp re-seats the whole config.
+        dbg.maxDumps(1_000_000);
+        dbg.stepOnBp(n);
+        return { armed: n, ...traceArmReadback(exports), note: "now arm breakOn(addr, {fast:true, pause:false}); the trace starts when it hits" };
+    });
+
+    /**
+     * guestTrace({limit, filter, clear, capacity}) — the guest-side diagnostics the wasm wrote
+     * to the worker's console.error (step traces, write-watch dumps).
+     *
+     * Those lines describe what the GUEST ran between two thunks, which is precisely the window
+     * a wild EIP lands in — and they used to reach only the worker's own console, where no log
+     * stream or archive could see them. `{clear:true}` empties the ring after reading.
+     */
+    svc.register("guestTrace", (args) => {
+        const opts = (args[0] ?? {}) as { limit?: number; filter?: string; clear?: boolean; capacity?: number };
+        if (opts.capacity) guestTrace.start(opts.capacity);
+        const out = guestTrace.read(opts.limit ?? 200, opts.filter);
+        if (opts.clear) guestTrace.clear();
+        return out;
     });
 
     /** loadSymbols(module, {name:rva,...}) — install a sidecar symbol map for breakOnSymbol. */
@@ -200,8 +436,92 @@ export function registerBreakpointCommands(svc: HarnessService): void {
         return { paused: false };
     });
 
+    /** captureAt(eip, specs, label?) — non-pausing EIP breakpoint that records register-relative
+     *  memory into globalThis.__bpcap on every hit (read via worker-eval). Sidesteps the
+     *  pause-wedge: JIT is OFF (eip bp) but the guest keeps running. Each spec:
+     *  { reg:'edi', off?:0, count?:1, deref?:false, sample?:0 } — base=reg+off; ptr=deref?*(base):base;
+     *  reads `count` dwords at ptr; if `sample`>0, counts non-zero bytes in [ptr, ptr+sample). */
+    svc.register("captureAt", (args, ctx) => {
+        const addr = toAddr(args[0] as number | string);
+        assertNotSpinLoop(addr);
+        interface CapSpec { reg: string; off?: number; count?: number; deref?: boolean; sample?: number; postOff?: number; eq?: number; ne?: number; ge?: number; lt?: number; path?: number[] }
+        const specs = (args[1] ?? []) as CapSpec[];
+        const label = String(args[2] ?? "cap");
+        const RI: Record<string, number> = { eax: 0, ecx: 1, edx: 2, ebx: 3, esp: 4, ebp: 5, esi: 6, edi: 7 };
+        dbg.enable(); dbg.bp(addr);
+        dbg.maxDumps(1_000_000);   // hot-address captures blow the 4000-line default silently
+        const g = globalThis as any;
+        const id = eipBreaks.arm(addr, {
+            runId: ctx.runId, once: false, pause: false, callsite: false,   // own recorder; armed at hot addresses
+            onHit: () => {
+                try {
+                    const c: any = proc()?.v86?.cpu ?? (proc() as any)?.v86?.v86?.cpu;
+                    const m: Uint8Array | undefined = (proc() as any)?.getCurrentMemory?.();
+                    if (!c?.reg32 || !m) return;
+                    const dv = new DataView(m.buffer, m.byteOffset, m.byteLength);
+                    const rU = (a: number) => (a >>> 0) + 4 <= m.length ? dv.getUint32(a >>> 0, true) >>> 0 : -1;
+                    const rec: any = { label, seq: (g.__seq = (g.__seq || 0) + 1) };
+                    for (const s of specs) {
+                        // Address resolution: `path` walks a deref chain (cur = *(cur+p) per hop);
+                        // legacy form is reg+off with one optional deref. postOff shifts the final ptr.
+                        let ptr: number;
+                        let key: string;
+                        if (s.path && s.path.length) {
+                            let cur = c.reg32[RI[s.reg]] >>> 0;
+                            for (const p of s.path) cur = rU((cur + (p | 0)) >>> 0) >>> 0;
+                            ptr = (cur + ((s.postOff ?? 0) | 0)) >>> 0;
+                            key = s.reg + "[" + s.path.join(",") + "]+" + ((s.postOff ?? 0) | 0);
+                        } else {
+                            const base = ((c.reg32[RI[s.reg]] >>> 0) + ((s.off ?? 0) | 0)) >>> 0;
+                            ptr = (((s.deref ? rU(base) : base) >>> 0) + ((s.postOff ?? 0) | 0)) >>> 0;
+                            key = s.reg + "+" + ((s.off ?? 0) | 0) + (s.deref ? "*" : "") + "+" + ((s.postOff ?? 0) | 0);
+                        }
+                        // eq/ne/ge/lt on a spec make it a FILTER: value at ptr must match or the whole hit is dropped.
+                        if (s.eq !== undefined || s.ne !== undefined || s.ge !== undefined || s.lt !== undefined) {
+                            const v = rU(ptr) >>> 0;
+                            if (s.eq !== undefined && v !== (s.eq >>> 0)) return;
+                            if (s.ne !== undefined && v === (s.ne >>> 0)) return;
+                            if (s.ge !== undefined && v < (s.ge >>> 0)) return;
+                            if (s.lt !== undefined && v >= (s.lt >>> 0)) return;
+                        }
+                        const vals: string[] = [];
+                        for (let k = 0; k < (s.count ?? 1); k++) vals.push("0x" + (rU((ptr + k * 4) >>> 0) >>> 0).toString(16));
+                        let nz: number | null = null;
+                        if (s.sample && ptr > 0x1000 && (ptr + s.sample) < m.length) { nz = 0; for (let i = 0; i < s.sample; i++) if (m[(ptr + i) >>> 0]) nz++; }
+                        rec[key] = { ptr: "0x" + (ptr >>> 0).toString(16), vals, nz };
+                    }
+                    (g.__bpcap ??= []).push(rec);
+                    if (g.__bpcap.length > 6000) g.__bpcap.shift();
+                } catch { /* */ }
+            },
+        });
+        return { armed: true, id, addr: addr >>> 0, note: "records to globalThis.__bpcap (JIT off, non-pausing)" };
+    });
+
+    /** breakEvents({since?, limit?, clear?, capacity?}) — every breakpoint hit this worker
+     *  recorded, EIP and API alike, newest last. The durable half of a continuous break:
+     *  hits land in the worker ring as they happen, so a reader that dies at its RPC/pageEval
+     *  timeout loses nothing — poll again with `since: lastSeq`. Reports `evicted` and an
+     *  explicit `gap` rather than silently returning a shorter list. */
+    svc.register("breakEvents", (args) => {
+        const opts = (args[0] ?? {}) as { since?: number; limit?: number; clear?: boolean; capacity?: number };
+        if (typeof opts.capacity === "number") breakEvents.setCapacity(opts.capacity);
+        const out = breakEvents.read({ since: opts.since, limit: opts.limit });
+        if (opts.clear) (out as Record<string, unknown>).cleared = breakEvents.clear();
+        return out;
+    });
+
     /** breaks() — list all armed breakpoints. */
-    svc.register("breaks", () => ({ api: apiBreaks.list(), eip: eipBreaks.list(), symbolMaps: symbolMap.loaded() }));
+    svc.register("breaks", () => {
+        const eip = eipBreaks.list();
+        return {
+            api: apiBreaks.list(),
+            eip: eip.map((e) => (e.hits === 0
+                ? { ...e, note: "0 hits — an EIP bp only fires at a v86 BLOCK ENTRY, so this may mean 'not a block entry', not 'never executed'" }
+                : e)),
+            symbolMaps: symbolMap.loaded(),
+        };
+    });
 
     /** clearBreaks() — disarm everything (and restore JIT via dbg.clear()). */
     svc.register("clearBreaks", () => {

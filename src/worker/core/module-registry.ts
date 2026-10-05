@@ -2,6 +2,7 @@
 // Tracks loaded PE modules (EXE + DLLs) with their exports for GetProcAddress, GetModuleHandle, etc.
 
 import { Logger, LogCategory } from './logger';
+import { MEM_ROM_BASE, MEM_ROM_SIZE, MEM_HLE_IMAGE_BASE } from './cpu/emulator-config';
 
 /**
  * Information about a loaded PE module (EXE or DLL)
@@ -45,14 +46,19 @@ export interface PESection {
 }
 
 /**
- * DLL base address allocation constants
- * ROM region starts at 0x13000000 to avoid conflicts with:
- * - EXE image: 0x00400000
- * - Heap: 0x03000000+
- * - Surfaces: 0x05000000+
- * - Thunks: 0x10000000+
+ * DLL images are rebased into the ROM bucket the layout reserves for PE images
+ * (emulator-config.ts). They must NOT share VA with HEAP: the kernel32 slab arena
+ * carves top-down from HEAP's limit and ZEROES what it takes, so an image mapped
+ * inside HEAP is wiped the moment heap growth reaches it — its vtables read back as
+ * 0 and the next virtual call jumps to NULL, hundreds of frames after the write.
+ * ROM sits above the red zone and no allocator carves from it, so the two frontiers
+ * can never meet.
  */
-const DLL_BASE_START = 0x13000000;
+const DLL_BASE_START = MEM_ROM_BASE;
+// The top of ROM is the HLE synthetic-image arena (emulator-config). Real DLLs stop
+// short of it: a slot there is pinned per module for the life of the process, so it must
+// never enter this allocator's bump range or its FreeLibrary free-list.
+const DLL_BASE_LIMIT = MEM_HLE_IMAGE_BASE;
 const DLL_BASE_ALIGNMENT = 0x10000; // 64KB alignment (Windows standard)
 
 /**
@@ -67,10 +73,33 @@ const DLL_BASE_ALIGNMENT = 0x10000; // 64KB alignment (Windows standard)
 export class ModuleRegistry {
     private modules = new Map<string, LoadedPEModule>();
     private byBase = new Map<number, LoadedPEModule>();
+    /** Image spans sorted by base; rebuilt lazily after any membership change.
+     *  getModuleContainingAddress is on the VirtualQuery path, which a pointer-validity
+     *  probe loop drives hundreds of thousands of times per boot — a sweep there is
+     *  O(modules) per probe. Images never overlap, so "last base <= addr" decides it. */
+    private spanIndex: Array<{ base: number; end: number; mod: LoadedPEModule }> | null = null;
     private nextDllBase = DLL_BASE_START;
+    /** VA returned by unregister(), first-fit reusable. See allocateBase. */
+    private freeDllRanges: Array<{ base: number; size: number }> = [];
 
+    /** A module is identified by the FILE it maps, so the key is the basename WITH its
+     *  extension — a load through a full path and a later import of the bare name are the
+     *  same module, but XIII.exe and Xiii.dll are two. Keying on the caller's spelling
+     *  instead loads a second copy of the image, and the two copies then have separate
+     *  statics: Hitman's gsc.dll registered its script host in "c:\gsc" while
+     *  hitmandlc.dlc called getHostInterface() on "gsc" and got NULL. Dropping the
+     *  extension collides an EXE with a DLL of the same name, which is the other half:
+     *  the import of `Xiii.dll` resolved to XIII.exe and every slot got the trap stub.
+     *
+     *  An extensionless name means ".dll" — the rule LoadLibrary/GetModuleHandle
+     *  document, and the one findDllPath already applies to the VFS lookup. */
     private normalizeModuleLookupKey(name: string): string {
-        return name.toLowerCase().replace(/\.(dll|exe)$/i, '');
+        const lower = name.toLowerCase();
+        const cut = Math.max(lower.lastIndexOf('/'), lower.lastIndexOf('\\'));
+        const base = cut >= 0 ? lower.slice(cut + 1) : lower;
+        // A trailing "." is Win32's "this name has no extension, do not append one".
+        if (base.endsWith('.')) return base.slice(0, -1);
+        return /\.\w+$/.test(base) ? base : `${base}.dll`;
     }
 
     /**
@@ -80,13 +109,19 @@ export class ModuleRegistry {
         const nameLower = this.normalizeModuleLookupKey(mod.name);
 
         // Check for duplicate registration
-        if (this.modules.has(nameLower)) {
+        const previous = this.modules.get(nameLower);
+        if (previous) {
             Logger.warn(LogCategory.SYSTEM,
                 `[ModuleRegistry] Module "${mod.name}" already registered, replacing`);
+            // The replaced module keeps its byBase entry otherwise, so getByBase(oldBase)
+            // keeps answering with a module no name resolves to any more — a live handle
+            // pointing at an image the registry no longer believes is loaded.
+            if (previous.baseAddress !== mod.baseAddress) this.byBase.delete(previous.baseAddress);
         }
 
         this.modules.set(nameLower, mod);
         this.byBase.set(mod.baseAddress, mod);
+        this.spanIndex = null;
 
         Logger.log(LogCategory.SYSTEM,
             `[ModuleRegistry] Registered "${mod.name}" at 0x${mod.baseAddress.toString(16)}, ` +
@@ -103,6 +138,8 @@ export class ModuleRegistry {
 
         this.modules.delete(nameLower);
         this.byBase.delete(mod.baseAddress);
+        this.spanIndex = null;
+        this.releaseBase(mod.baseAddress, mod.size);
         return true;
     }
 
@@ -110,26 +147,10 @@ export class ModuleRegistry {
      * Get module by name (case-insensitive, handles .dll extension)
      */
     getByName(name: string): LoadedPEModule | undefined {
-        const nameLower = name.toLowerCase();
-        // A ".dll" request must not resolve to the main EXE. The EXE is keyed by its
-        // bare basename (e.g. "hl" from hl.exe), which collides with a game DLL of the
-        // same basename ("hl.dll" → "hl"). Without this guard, LoadLibrary("…\hl.dll")
-        // returned the exe at 0x400000 and GetProcAddress("GiveFnptrsToDll") failed.
-        const wantsDll = /\.dll$/i.test(nameLower);
-        const acceptable = (m: LoadedPEModule | undefined): LoadedPEModule | undefined =>
-            (m && !(wantsDll && m.isExecutable)) ? m : undefined;
-
-        const existing = acceptable(this.modules.get(this.normalizeModuleLookupKey(nameLower)));
-        if (existing) return existing;
-
-        // Also try basename only — DLLs loaded via import table are registered
-        // by short name ("engine"), but LoadLibraryA passes full path ("c:\system\engine")
-        const lastSlash = Math.max(nameLower.lastIndexOf('/'), nameLower.lastIndexOf('\\'));
-        if (lastSlash >= 0) {
-            const basename = this.normalizeModuleLookupKey(nameLower.substring(lastSlash + 1));
-            return acceptable(this.modules.get(basename));
-        }
-        return undefined;
+        // The key is the basename with its extension, so a full-path request
+        // ("c:\system\engine.dll") and an import-table one ("engine.dll") land on the same
+        // entry, while "hl.dll" / "xiii.dll" cannot reach the hl.exe / XIII.exe module.
+        return this.modules.get(this.normalizeModuleLookupKey(name));
     }
 
     /**
@@ -169,12 +190,23 @@ export class ModuleRegistry {
      * Get module containing a given address (for GetModuleHandleEx with FROM_ADDRESS)
      */
     getModuleContainingAddress(addr: number): LoadedPEModule | undefined {
-        for (const mod of this.modules.values()) {
-            if (addr >= mod.baseAddress && addr < mod.baseAddress + mod.size) {
-                return mod;
+        let spans = this.spanIndex;
+        if (!spans) {
+            spans = [];
+            for (const mod of this.modules.values()) {
+                if (mod.size > 0) spans.push({ base: mod.baseAddress, end: mod.baseAddress + mod.size, mod });
             }
+            spans.sort((a, b) => a.base - b.base);
+            this.spanIndex = spans;
         }
-        return undefined;
+        let lo = 0, hi = spans.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (spans[mid]!.base <= addr) { last = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        if (last < 0) return undefined;
+        const s = spans[last]!;
+        return addr < s.end ? s.mod : undefined;
     }
 
     /** True when addr lies in a PE section marked IMAGE_SCN_MEM_WRITE (e.g. .data), not .text. */
@@ -230,13 +262,73 @@ export class ModuleRegistry {
         // Align image size to 64KB boundary
         const alignedSize = (imageSize + DLL_BASE_ALIGNMENT - 1) & ~(DLL_BASE_ALIGNMENT - 1);
 
+        // Reuse VA an unloaded module gave back before taking new ground: the bucket is
+        // bounded now, and a title that cycles LoadLibrary/FreeLibrary on the same DLL —
+        // a real pattern this runtime supports — would otherwise exhaust it in ~100 cycles
+        // and then fail every later load.
+        for (let i = 0; i < this.freeDllRanges.length; i++) {
+            const r = this.freeDllRanges[i];
+            if (r.size < alignedSize) continue;
+            const reused = r.base;
+            if (r.size === alignedSize) this.freeDllRanges.splice(i, 1);
+            else { r.base += alignedSize; r.size -= alignedSize; }
+            Logger.log(LogCategory.SYSTEM,
+                `[ModuleRegistry] Reused base 0x${reused.toString(16)} for DLL (size=0x${imageSize.toString(16)})`);
+            return reused;
+        }
+
         const base = this.nextDllBase;
+        // Running past the bucket would hand out SURFACE VA and corrupt texture pixels
+        // instead of failing — a LoadLibrary failure is the honest outcome.
+        if (base + alignedSize > DLL_BASE_LIMIT) {
+            throw new Error(
+                `ModuleRegistry: module VA exhausted (need 0x${alignedSize.toString(16)} at ` +
+                `0x${base.toString(16)}, limit 0x${DLL_BASE_LIMIT.toString(16)})`);
+        }
         this.nextDllBase += alignedSize;
 
         Logger.log(LogCategory.SYSTEM,
             `[ModuleRegistry] Allocated base 0x${base.toString(16)} for DLL (size=0x${imageSize.toString(16)})`);
 
         return base;
+    }
+
+    /**
+     * Give a module's VA back to the pool, coalescing with neighbours so a load/unload cycle
+     * cannot fragment the bucket into unusable slivers. Rewinding the bump pointer when the
+     * range is the topmost allocation keeps the common case (one DLL loaded and unloaded
+     * repeatedly) exactly as cheap as it was before the bucket had a limit.
+     */
+    private releaseBase(base: number, size: number): void {
+        const aligned = (size + DLL_BASE_ALIGNMENT - 1) & ~(DLL_BASE_ALIGNMENT - 1);
+        if (aligned <= 0 || base < DLL_BASE_START || base + aligned > DLL_BASE_LIMIT) return;
+        if (base + aligned === this.nextDllBase) {
+            this.nextDllBase = base;
+            // Absorb any free range that now sits at the top.
+            let merged = true;
+            while (merged) {
+                merged = false;
+                for (let i = 0; i < this.freeDllRanges.length; i++) {
+                    const r = this.freeDllRanges[i];
+                    if (r.base + r.size === this.nextDllBase) {
+                        this.nextDllBase = r.base;
+                        this.freeDllRanges.splice(i, 1);
+                        merged = true;
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+        this.freeDllRanges.push({ base, size: aligned });
+        this.freeDllRanges.sort((a, b) => a.base - b.base);
+        for (let i = this.freeDllRanges.length - 1; i > 0; i--) {
+            const prev = this.freeDllRanges[i - 1];
+            if (prev.base + prev.size === this.freeDllRanges[i].base) {
+                prev.size += this.freeDllRanges[i].size;
+                this.freeDllRanges.splice(i, 1);
+            }
+        }
     }
 
     /**
@@ -282,7 +374,9 @@ export class ModuleRegistry {
     reset(): void {
         this.modules.clear();
         this.byBase.clear();
+        this.spanIndex = null;
         this.nextDllBase = DLL_BASE_START;
+        this.freeDllRanges = [];
         Logger.log(LogCategory.SYSTEM, '[ModuleRegistry] Reset');
     }
 

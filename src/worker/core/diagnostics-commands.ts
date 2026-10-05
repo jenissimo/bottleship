@@ -12,9 +12,11 @@
  */
 
 import { frameVarianceDiagnostics } from './frame-variance-diagnostics';
+import { invalidateGuestCode, writeGuestCode } from './memory/guest-code';
 import { framePacer } from './frame-pacer';
 import { frameProfiler } from './frame-profiler';
 import { drawCostProfiler } from '../backends/webgpu/ddraw/draw-cost-profiler';
+import { lockCostProfiler } from '../modules/ddraw/lock-cost-profiler';
 import { Logger, LogCategory } from './logger';
 import { System } from './system';
 import { debugSession, watchThunk } from './debug/debug-session';
@@ -615,6 +617,26 @@ if (typeof globalThis !== 'undefined') {
         console.table(r.phases);
         return r;
     };
+    // Per-Lock cost profiler — the same shape for IDirectDrawSurface7_Lock/_Unlock, split
+    // by lock class. lockCostEnable() → play a window → lockCostReport().
+    (globalThis as any).lockCostEnable = () => {
+        lockCostProfiler.enable();
+        console.log('[lockCost] enabled — play a Lock-heavy scene, then lockCostReport()');
+    };
+    (globalThis as any).lockCostDisable = () => {
+        lockCostProfiler.disable();
+        console.log('[lockCost] disabled');
+    };
+    (globalThis as any).lockCostReset = () => {
+        lockCostProfiler.reset();
+        console.log('[lockCost] window reset');
+    };
+    (globalThis as any).lockCostReport = () => {
+        const r = lockCostProfiler.report();
+        console.log('[lockCost][JSON] ' + JSON.stringify(r));
+        for (const c of r.classes) console.table(c.phases);
+        return r;
+    };
     (globalThis as any).slowPathReport = slowPathReport;
     (globalThis as any).slowPathProfile = slowPathProfile;
     (globalThis as any).asyncParkReport = asyncParkReport;
@@ -904,7 +926,7 @@ if (typeof globalThis !== 'undefined') {
         if (narrHookActive) {
             // Unhook: restore original bytes
             for (const entry of narrHookSaved) {
-                mem.set(entry.bytes, entry.addr);
+                writeGuestCode(mem, entry.bytes, entry.addr);
                 console.log(`[NarrHook] Restored ${entry.label} at 0x${entry.addr.toString(16)}`);
             }
             narrHookSaved.length = 0;
@@ -954,6 +976,7 @@ if (typeof globalThis !== 'undefined') {
             mem[addr + 7] = (funcId >> 8) & 0xFF;
             mem[addr + 8] = (funcId >> 16) & 0xFF;
             mem[addr + 9] = (funcId >> 24) & 0xFF;
+            invalidateGuestCode(addr, 10);
 
             console.log(`[NarrHook] Patched ${label} @ 0x${addr.toString(16)} → canary write id=${funcId}`);
         }
@@ -1192,10 +1215,17 @@ if (typeof globalThis !== 'undefined') {
             });
         (rows as any).topEips = topEips;
 
+        // `top` says how many rows the CALLER wants back; it must not also decide how many
+        // reach the console. captureHotBlocksMark asks for every row (99999) so the trace
+        // mark is complete, and printing that many — console.table plus a JSON.stringify of
+        // the same array, each entry also forwarded to an attached CDP client — allocated
+        // enough to kill the worker outright on a long-running session, where the JIT cache
+        // is large and where profiling is most wanted. The rows returned are unaffected.
+        const printed = Math.min(top, rows.length, CONSOLE_ROW_CAP);
         console.log(`[dumpHotJitBlocks] ${count} JIT blocks, ${runningSamples} EIP samples in ${elapsed.toFixed(0)}ms, ${pagesRunning.size} unique hot pages, ${eipRunning.size} unique EIPs`);
-        console.log(`Top ${Math.min(top, rows.length)} JIT blocks (by EIP samples):`);
-        console.log('[dumpHotJitBlocks][JSON] ' + JSON.stringify({ count, runningSamples, hotPages: pagesRunning.size, rows: rows.slice(0, top) }));
-        console.table(rows.slice(0, top));
+        console.log(`Top ${printed} of ${rows.length} JIT blocks (by EIP samples):`);
+        console.log('[dumpHotJitBlocks][JSON] ' + JSON.stringify({ count, runningSamples, hotPages: pagesRunning.size, rows: rows.slice(0, printed) }));
+        console.table(rows.slice(0, printed));
         // Return the full table so callers can post-process or save it.
         return rows;
     };
@@ -1207,6 +1237,9 @@ Logger.log(LogCategory.SYSTEM, '[eipSample] Console API: eipSample(durationMs=30
 // saveHotJitBlocks: convenience wrapper — runs dumpHotJitBlocks, triggers a
 // file download of the full row array (not just top-N) so it can be fed to
 // analyze-trace.ts --map without copy-paste gymnastics.
+/** Most rows dumpHotJitBlocks will ever PRINT, whatever `top` the caller asked to receive. */
+const CONSOLE_ROW_CAP = 25;
+
 (globalThis as any).saveHotJitBlocks = async (durationMs = 3000, intervalMs = 5) => {
     const rows = await (globalThis as any).dumpHotJitBlocks?.(durationMs, intervalMs, 9999);
     if (!rows || !Array.isArray(rows)) {

@@ -17,8 +17,13 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   (File-level CoW lives in the OPFS overlay, not in paging.)
 - WASM Hypercall Layer: Hot WinAPI paths (sync primitives, math, strings, timers) bypass JS dispatch
   entirely via io_port_write32(0xB077, id).
-- Thread Scheduler: Cooperative + preemptive (1ms quantum). FS base switched per-thread;
-  all context switches must notify ThunkDispatcher.
+- Thread Scheduler: Cooperative + preemptive. The quantum is measured in RETIRED GUEST
+  INSTRUCTIONS (minQuantumMs x TARGET_INSN_PER_MS), not wall-clock, so a switch point is a
+  function of guest state rather than host speed. minQuantumMs is 16 — NT's client quantum,
+  not a tuning knob: preempting ~15x more often than the OS these titles were written
+  against turns benign guest races into reliable ones. Anything derived from it (the winmm
+  timer budget, insnQuantumFraction callers) must be DERIVED, not a parallel constant.
+  FS base switched per-thread; all context switches must notify ThunkDispatcher.
 
 3. Engineering Directives
 
@@ -52,13 +57,64 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   - Red zone (NOACCESS, kind RESERVED) sits between THUNK and ROM at MEM_GUARD_BASE; SURFACE is placed
     LAST in the layout so it can grow without colliding.
 - Permission Model:
-  - Enforce RX (read-execute), RW (read-write), NOACCESS at both JS accessor layer (Mem) and CPU page level.
-  - THUNK_CODE is immutable (RX only) — any write is a fatal corruption bug.
-  - Use #PF handler to catch illegal writes; fallback to checksums if page protection unreliable.
+  - RX / RW / NOACCESS are the GUEST's view, enforced at the CPU page level (PageTableManager) and
+    validated for guest-supplied pointers at the JS accessor layer (Mem). They do NOT constrain the
+    HLE layer: JS is the loader/linker and legitimately publishes executable bytes into THUNK_CODE,
+    CALLBACK_STUB, ROM (PE images) and occasionally HEAP.
+  - THUNK_CODE is MUTABLE by design — the ThunkGenerator bump arena grows for the life of the
+    process and ThunkDispatcher rewrites live stubs in place. Only the static sub-regions
+    (callback-stub pool, spin loop) are write-once, and those alone are checksum-guarded; a write
+    into the generator arena is normal operation, not corruption.
+  - GUEST-CODE COHERENCE — the binding rule. v86 caches compiled blocks per 4 KiB PHYSICAL page and
+    drops them only when it observes a GUEST store (TLB_HAS_CODE → jit_dirty_page). A JS write
+    through mem8 is invisible to it. Every JS write of bytes the guest may execute MUST go through
+    writeGuestCode() / invalidateGuestCode() (core/memory/guest-code.ts), and the invalidation must
+    be in the SAME JS TURN as the write — an await in between lets other guest threads re-JIT the
+    page. LoadLibrary* handlers are async, so PE loading is a run-time activity concurrent with
+    other threads, not a quiescent load-time one. Invalidation is page-granular, so one call covers
+    the whole write. Guest self-modifying code needs nothing from us. This depends on the identity
+    map (linear == physical); if paging ever stops being identity, every call site becomes wrong.
+  - #PF / MemWriteTrap catch GUEST illegal writes and are diagnostic. They cannot see a JS write —
+    there is no host mechanism that can (no MMU, and the one trapping Proxy we had cost ~50x).
+    Do not design as if there were.
+  - guest-code.ts is the SINGLE OWNER of cpu["jit_dirty_cache"] — never call it directly;
+    validate-guest-code-writes.ts (validate-guest-code-writes) enforces that ownership, which is what stops the
+    chokepoint eroding back into scattered copies. It checks ownership, not coverage: deciding
+    whether `mem[addr+i] = b` targets executable memory needs dataflow, so coverage is enforced
+    structurally instead — the two allocators that hand out executable guest memory
+    (ThunkGenerator's bump, MemoryManager for THUNK_CODE/CALLBACK_STUB/SPIN_LOOP or rx/rwx)
+    invalidate what they hand out, so an in-place emitter is covered without knowing this file
+    exists.
+  - Diagnostics: harness `codeAudit` is the COVERAGE check — it hashes executable pages and names
+    any that changed without a covering invalidateGuestCode, which is what the gate structurally
+    cannot do. `codeInvalidations` (wired? how much dropped?);
+    `setWorkerFlag('__noCodeInvalidate', true)` reproduces the stale-block failure on demand.
+    `__codeInvalidateGlobal` escalates every publication to a full clear — but a title surviving
+    ONLY under it does NOT imply a missing call site. jit_clear_cache is literally
+    jit_dirty_page_ctx over every page with code (v86 jit.rs:4434), so it cannot reach anything a
+    ranged dirty leaves behind on the SAME page; what it also does is keep the JIT permanently
+    cold, and that is a separate property some titles survive on. Before concluding "a site is
+    missing": confirm with `codeAudit` (names the page) and rule out tiering with
+    `dbgCall('jitTier2', 0)` — JIT on, invalidation unchanged, promotion off. House of 1000 Doors
+    read as a missing site on this flag alone and was neither.
 - Safe Memory Accessors:
+  - A PLAIN guest view is per-TURN. `process.getCurrentMemory()` normalizes v86's Proxy into a
+    plain Uint8Array, which DETACHES the instant WASM memory grows — `.subarray()` then throws
+    and plain indexing silently reads nothing, both far from the store. Never keep one in a
+    field, hand it to a constructor, or pass it to a `create*` factory; re-derive per use. v86's
+    raw Proxy is the growth-transparent one, which is why a thunk's `mem` parameter may be held.
+    `tools/validate-guest-memory-views.ts` (validate-guest-memory-views) enforces all three shapes — the
+    accessor's own comment asserted this invariant while two modules were violating it.
   - All HLE modules must use Mem.read*/write* instead of direct mem8[...] access in new/changed code.
   - Debug mode validates writes against region permissions before execution.
   - Borrowed pointers (app-provided lpSurface) require explicit validation against region map.
+    The sanctioned shape is validate-once-at-the-boundary — `isValidAddress(mem, ptr, size, perms)`
+    over the WHOLE extent the handler will touch — and then a hoisted view for the work, because
+    a per-access accessor inside a per-pixel/per-vertex loop fights the zero-alloc rule above.
+    A bounds test (`ptr + size <= mem.length`) is NOT validation: only the region map knows the
+    target is not THUNK_CODE, a red zone or read-only. `tools/validate-guest-pointer-guards.ts`
+    (validate-guest-pointer-guards) enforces this for writes in ddraw, so the convention cannot erode silently
+    again — it had, in the whole `ddraw/d3d/` subtree.
 - Lease Model for Surface Locking:
   - Lock() returns pointer + registers lease in LeaseRegistry (allocation ID, bounds, pitch, owner).
   - Unlock() revokes lease; surface destruction auto-revokes all leases.
@@ -72,8 +128,25 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
 
 - Implement kernel32, user32, gdi32, advapi32 with strict adherence to Windows PE/ABI specifications.
 - Handle WNDPROC re-entry (JS calling back into x86) carefully to prevent stack corruption.
+- STUB TABLES NEVER SHADOW A REAL HANDLER. A module's export table is one flat
+  `Record<"Interface_Method", impl>` built by several factories; merging a `*-stubs.ts`
+  table with `Object.assign` replaces every real handler registered before it with
+  `() => S_OK`, and the guest then reads an untouched out-param — which, on an
+  identity-mapped address space, dereferences linear 0 without a #PF and jumps into
+  garbage. Merge with `assignStubsOnce` (core/thunking/stub-merge.ts) so the real
+  implementation wins regardless of order; `tools/validate-stub-tables.ts` (validate-stub-tables)
+  fails on a stub name that is also implemented.
 - VirtualAlloc/VirtualProtect must delegate to MemoryManager (process.memory) for allocation and
   AddressSpace.protect for perm changes.
+- A VfsFileHandle's `position` is the FILE OBJECT's state, owned by vfs.ts plus the two handle
+  layers (kernel32 FileHandleWrapper, the CRT FILE*/fd tables). Anything else that needs to read
+  a file takes its OWN cursor via `vfs.duplicateHandle()` — MapViewOfFile/FlushViewOfFile do,
+  because Win32 mapping calls do not touch the file pointer and a save/restore across an await
+  silently reverts a seek the guest made during the yield. `position +=` is banned outright
+  (read-modify-write across a yield = double advance, served silently at full length); advances
+  go through the single named mutation. `tools/validate-file-cursor.ts` (validate-file-cursor) enforces
+  both — and pins the NUMBER of cursor-mutation sites per owner, in any spelling, because a ban
+  on `+=` alone is a ban on a spelling that the sanctioned advance itself sidesteps.
 
 3.3 Graphics Strategy
 
@@ -92,6 +165,22 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
 - Ring Buffers: Capture last N WinAPI calls (IDs + timestamps) and memory events (alloc/free, Lock/Unlock, Blt/Flip).
 - Corruption Protocol: On fault, log: EIP, fault address, last N calls, ring buffer, full memory map.
 - Invariants: No region overlaps; borrowed pointers never point into THUNK_CODE/RESERVED.
+- FAST-PATH LEDGER RULE — a checksum proves only that the work which reached it was correct; it
+  cannot prove that all promised work ran. Every new fast path must update the same logical
+  counters/ledgers as the slow path, and a differential test must run both paths and compare those
+  ledgers. That is necessary but not sufficient: both paths can copy the same expected count. Also
+  gate absolute counts from an independent canonical workload/transcript oracle. Track submitted,
+  encoded and consumed draws, query boundaries, present serials and rollback/decline positions as
+  applicable; a visually plausible frame is not evidence of complete work. A counter incremented
+  from `expectedCount` is intention accounting and must never be labelled "executed".
+- PERF EVIDENCE RULE — applies to every performance change, not only emitter/codegen. Accept on
+  measured same-workload evidence, never emitted instruction count or IR aesthetics. Every arm uses
+  a fresh load after atomic `resetWorkerFlags`, exact workload/runtime/WASM/config hashes, balanced
+  paired order, exact present serial and the independent correctness oracles above. Short smoke runs
+  establish correctness only, not performance. Record all raw values, N, median/spread, environment
+  and a mode/window-specific noise floor. A disabled path must reproduce the pre-feature baseline;
+  any disabled-path regression or same-work violation invalidates the A/B. Keeping correct code and
+  attributing a causal speedup are separate decisions; a delta inside noise is directional only.
 
 3.5 Thunk System Invariants
 
@@ -113,6 +202,12 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   TimeService.advanceVirtualTime() (gated on a >0.5ms deficit, capped at 16ms per credit).
   Without this, games accelerate because no x86 instructions were generated during the
   thunk (dt starvation).
+  The 16ms cap bounds ONE credit, NOT the delta a game observes between two clock reads:
+  the credit runs per sync thunk and is not rate-limited, so a 210ms deficit drains in ~14
+  successive thunks and games issue hundreds per frame. Guest-visible time is wall-clock
+  with a 2ms leash (MAX_AHEAD_MS, runtime/time.ts), and the only real bound on guest dt is
+  MAX_DELTA_MS = 60_000. A game whose state machine assumes small frame deltas can be
+  handed multi-second ones when WE stall. See plan/virtual-time.md.
 - lastExpectedEspAfterReturn is set only for sync thunks, never async.
 
 3.6 Thread Safety Rules
@@ -146,6 +241,10 @@ Legacy Graphics (DirectDraw, D3D3-9). You bridge x86 Windows internals with mode
   This class survives pipeline-level bisects — suspect context switching first.
 - Self-restore optimization: if performSwitch picks the same thread, skip restore entirely —
   CPU state is already correct, RET N executes naturally.
+- JS and the guest CPU share one worker thread, so a JS mem.set is atomic w.r.t. the guest —
+  code writes need no locking. The hazard is INTERLEAVING: every await inside an async thunk is a
+  yield point at which other guest threads execute over the address space being modified. Never
+  split a guest-code write from its JIT invalidation across an await (see §3.1 coherence rule).
 
 3.7 WASM Hypercall Tiers
 
@@ -205,18 +304,43 @@ happened" loop in fluent, self-judging verbs. Invoke the `/bringup` skill (`.cla
 for the operational checklist; `bun tools/harness.ts up` does cold-to-ready, then e.g.
 `harness().openWgb(..).waitForEvent('dialogShow').click('Play').tickFrames(120).expectSurfaceNonBlack('primary').state([..]).run()`.
 Drive the emulator through the project's own CDP harness (`tools/harness.ts` / `window.__BS__.harness`),
-NOT a browser MCP — the harness owns the Chrome instance; a second CDP client conflicts with it. Load-bearing facts the harness encodes (and the manual `dbg.*` fallback still needs):
+NOT a browser MCP — an uncoordinated second CDP client fights the harness for the same tab. Several
+HARNESS agents may share the one Chrome: `BS_TAB=<name>` (below) gives each its own tab. Load-bearing
+facts the harness encodes (and the manual `dbg.*` fallback still needs):
   - Dev: `bun run dev` (:5174 plain HTTP by default — automation needn't clear a self-signed cert;
     `bun run dev:ssl` opts into HTTPS) +
-    `bun run dev:logs` (:3001 log server; start it BEFORE streaming). Kill a stale Vite via PowerShell
-    `Get-CimInstance Win32_Process | ? CommandLine -match 'vite'` (git-bash `pkill` won't kill it).
+    `bun run dev:sidecar` (:3001 dev sidecar — log archive + file writer + Range delivery of `.wgb`
+    via `GET /wgb?path=`; `dev:logs` is an alias. Start it BEFORE streaming). The sidecar binds
+    LOOPBACK only and confines `path=` to a root set (repo root + the realpath parent of
+    `public/apps/external-wgb`, so `G:/WGB/**` keeps working); anything else needs `BS_WGB_ROOTS`.
+    Its WebSocket refuses a foreign `Origin` — a browser page must not be able to write files.
+    Kill a stale Vite via PowerShell
+    `Get-CimInstance Win32_Process | ? CommandLine -match 'vite'` (git-bash `pkill` won't kill it) — but
+    match the PID, not the pattern, when other agents are working: that filter kills EVERY Vite on the
+    box. The same applies to the sidecar, and to every kill-by-pattern: match the PID you started.
   - `?game=dev` = the bare emulator exposing `window.loadApp/worker/dbg/__BS__`.
+  - PARALLEL bring-up (the queue is mostly WAITING — a bundle load is gigabytes, a boot is minutes):
+    `BS_TAB=<name>` binds every harness command to its own `?game=dev&bs=<name>` tab of the SAME Chrome
+    and re-roots that run's evidence under `logs/<name>/` (screenshots, journals, dumps, and the sidecar's
+    log archive). Two agents with different names never touch each other's tab or files; with `BS_TAB`
+    unset everything is exactly as it was. Bring-up ONLY — parallel guests share the CPU, so every
+    measurement (`trace`, any A/B timing) must run with one tab open; `harness trace` refuses otherwise.
   - Audio: needs a real gesture OR Chrome's `--autoplay-policy=no-user-gesture-required` (which
     `harness up` sets). Without it AudioContext stays SUSPENDED → SAB play cursor frozen → audio-gated
     logic stalls silently (frames render but the game never advances).
-  - SEE pixels via screenshot / `harness shot()` — the canvas is an OffscreenCanvas the main thread
-    can't read. A specific guest surface/texture: `dumpSurface`/`textures` (or `__gdibDumpName` →
-    GetDIBits PNG → `debug_png_dump` → log server `logs/debug/`).
+  - SEE pixels via `harness shot()` — the SCREEN (overlays composited), read from the mirror the
+    present path keeps, because a presented WebGPU canvas is no longer readable and a presenter's
+    own capture predates the composite. `shot({source:'layer'})` is the pre-composite game layer,
+    labelled as such; `bun tools/harness.ts shot --verify` cross-checks every route against the
+    browser's own capture. A specific guest surface/texture: `dumpSurface`/`textures` (or
+    `__gdibDumpName` → GetDIBits PNG → `debug_png_dump` → sidecar `logs/debug/`).
+  - KNOW WHICH SCENE you measured, before quoting a number from it: `sceneProbe` returns how
+    much the frame is MOVING (mean luma delta on a coarse grid) plus what the D3D9 backend
+    submitted, and `sceneCompare(a,b)` says whether two runs were looking at the same thing.
+    An A/B whose arms sat on different screens produces perfectly plausible percentiles that
+    mean nothing side by side, and nothing else in a run notices — this verb exists because a
+    frame tail was once reported as "in a race" when the screenshot was the track-selection
+    menu. `motion` near 0 is a static screen (a menu or a load), whatever the game.
   - Intros: a bundle's `skipVideo` makes MCI/Bink/Smack complete instantly.
   - ANY non-standard situation (froze / vanished / black frame / unexpected exit / wild EIP) → FIRST
     pull `report()` (CLI: `bun tools/harness.ts report`). One firehose-immune POJO with: CPU regs, the
@@ -229,7 +353,14 @@ NOT a browser MCP — the harness owns the Chrome instance; a second CDP client 
     `breakOnApi('kernel32:ExitProcess')` (its snapshot carries `backtrace`+`lastThunks`) or `report()`.
   - Logs (megabytes/sec): don't grep the firehose — `logStats` (template-dedup summary), `watchLog(/re/)`
     (signal→event), `markLog`/`logsSince` (windows); the fault snapshot carries the log-ring tail. The
-    log server (:3001) is the durable archive tier, managed by `harness up`.
+    dev sidecar (:3001) is the durable archive tier, started by `harness up` (detached, stdout to
+    `logs/dev-sidecar.out.log` — never an inherited pipe nobody drains). Its in-memory buffer is
+    BOUNDED: when the writer cannot write (full disk, deleted `logs/`) it drops the oldest lines,
+    counts them, prints one degraded line per 10s, and writes an `[ARCHIVE GAP]` marker into the
+    archive when it recovers — `GET /stats` reports buffered/written/dropped/lastError per session
+    and `harness up` warns on it. A log window with no gap marker really is complete. It also serves
+    bundles by Range (`/wgb?path=`) — deliberately NOT through Vite, whose dev server degrades on
+    that route over a session and blows the io-worker's 30 s deadline (`SabIoSource: read timed out`).
   - RE the guest: the warm RE service (`tools/re/`, §14) — `re decompile/resolve/exportSymbolMap`
     (Ghidra headless writes to a file; stdout is lost). `re resolve <eip> --base <liveBase>` closes the
     wild-EIP→function loop; `re exportSymbolMap` feeds `loadSymbols`/`breakOnSymbol`.
@@ -246,14 +377,110 @@ Quality Gate (mandatory order):
   1. bun tools/generate-index.ts
   2. bun tools/validate-signatures.ts
   3. bun tools/validate-struct-offsets.ts
-  4. bun run typecheck
+  4. bun tools/validate-guest-code-writes.ts
+  5. bun tools/validate-stub-tables.ts   (a stub table shadowing a real handler; ALSO one export
+     key registered by two factories merged into the same generated index)
+  6. bun tools/validate-data-export-binding.ts   (one address per HLE export: `hleImageExportAddress`
+     stays private to the precedence owner, plus a pinned census of API-descriptor/registerDataExport
+     doubles)
+  7. bun tools/validate-api-export-uniqueness.ts   (a module descriptor declares each export
+     name ONCE — a name declared twice lays two stub bodies at two addresses under one name,
+     so the PE walk and `exportAddresses` can answer with different ones, and a title that
+     compares GetProcAddress against its own IAT reads that as a hooked API)
+  8. bun tools/validate-d3d9-export-collisions.ts   (the hand-composed d3d9 tables: a resource
+     constructor has ONE owner, so merge order cannot pick the fallback)
+  9. bun tools/validate-unimplemented-returns.ts  (a declared export with no handler must answer
+     FAILURE — the default "zero" is SUCCESS under HRESULT/MMSYSERR/MCI/LSTATUS, so those
+     descriptors must carry onUnimplemented, and a makeFunc factory must spread its overrides)
+ 10. bun tools/validate-file-cursor.ts
+ 11. bun tools/validate-jit-exports.ts   (checks the BUILT v86 artifact — skips cleanly if absent)
+ 12. bun tools/validate-guest-pointer-guards.ts   (ddraw + d3d9 HANDLER tables. It models
+     `Iface_Method: (ctx, mem, args) => …`; the d3d9 backend draw paths take guest pointers
+     too and are outside that model — a code-shape gap, not a scope one)
+ 13. bun tools/validate-guest-memory-borrow.ts   (raw guest-memory Proxy access confined to its owners)
+ 14. bun tools/validate-guest-memory-views.ts    (no PLAIN guest view stored past the turn that derived it)
+ 15. bun tools/validate-cpu-proxy-reads.ts      (v86 publishes the CPU state block — reg32, EIP,
+     instruction_counter, segment_offsets — as `view()` Proxies, so every INDEX is a get trap +
+     resolve() + buffer compare, per access, on the thunk/scheduler hot paths. core/cpu/cpu-views.ts
+     is the single owner of plain views over those bytes and of the pinned offsets;
+     `cpuViews(cpu)` / `readEip` / `readEsp` / `readRetiredInsns` are the sanctioned spellings.
+     Ownership + a pinned per-file census, so the class can shrink but never grow — a bare
+     comment cannot hold it, because indexing the Proxy is always CORRECT)
+ 16. bun tools/validate-hypercall-abi.ts         (Rust/TS hypercall page offsets + handler ids agree)
+ 17. bun tools/validate-jit-shipping-config.ts   (the ONE shipping JIT envelope, tools/jit-config/shipping.mjs,
+     is what PreemptionManager applies and what every offline arm calls "shipping")
+ 18. bun tools/validate-census-abi.ts            (opcode-census key layout agrees between opstats.rs and
+     guest-opcode-classes.ts)
+ 19. bun tools/validate-tlb-mirror.mjs           (`tlb_data` has ONE writer, cpu::set_tlb_entry, in any
+     assignment spelling — the permission bitmap is a mirror of it)
+ 20. bun tools/validate-eagl-read-cursor.mjs     (every function that CLEARS a TLB entry
+     — `set_tlb_entry(page, 0)` — also drops the EAGL read cursor. That containment is the
+     whole safety argument for the cursor outliving a hypercall; a fifth clearing site
+     would otherwise let it answer from a page the CPU no longer maps, and the read would
+     succeed with the wrong bytes)
+ 21. bun tools/validate-video-plane-policy.ts   (the video plane has ONE composite policy —
+     `video/video-plane-policy.ts`. Six present paths reach the screen; when each decided for
+     itself from "the plane still holds a bitmap" they disagreed about when it STOPS being on
+     screen, and a finished movie covered the menu. Nothing outside `src/worker/video/` may
+     reach `getOverlayService()`)
+ 22. bun tools/validate-render-space-ownership.ts   (the host canvas size is not a guest-space
+     quantity. Guest space is the extent the app asked for — viewport, scissor, the XYZRHW
+     divisor, every readback extent; the canvas is the present target, sized by the host
+     container. D3D9 conflated them and rendered a 640x480 game into the top-left corner of a
+     1557x1168 canvas. Reading the canvas is a pinned census of file+member: the present pass
+     and the internal-scale resolver, nothing else)
+ 23. bun tools/validate-wgsl-calls.ts            (every call to a WGSL helper we wrote passes the
+     arity that helper declares — our shaders are template strings, invisible to the typechecker,
+     and one bad call blackens a whole pass)
+ 24. bun tools/validate-d3d9-arena-abi.ts        (LayoutIdx order/length matches arena.rs
+     LAYOUT_TABLE, and the arena exports in public/v86.wasm match the ones arena.rs declares —
+     missing AND stale extras, so a not-rebuilt artifact cannot silently disable the arena)
+ 25. bun tools/validate-d3d9-capability-contracts.ts   (the MSAA/float/volume contracts are measured
+     from the live device, not read off globalThis, and the probe is AWAITED as an unconditional
+     statement before the device is published)
+ 26. bun tools/d3d9-parity/validate-caps.ts      (`bun run validate-d3d9-caps` — the name no longer
+     predicts the path: the checked-in reference D3DCAPS9 blob AND the caps we answer with)
+ 27. bun tools/validate-snapshots.ts             (every toMatchSnapshot() has a TRACKED .snap: bun
+     writes a missing snapshot and exits 0, so without the file the assertion asserts nothing)
+ 28. bun run gate:d3d9-capture                   (differential native-D3D9 capture. `report:d3d9-capture`
+     is reporting-only and exits 0 for everything; this wrapper fails on an unreadable/invalid
+     capture and on any divergence NOT recorded in tools/d3d9-capture-expected.json — the
+     intentional ones of plan/dx9c-review-findings-2026-08-26.md §B2. Record a new intentional
+     one with `--update-baseline`)
+ 29. bun run report:d3d9-wgsl-validator          (with BS_REQUIRE_WGSL_VALIDATOR=1, so a missing
+     naga is an error instead of a silent skip)
+ 30. bun run typecheck
+ 31. bun test                                    (also with BS_REQUIRE_WGSL_VALIDATOR=1 — otherwise
+     every describe.skipIf in wgsl-smoke.test.ts vanishes and the suite is green without it)
+
+`bun run gate` runs all of it in order — including the test suite as the final step. CI runs
+that same script, not a hand-copied subset (.github/workflows/ci.yml), so the two cannot drift.
+`census-selftest` and `perm-map-differential` are NOT in it: they need the vendor build
+(vendor/v86/build/libv86.mjs) and SKIP without it, so they are run by hand after a v86 rebuild.
+
+A validator that cannot fail is worse than no validator: it converts an unchecked invariant
+into a false assurance. When one of these passes, confirm it CAN fail — feed it the bypass it
+is meant to catch — before trusting a green run.
 
 Tooling:
   - analyze-trace.ts  — Chrome profiler trace → self/total time per thread, WASM breakdown
     (JIT blocks, io_port_write32, hypercall annotation), 2s-bucket timeline. Primary perf tool.
     Usage: bun tools/analyze-trace.ts <trace.json.gz> [--top N] [--thread worker|main|audio]
+           [--budget-ms 33.34] [--range A-Bs] [--map blocks.json]
     Interpreting output: io_port_write32 in top → heavy thunks; jit_find_cache_entry → indirect
     jump pressure; wasm% > 85% → CPU bound in guest code, not JS overhead.
+    FRAME TAIL: the render-frame stats (p50/p95/p99, frames over budget) come from the SAME
+    module as the live harness `frameReport` (src/worker/core/frame-time-distribution.ts) — one
+    definition, two callers, so a trace and a live window cannot disagree by rounding. Budget is
+    `--budget-ms` or DERIVED from the observed cadence (never a hardcoded 30/60 fps); a
+    percentile whose rank has no observation behind it prints `n/a`, not a number. WORST FRAMES
+    adds per-frame stack attribution (JS/wasm split + leaf functions) — that, and GC, are what
+    the trace can see and the live profiler cannot.
+    GUEST ATTRIBUTION needs the `bottleship.hotblocks` mark to resolve `wasm-function[N]` →
+    `module:rva` (v86 table indices ≠ Chrome's numbering, so the join is SAMPLED, never
+    computed). `bun tools/harness.ts trace <sec>` now emits it inside the recording window; a
+    trace without it prints an explicit "GUEST ATTRIBUTION: UNAVAILABLE" section rather than
+    degrading silently to bare indices.
   - make-wgb — HIGH-LEVEL bundle creator. Takes a raw game dir + CLI flags, generates
     manifest.json + registry.json via JSON.stringify (guarantees correct \\ escaping),
     packs everything in one step. Use this instead of wgb.ts for creating new bundles.
@@ -294,7 +521,25 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
     - inno/         — Inno Setup headers (LZMA1/2 via the Rust WASM backend). CLI: `tools/inno-inspect.ts`;
                       end-to-end GOG installer → bundle: `tools/gog-to-wgb.ts`.
     - freearc/      — FreeArc (`.arc`, srep+LZMA) used by some repacks.
+    - rar/          — RAR5 layout + STORED data (the store-only `.rar` a game drop wraps an
+                      installer in), incl. multi-volume `.partN.rar`. CLI:
+                      `tools/rar-extract.ts <a.rar> <out> [--list]`. RAR's own compression,
+                      solid groups, encryption and RAR 1.5–4.x are REFUSED by name.
     - iso/          — ISO9660 + BIN/CUE disc images. CLI: `tools/iso-to-wgb.ts`; `tools/bin2iso.ts`.
+    - mpq/          — MoPaQ (`MPQ\x1A`, v0/v1), incl. one APPENDED to a Blizzard self-extracting
+                      installer, and MPQs nested inside it. Storm crypt + PKWARE DCL implode
+                      (`explode.ts`) + zlib. CLI: `tools/mpq-extract.ts <a.mpq|installer.exe> <out>
+                      [--list]`. An installer payload has NO `(listfile)`: names come from the
+                      install script inside it, and `readBlockByIndex` recovers a block's key from
+                      its own sector table when there is no name to hash.
+    - xz/ + tar/    — the `.tar.xz` a Linux game drop arrives as (xz container over the shared
+                      LZMA2 backend; ustar + GNU/pax tar). CLI: `tools/tar-extract.ts <archive>
+                      <out> [--list] [--filter s] [--strip n] [--offset n]`. A stream APPENDED to
+                      a stub — a makeself/YAD `.sh` installer, an SFX `.exe` — is found in place
+                      by anchoring the candidate on the footer at EOF, so no carve-out copy of an
+                      11 GB payload. Such a drop is a whole Wine prefix: the game is under
+                      `prefix/drive_c/`, and the prefix's `system.reg`/`user.reg` feed make-wgb's
+                      `--reg-import` + `--reg-import-under`.
     - unpack/       — shared native codec backend (LZMA1/LZMA2/srep) built from the Rust crate
                       `tools/build-unpack-streaming` → `public/unpack-streaming.wasm`, plus the
                       dependency-free primitives (RandomAccessSource, Crc32/Md5/Sha1) every reader uses.

@@ -1,5 +1,6 @@
 /**
- * decoder_api.c — Minimal FFmpeg WASM video decoder for Bink, Smacker, AVI, and MPEG-PS
+ * decoder_api.c — Minimal FFmpeg WASM video decoder for Bink, Smacker, AVI, MPEG-PS and
+ * the other game containers build.sh lists (Eidos Escape .RPL among them)
  *
  * Compiled with Emscripten to produce public/video-decoder.wasm.
  * Supports up to MAX_HANDLES simultaneous open decoders.
@@ -27,6 +28,7 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
@@ -45,6 +47,13 @@
 /* Max samples per audio frame for the SWR conversion temp buffer.
  * Bink audio frames are typically <= 4096 samples. */
 #define MAX_AUDIO_SAMPLES  8192
+
+/* ── Enhancement flags (decoder_set_enhance) — every bit is opt-in; zero is the conversion
+ *    a period software player produced ──────────────────────────────────────────────── */
+#define ENH_CHROMA_SMOOTH      1   /* filter 4:2:0 chroma up instead of replicating it 2x2 */
+#define ENH_DITHER_16          2   /* ordered dither in the RGB565 packer */
+#define ENH_DEINTERLACE        4   /* rebuild one field of a frame the decoder flags interlaced */
+#define ENH_DEINTERLACE_FORCE  8   /* ...of every frame (fields baked into progressive-coded content) */
 
 static int g_initialized = 0;
 
@@ -120,6 +129,13 @@ typedef struct {
     uint8_t        *rgb565_buf;
     int             rgb565_valid;    /* 1 if rgb565_buf matches current bgra_buf */
 
+    /* Enhancements + what sws_ctx was built for; a frame that disagrees rebuilds it */
+    int             enh_flags;
+    int             sws_fmt, sws_range, sws_space, sws_enh;
+    int             frame_range, frame_space;   /* as the decoder tagged the last frame */
+    int             frame_interlaced;          /* last frame carried AV_FRAME_FLAG_INTERLACED */
+    int             interlaced_frames;         /* running count, for the harness */
+
     /* PAL8 support: preserved before sws_scale converts to BGRA */
     uint8_t        *pal8_indices;    /* width*height bytes (palette indices) */
     uint8_t         pal8_palette[1024]; /* 256 entries × 4 bytes (BGRA) */
@@ -181,13 +197,92 @@ static int audio_ring_drain(Session *s, uint8_t *dst, int out_size) {
     return to_copy;
 }
 
-/* ── sws_scale helper (deduplicates video/flush paths) ────────────────────── */
+/* ── Frame → BGRA ─────────────────────────────────────────────────────────── */
+
+/* AVCOL_SPC_* and SWS_CS_* are NOT the same numbering (AVCOL_SPC_SMPTE170M is 6, an empty
+ * row of swscale's table) — map explicitly. */
+static int sws_cs_for(int spc) {
+    switch (spc) {
+    case AVCOL_SPC_BT709:      return SWS_CS_ITU709;
+    case AVCOL_SPC_FCC:        return SWS_CS_FCC;
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:  return SWS_CS_ITU601;
+    case AVCOL_SPC_SMPTE240M:  return SWS_CS_SMPTE240M;
+    case AVCOL_SPC_BT2020_NCL: return SWS_CS_BT2020;
+    default:                   return SWS_CS_DEFAULT;
+    }
+}
+
+static int is_yuvj(int fmt) {
+    return fmt == AV_PIX_FMT_YUVJ420P || fmt == AV_PIX_FMT_YUVJ422P ||
+           fmt == AV_PIX_FMT_YUVJ444P || fmt == AV_PIX_FMT_YUVJ440P || fmt == AV_PIX_FMT_YUVJ411P;
+}
+
+/* The converter is built from the FRAME, not the codec context: the format is only certain
+ * once a frame exists, and range/matrix are what the decoder tagged it with. swscale's own
+ * defaults are limited-range BT.601; a full-range source (Bink 'k', MJPEG) converted under
+ * them crushes blacks and clips whites. */
+static int ensure_sws(Session *s, const AVFrame *f) {
+    int fmt = f->format, range = f->color_range, space = f->colorspace;
+    int enh = s->enh_flags & ENH_CHROMA_SMOOTH;
+    if (s->sws_ctx && fmt == s->sws_fmt && range == s->sws_range &&
+        space == s->sws_space && enh == s->sws_enh) return 0;
+    if (s->sws_ctx) { sws_freeContext(s->sws_ctx); s->sws_ctx = NULL; }
+    /* At 1:1 the scaler flag only decides how 4:2:0 chroma reaches full resolution:
+     * SWS_POINT replicates it, the way period software players drew it. */
+    int flags = enh ? (SWS_BICUBIC | SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND) : SWS_POINT;
+    s->sws_ctx = sws_getContext(s->width, s->height, fmt, s->width, s->height, AV_PIX_FMT_BGRA,
+                                flags, NULL, NULL, NULL);
+    if (!s->sws_ctx) return -1;
+    int src_full = (range == AVCOL_RANGE_JPEG) || is_yuvj(fmt);
+    sws_setColorspaceDetails(s->sws_ctx, sws_getCoefficients(sws_cs_for(space)), src_full,
+                             sws_getCoefficients(SWS_CS_DEFAULT), 0, 0, 1 << 16, 1 << 16);
+    s->sws_fmt = fmt; s->sws_range = range; s->sws_space = space; s->sws_enh = enh;
+    return 0;
+}
+
+/* Keep the first field in time, rebuild the other from its neighbours (what a bob
+ * deinterlacer draws per field). Planar 8-bit only — RGB, palettes and packed layouts are
+ * left alone. The decoder may still reference this frame for prediction, so it is made
+ * writable (copied) before being touched. */
+static void deinterlace_planar(AVFrame *f) {
+    const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(f->format);
+    if (!d || !(d->flags & AV_PIX_FMT_FLAG_PLANAR) ||
+        (d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BITSTREAM)) ||
+        d->comp[0].depth != 8) return;
+    if (av_frame_make_writable(f) < 0) return;
+    int rebuild = (f->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) ? 1 : 0;
+    for (int p = 0; p < 4 && f->data[p]; p++) {
+        int chroma = (p == 1 || p == 2);
+        int pw = chroma ? AV_CEIL_RSHIFT(f->width,  d->log2_chroma_w) : f->width;
+        int ph = chroma ? AV_CEIL_RSHIFT(f->height, d->log2_chroma_h) : f->height;
+        int ls = f->linesize[p];
+        uint8_t *base = f->data[p];
+        if (ph < 2) continue;
+        for (int y = rebuild; y < ph; y += 2) {
+            const uint8_t *above = base + (y > 0      ? y - 1 : y + 1) * ls;
+            const uint8_t *below = base + (y + 1 < ph ? y + 1 : y - 1) * ls;
+            uint8_t *row = base + y * ls;
+            for (int x = 0; x < pw; x++) row[x] = (uint8_t)((above[x] + below[x] + 1) >> 1);
+        }
+    }
+}
+
 static void convert_frame_to_bgra(Session *s) {
+    AVFrame *f = s->raw_frame;
+    s->frame_range = f->color_range;
+    s->frame_space = f->colorspace;
+    s->frame_interlaced = !!(f->flags & AV_FRAME_FLAG_INTERLACED);
+    if (s->frame_interlaced) s->interlaced_frames++;
+    if ((s->enh_flags & ENH_DEINTERLACE) &&
+        (s->frame_interlaced || (s->enh_flags & ENH_DEINTERLACE_FORCE)))
+        deinterlace_planar(f);
+
     /* Preserve PAL8 data before sws_scale destroys it.
      * FFmpeg's Smacker/8-bit decoders output AV_PIX_FMT_PAL8:
      *   data[0] = width*height palette indices
      *   data[1] = 256-entry palette, each entry 4 bytes (BGRA / 0xAARRGGBB) */
-    if (s->raw_frame->format == AV_PIX_FMT_PAL8) {
+    if (f->format == AV_PIX_FMT_PAL8) {
         s->has_pal8 = 1;
         if (!s->pal8_indices) {
             s->pal8_indices = (uint8_t *)malloc(s->width * s->height);
@@ -196,24 +291,24 @@ static void convert_frame_to_bgra(Session *s) {
             /* raw_frame may have padding (linesize[0] >= width) */
             for (int y = 0; y < s->height; y++) {
                 memcpy(s->pal8_indices + y * s->width,
-                       s->raw_frame->data[0] + y * s->raw_frame->linesize[0],
+                       f->data[0] + y * f->linesize[0],
                        s->width);
             }
         }
-        if (s->raw_frame->data[1]) {
-            memcpy(s->pal8_palette, s->raw_frame->data[1], 1024);
+        if (f->data[1]) {
+            memcpy(s->pal8_palette, f->data[1], 1024);
         }
     }
 
-    const uint8_t *src_d[4] = { s->raw_frame->data[0], s->raw_frame->data[1],
-                                 s->raw_frame->data[2], s->raw_frame->data[3] };
-    int src_ls[4] = { s->raw_frame->linesize[0], s->raw_frame->linesize[1],
-                       s->raw_frame->linesize[2], s->raw_frame->linesize[3] };
-    uint8_t *dst_d[4]  = { s->bgra_buf, NULL, NULL, NULL };
-    int       dst_ls[4] = { s->width * 4, 0, 0, 0 };
-    sws_scale(s->sws_ctx, src_d, src_ls, 0, s->height, dst_d, dst_ls);
+    if (ensure_sws(s, f) == 0) {
+        const uint8_t *src_d[4] = { f->data[0], f->data[1], f->data[2], f->data[3] };
+        int src_ls[4] = { f->linesize[0], f->linesize[1], f->linesize[2], f->linesize[3] };
+        uint8_t *dst_d[4]  = { s->bgra_buf, NULL, NULL, NULL };
+        int       dst_ls[4] = { s->width * 4, 0, 0, 0 };
+        sws_scale(s->sws_ctx, src_d, src_ls, 0, s->height, dst_d, dst_ls);
+    }
     s->rgb565_valid = 0;  /* invalidate cached RGB565 — new BGRA data */
-    av_frame_unref(s->raw_frame);
+    av_frame_unref(f);
 }
 
 /* ── Public API ───────────────────────────────────────────────────────────── */
@@ -390,13 +485,9 @@ int32_t decoder_open(const uint8_t *data, int32_t size) {
     s->raw_frame = av_frame_alloc();
     if (!s->raw_frame) goto fail;
 
-    /* swscale: video pixel format → BGRA (native Windows 32-bit pixel order).
-     * SWS_POINT (nearest-neighbor) is faster and authentic for 90s-era content. */
-    s->sws_ctx = sws_getContext(
-        s->width, s->height, s->video_ctx->pix_fmt,
-        s->width, s->height, AV_PIX_FMT_BGRA,
-        SWS_POINT, NULL, NULL, NULL);
-    if (!s->sws_ctx) goto fail;
+    /* sws_ctx is built by the first frame (ensure_sws); until then report the codec's tags */
+    s->frame_range = s->video_ctx->color_range;
+    s->frame_space = s->video_ctx->colorspace;
 
     s->valid = 1;
     return handle;
@@ -525,6 +616,9 @@ const uint8_t *decoder_get_frame_pal8_ptr(int32_t handle) {
     return s->pal8_indices;
 }
 
+/* 4x4 Bayer thresholds, 0..15 */
+static const uint8_t BAYER4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+
 /**
  * Convert current BGRA frame to RGB565 and return pointer to the buffer.
  * The conversion is done in C/WASM for ~8-15x speedup vs JS byte-level loop.
@@ -546,15 +640,35 @@ const uint8_t *decoder_get_frame_rgb565_ptr(int32_t handle) {
     if (!s->rgb565_valid) {
         const uint32_t *src = (const uint32_t *)s->bgra_buf;
         uint16_t *dst = (uint16_t *)s->rgb565_buf;
-        int count = s->width * s->height;
-        for (int i = 0; i < count; i++) {
-            uint32_t px = src[i];
-            /* BGRA u32 (LE): A<<24|R<<16|G<<8|B → RGB565 */
-            dst[i] = (uint16_t)(
-                ((px & 0x00F80000u) >> 8) |
-                ((px & 0x0000FC00u) >> 5) |
-                ((px & 0x000000F8u) >> 3)
-            );
+        int w = s->width, h = s->height;
+        if (s->enh_flags & ENH_DITHER_16) {
+            /* Ordered dither in the quantizer's own domain: level k = floor(v*(2^n-1)/255 + t/16),
+             * so the block mean lands on the source once a 16-bit surface is expanded back
+             * ((k<<3)|(k>>2)); dithering v/8 instead sits half a step high. */
+            for (int y = 0; y < h; y++) {
+                const uint8_t *th = BAYER4 + (y & 3) * 4;
+                const uint32_t *row = src + y * w;
+                uint16_t *out = dst + y * w;
+                for (int x = 0; x < w; x++) {
+                    uint32_t px = row[x];
+                    int t = th[x & 3] * 255;
+                    int r = (int)(((px >> 16) & 0xFF) * 496  + t) / 4080;   /* 31*16 */
+                    int g = (int)(((px >> 8)  & 0xFF) * 1008 + t) / 4080;   /* 63*16 */
+                    int b = (int)(( px        & 0xFF) * 496  + t) / 4080;
+                    out[x] = (uint16_t)((r << 11) | (g << 5) | b);
+                }
+            }
+        } else {
+            int count = w * h;
+            for (int i = 0; i < count; i++) {
+                uint32_t px = src[i];
+                /* BGRA u32 (LE): A<<24|R<<16|G<<8|B → RGB565 */
+                dst[i] = (uint16_t)(
+                    ((px & 0x00F80000u) >> 8) |
+                    ((px & 0x0000FC00u) >> 5) |
+                    ((px & 0x000000F8u) >> 3)
+                );
+            }
         }
         s->rgb565_valid = 1;
     }
@@ -681,6 +795,45 @@ int32_t decoder_get_video_pix_fmt(int32_t handle) {
     if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return -1;
     Session *s = &sessions[handle];
     return s->video_ctx ? (int32_t)s->video_ctx->pix_fmt : -1;
+}
+
+/** Select the opt-in enhancements (ENH_*) for a session. The 16-bit packing of the current
+ *  frame follows immediately; the conversion itself from the next frame on. */
+void decoder_set_enhance(int32_t handle, int32_t flags) {
+    if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return;
+    Session *s = &sessions[handle];
+    if (s->enh_flags == flags) return;
+    s->enh_flags = flags;
+    s->rgb565_valid = 0;
+}
+
+int32_t decoder_get_enhance(int32_t handle) {
+    if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return 0;
+    return sessions[handle].enh_flags;
+}
+
+/** 1 if the last decoded frame carried AV_FRAME_FLAG_INTERLACED. */
+int32_t decoder_get_frame_interlaced(int32_t handle) {
+    if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return 0;
+    return sessions[handle].frame_interlaced;
+}
+
+/** How many decoded frames so far were flagged interlaced. */
+int32_t decoder_get_interlaced_frames(int32_t handle) {
+    if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return 0;
+    return sessions[handle].interlaced_frames;
+}
+
+/** AVCOL_RANGE_* the decoder tagged the last frame with (the codec's own before any frame). */
+int32_t decoder_get_video_color_range(int32_t handle) {
+    if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return -1;
+    return sessions[handle].frame_range;
+}
+
+/** AVCOL_SPC_* likewise. */
+int32_t decoder_get_video_colorspace(int32_t handle) {
+    if (handle < 0 || handle >= MAX_HANDLES || !sessions[handle].valid) return -1;
+    return sessions[handle].frame_space;
 }
 
 void decoder_close(int32_t handle) {

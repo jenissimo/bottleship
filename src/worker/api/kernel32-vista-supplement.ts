@@ -23,7 +23,7 @@ export const kernel32VistaSupplement: ModuleDescriptor = {
         makeFunc("InitializeConditionVariable", 1),
         makeFunc("InitializeSRWLock", 1),
         makeFunc("WakeConditionVariable", 1),
-        makeFunc("SleepConditionVariableCS", 4),
+        makeFunc("SleepConditionVariableCS", 3),
         makeFunc("FlushProcessWriteBuffers", 0),
         makeFunc("FreeLibraryWhenCallbackReturns", 2),
         makeFunc("GetCurrentProcessorNumber", 0),

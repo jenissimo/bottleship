@@ -6,6 +6,14 @@ export interface SettingsDrawerProps {
   onClose: () => void;
   quality: QualityConfig;
   onChange: (patch: Partial<QualityConfig>) => void;
+  /** Non-default quality keys the active graphics backend does not implement (see
+   *  worker/backends/webgpu/shared/quality-capabilities.ts) — empty until the worker's
+   *  first set_quality ack arrives. */
+  unsupportedQualityKeys?: ReadonlySet<string>;
+  /** Quality keys the loaded game's manifest overrides — the control edits the global
+   *  preference, but the game's value is what the frame uses. Also empty until the
+   *  worker's first set_quality ack arrives. */
+  overriddenQualityKeys?: ReadonlySet<string>;
   uiSettings: UiSettings;
   onUiChange: (patch: Partial<UiSettings>) => void;
   statsOverlay: boolean;
@@ -14,6 +22,9 @@ export interface SettingsDrawerProps {
   onToggleLogStreaming: (enabled: boolean) => void;
   onResetDefaults: () => void;
   guestResolution: { width: number; height: number };
+  /** Canvas physical-pixel backing size (clientWidth/Height × devicePixelRatio) — what
+   *  QualityPanel's "Internal resolution: Auto" fits to. */
+  renderSize: { width: number; height: number };
   integerScale: number;
   onOpenDevConsole?: () => void;
 }

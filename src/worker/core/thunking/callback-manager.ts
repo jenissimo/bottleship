@@ -47,6 +47,12 @@ export interface CallbackInvocation {
     ownerThreadId?: number;       // Thread that invoked callback (owner of in-flight return path)
     /** Return EIP was synthesized (e.g. winmm timer thread → spin loop); callerRet check skipped. */
     syntheticReturnEip?: boolean;
+    /** Complete only the currently executing API thunk, preserving any outer callback frame. */
+    directThunkReturn?: {
+        returnAddr: number;
+        postEsp: number;
+        complete?: (callbackReturnValue: number) => number | null;
+    };
 }
 
 export interface CallbackReturnStub {
@@ -79,6 +85,8 @@ export interface CallbackForensicRecord {
 export interface CallbackForensicState {
     pendingCount: number;
     thunkContextDepth: number;
+    /** Number of direct callback-return restores that repaired callee-saved GPRs. */
+    calleeSavedRepairs: number;
     lastInvoke: CallbackForensicRecord | null;
     lastReturn: CallbackForensicRecord | null;
     suspendedFrames: SuspendedThunkFrame[];
@@ -99,6 +107,13 @@ export interface InvokeCallbackOptions {
     // For deferred callbacks dispatched at scheduler safe-points:
     // synthesize an explicit return EIP instead of relying on arbitrary stack top.
     forceSyntheticReturnEip?: boolean;
+    // Synchronous guest call made by an API such as CallWindowProc: resume
+    // where that API's RET N would have returned without consuming an outer frame.
+    directThunkReturn?: {
+        returnAddr: number;
+        postEsp: number;
+        complete?: (callbackReturnValue: number) => number | null;
+    };
 }
 
 // Special callback IDs start from 0x80000000 to distinguish from regular thunks
@@ -108,9 +123,19 @@ const CALLBACK_ID_BASE = 0x80000000;
 const CLEANUP_AMOUNTS = [0, 4, 8, 12, 16, 20, 24, 32];
 
 // Maximum callback nesting depth to prevent exhaust of return stub pool
-const MAX_CALLBACK_NESTING = 8;
+const MAX_CALLBACK_NESTING = 32;
 const SUSPENDED_FRAME_RING_SIZE = 64;
 const MAX_PENDING_CALLBACK_SLOTS = 256;
+
+/** A suspended-thunk completion waiting for its owner thread to become current. */
+interface DeferredFrameCompletion {
+    frameId: number;
+    /** Callback whose completeThunk produced the value; for diagnostics only. */
+    functionId: number;
+    finalValue: number;
+    isCdecl: boolean;
+    source: string;
+}
 
 export class CallbackManager {
     private v86: any;
@@ -160,6 +185,15 @@ export class CallbackManager {
     private frameEspEntry = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameReturnAddr = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameThunkCleanup = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
+    /**
+     * EBX/ESI/EDI/EBP as the SUSPENDED THUNK's caller left them. A guest callback must give
+     * these back untouched (stdcall/cdecl both make them callee-saved), so a difference at
+     * the direct restore is OUR bug, not the game's — and the symptom lands far away, at the
+     * caller's next use of the register. The restore below enforces that ABI boundary.
+     */
+    private frameCalleeSaved = new Uint32Array(SUSPENDED_FRAME_RING_SIZE * 4);
+    /** 1 when this slot contains a capture from a live CPU register file. */
+    private frameCalleeSavedValid = new Uint8Array(SUSPENDED_FRAME_RING_SIZE);
     private frameExpectedPostEsp = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameCallbackId = new Uint32Array(SUSPENDED_FRAME_RING_SIZE);
     private frameSource: string[] = new Array(SUSPENDED_FRAME_RING_SIZE).fill('');
@@ -167,6 +201,11 @@ export class CallbackManager {
     private nextFrameId = 1;
     private frameStack = new Int16Array(SUSPENDED_FRAME_RING_SIZE);
     private frameStackDepth = 0;
+    /** Terminal frame completions that arrived while a thread OTHER than the frame's owner
+     *  was current, keyed by owner thread. Drained at that thread's own safe point (see the
+     *  thread-mismatch branch in the callback-return path). At most one per thread: a frame
+     *  completes exactly once, and its owner is parked until it does. */
+    private deferredCompletions = new Map<number, DeferredFrameCompletion>();
     private lastInvokeForensics: CallbackForensicRecord | null = null;
     private lastReturnForensics: CallbackForensicRecord | null = null;
     private lastWinMmForensicLogMs = 0;
@@ -419,6 +458,9 @@ export class CallbackManager {
                     callback.ownerThreadId ?? 0,
                     callback.callbackAddress >>> 0
                 );
+                (System.getInstance().process?.getModule('winmm') as
+                    { notePostedCallbackReturned?(addr: number): void } | undefined)
+                    ?.notePostedCallbackReturned?.(callback.callbackAddress >>> 0);
                 // End the cycle slice: the return resumes at the spin loop, which v86
                 // would otherwise honestly execute until the next tick boundary.
                 sch.onWinmmTimerCallbackReturned?.();
@@ -450,7 +492,7 @@ export class CallbackManager {
         let callerRet = view.getUint32(esp + 4, true) >>> 0;
         let callerRetInStubPool = callerRet >= this.stubPoolBase && callerRet < this.stubPoolEnd;
         let callerRetLowAddress = callerRet < 0x100000;
-        let callerRetInStack = callerRet >= 0x80000 && callerRet < 0x100000;
+        let callerRetInStack = this.isGuestStackAddress(callerRet);
         let driftStdcall: number | null = null;
         let driftCdecl: number | null = null;
 
@@ -538,7 +580,7 @@ export class CallbackManager {
             }
         }
 
-        if (!callback.completeThunk && !callback.syntheticReturnEip &&
+        if (!callback.completeThunk && !callback.syntheticReturnEip && !callback.directThunkReturn &&
             (callerRetInStubPool || callerRetInStack || callerRetLowAddress || callerRet === 0 ||
                 this.isInvalidGuestReturnAddress(callerRet))) {
             Logger.error(LogCategory.CALLBACK,
@@ -550,6 +592,36 @@ export class CallbackManager {
         }
 
         callback.resolve(returnValue);
+
+        if (callback.directThunkReturn) {
+            const returnAddr = callback.directThunkReturn.returnAddr >>> 0;
+            const postEsp = callback.directThunkReturn.postEsp >>> 0;
+            const completed = callback.directThunkReturn.complete?.(returnValue);
+            if (completed === null) {
+                this.releaseCallback(functionId, stub);
+                return;
+            }
+            const finalValue = completed === undefined ? returnValue : completed;
+            const returnAddrInStack = this.isGuestStackAddress(returnAddr);
+            if (returnAddr < 0x1000 || returnAddr >= mem.length || returnAddrInStack
+                || postEsp > mem.length) {
+                Logger.error(LogCategory.CALLBACK,
+                    `Invalid direct thunk return: EIP=0x${returnAddr.toString(16)} ESP=0x${postEsp.toString(16)}` +
+                    (returnAddrInStack ? ' — target is INSIDE the guest stack (skewed RET N / stack-executed return)' : ''));
+                this.releaseCallbackWithFatal(
+                    functionId, stub, 0x3002, returnAddr,
+                    System.getInstance().scheduler.getCurrentThreadId() >>> 0,
+                );
+                return;
+            }
+
+            cpu.reg32[0] = finalValue >>> 0;
+            cpu.reg32[4] = postEsp;
+            if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+            cpu.instruction_pointer[0] = returnAddr;
+            this.releaseCallback(functionId, stub);
+            return;
+        }
 
         if (callback.completeThunk) {
             const result = callback.completeThunk(returnValue);
@@ -587,22 +659,42 @@ export class CallbackManager {
                 return;
             }
 
-            if ((this.frameThreadId[frameIndex] >>> 0) !== threadId) {
-                Logger.error(LogCategory.CALLBACK,
-                    `Suspended frame thread mismatch: frameId=${frameId} ownerThread=${this.frameThreadId[frameIndex]} currentThread=${threadId}`);
-
-                this.releaseFrame(frameIndex);
-                this.releaseCallbackWithFatal(functionId, stub, 0x3003, functionId >>> 0, threadId);
+            const ownerThreadId = this.frameThreadId[frameIndex] >>> 0;
+            if (ownerThreadId !== threadId) {
+                // Completing a frame WRITES the owner's EIP/ESP/EAX, so it may only run while
+                // the owner is current — doing it now would drop those registers on whatever
+                // thread happens to be running.
+                //
+                // This is reachable by design, not corruption: a thread owning a live frame is
+                // parked WAITING between pump callbacks (scheduler pumpPark), so the scheduler
+                // legitimately runs a sibling, and the JS-driven chain can reach its terminal
+                // step with that sibling current. UE1 front-ends hit it on every EndDialog
+                // teardown — the modal pump's last WM_NCDESTROY lands after a sibling's async
+                // GetMessage resumed. Defer to the owner's own safe point, exactly as a
+                // cross-thread async thunk completion already does.
+                Logger.log(LogCategory.CALLBACK,
+                    `Deferring suspended-thunk completion to owner: frameId=${frameId} ` +
+                    `ownerThread=${ownerThreadId} currentThread=${threadId} value=0x${finalValue.toString(16)}`);
+                this.deferredCompletions.set(ownerThreadId, {
+                    frameId, functionId: functionId >>> 0, finalValue,
+                    isCdecl: !!callback.isCdecl,
+                    source: callback.source ?? '',
+                });
+                // The owner is parked with no other waker — the drain only runs once the
+                // scheduler makes it current, so ready it here or the frame strands forever.
+                System.getInstance().scheduler.wakeThreadForAsyncCompletion(ownerThreadId);
+                this.releaseCallback(functionId, stub);
                 return;
             }
 
             const returnAddr = this.frameReturnAddr[frameIndex] >>> 0;
-            const returnAddrInStack = returnAddr >= 0x80000 && returnAddr < 0x100000;
+            const returnAddrInStack = this.isGuestStackAddress(returnAddr);
             if (returnAddr < 0x1000 || returnAddr >= mem.length ||
                 (returnAddr >= this.stubPoolBase && returnAddr < this.stubPoolEnd) ||
                 returnAddrInStack || this.isInvalidGuestReturnAddress(returnAddr)) {
                 Logger.error(LogCategory.CALLBACK,
-                    `Invalid frame returnAddr: 0x${returnAddr.toString(16)} frameId=${frameId}`);
+                    `Invalid frame returnAddr: 0x${returnAddr.toString(16)} frameId=${frameId}` +
+                    (returnAddrInStack ? ' — INSIDE the guest stack (skewed RET N / stack-executed return)' : ''));
     
                 this.releaseCallbackWithFatal(functionId, stub, 0x3002, returnAddr >>> 0, threadId);
                 return;
@@ -621,6 +713,7 @@ export class CallbackManager {
 
             const preWriteEsp = cpu.reg32[4];
             const preWriteEip = cpu.instruction_pointer?.[0] ?? 0;
+            this.restoreCalleeSavedAcrossCallback(frameIndex, frameId, this.frameSource[frameIndex] ?? '');
 
             // Direct-restore: do not resume the callback return stub (mid-stub OUT trap).
             // [frameEsp] may still hold spinLoopAddress from redirectStackToSpinLoop.
@@ -743,6 +836,97 @@ export class CallbackManager {
         return false;
     }
 
+    /** True when `threadId` has a terminal frame completion waiting for it to become current. */
+    hasDeferredCompletionForThread(threadId: number): boolean {
+        return this.deferredCompletions.has(threadId >>> 0);
+    }
+
+    /** Diagnostics: completions waiting on their owner thread (harness `asyncParked`).
+     *  A non-empty list on a stalled guest means an owner never reached its safe point. */
+    listDeferredCompletions(): Array<{ threadId: number; frameId: number; source: string; value: number }> {
+        return Array.from(this.deferredCompletions.entries()).map(([threadId, d]) => ({
+            threadId, frameId: d.frameId, source: d.source, value: d.finalValue >>> 0,
+        }));
+    }
+
+    /**
+     * Apply a completion that was deferred because its owner thread was not current
+     * (see the thread-mismatch branch of the callback-return path). Must be called only
+     * when `threadId` IS the current thread and its registers are live — the scheduler's
+     * async-restore poll is that point, and it is the same one a cross-thread async thunk
+     * completion resumes at.
+     *
+     * Returns true when a completion was applied (the caller should not also let the
+     * thread keep spinning at the park address).
+     */
+    tryApplyDeferredCompletion(threadId: number, cpu: any): boolean {
+        const tid = threadId >>> 0;
+        const deferred = this.deferredCompletions.get(tid);
+        if (!deferred) return false;
+
+        const frameIndex = this.findFrameIndexById(deferred.frameId);
+        if (frameIndex < 0) {
+            // The frame went away underneath us (process teardown). Drop the completion
+            // rather than restoring registers to a frame that no longer describes anything.
+            this.deferredCompletions.delete(tid);
+            Logger.warn(LogCategory.CALLBACK,
+                `Deferred completion dropped: frame ${deferred.frameId} gone (owner T${tid}, source=${deferred.source})`);
+            return false;
+        }
+        if ((this.frameThreadId[frameIndex] >>> 0) !== tid) return false;
+
+        const mem = this.getMemory();
+        const returnAddr = this.frameReturnAddr[frameIndex] >>> 0;
+        const returnAddrInStack = this.isGuestStackAddress(returnAddr);
+        if (returnAddr < 0x1000 || returnAddr >= mem.length ||
+            (returnAddr >= this.stubPoolBase && returnAddr < this.stubPoolEnd) ||
+            returnAddrInStack || this.isInvalidGuestReturnAddress(returnAddr)) {
+            this.deferredCompletions.delete(tid);
+            this.releaseFrame(frameIndex);
+            Logger.error(LogCategory.CALLBACK,
+                `Deferred completion has invalid returnAddr 0x${returnAddr.toString(16)} frameId=${deferred.frameId}` +
+                (returnAddrInStack ? ' — INSIDE the guest stack (skewed RET N / stack-executed return)' : ''));
+            this.reportFatalFromCallback(0x3002, returnAddr >>> 0, tid);
+            return false;
+        }
+
+        const targetEsp = deferred.isCdecl
+            ? ((this.frameEspEntry[frameIndex] + 4) >>> 0)
+            : (this.frameExpectedPostEsp[frameIndex] >>> 0);
+        if (!(targetEsp >= 0 && targetEsp <= mem.length)) {
+            this.deferredCompletions.delete(tid);
+            this.releaseFrame(frameIndex);
+            Logger.error(LogCategory.CALLBACK,
+                `Deferred completion out of bounds: frameId=${deferred.frameId} targetESP=0x${targetEsp.toString(16)}`);
+            this.reportFatalFromCallback(0x3002, returnAddr >>> 0, tid);
+            return false;
+        }
+
+        this.restoreCalleeSavedAcrossCallback(frameIndex, deferred.frameId, deferred.source ?? '');
+        cpu.reg32[0] = deferred.finalValue >>> 0;
+        cpu.reg32[4] = targetEsp >>> 0;
+        if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+        cpu.instruction_pointer[0] = returnAddr >>> 0;
+
+        Logger.log(LogCategory.CALLBACK,
+            `Completed deferred suspended thunk on owner T${tid}: EAX=0x${deferred.finalValue.toString(16)}, ` +
+            `EIP=0x${returnAddr.toString(16)}, ESP=0x${targetEsp.toString(16)} (frameId=${deferred.frameId})`);
+
+        this.deferredCompletions.delete(tid);
+        this.releaseFrame(frameIndex);
+        for (const [cbId, cb] of this.pendingCallbacks.entries()) {
+            if ((cb.frameId ?? 0) === deferred.frameId) {
+                const orphanStub = this.stubsById.get(cbId);
+                if (orphanStub) this.releaseCallback(cbId, orphanStub);
+                else { this.pendingCallbacks.delete(cbId); this.untrackPendingCallback(cbId); }
+            }
+        }
+        return true;
+    }
+
+    /** True while a thunk is suspended inside a guest callback (diagnostics gate). */
+    public isInsideSuspendedCallback(): boolean { return this.frameStackDepth > 0; }
+
     private getTopSuspendedFrameId(): number {
         if (this.frameStackDepth <= 0) return 0;
         const idx = this.frameStack[this.frameStackDepth - 1];
@@ -789,6 +973,18 @@ export class CallbackManager {
         this.frameExpectedPostEsp[slot] = (espEntry + 4 + thunkCleanup) >>> 0;
         this.frameCallbackId[slot] = 0;
         this.frameSource[slot] = source;
+        // Clear validity before capture: ring slots are recycled, and early-boot frames can
+        // be allocated before v86 exposes a register file. In that case the old slot values
+        // are diagnostic garbage and must never be restored into a later callback.
+        this.frameCalleeSavedValid[slot] = 0;
+        const reg = this.guestRegFile();
+        if (reg) {
+            this.frameCalleeSaved[slot * 4] = reg[3]!;
+            this.frameCalleeSaved[slot * 4 + 1] = reg[6]!;
+            this.frameCalleeSaved[slot * 4 + 2] = reg[7]!;
+            this.frameCalleeSaved[slot * 4 + 3] = reg[5]!;
+            this.frameCalleeSavedValid[slot] = 1;
+        }
 
         this.frameStack[this.frameStackDepth++] = slot;
         this.frameWriteIdx = (slot + 1) % SUSPENDED_FRAME_RING_SIZE;
@@ -801,6 +997,48 @@ export class CallbackManager {
         } catch { /* scheduler not ready yet */ }
 
         return frameId;
+    }
+
+    /** Optional verbose logging switch shared with the dispatcher's callee-saved diagnostics. */
+    private get checkCalleeSaved(): boolean {
+        return !!(globalThis as { __checkCalleeSaved?: boolean }).__checkCalleeSaved;
+    }
+
+    /** The live register file, or null when the CPU is not up yet. */
+    private guestRegFile(): Int32Array | null {
+        const cpu = this.v86?.cpu || (this.v86?.v86 && this.v86.v86.cpu);
+        return cpu?.reg32 ?? null;
+    }
+
+    /** Callbacks that came back with a callee-saved register the direct restore had to put
+     *  back. Non-zero means our re-entry lost what a real CALL/RET would have preserved. */
+    public calleeSavedRepairs = 0;
+    private lastCalleeSavedWarnMs = 0;
+
+    /** Win32 callback ABI preserves these lanes; restore them from the validated frame capture. */
+    private restoreCalleeSavedAcrossCallback(slot: number, frameId: number, source: string): void {
+        if (this.frameCalleeSavedValid[slot] !== 1) return;
+        const reg = this.guestRegFile();
+        if (!reg) return;
+        const order = [3, 6, 7, 5];
+        const names = ["EBX", "ESI", "EDI", "EBP"];
+        let diff = "";
+        for (let i = 0; i < 4; i++) {
+            const before = this.frameCalleeSaved[slot * 4 + i] >>> 0;
+            const now = reg[order[i]!]! >>> 0;
+            if (before === now) continue;
+            diff += ` ${names[i]}: 0x${now.toString(16)} -> 0x${before.toString(16)}`;
+            reg[order[i]!] = before | 0;
+        }
+        if (!diff) return;
+        this.calleeSavedRepairs++;
+        const now = performance.now();
+        if (this.checkCalleeSaved || now - this.lastCalleeSavedWarnMs > 1000) {
+            this.lastCalleeSavedWarnMs = now;
+            Logger.warn(LogCategory.CALLBACK,
+                `Callee-saved register(s) restored across callback (frameId=${frameId}, ` +
+                `thunk=${source}):${diff} (${this.calleeSavedRepairs} so far)`);
+        }
     }
 
     private releaseFrame(slot: number): void {
@@ -817,6 +1055,8 @@ export class CallbackManager {
             }
         }
 
+        const pinnedThreadId = this.frameThreadId[slot];
+
         this.frameActive[slot] = 0;
         this.frameIdRing[slot] = 0;
         this.frameThreadId[slot] = 0;
@@ -826,10 +1066,14 @@ export class CallbackManager {
         this.frameExpectedPostEsp[slot] = 0;
         this.frameCallbackId[slot] = 0;
         this.frameSource[slot] = '';
+        this.frameCalleeSavedValid[slot] = 0;
 
-        // Unpin the thread (balanced with pin in allocateSuspendedFrame)
+        // Unpin the thread that took the pin in allocateSuspendedFrame — NOT whoever is
+        // current now. A pinned thread that blocks does switch away, so releasing the frame
+        // from another thread would decrement the wrong counter and leave the owner pinned
+        // (never preemptible) for good.
         try {
-            System.getInstance().scheduler.unpinCurrentThread();
+            System.getInstance().scheduler.unpinThread(pinnedThreadId);
         } catch { /* scheduler not ready yet */ }
 
         this.notifyIdleIfReady();
@@ -841,7 +1085,7 @@ export class CallbackManager {
             const scheduler = System.getInstance().scheduler;
             for (let i = 0; i < SUSPENDED_FRAME_RING_SIZE; i++) {
                 if (this.frameActive[i] === 1) {
-                    scheduler.unpinCurrentThread();
+                    scheduler.unpinThread(this.frameThreadId[i]);
                 }
             }
         } catch { /* scheduler not ready */ }
@@ -855,6 +1099,7 @@ export class CallbackManager {
         this.frameExpectedPostEsp.fill(0);
         this.frameCallbackId.fill(0);
         this.frameSource.fill('');
+        this.frameCalleeSavedValid.fill(0);
         this.frameWriteIdx = 0;
         this.nextFrameId = 1;
         this.frameStackDepth = 0;
@@ -1023,7 +1268,7 @@ export class CallbackManager {
             return { callbackId: 0 };
         }
 
-        if (callbackAddress >= 0x80000 && callbackAddress < 0x100000) {
+        if (this.isGuestStackAddress(callbackAddress)) {
             const msg = `Attempted to invoke callback at STACK address 0x${callbackAddress.toString(16)}!`;
             Logger.error(LogCategory.SYSTEM, msg);
             throw new CallbackError(msg, callbackAddress, ERROR_INVALID_PARAMETER);
@@ -1176,6 +1421,7 @@ export class CallbackManager {
             espBeforeInvoke,  // Save ESP for stack drift detection
             ownerThreadId: System.getInstance().scheduler.getCurrentThreadId() >>> 0,
             syntheticReturnEip: usedSyntheticReturnEip,
+            directThunkReturn: options?.directThunkReturn,
         };
 
         // Attach thunkContext from stack for callbacks that will complete a suspended thunk
@@ -1195,7 +1441,7 @@ export class CallbackManager {
 
             Logger.verbose(LogCategory.CALLBACK,
                 `Attached suspended frame ${resolvedFrameId} to callback 0x${stub.callbackId.toString(16)} (depth=${this.frameStackDepth})`);
-        } else if (this.frameStackDepth > 0) {
+        } else if (this.frameStackDepth > 0 && !options?.directThunkReturn) {
             Logger.warn(LogCategory.CALLBACK,
                 `Suspended frame stack has depth=${this.frameStackDepth} but callback 0x${stub.callbackId.toString(16)} has no completion handler`);
         }
@@ -1326,6 +1572,8 @@ export class CallbackManager {
         this.pendingCallbacks.clear();
         this.resetPendingSlots();
         this.nextCallbackId = 1;
+        this.calleeSavedRepairs = 0;
+        this.lastCalleeSavedWarnMs = 0;
         this.resetSuspendedFrames();
         // Re-initialize stubs in memory just in case
         this.initialize();
@@ -1334,6 +1582,54 @@ export class CallbackManager {
 
     hasSavedThunkContext(): boolean {
         return this.frameStackDepth > 0;
+    }
+
+    /**
+     * Abandon a suspended-thunk frame whose callback chain never started, so the thunk can
+     * complete synchronously instead.
+     *
+     * saveSuspendedThunkContext PINS the calling thread (a real Win32 enumeration is
+     * synchronous, so the callback chain must not be preempted). A caller that saves the
+     * frame and then fails to dispatch even one callback — invokeCallback refused
+     * (nesting limit, frame not found) or threw (null target, stack bounds, slot
+     * exhaustion), or the enumeration bailed before its first invoke — would otherwise
+     * leave the thread pinned for good AND return "suspended" to a dispatcher that then
+     * waits for a callback nobody will ever issue: a silent freeze with no fault.
+     * Releasing the frame here unpins the owner and drops any callbacks already bound to
+     * it; the caller must then return a normal HRESULT, not `suspendedForCallback`.
+     *
+     * Returns true when a live frame was found and released.
+     */
+    abandonSuspendedFrame(frameId: number): boolean {
+        const target = frameId >>> 0;
+        const frameIndex = this.findFrameIndexById(target);
+        if (frameIndex < 0) return false;
+
+        const source = this.frameSource[frameIndex] || 'unknown';   // releaseFrame clears it
+        for (const [cbId, cb] of this.pendingCallbacks.entries()) {
+            if ((cb.frameId ?? 0) !== target) continue;
+            const stub = this.stubsById.get(cbId);
+            if (stub) this.releaseCallback(cbId, stub);
+            else { this.pendingCallbacks.delete(cbId); this.untrackPendingCallback(cbId); }
+        }
+        this.releaseFrame(frameIndex);
+
+        Logger.warn(LogCategory.CALLBACK,
+            `Abandoned suspended frame ${target} (${source}): ` +
+            `no callback was dispatched — thunk completes synchronously`);
+        return true;
+    }
+
+    /**
+     * Return the innermost live suspended thunk frame.
+     *
+     * A Win32 API can be entered from a guest callback whose return address is one of
+     * our callback stubs (for example subclass proc -> DefWindowProc -> SendMessage).
+     * Such an API must extend the callback's existing completion chain rather than try
+     * to suspend the synthetic callback-stub frame as a new guest thunk.
+     */
+    getActiveSuspendedFrameId(): number {
+        return this.getTopSuspendedFrameId();
     }
 
     getStubPoolRange(): { base: number; end: number } {
@@ -1353,6 +1649,7 @@ export class CallbackManager {
         return {
             pendingCount: this.pendingSlotCount,
             thunkContextDepth: this.frameStackDepth,
+            calleeSavedRepairs: this.calleeSavedRepairs,
             lastInvoke: copy(this.lastInvokeForensics),
             lastReturn: copy(this.lastReturnForensics),
             suspendedFrames: this.snapshotSuspendedFrames(),
@@ -1377,5 +1674,32 @@ export class CallbackManager {
         if (a === 0 || a < 0x1000) return true;
         if (a >= MEM_THUNK_CODE_BASE && a < MEM_THUNK_CODE_BASE + MEM_THUNK_CODE_SIZE) return true;
         return false;
+    }
+
+    /**
+     * True when `addr` lands inside the RUNNING thread's guest stack.
+     *
+     * An address we are about to set EIP to came out of a stack slot; if it points back
+     * into that same stack it is data the guest overwrote, not code, and jumping there
+     * executes the stack. That is the signature of a skewed RET N (a stub-cleanup
+     * mismatch, a stdcall/cdecl mix-up) and it must be a NAMED fatal, not a silent jump.
+     *
+     * The bounds come from the scheduler because thread stacks are carved out of HEAP:
+     * there is no RegionKind to ask, and a fixed address window cannot answer it at all.
+     * Only the current thread is checked — it owns the live frame, and a per-return scan
+     * of every thread would put an allocation and a loop on a path that runs once per
+     * callback. A base of 0 means the main stack was never registered: report nothing
+     * rather than swallow the address space whole.
+     */
+    private isGuestStackAddress(addr: number): boolean {
+        try {
+            const scheduler = System.getInstance().scheduler;
+            const bounds = scheduler.getThreadStackBounds(scheduler.getCurrentThreadId() >>> 0);
+            if (!bounds || bounds.base < 0x1000) return false;
+            const a = addr >>> 0;
+            return a >= bounds.base && a < bounds.top;
+        } catch {
+            return false;   // scheduler not up yet (early boot) — nothing to compare against
+        }
     }
 }

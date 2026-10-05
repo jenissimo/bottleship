@@ -10,6 +10,7 @@ export interface CrtMbHost {
     compareCString(aPtr: number, bPtr: number, ignoreCase: boolean, max: number): number;
     ischartype(ch: number, mask: number): number;
     setMbcp(codepage: number): number;
+    getMbcp(): number;
 }
 
 export function registerCrtMbExports(exports: Record<string, ThunkImplementation>, host: CrtMbHost): void {
@@ -159,4 +160,31 @@ export function registerCrtMbExports(exports: Record<string, ThunkImplementation
     exports["_ismbcdigit"] = (_c, _m, a) => host.ischartype(a[0] ?? 0, 0x0004);
 
     exports["_setmbcp"] = (_c, _m, a) => host.setMbcp(a[0] ?? 0);
+    exports["_getmbcp"] = () => host.getMbcp();
+
+    exports["_mbsicmp"] = (_c, _m, a) => host.compareCString(a[0] ?? 0, a[1] ?? 0, true, 0);
+
+    // unsigned char* _mbsnbcpy(dst, src, count) — strncpy over bytes: copies at most
+    // count bytes and zero-pads the remainder, so it does NOT guarantee termination.
+    exports["_mbsnbcpy"] = (_c, _m, a) => {
+        const dst = a[0] ?? 0, src = a[1] ?? 0, count = (a[2] ?? 0) >>> 0;
+        if (!dst || count === 0) return dst >>> 0;
+        const out = new Uint8Array(count);
+        for (let i = 0; i < count; i++) {
+            const b = chr(src, i);
+            if (b === 0) break;
+            out[i] = b;
+        }
+        Mem.writeBytes(dst, out);
+        return dst >>> 0;
+    };
+
+    exports["_mbctolower"] = (_c, _m, a) => {
+        const c = (a[0] ?? 0) & 0xffff;
+        return c >= 0x41 && c <= 0x5a ? c + 0x20 : c;
+    };
+    exports["_mbctoupper"] = (_c, _m, a) => {
+        const c = (a[0] ?? 0) & 0xffff;
+        return c >= 0x61 && c <= 0x7a ? c - 0x20 : c;
+    };
 }

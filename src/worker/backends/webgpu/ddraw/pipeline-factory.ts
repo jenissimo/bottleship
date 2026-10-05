@@ -6,6 +6,7 @@
 import { Logger, LogCategory } from "../../../core/logger";
 import { System } from "../../../core/system";
 import { isBitmapTexture } from "../../../modules/ddraw/com-objects";
+import { normalizePortableWebGpuSampleCount } from "../shared/msaa-policy";
 import {
     D3DRENDERSTATE_CULLMODE,
     D3DRENDERSTATE_SHADEMODE,
@@ -58,32 +59,108 @@ import {
     D3DTFN_POINT,
     D3DTFG_POINT,
 } from "../../../modules/ddraw/constants";
-import { DebugFlags, generatePipelineKey, generateMegaBatchPipelineKey, PipelineKeyConfig, pipelineKeyConfigsEqual, megaBatchPipelineKeyConfigsEqual } from "./types";
+import { DebugFlags, generatePipelineKey, generateMegaBatchPipelineKey, PipelineKeyConfig, makeEmptyPipelineKeyConfig,
+    pipelineKeyConfigsEqual, megaBatchPipelineKeyConfigsEqual } from "./types";
 import { ShaderGenerator, ShaderConfig } from "./shader-generator";
 import { BindGroupManager } from "./bind-group-manager";
 import { DirectDrawSurfaceState } from "../../../modules/ddraw/com-objects";
 import { FfpStagesState, MAX_FFP_SAMPLED_STAGES } from "./ffp-stages";
+import { dwordToUnsignedLong } from "../shared/dword";
+import {
+    mapBlendFactor as sharedMapBlendFactor, mapBlendOp as sharedMapBlendOp, fixupBoth,
+    isKnownBlendFactor, isKnownBlendOperation, hasDualSourceBlendFactor,
+    D3DBLEND_ZERO, D3DBLEND_SRCCOLOR, D3DBLEND_INVSRCCOLOR,
+    D3DBLEND_SRCCOLOR2, D3DBLEND_INVSRCCOLOR2, D3DBLENDOP_ADD,
+} from "../shared/d3d-blend-factor";
+
+/** D3DRS_COLORWRITEENABLE / D3DRS_BLENDOP (d3d8types.h). D3D7's render-state enum stops at
+ *  152 and has neither, so on the DDraw/D3D7 half of this shared factory the seeded
+ *  defaults (all channels, ADD) are what every draw reads — exactly D3D7's fixed
+ *  behaviour. The DX and WebGPU channel bits agree bit-for-bit (RED=1, GREEN=2, BLUE=4,
+ *  ALPHA=8), so the mask needs no translation. */
+const D3DRENDERSTATE_COLORWRITEENABLE = 168;
+const D3DRENDERSTATE_BLENDOP = 171;
+const COLOR_WRITE_ALL = 0xf;
 
 /**
- * Maps D3D blend factor to WebGPU blend factor
+ * Maps a D3DBLEND factor to WebGPU, applying the DirectX-6 BOTH*SRCALPHA legacy fixup
+ * (D3DBLEND_BOTHSRCALPHA/BOTHINVSRCALPHA imply BOTH factors and DESTBLEND is ignored —
+ * see shared/d3d-blend-factor.ts `fixupBoth`, the same rule d3d9-blend.ts applies). An
+ * out-of-range or dual-source enum is refused rather than silently mapped to a plausible
+ * default — that silent-default was exactly F1's failure mode (docs/d3d8-parity/07-unification-map.md §2.1).
+ * The refusal is an INTERNAL invariant: every per-draw caller passes a value that already
+ * went through `sanitizeBlendFactor`, so guest state can never reach the throw.
  */
-function mapBlendFactor(blend: number): GPUBlendFactor {
-    // D3DBLEND_*: 1=ZERO, 2=ONE, 3=SRCCOLOR, 4=INVSRCCOLOR, 5=SRCALPHA, 6=INVSRCALPHA,
-    // 7=DESTALPHA, 8=INVDESTALPHA, 9=DESTCOLOR, 10=INVDESTCOLOR, 11=SRCALPHASAT
-    switch (blend | 0) {
-        case 1: return "zero";
-        case 2: return "one";
-        case 3: return "src";
-        case 4: return "one-minus-src";
-        case 5: return "src-alpha";
-        case 6: return "one-minus-src-alpha";
-        case 7: return "dst-alpha";
-        case 8: return "one-minus-dst-alpha";
-        case 9: return "dst";
-        case 10: return "one-minus-dst";
-        case 11: return "src-alpha-saturated";
-        default: return "src-alpha";
+export function mapBlendFactor(blend: number): GPUBlendFactor {
+    const normalized = blend >>> 0;
+    if (!isKnownBlendFactor(normalized) || hasDualSourceBlendFactor(normalized)) {
+        throw new Error(`PipelineFactory: unrepresentable D3DBLEND factor ${blend}`);
     }
+    return sharedMapBlendFactor(normalized);
+}
+
+/**
+ * Maps D3DBLENDOP to a WebGPU blend operation. An out-of-range enum is refused rather
+ * than silently defaulted to ADD (see mapBlendFactor above).
+ */
+export function mapBlendOperation(d3dBlendOp: number): GPUBlendOperation {
+    const normalized = d3dBlendOp >>> 0;
+    if (!isKnownBlendOperation(normalized)) {
+        throw new Error(`PipelineFactory: unrepresentable D3DBLENDOP ${d3dBlendOp}`);
+    }
+    return sharedMapBlendOp(normalized);
+}
+
+/**
+ * Reduce a guest D3DBLEND word to one this backend can build a pipeline from. Render state
+ * reaches a draw unvalidated, and `getOrCreatePipeline` runs INSIDE an open render pass: an
+ * exception escaping it unwinds past `currentRenderPass.end()` and loses the whole frame's
+ * command buffer — every draw AND every upload recorded on that encoder. Real drivers decode
+ * instead of failing (DXVK d3d9_util.cpp DecodeBlendFactor falls through to ZERO), so an
+ * unknown enum degrades to ZERO and dual-source — which needs a WebGPU feature this backend
+ * does not enable — degrades to its single-source counterpart.
+ */
+export function sanitizeBlendFactor(blend: number): number {
+    const normalized = blend >>> 0;
+    if (normalized === D3DBLEND_SRCCOLOR2) return D3DBLEND_SRCCOLOR;
+    if (normalized === D3DBLEND_INVSRCCOLOR2) return D3DBLEND_INVSRCCOLOR;
+    if (isKnownBlendFactor(normalized)) return normalized;
+    reportDegradedBlendState("D3DBLEND factor", normalized, D3DBLEND_ZERO);
+    return D3DBLEND_ZERO;
+}
+
+/** D3DBLENDOP counterpart of sanitizeBlendFactor (DXVK's DecodeBlendOp defaults to ADD). */
+export function sanitizeBlendOperation(d3dBlendOp: number): number {
+    const normalized = d3dBlendOp >>> 0;
+    if (isKnownBlendOperation(normalized)) return normalized;
+    reportDegradedBlendState("D3DBLENDOP", normalized, D3DBLENDOP_ADD);
+    return D3DBLENDOP_ADD;
+}
+
+/** Census for the degradation above: one line per distinct bad value, bounded so a state word
+ *  that is garbage every draw cannot drown the log. */
+const degradedBlendStatesSeen = new Set<string>();
+function reportDegradedBlendState(what: string, value: number, replacement: number): void {
+    if (degradedBlendStatesSeen.size >= 32) return;
+    const key = `${what}:${value}`;
+    if (degradedBlendStatesSeen.has(key)) return;
+    degradedBlendStatesSeen.add(key);
+    Logger.warn(
+        LogCategory.SYSTEM,
+        `PipelineFactory: unrepresentable ${what} ${value} — drawing with ${replacement} instead`
+    );
+}
+
+/**
+ * Resolve the (src, dst) blend-factor pair actually in effect: apply the D3D "unwritten
+ * state" defaults, then the BOTH*SRCALPHA fixup (which makes DESTBLEND's value moot when
+ * SRCBLEND names one of the legacy BOTH* factors). Callers key their pipeline cache on
+ * this resolved pair, not the raw render-state DWORDs, so a game that only ever writes
+ * SRCBLEND=BOTHSRCALPHA still gets a cache hit regardless of DESTBLEND's stale value.
+ */
+export function resolveBlendFactors(srcBlend: number, dstBlend: number, defaultSrc: number, defaultDst: number): [number, number] {
+    const [src, dst] = fixupBoth(srcBlend || defaultSrc, dstBlend || defaultDst);
+    return [sanitizeBlendFactor(src), sanitizeBlendFactor(dst)];
 }
 
 /**
@@ -130,42 +207,6 @@ function mapStencilOperation(d3dStencilOp: number): GPUStencilOperation {
     }
 }
 
-function shouldUseLegacyPointSample(
-    useTexture: boolean,
-    minFilter: number,
-    magFilter: number,
-    forcePointFilter: boolean,
-    disablePointUvBias: boolean
-): boolean {
-    if (!useTexture || disablePointUvBias) return false;
-
-    const effectiveMin = forcePointFilter ? D3DTFN_POINT : (minFilter || D3DTFN_POINT);
-    const effectiveMag = forcePointFilter ? D3DTFG_POINT : (magFilter || D3DTFG_POINT);
-    return effectiveMin === D3DTFN_POINT && effectiveMag === D3DTFG_POINT;
-}
-
-/** Bit N = sampled stage N uses the legacy POINT texel-selection bias in the shader. */
-function computePointSampleMask(
-    stages: FfpStagesState,
-    colorKeyActive: boolean,
-    debugFlags: DebugFlags
-): number {
-    let mask = 0;
-    for (let s = 0; s < MAX_FFP_SAMPLED_STAGES; s++) {
-        const sampled = (stages.sampledMask & (1 << s)) !== 0;
-        if (shouldUseLegacyPointSample(
-            sampled,
-            stages.minFilter[s],
-            stages.magFilter[s],
-            debugFlags.forcePointFilter || (s === 0 && colorKeyActive),
-            debugFlags.disablePointUvBias
-        )) {
-            mask |= 1 << s;
-        }
-    }
-    return mask;
-}
-
 /**
  * Factory for creating and caching render pipelines
  */
@@ -175,6 +216,16 @@ export class PipelineFactory {
     private bindGroupManager: BindGroupManager;
     private debugFlags: DebugFlags;
     private swapChainFormat: GPUTextureFormat;
+    // Colour format of the render target the next pipeline will be used with. A pipeline's
+    // fragment target format must EQUAL the pass attachment's format or WebGPU rejects the
+    // pass ("Attachment state of RenderPipeline is not compatible with RenderPassEncoder")
+    // and invalidates the whole command buffer — silently dropping every draw AND every
+    // texture upload recorded on that encoder. It is NOT always the swapchain format: a
+    // DirectDraw surface owns its texture, and paths that recreate it (the presenter's
+    // RGB565/PALETTE8 conversion needs an rgba8unorm target) legitimately give a
+    // bgra8unorm-swapchain build an rgba8unorm render target. Keyed, not cleared, so a game
+    // alternating targets of different formats does not thrash the cache.
+    private colorFormat: GPUTextureFormat;
     // MSAA sample count (1 = off). Must equal the color + depth attachment sampleCount at
     // draw time. Baked into every pipeline's `multisample.count` and the cache key.
     private sampleCount = 1;
@@ -183,6 +234,26 @@ export class PipelineFactory {
     private pipelineCache = new Map<string, GPURenderPipeline>();
 
     // Last-config fast path: avoids string allocation + Map lookup on consecutive same-state draws.
+    // Double-buffered key scratch: the fast path RETAINS the previous config by reference,
+    // so a single reusable object would alias `last` and make every comparison trivially
+    // equal — returning the previous pipeline for a changed state. Flipping only on a miss
+    // (the only moment `last` is reassigned) keeps write target and `last` distinct.
+    private readonly getPipelineKeyScratch: [PipelineKeyConfig, PipelineKeyConfig] =
+        [makeEmptyPipelineKeyConfig(), makeEmptyPipelineKeyConfig()];
+    private getPipelineKeyIdx = 0;
+    private readonly megaBatchKeyScratch: [PipelineKeyConfig, PipelineKeyConfig] =
+        [makeEmptyPipelineKeyConfig(), makeEmptyPipelineKeyConfig()];
+    private megaBatchKeyIdx = 0;
+    /** Cached ddraw module for the frame counters — a registry lookup per draw is not free. */
+    private cachedDDrawModule: any = null;
+    private cachedDDrawModuleResolved = false;
+    private ddrawModule(): any {
+        if (!this.cachedDDrawModuleResolved) {
+            this.cachedDDrawModuleResolved = true;
+            this.cachedDDrawModule = System.getInstance().process?.getModule("ddraw");
+        }
+        return this.cachedDDrawModule;
+    }
     private lastGetPipelineConfig: PipelineKeyConfig | null = null;
     private lastGetPipelinePipeline: GPURenderPipeline | null = null;
 
@@ -192,6 +263,18 @@ export class PipelineFactory {
 
     // Warn-once flag for XYZ without MVP
     private warnedXYZNoMVP = false;
+
+    /**
+     * D3DRS_COLORWRITEENABLE for this draw, as a 4-bit RGBA mask, read literally: 0 is the
+     * app asking for a depth/stencil-only pass, not an unwritten slot. Both state tables
+     * that reach this factory seed the API default 0xF (ddraw's createDefaultRenderStates,
+     * the D3D8 adapter's reset defaults), verified on a live device of each kind.
+     */
+    private colorWriteMask(renderStates: Int32Array): number {
+        const forced = this.debugFlags.forceColorWriteMask;
+        if (forced >= 0) return forced & COLOR_WRITE_ALL;
+        return renderStates[D3DRENDERSTATE_COLORWRITEENABLE] & COLOR_WRITE_ALL;
+    }
 
     constructor(
         device: GPUDevice,
@@ -205,14 +288,16 @@ export class PipelineFactory {
         this.bindGroupManager = bindGroupManager;
         this.debugFlags = debugFlags;
         this.swapChainFormat = swapChainFormat;
+        this.colorFormat = swapChainFormat;
     }
 
-    /**
-     * Update debug flags and invalidate cache
-     */
-    setDebugFlags(flags: DebugFlags): void {
-        this.debugFlags = flags;
-        this.pipelineCache.clear();
+    /** Declare the colour format of the render target subsequent pipelines will draw into.
+     *  Called when a render pass is opened; see `colorFormat`. */
+    setColorTargetFormat(format: GPUTextureFormat): void {
+        if (format === this.colorFormat) return;
+        this.colorFormat = format;
+        // The last-config fast paths memoise a pipeline for a config that no longer implies
+        // this format; drop them so the next draw re-keys.
         this.lastGetPipelineConfig = null;
         this.lastGetPipelinePipeline = null;
         this.lastMegaBatchConfig = null;
@@ -220,17 +305,24 @@ export class PipelineFactory {
     }
 
     /**
-     * Set the MSAA sample count (from quality.msaa). Clamps to {1,2,4}. On change, ALL cached
+     * Update debug flags and invalidate cache
+     */
+    setDebugFlags(flags: DebugFlags): void {
+        this.debugFlags = flags;
+        this.invalidateCache();
+    }
+
+    /**
+     * Set the MSAA sample count (from quality.msaa). Clamps to {1,4}. On change, ALL cached
      * pipelines are invalidated (they baked the old sampleCount into multisample.count) and the
      * fast-path configs cleared. Returns true if the count actually changed. sampleCount===1 is
      * the default and produces `multisample.count:1` — WebGPU's default → byte-identical output.
      */
     setSampleCount(n: number): boolean {
-        const clamped = n >= 4 ? 4 : n >= 2 ? 2 : 1;
+        const clamped = normalizePortableWebGpuSampleCount(n);
         if (clamped === this.sampleCount) return false;
         this.sampleCount = clamped;
         this.invalidateCache();
-        this.megaBatchPipelineCache.clear();
         return true;
     }
 
@@ -248,6 +340,10 @@ export class PipelineFactory {
      */
     invalidateCache(): void {
         this.pipelineCache.clear();
+        // Both caches: the MegaBatch pipelines bake the same debug flags and sample count,
+        // so leaving them behind makes a flag A/B read as "no effect" on every batched
+        // draw — which is most of them.
+        this.megaBatchPipelineCache.clear();
         this.lastGetPipelineConfig = null;
         this.lastGetPipelinePipeline = null;
         this.lastMegaBatchConfig = null;
@@ -280,8 +376,9 @@ export class PipelineFactory {
         const dstBlend = renderStates[D3DRENDERSTATE_DESTBLEND];
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
+        const colorWriteMask = this.colorWriteMask(renderStates);
+        const blendOp = sanitizeBlendOperation(renderStates[D3DRENDERSTATE_BLENDOP]);
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
-        const pointSampleMask = computePointSampleMask(stages, colorKeyActive, this.debugFlags);
 
         // Read stencil states
         const stencilEnable = renderStates[D3DRENDERSTATE_STENCILENABLE] || 0;
@@ -289,17 +386,30 @@ export class PipelineFactory {
         const stencilFail = renderStates[D3DRENDERSTATE_STENCILFAIL] || D3DSTENCILOP_KEEP;
         const stencilZFail = renderStates[D3DRENDERSTATE_STENCILZFAIL] || D3DSTENCILOP_KEEP;
         const stencilPass = renderStates[D3DRENDERSTATE_STENCILPASS] || D3DSTENCILOP_KEEP;
-        const stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
-        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK] ?? 0xff;
-        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK] ?? 0xff;
+        const stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
+        // No `?? 0xff` fallback: an Int32Array element is never undefined, so the old one
+        // could never fire. The masks' 0xFF defaults are seeded in the state tables.
+        const stencilMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILMASK]);
+        const stencilWriteMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILWRITEMASK]);
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
-        const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
-        const effectiveDstBlend = effectiveAlphaBlend ? (dstBlend || 1) : 0;
-        const effectiveZFunc = zEnable ? (zFunc || D3DCMP_LESSEQUAL) : 0;
+        // D3D7 unwritten-state defaults are ONE/ZERO; BOTH*SRCALPHA as SRCBLEND forces its
+        // implied dst and makes DESTBLEND's value moot (see resolveBlendFactors).
+        const [effectiveSrcBlend, effectiveDstBlend] = effectiveAlphaBlend
+            ? resolveBlendFactors(srcBlend, dstBlend, 2, 1)
+            : [0, 0];
+        // EQUAL + depth-writes-off is a coplanar overlay pass (decal / detail / lightmap). It
+        // relies on both passes interpolating identical depth, which differing triangulation
+        // breaks into a crawling dither. LESSEQUAL asks the same question robustly — nearer
+        // geometry still occludes it. NOTE: a divergence from real D3D (Wine and DXVK map
+        // D3DCMP_EQUAL straight through); confined to depth-write-off passes so anything using
+        // EQUAL while AUTHORING depth keeps exact semantics.
+        const zFuncCoplanar = (zFunc === D3DCMP_EQUAL && !zWrite) ? D3DCMP_LESSEQUAL : zFunc;
+        const coplanarPass = (zEnable && zFunc === D3DCMP_EQUAL && !zWrite) ? 1 : 0;
+        const effectiveZFunc = zEnable ? (zFuncCoplanar || D3DCMP_LESSEQUAL) : 0;
         const effectiveZWrite = zEnable ? (zWrite ? 1 : 0) : 0;
         const keyAlphaBlend = (effectiveAlphaBlend && !this.debugFlags.forceDisableAlphaBlend) ? 1 : 0;
-        
+
         const hasDiffuse = (vertexType & D3DFVF_DIFFUSE) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
         // UI detection: XYZRHW (pre-transformed) + no texture + diffuse only + fan/strip
@@ -313,55 +423,62 @@ export class PipelineFactory {
         }
         // (No RHW CW<->CCW swap: XYZRHW is culled identically to non-RHW — the old swap
         // inverted culling for pre-transformed geometry. See the cull-mode build below.)
-        const keyConfig: PipelineKeyConfig = {
-            vertexType,
-            primitiveType,
-            sampledMask: stages.sampledMask,
-            stageCount: stages.stageCount,
-            pointSampleMask,
-            missingTexture,
-            cullMode: effectiveCullMode,
-            zEnable,
-            zFunc: effectiveZFunc,
-            zWrite: effectiveZWrite,
-            zBias: zEnable ? zBias : 0, // Only include zBias when depth testing is enabled
-            alphaBlend: keyAlphaBlend,
-            alphaTest,
-            srcBlend: effectiveSrcBlend,
-            dstBlend: effectiveDstBlend,
-            alphaFunc,
-            colorKeyEnabled: colorKeyEnabled > 0 ? 1 : 0,
-            stencilEnable: stencilEnable > 0 ? 1 : 0,
-            stencilFunc: stencilEnable > 0 ? stencilFunc : 0,
-            stencilFail: stencilEnable > 0 ? stencilFail : 0,
-            stencilZFail: stencilEnable > 0 ? stencilZFail : 0,
-            stencilPass: stencilEnable > 0 ? stencilPass : 0,
-            stencilRef,
-            stencilMask,
-            stencilWriteMask,
-            forceZMidpoint: this.debugFlags.forceZMidpoint,
-            forceCullNone: this.debugFlags.forceCullNone,
-            forceDisableZTest: this.debugFlags.forceDisableZTest,
-            debugView: this.debugFlags.debugView,
-            flatShading: renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT,
-        };
+        const keyConfig = this.getPipelineKeyScratch[this.getPipelineKeyIdx];
+        keyConfig.vertexType = vertexType;
+        keyConfig.primitiveType = primitiveType;
+        keyConfig.sampledMask = stages.sampledMask;
+        keyConfig.stageCount = stages.stageCount;
+        keyConfig.missingTexture = missingTexture;
+        keyConfig.cullMode = effectiveCullMode;
+        keyConfig.zEnable = zEnable;
+        keyConfig.zFunc = effectiveZFunc;
+        keyConfig.zWrite = effectiveZWrite;
+        keyConfig.zBias = zEnable ? zBias : 0; // Only include zBias when depth testing is enabled
+        keyConfig.coplanarPass = coplanarPass;
+        keyConfig.alphaBlend = keyAlphaBlend;
+        keyConfig.alphaTest = alphaTest;
+        keyConfig.srcBlend = effectiveSrcBlend;
+        keyConfig.dstBlend = effectiveDstBlend;
+        keyConfig.blendOp = effectiveAlphaBlend ? blendOp : 0;
+        keyConfig.alphaFunc = alphaFunc;
+        keyConfig.colorWriteMask = colorWriteMask;
+        keyConfig.colorKeyEnabled = colorKeyEnabled > 0 ? 1 : 0;
+        keyConfig.stencilEnable = stencilEnable > 0 ? 1 : 0;
+        keyConfig.stencilFunc = stencilEnable > 0 ? stencilFunc : 0;
+        keyConfig.stencilFail = stencilEnable > 0 ? stencilFail : 0;
+        keyConfig.stencilZFail = stencilEnable > 0 ? stencilZFail : 0;
+        keyConfig.stencilPass = stencilEnable > 0 ? stencilPass : 0;
+        keyConfig.stencilRef = stencilRef;
+        keyConfig.stencilMask = stencilMask;
+        keyConfig.stencilWriteMask = stencilWriteMask;
+        keyConfig.forceZMidpoint = this.debugFlags.forceZMidpoint;
+        keyConfig.forceCullNone = this.debugFlags.forceCullNone;
+        keyConfig.forceDisableZTest = this.debugFlags.forceDisableZTest;
+        keyConfig.forceDisableZWrite = this.debugFlags.forceDisableZWrite;
+        keyConfig.debugView = this.debugFlags.debugView;
+        keyConfig.forceWireColor = this.debugFlags.forceWireColor;
+        keyConfig.flatShading = renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT;
 
         // Fast path: same config as last call → return cached pipeline without string alloc
+        // `keyConfig !== last` is a safety interlock, not an optimisation: should the scratch
+        // ever alias the retained config, every comparison would be trivially equal and this
+        // would hand back the previous pipeline for a changed state. Requiring distinct objects
+        // degrades to the (correct) cache lookup instead of rendering with the wrong pipeline.
         if (this.lastGetPipelineConfig !== null &&
             this.lastGetPipelinePipeline !== null &&
+            keyConfig !== this.lastGetPipelineConfig &&
             pipelineKeyConfigsEqual(keyConfig, this.lastGetPipelineConfig)) {
             return this.lastGetPipelinePipeline;
         }
 
         // sampleCount prefix keeps MSAA and non-MSAA pipelines distinct without touching the
         // shared PipelineKeyConfig in types.ts (sampleCount is a factory-global, not per-draw).
-        const key = this.sampleCount + "|" + generatePipelineKey(keyConfig);
+        const key = this.sampleCount + "|" + this.colorFormat + "|" + generatePipelineKey(keyConfig);
 
         // Check cache
         let pipeline = this.pipelineCache.get(key);
 
-        const system = System.getInstance();
-        const ddraw = system.process?.getModule("ddraw") as any;
+        const ddraw = this.ddrawModule();
 
         if (pipeline) {
             if (ddraw?.incrementFrameCounter) {
@@ -369,6 +486,7 @@ export class PipelineFactory {
             }
             this.lastGetPipelineConfig = keyConfig;
             this.lastGetPipelinePipeline = pipeline;
+            this.getPipelineKeyIdx ^= 1;
             return pipeline;
         }
 
@@ -384,17 +502,17 @@ export class PipelineFactory {
             primitiveType,
             stages.sampledMask,
             stages.stageCount,
-            pointSampleMask,
             missingTexture,
             d3dCull,
             zEnable,
-            zFunc,
+            effectiveZFunc,
             zWrite,
             zBias,
+            coplanarPass,
             effectiveAlphaBlend, // Use normalized value
             alphaTest,
-            srcBlend,
-            dstBlend,
+            effectiveSrcBlend,
+            effectiveDstBlend,
             alphaFunc,
             colorKeyEnabled > 0 ? 1 : 0,
             stencilEnable > 0 ? 1 : 0,
@@ -406,12 +524,15 @@ export class PipelineFactory {
             stencilMask,
             stencilWriteMask,
             needsUVFlip,
-            keyConfig.flatShading
+            keyConfig.flatShading,
+            colorWriteMask,
+            blendOp
         );
 
         this.pipelineCache.set(key, pipeline);
         this.lastGetPipelineConfig = keyConfig;
         this.lastGetPipelinePipeline = pipeline;
+        this.getPipelineKeyIdx ^= 1;
         Logger.verbose(LogCategory.SYSTEM, `PipelineFactory: Created new pipeline with key: ${key}`);
         return pipeline;
     }
@@ -445,21 +566,34 @@ export class PipelineFactory {
         const dstBlend = renderStates[D3DRENDERSTATE_DESTBLEND];
         const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC];
         const colorKeyEnabled = renderStates[D3DRENDERSTATE_COLORKEYENABLE] || 0;
+        const colorWriteMask = this.colorWriteMask(renderStates);
+        const blendOp = sanitizeBlendOperation(renderStates[D3DRENDERSTATE_BLENDOP]);
         const colorKeyActive = useTexture && !!texture?.srcColorKey && colorKeyEnabled !== 0;
-        const pointSampleMask = computePointSampleMask(stages, colorKeyActive, this.debugFlags);
         const stencilEnable = renderStates[D3DRENDERSTATE_STENCILENABLE] || 0;
         const stencilFunc = renderStates[D3DRENDERSTATE_STENCILFUNC] || D3DCMP_ALWAYS;
         const stencilFail = renderStates[D3DRENDERSTATE_STENCILFAIL] || D3DSTENCILOP_KEEP;
         const stencilZFail = renderStates[D3DRENDERSTATE_STENCILZFAIL] || D3DSTENCILOP_KEEP;
         const stencilPass = renderStates[D3DRENDERSTATE_STENCILPASS] || D3DSTENCILOP_KEEP;
-        const stencilRef = renderStates[D3DRENDERSTATE_STENCILREF] || 0;
-        const stencilMask = renderStates[D3DRENDERSTATE_STENCILMASK] ?? 0xff;
-        const stencilWriteMask = renderStates[D3DRENDERSTATE_STENCILWRITEMASK] ?? 0xff;
+        const stencilRef = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILREF]);
+        // See getOrCreatePipeline: the `??` fallback this used to carry was dead code.
+        const stencilMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILMASK]);
+        const stencilWriteMask = dwordToUnsignedLong(renderStates[D3DRENDERSTATE_STENCILWRITEMASK]);
 
         const effectiveAlphaBlend = alphaBlend ? 1 : 0;
-        const effectiveSrcBlend = effectiveAlphaBlend ? (srcBlend || 2) : 0;
-        const effectiveDstBlend = effectiveAlphaBlend ? (dstBlend || 1) : 0;
-        const effectiveZFunc = zEnable ? (zFunc || D3DCMP_LESSEQUAL) : 0;
+        // D3D7 unwritten-state defaults are ONE/ZERO; BOTH*SRCALPHA as SRCBLEND forces its
+        // implied dst and makes DESTBLEND's value moot (see resolveBlendFactors).
+        const [effectiveSrcBlend, effectiveDstBlend] = effectiveAlphaBlend
+            ? resolveBlendFactors(srcBlend, dstBlend, 2, 1)
+            : [0, 0];
+        // EQUAL + depth-writes-off is a coplanar overlay pass (decal / detail / lightmap). It
+        // relies on both passes interpolating identical depth, which differing triangulation
+        // breaks into a crawling dither. LESSEQUAL asks the same question robustly — nearer
+        // geometry still occludes it. NOTE: a divergence from real D3D (Wine and DXVK map
+        // D3DCMP_EQUAL straight through); confined to depth-write-off passes so anything using
+        // EQUAL while AUTHORING depth keeps exact semantics.
+        const zFuncCoplanar = (zFunc === D3DCMP_EQUAL && !zWrite) ? D3DCMP_LESSEQUAL : zFunc;
+        const coplanarPass = (zEnable && zFunc === D3DCMP_EQUAL && !zWrite) ? 1 : 0;
+        const effectiveZFunc = zEnable ? (zFuncCoplanar || D3DCMP_LESSEQUAL) : 0;
         const effectiveZWrite = zEnable ? (zWrite ? 1 : 0) : 0;
         const keyAlphaBlend = (effectiveAlphaBlend && !this.debugFlags.forceDisableAlphaBlend) ? 1 : 0;
 
@@ -476,55 +610,61 @@ export class PipelineFactory {
         // inverted culling for pre-transformed geometry. See the cull-mode build below.)
 
         // Generate cache key with "mb_" prefix for MegaBatch
-        const keyConfig: PipelineKeyConfig = {
-            vertexType,
-            primitiveType,
-            sampledMask: stages.sampledMask,
-            stageCount: stages.stageCount,
-            pointSampleMask,
-            missingTexture,
-            cullMode: effectiveCullMode,
-            zEnable,
-            zFunc: effectiveZFunc,
-            zWrite: effectiveZWrite,
-            zBias: zEnable ? zBias : 0,
-            alphaBlend: keyAlphaBlend,
-            alphaTest,
-            srcBlend: effectiveSrcBlend,
-            dstBlend: effectiveDstBlend,
-            alphaFunc,
-            colorKeyEnabled: colorKeyEnabled > 0 ? 1 : 0,
-            stencilEnable: stencilEnable > 0 ? 1 : 0,
-            stencilFunc: stencilEnable > 0 ? stencilFunc : 0,
-            stencilFail: stencilEnable > 0 ? stencilFail : 0,
-            stencilZFail: stencilEnable > 0 ? stencilZFail : 0,
-            stencilPass: stencilEnable > 0 ? stencilPass : 0,
-            stencilRef,
-            stencilMask,
-            stencilWriteMask,
-            forceZMidpoint: this.debugFlags.forceZMidpoint,
-            forceCullNone: this.debugFlags.forceCullNone,
-            forceDisableZTest: this.debugFlags.forceDisableZTest,
-            debugView: this.debugFlags.debugView,
-            flatShading: renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT,
-        };
+        const keyConfig = this.megaBatchKeyScratch[this.megaBatchKeyIdx];
+        keyConfig.vertexType = vertexType;
+        keyConfig.primitiveType = primitiveType;
+        keyConfig.sampledMask = stages.sampledMask;
+        keyConfig.stageCount = stages.stageCount;
+        keyConfig.missingTexture = missingTexture;
+        keyConfig.cullMode = effectiveCullMode;
+        keyConfig.zEnable = zEnable;
+        keyConfig.zFunc = effectiveZFunc;
+        keyConfig.zWrite = effectiveZWrite;
+        keyConfig.zBias = zEnable ? zBias : 0;
+        keyConfig.coplanarPass = coplanarPass;
+        keyConfig.alphaBlend = keyAlphaBlend;
+        keyConfig.alphaTest = alphaTest;
+        keyConfig.srcBlend = effectiveSrcBlend;
+        keyConfig.dstBlend = effectiveDstBlend;
+        keyConfig.blendOp = effectiveAlphaBlend ? blendOp : 0;
+        keyConfig.alphaFunc = alphaFunc;
+        keyConfig.colorWriteMask = colorWriteMask;
+        keyConfig.colorKeyEnabled = colorKeyEnabled > 0 ? 1 : 0;
+        keyConfig.stencilEnable = stencilEnable > 0 ? 1 : 0;
+        keyConfig.stencilFunc = stencilEnable > 0 ? stencilFunc : 0;
+        keyConfig.stencilFail = stencilEnable > 0 ? stencilFail : 0;
+        keyConfig.stencilZFail = stencilEnable > 0 ? stencilZFail : 0;
+        keyConfig.stencilPass = stencilEnable > 0 ? stencilPass : 0;
+        keyConfig.stencilRef = stencilRef;
+        keyConfig.stencilMask = stencilMask;
+        keyConfig.stencilWriteMask = stencilWriteMask;
+        keyConfig.forceZMidpoint = this.debugFlags.forceZMidpoint;
+        keyConfig.forceCullNone = this.debugFlags.forceCullNone;
+        keyConfig.forceDisableZTest = this.debugFlags.forceDisableZTest;
+        keyConfig.forceDisableZWrite = this.debugFlags.forceDisableZWrite;
+        keyConfig.debugView = this.debugFlags.debugView;
+        keyConfig.forceWireColor = this.debugFlags.forceWireColor;
+        keyConfig.flatShading = renderStates[D3DRENDERSTATE_SHADEMODE] === D3DSHADE_FLAT;
 
         // Fast path: same config as last call → return cached pipeline without string alloc
+        // Distinct-object interlock — see getOrCreatePipeline.
         if (this.lastMegaBatchConfig !== null &&
             this.lastMegaBatchPipeline !== null &&
+            keyConfig !== this.lastMegaBatchConfig &&
             megaBatchPipelineKeyConfigsEqual(keyConfig, this.lastMegaBatchConfig)) {
             return this.lastMegaBatchPipeline;
         }
 
         // Use MegaBatch key generator (excludes alphaTest/alphaFunc - they're dynamic uniforms).
         // sampleCount prefix segregates MSAA pipelines (see getOrCreatePipeline).
-        const key = "mb_" + this.sampleCount + "|" + generateMegaBatchPipelineKey(keyConfig);
+        const key = "mb_" + this.sampleCount + "|" + this.colorFormat + "|" + generateMegaBatchPipelineKey(keyConfig);
 
         // Check cache
         let pipeline = this.megaBatchPipelineCache.get(key);
         if (pipeline) {
             this.lastMegaBatchConfig = keyConfig;
             this.lastMegaBatchPipeline = pipeline;
+            this.megaBatchKeyIdx ^= 1;
             return pipeline;
         }
 
@@ -536,17 +676,17 @@ export class PipelineFactory {
             primitiveType,
             stages.sampledMask,
             stages.stageCount,
-            pointSampleMask,
             missingTexture,
             d3dCull,
             zEnable,
-            zFunc,
+            effectiveZFunc,
             zWrite,
             zBias,
+            coplanarPass,
             effectiveAlphaBlend,
             alphaTest,
-            srcBlend,
-            dstBlend,
+            effectiveSrcBlend,
+            effectiveDstBlend,
             alphaFunc,
             colorKeyEnabled > 0 ? 1 : 0,
             stencilEnable > 0 ? 1 : 0,
@@ -558,12 +698,15 @@ export class PipelineFactory {
             stencilMask,
             stencilWriteMask,
             needsUVFlip,
-            keyConfig.flatShading
+            keyConfig.flatShading,
+            colorWriteMask,
+            blendOp
         );
 
         this.megaBatchPipelineCache.set(key, pipeline);
         this.lastMegaBatchConfig = keyConfig;
         this.lastMegaBatchPipeline = pipeline;
+        this.megaBatchKeyIdx ^= 1;
         Logger.verbose(LogCategory.SYSTEM, `PipelineFactory: Created MegaBatch pipeline with key: ${key}`);
         return pipeline;
     }
@@ -573,13 +716,13 @@ export class PipelineFactory {
         primitiveType: number,
         sampledMask: number,
         stageCount: number,
-        pointSampleMask: number,
         missingTexture: boolean,
         d3dCull: number,
         zEnable: number,
         zFunc: number,
         zWrite: number,
         zBias: number,
+        coplanarPass: number,
         effectiveAlphaBlend: number,
         alphaTest: number,
         srcBlend: number,
@@ -595,7 +738,9 @@ export class PipelineFactory {
         stencilMask: number,
         stencilWriteMask: number,
         needsUVFlip: boolean,
-        flatShading: boolean
+        flatShading: boolean,
+        colorWriteMask: number,
+        blendOp: number
     ): GPURenderPipeline {
         const useTexture = (sampledMask & 1) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
@@ -642,7 +787,6 @@ export class PipelineFactory {
         const shaderConfig: ShaderConfig = {
             sampledMask,
             stageCount,
-            pointSampleMask,
             flatShading,
             alphaTestEnabled: this.debugFlags.forceDisableAlphaTest ? false : alphaTest !== 0,
             alphaFunc,
@@ -656,19 +800,19 @@ export class PipelineFactory {
         };
         const shader = this.shaderGenerator.getOrCreateMegaBatchShader(shaderConfig);
 
-        const effectiveSrcBlend = srcBlend || 2;
-        const effectiveDstBlend = dstBlend || 1;
+        // srcBlend/dstBlend arrive already resolved (unwritten-state defaults applied, and
+        // the BOTH*SRCALPHA legacy fixup expanded) — see resolveBlendFactors in the caller.
         const blendState: GPUBlendState | undefined = shouldEnableBlending
             ? {
                   color: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
+                      operation: mapBlendOperation(blendOp),
                   },
                   alpha: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
+                      operation: mapBlendOperation(blendOp),
                   },
               }
             : undefined;
@@ -702,7 +846,10 @@ export class PipelineFactory {
                 entryPoint: "fs_main",
                 targets: [
                     {
-                        format: this.swapChainFormat,
+                        format: this.colorFormat,
+                        // D3DRS_COLORWRITEENABLE. A depth-only or stencil-only pass sets it
+                        // to 0 and expects its geometry to leave no pixels behind.
+                        writeMask: colorWriteMask as GPUColorWriteFlags,
                         blend: blendState,
                     },
                 ],
@@ -718,13 +865,19 @@ export class PipelineFactory {
             },
             depthStencil: {
                 format: "depth24plus-stencil8",
-                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest) && (zWrite !== 0),
+                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest && !this.debugFlags.forceDisableZWrite) && (zWrite !== 0),
                 depthCompare:
                     (zEnable !== 0 && !this.debugFlags.forceDisableZTest)
                         ? mapDepthCompareFunction(zFunc)
                         : "always",
-                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : 0,
-                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) ? -1.0 : 0,
+                // Coplanar overlay pass (see effectiveZFunc): nudge it toward the camera so it
+                // survives the depth compare. The SLOPE term carries grazing-angle surfaces,
+                // where dz/dx across a pixel dwarfs any constant. Keyed on coplanarPass, never
+                // on writes-off alone — every blended particle and HUD quad is writes-off, and
+                // biasing those would pull them through geometry that occludes them. A
+                // game-supplied ZBIAS still wins.
+                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
+                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1.0 : 0,
                 depthBiasClamp: 0,
                 stencilFront: stencilEnable !== 0 ? {
                     compare: mapDepthCompareFunction(stencilFunc),
@@ -749,17 +902,17 @@ export class PipelineFactory {
         primitiveType: number,
         sampledMask: number,
         stageCount: number,
-        pointSampleMask: number,
         missingTexture: boolean,
         d3dCull: number,
         zEnable: number,
         zFunc: number,
         zWrite: number,
         zBias: number, // D3DRENDERSTATE_ZBIAS (0-16) for z-fighting prevention
+        coplanarPass: number, // draw asked for EQUAL with depth writes off
         effectiveAlphaBlend: number, // Already normalized (0 or 1)
         alphaTest: number,
-        srcBlend: number,
-        dstBlend: number,
+        srcBlend: number, // Already resolved: defaults applied, BOTH*SRCALPHA fixup expanded
+        dstBlend: number, // Already resolved: defaults applied, BOTH*SRCALPHA fixup expanded
         alphaFunc: number,
         colorKeyEnabled: number,
         stencilEnable: number,
@@ -771,7 +924,9 @@ export class PipelineFactory {
         stencilMask: number,
         stencilWriteMask: number,
         needsUVFlip: boolean,
-        flatShading: boolean
+        flatShading: boolean,
+        colorWriteMask: number,
+        blendOp: number
     ): GPURenderPipeline {
         const useTexture = (sampledMask & 1) !== 0;
         const isRHWVertex = (vertexType & D3DFVF_XYZRHW) !== 0;
@@ -829,7 +984,6 @@ export class PipelineFactory {
         const shaderConfig: ShaderConfig = {
             sampledMask,
             stageCount,
-            pointSampleMask,
             flatShading,
             alphaTestEnabled: this.debugFlags.forceDisableAlphaTest ? false : alphaTest !== 0,
             alphaFunc,
@@ -842,25 +996,25 @@ export class PipelineFactory {
         };
         const shader = this.shaderGenerator.getOrCreateShader(shaderConfig);
 
-        const effectiveSrcBlend = srcBlend || 2; // D3D7 default: ONE
-        const effectiveDstBlend = dstBlend || 1; // D3D7 default: ZERO
+        // srcBlend/dstBlend arrive already resolved (unwritten-state defaults applied, and
+        // the BOTH*SRCALPHA legacy fixup expanded) — see resolveBlendFactors in the caller.
         const blendState: GPUBlendState | undefined = shouldEnableBlending
             ? {
                   color: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
+                      operation: mapBlendOperation(blendOp),
                   },
                   alpha: {
-                      srcFactor: mapBlendFactor(effectiveSrcBlend),
-                      dstFactor: mapBlendFactor(effectiveDstBlend),
-                      operation: "add" as GPUBlendOperation,
+                      srcFactor: mapBlendFactor(srcBlend),
+                      dstFactor: mapBlendFactor(dstBlend),
+                      operation: mapBlendOperation(blendOp),
                   },
               }
             : undefined;
 
         // Diagnostic: Log shadow-style blending (ZERO/INVSRCCOLOR for multiplicative darkening)
-        if (shouldEnableBlending && effectiveSrcBlend === 1 && effectiveDstBlend === 4) {
+        if (shouldEnableBlending && srcBlend === 1 && dstBlend === 4) {
             Logger.log(LogCategory.DDRAW,
                 `PipelineFactory: Shadow blend mode (ZERO/INVSRCCOLOR) - tex=${useTexture} cull=${cullMode} zWrite=${zWrite !== 0}`);
         }
@@ -895,7 +1049,10 @@ export class PipelineFactory {
                 entryPoint: "fs_main",
                 targets: [
                     {
-                        format: this.swapChainFormat, // Use actual swapchain format (bgra8unorm on Windows, rgba8unorm on others)
+                        format: this.colorFormat, // The render target's own format (see colorFormat)
+                        // D3DRS_COLORWRITEENABLE. A depth-only or stencil-only pass sets it
+                        // to 0 and expects its geometry to leave no pixels behind.
+                        writeMask: colorWriteMask as GPUColorWriteFlags,
                         blend: blendState,
                     },
                 ],
@@ -912,7 +1069,7 @@ export class PipelineFactory {
             depthStencil: {
                 format: "depth24plus-stencil8",
                 // Enable depth test/write for both XYZ and XYZRHW when app sets Z (RHW vertices pass depth 0..1 in pos.z)
-                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest) && (zWrite !== 0),
+                depthWriteEnabled: (zEnable !== 0 && !this.debugFlags.forceDisableZTest && !this.debugFlags.forceDisableZWrite) && (zWrite !== 0),
                 depthCompare:
                     (zEnable !== 0 && !this.debugFlags.forceDisableZTest)
                         ? mapDepthCompareFunction(zFunc)
@@ -921,8 +1078,14 @@ export class PipelineFactory {
                 // Negative depthBias pushes geometry toward camera (smaller Z values)
                 // D3D ZBIAS is integer 0-16; we scale it appropriately for 24-bit depth buffer
                 // Each unit of D3D ZBIAS approximately corresponds to 1/65536 of depth range
-                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : 0,
-                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) ? -1.0 : 0,
+                // Coplanar overlay pass (see effectiveZFunc): nudge it toward the camera so it
+                // survives the depth compare. The SLOPE term carries grazing-angle surfaces,
+                // where dz/dx across a pixel dwarfs any constant. Keyed on coplanarPass, never
+                // on writes-off alone — every blended particle and HUD quad is writes-off, and
+                // biasing those would pull them through geometry that occludes them. A
+                // game-supplied ZBIAS still wins.
+                depthBias: (zEnable !== 0 && zBias > 0) ? -zBias * 4 : (coplanarPass !== 0 ? -1 : 0),
+                depthBiasSlopeScale: (zEnable !== 0 && zBias > 0) || coplanarPass !== 0 ? -1.0 : 0,
                 depthBiasClamp: 0,
                 stencilFront: stencilEnable !== 0 ? {
                     compare: mapDepthCompareFunction(stencilFunc),

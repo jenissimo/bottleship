@@ -4,26 +4,55 @@
  * Atomic implementation for message queue operations
  */
 
-import { ThunkImplementation, FastPathImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation, FastPathImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { System } from '../../core/system';
 import { TimeService } from '../../runtime/time';
 import { TimerKind } from '../../core/scheduler/types';
-import { getWindowByHandle } from './window';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
-import { isSentinelWndProc, handleSystemControlMessage, isContentChangingMessage, repaintDialogAfterContentChange } from './dialog';
+import { isSentinelWndProc } from './dialog';
+import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import { getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
+import { tryRichEditStreamMessage } from './rich-edit-stream';
+import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleAnimateMessage } from './animate-control';
-import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition } from './shared-state';
+import { windows, buttonCheckStates, registerWindowTimerKiller, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
+import { validateWindow } from './paint-region';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
-import { handleSystemControlMouseAtScreen, handleSystemControlWheel } from './control-interaction';
+import { isOwnerDrawButton } from './owner-draw';
+import { defWindowProcSetCursor, runOwnerDrawButtonPaint } from './window';
+import {
+    handleSystemControlMouseAtScreen,
+    handleSystemControlWheel,
+    handleSystemControlKey,
+    takePendingControlNotification,
+} from './control-interaction';
 import { encodeAnsi } from '../codepage-utils';
-import { PAINT_TRACE_ENABLED, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
+import { paintTraceEnabled, logPaintMsgDelivered, logPaintPendingBlocked, logPaintTrace } from './paint-trace';
 import { isValidGuestEip } from '../../core/scheduler/scheduler-context';
+import { WAIT_FAILED, WAIT_BLOCKED_NO_SWITCH } from '../../core/scheduler/types';
+import { deliverPendingApcs } from '../kernel32/sync';
+
+// MsgWaitForMultipleObjectsEx flags + the shared wait vocabulary.
+const MWMO_WAITALL = 0x0001;
+const MWMO_ALERTABLE = 0x0002;
+const MWMO_INPUTAVAILABLE = 0x0004;
+const MAXIMUM_WAIT_OBJECTS = 64;
+const WAIT_OBJECT_0 = 0;
+const ERROR_INVALID_PARAMETER = 87;
 
 const WM_TIMER = 0x0113;
+const WM_SETCURSOR_MSG = 0x0020;
 const WM_PAINT = 0x000F;
+const WM_SETTEXT_MSG = 0x000C;
+const WM_GETTEXT_MSG = 0x000D;
+const WM_GETTEXTLENGTH_MSG = 0x000E;
+const USER_TIMER_MINIMUM = 10;
+
+type TimerMessage = { hwnd: number; message: number; wParam: number; lParam: number };
+let noteFastPathTimerDelivery: ((msg: TimerMessage, removed: boolean) => void) | null = null;
 
 /**
  * Synchronously invoke a window's guest WndProc via the suspended-thunk callback
@@ -38,7 +67,7 @@ const WM_PAINT = 0x000F;
  * @returns a suspended-callback ThunkResult on success, or null when no callback
  *          manager is available (caller falls back to its default return).
  */
-function invokeGuestWndProcSync(
+export function invokeGuestWndProcSync(
     ctx: X86Context,
     mem: Uint8Array,
     wndProc: number,
@@ -56,11 +85,15 @@ function invokeGuestWndProcSync(
 
     const msgView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const thunkReturnAddr = msgView.getUint32(ctx.esp, true);
-    const frameId = callbackManager.saveSuspendedThunkContext(
-        { ...ctx, returnAddr: thunkReturnAddr },
-        stackCleanup,
-        tag,
-    );
+    const stubRange = callbackManager.getStubPoolRange();
+    const reusedFrame = thunkReturnAddr >= stubRange.base && thunkReturnAddr < stubRange.end;
+    const frameId = reusedFrame
+        ? callbackManager.getActiveSuspendedFrameId()
+        : callbackManager.saveSuspendedThunkContext(
+            { ...ctx, returnAddr: thunkReturnAddr },
+            stackCleanup,
+            tag,
+        );
     if (frameId === 0) {
         Logger.error(LogCategory.USER32,
             `${tag}: failed to save suspended context for msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)}`);
@@ -88,7 +121,97 @@ function invokeGuestWndProcSync(
         callbackId: first.callbackId,
         stackCleanup,
         skipStackCheck: true,
+        preserveCallbackReturnAddress: reusedFrame,
     };
+}
+
+/** Send a message synchronously when hwnd has a guest-visible WndProc. */
+export function invokeWindowMessageSync(
+    ctx: X86Context,
+    mem: Uint8Array,
+    hwnd: number,
+    message: number,
+    wParam: number,
+    lParam: number,
+    stackCleanup: number,
+    tag: string,
+    onReturn: (wndRet: number) => number | null,
+): ThunkResult | null {
+    const win = windows.get(hwnd);
+    if (!win?.wndProc || isSentinelWndProc(win.wndProc)) return null;
+    if (win.isSystemControl && !win.wndProcSubclassed) return null;
+    return invokeGuestWndProcSync(
+        ctx, mem, win.wndProc, hwnd, message, wParam, lParam,
+        stackCleanup, tag, onReturn,
+    );
+}
+
+/**
+ * Get/SetWindowText, Get/SetDlgItemText and SendMessage(WM_SETTEXT/WM_GETTEXT) all SEND
+ * the message to the window procedure — Wine routes every one of them through
+ * NtUserMessageCall, and only reads a window's stored text when the window belongs to
+ * ANOTHER process. Answering from our own record instead is invisible to a control the
+ * guest has SUBCLASSED: it never learns its caption changed (a front-end that renders
+ * what its subclass proc saw draws an empty box forever), and a subclass that keeps the
+ * string itself and never forwards leaves that record permanently stale, so the two
+ * halves must go the same way or they disagree.
+ *
+ * Returns a suspended-thunk result when a guest procedure owns the window, else null:
+ * the caller then applies the default handling itself. Our own DefWindowProc/DefDlgProc
+ * thunk is not worth a round trip through the guest to arrive back in the same handler.
+ */
+function sendWindowTextMessage(
+    ctx: X86Context,
+    mem: Uint8Array,
+    hwnd: number,
+    message: number,
+    wParam: number,
+    lParam: number,
+    stackCleanup: number,
+    tag: string,
+    onReturn: (wndRet: number) => number | null,
+): ThunkResult | null {
+    const win = windows.get(hwnd);
+    if (!win) return null;
+    const wndProc = win.wndProc >>> 0;
+    if (wndProc === getDefWindowProcAddress() || wndProc === getDefDlgProcAddress()) return null;
+    return invokeWindowMessageSync(
+        ctx, mem, hwnd, message, wParam >>> 0, lParam >>> 0,
+        stackCleanup, tag, onReturn,
+    );
+}
+
+/** SetWindowText / SetDlgItemText: WM_SETTEXT with the caller's own string pointer. */
+export function sendWindowSetText(
+    ctx: X86Context, mem: Uint8Array, hwnd: number, lpString: number,
+    stackCleanup: number, tag: string,
+): ThunkResult | null {
+    return sendWindowTextMessage(
+        ctx, mem, hwnd, WM_SETTEXT_MSG, 0, lpString,
+        stackCleanup, tag, (wndRet) => (wndRet ? 1 : 0),
+    );
+}
+
+/** GetWindowText / GetDlgItemText: WM_GETTEXT fills the caller's buffer and answers
+ *  the character count. */
+export function sendWindowGetText(
+    ctx: X86Context, mem: Uint8Array, hwnd: number, cchMax: number, lpString: number,
+    stackCleanup: number, tag: string,
+): ThunkResult | null {
+    return sendWindowTextMessage(
+        ctx, mem, hwnd, WM_GETTEXT_MSG, cchMax, lpString,
+        stackCleanup, tag, (wndRet) => wndRet >>> 0,
+    );
+}
+
+/** GetWindowTextLength: WM_GETTEXTLENGTH. */
+export function sendWindowGetTextLength(
+    ctx: X86Context, mem: Uint8Array, hwnd: number, stackCleanup: number, tag: string,
+): ThunkResult | null {
+    return sendWindowTextMessage(
+        ctx, mem, hwnd, WM_GETTEXTLENGTH_MSG, 0, 0,
+        stackCleanup, tag, (wndRet) => wndRet >>> 0,
+    );
 }
 
 export function createMessageExports(): Record<string, ThunkImplementation> {
@@ -106,13 +229,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     let peekCalls = 0;
     let peekHits = 0;
 
-    type TimerSkipReason = 'v86' | 'async' | 'callbackBusy';
-
     interface TimerState {
         wheelTimerId: number;
         hWnd: number;
         timerId: number;
         timerFunc: number;
+        intervalMs: number;
         pendingTicks: number;
     }
 
@@ -167,6 +289,40 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         System.getInstance().scheduler?.timerWheel.cancel(state.wheelTimerId);
     }
 
+    function armTimerState(state: TimerState): void {
+        state.wheelTimerId = System.getInstance().scheduler.timerWheel.add(
+            state.intervalMs,
+            false,
+            TimerKind.USER32_TIMER,
+            () => {
+                const system = System.getInstance();
+                if (system.isExiting || timers.get(timerKey(state.hWnd, state.timerId)) !== state) return;
+                timerDiag.ticks++;
+
+                // USER timers are synthesized messages, not periodic host callbacks.
+                // Once due, Win32 keeps one timer in the expired set and restarts it
+                // only when Get/PeekMessage removes that WM_TIMER (Wine queue.c:
+                // find_expired_timer -> restart_timer). Reposting while the previous
+                // tick is pending can leave an MFC modal loop permanently non-idle.
+                postTimerMessages(system, state, 1);
+                maybeLogTimerDiag();
+            },
+            TimeService.getInstance().nowMs(),
+        );
+    }
+
+    function restartRemovedTimer(msg: { hwnd: number; message: number; wParam: number; lParam: number }): void {
+        if (msg.message !== WM_TIMER) return;
+        const state = timers.get(timerKey(msg.hwnd, msg.wParam));
+        if (!state || state.timerFunc !== (msg.lParam >>> 0)) return;
+        armTimerState(state);
+    }
+
+    noteFastPathTimerDelivery = (msg, removed) => {
+        timerDiag.delivered++;
+        if (removed) restartRemovedTimer(msg);
+    };
+
     // Win32: DestroyWindow destroys all timers owned by that window. Called from
     // window.ts DestroyWindow via the shared-state hook. Without this, a destroyed
     // window's orphaned timer keeps posting WM_TIMER to the dead hwnd (e.g.
@@ -215,19 +371,6 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
     function maybeLogTimerDiag(): void {
         return;
-    }
-
-    function registerTimerSkip(state: TimerState, reason: TimerSkipReason): void {
-        if (reason === 'v86') timerDiag.skippedV86++;
-        else if (reason === 'async') timerDiag.skippedAsync++;
-        else timerDiag.skippedCallbackBusy++;
-
-        if (timerDiagConfig.queueSkippedMessageTimers) {
-            state.pendingTicks++;
-            timerDiag.pendingQueued++;
-            return;
-        }
-        timerDiag.pendingDropped++;
     }
 
     function postTimerMessages(system: System, state: TimerState, basePosts: number): void {
@@ -291,6 +434,24 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     };
     bindMsgTimerDiag("msgTimerDiag");
     bindMsgTimerDiag("h3TimerDiag"); // deprecated alias
+
+    // Per-thread GetMessageExtraInfo value: the dwExtraInfo of the input behind the last
+    // message GetMessage/PeekMessage handed this thread (0 for posted and host input), or
+    // whatever SetMessageExtraInfo stored since.
+    const messageExtraInfo = new Map<number, number>();
+    function noteRetrievedExtraInfo(threadId: number, msg: { extraInfo?: number }): void {
+        messageExtraInfo.set(threadId, (msg.extraInfo ?? 0) >>> 0);
+    }
+
+    exports['GetMessageExtraInfo'] = () =>
+        messageExtraInfo.get(System.getInstance().scheduler.getCurrentThreadId()) ?? 0;
+
+    exports['SetMessageExtraInfo'] = (ctx, mem, args) => {
+        const tid = System.getInstance().scheduler.getCurrentThreadId();
+        const previous = messageExtraInfo.get(tid) ?? 0;
+        messageExtraInfo.set(tid, args[0] >>> 0);
+        return previous;
+    };
 
     function writeMsgToMemory(mem: Uint8Array, lpMsg: number, msg: any) {
         if (lpMsg) {
@@ -575,13 +736,15 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const currentThreadId = system.scheduler.getCurrentThreadId();
         const msg = system.windowManager.peekMessage(true, wMsgFilterMin, wMsgFilterMax, currentThreadId);
         if (msg) {
+            restartRemovedTimer(msg);
             const retVal = msg.message === WM_QUIT ? 0 : 1;
-            if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('GetMessageW(sync)', msg.hwnd, msg.message, {
+            if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(sync)', msg.hwnd, msg.message, {
                 ret: retVal,
                 filterMin: wMsgFilterMin,
                 filterMax: wMsgFilterMax,
             });
-            Logger.log(LogCategory.USER32, `GetMessageW(sync): msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
+            Logger.verboseLazy(LogCategory.USER32, () =>
+                `GetMessageW(sync): msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
             if (isKeyboardHookMessage(msg.message)) {
                 // GetMessage blocking semantics vs discard-to-empty: delivering
                 // WM_NULL would be wrong, but a hook that discards is expected to
@@ -598,6 +761,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             }
             // WH_GETMESSAGE fires on the message about to be returned (any message,
             // not just keys) unless a keyboard chain already handled it above.
+            noteRetrievedExtraInfo(currentThreadId, msg);
             const gm = dispatchGetMessageHook(
                 ctx, msg, true, currentThreadId, lpMsg, 16,
                 (delivered) => (delivered ? (delivered.message === WM_QUIT ? 0 : 1) : 1), 'GetMessage:WH_GETMESSAGE',
@@ -626,7 +790,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             // an idle timeout signal (4ms), but real Windows GetMessage blocks until
             // a genuine message arrives. Returning WM_NULL with hwnd=0 to the game
             // causes crashes when null messages are processed (e.g. some galaxy.dll builds).
-            let waitMsg: { hwnd: number; message: number; wParam: number; lParam: number; time: number; ptX?: number; ptY?: number };
+            let waitMsg: { hwnd: number; message: number; wParam: number; lParam: number; time: number; ptX?: number; ptY?: number; extraInfo?: number };
             for (;;) {
                 waitMsg = await system.windowManager.waitForMessage(currentThreadId);
 
@@ -662,6 +826,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 break;
             }
 
+            restartRemovedTimer(waitMsg);
+
             // Note: Get fresh memory reference after async operation!
             const process = system.process;
             const v86 = process?.v86;
@@ -683,13 +849,15 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                     `GetMessageW(async): delivering msg=0x${waitMsg.message.toString(16)} WITHOUT ` +
                     `${keyHookPending ? 'WH_KEYBOARD' : 'WH_GETMESSAGE'} hook dispatch`);
             }
+            noteRetrievedExtraInfo(currentThreadId, waitMsg);
             const retVal = waitMsg.message === WM_QUIT ? 0 : 1;
-            if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('GetMessageW(async)', waitMsg.hwnd, waitMsg.message, {
+            if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(async)', waitMsg.hwnd, waitMsg.message, {
                 ret: retVal,
                 filterMin: wMsgFilterMin,
                 filterMax: wMsgFilterMax,
             });
-            Logger.log(LogCategory.USER32, `GetMessageW(async): msg=0x${waitMsg.message.toString(16)} hwnd=0x${waitMsg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
+            Logger.verboseLazy(LogCategory.USER32, () =>
+                `GetMessageW(async): msg=0x${waitMsg.message.toString(16)} hwnd=0x${waitMsg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
 
             writeMsgToMemory(freshMem, lpMsg, waitMsg);
             return { value: retVal, stackCleanup: 16 };
@@ -699,6 +867,25 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     };
 
     exports['GetMessageA'] = exports['GetMessageW'];
+
+    /**
+     * GetQueueStatus — HIWORD is what is in the queue now, LOWORD what arrived since
+     * the previous call. Our queue carries no per-QS_* class bits (same limitation
+     * MsgWaitForMultipleObjects documents below), so a non-empty queue answers with
+     * the caller's own mask in both words. That over-reports for a narrow mask, in the
+     * safe direction: the caller pumps, finds nothing of its class, and loops. The
+     * opposite error would have it wait on a queue that already holds its message.
+     */
+    exports['GetQueueStatus'] = (ctx, mem, args) => {
+        const flags = args[0] >>> 0;
+        const system = System.getInstance();
+        const currentThreadId = system.scheduler.getCurrentThreadId();
+
+        system.inputManager.poll(true);
+
+        const present = system.windowManager.hasMessages(0, 0, currentThreadId) ? flags & 0xffff : 0;
+        return ((present << 16) | present) >>> 0;
+    };
 
     exports['WaitMessage'] = (ctx, mem, args) => {
         const system = System.getInstance();
@@ -735,6 +922,87 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         // Thread is WAITING(MESSAGE); park at spin loop until postMessage wakes it.
         return { value: 1, blockedNoSwitch: true, stackCleanup: 0 };
     };
+
+    /**
+     * MsgWaitForMultipleObjects(Ex) — wait on handles OR on this thread's input queue.
+     *
+     * Win32 implements it by appending the thread's message-queue handle to the array
+     * and doing an ordinary wait over nCount+1 objects, which is why the queue's leg is
+     * reported as WAIT_OBJECT_0 + nCount; the scheduler mirrors that shape. Callers
+     * routinely branch on the exact value (LS3D's worker loop re-waits on anything that
+     * is not WAIT_OBJECT_0), so an out-of-contract return is not a soft failure — it
+     * sends the guest down a path Windows never produces.
+     *
+     * MWMO_INPUTAVAILABLE decides whether input ALREADY queued satisfies the wait;
+     * without it only input arriving after the call does. `dwWakeMask` is honoured only
+     * as "any input" — the queue does not carry per-QS_* class bits — which over-reports
+     * for a narrow mask. That direction is the safe one: the caller pumps, finds nothing
+     * it wants, and waits again, whereas under-reporting would hang it.
+     */
+    const msgWaitForMultipleObjects = (
+        ctx: X86Context, mem: Uint8Array,
+        nCount: number, lpHandles: number, dwMilliseconds: number, dwWakeMask: number, dwFlags: number,
+    ): ThunkResult | number => {
+        const system = System.getInstance();
+        const sched = system.scheduler;
+        const stackCleanup = 20; // 5 stdcall args, both entry points
+
+        // Windows caps the array one below MAXIMUM_WAIT_OBJECTS: the queue takes a slot.
+        if (nCount > MAXIMUM_WAIT_OBJECTS - 1 || (nCount > 0 && lpHandles === 0)) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return WAIT_FAILED;
+        }
+
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (nCount > 0 && lpHandles + nCount * 4 > mem.length) {
+            sched.setLastError(ERROR_INVALID_PARAMETER);
+            return WAIT_FAILED;
+        }
+        const handles: number[] = [];
+        for (let i = 0; i < nCount; i++) handles.push(view.getUint32(lpHandles + i * 4, true) >>> 0);
+
+        const waitAll = (dwFlags & MWMO_WAITALL) !== 0;
+        const alertable = (dwFlags & MWMO_ALERTABLE) !== 0;
+        const inputResult = WAIT_OBJECT_0 + nCount;
+        const currentThreadId = sched.getCurrentThreadId();
+
+        // Flush SAB input into the queue first — same as GetMessage/WaitMessage, so
+        // "is there input" is asked of a queue that is up to date.
+        system.inputManager.poll(true);
+        if ((dwFlags & MWMO_INPUTAVAILABLE) !== 0
+            && system.windowManager.hasMessages(0, 0, currentThreadId)) {
+            return inputResult;
+        }
+
+        if (alertable) {
+            const apcResult = deliverPendingApcs(ctx, 'MsgWaitForMultipleObjectsEx:APC', stackCleanup);
+            if (apcResult) return apcResult;
+        }
+
+        const returnAddr = view.getUint32(ctx.esp >>> 0, true) >>> 0;
+        const postReturnEsp = (ctx.esp + 4 + stackCleanup) >>> 0;
+
+        const result = sched.waitForObjectsOrMessageWithContext(
+            handles, waitAll, dwMilliseconds, inputResult,
+            returnAddr, postReturnEsp,
+            { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+            alertable,
+        );
+
+        if (result === WAIT_BLOCKED_NO_SWITCH) {
+            return { value: 0, blockedNoSwitch: true, stackCleanup };
+        }
+        return result;
+    };
+
+    exports['MsgWaitForMultipleObjects'] = (ctx, mem, args) => msgWaitForMultipleObjects(
+        ctx, mem, args[0] >>> 0, args[1] >>> 0, args[3] >>> 0, args[4] >>> 0,
+        args[2] !== 0 ? MWMO_WAITALL : 0,
+    );
+
+    exports['MsgWaitForMultipleObjectsEx'] = (ctx, mem, args) => msgWaitForMultipleObjects(
+        ctx, mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, args[3] >>> 0, args[4] >>> 0,
+    );
 
     exports['WaitForInputIdle'] = (ctx, mem, args) => {
         const hProcess = args[0] >>> 0;
@@ -778,7 +1046,9 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
 
         if (!msg) {
-            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
+                logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            }
             // Queue empty — synthesize WM_QUIT if per-thread flag is set
             if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
@@ -796,8 +1066,9 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         if (msg.message === WM_TIMER) {
             timerDiag.delivered++;
+            if (wRemoveMsg !== 0) restartRemovedTimer(msg);
         }
-        if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('PeekMessageW', msg.hwnd, msg.message, {
+        if (paintTraceEnabled) logPaintMsgDelivered('PeekMessageW', msg.hwnd, msg.message, {
             remove: wRemoveMsg,
             filterMin: wMsgFilterMin,
             filterMax: wMsgFilterMax,
@@ -822,6 +1093,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         // WH_GETMESSAGE fires on any message about to be returned unless the keyboard
         // chain already handled it above.
+        noteRetrievedExtraInfo(callerThreadId, msg);
         const gm = dispatchGetMessageHook(
             ctx, msg, wRemoveMsg !== 0, callerThreadId, lpMsg, 20,
             (delivered) => (delivered ? 1 : 0), 'PeekMessage:WH_GETMESSAGE',
@@ -845,12 +1117,22 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const lParam = view.getUint32(lpMsg + 12, true);
             const time = view.getUint32(lpMsg + 16, true);
 
-            Logger.log(LogCategory.USER32, `DispatchMessageW: msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)} wParam=0x${wParam.toString(16)} lParam=0x${lParam.toString(16)}`);
-            if (PAINT_TRACE_ENABLED && message === WM_PAINT) {
+            Logger.verboseLazy(LogCategory.USER32, () =>
+                `DispatchMessageW: msg=0x${message.toString(16)} hwnd=0x${hwnd.toString(16)} wParam=0x${wParam.toString(16)} lParam=0x${lParam.toString(16)}`);
+            if (paintTraceEnabled && message === WM_PAINT) {
                 logPaintTrace('DispatchMessageW', `enter hwnd=0x${hwnd.toString(16)} thread=${System.getInstance().scheduler.getCurrentThreadId()}`);
             }
             if (message === WM_TIMER) {
                 timerDiag.dispatched++;
+            }
+
+            // Posted WM_PAINT is suppressed once the window (or an ancestor) is
+            // hidden. A stale paint queued before a page switch must not resurrect
+            // that page's owner-draw controls on the shared overlay.
+            const paintWindow = message === WM_PAINT ? windows.get(hwnd) : undefined;
+            if (paintWindow && !isEffectivelyVisible(paintWindow)) {
+                validateWindow(hwnd, null);
+                return { value: 0, stackCleanup: 4 };
             }
 
             // WM_TIMER with a callback: call the callback instead of the window procedure.
@@ -929,8 +1211,47 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                     // WM_DRAWITEM and never hit-tests the click itself. So always handle owner-draw
                     // button clicks here, even on a custom-painted launcher.
                     if (handleSystemControlMouseAtScreen(host.handle, message, wParam, screenX, screenY)) {
+                        const notification = takePendingControlNotification();
+                        if (notification) {
+                            const parent = windows.get(notification.hwnd);
+                            if (parent?.wndProc && !isSentinelWndProc(parent.wndProc)) {
+                                const sync = invokeGuestWndProcSync(
+                                    ctx, mem, parent.wndProc, notification.hwnd,
+                                    notification.msg, notification.wParam, notification.lParam,
+                                    4, 'DispatchMessageW:control-notify', () => 0,
+                                );
+                                if (sync) return sync;
+                            }
+                        }
                         return { value: 0, stackCleanup: 4 };
                     }
+                }
+            }
+
+            // Keyboard for a JS-managed system control. DispatchMessage delivers the key
+            // to the FOCUS window, and for a control we manage that window's wndProc is
+            // our sentinel — so the class's own keyboard behaviour (listbox arrows,
+            // scrollbar SB_LINE*, Space on a button) has to run here, exactly as the
+            // mouse does above. Subclassed controls are skipped: their guest wndProc
+            // sees the key first and reaches the class proc through DefWindowProc.
+            const WM_KEYDOWN_MSG = 0x0100, WM_KEYUP_MSG = 0x0101;
+            if (message === WM_KEYDOWN_MSG || message === WM_KEYUP_MSG) {
+                const target = getWindowByHandle(hwnd);
+                if (target?.isSystemControl && !target.wndProcSubclassed
+                    && handleSystemControlKey(target, message, wParam & 0xFF)) {
+                    const notification = takePendingControlNotification();
+                    if (notification) {
+                        const parent = windows.get(notification.hwnd);
+                        if (parent?.wndProc && !isSentinelWndProc(parent.wndProc)) {
+                            const sync = invokeGuestWndProcSync(
+                                ctx, mem, parent.wndProc, notification.hwnd,
+                                notification.msg, notification.wParam, notification.lParam,
+                                4, 'DispatchMessageW:control-key-notify', () => 0,
+                            );
+                            if (sync) return sync;
+                        }
+                    }
+                    return { value: 0, stackCleanup: 4 };
                 }
             }
 
@@ -974,10 +1295,17 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                         && !!child.wndProcSubclassed && !!child.wndProc
                         && !isSentinelWndProc(child.wndProc);
                     if (isOwnerDrawBtn && child!.handle !== lastHoverChildHwnd) {
-                        // Coords are button-class-irrelevant (its move handler only arms a
-                        // timer); pass the parent lParam through unchanged.
+                        // lParam is CLIENT coordinates OF THE TARGET (Win32 contract), so a
+                        // message forwarded to a child must be re-expressed in the child's
+                        // space. Passing the parent's through unchanged shifts every read by
+                        // the child's own origin, which a guest that hit-tests its own
+                        // owner-draw button sees as a hot zone displaced further the further
+                        // the control sits from the parent's top-left.
+                        const childX = clientX - child!.x;
+                        const childY = clientY - child!.y;
+                        const childLParam = ((childY & 0xFFFF) << 16) | (childX & 0xFFFF);
                         System.getInstance().windowManager.postMessage(
-                            child!.handle, WM_MOUSEMOVE, wParam, lParam);
+                            child!.handle, WM_MOUSEMOVE, wParam, childLParam);
                         System.getInstance().scheduler.wakeMessageWaiters();
                         lastHoverChildHwnd = child!.handle;
                     } else if (!child) {
@@ -993,9 +1321,42 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const WM_NCDESTROY = 0x0082;
 
             const window = getWindowByHandle(hwnd);
+            // The BUTTON class proc's WM_PAINT: a BS_OWNERDRAW button is drawn by ONE
+            // WM_DRAWITEM to its parent (Wine button.c OB_Paint), which is a guest
+            // callback — so this is where an InvalidateRect/UpdateWindow on such a button
+            // finally reaches the guest. A subclassed one gets the message first and
+            // arrives here only through CallWindowProc (window.ts).
+            if (message === WM_PAINT && window?.isSystemControl && !window.wndProcSubclassed
+                && isOwnerDrawButton(window)) {
+                try {
+                    const repaint = runOwnerDrawButtonPaint(
+                        ctx, mem, window, 'DispatchMessage', 4);
+                    if (repaint) return repaint;
+                } catch (err) {
+                    Logger.error(LogCategory.USER32,
+                        `DispatchMessage owner-draw paint failed hwnd=0x${hwnd.toString(16)}: ${err}`);
+                }
+                return { value: 0, stackCleanup: 4 };
+            }
+            // WM_SETCURSOR is not a control-class message — no BUTTON/EDIT/LISTBOX
+            // procedure implements it, they all reach DefWindowProc, which offers the
+            // message to the parent and only then applies the class cursor. The control
+            // sink below has no DefWindowProc tail, so without this a control never
+            // restores the pointer and its dialog never gets the offer.
+            if (message === WM_SETCURSOR_MSG && window?.isSystemControl && !window.wndProcSubclassed) {
+                const plan = defWindowProcSetCursor(hwnd, wParam, lParam);
+                if (typeof plan === 'number') return { value: plan >>> 0, stackCleanup: 4 };
+                const sync = invokeWindowMessageSync(
+                    ctx, mem, plan.forwardTo, WM_SETCURSOR_MSG, wParam, lParam,
+                    4, 'DispatchMessageW:WM_SETCURSOR',
+                    (parentResult) => plan.onParentResult(parentResult >>> 0) >>> 0,
+                );
+                if (sync) return sync;
+                return { value: plan.onParentResult(0) >>> 0, stackCleanup: 4 };
+            }
             if (window?.isSystemControl && !window.wndProcSubclassed) {
                 const result = handleSystemControlMessage(window, message, wParam, lParam, mem);
-                if (isContentChangingMessage(message)) {
+                if (isContentChangingMessage(window, message)) {
                     repaintDialogAfterContentChange(window.parent ?? hwnd);
                 }
                 if (message === WM_NCDESTROY) finalizeWindowDestroy(hwnd);
@@ -1143,7 +1504,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const lpTimerFunc = args[3];
 
         const timerId = nIDEvent || nextTimerId++;
-        Logger.log(LogCategory.USER32,
+        Logger.verbose(LogCategory.USER32,
             `SetTimer(hwnd=0x${hWnd.toString(16)}, id=${timerId}, elapse=${uElapse}ms, func=0x${lpTimerFunc.toString(16)}) ` +
             `- ${lpTimerFunc ? 'callback' : 'message'} mode`
         );
@@ -1153,55 +1514,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             hWnd,
             timerId,
             timerFunc: lpTimerFunc >>> 0,
+            intervalMs: Math.max(uElapse, USER_TIMER_MINIMUM),
             pendingTicks: 0,
-        };
-
-        const trigger = () => {
-            const system = System.getInstance();
-            if (system.isExiting) return;
-            timerDiag.ticks++;
-
-            if (lpTimerFunc) {
-                // Callback-mode (lpTimerFunc != 0): invoking the x86 TimerProc mutates CPU
-                // state, so it requires a running CPU and no in-flight async/callback chain.
-                const v86 = system.process?.v86;
-                const isRunning = v86?.is_running?.() ?? false;
-                const callbackManager = system.process?.dispatcher.callbackManager;
-                const canInvoke = isRunning &&
-                                  !system.process?.dispatcher.hasActiveAsyncThunks() &&
-                                  callbackManager?.canAcceptDeferredCallback();
-
-                if (canInvoke) {
-                    // Note: Must use forceSyntheticReturnEip so after the TimerProc returns,
-                    // x86 resumes at the exact EIP it was at when the scheduler timer fired, with ESP preserved.
-                    // void CALLBACK TimerProc(HWND hwnd, UINT uMsg, UINT_PTR idEvent, DWORD dwTime)
-                    timerDiag.callbackInvoked++;
-                    callbackManager!.invokeCallback(
-                        lpTimerFunc,
-                        [hWnd, WM_TIMER, timerId, TimeService.getInstance().nowMs() | 0],
-                        0,
-                        undefined,
-                        false,
-                        'SetTimer_timerProc',
-                        undefined,
-                        { forceSyntheticReturnEip: true }
-                    );
-                    maybeLogTimerDiag();
-                    return;
-                }
-
-                // Fallback: post WM_TIMER to wake WaitMessage/GetMessage.
-                // This is faithful: callback timers still generate WM_TIMER in Windows.
-                registerTimerSkip(timerState, !isRunning ? 'v86' : (system.process?.dispatcher.hasActiveAsyncThunks() ? 'async' : 'callbackBusy'));
-                postTimerMessages(system, timerState, 1);
-                maybeLogTimerDiag();
-                return;
-            }
-
-            // Message-mode (lpTimerFunc == 0): posting WM_TIMER is pure message-queue
-            // manipulation, valid even when v86 is stopped.
-            postTimerMessages(system, timerState, 1);
-            maybeLogTimerDiag();
         };
 
         // Win32: SetTimer with an existing (hwnd, id) RESETS that timer — cancel the
@@ -1210,14 +1524,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const existing = timers.get(key);
         if (existing) cancelTimerState(existing);
 
-        timerState.wheelTimerId = System.getInstance().scheduler.timerWheel.add(
-            Math.max(uElapse, 1),
-            true,
-            TimerKind.USER32_TIMER,
-            trigger,
-            TimeService.getInstance().nowMs(),
-        );
         timers.set(key, timerState);
+        armTimerState(timerState);
 
         return timerId;
     };
@@ -1287,13 +1595,34 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             const animateResult = handleAnimateMessage(hWnd, msg, wParam, lParam, mem);
             if (animateResult !== null) return animateResult;
 
-            // System controls: delegate all messages
-            if (targetWindow.isSystemControl) {
+            // System controls: delegate all messages to our built-in control behavior —
+            // UNLESS the guest has subclassed the control (SetWindowLong GWL_WNDPROC). Once
+            // subclassed, the control's window procedure IS the guest's; SendMessage must
+            // invoke it so app-defined messages (e.g. MFC message-map broadcasts via
+            // SendMessageToDescendants) reach the guest. Mirrors the `!wndProcSubclassed`
+            // guard the DispatchMessage/postMessage path uses.
+            if (targetWindow.isSystemControl && !targetWindow.wndProcSubclassed) {
+                // EM_STREAMIN/OUT call back into the guest, so they need this thunk's
+                // return frame — the generic sink below has no way to suspend. Gated on
+                // allowGuestDispatch for the same reason the WndProc re-entry below is:
+                // the SendMessageTimeout wrapper cannot thread a suspended result back.
+                const stream = allowGuestDispatch
+                    ? tryRichEditStreamMessage(ctx, mem, targetWindow, msg, wParam, lParam, 16, 'SendMessage')
+                    : null;
+                if (stream) return stream;
+
                 const result = handleSystemControlMessage(targetWindow, msg, wParam, lParam, mem);
                 // Repaint content changes done outside the HLE modal pump (games that
                 // pump their own messages and SendMessage TBM_SETPOS / LB_ADDSTRING /
                 // WM_SETTEXT etc. at runtime — e.g. TS dialog init from its dlgProc).
-                if (isContentChangingMessage(msg)) {
+                if (isContentChangingMessage(targetWindow, msg)) {
+                    // Drop the control's OLD pixels first. On a guest-painted parent the
+                    // repaint below can only STAMP the control — it cannot restore what was
+                    // under it — so a changed caption renders on top of the previous one and
+                    // both stay readable (a front-end that reuses one Static across pages
+                    // ends up with two overlaid sentences). Erased AFTER the message applied,
+                    // so the repair this triggers re-stamps the NEW text, not the old.
+                    eraseControlOverlayRect(targetWindow);
                     repaintDialogAfterContentChange(targetWindow.parent ?? hWnd);
                 }
                 return result;
@@ -1301,16 +1630,17 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
             // Non-system windows: handle common messages in JS
             switch (msg) {
-                case WM_SETTEXT:
+                case WM_SETTEXT: {
+                    if (allowGuestDispatch) {
+                        const sent = sendWindowSetText(ctx, mem, hWnd, lParam, 16, 'SendMessage:WM_SETTEXT');
+                        if (sent) return sent;
+                    }
                     if (lParam) {
-                        targetWindow.title = readAnsiOrWideString(lParam);
+                        applyDefaultSetText(targetWindow, readAnsiOrWideString(lParam));
                         Logger.log(LogCategory.USER32, `SendMessage WM_SETTEXT hwnd=0x${hWnd.toString(16)} -> "${targetWindow.title}"`);
-                        // Sync tab title for top-level windows (matches SetWindowTextA/W behavior)
-                        if (!targetWindow.parent) {
-                            System.getInstance().notifyWindowTitle(targetWindow.title);
-                        }
                     }
                     return 1;
+                }
                 case WM_GETTEXT:
                     if (lParam && wParam > 0) {
                         const text = targetWindow.title;
@@ -1548,18 +1878,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
  * Called when WASM handler falls through (queue non-empty or starvation limit).
  * Reads args directly from stack, avoids marshaling overhead.
  */
-export function registerFastPathMessageFunctions(dispatcher: any): void {
+export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): void {
     if (!dispatcher || typeof dispatcher.registerFastPath !== 'function') return;
 
     const WM_QUIT = 0x0012;
 
-    const fastPathPeekMessage: FastPathImplementation = (
-        cpu: any,
-        mem8: Uint8Array,
-        _mem32: Uint32Array,
-        dataView: DataView
-    ): number | null => {
-        const esp = cpu.reg32[4]; // ESP
+    const fastPathPeekMessage: FastPathImplementation = (esp: number, dataView: DataView, mem8: Uint8Array): number | null => {
 
         // PeekMessageA/W(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)
         // stdcall: args at ESP+4 through ESP+20
@@ -1604,7 +1928,9 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         }
 
         if (!msg) {
-            if (PAINT_TRACE_ENABLED) logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
+                logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+            }
             // Queue empty — check per-thread quit flag before returning FALSE
             if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
@@ -1632,6 +1958,13 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
             return 0;
         }
 
+        // Match the slow PeekMessage path: USER restarts a synthesized timer when
+        // its WM_TIMER is removed from the queue. Omitting this in the fast path
+        // made hover timers one-shot in tight MFC pumps (Half-Life launcher).
+        if (msg.message === WM_TIMER) {
+            noteFastPathTimerDelivery?.(msg, wRemoveMsg !== 0);
+        }
+
         // Write MSG struct (28 bytes) to guest memory
         if (lpMsg && lpMsg + 28 <= mem8.length) {
             dataView.setUint32(lpMsg, msg.hwnd, true);        // hwnd
@@ -1643,7 +1976,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
             dataView.setInt32(lpMsg + 24, (msg as any).ptY ?? 0, true);  // pt.y
         }
 
-        if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('PeekMessageW(fastpath)', msg.hwnd, msg.message, {
+        if (paintTraceEnabled) logPaintMsgDelivered('PeekMessageW(fastpath)', msg.hwnd, msg.message, {
             remove: wRemoveMsg,
             filterMin: wMsgFilterMin,
             filterMax: wMsgFilterMax,
@@ -1659,13 +1992,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
     dispatcher.registerFastPath('user32', 'PeekMessageW', fastPathPeekMessage);
 
     // GetMessageA/W fast path: sync dequeue when message available, null → async slow path
-    const fastPathGetMessage: FastPathImplementation = (
-        cpu: any,
-        mem8: Uint8Array,
-        _mem32: Uint32Array,
-        dataView: DataView
-    ): number | null => {
-        const esp = cpu.reg32[4]; // ESP
+    const fastPathGetMessage: FastPathImplementation = (esp: number, dataView: DataView, mem8: Uint8Array): number | null => {
 
         // GetMessageA/W(lpMsg, hWnd, wMsgFilterMin, wMsgFilterMax)
         const lpMsg = dataView.getUint32(esp + 4, true);
@@ -1709,6 +2036,12 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
             return null; // No message → fall through to async slow path
         }
 
+        // GetMessage always removes the returned message, so an expired USER
+        // timer becomes eligible for its next interval here as on the slow path.
+        if (msg.message === WM_TIMER) {
+            noteFastPathTimerDelivery?.(msg, true);
+        }
+
         // Write MSG struct (28 bytes) to guest memory
         if (lpMsg && lpMsg + 28 <= mem8.length) {
             dataView.setUint32(lpMsg, msg.hwnd, true);
@@ -1721,7 +2054,7 @@ export function registerFastPathMessageFunctions(dispatcher: any): void {
         }
 
         const retVal = msg.message === WM_QUIT ? 0 : 1;
-        if (PAINT_TRACE_ENABLED) logPaintMsgDelivered('GetMessageW(fastpath)', msg.hwnd, msg.message, {
+        if (paintTraceEnabled) logPaintMsgDelivered('GetMessageW(fastpath)', msg.hwnd, msg.message, {
             ret: retVal,
             filterMin: wMsgFilterMin,
             filterMax: wMsgFilterMax,

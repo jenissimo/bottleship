@@ -1,0 +1,207 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.957Z",
+  "module": "wtsapi32",
+  "functions": [
+    {
+      "name": "WTSCloseServer",
+      "argCount": 1
+    },
+    {
+      "name": "WTSConnectSessionA",
+      "argCount": 4
+    },
+    {
+      "name": "WTSConnectSessionW",
+      "argCount": 4
+    },
+    {
+      "name": "WTSDisconnectSession",
+      "argCount": 3
+    },
+    {
+      "name": "WTSEnableChildSessions",
+      "argCount": 1
+    },
+    {
+      "name": "WTSEnumerateProcessesA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateProcessesExA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateProcessesExW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateProcessesW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateServersA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateServersW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateSessionsA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateSessionsExA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateSessionsExW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSEnumerateSessionsW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSFreeMemory",
+      "argCount": 1
+    },
+    {
+      "name": "WTSFreeMemoryExA",
+      "argCount": 3
+    },
+    {
+      "name": "WTSFreeMemoryExW",
+      "argCount": 3
+    },
+    {
+      "name": "WTSLogoffSession",
+      "argCount": 3
+    },
+    {
+      "name": "WTSOpenServerA",
+      "argCount": 1
+    },
+    {
+      "name": "WTSOpenServerExA",
+      "argCount": 1
+    },
+    {
+      "name": "WTSOpenServerExW",
+      "argCount": 1
+    },
+    {
+      "name": "WTSOpenServerW",
+      "argCount": 1
+    },
+    {
+      "name": "WTSQuerySessionInformationA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSQuerySessionInformationW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSQueryUserConfigA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSQueryUserConfigW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSQueryUserToken",
+      "argCount": 2
+    },
+    {
+      "name": "WTSRegisterSessionNotification",
+      "argCount": 2
+    },
+    {
+      "name": "WTSRegisterSessionNotificationEx",
+      "argCount": 3
+    },
+    {
+      "name": "WTSSendMessageA",
+      "argCount": 10
+    },
+    {
+      "name": "WTSSendMessageW",
+      "argCount": 10
+    },
+    {
+      "name": "WTSSetUserConfigA",
+      "argCount": 5
+    },
+    {
+      "name": "WTSSetUserConfigW",
+      "argCount": 5
+    },
+    {
+      "name": "WTSShutdownSystem",
+      "argCount": 2
+    },
+    {
+      "name": "WTSStartRemoteControlSessionA",
+      "argCount": 4
+    },
+    {
+      "name": "WTSStartRemoteControlSessionW",
+      "argCount": 4
+    },
+    {
+      "name": "WTSStopRemoteControlSession",
+      "argCount": 1
+    },
+    {
+      "name": "WTSTerminateProcess",
+      "argCount": 3
+    },
+    {
+      "name": "WTSUnRegisterSessionNotification",
+      "argCount": 1
+    },
+    {
+      "name": "WTSUnRegisterSessionNotificationEx",
+      "argCount": 2
+    },
+    {
+      "name": "WTSVirtualChannelClose",
+      "argCount": 1
+    },
+    {
+      "name": "WTSVirtualChannelOpen",
+      "argCount": 3
+    },
+    {
+      "name": "WTSVirtualChannelOpenEx",
+      "argCount": 3
+    },
+    {
+      "name": "WTSVirtualChannelPurgeInput",
+      "argCount": 1
+    },
+    {
+      "name": "WTSVirtualChannelPurgeOutput",
+      "argCount": 1
+    },
+    {
+      "name": "WTSVirtualChannelQuery",
+      "argCount": 4
+    },
+    {
+      "name": "WTSVirtualChannelRead",
+      "argCount": 5
+    },
+    {
+      "name": "WTSVirtualChannelWrite",
+      "argCount": 4
+    },
+    {
+      "name": "WTSWaitSystemEvent",
+      "argCount": 3
+    }
+  ]
+}

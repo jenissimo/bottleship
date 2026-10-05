@@ -1,0 +1,535 @@
+{
+  "source": "wine .spec (arity only)",
+  "generated": "2026-09-07T16:32:26.956Z",
+  "module": "wsock32",
+  "functions": [
+    {
+      "name": "__WSAFDIsSet",
+      "argCount": 2
+    },
+    {
+      "name": "accept",
+      "argCount": 3
+    },
+    {
+      "name": "AcceptEx",
+      "argCount": 8
+    },
+    {
+      "name": "bind",
+      "argCount": 3
+    },
+    {
+      "name": "closesocket",
+      "argCount": 1
+    },
+    {
+      "name": "connect",
+      "argCount": 3
+    },
+    {
+      "name": "EnumProtocolsA",
+      "argCount": 3
+    },
+    {
+      "name": "EnumProtocolsW",
+      "argCount": 3
+    },
+    {
+      "name": "GetAcceptExSockaddrs",
+      "argCount": 8
+    },
+    {
+      "name": "GetAddressByNameA",
+      "argCount": 10
+    },
+    {
+      "name": "GetAddressByNameW",
+      "argCount": 10
+    },
+    {
+      "name": "gethostbyaddr",
+      "argCount": 3
+    },
+    {
+      "name": "gethostbyname",
+      "argCount": 1
+    },
+    {
+      "name": "gethostname",
+      "argCount": 2
+    },
+    {
+      "name": "getnetbyname",
+      "argCount": 1
+    },
+    {
+      "name": "getpeername",
+      "argCount": 3
+    },
+    {
+      "name": "getprotobyname",
+      "argCount": 1
+    },
+    {
+      "name": "getprotobynumber",
+      "argCount": 1
+    },
+    {
+      "name": "getservbyname",
+      "argCount": 2
+    },
+    {
+      "name": "getservbyport",
+      "argCount": 2
+    },
+    {
+      "name": "GetServiceA",
+      "argCount": 7
+    },
+    {
+      "name": "GetServiceW",
+      "argCount": 7
+    },
+    {
+      "name": "getsockname",
+      "argCount": 3
+    },
+    {
+      "name": "getsockopt",
+      "argCount": 5
+    },
+    {
+      "name": "GetTypeByNameA",
+      "argCount": 2
+    },
+    {
+      "name": "GetTypeByNameW",
+      "argCount": 2
+    },
+    {
+      "name": "htonl",
+      "argCount": 1
+    },
+    {
+      "name": "htons",
+      "argCount": 1
+    },
+    {
+      "name": "inet_addr",
+      "argCount": 1
+    },
+    {
+      "name": "inet_network",
+      "argCount": 1
+    },
+    {
+      "name": "inet_ntoa",
+      "argCount": 1
+    },
+    {
+      "name": "ioctlsocket",
+      "argCount": 3
+    },
+    {
+      "name": "listen",
+      "argCount": 2
+    },
+    {
+      "name": "ntohl",
+      "argCount": 1
+    },
+    {
+      "name": "ntohs",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1",
+      "argCount": 3
+    },
+    {
+      "name": "ord_10",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1001",
+      "argCount": 6
+    },
+    {
+      "name": "ord_101",
+      "argCount": 4
+    },
+    {
+      "name": "ord_102",
+      "argCount": 7
+    },
+    {
+      "name": "ord_103",
+      "argCount": 5
+    },
+    {
+      "name": "ord_104",
+      "argCount": 5
+    },
+    {
+      "name": "ord_105",
+      "argCount": 5
+    },
+    {
+      "name": "ord_106",
+      "argCount": 6
+    },
+    {
+      "name": "ord_107",
+      "argCount": 6
+    },
+    {
+      "name": "ord_108",
+      "argCount": 1
+    },
+    {
+      "name": "ord_109",
+      "argCount": 1
+    },
+    {
+      "name": "ord_11",
+      "argCount": 1
+    },
+    {
+      "name": "ord_110",
+      "argCount": 0
+    },
+    {
+      "name": "ord_1100",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1101",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1107",
+      "argCount": 4
+    },
+    {
+      "name": "ord_1108",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1109",
+      "argCount": 10
+    },
+    {
+      "name": "ord_111",
+      "argCount": 0
+    },
+    {
+      "name": "ord_1110",
+      "argCount": 10
+    },
+    {
+      "name": "ord_1111",
+      "argCount": 3
+    },
+    {
+      "name": "ord_1112",
+      "argCount": 3
+    },
+    {
+      "name": "ord_1113",
+      "argCount": 2
+    },
+    {
+      "name": "ord_1114",
+      "argCount": 2
+    },
+    {
+      "name": "ord_1117",
+      "argCount": 6
+    },
+    {
+      "name": "ord_1118",
+      "argCount": 6
+    },
+    {
+      "name": "ord_1119",
+      "argCount": 7
+    },
+    {
+      "name": "ord_112",
+      "argCount": 1
+    },
+    {
+      "name": "ord_1120",
+      "argCount": 7
+    },
+    {
+      "name": "ord_113",
+      "argCount": 0
+    },
+    {
+      "name": "ord_114",
+      "argCount": 0
+    },
+    {
+      "name": "ord_1140",
+      "argCount": 6
+    },
+    {
+      "name": "ord_1141",
+      "argCount": 8
+    },
+    {
+      "name": "ord_1142",
+      "argCount": 8
+    },
+    {
+      "name": "ord_115",
+      "argCount": 2
+    },
+    {
+      "name": "ord_116",
+      "argCount": 0
+    },
+    {
+      "name": "ord_12",
+      "argCount": 3
+    },
+    {
+      "name": "ord_13",
+      "argCount": 2
+    },
+    {
+      "name": "ord_14",
+      "argCount": 1
+    },
+    {
+      "name": "ord_15",
+      "argCount": 1
+    },
+    {
+      "name": "ord_151",
+      "argCount": 2
+    },
+    {
+      "name": "ord_16",
+      "argCount": 4
+    },
+    {
+      "name": "ord_17",
+      "argCount": 6
+    },
+    {
+      "name": "ord_18",
+      "argCount": 5
+    },
+    {
+      "name": "ord_19",
+      "argCount": 4
+    },
+    {
+      "name": "ord_2",
+      "argCount": 3
+    },
+    {
+      "name": "ord_20",
+      "argCount": 6
+    },
+    {
+      "name": "ord_21",
+      "argCount": 5
+    },
+    {
+      "name": "ord_22",
+      "argCount": 2
+    },
+    {
+      "name": "ord_23",
+      "argCount": 3
+    },
+    {
+      "name": "ord_3",
+      "argCount": 1
+    },
+    {
+      "name": "ord_4",
+      "argCount": 3
+    },
+    {
+      "name": "ord_5",
+      "argCount": 3
+    },
+    {
+      "name": "ord_500",
+      "argCount": 0
+    },
+    {
+      "name": "ord_51",
+      "argCount": 3
+    },
+    {
+      "name": "ord_52",
+      "argCount": 1
+    },
+    {
+      "name": "ord_53",
+      "argCount": 1
+    },
+    {
+      "name": "ord_54",
+      "argCount": 1
+    },
+    {
+      "name": "ord_55",
+      "argCount": 2
+    },
+    {
+      "name": "ord_56",
+      "argCount": 2
+    },
+    {
+      "name": "ord_57",
+      "argCount": 2
+    },
+    {
+      "name": "ord_6",
+      "argCount": 3
+    },
+    {
+      "name": "ord_7",
+      "argCount": 5
+    },
+    {
+      "name": "ord_8",
+      "argCount": 1
+    },
+    {
+      "name": "ord_9",
+      "argCount": 1
+    },
+    {
+      "name": "recv",
+      "argCount": 4
+    },
+    {
+      "name": "recvfrom",
+      "argCount": 6
+    },
+    {
+      "name": "s_perror",
+      "argCount": 1
+    },
+    {
+      "name": "select",
+      "argCount": 5
+    },
+    {
+      "name": "send",
+      "argCount": 4
+    },
+    {
+      "name": "sendto",
+      "argCount": 6
+    },
+    {
+      "name": "SetServiceA",
+      "argCount": 6
+    },
+    {
+      "name": "SetServiceW",
+      "argCount": 6
+    },
+    {
+      "name": "setsockopt",
+      "argCount": 5
+    },
+    {
+      "name": "shutdown",
+      "argCount": 2
+    },
+    {
+      "name": "socket",
+      "argCount": 3
+    },
+    {
+      "name": "TransmitFile",
+      "argCount": 6
+    },
+    {
+      "name": "WEP",
+      "argCount": 0
+    },
+    {
+      "name": "WSAAsyncGetHostByAddr",
+      "argCount": 7
+    },
+    {
+      "name": "WSAAsyncGetHostByName",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetProtoByName",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetProtoByNumber",
+      "argCount": 5
+    },
+    {
+      "name": "WSAAsyncGetServByName",
+      "argCount": 6
+    },
+    {
+      "name": "WSAAsyncGetServByPort",
+      "argCount": 6
+    },
+    {
+      "name": "WSAAsyncSelect",
+      "argCount": 4
+    },
+    {
+      "name": "WSACancelAsyncRequest",
+      "argCount": 1
+    },
+    {
+      "name": "WSACancelBlockingCall",
+      "argCount": 0
+    },
+    {
+      "name": "WSACleanup",
+      "argCount": 0
+    },
+    {
+      "name": "WSAGetLastError",
+      "argCount": 0
+    },
+    {
+      "name": "WSAIsBlocking",
+      "argCount": 0
+    },
+    {
+      "name": "WSARecvEx",
+      "argCount": 4
+    },
+    {
+      "name": "WSASetBlockingHook",
+      "argCount": 1
+    },
+    {
+      "name": "WSASetLastError",
+      "argCount": 1
+    },
+    {
+      "name": "WSAStartup",
+      "argCount": 2
+    },
+    {
+      "name": "WSAUnhookBlockingHook",
+      "argCount": 0
+    },
+    {
+      "name": "WsControl",
+      "argCount": 6
+    }
+  ]
+}

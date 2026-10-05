@@ -1,0 +1,179 @@
+/**
+ * Guest memory reaches leaf hot loops as a REAL typed array, not v86's Proxy.
+ *
+ * v86's fork hands out `cpu.mem8` wrapped in a Proxy so that a WASM memory growth
+ * (which detaches `memory.buffer`) is transparent. ThunkDispatcher must keep passing
+ * that Proxy — it writes the guest stack after a thunk may have re-entered the guest —
+ * so every leaf loop that indexes guest memory per element has to unwrap it itself.
+ * Through the Proxy each `mem[i]` is a trap V8 cannot JIT; measured on the gdi32 DIB
+ * path, a 640x480x24bpp blit read 921,600 bytes in ~300ms instead of ~2ms, which pinned
+ * Blade of Darkness's menu at 3.5 FPS.
+ */
+import { describe, expect, it } from "bun:test";
+import {
+    toPlainGuestMemory,
+    guestMemoryBorrowCount,
+    setGuestMemoryBorrowBypass,
+    isGuestMemoryBorrowBypassed,
+    borrowGuestMemory,
+    setGuestMemoryStaleGuard,
+} from "../../src/worker/core/memory/guest-memory";
+
+/** Stand-in for vendor/v86/src/lib.js `view()`: element access goes through a trap. */
+function v86StyleProxy(view: Uint8Array): Uint8Array {
+    return new Proxy(view, {
+        get(target, prop) {
+            const x = Reflect.get(target, prop);
+            return typeof x === "function" ? x.bind(target) : x;
+        },
+        set(target, prop, value) {
+            (target as unknown as Record<PropertyKey, unknown>)[prop] = value;
+            return true;
+        },
+    }) as unknown as Uint8Array;
+}
+
+describe("toPlainGuestMemory", () => {
+    it("turns v86's Proxy into a real typed array over the same bytes", () => {
+        const backing = new Uint8Array(4096);
+        for (let i = 0; i < backing.length; i++) backing[i] = i & 0xff;
+        const proxied = v86StyleProxy(backing);
+
+        // The Proxy is what makes the leaf loops slow: it is not even a view.
+        expect(ArrayBuffer.isView(proxied)).toBe(false);
+
+        const plain = toPlainGuestMemory(proxied);
+        expect(ArrayBuffer.isView(plain)).toBe(true);
+        expect(plain.constructor).toBe(Uint8Array);
+        // Same window over the SAME buffer — an unwrap, never a copy.
+        expect(plain.buffer).toBe(backing.buffer);
+        expect(plain.byteOffset).toBe(backing.byteOffset);
+        expect(plain.length).toBe(backing.length);
+        for (const i of [0, 1, 255, 256, 4095]) expect(plain[i]).toBe(backing[i]);
+    });
+
+    it("writes through to the same memory the guest sees", () => {
+        const backing = new Uint8Array(64);
+        const plain = toPlainGuestMemory(v86StyleProxy(backing));
+        plain[7] = 0xab;
+        expect(backing[7]).toBe(0xab);
+    });
+
+    it("re-derives after a WASM growth swaps the buffer", () => {
+        const first = new Uint8Array(1024);
+        const a = toPlainGuestMemory(v86StyleProxy(first));
+        expect(a.buffer).toBe(first.buffer);
+
+        // Growth detaches the old buffer and installs a fresh one; the cache is keyed
+        // on buffer identity, so the next borrow must follow it rather than hand back
+        // a view onto memory the guest no longer uses.
+        const grown = new Uint8Array(2048);
+        const b = toPlainGuestMemory(v86StyleProxy(grown));
+        expect(b.buffer).toBe(grown.buffer);
+        expect(b.length).toBe(2048);
+    });
+
+    it("passes an already-plain view straight through", () => {
+        const plain = new Uint8Array(32);
+        expect(toPlainGuestMemory(plain)).toBe(plain);
+    });
+
+    it("tolerates null/undefined so callers need no guard", () => {
+        expect(toPlainGuestMemory(null)).toBe(null);
+        expect(toPlainGuestMemory(undefined)).toBe(undefined);
+    });
+
+    it("counts every borrow, so the dispatcher can name a thunk that never took one", () => {
+        // The counter is what turns "slow thunk" into "slow thunk that indexed the Proxy":
+        // it must tick even on the pass-through and the null paths, or a leaf that borrows
+        // once and then loops would read as never having borrowed.
+        const before = guestMemoryBorrowCount();
+        toPlainGuestMemory(v86StyleProxy(new Uint8Array(8)));
+        toPlainGuestMemory(new Uint8Array(8));
+        toPlainGuestMemory(null);
+        expect(guestMemoryBorrowCount()).toBe(before + 3);
+    });
+
+    describe("borrow bypass (dev A/B switch)", () => {
+        it("hands back the Proxy untouched while on, and restores plain views when off", () => {
+            const backing = new Uint8Array(64);
+            backing[3] = 0x5a;
+            const proxied = v86StyleProxy(backing);
+
+            setGuestMemoryBorrowBypass(true);
+            try {
+                expect(isGuestMemoryBorrowBypassed()).toBe(true);
+                const bypassed = toPlainGuestMemory(proxied);
+                // Same object, still not a view — that IS the slow arm being measured.
+                expect(bypassed).toBe(proxied);
+                expect(ArrayBuffer.isView(bypassed)).toBe(false);
+                // Slow, but never wrong: the bytes are identical either way.
+                expect(bypassed[3]).toBe(0x5a);
+            } finally {
+                setGuestMemoryBorrowBypass(false);
+            }
+
+            expect(isGuestMemoryBorrowBypassed()).toBe(false);
+            const plain = toPlainGuestMemory(proxied);
+            expect(ArrayBuffer.isView(plain)).toBe(true);
+            expect(plain[3]).toBe(0x5a);
+        });
+
+        it("drops the cached view on entry so the fast arm cannot serve a bypass-era stale one", () => {
+            const first = new Uint8Array(16);
+            toPlainGuestMemory(v86StyleProxy(first));
+            setGuestMemoryBorrowBypass(true);
+            const grown = new Uint8Array(32);
+            toPlainGuestMemory(v86StyleProxy(grown));   // bypassed: cache must not be primed
+            setGuestMemoryBorrowBypass(false);
+            const after = toPlainGuestMemory(v86StyleProxy(grown));
+            expect(after.buffer).toBe(grown.buffer);
+            expect(after.length).toBe(32);
+        });
+    });
+
+    describe("view identity", () => {
+        it("does not serve one subview's cached plain view to a different subview", () => {
+            const backing = new Uint8Array(64);
+            const lo = v86StyleProxy(backing.subarray(4, 12));
+            const hi = v86StyleProxy(backing.subarray(20, 32));
+
+            const first = toPlainGuestMemory(lo);
+            expect(first.byteOffset).toBe(4);
+            expect(toPlainGuestMemory(lo)).toBe(first);
+
+            // Same ArrayBuffer, different extent: buffer identity alone is NOT view identity.
+            const second = toPlainGuestMemory(hi);
+            expect(second.byteOffset).toBe(20);
+            expect(second.length).toBe(12);
+            second[0] = 0xad;
+            expect(backing[20]).toBe(0xad);
+            expect(backing[4]).toBe(0);
+        });
+    });
+});
+
+describe("stale-view guard", () => {
+    it("keeps typed-array accessors working and throws only on a stale touch", () => {
+        const memory = new WebAssembly.Memory({ initial: 1 });
+        const proxy = v86StyleProxy(new Uint8Array(memory.buffer));
+        setGuestMemoryStaleGuard(true);
+        try {
+            const guarded = borrowGuestMemory(proxy)!;
+            // buffer/byteLength/length are %TypedArray%.prototype accessors that validate
+            // `this`; forwarding the Proxy as the Reflect.get receiver TypeErrors on all three.
+            expect(guarded.length).toBe(65536);
+            expect(guarded.byteLength).toBe(65536);
+            expect(guarded.buffer).toBe(memory.buffer);
+            guarded[7] = 18;
+            expect(guarded.subarray(7, 8)[0]).toBe(18);
+
+            memory.grow(1);
+            toPlainGuestMemory(v86StyleProxy(new Uint8Array(memory.buffer)));
+            expect(() => guarded[7]).toThrow(/STALE/);
+            expect(() => { guarded[7] = 42; }).toThrow(/STALE/);
+        } finally {
+            setGuestMemoryStaleGuard(false);
+        }
+    });
+});

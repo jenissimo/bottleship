@@ -11,9 +11,12 @@ import { devices, deviceBoundDepthStencil, addComRef, isComObjectLive, deviceRen
 import { ensureBackBufferSurface } from './device-lifecycle';
 import type { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
 import { writeDeviceCaps8 } from './caps';
+import { deviceCooperativeLevel } from '../../core/gpu/gpu-device-loss-contract';
 
 const D3D_OK = 0;
 const D3DERR_INVALIDCALL = 0x8876086c;
+const D3DERR_DEVICELOST = 0x88760868;
+const D3DERR_DEVICENOTRESET = 0x88760869;
 const D3DERR_NOTFOUND = 0x88760866;
 
 const PRIM_NAMES = ['?', 'POINTLIST', 'LINELIST', 'LINESTRIP', 'TRILIST', 'TRISTRIP', 'TRIFAN'];
@@ -61,6 +64,9 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
     exports['IDirect3DDevice8_EndScene'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);
         if (!device) return D3DERR_INVALIDCALL;
+        // The frame's pixels are final here, and a title that read-Locks the finished
+        // frame does so between this call and Present — the only kick early enough.
+        device.pumpLockReadbackPrefetch("endScene");
         return D3D_OK;
     };
 
@@ -147,7 +153,16 @@ export function createDeviceExports(): Record<string, ThunkImplementation> {
         return D3D_OK;
     };
 
-    exports['IDirect3DDevice8_TestCooperativeLevel'] = () => D3D_OK;
+    // Same contract, same HRESULT values as d3d9 (D3D8 defines the identical facility codes).
+    exports['IDirect3DDevice8_TestCooperativeLevel'] = (_ctx, _mem, args) => {
+        const devicePtr = args[0] >>> 0;
+        if (!devices.has(devicePtr)) return D3DERR_INVALIDCALL;
+        switch (deviceCooperativeLevel(devicePtr)) {
+            case "lost": return D3DERR_DEVICELOST;
+            case "notreset": return D3DERR_DEVICENOTRESET;
+            default: return D3D_OK;
+        }
+    };
     exports['IDirect3DDevice8_GetAvailableTextureMem'] = () => 256 * 1024 * 1024; // 256MB
     exports['IDirect3DDevice8_ResourceManagerDiscardBytes'] = (_ctx, _mem, args) => {
         const device = devices.get(args[0]);

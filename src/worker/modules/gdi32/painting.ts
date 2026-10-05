@@ -1,5 +1,5 @@
 
-import { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
+import { type HleDispatcher, ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { registerPaintingDcStateExports } from './painting-dc-state';
 import { registerPaintingMiscExports } from './painting-misc';
 import { System } from '../../core/system';
@@ -8,16 +8,209 @@ import { Logger, LogCategory } from '../../core/logger';
 import { profiler } from '../../core/profiler';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { SystemResourceProvider } from '../../core/resources/system-resource-provider';
+import { toPlainGuestMemory } from '../../core/memory/guest-memory';
+import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
+import { writeBackDibSectionRect } from './bitmap-resolve';
 // Track GetPixel HDC usage for profiling
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
 // Store last GetDIBits output buffer address for texture loading workaround
 let lastGetDIBitsBuffer: { address: number; width: number; height: number } | null = null;
-let dibSectionSyncDiagCount = 0;
 const pixelFormatByHdc = new Map<number, number>();
 
 export function getLastGetDIBitsBuffer(): { address: number; width: number; height: number } | null {
     return lastGetDIBitsBuffer;
+}
+
+/** Allocation guard for a DIB claimed by guest-supplied header fields (~64 Mpx). */
+const MAX_DIB_PIXELS = 1 << 26;
+
+// ---- WGL pixel formats ----
+//
+// The format list is a CAPABILITY ENUMERATION: an engine walks it, scores every entry,
+// and picks a rendering path from what it finds. Publishing a single hardcoded entry
+// (and answering ChoosePixelFormat without reading the request) tells every engine the
+// same thing regardless of what it asked for, so one that wants 16-bit colour, no
+// stencil or a single buffer concludes the driver cannot serve it.
+//
+// Every entry below is backed by what the GL executor actually renders: an RGBA8
+// offscreen colour target with a depth24plus-stencil8 attachment, presented on
+// SwapBuffers. Depth/stencil widths are the MINIMUM an entry promises (GL guarantees
+// "at least"), so a 16-bit-depth entry served by depth24 is honest. There are no
+// colour-index, stereo, accumulation, aux-buffer, draw-to-bitmap, GDI-shared or
+// multisampled entries because none of those are implemented.
+
+const PFD_DOUBLEBUFFER = 0x00000001;
+const PFD_STEREO = 0x00000002;
+const PFD_DRAW_TO_WINDOW = 0x00000004;
+const PFD_DRAW_TO_BITMAP = 0x00000008;
+const PFD_SUPPORT_GDI = 0x00000010;
+const PFD_SUPPORT_OPENGL = 0x00000020;
+const PFD_SWAP_COPY = 0x00000400;
+const PFD_DEPTH_DONTCARE = 0x20000000;
+const PFD_DOUBLEBUFFER_DONTCARE = 0x40000000;
+const PFD_STEREO_DONTCARE = 0x80000000;
+
+const PFD_TYPE_RGBA = 0;
+
+interface WglPixelFormat {
+    colorBits: number;
+    redBits: number; redShift: number;
+    greenBits: number; greenShift: number;
+    blueBits: number; blueShift: number;
+    alphaBits: number; alphaShift: number;
+    depthBits: number;
+    stencilBits: number;
+    doubleBuffer: boolean;
+}
+
+function rgbaFormat(colorBits: number, depthBits: number, stencilBits: number, doubleBuffer: boolean): WglPixelFormat {
+    // 32bpp is BGRA in memory (the layout GDI and our surfaces use), 16bpp is 5:6:5.
+    return colorBits >= 32
+        ? {
+            colorBits: 32,
+            redBits: 8, redShift: 16,
+            greenBits: 8, greenShift: 8,
+            blueBits: 8, blueShift: 0,
+            alphaBits: 8, alphaShift: 24,
+            depthBits, stencilBits, doubleBuffer,
+        }
+        : {
+            colorBits: 16,
+            redBits: 5, redShift: 11,
+            greenBits: 6, greenShift: 5,
+            blueBits: 5, blueShift: 0,
+            alphaBits: 0, alphaShift: 0,
+            depthBits, stencilBits, doubleBuffer,
+        };
+}
+
+const WGL_PIXEL_FORMATS: WglPixelFormat[] = [
+    rgbaFormat(32, 24, 8, true),
+    rgbaFormat(32, 24, 0, true),
+    rgbaFormat(32, 16, 0, true),
+    rgbaFormat(32, 0, 0, true),
+    rgbaFormat(32, 24, 8, false),
+    rgbaFormat(32, 16, 0, false),
+    rgbaFormat(16, 24, 8, true),
+    rgbaFormat(16, 16, 0, true),
+];
+
+function pixelFormatFlags(fmt: WglPixelFormat): number {
+    // Neither PFD_GENERIC_FORMAT nor PFD_GENERIC_ACCELERATED: that pair is how Windows
+    // spells "full ICD", and engines reject a format with PFD_GENERIC_FORMAT set as a
+    // software rasterizer. PFD_SWAP_COPY because our colour target survives the present.
+    let flags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL;
+    if (fmt.doubleBuffer) flags |= PFD_DOUBLEBUFFER | PFD_SWAP_COPY;
+    return flags >>> 0;
+}
+
+export function getWglPixelFormatCount(): number {
+    return WGL_PIXEL_FORMATS.length;
+}
+
+/**
+ * DescribePixelFormat / wglDescribePixelFormat — one implementation, because two
+ * copies of a struct layout drift and the guest cannot tell which one it got.
+ * Returns the number of formats (0 only for an out-of-range index).
+ */
+export function describeWglPixelFormat(
+    mem: Uint8Array,
+    iPixelFormat: number,
+    nBytes: number,
+    ppfd: number,
+): number {
+    const count = WGL_PIXEL_FORMATS.length;
+    if (iPixelFormat <= 0 || iPixelFormat > count) return 0;
+    if (!ppfd || nBytes < 40 || ppfd + 40 > mem.length) return count;
+
+    const fmt = WGL_PIXEL_FORMATS[iPixelFormat - 1];
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    view.setUint16(ppfd + 0, 40, true);                    // nSize
+    view.setUint16(ppfd + 2, 1, true);                     // nVersion
+    view.setUint32(ppfd + 4, pixelFormatFlags(fmt), true); // dwFlags
+    view.setUint8(ppfd + 8, PFD_TYPE_RGBA);                // iPixelType
+    view.setUint8(ppfd + 9, fmt.colorBits);                // cColorBits
+    view.setUint8(ppfd + 10, fmt.redBits);
+    view.setUint8(ppfd + 11, fmt.redShift);
+    view.setUint8(ppfd + 12, fmt.greenBits);
+    view.setUint8(ppfd + 13, fmt.greenShift);
+    view.setUint8(ppfd + 14, fmt.blueBits);
+    view.setUint8(ppfd + 15, fmt.blueShift);
+    view.setUint8(ppfd + 16, fmt.alphaBits);
+    view.setUint8(ppfd + 17, fmt.alphaShift);
+    view.setUint8(ppfd + 18, 0);                           // cAccumBits
+    view.setUint8(ppfd + 19, 0);                           // cAccumRedBits
+    view.setUint8(ppfd + 20, 0);                           // cAccumGreenBits
+    view.setUint8(ppfd + 21, 0);                           // cAccumBlueBits
+    view.setUint8(ppfd + 22, 0);                           // cAccumAlphaBits
+    view.setUint8(ppfd + 23, fmt.depthBits);
+    view.setUint8(ppfd + 24, fmt.stencilBits);
+    view.setUint8(ppfd + 25, 0);                           // cAuxBuffers
+    view.setUint8(ppfd + 26, 0);                           // iLayerType = PFD_MAIN_PLANE
+    view.setUint8(ppfd + 27, 0);                           // bReserved
+    view.setUint32(ppfd + 28, 0, true);                    // dwLayerMask
+    view.setUint32(ppfd + 32, 0, true);                    // dwVisibleMask
+    view.setUint32(ppfd + 36, 0, true);                    // dwDamageMask
+    return count;
+}
+
+/**
+ * ChoosePixelFormat — score the published table against what the caller asked for.
+ * Hard requirements (an unmet one disqualifies a format outright) are the ones whose
+ * absence changes what the app may legally do with the DC; everything else is a
+ * weighted distance, with "more than asked" cheaper than "less than asked".
+ */
+export function chooseWglPixelFormat(mem: Uint8Array, ppfd: number): number {
+    if (!ppfd || ppfd + 40 > mem.length) return 1;
+    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    const wantFlags = view.getUint32(ppfd + 4, true) >>> 0;
+    const wantType = view.getUint8(ppfd + 8);
+    const wantColor = view.getUint8(ppfd + 9);
+    const wantAlpha = view.getUint8(ppfd + 16);
+    const wantAccum = view.getUint8(ppfd + 18);
+    const wantDepth = view.getUint8(ppfd + 23);
+    const wantStencil = view.getUint8(ppfd + 24);
+    const wantAux = view.getUint8(ppfd + 25);
+
+    // Capabilities we do not have. Answering with a format anyway would hand the app a
+    // DC it can never use as it intends — the honest answer is the documented failure.
+    if (wantType !== PFD_TYPE_RGBA) return 0;                                        // no colour-index
+    if ((wantFlags & PFD_STEREO) && !(wantFlags & PFD_STEREO_DONTCARE)) return 0;
+    if (wantFlags & PFD_DRAW_TO_BITMAP) return 0;                                    // GL renders to the window only
+    if (wantFlags & PFD_SUPPORT_GDI) return 0;                                       // no GDI drawing into a GL surface
+    if (wantAccum > 0) return 0;                                                     // no accumulation buffer
+    if (wantAux > 0) return 0;                                                       // no aux buffers
+
+    const distance = (have: number, want: number, shortfallWeight: number): number =>
+        have >= want ? (have - want) : (want - have) * shortfallWeight;
+
+    let best = 0;
+    let bestCost = Number.POSITIVE_INFINITY;
+    for (let i = 0; i < WGL_PIXEL_FORMATS.length; i++) {
+        const fmt = WGL_PIXEL_FORMATS[i];
+        if (!(wantFlags & PFD_DOUBLEBUFFER_DONTCARE)) {
+            const wantDouble = (wantFlags & PFD_DOUBLEBUFFER) !== 0;
+            if (wantDouble !== fmt.doubleBuffer) continue;
+        }
+        let cost = 0;
+        cost += distance(fmt.colorBits, wantColor, 8) * 4;
+        cost += distance(fmt.alphaBits, wantAlpha, 8) * 2;
+        if (!(wantFlags & PFD_DEPTH_DONTCARE)) cost += distance(fmt.depthBits, wantDepth, 8) * 2;
+        cost += distance(fmt.stencilBits, wantStencil, 16) * 2;
+        if (cost < bestCost) { bestCost = cost; best = i + 1; }
+    }
+    return best;
+}
+
+export function setWglPixelFormat(hdc: number, format: number): boolean {
+    if (format <= 0 || format > WGL_PIXEL_FORMATS.length) return false;
+    pixelFormatByHdc.set(hdc, format);
+    return true;
+}
+
+export function getWglPixelFormat(hdc: number): number {
+    return pixelFormatByHdc.get(hdc) ?? 1;
 }
 
 /** Optional scan-line window for SetDIBitsToDevice / StretchDIBits partial DIB copies. */
@@ -124,6 +317,13 @@ function dibToCanvas(
 ): boolean {
     if (!lpBmi || !lpBits) return false;
 
+    // Leaf hot loop: the per-pixel DIB→RGBA conversion below indexes guest memory a
+    // million times per blit, and the dispatcher hands us v86's always-live Proxy
+    // (which it must keep — see ThunkDispatcher.updateMemoryCache). Every `mem[i]`
+    // through that Proxy is a trap V8 cannot JIT. Nothing here re-enters the guest,
+    // so a plain view cannot go stale mid-call.
+    mem = toPlainGuestMemory(mem);
+
     const gdi = System.getInstance().gdiContext;
     const dcCtx = (gdi as any).contexts?.get(hdc) as OffscreenCanvasRenderingContext2D | undefined;
     if (!dcCtx) {
@@ -146,7 +346,15 @@ function dibToCanvas(
     const absHeight = isTopDown ? -biHeight : biHeight;
     const absWidth = biWidth > 0 ? biWidth : -biWidth;
 
-    if (absWidth <= 0 || absHeight <= 0 || absWidth > 4096 || absHeight > 4096) {
+    // Only reject what cannot be a DIB. A DIB is not bounded by any screen dimension —
+    // a tall single-column strip atlas (button tiles stacked vertically) is perfectly
+    // legal, and the scanline window drawn below is clamped to `scan` and bounds-checked
+    // against guest memory, so the sole remaining hazard is an absurd allocation. That
+    // is what the pixel-count cap covers; a resolution-shaped cap instead silently drops
+    // a legal blit, and the guest sees a black tile it drew nothing into.
+    if (absWidth <= 0 || absHeight <= 0
+        || absWidth > 0xFFFF || absHeight > 0xFFFF
+        || absWidth * absHeight > MAX_DIB_PIXELS) {
         Logger.warn(LogCategory.GDI32, `dibToCanvas: Invalid DIB dimensions ${absWidth}x${absHeight}`);
         return false;
     }
@@ -300,17 +508,36 @@ function dibToCanvas(
     // Create ImageData from the selected scan-line window
     const imgData = new ImageData(new Uint8ClampedArray(rgbaData.buffer), absWidth, drawHeight);
 
+
     // If source and dest sizes match and no offset, use putImageData directly
     const srcW = wSrc > 0 ? wSrc : absWidth;
     const srcH = hSrc > 0 ? hSrc : drawHeight;
-    if (srcW === wDest && srcH === hDest && xSrc === 0 && (ySrc === 0 || ySrc === uStartScan)) {
-        dcCtx.putImageData(imgData, xDest, yDest, 0, 0, wDest, hDest);
+    // A zero destination extent means "use the source extent" and a negative one is a
+    // mirrored blit — both are legal output, so the clip is applied to the extent that
+    // actually lands on the canvas rather than to the raw argument.
+    const outW = wDest !== 0 ? wDest : absWidth;
+    const outH = hDest !== 0 ? hDest : drawHeight;
+    const dstX = outW < 0 ? xDest + outW : xDest;
+    const dstY = outH < 0 ? yDest + outH : yDest;
+    const dstW = Math.abs(outW), dstH = Math.abs(outH);
+    // Clipping is DC state and applies to a DIB blit like any other output. putImageData
+    // ignores the canvas clip, so the 1:1 path writes one rect of the clip REGION at a
+    // time (via putImageData's own dirty-rect arguments) while the stretched path draws
+    // through the clip.
+    const clipRect = gdi.clipCopyRect(hdc, dstX, dstY, dstW, dstH);
+    if (!clipRect) return true;
+    if (srcW === outW && srcH === outH && xSrc === 0 && (ySrc === 0 || ySrc === uStartScan)) {
+        gdi.forEachClipPart(hdc, dstX, dstY, dstW, dstH, (px, py, pw, ph) => {
+            dcCtx.putImageData(imgData, xDest, yDest, px - xDest, py - yDest, pw, ph);
+        });
     } else {
         // Need stretching: draw via temporary canvas
         const tmpCanvas = new OffscreenCanvas(absWidth, drawHeight);
         const tmpCtx = tmpCanvas.getContext('2d')!;
         tmpCtx.putImageData(imgData, 0, 0);
-        dcCtx.drawImage(tmpCanvas, xSrc, 0, srcW, drawHeight, xDest, yDest, wDest, hDest);
+        const clipped = gdi.beginClipOn(hdc, dcCtx);
+        dcCtx.drawImage(tmpCanvas, xSrc, 0, srcW, drawHeight, xDest, yDest, outW, outH);
+        if (clipped) dcCtx.restore();
     }
 
     // Keep the DC's selected-bitmap backing canvas in sync, mirroring the writeback
@@ -324,10 +551,10 @@ function dibToCanvas(
     if (linkedBitmapCanvas) {
         const bmCtx = linkedBitmapCanvas.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
         if (bmCtx) {
-            const cw = wDest > 0 ? wDest : absWidth;
-            const ch = hDest > 0 ? hDest : drawHeight;
+            // Copied out of the (already clipped) DC canvas, so the clip governs it too.
             try {
-                bmCtx.drawImage(dcCtx.canvas, xDest, yDest, cw, ch, xDest, yDest, cw, ch);
+                bmCtx.drawImage(dcCtx.canvas, clipRect.x, clipRect.y, clipRect.w, clipRect.h,
+                    clipRect.x, clipRect.y, clipRect.w, clipRect.h);
             } catch { /* ignore writeback failures */ }
         }
     }
@@ -343,90 +570,16 @@ function dibToCanvas(
     Logger.verbose(LogCategory.GDI32,
         `dibToCanvas: Drew ${absWidth}x${drawHeight}@${uStartScan}/${absHeight} ${biBitCount}bpp DIB to DC 0x${hdc.toString(16)} at (${xDest},${yDest})`);
 
-    // If this HDC has a DIBSection selected, keep ppvBits memory in sync.
-    // Some engines upload textures directly from CreateDIBSection bits instead of blitting the HDC.
+    // A DIBSection selected into this DC has its guest bits as its pixel surface, so the
+    // blit has to land there too (engines upload textures straight from ppvBits). The
+    // source of truth is the DC canvas we just drew: it alone carries the destination
+    // offset, the stretch and the clip, all three of which a copy straight out of the
+    // decoded source buffer would lose — writing the whole bitmap from (0,0) and blanking
+    // whatever the blit did not cover.
     const linkedBitmap = ((dcCtx.canvas as any).__linkedBitmap as number | undefined) ||
         ((state as any)?.hBitmap as number | undefined);
     if (linkedBitmap && linkedBitmap !== 0x80000009) {
-        const userObj = SystemResourceProvider.getInstance().getUserObject(linkedBitmap) as any;
-        const bitsPtr = userObj?.bitsPtr as number | undefined;
-        const dibBpp = userObj?.dibBpp as number | undefined;
-        const dibStride = userObj?.dibStride as number | undefined;
-        const dibTopDown = !!userObj?.dibTopDown;
-        const w = userObj?.width as number | undefined;
-        const h = userObj?.height as number | undefined;
-
-        if (bitsPtr && dibBpp === 32 && dibStride && w && h && w > 0 && h > 0) {
-            // Sync from decoded RGBA buffer directly (faster and avoids canvas readback path).
-            const srcW = absWidth;
-            const srcH = drawHeight;
-            const copyW = Math.min(w, srcW);
-            const copyH = Math.min(h, srcH);
-            // Fast path: matching dimensions, stride=w*4, 4-byte aligned
-            const canFast32 = dibStride === w * 4 && copyW === w && copyW === srcW &&
-                (bitsPtr & 3) === 0;
-            if (canFast32) {
-                const dst32 = new Uint32Array(mem.buffer, mem.byteOffset + bitsPtr, w * h);
-                const src32 = new Uint32Array(rgbaData.buffer, 0, srcW * srcH);
-                for (let y = 0; y < copyH; y++) {
-                    const srcRowBase = y * srcW;
-                    const dstY = dibTopDown ? y : (h - 1 - y);
-                    const dstRowBase = dstY * w;
-                    for (let x = 0; x < copyW; x++) {
-                        const p = src32[srcRowBase + x];
-                        // RGBA → BGRA: swap R and B
-                        dst32[dstRowBase + x] = ((p & 0xFF) << 16) | (p & 0xFF00FF00) | ((p >> 16) & 0xFF);
-                    }
-                }
-                // Zero-fill remaining rows if h > copyH
-                for (let y = copyH; y < h; y++) {
-                    const dstY = dibTopDown ? y : (h - 1 - y);
-                    const dstRowBase = dstY * w;
-                    for (let x = 0; x < w; x++) dst32[dstRowBase + x] = 0xFF000000;
-                }
-            } else {
-                for (let y = 0; y < h; y++) {
-                    const srcY = y < copyH ? y : -1;
-                    const dstY = dibTopDown ? y : (h - 1 - y);
-                    let dstOff = bitsPtr + dstY * dibStride;
-                    for (let x = 0; x < w; x++) {
-                        if (srcY >= 0 && x < copyW) {
-                            const srcOff = (srcY * srcW + x) * 4;
-                            // RGBA -> BGRA
-                            mem[dstOff] = rgbaData[srcOff + 2];
-                            mem[dstOff + 1] = rgbaData[srcOff + 1];
-                            mem[dstOff + 2] = rgbaData[srcOff];
-                            mem[dstOff + 3] = rgbaData[srcOff + 3];
-                        } else {
-                            mem[dstOff] = 0;
-                            mem[dstOff + 1] = 0;
-                            mem[dstOff + 2] = 0;
-                            mem[dstOff + 3] = 255;
-                        }
-                        dstOff += 4;
-                    }
-                }
-            }
-            if (dibSectionSyncDiagCount < 3) {
-                const b = mem[bitsPtr];
-                const gch = mem[bitsPtr + 1];
-                const r = mem[bitsPtr + 2];
-                const a = mem[bitsPtr + 3];
-                const cX = Math.max(0, (w >> 1) - 1);
-                const cY = Math.max(0, (h >> 1) - 1);
-                const cOff = bitsPtr + (dibTopDown ? cY : (h - 1 - cY)) * dibStride + cX * 4;
-                const cb = mem[cOff];
-                const cg = mem[cOff + 1];
-                const cr = mem[cOff + 2];
-                const ca = mem[cOff + 3];
-                Logger.log(
-                    LogCategory.GDI32,
-                    `dibToCanvas: DIBSection sync hbm=0x${linkedBitmap.toString(16)} bits=0x${bitsPtr.toString(16)} ` +
-                    `sampleBGRA=[${b},${gch},${r},${a}] center=[${cb},${cg},${cr},${ca}] copy=${copyW}x${copyH}`
-                );
-                dibSectionSyncDiagCount++;
-            }
-        }
+        writeBackDibSectionRect(linkedBitmap, dcCtx, clipRect.x, clipRect.y, clipRect.w, clipRect.h);
     }
 
     return true;
@@ -579,10 +732,9 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['ChoosePixelFormat'] = (ctx, mem, args): number => {
         const hdc = args[0] >>> 0;
         const ppfd = args[1] >>> 0;
-        // Minimal Win32-compatible behavior for legacy OpenGL bootstrap.
-        // Return a stable, valid (>0) pixel format index.
-        Logger.verbose(LogCategory.GDI32, `ChoosePixelFormat(hdc=0x${hdc.toString(16)}, ppfd=0x${ppfd.toString(16)}) -> 1`);
-        return 1;
+        const format = chooseWglPixelFormat(mem, ppfd);
+        Logger.verbose(LogCategory.GDI32, `ChoosePixelFormat(hdc=0x${hdc.toString(16)}, ppfd=0x${ppfd.toString(16)}) -> ${format}`);
+        return format;
     };
 
     // BOOL SetPixelFormat(HDC hdc, int format, const PIXELFORMATDESCRIPTOR *ppfd)
@@ -590,11 +742,10 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const hdc = args[0] >>> 0;
         const format = args[1] | 0;
         const ppfd = args[2] >>> 0;
-        if (format <= 0) {
+        if (!setWglPixelFormat(hdc, format)) {
             Logger.warn(LogCategory.GDI32, `SetPixelFormat(hdc=0x${hdc.toString(16)}, format=${format}, ppfd=0x${ppfd.toString(16)}) -> FALSE`);
             return 0;
         }
-        pixelFormatByHdc.set(hdc, format);
         Logger.verbose(LogCategory.GDI32, `SetPixelFormat(hdc=0x${hdc.toString(16)}, format=${format}, ppfd=0x${ppfd.toString(16)}) -> TRUE`);
         return 1;
     };
@@ -605,50 +756,18 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const iPixelFormat = args[1] | 0;
         const nBytes = args[2] >>> 0;
         const ppfd = args[3] >>> 0;
-
-        // Single emulated pixel format for legacy OpenGL bootstrap.
-        const maxFormats = 1;
-        if (iPixelFormat <= 0 || iPixelFormat > maxFormats) {
-            Logger.verbose(
-                LogCategory.GDI32,
-                `DescribePixelFormat(hdc=0x${hdc.toString(16)}, fmt=${iPixelFormat}, nBytes=${nBytes}, ppfd=0x${ppfd.toString(16)}) -> 0`
-            );
-            return 0;
-        }
-
-        if (ppfd && nBytes >= 40 && ppfd + 40 <= mem.length) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            // PIXELFORMATDESCRIPTOR (40 bytes)
-            view.setUint16(ppfd + 0, 40, true);      // nSize
-            view.setUint16(ppfd + 2, 1, true);       // nVersion
-            view.setUint32(ppfd + 4, 0x00000025, true); // PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER
-            view.setUint8(ppfd + 8, 0);              // iPixelType = PFD_TYPE_RGBA
-            view.setUint8(ppfd + 9, 32);             // cColorBits
-            view.setUint8(ppfd + 10, 8);             // cRedBits
-            view.setUint8(ppfd + 11, 16);            // cRedShift
-            view.setUint8(ppfd + 12, 8);             // cGreenBits
-            view.setUint8(ppfd + 13, 8);             // cGreenShift
-            view.setUint8(ppfd + 14, 8);             // cBlueBits
-            view.setUint8(ppfd + 15, 0);             // cBlueShift
-            view.setUint8(ppfd + 16, 8);             // cAlphaBits
-            view.setUint8(ppfd + 17, 24);            // cAlphaShift
-            view.setUint8(ppfd + 23, 24);            // cDepthBits
-            view.setUint8(ppfd + 24, 8);             // cStencilBits
-            view.setUint8(ppfd + 25, 0);             // cAuxBuffers
-            view.setUint8(ppfd + 26, 0);             // iLayerType = PFD_MAIN_PLANE
-        }
-
+        const result = describeWglPixelFormat(mem, iPixelFormat, nBytes, ppfd);
         Logger.verbose(
             LogCategory.GDI32,
-            `DescribePixelFormat(hdc=0x${hdc.toString(16)}, fmt=${iPixelFormat}, nBytes=${nBytes}, ppfd=0x${ppfd.toString(16)}) -> ${maxFormats}`
+            `DescribePixelFormat(hdc=0x${hdc.toString(16)}, fmt=${iPixelFormat}, nBytes=${nBytes}, ppfd=0x${ppfd.toString(16)}) -> ${result}`
         );
-        return maxFormats;
+        return result;
     };
 
     // int GetPixelFormat(HDC hdc)
     exports['GetPixelFormat'] = (ctx, mem, args): number => {
         const hdc = args[0] >>> 0;
-        const format = pixelFormatByHdc.get(hdc) ?? 1;
+        const format = getWglPixelFormat(hdc);
         Logger.verbose(LogCategory.GDI32, `GetPixelFormat(hdc=0x${hdc.toString(16)}) -> ${format}`);
         return format;
     };
@@ -673,6 +792,24 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['CreateSolidBrush'] = (ctx, mem, args): number => {
         const color = args[0]; // 0x00BBGGRR
         Logger.verbose(LogCategory.GDI32, `CreateSolidBrush color=0x${color.toString(16)}`);
+        return System.getInstance().gdiContext.createSolidBrush(color);
+    };
+
+    // HBRUSH CreateBrushIndirect(const LOGBRUSH *lplb)
+    // LOGBRUSH is { UINT lbStyle; COLORREF lbColor; ULONG_PTR lbHatch } on Win32.
+    // The renderer supports solid brushes; return failure for patterns/hatches rather
+    // than pretending an unsupported brush can draw correctly.
+    exports['CreateBrushIndirect'] = (ctx, mem, args): number => {
+        const lplb = args[0] >>> 0;
+        if (!lplb || lplb + 12 > mem.byteLength) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const style = view.getUint32(lplb, true);
+        const color = view.getUint32(lplb + 4, true);
+        if (style !== 0 /* BS_SOLID */) {
+            Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect style=${style} unsupported`);
+            return 0;
+        }
+        Logger.verbose(LogCategory.GDI32, `CreateBrushIndirect solid color=0x${color.toString(16)}`);
         return System.getInstance().gdiContext.createSolidBrush(color);
     };
 
@@ -709,9 +846,17 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const bottom = args[4] | 0;
 
         Logger.verbose(LogCategory.GDI32, `Rectangle: (${left},${top}) - (${right},${bottom})`);
-        // Rectangle draws border with PEN and fills with BRUSH.
-        // Simplified: Fill with current brush.
-        return System.getInstance().gdiContext.fillRect(hdc, left, top, right, bottom) ? 1 : 0;
+        // Border with the PEN, interior with the BRUSH. GDI's right/bottom are exclusive:
+        // the outline runs along left..right-1 / top..bottom-1 and the brush fills what is
+        // left inside it, so filling the whole rect and then stroking the outline on top
+        // gives the identical footprint for a 1px pen (dibdrv_Rectangle).
+        const gdi = System.getInstance().gdiContext;
+        const filled = gdi.fillRect(hdc, left, top, right, bottom);
+        if (right - left >= 1 && bottom - top >= 1) {
+            const r = right - 1, b = bottom - 1;
+            gdi.strokePolyline(hdc, [left, top, r, top, r, b, left, b], true);
+        }
+        return filled ? 1 : 0;
     };
 
     exports['TextOutA'] = (ctx, mem, args): number => {
@@ -753,6 +898,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['SetBkColor'] = (ctx, mem, args): number => {
         const hdc = args[0];
         const color = args[1];
+        Logger.verbose(LogCategory.GDI32, `SetBkColor(hdc=0x${hdc.toString(16)}, color=0x${(color >>> 0).toString(16)})`);
         return System.getInstance().gdiContext.setBkColor(hdc, color);
     };
 
@@ -767,16 +913,27 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return System.getInstance().gdiContext.setTextColor(hdc, color);
     };
 
+    exports['SetTextAlign'] = (ctx, mem, args): number => {
+        return System.getInstance().gdiContext.setTextAlign(args[0], args[1]);
+    };
+
+    exports['GetTextAlign'] = (ctx, mem, args): number => {
+        return System.getInstance().gdiContext.getTextAlign(args[0]);
+    };
+
     exports['CreateFontW'] = (ctx, mem, args): number => {
         const height = args[0];
         const width = args[1];
+        const escapement = args[2];
         const weight = args[4];
         const italic = args[5];
+        const charSet = args[8] & 0xff;
+        const quality = args[11];
         const faceNamePtr = args[13];
 
         const faceName = Marshaler.readWideString(mem, faceNamePtr);
         const hFont = System.getInstance().gdiContext.createFont(
-            height, width, weight, italic !== 0, faceName
+            height, width, weight, italic !== 0, faceName, escapement, quality, charSet
         );
 
         Logger.verbose(LogCategory.GDI32, `CreateFontW height=${height} weight=${weight} face='${faceName}' -> 0x${hFont.toString(16)}`);
@@ -786,13 +943,16 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     exports['CreateFontA'] = (ctx, mem, args): number => {
         const height = args[0];
         const width = args[1];
+        const escapement = args[2];
         const weight = args[4];
         const italic = args[5];
+        const charSet = args[8] & 0xff;
+        const quality = args[11];
         const faceNamePtr = args[13];
 
         const faceName = Marshaler.readString(mem, faceNamePtr);
         const hFont = System.getInstance().gdiContext.createFont(
-            height, width, weight, italic !== 0, faceName
+            height, width, weight, italic !== 0, faceName, escapement, quality, charSet
         );
 
         Logger.verbose(LogCategory.GDI32, `CreateFontA height=${height} weight=${weight} face='${faceName}' -> 0x${hFont.toString(16)}`);
@@ -830,6 +990,8 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lfEscapement = view.getInt32(lplf + 8, true);
         const lfWeight = view.getInt32(lplf + 16, true);
         const lfItalic = mem[lplf + 20] !== 0;
+        const lfCharSet = mem[lplf + 23];
+        const lfQuality = mem[lplf + 26];
         const lfFaceNamePtr = lplf + 28;
 
         // Read face name (wide string, max 32 characters = 64 bytes)
@@ -838,7 +1000,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         Logger.verbose(LogCategory.GDI32, `CreateFontIndirectW: height=${lfHeight} width=${lfWidth} weight=${lfWeight} italic=${lfItalic} escapement=${lfEscapement} face='${faceName}'`);
 
         const hFont = System.getInstance().gdiContext.createFont(
-            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement
+            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement, lfQuality, lfCharSet
         );
 
         return hFont;
@@ -861,10 +1023,12 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const lfEscapement = view.getInt32(lplf + 8, true);
         const lfWeight = view.getInt32(lplf + 16, true);
         const lfItalic = mem[lplf + 20] !== 0;
+        const lfCharSet = mem[lplf + 23];
+        const lfQuality = mem[lplf + 26];
         const faceName = Marshaler.readString(mem, lplf + 28);
         Logger.verbose(LogCategory.GDI32, `CreateFontIndirectA: height=${lfHeight} width=${lfWidth} weight=${lfWeight} italic=${lfItalic} escapement=${lfEscapement} face='${faceName}'`);
         return System.getInstance().gdiContext.createFont(
-            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement
+            lfHeight, lfWidth, lfWeight, lfItalic, faceName, lfEscapement, lfQuality, lfCharSet
         );
     };
 
@@ -1039,6 +1203,10 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
+        // Leaf hot loop: the RGBA→DIB write-back below stores 3-4 bytes per pixel through
+        // `mem`, which the dispatcher hands us as v86's always-live Proxy. Nothing between
+        // here and the loop re-enters the guest, so a plain view cannot go stale.
+        mem = toPlainGuestMemory(mem);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
         // Read requested biHeight from caller's BITMAPINFO
@@ -1141,7 +1309,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         // compatible bitmap then GetDIBits-ing it back, so we must read the canvas here —
         // reading `pixels` returned the init colour (the buttons rendered as solid blocks).
         let sourcePixels: Uint8Array | Uint8ClampedArray;
-        const renderedPixels = (userObj as any).compatibleEmpty
+        const renderedPixels = (userObj as any).compatibleBitmap
             ? System.getInstance().gdiContext.getBitmapRenderedPixels(hbm)
             : null;
         if (renderedPixels) {
@@ -1247,16 +1415,19 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        // Get bitmap from SystemResourceProvider
+        // Get bitmap from SystemResourceProvider. DIBSections carry dibPalette
+        // (0xAARRGGBB — the SetDIBColorTable/resolveBitmapRgba layout); LoadImage
+        // bitmaps may carry the legacy palette field (0xAABBGGRR) instead.
         const userObj = SystemResourceProvider.getInstance().getUserObject(hBitmap);
-        if (!userObj || userObj.type !== 'BITMAP' || !userObj.palette) {
-            Logger.verbose(LogCategory.GDI32, `GetDIBColorTable: Bitmap 0x${hBitmap.toString(16)} has no palette (type=${userObj?.type}, hasPalette=${!!userObj?.palette})`);
+        const dibPalette = userObj?.type === 'BITMAP' ? userObj.dibPalette as Uint32Array | undefined : undefined;
+        const legacyPalette = userObj?.type === 'BITMAP' ? userObj.palette as Uint32Array | undefined : undefined;
+        const palette = dibPalette ?? legacyPalette;
+        if (!palette) {
+            Logger.verbose(LogCategory.GDI32, `GetDIBColorTable: Bitmap 0x${hBitmap.toString(16)} has no color table (type=${userObj?.type})`);
             return 0;
         }
-
-        const palette = userObj.palette as Uint32Array;
         const paletteSize = palette.length;
-        
+
         // Validate indices
         if (uStartIndex >= paletteSize) {
             Logger.warn(LogCategory.GDI32, `GetDIBColorTable: Start index ${uStartIndex} >= palette size ${paletteSize}`);
@@ -1269,25 +1440,18 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        // Write RGBQUAD entries (4 bytes each: B, G, R, reserved)
-        // Our palette is stored as 0xAABBGGRR (RGBA), need to convert to RGBQUAD (BGR + reserved)
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        // Write RGBQUAD entries (B, G, R, reserved).
+        const isArgb = palette === dibPalette; // 0xAARRGGBB; legacy is 0xAABBGGRR
         for (let i = 0; i < actualCount; i++) {
-            const paletteIndex = uStartIndex + i;
-            const color = palette[paletteIndex];
-            
-            // Extract RGBA from 0xAABBGGRR format
-            const r = (color) & 0xFF;
+            const color = palette[uStartIndex + i];
+            const r = (isArgb ? color >> 16 : color) & 0xFF;
             const g = (color >> 8) & 0xFF;
-            const b = (color >> 16) & 0xFF;
-            // const a = (color >> 24) & 0xFF; // Not used in RGBQUAD
-            
-            // Write as RGBQUAD: B, G, R, reserved (0)
+            const b = (isArgb ? color : color >> 16) & 0xFF;
             const offset = pColors + i * 4;
-            mem[offset] = b;     // Blue
-            mem[offset + 1] = g; // Green
-            mem[offset + 2] = r; // Red
-            mem[offset + 3] = 0; // Reserved (always 0)
+            mem[offset] = b;
+            mem[offset + 1] = g;
+            mem[offset + 2] = r;
+            mem[offset + 3] = 0;
         }
 
         Logger.verbose(LogCategory.GDI32, `GetDIBColorTable: Returned ${actualCount} palette entries (start=${uStartIndex}, total=${paletteSize})`);
@@ -1314,22 +1478,36 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         if (!hBitmap) return 0;
 
         const userObj = SystemResourceProvider.getInstance().getUserObject(hBitmap);
-        if (!userObj || userObj.type !== 'BITMAP' || !userObj.palette) {
-            return cEntries; // 32bpp DIBs have no palette — return count as if set
+        if (!userObj || userObj.type !== 'BITMAP') {
+            return cEntries;
         }
+        const palette = userObj.dibPalette as Uint32Array | undefined;
+        if (!palette) {
+            return cEntries; // 16/24/32bpp DIBs have no color table — report success
+        }
+        if (uStartIndex >= palette.length) return 0;
 
-        const palette = userObj.palette as Uint32Array;
-        const paletteSize = palette.length;
-        if (uStartIndex >= paletteSize) return 0;
+        const actualCount = Math.min(cEntries, palette.length - uStartIndex);
 
-        const actualCount = Math.min(cEntries, paletteSize - uStartIndex);
-
+        // Same 0xAARRGGBB layout resolveBitmapRgba decodes.
         for (let i = 0; i < actualCount; i++) {
             const offset = pColors + i * 4;
             const b = mem[offset];
             const g = mem[offset + 1];
             const r = mem[offset + 2];
-            palette[uStartIndex + i] = (0xFF << 24) | (b << 16) | (g << 8) | r;
+            palette[uStartIndex + i] = 0xff000000 | (r << 16) | (g << 8) | b;
+        }
+
+        // The bitmap may already be selected into this DC — re-materialize so
+        // reads through the DC see the new color table.
+        gdiContext.refreshDibSectionCanvas(hBitmap);
+        const dcCtx = (gdiContext as any).contexts?.get(hdc);
+        const bmpDC = (gdiContext as any).bitmapDCCache?.get(hBitmap);
+        const bmpCtx = bmpDC !== undefined ? (gdiContext as any).contexts?.get(bmpDC) : undefined;
+        if (dcCtx && bmpCtx && hdcState.hBitmap === hBitmap) {
+            dcCtx.clearRect(0, 0, dcCtx.canvas.width, dcCtx.canvas.height);
+            dcCtx.drawImage(bmpCtx.canvas, 0, 0);
+            (gdiContext as any).invalidateImageDataCache?.(hdc);
         }
 
         return actualCount;
@@ -1378,6 +1556,52 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
     const paletteStore = new Map<number, Uint8Array>(); // handle -> PALETTEENTRY[256] (4 bytes each)
     let nextPaletteHandle = 0x50000001;
     const dcPalette = new Map<number, number>(); // hdc -> hPal
+
+    /** The 20 static system colours, R,G,B triples: indices 0-9 then 246-255. */
+    const STATIC_SYSTEM_COLORS = [
+        0x000000, 0x800000, 0x008000, 0x808000, 0x000080,
+        0x800080, 0x008080, 0xc0c0c0, 0xc0dcc0, 0xa6caf0,
+        0xfffbf0, 0xa0a0a4, 0x808080, 0xff0000, 0x00ff00,
+        0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff,
+    ];
+
+    /**
+     * The default 8bpp colour table — the halftone palette every DIB and
+     * CreateHalftonePalette is measured against: a 4x8x8 blue/green/red cube with the
+     * 20 static system colours stamped over indices 0-9 and 246-255.
+     */
+    let cachedHalftoneEntries: Uint8Array | null = null;
+    function defaultColorTable8(): Uint8Array {
+        if (cachedHalftoneEntries) return cachedHalftoneEntries;
+        const entries = new Uint8Array(256 * 4); // PALETTEENTRY[256]: R,G,B,flags
+        for (let i = 0; i < 256; i++) {
+            entries[i * 4] = (i & 7) * 0x20;             // peRed
+            entries[i * 4 + 1] = ((i >> 3) & 7) * 0x20;  // peGreen
+            entries[i * 4 + 2] = (i >> 6) * 0x40;        // peBlue
+        }
+        for (let n = 0; n < STATIC_SYSTEM_COLORS.length; n++) {
+            const i = n < 10 ? n : 246 + (n - 10);
+            const rgb = STATIC_SYSTEM_COLORS[n];
+            entries[i * 4] = (rgb >> 16) & 0xff;
+            entries[i * 4 + 1] = (rgb >> 8) & 0xff;
+            entries[i * 4 + 2] = rgb & 0xff;
+        }
+        cachedHalftoneEntries = entries;
+        return entries;
+    }
+
+    // CreateHalftonePalette - the standard 256-colour halftone palette. Apps that load a
+    // >256-colour DIB take this branch instead of building a palette from the colour
+    // table, and then Select/RealizePalette it before every blit; a failed create is an
+    // HPALETTE of 0 that poisons the whole draw path.
+    exports['CreateHalftonePalette'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const handle = nextPaletteHandle++;
+        paletteStore.set(handle, new Uint8Array(defaultColorTable8()));
+        Logger.verbose(LogCategory.GDI32,
+            `CreateHalftonePalette(hdc=0x${hdc.toString(16)}) -> 0x${handle.toString(16)}`);
+        return handle;
+    };
 
     // CreatePalette - creates a logical palette
     exports['CreatePalette'] = (ctx, mem, args): number => {
@@ -1602,12 +1826,17 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             view.setUint32(ppvBits, bitsPtr >>> 0, true);
         }
 
+        // Real DIBSections have a fixed-size color table (1 << bpp); biClrUsed only
+        // bounds how many entries the caller's BITMAPINFO initializes. The rest are
+        // OPAQUE BLACK, not zero: readers take alpha from bits 24-31, so a zero entry
+        // is a fully transparent pixel where GDI yields black.
         let dibPalette: Uint32Array | undefined;
         if (bpp <= 8) {
-            const numColors = biClrUsed === 0 ? (1 << bpp) : Math.min(biClrUsed, 256);
+            const entries = 1 << bpp;
+            const numColors = biClrUsed === 0 ? entries : Math.min(biClrUsed, entries);
             const paletteOffset = pbmi + biSize;
             if (paletteOffset + numColors * 4 <= mem.length) {
-                dibPalette = new Uint32Array(numColors);
+                dibPalette = new Uint32Array(entries).fill(0xff000000);
                 for (let i = 0; i < numColors; i++) {
                     const co = paletteOffset + i * 4;
                     const b = mem[co];
@@ -1846,6 +2075,47 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return 1;
     };
 
+    exports['ExtTextOutW'] = (ctx, mem, args): number => {
+        const hdc = args[0];
+        const x = args[1] | 0;
+        const y = args[2] | 0;
+        const options = args[3];
+        const lpString = args[5];
+        const c = args[6];
+        const lpDx = args[7];
+        // lpString is legitimately NULL for a text-less ETO_OPAQUE/ETO_CLIPPED rect fill.
+        const text = lpString ? Marshaler.readWideString(mem, lpString).substring(0, c) : '';
+        Logger.verbose(LogCategory.GDI32, `ExtTextOutW: '${text}' at (${x},${y}) options=0x${options.toString(16)}`);
+
+        const gdi = System.getInstance().gdiContext;
+        // The spacing array is c ints long; a short one is a caller bug, and reading past it
+        // would throw out of the DataView rather than mis-space a string.
+        if (lpDx && c > 0 && lpDx + c * 4 <= mem.length) {
+            const dxView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+            let curX = x;
+            for (let i = 0; i < c; i++) {
+                gdi.textOut(hdc, curX, y, text[i] ?? '');
+                curX += dxView.getInt32(lpDx + i * 4, true);
+            }
+        } else {
+            gdi.textOut(hdc, x, y, text);
+        }
+        return 1;
+    };
+
+    /**
+     * GetFontLanguageInfo — the GCP_* bits that tell a caller its text needs special
+     * handling (bidi reordering, glyph substitution, kashida justification). Zero is a
+     * real answer, not a decline: it is what Windows returns for a Latin font in a
+     * Latin locale, and it steers the caller onto the simple path our text stack can
+     * actually draw. A font needing shaping would want GCP_GLYPHSHAPE here, which we
+     * would have to be able to honour first.
+     */
+    exports['GetFontLanguageInfo'] = (ctx, mem, args): number => {
+        Logger.verbose(LogCategory.GDI32, `GetFontLanguageInfo(hdc=0x${args[0].toString(16)}) -> 0`);
+        return 0;
+    };
+
     // Bitmap creation
     exports['CreateDIBitmap'] = (ctx, mem, args): number => {
         const hdc = args[0];
@@ -2011,6 +2281,27 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             pixels[i + 3] = 0xFF; // alpha
         }
 
+        // Initial bits: 1bpp is the canonical case (masks/patterns); rows are
+        // WORD-aligned, bit 7 = leftmost pixel, 1 = white.
+        let initialized = false;
+        if (lpBits && nPlanes === 1 && nBitCount === 1) {
+            const stride = ((nWidth + 15) >> 4) * 2;
+            if (lpBits + stride * nHeight <= mem.length) {
+                for (let y = 0; y < nHeight; y++) {
+                    for (let x = 0; x < nWidth; x++) {
+                        const bit = (mem[lpBits + y * stride + (x >> 3)] >> (7 - (x & 7))) & 1;
+                        if (bit) {
+                            const o = (y * nWidth + x) * 4;
+                            pixels[o] = pixels[o + 1] = pixels[o + 2] = 0xFF;
+                        }
+                    }
+                }
+                initialized = true;
+            }
+        } else if (lpBits) {
+            Logger.warn(LogCategory.GDI32, `CreateBitmap: initial bits for ${nBitCount}bpp not decoded`);
+        }
+
         const handle = SystemResourceProvider.getInstance().registerUserObject({
             type: 'BITMAP',
             name: 0,
@@ -2018,6 +2309,11 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             height: nHeight,
             loading: false,
             pixels,
+            bmBpp: nBitCount,
+            // Without initial bits this behaves like a DDB: its rendered canvas is
+            // the source of truth, while compatibleEmpty tracks whether it is pristine.
+            compatibleBitmap: !initialized,
+            compatibleEmpty: !initialized,
         });
         Logger.verbose(LogCategory.GDI32, `CreateBitmap(${nWidth}x${nHeight}) -> 0x${handle.toString(16)}`);
         return handle;
@@ -2101,19 +2397,21 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return hdc;
     };
 
+    // SaveDC/RestoreDC push and pop real DC levels: the clip region, the selected objects
+    // and the attributes that go with them (see GDIContext.saveDcState).
     exports['SaveDC'] = (ctx, mem, args): number => {
         const hdc = args[0];
-        Logger.verbose(LogCategory.GDI32, `SaveDC(hdc=0x${hdc.toString(16)})`);
-        // Stub: return saved state ID
-        return 1;
+        const level = System.getInstance().gdiContext.saveDcState(hdc);
+        Logger.verbose(LogCategory.GDI32, `SaveDC(hdc=0x${hdc.toString(16)}) -> ${level}`);
+        return level;
     };
 
     exports['RestoreDC'] = (ctx, mem, args): number => {
         const hdc = args[0];
-        const nSavedDC = args[1] | 0; // signed
-        Logger.verbose(LogCategory.GDI32, `RestoreDC(hdc=0x${hdc.toString(16)}, savedDC=${nSavedDC})`);
-        // Stub: return success
-        return 1;
+        const nSavedDC = args[1] | 0; // signed: negative is relative to the current level
+        const ok = System.getInstance().gdiContext.restoreDcState(hdc, nSavedDC);
+        Logger.verbose(LogCategory.GDI32, `RestoreDC(hdc=0x${hdc.toString(16)}, savedDC=${nSavedDC}) -> ${ok}`);
+        return ok ? 1 : 0;
     };
 
     exports['GetCurrentObject'] = (ctx, mem, args): number => {
@@ -2154,6 +2452,86 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         view.setInt32(lpPoint, pos.x, true);
         view.setInt32(lpPoint + 4, pos.y, true);
         return 1;
+    };
+
+    // HPEN CreatePen(int iStyle, int cWidth, COLORREF color)
+    exports['CreatePen'] = (ctx, mem, args): number => {
+        const style = args[0] | 0;
+        const width = args[1] | 0;
+        const color = args[2] >>> 0;
+        return System.getInstance().gdiContext.createPen(style, width, color) >>> 0;
+    };
+
+    // HPEN CreatePenIndirect(const LOGPEN *plpen)
+    exports['CreatePenIndirect'] = (ctx, mem, args): number => {
+        const plpen = args[0] >>> 0;
+        if (!plpen || plpen + LOGPEN_SIZE > mem.length) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        return System.getInstance().gdiContext.createPen(
+            view.getInt32(plpen + LOGPEN_OFFSETS.lopnStyle, true),
+            view.getInt32(plpen + LOGPEN_OFFSETS.lopnWidth_x, true),
+            view.getUint32(plpen + LOGPEN_OFFSETS.lopnColor, true),
+        ) >>> 0;
+    };
+
+    // BOOL LineTo(HDC hdc, int x, int y)
+    exports['LineTo'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        return System.getInstance().gdiContext.lineTo(hdc, args[1] | 0, args[2] | 0) ? 1 : 0;
+    };
+
+    /** Read cPoints POINTs (2 signed LONGs each) into a flat x,y,... list. */
+    const readPoints = (mem: Uint8Array, apt: number, cPoints: number): number[] | null => {
+        if (!apt || cPoints <= 0 || apt + cPoints * 8 > mem.length) return null;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const pts = new Array<number>(cPoints * 2);
+        for (let i = 0; i < cPoints; i++) {
+            pts[i * 2] = view.getInt32(apt + i * 8, true);
+            pts[i * 2 + 1] = view.getInt32(apt + i * 8 + 4, true);
+        }
+        return pts;
+    };
+
+    // BOOL Polyline(HDC hdc, const POINT *apt, int cpt) — does NOT use or move the
+    // current position; PolylineTo starts at it and leaves it at the last point.
+    exports['Polyline'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const pts = readPoints(mem, args[1] >>> 0, args[2] | 0);
+        if (!pts || pts.length < 4) return 0;
+        return System.getInstance().gdiContext.strokePolyline(hdc, pts) ? 1 : 0;
+    };
+
+    exports['PolylineTo'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const gdi = System.getInstance().gdiContext;
+        const pts = readPoints(mem, args[1] >>> 0, args[2] | 0);
+        if (!pts || pts.length < 2) return 0;
+        const from = gdi.getCurrentPosition(hdc);
+        const ok = gdi.strokePolyline(hdc, [from.x, from.y, ...pts]);
+        gdi.setCurrentPosition(hdc, pts[pts.length - 2], pts[pts.length - 1]);
+        return ok ? 1 : 0;
+    };
+
+    // BOOL PolyPolyline(HDC hdc, const POINT *apt, const DWORD *asz, DWORD csz) —
+    // csz independent polylines laid end to end in apt.
+    exports['PolyPolyline'] = (ctx, mem, args): number => {
+        const hdc = args[0] >>> 0;
+        const apt = args[1] >>> 0;
+        const asz = args[2] >>> 0;
+        const csz = args[3] >>> 0;
+        if (!apt || !asz || !csz || asz + csz * 4 > mem.length) return 0;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const gdi = System.getInstance().gdiContext;
+        let offset = apt;
+        let ok = true;
+        for (let i = 0; i < csz; i++) {
+            const count = view.getUint32(asz + i * 4, true);
+            const pts = readPoints(mem, offset, count);
+            if (!pts) return 0;
+            if (pts.length >= 4) ok = gdi.strokePolyline(hdc, pts) && ok;
+            offset += count * 8;
+        }
+        return ok ? 1 : 0;
     };
 
     registerPaintingDcStateExports(exports);
@@ -2201,7 +2579,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
  * Register high-frequency GDI functions to the Fast Path table.
  * This avoids the overhead of creating X86Context and stack manipulation.
  */
-export function registerFastPathGdiFunctions(dispatcher: any): void {
+export function registerFastPathGdiFunctions(dispatcher: HleDispatcher): void {
     if (dispatcher && typeof dispatcher.registerFastPath === 'function') {
         // OPTIMIZATION: Cache GDIContext reference to avoid System.getInstance() on every call
         let cachedGdiContext: ReturnType<typeof System.getInstance>['gdiContext'] | null = null;
@@ -2215,8 +2593,7 @@ export function registerFastPathGdiFunctions(dispatcher: any): void {
         let lastHeight = 0;
 
         // FastPathImplementation = (cpu, memory) => number
-        dispatcher.registerFastPath('gdi32', 'GetPixel', (cpu: any, mem: Uint8Array): number => {
-            const esp = cpu.reg32[4];
+        dispatcher.registerFastPath('gdi32', 'GetPixel', (esp: number, _view: DataView, mem: Uint8Array): number => {
 
             // Read arguments directly from stack
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);

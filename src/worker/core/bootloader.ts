@@ -2,6 +2,22 @@
 
 import { DllInitEntry } from './pe-loader';
 
+/**
+ * Marker ids for the deliberately-raised trap vectors. The low 16 bits of a 0xDEADxxxx id
+ * are what the dispatcher switches on, and there 0x0003/0x0004 are already the bootloader's
+ * own progress markers — so these carry a 0x01xx prefix rather than the bare vector number.
+ */
+export const TRAP_MARKER = {
+    bp: 0xdead0103,   // vector 3, INT 3
+    of: 0xdead0104,   // vector 4, INTO
+} as const;
+
+/** Vector each trap marker came from, for the dispatcher's NT-status mapping. */
+export const TRAP_MARKER_VECTOR: Record<number, number> = {
+    [TRAP_MARKER.bp & 0xffff]: 3,
+    [TRAP_MARKER.of & 0xffff]: 4,
+};
+
 // Creates a 16-bit real mode bootloader that switches to 32-bit protected mode
 // and jumps to the PE entry point.
 // dllInits: DLLs whose DllMain(DLL_PROCESS_ATTACH) must be called before entry.
@@ -11,7 +27,7 @@ export function createBootloader(
     dllInits: DllInitEntry[] = []
 ): { code: Uint8Array; loadAddress: number; startAddress: number } {
     const loadAddress = 0x7c00;
-    const gdtAddress = 0x7e00;
+    const gdtAddress = GDT_ADDRESS;
     // IDT immediately after GDT (32 bytes for 4 entries)
     const idtAddress = gdtAddress + 32; // 0x7E20
     const idtSize = 256 * 8; // 2048 bytes
@@ -198,6 +214,13 @@ export function createBootloader(
     const hInt2eOff = hPfOff + handlerSize;
     const hInt80Off = hInt2eOff + handlerSize;
     const hDeOff = hInt80Off + handlerSize; // #DE (Division Error) - recoverable
+    // Trap vectors a guest raises DELIBERATELY: INT 3 is how anti-debug code probes for a
+    // debugger, INTO how compiled overflow checks report. Both must reach the guest's SEH
+    // as EXCEPTION_BREAKPOINT / EXCEPTION_INT_OVERFLOW; the generic halt handler would
+    // stop the machine on code that runs fine on Windows. Appended AFTER the existing
+    // handlers so PF_HALT_TARGET's slot arithmetic below stays valid.
+    const hBpOff = hDeOff + handlerSize;    // #BP (INT 3) - recoverable
+    const hOfOff = hBpOff + handlerSize;    // #OF (INTO)  - recoverable
 
     const totalSize = 512 + 32 + idtSize + 1024;
     const finalBuffer = new Uint8Array(totalSize);
@@ -218,8 +241,8 @@ export function createBootloader(
         createHaltHandlerBytes(0xdead00ee, true),
         hGenericOff
     );
-    finalBuffer.set(createHaltHandlerBytes(0xdead0006, true), hUdOff); // #UD
-    finalBuffer.set(createHaltHandlerBytes(0xdead000d, true), hGpOff); // #GP
+    finalBuffer.set(createRecoverableFaultHandler(0xdead0006, true), hUdOff); // #UD - recoverable via IRET
+    finalBuffer.set(createRecoverableFaultHandler(0xdead000d, false), hGpOff); // #GP - recoverable via IRET
     finalBuffer.set(createRecoverablePfHandler(), hPfOff); // #PF - recoverable via IRET
     finalBuffer.set(
         createHaltHandlerBytes(0xdead02ee, false),
@@ -233,6 +256,9 @@ export function createBootloader(
         createRecoverableHandlerBytes(0xdead0000),
         hDeOff
     ); // #DE - recoverable via IRET
+    // A trap pushes no error code, so both share the #UD frame shape (dummy pushed).
+    finalBuffer.set(createRecoverableFaultHandler(TRAP_MARKER.bp, true), hBpOff);
+    finalBuffer.set(createRecoverableFaultHandler(TRAP_MARKER.of, true), hOfOff);
 
     // Create and write IDT
     const idtBytes = createIDTBytes({
@@ -243,6 +269,8 @@ export function createBootloader(
         int2e: loadAddress + hInt2eOff,
         int80: loadAddress + hInt80Off,
         de: loadAddress + hDeOff,
+        bp: loadAddress + hBpOff,
+        of: loadAddress + hOfOff,
     });
     finalBuffer.set(idtBytes, 512 + 32);
 
@@ -317,6 +345,40 @@ function createRecoverableHandlerBytes(thunkId: number): Uint8Array {
 }
 
 /**
+ * Creates a recoverable #UD/#GP handler: save EAX/EDX, OUT to JS, restore,
+ * pop the error code, IRET. Same frame shape as the #PF handler during the OUT:
+ *   [ESP+0]=saved_EDX, [ESP+4]=saved_EAX, [ESP+8]=ErrCode, [ESP+12]=EIP
+ * #UD pushes no error code, so its handler pushes a dummy 0 first
+ * (pushDummyErrorCode) to keep the frame uniform for the JS side.
+ * The JS handler decides the outcome by rewriting [ESP+12] (the IRET target):
+ * SEH handler address, spin loop (thread terminated), or PF_HALT_TARGET (fatal).
+ * Sizes: 21 bytes (#UD) / 19 bytes (#GP) — both fit the 25-byte handler slot.
+ */
+function createRecoverableFaultHandler(
+    thunkId: number,
+    pushDummyErrorCode: boolean
+): Uint8Array {
+    const bytes: number[] = [];
+    if (pushDummyErrorCode) bytes.push(0x6a, 0x00); // PUSH 0 (fake error code)
+    bytes.push(
+        0x50,                           // PUSH EAX     (save — clobbered by MOV below)
+        0x52,                           // PUSH EDX     (save — clobbered by MOV below)
+        0xb8,                           // MOV EAX, thunkId
+        thunkId & 0xff,
+        (thunkId >> 8) & 0xff,
+        (thunkId >> 16) & 0xff,
+        (thunkId >> 24) & 0xff,
+        0xba, 0x77, 0xb0, 0x00, 0x00,  // MOV EDX, 0xB077
+        0xef,                           // OUT DX, EAX  (JS handler runs synchronously)
+        0x5a,                           // POP EDX      (restore)
+        0x58,                           // POP EAX      (restore)
+        0x83, 0xc4, 0x04,              // ADD ESP, 4   (pop error code — IRET won't pop it)
+        0xcf,                           // IRET
+    );
+    return new Uint8Array(bytes);
+}
+
+/**
  * Creates a recoverable #PF handler that signals JS via OUT, then uses IRET to retry.
  *
  * Must save/restore EAX and EDX — the MOV+OUT clobber them, and IRET
@@ -384,6 +446,8 @@ function createIDTBytes(addrs: {
     int2e: number;
     int80: number;
     de: number;
+    bp: number;
+    of: number;
 }): Uint8Array {
     const idt = new Uint8Array(256 * 8);
     const view = new DataView(idt.buffer);
@@ -393,6 +457,8 @@ function createIDTBytes(addrs: {
     }
 
     setIDTEntry(view, 0, addrs.de);     // #DE - Division Error (recoverable)
+    setIDTEntry(view, 3, addrs.bp);     // #BP - INT 3 (recoverable)
+    setIDTEntry(view, 4, addrs.of);     // #OF - INTO (recoverable)
     setIDTEntry(view, 6, addrs.ud);
     setIDTEntry(view, 13, addrs.gp);
     setIDTEntry(view, 14, addrs.pf);
@@ -415,17 +481,28 @@ function createGDTBytes(): Uint8Array {
     view.setUint32(16, 0x0000ffff, true);
     view.setUint32(20, 0x00cf9200, true);
 
-    // Entry 3 (0x18): FS segment - Data 32-bit, Base=0 (updated per-thread via segment_offsets), Limit=4GB
+    // Entry 3 (0x18): FS segment - Data 32-bit, Limit=4GB. Base starts at 0 and is
+    // reprogrammed per-thread by setFsBase() (scheduler/fs-base.ts), which patches THIS
+    // descriptor as well as cpu.segment_offsets[4]. The descriptor is what the CPU
+    // re-reads whenever guest code reloads the FS selector (`pop fs`, an ordinary Borland/
+    // Delphi RTL epilogue idiom) — a base of 0 there silently sends every later fs:[…]
+    // to linear 0. Limit stays 4GB rather than the one TEB page: narrowing it would be
+    // closer to real Windows but would #GP code that uses large fs: offsets.
     view.setUint32(24, 0x0000ffff, true);
     view.setUint32(28, 0x00cf9200, true);
 
     return gdt;
 }
 
+/** Guest linear address of the GDT the bootloader lgdt's. */
+export const GDT_ADDRESS = 0x7e00;
+/** Entry 3 (selector 0x18) — the FS descriptor. Base fields live at +2/+3, +4 and +7. */
+export const GDT_FS_DESCRIPTOR_ADDRESS = GDT_ADDRESS + 3 * 8; // 0x7e18
+
 export function createGDT(): {
     gdt: Uint8Array;
     gdtAddress: number;
     gdtSize: number;
 } {
-    return { gdt: createGDTBytes(), gdtAddress: 0x7e00, gdtSize: 32 };
+    return { gdt: createGDTBytes(), gdtAddress: GDT_ADDRESS, gdtSize: 32 };
 }

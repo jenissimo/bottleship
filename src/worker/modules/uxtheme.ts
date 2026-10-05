@@ -14,6 +14,13 @@ export class Uxtheme implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     initialize(_process: Process): void {
+        // BottleShip does not provide native visual styles.  Still expose the
+        // capability probes: applications commonly call them after a successful
+        // LoadLibrary/GetProcAddress sequence and expect FALSE when themes are off.
+        // Omitting the exports leaves a null function pointer in such callers.
+        this.exports["IsThemeActive"] = () => 0;
+        this.exports["IsAppThemed"] = () => 0;
+
         // void SetThemeAppProperties(DWORD dwFlags)
         this.exports["SetThemeAppProperties"] = (ctx, mem, args) => {
             const flags = args[0] >>> 0;

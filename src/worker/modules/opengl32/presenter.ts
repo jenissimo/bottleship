@@ -4,6 +4,8 @@ import { System } from "../../core/system";
 import { Logger, LogCategory } from "../../core/logger";
 import { frameProfiler } from "../../core/frame-profiler";
 import { statsOverlay } from "../../core/stats-overlay";
+import { captureGLFrameIfArmed } from "./frame-capture";
+import { guestDrawableSize } from "./drawable";
 
 export class OpenGLPresenter implements RenderActive {
     readonly suppressGdiOverlay = true;
@@ -26,26 +28,32 @@ export class OpenGLPresenter implements RenderActive {
         if (!ctx.executor) {
             Logger.warn(LogCategory.SYSTEM,
                 `OpenGL present: no executor (frame=${ctx.frameId} backend=${!!ctx.backend})`);
-        } else if (ctx.commands.length === 0 && ctx.textures.size === 0) {
+        } else if (ctx.commands.count === 0 && ctx.textures.size === 0) {
             Logger.warn(LogCategory.SYSTEM, `OpenGL present: 0 commands, 0 textures (frame=${ctx.frameId})`);
         } else if (ctx.frameId <= 3) {
             Logger.verbose(LogCategory.SYSTEM,
-                `OpenGL present: cmds=${ctx.commands.length} texs=${ctx.textures.size} frame=${ctx.frameId}`);
+                `OpenGL present: cmds=${ctx.commands.count} texs=${ctx.textures.size} frame=${ctx.frameId}`);
         }
 
-        if (ctx.executor && (ctx.commands.length > 0 || ctx.textures.size > 0)) {
+        if (ctx.executor && (ctx.commands.count > 0 || ctx.textures.size > 0)) {
+            // The module owns the DC→window mapping, so the drawable is resolved here and
+            // handed to the executor; the executor may not read user32, and must not fall
+            // back to the canvas (a different space) once a context is current.
+            const d = guestDrawableSize(ctx.drawableDC);
+            ctx.executor.setDrawableSize(d.width, d.height);
+            const [dw, dh] = ctx.executor.getDrawableSize();
+            captureGLFrameIfArmed(ctx, dw, dh);
             ctx.executor.executeFrame({
                 commands: ctx.commands,
+                vertArena: ctx.vertArena.data,
                 textures: ctx.textures,
-                viewportX: ctx.viewportX,
-                viewportY: ctx.viewportY,
-                viewportW: ctx.viewportW,
-                viewportH: ctx.viewportH,
             });
         }
 
-        // Clear command buffer for next frame
-        ctx.commands = [];
+        // Commands and the vertex arena they point into are frame-scoped: reuse the
+        // storage, never hand a command or an arena slice past this point.
+        ctx.commands.reset();
+        ctx.vertArena.reset();
 
         // Notify render service
         const system = System.getInstance();
@@ -71,8 +79,11 @@ export class OpenGLPresenter implements RenderActive {
         this.ctx.executor?.repaintLastFrame();
     }
 
+    /** PNG of the screen (canvas, overlays composited). The GL executor renders straight
+     *  into the swap-chain texture, which has no COPY_SRC, so the canvas is the only
+     *  readable source; an empty blob means nothing was presented yet, not a black frame. */
     async captureFrame(): Promise<Blob> {
-        return new Blob([], { type: "image/png" });
+        return (await System.getInstance().services.render.tryCaptureScreen()) ?? new Blob([], { type: "image/png" });
     }
 
     getCounters(): Record<string, number> {

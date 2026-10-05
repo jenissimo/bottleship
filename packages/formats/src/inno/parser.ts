@@ -6,6 +6,7 @@ import { decompressBlockStream, getBlockEndOffset } from "./block-reader";
 import { BinaryReader } from "./binary-reader";
 import type { ParseContext } from "./context";
 import { loadDataEntry, type DataEntry } from "./entries/data";
+import { loadDirectoryEntry, type DirectoryEntry } from "./entries/directory";
 import { loadFileEntry, type FileEntry } from "./entries/file";
 import { loadIconEntry, type IconEntry } from "./entries/icon";
 import { loadLanguageEntry, type LanguageEntry } from "./entries/language";
@@ -13,7 +14,6 @@ import { loadRegistryEntry, type RegistryEntry } from "./entries/registry";
 import {
     skipComponentEntry,
     skipDeleteEntry,
-    skipDirectoryEntry,
     skipIniEntry,
     skipMessageEntry,
     skipPermissionEntry,
@@ -34,6 +34,7 @@ export interface InnoParseResult {
     version: ReturnType<typeof readVersionAt>;
     header: InnoHeader;
     languages: LanguageEntry[];
+    directories: DirectoryEntry[];
     files: FileEntry[];
     icons: IconEntry[];
     registryEntries: RegistryEntry[];
@@ -89,7 +90,7 @@ export async function parseInnoHeader(
     skipEntries(header.typeCount, skipTypeEntry, r1, ctx);
     skipEntries(header.componentCount, skipComponentEntry, r1, ctx);
     skipEntries(header.taskCount, skipTaskEntry, r1, ctx);
-    skipEntries(header.directoryCount, skipDirectoryEntry, r1, ctx);
+    const directories = loadEntries(r1, header.directoryCount, loadDirectoryEntry, ctx);
 
     const files = loadEntries(r1, header.fileCount, loadFileEntry, ctx);
     const icons = loadEntries(r1, header.iconCount, loadIconEntry, ctx);
@@ -113,7 +114,7 @@ export async function parseInnoHeader(
     assertStreamEnd(r2, "secondary header stream");
 
     const result: InnoParseResult = {
-        version, header, languages, files, icons, registryEntries, dataEntries, offsets,
+        version, header, languages, directories, files, icons, registryEntries, dataEntries, offsets,
     };
     parseGalaxyFiles(result);
     return result;

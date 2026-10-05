@@ -7,7 +7,7 @@
  * header + <name>{1,2,...}.cab data volumes, decompresses (per-chunk
  * raw-deflate), de-obfuscates, follows LINK_PREV dedup links (v6+), handles
  * volume-split files, and validates each file against its stored expanded
- * size (and MD5 when present — v5 carries a per-file MD5, v6+ as well).
+ * size and MD5 when present (early v5 descriptors omit the digest).
  *
  * No Node `fs`/`zlib`/`crypto`: operates on `Uint8Array` inputs, raw-inflate
  * via the platform `DecompressionStream("deflate-raw")` (Chromium — the wizard
@@ -220,8 +220,8 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
     const r = reader(hdr);
     if (r.u32(0) !== CAB_SIGNATURE) throw new Error("Not an ISc cabinet (bad signature)");
 
-    let major = decodeMajor(r.u32(4));
-    if (major < 5) major = 5; // libunshield.c clamps <5 to 5
+    const major = decodeMajor(r.u32(4));
+    if (major !== 0 && major !== 5 && major < 6) throw new Error(`Unsupported cabinet version ${major}`);
     const cdOff = r.u32(12);
     if (!cdOff) throw new Error("No CAB descriptor available");
 
@@ -246,6 +246,14 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
     for (let d = 0; d < directoryCount; d++) dirs.push(r.cstr(base + fileTable[d]!));
 
     const files: InstallShieldFile[] = [];
+    // Early IS5 stores 0x2a-byte descriptors, later IS5 appends a 16-byte digest.
+    // Bound each record by the next descriptor/string, so a missing digest cannot
+    // consume the following file's metadata as a checksum (lib/file.c case 0/5).
+    const recordBoundaries = [...fileTable];
+    if (major <= 5) {
+        for (let i = 0; i < fileCount; i++) recordBoundaries.push(r.u32(base + fileTable[directoryCount + i]!));
+    }
+    recordBoundaries.sort((a, b) => a - b);
     for (let i = 0; i < fileCount; i++) {
         let fd: InstallShieldFile;
         if (major <= 5) {
@@ -256,7 +264,9 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
             //   md5[16]@0x2a (ends 0x3a). No volume/link fields.
             const p = base + fileTable[directoryCount + i]!;
             const flags = r.u16(p + 0x08);
-            const md5 = (flags & FILE_INVALID) ? null : hdr.subarray(p + 0x2a, p + 0x3a);
+            const next = recordBoundaries.find(off => base + off > p) ?? (hdr.length - base);
+            const md5 = major === 5 && !(flags & FILE_INVALID) && base + next >= p + 0x3a
+                ? hdr.subarray(p + 0x2a, p + 0x3a) : null;
             fd = {
                 index: i,
                 name: r.cstr(base + r.u32(p + 0x00)),
@@ -545,6 +555,7 @@ function readRaw(
     while (written < size) {
         const b = getVol(volumes, vol);
         const want = Math.min(size - written, volLeft);
+        if (pos < 0 || pos + want > b.length) throw new Error(`Truncated cabinet volume ${vol} (${fd.name})`);
         out.set(b.subarray(pos, pos + want), written);
         written += want;
         pos += want;
@@ -596,6 +607,7 @@ async function extractFile(
         const len = rv.getUint16(off, true);
         off += 2;
         if (len === 0) throw new Error(`zero chunk len (${fd.name})`);
+        if (off + len > raw.length) throw new Error(`chunk data past end (${fd.name})`);
         const chunk = raw.subarray(off, off + len);
         off += len;
         const dec = await inflate(chunk);

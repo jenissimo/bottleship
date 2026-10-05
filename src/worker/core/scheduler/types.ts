@@ -16,6 +16,16 @@ export const enum ThreadState {
     TERMINATED = 5,
 }
 
+/** Win32 `MAXIMUM_SUSPEND_COUNT`. A SuspendThread that would push the count past this
+ *  fails with `(DWORD)-1` / ERROR_SIGNAL_REFUSED instead of counting on — engines that use
+ *  Suspend/Resume as a spin-sync primitive can otherwise accumulate an unbounded count that
+ *  no number of Resumes can drain, and a count real Windows never produces is a state the
+ *  guest was never written against. */
+export const MAXIMUM_SUSPEND_COUNT = 127;
+
+/** RtlNtStatusToDosError(STATUS_SUSPEND_COUNT_EXCEEDED). */
+export const ERROR_SIGNAL_REFUSED = 156;
+
 export const THREAD_STATE_NAMES: Record<ThreadState, string> = {
     [ThreadState.CREATED]: 'CREATED',
     [ThreadState.READY]: 'READY',
@@ -117,13 +127,29 @@ export interface WaitInfo {
     /** SleepConditionVariableCS: on wake, re-acquire the critical section at csAddress
      *  (instead of the SRW lock) and map WAIT_OBJECT_0→1, WAIT_TIMEOUT→0. */
     cvReacquireCs?: boolean;
+    /** EAX to deliver on the FINAL wake when a CV wake was requeued as a contended
+     *  SRW acquire (the CV BOOL result must survive the second wait). */
+    pendingEax?: number;
+    /** MsgWaitForMultipleObjects*: the thread's message queue is an extra wait slot
+     *  alongside `handles`, and this is the result its leg delivers (WAIT_OBJECT_0 +
+     *  nCount). Set means "arriving input also ends this wait", whatever the reason. */
+    messageWakeResult?: number;
+    /** The API's own answer for a wait whose Win32 return is not the wait status
+     *  (WaitOnAddress, GetOverlappedResultEx): maps the raw wake result to EAX and,
+     *  optionally, the woken thread's last error. */
+    onWake?: WaitCompletion;
 }
+
+export type WaitCompletion = (waitResult: number) => { value: number; lastError?: number };
 
 // ─── APC ────────────────────────────────────────────────────────────────────────
 
 export const enum ApcKind {
     USER32_QUEUE_USER_APC = 1,
     NTDLL_NT_QUEUE_APC = 2,
+    /** FILE_IO_COMPLETION_ROUTINE(dwErrorCode, dwBytesTransferred, lpOverlapped) —
+     *  ReadFileEx/WriteFileEx. Three args, cdecl-free stdcall, cleanup 12. */
+    IO_COMPLETION = 3,
 }
 
 export interface PendingApc {
@@ -244,6 +270,36 @@ export const WAIT_ABANDONED = 0x00000080;
 export const WAIT_BLOCKED_NO_SWITCH = 0xFFFFFFFE;
 export const INFINITE = 0xFFFFFFFF;
 export const CREATE_SUSPENDED = 0x00000004;
+/** dwStackSize names the RESERVE instead of the initial commit (Win32 CreateThread). */
+export const STACK_SIZE_PARAM_IS_A_RESERVATION = 0x00010000;
+
+/** A stack is a reservation, so it is rounded up like any other (Win32 dwAllocationGranularity). */
+export const STACK_ALLOCATION_GRANULARITY = 0x10000;
+
+/**
+ * How much address space a CreateThread stack gets.
+ *
+ * `dwStackSize` is the initial COMMIT, not the whole stack: Windows reserves
+ * SizeOfStackReserve from the image header and grows into it on demand, and only
+ * STACK_SIZE_PARAM_IS_A_RESERVATION makes dwStackSize the reserve. Reading it as the
+ * reserve hands a thread an order of magnitude less stack than it has on Windows, and
+ * the overflow lands in whatever the allocator placed underneath.
+ *
+ * The granularity rounding is not cosmetic: SizeOfStackReserve is whatever the linker
+ * was told, and a header may name less than a single page. Windows rounds that up to
+ * the allocation granularity, so the floor a thread can be given is 64 KB, never the
+ * literal header value.
+ */
+export function threadStackReserve(
+    stackSize: number, creationFlags: number, imageReserve: number, defaultReserve: number,
+): number {
+    const reserve = imageReserve > 0 ? imageReserve : defaultReserve;
+    const asked = stackSize > 0 ? stackSize : 0;
+    const want = (creationFlags & STACK_SIZE_PARAM_IS_A_RESERVATION) !== 0
+        ? (asked > 0 ? asked : reserve)
+        : Math.max(asked, reserve);
+    return Math.ceil(want / STACK_ALLOCATION_GRANULARITY) * STACK_ALLOCATION_GRANULARITY;
+}
 
 // ─── Wait Decision ──────────────────────────────────────────────────────────────
 
@@ -349,7 +405,14 @@ export interface SchedulerConfig {
 
 export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
     enabled: true,
-    minQuantumMs: 1,
+    // NT's client quantum is ~15.6 ms (two clock ticks). A 1 ms quantum preempts ~15x
+    // more often than the OS these titles were written against, which turns a benign
+    // guest race into a reliable one: a thread that seeks then reads a shared file
+    // handle gets split by a peer far more often than it ever would on Windows.
+    // Measured on Natalie Brooks, 6 level loads per arm: crashed 4/6 at 1 ms vs 0/6
+    // at 16 ms; corrupted archive reads per load 2.8 -> 1.7 mean. Preemption frequency
+    // is part of faithfulness, not just a tuning knob.
+    minQuantumMs: 16,
     debugLogging: false,
     asyncHleWaitEnabled: true,
 };

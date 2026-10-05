@@ -49,6 +49,7 @@ export const E_NOINTERFACE   = 0x80004002;
 export const E_POINTER       = 0x80004003;
 export const E_FAIL          = 0x80004005;
 export const E_NOTIMPL       = 0x80004001;
+export const E_ABORT         = 0x80004004;
 export const VFW_E_NOT_FOUND = 0x80040216;
 
 // Media event codes

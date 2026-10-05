@@ -9,10 +9,11 @@ import { parseBMPHeader, parseBMPPixels } from '../gdi32/gdi-raster';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
 import { Mem } from '../../core/memory/mem-accessor';
+import { isValidAddress } from '../../core/memory/address-guard';
 import { System } from '../../core/system';
 import { EMU_NATIVE_VIDEO_DLLS } from '../../core/cpu/emulator-config';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
-import { encodeAnsi, getCodePageDecoder, decodeAnsiString, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
+import { encodeAnsi, getAnsiCodePage, getCodePageDecoder, decodeAnsiString, readAnsiFromGuest, writeAnsiToGuest, encodeAnsiString } from '../codepage-utils';
 import { findResourceInPE } from '../kernel32/resource';
 import { loadBitmapFromPeResource } from '../kernel32/bitmap-extractor';
 import { loadIconFromPeResource } from '../kernel32/icon-extractor';
@@ -22,33 +23,385 @@ import {
     openClipboard as openClipboardState,
     closeClipboard as closeClipboardState,
     emptyClipboard as emptyClipboardState,
+    setClipboardFormatData,
+    getClipboardSequenceNumber,
+    getDoubleClickTimeMs,
+    setDoubleClickTimeMs,
     setCapture as setCaptureState,
     releaseCapture as releaseCaptureState,
     getCapture as getCaptureState,
-    noteLoadStringForDialog,
     windows,
     getAbsoluteWindowPosition,
+    installCursorAndUpdateHostVisibility,
+    getCurrentCursorHandle,
+    isGuestCursorVisible,
+    warpGuestCursorTo,
+    getCursorClipRect,
+    getVirtualScreenRect,
 } from './shared-state';
+import * as Classic from './classic-theme';
+import { getSystemCursorHandle } from './system-cursors';
+import { registerDeviceNotification, unregisterDeviceNotification } from './device-notify';
+import { invokeWindowMessageSync } from './message';
+import { PRIMARY_HMONITOR, monitorFromRect, monitorFallback } from './monitor';
+import { DESKTOP_HWND } from '../../runtime/windowing/window-manager';
 
-// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors
+// wsprintf's output buffer: reused across calls (hot path, thousands per frame) and
+// sized to the API's own 1024 code-unit budget including the terminator.
+const wsprintfScratch = new Uint8Array(1024 * 2);
+const wsprintfScratchView = new DataView(wsprintfScratch.buffer);
+
+/** The DBCS ANSI code pages (Shift-JIS, GBK, Wansung, Big5) — the ones whose
+ *  MaximumCharacterSize is 2 and which therefore make SM_DBCSENABLED true. */
+const DBCS_CODE_PAGES = new Set([932, 936, 949, 950, 1361]);
+function isDbcsCodePage(cp: number): boolean {
+    return DBCS_CODE_PAGES.has(cp);
+}
+
+/** '#RRGGBB' → COLORREF 0x00BBGGRR, so one palette can serve both painters and the API. */
+function cssToColorRef(css: string): number {
+    const v = parseInt(css.slice(1), 16);
+    return (((v & 0xFF) << 16) | (v & 0xFF00) | ((v >> 16) & 0xFF)) >>> 0;
+}
+
+// System color table (COLORREF: 0x00BBGGRR) — mutable via SetSysColors. The entries the
+// JS control painters also use come FROM classic-theme, so GetSysColor(COLOR_BTNFACE) and
+// a painted button face cannot drift apart: a window erased with the class brush would
+// otherwise sit a shade off every control on it.
 const sysColors = new Map<number, number>([
-    [0,  0xC0C0C0],  // COLOR_SCROLLBAR
-    [1,  0xC0DCC0],  // COLOR_BACKGROUND / COLOR_DESKTOP
-    [5,  0xFFFFFF],  // COLOR_WINDOW
-    [8,  0x000000],  // COLOR_WINDOWTEXT
-    [15, 0xC0C0C0],  // COLOR_BTNFACE
-    [16, 0x808080],  // COLOR_BTNSHADOW
-    [17, 0xFFFFFF],  // COLOR_GRAYTEXT (disabled text)
-    [18, 0x000080],  // COLOR_HIGHLIGHT
-    [19, 0xFFFFFF],  // COLOR_HIGHLIGHTTEXT
+    [0,  cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_SCROLLBAR
+    [1,  0xC0DCC0],                                  // COLOR_BACKGROUND / COLOR_DESKTOP
+    [2,  cssToColorRef(Classic.COLOR_ACTIVECAPTION)],// COLOR_ACTIVECAPTION
+    [3,  cssToColorRef(Classic.COLOR_INACTIVECAPTION)], // COLOR_INACTIVECAPTION
+    [4,  cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_MENU
+    [5,  cssToColorRef(Classic.COLOR_WINDOW)],       // COLOR_WINDOW
+    [6,  0x000000],                                  // COLOR_WINDOWFRAME
+    [7,  cssToColorRef(Classic.COLOR_WINDOWTEXT)],   // COLOR_MENUTEXT
+    [8,  cssToColorRef(Classic.COLOR_WINDOWTEXT)],   // COLOR_WINDOWTEXT
+    [9,  cssToColorRef(Classic.COLOR_BTNHILIGHT)],   // COLOR_CAPTIONTEXT
+    [10, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_ACTIVEBORDER
+    [11, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_INACTIVEBORDER
+    [12, 0x808080],                                  // COLOR_APPWORKSPACE
+    [13, cssToColorRef(Classic.COLOR_HIGHLIGHT)],    // COLOR_HIGHLIGHT
+    [14, cssToColorRef(Classic.COLOR_HIGHLIGHTTEXT)],// COLOR_HIGHLIGHTTEXT
+    [15, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_BTNFACE / COLOR_3DFACE
+    [16, cssToColorRef(Classic.COLOR_BTNSHADOW)],    // COLOR_BTNSHADOW
+    [17, cssToColorRef(Classic.COLOR_GRAYTEXT)],     // COLOR_GRAYTEXT (disabled text)
+    [18, cssToColorRef(Classic.COLOR_BTNTEXT)],      // COLOR_BTNTEXT
+    [19, cssToColorRef(Classic.COLOR_BTNFACE)],      // COLOR_INACTIVECAPTIONTEXT
+    [20, cssToColorRef(Classic.COLOR_BTNHILIGHT)],   // COLOR_BTNHIGHLIGHT / COLOR_3DHILIGHT
+    [21, cssToColorRef(Classic.COLOR_BTNDKSHADOW)],  // COLOR_3DDKSHADOW
+    [22, cssToColorRef(Classic.COLOR_BTNINNERHI)],   // COLOR_3DLIGHT
+    [23, cssToColorRef(Classic.COLOR_WINDOWTEXT)],   // COLOR_INFOTEXT
+    [24, 0xE1FFFF],                                  // COLOR_INFOBK
 ]);
+
+/** COLOR_BTNFACE / COLOR_3DFACE — the index every "standard grey" caller must ask for
+ *  rather than inlining a COLORREF, so the dialog face cannot drift from the controls. */
+export const COLOR_BTNFACE_INDEX = 15;
+
+/** Live system color for COLOR_*; unknown indices answer white as GetSysColor does. */
+export function getSystemColorRef(nIndex: number): number {
+    return sysColors.get(nIndex) ?? 0x00FFFFFF;
+}
+
+// GetSysColorBrush hands out a REAL brush the object table can resolve: an opaque cookie
+// reaches every painter (WM_CTLCOLOR*, class hbrBackground, FillRect) as "unresolvable"
+// and silently degrades to no fill. Cached per index, as Win32's are process-wide and
+// must not be deleted; re-created when a reset drops the object.
+const sysColorBrushes = new Map<number, number>();
+
+export function getSystemColorBrush(nIndex: number): number {
+    const gdi = System.getInstance().gdiContext;
+    const cached = sysColorBrushes.get(nIndex);
+    if (cached && gdi.getBrushCss(cached) !== null) return cached;
+    const brush = gdi.createSolidBrush(getSystemColorRef(nIndex));
+    if (brush) sysColorBrushes.set(nIndex, brush);
+    return brush;
+}
+
+const MAPVK_VK_TO_VSC = 0;
+const MAPVK_VSC_TO_VK = 1;
+const MAPVK_VK_TO_CHAR = 2;
+const MAPVK_VSC_TO_VK_EX = 3;
+const MAPVK_VK_TO_VSC_EX = 4;
+
+/**
+ * Set-1 scan code → virtual key, the US layout's own table (kbdus `ausVK[]`; Wine
+ * mirrors it as `vsc_to_vk` in dlls/win32u/input.c:322 with the T## defines in
+ * include/kbd.h:174). This direction is the PRIMARY one on Windows: a keyboard
+ * layout stores VSC→VK and derives VK→VSC by scanning it, which is why the sided
+ * modifiers (LSHIFT/RSHIFT/LCONTROL/LMENU) are what a scan code maps to and
+ * VK_SHIFT/VK_CONTROL/VK_MENU only appear after MAPVK_VSC_TO_VK folds them.
+ */
+const SCAN_TO_VK: Readonly<Record<number, number>> = {
+    0x01: 0x1b, 0x02: 0x31, 0x03: 0x32, 0x04: 0x33, 0x05: 0x34, 0x06: 0x35,
+    0x07: 0x36, 0x08: 0x37, 0x09: 0x38, 0x0a: 0x39, 0x0b: 0x30,
+    0x0c: 0xbd /* OEM_MINUS */, 0x0d: 0xbb /* OEM_PLUS */, 0x0e: 0x08, 0x0f: 0x09,
+    0x10: 0x51, 0x11: 0x57, 0x12: 0x45, 0x13: 0x52, 0x14: 0x54, 0x15: 0x59,
+    0x16: 0x55, 0x17: 0x49, 0x18: 0x4f, 0x19: 0x50,
+    0x1a: 0xdb, 0x1b: 0xdd, 0x1c: 0x0d, 0x1d: 0xa2 /* LCONTROL */,
+    0x1e: 0x41, 0x1f: 0x53, 0x20: 0x44, 0x21: 0x46, 0x22: 0x47, 0x23: 0x48,
+    0x24: 0x4a, 0x25: 0x4b, 0x26: 0x4c,
+    0x27: 0xba, 0x28: 0xde, 0x29: 0xc0, 0x2a: 0xa0 /* LSHIFT */, 0x2b: 0xdc,
+    0x2c: 0x5a, 0x2d: 0x58, 0x2e: 0x43, 0x2f: 0x56, 0x30: 0x42, 0x31: 0x4e,
+    0x32: 0x4d, 0x33: 0xbc, 0x34: 0xbe, 0x35: 0xbf,
+    0x36: 0xa1 /* RSHIFT */, 0x37: 0x6a /* MULTIPLY */, 0x38: 0xa4 /* LMENU */,
+    0x39: 0x20, 0x3a: 0x14,
+    0x3b: 0x70, 0x3c: 0x71, 0x3d: 0x72, 0x3e: 0x73, 0x3f: 0x74,
+    0x40: 0x75, 0x41: 0x76, 0x42: 0x77, 0x43: 0x78, 0x44: 0x79,
+    0x45: 0x90 /* NUMLOCK */, 0x46: 0x91 /* SCROLL */,
+    0x47: 0x24, 0x48: 0x26, 0x49: 0x21, 0x4a: 0x6d, 0x4b: 0x25, 0x4c: 0x0c,
+    0x4d: 0x27, 0x4e: 0x6b, 0x4f: 0x23, 0x50: 0x28, 0x51: 0x22, 0x52: 0x2d,
+    0x53: 0x2e, 0x54: 0x2c /* SNAPSHOT (SysRq) */,
+    0x56: 0xe2 /* OEM_102 */, 0x57: 0x7a /* F11 */, 0x58: 0x7b /* F12 */,
+    0x59: 0x0c /* CLEAR */, 0x5a: 0xee, 0x5b: 0xf0, 0x5c: 0xef, 0x5d: 0xf9,
+    0x5e: 0xf5, 0x5f: 0xf3, 0x62: 0xfb /* ZOOM */, 0x63: 0x2f /* HELP */,
+    0x64: 0x7c, 0x65: 0x7d, 0x66: 0x7e, 0x67: 0x7f, 0x68: 0x80, 0x69: 0x81,
+    0x6a: 0x82, 0x6b: 0x83, 0x6c: 0x84, 0x6d: 0x85, 0x6e: 0x86 /* F13..F23 */,
+    0x6f: 0xf7, 0x71: 0xe9, 0x73: 0xc1 /* ABNT_C1 */, 0x76: 0x87 /* F24 */,
+    0x7b: 0xf6, 0x7c: 0x09, 0x7e: 0xc2 /* ABNT_C2 */,
+};
+
+/** E0-prefixed scan codes (Wine `vsc_to_vk_e0`, X## defines in include/kbd.h:298). */
+const SCAN_E0_TO_VK: Readonly<Record<number, number>> = {
+    0x10: 0xb1, 0x19: 0xb0, 0x1c: 0x0d /* numpad Enter */, 0x1d: 0xa3 /* RCONTROL */,
+    0x20: 0xad, 0x21: 0xb7, 0x22: 0xb3, 0x24: 0xb2, 0x2e: 0xae, 0x30: 0xaf,
+    0x32: 0xac, 0x35: 0x6f /* DIVIDE */, 0x37: 0x2c /* PrintScreen */,
+    0x38: 0xa5 /* RMENU */, 0x46: 0x03 /* CANCEL (Ctrl+Break) */,
+    0x47: 0x24, 0x48: 0x26, 0x49: 0x21, 0x4b: 0x25, 0x4d: 0x27, 0x4f: 0x23,
+    0x50: 0x28, 0x51: 0x22, 0x52: 0x2d, 0x53: 0x2e,
+    0x5b: 0x5b, 0x5c: 0x5c, 0x5d: 0x5d, 0x5f: 0x5f,
+    0x65: 0xaa, 0x66: 0xab, 0x67: 0xa8, 0x68: 0xa9, 0x69: 0xa7, 0x6a: 0xa6,
+    0x6b: 0xb6, 0x6c: 0xb4, 0x6d: 0xb5,
+};
+
+/** Unshifted character for a VK (kbdus VK_TO_WCHARS). Letters stay UPPERCASE. */
+const VK_TO_CHAR: Readonly<Record<number, number>> = {
+    0x03: 0x03, 0x08: 0x08, 0x09: 0x09, 0x0c: 0x0c, 0x0d: 0x0d, 0x1b: 0x1b,
+    0x20: 0x20,
+    0x6a: 0x2a, 0x6b: 0x2b, 0x6d: 0x2d, 0x6e: 0x2e, 0x6f: 0x2f,
+    0xba: 0x3b, 0xbb: 0x3d, 0xbc: 0x2c, 0xbd: 0x2d, 0xbe: 0x2e, 0xbf: 0x2f,
+    0xc0: 0x60, 0xdb: 0x5b, 0xdc: 0x5c, 0xdd: 0x5d, 0xde: 0x27,
+};
+
+/**
+ * VK → scan code, derived by scanning the layout table in ascending order and taking
+ * the first entry that produces this VK — Windows' own algorithm (Wine input.c:1166),
+ * which is why the bare table wins over its E0 twin (VK_HOME is 0x47, not 0xE047) and
+ * why an unassigned VK yields 0 instead of a made-up code. `ext` is set only when the
+ * key exists solely as an E0 sequence (VK_RCONTROL, VK_RMENU, VK_DIVIDE, LWIN/RWIN…).
+ */
+const VK_TO_SCAN: ReadonlyMap<number, { scan: number; ext: boolean }> = (() => {
+    const map = new Map<number, { scan: number; ext: boolean }>();
+    for (const [scan, vk] of Object.entries(SCAN_TO_VK)) {
+        if (!map.has(vk)) map.set(vk, { scan: Number(scan), ext: false });
+    }
+    for (const [scan, vk] of Object.entries(SCAN_E0_TO_VK)) {
+        if (!map.has(vk)) map.set(vk, { scan: Number(scan), ext: true });
+    }
+    return map;
+})();
+
+/**
+ * VKs the layout table never names, because they are produced by NumLock/side folding
+ * rather than by a scan code of their own (Wine input.c:1149). MapVirtualKey answers
+ * for them with the physical key underneath.
+ */
+const VK_SCAN_ALIAS: Readonly<Record<number, number>> = {
+    0x10: 0xa0, 0x11: 0xa2, 0x12: 0xa4,       // SHIFT/CONTROL/MENU → left variant
+    0x60: 0x2d, 0x61: 0x23, 0x62: 0x28, 0x63: 0x22, 0x64: 0x25, // NUMPAD0..4
+    0x65: 0x0c, 0x66: 0x27, 0x67: 0x24, 0x68: 0x26, 0x69: 0x21, // NUMPAD5..9
+    0x6e: 0x2e,                                                  // DECIMAL → DELETE
+};
+
+/** MAPVK_VSC_TO_VK_EX result → the side-agnostic VK MAPVK_VSC_TO_VK reports. */
+function sidelessVk(vk: number): number {
+    switch (vk) {
+        case 0xa0: case 0xa1: return 0x10; // VK_LSHIFT/VK_RSHIFT → VK_SHIFT
+        case 0xa2: case 0xa3: return 0x11; // VK_LCONTROL/VK_RCONTROL → VK_CONTROL
+        case 0xa4: case 0xa5: return 0x12; // VK_LMENU/VK_RMENU → VK_MENU
+        default: return vk;
+    }
+}
+
+/** Scan code (bare, or 0xE0xx/0xE1xx prefixed) → sided virtual key. 0 = unassigned. */
+function scanCodeToVk(code: number): number {
+    if ((code & 0xff00) === 0xe000) return SCAN_E0_TO_VK[code & 0xff] ?? 0;
+    if ((code & 0xff00) === 0xe100) return (code & 0xff) === 0x1d ? 0x13 /* VK_PAUSE */ : 0;
+    return SCAN_TO_VK[code & 0xff] ?? 0;
+}
+
+/** VK → { scan, ext }; scan 0 when the layout assigns the VK no physical key. */
+function vkToScanEntry(vk: number): { scan: number; ext: boolean } {
+    return VK_TO_SCAN.get(VK_SCAN_ALIAS[vk] ?? vk) ?? { scan: 0, ext: false };
+}
+
+/** MAPVK_VK_TO_CHAR: Wine input.c:1200 returns the VK itself for 'A'..'Z' (uppercase). */
+function vkToChar(vk: number): number {
+    if (vk >= 0x30 && vk <= 0x39) return vk;          // '0'-'9'
+    if (vk >= 0x41 && vk <= 0x5a) return vk;          // 'A'-'Z'
+    if (vk >= 0x60 && vk <= 0x69) return vk - 0x60 + 0x30; // numpad digits
+    return VK_TO_CHAR[vk] ?? 0;
+}
+
+// SPI_* actions (winuser.h). Only the ones we answer are named; an action absent from
+// this file is answered with FALSE rather than a silent TRUE.
+const SPI_GETBEEP = 1, SPI_SETBEEP = 2, SPI_GETMOUSE = 3, SPI_SETMOUSE = 4;
+const SPI_GETBORDER = 5, SPI_SETBORDER = 6;
+const SPI_GETKEYBOARDSPEED = 10, SPI_SETKEYBOARDSPEED = 11;
+const SPI_ICONHORIZONTALSPACING = 13;
+const SPI_GETSCREENSAVETIMEOUT = 14, SPI_SETSCREENSAVETIMEOUT = 15;
+const SPI_GETSCREENSAVEACTIVE = 16, SPI_SETSCREENSAVEACTIVE = 17;
+const SPI_GETGRIDGRANULARITY = 18, SPI_SETGRIDGRANULARITY = 19;
+const SPI_SETDESKWALLPAPER = 20, SPI_SETDESKPATTERN = 21;
+const SPI_GETKEYBOARDDELAY = 22, SPI_SETKEYBOARDDELAY = 23;
+const SPI_ICONVERTICALSPACING = 24;
+const SPI_GETICONTITLEWRAP = 25, SPI_SETICONTITLEWRAP = 26;
+const SPI_GETMENUDROPALIGNMENT = 27, SPI_SETMENUDROPALIGNMENT = 28;
+const SPI_SETDOUBLECLKWIDTH = 29, SPI_SETDOUBLECLKHEIGHT = 30;
+const SPI_GETICONTITLELOGFONT = 31, SPI_SETICONTITLELOGFONT = 34;
+const SPI_SETDOUBLECLICKTIME = 32, SPI_SETMOUSEBUTTONSWAP = 33;
+const SPI_GETFASTTASKSWITCH = 35, SPI_SETFASTTASKSWITCH = 36;
+const SPI_SETDRAGFULLWINDOWS = 37, SPI_GETDRAGFULLWINDOWS = 38;
+const SPI_GETNONCLIENTMETRICS = 41, SPI_SETNONCLIENTMETRICS = 42;
+const SPI_GETMINIMIZEDMETRICS = 43, SPI_SETMINIMIZEDMETRICS = 44;
+const SPI_GETICONMETRICS = 45, SPI_SETICONMETRICS = 46;
+const SPI_SETWORKAREA = 47, SPI_GETWORKAREA = 48;
+const SPI_GETFILTERKEYS = 50, SPI_GETTOGGLEKEYS = 52, SPI_GETMOUSEKEYS = 54;
+const SPI_GETSHOWSOUNDS = 56, SPI_SETSHOWSOUNDS = 57;
+const SPI_GETSTICKYKEYS = 58, SPI_GETACCESSTIMEOUT = 60, SPI_GETSOUNDSENTRY = 64;
+const SPI_GETHIGHCONTRAST = 66;
+const SPI_GETKEYBOARDPREF = 68, SPI_GETSCREENREADER = 70;
+const SPI_GETANIMATION = 72, SPI_SETANIMATION = 73;
+const SPI_GETFONTSMOOTHING = 74, SPI_SETFONTSMOOTHING = 75;
+const SPI_SETDRAGWIDTH = 76, SPI_SETDRAGHEIGHT = 77;
+const SPI_GETLOWPOWERTIMEOUT = 79, SPI_GETPOWEROFFTIMEOUT = 80;
+const SPI_SETLOWPOWERTIMEOUT = 81, SPI_SETPOWEROFFTIMEOUT = 82;
+const SPI_GETLOWPOWERACTIVE = 83, SPI_GETPOWEROFFACTIVE = 84;
+const SPI_SETLOWPOWERACTIVE = 85, SPI_SETPOWEROFFACTIVE = 86;
+const SPI_SETDEFAULTINPUTLANG = 90, SPI_SETLANGTOGGLE = 91;
+const SPI_GETMOUSETRAILS = 94, SPI_SETMOUSETRAILS = 93;
+const SPI_SETSCREENSAVERRUNNING = 97;
+const SPI_SETCURSORS = 87, SPI_SETICONS = 88;
+const SPI_GETMOUSEHOVERWIDTH = 98, SPI_SETMOUSEHOVERWIDTH = 99;
+const SPI_GETMOUSEHOVERHEIGHT = 100, SPI_SETMOUSEHOVERHEIGHT = 101;
+const SPI_GETMOUSEHOVERTIME = 102, SPI_SETMOUSEHOVERTIME = 103;
+const SPI_GETWHEELSCROLLLINES = 104, SPI_SETWHEELSCROLLLINES = 105;
+const SPI_GETMENUSHOWDELAY = 106, SPI_SETMENUSHOWDELAY = 107;
+const SPI_GETWHEELSCROLLCHARS = 108, SPI_SETWHEELSCROLLCHARS = 109;
+const SPI_GETDEFAULTINPUTLANG = 89;
+const SPI_GETMOUSESPEED = 112, SPI_SETMOUSESPEED = 113;
+const SPI_GETSCREENSAVERRUNNING = 114, SPI_GETDESKWALLPAPER = 115;
+const SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000, SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+const SPI_GETFOREGROUNDFLASHCOUNT = 0x2004, SPI_SETFOREGROUNDFLASHCOUNT = 0x2005;
+const SPI_GETCARETWIDTH = 0x2006, SPI_SETCARETWIDTH = 0x2007;
+/** SM_CXDRAG/SM_CYDRAG have no GET action of their own — only SPI_SETDRAGWIDTH/HEIGHT
+ *  write them. These private slot ids keep the stored value out of the action space. */
+const SPI_GETDRAGWIDTH_X = -1, SPI_GETDRAGHEIGHT_Y = -2;
+
+/** The GET half of the visual-effect pairs (0x1000 block + SPI_GETUIEFFECTS). */
+const SPI_UI_EFFECT_GETS = [
+    0x1000, 0x1002, 0x1004, 0x1006, 0x1008, 0x100A, 0x100C, 0x100E,
+    0x1012, 0x1014, 0x1016, 0x1018, 0x101A, 0x101C, 0x101E, 0x1020,
+    0x1022, 0x1024, 0x1026, 0x103E,
+];
+/** Their SET counterparts sit one above each GET. */
+const SPI_UI_EFFECT_SET_TO_GET: Array<[number, number]> =
+    SPI_UI_EFFECT_GETS.map((get) => [get + 1, get]);
+
+/** SETs whose new value arrives in pvParam (cast to a value) rather than uiParam. */
+const SPI_SET_VALUE_IN_PVPARAM = new Set<number>([
+    SPI_SETMOUSESPEED, SPI_SETFOREGROUNDLOCKTIMEOUT, SPI_SETFOREGROUNDFLASHCOUNT,
+    SPI_SETCARETWIDTH,
+    ...SPI_UI_EFFECT_SET_TO_GET.map(([set]) => set),
+]);
+
+/** The classic UI face — the same one the JS control painters use (tab-control.ts),
+ *  so a caller that creates a font from these metrics matches what we draw. */
+const CLASSIC_UI_FACE = 'MS Sans Serif';
+
+/** LOGFONTA (60 bytes) / LOGFONTW (92): the first 28 bytes are shared, then the face
+ *  name array. Written whole — a partially filled LOGFONT is a garbage font request. */
+function writeLogFont(
+    mem: Uint8Array, ptr: number, wide: boolean, height: number, weight: number, face: string,
+): void {
+    const size = wide ? 92 : 60;
+    for (let i = 0; i < size; i++) mem[ptr + i] = 0;
+    const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+    v.setInt32(ptr, height, true);        // lfHeight (negative = character height)
+    v.setInt32(ptr + 16, weight, true);   // lfWeight
+    mem[ptr + 23] = 1;                    // lfCharSet = DEFAULT_CHARSET
+    mem[ptr + 27] = 0x22;                 // lfPitchAndFamily = VARIABLE_PITCH | FF_SWISS
+    const chars = Math.min(face.length, 31);
+    for (let i = 0; i < chars; i++) {
+        if (wide) v.setUint16(ptr + 28 + i * 2, face.charCodeAt(i), true);
+        else mem[ptr + 28 + i] = face.charCodeAt(i) & 0xff;
+    }
+}
+
+const DEFAULT_DISPLAY_REFRESH_RATE = 60;
+export type DisplayMode = { width: number; height: number; bpp: number; refreshRate: number };
+
+export const normalizeRefreshRate = (refreshRate: number | undefined): number => {
+    const hz = Number(refreshRate);
+    return Number.isFinite(hz) && hz > 0 ? Math.trunc(hz) : DEFAULT_DISPLAY_REFRESH_RATE;
+};
+
+/** The current mode of the one emulated display — what EnumDisplaySettings(ENUM_CURRENT_SETTINGS),
+ *  SM_CXSCREEN and the display-config paths all report. */
+export const getCurrentScreenMode = (): DisplayMode => {
+    const system = System.getInstance();
+    // System.requestHostResize is the single publisher of the emulated mode, so it is
+    // right even for a title that never creates a DDraw context; ddrawContext.display
+    // is the same value for DDraw titles and stays as the fallback for anything that
+    // sets it directly.
+    const mode = system.emulatedDisplayMode;
+    const ddraw = system.ddrawContext;
+    const cfg = EmulatorConfig.getInstance().screenResolution;
+    const screen = getVirtualScreenRect();
+    return {
+        width: screen.right,
+        height: screen.bottom,
+        bpp: mode?.bpp || ddraw?.display?.bpp || cfg.bpp || 16,
+        refreshRate: normalizeRefreshRate(mode?.refreshRate || ddraw?.display?.refresh || cfg.refreshRate),
+    };
+};
+
+/** The mode list EnumDisplaySettings enumerates. */
+export const getDisplayModes = (): DisplayMode[] => {
+    const configuredModes = EmulatorConfig.getInstance().supportedResolutions;
+    if (!configuredModes || configuredModes.length === 0) {
+        return [
+            { width: 640, height: 480, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 640, height: 480, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 800, height: 600, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 800, height: 600, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1024, height: 768, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1024, height: 768, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1152, height: 864, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1152, height: 864, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 960, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 960, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 1024, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 1024, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1600, height: 1200, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1600, height: 1200, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1280, height: 720, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+            { width: 1920, height: 1080, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
+        ];
+    }
+    return configuredModes.map((mode) => ({
+        width: mode.width,
+        height: mode.height,
+        bpp: mode.bpp,
+        refreshRate: normalizeRefreshRate(mode.refreshRate),
+    }));
+};
 
 export function createSystemExports(): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
     let mouseButtonsSwapped = false;
-    let doubleClickTimeMs = 500;
-    const deviceNotifications = new Set<number>();
-    let nextDeviceNotification = 0x00021000;
     const registeredClipboardFormats = new Map<string, number>();
     let nextRegisteredClipboardFormat = 0xC000;
 
@@ -100,32 +453,49 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     const SM_CYSMSIZE = 53;      // Small caption button height
     const SM_CXMENUSIZE = 54;    // Menu bar button width
     const SM_CYMENUSIZE = 55;    // Menu bar button height
-    const SM_IMMENABLED = 74;    // IME enabled
-    const SM_CXFOCUSBORDER = 75; // Focus border width
+    const SM_SECURE = 44;        // Security present
+    const SM_CXEDGE = 45;        // 3D border width
+    const SM_CYEDGE = 46;        // 3D border height
+    const SM_CXMINSPACING = 47;  // Minimized-window grid cell width
+    const SM_CYMINSPACING = 48;  // Minimized-window grid cell height
+    const SM_ARRANGE = 56;       // How minimized windows arrange
+    const SM_CXMINIMIZED = 57;   // Minimized-window width
+    const SM_CYMINIMIZED = 58;   // Minimized-window height
+    const SM_CXMAXTRACK = 59;    // Max tracking width
+    const SM_CYMAXTRACK = 60;    // Max tracking height
+    const SM_CXMAXIMIZED = 61;   // Maximized-window width
+    const SM_CYMAXIMIZED = 62;   // Maximized-window height
+    const SM_NETWORK = 63;       // Bit 0 = a network is present
+    const SM_CLEANBOOT = 67;     // Safe-mode boot
+    const SM_CXDRAG = 68;        // Drag-start threshold X
+    const SM_CYDRAG = 69;        // Drag-start threshold Y
+    const SM_SHOWSOUNDS = 70;    // Accessibility: visual cue for sounds
+    const SM_CXMENUCHECK = 71;   // Menu check-mark width
+    const SM_CYMENUCHECK = 72;   // Menu check-mark height
+    const SM_SLOWMACHINE = 73;   // Low-end machine
+    const SM_MIDEASTENABLED = 74; // Hebrew/Arabic support installed
+    const SM_MOUSEWHEELPRESENT = 75; // Wheel present
     const SM_XVIRTUALSCREEN = 76; // Virtual screen origin X (single monitor = 0)
     const SM_YVIRTUALSCREEN = 77;
     const SM_CXVIRTUALSCREEN = 78;
     const SM_CYVIRTUALSCREEN = 79;
     const SM_CMONITORS = 80;
+    const SM_SAMEDISPLAYFORMAT = 81; // All monitors share one colour format
+    const SM_IMMENABLED = 82;    // IME enabled
+    const SM_CXFOCUSBORDER = 83; // Focus border width
+    const SM_CYFOCUSBORDER = 84; // Focus border height
+    const SM_TABLETPC = 86;
+    const SM_MEDIACENTER = 87;
+    const SM_STARTER = 88;
+    const SM_SERVERR2 = 89;
+    const SM_MOUSEHORIZONTALWHEELPRESENT = 91;
+    const SM_CXPADDEDBORDER = 92; // Themed extra frame padding (0 = classic)
+    const SM_REMOTESESSION = 0x1000;
+    const SM_SHUTTINGDOWN = 0x2000;
+    const SM_REMOTECONTROL = 0x2001;
+    const SM_DIGITIZER = 94;
+    const SM_MAXIMUMTOUCHES = 95;
 
-    const DEFAULT_DISPLAY_REFRESH_RATE = 60;
-    type DisplayMode = { width: number; height: number; bpp: number; refreshRate: number };
-
-    const normalizeRefreshRate = (refreshRate: number | undefined): number => {
-        const hz = Number(refreshRate);
-        return Number.isFinite(hz) && hz > 0 ? Math.trunc(hz) : DEFAULT_DISPLAY_REFRESH_RATE;
-    };
-
-    const getCurrentScreenMode = (): DisplayMode => {
-        const ddraw = System.getInstance().ddrawContext;
-        const cfg = EmulatorConfig.getInstance().screenResolution;
-        return {
-            width: ddraw?.display?.width || cfg.width,
-            height: ddraw?.display?.height || cfg.height,
-            bpp: ddraw?.display?.bpp || cfg.bpp || 16,
-            refreshRate: normalizeRefreshRate(ddraw?.display?.refresh || cfg.refreshRate),
-        };
-    };
 
     exports['GetSystemMetrics'] = (ctx, mem, args) => {
         const nIndex = args[0];
@@ -175,7 +545,9 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             case SM_CYICONSPACING:  return 75;   // Icon vertical spacing
             case SM_MENUDROPALIGNMENT: return 0; // Menu drops aligned left
             case SM_PENWINDOWS:     return 0;    // No pen support
-            case SM_DBCSENABLED:    return 0;    // No DBCS
+            // "A DBCS version of user32 is installed" — true exactly when the ANSI code
+            // page is multi-byte, which is what the bundle's codepage setting decides.
+            case SM_DBCSENABLED:    return isDbcsCodePage(getAnsiCodePage()) ? 1 : 0;
             case SM_CMOUSEBUTTONS:  return 3;    // 3 mouse buttons
             case SM_CXSMICON:       return 16;   // Small icon width
             case SM_CYSMICON:       return 16;   // Small icon height
@@ -184,26 +556,65 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             case SM_CYSMSIZE:       return 14;   // Small caption button height
             case SM_CXMENUSIZE:     return 18;   // Menu bar button width
             case SM_CYMENUSIZE:     return 18;   // Menu bar button height
-            case SM_IMMENABLED:     return 0;    // No IME
-            case SM_CXFOCUSBORDER:  return 1;    // Focus border width
+            case SM_SECURE:         return 0;    // No security (Win9x-class desktop)
+            // The 3D edge is one border plus one highlight, which is what the classic
+            // painters draw — see controls.ts's SM_CXEDGE note.
+            case SM_CXEDGE:         return 2;
+            case SM_CYEDGE:         return 2;
+            case SM_CXMINIMIZED:    return 160;  // MINIMIZEDMETRICS iWidth (154) + 6
+            case SM_CYMINIMIZED:    return 24;   // SM_CYSIZE (18) + 6
+            case SM_CXMINSPACING:   return 160;  // + iHorzGap (0)
+            case SM_CYMINSPACING:   return 24;   // + iVertGap (0)
+            case SM_ARRANGE:        return 8;    // ARW_HIDE — the MINIMIZEDMETRICS default
+            // A maximized window's frame hangs off-screen; we model no taskbar, so the
+            // work area is the whole screen and nothing is subtracted.
+            case SM_CXMAXIMIZED:    return screenW + 2 * 4;   // + 2 * SM_CXFRAME
+            case SM_CYMAXIMIZED:    return screenH + 2 * 19;  // + 2 * SM_CYCAPTION
+            case SM_CXMAXTRACK:     return screenW + 4 + 2 * 4;
+            case SM_CYMAXTRACK:     return screenH + 4 + 2 * 4;
+            // Bit 0 = "a network is present". We serve winsock/wsock32 and the DPlay
+            // transports, so a title gating multiplayer on this must not be told there is
+            // no adapter — the menu item greys out and the whole path becomes unreachable.
+            case SM_NETWORK:        return 3;
+            case SM_CLEANBOOT:      return 0;    // Normal boot, not safe mode
+            case SM_CXDRAG:         return 4;    // Drag threshold (SPI_GETDRAGWIDTH default)
+            case SM_CYDRAG:         return 4;
+            case SM_SHOWSOUNDS:     return 0;    // No visual-cue accessibility mode
+            case SM_CXMENUCHECK:    return 13;   // Classic Marlett check cell (classic-theme.ts)
+            case SM_CYMENUCHECK:    return 13;
+            case SM_SLOWMACHINE:    return 0;
+            case SM_MIDEASTENABLED: return 0;    // No bidi user32
+            // The wheel is real: the host publishes deltas (INPUT_INDEX.mouseWheel), we
+            // dispatch WM_MOUSEWHEEL (message.ts) and DirectInput reports the Z axis with
+            // a 120 granularity. Answering 0 makes an engine that gates its wheel handler
+            // on this metric fall back to keys and ignore the messages we do deliver.
+            case SM_MOUSEWHEELPRESENT: return 1;
             case SM_XVIRTUALSCREEN: return 0;    // Single monitor, origin 0
             case SM_YVIRTUALSCREEN: return 0;
             case SM_CXVIRTUALSCREEN: return screenW;
             case SM_CYVIRTUALSCREEN: return screenH;
             case SM_CMONITORS:      return 1;    // Single monitor
+            case SM_SAMEDISPLAYFORMAT: return 1; // One monitor, so trivially the same format
+            case SM_IMMENABLED:     return 0;    // No IME
+            case SM_CXFOCUSBORDER:  return 1;    // Focus border width
+            case SM_CYFOCUSBORDER:  return 1;
+            case SM_TABLETPC:       return 0;
+            case SM_MEDIACENTER:    return 0;
+            case SM_STARTER:        return 0;
+            case SM_SERVERR2:       return 0;
+            // Nothing publishes a horizontal wheel and no WM_MOUSEHWHEEL is dispatched.
+            case SM_MOUSEHORIZONTALWHEELPRESENT: return 0;
+            case SM_CXPADDEDBORDER: return 0;    // Classic frame has no padded border
+            // No touch or pen digitizer: RegisterTouchWindow succeeds, but no WM_TOUCH comes.
+            case SM_DIGITIZER:      return 0;
+            case SM_MAXIMUMTOUCHES: return 0;
+            case SM_REMOTESESSION:  return 0;
+            case SM_SHUTTINGDOWN:   return 0;
+            case SM_REMOTECONTROL:  return 0;
             default:
                 Logger.warn(LogCategory.USER32, `GetSystemMetrics: unknown index ${nIndex}`);
                 return 0;
         }
-    };
-
-    // GetActiveWindow - return handle of the active window (NULL if none)
-    exports['GetActiveWindow'] = () => {
-        return System.getInstance().windowManager.getActiveHwnd();
-    };
-
-    exports['GetForegroundWindow'] = () => {
-        return System.getInstance().windowManager.getActiveHwnd();
     };
 
     // BOOL AttachThreadInput(DWORD idAttach, DWORD idAttachTo, BOOL fAttach)
@@ -238,9 +649,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['SetCursorPos'] = (ctx, mem, args) => {
         const x = args[0] | 0;
         const y = args[1] | 0;
-        System.getInstance().inputManager.setMousePosition(x, y);
-        // Notify host so it can update virtual cursor position during pointer lock
-        self.postMessage({ type: "set_cursor_pos", x, y });
+        warpGuestCursorTo(x, y);
         Logger.verbose(LogCategory.USER32, `SetCursorPos(${x}, ${y})`);
         return 1;
     };
@@ -310,9 +719,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const KEYEVENTF_KEYUP = 0x0002;
         const msg = (dwFlags & KEYEVENTF_KEYUP) !== 0 ? 0x0101 : 0x0100; // WM_KEYUP/WM_KEYDOWN
         const lParam = 1 | (bScan << 16);
+        const dwExtraInfo = args[3] >>> 0;
         const hwnd = System.getInstance().windowManager.getInputTargetWindow()?.hwnd ?? 0;
         if (hwnd) {
-            System.getInstance().windowManager.postMessage(hwnd, msg, bVk, lParam);
+            System.getInstance().windowManager.postMessage(hwnd, msg, bVk, lParam, 0, 0, 0, undefined, dwExtraInfo);
         }
         return 0;
     };
@@ -322,6 +732,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const dx = args[1] | 0;
         const dy = args[2] | 0;
         const dwData = args[3] >>> 0;
+        const dwExtraInfo = args[4] >>> 0;
 
         const MOUSEEVENTF_MOVE = 0x0001;
         const MOUSEEVENTF_LEFTDOWN = 0x0002;
@@ -363,7 +774,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
         const pos = inputManager.getMouseState();
         const lParam = ((pos.y & 0xffff) << 16) | (pos.x & 0xffff);
-        const post = (msg: number, wParam = 0) => wm.postMessage(hwnd, msg, wParam, lParam);
+        const post = (msg: number, wParam = 0) =>
+            wm.postMessage(hwnd, msg, wParam, lParam, 0, 0, 0, undefined, dwExtraInfo);
 
         if (dwFlags & MOUSEEVENTF_LEFTDOWN) post(0x0201, 0x0001);
         if (dwFlags & MOUSEEVENTF_LEFTUP) post(0x0202, 0);
@@ -454,6 +866,16 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return lpStr;
     };
 
+    // BOOL IsCharLowerA(CHAR ch)
+    // The ANSI entry point classifies the byte using the system ANSI code page. A
+    // character is lower case only when it has a distinct upper-case form and is
+    // already its lower-case form; digits, punctuation, and uncased letters are false.
+    exports['IsCharLowerA'] = (_ctx, _mem, args) => {
+        const cp = EmulatorConfig.getInstance().ansiCodePage;
+        const ch = getCodePageDecoder(cp).decode(new Uint8Array([args[0] & 0xFF]));
+        return ch === ch.toLowerCase() && ch !== ch.toUpperCase() ? 1 : 0;
+    };
+
     // LPWSTR CharUpperW(LPWSTR lpsz)
     // If lpsz <= 0xFFFF it is a single wide character passed as atom; return uppercased code point.
     // Otherwise it is a pointer to a null-terminated UTF-16LE string; upper-case in-place.
@@ -495,20 +917,17 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return lpStr;
     };
 
-    // GetLastActivePopup - return last active popup for the given window (minimal: return hwnd or NULL)
-    exports['GetLastActivePopup'] = (ctx, mem, args) => {
-        const hWnd = args[0];
-        Logger.verbose(LogCategory.USER32, `GetLastActivePopup(0x${hWnd.toString(16)})`);
-        return { value: hWnd || 0, stackCleanup: 4 };
-    };
-
     // ReleaseCapture - release mouse capture
     exports['ReleaseCapture'] = (ctx, mem, args) => {
         const prev = releaseCaptureState();
         // Win32: the window losing capture receives WM_CAPTURECHANGED (lParam = hwnd gaining
         // capture, here NULL). Faithful capture transfer — UE1 SetMouseCapture gates on this.
         if (prev) {
-            System.getInstance().windowManager.postMessage(prev, 0x0215 /* WM_CAPTURECHANGED */, 0, 0);
+            const sync = invokeWindowMessageSync(
+                ctx, mem, prev, 0x0215 /* WM_CAPTURECHANGED */, 0, 0,
+                0, 'ReleaseCapture:WM_CAPTURECHANGED', () => 1,
+            );
+            if (sync) return sync;
         }
         Logger.verbose(LogCategory.USER32, `ReleaseCapture() prev=0x${prev.toString(16)}`);
         return { value: 1, stackCleanup: 0 };
@@ -521,27 +940,56 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         // The previously-capturing window (if any, and different) loses capture →
         // WM_CAPTURECHANGED with lParam = the window gaining capture (hWnd).
         if (prev && prev !== (hWnd >>> 0)) {
-            System.getInstance().windowManager.postMessage(prev, 0x0215 /* WM_CAPTURECHANGED */, 0, hWnd >>> 0);
+            const sync = invokeWindowMessageSync(
+                ctx, mem, prev, 0x0215 /* WM_CAPTURECHANGED */, 0, hWnd >>> 0,
+                4, 'SetCapture:WM_CAPTURECHANGED', () => prev,
+            );
+            if (sync) return sync;
         }
         Logger.verbose(LogCategory.USER32, `SetCapture(0x${hWnd.toString(16)}) prev=0x${prev.toString(16)}`);
         return { value: prev, stackCleanup: 4 };
     };
 
-    exports['LoadCursorA'] = (ctx, mem, args) => {
-        const hInstance = args[0];
-        const lpCursorName = args[1];
-        Logger.verbose(LogCategory.USER32, `LoadCursorA(0x${hInstance.toString(16)}, ${lpCursorName})`);
-        return 0x100; // Dummy cursor handle
+    const loadCursorCommon = (apiName: string, hInstance: number, lpCursorName: number): number => {
+        // Ordinal ids resolve to the system cursor theme (system-cursors.ts).
+        // App PE-resource cursors (hInstance != 0 or a name string) are not
+        // decoded yet — they share the arrow shape so the pointer stays visible.
+        const handle = getSystemCursorHandle(lpCursorName < 0x10000 ? lpCursorName : 0);
+        Logger.verbose(LogCategory.USER32, `${apiName}(0x${hInstance.toString(16)}, ${lpCursorName}) -> 0x${handle.toString(16)}`);
+        return handle;
     };
 
-    exports['LoadCursorW'] = (ctx, mem, args) => {
-        const hInstance = args[0];
-        const lpCursorName = args[1];
-        Logger.verbose(LogCategory.USER32, `LoadCursorW(0x${hInstance.toString(16)}, ${lpCursorName})`);
-        return 0x100; // Dummy cursor handle
+    exports['LoadCursorA'] = (ctx, mem, args) => loadCursorCommon('LoadCursorA', args[0], args[1] >>> 0);
+
+    exports['LoadCursorW'] = (ctx, mem, args) => loadCursorCommon('LoadCursorW', args[0], args[1] >>> 0);
+
+    /**
+     * LoadCursorFromFile: a game that ships its own .cur/.ani asks for one per pointer shape and
+     * stores what it gets. NULL is a legal answer only when the file is missing, so answering it
+     * unconditionally hands the caller a handle it will dereference — RA3 read through it at
+     * +0x34 and took the process down. The SHAPE is still the system arrow (as it is for a PE
+     * resource cursor), so the pointer stays visible; only the identity is real.
+     */
+    const loadCursorFromFile = (mem: Uint8Array, namePtr: number, isWide: boolean): number => {
+        const apiName = isWide ? 'LoadCursorFromFileW' : 'LoadCursorFromFileA';
+        if (!namePtr) return 0;
+        const filename = isWide ? Marshaler.readWideString(mem, namePtr) : Marshaler.readString(mem, namePtr);
+        // Existence is the whole question — opening the file would take (and never give
+        // back) the overlay's exclusive sync handle for a file we never read.
+        if (!System.getInstance().fileSystem.fileExists(filename)) {
+            Logger.warn(LogCategory.USER32, `${apiName}: no such file "${filename}"`);
+            return 0;
+        }
+        const handle = getSystemCursorHandle(0);
+        Logger.verbose(LogCategory.USER32, `${apiName}("${filename}") -> 0x${handle.toString(16)}`);
+        return handle;
     };
 
-    let nextIconHandle = 0x200;
+    exports['LoadCursorFromFileA'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, false);
+    exports['LoadCursorFromFileW'] = (_ctx, mem, args) => loadCursorFromFile(mem, args[0] >>> 0, true);
+
+    const FIRST_LOADICON_HANDLE = 0x200;
+    let nextIconHandle = FIRST_LOADICON_HANDLE;
 
     const loadIconCommon = (mem: Uint8Array, hInstance: number, lpIconName: number, isWide: boolean): number => {
         if (!lpIconName) {
@@ -573,43 +1021,83 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return loadIconCommon(mem, hInstance, lpIconName, true);
     };
 
-    // wsprintfA - variadic string formatting function (direct-write: no JS string concat, no TextEncoder)
-    exports['wsprintfA'] = (ctx, mem, args) => {
-        const lpOut = args[0];
-        const lpFmt = args[1];
+    // wsprintfA/W - variadic string formatting (direct-write: no JS string concat, no TextEncoder).
+    // `wide` selects the code-unit size of BOTH the format string and the output buffer; the
+    // h/l/w length modifiers then select the width of each %s/%c argument independently, per
+    // the WPRINTF_ParseFormat{A,W} tables (wine dlls/user32/wsprintf.c).
+    const wsprintfCore = (mem: Uint8Array, args: number[], wide: boolean): number => {
+        const lpOut = args[0] >>> 0;
+        const lpFmt = args[1] >>> 0;
 
         if (!lpOut || !lpFmt) {
-            Logger.warn(LogCategory.USER32, 'wsprintfA: NULL pointer');
+            Logger.warn(LogCategory.USER32, `wsprintf${wide ? 'W' : 'A'}: NULL pointer`);
             return -1;
         }
 
-        // Write cursor into guest memory
-        let out = lpOut;
+        const unit = wide ? 2 : 1;
         const memEnd = mem.length;
+        // Real wsprintf formats through wvsnprintf with a hard 1024 code-unit budget INCLUDING
+        // the terminator, and reports 1024 when it overflows. Callers size their buffer to that
+        // documented maximum, so an unbounded formatter writes past a correctly-sized buffer.
+        // This bounds WRITES only — the format string and %s arguments may live anywhere.
+        const WSPRINTF_MAX_UNITS = 1024;
+        const outEnd = (WSPRINTF_MAX_UNITS - 1) * unit;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        // Helper: write a single byte
-        const writeByte = (b: number): void => { if (out < memEnd) mem[out++] = b; };
+        // Formatting builds in this reusable host buffer and lands in the guest through ONE
+        // Mem.writeBytes: the guest-supplied lpOut is then validated against the region map
+        // exactly once instead of per code unit (§3.1 — and this is a per-frame hot path).
+        const scratch = wsprintfScratch;
+        const scratchView = wsprintfScratchView;
+        let out = 0; // byte cursor into `scratch`
 
-        // Helper: write a JS string as ANSI bytes directly to mem
+        // Helper: read one code unit of the format string
+        const fmtAt = (p: number): number =>
+            wide ? (p + 2 <= memEnd ? view.getUint16(p, true) : 0) : (p < memEnd ? mem[p] : 0);
+
+        // Helper: write a single output code unit
+        const writeUnit = (c: number): void => {
+            if (out + unit > outEnd) return;
+            if (wide) { scratchView.setUint16(out, c & 0xFFFF, true); out += 2; }
+            else scratch[out++] = c & 0xFF;
+        };
+
+        // Helper: write a JS string in the output's code-unit width
         const writeStr = (s: string): void => {
+            if (wide) {
+                for (let i = 0; i < s.length; i++) writeUnit(s.charCodeAt(i));
+                return;
+            }
             const encoded = encodeAnsi(s);
-            const writeLen = Math.min(encoded.length, memEnd - out);
+            const writeLen = Math.min(encoded.length, outEnd - out);
             if (writeLen > 0) {
-                mem.set(encoded.subarray(0, writeLen), out);
+                scratch.set(encoded.subarray(0, writeLen), out);
                 out += writeLen;
             }
         };
 
-        // Helper: copy guest string (mem-to-mem) with optional max length
-        const writeGuestStr = (addr: number, maxLen: number): void => {
-            let j = 0;
-            while (j < maxLen && addr + j < memEnd) {
-                const b = mem[addr + j];
-                if (b === 0) break;
-                if (out >= memEnd) break;
-                mem[out++] = b;
-                j++;
+        // Helper: length of a guest string in its own code units, bounded by precision
+        const guestStrLen = (addr: number, srcWide: boolean, maxChars: number): number => {
+            let n = 0;
+            if (srcWide) {
+                while (n < maxChars && addr + n * 2 + 2 <= memEnd && view.getUint16(addr + n * 2, true) !== 0) n++;
+            } else {
+                while (n < maxChars && addr + n < memEnd && mem[addr + n] !== 0) n++;
             }
+            return n;
+        };
+
+        // Helper: copy a guest string; same-width stays mem-to-mem (no decode round-trip)
+        const writeGuestStr = (addr: number, srcWide: boolean, len: number): void => {
+            if (srcWide === wide) {
+                // Same width on both sides: a byte copy, UTF-16LE included.
+                const n = Math.min(len * unit, outEnd - out, memEnd - addr);
+                if (n > 0) { scratch.set(mem.subarray(addr, addr + n), out); out += n; }
+                return;
+            }
+            writeStr(srcWide
+                ? Marshaler.readWideString(mem, addr).slice(0, len)
+                : readAnsiFromGuest(mem, addr, len));
         };
 
         // Helper: format a number and write directly
@@ -641,32 +1129,40 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const totalLen = (sign ? 1 : 0) + str.length;
             // Right-align with spaces if needed
             if (width > totalLen) {
-                for (let p = totalLen; p < width; p++) writeByte(0x20);
+                for (let p = totalLen; p < width; p++) writeUnit(0x20);
             }
-            if (sign) writeByte(sign);
+            if (sign) writeUnit(sign);
             writeStr(str);
+        };
+
+        // Helper: write one character argument, converting if its width differs from the output's
+        const writeChar = (raw: number, srcWide: boolean): void => {
+            if (srcWide === wide) { writeUnit(srcWide ? raw & 0xFFFF : raw & 0xFF); return; }
+            writeStr(srcWide
+                ? String.fromCharCode(raw & 0xFFFF)
+                : getCodePageDecoder(getAnsiCodePage()).decode(Uint8Array.of(raw & 0xFF)));
         };
 
         // Parse format string directly from guest memory
         let fi = lpFmt;
         let argIndex = 2;
 
-        while (fi < memEnd) {
-            const ch = mem[fi];
+        while (fi + unit <= memEnd) {
+            const ch = fmtAt(fi);
             if (ch === 0) break;
 
             if (ch !== 0x25 /* '%' */) {
-                writeByte(ch);
-                fi++;
+                writeUnit(ch);
+                fi += unit;
                 continue;
             }
 
-            fi++; // skip '%'
-            if (fi >= memEnd || mem[fi] === 0) break;
+            fi += unit; // skip '%'
+            if (fmtAt(fi) === 0) break;
 
-            if (mem[fi] === 0x25) { // %%
-                writeByte(0x25);
-                fi++;
+            if (fmtAt(fi) === 0x25) { // %%
+                writeUnit(0x25);
+                fi += unit;
                 continue;
             }
 
@@ -674,56 +1170,65 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             let width = 0;
             let precision: number | null = null;
 
-            if (mem[fi] === 0x30) { // '0'
+            if (fmtAt(fi) === 0x30) { // '0'
                 zeroPad = true;
-                fi++;
+                fi += unit;
             }
 
-            while (fi < memEnd && mem[fi] >= 0x30 && mem[fi] <= 0x39) {
-                width = (width * 10) + (mem[fi] - 0x30);
-                fi++;
+            while (fmtAt(fi) >= 0x30 && fmtAt(fi) <= 0x39) {
+                width = (width * 10) + (fmtAt(fi) - 0x30);
+                fi += unit;
             }
 
-            if (fi < memEnd && mem[fi] === 0x2E) { // '.'
-                fi++;
+            if (fmtAt(fi) === 0x2E) { // '.'
+                fi += unit;
                 precision = 0;
-                while (fi < memEnd && mem[fi] >= 0x30 && mem[fi] <= 0x39) {
-                    precision = (precision * 10) + (mem[fi] - 0x30);
-                    fi++;
+                while (fmtAt(fi) >= 0x30 && fmtAt(fi) <= 0x39) {
+                    precision = (precision * 10) + (fmtAt(fi) - 0x30);
+                    fi += unit;
                 }
             }
 
-            // Skip length modifiers
-            if (fi < memEnd && (mem[fi] === 0x68 || mem[fi] === 0x6C)) { // 'h' or 'l'
-                const mod = mem[fi]; fi++;
-                if (fi < memEnd && mem[fi] === mod) fi++; // hh, ll
-            } else if (fi < memEnd && (mem[fi] === 0x4C || mem[fi] === 0x77)) { // 'L' or 'w'
-                fi++;
-            } else if (fi < memEnd && mem[fi] === 0x49) { // 'I'
-                fi++;
-                if (fi < memEnd && (mem[fi] === 0x33 || mem[fi] === 0x36)) { // '3' or '6'
-                    fi++;
-                    if (fi < memEnd && mem[fi] >= 0x30 && mem[fi] <= 0x39) fi++;
+            // Length modifiers: they pick the argument width for %s/%S/%c/%C
+            let modShort = false, modLong = false, modWide = false;
+            const mod = fmtAt(fi);
+            if (mod === 0x68 || mod === 0x6C) { // 'h' or 'l'
+                if (mod === 0x68) modShort = true; else modLong = true;
+                fi += unit;
+                if (fmtAt(fi) === mod) fi += unit; // hh, ll
+            } else if (mod === 0x4C || mod === 0x77) { // 'L' or 'w'
+                if (mod === 0x77) modWide = true;
+                fi += unit;
+            } else if (mod === 0x49) { // 'I'
+                fi += unit;
+                if (fmtAt(fi) === 0x33 || fmtAt(fi) === 0x36) { // '3' or '6'
+                    fi += unit;
+                    if (fmtAt(fi) >= 0x30 && fmtAt(fi) <= 0x39) fi += unit;
                 }
             }
 
-            if (fi >= memEnd || mem[fi] === 0) break;
-            const spec = mem[fi];
-            fi++;
+            const spec = fmtAt(fi);
+            if (spec === 0) break;
+            fi += unit;
 
             switch (spec) {
                 case 0x73: // 's'
+                case 0x53: // 'S' — the opposite width of the function's own
                     if (argIndex < args.length) {
-                        const strAddr = args[argIndex++];
+                        const isBigS = spec === 0x53;
+                        // Argument width per the WPRINTF_ParseFormat{A,W} tables verbatim
+                        // (wine dlls/user32/wsprintf.c) — note %S consults SHORT|WIDE in the
+                        // ANSI function and LONG|WIDE in the wide one, which is not symmetric.
+                        const srcWide = wide
+                            ? (isBigS ? (modLong || modWide) : !(modShort && !modWide))
+                            : (isBigS ? !(modShort || modWide) : (modLong || modWide));
+                        const strAddr = args[argIndex++] >>> 0;
                         if (strAddr) {
-                            // Measure guest string length (for width padding)
-                            let slen = 0;
-                            let maxCopy = precision !== null ? precision : 0x7FFFFFFF;
-                            while (slen < maxCopy && strAddr + slen < memEnd && mem[strAddr + slen] !== 0) slen++;
+                            const slen = guestStrLen(strAddr, srcWide, precision !== null ? precision : 0x7FFFFFFF);
                             if (width > slen) {
-                                for (let p = slen; p < width; p++) writeByte(0x20);
+                                for (let p = slen; p < width; p++) writeUnit(0x20);
                             }
-                            writeGuestStr(strAddr, slen);
+                            writeGuestStr(strAddr, srcWide, slen);
                         }
                     }
                     break;
@@ -749,30 +1254,38 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                     }
                     break;
                 case 0x63: // 'c'
+                case 0x43: // 'C' — the opposite width of the function's own
                     if (argIndex < args.length) {
-                        const charVal = args[argIndex++] & 0xFF;
+                        const isBigC = spec === 0x43;
+                        const srcWide = wide ? (isBigC ? modLong : !modShort) : (isBigC ? !modShort : modLong);
+                        const charVal = args[argIndex++];
                         if (width > 1) {
-                            for (let p = 1; p < width; p++) writeByte(0x20);
+                            for (let p = 1; p < width; p++) writeUnit(0x20);
                         }
-                        writeByte(charVal);
+                        writeChar(charVal, srcWide);
                     }
                     break;
                 case 0x25: // '%'
-                    writeByte(0x25);
+                    writeUnit(0x25);
                     break;
                 default:
-                    writeByte(0x25);
-                    writeByte(spec);
+                    writeUnit(0x25);
+                    writeUnit(spec);
             }
         }
 
-        // Null terminator
-        if (out < memEnd) mem[out] = 0;
-        const charsWritten = out - lpOut;
+        // Null terminator — the scratch buffer reserves the slot for it.
+        if (wide) scratchView.setUint16(out, 0, true); else scratch[out] = 0;
+        Mem.writeBytes(lpOut, scratch.subarray(0, out + unit));
+        const charsWritten = out / unit;
+        const truncated = charsWritten >= WSPRINTF_MAX_UNITS - 1;
 
-        Logger.verbose(LogCategory.USER32, `wsprintfA: ${charsWritten} chars written to 0x${lpOut.toString(16)}`);
-        return charsWritten;
+        Logger.verbose(LogCategory.USER32, `wsprintf${wide ? 'W' : 'A'}: ${charsWritten} chars written to 0x${lpOut.toString(16)}`);
+        return truncated ? WSPRINTF_MAX_UNITS : charsWritten;
     };
+
+    exports['wsprintfA'] = (_ctx, mem, args) => wsprintfCore(mem, args, false);
+    exports['wsprintfW'] = (_ctx, mem, args) => wsprintfCore(mem, args, true);
 
     // wvsprintfA - va_list variant of wsprintfA
     // Hot path: called thousands of times per frame by some games.
@@ -799,101 +1312,39 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     // MapVirtualKeyA - convert virtual key code to scan code or character
     exports['MapVirtualKeyA'] = (ctx, mem, args) => {
-        const uCode = args[0];
-        const uMapType = args[1];
-        
-        Logger.verbose(LogCategory.USER32, `MapVirtualKeyA(uCode=${uCode}, uMapType=${uMapType})`);
-        
-        // uMapType: 0 = virtual key to scan code, 1 = scan code to virtual key,
-        //           2 = virtual key to unshifted character, 3 = scan code to VK (distinguishes L/R)
-        if (uMapType === 0 || uMapType === 3) {
-            // Virtual key to scan code (Set 1 / AT keyboard)
-            // Letters A-Z
-            if (uCode >= 0x41 && uCode <= 0x5A) return uCode - 0x41 + 0x1E;
-            // Digits: '1'-'9' → 0x02-0x0A, '0' → 0x0B
-            if (uCode >= 0x31 && uCode <= 0x39) return uCode - 0x30 + 1;
-            if (uCode === 0x30) return 0x0B;
-            // Common keys
-            const vkToScan: Record<number, number> = {
-                0x08: 0x0E, 0x09: 0x0F, 0x0D: 0x1C, 0x10: 0x2A, 0x11: 0x1D,
-                0x12: 0x38, 0x13: 0x45, 0x14: 0x3A, 0x1B: 0x01, 0x20: 0x39,
-                // Navigation
-                0x21: 0x49, 0x22: 0x51, 0x23: 0x4F, 0x24: 0x47,
-                // Arrows
-                0x25: 0x4B, 0x26: 0x48, 0x27: 0x4D, 0x28: 0x50,
-                0x2C: 0x37, 0x2D: 0x52, 0x2E: 0x53,
-                // Numpad
-                0x60: 0x52, 0x61: 0x4F, 0x62: 0x50, 0x63: 0x51,
-                0x64: 0x4B, 0x65: 0x4C, 0x66: 0x4D, 0x67: 0x48,
-                0x68: 0x49, 0x69: 0x49,
-                0x6A: 0x37, 0x6B: 0x4E, 0x6D: 0x4A, 0x6E: 0x53, 0x6F: 0x35,
-                // F-keys
-                0x70: 0x3B, 0x71: 0x3C, 0x72: 0x3D, 0x73: 0x3E,
-                0x74: 0x3F, 0x75: 0x40, 0x76: 0x41, 0x77: 0x42,
-                0x78: 0x43, 0x79: 0x44, 0x7A: 0x57, 0x7B: 0x58,
-                0x90: 0x45, 0x91: 0x46,
-                // OEM keys (US layout)
-                0xBA: 0x27, 0xBB: 0x0D, 0xBC: 0x33, 0xBD: 0x0C,
-                0xBE: 0x34, 0xBF: 0x35, 0xC0: 0x29,
-                0xDB: 0x1A, 0xDC: 0x2B, 0xDD: 0x1B, 0xDE: 0x28,
-            };
-            return vkToScan[uCode] ?? 0;
-        } else if (uMapType === 1) {
-            // Scan code to virtual key
-            const scanToVk: Record<number, number> = {
-                0x01: 0x1B, 0x02: 0x31, 0x03: 0x32, 0x04: 0x33, 0x05: 0x34,
-                0x06: 0x35, 0x07: 0x36, 0x08: 0x37, 0x09: 0x38, 0x0A: 0x39,
-                0x0B: 0x30, 0x0C: 0xBD, 0x0D: 0xBB, 0x0E: 0x08, 0x0F: 0x09,
-                // Q-P row
-                0x10: 0x51, 0x11: 0x57, 0x12: 0x45, 0x13: 0x52, 0x14: 0x54,
-                0x15: 0x59, 0x16: 0x55, 0x17: 0x49, 0x18: 0x4F, 0x19: 0x50,
-                0x1A: 0xDB, 0x1B: 0xDD, 0x1C: 0x0D,
-                0x1D: 0x11, // Ctrl
-                // A-L row
-                0x1E: 0x41, 0x1F: 0x53, 0x20: 0x44, 0x21: 0x46, 0x22: 0x47,
-                0x23: 0x48, 0x24: 0x4A, 0x25: 0x4B, 0x26: 0x4C,
-                0x27: 0xBA, 0x28: 0xDE, 0x29: 0xC0,
-                0x2A: 0x10, // LShift
-                0x2B: 0xDC,
-                // Z-M row
-                0x2C: 0x5A, 0x2D: 0x58, 0x2E: 0x43, 0x2F: 0x56, 0x30: 0x42,
-                0x31: 0x4E, 0x32: 0x4D, 0x33: 0xBC, 0x34: 0xBE, 0x35: 0xBF,
-                0x36: 0x10, // RShift → VK_SHIFT
-                0x37: 0x6A, // Numpad *
-                0x38: 0x12, // Alt
-                0x39: 0x20, // Space
-                0x3A: 0x14, // CapsLock
-                // F-keys
-                0x3B: 0x70, 0x3C: 0x71, 0x3D: 0x72, 0x3E: 0x73,
-                0x3F: 0x74, 0x40: 0x75, 0x41: 0x76, 0x42: 0x77,
-                0x43: 0x78, 0x44: 0x79, 0x57: 0x7A, 0x58: 0x7B,
-                0x45: 0x90, 0x46: 0x91,
-                // Numpad / navigation
-                0x47: 0x24, 0x48: 0x26, 0x49: 0x21, 0x4A: 0x6D,
-                0x4B: 0x25, 0x4C: 0x0C, 0x4D: 0x27, 0x4E: 0x6B,
-                0x4F: 0x23, 0x50: 0x28, 0x51: 0x22, 0x52: 0x2D, 0x53: 0x2E,
-            };
-            return scanToVk[uCode] ?? 0;
-        } else if (uMapType === 2) {
-            // Virtual key to unshifted character
-            if (uCode >= 0x30 && uCode <= 0x39) return uCode; // 0-9
-            if (uCode >= 0x41 && uCode <= 0x5A) return uCode + 32; // a-z (lowercase)
-            if (uCode === 0x20) return 0x20; // Space
-            const oemChar: Record<number, number> = {
-                0xBA: 0x3B, 0xBB: 0x3D, 0xBC: 0x2C, 0xBD: 0x2D,
-                0xBE: 0x2E, 0xBF: 0x2F, 0xC0: 0x60,
-                0xDB: 0x5B, 0xDC: 0x5C, 0xDD: 0x5D, 0xDE: 0x27,
-            };
-            return oemChar[uCode] ?? 0;
-        }
+        const uCode = args[0] >>> 0;
+        const uMapType = args[1] >>> 0;
 
-        return 0;
+        Logger.verbose(LogCategory.USER32, `MapVirtualKeyA(uCode=${uCode}, uMapType=${uMapType})`);
+
+        switch (uMapType) {
+            case MAPVK_VK_TO_VSC:
+                return vkToScanEntry(uCode).scan;
+            case MAPVK_VK_TO_VSC_EX: {
+                const { scan, ext } = vkToScanEntry(uCode);
+                return ext ? (0xe000 | scan) : scan;
+            }
+            case MAPVK_VSC_TO_VK:
+                return sidelessVk(scanCodeToVk(uCode));
+            case MAPVK_VSC_TO_VK_EX:
+                return scanCodeToVk(uCode);
+            case MAPVK_VK_TO_CHAR:
+                return vkToChar(uCode);
+            default:
+                return 0;
+        }
     };
 
     // MapVirtualKeyW has the same ABI/behavior as MapVirtualKeyA for VK/scan translation.
     exports['MapVirtualKeyW'] = (ctx, mem, args) => {
         return exports['MapVirtualKeyA']!(ctx, mem, args) as number;
     };
+
+    // The *Ex forms take the layout explicitly; we model one layout, so the mapping is
+    // the same one. The extra HKL argument only changes the arity, and getting THAT wrong
+    // is a corrupted guest stack rather than a wrong key code.
+    exports['MapVirtualKeyExA'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
+    exports['MapVirtualKeyExW'] = (ctx, mem, args) => exports['MapVirtualKeyA']!(ctx, mem, args) as number;
 
     // int ToAscii(UINT uVirtKey, UINT uScanCode, const BYTE *lpKeyState, LPWORD lpChar, UINT uFlags)
     exports['ToAscii'] = (ctx, mem, args) => {
@@ -953,6 +1404,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 1; // one character produced
     };
 
+    // The *Ex forms differ only in taking the layout explicitly instead of the calling
+    // thread's. We model one layout, so the translation itself is the same one.
+    exports['ToAsciiEx'] = (ctx, mem, args) => exports['ToAscii']!(ctx, mem, args) as number;
+
     // ToUnicode is semantically similar to ToAscii for basic Latin keyboard paths.
     // Reuse ToAscii conversion and write one UTF-16 code unit at pwszBuff.
     exports['ToUnicode'] = (ctx, mem, args) => {
@@ -971,17 +1426,21 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         ]) as number;
     };
 
-    // int GetKeyNameTextA(LONG lParam, LPSTR lpString, int cchSize)
-    exports['GetKeyNameTextA'] = (ctx, mem, args) => {
-        const lParam = args[0];
-        const lpString = args[1] >>> 0;
-        const cchSize = args[2];
+    exports['ToUnicodeEx'] = (ctx, mem, args) => exports['ToUnicode']!(ctx, mem, args) as number;
 
-        if (!lpString || cchSize <= 0) return 0;
-
-        // Extract scan code from bits 16-23, extended flag from bit 24
+    // Decode a WM_KEYDOWN-style lParam into a Set 1 / US-layout key name.
+    // Bit 24 = extended, bit 25 = "don't care about left vs. right" (nt5 xlate.c _GetKeyNameText):
+    // right Shift folds onto left Shift, and the extended bit is dropped for Ctrl/Alt only —
+    // Win95 compatibility keeps it for the other extended keys (cursor pad, numpad Enter).
+    const resolveKeyName = (lParam: number): { name: string; scanCode: number; extended: number } => {
         let scanCode = (lParam >> 16) & 0xFF;
         let extended = (lParam >> 24) & 0x01;
+
+        if (lParam & 0x02000000) {
+            if (scanCode === 0x36) scanCode = 0x2A;
+            if (extended && (scanCode === 0x1D || scanCode === 0x38)) extended = 0;
+        }
+
         // DirectInput games (Max Payne et al.) pass DIK_* scan codes where the
         // extended keys are folded as 0x80|base (DIK_UP=0xC8, DIK_RCONTROL=0x9D…).
         // Recover the base make code + extended flag so the table below names them.
@@ -1019,16 +1478,39 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             0x57: 'F11', 0x58: 'F12',
         };
 
-        const name = keyNames[scanCode] ?? `Scan ${scanCode}`;
-        const maxLen = Math.min(name.length, cchSize - 1);
-        for (let i = 0; i < maxLen; i++) {
-            mem[lpString + i] = name.charCodeAt(i);
-        }
-        mem[lpString + maxLen] = 0;
-
-        Logger.verbose(LogCategory.USER32, `GetKeyNameTextA(scan=0x${scanCode.toString(16)}, ext=${extended}) -> "${name}"`);
-        return maxLen;
+        return { name: keyNames[scanCode] ?? `Scan ${scanCode}`, scanCode, extended };
     };
+
+    // int GetKeyNameTextA(LONG lParam, LPSTR lpString, int cchSize)
+    // int GetKeyNameTextW(LONG lParam, LPWSTR lpString, int cchSize)
+    // cchSize is the buffer size INCLUDING the terminator; the name is truncated to cchSize-1 and
+    // the return value is the character count written, excluding the terminator.
+    const getKeyNameText = (mem: Uint8Array, args: number[], wide: boolean): number => {
+        const lParam = args[0];
+        const lpString = args[1] >>> 0;
+        const cchSize = args[2] | 0;
+
+        if (!lpString) return 0;
+
+        // cchSize < 1 makes the kernel bail without touching the buffer, but the ANSI client
+        // wrapper terminates its output unconditionally afterwards (nt5 client/ntcftxt.h), so A
+        // still stores a NUL where W leaves the caller's buffer alone.
+        if (cchSize <= 0) {
+            if (!wide) Marshaler.writeString(mem, lpString, '', 1);
+            return 0;
+        }
+
+        const { name, scanCode, extended } = resolveKeyName(lParam);
+        const text = name.slice(0, cchSize - 1);
+        if (wide) Marshaler.writeWideString(mem, lpString, text, cchSize);
+        else Marshaler.writeString(mem, lpString, text, cchSize);
+
+        Logger.verbose(LogCategory.USER32, `GetKeyNameText${wide ? 'W' : 'A'}(scan=0x${scanCode.toString(16)}, ext=${extended}) -> "${text}"`);
+        return text.length;
+    };
+
+    exports['GetKeyNameTextA'] = (_ctx, mem, args) => getKeyNameText(mem, args, false);
+    exports['GetKeyNameTextW'] = (_ctx, mem, args) => getKeyNameText(mem, args, true);
 
     const loadImageCommon = async (
         ctx: any,
@@ -1038,7 +1520,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     ): Promise<number> => {
         const [hInst, name, type, cx, cy, fuLoad] = args;
         const apiName = isWide ? "LoadImageW" : "LoadImageA";
-        
+
         // IMAGE_BITMAP = 0, IMAGE_ICON = 1, IMAGE_CURSOR = 2
         const IMAGE_BITMAP = 0;
         const IMAGE_ICON = 1;
@@ -1167,6 +1649,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
                     resourceData.palette = header.palette;
                     Logger.verbose(LogCategory.USER32, `${apiName} BMP: Saved ${header.palette.length}-color palette for 8-bit BMP`);
                 }
+                // Preserve the raw DIB rows so GetObject can expose a real DIBSECTION
+                // (the file's own biBitCount, bmBits→its own rows). Sprite loaders that
+                // pass LR_CREATEDIBSECTION read that, not the 32bpp `pixels` above, which
+                // is the GPU-upload form. Depth-independent: a 24bpp caller reads
+                // biBitCount/biClrUsed to decide how to build its palette.
+                resourceData.bitCount = header.bitsPerPixel;
+                resourceData.dibStride = header.rowSize;
+                resourceData.dibTopDown = header.isTopDown;
+                resourceData.dibBits = data.slice(header.offset, header.offset + header.rowSize * header.height);
                 resourceData.loading = false;
                 Logger.verbose(LogCategory.USER32, `${apiName} BMP: Successfully loaded "${normalizedFilename}" ${header.width}x${header.height} -> handle=0x${handle.toString(16)}`);
 
@@ -1193,34 +1684,313 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return handle;
     };
 
+    // LR_SHARED icons and cursors outlive DestroyIcon/DestroyCursor (they die with the process).
+    const LR_SHARED = 0x8000;
+    const markSharedImage = (handle: number, fuLoad: number): number => {
+        if (handle && (fuLoad & LR_SHARED) !== 0) {
+            const obj = System.getInstance().resourceProvider.getUserObject(handle);
+            if (obj && (obj.type === 'ICON' || obj.type === 'CURSOR')) obj.shared = true;
+        }
+        return handle;
+    };
+
     // LoadImageA - load image, cursor, or icon
-    exports["LoadImageA"] = async (ctx, mem, args) => loadImageCommon(ctx, mem, args, false);
+    exports["LoadImageA"] = async (ctx, mem, args) => markSharedImage(await loadImageCommon(ctx, mem, args, false), args[5] >>> 0);
 
     // LoadImageW - load image, cursor, or icon (wide)
-    exports["LoadImageW"] = async (ctx, mem, args) => loadImageCommon(ctx, mem, args, true);
+    exports["LoadImageW"] = async (ctx, mem, args) => markSharedImage(await loadImageCommon(ctx, mem, args, true), args[5] >>> 0);
 
     // SetCursor - set cursor shape
     exports['SetCursor'] = (ctx, mem, args) => {
-        const hCursor = args[0];
-
-        Logger.verbose(LogCategory.USER32, `SetCursor(0x${hCursor.toString(16)})`);
-
-        // For now, just return the cursor handle
-        // In a full implementation, we would change the actual cursor shape
-        return hCursor;
+        const hCursor = args[0] >>> 0;
+        // SetCursor(NULL) hides the pointer (SDL2 hides its cursor this way, never
+        // calling ShowCursor). A non-NULL cursor is DRAWN by the system on real
+        // Windows — custom images are forwarded to the host for rendering.
+        const prev = installCursorAndUpdateHostVisibility(hCursor);
+        Logger.verbose(LogCategory.USER32, `SetCursor(0x${hCursor.toString(16)}) -> prev=0x${prev.toString(16)}`);
+        return prev;
     };
 
-    // SystemParametersInfo - retrieves or sets system-wide parameters
-    exports['SystemParametersInfoA'] = (ctx, mem, args) => {
-        const uiAction = args[0];
-        const uiParam = args[1];
-        const pvParam = args[2];
-        const fWinIni = args[3];
-        Logger.verbose(LogCategory.USER32, `SystemParametersInfoA(action=0x${uiAction.toString(16)}, param=${uiParam}, pvParam=0x${pvParam.toString(16)}, fWinIni=0x${fWinIni.toString(16)})`);
-        // Return TRUE for most queries to indicate success
-        return 1;
+    // ==================== SystemParametersInfo ====================
+
+    // The scalar settings, with Windows' own defaults. A GET reads from here and a SET
+    // writes to it, so a caller that sets a value and reads it back sees its own value —
+    // the property games actually depend on (mouse speed, wheel lines, drag thresholds).
+    const spiSettings = new Map<number, number>([
+        [SPI_GETBEEP, 1],
+        [SPI_GETBORDER, 1],
+        [SPI_GETKEYBOARDSPEED, 31],
+        [SPI_GETKEYBOARDDELAY, 1],
+        [SPI_GETSCREENSAVETIMEOUT, 600],
+        [SPI_GETSCREENSAVEACTIVE, 0],
+        [SPI_GETGRIDGRANULARITY, 0],
+        [SPI_GETICONTITLEWRAP, 1],
+        [SPI_GETMENUDROPALIGNMENT, 0],
+        [SPI_GETFASTTASKSWITCH, 1],
+        [SPI_GETDRAGFULLWINDOWS, 1],
+        [SPI_GETSHOWSOUNDS, 0],
+        [SPI_GETKEYBOARDPREF, 0],
+        [SPI_GETSCREENREADER, 0],
+        [SPI_GETFONTSMOOTHING, 0],
+        [SPI_GETLOWPOWERTIMEOUT, 0],
+        [SPI_GETPOWEROFFTIMEOUT, 0],
+        [SPI_GETLOWPOWERACTIVE, 0],
+        [SPI_GETPOWEROFFACTIVE, 0],
+        [SPI_GETMOUSEHOVERWIDTH, 4],
+        [SPI_GETMOUSEHOVERHEIGHT, 4],
+        [SPI_GETMOUSEHOVERTIME, 400],
+        // A wheel notch is WHEEL_DELTA (120) and this is the divisor a scroller applies to
+        // it. Leaving it unwritten is the "NaN out of granularity" shape: the caller keeps
+        // whatever its stack held and scrolls by a garbage amount, or divides by zero.
+        [SPI_GETWHEELSCROLLLINES, 3],
+        [SPI_GETWHEELSCROLLCHARS, 3],
+        [SPI_GETMENUSHOWDELAY, 400],
+        [SPI_GETMOUSESPEED, 10],
+        [SPI_GETSCREENSAVERRUNNING, 0],
+        [SPI_GETFOREGROUNDLOCKTIMEOUT, 0],
+        [SPI_GETFOREGROUNDFLASHCOUNT, 3],
+        [SPI_GETDRAGWIDTH_X, 4],
+        [SPI_GETDRAGHEIGHT_Y, 4],
+        [SPI_GETCARETWIDTH, 1],
+        [SPI_GETMOUSETRAILS, 0],
+    ]);
+    // Classic desktop: every visual effect is off, and off is the truth — we animate
+    // nothing, fade nothing and draw no drop shadows.
+    for (const action of SPI_UI_EFFECT_GETS) spiSettings.set(action, 0);
+
+    /** GET action → the SET action that writes the same slot. */
+    const spiSetToGet = new Map<number, number>([
+        [SPI_SETBEEP, SPI_GETBEEP],
+        [SPI_SETBORDER, SPI_GETBORDER],
+        [SPI_SETKEYBOARDSPEED, SPI_GETKEYBOARDSPEED],
+        [SPI_SETKEYBOARDDELAY, SPI_GETKEYBOARDDELAY],
+        [SPI_SETSCREENSAVETIMEOUT, SPI_GETSCREENSAVETIMEOUT],
+        [SPI_SETSCREENSAVEACTIVE, SPI_GETSCREENSAVEACTIVE],
+        [SPI_SETGRIDGRANULARITY, SPI_GETGRIDGRANULARITY],
+        [SPI_SETICONTITLEWRAP, SPI_GETICONTITLEWRAP],
+        [SPI_SETMENUDROPALIGNMENT, SPI_GETMENUDROPALIGNMENT],
+        [SPI_SETFASTTASKSWITCH, SPI_GETFASTTASKSWITCH],
+        [SPI_SETDRAGFULLWINDOWS, SPI_GETDRAGFULLWINDOWS],
+        [SPI_SETSHOWSOUNDS, SPI_GETSHOWSOUNDS],
+        [SPI_SETFONTSMOOTHING, SPI_GETFONTSMOOTHING],
+        [SPI_SETMOUSEHOVERWIDTH, SPI_GETMOUSEHOVERWIDTH],
+        [SPI_SETMOUSEHOVERHEIGHT, SPI_GETMOUSEHOVERHEIGHT],
+        [SPI_SETMOUSEHOVERTIME, SPI_GETMOUSEHOVERTIME],
+        [SPI_SETWHEELSCROLLLINES, SPI_GETWHEELSCROLLLINES],
+        [SPI_SETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLCHARS],
+        [SPI_SETMENUSHOWDELAY, SPI_GETMENUSHOWDELAY],
+        [SPI_SETMOUSESPEED, SPI_GETMOUSESPEED],
+        [SPI_SETDRAGWIDTH, SPI_GETDRAGWIDTH_X],
+        [SPI_SETDRAGHEIGHT, SPI_GETDRAGHEIGHT_Y],
+        [SPI_SETFOREGROUNDLOCKTIMEOUT, SPI_GETFOREGROUNDLOCKTIMEOUT],
+        [SPI_SETFOREGROUNDFLASHCOUNT, SPI_GETFOREGROUNDFLASHCOUNT],
+        [SPI_SETCARETWIDTH, SPI_GETCARETWIDTH],
+        [SPI_SETMOUSETRAILS, SPI_GETMOUSETRAILS],
+        [SPI_SETLOWPOWERTIMEOUT, SPI_GETLOWPOWERTIMEOUT],
+        [SPI_SETPOWEROFFTIMEOUT, SPI_GETPOWEROFFTIMEOUT],
+        [SPI_SETLOWPOWERACTIVE, SPI_GETLOWPOWERACTIVE],
+        [SPI_SETPOWEROFFACTIVE, SPI_GETPOWEROFFACTIVE],
+    ]);
+    for (const [set, get] of SPI_UI_EFFECT_SET_TO_GET) spiSetToGet.set(set, get);
+
+    /** SPI_SETMOUSE's three-int accel curve, and what SPI_GETMOUSE reads back. */
+    const mouseAccel = [6, 10, 1];
+
+    const systemParametersInfo = (wide: boolean): ThunkImplementation => (ctx, mem, args) => {
+        const uiAction = args[0] >>> 0;
+        const uiParam = args[1] >>> 0;
+        const pvParam = args[2] >>> 0;
+        const api = wide ? 'SystemParametersInfoW' : 'SystemParametersInfoA';
+        const v = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const canWrite = (bytes: number) =>
+            pvParam !== 0 && isValidAddress(mem, pvParam, bytes, 'rw');
+        const putDword = (value: number): number => {
+            if (!canWrite(4)) return 0;
+            v.setUint32(pvParam, value >>> 0, true);
+            return 1;
+        };
+        const logFontSize = wide ? 92 : 60;
+
+        // A scalar GET: pvParam is a DWORD out-param. Never report success without
+        // writing it — the caller cannot tell an unwritten buffer from an answer.
+        if (spiSettings.has(uiAction)) {
+            return putDword(spiSettings.get(uiAction)!);
+        }
+        const getSlot = spiSetToGet.get(uiAction);
+        if (getSlot !== undefined) {
+            // Windows takes the new value from uiParam for most SETs, and from pvParam for
+            // the ones whose value does not fit a UINT range check (the wheel/hover family).
+            const fromPv = SPI_SET_VALUE_IN_PVPARAM.has(uiAction);
+            spiSettings.set(getSlot, fromPv ? pvParam : uiParam);
+            return 1;
+        }
+
+        switch (uiAction) {
+            // --- pointer / input -------------------------------------------------
+            case SPI_GETMOUSE:
+                if (!canWrite(12)) return 0;
+                for (let i = 0; i < 3; i++) v.setInt32(pvParam + i * 4, mouseAccel[i]!, true);
+                return 1;
+            case SPI_SETMOUSE:
+                if (!canWrite(12)) return 0;
+                for (let i = 0; i < 3; i++) mouseAccel[i] = v.getInt32(pvParam + i * 4, true);
+                return 1;
+            case SPI_SETDOUBLECLICKTIME:
+                setDoubleClickTimeMs(uiParam);
+                return 1;
+            case SPI_SETMOUSEBUTTONSWAP:
+                mouseButtonsSwapped = uiParam !== 0;
+                return 1;
+            case SPI_SETDOUBLECLKWIDTH:
+            case SPI_SETDOUBLECLKHEIGHT:
+                return 1;
+
+            // --- desktop geometry -------------------------------------------------
+            case SPI_GETWORKAREA: {
+                // No taskbar is modelled, so the work area IS the virtual screen. A caller
+                // left with an unwritten RECT sizes and positions its window from stack
+                // garbage — off-screen, or a few million pixels wide.
+                if (!canWrite(16)) return 0;
+                const r = getVirtualScreenRect();
+                v.setInt32(pvParam, r.left, true);
+                v.setInt32(pvParam + 4, r.top, true);
+                v.setInt32(pvParam + 8, r.right, true);
+                v.setInt32(pvParam + 12, r.bottom, true);
+                return 1;
+            }
+            case SPI_SETWORKAREA:
+                // The work area is ours to publish, not the app's to shrink.
+                return 1;
+            case SPI_ICONHORIZONTALSPACING:
+            case SPI_ICONVERTICALSPACING:
+                // Dual-purpose: pvParam non-NULL is the GET, otherwise uiParam is the SET.
+                return pvParam ? putDword(75) : 1;
+
+            // --- metric structs ---------------------------------------------------
+            case SPI_GETNONCLIENTMETRICS: {
+                const size = wide ? 500 : 340;
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                // XP appended iPaddedBorderWidth; both sizes are legal, nothing else is.
+                if (cb !== size && cb !== size + 4) return 0;
+                if (!canWrite(cb)) return 0;
+                let o = 4;
+                const putInt = (value: number) => { v.setInt32(pvParam + o, value, true); o += 4; };
+                const putFont = (height: number, weight: number) => {
+                    writeLogFont(mem, pvParam + o, wide, height, weight, CLASSIC_UI_FACE);
+                    o += logFontSize;
+                };
+                putInt(1);   // iBorderWidth  (SM_CXBORDER)
+                putInt(16);  // iScrollWidth  (SM_CXVSCROLL)
+                putInt(16);  // iScrollHeight (SM_CYHSCROLL)
+                putInt(18);  // iCaptionWidth (SM_CXSIZE)
+                putInt(18);  // iCaptionHeight — SM_CYCAPTION is this + 1
+                putFont(-11, 700);  // lfCaptionFont (bold 8pt)
+                putInt(12);  // iSmCaptionWidth  (SM_CXSMSIZE)
+                putInt(14);  // iSmCaptionHeight (SM_CYSMSIZE)
+                putFont(-11, 700);  // lfSmCaptionFont
+                putInt(18);  // iMenuWidth  (SM_CXMENUSIZE)
+                putInt(18);  // iMenuHeight — SM_CYMENU is this + 1
+                putFont(-11, 400);  // lfMenuFont
+                putFont(-11, 400);  // lfStatusFont
+                putFont(-11, 400);  // lfMessageFont
+                if (cb === size + 4) v.setInt32(pvParam + o, 0, true); // iPaddedBorderWidth
+                return 1;
+            }
+            case SPI_GETICONMETRICS: {
+                const size = wide ? 108 : 76;
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== size || !canWrite(size)) return 0;
+                v.setInt32(pvParam + 4, 75, true);   // iHorzSpacing (SM_CXICONSPACING)
+                v.setInt32(pvParam + 8, 75, true);   // iVertSpacing
+                v.setInt32(pvParam + 12, 1, true);   // iTitleWrap
+                writeLogFont(mem, pvParam + 16, wide, -11, 400, CLASSIC_UI_FACE);
+                return 1;
+            }
+            case SPI_GETMINIMIZEDMETRICS: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== 20 || !canWrite(20)) return 0;
+                v.setInt32(pvParam + 4, 154, true);  // iWidth  (SM_CXMINIMIZED is this + 6)
+                v.setInt32(pvParam + 8, 0, true);    // iHorzGap
+                v.setInt32(pvParam + 12, 0, true);   // iVertGap
+                v.setInt32(pvParam + 16, 8, true);   // iArrange = ARW_HIDE (SM_ARRANGE)
+                return 1;
+            }
+            case SPI_GETICONTITLELOGFONT:
+                if (uiParam < logFontSize || !canWrite(logFontSize)) return 0;
+                writeLogFont(mem, pvParam, wide, -11, 400, CLASSIC_UI_FACE);
+                return 1;
+            case SPI_GETANIMATION: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== 8 || !canWrite(8)) return 0;
+                v.setInt32(pvParam + 4, 0, true);    // iMinAnimate — no minimize animation
+                return 1;
+            }
+            case SPI_GETHIGHCONTRAST: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb !== 12 || !canWrite(12)) return 0;
+                v.setUint32(pvParam + 4, 0x00000002, true); // HCF_AVAILABLE, not HCF_HIGHCONTRASTON
+                v.setUint32(pvParam + 8, 0, true);          // lpszDefaultScheme
+                return 1;
+            }
+            // Accessibility feature blocks. Every one of them is off here, and "off" is a
+            // real answer: zeroing the struct past cbSize says exactly that.
+            case SPI_GETFILTERKEYS:
+            case SPI_GETSTICKYKEYS:
+            case SPI_GETTOGGLEKEYS:
+            case SPI_GETMOUSEKEYS:
+            case SPI_GETACCESSTIMEOUT:
+            case SPI_GETSOUNDSENTRY: {
+                const cb = pvParam && isValidAddress(mem, pvParam, 4, 'rw') ? v.getUint32(pvParam, true) : 0;
+                if (cb < 8 || cb > 256 || !canWrite(cb)) return 0;
+                for (let i = 4; i < cb; i++) mem[pvParam + i] = 0;
+                return 1;
+            }
+
+            case SPI_GETDEFAULTINPUTLANG: {
+                // The one HKL GetKeyboardLayout hands out — two answers about the same
+                // layout must not disagree.
+                const langId = EmulatorConfig.getInstance().lcid & 0xffff;
+                return putDword((langId << 16) | langId);
+            }
+
+            // --- strings ---------------------------------------------------------
+            case SPI_GETDESKWALLPAPER: {
+                // There is no wallpaper; the empty string is what Windows returns then.
+                const bytes = wide ? 2 : 1;
+                if (uiParam < 1 || !canWrite(bytes)) return 0;
+                if (wide) v.setUint16(pvParam, 0, true); else mem[pvParam] = 0;
+                return 1;
+            }
+
+            // --- accepted no-ops --------------------------------------------------
+            // Settings that describe a desktop we do not draw. Accepting them is faithful
+            // (the value is stored by the shell, not observed by the app) and refusing
+            // would fail an installer's cosmetic pass for no reason.
+            case SPI_SETDESKWALLPAPER:
+            case SPI_SETDESKPATTERN:
+            case SPI_SETCURSORS:
+            case SPI_SETICONS:
+            case SPI_SETICONTITLELOGFONT:
+            case SPI_SETNONCLIENTMETRICS:
+            case SPI_SETICONMETRICS:
+            case SPI_SETMINIMIZEDMETRICS:
+            case SPI_SETANIMATION:
+            case SPI_SETDEFAULTINPUTLANG:
+            case SPI_SETLANGTOGGLE:
+            case SPI_SETSCREENSAVERRUNNING:
+                return 1;
+
+            default:
+                // Everything else: we do not know the parameter, so we cannot answer it.
+                // TRUE with an untouched pvParam is the one answer the caller cannot
+                // detect — it would read its own stack as the setting.
+                Logger.warn(LogCategory.USER32,
+                    `${api}: unimplemented action 0x${uiAction.toString(16)} -> FALSE (pvParam untouched)`);
+                return 0;
+        }
     };
-    exports['SystemParametersInfoW'] = exports['SystemParametersInfoA'];
+    exports['SystemParametersInfoA'] = systemParametersInfo(false);
+    exports['SystemParametersInfoW'] = systemParametersInfo(true);
 
     // ==================== Rect Functions ====================
 
@@ -1487,7 +2257,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         mem[lpBuffer + writeLen] = 0;
 
         Logger.log(LogCategory.USER32, `LoadStringA(hInst=0x${hInstance.toString(16)}, uID=${uID}) -> ${writeLen} "${versionString.slice(0, 40)}"`);
-        noteLoadStringForDialog(versionString);
         return { value: writeLen, stackCleanup: 16 };
     };
 
@@ -1560,10 +2329,12 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             return 0;
         }
 
-        clipboardDataByFormat.set(uFormat, hMem);
+        setClipboardFormatData(uFormat, hMem);
         System.getInstance().scheduler.setLastError(0);
         return hMem;
     };
+
+    exports['GetClipboardSequenceNumber'] = () => getClipboardSequenceNumber();
 
     exports['GetClipboardData'] = (ctx, mem, args) => {
         const uFormat = args[0] >>> 0;
@@ -1636,15 +2407,16 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
     exports['GetSysColor'] = (ctx, mem, args) => {
         const nIndex = args[0];
-        const color = sysColors.get(nIndex) ?? 0xFFFFFF; // default white
+        const color = getSystemColorRef(nIndex);
         Logger.verbose(LogCategory.USER32, `GetSysColor(${nIndex}) -> 0x${color.toString(16)}`);
         return color;
     };
 
     exports['GetSysColorBrush'] = (ctx, mem, args) => {
         const nIndex = args[0];
-        Logger.verbose(LogCategory.USER32, `GetSysColorBrush(${nIndex})`);
-        return 0x1000 + nIndex; // Return a dummy brush handle
+        const brush = getSystemColorBrush(nIndex);
+        Logger.verbose(LogCategory.USER32, `GetSysColorBrush(${nIndex}) -> 0x${brush.toString(16)}`);
+        return brush;
     };
 
     // BOOL SetSysColors(int cElements, const INT *lpaElements, const COLORREF *lpaRgbValues)
@@ -1668,6 +2440,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const index = view.getInt32(lpaElements  + i * 4, true);
             const color = view.getUint32(lpaRgbValues + i * 4, true) & 0x00FFFFFF;
             sysColors.set(index, color);
+            // Next GetSysColorBrush re-creates it at the new color.
+            sysColorBrushes.delete(index);
             Logger.verbose(LogCategory.USER32,
                 `SetSysColors: index=${index} color=0x${color.toString(16).padStart(6, '0')}`);
         }
@@ -1716,6 +2490,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         dmDriverVersion: 34,
         dmSize: 36,
         dmFields: 40,
+        dmPosition: 44,
         dmBitsPerPel: 104,
         dmPelsWidth: 108,
         dmPelsHeight: 112,
@@ -1728,6 +2503,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         dmDriverVersion: 66,
         dmSize: 68,
         dmFields: 72,
+        dmPosition: 76,
         dmBitsPerPel: 168,
         dmPelsWidth: 172,
         dmPelsHeight: 176,
@@ -1736,6 +2512,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         minSize: 188,
     };
     type DevModeOffsets = typeof DEVMODEA_OFFSETS;
+    const DM_POSITION   = 0x00000020;
     const DM_BITSPERPEL = 0x00040000;
     const DM_PELSWIDTH  = 0x00080000;
     const DM_PELSHEIGHT = 0x00100000;
@@ -1752,7 +2529,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return (
             Mem.writeUint16(lpDevMode + offsets.dmSpecVersion, 0x0401) &&
             Mem.writeUint16(lpDevMode + offsets.dmDriverVersion, 0x0401) &&
-            Mem.writeUint32(lpDevMode + offsets.dmFields, DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY) &&
+            Mem.writeUint32(lpDevMode + offsets.dmFields,
+                DM_POSITION | DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY) &&
+            // The display's origin in the virtual desktop. Windows always fills it, and a
+            // caller that reads it out of an uninitialized DEVMODE gets stack garbage:
+            // SDL2 resolves SDL_WINDOWPOS_CENTERED from exactly this field, so leaving it
+            // put every SDL window at a nonsense origin — and mouse messages, whose lParam
+            // is screen-minus-window, then carried a clamped client point instead of one.
+            Mem.writeUint32(lpDevMode + offsets.dmPosition, 0) &&
+            Mem.writeUint32(lpDevMode + offsets.dmPosition + 4, 0) &&
             Mem.writeUint32(lpDevMode + offsets.dmBitsPerPel, mode.bpp >>> 0) &&
             Mem.writeUint32(lpDevMode + offsets.dmPelsWidth, mode.width >>> 0) &&
             Mem.writeUint32(lpDevMode + offsets.dmPelsHeight, mode.height >>> 0) &&
@@ -1761,35 +2546,6 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         );
     };
 
-    const getDisplayModes = (): DisplayMode[] => {
-        const configuredModes = EmulatorConfig.getInstance().supportedResolutions;
-        if (!configuredModes || configuredModes.length === 0) {
-            return [
-                { width: 640, height: 480, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 640, height: 480, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 800, height: 600, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 800, height: 600, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1024, height: 768, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1024, height: 768, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1152, height: 864, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1152, height: 864, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 960, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 960, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 1024, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 1024, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1600, height: 1200, bpp: 16, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1600, height: 1200, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1280, height: 720, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-                { width: 1920, height: 1080, bpp: 32, refreshRate: DEFAULT_DISPLAY_REFRESH_RATE },
-            ];
-        }
-        return configuredModes.map((mode) => ({
-            width: mode.width,
-            height: mode.height,
-            bpp: mode.bpp,
-            refreshRate: normalizeRefreshRate(mode.refreshRate),
-        }));
-    };
 
     const enumDisplaySettings = (mem: Uint8Array, args: number[], offsets: DevModeOffsets, apiName: string): number => {
         const lpszDeviceName = args[0];
@@ -1872,7 +2628,10 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const w = ddraw?.display.width ?? width;
             const h = ddraw?.display.height ?? height;
             const b = ddraw?.display.bpp ?? bpp;
-            system.requestHostResize(w, h);
+            // ChangeDisplaySettings is a mode-set by definition, restore included.
+            system.requestHostResize(w, h, {
+                modeSet: true, bpp: b, refreshRate: ddraw?.display.refresh,
+            });
             system.windowManager.postDisplayChange(w, h, b);
             Logger.log(LogCategory.USER32, `${apiName}: applied ${w}x${h}x${b} (restore=${isRestore})`);
         };
@@ -2076,6 +2835,22 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return (lpsz && lpsz < _mem.length && _mem[lpsz] !== 0) ? lpsz + 1 : lpsz;
     };
 
+    // LPWSTR CharNextW(LPCWSTR lpsz) — one UTF-16 code unit, and a pointer that stops
+    // ON the terminator rather than walking past it (a caller's loop ends on == prev).
+    exports['CharNextW'] = (_ctx, mem, args) => {
+        const lpsz = args[0] >>> 0;
+        if (!lpsz || lpsz + 1 >= mem.length) return lpsz;
+        const ch = mem[lpsz] | (mem[lpsz + 1] << 8);
+        return ch === 0 ? lpsz : lpsz + 2;
+    };
+
+    // LPWSTR CharPrevW(LPCWSTR start, LPCWSTR current)
+    exports['CharPrevW'] = (_ctx, _mem, args) => {
+        const start = args[0] >>> 0;
+        const current = args[1] >>> 0;
+        return current > start ? current - 2 : start;
+    };
+
     // DWORD CharUpperBuffA(LPSTR lpsz, DWORD cchLength)
     exports['CharUpperBuffA'] = (ctx, mem, args) => {
         const lpsz = args[0] >>> 0;
@@ -2199,15 +2974,25 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['SetWinEventHook'] = () => 1;
     exports['NotifyWinEvent'] = () => 0;
     exports['GetCaretBlinkTime'] = () => 530;
-    exports['GetDoubleClickTime'] = () => doubleClickTimeMs;
-    exports['SetDoubleClickTime'] = (ctx, mem, args) => {
-        const interval = args[0] >>> 0;
-        if (interval < 4 || interval > 5000) return 0;
-        doubleClickTimeMs = interval;
+    exports['GetDoubleClickTime'] = () => getDoubleClickTimeMs();
+    // SetDoubleClickTime is SPI_SETDOUBLECLICKTIME: it cannot fail on a value.
+    exports['SetDoubleClickTime'] = (_ctx, _mem, args) => {
+        setDoubleClickTimeMs(args[0] >>> 0);
         return 1;
     };
     exports['EnumWindows'] = () => 1;
-    exports['WindowFromDC'] = () => 0;
+
+    // Returns the window a DC was obtained FOR (GetDC/GetWindowDC/GetDCEx/BeginPaint), NULL for
+    // a memory/compatible/info DC. Renderers use it to recover the target window from a DC handed
+    // to them: GoldSrc's D3D init does hwnd = WindowFromDC(hdc) and rejects the whole mode with
+    // "not supported by your video card" the moment IsWindow(hwnd) fails, so returning 0 here
+    // reads to the app as "this card cannot do D3D".
+    exports['WindowFromDC'] = (ctx, mem, args) => {
+        const hdc = args[0] >>> 0;
+        const hwnd = System.getInstance().gdiContext.getDCWindow(hdc);
+        // A DC whose window has been destroyed reports NULL, as on Win32.
+        return hwnd && windows.has(hwnd) ? hwnd : 0;
+    };
     exports['DisableProcessWindowsGhosting'] = () => 0;
 
     exports['GetCursorInfo'] = (ctx, mem, args) => {
@@ -2216,8 +3001,11 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
             const mouseState = System.getInstance().inputManager.getMouseState();
             view.setUint32(pci + 0, 20, true); // cbSize
-            view.setUint32(pci + 4, 1, true); // flags (CURSOR_SHOWING)
-            view.setUint32(pci + 8, 0x100, true); // hCursor
+            // CURSOR_SHOWING and hCursor are the GUEST's own pointer state — the same
+            // display count ShowCursor returns and the handle GetCursor reports. Host-side
+            // pointer suppression (core/pointer-policy) must not be visible here.
+            view.setUint32(pci + 4, isGuestCursorVisible() ? 1 : 0, true);
+            view.setUint32(pci + 8, getCurrentCursorHandle(), true);
             view.setInt32(pci + 12, mouseState.x, true);
             view.setInt32(pci + 16, mouseState.y, true);
         }
@@ -2225,19 +3013,41 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     };
 
     exports['CreateCursor'] = () => 0x100;
-    exports['GetCursor'] = () => 0x100;
+    // The save-and-restore idiom (`old = SetCursor(wait); …; SetCursor(old)`) and the
+    // GetCursor()==NULL visibility test both need the real installed handle.
+    exports['GetCursor'] = () => getCurrentCursorHandle();
     exports['DestroyCursor'] = () => 1;
-    exports['DestroyIcon'] = () => 1;
 
+    // BOOL DestroyIcon(HICON) — NtUserDestroyCursor semantics: a shared icon (LoadIcon,
+    // LR_SHARED, a system cursor) is not freed and still answers TRUE; the installed cursor
+    // is locked and answers FALSE; anything that is not an icon/cursor handle fails.
+    const ERROR_INVALID_CURSOR_HANDLE = 1402;
+    exports['DestroyIcon'] = (_ctx, _mem, args) => {
+        const hIcon = args[0] >>> 0;
+        if (hIcon >= FIRST_LOADICON_HANDLE && hIcon < nextIconHandle) return 1;
+        const provider = System.getInstance().resourceProvider;
+        const obj = hIcon ? provider.getUserObject(hIcon) : null;
+        if (!obj || (obj.type !== 'ICON' && obj.type !== 'CURSOR')) {
+            System.getInstance().scheduler?.setLastError(ERROR_INVALID_CURSOR_HANDLE);
+            return 0;
+        }
+        if (obj.shared || obj.systemCursorId !== undefined) return 1;
+        if (hIcon === getCurrentCursorHandle()) return 0;
+        provider.unregisterUserObject(hIcon);
+        return 1;
+    };
+
+    // The confinement rect an app can save and restore; unconfined reads back as the
+    // whole screen (wineserver seeds desktop cursor.clip with the virtual screen rect).
     exports['GetClipCursor'] = (ctx, mem, args) => {
         const lpRect = args[0] >>> 0;
         if (lpRect && lpRect + 16 <= mem.length) {
-            const mode = getCurrentScreenMode();
+            const rect = getCursorClipRect() ?? getVirtualScreenRect();
             const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setInt32(lpRect + 0, 0, true);
-            view.setInt32(lpRect + 4, 0, true);
-            view.setInt32(lpRect + 8, mode.width, true);
-            view.setInt32(lpRect + 12, mode.height, true);
+            view.setInt32(lpRect + 0, rect.left, true);
+            view.setInt32(lpRect + 4, rect.top, true);
+            view.setInt32(lpRect + 8, rect.right, true);
+            view.setInt32(lpRect + 12, rect.bottom, true);
         }
         return 1;
     };
@@ -2252,6 +3062,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         const { x, y } = getAbsoluteWindowPosition(win);
         const hdc = gdi.createSizedMemoryDC(win.width, win.height);
         if (!hdc) return 0;
+        gdi.setDCWindow(hdc, hWnd);
         gdi.attachWindowBlit(hdc, x, y, win.width, win.height);
         gdi.seedMemoryDCFromOverlay(hdc);
         Logger.verbose(LogCategory.USER32,
@@ -2259,9 +3070,33 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return hdc;
     };
 
-    exports['MonitorFromWindow'] = () => 1;
-    exports['MonitorFromPoint'] = () => 1;
-    exports['MonitorFromRect'] = () => 1;
+    // HMONITOR MonitorFromWindow(HWND, DWORD dwFlags): the monitor the window's rect
+    // intersects. An invalid window resolves like a rect on no monitor.
+    exports['MonitorFromWindow'] = (_ctx, _mem, args) => {
+        const hWnd = args[0] >>> 0;
+        const flags = args[1] >>> 0;
+        if (hWnd === DESKTOP_HWND) return PRIMARY_HMONITOR;
+        const win = hWnd ? windows.get(hWnd) : undefined;
+        if (!win) return monitorFallback(flags);
+        const { x, y } = getAbsoluteWindowPosition(win);
+        return monitorFromRect(x, y, x + win.width, y + win.height, flags);
+    };
+    // HMONITOR MonitorFromPoint(POINT pt, DWORD dwFlags) — POINT is passed by value.
+    exports['MonitorFromPoint'] = (_ctx, _mem, args) => {
+        const x = args[0] | 0;
+        const y = args[1] | 0;
+        return monitorFromRect(x, y, x + 1, y + 1, args[2] >>> 0);
+    };
+    // HMONITOR MonitorFromRect(LPCRECT lprc, DWORD dwFlags)
+    exports['MonitorFromRect'] = (_ctx, mem, args) => {
+        const lprc = args[0] >>> 0;
+        const flags = args[1] >>> 0;
+        if (!lprc || lprc + 16 > mem.length || !isValidAddress(mem, lprc, 16, 'r')) {
+            return monitorFallback(flags);
+        }
+        return monitorFromRect(Mem.readInt32(lprc) ?? 0, Mem.readInt32(lprc + 4) ?? 0,
+            Mem.readInt32(lprc + 8) ?? 0, Mem.readInt32(lprc + 12) ?? 0, flags);
+    };
 
     const writeMonitorInfo = (mem: Uint8Array, pmi: number, wide: boolean): boolean => {
         if (!pmi || pmi + 40 > mem.length) return false;
@@ -2335,7 +3170,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         callbackManager.saveSuspendedThunkContext(ctx, STACK_CLEANUP);
         const { callbackId } = callbackManager.invokeCallback(
             lpfnEnum,
-            [1, hdc, rectPtr, dwData],
+            [PRIMARY_HMONITOR, hdc, rectPtr, dwData],
             CALLBACK_CLEANUP,
             () => {
                 process!.memory.free(rectPtr);
@@ -2359,27 +3194,15 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return 1;
     };
 
-    exports['SetProcessDPIAware'] = () => 1;
-    exports['IsProcessDPIAware'] = () => 1;
-
-    // HDEVNOTIFY RegisterDeviceNotificationA/W — no device-change delivery in emulator.
-    const registerDeviceNotification = (_ctx: unknown, _mem: unknown, _args: number[]) => {
-        const handle = nextDeviceNotification++;
-        deviceNotifications.add(handle);
-        return handle;
-    };
-    exports['RegisterDeviceNotificationA'] = registerDeviceNotification;
-    exports['RegisterDeviceNotificationW'] = registerDeviceNotification;
+    // HDEVNOTIFY RegisterDeviceNotificationA/W(HANDLE hRecipient, LPVOID NotificationFilter, DWORD Flags)
+    exports['RegisterDeviceNotificationA'] = (ctx, mem, args) =>
+        registerDeviceNotification(mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, false);
+    exports['RegisterDeviceNotificationW'] = (ctx, mem, args) =>
+        registerDeviceNotification(mem, args[0] >>> 0, args[1] >>> 0, args[2] >>> 0, true);
 
     // BOOL UnregisterDeviceNotification(HDEVNOTIFY Handle)
-    exports['UnregisterDeviceNotification'] = (_ctx, _mem, args) => {
-        const handle = args[0] >>> 0;
-        if (!handle || !deviceNotifications.delete(handle)) {
-            System.getInstance().scheduler.setLastError(6); // ERROR_INVALID_HANDLE
-            return 0;
-        }
-        return 1;
-    };
+    exports['UnregisterDeviceNotification'] = (_ctx, _mem, args) =>
+        unregisterDeviceNotification(args[0] >>> 0) ? 1 : 0;
 
     return exports;
 }

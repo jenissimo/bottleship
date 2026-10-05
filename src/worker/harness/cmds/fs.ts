@@ -13,6 +13,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { bytesToBase64 } from "./screen";
 import { harnessBus } from "../event-bus";
+import { vfsIoCensus } from "../../runtime/filesystem/vfs";
 
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
@@ -26,7 +27,47 @@ function vfs(): any {
     return fsx as any;
 }
 
+const CRC32_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[i] = c >>> 0;
+    }
+    return t;
+})();
+
 export function registerFsCommands(svc: HarnessService): void {
+    /** fsHash(path, {chunkBytes?}) — CRC32 + size of a guest file read THROUGH the VFS,
+     *  in chunks, so a 40 MB ROM entry costs no RPC payload.
+     *
+     *  The question it answers: does the guest see the bytes we packed? A block-cache or
+     *  Range-delivery bug corrupts a few blocks out of thousands — most assets still load
+     *  and only a handful of decompressions fail, which reads as a guest bug until you
+     *  compare the digest against the same entry extracted with tools/wgb.ts. */
+    svc.register("fsHash", async (args) => {
+        const path = String(args[0] ?? "");
+        const chunk = Math.max(0x1000, ((args[1] ?? {}) as { chunkBytes?: number }).chunkBytes ?? 0x100000);
+        const fsx = vfs();
+        const handle = fsx.openSync(path, GENERIC_READ, OPEN_EXISTING);
+        if (!handle) throw new HarnessError(`file not found: ${path}`, HarnessErrorCode.NOT_FOUND);
+        const size = fsx.getFileSize(path);
+        let crc = 0xFFFFFFFF, read = 0, shortChunks = 0;
+        while (read < size) {
+            const want = Math.min(chunk, size - read);
+            const data: Uint8Array | null = await fsx.read(handle, want);
+            if (!data || data.length === 0) break;
+            if (data.length < want) shortChunks++;
+            for (let i = 0; i < data.length; i++) crc = CRC32_TABLE[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+            read += data.length;
+        }
+        return {
+            path, size, read, shortChunks,
+            crc32: ((crc ^ 0xFFFFFFFF) >>> 0).toString(16).padStart(8, "0"),
+            complete: read === size,
+        };
+    });
+
     /** fsRead(path, {maxBytes?, encoding?}) — read a file (capped). Uses the async
      *  read path so compressed/uncached ROM entries return real bytes (readSync
      *  returns null for those → would falsely report a non-empty file as 0 bytes). */
@@ -69,6 +110,28 @@ export function registerFsCommands(svc: HarnessService): void {
         return { path, written: bytes.length, source: h.source ?? "overlay" };
     });
 
+    /** fsFill(path, size, {byte?}) — create a file of an exact byte length in the overlay
+     *  without shipping its contents over CDP. Games gate on an asset's SIZE (a CD check
+     *  that opens one big file and compares _filelength against a constant); this answers
+     *  "is the only thing missing that file?" and drives the low-disk paths, in one call. */
+    svc.register("fsFill", async (args) => {
+        const path = String(args[0] ?? "");
+        const size = Math.max(0, Math.floor(Number(args[1] ?? 0)));
+        if (!path || !Number.isFinite(size)) throw new HarnessError("fsFill needs (path, size)", HarnessErrorCode.BAD_ARGS);
+        const byte = Number((args[2] as { byte?: number })?.byte ?? 0) & 0xff;
+        const fsx = vfs();
+        fsx.ensureParentDirsSync?.(path);
+        const h = await fsx.open(path, GENERIC_WRITE, CREATE_ALWAYS);
+        if (!h) throw new HarnessError(`could not open for write: ${path}`, HarnessErrorCode.BAD_ARGS);
+        const chunk = new Uint8Array(Math.min(size, 4 * 1024 * 1024)).fill(byte);
+        for (let done = 0; done < size; done += chunk.length) {
+            const n = Math.min(chunk.length, size - done);
+            await fsx.write(h, n === chunk.length ? chunk : chunk.subarray(0, n));
+        }
+        await fsx.flushFile?.(h.path ?? path);
+        return { path, size, byte, source: h.source ?? "overlay" };
+    });
+
     /** fsList(path) — directory listing. */
     svc.register("fsList", (args) => {
         const path = String(args[0] ?? "C:\\");
@@ -78,14 +141,53 @@ export function registerFsCommands(svc: HarnessService): void {
 
     /** fsStat(path) — existence + size + rom/overlay origin. getFileSize returns 0
      *  (not -1) for a missing file, so existence is probed with a read-only
-     *  openSync (null = absent) — a real 0-byte file still reports exists:true. */
+     *  openSync (null = absent) — a real 0-byte file still reports exists:true.
+     *
+     *  `listed` re-asks the same question the way FindFirstFile does — through the
+     *  parent's directory ENUMERATION rather than an exact stat. The two must agree;
+     *  when they don't, a game that gates its real open on FindFirstFile cannot read
+     *  back a file that every other probe says is there, and `exists:true` alone reads
+     *  as "the file is fine" while the guest is being told it does not exist. */
     svc.register("fsStat", (args) => {
         const path = String(args[0] ?? "");
         const fsx = vfs();
         const isDir = fsx.directoryExists(path);
         const handle = isDir ? null : fsx.openSync(path, GENERIC_READ, OPEN_EXISTING);
         const exists = !!handle || isDir;
-        return { path, exists, isDir, size: handle ? fsx.getFileSize(path) : null, source: handle?.source ?? null, inRom: fsx.hasRomFile?.(path) ?? null };
+        const full = String(fsx.resolvePath(path) ?? path);
+        const cut = full.lastIndexOf("\\");
+        const parent = cut > 0 ? full.slice(0, cut) : full.slice(0, cut + 1);
+        const leaf = full.slice(cut + 1).toLowerCase();
+        const listed = leaf
+            ? (fsx.listDirectory(parent) ?? []).some((e: any) => String(e.name).toLowerCase() === leaf)
+            : null;
+        return { path, exists, listed, isDir, size: handle ? fsx.getFileSize(path) : null, source: handle?.source ?? null, inRom: fsx.hasRomFile?.(path) ?? null };
+    });
+
+    /** fsDelete(path) — remove a file from the CoW overlay (reproduces a first-run
+     *  state after a seed/write; does not touch ROM). */
+    svc.register("fsDelete", async (args) => {
+        const path = String(args[0] ?? "");
+        if (!path) throw new HarnessError("fsDelete needs a path", HarnessErrorCode.BAD_ARGS);
+        const deleted = await vfs().deleteFile(path);
+        return { path, deleted };
+    });
+
+    /**
+     * fsRevert(path) — drop the user's copy-on-write copy and go back to the SHIPPED bundle
+     * file.
+     *
+     * `fsDelete` is a guest DeleteFile: on a ROM-shadowed path it leaves a whiteout, so the
+     * file ends up GONE, not shipped. That is correct, and it is also the wrong verb for
+     * resetting a fixture — a game's own written config shadowing the bundle's is exactly the
+     * case, and using fsDelete for it silently boots the game with no config at all (it cost a
+     * session: SS2 with no `CAM.CFG` never leaves the menu and says nothing). The result
+     * distinguishes "nothing to revert" from "reverted".
+     */
+    svc.register("fsRevert", async (args) => {
+        const path = String(args[0] ?? "");
+        if (!path) throw new HarnessError("fsRevert needs a path", HarnessErrorCode.BAD_ARGS);
+        return { path, ...(await vfs().revertToRom(path)) };
     });
 
     /** fsFlush() — durable flush (closes OPFS writers). The record/replay teardown barrier. */
@@ -94,10 +196,170 @@ export function registerFsCommands(svc: HarnessService): void {
         return { flushed: true };
     });
 
+    /** fsFlushHealth({timeoutMs?}) — does the teardown barrier still SETTLE, and which
+     *  paths are holding it?
+     *
+     *  flushAll is awaited by child-process exit, guest exit and session switch, and a
+     *  commit that cannot finish stalls all three with no error and no timeout. From the
+     *  outside that is indistinguishable from a busy guest: the game simply never moves
+     *  on. `settles:false` names it in one call, and `pending` names the file — which is
+     *  the whole diagnosis, because the stuck path is the one the guest is rewriting. */
+    svc.register("fsFlushHealth", async (args) => {
+        const timeoutMs = Number((args[0] as { timeoutMs?: number })?.timeoutMs ?? 5000);
+        const overlay = vfs().overlay;
+        if (!overlay) return { overlay: false, settles: true, pending: [], writers: [], committing: [] };
+        const snapshot = {
+            overlay: true,
+            pending: [...overlay.pendingFlushes.keys()],
+            writers: [...overlay.writerCache.keys()],
+            committing: [...(overlay.committingPaths ?? [])],
+            syncHandles: [...overlay.syncHandleCache.keys()],
+        };
+        const settles = await Promise.race([
+            vfs().flushAll().then(() => true, () => true),
+            new Promise<boolean>((r) => setTimeout(() => r(false), timeoutMs)),
+        ]);
+        return { ...snapshot, settles, timeoutMs };
+    });
+
     /** watchFiles(on?) — enable/disable the fileWritten event (off by default; the
      *  guest write path is hot). */
     svc.register("watchFiles", (args) => {
         harnessBus.fileEvents = args[0] === undefined ? true : !!args[0];
         return { fileEvents: harnessBus.fileEvents };
     });
+
+    /** fsTrace(action) — the OPEN side of "the game says it saved and nothing is on
+     *  disk". watchFiles only fires once bytes are written, so a settings write that
+     *  never gets that far (create refused, path resolved elsewhere, or the writing
+     *  code never reached) leaves NO evidence at all; this records every
+     *  openSync/deleteFile/rename attempt with its disposition and whether it
+     *  succeeded. Wraps the live VFS on demand — zero cost when off.
+     *  Actions: "start" | "stop" | "read" (returns + keeps) | "clear". */
+    svc.register("fsTrace", (args) => {
+        const action = String(args[0] ?? "read");
+        const fsx = vfs();
+        const MAX = 4000;
+        type Probe = { entries: unknown[]; originals: Record<string, (...a: any[]) => any> };
+        let probe: Probe | undefined = fsx.__fsTraceProbe;
+
+        if (action === "start") {
+            if (probe) return { ok: true, already: true, entries: probe.entries.length };
+            probe = { entries: [], originals: {} };
+            fsx.__fsTraceProbe = probe;
+            const push = (e: Record<string, unknown>): void => {
+                if (probe!.entries.length >= MAX) probe!.entries.shift();
+                probe!.entries.push({ t: performance.now() | 0, ...e });
+            };
+            const wrap = (name: string, note: (args: any[], result: unknown) => Record<string, unknown>): void => {
+                const original = fsx[name];
+                if (typeof original !== "function") return;
+                probe!.originals[name] = original;
+                fsx[name] = (...a: any[]) => {
+                    const r = original.apply(fsx, a);
+                    // Async verbs (deleteFile) return a promise — record the settled answer.
+                    if (r && typeof r.then === "function") {
+                        return r.then((v: unknown) => { push(note(a, v)); return v; });
+                    }
+                    push(note(a, r));
+                    return r;
+                };
+            };
+            wrap("openSync", (a, r) => ({ op: "openSync", path: String(a[0]), disposition: a[2] >>> 0, ok: !!r, source: (r as any)?.source }));
+            wrap("deleteFile", (a, r) => ({ op: "deleteFile", path: String(a[0]), ok: !!r }));
+            wrap("truncateAt", (a) => ({ op: "truncateAt", path: String(a[0]), size: Number(a[1]) }));
+            wrap("createDirectorySync", (a, r) => ({ op: "mkdir", path: String(a[0]), ok: !!(r as any)?.ok }));
+            return { ok: true, wrapped: Object.keys(probe.originals) };
+        }
+        if (!probe) return { ok: false, tracing: false, entries: [] };
+        if (action === "stop") {
+            for (const [name, fn] of Object.entries(probe.originals)) fsx[name] = fn;
+            const entries = probe.entries;
+            fsx.__fsTraceProbe = undefined;
+            return { ok: true, tracing: false, entries };
+        }
+        if (action === "clear") { probe.entries.length = 0; return { ok: true, entries: [] }; }
+        return { ok: true, tracing: true, entries: probe.entries };
+    });
+
+    /** fsIoReport({top?=20, reset?, sort?}) — the session-wide read census (vfsIoCensus).
+     *
+     *  This is the BOOT instrument: `ioReport` only counts when a streamed SabIoSource is
+     *  armed, and the frame profiler only accumulates once frames run — so the phase that
+     *  is almost entirely file I/O had no numbers at all.
+     *
+     *  `arms` partitions the reads the sync ladder answered; `asyncFallbacks` is the count
+     *  it could NOT, each of which parks the guest thread. `asyncMs` is measured around the
+     *  queued promise, so it includes waiting behind another read on the same handle — but
+     *  still EXCLUDES the dispatcher's park/resume, so an async read costs more than it says.
+     *
+     *  `armsSumOk` is the cross-check: the arms plus asyncFallbacks must equal `reads`, or
+     *  the ladder grew a branch that reports nothing and every rate below is understated.
+     */
+    svc.register("fsIoReport", (args) => {
+        const opts = (args[0] ?? {}) as { top?: number; reset?: boolean; sort?: string };
+        const c = vfsIoCensus;
+        const armsSum = c.hitHandleWindow + c.hitRomCache + c.hitRomRangeSync + c.hitOverlaySync;
+        const sortKey = opts.sort === "reads" ? "reads" : opts.sort === "bytes" ? "bytes"
+            : opts.sort === "opens" ? "opens" : "ms";
+        const rows = [...c.perPath.entries()]
+            .map(([path, v]) => ({ path, ...v, ms: +v.ms.toFixed(2), readsPerOpen: v.opens ? +(v.reads / v.opens).toFixed(2) : 0 }))
+            .sort((a, b) => (b as any)[sortKey] - (a as any)[sortKey])
+            .slice(0, opts.top ?? 20);
+        const out = {
+            /** With the census off every number below is 0 — which reads exactly like a boot
+             *  that did no I/O. A consumer must judge on this, not on the zeros. */
+            enabled: c.enabled,
+            reads: c.reads,
+            bytesMB: +(c.bytes / 1048576).toFixed(2),
+            /** Guest file opens. A re-open-per-asset archive reader is visible only here. */
+            opens: c.opens,
+            /** Reads that could not be classified tail/payload because the path had no
+             *  size. Non-zero ⇒ every row's tailReads is a LOWER bound, not a reading. */
+            tailUnsized: c.tailUnsized,
+            arms: {
+                hitHandleWindow: c.hitHandleWindow,
+                hitRomCache: c.hitRomCache,
+                hitRomRangeSync: c.hitRomRangeSync,
+                hitOverlaySync: c.hitOverlaySync,
+            },
+            asyncFallbacks: c.asyncFallbacks,
+            /** Sync ROM reads refused for coming back short mid-file (they retry blocking). */
+            romSyncShortFalls: c.romSyncShortFalls,
+            /** Reads the ladder served without naming an arm. MUST be 0 — see vfsIoCensus. */
+            armUnattributed: c.armUnattributed,
+            /** null with no reads: a cross-check over an empty census is vacuously true, and
+             *  `true` there is a PASS nobody measured. */
+            armsSumOk: c.reads === 0
+                ? null
+                : armsSum + c.asyncFallbacks + c.armUnattributed === c.reads && c.armUnattributed === 0,
+            asyncRate: c.reads ? +(c.asyncFallbacks / c.reads).toFixed(4) : 0,
+            syncMs: +c.syncMs.toFixed(1),
+            asyncMs: +c.asyncMs.toFixed(1),
+            asyncReads: c.asyncReads,
+            asyncBytesMB: +(c.asyncBytes / 1048576).toFixed(2),
+            msPerAsyncRead: c.asyncReads ? +(c.asyncMs / c.asyncReads).toFixed(3) : 0,
+            /** Per read ATTEMPT, not per served sync read: syncMs accumulates on every ladder
+             *  entry, including the ones that fall through to async. */
+            usPerReadAttempt: c.reads ? +((c.syncMs * 1000) / c.reads).toFixed(2) : 0,
+            /** §4.2 overlay warm. warmAttempted 0 with a nonzero skip reason says the
+             *  warm never ran and why; warmLanded far below warmAttempted says it ran
+             *  and lost the race. Either way the answer is not "it did nothing". */
+            warm: {
+                attempted: c.warmAttempted,
+                landed: c.warmLanded,
+                skippedHandle: c.warmSkippedHandle,
+                skippedEphemeral: c.warmSkippedEphemeral,
+                skippedCached: c.warmSkippedCached,
+                skippedNoFile: c.warmSkippedNoFile,
+                skippedWriter: c.warmSkippedWriter,
+                skippedCapacity: c.warmSkippedCapacity,
+            },
+            pathsTracked: c.perPath.size,
+            top: rows,
+        };
+        if (opts.reset) c.reset();
+        return out;
+    });
+
 }

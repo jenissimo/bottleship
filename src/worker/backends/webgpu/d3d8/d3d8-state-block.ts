@@ -187,63 +187,117 @@ export function refreshD3D8CapturedEntries(device: D3D8DeviceAdapter, entries: D
     }
 }
 
+// Membership tables ported from wined3d's stateblock.c (pixel_states_render/texture/
+// sampler, vertex_states_render/texture/sampler — dlls/wined3d/stateblock.c:104-263),
+// through D3D9's identical render-state numbering (D3D8's D3DRENDERSTATETYPE shares
+// values with wined3d's WINED3D_RS_* for every state D3D8 exposes; D3D9-only render
+// states appear here too but a real D3D8 title never sets them, so they're inert).
+//
+// TSS values are D3D8's D3DTEXTURESTAGESTATETYPE numbering (sampler-constants.ts) —
+// wined3d's WINED3D_TSS_* is a compacted INTERNAL index that does not match the
+// guest-visible D3DTSS_* constants, and wined3d's *_states_sampler arrays cover the
+// D3D9 sampler states that D3D8 still exposes as texture-stage states (ADDRESSU/V/W,
+// filters, MIPMAPLODBIAS, MAXMIPLEVEL, MAXANISOTROPY, BORDERCOLOR) — both were
+// hand-translated to D3D8 numbering below. D3DTSS_TEXCOORDINDEX/TEXTURETRANSFORMFLAGS
+// have DUAL membership (present in both wined3d texture arrays).
+const PIXEL_RENDER_STATES: readonly number[] = [
+    7, 8, 9, 14, 15, 16, 19, 20, 23, 24, 25, 26, 27, 36, 37, 38, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    128, 129, 130, 131, 132, 133, 134, 135, 168, 171, 174, 175, 176, 185, 186, 187, 188, 190, 191,
+    192, 193, 194, 195, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
+];
+
+const VERTEX_RENDER_STATES: readonly number[] = [
+    9, 22, 28, 29, 34, 35, 36, 37, 38, 48, 136, 137, 139, 140, 141, 142, 143, 145, 146, 147, 148,
+    151, 152, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 166, 167, 170, 172, 173,
+    178, 179, 180, 181, 182, 183, 184,
+];
+
+// D3DRS_SOFTWAREVERTEXPROCESSING — dxvk d3d8_state_block.cpp calls this out by name
+// ("a very easy footgun for D3D8 applications") as captured ONLY by D3DSBT_ALL, not by
+// either the vertex or pixel group.
+const SWVP_RENDER_STATE = 153;
+
+const PIXEL_TSS_TYPES: readonly number[] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28];
+const VERTEX_TSS_TYPES: readonly number[] = [11, 24];
+
 /**
- * CreateStateBlock: snapshot a predefined group. The pixel/vertex split follows the
- * same pragmatic grouping as the D3D9 backend (render states + texture stages +
- * textures + PS on the pixel side; transforms + lighting + VS + streams on the
- * vertex side); D3DSBT_ALL is the union plus viewport and indices.
+ * CreateStateBlock: snapshot a predefined group.
+ *
+ * Per wined3d, D3DSBT_VERTEXSTATE/PIXELSTATE capture only the render-state/TSS
+ * membership tables above (plus, for vertex, lights/vertex-shader/VS-constants; for
+ * pixel, pixel-shader/PS-constants) — material, world/view/projection transforms,
+ * clip planes, texture bindings, stream sources, and indices are captured ONLY by
+ * D3DSBT_ALL (stateblock_savedstates_set_all vs _set_vertex/_set_pixel; dxvk's
+ * D3D8StateBlock constructor sets its Textures/VertexBuffers/Indices/SWVP capture
+ * flags only for Type::All). This is a well-known D3D footgun: a VERTEXSTATE block
+ * does NOT snapshot the current transform.
  */
 export function captureD3D8StateToEntries(device: D3D8DeviceAdapter, blockType: number): D3D8StateBlockEntry[] {
     const entries: D3D8StateBlockEntry[] = [];
-    const includePixel = blockType === D3DSBT_ALL || blockType === D3DSBT_PIXELSTATE;
-    const includeVertex = blockType === D3DSBT_ALL || blockType === D3DSBT_VERTEXSTATE;
+    const all = blockType === D3DSBT_ALL;
+    const includePixel = all || blockType === D3DSBT_PIXELSTATE;
+    const includeVertex = all || blockType === D3DSBT_VERTEXSTATE;
 
     if (includePixel) {
-        for (let state = 0; state < 256; state++) {
+        for (const state of PIXEL_RENDER_STATES) {
             entries.push({ op: "renderState", state, value: device.getRenderState(state) });
         }
         for (let stage = 0; stage < 8; stage++) {
-            for (let type = 0; type < 32; type++) {
+            for (const type of PIXEL_TSS_TYPES) {
                 entries.push({
                     op: "textureStageState", stage, type,
                     value: device.getTextureStageState(stage, type),
                 });
             }
-            const texPtr = device.getTextureComPtr(stage);
-            if (texPtr !== 0) entries.push({ op: "texture", stage, texPtr });
         }
-        const ps = device.getPixelShaderHandle();
-        entries.push({ op: "pixelShader", handle: ps });
+        entries.push({ op: "pixelShader", handle: device.getPixelShaderHandle() });
         entries.push({ op: "psConstant", start: 0, data: new Float32Array(device.shaders.psConstants) });
     }
 
     if (includeVertex) {
-        for (const { state, matrix } of device.getAllTransforms()) {
-            entries.push({ op: "transform", state, matrix: new Float32Array(matrix) });
+        for (const state of VERTEX_RENDER_STATES) {
+            entries.push({ op: "renderState", state, value: device.getRenderState(state) });
         }
-        entries.push({ op: "material", mat: device.getMaterial() });
+        for (let stage = 0; stage < 8; stage++) {
+            for (const type of VERTEX_TSS_TYPES) {
+                entries.push({
+                    op: "textureStageState", stage, type,
+                    value: device.getTextureStageState(stage, type),
+                });
+            }
+        }
         for (const { index, light } of device.getAllLights()) {
             entries.push({ op: "light", index, light });
         }
         for (const index of device.getEnabledLightIndices()) {
             entries.push({ op: "lightEnable", index, enable: true });
         }
+        entries.push({ op: "vertexShader", token: device.getActiveVertexToken() });
+        entries.push({ op: "vsConstant", start: 0, data: new Float32Array(device.shaders.vsConstants) });
+    }
+
+    if (all) {
+        entries.push({ op: "renderState", state: SWVP_RENDER_STATE, value: device.getRenderState(SWVP_RENDER_STATE) });
+        entries.push({ op: "material", mat: device.getMaterial() });
+        for (const { state, matrix } of device.getAllTransforms()) {
+            entries.push({ op: "transform", state, matrix: new Float32Array(matrix) });
+        }
         for (const { index, plane } of device.getAllClipPlanes()) {
             entries.push({ op: "clipPlane", index, plane: new Float32Array(plane) });
         }
-        entries.push({ op: "vertexShader", token: device.getActiveVertexToken() });
-        entries.push({ op: "vsConstant", start: 0, data: new Float32Array(device.shaders.vsConstants) });
+        // Slot membership, not truthiness: an Apply must be able to restore a stage/stream
+        // back to NULL even if it was unbound at Capture time (dxvk:
+        // m_captures.textures.setAll() / equivalent for streams — every stage/stream gets
+        // an entry regardless of whether it currently holds a live pointer).
+        for (let stage = 0; stage < 8; stage++) {
+            entries.push({ op: "texture", stage, texPtr: device.getTextureComPtr(stage) });
+        }
         for (let s = 0; s < 16; s++) {
             const src = device.getStreamSource(s);
-            if (src.vb !== 0) entries.push({ op: "streamSource", stream: s, vb: src.vb, stride: src.stride });
+            entries.push({ op: "streamSource", stream: s, vb: src.vb, stride: src.stride });
         }
-    }
-
-    if (blockType === D3DSBT_ALL) {
         entries.push({ op: "viewport", vp: { ...device.viewport } });
-        if (device.indexIB !== 0) {
-            entries.push({ op: "indices", ib: device.indexIB, baseVertex: device.baseVertexIndex });
-        }
+        entries.push({ op: "indices", ib: device.indexIB, baseVertex: device.baseVertexIndex });
     }
 
     return entries;

@@ -37,6 +37,33 @@ function toCategoryEnums(names?: string[]): LogCategory[] | undefined {
 const categoryName = (c: LogCategory): string => (LogCategory as any)[c] ?? String(c);
 
 export function registerLogCommands(svc: HarnessService): void {
+    // Host wall time between guest-emitted markers. Polling/file I/O outside the
+    // two markers cannot inflate this interval. The tap is diagnostics only.
+    let phaseTap: ((e: { message: string }) => void) | undefined;
+    let phase: { begin: number | null; end: number | null; begins: number; ends: number; compileBegin: number | null; compileEnd: number | null } | undefined;
+    svc.register("logPhase", (args) => {
+        if (args[0] === "arm") {
+            if (phaseTap) Logger.removeLogTap(phaseTap);
+            const begin = String(args[1] ?? ""), end = String(args[2] ?? "");
+            if (!begin || !end || begin === end) throw new Error("Distinct nonempty markers required");
+            phase = { begin: null, end: null, begins: 0, ends: 0, compileBegin: null, compileEnd: null };
+            phaseTap = (e) => {
+                if (e.message.endsWith(`: "${begin}"`)) {
+                    phase!.begins++; phase!.begin = performance.now();
+                    phase!.compileBegin = (globalThis as any).__jitCompileStats?.count ?? null;
+                }
+                if (e.message.endsWith(`: "${end}"`)) {
+                    phase!.ends++; phase!.end = performance.now();
+                    phase!.compileEnd = (globalThis as any).__jitCompileStats?.count ?? null;
+                }
+            };
+            Logger.addLogTap(phaseTap);
+            return { armed: true };
+        }
+        if (args[0] === "seal" && phaseTap) { Logger.removeLogTap(phaseTap); phaseTap = undefined; }
+        return phase ? { ...phase, valid: phase.begins === 1 && phase.ends === 1 && phase.end! > phase.begin!,
+            ms: phase.begin !== null && phase.end !== null ? phase.end - phase.begin : null } : null;
+    });
     svc.register("streamLogs", (args) => {
         const categories = toCategoryEnums(args[0] as string[] | undefined);
         Logger.setStreamCallback((batch) => {
@@ -51,6 +78,51 @@ export function registerLogCommands(svc: HarnessService): void {
     svc.register("stopLogs", () => {
         Logger.setStreamCallback(null);
         return { ok: true };
+    });
+
+    /**
+     * logRing(size) — resize the in-memory log ring (default 50).
+     *
+     * The post-mortem workflow is "reproduce, then read the log tail that led to
+     * the fault", but 50 entries is a fraction of one boot's SYSTEM chatter, so
+     * the interesting lines are gone before `logs()` runs. Widen it BEFORE the
+     * repro. Resizing drops the current contents (the ring is reallocated).
+     *
+     * A page reload resets it, so the boot that FOLLOWS a re-exec cannot be armed this
+     * way at all — for that window use the persisted flag, which the host replays before
+     * any bundle loads: `dbgFlag('__logRingSize', 100000, {scope:'session'})`.
+     */
+    svc.register("logRing", (args) => {
+        const size = typeof args[0] === "number" ? Math.max(50, Math.min(200000, args[0] as number)) : 50;
+        Logger.setBufferSize(size);
+        return { size };
+    });
+
+    /** logLevel(category, level) — per-category verbosity, or reset with no args.
+     *  The ring holds a fixed number of ENTRIES, so a per-frame firehose category
+     *  overwrites init-time evidence long before a late crash fires. Lowering that
+     *  category keeps it out of the ring (and off the console); streaming and the log
+     *  hub still see it, so the durable archive loses nothing.
+     *  Level: SILENT|ERROR|WARN|NORMAL|VERBOSE (or a number). */
+    svc.register("logLevel", (args) => {
+        if (args.length === 0) {
+            Logger.resetCategoryLevels();
+            return { reset: true };
+        }
+        const catName = String(args[0] ?? "").toUpperCase();
+        const category = (LogCategory as any)[catName];
+        if (category === undefined) {
+            throw new HarnessError(`logLevel: unknown category '${args[0]}'`, HarnessErrorCode.BAD_ARGS);
+        }
+        const raw = args[1];
+        // A numeric enum has reverse mappings, so LogLevel["0"] is the STRING "SILENT" —
+        // accepting it would set a level nothing compares correctly against.
+        const level = typeof raw === "number" ? raw : (LogLevel as any)[String(raw ?? "").toUpperCase()];
+        if (typeof level !== "number" || !(level in LogLevel)) {
+            throw new HarnessError(`logLevel: unknown level '${raw}'`, HarnessErrorCode.BAD_ARGS);
+        }
+        Logger.setCategoryLevel(category, level);
+        return { category: catName, level };
     });
 
     svc.register("logs", (args) => {
@@ -118,11 +190,26 @@ export function registerLogCommands(svc: HarnessService): void {
         if (ts === undefined) throw new HarnessError(`no log mark '${label}' (call markLog first)`, HarnessErrorCode.NOT_FOUND);
         const opts = (args[1] ?? {}) as { filter?: string; count?: number };
         const filter = opts.filter?.toLowerCase();
-        let entries = Logger.getRecentEntries(opts.count ?? 0)
+        const recent = Logger.getRecentEntries(opts.count ?? 0);
+        const available = recent.length;
+        let entries = recent
             .filter((e) => e.timestamp >= ts)
             .map((e) => ({ timestamp: e.timestamp, category: categoryName(e.category), level: e.level, message: e.message }));
         if (filter) entries = entries.filter((e) => e.message.toLowerCase().includes(filter) || e.category.toLowerCase().includes(filter));
-        return { since: ts, sinceLabel: label, count: entries.length, entries };
+        // The ring is SMALL (50 entries by default) and a firehose empties it in
+        // milliseconds. Without saying so, an evicted window is indistinguishable from
+        // "it never happened" — the reader returns 0 either way, and a filtered 0 reads
+        // as proof of absence. Say which of the two it is.
+        const capacity = Logger.getBufferSize();
+        const truncated = available >= capacity;
+        return {
+            since: ts, sinceLabel: label, count: entries.length, entries,
+            ringCapacity: capacity, scanned: available, truncated,
+            ...(truncated ? {
+                note: `the ring held its full ${capacity} entries, so this window starts at the OLDEST SURVIVING line, not at the mark — `
+                    + `an empty or short result is NOT evidence of absence. Quiet the firehose (logLevel), enlarge the ring, or use watchLog (a live tap).`,
+            } : {}),
+        };
     });
 
     /**

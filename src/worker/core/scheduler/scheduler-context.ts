@@ -14,6 +14,7 @@
  */
 
 import type { CpuContext, V86Cpu } from "./types";
+import { cpuViews } from "../cpu/cpu-views";
 import { createDefaultFpuSnapshot, createDefaultSimdSnapshot, fpuSnapshot, simdSnapshot } from "../fpu-helper";
 
 /** Guest code address window — an EIP outside this is not a plain guest resume point. */
@@ -35,17 +36,18 @@ export function saveCpuContext(
     domainGen: number = 0,
     options?: { snapshotFpuSimd?: boolean; fpu?: Uint8Array; simd?: Uint8Array },
 ): CpuContext {
-    const reg = cpu.reg32;
+    const v = cpuViews(cpu);
+    const reg = v.reg32;
     const snapshotFpuSimd = options?.snapshotFpuSimd !== false;
     return {
         eax: reg[0] >>> 0, ecx: reg[1] >>> 0, edx: reg[2] >>> 0, ebx: reg[3] >>> 0,
         esp: reg[4] >>> 0, ebp: reg[5] >>> 0, esi: reg[6] >>> 0, edi: reg[7] >>> 0,
-        eip: cpu.instruction_pointer[0] >>> 0,
+        eip: v.instructionPointer[0] >>> 0,
         // MATERIALIZE lazy flags (get_eflags folds last_op1/last_result into the
         // arithmetic bits). Raw flags[0] is stale whenever flags_changed != 0 —
         // saving it loses the preempted thread's live ZF/CF/SF/OF across the
         // switch (wrong branch on resume → random corruption; NFSU crash-class).
-        eflags: (cpu.get_eflags ? cpu.get_eflags() : cpu.flags[0]) >>> 0,
+        eflags: (cpu.get_eflags ? cpu.get_eflags() : v.flags[0]) >>> 0,
         domain,
         domainGen: domainGen >>> 0,
         fpu: snapshotFpuSimd ? (fpuSnapshot({ cpu }) ?? undefined) : options?.fpu,

@@ -16,9 +16,17 @@
 import type { HarnessService } from "../service";
 import type { HarnessCtx } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
+import { retiredDelta } from "./perf";
 import { sys, cpu, guestMem, proc } from "../serialize";
 import { TimeService } from "../../runtime/time";
+import { guestTimeSteps } from "../../core/guest-time-steps";
+import { hypercallDataManager } from "../../core/cpu/hypercall-data";
+import { readRetiredInsns } from "../../core/cpu/cpu-views";
 import { harnessBus } from "../event-bus";
+import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
+
+/** virtualTimeSources patches the shared TimeService prototype; only one window at a time. */
+let virtualTimeSourcesBusy = false;
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -42,12 +50,30 @@ function buildPredicate(marker: unknown): () => boolean {
     const readF32 = (a: number) => view()?.getFloat32(a >>> 0, true) ?? 0;
     const eip = () => (cpu()?.instruction_pointer?.[0] ?? 0) >>> 0;
     const reg = (i: number) => (cpu()?.reg32?.[i] ?? 0) >>> 0;
+    // retired() — guest instructions since THIS wait began, accumulated across the counter's
+    // 32-bit wrap. A load is the one thing whose length is a property of the guest rather
+    // than of our speed, so it is what a paired timing run should stop on: both arms then
+    // do identical guest work and only the wall clock differs. Fresh per predicate, so the
+    // number always reads "since the wait started" and never carries a previous run in.
+    let retiredAcc = 0;
+    let retiredLast: number | null = null;
+    const retired = () => {
+        const c = cpu() as { instruction_counter?: Int32Array } | null;
+        // An unreadable counter reports NO progress. Defaulting it to 0 makes the next
+        // wrap-safe delta ~4.3e9 and satisfies any target instantly, with a perfectly
+        // plausible elapsed time attached — the failure this project keeps rediscovering.
+        if (!c?.instruction_counter) return retiredAcc;
+        const now = readRetiredInsns(c) >>> 0;
+        if (retiredLast !== null) retiredAcc += retiredDelta(retiredLast, now);
+        retiredLast = now;
+        return retiredAcc;
+    };
     const factory = new Function(
-        "read32", "read16", "read8", "readF32", "readU32", "eip", "reg", "Mem",
+        "read32", "read16", "read8", "readF32", "readU32", "eip", "reg", "Mem", "retired",
         `"use strict"; return (${src});`,
     );
     const Mem = { read32, read16, read8, readF32 };
-    return factory(read32, read16, read8, readF32, read32, eip, reg, Mem) as () => boolean;
+    return factory(read32, read16, read8, readF32, read32, eip, reg, Mem, retired) as () => boolean;
 }
 
 export function registerTimeCommands(svc: HarnessService): void {
@@ -70,6 +96,177 @@ export function registerTimeCommands(svc: HarnessService): void {
                 throw new HarnessError(`time action must be freeze|advance|realtime (got '${action}')`, HarnessErrorCode.BAD_ARGS);
         }
         return { mode: ts.getMode(), nowMs: ts.nowMs(), nowUnixMs: ts.nowUnixMs() };
+    });
+
+    /** guestTime({sampleMs}) — what the GUEST's clock does relative to wall clock.
+     *
+     *  GetTickCount/timeGetTime/QPC all read TimeService's virtual clock, which only
+     *  advances while the guest executes instructions plus the explicit credits
+     *  (heavy-thunk deficit, capped per §3.5; idle pump; video decode). A frame spent
+     *  inside one long thunk therefore generates almost no game time, and a title whose
+     *  logic is dt-driven runs in slow motion while audio and input run on wall clock.
+     *  `rate` is Δvirtual/Δwall over the sample: 1.0 = tracking, <1 = guest time is
+     *  losing, >1 = running fast. `behindMs` is the accumulated lead of wall over
+     *  virtual, which never recovers (the clock has no drift correction by design). */
+    svc.register("guestTime", async (args, ctx: HarnessCtx) => {
+        const sampleMs = Math.max(1, Number((args[0] as { sampleMs?: number } | undefined)?.sampleMs ?? 1000));
+        const ts = TimeService.getInstance();
+        const v0 = ts.nowMs(), w0 = performance.now();
+        await delay(sampleMs, ctx.signal);
+        const v1 = ts.nowMs(), w1 = performance.now();
+        const dv = v1 - v0, dw = w1 - w0;
+        return {
+            virtualTimeActive: ts.isVirtualTimeActive(),
+            sampleMs: +dw.toFixed(1),
+            virtualDeltaMs: +dv.toFixed(1),
+            rate: +(dv / dw).toFixed(3),
+            behindMs: +(w1 - v1).toFixed(1),
+            // Session-wide, not window-scoped: how many publishes of the guest clock had to be
+            // raised to keep QPC/GetTickCount/TSC monotonic (see publishClock). Non-zero is not
+            // an error — it is the count of backwards steps a guest would otherwise have read as
+            // a ~2^32-tick elapsed time.
+            clockMonotonic: hypercallDataManager.getClockMonotonicStats(),
+        };
+    });
+
+    /** virtualTimeSources({sampleMs, stackEveryNth}) — WHO advanced the guest clock during the
+     *  window, and by how much. `guestTime` says the rate is wrong; this says which of the
+     *  seven advance paths (plan/virtual-time.md §1.2) spent the milliseconds, so a wrong rate
+     *  becomes a named entry point rather than a number to reason about.
+     *
+     *  Self-checking: `creditedMs` (what the wrapped entry points were asked for) is
+     *  reported next to `virtualDeltaMs` (what the clock actually did). A large residual
+     *  means an advance path this wrapper does not cover wrote `virtualTimeMs` directly —
+     *  reported as `unattributedMs`, never silently folded into the rows.
+     *
+     *  The MS ARE COMPLETE, the CALLERS ARE SAMPLED. Every credit is tallied per kind, but the
+     *  caller frame needs `new Error().stack`, and the heaviest advance path is the post-sync-thunk
+     *  credit — hundreds of calls per frame (CLAUDE.md §3.5). Materializing a stack string on
+     *  that path slows the worker enough to depress the very rate this verb reports, and to make
+     *  it incomparable with `guestTime`'s. So the stack is taken once per `stackEveryNth` credit;
+     *  the residual per-credit cost is an increment, a modulo and one Map lookup. `rows` is
+     *  therefore the sampled subset and says so — `byKind` is the complete accounting. */
+    svc.register("virtualTimeSources", async (args, ctx: HarnessCtx) => {
+        const o = (args[0] ?? {}) as { sampleMs?: number; stackEveryNth?: number };
+        const sampleMs = Math.max(1, Number(o.sampleMs ?? 2000));
+        const stackEveryNth = Math.max(1, Math.floor(Number(o.stackEveryNth ?? 64)));
+        const ts = TimeService.getInstance();
+        if (!ts.isVirtualTimeActive()) {
+            return { virtualTimeActive: false, note: "virtual time is off — nothing advances the guest clock" };
+        }
+        // The wrappers live on the shared prototype, so two overlapping windows would save each
+        // other's wrappers as "orig" and leave one installed for the life of the worker.
+        if (virtualTimeSourcesBusy) {
+            return { error: "virtualTimeSources is already sampling — it patches TimeService.prototype and cannot nest" };
+        }
+        virtualTimeSourcesBusy = true;
+        const proto = TimeService.prototype as unknown as Record<string, (...a: never[]) => unknown>;
+        const byKind = new Map<string, { calls: number; ms: number }>();
+        const tally = new Map<string, { calls: number; ms: number }>();
+        let credits = 0, stacksTaken = 0;
+        const callerKey = (): string => {
+            const stack = (new Error().stack ?? "").split("\n");
+            // 0 = "Error", 1 = this helper, 2 = the wrapper — 3.. is the real caller.
+            return stack.slice(3, 6).map((s) => s.trim()).join(" <- ").slice(0, 300) || "unknown";
+        };
+        const bump = (kind: string, ms: number): void => {
+            if (!ms) return;
+            const total = byKind.get(kind) ?? { calls: 0, ms: 0 };
+            total.calls++; total.ms += ms;
+            byKind.set(kind, total);
+            if (++credits % stackEveryNth !== 0) return;
+            stacksTaken++;
+            const key = `${kind} ${callerKey()}`;
+            const row = tally.get(key) ?? { calls: 0, ms: 0 };
+            row.calls++; row.ms += ms;
+            tally.set(key, row);
+        };
+        const origAdvance = proto.advanceVirtualTime;
+        const origCredit = proto.creditIdleMs;
+        const origReanchor = proto.reanchorToWallClock;
+        const origPauseResume = proto.notifyPauseResume;
+        const before = (self: unknown): number => (self as { virtualTimeMs: number }).virtualTimeMs;
+        proto.advanceVirtualTime = function (this: TimeService, d: number) {
+            bump("advanceVirtualTime", d);
+            return (origAdvance as (this: TimeService, d: number) => void).call(this, d);
+        } as never;
+        proto.creditIdleMs = function (this: TimeService, d: number) {
+            const r = (origCredit as (this: TimeService, d: number) => number).call(this, d);
+            bump("creditIdleMs", r);
+            return r;
+        } as never;
+        proto.reanchorToWallClock = function (this: TimeService) {
+            const b = before(this);
+            const r = (origReanchor as (this: TimeService) => void).call(this);
+            bump("reanchorToWallClock", before(this) - b);
+            return r;
+        } as never;
+        proto.notifyPauseResume = function (this: TimeService) {
+            const b = before(this);
+            const r = (origPauseResume as (this: TimeService) => void).call(this);
+            bump("notifyPauseResume", before(this) - b);
+            return r;
+        } as never;
+
+        const v0 = ts.nowMs(), w0 = performance.now();
+        try {
+            await delay(sampleMs, ctx.signal);
+        } finally {
+            proto.advanceVirtualTime = origAdvance;
+            proto.creditIdleMs = origCredit;
+            proto.reanchorToWallClock = origReanchor;
+            proto.notifyPauseResume = origPauseResume;
+            virtualTimeSourcesBusy = false;
+        }
+        const v1 = ts.nowMs(), w1 = performance.now();
+        const dv = v1 - v0, dw = w1 - w0;
+        const kinds = [...byKind.entries()]
+            .map(([kind, r]) => ({ kind, calls: r.calls, ms: +r.ms.toFixed(1) }))
+            .sort((a, b) => b.ms - a.ms);
+        const rows = [...tally.entries()]
+            .map(([caller, r]) => ({ caller, sampledCalls: r.calls, sampledMs: +r.ms.toFixed(1) }))
+            .sort((a, b) => b.sampledMs - a.sampledMs);
+        const creditedMs = kinds.reduce((s, r) => s + r.ms, 0);
+        return {
+            virtualTimeActive: true,
+            sampleMs: +dw.toFixed(1),
+            virtualDeltaMs: +dv.toFixed(1),
+            rate: +(dv / dw).toFixed(3),
+            // Complete: every credit in the window, by entry point.
+            creditedMs: +creditedMs.toFixed(1),
+            unattributedMs: +(dv - creditedMs).toFixed(1),
+            byKind: kinds,
+            // Sampled: caller frames for one credit in `stackEveryNth`. Rank them, don't sum them.
+            stackSampling: { everyNth: stackEveryNth, credits, stacksTaken },
+            rows: rows.slice(0, 20),
+        };
+    });
+
+    /** guestSteps({arm,reset,disarm,budgetMs,maxBuckets,sampleMs}) — the dt the GUEST observes
+     *  per frame, and above all its MAXIMUM.
+     *
+     *  `guestTime`/`virtualTimeSources` report a rate, and a rate is a mean: a stall shows up
+     *  there as a perfectly healthy 1.000 while the guest is handed one multi-second delta
+     *  (CLAUDE.md §3.5 — the credit cap bounds ONE credit, not the delta between two clock
+     *  reads). A dt-driven animation/cutscene/physics step skips by exactly that delta.
+     *
+     *  Each step carries its wall twin, so "we stalled honestly" (guestMs ~= wallMs) and "we
+     *  fabricated time" (guestMs >> wallMs) are told apart from one window.
+     *
+     *  Arm it BEFORE the phase you care about and read it after — `sampleMs` is the
+     *  self-contained variant (arm, wait, read) for a short window. */
+    svc.register("guestSteps", async (args, ctx: HarnessCtx) => {
+        const o = (args[0] ?? {}) as {
+            arm?: boolean; disarm?: boolean; reset?: boolean;
+            budgetMs?: number; maxBuckets?: number; sampleMs?: number;
+        };
+        if (o.disarm) {
+            guestTimeSteps.disarm();
+            return { armed: false };
+        }
+        if (o.arm || o.reset || o.sampleMs !== undefined) guestTimeSteps.arm(o.budgetMs);
+        if (o.sampleMs !== undefined) await delay(Math.max(1, Number(o.sampleMs)), ctx.signal);
+        return { armed: guestTimeSteps.isArmed(), ...guestTimeSteps.report(o.maxBuckets) };
     });
 
     /** watchFrames(on?) — enable/disable the per-present frameRendered event
@@ -116,6 +313,79 @@ export function registerTimeCommands(svc: HarnessService): void {
             if (fn) { fn(); parked = true; } else { try { await v86?.stop?.(); parked = true; } catch { /* */ } }
         }
         return { frames: n, startSerial: start, endSerial: render.getPresentSerial() >>> 0, ms: performance.now() - t0, presenter: render.getLastPresenterKind?.() ?? null, parked };
+    });
+
+    /** stepFrames(n=1, {capture?, backend?, timeoutMs?}) — advance EXACTLY n presents from a
+     *  parked guest and park again, inside ONE rpc.
+     *
+     *  `tickFrames(n,{park:true})` already resumes-waits-parks, but a paused inspection
+     *  session also wants the frame's per-draw capture, and arming that from a second CLI
+     *  round-trip lets the guest run free in between — the frame you inspect is then not the
+     *  frame you stepped. `capture:true` arms the CaptureBus BEFORE the resume; the capture
+     *  discards the in-progress frame and records the next, so it may consume one present
+     *  beyond `n` (reported as `endSerial`, never hidden).
+     *
+     *  Reports the present serial on both sides and the paused state afterwards: a step that
+     *  did not step (present serial unchanged, or the guest left running) reads as such
+     *  instead of as success. */
+    svc.register("stepFrames", async (args, ctx: HarnessCtx) => {
+        const n = Math.max(1, Number(args[0] ?? 1) | 0);
+        const opts = (args[1] ?? {}) as { capture?: boolean; backend?: string; timeoutMs?: number };
+        const render: any = sys().services?.render;
+        if (!render?.getPresentSerial) throw new HarnessError("render service unavailable", HarnessErrorCode.NO_PROCESS);
+        const v86: any = proc()?.v86;
+        const wasRunning = !!v86?.is_running?.();
+        const timeoutMs = opts.timeoutMs ?? 30_000;
+        const t0 = performance.now();
+
+        // Arm the capture while the guest is still parked, so no frame can slip past it.
+        let capPromise: Promise<unknown> | null = null;
+        if (opts.capture) capPromise = frameCaptureStart(opts.backend);
+
+        const start = render.getPresentSerial() >>> 0;
+        if (!wasRunning) (globalThis as any).__harnessResume?.();
+
+        let timedOut = false;
+        const target = start + n;
+        while ((render.getPresentSerial() >>> 0) < target) {
+            if (ctx.signal.aborted) throw ctx.signal.reason ?? new HarnessError("aborted", HarnessErrorCode.CANCELLED);
+            if (performance.now() - t0 > timeoutMs) { timedOut = true; break; }
+            await delay(4, ctx.signal);
+        }
+
+        let capture: unknown = null;
+        let captureError: string | null = null;
+        if (capPromise) {
+            try {
+                capture = await Promise.race([
+                    capPromise,
+                    (async () => {
+                        while (performance.now() - t0 <= timeoutMs) await delay(4, ctx.signal);
+                        throw new HarnessError(`capture did not complete within ${timeoutMs}ms`, HarnessErrorCode.TIMEOUT);
+                    })(),
+                ]);
+            } catch (e) {
+                captureError = (e as Error).message;
+                frameCaptureCancel(e instanceof Error ? e : new Error(String(e)));
+            }
+        }
+
+        const fn = (globalThis as any).__harnessPause;
+        if (fn) fn(); else { try { await v86?.stop?.(); } catch { /* park is best-effort without the hook */ } }
+        const endSerial = render.getPresentSerial() >>> 0;
+        return {
+            requested: n,
+            startSerial: start,
+            endSerial,
+            advanced: (endSerial - start) >>> 0,
+            wasRunning,
+            paused: !!sys().isPaused,
+            timedOut,
+            ms: performance.now() - t0,
+            presenter: render.getLastPresenterKind?.() ?? null,
+            capture,
+            captureError,
+        };
     });
 
     svc.register("waitUntil", async (args, ctx: HarnessCtx) => {

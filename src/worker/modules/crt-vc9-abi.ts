@@ -89,8 +89,6 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
     };
     exports["??_V@YAXPAX@Z"] = (_ctx, _mem, args) => host.free(args[0] ?? 0);
 
-    // _except_handler4_common — registered by crt-vc9-seh.ts (semantic)
-
     exports["_CIatan"] = () => {
         try {
             const x = fpuGetST(host.process.v86, 0);
@@ -133,6 +131,19 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
         let n = 0;
         for (; n < str.length && str.charCodeAt(n) !== 0; n++) {
             if (rejSet.has(str[n]!)) break;
+        }
+        return n;
+    };
+
+    exports["strspn"] = (_ctx, _mem, args) => {
+        const s = args[0] ?? 0;
+        const accept = args[1] ?? 0;
+        if (!s || !accept) return 0;
+        const str = host.readCString(s, 0x10000);
+        const accSet = new Set(host.readCString(accept, 256).split(""));
+        let n = 0;
+        for (; n < str.length; n++) {
+            if (!accSet.has(str[n]!)) break;
         }
         return n;
     };
@@ -215,18 +226,10 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
             host.setErrno(2);
             return 0;
         }
-        const result = host.getcwd(buffer, maxLen);
-        if (!buffer || !result) return result;
-        const path = host.readCString(result, maxLen);
-        if (!path.match(/^[A-Za-z]:/)) {
-            const prefixed = `C:\\${path.replace(/^\\+/, "")}`;
-            if (prefixed.length >= maxLen) {
-                host.setErrno(34);
-                return 0;
-            }
-            host.writeCString(buffer, prefixed);
-        }
-        return buffer >>> 0;
+        // Drive qualification and the buffer==NULL allocation size both live in getcwd, so
+        // the two forms cannot diverge (they did while the fix-up lived here: it could only
+        // reach the caller-supplied-buffer form).
+        return host.getcwd(buffer, maxLen);
     };
 
     // C++ exception / type_info — minimal no-op stubs (Stage A)

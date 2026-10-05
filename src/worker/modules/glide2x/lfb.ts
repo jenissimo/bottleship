@@ -265,6 +265,8 @@ function revokeLock(context: GlideContext): void {
         surface.activeLeaseId = 0;
         if (lock.writeAccess) {
             surface.dirty = true;
+            context.lfbContentVersion++;
+            context.lfbWriteMark = context.stream.commandCount;
         }
     }
     context.activeLfbLock = null;
@@ -366,6 +368,81 @@ export function destroyLfbSurfaces(context: GlideContext): void {
     context.activeLfbLock = null;
 }
 
+/**
+ * Publish the rendered frame into an LFB surface before the guest reads it.
+ *
+ * A read lock on the front/back buffer is the guest asking for the pixels the
+ * rasterizer produced, not for its own last writes. The executor keeps a CPU
+ * mirror of the render target (armed here, on the first read); this converts it
+ * into the surface's own pixel layout so a post-process reads a real frame.
+ */
+export function syncSurfaceFromRenderedFrame(
+    context: GlideContext,
+    surface: GlideLfbSurfaceState,
+    // Only a GUEST read may set lfbReadThisFrame: it feeds the composite-order
+    // decision, so a debug dump that set it would change the frame it is inspecting.
+    fromGuestRead = true,
+): void {
+    const executor = context.executor;
+    if (!executor) return;
+    if (fromGuestRead) context.lfbReadThisFrame = true;
+    // Once per frame: a second sync would overwrite what the guest wrote after the first.
+    if (context.lfbSyncedFrame === context.frameSnapshot.frameId) return;
+    context.lfbSyncedFrame = context.frameSnapshot.frameId;
+    // We are about to rewrite the surface behind the presenter's back; its cached
+    // RGBA conversion is keyed on "the guest did not write since the last present"
+    // and this write is not the guest's.
+    context.lfbRgbaSource = 0;
+    context.lfbContentVersion++;
+    executor.enableFramebufferMirror();
+    const mirror = executor.getFramebufferMirror();
+    if (!mirror) return;
+
+    const width = Math.min(surface.width, mirror.width);
+    const height = Math.min(surface.height, mirror.height);
+    if (width <= 0 || height <= 0) return;
+
+    const bpp = surface.bytesPerPixel;
+    const row = new Uint8Array(surface.pitch);
+    const src = mirror.rgba;
+
+    for (let y = 0; y < height; y++) {
+        const srcRow = y * mirror.width * 4;
+        if (bpp === 2) {
+            for (let x = 0; x < width; x++) {
+                const s = srcRow + x * 4;
+                const r = src[s] ?? 0, g = src[s + 1] ?? 0, b = src[s + 2] ?? 0;
+                let packed: number;
+                switch (surface.writeMode) {
+                    case GR_LFBWRITEMODE_555:
+                        packed = (((r >> 3) & 0x1f) << 10) | (((g >> 3) & 0x1f) << 5) | ((b >> 3) & 0x1f);
+                        break;
+                    case GR_LFBWRITEMODE_1555:
+                        packed = 0x8000 | (((r >> 3) & 0x1f) << 10) | (((g >> 3) & 0x1f) << 5) | ((b >> 3) & 0x1f);
+                        break;
+                    default: // 565 — the Voodoo's natural 16-bit colour buffer
+                        packed = (((r >> 3) & 0x1f) << 11) | (((g >> 2) & 0x3f) << 5) | ((b >> 3) & 0x1f);
+                        break;
+                }
+                row[x * 2] = packed & 0xff;
+                row[x * 2 + 1] = (packed >>> 8) & 0xff;
+            }
+        } else if (bpp === 4) {
+            for (let x = 0; x < width; x++) {
+                const s = srcRow + x * 4;
+                // ARGB in memory order for the default GR_COLORFORMAT_ARGB lane mapping.
+                row[x * 4] = src[s + 2] ?? 0;
+                row[x * 4 + 1] = src[s + 1] ?? 0;
+                row[x * 4 + 2] = src[s] ?? 0;
+                row[x * 4 + 3] = 0xff;
+            }
+        } else {
+            return;
+        }
+        Mem.writeBytes(surface.dataPtr + y * surface.pitch, row.subarray(0, width * bpp));
+    }
+}
+
 export function createLfbExports(context: GlideContext): Record<string, ThunkImplementation> {
     return {
         "_grLfbLock@24": (_ctx, _mem, args) => {
@@ -375,13 +452,12 @@ export function createLfbExports(context: GlideContext): Record<string, ThunkImp
             // resolve it to 565 (our default 16-bit color buffer) and report that back,
             // otherwise the caller reads info->writeMode == 0xFF and can't pack pixels.
             const requestedWriteMode = args[2] | 0;
-            const writeMode = requestedWriteMode === GR_LFBWRITEMODE_ANY ? GR_LFBWRITEMODE_565 : requestedWriteMode;
             const origin = args[3] | 0;
             const infoPtr = args[5] >>> 0;
             if (shouldLogEntry(context)) {
                 Logger.log(
                     LogCategory.SYSTEM,
-                    `[Glide] grLfbLock type=${lockType} buf=${buffer} writeMode=${writeMode} ` +
+                    `[Glide] grLfbLock type=${lockType} buf=${buffer} writeMode=${requestedWriteMode} ` +
                     `origin=${origin} infoPtr=0x${infoPtr.toString(16)} winOpen=${context.winOpen}`,
                 );
             }
@@ -393,6 +469,13 @@ export function createLfbExports(context: GlideContext): Record<string, ThunkImp
 
             const writeAccess = lockType !== GR_LFB_READ_ONLY;
             const targetBuffer = resolveTargetBuffer(context, buffer);
+            // A READ lock names no write mode, so it must not choose one: coercing ANY to
+            // 565 here would re-lay an existing 8888 surface and then read it back in the
+            // wrong format. Only a write lock may (re)configure the surface.
+            const existingMode = context.lfbSurfaces.get(targetBuffer)?.writeMode;
+            const writeMode = requestedWriteMode === GR_LFBWRITEMODE_ANY
+                ? (existingMode ?? GR_LFBWRITEMODE_565)
+                : requestedWriteMode;
             const surface = ensureSurfaceForBuffer(context, targetBuffer, writeMode);
             if (!surface) return FXFALSE;
 
@@ -410,6 +493,14 @@ export function createLfbExports(context: GlideContext): Record<string, ThunkImp
             if (!leaseId) {
                 setLfbError(context, 0x4011, "grLfbLock failed: lease conflict");
                 return FXFALSE;
+            }
+
+            // A read lock obviously needs the frame. A WRITE lock does too once the
+            // guest has read the frame this frame: it is writing back a post-process,
+            // and the pixels it does not touch must still be the frame, not the
+            // backdrop the guest last wrote.
+            if (!writeAccess || context.lfbReadThisFrame) {
+                syncSurfaceFromRenderedFrame(context, surface);
             }
 
             surface.activeLeaseId = leaseId;
@@ -434,6 +525,7 @@ export function createLfbExports(context: GlideContext): Record<string, ThunkImp
             );
 
             context.frameSnapshot.lfbLocks++;
+            if (!writeAccess) context.frameSnapshot.lfbReadLocks++;
             context.diagnostics.push("lfb_lock", `buf=${targetBuffer} lease=${leaseId} mode=${writeMode}`);
             return FXTRUE;
         },
@@ -518,6 +610,9 @@ export function createLfbExports(context: GlideContext): Record<string, ThunkImp
             if (!dstPtr || width <= 0 || height <= 0) return FXFALSE;
             const surface = context.lfbSurfaces.get(buffer) ?? context.lfbSurfaces.get(context.renderBuffer);
             if (!surface) return FXFALSE;
+            // Same contract as a read lock: this reads the frame buffer, not our copy of
+            // what the guest last wrote into it.
+            syncSurfaceFromRenderedFrame(context, surface);
 
             const rowBytes = width * surface.bytesPerPixel;
             const effectiveDstStride = dstStride > 0 ? dstStride : rowBytes;
@@ -628,6 +723,8 @@ export function createLfbExports(context: GlideContext): Record<string, ThunkImp
 
             const ok = copyRegionFromGuest(surface, dstX, dstY, width, height, srcStride, srcPtr, effectiveBpp);
             if (ok) {
+                context.lfbWriteMark = context.stream.commandCount;
+                context.lfbContentVersion++;
                 context.frameSnapshot.lfbWrites++;
                 context.diagnostics.push("lfb_write", `buf=${targetBuffer} ${width}x${height} fmt=${srcFormat} bpp=${effectiveBpp}`);
             }

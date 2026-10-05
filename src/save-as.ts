@@ -44,14 +44,15 @@ export async function writeBytesToFileHandle(
     data: BlobPart,
     onProgress?: WriteProgressFn,
 ): Promise<void> {
-    const bytes = await toUint8Array(data);
-    const total = bytes.byteLength;
+    const blob = data instanceof Blob ? data : null;
+    const bytes = blob ? null : await toUint8Array(data);
+    const total = blob ? blob.size : bytes!.byteLength;
     onProgress?.(0, total);
     const w = await handle.createWritable();
     try {
         for (let offset = 0; offset < total; offset += WRITE_CHUNK_BYTES) {
             const end = Math.min(offset + WRITE_CHUNK_BYTES, total);
-            await w.write(asWriteChunk(bytes.subarray(offset, end)));
+            await w.write(blob ? blob.slice(offset, end) : asWriteChunk(bytes!.subarray(offset, end)));
             onProgress?.(end, total);
         }
         await w.close();

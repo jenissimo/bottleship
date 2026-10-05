@@ -15,6 +15,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { Scheduler } from "../../src/worker/core/scheduler/scheduler";
+import { CallbackManager } from "../../src/worker/core/thunking/callback-manager";
 import {
     ThreadState,
     THREAD_STATE_NAMES,
@@ -24,6 +25,7 @@ import {
     isValidTransition,
     WAIT_OBJECT_0,
     WAIT_BLOCKED_NO_SWITCH,
+    WAIT_TIMEOUT,
     INFINITE,
     type Thread,
     type CpuContext,
@@ -36,8 +38,13 @@ import {
     createPostReturnContext,
 } from "../../src/worker/core/scheduler/scheduler-context";
 import { TARGET_INSN_PER_MS } from "../../src/worker/core/scheduler/timing";
+import {
+    DEFAULT_SCHEDULER_CONFIG, MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED,
+} from "../../src/worker/core/scheduler/types";
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { hasFpuSimdDirtyFlag } from "../../src/worker/core/fpu-helper";
+import { System } from "../../src/worker/core/system";
+import { preemptionManager, PreemptionManager } from "../../src/worker/core/cpu/preemption-manager";
 
 const ALL_STATES: ThreadState[] = [
     ThreadState.CREATED,
@@ -333,6 +340,145 @@ describe("scheduler/markThreadRunningAfterAsyncWake — READY(current) -> RUNNIN
         expect(s.markThreadRunningAfterAsyncWake(1)).toBe(false);
         expect((s as any).threads.get(1).state).toBe(ThreadState.READY);
     });
+
+    test("repairs divergent callee-saved registers and increments the repair counter", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+        t.context = {
+            eax: 0x11111111, ecx: 0x22222222, edx: 0x33333333, ebx: 0x44444444,
+            esp: 0x0028aa00, ebp: 0x55555555, esi: 0x66666666, edi: 0x77777777,
+            eip: 0x00401000, eflags: 0x246, domain: "spin",
+        };
+        const cpu = fakeCpu({ eax: 0xaaaaaaaa, esp: 0x0028bb00, ebp: 0xbbbbbbbb, eip: 0x00402000, eflags: 0x202 });
+        cpu.reg32[1] = 0xbbbbbbbb;
+        cpu.reg32[2] = 0xcccccccc;
+        cpu.reg32[3] = 0xdddddddd;
+        cpu.reg32[6] = 0xeeeeeeee;
+        cpu.reg32[7] = 0xffffffff;
+
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(Array.from(cpu.reg32)).toEqual([
+            0x11111111, 0x22222222, 0x33333333, 0x44444444,
+            0x0028aa00, 0x55555555, 0x66666666, 0x77777777,
+        ].map(value => value | 0));
+        expect(cpu.flags[0] >>> 0).toBe(0x246);
+        expect(s.asyncWakeRegisterRepairs).toBe(1);
+    });
+
+    test("restores the parked x87 FPU and SSE state before async completion", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+        const parkedFpu = new Uint8Array(134);
+        parkedFpu[0] = 0x47;
+        parkedFpu[128] = 0x03;
+        const parkedSimd = new Uint8Array(132);
+        parkedSimd[0] = 0xc0; // MXCSR low byte
+        parkedSimd[4] = 0x58; // XMM0 byte 0
+        t.context = {
+            eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0x0028aa00, ebp: 0, esi: 0, edi: 0,
+            eip: 0x00401000, eflags: 0x202, domain: "spin", fpu: parkedFpu, simd: parkedSimd,
+        };
+        const cpu = fakeCpuWithWasm();
+        const wasm = new Uint8Array((cpu as any).wasm_memory.buffer);
+        wasm[FPU_ST_WASM_OFFSET] = 0x11;
+        wasm[MXCSR_WASM_OFFSET] = 0x80;
+        wasm[REG_XMM_WASM_OFFSET] = 0x22;
+        (cpu as any).fpu_simd_dirty[0] = 1;
+
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(wasm[FPU_ST_WASM_OFFSET]).toBe(0x47);
+        expect(wasm[FPU_SIMD_DIRTY_WASM_OFFSET]).toBe(0);
+        expect(wasm[MXCSR_WASM_OFFSET]).toBe(0xc0);
+        expect(wasm[REG_XMM_WASM_OFFSET]).toBe(0x58);
+    });
+
+    // `thread.context` is non-null exactly while the thread is NOT live in the CPU. The
+    // async-wake restore consumes the parked snapshot, so it must leave the invariant the
+    // way the switch path does — otherwise a SECOND wake at the spin loop re-applies the
+    // FIRST park's registers over correct live ones, and reports it as a repair.
+    test("the parked context is consumed, not left for the next wake to re-apply", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+        t.context = {
+            eax: 0, ecx: 0, edx: 0, ebx: 0x44444444, esp: 0x0028aa00, ebp: 0x55555555,
+            esi: 0x66666666, edi: 0x77777777, eip: 0x00401000, eflags: 0x246, domain: "spin",
+        };
+        const cpu = fakeCpu({ esp: 0x0028bb00, eip: 0x00402000 });
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(t.context).toBeNull();
+        const repairsAfterFirst = s.asyncWakeRegisterRepairs;
+
+        // Second wake, no intervening park: the live register file is this thread's own,
+        // so the first park's snapshot must not be written over it — nor counted a repair.
+        t.state = ThreadState.READY;
+        cpu.reg32[3] = 0x0badf00d;
+        cpu.reg32[4] = 0x0028cc00;
+        expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+        expect(cpu.reg32[3] >>> 0).toBe(0x0badf00d);
+        expect(cpu.reg32[4] >>> 0).toBe(0x0028cc00);
+        expect(s.asyncWakeRegisterRepairs).toBe(repairsAfterFirst);
+    });
+
+    for (const consumer of ["startCallbackChain", "dllInits"] as const) {
+        test(`restores parked ESP before the ${consumer} async-wake branch`, () => {
+            const s = new Scheduler();
+            const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true, current: true });
+            t.context = {
+                eax: 0, ecx: 0, edx: 0, ebx: 0, esp: 0x0028aa00, ebp: 0, esi: 0, edi: 0,
+                eip: 0x00401000, eflags: 0x202, domain: "spin",
+            };
+            const cpu = fakeCpu({ esp: 0x0028bb00, eip: 0x00402000 });
+
+            expect(s.markThreadRunningAfterAsyncWake(1, cpu)).toBe(true);
+            // Both branches hand the live CPU directly to their callback-chain consumer;
+            // neither calls applyAsyncRestoreCpuState afterwards to repair the stack.
+            expect(cpu.reg32[4] >>> 0).toBe(0x0028aa00);
+        });
+    }
+});
+
+describe("callback-manager/callee-saved frame validity", () => {
+    test("does not restore stale ring values after a pre-boot capture skipped the registers", () => {
+        const captured = new Int32Array(8);
+        captured[3] = 0x11111111;
+        captured[5] = 0x22222222;
+        captured[6] = 0x33333333;
+        captured[7] = 0x44444444;
+        const manager = new CallbackManager(
+            { cpu: { reg32: captured } },
+            {} as any,
+            () => new Uint8Array(0x4000),
+        );
+
+        const first = (manager as any).allocateSuspendedFrame(1, 0x100, 0x200, 0, "first");
+        const firstSlot = (manager as any).findFrameIndexById(first);
+        const live = (manager as any).v86.cpu.reg32 as Int32Array;
+        live[3] = 0xaaaaaaa1;
+        (manager as any).restoreCalleeSavedAcrossCallback(firstSlot, first, "first");
+        expect(live[3] >>> 0).toBe(0x11111111);
+        expect(manager.calleeSavedRepairs).toBe(1);
+        expect(manager.getForensicState().calleeSavedRepairs).toBe(1);
+        (manager as any).releaseFrame(firstSlot);
+
+        // Force the ring allocator to reuse the old slot while v86 is still pre-boot.
+        (manager as any).frameWriteIdx = firstSlot;
+        (manager as any).v86.cpu = undefined;
+        const second = (manager as any).allocateSuspendedFrame(1, 0x300, 0x400, 0, "preboot");
+        const secondSlot = (manager as any).findFrameIndexById(second);
+        const postBootRegs = new Int32Array(8);
+        postBootRegs[3] = 0xdeadbeef;
+        postBootRegs[5] = 0xcafebabe;
+        postBootRegs[6] = 0x0badf00d;
+        postBootRegs[7] = 0xfeedface;
+        (manager as any).v86.cpu = { reg32: postBootRegs };
+
+        (manager as any).restoreCalleeSavedAcrossCallback(secondSlot, second, "preboot");
+        expect(Array.from(postBootRegs)).toEqual([
+            0, 0, 0, 0xdeadbeef, 0, 0xcafebabe, 0x0badf00d, 0xfeedface,
+        ].map(value => value | 0));
+        expect(manager.calleeSavedRepairs).toBe(1);
+        expect(manager.getForensicState().calleeSavedRepairs).toBe(1);
+    });
 });
 
 // ─── 5. suspend / resume / terminate (the bespoke-side-effect state writes) ────
@@ -348,6 +494,30 @@ describe("scheduler/suspendThread", () => {
         expect(t.suspendCount).toBe(1);
     });
 
+    // A thread that suspends ITSELF has yielded the CPU at that instruction (NT parks it on
+    // its suspend semaphore inside the call). Marking the state without asking for a switch
+    // let Discworld Noir's worker keep running past its own SuspendThread and call it again
+    // for the rest of the quantum — ~450k/s until the count saturated at 127 and every call
+    // was refused for the rest of the session.
+    test("suspending the CURRENT thread requests a switch away from it", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        (s as any).switchRequested = false;
+        s.suspendThread(t.handle);
+        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect((s as any).switchRequested).toBe(true);
+    });
+
+    test("suspending ANOTHER thread does not request a switch", () => {
+        const s = new Scheduler();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const other = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        (s as any).switchRequested = false;
+        s.suspendThread(other.handle);
+        expect(other.state).toBe(ThreadState.SUSPENDED);
+        expect((s as any).switchRequested).toBe(false);
+    });
+
     test("READY -> SUSPENDED removes it from the run queue", () => {
         const s = new Scheduler();
         const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true });
@@ -356,11 +526,17 @@ describe("scheduler/suspendThread", () => {
         expect((s as any).runQueue).not.toContain(1);
     });
 
-    test("WAITING -> SUSPENDED (deferred resume checks suspendCount later)", () => {
+    // Suspension is ORTHOGONAL to waiting (NT carries it on the suspend APC, so the wait
+    // object still satisfies the wait underneath). A real wait therefore stays WAITING —
+    // see the "suspend ⟂ wait" block below for the behaviour that depends on it.
+    test("WAITING stays WAITING — suspendCount alone takes it off the CPU", () => {
         const s = new Scheduler();
         const t = inject(s, mkThread(1, ThreadState.WAITING));
+        t.waitInfo = { reason: WaitReason.SINGLE_OBJECT, handles: [0x1234], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0 } as any;
         s.suspendThread(t.handle);
-        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect(t.state).toBe(ThreadState.WAITING);
+        expect(t.suspendCount).toBe(1);
+        expect(t.waitInfo).not.toBeNull();
     });
 
     test("nested suspend increments count, stays SUSPENDED", () => {
@@ -377,6 +553,37 @@ describe("scheduler/suspendThread", () => {
         const t = inject(s, mkThread(1, ThreadState.TERMINATED));
         expect(s.suspendThread(t.handle) >>> 0).toBe(0xFFFFFFFF);
         expect(t.state).toBe(ThreadState.TERMINATED);
+    });
+
+    // Engines that use Suspend/Resume as a spin-sync primitive out-suspend their own
+    // resumes; Win32 refuses past MAXIMUM_SUSPEND_COUNT instead of counting on forever.
+    test("refuses past MAXIMUM_SUSPEND_COUNT: -1, count pinned, ERROR_SIGNAL_REFUSED", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        t.suspendCount = MAXIMUM_SUSPEND_COUNT - 1;
+        expect(s.suspendThread(t.handle)).toBe(MAXIMUM_SUSPEND_COUNT - 1); // last one allowed
+        expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT);
+
+        expect(s.suspendThread(t.handle) >>> 0).toBe(0xFFFFFFFF);
+        expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT); // NOT 128
+        expect(t.lastError).toBe(ERROR_SIGNAL_REFUSED);
+    });
+
+    // The fast path answers the refusal ITSELF (suspendThread sets the last error, and
+    // setLastError syncs the page GetLastError reads). Deferring it sent the engine that
+    // saturates the count — the very engine this fast path exists for — through the
+    // slow-dispatch swarm on every one of its ~1.4M calls/s.
+    test("suspendThreadFast answers the cap refusal without deferring", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        t.suspendCount = MAXIMUM_SUSPEND_COUNT - 1;
+        expect(s.suspendThreadFast(t.handle)).toBe(MAXIMUM_SUSPEND_COUNT - 1);
+
+        const refused = s.suspendThreadFast(t.handle);
+        expect(refused).not.toBeNull();                 // NOT deferred to the slow path
+        expect(refused! >>> 0).toBe(0xFFFFFFFF);
+        expect(t.suspendCount).toBe(MAXIMUM_SUSPEND_COUNT);
+        expect(t.lastError).toBe(ERROR_SIGNAL_REFUSED); // the failure is fully reported here
     });
 });
 
@@ -397,6 +604,245 @@ describe("scheduler/resumeThread", () => {
         expect(s.resumeThread(t.handle)).toBe(2);
         expect(t.suspendCount).toBe(1);
         expect(t.state).toBe(ThreadState.SUSPENDED);
+    });
+});
+
+// ─── 5b. suspend ⟂ wait ────────────────────────────────────────────────────────
+// Suspension is a SEPARATE condition from the wait. NT models it as the builtin
+// suspend APC: the APC breaks the wait, blocks on the thread's suspend semaphore
+// (thredsup.c KiSuspendThread), and on resume the wait is RE-ENTERED with the
+// original due time (wait.c, the STATUS_KERNEL_APC arm + KiComputeWaitInterval).
+// Observably: the object still satisfies the wait, the timeout deadline keeps
+// running, and suspendCount — not the state — is what keeps the thread off the CPU.
+//
+// Our shape: the thread stays WAITING while suspended (so every waker still finds
+// it); a SATISFIED wait parks in SUSPENDED with the result already in EAX; a
+// consuming signal skips a suspended waiter (NT unlinks its wait block) and the
+// last ResumeThread re-evaluates instead.
+
+/** Park a thread on `h` from READY (so several can wait on one handle in one test). */
+function blockOn(s: Scheduler, t: Thread, handles: number[], timeoutMs: number | null = null, eip = 0x402000): Thread {
+    const ctx = { eip, esp: 0x290000, eax: 0 } as CpuContext;
+    (s as any).blockThread(t, WaitReason.SINGLE_OBJECT, handles, false, timeoutMs, false, 0, ctx);
+    return t;
+}
+
+// Resuming a thread readies it, and the resumer is normally waiting on what it released —
+// the same reason wakeThread asks for a switch. Only the SUSPENDED->READY transition asks:
+// an engine that calls ResumeThread once per main-loop iteration (Discworld Noir, ~11k per
+// frame) would otherwise force a context switch on every one.
+describe("scheduler/resumeThread — switch policy", () => {
+    test("the transition out of SUSPENDED requests a switch", () => {
+        const s = new Scheduler();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t = inject(s, mkThread(2, ThreadState.RUNNING));
+        s.suspendThread(t.handle);
+        (s as any).switchRequested = false;
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect((s as any).switchRequested).toBe(true);
+    });
+
+    test("a resume of an already-runnable thread does not", () => {
+        const s = new Scheduler();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        (s as any).switchRequested = false;
+        s.resumeThread(t.handle);
+        expect((s as any).switchRequested).toBe(false);
+    });
+});
+
+describe("scheduler/suspend ⟂ wait", () => {
+    test("a signal that arrives while suspended is delivered on resume", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);        // auto-reset, unsignaled
+        blockOn(s, t, [h]);
+        expect(t.state).toBe(ThreadState.WAITING);
+
+        s.suspendThread(t.handle);
+        s.setEvent(h);
+
+        // Skipped by the wake scan — it cannot act on the signal — so it is neither
+        // readied nor holding the event: still parked, still registered.
+        expect(t.state).toBe(ThreadState.WAITING);
+        expect((s as any).runQueue).not.toContain(1);
+        expect((s as any).waitEngine.getHandleWaiters(h)).toContain(1);
+
+        // The last resume re-evaluates the wait: the latched signal is consumed now.
+        expect(s.resumeThread(t.handle)).toBe(1);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(t.context!.eax >>> 0).toBe(WAIT_OBJECT_0);
+        expect((s as any).runQueue).toContain(1);
+        expect((s as any).waitEngine.getHandleWaiters(h)).not.toContain(1);
+    });
+
+    test("resume of a still-unsatisfied wait returns to WAITING, not READY", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);        // never signaled
+        blockOn(s, t, [h]);
+
+        s.suspendThread(t.handle);
+        expect(s.resumeThread(t.handle)).toBe(1);
+
+        expect(t.state).toBe(ThreadState.WAITING);    // NOT a return from a wait that never completed
+        expect(t.suspendCount).toBe(0);
+        expect(t.waitInfo!.handles).toEqual([h]);
+        expect((s as any).runQueue).not.toContain(1);
+        expect((s as any).waitEngine.getHandleWaiters(h)).toContain(1);
+        expect(t.context!.eax >>> 0).toBe(0);         // no result was invented
+    });
+
+    test("a wait satisfied while suspended parks in SUSPENDED, off the run queue, until resumed", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const ctx = { eip: 0x402000, esp: 0x290000, eax: 0 } as CpuContext;
+        // A MESSAGE wait consumes nothing on wake, so it is delivered to a suspended
+        // waiter rather than skipped — the guest re-polls its queue when it runs again.
+        (s as any).blockThread(t, WaitReason.MESSAGE, [], false, null, false, 0, ctx);
+
+        s.suspendThread(t.handle);
+        s.wakeMessageWaiters();
+
+        expect(t.state).toBe(ThreadState.SUSPENDED);  // wait complete, suspend still holds it
+        expect(t.waitInfo).toBeNull();
+        expect(t.context!.eax >>> 0).toBe(1);         // WaitMessage TRUE, banked
+        expect((s as any).runQueue).not.toContain(1);
+        expect((s as any).pickNextRunnable()).toBeNull();
+
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect((s as any).runQueue).toContain(1);
+        expect(t.context!.eax >>> 0).toBe(1);         // the result survived the suspension
+    });
+
+    test("a timed wait suspended mid-flight still times out on schedule", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);
+        blockOn(s, t, [h], 50);
+        expect(t.waitInfo!.timeoutTimerId).toBeGreaterThan(0);
+
+        s.suspendThread(t.handle);
+        const now = (s as any).timeService.nowMs();
+        expect(s.timerWheel.poll(now + 60)).toBe(1);  // the deadline is absolute, not "while running"
+
+        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect(t.waitInfo).toBeNull();
+        expect(t.context!.eax >>> 0).toBe(WAIT_TIMEOUT);
+
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(t.context!.eax >>> 0).toBe(WAIT_TIMEOUT);
+    });
+
+    test("nested suspends: the wait is delivered only when the LAST one drains", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);
+        blockOn(s, t, [h]);
+
+        s.suspendThread(t.handle);
+        s.suspendThread(t.handle);
+        expect(t.suspendCount).toBe(2);
+        s.setEvent(h);
+
+        expect(s.resumeThread(t.handle)).toBe(2);
+        expect(t.suspendCount).toBe(1);
+        expect(t.state).toBe(ThreadState.WAITING);    // still suspended → no re-evaluation
+        expect((s as any).runQueue).not.toContain(1);
+
+        expect(s.resumeThread(t.handle)).toBe(1);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(t.context!.eax >>> 0).toBe(WAIT_OBJECT_0);
+    });
+
+    test("a consuming signal goes to the runnable waiter, never to the suspended one", () => {
+        // NT unlinks a suspended thread's wait block, so an auto-reset event cannot be
+        // swallowed by a thread that will not run. Guards the skip in
+        // wakeWaitingThreadsForHandle against being dropped when the state stops saying it.
+        const s = new Scheduler();
+        const t1 = inject(s, mkThread(1, ThreadState.READY), { runnable: true });
+        const t2 = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        const h = s.createEvent(false, false);        // auto-reset: exactly one winner
+        blockOn(s, t1, [h]);
+        blockOn(s, t2, [h], null, 0x403000);
+
+        s.suspendThread(t1.handle);                   // T1 is first in the waiter set
+        s.setEvent(h);
+
+        expect(t2.state).toBe(ThreadState.READY);
+        expect(t2.context!.eax >>> 0).toBe(WAIT_OBJECT_0);
+        expect(t1.state).toBe(ThreadState.WAITING);   // still parked, holding nothing
+        expect(t1.context!.eax >>> 0).toBe(0);
+    });
+
+    test("a READY thread with suspendCount > 0 is never picked to run", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.READY), { runnable: true });
+        t.suspendCount = 1;
+        expect((s as any).pickNextRunnable()).toBeNull();
+        t.suspendCount = 0;
+        expect((s as any).pickNextRunnable()).toBe(t);
+    });
+
+    // The census is what makes this class observable in a live guest (no title in the sweep
+    // suspends a waiter on its own). An instrument that always reads 0 is worse than none, so
+    // pin that each counter actually moves on the event it names.
+    test("suspendWaitStats counts each interaction it names", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+        const h = s.createEvent(false, false);
+        blockOn(s, t, [h]);
+
+        s.suspendThread(t.handle);
+        expect(s.suspendWaitStats.suspendOnWaiting).toBe(1);
+
+        s.setEvent(h);
+        expect(s.suspendWaitStats.skippedSuspendedWaiter).toBe(1);
+
+        s.resumeThread(t.handle);
+        expect(s.suspendWaitStats.reevalOnResume).toBe(1);
+        expect(s.suspendWaitStats.reevalSatisfied).toBe(1);
+
+        // A MESSAGE wake is delivered to a suspended waiter rather than skipped.
+        const t2 = inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        (s as any).blockThread(t2, WaitReason.MESSAGE, [], false, null, false, 0,
+            { eip: 0x403000, esp: 0x291000, eax: 0 } as CpuContext);
+        s.suspendThread(t2.handle);
+        s.wakeMessageWaiters();
+        expect(s.suspendWaitStats.wakeWhileSuspended).toBe(1);
+
+        t2.suspendCount = MAXIMUM_SUSPEND_COUNT;
+        s.suspendThread(t2.handle);
+        expect(s.suspendWaitStats.suspendRefused).toBe(1);
+
+        const t3 = inject(s, mkThread(3, ThreadState.WAITING));
+        t3.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0 } as any;
+        s.suspendThread(t3.handle);
+        expect(s.suspendWaitStats.suspendOnAsyncPark).toBe(1);
+        expect(s.suspendWaitStats.suspendOnWaiting).toBe(2); // t1 + t2, NOT the async park
+    });
+
+    // The async park is deliberately NOT orthogonal: it is not a guest wait, it is resumed by
+    // the dispatcher's pendingAsyncRestores FIFO, which RETRIES until the thread is runnable
+    // and so cannot lose a completion. Its guards are written against the state flip.
+    test("an async park is unchanged: WAITING -> SUSPENDED, and the completion is retried", () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.WAITING));
+        t.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false, timeoutTimerId: 0, alertable: false, csAddress: 0 } as any;
+        t.context = { eip: 0x402000, esp: 0x290000, eax: 0 } as CpuContext;
+
+        s.suspendThread(t.handle);
+        expect(t.state).toBe(ThreadState.SUSPENDED);
+        expect(s.isThreadAsyncParked(1)).toBe(false);
+        expect(s.wakeThreadForAsyncCompletion(1)).toBe(false);  // stays queued in the FIFO
+
+        s.resumeThread(t.handle);
+        expect(t.state).toBe(ThreadState.READY);
+        expect(s.wakeThreadForAsyncCompletion(1)).toBe(true);   // now the FIFO drains it
     });
 });
 
@@ -550,13 +996,23 @@ function v86ViewProxy(buffer: ArrayBuffer, offset: number, length: number): unkn
 }
 
 /** Fake CPU backed by a WASM-memory ArrayBuffer so simd/fpu snapshot can read it. */
+// v86 keeps the whole CPU state block at fixed offsets in wasm linear memory
+// (global_pointers.rs) and only PUBLISHES it as `cpu.reg32` & co. A fake whose register
+// file is a standalone array beside the buffer is not the same machine: a reader that
+// re-derives from `wasm_memory.buffer` writes somewhere this fake never looks, and the
+// test passes while asserting on the wrong bytes.
+const REG32_WASM_OFFSET = 64;
+const FLAGS_WASM_OFFSET = 120;
+const EIP_WASM_OFFSET = 556;
+const SREG_WASM_OFFSET = 668;
+
 function fakeCpuWithWasm(opts?: { exportDirtyFlag?: boolean; v86ViewProxy?: boolean }): V86Cpu {
     const buffer = new ArrayBuffer(4096);
     const cpu: Record<string, unknown> = {
-        reg32: new Int32Array(8),
-        instruction_pointer: new Int32Array(1),
-        flags: new Int32Array(1),
-        sreg: new Int16Array(8),
+        reg32: new Int32Array(buffer, REG32_WASM_OFFSET, 8),
+        instruction_pointer: new Int32Array(buffer, EIP_WASM_OFFSET, 1),
+        flags: new Int32Array(buffer, FLAGS_WASM_OFFSET, 1),
+        sreg: new Int16Array(buffer, SREG_WASM_OFFSET, 8),
         is_jumping: false,
         wasm_memory: { buffer },
     };
@@ -983,6 +1439,38 @@ describe("scheduler/thread-exit liveness — survivor switched in after a siblin
         expect(yielded).toBe(true);
     });
 
+    // A pause landing while every thread sleeps finds v86 already stopped by the yield, so it
+    // stops nothing; the yield's own resume then restarted the guest under the pause.
+    test("an idle-yield resume does not restart a paused CPU", () => {
+        const s = mkProcSched();
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        let runs = 0;
+        const any = s as any;
+        const arm = () => {
+            any.yieldCpu = fakeCpu({ eip: 0x00401000 });
+            any.yieldEngine = { run: () => { runs++; }, stop: () => {} };
+            any.yieldMs = 4;
+            any.yieldStartMs = performance.now();
+            s.intentionalYield = true;
+        };
+        const sys = System.getInstance();
+        const wasPaused = sys.isPaused;
+        try {
+            sys.isPaused = true;
+            arm();
+            any.resumeFromYield();
+            expect(runs).toBe(0);
+            expect(s.intentionalYield).toBe(false);
+
+            sys.isPaused = false;
+            arm();
+            any.resumeFromYield();
+            expect(runs).toBe(1);
+        } finally {
+            sys.isPaused = wasPaused;
+        }
+    });
+
     test("F4: the reaper does not delete the thread still marked current (no +5s door-slam)", () => {
         const s = mkProcSched();
         inject(s, mkThread(3, ThreadState.TERMINATED), { current: true });
@@ -1140,13 +1628,72 @@ describe("scheduler/non-preemptible slab-stub region", () => {
     });
 });
 
+// The callback pin (WndProc / Enum* chains) may delay a preemptive switch, but it may not
+// starve queued peers forever: guest code inside such a callback can wait on a peer thread
+// (UE1 runs its whole engine tick inside DispatchMessage and Core.dll spins `while(lock)
+// Sleep(0)`), and an unbounded defer makes that wait unsatisfiable — a hard freeze with a
+// non-empty run queue and zero context switches.
+describe("scheduler/callback pin cannot starve queued peers forever", () => {
+    function setup() {
+        const s = new Scheduler();
+        (s as any).process = { id: 1, getModule: () => undefined, getCurrentMemory: () => new Uint8Array(0x100) };
+        (s as any).lastDeadlockCheckMs = Number.MAX_SAFE_INTEGER;
+        const t1 = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t2 = mkThread(2, ThreadState.READY);
+        (t2 as any).tebAddress = 0x00050000;
+        t2.context = createInitialContext(0x00402000, 0x00290000);
+        inject(s, t2, { runnable: true });
+        t1.kernelPinCount = 1;                                  // inside a callback chain
+        return { s, t1, t2, cpu: fakeCpu({ eip: 0x00401000, esp: 0x0028ff00 }) };
+    }
+
+    test("a short pinned callback is NOT split", () => {
+        const { s, cpu } = setup();
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).currentThreadId).toBe(1);             // pin honored
+        expect((s as any).pinStarvationForced).toBe(0);
+    });
+
+    test("past the starvation bound the switch is forced", () => {
+        const { s, cpu } = setup();
+        (s as any).preemptAtTickBoundary(cpu);                  // starts the defer window
+        expect((s as any).currentThreadId).toBe(1);
+        // Backdate the window past the bound — the guest has held the pin too long.
+        (s as any).pinDeferSinceMs -= (Scheduler as any).PIN_STARVATION_MAX_MS + 1;
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).currentThreadId).toBe(2);             // peer finally runs
+        expect((s as any).pinStarvationForced).toBe(1);
+    });
+
+    test("releasing the pin ends the defer window", () => {
+        const { s, t1, cpu } = setup();
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).pinDeferSinceMs).toBeGreaterThan(0);
+        t1.kernelPinCount = 0;
+        (s as any).preemptAtTickBoundary(cpu);
+        expect((s as any).currentThreadId).toBe(2);
+        expect((s as any).pinDeferSinceMs).toBe(0);
+        expect((s as any).pinStarvationForced).toBe(0);         // not a starvation escape
+    });
+
+    test("unpinThread releases the OWNER's pin, not the current thread's", () => {
+        const { s, t1, t2 } = setup();
+        t2.kernelPinCount = 0;
+        (s as any).currentThreadId = 2;                         // owner is no longer current
+        s.unpinThread(1);
+        expect(t1.kernelPinCount).toBe(0);                      // owner released
+        expect(t2.kernelPinCount).toBe(0);                      // and nobody else charged
+    });
+});
+
 // The preemption quantum is measured in RETIRED GUEST INSTRUCTIONS (cpu.instruction_counter),
 // not performance.now(). This makes the switch point a deterministic function of guest state —
 // identical on Mac and PC — which removes the platform-dependent interleaving that shifted the
-// async/JIT OUT+RET-N window into the Re-Volt mac wild-ESP/EBP corruption. minQuantumMs=1 default
-// → 100_000-instruction budget (TARGET_INSN_PER_MS).
+// async/JIT OUT+RET-N window into the Re-Volt mac wild-ESP/EBP corruption. The budget is
+// minQuantumMs * TARGET_INSN_PER_MS — derived here, not restated, so retuning the quantum for
+// fidelity cannot silently invalidate these assertions.
 describe("scheduler/preemption quantum is instruction-based (deterministic)", () => {
-    const QUANTUM = TARGET_INSN_PER_MS; // minQuantumMs(1) * TARGET_INSN_PER_MS
+    const QUANTUM = DEFAULT_SCHEDULER_CONFIG.minQuantumMs * TARGET_INSN_PER_MS;
 
     test("not expired below the instruction budget; expired at/above it", () => {
         const s = new Scheduler();
@@ -1314,6 +1861,25 @@ function mkBlockableCurrent(s: Scheduler, id: number): Thread {
     return t;
 }
 
+const CALLER_CONTEXT = {
+    ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202,
+};
+
+describe("scheduler/NT delay semantics", () => {
+    test("sole-runnable Sleep(INFINITE) remains blocked without a timeout timer", () => {
+        const s = new Scheduler();
+        const t = mkBlockableCurrent(s, 1);
+
+        const ret = s.sleepWithContext(INFINITE, 0x401000, 0x10ffa00, CALLER_CONTEXT);
+
+        expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
+        expect(t.state).toBe(ThreadState.WAITING);
+        expect(t.waitInfo?.reason).toBe(WaitReason.SLEEP);
+        expect(t.waitInfo?.timeoutTimerId).toBe(0);
+        expect((s as any).runQueue).toHaveLength(0);
+    });
+});
+
 describe("scheduler/blockThread — lost-wakeup guard (WASM SetEvent/Wait race)", () => {
     test("auto-reset event latched in the mirror during the window wakes the thread (not stuck WAITING)", () => {
         const s = new Scheduler();
@@ -1434,6 +2000,26 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
 });
 
 describe("scheduler/waitForSingleObjectWithContext — blocked with runnable peer", () => {
+    test("zero-timeout probe stays non-blocking but yields fairly to a READY peer", () => {
+        const s = new Scheduler();
+        const t1 = mkBlockableCurrent(s, 1);
+        inject(s, mkThread(2, ThreadState.READY), { runnable: true });
+        const h = s.createEvent(true, false);
+
+        const ret = s.waitForSingleObjectWithContext(
+            h,
+            0,
+            0x401000,
+            0x10ffa00,
+            { ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202 },
+        );
+
+        expect(ret).toBe(WAIT_TIMEOUT);
+        expect(t1.state).toBe(ThreadState.RUNNING);
+        expect(t1.waitInfo).toBeNull();
+        expect((s as any).switchRequested).toBe(true);
+    });
+
     test("returns WAIT_BLOCKED_NO_SWITCH when blocking with requestSwitch (not WAIT_OBJECT_0 to sync thunk)", () => {
         const s = new Scheduler();
         const t1 = mkBlockableCurrent(s, 1);
@@ -1452,6 +2038,40 @@ describe("scheduler/waitForSingleObjectWithContext — blocked with runnable pee
         expect(t1.state).toBe(ThreadState.WAITING);
         expect(t1.context!.eip >>> 0).toBe(0x401000);
         expect(t1.context!.esp >>> 0).toBe(0x10ffa00);
+    });
+
+    // A finite timeout is CONSUMED, never answered early — even with nothing else to run.
+    // Guests measure it: Blade of Darkness calibrates its RDTSC game clock from the TSC
+    // delta across WaitForSingleObject(sem, 100), so an early WAIT_TIMEOUT scales every
+    // frame it will ever render.
+    test("sole runnable thread parks for the full timeout instead of returning WAIT_TIMEOUT", () => {
+        const s = new Scheduler();
+        const t1 = mkBlockableCurrent(s, 1);
+        const sem = s.createSemaphore(0, 1);   // count 0 → the wait cannot be satisfied
+
+        const ret = s.waitForSingleObjectWithContext(
+            sem,
+            100,
+            0x401000,
+            0x10ffa00,
+            { ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202 },
+        );
+
+        expect(ret).not.toBe(WAIT_TIMEOUT);
+        expect(ret).toBe(WAIT_BLOCKED_NO_SWITCH);
+        expect(t1.state).toBe(ThreadState.WAITING);
+        expect(t1.waitInfo!.timeoutTimerId).toBeGreaterThan(0);
+
+        // The wheel entry carries the WHOLE timeout — that deadline is what the guest measures.
+        const wheel = (s as any).timerWheel as TimerWheel;
+        const now = (s as any).timeService.nowMs();
+        expect(wheel.nextFireIn(now)).toBeGreaterThan(95);
+        expect(wheel.nextFireIn(now)).toBeLessThanOrEqual(100);
+
+        // Parked with nobody READY/RUNNING ⇒ pollTimeouts' idle pump owns the clock and
+        // paces the wait in wall time. Without this the park would freeze virtual time
+        // and the deadline could never come due.
+        expect((s as any).shouldPumpIdleVirtualTime()).toBe(true);
     });
 });
 
@@ -1490,5 +2110,145 @@ describe("scheduler/timer dispatch pre-guard", () => {
         s.reset();
         expect((s as any).cachedWinmmTimerThreadId).toBe(0);
         expect((s as any).cachedWinmmTimerWakeEvent).toBe(0);
+    });
+});
+
+// ─── Urgent exit vs. the thread switched in behind it ─────────────────────────
+// requestImmediateExit() zeroes the live cycle limit for the thread LEAVING the CPU. v86's
+// cycle loop keeps the budget it read at slice entry, so when a switch loads another context
+// in the same JS turn, that thread runs the rest of the slice — and with the live slot still
+// 0 every chain check refuses and every later pass of main_loop retires nothing.
+
+describe("scheduler/urgent exit — the switched-in thread gets the slice back", () => {
+    const PARK = 0x21047000;
+    /** Point the singleton at a private hypercall page; returns the undo. */
+    function armPreemption(): () => void {
+        const pm = preemptionManager as any;
+        const keys = ["wasmExports", "hpBase", "initialized", "wasmMemoryObj", "wasmMemory", "view",
+            "sliceGrant", "urgentExitPending", "sliceEndHeld", "sliceResumes"];
+        const saved = Object.fromEntries(keys.map((k) => [k, pm[k]]));
+        const memory = new WebAssembly.Memory({ initial: 1 });
+        Object.assign(pm, { wasmExports: { memory }, wasmMemoryObj: memory, wasmMemory: null, view: null,
+            hpBase: 0x100, initialized: true, sliceResumes: 0 });
+        return () => Object.assign(pm, saved);
+    }
+    function parkAndSwitch(peerEip: number): { s: Scheduler; t2: Thread; cpu: V86Cpu } {
+        const s = new Scheduler();
+        (s as any).spinLoopBase = PARK;
+        inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+        const t2 = mkThread(2, ThreadState.READY);
+        t2.context = createInitialContext(peerEip, 0x00290000);
+        inject(s, t2, { runnable: true });
+        const cpu = fakeCpu({ eip: 0x00401000, esp: 0x0028ff00 });
+        preemptionManager.prepareForExecution(cpu, false);
+        expect(s.markThreadAsyncParked(1, cpu)).toBe(true);
+        preemptionManager.requestImmediateExit();
+        expect(preemptionManager.getCycleLimit()).toBe(0);
+        expect((s as any).performSwitch(cpu, ThunkBoundaryKind.SPIN_LOOP, 0)).toBe(true);
+        return { s, t2, cpu };
+    }
+
+    test("async park + in-turn switch: the incoming thread runs with the slice's grant, not 0", () => {
+        const undo = armPreemption();
+        try {
+            const { t2 } = parkAndSwitch(0x00402000);
+            expect(t2.state).toBe(ThreadState.RUNNING);
+            expect(preemptionManager.getCycleLimit()).toBe(PreemptionManager.SINGLE_THREAD_LIMIT);
+            expect(preemptionManager.sliceResumes).toBe(1);
+        } finally { undo(); }
+    });
+
+    test("the restored budget is the grant this slice started with (timer-capped slice)", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const t2 = mkThread(2, ThreadState.READY);
+            t2.context = createInitialContext(0x00402000, 0x00290000);
+            inject(s, t2, { runnable: true });
+            const cpu = fakeCpu({ eip: 0x00401000 });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.capSliceForTimerDeadline(200_000);
+            s.markThreadAsyncParked(1, cpu);
+            preemptionManager.requestImmediateExit();
+            (s as any).performSwitch(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+            expect(preemptionManager.getCycleLimit()).toBe(200_000);
+        } finally { undo(); }
+    });
+
+    test("a switch onto the park address keeps the exit (a chain into JMP $ would skip the park-exit)", () => {
+        const undo = armPreemption();
+        try {
+            parkAndSwitch(PARK);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+            expect(preemptionManager.sliceResumes).toBe(0);
+        } finally { undo(); }
+    });
+
+    test("a pause-held exit survives the switch", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const t2 = mkThread(2, ThreadState.READY);
+            t2.context = createInitialContext(0x00402000, 0x00290000);
+            inject(s, t2, { runnable: true });
+            const cpu = fakeCpu({ eip: 0x00401000 });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.endSliceUntilNextTick();
+            (s as any).performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+            // ... and ends with the tick: the next slice is granted normally.
+            preemptionManager.prepareForExecution(cpu, false);
+            expect(preemptionManager.getCycleLimit()).toBe(PreemptionManager.SINGLE_THREAD_LIMIT);
+        } finally { undo(); }
+    });
+
+    test("a self-reschedule keeps the exit: the thread that asked for it is still on the CPU", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const cpu = fakeCpu({ eip: 0x2100000c });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.requestImmediateExit();
+            expect((s as any).performSwitch(cpu, ThunkBoundaryKind.GUEST_CODE, 0)).toBe(false);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+        } finally { undo(); }
+    });
+
+    test("__noSliceResume is the A/B arm: the old behaviour, limit left at 0", () => {
+        const undo = armPreemption();
+        const g = globalThis as { __noSliceResume?: boolean };
+        g.__noSliceResume = true;
+        try {
+            parkAndSwitch(0x00402000);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+        } finally { delete g.__noSliceResume; undo(); }
+    });
+
+    test("a same-turn async restore resumes the parked thread at real code with the grant", () => {
+        const undo = armPreemption();
+        try {
+            const s = new Scheduler();
+            (s as any).spinLoopBase = PARK;
+            const cpu = fakeCpu({ eip: PARK, esp: 0x0028ff00 });
+            preemptionManager.prepareForExecution(cpu, false);
+            preemptionManager.requestImmediateExit();
+            expect(s.applyAsyncRestoreCpuState(cpu, 0x00401234, 0x0028ff08, 1, "test")).toBe(true);
+            expect(preemptionManager.getCycleLimit()).toBe(PreemptionManager.SINGLE_THREAD_LIMIT);
+        } finally { undo(); }
+    });
+
+    test("an urgent tick (current WAITING) grants 0 and nothing can resume it", () => {
+        const undo = armPreemption();
+        try {
+            preemptionManager.prepareForExecution(undefined, true);
+            expect(preemptionManager.resumeSliceForIncomingThread()).toBe(false);
+            expect(preemptionManager.getCycleLimit()).toBe(0);
+        } finally { undo(); }
     });
 });

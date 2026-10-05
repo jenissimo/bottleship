@@ -6,6 +6,7 @@
 import { Logger, LogCategory } from "../core/logger";
 import { registerBuiltinClass } from "./user32/class";
 import { ensureAnimateControlClasses } from "./user32/animate-control";
+import { getSystemCursorHandle, IDC_IBEAM } from "./user32/system-cursors";
 
 /** sizeof(INITCOMMONCONTROLSEX) - dwSize + dwICC */
 export const INITCOMMONCONTROLSEX_SIZE = 8;
@@ -34,13 +35,20 @@ const TOOLTIPS_CLASS = "tooltips_class32";
 /** cbWndExtra hints from comctl32 class registration (approximate v5 values). */
 const DEFAULT_WND_EXTRA = 4;
 
-function registerClass(className: string, cbWndExtra = DEFAULT_WND_EXTRA): void {
-    registerBuiltinClass(className, { cbWndExtra });
+function registerClass(
+    className: string,
+    cbWndExtra = DEFAULT_WND_EXTRA,
+    controlClass?: string,
+    /** Class cursor; omit for comctl32's usual IDC_ARROW (registerBuiltinClass's default). */
+    hCursor?: number,
+): void {
+    registerBuiltinClass(className, { cbWndExtra, controlClass, hCursor });
 }
 
 function registerListViewClasses(): void {
-    registerClass("SysListView32", 4);
-    registerClass("SysHeader32", 4);
+    // controlClass → CreateWindowEx marks isSystemControl (dialog templates already do).
+    registerClass("SysListView32", 4, "SysListView32");
+    registerClass("SysHeader32", 4, "SysHeader32");
 }
 
 function registerTreeViewClasses(): void {
@@ -51,12 +59,17 @@ function registerTreeViewClasses(): void {
 function registerBarClasses(): void {
     registerClass("ToolbarWindow32", 4);
     registerClass("msctls_statusbar32", 4);
-    registerClass("msctls_trackbar32", 4);
+    // controlClass is what makes CreateWindowEx mark the window isSystemControl —
+    // without it the class exists but its window is an inert plain child: no painter,
+    // and TBM_*/PBM_* never reach the control message sink.
+    registerClass("msctls_trackbar32", 4, "msctls_trackbar32");
     registerClass(TOOLTIPS_CLASS, 4);
 }
 
 function registerTabClasses(): void {
-    registerClass("SysTabControl32", 4);
+    // controlClass is what makes the window a JS system control — without it the
+    // class name resolves but nothing paints, hit-tests or answers TCM_*.
+    registerClass("SysTabControl32", 4, "SysTabControl32");
     registerClass(TOOLTIPS_CLASS, 4);
 }
 
@@ -65,11 +78,13 @@ function registerUpDownClass(): void {
 }
 
 function registerProgressClass(): void {
-    registerClass("msctls_progress32", 4);
+    registerClass("msctls_progress32", 4, "msctls_progress32");
 }
 
 function registerHotKeyClass(): void {
-    registerClass("msctls_hotkey32", 4);
+    // comctl32 registers the hotkey class with a NULL cursor (hotkey.c), so
+    // DefWindowProc leaves whatever the pointer already is over one.
+    registerClass("msctls_hotkey32", 4, undefined, 0);
 }
 
 function registerAnimateClass(): void {
@@ -87,11 +102,14 @@ function registerUserExClasses(): void {
 }
 
 function registerCoolClasses(): void {
-    registerClass("ReBarWindow32", 4);
+    // NULL class cursor in comctl32 (rebar.c) — the band's own drag cursors are
+    // installed by the control, not by the class.
+    registerClass("ReBarWindow32", 4, undefined, 0);
 }
 
 function registerInternetClasses(): void {
-    registerClass("SysIPAddress32", 4);
+    // The IP-address control is a row of edit fields: IDC_IBEAM (ipaddress.c).
+    registerClass("SysIPAddress32", 4, undefined, getSystemCursorHandle(IDC_IBEAM));
 }
 
 function registerPagerClass(): void {

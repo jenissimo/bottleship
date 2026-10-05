@@ -1,23 +1,20 @@
 import { TimeService } from "./time";
 import { Logger, LogCategory } from "../core/logger";
 import { harnessBus } from "../harness/event-bus";
+import { frameProfiler } from "../core/frame-profiler";
+import { guestTimeSteps } from "../core/guest-time-steps";
 
 export interface RenderBackend {
     readonly kind: string;
     initialize(canvas: OffscreenCanvas): void | Promise<void>;
     composite(overlay: OffscreenCanvas, clearScreen?: boolean): void;
-    compositeRect?(
-        overlay: OffscreenCanvas,
-        dstX: number, dstY: number,
-        dstW: number, dstH: number,
-        screenW: number, screenH: number,
-        clearScreen?: boolean,
-    ): void;
-    /** Composite specific overlay sub-rects 1:1 (live dialogs over a flip chain). */
+    /** Composite specific overlay sub-rects, in guest coordinates (live dialogs over a flip chain). */
     compositeRects?(
         overlay: OffscreenCanvas,
         rects: Array<{ x: number; y: number; w: number; h: number }>,
     ): void;
+    /** Publish where a guest picture of this size lands on the canvas (see present-geometry). */
+    publishGuestPresentRect?(srcW: number, srcH: number): void;
     /**
      * Apply a per-channel gamma ramp (256 normalized entries each) as a final
      * RAMDAC-style LUT over the presented frame. Identity ramp = passthrough.
@@ -29,10 +26,27 @@ export interface RenderBackend {
         blue: Float32Array,
         isIdentity: boolean,
     ): void;
+    /** The canvas that IS the screen (the one the host transferred). Source of truth for screenshots. */
+    getScreenCanvas?(): OffscreenCanvas | null;
+    /** Copy the frame just submitted to the canvas into a readable mirror (screenshots).
+     *  Return false when the copy did NOT happen (unconfigured canvas, 0x0 texture) —
+     *  RenderService only stamps the mirror as current on a real copy. `void` is treated as
+     *  "copied" for backends that predate the return value. */
+    mirrorPresentedFrame?(): void | boolean;
+    /** PNG of that mirror; null until a frame has been mirrored. */
+    captureMirroredFrame?(): Promise<Blob | null>;
 }
 
 export interface RenderActive {
+    /** PNG of the SCREEN — canvas first (overlays composited), presenter source only as fallback. */
     captureFrame(): Promise<Blob>;
+    /**
+     * PNG of the presenter's OWN frame source — the game layer as it exists before the
+     * canvas composite (how far "before" is backend-dependent). Splits "which layer holds
+     * the pixels" from "does the composite put it on screen"; never a substitute for
+     * captureFrame(). Null/absent when the presenter has no readable source of its own.
+     */
+    capturePresentedLayer?(): Promise<Blob | null>;
     getCounters(): Record<string, number>;
     /**
      * True for hardware 3D presenters (OpenGL/Glide/D3D) that own the whole screen
@@ -43,6 +57,18 @@ export interface RenderActive {
      */
     readonly suppressGdiOverlay?: boolean;
     /**
+     * True while this presenter holds the display in EXCLUSIVE FULLSCREEN — a 3D device
+     * created (or Reset) with Windowed=FALSE. That is the same display ownership a
+     * DirectDraw flip chain has: GDI window output goes to an off-screen surface and NO
+     * window is visible over the frame until the mode is released, so no dialog composites
+     * over it (see isGdiOutputOnScreen). A WINDOWED device leaves GDI on screen — a modal
+     * over a windowed game is genuinely visible and must still composite.
+     *
+     * Absent means the presenter does not track the mode; it is read as windowed, which is
+     * the conservative answer (composite as before) rather than a claim of ownership.
+     */
+    readonly presentsExclusiveFullscreen?: boolean;
+    /**
      * Re-present the last rendered frame to the canvas without re-rendering. The GDI
      * present loop calls this every animation frame while a low-fps 3D renderer owns
      * the screen, so the WebGPU canvas keeps showing the last frame at the display
@@ -51,12 +77,19 @@ export interface RenderActive {
     repaintLastFrame?(): void;
 }
 
-export type PresenterKind = "ddraw" | "glide" | "d3d8" | "d3d9" | "gdi" | "opengl";
+/** `video` is OURS: the compositor that puts a fallback video-overlay frame on the
+ *  screen when the guest is inside a playback loop and presenting nothing. Everything
+ *  else is a present the GUEST asked for. */
+export type PresenterKind = "ddraw" | "glide" | "d3d8" | "d3d9" | "gdi" | "opengl" | "video";
 
 export class RenderService {
     private backend: RenderBackend | null = null;
     private active: RenderActive | null = null;
     private presentSerial = 0;
+    /** Presents the GUEST drove. Video routing decides "is the app presenting this movie
+     *  itself?" from a rising serial, so our own video composite must not advance it —
+     *  otherwise we answer our own question and clear the overlay we just drew. */
+    private guestPresentSerial = 0;
     private lastPresenterKind: PresenterKind | null = null;
     private static readonly FLIP_TRACE_MARK = "bottleship.flip";
 
@@ -79,6 +112,13 @@ export class RenderService {
     // --- Flip-cadence instrument (inter-present intervals) for frame-variance diagnosis.
     //     Always-on ring buffer; ~1 perf.now() + push per present (≈ display rate) = negligible.
     //     Read via flipCadence() / scope a window with flipCadenceReset() (diagnostics-commands). ---
+    // Screenshot mirror: kept up to date from every present, because a screenshot must be
+    // available for the frame ALREADY on screen — arming it lazily means the first capture
+    // (typically of a frozen screen worth looking at) has nothing to read. Cost is one
+    // full-screen texture copy per present, the same snapshot the D3D9 executor already
+    // takes for repaintLastFrame.
+    private screenMirrorSerial = 0;
+
     private flipLastMs = 0;
     private flipIntervals: number[] = [];
     private static readonly FLIP_CADENCE_CAP = 1200;
@@ -89,6 +129,65 @@ export class RenderService {
 
     getBackend(): RenderBackend | null {
         return this.backend;
+    }
+
+    /**
+     * PNG of the SCREEN — the canvas itself, every overlay already composited.
+     *
+     * A presenter's own captureFrame() reads back the texture it drew FROM, and the
+     * video plane / GDI dialog rects / stats overlay are blitted onto the canvas
+     * AFTER that texture is recorded — so a presenter capture is blind to exactly the
+     * compositing bugs a screenshot is asked to settle. Read the canvas instead.
+     *
+     * The mirror is the ONLY route. Reading the canvas back looks like it should work and
+     * does not: a WebGPU canvas hands its presented image to the compositor, so
+     * convertToBlob() throws "Readback of the source image has failed" and
+     * createImageBitmap() returns either a 0x0 bitmap or a BLANK one — the current
+     * (undrawn) swap texture rather than the frame on screen. It happened to match while a
+     * game presented every frame, which is exactly how a wrong screenshot stays believed;
+     * on a static screen (a launcher dialog, anything paused) it silently returns empty.
+     *
+     * Null when there is no backend/canvas at all; THROWS when nothing has ever been
+     * presented — different diagnoses, and a caller that collapses them sends the reader
+     * elsewhere.
+     */
+    async captureScreen(): Promise<Blob | null> {
+        if (!this.backend?.getScreenCanvas?.()) return null;
+        const mirrored = await this.backend?.captureMirroredFrame?.();
+        if (mirrored) return mirrored;
+        throw new Error("no frame has been presented to the canvas yet — nothing to screenshot");
+    }
+
+    /**
+     * Copy this present into the readable mirror. True only when the copy ACTUALLY happened —
+     * stamping the serial unconditionally is what made `shot()` hand back the previous frame
+     * labelled as the latest, which is the exact failure the mirror exists to eliminate.
+     */
+    private mirrorCurrentFrame(): boolean {
+        const backend = this.backend;
+        if (!backend?.mirrorPresentedFrame) return false;
+        // The backend bails on an unconfigured context or a 0x0 texture; a canvas with no
+        // extent is the same condition seen from here.
+        const canvas = backend.getScreenCanvas?.();
+        if (canvas && (canvas.width <= 0 || canvas.height <= 0)) return false;
+        return backend.mirrorPresentedFrame() !== false;
+    }
+
+    /** Presents since the mirrored frame — 0 means the mirror IS the current screen,
+     *  a positive value means it is that many frames STALE, -1 that nothing was mirrored. */
+    screenMirrorAge(): number {
+        return this.screenMirrorSerial > 0 ? this.presentSerial - this.screenMirrorSerial : -1;
+    }
+
+    /** captureScreen() that degrades to null instead of throwing — for presenters that
+     *  have their own fallback source. */
+    async tryCaptureScreen(): Promise<Blob | null> {
+        try {
+            return await this.captureScreen();
+        } catch (err) {
+            Logger.warn(LogCategory.SYSTEM, `RenderService.captureScreen failed — ${(err as Error).message}`);
+            return null;
+        }
     }
 
     setActive(active: RenderActive | null): void {
@@ -119,14 +218,40 @@ export class RenderService {
         this.firstPresentFired = false;
     }
 
+    /** A present that reaches the canvas in the same call: both edges at once. */
     notifyPresent(presenterKind: PresenterKind): void {
+        if (presenterKind !== "video") this.notifyGuestPresent();
+        this.notifyCanvasPresent(presenterKind);
+    }
+
+    /**
+     * The GUEST's Present, for a presenter whose pixels reach the canvas later (threaded D3D9:
+     * the frame arrives from the render side and brings notifyCanvasPresent with it). Advances
+     * only the serial video routing and the GDI loop read "did the app present" from.
+     */
+    notifyGuestPresent(): void {
+        this.guestPresentSerial += 1;
+    }
+
+    /** Pixels reached the canvas: the mirror, first-present, cadence and frame-time edge. */
+    notifyCanvasPresent(presenterKind: PresenterKind): void {
         this.presentSerial += 1;
         this.lastPresenterKind = presenterKind;
+        // Screenshot mirror: encoded here because EVERY present path funnels through this
+        // edge, so no backend can silently miss it and leave a stale image.
+        if (this.mirrorCurrentFrame()) this.screenMirrorSerial = this.presentSerial;
         if (!this.firstPresentFired) {
             this.firstPresentFired = true;
             try { this.firstPresentCb?.(); } catch { /* host bridge must never break the present path */ }
         }
         this.recordFlipCadence();
+        // Frame-time distribution rides the SAME boundary as the cadence ring and the trace
+        // mark below, so the live tail, getFlipCadence and analyze-trace cannot disagree by
+        // construction — only because the world disagreed. Zero-cost while disarmed.
+        frameProfiler.markPresent();
+        // Same boundary, the OTHER clock: how much GUEST time this frame delivered. Inert while
+        // disarmed; see guest-time-steps.ts for why a rate cannot answer this question.
+        guestTimeSteps.markPresent(this.presentSerial);
         this.emitFlipTraceMark();
         // Harness frameRendered event — gated so the perf-critical present path
         // stays zero-cost until a script opts in (watchFrames).
@@ -202,13 +327,30 @@ export class RenderService {
         return this.presentSerial;
     }
 
+    /** Presents excluding our own video compositor — see `guestPresentSerial`. */
+    getGuestPresentSerial(): number {
+        return this.guestPresentSerial;
+    }
+
     getLastPresenterKind(): PresenterKind | null {
         return this.lastPresenterKind;
+    }
+
+    /**
+     * Draws in the guest's last present, or null when the active presenter cannot say.
+     * Null is "unknown" and must never be read as "few" — a policy that guesses low here
+     * would suppress a rescue on the presenters that do not report.
+     */
+    getLastPresentDrawCount(): number | null {
+        const active = this.active as { getLastPresentDrawCount?(): number | null } | null;
+        return active?.getLastPresentDrawCount?.() ?? null;
     }
 
     reset(): void {
         this.active = null;
         this.presentSerial = 0;
+        this.guestPresentSerial = 0;
+        this.screenMirrorSerial = 0; // the previous game's mirror is not this game's screen
         this.lastPresenterKind = null;
         this.resetFlipCadence();
         // Keep backend, it can be reused

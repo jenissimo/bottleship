@@ -68,7 +68,6 @@ export function patchGalaxyNativeModule(
     const patchCtx: PatchContext = {
         dispatcher: process.dispatcher,
         thunkGenerator: process.thunkGenerator,
-        cpu: process.v86?.cpu ?? process.v86?.v86?.cpu,
         getMemory: () => process.getCurrentMemory(),
     };
 

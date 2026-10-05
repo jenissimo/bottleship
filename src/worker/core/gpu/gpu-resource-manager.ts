@@ -1,5 +1,6 @@
 import { Logger, LogCategory } from "../logger";
 import { returnGPUTextureToPool, clearGPUTexturePool } from "../../modules/ddraw/gpu-texture-utils";
+import { registerGpuDeviceObserver } from "./gpu-device-lifecycle";
 
 /**
  * GPU Resource Manager for deferred destruction of GPU textures.
@@ -14,6 +15,13 @@ import { returnGPUTextureToPool, clearGPUTexturePool } from "../../modules/ddraw
  */
 export class GpuResourceManager {
     private pendingDestruction: GPUTexture[] = [];
+
+    constructor() {
+        // Textures queued for deferred destruction belong to the dead device. Recycling them
+        // into the pool would hand a dead handle back to a caller that asked for a live one;
+        // destroying them is meaningless. Drop the queue (and the pool) instead.
+        registerGpuDeviceObserver("gpu-resource-manager", { onDeviceLost: () => this.clear() });
+    }
 
     /**
      * Enqueue a GPU texture for deferred destruction (or pool return).

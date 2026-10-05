@@ -198,5 +198,54 @@ export function createSequenceExports(ctx: MSSContext): Record<string, ThunkImpl
         return 0;
     };
 
+    // _AIL_sequence_ms_position@12(seq, total_ms*, current_ms*) — the millisecond twin
+    // of _AIL_sequence_position. We run no sequencer, so both are 0; writing them is
+    // the contract, because the caller reads the out-params whatever we return.
+    exports["_AIL_sequence_ms_position@12"] = (ctxThunk, mem, args) => {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        for (const ptr of [args[1], args[2]]) {
+            if (ptr && MemoryGuard.isValidRange(mem, ptr, 4)) view.setUint32(ptr, 0, true);
+        }
+        return 0;
+    };
+
+    // _AIL_set_sequence_user_data@12(seq, index, value) / getter — opaque slots Miles
+    // hands back to the app's own callbacks; storing them IS the whole contract.
+    exports["_AIL_set_sequence_user_data@12"] = (ctxThunk, mem, args) => {
+        const handle = args[0];
+        const index = args[1] | 0;
+        if (!ctx.sequences.has(handle) || index < 0) return 0;
+        let slots = ctx.sequenceUserData.get(handle);
+        if (!slots) ctx.sequenceUserData.set(handle, (slots = []));
+        slots[index] = args[2] >>> 0;
+        return 0;
+    };
+    exports["_AIL_sequence_user_data@8"] = (ctxThunk, mem, args) => {
+        return (ctx.sequenceUserData.get(args[0])?.[args[1] | 0] ?? 0) >>> 0;
+    };
+
+    // _AIL_register_sequence_callback@8(seq, callback) -> previous callback.
+    exports["_AIL_register_sequence_callback@8"] = (ctxThunk, mem, args) => {
+        const handle = args[0];
+        const callback = args[1] >>> 0;
+        if (!ctx.sequences.has(handle)) return 0;
+        const previous = ctx.sequenceCallbacks.get(handle) ?? 0;
+        if (callback) ctx.sequenceCallbacks.set(handle, callback);
+        else ctx.sequenceCallbacks.delete(handle);
+        return previous;
+    };
+
+    // _AIL_MIDI_to_XMI@20(midi, midi_size, xmi**, xmi_size*, flags) -> 0 on failure.
+    // We have no MIDI-to-XMI converter. Reporting failure and leaving the out-params
+    // NULL/0 is the honest answer; claiming success would hand the caller a pointer it
+    // would then hand back to us as a sequence.
+    exports["_AIL_MIDI_to_XMI@20"] = (ctxThunk, mem, args) => {
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (args[2] && MemoryGuard.isValidRange(mem, args[2], 4)) view.setUint32(args[2], 0, true);
+        if (args[3] && MemoryGuard.isValidRange(mem, args[3], 4)) view.setUint32(args[3], 0, true);
+        Logger.warn(LogCategory.SYSTEM, "MSS32: _AIL_MIDI_to_XMI@20 — no MIDI/XMI converter, reporting failure");
+        return 0;
+    };
+
     return exports;
 }

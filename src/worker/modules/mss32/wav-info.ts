@@ -1,6 +1,7 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
 import { MemoryGuard } from "../../core/memory/mem-guard";
+import { buildPcmWavImage } from "@bottleship/formats/audio";
 import { MSSContext } from "./context";
 import {
     DIG_F_ADPCM_MASK,
@@ -105,7 +106,15 @@ export function createWavInfoExports(ctx: MSSContext): Record<string, ThunkImple
             return 0;
         }
 
-        const outBytes = pcm.byteLength;
+        // The output is a complete PCM .WAV FILE IMAGE, not the bare samples: every caller
+        // feeds it straight back into AIL_WAV_info / AIL_set_sample_file, both of which parse
+        // a RIFF header. Handing back raw PCM makes those two answer "not a RIFF/WAVE file",
+        // the voice never gets data, and a caller that waits for the sample to reach SMP_DONE
+        // waits forever (ZenGin's dialogue output does exactly that).
+        const pcmBytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+        const image = buildPcmWavImage(pcmBytes, channels, info.rate || 22050);
+
+        const outBytes = image.byteLength;
         const allocPtr = ctx.process.memory.alloc(outBytes);
         if (!allocPtr) {
             Logger.error(LogCategory.SYSTEM, `MSS32: _AIL_decompress_ADPCM@12: failed to allocate ${outBytes} bytes`);
@@ -113,8 +122,7 @@ export function createWavInfoExports(ctx: MSSContext): Record<string, ThunkImple
         }
         ctx.memAllocatedByMss.add(allocPtr);
 
-        const pcmBytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-        if (!MemoryGuard.writeBytes(mem, allocPtr, pcmBytes, "MSS32:_AIL_decompress_ADPCM@12")) {
+        if (!MemoryGuard.writeBytes(mem, allocPtr, image, "MSS32:_AIL_decompress_ADPCM@12")) {
             ctx.process.memory.free(allocPtr);
             ctx.memAllocatedByMss.delete(allocPtr);
             return 0;
@@ -126,7 +134,8 @@ export function createWavInfoExports(ctx: MSSContext): Record<string, ThunkImple
 
         Logger.log(
             LogCategory.SYSTEM,
-            `MSS32: _AIL_decompress_ADPCM@12: ${info.dataLen} bytes ADPCM (tag=${formatTag}) -> ${outBytes} bytes PCM at 0x${allocPtr.toString(16)}`
+            `MSS32: _AIL_decompress_ADPCM@12: ${info.dataLen} bytes ADPCM (tag=${formatTag}) -> ` +
+            `${pcmBytes.byteLength} bytes PCM in a ${outBytes}-byte WAV image at 0x${allocPtr.toString(16)}`
         );
         return 1;
     };

@@ -1,11 +1,13 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
-import { transform } from "esbuild";
+import { build as esbuild } from "esbuild";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "node:child_process";
+import type { ServerResponse } from "node:http";
+import { isUnc, listWgb, underAnyRoot, wgbListRoots, wgbRoots } from "./tools/wgb-roots";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,10 +32,21 @@ function audioWorkletPlugin(): Plugin {
   const src = path.resolve(__dirname, "src/audio/bottleship-audio-worklet.ts");
   const out = path.resolve(__dirname, "src/audio/bottleship-audio-worklet.js");
 
+  // BUNDLED, not merely transpiled: an AudioWorklet module cannot resolve imports at
+  // runtime, so the worklet used to re-declare every control-block constant it reads.
+  // Bundling lets it import the one definition instead, which is what keeps the
+  // worker's writes and the worklet's reads from drifting apart silently.
   async function compile() {
-    const code = fs.readFileSync(src, "utf-8");
-    const result = await transform(code, { loader: "ts", target: "esnext" });
-    fs.writeFileSync(out, result.code);
+    const result = await esbuild({
+      entryPoints: [src],
+      bundle: true,
+      format: "esm",
+      target: "esnext",
+      platform: "browser",
+      write: false,
+      logLevel: "silent",
+    });
+    fs.writeFileSync(out, result.outputFiles[0]!.text);
   }
 
   return {
@@ -43,9 +56,15 @@ function audioWorkletPlugin(): Plugin {
     },
     configureServer(server) {
       server.watcher.on("change", async (file) => {
-        if (path.normalize(file) === path.normalize(src)) {
+        if (path.normalize(file) !== path.normalize(src)) return;
+        // A half-saved edit (or a module that does not resolve yet) must not take the dev
+        // server down with it — keep the last good bundle and say what broke.
+        try {
           await compile();
           console.log("[audio-worklet] Recompiled bottleship-audio-worklet.js");
+        } catch (e) {
+          console.error("[audio-worklet] bundle FAILED — keeping the previous build:",
+            e instanceof Error ? e.message : e);
         }
       });
     },
@@ -76,8 +95,21 @@ function harnessHealthPlugin(): Plugin {
 // lives in the repo tree, so no cleanup can ever recurse into a real drive again. Full HTTP
 // Range support (206, suffix `bytes=-N`) so the worker's synchronous on-demand streaming
 // loader (SyncHttpRangeSource) works — a server that ignores Range is exactly what breaks it.
+// A ROM read is one Range request, so a bundle boot issues hundreds of them against a
+// multi-GB file. `.pipe(res)` alone leaks the descriptor whenever the client goes away
+// before the body is drained (aborted prefetch, page reload mid-load) — the stream stays
+// open with nothing consuming it, and a long-lived dev server accumulates them until
+// every further read crawls. Destroy the stream when the response closes.
+function pipeAndCleanup(stream: fs.ReadStream, res: ServerResponse): void {
+  res.on("close", () => stream.destroy());
+  stream.on("error", () => { stream.destroy(); if (!res.writableEnded) res.end(); });
+  stream.pipe(res);
+}
+
 function serveWgbFromDisk(): Plugin {
   const ROUTE = "/__wgb/";
+  const LIST_ROUTE = "/__wgb/list";
+  const roots = wgbRoots(__dirname);
   return {
     name: "serve-wgb-from-disk",
     apply: "serve",
@@ -87,12 +119,32 @@ function serveWgbFromDisk(): Plugin {
       server.middlewares.use((req, res, next) => {
         if (!req.url || !req.url.startsWith(ROUTE)) return next();
         for (const [k, v] of Object.entries(coopCoepHeaders)) res.setHeader(k, v);
+        // The dev bundle browser (src/debug/WgbBrowser.tsx): what is loadable off disk
+        // WITHOUT registering it in the library catalog. Enumerating the same roots the
+        // delivery route below confines to means the browser cannot offer a bundle that
+        // would then be refused.
+        if (req.url.split("?")[0] === LIST_ROUTE) {
+          const listing = listWgb(wgbListRoots(__dirname));
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(listing));
+          return;
+        }
         // Caller supplies the absolute disk path via ?path= (URLSearchParams decodes it).
         const qi = req.url.indexOf("?");
         const abs = qi >= 0 ? new URLSearchParams(req.url.slice(qi + 1)).get("path") : null;
         if (!abs) { res.statusCode = 400; res.end("missing ?path=<absolute .wgb path>"); return; }
+        if (isUnc(abs)) { res.statusCode = 403; res.end("UNC paths are refused"); return; }
         const file = path.resolve(abs);
+        if (isUnc(file)) { res.statusCode = 403; res.end("UNC paths are refused"); return; }
         if (!file.toLowerCase().endsWith(".wgb")) { res.statusCode = 403; res.end("only .wgb files"); return; }
+        // Same confinement as the sidecar's /wgb — a fallback route that serves anything
+        // the sidecar would refuse means the confinement only holds when :3001 is up.
+        if (!underAnyRoot(file, roots)) {
+          res.statusCode = 403;
+          res.end("path is outside the configured roots (set BS_WGB_ROOTS)");
+          return;
+        }
         let size: number;
         try {
           const st = fs.statSync(file);
@@ -114,13 +166,13 @@ function serveWgbFromDisk(): Plugin {
           res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
           res.setHeader("Content-Length", String(end - start + 1));
           if (req.method === "HEAD") { res.end(); return; }
-          fs.createReadStream(file, { start, end }).pipe(res);
+          pipeAndCleanup(fs.createReadStream(file, { start, end }), res);
           return;
         }
         res.statusCode = 200;
         res.setHeader("Content-Length", String(size));
         if (req.method === "HEAD") { res.end(); return; }
-        fs.createReadStream(file).pipe(res);
+        pipeAndCleanup(fs.createReadStream(file), res);
       });
     },
   };
@@ -180,6 +232,18 @@ export default defineConfig({
     strictPort: true,
     ...useSsl ? { https: true } : {},
     hmr: false,
+    watch: {
+      // Chokidar registers one fs.watch handle PER FILE and its defaults ignore only
+      // .git/node_modules/the cache dir. These trees hold no importable module and tens of
+      // thousands of files (logs/ is appended continuously by the dev sidecar), and watching
+      // them saturates the libuv threadpool for minutes after listen — the dev server answers
+      // nothing until the watcher settles.
+      // Forward slashes: picomatch treats backslashes as escapes, so a path.resolve() result
+      // would never match on Windows.
+      ignored: ["logs", ".claude", "tmp", ".ghidra-home"].map(
+        (d) => path.resolve(__dirname, d).replace(/\\/g, "/") + "/**"
+      )
+    },
     headers: coopCoepHeaders
   },
   preview: {
@@ -204,7 +268,19 @@ export default defineConfig({
     copyPublicDir: false
   },
   optimizeDeps: {
-    force: true, // Force re-optimization of dependencies to avoid stale cache issues
-    include: ["react", "react-dom"]
+    // Pre-bundling is not optional here: @phosphor-icons/react is a large barrel and
+    // react/react-dom are CJS needing an ESM wrapper, so unbundled a single dev page load
+    // would be thousands of requests.
+    //
+    // This lists every bare import in the BROWSER tree and only that: `include` bundles a
+    // package whole, so naming an unused one is pure cost, while a dep the scanner discovers
+    // mid-session forces a re-optimization whose page reload has to travel over HMR — which is
+    // disabled above. Without that signal the page keeps requesting `?v=<hash>` URLs that no
+    // longer exist and every fresh module hangs while the server still looks alive.
+    //
+    // No `force`: it discards a valid cache on every start, and each re-run can re-hit the
+    // Windows failure where the optimizer's output is left in `node_modules/.vite-temp` and
+    // never renamed into `.vite/deps`, after which every dep request 504s.
+    include: ["react", "react-dom", "@phosphor-icons/react", "pako"]
   }
 });
