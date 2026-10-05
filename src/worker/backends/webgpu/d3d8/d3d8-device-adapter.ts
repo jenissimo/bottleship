@@ -77,6 +77,7 @@ import {
     D3DRENDERSTATE_LOCALVIEWER,
     D3DTADDRESS_WRAP,
     D3DTA_DIFFUSE,
+    D3DTA_CURRENT,
     D3DTA_TEXTURE,
     D3DBLEND_ONE,
     D3DBLEND_ZERO,
@@ -92,9 +93,11 @@ import {
     D3DTSS_ADDRESSU,
     D3DTSS_ADDRESSV,
     D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAARG0,
     D3DTSS_ALPHAARG2,
     D3DTSS_ALPHAOP,
     D3DTSS_COLORARG1,
+    D3DTSS_COLORARG0,
     D3DTSS_COLORARG2,
     D3DTSS_COLOROP,
     D3DTSS_MAGFILTER,
@@ -264,6 +267,13 @@ export function createD3D8DefaultTextureStates(): Int32Array {
 
         for (let stage = 0; stage < 8; stage++) {
             const offset = stage * 32;
+            // Seed defaults even on disabled stages: zero is an explicit DIFFUSE selector.
+            states[offset + D3DTSS_COLORARG0] = D3DTA_CURRENT;
+            states[offset + D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
+            states[offset + D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+            states[offset + D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+            states[offset + D3DTSS_COLORARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
+            states[offset + D3DTSS_ALPHAARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
             states[offset + D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP;
             states[offset + D3DTSS_ADDRESSV] = D3DTADDRESS_WRAP;
             states[offset + D3DTSS_TEXCOORDINDEX] = stage;

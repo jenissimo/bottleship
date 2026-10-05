@@ -4517,7 +4517,7 @@ export class DDrawWebGPUExecutor {
         }
 
         const alphaRefRaw = renderStates[D3DRENDERSTATE_ALPHAREF] || 0;
-        let alphaRef = Math.max(0, Math.min(255, alphaRefRaw & 0xff));
+        const alphaRef = Math.max(0, Math.min(255, alphaRefRaw & 0xff));
 
         // D3DRENDERSTATE_TEXTUREFACTOR: ARGB color
         const textureFactorDword = renderStates[D3DRENDERSTATE_TEXTUREFACTOR] ?? 0xFFFFFFFF;
@@ -4774,35 +4774,14 @@ export class DDrawWebGPUExecutor {
 
         // Alpha test (now dynamic uniforms for MegaBatch)
         const rawAlphaTestRS = renderStates[D3DRENDERSTATE_ALPHATESTENABLE] || 0;
-        let alphaTestEnabled = this.debugFlags.forceDisableAlphaTest ? 0 : rawAlphaTestRS;
-        let alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC] || 8; // Default to D3DCMP_ALWAYS (8)
+        const alphaTestEnabled = this.debugFlags.forceDisableAlphaTest ? 0 : rawAlphaTestRS;
+        const alphaFunc = renderStates[D3DRENDERSTATE_ALPHAFUNC] || 8; // Default to D3DCMP_ALWAYS (8)
 
-        // Auto-alpha-test DISABLED: some DX6 games set ALPHATESTENABLE=0
-        // right before DrawIndexedPrimitive.
-        // Auto-alpha-test was injecting alphaFunc=GREATEREQUAL ref=1, which discarded ALL pixels
-        // with alpha=0 — including black tire pixels (ARGB1555 bit15=0 → alpha=0).
-        // Transparency in these games works via blend equations:
-        //   - UI sprites: additive blend (ONE/ONE) — black=(0,0,0) adds nothing → transparent
-        //   - Foliage/particles: SRCALPHA/INVSRCALPHA — alpha=0 → src*0 + dst*1 → transparent
-        //   - 3D scene (tires): blending OFF → all pixels write directly → opaque
-        // The shader's conditional alpha=1.0 override (when blending disabled) prevents alpha
-        // leakage to intermediate render targets. Canvas alphaMode="opaque" handles final display.
-
-        // ARGB1555 alpha-discard: When texture has alpha channel (aMask=0x8000) but neither
-        // alpha blending nor alpha test is enabled, inject alpha test to discard alpha=0 pixels.
-        // Without this, the shader's alpha=1.0 override (for blending-off) makes transparent
-        // ARGB1555 pixels (bit15=0) opaque — stale pixels with non-zero RGB appear as white flash.
-        // Opaque ARGB1555 pixels have bit15=1 → alpha=255 → pass GREATEREQUAL 1.
-        // Skip when ALPHAOP=MODULATE — the game explicitly modulates texture alpha
-        // with vertex alpha. Auto-test uses the MODULATE result, so if vertex alpha=0,
-        // MODULATE produces 0 → fails GREATEREQUAL 1 → ALL pixels discarded → black screen.
-        // UT99 demo uses ALPHAOP=MODULATE + ALPHABLENDENABLE=0 + ALPHATESTENABLE=0.
-        if (!alphaBlend && !rawAlphaTestRS && useTexture && texture?.format?.aMask
-            && stages.alphaOp[0] !== D3DTOP_MODULATE) {
-            alphaTestEnabled = 1;
-            alphaFunc = 7; // D3DCMP_GREATEREQUAL
-            alphaRef = 1;  // Discard alpha=0, pass alpha>=1
-        }
+        // Alpha testing follows the guest's ALPHATESTENABLE, irrespective of texture
+        // format or ALPHAOP. In particular, DOTPRODUCT3 writes its result to alpha too:
+        // an opaque full-screen effect must overwrite even its alpha-zero (black) pixels.
+        // Injecting a test for textures with an alpha mask leaves the previous frame in
+        // those pixels and accumulates stale image data in intermediate render targets.
 
         // Determine texture format for swizzle flag
         // Use texture's actual format, not swapchain format

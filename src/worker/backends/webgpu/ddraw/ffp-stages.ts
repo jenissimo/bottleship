@@ -226,9 +226,11 @@ export class FfpStagesState {
 
             const active = colorOp !== D3DTOP_DISABLE;
 
-            // Argument defaults: stage 0 blends TEXTURE against DIFFUSE, later stages
-            // against CURRENT (the cascade accumulator). A raw 0 with a non-zero default
-            // is "uninitialized" (D3DTA_DIFFUSE=0 stays representable via the default).
+            // Device state tables seed the argument defaults. Zero is D3DTA_DIFFUSE,
+            // including ARG1/ARG0 and later stages; it must never mean "uninitialized".
+            // Replacing it with TEXTURE makes scene-copy alpha read a render target's
+            // shadow mask instead of vertex alpha, dropping pixels in the MegaBatch path.
+            // https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dta
             const defArg2 = s === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
             let colorArg1 = readStageArg(textureStates, base, D3DTSS_COLORARG1, D3DTA_TEXTURE);
             let colorArg2 = readStageArg(textureStates, base, D3DTSS_COLORARG2, defArg2);
@@ -413,8 +415,7 @@ export class FfpStagesState {
 }
 
 function readStageArg(states: Int32Array, base: number, key: number, def: number): number {
-    const value = states[base + key];
-    return value === 0 && def !== 0 ? def : value;
+    return states[base + key] ?? def;
 }
 
 function currentToDiffuse(arg: number): number {

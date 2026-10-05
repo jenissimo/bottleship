@@ -13,7 +13,7 @@ import { describe, expect, test } from "bun:test";
 // Prime the module graph: ddraw/constants participates in an import cycle through
 // core/com/com-memory → … → d3d/types (which reads constants at module scope).
 // Evaluating d3d/types first resolves the cycle the same way the worker entry does.
-import "../../src/worker/modules/ddraw/d3d/types";
+import { EMPTY_TEX_STATES } from "../../src/worker/modules/ddraw/d3d/types";
 import {
     FfpStagesState,
     MAX_FFP_STAGES,
@@ -35,6 +35,7 @@ import {
     D3DTSS_ALPHAARG0,
     D3DTOP_DISABLE,
     D3DTOP_MODULATE,
+    D3DTOP_MODULATE2X,
     D3DTOP_SELECTARG1,
     D3DTOP_MULTIPLYADD,
     D3DTOP_LERP,
@@ -45,7 +46,7 @@ import {
 } from "../../src/worker/modules/ddraw/constants";
 
 function makeStates(): Int32Array {
-    return new Int32Array(8 * 32);
+    return EMPTY_TEX_STATES.slice();
 }
 
 function set(states: Int32Array, stage: number, key: number, value: number): void {
@@ -53,7 +54,7 @@ function set(states: Int32Array, stage: number, key: number, value: number): voi
 }
 
 describe("FfpStagesState.resolve", () => {
-    test("uninitialized stage 0 with texture: MODULATE(TEXTURE, DIFFUSE), samples", () => {
+    test("default stage 0 with texture: MODULATE(TEXTURE, DIFFUSE), samples", () => {
         const st = new FfpStagesState();
         st.resolve(makeStates(), /*realTexMask*/ 1, /*hasTexCoords*/ true, /*dummy*/ true);
         expect(st.colorOp[0]).toBe(D3DTOP_MODULATE);
@@ -84,6 +85,70 @@ describe("FfpStagesState.resolve", () => {
         expect(st.colorArg2[0]).toBe(D3DTA_DIFFUSE);
     });
 
+    test.each([D3DTSS_COLORARG0, D3DTSS_COLORARG1, D3DTSS_COLORARG2,
+        D3DTSS_ALPHAARG0, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2])(
+        "explicit DIFFUSE (zero) survives resolution and packing for argument %i", (key) => {
+            for (const stage of [0, 1]) {
+                const states = makeStates();
+                set(states, stage, D3DTSS_COLOROP, D3DTOP_MODULATE);
+                set(states, stage, key, D3DTA_DIFFUSE);
+                const st = new FfpStagesState();
+                st.resolve(states, 0b11, true, false);
+                st.pack();
+                const [lane, shift] = key === D3DTSS_COLORARG0 ? [0, 16]
+                    : key === D3DTSS_ALPHAARG0 ? [0, 24]
+                    : key === D3DTSS_COLORARG1 ? [1, 0]
+                    : key === D3DTSS_COLORARG2 ? [1, 8]
+                    : key === D3DTSS_ALPHAARG1 ? [1, 16] : [1, 24];
+                expect((st.packed[stage * 4 + lane] >>> shift) & 0xff).toBe(D3DTA_DIFFUSE);
+            }
+        });
+
+    test("scene-copy alpha selects vertex alpha, independently of the shadowed texture alpha", () => {
+        // XIII copies a rendered scene whose shadow pass leaves some alpha pixels at zero.
+        // SELECTARG1(DIFFUSE) must use the fullscreen quad's alpha, even with a texture bound.
+        const states = makeStates();
+        set(states, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        set(states, 0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+        const st = new FfpStagesState();
+        st.resolve(states, 1, true, false);
+        st.pack();
+        expect(st.sampledMask).toBe(1);
+        expect(st.colorArg1[0]).toBe(D3DTA_TEXTURE);
+        expect((st.packed[1] >>> 16) & 0xff).toBe(D3DTA_DIFFUSE);
+    });
+
+    test("a later DIFFUSE arithmetic stage stays active without a texture", () => {
+        const states = makeStates();
+        set(states, 1, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        set(states, 1, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        set(states, 1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+        set(states, 1, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+        const st = new FfpStagesState();
+        st.resolve(states, 1, true, false);
+        expect(st.enabledMask).toBe(0b11);
+        expect(st.sampledMask).toBe(0b01);
+        expect(st.missingMask).toBe(0);
+        expect(st.colorArg1[1]).toBe(D3DTA_DIFFUSE);
+    });
+
+    test("vertex lighting after two textures runs without a third texture", () => {
+        const states = makeStates();
+        set(states, 1, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        set(states, 2, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+        set(states, 2, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        set(states, 2, D3DTSS_COLORARG2, D3DTA_CURRENT);
+        set(states, 2, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
+        const st = new FfpStagesState();
+        st.resolve(states, 0b11, true, false);
+        st.pack();
+        expect(st.enabledMask).toBe(0b111);
+        expect(st.sampledMask).toBe(0b011);
+        expect(st.missingMask).toBe(0);
+        expect(st.packed[8] & 0xff).toBe(D3DTOP_MODULATE2X);
+        expect(st.packed[9] & 0xff).toBe(D3DTA_DIFFUSE);
+    });
+
     test("textured stage 1 (lightmap): samples and extends the cascade", () => {
         const states = makeStates();
         set(states, 1, D3DTSS_COLOROP, D3DTOP_MODULATE);
@@ -94,7 +159,7 @@ describe("FfpStagesState.resolve", () => {
         expect(st.stageCount).toBe(2);
         // Stage 1+ defaults blend against CURRENT
         expect(st.colorArg2[1]).toBe(D3DTA_CURRENT);
-        expect(st.alphaOp[1]).toBe(D3DTOP_SELECTARG1);
+        expect(st.alphaOp[1]).toBe(D3DTOP_DISABLE);
     });
 
     test("MULTIPLYADD preserves COLORARG0 for the third combiner operand", () => {
@@ -160,7 +225,7 @@ describe("FfpStagesState.resolve", () => {
 
     test("cascade terminates at first DISABLE: stage 2 active behind disabled stage 1 is off", () => {
         const states = makeStates();
-        // stage 1 left uninitialized → DISABLE
+        // stage 1 retains its default → DISABLE
         set(states, 2, D3DTSS_COLOROP, D3DTOP_MODULATE);
         const st = new FfpStagesState();
         st.resolve(states, 0b101, true, true);

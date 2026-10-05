@@ -246,6 +246,8 @@ import {
     D3DTOP_MODULATE,
     D3DTA_TEXTURE,
     D3DTA_CURRENT,
+    D3DTSS_COLORARG0,
+    D3DTSS_ALPHAARG0,
     D3DTADDRESS_WRAP,
     D3DTFN_POINT,
     D3DTFG_POINT,
@@ -417,6 +419,15 @@ function createDefaultTexStates(): Int32Array {
     // NOTE: D3DTFP_NONE = 1 (not 0), so this is valid
     for (let stage = 0; stage < 8; stage++) {
         const offset = stage * 32;
+
+        // The resolver preserves zero (D3DTA_DIFFUSE), so seed argument defaults here,
+        // including disabled stages that a later COLOROP write may enable.
+        states[offset + D3DTSS_COLORARG0] = D3DTA_CURRENT;
+        states[offset + D3DTSS_ALPHAARG0] = D3DTA_CURRENT;
+        states[offset + D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+        states[offset + D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+        states[offset + D3DTSS_COLORARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
+        states[offset + D3DTSS_ALPHAARG2] = stage === 0 ? D3DTA_DIFFUSE : D3DTA_CURRENT;
 
         // Address modes (WRAP is default, value = 1)
         states[offset + D3DTSS_ADDRESSU] = D3DTADDRESS_WRAP; // 1

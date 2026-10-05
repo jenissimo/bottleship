@@ -30,6 +30,20 @@ import { d3d9TextureStageStateDefault } from "../../src/worker/backends/webgpu/d
 import { d3d9SamplerStateDefault } from "../../src/worker/backends/webgpu/d3d9/d3d9-sampler";
 import * as C from "../../src/worker/modules/ddraw/constants";
 
+test.each([ ["D3D7", EMPTY_TEX_STATES], ["D3D8", createD3D8DefaultTextureStates()] ] as const)(
+    "%s seeds texture arguments on every stage, including disabled stages", (_api, ts) => {
+        for (let stage = 0; stage < 8; stage++) {
+            const o = stage * 32;
+            expect(ts[o + C.D3DTSS_COLORARG0]).toBe(C.D3DTA_CURRENT);
+            expect(ts[o + C.D3DTSS_ALPHAARG0]).toBe(C.D3DTA_CURRENT);
+            expect(ts[o + C.D3DTSS_COLORARG1]).toBe(C.D3DTA_TEXTURE);
+            expect(ts[o + C.D3DTSS_ALPHAARG1]).toBe(C.D3DTA_TEXTURE);
+            const arg2 = stage === 0 ? C.D3DTA_DIFFUSE : C.D3DTA_CURRENT;
+            expect(ts[o + C.D3DTSS_COLORARG2]).toBe(arg2);
+            expect(ts[o + C.D3DTSS_ALPHAARG2]).toBe(arg2);
+        }
+    });
+
 // D3D9 render-state / TSS / sampler numeric IDs the tracker/device use internally (mirrors the
 // private consts in d3d9-state-tracker.ts / d3d9-device.ts — kept in sync by this very test).
 const D3DRS = {
