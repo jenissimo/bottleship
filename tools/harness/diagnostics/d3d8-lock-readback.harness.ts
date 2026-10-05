@@ -5,7 +5,7 @@
  * chained run — reading them from separate CLI invocations measures an unknown window and
  * reports a plausible number for it.
  *
- *   bun tools/harness.ts run tools/harness/regression/d3d8-lock-readback.harness.ts
+ *   bun tools/harness.ts run tools/harness/diagnostics/d3d8-lock-readback.harness.ts
  *   FRAMES=300 …                 longer window
  *   FLAG=__noD3D8LockPrefetch …  measure with a kill switch set, for an A/B
  *

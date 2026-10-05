@@ -45,6 +45,19 @@ async function started(worker: FakeWorker) {
 describe('isolated child lifecycle', () => {
     const request = { imagePath: 'C:\\helper.exe', commandLine: '/generate result.dat', currentDirectory: 'C:\\' };
 
+    test('a hidden top-level title does not request the foreground session', async () => {
+        const worker = new FakeWorker();
+        let offers = 0;
+        const task = startChildProcess(filesystem(), request, () => worker as unknown as Worker,
+            () => { offers++; return true; });
+        await started(worker);
+        worker.onmessage!({ data: { type: 'window_title', title: 'Helper', visible: false } });
+        expect(offers).toBe(0);
+        expect(task.record.needsSession).toBeUndefined();
+        worker.exit(0);
+        expect(await task.completion).toBe(0);
+    });
+
     test('exit waits for durability and destroys the child worker', async () => {
         const vfs = filesystem();
         let release!: () => void;

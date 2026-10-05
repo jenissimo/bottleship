@@ -722,7 +722,7 @@ export class VirtualFileSystem {
     /**
      * mkdir -p for the PARENT directory of a file path: create the path's
      * directory and every missing ancestor. For EMULATOR-SIDE file injection
-     * only (shellExecFake createFiles, manifest writeFiles) — i.e. setup-time
+     * only (manifest writeFiles) — i.e. setup-time
      * conveniences that mirror what a real installer would do. The guest's own
      * CreateFile path stays faithful Win32 (ERROR_PATH_NOT_FOUND when a parent
      * dir is missing); do NOT route guest calls through here.

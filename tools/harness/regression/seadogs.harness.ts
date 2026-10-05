@@ -24,3 +24,5 @@ const result = await harness()
     .run();
 
 console.log(JSON.stringify({ ok: result.ok, error: result.error ?? null }, null, 2));
+if (!result.ok) throw new Error(`Sea Dogs scenario failed: ${JSON.stringify(result.error)}`);
+console.log("OK — Options has a non-black backbuffer");

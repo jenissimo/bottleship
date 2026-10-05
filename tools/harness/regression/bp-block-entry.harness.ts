@@ -90,6 +90,9 @@ return { stub: "0x" + stub.toString(16), trials: r };
 
 const r: any = await harness().call("evalWorker", CODE).run();
 const res = r.steps?.find((s: any) => s.cmd === "evalWorker")?.result;
+if (!r.ok || res?.trials?.length !== 6 || res.trials.some((t: any) => t.calls !== 5)) {
+    throw new Error(`Breakpoint trials did not complete: ${JSON.stringify(r.error ?? res)}`);
+}
 console.log(JSON.stringify(res, null, 2));
 for (const t of res?.trials ?? []) {
     console.log(`${t.mode.padEnd(7)} bp@${t.addr}: ${t.calls} calls, ${t.bpLines} <BP> line(s)`);

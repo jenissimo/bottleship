@@ -459,6 +459,22 @@
   text-decoration: underline;
 }
 
+.gog-upgrade {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line-1);
+  background: var(--surf-amber);
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+.gog-upgrade > div { flex: 1; min-width: 220px; }
+.gog-upgrade small { display: block; color: var(--fg-2); margin-top: 4px; }
+.app--immersive .gog-upgrade { display: none; }
+.app__panel:fullscreen ~ .gog-upgrade,
+.app__panel:-webkit-full-screen ~ .gog-upgrade { display: none; }
+
 /* Hide info strip in fullscreen */
 .app__panel:fullscreen ~ .emu-info-strip,
 .app__panel:-webkit-full-screen ~ .emu-info-strip {

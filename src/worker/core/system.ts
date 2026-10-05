@@ -384,7 +384,7 @@ export class System {
     private hostCursorClipSignalState: string | null = null;
     private hostMouseCapture: ((capture: boolean) => void) | null = null;
     private hostMouseCaptureState: boolean | null = null;
-    private hostWindowTitle: ((title: string) => void) | null = null;
+    private hostWindowTitle: ((title: string, visible: boolean) => void) | null = null;
 
     private constructor() {
         this.windowManager = new WindowManager();
@@ -777,7 +777,7 @@ export class System {
         this.hostCursorVisibility = callback;
     }
 
-    setHostWindowTitleCallback(callback: (title: string) => void): void {
+    setHostWindowTitleCallback(callback: (title: string, visible: boolean) => void): void {
         this.hostWindowTitle = callback;
     }
 
@@ -789,7 +789,7 @@ export class System {
      *  rewriting the frame title — but a title that only differs in its NUMBERS is an FPS
      *  counter, and logging that at every frame is a permanent per-frame line in the
      *  firehose. Those still reach the ring at verbose. */
-    notifyWindowTitle(title: string, source = "?"): void {
+    notifyWindowTitle(title: string, source = "?", visible = true): void {
         const skeleton = title.replace(/[\d.,:\s]+/g, "");
         if (skeleton !== this.lastWindowTitleSkeleton) {
             this.lastWindowTitleSkeleton = skeleton;
@@ -797,7 +797,7 @@ export class System {
         } else {
             Logger.verbose(LogCategory.USER32, `[WINDOW-TITLE] via=${source} ${JSON.stringify(title)}`);
         }
-        if (this.hostWindowTitle) this.hostWindowTitle(title);
+        if (this.hostWindowTitle) this.hostWindowTitle(title, visible);
     }
 
     requestHostCursorVisible(visible: boolean): void {

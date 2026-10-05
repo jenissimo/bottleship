@@ -21,14 +21,6 @@ import { VFS_FILETIME } from '../../runtime/filesystem/file-time';
 import { noteBootFileActivity } from '../../runtime/boot-status';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { getCodePageDecoder } from '../codepage-utils';
-import {
-    classifyUe1FirstRunFile,
-    dirOfWindowsPath,
-    baseOfWindowsPath,
-    pinUeEngineIni,
-    detectUe2PcPackages,
-} from '../../runtime/filesystem/ue1-firstrun';
-import { invalidateIniCache } from './profile';
 import { namedObjects } from './named-objects';
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from '../../core/diagnostics/large-io-trace';
 import { ioTraceRing } from '../../core/debug/io-trace-ring';
@@ -195,109 +187,6 @@ const FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
  *  read run is a scan through one file rather than two adjacent unrelated reads. */
 function applyOpenFlags(handle: VfsFileHandle, dwFlagsAndAttributes: number): void {
     if ((dwFlagsAndAttributes & FILE_FLAG_SEQUENTIAL_SCAN) !== 0) handle.sequentialFlag = true;
-}
-
-/**
- * Generic Unreal Engine 1 first-run handler — reactive layer at the file-open
- * boundary. UE1 games READ their render-detection output (Detected.ini) and
- * their lazily-copied active config (e.g. HP.ini / User.ini) with OPEN_EXISTING;
- * if either is missing the game stalls. The active-config directory is baked
- * into the exe (some titles redirect to C:\My Documents\<GameFolder>) — unknown at build
- * time — so we learn it from the game's own Detected.* request, then materialize
- * the missing files into the CoW overlay.
- *
- * Conservative by construction: only fires when (a) the bundle is UE1, (b) the
- * disposition is OPEN_EXISTING, (c) the access requests read, (d) the file is
- * genuinely MISSING, and (e) the basename matches our patterns. Returns true if
- * it materialized a file (the caller should then re-attempt the normal open,
- * which will now succeed). Never overwrites an existing file; never acts on
- * write dispositions (the engine/game owns those).
- *
- * Mirrors shell32 applyShellExecFake's overlay file-creation: ensureParentDirsSync
- * (mkdir -p), then open(GENERIC_WRITE, CREATE_ALWAYS) → write → flushFile, plus
- * invalidateIniCache for *.ini.
- */
-async function tryUe1FirstRunMaterialize(
-    filename: string,
-    dwDesiredAccess: number,
-    dwCreationDisposition: number,
-): Promise<boolean> {
-    const config = EmulatorConfig.getInstance();
-    if (!config.ue1) return false;
-    if ((dwCreationDisposition >>> 0) !== OPEN_EXISTING) return false;
-    if ((dwDesiredAccess & GENERIC_READ) === 0) return false;
-    if (!filename) return false;
-
-    const vfs = System.getInstance().fileSystem;
-
-    // Only act on a genuine miss — never clobber an existing file.
-    if (vfs.openSync(filename, GENERIC_READ, OPEN_EXISTING) !== null) return false;
-
-    const full = vfs.resolvePath(filename);
-    const dir = dirOfWindowsPath(full);
-    const base = baseOfWindowsPath(full);
-    const inUserDir = config.ue1UserDir !== null && dir.toLowerCase() === config.ue1UserDir.toLowerCase();
-    const kind = classifyUe1FirstRunFile(base, inUserDir);
-    if (kind === null) return false;
-
-    const materialize = async (path: string, data: Uint8Array, sourceDesc: string): Promise<boolean> => {
-        try {
-            vfs.ensureParentDirsSync(path);
-            const h = await vfs.open(path, GENERIC_WRITE, CREATE_ALWAYS);
-            if (!h) {
-                Logger.warn(LogCategory.SYSTEM, `UE1: could not create "${path}" (parent missing?)`);
-                return false;
-            }
-            if (data.length > 0) await vfs.write(h, data);
-            await vfs.flushFile(h.path);
-            if (path.toLowerCase().endsWith('.ini')) invalidateIniCache(path);
-            Logger.log(LogCategory.SYSTEM, `UE1 first-run: materialized "${path}" (${data.length} bytes, source=${sourceDesc})`);
-            return true;
-        } catch (err) {
-            Logger.warn(LogCategory.SYSTEM, `UE1: materialize "${path}" failed: ${err}`);
-            return false;
-        }
-    };
-
-    const readSource = async (srcPath: string): Promise<Uint8Array | null> => {
-        const src = await vfs.open(srcPath, GENERIC_READ, OPEN_EXISTING);
-        if (!src) return null;
-        const size = vfs.getFileSize(srcPath);
-        return size > 0 ? await vfs.read(src, size) : new Uint8Array(0);
-    };
-
-    if (kind === 'detected') {
-        // Render-detection output the game reads but never finds: an empty file is
-        // enough to let the OPEN_EXISTING succeed and the game proceed. Learn the
-        // containing directory as the UE1 user dir for subsequent config seeding.
-        const ok = await materialize(full, new Uint8Array(0), 'empty');
-        if (ok && dir) {
-            config.ue1UserDir = dir;
-            Logger.log(LogCategory.SYSTEM, `UE1 first-run: learned user dir "${dir}" from "${base}"`);
-        }
-        return ok;
-    }
-
-    if (kind === 'user-ini') {
-        // Active key-bindings config — seed from the factory DefUser.ini template.
-        const data = await readSource('C:\\System\\DefUser.ini');
-        if (data === null) {
-            Logger.warn(LogCategory.SYSTEM, `UE1: cannot seed "${full}" — System\\DefUser.ini missing`);
-            return false;
-        }
-        return await materialize(full, data, 'System\\DefUser.ini');
-    }
-
-    // kind === 'ini': active settings config — seed from Default.ini, pinning our
-    // D3D render device (reproduces what the curated HP.ini did by hand).
-    const raw = await readSource('C:\\System\\Default.ini');
-    if (raw === null) {
-        Logger.warn(LogCategory.SYSTEM, `UE1: cannot seed "${full}" — System\\Default.ini missing`);
-        return false;
-    }
-    const hasPcPackages = detectUe2PcPackages((guestPath) => System.getInstance().fileSystem.getFileSize(guestPath) > 0);
-    const pinned = pinUeEngineIni(new TextDecoder('utf-8').decode(raw), { hasPcPackages });
-    return await materialize(full, new TextEncoder().encode(pinned), 'System\\Default.ini (engine-pinned)');
 }
 
 const fileIoModule = (() => {
@@ -616,32 +505,6 @@ const fileIoModule = (() => {
         const openFailure = vfs.classifyOpenFailure(filename, dwCreationDisposition);
         const disp = dwCreationDisposition >>> 0;
 
-        // Generic UE1 first-run: an OPEN_EXISTING read-miss on Detected.ini /
-        // a config-ini → materialize/seed it into the overlay, then retry the open.
-        // Gated on the ue1 flag (no-op for non-UE1 games). Async because it writes.
-        if (disp === 3 && EmulatorConfig.getInstance().ue1 && (dwDesiredAccess & GENERIC_READ) !== 0) {
-            return (async (): Promise<number> => {
-                const materialized = await tryUe1FirstRunMaterialize(filename, dwDesiredAccess, dwCreationDisposition);
-                if (materialized) {
-                    const vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
-                    if (vfsHandle) {
-                        applyOpenFlags(vfsHandle, dwFlagsAndAttributes);
-                        const handle = new FileHandleWrapper(vfsHandle, vfs);
-                        const handleId = System.getInstance().resourceProvider.registerFileHandle(handle);
-                        System.getInstance().scheduler.setLastError(0);
-                        Logger.log(LogCategory.KERNEL32, `CreateFileA: OK (UE1 first-run) "${filename}" handle=0x${handleId.toString(16)}`);
-                        return handleId;
-                    }
-                }
-                let resolved = '';
-                try { resolved = vfs.resolvePath(filename); } catch { /* ignore */ }
-                Logger.log(LogCategory.KERNEL32,
-                    `CreateFileA: FAILED "${filename}" resolved="${resolved}" disposition=${dwCreationDisposition} err=${openFailure}`);
-                System.getInstance().scheduler.setLastError(openFailure);
-                return INVALID_HANDLE_VALUE;
-            })();
-        }
-
         if (
             disp === 3 ||
             openFailure === ERROR_PATH_NOT_FOUND ||
@@ -799,10 +662,7 @@ const fileIoModule = (() => {
         // Async path: overlay files / create dispositions that must write.
         return (async () => {
             try {
-                let vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
-                if (!vfsHandle && await tryUe1FirstRunMaterialize(filename, dwDesiredAccess, dwCreationDisposition)) {
-                    vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
-                }
+                const vfsHandle = await vfs.open(filename, dwDesiredAccess, dwCreationDisposition);
                 if (!vfsHandle) {
                     System.getInstance().scheduler.setLastError(openFailure || ERROR_FILE_NOT_FOUND);
                     return INVALID_HANDLE_VALUE;

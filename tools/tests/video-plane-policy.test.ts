@@ -8,7 +8,7 @@
  * screen — the half that "the plane still holds a bitmap" cannot express, and the half that
  * kept coming back as a finished movie over a menu.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { VideoRoutingService } from "../../src/worker/video/video-routing-service";
 import type { VideoFrameViews, VideoTargetHint } from "../../src/worker/video/video-routing-types";
 import { getVirtualScreenRect } from "../../src/worker/modules/user32/shared-state";
@@ -33,8 +33,22 @@ class StubOffscreenCanvas {
     getContext(): StubContext { return new StubContext(); }
 }
 const g = globalThis as Record<string, unknown>;
-g.OffscreenCanvas ??= StubOffscreenCanvas;
-g.ImageData ??= class { constructor(public data: unknown, public width: number, public height: number) {} };
+function installCanvasFixture(): void {
+    let canvasDescriptor: PropertyDescriptor | undefined;
+    let imageDescriptor: PropertyDescriptor | undefined;
+    beforeEach(() => {
+        canvasDescriptor = Object.getOwnPropertyDescriptor(g, "OffscreenCanvas");
+        imageDescriptor = Object.getOwnPropertyDescriptor(g, "ImageData");
+        g.OffscreenCanvas = StubOffscreenCanvas;
+        g.ImageData = class { constructor(public data: unknown, public width: number, public height: number) {} };
+    });
+    afterEach(() => {
+        if (canvasDescriptor) Object.defineProperty(g, "OffscreenCanvas", canvasDescriptor);
+        else delete g.OffscreenCanvas;
+        if (imageDescriptor) Object.defineProperty(g, "ImageData", imageDescriptor);
+        else delete g.ImageData;
+    });
+}
 
 /** Just enough RenderService for the router: a serial, a presenter kind and a draw load. */
 function fakeRender() {
@@ -74,6 +88,7 @@ function guestScreen(): { w: number; h: number } {
 }
 
 describe("video plane composite policy", () => {
+    installCanvasFixture();
     test("a rescued movie is on screen, and says so", () => {
         const render = fakeRender();
         render.state.draws = 1; // the guest is blitting a movie, not drawing a scene
@@ -159,6 +174,7 @@ describe("video plane composite policy", () => {
  * blows a windowed movie up over the whole screen.
  */
 describe("video plane placement", () => {
+    installCanvasFixture();
     test("the plane is a GUEST-SCREEN image, not a frame-sized one", () => {
         const render = fakeRender();
         render.state.draws = 1;

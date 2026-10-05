@@ -7,6 +7,8 @@ export class SessionWorker extends EventTarget implements Worker {
     private ports = new Set<MessagePort>();
     private requests = new Map<unknown, MessagePort | null>();
     private settings = new Map<string, any>();
+    private rootExited = false;
+    private rootPresentation = new Map<string, any>();
     private sources = new WeakMap<MessageEvent, Worker | MessagePort>();
     replyTarget(event: MessageEvent): Worker | MessagePort { return this.sources.get(event) ?? this.root; }
 
@@ -19,6 +21,16 @@ export class SessionWorker extends EventTarget implements Worker {
     }
 
     private receive(event: MessageEvent, source: MessagePort | null): void {
+        const data = event.data;
+        if (data?.type === 'process_exit' && (source === null || data.broker)) this.rootExited = true;
+        if (source === null) {
+            if (data?.type === 'audio_register') this.rootPresentation.set(`audio:${data.payload.id}`, data);
+            else if (data?.type === 'audio_unregister') this.rootPresentation.delete(`audio:${data.payload.id}`);
+            else if (['audio_listener_sab', 'audio_stats_sab', 'audio_master_stats_sab',
+                'window_title', 'cursor_visibility', 'cursor_image'].includes(data?.type)) {
+                this.rootPresentation.set(data.type, data);
+            }
+        }
         const reply = event.data?.type === 'harness_reply' && this.requests.has(event.data.id)
             && this.requests.get(event.data.id) === source;
         if (reply) this.requests.delete(event.data.id);
@@ -30,7 +42,13 @@ export class SessionWorker extends EventTarget implements Worker {
             port.onmessage = next => this.receive(next, port);
             for (const setting of this.settings.values()) port.postMessage(setting);
         } else if (source !== this.foreground && !reply) return;
-        const message = new MessageEvent('message', { data: event.data, ports: [...event.ports] });
+        // A broker exit belongs to the parent. Its live child still owns the display.
+        if (data?.type === 'process_exit' && data.broker) return;
+        const childExit = data?.type === 'process_exit' && source !== null;
+        const message = new MessageEvent('message', {
+            data: childExit && !this.rootExited ? { ...data, type: 'child_process_exit' } : data,
+            ports: [...event.ports],
+        });
         this.sources.set(message, source ?? this.root);
         this.dispatchEvent(message);
         // A promoted child that has exited is about to be terminated by its parent, so
@@ -69,9 +87,20 @@ export class SessionWorker extends EventTarget implements Worker {
             this.sources.set(dead, this.root);
             this.dispatchEvent(dead);
         }
-        const reset = new MessageEvent('message', { data: { type: 'child_session_reset' } });
+        const resumeParent = !this.rootExited;
+        const reset = new MessageEvent('message', { data: { type: 'child_session_reset', resumeParent } });
         this.sources.set(reset, this.root);
         this.dispatchEvent(reset);
+        if (resumeParent) {
+            this.root.postMessage({ type: 'resume_session' });
+            for (const data of this.rootPresentation.values()) {
+                const restored = new MessageEvent('message', { data });
+                this.sources.set(restored, this.root);
+                this.dispatchEvent(restored);
+            }
+        }
+        this.ports.delete(retired);
+        retired.close();
     }
 
     postMessage(message: any, options: Transferable[] | StructuredSerializeOptions = []): void {
@@ -80,6 +109,8 @@ export class SessionWorker extends EventTarget implements Worker {
             this.ports.clear();
             this.requests.clear();
             this.foreground = null;
+            this.rootExited = false;
+            this.rootPresentation.clear();
             const reset = new MessageEvent('message', { data: { type: 'child_session_reset' } });
             this.dispatchEvent(reset);
         }

@@ -204,29 +204,32 @@ export function decompressChunkStream(
     const absBase = chunk.sortOffset;
     verifyMagic(slice.readSpan(chunk.firstSlice, chunk.sortOffset, 4), absBase);
 
-    const payload = slice.readSpan(chunk.firstSlice, chunk.sortOffset + 4, chunk.chunkSize);
-    if (payload.byteLength !== chunk.chunkSize) {
-        throw new InnoFormatError(
-            `truncated chunk payload (got ${payload.byteLength}, expected ${chunk.chunkSize})`,
-            absBase + 4,
-        );
-    }
+    const payloadSource = (skip = 0): RandomAccessSource => ({
+        size: chunk.chunkSize - skip,
+        readRangeSync(start, end) {
+            const bytes = slice.readSpan(chunk.firstSlice, chunk.sortOffset + 4 + skip + start, end - start);
+            if (bytes.length !== end - start) throw new InnoFormatError("truncated chunk payload", absBase + 4 + start);
+            return bytes;
+        },
+    });
 
     switch (chunk.compression) {
         case CompressionMethod.Stored: {
-            if (!onWrite(payload)) {
-                throw new InnoFormatError("output aborted during stored chunk decode", absBase);
+            const source = payloadSource();
+            for (let at = 0; at < source.size; at += 256 * 1024) {
+                if (!onWrite(source.readRangeSync(at, Math.min(source.size, at + 256 * 1024)))) {
+                    throw new InnoFormatError("output aborted during stored chunk decode", absBase);
+                }
             }
             break;
         }
         case CompressionMethod.LZMA1: {
-            if (payload.byteLength < 5) {
+            if (chunk.chunkSize < 5) {
                 throw new InnoFormatError("LZMA1 chunk header too short", absBase + 4);
             }
-            const props = payload.subarray(0, 5);
-            const compressed = payload.subarray(5);
+            const props = payloadSource().readRangeSync(0, 5);
             try {
-                lzma.decodeToCallback(UNPACK_LZMA1, compressed, onWrite, props);
+                lzma.decodeSourceToCallback(UNPACK_LZMA1, payloadSource(5), onWrite, props);
             } catch (e) {
                 throw new InnoFormatError(
                     `LZMA1 decode failed @ slice+0x${chunk.sortOffset.toString(16)}: ${e}`,
@@ -236,16 +239,15 @@ export function decompressChunkStream(
             break;
         }
         case CompressionMethod.LZMA2: {
-            if (payload.byteLength < 1) {
+            if (chunk.chunkSize < 1) {
                 throw new InnoFormatError("LZMA2 chunk header too short", absBase + 4);
             }
-            const prop = payload[0]!;
+            const prop = payloadSource().readRangeSync(0, 1)[0]!;
             const dictSize = lzma2DictSize(prop);
             const props = new Uint8Array(4);
             new DataView(props.buffer).setUint32(0, dictSize, true);
-            const compressed = payload.subarray(1);
             try {
-                lzma.decodeToCallback(UNPACK_LZMA2, compressed, onWrite, props);
+                lzma.decodeSourceToCallback(UNPACK_LZMA2, payloadSource(1), onWrite, props);
             } catch (e) {
                 throw new InnoFormatError(
                     `LZMA2 decode failed @ slice+0x${chunk.sortOffset.toString(16)}: ${e}`,

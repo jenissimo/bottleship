@@ -1,8 +1,8 @@
 /**
- * Template touch/mobile script — the P3 acceptance shape from plan/mobile-touch-plan.md.
+ * Template touch/mobile script; adapt assertions to the selected game's input behavior.
  *
  * Prereqs: `bun tools/harness.ts up`. Then:
- *   WGB=/apps/<bundle>.wgb bun tools/harness.ts run tools/harness/regression/touch.harness.ts
+ *   WGB=/apps/<bundle>.wgb bun tools/harness.ts run tools/harness/templates/touch.harness.ts
  *
  * `device` + the gesture verbs execute CLI-side over CDP (Emulation.* /
  * Input.dispatchTouchEvent) and splice back into the same ordered result as the

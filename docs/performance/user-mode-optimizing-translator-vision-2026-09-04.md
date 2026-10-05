@@ -1,7 +1,7 @@
 # Оптимизирующий x86 user-mode транслятор: архитектурное видение
 
 Дата: 2026-09-04. Статус: проектное предложение, не реализованный backend и не performance claim.
-Продолжает CPU-трек [плана v2](generic-cpu-hle-d3d-plan-v2-2026-09-04.md).
+Историческое проектное предложение CPU-трека; текущие правила см. в [протоколе измерений](benchmark-method.md).
 
 Цель исследования — проверить возможность **роста CPU throughput примерно в 2 раза** на
 широком классе Win32-программ в браузере. Более высокие множители рассматриваются как
@@ -698,4 +698,4 @@ contract. Если legal specialization не снимает этот cost, эт�
 - [Исторический полный ABI-контракт](../../plan/aot-module-contract.md).
 - [Исторический AOT design rev3](../../plan/aot-compiler-design.rev3-2026-07-29.md).
 - [Отрицательные performance results](negative-results.md).
-- [Общий CPU/HLE/D3D план v2](generic-cpu-hle-d3d-plan-v2-2026-09-04.md).
+- [Протокол измерений](benchmark-method.md).

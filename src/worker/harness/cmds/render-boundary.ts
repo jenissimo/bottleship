@@ -1,15 +1,12 @@
 /**
- * renderBoundaryMark / renderBoundary / renderBoundaryAudit — censuses A and C of the
- * render-worker plan's §8.0 gate (docs/performance/render-worker-plan-2026-09-11.md).
+ * renderBoundaryMark / renderBoundary / renderBoundaryAudit — GPU waits and dirty-byte
+ * accounting (docs/performance/benchmark-method.md).
  *
  * Two questions the gate turns on, neither of which any existing counter answers:
  *
- *   A. How often does a GPU round trip PARK the guest, per presented frame? §6 makes
- *      "fences no more frequent than today" a perf invariant, and an invariant with no
- *      pre-measurement is unfalsifiable.
- *   C. How many dirty bytes cross to the GPU per frame? §5 would add a staging copy of
- *      exactly those bytes, and §10 refuses to build the project if that copy costs more
- *      than half the §1 ceiling.
+ *   A. How often does a GPU round trip PARK the guest, per presented frame?
+ *   C. How many dirty bytes cross to the GPU per frame? A staging copy has to account
+ *      for those bytes when assessing the benefit of moving execution.
  *
  * Both are per-FRAME questions. A session total hides the shape — one 8 MB frame and a
  * hundred 80 KB ones total the same and price completely differently — so the ledger is a

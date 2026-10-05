@@ -1,31 +1,12 @@
-/**
- * WGB build service (Stage 1) — split bundle *building* from *booting*.
- *
- * `loadBundle` (emulator.worker.ts) still owns the boot path; this module owns the
- * non-booting half: classify a dropped payload, extract/synthesize into a staged `.wgb`
- * under OPFS `bottleship/_wizard/<id>.wgb`, inspect an existing `.wgb`, and finalize a
- * (possibly edited) staged bundle to one of three destinations (play / library / download).
- *
- * It deliberately reuses the existing browser-callable building blocks rather than
- * re-implementing them: `installerToWgb` (Inno extract → synth → buildZip), `synthesizeManifest`
- * (manifest + registry), `buildZip` (store-only ZIP), `ZipArchive` (reader), `container-id`.
- *
- * Pure helpers (`detectFromBytes`, `classifySource`, `mergeManifest`, `unzipStored`) are exported
- * for unit tests; nothing here touches v86 or boots the guest.
- */
+/** Classify, stage, inspect and finalize bundles without booting the guest. */
 
 import {
     BufferSource,
-    extractInnoToMap,
-    MultiSliceReader,
-    parseInnoHeader,
-    parseSliceFile,
     type InnoParseResult,
-    type SliceData,
 } from "@bottleship/formats/inno";
-import { UnpackDecoder } from "@bottleship/formats/unpack";
-import { detectFormat, sniffBlobHead, type DetectedFormat } from "@bottleship/repack/detect";
-import { installerToWgb } from "@bottleship/repack/installer-to-wgb";
+import { detectFormat, detectSourceFormat, sniffBlobHead, type DetectedFormat } from "@bottleship/repack/detect";
+import { buildInstallerOnDisk, blobRandomAccess } from "./installer-opfs";
+import { writeZipStream, type ZipStreamEntry } from "@bottleship/formats/wgb/zip-stream";
 import { buildZip } from "@bottleship/formats/wgb/zip-build";
 import {
     guessCacheKey,
@@ -38,7 +19,7 @@ import { isGogJunk, detectExeFromPaths } from "@bottleship/repack/gog-filter";
 import { detectInstallShield, extractInstallerFromFiles } from "@bottleship/repack/container-extract";
 import { IsoImage, detectSectorLayout, extractIsoToMap } from "@bottleship/formats/iso";
 import { extract7z } from "../archive/unpack-buffered";
-import { ZipArchive, BufferSource as ZipBufferSource, unzipToMap, type ZipEntry } from "@bottleship/formats/zip";
+import { ZipArchive, BlobSource, BufferSource as ZipBufferSource, unzipToMap, type ZipEntry } from "@bottleship/formats/zip";
 import { resolveGameId, gameIdToContainerDir, manifestToWgbFilename } from "@bottleship/formats/wgb/container-id";
 import { getBottleshipRoot } from "./container-store";
 import { WgbCache } from "./wgb-cache";
@@ -66,6 +47,9 @@ export interface BuildSource {
     blobs?: File[];
     /** A folder of already-extracted game files (host-enumerated → rel-path → bytes). */
     files?: Map<string, Uint8Array>;
+    /** Read-only directory access; payloads are read by range in the worker. */
+    directory?: FileSystemDirectoryHandle;
+    directoryMode?: "installed" | "gog-installer";
     /** Cached bundle URL (existing `.wgb` served from /apps/...). */
     url?: string;
     /** Manifest-synthesis overrides forwarded from the wizard form (name/exe/os/...). */
@@ -127,8 +111,10 @@ export interface FinalizeArgs {
 export interface FinalizeResult {
     destination: FinalizeDestination;
     gameId: string;
-    /** Final `.wgb` bytes (always returned for `download`; also handy for `play`). */
+    /** Legacy buffered output; current browser finalization returns file. */
     bytes?: Uint8Array;
+    /** Disk-backed output; structured cloning a File does not copy its payload into RAM. */
+    file?: File;
     /** OPFS cache key the library copy was persisted under (`library`). */
     cacheKey?: string;
     suggestedFilename: string;
@@ -143,6 +129,84 @@ export interface BuildProgress {
 export type ProgressFn = (phase: BuildProgress["phase"], percent: number, label: string) => void;
 
 const WIZARD_DIR = "_wizard";
+
+/** Enumerate snapshots and relative names; never read payloads while walking a folder. */
+export async function readDirectoryFiles(directory: FileSystemDirectoryHandle): Promise<Map<string, File>> {
+    const files = new Map<string, File>();
+    const walk = async (dir: FileSystemDirectoryHandle, prefix: string): Promise<void> => {
+        const iterable = dir as FileSystemDirectoryHandle & {
+            entries(): AsyncIterable<[string, FileSystemHandle]>;
+        };
+        for await (const [name, handle] of iterable.entries()) {
+            const path = prefix + name;
+            if (handle.kind === "directory") await walk(handle as FileSystemDirectoryHandle, path + "/");
+            else files.set(path, await (handle as FileSystemFileHandle).getFile());
+        }
+    };
+    await walk(directory, "");
+    if (!files.size) throw new Error("That folder is empty");
+    return files;
+}
+
+async function installerDirectorySource(source: BuildSource): Promise<BuildSource> {
+    const dir = source.directory! as FileSystemDirectoryHandle & {
+        entries(): AsyncIterable<[string, FileSystemHandle]>;
+    };
+    const files: File[] = [];
+    for await (const [name, handle] of dir.entries()) {
+        if (handle.kind === "file" && /\.(exe|bin)$/i.test(name)) files.push(await (handle as FileSystemFileHandle).getFile());
+    }
+    const setups = files.filter(f => /\.exe$/i.test(f.name));
+    if (setups.length !== 1) throw new Error("Choose the folder for one GOG offline installer, containing one setup.exe and its .bin parts. Use Choose files to select a specific installer from a larger folder.");
+    const base = setups[0]!.name.replace(/\.exe$/i, "").toLowerCase() + "-";
+    return { blobs: [setups[0]!, ...files.filter(f => /\.bin$/i.test(f.name) && f.name.toLowerCase().startsWith(base))], cli: source.cli };
+}
+
+async function buildDirectoryBundle(source: BuildSource, onProgress?: ProgressFn): Promise<BuildResult> {
+    const files = await readDirectoryFiles(source.directory!);
+    if (detectInstallShield(files.keys()).stem) throw new Error("This folder contains an InstallShield installer. Choose its archive, or select the already installed game folder.");
+    const metadata = new Map<string, Uint8Array>();
+    for (const [name, file] of files) {
+        const meta = /(^|\/)goggame-.*\.(info|script)$/i.test(name) || /(^|\/)setup\.ini$/i.test(name);
+        if (meta && file.size > 16 * 1024 * 1024) throw new Error("Game metadata exceeds 16 MB");
+        metadata.set(name, meta ? new Uint8Array(await file.arrayBuffer()) : new Uint8Array(0));
+    }
+    const db = await loadOverrides();
+    const synth = synthFromFiles(metadata, withSynthName(source.cli, source, metadata), db);
+    const manifest = synth.manifest;
+    const gameId = resolveGameId(manifest);
+    const bs = await getBottleshipRoot(true);
+    if (!bs) throw new Error("Browser storage unavailable");
+    const dir = await bs.getDirectoryHandle(WIZARD_DIR, { create: true });
+    const key = crypto.randomUUID() + ".wgb";
+    const handle = await dir.getFileHandle(key, { create: true });
+    const writable = await handle.createWritable();
+    const enc = new TextEncoder();
+    const entries: ZipStreamEntry[] = [
+        { name: "manifest.json", source: new ZipBufferSource(enc.encode(JSON.stringify(manifest, null, 2))) },
+        { name: "registry.json", source: new ZipBufferSource(enc.encode(JSON.stringify(synth.registry, null, 2))) },
+        ...[...files].filter(([name]) => !isGogJunk(name)).map(([name, file]) => ({
+            name: "rom/" + name, source: { size: file.size, readRange: async (a: number, b: number) => new Uint8Array(await file.slice(a, b).arrayBuffer()) },
+        })),
+    ];
+    const total = entries.reduce((n, e) => n + e.source.size, 0);
+    try {
+        await writeZipStream(entries, { write: async (bytes, at) => { await writable.seek(at); await writable.write(asWriteChunk(bytes)); } },
+            done => onProgress?.("packing", Math.min(99, total ? Math.round(done / total * 100) : 0), "Packaging game folder to browser storage"));
+        await writable.close();
+    } catch (error) {
+        try { await writable.abort(); } catch { /* Preserve the write error. */ }
+        try { await dir.removeEntry(key); } catch { /* Storage can clean abandoned files. */ }
+        if ((error as DOMException).name === "QuotaExceededError") throw new Error("Browser storage is full. Free cached files in Settings → Storage and try again.");
+        throw error;
+    }
+    const detections = { kind: "game-folder" as const, ...collectExeDetections(files.keys()),
+        gogGameId: parseGogGameInfo(metadata).gameId, note: `${files.size} files in ${source.directory!.name}` };
+    const stagedPath = `${WIZARD_DIR}/${key}`;
+    const result = await inspectStaged(stagedPath);
+    onProgress?.("done", 100, "Ready");
+    return { stagedPath, manifest, gameId, entries: result.entries, detections };
+}
 
 // --- pure helpers (unit-tested) ---------------------------------------------------
 
@@ -254,6 +318,15 @@ async function getLzmaWasm(): Promise<ArrayBuffer> {
  * full buffer when it must walk an Inno offsets table or a ZIP central directory).
  */
 export async function detectSource(source: BuildSource): Promise<SourceDetection> {
+    if (source.directory) {
+        if (source.directoryMode === "gog-installer") {
+            return detectSource(await installerDirectorySource(source));
+        }
+        const files = await readDirectoryFiles(source.directory);
+        const { exeCandidates, suggestedEntrypoint } = collectExeDetections(files.keys());
+        return { kind: "game-folder", exeCandidates, suggestedEntrypoint,
+            note: `${files.size} files in ${source.directory.name}` };
+    }
     // Folder of already-extracted files.
     if (source.files) {
         const is = detectInstallShield(source.files.keys());
@@ -279,8 +352,7 @@ export async function detectSource(source: BuildSource): Promise<SourceDetection
     if (source.blobs && source.blobs.length) {
         const exe = source.blobs.find((f) => !f.name.toLowerCase().endsWith(".bin"));
         if (!exe) return { kind: "unknown", exeCandidates: [], note: "no setup.exe among dropped files" };
-        const data = new Uint8Array(await exe.arrayBuffer());
-        const fmt = detectFromBytes(data);
+        const fmt = await detectBlobFormat(exe);
         if (fmt === "inno") return { kind: "gog-installer", exeCandidates: [], detectedFormat: fmt };
         return {
             kind: "unknown",
@@ -305,8 +377,7 @@ export async function detectSource(source: BuildSource): Promise<SourceDetection
         const headKind = sniffBlobHead(head);
         if (headKind === "wgb") {
             // PK — either a finished `.wgb` (has manifest.json) or a plain installer `.zip`.
-            const data = new Uint8Array(await source.blob.arrayBuffer());
-            const archive = new ZipArchive(new ZipBufferSource(data));
+            const archive = new ZipArchive(new BlobSource(source.blob));
             await archive.init();
             const names = archive.listEntries().map((e) => e.name);
             if (looksLikeWgb(names)) {
@@ -331,12 +402,12 @@ export async function detectSource(source: BuildSource): Promise<SourceDetection
             };
         }
         if (headKind === "mz") {
-            const data = new Uint8Array(await source.blob.arrayBuffer());
-            const fmt = detectFromBytes(data);
+            const fmt = await detectBlobFormat(source.blob);
             if (fmt === "inno") return { kind: "gog-installer", exeCandidates: [], detectedFormat: fmt };
             // Not Inno — maybe a self-extractor (WinZip SFX etc.): a PE stub with a ZIP
             // appended. Unwrap it like any other container and recurse into the payload.
-            const sfxNames = await sfxZipEntries(data);
+            const sfxArchive = new ZipArchive(new BlobSource(source.blob));
+            const sfxNames = await sfxArchive.init().then(() => sfxArchive.listEntries().map(e => e.name)).catch(() => null);
             if (sfxNames) {
                 if (looksLikeWgb(sfxNames)) return { kind: "wgb", exeCandidates: [], detectedFormat: "wgb" };
                 const { exeCandidates, suggestedEntrypoint } = collectExeDetections(sfxNames);
@@ -456,6 +527,7 @@ function parseSetupIniAppName(files: Map<string, Uint8Array>): string | undefine
 
 /** Worst-case display name: the source file's basename (sans extension). */
 function sourceBaseName(source: BuildSource): string | undefined {
+    if (source.directory) return source.directory.name;
     let n: string | undefined;
     const named = source.blob as File | undefined;
     if (named && typeof named.name === "string") n = named.name;
@@ -476,6 +548,7 @@ function withSynthName(
     iniFiles?: Map<string, Uint8Array>,
 ): SynthOptions["cli"] | undefined {
     if (cli?.name) return cli;
+    if (iniFiles && parseGogGameInfo(iniFiles).name) return cli;
     const name = (iniFiles ? parseSetupIniAppName(iniFiles) : undefined) ?? sourceBaseName(source);
     return name ? { ...(cli ?? {}), name } : cli;
 }
@@ -537,6 +610,13 @@ async function writeStaged(id: string, bytes: Uint8Array): Promise<string> {
  * write to OPFS `bottleship/_wizard/<id>.wgb`. Posts progress via `onProgress`.
  */
 export async function buildStagedBundle(source: BuildSource, onProgress?: ProgressFn): Promise<BuildResult> {
+    if (source.directory) {
+        onProgress?.("detecting", 0, `Reading ${source.directory.name}`);
+        if (source.directoryMode === "gog-installer") {
+            return buildStagedBundle(await installerDirectorySource(source), onProgress);
+        }
+        return buildDirectoryBundle(source, onProgress);
+    }
     onProgress?.("detecting", 0, "Inspecting source");
     const detections = await detectSource(source);
     const db = await loadOverrides();
@@ -546,62 +626,40 @@ export async function buildStagedBundle(source: BuildSource, onProgress?: Progre
     let gameId: string;
 
     if (detections.kind === "wgb") {
-        // Passthrough: read the finished bundle's bytes + manifest, re-stage as-is.
         onProgress?.("reading", 10, "Reading bundle");
-        const data = await readSourceBytes(source);
-        const archive = new ZipArchive(new ZipBufferSource(data));
+        const blob = await readSourceBlob(source);
+        const archive = new ZipArchive(new BlobSource(blob));
         await archive.init();
         const manEntry = archive.getEntry("manifest.json");
         if (!manEntry) throw new Error("not a WGB bundle (no manifest.json)");
         manifest = JSON.parse(new TextDecoder().decode(await archive.readEntry(manEntry)));
         gameId = resolveGameId(manifest as { gameId?: string; name?: string; entrypoint?: string });
-        wgbBytes = data;
-        onProgress?.("packing", 90, "Staging");
-    } else if (detections.kind === "gog-installer") {
-        // Inno installer (single or multi-part) — reuse installerToWgb end to end.
-        onProgress?.("installing", 0, "Extracting installer");
-        const wasm = await getLzmaWasm();
-        const lzma = new UnpackDecoder();
-        await lzma.init(wasm);
-
-        let parsed: InnoParseResult;
-        let setupBytes: Uint8Array;
-        let sliceSource: MultiSliceReader | undefined;
-
-        if (source.blobs && source.blobs.length) {
-            const exe = source.blobs.find((f) => !f.name.toLowerCase().endsWith(".bin"))!;
-            const bins = source.blobs.filter((f) => f.name.toLowerCase().endsWith(".bin"));
-            setupBytes = new Uint8Array(await exe.arrayBuffer());
-            parsed = await parseInnoHeader(new BufferSource(setupBytes), lzma);
-            // Natural-sort the slices by their `-N[letter].bin` ordinal.
-            const ordered = [...bins].sort((a, b) => sliceOrdinal(a.name) - sliceOrdinal(b.name));
-            const sliceData: SliceData[] = [];
-            for (const f of ordered) sliceData.push(parseSliceFile(new Uint8Array(await f.arrayBuffer())));
-            sliceSource = new MultiSliceReader(sliceData);
-        } else {
-            setupBytes = await readSourceBytes(source);
-            parsed = await parseInnoHeader(new BufferSource(setupBytes), lzma);
+        const bs = await getBottleshipRoot(true);
+        if (!bs) throw new Error("Browser storage unavailable");
+        const dir = await bs.getDirectoryHandle(WIZARD_DIR, { create: true });
+        const key = crypto.randomUUID() + ".wgb";
+        const writable = await (await dir.getFileHandle(key, { create: true })).createWritable();
+        try {
+            for (let at = 0; at < blob.size; at += 256 * 1024) {
+                await writable.write(blob.slice(at, Math.min(blob.size, at + 256 * 1024)));
+                onProgress?.("staging", Math.round(Math.min(blob.size, at + 256 * 1024) / blob.size * 100), "Staging bundle on disk");
+            }
+            await writable.close();
+        } catch (err) {
+            await writable.abort();
+            await dir.removeEntry(key);
+            throw err;
         }
-
-        const result = await installerToWgb({
-            source: new BufferSource(setupBytes),
-            wasmBytes: wasm,
-            parsed,
-            sliceSource,
-            overrides: db,
-            synth: source.cli,
-            onProgress: (p) => {
-                const pct = p.totalBytes > 0 ? Math.round((p.doneBytes / p.totalBytes) * 100) : 0;
-                onProgress?.("installing", pct, p.phase);
-            },
-        });
-        wgbBytes = result.wgb;
-        const archive = new ZipArchive(new ZipBufferSource(wgbBytes));
-        await archive.init();
-        manifest = JSON.parse(new TextDecoder().decode(await archive.readEntry(archive.getEntry("manifest.json")!)));
-        gameId = resolveGameId(manifest as { gameId?: string; name?: string; entrypoint?: string });
-        // Carry the GOG id detection forward from the synthesized manifest.
-        detections.gogGameId = detections.gogGameId ?? result.gameId;
+        return { stagedPath: `${WIZARD_DIR}/${key}`, manifest, entries: entriesFromZip(archive.listEntries()), gameId, detections };
+    } else if (detections.kind === "gog-installer") {
+        const result = await buildInstallerOnDisk(source, db, onProgress);
+        manifest = result.manifest;
+        gameId = resolveGameId(manifest);
+        detections.gogGameId = result.gameId;
+        const entries = (await inspectStaged(result.stagedPath)).entries;
+        Object.assign(detections, collectExeDetections(entries.map(e => e.name.replace(/^rom\//, ""))));
+        onProgress?.("done", 100, "Ready");
+        return { stagedPath: result.stagedPath, manifest, entries, gameId, detections };
     } else if (detections.kind === "installshield") {
         // InstallShield 5/6 cabinet (inside a zip, or a folder of installer files) →
         // recurse into the installer (data*.hdr+data*.cab → real game tree), then synth
@@ -676,8 +734,7 @@ export async function buildStagedBundle(source: BuildSource, onProgress?: Progre
 
 /** Inspect an existing `.wgb` (list entries + read manifest.json) WITHOUT a full extraction. */
 export async function inspectBundle(source: BuildSource): Promise<InspectResult> {
-    const data = await readSourceBytes(source);
-    const archive = new ZipArchive(new ZipBufferSource(data));
+    const archive = new ZipArchive(new BlobSource(await readSourceBlob(source)));
     await archive.init();
     const manEntry = archive.getEntry("manifest.json");
     if (!manEntry) throw new Error("not a WGB bundle (no manifest.json)");
@@ -691,74 +748,118 @@ export async function inspectBundle(source: BuildSource): Promise<InspectResult>
  * staged bundle or the entry is missing.
  */
 export async function readStagedEntry(stagedPath: string, name: string): Promise<Uint8Array> {
-    const staged = await readStaged(stagedPath);
-    const archive = new ZipArchive(new ZipBufferSource(staged));
+    const archive = new ZipArchive(new BlobSource(await stagedFile(stagedPath)));
     await archive.init();
     const entry = archive.getEntry(name);
     if (!entry) throw new Error(`entry "${name}" not found in staged bundle`);
+    if (entry.uncompressedSize > 16 * 1024 * 1024) throw new Error("Text editor supports files up to 16 MB");
     return archive.readEntry(entry);
 }
 
 /**
  * Finalize a staged bundle: read its entries, swap the (possibly edited) manifest.json /
  * registry.json, re-pack, and route by destination.
- *   - `play`     → return bytes (the caller hands them to loadBundle({data})).
+ *   - `play`     → persist to the library, then launch by cache URL.
  *   - `library`  → persist into the OPFS WGB cache (keyed by gameId container dir).
- *   - `download` → return bytes for the host to save (showSaveFilePicker / anchor download).
+ *   - `download` → return a disk-backed File for the host to save.
  */
 export async function finalizeBundle(args: FinalizeArgs): Promise<FinalizeResult> {
     const report = (percent: number, label: string) => args.onProgress?.(percent, label);
 
     report(0, "Reading staged bundle…");
-    const staged = await readStaged(args.stagedPath);
-    const archive = new ZipArchive(new ZipBufferSource(staged));
+    const archive = new ZipArchive(new BlobSource(await stagedFile(args.stagedPath)));
     await archive.init();
-
-    const files = new Map<string, Uint8Array>();
-    const fileEntries = archive.listEntries().filter((e) => !e.isDirectory);
-    for (let i = 0; i < fileEntries.length; i++) {
-        const entry = fileEntries[i]!;
-        files.set(entry.name, await archive.readEntry(entry));
-        if (fileEntries.length > 0) {
-            const pct = Math.round(((i + 1) / fileEntries.length) * 45);
-            report(pct, `Reading files (${i + 1}/${fileEntries.length})…`);
+    const enc = new TextEncoder();
+    const replacements = new Map<string, Uint8Array>([
+        ["manifest.json", enc.encode(JSON.stringify(args.manifest, null, 2))],
+    ]);
+    if (args.registry !== undefined) replacements.set("registry.json", enc.encode(JSON.stringify(args.registry, null, 2)));
+    for (const [name, text] of Object.entries(args.editedFiles ?? {})) {
+        if (archive.getEntry(name)) replacements.set(name, enc.encode(text));
+    }
+    const sources: ZipStreamEntry[] = [];
+    for (const entry of archive.listEntries()) {
+        if (entry.isDirectory || replacements.has(entry.name)) continue;
+        if (entry.compression !== 0) throw new Error("WGB finalization requires store-only entries");
+        sources.push({ name: entry.name, source: { size: entry.uncompressedSize,
+            readRange: (start, end) => archive.readEntryRange(entry, start, end - start) } });
+    }
+    for (const [name, bytes] of replacements) sources.push({ name, source: new ZipBufferSource(bytes) });
+    const gameId = resolveGameId(args.manifest);
+    const suggestedFilename = manifestToWgbFilename(args.manifest);
+    const bs = await getBottleshipRoot(true);
+    if (!bs) throw new Error("Browser storage unavailable");
+    const cacheKey = gameIdToContainerDir(gameId) + ".wgb";
+    const dir = await bs.getDirectoryHandle(args.destination === "download" ? WIZARD_DIR : "wgb-cache", { create: true });
+    const handle = await dir.getFileHandle(args.destination === "download" ? "export-" + crypto.randomUUID() + ".wgb" : cacheKey, { create: true });
+    const writable = await handle.createWritable();
+    const total = sources.reduce((n, e) => n + e.source.size, 0);
+    try {
+        await writeZipStream(sources, { write: async (bytes, at) => { await writable.seek(at); await writable.write(asWriteChunk(bytes)); } },
+            done => report(Math.min(99, total ? Math.round(done / total * 100) : 0), "Saving package to browser storage…"));
+        await writable.close();
+    } catch (err) {
+        try { await writable.abort(); } catch { /* Preserve the write error. */ }
+        if ((await handle.getFile()).size === 0) await dir.removeEntry(handle.name);
+        if ((err as DOMException).name === "QuotaExceededError") {
+            throw new Error("Browser storage is full. Free cached files in Settings → Storage and try again.");
         }
+        throw err;
     }
+    const file = await handle.getFile();
+    if (args.destination !== "download") await removeStagedBundle(args.stagedPath);
+    report(100, "Done");
+    return { destination: args.destination, gameId, suggestedFilename, file,
+        ...(args.destination === "download" ? {} : { cacheKey }) };
+}
 
-    // Swap the edited manifest (always) and registry (when provided).
-    files.set("manifest.json", new TextEncoder().encode(JSON.stringify(args.manifest, null, 2)));
-    if (args.registry !== undefined) {
-        files.set("registry.json", new TextEncoder().encode(JSON.stringify(args.registry, null, 2)));
-    }
-    // Overwrite any inline-edited text files with their new UTF-8 bytes (only entries that
-    // actually exist in the staged bundle; an unknown key is ignored rather than injected).
-    if (args.editedFiles) {
-        const enc = new TextEncoder();
-        for (const [path, text] of Object.entries(args.editedFiles)) {
-            if (files.has(path)) files.set(path, enc.encode(text));
-        }
-    }
+export async function stagedFile(stagedPath: string): Promise<File> {
+    const parts = stagedPath.split("/");
+    if (!(parts[0] === WIZARD_DIR && parts.length === 2) && !(parts[0] === "_imports" && parts.length === 3)) throw new Error("Invalid staging path");
+    if (parts.some(p => !p || p === "." || p === ".." || p.includes("\\"))) throw new Error("Invalid staging path");
+    let dir = await getBottleshipRoot(false);
+    if (!dir) throw new Error("Browser storage unavailable");
+    for (const part of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(part);
+    return (await dir.getFileHandle(parts[parts.length - 1]!)).getFile();
+}
 
-    report(50, "Building package…");
-    const bytes = buildZip(files);
-    const gameId = resolveGameId(args.manifest as { gameId?: string; name?: string; entrypoint?: string });
-    const suggestedFilename = manifestToWgbFilename(args.manifest as { gameId?: string; name?: string; entrypoint?: string });
+export async function removeStagedBundle(path: string): Promise<void> {
+    // Validate before deleting; staging never owns saves or cached library bundles.
+    await stagedFile(path);
+    const root = await getBottleshipRoot(false);
+    if (!root) return;
+    const parts = path.split("/");
+    const dir = await root.getDirectoryHandle(parts[0]!);
+    await dir.removeEntry(parts[1]!, parts[0] === "_imports" ? { recursive: true } : undefined);
+}
 
-    if (args.destination === "library") {
-        const cacheKey = `${gameIdToContainerDir(gameId)}.wgb`;
-        report(60, "Saving to library…");
-        await WgbCache.put(cacheKey, bytes);
-        report(100, "Done");
-        Logger.log(LogCategory.SYSTEM, `WGB finalize: persisted "${cacheKey}" to library (${bytes.byteLength} bytes)`);
-        return { destination: "library", gameId, cacheKey, bytes, suggestedFilename };
-    }
-
-    report(55, "Package ready");
-    // play + download both hand the bytes back to the caller.
-    return { destination: args.destination, gameId, bytes, suggestedFilename };
+async function inspectStaged(path: string): Promise<InspectResult> {
+    const archive = new ZipArchive(new BlobSource(await stagedFile(path)));
+    await archive.init();
+    const manifest = JSON.parse(new TextDecoder().decode(await archive.readEntry(archive.getEntry("manifest.json")!)));
+    return { manifest, entries: entriesFromZip(archive.listEntries()) };
 }
 
 // --- source byte readers ----------------------------------------------------------
+
+async function readSourceBlob(source: BuildSource): Promise<Blob> {
+    if (source.blob) return source.blob;
+    if (source.url) {
+        const cached = await WgbCache.getBlob(source.url);
+        if (cached) return cached;
+        const response = await fetch(source.url);
+        if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${source.url}`);
+        return response.blob();
+    }
+    throw new Error("source has no readable blob or URL");
+}
+
+async function detectBlobFormat(blob: Blob): Promise<DetectedFormat> {
+    if (typeof (globalThis as { FileReaderSync?: unknown }).FileReaderSync === "function") {
+        return detectSourceFormat(blobRandomAccess(blob));
+    }
+    return detectFormat(new Uint8Array(await blob.arrayBuffer()));
+}
 
 async function readSourceBytes(source: BuildSource): Promise<Uint8Array> {
     if (source.blob) return new Uint8Array(await source.blob.arrayBuffer());
@@ -770,27 +871,6 @@ async function readSourceBytes(source: BuildSource): Promise<Uint8Array> {
         return new Uint8Array(await resp.arrayBuffer());
     }
     throw new Error("source has no readable bytes (expected blob or url)");
-}
-
-async function readStaged(stagedPath: string): Promise<Uint8Array> {
-    const bs = await getBottleshipRoot(false);
-    if (!bs) throw new Error("OPFS unavailable — cannot read staged bundle");
-    // stagedPath is "<WIZARD_DIR>/<key>".
-    const slash = stagedPath.indexOf("/");
-    const dirName = slash >= 0 ? stagedPath.slice(0, slash) : WIZARD_DIR;
-    const key = slash >= 0 ? stagedPath.slice(slash + 1) : stagedPath;
-    const dir = await bs.getDirectoryHandle(dirName);
-    const fh = await dir.getFileHandle(key);
-    return new Uint8Array(await (await fh.getFile()).arrayBuffer());
-}
-
-// --- slice ordering (multi-part GOG) ----------------------------------------------
-
-/** Natural slice ordinal from a `-<major>[<letter>].bin` suffix. Matches emulator.worker.ts. */
-function sliceOrdinal(name: string): number {
-    const m = name.toLowerCase().match(/-(\d+)([a-z])?\.bin$/);
-    if (!m) return 0;
-    return parseInt(m[1]!, 10) * 100 + (m[2] ? m[2].charCodeAt(0) - 97 : 0);
 }
 
 // Re-export for the cache-key guess (used by callers that want to dedupe Inno builds).

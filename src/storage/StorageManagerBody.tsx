@@ -14,6 +14,8 @@ import {
   listCachedBundles,
   listGameStorage,
   requestPersistentStorage,
+  temporaryImportBytes,
+  clearTemporaryImports,
 } from "../storage-manager";
 import { downloadBlob, pickFile, SettingsIconBtn } from "../settings/SettingsIconBtn";
 import { asBlobPart } from "../dom-buffer";
@@ -27,14 +29,17 @@ export default function StorageManagerBody({ active }: { active: boolean }): Rea
   const [games, setGames] = React.useState<GameStorageInfo[]>([]);
   const [bundles, setBundles] = React.useState<CachedBundleInfo[]>([]);
   const [busy, setBusy] = React.useState(false);
+  const [temporaryBytes, setTemporaryBytes] = React.useState(0);
+  const [storageError, setStorageError] = React.useState<string | null>(null);
 
   const refresh = React.useCallback(async () => {
     setBusy(true);
     try {
-      const [est, g, b] = await Promise.all([getStorageEstimate(), listGameStorage(), listCachedBundles()]);
+      const [est, g, b, temporary] = await Promise.all([getStorageEstimate(), listGameStorage(), listCachedBundles(), temporaryImportBytes()]);
       setEstimate(est);
       setGames(g);
       setBundles(b);
+      setTemporaryBytes(temporary);
     } finally {
       setBusy(false);
     }
@@ -200,6 +205,16 @@ export default function StorageManagerBody({ active }: { active: boolean }): Rea
           ))}
         </div>
       )}
+
+      <h3 className={sh["sect-h"]} style={{ marginTop: 18 }}>Temporary imports & exports</h3>
+      <p className={hm["hint"]}>{formatBytes(temporaryBytes)} · unfinished imports and downloaded packages.</p>
+      <button className={bm["btn"]} disabled={busy || temporaryBytes === 0} onClick={async () => {
+        setBusy(true); setStorageError(null);
+        try { await clearTemporaryImports(); await refresh(); }
+        catch (err) { setStorageError(`Could not clear temporary files: ${err instanceof Error ? err.message : String(err)}`); }
+        finally { setBusy(false); }
+      }}>Free temporary files</button>
+      {storageError && <p role="alert" className={hm["hint"]}>{storageError}</p>}
 
       <p className={hm["hint"]} style={{ marginTop: 12 }}>
         Saves persist by default; <code>*.log · temp/** · cache/**</code> stay ephemeral.{" "}

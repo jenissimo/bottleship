@@ -172,7 +172,7 @@ integrity-valid result does not establish independent-pair game performance.
 ## NFSU entry in one action
 
 Continuation guide with experiment results, current WBUF candidate and unfinished
-engine-comparison setup: [v86 FPS handoff](../../../docs/performance/v86-fps-handoff-2026-09-10.md).
+engine-comparison setup: [measurement contracts](../../../docs/performance/benchmark-method.md).
 
 With the dev app on `127.0.0.1:5174`, start the local evidence collector:
 

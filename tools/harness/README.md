@@ -9,6 +9,9 @@ one-off investigation probes never land here — see "Admission rule" below.
 - **templates/** — copy-and-adapt starting points, not run as-is in CI/regress:
   `bringup.harness.ts` (generic bring-up chain), `diagnose-eip.harness.ts`
   (API-breakpoint + worker-side `waitUntil`).
+- **diagnostics/** — reusable instruments for a running guest, such as D3D8 readback
+  counters. They report measurements, do not claim game acceptance, and are excluded
+  from `regress`.
 - **regression/** — self-judging per-game scenarios, meant to be run as a batch:
   `bun tools/harness.ts regress`. Each one throws (or sets `process.exitCode`) with
   a stated reason on failure and prints `OK — ...` on success; none of them ask a

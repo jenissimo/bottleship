@@ -1,7 +1,7 @@
 # P0 results: measured attribution, the selected kernel, and the MMU contract
 
 Дата: 2026-09-05. Статус: выполненный этап P0
-[плана реализации](user-mode-optimizing-translator-implementation-plan-2026-09-04.md).
+экспериментального транслятора.
 Всё ниже — измерения и исполнимые проверки; ни одного performance claim о трансляторе здесь нет.
 
 ## Итог в одном абзаце

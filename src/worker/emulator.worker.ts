@@ -129,18 +129,15 @@ import {
 } from "./core/cpu/emulator-config";
 import { WgbLoader, buildRomIndex, readEntrypointBytes, type WgbManifest, type WgbWriteFileSpec } from "./runtime/filesystem/wgb-loader";
 import { WgbCache } from "./runtime/filesystem/wgb-cache";
-import { detectFormat, sniffBlobHead } from "@bottleship/repack/detect";
-import { installerBytesToWgb } from "@bottleship/repack/installer-to-wgb";
-import { guessCacheKey } from "@bottleship/repack/manifest-synth";
-import { BufferSource, InnoFormatError, parseInnoHeader, MultiSliceReader, parseSliceFile, type SliceData } from "@bottleship/formats/inno";
+import { detectSourceFormat, sniffBlobHead } from "@bottleship/repack/detect";
+import { blobRandomAccess } from "./runtime/filesystem/installer-opfs";
+import { InnoFormatError } from "@bottleship/formats/inno";
 import { SyncHttpRangeSource } from "@bottleship/formats/zip";
 import { SabIoSource } from "./runtime/filesystem/sab-io-source";
-import { UnpackDecoder } from "@bottleship/formats/unpack";
 import { RegistryPersistence } from "./runtime/filesystem/registry-persistence";
 import { resolveGameId, gameIdToContainerDir } from "@bottleship/formats/wgb/container-id";
 import { aotCache } from "./core/cpu/aot-cache";
 import { PathPolicy } from "./runtime/filesystem/path-policy";
-import { detectUe1, detectUe2PcPackages, pinUeEngineIni, UE1_RENDER_DEVICE as UE1_RENDER_DEVICE_NAME } from "./runtime/filesystem/ue1-firstrun";
 import { buildStagedBundle, inspectBundle, finalizeBundle, readStagedEntry, type BuildSource, type FinalizeDestination } from "./runtime/filesystem/wgb-build";
 import { TimeService } from "./runtime/time";
 import { resolveMessageBox } from "./runtime/dialog-bridge";
@@ -1422,100 +1419,6 @@ const applyManifestWriteFiles = async (): Promise<void> => {
   }
 };
 
-// Generic Unreal Engine 1 first-run setup. Detects a UE1 bundle (System/Core+Engine
-// packages) and, if so, sets the ue1 flag and pins our D3D render device in
-// System/Default.ini so any config the engine derives from it inherits D3DDrv
-// instead of falling back to a software/null device. The reactive Detected.ini /
-// config-ini materialization (kernel32 CreateFile*) also gates on this flag.
-// Non-UE1 games: detectUe1() returns false → this is a complete no-op.
-const pinGuestEngineIni = async (
-  vfs: ReturnType<typeof System.getInstance>["fileSystem"],
-  iniPath: string,
-  hasPcPackages: boolean,
-): Promise<void> => {
-  if (vfs.getFileSize(iniPath) <= 0) return;
-  try {
-    const size = vfs.getFileSize(iniPath);
-    // Read the WHOLE file, and prove it. A short read here used to be indistinguishable
-    // from an empty config: pinUeEngineIni("") synthesizes a bare [Engine.Engine] (exactly
-    // 136 bytes) and the write below then replaced the 10 KB factory config with it — in the
-    // CoW overlay, which shadows ROM, so one transient short read poisoned every later boot.
-    // The engine then had no [Core.System] at all: no Language, so it asked for
-    // `Splash.bmp` / `EALogo(null).bmp` instead of `splasheng.bmp` and died in InitEngine
-    // (`Assertion failed: Bitmap.LoadFile`). A config we could not read whole is a config we
-    // must not rewrite — leave it alone and say so loudly.
-    // read() is allowed to return less than asked (it serves whatever window it has), so
-    // "read to completion" means looping until the file is consumed or a read stops making
-    // progress — the latter is the real failure and the only case that must not pin.
-    const readWhole = async (): Promise<Uint8Array | null> => {
-      const handle = await vfs.open(iniPath, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
-      if (!handle) return null;
-      const out = new Uint8Array(size);
-      let got = 0;
-      while (got < size) {
-        const chunk = await vfs.read(handle, size - got);
-        if (chunk.length === 0) return null;   // no progress → truncated/failed read
-        out.set(chunk.subarray(0, Math.min(chunk.length, size - got)), got);
-        got += chunk.length;
-      }
-      return out;
-    };
-    // One retry: the loss is transient (streamed ROM / OPFS hiccup), not a property of the file.
-    const bytes = (await readWhole()) ?? (await readWhole());
-    if (!bytes) {
-      Logger.error(LogCategory.SYSTEM,
-        `UE1: refusing to pin ${iniPath} — could not read all ${size} bytes (short read). ` +
-        `Leaving the config untouched; overwriting it with a synthesized stub would strip ` +
-        `[Core.System] (Language/Paths) and break the engine on every later boot.`);
-      return;
-    }
-    const text = new TextDecoder("utf-8").decode(bytes);
-    // A factory UE config always carries [Core.System] (Language, Paths). Its absence means
-    // this overlay copy is a stub a poisoned earlier boot left behind, not a real config —
-    // name it, because the downstream symptom (engine asks for an unsuffixed Splash.bmp and
-    // asserts) points nowhere near here.
-    if (!/^\s*\[Core\.System\]/im.test(text)) {
-      Logger.warn(LogCategory.SYSTEM,
-        `UE1: ${iniPath} (${size} bytes) has no [Core.System] section — the engine will have no ` +
-        `Language/Paths. If this game previously failed to load a config, clear its OPFS overlay ` +
-        `so the factory config in the bundle is used again.`);
-    }
-    const pinned = pinUeEngineIni(text, { hasPcPackages });
-    if (pinned !== text) {
-      await writeVfsOverride(iniPath, new TextEncoder().encode(pinned));
-      Logger.log(LogCategory.SYSTEM, `UE1: pinned engine defaults in ${iniPath} (render=${UE1_RENDER_DEVICE_NAME})`);
-    } else {
-      Logger.log(LogCategory.SYSTEM, `UE1: ${iniPath} already has engine defaults`);
-    }
-  } catch (err) {
-    Logger.warn(LogCategory.SYSTEM, `UE1: failed to pin engine defaults in ${iniPath}: ${err}`);
-  }
-};
-
-const applyUe1FirstRunSetup = async (entrypointPath?: string): Promise<void> => {
-  const config = EmulatorConfig.getInstance();
-  const vfs = System.getInstance().fileSystem;
-  const exists = (guestPath: string): boolean => vfs.getFileSize(guestPath) > 0;
-  config.ue1 = detectUe1(exists);
-  if (!config.ue1) return;
-  Logger.log(LogCategory.SYSTEM, "UE1: detected Unreal Engine 1 bundle — enabling generic first-run handler");
-
-  const hasPcPackages = detectUe2PcPackages(exists);
-  // Pin D3D render device + UE2 WinDrv ForceFeedbackManager in factory and active configs.
-  const iniPaths = ["C:\\System\\Default.ini"];
-  if (entrypointPath) {
-    const exeName = entrypointPath.split(/[\\/]/).pop() ?? "";
-    const gameIni = exeName.replace(/\.[^.]+$/i, "");
-    if (gameIni) {
-      config.ue1ConfigIni = `C:\\System\\${gameIni}.ini`;
-      iniPaths.push(config.ue1ConfigIni);
-    }
-  }
-  for (const iniPath of iniPaths) {
-    await pinGuestEngineIni(vfs, iniPath, hasPcPackages);
-  }
-};
-
 /** Recursively merge `src` into `target` (plain objects merged, everything else replaced). */
 const deepMergeInto = (target: Record<string, unknown>, src: Record<string, unknown>): void => {
   for (const k of Object.keys(src)) {
@@ -1529,38 +1432,18 @@ const deepMergeInto = (target: Record<string, unknown>, src: Record<string, unkn
   }
 };
 
-/** slice.cpp slice_filename — external slice file name for a given slice index. */
-const sliceFilename = (base: string, slice: number, slicesPerDisk: number): string => {
-  if (slicesPerDisk <= 1) return `${base}-${slice + 1}.bin`;
-  const major = Math.floor(slice / slicesPerDisk) + 1;
-  const minor = slice % slicesPerDisk;
-  return `${base}-${major}${String.fromCharCode(97 + minor)}.bin`;
-};
+async function importInstallerBundle(source: BuildSource) {
+  const staged = await buildStagedBundle(source, (phase, percent, label) => {
+    self.postMessage({ type: "loading_progress", phase, percent, label });
+  });
+  const result = await finalizeBundle({ stagedPath: staged.stagedPath, manifest: staged.manifest, destination: "library",
+    onProgress: (percent, label) => self.postMessage({ type: "loading_progress", phase: "packing", percent, label }) });
+  const cached = await WgbCache.openSyncSourceForUrl("/apps/byo/" + result.cacheKey);
+  if (!cached) throw new Error("Could not open imported game from browser storage");
+  return WgbLoader.fromSource(cached);
+}
 
-/** Natural slice ordinal from a `-<major>[<letter>].bin` suffix (fallback ordering). */
-const sliceOrdinal = (name: string): number => {
-  const m = name.toLowerCase().match(/-(\d+)([a-z])?\.bin$/);
-  if (!m) return 0;
-  return parseInt(m[1]!, 10) * 100 + (m[2] ? m[2].charCodeAt(0) - 97 : 0);
-};
-
-/** Order dropped `.bin` slices by slice index: try the Inno naming scheme, else natural sort. */
-const orderSliceFiles = (bins: File[], base: string, slicesPerDisk: number): File[] => {
-  const byName = new Map(bins.map((f) => [f.name.toLowerCase(), f]));
-  const ordered: File[] = [];
-  for (let i = 0; i < bins.length; i++) {
-    const f = byName.get(sliceFilename(base, i, slicesPerDisk).toLowerCase());
-    if (!f) { ordered.length = 0; break; }
-    ordered.push(f);
-  }
-  if (ordered.length === bins.length) return ordered;
-  return [...bins].sort((a, b) => sliceOrdinal(a.name) - sliceOrdinal(b.name));
-};
-
-/**
- * Authoritative teardown before loading a new game while another is (or was) running.
- * Pauses the guest loop first so the 1ms scheduler cannot restart v86 mid-reset.
- */
+/** Pause the scheduler before replacing guest state. */
 const prepareFullGameSwitch = async (): Promise<void> => {
   stopChildProcesses();
   if (gameSessionActive) {
@@ -1782,59 +1665,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       }
       } // end if (!bundle) — dev sync-stream did not already produce a bundle
     } else if (payload.blobs && payload.blobs.length) {
-      // Multi-part installer: setup.exe (header + file list) + external setup-*.bin data slices.
-      const all = payload.blobs;
-      const bins = all.filter((f) => f.name.toLowerCase().endsWith(".bin"));
-      const exe = all.find((f) => !f.name.toLowerCase().endsWith(".bin"));
-      if (!exe) throw new Error("multi-part install: no setup.exe among the dropped files");
-      if (!bins.length) throw new Error("multi-part install: no setup-*.bin data slices dropped");
-
-      self.postMessage({ type: "loading_progress", phase: "loading", percent: 0, label: "Reading installer" });
-      const data = new Uint8Array(await exe.arrayBuffer());
-      const kind = detectFormat(data);
-      if (kind !== "inno") {
-        const msg = kind === "inno-unsupported"
-          ? "This Inno Setup version is not supported"
-          : "Dropped files aren't a supported multi-part GOG installer";
-        self.postMessage({ type: "installer_unsupported", message: msg });
-        throw new Error(msg);
-      }
-
-      const wasmResp = await fetch("/unpack-streaming.wasm");
-      const wasmBytes = await wasmResp.arrayBuffer();
-      const lzma = new UnpackDecoder();
-      await lzma.init(wasmBytes);
-      const parsed = await parseInnoHeader(new BufferSource(data), lzma);
-
-      const slicesPerDisk = Math.max(1, parsed.header.slicesPerDisk || 1);
-      const base = exe.name.replace(/\.exe$/i, "");
-      const ordered = orderSliceFiles(bins, base, slicesPerDisk);
-      const sliceData: SliceData[] = [];
-      for (const f of ordered) {
-        sliceData.push(parseSliceFile(new Uint8Array(await f.arrayBuffer())));
-      }
-
-      const cacheKey = guessCacheKey(parsed);
-      const cached = await WgbCache.getByKey(cacheKey);
-      if (cached) {
-        Logger.log(LogCategory.SYSTEM, `GOG import (multi-part): cache hit ${cacheKey}`);
-        self.postMessage({ type: "install_progress", phase: "starting", doneBytes: cached.byteLength, totalBytes: cached.byteLength });
-        bundle = await WgbLoader.fromBuffer(cached);
-      } else {
-        let installProgressLast = 0;
-        const result = await installerBytesToWgb(data, wasmBytes, {
-          parsed,
-          sliceSource: new MultiSliceReader(sliceData),
-          onProgress: (p) => {
-            const now = performance.now();
-            if (now - installProgressLast < 100) return;
-            installProgressLast = now;
-            self.postMessage({ type: "install_progress", phase: p.phase, doneBytes: p.doneBytes, totalBytes: p.totalBytes });
-          },
-        });
-        await WgbCache.put(result.cacheKey ?? cacheKey, result.wgb);
-        bundle = await WgbLoader.fromBuffer(result.wgb);
-      }
+      bundle = await importInstallerBundle({ blobs: payload.blobs });
     } else if (payload.blob) {
       const head = new Uint8Array(await payload.blob.slice(0, 64).arrayBuffer());
       const headKind = sniffBlobHead(head);
@@ -1855,11 +1686,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         self.postMessage({ type: "installer_unsupported", message: msg });
         throw new Error(msg);
       } else {
-        const data = new Uint8Array(await payload.blob.arrayBuffer());
-        const kind = detectFormat(data);
+        const kind = detectSourceFormat(blobRandomAccess(payload.blob));
 
         if (kind === "pe") {
-          await loadPeData(data);
+          await loadPeData(new Uint8Array(await payload.blob.arrayBuffer()));
           return;
         }
         if (kind === "unknown" || kind === "inno-unsupported") {
@@ -1870,40 +1700,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
           throw new Error(msg);
         }
         if (kind === "inno") {
-          let installProgressLast = 0;
-          const wasmResp = await fetch("/unpack-streaming.wasm");
-          const wasmBytes = await wasmResp.arrayBuffer();
-
-          const lzma = new UnpackDecoder();
-          await lzma.init(wasmBytes);
-          const parsed = await parseInnoHeader(new BufferSource(data), lzma);
-          const cacheKey = guessCacheKey(parsed);
-
-          const cached = await WgbCache.getByKey(cacheKey);
-          let wgbBuffer: Uint8Array;
-          if (cached) {
-            Logger.log(LogCategory.SYSTEM, `GOG import: cache hit ${cacheKey}`);
-            self.postMessage({ type: "install_progress", phase: "starting", doneBytes: cached.byteLength, totalBytes: cached.byteLength });
-            wgbBuffer = cached;
-          } else {
-            const result = await installerBytesToWgb(data, wasmBytes, {
-              parsed,
-              onProgress: (p) => {
-                const now = performance.now();
-                if (now - installProgressLast < 100) return;
-                installProgressLast = now;
-                self.postMessage({
-                  type: "install_progress",
-                  phase: p.phase,
-                  doneBytes: p.doneBytes,
-                  totalBytes: p.totalBytes,
-                });
-              },
-            });
-            wgbBuffer = result.wgb;
-            await WgbCache.put(result.cacheKey ?? cacheKey, wgbBuffer);
-          }
-          bundle = await WgbLoader.fromBuffer(wgbBuffer);
+          bundle = await importInstallerBundle({ blob: payload.blob });
         } else {
           bundle = await WgbLoader.fromBlob(payload.blob, onCacheProgress);
         }
@@ -2167,7 +1964,6 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
 
     // Generic UE1 first-run: detect engine + pin D3D render device in Default.ini.
     // After writeFiles so a manifest-shipped Default.ini override is the one we pin.
-    await applyUe1FirstRunSetup(bundle.manifest.entrypoint);
 
     // The boot publisher of the emulated display mode: until a game mode-sets, the bundle's
     // declared resolution IS the desktop, and every SM_CXSCREEN/EnumDisplaySettings reader
@@ -2650,8 +2446,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       system.setHostInputResetCallback(() => {
         self.postMessage({ type: "input_reset" });
       });
-      system.setHostWindowTitleCallback((title) => {
-        self.postMessage({ type: "window_title", title });
+      system.setHostWindowTitleCallback((title, visible) => {
+        self.postMessage({ type: "window_title", title, visible });
       });
 
       // Initialize WebGPU backend immediately if possible
@@ -3455,6 +3251,13 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     childSessionTransport?.attach(event.data.port);
     return;
   }
+  if (event.data?.type === 'resume_session') {
+    if (state.inputBuffer) System.getInstance().connectInput(state.inputBuffer);
+    System.getInstance().services.render.armFirstPresent();
+    System.getInstance().gdiContext.setOverlayDirty(true);
+    kickGdiPresentLoop();
+    return;
+  }
   if (event.data?.type === 'child_surface') {
     const message = event.data;
     // An immediately exiting parent can offer the session before child boot starts.
@@ -3785,16 +3588,11 @@ const handleWorkerMessage = (event: MessageEvent): void => {
         if (result.destination === "play") {
           // Hand the freshly-built bytes straight to the existing boot path.
           self.postMessage({ type: "wgb_finalize_done", destination, gameId: result.gameId, suggestedFilename: result.suggestedFilename });
-          loadBundle({ data: result.bytes });
+          loadBundle({ url: `/apps/byo/${result.cacheKey}` });
           return;
         }
-        if (result.destination === "download" && result.bytes) {
-          // Transfer the buffer so the host can save it (showSaveFilePicker / anchor download).
-          const buf = result.bytes.buffer;
-          (self as any).postMessage(
-            { type: "wgb_finalize_done", destination, gameId: result.gameId, suggestedFilename: result.suggestedFilename, bytes: result.bytes },
-            [buf],
-          );
+        if (result.destination === "download" && result.file) {
+          self.postMessage({ type: "wgb_finalize_done", destination, gameId: result.gameId, suggestedFilename: result.suggestedFilename, file: result.file });
           return;
         }
         // library

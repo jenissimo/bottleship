@@ -2308,8 +2308,8 @@ interface DeferrableCensus {
    * `offGuestUs` answers "is this work the guest is already done waiting for"; these two
    * answer "would moving the executor take it away", which is the question a placement plan
    * is actually costed against. They differ by an order of magnitude — the drain region IS
-   * the recorder, and a recorder stays on the guest thread. Reporting only the union is how
-   * render-worker-plan-2026-09-11 came to quote a ceiling 3-5x its own scope.
+   * the recorder, and a recorder stays on the guest thread. Reporting only the union
+   * overstates the benefit of moving executor work.
    */
   movesUs: number;
   keepsUs: number;
@@ -2319,7 +2319,7 @@ interface DeferrableCensus {
 }
 
 /**
- * The modules a render worker would own (render-worker-plan-2026-09-11 SS4). Everything else
+ * The render-worker module boundary (docs/performance/benchmark-method.md). Everything else
  * in the deferrable region is recorder/shadow state, which stays with the guest thread.
  */
 const RENDER_WORKER_SIDE = [

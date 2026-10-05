@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 500" role="img" aria-label="Quake II Demo">
+<defs><linearGradient id="bg" x2=".5" y2="1"><stop stop-color="#193a45"/><stop offset="1" stop-color="#080e14"/></linearGradient></defs>
+<rect width="360" height="500" fill="url(#bg)"/><rect x="16" y="16" width="328" height="468" rx="4" fill="none" stroke="#a58341" stroke-width="2"/>
+<path d="M180 67 278 122 278 198 180 253 82 198 82 122Z" fill="none" stroke="#618891" stroke-width="3"/><path d="M145 129 211 160 145 192Z" fill="#c7ad72"/>
+<text x="180" y="285" text-anchor="middle" fill="#e7d7aa" font-family="Georgia,serif" font-size="29" font-weight="bold">QUAKE II</text><text x="180" y="426" text-anchor="middle" fill="#c8d5ce" font-family="Arial,sans-serif" font-size="19" letter-spacing="7">DEMO</text>
+<text x="180" y="459" text-anchor="middle" fill="#9eadaf" font-family="Arial,sans-serif" font-size="14">1997 · FPS</text></svg>

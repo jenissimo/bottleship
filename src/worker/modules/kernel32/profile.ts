@@ -30,7 +30,7 @@ export function resetIniCache(): void {
 
 /**
  * Invalidate cached INI data for a specific file path.
- * Called when shellExecFake writes a new INI file that was previously cached as empty.
+ * Invalidate a cached profile after a host-side configuration write.
  */
 export function invalidateIniCache(filePath: string): void {
     const system = System.getInstance();

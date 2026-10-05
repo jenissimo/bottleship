@@ -2,7 +2,7 @@
  * Fixed-work timing of one codegen-pair kernel, on a chosen v86 engine binary.
  *
  * Why fixed work: the game stand's FPS wanders far more than a codegen candidate is worth
- * (see docs/performance/v86-fps-handoff-2026-09-10.md). The demo runs a fixed iteration count
+ * (see docs/performance/benchmark-method.md). The demo runs a fixed iteration count
  * and the GUEST times it with GetTickCount around cg_run, so a run measures the kernel rather
  * than a scene, a load, or a teardown.
  *

@@ -49,16 +49,8 @@ import { downloadBlob } from "../settings/SettingsIconBtn";
 import { isSaveFilePickerSupported, pickSaveWgbFile, writeBytesToFileHandle, WGB_SAVE_PACK_PERCENT } from "../save-as";
 
 /**
- * WgbWizardModal — the WGB wizard.
- *
- * 4 steps: Source -> Process -> Configure -> Finish. Absorbs AddGameModal.
- *
- * Worker seam: the bare library screen has NO live emulator worker
- * (App.tsx only creates one once a game/canvas mounts). So this wizard owns a
- * DEDICATED worker for build/inspect/finalize (library + download destinations are
- * fully wired through it). The "Play now" destination cannot boot in that workerless
- * wizard context, so it is routed back out via the `onPlay` callback to App's existing
- * navigate+stage launch flow — the one path that already boots a game. See TODO(stage2-worker).
+ * A dedicated worker builds bundles while the library has no emulator worker.
+ * Play finalizes to the cache first, then onPlay navigates to the game.
  */
 
 // --- the bottle mark (only inline SVG kept; copied from GameSelectScreen.tsx) -------
@@ -346,10 +338,6 @@ export default function WgbWizardModal({
   const [step, setStep] = useState<StepId>(1);
   const [maxStepReached, setMaxStepReached] = useState<StepId>(1);
 
-  // The original picked source (kept so "Play now" can route through App's launch flow).
-  const [pickedFiles, setPickedFiles] = useState<File[] | null>(null);
-  const [pickedUrl, setPickedUrl] = useState<string | null>(null);
-
   // Build results from the worker.
   const [progress, setProgress] = useState<{ phase: string; percent: number; label: string }>({
     phase: "",
@@ -389,13 +377,19 @@ export default function WgbWizardModal({
   // --- dedicated wizard worker (lazy; created on first need) -----------------------
   const getWorker = useCallback((): Worker => {
     if (!workerRef.current) {
-      // TODO(stage2-worker): this is a dedicated, build-only worker. It can extract /
-      // synthesize / pack / persist / download, but it has no OffscreenCanvas, so it
-      // CANNOT boot a game. "Play now" therefore routes via onPlay (App's launch flow).
+      // No OffscreenCanvas exists on the library screen; onPlay launches in App.
       workerRef.current = new Worker(
         new URL("../worker/emulator.worker.ts", import.meta.url),
         { type: "module" },
       );
+      workerRef.current.addEventListener("error", (event) => {
+        setBuilding(false);
+        setFinalizing(false);
+        setFinalizeProgress(null);
+        setError(`Import worker stopped: ${event.message || "browser worker error"}. Temporary files can be cleared in Settings → Storage.`);
+        workerRef.current?.terminate();
+        workerRef.current = null;
+      });
     }
     return workerRef.current;
   }, []);
@@ -417,8 +411,6 @@ export default function WgbWizardModal({
   const resetState = useCallback(() => {
     setStep(1);
     setMaxStepReached(1);
-    setPickedFiles(null);
-    setPickedUrl(null);
     setProgress({ phase: "", percent: 0, label: "" });
     setBuilding(false);
     setError(null);
@@ -549,8 +541,6 @@ export default function WgbWizardModal({
         return;
       }
 
-      setPickedFiles(files);
-      setPickedUrl(null);
       const source: BuildSource =
         files.length === 1 ? { blob: files[0]! } : { blobs: files };
       startBuild(source);
@@ -558,33 +548,12 @@ export default function WgbWizardModal({
     [startBuild],
   );
 
-  const pickFolder = useCallback(async () => {
+  const pickFolder = useCallback(async (directoryMode: "installed" | "gog-installer") => {
     if (!supportsDirPicker) return;
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const dirHandle: any = await (window as any).showDirectoryPicker();
-      const map = new Map<string, Uint8Array>();
-      const walk = async (handle: any, prefix: string): Promise<void> => {
-        for await (const [name, child] of handle.entries()) {
-          const rel = prefix ? `${prefix}/${name}` : name;
-          if (child.kind === "file") {
-            const file: File = await child.getFile();
-            map.set(rel, new Uint8Array(await file.arrayBuffer()));
-          } else if (child.kind === "directory") {
-            await walk(child, rel);
-          }
-        }
-      };
-      await walk(dirHandle, "");
-      if (map.size === 0) {
-        setError("That folder is empty.");
-        return;
-      }
-      setPickedFiles(null);
-      setPickedUrl(null);
-      // A folder source has no File[] to hand to onPlay; "Play now" will fall back to
-      // library + navigate after finalize (handled in onConfirm).
-      startBuild({ files: map });
+      const directory: FileSystemDirectoryHandle = await (window as any).showDirectoryPicker({ mode: "read", id: `bottleship-${directoryMode}` });
+      startBuild({ directory, directoryMode });
     } catch (err) {
       // AbortError = user cancelled the picker; ignore.
       if ((err as DOMException)?.name !== "AbortError") {
@@ -600,8 +569,6 @@ export default function WgbWizardModal({
       setError("URL loading expects a direct link to a .wgb bundle.");
       return;
     }
-    setPickedUrl(v);
-    setPickedFiles(null);
     startBuild({ url: v });
   }, [urlInput, startBuild]);
 
@@ -741,23 +708,6 @@ export default function WgbWizardModal({
       manifest.emulator = { ...(manifest.emulator ?? {}), writeFiles: writeFilesList };
     }
 
-    if (destination === "play") {
-      // The wizard can't boot — route the ORIGINAL source through App's launch flow.
-      // (If the source was a picked folder there's no File[]; fall through to library.)
-      if (pickedFiles && pickedFiles.length > 0) {
-        onPlay({ files: pickedFiles });
-        onClose();
-        return;
-      }
-      if (pickedUrl) {
-        onPlay({ url: pickedUrl });
-        onClose();
-        return;
-      }
-      // Folder source (or no original): finalize to library, then ask App to play it.
-      // Falls through to the finalize path below with a play-then-navigate flow.
-    }
-
     if (!stagedPath) {
       setError("No staged bundle to finalize.");
       return;
@@ -789,11 +739,11 @@ export default function WgbWizardModal({
       } else if (d.type === "wgb_finalize_done") {
         worker.removeEventListener("message", handler);
         void (async () => {
-          if (d.destination === "download" && d.bytes) {
+          if (d.destination === "download" && (d.file || d.bytes)) {
             const filename = String(d.suggestedFilename ?? "game.wgb");
             try {
               if (saveHandle) {
-                await writeBytesToFileHandle(saveHandle, d.bytes, (written, size) => {
+                await writeBytesToFileHandle(saveHandle, d.file ?? d.bytes, (written, size) => {
                   const span = 100 - WGB_SAVE_PACK_PERCENT;
                   const pct = WGB_SAVE_PACK_PERCENT + Math.round((written / size) * span);
                   setFinalizeProgress({
@@ -803,7 +753,7 @@ export default function WgbWizardModal({
                 });
               } else {
                 setFinalizeProgress({ percent: 90, label: "Starting download…" });
-                downloadBlob(d.bytes, filename);
+                downloadBlob(d.file ?? d.bytes, filename);
                 setFinalizeProgress({ percent: 100, label: "Download started" });
               }
             } catch (err) {
@@ -818,9 +768,8 @@ export default function WgbWizardModal({
           if (d.destination === "library") {
             onPersisted?.();
           }
-          // For the folder-source "play" fallback: persisted to library, now launch by url.
+          // Launch the finalized package so edits are applied and extraction runs once.
           if (destination === "play" && d.destination === "library") {
-            onPersisted?.();
             onPlay({ url: `/apps/byo/${String(d.cacheKey ?? d.suggestedFilename ?? "")}` });
           }
           setFinalizing(false);
@@ -835,7 +784,6 @@ export default function WgbWizardModal({
       }
     };
     worker.addEventListener("message", handler);
-    // A folder-source "play" finalizes to library (so it can be launched by url afterwards).
     const finalizeDest: FinalizeDestination = destination === "play" ? "library" : destination;
     worker.postMessage({
       type: "wgb_finalize",
@@ -846,8 +794,6 @@ export default function WgbWizardModal({
     });
   }, [
     destination,
-    pickedFiles,
-    pickedUrl,
     stagedPath,
     buildEditedManifest,
     writeFilesList,
@@ -955,6 +901,10 @@ export default function WgbWizardModal({
               <div className={s["drop__h"]}>
                 .wgb package · GOG <code>setup.exe</code> (+ <code>setup-*.bin</code>) · installer .zip / .7z · or pick a folder
               </div>
+              {supportsDirPicker && <div className={s["drop__h"]}>
+                Choose one installed game's folder, or a download folder containing one GOG setup and its parts.
+                Your saved package will work independently of that folder.
+              </div>}
               <div className={s["chrow"]}>
                 <button className={ch["chip"]} disabled={disabled} onClick={() => fileInputRef.current?.click()}>
                   <FileIcon size={14} aria-hidden /> Choose files…
@@ -963,10 +913,15 @@ export default function WgbWizardModal({
                   className={ch["chip"]}
                   disabled={disabled || !supportsDirPicker}
                   title={supportsDirPicker ? undefined : "Folder picking needs a Chromium browser"}
-                  onClick={pickFolder}
+                  onClick={() => void pickFolder("installed")}
                 >
-                  <Folder size={14} aria-hidden /> Pick a folder…
+                  <Folder size={14} aria-hidden /> Installed game folder…
                 </button>
+                {supportsDirPicker && (
+                  <button className={ch["chip"]} disabled={disabled} onClick={() => void pickFolder("gog-installer")}>
+                    <FolderOpen size={14} aria-hidden /> GOG installer folder…
+                  </button>
+                )}
                 {onEditLibrary && (
                   <button className={cx(ch, "chip", "chip--mount")} onClick={onEditLibrary}>
                     <PencilSimple size={14} aria-hidden /> Edit one in your library →

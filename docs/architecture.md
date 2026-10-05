@@ -64,18 +64,28 @@ real software mixer.
 
 - **Address space.** A paged 4 GB space with per-region permissions (read-execute,
   read-write, no-access) enforced both at the JS accessor layer and at the CPU page level.
-  Thunk code is immutable; a page-fault handler catches illegal writes and enforces
-  copy-on-write and decommit semantics. New/changed HLE code uses safe `Mem.read*/write*`
-  accessors rather than raw memory indexing.
+  Guest page faults enforce guest permissions and decommit; file copy-on-write lives in
+  the VFS overlay. The thunk generator arena is mutable. HLE writes of executable bytes
+  use `writeGuestCode` / `invalidateGuestCode` in the same JS turn so v86 cannot execute
+  stale compiled blocks. Guest page faults cannot observe JS writes. New/changed HLE code
+  uses safe `Mem.read*/write*` accessors rather than raw memory indexing.
 - **Virtual file system.** Each game gets a copy-on-write **overlay** over a read-only ROM,
   backed by the Origin Private File System (OPFS). Persistent data (saves, config) is written
   through to OPFS; ephemeral data (caches, temp, unpacked assets) can be kept in memory and
   discarded. Each game is an isolated container, so state never leaks between titles.
 - **Registry.** An in-memory HLE registry, seeded per game from the bundle's `registry.json`.
+- **Installer workspace.** Direct Inno imports use ranged input and chunked decoding into
+  an OPFS disk arena, followed by a streamed ZIP64 WGB. The wizard finalizes from that staged
+  archive by range. Completed library imports remove their scratch files; Storage exposes
+  temporary-file cleanup and cached WGB download. See [GOG import](gog-import.md).
+  Chrome directory handles are cloned to the build worker; installed folder payloads are
+  copied by range, while installer folders collect the setup and matching slice handles.
 
 ## Scheduling and CPU context
 
-Guest threads are driven by a cooperative + preemptive scheduler (a short preemption quantum).
+Guest threads are driven by a cooperative + preemptive scheduler. The quantum is counted in
+retired guest instructions, derived from the 16 ms client quantum and `TARGET_INSN_PER_MS`;
+it does not depend on how quickly the host executes those instructions.
 Every context switch saves and restores the full CPU state that the guest shares through the
 single v86 register file — including the x87 FPU stack, SSE (XMM/MXCSR), and lazily-computed
 EFLAGS — so a thread preempted mid-computation resumes with exactly its own state. The thread's
@@ -91,6 +101,11 @@ covered by characterization tests.
 - **Web Worker** (`src/worker/`) — the emulator: the v86 core, thunk dispatcher, scheduler,
   memory/address-space, the WinAPI module implementations (`modules/`), the WebGPU backends
   (`backends/webgpu/`), and the runtime (VFS, bundle loader, input, dialogs).
+- **D3D9 render worker** (`src/worker/render/`) — executes recorded D3D9 commands separately
+  from the CPU worker by default, and returns presented frames. Guest API/state ownership
+  remains in the emulator worker; resources cross through the render transport.
+- **Wizard worker** — builds/inspects/finalizes packages while the library has no running
+  emulator. Play first persists a configured WGB, then navigates to a game and launches it.
 
 Cross-origin isolation (COOP/COEP headers) is required for `SharedArrayBuffer`; the dev server
 and `deploy/server.ts` set these.

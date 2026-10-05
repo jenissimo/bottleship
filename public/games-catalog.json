@@ -35,6 +35,17 @@
     "enabled": true
   },
   {
+    "id": "warcraft3-demo",
+    "name": "Warcraft III",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/warcraft3-demo.wgb",
+    "coverUrl": "/covers/warcraft3-demo.svg",
+    "description": "Blizzard's fantasy real-time strategy demo. Lead the Orcs through the prologue campaign.",
+    "year": "2002",
+    "genre": "RTS",
+    "enabled": true
+  },
+  {
     "id": "diablo2",
     "name": "Diablo II",
     "subtitle": "Demo",
@@ -115,7 +126,7 @@
     "id": "ut-demo",
     "name": "Unreal Tournament",
     "subtitle": "Demo",
-    "wgbUrl": "/apps/ut_demo.wgb",
+    "wgbUrl": "/apps/ut_demo.wgb?rev=20261005",
     "coverUrl": "/covers/unreal-tournament-box.jpg",
     "description": "Epic's fast, competitive arena shooter on the Unreal Engine: deathmatch, CTF and Domination.",
     "year": "1999",
@@ -142,6 +153,88 @@
     "description": "Psygnosis' isometric pirate romp (released as Shipwreckers! in the US) — sail a cannon-armed galleon through island mazes, blasting forts, sea monsters and rival ships. Single-level demo.",
     "year": "1997",
     "genre": "Action",
+    "enabled": true
+  },
+  {
+    "id": "quake2-demo",
+    "name": "Quake II",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/quake2-demo.wgb",
+    "coverUrl": "/covers/quake2-demo.svg",
+    "description": "Classic Win32 demo 3.14. Explore the Strogg base with the original OpenGL renderer.",
+    "year": "1997",
+    "genre": "FPS",
+    "gogUrl": "https://www.gog.com/en/game/quake_ii_quad_damage",
+    "enabled": true
+  },
+  {
+    "id": "american-mcgee-alice-demo",
+    "name": "American McGee's Alice",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/american-mcgee-alice-demo.wgb",
+    "coverUrl": "/covers/american-mcgee-alice-demo.svg",
+    "description": "Enter a dark Wonderland in the original PC demo.",
+    "year": "2000",
+    "genre": "Action-Adventure",
+    "enabled": true
+  },
+  {
+    "id": "xiii-demo",
+    "name": "XIII",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/xiii-demo.wgb",
+    "coverUrl": "/covers/xiii-demo.svg",
+    "description": "The original cel-shaded shooter. UK demo with the beach and snow levels.",
+    "year": "2003",
+    "genre": "FPS",
+    "gogUrl": "https://www.gog.com/en/game/xiii",
+    "enabled": true
+  },
+  {
+    "id": "hitman-codename-47-demo",
+    "name": "Hitman: Codename 47",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/hitman-codename-47-demo.wgb",
+    "coverUrl": "/covers/hitman-codename-47-demo.svg",
+    "description": "Revision 2 of the original PC demo, configured for its Direct3D renderer.",
+    "year": "2000",
+    "genre": "Stealth",
+    "gogUrl": "https://www.gog.com/en/game/hitman_codename_47",
+    "enabled": true
+  },
+  {
+    "id": "serious-sam-tfe-demo",
+    "name": "Serious Sam: The First Encounter",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/serious-sam-tfe-demo.wgb",
+    "coverUrl": "/covers/serious-sam-tfe-demo.svg",
+    "description": "Classic First Encounter demo with Russian menus. A first-launch information dialog appears once.",
+    "year": "2001",
+    "genre": "FPS",
+    "gogUrl": "https://www.gog.com/en/game/serious_sam_the_first_encounter",
+    "enabled": true
+  },
+  {
+    "id": "worms-armageddon-demo",
+    "name": "Worms Armageddon",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/worms-armageddon-demo.wgb",
+    "coverUrl": "/covers/worms-armageddon-demo.svg",
+    "description": "Team17’s original PC demo: turn-based worm warfare and explosive weapons.",
+    "year": "1999",
+    "genre": "Strategy",
+    "gogUrl": "https://www.gog.com/en/game/worms_armageddon",
+    "enabled": true
+  },
+  {
+    "id": "system-shock2-demo",
+    "name": "System Shock 2",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/system-shock2-demo.wgb",
+    "coverUrl": "/covers/system-shock2-demo.svg",
+    "description": "Original 1999 demo with the tutorial and an introduction to the MedSci level.",
+    "year": "1999",
+    "genre": "Action RPG",
     "enabled": true
   }
 ]

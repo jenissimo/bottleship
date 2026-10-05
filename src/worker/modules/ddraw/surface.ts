@@ -153,12 +153,8 @@ const leaseRegionUnchanged = (
  * DirectDraw maps one sub-resource at a time regardless of the rects asked for
  * (Wine surface.c:1138-1141 maps the wined3d "already mapped" error to this, and
  * ddraw7.c:14292-14300 asserts it for two whole-surface READONLY|WAIT locks).
- *
- * Kill switch for a title that relied on the old permissiveness:
- * setWorkerFlag('__noLockExclusivity', true).
  */
 const surfaceAlreadyLocked = (state: DirectDrawSurfaceState): boolean => {
-    if ((globalThis as { __noLockExclusivity?: boolean }).__noLockExclusivity === true) return false;
     if (state.activeLeaseId === undefined) return false;
     if (leaseRegistry.validateLease(state.activeLeaseId)) return true;
     // A revoked lease is not a lock: drop the stale id rather than refuse forever.

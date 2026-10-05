@@ -297,9 +297,13 @@ export default function App() {
   /** Display name from the loaded WGB manifest (title || name). Used so ?game=dev&load=…
    *  doesn't keep saying "Dev" / "Starting Dev" once the bundle is known. */
   const [bundleDisplayName, setBundleDisplayName] = useState<string | null>(null);
+  const [hasImportedBundle, setHasImportedBundle] = useState(false);
+  const userImportPendingRef = useRef(false);
+  const installerInputRef = useRef<HTMLInputElement>(null);
   const handleDroppedFiles = useCallback((fileList: FileList | File[]) => {
     const files = Array.from(fileList);
     if (files.length === 0 || !globalWorker) return;
+    userImportPendingRef.current = true;
     ensurePersistentStorageRequested();
     canvasRef.current?.focus();
     setIsLoadingApp(true);
@@ -1281,7 +1285,14 @@ export default function App() {
         worker.postMessage({ type: 'child_surface', canvas: surface, inputBuffer }, [surface]);
         return;
       }
-      if (event.data?.type === 'child_session_reset') { childSurface.clear(); return; }
+      if (event.data?.type === 'child_session_reset') {
+        childSurface.clear();
+        if (event.data.resumeParent) {
+          audioEngine?.stopAll();
+          setExitInfo(null); exitInfoRef.current = null;
+        }
+        return;
+      }
       //console.log('BottleShip: Worker message received:', event.data?.type);
       
       // Forward logs to server (if enabled)
@@ -1345,6 +1356,7 @@ export default function App() {
         setFpuStrictEnabled(!!event.data.strict);
       }
       if (event.data?.type === "error") {
+        userImportPendingRef.current = false;
         setWorkerStatus("error");
         setErrorMessage(event.data.message ?? "Worker error");
         // Tear down the launch overlay so the error surfaces instead of a stuck "booting".
@@ -1397,6 +1409,10 @@ export default function App() {
         return;
       }
       if (event.data?.type === "bundle_meta") {
+        if (userImportPendingRef.current) {
+          setHasImportedBundle(true);
+          userImportPendingRef.current = false;
+        }
         const name = typeof event.data.name === "string" ? event.data.name.trim() : "";
         if (name) setBundleDisplayName(name);
         setGameId(typeof event.data.gameId === "string" ? event.data.gameId : null);
@@ -1460,6 +1476,7 @@ export default function App() {
         }
       }
       if (event.data?.type === "installer_unsupported") {
+        userImportPendingRef.current = false;
         setIsLoadingApp(false);
         setLoadingProgress(null);
         setErrorMessage(event.data.message ?? "This installer format is not supported.");
@@ -1759,6 +1776,7 @@ export default function App() {
     };
 
     worker.onerror = (event: ErrorEvent) => {
+      userImportPendingRef.current = false;
       setWorkerStatus("error");
       setErrorMessage(event.message || "Worker error");
       // Same teardown as the worker's own `error` message: leave the launch overlay up
@@ -3185,7 +3203,7 @@ export default function App() {
           {(displayGame!.id !== "dev" || bundleDisplayName) && (
             <>
               <span className={s["emu-game-name"]}>{gameDisplayName}</span>
-              {displayGame!.id !== "dev" && displayGame!.subtitle && (
+              {!hasImportedBundle && displayGame!.id !== "dev" && displayGame!.subtitle && (
                 <span className={s["emu-game-subtitle"]}>{displayGame!.subtitle}</span>
               )}
             </>
@@ -3351,24 +3369,28 @@ export default function App() {
         <div className={s["emu-info-strip"]}>
           <span className={s["emu-info-name"]}>
             {gameDisplayName}
-            {displayGame!.id !== "dev" && displayGame!.subtitle && (
+            {!hasImportedBundle && displayGame!.id !== "dev" && displayGame!.subtitle && (
               <span className={s["emu-info-subtitle"]}>&nbsp;{displayGame!.subtitle}</span>
             )}
           </span>
           <span className={s["emu-info-desc"]}>
-            {displayGame!.id !== "dev" ? displayGame!.description : ""}
+            {!hasImportedBundle && displayGame!.id !== "dev" ? displayGame!.description : ""}
           </span>
-          {displayGame!.id !== "dev" && displayGame!.gogUrl && (
-            <a
-              className={s["emu-info-gog"]}
-              href={displayGame!.gogUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Own it? Get it on GOG →
-            </a>
-          )}
           <span className={s["emu-info-hints"]}>F11 · Fullscreen</span>
+        </div>
+      )}
+
+      {displayGame!.id !== "dev" && displayGame!.gogUrl && !hasImportedBundle && (
+        <div className={s["gog-upgrade"]}>
+          <div><strong>Own the full game on GOG?</strong> Drop your offline installer here and play your copy.
+            <small>Include setup.exe and every setup-*.bin part. Download your WGB or free cached files in Settings → Storage.</small>
+          </div>
+          <button className={s["emu-topbar-btn"]} disabled={isLoadingApp} onClick={() => installerInputRef.current?.click()}>Import full game</button>
+          <a className={s["emu-info-gog"]} href={displayGame!.gogUrl} target="_blank" rel="noopener noreferrer">Get it on GOG →</a>
+          <input ref={installerInputRef} type="file" accept=".exe,.bin" multiple hidden onChange={(e) => {
+            if (e.target.files?.length) handleDroppedFiles(e.target.files);
+            e.target.value = "";
+          }} />
         </div>
       )}
 

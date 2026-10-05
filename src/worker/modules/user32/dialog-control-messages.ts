@@ -165,7 +165,7 @@ export function applyDefaultSetText(win: WindowInfo, text: string): void {
     const changed = win.title !== text;
     if (changed) eraseControlOverlayRect(win);
     applyControlSetText(win, text);
-    if (!win.parent) System.getInstance().notifyWindowTitle(text, 'WM_SETTEXT');
+    if (!win.parent) System.getInstance().notifyWindowTitle(text, 'WM_SETTEXT', win.visible);
     else if (changed) repaintDialogAfterContentChange(win.parent);
 }
 

@@ -3,8 +3,7 @@
 
 import { type HleDispatcher, ThunkImplementation, ThunkResult } from '../../../core/thunking/thunk-dispatcher';
 import {
-    startChildProcess, promoteChildSession, hasChildSession, pendingChildHandoff,
-    ChildProcessCancelled, ChildNeedsSession,
+    promoteChildSession, hasChildSession, pendingChildHandoff,
     type ChildProcessRequest, type ChildProcessRecord,
 } from '../../../core/child-process';
 import { Logger, LogCategory } from '../../../core/logger';
@@ -21,12 +20,10 @@ import { invalidateGuestCode, invalidateAllGuestCode } from '../../../core/memor
 import { Marshaler } from '../../../core/memory/marshaler';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
 import { encodeAnsi } from '../../codepage-utils';
-import { applyShellExecFake, hasShellExecFakeMatch, isDifferentCommandLine } from '../../shell32';
-import { isUe1RenderProbeCommandLine } from '../../../runtime/filesystem/ue1-firstrun';
-import { applyUe1RenderProbeResult } from '../ue1-render-probe';
+import { isDifferentCommandLine } from '../../shell32';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
 import { hostToolsEnabled } from '../../../core/host-tool-bridge';
-import { startGuestHostTool } from '../../../core/guest-host-tool';
+import { startProcessRuntime } from './runtime-child';
 import { createActCtxExports } from './actctx';
 import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
@@ -602,9 +599,6 @@ const writeVirtualProcessMemory = (pid: number, address: number, data: Uint8Arra
     return data.length;
 };
 
-const isUnrealBrowserProbe = (applicationName: string, commandLine: string): boolean =>
-    isUe1RenderProbeCommandLine(`${applicationName} ${commandLine}`.trim());
-
 /**
  * True when the file's own bytes are an i386 PE executable image. CreateProcess maps the
  * file as a section and never consults the extension, so a wrapper that ships the real
@@ -666,10 +660,11 @@ const failVirtualProcess = (
     applicationName: string,
     commandLine: string,
     currentDirectory: string,
-    isWide: boolean
+    isWide: boolean,
+    errorCode: number,
 ): ThunkResult => {
     writeProcessInformationZeroed(lpProcessInformation);
-    System.getInstance().scheduler.setLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    System.getInstance().scheduler.setLastError(errorCode);
     Logger.warn(
         LogCategory.KERNEL32,
         `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}") ` +
@@ -698,12 +693,7 @@ const finishVirtualProcess = (
     currentDirectory: string,
     dwCreationFlags: number,
     isWide: boolean,
-    noOpProbe: boolean,
     deferredExec?: { imagePath: string; commandLine: string },
-    /** Present when the child has ALREADY run to completion: the handle
-     *  must be signalled before we return, or the parent's WaitForSingleObject never
-     *  completes and it spins on a child that will never exist. */
-    exitCode?: number,
     /** Present when a headless child runtime is to run this process. Started here, after
      *  the handles are published, and it owns the exit code from now on. */
     childRequest?: ChildProcessRequest,
@@ -738,33 +728,13 @@ const finishVirtualProcess = (
         `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}", ` +
         `flags=0x${dwCreationFlags.toString(16)}) -> pid=${proc.processId} tid=${proc.threadId} ` +
         `hProcess=0x${proc.processHandle.toString(16)} hThread=0x${proc.threadHandle.toString(16)}` +
-        `${noOpProbe ? ' no-op-probe=1 sync=1' : ''}` +
         `${deferredExec ? ` suspended-exec="${deferredExec.imagePath}"` : ''}`
     );
 
-    if (exitCode !== undefined) manager.terminateProcess(proc.processHandle, exitCode);
-
     if (childRequest) {
-        const vfs = System.getInstance().fileSystem;
-        const task = childBackend === 'host' ? startGuestHostTool(vfs, childRequest)
-            : startChildProcess(vfs, childRequest, undefined, record => handOffToChild(System.getInstance(), record));
-        const complete = manager.bindRuntime(proc.processId, task);
-        task.onGuestExit = complete;
-        task.completion.then(
-            complete,
-            (error) => {
-                if (error instanceof ChildProcessCancelled || !manager.isRuntimeCurrent(proc.processId, task)) return;
-                // The child that wants the screen gets it here, without waiting for a
-                // parent exit that a blocked parent will never reach.
-                if (error instanceof ChildNeedsSession
-                    && handOffToChild(System.getInstance(), error.record)) return;
-                // Otherwise the handle still has to stop being STILL_ACTIVE, or a parent
-                // waiting on a child we could neither run nor hand the session to waits
-                // forever. Failure, loudly: the record keeps why.
-                Logger.error(LogCategory.SYSTEM,
-                    `Child process "${childRequest.imagePath}" failed: ${error}`);
-                complete(1);
-            });
+        const system = System.getInstance();
+        startProcessRuntime(system.fileSystem, proc.processId, childRequest, childBackend,
+            record => handOffToChild(system, record));
     }
 
     System.getInstance().scheduler.setLastError(0);
@@ -793,93 +763,49 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         return { value: 0, stackCleanup: 40 };
     }
 
-    // Only fake a child process when an explicit shellExecFake rule matches, or
-    // for UE1's renderer/browser `-b false` probe. Most no-match launches still fail.
-    // For UT99, a hard failure on `-b false` can leave Core's native script
-    // dispatch with an uninitialized object pointer, so keep this case as a
-    // no-op virtual child that auto-exits.
-    const probeCommand = commandLine || applicationName;
-    const hasFakeRule = hasShellExecFakeMatch(probeCommand);
-    const noOpProbe = !hasFakeRule && isUnrealBrowserProbe(applicationName, commandLine);
-    if (noOpProbe) {
-        // The virtual child still owes its config side effect — see ue1-render-probe.
-        return applyUe1RenderProbeResult(probeCommand).then(() => finishVirtualProcess(
+    // lpApplicationName may be NULL, in which case the image is argv[0] of the command
+    // line and the arguments are what follows it, the split CreateProcess itself performs.
+    const system = System.getInstance();
+    const argv0 = applicationName || firstCommandLineToken(commandLine || "");
+    const reExecArgs = applicationName
+        ? (commandLine || "")
+        : stripFirstCommandLineToken(commandLine || "");
+    const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
+    const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
+        || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
+    // Subsystem selects the optional host-tool backend, never permission to replace the parent.
+    const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
+    const execCandidate = !!imagePath && isBundledImage(imagePath);
+    if (execCandidate && deferExec) {
+        return finishVirtualProcess(
             lpProcessInformation, applicationName, commandLine,
-            currentDirectory, dwCreationFlags, isWide, true,
-        ));
-    }
-    if (!hasFakeRule) {
-        // lpApplicationName may be NULL, in which case the image is argv[0] of the command
-        // line and the arguments are what follows it, the split CreateProcess itself performs.
-        const system = System.getInstance();
-        const argv0 = applicationName || firstCommandLineToken(commandLine || "");
-        const reExecArgs = applicationName
-            ? (commandLine || "")
-            : stripFirstCommandLineToken(commandLine || "");
-        const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
-        const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
-            || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
-        // Subsystem selects the optional host-tool backend, never permission to replace the parent.
-        const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
-        const execCandidate = !!imagePath && isBundledImage(imagePath);
-        if (execCandidate && deferExec) {
-            return finishVirtualProcess(
-                lpProcessInformation, applicationName, commandLine,
-                currentDirectory, dwCreationFlags, isWide, true,
-                { imagePath, commandLine: reExecArgs },
-            );
-        }
-        if (execCandidate && !deferExec) {
-            // Windows starts the child and RETURNS; it never blocks the caller, and nothing
-            // here can know which of our two single-session realizations this child needs.
-            // Blocking until it exits answered that question with the PE subsystem and got
-            // it wrong twice over: a GUI image can be a helper the parent waits on, and a
-            // console image can be the program the user is meant to end up in front of.
-            // So do what Windows does, and let the parent's own next move say it — a wait
-            // completes against the headless run, an exit hands the session over
-            // (pendingChildHandoff, consumed in shutdownProcess).
-            return finishVirtualProcess(
-                lpProcessInformation, applicationName, commandLine,
-                currentDirectory, dwCreationFlags, isWide, false, undefined, undefined,
-                {
-                    imagePath, commandLine: reExecArgs,
-                    currentDirectory: currentDirectory || system.fileSystem.currentDir,
-                    rawCommandLine: commandLine || applicationName,
-                    environment: system.process ? [...system.process.environment] : undefined,
-                },
-                isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
-            );
-        }
-        return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide);
-    }
-
-    // Keep the common no-match/no-op probe path synchronous. The async thunk
-    // machinery is only needed when a matched shellExecFake rule has to touch VFS.
-    if (hasFakeRule) {
-        return applyShellExecFake(probeCommand, "KERNEL32").then((faked) =>
-            faked
-                ? finishVirtualProcess(
-                    lpProcessInformation,
-                    applicationName,
-                    commandLine,
-                    currentDirectory,
-                    dwCreationFlags,
-                    isWide,
-                    false
-                )
-                : failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide)
+            currentDirectory, dwCreationFlags, isWide,
+            { imagePath, commandLine: reExecArgs },
         );
     }
-
-    return finishVirtualProcess(
-        lpProcessInformation,
-        applicationName,
-        commandLine,
-        currentDirectory,
-        dwCreationFlags,
-        isWide,
-        false
-    );
+    if (execCandidate && !deferExec) {
+        // Windows starts the child and RETURNS; it never blocks the caller, and nothing
+        // here can know which of our two single-session realizations this child needs.
+        // Blocking until it exits answered that question with the PE subsystem and got
+        // it wrong twice over: a GUI image can be a helper the parent waits on, and a
+        // console image can be the program the user is meant to end up in front of.
+        // So do what Windows does, and let the parent's own next move say it — a wait
+        // completes against the headless run, an exit hands the session over
+        // (pendingChildHandoff, consumed in shutdownProcess).
+        return finishVirtualProcess(
+            lpProcessInformation, applicationName, commandLine,
+            currentDirectory, dwCreationFlags, isWide, undefined,
+            {
+                imagePath, commandLine: reExecArgs,
+                currentDirectory: currentDirectory || system.fileSystem.currentDir,
+                rawCommandLine: commandLine || applicationName,
+                environment: system.process ? [...system.process.environment] : undefined,
+            },
+            isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
+        );
+    }
+    return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
+        imagePath && system.fileSystem.fileExists(imagePath) ? 193 : 2); // BAD_EXE_FORMAT / FILE_NOT_FOUND
 };
 
 /**

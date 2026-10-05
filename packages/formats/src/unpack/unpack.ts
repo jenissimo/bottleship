@@ -31,8 +31,10 @@ type UnpackExports = {
     unpack_decode: (kind: number, propsPtr: number, propsLen: number) => number;
 };
 
+import { BufferSource, type RandomAccessSource } from "./source";
+
 interface DecodeSession {
-    input: Uint8Array;
+    input: RandomAccessSource;
     cursor: number;
     output: Uint8Array[];
     outputLen: number;
@@ -48,10 +50,12 @@ const IMPORTS: WebAssembly.Imports = {
             const s = activeSession;
             const mem = wasmMemory;
             if (!s || !mem) return 0;
-            const remaining = s.input.length - s.cursor;
+            const remaining = s.input.size - s.cursor;
             if (remaining <= 0) return 0;
-            const n = Math.min(cap, remaining);
-            new Uint8Array(mem.buffer).set(s.input.subarray(s.cursor, s.cursor + n), ptr);
+            const n = Math.min(cap, remaining, UNPACK_TRANSFER_BUF_SIZE);
+            const bytes = s.input.readRangeSync(s.cursor, s.cursor + n);
+            if (bytes.length !== n) throw new UnpackError("truncated compressed input", -3);
+            new Uint8Array(mem.buffer).set(bytes, ptr);
             s.cursor += n;
             return n;
         },
@@ -136,7 +140,18 @@ export class UnpackDecoder {
         onWrite: (bytes: Uint8Array) => boolean,
         props: Uint8Array = new Uint8Array(0),
     ): void {
+        this.decodeSourceToCallback(kind, new BufferSource(compressed), onWrite, props);
+    }
+
+    /** Pull compressed input by bounded ranges, including multi-gigabyte solid streams. */
+    decodeSourceToCallback(
+        kind: number,
+        source: RandomAccessSource,
+        onWrite: (bytes: Uint8Array) => boolean,
+        props: Uint8Array = new Uint8Array(0),
+    ): void {
         const exp = this.exp();
+        wasmMemory = exp.memory;
 
         let propsPtr = 0;
         if (props.byteLength > 0) {
@@ -146,7 +161,7 @@ export class UnpackDecoder {
         }
 
         const sess: DecodeSession = {
-            input: compressed,
+            input: source,
             cursor: 0,
             output: [],
             outputLen: 0,
@@ -182,6 +197,7 @@ export class UnpackDecoder {
      */
     decode(kind: number, compressed: Uint8Array, props: Uint8Array = new Uint8Array(0)): Uint8Array {
         const exp = this.exp();
+        wasmMemory = exp.memory;
 
         let propsPtr = 0;
         if (props.byteLength > 0) {
@@ -191,7 +207,7 @@ export class UnpackDecoder {
         }
 
         const sess: DecodeSession = {
-            input: compressed,
+            input: new BufferSource(compressed),
             cursor: 0,
             output: [],
             outputLen: 0,

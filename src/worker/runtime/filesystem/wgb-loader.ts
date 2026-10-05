@@ -200,13 +200,6 @@ export interface WgbManifest {
         appDirDlls?: string[];
         /** Glob patterns for files to eagerly prefetch during startup (e.g. ["*.dll", "data/sprites.vga"]) */
         prefetch?: string[];
-        /** Fake ShellExecuteA subprocess results: when parameters match `match`, create `createFiles` in VFS */
-        shellExecFake?: Array<{
-            match: string;
-            /** ifAbsent: only create if the target doesn't already exist (so a game-written
-             *  copy — e.g. a config with the user's resolution — survives across launches). */
-            createFiles: Array<{ path: string; content?: string; copyFrom?: string; ifAbsent?: boolean }>;
-        }>;
         /** VFS paths to delete from CoW overlay on every boot (e.g. crash-sentinel files like Running.ini) */
         deleteOnBoot?: string[];
         /**

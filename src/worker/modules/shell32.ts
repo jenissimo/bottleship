@@ -1,6 +1,5 @@
 /**
- * SHELL32.dll stub module.
- * ShellExecuteA вЂ” safe stub so PE imports don't corrupt stack.
+ * SHELL32.dll: shell folders, file operations and guest process launch.
  */
 
 import { IModule } from "../core/module";
@@ -9,11 +8,9 @@ import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatc
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
-import { EmulatorConfig } from "../core/emulator-config-manager";
-import { invalidateIniCache } from "./kernel32/profile";
 import { readAnsiFromGuest, readWideFromGuest, encodeAnsi } from "./codepage-utils";
-import { isUe1RenderProbeCommandLine } from "../runtime/filesystem/ue1-firstrun";
-import { applyUe1RenderProbeResult } from "./kernel32/ue1-render-probe";
+import { startProcessRuntime } from "./kernel32/process/runtime-child";
+import { getVirtualProcessManager } from "./kernel32/process/virtual-process-manager";
 import { Marshaler } from "../core/memory/marshaler";
 import { performShFileOperation, DE_INVALIDFILES } from "./shell32-fileop";
 import { windows } from "./user32/shared-state";
@@ -24,17 +21,6 @@ import {
     resolveModuleBaseForIconPath,
 } from "./kernel32/icon-extractor";
 
-/**
- * Check `shellExecFake` rules against the given command line / parameter string.
- * If a rule matches, create the declared files in VFS and return true; otherwise
- * return false without side effects. Shared between ShellExecute* (shell32) and
- * CreateProcess* (kernel32), because some games (Unreal Engine setup) probe
- * render devices via either API.
- *
- * If no rule matches, callers choose their compatibility behavior. CreateProcess*
- * keeps a narrow UE1 `-b false` no-op child fallback because some builds do not
- * tolerate a hard failure on that probe.
- */
 /**
  * SHFILEOPSTRUCTA/W field offsets. shellapi.h wraps the whole header in
  * `#include <pshpack1.h>`, so this struct is PACKED: fAnyOperationsAborted sits at 18,
@@ -78,66 +64,6 @@ function readPathList(mem: Uint8Array, ptr: number, wide: boolean): string[] {
         }
     }
     return out;
-}
-
-export function hasShellExecFakeMatch(commandLine: string): boolean {
-    return EmulatorConfig.getInstance().shellExecFake.some(rule => commandLine.includes(rule.match));
-}
-
-export async function applyShellExecFake(commandLine: string, source: string): Promise<boolean> {
-    const rules = EmulatorConfig.getInstance().shellExecFake;
-    for (const rule of rules) {
-        if (!commandLine.includes(rule.match)) continue;
-
-        Logger.log(
-            LogCategory.SYSTEM,
-            `[${source}] shellExecFake matched "${rule.match}" - creating ${rule.createFiles.length} file(s)`
-        );
-        const vfs = System.getInstance().fileSystem;
-        for (const f of rule.createFiles) {
-            // ifAbsent: don't clobber an existing copy (e.g. a config the game rewrote with
-            // the user's resolution) — only create on first run. Mirrors manifest writeFiles.
-            if (f.ifAbsent && vfs.getFileSize(f.path) > 0) {
-                Logger.log(LogCategory.SYSTEM, `[${source}] shellExecFake: "${f.path}" already exists, skipped (ifAbsent)`);
-                continue;
-            }
-            // Emulator-side injection: mkdir -p the target's parent dirs so an author
-            // can drop a file into a path the bundle doesn't ship (e.g. a freshly-
-            // installed game's "My Documents\<Game>" config dir). CREATE_ALWAYS below
-            // returns null on a missing parent (faithful Win32), which would silently
-            // skip the write — this makes the declared path Just Work.
-            vfs.ensureParentDirsSync(f.path);
-            let data: Uint8Array | undefined;
-            if (f.copyFrom) {
-                const src = await vfs.open(f.copyFrom, 0x80000000, 3); // GENERIC_READ, OPEN_EXISTING
-                if (src) {
-                    const size = vfs.getFileSize(f.copyFrom);
-                    if (size > 0) data = await vfs.read(src, size);
-                } else {
-                    Logger.warn(
-                        LogCategory.SYSTEM,
-                        `[${source}] shellExecFake: copyFrom source not found: "${f.copyFrom}"`
-                    );
-                }
-            } else if (f.content) {
-                data = encodeAnsi(f.content);
-            }
-            const h = await vfs.open(f.path, 0x40000000, 2); // GENERIC_WRITE, CREATE_ALWAYS
-            if (h && data) {
-                await vfs.write(h, data);
-                await vfs.flushFile(h.path);
-            }
-            if (f.path.toLowerCase().endsWith('.ini')) {
-                invalidateIniCache(f.path);
-            }
-            Logger.log(
-                LogCategory.SYSTEM,
-                `[${source}] shellExecFake created: "${f.path}"${data ? ` (${data.length} bytes)` : ''}`
-            );
-        }
-        return true;
-    }
-    return false;
 }
 
 /**
@@ -342,140 +268,42 @@ export class Shell32 implements IModule {
             return String.fromCharCode(...chars);
         };
 
-        /**
-         * ShellExecute* return value. >32 is success; 0..31 are SE_ERR_* codes.
-         *
-         * Success is a claim about EFFECT, not mechanism: we are single-process, so the
-         * only launch shape we can serve is one whose entire observable contract is a
-         * side effect on the filesystem (UE1's `testrendev` child exists purely to leave
-         * Detected.ini behind — the parent never waits on it and never reads an exit
-         * code). Saying "launched" when we produced that artifact is honest; saying it
-         * when we did nothing tells the guest a child ran and lets it proceed on a false
-         * premise, failing arbitrarily far from here.
-         *
-         * The refusal code must not itself assert something false about the image:
-         * SE_ERR_FNF/SE_ERR_BADFORMAT are falsifiable by the guest and route some callers
-         * into a reinstall/repair branch. ACCESSDENIED says only "this environment would
-         * not run it", which is true.
-         */
+        type ShellLaunch = { value: number; processHandle?: number };
         const executeShell = async (
-            apiName: "ShellExecuteA" | "ShellExecuteW" | "ShellExecuteExA" | "ShellExecuteExW",
-            operation: string,
-            file: string,
-            parameters: string,
-            directory: string,
-            nShowCmd: number,
-            allowImageExec = true,
-        ): Promise<number> => {
-            const launched = await applyShellExecFake(parameters, "SHELL32");
-
-            // UE1's render-device probe, which a bundle need not carry a shellExecFake rule
-            // for: its Detected.ini/Detected.log is materialized reactively at the file-open
-            // layer, so the child's whole observable effect already happens without us
-            // launching anything. Claiming success here is the same honesty rule as below —
-            // the artifact the parent goes on to read does exist.
-            if (!launched && isUe1RenderProbeCommandLine(parameters)) {
-                await applyUe1RenderProbeResult(parameters);
-                System.getInstance().scheduler.setLastError(0);
-                Logger.log(
-                    LogCategory.SYSTEM,
-                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}") -> ${SHELL_EXEC_OK} ` +
-                    `(UE1 render-device probe; Detected.* is materialized on open)`
-                );
-                return SHELL_EXEC_OK;
-            }
-
-            // Self re-exec: a launcher relaunching its OWN image with a new command line
-            // (see System.isSelfImage). The child's whole observable contract is "this
-            // program, restarted with these arguments", and that we can reproduce exactly.
-            //
-            // Strictly AFTER shellExecFake and the probe: a self-launch whose real purpose is
-            // a file side effect is already served by those, and restarting for it makes the
-            // probe BE the game — a `testrendev=` run inits the renderer, logs, and exits.
+            apiName: string, operation: string, file: string, parameters: string,
+            directory: string, nShowCmd: number, retainProcess = false,
+        ): Promise<ShellLaunch> => {
             const system = System.getInstance();
-            if (!launched && allowImageExec && system.isSelfImage(file, directory)
-                && isDifferentCommandLine(parameters, system.executableArgs)
-                && system.requestReExec(parameters)) {
-                system.scheduler.setLastError(0);
-                Logger.log(
-                    LogCategory.SYSTEM,
-                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}") -> re-exec ` +
-                    `(launcher relaunching its own image; restarting with the new command line)`
-                );
-                return SHELL_EXEC_OK;
+            const imagePath = system.resolveImagePath(file, directory);
+            if (!imagePath || !system.fileSystem.fileExists(imagePath)) {
+                system.scheduler.setLastError(2);
+                return { value: 2 };
             }
-
-            // A small launcher often hands off with ShellExecute rather than
-            // CreateProcess.  Cossacks' GOG video player is one example: after its
-            // AVI queue it ShellExecutes dmln.exe, which in turn starts the game.
-            //
-            // We still cannot promise to run an arbitrary host program.  The only
-            // successful non-self launch is a bundled DOS/Windows image that the VFS
-            // can prove exists.  It has the same one-process realization as the
-            // CreateProcess path: restart the guest on that image after this thunk
-            // returns, preserving the bundle's writable layer.
-            const imagePath = !launched ? system.resolveImagePath(file, directory) : "";
-            const bundledExecutable = !!imagePath
-                && /\.(?:exe|com)$/i.test(imagePath)
-                && system.fileSystem.fileExists(imagePath)
-                // The self-image branch above deliberately rejects identical args to
-                // avoid a restart loop; never re-admit that same request here.
-                && !system.isSelfImage(file, directory);
-            if (!launched && allowImageExec && bundledExecutable && system.requestReExec(parameters, imagePath)) {
-                system.scheduler.setLastError(0);
-                Logger.log(
-                    LogCategory.SYSTEM,
-                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}") ` +
-                    `-> exec "${imagePath}" (bundled child image)`
-                );
-                return SHELL_EXEC_OK;
+            if (operation.toLowerCase() !== "open" && operation.toLowerCase() !== "runas") {
+                system.scheduler.setLastError(ERROR_ACCESS_DENIED);
+                return { value: SE_ERR_ACCESSDENIED };
             }
-
-            if (!launched) {
-                System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
-                Logger.warn(
-                    LogCategory.SYSTEM,
-                    `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}", ` +
-                    `show=${nShowCmd}) -> SE_ERR_ACCESSDENIED (no emulated child effect; ` +
-                    `single-process HLE cannot spawn a real child)`
-                );
-                return SE_ERR_ACCESSDENIED;
-            }
-
-            System.getInstance().scheduler.setLastError(0);
-            Logger.log(
-                LogCategory.SYSTEM,
-                `[SHELL32] ${apiName}("${operation}", "${file}", "${parameters}", dir="${directory}", ` +
-                `show=${nShowCmd}) -> ${SHELL_EXEC_OK} (child effect emulated)`
-            );
-            return SHELL_EXEC_OK;
+            const manager = getVirtualProcessManager();
+            const currentDirectory = directory || system.fileSystem.currentDir;
+            const proc = manager.createProcess({ applicationName: imagePath,
+                commandLine: parameters, currentDirectory, creationFlags: 0, runtimeBacked: true });
+            startProcessRuntime(system.fileSystem, proc.processId, {
+                imagePath, commandLine: parameters, currentDirectory,
+                rawCommandLine: '\"' + imagePath + '\"' + (parameters ? " " + parameters : ""),
+                environment: system.process ? [...system.process.environment] : undefined,
+            });
+            system.resourceProvider.unregisterKernelObject(proc.threadHandle);
+            if (!retainProcess) system.resourceProvider.unregisterKernelObject(proc.processHandle);
+            system.scheduler.setLastError(0);
+            Logger.log(LogCategory.SYSTEM,
+                "[SHELL32] " + apiName + " -> guest child pid=" + proc.processId + " image=" + imagePath);
+            return { value: SHELL_EXEC_OK, processHandle: retainProcess ? proc.processHandle : undefined };
         };
 
-        /** Shared tail for ShellExecuteEx{A,W}: hInstApp + handle policy + BOOL. */
-        const finishShellExecuteEx = (pExecInfo: number, fMask: number, result: number): ThunkResult => {
-            // A handle we cannot back must not exist: an unregistered value never signals
-            // a wait, fails GetExitCodeProcess, and corrupts whatever real object later
-            // lands on it via CloseHandle. So when the caller ASKED for the process handle,
-            // hProcess stays NULL — and the call must then report FAILURE, because TRUE with
-            // a NULL hProcess sends a guest straight into WaitForSingleObject(NULL) with no
-            // branch for the error it gets back.
-            const wantsProcess = (fMask & SEE_MASK_NOCLOSEPROCESS) !== 0;
-            let outcome = result;
-            if (wantsProcess) {
-                Mem.writeUint32(pExecInfo + 56, 0); // hProcess
-                if (outcome > SE_ERR_MAX) {
-                    outcome = SE_ERR_ACCESSDENIED;
-                    System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
-                    Logger.warn(
-                        LogCategory.SYSTEM,
-                        `[SHELL32] ShellExecuteEx: SEE_MASK_NOCLOSEPROCESS requested but no process handle ` +
-                        `can be backed — reporting FALSE/SE_ERR_ACCESSDENIED rather than a NULL hProcess`
-                    );
-                }
-            }
-
-            Mem.writeUint32(pExecInfo + 32, outcome >>> 0); // hInstApp (SE_ERR_* on failure)
-            return { value: outcome > SE_ERR_MAX ? 1 : 0, stackCleanup: 4 };
+        const finishShellExecuteEx = (pExecInfo: number, fMask: number, result: ShellLaunch): ThunkResult => {
+            Mem.writeUint32(pExecInfo + 56, result.processHandle ?? 0);
+            Mem.writeUint32(pExecInfo + 32, result.value >>> 0);
+            return { value: result.value > SE_ERR_MAX ? 1 : 0, stackCleanup: 4 };
         };
 
         // ShellExecuteA(HWND hwnd, LPCSTR lpOperation, LPCSTR lpFile,
@@ -493,7 +321,7 @@ export class Shell32 implements IModule {
             const directory = lpDirectory ? readStrA(mem, lpDirectory) : "";
 
             const result = await executeShell("ShellExecuteA", operation, file, parameters, directory, nShowCmd);
-            return { value: result, stackCleanup: 24 };
+            return { value: result.value, stackCleanup: 24 };
         };
 
         // ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile,
@@ -511,7 +339,7 @@ export class Shell32 implements IModule {
             const directory = lpDirectory ? readStrW(mem, lpDirectory) : "";
 
             const result = await executeShell("ShellExecuteW", operation, file, parameters, directory, nShowCmd);
-            return { value: result, stackCleanup: 24 };
+            return { value: result.value, stackCleanup: 24 };
         };
 
         // BOOL ShellExecuteExA(SHELLEXECUTEINFOA *pExecInfo)
@@ -533,7 +361,7 @@ export class Shell32 implements IModule {
 
             const result = await executeShell(
                 "ShellExecuteExA", operation, file, parameters, directory, nShow,
-                (fMask & SEE_MASK_NOCLOSEPROCESS) === 0,
+                (fMask & SEE_MASK_NOCLOSEPROCESS) !== 0,
             );
             return finishShellExecuteEx(pExecInfo, fMask, result);
         };
@@ -557,7 +385,7 @@ export class Shell32 implements IModule {
 
             const result = await executeShell(
                 "ShellExecuteExW", operation, file, parameters, directory, nShow,
-                (fMask & SEE_MASK_NOCLOSEPROCESS) === 0,
+                (fMask & SEE_MASK_NOCLOSEPROCESS) !== 0,
             );
             return finishShellExecuteEx(pExecInfo, fMask, result);
         };

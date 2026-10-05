@@ -1,7 +1,7 @@
 /**
  * Natalie Brooks: Secrets of Treasure House — boot + new-game regression script.
  *
- *   WGB=g:/WGB/running/NatalieBrooksSTH-nofpu.wgb \
+ *   WGB=/apps/external-wgb/natalie-brooks.wgb \
  *   bun tools/harness.ts run tools/harness/regression/natalie-brooks.harness.ts
  *
  * Doubles as the phase stopwatch for load-time work: it ticks SMALL frame batches
@@ -16,7 +16,7 @@
 
 import { harness } from "../../harness";
 
-const WGB = process.env.WGB ?? "g:/WGB/running/NatalieBrooksSTH-nofpu.wgb";
+const WGB = process.env.WGB ?? "/apps/external-wgb/natalie-brooks.wgb";
 const BATCH = 30;
 const MENU_BATCHES = 45;   // splash is a ~12 s timed logo at full frame rate
 const LOAD_BATCHES = 30;
@@ -49,4 +49,5 @@ for (const s of r.steps) {
 }
 console.log(`ok=${r.ok}  bootToSplash=${Math.round(bootStall)}ms  ` +
     `menuReachedBy=${(clickAt / 1000).toFixed(1)}s  newGameLoad=${Math.round(loadStall)}ms`);
-if (!r.ok) console.log(JSON.stringify(r.error));
+if (!r.ok) throw new Error(`Natalie Brooks scenario failed: ${JSON.stringify(r.error)}`);
+console.log("OK — new-game scene has a non-black primary surface");

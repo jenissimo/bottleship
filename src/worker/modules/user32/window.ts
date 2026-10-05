@@ -1436,8 +1436,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         const windowInfo = createInternal(className, windowName, dwStyle, dwExStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
         if (!windowInfo) return 0;
-        if (windowName && !hWndParent) {
-            System.getInstance().notifyWindowTitle(windowName, 'CreateWindowEx');
+        if (!hWndParent && (windowName || windowInfo.visible)) {
+            System.getInstance().notifyWindowTitle(windowName, 'CreateWindowEx', windowInfo.visible);
         }
 
         return fireCreateWindowCallbacks(ctx, windowInfo, lpParam, hInstance, hMenu, hWndParent, dwStyle, lpWindowName, lpClassName, dwExStyle, 'CreateWindowExA');
@@ -1464,8 +1464,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
         const windowInfo = createInternal(className, windowName, dwStyle, dwExStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
         if (!windowInfo) return 0;
-        if (windowName && !hWndParent) {
-            System.getInstance().notifyWindowTitle(windowName, 'CreateWindowEx');
+        if (!hWndParent && (windowName || windowInfo.visible)) {
+            System.getInstance().notifyWindowTitle(windowName, 'CreateWindowEx', windowInfo.visible);
         }
 
         return fireCreateWindowCallbacks(ctx, windowInfo, lpParam, hInstance, hMenu, hWndParent, dwStyle, lpWindowName, lpClassName, dwExStyle, 'CreateWindowExW');
@@ -1817,6 +1817,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
 
             if (visibilityChanged) {
                 live.visible = show;
+                if (show && !live.parent) System.getInstance().notifyWindowTitle(live.title, 'ShowWindow', true);
                 if (show) live.style |= WS_VISIBLE;
                 else live.style &= ~WS_VISIBLE;
 
@@ -2037,6 +2038,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             if (showing) {
                 live.visible = true;
                 live.style |= WS_VISIBLE;
+                if (!live.parent) System.getInstance().notifyWindowTitle(live.title, 'SetWindowPos', true);
             } else if (hiding) {
                 live.visible = false;
                 live.style &= ~WS_VISIBLE;

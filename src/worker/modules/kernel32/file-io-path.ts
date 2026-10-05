@@ -9,12 +9,18 @@ import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { VirtualFileSystem } from '../../runtime/filesystem/vfs';
-import { dirOfWindowsPath } from '../../runtime/filesystem/ue1-firstrun';
 import { readStringA, readStringW, encodeUTF16LE, encodeFileApiString } from './file-io-strings';
 import { searchPathSafeMode } from '../../core/dll-search-order';
 
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_INVALID_PARAMETER = 87;
+
+/** Directory portion of a Windows path, without a trailing separator. */
+const dirOfWindowsPath = (path: string): string => {
+    const normalized = path.split('/').join('\\');
+    const end = normalized.lastIndexOf('\\');
+    return end <= 0 ? '' : normalized.slice(0, end);
+};
 
 const pathHasSeparator = (path: string): boolean => path.includes('\\') || path.includes('/');
 

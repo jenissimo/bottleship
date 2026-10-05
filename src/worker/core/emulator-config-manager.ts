@@ -348,29 +348,6 @@ export class EmulatorConfig {
     // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
     public appDirDlls: string[] = [];
 
-    // Fake ShellExecuteA subprocess results
-    public shellExecFake: Array<{
-        match: string;
-        createFiles: Array<{ path: string; content?: string; copyFrom?: string; ifAbsent?: boolean }>;
-    }> = [];
-
-    // Unreal Engine 1 first-run support (set at bundle load by detectUe1()).
-    // Gates the generic UE1 config seeding (Default.ini D3D pin + reactive
-    // Detected.ini / config-ini materialization in CreateFile*). Detection keys
-    // on System/Core+Engine packages, so non-UE1 games leave this false and are
-    // completely unaffected. Reset to false on every boot (see reset()).
-    public ue1 = false;
-
-    // Learned UE1 "user dir" — the directory the game reads its active config and
-    // Detected.ini from (baked into the exe; e.g. C:\My Documents\Hp demo). Set
-    // reactively the first time Detected.ini/Detected.log is opened. null until learned.
-    public ue1UserDir: string | null = null;
-
-    // The engine's active config (`System\<exe>.ini`) — the file UE1's GConfig writes
-    // when a caller passes no filename. The virtual render probe patches DescFlags
-    // there, so it must be the same path applyUe1FirstRunSetup pins.
-    public ue1ConfigIni: string | null = null;
-
     // VFS paths to delete from CoW overlay on every boot
     public deleteOnBoot: string[] = [];
 
@@ -640,12 +617,6 @@ export class EmulatorConfig {
             );
         }
 
-        // Apply shellExecFake rules
-        if (config.shellExecFake && config.shellExecFake.length > 0) {
-            this.shellExecFake = config.shellExecFake;
-            Logger.log(LogCategory.SYSTEM, `EmulatorConfig: ${this.shellExecFake.length} shellExecFake rule(s) loaded`);
-        }
-
         // Apply deleteOnBoot list
         if (config.deleteOnBoot && config.deleteOnBoot.length > 0) {
             this.deleteOnBoot = config.deleteOnBoot
@@ -721,13 +692,9 @@ export class EmulatorConfig {
         this.fpuStrict = false;
         this.disabledDlls = [];
         this.appDirDlls = [];
-        this.shellExecFake = [];
         this.deleteOnBoot = [];
         this.writeFiles = [];
         this.createDirs = [];
-        this.ue1 = false;
-        this.ue1UserDir = null;
-        this.ue1ConfigIni = null;
         // Manifest-only when present: without this, a CP1251/non-US title leaves its
         // ACP/OEMCP/LCID for the next Western title that omits those fields.
         this.ansiCodePage = 1252;

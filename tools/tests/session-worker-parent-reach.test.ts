@@ -39,6 +39,25 @@ function rig() {
     return { root, rootMessages, childMessages, output, endpoint, channel, fromRoot, promote };
 }
 
+test('returning to a live parent restores current shared audio buffers and its title', async () => {
+    const r = rig();
+    try {
+        const sab = new SharedArrayBuffer(64);
+        r.fromRoot({ type: 'audio_register', payload: { id: 1, sab } });
+        r.fromRoot({ type: 'window_title', title: 'Parent', visible: true });
+        r.promote();
+        r.fromRoot({ type: 'audio_unregister', payload: { id: 1 } });
+        r.fromRoot({ type: 'audio_register', payload: { id: 2, sab } });
+        const before = r.output.length;
+        r.channel.port2.postMessage({ type: 'process_exit', exitCode: 0 });
+        await until(() => r.output.some(m => m.type === 'child_session_reset'));
+        const restored = r.output.slice(before);
+        expect(restored.some(m => m.type === 'audio_register' && m.payload.id === 1)).toBe(false);
+        expect(restored).toContainEqual({ type: 'audio_register', payload: { id: 2, sab } });
+        expect(restored).toContainEqual({ type: 'window_title', title: 'Parent', visible: true });
+    } finally { r.endpoint.terminate(); r.channel.port2.close(); }
+});
+
 test("a promoted child that exits hands the channel back to the root", async () => {
     const r = rig();
     try {
@@ -48,7 +67,7 @@ test("a promoted child that exits hands the channel back to the root", async () 
 
         // The child's guest exits. Its worker is about to be terminated by the parent.
         r.channel.port2.postMessage({ type: "process_exit", exitCode: 0 });
-        await until(() => r.output.some((m) => m.type === "process_exit"));
+        await until(() => r.output.some((m) => m.type === "child_process_exit"));
 
         const before = r.rootMessages.length;
         r.endpoint.postMessage({ type: "harness_rpc", id: 2, cmd: "report" });
@@ -56,6 +75,9 @@ test("a promoted child that exits hands the channel back to the root", async () 
         expect(r.rootMessages.length).toBe(before + 1);
         expect(r.rootMessages.at(-1)).toMatchObject({ id: 2, cmd: "report" });
         expect(r.childMessages.length).toBe(1); // nothing more was posted at the dead port
+        expect(r.output.some(m => m.type === 'process_exit')).toBe(false);
+        expect(r.output).toContainEqual({ type: 'child_session_reset', resumeParent: true });
+        expect(r.rootMessages).toContainEqual({ type: 'resume_session' });
     } finally { r.endpoint.terminate(); r.channel.port2.close(); }
 });
 
@@ -85,12 +107,15 @@ test("the PARENT's own exit, relayed as broker, does not retire the child", asyn
         // `broker:true` is the parent reporting ITS exit through the child's port; the
         // child is still the live realm and must keep the foreground.
         r.channel.port2.postMessage({ type: "process_exit", exitCode: 0, broker: true });
-        await until(() => r.output.some((m) => m.type === "process_exit"));
-
         const before = r.childMessages.length;
         r.endpoint.postMessage({ type: "harness_rpc", id: 9, cmd: "state" });
         await until(() => r.childMessages.length === before + 1);
         expect(r.childMessages.at(-1)).toMatchObject({ id: 9 });
+        expect(r.output.some(m => m.type === 'process_exit')).toBe(false);
+        r.channel.port2.postMessage({ type: 'process_exit', exitCode: 4 });
+        await until(() => r.output.some(m => m.type === 'process_exit'));
+        expect(r.output.filter(m => m.type === 'process_exit')).toEqual([{type:'process_exit',exitCode:4}]);
+        expect(r.rootMessages.some(m => m.type === 'resume_session')).toBe(false);
     } finally { r.endpoint.terminate(); r.channel.port2.close(); }
 });
 

@@ -1,8 +1,8 @@
 # Census B — presenter kinds across the `.wgb` library
 
-Stage 8.0 of `render-worker-plan-2026-09-11.md`, row 10 of its §12 checklist. Answers one
+Historical presenter census, with the scope described in [measurement contracts](benchmark-method.md). Answers one
 question: **stage 1 carries the D3D9 executor off the guest thread and refuses everything else
-(§4) — how many titles in the library does that refuse?**
+— how many titles in the library does that refuse?**
 
 Static pass, no boot. Tool: `tools/census-presenter-kinds.ts`. Repo `eee6ffb`, scanned
 2026-09-11.

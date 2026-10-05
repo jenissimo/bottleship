@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 
 /**
- * Presenter-kind census over the `.wgb` library — census B of the render-worker plan
- * (`docs/performance/render-worker-plan-2026-09-11.md` §8.0 / §4).
+ * Presenter-kind census over the `.wgb` library.
+ * See docs/performance/benchmark-method.md for the render-worker measurement boundary.
  *
  * The question: stage 1 moves the D3D9 executor + composite off the guest thread and
  * REFUSES LOUDLY for every other executor (ddraw/D3D7, D3D8, glide, opengl). How many
