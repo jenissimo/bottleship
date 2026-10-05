@@ -24,7 +24,7 @@ import {
     deviceBoundDepthStencil,
 } from './shared-state';
 import { D3D8DeviceAdapter } from '../../backends/webgpu/d3d8/d3d8-device-adapter';
-import { createRenderTarget, createTextureSurface, d3dFormatToSurfaceFormat } from '../../backends/webgpu/shared/surface-factory';
+import { createRenderTarget, createTextureSurface } from '../../backends/webgpu/shared/surface-factory';
 import {
     isD3D8DepthStencilFormat,
     isD3D8ExclusiveFormat,
@@ -129,7 +129,6 @@ function writeSurfaceDesc(
     format: number,
     width: number,
     height: number,
-    bytesPerPixel: number,
     usage: number = 0,
     pool: number = D3DPOOL_DEFAULT
 ): void {
@@ -138,7 +137,9 @@ function writeSurfaceDesc(
     view.setUint32(pDesc + 4, D3DRTYPE_SURFACE, true);              // Type
     view.setUint32(pDesc + 8, usage >>> 0, true);                   // Usage
     view.setUint32(pDesc + 12, pool >>> 0, true);                   // Pool
-    view.setUint32(pDesc + 16, (width * height * bytesPerPixel) >>> 0, true); // Size
+    // Size describes the locked resource bytes, including whole compressed blocks
+    // for small mip levels. The RGBA decode buffer is not guest texture storage.
+    view.setUint32(pDesc + 16, getD3DTextureLayout(format, width, height).bytes, true); // Size
     view.setUint32(pDesc + 20, D3DMULTISAMPLE_NONE, true);          // MultiSampleType
     view.setUint32(pDesc + 24, width >>> 0, true);                  // Width
     view.setUint32(pDesc + 28, height >>> 0, true);                 // Height
@@ -853,14 +854,12 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         if (!meta || level >= meta.levels) return D3DERR_INVALIDCALL;
 
         const dims = getTextureLevelDims(meta.width, meta.height, level);
-        const bytesPerPixel = bytesPerPixelFromBpp(d3dFormatToSurfaceFormat(meta.format).bpp);
         writeSurfaceDesc(
             mem,
             pDesc,
             meta.format,
             dims.width,
             dims.height,
-            bytesPerPixel,
             meta.usage,
             meta.pool
         );
@@ -907,14 +906,12 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const adapter = resourceToDevice.get(pSurf);
         const surface = resolveLockSurface(info, adapter);
         const meta = info.texturePtr ? textureMeta.get(info.texturePtr) : null;
-        const bytesPerPixel = bytesPerPixelFromBpp(surface.format.bpp);
         writeSurfaceDesc(
             mem,
             pDesc,
             info.d3dFormat,
             surface.width,
             surface.height,
-            bytesPerPixel,
             meta?.usage ?? 0,
             info.role === 'backbuffer' ? D3DPOOL_DEFAULT : (meta?.pool ?? info.pool ?? D3DPOOL_DEFAULT)
         );

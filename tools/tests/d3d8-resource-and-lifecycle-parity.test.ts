@@ -31,6 +31,7 @@ import {
     type D3D8SurfaceInfo,
 } from "../../src/worker/modules/d3d8/shared-state";
 import { createRenderTarget, createTextureSurface } from "../../src/worker/backends/webgpu/shared/surface-factory";
+import { D3DFMT_DXT1, D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5 } from "../../src/worker/backends/webgpu/shared/texture-formats";
 import { System } from "../../src/worker/core/system";
 import type { D3D8DeviceAdapter } from "../../src/worker/backends/webgpu/d3d8/d3d8-device-adapter";
 
@@ -235,6 +236,46 @@ afterEach(() => {
         resourceToDevice.delete(ptr);
         textureMeta.delete(ptr);
         textureLevelSurfaces.delete(ptr);
+    }
+});
+
+describe("D3D8 surface descriptor storage size", () => {
+    const cases = [
+        { name: "DXT1", format: D3DFMT_DXT1, width: 64, height: 64, level: 0, w: 64, h: 64, bytes: 2048 },
+        { name: "DXT2 mip", format: D3DFMT_DXT2, width: 16, height: 8, level: 1, w: 8, h: 4, bytes: 32 },
+        { name: "DXT3 mip", format: D3DFMT_DXT3, width: 64, height: 32, level: 1, w: 32, h: 16, bytes: 512 },
+        { name: "DXT4 tiny mip", format: D3DFMT_DXT4, width: 8, height: 8, level: 2, w: 2, h: 2, bytes: 16 },
+        { name: "DXT5 tiny mip", format: D3DFMT_DXT5, width: 16, height: 8, level: 4, w: 1, h: 1, bytes: 16 },
+        { name: "DXT1 partial blocks", format: D3DFMT_DXT1, width: 7, height: 5, level: 0, w: 7, h: 5, bytes: 32 },
+        { name: "DXT1 one block", format: D3DFMT_DXT1, width: 1, height: 1, level: 0, w: 1, h: 1, bytes: 8 },
+        { name: "RGB565", format: D3DFMT_R5G6B5, width: 64, height: 64, level: 0, w: 64, h: 64, bytes: 8192 },
+        { name: "RGBA mip", format: D3DFMT_A8R8G8B8, width: 16, height: 8, level: 1, w: 8, h: 4, bytes: 128 },
+    ];
+    for (const c of cases) {
+        test(`${c.name}: GetDesc and GetLevelDesc agree with LockRect storage`, () => {
+            withFakeGuestMemory(0x20000, (mem) => {
+                const pTex = 0xd3d8_2001, pSurf = 0xd3d8_2002;
+                const surface = createTextureSurface(c.w, c.h, c.format);
+                surface.surfacePtr = 0x200;
+                textureMeta.set(pTex, { width: c.width, height: c.height, levels: c.level + 1, usage: 0, pool: 1, format: c.format });
+                usedPtrs.push(pTex);
+                trackedInfo(pSurf, { texturePtr: pTex, level: c.level, surface, d3dFormat: c.format });
+                const view = new DataView(mem.buffer);
+                expect(resources["IDirect3DTexture8_GetLevelDesc"]!({} as never, mem, [pTex, c.level, 0x20])).toBe(D3D_OK);
+                expect(resources["IDirect3DSurface8_GetDesc"]!({} as never, mem, [pSurf, 0x40])).toBe(D3D_OK);
+                expect(mem.subarray(0x20, 0x40)).toEqual(mem.subarray(0x40, 0x60));
+                expect(view.getUint32(0x20, true)).toBe(c.format);
+                expect(view.getUint32(0x38, true)).toBe(c.w);
+                expect(view.getUint32(0x3c, true)).toBe(c.h);
+                expect(view.getUint32(0x30, true)).toBe(c.bytes);
+                expect(resources["IDirect3DSurface8_LockRect"]!({} as never, mem, [pSurf, 0x80, 0, 0])).toBe(D3D_OK);
+                const bits = view.getUint32(0x84, true);
+                // A client copying the advertised Size must leave the next heap object intact.
+                mem.fill(0xcc, bits + c.bytes, bits + c.bytes + 32);
+                mem.set(new Uint8Array(view.getUint32(0x30, true)).fill(0x55), bits);
+                expect(mem.subarray(bits + c.bytes, bits + c.bytes + 32)).toEqual(new Uint8Array(32).fill(0xcc));
+            });
+        });
     }
 });
 
