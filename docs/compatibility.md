@@ -5,12 +5,9 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-10-05** against the maintainer's working collection in `G:\WGB\running`
-and existing production demos. Newly listed working titles and promotions from "in progress"
-reflect the maintainer's report; this release pass did not replay every game. Warcraft III
-Demo was freshly checked to its rendered menu. New demo coverage is separated below.
-GOG extraction was checked with The Blackwell
-Legacy and Far Cry, which does not establish fresh gameplay coverage for those installers.
+Updated **2026-10-05**. Working statuses include maintainer reports; every title has not
+been retested for this release. Observed demo stages are listed separately below. Successful
+GOG extraction does not establish gameplay coverage for that installer edition.
 
 **How to read the table**
 
@@ -90,15 +87,15 @@ The Re-Volt beta is a separate working build, not a replacement for the released
 System Shock 2 coverage is for the original 1999 game, including previously purchased GOG
 copies; it does not cover the 2025 remaster. Unreal Gold's former GOG edition is delisted.
 Quake II coverage is for the classic Win32 executable, rather than the Enhanced executable.
-The Bard's Tale and Worms World Party demos listed in [demo sources](demo-sources.md) are
-older editions than the working remasters and need their own compatibility checks.
+The original Bard's Tale and Worms World Party demos are older editions than the working
+remasters and need their own compatibility checks.
 
-## Demo checks in this release
+## Demo coverage
 
-These checks used one Chrome guest tab, with no engine-specific runtime overrides.
-They describe these demo editions only; a rendered menu does not establish full playability.
+These observations cover the listed demo editions only; a rendered menu does not establish
+full playability.
 
-| Demo | Freshly observed | Public catalog |
+| Demo | Observed stage | Public catalog |
 |---|---|:---:|
 | Quake II 3.14 (classic Win32) | Entered a playable level, movement and rendered HUD; OpenGL | ✓ |
 | American McGee's Alice | Main menu, OpenGL | ✓ |
@@ -112,10 +109,7 @@ They describe these demo editions only; a rendered menu does not establish full 
 | Gothic USA demo | SmartHeap / debug CRT dialog; did not reach the menu | |
 | Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |
 
-Harry Potter 1's existing demo was checked on a clean game ID and again with the same
-saved state. Its renderer helper actually ran and wrote detection/configuration files;
-the hidden helper did not replace the parent display. The updated Unreal Tournament WGB
-contains no fabricated ShellExecute rules and reaches its rendered menu.
+Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
 
 ## Stretch / in progress
 

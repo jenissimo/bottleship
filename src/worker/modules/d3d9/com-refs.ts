@@ -83,9 +83,8 @@ function internalBindingRefsWanted(): boolean {
 /**
  * Real COM keeps the count inside the object, and so do we now: the guest block is the count
  * of record unless `__d3d9MirrorRefcount` asks for the old JS-Map-authoritative behaviour.
- * The differential oracle (below) is what makes this default safe to flip generically rather
- * than per-title — see docs/performance/nfsu-max-settings-ceiling-2026-09-02.md §4.1 for the
- * evidence this default rests on, including the 1->0 destruction path specifically.
+ * The differential oracle below compares the guest and JS counts, including the 1->0
+ * destruction path, so both modes must agree on object lifetime.
  */
 function guestRefcountWanted(): boolean {
     return !flags.__d3d9MirrorRefcount;

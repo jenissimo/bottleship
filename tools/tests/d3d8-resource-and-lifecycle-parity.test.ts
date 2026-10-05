@@ -1,8 +1,5 @@
 /**
- * D3D8 resource/state-block parity tests — see docs/d3d8-parity/05-resources-formats-caps.md
- * (§3.3 CopyRects, §3.4 UpdateTexture) and docs/d3d8-parity/06-device-lifecycle.md (F2/F3
- * state-block membership). Each test is written to FAIL against the pre-fix code, not just
- * pass against the fixed code — see the inline notes on what the old behaviour would do.
+ * D3D8 CopyRects/UpdateTexture and state-block membership parity tests.
  *
  * State-block tests exercise captureD3D8StateToEntries/applyD3D8StateBlockEntries directly
  * against a minimal duck-typed device (only the methods those two functions actually call —

@@ -59,7 +59,7 @@ function toWebGPUFilter(d3d: number, isMag: boolean): GPUFilterMode {
  * the SamplerSpec carries real intent even though the FFP WGSL emitter (shader-generator.ts, outside
  * this module's ownership) does not yet substitute the border colour — DxSamplerCache still falls back
  * to a native clamp-to-edge sampler for it, so this is a no-op today and a decode-correctness fix for
- * whenever the shader side is wired (see docs/d3d8-parity/02-samplers.md F2).
+ * whenever the shader side is wired.
  */
 function toWebGPUAddressMode(d3d: number): DxSamplerAddressMode {
     switch (d3d) {

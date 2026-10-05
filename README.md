@@ -72,7 +72,7 @@ Requirements: [Bun](https://bun.sh/), and a browser with WebGPU (Chrome / Edge 1
 SharedArrayBuffer.
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/jenissimo/bottleship
 cd bottleship
 bun install
 bun run dev
@@ -133,6 +133,8 @@ BottleShip is free and open source. If it brought a game back to life for you, y
 - [Importing games](docs/bundles.md) · [GOG import](docs/gog-import.md)
 - [Development & self-hosting](docs/development.md)
 - [Automation harness](docs/harness.md) — driving and observing games
+- [Child processes](docs/headless-child-processes.md) — execution, display routing and diagnostics
+- [Performance measurements](docs/performance.md) — workload and correctness contracts
 - [Contributing with coding agents](docs/contributing-with-ai.md)
 
 ## License & acknowledgements

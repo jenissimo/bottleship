@@ -357,7 +357,7 @@ export default function App() {
   const [frameAnalysisOpen, setFrameAnalysisOpen] = useState(false);
   const [statsOverlayEnabled, setStatsOverlayEnabled] = useState(false);
   const [fpuStrictEnabled, setFpuStrictEnabled] = useState(false);
-  // AOT code cache (docs/performance/sota-roadmap/05-A0-play-and-record.md). Recording is a
+  // AOT code cache. Recording is a
   // two-step ritual whose failure mode is silent — a `stop` that never ran keeps nothing —
   // so the panel shows the state rather than expecting it to be remembered.
   const [aotRecording, setAotRecording] = useState(false);

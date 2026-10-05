@@ -1,9 +1,7 @@
 /**
  * A small 32-bit x86 emitter, enough for the guestbench fixtures.
  *
- * The roadmap makes a synthetic perf fixture mandatory for every lever
- * (docs/performance/sota-roadmap/README.md, "Синтетические тесты: общая форма"), and the
- * fixtures have to be IN this repository — a demo living on one machine cannot compare two
+ * Perf fixtures have to be IN this repository — a demo living on one machine cannot compare two
  * branches. Emitting the guest code from JS is what makes that possible without a C++
  * toolchain in the loop: a fixture is a few dozen lines, its instruction mix is exact by
  * construction rather than by whatever the compiler decided, and the same source builds

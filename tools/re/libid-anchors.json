@@ -4,7 +4,7 @@
   "images": [
     {
       "image": "Speed.exe",
-      "note": "NFSU, addresses from docs/performance/library-hle-catalog-audit-2026-09-12.md (Ghidra FID Single Match)",
+      "note": "NFSU, addresses identified by Ghidra FID Single Match",
       "anchors": [
         {
           "addr": "0x00672fc8",
@@ -46,7 +46,7 @@
     },
     {
       "image": "SPEED2.EXE",
-      "note": "NFSU2, addresses from docs/performance/nfsu2-eagl-re-2026-09-12.md (Codex analysis)",
+      "note": "NFSU2, addresses identified by guest-image analysis",
       "anchors": [
         {
           "addr": "0x00669296",

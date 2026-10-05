@@ -22,7 +22,7 @@ interface DevPanelProps {
   onToggleFpuStrict: (strict: boolean) => void;
   loggingEnabled: boolean;
   onToggleLogging: () => void;
-  /** AOT code cache — see docs/performance/sota-roadmap/05-A0-play-and-record.md. */
+  /** AOT code cache. */
   aotRecording: boolean;
   aotAutoLoad: boolean;
   aotStatus: string;

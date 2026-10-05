@@ -1,7 +1,6 @@
 /**
  * idleMark / idleReport — what the worker's wall-clock was spent on over a window,
- * and specifically WHICH mechanism produced the idle the Far Cry trace showed
- * (docs/performance/sota-roadmap/08-io-idle.md).
+ * separating synchronous SAB waits from gaps between v86 ticks.
  *
  * A trace can say "12% of samples were idle" but not whether the thread was parked in
  * `Atomics.wait` inside a synchronous SAB read or waiting for the next macrotask between

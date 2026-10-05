@@ -97,8 +97,7 @@ The embedded browser is recorded by user agent; it is not labelled stock Chrome.
 The existing state/exit oracle remains necessary for a real JIT transformation: output equality
 on this fixture does not prove x86 flags, fault ordering, SMC/CoW, budget exits or callbacks.
 
-See `docs/performance/source-pair-lab-2026-09-09.md` for the laboratory inventory, first results
-and the capabilities still needed before accepting an optimization.
+See the [measurement contracts](../../../docs/performance.md) before accepting an optimization.
 
 ## Offline rotate experiment
 
@@ -125,7 +124,6 @@ The full cache version (including RAM base and codegen fingerprint), pages and s
 unchanged. The pass is opt-in and offline; it is not installed globally on the JIT hot path.
 These synthetic measurements do not establish gains in a game or on old physical hardware.
 Use `browser.html?control=identity` for the identical-byte performance control.
-Results and limitations: `docs/performance/aot-exact-rotate-2026-09-09.md`.
 
 ## Game capture on a separate origin
 
@@ -171,8 +169,7 @@ integrity-valid result does not establish independent-pair game performance.
 
 ## NFSU entry in one action
 
-Continuation guide with experiment results, current WBUF candidate and unfinished
-engine-comparison setup: [measurement contracts](../../../docs/performance/benchmark-method.md).
+Follow the [measurement contracts](../../../docs/performance.md) when comparing engines.
 
 With the dev app on `127.0.0.1:5174`, start the local evidence collector:
 

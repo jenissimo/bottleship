@@ -1,7 +1,6 @@
 /**
- * dispatchArm / dispatchMark / dispatchReport — WHICH class of transition pays the ~5% of
- * busy that the Far Cry trace attributes to dispatch
- * (docs/performance/sota-roadmap/07-dispatch-tax.md).
+ * dispatchArm / dispatchMark / dispatchReport — which class of transition pays the
+ * dispatch cost over a measured window.
  *
  * `dbg.dispatchStats()` already reads these counters, but it reports lifetime totals, it
  * stops before the memo split (indices 18-22), and a build with the counters switched off

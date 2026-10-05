@@ -52,7 +52,7 @@ export interface DeclStreamCopy {
     /** True when the source element is a raw D3DVSDT_UBYTE4-typed COLOR register (component
      *  order R,G,B,A in memory) landing in the canonical D3DCOLOR slot the FFP renderer always
      *  assumes (B,G,R,A in memory) — the copy must swap bytes 0 and 2 (R<->B), or R/B render
-     *  swapped on screen with no warning (see Finding 1, docs/d3d8-parity/04-vertex-pipeline.md). */
+     *  swapped on screen with no warning. */
     swizzleColorBytes?: boolean;
 }
 
@@ -162,8 +162,7 @@ export function declToSyntheticFvf(elements: RawVertexElement[], declStride: num
         // Multi-stream: build a canonical interleave plan. A POSITION/NORMAL/COLOR element
         // that can't fill its canonical slot still bails the WHOLE plan (those corrupt the
         // rest of the vertex if misread); a non-FLOAT2 TEXCOORD degrades PER-ELEMENT instead
-        // (Finding 2, docs/d3d8-parity/04-vertex-pipeline.md) — position/normal/color that
-        // were perfectly representable must not be thrown away over one texcoord's size.
+        // so representable position/normal/color data survives an unsupported texcoord size.
         const copies: DeclStreamCopy[] = [];
         let mappable = faithful;
         let degraded = false;

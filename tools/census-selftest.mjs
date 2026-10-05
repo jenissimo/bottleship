@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * demo_census_probe — the census's own self-test (docs/performance/sota-roadmap/10).
+ * demo_census_probe — the census's own self-test.
  *
  * A class table is only worth the decision it steers, and the way this project has been
  * burned before is a table that reports a plausible share of something other than its
