@@ -439,8 +439,8 @@ test("a static control's image is bracketed by the DC clip, not only by its own 
     // is inherited by every later test file in the same run, and the next module that
     // asks it for a measuring context (the edit control's word wrap does) gets a context
     // with no measureText and fails for a reason that has nothing to do with itself.
-    const hadImageData = "ImageData" in globalThis;
-    const hadOffscreen = "OffscreenCanvas" in globalThis;
+    const imageDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'ImageData');
+    const canvasDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'OffscreenCanvas');
     (globalThis as any).ImageData ??= class { constructor(public data: any, public width: number, public height: number) { } };
     (globalThis as any).OffscreenCanvas ??= class {
         constructor(public width: number, public height: number) { }
@@ -478,8 +478,10 @@ test("a static control's image is bracketed by the DC clip, not only by its own 
     // The DC's clip rect is the FIRST one pushed — the control rect narrows it, never widens it.
     expect(ctx.ops.find((o: Op) => o.op === "rect")!.args).toEqual([0, 0, 6, H]);
     } finally {
-        if (!hadImageData) delete (globalThis as any).ImageData;
-        if (!hadOffscreen) delete (globalThis as any).OffscreenCanvas;
+        if (imageDescriptor) Object.defineProperty(globalThis, 'ImageData', imageDescriptor);
+        else delete (globalThis as any).ImageData;
+        if (canvasDescriptor) Object.defineProperty(globalThis, 'OffscreenCanvas', canvasDescriptor);
+        else delete (globalThis as any).OffscreenCanvas;
     }
 });
 

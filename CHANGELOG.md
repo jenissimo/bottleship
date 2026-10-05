@@ -38,8 +38,8 @@
 - Removed stale release-independent plans/handoffs and a closed A/B probe from tracked files.
   Touch templates and readback diagnostics no longer run as regression scenarios. Regression
   scripts now fail when their assertions or worker steps fail.
-- Fixed Linux CI failures caused by a video-plane canvas mock leaking into EDIT control
-  tests. Canvas globals are restored after each policy test.
+- Fixed Linux CI failures caused by video-plane and GDI canvas mocks leaking into EDIT
+  control tests. Fixtures restore the original globals, including absent properties.
 - Removed engine-specific first-run file creation, runtime INI overrides and fabricated
   renderer-probe processes. Missing files report the normal error, and child programs
   execute guest code with real waitable lifetimes and shared filesystem effects.

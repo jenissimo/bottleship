@@ -46,7 +46,7 @@ class FakeContext {
 }
 
 test("DrawText keeps font smoothing for DEFAULT_QUALITY", () => {
-    const previous = globalThis.OffscreenCanvas;
+    const previous = Object.getOwnPropertyDescriptor(globalThis, 'OffscreenCanvas');
     class FakeOffscreenCanvas {
         width: number;
         height: number;
@@ -93,12 +93,13 @@ test("DrawText keeps font smoothing for DEFAULT_QUALITY", () => {
         expect(target.directFillTextCalls).toBe(1);
         expect(target.putImageDataCalls).toBe(0);
     } finally {
-        (globalThis as any).OffscreenCanvas = previous;
+        if (previous) Object.defineProperty(globalThis, 'OffscreenCanvas', previous);
+        else delete (globalThis as any).OffscreenCanvas;
     }
 });
 
 test("DrawText thresholds only explicitly NONANTIALIASED_QUALITY fonts", () => {
-    const previous = globalThis.OffscreenCanvas;
+    const previous = Object.getOwnPropertyDescriptor(globalThis, 'OffscreenCanvas');
     class FakeOffscreenCanvas {
         width: number;
         height: number;
@@ -138,6 +139,7 @@ test("DrawText thresholds only explicitly NONANTIALIASED_QUALITY fonts", () => {
         expect(target.imageSmoothingEnabled).toBe(true); // restored
         expect(target.lastDrawImageDest?.x).toBe(47);
     } finally {
-        (globalThis as any).OffscreenCanvas = previous;
+        if (previous) Object.defineProperty(globalThis, 'OffscreenCanvas', previous);
+        else delete (globalThis as any).OffscreenCanvas;
     }
 });

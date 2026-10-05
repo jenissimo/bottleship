@@ -60,6 +60,15 @@ Canvas/ImageData mock теперь ограничен двумя video-plane sui
 GitHub Actions запускается на релизном коммите. Успех старого failed run не заявляется;
 итоговый status доступен в [Actions](https://github.com/jenissimo/bottleship/actions).
 
+Первый релизный [run 37323934570](https://github.com/jenissimo/bottleship/actions/runs/37323934570)
+выявил вторую цепочку утечки с теми же 15 EDIT failures: DrawText-тест восстанавливал
+отсутствующий canvas присваиванием `undefined`, создавая свойство. GDI clip-тест проверял
+`"OffscreenCanvas" in globalThis`, устанавливал mock через `??=` и оставлял его, поскольку
+свойство ранее существовало. Оба fixtures теперь восстанавливают descriptors, включая
+исходное отсутствие свойства. Воспроизводимый начальный state `OffscreenCanvas = undefined`:
+до правки **25 pass / 15 fail**, после **40 pass / 0 fail**. Полный Windows gate повторён:
+**5227 pass / 0 fail**. Runtime EDIT не ослаблялся ради неполного тестового canvas.
+
 Дополнительный полный Linux/Bun 1.4.2 прогон: **5215 pass, 34 skip, 0 fail**.
 В локальном WSL нет Naga, поэтому соответствующие shader-проверки пропущены; это не полный
 Linux gate. Timeout для этого диагностического прогона был 15 секунд из-за медленного
@@ -70,7 +79,7 @@ Linux gate. Timeout для этого диагностического прог�
 ### Release checks
 
 - Исходный `bun run gate` до правок: **5241 pass, 0 fail**, 482 файла.
-- Финальный `bun run gate`: **5227 pass, 0 fail**, 483 файла, 41.21 с; typecheck, все validators,
+- Финальный `bun run gate`: **5227 pass, 0 fail**, 483 файла, 42.12 с; typecheck, все validators,
   native D3D9 capture gate и WGSL/Naga пройдены. Удалены тесты, подтверждавшие прежние UE1
   обходы; добавлены проверки реального child lifetime, ошибок API и восстановления родителя.
   InstallShield/container regression: **21 pass**, включая ранние дескрипторы, embedded headers
