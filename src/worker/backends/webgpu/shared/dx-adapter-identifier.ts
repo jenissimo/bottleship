@@ -6,6 +6,7 @@
 
 import { Mem } from '../../../core/memory/mem-accessor';
 import { Marshaler } from '../../../core/memory/marshaler';
+import { EmulatorConfig } from '../../../core/emulator-config-manager';
 
 export const D3DENUM_WHQL_LEVEL = 0x00000002;
 
@@ -51,24 +52,30 @@ function adapterOverride(): AdapterIdentityOverride | null {
 
 export function adapterVendorId(): number {
     const v = adapterOverride()?.vendorId;
-    return typeof v === "number" ? v >>> 0 : DEFAULT_VENDOR_ID;
+    return typeof v === "number" ? v >>> 0 : EmulatorConfig.getInstance().graphicsAdapter?.vendorId ?? DEFAULT_VENDOR_ID;
 }
 
 export function adapterDeviceId(): number {
     const v = adapterOverride()?.deviceId;
-    return typeof v === "number" ? v >>> 0 : DEFAULT_DEVICE_ID;
+    return typeof v === "number" ? v >>> 0 : EmulatorConfig.getInstance().graphicsAdapter?.deviceId ?? DEFAULT_DEVICE_ID;
 }
 
 export function adapterDescription(): string {
     const v = adapterOverride()?.description;
-    return typeof v === "string" && v.length > 0 ? v : DEFAULT_DEVICE_DESC;
+    return typeof v === "string" && v.length > 0 ? v : EmulatorConfig.getInstance().graphicsAdapter?.description ?? DEFAULT_DEVICE_DESC;
 }
 
 export function adapterDriverDll(): string {
     const v = adapterOverride()?.driver;
-    return typeof v === "string" && v.length > 0 ? v : DEFAULT_DRIVER_DLL;
+    return typeof v === "string" && v.length > 0 ? v : EmulatorConfig.getInstance().graphicsAdapter?.driver ?? DEFAULT_DRIVER_DLL;
 }
 
+export function adapterDriverVersion(): bigint {
+    const version = EmulatorConfig.getInstance().graphicsAdapter?.driverVersion;
+    return version ? version.reduce((packed, word) => (packed << 16n) | BigInt(word), 0n) : DEFAULT_DRIVER_VERSION;
+}
+
+export const DDDEVICEIDENTIFIER6_SIZE = 1064;
 export const D3DADAPTER_IDENTIFIER8_SIZE = 1068;
 
 const D3DADAPTER_IDENTIFIER8_OFFSETS = {
@@ -107,10 +114,10 @@ function writeStableAdapterIds(mem: Uint8Array, pIdentifier: number, offsets: {
     DeviceIdentifier: number;
     WHQLLevel: number;
 }, flags: number): boolean {
-    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    view.setBigUint64(pIdentifier + offsets.DriverVersion, DEFAULT_DRIVER_VERSION, true);
-
+    const version = adapterDriverVersion();
     if (
+        !Mem.writeUint32(pIdentifier + offsets.DriverVersion, Number(version & 0xffffffffn)) ||
+        !Mem.writeUint32(pIdentifier + offsets.DriverVersion + 4, Number(version >> 32n)) ||
         !Mem.writeUint32(pIdentifier + offsets.VendorId, adapterVendorId()) ||
         !Mem.writeUint32(pIdentifier + offsets.DeviceId, adapterDeviceId()) ||
         !Mem.writeUint32(pIdentifier + offsets.SubSysId, 0) ||
@@ -119,9 +126,16 @@ function writeStableAdapterIds(mem: Uint8Array, pIdentifier: number, offsets: {
         return false;
     }
 
-    for (let i = 0; i < 16; i++) {
-        if (!Mem.writeUint8(pIdentifier + offsets.DeviceIdentifier + i, i)) {
-            return false;
+    const identity = EmulatorConfig.getInstance().graphicsAdapter;
+    if (identity) {
+        // Stable opaque GUID: PCI identity + driver version in a BottleShip namespace.
+        const words = [adapterVendorId(), adapterDeviceId(), ...identity.driverVersion, 0x4757, 0x3142];
+        for (let i = 0; i < words.length; i++) {
+            if (!Mem.writeUint16(pIdentifier + offsets.DeviceIdentifier + i * 2, words[i])) return false;
+        }
+    } else {
+        for (let i = 0; i < 16; i++) {
+            if (!Mem.writeUint8(pIdentifier + offsets.DeviceIdentifier + i, i)) return false;
         }
     }
 
@@ -143,6 +157,14 @@ export function writeAdapterIdentifier8(mem: Uint8Array, pIdentifier: number, fl
     Marshaler.writeString(mem, pIdentifier + D3DADAPTER_IDENTIFIER8_OFFSETS.Description, adapterDescription(), 512);
 
     return writeStableAdapterIds(mem, pIdentifier, D3DADAPTER_IDENTIFIER8_OFFSETS, flags);
+}
+
+/** DirectDraw 4 has the DX6 layout without the trailing WHQL field. */
+export function writeAdapterIdentifier6(mem: Uint8Array, pIdentifier: number): boolean {
+    if (Mem.writeBytes(pIdentifier, new Uint8Array(DDDEVICEIDENTIFIER6_SIZE)) !== DDDEVICEIDENTIFIER6_SIZE) return false;
+    Marshaler.writeString(mem, pIdentifier, adapterDriverDll(), 512);
+    Marshaler.writeString(mem, pIdentifier + 512, adapterDescription(), 512);
+    return writeStableAdapterIds(mem, pIdentifier, D3DADAPTER_IDENTIFIER8_OFFSETS, 0);
 }
 
 export function writeAdapterIdentifier9(mem: Uint8Array, pIdentifier: number, flags: number): boolean {

@@ -104,6 +104,12 @@ full playability.
 | Serious Sam: The First Encounter | English single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
 | Worms Armageddon | Clean startup splashes, working single-player menu and quick match against the CPU; DirectDraw | ✓ |
 | System Shock 2 (original demo) | Main menu, DirectDraw | ✓ |
+| Red Faction Worldwide Demo | Entered gameplay with rendered weapon, HUD and mission messages | |
+| Star Wars Episode I: Racer demo | Rendered main menu; demo gameplay remains unverified | |
+| Discworld Noir demo | Rendered main menu; requires the installed `Discworld Noir` subdirectory | |
+| Far Cry Demo 2 (Research) | Research level playable with the WGB's AMD adapter profile; terrain, water and distance fog verified. Prepared WGB includes the engine's shader cache to shorten first level load | ✓ |
+| Tomb Raider II: Great Wall demo | Gameplay after a saved setup; cold first-run setup crashes, so not ready for the public catalog | |
+| Blade of Darkness demo | Did not pass DirectInput initialization in the observed run | |
 | Harry Potter: Chamber of Secrets | Start menu and real renderer-probe child exit; entering gameplay remains unverified | |
 | NFS Underground 2 | Rendered startup notice; did not reach the menu | |
 | Gothic USA demo | SmartHeap / debug CRT dialog; did not reach the menu | |

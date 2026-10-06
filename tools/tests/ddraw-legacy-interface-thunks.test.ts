@@ -16,7 +16,9 @@
  * dwCaps only, and every legacy version reaches the same raster-status implementation.
  */
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
+import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { createDirectDrawExports } from "../../src/worker/modules/ddraw/directdraw";
 import { createSurfaceExports } from "../../src/worker/modules/ddraw/surface";
 import { rasterStatusAt } from "../../src/worker/modules/ddraw/raster-status";
@@ -38,6 +40,9 @@ const SURFACE_PTR = 0x1000;
 const PALETTE_PTR = 0x1800;
 const DDSCAPS_TEXTURE = 0x00001000;
 const SURFACE_BITS = 0x4000;
+
+beforeEach(() => EmulatorConfig.getInstance().reset());
+afterEach(() => EmulatorConfig.getInstance().reset());
 
 function makeContext(overrides: Record<string, unknown> = {}) {
     const surfaceState: any = {
@@ -69,6 +74,7 @@ function harness() {
     const dd = createDirectDrawExports(context);
     const surf = createSurfaceExports(context);
     const mem = new Uint8Array(0x10000);
+    Mem.bind(() => mem);
     const view = new DataView(mem.buffer);
     const poison = (addr: number, dwords: number) => {
         for (let i = 0; i < dwords; i++) view.setUint32(addr + i * 4, POISON, true);
@@ -187,6 +193,23 @@ describe("GetDeviceIdentifier answers for the same machine D3D does", () => {
             expect(h.view.getUint32(OUT + DDDEVICEIDENTIFIER2.dwDeviceId, true)).toBe(DEFAULT_DEVICE_ID);
             expect(h.view.getBigUint64(OUT + DDDEVICEIDENTIFIER2.liDriverVersion, true)).toBe(DEFAULT_DRIVER_VERSION);
             expect(readString(h.mem, OUT + DDDEVICEIDENTIFIER2.szDescription)).toBe(DEFAULT_DEVICE_DESC);
+        });
+
+        test(`${iface} honors the manifest adapter without overwriting the next field`, () => {
+            EmulatorConfig.getInstance().applyFromManifest({
+                formatVersion: 2, name: 'test', entrypoint: 'rom/test.exe', emulator: {
+                    graphicsAdapter: { vendorId: 0x1002, deviceId: 0x73bf, description: 'AMD Radeon RX 6900 XT',
+                        driver: 'aticfx32.dll', driverVersion: [31, 0, 24033, 1003] },
+                },
+            });
+            const h = harness(), size = iface === 'IDirectDraw4' ? 1064 : 1068;
+            h.poison(OUT, 300);
+            expect(h.call(h.dd, `${iface}_GetDeviceIdentifier`, 0, OUT, 0)).toBe(DD_OK);
+            expect(h.view.getUint32(OUT + 1032, true)).toBe(0x1002);
+            expect(h.view.getUint32(OUT + 1036, true)).toBe(0x73bf);
+            expect(h.view.getBigUint64(OUT + 1024, true)).toBe(0x001f00005de103ebn);
+            expect(readString(h.mem, OUT)).toBe('aticfx32.dll');
+            expect(h.view.getUint32(OUT + size, true)).toBe(POISON);
         });
     }
 });

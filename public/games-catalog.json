@@ -236,5 +236,17 @@
     "year": "1999",
     "genre": "Action RPG",
     "enabled": true
+  },
+  {
+    "id": "far-cry-demo",
+    "name": "Far Cry",
+    "subtitle": "Research Demo",
+    "wgbUrl": "/apps/far-cry-demo.wgb",
+    "coverUrl": "/covers/far-cry-box.webp",
+    "description": "Explore the tropical Research island in the original second PC demo.",
+    "year": "2004",
+    "genre": "FPS",
+    "gogUrl": "https://www.gog.com/en/game/far_cry",
+    "enabled": true
   }
 ]

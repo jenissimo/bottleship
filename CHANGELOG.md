@@ -4,6 +4,8 @@
 
 ### Library and importing
 
+- Added the Far Cry Research demo to the public catalog with the original PC cover.
+
 - Added Warcraft III Demo, Quake II, American McGee's Alice, XIII, Hitman: Codename 47,
   Serious Sam: The First Encounter, Worms Armageddon and System Shock 2 demos to the catalog.
 - Demo pages with a GOG edition now explain how to launch an owned
@@ -20,6 +22,11 @@
   between equally named language files. Truncated cabinet reads fail explicitly.
 
 ### Games, graphics and sound
+
+- WGB manifests can select a complete virtual graphics-adapter identity. DirectDraw 4/7
+  and Direct3D 8/9 report the same vendor, device, driver and version.
+- The Far Cry Research demo includes stored PAK entries and its compiled shader cache,
+  reducing the measured cold level load from about 196 to 93 seconds while preserving fog.
 
 - Fixed retained splash images on 8-bit DirectDraw surfaces, including Worms Armageddon.
 - Palette presentation releases its temporary GPU buffers after submission, preventing
