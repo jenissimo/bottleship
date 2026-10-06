@@ -902,6 +902,9 @@ export class DDrawPresenter implements RenderActive {
             return;
         }
 
+        // The converter is shared with the executor. Submit its pending commands before
+        // retiring conversion buffers after this presenter's separate upload submission.
+        executor.flush();
         const encoder = device.createCommandEncoder();
         textureConverter.convertToTexture(
             encoder,
@@ -916,7 +919,11 @@ export class DDrawPresenter implements RenderActive {
             "rgba8unorm",
             palette
         );
-        queue.submit([encoder.finish()]);
+        try {
+            queue.submit([encoder.finish()]);
+        } finally {
+            textureConverter.destroyPendingAfterSubmit();
+        }
 
         // Mark as uploaded
         if (isRenderSurface(surface)) {

@@ -1085,7 +1085,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classId,
             title: windowName,
             style: dwStyle,
-            exStyle: dwExStyle,
+            exStyle: System.getInstance().windowManager.getWindow(hwnd)?.exStyle ?? dwExStyle,
             x: resolvedX,
             y: resolvedY,
             width: size.width,

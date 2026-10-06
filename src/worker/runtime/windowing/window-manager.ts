@@ -371,6 +371,11 @@ export class WindowManager {
         const system = System.getInstance();
         const creatorThreadId = system.scheduler?.getCurrentThreadId() ?? 0;
 
+        // An owned top-level window inherits its owner's topmost status, otherwise
+        // the owner would cover the popup and receive its mouse input (SetWindowPos contract).
+        if ((style & WS_CHILD) === 0 && parent && this.isTopmost(parent)) {
+            exStyle |= WS_EX_TOPMOST;
+        }
         const window: WindowObject = {
             hwnd,
             wndClass,
