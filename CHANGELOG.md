@@ -8,7 +8,7 @@
 - The Tomb Raider II demo includes its native 640 × 480, 16-bit video settings for a fresh-container launch. The unconfigured setup dialog remains a known failure.
 - CRT process termination now uses the same child hand-off and durability barrier as ExitProcess, preserving a game launched by an exiting front-end and terminating all parent threads.
 - Added Racer with real cover artwork; the Boonta Training Course race is playable.
-- Prepared the original English Discworld Noir interactive demo and real PC box artwork. Office movement and the F1 restart flow work, but the title's idle script selects omitted scenes (`bogus.scn`); the demo remains disabled in the public catalog.
+- Added the English Discworld Noir interactive demo with original PC box artwork, native installation settings, and verified saving/loading across reload. Automatic attract-mode playback is disabled in the demo's menu resource, avoiding stripped-scene `bogus.scn` errors and a blank menu on return; its executable is unchanged. The WGB downloads into OPFS before launch for reliable CRT file reads.
 
 ## 2026-10-05
 
