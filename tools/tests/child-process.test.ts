@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { System } from '../../src/worker/core/system';
+import { Msvcrt } from '../../src/worker/modules/msvcrt';
 import { CHILD_IO_BYTES, createChildVfsServer } from '../../src/worker/core/child-vfs';
 import {
     runChildProcess, startChildProcess, stopChildProcesses, pendingChildHandoff, ChildNeedsSession, type ChildBoot,
@@ -144,6 +146,37 @@ describe('isolated child lifecycle', () => {
  */
 describe('helper or session', () => {
     const request = { imagePath: 'C:\\helper.exe', commandLine: '/generate result.dat', currentDirectory: 'C:\\' };
+
+    test('CRT process exit preserves a just-launched child before its image has opened', async () => {
+        const ports: MessagePort[] = [];
+        setChildSessionPublisher(port => { ports.push(port); });
+        const worker = new FakeWorker();
+        const task = startChildProcess(filesystem(), request, () => worker as unknown as Worker);
+        const result = task.completion.catch(e => e);
+        const system = System.getInstance();
+        const wasExiting = system.isExiting;
+        const terminate = spyOn(system.scheduler, 'terminateAllThreads').mockImplementation(() => {});
+        const notify = spyOn(system, 'postProcessExitWhenDurable').mockImplementation(() => {});
+        const report = spyOn(system, 'buildProcessExitReport').mockImplementation(() => undefined as never);
+        try {
+            const crt = Object.create(Msvcrt.prototype) as { exitProcess(code: number): unknown };
+            expect(crt.exitProcess(17)).toEqual({ value: 0, terminated: true });
+            expect(terminate).toHaveBeenCalledWith(17);
+            expect(notify).toHaveBeenCalledWith({ exitCode: 17, fault: undefined });
+            expect(hasChildSession()).toBe(true);
+            await started(worker);
+            await stopChildProcesses(true);
+            expect(worker.terminated).toBe(false);
+            expect(ports).toHaveLength(1);
+            worker.exit(42);
+            expect(await result).toBe(42);
+        } finally {
+            terminate.mockRestore(); notify.mockRestore(); report.mockRestore();
+            system.isExiting = wasExiting;
+            for (const port of ports) port.close();
+            for (const message of worker.messages) message.port?.close();
+        }
+    });
 
     test.each(['window', 'parent-exit'])('live promotion on %s never reboots or repeats pre-window effects', async trigger => {
         const ports: MessagePort[] = [];

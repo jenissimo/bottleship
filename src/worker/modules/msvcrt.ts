@@ -11,6 +11,7 @@ import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatc
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
+import { shutdownProcess } from "./kernel32/process/process";
 import { VfsFileHandle } from "../runtime/filesystem/vfs";
 import {
     fpuGetST, fpuPop, fpuPush, fpuSetST0,
@@ -1340,20 +1341,10 @@ export class Msvcrt implements IModule {
 
     /** Terminating half of exit(), shared with the atexit chain's terminal step. */
     private beginProcessExit(exitCode: number): void {
-        const system = System.getInstance();
-        system.isExiting = true;
-        system.scheduler.exitThread(exitCode);
-        // C exit() ends the PROCESS, so the host gets the same notification ExitProcess
-        // sends — behind the same durability barrier. This is the path the atexit chain
-        // ends on, i.e. exactly where a game's settings write has just happened and is
-        // still sitting in the overlay's buffers.
-        let exitFault: unknown;
-        try {
-            exitFault = system.buildProcessExitReport(exitCode);
-        } catch (e) {
-            Logger.warn(LogCategory.SYSTEM, `msvcrt.exit: exit report failed: ${e}`);
-        }
-        system.postProcessExitWhenDurable({ exitCode: exitCode >>> 0, fault: exitFault });
+        // CRT termination ends every thread in this process, while children survive.
+        // Reuse ExitProcess's hand-off and durability barrier after the CRT's own
+        // callback chain; ending only the calling thread loses a launcher's live child.
+        shutdownProcess(exitCode);
     }
 
     private exitProcess(code: number): ThunkResult {

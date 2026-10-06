@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-06
+
+- Added the original English Harry Potter and the Chamber of Secrets demo and Tomb Raider II Great Wall demo, with real cover artwork and verified level movement.
+- The Tomb Raider II demo includes its native 640 × 480, 16-bit video settings for a fresh-container launch. The unconfigured setup dialog remains a known failure.
+- CRT process termination now uses the same child hand-off and durability barrier as ExitProcess, preserving a game launched by an exiting front-end and terminating all parent threads.
+- Added Racer with real cover artwork; the Boonta Training Course race is playable.
+- Prepared the original English Discworld Noir interactive demo and real PC box artwork. Office movement and the F1 restart flow work, but the title's idle script selects omitted scenes (`bogus.scn`); the demo remains disabled in the public catalog.
+
 ## 2026-10-05
 
 ### Library and importing
