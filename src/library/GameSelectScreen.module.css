@@ -213,7 +213,7 @@
     linear-gradient(160deg, var(--surf-3), var(--ink-800));
 }
 .card__glyph { font-family: var(--font-display); font-weight: 700; font-size: 3.4rem; color: var(--fg-3); }
-.card__cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.card__cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: var(--ink-800); }
 
 /* Source/subtitle badges */
 .badge {
