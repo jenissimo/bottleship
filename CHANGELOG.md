@@ -4,6 +4,8 @@
 
 ### Library and importing
 
+- Added Red Faction Worldwide Demo and both Half-Life demos (Uplink and Day One) to the public catalog with original covers.
+- Both Half-Life demos include a tested 1024 × 768, 16-bit video configuration: Direct3D for Uplink and OpenGL for Day One.
 - Added the Far Cry Research demo to the public catalog with the original PC cover.
 
 - Added Warcraft III Demo, Quake II, American McGee's Alice, XIII, Hitman: Codename 47,

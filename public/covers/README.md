@@ -15,7 +15,8 @@ Sources for the demo covers added in October 2026:
 | `serious-sam-tfe-box.jpg` | Serious Sam Classic: The First Encounter (2001) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/41050/library_600x900.jpg) |
 | `worms-armageddon-box.jpg` | Worms Armageddon (1999) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/217200/library_600x900.jpg) |
 | `system-shock2-box.jpg` | System Shock 2 (1999) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/238210/library_600x900.jpg) |
-
 | `far-cry-box.webp` | Far Cry (2004), original PC box | [XGAMER cover scan](https://www.xgamertechnologies.com/images/pcgames/FARCRY%201.webp) |
+| `red-faction-box.jpg` | Red Faction (2001) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/20530/library_600x900.jpg) |
+| `half-life-box.jpg` | Half-Life (1998); Uplink and Day One demos | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/70/library_600x900.jpg) |
 
 Artwork remains copyright of its respective owners.
