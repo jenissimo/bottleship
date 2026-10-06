@@ -327,6 +327,7 @@
     "description": "Explore Ankh-Morpork as detective Lewton in the original English PC demo.",
     "year": "1999",
     "genre": "Adventure",
-    "enabled": true
+    "enabled": true,
+    "preload": true
   }
 ]
