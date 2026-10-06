@@ -21,6 +21,7 @@
  *   <out-dir>     destination directory (created); files land under <dir-name>/<file-name>
  *   --list        only print the file table; do not extract
  *   --quiet       suppress per-file progress
+ *   --ignore-obfuscation  explicitly recover plaintext payloads with a wrong flag
  *
  * Not supported: encryption.
  */
@@ -45,10 +46,10 @@ const COMMON_HEADER_SIZE = 20;
 function parseArgs() {
   const a = process.argv.slice(2);
   if (a.length < 2) { console.error('Usage: bun tools/unshield-extract.ts <data1.hdr> <out-dir> [--list] [--quiet]'); process.exit(1); }
-  return { hdrPath: a[0]!, outDir: a[1]!, list: a.includes('--list'), quiet: a.includes('--quiet') };
+  return { hdrPath: a[0]!, outDir: a[1]!, list: a.includes('--list'), quiet: a.includes('--quiet'), ignoreObfuscation: a.includes('--ignore-obfuscation') };
 }
 
-const { hdrPath, outDir, list, quiet } = parseArgs();
+const { hdrPath, outDir, list, quiet, ignoreObfuscation } = parseArgs();
 const hdr = new Uint8Array(readFileSync(hdrPath));
 
 let info;
@@ -65,7 +66,7 @@ const volCache = new Map<number, Uint8Array>();
 function volBuf(vol: number): Uint8Array {
   if (!volCache.has(vol)) {
     const dir = dirname(hdrPath);
-    const stem = basename(hdrPath).replace(/1\.hdr$/i, '');
+    const stem = basename(hdrPath).replace(/1\.(?:hdr|cab)$/i, '');
     const path = join(dir, `${stem}${vol}.cab`);
     volCache.set(vol, new Uint8Array(readFileSync(path)));
   }
@@ -143,7 +144,7 @@ function readRaw(fd: InstallShieldFile, size: number): Uint8Array {
     const vh = volHeader(vol);
     pos = vh.firstFileOffset; volLeft = (fd.flags & FILE_COMPRESSED) ? vh.firstFileSizeCompressed : vh.firstFileSizeExpanded;
   }
-  if (fd.flags & FILE_OBFUSCATED) deobfuscate(out);
+  if (!ignoreObfuscation && (fd.flags & FILE_OBFUSCATED)) deobfuscate(out);
   return out;
 }
 

@@ -111,6 +111,8 @@ full playability.
 | Discworld Noir demo | English interactive demo with native installation settings. Office movement, map transition, saving/loading across reload, F1 restart and extended idle-menu stability verified. Automatic attract-mode playback is disabled in the demo menu resource; original executable unchanged. WGB preloads into OPFS; direct HTTP startup fails an early CRT file read | ✓ |
 | Far Cry Demo 2 (Research) | Research level playable with the WGB's AMD adapter profile; terrain, water and distance fog verified. Prepared WGB includes the engine's shader cache to shorten first level load | ✓ |
 | Tomb Raider II: Great Wall demo | Fresh-container launch enters the level; movement and turning verified. WGB includes the native 640 × 480, 16-bit Direct3D settings. Opening the unconfigured first-run setup still crashes (`0x3003`) | ✓ |
+| The Blackwell Legacy demo | Original English AGS demo: title menu, bridge introduction and Rosa’s apartment. Native saving and restoring verified; save persists across page reload | ✓ |
+| KKND2: Krossfire demo | Original 1998 demo: army selection, mission briefing, rendered Survivors mission, unit movement and native saving/loading across page reload verified; DirectDraw | ✓ |
 | Blade of Darkness demo | Did not pass DirectInput initialization in the observed run | |
 | Harry Potter and the Chamber of Secrets demo | Original English PC demo: launcher starts the real game process; entered the level, moved and collected beans. Selected English dialogue and localization files are installed in the WGB | ✓ |
 | NFS Underground 2 | Rendered startup notice; did not reach the menu | |
@@ -123,7 +125,6 @@ The following demo installers have been acquired but are not ready for the publi
 
 | Demo source | Packaging result |
 |---|---|
-| [KKND2: Krossfire](https://archive.org/details/KKND2_zip) | ZIP contains an InstallShield cabinet and loose media; cabinet extraction fails with an invalid deflate code table |
 | [Cossacks: European Wars](https://archive.org/details/cossacks_202006) | Wise installer; this format is not supported by the project reader |
 | [Mafia](https://archive.org/details/Mafia_201405) | RAR4 self-extractor; the project reader supports RAR5 stored entries |
 | [Carmageddon II](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | ZIP contains an older InstallShield data.z payload, outside the supported cabinet formats |

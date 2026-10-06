@@ -116,6 +116,7 @@ class Inflater {
         private readonly src: Uint8Array,
         private readonly start: number,
         private readonly out: Uint8Array,
+        private readonly storedComplement = true,
     ) {
         this.pos = start;
     }
@@ -159,16 +160,17 @@ class Inflater {
     }
 
     private stored(): void {
-        // Discard the partial byte, then LEN / ~LEN.
+        // NSIS 2's zlib fork omits ~LEN; ordinary DEFLATE must still validate it.
         this.bitbuf = 0;
         this.bitcnt = 0;
-        if (this.pos + 4 > this.src.length) {
+        const headerSize = this.storedComplement ? 4 : 2;
+        if (this.pos + headerSize > this.src.length) {
             throw new Bail('truncated', `stored-block header at in+${this.pos - this.start}`);
         }
         const len = this.src[this.pos] | (this.src[this.pos + 1] << 8);
         const nlen = this.src[this.pos + 2] | (this.src[this.pos + 3] << 8);
-        this.pos += 4;
-        if (len !== (~nlen & 0xffff)) {
+        this.pos += headerSize;
+        if (this.storedComplement && len !== (~nlen & 0xffff)) {
             throw new Bail('data-error', `stored-block length complement mismatch at in+${this.pos - this.start - 4}`);
         }
         if (this.pos + len > this.src.length) {
@@ -294,7 +296,15 @@ class Inflater {
 
 /** Decode a raw DEFLATE stream (no zlib/gzip wrapper) into `out`. */
 export function inflateRawSync(src: Uint8Array, out: Uint8Array, srcStart = 0): InflateOutcome {
-    const inf = new Inflater(src, srcStart, out);
+    return inflateInto(new Inflater(src, srcStart, out));
+}
+
+/** NSIS 2 zlib: raw DEFLATE with two-byte stored-block lengths (no complement). */
+export function inflateNsisSync(src: Uint8Array, out: Uint8Array): InflateOutcome {
+    return inflateInto(new Inflater(src, 0, out, false));
+}
+
+function inflateInto(inf: Inflater): InflateOutcome {
     try {
         inf.run();
     } catch (e) {

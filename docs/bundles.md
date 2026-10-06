@@ -90,6 +90,18 @@ BottleShip is the engine; you supply games you legally own. Three ways to get a 
    [`docs/gog-import.md`](gog-import.md).
 3. **`make-wgb`** from a game directory you already have, as above.
 
+## Other installer payloads
+
+`bun tools/nsis-extract.ts installer.exe output-dir [--list]` reads static file sections
+from ANSI NSIS 2 installers using non-solid zlib compression. It checks the installer
+CRC and follows `$INSTDIR`/`$OUTDIR` paths and static variable aliases without running
+the installer. Unicode, solid and other codecs, conditional file sections and dynamic
+paths are rejected. Generated configuration, registry actions and plugins are not executed.
+
+For a cabinet whose payload is demonstrably plaintext despite its obfuscation flag,
+`unshield-extract.ts --ignore-obfuscation` provides explicit recovery; normal extraction
+honors the flag. Verify the original payload and retain size/checksum validation.
+
 ## A note on distribution
 
 The bundled/showcase set is limited to content that is legal to redistribute (freeware,

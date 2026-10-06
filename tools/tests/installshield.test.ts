@@ -20,6 +20,7 @@ import {
     extractInstallShield,
     detectInstallShieldStem,
     FILE_COMPRESSED,
+    FILE_OBFUSCATED,
 } from "@bottleship/formats/installshield";
 
 const CAB_SIGNATURE = 0x28635349;
@@ -199,6 +200,42 @@ describe("InstallShield 5 parser", () => {
 });
 
 describe("InstallShield 5 extraction", () => {
+    test('plaintext recovery is explicit and still verifies the digest', async () => {
+        const payload = new TextEncoder().encode('MZ-plaintext-with-a-wrong-cabinet-flag');
+        for (const compress of [false, true]) {
+            const {header, cab} = buildIs5([''], [{name:'game.exe',dirIndex:0,data:payload,compress}]);
+            const dv = new DataView(header.buffer);
+            const base = COMMON_HEADER_SIZE + dv.getUint32(COMMON_HEADER_SIZE + 0x0c, true);
+            const descriptor = base + dv.getUint32(base + 4, true);
+            dv.setUint16(descriptor + 8, (compress ? FILE_COMPRESSED : 0) | FILE_OBFUSCATED, true);
+            const volumes = new Map([[1, cab]]);
+            await expect(extractInstallShield(header, volumes, {inflateRaw:nodeInflate})).rejects.toThrow();
+            const restored = await extractInstallShield(header, volumes, {inflateRaw:nodeInflate,ignoreObfuscation:true});
+            expect(restored.get('game.exe')).toEqual(payload);
+            header[descriptor + 0x2a]! ^= 1;
+            await expect(extractInstallShield(header, volumes, {inflateRaw:nodeInflate,ignoreObfuscation:true})).rejects.toThrow(/MD5 mismatch/);
+        }
+    });
+
+    test('normal extraction decodes genuinely obfuscated payloads', async () => {
+        const payload = new TextEncoder().encode('MZ-genuinely-obfuscated');
+        for (const compress of [false, true]) {
+            const {header, cab} = buildIs5([''], [{name:'game.exe',dirIndex:0,data:payload,compress}]);
+            const dv = new DataView(header.buffer);
+            const base = COMMON_HEADER_SIZE + dv.getUint32(COMMON_HEADER_SIZE + 0x0c, true);
+            const descriptor = base + dv.getUint32(base + 4, true);
+            dv.setUint16(descriptor + 8, (compress ? FILE_COMPRESSED : 0) | FILE_OBFUSCATED, true);
+            const start = dv.getUint32(descriptor + 0x26, true);
+            const size = dv.getUint32(descriptor + 0x0e, true);
+            for (let i = 0; i < size; i++) {
+                const shifted = (cab[start + i]! + i % 0x47) & 0xff;
+                cab[start + i] = ((shifted << 2) | (shifted >>> 6)) ^ 0xd5;
+            }
+            const restored = await extractInstallShield(header, new Map([[1,cab]]), {inflateRaw:nodeInflate});
+            expect(restored.get('game.exe')).toEqual(payload);
+        }
+    });
+
     test('container extraction accepts an IS5 descriptor embedded in data1.cab', async () => {
         const payload = new TextEncoder().encode('MZ-test-game');
         const {header,cab} = buildIs5([''], [{name:'game.exe',dirIndex:0,data:payload,compress:true}]);
