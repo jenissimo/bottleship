@@ -206,7 +206,7 @@
     "id": "serious-sam-tfe-demo",
     "name": "Serious Sam: The First Encounter",
     "subtitle": "Demo",
-    "wgbUrl": "/apps/serious-sam-tfe-demo.wgb?v=20261006-en",
+    "wgbUrl": "/apps/serious-sam-tfe-demo-en.wgb",
     "coverUrl": "/covers/serious-sam-tfe-box.jpg",
     "description": "Original English First Encounter demo. A first-launch information dialog appears once.",
     "year": "2001",
