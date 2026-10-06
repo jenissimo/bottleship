@@ -248,5 +248,39 @@
     "genre": "FPS",
     "gogUrl": "https://www.gog.com/en/game/far_cry",
     "enabled": true
+  },
+  {
+    "id": "red-faction-demo",
+    "name": "Red Faction",
+    "subtitle": "Worldwide Demo",
+    "wgbUrl": "/apps/red-faction-demo.wgb",
+    "coverUrl": "/covers/red-faction-box.jpg",
+    "description": "The original Worldwide Demo: escape the mines of Mars with Volition’s Geo-Mod shooter.",
+    "year": "2001",
+    "genre": "FPS",
+    "gogUrl": "https://www.gog.com/en/game/red_faction",
+    "enabled": true
+  },
+  {
+    "id": "hl-day-one-demo",
+    "name": "Half-Life",
+    "subtitle": "Day One Demo",
+    "wgbUrl": "/apps/hl-day-one-demo.wgb",
+    "coverUrl": "/covers/half-life-box.jpg",
+    "description": "Begin Gordon Freeman's first day at Black Mesa in the original 1998 PC demo.",
+    "year": "1998",
+    "genre": "FPS",
+    "enabled": true
+  },
+  {
+    "id": "hl-uplink-demo",
+    "name": "Half-Life",
+    "subtitle": "Uplink Demo",
+    "wgbUrl": "/apps/hl-uplink-demo.wgb",
+    "coverUrl": "/covers/half-life-box.jpg",
+    "description": "Play the standalone Uplink mission from the original 1999 PC demo.",
+    "year": "1999",
+    "genre": "FPS",
+    "enabled": true
   }
 ]

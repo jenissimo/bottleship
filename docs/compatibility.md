@@ -104,7 +104,9 @@ full playability.
 | Serious Sam: The First Encounter | English single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
 | Worms Armageddon | Clean startup splashes, working single-player menu and quick match against the CPU; DirectDraw | ✓ |
 | System Shock 2 (original demo) | Main menu, DirectDraw | ✓ |
-| Red Faction Worldwide Demo | Entered gameplay with rendered weapon, HUD and mission messages | |
+| Half-Life: Uplink demo | Fresh-container launch reaches a rendered level and HUD; movement verified. Direct3D at 1024 × 768, 16-bit color; OpenGL exits during level load in the observed run | ✓ |
+| Half-Life: Day One demo | Fresh-container launch reaches the rendered Black Mesa tram introduction; OpenGL at 1024 × 768 | ✓ |
+| Red Faction Worldwide Demo | Entered gameplay with rendered weapon, HUD and mission messages | ✓ |
 | Star Wars Episode I: Racer demo | Rendered main menu; demo gameplay remains unverified | |
 | Discworld Noir demo | Rendered main menu; requires the installed `Discworld Noir` subdirectory | |
 | Far Cry Demo 2 (Research) | Research level playable with the WGB's AMD adapter profile; terrain, water and distance fog verified. Prepared WGB includes the engine's shader cache to shorten first level load | ✓ |
@@ -116,6 +118,19 @@ full playability.
 | Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
+
+The following demo installers have been acquired but are not ready for the public catalog:
+
+| Demo source | Packaging result |
+|---|---|
+| [KKND2: Krossfire](https://archive.org/details/KKND2_zip) | ZIP contains an InstallShield cabinet and loose media; cabinet extraction fails with an invalid deflate code table |
+| [Cossacks: European Wars](https://archive.org/details/cossacks_202006) | Wise installer; this format is not supported by the project reader |
+| [Mafia](https://archive.org/details/Mafia_201405) | RAR4 self-extractor; the project reader supports RAR5 stored entries |
+| [Carmageddon II](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | ZIP contains an older InstallShield data.z payload, outside the supported cabinet formats |
+| [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | Downloaded installer is not recognized by the current format reader |
+
+Time-limited shareware trials are excluded from the demo catalog, including Alice Greenfingers,
+Montezuma, Natalie Brooks, Farm Frenzy and House of 1000 Doors.
 
 ## Stretch / in progress
 
