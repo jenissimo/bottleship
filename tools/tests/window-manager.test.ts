@@ -150,6 +150,28 @@ describe("WindowManager Z-order", () => {
         wm.getWindow(b)!.visible = true;
         expect(wm.getZOrder()).toEqual([b, a]);
     });
+
+    test("an owned popup inherits topmost and receives input above its owner", () => {
+        const owner = mkTopLevel(wm, 0, 0, 100, 100, { topmost: true });
+        const popup = mkOwned(wm, owner);
+        const button = mkChild(wm, popup, 10, 10, 50, 50);
+        const unrelated = mkTopLevel(wm, 0, 0, 100, 100);
+        expect(wm.getWindow(popup)!.exStyle & WS_EX_TOPMOST).toBe(WS_EX_TOPMOST);
+        expect(wm.getZOrder()).toEqual([popup, owner, unrelated]);
+        expect(wm.windowFromPoint(25, 25)).toBe(button);
+        wm.setActiveWindow(owner);
+        expect(wm.windowFromPoint(25, 25)).toBe(button);
+    });
+
+    test("topmost ownership propagates through nested popups, not child windows", () => {
+        const owner = mkTopLevel(wm, 0, 0, 100, 100, { topmost: true });
+        const popup = mkOwned(wm, owner);
+        const nested = mkOwned(wm, popup);
+        const child = mkChild(wm, nested, 10, 10, 50, 50);
+        expect(wm.getWindow(nested)!.exStyle & WS_EX_TOPMOST).toBe(WS_EX_TOPMOST);
+        expect(wm.getWindow(child)!.exStyle & WS_EX_TOPMOST).toBe(0);
+        expect(wm.windowFromPoint(25, 25)).toBe(child);
+    });
 });
 
 describe("WindowManager WindowFromPoint", () => {

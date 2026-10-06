@@ -651,12 +651,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         // CPU-First: Deterministic mode assignment
         // mode="GPU_ONLY" ONLY for pure 3D render targets (DDSCAPS_3DDEVICE)
         // mode="CPU" for everything else (default)
-        // NOTE: Primary/backbuffer with 3DDEVICE must stay GPU_ONLY — D3D renders to GPU texture
+        // Indexed surfaces must retain palette indices in guest memory: an RGBA GPU clear
+        // cannot be read back as indices before a subsequent CPU color-key blit.
+        // NOTE: True-color primary/backbuffer with 3DDEVICE must stay GPU_ONLY — D3D renders to GPU texture
         // and switching to CPU mode causes Flip to overwrite D3D content with zeros (black screen).
         // If a hybrid engine needs Lock(), the existing demotion logic in
         // IDirectDrawSurface7_Lock handles GPU_ONLY→CPU transition automatically.
         const initialMode: "CPU" | "GPU_ONLY" =
-            (isD3dRenderTarget && !isSystemMemory) ? "GPU_ONLY" : "CPU";
+            (isD3dRenderTarget && !isSystemMemory && normalizedDesc.pixelFormat!.bpp !== 8) ? "GPU_ONLY" : "CPU";
 
         // Create RenderSurface (mutable surface for rendering, backbuffers, etc.)
         // CPU-First architecture: surfacePtr always authoritative, GPU is ephemeral cache
