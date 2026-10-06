@@ -21,6 +21,10 @@
 
 ### Games, graphics and sound
 
+- Fixed retained splash images on 8-bit DirectDraw surfaces, including Worms Armageddon.
+- Palette presentation releases its temporary GPU buffers after submission, preventing
+  continuous GPU memory growth. Owned topmost dialogs now receive menu clicks correctly.
+- Repacked the Serious Sam: The First Encounter demo with its original English text and audio.
 - Expanded the compatibility list with the builds reported working in the current game
   collection, including Far Cry, Mafia, GTA: Vice City, NFS Underground 2, XIII, Painkiller,
   KKND2, Serious Sam, Deponia and Chains of Satinav. Demo-only coverage is stated explicitly.
