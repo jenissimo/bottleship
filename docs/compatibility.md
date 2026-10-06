@@ -107,12 +107,12 @@ full playability.
 | Half-Life: Uplink demo | Fresh-container launch reaches a rendered level and HUD; movement verified. Direct3D at 1024 × 768, 16-bit color; OpenGL exits during level load in the observed run | ✓ |
 | Half-Life: Day One demo | Fresh-container launch reaches the rendered Black Mesa tram introduction; OpenGL at 1024 × 768 | ✓ |
 | Red Faction Worldwide Demo | Entered gameplay with rendered weapon, HUD and mission messages | ✓ |
-| Star Wars Episode I: Racer demo | Rendered main menu; demo gameplay remains unverified | |
-| Discworld Noir demo | Rendered main menu; requires the installed `Discworld Noir` subdirectory | |
+| Star Wars Episode I: Racer demo | Entered the Boonta Training Course race; acceleration and steering verified. Maintainer confirms correct rendering | ✓ |
+| Discworld Noir demo | Original English interactive demo reaches Lewton's office; walking, hotspot labels, the map transition and the F1 restart flow verified. The title's idle script still selects omitted scenes and fails with `bogus.scn`; held out of the public catalog pending a fix | |
 | Far Cry Demo 2 (Research) | Research level playable with the WGB's AMD adapter profile; terrain, water and distance fog verified. Prepared WGB includes the engine's shader cache to shorten first level load | ✓ |
-| Tomb Raider II: Great Wall demo | Gameplay after a saved setup; cold first-run setup crashes, so not ready for the public catalog | |
+| Tomb Raider II: Great Wall demo | Fresh-container launch enters the level; movement and turning verified. WGB includes the native 640 × 480, 16-bit Direct3D settings. Opening the unconfigured first-run setup still crashes (`0x3003`) | ✓ |
 | Blade of Darkness demo | Did not pass DirectInput initialization in the observed run | |
-| Harry Potter: Chamber of Secrets | Start menu and real renderer-probe child exit; entering gameplay remains unverified | |
+| Harry Potter and the Chamber of Secrets demo | Original English PC demo: launcher starts the real game process; entered the level, moved and collected beans. Selected English dialogue and localization files are installed in the WGB | ✓ |
 | NFS Underground 2 | Rendered startup notice; did not reach the menu | |
 | Gothic USA demo | SmartHeap / debug CRT dialog; did not reach the menu | |
 | Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |

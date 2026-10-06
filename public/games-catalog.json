@@ -282,5 +282,51 @@
     "year": "1999",
     "genre": "FPS",
     "enabled": true
+  },
+  {
+    "id": "hp-cos-demo",
+    "name": "Harry Potter and the Chamber of Secrets",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/harry-potter-cos-demo.wgb",
+    "coverUrl": "/covers/harry-potter-cos-box.jpg",
+    "description": "Explore Hogwarts and practise spellcasting in the original English PC demo.",
+    "year": "2002",
+    "genre": "Action-Adventure",
+    "enabled": true
+  },
+  {
+    "id": "tomb-raider2-great-wall-demo",
+    "name": "Tomb Raider II",
+    "subtitle": "Great Wall Demo",
+    "wgbUrl": "/apps/tomb-raider2-great-wall-demo.wgb",
+    "coverUrl": "/covers/tomb-raider2-box.jpg",
+    "description": "Explore the Great Wall as Lara Croft in the original PC demo, with a ready-to-play video configuration.",
+    "year": "1997",
+    "genre": "Action-Adventure",
+    "gogUrl": "https://www.gog.com/en/game/tomb_raider_123",
+    "enabled": true
+  },
+  {
+    "id": "starwars-racer-demo",
+    "name": "Star Wars: Episode I Racer",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/starwars-racer-demo.wgb",
+    "coverUrl": "/covers/starwars-racer-box.jpg",
+    "description": "Race Anakin's podracer on the Boonta Training Course in the original PC demo.",
+    "year": "1999",
+    "genre": "Racing",
+    "gogUrl": "https://www.gog.com/en/game/star_wars_episode_i_racer",
+    "enabled": true
+  },
+  {
+    "id": "discworld-noir-demo",
+    "name": "Discworld Noir",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/discworld-noir-demo.wgb",
+    "coverUrl": "/covers/discworld-noir-box.jpg",
+    "description": "Explore Ankh-Morpork as detective Lewton in the original English PC demo.",
+    "year": "1999",
+    "genre": "Adventure",
+    "enabled": false
   }
 ]

@@ -18,5 +18,9 @@ Sources for the demo covers added in October 2026:
 | `far-cry-box.webp` | Far Cry (2004), original PC box | [XGAMER cover scan](https://www.xgamertechnologies.com/images/pcgames/FARCRY%201.webp) |
 | `red-faction-box.jpg` | Red Faction (2001) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/20530/library_600x900.jpg) |
 | `half-life-box.jpg` | Half-Life (1998); Uplink and Day One demos | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/70/library_600x900.jpg) |
+| `harry-potter-cos-box.jpg` | Harry Potter and the Chamber of Secrets (2002), North American PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/r2_e5ca311c-670b-44e5-a448-e8c7cf9158d5.jpg) |
+| `tomb-raider2-box.jpg` | Tomb Raider II (1997), original game | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/225300/library_600x900.jpg) |
+| `starwars-racer-box.jpg` | Star Wars: Episode I Racer (1999), North American PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/c34f5c6b-ca6b-4448-bdda-5b83754ef11d.jpg) |
+| `discworld-noir-box.jpg` | Discworld Noir (1999), United Kingdom PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/fb015c13-8e09-44ca-ad04-5caa04028257.jpg) |
 
 Artwork remains copyright of its respective owners.
