@@ -77,6 +77,7 @@ function withBlockCache(source: ZipSource): ZipSource {
     return cache;
 }
 import type { QualityConfig } from "../../core/quality-config";
+import type { GraphicsAdapterConfig } from "../../core/graphics-adapter-config";
 
 /** Presentation metadata baseline carried in the bundle (overridable by the editorial catalog / user). */
 export interface WgbMeta {
@@ -109,6 +110,8 @@ export interface WgbManifest {
     rom?: string;
     registry?: string;
     emulator?: {
+        /** Virtual adapter identity used by legacy driver databases. */
+        graphicsAdapter?: GraphicsAdapterConfig;
         osVersion?: {
             major: number;
             minor: number;

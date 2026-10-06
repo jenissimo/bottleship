@@ -16,4 +16,6 @@ Sources for the demo covers added in October 2026:
 | `worms-armageddon-box.jpg` | Worms Armageddon (1999) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/217200/library_600x900.jpg) |
 | `system-shock2-box.jpg` | System Shock 2 (1999) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/238210/library_600x900.jpg) |
 
+| `far-cry-box.webp` | Far Cry (2004), original PC box | [XGAMER cover scan](https://www.xgamertechnologies.com/images/pcgames/FARCRY%201.webp) |
+
 Artwork remains copyright of its respective owners.

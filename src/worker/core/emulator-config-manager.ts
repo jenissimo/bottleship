@@ -1,4 +1,5 @@
-import { WgbManifest, WgbWriteFileSpec } from "../runtime/filesystem/wgb-loader";
+import type { WgbManifest, WgbWriteFileSpec } from "../runtime/filesystem/wgb-loader";
+import { normalizeGraphicsAdapter, type GraphicsAdapterConfig } from "./graphics-adapter-config";
 import { Logger, LogCategory } from "./logger";
 import {
     EMU_MEMORY_SIZE,
@@ -270,6 +271,7 @@ export class EmulatorConfig {
 
     // OS Version configuration
     public osVersion = { ...DEFAULT_OS_VERSION };
+    public graphicsAdapter: GraphicsAdapterConfig | null = null;
 
     // Screen resolution configuration
     public screenResolution = { ...DEFAULT_SCREEN_RESOLUTION };
@@ -427,6 +429,11 @@ export class EmulatorConfig {
         }
 
         const config = manifest.emulator;
+
+        if (config.graphicsAdapter !== undefined) {
+            this.graphicsAdapter = normalizeGraphicsAdapter(config.graphicsAdapter);
+            if (!this.graphicsAdapter) Logger.warn(LogCategory.SYSTEM, 'EmulatorConfig: Invalid graphics adapter identity');
+        }
 
         // Apply OS version override
         if (config.osVersion) {
@@ -679,6 +686,7 @@ export class EmulatorConfig {
      */
     reset(): void {
         this.osVersion = { ...DEFAULT_OS_VERSION };
+        this.graphicsAdapter = null;
         this.screenResolution = { ...DEFAULT_SCREEN_RESOLUTION };
         this.supportedResolutions = [...DEFAULT_DISPLAY_MODES];
         this.memory = {

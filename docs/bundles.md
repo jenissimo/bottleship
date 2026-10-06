@@ -63,6 +63,24 @@ bun tools/wgb.ts patch-manifest game.wgb …  # (alias: pm)
 
 ## Bringing your own game
 
+`manifest.emulator.graphicsAdapter` selects the virtual adapter identity exposed by
+DirectDraw 4/7 and Direct3D 8/9. Legacy engines use it to select driver paths. Supply
+the complete identity: `vendorId`, `deviceId`, `description`, `driver` (DLL basename),
+and `driverVersion` (four 16-bit version numbers). For example:
+
+```json
+"graphicsAdapter": {
+  "vendorId": 4098,
+  "deviceId": 29631,
+  "description": "AMD Radeon RX 6900 XT",
+  "driver": "aticfx32.dll",
+  "driverVersion": [31, 0, 24033, 1003]
+}
+```
+
+Rendering capabilities still come from BottleShip's renderer. Omitting the identity
+uses the default adapter; loading another bundle clears the previous override.
+
 BottleShip is the engine; you supply games you legally own. Three ways to get a game in:
 
 1. **Load File…** in the UI — drop a `.wgb`, a raw game folder, or an installer.
