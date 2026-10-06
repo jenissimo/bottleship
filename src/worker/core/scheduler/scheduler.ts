@@ -417,6 +417,8 @@ export class Scheduler {
      *  Returns true if a restore was applied (CPU state modified). */
     public onPollAsyncRestores: ((cpu: V86Cpu, source?: string) => boolean) | null = null;
     public onHasPendingAsyncRestores: (() => boolean) | null = null;
+    /** GetMessage's promise parks as ASYNC_THUNK, but its queue can be woken by a USER timer. */
+    public onHasMessageWaiters: (() => boolean) | null = null;
     /** True when the thread owns a live suspended-thunk frame (a JS-driven pump like
      *  DialogBoxParamA). Lets the spin-loop safety net park such a thread WAITING between
      *  pump callbacks — the pump's next invokeCallback wakes it via
@@ -4221,7 +4223,10 @@ export class Scheduler {
         // activeCount>0 to break it, so the hang would be silent. Pump wall-clock virtual
         // time so the wheel fires at native cadence — faithful, since these pumps are
         // wall-clock-paced on real Windows.
-        if (anyNonAsyncWaiter && this.timerWheel.activeCount > 0) {
+        // GetMessage's async slow path waits on the message queue rather than WaitEngine.
+        // Its ASYNC_THUNK park still needs wall-paced time for SetTimer to deliver WM_TIMER.
+        // Other async operations retain their own clock/restore ownership.
+        if (this.timerWheel.activeCount > 0 && (anyNonAsyncWaiter || this.onHasMessageWaiters?.())) {
             needsIdlePump = true;
         }
         return needsIdlePump;

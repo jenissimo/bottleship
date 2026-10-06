@@ -44,6 +44,7 @@ import {
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { hasFpuSimdDirtyFlag } from "../../src/worker/core/fpu-helper";
 import { System } from "../../src/worker/core/system";
+import { MessageQueue } from "../../src/worker/runtime/windowing/message-queue";
 import { preemptionManager, PreemptionManager } from "../../src/worker/core/cpu/preemption-manager";
 
 const ALL_STATES: ThreadState[] = [
@@ -1996,6 +1997,34 @@ describe("scheduler/shouldPumpIdleVirtualTime — wheel-driven wakeups (audio-pu
         // Only an ASYNC_THUNK waiter exists (woken by its JS promise) → no non-async waiter
         // for the wheel to wake → don't pump.
         expect((s as any).shouldPumpIdleVirtualTime()).toBe(false);
+    });
+
+    test("a sole async GetMessage waiter receives its USER timer while the guest is stopped", async () => {
+        const s = new Scheduler();
+        const t = inject(s, mkThread(1, ThreadState.WAITING), {});
+        t.waitInfo = { reason: WaitReason.ASYNC_THUNK, handles: [], waitAll: false } as any;
+        const queue = new MessageQueue();
+        s.onHasMessageWaiters = () => queue.hasWaiters();
+        let virtualMs = 0;
+        (s as any).timeService = {
+            isVirtualTimeActive: () => true,
+            nowMs: () => virtualMs,
+            advanceVirtualTime: (ms: number) => { virtualMs += ms; },
+        };
+        const message = queue.waitForMessage(1);
+        s.timerWheel.add(5, false, TimerKind.USER32_TIMER,
+            () => queue.enqueue(0x10001, 0x113, 2, 0, 0, 0, 1), 0);
+
+        s.pollTimeouts(); // establish the stopped guest's wall-clock anchor
+        (s as any).idleAnchorWallMs -= 20;
+        s.pollTimeouts();
+
+        const delivered = await message;
+        expect(delivered.message).toBe(0x113);
+        expect(delivered.hwnd).toBe(0x10001);
+        expect(delivered.wParam).toBe(2);
+        expect(s.idlePumpStats.pumps).toBe(2);
+        expect(queue.hasWaiters()).toBe(false);
     });
 });
 
