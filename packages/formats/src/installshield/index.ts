@@ -149,6 +149,9 @@ interface VolumeHeaderView {
 }
 
 export interface ExtractOptions {
+    /** Explicit recovery for cabinets whose obfuscation flag marks plaintext bytes.
+     * Size and MD5 verification still apply; normal extraction honors the flag. */
+    ignoreObfuscation?: boolean;
     /** Verify each file against its stored expanded size (default true). */
     verifySize?: boolean;
     /** Verify each file against its stored MD5 if present (default true). */
@@ -536,6 +539,7 @@ function readRaw(
     compressed: boolean,
     volumes: Map<number, Uint8Array>,
     major: number,
+    ignoreObfuscation = false,
 ): Uint8Array {
     const out = new Uint8Array(size);
     let written = 0;
@@ -567,7 +571,7 @@ function readRaw(
         volLeft = compressed ? vh.firstFileSizeCompressed : vh.firstFileSizeExpanded;
     }
 
-    if (fd.flags & FILE_OBFUSCATED) deobfuscate(out);
+    if (!ignoreObfuscation && (fd.flags & FILE_OBFUSCATED)) deobfuscate(out);
     return out;
 }
 
@@ -584,20 +588,21 @@ async function extractFile(
     volumes: Map<number, Uint8Array>,
     major: number,
     inflate: (c: Uint8Array) => Promise<Uint8Array> | Uint8Array,
+    ignoreObfuscation: boolean,
 ): Promise<Uint8Array | null> {
     if ((fd.flags & FILE_INVALID) || fd.dataOffset === 0 || !fd.name) return null;
     if (fd.linkFlags & LINK_PREV) {
         const prev = files[fd.linkPrev];
-        return prev ? extractFile(prev, files, volumes, major, inflate) : null;
+        return prev ? extractFile(prev, files, volumes, major, inflate, ignoreObfuscation) : null;
     }
 
     if (!(fd.flags & FILE_COMPRESSED)) {
-        return readRaw(fd, fd.expanded, false, volumes, major);
+        return readRaw(fd, fd.expanded, false, volumes, major, ignoreObfuscation);
     }
 
     // compressed: stream of [u16 len][len bytes raw-deflate] chunks
     // (the default `unshield_file_save` path — applies to both v5 and v6).
-    const raw = readRaw(fd, fd.compressed, true, volumes, major);
+    const raw = readRaw(fd, fd.compressed, true, volumes, major, ignoreObfuscation);
     const rv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
     const parts: Uint8Array[] = [];
     let off = 0;
@@ -705,7 +710,7 @@ export async function extractInstallShield(
             // External/loose media file — bytes are not in the cabinet; ask the caller.
             data = opts.resolveExternal ? await opts.resolveExternal(fd, outPath) : null;
         } else {
-            data = await extractFile(fd, info.files, volumes, info.major, inflate);
+            data = await extractFile(fd, info.files, volumes, info.major, inflate, opts.ignoreObfuscation ?? false);
         }
         if (!data) {
             // Unresolved external file (no resolveExternal hook, or not found on media):

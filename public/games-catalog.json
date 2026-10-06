@@ -329,5 +329,29 @@
     "genre": "Adventure",
     "enabled": true,
     "preload": true
+  },
+  {
+    "id": "blackwell-legacy-demo",
+    "name": "The Blackwell Legacy",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/blackwell-legacy-demo.wgb",
+    "coverUrl": "/covers/blackwell-legacy-box.jpg",
+    "description": "Meet Rosa Blackwell and Joey Mallone in the original English adventure demo.",
+    "year": "2006",
+    "genre": "Adventure",
+    "gogUrl": "https://www.gog.com/en/game/blackwell_bundle",
+    "enabled": true
+  },
+  {
+    "id": "kknd2-demo",
+    "name": "KKND2: Krossfire",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/kknd2-demo.wgb",
+    "coverUrl": "/covers/kknd2-box.jpg",
+    "description": "Lead the Survivors, Evolved or Series 9 in the original real-time strategy demo.",
+    "year": "1998",
+    "genre": "RTS",
+    "gogUrl": "https://www.gog.com/en/game/krush_kill_n_destroy_2_krossfire",
+    "enabled": true
   }
 ]
