@@ -5,7 +5,7 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-10-05**. Working statuses include maintainer reports; every title has not
+Updated **2026-10-06**. Working statuses include maintainer reports; every title has not
 been retested for this release. Observed demo stages are listed separately below. Successful
 GOG extraction does not establish gameplay coverage for that installer edition.
 
@@ -101,8 +101,8 @@ full playability.
 | American McGee's Alice | Main menu, OpenGL | ✓ |
 | XIII UK demo | Rendered menu, D3D8 | ✓ |
 | Hitman: Codename 47 revision 2 | Mission briefing, Direct3D; original OpenGL setup fails pixel-format selection | ✓ |
-| Serious Sam: The First Encounter | Russian single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
-| Worms Armageddon | Main menu, DirectDraw | ✓ |
+| Serious Sam: The First Encounter | English single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
+| Worms Armageddon | Clean startup splashes, working single-player menu and quick match against the CPU; DirectDraw | ✓ |
 | System Shock 2 (original demo) | Main menu, DirectDraw | ✓ |
 | Harry Potter: Chamber of Secrets | Start menu and real renderer-probe child exit; entering gameplay remains unverified | |
 | NFS Underground 2 | Rendered startup notice; did not reach the menu | |
