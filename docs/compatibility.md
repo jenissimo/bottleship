@@ -108,7 +108,7 @@ full playability.
 | Half-Life: Day One demo | Fresh-container launch reaches the rendered Black Mesa tram introduction; OpenGL at 1024 × 768 | ✓ |
 | Red Faction Worldwide Demo | Entered gameplay with rendered weapon, HUD and mission messages | ✓ |
 | Star Wars Episode I: Racer demo | Entered the Boonta Training Course race; acceleration and steering verified. Maintainer confirms correct rendering | ✓ |
-| Discworld Noir demo | Original English interactive demo includes native installation registry settings and save directories. Office movement, map transition, saving, loading across reload and F1 restart verified. The title's idle script still selects omitted scenes and fails with `bogus.scn`; held out of the public catalog pending a fix | |
+| Discworld Noir demo | English interactive demo with native installation settings. Office movement, map transition, saving/loading across reload, F1 restart and extended idle-menu stability verified. Automatic attract-mode playback is disabled in the demo menu resource; original executable unchanged | ✓ |
 | Far Cry Demo 2 (Research) | Research level playable with the WGB's AMD adapter profile; terrain, water and distance fog verified. Prepared WGB includes the engine's shader cache to shorten first level load | ✓ |
 | Tomb Raider II: Great Wall demo | Fresh-container launch enters the level; movement and turning verified. WGB includes the native 640 × 480, 16-bit Direct3D settings. Opening the unconfigured first-run setup still crashes (`0x3003`) | ✓ |
 | Blade of Darkness demo | Did not pass DirectInput initialization in the observed run | |
