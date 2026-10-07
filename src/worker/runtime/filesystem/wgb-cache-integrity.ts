@@ -27,4 +27,3 @@ export function hasZipEocd(sah: SyncAccessHandleLike, size: number): boolean {
     }
     return false;
 }
-
