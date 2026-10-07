@@ -90,6 +90,10 @@ far too much log output to grep. So the harness gives you structured views inste
   the stream to disk.
 - **Surfaces & textures.** Dump a specific guest surface or texture to a PNG when a screenshot
   of the composited canvas isn't enough.
+- **D3D9 draw capture.** `captureFrame({ backend: "d3d9", timeoutMs: 5000 })`
+  records the next complete frame, including draws executed by the separate render worker.
+  Keep the guest running while capturing. `maxVerts` and `maxIndexedVerts` control vertex
+  sample sizes; concurrent captures fail explicitly, and a timeout disarms the recording.
 - **Emitted JIT code.** `jitBytes` captures the wasm module bytes the JIT emits for a set of hot
   guest pages and diffs two captures — per-section sizes, declared locals, first differing
   offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is

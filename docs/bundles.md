@@ -92,6 +92,18 @@ BottleShip is the engine; you supply games you legally own. Three ways to get a 
 
 ## Other installer payloads
 
+`bun tools/msi-extract.ts installer.msi output-dir [--root INSTALLDIR] [--list]`
+reads a selected installed tree from MSI File, Component and Directory tables. It
+restores long filenames and extracts embedded cabinets or cabinets beside the MSI,
+checking installed file sizes and MSI file hashes when present. Custom actions,
+registry writes and generated files are not executed; loose, non-cabinet media is
+unsupported. `--root` selects the MSI Directory key to extract beneath.
+
+The shared container extraction pipeline also detects MSI packages inside folders
+or archives and CAB self-extracting EXEs, including direct game payloads and
+PackageForTheWeb wrappers around InstallShield media. Cabinet decompression uses
+the project's existing CAB reader and its supported codecs.
+
 `bun tools/nsis-extract.ts installer.exe output-dir [--list]` reads static file sections
 from ANSI NSIS 2 installers using non-solid zlib compression. It checks the installer
 CRC and follows `$INSTDIR`/`$OUTDIR` paths and static variable aliases without running

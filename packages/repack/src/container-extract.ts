@@ -14,7 +14,7 @@
  *   1. EA WinZip self-installer   (`compressed.zip` payload + `common_filelist.txt` manifest)
  *   2. InstallShield 5/6 cabinet  (`<stem>1.hdr` + `<stem>{N}.cab`)
  *   3. FreeArc archive            (`ArC\x01` magic — `.pak`/`.arc`/`.bin` repack payload)
- *   4. PackageForTheWeb self-extractor (MSCF cabinet appended to a stub → InstallShield disk images)
+ *   4. CAB self-extractor (MSCF appended to a stub → installer or direct game payload)
  *   5. Inno Setup, self-contained (a `setup.exe` whose data is embedded in the exe)
  * The EA format is probed FIRST: its container also carries an `eauninstall.exe`/`setup.exe`
  * shell that the Inno probe would waste time parsing, and its signature is unambiguous.
@@ -41,8 +41,9 @@ import { findCabinet, parseCabHeader, extractCabToMap, type CabInflateBlock } fr
 import { detectFreeArc, extractFreeArcToMap, FreeArcUnsupportedError } from "@bottleship/formats/freearc";
 import { unzipToMap } from "@bottleship/formats/zip";
 import { isGogJunk } from "./gog-filter";
+import { extractMsiPayload } from './msi-extract';
 
-export type InstallerVia = "ea-winzip" | "installshield" | "inno" | "freearc" | "pftw" | "none";
+export type InstallerVia = "ea-winzip" | "installshield" | "inno" | "freearc" | "pftw" | "cab-sfx" | "msi" | "none";
 
 export interface ContainerExtractOptions {
     /** inno-lzma WASM bytes — required to unpack an Inno installer OR a FreeArc archive
@@ -439,39 +440,37 @@ const innoFormat: InstallerFormat<{ bytes: Uint8Array; parsed: InnoParseResult; 
  * reader (a lower-priority format above) turns those disk images into game files.
  * Probed before Inno because a PFTW stub is an MZ exe the Inno scanner would parse.
  */
+function findCabSelfExtractor(files: Map<string, Uint8Array>, requireInstaller: boolean): { exe: Uint8Array } | null {
+    for (const [rel, data] of files) {
+        if (!rel.toLowerCase().endsWith('.exe') || data.length < 4 || data[0] !== 0x4d || data[1] !== 0x5a) continue;
+        const off = findCabinet(data);
+        if (off == null || off === 0) continue;
+        const cab = parseCabHeader(data, off);
+        if (!cab) continue;
+        if (requireInstaller && !cab.files.some(f => /1\.hdr$|setup\.(?:inx|ins)$/i.test(f.name))) continue;
+        return { exe: data };
+    }
+    return null;
+}
+
+async function unwrapCabSelfExtractor(match: { exe: Uint8Array }, ctx: ContainerExtractOptions) {
+    const cabFiles = await extractCabToMap(match.exe, {
+        inflateBlock: ctx.cabInflateBlock,
+        onProgress: (done, total, name) => {
+            ctx.onProgress?.(total > 0 ? Math.round((done / total) * 100) : 0, `Unwrapping ${name}`);
+        },
+    });
+    return extractInstallerFromFiles(cabFiles, ctx);
+}
+
 const pftwFormat: InstallerFormat<{ exe: Uint8Array }> = {
     id: "pftw",
     label: "InstallShield PackageForTheWeb self-extractor",
     detect(files) {
-        // An appended MSCF whose file table names an InstallShield disk image
-        // (`*1.hdr` / `setup.inx`) — parseCabHeader is cheap (no decompression).
-        for (const [rel, data] of files) {
-            const base = (rel.split(/[\\/]/).pop() ?? rel).toLowerCase();
-            if (!base.endsWith(".exe")) continue;
-            if (data.length < 4 || data[0] !== 0x4d || data[1] !== 0x5a) continue; // not MZ
-            const off = findCabinet(data);
-            if (off == null) continue;
-            const cab = parseCabHeader(data, off);
-            if (!cab) continue;
-            const hasInstaller = cab.files.some((f) => {
-                const n = f.name.toLowerCase();
-                return /1\.hdr$/.test(n) || n.endsWith("setup.inx") || n.endsWith("setup.ins");
-            });
-            if (hasInstaller) return { exe: data };
-        }
-        return null;
+        return findCabSelfExtractor(files, true);
     },
     async extract(_files, match, ctx) {
-        const cabFiles = await extractCabToMap(match.exe, {
-            inflateBlock: ctx.cabInflateBlock,
-            onProgress: (done, total, name) => {
-                const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-                ctx.onProgress?.(pct, `Unwrapping ${name}`);
-            },
-        });
-        // The cabinet holds InstallShield disk images — recurse so the installShield
-        // format (or another) turns them into the real game files.
-        const inner = await extractInstallerFromFiles(cabFiles, ctx);
+        const inner = await unwrapCabSelfExtractor(match, ctx);
         return {
             gameFiles: inner.gameFiles,
             note: `PackageForTheWeb → ${inner.note}`,
@@ -479,11 +478,45 @@ const pftwFormat: InstallerFormat<{ exe: Uint8Array }> = {
     },
 };
 
+/** CAB self-extractors may contain the installed tree directly, without an InstallShield script. */
+const cabSfxFormat: InstallerFormat<{ exe: Uint8Array }> = {
+    id: 'cab-sfx',
+    label: 'Microsoft Cabinet self-extractor',
+    detect: files => findCabSelfExtractor(files, false),
+    async extract(_files, match, ctx) {
+        const inner = await unwrapCabSelfExtractor(match, ctx);
+        return { gameFiles: inner.gameFiles, note: `CAB self-extractor → ${inner.note}` };
+    },
+};
+
+const msiFormat: InstallerFormat<{ name: string; bytes: Uint8Array }> = {
+    id: 'msi',
+    label: 'MSI cabinet payload',
+    detect(files) {
+        let best: {name: string; bytes: Uint8Array} | null = null;
+        for (const [name, bytes] of files) {
+            if (!/\.msi$/i.test(name) || bytes.length < 8 || bytes[0] !== 0xd0 || bytes[1] !== 0xcf || bytes[2] !== 0x11 || bytes[3] !== 0xe0) continue;
+            // A media root may include smaller prerequisite MSIs alongside the game.
+            if (!best || bytes.length > best.bytes.length) best = {name, bytes};
+        }
+        return best;
+    },
+    async extract(files, match, ctx) {
+        const index = new Map([...files].map(([name, bytes]) => [normSlash(name).toLowerCase(), bytes]));
+        const root = dirOf(match.name);
+        const gameFiles = await extractMsiPayload(match.bytes, name => index.get((root + normSlash(name)).toLowerCase()) ?? null, {
+            inflateBlock: ctx.cabInflateBlock,
+            onProgress: (done, total, name) => ctx.onProgress?.(Math.round(done / total * 100), `Extracting ${name}`),
+        });
+        return {gameFiles, note: 'MSI File/Component/Directory tables → INSTALLDIR (custom actions not executed)'};
+    },
+};
+
 /**
  * The format registry. Detection runs top-to-bottom; the first match wins. Order encodes
  * priority — see the module header for why FreeArc precedes Inno.
  */
-const INSTALLER_FORMATS: InstallerFormat<any>[] = [eaWinzipFormat, installShieldFormat, freeArcFormat, pftwFormat, innoFormat];
+const INSTALLER_FORMATS: InstallerFormat<any>[] = [eaWinzipFormat, msiFormat, installShieldFormat, freeArcFormat, pftwFormat, cabSfxFormat, innoFormat];
 
 // --- the recursion ------------------------------------------------------------------
 
