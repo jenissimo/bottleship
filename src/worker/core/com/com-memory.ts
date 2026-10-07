@@ -8,10 +8,12 @@ const COM_TOTAL_SIZE = COM_GUARD_SIZE + COM_OBJECT_SIZE + COM_GUARD_SIZE;
 
 interface ComMemoryAlloc {
     allocSystemBlock(size: number): number;
+    readonly systemPoolGeneration?: number;
 }
 
 interface ComMemoryFree {
     freeSystemBlock(addr: number, size: number): void;
+    readonly systemPoolGeneration?: number;
 }
 
 // ─── vtable ownership ────────────────────────────────────────────────────────
@@ -155,17 +157,16 @@ class OwnerBlockPool {
 
 const ownerPools = new Map<string, OwnerBlockPool>();
 
-// Every address here belongs to ONE MemoryManager's system-object arena. A worker that
-// builds a second process (a launcher re-execing the real exe is the normal case, not an
-// edge one) gets a fresh arena, and a block address carried over from the previous one
-// points at whatever the new layout put there. The old code could not have this problem —
-// it handed blocks back to MemoryManager.freeSystemBlock, which dies with the process —
-// so the pools have to be told when the process underneath them changed.
+// Pool addresses belong to one arena generation. Resetting an allocator in place
+// invalidates its addresses even though the MemoryManager identity is unchanged.
 let poolArenaOwner: object | null = null;
+let poolArenaGeneration = -1;
 
-function ensurePoolEpoch(memory: object): void {
-    if (poolArenaOwner === memory) return;
+function ensurePoolEpoch(memory: ComMemoryAlloc | ComMemoryFree): void {
+    const generation = memory.systemPoolGeneration ?? 0;
+    if (poolArenaOwner === memory && poolArenaGeneration === generation) return;
     poolArenaOwner = memory;
+    poolArenaGeneration = generation;
     ownerPools.clear();
     releasedBlocks.clear();
     freeBlocks.clear();
