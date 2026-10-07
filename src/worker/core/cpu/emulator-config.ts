@@ -558,7 +558,8 @@ export const EMU_D3D_DEFAULT_CAPS = {
 
     // Texture stages
     wMaxTextureBlendStages: 8,
-    wMaxSimultaneousTextures: 8,
+    // The cascade has eight arithmetic stages, but only four texture samplers.
+    wMaxSimultaneousTextures: 4,
 };
 
 // Video DLL support: when false (default), binkw32/smackw32 are handled by HLE stubs
