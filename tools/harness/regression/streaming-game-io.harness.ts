@@ -10,9 +10,10 @@ const mode = (process.env.IO_MODE ?? "stream+fill") as WgbIoMode;
 if (!["stream", "stream+fill"].includes(mode)) throw new Error("IO_MODE must be stream or stream+fill");
 const caseId = process.env.IO_CASE ?? `acceptance-${Date.now()}`;
 const port = process.env.BS_SIDECAR_PORT ?? "3001";
-const url = /^[A-Za-z]:[\\/]/.test(wgb)
-    ? `http://localhost:${port}/wgb?ioCase=${encodeURIComponent(caseId)}&path=${encodeURIComponent(wgb)}`
-    : wgb;
+const gameUrl = (path: string) => /^[A-Za-z]:[\\/]/.test(path)
+    ? `http://localhost:${port}/wgb?ioCase=${encodeURIComponent(caseId)}&path=${encodeURIComponent(path)}`
+    : path;
+const url = gameUrl(wgb);
 const root = resolve("logs", process.env.BS_TAB ?? "streaming-game-io");
 mkdirSync(root, { recursive: true });
 const evidence: unknown[] = [];
@@ -36,6 +37,8 @@ async function snapshot(label: string) {
     const scene = result.named.sceneProbe as any;
     evidence.push({ label, result });
     await Bun.write(resolve(root, `${caseId}.game-io.json`), JSON.stringify({ url, mode, evidence }, null, 2));
+    const shot = await harness().shot({ save: `${caseId}.${label}.png` }).run();
+    if (!shot.ok) throw new Error(`${label}: screenshot failed: ${JSON.stringify(shot.error)}`);
     if (!(state.screen?.presentSerial > 0) || !(scene.brightness > 1)) throw new Error(`${label}: no rendered scene`);
     if (io.armed && (!io.ioWorker.chunkOutcomesSumOk || io.asyncChannel.failed || io.guest.timeouts || io.ioWorker.diskWriteFailures)) {
         throw new Error(`${label}: invalid I/O ledger or failed reads: ${JSON.stringify(io)}`);
@@ -81,7 +84,15 @@ try {
     const warm = await snapshot("reopened");
     if (mode === "stream+fill" && warm.armed) throw new Error("Full cache reopen still uses network streaming");
     if (mode === "stream" && (!warm.armed || !warm.ioWorker.chunksDiskHit)) throw new Error("Sparse reopen did not serve persisted chunks");
-    console.log("PASS: cold game I/O, valid ledgers, persistent reopen and rendered scenes");
+    if (process.env.SWITCH_WGB) {
+        const switched = await harness().evalPage("window.__ioSwitchMarker = 1")
+            .openWgb(gameUrl(process.env.SWITCH_WGB), { reload: false, io: { mode: "stream" } })
+            .tickFrames(30, { timeoutMs: 180_000 })
+            .evalPage("window.__ioSwitchMarker === 1").run();
+        if (!switched.ok || switched.named.evalPage !== true) throw new Error(`Game switch reloaded the page or failed: ${JSON.stringify(switched.error)}`);
+        await snapshot("switched");
+    }
+    console.log("PASS: cold game I/O, valid ledgers, persistent reopen, rendered scenes and requested inputs/switch");
 } finally {
     closeHarnessConnection();
 }
