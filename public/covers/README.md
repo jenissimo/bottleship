@@ -24,5 +24,7 @@ Sources for the demo covers added in October 2026:
 | `discworld-noir-box.jpg` | Discworld Noir (1999), United Kingdom PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/fb015c13-8e09-44ca-ad04-5caa04028257.jpg) |
 | `blackwell-legacy-box.jpg` | The Blackwell Legacy (2006), original game | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/80330/library_600x900.jpg) |
 | `kknd2-box.jpg` | KKND2: Krossfire (1998), original game | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/1292180/library_600x900.jpg) |
+| `bards-tale-box.jpg` | The Bard's Tale (2005), original North American PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/fdd2db64-d4ff-4078-bbec-8f9ab1d62ef8.jpg) |
+| `deponia-box.jpg` | Deponia (2012), original game | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/214340/library_600x900.jpg) |
 
 Artwork remains copyright of its respective owners.

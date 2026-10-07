@@ -74,6 +74,17 @@ beforeEach(() => {
 });
 
 describe("pre-populated GetProcAddress cache", () => {
+    test("warming cannot expose debug-only symbols on a release CRT", () => {
+        const msvcrt = hleImageBase("msvcrt")!;
+        for (const name of ["_msize_dbg", "_malloc_dbg", "_CrtDbgReport"]) {
+            // The shared handler remains available for direct debug-CRT imports.
+            expect(hleExportBindingAddress(gen, "msvcrt", name)).toBeDefined();
+            expect(getProcAddress(msvcrt, name)).toBe(0);
+            expect(System.getInstance().process!.lastError).toBe(127);
+            expect(getProcAddress(msvcrt, name)).toBe(0);
+        }
+        expect(getProcAddress(msvcrt, "_msize")).not.toBe(0);
+    });
     test("a data export answers its registered address, not the declared stub", () => {
         const msvcrt = hleImageBase("msvcrt")!;
         expect(msvcrt).toBeDefined();

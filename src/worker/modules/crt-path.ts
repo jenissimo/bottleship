@@ -38,16 +38,22 @@ function qualifyDrive(path: string): string {
     return "C:\\" + path.replace(/^\\+/, "");
 }
 
+/** CRT and WinAPI share the process working directory; only roots retain a separator. */
+function currentDirectory(): string {
+    const path = qualifyDrive(System.getInstance().fileSystem.currentDir || "C:\\");
+    const trimmed = path.replace(/[\\/]+$/, "");
+    return /^[A-Za-z]:$/.test(trimmed) ? trimmed + "\\" : trimmed;
+}
+
 export function registerCrtPathExports(exports: Record<string, ThunkImplementation>, host: CrtPathHost): CrtPathFns {
 
     function getcwd(buffer: number, maxLen: number): number {
-        const system = System.getInstance();
         // Both _getcwd and _getdcwd return a DRIVE-QUALIFIED absolute path on Windows, so
         // qualify here — once, before the size is chosen. Doing it in the _getdcwd wrapper
         // instead only covered the caller-supplied-buffer form, so a cwd without a drive
         // came back qualified through one form and bare through the other, and the
         // NULL-buffer form could not have been fixed up anyway (its block is already sized).
-        const cwd = qualifyDrive((system as any).currentDirectory || "C:\\");
+        const cwd = currentDirectory();
         // maxLen is a signed int. `>>> 0` turns _getcwd(NULL, -1) into a 4 GiB malloc; the
         // real CRT validates it and sets EINVAL.
         if ((maxLen | 0) <= 0) {
@@ -80,8 +86,7 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
         let full = rel.replace(/\//g, "\\");
 
         if (!full.match(/^[A-Za-z]:/)) {
-            const system = System.getInstance();
-            const cwd = (system as any).currentDirectory || "C:\\";
+            const cwd = currentDirectory();
             if (full.startsWith("\\")) {
                 full = cwd.slice(0, 2) + full; // drive letter from CWD
             } else {
@@ -101,6 +106,7 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
             }
         }
         full = result.join("\\");
+        if (/^[A-Za-z]:$/.test(full)) full += "\\";
 
         if (!absPath) {
             // Same ownership contract as getcwd(NULL): malloc the buffer and return it.
@@ -149,8 +155,10 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
     function chdir(pathPtr: number): number {
         if (!pathPtr) { host.setErrno(22); return -1; }
         const path = host.readCString(pathPtr, 512);
-        const system = System.getInstance();
-        (system as any).currentDirectory = path;
+        if (!System.getInstance().fileSystem.setCurrentDirectory(path)) {
+            host.setErrno(2); // ENOENT
+            return -1;
+        }
         Logger.log(LogCategory.SYSTEM, `msvcrt._chdir("${path}")`);
         return 0;
     }

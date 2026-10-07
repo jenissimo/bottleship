@@ -359,6 +359,7 @@ export class Msvcrt implements IModule {
             this.vsnwprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
 
         exports["_open"] = (ctx, mem, args) => this.open(args[0] ?? 0, args[1] ?? 0);
+        exports["_wopen"] = (ctx, mem, args) => this.open(args[0] ?? 0, args[1] ?? 0, true);
         exports["_sopen"] = (ctx, mem, args) => this.sopen(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
         exports["_close"] = (ctx, mem, args) => this.close(args[0] ?? 0);
         exports["_chsize"] = (ctx, mem, args) => this.chsize(args[0] ?? 0, args[1] ?? 0);
@@ -1783,8 +1784,10 @@ export class Msvcrt implements IModule {
         return (flags & mask) !== 0 ? 1 : 0;
     }
 
-    private open(pathPtr: number, oflag: number): number {
-        const path = this.readCString(pathPtr, 512);
+    private open(pathPtr: number, oflag: number, wide = false): number {
+        // _wopen differs only in the filename encoding; flags and fd ownership
+        // follow the same path as _open (MSVC CRT open-wopen contract).
+        const path = wide ? this.readWString(pathPtr, 512) : this.readCString(pathPtr, 512);
         if (!path) {
             this.setErrno(2);
             return -1;

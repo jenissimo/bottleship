@@ -534,6 +534,9 @@ export interface OpenGLContext {
     unpackSkipPixels: number;
     unpackSkipRows: number;
     packAlignment: number;
+    packRowLength: number;
+    packSkipPixels: number;
+    packSkipRows: number;
 
     // Color mask
     colorMaskR: boolean; colorMaskG: boolean; colorMaskB: boolean; colorMaskA: boolean;
@@ -793,6 +796,9 @@ export function createOpenGLContext(process: Process): OpenGLContext {
         unpackSkipPixels: 0,
         unpackSkipRows: 0,
         packAlignment: 4,
+        packRowLength: 0,
+        packSkipPixels: 0,
+        packSkipRows: 0,
 
         colorMaskR: true, colorMaskG: true, colorMaskB: true, colorMaskA: true,
 

@@ -43,6 +43,7 @@ import {
     NAME_STACK_MAX_DEPTH,
 } from "./constants";
 import { Logger, LogCategory } from "../../core/logger";
+import { GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS } from "./constants";
 
 const GL_RED_BITS = 0x0D52;
 const GL_GREEN_BITS = 0x0D53;
@@ -204,6 +205,9 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
             case GL_COLOR_WRITEMASK: writeInts([ctx.colorMaskR ? 1 : 0, ctx.colorMaskG ? 1 : 0, ctx.colorMaskB ? 1 : 0, ctx.colorMaskA ? 1 : 0]); break;
             case GL_UNPACK_ALIGNMENT: writeInt(ctx.unpackAlignment); break;
             case GL_PACK_ALIGNMENT: writeInt(ctx.packAlignment); break;
+            case GL_PACK_ROW_LENGTH: writeInt(ctx.packRowLength); break;
+            case GL_PACK_SKIP_PIXELS: writeInt(ctx.packSkipPixels); break;
+            case GL_PACK_SKIP_ROWS: writeInt(ctx.packSkipRows); break;
             case GL_FOG_MODE: writeInt(ctx.fogMode); break;
             case GL_POLYGON_MODE: writeInts([ctx.polygonModeFront, ctx.polygonModeBack]); break;
             case GL_RGBA_MODE: writeInt(1); break;
@@ -457,7 +461,6 @@ export function createQueryExports(ctx: OpenGLContext): Record<string, ThunkImpl
         return 0;
     };
 
-    exports['glGetTexImage'] = (): number => 0;
     exports['glGetPointerv'] = (): number => 0;
     exports['glAreTexturesResident'] = (): number => GL_TRUE;
 

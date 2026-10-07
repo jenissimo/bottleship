@@ -306,6 +306,7 @@ export const msvcrtModule: ModuleDescriptor = {
         makeThiscall("?name@type_info@@QBEPBDXZ", 0),
         makeThiscall("?raw_name@type_info@@QBEPBDXZ", 0),
         makeFunc("_open", 2),
+        makeFunc("_wopen", 2),
         makeFunc("_sopen", 4),
         makeFunc("_close", 1),
         makeFunc("_chsize", 2),
