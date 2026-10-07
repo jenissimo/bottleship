@@ -13,6 +13,7 @@ import { markJoystickInputLost } from '../../modules/dinput/device-presence';
 import { broadcastGamepadDeviceChange } from '../../modules/user32/device-notify';
 import { GamepadPresenceTracker } from './gamepad-presence';
 import { isExclusiveMouseAcquired } from '../../core/pointer-policy';
+import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import {
     GUEST_POLLED_KEYS_BASE,
     GUEST_POLLED_KEYS_COUNT,
@@ -554,8 +555,7 @@ export class InputManager {
             this.lastSabMouseX = mouseX;
             this.lastSabMouseY = mouseY;
             const confined = clampToCursorClip(mouseX, mouseY);
-            this.currentMouseX = confined.x;
-            this.currentMouseY = confined.y;
+            this.commitCursorPosition(confined.x, confined.y);
         }
         this.currentButtons   = buttons;
 
@@ -973,8 +973,7 @@ export class InputManager {
     moveCursorTo(x: number, y: number): boolean {
         const confined = clampToCursorClip(x | 0, y | 0);
         const displaced = confined.x !== this.currentMouseX || confined.y !== this.currentMouseY;
-        this.currentMouseX = confined.x;
-        this.currentMouseY = confined.y;
+        this.commitCursorPosition(confined.x, confined.y);
         this.lastMouseX = confined.x;
         this.lastMouseY = confined.y;
         if (this.shouldEnqueueMessages?.() ?? true) {
@@ -1150,8 +1149,7 @@ export class InputManager {
         this.lastMouseY = 0;
         this.lastButtons = 0;
         this.lastMouseWheel = 0;
-        this.currentMouseX = 0;
-        this.currentMouseY = 0;
+        this.commitCursorPosition(0, 0);
         this.lastSabMouseX = 0;
         this.lastSabMouseY = 0;
         this.currentButtons = 0;
@@ -1626,8 +1624,15 @@ export class InputManager {
      *  pointer is placed, so the clip rect still binds. */
     setMousePosition(x: number, y: number): void {
         const confined = clampToCursorClip(x | 0, y | 0);
-        this.currentMouseX = confined.x;
-        this.currentMouseY = confined.y;
+        this.commitCursorPosition(confined.x, confined.y);
+    }
+
+    /** GetCursorPos can run in WASM again within this tick, including after SetCursorPos.
+     * Publish at the mutation, before callbacks/messages can observe the old position. */
+    private commitCursorPosition(x: number, y: number): void {
+        this.currentMouseX = x;
+        this.currentMouseY = y;
+        hypercallDataManager.updateCursorData(x, y);
     }
 
     /**

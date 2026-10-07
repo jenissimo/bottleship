@@ -303,6 +303,9 @@ export const GL_SCISSOR_BOX = 0x0C10;
 
 // Pixel Store
 export const GL_PACK_ALIGNMENT = 0x0D05;
+export const GL_PACK_ROW_LENGTH = 0x0D02;
+export const GL_PACK_SKIP_ROWS = 0x0D03;
+export const GL_PACK_SKIP_PIXELS = 0x0D04;
 export const GL_UNPACK_ALIGNMENT = 0x0CF5;
 export const GL_UNPACK_ROW_LENGTH = 0x0CF2;
 export const GL_UNPACK_SKIP_PIXELS = 0x0CF4;

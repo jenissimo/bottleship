@@ -353,5 +353,29 @@
     "genre": "RTS",
     "gogUrl": "https://www.gog.com/en/game/krush_kill_n_destroy_2_krossfire",
     "enabled": true
+  },
+  {
+    "id": "bards-tale-demo",
+    "name": "The Bard's Tale",
+    "subtitle": "Original PC Demo",
+    "wgbUrl": "/apps/bards-tale-demo.wgb",
+    "coverUrl": "/covers/bards-tale-box.jpg",
+    "description": "Explore the tutorial and Mountain Tomb in the original English 2005 PC action-RPG demo.",
+    "year": "2005",
+    "genre": "Action RPG",
+    "gogUrl": "https://www.gog.com/en/game/the_bards_tale",
+    "enabled": true
+  },
+  {
+    "id": "deponia-demo",
+    "name": "Deponia",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/deponia-demo.wgb",
+    "coverUrl": "/covers/deponia-box.jpg",
+    "description": "Meet Rufus on Deponia in the original English adventure demo.",
+    "year": "2012",
+    "genre": "Adventure",
+    "gogUrl": "https://www.gog.com/en/game/deponia",
+    "enabled": true
   }
 ]

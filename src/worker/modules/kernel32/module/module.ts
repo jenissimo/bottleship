@@ -1309,6 +1309,15 @@ function initModuleFunctions(): void {
             return finish(0);
         }
 
+        // Export visibility is a module contract, so it must precede both the
+        // warmed address cache and synthetic PE export tables.
+        const hleName = hleModuleNameByBase(hModule);
+        if (!isOrdinal && hleName && RELEASE_CRT_MODULE_RE.test(hleName)
+            && DEBUG_CRT_ONLY_EXPORTS.has(procName.toLowerCase())) {
+            system.process!.lastError = 127;
+            return finish(0);
+        }
+
         const cacheKey = buildGetProcCacheKey(hModule, procName, isOrdinal, ordinal);
         const cached = getProcAddressCache.get(cacheKey);
         if (cached !== undefined && cached !== 0) {

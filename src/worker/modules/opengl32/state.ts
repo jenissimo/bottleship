@@ -22,6 +22,7 @@ import {
 } from "./context";
 import {
     GL_RGBA, GL_RGB, GL_BGR, GL_BGRA, GL_UNSIGNED_BYTE, GL_QUADS, GL_COLOR_BUFFER_BIT, GL_TRIANGLES,
+    GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS,
     GL_NO_ERROR, GL_INVALID_ENUM, GL_INVALID_VALUE,
     GL_DEPTH_TEST, GL_BLEND, GL_ALPHA_TEST, GL_CULL_FACE, GL_TEXTURE_2D,
     GL_FOG, GL_SCISSOR_TEST, GL_LIGHTING, GL_LIGHT0,
@@ -234,6 +235,15 @@ function emitScissorColorClear(ctx: OpenGLContext): void {
 }
 
 export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImplementation> {
+    function validPixelStore(pname: number, param: number): boolean {
+        const alignment = pname === GL_PACK_ALIGNMENT || pname === GL_UNPACK_ALIGNMENT;
+        if ((alignment && param !== 1 && param !== 2 && param !== 4 && param !== 8)
+            || (!alignment && param < 0)) {
+            ctx.error = GL_INVALID_VALUE;
+            return false;
+        }
+        return true;
+    }
     const getMem = () => ctx.process.getCurrentMemory();
 
     return {
@@ -754,25 +764,33 @@ export function createStateExports(ctx: OpenGLContext): Record<string, ThunkImpl
         glPixelStorei: (_c, _m, args) => {
             const pname = args[0] >>> 0;
             const param = args[1] | 0;
+            if (!validPixelStore(pname, param)) return 0;
             switch (pname) {
                 case GL_UNPACK_ALIGNMENT: ctx.unpackAlignment = param; break;
                 case GL_UNPACK_ROW_LENGTH: ctx.unpackRowLength = param; break;
                 case GL_UNPACK_SKIP_PIXELS: ctx.unpackSkipPixels = param; break;
                 case GL_UNPACK_SKIP_ROWS: ctx.unpackSkipRows = param; break;
                 case GL_PACK_ALIGNMENT: ctx.packAlignment = param; break;
+                case GL_PACK_ROW_LENGTH: ctx.packRowLength = param; break;
+                case GL_PACK_SKIP_PIXELS: ctx.packSkipPixels = param; break;
+                case GL_PACK_SKIP_ROWS: ctx.packSkipRows = param; break;
             }
             return 0;
         },
 
         glPixelStoref: (_c, _m, args) => {
             const pname = args[0] >>> 0;
-            const param = bitsToF32(args[1]) | 0;
+            const param = Math.round(bitsToF32(args[1]));
+            if (!validPixelStore(pname, param)) return 0;
             switch (pname) {
                 case GL_UNPACK_ALIGNMENT: ctx.unpackAlignment = param; break;
                 case GL_UNPACK_ROW_LENGTH: ctx.unpackRowLength = param; break;
                 case GL_UNPACK_SKIP_PIXELS: ctx.unpackSkipPixels = param; break;
                 case GL_UNPACK_SKIP_ROWS: ctx.unpackSkipRows = param; break;
                 case GL_PACK_ALIGNMENT: ctx.packAlignment = param; break;
+                case GL_PACK_ROW_LENGTH: ctx.packRowLength = param; break;
+                case GL_PACK_SKIP_PIXELS: ctx.packSkipPixels = param; break;
+                case GL_PACK_SKIP_ROWS: ctx.packSkipRows = param; break;
             }
             return 0;
         },
