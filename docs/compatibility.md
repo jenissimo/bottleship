@@ -119,7 +119,7 @@ full playability.
 | Blade of Darkness demo | Did not pass DirectInput initialization in the observed run | |
 | Harry Potter and the Chamber of Secrets demo | Original English PC demo: launcher starts the real game process; entered the level, moved and collected beans. Selected English dialogue and localization files are installed in the WGB | ✓ |
 | NFS Underground 2 | Rendered startup notice; did not reach the menu | |
-| Gothic USA demo | Menu, world, Diego subtitles and dialogue choices verified after correcting Direct3D sampler capabilities. A background-thread crash after ending the conversation blocks gameplay verification; not published | |
+| Gothic USA demo 1.08h | English demo: Diego dialogue exit, rendered subtitles/HUD, movement and native saving verified. WGB recreates the required save directories; slots and thumbnails survive page reload. Restoring a saved game can stall in a resource-thread wait; further stability testing is pending | ✓ |
 | Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.

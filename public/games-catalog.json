@@ -377,5 +377,17 @@
     "genre": "Adventure",
     "gogUrl": "https://www.gog.com/en/game/deponia",
     "enabled": true
+  },
+  {
+    "id": "gothic-demo",
+    "name": "Gothic",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/gothic-demo.wgb",
+    "coverUrl": "/covers/gothic-box.jpg",
+    "description": "Explore the Valley of Mines in the original English demo. Saving works; loading a saved game may stall.",
+    "year": "2001",
+    "genre": "Action RPG",
+    "gogUrl": "https://www.gog.com/en/game/gothic",
+    "enabled": true
   }
 ]
