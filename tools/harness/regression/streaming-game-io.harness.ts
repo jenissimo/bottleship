@@ -37,8 +37,10 @@ async function snapshot(label: string) {
     const scene = result.named.sceneProbe as any;
     evidence.push({ label, result });
     await Bun.write(resolve(root, `${caseId}.game-io.json`), JSON.stringify({ url, mode, evidence }, null, 2));
-    const shot = await harness().shot({ save: `${caseId}.${label}.png` }).run();
+    const shot = await harness().shot().run();
     if (!shot.ok) throw new Error(`${label}: screenshot failed: ${JSON.stringify(shot.error)}`);
+    const png = shot.named.shot as { base64: string };
+    await Bun.write(resolve(root, `${caseId}.${label}.png`), Buffer.from(png.base64, "base64"));
     if (!(state.screen?.presentSerial > 0) || !(scene.brightness > 1)) throw new Error(`${label}: no rendered scene`);
     if (io.armed && (!io.ioWorker.chunkOutcomesSumOk || io.asyncChannel.failed || io.guest.timeouts || io.ioWorker.diskWriteFailures)) {
         throw new Error(`${label}: invalid I/O ledger or failed reads: ${JSON.stringify(io)}`);
