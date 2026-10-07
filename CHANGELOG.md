@@ -2,7 +2,7 @@
 
 ## 2026-10-07
 
-- Added the original English Need for Speed: Underground 2 PC demo with original PC box artwork. Free Roam driving and keyboard controls are verified.
+- Added the original English Need for Speed: Underground 2 PC demo with original PC box artwork. Free Roam driving, keyboard controls and the City Hall Circuit race are verified, including a production HTTP launch. Cold startup/level loading can take several minutes.
 
 - Guest threads that suspend themselves now park when every peer is blocked and stay parked until resumed. Regression tests execute the caller on v86 with interpreter and production JIT settings.
 - Added the original English Gothic 1.08h demo with original cover artwork and required save directories. Dialogue exit, HUD, movement and native saving are verified; restoring a saved game can still stall.
