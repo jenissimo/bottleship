@@ -1,3 +1,4 @@
+import { WgbCache } from "../../runtime/filesystem/wgb-cache";
 /**
  * ioReport — the streamed-bundle I/O instruments (plan/streamed-io-architecture.md,
  * stage 0).
@@ -17,7 +18,7 @@
 
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
-import type { SabIoSource } from "../../runtime/filesystem/sab-io-source";
+import { SabIoSource } from "../../runtime/filesystem/sab-io-source";
 import type { IoWorkerStats } from "../../runtime/filesystem/sab-io-protocol";
 
 type Snapshot = ReturnType<SabIoSource["stats"]>;
@@ -27,7 +28,7 @@ type BlockCacheStats = {
     uniqueTouchedBytes: number; touchGranuleBytes: number; prefetchEvictedUnreadBytes: number;
 };
 
-interface Mark { at: number; io: Snapshot; cache: BlockCacheStats | null }
+interface Mark { at: number; source: SabIoSource; io: Snapshot; cache: BlockCacheStats | null }
 
 let mark: Mark | null = null;
 
@@ -83,13 +84,74 @@ function diffNumbers<T extends object>(now: T, base: T): T {
 }
 
 export function registerIoCommands(svc: HarnessService): void {
+    svc.register("ioRestart", async () => {
+        const source = sabIo();
+        if (!source) throw new HarnessError("no SAB I/O source", HarnessErrorCode.NO_PROCESS);
+        await source.restartWorker();
+        return source.stats();
+    });
+    svc.register("ioCacheVerify", async args => {
+        if (sabIo()) throw new HarnessError("ioCacheVerify requires an idle tab without a streamed bundle", HarnessErrorCode.BAD_ARGS);
+        const options = args[0] as { url: string; ranges: Array<{ start: number; end: number; sha256: string }>; fill?: boolean; restart?: boolean };
+        if (!options?.url || !Array.isArray(options.ranges) || options.ranges.length === 0) throw new HarnessError("url and oracle ranges required", HarnessErrorCode.BAD_ARGS);
+        const hash = async (bytes: Uint8Array) => Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes.slice().buffer as ArrayBuffer)), b => b.toString(16).padStart(2, "0")).join("");
+        const source = await SabIoSource.create(options.url, { cacheMB: 16, prefetchChunks: 0 });
+        let verified = 0, bytesVerified = 0;
+        try {
+            for (const range of options.ranges) {
+                const bytes = await source.readRange(range.start, range.end);
+                if (bytes.length !== range.end - range.start || await hash(bytes) !== range.sha256) throw new Error(`Range oracle mismatch at ${range.start}`);
+                verified++; bytesVerified += bytes.length;
+            }
+            if (options.restart) {
+                await source.restartWorker();
+                const range = options.ranges[0];
+                if (await hash(await source.readRange(range.start, range.end)) !== range.sha256) throw new Error("Restart changed bytes");
+            }
+            const demand = source.stats();
+            if (options.fill) {
+                source.startFill();
+                const deadline = performance.now() + 45_000;
+                while (!source.stats().io.diskComplete) {
+                    if (performance.now() >= deadline) throw new Error("Sparse promotion timed out");
+                    await new Promise<void>(resolve => setTimeout(resolve, 25));
+                }
+            }
+            const filled = source.stats();
+            await source.closeAsync();
+            let localVerified = 0;
+            if (options.fill) {
+                const local = await WgbCache.openSyncSourceForUrl(options.url);
+                if (!local) throw new Error("Promoted bundle did not open as an OPFS source");
+                for (const range of options.ranges) {
+                    const bytes = local.readRangeSync(range.start, range.end);
+                    if (bytes.length !== range.end - range.start || await hash(bytes) !== range.sha256) throw new Error(`Local cache oracle mismatch at ${range.start}`);
+                    localVerified++;
+                }
+                WgbCache.releaseMountedSource();
+            }
+            return { verified, bytesVerified, localVerified, restartVerified: options.restart ? 1 : 0, demand, filled };
+        } finally { await source.closeAsync(); }
+    });
+    svc.register("ioProfile", () => {
+        const source = sabIo();
+        const cache = (globalThis as { __wgbBlockCache?: { profile(): unknown } }).__wgbBlockCache;
+        if (!source || !cache) throw new HarnessError("no streamed bundle profile", HarnessErrorCode.NO_PROCESS);
+        return { ...cache.profile() as object, ...source.identity() };
+    });
+    svc.register("ioPhase", args => {
+        const phase = String(args[0] ?? "gameplay");
+        if (!phase || phase.length > 64) throw new HarnessError("phase must be 1..64 characters", HarnessErrorCode.BAD_ARGS);
+        (globalThis as { __wgbBlockCache?: { setProfilePhase(phase: string): void } }).__wgbBlockCache?.setProfilePhase(phase);
+        return { phase };
+    });
     /** ioMark() — baseline for a windowed ioReport. The counters are monotonic, so a
      *  measurement over "the radio playing" is a difference, not a total; without this
      *  every A/B is polluted by the boot's own thousands of cold reads. */
     svc.register("ioMark", () => {
         const src = sabIo();
         if (!src) throw new HarnessError("no SAB I/O source (bundle not streamed)", HarnessErrorCode.NO_PROCESS);
-        mark = { at: performance.now(), io: src.stats(), cache: blockCache() };
+        mark = { at: performance.now(), source: src, io: src.stats(), cache: blockCache() };
         return { marked: true, at: mark.at };
     });
 
@@ -114,6 +176,7 @@ export function registerIoCommands(svc: HarnessService): void {
         const cacheNow = blockCache();
         const windowed = opts.since === "mark";
         if (windowed && !mark) throw new HarnessError("ioReport since:\"mark\" with no ioMark", HarnessErrorCode.BAD_ARGS);
+        if (windowed && mark!.source !== src) throw new HarnessError("bundle changed since ioMark", HarnessErrorCode.BAD_ARGS);
 
         // `bucketsMs` is the histogram's AXIS, not a counter — diffing it against itself
         // yields all-zero edges, and the percentile lookup then reports a confident 0 ms
@@ -129,6 +192,9 @@ export function registerIoCommands(svc: HarnessService): void {
                 config: now.io.config,
                 armed: now.io.armed,
                 residentKB: now.io.residentKB,
+                diskChunks: now.io.diskChunks,
+                diskArmed: now.io.diskArmed,
+                diskComplete: now.io.diskComplete,
             }
             : now.io;
         const cache = windowed && cacheNow && mark!.cache
@@ -142,7 +208,7 @@ export function registerIoCommands(svc: HarnessService): void {
             : cacheNow;
 
         const p = (q: number) => histPercentile(wait.histogram, wait.bucketsMs, q);
-        const chunkSum = io.chunksResidentHit + io.chunksJoinedInflight + io.chunksFetchedCold;
+        const chunkSum = io.chunksResidentHit + io.chunksDiskHit + io.chunksJoinedInflight + io.chunksFetchedCold;
 
         return {
             armed: true,
@@ -168,7 +234,7 @@ export function registerIoCommands(svc: HarnessService): void {
                 recentExact: windowed ? null : now.wait.recent,
             },
 
-            // The I/O worker's view. `chunkOutcomesSumOk` is the cross-check: the three
+            // The I/O worker's view. `chunkOutcomesSumOk` is the cross-check: the four
             // outcomes partition every chunk a guest request needed, so a false here
             // means the accounting itself drifted and no number below it is usable.
             ioWorker: {
@@ -176,6 +242,13 @@ export function registerIoCommands(svc: HarnessService): void {
                 requests: io.requests,
                 chunksNeeded: io.chunksNeeded,
                 chunksResidentHit: io.chunksResidentHit,
+                chunksDiskHit: io.chunksDiskHit,
+                diskChunks: now.io.diskChunks,
+                diskArmed: now.io.diskArmed,
+                diskComplete: now.io.diskComplete,
+                diskWriteFailures: io.diskWriteFailures,
+                fillFetches: io.fillFetches,
+                fillKB: io.fillKB,
                 chunksJoinedInflight: io.chunksJoinedInflight,
                 chunksFetchedCold: io.chunksFetchedCold,
                 chunkOutcomesSumOk: chunkSum === io.chunksNeeded,
@@ -220,7 +293,8 @@ export function registerIoCommands(svc: HarnessService): void {
 
             // The guest-local block cache in front of all of it: only its misses ever
             // become a SAB request, so `guest.requests` should track `blockingFaults`.
-            blockCache: cache ?? { note: "__wgbBlockCache exposed in dev builds only" },
+            gameplay: now.gameplay,
+            blockCache: cache ?? { note: "no guest-local block cache" },
         };
     });
 }

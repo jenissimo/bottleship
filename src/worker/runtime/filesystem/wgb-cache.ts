@@ -3,7 +3,7 @@ import { SyncAccessHandleSource } from "@bottleship/formats/zip";
 import { asWriteChunk } from "../../../dom-buffer";
 import type { SyncAccessHandleLike } from "@bottleship/formats/zip";
 
-const CACHE_DIR = "wgb-cache";
+import { WGB_CACHE_DIR as CACHE_DIR, urlToCacheKey, type WgbVersion } from "./wgb-cache-identity";
 
 /** Fallback OPFS key for a nameless Blob (a real File carries its filename → keyed by it,
  *  so a disk drop dedupes against the same game's URL cache entry). */
@@ -16,72 +16,15 @@ const LRU_META_FILE = "_cache-lru.json";
  *  never fills the origin to the brim (saves/overlay writes must keep working). */
 const STAGE_QUOTA_MARGIN = 256 * 1024 * 1024;
 
-/** 8 hex chars of FNV-1a — enough to separate bundles, short enough to keep a key readable. */
-function shortHash(s: string): string {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = Math.imul(h, 0x01000193);
-    }
-    return (h >>> 0).toString(16).padStart(8, "0");
-}
-
-/**
- * OPFS filename for a bundle URL.
- *
- * The last path segment alone is NOT an identity when the query string is where the
- * bundle is actually named: the dev sidecar serves every bundle from `/wgb?path=...`, so
- * a bare-basename key files all of them under "wgb" and the second game launched reads
- * the first one's bytes. A query therefore folds into the key as a hash. The classic
- * `/apps/<name>.wgb[?v=2]` shape keeps its plain filename so an existing cache entry —
- * and the dedupe against the same file dropped from disk — still match.
- */
-function urlToCacheKey(url: string): string {
-    const [path, query] = url.split("?");
-    const parts = path.split("/");
-    const base = parts[parts.length - 1] || "game.wgb";
-    if (base.toLowerCase().endsWith(".wgb")) return base;
-    const named = query ? `${base}-${shortHash(query)}` : base;
-    return named.toLowerCase().endsWith(".wgb") ? named : `${named}.wgb`;
-}
-
-/** Bytes scanned from the tail for the EOCD record: 22-byte record + max 64K comment. */
-const EOCD_SCAN_BYTES = 22 + 0xffff;
-const EOCD_SIGNATURE = 0x06054b50;
-
-/**
- * Does this file actually end in a ZIP end-of-central-directory record?
- *
- * The only checks the cache used to make were "non-empty" and "matches Content-Length",
- * and neither can tell a bundle from what a server hands back when something goes wrong:
- * an HTML error page is a perfectly well-formed 1.6 KB response, and once written under
- * the bundle's key it is served from cache forever, failing the loader with "EOCD not
- * found" on every later launch with no way for the user to know why. Reading the tail is
- * one seek and answers the question the loader is about to ask anyway — so a poisoned
- * entry is caught on write AND healed on read, including entries already on disk.
- */
-function hasZipEocd(sah: SyncAccessHandleLike, size: number): boolean {
-    if (size < 22) return false;
-    const scan = Math.min(size, EOCD_SCAN_BYTES);
-    const buf = new Uint8Array(scan);
-    const got = sah.read(buf, { at: size - scan });
-    if (got < 22) return false;
-    const view = new DataView(buf.buffer, buf.byteOffset, got);
-    for (let i = got - 22; i >= 0; i--) {
-        if (view.getUint32(i, true) === EOCD_SIGNATURE) return true;
-    }
-    return false;
-}
+import { hasZipEocd } from "./wgb-cache-integrity";
 
 /**
  * Simple OPFS-backed cache for WGB files.
  *
  * Layout: navigator.storage / "bottleship" / "wgb-cache" / "{filename}.wgb"
  *
- * Usage pattern:
- *   1. `get(url)` on startup — returns cached buffer or null.
- *   2. On cache miss: start game via HttpRangeSource, then call `downloadAndStore(url)` in background.
- *   3. Next launch: `get()` returns the full buffer → BufferSource (no network).
+ * Prefer openSyncSourceForUrl before streaming. The I/O worker persists validated
+ * chunks in SparseWgbCache and promotes a complete archive into this directory.
  */
 export class WgbCache {
     private static cacheDir: FileSystemDirectoryHandle | null = null;
@@ -156,6 +99,23 @@ export class WgbCache {
         }
     }
 
+    static async prepareSparseCache(size: number, key: string): Promise<FileSystemDirectoryHandle | null> {
+        const dir = await this.getCacheDir();
+        if (!dir) return null;
+        let existing = 0;
+        try { existing = (await (await dir.getFileHandle(`${key}.sparse`)).getFile()).size; } catch {}
+        return await this.ensureSpaceFor(Math.max(0, size - existing), key) ? dir : null;
+    }
+
+    static async storeVersion(version: WgbVersion, directory?: FileSystemDirectoryHandle): Promise<void> {
+        const dir = directory ?? await this.getCacheDir();
+        if (!dir) return;
+        const file = await dir.getFileHandle(`${urlToCacheKey(version.url)}.version.json`, { create: true });
+        const writer = await file.createWritable();
+        try { await writer.write(JSON.stringify(version)); await writer.close(); }
+        catch (error) { await writer.abort(); throw error; }
+    }
+
     // ---- LRU bookkeeping + quota-pressure eviction ------------------------------
     //
     // Cache entries are RECOVERABLE (the user still has the file; the server still
@@ -219,7 +179,8 @@ export class WgbCache {
         const victims: Array<{ key: string; size: number; used: number }> = [];
         for await (const [name, handle] of (dir as unknown as { entries(): AsyncIterable<[string, FileSystemHandle]> }).entries()) {
             if (handle.kind !== "file" || name === LRU_META_FILE) continue;
-            if (name === excludeKey || name === this.currentSourceKey) continue;
+            if ((excludeKey && (name === excludeKey || name.startsWith(`${excludeKey}.`)))
+                || (this.currentSourceKey && (name === this.currentSourceKey || name.startsWith(`${this.currentSourceKey}.`)))) continue;
             try {
                 const size = (await (handle as FileSystemFileHandle).getFile()).size;
                 victims.push({ key: name, size, used: meta[name] ?? 0 });
@@ -348,6 +309,7 @@ export class WgbCache {
         // Persist to OPFS (best-effort — don't fail the launch if OPFS is unavailable or locked).
         try {
             await this.writeCacheFile(key, buffer);
+            await this.storeVersion({ url, size: buffer.length, etag: resp.headers.get("etag") ?? "" });
             Logger.log(LogCategory.SYSTEM, `WgbCache: "${key}" cached (${mb} MB)`);
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `WgbCache: OPFS write failed for "${key}": ${e}`);
@@ -453,6 +415,7 @@ export class WgbCache {
 
         try { await dir.removeEntry(key); } catch { /* no prior entry */ }
         await handleOps.move(key);
+        await this.storeVersion({ url, size, etag: resp.headers.get("etag") ?? "" });
         Logger.log(LogCategory.SYSTEM, `WgbCache: streamed "${key}" to OPFS (${(size / 1024 / 1024).toFixed(1)} MB, off-disk, no RAM copy)`);
         return this.openSyncSourceByKey(key);
     }
@@ -520,6 +483,7 @@ export class WgbCache {
             return false;
         }
         await movable.move(key);
+        await this.storeVersion({ url, size, etag: resp.headers.get("etag") ?? "" });
         this.queueTouch(key);
         return true;
     }
@@ -563,11 +527,19 @@ export class WgbCache {
             return true; // not cached — nothing to invalidate
         }
         try {
-            const resp = await fetch(url, { method: "HEAD" });
+            const resp = await fetch(url, { method: "HEAD", cache: "no-cache", signal: AbortSignal.timeout(5000) });
             if (!resp.ok) return true;
             const len = Number(resp.headers.get("content-length") ?? "0");
-            if (!(len > 0) || len === cachedSize) return true;
-            await dir.removeEntry(key);
+            let version: WgbVersion | null = null;
+            try {
+                const file = await (await dir.getFileHandle(`${key}.version.json`)).getFile();
+                version = JSON.parse(await file.text());
+            } catch {}
+            const etag = resp.headers.get("etag");
+            const changed = (len > 0 && len !== cachedSize)
+                || (etag !== null && (version === null || version.url !== url || version.etag !== etag));
+            if (!changed) return true;
+            try { await dir.removeEntry(key); } catch { /* another tab may hold its reader */ }
             Logger.log(LogCategory.SYSTEM,
                 `WgbCache: "${key}" changed on the server (${cachedSize} → ${len} bytes) — re-downloading`);
             return false;

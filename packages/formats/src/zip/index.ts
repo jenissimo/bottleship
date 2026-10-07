@@ -44,6 +44,7 @@ export interface ReadHint {
      *  distinction a transport serves speculation and a caller's blocking read from
      *  the same connection budget, and the blocking one waits behind the guesses. */
     speculative?: boolean;
+    entryName?: string;
 }
 
 export interface ZipSource {
@@ -142,61 +143,8 @@ export class BlobSource implements ZipSource {
     }
 }
 
-export class HttpRangeSource implements ZipSource {
-    size: number;
-    private url: string;
-
-    private constructor(url: string, size: number) {
-        this.url = url;
-        this.size = size;
-    }
-
-    static async create(url: string): Promise<HttpRangeSource> {
-        // Preferred path: HEAD + content-length.
-        try {
-            const head = await fetch(url, { method: "HEAD" });
-            if (head.ok) {
-                const length = head.headers.get("content-length");
-                if (length) {
-                    return new HttpRangeSource(url, Number(length));
-                }
-            }
-        } catch {
-            // Fall through to range probe.
-        }
-
-        // Fallback path: probe byte-range support and infer total size from Content-Range.
-        const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
-        if (probe.status !== 206) {
-            // Avoid buffering potentially huge response body when range is unsupported.
-            try { await probe.body?.cancel(); } catch {}
-            throw new Error(`Range requests are required for WGB loading (expected 206, got ${probe.status})`);
-        }
-        const contentRange = probe.headers.get("content-range");
-        if (!contentRange) {
-            try { await probe.body?.cancel(); } catch {}
-            throw new Error(`Missing Content-Range for ${url}`);
-        }
-        const match = contentRange.match(/\/(\d+)\s*$/);
-        if (!match) {
-            try { await probe.body?.cancel(); } catch {}
-            throw new Error(`Invalid Content-Range "${contentRange}" for ${url}`);
-        }
-        try { await probe.body?.cancel(); } catch {}
-        return new HttpRangeSource(url, Number(match[1]));
-    }
-
-    async readRange(start: number, end: number): Promise<Uint8Array> {
-        const range = `bytes=${start}-${end - 1}`;
-        const resp = await fetch(this.url, { headers: { Range: range } });
-        if (resp.status !== 206) {
-            try { await resp.body?.cancel(); } catch {}
-            throw new Error(`Range request failed (${resp.status}) for ${this.url}`);
-        }
-        const buf = await resp.arrayBuffer();
-        return new Uint8Array(buf);
-    }
-}
+export { HttpRangeSource, BundleVersionError } from "./http-range-source";
+import { HttpRangeSource } from "./http-range-source";
 
 /**
  * Like {@link HttpRangeSource}, but serves the guest's SYNCHRONOUS reads directly
@@ -245,6 +193,7 @@ export class SyncHttpRangeSource implements ZipSource {
     readRangeSync(start: number, end: number): Uint8Array {
         const xhr = new XMLHttpRequest();
         xhr.open("GET", this.url, false); // synchronous — worker-only
+        xhr.timeout = 25_000;
         xhr.responseType = "arraybuffer"; // permitted for sync XHR inside a Worker
         xhr.setRequestHeader("Range", `bytes=${start}-${end - 1}`);
         xhr.send();
@@ -493,8 +442,6 @@ export class ZipArchive {
      * Reads an uncompressed (STORED) entry range without loading the whole file.
      */
     async readEntryRange(entry: ZipEntry, offset: number, length: number, sequential = false): Promise<Uint8Array> {
-        const sync = this.readEntryRangeSync(entry, offset, length, sequential);
-        if (sync) return sync;
         if (entry.compression !== 0) {
             throw new Error(`Range read is supported only for STORED entries (${entry.name})`);
         }
@@ -510,6 +457,7 @@ export class ZipArchive {
 
         const dataStart = await this.getEntryDataStart(entry);
         return this.source.readRange(dataStart + clampedOffset, dataStart + clampedEnd, {
+            entryName: entry.name,
             entryStart: dataStart,
             entryEnd: dataStart + entry.uncompressedSize,
             cursor: dataStart + clampedOffset,
@@ -529,6 +477,7 @@ export class ZipArchive {
         const dataStart = this.getEntryDataStartSync(entry);
         if (dataStart === null) return null;
         const hint: ReadHint = {
+            entryName: entry.name,
             entryStart: dataStart,
             entryEnd: dataStart + entry.uncompressedSize,
             cursor: dataStart + clampedOffset,
@@ -538,8 +487,8 @@ export class ZipArchive {
     }
 
     private async getEntryDataStart(entry: ZipEntry): Promise<number> {
-        const sync = this.getEntryDataStartSync(entry);
-        if (sync !== null) return sync;
+        const cached = this.localDataOffsets.get(entry.name);
+        if (cached !== undefined) return cached;
         const locStart = entry.localHeaderOffset + this.prefixDelta;
         const header = await this.source.readRange(locStart, locStart + 30);
         const view = new DataView(header.buffer, header.byteOffset, header.byteLength);

@@ -24,6 +24,12 @@ done)
 paths=$(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | cut -d' ' -f2-)
 [ -n "$paths" ] || exit 0
 
+# Managed worktrees export the parent's GIT_DIR to hooks; -C alone cannot escape it.
+submodule_git() (
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
+    git -C "$path" "$@"
+)
+
 for path in $paths; do
     links=$(for sha in $pushed; do
         git ls-tree "$sha" -- "$path" 2>/dev/null | awk '$2 == "commit" { print $3 }'
@@ -35,16 +41,16 @@ for path in $paths; do
         continue
     fi
 
-    if ! git -C "$path" fetch --quiet origin 2>/dev/null; then
+    if ! submodule_git fetch --quiet origin 2>/dev/null; then
         echo "pre-push: could not reach $path's remote — gitlink NOT verified." >&2
         continue
     fi
 
-    refs=$(git -C "$path" for-each-ref --format='%(refname)' refs/remotes/origin)
+    refs=$(submodule_git for-each-ref --format='%(refname)' refs/remotes/origin)
     for link in $links; do
         found=0
         for ref in $refs; do
-            if git -C "$path" merge-base --is-ancestor "$link" "$ref" 2>/dev/null; then
+            if submodule_git merge-base --is-ancestor "$link" "$ref" 2>/dev/null; then
                 found=1
                 break
             fi

@@ -764,7 +764,7 @@ async function loadStreamFile(ctx: MSSContext, stream: MSSStream, tryIncremental
 
         system.fileSystem.setPosition(handle, 0, 0);
 
-        let fileData = system.fileSystem.readSync(handle, fileSize);
+        let fileData = system.fileSystem.readSync(handle, fileSize, "park-preferred");
         if (!fileData) {
             fileData = await system.fileSystem.read(handle, fileSize);
         }

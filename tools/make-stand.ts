@@ -19,6 +19,7 @@
  */
 import fs from "fs";
 import path from "path";
+import type { WgbIoPolicy } from "@bottleship/formats/wgb/io-profile";
 
 interface StandGame {
     id: string;
@@ -30,6 +31,7 @@ interface StandGame {
     wgb: string;
     cover: string;
     preload?: boolean;
+    io?: WgbIoPolicy;
 }
 
 interface StandConfig {
@@ -43,6 +45,7 @@ interface StandConfig {
      *  streaming). Worth it wherever range round-trips cost real latency. Per-game
      *  `preload` overrides it. */
     preload?: boolean;
+    io?: WgbIoPolicy;
     games: StandGame[];
 }
 
@@ -93,6 +96,7 @@ const catalog = config.games.map((g) => {
         year: g.year,
         genre: g.genre,
         preload: g.preload ?? config.preload ?? false,
+        io: g.io ?? config.io,
         enabled: true,
     };
 });
@@ -108,6 +112,7 @@ if (config.allowedBrowsers?.length) {
     );
 }
 fs.copyFileSync(path.join(REPO, "deploy", "server.ts"), path.join(out, "server.ts"));
+fs.copyFileSync(path.join(REPO, "deploy", "wgb-etag.ts"), path.join(out, "wgb-etag.ts"));
 // The compose file is deployment-local config once it lands (passwords, host paths,
 // network name), so ship the template only when the stand doesn't have one yet.
 const compose = path.join(out, "docker-compose.yml");
@@ -116,4 +121,4 @@ if (!fs.existsSync(compose)) fs.copyFileSync(path.join(REPO, "deploy", "docker-c
 const mb = (p: string) => (fs.statSync(p).size / 1048576).toFixed(1);
 console.log(`stand payload → ${out}`);
 for (const g of catalog) console.log(`  ${g.id.padEnd(20)} ${mb(path.join(appsOut, `${g.id}.wgb`))} MB  ${g.name}`);
-console.log(`  dist/ + server.ts + docker-compose.yml`);
+console.log(`  dist/ + server.ts + wgb-etag.ts + docker-compose.yml`);

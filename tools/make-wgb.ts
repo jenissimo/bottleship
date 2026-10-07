@@ -14,6 +14,8 @@
  *   <output.wgb>    Destination .wgb file path.
  *
  * Options:
+ *   --order <profile>    Store files in first-access order from a harness .wgb.profile
+ *   --content-addressed  Write a copy named <name>.<sha256>.wgb for immutable hosting
  *   --name <str>          Display name  (default: basename of game-dir)
  *   --game-id <str>       Stable container/save key, namespaced "<scheme>:<id>"
  *                         (gog:<productId> | steam:<appid> | app:<reverse-dns> | byo:<hex>).
@@ -83,6 +85,7 @@
 
 import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
 import { join, basename, extname, resolve } from 'path';
+import { orderFilesByProfile, parseIoProfile } from "@bottleship/formats/wgb/io-profile";
 import { ZipStoreWriter } from './internal/zip-store-writer';
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from '@bottleship/formats/wgb/container-id';
 import { parseRegFile, mergeRegSeeds, type RegSeed } from '@bottleship/formats/reg';
@@ -415,8 +418,18 @@ if (regPath) {
 const writer = new ZipStoreWriter(output);
 writer.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
 writer.addBuffer('registry.json', Buffer.from(JSON.stringify(registry, null, 2), 'utf8'));
-for (const [zipName, path] of romFiles) writer.addFile(zipName, path);
+const orderProfile = get('--order');
+const orderedFiles = orderProfile ? orderFilesByProfile(romFiles, parseIoProfile(JSON.parse(readFileSync(orderProfile, 'utf8')))) : [...romFiles];
+for (const [zipName, path] of orderedFiles) writer.addFile(zipName, path);
 const { bytes, entries: entryCount } = writer.finish();
+
+if (has('--content-addressed')) {
+    const hasher = new Bun.CryptoHasher("sha256");
+    for await (const chunk of Bun.file(output).stream()) hasher.update(chunk);
+    const addressed = output.replace(/\.wgb$/i, '') + `.${hasher.digest("hex")}.wgb`;
+    await Bun.write(addressed, Bun.file(output));
+    console.log(`Immutable bundle: ${addressed}`);
+}
 
 console.log(`Created ${output} (${entryCount} files, ${(bytes / 1024 / 1024).toFixed(1)} MB)`);
 console.log(`  name:       ${name}`);

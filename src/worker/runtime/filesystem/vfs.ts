@@ -1,3 +1,4 @@
+import { enterIoReadPolicy, restoreIoReadPolicy, type IoReadPolicy } from "./io-read-policy";
 import { ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import { LruCache } from "../../core/collections/lru-cache";
 import { Logger, LogCategory } from "../../core/logger";
@@ -891,10 +892,13 @@ export class VirtualFileSystem {
     /**
      * Synchronous version of read for fast-path scenarios (e.g. cached ROM files)
      */
-    readSync(handle: VfsFileHandle, length: number): Uint8Array | null {
+    readSync(handle: VfsFileHandle, length: number, policy: IoReadPolicy = "may-block"): Uint8Array | null {
+        if (handle.io) return null;
         const t0 = performance.now();
         const pos = handle.position;
-        const r = this.readSyncInner(handle, length);
+        const previousPolicy = enterIoReadPolicy(policy);
+        let r: Uint8Array | null;
+        try { r = this.readSyncInner(handle, length); } finally { restoreIoReadPolicy(previousPolicy); }
         censusSync(handle.path, r ? r.length : 0, performance.now() - t0, this.lastSyncArm, r !== null,
             pos, this.censusSizeOf);
         return r;
@@ -1021,15 +1025,13 @@ export class VirtualFileSystem {
         }
 
         Logger.verbose(LogCategory.SYSTEM, `VFS: read(handle.path="${handle.path}", position=${handle.position}, length=${length}) starting`);
-        const sync = this.readSync(handle, length);
+        const sync = this.readSync(handle, length, "park-preferred");
         if (sync) {
             Logger.verbose(LogCategory.SYSTEM, `VFS: read("${handle.path}") completed via sync fast-path, read ${sync.length} bytes`);
             return sync;
         }
 
-        const prior = handle.io ?? Promise.resolve();
-        const mine = prior.then(() => this.readLocked(handle, length), () => this.readLocked(handle, length));
-        handle.io = mine.catch(() => undefined);
+        const mine = this.enqueueRead(handle, () => this.readLocked(handle, length));
         // The census charges the async answer here, where the queue wait is included —
         // `readLocked` alone would price the fetch and hide the serialisation behind it.
         const t0 = performance.now();
@@ -1040,11 +1042,23 @@ export class VirtualFileSystem {
         });
     }
 
+    private enqueueRead<T>(handle: VfsFileHandle, operation: () => Promise<T>): Promise<T> {
+        const prior = handle.io ?? Promise.resolve();
+        const mine = prior.then(operation, operation);
+        const queued = mine.then(() => undefined, () => undefined).finally(() => {
+            if (handle.io === queued) handle.io = undefined;
+        });
+        handle.io = queued;
+        return mine;
+    }
+
     private async readLocked(handle: VfsFileHandle, length: number): Promise<Uint8Array> {
         // Re-check the window: a read that queued behind another one may now be a hit.
         // Deliberately the UNCENSUSED inner ladder — this read was already counted on the
         // way in, and counting the re-check would make one guest read look like two.
-        const sync = this.readSyncInner(handle, length);
+        const previousPolicy = enterIoReadPolicy("park-preferred");
+        let sync: Uint8Array | null;
+        try { sync = this.readSyncInner(handle, length); } finally { restoreIoReadPolicy(previousPolicy); }
         if (sync) return sync;
 
         try {
@@ -1114,10 +1128,13 @@ export class VirtualFileSystem {
     /**
      * Synchronous read-into for fast-path (cached ROM): writes into target, returns bytes read or null if async needed.
      */
-    readIntoSync(handle: VfsFileHandle, target: Uint8Array, targetOffset: number, length: number): number | null {
+    readIntoSync(handle: VfsFileHandle, target: Uint8Array, targetOffset: number, length: number, policy: IoReadPolicy = "may-block"): number | null {
+        if (handle.io) return null;
         const t0 = performance.now();
         const pos = handle.position;
-        const n = this.readIntoSyncInner(handle, target, targetOffset, length);
+        const previousPolicy = enterIoReadPolicy(policy);
+        let n: number | null;
+        try { n = this.readIntoSyncInner(handle, target, targetOffset, length); } finally { restoreIoReadPolicy(previousPolicy); }
         censusSync(handle.path, n ?? 0, performance.now() - t0, this.lastSyncArm, n !== null,
             pos, this.censusSizeOf);
         return n;
@@ -1174,32 +1191,39 @@ export class VirtualFileSystem {
     /**
      * Read directly into target buffer (no intermediate allocation). Uses chunks on async path to limit temp buffer size.
      */
-    async readInto(handle: VfsFileHandle, target: Uint8Array, targetOffset: number, length: number): Promise<number> {
-        const sync = this.readIntoSync(handle, target, targetOffset, length);
+    async readInto(handle: VfsFileHandle, target: Uint8Array | (() => Uint8Array), targetOffset: number, length: number): Promise<number> {
+        const currentTarget = () => typeof target === "function" ? target() : target;
+        const sync = this.readIntoSync(handle, currentTarget(), targetOffset, length, "park-preferred");
         if (sync !== null) {
             Logger.verbose(LogCategory.SYSTEM, `VFS: readInto("${handle.path}") sync fast-path, read ${sync} bytes`);
             return sync;
         }
 
-        const chunkSize = VirtualFileSystem.READ_INTO_CHUNK;
-        let totalRead = 0;
-        const startPos = handle.position;
-
-        try {
-            while (totalRead < length) {
-                const chunk = Math.min(chunkSize, length - totalRead);
-                const data = await this.read(handle, chunk);
-                if (data.length === 0) break;
-                target.set(data, targetOffset + totalRead);
-                totalRead += data.length;
-                if (data.length < chunk) break;
+        const t0 = performance.now(), pos = handle.position;
+        // Keep the file-object queue for the entire read, including all bounded chunks.
+        return this.enqueueRead(handle, async () => {
+            const chunkSize = VirtualFileSystem.READ_INTO_CHUNK;
+            let totalRead = 0;
+            const startPos = handle.position;
+            try {
+                while (totalRead < length) {
+                    const chunk = Math.min(chunkSize, length - totalRead);
+                    const data = await this.readLocked(handle, chunk);
+                    if (data.length === 0) break;
+                    currentTarget().set(data, targetOffset + totalRead);
+                    totalRead += data.length;
+                    if (data.length < chunk) break;
+                }
+                Logger.verbose(LogCategory.SYSTEM, `VFS: readInto("${handle.path}") async, read ${totalRead} bytes`);
+                return totalRead;
+            } catch (e) {
+                Logger.error(LogCategory.SYSTEM, `VFS: readInto("${handle.path}", position=${startPos}, length=${length}) failed: ${e}`);
+                throw e;
             }
-            Logger.verbose(LogCategory.SYSTEM, `VFS: readInto("${handle.path}") async, read ${totalRead} bytes`);
-            return totalRead;
-        } catch (e) {
-            Logger.error(LogCategory.SYSTEM, `VFS: readInto("${handle.path}", position=${startPos}, length=${length}) failed: ${e}`);
-            throw e;
-        }
+        }).then(n => {
+            censusAsync(handle.path, n, performance.now() - t0, pos, this.censusSizeOf);
+            return n;
+        });
     }
 
     /** Synchronous write for CRT _write paths — buffers to overlay and schedules OPFS flush. */
