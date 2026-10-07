@@ -1,6 +1,6 @@
 //! Installer/archive unpack codecs — WASM module (hand-rolled C ABI).
 //!
-//! LZMA1/LZMA2 (Inno Setup) + srep (FreeArc long-range dedup filter). The TS format parsers
+//! LZMA1/LZMA2 (Inno Setup), srep (FreeArc) and RAR PPMd. The TS format parsers
 //! stay thin; the heavy decompression lives here.
 //!
 //! # ABI (must match `packages/formats/src/unpack/unpack.ts`)
@@ -18,6 +18,10 @@
 //!   - `props` for LZMA2: 4-byte LE dict size
 //!   - srep: no props; input is a raw SREP stream (already LZMA-decoded by the caller)
 //!   - Returns `0` on success, negative error code on failure
+//! - `rar_ppm_new(input, len)` / `rar_ppm_free(session)` — persistent PPMd model
+//! - `rar_ppm_block(session, input_offset, output, base, capacity)` — decode one coding block;
+//!   `0` = EOF, `1` = new table, negative = error. Dictionary bytes before `base` are caller-owned.
+//! - `rar_ppm_position(session)` / `rar_ppm_written(session)` — consumed/produced extents
 //!
 //! `unpack_decode` runs the whole stream to EOF in one call, invoking imports in a loop.
 //! JS must copy bytes from `unpack_write` before returning — views are invalidated on memory growth.
@@ -26,6 +30,7 @@ use core::ptr;
 use lzma_rust2::{Lzma2Reader, LzmaReader};
 use std::alloc::{alloc, dealloc, Layout};
 use std::io::{self, Read, Write};
+mod rar;
 
 /// Unknown uncompressed size — Inno solid chunks use this for LZMA1 streams.
 const LZMA_UNKNOWN_SIZE: u64 = u64::MAX;

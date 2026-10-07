@@ -30,3 +30,5 @@ Sources for the demo covers added in October 2026:
 | `nfs-underground2-box.jpg` | Need for Speed: Underground 2 (2004), original North American PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/d17ce24a-ca99-40a2-94fa-330708c82d9f.jpg) |
 
 Artwork remains copyright of its respective owners.
+
+| `cossacks-european-wars-box.jpg` | Cossacks: European Wars (2001) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/4880/library_600x900.jpg) |

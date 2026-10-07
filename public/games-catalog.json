@@ -400,5 +400,16 @@
     "year": "2004",
     "genre": "Racing",
     "enabled": true
+  },
+  {
+    "id": "cossacks-demo",
+    "name": "Cossacks: European Wars",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/cossacks-european-wars-demo.wgb",
+    "coverUrl": "/covers/cossacks-european-wars-box.jpg",
+    "description": "Historical real-time strategy with large armies, resource gathering and settlement building. Includes the original single-player demo.",
+    "year": "2001",
+    "genre": "RTS",
+    "enabled": true
   }
 ]

@@ -117,6 +117,7 @@ class Inflater {
         private readonly start: number,
         private readonly out: Uint8Array,
         private readonly storedComplement = true,
+        private readonly storedWordAligned = false,
     ) {
         this.pos = start;
     }
@@ -163,6 +164,8 @@ class Inflater {
         // NSIS 2's zlib fork omits ~LEN; ordinary DEFLATE must still validate it.
         this.bitbuf = 0;
         this.bitcnt = 0;
+        // VISE's word reader aligns stored blocks to 16 bits, including odd payload padding.
+        if (this.storedWordAligned && ((this.pos - this.start) & 1)) this.pos++;
         const headerSize = this.storedComplement ? 4 : 2;
         if (this.pos + headerSize > this.src.length) {
             throw new Bail('truncated', `stored-block header at in+${this.pos - this.start}`);
@@ -185,6 +188,10 @@ class Inflater {
         this.out.set(this.src.subarray(this.pos, this.pos + len), this.outPos);
         this.outPos += len;
         this.pos += len;
+        if (this.storedWordAligned && (len & 1)) {
+            if (this.pos >= this.src.length) throw new Bail('truncated', 'VISE stored-block padding missing');
+            this.pos++;
+        }
     }
 
     private codes(lit: Huffman, dist: Huffman): void {
@@ -302,6 +309,11 @@ export function inflateRawSync(src: Uint8Array, out: Uint8Array, srcStart = 0): 
 /** NSIS 2 zlib: raw DEFLATE with two-byte stored-block lengths (no complement). */
 export function inflateNsisSync(src: Uint8Array, out: Uint8Array): InflateOutcome {
     return inflateInto(new Inflater(src, 0, out, false));
+}
+
+/** VISE DEFLATE after byte-swapping each 16-bit input word. */
+export function inflateViseSync(src: Uint8Array, out: Uint8Array): InflateOutcome {
+    return inflateInto(new Inflater(src, 0, out, true, true));
 }
 
 function inflateInto(inf: Inflater): InflateOutcome {

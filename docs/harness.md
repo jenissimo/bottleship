@@ -134,3 +134,5 @@ function name, or export a symbol map to load breakpoints from.
 Confirm with **data** — a dump, a logged value, a `report()` — not by reasoning about how you
 think GDI or a vtable is laid out. Multi-DC composites, the canvas-vs-selected-bitmap
 distinction, and COM vtable topology all mis-model easily; a dump settles it.
+
+`counterRate(address, {sampleMs: 3000, intervalMs: 50, bits: 32})` samples an unsigned guest counter while JIT remains enabled and compares its increments with wall and guest time. It returns the raw samples; resets are reported as modulo wraps. `report().callbacks` includes pending/suspended callback frames and the most recent invocation and return.

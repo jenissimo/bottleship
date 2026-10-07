@@ -16,7 +16,7 @@ import {
 } from "@bottleship/repack/manifest-synth";
 import { loadOverrides, getOverride, type GogOverridesDb } from "@bottleship/repack/overrides";
 import { isGogJunk, detectExeFromPaths } from "@bottleship/repack/gog-filter";
-import { detectInstallShield, extractInstallerFromFiles } from "@bottleship/repack/container-extract";
+import { detectInstallShield, detectLegacyInstaller, extractInstallerFromFiles } from "@bottleship/repack/container-extract";
 import { IsoImage, detectSectorLayout, extractIsoToMap } from "@bottleship/formats/iso";
 import { extract7z } from "../archive/unpack-buffered";
 import { ZipArchive, BlobSource, BufferSource as ZipBufferSource, unzipToMap, type ZipEntry } from "@bottleship/formats/zip";
@@ -36,6 +36,7 @@ export type SourceKind =
     | "iso9660"
     | "installer-zip"
     | "installer-sfx"
+    | "installer-payload"
     | "game-folder"
     | "unknown";
 
@@ -404,6 +405,10 @@ export async function detectSource(source: BuildSource): Promise<SourceDetection
         if (headKind === "mz") {
             const fmt = await detectBlobFormat(source.blob);
             if (fmt === "inno") return { kind: "gog-installer", exeCandidates: [], detectedFormat: fmt };
+            const probe = new Uint8Array(await source.blob.slice(0, 1 << 20).arrayBuffer());
+            const tail = new Uint8Array(await source.blob.slice(-8).arrayBuffer());
+            const legacy = detectLegacyInstaller(probe, tail);
+            if (legacy) return { kind: 'installer-payload', exeCandidates: [], note: `${legacy} installer — extracting` };
             // Not Inno — maybe a self-extractor (WinZip SFX etc.): a PE stub with a ZIP
             // appended. Unwrap it like any other container and recurse into the payload.
             const sfxArchive = new ZipArchive(new BlobSource(source.blob));
@@ -426,6 +431,8 @@ export async function detectSource(source: BuildSource): Promise<SourceDetection
                 note: fmt === "inno-unsupported" ? "unsupported Inno Setup version" : "executable is not an Inno installer",
             };
         }
+        const legacy = detectLegacyInstaller(new Uint8Array(await source.blob.slice(0, 255).arrayBuffer()));
+        if (legacy) return { kind: 'installer-payload', exeCandidates: [], note: `${legacy} archive — extracting` };
         // No PK/MZ head magic — a disc image hides its filesystem at sector 16. Probe the
         // volume-descriptor region (covers every CD framing) without reading the whole disc.
         const isoProbe = new Uint8Array(await source.blob.slice(0, ISO_PROBE_BYTES).arrayBuffer());
@@ -468,7 +475,7 @@ function packGameFiles(
     files.set("manifest.json", new TextEncoder().encode(JSON.stringify(manifest, null, 2)));
     files.set("registry.json", new TextEncoder().encode(JSON.stringify(registry, null, 2)));
     for (const [rel, data] of gameFiles) {
-        if (isGogJunk(rel)) continue;
+        if (isGogJunk(rel) || rel.endsWith('/')) continue;
         files.set(`rom/${rel.replace(/\\/g, "/")}`, data);
     }
     return files;
@@ -501,6 +508,11 @@ async function buildFromContainer(
     onProgress?.("packing", 80, "Building bundle");
     const synth = synthFromFiles(gameFiles, withSynthName(source.cli, source, containerFiles), db);
     const manifest = synth.manifest;
+    const directories = [...gameFiles.keys()].filter(p => p.endsWith('/')).map(p => p.slice(0, -1).replace(/\//g, '\\'));
+    if (directories.length) {
+        const emulator = (manifest.emulator ?? {}) as Record<string, unknown> & { createDirs?: string[] };
+        manifest.emulator = { ...emulator, createDirs: [...new Set([...(emulator.createDirs ?? []), ...directories])] };
+    }
     const gameId = resolveGameId(manifest as { gameId?: string; name?: string; entrypoint?: string });
     const wgbBytes = buildZip(packGameFiles(gameFiles, synth.manifest, synth.registry));
 
@@ -681,6 +693,11 @@ export async function buildStagedBundle(source: BuildSource, onProgress?: Progre
         const extracted = await extract7z(await readSourceBytes(source));
         onProgress?.("installing", 10, "Extracting installer");
         ({ wgbBytes, manifest, gameId } = await buildFromContainer(extracted, source, db, detections, onProgress, 10));
+    } else if (detections.kind === 'installer-payload') {
+        onProgress?.('installing', 10, 'Extracting installer');
+        const bytes = await readSourceBytes(source);
+        const name = (source.blob as File)?.name ?? 'installer.bin';
+        ({ wgbBytes, manifest, gameId } = await buildFromContainer(new Map([[name, bytes]]), source, db, detections, onProgress, 10));
     } else if (detections.kind === "installer-sfx") {
         // Self-extracting archive (WinZip SFX etc.) → unwrap the embedded ZIP, then recurse:
         // the payload is usually an installer (e.g. an EA `compressed.zip` + `common_filelist.txt`),
@@ -709,12 +726,7 @@ export async function buildStagedBundle(source: BuildSource, onProgress?: Progre
             onProgress?.("unzipping", 0, "Unzipping");
             gameFiles = await unzipStored(await readSourceBytes(source));
         }
-        onProgress?.("packing", 60, "Building bundle");
-        const synth = synthFromFiles(gameFiles, withSynthName(source.cli, source, gameFiles), db);
-        manifest = synth.manifest;
-        gameId = resolveGameId(manifest as { gameId?: string; name?: string; entrypoint?: string });
-        wgbBytes = buildZip(packGameFiles(gameFiles, synth.manifest, synth.registry));
-        detections.gogGameId = detections.gogGameId ?? synth.gameId;
+        ({ wgbBytes, manifest, gameId } = await buildFromContainer(gameFiles, source, db, detections, onProgress, 60));
     } else {
         throw new Error(`unsupported source: ${detections.note ?? detections.kind}`);
     }

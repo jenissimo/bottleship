@@ -42,12 +42,15 @@ import { detectFreeArc, extractFreeArcToMap, FreeArcUnsupportedError } from "@bo
 import { unzipToMap } from "@bottleship/formats/zip";
 import { isGogJunk } from "./gog-filter";
 import { extractMsiPayload } from './msi-extract';
+import { isWise, extractWise } from '@bottleship/formats/wise';
+import { isVise, extractVise } from '@bottleship/formats/vise';
+import { isInstallShield3, extractInstallShield3 } from '@bottleship/formats/installshield3';
+import { findRar4, extractRar4 } from '@bottleship/formats/rar';
 
-export type InstallerVia = "ea-winzip" | "installshield" | "inno" | "freearc" | "pftw" | "cab-sfx" | "msi" | "none";
+export type InstallerVia = "ea-winzip" | "installshield" | "installshield3" | "wise" | "vise" | "rar4" | "inno" | "freearc" | "pftw" | "cab-sfx" | "msi" | "none";
 
 export interface ContainerExtractOptions {
-    /** inno-lzma WASM bytes — required to unpack an Inno installer OR a FreeArc archive
-     *  (both reuse the same raw-LZMA1 WASM decoder). */
+    /** Shared unpack-streaming WASM bytes for Inno/FreeArc LZMA and RAR PPMd. */
     innoWasm?: ArrayBuffer;
     /** Raw-deflate override for InstallShield (Node/Bun may inject a zlib impl). */
     inflateRaw?: (chunk: Uint8Array) => Promise<Uint8Array> | Uint8Array;
@@ -76,6 +79,15 @@ export interface ContainerExtractResult {
     via: InstallerVia;
     /** Human-readable summary (e.g. "InstallShield cabinet 'data'", "no installer — packaged as-is"). */
     note: string;
+}
+
+/** Bounded probes suffice for the SFX signatures; VISE's signature is in the final eight bytes. */
+export function detectLegacyInstaller(head: Uint8Array, tail: Uint8Array = head): 'wise' | 'vise' | 'rar4' | 'installshield3' | null {
+    if (isWise(head)) return 'wise';
+    if (isVise(tail)) return 'vise';
+    if (findRar4(head) !== null) return 'rar4';
+    if (isInstallShield3(head)) return 'installshield3';
+    return null;
 }
 
 type MaybePromise<T> = T | Promise<T>;
@@ -516,7 +528,47 @@ const msiFormat: InstallerFormat<{ name: string; bytes: Uint8Array }> = {
  * The format registry. Detection runs top-to-bottom; the first match wins. Order encodes
  * priority — see the module header for why FreeArc precedes Inno.
  */
-const INSTALLER_FORMATS: InstallerFormat<any>[] = [eaWinzipFormat, msiFormat, installShieldFormat, freeArcFormat, pftwFormat, cabSfxFormat, innoFormat];
+function singlePayload(id: 'wise' | 'vise' | 'installshield3', label: string,
+    detect: (bytes: Uint8Array) => boolean, extract: (bytes: Uint8Array) => Map<string, Uint8Array>): InstallerFormat<Uint8Array> {
+    return {
+        id, label,
+        detect(files) {
+            // Installation media can carry a smaller installer runtime archive beside the game payload.
+            const candidates = [...files.values()].filter(detect).sort((a, b) => b.length - a.length);
+            if (candidates.length > 1 && candidates[0].length === candidates[1].length) throw new Error(`${label}: ambiguous payloads; select one installer`);
+            return candidates[0] ?? null;
+        },
+        async extract(_files, bytes) { return { gameFiles: extract(bytes) }; },
+    };
+}
+
+const rar4Format: InstallerFormat<{ bytes: Uint8Array; offset: number }> = {
+    id: 'rar4', label: 'RAR4 self-extractor',
+    detect(files) {
+        const candidates = [...files.values()].flatMap(bytes => {
+            const offset = findRar4(bytes);
+            return offset === null ? [] : [{ bytes, offset }];
+        });
+        if (candidates.length > 1) throw new Error('RAR4: multiple payloads; select one archive');
+        return candidates[0] ?? null;
+    },
+    async extract(_files, match, ctx) {
+        const codec = await makeLzma(ctx);
+        const files = extractRar4(new BufferSource(match.bytes), match.offset, {
+            createPpmSession: codec ? input => codec.createRarPpmSession(input) : undefined,
+        });
+        const inner = await extractInstallerFromFiles(files, ctx);
+        return { gameFiles: inner.gameFiles, note: `RAR4 → ${inner.via === 'none' ? 'installed file tree' : inner.note}` };
+    },
+};
+
+const INSTALLER_FORMATS: InstallerFormat<any>[] = [
+    eaWinzipFormat, msiFormat, installShieldFormat,
+    singlePayload('installshield3', 'InstallShield 3 Z archive', isInstallShield3, extractInstallShield3),
+    singlePayload('wise', 'Wise DEFLATE installer', isWise, extractWise),
+    singlePayload('vise', 'VISE object-table installer', isVise, extractVise),
+    rar4Format, freeArcFormat, pftwFormat, cabSfxFormat, innoFormat,
+];
 
 // --- the recursion ------------------------------------------------------------------
 

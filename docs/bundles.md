@@ -104,6 +104,29 @@ or archives and CAB self-extracting EXEs, including direct game payloads and
 PackageForTheWeb wrappers around InstallShield media. Cabinet decompression uses
 the project's existing CAB reader and its supported codecs.
 
+`bun tools/installer-extract.ts installer.exe output-dir --report evidence.json` uses the
+shared format registry, including nested installers inside ZIPs and RAR4 self-extractors.
+Extraction requires an empty destination. `--list` validates and decodes the payload without
+writing it. Reports contain the source SHA256, file counts, sizes and every extracted file's
+SHA256. Pack the extracted directory with `make-wgb`; installer actions and registry scripts
+are not executed, so required registry settings still belong in the bundle metadata.
+
+The browser's installer and ZIP imports use the same readers:
+
+| Payload | Supported scope |
+|---|---|
+| Wise | Static `%MAINDIR%` file records backed by raw DEFLATE streams; stream CRCs and declared file extents are verified |
+| InstallShield 3 `data.z` | Directory/file tables and PKWARE DCL compression; decoded lengths are verified and empty directories retained |
+| VISE | ESIV static object tables with folder/file and shortcut records; word-swapped DEFLATE with 16-bit stored-block alignment, file CRCs and empty directories |
+| RAR4 / RAR SFX | Stored entries and non-solid version-29 LZ/PPMd blocks, including coding-table changes; header and file CRCs. Standard E8/E8E9, RGB, audio and delta filters; arbitrary VM programs are rejected |
+
+RAR4 split volumes, solid groups, encryption, Unicode filename coding and other compression
+versions are rejected explicitly. RAR5 retains its existing stored-entry and multi-volume
+reader. `bun tools/rar-extract.ts archive.rar output-dir` also detects RAR4 SFX files.
+PPMd uses the shared Rust WASM backend; rebuild it with `bun run build:unpack-streaming`
+after changing the codec. Wise and VISE script variants and compression methods outside
+these static layouts fail explicitly.
+
 `bun tools/nsis-extract.ts installer.exe output-dir [--list]` reads static file sections
 from ANSI NSIS 2 installers using non-solid zlib compression. It checks the installer
 CRC and follows `$INSTDIR`/`$OUTDIR` paths and static variable aliases without running

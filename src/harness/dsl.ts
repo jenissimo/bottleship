@@ -337,6 +337,9 @@ export class HarnessChain {
     }): this { return this.push("screenPixels", [opts]); }
     /** Snapshot the screen for a later screenChangeSince() per-pixel compare. */
     screenMark(): this { return this.push("screenMark", []); }
+    counterRate(address: number, opts?: { sampleMs?: number; intervalMs?: number; bits?: 16 | 32 }): this {
+        return this.pushTimed("counterRate", [address, opts], (opts?.sampleMs ?? 3000) + 5_000);
+    }
     /** WHICH pixels changed since screenMark(). `allow` names the rects that were
      *  SUPPOSED to repaint: `outside.changed` is the scope finding, and each allow
      *  rect's own count is the positive control that the transition happened at all. */

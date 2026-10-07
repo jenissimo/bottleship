@@ -120,6 +120,7 @@ full playability.
 | Harry Potter and the Chamber of Secrets demo | Original English PC demo: launcher starts the real game process; entered the level, moved and collected beans. Selected English dialogue and localization files are installed in the WGB | ✓ |
 | NFS Underground 2 demo | Original English PC demo: Free Roam and the City Hall Circuit race with three AI opponents verified; rendered city, traffic and HUD, acceleration, braking, reverse and steering. Production HTTP launch and race tested; cold startup/level loading can take several minutes. Persistence remains unverified | ✓ |
 | Gothic USA demo 1.08h | English demo: Diego dialogue exit, rendered subtitles/HUD, movement and native saving verified. WGB recreates the required save directories; slots and thumbnails survive page reload. Restoring a saved game can stall in a resource-thread wait; further stability testing is pending | ✓ |
+| Cossacks: European Wars demo | Original Wise demo: rendered menu and playable random map; primary scanout and palette animation verified. Native Slow mode with a 50 ms interval gives 20 simulation steps/s | |
 | Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
@@ -128,11 +129,10 @@ The following demo installers have been acquired but are not ready for the publi
 
 | Demo source | Packaging result |
 |---|---|
-| [Cossacks: European Wars](https://archive.org/details/cossacks_202006) | Wise installer; this format is not supported by the project reader |
-| [Mafia](https://archive.org/details/Mafia_201405) | RAR4 self-extractor; the project reader supports RAR5 stored entries |
-| [Carmageddon II](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | ZIP contains an older InstallShield data.z payload, outside the supported cabinet formats |
-| [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | VISE installer; payload is not supported by the current format reader |
-| [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | RAR4 self-extractor wrapping an InstallShield cabinet set; the outer compression is not supported |
+| [Mafia](https://archive.org/details/Mafia_201405) | RAR4 LZ reader extracts 27 files with CRC verification; WGB prepared. After the normal first-run Setup dialog's Save and exit and a cold relaunch, entered the rendered mission with a car, city and HUD |
+| [Carmageddon II](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | ZIP → InstallShield 3 `data.z` reader extracts 1,605 files with decoded-size checks; WGB prepared. Cold launch reaches a rendered Controls screen; race entry remains unverified |
+| [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | VISE reader extracts 55 game files with CRC verification; WGB prepared. Cold launch reaches the rendered main menu; level entry remains unverified |
+| [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | RAR4 → InstallShield cabinet recursion extracts 625 files with outer CRC and inner size/MD5 verification; WGB prepared. Cold launch reaches the rendered demo splash; match entry remains unverified |
 
 Time-limited shareware trials are excluded from the demo catalog, including Alice Greenfingers,
 Montezuma, Natalie Brooks, Farm Frenzy and House of 1000 Doors.

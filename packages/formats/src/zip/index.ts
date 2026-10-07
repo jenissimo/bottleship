@@ -1,4 +1,5 @@
 import { asBlobPart } from "../dom-buffer";
+import { inflateRawSync as inflateRawInto } from './inflate';
 
 // Synchronous inflate — usable where DecompressionStream is not (guest traps).
 export { adler32, inflateRawSync, inflateZlibSync } from "./inflate";
@@ -433,7 +434,7 @@ export class ZipArchive {
         const compressed = await this.source.readRange(dataStart, dataEnd);
 
         if (entry.compression === 8) {
-            return inflateRaw(compressed);
+            return inflateRaw(compressed, entry.uncompressedSize);
         }
         throw new Error(`Unsupported compression ${entry.compression} for ${entry.name}`);
     }
@@ -535,9 +536,11 @@ export async function unzipToMap(data: Uint8Array): Promise<Map<string, Uint8Arr
     return out;
 }
 
-async function inflateRaw(data: Uint8Array): Promise<Uint8Array> {
+async function inflateRaw(data: Uint8Array, expectedSize: number): Promise<Uint8Array> {
     if (typeof DecompressionStream === "undefined") {
-        throw new Error("DecompressionStream unavailable");
+        const out = new Uint8Array(expectedSize), result = inflateRawInto(data, out);
+        if (result.status !== 'ok' || result.written !== expectedSize) throw new Error(`ZIP: invalid DEFLATE (${result.status}, ${result.written}/${expectedSize})`);
+        return out;
     }
     const stream = new Blob([asBlobPart(data)]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
     const buf = await new Response(stream).arrayBuffer();

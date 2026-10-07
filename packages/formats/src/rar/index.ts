@@ -5,7 +5,8 @@
  * what the game-distribution `.rar` we actually meet contains (a store-only wrapper around
  * an installer, so the bytes are already there and only need to be sliced out). The RAR
  * compression methods are a separate LZSS/PPMd stack; this reader REFUSES them by name
- * rather than returning wrong bytes, and the same goes for RAR 1.5-4.x and for encryption
+ * rather than returning wrong bytes. The separate rar4.ts reader handles RAR 2.9 coding.
+ * This RAR5 entrypoint refuses older headers and encryption
  * in either form — whole-archive (a CRYPT header) or per-file (`rar -p`, an extra-area
  * record behind otherwise readable headers). Multi-volume sets are enumerated per volume;
  * a file split across volumes is reported as such so a caller can concatenate its parts.
@@ -15,6 +16,8 @@
  */
 
 import type { RandomAccessSource } from "../unpack/source";
+export { findRar4, parseRar4, extractRar4 } from './rar4';
+export type { Rar4Entry, Rar4Archive, Rar4Options } from './rar4';
 
 export const RAR5_SIGNATURE = Uint8Array.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]);
 const RAR4_SIGNATURE = Uint8Array.from([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]);

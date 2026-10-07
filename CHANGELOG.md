@@ -2,6 +2,9 @@
 
 ## 2026-10-07
 
+- Added the original Cossacks: European Wars demo to the public catalog. Primary DirectDraw scanout observes directly mapped indexed pixels and palette changes; queued presentation re-derives guest memory after yields. The bundle uses native Slow mode with a 50 ms simulation interval.
+- Added self-hosted Wise, VISE, InstallShield 3 and non-solid RAR4 LZ/PPMd payload readers with checksum validation, shared browser import and extraction CLI support. Unsupported script/compression variants fail explicitly.
+
 - Added self-hosted MSI payload extraction and a CLI, including compound-file streams, installed directory/file tables, embedded or adjacent cabinets, and installed-file size/MD5 validation. Appended Microsoft Cabinet self-extractors can also be opened directly; installer custom actions are not executed.
 - D3D9 frame capture now records the separate render worker's draws without blocking future frame messages; remote Present closes the recording at the frame boundary. Overlapping requests and capture timeouts are handled explicitly.
 
