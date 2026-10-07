@@ -30,9 +30,9 @@
 // the guest is copying out).
 //
 // SAB LAYOUT (single outstanding request — the guest is single-threaded):
-//   [0, 128)           control    Int32Array(32) — Atomics futex + counters
-//   [128, 160)         meta       Float64Array(4) — 64-bit request offset/len
-//   [160, 160+DATA)    data       Uint8Array     — response payload arena
+//   [0, 256)           control    Int32Array(64) — Atomics futex + counters
+//   [256, 288)         meta       Float64Array(4) — 64-bit request offset/len
+//   [288, 288+DATA)    data       Uint8Array     — response payload arena
 //
 // The control block is oversized on purpose: it is the only channel through which
 // the I/O worker's diagnostics reach the guest without a message round-trip, and a
@@ -43,10 +43,10 @@
  *  directory reads, future larger runs). Requests past this are chunked. */
 export const DATA_BYTES = 16 * 1024 * 1024;
 
-export const CTL_BYTES = 128;
+export const CTL_BYTES = 256;
 export const META_BYTES = 32;
-export const META_OFFSET_BYTES = CTL_BYTES;          // 32
-export const DATA_OFFSET_BYTES = CTL_BYTES + META_BYTES; // 64
+export const META_OFFSET_BYTES = CTL_BYTES;          // 256
+export const DATA_OFFSET_BYTES = CTL_BYTES + META_BYTES; // 288
 export const SAB_TOTAL_BYTES = DATA_OFFSET_BYTES + DATA_BYTES;
 
 // ---- control Int32Array indices (Atomics) ----
@@ -122,7 +122,17 @@ export const CTL_IO_PREFETCH_EVICTED_UNREAD_KB = 22;
 /** Async (non-blocking) requests served over the postMessage channel. */
 export const CTL_IO_ASYNC_REQS = 23;
 
-export const CTL_WORDS = 32;
+export const CTL_IO_CHUNKS_DISK_HIT = 24;
+export const CTL_IO_DISK_CHUNKS = 25;
+export const CTL_IO_FILL_FETCHES = 26;
+export const CTL_IO_FILL_KB = 27;
+export const CTL_IO_DISK_ARMED = 28;
+export const CTL_IO_DEAD = 29;
+export const CTL_REQ_SEQ = 30;
+export const CTL_IO_HEARTBEAT = 31;
+export const CTL_IO_DISK_COMPLETE = 32;
+export const CTL_IO_DISK_WRITE_FAILURES = 33;
+export const CTL_WORDS = 64;
 
 /**
  * The shape of the shared arena, as the compiling side sees it. Both workers import
@@ -223,6 +233,13 @@ export interface IoWorkerStats {
     requests: number;
     chunksNeeded: number;
     chunksResidentHit: number;
+    chunksDiskHit: number;
+    diskChunks: number;
+    diskArmed: boolean;
+    diskComplete: boolean;
+    diskWriteFailures: number;
+    fillFetches: number;
+    fillKB: number;
     chunksJoinedInflight: number;
     chunksFetchedCold: number;
     chunksRefetchedAfterEvict: number;
@@ -246,6 +263,13 @@ export function readIoWorkerStats(ctl: Int32Array): IoWorkerStats {
         requests: g(CTL_REQS),
         chunksNeeded: g(CTL_IO_CHUNKS_NEEDED),
         chunksResidentHit: g(CTL_IO_CHUNKS_RESIDENT_HIT),
+        chunksDiskHit: g(CTL_IO_CHUNKS_DISK_HIT),
+        diskChunks: g(CTL_IO_DISK_CHUNKS),
+        diskArmed: g(CTL_IO_DISK_ARMED) === 1,
+        diskComplete: g(CTL_IO_DISK_COMPLETE) === 1,
+        diskWriteFailures: g(CTL_IO_DISK_WRITE_FAILURES),
+        fillFetches: g(CTL_IO_FILL_FETCHES),
+        fillKB: g(CTL_IO_FILL_KB),
         chunksJoinedInflight: g(CTL_IO_CHUNKS_JOINED_INFLIGHT),
         chunksFetchedCold: g(CTL_IO_CHUNKS_FETCHED_COLD),
         chunksRefetchedAfterEvict: g(CTL_IO_CHUNKS_REFETCHED_AFTER_EVICT),

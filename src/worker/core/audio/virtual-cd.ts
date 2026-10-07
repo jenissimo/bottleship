@@ -577,7 +577,7 @@ export class VirtualCdAudio {
             let filled = 0;
             while (filled < size) {
                 const want = Math.min(TRACK_READ_CHUNK_BYTES, size - filled);
-                const chunk = vfs.readSync(handle, want) ?? await vfs.read(handle, want);
+                const chunk = vfs.readSync(handle, want, "park-preferred") ?? await vfs.read(handle, want);
                 if (!chunk || chunk.length === 0) break;
                 out.set(chunk, filled);
                 filled += chunk.length;
@@ -748,7 +748,7 @@ export class VirtualCdAudio {
         try {
             const size = System.getInstance().fileSystem.getFileSize(file);
             if (size <= 0) return 0;
-            const info = probeAudio(new VfsAudioSource(file, size));
+            const info = probeAudio(new VfsAudioSource(file, size, "may-block"));
             return info && info.durationMs > 0 ? Math.round(info.durationMs) : 0;
         } catch (e) {
             Logger.warn(LogCategory.SYSTEM, `VirtualCd: probe "${file}" failed: ${e}`);

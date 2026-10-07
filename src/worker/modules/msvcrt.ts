@@ -1759,7 +1759,7 @@ export class Msvcrt implements IModule {
             if (LARGE_IO_TRACE_ENABLED) Logger.verbose(LogCategory.KERNEL32, `fscanf("${stream.handle.path}") fmt=${JSON.stringify(format)} assigned=${assigned} consumed=${consumed}`);
             return eof && assigned === 0 ? -1 : assigned;
         };
-        const sync = vfs.readSync(stream.handle, CHUNK);
+        const sync = vfs.readSync(stream.handle, CHUNK, "park-preferred");
         if (sync !== null) return apply(sync);
         return (async (): Promise<ThunkResult> => {
             try { const b = await vfs.read(stream.handle, CHUNK); return { value: apply(b) >>> 0 }; }
@@ -1860,7 +1860,7 @@ export class Msvcrt implements IModule {
         }
         const vfs = System.getInstance().fileSystem;
         const want = count >>> 0;
-        const synced = vfs.readIntoSync(handle, mem, buffer, want);
+        const synced = vfs.readIntoSync(handle, mem, buffer, want, "park-preferred");
         if (synced !== null) {
             return synced;
         }
@@ -1872,7 +1872,7 @@ export class Msvcrt implements IModule {
                 return { value: -1 };
             }
             try {
-                const bytesRead = await vfs.readInto(handle, freshMem, buffer, want);
+                const bytesRead = await vfs.readInto(handle, () => Mem.getView()!, buffer, want);
                 if (bytesRead < 0) {
                     this.setErrno(5);
                     return { value: -1 };
@@ -3089,7 +3089,7 @@ export class Msvcrt implements IModule {
         if (totalBytes === 0) return 0;
         const vfs = System.getInstance().fileSystem;
         const startPos = stream.handle.position;
-        const synced = vfs.readIntoSync(stream.handle, mem, bufPtr, totalBytes);
+        const synced = vfs.readIntoSync(stream.handle, mem, bufPtr, totalBytes, "park-preferred");
         if (synced !== null) {
             if (LARGE_IO_TRACE_ENABLED) traceLargeRead('fread', stream.handle.path, stream.fd, startPos, totalBytes, synced);
             return Math.floor(synced / elemSize);
@@ -3099,7 +3099,7 @@ export class Msvcrt implements IModule {
             const freshMem = Mem.getView();
             if (!freshMem) return { value: 0 };
             try {
-                const bytesRead = await vfs.readInto(stream.handle, freshMem, bufPtr, totalBytes);
+                const bytesRead = await vfs.readInto(stream.handle, () => Mem.getView()!, bufPtr, totalBytes);
                 if (LARGE_IO_TRACE_ENABLED) traceLargeRead('fread', stream.handle.path, stream.fd, startPos, totalBytes, bytesRead);
                 return { value: Math.floor(bytesRead / elemSize) };
             } catch {
@@ -3199,7 +3199,7 @@ export class Msvcrt implements IModule {
         // closure below, which resumes the loop to completion.
         let step: IteratorResult<void, number> = loop.next(EMPTY_BYTES);
         while (!step.done) {
-            const data = vfs.readSync(stream.handle, 1);
+            const data = vfs.readSync(stream.handle, 1, "park-preferred");
             if (data === null) {
                 // Not resident — finish the SAME loop on the async thunk path.
                 return (async (): Promise<ThunkResult> => {
@@ -3451,13 +3451,13 @@ export class Msvcrt implements IModule {
                     return Mem.readUint8(bufPtr) ?? -1;             // return first byte
                 };
                 const view = Mem.getView();
-                const sync = view ? vfs.readIntoSync(stream.handle, view, bufPtr, Msvcrt.GETC_CHUNK) : null;
+                const sync = view ? vfs.readIntoSync(stream.handle, view, bufPtr, Msvcrt.GETC_CHUNK, "park-preferred") : null;
                 if (sync !== null) return fillFromChunk(sync);
                 return (async (): Promise<ThunkResult> => {
                     const m = Mem.getView();
                     if (!m) return { value: 0xffffffff };
                     try {
-                        const n = await vfs.readInto(stream.handle, m, bufPtr, Msvcrt.GETC_CHUNK);
+                        const n = await vfs.readInto(stream.handle, () => Mem.getView()!, bufPtr, Msvcrt.GETC_CHUNK);
                         return { value: fillFromChunk(n) >>> 0 };
                     } catch { return { value: 0xffffffff }; }
                 })();
@@ -3465,7 +3465,7 @@ export class Msvcrt implements IModule {
             // malloc failed — fall through to single-byte read below.
         }
 
-        const data = vfs.readSync(stream.handle, 1);
+        const data = vfs.readSync(stream.handle, 1, "park-preferred");
         // null is "not resident — await it", NOT end of file. Collapsing the two reports
         // EOF on the first cold block of a streamed bundle.
         if (data === null) {

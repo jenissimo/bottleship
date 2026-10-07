@@ -8,6 +8,8 @@
  *   bun tools/harness.ts run <script.ts>    run a *.harness.ts fluent script
  *   bun tools/harness.ts repl               interactive: eval lines in the page
  *   bun tools/harness.ts health             probe Vite/log-server/Chrome
+ *   bun tools/harness.ts ioProfile [file]    export ordered streamed-bundle first touches
+ *   bun tools/harness.ts ioPhase <phase>     label subsequent first touches
  *   bun tools/harness.ts eval <expr>        one-off page eval (debug)
  *   bun tools/harness.ts heapsample [sec] [top] [--major]   rank the worker's JS allocation sites
  *                                           (GC pressure; --major = only what full GCs reclaim)
@@ -942,6 +944,15 @@ async function main(): Promise<void> {
         case "run": await cmdRun(rest[0]); break;
         case "repl": await cmdRepl(); break;
         case "health": await cmdHealth(); break;
+        case "ioProfile": {
+            const result = await execViaCdp([{ cmd: "ioProfile", args: [] } as HarnessStep]);
+            const profile = result.steps?.[0]?.result;
+            if (!profile) throw new Error("ioProfile returned no profile");
+            const output = rest[0] ?? artifact("logs/bundle.wgb.profile");
+            await Bun.write(output, JSON.stringify(profile, null, 2));
+            console.log(output);
+            break;
+        }
         case "eval": await cmdEval(rest.join(" ")); break;
         case "worker-eval": await cmdWorkerEval(rest.join(" ")); break;
         case "stack": await cmdStack(rest[0]); break;

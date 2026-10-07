@@ -894,7 +894,7 @@ export class Crtdll implements IModule {
         const vfs = System.getInstance().fileSystem;
         const want = count >>> 0;
         const startPos = handle.position;
-        const synced = vfs.readIntoSync(handle, mem, buffer, want);
+        const synced = vfs.readIntoSync(handle, mem, buffer, want, "park-preferred");
         if (synced !== null) {
             if (LARGE_IO_TRACE_ENABLED) traceLargeRead('_read', handle.path, fd, startPos, want, synced);
             return synced;
@@ -908,7 +908,7 @@ export class Crtdll implements IModule {
                 return { value: -1 };
             }
             try {
-                const bytesRead = await vfs.readInto(handle, freshMem, buffer, want);
+                const bytesRead = await vfs.readInto(handle, () => Mem.getView()!, buffer, want);
                 if (bytesRead < 0) {
                     this.setErrno(5);
                     return { value: -1 };

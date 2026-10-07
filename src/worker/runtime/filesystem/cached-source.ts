@@ -92,6 +92,8 @@ export interface CachedSourceOptions {
     prefetchDepthRuns?: number;
     /** Optional label for diagnostics. */
     name?: string;
+    syncAlignmentBytes?: number;
+    recordProfile?: boolean;
 }
 
 export class CachedSource implements ZipSource {
@@ -118,6 +120,12 @@ export class CachedSource implements ZipSource {
      *  `prefetchAhead * prefetchDepthRuns` blocks ahead of this. */
     private globalCursorBlock = -1;
     private readonly name: string;
+    private readonly syncAlignment: number;
+    private closed = false;
+    private readonly profileStart = performance.now();
+    private profilePhase = "loading";
+    private readonly access: Array<{ granule: number; ms: number; phase: string; entryName?: string }> | null;
+    private readonly fileAccess = new Map<string, { entryName: string; ms: number; phase: string }>();
 
     /** blockIndex → resident block bytes (last block may be shorter at EOF). */
     private readonly blocks = new Map<number, Uint8Array>();
@@ -196,7 +204,9 @@ export class CachedSource implements ZipSource {
         this.prefetchAhead = Math.max(0, Math.floor(opts.prefetchAheadBlocks ?? 0));
         this.prefetchDepthRuns = Math.max(1, Math.floor(opts.prefetchDepthRuns ?? 1));
         this.name = opts.name ?? "cached";
-        this.syncFaultCapable = typeof inner.readRangeSync === "function";
+        this.syncAlignment = opts.syncAlignmentBytes ?? 0;
+        this.access = opts.recordProfile ? [] : null;
+        this.syncFaultCapable = typeof inner.readRangeSync === "function" && inner.syncFaultCapable !== false;
         this.touched = new Uint8Array(Math.ceil(Math.max(1, this.size) / TOUCH_GRANULE / 8));
     }
 
@@ -210,6 +220,7 @@ export class CachedSource implements ZipSource {
      *  (msvcrt getc) off a per-byte inner read: one inner fault per 256 KiB block,
      *  the rest from RAM. */
     readRangeSync(start: number, end: number, hint?: ReadHint): Uint8Array | null {
+        if (this.closed) throw new Error("CachedSource closed");
         const [s, e] = this.clamp(start, end);
         if (e <= s) return new Uint8Array(0);
 
@@ -239,7 +250,7 @@ export class CachedSource implements ZipSource {
 
         const out = this.assemble(datas, first, last, s, e);
         this._syncHits++;
-        this.markTouched(s, e);
+        this.markTouched(s, e, hint);
         // Advance the read cursor and top the prefetch pipeline back up — done on
         // resident HITS too, so a sequential scan through already-prefetched blocks
         // keeps the window full instead of draining until the next cold fault.
@@ -251,6 +262,7 @@ export class CachedSource implements ZipSource {
     /** Asynchronous read. Faults in any missing covering blocks (coalesced),
      *  caches them, then assembles. */
     async readRange(start: number, end: number, hint?: ReadHint): Promise<Uint8Array> {
+        if (this.closed) throw new Error("CachedSource closed");
         const [s, e] = this.clamp(start, end);
         if (e <= s) return new Uint8Array(0);
 
@@ -260,19 +272,21 @@ export class CachedSource implements ZipSource {
 
         // Hold direct references to every covering block's bytes so assembly is
         // immune to eviction that may happen as later blocks are inserted.
-        const datas: Uint8Array[] = [];
+        const pending: Promise<Uint8Array>[] = [];
+        for (let b = first; b <= last; b++) pending.push(this.ensureBlock(b, hint));
+        const datas = await Promise.all(pending);
         for (let b = first; b <= last; b++) {
-            datas.push(await this.ensureBlock(b, hint));
             this.prefetchedUnread.delete(b);
             this.readaheadUnread.delete(b);
         }
 
-        this.markTouched(s, e);
+        this.markTouched(s, e, hint);
         return this.assemble(datas, first, last, s, e);
     }
 
     /** Best-effort passthrough so wrapping a closable source (SAH) still cleans up. */
     close(): void {
+        this.closed = true;
         const inner = this.inner as ZipSource & { close?: () => void };
         if (typeof inner.close === "function") {
             try { inner.close(); } catch { /* best-effort */ }
@@ -356,15 +370,27 @@ export class CachedSource implements ZipSource {
         this.hintSequential = hint.sequential;
     }
 
-    /** Mark [s,e) delivered. Granule-rounded, so it over-states a scattered read and
-     *  cannot under-state one — the direction that keeps the ratio it feeds honest. */
-    private markTouched(s: number, e: number): void {
+    setProfilePhase(phase: string): void { this.profilePhase = phase; }
+
+    profile(): { version: 1; size: number; granuleBytes: number; accesses: NonNullable<CachedSource["access"]>; files: Array<{ entryName: string; ms: number; phase: string }> } {
+        return { version: 1, size: this.size, granuleBytes: TOUCH_GRANULE, accesses: this.access?.slice() ?? [], files: [...this.fileAccess.values()] };
+    }
+
+    /** Delivered bytes only; file order is independent because small files share granules. */
+    private markTouched(s: number, e: number, hint?: ReadHint): void {
+        if (this.access && hint?.entryName && !hint.speculative) {
+            const key = hint.entryName.toLowerCase();
+            if (!this.fileAccess.has(key)) this.fileAccess.set(key, { entryName: hint.entryName, ms: performance.now() - this.profileStart, phase: this.profilePhase });
+        }
         const firstG = Math.floor(s / TOUCH_GRANULE);
         const lastG = Math.floor((e - 1) / TOUCH_GRANULE);
         for (let g = firstG; g <= lastG; g++) {
             const byte = g >> 3, bit = 1 << (g & 7);
             if (byte >= this.touched.length) break;
-            if ((this.touched[byte] & bit) === 0) { this.touched[byte] |= bit; this._touchedGranules++; }
+            if ((this.touched[byte] & bit) === 0) {
+                this.touched[byte] |= bit; this._touchedGranules++;
+                this.access?.push({ granule: g, ms: performance.now() - this.profileStart, phase: this.profilePhase, entryName: hint?.entryName });
+            }
         }
     }
 
@@ -418,24 +444,26 @@ export class CachedSource implements ZipSource {
         innerSync: (start: number, end: number, hint?: ReadHint) => Uint8Array | null,
         hint?: ReadHint,
     ): Uint8Array | null {
-        const lastBlock = this.lastBlockFor(hint);
+        const aligned = this.syncAlignment > 0 && this.syncAlignment % this.blockSize === 0;
+        const firstBlock = aligned ? Math.floor(b * this.blockSize / this.syncAlignment) * this.syncAlignment / this.blockSize : b;
+        const lastBlock = Math.min(this.lastBlockFor(hint), aligned ? firstBlock + this.syncAlignment / this.blockSize - 1 : Infinity);
         let endBlock = b;
         while (
-            endBlock - b + 1 < this.syncReadahead &&
+            endBlock - firstBlock + 1 < this.syncReadahead &&
             endBlock < lastBlock &&
             !this.blocks.has(endBlock + 1)
         ) {
             endBlock++;
         }
 
-        const runStart = b * this.blockSize;
+        const runStart = firstBlock * this.blockSize;
         const runEnd = Math.min(this.size, (endBlock + 1) * this.blockSize);
         const buf = innerSync(runStart, runEnd, hint);
         if (!buf) return null;
         this._faults++;
         this._blockingFaults++;
         this._faultBlocksAsked++;
-        this._faultBlocksReadahead += endBlock - b;
+        this._faultBlocksReadahead += endBlock - firstBlock;
         for (let rb = b + 1; rb <= endBlock; rb++) this.readaheadUnread.add(rb);
         if (hint === undefined) this._faultsUnhinted++;
         else if (hint.sequential) this._faultsSequential++;
@@ -448,11 +476,14 @@ export class CachedSource implements ZipSource {
         // itself is driven from readRangeSync after the whole read resolves.
         if (endBlock + 1 > this.prefetchFrontier) this.prefetchFrontier = endBlock + 1;
 
-        if (endBlock === b) {
+        if (endBlock === b && firstBlock === b) {
             this.insert(b, buf);
             return buf;
         }
-        return this.insertRun(b, endBlock, buf);
+        if (firstBlock === b) return this.insertRun(b, endBlock, buf);
+        const requested = buf.slice((b - firstBlock) * this.blockSize, (b - firstBlock + 1) * this.blockSize);
+        this.insertRun(firstBlock, endBlock, buf);
+        return requested;
     }
 
     /** Split a multi-block run buffer into per-block slices and cache them.
@@ -485,7 +516,7 @@ export class CachedSource implements ZipSource {
      *  than speculatively pulling the rest of a multi-GB bundle. Errors are
      *  swallowed — the sync path re-faults on demand. */
     private pumpPrefetch(): void {
-        if (!this.prefetchAhead || this.size === 0) return;
+        if (this.closed || !this.prefetchAhead || this.size === 0) return;
         // A hinting caller that says it is not scanning gets no speculation: NT reads
         // ahead off the file object's own sequential state for the same reason.
         if (this.hintSequential === false) return;
@@ -582,6 +613,7 @@ export class CachedSource implements ZipSource {
     }
 
     private insert(b: number, data: Uint8Array): void {
+        if (this.closed) return;
         // Never cache a SHORT block. blockBounds already clamps the legitimate last block
         // to `size`, so anything below that width is a short inner read — caching it would
         // make every later hit on this block serve a zero-filled tail from RAM, with no

@@ -1,3 +1,4 @@
+import { wgbEtag } from "../../deploy/wgb-etag";
 /**
  * BottleShip dev sidecar (:3001) — the local process that does the things the browser cannot,
  * for both the app and the agent harness. Five roles:
@@ -426,8 +427,8 @@ function wgbHeaders(req: Request): Record<string, string> {
   const origin = req.headers.get("origin");
   const h: Record<string, string> = {
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-    "Access-Control-Allow-Headers": "Range",
-    "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+    "Access-Control-Allow-Headers": "Range, If-Range",
+    "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges, ETag",
     "Cross-Origin-Resource-Policy": "cross-origin",
     Vary: "Origin",
   };
@@ -464,7 +465,10 @@ async function serveWgb(req: Request, url: URL): Promise<Response> {
     "Content-Type": "application/octet-stream",
   };
 
-  const range = req.headers.get("range");
+  headers.ETag = await wgbEtag(file);
+  headers["Cache-Control"] = "no-cache";
+  const validator = req.headers.get("if-range");
+  const range = !validator || validator === headers.ETag ? req.headers.get("range") : null;
   const m = range ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
   if (m) {
     let start: number, end: number;

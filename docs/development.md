@@ -37,8 +37,11 @@ The server must send `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` (SAB) and honor HTTP `Range` requests (so large
 `.wgb` bundles stream instead of fully downloading). `deploy/server.ts` does both; any static
 host works as long as it sets those headers and supports ranges. A reverse proxy in front must
-not buffer or cache these responses — a proxy that turns a `206` into a `200` breaks bundle
-streaming.
+preserve `Range`, `If-Range`, `ETag`, `Content-Range` and the 206 status. Streaming requires
+a strong ETag; otherwise the loader stages a full local copy. Serve browser traffic
+through a TLS reverse proxy with HTTP/2: the Bun server itself uses plain HTTP/1.1,
+whose browser connection limit also constrains concurrent bundle requests. Range-aware
+proxy caching is safe when its keys include the object version and byte range.
 
 Optional env, all off by default:
 
@@ -66,7 +69,9 @@ A catalog entry can also set `"preload": true` (stand config: per game, or once 
 the bundle is downloaded to OPFS before the game starts instead of being streamed on demand.
 Streaming wins on a fast local origin — a big game boots after fetching only what the boot path
 reads — but it costs one round trip per read, so a game that keeps pulling files at runtime
-crawls over a high-latency link. Preloading trades a wait up front for no stalls afterwards.
+crawls over a high-latency link. Preloading trades a wait up front for local reads afterwards.
+The `io` field supports more selective policies and profile preload; see
+[runtime I/O policy](bundles.md#runtime-io-policy-and-access-profiles).
 
 ## Quality gate
 

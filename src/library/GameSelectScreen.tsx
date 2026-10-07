@@ -38,6 +38,7 @@ export interface GameEntry {
    *  Worth it wherever range round-trips are expensive (self-hosted stand behind a
    *  reverse proxy, high-RTT link): one sequential download beats hundreds of reads. */
   preload?: boolean;
+  io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy;
 }
 
 interface GameSelectScreenProps {

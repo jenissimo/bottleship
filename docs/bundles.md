@@ -114,6 +114,52 @@ For a cabinet whose payload is demonstrably plaintext despite its obfuscation fl
 `unshield-extract.ts --ignore-obfuscation` provides explicit recovery; normal extraction
 honors the flag. Verify the original payload and retain size/checksum validation.
 
+## Runtime I/O policy and access profiles
+
+For URL bundles, the loader checks the full OPFS cache first. On a miss it streams
+versioned ranges and saves each chunk to a sparse OPFS copy. The default `stream+fill`
+mode starts an idle download after the first presented frame and promotes a complete
+copy for later launches. Demand reads take priority over readahead and fill.
+
+Set `emulator.io` in the manifest, `io` on a catalog/stand entry, or pass it to
+`loadApp(url, {io: {mode: "stream"}})`:
+
+| Mode | Behavior |
+| --- | --- |
+| `stream` | Persist requested chunks; no full background download |
+| `stream+fill` | Stream now and fill the remaining disk chunks after the first frame |
+| `preload-profile` | Fetch the profile's loading/first-level chunks before guest startup, then fill |
+| `preload-full` | Download the full bundle before guest startup |
+
+`preload: true` remains an alias for full preload. `preload-profile` requires
+`profileUrl`; `preloadPhases` can override the default `["loading", "first-level"]`.
+Runtime profiles must match the bundle URL, size and strong ETag exactly. A server
+without a strong ETag falls back to a full download. When OPFS is unavailable or quota
+is insufficient, streaming still works and cold async-capable reads park their caller;
+disk fill is unavailable.
+
+Record an uncached streamed run with the project harness, label a level transition,
+and export a profile beside the bundle:
+
+```powershell
+bun tools/harness.ts ioPhase first-level
+bun tools/harness.ts ioProfile C:/WGB/example.wgb.profile
+bun tools/harness.ts ioReport
+```
+
+`ioReport.gameplay.stallMsPerMinute` measures time spent in blocking SAB waits since
+the first frame. Async request latency is reported separately. Profiles include
+ordered 64 KiB first touches and file names; repacking uses names because offsets
+change:
+
+```powershell
+bun tools/make-wgb.ts C:/Games/Example C:/WGB/example.wgb --exe game.exe --order C:/WGB/example.wgb.profile --content-addressed
+```
+
+`--content-addressed` also writes `example.<sha256>.wgb`; deploy that URL for immutable
+edge caching. Re-record the runtime profile after repacking. Cloudflare caches ranges
+under URL+ETag+range and checks the current R2 version before serving them.
+
 ## A note on distribution
 
 The bundled/showcase set is limited to content that is legal to redistribute (freeware,
