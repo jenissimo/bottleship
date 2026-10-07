@@ -1,0 +1,8 @@
+{
+  "name": "bottleship",
+  "pages_build_output_dir": "./dist",
+  "compatibility_date": "2026-10-07",
+  "r2_buckets": [
+    { "binding": "APPS", "bucket_name": "bottleship-apps" }
+  ]
+}

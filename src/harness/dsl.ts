@@ -50,6 +50,10 @@ export class HarnessChain {
         this.steps.push({ cmd, args: ser(args) });
         return this;
     }
+    /** Address the source-owning parent even after a launcher promotes its child. */
+    callRoot(cmd: string, ...args: unknown[]): this {
+        return this.pushWithOpts(cmd, args, { target: "root" });
+    }
     private push(cmd: string, args: unknown[], label?: string): this {
         this.steps.push({ cmd, args: ser(args), label });
         return this;

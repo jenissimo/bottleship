@@ -44,6 +44,7 @@ export const onRequest: PagesFunction<Env> = async ({ params, request, env, wait
     cacheKey = new Request(url.toString());
     const hit = await cache.match(cacheKey);
     if (hit) {
+      headers.set("X-WGB-Cache", "HIT");
       headers.set("Content-Range", `bytes ${start}-${end}/${meta.size}`);
       headers.set("Content-Length", String(length));
       return new Response(hit.body, { status: 206, headers });
@@ -63,6 +64,7 @@ export const onRequest: PagesFunction<Env> = async ({ params, request, env, wait
   if (!ranged) return new Response(object.body, { status: 200, headers });
   headers.set("Content-Range", `bytes ${start}-${end}/${meta.size}`);
   headers.set("Content-Length", String(length));
+  headers.set("X-WGB-Cache", cacheKey ? "MISS" : "BYPASS");
   const response = new Response(object.body, { status: 206, headers });
   if (cacheKey) {
     const internalHeaders = new Headers(headers);

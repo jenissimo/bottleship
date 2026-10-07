@@ -47,6 +47,7 @@ describe("versioned edge chunks", () => {
         for (let i = 0; i < 2; i++) {
             const response = await f.call({ Range: "bytes=0-15", "If-Range": '"v1"' });
             expect(response.status).toBe(206);
+            expect(response.headers.get("x-wgb-cache")).toBe(i === 0 ? "MISS" : "HIT");
             expect(response.headers.get("content-range")).toBe("bytes 0-15/64");
             expect(new Uint8Array(await response.arrayBuffer())).toEqual(f.data.slice(0, 16));
         }
