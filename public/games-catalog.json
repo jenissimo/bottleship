@@ -389,5 +389,16 @@
     "genre": "Action RPG",
     "gogUrl": "https://www.gog.com/en/game/gothic",
     "enabled": true
+  },
+  {
+    "id": "nfs-underground2-demo",
+    "name": "Need for Speed: Underground 2",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/nfs-underground2-demo.wgb",
+    "coverUrl": "/covers/nfs-underground2-box.jpg",
+    "description": "Drive through Bayview in the original English PC racing demo.",
+    "year": "2004",
+    "genre": "Racing",
+    "enabled": true
   }
 ]
