@@ -59,14 +59,14 @@ interface GameSelectScreenProps {
 }
 
 type SourceFilter = "all" | "builtin" | "gog" | "local";
-type SortMode = "added" | "played" | "title" | "year";
+type SortMode = "featured" | "title" | "genre" | "year";
 type ViewMode = "grid" | "list";
 
 const SORT_LABELS: Record<SortMode, string> = {
-  added: "Recently added",
-  played: "Recently played",
+  featured: "Featured",
   title: "Title (A–Z)",
-  year: "Year",
+  genre: "Genre",
+  year: "Year (newest first)",
 };
 
 interface SupportLink {
@@ -104,7 +104,7 @@ export default function GameSelectScreen({
   const [query, setQuery] = React.useState("");
   const [view, setView] = React.useState<ViewMode>("grid");
   const [source, setSource] = React.useState<SourceFilter>("all");
-  const [sort, setSort] = React.useState<SortMode>("added");
+  const [sort, setSort] = React.useState<SortMode>("featured");
   const [srcMenuOpen, setSrcMenuOpen] = React.useState(false);
   const [sortMenuOpen, setSortMenuOpen] = React.useState(false);
   const [supportMenuOpen, setSupportMenuOpen] = React.useState(false);
@@ -155,6 +155,17 @@ export default function GameSelectScreen({
           return matches(g.name);
         })
       : [];
+
+  if (sort === "title") {
+    visibleBuiltin.sort((a, b) => a.name.localeCompare(b.name));
+    visibleAdded.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sort === "genre") {
+    visibleBuiltin.sort((a, b) => a.genre.localeCompare(b.genre) || a.name.localeCompare(b.name));
+    visibleAdded.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sort === "year") {
+    visibleBuiltin.sort((a, b) => Number(b.year) - Number(a.year) || a.name.localeCompare(b.name));
+    visibleAdded.sort((a, b) => (b.year ?? 0) - (a.year ?? 0) || a.name.localeCompare(b.name));
+  }
 
   const builtinCount = games.length;
   const gogCount = addedGames.filter(isGogAdded).length;

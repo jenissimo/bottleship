@@ -188,3 +188,13 @@ under URL+ETag+range and checks the current R2 version before serving them.
 The bundled/showcase set is limited to content that is legal to redistribute (freeware,
 shareware, demo episodes). Commercial games are **bring-your-own** — BottleShip does not ship
 their files. Keep your own bundles out of the repository.
+
+### Generated installer configuration
+
+Payload extraction does not run installer actions. The original Thief Gold demo keeps its resource archives beside THIEF.EXE and needs the generated install.cfg. For that layout, publish the saved configuration before testing the bundle:
+
+```powershell
+bun tools/wgb.ts replace C:/WGB/thief-gold-demo.wgb rom/install.cfg tools/demo-configs/thief-gold-install.cfg
+```
+
+The C: paths refer to the guest installation root, rather than the host source directory. A layout with archives under RES needs its resource path to point there instead.

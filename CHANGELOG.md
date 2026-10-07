@@ -2,6 +2,9 @@
 
 ## 2026-10-07
 
+- Added the original Thief Gold demo with the installer's native resource-path configuration. Thieves' Guild loads, with keyboard movement and mouse look verified.
+- The demo catalog opens with a curated selection followed by genre groups. The sort menu now orders games by title, genre or year and restores the featured selection.
+- Harness screenshots can save the composited screen mirror directly; `BS_URL_MATCH` selects a library page for UI checks through the same CDP connection.
 - Added the original Cossacks: European Wars demo to the public catalog. Primary DirectDraw scanout observes directly mapped indexed pixels and palette changes; queued presentation re-derives guest memory after yields. The bundle uses native Slow mode with a 50 ms simulation interval.
 - Added self-hosted Wise, VISE, InstallShield 3 and non-solid RAR4 LZ/PPMd payload readers with checksum validation, shared browser import and extraction CLI support. Unsupported script/compression variants fail explicitly.
 

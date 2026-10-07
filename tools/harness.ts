@@ -87,7 +87,7 @@ function artifact(path: string): string {
 
 async function ensureSession(): Promise<CdpSession> {
     if (_session) return _session;
-    const { session } = await connect();
+    const { session } = await connect({ urlMatch: process.env.BS_URL_MATCH });
     _session = session;
     return session;
 }
@@ -481,17 +481,25 @@ async function cmdFixture(mode: string, name: string, args: string[]): Promise<v
     throw new Error(`unknown fixture mode '${mode}' (save|restore)`);
 }
 
-/** shot [out.png] [--verify] — page screenshot to a file (browser-side ground truth).
- *  With --verify it also pulls the worker's own `shot` (the canvas read from inside the
- *  worker) and compares the two, so the screenshot verb can report its own failure
- *  instead of handing back a plausible image. */
+/** --mirror saves the composited present mirror without waiting for a browser frame. */
 async function cmdShot(out: string, ...flags: string[]): Promise<void> {
     const session = await ensureSession();
-    const b64 = await screenshot(session);
+    const mirror = out === "--mirror" || flags.includes("--mirror");
+    let b64: string;
+    if (mirror) {
+        const result = await runPageSteps(session, [{ cmd: "shot", args: [{ source: "screen" }] }]);
+        const shot = result.steps?.[0]?.result as { base64?: string; source?: string; composited?: boolean } | undefined;
+        if (!result.ok || !shot?.base64 || shot.source !== "screen" || !shot.composited) {
+            throw new Error(`screen mirror capture failed: ${JSON.stringify(result.error ?? shot)}`);
+        }
+        b64 = shot.base64;
+    } else {
+        b64 = await screenshot(session);
+    }
     const file = out && !out.startsWith("--") ? out : artifact("logs/harness-shot.png");
     await Bun.write(file, Buffer.from(b64, "base64"));
-    console.log(`screenshot -> ${file} (${b64.length} b64 chars)`);
-    if (out?.startsWith("--") || flags.includes("--verify")) await verifyShot(session);
+    console.log(`screenshot -> ${file} (${b64.length} b64 chars, ${mirror ? "screen mirror" : "browser"})`);
+    if (out === "--verify" || flags.includes("--verify")) await verifyShot(session);
 }
 
 /** Mean/max per-CHANNEL |Δ| between two PNGs, both downscaled to a 32x32 grid in the page
@@ -968,7 +976,7 @@ async function main(): Promise<void> {
         case "reload": await cmdReload(); break;
         case "regress": await cmdRegress(rest); break;
         case undefined:
-            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...] [--parent]>");
+            console.log("usage: bun tools/harness.ts <up|run <script>|repl|health|eval <expr>|worker-eval <expr>|fixture <save|restore> <name> [--container <id>]|shot [out.png] [--mirror] [--verify]|gridShot [out.png] [step]|trace <sec> [out.json.gz]|workers <sec> [--heap]|crashes [minutes]|reload|regress [--only <glob>]|device <profile>|tap <x> <y>|<any-harness-command> [args...] [--parent]>");
             process.exit(0);
             break;
         // Any other token is dispatched as a harness RPC command (report, stubs, backtrace,

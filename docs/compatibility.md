@@ -121,7 +121,7 @@ full playability.
 | NFS Underground 2 demo | Original English PC demo: Free Roam and the City Hall Circuit race with three AI opponents verified; rendered city, traffic and HUD, acceleration, braking, reverse and steering. Production HTTP launch and race tested; cold startup/level loading can take several minutes. Persistence remains unverified | ✓ |
 | Gothic USA demo 1.08h | English demo: Diego dialogue exit, rendered subtitles/HUD, movement and native saving verified. WGB recreates the required save directories; slots and thumbnails survive page reload. Restoring a saved game can stall in a resource-thread wait; further stability testing is pending | ✓ |
 | Cossacks: European Wars demo | Original Wise demo: rendered menu and playable random map; primary scanout and palette animation verified. Native Slow mode with a 50 ms interval gives 20 simulation steps/s | |
-| Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |
+| Thief Gold demo | Original demo: menu, Thieves Guild mission, movement and mouse look verified. Bundle includes the installer-generated install.cfg pointing at its root-level resource archives; without it the guest dereferences a missing interface image | |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
 
