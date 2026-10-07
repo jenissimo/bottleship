@@ -73,6 +73,13 @@ crawls over a high-latency link. Preloading trades a wait up front for local rea
 The `io` field supports more selective policies and profile preload; see
 [runtime I/O policy](bundles.md#runtime-io-policy-and-access-profiles).
 
+Cloudflare Pages uses `wrangler.jsonc` for the `APPS` R2 binding in preview and
+production. Both use `bottleship-apps`; bundle delivery only reads this bucket.
+The `X-WGB-Cache` response header identifies `HIT`, `MISS` or `BYPASS` on ranges.
+Run `tools/harness/diagnostics/wgb-http-smoke.ts` with `WGB_URL` set to a deployed
+bundle and `EXPECT_EDGE_CACHE=1` to check HEAD, pinned ranges, a real cache hit,
+If-Range mismatch and unsatisfiable ranges without downloading the full archive.
+
 ## Quality gate
 
 Run before sending a change — in this order:
