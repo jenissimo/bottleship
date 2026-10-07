@@ -21,7 +21,7 @@ interface QueueMessage {
     type: "queue"; batch: number; bytes: ArrayBuffer; end: number; splitRecordId: number;
     methodBase: number; methodNames: string[]; handlers: Array<[number, string, number]> | null;
 }
-interface RequestMessage { type: "request"; id: number; kind: string; reset?: boolean; slot?: number; texPtr?: number; method?: string; arm?: boolean; sites?: boolean }
+interface RequestMessage { type: "request"; id: number; kind: string; reset?: boolean; slot?: number; texPtr?: number; method?: string; arm?: boolean; sites?: boolean; timeoutMs?: number; maxVerts?: number; maxIndexedVerts?: number }
 interface FlagsMessage { type: "flags"; flags: Record<string, unknown> }
 /** The emulator worker's present target and quality: the internal scale is resolved from them. */
 interface TargetMessage { type: "target"; width: number; height: number; quality: unknown }
@@ -247,6 +247,20 @@ async function answer(msg: RequestMessage): Promise<void> {
                 const blob = twin ? await twin.capturePresentedLayer() : null;
                 value = blob ? new Uint8Array(await blob.arrayBuffer()) : null;
                 break;
+            }
+            case "captureFrame": {
+                const capture = await import("../modules/ddraw/frame-capture");
+                if (capture.isCapturing()) throw new Error("a D3D9 frame capture is already armed");
+                const recording = capture.startCapture("d3d9", { maxVerts: msg.maxVerts, maxIndexedVerts: msg.maxIndexedVerts });
+                const timer = setTimeout(() => capture.cancelCapture(new Error("no D3D9 frame presented within capture timeout")), msg.timeoutMs ?? 5000);
+                // Arm in message order, then release the queue: the next complete frame is
+                // carried by FUTURE queue messages. Awaiting it here prevents those messages
+                // from replaying and makes every capture time out.
+                void recording.then(
+                    (frame) => post({ type: "reply", id: msg.id, value: frame }),
+                    (error) => post({ type: "reply", id: msg.id, value: { error: String(error) } }),
+                ).finally(() => clearTimeout(timer));
+                return;
             }
             default:
                 value = { error: `unknown request ${msg.kind}` };

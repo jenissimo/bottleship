@@ -10,9 +10,8 @@
  *   construction: the guest never Locks it, it only renders/composites into it).
  * - expectSurfaceNonBlack(sel): cheap liveness assertion over a subsampled
  *   readback (reuses the existing dbgReadSurfacePixels nonBlackPct).
- * - captureFrame(): the RenderDoc-style per-draw capture. Works for the FFP
- *   backends (DDraw/D3D7, and D3D8 which loads the ddraw module's executor) via
- *   the existing frame-capture. D3D9 per-draw producers remain unimplemented.
+ * - captureFrame(): per-draw capture for DDraw/D3D7, D3D8 and D3D9, including
+ *   D3D9's separate render worker.
  */
 
 import type { HarnessService, HarnessCtx } from "../service";
@@ -586,7 +585,16 @@ export function registerTextureCommands(svc: HarnessService): void {
         });
         let frame: { drawCalls: Array<{ rtSurfacePtr: number; rtWidth: number; rtHeight: number; rtFormat?: string | null }> };
         try {
-            frame = await Promise.race([frameCaptureStart(opts.backend, { maxVerts: opts.maxVerts, maxIndexedVerts: opts.maxIndexedVerts }), aborted]);
+            const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+            const client = opts.backend === "d3d9" ? getD3D9RenderClient() : null;
+            const recording = client
+                ? client.request("captureFrame", { timeoutMs, maxVerts: opts.maxVerts, maxIndexedVerts: opts.maxIndexedVerts }).then((answer) => {
+                    const result = answer as typeof frame & { error?: string };
+                    if (!result || result.error || !Array.isArray(result.drawCalls)) throw new HarnessError(result?.error ?? "invalid render-worker frame capture", HarnessErrorCode.UNSUPPORTED);
+                    return result;
+                })
+                : frameCaptureStart(opts.backend, { maxVerts: opts.maxVerts, maxIndexedVerts: opts.maxIndexedVerts });
+            frame = await Promise.race([recording, aborted]);
         } catch (e) {
             frameCaptureCancel(e instanceof Error ? e : abortReason ?? new Error(String(e)));
             throw e;

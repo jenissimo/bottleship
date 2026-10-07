@@ -9108,8 +9108,10 @@ export class D3D9Device {
             // Close the render-boundary census frame on the same edge the serial advances, so a
             // per-frame row and its serial can never come from different boundaries.
             d3d9NoteRenderFrameBoundary(renderSvc.getGuestPresentSerial());
-            frameCapture.onFrameEnd("d3d9"); // harness CaptureBus frame boundary (D3D9)
         }
+        // A remote render worker owns its capture buffer and sees no guest-side Present.
+        // An in-process twin shares the front's buffer, so only the front closes it there.
+        if (guestSide || inRenderWorker()) frameCapture.onFrameEnd("d3d9");
 
         // Update frame snapshot for debug panel
         this.frameSnapshot.presents++;
