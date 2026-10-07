@@ -537,7 +537,10 @@ export class EmulatorConfig {
                 this.d3dCaps.wMaxTextureBlendStages = Math.max(1, Math.min(8, config.d3dCaps.wMaxTextureBlendStages));
             }
             if (config.d3dCaps.wMaxSimultaneousTextures !== undefined) {
-                this.d3dCaps.wMaxSimultaneousTextures = Math.max(1, Math.min(8, config.d3dCaps.wMaxSimultaneousTextures));
+                this.d3dCaps.wMaxSimultaneousTextures = Math.max(1, Math.min(
+                    EMU_D3D_DEFAULT_CAPS.wMaxSimultaneousTextures,
+                    config.d3dCaps.wMaxSimultaneousTextures
+                ));
             }
             Logger.log(LogCategory.SYSTEM, "EmulatorConfig: D3D caps updated from manifest");
         }
