@@ -27,3 +27,17 @@ bun tools/make-wgb.ts <extracted-game-dir> blade-of-darkness-demo.wgb `
   --exe Bin/WinBlade.exe --os win98 --width 640 --height 480 --bpp 16 --ram 256 `
   --skip-video
 ```
+
+`american-mcgee-alice/config.cfg` seeds the original Alice demo's native video
+settings: 1280 × 1024 (`r_mode 8`), 32-bit color and textures, maximum texture
+detail (`r_picmip 0`), detail textures and trilinear filtering. Texture and
+lightmap compression are disabled; full lighting, sky and stock high geometry
+detail are enabled. Default key bindings still come from the original `default.cfg`.
+
+```powershell
+bun tools/wgb.ts replace <alice-demo.wgb> rom/demo/config.cfg docs/demo-presets/american-mcgee-alice/config.cfg
+bun tools/wgb.ts patch-manifest <alice-demo.wgb> emulator.screenResolution '{"width":1280,"height":1024,"bpp":32}'
+```
+
+The engine can save subsequent changes normally. A previously saved `demo/config.cfg`
+in the user's overlay takes precedence over this bundled default.

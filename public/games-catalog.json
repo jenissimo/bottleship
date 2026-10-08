@@ -381,7 +381,7 @@
     "subtitle": "Demo",
     "wgbUrl": "/apps/american-mcgee-alice-demo.wgb",
     "coverUrl": "/covers/american-mcgee-alice-box.webp",
-    "description": "Enter a dark Wonderland in the original PC demo.",
+    "description": "Enter a dark Wonderland in the original PC demo, preset to 1280×1024 with 32-bit color and textures, maximum texture detail and trilinear filtering.",
     "year": "2000",
     "genre": "Action-Adventure",
     "enabled": true

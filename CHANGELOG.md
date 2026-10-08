@@ -12,6 +12,7 @@ version's goals. The dated entries below retain the detailed change history.
 
 ## 2026-10-08
 
+- Seeded the original Alice demo with native 1280 × 1024, 32-bit color and textures, maximum texture detail, detail textures and trilinear filtering.
 - Added the original Blade of Darkness demo with native Direct3D and audio settings. Sargon's prison level, movement, turning and mouse attack are verified.
 - Fixed fixed-function texture sampling when alpha uses a texture independently of vertex color, including selected operands and implicit texture-alpha blends. Declared the Video for Windows MCI window creation ABI and separated query-addressed bundles in trailing-slash cache routes.
 - Published the original Mafia, Painkiller Demo 2, Carmageddon II and Worms World Party demos with original cover artwork. Mafia includes its native Setup registry settings for 1024 × 768, 32-bit fullscreen startup; no first-run Setup is required.

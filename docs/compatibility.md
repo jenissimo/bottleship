@@ -99,7 +99,7 @@ full playability.
 | Demo | Observed stage | Public catalog |
 |---|---|:---:|
 | Quake II 3.14 (classic Win32) | Entered a playable level, movement and rendered HUD; OpenGL | ✓ |
-| American McGee's Alice | Main menu, OpenGL | ✓ |
+| American McGee's Alice | Main menu, OpenGL; bundled 1280 × 1024, 32-bit color/textures and high texture detail | ✓ |
 | XIII UK demo | Rendered menu, D3D8 | ✓ |
 | Hitman: Codename 47 revision 2 | Mission briefing, Direct3D; original OpenGL setup fails pixel-format selection | ✓ |
 | Serious Sam: The First Encounter | English single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
