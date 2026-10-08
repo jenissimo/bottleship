@@ -36,7 +36,7 @@ export default function SettingsAboutSection(): React.ReactElement {
           Takedown or contact:{" "}
           <a href="mailto:jenissimo+bottleship@gmail.com">jenissimo+bottleship@gmail.com</a>.
         </div>
-        <div className={s["about__ver"]}>v0.9.0 · build {__BUILD_SHA__} · Apache-2.0</div>
+        <div className={s["about__ver"]}>v{__APP_VERSION__} · build {__BUILD_SHA__} · Apache-2.0</div>
       </div>
     </SettingsSection>
   );

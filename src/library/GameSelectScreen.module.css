@@ -43,6 +43,18 @@
   line-height: 1;
 }
 .wordmark b { color: var(--amber); font-weight: 800; }
+.brand__version {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--fg-2);
+  padding: 5px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  text-decoration: none;
+}
+.brand__version:hover { color: var(--amber); border-color: var(--amber); }
+.brand__version:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; }
 .brand__tag {
   font-size: var(--fs-md);
   color: var(--fg-2);
@@ -381,6 +393,16 @@
 
 @media (max-width: 820px) {
   .search { width: 200px; }
+}
+
+@media (max-width: 640px) {
+  .cmdbar { flex-wrap: wrap; gap: 16px; }
+  .brand { min-width: 0; flex: 1 1 100%; }
+  .brand__mark { flex-wrap: wrap; gap: 12px; }
+  .brand__bottle { width: 41px; height: 27px; }
+  .wordmark { font-size: 2rem; }
+  .cmd-spacer { display: none; }
+  .cmd-actions { margin-left: auto; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -182,6 +182,15 @@ export default function GameSelectScreen({
             <span className={s["wordmark"]}>
               Bottle<b>Ship</b>
             </span>
+            <a
+              className={s["brand__version"]}
+              href={`https://github.com/jenissimo/bottleship/releases/tag/v${__APP_VERSION__}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Release notes"
+            >
+              v{__APP_VERSION__}
+            </a>
           </div>
           <span className={s["brand__tag"]}>Run classic Windows games in your browser.</span>
         </div>

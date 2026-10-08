@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7 — 2026-10-08
+
+This release covers changes merged into `main` since October 5, 2026. Compatibility
+grows from 15 to 53 games, with an optimized Direct3D 9 renderer, easier GOG imports,
+mobile controls, loading and frame-rate improvements, and experimental AOT code caching.
+The public demo catalog now contains 42 entries.
+
+Read the [0.7 release notes](docs/releases/0.7.md) for highlights, AOT usage and the next
+version's goals. The dated entries below retain the detailed change history.
+
 ## 2026-10-08
 
 - Added the original Blade of Darkness demo with native Direct3D and audio settings. Sargon's prison level, movement, turning and mouse attack are verified.

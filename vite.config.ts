@@ -11,6 +11,7 @@ import type { ServerResponse } from "node:http";
 import { isUnc, listWgb, underAnyRoot, wgbListRoots, wgbRoots } from "./tools/wgb-roots";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION: string = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version;
 
 // Truthful build id for the About panel: Cloudflare Pages exposes the deployed
 // commit as CF_PAGES_COMMIT_SHA; locally fall back to `git rev-parse`. Baked in
@@ -210,6 +211,7 @@ function copyPublicDirExceptApps(): Plugin {
 export default defineConfig({
   define: {
     __BUILD_SHA__: JSON.stringify(BUILD_SHA),
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
   },
   plugins: [
     audioWorkletPlugin(),

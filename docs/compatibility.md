@@ -5,7 +5,7 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-10-07**. Working statuses include maintainer reports; every title has not
+Updated **2026-10-08** for **BottleShip 0.7**. Working statuses include maintainer reports; every title has not
 been retested for this release. Observed demo stages are listed separately below. Successful
 GOG extraction does not establish gameplay coverage for that installer edition.
 
