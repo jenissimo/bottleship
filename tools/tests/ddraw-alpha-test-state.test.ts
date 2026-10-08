@@ -69,6 +69,11 @@ test.each([C.D3DTOP_SELECTARG1, C.D3DTOP_MODULATE])("opaque alpha operation %i p
         .toEqual({ enabled: 0, func: C.D3DCMP_GREATER, ref: 127 });
 });
 
+test("vertex-colored glyph draws preserve sampling for texture alpha", () => {
+    expect(prepareAlphaState(0xff000000, C.D3DTOP_SELECTARG2, C.D3DTOP_MODULATE, false))
+        .toEqual({ enabled: 0, func: C.D3DCMP_GREATER, ref: 127 });
+});
+
 test("explicit alpha testing preserves the guest's function and reference", () => {
     expect(prepareAlphaState(0xff000000, C.D3DTOP_MODULATE, C.D3DTOP_SELECTARG1, true))
         .toEqual({ enabled: 1, func: C.D3DCMP_GREATER, ref: 127 });

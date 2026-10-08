@@ -354,6 +354,17 @@
     "enabled": true
   },
   {
+    "id": "blade-of-darkness-demo",
+    "name": "Severance: Blade of Darkness",
+    "subtitle": "Original PC Demo",
+    "wgbUrl": "/apps/blade-of-darkness-demo.wgb",
+    "coverUrl": "/covers/blade-of-darkness-box.jpg",
+    "description": "Escape Sargon's prison and explore the original 2001 demo. Native video and sound settings are included; use arrow keys to move and the left mouse button to attack.",
+    "year": "2001",
+    "genre": "Action RPG",
+    "enabled": true
+  },
+  {
     "id": "system-shock2-demo",
     "name": "System Shock 2",
     "subtitle": "Demo",

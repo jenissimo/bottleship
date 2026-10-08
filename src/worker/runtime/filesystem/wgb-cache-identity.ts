@@ -8,7 +8,7 @@ export function shortHash(s: string): string {
 
 export function urlToCacheKey(url: string): string {
     const [path, query] = url.split("?");
-    const base = path.split("/").pop() || "game.wgb";
+    const base = path.split("/").pop() || "game";
     if (base.toLowerCase().endsWith(".wgb")) return base;
     return `${query ? `${base}-${shortHash(query)}` : base}.wgb`;
 }
