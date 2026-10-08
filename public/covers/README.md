@@ -31,4 +31,9 @@ Sources for the demo covers added in October 2026:
 | `cossacks-european-wars-box.jpg` | Cossacks: European Wars (2001) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/4880/library_600x900.jpg) |
 | `thief-gold-box.jpg` | Thief Gold (1999) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/211600/library_600x900.jpg) |
 
+| `mafia-box.jpg` | Mafia (2002), original game | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/40990/library_600x900.jpg) |
+| `carmageddon2-box.jpg` | Carmageddon II: Carpocalypse Now (1998) | [Steam library artwork](https://cdn.akamai.steamstatic.com/steam/apps/282030/library_600x900.jpg) |
+| `painkiller-box.jpg` | Painkiller (2004), original PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/b3863093-8d47-452c-9a2a-12ef7c2dbf68.jpg) |
+| `worms-world-party-box.jpg` | Worms World Party (2001), original PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/0a9b2dd5-ddb3-4135-b30b-0298e8b7d8e8.jpg) |
+
 Artwork remains copyright of its respective owners.

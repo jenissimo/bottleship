@@ -89,7 +89,7 @@ copies; it does not cover the 2025 remaster. Unreal Gold's former GOG edition is
 Quake II coverage is for the classic Win32 executable, rather than the Enhanced executable.
 The original Bard's Tale and Worms World Party demos are older editions than the working
 remasters. The original Bard's Tale demo has now been checked independently (see below);
-Worms World Party's original demo remains unverified.
+Worms World Party's original demo reaches its startup splash; match entry remains unverified.
 
 ## Demo coverage
 
@@ -120,19 +120,21 @@ full playability.
 | Harry Potter and the Chamber of Secrets demo | Original English PC demo: launcher starts the real game process; entered the level, moved and collected beans. Selected English dialogue and localization files are installed in the WGB | ✓ |
 | NFS Underground 2 demo | Original English PC demo: Free Roam and the City Hall Circuit race with three AI opponents verified; rendered city, traffic and HUD, acceleration, braking, reverse and steering. Production HTTP launch and race tested; cold startup/level loading can take several minutes. Persistence remains unverified | ✓ |
 | Gothic USA demo 1.08h | English demo: Diego dialogue exit, rendered subtitles/HUD, movement and native saving verified. WGB recreates the required save directories; slots and thumbnails survive page reload. Restoring a saved game can stall in a resource-thread wait; further stability testing is pending | ✓ |
-| Cossacks: European Wars demo | Original Wise demo: rendered menu and playable random map; primary scanout and palette animation verified. Native Slow mode with a 50 ms interval gives 20 simulation steps/s | |
-| Thief Gold demo | Original demo: menu, Thieves Guild mission, movement and mouse look verified. Bundle includes the installer-generated install.cfg pointing at its root-level resource archives; without it the guest dereferences a missing interface image | |
+| Cossacks: European Wars demo | Original Wise demo: rendered menu and playable random map; primary scanout and palette animation verified. Native Slow mode with a 50 ms interval gives 20 simulation steps/s | ✓ |
+| Thief Gold demo | Original demo: menu, Thieves Guild mission, movement and mouse look verified. Bundle includes the installer-generated install.cfg pointing at its root-level resource archives; without it the guest dereferences a missing interface image | ✓ |
+| [Mafia original demo](https://archive.org/details/Mafia_201405) | Rendered mission with a car, city and HUD. WGB includes the native Setup registry value for 1024 × 768, 32-bit fullscreen startup; fresh launch bypasses Setup | ✓ |
+| [Carmageddon II demo](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | Rendered Controls screen; race entry remains unverified | ✓ |
+| [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | Rendered main menu; level entry remains unverified | ✓ |
+| [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | Rendered demo splash; match entry remains unverified | ✓ |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
 
-The following demo installers have been acquired but are not ready for the public catalog:
-
-| Demo source | Packaging result |
-|---|---|
-| [Mafia](https://archive.org/details/Mafia_201405) | RAR4 LZ reader extracts 27 files with CRC verification; WGB prepared. After the normal first-run Setup dialog's Save and exit and a cold relaunch, entered the rendered mission with a car, city and HUD |
-| [Carmageddon II](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | ZIP → InstallShield 3 `data.z` reader extracts 1,605 files with decoded-size checks; WGB prepared. Cold launch reaches a rendered Controls screen; race entry remains unverified |
-| [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | VISE reader extracts 55 game files with CRC verification; WGB prepared. Cold launch reaches the rendered main menu; level entry remains unverified |
-| [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | RAR4 → InstallShield cabinet recursion extracts 625 files with outer CRC and inner size/MD5 verification; WGB prepared. Cold launch reaches the rendered demo splash; match entry remains unverified |
+These four original installers use the project's own readers: Mafia's RAR4 LZ payload
+(27 files, CRC verified), Carmageddon II's ZIP → InstallShield 3 `data.z` payload
+(1,605 files, decoded sizes checked), Painkiller's VISE payload (55 files, CRC verified),
+and Worms World Party's RAR4 → InstallShield cabinet set (625 files, outer CRC and inner
+size/MD5 verified). The captured Mafia settings and repack command are recorded in
+[`demo-presets/README.md`](demo-presets/README.md).
 
 Time-limited shareware trials are excluded from the demo catalog, including Alice Greenfingers,
 Montezuma, Natalie Brooks, Farm Frenzy and House of 1000 Doors.

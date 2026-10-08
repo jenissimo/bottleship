@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-08
+
+- Published the original Mafia, Painkiller Demo 2, Carmageddon II and Worms World Party demos with original cover artwork. Mafia includes its native Setup registry settings for 1024 × 768, 32-bit fullscreen startup; no first-run Setup is required.
+- Demo compatibility records distinguish Mafia's rendered mission from the menu or splash stages verified for the other three editions.
+
 ## 2026-10-07
 
 - Added the original Thief Gold demo with the installer's native resource-path configuration. Thieves' Guild loads, with keyboard movement and mouse look verified.

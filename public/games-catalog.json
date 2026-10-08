@@ -57,6 +57,17 @@
     "enabled": true
   },
   {
+    "id": "mafia-demo",
+    "name": "Mafia",
+    "subtitle": "Original PC Demo",
+    "wgbUrl": "/apps/mafia-demo.wgb",
+    "coverUrl": "/covers/mafia-box.jpg",
+    "description": "Lost Heaven in the original 2002 PC demo. Native video and audio settings are included, so the game starts without the Setup dialog.",
+    "year": "2002",
+    "genre": "Third-Person Shooter",
+    "enabled": true
+  },
+  {
     "id": "cossacks-demo",
     "name": "Cossacks: European Wars",
     "subtitle": "Demo",
@@ -160,6 +171,17 @@
     "enabled": true
   },
   {
+    "id": "painkiller-demo2",
+    "name": "Painkiller",
+    "subtitle": "Demo 2",
+    "wgbUrl": "/apps/painkiller-demo2.wgb",
+    "coverUrl": "/covers/painkiller-box.jpg",
+    "description": "The original 2004 supernatural shooter demo. Main-menu startup is verified; level entry is still being checked.",
+    "year": "2004",
+    "genre": "FPS",
+    "enabled": true
+  },
+  {
     "id": "red-faction-demo",
     "name": "Red Faction",
     "subtitle": "Worldwide Demo",
@@ -253,6 +275,17 @@
     "enabled": true
   },
   {
+    "id": "worms-world-party-demo",
+    "name": "Worms World Party",
+    "subtitle": "Original PC Demo",
+    "wgbUrl": "/apps/worms-world-party-demo.wgb",
+    "coverUrl": "/covers/worms-world-party-box.jpg",
+    "description": "The original 2001 turn-based artillery demo from Team17. Startup splashes are verified; match entry is still being checked.",
+    "year": "2001",
+    "genre": "Turn-Based Strategy",
+    "enabled": true
+  },
+  {
     "id": "nfsu-demo",
     "name": "Need for Speed: Underground",
     "subtitle": "Demo",
@@ -271,6 +304,17 @@
     "coverUrl": "/covers/porsche-unleashed-demo-box.jpg",
     "description": "EA's love letter to Porsche: drive 80 years of models across the Evolution and Factory Driver modes.",
     "year": "2000",
+    "genre": "Racing",
+    "enabled": true
+  },
+  {
+    "id": "carmageddon2-demo",
+    "name": "Carmageddon II: Carpocalypse Now",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/carmageddon2-demo.wgb",
+    "coverUrl": "/covers/carmageddon2-box.jpg",
+    "description": "The original 1998 vehicular combat demo. The Controls screen renders; race entry is still being checked.",
+    "year": "1998",
     "genre": "Racing",
     "enabled": true
   },
