@@ -338,7 +338,7 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
 
     /**
      * Clear viewport region with proper color, depth, and stencil handling.
-     * Supports scissor rects for partial clears. If rects provided, use only rects; else viewport.
+     * Rects, when given, are clipped to this viewport — as Device7::Clear with it active.
      */
     const clearViewportRegion = (
         vpObj: Direct3DViewport3Object | Direct3DViewport2Object | null,
@@ -359,8 +359,7 @@ export const createViewportExports = (context: DDrawContext): D3DExports => {
             const validDepth = (depthValue !== undefined && !isNaN(depthValue) && isFinite(depthValue))
                 ? depthValue
                 : 1.0;
-            const viewportToUse = rects?.length ? undefined : vp;
-            context.executor.clear(state, dwFlags, clearColor, validDepth, viewportToUse, rects, stencil);
+            context.executor.clear(state, dwFlags, clearColor, validDepth, vp, rects, stencil);
         }
     };
 
