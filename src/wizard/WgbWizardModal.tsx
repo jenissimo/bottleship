@@ -257,10 +257,10 @@ function manifestToForm(m: Manifest): FormState {
     gameId: String(m?.gameId ?? ""),
     entrypoint: String(m?.entrypoint ?? ""),
     args: String(m?.args ?? ""),
-    width: res.width != null ? String(res.width) : "",
-    height: res.height != null ? String(res.height) : "",
-    bpp: res.bpp != null ? String(res.bpp) : "",
-    ram: ramBytes != null ? String(Math.round(ramBytes / (1024 * 1024))) : "",
+    width: String(res.width ?? 1024),
+    height: String(res.height ?? 768),
+    bpp: String(res.bpp ?? 32),
+    ram: String(Math.round((ramBytes ?? 128 * 1024 * 1024) / (1024 * 1024))),
     os: osKeyFromManifest(m),
     skipVideo: Boolean(emu.skipVideo),
     cdPath: String(emu.cdPath ?? ""),
@@ -1048,7 +1048,7 @@ export default function WgbWizardModal({
                     </div>
                     <div>
                       <label>BPP</label>
-                      <select value={form.bpp || "16"} onChange={(e) => setForm({ ...form, bpp: e.target.value })}>
+                      <select value={form.bpp || "32"} onChange={(e) => setForm({ ...form, bpp: e.target.value })}>
                         <option value="8">8-bit</option>
                         <option value="16">16-bit</option>
                         <option value="24">24-bit</option>
