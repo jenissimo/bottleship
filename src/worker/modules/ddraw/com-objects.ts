@@ -1191,9 +1191,9 @@ export class Direct3DDevice3Object extends BaseComObject {
     }
 
     private setTextureStageStateRaw(stage: number, state: number, value: number): void {
-        const idx = stage * 32 + state;
-        if (idx >= 0 && idx < this.textureStageStates.length && this.textureStageStates[idx] !== value) {
-            this.textureStageStates[idx] = value;
+        if (stage >= 0 && stage < 8 && state >= 0 && state < 32) {
+            const idx = stage * 32 + state;
+            if (this.textureStageStates[idx] !== value) this.textureStageStates[idx] = value;
         }
     }
 

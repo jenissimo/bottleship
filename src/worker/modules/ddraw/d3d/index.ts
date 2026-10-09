@@ -12,6 +12,7 @@ import { Logger, LogCategory } from "../../../core/logger";
 import { Direct3DDevice3Object, Direct3DDevice7Object, Direct3DVertexBufferObject } from "../com-objects";
 import { lostSurfaceCount } from "../../../core/gpu/gpu-device-loss-contract";
 import { isValidAddress } from "../../../core/memory/address-guard";
+import { D3DTSS_ADDRESS } from "./sampler-constants";
 
 import { createTextureManager } from "./texture-manager";
 import { createDrawHandler } from "./draw-handler";
@@ -451,9 +452,12 @@ export function registerFastPathD3DFunctions(dispatcher: HleDispatcher, context:
                 lastD3D3Obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice3Object | null;
                 lastD3D3TSS = lastD3D3Obj?.getAllTextureStageStates() ?? null;
             }
-            if (lastD3D3TSS) {
-                const idx = (stage * 32 + type) | 0;
-                if ((idx >>> 0) < 256 && lastD3D3TSS[idx] !== value) lastD3D3TSS[idx] = value;
+            // D3DTSS_ADDRESS sets ADDRESSU and ADDRESSV too: the device's own setter fans it out.
+            if (type === D3DTSS_ADDRESS) {
+                lastD3D3Obj?.setTextureStageState(stage, type, value);
+            } else if (lastD3D3TSS && stage < 8 && type < 32) {
+                const idx = stage * 32 + type;
+                if (lastD3D3TSS[idx] !== value) lastD3D3TSS[idx] = value;
             }
         }, true);
 
@@ -501,9 +505,12 @@ export function registerFastPathD3DFunctions(dispatcher: HleDispatcher, context:
                 lastD3D7Obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
                 lastD3D7TSS = lastD3D7Obj?.getAllTextureStageStates() ?? null;
             }
-            if (lastD3D7TSS) {
-                const idx = (stage * 32 + type) | 0;
-                if ((idx >>> 0) < 256 && lastD3D7TSS[idx] !== value) lastD3D7TSS[idx] = value;
+            // D3DTSS_ADDRESS sets ADDRESSU and ADDRESSV too: the device's own setter fans it out.
+            if (type === D3DTSS_ADDRESS) {
+                lastD3D7Obj?.setTextureStageState(stage, type, value);
+            } else if (lastD3D7TSS && stage < 8 && type < 32) {
+                const idx = stage * 32 + type;
+                if (lastD3D7TSS[idx] !== value) lastD3D7TSS[idx] = value;
             }
         }, true);
 
