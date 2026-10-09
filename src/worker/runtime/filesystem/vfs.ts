@@ -338,6 +338,8 @@ export class VirtualFileSystem {
     currentDir = "C:\\";
     /** When set, D:\ (the CD-ROM drive) is redirected to this guest path. See manifest emulator.cdPath. */
     private cdRedirect: string | null = null;
+    /** The disc's volume label, as GetVolumeInformation reports it for D:\. See manifest emulator.cdLabel. */
+    private cdVolumeLabel: string | null = null;
 
     /**
      * Open the writable overlay for a game's container (bottleship/games/<containerDir>/overlay/).
@@ -368,6 +370,7 @@ export class VirtualFileSystem {
         // Per-game path state must not leak across a game switch.
         this.currentDir = "C:\\";
         this.cdRedirect = null;
+        this.cdVolumeLabel = null;
     }
 
     mountRom(archive: ZipArchive, romPrefix: string, index: Map<string, ZipEntry>): void {
@@ -470,6 +473,15 @@ export class VirtualFileSystem {
             absolute = this.cdRedirect + absolute.slice(2);
         }
         return normalizePath(absolute);
+    }
+
+    /** The label of the disc in D:\, reported as given; null or blank means the generic one. */
+    setCdVolumeLabel(label: string | null): void {
+        this.cdVolumeLabel = label && label.trim() ? label : null;
+    }
+
+    getCdVolumeLabel(): string | null {
+        return this.cdVolumeLabel;
     }
 
     /** Redirect the CD-ROM drive (D:\) into the ROM at a guest path; null disables. */

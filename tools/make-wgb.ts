@@ -47,6 +47,8 @@
  *                         GTA III reads HKLM\SOFTWARE\Rockstar Games\GTA 3\InstallDir.
  *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
  *                         still checks for its disc. Usually "C:\" (the install root).
+ *   --cd-label <str>      Volume label of that disc, as GetVolumeInformation reports it for
+ *                         D:\ — what a title that checks its disc by label compares against.
  *   --app-dir-dlls <list> Comma/semicolon-separated DLL names whose copy IN THE GAME
  *                         DIRECTORY must win over our HLE module, as Windows' search
  *                         order does (app dir before System32). Required for a game that
@@ -245,6 +247,8 @@ const createDirs = [...new Set([...explicitCreateDirs, ...emptyDirs])].sort();
 // hunts for a DRIVE_CDROM whose AUDIO\HEAD.WAV opens — so a bundle packed from an install
 // must say which guest path stands in for the disc, usually the install root itself.
 const cdPath = get('--cd-path');
+// The disc's volume label — what a retail title compares GetVolumeInformation against.
+const cdLabel = get('--cd-label');
 
 // DLLs whose game-directory copy must beat our HLE module (Windows' own search order).
 // Wrapper/proxy DLLs a game ships — ASI loaders, Glide/ddraw shims — never execute without it.
@@ -310,6 +314,7 @@ const manifest: Record<string, unknown> = {
         ...(createDirs.length > 0 ? { createDirs } : {}),
         ...(appDirDlls.length > 0 ? { appDirDlls } : {}),
         ...(cdPath ? { cdPath } : {}),
+        ...(cdLabel ? { cdLabel } : {}),
         ...(touch ? { touch } : {}),
     },
 };

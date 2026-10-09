@@ -192,6 +192,11 @@ export interface WgbManifest {
          */
         cdPath?: string;
         /**
+         * The volume label of the disc in D:\. A retail title checks its disc by label
+         * (GetVolumeInformation), so a bundle standing in for one must carry the real label.
+         */
+        cdLabel?: string;
+        /**
          * Case-insensitive LoadLibrary* deny-list for per-game driver toggles.
          * Supports names, paths and wildcard patterns ("opengl3z", "opengl3z.dll", "drivers/opengl3/*").
          */

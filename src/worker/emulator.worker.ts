@@ -1772,6 +1772,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // Always set the CD redirect (null clears a prior game's redirect — no cross-game leak).
     const cdPath = bundle.manifest.emulator?.cdPath ?? null;
     system.fileSystem.setCdRedirect(cdPath);
+    system.fileSystem.setCdVolumeLabel(bundle.manifest.emulator?.cdLabel ?? null);
     if (cdPath) Logger.log(LogCategory.SYSTEM, `VFS: CD-ROM drive (D:) redirected to "${cdPath}"`);
     bootMark("rom-mounted");
 
