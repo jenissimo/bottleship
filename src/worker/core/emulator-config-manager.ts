@@ -722,6 +722,12 @@ export class EmulatorConfig {
         this.recomputeQuality();
     }
 
+    /** True when the reported OS is major.minor or later (Vista = 6.0); Win9x is 4.x. */
+    osAtLeast(major: number, minor: number): boolean {
+        const v = this.osVersion;
+        return v.major > major || (v.major === major && v.minor >= minor);
+    }
+
     /**
      * Get GetVersion return value (DWORD)
      * Returns version in format: (platformId << 16) | (build << 8) | (minor << 4) | major

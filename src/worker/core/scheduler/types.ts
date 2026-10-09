@@ -204,6 +204,8 @@ export interface Thread {
 
     // Priority
     priority: number;
+    // Inside SetThreadPriority(THREAD_MODE_BACKGROUND_BEGIN) .. END (Vista+). Absent = no.
+    backgroundMode?: boolean;
 
     // Timing — wall-clock stamp (diagnostics / timer-thread fairness budget).
     lastSwitchTime: number;
