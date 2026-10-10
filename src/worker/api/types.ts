@@ -59,6 +59,8 @@ export type UnimplementedReturn =
     | "mcierror"
     /** ERROR_CALL_NOT_IMPLEMENTED (120) — LSTATUS/LONG returns carrying a Win32 code (Reg*). */
     | "win32Status"
+    /** STATUS_NOT_IMPLEMENTED — NTSTATUS exports, where zero is STATUS_SUCCESS. */
+    | "ntstatus"
     /**
      * No value reads as failure — every bit pattern is a legal answer (GetTickCount64).
      * Returning anything at all is a lie, so the export does not resolve: GetProcAddress

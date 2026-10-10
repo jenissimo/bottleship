@@ -33,6 +33,7 @@ const VALUES: Record<UnimplementedReturn, number> = {
     mmresult: MMSYSERR_NOTSUPPORTED,
     mcierror: MCIERR_UNSUPPORTED_FUNCTION,
     win32Status: ERROR_CALL_NOT_IMPLEMENTED,
+    ntstatus: 0xC0000002,
     unresolvable: 0,
 };
 

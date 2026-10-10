@@ -35,5 +35,6 @@ export const ntdllModule: ModuleDescriptor = {
     makeFunc("RtlCreateUserThread", 10),
     makeFunc("NtQueueApcThread", 5),
     makeFunc("NtDelayExecution", 2),
+    makeFunc("NtQuerySystemInformation", 4, { onUnimplemented: "ntstatus" }),
   ],
 };

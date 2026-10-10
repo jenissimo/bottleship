@@ -92,6 +92,7 @@ import { Msimg32 } from "./modules/msimg32";
 import { Uxtheme } from "./modules/uxtheme";
 import { Wintrust } from "./modules/wintrust";
 import { Crypt32 } from "./modules/crypt32";
+import { BCrypt } from "./modules/bcrypt";
 import { Ws2_32 } from "./modules/ws2_32";
 import { Psapi } from "./modules/psapi";
 import { Iphlpapi } from "./modules/iphlpapi";
@@ -2569,6 +2570,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const uxtheme = new Uxtheme();
       const wintrust = new Wintrust();
       const crypt32 = new Crypt32();
+      const bcrypt = new BCrypt();
       const ws2_32 = new Ws2_32();
       const iphlpapi = new Iphlpapi();
       const tapi32 = new Tapi32();
@@ -2647,6 +2649,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       uxtheme.initialize(process);
       wintrust.initialize(process);
       crypt32.initialize(process);
+      bcrypt.initialize(process);
       ws2_32.initialize(process);
       iphlpapi.initialize(process);
       psapi.initialize(process);
@@ -2722,6 +2725,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(uxtheme.name, uxtheme);
       process.registerModule(wintrust.name, wintrust);
       process.registerModule(crypt32.name, crypt32);
+      process.registerModule(bcrypt.name, bcrypt);
       process.registerModule(ws2_32.name, ws2_32);
       process.registerModule(psapi.name, psapi);
       process.registerModule(iphlpapi.name, iphlpapi);
@@ -2799,6 +2803,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(uxtheme.name, uxtheme.exports);
       process.dispatcher.registerModule(wintrust.name, wintrust.exports);
       process.dispatcher.registerModule(crypt32.name, crypt32.exports);
+      process.dispatcher.registerModule(bcrypt.name, bcrypt.exports);
       process.dispatcher.registerModule(ws2_32.name, ws2_32.exports);
       process.dispatcher.registerModule(psapi.name, psapi.exports);
       process.dispatcher.registerModule(iphlpapi.name, iphlpapi.exports);

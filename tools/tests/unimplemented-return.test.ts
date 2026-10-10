@@ -14,6 +14,7 @@ import { kernel32Module } from '../../src/worker/api/kernel32.api';
 import { winmmModule } from '../../src/worker/api/winmm.api';
 import { ole32Module } from '../../src/worker/api/ole32.api';
 import { shfolderModule } from '../../src/worker/api/shfolder.api';
+import { ntdllModule } from '../../src/worker/api/ntdll.api';
 import { resolveHleExportAddress } from '../../src/worker/core/thunking/export-resolver';
 
 const LEGACY_ERROR_NOT_SUPPORTED = 50;
@@ -21,7 +22,7 @@ const LEGACY_ERROR_NOT_SUPPORTED = 50;
 // Vite's import.meta.glob does not run under bun, so the descriptors this test cares
 // about are registered explicitly — the same registerModule() the worker calls.
 const registry = APIRegistry.getInstance();
-for (const m of [kernel32Module, winmmModule, ole32Module, shfolderModule]) registry.registerModule(m as any);
+for (const m of [kernel32Module, winmmModule, ole32Module, shfolderModule, ntdllModule]) registry.registerModule(m as any);
 
 /** Run the real dispatcher slow path for a stub with no implementation; return EAX. */
 function callUnimplemented(dllName: string, functionName: string, functionId = 0x100): number {
@@ -41,6 +42,15 @@ function callUnimplemented(dllName: string, functionName: string, functionId = 0
 const succeeded = (hr: number): boolean => (hr & 0x80000000) === 0;
 
 describe('unimplemented exports never answer "success"', () => {
+    it('NtQuerySystemInformation has a four-argument ABI and reports NTSTATUS failure', () => {
+        const descriptor = ntdllModule.functions.find(fn => fn.name === 'NtQuerySystemInformation')!;
+        expect(descriptor.params).toHaveLength(4);
+        expect(descriptor.callingConvention).toBe('stdcall');
+        const status = callUnimplemented('ntdll', descriptor.name);
+        expect(status).toBe(0xc0000002);
+        expect(status | 0).toBeLessThan(0);
+    });
+
     it('the legacy sentinel would have passed every success test (why this matters)', () => {
         expect(succeeded(LEGACY_ERROR_NOT_SUPPORTED)).toBe(true);   // SUCCEEDED(50)
         expect(LEGACY_ERROR_NOT_SUPPORTED !== 0).toBe(true);        // BOOL TRUE
