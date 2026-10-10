@@ -10,6 +10,7 @@ import { encodeAnsi } from '../codepage-utils';
 import { addFontResource, removeFontResource } from './font-resource';
 import { PS_STYLE_MASK } from './gdi-objects';
 import { DEFAULT_CHARSET, fontSignature, systemDefaultCharset } from './font-charset';
+import { enumerateFontFamilies } from './font-enumeration';
 
 let nextMetafileHandle = 0x50000;
 
@@ -18,36 +19,9 @@ const PS_TYPE_MASK = 0x000F0000;
 const PS_GEOMETRIC = 0x00010000;
 
 export function registerPaintingMiscExports(exports: Record<string, ThunkImplementation>): void {
-    // int EnumFontFamiliesA(HDC hdc, LPCSTR lpszFamily, FONTENUMPROCA lpFontFamProc, LPARAM lParam)
-    exports['EnumFontFamiliesA'] = (ctx, mem, args): number => {
-        const hdc = args[0];
-        const lpszFamily = args[1];
-        const lpFontFamProc = args[2];
-        const family = lpszFamily ? Marshaler.readString(mem, lpszFamily) : '';
-        Logger.verbose(
-            LogCategory.GDI32,
-            `EnumFontFamiliesA(hdc=0x${hdc.toString(16)}, family='${family}', proc=0x${lpFontFamProc.toString(16)})`,
-        );
-        if (!lpFontFamProc) return 0;
-        // Vacuous enumeration — report success without re-entering the guest callback.
-        return 1;
-    };
-
-    // int EnumFontFamiliesEx{A,W}(HDC, LPLOGFONT, FONTENUMPROC, LPARAM, DWORD dwFlags)
-    // The LOGFONT is only read for logging, so A and W share one body.
-    const enumFontFamiliesEx = (name: string): ThunkImplementation => (ctx, mem, args): number => {
-        const hdc = args[0];
-        const lpCallback = args[2];
-        const dwFlags = args[4] >>> 0;
-        Logger.verbose(
-            LogCategory.GDI32,
-            `${name}(hdc=0x${hdc.toString(16)}, proc=0x${lpCallback.toString(16)}, flags=0x${dwFlags.toString(16)})`,
-        );
-        if (!lpCallback) return 0;
-        return 1;
-    };
-    exports['EnumFontFamiliesExA'] = enumFontFamiliesEx('EnumFontFamiliesExA');
-    exports['EnumFontFamiliesExW'] = enumFontFamiliesEx('EnumFontFamiliesExW');
+    exports['EnumFontFamiliesA'] = (ctx, _mem, args) => enumerateFontFamilies(ctx, args, false, false);
+    exports['EnumFontFamiliesExA'] = (ctx, _mem, args) => enumerateFontFamilies(ctx, args, false, true);
+    exports['EnumFontFamiliesExW'] = (ctx, _mem, args) => enumerateFontFamilies(ctx, args, true, true);
 
     // int GetTextFaceA(HDC hdc, int c, LPSTR lpName)
     exports['GetTextFaceA'] = (ctx, mem, args): number => {
@@ -194,7 +168,7 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
 
     // int AddFontResource{A,W}(LPCTSTR pszFilename) — the two differ only in how
     // the filename is decoded, so both names share one body.
-    const addFontResourceByPath = (api: string, path: string): number | Promise<number> => {
+    const addFontResourceByPath = (api: string, path: string, flags = 0): number | Promise<number> => {
         Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
 
         if (!path) return 0;
@@ -216,7 +190,7 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
                 const handle = await vfs.open(resolved, GENERIC_READ, OPEN_EXISTING);
                 if (!handle) return 0;
                 const data = await vfs.read(handle, size);
-                return await addFontResource(resolved, data);
+                return await addFontResource(resolved, data, flags);
             } catch (e) {
                 Logger.warn(LogCategory.GDI32, `${api}: read failed for "${path}": ${e}`);
                 return 0;
@@ -224,11 +198,11 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
         })();
     };
 
-    const removeFontResourceByPath = (api: string, path: string): number => {
+    const removeFontResourceByPath = (api: string, path: string, flags = 0): number => {
         Logger.verbose(LogCategory.GDI32, `${api}("${path}")`);
         if (!path) return 0;
         const vfs = System.getInstance().fileSystem;
-        return removeFontResource(vfs.resolvePath(path)) ? 1 : 0;
+        return removeFontResource(vfs.resolvePath(path), flags) ? 1 : 0;
     };
 
     // int AddFontResourceA(LPCSTR pszFilename)
@@ -255,6 +229,20 @@ export function registerPaintingMiscExports(exports: Record<string, ThunkImpleme
             'RemoveFontResourceW',
             args[0] ? Marshaler.readWideString(mem, args[0]) : '',
         );
+
+    for (const wide of [false, true]) {
+        const suffix = wide ? 'W' : 'A';
+        exports[`AddFontResourceEx${suffix}`] = (_ctx, mem, args) => {
+            if (args[2] || ((args[1] >>> 0) & ~0x30)) return 0;
+            const path = args[0] ? (wide ? Marshaler.readWideString(mem, args[0]) : Marshaler.readString(mem, args[0])) : '';
+            return addFontResourceByPath(`AddFontResourceEx${suffix}`, path, args[1] >>> 0);
+        };
+        exports[`RemoveFontResourceEx${suffix}`] = (_ctx, mem, args) => {
+            if (args[2] || ((args[1] >>> 0) & ~0x30)) return 0;
+            const path = args[0] ? (wide ? Marshaler.readWideString(mem, args[0]) : Marshaler.readString(mem, args[0])) : '';
+            return removeFontResourceByPath(`RemoveFontResourceEx${suffix}`, path, args[1] >>> 0);
+        };
+    }
 
     // BOOL GetICMProfileW(HDC hdc, LPDWORD pBufSize, LPWSTR pszFilename)
     //

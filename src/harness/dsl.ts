@@ -368,6 +368,8 @@ export class HarnessChain {
      *  the overlay, each with an opaque/non-black/luma summary. An all-black surface is then
      *  a measurement rather than a deduction about DC topology. */
     gdiDcs(opts?: { pixels?: boolean }): this { return this.push("gdiDcs", [opts]); }
+    /** Check the font Canvas actually uses against the DC's cached selection. */
+    gdiFonts(opts?: { hdc?: number; text?: string; assert?: boolean }): this { return this.push("gdiFonts", [opts]); }
     /** One GDI surface as a PNG: "dc:<hdc>" | "client:<hwnd>" | "bitmap:<hbitmap>" | "overlay". */
     gdiDump(sel: string, save?: string): this { return this.push("gdiDump", [sel, save]); }
     /** DDraw composition-op ring: `{arm:N}` to record the next N Blt/BltFast/Flip/Load/fill ops,

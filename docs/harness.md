@@ -90,6 +90,9 @@ far too much log output to grep. So the harness gives you structured views inste
   the stream to disk.
 - **Surfaces & textures.** Dump a specific guest surface or texture to a PNG when a screenshot
   of the composited canvas isn't enough.
+- **GDI font state.** `gdiFonts({text:'H', assert:true})` compares each DC's cached font
+  with the canonical font Canvas actually uses and reports glyph measurements and selected
+  bitmap dimensions. An unapplied lazy selection is allowed; a stale cache fails the assertion.
 - **Live string copies.** `call('memoryFind', 'menu.cfg', {start, end, context:32, limit:64})`
   searches readable guest regions and returns each match's address, region, surrounding
   hex bytes and ASCII. `encoding:'utf16le'` searches wide strings; `encoding:'hex'` accepts

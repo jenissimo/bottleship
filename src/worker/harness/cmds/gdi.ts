@@ -60,6 +60,35 @@ function hex(v: number | undefined): string | null {
 }
 
 export function registerGdiCommands(svc: HarnessService): void {
+    /** Compare the DC's cached font against Canvas' canonical font without repairing it. */
+    svc.register("gdiFonts", (args) => {
+        const opts = (args[0] ?? {}) as { hdc?: number; text?: string; assert?: boolean };
+        const gdi = sys().gdiContext;
+        const probe = new OffscreenCanvas(1, 1).getContext('2d');
+        if (!probe) throw new HarnessError('gdiFonts: cannot create font probe', HarnessErrorCode.INTERNAL);
+        const dcs = [...gdi.hdcStates].filter(([hdc]) => opts.hdc === undefined || hdc === opts.hdc).map(([hdc, state]) => {
+            const ctx = gdi.contexts.get(hdc);
+            probe.font = '10px sans-serif';
+            probe.font = state.font;
+            const expected = probe.font;
+            const metrics = ctx?.measureText(opts.text ?? 'H');
+            return {
+                hdc: hex(hdc), hFont: hex(state.hFont), hBitmap: hex(state.hBitmap),
+                width: ctx?.canvas.width ?? 0, height: ctx?.canvas.height ?? 0,
+                requested: state.font, expected, actual: ctx?.font ?? null,
+                cached: state.appliedFont === state.font,
+                mismatch: state.appliedFont === state.font && !!ctx && ctx.font !== expected,
+                metrics: metrics ? {
+                    advance: metrics.width, left: metrics.actualBoundingBoxLeft, right: metrics.actualBoundingBoxRight,
+                    ascent: metrics.fontBoundingBoxAscent, descent: metrics.fontBoundingBoxDescent,
+                } : null,
+            };
+        });
+        const mismatches = dcs.filter(dc => dc.mismatch).length;
+        if (opts.assert && mismatches) throw new HarnessError(`gdiFonts: ${mismatches} cached font(s) differ from Canvas`, HarnessErrorCode.ASSERT_FAILED);
+        return { dcs, mismatches };
+    });
+
     /**
      * gdiDcs({ pixels? }) — every live DC and every retained window-client image.
      * `pixels:false` skips the coverage read (a getImageData per surface) when only the

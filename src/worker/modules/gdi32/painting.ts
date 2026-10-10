@@ -11,6 +11,9 @@ import { SystemResourceProvider } from '../../core/resources/system-resource-pro
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
 import { writeBackDibSectionRect } from './bitmap-resolve';
+import { extTextOut } from './ext-text-out';
+import { Mem } from '../../core/memory/mem-accessor';
+import { isValidAddress } from '../../core/memory/address-guard';
 // Track GetPixel HDC usage for profiling
 const getPixelHdcStats = new Map<number, { count: number; maxX: number; maxY: number }>();
 
@@ -643,7 +646,12 @@ function writeTextMetrics(hdc: number, lptm: number, mem: Uint8Array): void {
                 descent  = Math.ceil(m.fontBoundingBoxDescent);
             }
             aveWidth = Math.round(dcCtx.measureText('x').width);
-            maxWidth = Math.round(dcCtx.measureText('W').width);
+            maxWidth = 0;
+            for (let code = 32; code <= 255; code++) {
+                const glyph = dcCtx.measureText(String.fromCharCode(code));
+                maxWidth = Math.max(maxWidth, Math.ceil(glyph.width),
+                    Math.ceil(glyph.actualBoundingBoxLeft + glyph.actualBoundingBoxRight));
+            }
         } catch (_) {
             // keep defaults
         }
@@ -2051,60 +2059,8 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         return 1; // success
     };
 
-    exports['ExtTextOutA'] = (ctx, mem, args): number => {
-        const hdc = args[0];
-        const x = args[1] | 0;
-        const y = args[2] | 0;
-        const options = args[3];
-        const lprect = args[4];
-        const lpString = args[5];
-        const c = args[6];
-        const lpDx = args[7];
-        const text = Marshaler.readString(mem, lpString).substring(0, c);
-        Logger.verbose(LogCategory.GDI32, `ExtTextOutA: '${text}' at (${x},${y}) options=0x${options.toString(16)} lpDx=0x${lpDx.toString(16)}`);
-
-        const gdi = System.getInstance().gdiContext;
-        if (lpDx && c > 0) {
-            // Per-character spacing: draw each character at explicit X offset
-            const dxView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            let curX = x;
-            for (let i = 0; i < c; i++) {
-                gdi.textOut(hdc, curX, y, text[i]);
-                curX += dxView.getInt32(lpDx + i * 4, true);
-            }
-        } else {
-            gdi.textOut(hdc, x, y, text);
-        }
-        return 1;
-    };
-
-    exports['ExtTextOutW'] = (ctx, mem, args): number => {
-        const hdc = args[0];
-        const x = args[1] | 0;
-        const y = args[2] | 0;
-        const options = args[3];
-        const lpString = args[5];
-        const c = args[6];
-        const lpDx = args[7];
-        // lpString is legitimately NULL for a text-less ETO_OPAQUE/ETO_CLIPPED rect fill.
-        const text = lpString ? Marshaler.readWideString(mem, lpString).substring(0, c) : '';
-        Logger.verbose(LogCategory.GDI32, `ExtTextOutW: '${text}' at (${x},${y}) options=0x${options.toString(16)}`);
-
-        const gdi = System.getInstance().gdiContext;
-        // The spacing array is c ints long; a short one is a caller bug, and reading past it
-        // would throw out of the DataView rather than mis-space a string.
-        if (lpDx && c > 0 && lpDx + c * 4 <= mem.length) {
-            const dxView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            let curX = x;
-            for (let i = 0; i < c; i++) {
-                gdi.textOut(hdc, curX, y, text[i] ?? '');
-                curX += dxView.getInt32(lpDx + i * 4, true);
-            }
-        } else {
-            gdi.textOut(hdc, x, y, text);
-        }
-        return 1;
-    };
+    exports['ExtTextOutA'] = (_ctx, _mem, args) => extTextOut(args, false);
+    exports['ExtTextOutW'] = (_ctx, _mem, args) => extTextOut(args, true);
 
     /**
      * GetFontLanguageInfo — the GCP_* bits that tell a caller its text needs special
@@ -2548,26 +2504,29 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
 
         Logger.verbose(LogCategory.GDI32, `GetCharABCWidthsA(hdc=0x${hdc.toString(16)}, first=${wFirst}, last=${wLast})`);
 
-        if (!lpABC) return 0;
+        if (!lpABC || wLast < wFirst || wLast > 0xffff) return 0;
 
         const gdi = System.getInstance().gdiContext;
         const dcCtx = gdi.getMeasureContext(hdc);
         const count = wLast - wFirst + 1;
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (!isValidAddress(mem, lpABC, count * 12, 'rw')) return 0;
         for (let i = 0; i < count; i++) {
             const charCode = wFirst + i;
             const ch = String.fromCharCode(charCode);
             let width = 8; // fallback
+            let left = 0, black = width;
             if (dcCtx) {
                 try {
-                    width = Math.round(dcCtx.measureText(ch).width);
-                    if (width < 1) width = 1;
+                    const metrics = dcCtx.measureText(ch);
+                    width = Math.round(metrics.width);
+                    left = Math.floor(-metrics.actualBoundingBoxLeft);
+                    black = Math.max(0, Math.ceil(metrics.actualBoundingBoxRight) - left);
                 } catch (_) { /* keep fallback */ }
             }
             const offset = lpABC + i * 12;
-            view.setInt32(offset, 0, true);       // abcA (left bearing)
-            view.setInt32(offset + 4, width, true); // abcB (character width)
-            view.setInt32(offset + 8, 0, true);   // abcC (right bearing)
+            Mem.writeUint32(offset, left);
+            Mem.writeUint32(offset + 4, black);
+            Mem.writeUint32(offset + 8, width - left - black);
         }
 
         return 1; // TRUE

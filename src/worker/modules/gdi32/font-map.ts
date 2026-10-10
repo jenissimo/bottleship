@@ -30,3 +30,11 @@ export function resolveWindowsFontName(faceName: string): string {
     const mapped = WINDOWS_FONT_MAP[faceName.toLowerCase()];
     return mapped ?? faceName;
 }
+
+/** Realised families; the dialog-manager substitution names are not physical families. */
+export function bundledFontFamilies(): string[] {
+    return [...new Set([
+        ...Object.keys(WINDOWS_FONT_MAP).filter(name => !name.startsWith('ms shell dlg')),
+        ...Object.values(WINDOWS_FONT_MAP),
+    ])];
+}

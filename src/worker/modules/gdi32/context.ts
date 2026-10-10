@@ -1846,6 +1846,9 @@ export class GDIContext {
                         if (ctx.canvas.width !== bitmapWidth || ctx.canvas.height !== bitmapHeight) {
                             ctx.canvas.width = bitmapWidth;
                             ctx.canvas.height = bitmapHeight;
+                            // Resizing resets Canvas attributes, while the DC's selected objects persist.
+                            state.appliedFont = '';
+                            state.appliedFillStyle = '';
                             this.invalidateImageDataCache(hdc);
                             needsRedraw = true;
                         }
@@ -1975,7 +1978,7 @@ export class GDIContext {
         return getFontCssImpl(this, hFont);
     }
 
-    fillRect(hdc: number, left: number, top: number, right: number, bottom: number): boolean {
+    fillRect(hdc: number, left: number, top: number, right: number, bottom: number, color?: string): boolean {
         const ctx = this.contexts.get(hdc);
         const state = this.hdcStates.get(hdc);
         if (!ctx || !state) {
@@ -1991,12 +1994,12 @@ export class GDIContext {
         }
 
         // Resolve current brush style (solid or bitmap pattern).
-        let fillStyle: string | CanvasPattern = state.brushColor;
+        let fillStyle: string | CanvasPattern = color ?? state.brushColor;
         let patternTile: OffscreenCanvas | null = null;
         const brushObj = this.isStockObject(state.hBrush)
             ? this.getStockObject(state.hBrush)
             : (this.objects.get(state.hBrush) ?? null);
-        if (brushObj && brushObj.type === 'BRUSH') {
+        if (color === undefined && brushObj && brushObj.type === 'BRUSH') {
             if (typeof brushObj.data === 'string') {
                 fillStyle = brushObj.data;
             } else if (brushObj.data && brushObj.data.kind === 'pattern' && brushObj.data.tileCanvas) {
