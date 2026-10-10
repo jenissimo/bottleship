@@ -613,3 +613,7 @@ export const buildFullRect = (surface: DirectDrawSurfaceState): Rect => ({
     right: surface.width,
     bottom: surface.height,
 });
+
+/** Whether writing `rect` replaces every pixel of the surface. */
+export const rectCoversSurface = (rect: Rect, surface: DirectDrawSurfaceState): boolean =>
+    rect.left <= 0 && rect.top <= 0 && rect.right >= surface.width && rect.bottom >= surface.height;

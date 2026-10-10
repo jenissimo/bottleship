@@ -48,7 +48,7 @@ import {
 } from "./constants";
 import { readRect, surfaceAt, type Rect } from "./helpers";
 import { absToRel } from "./helpers";
-import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect } from "./surface-helpers";
+import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect, rectCoversSurface } from "./surface-helpers";
 import { RectPool } from "./rect-pool";
 import { DirectDrawSurfaceObject, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { convertRGBAToSurface, createGPUTexture, uploadToGPUTexture } from "./gpu-texture-utils";
@@ -819,6 +819,12 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 }
 
                 Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Blt: Using GPU-only clear for GPU_ONLY surface ColorFill color=0x${(fillColor >>> 0).toString(16)}`);
+                // The clear rewrites dstRect only, while setAuthorityGpu below declares the whole
+                // texture current — so pixels a CPU blit left pending outside the rect must reach
+                // the GPU first. A fill that covers the surface replaces them all.
+                if (!rectCoversSurface(dstRect, dstState) && surfaceSyncManager.needsGPUSync(dstState).needed) {
+                    context.executor!.syncSurfaceFromMemory(dstState);
+                }
                 context.executor!.clear(dstState, D3DCLEAR_TARGET, argbColor, 1.0, {
                     x: dstRect.left,
                     y: dstRect.top,
