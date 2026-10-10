@@ -3586,9 +3586,7 @@ export class D3D9BackendExecutor {
             }
             // A WebGPU render pass may reference only one occlusion query set. Resolve
             // the set before opening the pass so beginOcclusionQuery is valid for the
-            // manager-owned slots. If a frame spans multiple pools the manager returns
-            // null; its begin/end hooks then fail explicitly and GetData reports
-            // NOTAVAILABLE instead of leaving a permanently pending query.
+            // manager-owned slots. Queries in another pool become explicitly unavailable.
             const occlusionQueryIds: number[] = [];
             if (queryManager) {
                 for (let i = 0; i < frame.commandCount; i++) {
@@ -4262,6 +4260,7 @@ export class D3D9BackendExecutor {
                 }
             }
 
+            queryManager?.closeOcclusionPass(renderPass);
             renderPass.end();
             if (padded) this.depthColorPadding.restore(encoder,padded.colorSources!,
                 padded.depthExtent!.width,padded.depthExtent!.height);
@@ -4323,6 +4322,7 @@ export class D3D9BackendExecutor {
             const submitT0 = performance.now();
             queue.submit([encoder.finish()]);
             this.submitMs += performance.now() - submitT0;
+            this.d3d9MsaaCache?.flushGarbage();
             if (queryManager && queryBatch?.status === "encoded") {
                 queryManager.markSubmitted(queryBatch);
             } else if (queryManager && querySubmissionSerial !== undefined) {

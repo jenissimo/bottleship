@@ -150,8 +150,8 @@ export interface D3D9StandaloneDepthPolicy {
 
 /**
  * A depth-stencil surface is an attachment, not a texture resolve. D3D9 requires its sample
- * count to match the active color target, so make that invariant reusable by module validation
- * and the backend bind path instead of silently substituting the implicit depth buffer.
+ * count to match the active color target when drawing, after the app has finished rebinding
+ * the attachments.
  */
 export function resolveD3D9StandaloneDepthPolicy(
     depthMultiSampleType: number,
@@ -205,9 +205,7 @@ export interface D3D9MrtCompatibility {
 /**
  * Validate the WebGPU invariants shared by all enabled D3D9 color targets.
  * WebGPU requires one sample count and one extent for every color attachment;
- * keeping this as a pure policy makes the SetRenderTarget bind-time check and
- * the attachment tests use the same rule instead of discovering a mismatch
- * only when beginRenderPass validates the descriptor.
+ * compatibility is required when drawing, after the app has finished rebinding the set.
  */
 export function resolveD3D9MrtCompatibility(
     anchor: D3D9MrtAttachmentShape,
@@ -281,6 +279,18 @@ function descriptorFingerprint(desc: D3D9MultisampleTargetDescriptor): string {
         desc.depthView ? objectIdentity(desc.depthView) : "default-depth-view",
         ...(desc.colorViewFormats ?? []),
     ].join("|");
+}
+
+function colorFingerprint(desc: D3D9MultisampleTargetDescriptor): string {
+    return [desc.width, desc.height, desc.colorFormat, desc.sampleCount,
+        desc.resolveTexture ? objectIdentity(desc.resolveTexture) : "internal-resolve",
+        ...(desc.colorViewFormats ?? [])].join("|");
+}
+
+function depthFingerprint(desc: D3D9MultisampleTargetDescriptor): string {
+    return [desc.width, desc.height, desc.depthFormat, desc.sampleCount,
+        desc.depthTexture ? objectIdentity(desc.depthTexture) : "internal-depth",
+        desc.depthView ? objectIdentity(desc.depthView) : "default-depth-view"].join("|");
 }
 
 const objectIds = new WeakMap<object, number>();
@@ -357,12 +367,16 @@ export function beginD3D9MultisampleRenderPass(
 /**
  * Cache and lifecycle manager for color/depth MSAA attachments.
  *
- * The cache identity includes target identity, dimensions, formats, view
- * formats, and sample count.  A changed descriptor retires all three textures;
- * callers invoke `flushGarbage` only after the corresponding queue submission.
+ * Color and depth storage have separate identities: changing the depth surface must preserve
+ * accumulated color samples. Retired storage is destroyed after the queue submission.
  */
 export class D3D9MultisampleTargetCache {
-    private readonly byTarget = new Map<string, { fingerprint: string; target: D3D9MultisampleTarget }>();
+    private readonly byTarget = new Map<string, {
+        fingerprint: string;
+        colorFingerprint: string;
+        depthFingerprint: string;
+        target: D3D9MultisampleTarget;
+    }>();
     private garbage: GPUTexture[] = [];
     private readonly adapterProbe: D3D9MsaaAdapterProbe;
 
@@ -386,10 +400,20 @@ export class D3D9MultisampleTargetCache {
         const fingerprint = descriptorFingerprint(desc);
         const existing = this.byTarget.get(targetKey);
         if (existing?.fingerprint === fingerprint) return existing.target;
-        if (existing) this.retire(existing.target);
+        const colorKey = colorFingerprint(desc);
+        const depthKey = depthFingerprint(desc);
+        const color = existing?.colorFingerprint === colorKey ? existing.target : null;
+        const depth = existing?.depthFingerprint === depthKey ? existing.target : null;
+        if (existing) {
+            if (!color) {
+                this.garbage.push(existing.target.colorTexture);
+                if (existing.target.ownsResolveTexture) this.garbage.push(existing.target.resolveTexture);
+            }
+            if (!depth && existing.target.ownsDepthTexture) this.garbage.push(existing.target.depthTexture);
+        }
 
         const size = { width: desc.width, height: desc.height, depthOrArrayLayers: 1 };
-        const colorTexture = this.device.createTexture({
+        const colorTexture = color?.colorTexture ?? this.device.createTexture({
             size,
             format: desc.colorFormat,
             ...(desc.colorViewFormats?.length ? { viewFormats: desc.colorViewFormats } : {}),
@@ -397,7 +421,7 @@ export class D3D9MultisampleTargetCache {
             usage: renderAttachmentUsage(),
         });
         const ownsResolveTexture = !desc.resolveTexture;
-        const resolveTexture = desc.resolveTexture ?? this.device.createTexture({
+        const resolveTexture = color?.resolveTexture ?? desc.resolveTexture ?? this.device.createTexture({
             size,
             format: desc.colorFormat,
             ...(desc.colorViewFormats?.length ? { viewFormats: desc.colorViewFormats } : {}),
@@ -405,7 +429,7 @@ export class D3D9MultisampleTargetCache {
             usage: colorResolveUsage(),
         });
         const ownsDepthTexture = !desc.depthTexture;
-        const depthTexture = desc.depthTexture ?? this.device.createTexture({
+        const depthTexture = depth?.depthTexture ?? desc.depthTexture ?? this.device.createTexture({
             size,
             format: desc.depthFormat,
             sampleCount,
@@ -419,15 +443,15 @@ export class D3D9MultisampleTargetCache {
             depthFormat: desc.depthFormat,
             sampleCount,
             colorTexture,
-            colorView: colorTexture.createView(),
+            colorView: color?.colorView ?? colorTexture.createView(),
             resolveTexture,
-            resolveView: desc.resolveView ?? resolveTexture.createView(),
+            resolveView: desc.resolveView ?? color?.resolveView ?? resolveTexture.createView(),
             ownsResolveTexture,
             depthTexture,
-            depthView: desc.depthView ?? depthTexture.createView(),
+            depthView: desc.depthView ?? depth?.depthView ?? depthTexture.createView(),
             ownsDepthTexture,
         };
-        this.byTarget.set(targetKey, { fingerprint, target });
+        this.byTarget.set(targetKey, { fingerprint, colorFingerprint: colorKey, depthFingerprint: depthKey, target });
         return target;
     }
 

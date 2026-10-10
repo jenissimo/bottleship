@@ -27,13 +27,12 @@ import {
     d3d9MsaaSampleCount,
     D3D9MultisampleTargetCache,
     getD3D9MsaaCapabilityContract,
-    resolveD3D9MrtCompatibility,
-    resolveD3D9StandaloneDepthPolicyBySampleCount,
     type D3D9MsaaAdapterProbe,
     type D3D9MultisampleTarget,
 } from "./multisample";
 import { resolveD3D9ClearRegion, resolveD3D9RectClearPolicy } from "./clear-policy";
 import { D3D9QueryManager } from "../../../modules/d3d9/query-manager";
+import { textureWriteLog } from "../../../modules/d3d9/texture-write-log";
 import { SplitQueryHost } from "./split-query-host";
 import type { SplitQueryChannel, SplitQueryResult, RemoteGpuObserver } from "../../../render/d3d9-remote-state";
 import type { DeviceLossSource } from "../../../core/gpu/gpu-device-loss-contract";
@@ -50,6 +49,7 @@ import {
     resolveD3D9FloatTexturePolicy,
 } from "../shared/float-format-policy";
 import { TexturePaletteStore } from "../shared/texture-palette-store";
+import { makeD3D9Unorm16Upload, normalized16TexturePolicy } from "../shared/unorm16-texture-policy";
 import { decodeD3d9Sampler, d3d9SamplerStateDefault } from "./d3d9-sampler";
 import { readGpuTextureRgba, readGpuTextureStats } from "../shared/gpu-readback";
 import {
@@ -65,6 +65,7 @@ import {
     canUploadNativeBC,
     decodeD3DTextureToRgba8,
     getD3DTextureLayout,
+    D3DFMT_A16B16G16R16,
     getNativeBCTextureFormat,
     isBlockCompressedFormat,
     isD3DFloatFormat,
@@ -602,7 +603,7 @@ interface PendingArenaRecord {
 
 /** How many constant registers a frame capture carries per draw. Enough for the ps_1_x banks
  *  and a vertex transform, without turning every draw record into a 4 KB blob. */
-const PS_CAPTURE_REGISTERS = 8;
+const PS_CAPTURE_REGISTERS = 32;
 const VS_CAPTURE_REGISTERS = 16;
 
 /** Words per cached hash block. 16 = four vec4 registers: small enough that a typical
@@ -794,6 +795,7 @@ export class D3D9Device {
     private vertexBuffers = new VertexBufferStore();
     private indexBuffers = new IndexBufferStore();
     private textures = new TextureStore();
+    private borrowedTextureMemory?: Map<number, { ptr: number; bytes: number }>;
     /** Volume textures use a separate negative index namespace so the existing
      *  TextureStore's 2-D/cube metadata remains type-safe. */
     private volumeByPointer = new Map<number, number>();
@@ -1180,11 +1182,19 @@ export class D3D9Device {
      * also what ensureCubeTexture must write: the two cannot be decided separately.
      */
     private sampledCubeGpuFormat(d3dFormat: number): GPUTextureFormat {
+        const normalized = this.normalizedTexturePolicy(d3dFormat);
+        if (normalized) return normalized.gpuFormat;
         if (isD3DFloatFormat(d3dFormat)) {
             const policy = resolveD3D9FloatTexturePolicy(d3dFormat);
             if (policy.supported && policy.gpuFormat) return policy.gpuFormat;
         }
         return "rgba8unorm";
+    }
+
+    private normalizedTexturePolicy(format: number): { gpuFormat: GPUTextureFormat; bytesPerTexel: number } | null {
+        // Integer HDR lightmaps use the low bits too; an RGBA8 shadow is only a display conversion.
+        if (format !== D3DFMT_A16B16G16R16) return null;
+        return normalized16TexturePolicy(this.backend.getDevice()?.features);
     }
 
     /** Actual format of a texture in the WebGPU store (D3D format is converted on upload). */
@@ -1198,6 +1208,8 @@ export class D3D9Device {
         // A cube is allocated eagerly whatever its format, so it has real storage even where
         // a 2D texture of the same format would have none; ask the one resolver that decided it.
         if (this.textures.isCubeMap(index)) return this.sampledCubeGpuFormat(format);
+        const normalized = this.normalizedTexturePolicy(format);
+        if (normalized) return normalized.gpuFormat;
         if (isD3DFloatFormat(format)) {
             return resolveD3D9FloatTexturePolicy(format).gpuFormat;
         }
@@ -1266,6 +1278,34 @@ export class D3D9Device {
         return d3d9MsaaSampleCount(type) ?? 1;
     }
 
+    /** Setters may temporarily disagree while the app replaces color and depth separately. */
+    private attachmentCompatibilityError(): string | null {
+        const rt0 = this.renderTargetIndices[0];
+        const backbuffer = rt0 === null ? this.backendExecutor.getGuestBackbufferSize() : null;
+        const width = backbuffer?.width ?? this.textures.getWidth(rt0!);
+        const height = backbuffer?.height ?? this.textures.getHeight(rt0!);
+        const samples = this.activeRenderTargetSampleCount();
+        for (let i = 1; i < this.renderTargetIndices.length; i++) {
+            const rt = this.renderTargetIndices[i];
+            if (rt === null) continue;
+            if ((d3d9MsaaSampleCount(this.renderTargetSampleTypes[i] ?? 0) ?? 1) !== samples
+                || this.textures.getWidth(rt) !== width || this.textures.getHeight(rt) !== height) {
+                return "incompatible MRT attachments";
+            }
+        }
+        const depth = this.activeStandaloneDepthSurface === null
+            ? null : this.standaloneDepthBinding(this.activeStandaloneDepthSurface);
+        if (depth && (depth.sampleCount !== samples || depth.width < width || depth.height < height)) {
+            return "incompatible standalone depth attachment";
+        }
+        if (this.depthTextureIndex !== null
+            && (samples !== 1 || this.textures.getWidth(this.depthTextureIndex) < width
+                || this.textures.getHeight(this.depthTextureIndex) < height)) {
+            return "incompatible depth texture attachment";
+        }
+        return null;
+    }
+
     /**
      * Draws in the last present. The video plane's policy uses it to tell a guest that is
      * BLITTING a movie (a fullscreen quad, maybe letterbox bars and a subtitle) from one that
@@ -1292,17 +1332,6 @@ export class D3D9Device {
             return D3DERR_INVALIDCALL;
         }
         if (!this.supportsD3D9MultisampleType(multiSampleType)) return D3DERR_NOTAVAILABLE;
-        const requestedSampleCount = d3d9MsaaSampleCount(multiSampleType) ?? 1;
-        // Pipelines are device-wide in this backend. A target with a different
-        // sample count cannot be attached safely without a second pipeline cache.
-        if (index === 0 && requestedSampleCount !== this.d3d9MsaaSampleCount) return D3DERR_NOTAVAILABLE;
-        if (index === 0 && this.activeStandaloneDepthSurface !== null) {
-            const depth = this.standaloneDepthBinding(this.activeStandaloneDepthSurface);
-            if (depth && !resolveD3D9StandaloneDepthPolicyBySampleCount(
-                depth.sampleCount,
-                requestedSampleCount,
-            ).supported) return D3DERR_INVALIDCALL;
-        }
         this.rtSetsThisFrame++;
         let newTarget: number | null = null;
         let newFace = -1;
@@ -1326,62 +1355,6 @@ export class D3D9Device {
             newTarget = idx;
             // Only a cube RT honors a face selector; a plain 2D RT renders to layer 0.
             newFace = this.textures.isCubeMap(idx) ? face : -1;
-        }
-        // WebGPU render passes use one sample count and one attachment extent
-        // for every enabled color target.  D3D9 validates this at bind time;
-        // accepting a mismatched MRT and dropping it later would silently turn
-        // an MSAA target into a single-sample draw (or lose the whole frame).
-        const anchorSampleCount = index === 0
-            ? requestedSampleCount
-            : this.renderTargetIndices[0] === null
-                ? this.d3d9MsaaSampleCount
-                : (d3d9MsaaSampleCount(this.renderTargetSampleTypes[0] ?? 0) ?? 1);
-        if (index !== 0 && requestedSampleCount !== anchorSampleCount) return D3DERR_INVALIDCALL;
-        if (index === 0) {
-            for (let rt = 1; rt < D3D9_MAX_RENDER_TARGETS; rt++) {
-                if (this.renderTargetIndices[rt] === null) continue;
-                if ((d3d9MsaaSampleCount(this.renderTargetSampleTypes[rt] ?? 0) ?? 1) !== requestedSampleCount) {
-                    return D3DERR_INVALIDCALL;
-                }
-            }
-        }
-        if (newTarget !== null) {
-            const width = this.textures.getWidth(newTarget);
-            const height = this.textures.getHeight(newTarget);
-            // When RT0 is the implicit backbuffer, there is no texture index to
-            // include in `peers`; use the implicit back buffer's own guest extent as the
-            // MRT anchor instead of accepting an extent D3D9 itself would reject.
-            if (index !== 0 && this.renderTargetIndices[0] === null) {
-                const backbuffer = this.backendExecutor.getGuestBackbufferSize();
-                const compatibility = resolveD3D9MrtCompatibility(
-                    { sampleCount: this.d3d9MsaaSampleCount, width: backbuffer.width, height: backbuffer.height },
-                    { sampleCount: requestedSampleCount, width, height },
-                );
-                if (!compatibility.supported) return D3DERR_INVALIDCALL;
-            }
-            const peers = index === 0
-                ? this.renderTargetIndices.slice(1)
-                : [this.renderTargetIndices[0]];
-            for (const peer of peers) {
-                if (peer === null) continue;
-                const compatibility = resolveD3D9MrtCompatibility(
-                    {
-                        // For RT0 replacement the preceding loop has already
-                        // established that every peer has requestedSampleCount.
-                        // For an RT1..3 bind, peer is slot 0 and its recorded
-                        // sample type is the anchor.
-                        sampleCount: index === 0
-                            ? requestedSampleCount
-                            : d3d9MsaaSampleCount(this.renderTargetSampleTypes[0] ?? 0) ?? 1,
-                        width: this.textures.getWidth(peer),
-                        height: this.textures.getHeight(peer),
-                    },
-                    { sampleCount: requestedSampleCount, width, height },
-                );
-                if (!compatibility.supported) {
-                    return D3DERR_INVALIDCALL;
-                }
-            }
         }
         if (newTarget !== null) this.rtNonBackThisFrame++;
         if (newTarget === this.renderTargetIndices[index] && newFace === this.renderTargetFaces[index]
@@ -1506,11 +1479,7 @@ export class D3D9Device {
         };
     }
 
-    /**
-     * Bind a standalone CreateDepthStencilSurface allocation. The sample count is checked
-     * against the active RT before any command is flushed, and the resulting attachment is
-     * reused by both single-sample passes and the MSAA resolve target.
-     */
+    /** Bind a standalone depth surface; compatibility is checked after all attachments are set. */
     setDepthStencilSurface(
         surfacePtr: number,
         width: number,
@@ -1524,12 +1493,6 @@ export class D3D9Device {
         }
         if (!this.supportsD3D9MultisampleType(multiSampleType)) return D3DERR_NOTAVAILABLE;
         const sampleCount = d3d9MsaaSampleCount(multiSampleType) ?? 1;
-        // Sample COUNTS on both sides: the active target's count already accounts for the
-        // implicit backbuffer, and feeding it to the type-decoding entry point read count 1
-        // as D3DMULTISAMPLE_NONMASKABLE and refused every non-MSAA depth surface.
-        const depthPolicy = resolveD3D9StandaloneDepthPolicyBySampleCount(
-            sampleCount, this.activeRenderTargetSampleCount());
-        if (!depthPolicy.supported) return D3DERR_INVALIDCALL;
         const previous = this.activeStandaloneDepthSurface;
         const current = this.standaloneDepthSurfaces.get(ptr);
         if (!current || current.width !== width || current.height !== height
@@ -4583,7 +4546,10 @@ export class D3D9Device {
     }
 
     splitQueryHostCounters(): Record<string, unknown> | null {
-        return this.splitQueryHost ? JSON.parse(JSON.stringify(this.splitQueryHost.counters)) as Record<string, unknown> : null;
+        return this.splitQueryHost ? {
+            ...JSON.parse(JSON.stringify(this.splitQueryHost.counters)),
+            manager: this.gpuQueryManager?.getCounters() ?? null,
+        } : null;
     }
 
     twinForgetComObject(kind: "vs" | "ps" | "decl", comPtr: number): void {
@@ -4798,12 +4764,19 @@ export class D3D9Device {
         return this.volumeEntry(index)?.view ?? null;
     }
 
-    createTexture(texPtr: number, width: number, height: number, levels: number, format: number, usage: number = 0, pool = 0): number {
+    createTexture(texPtr: number, width: number, height: number, levels: number, format: number, usage: number = 0, pool = 0, borrowedPtr = 0): number {
         if (this.role !== "render" && !System.getInstance().process) return 0;
         const bytes = getD3DTextureLayout(format, width, height).bytes;
         try {
-            const guestPtr = this.guestAlloc(bytes);
+            const borrowed = this.role !== "render" && borrowedPtr !== 0;
+            const guestPtr = borrowed ? borrowedPtr : this.guestAlloc(bytes);
             const index = this.textures.create(texPtr, width, height, levels, format, guestPtr, pool);
+            if (borrowed) {
+                (this.borrowedTextureMemory ??= new Map()).set(texPtr, { ptr: borrowedPtr, bytes });
+            }
+            if (this.role !== "render" && textureWriteLog.enabled) {
+                textureWriteLog.create(texPtr, { width, height, levels, format, usage, pool });
+            }
             // Standard D3D depth textures are both render attachments and shadow-map
             // resources. Keeping them as a native depth format is required by WebGPU's
             // texture_depth_2d / sampler_comparison validation contract.
@@ -5163,6 +5136,7 @@ export class D3D9Device {
             // republishes. NOT setDirty: these pixels came FROM the GPU and must not be
             // uploaded straight back to it.
             this.textures.noteDataWritten(dstIdx);
+            if (!this.publishBorrowedTexturePixels(this.textures.getHandle(dstIdx), dstData)) return false;
             d3d9ReadbackCounters.downloads++;
             d3d9ReadbackCounters.downloadedPixels += width * height;
             return true;
@@ -5207,7 +5181,15 @@ export class D3D9Device {
         if (!fetched?.data || index === null || !data) return undefined;
         data.set(fetched.data.subarray(0, data.length));
         this.textures.noteDataWritten(index);
+        if (!this.publishBorrowedTexturePixels(texPtr, data)) return undefined;
         return fetched.answer;
+    }
+
+    private publishBorrowedTexturePixels(texPtr: number, data: Uint8Array): boolean {
+        const borrowed = this.borrowedTextureMemory?.get(texPtr);
+        if (!borrowed) return true;
+        if (!isValidAddress(this.memory, borrowed.ptr, borrowed.bytes, 'rw')) return false;
+        return Mem.writeBytes(borrowed.ptr, data) === borrowed.bytes;
     }
 
     /** The level-0 CPU shadow of a texture, copied (what a split front adopts after a readback). */
@@ -5284,6 +5266,7 @@ export class D3D9Device {
         // These pixels came FROM the GPU, so the guest copy no longer mirrors it and the next
         // Lock republishes — but they must NOT be uploaded straight back (see the sibling path).
         this.textures.noteDataWritten(dstIdx);
+        if (!this.publishBorrowedTexturePixels(dstTexPtr, dstData)) return D3DERR_INVALIDCALL;
         d3d9ReadbackCounters.getRenderTargetData++;
         d3d9ReadbackCounters.downloadedPixels += width * height;
         return 0;
@@ -5349,9 +5332,14 @@ export class D3D9Device {
     lockTexture(texPtr: number, level: number, discard = false): { ptr: number; pitch: number } | null {
         const index = this.textures.getIndex(texPtr);
         if (index === null) return null;
+        if (this.role !== "render" && textureWriteLog.selected(texPtr)) {
+            textureWriteLog.record(texPtr, 'lock', { level, discard });
+        }
 
         // Level 0 is backed by the per-texture HEAP allocation.
         if (level === 0) {
+            const borrowed = this.borrowedTextureMemory?.get(texPtr);
+            if (borrowed && !isValidAddress(this.memory, borrowed.ptr, borrowed.bytes, 'rw')) return null;
             if (this.textures.isLocked(index)) {
                 const ptr = this.textures.getLockedPtr(index);
                 if (ptr >= 0) {
@@ -5359,6 +5347,7 @@ export class D3D9Device {
                 }
             }
             const publish = !discard
+                && !borrowed
                 && (globalThis as { __noD3D9LockReadback?: boolean }).__noD3D9LockReadback !== true;
             const held = this.role === "render"
                 ? this.textures.lock(index, NO_GUEST_MEMORY, { publish: false })
@@ -5417,7 +5406,14 @@ export class D3D9Device {
         const bytes = pitch * layout.rows;
 
         if (level === 0) {
+            const borrowed = this.borrowedTextureMemory?.get(texPtr);
             const data = this.textures.getData(index);
+            if (borrowed) {
+                // Re-read the caller's buffer at the consuming API boundary; never retain its WASM view.
+                const source = Mem.readBytes(borrowed.ptr, borrowed.bytes);
+                if (!source || !data) return null;
+                data.set(source);
+            }
             if (!data || data.length < bytes) return null;
             return { data, pitch, width, height };
         }
@@ -5435,6 +5431,9 @@ export class D3D9Device {
     setTextureLevelPixels(texPtr: number, level: number, src: Uint8Array, srcPitch: number): boolean {
         const index = this.textures.getIndex(texPtr);
         if (index === null) return false;
+        if (this.role !== "render" && textureWriteLog.selected(texPtr)) {
+            textureWriteLog.record(texPtr, 'copy', { level, pitch: srcPitch }, src);
+        }
 
         const width = Math.max(1, this.textures.getWidth(index) >>> level);
         const height = Math.max(1, this.textures.getHeight(index) >>> level);
@@ -5444,6 +5443,8 @@ export class D3D9Device {
         if (src.length < srcPitch * layout.rows) return false;
 
         if (level === 0) {
+            const borrowed = this.borrowedTextureMemory?.get(texPtr);
+            if (borrowed && !isValidAddress(this.memory, borrowed.ptr, borrowed.bytes, 'rw')) return false;
             const data = this.textures.getData(index);
             if (!data) return false;
             if (srcPitch === pitch) {
@@ -5456,6 +5457,7 @@ export class D3D9Device {
                     );
                 }
             }
+            if (borrowed && Mem.writeBytes(borrowed.ptr, data) !== bytes) return false;
             this.textures.setDirty(index, true);
             this.arenaSamplerBankGeneration++; // content change: the resolved stage window must re-run ensureTexture
             return true;
@@ -5502,6 +5504,9 @@ export class D3D9Device {
         const noDirtyUpdate = typeof options === "boolean" ? false : options.noDirtyUpdate === true;
         const index = this.textures.getIndex(texPtr);
         if (index === null) return 0;
+        if (this.role !== "render" && textureWriteLog.selected(texPtr)) {
+            textureWriteLog.record(texPtr, 'unlock', { level, readOnly, noDirtyUpdate }, this.captureLockedTextureBytes(texPtr, level));
+        }
 
         if (level !== 0) {
             const key = `${texPtr}:${level}`;
@@ -5664,6 +5669,7 @@ export class D3D9Device {
         }
         const relIndex = this.textures.getIndex(texPtr);
         if (relIndex !== null) {
+            this.renderTargetGpuFormats.delete(relIndex);
             const viewPrefix = `${relIndex}:`;
             for (const key of this.cubeFaceRenderViews.keys()) {
                 if (key.startsWith(viewPrefix)) this.cubeFaceRenderViews.delete(key);
@@ -5671,8 +5677,9 @@ export class D3D9Device {
         }
 
         const tex = this.textures.release(texPtr);
+        const borrowed = this.borrowedTextureMemory?.delete(texPtr) === true;
         if (!tex) return;
-        if (tex.guestPtr > 0) {
+        if (tex.guestPtr > 0 && !borrowed) {
             this.guestFree(tex.guestPtr);
         }
         if (tex.gpuTexture) {
@@ -9788,6 +9795,11 @@ export class D3D9Device {
      * coverage or depth/stencil side effects.
      */
     private rasterStateSupported(topology: D3D9DrawTopology): boolean {
+        const attachmentError = this.attachmentCompatibilityError();
+        if (attachmentError !== null) {
+            Logger.error(LogCategory.D3D9, `[D3D9] refusing draw: ${attachmentError}`);
+            return false;
+        }
         const fillMode = this.getRS(D3DRS_FILLMODE);
         if (fillMode !== 3 /* D3DFILL_SOLID */) {
             Logger.error(LogCategory.D3D9,
@@ -12157,6 +12169,12 @@ export class D3D9Device {
             releasePooledBuffers();
             this.resetArenaAfterSubmit();
         };
+        const attachmentError = this.attachmentCompatibilityError();
+        if (attachmentError !== null) {
+            Logger.error(LogCategory.D3D9, `[D3D9] refusing target pass: ${attachmentError}`);
+            refuseFrame(attachmentError);
+            return;
+        }
         if (present) {
             const c = frame.clear.color as any;
             this.frameLogRing.push({
@@ -12518,12 +12536,11 @@ export class D3D9Device {
         if (!data) return;
 
         const texFormat = this.textures.getFormat(index);
-        // The 16-bit float family has an opt-in native storage path. Preserve
-        // its little-endian rows exactly; decoding to rgba8unorm would destroy
-        // values outside [0,1] before sampling.
-        if (isD3DFloatFormat(texFormat)) {
-            const policy = resolveD3D9FloatTexturePolicy(texFormat);
-            if (!policy.supported) return;
+        // Preserve HDR float values and normalized low bits before texture filtering.
+        const normalized = this.normalizedTexturePolicy(texFormat);
+        if (normalized || isD3DFloatFormat(texFormat)) {
+            const policy = normalized ?? resolveD3D9FloatTexturePolicy(texFormat);
+            if ("supported" in policy && !policy.supported) return;
             const texelBytes = policy.bytesPerTexel;
             const handle = this.textures.getHandle(index);
             const levelCount = effectiveMipLevels(
@@ -12546,7 +12563,9 @@ export class D3D9Device {
             if (!this.textures.isDirty(index)) return;
             const queue = this.backend.getQueue()!;
             const uploadLevel = (pixels: Uint8Array, w: number, h: number, pitch: number, level: number): number => {
-                const packed = makeD3D9FloatUpload(pixels, w, h, pitch, texelBytes);
+                const packed = normalized
+                    ? makeD3D9Unorm16Upload(pixels, w, h, pitch, normalized.gpuFormat)
+                    : makeD3D9FloatUpload(pixels, w, h, pitch, texelBytes);
                 if (!packed) return 0;
                 queue.writeTexture(
                     { texture: gpuTexture!, mipLevel: level },
@@ -12784,10 +12803,11 @@ export class D3D9Device {
         );
         const isRenderTarget = this.textures.isRenderTarget(index);
         const gpuFormat = this.sampledCubeGpuFormat(format);
-        const floatPolicy = gpuFormat === "rgba8unorm" ? null : resolveD3D9FloatTexturePolicy(format);
+        const floatPolicy = this.normalizedTexturePolicy(format)
+            ?? (gpuFormat === "rgba8unorm" ? null : resolveD3D9FloatTexturePolicy(format));
         if (isRenderTarget && !gpuTexture) return; // ensureTexture's RT branch owns attachments
         const levels = isRenderTarget ? gpuTexture!.mipLevelCount : authoredLevels;
-        if (!gpuTexture || (!isRenderTarget && gpuTexture.mipLevelCount !== levels)) {
+        if (!gpuTexture || (!isRenderTarget && (gpuTexture.mipLevelCount !== levels || gpuTexture.format !== gpuFormat))) {
             const replacement = device.createTexture({
                 size: {
                     width: this.textures.getWidth(index),
@@ -12818,7 +12838,9 @@ export class D3D9Device {
                     // Native float storage: hand the rows over as they are. Decoding to
                     // rgba8unorm here would clamp and quantise the very values the caller
                     // asked for a float cube in order to keep.
-                    const packed = makeD3D9FloatUpload(px, dim, dim, pitch, floatPolicy.bytesPerTexel);
+                    const packed = format === D3DFMT_A16B16G16R16
+                        ? makeD3D9Unorm16Upload(px, dim, dim, pitch, floatPolicy.gpuFormat!)
+                        : makeD3D9FloatUpload(px, dim, dim, pitch, floatPolicy.bytesPerTexel);
                     if (!packed) continue;
                     queue.writeTexture(
                         { texture: gpuTexture, mipLevel: lvl, origin: { x: 0, y: 0, z: face } },

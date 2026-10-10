@@ -93,6 +93,10 @@ far too much log output to grep. So the harness gives you structured views inste
 - **GDI font state.** `gdiFonts({text:'H', assert:true})` compares each DC's cached font
   with the canonical font Canvas actually uses and reports glyph measurements and selected
   bitmap dimensions. An unapplied lazy selection is allowed; a stale cache fails the assertion.
+- **CPU texture transfers.** Arm `textureWrites({arm:true, width:512, format:21})` before
+  loading, then read `textureWrites()` to distinguish textures that received no writes,
+  zero-filled transfers, and populated transfers. The bounded journal reports dropped events;
+  `textureWrites({arm:false})` stops collection.
 - **Live string copies.** `call('memoryFind', 'menu.cfg', {start, end, context:32, limit:64})`
   searches readable guest regions and returns each match's address, region, surrounding
   hex bytes and ASCII. `encoding:'utf16le'` searches wide strings; `encoding:'hex'` accepts

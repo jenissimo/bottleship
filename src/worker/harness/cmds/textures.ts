@@ -19,6 +19,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { getModule, guestMem, serializeSurfaces, sys } from "../serialize";
 import { bytesToBase64, debugDumpPath } from "./screen";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
+import { textureWriteLog } from "../../modules/d3d9/texture-write-log";
 import { surfaceInfo as d3d8SurfaceInfo, devices as d3d8Devices } from "../../modules/d3d8/shared-state";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 import { armSurfaceOps, takeSurfaceOps } from "../../modules/ddraw/surface-op-log";
@@ -59,6 +60,16 @@ export async function encodePngBase64(rgba: Uint8Array, w: number, h: number): P
 }
 
 export function registerTextureCommands(svc: HarnessService): void {
+    svc.register("textureWrites", (args) => {
+        const options = args[0] as Parameters<typeof textureWriteLog.configure>[0];
+        for (const field of ['width', 'height', 'format', 'limit'] as const) {
+            const value = options?.[field];
+            if (value !== undefined && (!Number.isInteger(value) || value <= 0)) {
+                throw new HarnessError(`textureWrites: ${field} must be a positive integer`, HarnessErrorCode.BAD_ARGS);
+            }
+        }
+        return textureWriteLog.configure(options);
+    });
     svc.register("renderTargetState", async () => {
         const {getD3D9RenderClient}=await import('../../render/d3d9-render-client');
         const client=getD3D9RenderClient();
@@ -371,6 +382,13 @@ export function registerTextureCommands(svc: HarnessService): void {
      *  attachment in its own value space, newest store index last, so the first dark,
      *  saturated or NaN link in the chain identifies itself. */
     svc.register("rtGallery", async () => {
+        const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+        const client = getD3D9RenderClient();
+        if (client) {
+            const { d3d9SplitFlush } = await import("../../modules/d3d9/split");
+            d3d9SplitFlush();
+            return client.request("targetGallery");
+        }
         const rows: Array<Record<string, unknown>> = [];
         for (const [device, instance] of d3d9Devices) {
             const gallery = (instance as unknown as {

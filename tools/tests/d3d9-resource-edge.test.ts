@@ -269,9 +269,9 @@ describe("D3D9 resource lock edge contracts", () => {
         const view = new DataView(memory.buffer);
         view.setUint32(BOX + 0, 0, true);
         view.setUint32(BOX + 4, 0, true);
-        view.setUint32(BOX + 8, 0, true);
+        view.setUint32(BOX + 8, 1, true);
         view.setUint32(BOX + 12, 1, true);
-        view.setUint32(BOX + 16, 1, true);
+        view.setUint32(BOX + 16, 0, true);
         view.setUint32(BOX + 20, 1, true);
         memory.fill(0x5a, level.ptr, level.ptr + level.bytes);
         expect(call(volume, "IDirect3DVolumeTexture9_LockBox", TEXTURE, 0, LOCKED, BOX, 0x2000))
@@ -292,9 +292,9 @@ describe("D3D9 resource lock edge contracts", () => {
         const view = new DataView(memory.buffer);
         view.setUint32(BOX + 0, 1, true);
         view.setUint32(BOX + 4, 1, true);
-        view.setUint32(BOX + 8, 0, true);
+        view.setUint32(BOX + 8, 3, true);
         view.setUint32(BOX + 12, 3, true);
-        view.setUint32(BOX + 16, 3, true);
+        view.setUint32(BOX + 16, 0, true);
         view.setUint32(BOX + 20, 2, true);
         expect(call(volume, "IDirect3DVolumeTexture9_AddDirtyBox", TEXTURE, BOX)).toBe(D3D_OK);
         expect(dirtyVolumeMarks).toBe(2);

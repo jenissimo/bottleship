@@ -171,6 +171,22 @@ describe('CPU volume mip storage and LockBox', () => {
         volumeTextureResources.delete(SRC);
     });
 
+    test('LockBox reads the native D3DBOX field order for a nonzero slice', () => {
+        const resource = makeVolume(8, 4, 3, 1, 0, 2);
+        volumeTextureResources.set(SRC, resource);
+        const view = new DataView(memory.buffer);
+        const box = 0x900;
+        // D3DBOX: Left, Top, Right, Bottom, Front, Back.
+        [1, 2, 5, 4, 1, 2].forEach((value, index) => view.setUint32(box + index * 4, value, true));
+        const volume = createVolumeExports();
+        expect(volume['IDirect3DVolumeTexture9_LockBox']!({ esp: 0 }, memory, [SRC, 0, 0x800, box, 0]))
+            .toBe(D3D_OK);
+        expect(view.getUint32(0x800, true)).toBe(32);
+        expect(view.getUint32(0x804, true)).toBe(128);
+        expect(view.getUint32(0x808, true)).toBe(resource.levelData[0]!.ptr + 128 + 64 + 4);
+        expect(volume['IDirect3DVolumeTexture9_UnlockBox']!({ esp: 0 }, memory, [SRC, 0])).toBe(D3D_OK);
+    });
+
     test('LockBox NO_DIRTY_UPDATE copies through without publishing a dirty mark', () => {
         const resource = makeVolume(2, 2, 1, 1, 0, 0);
         volumeTextureResources.set(SRC, resource);

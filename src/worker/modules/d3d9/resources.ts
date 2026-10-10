@@ -61,6 +61,7 @@ import {
     type LockRect,
 } from '../d3d-common/lock-flags';
 import { d3d9LockCounters } from './lock-stats';
+import { textureWriteLog } from './texture-write-log';
 import type { D3D9Device } from '../../backends/webgpu/d3d9/d3d9-device';
 import {
     clearResourceContract,
@@ -236,6 +237,7 @@ function planTextureLock(
     const rect = readLockRect(pRect);
     if (pRect && !rect) return null;
     const decision = decideLockFlags(flags, rect, width, height, poolDefault);
+    if (textureWriteLog.selected(texPtr)) textureWriteLog.record(texPtr, 'lock-plan', { level, flags, rect, invalid: decision.invalid });
     // A DISCARD honoured at the whole-surface extent when the app named a sub-rect is the
     // bug this switch reproduces on demand; see the d3d9 conformance scene.
     const discard = (globalThis as { __d3d9LockDiscardWholeSurface?: boolean })
@@ -680,6 +682,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const Format = args[5] >>> 0;
         const Pool = args[6];
         const ppTexture = args[7];
+        const pSharedHandle = args[8] >>> 0;
 
         if (!ppTexture) return D3DERR_INVALIDCALL;
         initReturnPtr(ppTexture);
@@ -709,19 +712,27 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
             return D3DERR_INVALIDCALL;
         }
 
-        const vtables = getVTables();
-        const vtableAddr = vtables['IDirect3DTexture9']?.address;
-        if (!vtableAddr) {
-            Logger.error(LogCategory.D3D9, 'IDirect3DTexture9 vtable not found!');
-            return D3DERR_INVALIDCALL;
-        }
-
         const width = Width >>> 0;
         const height = Height >>> 0;
         const maxLevels = resolveRequestedMipLevels(width, height, Levels >>> 0);
         if (maxLevels === null) return D3DERR_INVALIDCALL;
         const levelCount = maxLevels;
         const normalizedPool = normalizePalettizedTexturePool(Format, Pool);
+        let borrowedPtr = 0;
+        if (pSharedHandle) {
+            const layout = getD3DTextureLayout(Format, width, height);
+            borrowedPtr = Mem.readUint32(pSharedHandle) ?? 0;
+            if (Pool !== D3DPOOL_SYSTEMMEM || Levels !== 1 || Usage !== 0 || layout.compressed
+                || layout.rows !== height || !borrowedPtr || !isValidAddress(mem, borrowedPtr, layout.bytes, 'rw')) {
+                return D3DERR_INVALIDCALL;
+            }
+        }
+
+        const vtableAddr = getVTables()['IDirect3DTexture9']?.address;
+        if (!vtableAddr) {
+            Logger.error(LogCategory.D3D9, 'IDirect3DTexture9 vtable not found!');
+            return D3DERR_INVALIDCALL;
+        }
 
         const texPtr = createComObject(vtableAddr);
         // A module reset can reclaim a COM slot before an old lock thunk's
@@ -732,7 +743,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         baseTextureState.delete(texPtr >>> 0);
         Logger.log(LogCategory.D3D9, `CreateTexture(${Width}x${Height}, Levels=${Levels}, Usage=0x${(Usage>>>0).toString(16)}, Format=${Format}, Pool=${normalizedPool}) -> 0x${texPtr.toString(16)}`);
 
-        const guestPtr = device.createTexture(texPtr, width, height, levelCount, Format, Usage >>> 0, normalizedPool);
+        const guestPtr = device.createTexture(texPtr, width, height, levelCount, Format, Usage >>> 0, normalizedPool, borrowedPtr);
         if (guestPtr === 0) {
             releaseComRef(texPtr);
             initReturnPtr(ppTexture);
@@ -1368,6 +1379,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const pLockedRect = args[2];
         const pRect = args[3];
         const Flags = args[4];
+        if (textureWriteLog.selected(pTexture)) textureWriteLog.record(pTexture, 'lock-request', { level: Level, flags: Flags, lockedRect: pLockedRect });
 
         const device = resourceToDevice.get(pTexture);
         if (!device) {
@@ -1464,6 +1476,7 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
         const pTexture = args[0];
         const level = args[1] >>> 0;
         const ppSurfaceLevel = args[2];
+        if (textureWriteLog.selected(pTexture)) textureWriteLog.record(pTexture, 'surface-request', { level });
         if (!ppSurfaceLevel) return D3DERR_INVALIDCALL;
         initReturnPtr(ppSurfaceLevel);
 
@@ -1881,6 +1894,9 @@ export function createResourcesExports(): Record<string, ThunkImplementation> {
 
         const meta = surfaceMeta.get(pSurface);
         const device = resourceToDevice.get(pSurface);
+        if (meta?.texturePtr && textureWriteLog.selected(meta.texturePtr)) {
+            textureWriteLog.record(meta.texturePtr, 'surface-lock-request', { surface: pSurface, level: meta.level ?? 0, flags, lockable: meta.lockable ?? null, caller: Mem.readUint32(_ctx.esp) });
+        }
         if (!meta || !device || !meta.texturePtr || meta.lockable === false || !pLockedRect) {
             return D3DERR_INVALIDCALL;
         }

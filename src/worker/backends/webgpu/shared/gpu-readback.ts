@@ -13,6 +13,7 @@ function readbackTexelBytes(format: GPUTextureFormat): number | null {
         case "r16float": return 2;
         case "rg16float": return 4;
         case "rgba16float": return 8;
+        case "rgba16unorm": return 8;
         case "r32float": return 4;
         case "rg32float": return 8;
         case "rgba32float": return 16;
@@ -74,7 +75,7 @@ export async function readGpuTextureRgba(
             decodeDxtToRgba(dxtFormat, mapped, padded, width, height, rgba);
             return rgba;
         }
-        if (texture.format.endsWith("float")) {
+        if (texture.format.endsWith("float") || texture.format === "rgba16unorm") {
             // A float attachment carries values outside [0,1]; this seam is the 8-bit
             // RGBA one every caller consumes, so clamp rather than wrap.
             const wide = texture.format.endsWith("32float");
@@ -92,7 +93,7 @@ export async function readGpuTextureRgba(
                     for (let c = 0; c < 4; c++) {
                         if (c >= channels) { rgba[d + c] = c === 3 ? 255 : 0; continue; }
                         const raw = words[s + c]!;
-                        const value = wide ? raw : halfToFloat(raw);
+                        const value = wide ? raw : texture.format === "rgba16unorm" ? raw / 65535 : halfToFloat(raw);
                         rgba[d + c] = Math.max(0, Math.min(255, Math.round((value || 0) * 255)));
                     }
                 }
@@ -162,17 +163,19 @@ export async function readGpuTextureStats(
         const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
         const wide = texture.format.endsWith("32float");
         const half = texture.format.endsWith("16float");
+        const normalized16 = texture.format === "rgba16unorm";
         const stepY = Math.max(1, Math.floor(height / gridSteps));
         const stepX = Math.max(1, Math.floor(width / gridSteps));
         // EVERY channel, not just the first. Reading one channel and labelling the answer
         // "the texture" reports a black opaque frame as saturated (alpha) and a blue-tinted
         // one as empty (red) — a rendering verdict drawn from a number that never described
         // the image.
-        const bytesPerChannel = wide ? 4 : half ? 2 : 1;
+        const bytesPerChannel = wide ? 4 : half || normalized16 ? 2 : 1;
         const channelCount = Math.max(1, Math.min(4, Math.floor(texelBytes / bytesPerChannel)));
         const readChannel = (offset: number): number => (
             wide ? view.getFloat32(offset, true)
                 : half ? halfToFloat(view.getUint16(offset, true))
+                : normalized16 ? view.getUint16(offset, true) / 65535
                 : raw[offset]! / 255
         );
         const chMin = new Array<number>(channelCount).fill(Infinity);

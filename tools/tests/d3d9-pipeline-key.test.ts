@@ -92,6 +92,7 @@ describe("rasterStateSupported is the shared gate for BOTH pipeline paths", () =
     }).rasterStateSupported;
 
     const probe = (states: Record<number, number>, depthFormat: GPUTextureFormat) => ({
+        attachmentCompatibilityError: () => null,
         getRS: (state: number) => states[state] ?? 0,
         activeDepthTargetFormat: () => depthFormat,
         activeRenderTargetSampleCount: () => 1,

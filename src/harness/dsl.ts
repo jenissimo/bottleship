@@ -370,6 +370,8 @@ export class HarnessChain {
     gdiDcs(opts?: { pixels?: boolean }): this { return this.push("gdiDcs", [opts]); }
     /** Check the font Canvas actually uses against the DC's cached selection. */
     gdiFonts(opts?: { hdc?: number; text?: string; assert?: boolean }): this { return this.push("gdiFonts", [opts]); }
+    /** Arm before loading to see which matching textures received CPU pixel bytes. */
+    textureWrites(opts?: { arm?: boolean; width?: number; height?: number; format?: number; limit?: number }): this { return this.push("textureWrites", [opts]); }
     /** One GDI surface as a PNG: "dc:<hdc>" | "client:<hwnd>" | "bitmap:<hbitmap>" | "overlay". */
     gdiDump(sel: string, save?: string): this { return this.push("gdiDump", [sel, save]); }
     /** DDraw composition-op ring: `{arm:N}` to record the next N Blt/BltFast/Flip/Load/fill ops,

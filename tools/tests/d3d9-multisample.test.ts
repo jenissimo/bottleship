@@ -47,6 +47,41 @@ function installGpuTextureUsage(): void {
 }
 
 describe("D3D9 multisample resources", () => {
+    test("depth rebinding preserves accumulated color and retires only replaced owned depth", () => {
+        installGpuTextureUsage();
+        const { device, textures } = makeMockDevice();
+        const cache = new D3D9MultisampleTargetCache(device as unknown as GPUDevice, {
+            supportsSampleCount: () => true,
+        });
+        const desc = {
+            key: "backbuffer", width: 64, height: 64,
+            colorFormat: "bgra8unorm" as GPUTextureFormat,
+            depthFormat: "depth24plus-stencil8" as GPUTextureFormat, sampleCount: 4,
+        };
+        const first = cache.acquire(desc)!;
+        const externalDepth = device.createTexture({ sampleCount: 4 });
+        const second = cache.acquire({ ...desc,
+            depthTexture: externalDepth as unknown as GPUTexture,
+            depthView: externalDepth.createView() as GPUTextureView,
+        })!;
+        expect(second.colorTexture).toBe(first.colorTexture);
+        expect(second.colorView).toBe(first.colorView);
+        expect(second.resolveTexture).toBe(first.resolveTexture);
+        expect(second.depthTexture).toBe(externalDepth as unknown as GPUTexture);
+        expect(textures).toHaveLength(4);
+        expect(textures.every(texture => !texture.destroyed)).toBe(true);
+        cache.flushGarbage();
+        expect(textures.map(texture => texture.destroyed)).toEqual([false, false, true, false]);
+        const third = cache.acquire(desc)!;
+        expect(third.colorTexture).toBe(first.colorTexture);
+        expect(third.resolveTexture).toBe(first.resolveTexture);
+        expect(third.depthTexture).not.toBe(first.depthTexture);
+        cache.flushGarbage();
+        expect(externalDepth.destroyed).toBe(false);
+        cache.destroy();
+        expect(textures.map(texture => texture.destroyed)).toEqual([true, true, true, false, true]);
+    });
+
     test("creates matching 2x color/depth attachments and a single-sample resolve target", () => {
         installGpuTextureUsage();
         const { device, textures } = makeMockDevice();
@@ -147,9 +182,12 @@ describe("D3D9 multisample resources", () => {
             resolveView: secondView as unknown as GPUTextureView,
         });
         expect(second).not.toBe(first);
+        expect(second!.colorTexture).toBe(first!.colorTexture);
+        expect(second!.depthTexture).toBe(first!.depthTexture);
+        expect(second!.resolveView).toBe(secondView as unknown as GPUTextureView);
         expect(textures[1]!.destroyed).toBe(false);
         cache.flushGarbage();
-        expect(textures[1]!.destroyed).toBe(true);
+        expect(textures[1]!.destroyed).toBe(false);
         expect(textures[0]!.destroyed).toBe(false);
     });
 

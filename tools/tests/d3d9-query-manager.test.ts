@@ -68,6 +68,7 @@ class FakeDevice {
     }
 
     createQuerySet(desc: QuerySetDesc): FakeQuerySet {
+        if (desc.count > 4096) throw new Error("query count exceeds WebGPU's limit");
         const querySet = new FakeQuerySet(desc);
         this.querySets.push(querySet);
         return querySet;
@@ -111,6 +112,9 @@ class FakeCommandEncoder {
     }
 
     resolveQuerySet(querySet: FakeQuerySet, firstQuery: number, queryCount: number, destination: FakeBuffer, destinationOffset: number): void {
+        if (destinationOffset % 256 !== 0 || destinationOffset + queryCount * 8 > destination.size) {
+            throw new Error("invalid WebGPU query resolve range");
+        }
         this.calls.push({ name: "resolveQuerySet", args: [querySet, firstQuery, queryCount, destination, destinationOffset] });
     }
 
@@ -150,6 +154,76 @@ function makeManager(
 }
 
 describe("D3D9 WebGPU query manager", () => {
+    test("the default pool fits a full WebGPU query set in one render pass", () => {
+        const device = new FakeDevice();
+        const manager = new D3D9QueryManager({
+            device: device as unknown as QueryManagerDevice,
+            queue: new FakeQueue() as unknown as QueryManagerQueue,
+        });
+        const ids: number[] = [];
+        for (let id = 0; id < 4096; id++) {
+            ids.push(id);
+            expect(manager.acquire(id, {
+                type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 1,
+            }).index).toBe(id);
+        }
+        expect(device.querySets).toHaveLength(1);
+        expect(device.querySets[0]!.count).toBe(4096);
+        expect(manager.getOcclusionQuerySet(ids)).toBe(device.querySets[0] as unknown as GPUQuerySet);
+        expect(manager.getCounters().passSplitFallbacks).toBe(0);
+    });
+
+    test("an oversized requested pool is bounded by WebGPU's query-set limit", () => {
+        const device = new FakeDevice();
+        const manager = new D3D9QueryManager({
+            device: device as unknown as QueryManagerDevice,
+            queue: new FakeQueue() as unknown as QueryManagerQueue,
+            querySetCapacity: 10000,
+        });
+        expect(manager.acquire(1, {
+            type: D3D9_QUERYTYPE_OCCLUSION, begun: false, issued: false, issueSerial: 1,
+        }).mode).toBe("gpu");
+        expect(device.querySets[0]!.count).toBe(4096);
+    });
+
+    test("resolves multiple query results at aligned offsets and packs their readback", async () => {
+        const device = new FakeDevice(["timestamp-query"]);
+        const { manager, queue } = makeManager(device);
+        const encoder = new FakeCommandEncoder();
+        for (const id of [11, 12, 13]) {
+            manager.acquire(id, { type: D3D9_QUERYTYPE_TIMESTAMP, begun: false, issued: true, issueSerial: 1 });
+            manager.writeTimestamp(id, encoder as unknown as QueryCommandEncoder);
+        }
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, [11, 12, 13], 1);
+        expect(batch.status).toBe("encoded");
+        const expected = [7n, 0xffff_ffffn, 0x1234_5678_9abc_def0n];
+        let resolved = 0;
+        let copied = 0;
+        for (const call of encoder.calls) {
+            if (call.name === "resolveQuerySet") {
+                const [, , count, destination, offset] = call.args as [FakeQuerySet, number, number, FakeBuffer, number];
+                expect(offset).toBe(resolved * 256);
+                expect(count).toBe(1);
+                new DataView(destination.bytes).setBigUint64(offset, expected[resolved++], true);
+            } else if (call.name === "copyBufferToBuffer") {
+                const [source, sourceOffset, destination, destinationOffset, size] = call.args as [FakeBuffer, number, FakeBuffer, number, number];
+                expect(sourceOffset).toBe(copied * 256);
+                expect(destinationOffset).toBe(copied * 8);
+                expect(size).toBe(8);
+                new Uint8Array(destination.bytes, destinationOffset, size).set(new Uint8Array(source.bytes, sourceOffset, size));
+                copied++;
+            }
+        }
+        expect(resolved).toBe(3);
+        expect(copied).toBe(3);
+        manager.submit(encoder as unknown as QueryCommandEncoder, batch);
+        queue.complete();
+        await manager.waitForBatch(batch);
+        for (let i = 0; i < 3; i++) {
+            expect(manager.poll(11 + i)).toEqual({ state: "ready", submissionSerial: 1, value: expected[i] });
+        }
+    });
+
     test("allocates query sets lazily and keeps occlusion/timestamp pools separate", () => {
         const device = new FakeDevice(["timestamp-query"]);
         const { manager } = makeManager(device);
@@ -307,6 +381,67 @@ describe("D3D9 WebGPU query manager", () => {
         expect(pass.calls.map((call) => call.name)).toEqual([
             "beginOcclusionQuery", "beginOcclusionQuery", "endOcclusionQuery",
         ]);
+    });
+
+    test("closes a BEGIN-only pass without exposing its partial result and retries on the next interval", async () => {
+        class CheckedPass extends FakePassEncoder {
+            open = false;
+            beginOcclusionQuery(index: number): void {
+                if (this.open) throw new Error("query already active");
+                this.open = true;
+                super.beginOcclusionQuery(index);
+            }
+            endOcclusionQuery(): void {
+                if (!this.open) throw new Error("no active query");
+                this.open = false;
+                super.endOcclusionQuery();
+            }
+            end(): void {
+                if (this.open) throw new Error("incomplete occlusion query");
+                this.calls.push({ name: "endPass" });
+            }
+        }
+        const device = new FakeDevice();
+        const { manager, queue } = makeManager(device, new FakeQueue(), 1);
+        const record = { type: D3D9_QUERYTYPE_OCCLUSION, begun: true, issued: false, issueSerial: 0 };
+        const first = new CheckedPass();
+        manager.acquire("pass-boundary", record);
+        expect(manager.beginOcclusion("pass-boundary", first).ok).toBe(true);
+        manager.closeOcclusionPass(first);
+        first.end();
+        manager.notifySubmitted(1);
+        expect(manager.poll("pass-boundary")).toEqual({
+            state: "fallback", reason: "occlusion-interval-pass-split",
+        });
+        const encoder = new FakeCommandEncoder();
+        expect(manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["pass-boundary"], 1).status)
+            .toBe("empty");
+        expect(device.buffers).toHaveLength(0);
+        expect(manager.getCounters().passSplitFallbacks).toBe(1);
+        expect(manager.endOcclusion("pass-boundary", new CheckedPass())).toEqual({
+            ok: true, mode: "fallback", reason: "occlusion-interval-pass-split",
+        });
+
+        record.issued = true;
+        record.issueSerial = 2;
+        expect(manager.rearm("pass-boundary", record)).toMatchObject({ mode: "gpu", index: 0 });
+        const second = new CheckedPass();
+        expect(manager.beginOcclusion("pass-boundary", second).ok).toBe(true);
+        expect(manager.endOcclusion("pass-boundary", second).ok).toBe(true);
+        manager.closeOcclusionPass(second);
+        second.end();
+        const batch = manager.encodeResolves(encoder as unknown as QueryCommandEncoder, ["pass-boundary"], 2);
+        expect(batch.entries).toHaveLength(1);
+        new DataView(device.buffers[1]!.bytes).setBigUint64(0, 42n, true);
+        manager.submit(encoder as unknown as QueryCommandEncoder, batch);
+        queue.complete();
+        await manager.waitForBatch(batch);
+        expect(manager.poll("pass-boundary")).toMatchObject({ state: "ready", value: 42n });
+        expect([...first.calls, ...second.calls].map(call => call.name)).toEqual([
+            "beginOcclusionQuery", "endOcclusionQuery", "endPass",
+            "beginOcclusionQuery", "endOcclusionQuery", "endPass",
+        ]);
+        expect(manager.getCounters().passSplitFallbacks).toBe(1);
     });
 
     test("does not reuse an in-flight slot and encodes nested occlusion ownership independently", () => {

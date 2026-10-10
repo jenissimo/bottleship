@@ -258,6 +258,14 @@ async function answer(msg: RequestMessage): Promise<void> {
                 value = [...(replayer?.twins ?? [])].map(([slot,twin]) => ({slot,state:twin.getRtDebug(),passes:twin.getPassDebug()}));
                 break;
             }
+            case "targetGallery": {
+                const rows = [];
+                for (const [slot, twin] of replayer?.twins ?? []) {
+                    for (const row of await twin.renderTargetGallery()) rows.push({ device: slot, ...row });
+                }
+                value = rows;
+                break;
+            }
             case "shaderCensus": {
                 const { collectShaderCensus } = await import("../harness/shader-census");
                 value = {

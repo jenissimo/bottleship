@@ -107,8 +107,8 @@ function readVolumeBox(mem: Uint8Array, pBox: number): VolumeBox | null {
     const values = [0, 4, 8, 12, 16, 20].map((offset) => Mem.readUint32(pBox + offset));
     if (values.some((value) => value === null)) return null;
     return {
-        left: values[0]!, top: values[1]!, front: values[2]!,
-        right: values[3]!, bottom: values[4]!, back: values[5]!,
+        left: values[0]!, top: values[1]!, right: values[2]!,
+        bottom: values[3]!, front: values[4]!, back: values[5]!,
     };
 }
 

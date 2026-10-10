@@ -15,7 +15,7 @@ import { describe, expect, test } from "bun:test";
 (globalThis as unknown as { GPUBufferUsage: unknown }).GPUBufferUsage ??= { COPY_DST: 1, MAP_READ: 2 };
 (globalThis as unknown as { GPUMapMode: unknown }).GPUMapMode ??= { READ: 1 };
 
-import { readGpuTextureRgba } from "../../src/worker/backends/webgpu/shared/gpu-readback";
+import { readGpuTextureRgba, readGpuTextureStats } from "../../src/worker/backends/webgpu/shared/gpu-readback";
 
 /** A minimal GPUDevice/GPUQueue stand-in. `mapped` is the raw padded-row buffer the "GPU"
  *  claims to hold; `format` drives the BGRA branch exactly like a real GPUTexture.format. */
@@ -40,6 +40,24 @@ function fakeDeviceReading(mapped: Uint8Array, opts?: { failMapAsync?: boolean }
 }
 
 describe("readGpuTextureRgba", () => {
+    test("16-bit normalized readback preserves low-bit light values and padded rows", async () => {
+        const mapped = new Uint8Array(512);
+        const view = new DataView(mapped.buffer);
+        for (const [offset, values] of [[0, [1, 128, 32768, 65535]], [256, [255, 256, 257, 65535]]] as const) {
+            values.forEach((value, channel) => view.setUint16(offset + channel * 2, value, true));
+        }
+        const { device, queue } = fakeDeviceReading(mapped);
+        const texture = { format: "rgba16unorm" } as GPUTexture;
+        const rgba = await readGpuTextureRgba(device, queue, texture, 1, 2);
+        expect([...rgba]).toEqual([0, 0, 128, 255, 1, 1, 1, 255]);
+        const stats = await readGpuTextureStats(device, queue, texture, 1, 2);
+        expect(stats.samples).toBe(8);
+        expect(stats.channels[0]!.min).toBe(1 / 65535);
+        expect(stats.channels[0]!.max).toBe(255 / 65535);
+        expect(stats.channels[1]!.mean).toBe(192 / 65535);
+        expect(stats.nan).toBe(0);
+    });
+
     test("BC3 readback decodes transparency and skips padding between block rows", async () => {
         const mapped = new Uint8Array(512);
         // Black BC3 blocks: first row opaque (alpha selector 0), second transparent (1).

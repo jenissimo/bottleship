@@ -117,7 +117,7 @@ type SlotPool = {
 export type QueryManagerCounters = {
     /** Re-arms demoted to fallback because the displaced generation's pool was full. */
     poolExhaustedFallbacks: number;
-    /** Queries demoted so one render pass keeps a single occlusion set. */
+    /** Queries demoted because their pool or interval cannot fit one render pass. */
     passSplitFallbacks: number;
     /** Generations displaced by a re-arm while their readback was still in flight. */
     displacedGenerations: number;
@@ -180,12 +180,15 @@ export const QUERY_MANAGER_BUFFER_USAGE = {
 
 const MAP_MODE_READ = 0x0001;
 const RESULT_BYTES = 8;
+const RESOLVE_ALIGNMENT = 256;
+const MAX_QUERY_SET_CAPACITY = 4096;
 
 /** Demotions caused by slot pressure rather than by a missing capability: a later re-arm
  *  may put the query back on the GPU path once its pool has free slots again. */
 const TRANSIENT_FALLBACK_REASONS = new Set([
     'query-pool-exhausted-in-pass',
     'occlusion-pass-pool-split',
+    'occlusion-interval-pass-split',
 ]);
 
 function keyOf(id: QueryId): string {
@@ -237,11 +240,15 @@ export class D3D9QueryManager {
     private reservedSerial = 0;
     private deviceLost = false;
     private deviceLossReason = 'device-lost';
+    private activeOcclusionPass: QueryPassEncoder | null = null;
+    private activeOcclusionState: RecordState | null = null;
 
     constructor(options: QueryManagerOptions) {
         this.device = options.device;
         this.queue = options.queue;
-        this.capacity = Math.max(1, Math.trunc(options.querySetCapacity ?? 64));
+        // A pass can bind only one set; use WebGPU's full set capacity before splitting pools.
+        this.capacity = Math.min(MAX_QUERY_SET_CAPACITY,
+            Math.max(1, Math.trunc(options.querySetCapacity ?? MAX_QUERY_SET_CAPACITY)));
         this.fallback = options.fallback;
         if (options.device.lost) {
             void options.device.lost.then((info) => {
@@ -518,6 +525,8 @@ export class D3D9QueryManager {
             return { ok: false, reason };
         }
         state.began = true;
+        this.activeOcclusionPass = pass;
+        this.activeOcclusionState = state;
         const scale = Number.isFinite(sampleScale) && sampleScale > 0 ? sampleScale : 1;
         if (state.sampleScale !== undefined && state.sampleScale !== scale) state.sampleScaleMixed = true;
         state.sampleScale = scale;
@@ -537,7 +546,21 @@ export class D3D9QueryManager {
         }
         state.began = false;
         state.recorded = true;
+        this.activeOcclusionPass = null;
+        this.activeOcclusionState = null;
         return { ok: true, mode: 'gpu', index: state.index! };
+    }
+
+    /** WebGPU forbids ending a pass with an open query. Without segment accumulation,
+     * a split D3D9 interval has no complete measurement and must stay value-less. */
+    closeOcclusionPass(pass: QueryPassEncoder): void {
+        if (this.activeOcclusionPass !== pass) return;
+        const state = this.activeOcclusionState!;
+        this.activeOcclusionPass = null;
+        this.activeOcclusionState = null;
+        if (this.runValidationScoped(state, 'end-occlusion-query-failed', () => pass.endOcclusionQuery())) {
+            this.demoteToFallback(state, 'occlusion-interval-pass-split');
+        }
     }
 
     /** Encode one timestamp write at the D3D9 END point. */
@@ -606,7 +629,7 @@ export class D3D9QueryManager {
             }
             resolveBuffer = this.device.createBuffer({
                 label: 'D3D9 query resolve',
-                size: byteLength,
+                size: (entries.length - 1) * RESOLVE_ALIGNMENT + RESULT_BYTES,
                 usage: QUERY_MANAGER_BUFFER_USAGE.QUERY_RESOLVE | QUERY_MANAGER_BUFFER_USAGE.COPY_SRC,
             });
             readbackBuffer = this.device.createBuffer({
@@ -614,17 +637,19 @@ export class D3D9QueryManager {
                 size: byteLength,
                 usage: QUERY_MANAGER_BUFFER_USAGE.COPY_DST | QUERY_MANAGER_BUFFER_USAGE.MAP_READ,
             });
-            for (const entry of entries) {
+            for (let i = 0; i < entries.length; i++) {
+                const entry = entries[i];
+                const resolveOffset = i * RESOLVE_ALIGNMENT;
                 encoder.resolveQuerySet(
                     entry.state.pool!.querySet,
                     entry.state.index!,
                     1,
                     resolveBuffer,
-                    entry.byteOffset,
+                    resolveOffset,
                 );
                 encoder.copyBufferToBuffer(
                     resolveBuffer,
-                    entry.byteOffset,
+                    resolveOffset,
                     readbackBuffer,
                     entry.byteOffset,
                     RESULT_BYTES,
@@ -787,6 +812,8 @@ export class D3D9QueryManager {
     }
 
     destroy(): void {
+        this.activeOcclusionPass = null;
+        this.activeOcclusionState = null;
         for (const pools of this.pools.values()) {
             for (const pool of pools) destroyGpuObject(pool.querySet);
         }
