@@ -97,6 +97,11 @@ far too much log output to grep. So the harness gives you structured views inste
   loading, then read `textureWrites()` to distinguish textures that received no writes,
   zero-filled transfers, and populated transfers. The bounded journal reports dropped events;
   `textureWrites({arm:false})` stops collection.
+- **Save durability.** `fsDurability(path)` snapshots guest-visible bytes, flushes, then
+  compares them with the committed OPFS file while bypassing the content cache. It reports
+  the first differing offset and prefixes for files up to 16 MiB. Pause after the guest
+  finishes saving to compare stable content. `call('fsTrace', 'start', {writes:true, path:'.sav'})`
+  also records write offsets, lengths and byte prefixes; `call('fsTrace', 'stop')` reads the journal.
 - **Live string copies.** `call('memoryFind', 'menu.cfg', {start, end, context:32, limit:64})`
   searches readable guest regions and returns each match's address, region, surrounding
   hex bytes and ASCII. `encoding:'utf16le'` searches wide strings; `encoding:'hex'` accepts

@@ -2372,6 +2372,8 @@ interface WriterCacheEntry {
     path: string;
     lastUsed: number;
     queue: Promise<void>;
+    /** A retired stream must commit before this stream copies its persisted contents. */
+    predecessor?: Promise<void>;
     /** Open the next writable stream as a replacement/truncate, not as keep-existing-data. */
     replaceExisting?: boolean;
     // Memory buffer for sequential writes
@@ -2656,6 +2658,7 @@ class OpfsOverlay {
             path,
             lastUsed: performance.now(),
             queue: Promise.resolve(),
+            predecessor: this.pendingFlushes.get(key),
             replaceExisting: true,
             memoryBuffer: new Uint8Array(0),
             bufferOffset: 0,
@@ -2675,12 +2678,13 @@ class OpfsOverlay {
         this.cacheWrite(key, offset, data);  // authoritative in-memory copy for reads
         let cacheEntry = this.writerCache.get(key);
         if (!cacheEntry) {
-            this.closeSyncHandle(path);
+            if (!this.pendingFlushes.has(key)) this.closeSyncHandle(path);
             cacheEntry = {
                 writer: null,
                 path,
                 lastUsed: performance.now(),
                 queue: Promise.resolve(),
+                predecessor: this.pendingFlushes.get(key),
                 replaceExisting: false,
                 memoryBuffer: new Uint8Array(0),
                 bufferOffset: offset,
@@ -2955,7 +2959,7 @@ class OpfsOverlay {
      * (when create=false). A sync access handle is exclusive, so callers must ensure no
      * WritableFileStream is open for the same file first (writerCache empty / writer closed).
      */
-    private async ensureSyncHandle(path: string, create = false, speculative = false): Promise<any /* FileSystemSyncAccessHandle */ | null> {
+    private async ensureSyncHandle(path: string, create = false, speculative = false, retiredCommit = false): Promise<any /* FileSystemSyncAccessHandle */ | null> {
         const key = toKey(path);
 
         // At most one extra pass: joining a less permissive open can leave this caller
@@ -2966,7 +2970,7 @@ class OpfsOverlay {
 
             // Don't open if writer is active — a WritableFileStream and a sync access handle
             // can't coexist on the same OPFS file (createSyncAccessHandle would throw).
-            if (this.writerCache.has(key)) return null;
+            if (!retiredCommit && this.writerCache.has(key)) return null;
 
             // The handle is an EXCLUSIVE lock, so a second open of the same path while the
             // first is still in flight does not race — it fails. Speculative warms make that
@@ -3148,12 +3152,13 @@ class OpfsOverlay {
             this.cacheWrite(key, offset, data);  // authoritative in-memory copy for reads
             let cacheEntry = this.writerCache.get(key);
             if (!cacheEntry) {
-                this.closeSyncHandle(path);
+                if (!this.pendingFlushes.has(key)) this.closeSyncHandle(path);
                 cacheEntry = {
                     writer: null,
                     path,
                     lastUsed: performance.now(),
                     queue: Promise.resolve(),
+                    predecessor: this.pendingFlushes.get(key),
                     replaceExisting: false,
                     memoryBuffer: new Uint8Array(0),
                     bufferOffset: offset,
@@ -3213,18 +3218,13 @@ class OpfsOverlay {
         }
     }
 
-    /**
-     * Open the entry's WritableFileStream.
-     *
-     * OPFS gives `createWritable` an EXCLUSIVE lock, so it throws
-     * NoModificationAllowedError while any other writable or sync access handle on the
-     * same file is still open — including one of ours whose close() has not settled
-     * (prepareCreateSync/cleanupWriters retire entries without awaiting the close).
-     * A commit that gives up there loses the guest's bytes, so wait the conflict out
-     * once: settle whatever commit we already have in flight for this path and retry.
-     */
+    /** Siloed OPFS streams copy committed bytes at open; copying before an older close loses writes. */
     private async ensureWriter(entry: WriterCacheEntry): Promise<void> {
         if (entry.writer) return;
+        if (entry.predecessor) {
+            try { await entry.predecessor; } catch { /* its owner logs the commit failure */ }
+            entry.predecessor = undefined;
+        }
         this.closeSyncHandle(entry.path);
         const keepExistingData = !entry.replaceExisting;
         const open = async (): Promise<FileSystemWritableFileStream> => {
@@ -3411,7 +3411,7 @@ class OpfsOverlay {
                 try {
                     if (cacheEntry.writer) {
                         // A WritableFileStream was already opened for this file — finish through
-                        // it (it holds the exclusive lock) and close so the file is committed.
+                        // it and close so the file is committed.
                         if (pending.length > 0) {
                             await cacheEntry.writer.seek(pendingOffset);
                             // SAB-backed: cast at DOM boundary
@@ -3422,16 +3422,24 @@ class OpfsOverlay {
                         }
                         await cacheEntry.queue;
                         await cacheEntry.writer.close();
-                    } else if (pending.length > 0) {
+                    } else if (pending.length > 0 || replace) {
                         // Lazy case (the common one): commit synchronously via a sync access
                         // handle. createSyncAccessHandle requires the file to exist, so create it.
                         // Reads are served from contentCache regardless, so a failure here only
                         // costs cross-session persistence, not in-session read-after-write.
-                        const sh = await this.ensureSyncHandle(path, true);
+                        // The successor waits for this commit; its queued entry holds no physical lock.
+                        const sh = await this.ensureSyncHandle(path, true, false, true);
                         if (sh) {
                             if (replace) sh.truncate(pendingOffset + pending.length);
                             sh.write(pending, { at: pendingOffset });
                             sh.flush();
+                        } else {
+                            await this.ensureWriter(cacheEntry);
+                            if (pending.length > 0) {
+                                await cacheEntry.writer!.seek(pendingOffset);
+                                await cacheEntry.writer!.write(new Uint8Array(pending));
+                            }
+                            await cacheEntry.writer!.close();
                         }
                     }
                 } catch (e) {
@@ -3484,16 +3492,9 @@ class OpfsOverlay {
             this.writerCleanupTimer = null;
         }
         const entries = Array.from(this.writerCache.entries());
-        this.writerCache.clear();
         for (const [key, entry] of entries) {
             try {
-                if (entry.flushTimer !== null) {
-                    clearTimeout(entry.flushTimer);
-                    entry.flushTimer = null;
-                }
-                await this.flushWriteBuffer(entry);   // opens a writer for lazy/replace entries
-                await entry.queue;
-                await entry.writer?.close();
+                if (this.writerCache.get(key) === entry) await this.flushFile(entry.path);
             } catch (e) {
                 // Loud: the teardown barrier failing means the guest's last writes to
                 // this file did not reach OPFS (see flushWriteBuffer's fallback).
@@ -3598,15 +3599,8 @@ class OpfsOverlay {
         for (const [key, entry] of entries) {
             if (now - entry.lastUsed < this.writerIdleCloseMs) continue;
 
-            // Remove from cache before starting async close process
-            this.writerCache.delete(key);
-
-            // Flush memory buffer first
-            await this.flushWriteBuffer(entry);
-
-            await entry.queue;
             try {
-                await entry.writer?.close();
+                if (this.writerCache.get(key) === entry) await this.flushFile(entry.path);
             } catch (e) {
                 Logger.warn(LogCategory.SYSTEM, `OPFS: Error closing idle writer for key "${key}": ${e}`);
             }

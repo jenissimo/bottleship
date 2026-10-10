@@ -59,6 +59,76 @@ async function overlayWithOpenWriter(name: string) {
 }
 
 describe("flushFile does not close a writer that still has a run in flight", () => {
+    test("a replacement writer waits for the previous stream to commit before copying its contents", async () => {
+        const { root, vfs, overlay, key, handle } = await overlayWithOpenWriter("save.bin");
+        vfs.writeSync(handle, new Uint8Array([0xBB]));
+        const previous = overlay.writerCache.get(key)!;
+        let release!: () => void;
+        previous.queue = previous.queue.then(() => new Promise<void>(r => { release = r; }));
+        const first = overlay.flushWriteBuffer(previous);
+        const closing = overlay.flushFile("C:\\save.bin");
+        await Promise.resolve();
+        vfs.writeSync(handle, new Uint8Array([0xCC]));
+        const next = overlay.writerCache.get(key)!;
+        expect(next).not.toBe(previous);
+        const second = overlay.flushWriteBuffer(next);
+        // OPFS's default siloed streams permit this open before the older close settles.
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+        release();
+        await Promise.all([first, closing, second]);
+        await vfs.flushAll();
+        expect([...findFakeByName(root, "save.bin")!.data]).toEqual([0xAA, 0xBB, 0xCC]);
+    });
+
+    test("a queued successor does not revoke the predecessor's sync-handle commit", async () => {
+        const { root, vfs, overlay, key, handle } = await overlayWithOpenWriter("append.bin");
+        await overlay.flushFile("C:\\append.bin");
+        vfs.writeSync(handle, new Uint8Array([0xBB]));
+        const closing = overlay.flushFile("C:\\append.bin");
+        vfs.writeSync(handle, new Uint8Array([0xCC]));
+        await closing;
+        await vfs.flushAll();
+        expect([...findFakeByName(root, "append.bin")!.data]).toEqual([0xAA, 0xBB, 0xCC]);
+    });
+
+    test("a retired lazy commit can acquire its handle while a successor is queued", async () => {
+        const { root, vfs, overlay, key, handle } = await overlayWithOpenWriter("queued.bin");
+        await overlay.flushFile("C:\\queued.bin");
+        vfs.writeSync(handle, new Uint8Array([0xBB]));
+        const entry = overlay.writerCache.get(key)!;
+        let release!: () => void;
+        const gate = new Promise<void>(r => { release = r; });
+        entry.flushInFlight = gate;
+        gate.then(() => { entry.flushInFlight = null; });
+        const closing = overlay.flushFile("C:\\queued.bin");
+        vfs.writeSync(handle, new Uint8Array([0xCC]));
+        release();
+        await closing;
+        await vfs.flushAll();
+        expect([...findFakeByName(root, "queued.bin")!.data]).toEqual([0xAA, 0xBB, 0xCC]);
+    });
+
+    test("a refused sync handle falls back to a writable stream without dropping the buffered run", async () => {
+        const { root, vfs, overlay, handle } = await overlayWithOpenWriter("fallback.bin");
+        await overlay.flushFile("C:\\fallback.bin");
+        const internals = overlay as any;
+        const original = internals.ensureSyncHandle;
+        internals.ensureSyncHandle = async () => null;
+        try {
+            vfs.writeSync(handle, new Uint8Array([0xBB]));
+            await overlay.flushFile("C:\\fallback.bin");
+            expect([...findFakeByName(root, "fallback.bin")!.data]).toEqual([0xAA, 0xBB]);
+        } finally { internals.ensureSyncHandle = original; }
+    });
+
+    test("an empty replacement is truncated durably even without a buffered write", async () => {
+        const { root, vfs, overlay } = await overlayWithOpenWriter("empty.bin");
+        await overlay.flushFile("C:\\empty.bin");
+        vfs.openSync("C:\\empty.bin", GENERIC_WRITE, CREATE_ALWAYS);
+        await vfs.flushAll();
+        expect([...findFakeByName(root, "empty.bin")!.data]).toEqual([]);
+    });
+
     test("bytes buffered by a flush that starts during the drain still reach OPFS", async () => {
         const { root, vfs, overlay, key, handle } = await overlayWithOpenWriter("log.txt");
 

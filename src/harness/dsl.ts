@@ -574,6 +574,7 @@ export class HarnessChain {
     fsList(path: string): this { return this.push("fsList", [path]); }
     fsStat(path: string): this { return this.push("fsStat", [path]); }
     fsFlush(): this { return this.push("fsFlush", []); }
+    fsDurability(path: string): this { return this.push("fsDurability", [path]); }
     /** Does flushAll still settle, and which path is holding it? A stuck commit stalls
      *  child-process/guest exit silently, and reads from outside as a busy guest. */
     fsFlushHealth(opts?: { timeoutMs?: number }): this { return this.pushTimed("fsFlushHealth", [opts], (opts?.timeoutMs ?? 5000) + 10_000); }

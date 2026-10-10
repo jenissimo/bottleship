@@ -196,6 +196,34 @@ export function registerFsCommands(svc: HarnessService): void {
         return { flushed: true };
     });
 
+    /** Compare guest-visible bytes with committed OPFS bytes, bypassing the content cache. */
+    svc.register("fsDurability", async (args) => {
+        const path = String(args[0] ?? '');
+        const fsx = vfs();
+        const handle = fsx.openSync(path, GENERIC_READ, OPEN_EXISTING);
+        if (!handle) throw new HarnessError(`file not found: ${path}`, HarnessErrorCode.NOT_FOUND);
+        const size = fsx.getFileSize(path);
+        if (size > 16 * 1024 * 1024) throw new HarnessError('fsDurability: file exceeds 16 MiB comparison limit', HarnessErrorCode.BAD_ARGS);
+        const expected = (await fsx.read(handle, size))?.slice() as Uint8Array | undefined;
+        if (!expected || expected.length !== size) throw new HarnessError('fsDurability: incomplete guest read', HarnessErrorCode.INTERNAL);
+        await fsx.flushAll();
+        const physical = await fsx.overlay.getFileHandle(path, false);
+        const file = await physical.getFile();
+        if (file.size > 16 * 1024 * 1024) throw new HarnessError('fsDurability: committed file exceeds 16 MiB comparison limit', HarnessErrorCode.BAD_ARGS);
+        const committed = new Uint8Array(await file.arrayBuffer());
+        let firstMismatch = -1, mismatches = 0;
+        for (let i = 0; i < Math.max(expected.length, committed.length); i++) {
+            if (expected[i] === committed[i]) continue;
+            if (firstMismatch < 0) firstMismatch = i;
+            mismatches++;
+        }
+        return {
+            path, guestBytes: expected.length, committedBytes: committed.length,
+            matches: firstMismatch < 0, firstMismatch, mismatches,
+            guestPrefix: Array.from(expected.subarray(0, 32)), committedPrefix: Array.from(committed.subarray(0, 32)),
+        };
+    });
+
     /** fsFlushHealth({timeoutMs?}) — does the teardown barrier still SETTLE, and which
      *  paths are holding it?
      *
@@ -269,6 +297,19 @@ export function registerFsCommands(svc: HarnessService): void {
             wrap("deleteFile", (a, r) => ({ op: "deleteFile", path: String(a[0]), ok: !!r }));
             wrap("truncateAt", (a) => ({ op: "truncateAt", path: String(a[0]), size: Number(a[1]) }));
             wrap("createDirectorySync", (a, r) => ({ op: "mkdir", path: String(a[0]), ok: !!(r as any)?.ok }));
+            const opts = (args[1] ?? {}) as { writes?: boolean; path?: string };
+            if (opts.writes) for (const name of ['writeSync', 'write']) {
+                const original = fsx[name];
+                probe.originals[name] = original;
+                fsx[name] = (...a: any[]) => {
+                    const selected = !opts.path || String(a[0].path).toLowerCase().includes(opts.path.toLowerCase());
+                    const fact = selected ? { op: name, path: a[0].path, offset: a[0].position,
+                        length: a[1].length, prefix: Array.from(a[1].subarray(0, 32)) } : null;
+                    const r = original.apply(fsx, a);
+                    const note = (written: unknown) => { if (fact) push({ ...fact, written }); return written; };
+                    return r?.then ? r.then(note) : note(r);
+                };
+            }
             return { ok: true, wrapped: Object.keys(probe.originals) };
         }
         if (!probe) return { ok: false, tracing: false, entries: [] };
