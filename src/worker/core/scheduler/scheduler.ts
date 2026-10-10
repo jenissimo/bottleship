@@ -3382,7 +3382,7 @@ export class Scheduler {
 
     setThreadPriority(handle: number, priority: number): boolean {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
-        if (!thread || priority < -15 || priority > 15) return false;
+        if (!thread) return false;
         thread.priority = priority;
         return true;
     }

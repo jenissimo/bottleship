@@ -38,6 +38,8 @@ export interface IsoFileEntry {
 
 export interface IsoFilesystem {
     volumeName: string;
+    /** The drive label Windows reports for this disc — see readVolumeLabel. */
+    volumeLabel: string;
     /** True when names came from a Joliet supplementary descriptor. */
     joliet: boolean;
     files: IsoFileEntry[];
@@ -77,6 +79,27 @@ function decodeName(raw: Uint8Array, joliet: boolean): string {
     // Some authoring tools leave a trailing dot on extension-less names.
     if (name.endsWith(".")) name = name.slice(0, -1);
     return name;
+}
+
+/**
+ * The volume label a mounted disc reports, by the rules of Wine's mount manager
+ * (dlls/mountmgr.sys/device.c: VOLUME_FindCdRomDataBestVoldesc, VOLUME_GetSuperblockLabel):
+ * of the descriptors in sectors 16..19 before the terminator, the one of highest type (the
+ * first on a tie, so a supplementary beats the primary); 16 UCS-2 characters when it carries
+ * a Joliet escape, else 32 single-byte ones; trailing spaces dropped, ending at the first NUL.
+ */
+export function readVolumeLabel(image: IsoImage): string {
+    let best: Uint8Array | undefined;
+    for (let i = 16; i <= 19; i++) {
+        const vd = image.readBlock(i);
+        if (vd.length < LOGICAL_BLOCK_SIZE || vd[0] === VD_TERMINATOR) break;
+        if (vd[0]! > (best?.[0] ?? 0)) best = vd;
+    }
+    if (!best || best[1] !== 0x43 || best[2] !== 0x44 || best[3] !== 0x30 || best[4] !== 0x30 || best[5] !== 0x31) return "";
+    const label = isJolietEscape(best)
+        ? new TextDecoder("utf-16be").decode(best.subarray(40, 72))
+        : new TextDecoder("latin1").decode(best.subarray(40, 72));
+    return label.replace(/ +$/, "").split("\0")[0]!;
 }
 
 /** Pick the volume descriptor we will read names from (Joliet preferred). */
@@ -171,7 +194,7 @@ export function parseIso9660(image: IsoImage): IsoFilesystem {
     };
 
     visit(root.rootLba, root.rootSize, "", 0);
-    return { volumeName: root.volumeName, joliet: root.joliet, files };
+    return { volumeName: root.volumeName, volumeLabel: readVolumeLabel(image), joliet: root.joliet, files };
 }
 
 /**

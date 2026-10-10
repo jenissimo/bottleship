@@ -34,7 +34,12 @@ const ERROR_INVALID_PARAMETER = 87;
 const ERROR_CALL_NOT_IMPLEMENTED = 120;
 const ERROR_PARTIAL_COPY = 299;
 const ERROR_NO_MORE_FILES = 18;
+const ERROR_THREAD_MODE_ALREADY_BACKGROUND = 400;
+const ERROR_THREAD_MODE_NOT_BACKGROUND = 401;
 const CURRENT_PROCESS_PSEUDO_HANDLE = 0xFFFFFFFF;
+const CURRENT_THREAD_PSEUDO_HANDLE = 0xFFFFFFFE;
+const THREAD_MODE_BACKGROUND_BEGIN = 0x00010000;
+const THREAD_MODE_BACKGROUND_END = 0x00020000;
 const STILL_ACTIVE = 259;
 const CURRENT_PROCESS_ID = VIRTUAL_CURRENT_PROCESS_ID;
 const DEFAULT_MIN_WORKING_SET_BYTES = 0x00020000; // 128 KB
@@ -58,6 +63,18 @@ const PE_SNIFF_BYTES = 0x1000;
 const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
+
+/**
+ * The relative priorities SetThreadPriority accepts: IDLE and TIME_CRITICAL always,
+ * LOWEST..HIGHEST in the ordinary classes, and the wider -7..6 band under REALTIME
+ * (ntdll NtSetInformationThread / Wine SetThreadPriority).
+ */
+function isValidThreadPriority(priority: number): boolean {
+    if (priority === -15 || priority === 15) return true;
+    return currentPriorityClass === REALTIME_PRIORITY_CLASS
+        ? priority >= -7 && priority <= 6
+        : priority >= -2 && priority <= 2;
+}
 
 // Tracks the last ES_CONTINUOUS SetThreadExecutionState value.
 // Initial state: ES_CONTINUOUS only (no active power-management request).
@@ -1342,12 +1359,42 @@ export const exports: Record<string, ThunkImplementation> = {
 
     'SetThreadPriority': (ctx, mem, args) => {
         const hThread = args[0];
-        const nPriority = args[1]; // Signed int
+        // Arguments arrive as unsigned DWORDs; THREAD_PRIORITY_LOWEST is -2, not 0xfffffffe.
+        const nPriority = args[1] | 0;
 
         Logger.verbose(LogCategory.KERNEL32, `SetThreadPriority(hThread=0x${hThread.toString(16)}, nPriority=${nPriority})`);
 
-        const success = System.getInstance().scheduler.setThreadPriority(hThread, nPriority);
-        return { value: success ? 1 : 0, stackCleanup: 8 }; // BOOL: TRUE (1) or FALSE (0)
+        const scheduler = System.getInstance().scheduler;
+        // Background processing mode is Vista+, and only the calling thread can enter or leave
+        // it; before 6.0 the two values are as invalid as any other out-of-range priority.
+        if ((nPriority === THREAD_MODE_BACKGROUND_BEGIN || nPriority === THREAD_MODE_BACKGROUND_END)
+            && EmulatorConfig.getInstance().osAtLeast(6, 0)) {
+            if (scheduler.getThreadPriority(hThread) === null) {
+                scheduler.setLastError(ERROR_INVALID_HANDLE);
+                return { value: 0, stackCleanup: 8 };
+            }
+            const current = scheduler.getCurrentThread();
+            if (!current || (hThread >>> 0 !== CURRENT_THREAD_PSEUDO_HANDLE && hThread >>> 0 !== current.handle)) {
+                scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return { value: 0, stackCleanup: 8 };
+            }
+            const begin = nPriority === THREAD_MODE_BACKGROUND_BEGIN;
+            if (!!current.backgroundMode === begin) {
+                scheduler.setLastError(begin ? ERROR_THREAD_MODE_ALREADY_BACKGROUND : ERROR_THREAD_MODE_NOT_BACKGROUND);
+                return { value: 0, stackCleanup: 8 };
+            }
+            current.backgroundMode = begin;
+            return { value: 1, stackCleanup: 8 };
+        }
+        if (!isValidThreadPriority(nPriority)) {
+            scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return { value: 0, stackCleanup: 8 };
+        }
+        if (!scheduler.setThreadPriority(hThread, nPriority)) {
+            scheduler.setLastError(ERROR_INVALID_HANDLE);
+            return { value: 0, stackCleanup: 8 };
+        }
+        return { value: 1, stackCleanup: 8 };
     },
 
     // BOOL SetPriorityClass(HANDLE hProcess, DWORD dwPriorityClass)

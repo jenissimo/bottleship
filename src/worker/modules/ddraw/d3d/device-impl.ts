@@ -288,7 +288,7 @@ export const createDeviceExports = (
     };
 
     // IDirect3DDevice7_Clear: must run before draw, clears RT/depth so no trails.
-    // Clear is scoped to current viewport; when no rects, pass full-RT viewport so we don't clear "everything".
+    // Clear is scoped to the current viewport, with or without rects.
     // Signature: Clear(dwCount, lpRects, dwFlags, dwColor, dvZ, dwStencil)
     exports["IDirect3DDevice7_Clear"] = (ctx, mem, args) => {
         const thisPtr = args[0];
@@ -327,15 +327,11 @@ export const createDeviceExports = (
             }
         }
 
-        let viewport: { x: number; y: number; width: number; height: number } | undefined;
-        if (rects?.length) {
-            viewport = undefined;
-        } else {
-            const vp = obj.getViewportData();
-            viewport = vp
-                ? { x: vp.x, y: vp.y, width: vp.width, height: vp.height }
-                : { x: 0, y: 0, width: state.width, height: state.height };
-        }
+        // The viewport bounds the clear even when rects are given: the executor clips them to it.
+        const vp = obj.getViewportData();
+        const viewport = vp
+            ? { x: vp.x, y: vp.y, width: vp.width, height: vp.height }
+            : { x: 0, y: 0, width: state.width, height: state.height };
         context.executor.clear(state, dwFlags, dwColor, validDepth, viewport, rects, dwStencil);
         return D3D_OK;
     };

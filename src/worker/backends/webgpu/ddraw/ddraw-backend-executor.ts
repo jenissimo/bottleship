@@ -164,7 +164,7 @@ import { MipGenerator, mipLevelCountFor } from "./mip-generator";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
 import { ShaderGenerator } from "./shader-generator";
 import { PipelineFactory } from "./pipeline-factory";
-import { ClearPipeline } from "./clear-pipeline";
+import { ClearPipeline, clipClearRectsToViewport } from "./clear-pipeline";
 import { MsaaColorManager } from "./msaa-color-manager";
 import { ColorKeyBlitPipeline } from "./colorkey-blit-pipeline";
 import { VertexConverter, GPU_VERTEX_THRESHOLD, GpuVertexConversionResult, computeFvfStride, OUTPUT_VERTEX_BYTES, OUTPUT_VERTEX_U32S } from "./compute/vertex-converter";
@@ -1282,6 +1282,10 @@ export class DDrawWebGPUExecutor {
         // pass' color + depth attachments (and the clear pipeline) all share one sampleCount.
         this.syncMsaaSampleCount();
 
+        if (rects?.length && viewport) {
+            rects = clipClearRectsToViewport(rects, viewport);
+            if (rects.length === 0) return;
+        }
         const hasRects = rects && rects.length > 0;
         if (this.opLogArmed > 0) this.opLog(`CLEAR flags=${flags} rects=${rects?.length ?? 0} passOpen=${!!this.currentRenderPass} pendingBatch=${this.currentBatch ? (this.currentBatch.draws?.length ?? 0) : 0}`);
         // D3D semantics: Clear is constrained to the current viewport (∩ rects). A

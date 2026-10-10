@@ -38,6 +38,25 @@ const BLEND_CONSTANT_CLEAR = {
  * Pipelines are cached per color format (rgba8unorm, bgra8unorm, etc.) to support
  * SwapChain and 16-bit surfaces. Depth/stencil uses depth24plus-stencil8.
  */
+/**
+ * The parts of D3D Clear rects that lie inside the viewport. Clear's rects are clipped to
+ * the current viewport (wined3d_cs_emit_clear's draw_rect), so a title may pass the whole
+ * target as its rect and steer the clear with SetViewport alone. Empty results are dropped.
+ */
+export function clipClearRectsToViewport(
+    rects: ReadonlyArray<{ x1: number; y1: number; x2: number; y2: number }>,
+    viewport: { x: number; y: number; width: number; height: number },
+): Array<{ x1: number; y1: number; x2: number; y2: number }> {
+    const vx2 = viewport.x + viewport.width, vy2 = viewport.y + viewport.height;
+    const out: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
+    for (const r of rects) {
+        const x1 = Math.max(r.x1, viewport.x), y1 = Math.max(r.y1, viewport.y);
+        const x2 = Math.min(r.x2, vx2), y2 = Math.min(r.y2, vy2);
+        if (x2 > x1 && y2 > y1) out.push({ x1, y1, x2, y2 });
+    }
+    return out;
+}
+
 export class ClearPipeline {
     private device: GPUDevice;
     private queue: GPUQueue;

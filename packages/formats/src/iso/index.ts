@@ -22,6 +22,7 @@ export {
     type IsoFileEntry,
     type IsoFilesystem,
     parseIso9660,
+    readVolumeLabel,
     extractIsoToMap,
 } from "./iso9660";
 

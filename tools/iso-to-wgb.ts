@@ -26,6 +26,10 @@
  *   --game-id <scheme:id> Stable save key (default: app:<slug(name)>)
  *   --reg-hive/--reg-path/--reg-install   optional InstallPath registry seed
  *   --skip-video          Set emulator.skipVideo=true
+ *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
+ *                         checks for its disc: "C:\" (the disc root), or "C:\discN" with
+ *                         --disc-dirs. D: then reports that disc's own volume label.
+ *   --cd-label <str>      Override the volume label D: reports
  *   --disc-dirs           Keep each disc in its own rom/discN/ subtree
  *   --list                Parse + list disc contents, do not pack
  */
@@ -37,6 +41,7 @@ import type { RandomAccessSource } from "@bottleship/formats/unpack/source";
 import { BufferSource } from "@bottleship/formats/unpack/source";
 import { IsoImage, parseIso9660, parseCue, type IsoFileEntry } from "@bottleship/formats/iso";
 import { detectExeFromPaths } from "@bottleship/repack/gog-filter";
+import { discLabelForCdPath } from "@bottleship/repack/disc-label";
 import { detectInstallShield, extractInstallerFromFiles } from "@bottleship/repack/container-extract";
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from "@bottleship/formats/wgb/container-id";
 
@@ -238,7 +243,7 @@ function readZipMemberBytes(archivePath: string, m: ZipMember): Uint8Array {
 // Resolve a CLI input to a mounted IsoImage
 // ---------------------------------------------------------------------------
 
-interface MountedDisc { image: IsoImage; files: IsoFileEntry[]; volumeName: string; label: string; }
+interface MountedDisc { image: IsoImage; files: IsoFileEntry[]; volumeName: string; volumeLabel: string; label: string; }
 
 function mountIso(input: string): MountedDisc {
     const ext = extname(input).toLowerCase();
@@ -253,7 +258,7 @@ function mountIso(input: string): MountedDisc {
         const src = new FileSource(binPath);
         const image = new IsoImage(src, sheet.dataTrack.layout, sheet.dataTrack.byteOffsetInFile);
         const fs = parseIso9660(image);
-        return { image, files: fs.files, volumeName: fs.volumeName, label: `${basename(input)} → ${sheet.dataTrack.file} [${sheet.dataTrack.layout.label}]` };
+        return { image, files: fs.files, volumeName: fs.volumeName, volumeLabel: fs.volumeLabel, label: `${basename(input)} → ${sheet.dataTrack.file} [${sheet.dataTrack.layout.label}]` };
     }
 
     if (ext === ".zip") {
@@ -264,7 +269,7 @@ function mountIso(input: string): MountedDisc {
     const src = new FileSource(input);
     const image = IsoImage.mount(src);
     const fs = parseIso9660(image);
-    return { image, files: fs.files, volumeName: fs.volumeName, label: `${basename(input)} [${image.layout.label}]` };
+    return { image, files: fs.files, volumeName: fs.volumeName, volumeLabel: fs.volumeLabel, label: `${basename(input)} [${image.layout.label}]` };
 }
 
 /** Find and mount an ISO (or CUE+BIN) packed inside a .zip archive. */
@@ -279,11 +284,11 @@ function mountFromArchive(archivePath: string): MountedDisc {
             const src = new FileSource(archivePath, isoMember.dataOffset, isoMember.compSize);
             const image = IsoImage.mount(src);
             const fs = parseIso9660(image);
-            return { image, files: fs.files, volumeName: fs.volumeName, label: `${basename(archivePath)}:${isoMember.name} [${image.layout.label}, in-place]` };
+            return { image, files: fs.files, volumeName: fs.volumeName, volumeLabel: fs.volumeLabel, label: `${basename(archivePath)}:${isoMember.name} [${image.layout.label}, in-place]` };
         }
         const image = IsoImage.mount(new BufferSource(readZipMemberBytes(archivePath, isoMember)));
         const fs = parseIso9660(image);
-        return { image, files: fs.files, volumeName: fs.volumeName, label: `${basename(archivePath)}:${isoMember.name} [${image.layout.label}, inflated]` };
+        return { image, files: fs.files, volumeName: fs.volumeName, volumeLabel: fs.volumeLabel, label: `${basename(archivePath)}:${isoMember.name} [${image.layout.label}, inflated]` };
     }
 
     const cueMember = byExt(".cue")[0];
@@ -297,7 +302,7 @@ function mountFromArchive(archivePath: string): MountedDisc {
             : new BufferSource(readZipMemberBytes(archivePath, binMember));
         const image = new IsoImage(src, sheet.dataTrack.layout, sheet.dataTrack.byteOffsetInFile);
         const fs = parseIso9660(image);
-        return { image, files: fs.files, volumeName: fs.volumeName, label: `${basename(archivePath)}:${cueMember.name}+${sheet.dataTrack.file}` };
+        return { image, files: fs.files, volumeName: fs.volumeName, volumeLabel: fs.volumeLabel, label: `${basename(archivePath)}:${cueMember.name}+${sheet.dataTrack.file}` };
     }
 
     throw new Error(`${basename(archivePath)}: no .iso/.img or .cue member found in archive`);
@@ -327,7 +332,7 @@ function parseArgs(argv: string[]) {
     }
     const flagsWithValue = new Set([
         "--name", "--exe", "--args", "--width", "--height", "--bpp", "--ram", "--os",
-        "--game-id", "--reg-hive", "--reg-path", "--reg-install",
+        "--game-id", "--reg-hive", "--reg-path", "--reg-install", "--cd-path", "--cd-label",
     ]);
     const positionals: string[] = [];
     for (let i = 0; i < args.length; i++) {
@@ -505,6 +510,12 @@ const osKey = get("--os") ?? "win98";
 const osVer = OS_PRESETS[osKey];
 if (!osVer) { console.error(`Error: unknown --os "${osKey}" (valid: ${Object.keys(OS_PRESETS).join(", ")})`); process.exit(1); }
 
+// A title that checks its disc reads D:'s label, so D: carries the label of the disc it is.
+const cdPath = get("--cd-path");
+const cdLabel = get("--cd-label")
+    ?? (cdPath ? discLabelForCdPath(cdPath, discs.map((d) => d.volumeLabel), discDirs) : undefined);
+if (cdPath) console.log(`  D: → ${cdPath}${cdLabel ? `, label "${cdLabel}"` : " (not a disc root: no label)"}`);
+
 const entrypoint = `rom/${exeName.replace(/\\/g, "/")}`;
 let gameId = get("--game-id");
 if (gameId && !isValidGameId(gameId)) {
@@ -529,6 +540,8 @@ const manifest: Record<string, unknown> = {
         },
         memory: { ram: parseInt(get("--ram") ?? "64", 10) * 1024 * 1024 },
         ...(has("--skip-video") ? { skipVideo: true } : {}),
+        ...(cdPath ? { cdPath } : {}),
+        ...(cdLabel ? { cdLabel } : {}),
     },
 };
 const gameArgs = get("--args");
