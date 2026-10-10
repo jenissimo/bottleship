@@ -477,5 +477,15 @@
     "year": "1997",
     "genre": "Action",
     "enabled": true
+  },
+  {
+    "id": "battle-for-naboo-demo",
+    "name": "Star Wars: Battle for Naboo",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/battle-for-naboo-demo.wgb",
+    "description": "Pilot a Heavy STAP across Naboo farmland in the Neimoidian Plunder demo mission. Protect civilians and settlements from Trade Federation forces.",
+    "year": "2001",
+    "genre": "Arcade Flight",
+    "enabled": true
   }
 ]
