@@ -47,6 +47,7 @@ import { ensureNativeEHProlog } from "./crt-eh-prolog";
 import { registerRttiExports, demangleTypeInfoName } from "./crt-rtti";
 import { registerUcrtExports } from "./crt-ucrt";
 import { invokeGuestVoidChain, readFunctionPointerTable } from "./crt-callback-chain";
+import { CrtEnvironment, readWideEnvironmentString } from "./crt-environment";
 
 /** Priming value for fgetsLoop — a generator's first next() discards its argument. */
 const EMPTY_BYTES = new Uint8Array(0);
@@ -93,6 +94,7 @@ export class Msvcrt implements IModule {
     private ehPrologAddr = 0;
     private envpVectorAddr = 0;
     private environVarAddr = 0;  // char** _environ / __environ / _environ_dll
+    private crtEnvironment: CrtEnvironment | null = null;
     private iobAddr = 0;
     private tmpnamBuf = 0;
     private pioinfoAddr = 0;
@@ -377,21 +379,21 @@ export class Msvcrt implements IModule {
         exports["qsort"] = () => 0;
         exports["bsearch"] = () => 0;   // overridden by the native data export (see ensureNativeCBsearch)
         exports["getenv"] = (ctx, mem, args) => {
-            const name = Marshaler.readString(mem, args[0] ?? 0);
-            Logger.verbose(LogCategory.SYSTEM, `getenv("${name}") -> NULL`);
-            return 0; // NULL - environment variable not found
+            if (!args[0]) { this.setErrno(22); return 0; }
+            return this.crtEnvironment!.get(this.readCString(args[0], 32768));
         };
         exports["_putenv"] = (ctx, mem, args) => {
-            const envstr = Marshaler.readString(mem, args[0] ?? 0);
-            Logger.verbose(LogCategory.SYSTEM, `_putenv("${envstr}") -> 0`);
-            return 0; // success
+            if (!args[0]) { this.setErrno(22); return -1; }
+            return this.crtEnvironment!.put(this.readCString(args[0], 32768));
         };
         exports["_wputenv"] = (ctx, mem, args) => {
-            const envstr = Marshaler.readWideString(mem, args[0] ?? 0);
-            Logger.verbose(LogCategory.SYSTEM, `_wputenv("${envstr}") -> 0`);
-            return 0;
+            if (!args[0]) { this.setErrno(22); return -1; }
+            return this.crtEnvironment!.put(readWideEnvironmentString(args[0]), true);
         };
-        exports["_wgetenv"] = () => 0; // NULL
+        exports["_wgetenv"] = (ctx, mem, args) => {
+            if (!args[0]) { this.setErrno(22); return 0; }
+            return this.crtEnvironment!.get(readWideEnvironmentString(args[0]), true);
+        };
 
         // --- VC8 (msvcr80) additions: *_s, 64-bit conversions, aligned alloc, FPU state ---
         registerCrtVc8Exports(exports, {
@@ -458,6 +460,7 @@ export class Msvcrt implements IModule {
         registerCrtMathExports(exports, {
             process: this.process,
             u32PairToDouble: (lo, hi) => this.u32PairToDouble(lo, hi),
+            setErrno: (value) => { this.setErrno(value); },
         });
 
         // --- Threading ---
@@ -809,6 +812,7 @@ export class Msvcrt implements IModule {
         this.ehPrologAddr = 0;
         this.envpVectorAddr = 0;
         this.environVarAddr = 0;
+        this.crtEnvironment = null;
         this.iobAddr = 0;
         this.pioinfoAddr = 0;
         this.badioinfoAddr = 0;
@@ -897,6 +901,18 @@ export class Msvcrt implements IModule {
         if (this.environVarAddr === 0) {
             this.environVarAddr = this.process.memory.alloc(4, "THUNK_DATA", "rw");
             Mem.writeUint32(this.environVarAddr, this.envpVectorAddr);
+        }
+        if (!this.crtEnvironment) {
+            this.crtEnvironment = new CrtEnvironment(this.process.environment ?? new Map(), {
+                alloc: size => this.process.memory.alloc(size),
+                free: ptr => this.process.memory.free(ptr),
+                setErrno: value => this.setErrno(value),
+                publish: vector => {
+                    this.envpVectorAddr = vector;
+                    Mem.writeUint32(this.environVarAddr, vector);
+                },
+            });
+            this.crtEnvironment.vector();
         }
         if (this.iobAddr === 0) {
             this.iobAddr = this.process.memory.alloc(0x60, "THUNK_DATA", "rw");
@@ -1222,7 +1238,6 @@ export class Msvcrt implements IModule {
 
         Mem.writeUint32(this.argvVectorAddr, this.arg0Addr >>> 0);
         Mem.writeUint32(this.argvVectorAddr + 4, 0);
-        Mem.writeUint32(this.envpVectorAddr, 0);
         if (this.argcAddr) Mem.writeUint32(this.argcAddr, 1);
         if (this.argvPtrVarAddr) Mem.writeUint32(this.argvPtrVarAddr, this.argvVectorAddr >>> 0);
         if (this.environVarAddr) {

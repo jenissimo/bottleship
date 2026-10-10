@@ -11,6 +11,7 @@ import { registerFileIoConsoleExports, ConsoleDeviceHandle, isConsoleDeviceHandl
 import { registerFileIoFindExports } from './file-io-find';
 import { registerFileIoVolumeExports } from './file-io-volume';
 import { registerFileIoPathExports } from './file-io-path';
+import { registerFileIoAttributeExports } from './file-io-attributes';
 import { readStringA, readStringW, encodeFileApiString, setFileApisAnsi, areFileApisAnsi } from './file-io-strings';
 import { MemoryGuard } from '../../core/memory/mem-guard';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -374,6 +375,7 @@ const fileIoModule = (() => {
     registerFileIoFindExports(exports);
     registerFileIoVolumeExports(exports);
     registerFileIoPathExports(exports);
+    registerFileIoAttributeExports(exports);
 
     exports['CreateDirectoryA'] = (ctx, mem, args) => {
         const lpPathName = args[0];

@@ -23,6 +23,7 @@ export interface CrtMathHost {
     process: Process;
     /** Reinterpret two u32 halves (lo, hi) as an IEEE-754 double. */
     u32PairToDouble(lo: number, hi: number): number;
+    setErrno(value: number): void;
 }
 
 export function registerCrtMathExports(exports: Record<string, ThunkImplementation>, host: CrtMathHost): void {
@@ -158,6 +159,15 @@ export function registerCrtMathExports(exports: Record<string, ThunkImplementati
         const y = host.u32PairToDouble(a[0] ?? 0, a[1] ?? 0);
         const x = host.u32PairToDouble(a[2] ?? 0, a[3] ?? 0);
         fpuPush(host.process.v86, Math.atan2(y, x));
+        return 0;
+    };
+
+    exports["_hypot"] = (_c, _m, a) => {
+        const x = host.u32PairToDouble(a[0] ?? 0, a[1] ?? 0);
+        const y = host.u32PairToDouble(a[2] ?? 0, a[3] ?? 0);
+        const result = Math.hypot(x, y);
+        if (result === Infinity && Number.isFinite(x) && Number.isFinite(y)) host.setErrno(34); // ERANGE
+        fpuPush(host.process.v86, result);
         return 0;
     };
 

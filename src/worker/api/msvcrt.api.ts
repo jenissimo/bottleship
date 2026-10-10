@@ -398,6 +398,9 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("asin", 2),
         makeFunc("atan", 2),
         makeFunc("atan2", 4),
+        makeFunc("_hypot", 0, { returnType: "f64", params: [
+            { name: "x", type: "f64" }, { name: "y", type: "f64" },
+        ] }),
         makeFunc("tan", 2),
         makeFunc("sinh", 2),
         makeFunc("cosh", 2),
@@ -567,6 +570,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("_fdopen", 2),
         makeFunc("__doserrno", 0),
         makeFunc("_get_osfhandle", 1),
+        makeFunc("_dup", 1, { returnType: "i32", onUnimplemented: "minusOne" }),
+        makeFunc("_locking", 3, { returnType: "i32", onUnimplemented: "minusOne" }),
         makeFunc("__p___argc", 0),
         makeFunc("__p___argv", 0),
         makeFunc("_EH_prolog", 0),

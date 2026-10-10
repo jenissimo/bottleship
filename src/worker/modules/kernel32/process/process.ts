@@ -1884,6 +1884,9 @@ export const exports: Record<string, ThunkImplementation> = {
         return winDir.length;
     },
 
+    'GetSystemWindowsDirectoryA': (ctx, mem, args) => exports['GetWindowsDirectoryA'](ctx, mem, args),
+    'GetSystemWindowsDirectoryW': (ctx, mem, args) => exports['GetWindowsDirectoryW'](ctx, mem, args),
+
     // BOOL IsWow64Process(HANDLE hProcess, PBOOL Wow64Process)
     // A 32-bit process on a 32-bit Windows: never under WOW64. Callers branch on this to
     // pick which registry view / Program Files path to use, so answering FALSE (rather
