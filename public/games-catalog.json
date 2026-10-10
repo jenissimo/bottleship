@@ -488,5 +488,16 @@
     "year": "2001",
     "genre": "Arcade Flight",
     "enabled": true
+  },
+  {
+    "id": "midtown-madness2-demo",
+    "name": "Midtown Madness 2",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/midtown-madness2-demo.wgb",
+    "coverUrl": "/covers/midtown-madness2-box.jpg",
+    "description": "Cruise through San Francisco in a Ford Mustang Fastback in the original Microsoft trial.",
+    "year": "2000",
+    "genre": "Arcade Racing",
+    "enabled": true
   }
 ]
