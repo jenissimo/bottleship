@@ -41,6 +41,7 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Unreal Tournament (demo) | playable | |
 | Quake II | playable | ✓ |
 | Half-Life: Uplink / Day One (demos) | playable | |
+| Half-Life 2 | boots | |
 | Red Faction | playable | ✓ |
 | Grand Theft Auto III | playable | |
 | Grand Theft Auto: Vice City | playable | |
@@ -87,6 +88,15 @@ The Re-Volt beta is a separate working build, not a replacement for the released
 System Shock 2 coverage is for the original 1999 game, including previously purchased GOG
 copies; it does not cover the 2025 remaster. Unreal Gold's former GOG edition is delisted.
 Quake II coverage is for the classic Win32 executable, rather than the Enhanced executable.
+Half-Life 2 coverage is for `hl2-20th.wgb` (checked 2026-10-10): ordinary New Game plays the
+G-Man introduction and reaches the starting train, platform, station corridor, waiting hall
+and security checkpoint, with movement, turning and audio verified. Menu text, sky textures
+and interior lighting are corrected; these scenes use `mat_fullbright=0`. Quicksaves from
+the ordinary starting train survive a full browser/worker restart and match committed OPFS
+bytes exactly. A separate direct-map check of `d1_trainstation_02` verifies quicksave
+overwrites, F9 restoration and loading after a full browser/worker restart. The normal
+transition to the second map and the full campaign have not been tested. Occlusion intervals
+spanning render passes currently report unavailable.
 The original Bard's Tale and Worms World Party demos are older editions than the working
 remasters. The original Bard's Tale demo has now been checked independently (see below);
 Worms World Party's original demo reaches its startup splash; match entry remains unverified.

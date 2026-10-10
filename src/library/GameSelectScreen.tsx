@@ -13,6 +13,7 @@ import {
   PencilSimple,
   X,
   GithubLogo,
+  ArrowSquareOut,
 } from "@phosphor-icons/react";
 import type { AddedGame } from "../wgb-library";
 import { cx } from "../ui/cx";
@@ -180,6 +181,16 @@ export default function GameSelectScreen({
         </div>
         <span className={s["cmd-spacer"]} />
         <div className={s["cmd-actions"]}>
+          <a
+            className={bm["btn"]}
+            href="https://github.com/jenissimo/bottleship/blob/main/docs/compatibility.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="View game compatibility on GitHub"
+          >
+            <ArrowSquareOut size={16} aria-hidden />
+            Compatibility
+          </a>
           <a
             className={cx(bm, "btn", "btn--primary")}
             href="https://github.com/jenissimo/bottleship"
