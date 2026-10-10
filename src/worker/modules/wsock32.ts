@@ -68,6 +68,7 @@ export class Wsock32 implements IModule {
                 setError(WSAENOTSOCK);
                 return SOCKET_ERROR;
             }
+            this.socketTable.setNonBlocking(s, true);
             setError(0);
             return 0;
         };

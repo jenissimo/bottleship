@@ -1059,6 +1059,9 @@ export function validateSocketTriple(af: number, type: number, protocol: number)
 interface StubSocket {
     connected: boolean;
     nonBlocking: boolean;
+    listening: boolean;
+    type: number;
+    accepts: Array<(value: number) => void>;
 }
 
 /** Deterministic offline socket table — connect succeeds, I/O is no-network safe. */
@@ -1067,17 +1070,22 @@ export class WsaSocketTable {
     private sockets = new Map<number, StubSocket>();
 
     reset(): void {
+        for (const socket of this.sockets.values()) {
+            for (const resolve of socket.accepts) resolve(INVALID_SOCKET);
+        }
         this.nextId = 1;
         this.sockets.clear();
     }
 
-    socket(): number {
+    socket(type = SOCK_STREAM): number {
         const id = this.nextId++;
-        this.sockets.set(id, { connected: false, nonBlocking: true });
+        this.sockets.set(id, { connected: false, nonBlocking: false, listening: false, type, accepts: [] });
         return id;
     }
 
     closesocket(s: number): number {
+        const socket = this.sockets.get(s >>> 0);
+        if (socket) for (const resolve of socket.accepts) resolve(INVALID_SOCKET);
         if (!this.sockets.delete(s >>> 0)) return SOCKET_ERROR;
         return 0;
     }
@@ -1093,12 +1101,25 @@ export class WsaSocketTable {
         return 0;
     }
 
-    listen(_s: number): number {
+    listen(s: number): number {
+        const socket = this.sockets.get(s >>> 0);
+        if (!socket || (socket.type !== SOCK_STREAM && socket.type !== SOCK_SEQPACKET)) return SOCKET_ERROR;
+        socket.listening = true;
         return 0;
     }
 
-    accept(_s: number): number {
-        return this.socket();
+    acceptError(s: number): number {
+        const socket = this.sockets.get(s >>> 0);
+        if (!socket) return WSAENOTSOCK;
+        if (socket.type !== SOCK_STREAM && socket.type !== SOCK_SEQPACKET) return 10045; // WSAEOPNOTSUPP
+        if (!socket.listening) return WSAEINVAL;
+        return socket.nonBlocking ? WSAEWOULDBLOCK : 0;
+    }
+
+    accept(s: number): number | Promise<number> {
+        if (this.acceptError(s)) return INVALID_SOCKET;
+        // The offline transport has no incoming queue; a blocking accept waits until cancellation.
+        return new Promise(resolve => this.sockets.get(s >>> 0)!.accepts.push(resolve));
     }
 
     send(s: number, len: number): number {
@@ -1145,6 +1166,11 @@ export class WsaSocketTable {
         return this.sockets.get(s >>> 0)?.connected ?? false;
     }
 
+    setNonBlocking(s: number, nonBlocking: boolean): void {
+        const socket = this.sockets.get(s >>> 0);
+        if (socket) socket.nonBlocking = nonBlocking;
+    }
+
     ioctl(s: number, cmd: number, argp: number, mem: Uint8Array | null): number {
         const sock = this.sockets.get(s >>> 0);
         if (!sock) return SOCKET_ERROR;
@@ -1183,7 +1209,9 @@ export function makeSocketExports(
             setLastError(err);
             return INVALID_SOCKET;
         }
-        const id = table.socket();
+        const selectedType = type || PROTOCOL_CATALOG.find(e => (af === AF_UNSPEC || e.af === af)
+            && (protocol === 0 || (protocol >= e.protocol && protocol <= e.protocol + e.maxOffset)))!.type;
+        const id = table.socket(selectedType);
         setLastError(0);
         return id;
     };
@@ -1219,14 +1247,22 @@ export function makeSocketExports(
         listen: (_ctx, _mem, args) => {
             const s = args[0] >>> 0;
             if (!requireSocket(s)) return SOCKET_ERROR;
-            setLastError(0);
-            return table.listen(s);
+            const result = table.listen(s);
+            setLastError(result === SOCKET_ERROR ? 10045 : 0);
+            return result;
         },
         accept: (_ctx, _mem, args) => {
             const s = args[0] >>> 0;
+            if (!counter.started) { setLastError(WSANOTINITIALISED); return INVALID_SOCKET; }
             if (!requireSocket(s)) return INVALID_SOCKET;
-            setLastError(0);
-            return table.accept(s);
+            const error = table.acceptError(s);
+            if (error) { setLastError(error); return INVALID_SOCKET; }
+            const result = table.accept(s);
+            if (typeof result === 'number') return result;
+            return result.then<number>(value => {
+                setLastError(10004); // WSAEINTR: close/reset cancelled the blocking call.
+                return value;
+            });
         },
         send: (_ctx, _mem, args) => {
             const s = args[0] >>> 0;

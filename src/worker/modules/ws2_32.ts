@@ -113,6 +113,7 @@ export class Ws2_32 implements IModule {
                 setError(WSAENOTSOCK);
                 return SOCKET_ERROR;
             }
+            this.socketTable.setNonBlocking(s, true);
             setError(0);
             return 0;
         };
@@ -267,6 +268,7 @@ export class Ws2_32 implements IModule {
                 setError(WSAEINVAL);
                 return SOCKET_ERROR;
             }
+            this.socketTable.setNonBlocking(socket, true);
             return 0;
         };
 
