@@ -2844,6 +2844,14 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
         return ch === 0 ? lpsz : lpsz + 2;
     };
 
+    // LPSTR CharPrevA(LPCSTR start, LPCSTR current) — every ANSI code page we provide is
+    // single-byte (IsDBCSLeadByte answers FALSE), so the previous character is one byte back.
+    exports['CharPrevA'] = (_ctx, _mem, args) => {
+        const start = args[0] >>> 0;
+        const current = args[1] >>> 0;
+        return current > start ? current - 1 : start;
+    };
+
     // LPWSTR CharPrevW(LPCWSTR start, LPCWSTR current)
     exports['CharPrevW'] = (_ctx, _mem, args) => {
         const start = args[0] >>> 0;
