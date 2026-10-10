@@ -5,11 +5,12 @@
 // async-park atomicization. These are CHARACTERIZATION tests: they
 // assert what the code does TODAY. Pin first, slice second.
 
-import { describe, it, expect } from 'bun:test';
+import { afterEach, beforeEach, describe, it, expect } from 'bun:test';
 import { ThunkDispatcher } from '../../src/worker/core/thunking/thunk-dispatcher';
 import { Logger } from '../../src/worker/core/logger';
 import { preemptionManager } from '../../src/worker/core/cpu/preemption-manager';
 import { System } from '../../src/worker/core/system';
+import { ThunkBoundaryKind } from '../../src/worker/core/scheduler/types';
 
 const SPIN_ADDR = 0xdead0000;
 
@@ -42,6 +43,55 @@ describe('ThunkDispatcher — instantiation', () => {
     it('constructs in isolation with a fake v86 (no WASM/DOM)', () => {
         expect(mkDispatcher()).toBeTruthy();
     });
+});
+
+describe('ThunkDispatcher — failed sync call ABI', () => {
+    let originalProcess: typeof System.prototype.process;
+    beforeEach(() => {
+        originalProcess = System.getInstance().process;
+        System.getInstance().process = null;
+    });
+    afterEach(() => { System.getInstance().process = originalProcess; });
+
+    for (const failure of ['missing', 'throw'] as const) {
+        for (const cleanup of [0, 16]) {
+            it(`${failure} handler preserves the stub RET ${cleanup} at the scheduler boundary`, () => {
+                const d = mkDispatcher();
+                const { dv } = bindMemory(d);
+                const id = 0x1000;
+                const name = 'kernel32:MissingCall';
+                const cpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw, flags: d.cachedFlagsRaw };
+                cpu.reg32[4] = 0x1000;
+                cpu.instruction_pointer[0] = 0x00402000;
+                dv.setUint32(0x1000, 0x00401000, true);
+                d.cachedCpu = cpu;
+                d.namesTable[id] = name;
+                d.argCountsTable[id] = 4;
+                d.stackCleanupTable[id] = cleanup;
+                d.thunkGenerator = { getStubById: () => ({ dllName: 'kernel32', functionName: 'MissingCall', argCount: 4 }) };
+                d.markHleRegistrationComplete();
+                d.validateReturnAddrFast = () => true;
+                d._trySameNameLookup = d._tryDllForward = d._tryPendingRegistration = () => null;
+                const boundaries: Array<[ThunkBoundaryKind, number]> = [];
+                d.ensureScheduler = () => ({
+                    isThreadExitId: () => false,
+                    getCurrentThreadId: () => 1,
+                    getCurrentThread: () => null,
+                    setLastError: () => {},
+                    onThunkBoundary: (_cpu: unknown, kind: ThunkBoundaryKind, bytes: number) => boundaries.push([kind, bytes]),
+                });
+                if (failure === 'throw') d.dispatchTable[id] = () => { throw new Error('handler failed'); };
+
+                d._handlePortWriteSlow(id, true);
+
+                expect(boundaries).toEqual([[ThunkBoundaryKind.THUNK_STUB, cleanup]]);
+                expect(cpu.reg32[4]).toBe(0x1000);
+                expect(d.lastExpectedEspAfterReturn).toBe(0x1004 + cleanup);
+                expect(d.lastThunkIdAfterReturn).toBe(id);
+                expect(d.lastThunkName).toBe(name);
+            });
+        }
+    }
 });
 
 describe('ThunkDispatcher — WBUF dynarec lifecycle', () => {

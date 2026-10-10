@@ -892,6 +892,9 @@ export class Scheduler {
     onThunkBoundary(cpu: V86Cpu, kind: ThunkBoundaryKind, cleanup: number): void {
         if (!this.process) return;
 
+        // A parked OUT may still execute RET N; keep its redirected stack until the tick boundary.
+        if (kind === ThunkBoundaryKind.SPIN_LOOP) return;
+
         if (this.handleUnhandledFaultHalt(cpu, "onThunkBoundary")) return;
 
         // 1. Process pending async restores (highest priority — unblocks spin-loop threads)
@@ -1745,13 +1748,10 @@ export class Scheduler {
         this.tryArmTimerNoFpuRestoreSkip(cpu, next, savedCtx);
         this.transitionTo(next, ThreadState.RUNNING, null, null);
 
-        // Determine restore method based on current EIP location
-        const currentEip = readEip(cpu);
-        const inThunkRegion = (currentEip >= this.thunkStubBase && currentEip < this.thunkStubEnd) ||
-            (this.callbackStubBase > 0 && currentEip >= this.callbackStubBase && currentEip < this.callbackStubEnd);
-
-        if (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB &&
-            !(globalThis as { __noStackBasedRestore?: boolean }).__noStackBasedRestore) {
+        // HLE image exports also have a pending RET, outside the generator arena.
+        const stackRestore = kind === ThunkBoundaryKind.THUNK_STUB &&
+            !(globalThis as { __noStackBasedRestore?: boolean }).__noStackBasedRestore;
+        if (stackRestore) {
             // Stack-based restore: compute adjusted ESP, write target EIP, let RET N pop naturally
             this.stackBasedRestore(cpu, savedCtx, cleanup, next.id);
         } else {
@@ -1764,7 +1764,7 @@ export class Scheduler {
         // save/restore losing a register (esi=0 hypothesis). Method = which restore path ran.
         if (this.debugHeadWatch && savedCtx.eip >= this.debugHeadWatch.loEip && savedCtx.eip < this.debugHeadWatch.hiEip) {
             const r = cpuViews(cpu).reg32;
-            const method = (inThunkRegion && kind === ThunkBoundaryKind.THUNK_STUB) ? "stack" : "direct";
+            const method = stackRestore ? "stack" : "direct";
             const mism = ((r[6] >>> 0) !== (savedCtx.esi >>> 0)) || ((r[4] >>> 0) !== (savedCtx.esp >>> 0)) ||
                          ((r[7] >>> 0) !== (savedCtx.edi >>> 0)) || ((r[3] >>> 0) !== (savedCtx.ebx >>> 0));
             if (this.debugHeadZeroSnaps.length < 2000) {

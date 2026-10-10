@@ -1023,6 +1023,19 @@ export class ThunkDispatcher {
         this.notifySchedulerBoundary(cpu);
     }
 
+    private completeFailedSyncCall(id: number, name: string, cpu: any, esp: number, argCount: number): void {
+        // The emitted RET still runs when a handler is missing or fails.
+        const cleanup = this.resolveThunkCleanup(id, argCount, name);
+        this.lastThunkId = id;
+        this.lastThunkName = name;
+        this.lastExpectedEspAfterReturn = esp + 4 + cleanup;
+        this.lastThunkIdAfterReturn = id;
+        this.lastThunkNameAfterReturn = name;
+        this.winApiRing.recordReturnValue(this.regsRaw[0] >>> 0);
+        this.recordShadowStackAtEntry(id, esp);
+        this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.THUNK_STUB, cleanup);
+    }
+
     /**
      * Dump callback-manager and callback-queue forensic state.
      * Called only on critical faults to keep hot path clean.
@@ -2613,7 +2626,7 @@ export class ThunkDispatcher {
         if (!impl) {
             this._slowPathMissingImplementation(functionId, cpu, thunkName);
             if (profileThunk) profiler.endAsync(thunkName);
-            this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.THUNK_STUB, 0);
+            this.completeFailedSyncCall(functionId, thunkName, cpu, espAtEntry, argCount);
             if (sampleProfiler) profiler.end("thunk_dispatch");
             return;
         }
@@ -2630,7 +2643,7 @@ export class ThunkDispatcher {
         if (!this.validateReturnAddrFast(espAtEntry, allowStubPoolRet)) {
             this._slowPathInvalidReturnPreCall(functionId, thunkName, espAtEntry, cpu);
             if (profileThunk) profiler.endAsync(thunkName);
-            this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.THUNK_STUB, 0);
+            this.completeFailedSyncCall(functionId, thunkName, cpu, espAtEntry, argCount);
             if (sampleProfiler) profiler.end("thunk_dispatch");
             return;
         }
@@ -2694,7 +2707,7 @@ export class ThunkDispatcher {
         } catch (e) {
             this._slowPathHandleThunkError(functionId, thunkName, e, cpu);
             if (profileThunk) profiler.endAsync(thunkName);
-            this.setBoundaryAndNotify(cpu, ThunkBoundaryKind.THUNK_STUB, 0);
+            this.completeFailedSyncCall(functionId, thunkName, cpu, espAtEntry, argCount);
             if (sampleProfiler) profiler.end("thunk_dispatch");
             const dur = frameProfiler.endTimer("thunk", thunkStart);
             frameProfiler.recordThunk(thunkName, dur);

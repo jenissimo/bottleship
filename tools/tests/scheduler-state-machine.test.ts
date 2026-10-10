@@ -44,6 +44,7 @@ import {
 import { hypercallDataManager } from "../../src/worker/core/cpu/hypercall-data";
 import { hasFpuSimdDirtyFlag } from "../../src/worker/core/fpu-helper";
 import { System } from "../../src/worker/core/system";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { MessageQueue } from "../../src/worker/runtime/windowing/message-queue";
 import { preemptionManager, PreemptionManager } from "../../src/worker/core/cpu/preemption-manager";
 
@@ -1516,6 +1517,78 @@ describe("scheduler/thread-exit liveness — survivor switched in after a siblin
 // them, letting the x87 control word / MXCSR drift on the sync-return switch path.
 
 describe("scheduler/stackBasedRestore", () => {
+    test("a park boundary finishes its pending RET before switching or applying async restores", () => {
+        const s = new Scheduler();
+        const mem = new Uint8Array(0x4000);
+        const view = new DataView(mem.buffer);
+        Mem.bind(() => mem);
+        const spin = 0x21040000;
+        const cpu = fakeCpu({ eip: spin, esp: 0x2000 });
+        (s as any).process = { id: 1, getCurrentMemory: () => mem, getModule: () => undefined, v86: { cpu } };
+        (s as any).spinLoopBase = spin;
+        (s as any).spinLoopEnd = spin + 0x1000;
+        (s as any).lastDeadlockCheckMs = Number.MAX_SAFE_INTEGER;
+        const parked = inject(s, mkThread(1, ThreadState.WAITING), { current: true });
+        parked.context = createInitialContext(0x00401000, 0x2014);
+        const incoming = mkThread(2, ThreadState.READY);
+        incoming.context = createInitialContext(0x00402000, 0x1000);
+        inject(s, incoming, { runnable: true });
+        view.setUint32(0x2000, spin, true);
+        view.setUint32(0x1000, 0xdeadc0de, true);
+        let restorePolls = 0;
+        s.onPollAsyncRestores = () => { restorePolls++; return false; };
+        s.requestSwitch();
+
+        s.onThunkBoundary(cpu, ThunkBoundaryKind.SPIN_LOOP, 0);
+
+        expect(s.getCurrentThreadId()).toBe(1);
+        expect(restorePolls).toBe(0);
+        expect(view.getUint32(cpu.reg32[4] >>> 0, true)).toBe(spin);
+        cpu.instruction_pointer[0] = view.getUint32(cpu.reg32[4] >>> 0, true);
+        cpu.reg32[4] += 20;
+        s.preemptAtTickBoundary(cpu);
+        expect(s.getCurrentThreadId()).toBe(2);
+        expect(cpu.instruction_pointer[0] >>> 0).toBe(0x00402000);
+        expect(cpu.reg32[4] >>> 0).toBe(0x1000);
+        expect(restorePolls).toBe(1);
+        expect(parked.context?.eip).toBe(0x00401000);
+        expect(parked.context?.esp).toBe(0x2014);
+    });
+
+    for (const stubEip of [0x2104100b, 0x2a00178b]) {
+        test(`pending RET 8 resumes the incoming thread from stub 0x${stubEip.toString(16)}`, () => {
+            const s = new Scheduler();
+            const mem = new Uint8Array(0x4000);
+            const view = new DataView(mem.buffer);
+            Mem.bind(() => mem);
+            (s as any).process = { getCurrentMemory: () => mem };
+            (s as any).thunkStubBase = 0x21041000;
+            (s as any).thunkStubEnd = 0x21141000;
+            const outgoing = inject(s, mkThread(1, ThreadState.RUNNING), { current: true });
+            const incoming = mkThread(2, ThreadState.READY);
+            incoming.context = createInitialContext(0x00402000, 0x1000);
+            incoming.tebAddress = 0x50000;
+            inject(s, incoming, { runnable: true });
+            const switches: Array<[number, number]> = [];
+            s.onThreadSwitchCallback = (oldId, newId) => switches.push([oldId, newId]);
+            view.setUint32(0x2000, 0x00401000, true);
+            view.setUint32(0x1000, 0xdeadc0de, true);
+            const cpu = fakeCpu({ eip: stubEip, esp: 0x2000 });
+
+            expect((s as any).performSwitch(cpu, ThunkBoundaryKind.THUNK_STUB, 8)).toBe(true);
+            // v86 completes the RET 8 already compiled after the intercepted OUT.
+            const resumedEip = view.getUint32(cpu.reg32[4] >>> 0, true);
+            const resumedEsp = (cpu.reg32[4] + 12) >>> 0;
+
+            expect(resumedEip).toBe(0x00402000);
+            expect(resumedEsp).toBe(0x1000);
+            expect(outgoing.context?.eip).toBe(0x00401000);
+            expect(outgoing.context?.esp).toBe(0x200c);
+            expect(cpu.segment_offsets[4] >>> 0).toBe(0x50000);
+            expect(switches).toEqual([[1, 2]]);
+        });
+    }
+
     test("writes EIP to the stack, sets GPRs/EFLAGS, and restores FPU + SSE", () => {
         const s = new Scheduler();
         const mem = new Uint8Array(0x2000);
