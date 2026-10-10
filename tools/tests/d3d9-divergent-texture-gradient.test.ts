@@ -198,4 +198,37 @@ describe("D3D9 divergent texture gradients", () => {
 
         expect(planUniformity(program).isDerivativeRefused(texldd)).toBe(true);
     });
+
+    test("nested uniform reps sample loop-carried coordinates without hoisting derivatives", () => {
+        const sample = instruction(Op.TEX, [source(RegType.TEMP, 0), source(RegType.SAMPLER, 0)], destination(1));
+        const program = pixelProgram([
+            instruction(Op.MOV, [source(RegType.INPUT, 0)], destination(0)),
+            instruction(Op.REP, [source(RegType.CONSTINT, 0)]),
+            instruction(Op.REP, [source(RegType.CONSTINT, 1)]),
+            sample,
+            instruction(Op.MUL, [source(RegType.TEMP, 1), source(RegType.CONST, 0)], destination(0)),
+            instruction(Op.ENDREP),
+            instruction(Op.ENDREP),
+        ]);
+        expect(planUniformity(program).get(sample)).toMatchObject({ mode: "implicit", divergent: false, derivative: null });
+        const wgsl = emitPsMain(program, analyzePs(program));
+        expect(wgsl).toContain("textureSample(tex0, samp");
+        expect(wgsl).not.toContain("dpdx(");
+        expect(wgsl.indexOf("textureSample(")).toBeGreaterThan(wgsl.lastIndexOf("for ("));
+    });
+
+    test("an implicit sample with a non-affine coordinate remains refused after a per-lane break", () => {
+        const sample = instruction(Op.TEX, [source(RegType.TEMP, 0), source(RegType.SAMPLER, 0)], destination(1));
+        const program = pixelProgram([
+            instruction(Op.REP, [source(RegType.CONSTINT, 0)]),
+            instruction(Op.IF, [source(RegType.INPUT, 1)]),
+            instruction(Op.BREAK),
+            instruction(Op.ENDIF),
+            instruction(Op.MUL, [source(RegType.INPUT, 0), source(RegType.INPUT, 1)], destination(0)),
+            sample,
+            instruction(Op.ENDREP),
+        ]);
+        expect(planUniformity(program).get(sample)).toMatchObject({ mode: "refuse", divergent: true });
+        expect(() => emitPsMain(program, analyzePs(program))).toThrow("refusing link");
+    });
 });

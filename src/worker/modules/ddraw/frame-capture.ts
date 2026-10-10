@@ -147,13 +147,14 @@ let captureWantBackend: string | undefined;
 let captureNeedsFrameBoundary = false;
 /** Frame ends skipped because they carried nothing — reported, never silently dropped. */
 let captureSkippedEmpty = 0;
+let captureSkippedFiltered = 0;
 /** How many empty frame ends to wait through before giving up and reporting one. */
 const MAX_EMPTY_FRAME_ENDS = 8;
 /** The `firstVertices`/`indexedVertices` sample sizes armed for the in-progress capture,
  *  and what to restore the ambient `__captureVertsMax`/`__captureIndexedVertsMax` globals to
  *  when it ends — so a `captureFrame({maxIndexedVerts})` call cannot leak its override into
  *  the next, unrelated capture. */
-let captureConfig: { maxVerts: number; maxIndexedVerts: number } | undefined;
+let captureConfig: { maxVerts: number; maxIndexedVerts: number; minDraws?: number; minRenderTargets?: number } | undefined;
 let captureConfigRestore: { maxVerts: number | undefined; maxIndexedVerts: number | undefined } | undefined;
 
 export function isCapturing(): boolean {
@@ -171,7 +172,7 @@ export function isCapturing(): boolean {
  * `recordDrawCall`) — configurable because a mesh smaller than the default sample makes
  * "sampled N of N" and "the option did nothing" look identical without a knob to check it.
  */
-export function startCapture(backend?: string, opts?: { maxVerts?: number; maxIndexedVerts?: number }): Promise<CapturedFrame> {
+export function startCapture(backend?: string, opts?: { maxVerts?: number; maxIndexedVerts?: number; minDraws?: number; minRenderTargets?: number }): Promise<CapturedFrame> {
     // Settle a still-armed prior capture so its caller doesn't hang until its own
     // timeout (two overlapping captureFrame calls, or capture + dbg.frame()).
     if (captureReject) captureReject(new Error("capture superseded by a new startCapture"));
@@ -180,6 +181,7 @@ export function startCapture(backend?: string, opts?: { maxVerts?: number; maxIn
     captureBackend = "ddraw";
     captureWantBackend = backend;
     captureSkippedEmpty = 0;
+    captureSkippedFiltered = 0;
     captureNeedsFrameBoundary = true;
     captureActive = true;
     const g = globalThis as unknown as Record<string, unknown>;
@@ -187,6 +189,8 @@ export function startCapture(backend?: string, opts?: { maxVerts?: number; maxIn
     const maxVerts = opts?.maxVerts && opts.maxVerts > 0 ? opts.maxVerts | 0 : 4;
     const maxIndexedVerts = opts?.maxIndexedVerts && opts.maxIndexedVerts > 0 ? opts.maxIndexedVerts | 0 : 6;
     captureConfig = { maxVerts, maxIndexedVerts };
+    if (opts?.minDraws !== undefined) captureConfig.minDraws = Math.max(0, Math.floor(opts.minDraws));
+    if (opts?.minRenderTargets !== undefined) captureConfig.minRenderTargets = Math.max(0, Math.floor(opts.minRenderTargets));
     g.__captureVertsMax = maxVerts;
     g.__captureIndexedVertsMax = maxIndexedVerts;
     return new Promise<CapturedFrame>((resolve, reject) => {
@@ -214,6 +218,7 @@ export function cancelCapture(reason = new Error("capture cancelled")): void {
     captureBackend = "ddraw";
     captureWantBackend = undefined;
     captureSkippedEmpty = 0;
+    captureSkippedFiltered = 0;
     captureNeedsFrameBoundary = false;
     restoreCaptureConfig();
     const reject = captureReject;
@@ -288,6 +293,16 @@ export function onFrameEnd(producer = "ddraw"): void {
         return;
     }
     const empty = captureBuffer.length === 0 && clearBuffer.length === 0;
+    // Wait through loading screens without mixing their commands into the selected frame.
+    const targets = captureConfig?.minRenderTargets
+        ? new Set(captureBuffer.map(draw => draw.rtSurfacePtr)).size : Infinity;
+    if (captureBuffer.length < (captureConfig?.minDraws ?? 0) || targets < (captureConfig?.minRenderTargets ?? 0)) {
+        captureSkippedFiltered++;
+        captureBuffer = [];
+        clearBuffer = [];
+        captureBackend = "ddraw";
+        return;
+    }
     if (empty && captureSkippedEmpty < MAX_EMPTY_FRAME_ENDS) {
         captureSkippedEmpty++;
         return;
@@ -302,12 +317,15 @@ export function onFrameEnd(producer = "ddraw"): void {
         drawCalls: captureBuffer,
         clears: clearBuffer,
         captureConfig,
+        ...(captureConfig?.minDraws !== undefined || captureConfig?.minRenderTargets !== undefined
+            ? { skippedFilteredFrameEnds: captureSkippedFiltered } : {}),
     };
     captureBuffer = [];
     clearBuffer = [];
     captureBackend = "ddraw";
     captureWantBackend = undefined;
     captureSkippedEmpty = 0;
+    captureSkippedFiltered = 0;
     captureNeedsFrameBoundary = false;
     restoreCaptureConfig();
     const resolve = captureResolve;

@@ -344,14 +344,19 @@ export class HarnessChain {
      *  frame boundary ends it — without it, a title where two paths present returns the other
      *  path's empty frame and that reads exactly like "no draws happened". `dumpTargets` adds
      *  the distinct render attachments the frame drew into. */
-    captureFrame(opts?: { dumpTargets?: boolean; backend?: "ddraw" | "d3d8" | "d3d9"; timeoutMs?: number }): this { return this.push("captureFrame", [opts]); }
+    captureFrame(opts?: { dumpTargets?: boolean; backend?: "ddraw" | "d3d8" | "d3d9"; timeoutMs?: number; maxVerts?: number; maxIndexedVerts?: number; minDraws?: number; minRenderTargets?: number }): this {
+        const deadline = opts?.timeoutMs ?? 5_000;
+        return this.pushTimed("captureFrame", [opts], deadline > 0 ? deadline + 5_000 : 0);
+    }
     /** Flip one render-backend DebugFlag (alpha test/blend, z test, texture resync, converter
      *  debug colours...). The first toggle that makes an invisible draw appear names the stage
      *  that was dropping it. Omit `name` to read the currently-armed flags. Sticky — clear them. */
     gpuToggle(name?: string, enabled?: boolean, value?: number): this { return this.push("gpuToggle", [name, enabled, value]); }
     textures(): this { return this.push("textures", []); }
     dumpTexture(sel: string | { stage: number }): this { return this.push("dumpTexture", [sel]); }
-    dumpSurface(sel: string): this { return this.push("dumpSurface", [sel]); }
+    dumpSurface(sel: string|number, opts?: {save?: string;from?: "auto"|"gpu"|"scratch";level?: number}): this {
+        return this.push("dumpSurface", opts ? [sel,opts] : [sel]);
+    }
     /** WHICH GDI surface holds what: every live DC, every retained window-client image and
      *  the overlay, each with an opaque/non-black/luma summary. An all-black surface is then
      *  a measurement rather than a deduction about DC topology. */

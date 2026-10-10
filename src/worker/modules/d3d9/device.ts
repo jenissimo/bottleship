@@ -231,6 +231,7 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
     if (!enableAutoDS) {
         // No implicit DS — clear any stale binding so Get returns NULL faithfully.
         deviceBoundDepthStencil.delete(devicePtr);
+        device.setDepthStencilTexture(0);
         return;
     }
     const vtableAddr = getVTables()['IDirect3DSurface9']?.address;
@@ -258,6 +259,7 @@ function bindAutoDepthStencil(device: D3D9Device, devicePtr: number, mem: Uint8A
         standalone: true,
     });
     registerComFinalizer(surfacePtr, () => releaseSurfaceMetadata(surfacePtr));
+    device.setDepthStencilSurface(surfacePtr, w, h, format, multiSampleType);
     deviceBoundDepthStencil.set(devicePtr, surfacePtr);
     // The implicit DS is device-owned: its creation reference IS the binding's.
     adoptSurfaceSlot(devicePtr, 'ds', surfacePtr);

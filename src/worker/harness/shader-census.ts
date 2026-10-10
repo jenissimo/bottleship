@@ -17,11 +17,14 @@ export interface ShaderCensusCollection {
     snapshotFailures: number;
 }
 
-export function collectShaderCensus(reset: boolean): ShaderCensusCollection {
+export function collectShaderCensus(
+    reset: boolean,
+    sources: Iterable<readonly [number, unknown]> = d3d9Devices,
+): ShaderCensusCollection {
     const snapshots: Array<Record<string, unknown>> = [];
     let deviceCount = 0;
     let snapshotFailures = 0;
-    for (const [device, instance] of d3d9Devices) {
+    for (const [device, instance] of sources) {
         deviceCount++;
         const instrumentation = instance as unknown as {
             shaderInstrumentationSnapshot?: (reset: boolean) => Record<string, unknown>;
@@ -51,5 +54,6 @@ export function collectShaderCensus(reset: boolean): ShaderCensusCollection {
 
 /** A census covers something only if a device answered and none of them failed. */
 export function censusComplete(c: ShaderCensusCollection): boolean {
-    return c.deviceCount > 0 && c.snapshotFailures === 0;
+    return c.deviceCount > 0 && c.snapshotFailures === 0
+        && c.snapshots.every(s => (s.census as { complete?: boolean } | undefined)?.complete !== false);
 }

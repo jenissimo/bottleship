@@ -91,7 +91,7 @@ const RECORDED = [
     "setNPatchMode", "setPaletteEntries", "setPixelShader", "setPixelShaderConstantB",
     "setPixelShaderConstantBFromArray", "setPixelShaderConstantF", "setPixelShaderConstantFFromArray",
     "setPixelShaderConstantI", "setPixelShaderConstantIFromArray", "setPresentationInterval",
-    "setRenderState", "setRenderTarget", "setSamplerState", "setScissorRect",
+    "setRenderState", "setRenderTarget", "setSamplerState", "setScissorRect", "setShaderOutputOverride",
     "setSoftwareVertexProcessing", "setStreamSource", "setStreamSourceFreq", "setSwapEffect",
     "setTexture", "setTextureLevelPixels", "setCubeFacePixels", "setTextureStageState", "setTransform",
     "setVertexDeclaration", "setVertexShader", "setVertexShaderConstantB",
@@ -369,7 +369,15 @@ class SplitStream {
         } finally {
             this.depth--;
         }
-        if (site.post) {
+        if (name === "registerVolumeTexture") {
+            const descriptor = device.captureVolumeTextureDescriptor(a0 as number);
+            this.record(slot, name, [a0, descriptor], result);
+            if (result === true && descriptor) this.recordVolumePixels(device, slot, a0 as number, descriptor);
+        } else if (name === "markVolumeTextureDirty") {
+            const descriptor = device.captureVolumeTextureDescriptor(a0 as number);
+            if (descriptor) this.recordVolumePixels(device, slot, a0 as number, descriptor);
+            this.record(slot, name, args, result);
+        } else if (site.post) {
             const t = site.post(device, args, result);
             if (t) this.record(slot, t[0], t[1], undefined);
         } else if (record) {
@@ -379,6 +387,20 @@ class SplitStream {
         else if (site.readbackFence && result !== null && typeof result === "object"
             && typeof (result as Promise<unknown>).then === "function") this.flush();
         return result;
+    }
+
+    private recordVolumePixels(device: D3D9Device, slot: number, ptr: number,
+        descriptor: NonNullable<ReturnType<D3D9Device["captureVolumeTextureDescriptor"]>>): void {
+        // Keep each record below the payload limit, including the largest supported volume.
+        const chunkBytes = 4 * 1024 * 1024;
+        for (let level = 0; level < descriptor.levels; level++) {
+            const size = descriptor.levelData[level]!.bytes;
+            for (let offset = 0; offset < size; offset += chunkBytes) {
+                const bytes = device.captureVolumeTextureLevelBytes(ptr, level, offset, Math.min(chunkBytes, size - offset));
+                if (!bytes) throw new Error(`volume 0x${ptr.toString(16)} mip ${level} is unreadable`);
+                this.record(slot, "setVolumeTextureLevelBytes", [ptr, level, offset, bytes], undefined);
+            }
+        }
     }
 
     private record(slot: number, name: string, args: Args, result: unknown): void {
@@ -395,7 +417,11 @@ class SplitStream {
             if (this.stats.encodeErrors[name] === 1) Logger.error(LogCategory.D3D9, `[split] ${String(e)}`);
             return;
         }
-        this.dispatcher.enqueuePayloadById(this.queueId, this.methodId(name), slot, 0, 0, enc.bytes, 0, enc.length);
+        if (!this.dispatcher.enqueuePayloadById(this.queueId, this.methodId(name), slot, 0, 0, enc.bytes, 0, enc.length)) {
+            this.stats.encodeErrors[name] = (this.stats.encodeErrors[name] ?? 0) + 1;
+            Logger.error(LogCategory.D3D9, `[split] queue rejected ${name} (${enc.length} bytes)`);
+            return;
+        }
         this.stats.recorded++;
         this.stats.recordedBytes += enc.length;
     }

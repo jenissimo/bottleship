@@ -55,6 +55,7 @@ import { readGpuTextureRgba, readGpuTextureStats } from "../shared/gpu-readback"
 import {
     buildColorTargetState, computeBlendKey, buildDepthStencilState, computeDepthKey,
     D3DRS_SRCBLENDALPHA, D3DRS_DESTBLENDALPHA, D3DRS_BLENDFACTOR,
+    D3DRS_BLENDOP, D3DRS_BLENDOPALPHA, D3DRS_SEPARATEALPHABLENDENABLE,
     isD3D9BlendStateRepresentable, unrepresentableD3D9DepthStencilState,
     hasUnsupportedStencilState, D3DRS_STENCILREF, d3dColorToGpu,
 } from "./d3d9-blend";
@@ -71,9 +72,9 @@ import {
 import { TimeService } from "../../../runtime/time";
 import { System } from "../../../core/system";
 import {
-    getVolumeLevel,
     volumeTextureResources,
-    type VolumeTextureResource,
+    type VolumeLevel,
+    type VolumeTextureDescriptor,
 } from "../../../modules/d3d9/volume-resources";
 import * as frameCapture from "../../../modules/ddraw/frame-capture";
 import { getOverlayCompositePlan } from "../../../modules/user32/dialog-overlay";
@@ -310,6 +311,11 @@ interface ShaderPairDiagnosticRecord {
     build: ShaderDiagnosticBuild;
     error: string | null;
     pipelineId: number | null;
+    pipelineState?: {
+        colorTargets: Array<GPUColorTargetState | null>;
+        vertexBuffers: Array<GPUVertexBufferLayout | null>;
+        depthStencil: GPUDepthStencilState;
+    };
     drawsIssued: number;
     /** The two stage records this pair attributes its draws to, resolved once and revalidated
      *  by `epoch` — the draw path runs on every programmable draw and must not look them up. */
@@ -791,7 +797,10 @@ export class D3D9Device {
     /** Volume textures use a separate negative index namespace so the existing
      *  TextureStore's 2-D/cube metadata remains type-safe. */
     private volumeByPointer = new Map<number, number>();
-    private volumeByIndex = new Map<number, { pointer: number; texture: GPUTexture | null; view: GPUTextureView | null; dirty: boolean }>();
+    private volumeByIndex = new Map<number, {
+        pointer: number; texture: GPUTexture | null; view: GPUTextureView | null; dirty: boolean;
+        shadow: (VolumeTextureDescriptor & { data: Uint8Array[] }) | null;
+    }>();
     private nextVolumeIndex = -1;
     readonly texturePalettes = new TexturePaletteStore();
 
@@ -1042,12 +1051,17 @@ export class D3D9Device {
     } | null = null;
 
     /** HARNESS rtDebug verb: what SetRenderTarget saw + which textures were created as RTs. */
-    getRtDebug(): { resolves: string[]; creates: string[]; currentRtIndex: number | null; targets: Array<number | null> } {
+    getRtDebug() {
+        const depth = this.activeStandaloneDepthSurface === null ? null
+            : this.standaloneDepthBinding(this.activeStandaloneDepthSurface);
         return {
             resolves: [...this.rtResolveLog],
             creates: [...this.rtCreateLog],
             currentRtIndex: this.currentRtIndex,
             targets: [...this.renderTargetIndices],
+            depth: this.depthTextureIndex !== null ? {textureIndex:this.depthTextureIndex}
+                : depth ? {surfacePtr:this.activeStandaloneDepthSurface,width:depth.width,
+                    height:depth.height,format:depth.format,sampleCount:depth.sampleCount} : null,
         };
     }
 
@@ -1662,17 +1676,10 @@ export class D3D9Device {
     }
 
     /**
-     * The depth/stencil attachment for a pass whose color target is renderW x renderH.
-     *
-     * D3D9 lets the bound depth surface be LARGER than the render target — only its
-     * top-left renderW x renderH sub-rect participates (DXVK BindFramebuffer encodes the
-     * same rule, and Vulkan can bind the oversized image directly). WebGPU requires every
-     * attachment of a pass to have identical dimensions, so an exact match binds the real
-     * surface and any other size renders into a cached scratch depth of the render area in
-     * the SAME format and sample count — the pipeline's depth format keeps agreeing with
-     * the attachment, which a dropped depth attachment would not.
+     * D3D9 permits oversized depth surfaces. Padding single-sample color targets preserves
+     * their shared stencil contents while satisfying WebGPU's equal attachment extents.
      */
-    private resolveDepthAttachment(renderW: number, renderH: number, physScale = 1): {
+    private resolveDepthAttachment(renderW: number, renderH: number, physScale = 1, padColor = false): {
         view: GPUTextureView;
         format: GPUTextureFormat;
         width: number;
@@ -1716,7 +1723,8 @@ export class D3D9Device {
         // and disagrees in image size — which WebGPU rejects for the whole pass.
         const scratchW = Math.max(1, Math.round(renderW * physScale));
         const scratchH = Math.max(1, Math.round(renderH * physScale));
-        if (bound.physW === scratchW && bound.physH === scratchH) {
+        if ((bound.physW === scratchW && bound.physH === scratchH)
+            || (padColor && bound.sampleCount === 1 && bound.physW >= scratchW && bound.physH >= scratchH)) {
             return { view: bound.view, format: bound.format, width: bound.physW, height: bound.physH, substituted: false };
         }
         const key = `${bound.width}x${bound.height}(${bound.physW}x${bound.physH})->${renderW}x${renderH}(${scratchW}x${scratchH})`;
@@ -1751,10 +1759,8 @@ export class D3D9Device {
      * That is invisible to the app: D3D9 depth formats are not lockable and we never read one
      * back. Any other extent belongs to a guest render target, which is always 1:1.
      *
-     * The scale therefore follows the DECLARED extent, not the pass. The residual: above
-     * Native, a back-buffer-sized depth surface bound while rendering into an equally-sized
-     * guest render target cannot be that pass's attachment, and resolveDepthAttachment
-     * substitutes a scratch depth — the pass keeps its Z, but not the surface's contents.
+     * The scale follows the declared extent so binding a smaller color target does not
+     * discard depth/stencil contents by reallocating its companion surface.
      */
     private depthSurfaceScale(width: number, height: number): number {
         const bb = this.backendExecutor.getGuestBackbufferSize();
@@ -1827,6 +1833,7 @@ export class D3D9Device {
     private activePixelShader: number = 0;
     /** Harness-only hybrid fragment output diagnostic: 0 normal, 1 tex0, 2 colour, 3 white. */
     private hybridDebugOutput = 0;
+    private shaderOutputOverride: { vs: number; ps: number; expression: string } | null = null;
     // c0-c223. Integer and boolean registers have separate fixed banks in the WGSL block.
     private psConstants = new Float32Array(PS_FLOAT_REGISTER_COUNT * 4);
     private psConstantBits = new Uint32Array(this.psConstants.buffer);
@@ -2262,7 +2269,7 @@ export class D3D9Device {
             entry.texture?.destroy();
             entry.texture = null;
             entry.view = null;
-            const resource = volumeTextureResources.get(entry.pointer);
+            const resource = entry.shadow ?? volumeTextureResources.get(entry.pointer);
             // DEFAULT volume contents are lost on reset; managed/system-memory volumes retain
             // their guest shadow and can be re-uploaded on first bind.
             entry.dirty = resource?.pool !== 0;
@@ -2675,8 +2682,7 @@ export class D3D9Device {
         pair.diagEpoch = this.shaderDiagnosticEpoch;
     }
 
-    /** Read-only harness seam for the shaderOps command. `complete:false` is intentional:
-     * unsupported/approximated lists currently come from emitted WGSL markers. */
+    /** The remote API front never links modules; only its render twin has a shader census. */
     shaderInstrumentationSnapshot(reset = false): Record<string, unknown> {
         if (reset) {
             for (const shader of this.shaderDiagnostics.values()) shader.drawsIssued = 0;
@@ -2706,6 +2712,7 @@ export class D3D9Device {
             build: pair.build,
             error: pair.error,
             pipelineId: pair.pipelineId,
+            pipelineState: pair.pipelineState ?? null,
             drawsIssued: pair.drawsIssued,
         }));
         // The numeric index the fast attribution path reads must name the RECORDS the
@@ -2723,8 +2730,8 @@ export class D3D9Device {
             shaderBuildFailures: this.shaderBuildFailures,
             gpuPipelineValidationFailures: this.gpuPipelineValidationFailures,
             census: {
-                complete: true,
-                source: "emitter-dispatch",
+                complete: !this.splitFramesRemote,
+                source: this.splitFramesRemote ? "api-front; use shaderOps for render-worker census" : "emitter-dispatch",
                 note: "opcode status is recorded by the emitters themselves (LinkResult.census); a shader with dispatched=0 was never linked, which is not the same as having no unsupported opcodes",
             },
             shaders,
@@ -2744,7 +2751,7 @@ export class D3D9Device {
     }
 
     /** Read-only harness seam for the generated module text, including a failed pipeline build. */
-    shaderInstrumentationWgsl(handle: number): Record<string, unknown> | null {
+    shaderInstrumentationWgsl(handle: number, includeProgram = false): Record<string, unknown> | null {
         const pair = this.shaderPairDiagnostics.get(handle);
         if (!pair) return null;
         return {
@@ -2757,6 +2764,11 @@ export class D3D9Device {
             vsVersion: pair.vsVersion,
             psVersion: pair.psVersion,
             pipelineId: pair.pipelineId,
+            pipelineState: pair.pipelineState ?? null,
+            ...(includeProgram ? {
+                vertexProgram: this.vsShaderRegistry.get(pair.vsHandle)?.prog ?? null,
+                pixelProgram: pair.psHandle === null ? null : this.psShaderRegistry.get(pair.psHandle)?.prog ?? null,
+            } : {}),
         };
     }
 
@@ -4642,22 +4654,51 @@ export class D3D9Device {
         return this.volumeByPointer.get(texturePtr >>> 0) ?? null;
     }
 
-    private volumeEntry(index: number): { pointer: number; texture: GPUTexture | null; view: GPUTextureView | null; dirty: boolean } | null {
+    private volumeEntry(index: number) {
         return this.volumeByIndex.get(index) ?? null;
     }
 
+    captureVolumeTextureDescriptor(texturePtr: number): VolumeTextureDescriptor | null {
+        const resource = volumeTextureResources.get(texturePtr >>> 0);
+        if (!resource) return null;
+        const { allocator: _allocator, levelData, ...descriptor } = resource;
+        return { ...descriptor, levelData: levelData.map(({ ptr: _ptr, locked: _locked, ...mip }) => mip) };
+    }
+
+    captureVolumeTextureLevelBytes(texturePtr: number, level: number, offset: number, bytes: number): Uint8Array | null {
+        const mip = volumeTextureResources.get(texturePtr >>> 0)?.levelData[level];
+        if (!mip || offset < 0 || bytes < 0 || offset + bytes > mip.bytes) return null;
+        const memory = this.memory;
+        if (!isValidAddress(memory, mip.ptr, mip.bytes, "r")) return null;
+        return memory.slice(mip.ptr + offset, mip.ptr + offset + bytes);
+    }
+
     /** Register the API-owned CPU volume resource in the common texture-stage namespace. */
-    registerVolumeTexture(texturePtr: number): boolean {
+    registerVolumeTexture(texturePtr: number, descriptor?: VolumeTextureDescriptor | null): boolean {
         const ptr = texturePtr >>> 0;
-        if (!volumeTextureResources.has(ptr)) return false;
+        if (!descriptor && !volumeTextureResources.has(ptr)) return false;
         if (this.volumeByPointer.has(ptr)) return true;
         const index = this.nextVolumeIndex--;
         this.volumeByPointer.set(ptr, index);
-        this.volumeByIndex.set(index, { pointer: ptr, texture: null, view: null, dirty: true });
+        const shadow = descriptor
+            ? { ...descriptor, data: descriptor.levelData.map(mip => new Uint8Array(mip.bytes)) }
+            : null;
+        this.volumeByIndex.set(index, { pointer: ptr, texture: null, view: null, dirty: true, shadow });
         // isVolumeIndex now answers differently for this index, which is what the bound-bank
         // memos are keyed on. The release path bumps for the same reason.
         this.arenaSamplerBankGeneration++;
         return true;
+    }
+
+    setVolumeTextureLevelBytes(texturePtr: number, level: number, offset: number, bytes: Uint8Array): void {
+        const index = this.volumeIndexForPointer(texturePtr);
+        const entry = index === null ? null : this.volumeEntry(index);
+        const data = entry?.shadow?.data[level];
+        if (!data || offset < 0 || offset + bytes.length > data.length) {
+            throw new RangeError("volume upload does not fit the registered mip level");
+        }
+        data.set(bytes, offset);
+        entry!.dirty = true;
     }
 
     releaseVolumeTexture(texturePtr: number): void {
@@ -4688,7 +4729,7 @@ export class D3D9Device {
     private ensureVolumeTexture(index: number): void {
         const entry = this.volumeEntry(index);
         if (!entry) return;
-        const resource = volumeTextureResources.get(entry.pointer);
+        const resource = entry.shadow ?? volumeTextureResources.get(entry.pointer);
         const device = this.backend.getDevice();
         const queue = this.backend.getQueue();
         if (!resource || !device || !queue) return;
@@ -4711,13 +4752,17 @@ export class D3D9Device {
             entry.dirty = entry.dirty || resource.pool !== 0;
         }
         if (!entry.dirty || !entry.texture) return;
-        const memory = this.memory;
+        // The render worker owns byte snapshots; it must never borrow the guest's RAM.
+        const memory = entry.shadow ? null : this.memory;
         for (let level = 0; level < resource.levels; level++) {
-            const mip = getVolumeLevel(entry.pointer, level);
-            if (!mip || mip.ptr + mip.bytes > memory.byteLength) continue;
+            const mip = resource.levelData[level];
+            if (!mip) continue;
+            const ptr = (mip as VolumeLevel).ptr;
+            if (memory && !isValidAddress(memory, ptr, mip.bytes, "r")) continue;
+            const data = entry.shadow ? entry.shadow.data[level]! : memory!.subarray(ptr, ptr + mip.bytes);
             const rgba = new Uint8Array(mip.width * mip.height * 4);
             for (let z = 0; z < mip.depth; z++) {
-                const source = memory.subarray(mip.ptr + z * mip.slicePitch, mip.ptr + z * mip.slicePitch + mip.slicePitch);
+                const source = data.subarray(z * mip.slicePitch, (z + 1) * mip.slicePitch);
                 decodeD3DTextureToRgba8(source, 0, mip.width, mip.height, resource.format, {
                     pitch: mip.pitch,
                     out: rgba,
@@ -6708,18 +6753,23 @@ export class D3D9Device {
      *  mean the same thing every frame. Draws on other targets are never cut, so the passes the
      *  scoped pass depends on still run. */
     private scrubTarget = 0;
+    private scrubExclude = false;
+    private scrubLastCut: { index: number; vertexShader: number; pixelShader: number } | null = null;
 
-    setDrawScrub(min: number, max: number, target = 0): void {
+    setDrawScrub(min: number, max: number, target = 0, exclude = false): void {
         this.scrubMin = min | 0;
         this.scrubMax = max | 0;
         this.scrubTarget = target >>> 0;
+        this.scrubExclude = exclude;
     }
 
-    getDrawScrub(): { min: number; max: number; target: string; lastFrameDraws: number } {
+    getDrawScrub() {
         return {
             min: this.scrubMin, max: this.scrubMax,
             target: "0x" + this.scrubTarget.toString(16),
             lastFrameDraws: this.scrubLastFrameDraws,
+            exclude: this.scrubExclude,
+            lastCut: this.scrubLastCut,
         };
     }
 
@@ -6801,7 +6851,11 @@ export class D3D9Device {
         // A scoped scrub counts and cuts ONLY its own attachment; every other pass runs whole.
         if (this.scrubTarget !== 0 && this.captureRtId() >>> 0 !== this.scrubTarget) return false;
         const i = this.scrubDrawIndex++;
-        return i < this.scrubMin || i > this.scrubMax;
+        const cut = this.scrubExclude
+            ? i >= this.scrubMin && i <= this.scrubMax
+            : i < this.scrubMin || i > this.scrubMax;
+        if (cut) this.scrubLastCut = { index: i, vertexShader: this.activeVertexShader, pixelShader: this.activePixelShader };
+        return cut;
     }
 
     /**
@@ -6825,9 +6879,18 @@ export class D3D9Device {
         const describe = (slot: number, kind: string): void => {
             const ti = this.stateTracker.getTexture(slot);
             if (ti === null) return;
+            const sampler = {
+                addressU: this.getSamplerState(slot, 1), addressV: this.getSamplerState(slot, 2),
+                addressW: this.getSamplerState(slot, 3), borderColor: this.getSamplerState(slot, 4) >>> 0,
+                magFilter: this.getSamplerState(slot, 5), minFilter: this.getSamplerState(slot, 6),
+                mipFilter: this.getSamplerState(slot, 7), mipLodBias: this.rsFloat(this.getSamplerState(slot, 8)),
+                maxMipLevel: this.getSamplerState(slot, 9), maxAnisotropy: this.getSamplerState(slot, 10),
+                srgbTexture: this.getSamplerState(slot, 11),
+            };
             if (this.isVolumeIndex(ti)) {
                 out.push({
                     slot, kind: `${kind}:volume`,
+                    ...sampler,
                     texture: `0x${(this.volumeEntry(ti)?.pointer ?? 0).toString(16)}`,
                     d3dFormat: null, width: null, height: null, levels: null, alphalessFormat: null,
                 });
@@ -6836,6 +6899,7 @@ export class D3D9Device {
             const fmt = this.textures.getFormat(ti);
             out.push({
                 slot, kind,
+                ...sampler,
                 texture: `0x${this.textures.getHandle(ti).toString(16)}`,
                 d3dFormat: fmt,
                 width: this.textures.getWidth(ti),
@@ -6989,12 +7053,26 @@ export class D3D9Device {
             rtSurfacePtr: this.captureRtId(),
             rtWidth: size.w,
             rtHeight: size.h,
+            rtFormat: this.activeColorTargetFormats()?.[0] ?? null,
             zEnable: rs(D3DRS_ZENABLE),
             zWrite: rs(D3DRS_ZWRITEENABLE),
             zFunc: rs(D3DRS_ZFUNC),
+            depthFormat: this.activeDepthTargetFormat(),
+            depthBias: this.rsFloat(rs(195)),
+            slopeScaleDepthBias: this.rsFloat(rs(175)),
+            stencil: {
+                enable: rs(52), fail: rs(53), zFail: rs(54), pass: rs(55), func: rs(56),
+                ref: rs(57), mask: rs(58), writeMask: rs(59), twoSided: rs(185),
+                ccwFail: rs(186), ccwZFail: rs(187), ccwPass: rs(188), ccwFunc: rs(189),
+            },
             alphaBlendEnabled: rs(D3DRS_ALPHABLENDENABLE),
             srcBlend: rs(D3DRS_SRCBLEND),
             dstBlend: rs(D3DRS_DESTBLEND),
+            blendOp: rs(D3DRS_BLENDOP),
+            separateAlphaBlendEnabled: rs(D3DRS_SEPARATEALPHABLENDENABLE),
+            srcBlendAlpha: rs(D3DRS_SRCBLENDALPHA),
+            dstBlendAlpha: rs(D3DRS_DESTBLENDALPHA),
+            blendOpAlpha: rs(D3DRS_BLENDOPALPHA),
             alphaTestEnabled: rs(D3DRS_ALPHATESTENABLE),
             alphaFunc: rs(D3DRS_ALPHAFUNC),
             alphaRef: rs(D3DRS_ALPHAREF),
@@ -7034,9 +7112,9 @@ export class D3D9Device {
             // stage we silently drop (lightmap, detail) — invisible in the picture as anything
             // but "the lighting looks wrong".
             warnings: [
-                ...(stage0 != null ? [`tex0 handle=0x${this.textures.getHandle(stage0).toString(16)}`] : []),
+                ...(stage0 != null ? [`tex0 handle=0x${(this.boundTexturePtrs[0]! >>> 0).toString(16)}`] : []),
                 ...(stage1 != null
-                    ? [`tex1 handle=0x${this.textures.getHandle(stage1).toString(16)}`]
+                    ? [`tex1 handle=0x${(this.boundTexturePtrs[1]! >>> 0).toString(16)}`]
                     : []),
                 `tss0 cop=${this.getTextureStageState(0, D3DTSS_COLOROP)} c1=${this.getTextureStageState(0, 2)} c2=${this.getTextureStageState(0, 3)} ` +
                     `aop=${this.getTextureStageState(0, 4)} a1=${this.getTextureStageState(0, 5)} a2=${this.getTextureStageState(0, 6)} tci=${this.getTextureStageState(0, D3DTSS_TEXCOORDINDEX)}`,
@@ -9108,8 +9186,10 @@ export class D3D9Device {
             // Close the render-boundary census frame on the same edge the serial advances, so a
             // per-frame row and its serial can never come from different boundaries.
             d3d9NoteRenderFrameBoundary(renderSvc.getGuestPresentSerial());
-            frameCapture.onFrameEnd("d3d9"); // harness CaptureBus frame boundary (D3D9)
         }
+        // A remote render worker owns its capture buffer and sees no guest-side Present.
+        // An in-process twin shares the front's buffer, so only the front closes it there.
+        if (guestSide || inRenderWorker()) frameCapture.onFrameEnd("d3d9");
 
         // Update frame snapshot for debug panel
         this.frameSnapshot.presents++;
@@ -9306,28 +9386,29 @@ export class D3D9Device {
     }
 
     /**
-     * Level-0 pixels of a D3D9 texture as RGBA8 — the diagnostic counterpart to the DDraw
+     * Authored mip pixels of a D3D9 texture as RGBA8 — the diagnostic counterpart to the DDraw
      * surface dump, which cannot see this store at all. Decoded through the SAME
-     * decodeD3DTextureToRgba8 the upload path uses, so what this returns is what the GPU
-     * copy holds (short of a later guest write we have not uploaded yet).
+     * decodeD3DTextureToRgba8 the upload path uses. GPU readback independently checks
+     * whether these bytes reached the sampled resource.
      *
      * A render target has no guest-side pixels — say so rather than return a blank image.
      */
-    readTextureRgba(handle: number): { rgba: Uint8Array; w: number; h: number; format: number } | { err: string } {
+    readTextureRgba(handle: number, level = 0): { rgba: Uint8Array; w: number; h: number; format: number } | { err: string } {
         const index = this.textures.getIndex(handle);
         if (index === null) return { err: `no d3d9 texture with handle 0x${(handle >>> 0).toString(16)}` };
+        if (!Number.isInteger(level) || level < 0 || level >= this.textures.getLevels(index)) {
+            return { err: `mip level ${level} is outside the texture` };
+        }
         if (this.textures.isRenderTarget(index)) {
             return { err: "render-target texture — rendered into, no guest pixels (capture the screen instead)" };
         }
-        const data = this.textures.getData(index);
-        if (!data) return { err: "texture has no backing store (never locked?)" };
-        const w = this.textures.getWidth(index), h = this.textures.getHeight(index);
+        if (level > 0 && !this.mipLevelData.has(`${handle}:${level}`)) return { err: "mip has no authored pixels" };
+        const pixels = this.getTextureLevelPixels(handle, level);
+        if (!pixels) return { err: "texture has no backing store (never locked?)" };
+        const w = pixels.width, h = pixels.height;
         const format = this.textures.getFormat(index);
         const rgba = new Uint8Array(w * h * 4);
-        // The shared decoder handles DXT/BC blocks as well as plain pixels. Keeping BC
-        // textures on the GPU-readback fallback is misleading: copyTextureToBuffer returns
-        // compressed blocks, while that fallback interprets them as RGBA rows.
-        decodeD3DTextureToRgba8(data, 0, w, h, format, { pitch: this.textures.getPitch(index), out: rgba });
+        decodeD3DTextureToRgba8(pixels.data, 0, w, h, format, { pitch: pixels.pitch, out: rgba });
         return { rgba, w, h, format };
     }
 
@@ -9624,22 +9705,30 @@ export class D3D9Device {
         return rows;
     }
 
-    async readRenderTargetRgba(handle: number): Promise<{ rgba: Uint8Array; w: number; h: number; format: number } | { err: string }> {
+    async readRenderTargetRgba(handle: number, level = 0): Promise<{ rgba: Uint8Array; w: number; h: number; format: number } | { err: string }> {
         const index = this.textures.getIndex(handle);
         if (index === null) return { err: `no d3d9 texture with handle 0x${(handle >>> 0).toString(16)}` };
         const gpuTex = this.textures.getGpuTexture(index);
         const device = this.backend.getDevice();
         const queue = this.backend.getQueue();
         if (!gpuTex || !device || !queue) return { err: "texture has no GPU copy yet" };
-        const w = this.textures.getWidth(index), h = this.textures.getHeight(index);
+        if (!Number.isInteger(level) || level < 0 || level >= gpuTex.mipLevelCount) {
+            return { err: `mip level ${level} is outside the GPU texture` };
+        }
+        const w = Math.max(1, this.textures.getWidth(index) >>> level);
+        const h = Math.max(1, this.textures.getHeight(index) >>> level);
         if (w <= 0 || h <= 0) return { err: `degenerate size ${w}x${h}` };
         // Flush recorded draws so the readback sees what this frame rendered into it.
         this.submitFrame(false);
+        device.pushErrorScope("validation");
         try {
             d3d9NoteFence("rtRgbaReadback");
-            const rgba = await readGpuTextureRgba(device, queue, gpuTex, w, h);
+            const rgba = await readGpuTextureRgba(device, queue, gpuTex, w, h, level);
+            const error = await device.popErrorScope();
+            if (error) return { err: `GPU readback was dropped: ${error.message}` };
             return { rgba, w, h, format: this.textures.getFormat(index) };
         } catch (e) {
+            await device.popErrorScope().catch(() => null);
             return { err: `render-target readback failed: ${e}` };
         }
     }
@@ -10806,13 +10895,22 @@ export class D3D9Device {
         const pair = this.beginShaderPair(vs, ps);
         try {
             const link = linkProgram({ vs, ps, declElements, streamStride: stride, streamStrides, alphaTest, cubeMask, volumeMask, vertexVolumeMask, comparisonSamplers, samplerStates, projectedStages, ffpStageCount: hybridStages || undefined, preTransformed, pointExpansion, pointSpriteEnable, clipPlanes });
+            const diagnostic = this.shaderOutputOverride;
+            if (diagnostic && diagnostic.vs === this.activeVertexShader && diagnostic.ps === this.activePixelShader) {
+                if (!/return (?:oC0|r0);/.test(link.wgsl)) {
+                    throw new Error("shaderOutputOverride requires a single color output without depth");
+                }
+                link.wgsl = link.wgsl.replace(/return (?:oC0|r0);/, `return ${diagnostic.expression};`);
+            }
             this.recordShaderCensus(pair, link);
             if (link.interpolantBudgetExceeded) {
                 throw new Error("D3D9 shader link exceeds WebGPU inter-stage interpolant budget");
             }
             const gpuDevice = this.backend.getDevice()!;
             const colorTargets = this.activeColorTargetStates();
-            if (!colorTargets) return -1;
+            if (!colorTargets) {
+                throw new Error(`unrepresentable color target state: blend=${computeBlendKey(this.getRS)} targets=${this.activeColorTargetKey()}`);
+            }
             const module = gpuDevice.createShaderModule({ code: link.wgsl });
             this.observeShaderCompilation(module, pair, `programmable:${pair.handle}`);
             // Cube-sampler stages need a cube-dimension bind-group layout; pick the variant that
@@ -10837,6 +10935,8 @@ export class D3D9Device {
                     attributes: link.vertexAttributes,
                 }], this.streams.freq);
             if (!validateWebGpuVertexBufferStrides(buffers, "programmable")) return -1;
+            const depthStencil = buildDepthStencilState(this.activeDepthTargetFormat(), this.getRS);
+            pair.pipelineState = { colorTargets, vertexBuffers: buffers, depthStencil };
             gpuDevice.pushErrorScope("validation");
             let pipeline: GPURenderPipeline;
             try {
@@ -10856,7 +10956,7 @@ export class D3D9Device {
                         count: this.activeRenderTargetSampleCount(),
                         mask: this.getRS(D3DRS_MULTISAMPLEMASK) >>> 0,
                     },
-                    depthStencil: buildDepthStencilState(this.activeDepthTargetFormat(), this.getRS),
+                    depthStencil,
                 });
             } catch (error) {
                 void gpuDevice.popErrorScope().catch(() => undefined);
@@ -10870,7 +10970,7 @@ export class D3D9Device {
             // intentionally opaque and cannot be cloned later by the executor.
             const hasInstanceRateStream = buffers.some(buffer => buffer?.stepMode === "instance");
             // An explicit false is the A/B kill switch and avoids companion shader compilation.
-            if (!preTransformed && !pointExpansion && !hasInstanceRateStream
+            if (!diagnostic && !preTransformed && !pointExpansion && !hasInstanceRateStream
                 && !shaderUsesIntegerBoolean(vs.prog)
                 && (globalThis as { __d3d9MegaBatch?: boolean }).__d3d9MegaBatch !== false) {
                 try {
@@ -12091,6 +12191,8 @@ export class D3D9Device {
              *  same extent are indistinguishable without it, and "which of the three 800x600
              *  targets did this write into" is the question a black frame asks. */
             rtIdentities?: Array<string | null>;
+            depthExtent?: { width: number; height: number };
+            colorSources?: Array<{ texture: GPUTexture; format: GPUTextureFormat; layer: number } | null>;
         } | null = null;
         let vpW = size.width, vpH = size.height;
         if (this.depthTextureIndex !== null) {
@@ -12168,13 +12270,23 @@ export class D3D9Device {
                     return;
                 }
             }
-            const depthAttachment = this.resolveDepthAttachment(vpW, vpH, rt0 === null ? this.backendExecutor.getBackbufferScale() : 1);
+            const depthAttachment = this.resolveDepthAttachment(vpW, vpH,
+                rt0 === null ? this.backendExecutor.getBackbufferScale() : 1, rt0 !== null && !multisample);
+            const needsColorPadding = rt0 !== null && !multisample && depthAttachment
+                && !depthAttachment.substituted
+                && (depthAttachment.width > vpW || depthAttachment.height > vpH);
             target = {
                 colorViews,
                 colorFormats: formats,
                 depthView: depthAttachment?.view
                     ?? (rt0 === null ? undefined : this.getRtDepthView(vpW, vpH, this.activeDepthTargetFormat())),
                 depthFormat: this.activeDepthTargetFormat(),
+                depthExtent: needsColorPadding
+                    ? { width: depthAttachment.width, height: depthAttachment.height } : undefined,
+                colorSources: needsColorPadding ? this.renderTargetIndices.slice(0, formats.length).map((rt, slot) => rt === null ? null : {
+                    texture: this.textures.getGpuTexture(rt)!, format: formats[slot]!,
+                    layer: Math.max(0, this.renderTargetFaces[slot] ?? 0),
+                }) : undefined,
                 stencilReference: this.getRS(D3DRS_STENCILREF) & 0xff,
                 backbuffer: rt0 === null,
                 multisample: multisample ?? undefined,
@@ -12481,7 +12593,7 @@ export class D3D9Device {
                 format: "rgba8unorm",
                 viewFormats: dxSrgbViewFormats("rgba8unorm"),
                 mipLevelCount: levelCount,
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
             });
             // Default view covers all mip levels → the sampler's mip filter has a chain to walk.
             this.textures.setGpuTexture(index, gpuTexture, gpuTexture.createView());
@@ -12581,7 +12693,7 @@ export class D3D9Device {
                 mipLevelCount: levelCount,
                 format: useBc ? getNativeBCTextureFormat(format)! : "rgba8unorm",
                 viewFormats: dxSrgbViewFormats(useBc ? getNativeBCTextureFormat(format)! : "rgba8unorm"),
-                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+                usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC,
             });
             const view = gpuTexture.createView();
             this.textures.setGpuTexture(index, gpuTexture, view);
@@ -12844,6 +12956,17 @@ export class D3D9Device {
         const key = toggle as keyof D3D9DebugFlags;
         if (this.debugFlags[key] === enabled) return true;
         this.debugFlags[key] = enabled;
+        this.invalidatePipelineCaches();
+        return true;
+    }
+
+    /** Inspect a shader's register values with its actual geometry, constants and textures. */
+    setShaderOutputOverride(vs: number, ps: number, expression: string | null): void {
+        this.shaderOutputOverride = expression ? { vs, ps, expression } : null;
+        this.invalidatePipelineCaches();
+    }
+
+    private invalidatePipelineCaches(): void {
         // Every pipeline in flight was built under the previous setting. The canonical arena
         // identity normally separates these states, but clear both caches and the last-resolve
         // memo at the toggle boundary so no stale in-flight alias survives.
@@ -12855,7 +12978,6 @@ export class D3D9Device {
         this.invalidateLastResolve();
         this.currentPipelineKey = null;
         this.currentPipelineId = null;
-        return true;
     }
 
     // ── State blocks ─────────────────────────────────────────────────────

@@ -106,7 +106,7 @@ describe("buildColorTargetState — separate alpha blend", () => {
         m[D3DRS_BLENDOPALPHA] = 5;                             // alpha: MAX
         const blend = buildColorTargetState(FMT, get(m)).blend!;
         expect(blend.color).toEqual({ srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" });
-        expect(blend.alpha).toEqual({ srcFactor: "one", dstFactor: "zero", operation: "max" });
+        expect(blend.alpha).toEqual({ srcFactor: "one", dstFactor: "one", operation: "max" });
     });
 });
 
@@ -129,12 +129,48 @@ describe("buildColorTargetState — dual-source and constant factors", () => {
 });
 
 describe("blend state validation", () => {
-    test("refuses an unknown factor instead of mapping it to ONE", () => {
+    test("unknown factors draw with ZERO, matching native HAL and REF", () => {
         const m = defaults();
         m[D3DRS_ALPHABLENDENABLE] = 1;
-        m[D3DRS_SRCBLEND] = 0xdead;
-        expect(isD3D9BlendStateRepresentable(get(m))).toBe(false);
-        expect(() => buildColorTargetState(FMT, get(m))).toThrow(/invalid factor or operation/);
+        for (const factor of [0, 0xdead, 0xffffffff]) {
+            m[D3DRS_SRCBLEND] = factor;
+            m[D3DRS_DESTBLEND] = factor;
+            expect(isD3D9BlendStateRepresentable(get(m))).toBe(true);
+            const target = buildColorTargetState(FMT, get(m));
+            expect(target.blend?.color).toEqual({ srcFactor: "zero", dstFactor: "zero", operation: "add" });
+            expect(target.blend?.alpha).toEqual(target.blend?.color);
+        }
+    });
+
+    test("the unknown-factor descriptors match independently captured native pixels and HRESULTs", () => {
+        const capture = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "d3d9-blend-native.json"), "utf8"));
+        const rows = capture.results.filter((row: any) => row.op === 1 && [0, 0xdead, 0xffffffff].includes(row.src));
+        expect(rows).toHaveLength(6);
+        expect(new Set(rows.map((row: any) => row.deviceType))).toEqual(new Set([1, 2]));
+        for (const row of rows) {
+            expect(row.setHr).toEqual([0, 0, 0]);
+            expect(row.readStates).toEqual([row.src, row.dst, row.op]);
+            expect(row.drawHr).toBe(0);
+            expect(row.rgb).toBe(0);
+            const m = defaults(); m[D3DRS_ALPHABLENDENABLE] = 1;
+            m[D3DRS_SRCBLEND] = row.src; m[D3DRS_DESTBLEND] = row.dst;
+            const blend = buildColorTargetState(FMT, get(m)).blend!;
+            expect(blend.color).toEqual({ srcFactor: "zero", dstFactor: "zero", operation: "add" });
+        }
+    });
+
+    test("MIN/MAX ignore factor states and satisfy WebGPU's ONE/ONE requirement", () => {
+        const m = defaults(); m[D3DRS_ALPHABLENDENABLE] = 1;
+        for (const [op, operation] of [[4, "min"], [5, "max"]] as const) {
+            m[D3DRS_BLENDOP] = op;
+            for (const [src, dst] of [[5, 6], [0, 0], [16, 17]]) {
+                m[D3DRS_SRCBLEND] = src!; m[D3DRS_DESTBLEND] = dst!;
+                expect(isD3D9BlendStateRepresentable(get(m))).toBe(true);
+                const target = buildColorTargetState(FMT, get(m));
+                expect(target.blend?.color).toEqual({ srcFactor: "one", dstFactor: "one", operation });
+                expect(target.blend?.alpha).toEqual(target.blend?.color);
+            }
+        }
     });
 
     test("refuses an unknown blend operation instead of mapping it to ADD", () => {

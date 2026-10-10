@@ -103,6 +103,10 @@ export function bindSharedParameters(poolPtr: number, model: EffectModel): numbe
                 continue; // shape disagreement: keep the private block rather than corrupt both
             }
         }
+        if (group.length) {
+            param.objectPtr = group[0]!.objectPtr;
+            param.objectIndex = group[0]!.objectIndex;
+        }
         group.push(param);
         groupOf.set(param, group);
         bound++;
@@ -113,10 +117,8 @@ export function bindSharedParameters(poolPtr: number, model: EffectModel): numbe
 /**
  * Drop `model`'s parameters out of the pool's groups when its effect dies.
  *
- * A pool outlives the effects that share through it — one pool for a whole run is the normal
- * shape — so a group that only ever grows pins every retired effect's model and makes
- * propagateSharedObject walk the dead. The pool's VALUE storage stays: it is the shared state
- * the surviving effects still alias.
+ * Surviving effects keep the shared value. The last member frees its reference and storage;
+ * a later effect with the same name starts from its own defaults.
  */
 export function unbindSharedParameters(poolPtr: number, model: EffectModel): void {
     const pool = pools.get(poolPtr >>> 0);
@@ -127,7 +129,12 @@ export function unbindSharedParameters(poolPtr: number, model: EffectModel): voi
         const at = group.indexOf(param);
         if (at >= 0) group.splice(at, 1);
         groupOf.delete(param);
-        if (!group.length) pool.groups.delete(param.name);
+        if (group.length) {
+            param.objectPtr = 0;
+        } else {
+            pool.groups.delete(param.name);
+            pool.values.delete(param.name);
+        }
     }
 }
 

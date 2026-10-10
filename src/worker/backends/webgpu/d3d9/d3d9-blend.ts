@@ -15,6 +15,7 @@ import { isGpuColorFormatBlendable } from "../shared/float-format-policy";
 import {
     mapBlendFactor, mapBlendOp, fixupBoth, isKnownBlendFactor, isKnownBlendOperation,
     hasDualSourceBlendFactor,
+    D3DBLEND_ZERO, D3DBLENDOP_MIN, D3DBLENDOP_MAX,
 } from "../shared/d3d-blend-factor";
 
 /** Reads a D3D9 render-state value (index → DWORD). */
@@ -83,13 +84,32 @@ export function isD3D9BlendStateRepresentable(getRS: GetRenderState): boolean {
         aOp = getRS(D3DRS_BLENDOPALPHA);
     }
 
-    return representableFactor(cSrc) && representableFactor(cDst)
-        && representableFactor(aSrc) && representableFactor(aDst)
-        && isKnownBlendOperation(cOp) && isKnownBlendOperation(aOp);
+    return representableComponent(cSrc, cDst, cOp) && representableComponent(aSrc, aDst, aOp);
 }
 
-function representableFactor(factor: number): boolean {
-    return isKnownBlendFactor(factor) && !hasDualSourceBlendFactor(factor);
+function extremaOperation(op: number): boolean {
+    return op === D3DBLENDOP_MIN || op === D3DBLENDOP_MAX;
+}
+
+function representableComponent(src: number, dst: number, op: number): boolean {
+    return isKnownBlendOperation(op)
+        && (extremaOperation(op) || (!hasDualSourceBlendFactor(src) && !hasDualSourceBlendFactor(dst)));
+}
+
+function blendComponent(src: number, dst: number, op: number): GPUBlendComponent {
+    if (!isKnownBlendOperation(op)) throw new Error("D3D9 blend state contains an invalid factor or operation");
+    // MIN/MAX ignore factors in D3D9; WebGPU requires ONE for both descriptor fields.
+    if (extremaOperation(op)) return { srcFactor: "one", dstFactor: "one", operation: mapBlendOp(op) };
+    if (hasUnsupportedBlendFactor(src) || hasUnsupportedBlendFactor(dst)) {
+        throw new Error("D3D9 dual-source blending is not representable by WebGPU");
+    }
+    // Native HAL and REF accept out-of-enum factors, retain them in GetRenderState, and
+    // draw with ZERO. Normalize only the descriptor so the guest-visible state stays raw.
+    return {
+        srcFactor: mapBlendFactor(isKnownBlendFactor(src) ? src : D3DBLEND_ZERO),
+        dstFactor: mapBlendFactor(isKnownBlendFactor(dst) ? dst : D3DBLEND_ZERO),
+        operation: mapBlendOp(op),
+    };
 }
 
 /**
@@ -119,24 +139,12 @@ export function buildColorTargetState(
         [aSrc, aDst] = fixupBoth(getRS(D3DRS_SRCBLENDALPHA), getRS(D3DRS_DESTBLENDALPHA));
         aOp = getRS(D3DRS_BLENDOPALPHA);
     }
-    // The factors/ops resolved above are exactly what isD3D9BlendStateRepresentable would
-    // re-derive; check them directly rather than walking the render states a second time.
-    if (hasUnsupportedBlendFactor(cSrc) || hasUnsupportedBlendFactor(cDst)
-        || hasUnsupportedBlendFactor(aSrc) || hasUnsupportedBlendFactor(aDst)) {
-        throw new Error("D3D9 dual-source blending is not representable by WebGPU");
-    }
-    if (!isKnownBlendFactor(cSrc) || !isKnownBlendFactor(cDst)
-        || !isKnownBlendFactor(aSrc) || !isKnownBlendFactor(aDst)
-        || !isKnownBlendOperation(cOp) || !isKnownBlendOperation(aOp)) {
-        throw new Error("D3D9 blend state contains an invalid factor or operation");
-    }
-
     return {
         format,
         writeMask,
         blend: {
-            color: { srcFactor: mapBlendFactor(cSrc), dstFactor: mapBlendFactor(cDst), operation: mapBlendOp(cOp) },
-            alpha: { srcFactor: mapBlendFactor(aSrc), dstFactor: mapBlendFactor(aDst), operation: mapBlendOp(aOp) },
+            color: blendComponent(cSrc, cDst, cOp),
+            alpha: blendComponent(aSrc, aDst, aOp),
         },
     };
 }

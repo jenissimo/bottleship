@@ -40,6 +40,20 @@ function fakeDeviceReading(mapped: Uint8Array, opts?: { failMapAsync?: boolean }
 }
 
 describe("readGpuTextureRgba", () => {
+    test("BC3 readback decodes transparency and skips padding between block rows", async () => {
+        const mapped = new Uint8Array(512);
+        // Black BC3 blocks: first row opaque (alpha selector 0), second transparent (1).
+        mapped[0] = 255;
+        mapped[256] = 255;
+        mapped.fill(0x49, 258, 264);
+        mapped[263] = 0x24;
+        const { device, queue } = fakeDeviceReading(mapped);
+        const rgba = await readGpuTextureRgba(device, queue,
+            { format: "bc3-rgba-unorm" } as GPUTexture, 4, 8);
+        expect(Array.from(rgba.subarray(0, 4))).toEqual([0, 0, 0, 255]);
+        expect(Array.from(rgba.subarray(4 * 4 * 4, 4 * 4 * 4 + 4))).toEqual([0, 0, 0, 0]);
+    });
+
     test("rgba8 format copies each row verbatim, dropping 256-byte alignment padding", async () => {
         const w = 3, h = 2;
         const padded = Math.ceil(w * 4 / 256) * 256; // 256 (well under one row's real width)

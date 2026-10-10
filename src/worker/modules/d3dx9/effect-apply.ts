@@ -18,6 +18,7 @@ import type { D3D9Device } from "../../backends/webgpu/d3d9/d3d9-device";
 import { Logger, LogCategory } from "../../core/logger";
 import { parseShaderConstantTable, RegisterSet, type CtabTable } from "./ctab";
 import { bindConstants, packParameter } from "./effect-constants";
+import { ShaderPreshader } from "./effect-shader-preshader";
 import { effectParamWasWritten } from "./effect-values";
 import {
     EffectStateClass,
@@ -59,6 +60,7 @@ const MATERIAL_FIELD_SIZE = [16, 16, 16, 16, 4];
 interface ShaderBinding {
     handle: number;
     table: CtabTable | null;
+    preshader?: ShaderPreshader;
     /** d3dx does not fail the effect when a shader will not create; it binds NULL. */
     failed: boolean;
     /** The constant→parameter join, resolved once. Both sides are fixed for the life of the
@@ -353,6 +355,8 @@ function shaderFor(
             binding.handle = created.handle;
             binding.failed = false;
             binding.table = parseShaderConstantTable(created.bytecode);
+            const pres = parsePreshader(data);
+            if (pres) binding.preshader = new ShaderPreshader(pres);
         }
     }
     if (binding.failed) {
@@ -585,7 +589,13 @@ export function applyPassStates(deps: EffectApplyDeps, inst: EffectInstance, pas
             const handle = binding && !binding.failed ? binding.handle : 0;
             if (vertex) device.setVertexShader(handle);
             else device.setPixelShader(handle);
-            if (binding && !binding.failed) uploadShaderConstants(deps, inst, binding, vertex);
+            if (binding && !binding.failed) {
+                uploadShaderConstants(deps, inst, binding, vertex);
+                if (binding.preshader && !binding.preshader.apply(device, inst.model.parameters, vertex)) {
+                    warnOnce(`shader-pres:${objectIndex}`, lastPreshaderError() ?? "shader preshader failed");
+                    result = D3DERR_INVALIDCALL;
+                }
+            }
             continue;
         }
 

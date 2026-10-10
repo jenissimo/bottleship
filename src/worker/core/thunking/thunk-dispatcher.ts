@@ -1548,9 +1548,16 @@ export class ThunkDispatcher {
     }
 
     private ensureWbufQueue(bytes: number): void {
+        // Resource uploads can accumulate without a Present; ship complete entries before
+        // growing the queue. One payload may exceed the batch limit and stays indivisible.
+        const appendBytes = bytes - this.wbufQueueEnd;
+        if (this.wbufQueueEnd > 0 && bytes > WBUF_DEFER_QUEUE_LIMIT) {
+            this.executeWbufQueue();
+            bytes = this.wbufQueueEnd + appendBytes;
+        }
         if (this.wbufQueueU8 && this.wbufQueueU8.length >= bytes) return;
         const size = Math.max(bytes, (this.wbufQueueU8?.length ?? 0) * 2, 1 << 20);
-        const buffer = new ArrayBuffer((size + 4095) & ~4095);
+        const buffer = new ArrayBuffer(Math.ceil(size / 4096) * 4096);
         const u8 = new Uint8Array(buffer);
         if (this.wbufQueueU8) u8.set(this.wbufQueueU8.subarray(0, this.wbufQueueEnd));
         this.wbufQueueU8 = u8;

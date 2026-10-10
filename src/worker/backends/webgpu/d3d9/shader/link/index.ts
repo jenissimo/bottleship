@@ -301,22 +301,44 @@ function patchVsSemanticOutputs(
     if (psSemanticKeys.size === 0) return vs.analysis;
 
     const outputBindings = new Map(vs.analysis.outputBindings);
-    const writesTexcoord = new Set(vs.analysis.writesTexcoord);
+    const unusedSemantics = new Map<string, PsInputBinding>();
+    let nextSlot = 0;
+    for (const binding of bySemantic.values()) {
+        if (binding.kind === "texcoord") nextSlot = Math.max(nextSlot, binding.index + 1);
+    }
     let changed = false;
     for (const dcl of vs.prog.declarations) {
         if (dcl.reg.type !== 6 /* OUTPUT */) continue;
-        if (!psSemanticKeys.has(`${dcl.usage}:${dcl.usageIndex}`)) continue;
-
-        const binding = bySemantic.get(`${dcl.usage}:${dcl.usageIndex}`)
-            ?? mapPsInputSemantic(dcl.usage, dcl.usageIndex);
+        const key = `${dcl.usage}:${dcl.usageIndex}`;
+        let binding = bySemantic.get(key);
+        if (!binding) {
+            const original = vs.analysis.outputBindings.get(dcl.reg.num);
+            if (original?.kind !== "texcoord") continue;
+            // Unconsumed outputs still execute; reserve separate slots so their writes
+            // cannot overwrite a semantic compacted into the same numeric index.
+            binding = unusedSemantics.get(key);
+            if (!binding) {
+                binding = { kind: "texcoord", index: nextSlot++, usage: dcl.usage };
+                unusedSemantics.set(key, binding);
+            }
+        }
         if (binding.kind !== "texcoord") continue;
         const previous = outputBindings.get(dcl.reg.num);
         if (previous?.kind === "texcoord" && previous.index === binding.index) continue;
         outputBindings.set(dcl.reg.num, { kind: "texcoord", index: binding.index });
-        writesTexcoord.add(binding.index);
         changed = true;
     }
     if (!changed) return vs.analysis;
+    const writtenRegisters = new Set<number>();
+    for (const instruction of vs.prog.instructions) {
+        if (instruction.dst?.reg.type === RegType.OUTPUT) writtenRegisters.add(instruction.dst.reg.num);
+    }
+    const writesTexcoord = new Set<number>();
+    for (const [reg, binding] of outputBindings) {
+        if (binding.kind === "texcoord" && (vs.analysis.usesRelativeOutput || writtenRegisters.has(reg))) {
+            writesTexcoord.add(binding.index);
+        }
+    }
     return { ...vs.analysis, outputBindings, writesTexcoord };
 }
 

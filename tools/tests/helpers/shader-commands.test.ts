@@ -12,13 +12,13 @@ class StubHarnessService {
 }
 
 describe("shader harness commands", () => {
-    test("d3d9Census exposes the refusal and approximation ledgers", () => {
+    test("d3d9Census exposes the refusal and approximation ledgers", async () => {
         const service = new StubHarnessService();
         registerShaderCommands(service as never);
         // `reset` reports the window it closes, so the first call hands back whatever earlier
         // tests in this process recorded; the empty ledgers are the SECOND call's.
-        service.handlers.get("d3d9Census")!([{ reset: true }], {});
-        const result = service.handlers.get("d3d9Census")!([{ reset: true }], {});
+        await service.handlers.get("d3d9Census")!([{ reset: true }], {});
+        const result = await service.handlers.get("d3d9Census")!([{ reset: true }], {});
         const census = result as {
             dropDraws: Record<string, number>;
             ffpUnimplemented: Record<string, number>;

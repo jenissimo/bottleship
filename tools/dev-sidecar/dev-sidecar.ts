@@ -642,7 +642,11 @@ const server = Bun.serve<SocketData>({
       if (server.upgrade(req, { data: { session: "", writes: 0, windowStart: Date.now() } })) return;
     }
     const url = new URL(req.url);
-    if (url.pathname === "/wgb") return serveWgb(req, url);
+    if (url.pathname === "/wgb") {
+      // A cold content hash or a large transfer can outlive Bun's idle timeout.
+      server.timeout(req, 0);
+      return serveWgb(req, url);
+    }
     if (url.pathname === "/tool/run") return runHostTool(req);
     if (url.pathname.endsWith("/stats")) {
       return new Response(JSON.stringify(archiveStats()), {

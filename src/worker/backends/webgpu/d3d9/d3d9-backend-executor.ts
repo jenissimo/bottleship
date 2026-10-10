@@ -39,6 +39,7 @@ import { validateD3D9RasterDrawCommand } from "./raster-emulation";
 import { d3dColorToGpu } from "./d3d9-blend";
 import { resolveInternalScaleFactor } from "../shared/internal-resolution";
 import { EmulatorConfig } from "../../../core/emulator-config-manager";
+import {DepthColorPadding, type PaddedColorSource} from './depth-color-padding';
 
 export interface PipelineInfo {
     pipeline: GPURenderPipeline;
@@ -667,6 +668,7 @@ export class D3D9BackendExecutor {
     private offscreenSrgbView: GPUTextureView | null = null;
     private depthTexture: GPUTexture | null = null;
     private depthView: GPUTextureView | null = null;
+    private depthColorPadding = new DepthColorPadding();
     /** Opt-in D3D9 backbuffer MSAA resources; null until an adapter probe accepts a count. */
     private d3d9MsaaCache: D3D9MultisampleTargetCache | null = null;
     private d3d9MsaaTarget: D3D9MultisampleTarget | null = null;
@@ -1056,6 +1058,7 @@ export class D3D9BackendExecutor {
         this.offscreenSrgbView = null;
         this.depthTexture = null;
         this.depthView = null;
+        this.depthColorPadding.destroy();
         this.d3d9MsaaCache = null;
         this.d3d9MsaaTarget = null;
         this.presentedTexture = null;
@@ -3193,6 +3196,8 @@ export class D3D9BackendExecutor {
             multisampleDepth?: { texture: GPUTexture; view: GPUTextureView };
             /** Use an sRGB view of the offscreen attachment for D3DRS_SRGBWRITEENABLE. */
             srgbWrite?: boolean;
+            depthExtent?: { width: number; height: number };
+            colorSources?: Array<PaddedColorSource|null>;
         } | null,
         /** DISCARD swap chains expose undefined backbuffer contents after Present. */
         discardBackbufferAfterPresent = false,
@@ -3551,8 +3556,13 @@ export class D3D9BackendExecutor {
             const offscreenColorView = target?.srgbWrite
                 ? (this.offscreenSrgbView ?? this.offscreenView)
                 : this.offscreenView;
+            const padded = target?.depthExtent && target.colorSources && !passMultisample ? target : null;
+            const passColorViews = padded
+                ? this.depthColorPadding.prepare(device, encoder, padded.colorSources!,
+                    padded.depthExtent!.width, padded.depthExtent!.height)
+                : target?.colorViews;
             const colorAttachments: Array<GPURenderPassColorAttachment | null> = target
-                ? target.colorViews.map((view, index) => (view ?? (index === 0 ? offscreenColorView : null)) ? ({
+                ? passColorViews!.map((view, index) => (view ?? (index === 0 ? offscreenColorView : null)) ? ({
                     view: (view ?? (index === 0 ? offscreenColorView : null))!,
                     clearValue: frame.clear.color,
                     loadOp: (frame.hasClear && clearTarget) ? "clear" : "load",
@@ -3567,6 +3577,13 @@ export class D3D9BackendExecutor {
 
             const depthFormat = passMultisample?.depthFormat ?? target?.depthFormat ?? "depth24plus-stencil8";
             const hasStencil = depthFormat === "depth24plus-stencil8" || depthFormat === "depth32float-stencil8";
+            if (padded && frame.hasClear && (frame.clear.flags & 6)) {
+                const color = padded.colorSources!.find(source => source !== null)!;
+                this.clearDepthStencilRect(padded.depthView!, depthFormat,
+                    padded.depthExtent!.width, padded.depthExtent!.height,
+                    {left:0,top:0,right:color.texture.width,bottom:color.texture.height},
+                    frame.clear.depth,frame.clear.stencil,frame.clear.flags & 6);
+            }
             // A WebGPU render pass may reference only one occlusion query set. Resolve
             // the set before opening the pass so beginOcclusionQuery is valid for the
             // manager-owned slots. If a frame spans multiple pools the manager returns
@@ -3585,11 +3602,11 @@ export class D3D9BackendExecutor {
             const depthStencilAttachment: GPURenderPassDepthStencilAttachment = target?.depthStencil ?? {
                 view: target?.depthView ?? this.depthView!,
                 depthClearValue: frame.clear.depth,
-                depthLoadOp: (frame.hasClear && clearZ) ? "clear" : "load",
+                depthLoadOp: (!padded && frame.hasClear && clearZ) ? "clear" : "load",
                 depthStoreOp: "store",
                 ...(hasStencil ? {
                     stencilClearValue: frame.clear.stencil,
-                    stencilLoadOp: (frame.hasClear && (frame.clear.flags & 4) !== 0) ? "clear" : "load",
+                    stencilLoadOp: (!padded && frame.hasClear && (frame.clear.flags & 4) !== 0) ? "clear" : "load",
                     stencilStoreOp: "store",
                 } : {}),
             };
@@ -3620,10 +3637,11 @@ export class D3D9BackendExecutor {
             // Guest-space → physical. Only the implicit backbuffer is supersampled; a
             // guest-created render target is its own guest-sized texture and stays 1:1.
             const passScale = (!target || target.backbuffer === true) ? this.getBackbufferScale() : 1;
-            // The render area every viewport/scissor in this pass must sit inside. Known only
-            // for the implicit backbuffer — an explicit render target is the guest's own
-            // texture and this encoder never learns its extent.
-            const passArea = (!target || target.colorViews[0] === null) ? this.offscreenSize : null;
+            // Padding must not expose pixels beyond the guest's logical color target.
+            const paddedColor = padded?.colorSources?.find(source => source !== null);
+            const passArea = (!target || target.colorViews[0] === null) ? this.offscreenSize
+                : paddedColor ? { width:paddedColor.texture.width,height:paddedColor.texture.height } : null;
+            if (paddedColor) renderPass.setScissorRect(0,0,passArea!.width,passArea!.height);
             if (viewport && typeof renderPass.setViewport === "function") {
                 this.setScaledViewport(renderPass, viewport.x, viewport.y, viewport.width,
                     viewport.height, viewport.minZ, viewport.maxZ, passScale, passArea);
@@ -4245,6 +4263,8 @@ export class D3D9BackendExecutor {
             }
 
             renderPass.end();
+            if (padded) this.depthColorPadding.restore(encoder,padded.colorSources!,
+                padded.depthExtent!.width,padded.depthExtent!.height);
             if (queryManager && querySubmissionSerial !== undefined && queryIds.length > 0) {
                 queryBatch = queryManager.encodeResolves(
                     encoder as unknown as QueryCommandEncoder,

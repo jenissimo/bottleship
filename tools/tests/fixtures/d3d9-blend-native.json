@@ -1,0 +1,298 @@
+{
+  "source": "tools/d3d9-ffp-oracle.rs --blend",
+  "capturedUtc": "2026-10-09T22:59:04.3016638Z",
+  "os": "Microsoft Windows NT 10.0.26300.0",
+  "surface": "X8R8G8B8 64x64",
+  "sourceArgb": "0x80cc8040",
+  "destinationArgb": "0xff336699",
+  "results": [
+    {
+      "deviceType": 1,
+      "src": 2,
+      "dst": 1,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        2,
+        1,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 13402176
+    },
+    {
+      "deviceType": 1,
+      "src": 1,
+      "dst": 1,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        1,
+        1,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 1,
+      "src": 0,
+      "dst": 0,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        0,
+        0,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 1,
+      "src": 57005,
+      "dst": 57005,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        57005,
+        57005,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 1,
+      "src": 4294967295,
+      "dst": 4294967295,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        4294967295,
+        4294967295,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 1,
+      "src": 2,
+      "dst": 1,
+      "op": 57005,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        2,
+        1,
+        57005
+      ],
+      "drawHr": 0,
+      "rgb": 13402265
+    },
+    {
+      "deviceType": 1,
+      "src": 5,
+      "dst": 6,
+      "op": 4,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        5,
+        6,
+        4
+      ],
+      "drawHr": 0,
+      "rgb": 3368512
+    },
+    {
+      "deviceType": 1,
+      "src": 0,
+      "dst": 0,
+      "op": 5,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        0,
+        0,
+        5
+      ],
+      "drawHr": 0,
+      "rgb": 13402265
+    },
+    {
+      "deviceType": 2,
+      "src": 2,
+      "dst": 1,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        2,
+        1,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 13402176
+    },
+    {
+      "deviceType": 2,
+      "src": 1,
+      "dst": 1,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        1,
+        1,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 2,
+      "src": 0,
+      "dst": 0,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        0,
+        0,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 2,
+      "src": 57005,
+      "dst": 57005,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        57005,
+        57005,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 2,
+      "src": 4294967295,
+      "dst": 4294967295,
+      "op": 1,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        4294967295,
+        4294967295,
+        1
+      ],
+      "drawHr": 0,
+      "rgb": 0
+    },
+    {
+      "deviceType": 2,
+      "src": 2,
+      "dst": 1,
+      "op": 57005,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        2,
+        1,
+        57005
+      ],
+      "drawHr": 0,
+      "rgb": 13402176
+    },
+    {
+      "deviceType": 2,
+      "src": 5,
+      "dst": 6,
+      "op": 4,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        5,
+        6,
+        4
+      ],
+      "drawHr": 0,
+      "rgb": 3368512
+    },
+    {
+      "deviceType": 2,
+      "src": 0,
+      "dst": 0,
+      "op": 5,
+      "setHr": [
+        0,
+        0,
+        0
+      ],
+      "readStates": [
+        0,
+        0,
+        5
+      ],
+      "drawHr": 0,
+      "rgb": 13402265
+    }
+  ]
+}

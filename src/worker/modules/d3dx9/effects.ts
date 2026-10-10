@@ -25,7 +25,8 @@ import { createVTablesFromDescriptor, VTableInfo } from '../../api/adapters/modu
 import { IUnknown } from '../../api/types';
 import { InterfaceDescriptor, ModuleDescriptor } from '../../api/types';
 import { createComObject, devices } from '../d3d9/shared-state';
-import { bindSharedParameters, unbindSharedParameters } from './effect-pool';
+import { bindSharedParameters } from './effect-pool';
+import { disposeEffectParameters, effectLostDevice } from './effect-lifetime';
 import { addComRef, registerComFinalizer, releaseComRef } from '../d3d9/com-refs';
 import { normalizeGuid, readGuidFromMem } from '../../core/com/typelib/typelib-types';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -995,6 +996,12 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
         return D3D_OK;
     };
 
+    exports['ID3DXEffect_OnLostDevice'] = (_ctx, _mem, args) => {
+        const inst = instanceOf(args[0]);
+        if (inst) effectLostDevice(inst);
+        return D3D_OK;
+    };
+
     exports['ID3DXEffect_GetPass'] = (_ctx, _mem, args) => {
         const inst = instanceOf(args[0]);
         if (!inst) return FAKE_HANDLE;
@@ -1224,10 +1231,9 @@ export function createEffectExports(process: Process): Record<string, ThunkImple
             });
             // The instance outlives nothing: it dies with the COM object the app released,
             // and its shared parameters leave the pool's groups with it.
-            const boundModel = model;
-            const boundPool = poolPtr >>> 0;
             registerComFinalizer(effectPtr, () => {
-                if (boundPool) unbindSharedParameters(boundPool, boundModel);
+                const inst = getEffectInstance(effectPtr);
+                if (inst) disposeEffectParameters(inst);
                 releaseEffectInstance(effectPtr);
             });
         }

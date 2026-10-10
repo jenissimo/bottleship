@@ -162,13 +162,47 @@ export function registerVc9AbiExports(exports: Record<string, ThunkImplementatio
     };
 
     exports["strncpy_s"] = (_ctx, _mem, args) => {
-        const dest = args[0] ?? 0;
-        const destSize = args[1] ?? 0;
-        const src = args[2] ?? 0;
-        const count = args[3] ?? 0;
-        if (!dest || destSize === 0) { invalidParam(); return 22; }
-        if (count >= destSize) { invalidParam(); return 22; }
-        return host.strncpy(dest, src, count);
+        const dest = (args[0] ?? 0) >>> 0;
+        const destSize = (args[1] ?? 0) >>> 0;
+        const src = (args[2] ?? 0) >>> 0;
+        const count = (args[3] ?? 0) >>> 0;
+        const fail = (code: number, clear: boolean) => {
+            if (clear) Mem.writeUint8(dest, 0);
+            host.setErrno(code);
+            invalidParam();
+            return code;
+        };
+        if (count === 0 && dest === 0 && destSize === 0) return 0;
+        if (!dest || destSize === 0) return fail(22, false);
+        if (count === 0) { Mem.writeUint8(dest, 0); return 0; }
+        if (!src) return fail(22, true);
+
+        const truncate = count === 0xffffffff;
+        const limit = Math.min(count, destSize - 1);
+        let length = 0;
+        while (length < limit) {
+            const byte = Mem.readUint8(src + length);
+            if (byte === null) return fail(22, true);
+            if (byte === 0) break;
+            length++;
+        }
+        let truncated = false;
+        if (length === limit && (truncate || count > limit)) {
+            const byte = Mem.readUint8(src + length);
+            if (byte === null) return fail(22, true);
+            if (byte !== 0) {
+                if (!truncate) return fail(34, true);
+                truncated = true;
+            }
+        }
+        // The secure form always terminates and never pads the unused tail like strncpy.
+        if (length > 0) {
+            const bytes = Mem.readBytes(src, length);
+            if (!bytes) return fail(22, true);
+            Mem.writeBytes(dest, bytes);
+        }
+        Mem.writeUint8(dest + length, 0);
+        return truncated ? 80 : 0;
     };
 
     exports["strncat_s"] = (_ctx, _mem, args) => {

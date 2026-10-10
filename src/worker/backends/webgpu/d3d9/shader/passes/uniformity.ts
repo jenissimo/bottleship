@@ -521,7 +521,7 @@ function walkInstructions(
                 instruction,
                 facts,
                 affine,
-                ancestors.divergent,
+                ancestors.nonUniform,
                 [...path, index],
                 sampleCounter.value++,
                 census,

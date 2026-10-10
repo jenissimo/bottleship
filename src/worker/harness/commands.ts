@@ -44,6 +44,7 @@ import { registerPaintTraceCommands } from "./cmds/paint-trace";
 import { registerAssertCommands } from "./cmds/assert";
 import { registerRecordCommands } from "./cmds/record";
 import { registerMemTrapCommands } from "./cmds/memtrap";
+import { registerMemoryCommands } from "./cmds/memory";
 import { registerPerfCommands } from "./cmds/perf";
 import { registerLfbUnpackCommands } from "./cmds/lfb-unpack";
 import { registerFadeProbeCommands } from "./cmds/fadeprobe";
@@ -101,6 +102,7 @@ export function installHarnessCommands(): void {
     registerAssertCommands(harnessService);
     registerRecordCommands(harnessService);
     registerMemTrapCommands(harnessService);
+    registerMemoryCommands(harnessService);
     registerPerfCommands(harnessService);
     registerLfbUnpackCommands(harnessService);
     registerFadeProbeCommands(harnessService);

@@ -93,6 +93,11 @@ export type CapturedDrawCall = {
     alphaBlendEnabled: number;
     srcBlend: number;
     dstBlend: number;
+    blendOp?: number;
+    separateAlphaBlendEnabled?: number;
+    srcBlendAlpha?: number;
+    dstBlendAlpha?: number;
+    blendOpAlpha?: number;
     alphaTestEnabled: number;
     alphaFunc: number;
     alphaRef: number;
@@ -101,6 +106,10 @@ export type CapturedDrawCall = {
     zWrite: number;
     /** The compare, without which zEnable says nothing about what gets rejected. */
     zFunc?: number;
+    stencil?: { enable: number; fail: number; zFail: number; pass: number; func: number; ref: number; mask: number; writeMask: number; twoSided: number; ccwFail: number; ccwZFail: number; ccwPass: number; ccwFunc: number };
+    depthBias?: number;
+    slopeScaleDepthBias?: number;
+    depthFormat?: string;
     cullMode: number;
     lightingEnabled: number;
     fogEnabled: number;
@@ -225,5 +234,6 @@ export type CapturedFrame = {
     /** The `firstVertices`/`indexedVertices` sample sizes armed for this capture
      *  (`captureFrame({maxVerts, maxIndexedVerts})`, defaults 4/6). Reported so a caller
      *  can tell an intentionally small sample from the option being silently ignored. */
-    captureConfig?: { maxVerts: number; maxIndexedVerts: number };
+    captureConfig?: { maxVerts: number; maxIndexedVerts: number; minDraws?: number; minRenderTargets?: number };
+    skippedFilteredFrameEnds?: number;
 };

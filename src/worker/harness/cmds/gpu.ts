@@ -94,6 +94,52 @@ function snapshot(): Record<string, unknown> {
 }
 
 export function registerGpuCommands(svc: HarnessService): void {
+    /** Evaluate scalar WGSL expressions with runtime inputs on the live adapter. */
+    svc.register("gpuMathProbe", async (args) => {
+        const inputs = args[0] as number[];
+        const expressions = args[1] as string[];
+        if (!Array.isArray(inputs) || !Array.isArray(expressions)
+            || inputs.length === 0 || inputs.length > 64 || expressions.length === 0
+            || expressions.length > 64 || inputs.some(v => typeof v !== "number")
+            || expressions.some(e => typeof e !== "string")) {
+            throw new HarnessError("expected 1..64 inputs and scalar WGSL expressions using input[n]", HarnessErrorCode.BAD_ARGS);
+        }
+        const device = backend().getDevice();
+        if (!device) throw new HarnessError("GPU device unavailable", HarnessErrorCode.UNSUPPORTED);
+        const input = device.createBuffer({ size: inputs.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        const output = device.createBuffer({ size: expressions.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readback = device.createBuffer({ size: expressions.length * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+        device.pushErrorScope("validation");
+        let scopeOpen = true;
+        try {
+            device.queue.writeBuffer(input, 0, new Float32Array(inputs));
+            const module = device.createShaderModule({ code:
+                "@group(0) @binding(0) var<storage, read> input: array<f32>;\n"
+                + "@group(0) @binding(1) var<storage, read_write> output: array<f32>;\n"
+                + "@compute @workgroup_size(1) fn main() {\n"
+                + expressions.map((e, i) => `output[${i}] = ${e};`).join("\n") + "\n}",
+            });
+            const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
+            const bind = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+                { binding: 0, resource: { buffer: input } }, { binding: 1, resource: { buffer: output } },
+            ] });
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline); pass.setBindGroup(0, bind); pass.dispatchWorkgroups(1); pass.end();
+            encoder.copyBufferToBuffer(output, 0, readback, 0, expressions.length * 4);
+            device.queue.submit([encoder.finish()]);
+            await readback.mapAsync(GPUMapMode.READ);
+            scopeOpen = false;
+            const error = await device.popErrorScope();
+            if (error) throw new HarnessError(error.message, HarnessErrorCode.INTERNAL);
+            const values = Array.from(new Float32Array(readback.getMappedRange()), v =>
+                Number.isFinite(v) ? v : Number.isNaN(v) ? "NaN" : v > 0 ? "+Inf" : "-Inf");
+            return { inputs, expressions, values };
+        } finally {
+            if (scopeOpen) await device.popErrorScope().catch(() => null);
+            input.destroy(); output.destroy(); readback.destroy();
+        }
+    });
     /**
      * gpuCensus({arm?, sites?, reset?}) — live GPUBuffer/GPUTexture/GPUQuerySet/ImageBitmap/
      * GPUDevice objects on this worker AND the split render worker (core/gpu/gpu-resource-census.ts).

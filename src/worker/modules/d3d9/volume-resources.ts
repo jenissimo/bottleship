@@ -46,6 +46,10 @@ export interface VolumeTextureResource {
     allocator: VolumeAllocator;
 }
 
+export type VolumeTextureDescriptor = Omit<VolumeTextureResource, 'allocator' | 'levelData'> & {
+    levelData: Omit<VolumeLevel, 'ptr' | 'locked'>[];
+};
+
 /** Stable texture metadata keyed by the guest COM pointer. */
 export const volumeTextureResources = new Map<number, VolumeTextureResource>();
 

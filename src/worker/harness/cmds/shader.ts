@@ -12,7 +12,7 @@ import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
 import { devices as d3d9Devices } from "../../modules/d3d9/shared-state";
 import { getD3D9PerfSnapshot, resetD3D9Perf } from "../../modules/d3d9/d3d9-perf";
-import { collectShaderCensus, censusComplete } from "../shader-census";
+import { collectShaderCensus, censusComplete, type ShaderCensusCollection } from "../shader-census";
 import type { WebGPUBackend } from "../../backends/webgpu/webgpu-backend";
 import {
     getD3D9FloatCapabilityContract,
@@ -118,8 +118,7 @@ async function checkWgsl(source: string): Promise<Record<string, unknown>> {
     }
 }
 
-function snapshotShaderOps(reset: boolean): Record<string, unknown> {
-    const collection = collectShaderCensus(reset);
+function snapshotShaderOps(collection: ShaderCensusCollection): Record<string, unknown> {
     const snapshots = collection.snapshots;
     const shaders: Array<Record<string, unknown>> = [];
     const pairs: Array<Record<string, unknown>> = [];
@@ -161,6 +160,27 @@ function snapshotShaderOps(reset: boolean): Record<string, unknown> {
     };
 }
 
+async function shaderDiagnostics(reset: boolean): Promise<{
+    shaders: Record<string, unknown>; perf: ReturnType<typeof getD3D9PerfSnapshot>; producer: string;
+}> {
+    const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+    const client = getD3D9RenderClient();
+    if (!client) return {
+        shaders: snapshotShaderOps(collectShaderCensus(reset)), perf: getD3D9PerfSnapshot(), producer: "inline",
+    };
+    // The API device never links shaders when rendering is split. Read the twins in stream
+    // order, otherwise zero build failures on the front can hide missing geometry.
+    const { d3d9SplitFlush } = await import("../../modules/d3d9/split");
+    d3d9SplitFlush();
+    const reply = await client.request("shaderCensus", { reset }) as {
+        collection?: ShaderCensusCollection; perf?: ReturnType<typeof getD3D9PerfSnapshot>; error?: string;
+    } | null;
+    if (!reply?.collection || !reply.perf) {
+        throw new HarnessError(reply?.error ?? "render worker shader census unavailable", HarnessErrorCode.UNSUPPORTED);
+    }
+    return { shaders: snapshotShaderOps(reply.collection), perf: reply.perf, producer: "render" };
+}
+
 export function registerShaderCommands(svc: HarnessService): void {
     /** wgslCheck({wgsl}) — compile with the live WebGPU device and return normalized diagnostics. */
     svc.register("wgslCheck", async (args) => {
@@ -173,20 +193,22 @@ export function registerShaderCommands(svc: HarnessService): void {
      *  CAVEAT: the device seam (d3d9-device.shaderInstrumentationSnapshot) zeroes drawsIssued
      *  BEFORE building its arrays, so `{reset:true}` reports 0 draws for the window it is
      *  summarizing. Ask without `reset` until that seam reads first. */
-    svc.register("shaderOps", (args) => {
+    svc.register("shaderOps", async (args) => {
         const opts = (args[0] ?? {}) as { reset?: boolean };
-        return snapshotShaderOps(!!opts.reset);
+        const { shaders, producer } = await shaderDiagnostics(!!opts.reset);
+        return { ...shaders, producer };
     });
 
     /** d3d9Census({reset?}) — one ledger for refusals, unsupported ops and approximations.
      *  `reset` zeroes AFTER reading: resetting first answers "what did this scene drop?" with
      *  zeros, which reads as a clean frame. */
-    svc.register("d3d9Census", (args) => {
+    svc.register("d3d9Census", async (args) => {
         const opts = (args[0] ?? {}) as { reset?: boolean };
-        const perf = getD3D9PerfSnapshot();
-        const shaders = snapshotShaderOps(!!opts.reset);
+        const frontPerf = getD3D9PerfSnapshot();
+        const { perf, shaders, producer } = await shaderDiagnostics(!!opts.reset);
         if (opts.reset) resetD3D9Perf();
         return {
+            producer,
             dropDraws: { ...perf.droppedDraws },
             ffpUnimplemented: { ...perf.ffpUnimplemented },
             // What the fixed-function pipelines this scene BUILT declare per sampler slot.
@@ -196,10 +218,11 @@ export function registerShaderCommands(svc: HarnessService): void {
             // anything. A stage that is never bound draws the same as one bound efficiently.
             textureBindOutcome: { ...perf.textureBindOutcome },
             approximated: { ...perf.approximated },
-            formatSupport: perf.formatSupport,
+            formatSupport: frontPerf.formatSupport,
+            renderFormatSupport: perf.formatSupport,
             // What a CONSTRUCTOR refused. A format that formatSupport does NOT list as refused
             // but that appears here is advertised-then-rejected — a NULL the guest cannot see.
-            creationRefusals: { ...perf.creationRefusals },
+            creationRefusals: { ...frontPerf.creationRefusals },
             // `probed:false` means EVERY float answer below is a default refusal, not a
             // measurement — the one state in which the numbers here mean nothing.
             floatCapabilities: floatCapabilityAnswers(),
@@ -242,7 +265,7 @@ export function registerShaderCommands(svc: HarnessService): void {
     });
 
     /** shaderWgsl({handle}) — retrieve one saved VS/PS module, even after a failed build. */
-    svc.register("shaderWgsl", (args) => {
+    svc.register("shaderWgsl", async (args) => {
         const value = args[0];
         const rawHandle = typeof value === "object" && value !== null
             ? (value as { handle?: unknown }).handle
@@ -251,12 +274,26 @@ export function registerShaderCommands(svc: HarnessService): void {
         if (!Number.isSafeInteger(handle) || handle <= 0) {
             throw new HarnessError("shaderWgsl requires a positive instrumentation handle", HarnessErrorCode.BAD_ARGS);
         }
+        const opts = (typeof value === "object" && value !== null ? value : {}) as {
+            includeProgram?: boolean; slot?: number;
+        };
+        const { getD3D9RenderClient } = await import("../../render/d3d9-render-client");
+        const client = getD3D9RenderClient();
+        if (client) {
+            const { d3d9SplitFlush } = await import("../../modules/d3d9/split");
+            d3d9SplitFlush();
+            const result = await client.request("shaderWgsl", { handle, ...opts });
+            if (result) return result;
+            throw new HarnessError(`render shader instrumentation handle ${handle} not found`, HarnessErrorCode.NOT_FOUND);
+        }
         for (const [device, instance] of d3d9Devices) {
             const instrumentation = instance as unknown as {
-                shaderInstrumentationWgsl?: (handle: number) => Record<string, unknown> | null;
+                shaderInstrumentationWgsl?: (handle: number, includeProgram?: boolean) => Record<string, unknown> | null;
             };
             if (typeof instrumentation.shaderInstrumentationWgsl !== "function") continue;
-            const result = instrumentation.shaderInstrumentationWgsl.call(instance, handle);
+            const includeProgram = typeof value === "object" && value !== null
+                && (value as { includeProgram?: boolean }).includeProgram === true;
+            const result = instrumentation.shaderInstrumentationWgsl.call(instance, handle, includeProgram);
             if (result) return { device: device >>> 0, ...result };
         }
         throw new HarnessError(`shader instrumentation handle ${handle} not found`, HarnessErrorCode.NOT_FOUND);

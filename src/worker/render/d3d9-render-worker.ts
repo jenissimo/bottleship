@@ -21,7 +21,7 @@ interface QueueMessage {
     type: "queue"; batch: number; bytes: ArrayBuffer; end: number; splitRecordId: number;
     methodBase: number; methodNames: string[]; handlers: Array<[number, string, number]> | null;
 }
-interface RequestMessage { type: "request"; id: number; kind: string; reset?: boolean; slot?: number; texPtr?: number; method?: string; arm?: boolean; sites?: boolean }
+interface RequestMessage { type: "request"; id: number; kind: string; reset?: boolean; slot?: number; texPtr?: number; level?: number; method?: string; arm?: boolean; sites?: boolean; timeoutMs?: number; maxVerts?: number; maxIndexedVerts?: number; minDraws?: number; minRenderTargets?: number; handle?: number; includeProgram?: boolean; min?: number; max?: number; target?: number; exclude?: boolean; vs?: number; ps?: number; expression?: string | null }
 interface FlagsMessage { type: "flags"; flags: Record<string, unknown> }
 /** The emulator worker's present target and quality: the internal scale is resolved from them. */
 interface TargetMessage { type: "target"; width: number; height: number; quality: unknown }
@@ -209,6 +209,24 @@ async function answer(msg: RequestMessage): Promise<void> {
     let value: unknown = null;
     try {
         switch (msg.kind) {
+            case "drawScrub": {
+                const devices = [];
+                for (const [slot, twin] of replayer?.twins ?? []) {
+                    if (msg.slot !== undefined && msg.slot !== slot) continue;
+                    if (msg.min !== undefined) twin.setDrawScrub(msg.min, msg.max ?? -1, msg.target ?? 0, msg.exclude === true);
+                    devices.push({ slot, ...twin.getDrawScrub() });
+                }
+                value = { producer: "render", devices };
+                break;
+            }
+            case "shaderOutputOverride": {
+                for (const [slot, twin] of replayer?.twins ?? []) {
+                    if (msg.slot !== undefined && msg.slot !== slot) continue;
+                    twin.setShaderOutputOverride(msg.vs ?? 0, msg.ps ?? 0, msg.expression ?? null);
+                }
+                value = { producer: "render", vs: msg.vs, ps: msg.ps, expression: msg.expression };
+                break;
+            }
             case "stats":
                 value = {
                     replay: replayer?.takeStats(msg.reset === true) ?? null,
@@ -224,6 +242,40 @@ async function answer(msg: RequestMessage): Promise<void> {
                 await replayer?.settled();
                 const twin = replayer?.twins.get(msg.slot ?? 0);
                 value = { data: twin?.copyTextureShadow(msg.texPtr ?? 0) ?? null, answer: replayer?.lastAsyncAnswer.get(msg.method ?? "") };
+                break;
+            }
+            case "textureRgba": {
+                value = null;
+                for (const [slot,twin] of replayer?.twins ?? []) {
+                    if (msg.slot !== undefined && slot !== msg.slot) continue;
+                    const result = await twin.readRenderTargetRgba(msg.texPtr ?? 0, msg.level ?? 0);
+                    if (result) value = result;
+                    if (result && !("err" in result)) break;
+                }
+                break;
+            }
+            case "targetState": {
+                value = [...(replayer?.twins ?? [])].map(([slot,twin]) => ({slot,state:twin.getRtDebug(),passes:twin.getPassDebug()}));
+                break;
+            }
+            case "shaderCensus": {
+                const { collectShaderCensus } = await import("../harness/shader-census");
+                value = {
+                    collection: collectShaderCensus(msg.reset === true, replayer?.twins ?? []),
+                    perf: perfSnapshot?.() ?? null,
+                };
+                if (msg.reset) {
+                    const { resetD3D9Perf } = await import("../modules/d3d9/d3d9-perf");
+                    resetD3D9Perf();
+                }
+                break;
+            }
+            case "shaderWgsl": {
+                for (const [slot, twin] of replayer?.twins ?? []) {
+                    if (msg.slot !== undefined && msg.slot !== slot) continue;
+                    const result = twin.shaderInstrumentationWgsl(msg.handle ?? 0, msg.includeProgram === true);
+                    if (result) { value = { device: slot, producer: "render", ...result }; break; }
+                }
                 break;
             }
             case "gpuCensus": {
@@ -247,6 +299,20 @@ async function answer(msg: RequestMessage): Promise<void> {
                 const blob = twin ? await twin.capturePresentedLayer() : null;
                 value = blob ? new Uint8Array(await blob.arrayBuffer()) : null;
                 break;
+            }
+            case "captureFrame": {
+                const capture = await import("../modules/ddraw/frame-capture");
+                if (capture.isCapturing()) throw new Error("a D3D9 frame capture is already armed");
+                const recording = capture.startCapture("d3d9", { maxVerts: msg.maxVerts, maxIndexedVerts: msg.maxIndexedVerts, minDraws: msg.minDraws, minRenderTargets: msg.minRenderTargets });
+                const timer = setTimeout(() => capture.cancelCapture(new Error("no D3D9 frame presented within capture timeout")), msg.timeoutMs ?? 5000);
+                // Arm in message order, then release the queue: the next complete frame is
+                // carried by FUTURE queue messages. Awaiting it here prevents those messages
+                // from replaying and makes every capture time out.
+                void recording.then(
+                    (frame) => post({ type: "reply", id: msg.id, value: frame }),
+                    (error) => post({ type: "reply", id: msg.id, value: { error: String(error) } }),
+                ).finally(() => clearTimeout(timer));
+                return;
             }
             default:
                 value = { error: `unknown request ${msg.kind}` };

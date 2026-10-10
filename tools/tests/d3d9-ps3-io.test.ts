@@ -197,6 +197,49 @@ describe("D3D9 PS3 I/O (W6)", () => {
         expect(new Set(interpLocations).size).toBe(interpLocations.length);
     });
 
+    test("a late unconsumed VS output cannot overwrite a compacted PS input", () => {
+        const vsTokens = new Uint32Array([
+            version(false, 3, 0),
+            ...dclReg(Usage.POSITION, 0, RegType.INPUT, 0),
+            ...dclReg(Usage.POSITION, 0, RegType.OUTPUT, 0),
+            ...dclReg(Usage.TEXCOORD, 0, RegType.OUTPUT, 1),
+            ...dclReg(Usage.TEXCOORD, 1, RegType.OUTPUT, 2),
+            ...dclReg(Usage.TEXCOORD, 2, RegType.OUTPUT, 3),
+            instr(Op.MOV, 2), dst(RegType.OUTPUT, 0), src(RegType.INPUT, 0),
+            instr(Op.MOV, 2), dst(RegType.OUTPUT, 1), src(RegType.CONST, 0),
+            instr(Op.MOV, 2), dst(RegType.OUTPUT, 3), src(RegType.CONST, 1),
+            instr(Op.MOV, 2), dst(RegType.OUTPUT, 2), src(RegType.CONST, 2),
+            END,
+        ]);
+        for (const order of [[0, 2], [2, 0]]) {
+            const psTokens = new Uint32Array([
+                version(true, 3, 0),
+                ...order.flatMap((semantic, reg) => dclReg(Usage.TEXCOORD, semantic, RegType.INPUT, reg)),
+                instr(Op.ADD, 3), dst(RegType.COLOROUT, 0), src(RegType.INPUT, 0), src(RegType.INPUT, 1),
+                END,
+            ]);
+            const result = linkProgram({
+                vs: compileVertexShader(vsTokens),
+                ps: compilePixelShader(psTokens),
+                declElements: positionDecl,
+                streamStride: 12,
+            });
+            // The three constant values must reach three distinct registers, even
+            // though the fragment stage consumes only TEXCOORD0 and TEXCOORD2.
+            for (const [constant, slot] of [[0, order.indexOf(0)], [1, order.indexOf(2)], [2, 2]]) {
+                const store = result.wgsl.match(new RegExp(
+                    `let _st\\d+ = vec4<f32>\\(vsc\\.c\\[${constant}\\]\\);\\s+([^\\n]+)`,
+                ));
+                expect(store?.[1]).toStartWith(`oT${slot} = `);
+            }
+            expect(fragmentBody(result.wgsl)).toContain("in.tex0");
+            expect(fragmentBody(result.wgsl)).toContain("in.tex1");
+            expect(fragmentBody(result.wgsl)).not.toContain("in.tex2");
+            expect(result.census.vs.unsupportedOps).toEqual([]);
+            expect(result.interpolantBudgetExceeded).toBe(false);
+        }
+    });
+
     test("moves programmable fog when TEXCOORD8 occupies the legacy fog location", () => {
         const psTokens = new Uint32Array([
             version(true, 2, 0),

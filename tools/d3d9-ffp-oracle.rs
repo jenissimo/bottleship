@@ -6,6 +6,7 @@
 // Build + run (needs rustc and the Windows SDK; no cargo project):
 //   LIB="C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64"
 //   rustc -O -o tmp/d3d9-ffp-oracle.exe -L "$LIB" tools/d3d9-ffp-oracle.rs && tmp/d3d9-ffp-oracle.exe
+//   tmp/d3d9-ffp-oracle.exe --blend   # HAL/REF blend factors and MIN/MAX, JSON lines
 //
 // bun:ffi cannot stand in for this: calling a COM vtable slot through CFunction segfaults on
 // Windows x64 (the interface pointer is truncated in the call), which is why this is Rust.
@@ -47,9 +48,14 @@ unsafe fn slot(iface: *mut c_void, idx: usize) -> *const c_void {
 }
 fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 
-fn main() { unsafe { run() } }
+fn main() { unsafe {
+    if std::env::args().any(|a| a == "--blend") {
+        run(1, true);
+        run(2, true);
+    } else { run(2, false); }
+} }
 
-unsafe fn run() {
+unsafe fn run(device_type: u32, blend: bool) {
     let d3d = Direct3DCreate9(32);
     if d3d.is_null() { println!("Direct3DCreate9 failed"); return; }
 
@@ -71,8 +77,10 @@ unsafe fn run() {
                                            *mut PresentParameters, *mut *mut c_void) -> HRESULT;
     let create: CreateDevice = std::mem::transmute(slot(d3d, 16));
     // D3DDEVTYPE_REF = 2, D3DCREATE_SOFTWARE_VERTEXPROCESSING = 0x20
-    let hr = create(d3d, 0, 2, hwnd, 0x20, &mut pp, &mut dev);
-    if hr < 0 || dev.is_null() { println!("CreateDevice(REF) failed 0x{:08x}", hr as u32); return; }
+    let hr = create(d3d, 0, device_type, hwnd, 0x20, &mut pp, &mut dev);
+    if hr < 0 || dev.is_null() { println!("CreateDevice({}) failed 0x{:08x}", device_type, hr as u32); return; }
+
+    if blend { blend_probe(dev, device_type); return; }
     println!("REF device created");
 
     type SetRS = extern "system" fn(*mut c_void, u32, u32) -> HRESULT;
@@ -146,5 +154,65 @@ unsafe fn run() {
         println!("=> REF RENDERS IT BLACK. Wine, DXVK and our FFP all agree; RA3 must reach this draw differently.");
     } else {
         println!("=> REF PASSES THE VERTEX COLOUR THROUGH. A normal-less vertex is NOT lit — OUR FFP IS WRONG.");
+    }
+}
+
+unsafe fn blend_probe(dev: *mut c_void, device_type: u32) {
+    type SetRS = extern "system" fn(*mut c_void, u32, u32) -> HRESULT;
+    type GetRS = extern "system" fn(*mut c_void, u32, *mut u32) -> HRESULT;
+    type SetTSS = extern "system" fn(*mut c_void, u32, u32, u32) -> HRESULT;
+    type SetFVF = extern "system" fn(*mut c_void, u32) -> HRESULT;
+    type Nullary = extern "system" fn(*mut c_void) -> HRESULT;
+    type Clear = extern "system" fn(*mut c_void, u32, *const c_void, u32, u32, f32, u32) -> HRESULT;
+    type Draw = extern "system" fn(*mut c_void, u32, u32, *const c_void, u32) -> HRESULT;
+    type GetBack = extern "system" fn(*mut c_void, u32, u32, u32, *mut *mut c_void) -> HRESULT;
+    type CreateOff = extern "system" fn(*mut c_void, u32, u32, u32, u32, *mut *mut c_void, *mut c_void) -> HRESULT;
+    type Copy = extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT;
+    type Lock = extern "system" fn(*mut c_void, *mut LockedRect, *const c_void, u32) -> HRESULT;
+    let rs: SetRS = std::mem::transmute(slot(dev, 57));
+    let get_rs: GetRS = std::mem::transmute(slot(dev, 58));
+    let tss: SetTSS = std::mem::transmute(slot(dev, 67));
+    let fvf: SetFVF = std::mem::transmute(slot(dev, 89));
+    let begin: Nullary = std::mem::transmute(slot(dev, 41));
+    let end: Nullary = std::mem::transmute(slot(dev, 42));
+    let clear: Clear = std::mem::transmute(slot(dev, 43));
+    let draw: Draw = std::mem::transmute(slot(dev, 83));
+    let back_fn: GetBack = std::mem::transmute(slot(dev, 18));
+    let off_fn: CreateOff = std::mem::transmute(slot(dev, 36));
+    let copy: Copy = std::mem::transmute(slot(dev, 32));
+    let mut back = null_mut();
+    let mut off = null_mut();
+    assert!(back_fn(dev, 0, 0, 0, &mut back) >= 0);
+    assert!(off_fn(dev, 64, 64, 22, 2, &mut off, null_mut()) >= 0);
+    let lock: Lock = std::mem::transmute(slot(off, 13));
+    let unlock: Nullary = std::mem::transmute(slot(off, 14));
+    fvf(dev, 0x004 | 0x040);
+    rs(dev, 137, 0); rs(dev, 22, 1); rs(dev, 7, 0); rs(dev, 27, 1);
+    rs(dev, 206, 0);
+    tss(dev, 0, 1, 2); tss(dev, 0, 2, 0);
+    tss(dev, 0, 4, 2); tss(dev, 0, 5, 0); tss(dev, 1, 1, 1);
+    #[repr(C)] struct V { x: f32, y: f32, z: f32, w: f32, c: u32 }
+    let verts = [
+        V { x: 0., y: 0., z: 0.5, w: 1., c: 0x80cc8040 },
+        V { x: 0., y: 64., z: 0.5, w: 1., c: 0x80cc8040 },
+        V { x: 64., y: 0., z: 0.5, w: 1., c: 0x80cc8040 },
+        V { x: 64., y: 64., z: 0.5, w: 1., c: 0x80cc8040 },
+    ];
+    for (src, dst, op) in [(2, 1, 1), (1, 1, 1), (0, 0, 1), (0xdead, 0xdead, 1), (u32::MAX, u32::MAX, 1), (2, 1, 0xdead), (5, 6, 4), (0, 0, 5)] {
+        let a = rs(dev, 19, src); let b = rs(dev, 20, dst); let c = rs(dev, 171, op);
+        let mut read_src = 0; let mut read_dst = 0; let mut read_op = 0;
+        get_rs(dev, 19, &mut read_src); get_rs(dev, 20, &mut read_dst); get_rs(dev, 171, &mut read_op);
+        assert!(clear(dev, 0, null_mut(), 1, 0xff336699, 1., 0) >= 0);
+        assert!(begin(dev) >= 0);
+        let drawn = draw(dev, 5, 2, verts.as_ptr().cast(), std::mem::size_of::<V>() as u32);
+        assert!(end(dev) >= 0);
+        let copied = copy(dev, back, off);
+        assert!(copied >= 0);
+        let mut lr = LockedRect { Pitch: 0, pBits: null_mut() };
+        assert!(lock(off, &mut lr, std::ptr::null(), 0) >= 0);
+        let px = *(lr.pBits as *const u8).add(32 * lr.Pitch as usize + 32 * 4).cast::<u32>();
+        assert!(unlock(off) >= 0);
+        println!("{{\"deviceType\":{},\"src\":{},\"dst\":{},\"op\":{},\"setHr\":[{},{},{}],\"readStates\":[{},{},{}],\"drawHr\":{},\"rgb\":{}}}",
+            device_type, src, dst, op, a, b, c, read_src, read_dst, read_op, drawn, px & 0xffffff);
     }
 }
