@@ -83,6 +83,12 @@ try {
 
     // The load starts with the switch out of the menu's display mode.
     await waitFor("the loading screen", 30_000, async () => (await screen()).width !== MENU_WIDTH);
+    // SetDisplayMode changes worker state before the new frame reaches the host. A shot
+    // taken on the mode change alone can still show vehicle select and falsely pass.
+    const modeSwitch = await screen();
+    await waitFor("a frame presented in the loading mode", 30_000,
+        async () => (await screen()).presentSerial > modeSwitch.presentSerial);
+    await harness().sleep(300).run();
     const loading = await litFraction("loading");
     const during = await screen();
     await harness().sleep(1000).run();
