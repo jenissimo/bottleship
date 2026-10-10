@@ -45,6 +45,8 @@ import {
     D3DTFP_LINEAR,
     D3DTOP_MULTIPLYADD,
     D3DTOP_LERP,
+    D3DTOP_BLENDTEXTUREALPHA,
+    D3DTOP_BLENDTEXTUREALPHAPM,
 } from "../../../modules/ddraw/constants";
 // Not re-exported by the barrel above — imported straight from the leaf constants module
 // (see CLAUDE.md file-ownership notes: modules/ddraw/constants.ts itself is out of scope).
@@ -249,22 +251,10 @@ export class FfpStagesState {
                 alphaArg0 = currentToDiffuse(alphaArg0);
             }
 
-            // Captured BEFORE the missing-texture remap: distinguishes a true arithmetic
-            // stage (args never reference TEXTURE, e.g. CURRENT×TFACTOR fade) from a
-            // textured stage degraded by a missing texture.
-            // ARG0 counts only when the op READS it — MULTIPLYADD and LERP are the only
-            // two that do. Every other op ignores ARG0, and the state persists across
-            // draws, so a stale ARG0=TEXTURE from an earlier LERP would otherwise make a
-            // pure-arithmetic stage look textured and drop it (and everything above it)
-            // out of the cascade.
-            const readsArg0 = (op: number): boolean => op === D3DTOP_MULTIPLYADD || op === D3DTOP_LERP;
+            // Color and alpha have independent operands; unused arguments persist across draws.
             const wantsTexture =
-                (colorArg1 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
-                (colorArg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
-                (alphaArg1 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
-                (alphaArg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
-                (readsArg0(colorOp) && (colorArg0 & D3DTA_SELECTMASK) === D3DTA_TEXTURE) ||
-                (readsArg0(alphaOp) && (alphaArg0 & D3DTA_SELECTMASK) === D3DTA_TEXTURE);
+                operationUsesTexture(colorOp, colorArg0, colorArg1, colorArg2) ||
+                operationUsesTexture(alphaOp, alphaArg0, alphaArg1, alphaArg2);
 
             if (!hasRealTexture) {
                 // TEXTURE args with no texture bound resolve to DIFFUSE.
@@ -295,18 +285,9 @@ export class FfpStagesState {
             let enabled: boolean;
             const sampleable = s < MAX_FFP_SAMPLED_STAGES;
             if (s === 0) {
-                // Stage 0 always runs. Sampling matches the legacy useTexture rules:
-                // DISABLE and SELECTARG2(non-texture) never sample; otherwise sample when
-                // UVs exist, a view is bindable (real, or the 1×1 dummy fallback so the
-                // pipeline layout stays satisfiable), and args still reference TEXTURE
-                // after the missing-texture remap (i.e. a real texture is present).
-                const argsRequireTexture = wantsTexture && hasRealTexture;
-                if (!active || (colorOp === D3DTOP_SELECTARG2 &&
-                    (colorArg2 & D3DTA_SELECTMASK) !== D3DTA_TEXTURE)) {
-                    samples = false;
-                } else {
-                    samples = hasTexCoords && (hasRealTexture || hasDummyTexture) && argsRequireTexture;
-                }
+                // Selecting vertex color can still require a texture for alpha.
+                samples = active && hasTexCoords && (hasRealTexture || hasDummyTexture) &&
+                    hasRealTexture && wantsTexture;
                 enabled = true;
                 if (hasTexCoords && !hasRealTexture && active && wantsTexture) {
                     missingMask |= 1 << s;
@@ -411,6 +392,21 @@ export class FfpStagesState {
             p[s * 4 + 2] = this.tci[s] >>> 0;
             p[s * 4 + 3] = this.texXformFlags[s] >>> 0;
         }
+    }
+}
+
+function operationUsesTexture(op: number, arg0: number, arg1: number, arg2: number): boolean {
+    switch (op) {
+        case D3DTOP_DISABLE: return false;
+        case D3DTOP_SELECTARG1: return (arg1 & D3DTA_SELECTMASK) === D3DTA_TEXTURE;
+        case D3DTOP_SELECTARG2: return (arg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE;
+        case D3DTOP_BLENDTEXTUREALPHA:
+        case D3DTOP_BLENDTEXTUREALPHAPM: return true;
+        default:
+            return (arg1 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
+                (arg2 & D3DTA_SELECTMASK) === D3DTA_TEXTURE ||
+                ((op === D3DTOP_MULTIPLYADD || op === D3DTOP_LERP) &&
+                    (arg0 & D3DTA_SELECTMASK) === D3DTA_TEXTURE);
     }
 }
 

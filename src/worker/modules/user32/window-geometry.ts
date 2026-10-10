@@ -135,6 +135,7 @@ export function adjustWindowRectCore(
     const WS_CAPTION = 0x00C00000;
     const WS_THICKFRAME = 0x00040000;
     const WS_BORDER = 0x00800000;
+    const WS_DLGFRAME = 0x00400000;
 
     const WS_EX_DLGMODALFRAME = 0x00000001;
     const WS_EX_WINDOWEDGE = 0x00000100;
@@ -152,8 +153,14 @@ export function adjustWindowRectCore(
     // deltas are zero and this is AdjustWindowRectEx exactly.
     const at = (index: number): number =>
         (systemMetricForDpi(index, dpi) ?? 0) - (systemMetricForDpi(index, USER_DEFAULT_SCREEN_DPI) ?? 0);
-    const borderWidth = (dwStyle & WS_THICKFRAME) ? 4 + at(SM_CXFRAME_INDEX) : ((dwStyle & WS_BORDER) ? 1 : 0);
-    const captionHeight = (dwStyle & WS_CAPTION) ? 23 + at(SM_CYCAPTION_INDEX) : 0;
+    // WS_CAPTION is WS_BORDER | WS_DLGFRAME: a title bar needs BOTH bits. One alone is a
+    // plain border or a dialog frame, which frames the top edge like the other three.
+    const hasCaption = (dwStyle & WS_CAPTION) === WS_CAPTION;
+    const borderWidth = (dwStyle & WS_THICKFRAME) ? 4 + at(SM_CXFRAME_INDEX)
+        : hasCaption ? 1
+        : (dwStyle & WS_DLGFRAME) ? 3
+        : (dwStyle & WS_BORDER) ? 1 : 0;
+    const captionHeight = hasCaption ? 23 + at(SM_CYCAPTION_INDEX) : borderWidth;
     const menuHeight = bMenu ? 19 + at(SM_CYMENU_INDEX) : 0;
     const exBorder =
         ((dwExStyle & WS_EX_CLIENTEDGE) ? 2 : 0) +
@@ -183,6 +190,7 @@ export function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMen
     const WS_CAPTION_STYLE = 0x00C00000;
     const WS_THICKFRAME_STYLE = 0x00040000;
     const WS_BORDER_STYLE = 0x00800000;
+    const WS_DLGFRAME_STYLE = 0x00400000;
 
     const WS_EX_DLGMODALFRAME = 0x00000001;
     const WS_EX_WINDOWEDGE = 0x00000100;
@@ -194,8 +202,12 @@ export function getWindowFrameMetrics(dwStyle: number, dwExStyle: number, hasMen
         return { padTop: 0, padSide: 0, padBottom: 0, borderX: 0, borderY: 0 };
     }
 
-    const borderWidth = (dwStyle & WS_THICKFRAME_STYLE) ? 4 : ((dwStyle & WS_BORDER_STYLE) ? 1 : 0);
-    const captionHeight = (dwStyle & WS_CAPTION_STYLE) ? 23 : 0;
+    const hasCaption = (dwStyle & WS_CAPTION_STYLE) === WS_CAPTION_STYLE;
+    const borderWidth = (dwStyle & WS_THICKFRAME_STYLE) ? 4
+        : hasCaption ? 1
+        : (dwStyle & WS_DLGFRAME_STYLE) ? 3
+        : (dwStyle & WS_BORDER_STYLE) ? 1 : 0;
+    const captionHeight = hasCaption ? 23 : borderWidth;
     const menuHeight = hasMenu ? 19 : 0;
     const exBorder =
         ((dwExStyle & WS_EX_CLIENTEDGE) ? 2 : 0) +

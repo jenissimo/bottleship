@@ -124,6 +124,8 @@ export class MemoryManager {
     private static readonly SYS_POOL_ARENA_SIZE = 0x100000; // 1MB, grown on demand
     private sysPoolArena: { next: number; limit: number } | null = null;
     private sysPoolFree: Map<number, number[]> = new Map();
+    /** Address-keyed COM pools must expire when this allocator rewinds in place. */
+    systemPoolGeneration = 0;
 
     allocSystemBlock(size: number): number {
         const aligned = this.alignUp(size, 16);
@@ -720,6 +722,7 @@ export class MemoryManager {
         this.largeFreeBlocks.clear();
         this.sysPoolArena = null;
         this.sysPoolFree.clear();
+        this.systemPoolGeneration++;
         this.totalAllocated = 0;
         this.currentBytes = 0;
         this.peakBytes = 0;

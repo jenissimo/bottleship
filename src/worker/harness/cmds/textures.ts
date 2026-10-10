@@ -314,7 +314,10 @@ export function registerTextureCommands(svc: HarnessService): void {
     const dump = async (args: unknown[]) => {
         const ptr = resolvePtr(args[0]);
         if (!ptr) throw new HarnessError("surface pointer is 0 (no such surface / not initialized)", HarnessErrorCode.NOT_FOUND);
-        const opts = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch"; level?: number };
+        const opts = (args[1] ?? {}) as { save?: string; from?: "auto" | "gpu" | "scratch" | "guest"; level?: number };
+        if (opts.from && !["auto", "gpu", "scratch", "guest"].includes(opts.from)) {
+            throw new HarnessError(`unknown surface representation ${opts.from}`, HarnessErrorCode.BAD_ARGS);
+        }
         const emit = async (rgba: Uint8Array, w: number, h: number, source: string) => {
             const name = (opts.save ?? `surf_${ptr.toString(16)}_${w}x${h}`).replace(/\.png$/i, "");
             const base64 = await encodePngBase64(rgba, w, h);
@@ -349,12 +352,12 @@ export function registerTextureCommands(svc: HarnessService): void {
         if (dd?.readSurfaceRGBA) {
             const r = await dd.readSurfaceRGBA(ptr, opts.from ?? "auto");
             if (!("err" in r)) return emit(r.rgba, r.w, r.h, r.source);
-            const d9 = await dumpD3d9(ptr, opts.from, opts.level);
+            const d9 = await dumpD3d9(ptr, opts.from === "guest" ? "auto" : opts.from, opts.level);
             if (!d9) throw new HarnessError(`readSurfaceRGBA: ${r.err} (and no d3d9 texture with that handle)`, HarnessErrorCode.INTERNAL);
             if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
             return emit(d9.rgba, d9.w, d9.h, `${d9Source}(fmt ${d9.format})`);
         }
-        const d9 = await dumpD3d9(ptr, opts.from, opts.level);
+        const d9 = await dumpD3d9(ptr, opts.from === "guest" ? "auto" : opts.from, opts.level);
         if (!d9) throw new HarnessError("no DDraw surface and no D3D9 texture with that handle", HarnessErrorCode.NOT_FOUND);
         if ("err" in d9) throw new HarnessError(`d3d9 texture 0x${ptr.toString(16)}: ${d9.err}`, HarnessErrorCode.UNSUPPORTED);
         return emit(d9.rgba, d9.w, d9.h, `${d9Source}(fmt ${d9.format})`);

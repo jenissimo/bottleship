@@ -5,7 +5,7 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-10-05**. Working statuses include maintainer reports; every title has not
+Updated **2026-10-08** for **BottleShip 0.7**. Working statuses include maintainer reports; every title has not
 been retested for this release. Observed demo stages are listed separately below. Successful
 GOG extraction does not establish gameplay coverage for that installer edition.
 
@@ -88,7 +88,8 @@ System Shock 2 coverage is for the original 1999 game, including previously purc
 copies; it does not cover the 2025 remaster. Unreal Gold's former GOG edition is delisted.
 Quake II coverage is for the classic Win32 executable, rather than the Enhanced executable.
 The original Bard's Tale and Worms World Party demos are older editions than the working
-remasters and need their own compatibility checks.
+remasters. The original Bard's Tale demo has now been checked independently (see below);
+Worms World Party's original demo reaches its startup splash; match entry remains unverified.
 
 ## Demo coverage
 
@@ -98,18 +99,45 @@ full playability.
 | Demo | Observed stage | Public catalog |
 |---|---|:---:|
 | Quake II 3.14 (classic Win32) | Entered a playable level, movement and rendered HUD; OpenGL | ✓ |
-| American McGee's Alice | Main menu, OpenGL | ✓ |
+| American McGee's Alice | Main menu, OpenGL; bundled 1280 × 1024, 32-bit color/textures and high texture detail | ✓ |
 | XIII UK demo | Rendered menu, D3D8 | ✓ |
 | Hitman: Codename 47 revision 2 | Mission briefing, Direct3D; original OpenGL setup fails pixel-format selection | ✓ |
-| Serious Sam: The First Encounter | Russian single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
-| Worms Armageddon | Main menu, DirectDraw | ✓ |
+| Serious Sam: The First Encounter | English single-player menu, OpenGL; dismiss the normal first-run information dialog | ✓ |
+| Worms Armageddon | Clean startup splashes, working single-player menu and quick match against the CPU; DirectDraw | ✓ |
 | System Shock 2 (original demo) | Main menu, DirectDraw | ✓ |
-| Harry Potter: Chamber of Secrets | Start menu and real renderer-probe child exit; entering gameplay remains unverified | |
-| NFS Underground 2 | Rendered startup notice; did not reach the menu | |
-| Gothic USA demo | SmartHeap / debug CRT dialog; did not reach the menu | |
-| Thief Gold demo | Crashed at boot (`0x7c07`); do not infer support from the working full edition | |
+| Half-Life: Uplink demo | Fresh-container launch reaches a rendered level and HUD; movement verified. Direct3D at 1024 × 768, 16-bit color; OpenGL exits during level load in the observed run | ✓ |
+| Half-Life: Day One demo | Fresh-container launch reaches the rendered Black Mesa tram introduction; OpenGL at 1024 × 768 | ✓ |
+| Red Faction Worldwide Demo | Entered gameplay with rendered weapon, HUD and mission messages | ✓ |
+| Star Wars Episode I: Racer demo | Entered the Boonta Training Course race; acceleration and steering verified. Maintainer confirms correct rendering | ✓ |
+| Discworld Noir demo | English interactive demo with native installation settings. Office movement, map transition, saving/loading across reload, F1 restart and extended idle-menu stability verified. Automatic attract-mode playback is disabled in the demo menu resource; original executable unchanged. WGB preloads into OPFS; direct HTTP startup fails an early CRT file read | ✓ |
+| Far Cry Demo 2 (Research) | Research level playable with the WGB's AMD adapter profile; terrain, water and distance fog verified. Prepared WGB includes the engine's shader cache to shorten first level load | ✓ |
+| Tomb Raider II: Great Wall demo | Fresh-container launch enters the level; movement and turning verified. WGB includes the native 640 × 480, 16-bit Direct3D settings. Opening the unconfigured first-run setup still crashes (`0x3003`) | ✓ |
+| The Blackwell Legacy demo | Original English AGS demo: title menu, bridge introduction and Rosa’s apartment. Native saving and restoring verified; save persists across page reload | ✓ |
+| KKND2: Krossfire demo | Original 1998 demo: army selection, mission briefing, rendered Survivors mission, unit movement and native saving/loading across page reload verified; DirectDraw | ✓ |
+| The Bard's Tale original PC demo (2005) | Tutorial, summoning and the Mountain Tomb level verified; right mouse button movement and companion following. This is the original demo, separate from the working remaster | ✓ |
+| Deponia demo 1.1 | English tutorial and Rufus's first room; clean OpenGL rendering and mouse input. Native saving/loading, including the save thumbnail, verified after page reload. WGB creates the engine's required temporary directory | ✓ |
+| Blade of Darkness demo | Original demo v0.6: native Direct3D/audio settings included; character selection and Sargon's prison level render with readable text and HUD. Keyboard movement, turning and mouse attack verified. Saving and full mission completion remain unverified; Miles sample reverb is not implemented | ✓ |
+| Harry Potter and the Chamber of Secrets demo | Original English PC demo: launcher starts the real game process; entered the level, moved and collected beans. Selected English dialogue and localization files are installed in the WGB | ✓ |
+| NFS Underground 2 demo | Original English PC demo: Free Roam and the City Hall Circuit race with three AI opponents verified; rendered city, traffic and HUD, acceleration, braking, reverse and steering. Production HTTP launch and race tested; cold startup/level loading can take several minutes. Persistence remains unverified | ✓ |
+| Gothic USA demo 1.08h | English demo: Diego dialogue exit, rendered subtitles/HUD, movement and native saving verified. WGB recreates the required save directories; slots and thumbnails survive page reload. Restoring a saved game can stall in a resource-thread wait; further stability testing is pending | ✓ |
+| Cossacks: European Wars demo | Original Wise demo: rendered menu and playable random map; primary scanout and palette animation verified. Native Slow mode with a 50 ms interval gives 20 simulation steps/s | ✓ |
+| Thief Gold demo | Original demo: menu, Thieves Guild mission, movement and mouse look verified. Bundle includes the installer-generated install.cfg pointing at its root-level resource archives; without it the guest dereferences a missing interface image | ✓ |
+| [Mafia original demo](https://archive.org/details/Mafia_201405) | Rendered mission with a car, city and HUD. WGB includes the native Setup registry value for 1024 × 768, 32-bit fullscreen startup; fresh launch bypasses Setup | ✓ |
+| [Carmageddon II demo](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | Rendered Controls screen; race entry remains unverified | ✓ |
+| [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | Rendered main menu; level entry remains unverified | ✓ |
+| [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | Rendered demo splash; match entry remains unverified | ✓ |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
+
+These four original installers use the project's own readers: Mafia's RAR4 LZ payload
+(27 files, CRC verified), Carmageddon II's ZIP → InstallShield 3 `data.z` payload
+(1,605 files, decoded sizes checked), Painkiller's VISE payload (55 files, CRC verified),
+and Worms World Party's RAR4 → InstallShield cabinet set (625 files, outer CRC and inner
+size/MD5 verified). The captured Mafia settings and repack command are recorded in
+[`demo-presets/README.md`](demo-presets/README.md).
+
+Time-limited shareware trials are excluded from the demo catalog, including Alice Greenfingers,
+Montezuma, Natalie Brooks, Farm Frenzy and House of 1000 Doors.
 
 ## Stretch / in progress
 

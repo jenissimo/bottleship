@@ -177,6 +177,11 @@ export function registerStateCommands(svc: HarnessService): void {
         return buildHarnessReport(esp);
     });
 
+    svc.register("asyncParkReport", () => {
+        const dispatcher = sys().process?.dispatcher;
+        if (!dispatcher) throw new HarnessError("dispatcher unavailable", HarnessErrorCode.NO_PROCESS);
+        return dispatcher.getAsyncParkReport();
+    });
     /**
      * asyncParked() — diagnose a thread stuck in WAITING/ASYNC_THUNK. report()
      * shows the scheduler state but NOT which async thunk parked the thread or whether its

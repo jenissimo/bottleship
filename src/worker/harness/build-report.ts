@@ -23,6 +23,7 @@ import { d3dxConstantTableCensus } from "../modules/d3dx9/constant-table";
 import { collectShaderCensus, censusComplete } from "./shader-census";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { activeQualityBackend, computeQualityGaps } from "../backends/webgpu/shared/quality-capabilities";
+import type { CallbackForensicState } from "../core/thunking/callback-manager";
 
 const hx = (v: number) => "0x" + (v >>> 0).toString(16);
 
@@ -261,6 +262,7 @@ export interface HarnessReport {
     /** Parked-stack write-guard violations (newest last) — plant-time tripwire for the
      *  0x7c07 corruption class; each line carries the JS stack at write time. */
     stackGuardViolations: string[];
+    callbacks: CallbackForensicState | null;
     /** Recent SEH catch dispatches (newest last) with descent windows + WILD-EBP notes. */
     sehDispatchTrace: string[];
     /** The crash that ended the run, INCLUDING one raised before any guest code ran
@@ -308,6 +310,7 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         getLastWinApiTrace?: (n: number) => string[];
         getLastWinApiCallsRich?: (n: number) => Array<{ name: string; esp: number; retAddrBefore: number }>;
         getLastHypercalls?: (n: number) => string[];
+        callbackManager?: { getForensicState(): CallbackForensicState };
     } | undefined;
     const bt = d?.getGuestCallStack?.(esp);
     const cpuSnap = serializeCpu() as SerializedCpuSnapshot | null;
@@ -440,6 +443,7 @@ export function buildHarnessReport(esp?: number): HarnessReport {
         eipModule: moduleAtEip(eipVal),
         slab: hypercallDataManager.getSlabStats(),
         stackGuardViolations: getStackGuardViolations(),
+        callbacks: d?.callbackManager?.getForensicState() ?? null,
         sehDispatchTrace: getSehDispatchTrace(),
         crash: (() => {
             const f = loadDiagnostics.lastFailure();

@@ -268,10 +268,10 @@ export function synthesizeManifest(opts: SynthOptions): SynthResult {
 
     const name = cli.name ?? gogInfo.name ?? opts.parsed.header.appName ?? "GOG Game";
     const gameArgs = cli.args ?? gogInfo.args;
-    const width = cli.width ?? 640;
-    const height = cli.height ?? 480;
-    const bpp = cli.bpp ?? 16;
-    const ramMB = cli.ramMB ?? 64;
+    const width = cli.width ?? 1024;
+    const height = cli.height ?? 768;
+    const bpp = cli.bpp ?? 32;
+    const ramMB = cli.ramMB ?? 128;
     const regInstall = cli.regInstall ?? "C:\\";
     const regHive = cli.regHive ?? "HKLM";
     const regPath = cli.regPath;

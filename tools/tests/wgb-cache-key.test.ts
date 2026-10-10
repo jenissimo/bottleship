@@ -57,6 +57,16 @@ describe("urlToCacheKey", () => {
         expect(urlToCacheKey(url)).toBe(urlToCacheKey(url));
     });
 
+    test("a trailing-slash disk route distinguishes bundles by its query", () => {
+        for (const route of ["/__wgb/", "http://localhost:5184/__wgb/"]) {
+            const a = urlToCacheKey(`${route}?path=G%3A%2FWGB%2Ffirst.wgb`);
+            const b = urlToCacheKey(`${route}?path=G%3A%2FWGB%2Fsecond.wgb`);
+            expect(a).not.toBe(b);
+            expect(a).not.toBe("game.wgb");
+            expect(a).toMatch(/^[^/\\]+\.wgb$/);
+        }
+    });
+
     test("a URL with no usable segment still yields a key", () => {
         expect(urlToCacheKey("")).toBe("game.wgb");
     });

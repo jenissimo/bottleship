@@ -23,6 +23,21 @@ describe("USER32 API descriptors", () => {
         expect(arity("ToAsciiEx")).toBe(6);
         expect(arity("IsCharLowerA")).toBe(1);
         expect(arity("IsMenu")).toBe(1);
+        expect(arity("CharPrevA")).toBe(2);
+    });
+});
+
+describe("CharPrevA", () => {
+    test("steps one byte back and stops at the start of the string", () => {
+        const start = 0x3000;
+        expect(callSystem("CharPrevA", [start, start + 5])).toBe(start + 4);
+        expect(callSystem("CharPrevA", [start, start + 1])).toBe(start);
+        expect(callSystem("CharPrevA", [start, start])).toBe(start);
+    });
+
+    test("compares the pointers unsigned", () => {
+        const start = 0x80001000;
+        expect(callSystem("CharPrevA", [start | 0, (start + 3) | 0])).toBe(start + 2);
     });
 });
 

@@ -14,6 +14,8 @@
  *   <output.wgb>    Destination .wgb file path.
  *
  * Options:
+ *   --order <profile>    Store files in first-access order from a harness .wgb.profile
+ *   --content-addressed  Write a copy named <name>.<sha256>.wgb for immutable hosting
  *   --name <str>          Display name  (default: basename of game-dir)
  *   --game-id <str>       Stable container/save key, namespaced "<scheme>:<id>"
  *                         (gog:<productId> | steam:<appid> | app:<reverse-dns> | byo:<hex>).
@@ -45,6 +47,8 @@
  *                         GTA III reads HKLM\SOFTWARE\Rockstar Games\GTA 3\InstallDir.
  *   --cd-path <str>       Guest path the CD-ROM drive (D:\) aliases to, for a title that
  *                         still checks for its disc. Usually "C:\" (the install root).
+ *   --cd-label <str>      Volume label of that disc, as GetVolumeInformation reports it for
+ *                         D:\ — what a title that checks its disc by label compares against.
  *   --app-dir-dlls <list> Comma/semicolon-separated DLL names whose copy IN THE GAME
  *                         DIRECTORY must win over our HLE module, as Windows' search
  *                         order does (app dir before System32). Required for a game that
@@ -83,6 +87,7 @@
 
 import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
 import { join, basename, extname, resolve } from 'path';
+import { orderFilesByProfile, parseIoProfile } from "@bottleship/formats/wgb/io-profile";
 import { ZipStoreWriter } from './internal/zip-store-writer';
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from '@bottleship/formats/wgb/container-id';
 import { parseRegFile, mergeRegSeeds, type RegSeed } from '@bottleship/formats/reg';
@@ -242,6 +247,8 @@ const createDirs = [...new Set([...explicitCreateDirs, ...emptyDirs])].sort();
 // hunts for a DRIVE_CDROM whose AUDIO\HEAD.WAV opens — so a bundle packed from an install
 // must say which guest path stands in for the disc, usually the install root itself.
 const cdPath = get('--cd-path');
+// The disc's volume label — what a retail title compares GetVolumeInformation against.
+const cdLabel = get('--cd-label');
 
 // DLLs whose game-directory copy must beat our HLE module (Windows' own search order).
 // Wrapper/proxy DLLs a game ships — ASI loaders, Glide/ddraw shims — never execute without it.
@@ -307,6 +314,7 @@ const manifest: Record<string, unknown> = {
         ...(createDirs.length > 0 ? { createDirs } : {}),
         ...(appDirDlls.length > 0 ? { appDirDlls } : {}),
         ...(cdPath ? { cdPath } : {}),
+        ...(cdLabel ? { cdLabel } : {}),
         ...(touch ? { touch } : {}),
     },
 };
@@ -415,8 +423,18 @@ if (regPath) {
 const writer = new ZipStoreWriter(output);
 writer.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
 writer.addBuffer('registry.json', Buffer.from(JSON.stringify(registry, null, 2), 'utf8'));
-for (const [zipName, path] of romFiles) writer.addFile(zipName, path);
+const orderProfile = get('--order');
+const orderedFiles = orderProfile ? orderFilesByProfile(romFiles, parseIoProfile(JSON.parse(readFileSync(orderProfile, 'utf8')))) : [...romFiles];
+for (const [zipName, path] of orderedFiles) writer.addFile(zipName, path);
 const { bytes, entries: entryCount } = writer.finish();
+
+if (has('--content-addressed')) {
+    const hasher = new Bun.CryptoHasher("sha256");
+    for await (const chunk of Bun.file(output).stream()) hasher.update(chunk);
+    const addressed = output.replace(/\.wgb$/i, '') + `.${hasher.digest("hex")}.wgb`;
+    await Bun.write(addressed, Bun.file(output));
+    console.log(`Immutable bundle: ${addressed}`);
+}
 
 console.log(`Created ${output} (${entryCount} files, ${(bytes / 1024 / 1024).toFixed(1)} MB)`);
 console.log(`  name:       ${name}`);

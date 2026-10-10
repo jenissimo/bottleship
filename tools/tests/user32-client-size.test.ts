@@ -12,6 +12,7 @@ const WS_OVERLAPPEDWINDOW =
     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
 const WS_POPUP = 0x80000000;
 const WS_BORDER = 0x00800000;
+const WS_DLGFRAME = 0x00400000;
 const WS_EX_CLIENTEDGE = 0x00000200;
 
 const RECT_PTR = 0x100;
@@ -54,6 +55,9 @@ describe('window client size', () => {
             { style: WS_OVERLAPPEDWINDOW, exStyle: 0, hasMenu: true, w: 640, h: 480 },
             { style: WS_OVERLAPPEDWINDOW, exStyle: WS_EX_CLIENTEDGE, hasMenu: false, w: 1024, h: 768 },
             { style: WS_CAPTION | WS_BORDER, exStyle: 0, hasMenu: false, w: 320, h: 240 },
+            { style: WS_BORDER, exStyle: 0, hasMenu: false, w: 320, h: 240 },
+            { style: WS_DLGFRAME, exStyle: 0, hasMenu: false, w: 320, h: 240 },
+            { style: WS_THICKFRAME, exStyle: 0, hasMenu: false, w: 320, h: 240 },
             { style: WS_POPUP, exStyle: 0, hasMenu: false, w: 1280, h: 1024 },
         ];
         for (const c of cases) {
@@ -73,6 +77,16 @@ describe('window client size', () => {
         // nothing and converts nothing — two no-ops agree perfectly.
         const popup = adjust(api, WS_POPUP, 0, false, 800, 600);
         expect(popup).toEqual({ width: 800, height: 600 });
+    });
+
+    // WS_CAPTION is two bits. Testing it as a mask gives a bordered window a title bar's
+    // worth of frame, and a caller that sizes a window around its content (MCIWnd around a
+    // movie) ends up 22 pixels too tall.
+    test('a border or a dialog frame alone is not a caption', () => {
+        expect(adjust(api, WS_BORDER, 0, false, 320, 240)).toEqual({ width: 322, height: 242 });
+        expect(adjust(api, WS_DLGFRAME, 0, false, 320, 240)).toEqual({ width: 326, height: 246 });
+        expect(adjust(api, WS_THICKFRAME, 0, false, 320, 240)).toEqual({ width: 328, height: 248 });
+        expect(adjust(api, WS_CAPTION, 0, false, 320, 240).height).toBeGreaterThan(246);
     });
 
     test('a child window keeps its size: no frame to subtract', () => {

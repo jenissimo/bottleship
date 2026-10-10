@@ -1,8 +1,66 @@
 # Changelog
 
+## 0.7 — 2026-10-08
+
+This release covers changes merged into `main` since October 5, 2026. Compatibility
+grows from 15 to 53 games, with an optimized Direct3D 9 renderer, easier GOG imports,
+mobile controls, loading and frame-rate improvements, and experimental AOT code caching.
+The public demo catalog now contains 42 entries.
+
+Read the [0.7 release notes](docs/releases/0.7.md) for highlights, AOT usage and the next
+version's goals. The dated entries below retain the detailed change history.
+
+## 2026-10-08
+
+- Seeded the original Alice demo with native 1280 × 1024, 32-bit color and textures, maximum texture detail, detail textures and trilinear filtering.
+- Added the original Blade of Darkness demo with native Direct3D and audio settings. Sargon's prison level, movement, turning and mouse attack are verified.
+- Fixed fixed-function texture sampling when alpha uses a texture independently of vertex color, including selected operands and implicit texture-alpha blends. Declared the Video for Windows MCI window creation ABI and separated query-addressed bundles in trailing-slash cache routes.
+- Published the original Mafia, Painkiller Demo 2, Carmageddon II and Worms World Party demos with original cover artwork. Mafia includes its native Setup registry settings for 1024 × 768, 32-bit fullscreen startup; no first-run Setup is required.
+- Demo compatibility records distinguish Mafia's rendered mission from the menu or splash stages verified for the other three editions.
+
+## 2026-10-07
+
+- Added the original Thief Gold demo with the installer's native resource-path configuration. Thieves' Guild loads, with keyboard movement and mouse look verified.
+- The demo catalog opens with a curated selection followed by genre groups. The sort menu now orders games by title, genre or year and restores the featured selection.
+- Harness screenshots can save the composited screen mirror directly; `BS_URL_MATCH` selects a library page for UI checks through the same CDP connection.
+- Added the original Cossacks: European Wars demo to the public catalog. Primary DirectDraw scanout observes directly mapped indexed pixels and palette changes; queued presentation re-derives guest memory after yields. The bundle uses native Slow mode with a 50 ms simulation interval.
+- Added self-hosted Wise, VISE, InstallShield 3 and non-solid RAR4 LZ/PPMd payload readers with checksum validation, shared browser import and extraction CLI support. Unsupported script/compression variants fail explicitly.
+
+- Added self-hosted MSI payload extraction and a CLI, including compound-file streams, installed directory/file tables, embedded or adjacent cabinets, and installed-file size/MD5 validation. Appended Microsoft Cabinet self-extractors can also be opened directly; installer custom actions are not executed.
+- D3D9 frame capture now records the separate render worker's draws without blocking future frame messages; remote Present closes the recording at the frame boundary. Overlapping requests and capture timeouts are handled explicitly.
+
+- Added the original English Need for Speed: Underground 2 PC demo with original PC box artwork. Free Roam driving, keyboard controls and the City Hall Circuit race are verified, including a production HTTP launch. Cold startup/level loading can take several minutes.
+
+- Guest threads that suspend themselves now park when every peer is blocked and stay parked until resumed. Regression tests execute the caller on v86 with interpreter and production JIT settings.
+- Added the original English Gothic 1.08h demo with original cover artwork and required save directories. Dialogue exit, HUD, movement and native saving are verified; restoring a saved game can still stall.
+
+- Legacy Direct3D now reports four simultaneous texture samplers, matching the renderer, while retaining eight arithmetic blend stages. Manifest overrides cannot exceed this limit. This fixes invisible dialogue text and HUD in the Gothic USA demo.
+
+- Added the original English The Bard's Tale (2005) and Deponia 1.1 demos with original cover artwork. Bard's tutorial, summoning and Mountain Tomb movement are verified; Deponia's tutorial, first room and native saving/loading across reload are verified.
+- OpenGL texture readback now preserves uploaded image contents and applies pixel packing, fixing corrupted texture atlases and cursors in Deponia.
+- Cursor warps immediately update the WASM GetCursorPos cache, preventing stale coordinates within the same guest tick.
+- Added Unicode CRT file opening and long-path queries; CRT and WinAPI now share the process working directory, and drive-relative full paths resolve against it. Release CRT modules no longer expose debug-only exports through a warmed GetProcAddress cache.
+- Added the original English Blackwell Legacy and KKND2: Krossfire demos with real cover artwork. Both retain native saves across page reload; KKND2 mission control and Blackwell’s apartment introduction are verified.
+- Added a self-hosted NSIS 2 ANSI/non-solid zlib payload reader and extraction CLI. It verifies installer CRC, reconstructs static installation paths and rejects unsupported conditional/dynamic file sections. Installer plugins and custom actions are not executed.
+- InstallShield extraction supports explicit recovery of plaintext data incorrectly marked as obfuscated; size and MD5 verification remain enabled. This unblocks packaging the original KKND2 demo without modifying its executable.
+
+## 2026-10-06
+
+- Borland CRT directory enumeration now uses its native Win32 implementation, so games can find and load save files written through the VFS-backed stdio layer.
+- USER32 timers now continue while the only guest thread is blocked in GetMessage, preventing native installer message loops from stalling with a frozen virtual clock.
+- Added the original English Harry Potter and the Chamber of Secrets demo and Tomb Raider II Great Wall demo, with real cover artwork and verified level movement.
+- The Tomb Raider II demo includes its native 640 × 480, 16-bit video settings for a fresh-container launch. The unconfigured setup dialog remains a known failure.
+- CRT process termination now uses the same child hand-off and durability barrier as ExitProcess, preserving a game launched by an exiting front-end and terminating all parent threads.
+- Added Racer with real cover artwork; the Boonta Training Course race is playable.
+- Added the English Discworld Noir interactive demo with original PC box artwork, native installation settings, and verified saving/loading across reload. Automatic attract-mode playback is disabled in the demo's menu resource, avoiding stripped-scene `bogus.scn` errors and a blank menu on return; its executable is unchanged. The WGB downloads into OPFS before launch for reliable CRT file reads.
+
 ## 2026-10-05
 
 ### Library and importing
+
+- Added Red Faction Worldwide Demo and both Half-Life demos (Uplink and Day One) to the public catalog with original covers.
+- Both Half-Life demos include a tested 1024 × 768, 16-bit video configuration: Direct3D for Uplink and OpenGL for Day One.
+- Added the Far Cry Research demo to the public catalog with the original PC cover.
 
 - Added Warcraft III Demo, Quake II, American McGee's Alice, XIII, Hitman: Codename 47,
   Serious Sam: The First Encounter, Worms Armageddon and System Shock 2 demos to the catalog.
@@ -21,6 +79,15 @@
 
 ### Games, graphics and sound
 
+- WGB manifests can select a complete virtual graphics-adapter identity. DirectDraw 4/7
+  and Direct3D 8/9 report the same vendor, device, driver and version.
+- The Far Cry Research demo includes stored PAK entries and its compiled shader cache,
+  reducing the measured cold level load from about 196 to 93 seconds while preserving fog.
+
+- Fixed retained splash images on 8-bit DirectDraw surfaces, including Worms Armageddon.
+- Palette presentation releases its temporary GPU buffers after submission, preventing
+  continuous GPU memory growth. Owned topmost dialogs now receive menu clicks correctly.
+- Repacked the Serious Sam: The First Encounter demo with its original English text and audio.
 - Expanded the compatibility list with the builds reported working in the current game
   collection, including Far Cry, Mafia, GTA: Vice City, NFS Underground 2, XIII, Painkiller,
   KKND2, Serious Sam, Deponia and Chains of Satinav. Demo-only coverage is stated explicitly.

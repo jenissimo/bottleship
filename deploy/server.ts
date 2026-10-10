@@ -1,3 +1,4 @@
+import { wgbEtag } from "./wgb-etag";
 /**
  * Production static file server.
  * - Adds COOP/COEP headers (required for SharedArrayBuffer / cross-origin isolation)
@@ -82,7 +83,11 @@ async function serveFile(filePath: string, req: Request, extraHeaders: Record<st
     if (fileSize === 0 && !(await file.exists())) return null;
 
     const contentType = MIME[path.extname(filePath).toLowerCase()] ?? "application/octet-stream";
-    const rangeHeader = req.headers.get("Range");
+    if (/\.wgb$/i.test(filePath)) {
+        extraHeaders = { ...extraHeaders, ETag: await wgbEtag(filePath), "Cache-Control": "no-cache" };
+    }
+    const validator = req.headers.get("If-Range");
+    const rangeHeader = !validator || validator === extraHeaders.ETag ? req.headers.get("Range") : null;
     const isHead = req.method === "HEAD";
 
     if (rangeHeader) {

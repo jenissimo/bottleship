@@ -12,7 +12,7 @@
  * Ground truth: Wine dlls/msvcrt/dir.c `_getcwd` — `if (size < len) size = len; buf = malloc(size)`.
  */
 
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
 import { registerCrtPathExports, type CrtPathHost } from "../../src/worker/modules/crt-path";
@@ -25,6 +25,7 @@ describe("crt-path NULL-buffer allocation contract", () => {
     let exports: Record<string, ThunkImplementation>;
     let mallocSizes: number[];
     let host: CrtPathHost;
+    let originalCwd: string;
 
     /** Bump allocator that remembers every requested size. */
     function makeHost(): CrtPathHost {
@@ -56,9 +57,11 @@ describe("crt-path NULL-buffer allocation contract", () => {
         exports = {};
         mallocSizes = [];
         host = makeHost();
-        (System.getInstance() as any).currentDirectory = "C:\\";
+        originalCwd = System.getInstance().fileSystem.currentDir;
+        System.getInstance().fileSystem.currentDir = "C:\\";
         registerCrtPathExports(exports, host);
     });
+    afterEach(() => { System.getInstance().fileSystem.currentDir = originalCwd; });
 
     const call = (name: string, ...args: number[]) =>
         (exports[name] as any)(null, mem, args) as number;
@@ -73,7 +76,7 @@ describe("crt-path NULL-buffer allocation contract", () => {
     });
 
     test("_getcwd(NULL, tiny) still fits the cwd itself", () => {
-        (System.getInstance() as any).currentDirectory = "C:\\Games\\SS2\\Data";
+        System.getInstance().fileSystem.currentDir = "C:\\Games\\SS2\\Data\\";
         const ptr = call("_getcwd", 0, 4);
         expect(ptr).toBeGreaterThan(0);
         expect(mallocSizes[0]).toBeGreaterThanOrEqual("C:\\Games\\SS2\\Data".length + 1);
@@ -88,7 +91,7 @@ describe("crt-path NULL-buffer allocation contract", () => {
     });
 
     test("_getcwd(buffer, tooSmall) fails with ERANGE rather than overrunning", () => {
-        (System.getInstance() as any).currentDirectory = "C:\\Games\\SS2";
+        System.getInstance().fileSystem.currentDir = "C:\\Games\\SS2\\";
         const buf = 0x8000;
         mem[buf + 3] = 0x7f;                       // canary just past the room we allow
         expect(call("_getcwd", buf, 3)).toBe(0);
@@ -103,5 +106,25 @@ describe("crt-path NULL-buffer allocation contract", () => {
         expect(mallocSizes[0]).toBeGreaterThanOrEqual(MAX_PATH);
         expect(ptr).toBe(0x1000);                  // the block, not strlen+1
         expect(host.readCString(ptr, MAX_PATH)).toBe("C:\\Data\\cutscenes\\intro.avi");
+    });
+
+    test("CRT chdir shares the WinAPI directory and preserves it when a target is missing", () => {
+        const vfs = System.getInstance().fileSystem;
+        const originalExists = vfs.directoryExists;
+        let errno = 0;
+        host.setErrno = value => { errno = value; return true; };
+        vfs.directoryExists = path => path === "C:\\" || path.toLowerCase() === "c:\\system";
+        try {
+            vfs.currentDir = "C:\\system\\";
+            expect(host.readCString(call("_getcwd", 0, 260), 260)).toBe("C:\\system");
+            host.writeCString(0x9000, "..");
+            expect(call("_chdir", 0x9000)).toBe(0);
+            expect(vfs.currentDir).toBe("C:\\");
+            expect(host.readCString(call("_getcwd", 0, 260), 260)).toBe("C:\\");
+            host.writeCString(0x9000, "missing");
+            expect(call("_chdir", 0x9000)).toBe(-1);
+            expect(errno).toBe(2);
+            expect(vfs.currentDir).toBe("C:\\");
+        } finally { vfs.directoryExists = originalExists; }
     });
 });

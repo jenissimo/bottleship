@@ -37,6 +37,9 @@ import {
     D3DTOP_MODULATE,
     D3DTOP_MODULATE2X,
     D3DTOP_SELECTARG1,
+    D3DTOP_SELECTARG2,
+    D3DTOP_BLENDTEXTUREALPHA,
+    D3DTOP_BLENDTEXTUREALPHAPM,
     D3DTOP_MULTIPLYADD,
     D3DTOP_LERP,
     D3DTA_TEXTURE,
@@ -116,6 +119,62 @@ describe("FfpStagesState.resolve", () => {
         expect(st.sampledMask).toBe(1);
         expect(st.colorArg1[0]).toBe(D3DTA_TEXTURE);
         expect((st.packed[1] >>> 16) & 0xff).toBe(D3DTA_DIFFUSE);
+    });
+
+    test("vertex-colored glyphs sample the texture used by alpha modulation", () => {
+        const states = makeStates();
+        set(states, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+        set(states, 0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        const st = new FfpStagesState();
+        st.resolve(states, 1, true, false);
+        st.pack();
+        expect(st.sampledMask).toBe(1);
+        expect(st.packed[0] & 0xffff).toBe(D3DTOP_SELECTARG2 | D3DTOP_MODULATE << 8);
+        expect(st.colorArg2[0]).toBe(D3DTA_DIFFUSE);
+        expect(st.alphaArg1[0]).toBe(D3DTA_TEXTURE);
+    });
+
+    test.each([D3DTOP_SELECTARG1, D3DTOP_SELECTARG2])(
+        "selection operation %i ignores unselected texture operands", op => {
+            const states = makeStates();
+            const selected = op === D3DTOP_SELECTARG1 ? D3DTSS_COLORARG1 : D3DTSS_COLORARG2;
+            const selectedAlpha = op === D3DTOP_SELECTARG1 ? D3DTSS_ALPHAARG1 : D3DTSS_ALPHAARG2;
+            for (const stage of [0, 1]) {
+                set(states, stage, D3DTSS_COLOROP, op);
+                set(states, stage, D3DTSS_ALPHAOP, op);
+                set(states, stage, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+                set(states, stage, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+                set(states, stage, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+                set(states, stage, D3DTSS_ALPHAARG2, D3DTA_TEXTURE);
+                set(states, stage, selected, D3DTA_DIFFUSE);
+                set(states, stage, selectedAlpha, D3DTA_CURRENT);
+            }
+            const st = new FfpStagesState();
+            st.resolve(states, 0, true, false);
+            expect(st.sampledMask).toBe(0);
+            expect(st.enabledMask).toBe(0b11);
+            expect(st.missingMask).toBe(0);
+        });
+
+    test.each([D3DTOP_BLENDTEXTUREALPHA, D3DTOP_BLENDTEXTUREALPHAPM])(
+        "operation %i samples its implicit texture alpha", op => {
+            const states = makeStates();
+            set(states, 0, D3DTSS_COLOROP, op);
+            set(states, 0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+            set(states, 0, D3DTSS_COLORARG2, D3DTA_CURRENT);
+            set(states, 0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+            const st = new FfpStagesState();
+            st.resolve(states, 1, true, false);
+            expect(st.sampledMask).toBe(1);
+        });
+
+    test("disabled color stage does not sample an active alpha operation", () => {
+        const states = makeStates();
+        set(states, 0, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        set(states, 0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        const st = new FfpStagesState();
+        st.resolve(states, 1, true, false);
+        expect(st.sampledMask).toBe(0);
     });
 
     test("a later DIFFUSE arithmetic stage stays active without a texture", () => {

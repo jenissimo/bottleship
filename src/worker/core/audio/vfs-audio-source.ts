@@ -1,3 +1,4 @@
+import type { IoReadPolicy } from "../../runtime/filesystem/io-read-policy";
 /**
  * RandomAccessSource adapter over the guest VFS, for container probes that need a
  * few KB from each end of a multi-megabyte file (see @bottleship/formats/audio).
@@ -28,7 +29,7 @@ interface Window {
 
 /**
  * The VFS can only serve some ranges asynchronously (compressed ROM entries,
- * cold OPFS overlay files). readRangeSync must never block the worker, so an
+ * cold OPFS overlay files). Under the default must-not-block lease an
  * unavailable range yields an empty slice — probes read that as "not parseable"
  * and the caller degrades to "duration unknown". prime() pre-fetches the head
  * and tail windows through the async path so a later sync probe sees real bytes.
@@ -40,17 +41,15 @@ export class VfsAudioSource implements RandomAccessSource {
     private handle: VfsFileHandle | null = null;
     private handleOpened = false;
 
-    constructor(path: string, size: number) {
+    constructor(path: string, size: number, private readonly policy: IoReadPolicy = "must-not-block") {
         this.path = path;
         this.size = Math.max(0, size);
     }
 
     async prime(): Promise<void> {
-        await this.fetchWindow(0, Math.min(PRIME_WINDOW_BYTES, this.size));
-        if (this.size > PRIME_WINDOW_BYTES) {
-            const tailStart = Math.max(0, this.size - PRIME_WINDOW_BYTES);
-            await this.fetchWindow(tailStart, this.size - tailStart);
-        }
+        const head = this.fetchWindow(0, Math.min(PRIME_WINDOW_BYTES, this.size));
+        const tailStart = Math.max(0, this.size - PRIME_WINDOW_BYTES);
+        await Promise.all([head, this.size > PRIME_WINDOW_BYTES ? this.fetchWindow(tailStart, this.size - tailStart) : Promise.resolve()]);
     }
 
     readRangeSync(start: number, end: number): Uint8Array {
@@ -70,7 +69,7 @@ export class VfsAudioSource implements RandomAccessSource {
         let filled = 0;
         vfs.setPosition(handle, from, FILE_BEGIN);
         while (filled < want) {
-            const chunk = vfs.readSync(handle, want - filled);
+            const chunk = vfs.readSync(handle, want - filled, this.policy);
             if (!chunk || chunk.length === 0) break;
             out.set(chunk, filled);
             filled += chunk.length;

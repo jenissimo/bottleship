@@ -1,3 +1,4 @@
+import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship/formats/wgb/io-profile";
 import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
@@ -132,7 +133,6 @@ import { WgbCache } from "./runtime/filesystem/wgb-cache";
 import { detectSourceFormat, sniffBlobHead } from "@bottleship/repack/detect";
 import { blobRandomAccess } from "./runtime/filesystem/installer-opfs";
 import { InnoFormatError } from "@bottleship/formats/inno";
-import { SyncHttpRangeSource } from "@bottleship/formats/zip";
 import { SabIoSource } from "./runtime/filesystem/sab-io-source";
 import { RegistryPersistence } from "./runtime/filesystem/registry-persistence";
 import { resolveGameId, gameIdToContainerDir } from "@bottleship/formats/wgb/container-id";
@@ -334,7 +334,8 @@ const resetHleReady = (): void => {
 };
 
 let pendingPeData: Uint8Array | null = null;
-let pendingBundle: { data?: Uint8Array; url?: string; blob?: Blob } | null = null;
+let pendingBundle: { data?: Uint8Array; url?: string; blob?: Blob; preload?: boolean; io?: WgbIoPolicy } | null = null;
+let preparedPendingBundle: { payload: { data?: Uint8Array; url?: string; blob?: Blob; preload?: boolean; io?: WgbIoPolicy }; bundle: import("./runtime/filesystem/wgb-loader").WgbBundle } | null = null;
 let heartbeatInterval: number | null = null;
 let schedulerInterval: number | null = null;
 let registryFlushInterval: number | null = null;
@@ -351,7 +352,7 @@ let loadBundleChain: Promise<void> = Promise.resolve();
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
 /** The payload that booted the current game — replayed verbatim by a self re-exec. */
-let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean } | null = null;
+let lastBundlePayload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy } | null = null;
 /** Command line the next boot must use instead of the manifest's `args` (self re-exec). */
 let pendingReExecArgs: string | null = null;
 /** Harness boot-args override (load_bundle `args`): replaces the manifest's args for one
@@ -1444,7 +1445,7 @@ async function importInstallerBundle(source: BuildSource) {
 }
 
 /** Pause the scheduler before replacing guest state. */
-const prepareFullGameSwitch = async (): Promise<void> => {
+const prepareFullGameSwitch = async (preserveBundleSource = false): Promise<void> => {
   stopChildProcesses();
   if (gameSessionActive) {
     Logger.log(LogCategory.SYSTEM, "[GameSwitch] full reset before loading new game");
@@ -1454,7 +1455,6 @@ const prepareFullGameSwitch = async (): Promise<void> => {
   gdiLastGuestPresentSerial = -1;
   _prefetchController?.abort();
   _prefetchController = null;
-  WgbCache.releaseMountedSource();
   setBootOverlayActive(false);
 
   const system = System.getInstance();
@@ -1475,6 +1475,14 @@ const prepareFullGameSwitch = async (): Promise<void> => {
     }
   }
 
+  if (!preserveBundleSource) {
+    const io = (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo;
+    (globalThis as { __wgbBlockCache?: { close(): void } }).__wgbBlockCache?.close();
+    await io?.closeAsync();
+    (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = undefined;
+    (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
+    WgbCache.releaseMountedSource();
+  }
   resetHeapSlab();
   await system.reset();
   if (state.inputBuffer) system.connectInput(state.inputBuffer);
@@ -1500,7 +1508,7 @@ const postBundleMeta = (manifest: WgbManifest, gameId: string): void => {
   });
 };
 
-const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
+const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
   const system = System.getInstance();
   if (!system.process) {
     pendingBundle = payload;
@@ -1516,7 +1524,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   // A previous run's lost devices/surfaces are not this run's state.
   resetDeviceLossContract();
 
-  await prepareFullGameSwitch();
+  const prepared = preparedPendingBundle && preparedPendingBundle.payload === payload ? preparedPendingBundle.bundle : null;
+  preparedPendingBundle = null;
+  await prepareFullGameSwitch(prepared !== null);
 
   // Restart placeholder drawing
   placeholderActive = true;
@@ -1529,12 +1539,23 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // see below) — it can't be rooted before we know which game's container to open.
     bootMark("pre-overlay");
 
-    let bundle;
-    if (payload.url) {
+    let bundle = prepared;
+    if (bundle) {
+      // The early RAM/config probe already opened this archive and its source.
+    } else if (payload.url) {
       // Prefer a cached bundle read SYNCHRONOUSLY off disk via a sync-access handle —
       // no 1.5GB BufferSource held in worker RAM, and the same OPFS copy a disk-blob
       // load of this game would use (one copy per game, not two).
       const url = payload.url;
+      let cachedSource = await WgbCache.openSyncSourceForUrl(url);
+      if (cachedSource) {
+        try { bundle = await WgbLoader.fromSource(cachedSource); }
+        catch (error) {
+          Logger.warn(LogCategory.SYSTEM, `WGB: cached source unusable (${error}) — reloading`);
+          await WgbCache.evict(url);
+          cachedSource = null;
+        }
+      }
 
       // Stream the bundle on demand instead of a full OPFS download — instant start,
       // NO blocking multi-GB copy (a 1.6 GB game boots after fetching just what the
@@ -1548,27 +1569,18 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       // `__noSabIo` forces the OPFS-staged path so the streaming transport can be A/B'd
       // against a local synchronous pread — the ceiling for any transport change.
       const streamCapable = (globalThis as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated === true
+        && !bundle
         && payload.preload !== true
+        && payload.io?.mode !== "preload-full"
         && (globalThis as Record<string, unknown>).__noSabIo !== true;
       if (streamCapable) {
         try {
-          // Preferred: serve the guest's synchronous reads from a dedicated I/O
-          // worker over a SharedArrayBuffer. The I/O worker owns the network,
-          // fetches in parallel and prefetches ahead of the guest cursor, so a
-          // cold read parks the guest for ~a SAB round-trip instead of a network
-          // one — no serial, latency-bound sync-XHR grind. Needs cross-origin
-          // isolation (SAB); falls back to the blocking sync-XHR range source.
-          let src: import("@bottleship/formats/zip").ZipSource;
-          let sabIo: SabIoSource | null = null;
-          try {
-            sabIo = await SabIoSource.create(url);
-            src = sabIo;
-            (globalThis as unknown as { __wgbSabIo?: unknown }).__wgbSabIo = src;
-            Logger.log(LogCategory.SYSTEM, `WGB: streaming "${url}" via SAB I/O worker (parallel prefetch)`);
-          } catch (sabErr) {
-            src = await SyncHttpRangeSource.create(url);
-            Logger.log(LogCategory.SYSTEM, `WGB: SAB I/O unavailable (${(sabErr as Error).message}) — streaming via sync-XHR range`);
-          }
+          // Cold reads from async-capable APIs park their guest thread; disk hits
+          // keep the synchronous path. Without SAB, stage a complete local bundle.
+          const sabIo = await SabIoSource.create(url);
+          const src = sabIo;
+          (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = sabIo;
+          Logger.log(LogCategory.SYSTEM, `WGB: streaming "${url}" via SAB I/O worker`);
           // Reflect the actual streaming stages (index read → entrypoint fetch) in the
           // loading UI instead of a static "Streaming" — the prefetch phase below then
           // takes over with its determinate "N / M files" bar.
@@ -1580,8 +1592,10 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
           } catch (loadErr) {
             // fromSource failed after the I/O worker spun up — terminate it so the
             // fallthrough to OPFS staging doesn't leak a live worker + its SAB.
-            sabIo?.close();
+            (globalThis as { __wgbBlockCache?: { close(): void } }).__wgbBlockCache?.close();
+            await sabIo.closeAsync();
             (globalThis as unknown as { __wgbSabIo?: unknown }).__wgbSabIo = undefined;
+            (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
             throw loadErr;
           }
         } catch (e) {
@@ -1602,7 +1616,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         return buf;
       };
 
-      let syncSource = await WgbCache.openSyncSourceForUrl(url);
+      let syncSource = cachedSource;
       let downloadedBuffer: Uint8Array | null = null;
       if (syncSource) {
         Logger.log(LogCategory.SYSTEM, `WGB: OPFS cache hit (sync), launching immediately`);
@@ -1758,6 +1772,7 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
     // Always set the CD redirect (null clears a prior game's redirect — no cross-game leak).
     const cdPath = bundle.manifest.emulator?.cdPath ?? null;
     system.fileSystem.setCdRedirect(cdPath);
+    system.fileSystem.setCdVolumeLabel(bundle.manifest.emulator?.cdLabel ?? null);
     if (cdPath) Logger.log(LogCategory.SYSTEM, `VFS: CD-ROM drive (D:) redirected to "${cdPath}"`);
     bootMark("rom-mounted");
 
@@ -1877,6 +1892,29 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
         }
 
         Logger.log(LogCategory.SYSTEM, `WGB: phase1 done in ${(performance.now() - t1) | 0}ms`);
+    }
+    const liveIo = (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo;
+    if (liveIo && payload.url) {
+      const policy = payload.io ?? bundle.manifest.emulator?.io ?? {};
+      const mode = payload.preload ? "preload-full" : policy.mode ?? "stream+fill";
+      if (mode === "preload-full") {
+        await liveIo.preloadFull();
+      } else if (policy.profileUrl) {
+        const response = await fetch(policy.profileUrl, { signal: AbortSignal.timeout(15_000), cache: "no-cache" });
+        if (!response.ok) throw new Error(`WGB profile HTTP ${response.status}`);
+        const profile = parseIoProfile(await response.json());
+        const identity = liveIo.identity();
+        if (profile.size !== identity.size || !identity.etag || profile.etag !== identity.etag
+            || profile.url !== identity.url) throw new Error("WGB profile belongs to a different bundle version");
+        const order = profileChunkOrder(profile, liveIo.chunkBytes);
+        if (mode === "preload-profile") {
+          await liveIo.preloadChunks(profileChunkOrder(profile, liveIo.chunkBytes, policy.preloadPhases ?? ["loading", "first-level"]));
+        }
+        if (mode !== "stream") liveIo.armFill(order);
+      } else {
+        if (mode === "preload-profile") throw new Error("preload-profile requires io.profileUrl");
+        if (mode === "stream+fill") liveIo.armFill();
+      }
     }
     bootMark("prefetch-done");
 
@@ -2125,11 +2163,16 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
   } catch (err) {
     const error = err as Error;
     Logger.error(LogCategory.SYSTEM, `Bundle load failed: ${error.message} (${error.name})\n${error.stack}`);
+    await (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo?.closeAsync();
+    (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = undefined;
+    (globalThis as { __wgbBlockCache?: { close(): void } }).__wgbBlockCache?.close();
+    (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
+    WgbCache.releaseMountedSource();
     self.postMessage({ type: "error", message: "bundle load failed: " + error.message });
   }
 };
 
-const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean }) => {
+const loadBundle = (payload: { data?: Uint8Array; url?: string; blob?: Blob; blobs?: File[]; preload?: boolean; io?: WgbIoPolicy }) => {
   lastBundlePayload = payload;
   loadBundleChain = loadBundleChain
     .then(() => loadBundleImpl(payload))
@@ -2256,7 +2299,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
     try {
       let bundle;
       if (pendingBundle.url) {
-        bundle = await WgbLoader.fromUrl(pendingBundle.url);
+        bundle = await WgbLoader.fromUrl(pendingBundle.url, pendingBundle);
       } else if (pendingBundle.blob) {
         bundle = await WgbLoader.fromBlob(pendingBundle.blob, (done, total) => {
           const doneMb = (done / 1024 / 1024).toFixed(0);
@@ -2268,6 +2311,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         bundle = await WgbLoader.fromBuffer(pendingBundle.data as Uint8Array);
       }
 
+      preparedPendingBundle = { payload: pendingBundle, bundle };
       // Apply emulator configuration from manifest for RAM (and reset stale prior-game overrides)
       const emulatorConfig = EmulatorConfig.getInstance();
       emulatorConfig.reset();
@@ -2450,6 +2494,14 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         self.postMessage({ type: "window_title", title, visible });
       });
 
+      system.services.render.onFirstPresent(() => {
+        bootMark("first-present");
+        setBootOverlayActive(false);
+        (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo?.markFirstFrame();
+        (globalThis as { __wgbBlockCache?: { setProfilePhase(phase: string): void } }).__wgbBlockCache?.setProfilePhase("gameplay");
+        self.postMessage({ type: "first_present" });
+      });
+
       // Initialize WebGPU backend immediately if possible
       const canWebGpu = typeof navigator !== "undefined" && "gpu" in navigator;
       if (canWebGpu) {
@@ -2458,14 +2510,6 @@ const initV86 = async (canvas: OffscreenCanvas) => {
           await backend.initialize(canvas);
           system.services.render.setBackend(backend);
           system.gdiContext.registerOverlayDirtyNotifier(kickGdiPresentLoop);
-          // Tell the host the moment the guest composites its FIRST real frame, so it can
-          // tear down the loading screen exactly at the first flip (not at PE-load, which
-          // left a black canvas during CRT/DirectX/asset init). One-shot per game load.
-          system.services.render.onFirstPresent(() => {
-            bootMark("first-present");
-            setBootOverlayActive(false);
-            self.postMessage({ type: "first_present" });
-          });
           // Start GDI presentation loop
           requestAnimationFrame(gdiPresentLoop);
           Logger.log(LogCategory.SYSTEM, "WebGPU backend initialized for compositing");
@@ -3513,7 +3557,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     // The launcher's own re-exec still outranks this (it is what the guest asked for);
     // this only replaces the manifest's boot args, and only for this load.
     bootArgsOverride = typeof message.args === "string" ? message.args : null;
-    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload });
+    loadBundle({ data: message.data, url: message.url, blob: message.blob, blobs: message.blobs, preload: message.preload, io: message.io });
   }
 
   // --- WGB wizard build service (Stage 1) — additive, separate from the boot path above. -----

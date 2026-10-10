@@ -15,6 +15,16 @@ import { searchPathSafeMode } from '../../core/dll-search-order';
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_INVALID_PARAMETER = 87;
 
+/** A drive prefix alone is relative to that drive's current directory, not its root. */
+function qualifyDriveRelativePath(path: string): string {
+    const match = /^([A-Za-z]):(?![\\/])(.*)$/.exec(path);
+    if (!match) return path;
+    const drive = match[1].toUpperCase();
+    const current = System.getInstance().fileSystem.currentDir;
+    const base = current.slice(0, 2).toUpperCase() === drive + ':' ? current : drive + ':\\';
+    return base.replace(/[\\/]+$/, '') + '\\' + match[2];
+}
+
 /** Directory portion of a Windows path, without a trailing separator. */
 const dirOfWindowsPath = (path: string): string => {
     const normalized = path.split('/').join('\\');
@@ -168,7 +178,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
         let fullPath: string;
         if (fileName.length >= 2 && fileName[1] === ':') {
             // Already absolute path (e.g., "C:\...")
-            fullPath = fileName;
+            fullPath = qualifyDriveRelativePath(fileName);
         } else if (fileName.startsWith('\\') || fileName.startsWith('/')) {
             // Root-relative path
             const currentDir = System.getInstance().fileSystem?.currentDir || 'C:\\';
@@ -245,7 +255,7 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
 
         let fullPath: string;
         if (fileName.length >= 2 && fileName[1] === ':') {
-            fullPath = fileName;
+            fullPath = qualifyDriveRelativePath(fileName);
         } else if (fileName.startsWith('\\') || fileName.startsWith('/')) {
             const currentDir = System.getInstance().fileSystem?.currentDir || 'C:\\';
             const drive = currentDir.substring(0, 2);
@@ -393,6 +403,34 @@ export function registerFileIoPathExports(exports: Record<string, ThunkImplement
             Mem.writeBytes(lpszShortPath, pathBytes);
         }
         return shortPath.length;
+    };
+
+    exports['GetLongPathNameW'] = (ctx, mem, args) => {
+        const input = args[0] >>> 0, output = args[1] >>> 0, capacity = args[2] >>> 0;
+        const path = input ? readStringW(mem, input) : '';
+        const system = System.getInstance();
+        if (!path) {
+            system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        // VFS names already use their long form. Windows permits copying an
+        // existing name unchanged when no alternate long form is available.
+        if (!system.fileSystem.fileExists(path) && !system.fileSystem.directoryExists(path)) {
+            system.scheduler.setLastError(ERROR_FILE_NOT_FOUND);
+            return 0;
+        }
+        const required = path.length + 1;
+        if (capacity < required) return required;
+        if (!output) {
+            system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const bytes = encodeUTF16LE(path);
+        if (Mem.writeBytes(output, bytes) !== bytes.length) {
+            system.scheduler.setLastError(122);
+            return 0;
+        }
+        return path.length;
     };
 
     exports['GetLongPathNameA'] = (ctx, mem, args) => {

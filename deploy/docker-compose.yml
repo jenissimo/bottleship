@@ -2,10 +2,11 @@
 #
 # Host layout (upload once; updating the stand is an rsync, not an image rebuild):
 #   ${BS_ROOT}/server.ts   copy of deploy/server.ts
+#   ${BS_ROOT}/wgb-etag.ts strong validators for WGB ranges
 #   ${BS_ROOT}/dist/       output of `bun run build` (with the catalog/covers you want)
 #   ${BS_ROOT}/apps/       the .wgb bundles the catalog's wgbUrl entries point at
 #
-# server.ts pulls in nothing but Bun + node:path/node:crypto, so there is no install
+# The server uses Bun and Node builtins only, so there is no install
 # and no build step in the container — it serves the prebuilt dist straight off the mount.
 # Set BS_AUTH_USER/BS_AUTH_PASS (stack environment variables, or a .env next to this
 # file) to put the whole stand behind HTTP Basic auth.
@@ -38,6 +39,7 @@ services:
       sh -eu -c '
         echo ">>> ls /app"; ls -la /app | head -n 40
         test -f /app/server.ts       || { echo "!! no /app/server.ts";  exit 1; }
+        test -f /app/wgb-etag.ts     || { echo "!! no /app/wgb-etag.ts — rerun tools/make-stand.ts"; exit 1; }
         test -f /app/dist/index.html || { echo "!! no /app/dist — payload not built (tools/make-stand.ts)"; exit 1; }
         ls /app/apps/*.wgb >/dev/null 2>&1 || { echo "!! no .wgb bundles in /app/apps"; exit 1; }
         exec bun /app/server.ts

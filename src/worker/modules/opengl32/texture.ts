@@ -1,11 +1,13 @@
 import { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { OpenGLContext, GLTextureObject, boundTextureStorageId } from "./context";
 import {
     GL_TEXTURE_1D, GL_TEXTURE_2D, GL_TEXTURE_3D, GL_RGBA,
     GL_PROXY_TEXTURE_2D, GL_IMPL_MAX_TEXTURE_SIZE,
     GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
-    GL_INVALID_ENUM, GL_INVALID_VALUE,
+    GL_INVALID_ENUM, GL_INVALID_VALUE, GL_INVALID_OPERATION,
+    GL_BGR, GL_BGRA, GL_RED, GL_GREEN, GL_BLUE, GL_UNSIGNED_BYTE,
     GL_REPEAT, GL_NEAREST,
     GL_RGB, GL_R3_G3_B2, GL_RGB4, GL_RGB5, GL_RGB8, GL_RGB10, GL_RGB12, GL_RGB16,
     GL_LUMINANCE, GL_LUMINANCE4, GL_LUMINANCE8, GL_LUMINANCE12, GL_LUMINANCE16,
@@ -398,6 +400,75 @@ export function createTextureExports(ctx: OpenGLContext): Record<string, ThunkIm
                 `rgba0=[${sub[p0]},${sub[p0 + 1]},${sub[p0 + 2]},${sub[p0 + 3]}] center=[${sub[pc]},${sub[pc + 1]},${sub[pc + 2]},${sub[pc + 3]}]`
             );
             texUploadDiagCount++;
+        }
+        return 0;
+    };
+
+    /** Read the stored image, not the framebuffer or a guest upload pointer. Engines
+     * use this to preserve an atlas before replacing a small region in it.
+     * GL 2.1 GetTexImage uses PACK state and performs no pixel transfer operations:
+     * https://registry.khronos.org/OpenGL-Refpages/gl2.1/xhtml/glGetTexImage.xml
+     */
+    exports['glGetTexImage'] = (_c, _m, args): number => {
+        const target = args[0] >>> 0, level = args[1] | 0;
+        const format = args[2] >>> 0, type = args[3] >>> 0, dst = args[4] >>> 0;
+        if (ctx.immediateMode) { ctx.error = GL_INVALID_OPERATION; return 0; }
+        const components = format === GL_RGB || format === GL_BGR ? 3
+            : format === GL_RGBA || format === GL_BGRA ? 4
+            : format === GL_LUMINANCE_ALPHA ? 2
+            : format === GL_RED || format === GL_GREEN || format === GL_BLUE
+                || format === GL_ALPHA || format === GL_LUMINANCE ? 1 : 0;
+        if (target !== GL_TEXTURE_2D || components === 0 || type !== GL_UNSIGNED_BYTE) {
+            ctx.error = GL_INVALID_ENUM;
+            return 0;
+        }
+        if (level < 0 || level > Math.floor(Math.log2(GL_IMPL_MAX_TEXTURE_SIZE))) {
+            ctx.error = GL_INVALID_VALUE;
+            return 0;
+        }
+        // Only level zero is currently defined by the texture upload path. Undefined
+        // levels have width/height zero, so a read leaves the destination untouched.
+        const tex = ctx.textures.get(boundTextureStorageId(ctx.textureUnits[ctx.activeTextureUnit]));
+        if (level !== 0 || !tex?.data || tex.width <= 0 || tex.height <= 0) return 0;
+        const rowLength = ctx.packRowLength || tex.width;
+        const skipPixels = ctx.packSkipPixels || 0, skipRows = ctx.packSkipRows || 0;
+        const alignment = ctx.packAlignment || 4;
+        const stride = Math.ceil(rowLength * components / alignment) * alignment;
+        const start = skipRows * stride + skipPixels * components;
+        const extent = start + (tex.height - 1) * stride + tex.width * components;
+        const mem = ctx.process.getCurrentMemory();
+        if (!dst || !Number.isSafeInteger(extent) || extent < 0 || dst + extent > mem.length
+            || !isValidAddress(mem, dst, extent, "rw")) {
+            ctx.error = GL_INVALID_OPERATION;
+            return 0;
+        }
+        // One validated per-turn view; row padding and skipped bytes are not written.
+        const base = baseInternalFormat(tex.internalFormat);
+        const rgba = tex.data;
+        const swapRb = format === GL_BGR || format === GL_BGRA;
+        for (let y = 0; y < tex.height; y++) {
+            const source = y * tex.width * 4, output = dst + start + y * stride;
+            if (format === GL_RGBA && base === BaseFormat.RGBA) {
+                mem.set(rgba.subarray(source, source + tex.width * 4), output);
+                continue;
+            }
+            for (let x = 0; x < tex.width; x++) {
+                const s = source + x * 4, d = output + x * components;
+                const r = base === BaseFormat.ALPHA ? rgba[s + 3] : rgba[s];
+                const single = base === BaseFormat.ALPHA || base === BaseFormat.LUMINANCE || base === BaseFormat.INTENSITY;
+                const g = single || base === BaseFormat.LUMINANCE_ALPHA ? 0 : rgba[s + 1];
+                const b = single || base === BaseFormat.LUMINANCE_ALPHA ? 0 : rgba[s + 2];
+                const a = single || base === BaseFormat.RGB ? 255 : rgba[s + 3];
+                if (components >= 3) {
+                    mem[d] = swapRb ? b : r; mem[d + 1] = g; mem[d + 2] = swapRb ? r : b;
+                    if (components === 4) mem[d + 3] = a;
+                } else if (format === GL_LUMINANCE || format === GL_LUMINANCE_ALPHA) {
+                    mem[d] = Math.min(255, r + g + b);
+                    if (components === 2) mem[d + 1] = a;
+                } else {
+                    mem[d] = format === GL_GREEN ? g : format === GL_BLUE ? b : format === GL_ALPHA ? a : r;
+                }
+            }
         }
         return 0;
     };

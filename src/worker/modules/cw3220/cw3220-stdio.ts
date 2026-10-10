@@ -56,7 +56,7 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
     // decompression fails ("Decompression error"). Switch msvcrt to real, zeroed
     // FILE structs so the inlined macro always defers to our _fgetc.
     msvcrt.enableRealFileStructs?.();
-    const noop0: ThunkImplementation = () => 0;     // success / NULL DIR* / dropped output
+    const noop0: ThunkImplementation = () => 0;     // success / dropped output
     const fail: ThunkImplementation = () => -1;     // _fstat: report failure, caller falls back
 
     // [name, handler, argCount]. FILE*-consuming funcs MUST all be overridden so our
@@ -80,10 +80,12 @@ export function installCw3220Stdio(process: Process): Map<string, number> | null
         ["_flushall", noop0, 0],
         ["_remove", noop0, 1],
         ["_mkdir", noop0, 1],
-        ["_opendir", noop0, 1],        // stub: no directory enumeration (not on the boot path)
-        ["_readdir", noop0, 1],
-        ["_closedir", noop0, 1],
     ];
+
+    // Directory streams stay native. CW3220's opendir/readdir/closedir/rewinddir
+    // use FindFirstFileA/FindNextFileA/FindClose directly, rather than the FILE*
+    // subsystem above. Replacing them with NULL-returning stubs hides every
+    // directory entry from callers, including save files they just wrote.
 
     const handlers: Record<string, ThunkImplementation> = {};
     const methods: Cw3220StubInfo[] = [];

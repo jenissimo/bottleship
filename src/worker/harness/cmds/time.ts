@@ -22,6 +22,8 @@ import { TimeService } from "../../runtime/time";
 import { guestTimeSteps } from "../../core/guest-time-steps";
 import { hypercallDataManager } from "../../core/cpu/hypercall-data";
 import { readRetiredInsns } from "../../core/cpu/cpu-views";
+import { Mem } from "../../core/memory/mem-accessor";
+import { isValidAddress } from "../../core/memory/address-guard";
 import { harnessBus } from "../event-bus";
 import { cancelCapture as frameCaptureCancel, startCapture as frameCaptureStart } from "../../modules/ddraw/frame-capture";
 
@@ -126,6 +128,48 @@ export function registerTimeCommands(svc: HarnessService): void {
             // an error — it is the count of backwards steps a guest would otherwise have read as
             // a ~2^32-tick elapsed time.
             clockMonotonic: hypercallDataManager.getClockMonotonicStats(),
+        };
+    });
+
+    /** Measure an unsigned guest counter against wall and guest time without disabling JIT. */
+    svc.register("counterRate", async (args, ctx: HarnessCtx) => {
+        const address = Number(args[0]);
+        const o = (args[1] ?? {}) as { sampleMs?: number; intervalMs?: number; bits?: number };
+        const sampleMs = Number(o.sampleMs ?? 3000), bits = Number(o.bits ?? 32);
+        const intervalMs = Math.max(Number(o.intervalMs ?? 50), sampleMs / 4095);
+        if (!Number.isInteger(address) || address < 0 || address > 0xffffffff ||
+            !Number.isFinite(sampleMs) || sampleMs < 1 || sampleMs > 60_000 ||
+            !Number.isFinite(intervalMs) || intervalMs < 1 || (bits !== 16 && bits !== 32)) {
+            throw new HarnessError("counterRate expects a guest address, 16|32 bits and a 1..60000ms window", HarnessErrorCode.BAD_ARGS);
+        }
+        const owner = proc(), ts = TimeService.getInstance();
+        const read = (): number => {
+            const mem = guestMem();
+            if (proc() !== owner || !mem || !isValidAddress(mem, address, bits / 8, 'r')) {
+                throw new HarnessError("counterRate counter is no longer readable", HarnessErrorCode.BAD_ARGS);
+            }
+            const value = bits === 16 ? Mem.readUint16(address) : Mem.readUint32(address);
+            if (value === null) throw new HarnessError("counterRate counter read failed", HarnessErrorCode.BAD_ARGS);
+            return value;
+        };
+        const start = read(), wallStart = performance.now(), guestStart = ts.nowMs();
+        const samples = [{ wallMs: 0, value: start }];
+        let previous = start, increments = 0, wraps = 0, maxStep = 0;
+        while (performance.now() - wallStart < sampleMs) {
+            await delay(Math.min(intervalMs, sampleMs - (performance.now() - wallStart)), ctx.signal);
+            const value = read(), step = (value - previous + 2 ** bits) % (2 ** bits);
+            if (value < previous) wraps++;
+            increments += step;
+            maxStep = Math.max(maxStep, step);
+            samples.push({ wallMs: performance.now() - wallStart, value });
+            previous = value;
+        }
+        const wallMs = performance.now() - wallStart, guestMs = ts.nowMs() - guestStart;
+        return {
+            address: `0x${address.toString(16)}`, bits, wallMs, guestMs, start, end: previous,
+            increments, perWallSecond: increments * 1000 / wallMs,
+            perGuestSecond: guestMs > 0 ? increments * 1000 / guestMs : null,
+            wraps, maxStep, assumption: "unsigned counter increments modulo 2^bits; resets count as wraps", samples,
         };
     });
 

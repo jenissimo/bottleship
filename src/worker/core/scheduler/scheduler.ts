@@ -417,6 +417,8 @@ export class Scheduler {
      *  Returns true if a restore was applied (CPU state modified). */
     public onPollAsyncRestores: ((cpu: V86Cpu, source?: string) => boolean) | null = null;
     public onHasPendingAsyncRestores: (() => boolean) | null = null;
+    /** GetMessage's promise parks as ASYNC_THUNK, but its queue can be woken by a USER timer. */
+    public onHasMessageWaiters: (() => boolean) | null = null;
     /** True when the thread owns a live suspended-thunk frame (a JS-driven pump like
      *  DialogBoxParamA). Lets the spin-loop safety net park such a thread WAITING between
      *  pump callbacks — the pump's next invokeCallback wakes it via
@@ -1038,7 +1040,7 @@ export class Scheduler {
         // 6. Check if all threads are waiting or sole thread stuck at spin loop — yield to browser
         if (this.runQueue.length === 0) {
             const current = this.getCurrentThread();
-            if (current && current.state === ThreadState.WAITING) {
+            if (current && (current.state === ThreadState.WAITING || current.state === ThreadState.SUSPENDED)) {
                 this.yieldToHost(cpu, this.computeYieldMs(4), "allBlocked");
                 return;
             }
@@ -1682,7 +1684,22 @@ export class Scheduler {
 
         // Pick next thread
         const next = this.pickNextRunnable(current?.id);
-        if (!next) { this.roundTripStats.noRunnable++; return false; }
+        if (!next) {
+            this.roundTripStats.noRunnable++;
+            if (current?.state === ThreadState.SUSPENDED && this.spinLoopBase > 0) {
+                // A self-suspend must stop caller code even when every peer is blocked.
+                // Keep its saved continuation intact; only the live CPU enters the park.
+                if (kind === ThunkBoundaryKind.THUNK_STUB) {
+                    const esp = readEsp(cpu);
+                    guardStackWrite(esp, 4, 'sched:selfSuspendPark', this.spinLoopBase);
+                    Mem.writeUint32(esp, this.spinLoopBase);
+                }
+                cpuViews(cpu).instructionPointer[0] = this.spinLoopBase;
+                if (cpu.is_jumping !== undefined) cpu.is_jumping = true;
+                preemptionManager.requestImmediateExit();
+            }
+            return false;
+        }
 
         // ── TEMP DIAGNOSTIC (crash-hunt): see setDebugHeadWatch/debugHeadWatchLog above.
         // Hot path is cheap: compute midMutation from outEip (no mem), read one dword for
@@ -3365,7 +3382,7 @@ export class Scheduler {
 
     setThreadPriority(handle: number, priority: number): boolean {
         const thread = this.getThreadByHandle(this.resolveHandle(handle));
-        if (!thread || priority < -15 || priority > 15) return false;
+        if (!thread) return false;
         thread.priority = priority;
         return true;
     }
@@ -4221,7 +4238,10 @@ export class Scheduler {
         // activeCount>0 to break it, so the hang would be silent. Pump wall-clock virtual
         // time so the wheel fires at native cadence — faithful, since these pumps are
         // wall-clock-paced on real Windows.
-        if (anyNonAsyncWaiter && this.timerWheel.activeCount > 0) {
+        // GetMessage's async slow path waits on the message queue rather than WaitEngine.
+        // Its ASYNC_THUNK park still needs wall-paced time for SetTimer to deliver WM_TIMER.
+        // Other async operations retain their own clock/restore ownership.
+        if (this.timerWheel.activeCount > 0 && (anyNonAsyncWaiter || this.onHasMessageWaiters?.())) {
             needsIdlePump = true;
         }
         return needsIdlePump;
@@ -4960,7 +4980,8 @@ export class Scheduler {
             // scheduled via setTimeout or a host task (a macrotask), so this
             // cannot blow the stack.
             const current = this.getCurrentThread();
-            if (current && current.state === ThreadState.WAITING && this.runQueue.length === 0) {
+            if (current && (current.state === ThreadState.WAITING || current.state === ThreadState.SUSPENDED) &&
+                this.runQueue.length === 0) {
                 // Clamp to ≥1: a 0 from computeYieldMs (overdue timer) would make the
                 // nested yieldToHost early-return with v86 stopped and NO resume scheduled.
                 this.yieldToHost(cpu, Math.max(1, this.computeYieldMs(4)), "reYield");

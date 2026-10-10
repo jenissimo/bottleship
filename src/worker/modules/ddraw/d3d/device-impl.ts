@@ -74,6 +74,7 @@ import {
 import { setDeviceRenderTarget } from "./texture-manager";
 import { surfaceSyncManager, syncActiveGdiContextBeforeD3D } from "../surface-sync";
 import { createDeviceStubsExports } from "./device-impl-stubs";
+import { createStridedDrawHandlers } from "./strided-draw";
 import { frustumPlanesFromCombined, sphereVisibilityBits, clipBitsToD3dVis } from "./sphere-visibility";
 import {
     fillDeviceDesc,
@@ -147,6 +148,11 @@ export const createDeviceExports = (
 ): D3DExports => {
     const exports: D3DExports = {};
     const resourceProvider = context.resourceProvider;
+    const stridedDraw = createStridedDrawHandlers(context, drawHandler);
+    exports["IDirect3DDevice7_DrawPrimitiveStrided"] = (ctx, mem, args) => stridedDraw.draw(ctx, mem, args);
+    exports["IDirect3DDevice7_DrawIndexedPrimitiveStrided"] = (ctx, mem, args) => stridedDraw.drawIndexed(ctx, mem, args);
+    exports["IDirect3DDevice3_DrawPrimitiveStrided"] = (ctx, mem, args) => stridedDraw.draw(ctx, mem, args);
+    exports["IDirect3DDevice3_DrawIndexedPrimitiveStrided"] = (ctx, mem, args) => stridedDraw.drawIndexed(ctx, mem, args);
 
     // ==========================================================================
     // PERFORMANCE OPTIMIZATION: Cached DataView and Matrix Pool
@@ -288,7 +294,7 @@ export const createDeviceExports = (
     };
 
     // IDirect3DDevice7_Clear: must run before draw, clears RT/depth so no trails.
-    // Clear is scoped to current viewport; when no rects, pass full-RT viewport so we don't clear "everything".
+    // Clear is scoped to the current viewport, with or without rects.
     // Signature: Clear(dwCount, lpRects, dwFlags, dwColor, dvZ, dwStencil)
     exports["IDirect3DDevice7_Clear"] = (ctx, mem, args) => {
         const thisPtr = args[0];
@@ -327,15 +333,11 @@ export const createDeviceExports = (
             }
         }
 
-        let viewport: { x: number; y: number; width: number; height: number } | undefined;
-        if (rects?.length) {
-            viewport = undefined;
-        } else {
-            const vp = obj.getViewportData();
-            viewport = vp
-                ? { x: vp.x, y: vp.y, width: vp.width, height: vp.height }
-                : { x: 0, y: 0, width: state.width, height: state.height };
-        }
+        // The viewport bounds the clear even when rects are given: the executor clips them to it.
+        const vp = obj.getViewportData();
+        const viewport = vp
+            ? { x: vp.x, y: vp.y, width: vp.width, height: vp.height }
+            : { x: 0, y: 0, width: state.width, height: state.height };
         context.executor.clear(state, dwFlags, dwColor, validDepth, viewport, rects, dwStencil);
         return D3D_OK;
     };
@@ -1860,15 +1862,6 @@ export const createDeviceExports = (
         return D3D_OK;
     };
 
-    // Strided draw: full implementation needed for games like Quake 2 (D3D mode) that use LPD3DDRAWPRIMITIVESTRIDEDDATA.
-    exports["IDirect3DDevice3_DrawPrimitiveStrided"] = (ctx, mem, args) => {
-        const type = args[1];
-        const vtype = args[2];
-        const count = args[4];
-        Logger.verbose(LogCategory.SYSTEM, `IDirect3DDevice3_DrawPrimitiveStrided: type=${type} vtype=${vtype} count=${count}`);
-        return D3D_OK;
-    };
-
     exports["IDirect3DDevice3_DrawIndexedPrimitive"] = (ctx, mem, args) => {
         Logger.verbose(LogCategory.SYSTEM, `IDirect3DDevice3_DrawIndexedPrimitive: type=${args[1]} vtype=0x${args[2].toString(16)} vCount=${args[4]} iCount=${args[6]}`);
         drawHandler.handleDrawPrimitive(args[0], args[1], args[2], args[3], args[4], mem, true, args[5], args[6]);
@@ -1904,16 +1897,6 @@ export const createDeviceExports = (
         }
         const dataAddr = obj.getDataPtr();
         drawHandler.handleDrawPrimitive(args[0], primType, obj.getFVF(), dataAddr, obj.getNumVertices(), mem, true, lpIndices, indexCount);
-        return D3D_OK;
-    };
-
-    // Strided indexed draw: full implementation needed for games like Quake 2 (D3D mode).
-    exports["IDirect3DDevice3_DrawIndexedPrimitiveStrided"] = (ctx, mem, args) => {
-        const type = args[1];
-        const vtype = args[2];
-        const vCount = args[4];
-        const iCount = args[6];
-        Logger.log(LogCategory.SYSTEM, `IDirect3DDevice3_DrawIndexedPrimitiveStrided: type=${type} vtype=${vtype} vCount=${vCount} iCount=${iCount}`);
         return D3D_OK;
     };
 

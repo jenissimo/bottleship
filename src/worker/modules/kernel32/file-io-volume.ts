@@ -429,7 +429,7 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
         let volumeSerial = 0x4A62_6840; // Stable per-emulator serial
 
         if (driveLetter === "D") {
-            volumeName = "BOTTLESHIP_CD";
+            volumeName = System.getInstance().fileSystem.getCdVolumeLabel() ?? "BOTTLESHIP_CD";
             fileSystemName = "CDFS";
             maxComponentLength = 110;
             fileSystemFlags = FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_READ_ONLY_VOLUME;
@@ -508,7 +508,7 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
         let volumeSerial = 0x4A62_6840;
 
         if (driveLetter === "D") {
-            volumeName = "BOTTLESHIP_CD";
+            volumeName = System.getInstance().fileSystem.getCdVolumeLabel() ?? "BOTTLESHIP_CD";
             fileSystemName = "CDFS";
             maxComponentLength = 110;
             fileSystemFlags = FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_READ_ONLY_VOLUME;

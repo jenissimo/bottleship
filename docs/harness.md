@@ -95,6 +95,10 @@ far too much log output to grep. So the harness gives you structured views inste
   hex bytes and ASCII. `encoding:'utf16le'` searches wide strings; `encoding:'hex'` accepts
   a byte pattern. Use the returned addresses with `trapWrites` or `trapJsWrites` to find
   where a correct source becomes a corrupted copy. `truncated` reports a hit limit.
+- **D3D9 draw capture.** `captureFrame({ backend: "d3d9", timeoutMs: 5000 })`
+  records the next complete frame, including draws executed by the separate render worker.
+  Keep the guest running while capturing. `maxVerts` and `maxIndexedVerts` control vertex
+  sample sizes; concurrent captures fail explicitly, and a timeout disarms the recording.
 - **Emitted JIT code.** `jitBytes` captures the wasm module bytes the JIT emits for a set of hot
   guest pages and diffs two captures — per-section sizes, declared locals, first differing
   offset. It is the decisive test for any codegen flag: if the bytes don't change, the flag is
@@ -172,3 +176,11 @@ function name, or export a symbol map to load breakpoints from.
 Confirm with **data** — a dump, a logged value, a `report()` — not by reasoning about how you
 think GDI or a vtable is laid out. Multi-DC composites, the canvas-vs-selected-bitmap
 distinction, and COM vtable topology all mis-model easily; a dump settles it.
+
+`counterRate(address, {sampleMs: 3000, intervalMs: 50, bits: 32})` samples an unsigned guest counter while JIT remains enabled and compares its increments with wall and guest time. It returns the raw samples; resets are reported as modulo wraps. `report().callbacks` includes pending/suspended callback frames and the most recent invocation and return.
+
+`bun tools/harness.ts shot capture.png --mirror` saves the composited screen mirror directly to a local file, including on a busy or backgrounded tab where the browser compositor cannot answer. The default route still captures the browser; `--verify` compares the routes.
+
+`BS_URL_MATCH=http://localhost:5174/` selects an existing library tab for host UI checks with `eval` and `shot`. Leave it unset for the normal `?game=dev` guest tab, or use `BS_TAB` to select a named guest tab.
+
+The original Thief Gold demo scenario takes `WGB` from the environment: `bun tools/harness.ts run tools/harness/regression/thief-gold-demo.harness.ts`. It navigates to Thieves' Guild, requires actual reads from miss15.mis in the VFS census, and captures the mission after keyboard movement and mouse look, rejecting crashes and unimplemented APIs.

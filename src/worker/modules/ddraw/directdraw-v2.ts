@@ -11,17 +11,11 @@ import { DDrawContext } from "./context";
 import { isValidAddress } from "../../core/memory/address-guard";
 import {
     DD_OK, E_POINTER,
-    DDDEVICEIDENTIFIER_SIZE, DDDEVICEIDENTIFIER2_OFFSETS, DDDEVICEIDENTIFIER2_STRING_SIZE,
+    DDDEVICEIDENTIFIER_SIZE,
     IID_IDirectDrawSurface,
 } from "./constants";
 import {
-    adapterVendorId,
-    adapterDeviceId,
-    adapterDescription,
-    adapterDriverDll,
-    DEFAULT_DRIVER_VERSION,
-    DEFAULT_DEVICE_DESC,
-    DEFAULT_DRIVER_DLL,
+    writeAdapterIdentifier6,
 } from "../../backends/webgpu/shared/dx-adapter-identifier";
 
 interface DirectDraw2Deps {
@@ -132,43 +126,14 @@ export function registerDirectDraw2Exports(
         const thisPtr = args[0];
         const lpdddi = args[1]; // Pointer to DDDEVICEIDENTIFIER (DX6, 1064 bytes, no WHQL)
         const dwFlags = args[2];
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-
         Logger.log(LogCategory.SYSTEM, `IDirectDraw4_GetDeviceIdentifier: this=0x${thisPtr.toString(16)}, lpdddi=0x${lpdddi.toString(16)}, flags=0x${dwFlags.toString(16)}`);
 
-        if (!lpdddi || !isValidAddress(mem, lpdddi, DDDEVICEIDENTIFIER_SIZE)) {
+        if (!lpdddi || !isValidAddress(mem, lpdddi, DDDEVICEIDENTIFIER_SIZE, 'rw')) {
             Logger.warn(LogCategory.SYSTEM, `IDirectDraw4_GetDeviceIdentifier: Invalid lpdddi pointer 0x${lpdddi.toString(16)}`);
             return E_POINTER;
         }
 
-        // Zero DDDEVICEIDENTIFIER (DX6, 1064 bytes — no dwWHQLLevel)
-        mem.fill(0, lpdddi, lpdddi + DDDEVICEIDENTIFIER_SIZE);
-
-        // The SAME adapter D3D8/D3D9 report — see dx-adapter-identifier.ts. An app that
-        // asks both interfaces in one process must not be told it is on two machines.
-        // szDriver at offset 0 — the display driver's file name, not a category word.
-        const driverBytes = new TextEncoder().encode(adapterDriverDll());
-        const driverLen = Math.min(driverBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
-        for (let i = 0; i < driverLen; i++) mem[lpdddi + i] = driverBytes[i];
-
-        // szDescription at offset 512
-        const descBytes = new TextEncoder().encode(adapterDescription());
-        const descLen = Math.min(descBytes.length, DDDEVICEIDENTIFIER2_STRING_SIZE - 1);
-        for (let i = 0; i < descLen; i++) mem[lpdddi + 512 + i] = descBytes[i];
-
-        // liDriverVersion at offset 1024
-        view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
-        // dwVendorId at offset 1032
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, adapterVendorId(), true);
-        // dwDeviceId at offset 1036
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, adapterDeviceId(), true);
-        // dwSubSysId at offset 1040 stays zero; dwRevision at 1044 matches the D3D answer.
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwRevision, 1, true);
-        // guidDeviceIdentifier at offset 1048 (16 bytes)
-        for (let i = 0; i < 16; i++) mem[lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.guidDeviceIdentifier + i] = i;
-        // NO dwWHQLLevel write — field does not exist in DX6 DDDEVICEIDENTIFIER
-
-        return DD_OK;
+        return writeAdapterIdentifier6(mem, lpdddi) ? DD_OK : E_POINTER;
     };
 
     // IDirectDraw4 stub methods - delegate to v7 where possible

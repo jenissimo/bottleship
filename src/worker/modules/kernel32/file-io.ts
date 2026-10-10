@@ -139,14 +139,14 @@ class FileHandleWrapper {
      * Returns null if async read is needed
      */
     readSync(length: number): Uint8Array | null {
-        return this.vfs.readSync(this.handle, length);
+        return this.vfs.readSync(this.handle, length, "park-preferred");
     }
 
     /**
      * Read directly into target buffer (no intermediate allocation). Returns bytes read or null if async needed.
      */
     readIntoSync(target: Uint8Array, targetOffset: number, length: number): number | null {
-        return this.vfs.readIntoSync(this.handle, target, targetOffset, length);
+        return this.vfs.readIntoSync(this.handle, target, targetOffset, length, "park-preferred");
     }
 
     async read(length: number): Promise<Uint8Array> {
@@ -157,7 +157,11 @@ class FileHandleWrapper {
      * Read directly into target buffer (avoids double buffer + large temp alloc on big reads e.g. LOD).
      */
     async readInto(target: Uint8Array, targetOffset: number, length: number): Promise<number> {
-        return await this.vfs.readInto(this.handle, target, targetOffset, length);
+        return await this.vfs.readInto(this.handle, () => {
+            const view = Mem.getView();
+            if (!view) throw new Error("Guest memory unavailable");
+            return view;
+        }, targetOffset, length);
     }
 
     async write(data: Uint8Array): Promise<number> {
@@ -1212,10 +1216,10 @@ const fileIoModule = (() => {
         // it as a 0-byte SUCCESS would hand the completion routine a truncated file — a wrong
         // answer the caller cannot detect — so the miss goes to the async read instead.
         if (lpBuffer && lpBuffer + nNumberOfBytesToRead <= mem.length) {
-            const sync = vfs.readIntoSync(cursor, mem, lpBuffer, nNumberOfBytesToRead);
+            const sync = vfs.readIntoSync(cursor, mem, lpBuffer, nNumberOfBytesToRead, "park-preferred");
             if (sync !== null) return complete(sync);
         } else {
-            const data = vfs.readSync(cursor, nNumberOfBytesToRead);
+            const data = vfs.readSync(cursor, nNumberOfBytesToRead, "park-preferred");
             if (data !== null) return complete(MemoryGuard.writeBytes(mem, lpBuffer, data, "ReadFileEx"));
         }
 
@@ -1224,7 +1228,7 @@ const fileIoModule = (() => {
             try {
                 const freshMem = Mem.getView();
                 if (freshMem && lpBuffer && lpBuffer + nNumberOfBytesToRead <= freshMem.length) {
-                    bytesRead = await vfs.readInto(cursor, freshMem, lpBuffer, nNumberOfBytesToRead);
+                    bytesRead = await vfs.readInto(cursor, () => Mem.getView()!, lpBuffer, nNumberOfBytesToRead);
                 } else {
                     const data = await vfs.read(cursor, nNumberOfBytesToRead);
                     bytesRead = MemoryGuard.writeBytes(Mem.getView() || mem, lpBuffer, data, "ReadFileEx");
@@ -1803,8 +1807,16 @@ const fileIoModule = (() => {
             const wrapper = fileHandle as FileHandleWrapper;
             const bytesRead = wrapper.readIntoSync(mem, lpBuffer, uBytes);
             if (bytesRead === null) {
-                // Fallback path when sync read is unavailable.
-                return 0;
+                return wrapper.read(uBytes).then(data => {
+                    if (data.length > 0 && Mem.writeBytes(lpBuffer, data) !== data.length) {
+                        System.getInstance().scheduler.setLastError(ERROR_NOACCESS);
+                        return { value: HFILE_ERROR };
+                    }
+                    return { value: data.length };
+                }).catch(() => {
+                    System.getInstance().scheduler.setLastError(ERROR_IO_DEVICE);
+                    return { value: HFILE_ERROR };
+                });
             }
             return bytesRead;
         } catch {

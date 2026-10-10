@@ -1,9 +1,8 @@
 #!/usr/bin/env bun
 /**
- * rar-extract: List or extract a RAR5 archive using our own reader
- * (`packages/formats/src/rar/`). STORED entries only — game drops are routinely a
- * store-only `.rar` around an installer, and that is the case this exists to unwrap;
- * a compressed/encrypted/solid entry is refused by name rather than mis-extracted.
+ * rar-extract: List or extract a RAR4/RAR5 archive using our own reader
+ * (`packages/formats/src/rar/`). RAR5 supports stored entries; RAR4/SFX also supports
+ * non-solid RAR 2.9 LZ/PPMd and standard filters. Unsupported coding is refused.
  *
  * Multi-volume sets (`name.part1.rar`, `name.part2.rar`, …) are followed automatically
  * from the first volume, and a file split across volumes is concatenated in order.
@@ -11,11 +10,11 @@
  * Usage:
  *   bun tools/rar-extract.ts <archive.rar> <out-dir> [--list] [--quiet] [--no-verify]
  */
-import { openSync, writeSync, closeSync, mkdirSync, existsSync } from "node:fs";
+import { openSync, writeSync, closeSync, mkdirSync, existsSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { tryResolveArchiveExtractPath } from "./internal/archive-extract-path";
-import { parseRar, assertExtractable, volumeName, RarError, type RarEntry } from "@bottleship/formats/rar";
-import { Crc32 } from "@bottleship/formats/unpack";
+import { parseRar, assertExtractable, volumeName, RarError, type RarEntry, findRar4, parseRar4, extractRar4 } from "@bottleship/formats/rar";
+import { Crc32, UnpackDecoder } from "@bottleship/formats/unpack";
 import { FileSource } from "./internal/file-source";
 
 const args = process.argv.slice(2);
@@ -34,6 +33,26 @@ if (!listOnly && !outDirArg) {
     process.exit(1);
 }
 const outDir = outDirArg ? resolve(outDirArg) : "";
+
+const firstSource = new FileSource(archivePath);
+const rar4Offset = findRar4(firstSource.readRangeSync(0, Math.min(firstSource.size, 1 << 20)));
+if (rar4Offset !== null) {
+    const archive = parseRar4(firstSource, rar4Offset);
+    if (listOnly) {
+        for (const e of archive.entries) console.log(`${e.isDirectory ? '<DIR>' : e.unpackedSize}\t${e.name}`);
+    } else {
+        const codec = new UnpackDecoder();
+        await codec.init(await Bun.file(new URL('../public/unpack-streaming.wasm', import.meta.url)).arrayBuffer());
+        const files = extractRar4(firstSource, rar4Offset, { createPpmSession: input => codec.createRarPpmSession(input) });
+        for (const [name, bytes] of files) {
+            const target = safeJoin(outDir, name);
+            mkdirSync(name.endsWith('/') ? target : dirname(target), { recursive: true });
+            if (!name.endsWith('/')) writeFileSync(target, bytes, { flag: 'wx' });
+        }
+        console.log(`Extracted ${files.size} RAR4 entries with CRC verification to ${outDir}`);
+    }
+    process.exit(0);
+}
 
 const CHUNK = 8 << 20;
 

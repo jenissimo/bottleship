@@ -63,6 +63,24 @@ bun tools/wgb.ts patch-manifest game.wgb …  # (alias: pm)
 
 ## Bringing your own game
 
+`manifest.emulator.graphicsAdapter` selects the virtual adapter identity exposed by
+DirectDraw 4/7 and Direct3D 8/9. Legacy engines use it to select driver paths. Supply
+the complete identity: `vendorId`, `deviceId`, `description`, `driver` (DLL basename),
+and `driverVersion` (four 16-bit version numbers). For example:
+
+```json
+"graphicsAdapter": {
+  "vendorId": 4098,
+  "deviceId": 29631,
+  "description": "AMD Radeon RX 6900 XT",
+  "driver": "aticfx32.dll",
+  "driverVersion": [31, 0, 24033, 1003]
+}
+```
+
+Rendering capabilities still come from BottleShip's renderer. Omitting the identity
+uses the default adapter; loading another bundle clears the previous override.
+
 BottleShip is the engine; you supply games you legally own. Three ways to get a game in:
 
 1. **Load File…** in the UI — drop a `.wgb`, a raw game folder, or an installer.
@@ -72,8 +90,111 @@ BottleShip is the engine; you supply games you legally own. Three ways to get a 
    [`docs/gog-import.md`](gog-import.md).
 3. **`make-wgb`** from a game directory you already have, as above.
 
+## Other installer payloads
+
+`bun tools/msi-extract.ts installer.msi output-dir [--root INSTALLDIR] [--list]`
+reads a selected installed tree from MSI File, Component and Directory tables. It
+restores long filenames and extracts embedded cabinets or cabinets beside the MSI,
+checking installed file sizes and MSI file hashes when present. Custom actions,
+registry writes and generated files are not executed; loose, non-cabinet media is
+unsupported. `--root` selects the MSI Directory key to extract beneath.
+
+The shared container extraction pipeline also detects MSI packages inside folders
+or archives and CAB self-extracting EXEs, including direct game payloads and
+PackageForTheWeb wrappers around InstallShield media. Cabinet decompression uses
+the project's existing CAB reader and its supported codecs.
+
+`bun tools/installer-extract.ts installer.exe output-dir --report evidence.json` uses the
+shared format registry, including nested installers inside ZIPs and RAR4 self-extractors.
+Extraction requires an empty destination. `--list` validates and decodes the payload without
+writing it. Reports contain the source SHA256, file counts, sizes and every extracted file's
+SHA256. Pack the extracted directory with `make-wgb`; installer actions and registry scripts
+are not executed, so required registry settings still belong in the bundle metadata.
+
+The browser's installer and ZIP imports use the same readers:
+
+| Payload | Supported scope |
+|---|---|
+| Wise | Static `%MAINDIR%` file records backed by raw DEFLATE streams; stream CRCs and declared file extents are verified |
+| InstallShield 3 `data.z` | Directory/file tables and PKWARE DCL compression; decoded lengths are verified and empty directories retained |
+| VISE | ESIV static object tables with folder/file and shortcut records; word-swapped DEFLATE with 16-bit stored-block alignment, file CRCs and empty directories |
+| RAR4 / RAR SFX | Stored entries and non-solid version-29 LZ/PPMd blocks, including coding-table changes; header and file CRCs. Standard E8/E8E9, RGB, audio and delta filters; arbitrary VM programs are rejected |
+
+RAR4 split volumes, solid groups, encryption, Unicode filename coding and other compression
+versions are rejected explicitly. RAR5 retains its existing stored-entry and multi-volume
+reader. `bun tools/rar-extract.ts archive.rar output-dir` also detects RAR4 SFX files.
+PPMd uses the shared Rust WASM backend; rebuild it with `bun run build:unpack-streaming`
+after changing the codec. Wise and VISE script variants and compression methods outside
+these static layouts fail explicitly.
+
+`bun tools/nsis-extract.ts installer.exe output-dir [--list]` reads static file sections
+from ANSI NSIS 2 installers using non-solid zlib compression. It checks the installer
+CRC and follows `$INSTDIR`/`$OUTDIR` paths and static variable aliases without running
+the installer. Unicode, solid and other codecs, conditional file sections and dynamic
+paths are rejected. Generated configuration, registry actions and plugins are not executed.
+
+For a cabinet whose payload is demonstrably plaintext despite its obfuscation flag,
+`unshield-extract.ts --ignore-obfuscation` provides explicit recovery; normal extraction
+honors the flag. Verify the original payload and retain size/checksum validation.
+
+## Runtime I/O policy and access profiles
+
+For URL bundles, the loader checks the full OPFS cache first. On a miss it streams
+versioned ranges and saves each chunk to a sparse OPFS copy. The default `stream+fill`
+mode starts an idle download after the first presented frame and promotes a complete
+copy for later launches. Demand reads take priority over readahead and fill.
+
+Set `emulator.io` in the manifest, `io` on a catalog/stand entry, or pass it to
+`loadApp(url, {io: {mode: "stream"}})`:
+
+| Mode | Behavior |
+| --- | --- |
+| `stream` | Persist requested chunks; no full background download |
+| `stream+fill` | Stream now and fill the remaining disk chunks after the first frame |
+| `preload-profile` | Fetch the profile's loading/first-level chunks before guest startup, then fill |
+| `preload-full` | Download the full bundle before guest startup |
+
+`preload: true` remains an alias for full preload. `preload-profile` requires
+`profileUrl`; `preloadPhases` can override the default `["loading", "first-level"]`.
+Runtime profiles must match the bundle URL, size and strong ETag exactly. A server
+without a strong ETag falls back to a full download. When OPFS is unavailable or quota
+is insufficient, streaming still works and cold async-capable reads park their caller;
+disk fill is unavailable.
+
+Record an uncached streamed run with the project harness, label a level transition,
+and export a profile beside the bundle:
+
+```powershell
+bun tools/harness.ts ioPhase first-level
+bun tools/harness.ts ioProfile C:/WGB/example.wgb.profile
+bun tools/harness.ts ioReport
+```
+
+`ioReport.gameplay.stallMsPerMinute` measures time spent in blocking SAB waits since
+the first frame. Async request latency is reported separately. Profiles include
+ordered 64 KiB first touches and file names; repacking uses names because offsets
+change:
+
+```powershell
+bun tools/make-wgb.ts C:/Games/Example C:/WGB/example.wgb --exe game.exe --order C:/WGB/example.wgb.profile --content-addressed
+```
+
+`--content-addressed` also writes `example.<sha256>.wgb`; deploy that URL for immutable
+edge caching. Re-record the runtime profile after repacking. Cloudflare caches ranges
+under URL+ETag+range and checks the current R2 version before serving them.
+
 ## A note on distribution
 
 The bundled/showcase set is limited to content that is legal to redistribute (freeware,
 shareware, demo episodes). Commercial games are **bring-your-own** — BottleShip does not ship
 their files. Keep your own bundles out of the repository.
+
+### Generated installer configuration
+
+Payload extraction does not run installer actions. The original Thief Gold demo keeps its resource archives beside THIEF.EXE and needs the generated install.cfg. For that layout, publish the saved configuration before testing the bundle:
+
+```powershell
+bun tools/wgb.ts replace C:/WGB/thief-gold-demo.wgb rom/install.cfg tools/demo-configs/thief-gold-install.cfg
+```
+
+The C: paths refer to the guest installation root, rather than the host source directory. A layout with archives under RES needs its resource path to point there instead.

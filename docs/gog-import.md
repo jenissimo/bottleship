@@ -20,6 +20,9 @@ The picker grants read access. The worker reads files in chunks to build an inde
 so launching the saved package later does not require renewed access to the original folder.
 The wizard still lets you choose among executable candidates and adjust settings before saving.
 
+New imports default to **1024×768**, **32-bit color**, **128 MB RAM**, **Windows 98**,
+and **Skip video: no**. Explicit bundle settings and curated overrides take precedence.
+
 The same importer is available through **Add game** in the library and **Load File…**
 in the dev panel. The wizard lets you review the executable and settings before choosing
 **Play now**, **Save to library**, or **Download WGB**. Play now saves the configured

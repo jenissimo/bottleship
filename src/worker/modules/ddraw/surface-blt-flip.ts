@@ -48,7 +48,7 @@ import {
 } from "./constants";
 import { readRect, surfaceAt, type Rect } from "./helpers";
 import { absToRel } from "./helpers";
-import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect } from "./surface-helpers";
+import { copySurfaceRegion, copySurfaceRegionWithColorKey, copySurfaceRegionWithRop, copyCompressedSurfaceRegion, buildFullRect, rectCoversSurface } from "./surface-helpers";
 import { RectPool } from "./rect-pool";
 import { DirectDrawSurfaceObject, isBitmapTexture, isRenderSurface } from "./com-objects";
 import { convertRGBAToSurface, createGPUTexture, uploadToGPUTexture } from "./gpu-texture-utils";
@@ -819,6 +819,12 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 }
 
                 Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_Blt: Using GPU-only clear for GPU_ONLY surface ColorFill color=0x${(fillColor >>> 0).toString(16)}`);
+                // The clear rewrites dstRect only, while setAuthorityGpu below declares the whole
+                // texture current — so pixels a CPU blit left pending outside the rect must reach
+                // the GPU first. A fill that covers the surface replaces them all.
+                if (!rectCoversSurface(dstRect, dstState) && surfaceSyncManager.needsGPUSync(dstState).needed) {
+                    context.executor!.syncSurfaceFromMemory(dstState);
+                }
                 context.executor!.clear(dstState, D3DCLEAR_TARGET, argbColor, 1.0, {
                     x: dstRect.left,
                     y: dstRect.top,
@@ -1299,10 +1305,13 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             unionSurfaceDirtyRegion(dstState, dstRect);
             (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
             recordSurfaceOp("bltfast", useColorKey ? "cpu:colorkey" : "cpu", dstState, srcState, dstRect, srcRect, useColorKey ? srcState.srcColorKey : undefined);
+            return finishBltFast();
+        };
 
-            // BltFast to primary triggers present (same as Blt to primary).
-            // Many 2D games use BltFast exclusively for rendering.
-            // Non-blocking: yield at most once per rAF cycle (see Blt comment above).
+        // BltFast to primary triggers present (same as Blt to primary).
+        // Many 2D games use BltFast exclusively for rendering.
+        // Non-blocking: yield at most once per rAF cycle (see Blt comment above).
+        const finishBltFast = (): number | Promise<number> => {
             if (context.surfaces.primary && thisPtr === context.surfaces.primary) {
                 return framePacer.waitForFrameSlot({ nonBlocking: true }).then(() => {
                     if (!context.suppressPresent) {
@@ -1312,6 +1321,29 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
                 });
             }
             return DD_OK;
+        };
+
+        // Blt's mixed path, for the same reason: the destination's current pixels are on the
+        // GPU (a render target D3D drew into), so the copy composites there. The CPU copy
+        // would first have to download the whole destination — every frame, for a HUD blitted
+        // over a 3D scene.
+        const bltFastOnGpu = (): boolean => {
+            if (!context.backend || !context.executor) return false;
+            if (!isRenderSurface(dstState) || dstState.mode !== "GPU_ONLY" || !dstState.gpuTexture) return false;
+            if (surfaceHasActiveWriteLease(dstState)) return false;
+            if (!srcState.gpuTexture) ensureGpuTextureForBlt(srcState, context, mem, resolveSurfaceTextureFormat(dstState));
+            if (!srcState.gpuTexture) return false;
+            const colorKey = useColorKey ? srcState.srcColorKey : undefined;
+            if (colorKey) {
+                context.executor.blitWithColorKey(srcState, dstState, srcRect, dstRect, colorKey);
+            } else {
+                context.executor.blitWithShaderCopy(srcState, dstState, srcRect, dstRect);
+            }
+            context.executor.flush();
+            setAuthorityGpu(dstState);
+            (dstState as { surfaceEverWritten?: boolean }).surfaceEverWritten = true;
+            recordSurfaceOp("bltfast", colorKey ? "gpu:mixed:colorkey" : "gpu:mixed", dstState, srcState, dstRect, srcRect, colorKey);
+            return true;
         };
 
         // Readback GPU-authoritative data before CPU copy to prevent stale pixels
@@ -1327,6 +1359,8 @@ export function createSurfaceBltFlipExports(context: DDrawContext): Record<strin
             if (needDstReadback && context.executor.syncSurfaceToMemoryFromScratch(dstState, mem)) {
                 needDstReadback = false;
             }
+
+            if (needDstReadback && !needSrcReadback && bltFastOnGpu()) return finishBltFast();
 
             if (needSrcReadback || needDstReadback) {
                 // Async path: GPU→CPU readback needed

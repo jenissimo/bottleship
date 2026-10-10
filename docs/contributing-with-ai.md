@@ -82,6 +82,10 @@ template):
   in the issue or PR and commit reusable harness scenarios under `tools/harness/`.
 - **Never commit game files**, box art you can't redistribute, decompiled binaries, or
   leaked source. Reports and fixes about commercial games are welcome; their bytes are not.
+- **Use real cover art or the existing fallback.** If a catalog entry has no cover, omit
+  `coverUrl` so the library shows its gradient and initial. Do not make synthetic cover
+  files; the `subtitle` badge already identifies a demo. Preview covers and missing-image
+  cards in the desktop and mobile library before submitting catalog changes.
 - **You own what you submit.** AI-assisted is welcome and assumed — but you are the author:
   run the loop, read the diff, and stand behind the claim. "The agent said so" is not a
   citation.

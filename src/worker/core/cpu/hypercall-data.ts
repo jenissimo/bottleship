@@ -1666,7 +1666,8 @@ export class HypercallDataManager {
 
     /**
      * Update cursor position in shared page.
-     * Called before each main_loop() tick.
+     * Published by InputManager on every pointer mutation, and seeded before each tick.
+     * A guest warp must be visible to the next GetCursorPos in the SAME tick.
      */
     updateCursorData(x: number, y: number): void {
         if (!this.initialized || !this.view) return;

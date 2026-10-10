@@ -289,7 +289,7 @@ async function readFileToBuffer(
 
         system.fileSystem.setPosition(vfsHandle, 0, 0);
 
-        fileData = system.fileSystem.readSync(vfsHandle, fileSize);
+        fileData = system.fileSystem.readSync(vfsHandle, fileSize, "park-preferred");
         if (!fileData) {
             fileData = await system.fileSystem.read(vfsHandle, fileSize);
             usedAsync = true;
@@ -386,7 +386,7 @@ async function fileReadLowLevel(ctx: MSSContext, mem: Uint8Array, fileHandle: nu
             return 0;
         }
 
-        const syncData = system.fileSystem.readSync(vfsHandle, readSize);
+        const syncData = system.fileSystem.readSync(vfsHandle, readSize, "park-preferred");
         if (syncData) {
             const writeLen = MemoryGuard.writeBytes(mem, buffer, syncData, "MSS32:_AIL_file_read@12");
             Logger.verbose(LogCategory.SYSTEM, `MSS32: _AIL_file_read@12: Read ${writeLen} bytes`);

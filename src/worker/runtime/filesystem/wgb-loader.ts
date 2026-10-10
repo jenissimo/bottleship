@@ -1,4 +1,4 @@
-import { BlobSource, BufferSource, HttpRangeSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
+import { BlobSource, BufferSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
 import { SabIoSource } from "./sab-io-source";
@@ -32,6 +32,7 @@ function withBlockCache(source: ZipSource): ZipSource {
     // for hot reads; only cold misses then cross to the I/O worker.
     const expensiveSync = source instanceof BlobSource || source instanceof SyncHttpRangeSource || source instanceof SabIoSource;
     if (typeof source.readRangeSync === "function" && !expensiveSync) {
+        (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
         return source;
     }
     const maxBytes = computeAdaptiveMaxBytes(source.size);
@@ -64,6 +65,8 @@ function withBlockCache(source: ZipSource): ZipSource {
     const overSabIo = source instanceof SabIoSource;
     const dev = (globalThis as unknown as { __wgbTune?: { depth?: number; readahead?: number; budgetMB?: number; blockKB?: number } }).__wgbTune;
     const cache = new CachedSource(source, {
+        syncAlignmentBytes: overSabIo ? source.chunkBytes : undefined,
+        recordProfile: overSabIo,
         maxBytes: dev?.budgetMB ? dev.budgetMB * 1024 * 1024 : maxBytes,
         name,
         blockSize: dev?.blockKB ? dev.blockKB * 1024 : undefined,
@@ -71,12 +74,12 @@ function withBlockCache(source: ZipSource): ZipSource {
         prefetchAheadBlocks: overSabIo ? SAB_BLOCKS_PER_CHUNK * 2 : 32,
         prefetchDepthRuns: overSabIo ? 2 : (dev?.depth ?? 4),
     });
-    // Dev-only diagnostic handle: `worker-eval globalThis.__wgbBlockCache.stats()`
-    // exposes the getc↔streaming interplay (blockingFaults vs syncHits/prefetchRuns).
-    if (import.meta.env?.DEV) (globalThis as unknown as { __wgbBlockCache?: ZipSource }).__wgbBlockCache = cache;
+    // The harness exports ordered first touches from this cache in every build.
+    (globalThis as unknown as { __wgbBlockCache?: ZipSource }).__wgbBlockCache = cache;
     return cache;
 }
 import type { QualityConfig } from "../../core/quality-config";
+import type { GraphicsAdapterConfig } from "../../core/graphics-adapter-config";
 
 /** Presentation metadata baseline carried in the bundle (overridable by the editorial catalog / user). */
 export interface WgbMeta {
@@ -109,6 +112,8 @@ export interface WgbManifest {
     rom?: string;
     registry?: string;
     emulator?: {
+        /** Virtual adapter identity used by legacy driver databases. */
+        graphicsAdapter?: GraphicsAdapterConfig;
         osVersion?: {
             major: number;
             minor: number;
@@ -178,6 +183,7 @@ export interface WgbManifest {
          * user preference at load. See src/worker/core/quality-config.ts (QualityConfig).
          */
         quality?: Partial<QualityConfig>;
+        io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy;
         /**
          * Redirect the CD-ROM drive (D:\) to a guest path inside the bundle (typically the install
          * dir holding the CD folders). Run-from-CD games scan D:\ for their data; this aliases
@@ -185,6 +191,11 @@ export interface WgbManifest {
          * Example: "C:\\Discworld Noir" makes D:\CD1 resolve to C:\Discworld Noir\CD1.
          */
         cdPath?: string;
+        /**
+         * The volume label of the disc in D:\. A retail title checks its disc by label
+         * (GetVolumeInformation), so a bundle standing in for one must carry the real label.
+         */
+        cdLabel?: string;
         /**
          * Case-insensitive LoadLibrary* deny-list for per-game driver toggles.
          * Supports names, paths and wildcard patterns ("opengl3z", "opengl3z.dll", "drivers/opengl3/*").
@@ -285,32 +296,7 @@ export class WgbLoader {
         return this.loadFromArchive(archive, onStage);
     }
 
-    static async fromUrl(url: string): Promise<WgbBundle> {
-        // DEV: stream on-demand straight from the dev server via synchronous XHR range
-        // reads — instant start, NO blocking OPFS full-copy (the slow part of opening a
-        // fresh multi-GB bundle). Gated on the server honoring Range: create() probes
-        // for 206, so a server that ignores Range throws and we fall through to staging.
-        if (import.meta.env?.DEV) {
-            // A prior background stage makes repeat dev launches OPFS-fast.
-            const staged = await WgbCache.openSyncSourceForUrl(url);
-            if (staged) {
-                Logger.log(LogCategory.SYSTEM, `WGB: dev cache hit for "${url}" — OPFS sync handle`);
-                return this.fromSource(staged);
-            }
-            // `__wgbForceCache` skips the streaming source so the same bundle can be
-            // A/B'd against the OPFS-staged one — the two differ in their read/prefetch
-            // machinery, which is exactly what a wrong-offset bug hunt needs to isolate.
-            if ((globalThis as { __wgbForceCache?: unknown }).__wgbForceCache === true) {
-                Logger.log(LogCategory.SYSTEM, `WGB: __wgbForceCache — skipping dev sync-XHR, staging "${url}" to OPFS`);
-            } else try {
-                const sync = await SyncHttpRangeSource.create(url);
-                Logger.log(LogCategory.SYSTEM, `WGB: dev-streaming "${url}" via sync-XHR range (no OPFS copy)`);
-                return await this.fromSource(sync);
-            } catch (e) {
-                Logger.log(LogCategory.SYSTEM, `WGB: dev sync-stream unavailable (${(e as Error).message}) — staging to OPFS`);
-            }
-        }
-
+    static async fromUrl(url: string, options?: { preload?: boolean; io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy }): Promise<WgbBundle> {
         // Fastest path: a cached bundle read SYNCHRONOUSLY off disk (no RAM copy).
         const syncSource = await WgbCache.openSyncSourceForUrl(url);
         if (syncSource) return this.fromSource(syncSource);
@@ -319,9 +305,29 @@ export class WgbLoader {
         const cached = await WgbCache.get(url);
         if (cached) return this.fromSource(new BufferSource(cached));
 
-        // Cache miss: start immediately via HTTP range requests, then cache full file in background.
-        Logger.log(LogCategory.SYSTEM, `WGB: range-loading "${url}" (first run, caching in background)`);
-        return this.fromSource(await HttpRangeSource.create(url));
+        const flags = globalThis as { __noSabIo?: boolean; __wgbForceCache?: boolean };
+        if (options?.preload || options?.io?.mode === "preload-full" || flags.__noSabIo || flags.__wgbForceCache) {
+            const staged = await WgbCache.downloadToSyncSource(url, () => {});
+            return staged ? this.fromSource(staged) : this.fromBuffer(await WgbCache.downloadWithProgress(url, () => {}));
+        }
+
+        // On a miss, stream validated ranges and persist them in the I/O worker.
+        Logger.log(LogCategory.SYSTEM, `WGB: range-loading "${url}" (first run)`);
+        try {
+            const io = await SabIoSource.create(url);
+            (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = io;
+            try { return await this.fromSource(io); }
+            catch (error) {
+                (globalThis as { __wgbBlockCache?: CachedSource }).__wgbBlockCache?.close();
+                await io.closeAsync();
+                (globalThis as { __wgbSabIo?: SabIoSource }).__wgbSabIo = undefined;
+                (globalThis as { __wgbBlockCache?: unknown }).__wgbBlockCache = undefined;
+                throw error;
+            }
+        } catch {
+            const staged = await WgbCache.downloadToSyncSource(url, () => {});
+            return staged ? this.fromSource(staged) : this.fromBuffer(await WgbCache.downloadWithProgress(url, () => {}));
+        }
     }
 
     static async fromBuffer(data: Uint8Array): Promise<WgbBundle> {

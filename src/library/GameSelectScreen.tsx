@@ -13,7 +13,6 @@ import {
   PencilSimple,
   X,
   GithubLogo,
-  HandHeart,
 } from "@phosphor-icons/react";
 import type { AddedGame } from "../wgb-library";
 import { cx } from "../ui/cx";
@@ -38,6 +37,7 @@ export interface GameEntry {
    *  Worth it wherever range round-trips are expensive (self-hosted stand behind a
    *  reverse proxy, high-RTT link): one sequential download beats hundreds of reads. */
   preload?: boolean;
+  io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy;
 }
 
 interface GameSelectScreenProps {
@@ -58,27 +58,15 @@ interface GameSelectScreenProps {
 }
 
 type SourceFilter = "all" | "builtin" | "gog" | "local";
-type SortMode = "added" | "played" | "title" | "year";
+type SortMode = "featured" | "title" | "genre" | "year";
 type ViewMode = "grid" | "list";
 
 const SORT_LABELS: Record<SortMode, string> = {
-  added: "Recently added",
-  played: "Recently played",
+  featured: "Featured",
   title: "Title (A–Z)",
-  year: "Year",
+  genre: "Genre",
+  year: "Year (newest first)",
 };
-
-interface SupportLink {
-  label: string;
-  url: string;
-}
-
-// Donation targets shown in the header "Support" menu. Append as more are added.
-const SUPPORT_LINKS: SupportLink[] = [
-  { label: "Ko-fi", url: "https://ko-fi.com/bottleship" },
-  { label: "CloudTips (RU)", url: "https://pay.cloudtips.ru/p/e2362fd1" },
-  { label: "Crypto", url: "https://nowpayments.io/donation/bottleship" },
-];
 
 function isGogAdded(game: AddedGame): boolean {
   const hay = `${game.key} ${game.url}`.toLowerCase();
@@ -103,14 +91,12 @@ export default function GameSelectScreen({
   const [query, setQuery] = React.useState("");
   const [view, setView] = React.useState<ViewMode>("grid");
   const [source, setSource] = React.useState<SourceFilter>("all");
-  const [sort, setSort] = React.useState<SortMode>("added");
+  const [sort, setSort] = React.useState<SortMode>("featured");
   const [srcMenuOpen, setSrcMenuOpen] = React.useState(false);
   const [sortMenuOpen, setSortMenuOpen] = React.useState(false);
-  const [supportMenuOpen, setSupportMenuOpen] = React.useState(false);
   const searchRef = React.useRef<HTMLInputElement>(null);
   const srcWrapRef = React.useRef<HTMLDivElement>(null);
   const sortWrapRef = React.useRef<HTMLDivElement>(null);
-  const supportWrapRef = React.useRef<HTMLDivElement>(null);
 
   const openSettings = onOpenSettings ?? onManageStorage ?? (() => {});
   const totalGames = games.length + addedGames.length;
@@ -128,18 +114,17 @@ export default function GameSelectScreen({
   }, []);
 
   React.useEffect(() => {
-    if (!srcMenuOpen && !sortMenuOpen && !supportMenuOpen) return;
+    if (!srcMenuOpen && !sortMenuOpen) return;
     const onClick = (e: MouseEvent) => {
       const t = e.target as Node;
-      if (!srcWrapRef.current?.contains(t) && !sortWrapRef.current?.contains(t) && !supportWrapRef.current?.contains(t)) {
+      if (!srcWrapRef.current?.contains(t) && !sortWrapRef.current?.contains(t)) {
         setSrcMenuOpen(false);
         setSortMenuOpen(false);
-        setSupportMenuOpen(false);
       }
     };
     document.addEventListener("click", onClick);
     return () => document.removeEventListener("click", onClick);
-  }, [srcMenuOpen, sortMenuOpen, supportMenuOpen]);
+  }, [srcMenuOpen, sortMenuOpen]);
 
   const q = query.trim().toLowerCase();
   const matches = (name: string) => !q || name.toLowerCase().includes(q);
@@ -154,6 +139,17 @@ export default function GameSelectScreen({
           return matches(g.name);
         })
       : [];
+
+  if (sort === "title") {
+    visibleBuiltin.sort((a, b) => a.name.localeCompare(b.name));
+    visibleAdded.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sort === "genre") {
+    visibleBuiltin.sort((a, b) => a.genre.localeCompare(b.genre) || a.name.localeCompare(b.name));
+    visibleAdded.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sort === "year") {
+    visibleBuiltin.sort((a, b) => Number(b.year) - Number(a.year) || a.name.localeCompare(b.name));
+    visibleAdded.sort((a, b) => (b.year ?? 0) - (a.year ?? 0) || a.name.localeCompare(b.name));
+  }
 
   const builtinCount = games.length;
   const gogCount = addedGames.filter(isGogAdded).length;
@@ -170,50 +166,29 @@ export default function GameSelectScreen({
             <span className={s["wordmark"]}>
               Bottle<b>Ship</b>
             </span>
+            <a
+              className={s["brand__version"]}
+              href={`https://github.com/jenissimo/bottleship/releases/tag/v${__APP_VERSION__}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Release notes"
+            >
+              v{__APP_VERSION__}
+            </a>
           </div>
           <span className={s["brand__tag"]}>Run classic Windows games in your browser.</span>
         </div>
         <span className={s["cmd-spacer"]} />
         <div className={s["cmd-actions"]}>
-          <div ref={supportWrapRef} className={s["srcwrap"]}>
-            <button
-              className={cx(bm, "btn", "btn--primary")}
-              onClick={(e) => {
-                e.stopPropagation();
-                setSupportMenuOpen((o) => !o);
-                setSrcMenuOpen(false);
-                setSortMenuOpen(false);
-              }}
-              title="Support BottleShip"
-            >
-              <HandHeart size={16} weight="fill" aria-hidden />
-              Support
-            </button>
-            <div className={cx(s, "menu", "menu--right", supportMenuOpen && "is-open")} style={{ minWidth: 176 }}>
-              <div className={s["menuhead"]}>Support development</div>
-              {SUPPORT_LINKS.map((l) => (
-                <a
-                  key={l.url}
-                  className={s["menuitem"]}
-                  href={l.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={() => setSupportMenuOpen(false)}
-                >
-                  {l.label}
-                </a>
-              ))}
-            </div>
-          </div>
           <a
-            className={ib["iconbtn"]}
+            className={cx(bm, "btn", "btn--primary")}
             href="https://github.com/jenissimo/bottleship"
             target="_blank"
             rel="noopener noreferrer"
-            title="View source on GitHub"
-            aria-label="GitHub repository"
+            title="Contribute to BottleShip on GitHub"
           >
-            <GithubLogo size={18} weight="fill" aria-hidden />
+            <GithubLogo size={16} weight="fill" aria-hidden />
+            Contribute
           </a>
           <button className={ib["iconbtn"]} title="Settings" onClick={() => openSettings()}>
             <GearSix size={19} aria-hidden />

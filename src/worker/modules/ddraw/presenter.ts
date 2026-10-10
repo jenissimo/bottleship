@@ -42,7 +42,6 @@ export class DDrawPresenter implements RenderActive {
     private presentEarlyReturns = 0;
     private lastPresentTime = 0;
     private pendingSurface: DirectDrawSurfaceState | null = null;
-    private pendingMem: Uint8Array | null = null;
     private pendingOptions: { throttle?: boolean } | null = null;
     private pendingResolvers: Array<{ resolve: () => void, reject: (reason?: unknown) => void }> = [];
     private pumpRunning = false;
@@ -114,7 +113,6 @@ export class DDrawPresenter implements RenderActive {
             resolver.reject(new Error("DDrawPresenter reset during pending present"));
         }
         this.pendingSurface = null;
-        this.pendingMem = null;
         this.pendingOptions = null;
         this.pumpRunning = false;
 
@@ -235,7 +233,7 @@ export class DDrawPresenter implements RenderActive {
         }
     }
 
-    async present(surface: DirectDrawSurfaceState, mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
+    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
         this.presentCallCount++;
         return new Promise<void>((resolve, reject) => {
             if (this.pendingSurface || this.pendingResolvers.length > 0) {
@@ -246,7 +244,6 @@ export class DDrawPresenter implements RenderActive {
             }
 
             this.pendingSurface = surface;
-            this.pendingMem = mem;
             this.pendingOptions = options;
             this.pendingResolvers.push({ resolve, reject });
             void this.pumpLoop();
@@ -260,10 +257,10 @@ export class DDrawPresenter implements RenderActive {
             while (true) {
                 const frame = this.dequeuePendingFrame();
                 if (!frame) break;
-                const { surface, mem, options, resolvers } = frame;
+                const { surface, options, resolvers } = frame;
 
                 try {
-                    await this.drawFrame(surface, mem, options);
+                    await this.drawFrame(surface, options);
                     for (const resolver of resolvers) resolver.resolve();
                 } catch (err) {
                     for (const resolver of resolvers) resolver.reject(err);
@@ -279,18 +276,17 @@ export class DDrawPresenter implements RenderActive {
     }
 
     private dequeuePendingFrame() {
-        if (!this.pendingSurface || !this.pendingMem) return null;
+        if (!this.pendingSurface) return null;
         const surface = this.pendingSurface;
-        const mem = this.pendingMem;
         const options = this.pendingOptions;
         const resolvers = this.pendingResolvers.splice(0);
         this.pendingSurface = null;
-        this.pendingMem = null;
         this.pendingOptions = null;
-        return { surface, mem, options, resolvers };
+        return { surface, options, resolvers };
     }
 
-    private async drawFrame(surface: DirectDrawSurfaceState, mem: Uint8Array, options?: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } | null): Promise<void> {
+    private async drawFrame(surface: DirectDrawSurfaceState, options?: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } | null): Promise<void> {
+        let mem = this.process.getCurrentMemory();
         profiler.start("present");
         const presentStart = frameProfiler.startTimer();
         let didPresent = false;
@@ -406,6 +402,8 @@ export class DDrawPresenter implements RenderActive {
                         if (this.counters.frames < 10) Logger.log(LogCategory.DDRAW, `drawFrame: before flushAll frame=${this.counters.frames}`);
                         const _fa = performance.now();
                         await ddrawModule.context.deferredUploadManager.flushAll(queue, mem);
+                        // Other guest threads may grow WASM memory while the upload awaits.
+                        mem = this.process.getCurrentMemory();
                         _pdFlushAll += performance.now() - _fa;
                         if (this.counters.frames < 10) Logger.log(LogCategory.DDRAW, `drawFrame: after flushAll frame=${this.counters.frames}`);
                     }
@@ -902,6 +900,9 @@ export class DDrawPresenter implements RenderActive {
             return;
         }
 
+        // The converter is shared with the executor. Submit its pending commands before
+        // retiring conversion buffers after this presenter's separate upload submission.
+        executor.flush();
         const encoder = device.createCommandEncoder();
         textureConverter.convertToTexture(
             encoder,
@@ -916,7 +917,11 @@ export class DDrawPresenter implements RenderActive {
             "rgba8unorm",
             palette
         );
-        queue.submit([encoder.finish()]);
+        try {
+            queue.submit([encoder.finish()]);
+        } finally {
+            textureConverter.destroyPendingAfterSubmit();
+        }
 
         // Mark as uploaded
         if (isRenderSurface(surface)) {

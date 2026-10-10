@@ -87,7 +87,10 @@ import { createDirectDrawExports } from './directdraw';
 import { createSurfaceExports, registerFastPathSurfaceFunctions } from './surface';
 import { createD3DExports, registerFastPathD3DFunctions } from './d3d/index';
 import { freeExecuteBufferScratch } from './d3d/execute-buffer-impl';
-import { createGPUTexture, convertRGBAToSurface, FormatInfo, readSurfaceStateRGBA } from './gpu-texture-utils';
+import { freeStridedDrawScratch } from './d3d/strided-draw';
+import { createGPUTexture, convertRGBAToSurface, convertSurfaceToRGBA, resolvePalette, FormatInfo, readSurfaceStateRGBA } from './gpu-texture-utils';
+import { isValidAddress } from '../../core/memory/address-guard';
+import { PrimaryScanoutTracker } from './primary-scanout';
 import { resolveBitmapRgba, bitmapHasPixelSource } from '../gdi32/bitmap-resolve';
 import { setAuthorityCpu } from './surface-sync';
 import { startCapture as frameCaptureStart } from './frame-capture';
@@ -169,7 +172,8 @@ export class DDraw implements IModule {
     private process!: Process;
     private context!: DDrawContext;
     private bitmapToSurfaceCache: Map<number, number> = new Map(); // HBITMAP -> Surface address
-    private thrashAutoPresenterUnregister: (() => void) | null = null;
+    private primaryAutoPresenterUnregister: (() => void) | null = null;
+    private primaryScanout = new PrimaryScanoutTracker();
     
     // Frame snapshot tracking for debug panel
     private frameSnapshot: FrameDebugSnapshot = {
@@ -554,7 +558,7 @@ export class DDraw implements IModule {
      *  the authoritative CPU rgbaScratch (zero GPU work, for bitmap textures), else
      *  GPU-reads the texture, de-pads rows, and applies the bgra->rgba swizzle so
      *  the bytes are straight top-down RGBA8 ready for PNG encoding. */
-    async readSurfaceRGBA(ptrLike: number | string, from: "auto" | "gpu" | "scratch" = "auto"): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
+    async readSurfaceRGBA(ptrLike: number | string, from: "auto" | "gpu" | "scratch" | "guest" = "auto"): Promise<{ w: number; h: number; rgba: Uint8Array; source: string } | { err: string }> {
         const want = (typeof ptrLike === "string" ? parseInt(ptrLike, 16) : ptrLike) >>> 0;
         if (!this.context) return { err: "no ddraw context" };
         let state: DirectDrawSurfaceState | null = null;
@@ -565,6 +569,15 @@ export class DDraw implements IModule {
             if (s && (s.surfacePtr >>> 0) === want) { state = s; break; }
         }
         if (!state) return { err: `surface 0x${want.toString(16)} not found` };
+        if (from === "guest") {
+            const mem = this.getMemory(), w = state.width, h = state.height;
+            const pitch = state.pitch || Math.ceil(w * state.format.bpp / 8);
+            if (!want || w <= 0 || h <= 0 || pitch <= 0 || !isValidAddress(mem, want, pitch * h, "r")) {
+                return { err: "invalid guest pixel backing" };
+            }
+            return { w, h, source: "guest", rgba: convertSurfaceToRGBA(mem, want, w, h, pitch, state.format,
+                undefined, undefined, resolvePalette(state)) };
+        }
         return readSurfaceStateRGBA(state, this.context.backend ?? null, () => this.context.executor?.flush(), from);
     }
 
@@ -669,16 +682,12 @@ export class DDraw implements IModule {
         // Register FastPath for high-frequency surface functions
         registerFastPathSurfaceFunctions(process.dispatcher, this.context);
 
-        // Auto-present for THRASH-style renderers that bypass DDraw Flip/Blt.
-        // These renderers hold a write lock on the primary surface indefinitely and never call Unlock/Flip.
-        // Hook into framePacer rAF loop for THRASH-style renderers.
-        // These renderers Lock the primary surface once and render directly into guest memory
-        // without ever calling Unlock or Flip. We present the surface every rAF ourselves.
-        // NOTE: intentionally not unregistered in reset() — must survive system.reset() → loadPeData().
-        if (this.thrashAutoPresenterUnregister !== null) {
-            this.thrashAutoPresenterUnregister();
+        // Directly mapped primary pixels need scanout even without a Flip/Blt call.
+        // Keep the callback across reset: initialize() is not repeated for the next process.
+        if (this.primaryAutoPresenterUnregister !== null) {
+            this.primaryAutoPresenterUnregister();
         }
-        this.thrashAutoPresenterUnregister = framePacer.registerOnFrame(() => {
+        this.primaryAutoPresenterUnregister = framePacer.registerOnFrame(() => {
             const ctx = this.context;
             if (!ctx) return;
             const primaryAddr = ctx.surfaces.primary;
@@ -686,20 +695,17 @@ export class DDraw implements IModule {
             const primaryObj = surfaceAt(ctx.resourceProvider, primaryAddr);
             if (!primaryObj) return;
             const state = primaryObj.getState();
-            // Gate on write-lock: normal games release the lock before Flip
-            // → activeLeaseId=undefined → this path is skipped entirely for them.
-            if (state.activeLeaseId === undefined) return;
             if (!isRenderSurface(state)) return;
-            // THRASH renderers write new pixels each frame without Unlock,
-            // so uploadRGB565SurfaceToGPU's gpuDirty=false reset would otherwise stop presentation.
-            // BUT: if GPU has authority (Flip did GPU→GPU copy), guest memory is stale —
-            // calling setAuthorityCpu would mark gpuDirty=true, causing the presenter to
-            // upload stale/black CPU data over the valid GPU texture → black frame flicker.
+            const locked = state.activeLeaseId !== undefined;
+            const indexedCpu = state.format.bpp === 8 && state.everLocked && state.mode === 'CPU'
+                && state.gpuWrittenVersion !== state.version;
+            if (!locked && !indexedCpu) return;
+            const mem = this.getMemory();
+            if (!locked && !this.primaryScanout.changed(mem, state)) return;
+            // A GPU-authored primary has a stale guest copy; never promote that copy.
             if (state.gpuWrittenVersion !== state.version) {
                 setAuthorityCpu(state);
             }
-            const mem = this.getMemory();
-            if (!mem) return;
             void ctx.presenter.present(state, mem, { throttle: true });
         });
     }
@@ -824,16 +830,13 @@ export class DDraw implements IModule {
     }
 
     reset(): void {
-        // NOTE: thrashAutoPresenterUnregister is intentionally NOT called here.
-        // The auto-presenter callback is registered once in initialize() and must survive
-        // system.reset() → DDraw.reset() → loadPeData() flow. After reset, the callback
-        // harmlessly returns early (primaryAddr=0, no lease) until the primary is initialized.
-        // Unregistering here would leave frameCallbacks empty since initialize() is not
-        // re-called after system.reset().
+        // The scanout callback survives reset; its previous surface snapshot must not.
+        this.primaryScanout.reset();
 
         if (this.context) {
             this.flushDeferredSurfacePtrFrees();
             freeExecuteBufferScratch(this.context.process.memory);
+            freeStridedDrawScratch(this.context.process.memory);
 
             // Reset primary/backbuffer surfaces
             this.context.surfaces.primary = 0;

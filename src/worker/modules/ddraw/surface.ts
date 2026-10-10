@@ -2611,6 +2611,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                 setAuthorityCpu(nextState);
                 nextAddr = nextState.attachedSurfaceAddr;
             }
+            if (!context.suppressPresent) void context.presenter?.present(state, mem, { throttle: true });
         }
 
         Logger.log(LogCategory.DDRAW, `SetPalette: Linked palette handle=0x${paletteObj.handle.toString(16)} to surface=0x${thisPtr.toString(16)}${isTexture ? ' [TEXTURE]' : ''}`);

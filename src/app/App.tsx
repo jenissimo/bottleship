@@ -621,7 +621,7 @@ export default function App() {
 
     (window as any).loadApp?.(
       selectedGame.id === "dev" ? loadParam : selectedGame.wgbUrl,
-      { preload: selectedGame.preload === true },
+      { preload: selectedGame.preload === true, io: selectedGame.io },
     );
     // launchBlocked, not its inputs: the deployment policy resolves asynchronously and
     // may be the LAST of them to arrive. Depending on the others only, the one run that
@@ -2249,7 +2249,7 @@ export default function App() {
 
     // opts.preload: download the whole bundle to OPFS before starting instead of
     // streaming it on demand (catalog entry `preload`) — see the worker's URL path.
-    (window as any).loadApp = async (path: string, opts?: { preload?: boolean; args?: string }) => {
+    (window as any).loadApp = async (path: string, opts?: { preload?: boolean; args?: string; io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy }) => {
       console.log(`BottleShip: Loading App from ${path}`);
       rotateLogFile(bundleLogName(path));
       ensurePersistentStorageRequested();
@@ -2275,7 +2275,7 @@ export default function App() {
       const lower = path.toLowerCase();
       if (lower.endsWith(".wgb")) {
         setLoadingProgress({ phase: "loading", percent: 0, label: "" });
-        globalWorker.postMessage({ type: "load_bundle", url: path, preload: opts?.preload === true, args: opts?.args });
+        globalWorker.postMessage({ type: "load_bundle", url: path, preload: opts?.preload === true, io: opts?.io, args: opts?.args });
         return;
       }
       try {
@@ -3243,6 +3243,20 @@ export default function App() {
         </div>
       </header>
 
+      {displayGame!.id !== "dev" && displayGame!.gogUrl && !hasImportedBundle && (
+        <div className={cx(s, "gog-upgrade", isFullscreen && "gog-upgrade--hidden")}>
+          <div><strong>Own the full game on GOG?</strong> Drop your offline installer here and play your copy.
+            <small>Include setup.exe and every setup-*.bin part. Download your WGB or free cached files in Settings → Storage.</small>
+          </div>
+          <button className={s["emu-topbar-btn"]} disabled={isLoadingApp} onClick={() => installerInputRef.current?.click()}>Import full game</button>
+          <a className={s["emu-info-gog"]} href={displayGame!.gogUrl} target="_blank" rel="noopener noreferrer">Get it on GOG →</a>
+          <input ref={installerInputRef} type="file" accept=".exe,.bin" multiple hidden onChange={(e) => {
+            if (e.target.files?.length) handleDroppedFiles(e.target.files);
+            e.target.value = "";
+          }} />
+        </div>
+      )}
+
       {/* Dev panel */}
       {devPanelOpen && (
         <DevPanel
@@ -3379,21 +3393,6 @@ export default function App() {
           <span className={s["emu-info-hints"]}>F11 · Fullscreen</span>
         </div>
       )}
-
-      {displayGame!.id !== "dev" && displayGame!.gogUrl && !hasImportedBundle && (
-        <div className={s["gog-upgrade"]}>
-          <div><strong>Own the full game on GOG?</strong> Drop your offline installer here and play your copy.
-            <small>Include setup.exe and every setup-*.bin part. Download your WGB or free cached files in Settings → Storage.</small>
-          </div>
-          <button className={s["emu-topbar-btn"]} disabled={isLoadingApp} onClick={() => installerInputRef.current?.click()}>Import full game</button>
-          <a className={s["emu-info-gog"]} href={displayGame!.gogUrl} target="_blank" rel="noopener noreferrer">Get it on GOG →</a>
-          <input ref={installerInputRef} type="file" accept=".exe,.bin" multiple hidden onChange={(e) => {
-            if (e.target.files?.length) handleDroppedFiles(e.target.files);
-            e.target.value = "";
-          }} />
-        </div>
-      )}
-
 
       {messageBox && (
         <MessageBoxModal messageBox={messageBox} onClose={() => setMessageBox(null)} />

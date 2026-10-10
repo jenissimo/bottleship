@@ -58,7 +58,7 @@ import {
     handleSystemControlKey,
     takePendingControlNotification,
 } from './control-interaction';
-import { isDDrawExclusiveFullscreen } from '../ddraw/gdi-visibility';
+import { ddrawOwnsScreen } from '../ddraw/gdi-visibility';
 import { paintTraceEnabled, logBeginEndPaint } from './paint-trace';
 import { repaintChildControls } from './controls';
 import { restampOwnedPopups } from './paint-hooks';
@@ -351,7 +351,9 @@ function shouldSuppressWindowOverlay(hWnd: number, window: WindowInfo): boolean 
     const ddraw = System.getInstance().ddrawContext;
     if (!ddraw || ddraw.cooperative.hwnd !== hWnd) return false;
     if (isDialogLikeWindow(window)) return false;
-    return isDDrawExclusiveFullscreen(ddraw);
+    // Exclusive rights alone put nothing on the display: until a primary surface exists the
+    // window's own GDI output (its class-brush erase included) is what the screen shows.
+    return ddrawOwnsScreen(ddraw);
 }
 
 /** Seed `hdc` from the nearest ancestor that has a retained client image covering it. */
@@ -1085,7 +1087,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classId,
             title: windowName,
             style: dwStyle,
-            exStyle: dwExStyle,
+            exStyle: System.getInstance().windowManager.getWindow(hwnd)?.exStyle ?? dwExStyle,
             x: resolvedX,
             y: resolvedY,
             width: size.width,

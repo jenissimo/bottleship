@@ -3,7 +3,7 @@
  */
 import type { ThunkImplementation } from "../../core/thunking/thunk-dispatcher";
 import { Logger, LogCategory } from "../../core/logger";
-import { DD_OK, E_FAIL, E_POINTER, E_NOINTERFACE, DDERR_INVALIDPARAMS } from "./constants";
+import { DD_OK, E_FAIL, E_POINTER, E_NOINTERFACE, DDERR_INVALIDPARAMS, DDSCAPS_PRIMARYSURFACE } from "./constants";
 import { bytesToGuid } from "./helpers";
 import { DirectDrawPaletteObject, DirectDrawClipperObject, DirectDrawSurfaceObject } from "./com-objects";
 import { setAuthorityCpu } from "./surface-sync";
@@ -19,13 +19,17 @@ export function createDirectDrawPaletteClipperExports(
 ): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
-    const markSurfacesDirtyByPalette = (paletteHandle: number): void => {
+    const markSurfacesDirtyByPalette = (paletteHandle: number, mem: Uint8Array): void => {
         const allComObjects = context.resourceProvider.getAllComObjects();
         for (const obj of allComObjects) {
             if (!(obj instanceof DirectDrawSurfaceObject)) continue;
             const state = obj.getState();
             if (state.paletteHandle === paletteHandle) {
                 setAuthorityCpu(state);
+                // Palette animation changes scanout even when the application never flips.
+                if ((state.caps & DDSCAPS_PRIMARYSURFACE) && !context.suppressPresent) {
+                    void context.presenter?.present(state, mem, { throttle: true });
+                }
             }
         }
     };
@@ -58,7 +62,7 @@ export function createDirectDrawPaletteClipperExports(
                 return DDERR_INVALIDPARAMS;
             }
             obj.setEntries(dwStartingEntry, dwCount, lpEntries, mem);
-            markSurfacesDirtyByPalette(obj.handle);
+            markSurfacesDirtyByPalette(obj.handle, mem);
         }
 
         Logger.log(LogCategory.DDRAW, `IDirectDrawPalette_SetEntries: this=0x${thisPtr.toString(16)} start=${dwStartingEntry} count=${dwCount}`);

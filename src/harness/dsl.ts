@@ -50,6 +50,10 @@ export class HarnessChain {
         this.steps.push({ cmd, args: ser(args) });
         return this;
     }
+    /** Address the source-owning parent even after a launcher promotes its child. */
+    callRoot(cmd: string, ...args: unknown[]): this {
+        return this.pushWithOpts(cmd, args, { target: "root" });
+    }
     private push(cmd: string, args: unknown[], label?: string): this {
         this.steps.push({ cmd, args: ser(args), label });
         return this;
@@ -74,7 +78,7 @@ export class HarnessChain {
      *  need the composited canvas itself — `shot` hands back a PNG, not pixels. */
     evalPage(expr: string, timeoutMs?: number): this { return this.push("evalPage", [expr, timeoutMs]); }
     /** Load a WGB. By default reloads the page first (fresh worker + code); pass `{ reload: false }` to skip. */
-    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean; args?: string }): this {
+    openWgb(idOrUrl: string, opts?: { hle?: boolean; logOnly?: boolean; reload?: boolean; args?: string; preload?: boolean; io?: import("@bottleship/formats/wgb/io-profile").WgbIoPolicy }): this {
         const reload = opts?.reload !== false;
         if (reload) this.push("reload", []);
         return this.push("openWgb", [idOrUrl, { ...opts, reload: false }]);
@@ -333,6 +337,9 @@ export class HarnessChain {
     }): this { return this.push("screenPixels", [opts]); }
     /** Snapshot the screen for a later screenChangeSince() per-pixel compare. */
     screenMark(): this { return this.push("screenMark", []); }
+    counterRate(address: number, opts?: { sampleMs?: number; intervalMs?: number; bits?: 16 | 32 }): this {
+        return this.pushTimed("counterRate", [address, opts], (opts?.sampleMs ?? 3000) + 5_000);
+    }
     /** WHICH pixels changed since screenMark(). `allow` names the rects that were
      *  SUPPOSED to repaint: `outside.changed` is the scope finding, and each allow
      *  rect's own count is the positive control that the transition happened at all. */

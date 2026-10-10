@@ -1,3 +1,4 @@
+import { wgbEtag } from "./deploy/wgb-etag";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
@@ -10,6 +11,7 @@ import type { ServerResponse } from "node:http";
 import { isUnc, listWgb, underAnyRoot, wgbListRoots, wgbRoots } from "./tools/wgb-roots";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const APP_VERSION: string = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8")).version;
 
 // Truthful build id for the About panel: Cloudflare Pages exposes the deployed
 // commit as CF_PAGES_COMMIT_SHA; locally fall back to `git rev-parse`. Baked in
@@ -116,7 +118,7 @@ function serveWgbFromDisk(): Plugin {
     configureServer(server) {
       // Registered in the body (not a returned post-hook) so it runs BEFORE Vite's
       // internal static/SPA-fallback middlewares and reliably intercepts the route.
-      server.middlewares.use((req, res, next) => {
+      server.middlewares.use(async (req, res, next) => {
         if (!req.url || !req.url.startsWith(ROUTE)) return next();
         for (const [k, v] of Object.entries(coopCoepHeaders)) res.setHeader(k, v);
         // The dev bundle browser (src/debug/WgbBrowser.tsx): what is loadable off disk
@@ -153,7 +155,13 @@ function serveWgbFromDisk(): Plugin {
         } catch { res.statusCode = 404; res.end(`not found: ${file}`); return; }
         res.setHeader("Accept-Ranges", "bytes");
         res.setHeader("Content-Type", "application/octet-stream");
-        const range = req.headers["range"];
+        let etag: string;
+        try { etag = await wgbEtag(file); }
+        catch { res.statusCode = 503; res.end("bundle changed while hashing"); return; }
+        res.setHeader("ETag", etag);
+        res.setHeader("Cache-Control", "no-cache");
+        const validator = req.headers["if-range"];
+        const range = !validator || validator === etag ? req.headers["range"] : undefined;
         const m = typeof range === "string" ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
         if (m) {
           let start: number, end: number;
@@ -203,6 +211,7 @@ function copyPublicDirExceptApps(): Plugin {
 export default defineConfig({
   define: {
     __BUILD_SHA__: JSON.stringify(BUILD_SHA),
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
   },
   plugins: [
     audioWorkletPlugin(),

@@ -39,6 +39,10 @@ export const msvfw32Module: ModuleDescriptor = {
         makeFunc("VideoForWindowsVersion", 0),
         makeFunc("ord_2", 0, { ordinal: 2 }),
 
+        // HWND hwndParent, HINSTANCE hInstance, DWORD dwStyle, LPCTSTR szFile.
+        makeFunc("MCIWndCreateA", 4, { onUnimplemented: "zero" }),
+        makeFunc("MCIWndCreateW", 4, { onUnimplemented: "zero" }),
+
         // DrawDib API
         makeFunc("DrawDibOpen", 0),              // → HDRAWDIB
         makeFunc("DrawDibClose", 1),             // hdd

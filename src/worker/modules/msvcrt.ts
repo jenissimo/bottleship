@@ -11,6 +11,7 @@ import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatc
 import { Logger, LogCategory } from "../core/logger";
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
+import { shutdownProcess } from "./kernel32/process/process";
 import { VfsFileHandle } from "../runtime/filesystem/vfs";
 import {
     fpuGetST, fpuPop, fpuPush, fpuSetST0,
@@ -358,6 +359,7 @@ export class Msvcrt implements IModule {
             this.vsnwprintf(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
 
         exports["_open"] = (ctx, mem, args) => this.open(args[0] ?? 0, args[1] ?? 0);
+        exports["_wopen"] = (ctx, mem, args) => this.open(args[0] ?? 0, args[1] ?? 0, true);
         exports["_sopen"] = (ctx, mem, args) => this.sopen(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0, args[3] ?? 0);
         exports["_close"] = (ctx, mem, args) => this.close(args[0] ?? 0);
         exports["_chsize"] = (ctx, mem, args) => this.chsize(args[0] ?? 0, args[1] ?? 0);
@@ -1340,20 +1342,10 @@ export class Msvcrt implements IModule {
 
     /** Terminating half of exit(), shared with the atexit chain's terminal step. */
     private beginProcessExit(exitCode: number): void {
-        const system = System.getInstance();
-        system.isExiting = true;
-        system.scheduler.exitThread(exitCode);
-        // C exit() ends the PROCESS, so the host gets the same notification ExitProcess
-        // sends — behind the same durability barrier. This is the path the atexit chain
-        // ends on, i.e. exactly where a game's settings write has just happened and is
-        // still sitting in the overlay's buffers.
-        let exitFault: unknown;
-        try {
-            exitFault = system.buildProcessExitReport(exitCode);
-        } catch (e) {
-            Logger.warn(LogCategory.SYSTEM, `msvcrt.exit: exit report failed: ${e}`);
-        }
-        system.postProcessExitWhenDurable({ exitCode: exitCode >>> 0, fault: exitFault });
+        // CRT termination ends every thread in this process, while children survive.
+        // Reuse ExitProcess's hand-off and durability barrier after the CRT's own
+        // callback chain; ending only the calling thread loses a launcher's live child.
+        shutdownProcess(exitCode);
     }
 
     private exitProcess(code: number): ThunkResult {
@@ -1767,7 +1759,7 @@ export class Msvcrt implements IModule {
             if (LARGE_IO_TRACE_ENABLED) Logger.verbose(LogCategory.KERNEL32, `fscanf("${stream.handle.path}") fmt=${JSON.stringify(format)} assigned=${assigned} consumed=${consumed}`);
             return eof && assigned === 0 ? -1 : assigned;
         };
-        const sync = vfs.readSync(stream.handle, CHUNK);
+        const sync = vfs.readSync(stream.handle, CHUNK, "park-preferred");
         if (sync !== null) return apply(sync);
         return (async (): Promise<ThunkResult> => {
             try { const b = await vfs.read(stream.handle, CHUNK); return { value: apply(b) >>> 0 }; }
@@ -1792,8 +1784,10 @@ export class Msvcrt implements IModule {
         return (flags & mask) !== 0 ? 1 : 0;
     }
 
-    private open(pathPtr: number, oflag: number): number {
-        const path = this.readCString(pathPtr, 512);
+    private open(pathPtr: number, oflag: number, wide = false): number {
+        // _wopen differs only in the filename encoding; flags and fd ownership
+        // follow the same path as _open (MSVC CRT open-wopen contract).
+        const path = wide ? this.readWString(pathPtr, 512) : this.readCString(pathPtr, 512);
         if (!path) {
             this.setErrno(2);
             return -1;
@@ -1866,7 +1860,7 @@ export class Msvcrt implements IModule {
         }
         const vfs = System.getInstance().fileSystem;
         const want = count >>> 0;
-        const synced = vfs.readIntoSync(handle, mem, buffer, want);
+        const synced = vfs.readIntoSync(handle, mem, buffer, want, "park-preferred");
         if (synced !== null) {
             return synced;
         }
@@ -1878,7 +1872,7 @@ export class Msvcrt implements IModule {
                 return { value: -1 };
             }
             try {
-                const bytesRead = await vfs.readInto(handle, freshMem, buffer, want);
+                const bytesRead = await vfs.readInto(handle, () => Mem.getView()!, buffer, want);
                 if (bytesRead < 0) {
                     this.setErrno(5);
                     return { value: -1 };
@@ -3095,7 +3089,7 @@ export class Msvcrt implements IModule {
         if (totalBytes === 0) return 0;
         const vfs = System.getInstance().fileSystem;
         const startPos = stream.handle.position;
-        const synced = vfs.readIntoSync(stream.handle, mem, bufPtr, totalBytes);
+        const synced = vfs.readIntoSync(stream.handle, mem, bufPtr, totalBytes, "park-preferred");
         if (synced !== null) {
             if (LARGE_IO_TRACE_ENABLED) traceLargeRead('fread', stream.handle.path, stream.fd, startPos, totalBytes, synced);
             return Math.floor(synced / elemSize);
@@ -3105,7 +3099,7 @@ export class Msvcrt implements IModule {
             const freshMem = Mem.getView();
             if (!freshMem) return { value: 0 };
             try {
-                const bytesRead = await vfs.readInto(stream.handle, freshMem, bufPtr, totalBytes);
+                const bytesRead = await vfs.readInto(stream.handle, () => Mem.getView()!, bufPtr, totalBytes);
                 if (LARGE_IO_TRACE_ENABLED) traceLargeRead('fread', stream.handle.path, stream.fd, startPos, totalBytes, bytesRead);
                 return { value: Math.floor(bytesRead / elemSize) };
             } catch {
@@ -3205,7 +3199,7 @@ export class Msvcrt implements IModule {
         // closure below, which resumes the loop to completion.
         let step: IteratorResult<void, number> = loop.next(EMPTY_BYTES);
         while (!step.done) {
-            const data = vfs.readSync(stream.handle, 1);
+            const data = vfs.readSync(stream.handle, 1, "park-preferred");
             if (data === null) {
                 // Not resident — finish the SAME loop on the async thunk path.
                 return (async (): Promise<ThunkResult> => {
@@ -3457,13 +3451,13 @@ export class Msvcrt implements IModule {
                     return Mem.readUint8(bufPtr) ?? -1;             // return first byte
                 };
                 const view = Mem.getView();
-                const sync = view ? vfs.readIntoSync(stream.handle, view, bufPtr, Msvcrt.GETC_CHUNK) : null;
+                const sync = view ? vfs.readIntoSync(stream.handle, view, bufPtr, Msvcrt.GETC_CHUNK, "park-preferred") : null;
                 if (sync !== null) return fillFromChunk(sync);
                 return (async (): Promise<ThunkResult> => {
                     const m = Mem.getView();
                     if (!m) return { value: 0xffffffff };
                     try {
-                        const n = await vfs.readInto(stream.handle, m, bufPtr, Msvcrt.GETC_CHUNK);
+                        const n = await vfs.readInto(stream.handle, () => Mem.getView()!, bufPtr, Msvcrt.GETC_CHUNK);
                         return { value: fillFromChunk(n) >>> 0 };
                     } catch { return { value: 0xffffffff }; }
                 })();
@@ -3471,7 +3465,7 @@ export class Msvcrt implements IModule {
             // malloc failed — fall through to single-byte read below.
         }
 
-        const data = vfs.readSync(stream.handle, 1);
+        const data = vfs.readSync(stream.handle, 1, "park-preferred");
         // null is "not resident — await it", NOT end of file. Collapsing the two reports
         // EOF on the first cold block of a streamed bundle.
         if (data === null) {

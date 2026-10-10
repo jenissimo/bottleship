@@ -1,4 +1,5 @@
-import { WgbManifest, WgbWriteFileSpec } from "../runtime/filesystem/wgb-loader";
+import type { WgbManifest, WgbWriteFileSpec } from "../runtime/filesystem/wgb-loader";
+import { normalizeGraphicsAdapter, type GraphicsAdapterConfig } from "./graphics-adapter-config";
 import { Logger, LogCategory } from "./logger";
 import {
     EMU_MEMORY_SIZE,
@@ -270,6 +271,7 @@ export class EmulatorConfig {
 
     // OS Version configuration
     public osVersion = { ...DEFAULT_OS_VERSION };
+    public graphicsAdapter: GraphicsAdapterConfig | null = null;
 
     // Screen resolution configuration
     public screenResolution = { ...DEFAULT_SCREEN_RESOLUTION };
@@ -428,6 +430,11 @@ export class EmulatorConfig {
 
         const config = manifest.emulator;
 
+        if (config.graphicsAdapter !== undefined) {
+            this.graphicsAdapter = normalizeGraphicsAdapter(config.graphicsAdapter);
+            if (!this.graphicsAdapter) Logger.warn(LogCategory.SYSTEM, 'EmulatorConfig: Invalid graphics adapter identity');
+        }
+
         // Apply OS version override
         if (config.osVersion) {
             this.osVersion = {
@@ -530,7 +537,10 @@ export class EmulatorConfig {
                 this.d3dCaps.wMaxTextureBlendStages = Math.max(1, Math.min(8, config.d3dCaps.wMaxTextureBlendStages));
             }
             if (config.d3dCaps.wMaxSimultaneousTextures !== undefined) {
-                this.d3dCaps.wMaxSimultaneousTextures = Math.max(1, Math.min(8, config.d3dCaps.wMaxSimultaneousTextures));
+                this.d3dCaps.wMaxSimultaneousTextures = Math.max(1, Math.min(
+                    EMU_D3D_DEFAULT_CAPS.wMaxSimultaneousTextures,
+                    config.d3dCaps.wMaxSimultaneousTextures
+                ));
             }
             Logger.log(LogCategory.SYSTEM, "EmulatorConfig: D3D caps updated from manifest");
         }
@@ -679,6 +689,7 @@ export class EmulatorConfig {
      */
     reset(): void {
         this.osVersion = { ...DEFAULT_OS_VERSION };
+        this.graphicsAdapter = null;
         this.screenResolution = { ...DEFAULT_SCREEN_RESOLUTION };
         this.supportedResolutions = [...DEFAULT_DISPLAY_MODES];
         this.memory = {
@@ -709,6 +720,12 @@ export class EmulatorConfig {
         // applyFromManifest for exactly this reason.
         this.qualityManifest = null;
         this.recomputeQuality();
+    }
+
+    /** True when the reported OS is major.minor or later (Vista = 6.0); Win9x is 4.x. */
+    osAtLeast(major: number, minor: number): boolean {
+        const v = this.osVersion;
+        return v.major > major || (v.major === major && v.minor >= minor);
     }
 
     /**

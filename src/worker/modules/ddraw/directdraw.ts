@@ -18,11 +18,7 @@ import { framePacer } from "../../core/frame-pacer";
 import { initReturnPtr } from "../../backends/webgpu/shared/dx-com-helpers";
 import { getSurfaceFormatLayout } from "../../backends/webgpu/shared/texture-formats";
 import {
-    DEFAULT_VENDOR_ID,
-    DEFAULT_DEVICE_ID,
-    DEFAULT_DRIVER_VERSION,
-    DEFAULT_DEVICE_DESC,
-    DEFAULT_DRIVER_DLL,
+    writeAdapterIdentifier8,
 } from "../../backends/webgpu/shared/dx-adapter-identifier";
 import {
     DD_OK,
@@ -35,10 +31,7 @@ import {
     CKCAPS_COMBINED,
     DDFXCAPS_COMBINED,
     DDPCAPS_COMBINED,
-    DDDEVICEIDENTIFIER_SIZE,
     DDDEVICEIDENTIFIER2_SIZE,
-    DDDEVICEIDENTIFIER2_OFFSETS,
-    DDDEVICEIDENTIFIER2_STRING_SIZE,
     DDSD_CAPS,
     DDSD_LPSURFACE,
     DDSD_PITCH,
@@ -651,12 +644,14 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
         // CPU-First: Deterministic mode assignment
         // mode="GPU_ONLY" ONLY for pure 3D render targets (DDSCAPS_3DDEVICE)
         // mode="CPU" for everything else (default)
-        // NOTE: Primary/backbuffer with 3DDEVICE must stay GPU_ONLY — D3D renders to GPU texture
+        // Indexed surfaces must retain palette indices in guest memory: an RGBA GPU clear
+        // cannot be read back as indices before a subsequent CPU color-key blit.
+        // NOTE: True-color primary/backbuffer with 3DDEVICE must stay GPU_ONLY — D3D renders to GPU texture
         // and switching to CPU mode causes Flip to overwrite D3D content with zeros (black screen).
         // If a hybrid engine needs Lock(), the existing demotion logic in
         // IDirectDrawSurface7_Lock handles GPU_ONLY→CPU transition automatically.
         const initialMode: "CPU" | "GPU_ONLY" =
-            (isD3dRenderTarget && !isSystemMemory) ? "GPU_ONLY" : "CPU";
+            (isD3dRenderTarget && !isSystemMemory && normalizedDesc.pixelFormat!.bpp !== 8) ? "GPU_ONLY" : "CPU";
 
         // Create RenderSurface (mutable surface for rendering, backbuffers, etc.)
         // CPU-First architecture: surfacePtr always authoritative, GPU is ephemeral cache
@@ -2325,7 +2320,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
 
         Logger.log(LogCategory.SYSTEM, `IDirectDraw7_GetDeviceIdentifier: this=0x${thisPtr.toString(16)}, lpdddi=0x${lpdddi.toString(16)}, flags=0x${dwFlags.toString(16)}, ret=0x${retAddr.toString(16)}`);
 
-        if (!lpdddi || !isValidAddress(mem, lpdddi, DDDEVICEIDENTIFIER2_SIZE)) {
+        if (!lpdddi || !isValidAddress(mem, lpdddi, DDDEVICEIDENTIFIER2_SIZE, 'rw')) {
             Logger.warn(LogCategory.SYSTEM, `GetDeviceIdentifier: Invalid lpdddi pointer 0x${lpdddi.toString(16)}`);
             return E_POINTER;
         }
@@ -2346,51 +2341,7 @@ export const createDirectDrawExports = (context: DDrawContext): Record<string, T
             Logger.warn(LogCategory.SYSTEM, `GetDeviceIdentifier: Buffer 0x${lpdddi.toString(16)} is in high memory (COM/thunk area) - potential overlap!`);
         }
 
-        // Write minimal device info - matching the "Driver" and "Display" pattern we see
-        const writeString = (offset: number, str: string, maxLen: number) => {
-            const bytes = new TextEncoder().encode(str);
-            const toWrite = Math.min(bytes.length, maxLen - 1);
-            for (let i = 0; i < toWrite; i++) {
-                mem[lpdddi + offset + i] = bytes[i];
-            }
-            mem[lpdddi + offset + toWrite] = 0; // Null terminator
-        };
-
-        // Zero the entire structure first
-        mem.fill(0, lpdddi, lpdddi + DDDEVICEIDENTIFIER2_SIZE);
-
-        // The SAME adapter D3D8/D3D9 report — see dx-adapter-identifier.ts. dwVendorId +
-        // dwDeviceId is what an app matches against its own table of known cards to switch
-        // work-arounds on and off; a pair that never shipped (the old ATI 0x1002 / 0x9999)
-        // matches nothing, and a period-correct card would be worse still — it would ARM
-        // work-arounds written for that silicon's bugs, which this renderer does not have.
-        // An adapter newer than the title is the case with real evidence behind it: it is
-        // exactly what these games get on a modern Windows machine, where they run.
-        // szDriver is the display driver's file name, not a category word.
-        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDriver, DEFAULT_DRIVER_DLL, DDDEVICEIDENTIFIER2_STRING_SIZE);
-        writeString(DDDEVICEIDENTIFIER2_OFFSETS.szDescription, DEFAULT_DEVICE_DESC, DDDEVICEIDENTIFIER2_STRING_SIZE);
-
-        // liDriverVersion (LARGE_INTEGER = 8 bytes)
-        view.setBigUint64(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.liDriverVersion, DEFAULT_DRIVER_VERSION, true);
-
-        // dwVendorId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwVendorId, DEFAULT_VENDOR_ID, true);
-        // dwDeviceId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwDeviceId, DEFAULT_DEVICE_ID, true);
-        // dwSubSysId
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwSubSysId, 0, true);
-        // dwRevision
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwRevision, 1, true);
-
-        // guidDeviceIdentifier (16 bytes) - fill with a recognizable pattern
-        for (let i = 0; i < 16; i++) {
-            mem[lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.guidDeviceIdentifier + i] = i;
-        }
-
-        // dwWHQLLevel
-        view.setUint32(lpdddi + DDDEVICEIDENTIFIER2_OFFSETS.dwWHQLLevel, 0, true);
-
-        return DD_OK;
+        return writeAdapterIdentifier8(mem, lpdddi, dwFlags) ? DD_OK : E_POINTER;
     };
 
     exports["IDirectDraw7_GetScanLine"] = (ctx, mem, args) => {

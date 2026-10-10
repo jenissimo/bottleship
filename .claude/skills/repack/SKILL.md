@@ -18,7 +18,7 @@ don't reach for a binary.
 |---|---|---|
 | `data1.hdr` + `data1.cab`… | InstallShield Cabinet (`ISc(`, v5/v6+) — most 1998–2003 game installers | `bun tools/unshield-extract.ts <data1.hdr> <out> [--list]` |
 | `setup.exe` (WinZip-SFX / "PackageForTheWeb") | a ZIP or CAB **wrapping** an InstallShield disk set | unwrap outer with `cab-extract`/zip → then `unshield-extract` the inner `data1.hdr` |
-| `.cab` (`MSCF`), incl. appended to an SFX stub | Microsoft Cabinet (NONE + MSZIP) | `bun tools/cab-extract.ts` |
+| `.cab` (`MSCF`), incl. appended to an SFX stub | Microsoft Cabinet (NONE + MSZIP + LZX) | `bun tools/cab-extract.ts` |
 | GOG `setup_*.exe` / Inno Setup | Inno headers (LZMA1/2) | end-to-end: `bun tools/gog-to-wgb.ts`; inspect: `bun tools/inno-inspect.ts` |
 | `.iso` / `.bin`+`.cue` | ISO9660 / disc image | `bun tools/iso-to-wgb.ts`; `bun tools/bin2iso.ts` |
 | `.arc` | FreeArc (srep+LZMA) repacks | `packages/formats/src/freearc/` |
