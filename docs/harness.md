@@ -20,6 +20,20 @@ silently otherwise), opens the bare emulator page, and waits until everything is
 
 In the browser console the same capability is on `window.__BS__.harness`.
 
+`BS_CHROME_PROFILE` selects the Chrome profile directory on a cold launch. Put it on
+a drive with ample free space: OPFS lives inside the profile, and browser eviction
+under disk pressure can remove saves together with cached bundles. `BS_CDP_PORT`
+selects the debug port when an isolated browser is needed. For example, in PowerShell:
+
+```powershell
+$env:BS_CHROME_PROFILE = 'G:/BottleShip/harness/hl2-profile'
+$env:BS_CDP_PORT = '9340'
+bun tools/harness.ts up
+```
+
+An already-running browser keeps its existing profile; crash inspection uses
+`BS_CHROME_PROFILE` too.
+
 ## Several games at once
 
 Bringing a game up is mostly *waiting* — a bundle is gigabytes, a boot is minutes — so the harness

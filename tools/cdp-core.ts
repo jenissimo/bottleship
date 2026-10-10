@@ -23,6 +23,7 @@ import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
+import { attachEmulatorWorker } from "./cdp-worker-session";
 
 export const DEFAULT_CDP_PORT = Number(process.env.BS_CDP_PORT ?? 9333);
 /** BS_DEV_URL / BS_SIDECAR_PORT point the tools at a SECOND dev stack (an isolated
@@ -37,9 +38,9 @@ const CHROME_PATH = IS_MAC
     : "C:/Program Files/Google/Chrome/Application/chrome.exe";
 /** Where a detached Chrome's stdout/stderr land — see launchChrome. */
 export const CHROME_STDIO_DIR = `${process.cwd()}/logs/chrome`;
-const DEFAULT_PROFILE = IS_MAC
+const DEFAULT_PROFILE = process.env.BS_CHROME_PROFILE ?? (IS_MAC
     ? `${process.env.HOME}/.bottleship-cdp-profile`
-    : `${process.cwd()}/tmp/cdp-profile`;
+    : `${process.cwd()}/tmp/cdp-profile`);
 
 export interface CdpTarget {
     id: string;
@@ -180,7 +181,7 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
         mkdirSync(CHROME_STDIO_DIR, { recursive: true });
         const psArgs = args.map((a) => `'${a}'`).join(",");
         Bun.spawnSync(["powershell", "-NoProfile", "-Command",
-            `Start-Process -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}` +
+            `Start-Process -WindowStyle Hidden -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}` +
             ` -RedirectStandardOutput '${CHROME_STDIO_DIR}/stdout.log'` +
             ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`]);
     }
@@ -309,6 +310,13 @@ export class CdpSession {
         const ls = this.listeners.get(method) ?? [];
         ls.push(cb);
         this.listeners.set(method, ls);
+    }
+
+    off(method: string, cb: (params: any, sessionId?: string) => void): void {
+        const ls = this.listeners.get(method);
+        if (!ls) return;
+        const index = ls.indexOf(cb);
+        if (index !== -1) ls.splice(index, 1);
     }
 
     close(): void {
@@ -488,37 +496,9 @@ export async function setPointerLock(session: CdpSession, engage: boolean, opts:
 
 /** Evaluate an expression in the WORKER context via the flattened auto-attach dance. */
 export async function workerEval(session: CdpSession, expr: string, opts: { timeoutMs?: number } = {}): Promise<any> {
-    let workerSession: string | undefined;
-    const got = new Promise<string>((resolve) => {
-        session.on("Target.attachedToTarget", (params) => {
-            if (params?.targetInfo?.type === "worker") {
-                workerSession = params.sessionId;
-                resolve(params.sessionId);
-            }
-        });
-    });
-    await session.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
-    await session.send("Target.setDiscoverTargets", { discover: true }).catch(() => { /* optional */ });
-
-    // AutoAttach only fires for workers created *after* enable — attach existing ones too.
-    if (!workerSession) {
-        try {
-            const targets = await session.send("Target.getTargets");
-            for (const t of targets.result?.targetInfos ?? []) {
-                if (t.type !== "worker") continue;
-                const attach = await session.send("Target.attachToTarget", { targetId: t.targetId, flatten: true });
-                workerSession = attach.result?.sessionId ?? workerSession;
-                if (workerSession) break;
-            }
-        } catch { /* fall through to race */ }
-    }
-
-    const sessionId = workerSession ?? (await Promise.race([
-        got,
-        new Promise<string>((_res, rej) => setTimeout(() => rej(new Error("no worker attached in 15s")), 15_000)),
-    ]));
-    await session.send("Runtime.enable", {}, sessionId).catch(() => { /* idempotent */ });
     const timeoutMs = opts.timeoutMs ?? 30_000;
+    const sessionId = await attachEmulatorWorker(session);
+    await session.send("Runtime.enable", {}, sessionId, { timeoutMs });
     const r = await Promise.race([
         session.send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true }, sessionId),
         Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
@@ -527,36 +507,6 @@ export async function workerEval(session: CdpSession, expr: string, opts: { time
     const res = (r as any).result;
     if (res?.exceptionDetails) throw new Error(`worker eval exception: ${res.exceptionDetails.text}`);
     return res?.result?.value ?? res?.result;
-}
-
-/** Attach to the worker target and return its sessionId (auto-attach + existing-target fallback). */
-async function attachWorkerSession(session: CdpSession): Promise<string> {
-    let workerSession: string | undefined;
-    const got = new Promise<string>((resolve) => {
-        session.on("Target.attachedToTarget", (params) => {
-            if (params?.targetInfo?.type === "worker") {
-                workerSession = params.sessionId;
-                resolve(params.sessionId);
-            }
-        });
-    });
-    await session.send("Target.setAutoAttach", { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
-    await session.send("Target.setDiscoverTargets", { discover: true }).catch(() => { /* optional */ });
-    if (!workerSession) {
-        try {
-            const targets = await session.send("Target.getTargets");
-            for (const t of targets.result?.targetInfos ?? []) {
-                if (t.type !== "worker") continue;
-                const attach = await session.send("Target.attachToTarget", { targetId: t.targetId, flatten: true });
-                workerSession = attach.result?.sessionId ?? workerSession;
-                if (workerSession) break;
-            }
-        } catch { /* fall through to race */ }
-    }
-    return workerSession ?? (await Promise.race([
-        got,
-        new Promise<string>((_res, rej) => setTimeout(() => rej(new Error("no worker attached in 15s")), 15_000)),
-    ]));
 }
 
 export interface WorkerStackFrame {
@@ -571,25 +521,27 @@ export interface WorkerStackFrame {
  * when the worker's event loop is starved by a synchronous loop (V8 pauses via
  * interrupt at loop back-edges / wasm). Takes `samples` stacks `intervalMs` apart
  * so a hot loop shows up as the repeated frame. Resumes the worker after each sample.
+ * delayMs attaches before a reproducible stall, while the target still answers.
  */
 export async function workerStack(
     session: CdpSession,
-    opts: { samples?: number; intervalMs?: number; timeoutMs?: number } = {},
+    opts: { samples?: number; intervalMs?: number; timeoutMs?: number; delayMs?: number } = {},
 ): Promise<WorkerStackFrame[][]> {
     const samples = opts.samples ?? 3;
     const intervalMs = opts.intervalMs ?? 250;
     const timeoutMs = opts.timeoutMs ?? 10_000;
-    const sessionId = await attachWorkerSession(session);
-    await session.send("Debugger.enable", {}, sessionId);
+    const sessionId = await attachEmulatorWorker(session, timeoutMs);
+    await session.send("Debugger.enable", {}, sessionId, { timeoutMs });
     const out: WorkerStackFrame[][] = [];
     try {
+        if (opts.delayMs) await Bun.sleep(opts.delayMs);
         for (let i = 0; i < samples; i++) {
             const paused = new Promise<any>((resolve) => {
                 session.on("Debugger.paused", (params, sid) => {
                     if (sid === sessionId) resolve(params);
                 });
             });
-            await session.send("Debugger.pause", {}, sessionId);
+            await session.send("Debugger.pause", {}, sessionId, { timeoutMs });
             const p = await Promise.race([
                 paused,
                 Bun.sleep(timeoutMs).then(() => null),
@@ -604,12 +556,12 @@ export async function workerStack(
                 line: (f.location?.lineNumber ?? 0) + 1,
                 column: f.location?.columnNumber ?? 0,
             })));
-            await session.send("Debugger.resume", {}, sessionId);
+            await session.send("Debugger.resume", {}, sessionId, { timeoutMs });
             if (i < samples - 1) await Bun.sleep(intervalMs);
         }
     } finally {
-        await session.send("Debugger.resume", {}, sessionId).catch(() => { /* already running */ });
-        await session.send("Debugger.disable", {}, sessionId).catch(() => { /* */ });
+        await session.send("Debugger.resume", {}, sessionId, { timeoutMs }).catch(() => { /* already running */ });
+        await session.send("Debugger.disable", {}, sessionId, { timeoutMs }).catch(() => { /* */ });
     }
     return out;
 }
@@ -637,7 +589,7 @@ export async function workerHeapSample(
     opts: { seconds?: number; intervalBytes?: number; top?: number; majorOnly?: boolean } = {},
 ): Promise<{ totalBytesPerSec: number; heapUsedMB: number | null; heapTotalMB: number | null; sites: HeapSampleSite[] }> {
     const seconds = opts.seconds ?? 5;
-    const sessionId = await attachWorkerSession(session);
+    const sessionId = await attachEmulatorWorker(session);
     await session.send("HeapProfiler.enable", {}, sessionId);
     await session.send("HeapProfiler.startSampling", {
         samplingInterval: opts.intervalBytes ?? 16_384,
@@ -696,7 +648,7 @@ export async function workerHeapSnapshotSummary(
     opts: { top?: number } = {},
 ): Promise<{ totalMB: number; rows: Array<{ type: string; name: string; count: number; selfMB: number }>;
     stringPrefixes: Array<{ prefix: string; count: number; MB: number }> }> {
-    const sessionId = await attachWorkerSession(session);
+    const sessionId = await attachEmulatorWorker(session);
     await session.send("HeapProfiler.enable", {}, sessionId);
     const chunks: string[] = [];
     session.on("HeapProfiler.addHeapSnapshotChunk", (params, sid) => {

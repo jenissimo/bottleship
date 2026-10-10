@@ -28,8 +28,9 @@
  * into a guest-side answer cannot be reported as a crossing. `cold:true` is the old single-turn
  * measurement, labelled interpreted. `__guestRet` is a plain guest RET — the floor a crossing
  * is compared against. N keeps a run near 1 ms: a pin defers a switch for 8 ms at most, and a
- * switch inside the loop is reported as an error rather than priced. Refused while paused: a
- * trap taken under pause ends the slice.
+ * switch inside the loop is reported as an error rather than priced. Requires a single live
+ * guest thread: the scheduler's bounded pin cannot protect the synchronous CPU snapshot from
+ * a peer taking over. Refused while paused: a trap taken under pause ends the slice.
  */
 
 import type { HarnessService } from "../service";
@@ -149,6 +150,9 @@ const loopPages = new Map<string, { page: number; written: boolean; turns: numbe
 
 function crossingCost(opts: { calls: CostCall[]; n?: number; reps?: number; cold?: boolean }) {
     if (sys().isPaused) throw new HarnessError("crossingCost: resume first — a trap taken under pause ends the slice", HarnessErrorCode.BAD_ARGS);
+    if (sys().scheduler.getThreadCount() !== 1) {
+        throw new HarnessError("crossingCost: requires a single live guest thread — use tools/harness/fixtures/crossings-pe.ts", HarnessErrorCode.BAD_ARGS);
+    }
     const d = dispatcher();
     const c = liveCpu();
     const mem = toPlainGuestMemory(guestMem());
@@ -224,7 +228,8 @@ function crossingCost(opts: { calls: CostCall[]; n?: number; reps?: number; cold
             const loopMeta = () => metaOf(ex, loopAt >>> 12);
             if (!opts.cold && !loopMeta()) {
                 // Hot enough to compile; the module is instantiated after this turn returns.
-                for (let i = 0; i < 4; i++) run(20000);
+                // Each pinned run must stay short even when the target dispatches to JS.
+                for (let i = 0; i < 4; i++) run(Math.min(nCap, 500));
                 if (++lp.turns >= 60) throw new HarnessError(`crossingCost ${call.name}: loop page never compiled after ${lp.turns} turns`, HarnessErrorCode.INTERNAL);
                 out.push({ name: call.name, state: "warming", turns: lp.turns });
                 warming++;

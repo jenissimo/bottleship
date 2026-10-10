@@ -57,6 +57,10 @@ export interface CrashReport {
     accessAddress: bigint | null;
     crashThread: string;
     committedGiB: number;
+    /** Chrome's Windows OOM parameters, as decimal bytes to preserve 64-bit values. */
+    oomAllocationBytes: string | null;
+    oomCommitLimitBytes: string | null;
+    oomAvailableCommitBytes: string | null;
     /** module+RVA — the same crash twice produces the same string. */
     fingerprint: string;
 }
@@ -98,6 +102,9 @@ export function parseMinidump(path: string): CrashReport | null {
     let exceptionCode = 0, crashTid = 0;
     let faultModule: string | null = null, faultRva: number | null = null;
     let accessKind: CrashReport["accessKind"] = null, accessAddress: bigint | null = null;
+    let oomAllocationBytes: string | null = null;
+    let oomCommitLimitBytes: string | null = null;
+    let oomAvailableCommitBytes: string | null = null;
     const ex = streams.get(STREAM_EXCEPTION);
     if (ex) {
         crashTid = d.readUInt32LE(ex.rva);
@@ -106,6 +113,16 @@ export function parseMinidump(path: string): CrashReport | null {
         const nParams = d.readUInt32LE(ex.rva + 32);
         const m = moduleAt(exAddr);
         if (m) { faultModule = m.name; faultRva = Number(exAddr - m.base); }
+        if (exceptionCode === 0xe0000008 && nParams >= 1) {
+            const parameter = (index: number, zeroIsUnknown = true) => {
+                if (nParams <= index) return null;
+                const value = d.readBigUInt64LE(ex.rva + 40 + index * 8);
+                return (zeroIsUnknown && value === 0n) || value === 0xffffffffffffffffn ? null : value.toString();
+            };
+            oomAllocationBytes = parameter(0);
+            oomCommitLimitBytes = parameter(1);
+            oomAvailableCommitBytes = parameter(2, false);
+        }
         if (exceptionCode === 0xc0000005 && nParams >= 2) {
             const kind = d.readBigUInt64LE(ex.rva + 40);
             accessKind = kind === 0n ? "read" : kind === 1n ? "write" : "execute";
@@ -160,11 +177,12 @@ export function parseMinidump(path: string): CrashReport | null {
         accessAddress,
         crashThread,
         committedGiB: +(Number(committed) / 2 ** 30).toFixed(2),
+        oomAllocationBytes, oomCommitLimitBytes, oomAvailableCommitBytes,
         fingerprint: faultModule ? `${faultModule}+0x${(faultRva ?? 0).toString(16)}` : `code:0x${exceptionCode.toString(16)}`,
     };
 }
 
-export function crashpadDir(profile = `${process.cwd()}/tmp/cdp-profile`): string {
+export function crashpadDir(profile = process.env.BS_CHROME_PROFILE ?? `${process.cwd()}/tmp/cdp-profile`): string {
     return join(profile, "Crashpad", "reports");
 }
 
@@ -184,6 +202,7 @@ export function listCrashes(opts: { dir?: string; since?: Date } = {}): CrashRep
 
 export function formatCrash(c: CrashReport): string {
     const addr = c.accessAddress === null ? "" : ` ${c.accessKind} @ 0x${c.accessAddress.toString(16)}`;
+    const oom = c.oomAllocationBytes === null ? "" : `; requested ${c.oomAllocationBytes} bytes`;
     return `${c.when.toISOString().slice(11, 19)}  ${c.processType.padEnd(9)} ${c.exceptionName}${addr}\n` +
-        `            at ${c.fingerprint}  thread "${c.crashThread}"  committed ${c.committedGiB} GiB  (${c.file.slice(0, 8)})`;
+        `            at ${c.fingerprint}  thread "${c.crashThread}"  committed ${c.committedGiB} GiB${oom}  (${c.file.slice(0, 8)})`;
 }
