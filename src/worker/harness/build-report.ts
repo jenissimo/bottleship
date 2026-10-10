@@ -272,6 +272,8 @@ export interface HarnessReport {
      *  argCount..."); the rest are latent stack-cleanup corruption. Fix in the
      *  module's `*.api.ts` (or tools/reference/win32) — see the crash reason. */
     unknownArgCounts: Array<{ api: string; aliasedFrom: string | null; count: number }>;
+    /** Failed runtime DLL loads, even when the guest catches the error and exits cleanly. */
+    dllLoadFailures: ReturnType<typeof loadDiagnostics.listDllFailures>;
 }
 
 function readStackWords(esp: number, count = 4): string[] {
@@ -460,5 +462,6 @@ export function buildHarnessReport(esp?: number): HarnessReport {
             aliasedFrom: u.aliasedFrom,
             count: u.count,
         })),
+        dllLoadFailures: loadDiagnostics.listDllFailures(),
     };
 }

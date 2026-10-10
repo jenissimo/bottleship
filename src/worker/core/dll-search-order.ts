@@ -132,6 +132,8 @@ export interface DllSearchContext {
     currentDir: string;
     /** LoadLibraryEx dwFlags (0 for implicit loads). */
     loadFlags?: number;
+    /** Top-level DLL's directory, used only while resolving its import closure. */
+    loadDir?: string;
 }
 
 /**
@@ -157,6 +159,7 @@ export function dllSearchDirectories(ctx: DllSearchContext): string[] {
         if (flags & LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) {
             flags |= LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_SYSTEM32;
         }
+        if ((flags & LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR) && ctx.loadDir) push(ctx.loadDir);
         if (flags & LOAD_LIBRARY_SEARCH_APPLICATION_DIR) push(appDir);
         if (flags & LOAD_LIBRARY_SEARCH_USER_DIRS) {
             for (const u of state.userDirs) push(u.dir);
@@ -166,7 +169,7 @@ export function dllSearchDirectories(ctx: DllSearchContext): string[] {
         return dirs;
     }
 
-    push(appDir);
+    push((flags & LOAD_WITH_ALTERED_SEARCH_PATH) && ctx.loadDir ? ctx.loadDir : appDir);
     if (state.dllDirectory === null) push(ctx.currentDir);
     else if (state.dllDirectory !== '') push(state.dllDirectory);
     push('C:\\');

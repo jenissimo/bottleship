@@ -640,7 +640,7 @@ export class PELoader {
      * loaded", and only the "path" case actually reads a file. Keeping the decision in one
      * place is what stops the sync predicate and the loader drifting apart.
      */
-    private resolveLoadTarget(dllName: string, loadFlags = 0):
+    private resolveLoadTarget(dllName: string, loadFlags = 0, searchDirectories?: readonly string[]):
         | { kind: "none" }
         | { kind: "existing"; module: LoadedPEModule }
         | { kind: "path"; path: string; nameLower: string } {
@@ -675,7 +675,7 @@ export class PELoader {
         }
 
         // Find DLL in VFS
-        const dllPath = this.findDllPath(dllNameLower, loadFlags);
+        const dllPath = this.findDllPath(dllNameLower, loadFlags, searchDirectories);
         if (!dllPath) return { kind: "none" };
         return { kind: "path", path: dllPath, nameLower: dllNameLower };
     }
@@ -694,12 +694,17 @@ export class PELoader {
     }
 
     /** Load a real DLL from VFS. Returns the module, or null if it is not there. */
-    async loadDll(dllName: string, invokeDllMain: boolean = true, loadFlags = 0): Promise<LoadedPEModule | null> {
-        const target = this.resolveLoadTarget(dllName, loadFlags);
+    async loadDll(dllName: string, invokeDllMain: boolean = true, loadFlags = 0,
+        searchDirectories?: readonly string[]): Promise<LoadedPEModule | null> {
+        const target = this.resolveLoadTarget(dllName, loadFlags, searchDirectories);
         if (target.kind === "none") return null;
         if (target.kind === "existing") return target.module;
         if (!this.vfs || !this.moduleRegistry) return null;
         const { path: dllPath, nameLower: dllNameLower } = target;
+        // Keep this call's search order across awaits and recursive imports; another
+        // guest thread may load a DLL with a different directory at the same time.
+        const dependencyDirectories = searchDirectories
+            ?? this.getDllSearchDirectories(loadFlags, dllPath.slice(0, dllPath.lastIndexOf('\\') + 1));
 
         Logger.log(LogCategory.SYSTEM, `[PE] Loading real DLL: ${dllName} from VFS path: ${dllPath}`);
 
@@ -832,7 +837,7 @@ export class PELoader {
             if (importDirRVA !== 0) {
                 Logger.warn(LogCategory.SYSTEM,
                     `[PE] === Processing imports for NATIVE DLL "${dllNameLower}" (base=0x${baseAddress.toString(16)}) ===`);
-                await this.processImports(baseAddress, importDirRVA);
+                await this.processImports(baseAddress, importDirRVA, dependencyDirectories);
             }
 
             // Real-DLL export patchers (HLE replacements for a library the game ships), AFTER
@@ -869,6 +874,8 @@ export class PELoader {
             // resolvable, or a later LoadLibrary returns its base with an unpatched
             // IAT and the guest jumps wild. Memory stays allocated (harmless leak);
             // the registry entry must go so subsequent loads report NOT FOUND.
+            loadDiagnostics.noteDllFailure({ name: dllName, path: dllPath,
+                searchDirectories: dependencyDirectories, reason: String(e) });
             if (registered) {
                 this.moduleRegistry.unregister(dllNameLower);
                 this.pendingDllInits = this.pendingDllInits.filter(p => p.name !== dllNameLower);
@@ -1248,7 +1255,7 @@ export class PELoader {
     /** VFS path of a DLL by the Windows search order, or null. Public because HLE
      *  modules that shadow a shipped DLL still need the file (e.g. to read its
      *  version resource and match that build's ABI). */
-    findDllPath(dllName: string, loadFlags = 0): string | null {
+    findDllPath(dllName: string, loadFlags = 0, searchDirectories?: readonly string[]): string | null {
         if (!this.vfs) return null;
 
         const dllNameLower = dllName.toLowerCase();
@@ -1280,19 +1287,8 @@ export class PELoader {
             return null;
         }
 
-        // Get application directory from executable path
-        const system = System.getInstance();
-        const exePath = system.executablePath;
-        const lastSlash = exePath.lastIndexOf('\\');
-        const appDir = lastSlash > 2 ? exePath.slice(0, lastSlash + 1) : 'C:\\';
-
-        // Current-directory slot: games commonly cd into a driver/plugin subfolder and then
-        // LoadLibrary a bare name expecting it to resolve there (Max Payne's
-        // e2driver\*_driver_mfc.dll). SetDllDirectory / LOAD_LIBRARY_SEARCH_* reshape the
-        // list — see dll-search-order.ts.
-        const searchPaths = dllSearchDirectories({
-            appDir, currentDir: this.vfs.currentDir, loadFlags,
-        }).map((dir) => `${dir}${dllFileName}`);
+        const searchPaths = (searchDirectories ?? this.getDllSearchDirectories(loadFlags))
+            .map((dir) => `${dir}${dllFileName}`);
 
         Logger.verbose(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): searching in ${searchPaths.join(', ')}`);
 
@@ -1306,6 +1302,13 @@ export class PELoader {
 
         Logger.verbose(LogCategory.SYSTEM, `[PE] findDllPath("${dllName}"): NOT FOUND`);
         return null;
+    }
+
+    private getDllSearchDirectories(loadFlags = 0, loadDir?: string): string[] {
+        const exePath = System.getInstance().executablePath;
+        const lastSlash = exePath.lastIndexOf('\\');
+        const appDir = lastSlash > 2 ? exePath.slice(0, lastSlash + 1) : 'C:\\';
+        return dllSearchDirectories({ appDir, currentDir: this.vfs?.currentDir ?? 'C:\\', loadFlags, loadDir });
     }
 
     /**
@@ -1323,7 +1326,8 @@ export class PELoader {
         return entry?.kind === 'file' ? entry.path : null;
     }
 
-    private async processImports(baseAddress: number, importDirRVA: number): Promise<void> {
+    private async processImports(baseAddress: number, importDirRVA: number,
+        searchDirectories: readonly string[] = this.getDllSearchDirectories()): Promise<void> {
         let descriptorAddr = baseAddress + importDirRVA;
         const allDependencies: Array<{
             dllName: string;
@@ -1348,7 +1352,7 @@ export class PELoader {
 
             const { dllName, aliasTarget, isThunked } = resolveImportBinding(dllNameRaw, functions, {
                 hasThunkedModule: (n) => this.apiRegistry.hasModule(n),
-                findDllPath: (n) => this.findDllPath(n),
+                findDllPath: (n) => this.findDllPath(n, 0, searchDirectories),
                 appDirRule: (raw) => findDllRule(EmulatorConfig.getInstance().appDirDlls, raw),
                 isUnderSystemDirectory: (p) => isUnderSystemDirectory(normalizeDllPathToken(p)),
                 exportFacts: (thunked, f) => f.name !== undefined
@@ -1784,7 +1788,7 @@ export class PELoader {
                 }
 
                 Logger.warn(LogCategory.SYSTEM, `[PE] Loading real DLL from VFS: "${dllName}" (${functions.length} imports)`);
-                const dllModule = await this.loadDll(dllName);
+                const dllModule = await this.loadDll(dllName, true, 0, searchDirectories);
 
                 if (dllModule) {
                     isRealDll = true;

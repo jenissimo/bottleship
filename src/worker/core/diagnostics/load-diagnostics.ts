@@ -4,9 +4,10 @@
  * ring, stubs) is live-process telemetry and is uniformly empty when an import
  * can't be thunked, so a PE-load failure otherwise reads as "nothing happened".
  *
- * Two records, both survivors of the teardown that follows:
+ * Records survive the teardown that follows:
  *  - unknown-argcount imports: the API surface gap that PRECEDES the fatal throw
  *    (the missing name is the actionable part; the throw only names the first one),
+ *  - DLL load failures and their search context,
  *  - the fatal crash payload itself, including crashes raised with no CPU context.
  */
 
@@ -26,9 +27,26 @@ export interface LoadFailure {
     lastThunk: string;
 }
 
+export interface DllLoadFailure {
+    name: string;
+    path: string;
+    searchDirectories: readonly string[];
+    reason: string;
+}
+
 class LoadDiagnostics {
     private unknown = new Map<string, UnknownArgCount>();
     private failure: LoadFailure | null = null;
+    private dllFailures: DllLoadFailure[] = [];
+
+    noteDllFailure(failure: DllLoadFailure): void {
+        if (this.dllFailures.length === 16) this.dllFailures.shift();
+        this.dllFailures.push({ ...failure, searchDirectories: [...failure.searchDirectories] });
+    }
+
+    listDllFailures(): DllLoadFailure[] {
+        return this.dllFailures.slice();
+    }
 
     /** One import the thunk generator has no arity for. Deduped; cheap to repeat. */
     noteUnknownArgCount(dll: string, func: string, aliasedFrom?: string | null): void {
@@ -57,6 +75,7 @@ class LoadDiagnostics {
     reset(): void {
         this.unknown.clear();
         this.failure = null;
+        this.dllFailures.length = 0;
     }
 }
 
