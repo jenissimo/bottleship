@@ -332,6 +332,7 @@ export const user32Module: ModuleDescriptor = {
         // String functions
         makeFunc("CharNextA", 1),
         makeFunc("CharNextW", 1),
+        makeFunc("CharPrevA", 2),
         makeFunc("CharPrevW", 2),
         makeFunc("CharUpperBuffA", 2),
         // Additional user32 imports from newer runtimes/launchers
