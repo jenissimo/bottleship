@@ -9,13 +9,13 @@
  * (`../installshield`) then consumes — so a PFTW `.exe` chains
  * MSCF → InstallShield → game files.
  *
- * Compression support: NONE (0) and MSZIP (1) — the two PFTW/InstallShield-web
- * emit. MSZIP is per-block: each CFDATA block is `'CK'` + a raw-DEFLATE stream
- * whose preset dictionary is the previous block's last 32 KiB of output. That
- * cross-block dictionary is why decoding needs a dictionary-capable inflater
- * (injected via `inflateBlock`; the platform `DecompressionStream` alone cannot
- * preset a dictionary). QUANTUM (2) and LZX (3) are rejected — not used by this
- * installer family.
+ * Compression support: NONE (0), MSZIP (1) and LZX (3). MSZIP is per-block:
+ * each CFDATA block is `'CK'` + a raw-DEFLATE stream whose preset dictionary is
+ * the previous block's last 32 KiB of output. That cross-block dictionary is why
+ * decoding needs a dictionary-capable inflater (injected via `inflateBlock`; the
+ * platform `DecompressionStream` alone cannot preset a dictionary). LZX is one
+ * stream per folder (`./lzx.ts`), which is what Microsoft's own self-extracting
+ * setups (IExpress, the Microsoft Games installer) emit. QUANTUM (2) is rejected.
  *
  * Layout reference (Microsoft `[MS-CAB]` / cabinet.h):
  *   CFHEADER  sig"MSCF" res1 u32, cbCabinet u32, res2 u32, coffFiles u32, res3 u32,
@@ -27,6 +27,10 @@
  *             attribs u16, szName (NUL-terminated; UTF-8 when attrib 0x80 set)
  *   CFDATA    csum u32, cbData u16, cbUncomp u16 [, abReserve …], ab[cbData]
  */
+
+import { decompressLzx, LZX_FRAME_SIZE } from "./lzx";
+
+export { decompressLzx } from "./lzx";
 
 const CAB_SIGNATURE = 0x4643534d; // "MSCF" little-endian
 
@@ -48,7 +52,7 @@ export interface CabFolder {
     coffCabStart: number;
     /** Number of CFDATA blocks in this folder. */
     cCFData: number;
-    /** Compression type (low nibble is the method; high bits are LZX window). */
+    /** Compression type (low nibble is the method; bits 8..12 are the LZX window exponent). */
     typeCompress: number;
 }
 
@@ -181,6 +185,35 @@ export function findCabinet(buf: Uint8Array): number | null {
     return null;
 }
 
+/**
+ * LZX folder: the CFDATA payloads are one continuous stream, each block one
+ * 32 KiB frame of it (the folder's last block may be short).
+ */
+function decompressLzxFolder(buf: Uint8Array, info: CabInfo, folder: CabFolder): Uint8Array {
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const blocks: Uint8Array[] = [];
+    let compressed = 0;
+    let uncompressed = 0;
+    let dp = info.cabOffset + folder.coffCabStart;
+    for (let b = 0; b < folder.cCFData; b++) {
+        const cbData = dv.getUint16(dp + 4, true);
+        const cbUncomp = dv.getUint16(dp + 6, true);
+        const dataStart = dp + 8 + info.dataReserve;
+        if (dataStart + cbData > buf.length) throw new Error("LZX cabinet folder is truncated");
+        if (cbUncomp > LZX_FRAME_SIZE || (cbUncomp !== LZX_FRAME_SIZE && b !== folder.cCFData - 1)) {
+            throw new Error(`LZX cabinet block ${b} holds ${cbUncomp} bytes, not one ${LZX_FRAME_SIZE}-byte frame`);
+        }
+        blocks.push(buf.subarray(dataStart, dataStart + cbData));
+        compressed += cbData;
+        uncompressed += cbUncomp;
+        dp = dataStart + cbData;
+    }
+    const stream = new Uint8Array(compressed);
+    let o = 0;
+    for (const block of blocks) { stream.set(block, o); o += block.length; }
+    return decompressLzx(stream, (folder.typeCompress >> 8) & 0x1f, uncompressed);
+}
+
 /** Decompress one folder's CFDATA chain into a single contiguous buffer. */
 async function decompressFolder(
     buf: Uint8Array,
@@ -190,8 +223,9 @@ async function decompressFolder(
 ): Promise<Uint8Array> {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const method = folder.typeCompress & 0x0f;
+    if (method === COMPRESS_LZX) return decompressLzxFolder(buf, info, folder);
     if (method !== COMPRESS_NONE && method !== COMPRESS_MSZIP) {
-        throw new Error(`unsupported cabinet compression type ${method} (only NONE/MSZIP)`);
+        throw new Error(`unsupported cabinet compression type ${method} (only NONE/MSZIP/LZX)`);
     }
     if (method === COMPRESS_MSZIP && !opts.inflateBlock) {
         throw new Error("MSZIP cabinet needs a dictionary-capable inflater (opts.inflateBlock)");

@@ -517,7 +517,7 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
   and works headless (CI, cron, no root). Coverage:
     - zip/          — store + deflate ZIP (also the `.wgb` container).
     - cab/          — Microsoft Cabinet (`MSCF`), incl. one APPENDED to a Win32 SFX stub
-                      ("PackageForTheWeb" self-extractors). CLI: `tools/cab-extract.ts`. NONE + MSZIP.
+                      ("PackageForTheWeb" self-extractors). CLI: `tools/cab-extract.ts`. NONE + MSZIP + LZX.
     - installshield/— InstallShield Cabinet (`ISc(`, v5 AND v6+) — the `data1.hdr` + `data{N}.cab`
                       layout behind most 1998–2003 game installers. Handles chunked raw-deflate,
                       de-obfuscation, LINK_PREV dedup, volume-split files, MD5 verify.
