@@ -26,6 +26,12 @@ test('cursor mutations reach the WASM GetCursorPos page before the next tick', (
         // A key/button publication must not undo the guest warp with old host coordinates.
         im.injectKey(0x41, true);
         expect(cached()).toEqual([512, 384]);
+        im.injectMoveAtScreen(145, 297);
+        expect(cached()).toEqual([145, 297]);
+        expect(im.getMouseState()).toMatchObject({x: 145, y: 297});
+        im.moveCursorTo(512, 384);
+        im.injectMoveAtScreen(145, 297);
+        expect(cached()).toEqual([145, 297]);
         setCursorClipRect({left: 10, top: 20, right: 100, bottom: 200});
         im.setMousePosition(500, -10);
         expect(cached()).toEqual([99, 20]);

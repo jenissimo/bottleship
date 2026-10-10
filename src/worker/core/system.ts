@@ -389,7 +389,10 @@ export class System {
     private constructor() {
         this.windowManager = new WindowManager();
         this.gdiContext = new GDIContext();
-        this.inputManager = new InputManager(this.windowManager);
+        this.inputManager = new InputManager(this.windowManager, () => this.scheduler.getCurrentThreadId());
+        this.windowManager.setKeyStateCallback((packed, threadId) => {
+            this.inputManager.applyMessageKeyState(packed, threadId || this.scheduler.getCurrentThreadId());
+        });
         this.services = new RuntimeServices();
         this.videoRouting = new VideoRoutingService(this.services.render);
         this.fileSystem = new VirtualFileSystem();

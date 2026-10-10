@@ -427,6 +427,7 @@ export class MessageQueue {
 
     // Input poll callback - called when waiting for messages
     private inputPollCallback: (() => void) | null = null;
+    private keyStateCallback: ((packed: Uint8Array, threadId: number) => void) | null = null;
 
     // Last dequeued message coordinates/time for GetMessagePos/GetMessageTime
     lastDequeuedPtX = 0;
@@ -434,10 +435,15 @@ export class MessageQueue {
     lastDequeuedTime = 0;
 
     /** Track coordinates/time from the last dequeued message. */
-    private trackDequeued(msg: Message): void {
+    private trackDequeued(msg: Message, callerThreadId: number): void {
         this.lastDequeuedPtX = msg.ptX ?? 0;
         this.lastDequeuedPtY = msg.ptY ?? 0;
         this.lastDequeuedTime = msg.time ?? 0;
+        if (msg.keyStatePacked) this.keyStateCallback?.(msg.keyStatePacked, callerThreadId || msg.targetThreadId || 0);
+    }
+
+    setKeyStateCallback(callback: (packed: Uint8Array, threadId: number) => void): void {
+        this.keyStateCallback = callback;
     }
 
     /**
@@ -561,7 +567,7 @@ export class MessageQueue {
             ? this.inputQueue.dequeue(callerThreadId)
             : this.inputQueue.dequeueFiltered(msgMin, msgMax, callerThreadId);
         if (queued) {
-            this.trackDequeued(queued);
+            this.trackDequeued(queued, callerThreadId);
             return queued;
         }
 
@@ -585,7 +591,7 @@ export class MessageQueue {
                     keyStatePacked: pending.keyStatePacked,
                     extraInfo: pending.extraInfo,
                 };
-                this.trackDequeued(msg);
+                this.trackDequeued(msg, callerThreadId);
                 return msg;
             }
         }
@@ -603,7 +609,7 @@ export class MessageQueue {
                     keyStatePacked: pending.keyStatePacked,
                     extraInfo: pending.extraInfo,
                 };
-                this.trackDequeued(msg);
+                this.trackDequeued(msg, callerThreadId);
                 return msg;
             }
         }
@@ -629,7 +635,7 @@ export class MessageQueue {
                     keyStatePacked: pending.keyStatePacked,
                     extraInfo: pending.extraInfo,
                 };
-                this.trackDequeued(msg);
+                this.trackDequeued(msg, callerThreadId);
                 return msg;
             }
         }

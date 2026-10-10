@@ -861,6 +861,10 @@ export class WindowManager {
         this.messageQueue.setInputPollCallback(callback);
     }
 
+    setKeyStateCallback(callback: (packed: Uint8Array, threadId: number) => void): void {
+        this.messageQueue.setKeyStateCallback(callback);
+    }
+
     /**
      * Wake up all waiting message handlers (e.g., when pausing)
      */

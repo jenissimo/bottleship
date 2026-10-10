@@ -7,6 +7,7 @@
 import { type HleDispatcher, ThunkImplementation, FastPathImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { Marshaler } from '../../core/memory/marshaler';
+import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { TimeService } from '../../runtime/time';
 import { TimerKind } from '../../core/scheduler/types';
@@ -1404,10 +1405,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     const VK_SHIFT = 0x10;
     const VK_CAPITAL = 0x14;
 
-    function vkToChar(vk: number, keyStates: Uint8Array): number {
-        const shiftDown = (keyStates[VK_SHIFT] & 0x80) !== 0;
-        // CapsLock toggle state: bit 0 of keyState (we approximate with pressed state)
-        const capsLock = (keyStates[VK_CAPITAL] & 0x80) !== 0;
+    function vkToChar(vk: number, shiftDown: boolean, capsLock: boolean): number {
         const upper = shiftDown !== capsLock; // XOR: shift or caps, not both
 
         // Letters A-Z (VK 0x41-0x5A)
@@ -1465,21 +1463,25 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const lpMsg = args[0];
         if (!lpMsg) return 0;
 
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const message = view.getUint32(lpMsg + 4, true);
+        const message = Mem.readUint32(lpMsg + 4);
 
         // Only translate WM_KEYDOWN (0x0100) and WM_SYSKEYDOWN (0x0104)
         if (message !== 0x0100 && message !== 0x0104) return 0;
 
-        const hwnd = view.getUint32(lpMsg, true);
-        const vk = view.getUint32(lpMsg + 8, true) & 0xFF;
+        const hwnd = Mem.readUint32(lpMsg);
+        const vkValue = Mem.readUint32(lpMsg + 8);
+        const lParam = Mem.readUint32(lpMsg + 12);
+        if (hwnd === null || vkValue === null || lParam === null) return 0;
+        const vk = vkValue & 0xFF;
 
-        const charCode = vkToChar(vk, System.getInstance().inputManager.keyStates);
+        const input = System.getInstance().inputManager;
+        const charCode = vkToChar(vk, (input.getKeyState(VK_SHIFT) & 0x8000) !== 0,
+            (input.getKeyState(VK_CAPITAL) & 1) !== 0);
         if (charCode === 0) return 0;
 
         // Post WM_CHAR (or WM_SYSCHAR for SYSKEYDOWN)
         const charMsg = message === 0x0104 ? 0x0106 : 0x0102; // WM_SYSCHAR : WM_CHAR
-        System.getInstance().windowManager.postMessage(hwnd, charMsg, charCode, view.getUint32(lpMsg + 12, true));
+        System.getInstance().windowManager.postMessage(hwnd, charMsg, charCode, lParam);
         return 1; // TRUE - message was translated
     };
 

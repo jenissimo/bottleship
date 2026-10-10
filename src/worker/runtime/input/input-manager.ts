@@ -295,6 +295,7 @@ export class InputManager {
     private readonly queuedKeyState = new Uint8Array(KEY_STATE_BYTES);
     private readonly packedKeyStateScratch = new Uint8Array(KEY_STATE_BYTES);
     private hasQueuedKeyState = false;
+    private readonly messageKeyStates = new Map<number, Uint8Array>();
     /** Tracks keys that transitioned 0→pressed since last GetAsyncKeyState query (bit 0). */
     private keyPressedSinceLastQuery = new Uint8Array(256);
     private currentMouseX = 0;
@@ -395,7 +396,7 @@ export class InputManager {
     private shouldEnqueueMessages: (() => boolean) | null = null;
     private hostInputReset: (() => void) | null = null;
 
-    constructor(windowManager: WindowManager) {
+    constructor(windowManager: WindowManager, private readonly currentThreadId: () => number = () => 0) {
         this.windowManager = windowManager;
     }
 
@@ -1092,10 +1093,28 @@ export class InputManager {
         }
         this.queuedKeyState.set(packedKeyState.subarray(0, KEY_STATE_BYTES));
         this.hasQueuedKeyState = true;
+        const table = this.messageKeyStates.get(this.currentThreadId());
+        if (table) table.set(this.queuedKeyState);
+    }
+
+    /** Queue state advances on removal, independently of later hardware transitions. */
+    applyMessageKeyState(packedKeyState: Uint8Array, threadId: number): void {
+        if (packedKeyState.length < KEY_STATE_BYTES) return;
+        let table = this.messageKeyStates.get(threadId);
+        if (!table) {
+            table = new Uint8Array(KEY_STATE_BYTES);
+            this.messageKeyStates.set(threadId, table);
+        }
+        table.set(packedKeyState.length === KEY_STATE_BYTES ? packedKeyState : packedKeyState.subarray(0, KEY_STATE_BYTES));
     }
 
     getKeyState(vk: number): number {
         const index = vk & 0xFF;
+        const table = this.messageKeyStates.get(this.currentThreadId());
+        if (table) {
+            const packed = table[index];
+            return ((packed & 0x80) ? 0x8000 : 0) | (packed & 0x01);
+        }
         if (this.hasQueuedKeyState) {
             const packed = this.queuedKeyState[index];
             return ((packed & 0x80) ? 0x8000 : 0) | (packed & 0x01);
@@ -1180,6 +1199,7 @@ export class InputManager {
         this.queuedKeyState.fill(0);
         this.packedKeyStateScratch.fill(0);
         this.hasQueuedKeyState = false;
+        this.messageKeyStates.clear();
         this.keyPressedSinceLastQuery.fill(0);
         this.mouseButtonLatch = 0;
         this.mouseButtonLatchStale = 0;
@@ -1702,6 +1722,9 @@ export class InputManager {
         view[INPUT_INDEX.mouseY] = screenY | 0;
         view[INPUT_INDEX.mouseInside] = 1;
         endInputWrite(view);
+        // An explicit motion can revisit the last host coordinate after a guest warp.
+        const confined = clampToCursorClip(screenX | 0, screenY | 0);
+        this.commitCursorPosition(confined.x, confined.y);
         this.poll(true);
         return true;
     }
