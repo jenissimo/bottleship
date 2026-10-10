@@ -4,13 +4,14 @@
  * Judges three things a screenshot of "a city that renders" does not:
  *  - the level loading screen shows its artwork, not a progress bar on black (a partial GPU
  *    colour fill used to drop the CPU-blitted background under it),
- *  - the pedestrians, which the game submits as strided primitives, are really drawn: the
- *    strided calls must be SEEN, and none of them may land on a stub (a stubbed draw
- *    succeeds silently, so "no error" alone would pass with every pedestrian missing),
+ *  - the strided drawing path is exercised and is not answered by a silent stub;
+ *    this is API coverage, not a visual comparison of every pedestrian with Windows,
  *  - the car moves under keyboard input.
  *
- * Starts from first-run state by wiping the title's container: Quick Race repeats the last
- * race, and only the default one (Cruise) is known to put pedestrians near the start line.
+ * Use a dedicated BS_TAB and a disposable browser origin/profile. This scenario never
+ * deletes a container or accepts a licence. Handle the trial's licence separately, then
+ * run with MM2_AT_MENU=1; otherwise WGB loads the bundle and the scenario waits at the
+ * licence for the operator. Selects Cruise explicitly instead of repeating the last race.
  */
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -18,10 +19,10 @@ import { harness, closeHarnessConnection } from "../../harness";
 import { decodePng } from "../../png-diff";
 
 const wgb = process.env.WGB;
-if (!wgb) throw new Error("WGB must point to the repacked Midtown Madness 2 trial");
-/** The bundle's gameId as an OPFS container name. */
-const CONTAINER = process.env.CONTAINER ?? "app-midtown-madness-2-demo";
-const out = resolve("logs", process.env.BS_TAB ?? "midtown-madness-2-demo", "midtown-madness-2-demo");
+const atMenu = process.env.MM2_AT_MENU === "1";
+if (!atMenu && !wgb) throw new Error("Set WGB to a lawfully obtained trial, or MM2_AT_MENU=1 after loading it");
+if (!process.env.BS_TAB) throw new Error("BS_TAB must identify a dedicated regression tab");
+const out = resolve("logs", process.env.BS_TAB, "midtown-madness-2-demo");
 mkdirSync(out, { recursive: true });
 
 /** Menu and vehicle-select put their forward button here (640x480 guest pixels). */
@@ -63,24 +64,19 @@ async function waitFor(what: string, timeoutMs: number, test: () => Promise<bool
 }
 
 try {
-    // The pause lets the torn-down worker's debounced OPFS flush finish before its files go.
-    const boot = await harness().reload().sleep(1500).containerDelete(CONTAINER).openWgb(wgb).sleep(8000).run();
+    const boot = atMenu
+        ? await harness().resume().run()
+        : await harness().reload().sleep(1500).openWgb(wgb!).sleep(8000).run();
     if (!boot.ok) throw new Error(`boot: ${JSON.stringify(boot.error)}`);
-    // The game shows its licence until the acceptance is in its registry key, so the dialog
-    // is also the proof that the wipe took: without it this is not first-run state.
-    const licence = await harness().click("Accept").run();
-    if (!licence.ok) {
-        throw new Error(`the first-run licence dialog did not appear, so container '${CONTAINER}' was not wiped ` +
-            `(set CONTAINER if the bundle's gameId differs): ${JSON.stringify(licence.error)}`);
-    }
 
     await waitFor("the main menu", 60_000, async () => (await screen()).width === MENU_WIDTH);
     await harness().sleep(4000).run();
     if (await litFraction("menu") < 0.5) throw new Error("main menu is mostly black");
 
-    // Quick Race, then Go Drive.
-    const toVehicle = await harness().move(NEXT.x, NEXT.y).sleep(600).clickHold(NEXT.x, NEXT.y, 250).sleep(8000).run();
-    if (!toVehicle.ok) throw new Error(`quick race: ${JSON.stringify(toVehicle.error)}`);
+    // Races -> Cruise -> Select Vehicle, independent of the saved last race.
+    const toVehicle = await harness().clickHold(530, 330, 250).sleep(2500)
+        .clickHold(150, 75, 250).sleep(800).clickHold(NEXT.x, NEXT.y, 250).sleep(4000).run();
+    if (!toVehicle.ok) throw new Error(`select Cruise: ${JSON.stringify(toVehicle.error)}`);
     if (await litFraction("vehicle") < 0.5) throw new Error("vehicle select is mostly black");
     const go = await harness().clickHold(NEXT.x, NEXT.y, 250).run();
     if (!go.ok) throw new Error(`go drive: ${JSON.stringify(go.error)}`);
@@ -143,12 +139,16 @@ try {
     // A parked view reads about 0.2 (traffic alone); the first seconds of acceleration read 13 or more.
     if (motion < 5) throw new Error(`the view did not move under acceleration (motion ${motion.toFixed(2)})`);
     if (strided === 0) {
-        throw new Error("no strided draw was issued in 30 s of driving, so the pedestrians were not judged — rerun");
+        throw new Error("no strided draw was issued in 30 s of driving, so that API path was not exercised — rerun");
     }
 
-    console.log(`OK — Midtown Madness 2 trial accepted its licence, showed its loading artwork ` +
-        `(${(loading * 100).toFixed(0)}% lit), entered a race, drove (motion ${motion.toFixed(1)}) and drew ` +
-        `${strided} strided primitives; evidence: ${out}`);
+    console.log(`OK — Midtown Madness 2 trial showed its loading artwork ` +
+        `(${(loading * 100).toFixed(0)}% lit), entered Cruise, drove (motion ${motion.toFixed(1)}) and issued ` +
+        `${strided} strided draw calls; evidence: ${out}`);
 } finally {
-    closeHarnessConnection();
+    try {
+        await harness().key(VK_UP, { down: false, up: true }).perfProfile({ enable: false }).pause().run();
+    } finally {
+        closeHarnessConnection();
+    }
 }
