@@ -719,10 +719,13 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const index = args[1];
         void hdc;
         let result: number;
+        // A screen DC describes the CURRENT display mode: after a mode-set these follow it,
+        // the same as SM_CXSCREEN. The manifest's desktop is only the mode at boot.
+        const mode = System.getInstance().emulatedDisplayMode;
         const screenRes = EmulatorConfig.getInstance().screenResolution;
-        if (index === 8) result = screenRes.width;           // HORZRES
-        else if (index === 10) result = screenRes.height;    // VERTRES
-        else if (index === 12 || index === 116) result = screenRes.bpp; // BITSPIXEL
+        if (index === 8) result = mode?.width || screenRes.width;            // HORZRES
+        else if (index === 10) result = mode?.height || screenRes.height;    // VERTRES
+        else if (index === 12 || index === 116) result = mode?.bpp || screenRes.bpp; // BITSPIXEL
         else result = DEVICE_CAPS_STATIC[index] ?? 0;
         Logger.log(LogCategory.GDI32, `GetDeviceCaps(hdc=0x${hdc.toString(16)}, index=${index}) -> ${result}`);
         return result;
