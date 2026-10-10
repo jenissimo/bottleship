@@ -1468,7 +1468,12 @@ export class WinmmMci {
                 return MMSYSERR_NOERROR;
             }
             if (verb === "pause") device.mode = "paused";
-            if (verb === "resume") device.mode = "playing";
+            if (verb === "resume" && device.mode === "paused") {
+                device.mode = "playing";
+                // The frame timer ran out while paused; nothing else restarts it.
+                this.clearMciVideoTimer(device);
+                this.scheduleMciVideoFrame(device);
+            }
             if (verb === "status") {
                 const itemTokens = lower.slice(2).filter((t) => t !== "wait" && t !== "notify");
                 const item = itemTokens.length > 0 ? itemTokens.join(" ") : "mode";
