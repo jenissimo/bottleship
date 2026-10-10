@@ -87,6 +87,7 @@ import { createDirectDrawExports } from './directdraw';
 import { createSurfaceExports, registerFastPathSurfaceFunctions } from './surface';
 import { createD3DExports, registerFastPathD3DFunctions } from './d3d/index';
 import { freeExecuteBufferScratch } from './d3d/execute-buffer-impl';
+import { freeStridedDrawScratch } from './d3d/strided-draw';
 import { createGPUTexture, convertRGBAToSurface, convertSurfaceToRGBA, resolvePalette, FormatInfo, readSurfaceStateRGBA } from './gpu-texture-utils';
 import { isValidAddress } from '../../core/memory/address-guard';
 import { PrimaryScanoutTracker } from './primary-scanout';
@@ -835,6 +836,7 @@ export class DDraw implements IModule {
         if (this.context) {
             this.flushDeferredSurfacePtrFrees();
             freeExecuteBufferScratch(this.context.process.memory);
+            freeStridedDrawScratch(this.context.process.memory);
 
             // Reset primary/backbuffer surfaces
             this.context.surfaces.primary = 0;

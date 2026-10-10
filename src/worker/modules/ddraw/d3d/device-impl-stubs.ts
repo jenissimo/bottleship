@@ -23,8 +23,6 @@ export function createDeviceStubsExports(): Record<string, ThunkImplementation> 
     ]);
 
     const d3dDevice7Stubs = [
-        "DrawPrimitiveStrided",
-        "DrawIndexedPrimitiveStrided",
         "SetClipPlane",
         "GetClipPlane",
         "GetInfo",
