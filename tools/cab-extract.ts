@@ -6,14 +6,14 @@
  * (`data1.hdr` + `data{N}.cab` + `Setup.exe` + `setup.inx` …) that
  * `tools/unshield-extract.ts` then turns into the real game files.
  *
- * The cabinet LAYOUT + MSZIP driver live in the browser-safe core
- * (`packages/formats/src/cab/index.ts`); this CLI adds the Node-side fs + a
- * dictionary-capable sync zlib for MSZIP's cross-block preset dictionary.
+ * The cabinet LAYOUT, the MSZIP driver and the LZX decoder live in the
+ * browser-safe core (`packages/formats/src/cab/`); this CLI adds the Node-side
+ * fs + a dictionary-capable sync zlib for MSZIP's cross-block preset dictionary.
  *
  * Usage:
  *   bun tools/cab-extract.ts <archive.exe|.cab> <out-dir> [--list] [--quiet]
  *
- * Supported compression: NONE + MSZIP. QUANTUM/LZX are rejected.
+ * Supported compression: NONE, MSZIP and LZX. QUANTUM is rejected.
  */
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { inflateRawSync } from "zlib";
