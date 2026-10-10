@@ -37,4 +37,6 @@ Sources for the demo covers added in October 2026:
 | `worms-world-party-box.jpg` | Worms World Party (2001), original PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/0a9b2dd5-ddb3-4135-b30b-0298e8b7d8e8.jpg) |
 | `blade-of-darkness-box.jpg` | Severance: Blade of Darkness (2001), original United Kingdom PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/d9e09e84-0374-422b-af17-763f9bb1ec76.jpg) |
 
+| `battle-for-naboo-box.jpg` | Star Wars: Battle for Naboo (2001), North American PC box | [LaunchBox PC cover scan](https://images.launchbox-app.com/73752a9d-442c-436e-9e44-275051f2b894.jpg) |
+
 Artwork remains copyright of its respective owners.
