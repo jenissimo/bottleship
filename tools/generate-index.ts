@@ -25,7 +25,13 @@ function generateMonolithicIndex(moduleName: string, importPath: string = `../${
 function collectAtomicFiles(dir: string, moduleDir: string): Array<{ category: string; relativePath: string }> {
     const result: Array<{ category: string; relativePath: string }> = [];
 
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    // The emitted order is the order the export tables are merged in, so it must not depend
+    // on the host: readdir is sorted on NTFS and arbitrary on APFS/ext4. This is NTFS's order.
+    const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((x, y) => {
+        const a = x.name.toUpperCase();
+        const b = y.name.toUpperCase();
+        return a < b ? -1 : a > b ? 1 : 0;
+    });
     for (const entry of entries) {
         if (entry.name === 'index.ts') {
             continue;
