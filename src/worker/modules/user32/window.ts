@@ -2453,7 +2453,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         // handled in JS. A subclass that leaves WM_PAINT to it (MFC's CWnd::Default →
         // m_pfnSuper) is asking for exactly Wine button.c's WM_PAINT → OB_Paint, which
         // is the only thing that can draw an owner-draw tile.
-        if ((lpPrevWndFunc & 0xFFFF0000) === 0xFFFF0000) {
+        if ((lpPrevWndFunc >>> 16) === 0xFFFF) {
             const subclassed = windows.get(hWnd);
             if (Msg === WM_PAINT && isOwnerDrawButton(subclassed)) {
                 try {

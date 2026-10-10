@@ -1031,7 +1031,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         maybeLogTimerDiag();
 
         const callerThreadId = system.scheduler.getCurrentThreadId();
-        const msg = system.windowManager.peekMessage(wRemoveMsg !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
+        const msg = system.windowManager.peekMessage((wRemoveMsg & 1) !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
         const now = performance.now();
         peekCalls++;
         if (msg) peekHits++;
@@ -1047,13 +1047,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         if (!msg) {
             if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
-                logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+                logPaintPendingBlocked('PeekMessageW', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & 1) !== 0);
             }
             // Queue empty — synthesize WM_QUIT if per-thread flag is set
             if (isQuitInFilterRange(wMsgFilterMin, wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
                 if (quitState && quitState.posted) {
-                    if (wRemoveMsg !== 0) {
+                    if ((wRemoveMsg & 1) !== 0) {
                         system.scheduler.clearQuitFlag(callerThreadId);
                     }
                     Logger.log(LogCategory.USER32, `PeekMessageW: synthesizing WM_QUIT exitCode=${quitState.exitCode} for thread=${callerThreadId}`);
@@ -1066,7 +1066,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         if (msg.message === WM_TIMER) {
             timerDiag.delivered++;
-            if (wRemoveMsg !== 0) restartRemovedTimer(msg);
+            if ((wRemoveMsg & 1) !== 0) restartRemovedTimer(msg);
         }
         if (paintTraceEnabled) logPaintMsgDelivered('PeekMessageW', msg.hwnd, msg.message, {
             remove: wRemoveMsg,
@@ -1084,7 +1084,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         if (isKeyboardHookMessage(msg.message)) {
             const suspended = dispatchKeyboardHookChain(
-                ctx, msg, wRemoveMsg !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId,
+                ctx, msg, (wRemoveMsg & 1) !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId,
                 lpMsg, 20, (delivered) => (delivered ? 1 : 0), 'PeekMessage:WH_KEYBOARD',
             );
             // Keyboard chain applies WH_GETMESSAGE internally on delivery.
@@ -1095,7 +1095,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         // chain already handled it above.
         noteRetrievedExtraInfo(callerThreadId, msg);
         const gm = dispatchGetMessageHook(
-            ctx, msg, wRemoveMsg !== 0, callerThreadId, lpMsg, 20,
+            ctx, msg, (wRemoveMsg & 1) !== 0, callerThreadId, lpMsg, 20,
             (delivered) => (delivered ? 1 : 0), 'PeekMessage:WH_GETMESSAGE',
         );
         if (gm) return gm;
@@ -1915,7 +1915,7 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
             }
         }
 
-        const msg = system.windowManager.peekMessage(wRemoveMsg !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
+        const msg = system.windowManager.peekMessage((wRemoveMsg & 1) !== 0, wMsgFilterMin, wMsgFilterMax, callerThreadId);
 
         // dbg.peekstats() diagnostic: histogram of dequeued message ids + empty-return count
         if ((globalThis as any).__peekDiagEnabled === true) {
@@ -1929,13 +1929,13 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
 
         if (!msg) {
             if (paintTraceEnabled && system.windowManager.hasMessages(WM_PAINT, WM_PAINT, callerThreadId)) {
-                logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, wRemoveMsg !== 0);
+                logPaintPendingBlocked('PeekMessageW(fastpath)', wMsgFilterMin, wMsgFilterMax, (wRemoveMsg & 1) !== 0);
             }
             // Queue empty — check per-thread quit flag before returning FALSE
             if (wMsgFilterMin === 0 && wMsgFilterMax === 0 || (WM_QUIT >= wMsgFilterMin && WM_QUIT <= wMsgFilterMax)) {
                 const quitState = system.scheduler.getQuitState(callerThreadId);
                 if (quitState && quitState.posted) {
-                    if (wRemoveMsg !== 0) {
+                    if ((wRemoveMsg & 1) !== 0) {
                         system.scheduler.clearQuitFlag(callerThreadId);
                     }
                     // Write synthesized WM_QUIT MSG
@@ -1962,7 +1962,7 @@ export function registerFastPathMessageFunctions(dispatcher: HleDispatcher): voi
         // its WM_TIMER is removed from the queue. Omitting this in the fast path
         // made hover timers one-shot in tight MFC pumps (Half-Life launcher).
         if (msg.message === WM_TIMER) {
-            noteFastPathTimerDelivery?.(msg, wRemoveMsg !== 0);
+            noteFastPathTimerDelivery?.(msg, (wRemoveMsg & 1) !== 0);
         }
 
         // Write MSG struct (28 bytes) to guest memory

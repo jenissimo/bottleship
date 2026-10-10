@@ -33,7 +33,7 @@ export const msvfw32Module: ModuleDescriptor = {
         makeFunc("ICInfo", 3),                   // fccType, fccHandler, lpicinfo → BOOL
         makeFunc("ICClose", 1),                  // hic → LRESULT
         makeFunc("ICSendMessage", 4),            // hic, msg, dw1, dw2 → LRESULT
-        makeFunc("ICDecompress", 6),             // hic, dwFlags, lpbiFormat, lpData, lpbi, lpBits → LRESULT
+        makeFunc("ICDecompress", 6, { callingConvention: "cdecl" }), // VFWAPIV
 
         // VideoForWindowsVersion() — exported by name and at ordinal 2.
         makeFunc("VideoForWindowsVersion", 0),

@@ -2260,5 +2260,5 @@ export function runModalDialogFromTemplate(
 }
 
 export function isSentinelWndProc(wndProc: number): boolean {
-    return (wndProc & 0xFFFF0000) === 0xFFFF0000;
+    return (wndProc >>> 16) === 0xFFFF;
 }

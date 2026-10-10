@@ -640,29 +640,26 @@ export class AudioEngine {
     // audio running again — clear the intentional-pause flag.
     this.userPaused = false;
     const context = this.ensureContext();
+    // A pre-gesture resume may stay pending; a later gesture needs a fresh request.
+    if (context.state === "suspended") {
+      try {
+        await context.resume();
+        console.log("BottleShip: AudioContext resumed", { state: context.state });
+      } catch (err) {
+        console.warn("BottleShip: AudioContext resume blocked", {
+          state: context.state,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+    }
+    if (context.state !== "running") return;
     if (this.resumePromise) {
       await this.resumePromise;
       return;
     }
 
     this.resumePromise = (async () => {
-      // Only resume if suspended (avoid redundant calls when already running)
-      if (context.state === "suspended") {
-        try {
-          await context.resume();
-          console.log("BottleShip: AudioContext resumed", { state: context.state });
-        } catch (err) {
-          // Gesture-gated failure: keep pending audio; next user gesture can resume successfully.
-          console.warn("BottleShip: AudioContext resume blocked", {
-            state: context.state,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return;
-        }
-      } else if (context.state !== "running") {
-        return;
-      }
-
       await this.ensureReady();
 
       // Resume encoded sources that were playing before pause
