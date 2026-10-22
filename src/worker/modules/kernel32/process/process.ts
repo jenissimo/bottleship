@@ -13,12 +13,14 @@ import {
     VER_PLATFORM_WIN32_NT,
     VER_PLATFORM_WIN32_WINDOWS,
 } from '../../../core/emulator-config-manager';
-import { isValidAddress } from '../../../core/memory/address-guard';
+import { isValidAddress, isValidUserAddress } from '../../../core/memory/address-guard';
 import { ThreadState } from '../../../core/scheduler/types';
 import { Mem } from '../../../core/memory/mem-accessor';
 import { invalidateGuestCode, invalidateAllGuestCode } from '../../../core/memory/guest-code';
 import { Marshaler } from '../../../core/memory/marshaler';
-import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
+import { SystemResourceProvider, IO_COMPLETION_ALL_ACCESS } from '../../../core/resources/system-resource-provider';
+import { exports as fileIo } from '../file-io';
+import { getWsaNativeSocketTable } from '../../wsa-stub-shared';
 import { encodeAnsi } from '../../codepage-utils';
 import { isDifferentCommandLine } from '../../shell32';
 import { getVirtualProcessManager, VIRTUAL_CURRENT_PROCESS_ID } from './virtual-process-manager';
@@ -1523,6 +1525,28 @@ export const exports: Record<string, ThunkImplementation> = {
         return { value: success ? 1 : 0, stackCleanup: 8 };
     },
 
+    'GetHandleInformation': (ctx, mem, args) => {
+        const system = System.getInstance();
+        if (system.process) getWsaNativeSocketTable(system.process, args[0] >>> 0);
+        const attributes = system.resourceProvider.getHandleAttributes(args[0]);
+        if (!attributes) { system.scheduler.setLastError(ERROR_INVALID_HANDLE); return 0; }
+        const output = args[1] >>> 0;
+        if (!output || output + 4 > mem.length || !isValidUserAddress(mem, output, 4, 'rw')) {
+            system.scheduler.setLastError(998); return 0;
+        }
+        Mem.writeUint32(output, attributes.flags);
+        return 1;
+    },
+
+    'SetHandleInformation': (ctx, mem, args) => {
+        const system = System.getInstance();
+        if (system.process) getWsaNativeSocketTable(system.process, args[0] >>> 0);
+        if (!system.resourceProvider.setHandleFlags(args[0], args[1], args[2])) {
+            system.scheduler.setLastError(ERROR_INVALID_HANDLE); return 0;
+        }
+        return 1;
+    },
+
     'DuplicateHandle': (ctx, mem, args) => {
         const hSourceProcessHandle = args[0];
         const hSourceHandle = args[1];
@@ -1553,13 +1577,45 @@ export const exports: Record<string, ThunkImplementation> = {
             System.getInstance().scheduler.setLastError(invalid ? ERROR_INVALID_HANDLE : ERROR_CALL_NOT_IMPLEMENTED);
             return { value: 0, stackCleanup: 28 };
         }
-        // Normal duplication must not allocate an alias before validating its destination.
-        // CLOSE_SOURCE's optional output follows the existing path below.
-        if (!(dwOptions & DUPLICATE_CLOSE_SOURCE) &&
-            (!lpTargetHandle || lpTargetHandle < 0 || lpTargetHandle + 4 > mem.length ||
-                !isValidAddress(mem, lpTargetHandle, 4, 'rw'))) {
-            System.getInstance().scheduler.setLastError(998); // ERROR_NOACCESS
+        const closeSource = !!(dwOptions & DUPLICATE_CLOSE_SOURCE);
+        const invalidOutput = lpTargetHandle !== 0 && (lpTargetHandle < 0 || lpTargetHandle + 4 > mem.length ||
+            !isValidUserAddress(mem, lpTargetHandle, 4, 'rw'));
+        if (invalidOutput || (!lpTargetHandle && !closeSource)) {
+            // Measured Windows closes an unprotected current-process source even when
+            // non-NULL output probing fails. Never allocate an unreachable target alias.
+            if (closeSource && sourceObject && isCurrentProcessHandle(hSourceProcessHandle))
+                fileIo.CloseHandle!(ctx, mem, [hSourceHandle]);
+            System.getInstance().scheduler.setLastError(998);
             return { value: 0, stackCleanup: 28 };
+        }
+
+        if (sourceObject && isCurrentProcessHandle(hSourceProcessHandle) && isCurrentProcessHandle(hTargetProcessHandle)) {
+            const source = resourceProvider.getHandleAttributes(hSourceHandle)!;
+            const maximum = sourceObject.kind === 'iocp' ? IO_COMPLETION_ALL_ACCESS : 0x001fffff;
+            let access = _dwDesiredAccess;
+            if (dwOptions & _DUPLICATE_SAME_ACCESS) access = source.grantedAccess;
+            else {
+                if (access & 0x12000000) access |= maximum; // GENERIC_ALL / MAXIMUM_ALLOWED
+                if (access & 0x80000000) access |= 0x00020001;
+                if (access & 0x40000000) access |= 0x00020002;
+                if (access & 0x20000000) access |= 0x00120000;
+                access &= maximum;
+            }
+            const attributes = { grantedAccess: access >>> 0, flags: _bInheritHandle ? 1 : 0 };
+            let target: number;
+            if (closeSource && !(source.flags & 2)) {
+                // Atomic same-process replacement: no last-reference gap or hidden NULL alias.
+                resourceProvider.replaceKernelHandle(hSourceHandle, attributes);
+                target = hSourceHandle >>> 0;
+            } else {
+                const virtual = getVirtualProcessManager().duplicateHandle(hSourceHandle >>> 0);
+                target = virtual ?? (sourceObject.kind === 'event'
+                    ? System.getInstance().scheduler.syncObjects.duplicateEvent(hSourceHandle)!
+                    : resourceProvider.registerKernelObject(sourceObject));
+                resourceProvider.setHandleAttributes(target, attributes);
+            }
+            if (lpTargetHandle) Mem.writeUint32(lpTargetHandle, target);
+            return { value: 1, stackCleanup: 28 };
         }
 
         let targetHandle = hSourceHandle;
@@ -1630,8 +1686,7 @@ export const exports: Record<string, ThunkImplementation> = {
             LogCategory.KERNEL32,
             `DuplicateHandle(src=0x${hSourceHandle.toString(16)}) -> 0x${(targetHandle >>> 0).toString(16)}`
         );
-        System.getInstance().scheduler.setLastError(0);
-        return { value: 1, stackCleanup: 28 }; // TRUE = success
+        return { value: 1, stackCleanup: 28 }; // TRUE preserves the caller's LastError.
     },
 
     'GetProcessVersion': (ctx, mem, args) => {

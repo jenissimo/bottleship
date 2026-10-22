@@ -61,7 +61,7 @@ describe("Winsock provider ownership and thread semantics", () => {
         expect(h.call(h.v1, "listen", [listener, 5])).toBe(0);
         const pending = h.call(h.v2, "accept", [listener, 0, 0]);
         expect(pending).toBeInstanceOf(Promise);
-        h.thread(1); h.call(h.v1, "WSASetLastError", [42]); h.call(h.v1, "closesocket", [listener]);
+        h.thread(1); h.call(h.v1, "closesocket", [listener]); h.call(h.v1, "WSASetLastError", [42]);
         expect((await pending as any).value).toBe(-1);
         expect(h.call(h.v2, "WSAGetLastError")).toBe(42);
         h.thread(2); expect(h.call(h.v1, "WSAGetLastError")).toBe(10004);

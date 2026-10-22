@@ -8,6 +8,8 @@ import { SystemResourceProvider } from '../resources/system-resource-provider';
 import { Mem } from '../memory/mem-accessor';
 import { readGuidFromMem } from './typelib/typelib-types';
 import { registerHleComServer, lookupHleComClass } from './hle-com-registry';
+import { retainHleModuleLoaded, type HleModuleLoadReference } from '../hle-module-images';
+import { isBlockedByDisabledDlls } from '../hle-system-catalog';
 
 const UNKNOWN = '00000000-0000-0000-c000-000000000046';
 const FACTORY = '00000001-0000-0000-c000-000000000046';
@@ -27,13 +29,37 @@ class HleClassFactory extends BaseComObject {
 /** Standard in-process COM class factories backed by an HLE module's real objects. */
 export class HleComServer {
     private locks = 0;
+    private loaderReference?: HleModuleLoadReference;
+    private loaderGeneration = -1;
     private implementations: Partial<Record<string, ThunkImplementation>> = {};
     static lookup(process: Process, clsid: string) { return lookupHleComClass(process, clsid); }
     constructor(readonly process: Process, readonly descriptor: ModuleDescriptor,
         readonly tables: () => Record<string, VTableInfo>, readonly classes: readonly HleComClass[]) {
         registerHleComServer(process, this, classes);
     }
-    reset(): void { this.locks = 0; }
+    reset(): void { this.locks = 0; this.releaseLoaderReference(); }
+    /** COM loads the registered server before asking it to accept the requested IID. */
+    acquireLoaderReference(): boolean {
+        if (isBlockedByDisabledDlls(this.descriptor.name)) return false;
+        const generation = this.process.resetGeneration ?? 0;
+        if (this.loaderReference && this.loaderGeneration === generation) return true;
+        this.releaseLoaderReference();
+        this.loaderReference = retainHleModuleLoaded(this.descriptor.name);
+        this.loaderGeneration = generation;
+        return this.loaderReference !== undefined;
+    }
+    releaseLoaderReference(): void {
+        this.loaderReference?.release();
+        this.loaderReference = undefined;
+        this.loaderGeneration = -1;
+    }
+    releaseUnusedLoaderReference(): void {
+        if (this.canUnload()) this.releaseLoaderReference();
+    }
+    private canUnload(): boolean {
+        return this.locks === 0 && !SystemResourceProvider.getInstance().getAllComObjects()
+            .some(object => comVtableOwner(object.vtableAddress) === this.descriptor.name);
+    }
     private valid(address: number, size: number, perms: 'r' | 'rw' = 'r'): boolean {
         return Number.isInteger(address) && address > 0 && this.process.addressSpace.validateRange(address, size, perms);
     }
@@ -102,8 +128,7 @@ export class HleComServer {
             if (!address) return E_OUTOFMEMORY;
             Mem.writeUint32(out, address); return 0;
         };
-        exports.DllCanUnloadNow = () => this.locks !== 0 || SystemResourceProvider.getInstance().getAllComObjects()
-            .some(object => comVtableOwner(object.vtableAddress) === this.descriptor.name) ? 1 : 0;
+        exports.DllCanUnloadNow = () => this.canUnload() ? 0 : 1;
         exports.IClassFactory_QueryInterface = (_ctx, _mem, args) => {
             const [self, iidAddress, out] = args.map(value => value >>> 0);
             if (!this.valid(out, 4, 'rw')) return E_POINTER;

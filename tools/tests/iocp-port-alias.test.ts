@@ -23,17 +23,18 @@ function port() {
     return {file, handle, object: resources.getKernelObject(handle)};
 }
 function duplicate(handle: number, flags = 2) {
-    const result = processApi.DuplicateHandle!(ctx, ram, [0xffffffff, handle, 0xffffffff, 32, 0, 0, flags]) as ThunkResult;
+    const result = processApi.DuplicateHandle!(ctx, ram, [0xffffffff, handle, 0xffffffff, 0x10020, 0, 0, flags]) as ThunkResult;
     expect(result.value).toBe(1);
-    const copy = get(32); handles.push(copy);
-    expect(copy).not.toBe(handle);
+    const copy = get(0x10020); handles.push(copy);
+    if (flags & 1) expect(copy).toBe(handle); // Native same-process CLOSE_SOURCE reuses this slot.
+    else expect(copy).not.toBe(handle);
     return copy;
 }
 function close(handle: number) { return fileIo.CloseHandle!(ctx, ram, [handle]); }
 function dequeue(handle: number, timeout = 0) { return invoke('GetQueuedCompletionStatus', [handle, 8, 12, 16, timeout]); }
 beforeEach(() => {
     resetSyncState(); handles = []; errors = [];
-    ram = new Uint8Array(4096); Mem.bind(() => ram);
+    ram = new Uint8Array(0x20000); Mem.bind(() => ram);
     owner = Object.create(Process.prototype) as Process;
     Object.assign(owner, { resetGeneration: 0, getMemory: () => ram, addressSpace: {
         validateRange: (address: number, size: number) => address > 0 && address + size <= ram.length,
@@ -101,8 +102,9 @@ test('only the final alias close abandons all object waiters', async () => {
 test('DUPLICATE_CLOSE_SOURCE transfers the port reference without closing the object', () => {
     const {file,handle,object} = port(), target = captureFileIoCompletion(file)!;
     const copy = duplicate(handle, 3);
-    expect(resources.getKernelObject(handle)).toBeNull();
-    expect(resources.getKernelObject(copy)).toBe(object);
+    expect(copy).toBe(handle);
+    expect(resources.getKernelObject(handle)).toBe(object);
+    expect(resources.kernelObjectReferenceCount(object)).toBe(1);
     expect(target.post(7, 0x180)).toBe(true);
     expect((dequeue(copy) as ThunkResult).value).toBe(1);
     expect(get(8)).toBe(7);
@@ -121,7 +123,7 @@ test('IOCP duplicate rejects foreign/invalid process endpoints instead of invent
     const {handle} = port();
     const before = resources.getStatistics().kernel_object.count;
     for (const [source,target] of [[0,0xffffffff],[0xffffffff,0],[0x12345,0xffffffff]]) {
-        const result = processApi.DuplicateHandle!(ctx, ram, [source,handle,target,32,0,0,2]) as ThunkResult;
+        const result = processApi.DuplicateHandle!(ctx, ram, [source,handle,target,0x10020,0,0,2]) as ThunkResult;
         expect(result.value).toBe(0);
         expect(resources.getStatistics().kernel_object.count).toBe(before);
     }

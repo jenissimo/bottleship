@@ -15,6 +15,17 @@ function fixture() {
 }
 function fails(fn:()=>unknown, code:number) { try { fn(); throw Error("expected error"); } catch(error) { expect(error).toBeInstanceOf(WsaFailure); expect((error as WsaFailure).code).toBe(code); } }
 describe("durable Winsock socket actor",()=>{
+    test("native alias flags remain independent before import and protected closesocket keeps traffic alive",()=>{
+        const h=fixture(),source=h.socket(),sender=h.socket(h.sibling);h.call(h.root,"bind",[source,h.address]);
+        h.call(h.root,"setHandleFlags",[source,1,0]);const handle=h.call(h.root,"duplicate",[source,h.child.pid]);
+        const native=(command:string,args:unknown[])=>h.kernel.execute(h.child,command,args,true) as any;
+        expect(native("get",[handle]).handleFlags).toBe(1);expect(h.call(h.root,"get",[source]).handleFlags).toBe(0);
+        expect(native("setHandleFlags",[handle,2,2])).toBe(0);expect(native("closesocket",[handle])).toBe(0);
+        h.call(h.child,"reset");expect(native("isValid",[handle])).toBe(true);
+        h.call(h.sibling,"send",[sender,Uint8Array.of(97),h.address]);expect(native("receive",[handle,1]).data).toEqual(Uint8Array.of(97));
+        expect(native("setHandleFlags",[handle,2,0])).toBe(0);expect(native("closesocket",[handle])).toBe(0);
+        expect(native("isValid",[handle])).toBe(false);expect(h.call(h.root,"isValid",[source])).toBe(true);
+    });
     test("native I/O tokens survive closing their handle without importing or retaining a physical reference",()=>{
         const h=fixture(),source=h.socket(),sender=h.socket(h.sibling);h.call(h.root,"bind",[source,h.address]);
         const handle=h.call(h.root,"duplicate",[source,h.child.pid]);

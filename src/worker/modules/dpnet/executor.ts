@@ -5,7 +5,7 @@ import { ModuleCallbackQueue, type ModuleCallbackTask, type ModuleCallbackInvoca
 import type { ThunkResult, X86Context } from "../../core/thunking/thunk-dispatcher";
 import { DPN } from "./constants";
 
-export interface DirectPlayCallbackTask extends ModuleCallbackTask { storageBytes?: number; }
+export interface DirectPlayCallbackTask extends ModuleCallbackTask { storageBytes?: number; message?: number; key?: object; }
 interface Job { lane: DirectPlayCallbackChannel; task: DirectPlayCallbackTask; active: boolean; prepared: boolean; done: boolean; thread: number; bytes: number; invocation?: ModuleCallbackInvocation; }
 interface Observer { routine: number; context: number; }
 interface Worker {
@@ -192,6 +192,10 @@ export class DirectPlayCallbackExecutor {
             if (!worker.queue.enqueue(task)) { worker.job = undefined; worker.task = undefined; worker.busy = false; job.active = false; break; }
         }
     }
+    cancelPending(lane: DirectPlayCallbackChannel, predicate: (task: DirectPlayCallbackTask) => boolean): void {
+        for (const worker of [...this.workers]) if (worker.job?.lane === lane && !worker.job.prepared && predicate(worker.job.task) && worker.task) worker.queue.cancel(worker.task);
+        for (const job of [...this.jobs]) if (job.lane === lane && !job.active && predicate(job.task)) { job.task.onDiscard?.(); this.finishJob(job); }
+    }
     discard(lane: DirectPlayCallbackChannel): void {
         this.channels.delete(lane);
         for (const worker of this.workers) if (worker.job?.lane === lane && !worker.job.prepared && worker.task) worker.queue.cancel(worker.task);
@@ -200,14 +204,16 @@ export class DirectPlayCallbackExecutor {
     }
     /** Execute queued callbacks on the issuing guest thread, without retaining any RAM view. */
     run(ctx: X86Context & { returnAddr?: number }, cleanup: number, lane?: DirectPlayCallbackChannel,
-        allowedTime = 0xffffffff, finalValue: number = DPN.OK, onDone: () => void = () => {}): number | ThunkResult {
+        allowedTime = 0xffffffff, finalValue: number | (() => number) = DPN.OK, onDone: () => void = () => {},
+        select?: (task: DirectPlayCallbackTask) => boolean): number | ThunkResult {
         const generation = this.generation, start = performance.now();
+        const result = () => typeof finalValue === "number" ? finalValue : finalValue();
         const release = lane?.pause();
         let finished = false;
         const finish = () => { if (finished) return; finished = true; release?.(); onDone(); this.pump(); };
-        const eligible = () => this.jobs.find(job => !job.active && !job.done && (!lane || job.lane === lane) && !job.lane.closed);
+        const eligible = () => this.jobs.find(job => !job.active && !job.done && (!lane || job.lane === lane) && !job.lane.closed && (!select || select(job.task)));
         let nextJob = eligible();
-        if (!nextJob) { finish(); return finalValue; }
+        if (!nextJob) { finish(); return result(); }
         const manager = this.process.dispatcher.callbackManager;
         const frame = manager.saveSuspendedThunkContext(ctx, cleanup, "DirectPlay inline callbacks");
         if (!frame) { finish(); return DPN.GENERIC; }
@@ -219,7 +225,7 @@ export class DirectPlayCallbackExecutor {
             try { invocation = manager.invokeCallback(call.routine, [...call.args], 0, value => {
                 call.onReturn?.(value);
                 if (this.live && generation === this.generation && (allowedTime === 0xffffffff || performance.now() - start < allowedTime)) nextJob = eligible();
-                if (!nextJob) { finish(); return finalValue; }
+                if (!nextJob) { finish(); return result(); }
                 return null;
             }, false, "DirectPlay inline callbacks", frame); }
             catch (error) { call.onDiscard?.(); throw error; }
@@ -229,7 +235,7 @@ export class DirectPlayCallbackExecutor {
             if (pending) pending.enumerationState = { continueEnumeration: next, finishEnumeration: finish };
         };
         try { next(); } catch { manager.abandonSuspendedFrame(frame); finish(); return DPN.GENERIC; }
-        return { value: finalValue, suspendedForCallback: true, callbackId: first, stackCleanup: cleanup, skipStackCheck: true };
+        return { value: result(), suspendedForCallback: true, callbackId: first, stackCleanup: cleanup, skipStackCheck: true };
     }
     reset(): void {
         if (!this.live) return; this.live = false; this.generation++; this.removeReset();
@@ -248,9 +254,14 @@ export class DirectPlayCallbackChannel {
     get size(): number { return this.executor.size(this); }
     get threadId(): number { return this.executor.threadId(this); }
     enqueue(task: DirectPlayCallbackTask): boolean { return this.executor.enqueue(this, task); }
+    cancelPending(predicate: (task: DirectPlayCallbackTask) => boolean): void { this.executor.cancelPending(this, predicate); }
     pause(): () => void { this.paused++; let resumed = false; return () => { if (!resumed) { resumed = true; this.paused--; this.executor.pump(); } }; }
-    run(ctx: X86Context & { returnAddr?: number }, cleanup: number, finalValue: number = DPN.OK, onDone?: () => void): number | ThunkResult {
+    run(ctx: X86Context & { returnAddr?: number }, cleanup: number, finalValue: number | (() => number) = DPN.OK, onDone?: () => void): number | ThunkResult {
         return this.executor.run(ctx, cleanup, this, 0xffffffff, finalValue, onDone);
+    }
+    runSelected(ctx: X86Context & { returnAddr?: number }, cleanup: number, select: (task: DirectPlayCallbackTask) => boolean,
+        finalValue: number | (() => number) = DPN.OK, onDone?: () => void): number | ThunkResult {
+        return this.executor.run(ctx, cleanup, this, 0xffffffff, finalValue, onDone, select);
     }
     close(): void { if (!this.closed) { this.closed = true; this.executor.discard(this); } }
 }

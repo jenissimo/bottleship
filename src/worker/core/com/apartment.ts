@@ -72,6 +72,9 @@ export class ComApartments {
         return (this.threads.get(threadId)?.oleInits ?? 0) > 0;
     }
 
+    /** Nested initialization and every other initialized apartment still own COM state. */
+    hasApartments(): boolean { return this.threads.size !== 0; }
+
     /** Any thread in the MTA — which is what lets an uninitialized thread use it implicitly. */
     hasMta(): boolean {
         for (const apt of this.threads.values()) if (apt.model === "mta") return true;

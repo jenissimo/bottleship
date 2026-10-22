@@ -47,6 +47,7 @@ export class DirectPlay8Session {
     private eventBytes = 0;
     private eventRetry?: ReturnType<typeof setTimeout>;
     private overflow = false;
+    get pendingLocalProcessing(): number { return this.engine instanceof NativeDirectPlayCore ? this.engine.pendingLocalProcessing : this.localProcessed.size; }
     get pendingEventCount(): number { return this.events.length; }
     onIndicate?: (request: JoinRequest) => JoinDecision | Promise<JoinDecision>;
     private known = new Map<number, Entity>();
@@ -54,6 +55,8 @@ export class DirectPlay8Session {
     private creatingGroups: { context: number; assigned: boolean }[] = [];
     private previousHost = 0;
     private localClosing = false;
+    private localProcessed = new Set<(result: number) => void>();
+    private localProcessedBytes = 0;
     private suppress = false;
     private generation = 0;
     private termination: { data: Uint8Array; reason: number } | null = null;
@@ -147,6 +150,7 @@ export class DirectPlay8Session {
     close(): number {
         if (!this.initialized) return DPN.UNINITIALIZED;
         ++this.generation; this.localClosing = true; this.connecting = false; this.suppress = false;
+        for (const finish of [...this.localProcessed]) finish(DPN.USERCANCEL);
         this.engine.close(); this.sync(); this.localId = 0; this.contexts.clear(); this.groupContexts.clear(); return DPN.OK;
     }
     dispose(): void {
@@ -154,12 +158,36 @@ export class DirectPlay8Session {
         if (this.eventRetry) clearTimeout(this.eventRetry); this.eventRetry = undefined;
         this.events = []; this.eventBytes = 0;
     }
-    send(to: number, flags: number, data: Uint8Array): number | Promise<number> {
+    send(to: number, flags: number, data: Uint8Array, signal?: AbortSignal,
+        delivered?: (metadata: import("./send-operations").DirectPlaySendMetadata) => void, completedLocal?: (result: number) => void): number | Promise<number> {
+        if (signal?.aborted) return DPN.USERCANCEL;
         if (this.error) return this.error;
         if (!this.localId || (to && !this.engine.entities.has(to))) return DPN.INVALIDPLAYER;
-        if (this.engine instanceof NativeDirectPlayCore) return this.engine.sendDpn(to, flags, data);
+        const localDelivery = () => delivered?.({ firstFrameRtt: 0, firstFrameRetries: 0, flags: flags & 8 ? 1 : 0 });
+        if (this.engine instanceof NativeDirectPlayCore) return this.engine.sendDpn(to, flags, data, signal, to === this.localId ? localDelivery : undefined, completedLocal);
+        if (flags & 4) {
+            const target = this.engine.entities.get(to);
+            const recipients = !to ? [...this.engine.entities.values()].filter(e => !e.group).map(e => e.id) : target!.group ? target!.members : [to];
+            const local = recipients.includes(this.localId) && !(flags & 0x20);
+            if (local && (this.localProcessed.size >= 256 || this.localProcessedBytes + data.length > 4 * 1024 * 1024)) return DPN.TABLEFULL;
+            const remote = recipients.some(id => id !== this.localId) ? this.engine.send(this.localId, to, flags & 8 ? 1 : 0, data) : DP.OK;
+            const processed = local ? new Promise<number>(resolve => {
+                const size = data.length, abort = () => finish(DPN.USERCANCEL);
+                const finish = (result: number) => {
+                    if (!this.localProcessed.delete(finish)) return;
+                    this.localProcessedBytes -= size; signal?.removeEventListener("abort", abort); resolve(result);
+                    // Groups and broadcasts may still await remote recipients.
+                    if (to === this.localId) completedLocal?.(result);
+                };
+                this.localProcessed.add(finish); this.localProcessedBytes += size; signal?.addEventListener("abort", abort, { once: true });
+                this.emit({ type: 0x11, id: this.localId, context: this.contexts.get(this.localId) ?? 0, data: data.slice(), flags: flags & 8 ? 1 : 0, processed: () => finish(DPN.OK) });
+            }) : Promise.resolve(DPN.OK);
+            if (local) localDelivery();
+            return Promise.all([Promise.resolve(remote).then(dp8Result), processed]).then(([sent, handled]) => sent || handled);
+        }
         const wireFlags = (flags & 8 ? 1 : 0) | (flags & 0x20 ? 0 : 0x10000);
         const result = this.engine.send(this.localId, to, wireFlags, data);
+        if (to === this.localId && result === DP.OK) localDelivery();
         return result instanceof Promise ? result.then(dp8Result) : dp8Result(result);
     }
     async setInfo(id: number, info: PlayerInfo, mask: number): Promise<number> {

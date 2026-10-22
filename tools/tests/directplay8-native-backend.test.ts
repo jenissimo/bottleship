@@ -19,8 +19,8 @@ function pair() {
     cleanup.push(() => nets.forEach(n => n.attach(null)));
     return nets;
 }
-function host(network: LanNetwork, configure: { badApplication?: boolean; fail?: number; reply?: Uint8Array; groups?: boolean } = {}) {
-    let peerNode = new Uint8Array(6), peerPort = 0, requests = 0, raw: Uint8Array[] = [], processed: number[] = [];
+function host(network: LanNetwork, configure: { badApplication?: boolean; fail?: number; reply?: Uint8Array; groups?: boolean; holdProcessed?: boolean } = {}) {
+    let peerNode = new Uint8Array(6), peerPort = 0, requests = 0, raw: Uint8Array[] = [], processed: number[] = [], outboundProcessed: number[] = [];
     const link = new NativeReliableLink({ send(bytes) { return network.send(2308, peerNode, peerPort, bytes, PROTO_UDP); },
         onMessage(message) {
             const view = new DataView(message.payload.buffer, message.payload.byteOffset, message.payload.byteLength);
@@ -45,10 +45,10 @@ function host(network: LanNetwork, configure: { badApplication?: boolean; fail?:
                 requests++; const id = view.getUint32(4, true), packet = new Uint8Array(4 + 40 + 4); packet.set(nativeCoreWords(0xdb, 8, 5, 0, 2, 0, 0, 40, 4, 8, id)); packet.set([9, 0, 8, 7], 44);
                 void link.sendReliable(packet);
             } else if (command === 0xe1) processed.push(view.getUint32(4, true));
-            else if (command === 0xe0) { raw.push(message.payload.slice(8)); void link.sendReliable(nativeCoreWords(0xe1, view.getUint32(4, true))); }
+            else if (command === 0xe0) { const id = view.getUint32(4, true); outboundProcessed.push(id); raw.push(message.payload.slice(8)); if (!configure.holdProcessed) void link.sendReliable(nativeCoreWords(0xe1, id)); }
         } });
     network.bind(2308, { deliver(dg) { peerNode = Uint8Array.from(dg.srcNode); peerPort = dg.srcPort; link.receive(dg.data); } }, PROTO_UDP); link.listen();
-    cleanup.push(() => link.close()); return { link, raw, processed, get requests() { return requests; } };
+    cleanup.push(() => link.close()); return { link, raw, processed, outboundProcessed, get requests() { return requests; } };
 }
 test("native backend joins with a real binary channel, preserves metadata, sends fragmented user data and closes both directions", async () => {
     const [client, server] = pair(), h = host(server), core = new NativeDirectPlayCore(client, "peer", 300, 2);
@@ -102,6 +102,20 @@ test("incoming COMPLETEONPROCESS waits for the application handler completion, i
     core.removeMessage(0); expect(await core.shutdown()).toBe(0);
 });
 
+test("active native COP cancellation releases its request and late E1 cannot finish a replacement operation", async () => {
+    const [client, server] = pair(), h = host(server, { holdProcessed: true }), core = new NativeDirectPlayCore(client, "peer", 300, 2); cleanup.push(() => core.dispose());
+    expect(await core.connect({ node: [...server.node], port: 2308 }, desc, { name: { short: "Игрок", long: "" }, data: [1, 0, 9], flags: 0 }, Uint8Array.of(3, 0, 7))).toBe(0);
+    const first = new AbortController(), pending = core.sendDpn(7, 12, Uint8Array.of(1, 0, 2), first.signal);
+    expect(h.outboundProcessed.length).toBe(1); first.abort(); expect(await pending).toBe(DPN.USERCANCEL);
+    const second = new AbortController(); let finished = false;
+    const replacement = core.sendDpn(7, 12, Uint8Array.of(3, 0, 4), second.signal).then(hr => { finished = true; return hr; });
+    expect(h.outboundProcessed.length).toBe(2); expect(h.outboundProcessed[0]).not.toBe(h.outboundProcessed[1]);
+    expect(await h.link.sendReliable(nativeCoreWords(0xe1, h.outboundProcessed[0]))).toBe(0); await Bun.sleep(2); expect(finished).toBe(false);
+    expect(await h.link.sendReliable(nativeCoreWords(0xe1, h.outboundProcessed[1]))).toBe(0); expect(await replacement).toBe(0);
+    second.abort(); expect(finished).toBe(true);
+    const local = new AbortController(), loopback = core.sendDpn(core.localId, 12, Uint8Array.of(5), local.signal);
+    local.abort(); expect(await loopback).toBe(DPN.USERCANCEL); core.queue.at(-1)!.processed!(); expect(await core.shutdown()).toBe(0);
+});
 test("bounded UDP carrier queue retries on writable and drains final EOS ACKs before releasing its binding", async () => {
     const [client, server] = pair(), h = host(server), original = client.send.bind(client); let busy = true, blockAcks = false;
     client.send = (...args: Parameters<LanNetwork["send"]>) => busy || (blockAcks && decodeNativeProtocolFrame(args[3])?.kind === "ack") ? false : original(...args);
@@ -127,4 +141,32 @@ test("malformed core operations and request extents fail before table access; pa
     const bytes = nativeCoreWords(0xd9, 9, 8, 7, 0, 8, 55), op = decodeNativeCoreOperation(bytes)!; bytes.fill(0);
     expect(op).toMatchObject({ command: 0xd9, id: 9, player: 8, version: 7, requesting: 8, handle: 55 });
     expect(() => encodeNativeCoreRequest(0xd6, 1, [8, 2], [{ field: 4, data: Uint8Array.of(1) }])).toThrow();
+});
+
+test("native self COP reports processing synchronously and only once before its Promise reaction", async () => {
+    const [client, server] = pair(); host(server); const session = new DirectPlay8Session(client);
+    cleanup.push(() => session.dispose()); expect(session.initialize()).toBe(0);
+    await session.setInfo(0, { name: "Игрок", data: [1, 0, 9], flags: 0 }, 3);
+    expect(await session.connectNative({ node: [...server.node], port: 2308 }, desc, 0, Uint8Array.of(3, 0, 7), 0, [20, 0, 2, 14, 300])).toBe(0);
+    let processed!: () => void, promiseRan = false;
+    session.onEvent = event => { if (event.type === 0x11) processed = event.processed!; };
+    const results: number[] = [];
+    const pending = Promise.resolve(session.send(session.localId, 12, Uint8Array.of(7), undefined, undefined, hr => results.push(hr))).then(hr => { promiseRan = true; return hr; });
+    expect(results).toEqual([]); expect(session.pendingLocalProcessing).toBe(1);
+    processed(); expect(results).toEqual([0]); expect(promiseRan).toBe(false); expect(session.pendingLocalProcessing).toBe(0);
+    processed(); session.close(); expect(results).toEqual([0]); expect(await pending).toBe(0);
+});
+test("native self delivery acceptance precedes the promise microtask and same-turn Close", async () => {
+    const [client, server] = pair(); host(server); const session = new DirectPlay8Session(client);
+    cleanup.push(() => session.dispose()); expect(session.initialize()).toBe(0);
+    await session.setInfo(0, { name: "Игрок", data: [1, 0, 9], flags: 0 }, 3);
+    expect(await session.connectNative({ node: [...server.node], port: 2308 }, desc, 0, Uint8Array.of(3, 0, 7), 0, [20, 0, 2, 14, 300])).toBe(0);
+    const events: string[] = [];
+    session.onEvent = event => { if (event.type === 0x11) { events.push("receive"); expect(event.data).toEqual(Uint8Array.of(3, 2, 1)); } };
+    const pending = session.send(session.localId, 8, Uint8Array.of(3, 2, 1), undefined, metadata => {
+        events.push("accepted"); expect(metadata).toEqual({ firstFrameRtt: 0, firstFrameRetries: 0, flags: 1 });
+    });
+    expect(events).toEqual(["receive", "accepted"]);
+    session.close(); events.push("closed"); expect(await pending).toBe(0);
+    expect(events).toEqual(["receive", "accepted", "closed"]);
 });

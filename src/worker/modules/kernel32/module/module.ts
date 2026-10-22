@@ -14,7 +14,7 @@ import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { FORCE_NATIVE_PACKAGE_LOAD, isUnderSystemDirectory } from '../../../core/hle-system-catalog';
 import { findDllRule } from '../../../core/dll-rules';
 import { validLoadLibrarySearchFlags } from '../../../core/dll-search-order';
-import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, loadedHleModules, markHleModuleLoaded } from '../../../core/hle-module-images';
+import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, loadedHleModules, retainHleModuleLoaded, type HleModuleLoadReference } from '../../../core/hle-module-images';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
 import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handle-miss-registry';
 import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
@@ -43,6 +43,7 @@ const loggedUnknownModuleHandles = new Set<number>();
 // them. Only explicitly LoadLibrary'd modules unload at refcount 0.
 const pinnedModuleBases = new Set<number>();
 const dynamicLoadRefs = new Map<number, number>();
+const hleLibraryReferences = new Map<number, Map<string, HleModuleLoadReference>>();
 let cacheOwnerProcess: any = null;
 let cacheOwnerResetGeneration = -1;
 
@@ -66,6 +67,8 @@ function ensureProcessLocalCaches(): void {
     moduleHandleMissRegistry.clear();
     pinnedModuleBases.clear();
     dynamicLoadRefs.clear();
+    for (const aliases of hleLibraryReferences.values()) for (const reference of aliases.values()) reference.release();
+    hleLibraryReferences.clear();
 }
 
 /** Pin every registered module that holds no dynamic LoadLibrary ref (see
@@ -234,6 +237,16 @@ function rememberModuleHandlePath(handle: number, pathOrName: string, moduleName
     if (!h) return;
     const path = formatModulePath(pathOrName, moduleName);
     if (path) handleToPathCache.set(h, path);
+}
+
+function rememberHleLibraryReference(name: string, handle: number): void {
+    let aliases = hleLibraryReferences.get(handle);
+    if (!aliases) hleLibraryReferences.set(handle, aliases = new Map());
+    const key = getDllBaseName(name);
+    if (!aliases.has(key)) {
+        const reference = retainHleModuleLoaded(name);
+        if (reference) aliases.set(key, reference);
+    }
 }
 
 function rememberLoadLibraryHandle(name: string, handle: number): void {
@@ -818,7 +831,7 @@ function initModuleFunctions(): void {
             if (blocked) {
                 return blocked;
             }
-            markHleModuleLoaded(dllName);
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}") -> 0x${thunkedBase.toString(16)} (thunked DLL)`);
             return { value: thunkedBase, stackCleanup: 12 };
@@ -907,7 +920,7 @@ function initModuleFunctions(): void {
             if (blocked) {
                 return blocked;
             }
-            markHleModuleLoaded(dllName);
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}") -> 0x${thunkedBase.toString(16)} (thunked DLL)`);
             return { value: thunkedBase, stackCleanup: 12 };
@@ -993,7 +1006,7 @@ function initModuleFunctions(): void {
         if (thunkedBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 4, "LoadLibraryW");
             if (blocked) return blocked;
-            markHleModuleLoaded(dllName);
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             return { value: thunkedBase, stackCleanup: 4 };
         }
@@ -1096,7 +1109,7 @@ function initModuleFunctions(): void {
                 return { value: 0, stackCleanup: 4 };
             }
 
-            markHleModuleLoaded(dllName);
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             return { value: thunkedBase, stackCleanup: 4 };
         }
@@ -1157,7 +1170,20 @@ function initModuleFunctions(): void {
         const registry = System.getInstance().process?.moduleRegistry;
         const mod = registry?.getByBase?.(hModule);
 
-        // Pinned (EXE + static imports), thunked pseudo-bases, and unknown handles:
+        if (!mod && hleModuleNameByBase(hModule) !== undefined) {
+            const refs = dynamicLoadRefs.get(hModule) ?? 0;
+            if (refs > 1) dynamicLoadRefs.set(hModule, refs - 1);
+            else if (refs === 1) {
+                dynamicLoadRefs.delete(hModule);
+                for (const reference of hleLibraryReferences.get(hModule)?.values() ?? []) reference.release();
+                hleLibraryReferences.delete(hModule);
+                for (const [key, value] of loadLibraryHandleCache) if (value === hModule) loadLibraryHandleCache.delete(key);
+                handleToPathCache.delete(hModule);
+            }
+            return { value: 1, stackCleanup: 4 };
+        }
+
+        // Pinned (EXE + static imports) and unknown handles:
         // report success without unloading (a static import holds a permanent ref).
         if (!mod || pinnedModuleBases.has(hModule)) {
             Logger.verbose(LogCategory.KERNEL32, `FreeLibrary(0x${hModule.toString(16)}) -> 1 (pinned/unknown)`);

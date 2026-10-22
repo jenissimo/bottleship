@@ -1024,6 +1024,7 @@ export interface WsaProcessState {
     reset(): void;
 }
 const processStates = new WeakMap<Process, WsaProcessState>();
+const nativeHandleProviders = new WeakMap<Process, { table: WsaSocketTable; provider: import('../core/resources/system-resource-provider').ExternalHandleProvider }>();
 /** Kernel calls can use an authenticated OS descriptor before loading a Winsock DLL. */
 export function getWsaNativeSocketTable(process: Process, socket: number): WsaSocketTable | undefined {
     // All emulated socket aliases occupy this range; unrelated kernel/file handles
@@ -1032,7 +1033,25 @@ export function getWsaNativeSocketTable(process: Process, socket: number): WsaSo
     const table = (processStates.get(process) ?? getWsaProcessState(process)).table;
     // isValid is an actor lookup under this process's PID/epoch, never a Winsock
     // context import. Keep the base identity for shared overlapped queues.
-    return table.nativeHandleView.isValid(socket) ? table : undefined;
+    if (!table.nativeHandleView.isValid(socket)) return undefined;
+    let registration = nativeHandleProviders.get(process);
+    if (!registration || registration.table !== table) {
+        const native = table.nativeHandleView;
+        const provider: import('../core/resources/system-resource-provider').ExternalHandleProvider = {
+            get(handle) {
+                try { return native.isValid(handle) ? { grantedAccess: 0x001f01ff, flags: native.get(handle).handleFlags } : undefined; }
+                catch { return undefined; }
+            },
+            set(handle, attributes) {
+                if (attributes.grantedAccess !== 0x001f01ff) return false;
+                try { if (!native.isValid(handle)) return false; native.setHandleFlags(handle, 3, attributes.flags); return true; }
+                catch { return false; }
+            },
+        };
+        nativeHandleProviders.set(process, registration = { table, provider });
+    }
+    System.getInstance().resourceProvider.setExternalHandleProvider(process, registration.provider);
+    return table;
 }
 export function hasWsaSocket(process: Process, socket: number): boolean {
     return getWsaNativeSocketTable(process, socket) !== undefined;

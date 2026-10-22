@@ -12,6 +12,7 @@ import { DirectPlaySendQueue } from "../dplayx/send-queue";
 import type { SessionDesc, Discovery, Address } from "../dplayx/session";
 import { DirectPlay8Session, dp8Result, type DirectPlay8Role } from "./peer";
 import { DirectPlay8Callbacks } from "./callbacks";
+import { DirectPlaySendOperationPool, type DirectPlaySendOperation } from "./send-operations";
 import { NativeDirectPlayDiscovery, type NativeDiscoveryOperation } from "./native-wire/discovery";
 import { isExternalIpv4Node } from "../../net/netplay-wire";
 import { DirectPlayAddressApi } from "./address-api";
@@ -23,7 +24,8 @@ import type { Lobby8Settings } from "../dpnlobby/structures";
 import { DPN, DP8_TCPIP, DP8_IPX, DP8_PEER, DP8_CLIENT, DP8_SERVER, guidBytes, guidString, utf16 } from "./constants";
 
 interface Operation { kind: "connect" | "enum" | "other"; context: number; done: boolean; cancel?(): void; }
-interface SendRecord { handle: number; flags: number; context: number; bytes: number; accounted: boolean; descriptors: { pointer: number; size: number }[]; }
+interface SendRecord { handle: number; flags: number; context: number; bytes: number; accounted: boolean;
+    localOperation?: DirectPlaySendOperation; descriptors: { pointer: number; size: number }[]; }
 interface PeerState {
     session: DirectPlay8Session; callbacks?: DirectPlay8Callbacks; nativeDiscovery?: NativeDirectPlayDiscovery; generation: number; nextHandle: number;
     operations: Map<number, Operation>; closing: boolean; pendingConnect: boolean; connectGeneration: number; sends: DirectPlaySendQueue; sendRecords: Map<number, SendRecord>;
@@ -36,9 +38,11 @@ export class DirectPlay8NetworkApi {
     private states = new Map<number, PeerState>();
     private lobbyRegistrations = new Set<LobbyPeerRegistration>();
     private guest: DirectPlayGuestMemory;
+    private sendOperations: DirectPlaySendOperationPool;
     constructor(readonly process: Process, readonly tables: () => Record<string, VTableInfo>,
-        readonly addresses: DirectPlayAddressApi, readonly network: LanNetwork = lanNetwork) { this.guest = new DirectPlayGuestMemory(process); }
-    reset(): void { for (const registration of this.lobbyRegistrations) registration.release(); this.lobbyRegistrations.clear(); for (const s of this.states.values()) { s.generation++; s.lobby?.release(); s.lobby = undefined; s.sends.reset(); s.sendRecords.clear(); s.nativeDiscovery?.close(); s.session.dispose(); s.callbacks?.close(); } this.states.clear(); }
+        readonly addresses: DirectPlayAddressApi, readonly network: LanNetwork = lanNetwork) { this.guest = new DirectPlayGuestMemory(process); this.sendOperations = DirectPlaySendOperationPool.forProcess(process); }
+    reset(): void { for (const registration of this.lobbyRegistrations) registration.release(); this.lobbyRegistrations.clear(); for (const s of this.states.values()) { s.generation++; s.lobby?.release(); s.lobby = undefined; s.sends.reset(); this.clearSendRecords(s); s.nativeDiscovery?.close(); s.session.dispose(); s.callbacks?.close(); } this.states.clear(); }
+    private clearSendRecords(state: PeerState): void { for (const record of state.sendRecords.values()) record.localOperation?.release(); state.sendRecords.clear(); }
     private state(ptr: number, role: DirectPlay8Role): PeerState | null {
         const obj = SystemResourceProvider.getInstance().getComObjectByAddress(ptr);
         if (!obj || ![DP8_PEER, DP8_CLIENT, DP8_SERVER].includes(obj.iid)) return null;
@@ -47,7 +51,10 @@ export class DirectPlay8NetworkApi {
             state = { session: new DirectPlay8Session(this.network, role), generation: 0, nextHandle: 1,
                 operations: new Map(), closing: false, pendingConnect: false, connectGeneration: 0, lobbyEvents: new WeakSet(), sends: null!, sendRecords: new Map(), caps: [20, 0, 200, 14, 25000], spcaps: new Map(), stats: new Map() };
             const owner = state;
-            state.sends = new DirectPlaySendQueue((job, data) => owner.session.send(job.to, owner.sendRecords.get(job.context)?.flags ?? 0, data), completion => {
+            state.sends = new DirectPlaySendQueue((job, data, settled) => {
+                const record = owner.sendRecords.get(job.context);
+                return owner.session.send(job.to, record?.flags ?? 0, data, job.signal, metadata => record?.localOperation?.delivered(metadata), settled);
+            }, completion => {
                 const record = owner.sendRecords.get(completion.context); if (!record) return true;
                 const result = completion.hr === 0x8877019a ? DPN.USERCANCEL : dp8Result(completion.hr);
                 const stats = this.stats(owner, completion.to);
@@ -55,13 +62,15 @@ export class DirectPlay8NetworkApi {
                     record.accounted = true;
                     if (!result) { const guaranteed = !!(record.flags & 8); stats[guaranteed ? 4 : 6] += record.bytes; stats[guaranteed ? 5 : 7]++; stats[record.flags & 0x80 ? 12 : record.flags & 0x40 ? 16 : 14]++; }
                 }
-                if (record.flags & 2) { owner.sendRecords.delete(completion.context); return true; }
+                if (record.flags & 2) { record.localOperation?.release(); owner.sendRecords.delete(completion.context); return true; }
                 const descriptors = record.flags & 1 ? record.descriptors : [];
+                const metadata = record.localOperation?.metadata();
+                const release = () => record.localOperation?.release();
                 const accepted = owner.callbacks?.native(0x14, 40 + descriptors.length * 8, ptr => {
                     Mem.writeUint32(ptr, 40);
-                    [record.handle, record.context, result, completion.sendTime, 0, 0, record.flags & 8 ? 1 : 0, descriptors.length ? ptr + 40 : 0, descriptors.length].forEach((n, i) => Mem.writeUint32(ptr + 4 + i * 4, n));
+                    [record.handle, record.context, result, completion.sendTime, metadata?.firstFrameRtt ?? 0, metadata?.firstFrameRetries ?? 0, metadata?.flags ?? (record.flags & 8 ? 1 : 0), descriptors.length ? ptr + 40 : 0, descriptors.length].forEach((n, i) => Mem.writeUint32(ptr + 4 + i * 4, n));
                     descriptors.forEach((d, i) => { Mem.writeUint32(ptr + 40 + i * 8, d.size); Mem.writeUint32(ptr + 44 + i * 8, d.pointer); });
-                }) ?? false;
+                }, () => { release(); }, release, record) ?? false;
                 if (accepted) owner.sendRecords.delete(completion.context);
                 return accepted;
             });
@@ -173,7 +182,7 @@ export class DirectPlay8NetworkApi {
         methods.Release = (s, a) => {
             const obj = SystemResourceProvider.getInstance().getComObjectByAddress(a[0])!, handle = obj.handle, count = obj.release();
             if (!count) {
-                s.generation++; s.sends.reset(); s.sendRecords.clear(); s.nativeDiscovery?.close(); s.session.dispose(); s.callbacks?.close(); this.states.delete(handle);
+                s.generation++; s.sends.reset(); this.clearSendRecords(s); s.nativeDiscovery?.close(); s.session.dispose(); s.callbacks?.close(); this.states.delete(handle);
                 const registration = s.lobby; s.lobby = undefined;
                 return this.retireLobby(registration);
             }
@@ -185,6 +194,7 @@ export class DirectPlay8NetworkApi {
             if (!this.guest.valid(a[2], 1, "rx")) return DPN.INVALIDPOINTER;
             const hr = s.session.initialize(); if (hr) return hr;
             s.callbacks = new DirectPlay8Callbacks(this.process, s.session, this.addresses, a[2], a[1]);
+            s.callbacks.onSpace = () => s.sends.retryCompletions();
             s.session.onIndicate = request => s.callbacks!.indicate(request);
             s.session.virtualProvider.onEnumQuery = request => s.callbacks!.query(request);
             const executor = s.callbacks.queue.executor, generation = s.generation;
@@ -364,7 +374,7 @@ export class DirectPlay8NetworkApi {
             Mem.writeUint32(a[2], s.session.groupContexts.get(a[1]) ?? 0); return DPN.OK;
         };
         methods.ReturnBuffer = (s, a) => a[2] ? DPN.INVALIDFLAGS : s.callbacks?.returnBuffer(a[1]) ?? DPN.UNINITIALIZED;
-        methods.SendTo = (s, a) => {
+        methods.SendTo = (s, a, _iface, ctx) => {
             const flags = a[7];
             if (flags & ~(SYNC | 0x1ff)) return DPN.INVALIDFLAGS;
             if ((flags & 0xc0) === 0xc0 || ((flags & 1) && (flags & 2)) || ((flags & 4) && (!(flags & 8) || (flags & 2))) ||
@@ -387,16 +397,31 @@ export class DirectPlay8NetworkApi {
                 return result;
             };
             if (!(flags & SYNC)) { const admissionError = s.sends.admissionError(total); if (admissionError) return dp8Result(admissionError); }
-            const copy = flags & 1 ? undefined : collect(); if (copy === null) return DPN.INVALIDPARAM;
-            if (flags & SYNC) return Promise.resolve(s.session.send(a[1], flags, copy ?? collect()!)).then<number>(hr => hr);
+            const local = a[1] === s.session.localId;
+            const copy = flags & 1 && !local ? undefined : collect(); if (copy === null) return DPN.INVALIDPARAM;
+            if (flags & SYNC) {
+                const callbacks = s.callbacks, inline = !!(flags & 4) && a[1] === s.session.localId && callbacks;
+                const resume = inline ? callbacks.queue.pause() : undefined;
+                const processing = s.session.pendingLocalProcessing, generation = s.generation;
+                const result = s.session.send(a[1], flags, copy ?? collect()!);
+                if (inline && s.session.pendingLocalProcessing > processing) return callbacks.queue.run(ctx, 32, () => generation === s.generation ? DPN.OK : DPN.USERCANCEL, resume);
+                resume?.(); return Promise.resolve(result).then<number>(hr => hr);
+            }
             if (a[6] && !this.guest.valid(a[6], 4, "rw")) return DPN.INVALIDPOINTER;
-            const handle = this.handle(s);
-            const record: SendRecord = { handle, flags, descriptors, context: a[5], bytes: total, accounted: false };
-            const admitted = s.sends.enqueue({ from: s.session.localId, to: a[1], flags: 0, priority: flags & 0x80 ? 2 : flags & 0x40 ? 0 : 1,
-                timeout: a[4], context: handle, data: () => copy ?? collect() }, total);
-            if (admitted.hr) return dp8Result(admitted.hr);
+            const localOperation = local ? this.sendOperations.begin(!!(flags & 4)) : undefined;
+            if (local && !localOperation) return DPN.OUTOFMEMORY;
+            const handle = this.handle(s), generation = s.generation;
+            const record: SendRecord = { handle, flags, descriptors, context: a[5], bytes: total, accounted: false, localOperation: localOperation ?? undefined };
+            const callbacks = s.callbacks, inline = local && !(flags & 4) && callbacks?.queue.executor.count === 0;
+            const resume = local ? callbacks?.queue.pause() : undefined;
             s.sendRecords.set(handle, record);
-            if (a[6]) Mem.writeUint32(a[6], handle); return DPN.PENDING;
+            const admitted = s.sends.enqueue({ from: s.session.localId, to: a[1], flags: 0, priority: flags & 0x80 ? 2 : flags & 0x40 ? 0 : 1,
+                timeout: a[4], context: handle, cancelActive: !!(flags & 4), eager: local, processing: local && !!(flags & 4), data: () => copy ?? collect() }, total);
+            if (admitted.hr) { s.sendRecords.delete(handle); record.localOperation?.rollback(); resume?.(); return dp8Result(admitted.hr); }
+            if (a[6]) Mem.writeUint32(a[6], handle);
+            if (inline) return callbacks.queue.runSelected(ctx, 32, task => task.key === record,
+                () => generation === s.generation ? DPN.PENDING : DPN.USERCANCEL, resume);
+            resume?.(); return DPN.PENDING;
         };
         methods.GetSendQueueInfo = (s, a) => {
             if (a[4] & ~7) return DPN.INVALIDFLAGS; if (s.session.error) return s.session.error;
@@ -490,27 +515,29 @@ export class DirectPlay8NetworkApi {
             const manual = callbacks && !callbacks.queue.executor.count, resume = manual ? callbacks.queue.pause() : undefined;
             const lobbyUpdate = registration && s.session.engine.desc ? registration.publish(3) : Promise.resolve();
             s.lobby = undefined;
-            ++s.generation; s.sends.reset(); s.sendRecords.clear(); s.nativeDiscovery?.close(); s.nativeDiscovery = undefined; s.operations.clear();
-            const nativeClose = s.session.engine.kind === "native" ? s.session.beginClose().then(hr => { s.session.close(); return hr; }) : undefined;
+            const generation = ++s.generation, processGeneration = this.process.resetGeneration;
+            const live = () => generation === s.generation && processGeneration === this.process.resetGeneration;
+            callbacks?.beginClose(); s.sends.seal(); s.nativeDiscovery?.close(); s.nativeDiscovery = undefined; s.operations.clear();
+            const nativeClose = s.session.engine.kind === "native" ? s.session.beginClose().then(hr => { if (!live()) return DPN.USERCANCEL; s.session.close(); return hr; }) : undefined;
             if (!nativeClose) s.session.close();
             if (manual) {
                 const finish = () => {
                     registration?.release(); if (registration) this.lobbyRegistrations.delete(registration);
-                    callbacks.close(); resume?.();
+                    if (!live()) { resume?.(); return; }
+                    s.sends.reset(); this.clearSendRecords(s); callbacks.close(); resume?.();
                     if (s.callbacks === callbacks) { s.callbacks = undefined; s.session.dispose(); s.closing = false; }
                 };
-                if (!registration && !nativeClose) return callbacks.queue.run(ctx, 8, DPN.OK, finish);
-                const generation = s.generation;
+                if (!registration && !nativeClose) return callbacks.queue.run(ctx, 8, () => live() ? DPN.OK : DPN.USERCANCEL, finish);
                 return Promise.resolve(nativeClose).then(() => lobbyUpdate).then(() => registration?.flush()).then<ThunkResult>(() => ({
-                    value: generation === s.generation ? DPN.OK : DPN.USERCANCEL,
+                    value: live() ? DPN.OK : DPN.USERCANCEL,
                     startCallbackChain: frame => {
-                        if (generation !== s.generation) { resume?.(); return false; }
-                        const value = callbacks.queue.run({ ...ctx, esp: frame.esp, returnAddr: frame.returnAddr }, 8, DPN.OK, finish);
+                        if (!live()) { resume?.(); return false; }
+                        const value = callbacks.queue.run({ ...ctx, esp: frame.esp, returnAddr: frame.returnAddr }, 8, () => live() ? DPN.OK : DPN.USERCANCEL, finish);
                         return typeof value !== "number" && !!value.suspendedForCallback;
                     },
                 }));
             }
-            return Promise.resolve(nativeClose).then(() => s.session.flush()).then(() => callbacks?.flush()).then(() => lobbyUpdate).then(() => registration?.flush()).then<ThunkResult>(() => ({ value: DPN.OK, startCallbackChain: () => { registration?.release(); if (registration) this.lobbyRegistrations.delete(registration); callbacks?.close(); if (s.callbacks === callbacks) { s.callbacks = undefined; s.session.dispose(); s.closing = false; } return false; } }));
+            return Promise.resolve(nativeClose).then(() => live() ? s.sends.flushCompletions() : undefined).then(() => live() ? s.session.flush() : undefined).then(() => live() ? callbacks?.flush() : undefined).then(() => lobbyUpdate).then(() => registration?.flush()).then<ThunkResult>(() => ({ value: live() ? DPN.OK : DPN.USERCANCEL, startCallbackChain: () => { registration?.release(); if (registration) this.lobbyRegistrations.delete(registration); if (!live()) return false; s.sends.reset(); this.clearSendRecords(s); callbacks?.close(); if (s.callbacks === callbacks) { s.callbacks = undefined; s.session.dispose(); s.closing = false; } return false; } }));
         };
         methods.EnumHosts = (s, a) => {
             if (a[11] & ~(SYNC | 3)) return DPN.INVALIDFLAGS;

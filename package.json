@@ -57,7 +57,7 @@
     "report:d3d9-capture": "bun tools/d3d9-parity/compare-capture.ts --reporting tools/d3d9-parity/captures/native-d3d9-windows-current.json",
     "gate:d3d9-capture": "bun tools/gate-d3d9-capture.ts",
     "report:d3d9-wgsl-validator": "bun tools/d3d9-parity/wgsl-validator.ts --reporting",
-    "test": "bun test",
+    "test": "bun test --path-ignore-patterns 'logs/**'",
     "gate": "bun tools/generate-index.ts && bun run validate-signatures && bun run validate-struct-offsets && bun run validate-guest-code-writes && bun run validate-stub-tables && bun run validate-data-export-binding && bun run validate-api-export-uniqueness && bun run validate-d3d9-export-collisions && bun run validate-unimplemented-returns && bun run validate-file-cursor && bun run validate-jit-exports && bun run validate-guest-pointer-guards && bun run validate-guest-memory-borrow && bun run validate-guest-memory-views && bun run validate-cpu-proxy-reads && bun run validate-hypercall-abi && bun run validate-jit-shipping-config && bun run validate-census-abi && bun run validate-tlb-mirror && bun run validate-eagl-read-cursor && bun run validate-video-plane-policy && bun run validate-render-space-ownership && bun run validate-wgsl-calls && bun run validate-d3d9-arena-abi && bun run validate-d3d9-capability-contracts && bun run validate-d3d9-caps && bun run validate-snapshots && bun run gate:d3d9-capture && BS_REQUIRE_WGSL_VALIDATOR=1 bun run report:d3d9-wgsl-validator && bun run typecheck && BS_REQUIRE_WGSL_VALIDATOR=1 bun run test",
     "gate:jit-integrity": "node tools/gate-jit-integrity.mjs",
     "aot:opt:p0": "node tools/aot/opt/runner.mjs",

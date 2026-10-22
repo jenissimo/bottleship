@@ -1,5 +1,7 @@
 import { beforeEach, afterEach, test, expect } from "bun:test";
 import { DirectPlay8NetworkApi } from "../../src/worker/modules/dpnet/network-api";
+import { DirectPlaySendOperationPool } from "../../src/worker/modules/dpnet/send-operations";
+import { DirectPlayCallbackExecutor } from "../../src/worker/modules/dpnet/executor";
 import { DirectPlayAddressApi } from "../../src/worker/modules/dpnet/address-api";
 import { DirectPlayAddress } from "../../src/worker/modules/dpnet/address";
 import { DPN, DP8_PEER, DP8_TCPIP, guidBytes, utf16 } from "../../src/worker/modules/dpnet/constants";
@@ -22,7 +24,7 @@ const oldProcess = system.process, oldCreate = scheduler.createThread, oldThread
 let network: LanNetwork;
 let ram: Uint8Array, process: Process, api: DirectPlay8NetworkApi, addresses: DirectPlayAddressApi, exports: Record<string, ThunkImplementation>;
 let objects: BaseComObject[], allocated: number, primary: number, methods: Map<string, ThunkImplementation>, reset: Set<() => void>, freed: number[];
-let calls: { args: number[]; done: (hr: number) => number }[];
+let calls: { args: number[]; done: (hr: number) => number | null; enumerationState?: { continueEnumeration(): void } }[];
 const ctx = () => ({ esp: 0x9000, eip: 0x7000, eax: 0, ebx: 0, ecx: 0, edx: 0, edi: 0, esi: 0, ebp: 0, eflags: 0x202 }) as X86Context;
 const write = (p: number, n: number) => new DataView(ram.buffer).setUint32(p, n >>> 0, true);
 const read = (p: number) => new DataView(ram.buffer).getUint32(p, true);
@@ -51,8 +53,8 @@ beforeEach(() => {
         resourceProvider: { unregisterKernelObject() {} },
         onReset: (fn: () => void) => { reset.add(fn); return () => reset.delete(fn); },
         dispatcher: { register: (_dll: string, name: string, fn: ThunkImplementation) => methods.set(name, fn),
-            callbackManager: { saveSuspendedThunkContext: () => 1, abandonSuspendedFrame() {}, getPendingCallback: () => undefined,
-                invokeCallback: (_routine: number, args: number[], _cleanup: number, done: (hr: number) => number) => {
+            callbackManager: { saveSuspendedThunkContext: () => 1, abandonSuspendedFrame() {}, getPendingCallback: (id: number) => calls[id - 1],
+                invokeCallback: (_routine: number, args: number[], _cleanup: number, done: (hr: number) => number | null) => {
                     calls.push({ args, done }); return { callbackId: calls.length };
                 } } },
     } as unknown as Process;
@@ -74,8 +76,9 @@ beforeEach(() => {
 afterEach(() => { api.reset(); addresses.reset(); for (const obj of objects) resource.unregisterComObject(obj.handle);
     system.process = oldProcess; scheduler.createThread = oldCreate; scheduler.getThreadIdByHandle = oldThreadId; });
 function initialize() { expect(call("Initialize", [0x1234, 0x7000, 0])).toBe(DPN.OK); }
-async function host() {
-    initialize(); write(0x3000, 24); write(0x3004, 1); write(0x3008, 0x3100); ram.set(utf16("Host\0"), 0x3100);
+async function host(poolInitialized = false) {
+    if (poolInitialized) { const result = await call("Initialize", [0x1234, 0x7000, 0]); expect(typeof result === "number" ? result : result.value).toBe(DPN.OK); }
+    else initialize(); write(0x3000, 24); write(0x3004, 1); write(0x3008, 0x3100); ram.set(utf16("Host\0"), 0x3100);
     expect((await call("SetPeerInfo", [0x3000, 0, 0, 0x80000000]) as ThunkResult).value).toBe(DPN.OK);
     const address = new DirectPlayAddress(); address.setGuid("provider", DP8_TCPIP); write(0x2000, addresses.create(address));
     write(0x4000, 72); write(0x4028, 4); write(0x4030, 0x3100); ram.set(guidBytes(DP8_PEER), 0x4018);
@@ -165,15 +168,14 @@ test("send admission preserves output handles under callback pressure and delive
     write(0x3600, 0xcccccccc); expect(call("SendTo", [0, 0x3400, 1, 0, 999, 0x3600, 0x20])).toBe(DPN.OUTOFMEMORY); expect(read(0x3600)).toBe(0xcccccccc);
     const deadline = Date.now() + 2000; while (state.sends.pending.length) { if (Date.now() >= deadline) throw Error("Queued sends did not complete"); await Bun.sleep(1); }
     expect(state.sends.pendingBytes).toBe(0); expect(state.sends.reservedJobs).toBe(256); expect(state.sendRecords.size).toBe(256);
-    callbacks(message => { expect(message).toBe(2); return 0; });
-    await Bun.sleep(8); const completed: number[] = [];
-    callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 12)).toBe(0); completed.push(read(ptr + 4)); return 0; });
+    const completed: number[] = [];
+    callbacks((message, ptr) => { if (message === 2) return 0; expect(message).toBe(0x14); expect(read(ptr + 12)).toBe(0); completed.push(read(ptr + 4)); return 0; });
     expect(completed).toEqual(admitted); expect(new Set(completed).size).toBe(256); expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
     await Bun.sleep(8); callbacks(() => { throw Error("Duplicated completion"); });
     expect(call("SendTo", [0, 0x3400, 1, 0, 1000, 0x3600, 0x20])).toBe(DPN.PENDING); await Bun.sleep(8); let last = 0;
     callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 8)).toBe(1000); last++; return 0; }); expect(last).toBe(1);
 });
-test("Close and reset retire blocked send completions before a fresh initialization", async () => {
+test("Close delivers blocked send completions while reset abandons the old lifetime before fresh initialization", async () => {
     for (const closing of [true, false]) {
         await host();
         const state = [...(api as unknown as { states: Map<number, {
@@ -188,14 +190,227 @@ test("Close and reset retire blocked send completions before a fresh initializat
         expect(state.sendRecords.size).toBe(1); expect(state.sends.reservedJobs).toBe(1);
         if (closing) {
             const close = call("Close", [0]) as Promise<ThunkResult>;
-            expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
-            callbacks(message => { expect(message === 2 || message === 9).toBe(true); return 0; });
+            expect(state.sendRecords.size).toBe(1); expect(state.sends.reservedJobs).toBe(1);
+            let completed = 0; callbacks((message, ptr) => { expect([2, 9, 0x14]).toContain(message); if (message === 0x14) { completed++; expect(read(ptr + 12)).toBe(0); } return 0; }); expect(completed).toBe(1);
             const result = await close; expect(result.value).toBe(0); result.startCallbackChain?.({ esp: 0x9000, returnAddr: 0x7000 });
+            expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
         } else { api.reset(); expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0); }
         state.sends.retryCompletions(); await Bun.sleep(8); expect(state.sends.pendingBytes).toBe(0);
         if (closing) { await host(); expect(call("SendTo", [0, 0x3400, 1, 0, 999, 0x3600, 0x20])).toBe(DPN.PENDING); await Bun.sleep(8);
             let completed = 0; callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 8)).toBe(999); completed++; return 0; }); expect(completed).toBe(1); api.reset(); }
     }
+});
+interface LocalCompletion { flags: number; rtt: number; hr: number; }
+async function manualHost() {
+    const executor = DirectPlayCallbackExecutor.forProcess(process);
+    if (!executor.initialized) expect(executor.initialize(0x7000, 0)).toBe(0);
+    expect(await executor.setCount(0)).toBe(0); return host(true);
+}
+function finishManual(begin: number, handler: (message: number, ptr: number) => void) {
+    for (let i = begin; i < calls.length; i++) {
+        const invocation = calls[i]; handler(invocation.args[1] & 0xffff, invocation.args[2]);
+        const result = invocation.done(0);
+        if (result === null) invocation.enumerationState!.continueEnumeration();
+    }
+}
+async function manualWork(handler: (message: number, ptr: number) => void) {
+    for (let turn = 0; turn < 1000; turn++) {
+        const begin = calls.length; DirectPlayCallbackExecutor.forProcess(process).run(ctx(), 0);
+        finishManual(begin, handler); await Bun.sleep(1);
+        const states = [...(api as unknown as { states: Map<number, { sends: { pending: unknown[] }; callbacks?: { pending: number } }> }).states.values()];
+        if (states.every(state => !state.sends.pending.length && !state.callbacks?.pending)) return;
+    }
+    throw Error("Manual DirectPlay work did not settle");
+}
+function collectCompletion(completed: Map<number, LocalCompletion>, message: number, ptr: number) {
+    if (message === 0x14) completed.set(read(ptr + 8), { hr: read(ptr + 12), rtt: read(ptr + 20), flags: read(ptr + 28) });
+}
+function localSend(id: number, flags: number, context: number, completed: Map<number, LocalCompletion>) {
+    write(0x3400, 4); write(0x3404, 0x3500); write(0x3500, 0x12340000 + context);
+    const begin = calls.length, result = call("SendTo", [id, 0x3400, 1, 0, context, 0x3600, flags]);
+    finishManual(begin, (message, ptr) => collectCompletion(completed, message, ptr));
+    expect(typeof result === "number" ? result : (result as ThunkResult).value).toBe(DPN.PENDING);
+}
+test("local COP metadata follows actual recycled operations across warmup and repeat batches", async () => {
+    const id = await manualHost(), completed = new Map<number, LocalCompletion>();
+    for (let batch = 0; batch < 2; batch++) {
+        for (let i = 0; i < 2; i++) localSend(id, 13, batch * 10 + i, completed);
+        await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+        expect([0, 1].map(i => completed.get(batch * 10 + i))).toEqual([
+            { hr: 0, rtt: 0xffffffff, flags: 0 }, { hr: 0, rtt: 0xffffffff, flags: 1 },
+        ]);
+    }
+    localSend(id, 8, 100, completed); await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    localSend(id, 12, 101, completed); await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    expect(completed.get(101)).toEqual({ hr: 0, rtt: 0xffffffff, flags: 1 });
+});
+test("manual local COP batches retire operations within each DoWork without host scheduling", async () => {
+    const id = await manualHost(), completed = new Map<number, LocalCompletion>(); let context = 0;
+    for (const size of [16, 2, 2]) {
+        const first = context;
+        for (let i = 0; i < size; i++) localSend(id, 13, context++, completed);
+        const begin = calls.length; DirectPlayCallbackExecutor.forProcess(process).run(ctx(), 0);
+        finishManual(begin, (message, ptr) => collectCompletion(completed, message, ptr));
+        expect(Array.from({ length: size }, (_, i) => completed.get(first + i))).toEqual(
+            Array.from({ length: size }, (_, i) => ({ hr: 0, rtt: 0xffffffff, flags: i ? 1 : 0 })));
+        expect(DirectPlaySendOperationPool.forProcess(process).activeLeases).toBe(0);
+    }
+});
+test("processing request union initialization survives a sixteen then two then two batch sequence", async () => {
+    const id = await manualHost(), completed = new Map<number, LocalCompletion>(); let context = 0;
+    for (const size of [16, 2, 2]) {
+        const first = context;
+        for (let i = 0; i < size; i++) localSend(id, 13, context++, completed);
+        await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+        expect(Array.from({ length: size }, (_, i) => completed.get(first + i)?.flags)).toEqual([0, ...new Array(size - 1).fill(1)]);
+    }
+});
+test("alternating unreliable delivery resets metadata inherited by guaranteed COP requests", async () => {
+    const id = await manualHost(), completed = new Map<number, LocalCompletion>();
+    for (let i = 0; i < 16; i++) localSend(id, i & 1 ? 13 : 1, i, completed);
+    await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    expect(Array.from({ length: 16 }, (_, i) => completed.get(i)?.flags)).toEqual(new Array(16).fill(0));
+    expect(Array.from({ length: 8 }, (_, i) => completed.get(i * 2 + 1)?.rtt)).toEqual(new Array(8).fill(0xffffffff));
+});
+test("local send metadata survives peer replacement and retires on the process reset boundary", async () => {
+    const completed = new Map<number, LocalCompletion>(); let id = await manualHost();
+    localSend(id, 8, 0, completed); await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    const table = read(primary);
+    let begin = calls.length; call("Close", [0]); finishManual(begin, () => {}); expect(call("Release")).toBe(0);
+    const object = ComObjectFactory.create(DP8_PEER, table)!;
+    primary = allocateComObject(process.memory, ram, table); resource.mapAddressToHandle(primary, object.handle);
+    id = await host(true); localSend(id, 13, 1, completed); await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    expect(completed.get(1)).toEqual({ hr: 0, rtt: 0xffffffff, flags: 1 });
+    api.reset(); for (const listener of [...reset]) listener(); (process as unknown as { resetGeneration: number }).resetGeneration++;
+    id = await manualHost();
+    localSend(id, 13, 2, completed); await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    expect(completed.get(2)).toEqual({ hr: 0, rtt: 0xffffffff, flags: 0 });
+});
+test("aggregate operation pressure preserves guest outputs and Final Release retires pending leases", async () => {
+    const id = await manualHost(), pool = new DirectPlaySendOperationPool(4, 3), completed = new Map<number, LocalCompletion>();
+    (api as unknown as { sendOperations: DirectPlaySendOperationPool }).sendOperations = pool;
+    localSend(id, 13, 1, completed); expect(pool.activeLeases).toBe(2);
+    write(0x3600, 0xcccccccc);
+    expect(call("SendTo", [id, 0x3400, 1, 0, 2, 0x3600, 13])).toBe(DPN.OUTOFMEMORY);
+    expect(read(0x3600)).toBe(0xcccccccc); expect(pool.activeLeases).toBe(2);
+    expect(call("Release")).toBe(0); expect(pool.activeLeases).toBe(0);
+});
+test("resetting another API wrapper cannot erase live process-owned operation leases", async () => {
+    const id = await manualHost(), pool = DirectPlaySendOperationPool.forProcess(process), completed = new Map<number, LocalCompletion>();
+    localSend(id, 13, 1, completed); expect(pool.activeLeases).toBe(2);
+    const other = new DirectPlay8NetworkApi(process, api.tables, addresses, network); other.reset();
+    expect(pool.activeLeases).toBe(2);
+    await manualWork((message, ptr) => collectCompletion(completed, message, ptr));
+    expect(completed.get(1)).toEqual({ hr: 0, rtt: 0xffffffff, flags: 0 }); expect(pool.activeLeases).toBe(0);
+});
+test("one synchronous DoWork completes self COP before any host microtask, including retained RECEIVE data", async () => {
+    const id = await manualHost(), completed = new Map<number, LocalCompletion>();
+    for (const flags of [12, 13]) {
+        localSend(id, flags, flags, completed); write(0x3500, 0xabcd0000 + flags);
+        const order: number[] = [], received: number[] = [], handles: number[] = [];
+        const begin = calls.length, result = DirectPlayCallbackExecutor.forProcess(process).run(ctx(), 0);
+        expect(typeof result !== "number" && result.suspendedForCallback).toBe(true);
+        for (let i = begin; i < calls.length; i++) {
+            const invocation = calls[i], message = invocation.args[1] & 0xffff, ptr = invocation.args[2];
+            order.push(message); collectCompletion(completed, message, ptr);
+            if (message === 0x11) { received.push(read(read(ptr + 12))); handles.push(read(ptr + 20)); }
+            if (message === 0x14) {
+                expect(read(ptr + 36)).toBe(flags & 1);
+                if (flags & 1) { const descriptor = read(ptr + 32); expect(read(descriptor + 4)).toBe(0x3500); expect(read(0x3500)).toBe(0xabcd0000 + flags); }
+            }
+            const next = invocation.done(message === 0x11 ? DPN.PENDING : 0);
+            if (next === null) invocation.enumerationState!.continueEnumeration();
+        }
+        // Deliberately no await/yield between returning from RECEIVE and inspecting completion.
+        expect(order).toEqual([0x11, 0x14]); expect(received).toEqual([0x12340000 + flags]);
+        expect(completed.get(flags)).toEqual({ hr: 0, rtt: 0xffffffff, flags: 0 });
+        expect(DirectPlaySendOperationPool.forProcess(process).activeLeases).toBe(0);
+        for (const handle of handles) expect(call("ReturnBuffer", [handle, 0])).toBe(0);
+    }
+});
+test("self COP snapshots COPY and NOCOPY data before SendTo returns while retaining original descriptors", async () => {
+    const id = await manualHost(), completed = new Map<number, LocalCompletion>();
+    for (const flags of [12, 13]) {
+        localSend(id, flags, flags, completed); write(0x3500, 0xabcd0000 + flags);
+        const received: number[] = [];
+        await manualWork((message, ptr) => {
+            collectCompletion(completed, message, ptr);
+            if (message === 0x11) received.push(read(read(ptr + 12)));
+            if (message === 0x14 && flags & 1) {
+                const descriptor = read(ptr + 32); expect(read(descriptor + 4)).toBe(0x3500);
+                expect(read(read(descriptor + 4))).toBe(0xabcd0000 + flags);
+            }
+        });
+        expect(received).toEqual([0x12340000 + flags]);
+    }
+});
+for (const [flags, cancelFirst] of [[12, false], [13, false], [12, true], [13, true]] as const)
+test(`manual Close drains sixteen cancelled COP completions, flags ${flags}, cancel ${cancelFirst}`, async () => {
+        const executor = DirectPlayCallbackExecutor.forProcess(process);
+        if (!executor.initialized) expect(executor.initialize(0x7000, 0)).toBe(0);
+        expect(executor.setCount(0)).toBe(0); const id = await host(true);
+        const state = [...(api as unknown as { states: Map<number, { sends: { pending: unknown[]; pendingBytes: number; reservedJobs: number }; sendRecords: Map<number, unknown> }> }).states.values()][0];
+        const handles: number[] = []; ram.set([7, 0, 9], 0x3500); write(0x3400, 3); write(0x3404, 0x3500);
+        for (let i = 0; i < 16; i++) { expect(call("SendTo", [id, 0x3400, 1, 0, 0x2000 + i, 0x3600, flags])).toBe(DPN.PENDING); handles.push(read(0x3600)); }
+        await Bun.sleep(5); expect(state.sends.pending.length).toBe(16);
+        if (cancelFirst) expect(call("CancelAsyncOperation", [0, 4])).toBe(0);
+        const before = calls.length, result = call("Close", [0]) as ThunkResult; expect(result.suspendedForCallback).toBe(true);
+        const messages: number[] = [], completed: number[] = [];
+        for (let i = before; i < calls.length; i++) {
+            const invocation = calls[i], message = invocation.args[1] & 0xffff, ptr = invocation.args[2]; messages.push(message);
+            if (message === 0x14) {
+                expect(read(ptr)).toBe(40); expect(read(ptr + 12)).toBe(DPN.USERCANCEL);
+                const index = read(ptr + 8) - 0x2000;
+                expect(read(ptr + 20)).toBe(0xffffffff); expect(read(ptr + 24)).toBe(0); expect(read(ptr + 28)).toBe([0, ...new Array(15).fill(1)][index]);
+                expect(read(ptr + 4)).toBe(handles[index]); expect(read(ptr + 36)).toBe(flags & 1 ? 1 : 0);
+                const descriptor = read(ptr + 32); if (flags & 1) { expect(read(descriptor)).toBe(3); expect(read(descriptor + 4)).toBe(0x3500); } else expect(descriptor).toBe(0); completed.push(index);
+            } else { expect(message).toBe(9); expect(read(ptr + 12)).toBe(1); }
+            const value = invocation.done(0); if (value === null) invocation.enumerationState!.continueEnumeration(); else expect(value).toBe(0);
+        }
+        expect(messages).toEqual([...new Array(16).fill(0x14), 9]); expect(completed).toEqual(Array.from({ length: 16 }, (_, i) => i));
+        expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0); expect(state.sends.pendingBytes).toBe(0);
+        const ended = calls.length; await Bun.sleep(8); expect(calls.length).toBe(ended);
+});
+test("manual Close refills a full callback lane without dropping any of 256 cancelled completions", async () => {
+    const executor = DirectPlayCallbackExecutor.forProcess(process); expect(executor.initialize(0x7000, 0)).toBe(0); expect(executor.setCount(0)).toBe(0);
+    const id = await host(true), state = [...(api as unknown as { states: Map<number, { callbacks: { native(type: number, size: number): boolean }; sends: { reservedJobs: number }; sendRecords: Map<number, unknown> }> }).states.values()][0];
+    let filled = 0; while (state.callbacks.native(2, 0)) { if (++filled > 3000) throw Error("Unbounded callback queue"); } expect(filled).toBe(2304);
+    ram.set([1], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+    for (let i = 0; i < 256; i++) expect(call("SendTo", [id, 0x3400, 1, 0, i, 0x3600, 13])).toBe(DPN.PENDING);
+    const begin = calls.length, result = call("Close", [0]) as ThunkResult; expect(result.suspendedForCallback).toBe(true);
+    const completed: number[] = []; let destroyed = 0;
+    for (let i = begin; i < calls.length; i++) {
+        const invocation = calls[i], message = invocation.args[1] & 0xffff, ptr = invocation.args[2];
+        if (message === 0x14) { expect(read(ptr + 12)).toBe(DPN.USERCANCEL); completed.push(read(ptr + 8)); }
+        else if (message === 9) { destroyed++; expect(completed.length).toBe(256); } else expect(message).toBe(2);
+        const value = invocation.done(0); if (value === null) invocation.enumerationState!.continueEnumeration(); else expect(value).toBe(0);
+    }
+    expect(completed).toEqual(Array.from({ length: 256 }, (_, i) => i)); expect(destroyed).toBe(1); expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
+});
+test("SYNC self COP preserves a real quota failure while older callbacks are pending", async () => {
+    const id = await host(), state = [...(api as unknown as { states: Map<number, { session: { send(id: number, flags: number, data: Uint8Array): number | Promise<number> } }> }).states.values()][0];
+    const pending: (number | Promise<number>)[] = [];
+    for (let i = 0; i < 256; i++) pending.push(state.session.send(id, 12, Uint8Array.of(i)));
+    ram.set([1], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+    expect(await call("SendTo", [id, 0x3400, 1, 0, 0, 0, 0x8000000c])).toBe(DPN.TABLEFULL);
+    callbacks(message => { expect(message).toBe(0x11); return 0; }); expect((await Promise.all(pending)).every(hr => hr === 0)).toBe(true);
+});
+test("reset inside a manual Close callback returns cancellation and cannot finish the old lifetime successfully", async () => {
+    const executor = DirectPlayCallbackExecutor.forProcess(process); expect(executor.initialize(0x7000, 0)).toBe(0); expect(executor.setCount(0)).toBe(0);
+    const id = await host(true); ram.set([1], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+    expect(call("SendTo", [id, 0x3400, 1, 0, 1, 0x3600, 13])).toBe(DPN.PENDING); await Bun.sleep(5);
+    expect((call("Close", [0]) as ThunkResult).suspendedForCallback).toBe(true);
+    const invocation = calls.at(-1)!; expect(invocation.args[1] & 0xffff).toBe(0x14); api.reset();
+    expect(invocation.done(0)).toBe(DPN.USERCANCEL); await host(true);
+});
+test("reset during Close cannot finalize or clear a freshly initialized lifetime", async () => {
+    await host(); const pending = call("Close", [0]) as Promise<ThunkResult>;
+    api.reset(); await host();
+    ram.set([1], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+    expect(call("SendTo", [0, 0x3400, 1, 0, 789, 0x3600, 0x20])).toBe(DPN.PENDING);
+    const stale = await pending; expect(stale.value).toBe(DPN.USERCANCEL); expect(stale.startCallbackChain?.({ esp: 0x9000, returnAddr: 0x7000 })).toBe(false);
+    await Bun.sleep(8); let completed = 0; callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 8)).toBe(789); completed++; return 0; }); expect(completed).toBe(1);
+    expect(call("GetCaps", [0x3000, 0])).toBe(DPN.INVALIDPARAM);
 });
 test("native SEND_COMPLETE only returns NOCOPY descriptors and self queue errors preserve outputs", async () => {
     const id = await host(); ram.set([7, 0, 9], 0x3500); write(0x3400, 1); write(0x3404, 0x3500); write(0x3408, 2); write(0x340c, 0x3501);
@@ -203,7 +418,7 @@ test("native SEND_COMPLETE only returns NOCOPY descriptors and self queue errors
     for (const flags of [0, 1, 8, 9]) {
         expect(call("SendTo", [id, 0x3400, 2, 0, flags + 100, 0x3600, flags])).toBe(DPN.PENDING); const handle = read(0x3600); await Bun.sleep(8); let completed = 0;
         callbacks((message, ptr) => { if (message === 0x11) return 0; expect(message).toBe(0x14); completed++;
-            expect(read(ptr)).toBe(40); expect(read(ptr + 4)).toBe(handle); expect(read(ptr + 8)).toBe(flags + 100); expect(read(ptr + 12)).toBe(0); expect(read(ptr + 28)).toBe(flags & 8 ? 1 : 0);
+            expect(read(ptr)).toBe(40); expect(read(ptr + 4)).toBe(handle); expect(read(ptr + 8)).toBe(flags + 100); expect(read(ptr + 12)).toBe(0); expect(read(ptr + 20)).toBe(0); expect(read(ptr + 24)).toBe(0); expect(read(ptr + 28)).toBe(flags & 8 ? 1 : 0);
             expect(read(ptr + 36)).toBe(flags & 1 ? 2 : 0);
             if (flags & 1) { const descriptors = read(ptr + 32); expect(descriptors).toBeGreaterThan(0); expect([read(descriptors), read(descriptors + 4), read(descriptors + 8), read(descriptors + 12)]).toEqual([1, 0x3500, 2, 0x3501]); } else expect(read(ptr + 32)).toBe(0);
             return 0;
@@ -252,9 +467,11 @@ test("DP8 send flags and async-handle preservation match the native 22-case orac
         [0x8000000a,false,0,1],[0x100,true,DPN.PENDING,1],[0x80000100,false,0,1],[0x80000080,false,0,1],[0x800000c0,false,DPN.INVALIDFLAGS,0],
     ];
     for (const [flags, handle, expected, receives] of cases) {
-        write(0x3600, 0xcccccccc); expect(await call("SendTo", [id, 0x3400, 1, 100, 0, handle ? 0x3600 : 0, flags])).toBe(expected);
+        write(0x3600, 0xcccccccc); const result = await call("SendTo", [id, 0x3400, 1, 100, 0, handle ? 0x3600 : 0, flags]); let count = 0;
+        if (typeof result !== "number" && result.suspendedForCallback) { const invocation = calls.at(-1)!; expect(invocation.args[1] & 0xffff).toBe(0x11); count++; expect(invocation.done(0)).toBe(expected); }
+        else expect(result).toBe(expected);
         expect(read(0x3600) !== 0xcccccccc).toBe(handle && expected === DPN.PENDING);
-        await Bun.sleep(1); let count = 0; callbacks(message => { if (message === 0x11) count++; return 0; }); expect(count).toBe(receives);
+        await Bun.sleep(1); callbacks(message => { if (message === 0x11) count++; return 0; }); expect(count).toBe(receives);
     }
     write(0x3400, 0); expect(await call("SendTo", [id, 0x3400, 1, 100, 0, 0, 0x80000000])).toBe(DPN.INVALIDPARAM);
 });

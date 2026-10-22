@@ -24,6 +24,16 @@ export enum ResourceType {
     FILE_HANDLE = 'file_handle',
 }
 
+export const HANDLE_FLAG_INHERIT = 1;
+export const HANDLE_FLAG_PROTECT_FROM_CLOSE = 2;
+export const IO_COMPLETION_ALL_ACCESS = 0x001f0003;
+export const IO_COMPLETION_MODIFY_STATE = 2;
+export interface HandleAttributes { readonly grantedAccess: number; readonly flags: number; }
+export interface ExternalHandleProvider {
+    get(handle: number): HandleAttributes | undefined;
+    set(handle: number, attributes: HandleAttributes): boolean;
+}
+
 export interface ResourceHandle {
     type: ResourceType;
     id: number; // Handle value returned to WinAPI
@@ -42,6 +52,9 @@ export class SystemResourceProvider {
     private kernelObjects: ResourceTable<any> = new ResourceTable();
     /** Open HANDLE references, keyed by object identity rather than any one alias. */
     private kernelObjectReferences = new WeakMap<object, number>();
+    /** Access and inheritance belong to an individual HANDLE, never its shared object. */
+    private handleAttributes = new Map<number, HandleAttributes>();
+    private externalHandleProviders = new WeakMap<object, ExternalHandleProvider>();
     private userObjects: ResourceTable<any> = new ResourceTable();
     private fileHandles: ResourceTable<any> = new ResourceTable();
 
@@ -341,12 +354,15 @@ export class SystemResourceProvider {
     /**
      * Register a kernel object (file handles, etc.)
      */
-    registerKernelObject(obj: any): number {
+    registerKernelObject(obj: any, attributes?: HandleAttributes): number {
         const handle = this.nextKernelHandle;
         if (handle >= 0x40000) {
             Logger.error(LogCategory.RESOURCE, `Kernel handle range exhausted! handle=0x${handle.toString(16)}`);
         }
         this.kernelObjects.create(handle, obj);
+        this.handleAttributes.set(handle, attributes ?? {
+            grantedAccess: obj?.kind === 'iocp' ? IO_COMPLETION_ALL_ACCESS : 0x001fffff, flags: 0,
+        });
         if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
             this.kernelObjectReferences.set(obj, (this.kernelObjectReferences.get(obj) ?? 0) + 1);
         }
@@ -368,12 +384,51 @@ export class SystemResourceProvider {
      */
     unregisterKernelObject(handle: number): any {
         const obj = this.kernelObjects.release(handle);
+        if (obj !== null) this.handleAttributes.delete(handle >>> 0);
         if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
             const remaining = (this.kernelObjectReferences.get(obj) ?? 1) - 1;
             if (remaining > 0) this.kernelObjectReferences.set(obj, remaining);
             else this.kernelObjectReferences.delete(obj);
         }
         return obj;
+    }
+
+    setExternalHandleProvider(owner: object, provider: ExternalHandleProvider): void {
+        this.externalHandleProviders.set(owner, provider);
+    }
+
+    getHandleAttributes(handle: number): HandleAttributes | undefined {
+        const own = this.handleAttributes.get(handle >>> 0);
+        if (own) return own;
+        const owner = System.getInstance().process;
+        return owner ? this.externalHandleProviders.get(owner)?.get(handle >>> 0) : undefined;
+    }
+
+    setHandleAttributes(handle: number, attributes: HandleAttributes): boolean {
+        handle >>>= 0;
+        if (!this.handleAttributes.has(handle)) {
+            const owner = System.getInstance().process;
+            return !!owner && !!this.externalHandleProviders.get(owner)?.set(handle, attributes);
+        }
+        this.handleAttributes.set(handle, { grantedAccess: attributes.grantedAccess >>> 0, flags: attributes.flags & 3 });
+        return true;
+    }
+
+    setHandleFlags(handle: number, mask: number, flags: number): boolean {
+        const current = this.getHandleAttributes(handle);
+        return !!current && this.setHandleAttributes(handle, {
+            grantedAccess: current.grantedAccess, flags: (current.flags & ~(mask & 3)) | (flags & mask & 3),
+        });
+    }
+
+    hasHandleAccess(handle: number, required: number): boolean {
+        const attributes = this.getHandleAttributes(handle);
+        return !!attributes && (attributes.grantedAccess & required) === required;
+    }
+
+    /** Same-process close-and-duplicate keeps object identity and never drops its last reference. */
+    replaceKernelHandle(handle: number, attributes: HandleAttributes): boolean {
+        return this.getKernelObject(handle >>> 0) !== null && this.setHandleAttributes(handle, attributes);
     }
 
     kernelObjectReferenceCount(obj: object): number {
@@ -453,6 +508,7 @@ export class SystemResourceProvider {
             this.nextFileHandle += 4;
         }
         this.fileHandles.create(handle, obj);
+        this.handleAttributes.set(handle, { grantedAccess: 0x001f01ff, flags: 0 });
 
         Logger.verbose(LogCategory.RESOURCE, `Registered file handle=0x${handle.toString(16)}`);
         return handle;
@@ -470,6 +526,7 @@ export class SystemResourceProvider {
      */
     unregisterFileHandle(handle: number): any {
         const obj = this.fileHandles.release(handle);
+        if (obj !== null) this.handleAttributes.delete(handle >>> 0);
         if (obj !== null && obj !== undefined) {
             this.freeFileHandles.push(handle >>> 0);
         }
@@ -593,6 +650,8 @@ export class SystemResourceProvider {
         this.gdiObjects = new ResourceTable();
         this.kernelObjects = new ResourceTable();
         this.kernelObjectReferences = new WeakMap();
+        this.handleAttributes.clear();
+        this.externalHandleProviders = new WeakMap();
         this.userObjects = new ResourceTable();
         this.fileHandles = new ResourceTable();
 

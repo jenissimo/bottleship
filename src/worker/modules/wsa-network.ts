@@ -43,7 +43,7 @@ export interface WsaPacket { data: Uint8Array; from: WsaAddress; truncated?: boo
 interface SocketState {
     id: number; wireId: number; af: number; type: number; protocol: number;
     acceptListener?: number; acceptListenerObjectId?: number; originalLocal?: WsaAddress | null; connectContextPending: boolean; connectExCompleted?: boolean; disconnected: boolean; connectedAt: number;
-    nonBlocking: boolean; overlapped: boolean; local: WsaAddress | null; peer: WsaAddress | null;
+    nonBlocking: boolean; overlapped: boolean; handleFlags: number; local: WsaAddress | null; peer: WsaAddress | null;
     state: "new" | "connecting" | "connected" | "listening" | "failed";
     backlog: number; pending: number[];
     packets: WsaPacket[]; chunks: Uint8Array[]; offset: number; available: number;
@@ -68,6 +68,7 @@ export class WsaSocketTable {
     private nextId = 0x10000000; // Opaque socket range, separate from std/file/kernel/COM handles.
     private sockets = new Map<number, SocketState>();
     private wireSockets = new Map<number, SocketState>();
+    private readonly connectOrigins = new WeakMap<SocketState, WsaAddress>();
     private bindings = new Map<string, Binding>();
     private listeners = new Set<() => void>();
     private epoch = 0;
@@ -103,6 +104,7 @@ export class WsaSocketTable {
                     if (error.wireId !== undefined && s.wireId !== error.wireId) continue;
                     if (!s.peer || s.eof || (s.state !== "connected" && s.state !== "connecting")) continue;
                     const connecting = s.state === "connecting";
+                    if (connecting) this.restoreConnectAddress(s);
                     s.error = connecting && error.code === WSA.ECONNRESET ? WSA.ECONNREFUSED : error.code;
                     s.state = "failed"; if (s.connectTimer) clearTimeout(s.connectTimer);
                     this.event(s, connecting ? FD_CONNECT : FD_CLOSE, s.error);
@@ -115,6 +117,7 @@ export class WsaSocketTable {
                 if (s.type !== 1 || s.eof || !s.peer || !same(s.peer.node, node) ||
                     (s.state !== "connected" && s.state !== "connecting")) continue;
                 const connecting = s.state === "connecting";
+                if (connecting) this.restoreConnectAddress(s);
                 s.error = connecting ? WSA.ECONNREFUSED : WSA.ECONNRESET; s.state = "failed";
                 if (s.connectTimer) clearTimeout(s.connectTimer);
                 this.event(s, connecting ? FD_CONNECT : FD_CLOSE, s.error);
@@ -137,6 +140,7 @@ export class WsaSocketTable {
                         if (s.error) this.event(s, FD_READ, s.error);
                     }
                     if (s.type === 1 && !s.eof && s.peer && !same(s.peer.node, this.network.node) && (s.state === "connecting" || s.state === "connected")) {
+                        if (s.state === "connecting") this.restoreConnectAddress(s);
                         s.state = "failed";
                         s.error = WSA.ENETDOWN;
                         if (s.connectTimer) clearTimeout(s.connectTimer);
@@ -188,6 +192,11 @@ export class WsaSocketTable {
     }
     isValid(s: number): boolean { return this.sockets.has(s >>> 0); }
     isConnected(s: number): boolean { return this.sockets.get(s >>> 0)?.state === "connected"; }
+    setHandleFlags(socket: number, mask: number, flags: number): number {
+        const state = this.get(socket);
+        state.handleFlags = (state.handleFlags & ~(mask & 3)) | (flags & mask & 3);
+        return 0;
+    }
     socket(type = 1, af = 2, protocol = 0): number {
         if (af !== 2 && af !== 6 && af !== 23) fail(WSA.EAFNOSUPPORT);
         if (type !== 1 && type !== 2 && type !== 3) fail(WSA.ESOCKTNOSUPPORT);
@@ -201,7 +210,7 @@ export class WsaSocketTable {
         let wireId: number;
         try { wireId = this.network.allocateSocketId(); } catch { fail(WSA.ENOBUFS); }
         this.sockets.set(id, {
-            id, wireId, af, type, protocol: selectedProtocol, connectContextPending: false, disconnected: false, connectedAt: 0, nonBlocking: false, overlapped: true, local: null, peer: null,
+            id, wireId, af, type, protocol: selectedProtocol, connectContextPending: false, disconnected: false, connectedAt: 0, nonBlocking: false, overlapped: true, handleFlags: 1, local: null, peer: null,
             state: "new", backlog: 1, pending: [], packets: [], chunks: [], offset: 0, available: 0,
             readShutdown: false, writeShutdown: false, eof: false, error: 0, pendingError: 0,
             oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, peerId: 0, credit: 0, writeBlocked: false,
@@ -252,6 +261,11 @@ export class WsaSocketTable {
         return 0;
     }
     private autoBind(s: SocketState): void { if (!s.local) this.bind(s.id); }
+    private restoreConnectAddress(s: SocketState): void {
+        const original = this.connectOrigins.get(s);
+        if (original && s.local) { s.local.ip = original.ip?.slice(); s.local.ip6 = original.ip6?.slice(); }
+        this.connectOrigins.delete(s);
+    }
     private detach(s: SocketState): void {
         if (!s.local) return;
         const key = `${this.proto(s)}:${this.boundPort(s)}`;
@@ -264,6 +278,7 @@ export class WsaSocketTable {
     }
     closesocket(sid: number): number {
         const s = this.get(sid);
+        if (s.handleFlags & 2) return 0; // Windows reports success while the protected OS descriptor stays open.
         if (s.connectTimer) clearTimeout(s.connectTimer);
         if (s.type === 1 && s.peer && (s.state === "connected" || s.state === "connecting")) {
             this.frame(s, (s.lingerEnabled && !s.lingerSeconds) || s.available || s.state === "connecting" ? RST : FIN);
@@ -384,11 +399,13 @@ export class WsaSocketTable {
         if (broadcast(peer.node)) fail(WSA.EADDRNOTAVAIL);
         this.autoBind(s);
         s.peer = this.routeAddress(peer);
+        this.connectOrigins.set(s, { ...s.local!, ip: s.local!.ip?.slice(), ip6: s.local!.ip6?.slice() });
         if (s.local!.ip && zeros(s.local!.ip)) s.local!.ip = this.network.ipv4;
             if (s.local!.ip6 && zeros(s.local!.ip6)) s.local!.ip6 = this.network.ipv6;
         s.state = "connecting";
         s.error = 0;
         if (!this.frame(s, SYN, this.synValue(s))) {
+            this.restoreConnectAddress(s);
             s.state = "new";
             fail(WSA.ENETDOWN);
         }
@@ -396,6 +413,7 @@ export class WsaSocketTable {
         if (s.error) fail(s.error);
         s.connectTimer = setTimeout(() => {
             if (s.state !== "connecting") return;
+            this.restoreConnectAddress(s);
             s.state = "failed"; s.error = WSA.ETIMEDOUT;
             this.event(s, FD_CONNECT, s.error); this.changed();
         }, 10000);
@@ -406,6 +424,7 @@ export class WsaSocketTable {
         const socket = this.get(sid);
         if (socket.type !== 1 || socket.state !== "connecting") return;
         this.frame(socket, RST, WSA.ECONNRESET);
+        this.restoreConnectAddress(socket);
         if (socket.connectTimer) clearTimeout(socket.connectTimer);
         this.wireSockets.delete(socket.wireId);
         // A cancelled identity must never receive a late SYNACK, even if identity allocation is exhausted.
@@ -516,6 +535,7 @@ export class WsaSocketTable {
         this.rearm(s, FD_READ);
         if (flags & ~11) fail(WSA.EOPNOTSUPP);
         if ((flags & 9) === 9) fail(WSA.EINVAL);
+        if (s.type === 2 && (s.af === 2 || s.af === 23) && !s.local) fail(WSA.EINVAL);
         if (s.readShutdown) fail(WSA.ESHUTDOWN);
         if (s.type !== 1) {
             if (flags & 9) fail(WSA.EOPNOTSUPP);
@@ -586,7 +606,7 @@ export class WsaSocketTable {
     shutdown(sid: number, how = 2): number {
         const s = this.get(sid);
         if (how < 0 || how > 2) fail(WSA.EINVAL);
-        if (s.state !== "connected") fail(WSA.ENOTCONN);
+        if (s.state !== "connected" && !(s.type === 2 && (s.af === 2 || s.af === 23))) fail(WSA.ENOTCONN);
         if (how !== 1) { s.readShutdown = true; s.packets = []; s.chunks = []; s.available = 0; }
         if (how !== 0 && !s.writeShutdown) {
             if (s.type === 1 && !this.frame(s, FIN)) fail(WSA.ENETDOWN);
@@ -778,10 +798,12 @@ export class WsaSocketTable {
         const s = this.wireSockets.get(dstId);
         if (!s || !binding.sockets.has(s.id) || !s.peer || s.peer.port !== from.port || !same(s.peer.node, from.node)) return;
         if (kind === RST) {
+            if (s.state === "connecting") this.restoreConnectAddress(s);
             s.error = value || WSA.ECONNRESET; s.state = "failed";
             if (s.connectTimer) clearTimeout(s.connectTimer);
             this.event(s, s.peerId ? FD_CLOSE : FD_CONNECT, s.error);
         } else if (kind === SYNACK && s.state === "connecting" && srcId) {
+            this.connectOrigins.delete(s);
             s.peerId = srcId; s.credit = Math.min(value & SYN_WINDOW_MASK, BUFFER_LIMIT); s.state = "connected"; s.connectedAt = Date.now();
             if (s.connectTimer) clearTimeout(s.connectTimer);
             this.event(s, FD_CONNECT); this.event(s, FD_WRITE);

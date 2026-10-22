@@ -24,11 +24,17 @@ test("a kernel-only child validates its reserved SOCKET before Winsock startup, 
     let closed=false;
     try{
         await request({boot:lease.boot},[lease.boot.port]);const source=table.socket(2),sender=table.socket(2),address=ipv4Address(network.ipv4,7621);
-        table.bind(source,address);const handle=table.duplicate(source,27002);
-        const expected={existed:false,valid:true,started:false,sameBase:true,nativeIsDifferent:true,sameProvider:true,type:2,foreign:false,denied:-1,error:10093,retained:true,cancelled:0};
+        table.bind(source,address);table.setHandleFlags(source,1,0);const handle=table.duplicate(source,27002);
+        expect(await request({command:"handleFlags",handle})).toEqual({value:1,error:0x2345,flags:1,started:false,valid:true,existedBefore:false});
+        expect(await request({command:"handleFlags",handle:source})).toEqual({value:0,error:6,flags:0xfeed,started:false,valid:false,existedBefore:true});
+        const expected={existed:true,valid:true,started:false,sameBase:true,nativeIsDifferent:true,sameProvider:true,type:2,foreign:false,denied:-1,error:10093,retained:true,cancelled:0};
         expect(await request({command:"lookup",handle,foreign:source})).toEqual(expected);
+        expect(await request({command:"handleFlags",handle})).toEqual({value:1,error:0x2345,flags:1,started:false,valid:true,existedBefore:true});
+        expect(await request({command:"handleFlags",handle,mask:1,flags:0,cleanup:true})).toEqual({value:1,error:0x2345,flags:0,started:false,valid:true,existedBefore:true});
+        expect(table.get(source).handleFlags).toBe(0);
         table.send(sender,Uint8Array.of(97,98,99),address);expect(await request({command:"read",handle})).toEqual([97,98,99]);
         expect(await request({command:"epoch",handle})).toEqual({stale:true,started:false});
+        expect(await request({command:"handleFlags",handle})).toEqual({value:0,error:6,flags:0xfeed,started:false,valid:false,existedBefore:true});
         const fresh=table.duplicate(source,27002);expect(await request({command:"lookup",handle:fresh,foreign:source})).toEqual({...expected,existed:true});
         // Closing an issued native handle leaves its pending operation alive while the source alias survives.
         expect(await request({command:"issue",handle:fresh})).toEqual({value:-1,error:997,internal:259,bytes:0,data:[0,0,0],signaled:false});

@@ -9,6 +9,7 @@ import type { DeferredWrite, FastPathImplementation } from '../../core/thunking/
 import { Logger, LogCategory } from '../../core/logger';
 import { recordSyncEvent } from '../../core/scheduler/sync-objects';
 import { System } from '../../core/system';
+import { IO_COMPLETION_MODIFY_STATE } from '../../core/resources/system-resource-provider';
 import { EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
 import { WAIT_FAILED, WAIT_TIMEOUT, WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION, TimerKind } from '../../core/scheduler/types';
 import { Mem } from '../../core/memory/mem-accessor';
@@ -1018,6 +1019,9 @@ const syncModule = (() => {
         }
 
         if (fileHandle !== 0 && fileHandle !== 0xffffffff) {
+            if (!resourceProvider.hasHandleAccess(portHandle, IO_COMPLETION_MODIFY_STATE)) {
+                scheduler.setLastError(5); return 0;
+            }
             const process = System.getInstance().process;
             const table = process && getWsaNativeSocketTable(process, fileHandle)?.nativeHandleView;
             const binding = { portHandle: portHandle >>> 0, key: completionKey,
@@ -1044,6 +1048,11 @@ const syncModule = (() => {
             return 0;
         }
 
+        if (!resourceProvider.hasHandleAccess(completionPortHandle, IO_COMPLETION_MODIFY_STATE)) {
+            scheduler.setLastError(5); // ERROR_ACCESS_DENIED on this alias only.
+            return 0;
+        }
+
         // The packet is delivered VERBATIM — the three values are opaque to the
         // OS, which is what makes this the standard way to wake a worker pool
         // with a private shutdown key rather than a real I/O completion.
@@ -1052,8 +1061,7 @@ const syncModule = (() => {
             completionKey: dwCompletionKey,
             overlapped: lpOverlapped,
         });
-        scheduler.setLastError(0);
-        return 1;
+        return 1; // Successful posting preserves LastError.
     };
 
     exports['GetQueuedCompletionStatus'] = (ctx, mem, args): number | ThunkResult | Promise<ThunkResult> => {
@@ -1072,6 +1080,11 @@ const syncModule = (() => {
             return 0;
         }
 
+        if (!resourceProvider.hasHandleAccess(completionPortHandle, IO_COMPLETION_MODIFY_STATE)) {
+            scheduler.setLastError(5);
+            if (lpOverlapped) Mem.writeUint32(lpOverlapped, 0);
+            return 0;
+        }
         const owner = System.getInstance().process;
         const generation = owner?.resetGeneration;
         const threadId = scheduler.getCurrentThreadId();

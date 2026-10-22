@@ -11,7 +11,9 @@ export function isValidAddress(
     perms: RegionPerms = "rw"
 ): boolean {
     const address = typeof memOrAddress === "number" ? memOrAddress : (addressOrSize ?? 0);
-    const size = typeof sizeOrPerms === "number" ? sizeOrPerms : 1;
+    const size = typeof memOrAddress === "number"
+        ? (addressOrSize ?? 1)
+        : (typeof sizeOrPerms === "number" ? sizeOrPerms : 1);
     const finalPerms = typeof sizeOrPerms === "string" ? sizeOrPerms : perms;
 
     if (address < 0 || size < 0) {
@@ -26,6 +28,44 @@ export function isValidAddress(
         Logger.warn(LogCategory.SYSTEM, `AddressGuard: invalid access 0x${address.toString(16)}+${size.toString(16)} perms=${finalPerms}`);
     }
     return valid;
+}
+
+/**
+ * Probe a Win32 application's buffer, rather than raw boot/DOS guest memory.
+ * GetSystemInfo advertises 0x10000 as the minimum application address. LOW_MEM
+ * also backs emulator-owned boot structures, so raw AddressSpace/Mem permissions
+ * alone cannot establish that those bytes are valid Win32 parameter storage.
+ * CPU Win9x compatibility and its null-page diagnostic do not change ownership.
+ * Optional NULL pointers remain an API-level decision; this only probes bytes.
+ */
+export function isValidUserAddress(mem: Uint8Array, address: number, size?: number, perms?: RegionPerms): boolean;
+export function isValidUserAddress(address: number, size?: number, perms?: RegionPerms): boolean;
+export function isValidUserAddress(
+    memOrAddress: Uint8Array | number,
+    addressOrSize?: number,
+    sizeOrPerms?: number | RegionPerms,
+    perms: RegionPerms = "rw"
+): boolean {
+    const numeric = typeof memOrAddress === "number";
+    const address = numeric ? memOrAddress : (addressOrSize ?? 0);
+    const size = numeric ? (addressOrSize ?? 1) : (typeof sizeOrPerms === "number" ? sizeOrPerms : 1);
+    const finalPerms = typeof sizeOrPerms === "string" ? sizeOrPerms : perms;
+    if (!Number.isSafeInteger(address) || !Number.isSafeInteger(size) ||
+        address < 0 || address > 0xffffffff || size < 0 || address + size > 0x100000000 ||
+        (size > 0 && address < 0x10000)) return false;
+
+    const process = System.getInstance().process;
+    // Derive the current length per call: a numeric probe must not retain an old
+    // plain memory view across WASM growth. The fallback supports isolated users
+    // with an AddressSpace but no running CPU.
+    const memoryLength = numeric
+        ? (process?.getCurrentMemory?.().length ?? process?.addressSpace?.getMemorySize?.())
+        : memOrAddress.length;
+    if (memoryLength === undefined || address + size > memoryLength) return false;
+
+    return numeric
+        ? isValidAddress(address, size, finalPerms)
+        : isValidAddress(memOrAddress, address, size, finalPerms);
 }
 
 /**

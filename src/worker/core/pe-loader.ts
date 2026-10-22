@@ -910,17 +910,27 @@ export class PELoader {
         label: string,
     ): RegionEntry[] {
         const dropped: RegionEntry[] = [];
+        const visited = new Set<number>();
+        const records = addressSpace.getRegions();
         for (const region of addressSpace.findRegionsIntersecting(base, size)) {
             if (region.kind !== "ROM" || region.owner !== "PELoader") continue;
-            if (this.moduleRegistry?.getByBase(region.base)) {
+            const allocationId = region.allocationId ?? region.id;
+            const allocationBase = region.allocationBase ?? region.base;
+            if (visited.has(allocationId)) continue;
+            visited.add(allocationId);
+            if (this.moduleRegistry?.getByBase(allocationBase)) {
                 Logger.error(LogCategory.SYSTEM,
                     `[PE] ${label}: image span 0x${base.toString(16)}..0x${(base + size).toString(16)} ` +
                     `overlaps LIVE module region 0x${region.base.toString(16)}..` +
                     `0x${(region.base + region.size).toString(16)} — not releasing it`);
                 continue;
             }
-            addressSpace.releaseRegion(region.base);
-            dropped.push(region);
+            // A VirtualProtect split does not create independently unloadable images.
+            // Save all siblings, even when only one fragment intersects the new image.
+            const siblings = records.filter(candidate => candidate.owner === "PELoader" &&
+                candidate.kind === "ROM" && (candidate.allocationId ?? candidate.id) === allocationId);
+            if (!addressSpace.releaseRegion(allocationBase)) continue;
+            dropped.push(...siblings);
             Logger.log(LogCategory.SYSTEM,
                 `[PE] ${label}: released stale image region 0x${region.base.toString(16)}..` +
                 `0x${(region.base + region.size).toString(16)} covered by the new image`);
@@ -951,10 +961,9 @@ export class PELoader {
                 // to the ROM layout bucket's read-only perms — a pointer into a freed DLL's
                 // data would start failing a write validation it used to pass.
                 for (const r of dropped) {
-                    addressSpace.registerRegion({
-                        base: r.base, size: r.size, perms: r.perms, kind: r.kind,
-                        owner: r.owner, tag: r.tag,
-                    });
+                    // New record IDs, same allocation identity/protection metadata.
+                    const { id: _id, ...entry } = r;
+                    addressSpace.registerRegion(entry);
                 }
             } else {
                 Logger.log(LogCategory.SYSTEM,

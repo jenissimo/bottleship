@@ -14,6 +14,7 @@ import { System } from "../core/system";
 import { Mem } from "../core/memory/mem-accessor";
 import { isValidAddress } from "../core/memory/address-guard";
 import { comApartments } from "../core/com/apartment";
+import { leaveComApartment } from "../core/com/hle-com-registry";
 import { HStrings, E_INVALIDARG } from "./combase-hstring";
 
 const REGDB_E_CLASSNOTREG = 0x80040154;
@@ -56,7 +57,7 @@ export class Combase implements IModule {
 
         // void RoUninitialize(void)
         this.exports["RoUninitialize"] = () => {
-            comApartments.leave(currentThread());
+            leaveComApartment(process, currentThread());
             return 0;
         };
 

@@ -42,9 +42,13 @@ let ownerGeneration = -1;
  * that answers a module WALK (VirtualQuery over the address space, then ask each base for
  * its name) must consult this, or it invents loaded modules: SmartHeap's shw32.dll walks
  * exactly like that, concludes the app links a foreign MSVC runtime, and refuses to start.
- * Populated by bound imports and successful explicit LoadLibrary calls; lookups are read-only.
+ * Bound imports are pinned here; explicit LoadLibrary and COM cache owners hold separate
+ * references below. Module lookups never change either kind of ownership.
  */
 let loadedNames = new Set<string>();
+/** Explicit loader owners (LoadLibrary and COM cache), independent of pinned imports. */
+let retainedNames = new Map<string, number>();
+export interface HleModuleLoadReference { release(): void; }
 /**
  * Image export address -> the inline stub its body now JMPs to. An export served by a
  * trap-free inline stub keeps its ONE address (the image body); only the bytes there
@@ -81,18 +85,36 @@ function slotKeys(dllName: string): string[] {
 }
 
 /**
- * Record an HLE'd DLL as loaded: its imports were bound into a PE image, or an explicit
- * LoadLibrary succeeded. Deliberately NOT inside hleImageBase — our own warmup
+ * Pin an HLE'd DLL whose imports were bound into a PE image.
+ * Deliberately NOT inside hleImageBase — our own warmup
  * loops resolve every known module's base, and marking there would vouch for all of them.
  */
 export function markHleModuleLoaded(dllName: string): void {
     for (const key of slotKeys(dllName)) if (slotByName.has(key)) loadedNames.add(key);
 }
 
+/** Hold one loader reason. A retired process' release cannot touch a new image epoch. */
+export function retainHleModuleLoaded(dllName: string): HleModuleLoadReference | undefined {
+    if (hleImageBase(dllName) === undefined) return undefined;
+    const names = slotKeys(dllName).filter(name => slotByName.has(name));
+    const counts = retainedNames;
+    for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+    let released = false;
+    return { release() {
+        if (released) return;
+        released = true;
+        for (const name of names) {
+            const count = (counts.get(name) ?? 1) - 1;
+            if (count > 0) counts.set(name, count); else counts.delete(name);
+        }
+    } };
+}
+
 /** Has this process loaded the module, or does it only have an image? See loadedNames. */
 export function isHleModuleLoaded(dllName: string): boolean {
     const raw = normalizeDllBaseName(dllName);
-    return loadedNames.has(slotByName.has(raw) ? raw : canonicalHleModuleName(dllName));
+    const key = slotByName.has(raw) ? raw : canonicalHleModuleName(dllName);
+    return loadedNames.has(key) || retainedNames.has(key);
 }
 
 /** Reverse of hleImageBase, for logging and handle->name resolution. */
@@ -187,6 +209,7 @@ export function resetHleModuleImages(): void {
     exportsByLowerName = new Map();
     ordinalsByName = new Map();
     loadedNames = new Set();
+    retainedNames = new Map();
     redirectByAddress = new Map();
     owner = null;
     ownerGeneration = -1;
@@ -236,6 +259,7 @@ export function materializeHleModuleImages(process: any): void {
     exportsByLowerName = new Map();
     ordinalsByName = new Map();
     loadedNames = new Set();
+    retainedNames = new Map();
     redirectByAddress = new Map();
 
     // Pinned names first, then everything else the APIRegistry knows, sorted so the

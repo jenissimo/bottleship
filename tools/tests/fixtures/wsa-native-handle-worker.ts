@@ -4,6 +4,7 @@ import {getWsaOverlapped} from "../../../src/worker/modules/wsa-overlapped";
 import {Process} from "../../../src/worker/core/process";
 import {Mem} from "../../../src/worker/core/memory/mem-accessor";
 import {System} from "../../../src/worker/core/system";
+import {exports as processApi} from "../../../src/worker/modules/kernel32/process/process";
 const owner=Object.create(Process.prototype) as Process;
 const memory=new Uint8Array(2*1024*1024);Mem.bind(()=>memory);
 Object.assign(owner,{resetGeneration:0,memory:{alloc(){return 0;},free(){}},getMemory:()=>memory,addressSpace:{
@@ -20,6 +21,16 @@ self.onmessage=async({data})=>{
     try{
         let result:unknown;
         if(data.boot){adoptProcessNetworkNamespace(data.boot);await getProcessNetworkNamespace().barrier();result=true;}
+        else if(data.command==="handleFlags"){
+            const system=System.getInstance(),previous=system.process,oldError=system.scheduler.setLastError,existedBefore=!!getWsaSocketTable(owner);let error=0x2345;word(0x10800,0xfeed);
+            system.process=owner;system.scheduler.setLastError=value=>{error=value;};
+            try{
+                if(data.mask!==undefined)processApi.SetHandleInformation({} as never,memory,[data.handle,data.mask,data.flags]);
+                const value=processApi.GetHandleInformation({} as never,memory,[data.handle,0x10800]);
+                if(data.cleanup){const state=getWsaProcessState(owner);state.counter.startup();state.counter.cleanup();}
+                result={value,error,flags:get(0x10800),started:getWsaProcessState(owner).counter.started,valid:hasWsaSocket(owner,data.handle),existedBefore};
+            }finally{system.process=previous;system.scheduler.setLastError=oldError;}
+        }
         else if(data.command==="lookup"){
             const existed=!!getWsaSocketTable(owner),valid=hasWsaSocket(owner,data.handle),table=getWsaNativeSocketTable(owner,data.handle);
             if(!valid||!table)throw Error("Reserved native handle was not found");

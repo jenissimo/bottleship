@@ -17,6 +17,8 @@ export class DirectPlay8Callbacks {
     private waitingBytes = 0;
     private retry?: ReturnType<typeof setTimeout>;
     private closed = false;
+    private closing = false;
+    onSpace?: () => void;
     private buffers = new Map<number, ReceiveBuffer>();
     private nextBuffer = 1;
     private reservedReceiveCount = 0;
@@ -26,13 +28,13 @@ export class DirectPlay8Callbacks {
         readonly routine: number, readonly userContext: number) {
         this.queue = DirectPlayCallbackExecutor.forProcess(process).channel();
         this.guest = new DirectPlayGuestMemory(process);
-        this.queue.onSpace = () => { this.promote(); if (!this.closed) this.session.resumeCallbacks(); };
+        this.queue.onSpace = () => { this.promote(); if (!this.closed) { this.onSpace?.(); this.session.resumeCallbacks(); } };
     }
     get pending(): number { return this.queue.size + this.waiting.length; }
-    native(type: number, size: number, fill: (ptr: number) => void = () => {}, onReturn?: (hr: number, ptr: number) => boolean | void, onDiscard?: () => void): boolean {
+    native(type: number, size: number, fill: (ptr: number) => void = () => {}, onReturn?: (hr: number, ptr: number) => boolean | void, onDiscard?: () => void, key?: object): boolean {
         if (this.closed) return false;
         const task: DirectPlayCallbackTask = {
-            storageBytes: size + 64,
+            storageBytes: size + 64, message: type, key,
             prepare: () => {
                 const ptr = size ? this.process.memory.alloc(size) : 0;
                 if (size && !ptr) { onDiscard?.(); throw new Error("DirectPlay callback allocation failed"); }
@@ -40,7 +42,11 @@ export class DirectPlay8Callbacks {
                 let released = false;
                 const free = () => { if (!released && ptr) { released = true; this.process.memory.free(ptr); } };
                 return { routine: this.routine, args: [this.userContext, (0xffff0000 | type) >>> 0, ptr],
-                    onReturn: hr => { if (this.closed) { free(); onDiscard?.(); } else if (!onReturn?.(hr, ptr)) free(); },
+                    onReturn: hr => {
+                        if (this.closed) { free(); onDiscard?.(); return; }
+                        let retained = false;
+                        try { retained = !!onReturn?.(hr, ptr); } finally { if (!retained) free(); }
+                    },
                     onDiscard: () => { free(); onDiscard?.(); } };
             }, onDiscard,
         };
@@ -61,6 +67,18 @@ export class DirectPlay8Callbacks {
         }, 4);
         (this.retry as unknown as { unref?(): void }).unref?.();
     }
+    beginClose(): void {
+        this.closing = true;
+        const resume = this.queue.pause();
+        const retained: DirectPlayCallbackTask[] = [];
+        for (const task of this.waiting) {
+            if (task.message === 0x11) { this.waitingBytes -= task.storageBytes!; task.onDiscard?.(); }
+            else retained.push(task);
+        }
+        this.waiting = retained;
+        this.queue.cancelPending(task => task.message === 0x11);
+        resume();
+    }
     async flush(): Promise<void> { while (!this.closed && this.pending) await new Promise(resolve => setTimeout(resolve, 4)); }
     close(): void {
         if (this.closed) return; this.closed = true;
@@ -77,6 +95,7 @@ export class DirectPlay8Callbacks {
         return DPN.OK;
     }
     emit(event: DirectPlay8Event): boolean {
+        if (this.closing && event.type === 0x11) return true;
         const id = event.id ?? 0, context = event.context ?? 0;
         if (event.type === 2) return this.native(2, 0);
         if (event.type === 7 || event.type === 6) {

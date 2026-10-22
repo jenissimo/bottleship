@@ -3,7 +3,7 @@ import { WsaSocketTable, WsaFailure, WSA, type WsaIoPurpose } from "./wsa-networ
 import type { WsaActorIdentity, WsaActorNotification } from "./wsa-actor-protocol";
 type State = ReturnType<WsaSocketTable["get"]>;
 type Cache = Partial<State>;
-interface Alias { id: number; physical: number; owner: Context; cache: Cache; imported: boolean; }
+interface Alias { id: number; physical: number; owner: Context; cache: Cache; imported: boolean; handleFlags: number; }
 interface NativeIo extends Alias { purpose: WsaIoPurpose; }
 interface Context extends WsaActorIdentity { aliases: Map<number, Alias>; nativeIo: Map<number, NativeIo>; notify?: (message: WsaActorNotification) => void; }
 const cached = new Set<keyof State>(["overlapped","broadcast","reuse","receiveLimit","sendLimit","receiveTimeout","sendTimeout","oobInline","lingerEnabled","lingerSeconds","connectContextPending"]);
@@ -57,7 +57,7 @@ export class WsaActorKernel {
         if (context.aliases.size >= 4096 || this.nextHandle > 0x7fffffff) fail(WSA.ENOBUFS);
         const id = this.nextHandle++, state = this.table.get(physical), values: Cache = {};
         for (const key of cached) (values as any)[key] = cache && Object.hasOwn(cache, key) ? cache[key] : state[key];
-        const alias: Alias = { id, physical, owner: context, cache: values, imported };
+        const alias: Alias = { id, physical, owner: context, cache: values, imported, handleFlags: 1 };
         context.aliases.set(id, alias);
         let refs = this.references.get(physical); if (!refs) this.references.set(physical, refs = new Set());
         refs.add(alias); return id;
@@ -76,12 +76,12 @@ export class WsaActorKernel {
     private snapshot(alias: Alias): State {
         const output: any = {};
         for (const [key, value] of Object.entries(this.table.get(alias.physical))) if (!omitted.has(key)) output[key] = value;
-        Object.assign(output, alias.cache, { id: alias.id, packets: [], chunks: [], oobPending: [] });
+        Object.assign(output, alias.cache, { id: alias.id, handleFlags: alias.handleFlags, packets: [], chunks: [], oobPending: [] });
         return structuredClone(output);
     }
     execute(identity: WsaActorIdentity, command: string, args: unknown[], nativeHandleOnly = false): unknown {
         const context = this.context(identity);
-        if (nativeHandleOnly && !["get", "isValid", "send", "receive", "readable", "writable", "closesocket", "fileObjectId", "hasFileObject", "acquireNativeIo", "nativeIo", "releaseNativeIo"].includes(command)) fail(WSA.EINVAL);
+        if (nativeHandleOnly && !["get", "isValid", "send", "receive", "readable", "writable", "closesocket", "setHandleFlags", "fileObjectId", "hasFileObject", "acquireNativeIo", "nativeIo", "releaseNativeIo"].includes(command)) fail(WSA.EINVAL);
         if (command === "fileObjectId") return this.alias(context, args[0] as number).physical;
         if (command === "hasFileObject") return this.table.isValid(args[0] as number) && [...context.aliases.values()].some(alias => alias.physical === args[0]);
         if (command === "acquireNativeIo") {
@@ -156,6 +156,10 @@ export class WsaActorKernel {
         // A Winsock lookup can attach the duplicated OS handle before an explicit WSASocket import.
         if (!nativeHandleOnly) alias.imported = true;
         if (command === "get") return this.snapshot(alias);
+        if (command === "setHandleFlags") {
+            alias.handleFlags = (alias.handleFlags & ~((args[1] as number) & 3)) | ((args[2] as number) & (args[1] as number) & 3);
+            return 0;
+        }
         if (command === "import") { alias.imported = true; return alias.id; } // Provider cleanup owns descriptors only after WSASocket imports them.
         if (command === "duplicate") {
             const target = this.processes.get(args[1] as number); if (!target) fail(WSA.EINVAL);
@@ -171,7 +175,10 @@ export class WsaActorKernel {
             }
             return null;
         }
-        if (command === "closesocket") { this.release(alias); context.notify?.({ type: "changed" }); return 0; }
+        if (command === "closesocket") {
+            if (alias.handleFlags & 2) return 0;
+            this.release(alias); context.notify?.({ type: "changed" }); return 0;
+        }
         if (command === "configureEvents") {
             this.selected.set(alias.physical, alias);
             this.table.configureEvents(alias.physical, args[1] as number, (bit, error) => {

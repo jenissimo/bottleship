@@ -197,7 +197,10 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         if (!af) af = protocol >= 1000 ? 6 : 2;
         if (!type) type = protocol === 17 || af === 6 ? 2 : protocol === 6 ? 1 : 3;
         const id = table.socket(type, af, protocol);
-        if(fromProtocolInfo)table.get(id).overlapped=!!(args[5]&1);
+        if(fromProtocolInfo){
+            table.get(id).overlapped=!!(args[5]&1);
+            table.setHandleFlags(id, 1, (args[5]&0x80)?0:1);
+        }
         setError(0); // Native Windows socket()/WSASocket success clears the thread error.
         return { value: id };
     };
@@ -212,7 +215,7 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         if (!entry) fail(WSA.EPROTONOSUPPORT);
         const image = protocolInfo({ ...entry, protocol: socket.protocol }, wide);
         new DataView(image.buffer).setUint32(112, provider.duplicate(a[0], a[1]), true);
-        return { value: 0, writes: patches(output, image) };
+        return { value: 0, error: 0, writes: patches(output, image) };
     });
     for (const wide of [false, true]) api[wide ? "WSAEnumProtocolsW" : "WSAEnumProtocolsA"] = adapt(counter, setError, a => {
         guard(a[2], 4, true);
@@ -237,10 +240,74 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
             return { value: 0, error: 0, writes: [{ address: a[2], value: value >>> 0, size: short ? 2 : 4 }] };
         });
     }
-    api.WSAConnect = (ctx, mem, args) => api.connect(ctx, mem, args);
-    api.WSASendDisconnect = adapt(counter, setError, a => ({ value: table.shutdown(a[0], 1), error: 0 }));
-    api.WSARecvDisconnect = adapt(counter, setError, a => ({ value: table.shutdown(a[0], 0), error: 0 }));
-    api.closesocket = adapt(counter, setError, a => ({ value: table.closesocket(a[0]) }));
+    const connectionData = (ptr: number): { length: number; buffer: number } | undefined => {
+        if (!ptr) return undefined;
+        guard(ptr, 8);
+        return { length: u32(ptr), buffer: u32(ptr + 4) };
+    };
+    const internetDataProvider = (socket: ReturnType<WsaSocketTable["get"]>) =>
+        (socket.af === 2 || socket.af === 23) && (socket.type === 1 || socket.type === 2);
+    const outboundConnectionData = (ptr: number, datagram: boolean): void => {
+        const data = connectionData(ptr);
+        if (!data?.length || !data.buffer) return;
+        if (datagram) fail(WSA.EINVAL);
+        guard(data.buffer, data.length);
+    };
+    api.WSAConnect = (ctx, mem, args) => {
+        const a = args.slice(), report = setError.capture?.() ?? setError;
+        const failure = (error: unknown): number => { if (!(error instanceof WsaFailure)) throw error; report(error.code); return -1; };
+        try {
+            if (!counter.started) fail(WSA.NOTINITIALISED);
+            const socket = table.get(a[0]), peer = address(a[1], a[2] | 0), stream = socket.type === 1;
+            // Preserve the connection-state errors before touching optional provider buffers.
+            if (!internetDataProvider(socket) || !peer.family || socket.disconnected ||
+                (stream && socket.state !== "new" && socket.state !== "failed")) return api.connect(ctx, mem, a);
+            if (peer.family !== socket.af) fail(WSA.EAFNOSUPPORT);
+            if (!peer.port) fail(WSA.EADDRNOTAVAIL);
+            // AFD binds before capturing connection data, including an eventual EFAULT.
+            if (!socket.local) table.bind(a[0]);
+            outboundConnectionData(a[3], !stream);
+            const callee = connectionData(a[4]), copyBack = !!callee?.length && !!callee.buffer;
+            if (!stream && copyBack) fail(WSA.EINVAL);
+            const generation = table.generation, nativeGeneration = table.nativeIoGeneration, processGeneration = process?.resetGeneration;
+            const finish = (): number => {
+                try {
+                    if (generation !== table.generation || nativeGeneration !== table.nativeIoGeneration ||
+                        (process && processGeneration !== process.resetGeneration)) fail(WSA.EINTR);
+                    if (copyBack) {
+                        // Native copies WSABUF fields in order. A protected pointer field
+                        // can fault after len was cleared; the TCP connection stays alive.
+                        guard(a[4], 4, true); if (!Mem.writeUint32(a[4], 0)) fail(WSA.EFAULT);
+                        guard(a[4] + 4, 4, true); if (!Mem.writeUint32(a[4] + 4, 0)) fail(WSA.EFAULT);
+                    }
+                    report(0); return 0;
+                } catch (error) { return failure(error); }
+            };
+            const answer = api.connect(ctx, mem, a);
+            if (answer instanceof Promise) return (answer as Promise<number | ThunkResult>).then<ThunkResult>(value => {
+                const result = typeof value === "number" ? { value } : value;
+                return result.value ? result : { ...result, value: -1, resumeOnOwner: finish };
+            });
+            return answer === 0 ? finish() : answer;
+        } catch (error) { return failure(error); }
+    };
+    api.WSASendDisconnect = adapt(counter, setError, a => {
+        const socket = table.get(a[0]);
+        if (internetDataProvider(socket)) {
+            if (socket.type === 1 && socket.state !== "connected") table.shutdown(a[0], 1);
+            outboundConnectionData(a[1], socket.type === 2);
+        }
+        return { value: table.shutdown(a[0], 1), error: 0 };
+    });
+    api.WSARecvDisconnect = adapt(counter, setError, a => {
+        const socket = table.get(a[0]), value = table.shutdown(a[0], 0);
+        if (internetDataProvider(socket)) {
+            const data = connectionData(a[1]);
+            if (data?.length && data.buffer) guard(data.buffer, data.length, true);
+        }
+        return { value, error: 0 };
+    });
+    api.closesocket = adapt(counter, setError, a => ({ value: table.closesocket(a[0]), error: 0 }));
     api.bind = adapt(counter, setError, a => ({ value: table.bind(a[0], address(a[1], a[2] | 0)) }));
     api.listen = adapt(counter, setError, a => ({ value: table.listen(a[0], a[1]) }));
     api.connect = adapt(counter, setError, a => {
@@ -336,7 +403,7 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const data = bytes(a[1], s.type === 1 ? Math.min(length, 16384) : length);
         const dst = to && a[4] ? address(a[4], a[5] | 0) : undefined;
         return mapPrepared(waitOperation(table, a[0], () => table.send(a[0], data, dst, a[3]), s.sendTimeout, true),
-            value => ({ value }));
+            value => ({ value, error: 0 }));
     };
     api.send = adapt(counter, setError, a => send(a, false));
     api.sendto = adapt(counter, setError, a => send(a, true));
@@ -372,15 +439,15 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
             return result instanceof Promise ? result.then(prepare, failure) : prepare(result);
         } catch (error) { return failure(error); }
     });
-    api.shutdown = adapt(counter, setError, a => ({ value: table.shutdown(a[0], a[1] | 0) }));
+    api.shutdown = adapt(counter, setError, a => ({ value: table.shutdown(a[0], a[1] | 0), error: 0 }));
     for (const [name, peer] of [["getsockname", false], ["getpeername", true]] as const) {
         api[name] = adapt(counter, setError, a => {
             const s = table.get(a[0]), addr = peer ? s.peer : s.local;
-            if (!addr) fail(peer ? WSA.ENOTCONN : WSA.EINVAL);
+            if (!addr || (peer && s.type === 1 && !s.connectedAt)) fail(peer ? WSA.ENOTCONN : WSA.EINVAL);
             if (s.acceptListener !== undefined || s.connectContextPending) fail(WSA.EINVAL);
             const out = outputAddress(a[1], a[2], s.af);
             if (!a[1]) fail(WSA.EFAULT);
-            return { value: 0, writes: out(addr) };
+            return { value: 0, error: 0, writes: out(addr) };
         });
     }
     api.ioctlsocket = adapt(counter, setError, a => {

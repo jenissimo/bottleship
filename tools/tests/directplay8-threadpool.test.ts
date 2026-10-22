@@ -122,6 +122,16 @@ test("closing one channel cancels an assigned unprepared task while other channe
     worker(0); expect(calls[0].args).toEqual([2]); complete(0); expect(returned).toBe(1);
     expect(first.size).toBe(0); expect(second.size).toBe(0);
 });
+test("selective cancellation drops unprepared receives once without cancelling an active callback or other messages", () => {
+    const lane = executor.channel(); let discarded = 0, returned = 0;
+    lane.enqueue({ message: 0x11, prepare: () => ({ routine: 0x7000, args: [1], onReturn: () => returned++ }), onDiscard: () => discarded++ });
+    worker(0); // The active receive must finish, while the two later receives are discarded.
+    lane.enqueue({ message: 0x11, prepare: () => ({ routine: 0x7000, args: [2] }), onDiscard: () => discarded++ });
+    lane.enqueue({ message: 0x14, prepare: () => ({ routine: 0x7000, args: [3] }) });
+    lane.enqueue({ message: 0x11, prepare: () => ({ routine: 0x7000, args: [4] }), onDiscard: () => discarded++ });
+    lane.cancelPending(task => task.message === 0x11); expect(discarded).toBe(2); expect(lane.size).toBe(2);
+    complete(0); expect(returned).toBe(1); worker(0); expect(calls[1].args).toEqual([3]); complete(1); expect(lane.size).toBe(0); expect(discarded).toBe(2);
+});
 test("callback payload byte quota refuses ownership without discarding or preparing the rejected task", () => {
     call("Initialize", [0, 0x7000, 0]); call("SetThreadCount", [0xffffffff, 0, 0]);
     const lane = executor.channel(100); let prepared = 0, discarded = 0;

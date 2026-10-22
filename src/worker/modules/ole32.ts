@@ -5,7 +5,7 @@ import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
 import { InterfaceRegistry, registerStandardDirectXInterfaces } from "../core/com/interface-registry";
 import { ComObjectFactory, BaseComObject } from "../core/com/base-com-object";
-import { lookupHleComClass } from "../core/com/hle-com-registry";
+import { lookupHleComClass, releaseHleComServerLoads, leaveComApartment } from "../core/com/hle-com-registry";
 import { SystemResourceProvider } from "../core/resources/system-resource-provider";
 import { allocateComObject } from "../core/com/com-memory";
 import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
@@ -102,7 +102,7 @@ export class Ole32 implements IModule {
         this.exports["CoUninitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, 'CoUninitialize called');
 
-            comApartments.leave(System.getInstance().scheduler.getCurrentThreadId());
+            leaveComApartment(this.process, System.getInstance().scheduler.getCurrentThreadId());
             return 0; // Return 0 for void function (COM convention)
         };
 
@@ -208,7 +208,7 @@ export class Ole32 implements IModule {
             if (!isValidAddress(mem, clsid, 16, "r") || !isValidAddress(mem, iid, 16, "r")) return E_POINTER;
             if (reserved) return E_INVALIDARG;
             const registered = lookupHleComClass(this.process, readGuidFromMem(mem, clsid));
-            if (!registered || !(context & 1)) return REGDB_E_CLASSNOTREG;
+            if (!registered || !(context & 1) || !registered.server.acquireLoaderReference()) return REGDB_E_CLASSNOTREG;
             return registered.server.getClassObject(ctx, clsid, iid, out);
         };
 
@@ -379,7 +379,7 @@ export class Ole32 implements IModule {
         // void OleUninitialize()
         this.exports["OleUninitialize"] = (ctx, mem, args) => {
             Logger.log(LogCategory.COM, `OleUninitialize called`);
-            comApartments.leaveOle(System.getInstance().scheduler.getCurrentThreadId());
+            leaveComApartment(this.process, System.getInstance().scheduler.getCurrentThreadId(), true);
             return 0;
         };
 
@@ -935,7 +935,13 @@ export class Ole32 implements IModule {
         iidAddress: number,
     ): number {
         const registered = lookupHleComClass(this.process, clsidNormalized);
-        if (registered) return registered.server.create(registered.definition, 0, iidAddress, ppv, context);
+        if (registered) {
+            if (!registered.server.acquireLoaderReference()) {
+                Mem.writeUint32(ppv, 0);
+                return REGDB_E_CLASSNOTREG;
+            }
+            return registered.server.create(registered.definition, 0, iidAddress, ppv, context);
+        }
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const interfaceRegistry = InterfaceRegistry.getInstance();
         const process = this.process;
@@ -1385,6 +1391,7 @@ export class Ole32 implements IModule {
      * THUNK_CODE. Stubs are regenerated in recreateVTables() after the new layout exists.
      */
     reset(): void {
+        releaseHleComServerLoads(this.process, true);
         comApartments.reset();
         this.dragDropRegistrations.reset();
         this.objectAddressMap.clear();

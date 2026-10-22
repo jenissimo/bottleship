@@ -136,6 +136,18 @@ describe("GetModuleHandle observes loaded HLE images without loading them", () =
         expect(isHleModuleLoaded("dinput8")).toBe(true);
         for (const api of apis) expect(lookup(api, "dinput8.dll")).toBe(result.value);
     });
+    test("the last dynamic alias release leaves an imported canonical DLL loaded", async () => {
+        markHleModuleLoaded("dinput");
+        const first = await call("LoadLibraryA", [writeName("dinput8.dll", false)]);
+        const second = await call("LoadLibraryW", [writeName("dinput8.dll", true)]);
+        expect(first.value).toBe(second.value);
+        expect(isHleModuleLoaded("dinput8")).toBe(true);
+        call("FreeLibrary", [first.value]);
+        expect(lookup("GetModuleHandleA", "dinput8.dll")).toBe(first.value);
+        call("FreeLibrary", [second.value]);
+        expect(lookup("GetModuleHandleA", "dinput8.dll")).toBe(0);
+        expect(lookup("GetModuleHandleA", "dinput.dll")).toBe(hleImageBase("dinput"));
+    });
     test("the fast path declines an unloaded image without changing loader membership", () => {
         expect(fast("ws2_32.dll")).toBeNull();
         expect(isHleModuleLoaded("ws2_32")).toBe(false);

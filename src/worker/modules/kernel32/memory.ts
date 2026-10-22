@@ -433,12 +433,14 @@ function buildHeapWalkSnapshot(view: DataView): HeapBlock[] {
 }
 
 /** Reset slab state on process cleanup. */
+let resetVirtualAllocationState = (): void => { virtualAllocRegions.clear(); decommittedPages.clear(); };
+
 export function resetHeapSlab(): void {
     slabRanges = [];
     totalSlabBytes = 0;
     nextSlabSize = HEAP_SLAB_INITIAL_SIZE;
     slabGrowLastAttempt = 0;
-    virtualAllocRegions.clear();
+    resetVirtualAllocationState();
     hypercallDataManager.resetHeapSlab();
     createdHeaps.clear();
     heapCompatibility.clear();
@@ -825,6 +827,11 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         shapes: [...vaCacheShapes].sort((a, b) => b[1] - a[1]).slice(0, 12),
         sizes: [...vaFreeCache].map(([size, list]) => ({ size, count: list.length })).filter((r) => r.count > 0),
     });
+
+    resetVirtualAllocationState = () => {
+        virtualAllocRegions.clear(); decommittedPages.clear(); reservedPages.clear();
+        vaFreeCache.clear(); vaCacheBytes = 0; vaProtectionTouched.clear();
+    };
 
     // virtualAllocRegions / decommittedPages are module-scoped: the fast-path tier
     // and HeapWalk/HeapSize read the same interval indexes.
@@ -1296,6 +1303,28 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         return perms as RegionPerms;
     };
 
+    const permsToProtect = (perms: RegionPerms): number =>
+        perms === "noaccess" ? PAGE_NOACCESS :
+        perms.includes("x") ? (perms.includes("w") ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ) :
+        perms.includes("w") ? PAGE_READWRITE : PAGE_READONLY;
+
+    // HeapAlloc deliberately has no region per small allocation. VirtualAlloc does:
+    // its reservation is the lifetime/identity boundary for protection and release.
+    function registerVirtualAllocation(process: any, base: number, size: number, perms: RegionPerms, protection: number): void {
+        const space = process.addressSpace;
+        if (typeof space.registerRegion !== "function") return; // isolated API harnesses
+        const existing = space.getRegions().find((region: any) =>
+            region.owner !== "Layout" && region.base === base && region.size === size);
+        if (existing) {
+            existing.protection = protection;
+            existing.allocationProtect = protection;
+            return;
+        }
+        const kind = space.getRegion(base)?.kind === "HEAP_HIGH" ? "HEAP_HIGH" : "HEAP";
+        space.registerRegion({ base, size, perms, kind, protection, allocationProtect: protection,
+            owner: "VirtualAlloc", skipOverlapCheck: true });
+    }
+
     // IMAGE_SCN_MEM_{EXECUTE,READ,WRITE}
     const SCN_EXECUTE = 0x20000000, SCN_READ = 0x40000000, SCN_WRITE = 0x80000000;
 
@@ -1524,6 +1553,24 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 }
             }
 
+            // Current protection comes from AddressSpace's allocation fragments, the
+            // same records used to validate HLE pointer reads/writes. PE section defaults
+            // remain authoritative until an explicit protection has replaced them.
+            let allocationProtect = protect;
+            const region = system.process?.addressSpace.getRegion(pageBase);
+            if (region && region.owner !== "Layout" && state === MEM_COMMIT) {
+                regionSize = Math.min(regionSize, region.base + region.size - pageBase);
+                if (region.protection !== undefined) {
+                    protect = region.protection;
+                    allocationProtect = region.allocationProtect ??
+                        permsToProtect(region.allocationPerms ?? region.perms);
+                    baseAddress = pageBase;
+                }
+            }
+            for (const [dcBase] of decommittedPages) {
+                if (dcBase > pageBase) regionSize = Math.min(regionSize, dcBase - pageBase);
+            }
+
             // Decommitted pages within a reserved/committed region read back as MEM_RESERVE.
             if (state === MEM_COMMIT) {
                 const dc = decommittedPages.find(pageBase);
@@ -1537,7 +1584,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const reportProtect = (state === MEM_RESERVE || state === MEM_FREE) ? PAGE_NOACCESS : protect;
             view.setUint32(lpBuffer, baseAddress, true);              // BaseAddress
             view.setUint32(lpBuffer + 4, allocationBase, true);       // AllocationBase
-            view.setUint32(lpBuffer + 8, state === MEM_FREE ? 0 : protect, true); // AllocationProtect
+            view.setUint32(lpBuffer + 8, state === MEM_FREE ? 0 : allocationProtect, true); // AllocationProtect
             view.setUint32(lpBuffer + 12, regionSize, true);          // RegionSize
             view.setUint32(lpBuffer + 16, state, true);               // State
             view.setUint32(lpBuffer + 20, reportProtect, true);       // Protect
@@ -2371,6 +2418,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
         // allocFromHigh/alloc may round up to 64KB granularity — track the live block size.
         const committedSize = process.memory.getSize(address) ?? alignedSize;
+        registerVirtualAllocation(process, address, committedSize, perms, flProtect);
+        // Only initial plain-RW reservations may enter the untouched-PTE recycler.
+        if (flProtect !== PAGE_READWRITE) vaProtectionTouched.add(address);
 
         if (flAllocationType & MEM_RESERVE) {
             reservedPages.set(address, committedSize);
@@ -2393,7 +2443,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             if (ptm?.isPagingEnabled()) {
                 ptm.commitPages(address, alignedSize);
             } else {
-                process.addressSpace.fill(address, alignedSize, 0);
+                mem.fill(0, address, address + alignedSize);
+            }
+            if (ptm?.isPagingEnabled() && perms !== 'rw') {
+                ptm.setProtection(address, alignedSize, permsToProtect(perms));
             }
             profiler.end("VirtualAlloc:commit");
             Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
@@ -2505,6 +2558,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 if (ptm?.isPagingEnabled()) ptm.setProtection(lpAddress, trackedSize, PAGE_READWRITE);
             }
 
+            process.addressSpace.releaseRegion?.(lpAddress);
             const allocSize = blockSize;
             if (allocSize === undefined) {
                 Logger.warn(LogCategory.KERNEL32,
@@ -2541,85 +2595,57 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             `VirtualFree: Decommitted ${alignedSize} bytes at 0x${alignedAddress.toString(16)}`);
         return 1; // TRUE
     };
-    // VirtualProtect - change memory protection on a region
+    // VirtualProtect changes every intersected page within ONE allocation.
     exports['VirtualProtect'] = (ctx, mem, args) => {
-        const lpAddress = args[0];
-        const dwSize = args[1];
-        const flNewProtect = args[2];
-        const lpflOldProtect = args[3]; // OUT pointer
-
-        const PAGE_SIZE = 0x1000;
-
-        // Windows rounds lpAddress DOWN to page boundary and adjusts size to cover
-        // the full range [alignedAddr, lpAddress + dwSize), rounded up to page size.
-        const alignedAddr = lpAddress & ~(PAGE_SIZE - 1);
-        const alignedSize = Math.ceil((dwSize + (lpAddress - alignedAddr)) / PAGE_SIZE) * PAGE_SIZE;
-        const process = System.getInstance().process;
-        if (!process) {
-            Logger.error(LogCategory.KERNEL32, 'VirtualProtect: No active process');
+        const lpAddress = args[0] >>> 0, dwSize = args[1] >>> 0;
+        const flNewProtect = args[2] >>> 0, lpflOldProtect = args[3] >>> 0;
+        const system = System.getInstance(), process = system.process;
+        if (!process) return 0;
+        const baseProtection = flNewProtect & 0xff;
+        if (!dwSize || ![PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+            PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY].includes(baseProtection) ||
+            (flNewProtect & ~0x7ff) !== 0) {
+            system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
             return 0;
         }
-
-        // Get current region for old perms
+        const alignedAddr = Math.floor(lpAddress / 0x1000) * 0x1000;
+        const end = Math.ceil((lpAddress + dwSize) / 0x1000) * 0x1000;
+        const alignedSize = end - alignedAddr;
         const region = process.addressSpace.getRegion(alignedAddr);
-        if (!region) {
-            System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            Logger.warn(LogCategory.KERNEL32,
-                `VirtualProtect: Invalid address 0x${alignedAddr.toString(16)}`);
+        const owner = virtualAllocRegions.find(alignedAddr);
+        let invalid = !region || end > mem.length || end > 0x100000000 ||
+            (owner !== null && end > owner.base + owner.size);
+        for (const [base, size] of virtualAllocRegions) {
+            if (base < end && base + size > alignedAddr && base !== owner?.base) invalid = true;
+        }
+        for (const [base, size] of decommittedPages) {
+            if (base < end && base + size > alignedAddr) invalid = true;
+        }
+        if (invalid || !region) {
+            system.scheduler.setLastError(ERROR_INVALID_ADDRESS);
             return 0;
         }
-
-        // Write old protect flags back (if pointer valid)
-        if (lpflOldProtect && lpflOldProtect + 4 <= mem.length) {
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            let oldProtect = PAGE_NOACCESS;
-            if (region.perms.includes('w')) {
-                oldProtect = PAGE_READWRITE;
-            } else if (region.perms.includes('x')) {
-                oldProtect = PAGE_EXECUTE_READ;
-            } else if (region.perms.includes('r')) {
-                oldProtect = PAGE_READONLY;
-            }
-            view.setUint32(lpflOldProtect, oldProtect, true);
+        if (!lpflOldProtect || lpflOldProtect + 4 > mem.length ||
+            !process.addressSpace.validateRange(lpflOldProtect, 4, "w")) {
+            system.scheduler.setLastError(998); // ERROR_NOACCESS
+            return 0;
         }
-
-        // Map new protect to perms using existing helper
+        const mod = process.moduleRegistry?.getModuleContainingAddress(alignedAddr);
+        const oldProtect = region.protection ?? (mod
+            ? imageProtectionRun(mod, alignedAddr).protect : permsToProtect(region.perms));
         const newPerms = mapProtectToPerms(flNewProtect);
-
-        // The recycler may only hand a block back with its PTEs untouched, so a block the
-        // app has re-protected is disqualified for good — recorded here rather than
-        // re-derived at release, where the original protection is no longer visible.
-        {
-            const owner = virtualAllocRegions.find(alignedAddr);
-            if (owner) vaProtectionTouched.add(owner.base);
+        if (!process.addressSpace.protect(alignedAddr, alignedSize, newPerms, flNewProtect)) {
+            system.scheduler.setLastError(ERROR_INVALID_ADDRESS);
+            return 0;
         }
-
-        // Apply protection. protect() requires exact (base, size) match; PE sub-pages
-        // (e.g. 0x41f000 inside module at 0x400000) don't match, so it fails.
-        const success = process.addressSpace.protect(alignedAddr, alignedSize, newPerms);
-        if (!success) {
-            const ptm = process.pageTableManager;
-            if (ptm?.isPagingEnabled()) {
-                ptm.setProtection(alignedAddr, alignedSize, flNewProtect);
-            }
-            // Fake success for sub-region (e.g. page inside PE). App expects TRUE;
-            // otherwise CRT aborts via INT 0x29. We already wrote lpflOldProtect.
-            Logger.verbose(LogCategory.KERNEL32,
-                `VirtualProtect(0x${alignedAddr.toString(16)}, ${alignedSize}) faked success (sub-region)`);
-            return 1;
-        }
-
-        // Also update PTEs if paging is active. The read map is updated by the
-        // PTE-level operation itself.
+        if (owner) vaProtectionTouched.add(owner.base);
         const ptm = process.pageTableManager;
         if (ptm?.isPagingEnabled()) {
-            ptm.setProtection(alignedAddr, alignedSize, flNewProtect);
+            // PTEs encode present/write, not Win32 COW/cache modifiers.
+            ptm.setProtection(alignedAddr, alignedSize, permsToProtect(newPerms));
         }
-
-        Logger.verbose(LogCategory.KERNEL32,
-            `VirtualProtect(0x${alignedAddr.toString(16)}, ${alignedSize}) -> ${newPerms}`);
-
-        return 1; // TRUE
+        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lpflOldProtect, oldProtect, true);
+        return 1;
     };
 
     // VirtualLock - Lock pages in memory to prevent paging (no-op in emulator)
@@ -3628,6 +3654,7 @@ const virtualQueryFastPath: FastPathImplementation = (esp: number, view: DataVie
     if (system.scheduler?.findStackReservation(pageBase)) { vqFastDefers++; return null; }
     if (process.moduleRegistry?.getModuleContainingAddress(lpAddress)) { vqFastDefers++; return null; }
     if (virtualAllocRegions.find(pageBase)) { vqFastDefers++; return null; }
+    if (process.addressSpace.getRegion(pageBase)?.protection !== undefined) { vqFastDefers++; return null; }
     if (decommittedPages.find(pageBase)) { vqFastDefers++; return null; }
 
     view.setUint32(lpBuffer, pageBase, true);                     // BaseAddress

@@ -5,7 +5,7 @@ import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA
     actorRequestFits, decodeActorValue, type WsaActorClientBoot, type WsaActorNotification, type WsaActorRoute } from "./wsa-actor-protocol";
 type State = ReturnType<WsaSocketTable["get"]>;
 export interface WsaActorTable extends WsaSocketTable { duplicate(socket: number, targetPid: number): number; importDuplicate(reservedHandle: number): number; }
-const commands = new Set(["socket","isValid","isConnected","maxMessageSize","bind","closesocket","listen","acceptError","accept","adoptAccepted","disconnect","deferAccepted","rejectAccepted","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setOobInline","setKeepAlive","setNoDelay","setNonBlocking","readable","writable","exceptional","atMark","bytesAvailable","enumEvents"]);
+const commands = new Set(["socket","isValid","isConnected","maxMessageSize","bind","closesocket","listen","acceptError","accept","adoptAccepted","disconnect","deferAccepted","rejectAccepted","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setHandleFlags","setOobInline","setKeepAlive","setNoDelay","setNonBlocking","readable","writable","exceptional","atMark","bytesAvailable","enumEvents"]);
 /** Each command is an immediate kernel operation; blocking guest calls wait on readiness after this returns. */
 export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorClientBoot | (()=>WsaActorClientBoot)): WsaActorTable {
     const local = new WsaSocketTable(network), listeners = new Set<() => void>(), notifications = new Map<number, (bit:number,error:number)=>void>();
@@ -162,7 +162,12 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
                 }
                 if (name === "receive") args[1] = Math.min(args[1] as number, 65535);
                 const result = call(name,args,routesFor(destination),nativeHandleOnly);
-                if (name === "closesocket") { notifications.delete(args[0] as number); properties.delete(args[0] as number); nativeProperties.delete(args[0] as number); changed(); }
+                if (name === "closesocket") {
+                    let retained = false;
+                    try { retained = !!call("isValid", [args[0]], [], true); } catch { /* A revoked process already retired its aliases. */ }
+                    if (!retained) { notifications.delete(args[0] as number); properties.delete(args[0] as number); nativeProperties.delete(args[0] as number); }
+                    changed();
+                }
                 return result;
             };
             const value = Reflect.get(target, name, target); return typeof value === "function" ? value.bind(target) : value;

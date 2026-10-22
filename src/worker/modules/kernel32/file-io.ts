@@ -1961,9 +1961,13 @@ const fileIoModule = (() => {
         const hObject = args[0] >>> 0;
 
         Logger.verbose(LogCategory.KERNEL32, `CloseHandle(0x${hObject.toString(16)})`);
-        readFileFirstLogged.delete(hObject);
         const system = System.getInstance(), process = system.process;
         const socketTable = process && getWsaNativeSocketTable(process, hObject);
+        if ((system.resourceProvider.getHandleAttributes(hObject)?.flags ?? 0) & 2) {
+            system.scheduler.setLastError(6); // Protected HANDLE: no reference/binding/waiter side effects.
+            return 0;
+        }
+        readFileFirstLogged.delete(hObject);
         if (socketTable) {
             // Closing the native descriptor neither loads Winsock nor imports an alias.
             // The actor releases only this owner's reference and notifies pending I/O.

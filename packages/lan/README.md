@@ -155,6 +155,20 @@ Every participant owns its native flows. Last-binding close releases them withou
 disconnecting the participant; TCP release after FIN drains accepted native writes
 before close. Disconnect destroys remaining flows.
 
+Unscoped native UDP flows for one participant, guest binding generation and
+native address family share an OS port across distinct remote peers. Replies are
+matched by their native source address and port; unrelated senders are dropped.
+Two virtual aliases to an identical native peer keep separate ports so reply
+addresses remain unambiguous. A retired peer keeps its virtual identity reserved
+until that native port closes, so delayed replies cannot enter a replacement
+alias. Each port retains at most `maxUdpFlows` peer identities; additional peers
+use another port. Scoped helper flows still use separate connected sockets. The configured UDP idle timeout expires idle flows; the last expired
+flow or binding release closes its native port. A shared source port is a
+prerequisite for peer traffic, while native DirectPlay Host and full mesh remain
+unfinished. The Node shared UDP backend does not yet expose an error queue with
+the original ICMP destination; asynchronous native UDP error parity remains
+unfinished, especially on POSIX.
+
 SO_KEEPALIVE and TCP_NODELAY use the actual native TCP socket in both Node and
 helper backends. Both default to false. Initial SYN flags preserve options set
 before connect; live option frames also work while SYNACK is pending. TCP_OPTION

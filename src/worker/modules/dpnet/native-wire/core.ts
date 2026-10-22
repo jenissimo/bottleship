@@ -9,7 +9,7 @@ import type { NativeReassembledMessage } from "./receive-window";
 import { decodeNativeCoreConnectInfo, encodeNativePlayerConnect, type NativeCoreApplication, type NativeNameTableEntry } from "./core-connect-codec";
 import { decodeNativeCoreOperation, encodeNativeCoreRequest, nativeCoreWide, nativeCoreWords, type NativeCoreOperation } from "./core-operations";
 
-interface Request { finish(reply: Reply): void; timer: ReturnType<typeof setTimeout>; command: number; }
+interface Request { finish(reply: Reply): void; timer: ReturnType<typeof setTimeout>; command: number; removeAbort?(): void; }
 const key = (a: Address): string => a.node.join(".") + ":" + a.port;
 const copyAddress = (a: Address): Address => ({ node: a.node.slice(), port: a.port });
 const emptyGuid = "0".repeat(32);
@@ -43,6 +43,7 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
     private localProcessed = new Set<(result: number) => void>();
     private failedClosing?: Promise<number>;
     constructor(readonly network: LanNetwork, readonly role: DirectPlay8Role, readonly timeout = 25000, readonly retryInterval = 200, readonly retries = 14) {}
+    get pendingLocalProcessing(): number { return this.localProcessed.size; }
     get localAddress(): Address { return { node: Array.from(this.network.node), port: this.channel?.localPort ?? 0 }; }
     get hostAddress(): Address | null { return this.remote ? copyAddress(this.remote) : null; }
     get ownKey(): string { return key(this.localAddress); }
@@ -164,14 +165,17 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         if (op.requesting === this.localId && op.handle) this.complete(op.handle, { hr: DPN.OK, ...(op.command === 0xd7 ? { id: op.id } : {}) });
     }
     private sendInternal(bytes: Uint8Array): Promise<number> { return this.channel?.link.sendReliable(bytes) ?? Promise.resolve(DPN.NOCONNECTION); }
-    private complete(id: number, reply: Reply): void { const request = this.requests.get(id); if (!request) return; this.requests.delete(id); clearTimeout(request.timer); request.finish(reply); }
-    private request(command: number, words: number[], blobs: { field: number; data: Uint8Array }[] = []): Promise<Reply> {
+    private complete(id: number, reply: Reply): void { const request = this.requests.get(id); if (!request) return; this.requests.delete(id); clearTimeout(request.timer); request.removeAbort?.(); request.finish(reply); }
+    private request(command: number, words: number[], blobs: { field: number; data: Uint8Array }[] = [], signal?: AbortSignal): Promise<Reply> {
+        if (signal?.aborted) return Promise.resolve({ hr: DPN.USERCANCEL });
         if (this.openError) return Promise.resolve({ hr: this.openError });
         if (this.requests.size >= 256) return Promise.resolve({ hr: DPN.TABLEFULL });
         let id = this.requestId++ >>> 0; while (!id || this.requests.has(id)) id = this.requestId++ >>> 0;
         let finish!: (reply: Reply) => void; const result = new Promise<Reply>(resolve => { finish = resolve; });
         const timer = setTimeout(() => this.complete(id, { hr: DPN.TIMEDOUT }), this.timeout); (timer as unknown as { unref?(): void }).unref?.();
-        this.requests.set(id, { finish, timer, command });
+        const abort = () => this.complete(id, { hr: DPN.USERCANCEL });
+        this.requests.set(id, { finish, timer, command, removeAbort: signal ? () => signal.removeEventListener("abort", abort) : undefined });
+        signal?.addEventListener("abort", abort, { once: true });
         let bytes: Uint8Array;
         try {
             if (command === 0xe0) { const data = blobs[0]?.data ?? new Uint8Array(); bytes = new Uint8Array(8 + data.length); bytes.set(nativeCoreWords(command, id)); bytes.set(data, 8); }
@@ -200,7 +204,8 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         return { hr: DPN.INVALIDPARAM };
     }
     send(from: number, to: number, flags: number, data: Uint8Array): number | Promise<number> { return this.sendDpn(to, (flags & 1 ? 8 : 0) | (flags & 0x10000 ? 0 : 0x20), data); }
-    async sendDpn(to: number, flags: number, data: Uint8Array): Promise<number> {
+    async sendDpn(to: number, flags: number, data: Uint8Array, signal?: AbortSignal, acceptedLocal?: () => void, completedLocal?: (result: number) => void): Promise<number> {
+        if (signal?.aborted) return DPN.USERCANCEL;
         if (this.closing) return DPN.ALREADYCLOSING;
         if (this.openError) return this.openError;
         if (!data.length || ((flags & 0x20) && to === this.localId)) return DPN.INVALIDPARAM;
@@ -214,15 +219,25 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
             if (flags & 4) {
                 if (this.localProcessed.size >= 256) return DPN.TABLEFULL;
                 local = new Promise<number>(resolve => {
-                    const finish = (result: number) => { if (this.localProcessed.delete(finish)) resolve(result); }; this.localProcessed.add(finish);
+                    const abort = () => finish(DPN.USERCANCEL);
+                    const finish = (result: number) => {
+                        if (!this.localProcessed.delete(finish)) return;
+                        signal?.removeEventListener("abort", abort); resolve(result);
+                        if (to === this.localId) completedLocal?.(result);
+                    }; this.localProcessed.add(finish);
+                    signal?.addEventListener("abort", abort, { once: true });
                     if (!this.enqueue(this.localId, data, flags & 8 ? 1 : 0, () => finish(DPN.OK))) finish(DPN.TABLEFULL);
+                    else acceptedLocal?.();
                 });
-            } else if (!this.enqueue(this.localId, data, flags & 8 ? 1 : 0)) return DPN.TABLEFULL;
+            } else {
+                if (!this.enqueue(this.localId, data, flags & 8 ? 1 : 0)) return DPN.TABLEFULL;
+                acceptedLocal?.();
+            }
         }
         if (!remote.length) return local;
         if (flags & 4) {
             // COMPLETEONPROCESS carries the real per-operation handle in the core envelope.
-            const [remoteResult, localResult] = await Promise.all([this.request(0xe0, [], [{ field: 0, data }]), local]); return remoteResult.hr || localResult;
+            const [remoteResult, localResult] = await Promise.all([this.request(0xe0, [], [{ field: 0, data }], signal), local]); return remoteResult.hr || localResult;
         }
         return flags & 8 ? this.channel!.link.sendReliable(data, 0, !(flags & 0x10)) : this.channel!.link.sendUnreliable(data, 0, !(flags & 0x10));
     }

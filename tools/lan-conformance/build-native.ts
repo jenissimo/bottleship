@@ -4,6 +4,10 @@ import { createHash } from "node:crypto";
 
 if (process.platform !== "win32") throw new Error("Native Winsock reference requires Windows.");
 const fixture = process.argv[2] ?? "winsock";
+const libraries = process.argv.slice(3).map(value => {
+    if (!/^--library=[a-z0-9_-]+$/.test(value)) throw new Error("Invalid native oracle library: " + value);
+    return value.slice("--library=".length);
+});
 if (!/^[a-z0-9-]+$/.test(fixture)) throw new Error("Invalid network oracle fixture name: " + fixture);
 const output = resolve("logs/lan-conformance", fixture === "winsock" ? "." : fixture);
 const game = join(output, "game");
@@ -20,7 +24,7 @@ const compile = Bun.spawnSync([
     compiler, "-O1", "-nostdlib", "-fno-builtin", "-fno-stack-protector",
     "-DORACLE_NONCE=" + nonce,
     "-Wl,--entry,_entry", "-Wl,--subsystem,console", "-o", exe,
-    resolve("tools/lan-conformance/" + fixture + ".c"), "-lws2_32", "-lkernel32", "-lole32", "-ldxguid", "-luuid",
+    resolve("tools/lan-conformance/" + fixture + ".c"), "-lws2_32", "-lkernel32", "-lole32", "-ldxguid", "-luuid", ...libraries.map(name => "-l" + name),
 ], { env: toolchainEnv, stdout: "pipe", stderr: "pipe" });
 if (compile.exitCode !== 0) throw new Error(`Could not compile the native Winsock oracle (exit ${compile.exitCode}): ${new TextDecoder().decode(compile.stderr)}`);
 const result = Bun.spawnSync([exe], { cwd: native, stdout: "inherit", stderr: "inherit", timeout: 15000 });
@@ -45,7 +49,7 @@ if (patch.exitCode !== 0) throw new Error("Could not configure fresh oracle outp
 const executableSha256 = createHash("sha256").update(new Uint8Array(await Bun.file(exe).arrayBuffer())).digest("hex");
 const referenceSha256 = createHash("sha256").update(bytes).digest("hex");
 await Bun.write(join(output, "build.json"), JSON.stringify({
-    fixture, bundle, reference: join(native, "lan-oracle.bin"), nonce,
+    fixture, bundle, reference: join(native, "lan-oracle.bin"), nonce, libraries,
     executableSha256, referenceSha256, builtAt: new Date().toISOString(),
 }, null, 2) + "\n");
 console.log(JSON.stringify({

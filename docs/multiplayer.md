@@ -99,7 +99,8 @@ Remaining gaps include SPX, complete multicast behavior, fragmented raw packets 
 IPv6 extension headers, the full protocol/namespace provider catalogue,
 Win32 file completion routines on sockets created without overlapped support,
 positive-linger timeout/flush, less common socket options and IOCTLs,
-Windows external out-of-line urgent marks,
+Windows external out-of-line urgent marks, asynchronous ICMP error attribution
+on the shared native UDP backend,
 DirectPlay security, NATResolver, native DirectPlay Host/full mesh and classic DP4 provider wire interoperability,
 DP8 Lobby launcher/descendant association and some provider scheduling policies. An explicit
 unsupported result is only parity when the corresponding native provider returns it
@@ -123,16 +124,22 @@ through a separate backend. A real guest PE has matched Windows in 64 observatio
 per transport: discovery, Peer Connect, null/Unicode metadata, a 4097-byte guaranteed
 message and native echo, retained RECEIVE data and ReturnBuffer, player data updates,
 and bidirectional Close with player callback contexts. A separate 74-observation
-fixture covers SendTo flag and asynchronous-handle contracts. These checks cover
+fixture covers SendTo flag and asynchronous-handle contracts. Another 121-observation
+fixture verifies COPY/NOCOPY SEND_COMPLETE structures, NOCOMPLETE and reinitialization.
+These checks cover
 one guest and one native host. Native Host/full mesh, remote group mutations,
 name-table resynchronization, migration and classic DP4 provider wire remain unfinished.
 Native self-send with COMPLETEONPROCESS and multiple buffers has a separate failing
 Windows diagnostic, including a blocked native Close; that case remains under investigation.
+Virtual-LAN COMPLETEONPROCESS still lacks remote application-processing acknowledgements;
+the native backend uses the provider's E0/E1 exchange.
 
 Asynchronous sends reserve at most 256 operations and 4 MiB of payload per object.
 If a completion consumer is full, notifications retain their operation slots and
 retry in order. Resource rejection preserves output handles and returns E_OUTOFMEMORY.
-Close, final COM Release and process reset reclaim the old reservations.
+Close cancels unfinished sends and drains their completion notifications before returning,
+including with a manual ThreadPool and a full callback queue. Final COM Release and
+process reset reclaim the old reservations without reviving a later object lifetime.
 
 The relay forwards virtual guest traffic. Its optional native gateway connects
 configured UDP/TCP destinations; see [gateway configuration](../packages/lan/README.md).
@@ -177,8 +184,12 @@ Additional fixtures use `build-native.ts <fixture>` with `winsock-advanced`,
 `winsock-blocking-hooks`, `winsock-blocking-active`, `winsock-blocking-default`,
 `winsock-blocking-delegate`, `winsock-blocking-nested`, `directplay`, `directplay8`,
 `directplay-com`, `directplay-lobby`, `directplay8-lobby`, `directplay8-lobby-process`,
-`directplay8-lobby-identity`, `directplay8-lobby-peer-process`,\n`directplay8-threadpool-only`, `directplay8-threadpool-work`,
-`event-alias` or `readfile-ex`. The `winsock-oob-*` fixtures cover
+`directplay8-lobby-identity`, `directplay8-lobby-peer-process`,
+`directplay8-threadpool-only`, `directplay8-threadpool-work`,
+`directplay8-send-flags`, `directplay8-send-completion`,
+`directplay8-send-close-pending-cop`, `directplay8-send-close-cancel-cop`,
+`directplay8-send-close-order`, `directplay8-send-close-fields`,
+`directplay8-send-close-fields-copy`, `event-alias` or `readfile-ex`. The `winsock-oob-*` fixtures cover
 urgent marks, repeated urgent writes and inline mode. Set `BS_ORACLE_BUILD=logs/lan-conformance/<fixture>/build.json`
 for their browser comparison. The process fixtures distinguish graceful TCP EOF
 from forced termination. DirectPlay fixtures record Unicode/name/data contracts,

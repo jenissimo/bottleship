@@ -1,4 +1,3 @@
-import { createSocket } from "node:dgram";
 import { lookup } from "node:dns/promises";
 import { networkInterfaces } from "node:os";
 import { isIP, Socket as NativeSocket } from "node:net";
@@ -9,6 +8,7 @@ import { NetResolveError, type ResolveRequest, type ResolveResult } from "./reso
 import { NativeHelperSocket } from "./native-helper";
 import { NativeDestinationPolicy } from "./native-policy";
 import { NativeUdpSocket } from "./native-udp";
+import { NativeUdpPortPool } from "./native-udp-port";
 import { RawEchoGateway } from "./raw-gateway";
 
 export interface GatewayRoute {
@@ -204,6 +204,7 @@ interface TcpFlow {
 }
 export class NativeGateway {
     private readonly udp = new Map<string, UdpFlow>();
+    private readonly udpPorts: NativeUdpPortPool;
     private readonly tcp = new Map<string, TcpFlow>();
     private readonly raw: RawEchoGateway;
     // One bounded port/protocol address space per authenticated participant. A
@@ -216,7 +217,10 @@ export class NativeGateway {
     private sweep: ReturnType<typeof setInterval> | undefined;
     constructor(private readonly routes: GatewayRoutes, private readonly emit: (frame: Uint8Array<ArrayBuffer>, reliable: boolean, bindingGeneration?: number) => boolean,
         private readonly reportError: (error: { node: number[]; localPort: number; remotePort: number; proto: number; code: number; bindingGeneration?: number }) => void = () => {},
-        guestNode: Uint8Array = Uint8Array.of(2, 0, 0, 0, 0, 1)) { this.raw = new RawEchoGateway(routes, emit, reportError, guestNode, this.nativeOwner); }
+        guestNode: Uint8Array = Uint8Array.of(2, 0, 0, 0, 0, 1)) {
+        this.udpPorts = new NativeUdpPortPool(undefined, routes.options.maxUdpFlows ?? 128);
+        this.raw = new RawEchoGateway(routes, emit, reportError, guestNode, this.nativeOwner);
+    }
     private startSweep(): void {
         if (this.sweep) return;
         this.sweep = setInterval(() => {
@@ -309,7 +313,8 @@ export class NativeGateway {
                 return;
             }
             const socket: GatewayUdpSocket = nativeHost.includes("%")
-                ? new NativeUdpSocket(this.routes.options.nativeHelperPath!, family) : createSocket(family === 6 ? "udp6" : "udp4");
+                ? new NativeUdpSocket(this.routes.options.nativeHelperPath!, family)
+                : this.udpPorts.open(datagram.proto+":"+datagram.srcPort+":"+(datagram.bindingGeneration??"legacy"),family,nativeHost,datagram.dstPort,nodeKey(datagram.node));
             flow = { socket, connected: false, pending: [], bytes: 0, packets: 0, seen: Date.now(),
                 node: datagram.node.slice(), localPort: datagram.srcPort, remotePort: datagram.dstPort, proto: datagram.proto, bindingGeneration: datagram.bindingGeneration, closed: false, release:lease.release };
             const current = flow;
