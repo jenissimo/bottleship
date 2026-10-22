@@ -40,6 +40,8 @@ export class SystemResourceProvider {
     private comObjects: ResourceTable<BaseComObject> = new ResourceTable();
     private gdiObjects: ResourceTable<any> = new ResourceTable();
     private kernelObjects: ResourceTable<any> = new ResourceTable();
+    /** Open HANDLE references, keyed by object identity rather than any one alias. */
+    private kernelObjectReferences = new WeakMap<object, number>();
     private userObjects: ResourceTable<any> = new ResourceTable();
     private fileHandles: ResourceTable<any> = new ResourceTable();
 
@@ -345,6 +347,9 @@ export class SystemResourceProvider {
             Logger.error(LogCategory.RESOURCE, `Kernel handle range exhausted! handle=0x${handle.toString(16)}`);
         }
         this.kernelObjects.create(handle, obj);
+        if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
+            this.kernelObjectReferences.set(obj, (this.kernelObjectReferences.get(obj) ?? 0) + 1);
+        }
         this.nextKernelHandle += 4;
 
         Logger.verbose(LogCategory.RESOURCE, `Registered kernel object handle=0x${handle.toString(16)}`);
@@ -362,7 +367,21 @@ export class SystemResourceProvider {
      * Unregister a kernel object
      */
     unregisterKernelObject(handle: number): any {
-        return this.kernelObjects.release(handle);
+        const obj = this.kernelObjects.release(handle);
+        if (obj !== null && (typeof obj === 'object' || typeof obj === 'function')) {
+            const remaining = (this.kernelObjectReferences.get(obj) ?? 1) - 1;
+            if (remaining > 0) this.kernelObjectReferences.set(obj, remaining);
+            else this.kernelObjectReferences.delete(obj);
+        }
+        return obj;
+    }
+
+    kernelObjectReferenceCount(obj: object): number {
+        return this.kernelObjectReferences.get(obj) ?? 0;
+    }
+
+    hasKernelObjectReference(obj: object): boolean {
+        return this.kernelObjectReferences.has(obj);
     }
 
     /**
@@ -573,6 +592,7 @@ export class SystemResourceProvider {
         this.comObjects = new ResourceTable();
         this.gdiObjects = new ResourceTable();
         this.kernelObjects = new ResourceTable();
+        this.kernelObjectReferences = new WeakMap();
         this.userObjects = new ResourceTable();
         this.fileHandles = new ResourceTable();
 

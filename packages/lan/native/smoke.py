@@ -1,6 +1,7 @@
 """Portable native helper/oracle composition; no third-party Python packages."""
 import json
 import queue
+import socket
 import struct
 import subprocess
 import sys
@@ -35,6 +36,21 @@ def command(process, kind, payload=b""):
     process.stdin.write(struct.pack("<II", kind, len(payload)) + payload)
     process.stdin.flush()
 
+def connected(events):
+    options = {}
+    while True:
+        event = events.get(timeout=5)
+        if isinstance(event, BaseException):
+            raise event
+        if event[0] != 20:
+            assert event == (10, b""), event
+            break
+        assert len(event[1]) == 8, event
+        option, enabled = struct.unpack("<II", event[1])
+        assert option in (1, 2) and option not in options and enabled == 0, event
+        options[option] = enabled
+    assert options == {1: 0, 2: 0}, options
+
 for inline in (False, True):
     peer = subprocess.Popen([peer_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     process = None
@@ -47,8 +63,7 @@ for inline in (False, True):
         events = queue.Queue()
         threading.Thread(target=records, args=(process.stdout, events), daemon=True).start()
         command(process, 4, struct.pack("<I", 262144))
-        event = events.get(timeout=5)
-        assert event == (10, b""), event
+        connected(events)
         command(process, 1, struct.pack("<I", 1) + b"ab")
         command(process, 2, struct.pack("<I", 2) + b"U")
         command(process, 1, struct.pack("<I", 3) + b"cd")
@@ -70,13 +85,19 @@ for inline in (False, True):
         assert normal == (b"abUcd" if inline else b"abcd"), normal
         assert urgent == (b"" if inline else b"U"), urgent
         command(process, 3)
+        finished = False
         while True:
             event = events.get(timeout=5)
             if isinstance(event, BaseException):
                 raise event
             if event[0] == 16:
+                assert finished, "Closed before native send shutdown acknowledgement"
                 break
-            assert event == (13, b""), event
+            if event == (19, b""):
+                assert not finished, "Duplicate send shutdown acknowledgement"
+                finished = True
+            else:
+                assert event == (13, b""), event
         assert process.wait(timeout=5) == 0
         assert peer.wait(timeout=5) == 0
         assert json.loads(peer_lines.get(timeout=5)) == {"normal": 4, "urgent": 1, "byte": ord("U")}
@@ -87,6 +108,49 @@ for inline in (False, True):
                 if child.poll() is None:
                     child.kill()
                 child.wait(timeout=5)
+
+# Exhaust receive credit without returning any token, then abort the real peer.
+# A native reset must wake the helper even with no outbound command to retry.
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(5)
+    process = subprocess.Popen([helper_path, "tcp", "127.0.0.1", str(listener.getsockname()[1]), "0"],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    peer = None
+    try:
+        events = queue.Queue()
+        threading.Thread(target=records, args=(process.stdout, events), daemon=True).start()
+        command(process, 4, struct.pack("<I", 262144))
+        peer, _ = listener.accept()
+        peer.settimeout(5)
+        connected(events)
+        peer.sendall(b"m" * 262144)
+        received = 0
+        while received < 262144:
+            event = events.get(timeout=5)
+            if isinstance(event, BaseException):
+                raise event
+            assert event[0] == 11 and event[1] == b"m" * len(event[1]), event
+            received += len(event[1])
+        assert received == 262144, received
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0))
+        peer.close()
+        peer = None
+        event = events.get(timeout=5)
+        assert isinstance(event, tuple) and event[0] == 14, event
+        # Preserve the native abort/reset distinction, including Windows 10053.
+        error = struct.unpack("<I", event[1])[0]
+        assert error in (10053, 10054), event
+        assert process.wait(timeout=5) == 1
+        print("native helper reset with exhausted credit: PASS error=" + str(error), flush=True)
+    finally:
+        if peer is not None:
+            peer.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 # Preserve host capability policy. No privilege elevation or raw-socket install.
 def checksum(data):

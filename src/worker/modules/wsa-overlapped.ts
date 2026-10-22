@@ -178,7 +178,10 @@ export class WsaOverlapped {
             if (request.objectId !== objectId || request.done || request.publishing || request.policy?.cancellable === false || !this.isCurrent(request) ||
                 (overlapped && request.overlapped !== overlapped) || (thread !== undefined && request.thread !== thread)) continue;
             const cancel = request.cancel;
-            count++; this.complete(request, { bytes: 0, flags: 0, writes: [], error: 995 }, false); cancel?.();
+            // A driver cancel can synchronously signal readiness. Block this request until its terminal status is selected.
+            count++; request.publishing = true;
+            try { cancel?.(); }
+            finally { request.publishing = false; this.complete(request, { bytes: 0, flags: 0, writes: [], error: 995 }, false); }
         }
         return count;
     }

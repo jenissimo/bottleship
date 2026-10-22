@@ -55,13 +55,13 @@ test("SendEx serializes delivery, timeout releases a stalled job and reset ignor
     const ready = new Promise<void>(resolve => { started = resolve; });
     const queue = new DirectPlaySendQueue(job => {
         sent.push(job.context); if (job.context === 1) { started(); return new Promise<number>(resolve => { release = resolve; }); } return DP.OK;
-    }, result => complete.push(result), () => 0);
+    }, result => { complete.push(result); }, () => 0);
     const job = (context: number, timeout = 0) => ({ from: 1, to: 2, flags: 0, priority: 0, context, timeout, data: () => new Uint8Array([1]) });
     const first = queue.enqueue(job(1, 100), 1);
     await ready; queue.enqueue(job(2), 1); await pause();
     expect(sent).toEqual([1]); await pause(125);
     expect(sent).toEqual([1, 2]); expect(complete.map(c => c.hr)).toEqual([DP.TIMEOUT, DP.OK]);
-    release(DP.OK); await pause(); expect(complete.filter(c => c.id === first).length).toBe(1);
+    release(DP.OK); await pause(); expect(complete.filter(c => c.id === first.id).length).toBe(1);
     queue.enqueue(job(1), 1); await pause(); queue.reset(); release(DP.OK); await pause();
     expect(complete.length).toBe(2); expect(queue.pending.length).toBe(0);
 });

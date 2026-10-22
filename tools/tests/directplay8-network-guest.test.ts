@@ -34,7 +34,7 @@ function callbacks(handler: (message: number, ptr: number) => number = () => 0) 
     const state = [...(api as unknown as { states: Map<number, { callbacks?: { queue: { size: number } } }> }).states.values()][0];
     while (state?.callbacks?.queue.size) {
         const before = calls.length;
-        const result = [...methods.values()][0](ctx(), ram, []) as ThunkResult;
+        const result = [...methods.values()].at(-1)!(ctx(), ram, []) as ThunkResult;
         expect(result.suspendedForCallback).toBe(true); expect(calls.length).toBe(before + 1);
         const invocation = calls.at(-1)!;
         expect(invocation.args[0]).toBe(0x1234);
@@ -148,6 +148,87 @@ test("retained receive buffers have bounded admission and releasing one buffer r
     for (const handle of handles.slice(1)) expect(call("ReturnBuffer", [handle, 0])).toBe(0);
 });
 
+test("send admission preserves output handles under callback pressure and delivers every completion once after space returns", async () => {
+    await host();
+    const state = [...(api as unknown as { states: Map<number, {
+        callbacks: { native(type: number, size: number): boolean };
+        sends: { pending: unknown[]; reservedJobs: number; pendingBytes: number };
+        sendRecords: Map<number, unknown>;
+    }> }).states.values()][0];
+    let filled = 0; while (state.callbacks.native(2, 0)) { filled++; if (filled > 3000) throw Error("Callback queue admission is unbounded"); }
+    expect(filled).toBeGreaterThan(256);
+    ram.set([9], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+    const admitted: number[] = [];
+    for (let i = 0; i < 256; i++) {
+        expect(call("SendTo", [0, 0x3400, 1, 0, i, 0x3600, 0x20])).toBe(DPN.PENDING); admitted.push(read(0x3600));
+    }
+    write(0x3600, 0xcccccccc); expect(call("SendTo", [0, 0x3400, 1, 0, 999, 0x3600, 0x20])).toBe(DPN.OUTOFMEMORY); expect(read(0x3600)).toBe(0xcccccccc);
+    const deadline = Date.now() + 2000; while (state.sends.pending.length) { if (Date.now() >= deadline) throw Error("Queued sends did not complete"); await Bun.sleep(1); }
+    expect(state.sends.pendingBytes).toBe(0); expect(state.sends.reservedJobs).toBe(256); expect(state.sendRecords.size).toBe(256);
+    callbacks(message => { expect(message).toBe(2); return 0; });
+    await Bun.sleep(8); const completed: number[] = [];
+    callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 12)).toBe(0); completed.push(read(ptr + 4)); return 0; });
+    expect(completed).toEqual(admitted); expect(new Set(completed).size).toBe(256); expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
+    await Bun.sleep(8); callbacks(() => { throw Error("Duplicated completion"); });
+    expect(call("SendTo", [0, 0x3400, 1, 0, 1000, 0x3600, 0x20])).toBe(DPN.PENDING); await Bun.sleep(8); let last = 0;
+    callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 8)).toBe(1000); last++; return 0; }); expect(last).toBe(1);
+});
+test("Close and reset retire blocked send completions before a fresh initialization", async () => {
+    for (const closing of [true, false]) {
+        await host();
+        const state = [...(api as unknown as { states: Map<number, {
+            callbacks: { native(type: number, size: number): boolean };
+            sends: { pending: unknown[]; reservedJobs: number; pendingBytes: number; retryCompletions(): void };
+            sendRecords: Map<number, unknown>;
+        }> }).states.values()][0];
+        let filled = 0; while (state.callbacks.native(2, 0)) { if (++filled > 3000) throw Error("Unbounded callback admission"); }
+        ram.set([7], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+        expect(call("SendTo", [0, 0x3400, 1, 0, 123, 0x3600, 0x20])).toBe(DPN.PENDING);
+        const deadline = Date.now() + 2000; while (state.sends.pending.length) { if (Date.now() >= deadline) throw Error("Send completion timeout"); await Bun.sleep(1); }
+        expect(state.sendRecords.size).toBe(1); expect(state.sends.reservedJobs).toBe(1);
+        if (closing) {
+            const close = call("Close", [0]) as Promise<ThunkResult>;
+            expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
+            callbacks(message => { expect(message === 2 || message === 9).toBe(true); return 0; });
+            const result = await close; expect(result.value).toBe(0); result.startCallbackChain?.({ esp: 0x9000, returnAddr: 0x7000 });
+        } else { api.reset(); expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0); }
+        state.sends.retryCompletions(); await Bun.sleep(8); expect(state.sends.pendingBytes).toBe(0);
+        if (closing) { await host(); expect(call("SendTo", [0, 0x3400, 1, 0, 999, 0x3600, 0x20])).toBe(DPN.PENDING); await Bun.sleep(8);
+            let completed = 0; callbacks((message, ptr) => { expect(message).toBe(0x14); expect(read(ptr + 8)).toBe(999); completed++; return 0; }); expect(completed).toBe(1); api.reset(); }
+    }
+});
+test("native SEND_COMPLETE only returns NOCOPY descriptors and self queue errors preserve outputs", async () => {
+    const id = await host(); ram.set([7, 0, 9], 0x3500); write(0x3400, 1); write(0x3404, 0x3500); write(0x3408, 2); write(0x340c, 0x3501);
+    write(0x3700, 999); write(0x3704, 999); expect(call("GetSendQueueInfo", [id, 0x3700, 0x3704, 0])).toBe(DPN.INVALIDPLAYER); expect(read(0x3700)).toBe(999); expect(read(0x3704)).toBe(999);
+    for (const flags of [0, 1, 8, 9]) {
+        expect(call("SendTo", [id, 0x3400, 2, 0, flags + 100, 0x3600, flags])).toBe(DPN.PENDING); const handle = read(0x3600); await Bun.sleep(8); let completed = 0;
+        callbacks((message, ptr) => { if (message === 0x11) return 0; expect(message).toBe(0x14); completed++;
+            expect(read(ptr)).toBe(40); expect(read(ptr + 4)).toBe(handle); expect(read(ptr + 8)).toBe(flags + 100); expect(read(ptr + 12)).toBe(0); expect(read(ptr + 28)).toBe(flags & 8 ? 1 : 0);
+            expect(read(ptr + 36)).toBe(flags & 1 ? 2 : 0);
+            if (flags & 1) { const descriptors = read(ptr + 32); expect(descriptors).toBeGreaterThan(0); expect([read(descriptors), read(descriptors + 4), read(descriptors + 8), read(descriptors + 12)]).toEqual([1, 0x3500, 2, 0x3501]); } else expect(read(ptr + 32)).toBe(0);
+            return 0;
+        }); expect(completed).toBe(1);
+    }
+});
+test("DP8 NOCOMPLETE releases all send reservations while the guest callback queue stays full", async () => {
+    await host(); const state = [...(api as unknown as { states: Map<number, { callbacks: { native(type: number, size: number): boolean }; sends: { pending: unknown[]; reservedJobs: number }; sendRecords: Map<number, unknown> }> }).states.values()][0];
+    let filled = 0; while (state.callbacks.native(2, 0)) { if (++filled > 3000) throw Error("Unbounded callback admission"); }
+    ram.set([9], 0x3500); write(0x3400, 1); write(0x3404, 0x3500);
+    for (let round = 0; round < 2; round++) {
+        for (let i = 0; i < 256; i++) expect(call("SendTo", [0, 0x3400, 1, 0, i, 0x3600, 0x22])).toBe(DPN.PENDING);
+        const deadline = Date.now() + 2000; while (state.sends.pending.length) { if (Date.now() >= deadline) throw Error("NOCOMPLETE delivery stalled"); await Bun.sleep(1); }
+        expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
+    }
+    callbacks(message => { expect(message).toBe(2); return 0; });
+});
+test("last COM Release abandons blocked completion storage and prevents old callbacks", async () => {
+    await host(); const state = [...(api as unknown as { states: Map<number, { callbacks: { native(type: number, size: number): boolean }; sends: { pending: unknown[]; reservedJobs: number; retryCompletions(): void }; sendRecords: Map<number, unknown> }> }).states.values()][0];
+    let filled = 0; while (state.callbacks.native(2, 0)) { if (++filled > 3000) throw Error("Unbounded callback admission"); }
+    ram.set([9], 0x3500); write(0x3400, 1); write(0x3404, 0x3500); expect(call("SendTo", [0, 0x3400, 1, 0, 5, 0x3600, 0x20])).toBe(DPN.PENDING);
+    const deadline = Date.now() + 2000; while (state.sends.pending.length) { if (Date.now() >= deadline) throw Error("Send completion stalled"); await Bun.sleep(1); }
+    expect(state.sendRecords.size).toBe(1); expect(call("Release")).toBe(0); expect(state.sendRecords.size).toBe(0); expect(state.sends.reservedJobs).toBe(0);
+    const before = calls.length; state.sends.retryCompletions(); await Bun.sleep(8); expect(calls.length).toBe(before);
+});
 test("cancel while external Connect DNS is pending cannot bind UDP or revive the cancelled request", async () => {
     initialize(); let finish!: (result: { addresses: { family: 4; address: string }[] }) => void;
     network.resolve = () => new Promise(resolve => { finish = resolve; });

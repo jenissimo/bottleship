@@ -51,8 +51,8 @@ typedef int socket_t;
 #define MAX_PACKET 65535
 #define WINDOW 262144
 #define QUEUE 64
-enum { CMD_DATA=1, CMD_OOB=2, CMD_FIN=3, CMD_CREDIT=4, CMD_CLOSE=5, CMD_OPTION=6, CMD_IP_OPTIONS=7, CMD_GUEST_ADDRESSES=8, CMD_UDP_TUPLE=9, CMD_NATIVE_OPTION=10 };
-enum { EV_CONNECTED=10, EV_DATA=11, EV_OOB=12, EV_EOF=13, EV_ERROR=14, EV_ACK=15, EV_CLOSED=16, EV_RAW_DATA=17, EV_UDP_TUPLE=18, EV_FINISHED=19, EV_NATIVE_OPTION=20 };
+enum { CMD_DATA=1, CMD_OOB=2, CMD_FIN=3, CMD_CREDIT=4, CMD_CLOSE=5, CMD_OPTION=6, CMD_IP_OPTIONS=7, CMD_GUEST_ADDRESSES=8, CMD_UDP_TUPLE=9, CMD_NATIVE_OPTION=10, CMD_TCP_CONTROL=11 };
+enum { EV_CONNECTED=10, EV_DATA=11, EV_OOB=12, EV_EOF=13, EV_ERROR=14, EV_ACK=15, EV_CLOSED=16, EV_RAW_DATA=17, EV_UDP_TUPLE=18, EV_FINISHED=19, EV_NATIVE_OPTION=20, EV_TCP_CONTROL=21 };
 typedef struct { uint32_t kind, id, length, offset, prepared; unsigned char data[MAX_PACKET]; } command_t;
 static command_t queue[QUEUE];
 static unsigned head, count, queued_bytes, receive_credit;
@@ -223,6 +223,10 @@ static int udp_tuple_translate(const udp_tuple_t *tuple,int family,int included,
 }
 
 static int read_exact(void *data, size_t length) { return fread(data,1,length,stdin)==length; }
+#ifndef _WIN32
+static int at_mark(socket_t connection);
+#endif
+#include "tcp-io.h"
 #ifdef _WIN32
 static DWORD WINAPI input_thread(LPVOID unused) {
 #else
@@ -230,6 +234,14 @@ static void *input_thread(void *unused) {
 #endif
     unsigned char header[8], payload[MAX_PACKET+4];
     (void)unused;
+    if(tcp_mode){
+        tcp_read_input();
+#ifdef _WIN32
+        return 0;
+#else
+        return NULL;
+#endif
+    }
     for (;;) {
         if (!read_exact(header,8)) break;
         uint32_t kind=get32(header), length=get32(header+4);
@@ -276,6 +288,7 @@ int main(int argc, char **argv) {
     int raw_family=strcmp(argv[1],"raw4")==0?AF_INET:strcmp(argv[1],"raw6")==0?AF_INET6:0;
     int udp_family=strcmp(argv[1],"udp4")==0?AF_INET:strcmp(argv[1],"udp6")==0?AF_INET6:0;
     int datagram_family=raw_family?raw_family:udp_family;
+    tcp_mode=!datagram_family;
     if (!datagram_family && strcmp(argv[1],"tcp")!=0) return 2;
     if (datagram_family && argc==7) return 2;
     int inline_mode=!datagram_family && argc>=5 && strcmp(argv[4],"1")==0;
@@ -342,6 +355,7 @@ int main(int argc, char **argv) {
         memcpy(native_source,raw_family==AF_INET?(void*)&((struct sockaddr_in*)&native_local)->sin_addr:(void*)&((struct sockaddr_in6*)&native_local)->sin6_addr,raw_family==AF_INET?4:16);
         memcpy(native_destination,raw_family==AF_INET?(void*)&((struct sockaddr_in*)&native_remote)->sin_addr:(void*)&((struct sockaddr_in6*)&native_remote)->sin6_addr,raw_family==AF_INET?4:16);
     }
+    if(tcp_mode){int result=tcp_prepare_wait(connection);if(result){emit32(EV_ERROR,(uint32_t)result);CLOSESOCKET(connection);return 1;}}
 #ifdef _WIN32
     u_long nonblocking=1;ioctlsocket(connection,FIONBIO,&nonblocking);
     HANDLE reader=CreateThread(NULL,0,input_thread,NULL,0,NULL);
@@ -354,6 +368,7 @@ int main(int argc, char **argv) {
     pthread_detach(reader);
 #endif
     if (!emit(EV_CONNECTED,NULL,0)) { CLOSESOCKET(connection);_Exit(1); }
+    if(tcp_mode){int result=tcp_run(connection,inline_mode);CLOSESOCKET(connection);_Exit(result);}
     int eof=0, fin=0, urgent=0, failed=0;
     udp_tuple_t udp_tuple={INVALID_SOCKET,0,0,0,0};
     while (!failed) {
@@ -449,7 +464,7 @@ int main(int argc, char **argv) {
             int peeked=recv(connection,(char*)prefix,(int)(credit<SEGMENT?credit:SEGMENT),MSG_PEEK);
             if (peeked>0) {
                 int n=recv(connection,(char*)prefix,peeked,0);
-                if (n>0) { if (!emit(EV_DATA,prefix,(uint32_t)n)) break;LOCK(&mutex);receive_credit-=(unsigned)n;UNLOCK(&mutex);credit-=(unsigned)n; }
+                if (n>0) { LOCK(&mutex);receive_credit-=(unsigned)n;UNLOCK(&mutex);credit-=(unsigned)n;if (!emit(EV_DATA,prefix,(uint32_t)n)) break; }
             }
         }
 #endif
@@ -461,8 +476,8 @@ int main(int argc, char **argv) {
             unsigned char byte;
             int received=recv(connection,(char*)&byte,1,MSG_OOB);
             if (received==1) {
-                if (!emit(EV_OOB,&byte,1)) break;
                 LOCK(&mutex);receive_credit--;UNLOCK(&mutex);credit--;urgent=0;
+                if (!emit(EV_OOB,&byte,1)) break;
             } else if (received==SOCKET_ERROR && SOCKERR()!=WOULD_BLOCK) { emit32(EV_ERROR,(uint32_t)native_error(SOCKERR()));break; }
         }
         if (credit && !eof && FD_ISSET(connection,&reads)) {
@@ -492,8 +507,8 @@ int main(int argc, char **argv) {
                     else adjust_transport(data,(unsigned)received,(unsigned)raw_protocol,raw_family,native_destination,native_source,guest_destination,guest_source);
                 }
                 if (datagram_family && (unsigned)received>credit) continue; /* Datagram drop under congestion. */
-                if (!emit(datagram_family?EV_RAW_DATA:EV_DATA,data,(uint32_t)received)) break;
                 LOCK(&mutex);receive_credit-=(unsigned)received;UNLOCK(&mutex);
+                if (!emit(datagram_family?EV_RAW_DATA:EV_DATA,data,(uint32_t)received)) break;
             } else if (!received && datagram_family) {
                 if (!emit(EV_RAW_DATA,NULL,0)) break;
             } else if (!received) {

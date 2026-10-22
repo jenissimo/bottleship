@@ -2,8 +2,9 @@ import { EventEmitter } from "node:events";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { TCP_SEGMENT, TCP_WINDOW } from "./tcp-protocol";
 
-const DATA = 1, OOB = 2, FIN = 3, CREDIT = 4, OPTION = 6, NATIVE_OPTION = 10;
-const CONNECTED = 10, READ = 11, URGENT = 12, EOF = 13, ERROR = 14, ACK = 15, CLOSED = 16, FINISHED = 19, OPTION_VALUE = 20;
+const DATA = 1, OOB = 2, FIN = 3, CREDIT = 4, CONTROL = 11;
+const INPUT_BUDGET = TCP_WINDOW + 8192, CONTROL_RECORDS = 64;
+const CONNECTED = 10, READ = 11, URGENT = 12, EOF = 13, ERROR = 14, ACK = 15, CLOSED = 16, FINISHED = 19, OPTION_VALUE = 20, CONTROL_ACK = 21;
 type ReadItem = { data: Buffer; offset: number } | { urgent: number };
 function failure(code: number, message: string): Error & { code: number } { return Object.assign(new Error(message), { code }); }
 
@@ -14,6 +15,10 @@ export class NativeHelperSocket extends EventEmitter {
     private readonly reads: ReadItem[] = [];
     private readonly writes = new Map<number, { bytes: number; callback: (error?: Error | null) => void }>();
     private nextWrite = 1;
+    private nextControl = 1;
+    private readonly controls = new Map<number, number>();
+    private pendingCredit = 0;
+    private creditScheduled = false;
     private readBytes = 0;
     private writeBytes = 0;
     private pendingCommandBytes = 0;
@@ -29,14 +34,21 @@ export class NativeHelperSocket extends EventEmitter {
     private endFinished = false;
     private readonly endCallbacks: (() => void)[] = [];
     constructor(private readonly executable: string, private inline = false) { super(); }
-    setOobInline(enabled: boolean): void { this.inline = enabled; if (this.child) this.command(OPTION, this.word(enabled ? 1 : 0)); }
+    setOobInline(enabled: boolean): void { this.inline = enabled; this.setNativeOption(0, enabled); }
     get readableLength(): number { return this.readBytes; }
     setNoDelay(enabled: boolean): this { this.noDelay = enabled; this.setNativeOption(2, enabled); return this; }
     setKeepAlive(enabled: boolean): this { this.keepAlive = enabled; this.setNativeOption(1, enabled); return this; }
     private setNativeOption(option: number, enabled: boolean): void {
         if (!this.child) return;
-        const payload = Buffer.allocUnsafe(8); payload.writeUInt32LE(option); payload.writeUInt32LE(+enabled, 4);
-        if (!this.command(NATIVE_OPTION, payload)) this.fail(failure(10057, "Native helper pipe closed"));
+        if (this.closed) return;
+        if (this.controls.size >= CONTROL_RECORDS) { this.fail(failure(10055, "Native helper control window exhausted")); return; }
+        let id = this.nextControl;
+        while (this.controls.has(id)) id = (id + 1) >>> 0 || 1;
+        this.nextControl = (id + 1) >>> 0 || 1;
+        const payload = Buffer.allocUnsafe(12);
+        payload.writeUInt32LE(id); payload.writeUInt32LE(option, 4); payload.writeUInt32LE(+enabled, 8);
+        this.controls.set(id, option);
+        if (!this.command(CONTROL, payload)) this.fail(failure(10057, "Native helper pipe closed"));
     }
     connect(port: number, host: string): void {
         if (this.closed || this.child) return;
@@ -58,7 +70,7 @@ export class NativeHelperSocket extends EventEmitter {
         const size = 8 + payload.length, child = this.child;
         // DATA has a separate native-send window, but control/CREDIT records also
         // occupy the pipe's JS queue while the helper is not reading.
-        if (this.pendingCommandBytes + size > TCP_WINDOW + 4096) {
+        if (this.pendingCommandBytes + size > INPUT_BUDGET) {
             this.fail(failure(10055, "Native helper input exceeded its bound")); return false;
         }
         const frame = Buffer.allocUnsafe(size);
@@ -94,6 +106,14 @@ export class NativeHelperSocket extends EventEmitter {
             else if (kind === OPTION_VALUE && size === 8 && (payload.readUInt32LE() === 1 || payload.readUInt32LE() === 2) && payload.readUInt32LE(4) <= 1) {
                 this.emit("option", { option: payload.readUInt32LE(), enabled: !!payload.readUInt32LE(4) });
             }
+            else if (kind === CONTROL_ACK && size === 12 && payload.readUInt32LE(8) <= 1) {
+                const id = payload.readUInt32LE(), option = payload.readUInt32LE(4), enabled = !!payload.readUInt32LE(8);
+                if (this.controls.get(id) !== option) { this.fail(failure(10022, "Unknown native control acknowledgement")); return; }
+                this.controls.delete(id);
+                if (option === 0) this.inline = enabled;
+                else this.emit("option", { option, enabled });
+                this.emit("control", { id, option, enabled });
+            }
             else if (kind === FINISHED && !size && this.endRequested && !this.endFinished) {
                 this.endFinished = true;
                 for (const callback of this.endCallbacks.splice(0)) callback();
@@ -116,7 +136,7 @@ export class NativeHelperSocket extends EventEmitter {
     takeUrgent(): number | null {
         const first = this.reads[0];
         if (!first || !("urgent" in first)) return null;
-        this.reads.shift(); this.command(CREDIT, this.word(1)); this.maybeEnd();
+        this.reads.shift(); this.returnCredit(1); this.maybeEnd();
         return first.urgent;
     }
     get urgentReady(): boolean { return !!this.reads[0] && "urgent" in this.reads[0]; }
@@ -133,8 +153,19 @@ export class NativeHelperSocket extends EventEmitter {
             item.offset += size; offset += size;
             if (item.offset === item.data.length) this.reads.shift();
         }
-        this.readBytes -= offset; this.command(CREDIT, this.word(offset)); this.maybeEnd();
+        this.readBytes -= offset; this.returnCredit(offset); this.maybeEnd();
         return bytes;
+    }
+    private returnCredit(bytes: number): void {
+        this.pendingCredit += bytes;
+        if (this.creditScheduled) return;
+        this.creditScheduled = true;
+        queueMicrotask(() => {
+            this.creditScheduled = false;
+            if (this.closed) return;
+            const credit = this.pendingCredit; this.pendingCredit = 0;
+            if (credit && !this.command(CREDIT, this.word(credit))) this.fail(failure(10057, "Native helper pipe closed"));
+        });
     }
     write(bytes: Uint8Array, callback: (error?: Error | null) => void = () => {}): boolean {
         const records = Math.ceil(bytes.length / TCP_SEGMENT);
@@ -142,7 +173,7 @@ export class NativeHelperSocket extends EventEmitter {
         // Reserve the complete call before serializing any segment: both the
         // native ACK window and the input pipe include every resulting record.
         if (stateError || this.writeBytes + bytes.length > TCP_WINDOW || this.writes.size + records > 256 ||
-            this.pendingCommandBytes + bytes.length + records * 12 > TCP_WINDOW + 4096) {
+            this.pendingCommandBytes + bytes.length + records * 12 > INPUT_BUDGET) {
             queueMicrotask(() => callback(failure(stateError || 10055, "Native helper write unavailable"))); return false;
         }
         if (!bytes.length) { queueMicrotask(() => callback()); return true; }
@@ -159,13 +190,15 @@ export class NativeHelperSocket extends EventEmitter {
     sendUrgent(byte: number, callback: (error?: Error | null) => void): void {
         const stateError = this.closed || !this.connected || !this.child?.stdin.writable ? 10057 : this.endRequested ? 10058 : 0;
         if (stateError || this.writeBytes >= TCP_WINDOW || this.writes.size >= 256 ||
-            this.pendingCommandBytes + 13 > TCP_WINDOW + 4096) {
+            this.pendingCommandBytes + 13 > INPUT_BUDGET) {
             queueMicrotask(() => callback(failure(stateError || 10055, "Native helper urgent write unavailable"))); return;
         }
         this.writeOne(OOB, Uint8Array.of(byte), callback);
     }
     private writeOne(kind: number, bytes: Uint8Array, callback: (error?: Error | null) => void): void {
-        const id = this.nextWrite++;
+        let id = this.nextWrite;
+        while (this.writes.has(id)) id = (id + 1) >>> 0 || 1;
+        this.nextWrite = (id + 1) >>> 0 || 1;
         const payload = Buffer.allocUnsafe(4 + bytes.length); payload.writeUInt32LE(id); payload.set(bytes, 4);
         this.writes.set(id, { bytes: bytes.length, callback }); this.writeBytes += bytes.length;
         if (!this.command(kind, payload)) this.fail(failure(10057, "Native helper pipe closed"));
@@ -196,7 +229,8 @@ export class NativeHelperSocket extends EventEmitter {
         this.closed = true;
         this.reads.length = 0; this.readBytes = 0; this.input = Buffer.alloc(0);
         for (const pending of this.writes.values()) pending.callback(failure(10054, "Native helper socket closed"));
-        this.writes.clear(); this.writeBytes = 0; this.pendingCommandBytes = 0; this.endCallbacks.length = 0;
+        this.writes.clear(); this.controls.clear(); this.writeBytes = 0; this.pendingCommandBytes = 0;
+        this.pendingCredit = 0; this.endCallbacks.length = 0;
         this.child?.stdin.destroy(); this.child?.stdout.destroy(); this.child?.stderr.destroy();
         this.child?.kill(); this.child = null;
         if (!this.emittedClose) { this.emittedClose = true; this.emit("close"); }

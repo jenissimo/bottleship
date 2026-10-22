@@ -14,7 +14,12 @@ function controlledPipe(completeWrites:boolean){
         const frame=Buffer.alloc(12);frame.writeUInt32LE(15);frame.writeUInt32LE(4,4);frame.writeUInt32LE(id,8);
         (helper as unknown as {accept(frame:Buffer):void}).accept(frame);
     };
-    return {helper,frames,callbacks,errors,acknowledge,get killed(){return killed}};
+    const acknowledgeControl=(request:Buffer)=>{
+        const frame=Buffer.alloc(20);frame.writeUInt32LE(21);frame.writeUInt32LE(12,4);
+        request.copy(frame,8,8,20);
+        (helper as unknown as {accept(frame:Buffer):void}).accept(frame);
+    };
+    return {helper,frames,callbacks,errors,acknowledge,acknowledgeControl,get killed(){return killed}};
 }
 test('segmented native writes reserve every record before accepting any payload',async()=>{
     const pipe=controlledPipe(true);let completed=0;const rejected:number[]=[];
@@ -32,12 +37,41 @@ test('segmented native writes reserve every record before accepting any payload'
 test('pipe backpressure rejects a whole segmented write before its first record',async()=>{
     const pipe=controlledPipe(false),failures:number[]=[];
     try{
-        const controls=Math.floor((TCP_WINDOW+4096-TCP_SEGMENT-12)/16);
-        for(let index=0;index<controls;index++)pipe.helper.setKeepAlive(!!(index&1));
+        const controls=Math.floor((TCP_WINDOW+8192-TCP_SEGMENT-12)/20);
+        for(let index=0;index<controls;index++){
+            pipe.helper.setKeepAlive(!!(index&1));
+            pipe.acknowledgeControl(pipe.frames.at(-1)!);
+        }
         const before=pipe.frames.length;
         expect(pipe.helper.write(new Uint8Array(TCP_SEGMENT*2),error=>{if(error)failures.push((error as Error&{code:number}).code)})).toBe(false);
         await Promise.resolve();
         expect(pipe.frames).toHaveLength(before);expect(failures).toEqual([10055]);expect(pipe.killed).toBe(0);expect(pipe.errors).toEqual([]);
+    }finally{pipe.helper.destroy()}
+});
+test('native controls retain bounded escrow until an acknowledged OS result',()=>{
+    const pipe=controlledPipe(true),observed:Array<{option:number;enabled:boolean}>=[];
+    pipe.helper.on('option',option=>observed.push(option));
+    try{
+        for(let index=0;index<64;index++)pipe.helper.setKeepAlive(!!(index&1));
+        expect(pipe.frames).toHaveLength(64);expect(pipe.errors).toEqual([]);
+        pipe.acknowledgeControl(pipe.frames[0]);
+        expect(observed).toEqual([{option:1,enabled:false}]);
+        pipe.helper.setNoDelay(true);
+        expect(pipe.frames).toHaveLength(65);expect(pipe.errors).toEqual([]);
+        pipe.helper.setNoDelay(false);
+        expect(pipe.frames).toHaveLength(65);expect(pipe.errors).toEqual([10055]);expect(pipe.killed).toBe(1);
+    }finally{pipe.helper.destroy()}
+});
+test('many small reads return one coalesced receive credit without losing its byte count',async()=>{
+    const pipe=controlledPipe(true);
+    try{
+        const frame=Buffer.alloc(8+4096);frame.writeUInt32LE(11);frame.writeUInt32LE(4096,4);
+        (pipe.helper as unknown as {accept(frame:Buffer):void}).accept(frame);
+        for(let index=0;index<4096;index++)expect(pipe.helper.read(1)?.length).toBe(1);
+        expect(pipe.frames).toHaveLength(0);await Promise.resolve();
+        expect(pipe.frames).toHaveLength(1);
+        expect([pipe.frames[0].readUInt32LE(),pipe.frames[0].readUInt32LE(8)]).toEqual([4,4096]);
+        expect(pipe.errors).toEqual([]);
     }finally{pipe.helper.destroy()}
 });
 test('native DATA and urgent writes after FIN fail without sending another record',async()=>{

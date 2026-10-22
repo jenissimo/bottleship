@@ -2,7 +2,7 @@ import { LanNetwork, type LanDatagram, type LanEndpoint } from "../../net/lan-ne
 import { PROTO_DIRECTPLAY } from "../../net/netplay-wire";
 
 export const DP = {
-    OK: 0, INVALIDPARAMS: 0x80070057, UNSUPPORTED: 0x80004001,
+    OK: 0, INVALIDPARAMS: 0x80070057, OUTOFMEMORY: 0x8007000e, UNSUPPORTED: 0x80004001,
     ALREADYINITIALIZED: 0x88770005, ACCESSDENIED: 0x8877000a, ACTIVEPLAYERS: 0x88770014,
     BUFFERTOOSMALL: 0x8877001e, CANTCREATEGROUP: 0x88770032, CANTCREATEPLAYER: 0x8877003c,
     INVALIDFLAGS: 0x88770078, INVALIDPLAYER: 0x88770096, INVALIDGROUP: 0x8877009b,
@@ -586,9 +586,11 @@ export class DirectPlaySession implements LanEndpoint {
         }
         this.queue.push(message); this.queuedBytes += bytes; this.onMessage?.(message.to);
     }
-    enqueueSystem(player: number, system: SystemMessage): void {
+    enqueueSystem(player: number, system: SystemMessage): boolean {
         const target = this.entities.get(player);
-        if (target && !target.group && target.owner === this.ownKey) this.enqueue({ from: 0, to: player, data: EMPTY, system });
+        if (!target || target.group || target.owner !== this.ownKey) return true;
+        if (this.queue.length >= 4096 || this.queuedBytes + 256 > 4 * 1024 * 1024) return false;
+        this.enqueue({ from: 0, to: player, data: EMPTY, system }); return true;
     }
     removeMessage(index: number): void {
         const [m] = this.queue.splice(index, 1);

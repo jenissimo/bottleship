@@ -5,7 +5,7 @@ import {Process} from "../../../src/worker/core/process";
 import {Mem} from "../../../src/worker/core/memory/mem-accessor";
 import {System} from "../../../src/worker/core/system";
 const owner=Object.create(Process.prototype) as Process;
-const memory=new Uint8Array(8192);Mem.bind(()=>memory);
+const memory=new Uint8Array(2*1024*1024);Mem.bind(()=>memory);
 Object.assign(owner,{resetGeneration:0,memory:{alloc(){return 0;},free(){}},getMemory:()=>memory,addressSpace:{
     validateRange:(ptr:number,length:number)=>ptr>0&&ptr+length<=memory.length,
     write:(ptr:number,bytes:Uint8Array)=>{if(ptr<=0||ptr+bytes.length>memory.length)return 0;memory.set(bytes,ptr);return bytes.length;},
@@ -46,6 +46,26 @@ self.onmessage=async({data})=>{
                 return{bytes:packet.data.length,flags:0,writes:[...packet.data].map((value,index)=>({address:0x1000+index,value,size:1 as const}))};
             },()=>[],true,undefined,{nativeIoLease:io});
             result={value:answer.value,error:answer.error,...status()};
+        }else if(["extensionAccept","extensionConnect","extensionTransmit"].includes(data.command)){
+            const table=getWsaNativeSocketTable(owner,data.handle)!,state=getWsaProcessState(owner);if(!state.counter.started)state.counter.startup();
+            if(event)System.getInstance().resourceProvider.unregisterKernelObject(event);
+            event=System.getInstance().scheduler.createEvent(true,false);memory.fill(0,0x300,0x314);word(0x310,event);
+            let error=0;const api=makeSocketExports(table,value=>{error=value;},state.counter,owner);
+            let value:unknown;
+            if(data.command==="extensionAccept"){
+                memory.fill(0,0x1000,0x1000+68);
+                value=api.AcceptEx({} as never,memory,[data.handle,data.target,0x1000,4,32,32,0x500,0x300]);
+            }else if(data.command==="extensionTransmit"){
+                for(let index=0;index<data.length;index++)memory[0x1000+index]=index%251;
+                memory.fill(0,0x600,0x610);word(0x600,0x1000);word(0x604,data.length);
+                value=api.TransmitFile({} as never,memory,[data.handle,0,0,0,0x300,0x600,0]);
+            }else{
+                memory.fill(0,0x700,0x710);new DataView(memory.buffer).setUint16(0x700,2,true);
+                new DataView(memory.buffer).setUint16(0x702,data.port,false);memory.set(data.ip,0x704);
+                for(let index=0;index<data.length;index++)memory[0x1000+index]=index%251;
+                value=api.ConnectEx({} as never,memory,[data.handle,0x700,16,0x1000,data.length,0x500,0x300]);
+            }
+            result={value,error,...status()};
         }else if(data.command==="wsaIssue"){
             const table=getWsaNativeSocketTable(owner,data.handle)!,state=getWsaProcessState(owner);if(!state.counter.started)state.counter.startup();
             if(event)System.getInstance().resourceProvider.unregisterKernelObject(event);

@@ -88,14 +88,14 @@ export function captureSocketIoCompletion(table: WsaSocketTable, objectId: numbe
 }
 function captureIoCompletionAssociation(association?: IoCompletionAssociation): IoCompletionTarget | undefined {
     if (!association) return undefined;
-    const { portHandle, key } = association;
+    const { key } = association;
     const system = System.getInstance(), owner = system.process, generation = owner?.resetGeneration;
-    const port = system.resourceProvider.getKernelObject(portHandle);
-    if (!port || port !== association.port || port.kind !== 'iocp' || !Array.isArray((port as {queue?: unknown}).queue)) return undefined;
+    const port = getLivePortObject(association.port);
+    if (!port) return undefined;
     return { post(bytesTransferred, overlapped, error = 0, publication) {
         if (owner !== System.getInstance().process || owner?.resetGeneration !== generation ||
-            system.resourceProvider.getKernelObject(portHandle) !== port) return false;
-        queueCompletionPacket(portHandle, {
+            !system.resourceProvider.hasKernelObjectReference(port)) return false;
+        queueCompletionPacket(port, {
             bytesTransferred: bytesTransferred >>> 0,
             completionKey: key >>> 0,
             overlapped: overlapped >>> 0,
@@ -131,25 +131,32 @@ export interface IoCompletionPacket {
 export const IO_COMPLETION_ABANDONED = 'abandoned';
 export type IoCompletionWake = IoCompletionPacket | null | typeof IO_COMPLETION_ABANDONED;
 
-/** Threads parked in GetQueuedCompletionStatus, per port, in arrival order. */
-const ioCompletionWaiters = new Map<number, Array<(wake: IoCompletionWake) => void>>();
-
-function getPortQueue(portHandle: number): IoCompletionPacket[] | null {
-    const port = System.getInstance().resourceProvider.getKernelObject(portHandle >>> 0) as
-        { kind?: string; queue?: IoCompletionPacket[] } | undefined;
-    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue)) return null;
-    return port.queue;
+interface IoCompletionPort {
+    kind: 'iocp';
+    queue: IoCompletionPacket[];
 }
 
-/** Post a packet and hand it straight to a thread already waiting for one. */
-export function queueCompletionPacket(portHandle: number, packet: IoCompletionPacket): void {
-    const waiters = ioCompletionWaiters.get(portHandle >>> 0);
+/** Threads parked on one port object, shared by all of its HANDLE aliases. */
+const ioCompletionWaiters = new Map<IoCompletionPort, Array<(wake: IoCompletionWake) => void>>();
+
+function getLivePortObject(handleOrObject: number | object): IoCompletionPort | null {
+    const provider = System.getInstance().resourceProvider;
+    const port = (typeof handleOrObject === 'number' ? provider.getKernelObject(handleOrObject >>> 0) : handleOrObject) as IoCompletionPort | null;
+    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue) || !provider.hasKernelObjectReference(port)) return null;
+    return port;
+}
+
+/** Post through an alias or a captured object while at least one alias is open. */
+export function queueCompletionPacket(portHandle: number | IoCompletionPort, packet: IoCompletionPacket): void {
+    const port = getLivePortObject(portHandle);
+    if (!port) return;
+    const waiters = ioCompletionWaiters.get(port);
     const waiter = waiters?.shift();
     if (waiter) {
         waiter(packet);
         return;
     }
-    getPortQueue(portHandle)?.push(packet);
+    port.queue.push(packet);
 }
 
 /**
@@ -159,8 +166,9 @@ export function queueCompletionPacket(portHandle: number, packet: IoCompletionPa
  * starves the very thread that would post the work.
  */
 export function waitForCompletionPacket(portHandle: number, timeoutMs: number): Promise<IoCompletionWake> {
+    const key = getLivePortObject(portHandle);
+    if (!key) return Promise.resolve(IO_COMPLETION_ABANDONED);
     return new Promise((resolve) => {
-        const key = portHandle >>> 0;
         let settled = false;
         let timer: ReturnType<typeof setTimeout> | null = null;
         const finish = (wake: IoCompletionWake) => {
@@ -186,7 +194,7 @@ export function waitForCompletionPacket(portHandle: number, timeoutMs: number): 
             if (settled) return;
             timer = null;  // the wait continues; only the warning was one-shot
             Logger.warn(LogCategory.KERNEL32,
-                `GetQueuedCompletionStatus: a thread has waited 10s on port 0x${key.toString(16)} — ` +
+                `GetQueuedCompletionStatus: a thread has waited 10s on port 0x${portHandle.toString(16)} — ` +
                 `if the guest is stuck, an I/O completion is not being posted for some operation`);
         }, 10_000);
     });
@@ -198,7 +206,8 @@ export function waitForCompletionPacket(portHandle: number, timeoutMs: number): 
  * strands the threads on a handle no packet can ever reach again.
  */
 export function abandonIoCompletionWaiters(portHandle: number): void {
-    const key = portHandle >>> 0;
+    const key = getLivePortObject(portHandle);
+    if (!key) return;
     const list = ioCompletionWaiters.get(key);
     if (list) {
         for (const waiter of list.slice()) waiter(IO_COMPLETION_ABANDONED);

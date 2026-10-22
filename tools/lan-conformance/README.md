@@ -1,7 +1,9 @@
 # Native multiplayer conformance
 
-These fixtures compare the same 32-bit PE executable on Windows and in BottleShip.
-Each comparison proves its recorded observations, not complete API coverage or
+Fixtures built by `build-native.ts` compare the same 32-bit PE executable on
+Windows and in BottleShip. DirectPlay wire capture uses paired native host and
+guest builds, whose separate hashes are recorded. Each comparison proves its
+recorded observations, not complete API coverage or
 compatibility with every game. The current native reference machine runs Windows
 11 build 26300 (x64); the fixtures themselves run as x86 processes. NT5 and Wine
 sources under the owner's reference directory help explain ABI and state
@@ -67,6 +69,7 @@ runtime edits.
 | `winsock-iocp-port-close` | Closed-port association retention, rejected rebind and event versus no-event status publication |
 | `winsock-iocp-duplicate-port` | A surviving DuplicateHandle alias to the same completion port |
 | `winsock-extension-alias-lifetime` | AcceptEx, ConnectEx and TransmitFile alias lifetime |
+| `directplay8-send-completion` | COPY/NOCOPY completion descriptors, completion suppression, queue queries and Close/Initialize lifetime |
 
 A fixture's presence does not mean that its browser comparison passes. Preserve
 known failures while their generic implementation is being completed.
@@ -96,6 +99,10 @@ Worker survives and that old guest IPC routes are retired. This covers a
 different lifetime boundary from creating a separate child Worker.
 
 The standalone server and native helper have their own tests under
-`tools/tests/lan-*.test.ts`. The unintegrated
-`lan-helper-pressure.draft.ts` describes an unfinished helper protocol extension;
-it is not a passing load test and has not established full-duplex queue parity.
+`tools/tests/lan-*.test.ts`. `lan-helper-pressure.test.ts` compiles a finite
+loopback peer and checks full TCP payload/record windows, native control results,
+receive-credit progress behind blocked sends, atomic write rejection, final
+stream hashes and reset with zero receive credit. The older
+`lan-helper-pressure.draft.ts` is retained as historical, unintegrated material;
+it is not itself passing evidence. RAW/UDP queue progress and exact Windows
+out-of-line urgent marks remain separate gaps.

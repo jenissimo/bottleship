@@ -1543,6 +1543,25 @@ export const exports: Record<string, ThunkImplementation> = {
         const CURRENT_PROCESS = 0xFFFFFFFF;
         const CURRENT_THREAD = 0xFFFFFFFE;
 
+        const resourceProvider = System.getInstance().resourceProvider;
+        const sourceObject = resourceProvider.getKernelObject(hSourceHandle >>> 0);
+        // Port objects currently live in this worker's process handle table. A foreign
+        // process requires a real IPC transfer rather than another local HANDLE.
+        if (sourceObject?.kind === 'iocp' &&
+            (!isCurrentProcessHandle(hSourceProcessHandle) || !isCurrentProcessHandle(hTargetProcessHandle))) {
+            const invalid = !isKnownProcessHandle(hSourceProcessHandle) || !isKnownProcessHandle(hTargetProcessHandle);
+            System.getInstance().scheduler.setLastError(invalid ? ERROR_INVALID_HANDLE : ERROR_CALL_NOT_IMPLEMENTED);
+            return { value: 0, stackCleanup: 28 };
+        }
+        // Normal duplication must not allocate an alias before validating its destination.
+        // CLOSE_SOURCE's optional output follows the existing path below.
+        if (!(dwOptions & DUPLICATE_CLOSE_SOURCE) &&
+            (!lpTargetHandle || lpTargetHandle < 0 || lpTargetHandle + 4 > mem.length ||
+                !isValidAddress(mem, lpTargetHandle, 4, 'rw'))) {
+            System.getInstance().scheduler.setLastError(998); // ERROR_NOACCESS
+            return { value: 0, stackCleanup: 28 };
+        }
+
         let targetHandle = hSourceHandle;
         let duplicatedVirtual = false;
 
@@ -1600,8 +1619,9 @@ export const exports: Record<string, ThunkImplementation> = {
             Logger.verbose(LogCategory.KERNEL32, `DuplicateHandle: DUPLICATE_CLOSE_SOURCE requested for handle 0x${hSourceHandle.toString(16)}`);
             if (System.getInstance().resourceProvider.getKernelObject(hSourceHandle)?.kind === "event") {
                 System.getInstance().scheduler.syncObjects.closeEvent(hSourceHandle);
-            } else if (duplicatedVirtual) {
-                // Best-effort close for virtual process/thread handles.
+            } else if (duplicatedVirtual || sourceObject) {
+                // A newly registered kernel alias holds the object before the old
+                // reference is released, including completion-port transfers.
                 System.getInstance().resourceProvider.unregisterKernelObject(hSourceHandle >>> 0);
             }
         }

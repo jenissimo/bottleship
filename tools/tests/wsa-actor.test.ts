@@ -40,6 +40,30 @@ describe("durable Winsock socket actor",()=>{
         expect(native("releaseNativeIo",[token])).toBeNull();expect(native("releaseNativeIo",[token])).toBeNull();
         expect(h.call(h.sibling,"bind",[h.socket(h.sibling),h.address])).toBe(0);
     });
+    test("scoped extension leases accept into a duplicated target after both issuing handles close",()=>{
+        const h=fixture(),listener=h.socket(h.root,1),target=h.socket(h.root,1),client=h.socket(h.sibling,1);
+        h.call(h.root,"bind",[listener,h.address]);h.call(h.root,"listen",[listener,4]);
+        const rawListener=h.call(h.root,"duplicate",[listener,h.child.pid]),rawTarget=h.call(h.root,"duplicate",[target,h.child.pid]);
+        const native=(command:string,args:unknown[])=>h.kernel.execute(h.child,command,args,true) as any;
+        const listenerToken=native("acquireNativeIo",[rawListener,"accept"]),targetToken=native("acquireNativeIo",[rawTarget,"acceptTarget"]);
+        const io=(token:number,command:string,args:unknown[])=>native("nativeIo",[token,command,args]);
+        native("closesocket",[rawListener]);native("closesocket",[rawTarget]);
+        h.call(h.sibling,"connect",[client,h.address]);
+        expect(io(listenerToken,"acceptInto",[rawListener,targetToken,rawTarget])).toBeNull();
+        h.call(h.sibling,"send",[client,Uint8Array.of(97,98,99)]);
+        expect(io(targetToken,"receive",[rawTarget,4]).data).toEqual(Uint8Array.of(97,98,99));
+        const accepted=h.call(h.root,"get",[target]);
+        expect(accepted.acceptListener).toBe(rawListener);
+        expect(accepted.acceptListenerObjectId).toBe(h.kernel.execute(h.root,"fileObjectId",[listener],true));
+        h.call(h.root,"send",[target,Uint8Array.of(122)]);
+        expect(h.call(h.sibling,"receive",[client,1]).data).toEqual(Uint8Array.of(122));
+        fails(()=>io(targetToken,"connect",[rawTarget,h.address]),WSA.EINVAL);
+        fails(()=>io(listenerToken,"set",[rawListener,{connectExCompleted:true}]),WSA.EINVAL);
+        const dataToken=native("acquireNativeIo",[h.call(h.root,"duplicate",[target,h.child.pid])]);
+        fails(()=>io(dataToken,"disconnect",[rawTarget,false]),WSA.EINVAL);
+        native("releaseNativeIo",[listenerToken]);native("releaseNativeIo",[targetToken]);native("releaseNativeIo",[dataToken]);
+        expect(h.call(h.root,"isValid",[listener])).toBe(true);expect(h.call(h.root,"isValid",[target])).toBe(true);
+    });
     test("native I/O token bounds, release and PID epoch revocation never create aliases",()=>{
         const h=fixture(),source=h.socket(),handle=h.call(h.root,"duplicate",[source,h.child.pid]),tokens:number[]=[];
         for(let i=0;i<4096;i++)tokens.push(h.kernel.execute(h.child,"acquireNativeIo",[handle],true) as number);

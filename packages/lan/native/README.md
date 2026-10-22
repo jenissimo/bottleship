@@ -57,11 +57,10 @@ Stdout contains only protocol records.
 | FIN | 3 | empty |
 | Read credit | 4 | additional bytes u32 |
 | Close | 5 | empty |
-| SO_OOBINLINE | 6 | enabled u32 (0 or 1) |
 | IP options | 7 | TTL/hops int32 + TOS/class u32 |
 | Raw guest addresses | 8 | family u32 (4 or 6) + source[16] + destination[16], IPv4 zero padded |
 | Reserved UDP tuple | 9 | guest source port u32 + remote port u32; RAW protocol 17 only |
-| Native TCP option | 10 | option u32 (1=KEEPALIVE, 2=NODELAY) + enabled u32 (0 or 1) |
+| TCP control | 11 | control id u32 + option u32 (0=OOBINLINE, 1=KEEPALIVE, 2=NODELAY) + enabled u32 (0 or 1) |
 
 | Event | Kind | Payload |
 | --- | --- | --- |
@@ -75,30 +74,45 @@ Stdout contains only protocol records.
 | Raw/UDP datagram | 17 | complete packet |
 | Reserved UDP tuple | 18 | guest source port u32 + remote port u32 + reserved native port u32 |
 | Send shutdown complete | 19 | empty; all preceding writes accepted and native shutdown(SEND) succeeded |
-| Native TCP option value | 20 | option u32 (1 or 2) + actual native getsockopt boolean u32 |
+| Initial native TCP option value | 20 | option u32 (1 or 2) + actual native getsockopt boolean u32 |
+| TCP control applied | 21 | control id u32 + option u32 (0, 1 or 2) + actual native getsockopt boolean u32 |
 
-Read credit and pending native writes are bounded to 256 KiB. The input command
-queue is additionally capped at 64 entries. Native sends preserve DATA/OOB/FIN
-ordering; write acknowledgements follow actual OS send acceptance. A graceful
-binding release waits for event 19 before destroying its helper, with a bounded
-drain deadline. Rebuild the helper together with the TypeScript server when
-updating this protocol. POSIX read
-records preserve the urgent mark. Windows urgent records use its separate
-MSG_OOB queue. Initial and live SO_OOBINLINE use the native socket option,
-preserving native inline byte order. KEEPALIVE and NODELAY default to false;
-the TCP helper accepts optional initial boolean arguments after the inline flag.
-Initial options apply before connect; live commands stay ordered with DATA.
-Option events report actual OS getsockopt values. Disconnect destroys the helper
-and socket.
+Read credit and pending native write payloads are each bounded to 256 KiB.
+TCP has an ordered lane for 256 DATA/OOB records and one reserved FIN, plus a
+separate lane for 64 acknowledged controls. The stdin reader accepts receive
+credit independently of a blocked native send. Controls apply before retrying
+that send; they do not wait for earlier DATA to drain. Each control retains its
+quota until event 21 reports the actual OS getsockopt result. Initial values use
+event 20. Command kinds 6 and 10 are superseded by kind 11 for TCP; rebuild the
+helper together with the TypeScript server when updating this private protocol.
+
+Native sends preserve DATA/OOB/FIN ordering; write acknowledgements follow actual
+OS send acceptance. A graceful binding release waits for event 19 before
+destroying its helper, with a bounded drain deadline. POSIX read records preserve
+the urgent mark. Windows urgent records use its separate MSG_OOB queue. Initial
+and live SO_OOBINLINE use the native socket option, preserving native inline byte
+order. KEEPALIVE and NODELAY default to false; the TCP helper accepts optional
+initial boolean arguments after the inline flag. Initial options apply before
+connect. Disconnect destroys the helper and socket.
 
 The parent preflights the complete segmented write against its payload, record
 and input-pipe budgets before accepting any segment. DATA/OOB after FIN is
-rejected with WSAESHUTDOWN. The C parser still has a 64-entry FIFO: under native
-send saturation its admission wait can delay later receive CREDIT and live
-options. Full-duplex progress in this condition remains unfinished. The planned
-control-acknowledgement pressure oracle is preserved in
-`tools/lan-conformance/lan-helper-pressure.draft.ts`; its native peer has not
-been built or run, and it is not passing conformance evidence.
+rejected with WSAESHUTDOWN. Receive credit is debited before publishing a payload,
+so an immediate credit return cannot overfill its window. TCP uses native socket
+events and an input wake event/pipe; abortive close errors remain observable with
+zero receive credit.
+
+`tools/tests/lan-helper-pressure.test.ts` compiles and runs a finite loopback
+peer. Its real OS socket tests fill both payload and record limits while the
+peer withholds reads, verify live controls and reverse receive credit, reject a
+segmented call without accepting a prefix, and check the final byte count and
+hash before FIN. Another case aborts the peer with every receive token withheld.
+Portable smoke covers urgent/inline delivery, send shutdown and credit-exhausted
+reset on Windows/POSIX. The earlier unintegrated pressure draft is retained as
+historical material, not conformance evidence.
+
+RAW/UDP still use the separate legacy 64-entry FIFO; TCP control priority and its
+event loop do not establish equivalent progress guarantees for that queue.
 
 Exact urgent mark placement for Windows out-of-line reads remains a compatibility
 gap: native MSG_PEEK skips a mark at the current read position and SIOCATMARK does

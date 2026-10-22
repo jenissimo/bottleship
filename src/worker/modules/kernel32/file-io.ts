@@ -2031,9 +2031,9 @@ const fileIoModule = (() => {
                         break;
                     }
                     const kernelObj = resourceProvider.getKernelObject(hObject);
-                    if (kernelObj?.kind === 'iocp') {
-                        // Threads parked in GetQueuedCompletionStatus on this port would
-                        // otherwise wait for a packet the closed port can never deliver.
+                    if (kernelObj?.kind === 'iocp' && resourceProvider.kernelObjectReferenceCount(kernelObj) === 1) {
+                        // Waiters belong to the port object, and another alias can still
+                        // receive packets after this HANDLE closes. Abandon only the last.
                         abandonIoCompletionWaiters(hObject);
                     }
                     if (kernelObj?.kind === 'event') {

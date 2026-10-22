@@ -77,6 +77,19 @@ describe("Winsock overlapped I/O contracts", () => {
         expect((System.getInstance().resourceProvider.getKernelObject(event) as any).signaled).toBe(false);
         provider.resume();expect((provider as any).requests.size).toBe(0);expect(releases).toBe(1);
     });
+    test("a reentrant cancel hook can still use its I/O lease and cannot complete as success before cancellation",async()=>{
+        const h=fixture(),provider=getWsaOverlapped(h.table,h.owner),event=h.event();let cancelled=false,released=false,attempts=0,hookCalls=0;
+        h.set(0x310,event);
+        const lease={table:h.table,release(){released=true;}};
+        provider.issue(h.server,0x300,0,"read",()=>{attempts++;if(!cancelled)throw new WsaFailure(WSA.EWOULDBLOCK);return{bytes:1,flags:0,writes:[{address:0x1000,value:77,size:1}]};},()=>[],true,()=>{
+            hookCalls++;expect(released).toBe(false);expect(lease.table.get(h.server).type).toBe(1);cancelled=true;
+            h.table.send(h.client,Uint8Array.of(9));provider.resume(); // changed/resume runs inside the driver's cancel.
+        },{nativeIoLease:lease});
+        const before=attempts;expect(provider.cancel(h.server,0x300)).toBe(1);await tick();
+        expect(hookCalls).toBe(1);expect(attempts).toBe(before);expect(released).toBe(true);
+        expect(wsaStatusError(h.get(0x300))).toBe(995);expect(h.get(0x304)).toBe(0);expect(h.memory()[0x1000]).toBe(0);
+        expect(h.table.receive(h.server,1).data).toEqual(Uint8Array.of(9));
+    });
     test("issue owns a native lease on validation failure, immediate errors, cancellation and process reset",async()=>{
         const h=fixture(),provider=getWsaOverlapped(h.table,h.owner);
         const attempt=()=>{throw new WsaFailure(WSA.EWOULDBLOCK);};

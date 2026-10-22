@@ -126,6 +126,13 @@ and bidirectional Close with player callback contexts. A separate 74-observation
 fixture covers SendTo flag and asynchronous-handle contracts. These checks cover
 one guest and one native host. Native Host/full mesh, remote group mutations,
 name-table resynchronization, migration and classic DP4 provider wire remain unfinished.
+Native self-send with COMPLETEONPROCESS and multiple buffers has a separate failing
+Windows diagnostic, including a blocked native Close; that case remains under investigation.
+
+Asynchronous sends reserve at most 256 operations and 4 MiB of payload per object.
+If a completion consumer is full, notifications retain their operation slots and
+retry in order. Resource rejection preserves output handles and returns E_OUTOFMEMORY.
+Close, final COM Release and process reset reclaim the old reservations.
 
 The relay forwards virtual guest traffic. Its optional native gateway connects
 configured UDP/TCP destinations; see [gateway configuration](../packages/lan/README.md).

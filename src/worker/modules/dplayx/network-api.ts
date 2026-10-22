@@ -475,10 +475,12 @@ export class DirectPlayNetworkApi {
                 Mem.writeUint32(a[9], 0);
                 return methods.Send(s, a.slice(0, 6), legacy, ctx, wide);
             }
+            const admissionError = s.asyncSends.admissionError(a[5]); if (admissionError) return admissionError;
             const copied = a[3] & 0x800 ? null : Mem.readBytes(a[4], a[5])!.slice();
-            const id = s.asyncSends.enqueue({ from: a[1], to: a[2], flags: a[3], priority: a[6], timeout: a[7], context: a[8],
+            const admitted = s.asyncSends.enqueue({ from: a[1], to: a[2], flags: a[3], priority: a[6], timeout: a[7], context: a[8],
                 data: () => copied ?? (this.valid(a[4], a[5]) ? this.process.getCurrentMemory().slice(a[4], a[4] + a[5]) : null) }, a[5]);
-            Mem.writeUint32(a[9], id); return DP.PENDING;
+            if (admitted.hr) return admitted.hr;
+            Mem.writeUint32(a[9], admitted.id); return DP.PENDING;
         };
         methods.CancelMessage = (s, a) => a[2] ? DP.INVALIDFLAGS : s.asyncSends.cancel(a[1]);
         methods.CancelPriority = (s, a) => a[3] ? DP.INVALIDFLAGS : s.asyncSends.cancelPriority(a[1], a[2]);

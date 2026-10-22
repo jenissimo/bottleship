@@ -477,13 +477,15 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
             fail(WSA.ENOPROTOOPT);
         }
         if ((a[1] >>> 0) === 0xffff && a[2] === 0x7010) {
-            if (!s.connectContextPending || s.state !== "connected") fail(WSA.EINVAL);
+            if ((!s.connectContextPending && !s.connectExCompleted) || s.state !== "connected") fail(WSA.EINVAL);
             s.connectContextPending = false; return { value: 0, error: 0 };
         }
         if ((a[1] >>> 0) !== 0xffff || a[4] < 4) fail(WSA.ENOPROTOOPT);
         const value = u32(a[3]);
         switch (a[2]) {
-            case 0x700b: if (s.acceptListener !== value || !table.isValid(value)) fail(WSA.EINVAL); s.acceptListener = undefined; break;
+            case 0x700b:
+                if (s.acceptListenerObjectId === undefined || !table.isValid(value) || table.fileObjectId(value) !== s.acceptListenerObjectId) fail(WSA.EINVAL);
+                s.acceptListener = undefined; s.acceptListenerObjectId = undefined; break;
             case 4: s.reuse = !!value; break;
             case 0x20: s.broadcast = !!value; break;
             case 0x80: s.lingerEnabled = !!(value & 0xffff); s.lingerSeconds = value >>> 16; break;
@@ -640,20 +642,22 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         if (extent > 0xffffffff) fail(WSA.EFAULT); guard(a[2], extent, true);
         if (a[6]) guard(a[6], 4, true);
         validateOverlapped(a[7], 0);
+        const provider = overlap(), listenerLease = table.acquireNativeIo(a[0], "accept");
+        let targetLease: ReturnType<WsaSocketTable["acquireNativeIo"]>;
+        try { targetLease = table.acquireNativeIo(a[1], "acceptTarget"); } catch (error) { listenerLease.release(); throw error; }
+        const incoming = listenerLease.table, destination = targetLease.table;
+        const lease = { table: incoming, release() { targetLease.release(); listenerLease.release(); } };
         let accepted = false;
         const attempt = (): WsaIoResult => {
-            if (!table.isValid(a[0]) || !table.isValid(a[1])) fail(995);
-            if (!accepted) {
-                const child = table.accept(a[0]); table.adoptAccepted(a[1], child); accepted = true;
-                table.get(a[1]).acceptListener = a[0];
-            }
-            const socket = table.get(a[1]), packet = a[3] ? table.receive(a[1], a[3]) : { data: new Uint8Array(0) };
+            if (!incoming.isValid(a[0]) || !destination.isValid(a[1])) fail(995);
+            if (!accepted) { incoming.acceptInto(a[0], destination, a[1]); accepted = true; }
+            const socket = destination.get(a[1]), packet = a[3] ? destination.receive(a[1], a[3]) : { data: new Uint8Array(0) };
             const local = a[2] + a[3], remote = local + a[4];
             return { bytes: packet.data.length, flags: 0, writes: [...patches(a[2], packet.data),
                 dword(local, size), ...patches(local + 16, encodeAddress(socket.local!)),
                 dword(remote, size), ...patches(remote + 16, encodeAddress(socket.peer!))] };
         };
-        return booleanIo(overlap().issue(a[0], a[7], 0, "read", attempt, result => a[6] ? [dword(a[6], result.bytes)] : []));
+        return booleanIo(provider.issue(a[0], a[7], 0, "read", attempt, result => a[6] ? [dword(a[6], result.bytes)] : [], true, undefined, { nativeIoLease: lease }));
     }, 0);
     api.GetAcceptExSockaddrs = (_ctx, _mem, a) => {
         try {
@@ -673,29 +677,31 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const peer = address(a[1], a[2]), data = bytes(a[3], a[4]);
         if (a[5]) guard(a[5], 4, true);
         validateOverlapped(a[6], 0);
+        const provider = overlap(), lease = table.acquireNativeIo(a[0], "connect"), operation = lease.table, originalLocal = socket.local;
         let started = false, sent = 0;
         const attempt = (): WsaIoResult => {
             if (!started) {
-                started = true; socket.originalLocal = socket.local;
-                try { table.connect(a[0], peer); } catch (error) {
+                started = true; operation.get(a[0]).originalLocal = originalLocal;
+                try { operation.connect(a[0], peer); } catch (error) {
                     if (!(error instanceof WsaFailure) || error.code !== WSA.EWOULDBLOCK) throw error;
                 }
             }
-            const current = table.get(a[0]);
+            const current = operation.get(a[0]);
             if (current.error) fail(current.error);
             if (current.state !== "connected") fail(WSA.EWOULDBLOCK);
-            while (sent < data.length) sent += table.send(a[0], data.subarray(sent, Math.min(sent + 16384, data.length)));
-            current.connectContextPending = true;
+            while (sent < data.length) sent += operation.send(a[0], data.subarray(sent, Math.min(sent + 16384, data.length)));
+            current.connectContextPending = true; current.connectExCompleted = true;
             return { bytes: sent, flags: 0, writes: [] };
         };
-        return booleanIo(overlap().issue(a[0], a[6], 0, "write", attempt, result => a[5] ? [dword(a[5], result.bytes)] : [], false, () => table.cancelConnect(a[0])));
+        return booleanIo(provider.issue(a[0], a[6], 0, "write", attempt, result => a[5] ? [dword(a[5], result.bytes)] : [], false, () => operation.cancelConnect(a[0]), { nativeIoLease: lease }));
     }, 0);
     api.DisconnectEx = adapt(counter, setError, a => {
         table.get(a[0]); if (a[2] & ~2 || a[3]) fail(WSA.EINVAL);
-        const attempt = (): WsaIoResult => { table.disconnect(a[0], !!(a[2] & 2)); return { bytes: 0, flags: 0, writes: [] }; };
-        if (!a[1]) return mapPrepared(waitOperation(table, a[0], attempt, 0), () => ({ value: 1, error: 0 }));
+        const attempt = (operation: WsaSocketTable): WsaIoResult => { operation.disconnect(a[0], !!(a[2] & 2)); return { bytes: 0, flags: 0, writes: [] }; };
+        if (!a[1]) return mapPrepared(waitOperation(table, a[0], () => attempt(table), 0), () => ({ value: 1, error: 0 }));
         validateOverlapped(a[1], 0);
-        return booleanIo(overlap().issue(a[0], a[1], 0, "write", attempt, () => []));
+        const provider = overlap(), lease = table.acquireNativeIo(a[0], "disconnect");
+        return booleanIo(provider.issue(a[0], a[1], 0, "write", () => attempt(lease.table), () => [], true, undefined, { nativeIoLease: lease }));
     }, 0);
     api.TransmitFile = adapt(counter, setError, a => {
         const socket = table.get(a[0]), flags = a[6] >>> 0, ov = a[4];
@@ -716,6 +722,7 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         if (fileLength + head.length + tail.length > 0x7ffffffe) fail(WSA.EINVAL);
         const cursor = file ? vfs.duplicateHandle(file.vfsHandle, offset) : undefined;
         const generation = table.generation, provider = ov ? overlap() : undefined;
+        const lease = ov ? table.acquireNativeIo(a[0], "transmit") : undefined, operation = lease?.table ?? table;
         let phase = 0, position = 0, sent = 0, fileSent = 0;
         let chunk: Uint8Array | undefined, reading = false, readError = 0;
         const chunkSize = Math.min(a[3] || 65536, 65536);
@@ -747,17 +754,17 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
                         buffer = chunk;
                     } else buffer = phase === 0 ? head : tail;
                     if (position === buffer.length) { if (phase === 1) chunk = undefined; else phase++; position = 0; continue; }
-                    const count = table.send(a[0], buffer.subarray(position, Math.min(position + 16384, buffer.length)));
+                    const count = operation.send(a[0], buffer.subarray(position, Math.min(position + 16384, buffer.length)));
                     position += count; sent += count; if (phase === 1) fileSent += count;
                 }
-                if (flags & 1) table.disconnect(a[0], !!(flags & 2));
+                if (flags & 1) operation.disconnect(a[0], !!(flags & 2));
                 return { bytes: sent, flags: 0, writes: [] };
             } catch (error) {
                 if (!(error instanceof WsaFailure) || error.code === WSA.EWOULDBLOCK) throw error;
                 return { bytes: sent, flags: 0, writes: [], error: error.code };
             }
         };
-        if (ov) return booleanIo(provider!.issue(a[0], ov, 0, "write", attempt, () => [], true));
+        if (ov) return booleanIo(provider!.issue(a[0], ov, 0, "write", attempt, () => [], true, undefined, { nativeIoLease: lease }));
         return mapPrepared(waitOperation(table, a[0], attempt, socket.sendTimeout, true, undefined, true),
             result => ({ value: result.error ? 0 : 1, error: result.error ?? 0 }));
     }, 0);
