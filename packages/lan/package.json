@@ -1,0 +1,30 @@
+{
+  "name": "@bottleship/lan",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Standalone virtual LAN relay with WebSocket and HTTP long-polling transports",
+  "exports": {
+    "./protocol": "./src/protocol.ts",
+    "./server": "./src/server.ts",
+    "./gateway": "./src/gateway.ts",
+    "./tcp-protocol": "./src/tcp-protocol.ts",
+    "./resolve": "./src/resolve.ts",
+    "./ip-address": "./src/ip-address.ts"
+  },
+  "scripts": {
+    "start": "bun src/cli.ts",
+    "build:native": "bun native/build.ts",
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "socket.io-client": "^4.8.1",
+    "typescript": "^6.0.3"
+  }
+}

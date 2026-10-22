@@ -1,10 +1,11 @@
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
-import { ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
+import { ThunkImplementation, ThunkResult, type X86Context } from "../core/thunking/thunk-dispatcher";
 import { System } from "../core/system";
 import { Logger, LogCategory } from "../core/logger";
 import { InterfaceRegistry, registerStandardDirectXInterfaces } from "../core/com/interface-registry";
 import { ComObjectFactory, BaseComObject } from "../core/com/base-com-object";
+import { lookupHleComClass } from "../core/com/hle-com-registry";
 import { SystemResourceProvider } from "../core/resources/system-resource-provider";
 import { allocateComObject } from "../core/com/com-memory";
 import { installComVtable, ComVtableMethod } from "../core/com/install-com-vtable";
@@ -190,14 +191,26 @@ export class Ole32 implements IModule {
             if (inprocResult !== null) {
                 if (inprocResult instanceof Promise) {
                     return inprocResult.then((r) =>
-                        r ?? this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized),
+                        r ?? { value: REGDB_E_CLASSNOTREG, resumeOnOwner: frame =>
+                            this.coCreateInstanceHle(frame.mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized, { ...ctx, esp: frame.esp }, riid) },
                     );
                 }
                 return inprocResult;
             }
 
-            return this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized);
+            return this.coCreateInstanceHle(mem, ppv, clsidStr, iidStr, clsidNormalized, iidNormalized, ctx, riid);
         }) as ThunkImplementation;
+
+        this.exports.CoGetClassObject = (ctx, mem, args) => {
+            const [clsid, context, reserved, iid, out] = args.map(value => value >>> 0);
+            if (!isValidAddress(mem, out, 4, "rw")) return E_POINTER;
+            Mem.writeUint32(out, 0);
+            if (!isValidAddress(mem, clsid, 16, "r") || !isValidAddress(mem, iid, 16, "r")) return E_POINTER;
+            if (reserved) return E_INVALIDARG;
+            const registered = lookupHleComClass(this.process, readGuidFromMem(mem, clsid));
+            if (!registered || !(context & 1)) return REGDB_E_CLASSNOTREG;
+            return registered.server.getClassObject(ctx, clsid, iid, out);
+        };
 
         // CoSetProxyBlanket - set authentication on a proxy. Everything here is
         // in-process, so there is no proxy to configure and no security to set;
@@ -918,7 +931,11 @@ export class Ole32 implements IModule {
         iidStr: string,
         clsidNormalized: string,
         iidNormalized: string,
+        context: X86Context,
+        iidAddress: number,
     ): number {
+        const registered = lookupHleComClass(this.process, clsidNormalized);
+        if (registered) return registered.server.create(registered.definition, 0, iidAddress, ppv, context);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const interfaceRegistry = InterfaceRegistry.getInstance();
         const process = this.process;
@@ -995,6 +1012,22 @@ export class Ole32 implements IModule {
             }
         }
 
+        const directPlay8Classes: Record<string, readonly string[]> = {
+            "934a9523-a3ca-4bc5-ada0-d6d95d979421": ["83783300-4063-4c8a-9db3-82830a7feb31", "e5a0e990-2bad-430b-87da-a142cf75de58"],
+            "286f484d-375e-4458-a272-b138e2f80a6a": ["5102dacf-241b-11d3-aea7-006097b01411"],
+            "743f1dc6-5aba-429f-8bdf-c54d03253dc2": ["5102dacd-241b-11d3-aea7-006097b01411"],
+            "da825e1b-6830-43d7-835d-0b5ad82956a2": ["5102dace-241b-11d3-aea7-006097b01411"],
+            "3b2b6775-70b6-45af-8dea-a209c69559f3": ["819074a2-016c-11d3-ae14-006097b01411"],
+            "667955ad-6b3b-43ca-b949-bc69b5baff7f": ["819074a3-016c-11d3-ae14-006097b01411"],
+        };
+        const directPlay8Interfaces = directPlay8Classes[clsidNormalized];
+        if (directPlay8Interfaces) {
+            if (iidNormalized === "00000000-0000-0000-c000-000000000046") targetIID = directPlay8Interfaces[0];
+            else if (!directPlay8Interfaces.includes(iidNormalized)) {
+                if (ppv) view.setUint32(ppv, 0, true);
+                return 0x80004002;
+            }
+        }
         const mapping = interfaceRegistry.getMapping(targetIID);
         if (!mapping) {
             Logger.warn(LogCategory.COM, `CoCreateInstance: CLSID/IID not found: CLSID=${clsidStr}, IID=${iidStr} (tried ${targetIID})`);
@@ -1050,6 +1083,18 @@ export class Ole32 implements IModule {
             if (!specificVtable) {
                 if (ppv) view.setUint32(ppv, 0, true);
                 return 0x80004002;
+            }
+            vtableAddr = specificVtable.address;
+        } else if (mapping.moduleName === "dpnet" || mapping.moduleName === "dpnlobby") {
+            if (!directPlay8Interfaces) {
+                if (ppv) view.setUint32(ppv, 0, true);
+                return REGDB_E_CLASSNOTREG;
+            }
+            const dpnet = this.process.modules.get(mapping.moduleName) as { vtables?: Record<string, { address: number }> } | undefined;
+            const specificVtable = dpnet?.vtables?.[mapping.className];
+            if (!specificVtable) {
+                if (ppv) view.setUint32(ppv, 0, true);
+                return REGDB_E_CLASSNOTREG;
             }
             vtableAddr = specificVtable.address;
         } else if (mapping.moduleName === "quartz") {

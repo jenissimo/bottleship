@@ -1,15 +1,17 @@
 /**
- * WSOCK32 (Winsock 1.1) stub module.
- * Keep behavior deterministic and fail unsupported networking paths safely.
+ * WSOCK32 (Winsock 1.1) module backed by the shared virtual LAN provider.
  */
 
 import { IModule } from "../core/module";
+import { wsock32Module } from "../api/wsock32.api";
 import { Process } from "../core/process";
+import { installWsaBlockingHooks } from "./wsa-blocking";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import {
     makeWsaStartup,
     makeWsaCleanup,
-    wsaStartupCount,
+    getWsaProcessState,
+    type WsaProcessState,
     WsaSocketTable,
     makeSocketExports,
     inetAddr,
@@ -19,7 +21,6 @@ import {
     makeSelect,
     makeFdIsSet,
     WSAEFAULT,
-    WSAENOTSOCK,
 } from "./wsa-stub-shared";
 
 const SOCKET_ERROR = -1;
@@ -27,12 +28,13 @@ const SOCKET_ERROR = -1;
 export class Wsock32 implements IModule {
     name = "wsock32";
     exports: Record<string, ThunkImplementation> = {};
-    private socketTable = new WsaSocketTable();
+    private socketTable!: WsaSocketTable;
+    private wsaState?: WsaProcessState;
 
     initialize(process: Process): void {
-        let wsaLastError = 0;
+        const state = this.wsaState = getWsaProcessState(process);
+        this.socketTable = state.table;
 
-        const ok = () => 0;
         const htons = (_ctx: unknown, _mem: unknown, args: number[]) => {
             const value = args[0] ?? 0;
             return ((value & 0xff) << 8) | ((value >>> 8) & 0xff);
@@ -46,39 +48,29 @@ export class Wsock32 implements IModule {
                 ((value >>> 24) & 0xff)
             ) >>> 0;
         };
-        const getLastError = () => wsaLastError >>> 0;
+        const getLastError = () => state.getError() >>> 0;
         const setLastError = (_ctx: unknown, _mem: unknown, args: number[]) => {
-            wsaLastError = (args[0] ?? 0) | 0;
+            state.setError((args[0] ?? 0) | 0);
             return 0;
         };
-        const setError = (code: number) => {
-            wsaLastError = code | 0;
-        };
-        const startup = makeWsaStartup(setError, WSAEFAULT, SOCKET_ERROR);
-        const socketExports = makeSocketExports(this.socketTable, setError);
+        const setError = state.setError;
+        const startup = makeWsaStartup(setError, WSAEFAULT, SOCKET_ERROR, state.counter);
+        const socketExports = makeSocketExports(this.socketTable, setError, state.counter, process);
         const dns = createDnsStubs(process, setError);
         const protoServ = createProtoServStubs(process, setError);
-        const asyncLookup = createAsyncLookupStubs(setError);
-        const selectImpl = makeSelect(this.socketTable, setError);
+        const asyncLookup = createAsyncLookupStubs(setError, process);
+        const selectImpl = makeSelect(this.socketTable, setError, state.counter);
         const fdIsSet = makeFdIsSet();
 
-        const wsaAsyncSelect: ThunkImplementation = (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!this.socketTable.isValid(s)) {
-                setError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-            this.socketTable.setNonBlocking(s, true);
-            setError(0);
-            return 0;
-        };
+        const wsaAsyncSelect = socketExports.WSAAsyncSelect!;
 
         this.exports["WSAStartup"] = startup;
-        const cleanup = makeWsaCleanup(wsaStartupCount, setError);
+        const cleanup = makeWsaCleanup(state.counter, setError);
         this.exports["WSACleanup"] = cleanup;
         this.exports["WSAGetLastError"] = getLastError;
         this.exports["WSASetLastError"] = setLastError;
-        Object.assign(this.exports, socketExports);
+        const publicSockets = new Set(wsock32Module.functions.map(fn => fn.name));
+        Object.assign(this.exports, Object.fromEntries(Object.entries(socketExports).filter(([name]) => publicSockets.has(name))));
         this.exports["gethostbyname"] = dns.gethostbyname;
         this.exports["gethostname"] = dns.gethostname;
         this.exports["inet_addr"] = inetAddr; // faithful dotted-string parse (was always INADDR_NONE)
@@ -106,11 +98,7 @@ export class Wsock32 implements IModule {
         this.exports["WSAAsyncGetProtoByName"] = asyncLookup.WSAAsyncGetProtoByName;
         this.exports["WSAAsyncGetServByPort"] = asyncLookup.WSAAsyncGetServByPort;
         this.exports["WSAAsyncGetServByName"] = asyncLookup.WSAAsyncGetServByName;
-        this.exports["WSACancelAsyncRequest"] = ok;
-        this.exports["WSASetBlockingHook"] = ok;
-        this.exports["WSAUnhookBlockingHook"] = ok;
-        this.exports["WSACancelBlockingCall"] = ok;
-        this.exports["WSAIsBlocking"] = ok;
+        this.exports["WSACancelAsyncRequest"] = asyncLookup.WSACancelAsyncRequest;
         this.exports["ioctlsocket"] = socketExports.ioctlsocket!;
         this.exports["setsockopt"] = socketExports.setsockopt!;
         this.exports["getsockopt"] = socketExports.getsockopt!;
@@ -153,20 +141,20 @@ export class Wsock32 implements IModule {
         this.exports["ord_105"] = asyncLookup.WSAAsyncGetProtoByName;
         this.exports["ord_106"] = asyncLookup.WSAAsyncGetServByPort;
         this.exports["ord_107"] = asyncLookup.WSAAsyncGetServByName;
-        this.exports["ord_108"] = ok;      // WSACancelAsyncRequest
-        this.exports["ord_109"] = ok;      // WSASetBlockingHook
-        this.exports["ord_110"] = ok;      // WSAUnhookBlockingHook
+        this.exports["ord_108"] = asyncLookup.WSACancelAsyncRequest;      // WSACancelAsyncRequest
         this.exports["ord_111"] = getLastError; // WSAGetLastError
         this.exports["ord_112"] = setLastError; // WSASetLastError
-        this.exports["ord_113"] = ok;      // WSACancelBlockingCall
-        this.exports["ord_114"] = ok;      // WSAIsBlocking
         this.exports["ord_115"] = startup; // WSAStartup
         this.exports["ord_116"] = cleanup; // WSACleanup
+        this.exports["ord_1107"] = socketExports.WSARecvEx!;
+        this.exports["ord_1140"] = socketExports.TransmitFile!;
+        this.exports["ord_1141"] = socketExports.AcceptEx!;
+        this.exports["ord_1142"] = socketExports.GetAcceptExSockaddrs!;
         this.exports["ord_151"] = fdIsSet; // __WSAFDIsSet
+        installWsaBlockingHooks(this.exports, wsock32Module, state, process);
     }
 
     reset(): void {
-        this.socketTable.reset();
-        wsaStartupCount.reset();
+        this.wsaState?.reset();
     }
 }

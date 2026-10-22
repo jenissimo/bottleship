@@ -1,10 +1,18 @@
+import { childProcessIdentity, type ProcessIdentityBoot } from './process-identity';
+import { createChildProcessIpc, getProcessIpc } from './process-ipc';
 import { CHILD_IO_BYTES, createChildVfsServer, settleWithin } from './child-vfs';
 import { Logger, LogCategory } from './logger';
+import { createChildNetworkNamespace, type NetworkNamespaceBoot } from './process-network';
 import type { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/registry';
 import type { NamedObjectSpec } from '../modules/kernel32/named-objects';
+import type { GuestImagePatch } from './system';
+
+export interface ChildProcessPreparation { imagePatches?: GuestImagePatch[]; }
 
 export interface ChildProcessRequest {
+    processId?: number;
+    startSuspended?: boolean;
     imagePath: string;
     commandLine: string;
     currentDirectory: string;
@@ -14,8 +22,12 @@ export interface ChildProcessRequest {
 
 export interface ChildBoot extends ChildProcessRequest {
     type: 'child_boot';
+    bootId: number;
     bytes: Uint8Array;
     io: SharedArrayBuffer;
+    networkNamespace?: NetworkNamespaceBoot;
+    processIdentity?: ProcessIdentityBoot;
+    ipcPort?: MessagePort;
     config?: Record<string, unknown>;
     registry?: ReturnType<RegistryStore['serialize']>;
     namedObjects?: NamedObjectSpec[];
@@ -60,6 +72,10 @@ function stall(record: ChildProcessRecord, step: string): void {
 export interface ChildProcessTask {
     record: ChildProcessRecord;
     completion: Promise<number>;
+    /** The mapped image and final network/IPC lifetime are ready before any guest instruction. */
+    ready: Promise<void>;
+    resume?(preparation?: ChildProcessPreparation): void;
+    holdStartup?(): void;
     terminate(exitCode: number): void;
     cancel(): void;
     promote?(): boolean;
@@ -86,6 +102,7 @@ export class ChildNeedsSession extends Error {
 
 export const childProcessHistory: ChildProcessRecord[] = [];
 const active = new Set<ChildProcessTask>();
+let nextChildBootId = 1;
 const unfinished = new Set<ChildProcessRecord>();
 let publishSession: ((port: MessagePort, record: ChildProcessRecord) => void) | undefined;
 let sessionFinished: (() => void) | undefined;
@@ -177,7 +194,7 @@ export function startChildExecution(
         onStop: cleanup => { if (stopped) clean(cleanup); else cleanups.push(cleanup); },
     };
     const task: ChildProcessTask = {
-        record, completion: null as unknown as Promise<number>,
+        record, completion: null as unknown as Promise<number>, ready: Promise.resolve(),
         terminate: code => {
             if (settled || controller.signal.aborted) return;
             forcedExit = code >>> 0;
@@ -237,10 +254,28 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
     onSessionRequest?: (record: ChildProcessRecord) => boolean,
 ): ChildProcessTask {
     const inherited = bootContext?.();
+    const bootId = nextChildBootId++;
+    let readySettled = false, loaded = false, resumeSent = false;
+    let resumeRequested = !request.startSuspended;
+    let preparation: ChildProcessPreparation | undefined;
+    let resolveReady!: () => void, rejectReady!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    // Headless callers may only observe completion; a startup failure still rejects ready.
+    void ready.catch(() => {});
+    const settleReady = (error?: unknown): void => {
+        if (readySettled) return;
+        readySettled = true;
+        if (error !== undefined) rejectReady(error); else resolveReady();
+    };
     let worker: Worker | null = null;
     let offered = false;
     let alive = true;
     let task!: ChildProcessTask;
+    const sendResume = (): void => {
+        if (!worker || !alive || !loaded || !resumeRequested || resumeSent) return;
+        resumeSent = true;
+        worker.postMessage({ type: 'child_resume', bootId, preparation });
+    };
     const offer = () => {
         if (!worker || !task.record.session || offered || !alive) return;
         const channel = new MessageChannel();
@@ -249,7 +284,10 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
         offered = true;
     };
     task = startChildExecution(vfs, request, async context => {
-        context.onStop(() => { alive = false; });
+        context.onStop(() => {
+            alive = false;
+            if (context.signal.aborted) settleReady(new ChildProcessCancelled());
+        });
         const file = await vfs.open(request.imagePath, 0x80000000, 3);
         context.checkActive();
         if (!file) throw new Error(`Cannot open child image: ${request.imagePath}`);
@@ -268,7 +306,12 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
             const paths = context.record.mutationPaths ??= [];
             if (paths.length < 16 && !paths.includes(path)) paths.push(path);
         });
+        const identity = childProcessIdentity(request.processId);
         const child = createWorker();
+        const ipc = createChildProcessIpc(identity.pid);
+        let network;
+        try { network = createChildNetworkNamespace(identity.pid); }
+        catch (error) { ipc.close(); child.terminate(); throw error; }
         worker = child;
         const registryId = nextRegistryRelay++;
         registryRelays.set(registryId, mutation => child.postMessage({ type: 'child_registry_down', mutation }));
@@ -280,6 +323,8 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
             child.onerror = null;
             child.onmessageerror = null;
             child.terminate();
+            network.close();
+            ipc.close();
             return serve.close();
         });
         return new Promise<number>((resolve, reject) => {
@@ -287,6 +332,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
             const finish = (code?: number, error?: Error) => {
                 if (done) return;
                 done = true;
+                settleReady(error ?? new Error('Child exited before image readiness'));
                 context.signal.removeEventListener('abort', aborted);
                 if (error) reject(error); else resolve(code!);
             };
@@ -297,7 +343,13 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
             child.onmessage = event => {
                 if (done || context.signal.aborted) return;
                 const message = event.data;
-                if (message.type === 'child_io') void serve(message.request);
+                if (message.type === 'child_ready') {
+                    if (message.bootId !== bootId || message.processId !== identity.pid || loaded) return;
+                    loaded = true;
+                    settleReady();
+                    sendResume();
+                }
+                else if (message.type === 'child_io') void serve(message.request);
                 else if (message.type === 'child_registry') applyChildRegistry?.(message.mutation, registryId);
                 else if (message.type === 'child_session' && publishSession) {
                     // An already-exiting child can itself be the VFS broker for a live
@@ -313,6 +365,7 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                     });
                 }
                 else if (message.type === 'process_exit') {
+                    getProcessIpc().markProcessExited(identity.pid);
                     context.record.fault = message.fault;
                     context.record.logs = message.logs;
                     // The child exited; its barrier did not drain. Not a crash, but the
@@ -340,10 +393,27 @@ export function startChildProcess(vfs: VirtualFileSystem, request: ChildProcessR
                     }
                 }
             };
-            child.postMessage({ type: 'child_boot', ...request, ...inherited, bytes, io } satisfies ChildBoot);
+            child.postMessage({ type: 'child_boot', ...request, ...inherited, bootId, bytes, io,
+                networkNamespace: network.boot, processIdentity: identity, ipcPort: ipc.port } satisfies ChildBoot, [network.boot.port, ipc.port]);
             offer();
         });
     });
+    task.ready = ready;
+    task.resume = state => {
+        if (!alive || resumeSent) return;
+        preparation = state;
+        resumeRequested = true;
+        sendResume();
+    };
+    task.holdStartup = () => {
+        if (!alive) return;
+        resumeRequested = false;
+        if (resumeSent && worker) {
+            resumeSent = false;
+            worker.postMessage({ type: 'child_hold', bootId });
+        }
+    };
+    void task.completion.catch(error => settleReady(error));
     task.promote = () => {
         if (!alive || !publishSession) return false;
         task.record.session = true;

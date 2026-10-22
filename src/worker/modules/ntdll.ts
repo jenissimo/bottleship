@@ -1,3 +1,4 @@
+import { currentProcessId } from '../core/process-identity';
 import { IModule } from "../core/module";
 import { Process } from "../core/process";
 import { System } from "../core/system";
@@ -201,7 +202,7 @@ export class Ntdll implements IModule {
 
             if (outClientIdPtr && outClientIdPtr + 8 <= mem.length) {
                 const tid = system.scheduler.getCurrentThreadId();
-                view.setUint32(outClientIdPtr + 0, 1234, true); // process id
+                view.setUint32(outClientIdPtr + 0, currentProcessId, true); // process id
                 view.setUint32(outClientIdPtr + 4, tid >>> 0, true);
             }
 

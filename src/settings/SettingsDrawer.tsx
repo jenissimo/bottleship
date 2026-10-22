@@ -4,6 +4,7 @@ import {
   SpeakerHigh,
   Keyboard,
   HardDrive,
+  Globe,
   Terminal,
   Info,
   X,
@@ -15,6 +16,7 @@ import SettingsAdvancedSection from "./SettingsAdvancedSection";
 import SettingsAudioSection from "./SettingsAudioSection";
 import SettingsGraphicsSection from "./SettingsGraphicsSection";
 import SettingsInputSection from "./SettingsInputSection";
+import SettingsNetworkSection from "./SettingsNetworkSection";
 import SettingsStorageSection from "./SettingsStorageSection";
 import type { SettingsDrawerProps, SettingsSectionId } from "./types";
 import { cx } from "../ui/cx";
@@ -29,6 +31,7 @@ const SECTIONS: Array<{ id: SettingsSectionId; icon: Icon; label: string }> = [
   { id: "graphics", icon: Monitor, label: "Display & Graphics" },
   { id: "audio", icon: SpeakerHigh, label: "Audio" },
   { id: "input", icon: Keyboard, label: "Input" },
+  { id: "network", icon: Globe, label: "Network" },
   { id: "storage", icon: HardDrive, label: "Library & Storage" },
   { id: "advanced", icon: Terminal, label: "Advanced" },
   { id: "about", icon: Info, label: "About" },
@@ -38,6 +41,7 @@ const SECTION_TITLE: Record<SettingsSectionId, string> = {
   graphics: "Display & Graphics",
   audio: "Audio",
   input: "Input",
+  network: "Network",
   storage: "Library & Storage",
   advanced: "Advanced",
   about: "About",
@@ -101,6 +105,7 @@ export default function SettingsDrawer(props: SettingsDrawerProps): React.ReactE
             {section === "graphics" && <SettingsGraphicsSection {...props} />}
             {section === "audio" && <SettingsAudioSection {...props} />}
             {section === "input" && <SettingsInputSection {...props} active={isOpen && section === "input"} />}
+            {section === "network" && <SettingsNetworkSection {...props} />}
             {section === "storage" && <SettingsStorageSection active={isOpen && section === "storage"} />}
             {section === "advanced" && <SettingsAdvancedSection {...props} />}
             {section === "about" && <SettingsAboutSection />}

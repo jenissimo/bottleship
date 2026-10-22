@@ -3,13 +3,18 @@ import { V86 } from "v86";
 import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
-import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot } from "./core/child-process";
+import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
+import { ChildStartupGate } from "./core/child-startup";
 import { createChildVfsClient } from "./core/child-vfs";
+import { adoptProcessIdentity } from "./core/process-identity";
+import { adoptProcessIpc, beginProcessIpcLifetime } from "./core/process-ipc";
+import { adoptProcessNetworkNamespace, getProcessNetworkNamespace, beginProcessNetworkLifetime, finishProcessNetworkLifetime, flushProcessNetworkNamespace } from "./core/process-network";
 import type { RegistryMutation } from "./runtime/filesystem/registry";
 import { ChildSessionTransport } from './core/child-session';
 import { ChildFrameClock } from './core/child-frame-clock';
 
 let childBoot: ChildBoot | null = null;
+let childStartupGate: ChildStartupGate<ChildProcessPreparation> | null = null;
 let childSessionTransport: ChildSessionTransport | null = null;
 /** Owner writes that reached this child before its store was restored. */
 const pendingRegistryDown: RegistryMutation[] = [];
@@ -62,6 +67,8 @@ import { setPresentRectListener } from "./backends/webgpu/shared/present-geometr
 import { flushHeldWindowDCs } from "./modules/user32/window";
 import { DInput } from "./modules/dinput";
 import { DPlayX } from "./modules/dplayx";
+import { Dpnet } from "./modules/dpnet/dpnet";
+import { Dpnlobby } from "./modules/dpnlobby/dpnlobby";
 import { MSS32 } from "./modules/mss32";
 import { SmackW32 } from "./modules/smackw32";
 import { BinkW32 } from "./modules/binkw32";
@@ -153,6 +160,9 @@ import { frameProfiler } from "./core/frame-profiler";
 import { frameVarianceDiagnostics } from "./core/frame-variance-diagnostics";
 import { framePacer } from "./core/frame-pacer";
 import { EmulatorConfig } from "./core/emulator-config-manager";
+import { configureNetplay } from "./net/configure-netplay";
+import { lanNetwork } from "./net/lan-network";
+import type { NetworkStatus } from "../network-config";
 import { logQualityGapsOnce, activeQualityBackend, onQualityBackendChanged } from "./backends/webgpu/shared/quality-capabilities";
 import type { QualityConfig } from "./core/quality-config";
 import { videoEngine } from "../video/video-engine";
@@ -350,6 +360,57 @@ let isPaused = false;
 let _prefetchController: AbortController | null = null;
 /** Serializes load_bundle so a new game always waits for the previous switch teardown. */
 let loadBundleChain: Promise<void> = Promise.resolve();
+let sessionNetworkReady: Promise<void> = Promise.resolve();
+let networkRevision = 0;
+let networkConnecting = false;
+const postNetworkState = (status: NetworkStatus): void => self.postMessage({ type: "network_state", status });
+const awaitSessionNetwork = async (): Promise<void> => {
+  if (EmulatorConfig.getInstance().network && !lanNetwork.connected && !networkConnecting) {
+    applySessionNetwork(EmulatorConfig.getInstance().network);
+  }
+  for (;;) {
+    const revision = networkRevision;
+    try { await sessionNetworkReady; }
+    catch (error) { if (revision === networkRevision) throw error; }
+    if (revision === networkRevision) return;
+  }
+};
+lanNetwork.onStateChange(state => {
+  const enabled = EmulatorConfig.getInstance().network !== null;
+  postNetworkState({
+    state: !enabled ? "offline" : state.connected ? "connected" : networkConnecting ? "connecting" : "disconnected",
+    address: state.connected ? state.ipv4.join(".") : undefined,
+    reason: state.reason,
+  });
+});
+const applySessionNetwork = (value: unknown): void => {
+  const revision = ++networkRevision;
+  try {
+    const config = EmulatorConfig.getInstance().setNetwork(value);
+    networkConnecting = config !== null;
+    postNetworkState({ state: config ? "connecting" : "offline" });
+    sessionNetworkReady = configureNetplay(config).then(() => {
+      if (revision !== networkRevision) return;
+      networkConnecting = false;
+      postNetworkState({
+        state: !config ? "offline" : lanNetwork.connected ? "connected" : "disconnected",
+        address: config ? lanNetwork.ipv4.join(".") : undefined,
+      });
+    }, error => {
+      if (revision === networkRevision) {
+        networkConnecting = false;
+        postNetworkState({ state: "error", reason: String(error instanceof Error ? error.message : error) });
+      }
+      throw error;
+    });
+  } catch (error) {
+    networkConnecting = false;
+    postNetworkState({ state: "error", reason: String(error instanceof Error ? error.message : error) });
+    sessionNetworkReady = Promise.reject(error);
+  }
+  // A load awaits this promise; the settings screen can also connect before any load.
+  void sessionNetworkReady.catch(() => {});
+};
 /** True once a PE has been booted in this worker session (loadApp / load_bundle without page reload). */
 let gameSessionActive = false;
 /** The payload that booted the current game — replayed verbatim by a self re-exec. */
@@ -1101,6 +1162,10 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
     await prepareFullGameSwitch();
   }
 
+  await finishProcessNetworkLifetime();
+  beginProcessNetworkLifetime();
+  beginProcessIpcLifetime();
+
   // Let every HLE module settle what depends on WHICH build of its DLL the bundle ships,
   // before ANY stub for it exists: a stub's RET N is emitted into guest code, and the
   // synthetic images published below already carry those bytes, so an answer that arrives
@@ -1126,6 +1191,7 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
   }
 
   try {
+    await awaitSessionNetwork();
     const module = await system.process.loader.loadExecutable(peData);
     Logger.log(LogCategory.SYSTEM, `Loaded PE. Entry point: 0x${module.entryPoint.toString(16)}, base: 0x${module.baseAddress.toString(16)}`);
 
@@ -1334,9 +1400,27 @@ const loadPeData = async (peData: Uint8Array, skipReset: boolean = false): Promi
 
     Logger.log(LogCategory.SYSTEM, `Starting bootloader execution at CS:IP = 0:0x${startAddress.toString(16)}`);
 
-    resumeEmulator();
-    framePacer.start();
-    gameSessionActive = true;
+    const startLoadedImage = (): void => {
+      resumeEmulator();
+      framePacer.start();
+      gameSessionActive = true;
+    };
+    await awaitSessionNetwork();
+    if (childStartupGate && !childStartupGate.isPrepared) {
+      childStartupGate.prepare(async preparation => {
+        await awaitSessionNetwork();
+        // Preserve the existing guest-image preparation in the CHILD address space.
+        const imageEnd = module.baseAddress + module.size;
+        for (const patch of preparation?.imagePatches ?? []) {
+          const binary = atob(patch.data), bytes = Uint8Array.from(binary, ch => ch.charCodeAt(0));
+          const address = patch.address >>> 0;
+          if (address < module.baseAddress || address + bytes.length > imageEnd) {
+            throw new Error("Child image preparation lies outside its mapped image");
+          }
+          writeGuestCode(system.process!.getCurrentMemory(), bytes, address);
+        }
+      }, startLoadedImage);
+    } else startLoadedImage();
     return "ok";
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -1486,6 +1570,7 @@ const prepareFullGameSwitch = async (preserveBundleSource = false): Promise<void
   }
   resetHeapSlab();
   await system.reset();
+  lanNetwork.reset();
   if (state.inputBuffer) system.connectInput(state.inputBuffer);
   gameSessionActive = false;
   bootMark("system-reset-done");
@@ -2291,6 +2376,8 @@ const requestSelfReExec = (commandLine: string, imagePath?: string, imagePatches
 };
 
 const initV86 = async (canvas: OffscreenCanvas) => {
+  // Install the shared port registry before any guest can bind, including offline boots.
+  getProcessNetworkNamespace();
   // Arm the HLE gate for THIS emulator instance before anything can await it.
   resetHleReady();
   // Try to apply RAM configuration from pending bundle if available
@@ -2534,6 +2621,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       const ddraw = new DDraw();
       const dinput = new DInput();
       const dplayx = new DPlayX();
+      const dpnet = new Dpnet();
+      const dpnlobby = new Dpnlobby(() => dpnet.addressApi);
       const mss32 = new MSS32();
       const smackw32 = new SmackW32();
       const binkw32 = new BinkW32();
@@ -2608,6 +2697,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       ddraw.initialize(process);
       dinput.initialize(process);
       dplayx.initialize(process);
+      dpnet.initialize(process);
+      dpnlobby.initialize(process);
       mss32.initialize(process);
       if (!EMU_NATIVE_VIDEO_DLLS) {
         smackw32.initialize(process);
@@ -2687,6 +2778,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.registerModule(ddraw.name, ddraw);
       process.registerModule(dinput.name, dinput);
       process.registerModule(dplayx.name, dplayx);
+      process.registerModule(dpnet.name, dpnet);
+      process.registerModule(dpnlobby.name, dpnlobby);
       process.registerModule(mss32.name, mss32);
       if (!EMU_NATIVE_VIDEO_DLLS) {
         process.registerModule(smackw32.name, smackw32);
@@ -2764,6 +2857,8 @@ const initV86 = async (canvas: OffscreenCanvas) => {
       process.dispatcher.registerModule(ddraw.name, ddraw.exports);
       process.dispatcher.registerModule(dinput.name, dinput.exports);
       process.dispatcher.registerModule(dplayx.name, dplayx.exports);
+      process.dispatcher.registerModule(dpnet.name, dpnet.exports);
+      process.dispatcher.registerModule(dpnlobby.name, dpnlobby.exports);
       process.dispatcher.registerModule(mss32.name, mss32.exports);
       if (!EMU_NATIVE_VIDEO_DLLS) {
         process.dispatcher.registerModule(smackw32.name, smackw32.exports);
@@ -3165,7 +3260,10 @@ const initV86 = async (canvas: OffscreenCanvas) => {
               flushError: flushError === undefined ? undefined : String(flushError),
             });
           };
-          void system.drainDurableState().then(() => report(), report);
+          void Promise.allSettled([system.drainDurableState(), flushProcessNetworkNamespace()]).then(results => {
+            const errors = results.flatMap(result => result.status === 'rejected' ? [String(result.reason)] : []);
+            report(errors.length ? errors.join('; ') : undefined);
+          });
         };
         system.executablePath = boot.imagePath;
         system.executableName = boot.imagePath.split(/[\\/]/).pop() ?? 'child.exe';
@@ -3227,6 +3325,7 @@ function pauseEmulator(): void {
   }
 }
 function resumeEmulator(): void {
+  if (childStartupGate && !childStartupGate.canRun) return;
   const system = System.getInstance();
   if (!system.process?.v86) return;
   isPaused = false;
@@ -3274,15 +3373,34 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (event.data?.type === 'child_boot') {
     if (childBoot || System.getInstance().process) return;
     childBoot = event.data as ChildBoot;
+    const boot = childBoot;
+    childStartupGate = new ChildStartupGate<ChildProcessPreparation>(
+      () => postToParent({ type: 'child_ready', bootId: boot.bootId, processId: boot.processIdentity?.pid ?? boot.processId }),
+      error => postToParent({ type: 'error', message: 'Child startup failed: ' + String(error) }),
+    );
+    if (childBoot.processIdentity) {
+      adoptProcessIdentity(childBoot.processIdentity);
+      if (childBoot.ipcPort) adoptProcessIpc(childBoot.processIdentity, childBoot.ipcPort);
+    }
+    if (childBoot.networkNamespace) adoptProcessNetworkNamespace(childBoot.networkNamespace);
     childImageReady = new Promise<void>(resolve => { resolveChildImageReady = resolve; });
     childSessionTransport = new ChildSessionTransport((message, transfer = []) => postToParent(message, transfer), handleWorkerMessage);
     childFrameClock = new ChildFrameClock(() => postToParent({ type: 'child_animation_request' }));
     self.requestAnimationFrame = childFrameClock.request;
     self.cancelAnimationFrame = childFrameClock.cancel;
     if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
+    applySessionNetwork(EmulatorConfig.getInstance().network);
     const canvas = new OffscreenCanvas(640, 480);
     state.canvas = canvas;
     void initV86(canvas).catch(error => self.postMessage({ type: 'error', message: String(error) }));
+    return;
+  }
+  if (event.data?.type === 'child_resume') {
+    if (childBoot && event.data.bootId === childBoot.bootId) childStartupGate?.resume(event.data.preparation);
+    return;
+  }
+  if (event.data?.type === 'child_hold') {
+    if (childBoot && event.data.bootId === childBoot.bootId) childStartupGate?.hold();
     return;
   }
   if (event.data?.type === 'child_registry_down') {
@@ -3370,6 +3488,11 @@ const handleWorkerMessage = (event: MessageEvent): void => {
       : null;
     Logger.log(LogCategory.SYSTEM,
       `[ReExec] boot from host: image "${pendingReExecImage ?? "(manifest)"}" args "${pendingReExecArgs ?? ""}"`);
+    return;
+  }
+
+  if (message?.type === "set_network") {
+    applySessionNetwork(message.network);
     return;
   }
 
@@ -3513,6 +3636,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   }
 
   if (message?.type === "load_pe") {
+    if (Object.hasOwn(message, "network")) applySessionNetwork(message.network);
     const peData = message.data as Uint8Array;
     loadPeData(peData).catch(err => Logger.error(LogCategory.SYSTEM, `load_pe failed: ${err}`));
   }
@@ -3538,6 +3662,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   }
 
   if (message?.type === "load_bundle") {
+    if (Object.hasOwn(message, "network")) applySessionNetwork(message.network);
     const cfg = EmulatorConfig.getInstance().hleLibs as {
       enable: boolean;
       logOnly: boolean;

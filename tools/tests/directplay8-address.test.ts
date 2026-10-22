@@ -1,0 +1,67 @@
+import { test, expect } from "bun:test";
+import { DirectPlayAddress } from "../../src/worker/modules/dpnet/address";
+import { DPN, DP8_TCPIP, guidBytes, guidString, utf16, fromUtf16 } from "../../src/worker/modules/dpnet/constants";
+import { DirectPlaySendQueue } from "../../src/worker/modules/dplayx/send-queue";
+import { DP } from "../../src/worker/modules/dplayx/session";
+const pause = (ms = 5) => new Promise(resolve => setTimeout(resolve, ms));
+test("DirectPlay 8 address component ordering, case replacement and native URL equality", () => {
+    const address = new DirectPlayAddress();
+    expect(address.url()).toBe("x-directplay:/");
+    expect(address.setText("hostname", "localhost")).toBe(DPN.OK);
+    expect(address.setDword("port", 8888)).toBe(DPN.OK);
+    expect(address.setGuid("provider", DP8_TCPIP)).toBe(DPN.OK);
+    expect(address.components.map(c => c.name)).toEqual(["provider", "hostname", "port"]);
+    expect(address.setText("HOSTNAME", "LOCALHOST")).toBe(DPN.OK);
+    expect(address.components.length).toBe(3); expect(address.components[1].name).toBe("hostname");
+    expect(address.url()).toBe("x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=LOCALHOST;port=8888");
+    const other = new DirectPlayAddress(); expect(other.buildURL(address.url())).toBe(DPN.OK);
+    expect(other.equal(address)).toBe(true); other.setText("hostname", "localhost"); expect(other.equal(address)).toBe(true);
+    other.clear(); other.setDword("port", 8888); other.setText("hostname", "localhost"); other.setGuid("provider", DP8_TCPIP);
+    expect(other.equal(address)).toBe(false);
+});
+test("DirectPlay 8 address values validate exact string extent, type and provider shortcuts atomically", () => {
+    const address = new DirectPlayAddress();
+    expect(address.set("hostname", utf16("тест🙂\0"), 1)).toBe(DPN.OK);
+    expect(address.text("hostname")).toBe("тест🙂");
+    expect(address.set("hostname", utf16("bad\0\0"), 1)).toBe(DPN.INVALIDPARAM);
+    expect(address.text("hostname")).toBe("тест🙂");
+    expect(address.set("port", new Uint8Array(6), 2)).toBe(DPN.INVALIDPARAM);
+    expect(address.set("port", utf16("12\0"), 1)).toBe(DPN.INVALIDPARAM);
+    expect(address.set("provider", new Uint8Array([73, 80, 0]), 5)).toBe(DPN.OK);
+    expect(address.guid("provider")).toBe(DP8_TCPIP);
+    expect(address.set("provider", utf16("bogus\0"), 1)).toBe(DPN.INVALIDPARAM);
+    expect(address.guid("provider")).toBe(DP8_TCPIP);
+    expect(address.set("provider", guidBytes(DP8_TCPIP), 3)).toBe(DPN.OK);
+    expect(guidString(guidBytes(DP8_TCPIP))).toBe(DP8_TCPIP);
+    expect(fromUtf16(utf16("🙂漢\0"))).toBe("🙂漢");
+});
+test("DirectPlay 8 URL escaped delimiters, binary user data and malformed partial state", () => {
+    const address = new DirectPlayAddress();
+    address.setText("hostname", "a b%;#=");
+    address.userData = new Uint8Array([0, 37, 255, 65, 59]);
+    expect(address.url()).toBe("x-directplay:/hostname=a%20b%%%3B%23%3D#%00%%%FFA%3B");
+    const other = new DirectPlayAddress(); expect(other.buildURL(address.url())).toBe(DPN.OK);
+    expect(other.text("hostname")).toBe("a b%;#="); expect(other.userData).toEqual(address.userData);
+    expect(other.buildURL("x-directplay:/hostname=good;port=bad")).toBe(DPN.INVALIDURL);
+    expect(other.text("hostname")).toBe("good"); expect(other.get("port")).toBeUndefined();
+    expect(other.buildURL("invalid:/")).toBe(DPN.INVALIDURL); expect(other.components.length).toBe(0);
+    expect(other.buildURL("x-directplay:/hostname=%Q1")).toBe(DPN.INVALIDURL);
+    const clone = address.clone(); clone.components[0].data[0] = 90; clone.userData[0] = 42;
+    expect(address.text("hostname")).toBe("a b%;#="); expect(address.userData[0]).toBe(0);
+});
+test("SendEx serializes delivery, timeout releases a stalled job and reset ignores late completions", async () => {
+    const sent: number[] = [], complete: { id: number; hr: number }[] = [];
+    let release!: (hr: number) => void, started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    const queue = new DirectPlaySendQueue(job => {
+        sent.push(job.context); if (job.context === 1) { started(); return new Promise<number>(resolve => { release = resolve; }); } return DP.OK;
+    }, result => complete.push(result), () => 0);
+    const job = (context: number, timeout = 0) => ({ from: 1, to: 2, flags: 0, priority: 0, context, timeout, data: () => new Uint8Array([1]) });
+    const first = queue.enqueue(job(1, 100), 1);
+    await ready; queue.enqueue(job(2), 1); await pause();
+    expect(sent).toEqual([1]); await pause(125);
+    expect(sent).toEqual([1, 2]); expect(complete.map(c => c.hr)).toEqual([DP.TIMEOUT, DP.OK]);
+    release(DP.OK); await pause(); expect(complete.filter(c => c.id === first).length).toBe(1);
+    queue.enqueue(job(1), 1); await pause(); queue.reset(); release(DP.OK); await pause();
+    expect(complete.length).toBe(2); expect(queue.pending.length).toBe(0);
+});

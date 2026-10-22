@@ -1,0 +1,331 @@
+// Adapted from cszackrison/bottleship, Apache-2.0; see packages/lan/NOTICE.
+import {
+    BROADCAST_NODE, PROTO_IPX, PROTO_RAW4, validBindingGeneration, decodeDatagram, encodeDatagram, isBroadcastNode, isLanNode,
+    isProtocol, isRawProtocol, validRawPayload, maxPayload, nodeToIpv4, validPort, isAddressNode, ipv4ToNode, isExternalIpv4Node, isExternalIpv6Node, LAN_IPV6_PREFIX, type GatewayIpv6Address,
+} from "./netplay-wire";
+export {
+    IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD, DIRECTPLAY_MAX_PAYLOAD, ipv4ToNode, nodeToIpv4,
+} from "./netplay-wire";
+import { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
+export { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
+export const IPX_NETNUM = new Uint8Array([0, 0, 0, 1]);
+export const LAN_NET_OCTET = 10;
+export interface LanDatagram { srcNode: Uint8Array; srcPort: number; data: Uint8Array }
+export interface LanEndpoint { deliver(dg: LanDatagram): void }
+export interface RawDeliveryTarget { port: number; generation: number }
+export interface LanPortDisconnect { node: Uint8Array; port: number; proto: number }
+export interface LanSocketError { node: Uint8Array; localPort: number; remotePort: number; proto: number; code: number; wireId?: number;bindingGeneration?:number }
+export interface NetTransport {
+    readonly connected?: boolean;
+    readonly routeLocal?: boolean;
+    send(frame: Uint8Array<ArrayBuffer>,bindingGeneration?:number): boolean;
+    releasePort?(port:number,proto:number,bindingGeneration:number):void;
+    resolve?(request: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>;
+    close(): void;
+}
+export interface LanPortRegistry {
+    allocateSocketId?(): number;
+    generation?(port:number,proto:number):number;
+    deliveryGeneration?(port: number, proto: number): number;
+    claim(port: number, proto: number, reuse?: boolean): boolean;
+    release(port: number, proto: number): void;
+}
+export interface LanState {
+    connected: boolean;
+    node: Uint8Array;
+    ipv4: Uint8Array;
+    generation: number;
+    reason?: string;
+    gatewayIpv4?: number[][];
+    gatewayIpv6?: GatewayIpv6Address[];
+}
+const EPHEMERAL = [[0x4000, 0x7fff], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [1, 256], [1, 256]];
+function randomNode(): Uint8Array {
+    const node = new Uint8Array([2, 0, 0, 0, 0, 0]);
+    do { crypto.getRandomValues(node.subarray(3)); } while (!isLanNode(node));
+    return node;
+}
+export class LanNetwork {
+    readonly node: Uint8Array;
+    readonly stats = { sent: 0, received: 0, dropped: 0 };
+    private readonly ports = Array.from({ length: 8 }, () => new Map<number, LanEndpoint>());
+    private nextEphemeral = EPHEMERAL.map(([low]) => low);
+    private readonly listeners = new Set<(state: LanState) => void>();
+    private readonly writableListeners = new Set<() => void>();
+    private readonly peerListeners = new Set<(node: Uint8Array) => void>();
+    private readonly socketErrorListeners = new Set<(error: LanSocketError) => void>();
+    private readonly portListeners = new Set<(port: LanPortDisconnect) => void>();
+    private transport: NetTransport | null = null;
+    private readonly gatewayAddresses = new Set<string>();
+    private readonly gatewayIpv6 = new Map<string, GatewayIpv6Address>();
+    private portRegistry: LanPortRegistry | null = null;
+    private online = false;
+    private generation = 0;
+    private nextSocketId = 1;
+    private nextBindingGeneration=1;
+    private nextDeliveryGeneration = 1;
+    private readonly deliveryBindings = Array.from({ length: 8 }, () => new Map<number, number>());
+    private readonly bindings=Array.from({length:8},()=>new Map<number,number>());
+    bindingGeneration(port:number,proto:number):number{return this.bindings[proto]?.get(port)??0;}
+    deliveryGeneration(port: number, proto: number): number { return this.deliveryBindings[proto]?.get(port) ?? 0; }
+    releaseRemotePort(port:number,proto:number,generation:number):void{this.transport?.releasePort?.(port,proto,generation);}
+    /** Wire identities outlive guest handles and are shared across process adapters. */
+    allocateSocketId(): number {
+        const id = this.portRegistry?.allocateSocketId?.() ?? (this.nextSocketId <= 0xffffffff ? this.nextSocketId++ : 0);
+        if (!id) throw new Error("Network socket identity space exhausted");
+        return id >>> 0;
+    }
+
+    constructor(node = randomNode()) {
+        if (!isLanNode(node)) throw new RangeError("Invalid virtual LAN node");
+        this.node = node.slice();
+    }
+    get ipv4(): Uint8Array { return nodeToIpv4(this.node); }
+    get connected(): boolean { return this.online; }
+    get ipv6(): Uint8Array {
+        const address = new Uint8Array(16); address.set(LAN_IPV6_PREFIX); address.set(this.node, 10); return address;
+    }
+    configureGatewayIpv6(addresses: GatewayIpv6Address[]): void { this.gatewayIpv6.clear(); this.registerGatewayIpv6(addresses); }
+    registerGatewayIpv6(addresses: GatewayIpv6Address[]): void {
+        if (!Array.isArray(addresses)) return;
+        for (const item of addresses.slice(0, 4096)) if (item && this.gatewayIpv6.size < 4096 && Array.isArray(item.address) && item.address.length === 16
+            && item.address.every(n => Number.isInteger(n) && n >= 0 && n < 256) && Array.isArray(item.node) && item.node.length === 6
+            && item.node.every(n => Number.isInteger(n) && n >= 0 && n < 256) && isExternalIpv6Node(Uint8Array.from(item.node))
+            && (item.scopeId === undefined || (Number.isInteger(item.scopeId) && item.scopeId >= 0 && item.scopeId <= 0xffffffff))) {
+            const scopeId = item.scopeId ?? 0;
+            this.gatewayIpv6.set(item.address.join(".") + "%" + scopeId,
+                { address: item.address.slice(), node: item.node.slice(), ...(scopeId ? { scopeId } : {}) });
+        }
+    }
+    routeIpv6(address: Uint8Array, scopeId = 0): Uint8Array {
+        if (address.length !== 16 || !Number.isInteger(scopeId) || scopeId < 0 || scopeId > 0xffffffff) throw new NetResolveError("NO_DATA");
+        if (address.subarray(0, 15).every(n => n === 0) && address[15] === 1) return this.node.slice();
+        if (address.subarray(0, 10).every(n => n === 0) && address[10] === 255 && address[11] === 255) return this.routeIpv4(address.subarray(12));
+        if (LAN_IPV6_PREFIX.every((n, i) => n === address[i]) && isLanNode(address.subarray(10))) return address.slice(10);
+        const gateway = this.gatewayIpv6.get(address.join(".") + "%" + scopeId);
+        if (!gateway) throw new NetResolveError("ACCESS_DENIED", "IPv6 destination is not configured");
+        return Uint8Array.from(gateway.node);
+    }
+    nodeToIpv6(node: Uint8Array): Uint8Array {
+        if (isLanNode(node)) { const address = new Uint8Array(16); address.set(LAN_IPV6_PREFIX); address.set(node, 10); return address; }
+        if (isExternalIpv4Node(node)) { const address = new Uint8Array(16); address[10] = address[11] = 255; address.set(nodeToIpv4(node), 12); return address; }
+        for (const item of this.gatewayIpv6.values()) if (item.node.every((n, i) => n === node[i])) return Uint8Array.from(item.address);
+        throw new NetResolveError("NO_DATA", "Unknown IPv6 relay address");
+    }
+    nodeToIpv6Scope(node: Uint8Array): number {
+        for (const item of this.gatewayIpv6.values()) if (item.node.every((n, i) => n === node[i])) return item.scopeId ?? 0;
+        return 0;
+    }
+    configureGatewayAddresses(addresses: number[][]): void {
+        this.gatewayAddresses.clear();
+        this.registerGatewayAddresses(addresses);
+    }
+    registerGatewayAddresses(addresses: number[][]): void {
+        if (!Array.isArray(addresses)) return;
+        for (const ip of addresses.slice(0, 4096)) if (Array.isArray(ip) && this.gatewayAddresses.size < 4096 && ip.length === 4
+            && ip.every(n => Number.isInteger(n) && n >= 0 && n < 256)) this.gatewayAddresses.add(ip.join("."));
+    }
+    setPortRegistry(registry: LanPortRegistry | null): void {
+        if (this.ports.some(ports => ports.size)) throw new Error("Port registry must be installed before binding");
+        this.portRegistry = registry;
+    }
+    adoptIdentity(node: Uint8Array): void {
+        if (!isLanNode(node) || this.ports.some(ports => ports.size)) throw new Error("Identity must be adopted before binding");
+        this.node.set(node);
+    }
+    routeIpv4(ip: Uint8Array): Uint8Array { return ipv4ToNode(ip, this.gatewayAddresses.has(ip.join("."))); }
+    async resolve(host: string, family: 0 | 4 | 6 = 0, signal?: AbortSignal): Promise<ResolveResult> {
+        if (signal?.aborted) throw new NetResolveError("CANCELLED");
+        if (!this.online || !this.transport?.resolve) throw new NetResolveError("NETWORK_DOWN");
+        return this.transport.resolve({ host, family }, signal);
+    }
+
+    attach(transport: NetTransport | null): void {
+        if (this.transport === transport) return;
+        const previous = this.transport;
+        this.transport = null;
+        this.setConnected(false, "transport changed", true);
+        previous?.close();
+        this.transport = transport;
+        if (transport && transport.connected !== false) this.setConnected(true);
+    }
+    setConnected(connected: boolean, reason?: string, force = false): void {
+        if (!force && this.online === connected) return;
+        this.online = connected;
+        const state: LanState = { connected, node: this.node.slice(), ipv4: this.ipv4, generation: ++this.generation, reason,
+            gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()] };
+        for (const listener of this.listeners) listener(state);
+    }
+    onStateChange(listener: (state: LanState) => void): () => void {
+        this.listeners.add(listener);
+        return () => this.listeners.delete(listener);
+    }
+    onPortDisconnect(listener: (port: LanPortDisconnect) => void): () => void {
+        this.portListeners.add(listener);
+        return () => this.portListeners.delete(listener);
+    }
+    notifyPortDisconnected(port: LanPortDisconnect): void {
+        if (!isAddressNode(port.node) || !validPort(port.port) || !isProtocol(port.proto)) return;
+        for (const listener of this.portListeners) listener({ ...port, node: port.node.slice() });
+    }
+    onSocketError(listener: (error: LanSocketError) => void): () => void {
+        this.socketErrorListeners.add(listener);
+        return () => this.socketErrorListeners.delete(listener);
+    }
+    notifySocketError(error: LanSocketError): void {
+        if (!isAddressNode(error.node) || !validPort(error.localPort) || !validPort(error.remotePort)
+            || !isProtocol(error.proto) || !Number.isInteger(error.code) || error.code < 10000 || error.code > 12000
+            || (error.bindingGeneration!==undefined&&(!Number.isInteger(error.bindingGeneration)||error.bindingGeneration<1||error.bindingGeneration>0xffffffff))
+            || (error.wireId !== undefined && (!Number.isInteger(error.wireId) || error.wireId < 1 || error.wireId > 0xffffffff))) return;
+        for (const listener of this.socketErrorListeners) listener({ ...error, node: error.node.slice() });
+    }
+    onPeerDisconnect(listener: (node: Uint8Array) => void): () => void {
+        this.peerListeners.add(listener);
+        return () => this.peerListeners.delete(listener);
+    }
+    notifyPeerDisconnected(node: Uint8Array): void {
+        if (!isLanNode(node) || this.isSelf(node)) return;
+        for (const listener of this.peerListeners) listener(node.slice());
+    }
+    onWritable(listener: () => void): () => void {
+        this.writableListeners.add(listener);
+        return () => this.writableListeners.delete(listener);
+    }
+    notifyWritable(): void {
+        for (const listener of this.writableListeners) listener();
+    }
+    isBound(port: number, proto = PROTO_IPX): boolean {
+        return isProtocol(proto) && this.ports[proto].has(port);
+    }
+    bind(port: number, endpoint: LanEndpoint, proto = PROTO_IPX, reuse = false): boolean {
+        if (!isProtocol(proto) || !validPort(port) || this.ports[proto].has(port)) return false;
+        if (this.portRegistry && !this.portRegistry.claim(port, proto, reuse)) return false;
+        const generation=this.portRegistry?.generation?.(port,proto)??this.nextBindingGeneration++;
+        const deliveryGeneration = this.portRegistry?.deliveryGeneration?.(port, proto) ?? this.nextDeliveryGeneration++;
+        if (!validBindingGeneration(generation) || !validBindingGeneration(deliveryGeneration)) { this.portRegistry?.release(port, proto); return false; }
+        this.bindings[proto].set(port,generation);
+        this.deliveryBindings[proto].set(port, deliveryGeneration);
+        this.ports[proto].set(port, endpoint);
+        return true;
+    }
+    bindEphemeral(endpoint: LanEndpoint, proto = PROTO_IPX): number {
+        if (!isProtocol(proto)) return 0;
+        const [low, high] = EPHEMERAL[proto];
+        for (let count = low; count <= high; count++) {
+            const port = this.nextEphemeral[proto];
+            this.nextEphemeral[proto] = port === high ? low : port + 1;
+            if (this.bind(port, endpoint, proto)) return port;
+        }
+        return 0;
+    }
+    unbind(port: number, endpoint: LanEndpoint, proto = PROTO_IPX): void {
+        if (isProtocol(proto) && this.ports[proto].get(port) === endpoint) {
+            const generation=this.bindingGeneration(port,proto);
+            this.ports[proto].delete(port);this.bindings[proto].delete(port);this.deliveryBindings[proto].delete(port);
+            this.portRegistry?.release(port, proto);
+            if(!this.portRegistry)this.releaseRemotePort(port,proto,generation);
+        }
+    }
+    send(srcPort: number, dstNode: Uint8Array, dstPort: number, data: Uint8Array, proto = PROTO_IPX, bindingGeneration=this.bindingGeneration(srcPort,proto)): boolean {
+        if (!isProtocol(proto) || !validPort(srcPort) || !validPort(dstPort) || dstNode.length !== 6
+            || data.length > maxPayload(proto) || (proto === PROTO_IPX && data.length < 2)
+            || (isRawProtocol(proto) && (!validRawPayload(data) || dstPort > 256 || srcPort > 256))) return false;
+        if (this.transport?.routeLocal) {
+            const accepted = this.transport.send(encodeDatagram(proto, dstNode, dstPort, srcPort, data),bindingGeneration);
+            if (accepted) this.stats.sent++; else this.stats.dropped++;
+            return accepted;
+        }
+        const broadcast = isBroadcastNode(dstNode);
+        const local = this.isSelf(dstNode);
+        if (!local && this.online && this.transport) {
+            if (!this.transport.send(encodeDatagram(proto, broadcast ? BROADCAST_NODE : dstNode, dstPort, srcPort, data),bindingGeneration)) {
+                this.stats.dropped++;
+                return false;
+            }
+        } else if (!local && !broadcast) {
+            this.stats.dropped++;
+            return false;
+        }
+        if (local || broadcast) this.deliverLocal(proto, this.node, srcPort, dstPort, data);
+        this.stats.sent++;
+        return true;
+    }
+    receiveFrame(frame: Uint8Array, allowLoopback = false,bindingGeneration?:number): void {
+        const datagram = decodeDatagram(frame);
+        if (!datagram || (bindingGeneration !== undefined && (!validBindingGeneration(bindingGeneration)
+            || bindingGeneration !== this.bindingGeneration(datagram.dstPort, datagram.proto)))
+            || !isAddressNode(datagram.node) || (!allowLoopback && this.isSelf(datagram.node))) {
+            this.stats.dropped++;
+            return;
+        }
+        this.deliverLocal(datagram.proto, datagram.node, datagram.srcPort, datagram.dstPort, datagram.payload);
+    }
+    /** Trusted broker delivery: the capture owner was checked before fanout. */
+    receiveRawFrame(frame: Uint8Array, targets: readonly RawDeliveryTarget[]): void {
+        const datagram = decodeDatagram(frame);
+        if (!datagram || datagram.proto !== PROTO_RAW4 || !isAddressNode(datagram.node)) {
+            this.stats.dropped++;
+            return;
+        }
+        this.deliverRawBindings(datagram.node, datagram.srcPort, datagram.payload, targets);
+    }
+    private rawTargets(protocol: number): RawDeliveryTarget[] {
+        const targets: RawDeliveryTarget[] = [];
+        for (const port of new Set([protocol + 1, 1, 256])) {
+            const generation = this.deliveryGeneration(port, PROTO_RAW4);
+            if (generation) targets.push({ port, generation });
+        }
+        return targets;
+    }
+    private deliverRawBindings(srcNode: Uint8Array, srcPort: number, data: Uint8Array, targets: readonly RawDeliveryTarget[]): void {
+        if (!Array.isArray(targets) || !targets.length || targets.length > 3) { this.stats.dropped++; return; }
+        const candidates = new Set([data[0] + 1, 1, 256]), seen = new Set<number>();
+        const deliveries = new Map<LanEndpoint, RawDeliveryTarget[]>();
+        for (const target of targets) {
+            if (!target || !candidates.has(target.port) || seen.has(target.port) || !validBindingGeneration(target.generation)) {
+                this.stats.dropped++;
+                return;
+            }
+            seen.add(target.port);
+            const endpoint = this.ports[PROTO_RAW4].get(target.port);
+            if (!endpoint || this.deliveryGeneration(target.port, PROTO_RAW4) !== target.generation) continue;
+            const bindings = deliveries.get(endpoint) ?? [];
+            bindings.push({ port: target.port, generation: target.generation });
+            deliveries.set(endpoint, bindings);
+        }
+        let delivered = false;
+        for (const [endpoint, bindings] of deliveries) {
+            // A preceding callback may close or replace another recipient.
+            if (!bindings.some(target => this.deliveryGeneration(target.port, PROTO_RAW4) === target.generation
+                && this.ports[PROTO_RAW4].get(target.port) === endpoint)) continue;
+            if (!delivered) { delivered = true; this.stats.received++; }
+            endpoint.deliver({ srcNode: srcNode.slice(), srcPort, data: data.slice() });
+        }
+        if (!delivered) this.stats.dropped++;
+    }
+    reset(): void {
+        for (let proto = 0; proto < this.ports.length; proto++) {
+            for (const [port,endpoint] of [...this.ports[proto]]) this.unbind(port,endpoint,proto);
+        }
+        this.nextEphemeral = EPHEMERAL.map(([low]) => low);
+    }
+    isSelf(node: Uint8Array): boolean {
+        return node.length === 6 && this.node.every((value, index) => value === node[index]);
+    }
+    private deliverLocal(proto: number, srcNode: Uint8Array, srcPort: number, dstPort: number, data: Uint8Array): void {
+        if (proto === PROTO_RAW4) {
+            this.deliverRawBindings(srcNode, srcPort, data, this.rawTargets(data[0]));
+            return;
+        }
+        // NT's raw provider fans an IP packet out to its actual protocol plus
+        // wildcard address objects (protocol zero and IPPROTO_RAW). One endpoint
+        // may own several bindings; it must see the packet only once.
+        const ports = isRawProtocol(proto) ? [dstPort, 1, 256] : [dstPort];
+        const endpoints = new Set(ports.map(port => this.ports[proto].get(port)));
+        endpoints.delete(undefined);
+        if (!endpoints.size) { this.stats.dropped++; return; }
+        this.stats.received++;
+        for (const endpoint of endpoints) endpoint!.deliver({ srcNode: srcNode.slice(), srcPort, data: data.slice() });
+    }
+}
+export const lanNetwork = new LanNetwork();

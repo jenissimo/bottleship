@@ -1,0 +1,214 @@
+import { io, type Socket } from "socket.io-client";
+import type { ClientEvents, ServerEvents, LanReady } from "./netplay-wire";
+import { PROTOCOL_VERSION, PROTO_DIRECTPLAY, isTcpProtocol, asBytes, decodeDatagram, isLanNode, nodeToIpv4 } from "./netplay-wire";
+import { LanNetwork, type NetTransport } from "./lan-network";
+import { NetResolveError, type ResolveRequest, type ResolveResult, type ResolveReply, parseIpv6, parseIpv4, isExternalIpv6Node, validBindingGeneration } from "./netplay-wire";
+
+export interface RelayLinkOptions {
+    transports?: ("websocket" | "polling")[];
+    timeoutMs?: number;
+}
+const clientIds = new WeakMap<LanNetwork, string>();
+export class RelayLink implements NetTransport {
+    readonly ready: Promise<void>;
+    readonly socket: Socket<ServerEvents, ClientEvents>;
+    private online = false;
+    private closed = false;
+    private settled = false;
+    private readonly reliableQueue:({kind:"frame";frame:Uint8Array<ArrayBuffer>;generation?:number}|{kind:"release";port:number;proto:number;generation:number})[] = [];
+    private queuedBytes = 0;
+    private flushing = false;
+    private nextResolve = 1;
+    private readonly pendingResolves = new Map<number, { fail: (error: NetResolveError) => void; accept: (reply: ResolveReply) => void }>();
+    private resolveReady!: () => void;
+    private rejectReady!: (error: Error) => void;
+    private readonly deadline: ReturnType<typeof setTimeout>;
+    get connected(): boolean { return this.online; }
+    get connecting(): boolean { return !this.settled && !this.closed; }
+
+    constructor(url: string, room: string, private readonly net: LanNetwork, options: RelayLinkOptions = {}) {
+        this.ready = new Promise<void>((resolve, reject) => { this.resolveReady = resolve; this.rejectReady = reject; });
+        const timeout = options.timeoutMs ?? 10_000;
+        const clientId = clientIds.get(net) ?? crypto.randomUUID();
+        clientIds.set(net, clientId);
+        this.socket = io(url, {
+            autoConnect: false,
+            forceNew: true,
+            transports: options.transports ?? ["polling", "websocket"],
+            tryAllTransports: true,
+            upgrade: true,
+            timeout,
+            reconnection: true,
+            reconnectionDelay: 500,
+            reconnectionDelayMax: 10_000,
+            auth: { version: PROTOCOL_VERSION, room, clientId, node: Array.from(net.node) },
+        });
+        this.deadline = setTimeout(() => this.failInitial(new Error("LAN server readiness timed out")), timeout);
+        this.socket.on("connect", () => {
+            this.socket.io.engine.on("drain", () => {
+                this.flush();
+                if (this.online && !this.closed) this.net.notifyWritable();
+            });
+        });
+        this.socket.on("ready", info => this.acceptReady(info));
+        this.socket.on("resolved", (id, reply) => this.pendingResolves.get(id)?.accept(reply));
+        this.socket.on("frame", (input,generation) => {
+            if (!this.online || this.closed) return;
+            const bytes = asBytes(input);
+            if(bytes&&(generation===undefined||validBindingGeneration(generation)))this.net.receiveFrame(bytes,false,generation);
+        });
+        this.socket.on("peerLeft", peer => {
+            if (!this.online || this.closed || !peer || !Array.isArray(peer.node)
+                || peer.node.length !== 6 || !peer.node.every(value => Number.isInteger(value) && value >= 0 && value <= 255)) return;
+            const node = Uint8Array.from(peer.node);
+            if (isLanNode(node)) this.net.notifyPeerDisconnected(node);
+        });
+        this.socket.on("socketError", error => {
+            if (!this.online || this.closed || !error || !Array.isArray(error.node)
+                || error.node.length !== 6 || !error.node.every(value => Number.isInteger(value) && value >= 0 && value < 256)) return;
+            this.net.notifySocketError({ ...error, node: Uint8Array.from(error.node) });
+        });
+        this.socket.on("disconnect", reason => {
+            if (this.closed) return;
+            this.online = false;
+            this.clearQueue();
+            this.cancelResolves();
+            this.socket.sendBuffer.length = 0;
+            this.net.setConnected(false, reason);
+
+        });
+        this.socket.on("connect_error", error => {
+            if (this.closed) return;
+            this.net.setConnected(false, error.message);
+            if (!this.settled) this.failInitial(error);
+        });
+        this.socket.connect();
+    }
+    private enqueue(item:(typeof this.reliableQueue)[number],bytes:number):boolean{
+        if(this.reliableQueue.length>=256||this.queuedBytes+bytes>1024*1024){this.socket.disconnect();return false;}
+        this.reliableQueue.push(item);this.queuedBytes+=bytes;this.flush();return true;
+    }
+    releasePort(port:number,proto:number,generation:number):void{
+        if(this.closed||!this.online||!this.socket.connected||!generation)return;
+        this.enqueue({kind:"release",port,proto,generation},16);
+    }
+    send(frame: Uint8Array<ArrayBuffer>,generation=0): boolean {
+        const engine = this.socket.io.engine;
+        const datagram = decodeDatagram(frame);
+        if (!datagram || this.closed || !this.online || !this.socket.connected || !engine) return false;
+        const reliable = isTcpProtocol(datagram.proto) || datagram.proto === PROTO_DIRECTPLAY;
+        if (reliable) {
+            return this.enqueue({kind:"frame",frame:frame.slice(),generation:generation||undefined},frame.byteLength);
+        }
+        if (!engine.transport.writable || engine.writeBuffer.length || this.reliableQueue.length) return false;
+        // Offline datagrams never enter Socket.IO's reconnect sendBuffer.
+        if (generation) this.socket.volatile.emit("frame", frame, generation);
+        else this.socket.volatile.emit("frame", frame);
+        return true;
+    }
+    resolve(request: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult> {
+        if (signal?.aborted) return Promise.reject(new NetResolveError("CANCELLED"));
+        if (!this.online || this.closed) return Promise.reject(new NetResolveError("NETWORK_DOWN"));
+        if (this.pendingResolves.size >= 16) return Promise.reject(new NetResolveError("TRY_AGAIN"));
+        return new Promise((resolve, reject) => {
+            const id = this.nextResolve++;
+            const cleanup = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", abort);
+                this.pendingResolves.delete(id);
+            };
+            const fail = (error: NetResolveError) => { cleanup(); reject(error); };
+            const cancel = (error: NetResolveError) => {
+                if (this.online) this.socket.emit("cancelResolve", id);
+                fail(error);
+            };
+            const abort = () => cancel(new NetResolveError("CANCELLED"));
+            const timer = setTimeout(() => cancel(new NetResolveError(this.online ? "TRY_AGAIN" : "NETWORK_DOWN")), 5000);
+            this.pendingResolves.set(id, { fail, accept: reply => {
+                cleanup();
+                if (reply?.error) { reject(new NetResolveError(reply.error.code, reply.error.message)); return; }
+                const result = reply?.result;
+                if (!result || typeof result.canonicalName !== "string" || result.canonicalName.length > 253
+                    || !Array.isArray(result.addresses) || !result.addresses.length || result.addresses.length > 32
+                    || !result.addresses.every(item => item && typeof item.address === "string"
+                        && (item.family === 4 ? !!parseIpv4(item.address) : item.family === 6 && !!parseIpv6(item.address)
+                            && Array.isArray(item.node) && item.node.length === 6 && item.node.every(n => Number.isInteger(n) && n >= 0 && n < 256)
+                            && isExternalIpv6Node(Uint8Array.from(item.node))
+                            && (item.scopeId === undefined || (Number.isInteger(item.scopeId) && item.scopeId >= 0 && item.scopeId <= 0xffffffff))))) {
+                    reject(new NetResolveError("NO_RECOVERY")); return;
+                }
+                this.net.registerGatewayAddresses(result.addresses.filter(item => item.family === 4).map(item => item.address.split(".").map(Number)));
+                this.net.registerGatewayIpv6(result.addresses.filter(item => item.family === 6 && item.node && parseIpv6(item.address))
+                    .map(item => ({ address: Array.from(parseIpv6(item.address)!), node: item.node!, ...(item.scopeId ? { scopeId: item.scopeId } : {}) })));
+                resolve(result);
+            } });
+            signal?.addEventListener("abort", abort, { once: true });
+            this.socket.emit("resolve", id, request);
+        });
+    }
+    private cancelResolves(): void {
+        for (const entry of this.pendingResolves.values()) entry.fail(new NetResolveError("NETWORK_DOWN"));
+        this.pendingResolves.clear();
+    }
+    private flush(): void {
+        if (this.flushing || this.closed || !this.online || !this.socket.connected) return;
+        this.flushing = true;
+        try {
+            const engine = this.socket.io.engine;
+            while (this.reliableQueue.length && engine.transport.writable && !engine.writeBuffer.length) {
+                const item=this.reliableQueue.shift()!;
+                if(item.kind==="frame"){
+                    this.queuedBytes-=item.frame.byteLength;
+                    if(item.generation===undefined)this.socket.emit("frame",item.frame);
+                    else this.socket.emit("frame",item.frame,item.generation);
+                }
+                else{this.queuedBytes-=16;this.socket.emit("releasePort",item.proto,item.port,item.generation);}
+            }
+        } finally { this.flushing = false; }
+    }
+    private clearQueue(): void {
+        this.reliableQueue.length = 0;
+        this.queuedBytes = 0;
+    }
+    close(): void {
+        if (this.closed) return;
+        this.closed = true;
+        this.online = false;
+        this.clearQueue();
+        this.cancelResolves();
+        clearTimeout(this.deadline);
+        this.socket.removeAllListeners();
+        this.socket.sendBuffer.length = 0;
+        this.socket.disconnect();
+        this.net.setConnected(false, "closed");
+        if (!this.settled) {
+            this.settled = true;
+            this.rejectReady(new Error("LAN connection closed"));
+        }
+    }
+    private failInitial(error: Error): void {
+        if (this.settled || this.closed) return;
+        this.settled = true;
+        this.rejectReady(error);
+        this.close();
+    }
+    private acceptReady(info: LanReady): void {
+        if (this.closed) return;
+        const expectedIp = nodeToIpv4(this.net.node);
+        if (!info || typeof info !== "object" || info.version !== PROTOCOL_VERSION || !Array.isArray(info.node) || info.node.length !== 6
+            || !info.node.every((value, index) => value === this.net.node[index])
+            || !Array.isArray(info.ipv4) || info.ipv4.length !== 4
+            || !info.ipv4.every((value, index) => value === expectedIp[index])) {
+            if (!this.settled) this.failInitial(new Error("Invalid LAN server identity"));
+            else this.close();
+            return;
+        }
+        this.net.configureGatewayAddresses(info.gatewayIpv4 ?? []);
+        this.net.configureGatewayIpv6(info.gatewayIpv6 ?? []);
+        this.online = true;
+        clearTimeout(this.deadline);
+        this.net.setConnected(true);
+        this.flush();
+        if (!this.settled) { this.settled = true; this.resolveReady(); }
+    }
+}

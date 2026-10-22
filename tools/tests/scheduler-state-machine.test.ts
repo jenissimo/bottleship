@@ -2354,3 +2354,48 @@ describe("scheduler/urgent exit — the switched-in thread gets the slice back",
         } finally { undo(); }
     });
 });
+
+describe("event handle aliases share signal state", () => {
+    test("alias creation hands off the current WASM signal and closing either handle preserves the other", () => {
+        const scheduler = new Scheduler(), handle = scheduler.createEvent(false, false);
+        hypercallDataManager.writeEventMirrorSignaled(handle, true, false);
+        const alias = scheduler.syncObjects.duplicateEvent(handle)!;
+        expect(alias).not.toBe(handle);
+        expect(hypercallDataManager.readEventMirrorState(handle)).toBeNull();
+        expect(hypercallDataManager.readEventMirrorState(alias)).toBeNull();
+        expect(scheduler.tryConsumeWait(alias, 1)).toBe(true);
+        expect(scheduler.tryConsumeWait(handle, 1)).toBe(false);
+        scheduler.setEvent(handle);
+        scheduler.syncObjects.closeEvent(handle);
+        expect(scheduler.tryConsumeWait(alias, 1)).toBe(true);
+        expect(scheduler.tryConsumeWait(alias, 1)).toBe(false);
+        scheduler.syncObjects.closeEvent(alias);
+    });
+    test("manual aliases wake every handle's waiters and auto-reset aliases release exactly one", () => {
+        for (const manual of [true, false]) {
+            const scheduler = new Scheduler(), handle = scheduler.createEvent(manual, false);
+            const alias = scheduler.syncObjects.duplicateEvent(handle)!;
+            const a = inject(scheduler, mkThread(1, ThreadState.READY));
+            const b = inject(scheduler, mkThread(2, ThreadState.READY));
+            blockOn(scheduler, a, [handle]); blockOn(scheduler, b, [alias]);
+            expect(scheduler.hasWaitersForHandle(handle)).toBe(true);
+            expect(scheduler.hasWaitersForHandle(alias)).toBe(true);
+            scheduler.setEvent(alias);
+            expect([a, b].filter(thread => thread.state === ThreadState.READY).length).toBe(manual ? 2 : 1);
+            if (!manual) scheduler.setEvent(handle);
+            expect(a.state).toBe(ThreadState.READY); expect(b.state).toBe(ThreadState.READY);
+            scheduler.resetEvent(alias);
+            expect(scheduler.tryConsumeWait(handle, 1)).toBe(false);
+            scheduler.syncObjects.closeEvent(alias); scheduler.syncObjects.closeEvent(handle);
+        }
+    });
+});
+
+test("a wait on a closed event reports ERROR_INVALID_HANDLE on the issuing thread", () => {
+    const scheduler = new Scheduler(), thread = mkBlockableCurrent(scheduler, 42);
+    const handle = scheduler.createEvent(false, false);
+    scheduler.syncObjects.closeEvent(handle);
+    const result = scheduler.waitForSingleObjectWithContext(handle, 0, 0x401000, 0x280000,
+        { ecx: 0, edx: 0, ebx: 0, ebp: 0, esi: 0, edi: 0, eflags: 0x202 });
+    expect(result >>> 0).toBe(0xffffffff); expect(thread.lastError).toBe(6);
+});

@@ -179,11 +179,13 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
         // else — not in the trace, not in the page, not in any CDP event. Without this a
         // renderer or worker that dies of memory pressure leaves no evidence at all.
         mkdirSync(CHROME_STDIO_DIR, { recursive: true });
+        // The launcher must not capture pipes inherited by the detached daemon.
+        // Bun waits for their EOF even after PowerShell exits, blocking until Chrome exits.
         const psArgs = args.map((a) => `'${a}'`).join(",");
         Bun.spawnSync(["powershell", "-NoProfile", "-Command",
             `Start-Process -WindowStyle Hidden -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}` +
             ` -RedirectStandardOutput '${CHROME_STDIO_DIR}/stdout.log'` +
-            ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`]);
+            ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
     }
     return waitForChrome(port, 50);
 }
@@ -449,18 +451,16 @@ export async function connect(opts: { port?: number; urlMatch?: string } = {}): 
 /** Evaluate an expression in the PAGE context; returns the deserialized value. */
 export async function pageEval(session: CdpSession, expr: string, opts: { timeoutMs?: number; awaitPromise?: boolean; returnByValue?: boolean; userGesture?: boolean } = {}): Promise<any> {
     const timeoutMs = opts.timeoutMs ?? 30_000;
-    const r = await Promise.race([
-        session.send("Runtime.evaluate", {
-            expression: expr,
-            awaitPromise: opts.awaitPromise ?? true,
-            returnByValue: opts.returnByValue ?? true,
-            // Gesture-gated APIs (requestPointerLock, requestFullscreen, AudioContext.resume)
-            // reject without user activation, which no harness verb can otherwise grant.
-            userGesture: opts.userGesture ?? false,
-        }),
-        Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
-    ]);
-    if ((r as any).__timeout) throw new Error(`pageEval timed out after ${timeoutMs}ms`);
+    // The request owns its deadline and clears it on every reply. A losing sleep
+    // in Promise.race kept successful CLI processes alive for the whole step budget.
+    const r = await session.send("Runtime.evaluate", {
+        expression: expr,
+        awaitPromise: opts.awaitPromise ?? true,
+        returnByValue: opts.returnByValue ?? true,
+        // Gesture-gated APIs (requestPointerLock, requestFullscreen, AudioContext.resume)
+        // reject without user activation, which no harness verb can otherwise grant.
+        userGesture: opts.userGesture ?? false,
+    }, undefined, { timeoutMs });
     const res = (r as any).result;
     if (res?.exceptionDetails) {
         throw new Error(`page eval exception: ${res.exceptionDetails.text} ${res.exceptionDetails.exception?.description ?? ""}`);
@@ -499,11 +499,8 @@ export async function workerEval(session: CdpSession, expr: string, opts: { time
     const timeoutMs = opts.timeoutMs ?? 30_000;
     const sessionId = await attachEmulatorWorker(session);
     await session.send("Runtime.enable", {}, sessionId, { timeoutMs });
-    const r = await Promise.race([
-        session.send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true }, sessionId),
-        Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
-    ]);
-    if ((r as any).__timeout) throw new Error(`workerEval timed out after ${timeoutMs}ms`);
+    const r = await session.send("Runtime.evaluate",
+        { expression: expr, returnByValue: true, awaitPromise: true }, sessionId, { timeoutMs });
     const res = (r as any).result;
     if (res?.exceptionDetails) throw new Error(`worker eval exception: ${res.exceptionDetails.text}`);
     return res?.result?.value ?? res?.result;
@@ -845,8 +842,9 @@ function repairViteDepCache(listening: boolean): boolean {
 
 /** Detached `bun run dev`, so it outlives this process on every platform. */
 function spawnVite(): void {
+    const port = new URL(DEFAULT_DEV_URL).port || "5174";
     if (!IS_WIN) {
-        Bun.spawn(["bun", "run", "dev"], {
+        Bun.spawn(["bun", "run", "dev", "--port", port, "--strictPort"], {
             cwd: process.cwd(), stdin: "ignore", stdout: "ignore", stderr: "ignore",
         }).unref();
         return;
@@ -856,7 +854,7 @@ function spawnVite(): void {
     // would otherwise terminate the string and change the command.
     const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
     Bun.spawnSync(["powershell", "-NoProfile", "-Command",
-        `Start-Process -FilePath 'bun' -ArgumentList 'run','dev' -WorkingDirectory ${q(process.cwd())} -WindowStyle Hidden`]);
+        `Start-Process -FilePath 'bun' -ArgumentList 'run','dev','--port',${q(port)},'--strictPort' -WorkingDirectory ${q(process.cwd())} -WindowStyle Hidden`]);
 }
 
 function killWedgedVite(): void {
@@ -962,7 +960,8 @@ export async function ensureSidecar(): Promise<{ ok: boolean; action: string }> 
             const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
             Bun.spawnSync(["powershell", "-NoProfile", "-Command",
                 `Start-Process -FilePath 'bun' -ArgumentList 'run',${q(script)} -WorkingDirectory ${q(process.cwd())} ` +
-                `-WindowStyle Hidden -RedirectStandardOutput ${q(out)} -RedirectStandardError ${q(err)}`]);
+                `-WindowStyle Hidden -RedirectStandardOutput ${q(out)} -RedirectStandardError ${q(err)}`],
+                { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
         } else {
             Bun.spawn(["bun", "run", script], {
                 cwd: process.cwd(), stdin: "ignore",

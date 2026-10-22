@@ -81,7 +81,8 @@ describe("guest routines over the real callback manager", () => {
             return 0;
         })(), 0, "process reset");
         const marker = new Error("heap reached");
-        const model = {getMemory: () => mem, dispatcher: {callbackManager: manager},
+        const model = {resetGeneration: 0, resetListeners: new Set<() => void>(),
+            getMemory: () => mem, dispatcher: {callbackManager: manager},
             addressSpace: {getRegions: () => [], reset: () => {}}, initializeMemoryLayout: () => {},
             memory: {reset: () => {
                 expect(closed).toBe(1);

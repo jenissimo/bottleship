@@ -41,7 +41,6 @@ const CURRENT_THREAD_PSEUDO_HANDLE = 0xFFFFFFFE;
 const THREAD_MODE_BACKGROUND_BEGIN = 0x00010000;
 const THREAD_MODE_BACKGROUND_END = 0x00020000;
 const STILL_ACTIVE = 259;
-const CURRENT_PROCESS_ID = VIRTUAL_CURRENT_PROCESS_ID;
 const DEFAULT_MIN_WORKING_SET_BYTES = 0x00020000; // 128 KB
 const DEFAULT_MAX_WORKING_SET_BYTES = 0x01000000; // 16 MB
 const IDLE_PRIORITY_CLASS = 0x00000040;
@@ -101,6 +100,8 @@ export function resetProcessApiState(): void {
     threadExecutionState = 0x80000000;
     toolhelpSnapshots.clear();
     virtualProcessMemoryByPid.clear();
+    childImageByPid.clear();
+    childImagePathsByPid.clear();
 }
 
 function getSnapshot(handle: number): ToolhelpSnapshot | null {
@@ -223,7 +224,7 @@ function module32Impl(mem: Uint8Array, hSnapshot: number, lpme: number, isFirst:
 
     const m = snap.modules[snap.moduleIdx++];
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-    const OUR_PID = CURRENT_PROCESS_ID;
+    const OUR_PID = VIRTUAL_CURRENT_PROCESS_ID;
 
     // MODULEENTRY32A layout (548 bytes):
     // +0    dwSize        (uint32)
@@ -439,7 +440,7 @@ const isCurrentProcessHandle = (handle: number): boolean => {
         return true;
     }
     const pid = getVirtualProcessManager().getProcessIdByHandle(handle >>> 0);
-    return pid === CURRENT_PROCESS_ID;
+    return pid === VIRTUAL_CURRENT_PROCESS_ID;
 };
 
 const isKnownProcessHandle = (handle: number): boolean => {
@@ -453,14 +454,14 @@ const virtualProcessMemoryByPid = new Map<number, Map<number, number>>();
 
 const getVirtualProcessPid = (handle: number): number | null => {
     if ((handle >>> 0) === CURRENT_PROCESS_PSEUDO_HANDLE) {
-        return CURRENT_PROCESS_ID;
+        return VIRTUAL_CURRENT_PROCESS_ID;
     }
     return getVirtualProcessManager().getProcessIdByHandle(handle >>> 0);
 };
 
 const isVirtualChildProcessHandle = (handle: number): boolean => {
     const pid = getVirtualProcessPid(handle);
-    return pid !== null && pid !== CURRENT_PROCESS_ID;
+    return pid !== null && pid !== VIRTUAL_CURRENT_PROCESS_ID;
 };
 
 const getVirtualMemoryMapForPid = (pid: number): Map<number, number> => {
@@ -522,8 +523,8 @@ const loadChildImage = (path: string): ChildImageMap | null => {
 const childImageForPid = (pid: number): ChildImageMap | null => {
     const cached = childImageByPid.get(pid >>> 0);
     if (cached !== undefined) return cached;
-    const pending = pendingSuspendedChildExec.get(pid >>> 0);
-    const image = pending ? loadChildImage(pending.imagePath) : null;
+    const path = childImagePathsByPid.get(pid >>> 0);
+    const image = path ? loadChildImage(path) : null;
     childImageByPid.set(pid >>> 0, image);
     return image;
 };
@@ -692,70 +693,56 @@ const failVirtualProcess = (
 
 const CREATE_SUSPENDED = 0x00000004;
 
-/**
- * Children created SUSPENDED on an image we could actually run, keyed by pid, until the
- * launcher resumes them.
- *
- * CREATE_SUSPENDED means "map it but do not start it yet" — the caller intends to modify
- * the child before its first instruction, which for this family of launchers is the whole
- * point: the on-disk image is encrypted and the parent WriteProcessMemory's the decrypted
- * code over it. Running such an image at CreateProcess time executes ciphertext.
- */
-const pendingSuspendedChildExec = new Map<number, { imagePath: string; commandLine: string }>();
+// Image lookup remains process-local while a real child Worker owns execution.
+const childImagePathsByPid = new Map<number, string>();
 
 const finishVirtualProcess = (
-    lpProcessInformation: number,
-    applicationName: string,
-    commandLine: string,
-    currentDirectory: string,
-    dwCreationFlags: number,
-    isWide: boolean,
-    deferredExec?: { imagePath: string; commandLine: string },
-    /** Present when a headless child runtime is to run this process. Started here, after
-     *  the handles are published, and it owns the exit code from now on. */
-    childRequest?: ChildProcessRequest,
-    childBackend: 'worker' | 'host' = 'worker',
-): ThunkResult => {
-    const manager = getVirtualProcessManager();
+    lpProcessInformation: number, applicationName: string, commandLine: string,
+    currentDirectory: string, dwCreationFlags: number, isWide: boolean,
+    childRequest?: ChildProcessRequest, childBackend: 'worker' | 'host' = 'worker',
+): ThunkResult | Promise<ThunkResult> => {
+    const system = System.getInstance(), manager = getVirtualProcessManager();
+    const ownerThread = system.scheduler.getCurrentThreadId();
+    const ownerProcess = system.process, ownerGeneration = ownerProcess?.resetGeneration;
+    const ownerCurrent = (): boolean => !system.isExiting && system.process === ownerProcess && ownerProcess?.resetGeneration === ownerGeneration;
     const proc = manager.createProcess({
-        applicationName,
-        commandLine,
-        currentDirectory,
-        creationFlags: dwCreationFlags,
-        runtimeBacked: !!childRequest,
+        applicationName, commandLine, currentDirectory, creationFlags: dwCreationFlags, runtimeBacked: !!childRequest,
     });
-
-    if (!writeProcessInformation(
-        lpProcessInformation,
-        proc.processHandle,
-        proc.threadHandle,
-        proc.processId,
-        proc.threadId
-    )) {
-        manager.terminateProcess(proc.processHandle, 0);
+    const setError = (code: number): void => {
+        if (system.scheduler.getCurrentThreadId() === ownerThread) system.scheduler.setLastError(code);
+        else system.scheduler.setLastErrorForThread(ownerThread, code);
+    };
+    const publish = (): ThunkResult => {
+        if (!ownerCurrent()) return { value: 0, stackCleanup: 40 };
+        if (!writeProcessInformation(lpProcessInformation, proc.processHandle, proc.threadHandle, proc.processId, proc.threadId)) {
+            manager.terminateProcess(proc.processHandle, 0);
+            writeProcessInformationZeroed(lpProcessInformation);
+            setError(ERROR_INVALID_PARAMETER);
+            return { value: 0, stackCleanup: 40 };
+        }
+        Logger.log(LogCategory.KERNEL32,
+            'CreateProcess' + (isWide ? 'W' : 'A') + ' -> pid=' + proc.processId + ' tid=' + proc.threadId +
+            ' suspended=' + Number(!!(dwCreationFlags & CREATE_SUSPENDED)));
+        setError(0);
+        return { value: 1, stackCleanup: 40 };
+    };
+    if (!childRequest) return publish();
+    childImagePathsByPid.set(proc.processId, childRequest.imagePath);
+    const task = startProcessRuntime(system.fileSystem, proc.processId, childRequest, childBackend,
+        record => handOffToChild(system, record));
+    // Publish only after the real child image and its final network/IPC epoch exist.
+    return task.ready.then(publish, error => {
+        task.terminate(1);
+        if (!ownerCurrent()) return { value: 0, stackCleanup: 40 };
+        childImagePathsByPid.delete(proc.processId);
+        childImageByPid.delete(proc.processId);
+        system.resourceProvider.unregisterKernelObject(proc.threadHandle);
+        system.resourceProvider.unregisterKernelObject(proc.processHandle);
         writeProcessInformationZeroed(lpProcessInformation);
-        System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+        setError(193);
+        Logger.warn(LogCategory.SYSTEM, 'Child image preparation failed: ' + String(error));
         return { value: 0, stackCleanup: 40 };
-    }
-
-    if (deferredExec) pendingSuspendedChildExec.set(proc.processId, deferredExec);
-
-    Logger.log(
-        LogCategory.KERNEL32,
-        `CreateProcess${isWide ? 'W' : 'A'}("${applicationName}", "${commandLine}", cwd="${currentDirectory}", ` +
-        `flags=0x${dwCreationFlags.toString(16)}) -> pid=${proc.processId} tid=${proc.threadId} ` +
-        `hProcess=0x${proc.processHandle.toString(16)} hThread=0x${proc.threadHandle.toString(16)}` +
-        `${deferredExec ? ` suspended-exec="${deferredExec.imagePath}"` : ''}`
-    );
-
-    if (childRequest) {
-        const system = System.getInstance();
-        startProcessRuntime(system.fileSystem, proc.processId, childRequest, childBackend,
-            record => handOffToChild(system, record));
-    }
-
-    System.getInstance().scheduler.setLastError(0);
-    return { value: 1, stackCleanup: 40 };
+    });
 };
 
 const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolean): ThunkResult | Promise<ThunkResult> => {
@@ -788,37 +775,18 @@ const createVirtualProcess = (memory: Uint8Array, args: number[], isWide: boolea
         ? (commandLine || "")
         : stripFirstCommandLineToken(commandLine || "");
     const imagePath = argv0 ? system.resolveImagePath(argv0, currentDirectory || "") : "";
-    const deferExec = (dwCreationFlags & CREATE_SUSPENDED) !== 0
-        || !!(globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec;
-    // Subsystem selects the optional host-tool backend, never permission to replace the parent.
+    const startSuspended = (dwCreationFlags & CREATE_SUSPENDED) !== 0;
     const isConsoleTool = !!imagePath && isBundledImage(imagePath) && isConsoleSubsystemImage(imagePath);
-    const execCandidate = !!imagePath && isBundledImage(imagePath);
-    if (execCandidate && deferExec) {
+    if (imagePath && isBundledImage(imagePath)) {
         return finishVirtualProcess(
-            lpProcessInformation, applicationName, commandLine,
-            currentDirectory, dwCreationFlags, isWide,
-            { imagePath, commandLine: reExecArgs },
-        );
-    }
-    if (execCandidate && !deferExec) {
-        // Windows starts the child and RETURNS; it never blocks the caller, and nothing
-        // here can know which of our two single-session realizations this child needs.
-        // Blocking until it exits answered that question with the PE subsystem and got
-        // it wrong twice over: a GUI image can be a helper the parent waits on, and a
-        // console image can be the program the user is meant to end up in front of.
-        // So do what Windows does, and let the parent's own next move say it — a wait
-        // completes against the headless run, an exit hands the session over
-        // (pendingChildHandoff, consumed in shutdownProcess).
-        return finishVirtualProcess(
-            lpProcessInformation, applicationName, commandLine,
-            currentDirectory, dwCreationFlags, isWide, undefined,
+            lpProcessInformation, applicationName, commandLine, currentDirectory, dwCreationFlags, isWide,
             {
-                imagePath, commandLine: reExecArgs,
+                imagePath, commandLine: reExecArgs, startSuspended,
                 currentDirectory: currentDirectory || system.fileSystem.currentDir,
                 rawCommandLine: commandLine || applicationName,
                 environment: system.process ? [...system.process.environment] : undefined,
             },
-            isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
+            !startSuspended && isConsoleTool && hostToolsEnabled() ? 'host' : 'worker',
         );
     }
     return failVirtualProcess(lpProcessInformation, applicationName, commandLine, currentDirectory, isWide,
@@ -1000,7 +968,7 @@ export const exports: Record<string, ThunkImplementation> = {
     },
 
     'GetCurrentProcessId': (ctx, mem, args): number => {
-        return CURRENT_PROCESS_ID;
+        return VIRTUAL_CURRENT_PROCESS_ID;
     },
 
     'GetCurrentThreadId': (ctx, mem, args) => {
@@ -1011,30 +979,9 @@ export const exports: Record<string, ThunkImplementation> = {
         const hThread = args[0];
         const system = System.getInstance();
         const manager = getVirtualProcessManager();
-        // Resolve the owner BEFORE resuming: resumeThread can retire the record.
         const childPid = manager.getProcessIdByThreadHandle(hThread);
-        const virtualPrev = manager.resumeThread(hThread);
-
-        // The launcher has finished preparing the child (see pendingSuspendedChildExec):
-        // this is the point real Windows starts running it, and therefore ours too.
-        if (childPid !== null && virtualPrev === 1) {
-            const deferred = (globalThis as { __noSuspendedChildExec?: boolean }).__noSuspendedChildExec
-                ? undefined
-                : pendingSuspendedChildExec.get(childPid);
-            if (deferred) {
-                const patches = collectVirtualProcessWrites(childPid);
-                pendingSuspendedChildExec.delete(childPid);
-                childImageByPid.delete(childPid);
-                if (system.requestReExec(deferred.commandLine, deferred.imagePath, patches)) {
-                    const patchedBytes = patches.reduce((n, p) => n + ((p.data.length / 4) | 0) * 3, 0);
-                    Logger.log(LogCategory.SYSTEM,
-                        `[KERNEL32] ResumeThread(pid=${childPid}) -> exec "${deferred.imagePath}" ` +
-                        `(launcher resumed the child it created suspended; ` +
-                        `${patches.length} patch run(s), ~${patchedBytes} bytes)`);
-                    return { value: virtualPrev, stackCleanup: 4 };
-                }
-            }
-        }
+        const virtualPrev = manager.resumeThread(hThread, childPid === null ? undefined
+            : { imagePatches: collectVirtualProcessWrites(childPid) });
         const prevSuspendCount = virtualPrev !== null
             ? virtualPrev
             : system.scheduler.resumeThread(hThread);
@@ -1601,7 +1548,7 @@ export const exports: Record<string, ThunkImplementation> = {
 
         // Handle pseudo-handles (current process/thread)
         if (hSourceHandle === CURRENT_PROCESS) {
-            const currentProcAlias = getVirtualProcessManager().openProcessById(CURRENT_PROCESS_ID);
+            const currentProcAlias = getVirtualProcessManager().openProcessById(VIRTUAL_CURRENT_PROCESS_ID);
             targetHandle = currentProcAlias !== 0 ? (currentProcAlias >>> 0) : CURRENT_PROCESS;
         } else if (hSourceHandle === CURRENT_THREAD) {
             const sched = System.getInstance().scheduler;
@@ -1627,8 +1574,10 @@ export const exports: Record<string, ThunkImplementation> = {
                 const resourceProvider = System.getInstance().resourceProvider;
                 const resource = resourceProvider.getResource(hSourceHandle >>> 0);
                 if (resource?.type === 'kernel_object') {
-                    // Create an alias handle to the same kernel object payload.
-                    targetHandle = resourceProvider.registerKernelObject(resource.resource) >>> 0;
+                    // Event aliases must share signal consumption and all wait lists.
+                    targetHandle = resource.resource?.kind === "event"
+                        ? System.getInstance().scheduler.syncObjects.duplicateEvent(hSourceHandle)!
+                        : resourceProvider.registerKernelObject(resource.resource) >>> 0;
                 } else {
                     // Fallback for non-virtual handles: preserve legacy behavior.
                     targetHandle = hSourceHandle;
@@ -1649,7 +1598,9 @@ export const exports: Record<string, ThunkImplementation> = {
         // Handle DUPLICATE_CLOSE_SOURCE option
         if (dwOptions & DUPLICATE_CLOSE_SOURCE) {
             Logger.verbose(LogCategory.KERNEL32, `DuplicateHandle: DUPLICATE_CLOSE_SOURCE requested for handle 0x${hSourceHandle.toString(16)}`);
-            if (duplicatedVirtual) {
+            if (System.getInstance().resourceProvider.getKernelObject(hSourceHandle)?.kind === "event") {
+                System.getInstance().scheduler.syncObjects.closeEvent(hSourceHandle);
+            } else if (duplicatedVirtual) {
                 // Best-effort close for virtual process/thread handles.
                 System.getInstance().resourceProvider.unregisterKernelObject(hSourceHandle >>> 0);
             }
@@ -1969,7 +1920,7 @@ export const exports: Record<string, ThunkImplementation> = {
         const TH32CS_SNAPPROCESS = 0x2;
         const TH32CS_SNAPTHREAD = 0x4;
         const TH32CS_SNAPMODULE = 0x8;
-        const OUR_PID = CURRENT_PROCESS_ID;
+        const OUR_PID = VIRTUAL_CURRENT_PROCESS_ID;
 
         // Build process list
         const processes: ToolhelpSnapshot['processes'] = [];
@@ -2140,7 +2091,7 @@ export const exports: Record<string, ThunkImplementation> = {
     'GetProcessId': (ctx, mem, args) => {
         const hProcess = args[0] >>> 0;
         if (hProcess === CURRENT_PROCESS_PSEUDO_HANDLE) {
-            return CURRENT_PROCESS_ID;
+            return VIRTUAL_CURRENT_PROCESS_ID;
         }
         const pid = getVirtualProcessManager().getProcessIdByHandle(hProcess);
         if (pid !== null) {

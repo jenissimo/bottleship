@@ -201,6 +201,15 @@ export interface DeferredWrite {
     size: 1 | 2 | 4 | 8;  // Write size in bytes
 }
 
+export interface OwnerThunkFrame {
+    esp: number;
+    returnAddr: number;
+    /** Valid only during the synchronous continuation; reacquire after any allocation. */
+    mem: Uint8Array;
+}
+
+export type OwnerThunkResult = Pick<ThunkResult, 'value' | 'stackCleanup' | 'deferredWrites' | 'dllInits' | 'startCallbackChain'>;
+
 export interface ThunkResult {
     value: number;
     stackCleanup?: number;
@@ -227,9 +236,18 @@ export interface ThunkResult {
      * generalized for any async-initiated callback chain (e.g. inproc-COM CoCreateInstance after a DLL load).
      */
     startCallbackChain?: (frame: { esp: number; returnAddr: number; mem: Uint8Array }) => boolean;
+    /**
+     * Async-only, synchronous continuation on the issuing thread after lifetime/park validation.
+     * Use for guest allocation and HRESULT selection after a host Promise resolves. Never await,
+     * retain frame.mem, or invoke guest code here; return startCallbackChain to initiate callbacks.
+     * On throw/invalid result the outer value is the failure return and all pending writes are dropped.
+     */
+    resumeOnOwner?: (frame: OwnerThunkFrame) => number | OwnerThunkResult;
 }
 
 interface ActiveAsyncThunk {
+    /** Dispatcher lifetime captured before the Promise was parked. */
+    epoch?: number;
     functionId: number; // Changed from string name to ID for perf
     functionName?: string;
     startTime: number;
@@ -254,6 +272,7 @@ interface PendingAsyncRestore {
     completionName: string;
     /** Deferred guest-callback chain (see ThunkResult.startCallbackChain). Applied at the safe point. */
     startCallbackChain?: (frame: { esp: number; returnAddr: number; mem: Uint8Array }) => boolean;
+    resumeOnOwner?: ThunkResult['resumeOnOwner'];
     /** Consecutive TRANSIENT validation failures (target stack page momentarily non-writable
      *  during CoW/decommit churn). Retried up to ASYNC_RESTORE_MAX_VALIDATION_RETRIES before
      *  escalating, so a transient miss doesn't discard the thread's only completion → park forever. */
@@ -445,6 +464,7 @@ export class ThunkDispatcher {
 
     private activeAsyncThunks: Map<Promise<number | ThunkResult>, ActiveAsyncThunk> = new Map();
     private pendingAsyncRestores: PendingAsyncRestore[] = [];
+    private asyncEpoch = 0;
 
     // Async-park telemetry: per-thunk wall-clock spent parked (spin loop) per thread.
     // This is the idle-classification instrument — names which async thunk drives the
@@ -3406,6 +3426,7 @@ export class ThunkDispatcher {
 
         const tid = System.getInstance().scheduler.getCurrentThreadId();
         const thunkInfo: ActiveAsyncThunk = {
+            epoch: this.asyncEpoch,
             functionId: id,
             functionName: name,
             startTime: performance.now(),
@@ -3444,6 +3465,7 @@ export class ThunkDispatcher {
     }
 
     private _onAsyncComplete(promise: any, res: any, info: ActiveAsyncThunk, _cpu: any, defaultArgCount: number, name: string, asyncStart: number): void {
+        if (info.epoch !== undefined && info.epoch !== this.asyncEpoch) return;
         this.activeAsyncThunks.delete(promise);
         this.recordAsyncPark(name, info.threadId ?? 0, performance.now() - info.startTime);
         const duration = frameProfiler.endTimer("thunk", asyncStart);
@@ -3494,6 +3516,7 @@ export class ThunkDispatcher {
             deferredWrites,
             dllInits,
             startCallbackChain,
+            resumeOnOwner: (typeof res === 'object' && res !== null) ? (res as ThunkResult).resumeOnOwner : undefined,
             errorFlag: false,
             completionName: name,
         });
@@ -3512,6 +3535,7 @@ export class ThunkDispatcher {
     }
 
     private _onAsyncError(promise: any, err: any, info: ActiveAsyncThunk, _cpu: any, defaultArgCount: number, name: string, asyncStart: number): void {
+        if (info.epoch !== undefined && info.epoch !== this.asyncEpoch) return;
         this.activeAsyncThunks.delete(promise);
         this.recordAsyncPark(name, info.threadId ?? 0, performance.now() - info.startTime);
 
@@ -3749,7 +3773,9 @@ export class ThunkDispatcher {
                 scheduler.wakeThreadForAsyncCompletion(currentTid);     // WAITING→READY (idempotent)
                 scheduler.markThreadRunningAfterAsyncWake(currentTid, cpu);  // READY→RUNNING + restore this thread's own register file
                 this.applyPendingAsyncRestoreAtSafePoint(pending, cpu);
-                this.pendingAsyncRestores.splice(idx, 1);
+                // A continuation can reset the dispatcher; never remove a new lifetime's completion.
+                const completedIndex = this.pendingAsyncRestores.indexOf(pending);
+                if (completedIndex >= 0) this.pendingAsyncRestores.splice(completedIndex, 1);
                 (scheduler as any).traceTimerEvent?.(currentTid,
                     `restoreApplied ${pending.completionName} ret=0x${((pending.info.returnAddr ?? 0) >>> 0).toString(16)}`);
                 return true;  // applied this tick → caller early-returns
@@ -3782,6 +3808,7 @@ export class ThunkDispatcher {
     private classifyPendingAsyncRestore(pending: PendingAsyncRestore, source: string): { ok: boolean; transient: boolean; reason: string } {
         const scheduler: any = this.ensureScheduler();
         const info = pending.info;
+        if (info.epoch !== undefined && info.epoch !== this.asyncEpoch) return { ok: false, transient: false, reason: 'stale-dispatcher-epoch' };
         if (info.threadId === undefined) return { ok: false, transient: false, reason: 'no-threadId' };
         if (info.esp === undefined) return { ok: false, transient: false, reason: 'missing-park-esp' };
 
@@ -3907,6 +3934,59 @@ export class ThunkDispatcher {
     }
 
     private applyPendingAsyncRestoreAtSafePoint(pending: PendingAsyncRestore, cpu: any): void {
+        if (pending.resumeOnOwner) {
+            const scheduler = this.ensureScheduler();
+            const epoch = this.asyncEpoch;
+            const owner = pending.info.threadId;
+            const valid = this.classifyPendingAsyncRestore(pending, 'resumeOnOwner:before');
+            if (!valid.ok || owner === undefined || scheduler.getCurrentThreadId() !== owner) {
+                this.rejectPendingAsyncRestore(pending, cpu, 'resumeOnOwner:before', valid.ok ? 'foreign-owner-thread' : valid.reason);
+                return;
+            }
+            const resume = pending.resumeOnOwner;
+            pending.resumeOnOwner = undefined; // one invocation even when the result is invalid
+            this.updateMemoryCache();
+            try {
+                if (!this.cachedMem8?.byteLength) throw new Error('guest memory unavailable');
+                const result = resume({ esp: pending.info.esp!, returnAddr: pending.info.returnAddr! >>> 0, mem: this.cachedMem8 });
+                if (typeof result !== 'number' && (!result || typeof result !== 'object' || 'then' in result || 'resumeOnOwner' in result)) {
+                    throw new TypeError('resumeOnOwner must return a synchronous value or OwnerThunkResult');
+                }
+                const value = typeof result === 'number' ? result : result.value;
+                if (!Number.isFinite(value)) throw new TypeError('resumeOnOwner returned an invalid value');
+                const nextCleanup = typeof result === 'object' ? result.stackCleanup : undefined;
+                const nextWrites = typeof result === 'object' ? result.deferredWrites : pending.deferredWrites;
+                const nextInits = typeof result === 'object' ? result.dllInits : pending.dllInits;
+                const nextChain = typeof result === 'object' ? result.startCallbackChain : pending.startCallbackChain;
+                if (nextCleanup !== undefined && (!Number.isSafeInteger(nextCleanup) || nextCleanup < 0 || nextCleanup > 65535)) throw new TypeError('invalid owner stack cleanup');
+                if (nextWrites !== undefined && !Array.isArray(nextWrites)) throw new TypeError('invalid owner deferred writes');
+                if (nextInits !== undefined && !Array.isArray(nextInits)) throw new TypeError('invalid owner DLL initializers');
+                if (nextChain !== undefined && typeof nextChain !== 'function') throw new TypeError('invalid owner callback chain');
+                // Read all properties before committing: a throwing getter must preserve the failure return.
+                pending.returnValue = value >>> 0;
+                if (nextCleanup !== undefined) pending.cleanupBytes = nextCleanup >>> 0;
+                pending.deferredWrites = nextWrites;
+                pending.dllInits = nextInits;
+                pending.startCallbackChain = nextChain;
+            } catch (error) {
+                Logger.error(LogCategory.THUNK, `resumeOnOwner (${pending.completionName}) failed: ${error}`);
+                pending.errorFlag = true;
+                pending.deferredWrites = undefined;
+                pending.dllInits = undefined;
+                pending.startCallbackChain = undefined;
+            }
+            // A host continuation may trigger reset/exit. Never restore a dead frame or a foreign CPU.
+            if (epoch !== this.asyncEpoch) return;
+            if (scheduler.getCurrentThreadId() !== owner) {
+                this.rejectPendingAsyncRestore(pending, cpu, 'resumeOnOwner:after', 'owner-changed-during-continuation');
+                return;
+            }
+            const after = this.classifyPendingAsyncRestore(pending, 'resumeOnOwner:after');
+            if (!after.ok) {
+                this.rejectPendingAsyncRestore(pending, cpu, 'resumeOnOwner:after', after.reason);
+                return;
+            }
+        }
         const { info, returnValue, cleanupBytes, completionName, deferredWrites, dllInits, startCallbackChain } = pending;
 
         // Deferred guest-callback chain (ThunkResult.startCallbackChain): the async handler described a
@@ -8760,6 +8840,7 @@ export class ThunkDispatcher {
     }
 
     reset(): void {
+        this.asyncEpoch++;
         // The pending registrations below intentionally survive reset and will publish the
         // regenerated stub addresses. First remove descriptors for the old thunk arena.
         this.clearWbufDynarecIntrinsicRegistry();

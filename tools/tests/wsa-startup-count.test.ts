@@ -76,7 +76,11 @@ describe("socket()", () => {
 
         expect(validateSocketTriple(0, SOCK_STREAM, 0)).toBe(WSAEINVAL);
         expect(validateSocketTriple(AF_APPLETALK, SOCK_STREAM, 0)).toBe(WSAEAFNOSUPPORT);
-        expect(validateSocketTriple(AF_INET6, SOCK_RAW, 0)).toBe(WSAESOCKTNOSUPPORT);
+        // RAW/IPv6 is now a real provider (native raw ICMPv6 socket and options oracle).
+        expect(validateSocketTriple(AF_INET6, SOCK_RAW, 0)).toBe(0);
+        expect(validateSocketTriple(AF_INET6, SOCK_RAW, 58)).toBe(0);
+        expect(validateSocketTriple(AF_INET6, SOCK_RAW, 256)).toBe(WSAEPROTONOSUPPORT);
+        expect(validateSocketTriple(AF_INET6, 99, 0)).toBe(WSAESOCKTNOSUPPORT);
         expect(validateSocketTriple(AF_INET, SOCK_STREAM, IPPROTO_UDP)).toBe(WSAEPROTONOSUPPORT);
     });
 

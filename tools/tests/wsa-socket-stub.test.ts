@@ -1,90 +1,63 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { WsaSocketTable, WSAEWOULDBLOCK, WSAENOTSOCK, WSAEINVAL, INVALID_SOCKET,
     makeSocketExports, WsaStartupCount } from "../../src/worker/modules/wsa-stub-shared";
+import { WsaFailure } from "../../src/worker/modules/wsa-network";
+import { LanNetwork } from "../../src/worker/net/lan-network";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
 
-describe("WsaSocketTable", () => {
-    test("socket/connect/send/recv offline semantics", () => {
-        const table = new WsaSocketTable();
-        const s = table.socket();
-        expect(s).toBeGreaterThan(0);
-        expect(table.connect(s)).toBe(0);
-        expect(table.send(s, 128)).toBe(128);
-        expect(table.recv(s)).toBe(-1);
-        expect(table.closesocket(s)).toBe(0);
-        expect(table.isValid(s)).toBe(false);
+const tables: WsaSocketTable[] = [];
+afterEach(() => { for (const table of tables.splice(0)) table.reset(); });
+function make() {
+    const table = new WsaSocketTable(new LanNetwork()); tables.push(table);
+    const counter = new WsaStartupCount(); counter.startup();
+    let lastError = 0;
+    const exports = makeSocketExports(table, value => { lastError = value; }, counter);
+    const memory = new Uint8Array(256); Mem.bind(() => memory);
+    const call = (name: string, args: number[]) => exports[name]({} as never, memory, args);
+    return { table, exports, call, memory, error: () => lastError };
+}
+describe("WsaSocketTable provider boundary", () => {
+    test("invalid socket and missing destination are real failures", () => {
+        const h = make();
+        expect(h.call("send", [999, 8, 4, 0])).toBe(-1); expect(h.error()).toBe(WSAENOTSOCK);
+        const s = h.table.socket();
+        expect(h.call("connect", [s, 0, 0])).toBe(-1); expect(h.error()).toBe(10014);
     });
-
-    test("invalid socket returns errors via table helpers", () => {
-        const table = new WsaSocketTable();
-        expect(table.send(999, 4)).toBe(-1);
-        expect(table.isValid(999)).toBe(false);
-        void WSAEWOULDBLOCK;
-        void WSAENOTSOCK;
-    });
-
     test("empty nonblocking accept returns WSAEWOULDBLOCK and never allocates connections", () => {
-        const table = new WsaSocketTable();
-        const counter = new WsaStartupCount();
-        counter.startup();
-        let error = 0;
-        const exports = makeSocketExports(table, value => { error = value; }, counter);
-        const listener = table.socket();
-        table.listen(listener);
-        table.setNonBlocking(listener, true);
-        const memory = new Uint8Array(32).fill(0x5a);
+        const h = make(), listener = h.table.socket();
+        h.table.listen(listener); h.table.setNonBlocking(listener, true);
         for (let i = 0; i < 1000; i++) {
-            expect(exports.accept(null as never, memory, [listener, 8, 24])).toBe(INVALID_SOCKET);
-            expect(error).toBe(WSAEWOULDBLOCK);
+            expect(h.call("accept", [listener, 0, 0])).toBe(INVALID_SOCKET);
+            expect(h.error()).toBe(WSAEWOULDBLOCK);
         }
-        expect(table.socket()).toBe(listener + 1);
-        expect(memory.every(value => value === 0x5a)).toBe(true);
+        expect(h.table.socket()).toBe(listener + 1);
     });
-
     test("accept rejects non-listening, datagram and closed sockets", () => {
-        const table = new WsaSocketTable();
-        const stream = table.socket();
-        expect(table.acceptError(stream)).toBe(WSAEINVAL);
-        expect(table.accept(stream)).toBe(INVALID_SOCKET);
-        const datagram = table.socket(2);
-        expect(table.listen(datagram)).toBe(-1);
-        expect(table.acceptError(datagram)).toBe(10045);
-        const raw = table.socket(3);
-        expect(table.listen(raw)).toBe(-1);
-        expect(table.acceptError(raw)).toBe(10045);
-        table.closesocket(stream);
-        expect(table.acceptError(stream)).toBe(WSAENOTSOCK);
+        const h = make(), stream = h.table.socket(), datagram = h.table.socket(2);
+        expect(h.call("accept", [stream, 0, 0])).toBe(INVALID_SOCKET); expect(h.error()).toBe(WSAEINVAL);
+        expect(h.call("accept", [datagram, 0, 0])).toBe(INVALID_SOCKET); expect(h.error()).toBe(10045);
+        expect(h.call("listen", [datagram, 5])).toBe(-1); expect(h.error()).toBe(10045);
+        h.table.closesocket(stream);
+        expect(h.call("accept", [stream, 0, 0])).toBe(INVALID_SOCKET); expect(h.error()).toBe(WSAENOTSOCK);
     });
-
-    test("protocol-selected socket type retains stream or datagram listening semantics", () => {
-        const table = new WsaSocketTable();
-        const counter = new WsaStartupCount();
-        counter.startup();
-        let error = 0;
-        const exports = makeSocketExports(table, value => { error = value; }, counter);
-        const memory = new Uint8Array(32);
-        const udp = exports.socket(null as never, memory, [2, 0, 17]) as number;
-        expect(table.listen(udp)).toBe(-1);
-        expect(exports.accept(null as never, memory, [udp, 0, 0])).toBe(INVALID_SOCKET);
-        expect(error).toBe(10045);
-        const tcp = exports.socket(null as never, memory, [2, 0, 6]) as number;
-        expect(table.listen(tcp)).toBe(0);
-        table.setNonBlocking(tcp, true);
-        expect(exports.accept(null as never, memory, [tcp, 0, 0])).toBe(INVALID_SOCKET);
-        expect(error).toBe(WSAEWOULDBLOCK);
+    test("protocol-selected sockets retain stream/datagram semantics", () => {
+        const h = make();
+        const udp = h.call("socket", [2, 0, 17]) as number;
+        expect(h.call("listen", [udp, 5])).toBe(-1); expect(h.error()).toBe(10045);
+        const tcp = h.call("socket", [2, 0, 6]) as number;
+        expect(h.call("listen", [tcp, 5])).toBe(0); h.table.setNonBlocking(tcp, true);
+        expect(h.call("accept", [tcp, 0, 0])).toBe(INVALID_SOCKET); expect(h.error()).toBe(WSAEWOULDBLOCK);
     });
-
-    test("blocking accept stays pending until the listener closes or the table resets", async () => {
-        const table = new WsaSocketTable();
+    test("blocking accept stays parked until cancellation", async () => {
+        const h = make();
         for (const reset of [false, true]) {
-            const listener = table.socket();
-            table.listen(listener);
+            const listener = h.table.socket(); h.table.listen(listener);
             let completed = false;
-            const pending = table.accept(listener) as Promise<number>;
+            const pending = h.call("accept", [listener, 0, 0]) as Promise<any>;
             pending.then(() => { completed = true; });
-            await Promise.resolve();
-            expect(completed).toBe(false);
-            if (reset) table.reset(); else table.closesocket(listener);
-            expect(await pending).toBe(INVALID_SOCKET);
+            await Promise.resolve(); expect(completed).toBe(false);
+            if (reset) h.table.reset(); else h.table.closesocket(listener);
+            expect((await pending).value).toBe(INVALID_SOCKET); expect(h.error()).toBe(10004);
         }
     });
 });

@@ -1,5 +1,5 @@
 
-import { ThunkDispatcher } from './thunking/thunk-dispatcher';
+import { ThunkDispatcher, type DeferredWrite } from './thunking/thunk-dispatcher';
 import { toPlainGuestMemory } from './memory/guest-memory';
 import { PELoader } from './pe-loader';
 import { SystemResourceProvider } from './resources/system-resource-provider';
@@ -997,6 +997,12 @@ export class Process {
     // this so they self-invalidate after an in-place reset — the Process object
     // identity stays the same across reset(), so identity alone can't detect it.
     resetGeneration: number = 0;
+    private readonly resetListeners = new Set<() => void>();
+
+    onReset(listener: () => void): () => void {
+        this.resetListeners.add(listener);
+        return () => this.resetListeners.delete(listener);
+    }
 
     constructor(
         private getMemory: () => Uint8Array,
@@ -1083,6 +1089,34 @@ export class Process {
         return toPlainGuestMemory(this.getMemory());
     }
 
+    /**
+     * Publish an asynchronous device completion between guest execution turns.
+     * The caller owns only addresses and copied values, never a borrowed RAM view.
+     * Reset invalidates the entire completion before it can signal an event/APC.
+     */
+    enqueueCompletion(writes: readonly DeferredWrite[], afterPublish: (published: boolean) => void, isCurrent?: () => boolean): void {
+        const generation = this.resetGeneration;
+        const copied = writes.map(write => ({ ...write }));
+        queueMicrotask(() => {
+            if (generation !== this.resetGeneration || (isCurrent && !isCurrent())) return;
+            const valid = copied.every(write =>
+                Number.isInteger(write.address) && write.address > 0 &&
+                Number.isInteger(write.value) && [1, 2, 4, 8].includes(write.size) &&
+                this.addressSpace.validateRange(write.address, write.size, 'w'));
+            if (!valid) { afterPublish(false); return; }
+            let published = true;
+            for (const write of copied) {
+                const bytes = new Uint8Array(write.size);
+                let value = BigInt.asUintN(write.size * 8, BigInt(write.value));
+                for (let index = 0; index < bytes.length; index++, value >>= 8n) bytes[index] = Number(value & 255n);
+                // AddressSpace owns its fresh memory getter; Mem's global binding may
+                // currently belong to a different Process in a host-side test/pump.
+                if (this.addressSpace.write(write.address, bytes) !== bytes.length) { published = false; break; }
+            }
+            afterPublish(published);
+        });
+    }
+
     allocateMemory(size: number): number {
         return this.memory.alloc(size);
     }
@@ -1121,6 +1155,8 @@ export class Process {
      * Reset process state - clear memory, dispatcher state, and restore default environment
      */
     async reset(): Promise<void> {
+        this.resetGeneration++;
+        for (const listener of [...this.resetListeners]) listener();
         this.dispatcher.callbackManager?.cancelDirectCalls();
         // --- Zero out memory regions ---
         const mem = this.getMemory();
@@ -1156,7 +1192,6 @@ export class Process {
         this.thunkMemoryManager.reset();
         // Thunk stubs are regenerated below — bump the generation so address-keyed
         // caches (kernel32 GetProcAddress) drop stale pre-reset stub addresses.
-        this.resetGeneration++;
         this.moduleRegistry.reset();
         this.loader.resetCaches();
 

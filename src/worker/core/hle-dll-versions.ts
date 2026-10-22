@@ -40,6 +40,8 @@ const HLE_DLL_VERSION: Record<string, { major: number; minor: number; build: num
     // DirectX 8.1 — d3d8/dinput8 expose the 8.x interfaces.
     d3d8: { major: 4, minor: 8, build: 1, revision: 881 },
     dinput8: { major: 4, minor: 8, build: 1, revision: 881 },
+    dpnet: { major: 4, minor: 8, build: 1, revision: 881 },
+    dpnlobby: { major: 4, minor: 8, build: 1, revision: 881 },
     dpnhpast: { major: 4, minor: 8, build: 1, revision: 881 },
     dpnhupnp: { major: 4, minor: 8, build: 1, revision: 881 },
     // DirectX 9.0c.

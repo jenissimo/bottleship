@@ -42,7 +42,7 @@ let ownerGeneration = -1;
  * that answers a module WALK (VirtualQuery over the address space, then ask each base for
  * its name) must consult this, or it invents loaded modules: SmartHeap's shw32.dll walks
  * exactly like that, concludes the app links a foreign MSVC runtime, and refuses to start.
- * Populated by the name -> base handouts, which is what "the process asked for it" means.
+ * Populated by bound imports and successful explicit LoadLibrary calls; lookups are read-only.
  */
 let loadedNames = new Set<string>();
 /**
@@ -81,8 +81,8 @@ function slotKeys(dllName: string): string[] {
 }
 
 /**
- * Record an HLE'd DLL as loaded: its imports were bound into a PE image, or the guest
- * asked for its handle by name. Deliberately NOT inside hleImageBase — our own warmup
+ * Record an HLE'd DLL as loaded: its imports were bound into a PE image, or an explicit
+ * LoadLibrary succeeded. Deliberately NOT inside hleImageBase — our own warmup
  * loops resolve every known module's base, and marking there would vouch for all of them.
  */
 export function markHleModuleLoaded(dllName: string): void {

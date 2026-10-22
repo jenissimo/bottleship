@@ -75,6 +75,7 @@ export function describeSyncRing(limit = SYNC_RING_SIZE): SyncRingEntry[] {
 export class SyncObjectManager {
     private resourceProvider = SystemResourceProvider.getInstance();
     private eventHandles = new Set<number>();
+    private eventAliasGroups = new WeakMap<KernelEventObject, Set<number>>();
     private semaphoreHandles = new Set<number>();
     private mutexHandles = new Set<number>();
 
@@ -121,6 +122,46 @@ export class SyncObjectManager {
         this.eventHandles.add(handle);
         hypercallDataManager.registerEventMirror(handle, manualReset, initialState);
         return handle;
+    }
+
+    /**
+     * Aliases share one state word. The byte-per-handle WASM fast path cannot express
+     * that sharing, so hand this particular event back to JS before publishing an alias.
+     * Events that have never been duplicated retain the WASM fast path.
+     */
+    duplicateEvent(handle: number): number | null {
+        const event = this._getEvent(handle);
+        if (!event) return null;
+        const state = this._getEventState(event, handle);
+        event.signaled = state.signaled; event.pendingWake = state.pendingWake;
+        event.manualReset = state.manualReset;
+        this.eventHandles.add(handle);
+        const aliases = this.eventAliasGroups.get(event) ?? new Set([handle]);
+        for (const alias of aliases) hypercallDataManager.unregisterEventMirror(alias);
+        const duplicate = this.resourceProvider.registerKernelObject(event);
+        this.eventHandles.add(duplicate); aliases.add(duplicate); this.eventAliasGroups.set(event, aliases);
+        hypercallDataManager.unregisterEventMirror(duplicate);
+        return duplicate;
+    }
+
+    getEventAliases(handle: number): number[] {
+        const event = this._getEvent(handle); if (!event) return [];
+        const group = this.eventAliasGroups.get(event); if (!group) return [handle];
+        const aliases: number[] = [];
+        for (const alias of group) {
+            if (this._getEvent(alias) !== event) { group.delete(alias); this.eventHandles.delete(alias); continue; }
+            aliases.push(alias);
+        }
+        return aliases;
+    }
+
+    closeEvent(handle: number): boolean {
+        const event = this._getEvent(handle); if (!event) return false;
+        this.eventAliasGroups.get(event)?.delete(handle);
+        this.eventHandles.delete(handle);
+        hypercallDataManager.unregisterEventMirror(handle);
+        this.resourceProvider.unregisterKernelObject(handle);
+        return true;
     }
 
     setEvent(handle: number): boolean {
@@ -329,7 +370,7 @@ export class SyncObjectManager {
         for (const h of this.eventHandles) this.resourceProvider.unregisterKernelObject(h);
         for (const h of this.semaphoreHandles) this.resourceProvider.unregisterKernelObject(h);
         for (const h of this.mutexHandles) this.resourceProvider.unregisterKernelObject(h);
-        this.eventHandles.clear();
+        this.eventHandles.clear(); this.eventAliasGroups = new WeakMap();
         this.semaphoreHandles.clear();
         this.mutexHandles.clear();
         hypercallDataManager.clearEventMirrors();

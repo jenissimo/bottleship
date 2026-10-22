@@ -27,6 +27,9 @@ import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from '../../core/diagnostics/l
 import { ioTraceRing } from '../../core/debug/io-trace-ring';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { postFileIoCompletion, abandonIoCompletionWaiters, dissociateIoCompletionHandle } from './sync';
+import { cancelWsaIo, hasWsaSocket, getWsaNativeSocketTable } from '../wsa-stub-shared';
+import { trySocketFileIo, cancelSocketFileIo } from './socket-file-io';
+import { installReadFileEx, cancelFileReadEx } from './file-io-ex';
 
 const readFileFirstLogged = new Set<number>();
 let shortReadLogCount = 0;
@@ -311,10 +314,16 @@ const fileIoModule = (() => {
 
     // BOOL CancelIo(HANDLE hFile)
     // Cancels all pending async I/O operations issued by the calling thread for hFile.
-    // BottleShip completes all file I/O synchronously, so there is never anything to
-    // cancel. We validate the handle enough to catch bogus pointers and succeed quietly.
+    // Socket operations and ReadFileEx can remain pending and must complete with
+    // ERROR_OPERATION_ABORTED on their original completion path.
     exports['CancelIo'] = (ctx, mem, args) => {
         const hFile = args[0] >>> 0;
+        const system = System.getInstance();
+        const cancelled = system.process ? cancelWsaIo(system.process, hFile, 0, system.scheduler.getCurrentThreadId()) : null;
+        if (cancelled !== null) {
+            cancelSocketFileIo(system.process!, hFile, 0, system.scheduler.getCurrentThreadId());
+            return 1;
+        }
 
         // Pseudo-handles for standard streams — always OK.
         if (hFile === 0 || hFile === 1 || hFile === 2) {
@@ -330,29 +339,37 @@ const fileIoModule = (() => {
             return 0; // FALSE
         }
 
-        Logger.verbose(LogCategory.KERNEL32, `CancelIo(0x${hFile.toString(16)}) -> TRUE (no pending I/O)`);
+        if (system.process) cancelFileReadEx(system.process, hFile, 0, system.scheduler.getCurrentThreadId());
         System.getInstance().scheduler.setLastError(0);
         return 1; // TRUE
     };
 
     // BOOL CancelIoEx(HANDLE hFile, LPOVERLAPPED lpOverlapped)
-    // Unlike CancelIo, finding nothing to cancel is a failure: ERROR_NOT_FOUND. Every
-    // operation here has completed before its issuing call returns, so that is the answer
-    // for any live handle.
+    // Unlike CancelIo, finding nothing to cancel is a failure: ERROR_NOT_FOUND.
+    // lpOverlapped selects one operation; NULL cancels every issuing thread's I/O.
     exports['CancelIoEx'] = (_ctx, _mem, args) => {
         const hFile = args[0] >>> 0;
-        const sched = System.getInstance().scheduler;
+        const system = System.getInstance(), sched = system.scheduler;
+        const socketCancelled = system.process ? cancelWsaIo(system.process, hFile, args[1] >>> 0) : null;
+        const cancelled = socketCancelled === null ? null : socketCancelled + cancelSocketFileIo(system.process!, hFile, args[1] >>> 0);
+        if (cancelled !== null) {
+            if (!cancelled) sched.setLastError(ERROR_NOT_FOUND);
+            return { value: cancelled ? 1 : 0, stackCleanup: 8 };
+        }
         const isStd = hFile === 0 || hFile === 1 || hFile === 2;
         if (!isStd && !System.getInstance().resourceProvider.getFileHandle(hFile)) {
             sched.setLastError(ERROR_INVALID_HANDLE);
             return { value: 0, stackCleanup: 8 };
         }
-        sched.setLastError(ERROR_NOT_FOUND);
-        return { value: 0, stackCleanup: 8 };
+        const fileCancelled = system.process ? cancelFileReadEx(system.process, hFile, args[1] >>> 0) : 0;
+        if (!fileCancelled) sched.setLastError(ERROR_NOT_FOUND);
+        return { value: fileCancelled ? 1 : 0, stackCleanup: 8 };
     };
 
     exports['GetFileType'] = (ctx, mem, args) => {
         const hFile = args[0];
+        const process = System.getInstance().process;
+        if (process && hasWsaSocket(process, hFile)) return 3; // FILE_TYPE_PIPE
         Logger.verbose(LogCategory.KERNEL32, `GetFileType(0x${hFile.toString(16)})`);
 
         // FILE_TYPE_CHAR = 0x02 for console handles
@@ -367,7 +384,9 @@ const fileIoModule = (() => {
             return 0x02; // FILE_TYPE_CHAR
         }
 
-        return 0x01; // FILE_TYPE_DISK
+        if (fileHandle) return 0x01; // FILE_TYPE_DISK
+        System.getInstance().scheduler.setLastError(6); // ERROR_INVALID_HANDLE
+        return 0; // FILE_TYPE_UNKNOWN
     };
 
     registerFileIoCommExports(exports);
@@ -1159,95 +1178,23 @@ const fileIoModule = (() => {
         return exports['MapViewOfFile']!(ctx, mem, args) as Promise<number>;
     };
 
-    /**
-     * BOOL ReadFileEx(HANDLE, LPVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE)
-     *
-     * The APC form of an overlapped read: the completion routine — not an event, not a
-     * completion port — is what tells the ISSUING thread the request finished, and Windows
-     * runs it only while that thread sits in an alertable wait. We satisfy the read here
-     * and queue the routine; the alertable waits drain the queue. A stub instead leaves a
-     * streaming engine waiting on a completion that can never arrive (CryEngine hangs its
-     * whole level load on it), which looks like a deadlock nowhere near the read.
-     */
-    exports['ReadFileEx'] = (ctx, mem, args) => {
-        const hFile = args[0] >>> 0;
-        const lpBuffer = args[1] >>> 0;
-        const nNumberOfBytesToRead = args[2] >>> 0;
-        const lpOverlapped = args[3] >>> 0;
-        const lpCompletionRoutine = args[4] >>> 0;
-        const sched = System.getInstance().scheduler;
-
-        if (!lpOverlapped || lpOverlapped + 20 > mem.length) {
-            sched.setLastError(ERROR_INVALID_PARAMETER);
-            return 0;
-        }
-        const fileHandle = System.getInstance().resourceProvider.getFileHandle(hFile);
-        if (!fileHandle || isConsoleDeviceHandle(fileHandle)) {
-            sched.setLastError(ERROR_INVALID_HANDLE);
-            return 0;
-        }
-
-        // ReadFileEx ALWAYS takes its offset from OVERLAPPED and never advances the file
-        // pointer — the handle's own cursor belongs to whoever else is reading it, so the read
-        // runs over a DUPLICATE cursor (CLAUDE.md 3.2) rather than a save/restore that an await
-        // would tear.
-        const ovView = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-        const offset = ovView.getUint32(lpOverlapped + 8, true);
-        const wrapper = fileHandle as FileHandleWrapper;
-        const vfs = System.getInstance().fileSystem;
-        const cursor = vfs.duplicateHandle(wrapper.vfsHandle, offset);
-
-        const complete = (bytesRead: number): number => {
-            const freshMem = Mem.getView() || mem;
-            const outView = new DataView(freshMem.buffer, freshMem.byteOffset, freshMem.byteLength);
-            outView.setUint32(lpOverlapped, 0, true);              // Internal = STATUS_SUCCESS
-            outView.setUint32(lpOverlapped + 4, bytesRead, true);   // InternalHigh = bytes transferred
-
-            const tid = sched.getCurrentThread()?.id ?? 0;
-            if (lpCompletionRoutine && tid) {
-                sched.queueIoCompletionApc(tid, lpCompletionRoutine, 0, bytesRead, lpOverlapped);
-            }
-            Logger.log(LogCategory.KERNEL32,
-                `ReadFileEx(h=0x${hFile.toString(16)}, size=${nNumberOfBytesToRead}, offset=${offset}) -> ` +
-                `${bytesRead} byte(s), APC=0x${lpCompletionRoutine.toString(16)} on T${tid}`);
-            sched.setLastError(0);
-            return 1;
-        };
-
-        // null from the sync attempt is "not available synchronously", NOT end of file. Reporting
-        // it as a 0-byte SUCCESS would hand the completion routine a truncated file — a wrong
-        // answer the caller cannot detect — so the miss goes to the async read instead.
-        if (lpBuffer && lpBuffer + nNumberOfBytesToRead <= mem.length) {
-            const sync = vfs.readIntoSync(cursor, mem, lpBuffer, nNumberOfBytesToRead, "park-preferred");
-            if (sync !== null) return complete(sync);
-        } else {
-            const data = vfs.readSync(cursor, nNumberOfBytesToRead, "park-preferred");
-            if (data !== null) return complete(MemoryGuard.writeBytes(mem, lpBuffer, data, "ReadFileEx"));
-        }
-
-        return (async (): Promise<ThunkResult> => {
-            let bytesRead = 0;
-            try {
-                const freshMem = Mem.getView();
-                if (freshMem && lpBuffer && lpBuffer + nNumberOfBytesToRead <= freshMem.length) {
-                    bytesRead = await vfs.readInto(cursor, () => Mem.getView()!, lpBuffer, nNumberOfBytesToRead);
-                } else {
-                    const data = await vfs.read(cursor, nNumberOfBytesToRead);
-                    bytesRead = MemoryGuard.writeBytes(Mem.getView() || mem, lpBuffer, data, "ReadFileEx");
-                }
-            } catch (e) {
-                Logger.warn(LogCategory.KERNEL32, `ReadFileEx async read failed: ${e}`);
-            }
-            return { value: complete(bytesRead), stackCleanup: 20 };
-        })();
-    };
+    installReadFileEx(exports);
 
     exports['ReadFile'] = (ctx, mem, args) => {
+        const socketResult = trySocketFileIo('read', args);
+        if (socketResult !== null) return socketResult;
         const hFile = args[0];
         const lpBuffer = args[1];
         const nNumberOfBytesToRead = (args[2] >>> 0) as number;
-        const lpNumberOfBytesRead = args[3];
+        const lpNumberOfBytesRead = args[3] >>> 0;
         const lpOverlapped = args[4];
+        if (lpNumberOfBytesRead) {
+            if (!System.getInstance().process?.addressSpace.validateRange(lpNumberOfBytesRead, 4, 'w')) {
+                System.getInstance().scheduler.setLastError(998); // ERROR_NOACCESS
+                return 0;
+            }
+            Mem.writeUint32(lpNumberOfBytesRead, 0);
+        }
 
         const espEntry = ctx.esp;
         const eipEntry = ctx.eip;
@@ -1488,12 +1435,21 @@ const fileIoModule = (() => {
     };
 
     exports['WriteFile'] = (ctx, mem, args) => {
+        const socketResult = trySocketFileIo('write', args);
+        if (socketResult !== null) return socketResult;
         const perfStart = performance.now();
         const hFile = args[0];
         const lpBuffer = args[1];
         const nNumberOfBytesToWrite = args[2];
-        const lpNumberOfBytesWritten = args[3];
+        const lpNumberOfBytesWritten = args[3] >>> 0;
         const lpOverlapped = args[4];
+        if (lpNumberOfBytesWritten) {
+            if (!System.getInstance().process?.addressSpace.validateRange(lpNumberOfBytesWritten, 4, 'w')) {
+                System.getInstance().scheduler.setLastError(998); // ERROR_NOACCESS
+                return 0;
+            }
+            Mem.writeUint32(lpNumberOfBytesWritten, 0);
+        }
 
         /**
          * Complete an overlapped write the way the OS does: the OVERLAPPED's status
@@ -2002,24 +1958,34 @@ const fileIoModule = (() => {
 
     // CloseHandle is now synchronous - overlay flush is fire-and-forget
     exports['CloseHandle'] = (ctx, mem, args) => {
-        const hObject = args[0];
+        const hObject = args[0] >>> 0;
 
         Logger.verbose(LogCategory.KERNEL32, `CloseHandle(0x${hObject.toString(16)})`);
         readFileFirstLogged.delete(hObject);
-        // Handle values are recycled: a completion-port binding must die with the handle
-        // that owns it, or the next file to get this value posts into someone else's port.
+        const system = System.getInstance(), process = system.process;
+        const socketTable = process && getWsaNativeSocketTable(process, hObject);
+        if (socketTable) {
+            // Closing the native descriptor neither loads Winsock nor imports an alias.
+            // The actor releases only this owner's reference and notifies pending I/O.
+            socketTable.nativeHandleView.closesocket(hObject);
+            return 1;
+        }
+        // VFS bindings use the numeric handle. Socket bindings follow their shared
+        // file object and are released when its last alias in this process closes.
         dissociateIoCompletionHandle(hObject);
-
-        const resourceProvider = System.getInstance().resourceProvider;
+        const resourceProvider = system.resourceProvider;
         const resource = resourceProvider.getResource(hObject);
 
         if (!resource) {
+            system.scheduler.setLastError(6); // ERROR_INVALID_HANDLE
             return 0; // FALSE
         }
 
         try {
             switch (resource.type) {
                 case 'file_handle':
+                    const process = System.getInstance().process;
+                    if (process) cancelFileReadEx(process, hObject);
                     const fileHandle = resource.resource;
 
                     // Check if this is a console device handle

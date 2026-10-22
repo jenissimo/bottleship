@@ -47,7 +47,7 @@ const PEB_SIZE = 0x230;
 const TLS_MINIMUM_AVAILABLE = 64;
 const TLS_ARRAY_SIZE = TLS_MINIMUM_AVAILABLE * 4; // 64 slots * 4 bytes each
 
-const FAKE_PID = 1234;
+import { currentProcessId } from './process-identity';
 
 // PEB field offsets
 const PEB_BEING_DEBUGGED       = 0x02; // BOOLEAN (byte)
@@ -291,7 +291,7 @@ export class TebManager {
         view.setUint32(tebAddress + TEB_STACK_BASE, stackTop, true);        // StackBase (highest)
         view.setUint32(tebAddress + TEB_STACK_LIMIT, stackBase, true);      // StackLimit (lowest)
         view.setUint32(tebAddress + TEB_SELF, tebAddress, true);            // Self pointer
-        view.setUint32(tebAddress + TEB_CLIENT_ID_PROCESS, FAKE_PID, true); // PID
+        view.setUint32(tebAddress + TEB_CLIENT_ID_PROCESS, currentProcessId, true); // PID
         view.setUint32(tebAddress + TEB_CLIENT_ID_THREAD, threadId, true);  // TID
         view.setUint32(tebAddress + TEB_TLS_POINTER, tlsArrayAddress, true);// TLS array
         view.setUint32(tebAddress + TEB_PEB, this.pebAddress, true);        // PEB

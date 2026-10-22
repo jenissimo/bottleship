@@ -1,6 +1,8 @@
 
 import { Process } from "./process";
 import { stopChildProcesses, hasChildSession } from "./child-process";
+import { finishProcessNetworkLifetime } from "./process-network";
+import { finishProcessIpcLifetime } from "./process-ipc";
 import { WindowManager } from "../runtime/windowing/window-manager";
 import { GDIContext } from "../modules/gdi32/context";
 import { InputManager } from "../runtime/input/input-manager";
@@ -512,20 +514,26 @@ export class System {
     postProcessExitWhenDurable(payload: Record<string, unknown>): void {
         if (this.exitNotified) return;
         this.exitNotified = true;
+        finishProcessIpcLifetime();
+        const exitingProcess = this.process, generation = exitingProcess?.resetGeneration;
+        const currentLifetime = () => this.process === exitingProcess && this.process?.resetGeneration === generation;
+        const networkFinished = Promise.resolve().then(() => {
+            if (currentLifetime()) return finishProcessNetworkLifetime();
+        }).catch(error => Logger.warn(LogCategory.SYSTEM, `process exit: network drain failed: ${error}`));
         if (hasChildSession()) {
             this.brokerExit = payload;
             // Guest threads have exited; this worker still owns the live child's VFS.
             // The child reports its own final exit over the page's foreground port.
             const notifyParent = this.onProcessExit;
-            void stopChildProcesses(true).then(() => this.drainDurableState())
-                .then(() => notifyParent?.({ ...payload, broker: true }))
+            void Promise.all([stopChildProcesses(true), networkFinished]).then(() => this.drainDurableState())
+                .then(() => { if (currentLifetime()) notifyParent?.({ ...payload, broker: true }); })
                 .catch(error => Logger.warn(LogCategory.SYSTEM, `parent exit flush failed: ${error}`));
             return;
         }
         const childrenStopped = stopChildProcesses();
         if (this.onProcessExit) {
             const onExit = this.onProcessExit;
-            void childrenStopped.then(() => onExit(payload));
+            void Promise.all([childrenStopped, networkFinished]).then(() => { if (currentLifetime()) onExit(payload); });
             return;
         }
         // A launcher exiting into its own re-exec is a restart, not an exit — but the
@@ -534,7 +542,7 @@ export class System {
         const notifyHost = !this.isReExecPending;
         let posted = false;
         const post = (): void => {
-            if (posted || !notifyHost) return;
+            if (posted || !notifyHost || !currentLifetime()) return;
             posted = true;
             try {
                 (self as unknown as { postMessage: (m: unknown) => void })
@@ -546,7 +554,7 @@ export class System {
                 `process exit: flushAll did not drain within ${System.EXIT_FLUSH_BUDGET_MS}ms — notifying host anyway`);
             post();
         }, System.EXIT_FLUSH_BUDGET_MS) as unknown as number;
-        childrenStopped.then(() => this.drainDurableState())
+        Promise.all([childrenStopped.then(() => this.drainDurableState()), networkFinished])
             .catch((e) => Logger.warn(LogCategory.SYSTEM, `process exit: flushAll failed: ${e}`))
             .then(() => { clearTimeout(budget); post(); });
     }
@@ -916,6 +924,7 @@ export class System {
      */
     async reset(): Promise<void> {
         this.brokerExit = null;
+        finishProcessIpcLifetime();
         await stopChildProcesses();
         this.executableCommandLine = null;
         this.onProcessExit = null;

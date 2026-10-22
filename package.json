@@ -12,6 +12,8 @@
     "dev:ssl": "VITE_SSL=1 bun run dev",
     "dev:sidecar": "bun run tools/dev-sidecar/dev-sidecar.ts",
     "dev:logs": "bun run tools/dev-sidecar/dev-sidecar.ts",
+    "dev:lan": "bun run packages/lan/src/cli.ts",
+    "test:lan": "bun test packages/lan/test src/worker/net tools/tests/lan-*.test.ts tools/tests/wsa-*.test.ts tools/tests/directplay*.test.ts",
     "dev:all": "concurrently -n \"sidecar,vite\" -c \"cyan,magenta\" \"bun run dev:sidecar\" \"bun run dev\"",
     "build": "bunx --bun vite build",
     "preview": "bunx --bun vite preview",
@@ -101,6 +103,7 @@
     "pako": "^3.0.1",
     "react": "19.2.7",
     "react-dom": "19.2.7",
+    "socket.io-client": "^4.8.1",
     "v86": "file:vendor/v86"
   },
   "devDependencies": {

@@ -134,6 +134,7 @@ BottleShip is free and open source. If it brought a game back to life for you, y
 - [Development & self-hosting](docs/development.md)
 - [Release notes](docs/releases/0.7.md) · [Versioning](docs/releases/README.md)
 - [Automation harness](docs/harness.md) — driving and observing games
+- [Multiplayer](docs/multiplayer.md) — virtual LAN, server setup and API coverage
 - [Child processes](docs/headless-child-processes.md) — execution, display routing and diagnostics
 - [Performance measurements](docs/performance.md) — workload and correctness contracts
 - [Contributing with coding agents](docs/contributing-with-ai.md)

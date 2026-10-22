@@ -73,7 +73,7 @@ test('TerminateThread reaches the single primary child runtime through an alias'
     expect(manager.getExitCodeProcess(proc.processHandle)).toBe(53);
 });
 
-test('reset cancels the child and old completion cannot finish a reused PID', () => {
+test('reset cancels the child, allocates a new identity, and ignores old completion', () => {
     const old = child();
     let cancelled = 0;
     const runtime = { terminate() {}, cancel() { cancelled++; } };
@@ -81,7 +81,8 @@ test('reset cancels the child and old completion cannot finish a reused PID', ()
     manager.reset();
     expect(cancelled).toBe(1);
     const next = child();
-    expect(next.processId).toBe(old.processId);
+    expect(next.processId).toBeGreaterThan(old.processId);
+    expect(manager.isRuntimeCurrent(old.processId, runtime)).toBe(false);
     expect(manager.isRuntimeCurrent(next.processId, runtime)).toBe(false);
     completeOld(99);
     expect(manager.getExitCodeProcess(next.processHandle)).toBe(259);

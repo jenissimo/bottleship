@@ -1,0 +1,29 @@
+{
+  "host": "127.0.0.1",
+  "port": 9001,
+  "allowedOrigins": [
+    "http://localhost:5174"
+  ],
+  "gateway": {
+    "routes": [
+      {
+        "host": "127.0.0.1",
+        "address": "203.0.113.10",
+        "names": [
+          "gameserver.example"
+        ],
+        "ports": [
+          7777
+        ],
+        "protocols": [
+          "tcp",
+          "udp"
+        ]
+      }
+    ],
+    "maxTcpConnections": 128,
+    "maxUdpFlows": 128,
+    "connectTimeoutMs": 10000,
+    "udpIdleTimeoutMs": 60000
+  }
+}

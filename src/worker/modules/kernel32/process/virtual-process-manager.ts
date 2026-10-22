@@ -3,12 +3,21 @@ import { System } from '../../../core/system';
 import { SystemResourceProvider } from '../../../core/resources/system-resource-provider';
 import { MAXIMUM_SUSPEND_COUNT, ERROR_SIGNAL_REFUSED } from '../../../core/scheduler/types';
 import { ERROR_INVALID_HANDLE } from '../../../core/thunking/thunk-errors';
+import type { ChildProcessPreparation } from '../../../core/child-process';
+
+interface ChildRuntime {
+    terminate(exitCode: number): void;
+    cancel(): void;
+    resume?(preparation?: ChildProcessPreparation): void;
+    holdStartup?(): void;
+}
 
 const STILL_ACTIVE = 259;
 const CREATE_SUSPENDED = 0x00000004;
 const AUTO_EXIT_DELAY_MS = 1;
 
-export const VIRTUAL_CURRENT_PROCESS_ID = 1234;
+import { currentProcessId as VIRTUAL_CURRENT_PROCESS_ID, allocateProcessId, getProcessIdentity } from '../../../core/process-identity';
+export { currentProcessId as VIRTUAL_CURRENT_PROCESS_ID } from '../../../core/process-identity';
 
 export interface VirtualProcessInfo {
     processHandle: number;
@@ -53,6 +62,7 @@ interface VirtualThreadRecord {
     autoExitTimerId: ReturnType<typeof setTimeout> | null;
     runtimeBacked: boolean;
     context: VirtualThreadContext;
+    startupPreparation?: ChildProcessPreparation;
 }
 
 interface VirtualProcessRecord {
@@ -67,7 +77,7 @@ interface VirtualProcessRecord {
     primaryThreadHandle: number;
     primaryThreadId: number;
     isCurrentProcess: boolean;
-    runtime?: { terminate(exitCode: number): void; cancel(): void };
+    runtime?: ChildRuntime;
 }
 
 interface CreateVirtualProcessParams {
@@ -90,7 +100,6 @@ export class VirtualProcessManager {
     private processesByPid = new Map<number, VirtualProcessRecord>();
     private threadsByHandle = new Map<number, VirtualThreadRecord>();
     private threadsByTid = new Map<number, VirtualThreadRecord>();
-    private nextPid = 5000;
     private nextTid = 0x100000;
     private currentProcessHandle = 0;
 
@@ -142,7 +151,7 @@ export class VirtualProcessManager {
         const process: VirtualProcessRecord = {
             handle,
             pid: VIRTUAL_CURRENT_PROCESS_ID,
-            parentPid: 0,
+            parentPid: getProcessIdentity().parentPid,
             imageName,
             commandLine,
             currentDirectory: 'C:\\',
@@ -204,12 +213,14 @@ export class VirtualProcessManager {
         };
     }
 
-    private startThreadExecution(thread: VirtualThreadRecord): void {
+    private startThreadExecution(thread: VirtualThreadRecord, preparation?: ChildProcessPreparation): void {
         if (thread.terminated || thread.suspendCount > 0) return;
         if (thread.runtimeBacked) {
-            // Already running for real (see CreateVirtualProcessParams.runtimeBacked); the
-            // runner reports its exit, so there is nothing to fake and nothing to arm.
-            thread.started = true;
+            if (!thread.started) {
+                thread.started = true;
+                thread.startupPreparation = preparation;
+                this.processesByPid.get(thread.processPid)?.runtime?.resume?.(preparation);
+            }
             return;
         }
         if (thread.autoExitTimerId !== null) return;
@@ -260,7 +271,7 @@ export class VirtualProcessManager {
         const scheduler = system.scheduler;
         const processHandle = scheduler.createEvent(true, false);
         const threadHandle = scheduler.createEvent(true, false);
-        const pid = this.nextPid++;
+        const pid = allocateProcessId();
         const tid = this.nextTid++;
         const isSuspended = (params.creationFlags & CREATE_SUSPENDED) !== 0;
         const imageName = this.deriveImageName(params.applicationName, params.commandLine);
@@ -415,7 +426,7 @@ export class VirtualProcessManager {
         return this.threadsByHandle.get(handle >>> 0)?.processPid ?? null;
     }
 
-    resumeThread(handle: number): number | null {
+    resumeThread(handle: number, preparation?: ChildProcessPreparation): number | null {
         this.pruneStaleHandles();
         const thread = this.threadsByHandle.get(handle >>> 0);
         if (!thread) return null;
@@ -427,7 +438,7 @@ export class VirtualProcessManager {
         }
 
         if (thread.suspendCount === 0) {
-            this.startThreadExecution(thread);
+            this.startThreadExecution(thread, preparation);
         }
 
         return prev;
@@ -448,6 +459,10 @@ export class VirtualProcessManager {
             return 0xFFFFFFFF;
         }
         thread.suspendCount++;
+        if (thread.runtimeBacked && prev === 0) {
+            thread.started = false;
+            this.processesByPid.get(thread.processPid)?.runtime?.holdStartup?.();
+        }
         if (thread.autoExitTimerId !== null) {
             clearTimeout(thread.autoExitTimerId);
             thread.autoExitTimerId = null;
@@ -480,10 +495,12 @@ export class VirtualProcessManager {
     }
 
     /** The closure owns a process record, not a handle that the guest may close or a reused PID. */
-    bindRuntime(pid: number, runtime: { terminate(exitCode: number): void; cancel(): void }): (exitCode: number) => void {
+    bindRuntime(pid: number, runtime: ChildRuntime): (exitCode: number) => void {
         const process = this.processesByPid.get(pid);
         if (!process || process.terminated) throw new Error(`Cannot bind child runtime to pid ${pid}`);
         process.runtime = runtime;
+        const primary = this.threadsByTid.get(process.primaryThreadId);
+        if (primary && primary.suspendCount === 0) runtime.resume?.(primary.startupPreparation);
         return exitCode => {
             if (this.processesByPid.get(pid) !== process || process.runtime !== runtime) return;
             this.pruneStaleHandles();
@@ -567,7 +584,6 @@ export class VirtualProcessManager {
         this.processesByPid.clear();
         this.threadsByHandle.clear();
         this.threadsByTid.clear();
-        this.nextPid = 5000;
         this.nextTid = 0x100000;
         this.currentProcessHandle = 0;
     }

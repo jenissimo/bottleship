@@ -9,6 +9,7 @@ import {
 } from "./cpu/emulator-config";
 import { QualityConfig, DEFAULT_QUALITY, mergeQuality } from "./quality-config";
 import { asBufferSource } from "../../dom-buffer";
+import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
 
 // OS Version constants
 export const VER_PLATFORM_WIN32_WINDOWS = 0x1;
@@ -272,6 +273,13 @@ export class EmulatorConfig {
     // OS Version configuration
     public osVersion = { ...DEFAULT_OS_VERSION };
     public graphicsAdapter: GraphicsAdapterConfig | null = null;
+    /** Session preference, inherited by child processes and retained across game loads. */
+    public network: NetworkConfig | null = null;
+
+    setNetwork(value: unknown): NetworkConfig | null {
+        this.network = normalizeNetworkConfig(value);
+        return this.network;
+    }
 
     // Screen resolution configuration
     public screenResolution = { ...DEFAULT_SCREEN_RESOLUTION };

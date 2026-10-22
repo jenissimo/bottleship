@@ -95,6 +95,10 @@ far too much log output to grep. So the harness gives you structured views inste
   module-labelled guest call stack, the recent WinAPI call ring (the last thunks that ran), the
   **unimplemented-stub registry**, recent page faults, and thread states. This is the first
   thing to pull for *any* non-standard situation (froze / vanished / black frame / wild EIP).
+- **Guest IPC lifecycle.** `processIpcState()` reports the existing guest's PID,
+  generation, liveness, pending requests and child routes, plus guest/service handler
+  counts. It remains usable after exit and does not initialize IPC. Use it when
+  verifying a second PE boot in the same Worker or stale lobby endpoints.
 - **Stub registry.** The usual reason a game "gracefully vanishes" is that it called an export
   or vtable slot with no implementation, got a garbage return, and took an "unsupported → exit"
   branch. The stub registry names exactly which unimplemented call it was and who called it.

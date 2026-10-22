@@ -255,8 +255,12 @@ describe("GetOverlappedResultEx", () => {
     test("a completed operation answers its byte count at once", () => {
         view.setUint32(OV, 0, true);          // Internal = STATUS_SUCCESS
         view.setUint32(OV + 4, 321, true);    // InternalHigh
-        expect(call(fileIo, "GetOverlappedResultEx", 0x40, OV, BYTES, INFINITE, 0)).toBe(1);
-        expect(view.getUint32(BYTES, true)).toBe(321);
+        for(const api of ["GetOverlappedResult","GetOverlappedResultEx"]){
+            sched.setLastError(0x2345);
+            expect(call(fileIo,api,0x40,OV,BYTES,api==="GetOverlappedResult"?0:INFINITE,0)).toBe(1);
+            expect(sched.getLastError()).toBe(0);
+            expect(view.getUint32(BYTES,true)).toBe(321);
+        }
     });
 
     test("a pending operation with a zero timeout is ERROR_IO_INCOMPLETE", () => {
@@ -269,11 +273,12 @@ describe("GetOverlappedResultEx", () => {
         const hEvent = sched.createEvent(true, false);
         view.setUint32(OV, 0x103, true);
         view.setUint32(OV + 16, hEvent, true);
+        sched.setLastError(0x4567);
         const r = raw(fileIo, "GetOverlappedResultEx", 0x40, OV, BYTES, INFINITE, 0);
         expect(r.blockedNoSwitch).toBe(true);
         const waiter = (sched as any).threads.get(1) as Thread;
 
-        makeCurrent(2);
+        makeCurrent(2);sched.setLastError(0x9876);
         view.setUint32(OV, 0, true);
         view.setUint32(OV + 4, 77, true);
         sched.setEvent(hEvent);
@@ -281,6 +286,8 @@ describe("GetOverlappedResultEx", () => {
         expect(waiter.context!.eax).toBe(1);
         expect(waiter.context!.esp).toBe(ESP + 24);
         expect(view.getUint32(BYTES, true)).toBe(77);
+        expect(waiter.lastError).toBe(0);
+        expect(sched.getLastError()).toBe(0x9876);
     });
 
     test("a pending operation that times out is FALSE with WAIT_TIMEOUT as the error", () => {

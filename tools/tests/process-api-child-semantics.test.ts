@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { System } from '../../src/worker/core/system';
 import { Mem } from '../../src/worker/core/memory/mem-accessor';
 import { stopChildProcesses, type ChildBoot } from '../../src/worker/core/child-process';
+import { closeProcessNetworkNamespace } from '../../src/worker/core/process-network';
 import { VirtualFileSystem } from '../../src/worker/runtime/filesystem/vfs';
 import { exports as fileApi } from '../../src/worker/modules/kernel32/file-io';
 import { exports as processApi } from '../../src/worker/modules/kernel32/process/process';
@@ -20,14 +21,24 @@ describe('file and child-process API contracts', () => {
     const hostGlobals = new Map<string, PropertyDescriptor | undefined>();
     const memProperties = new Map<string, PropertyDescriptor | undefined>();
     const workers: FakeWorker[] = [];
+    let autoReady = true;
     class FakeWorker {
         onmessage: ((event: { data: unknown }) => void) | null = null;
         onerror: unknown;
         onmessageerror: unknown;
         boot: ChildBoot | null = null;
+        messages: any[] = [];
+        terminated = false;
         constructor() { workers.push(this); }
-        postMessage(message: any) { if (message.type === 'child_boot') this.boot = message; }
-        terminate() {}
+        postMessage(message: any) {
+            this.messages.push(message);
+            if (message.type === 'child_boot') {
+                this.boot = message;
+                if (autoReady) queueMicrotask(() => this.ready());
+            }
+        }
+        ready() { this.onmessage?.({ data: { type: 'child_ready', bootId: this.boot!.bootId, processId: this.boot!.processIdentity!.pid } }); }
+        terminate() { this.terminated = true; }
         exit(code: number) { this.onmessage?.({ data: { type: 'process_exit', exitCode: code } }); }
     }
     function text(value: string, wide = false, at = 512) {
@@ -47,9 +58,16 @@ describe('file and child-process API contracts', () => {
         errorDescriptor = Object.getOwnPropertyDescriptor(system.scheduler, 'setLastError');
         const setLastError = system.scheduler.setLastError;
         system.scheduler.setLastError = code => { lastError = code; setLastError.call(system.scheduler, code); };
-        memory.fill(0); workers.length = 0;
+        memory.fill(0); workers.length = 0; autoReady = true;
         for (const key of ['Worker', 'self']) hostGlobals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
-        Object.defineProperty(globalThis, 'Worker', { configurable: true, writable: true, value: FakeWorker });
+        const RealWorker = globalThis.Worker;
+        class WorkerBoundary extends FakeWorker {
+            constructor(url: string | URL, options?: WorkerOptions) {
+                if (String(url).includes('wsa-actor-worker')) return new RealWorker(url, options) as unknown as WorkerBoundary;
+                super();
+            }
+        }
+        Object.defineProperty(globalThis, 'Worker', { configurable: true, writable: true, value: WorkerBoundary });
         Object.defineProperty(globalThis, 'self', { configurable: true, writable: true, value: { location: { href: 'file:///guest-worker.js' } } });
         for (const key of ['memoryGetter', 'validateRange', 'getRegion']) memProperties.set(key, Object.getOwnPropertyDescriptor(Mem, key));
         Mem.bind(() => memory);
@@ -58,6 +76,7 @@ describe('file and child-process API contracts', () => {
         const bytes = new Uint8Array(256), header = new DataView(bytes.buffer);
         header.setUint16(0, 0x5a4d, true); header.setUint32(0x3c, 64, true);
         header.setUint32(64, 0x4550, true); header.setUint16(68, 0x14c, true);
+        header.setUint32(64 + 24 + 28, 0x400000, true); header.setUint32(64 + 24 + 56, 0x2000, true);
         const entry = { name: 'rom/System/helper.exe', uncompressedSize: bytes.length,
             compressedSize: bytes.length, compression: 0, localHeaderOffset: 0, isDirectory: false } as ZipEntry;
         system.fileSystem.mountRom({ readEntryRangeSync: (_: unknown, off: number, size: number) => bytes.slice(off, off + size),
@@ -65,14 +84,15 @@ describe('file and child-process API contracts', () => {
         } as unknown as ZipArchive, 'rom', new Map([['system/helper.exe', entry]]));
     });
     afterEach(async () => {
-        await stopChildProcesses(); manager.reset();
-        system.fileSystem = savedVfs; system.process = savedProcess;
-        if (errorDescriptor) Object.defineProperty(system.scheduler, 'setLastError', errorDescriptor);
-        else Reflect.deleteProperty(system.scheduler, 'setLastError');
+        // Restore the host boundary before asynchronous namespace teardown can create services.
         for (const [key, descriptor] of hostGlobals) {
             if (descriptor) Object.defineProperty(globalThis, key, descriptor);
             else Reflect.deleteProperty(globalThis, key);
         }
+        await stopChildProcesses(); await closeProcessNetworkNamespace(); manager.reset();
+        system.fileSystem = savedVfs; system.process = savedProcess;
+        if (errorDescriptor) Object.defineProperty(system.scheduler, 'setLastError', errorDescriptor);
+        else Reflect.deleteProperty(system.scheduler, 'setLastError');
         for (const [key, descriptor] of memProperties) {
             if (descriptor) Object.defineProperty(Mem, key, descriptor);
             else Reflect.deleteProperty(Mem, key);
@@ -112,6 +132,53 @@ describe('file and child-process API contracts', () => {
         for (let i = 0; i < 100 && !system.resourceProvider.getKernelObject(handle)?.signaled; i++) await Bun.sleep(1);
         expect(system.resourceProvider.getKernelObject(handle)?.signaled).toBe(true);
         expect(manager.getExitCodeProcess(handle)).toBe(17);
+    });
+    test('CREATE_SUSPENDED maps a separate child before returning PID and resumes it once without replacing its parent', async () => {
+        autoReady = false;
+        const parent = system.process, originalReExec = system.onReExecRequest;
+        let reExecs = 0, returned = false;
+        system.onReExecRequest = () => { reExecs++; return true; };
+        try {
+            const pending = Promise.resolve(processApi.CreateProcessA!(undefined as never, memory,
+                [text('C:\\System\\helper.exe'), 0, 0, 0, 0, 4, 0, 0, 0, 2048])).then(result => { returned = true; return result; });
+            const worker = await booted();
+            expect(returned).toBe(false);
+            expect(Mem.readUint32(2048)).toBe(0);
+            expect(worker.boot!.startSuspended).toBe(true);
+            worker.ready();
+            const result = await pending;
+            expect(typeof result === 'number' ? result : result.value).toBe(1);
+            const processHandle = Mem.readUint32(2048)!, threadHandle = Mem.readUint32(2052)!;
+            expect(Mem.readUint32(2056)).toBe(worker.boot!.processIdentity!.pid);
+            expect(manager.getExitCodeProcess(processHandle)).toBe(259);
+            expect(worker.messages.filter(message => message.type === 'child_resume')).toHaveLength(0);
+
+            expect((processApi.SuspendThread!(undefined as never, memory, [threadHandle]) as {value:number}).value).toBe(1);
+            expect((processApi.ResumeThread!(undefined as never, memory, [threadHandle]) as {value:number}).value).toBe(2);
+            expect(worker.messages.filter(message => message.type === 'child_resume')).toHaveLength(0);
+            expect((processApi.ResumeThread!(undefined as never, memory, [threadHandle]) as {value:number}).value).toBe(1);
+            expect((processApi.ResumeThread!(undefined as never, memory, [threadHandle]) as {value:number}).value).toBe(0);
+            expect(worker.messages.filter(message => message.type === 'child_resume')).toHaveLength(1);
+            expect(reExecs).toBe(0);
+            expect(system.process).toBe(parent);
+            worker.exit(23);
+            for (let i = 0; i < 100 && manager.getExitCodeProcess(processHandle) === 259; i++) await Bun.sleep(1);
+            expect(manager.getExitCodeProcess(processHandle)).toBe(23);
+            expect(system.process).toBe(parent);
+        } finally { system.onReExecRequest = originalReExec; }
+    });
+    test('suspended child load failure rejects CreateProcess without publishing provisional PID or handles', async () => {
+        autoReady = false;
+        const pending = Promise.resolve(processApi.CreateProcessA!(undefined as never, memory,
+            [text('C:\\System\\helper.exe'), 0, 0, 0, 0, 4, 0, 0, 0, 2048]));
+        const worker = await booted();
+        worker.onmessage?.({ data: { type: 'error', message: 'child loader failed' } });
+        const result = await pending;
+        expect(typeof result === 'number' ? result : result.value).toBe(0);
+        expect(lastError).toBe(193);
+        expect([...memory.slice(2048, 2064)]).toEqual(Array(16).fill(0));
+        await stopChildProcesses();
+        expect(worker.terminated).toBe(true);
     });
     test('ShellExecuteEx returns a waitable handle backed by the actual helper', async () => {
         const module = new Shell32(); module.initialize(undefined as never);

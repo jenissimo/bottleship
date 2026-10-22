@@ -150,6 +150,8 @@ export const enum ApcKind {
     /** FILE_IO_COMPLETION_ROUTINE(dwErrorCode, dwBytesTransferred, lpOverlapped) —
      *  ReadFileEx/WriteFileEx. Three args, cdecl-free stdcall, cleanup 12. */
     IO_COMPLETION = 3,
+    /** WSAOVERLAPPED_COMPLETION_ROUTINE(error, bytes, overlapped, flags). */
+    WSA_COMPLETION = 4,
 }
 
 export interface PendingApc {
@@ -157,6 +159,7 @@ export interface PendingApc {
     arg0: number;
     arg1: number;
     arg2: number;
+    arg3?: number;
     kind: ApcKind;
 }
 

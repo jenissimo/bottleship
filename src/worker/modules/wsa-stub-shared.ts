@@ -1,12 +1,22 @@
 /**
- * Shared Winsock stub helpers (WSAStartup WSADATA fill, ioctlsocket no-op).
+ * Shared Winsock ABI helpers and process-local provider state.
  */
 
 import { Mem } from "../core/memory/mem-accessor";
+import { isValidAddress } from "../core/memory/address-guard";
 import { Marshaler } from "../core/memory/marshaler";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Process } from "../core/process";
 import { System } from "../core/system";
+import { lanNetwork } from "../net/lan-network";
+import { parseIpv6, formatIpv6 } from "../net/netplay-wire";
+import { WsaSocketTable } from "./wsa-network";
+import { createWsaActorTable } from "./wsa-actor-table";
+import { getSocketActorClient } from "../core/process-network";
+import { makeNamespaceExports } from "./wsa-namespace";
+import { getWsaOverlapped } from "./wsa-overlapped";
+import { makeNetworkSocketExports, makeNetworkSelect, type WsaErrorSetter } from "./wsa-network-api";
+export { WsaSocketTable } from "./wsa-network";
 
 /**
  * Faithful `inet_addr` (winsock 1.1 / 2). Parses a dotted-address string into an in_addr.s_addr
@@ -30,7 +40,7 @@ export function parseInetAddr(str: string): number {
         else if (/^0[0-7]*$/.test(p)) v = parseInt(p, 8);          // "0" and octal
         else if (/^[1-9][0-9]*$/.test(p)) v = parseInt(p, 10);
         else return INADDR_NONE;
-        if (!Number.isFinite(v) || v < 0) return INADDR_NONE;
+        if (!Number.isSafeInteger(v) || v < 0 || v > 0xffffffff) return INADDR_NONE;
         vals.push(v >>> 0);
     }
     let bytes: number[];
@@ -66,16 +76,16 @@ const WSADATA_DESC_OFF = 4;
 const WSADATA_STATUS_OFF = 261;
 const WSADATA_IMAXSOCKETS_OFF = 390;
 const WSADATA_IMAXUDPDG_OFF = 392;
-const WSADATA_LPVENDORINFO_OFF = 394;
+const WSADATA_LPVENDORINFO_OFF = 396;
 
-/** Negotiate Winsock version for stub (1.1 or 2.2). */
+/** wVersion must not exceed the requested version; wHighVersion advertises our ceiling. */
 export function negotiateWsaVersion(wVersionRequested: number): { wVersion: number; wHighVersion: number } {
-    const req = wVersionRequested & 0xffff;
-    const lo = req & 0xff;
-    if (lo >= 2) {
-        return { wVersion: 0x0202, wHighVersion: 0x0202 };
-    }
-    return { wVersion: 0x0101, wHighVersion: 0x0101 };
+    const major = wVersionRequested & 0xff;
+    const minor = (wVersionRequested >>> 8) & 0xff;
+    const wVersion = major >= 2
+        ? ((major > 2 ? 2 : Math.min(minor, 2)) << 8) | 2
+        : (Math.min(minor, 1) << 8) | 1;
+    return { wVersion, wHighVersion: 0x0202 };
 }
 
 function writeU16(mem: Uint8Array | null, addr: number, value: number): boolean {
@@ -119,7 +129,7 @@ export function writeWsaData(lpWSAData: number, wVersionRequested: number, mem: 
     }
 
     const desc = new Uint8Array(257);
-    desc.set(new TextEncoder().encode("BottleShip Winsock stub\0").subarray(0, 256));
+    desc.set(new TextEncoder().encode("BottleShip virtual LAN\0").subarray(0, 256));
     const status = new Uint8Array(129);
     status.set(new TextEncoder().encode("Running\0").subarray(0, 128));
 
@@ -163,126 +173,128 @@ export interface DnsStubs {
 }
 
 /**
- * Deterministic offline DNS: any hostname/address probe resolves to a loopback hostent
- * (no real network in this stub), so callers never dereference NULL. Shared by wsock32
- * and ws2_32 so both DLLs answer identically instead of drifting.
+ * Local/numeric resolver namespace shared by wsock32 and ws2_32.
+ * A remote DNS resolver requires a gateway and unknown names fail explicitly.
  */
-export function createDnsStubs(process: Process, setLastError: (code: number) => void): DnsStubs {
-    let hostentAddr = 0;
-    let inetNtoaBufAddr = 0;
+function localHostName(): string {
+    return lanNetwork.connected ? `bottleship-${Array.from(lanNetwork.node.slice(3), b => b.toString(16).padStart(2, "0")).join("")}` : LOOPBACK_HOST_NAME;
+}
+function localHostAddress(): Uint8Array { return lanNetwork.connected ? lanNetwork.ipv4 : LOOPBACK_ADDR_BYTES; }
+/** Only the local namespace and numeric IPv4 are available until a resolver gateway exists. */
+function resolveLocalName(name: string): Uint8Array | null {
+    if (!name || name.toLowerCase() === localHostName().toLowerCase()) return localHostAddress().slice();
+    if (name.toLowerCase() === "localhost") return LOOPBACK_ADDR_BYTES.slice();
+    const numeric = parseInetAddr(name);
+    if (numeric === 0xffffffff && name !== "255.255.255.255") return null;
+    return new Uint8Array([numeric & 255, numeric >>> 8 & 255, numeric >>> 16 & 255, numeric >>> 24 & 255]);
+}
 
-    const ensureLoopbackHostent = (): number => {
-        if (hostentAddr) return hostentAddr;
-
-        // hostent:
-        //  +0 h_name      (char*)
-        //  +4 h_aliases   (char**)
-        //  +8 h_addrtype  (short)
-        // +10 h_length    (short)
-        // +12 h_addr_list (char**)
-        const hNameAddr = process.memory.alloc(LOOPBACK_HOST_NAME.length + 1, "THUNK_DATA", "rw");
-        const hAliasesAddr = process.memory.alloc(4, "THUNK_DATA", "rw");   // [NULL]
-        const hAddrBytesAddr = process.memory.alloc(4, "THUNK_DATA", "rw"); // 127.0.0.1
-        const hAddrListAddr = process.memory.alloc(8, "THUNK_DATA", "rw");  // [ptr, NULL]
-        const hEntAddr = process.memory.alloc(16, "THUNK_DATA", "rw");
-        if (!hNameAddr || !hAliasesAddr || !hAddrBytesAddr || !hAddrListAddr || !hEntAddr) {
-            setLastError(WSAENETDOWN);
-            return 0;
-        }
-
-        const nameBytes = new TextEncoder().encode(`${LOOPBACK_HOST_NAME}\0`);
-        if (Mem.writeBytes(hNameAddr, nameBytes) !== nameBytes.length) { setLastError(WSAENETDOWN); return 0; }
-        if (!Mem.writeUint32(hAliasesAddr, 0)) { setLastError(WSAENETDOWN); return 0; }
-        if (Mem.writeBytes(hAddrBytesAddr, LOOPBACK_ADDR_BYTES) !== LOOPBACK_ADDR_BYTES.length) {
-            setLastError(WSAENETDOWN);
-            return 0;
-        }
-        if (!Mem.writeUint32(hAddrListAddr, hAddrBytesAddr) || !Mem.writeUint32(hAddrListAddr + 4, 0)) {
-            setLastError(WSAENETDOWN);
-            return 0;
-        }
-        if (!Mem.writeUint32(hEntAddr, hNameAddr) ||
-            !Mem.writeUint32(hEntAddr + 4, hAliasesAddr) ||
-            Mem.writeBytes(hEntAddr + 8, new Uint8Array([AF_INET, 0, 4, 0])) !== 4 ||
-            !Mem.writeUint32(hEntAddr + 12, hAddrListAddr)) {
-            setLastError(WSAENETDOWN);
-            return 0;
-        }
-
-        hostentAddr = hEntAddr >>> 0;
-        return hostentAddr;
+interface WsaResolvedName { canonicalName: string; addresses: Uint8Array[]; scopeIds?: number[]; }
+function resolverError(error: unknown): number {
+    const code = (error as { code?: string })?.code;
+    return ({ HOST_NOT_FOUND: 11001, TRY_AGAIN: 11002, NO_RECOVERY: 11003, NO_DATA: 11004,
+        CANCELLED: 10004, NETWORK_DOWN: 10050, ACCESS_DENIED: 10013 } as Record<string, number>)[code ?? ""] ?? 11003;
+}
+function resolveWsaName(name: string, signal?: AbortSignal, family: 0 | 4 | 6 = 4): WsaResolvedName | Promise<WsaResolvedName> {
+    const local = resolveLocalName(name), ipv6 = parseIpv6(name);
+    const localName = !name || name.toLowerCase() === localHostName().toLowerCase();
+    const loopback = name.toLowerCase() === "localhost", loopback6 = new Uint8Array(16); loopback6[15] = 1;
+    if (family !== 4 && ipv6) return { canonicalName: name, addresses: [ipv6] };
+    if ((localName || loopback) && family !== 4) return { canonicalName: name || localHostName(),
+        addresses: family === 6 ? [loopback ? loopback6 : lanNetwork.ipv6] :
+            [loopback ? loopback6 : lanNetwork.ipv6, local!] };
+    if (local && family !== 6) return { canonicalName: name || localHostName(), addresses: [local] };
+    if (local || ipv6) return Promise.reject({ code: "NO_DATA" });
+    return lanNetwork.resolve(name, family, signal).then(result => {
+        const parsed = result.addresses.filter(a => !family || a.family === family).map(a => {
+            if (a.family === 6) return { ip: parseIpv6(a.address), scopeId: a.scopeId ?? 0 };
+            const ip = parseInetAddr(a.address);
+            return { ip: new Uint8Array([ip & 255, ip >>> 8 & 255, ip >>> 16 & 255, ip >>> 24 & 255]), scopeId: 0 };
+        }).filter((a): a is { ip: Uint8Array; scopeId: number } => !!a.ip);
+        if (!parsed.length) throw { code: "NO_DATA" };
+        return { canonicalName: result.canonicalName || name, addresses: parsed.map(a => a.ip), scopeIds: parsed.map(a => a.scopeId) };
+    });
+}
+function dataWrites(address: number, data: Uint8Array): import("../core/thunking/thunk-dispatcher").DeferredWrite[] {
+    const result: import("../core/thunking/thunk-dispatcher").DeferredWrite[] = [];
+    let i = 0;
+    for (; i + 4 <= data.length; i += 4) result.push({ address: address + i, size: 4,
+        value: (data[i] | data[i + 1] << 8 | data[i + 2] << 16 | data[i + 3] << 24) >>> 0 });
+    for (; i < data.length; i++) result.push({ address: address + i, size: 1, value: data[i] });
+    return result;
+}
+function hostentImage(base: number, result: WsaResolvedName): Uint8Array {
+    const name = new TextEncoder().encode(result.canonicalName + "\0");
+    const aliases = 16 + name.length, list = (aliases + 7) & ~3, addresses = list + 4 * (result.addresses.length + 1);
+    const image = new Uint8Array(addresses + 4 * result.addresses.length), view = new DataView(image.buffer);
+    view.setUint32(0, base + 16, true); view.setUint32(4, base + aliases, true);
+    view.setUint16(8, 2, true); view.setUint16(10, 4, true); view.setUint32(12, base + list, true);
+    image.set(name, 16);
+    result.addresses.forEach((ip, i) => { view.setUint32(list + 4 * i, base + addresses + 4 * i, true); image.set(ip, addresses + 4 * i); });
+    return image;
+}
+export function createDnsStubs(process: Process, setLastError: WsaErrorSetter): DnsStubs {
+    const scratch = new Map<number, { generation: number; ptr: number }>();
+    const table = getWsaProcessState(process).table;
+    const buffer = (): number => {
+        const tid = System.getInstance().scheduler?.getCurrentThreadId?.() ?? 0;
+        const old = scratch.get(tid);
+        if (old?.generation === table.generation) return old.ptr;
+        const ptr = process.memory.alloc(4096, "THUNK_DATA", "rw") >>> 0;
+        if (ptr) scratch.set(tid, { generation: table.generation, ptr });
+        return ptr;
     };
-
-    const ensureInetNtoaBuffer = (): number => {
-        if (inetNtoaBufAddr) return inetNtoaBufAddr;
-        const addr = process.memory.alloc(16, "THUNK_DATA", "rw"); // "255.255.255.255\0"
-        if (!addr) { setLastError(WSAENETDOWN); return 0; }
-        inetNtoaBufAddr = addr >>> 0;
-        return inetNtoaBufAddr;
+    const pack = (base: number, result: WsaResolvedName) => {
+        const image = hostentImage(base, result);
+        if (image.length > 4080) return null;
+        return dataWrites(base, image);
     };
-
+    const hostent = (result: WsaResolvedName): number => {
+        const base = buffer(), writes = base ? pack(base, result) : null;
+        if (!writes) { setLastError(WSAENOBUFS); return 0; }
+        for (const write of writes) if (!(write.size === 4 ? Mem.writeUint32(write.address, write.value) : Mem.writeUint8(write.address, write.value))) {
+            setLastError(WSAEFAULT); return 0;
+        }
+        return base;
+    };
     const gethostname: ThunkImplementation = (_ctx, _mem, args) => {
-        const namePtr = args[0] >>> 0;
-        const len = (args[1] ?? 0) | 0;
-        if (!namePtr || len <= 0) { setLastError(WSAEFAULT); return SOCKET_ERROR; }
-
-        const maxWrite = Math.max(0, len - 1);
-        const hostBytes = new TextEncoder().encode(LOOPBACK_HOST_NAME);
-        const toCopy = hostBytes.subarray(0, Math.min(hostBytes.length, maxWrite));
-        if (toCopy.length > 0 && Mem.writeBytes(namePtr, toCopy) !== toCopy.length) {
-            setLastError(WSAEFAULT);
-            return SOCKET_ERROR;
+        const ptr = args[0] >>> 0, length = args[1] | 0;
+        const data = new TextEncoder().encode(localHostName() + "\0");
+        if (!ptr || length < data.length || Mem.writeBytes(ptr, data) !== data.length) {
+            setLastError(WSAEFAULT); return SOCKET_ERROR;
         }
-        if (Mem.writeBytes(namePtr + toCopy.length, new Uint8Array([0])) !== 1) {
-            setLastError(WSAEFAULT);
-            return SOCKET_ERROR;
-        }
-
-        setLastError(0);
         return 0;
     };
-
     const gethostbyname: ThunkImplementation = (_ctx, mem, args) => {
-        const namePtr = args[0] >>> 0;
-        if (!namePtr) { setLastError(WSAEFAULT); return 0; }
-
-        const name = Marshaler.readString(mem, namePtr).trim();
-        if (!name) { setLastError(WSAHOST_NOT_FOUND); return 0; }
-
-        const ptr = ensureLoopbackHostent();
-        if (!ptr) { setLastError(WSAENETDOWN); return 0; }
-        setLastError(0);
-        return ptr;
+        const name = args[0] ? Marshaler.readString(mem, args[0] >>> 0).trim() : "";
+        const report = setLastError.capture?.() ?? setLastError, generation = table.generation;
+        const result = resolveWsaName(name, table.blockingSignal);
+        if (!(result instanceof Promise)) return hostent(result);
+        const base = buffer();
+        if (!base) { report(WSAENOBUFS); return 0; }
+        return result.then<import("../core/thunking/thunk-dispatcher").ThunkResult, import("../core/thunking/thunk-dispatcher").ThunkResult>(answer => {
+            if (generation !== table.generation) return { value: 0 };
+            const writes = pack(base, answer);
+            if (!writes) { report(WSAENOBUFS); return { value: 0 }; }
+            report(0); return { value: base, deferredWrites: writes };
+        }, error => { if (generation === table.generation) report(resolverError(error)); return { value: 0 }; });
     };
-
     const gethostbyaddr: ThunkImplementation = (_ctx, _mem, args) => {
-        const addrPtr = args[0] >>> 0;
-        const len = (args[1] ?? 0) | 0;
-        const addrType = (args[2] ?? 0) | 0;
-        if (!addrPtr || len < 4 || addrType !== AF_INET) { setLastError(WSAHOST_NOT_FOUND); return 0; }
-
-        const ptr = ensureLoopbackHostent();
-        if (!ptr) { setLastError(WSAENETDOWN); return 0; }
-        setLastError(0);
-        return ptr;
+        if (!args[0] || (args[1] | 0) < 4 || args[2] !== AF_INET) { setLastError(WSAEFAULT); return 0; }
+        const ip = Mem.readBytes(args[0] >>> 0, 4)?.slice();
+        if (!ip) { setLastError(WSAEFAULT); return 0; }
+        const local = localHostAddress();
+        if (ip.every((v, i) => v === local[i])) return hostent({ canonicalName: localHostName(), addresses: [ip] });
+        if (ip.every((v, i) => v === LOOPBACK_ADDR_BYTES[i])) return hostent({ canonicalName: LOOPBACK_HOST_NAME, addresses: [ip] });
+        setLastError(WSAHOST_NOT_FOUND); return 0;
     };
-
     const inetNtoa: ThunkImplementation = (_ctx, _mem, args) => {
-        const addrValue = args[0] >>> 0;
-        const target = ensureInetNtoaBuffer();
-        if (!target) { setLastError(WSAENETDOWN); return 0; }
-
-        // in_addr is passed by value; bytes are already in network order.
-        const a = addrValue & 0xff;
-        const b = (addrValue >>> 8) & 0xff;
-        const c = (addrValue >>> 16) & 0xff;
-        const d = (addrValue >>> 24) & 0xff;
-        const bytes = new TextEncoder().encode(`${a}.${b}.${c}.${d}\0`);
-        if (Mem.writeBytes(target, bytes) !== bytes.length) { setLastError(WSAENETDOWN); return 0; }
-        setLastError(0);
-        return target;
+        const value = args[0] >>> 0, ptr = buffer();
+        if (!ptr) { setLastError(WSAENOBUFS); return 0; }
+        const data = new TextEncoder().encode(`${value & 255}.${value >>> 8 & 255}.${value >>> 16 & 255}.${value >>> 24 & 255}\0`);
+        if (Mem.writeBytes(ptr + 4080, data) !== data.length) { setLastError(WSAEFAULT); return 0; }
+        return ptr + 4080;
     };
-
     return { gethostbyname, gethostbyaddr, gethostname, inetNtoa };
 }
 
@@ -475,14 +487,14 @@ const NI_NAMEREQD = 0x04;
  * name space the hostent stubs answer from (see createDnsStubs), so both spellings of "look
  * this name up" agree instead of one succeeding and the other failing. A NULL node with
  * AI_PASSIVE is INADDR_ANY (the bind case) and without it loopback, exactly as documented;
- * anything else resolves to loopback.
+ * local hostnames resolve to the virtual interface and unknown names fail.
  *
  * The result chain is allocated in guest memory and owned by us until freeaddrinfo — the
  * caller must not free it itself, so a per-call allocation set is tracked and released as a
  * unit. A dangling free (an addrinfo we never handed out) is ignored, matching the DLL's own
  * tolerance rather than corrupting the heap.
  */
-export function createAddrInfoStubs(process: Process, setLastError: (code: number) => void): AddrInfoStubs {
+export function createAddrInfoStubs(process: Process, setLastError: WsaErrorSetter): AddrInfoStubs {
     /** head addrinfo -> every guest block allocated for that chain, in allocation order. */
     const chains = new Map<number, number[]>();
 
@@ -498,90 +510,77 @@ export function createAddrInfoStubs(process: Process, setLastError: (code: numbe
     };
 
     const getaddrinfo: ThunkImplementation = (_ctx, mem, args) => {
-        const nodePtr = args[0] >>> 0;
-        const servicePtr = args[1] >>> 0;
-        const hintsPtr = args[2] >>> 0;
-        const resultPtr = args[3] >>> 0;
-        if (!resultPtr) { setLastError(WSAEFAULT); return WSAEFAULT; }
-
+        const nodePtr = args[0] >>> 0, servicePtr = args[1] >>> 0, hintsPtr = args[2] >>> 0, resultPtr = args[3] >>> 0;
+        const report = setLastError.capture?.() ?? setLastError;
+        const error = (code: number) => { report(code); return code; };
+        if (!resultPtr || !isValidAddress(mem, resultPtr, 4, "rw")) return error(WSAEFAULT);
         let flags = 0, family = AF_UNSPEC, socktype = 0, protocol = 0;
         if (hintsPtr) {
-            flags = (Mem.readUint32(hintsPtr) ?? 0) >>> 0;
-            family = (Mem.readUint32(hintsPtr + 4) ?? 0) | 0;
-            socktype = (Mem.readUint32(hintsPtr + 8) ?? 0) | 0;
-            protocol = (Mem.readUint32(hintsPtr + 12) ?? 0) | 0;
+            if (!isValidAddress(mem, hintsPtr, ADDRINFO_SIZE, "r")) return error(WSAEFAULT);
+            flags = Mem.readUint32(hintsPtr) ?? 0; family = Mem.readUint32(hintsPtr + 4) ?? 0;
+            socktype = Mem.readUint32(hintsPtr + 8) ?? 0; protocol = Mem.readUint32(hintsPtr + 12) ?? 0;
         }
-        if (family !== AF_UNSPEC && family !== AF_INET) { setLastError(EAI_FAMILY); return EAI_FAMILY; }
-
+        if (family !== AF_UNSPEC && family !== AF_INET && family !== 23) return error(EAI_FAMILY);
+        if (flags & ~0xd0f) return error(WSAEINVAL);
+        if (socktype && socktype !== SOCK_STREAM && socktype !== SOCK_DGRAM && socktype !== SOCK_RAW) return error(WSAESOCKTNOSUPPORT);
+        if (protocol > 255 || (protocol && socktype !== SOCK_RAW && socktype && protocol !== IPPROTO_TCP && protocol !== IPPROTO_UDP)) return error(WSAEPROTONOSUPPORT);
+        if ((socktype === SOCK_STREAM && protocol === IPPROTO_UDP) || (socktype === SOCK_DGRAM && protocol === IPPROTO_TCP)) return error(EAI_SERVICE);
         const node = nodePtr ? Marshaler.readString(mem, nodePtr).trim() : "";
         const service = servicePtr ? Marshaler.readString(mem, servicePtr).trim() : "";
+        if (!nodePtr && !servicePtr) return error(EAI_NONAME);
+        if ((socktype === SOCK_RAW && service) || ((flags & 8) && service && !/^[0-9]+$/.test(service))) return error(EAI_SERVICE);
         const port = parsePort(service, { socktype });
-        if (port === null) { setLastError(EAI_SERVICE); return EAI_SERVICE; }
-
-        // A numeric node keeps its literal address; a name resolves to loopback (offline).
-        let addr: number;
-        if (node) {
-            const literal = parseInetAddr(node);
-            if (literal !== 0xffffffff) addr = literal;
-            else if (flags & AI_NUMERICHOST) { setLastError(EAI_NONAME); return EAI_NONAME; }
-            else addr = INADDR_LOOPBACK;
-        } else if (!servicePtr) {
-            // Both node and service NULL is the one input getaddrinfo rejects outright.
-            setLastError(EAI_NONAME);
-            return EAI_NONAME;
-        } else {
-            addr = (flags & AI_PASSIVE) ? 0 : INADDR_LOOPBACK;
-        }
-
-        // With no socktype hint, real Windows returns one addrinfo per socket type.
-        const kinds: Array<{ socktype: number; protocol: number }> = socktype
-            ? [{ socktype, protocol: protocol || (socktype === SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP) }]
+        if (port === null) return error(EAI_SERVICE);
+        if ((flags & AI_NUMERICHOST) && node && !parseIpv6(node) && parseInetAddr(node) === 0xffffffff && node !== "255.255.255.255") return error(EAI_NONAME);
+        const kinds = socktype ? [{ socktype, protocol: socktype === SOCK_RAW ? protocol : protocol || (socktype === SOCK_DGRAM ? IPPROTO_UDP : IPPROTO_TCP) }]
+            : protocol ? [{ socktype: protocol === IPPROTO_UDP ? SOCK_DGRAM : protocol === IPPROTO_TCP ? SOCK_STREAM : SOCK_RAW, protocol }]
             : [{ socktype: SOCK_STREAM, protocol: IPPROTO_TCP }, { socktype: SOCK_DGRAM, protocol: IPPROTO_UDP }];
-
-        const owned: number[] = [];
-        const grab = (size: number): number => {
-            const p = process.memory.alloc(size, "THUNK_DATA", "rw");
-            if (p) owned.push(p >>> 0);
-            return (p ?? 0) >>> 0;
+        const table = getWsaProcessState(process).table, generation = table.generation;
+        const build = (answer: WsaResolvedName, deferred: boolean): number | import("../core/thunking/thunk-dispatcher").ThunkResult => {
+            if (generation !== table.generation) return { value: 10004 };
+            const canonical = (flags & AI_CANONNAME) ? new TextEncoder().encode(answer.canonicalName + "\0") : new Uint8Array(0);
+            const entries = answer.addresses.flatMap((ip, index) => kinds.map(kind => ({ ip, kind, scopeId: answer.scopeIds?.[index] ?? 0, size: ip.length === 16 ? 28 : SOCKADDR_IN_SIZE })));
+            const count = entries.length, records = entries.reduce((size, entry) => size + ADDRINFO_SIZE + entry.size, 0);
+            const size = records + canonical.length;
+            let base = 0;
+            try { base = process.memory.alloc(size, "THUNK_DATA", "rw") >>> 0; } catch { return deferred ? { value: error(EAI_MEMORY) } : error(EAI_MEMORY); }
+            if (!base) return deferred ? { value: error(EAI_MEMORY) } : error(EAI_MEMORY);
+            const image = new Uint8Array(size), view = new DataView(image.buffer);
+            let offset = 0, index = 0;
+            for (const entry of entries) {
+                const { ip, kind, size } = entry, sa = offset + ADDRINFO_SIZE, af = ip.length === 16 ? 23 : AF_INET;
+                view.setUint32(offset, flags, true); view.setUint32(offset + 4, af, true);
+                view.setUint32(offset + 8, kind.socktype, true); view.setUint32(offset + 12, kind.protocol, true);
+                view.setUint32(offset + 16, size, true); view.setUint32(offset + 20, !index && canonical.length ? base + records : 0, true);
+                view.setUint32(offset + 24, base + sa, true); view.setUint32(offset + 28, index + 1 < count ? base + sa + size : 0, true);
+                view.setUint16(sa, af, true); view.setUint16(sa + 2, port, false); image.set(ip, sa + (af === 23 ? 8 : 4));
+                if (af === 23) view.setUint32(sa + 24, node.includes("%") ? Number(node.split("%")[1]) >>> 0 : entry.scopeId, true);
+                offset += ADDRINFO_SIZE + size; index++;
+            }
+            image.set(canonical, records);
+            const writes = [...dataWrites(base, image), { address: resultPtr, size: 4 as const, value: base }];
+            chains.set(base, [base]); report(0);
+            if (deferred) return { value: 0, deferredWrites: writes };
+            for (const write of writes) if (!(write.size === 4 ? Mem.writeUint32(write.address, write.value) : Mem.writeUint8(write.address, write.value))) {
+                chains.delete(base); process.memory.free(base); return error(WSAEFAULT);
+            }
+            return 0;
         };
-        const abort = (code: number): number => {
-            for (const p of owned) process.memory.free(p);
-            setLastError(code);
-            return code;
-        };
-
-        let canonAddr = 0;
-        if (flags & AI_CANONNAME) {
-            const canon = node || LOOPBACK_HOST_NAME;
-            const bytes = new TextEncoder().encode(`${canon}\0`);
-            canonAddr = grab(bytes.length);
-            if (!canonAddr || Mem.writeBytes(canonAddr, bytes) !== bytes.length) return abort(EAI_MEMORY);
-        }
-
-        let head = 0, prev = 0;
-        for (const kind of kinds) {
-            const sa = grab(SOCKADDR_IN_SIZE);
-            const ai = grab(ADDRINFO_SIZE);
-            if (!sa || !ai) return abort(EAI_MEMORY);
-            // sockaddr_in: +0 sin_family +2 sin_port(net) +4 sin_addr +8 sin_zero[8]
-            const netPort = ((port & 0xff) << 8) | ((port >>> 8) & 0xff);
-            if (!Mem.writeUint16(sa, AF_INET) || !Mem.writeUint16(sa + 2, netPort) ||
-                !Mem.writeUint32(sa + 4, addr) ||
-                !Mem.writeUint32(sa + 8, 0) || !Mem.writeUint32(sa + 12, 0)) return abort(EAI_FAIL);
-            if (!Mem.writeUint32(ai, flags) || !Mem.writeUint32(ai + 4, AF_INET) ||
-                !Mem.writeUint32(ai + 8, kind.socktype) || !Mem.writeUint32(ai + 12, kind.protocol) ||
-                !Mem.writeUint32(ai + 16, SOCKADDR_IN_SIZE) ||
-                // ai_canonname is set on the FIRST result only, per the documented contract.
-                !Mem.writeUint32(ai + 20, prev ? 0 : canonAddr) ||
-                !Mem.writeUint32(ai + 24, sa) || !Mem.writeUint32(ai + 28, 0)) return abort(EAI_FAIL);
-            if (prev) { if (!Mem.writeUint32(prev + 28, ai)) return abort(EAI_FAIL); } else head = ai;
-            prev = ai;
-        }
-
-        if (!Mem.writeUint32(resultPtr, head)) return abort(WSAEFAULT);
-        chains.set(head, owned);
-        setLastError(0);
-        return 0;
+        const loopback6 = new Uint8Array(16); loopback6[15] = 1;
+        let lookup: WsaResolvedName | Promise<WsaResolvedName>;
+        try {
+            if (node && family === 23 && (flags & 0x800) && resolveLocalName(node)) {
+                const ip = resolveLocalName(node)!, mapped = new Uint8Array(16); mapped[10] = mapped[11] = 255; mapped.set(ip, 12);
+                lookup = { canonicalName: node, addresses: [mapped] };
+            } else lookup = node ? resolveWsaName(node, table.blockingSignal, family === 23 ? 6 : family === 2 ? 4 : 0) :
+                { canonicalName: LOOPBACK_HOST_NAME, addresses: family === 23 ? [flags & AI_PASSIVE ? new Uint8Array(16) : loopback6] :
+                    family === 2 ? [flags & AI_PASSIVE ? new Uint8Array(4) : LOOPBACK_ADDR_BYTES.slice()] :
+                    [flags & AI_PASSIVE ? new Uint8Array(16) : loopback6, flags & AI_PASSIVE ? new Uint8Array(4) : LOOPBACK_ADDR_BYTES.slice()] };
+        } catch (reason) { return error(resolverError(reason)); }
+        if (!(lookup instanceof Promise)) return build(lookup, false) as number;
+        return lookup.then<import("../core/thunking/thunk-dispatcher").ThunkResult, import("../core/thunking/thunk-dispatcher").ThunkResult>(
+            answer => build(answer, true) as import("../core/thunking/thunk-dispatcher").ThunkResult,
+            reason => ({ value: generation === table.generation ? error(resolverError(reason)) : 10004 }));
     };
 
     const freeaddrinfo: ThunkImplementation = (_ctx, _mem, args) => {
@@ -602,12 +601,16 @@ export function createAddrInfoStubs(process: Process, setLastError: (code: numbe
         const servLen = (args[5] ?? 0) >>> 0;
         const flags = (args[6] ?? 0) >>> 0;
         if (!saPtr || saLen < SOCKADDR_IN_SIZE) { setLastError(WSAEFAULT); return WSAEFAULT; }
-        if ((Mem.readUint16(saPtr) ?? 0) !== AF_INET) { setLastError(EAI_FAMILY); return EAI_FAMILY; }
+        const family = Mem.readUint16(saPtr) ?? 0;
+        if (family !== AF_INET && family !== 23) { setLastError(EAI_FAMILY); return EAI_FAMILY; }
+        if (family === 23 && saLen < 28) { setLastError(WSAEFAULT); return WSAEFAULT; }
 
         const netPort = (Mem.readUint16(saPtr + 2) ?? 0) >>> 0;
         const port = ((netPort & 0xff) << 8) | ((netPort >>> 8) & 0xff);
-        const a = (Mem.readUint32(saPtr + 4) ?? 0) >>> 0;
-        const dotted = `${a & 0xff}.${(a >>> 8) & 0xff}.${(a >>> 16) & 0xff}.${(a >>> 24) & 0xff}`;
+        const ip = Mem.readBytes(saPtr + (family === 23 ? 8 : 4), family === 23 ? 16 : 4)?.slice();
+        if (!ip) { setLastError(WSAEFAULT); return WSAEFAULT; }
+        const scopeId = family === 23 ? Mem.readUint32(saPtr + 24) ?? 0 : 0;
+        const dotted = family === 23 ? formatIpv6(ip) + (scopeId ? "%" + scopeId : "") : Array.from(ip).join(".");
 
         const write = (text: string, ptr: number, len: number): boolean => {
             if (!ptr || len === 0) return true;
@@ -618,15 +621,18 @@ export function createAddrInfoStubs(process: Process, setLastError: (code: numbe
 
         if (hostPtr && hostLen) {
             // Only loopback has a name offline; NI_NAMEREQD must fail rather than hand back a literal.
-            const named = !(flags & NI_NUMERICHOST) && a === INADDR_LOOPBACK;
+            const loopback = family === 23 ? ip.slice(0, 15).every(v => !v) && ip[15] === 1 : ip.every((v, i) => v === LOOPBACK_ADDR_BYTES[i]);
+            const local = family === 23 ? lanNetwork.ipv6 : localHostAddress();
+            const localName = loopback ? LOOPBACK_HOST_NAME : ip.every((v, i) => v === local[i]) ? localHostName() : "";
+            const named = !(flags & NI_NUMERICHOST) && localName;
             if (!named && (flags & NI_NAMEREQD)) { setLastError(EAI_NONAME); return EAI_NONAME; }
-            if (!write(named ? LOOPBACK_HOST_NAME : dotted, hostPtr, hostLen)) {
+            if (!write(named ? localName : dotted, hostPtr, hostLen)) {
                 setLastError(WSAEFAULT);
                 return WSAEFAULT;
             }
         }
         if (servPtr && servLen) {
-            const entry = (flags & NI_NUMERICSERV) ? undefined : KNOWN_SERVICES.find((s) => s.port === port);
+            const entry = (flags & NI_NUMERICSERV) ? undefined : KNOWN_SERVICES.find((s) => s.port === port && s.proto === (flags & 0x10 ? "udp" : "tcp"));
             if (!write(entry ? entry.name : String(port), servPtr, servLen)) {
                 setLastError(WSAEFAULT);
                 return WSAEFAULT;
@@ -667,35 +673,8 @@ function writeFdSetSockets(mem: Uint8Array, ptr: number, sockets: number[]): boo
  * socket is always ready to write (mirrors connect() completing synchronously). A socket
  * that isn't valid in any supplied set is a WSAENOTSOCK error for the whole call, per spec.
  */
-export function makeSelect(table: WsaSocketTable, setLastError: (code: number) => void): ThunkImplementation {
-    return (_ctx, mem, args) => {
-        const readfdsPtr = args[1] >>> 0;
-        const writefdsPtr = args[2] >>> 0;
-        const exceptfdsPtr = args[3] >>> 0;
-
-        const readSockets = parseFdSet(mem, readfdsPtr);
-        const writeSockets = parseFdSet(mem, writefdsPtr);
-        const exceptSockets = parseFdSet(mem, exceptfdsPtr);
-
-        for (const s of [...readSockets, ...writeSockets, ...exceptSockets]) {
-            if (!table.isValid(s)) {
-                setLastError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-        }
-
-        const readyWrite = writeSockets.filter((s) => table.isConnected(s));
-
-        if (!writeFdSetSockets(mem, readfdsPtr, []) ||
-            !writeFdSetSockets(mem, writefdsPtr, readyWrite) ||
-            !writeFdSetSockets(mem, exceptfdsPtr, [])) {
-            setLastError(WSAEFAULT);
-            return SOCKET_ERROR;
-        }
-
-        setLastError(0);
-        return readyWrite.length;
-    };
+export function makeSelect(table: WsaSocketTable, setLastError: WsaErrorSetter, counter?: WsaStartupCount): ThunkImplementation {
+    return makeNetworkSelect(table, setLastError, counter);
 }
 
 /** __WSAFDIsSet(s, fd_set*) — BOOL membership test used by the FD_ISSET() macro. */
@@ -797,6 +776,7 @@ function postAsyncLookupCompletion(hWnd: number, wMsg: number, task: number, byt
 }
 
 export interface AsyncLookupStubs {
+    WSACancelAsyncRequest: ThunkImplementation;
     WSAAsyncGetHostByName: ThunkImplementation;
     WSAAsyncGetHostByAddr: ThunkImplementation;
     WSAAsyncGetProtoByName: ThunkImplementation;
@@ -814,149 +794,109 @@ export interface AsyncLookupStubs {
  * which is what the previous always-fail stubs did (task handle 0 => caller treats it as an
  * immediate startup failure instead of draining the real error via the message).
  */
-export function createAsyncLookupStubs(setLastError: (code: number) => void): AsyncLookupStubs {
+const asyncLookupStates = new WeakMap<Process, AsyncLookupStubs>();
+export function createAsyncLookupStubs(setLastError: WsaErrorSetter, owner?: Process): AsyncLookupStubs {
+    const process = owner ?? System.getInstance().process;
+    if (process) {
+        const old = asyncLookupStates.get(process);
+        if (old) return old;
+    }
+    const table = process ? getWsaProcessState(process).table : null;
+    const tasks = new Map<number, { controller: AbortController; generation: number }>();
+    const enqueue = (hWnd: number, wMsg: number, buf: number, buflen: number,
+        query: (signal: AbortSignal) => Uint8Array | Promise<Uint8Array>): number => {
+        if (!process || !table) { setLastError(WSAENETDOWN); return 0; }
+        const state = getWsaProcessState(process);
+        if (!state.counter.started) { setLastError(WSANOTINITIALISED); return 0; }
+        const task = makeAsyncTaskHandle(), controller = new AbortController(), generation = table.generation;
+        tasks.set(task, { controller, generation });
+        const complete = (image?: Uint8Array, error = 0) => {
+            const request = tasks.get(task);
+            if (!request || request.generation !== table.generation) { tasks.delete(task); return; }
+            // Once publication is queued this request has completed; cancellation now returns WSAEINVAL.
+            tasks.delete(task);
+            const required = image?.length ?? 0;
+            if (image && required > buflen) { image = undefined; error = WSAENOBUFS; }
+            if (image && (!buf || !process.addressSpace.validateRange(buf, image.length, "w"))) { image = undefined; error = WSAEFAULT; }
+            process.enqueueCompletion(image ? dataWrites(buf, image) : [], published => {
+                if (generation !== table.generation) return;
+                postAsyncLookupCompletion(hWnd, wMsg, task, required, published ? error : WSAEFAULT);
+            });
+        };
+        queueMicrotask(() => {
+            if (!tasks.has(task) || generation !== table.generation) { tasks.delete(task); return; }
+            try {
+                const result = query(controller.signal);
+                if (result instanceof Promise) result.then(image => complete(image), reason => complete(undefined, resolverError(reason)));
+                else complete(result);
+            } catch (reason) { complete(undefined, resolverError(reason)); }
+        });
+        setLastError(0); return task;
+    };
+    if (table) {
+        let generation = table.generation;
+        table.subscribe(() => {
+            if (generation === table.generation) return;
+            generation = table.generation;
+            for (const request of tasks.values()) request.controller.abort();
+            tasks.clear();
+        });
+    }
+    const protoImage = (base: number, entry: ProtoEntry): Uint8Array => {
+        const name = new TextEncoder().encode(entry.name + "\0"), aliases = 12 + name.length;
+        const image = new Uint8Array(aliases + 4), view = new DataView(image.buffer);
+        view.setUint32(0, base + 12, true); view.setUint32(4, base + aliases, true); view.setUint16(8, entry.number, true);
+        image.set(name, 12); return image;
+    };
+    const servImage = (base: number, entry: ServEntry): Uint8Array => {
+        const name = new TextEncoder().encode(entry.name + "\0"), proto = new TextEncoder().encode(entry.proto + "\0");
+        const aliases = 16 + name.length + proto.length, image = new Uint8Array(aliases + 4), view = new DataView(image.buffer);
+        view.setUint32(0, base + 16, true); view.setUint32(4, base + aliases, true); view.setUint16(8, entry.port, false);
+        view.setUint32(12, base + 16 + name.length, true); image.set(name, 16); image.set(proto, 16 + name.length); return image;
+    };
+    const missing = (): never => { throw { code: "NO_DATA" }; };
     const WSAAsyncGetHostByName: ThunkImplementation = (_ctx, mem, args) => {
-        const hWnd = args[0] >>> 0;
-        const wMsg = args[1] >>> 0;
-        const namePtr = args[2] >>> 0;
-        const buf = args[3] >>> 0;
-        const buflen = (args[4] ?? 0) | 0;
-        const task = makeAsyncTaskHandle();
-        const name = namePtr ? Marshaler.readString(mem, namePtr).trim() : "";
-        let bytes = 0;
-        let error = 0;
-        if (!name) {
-            error = WSAHOST_NOT_FOUND;
-        } else {
-            bytes = packHostentInto(mem, buf, buflen, LOOPBACK_HOST_NAME, LOOPBACK_ADDR_BYTES);
-            if (bytes < 0) { bytes = 0; error = WSAENOBUFS; }
-        }
-        postAsyncLookupCompletion(hWnd, wMsg, task, bytes, error);
-        setLastError(0);
-        return task;
+        const [hWnd, wMsg, namePtr, buf, buflen] = args.slice(), name = namePtr ? Marshaler.readString(mem, namePtr).trim() : "";
+        return enqueue(hWnd, wMsg, buf, buflen, signal => {
+            const result = resolveWsaName(name, signal);
+            return result instanceof Promise ? result.then(answer => hostentImage(buf, answer)) : hostentImage(buf, result);
+        });
     };
-
-    const WSAAsyncGetHostByAddr: ThunkImplementation = (_ctx, mem, args) => {
-        const hWnd = args[0] >>> 0;
-        const wMsg = args[1] >>> 0;
-        const addrPtr = args[2] >>> 0;
-        const len = (args[3] ?? 0) | 0;
-        const addrType = (args[4] ?? 0) | 0;
-        const buf = args[5] >>> 0;
-        const buflen = (args[6] ?? 0) | 0;
-        const task = makeAsyncTaskHandle();
-        let bytes = 0;
-        let error = 0;
-        if (!addrPtr || len < 4 || addrType !== AF_INET) {
-            error = WSAHOST_NOT_FOUND;
-        } else {
-            bytes = packHostentInto(mem, buf, buflen, LOOPBACK_HOST_NAME, LOOPBACK_ADDR_BYTES);
-            if (bytes < 0) { bytes = 0; error = WSAENOBUFS; }
-        }
-        postAsyncLookupCompletion(hWnd, wMsg, task, bytes, error);
-        setLastError(0);
-        return task;
+    const WSAAsyncGetHostByAddr: ThunkImplementation = (_ctx, _mem, args) => {
+        const [hWnd, wMsg, addrPtr, len, type, buf, buflen] = args.slice(), ip = addrPtr && len >= 4 && type === AF_INET ? Mem.readBytes(addrPtr, 4)?.slice() : undefined;
+        return enqueue(hWnd, wMsg, buf, buflen, () => {
+            const local = localHostAddress();
+            if (!ip || (!ip.every((v, i) => v === local[i]) && !ip.every((v, i) => v === LOOPBACK_ADDR_BYTES[i]))) throw { code: "HOST_NOT_FOUND" };
+            return hostentImage(buf, { canonicalName: ip[0] === 127 ? LOOPBACK_HOST_NAME : localHostName(), addresses: [ip] });
+        });
     };
-
     const WSAAsyncGetProtoByName: ThunkImplementation = (_ctx, mem, args) => {
-        const hWnd = args[0] >>> 0;
-        const wMsg = args[1] >>> 0;
-        const namePtr = args[2] >>> 0;
-        const buf = args[3] >>> 0;
-        const buflen = (args[4] ?? 0) | 0;
-        const task = makeAsyncTaskHandle();
-        const name = namePtr ? Marshaler.readString(mem, namePtr).trim().toLowerCase() : "";
-        const entry = KNOWN_PROTOCOLS.find((p) => p.name === name);
-        let bytes = 0;
-        let error = 0;
-        if (!entry) {
-            error = WSANO_DATA;
-        } else {
-            bytes = packProtoentInto(mem, buf, buflen, entry);
-            if (bytes < 0) { bytes = 0; error = WSAENOBUFS; }
-        }
-        postAsyncLookupCompletion(hWnd, wMsg, task, bytes, error);
-        setLastError(0);
-        return task;
+        const [hWnd, wMsg, namePtr, buf, buflen] = args.slice(), name = namePtr ? Marshaler.readString(mem, namePtr).trim().toLowerCase() : "";
+        return enqueue(hWnd, wMsg, buf, buflen, () => protoImage(buf, KNOWN_PROTOCOLS.find(p => p.name === name) ?? missing()));
     };
-
-    const WSAAsyncGetProtoByNumber: ThunkImplementation = (_ctx, mem, args) => {
-        const hWnd = args[0] >>> 0;
-        const wMsg = args[1] >>> 0;
-        const number = (args[2] ?? 0) | 0;
-        const buf = args[3] >>> 0;
-        const buflen = (args[4] ?? 0) | 0;
-        const task = makeAsyncTaskHandle();
-        const entry = KNOWN_PROTOCOLS.find((p) => p.number === number);
-        let bytes = 0;
-        let error = 0;
-        if (!entry) {
-            error = WSANO_DATA;
-        } else {
-            bytes = packProtoentInto(mem, buf, buflen, entry);
-            if (bytes < 0) { bytes = 0; error = WSAENOBUFS; }
-        }
-        postAsyncLookupCompletion(hWnd, wMsg, task, bytes, error);
-        setLastError(0);
-        return task;
+    const WSAAsyncGetProtoByNumber: ThunkImplementation = (_ctx, _mem, args) => {
+        const [hWnd, wMsg, number, buf, buflen] = args.slice();
+        return enqueue(hWnd, wMsg, buf, buflen, () => protoImage(buf, KNOWN_PROTOCOLS.find(p => p.number === number) ?? missing()));
     };
-
     const WSAAsyncGetServByName: ThunkImplementation = (_ctx, mem, args) => {
-        const hWnd = args[0] >>> 0;
-        const wMsg = args[1] >>> 0;
-        const namePtr = args[2] >>> 0;
-        const protoPtr = args[3] >>> 0;
-        const buf = args[4] >>> 0;
-        const buflen = (args[5] ?? 0) | 0;
-        const task = makeAsyncTaskHandle();
-        const name = namePtr ? Marshaler.readString(mem, namePtr).trim().toLowerCase() : "";
-        const proto = protoPtr ? Marshaler.readString(mem, protoPtr).trim().toLowerCase() : "";
-        const entry = KNOWN_SERVICES.find((s) => s.name === name && (!proto || s.proto === proto));
-        let bytes = 0;
-        let error = 0;
-        if (!entry) {
-            error = WSANO_DATA;
-        } else {
-            bytes = packServentInto(mem, buf, buflen, entry);
-            if (bytes < 0) { bytes = 0; error = WSAENOBUFS; }
-        }
-        postAsyncLookupCompletion(hWnd, wMsg, task, bytes, error);
-        setLastError(0);
-        return task;
+        const [hWnd, wMsg, namePtr, protoPtr, buf, buflen] = args.slice();
+        const name = namePtr ? Marshaler.readString(mem, namePtr).trim().toLowerCase() : "", proto = protoPtr ? Marshaler.readString(mem, protoPtr).trim().toLowerCase() : "";
+        return enqueue(hWnd, wMsg, buf, buflen, () => servImage(buf, KNOWN_SERVICES.find(s => s.name === name && (!proto || proto === s.proto)) ?? missing()));
     };
-
     const WSAAsyncGetServByPort: ThunkImplementation = (_ctx, mem, args) => {
-        const hWnd = args[0] >>> 0;
-        const wMsg = args[1] >>> 0;
-        const netPort = (args[2] ?? 0) & 0xffff;
-        const protoPtr = args[3] >>> 0;
-        const buf = args[4] >>> 0;
-        const buflen = (args[5] ?? 0) | 0;
-        const task = makeAsyncTaskHandle();
-        const hostPort = ((netPort & 0xff) << 8) | ((netPort >>> 8) & 0xff);
+        const [hWnd, wMsg, netPort, protoPtr, buf, buflen] = args.slice(), port = ((netPort & 255) << 8) | ((netPort >>> 8) & 255);
         const proto = protoPtr ? Marshaler.readString(mem, protoPtr).trim().toLowerCase() : "";
-        const entry = KNOWN_SERVICES.find((s) => s.port === hostPort && (!proto || s.proto === proto));
-        let bytes = 0;
-        let error = 0;
-        if (!entry) {
-            error = WSANO_DATA;
-        } else {
-            bytes = packServentInto(mem, buf, buflen, entry);
-            if (bytes < 0) { bytes = 0; error = WSAENOBUFS; }
-        }
-        postAsyncLookupCompletion(hWnd, wMsg, task, bytes, error);
-        setLastError(0);
-        return task;
+        return enqueue(hWnd, wMsg, buf, buflen, () => servImage(buf, KNOWN_SERVICES.find(s => s.port === port && (!proto || proto === s.proto)) ?? missing()));
     };
-
-    return {
-        WSAAsyncGetHostByName,
-        WSAAsyncGetHostByAddr,
-        WSAAsyncGetProtoByName,
-        WSAAsyncGetProtoByNumber,
-        WSAAsyncGetServByName,
-        WSAAsyncGetServByPort,
+    const WSACancelAsyncRequest: ThunkImplementation = (_ctx, _mem, args) => {
+        const request = tasks.get(args[0]);
+        if (!request || request.generation !== table?.generation) { setLastError(WSAEINVAL); return SOCKET_ERROR; }
+        tasks.delete(args[0]); request.controller.abort(); setLastError(0); return 0;
     };
+    const result = { WSAAsyncGetHostByName, WSAAsyncGetHostByAddr, WSAAsyncGetProtoByName,
+        WSAAsyncGetProtoByNumber, WSAAsyncGetServByName, WSAAsyncGetServByPort, WSACancelAsyncRequest };
+    if (process) asyncLookupStates.set(process, result);
+    return result;
 }
 
 export const INVALID_SOCKET = -1;
@@ -984,12 +924,17 @@ export const WSANOTINITIALISED = 10093;
  */
 export class WsaStartupCount {
     private count = 0;
+    private negotiatedVersion = 0x0202;
+    constructor(private readonly onFinalCleanup?: () => void) {}
+    get version(): number { return this.negotiatedVersion; }
 
     get started(): boolean {
         return this.count > 0;
     }
 
-    startup(): void {
+    startup(version = 0x0202): void {
+        const current = this.negotiatedVersion;
+        if (!this.count || (version & 255) < (current & 255) || ((version & 255) === (current & 255) && (version >>> 8) < (current >>> 8))) this.negotiatedVersion = version;
         this.count++;
     }
 
@@ -997,11 +942,12 @@ export class WsaStartupCount {
     cleanup(): boolean {
         if (this.count === 0) return false;
         this.count--;
+        if (this.count === 0) { this.negotiatedVersion = 0x0202; this.onFinalCleanup?.(); }
         return true;
     }
 
     reset(): void {
-        this.count = 0;
+        this.count = 0; this.negotiatedVersion = 0x0202;
     }
 }
 
@@ -1017,6 +963,7 @@ export function makeWsaCleanup(
             setLastError(WSANOTINITIALISED);
             return SOCKET_ERROR;
         }
+        setLastError(0);
         return 0;
     };
 }
@@ -1034,6 +981,7 @@ const PROTOCOL_CATALOG: ReadonlyArray<{ af: number; type: number; protocol: numb
     { af: AF_INET, type: SOCK_RAW, protocol: 0, maxOffset: 255 },
     { af: AF_INET6, type: SOCK_STREAM, protocol: IPPROTO_TCP, maxOffset: 0 },
     { af: AF_INET6, type: SOCK_DGRAM, protocol: IPPROTO_UDP, maxOffset: 0 },
+    { af: AF_INET6, type: SOCK_RAW, protocol: 0, maxOffset: 255 },
     { af: AF_IPX, type: SOCK_DGRAM, protocol: 1000, maxOffset: 255 },
     { af: AF_IPX, type: SOCK_SEQPACKET, protocol: 1256, maxOffset: 0 },
     { af: AF_IPX, type: SOCK_SEQPACKET, protocol: 1257, maxOffset: 0 },
@@ -1056,390 +1004,63 @@ export function validateSocketTriple(af: number, type: number, protocol: number)
     return served ? 0 : WSAEPROTONOSUPPORT;
 }
 
-interface StubSocket {
-    connected: boolean;
-    nonBlocking: boolean;
-    listening: boolean;
-    type: number;
-    accepts: Array<(value: number) => void>;
-}
-
-/** Deterministic offline socket table — connect succeeds, I/O is no-network safe. */
-export class WsaSocketTable {
-    private nextId = 1;
-    private sockets = new Map<number, StubSocket>();
-
-    reset(): void {
-        for (const socket of this.sockets.values()) {
-            for (const resolve of socket.accepts) resolve(INVALID_SOCKET);
-        }
-        this.nextId = 1;
-        this.sockets.clear();
-    }
-
-    socket(type = SOCK_STREAM): number {
-        const id = this.nextId++;
-        this.sockets.set(id, { connected: false, nonBlocking: false, listening: false, type, accepts: [] });
-        return id;
-    }
-
-    closesocket(s: number): number {
-        const socket = this.sockets.get(s >>> 0);
-        if (socket) for (const resolve of socket.accepts) resolve(INVALID_SOCKET);
-        if (!this.sockets.delete(s >>> 0)) return SOCKET_ERROR;
-        return 0;
-    }
-
-    connect(s: number): number {
-        const sock = this.sockets.get(s >>> 0);
-        if (!sock) return SOCKET_ERROR;
-        sock.connected = true;
-        return 0;
-    }
-
-    bind(_s: number): number {
-        return 0;
-    }
-
-    listen(s: number): number {
-        const socket = this.sockets.get(s >>> 0);
-        if (!socket || (socket.type !== SOCK_STREAM && socket.type !== SOCK_SEQPACKET)) return SOCKET_ERROR;
-        socket.listening = true;
-        return 0;
-    }
-
-    acceptError(s: number): number {
-        const socket = this.sockets.get(s >>> 0);
-        if (!socket) return WSAENOTSOCK;
-        if (socket.type !== SOCK_STREAM && socket.type !== SOCK_SEQPACKET) return 10045; // WSAEOPNOTSUPP
-        if (!socket.listening) return WSAEINVAL;
-        return socket.nonBlocking ? WSAEWOULDBLOCK : 0;
-    }
-
-    accept(s: number): number | Promise<number> {
-        if (this.acceptError(s)) return INVALID_SOCKET;
-        // The offline transport has no incoming queue; a blocking accept waits until cancellation.
-        return new Promise(resolve => this.sockets.get(s >>> 0)!.accepts.push(resolve));
-    }
-
-    send(s: number, len: number): number {
-        const sock = this.sockets.get(s >>> 0);
-        if (!sock) return SOCKET_ERROR;
-        if (!sock.connected) return SOCKET_ERROR;
-        return Math.max(0, len | 0);
-    }
-
-    recv(s: number): number {
-        const sock = this.sockets.get(s >>> 0);
-        if (!sock) return SOCKET_ERROR;
-        if (!sock.connected) return SOCKET_ERROR;
-        return SOCKET_ERROR;
-    }
-
-    recvfrom(s: number): number {
-        return this.recv(s);
-    }
-
-    sendto(s: number, len: number): number {
-        const sock = this.sockets.get(s >>> 0);
-        if (!sock) return SOCKET_ERROR;
-        return Math.max(0, len | 0);
-    }
-
-    setsockopt(_s: number): number {
-        return 0;
-    }
-
-    getsockopt(_s: number): number {
-        return 0;
-    }
-
-    shutdown(_s: number): number {
-        return 0;
-    }
-
-    isValid(s: number): boolean {
-        return this.sockets.has(s >>> 0);
-    }
-
-    isConnected(s: number): boolean {
-        return this.sockets.get(s >>> 0)?.connected ?? false;
-    }
-
-    setNonBlocking(s: number, nonBlocking: boolean): void {
-        const socket = this.sockets.get(s >>> 0);
-        if (socket) socket.nonBlocking = nonBlocking;
-    }
-
-    ioctl(s: number, cmd: number, argp: number, mem: Uint8Array | null): number {
-        const sock = this.sockets.get(s >>> 0);
-        if (!sock) return SOCKET_ERROR;
-        const FIONBIO = 0x8004667e;
-        if (cmd === FIONBIO && argp) {
-            const view = mem
-                ? new DataView(mem.buffer, mem.byteOffset, mem.byteLength)
-                : null;
-            const on = view ? view.getUint32(argp, true) : (Mem.readUint32(argp) ?? 0);
-            sock.nonBlocking = on !== 0;
-        } else if (argp) {
-            if (mem) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setUint32(argp, 0, true);
-            } else {
-                Mem.writeUint32(argp, 0);
-            }
-        }
-        return 0;
-    }
-}
-
+/** Socket exports use the virtual LAN; unavailable providers fail explicitly. */
 export function makeSocketExports(
     table: WsaSocketTable,
-    setLastError: (code: number) => void,
+    setLastError: WsaErrorSetter,
     counter: WsaStartupCount = wsaStartupCount,
+    process?: Process,
 ): Record<string, ThunkImplementation> {
-    /** socket(af, type, protocol) and WSASocketA without a protocol-info override. */
-    const createSocket = (af: number, type: number, protocol: number): number => {
-        if (!counter.started) {
-            setLastError(WSANOTINITIALISED);
-            return INVALID_SOCKET;
-        }
-        const err = validateSocketTriple(af, type, protocol);
-        if (err) {
-            setLastError(err);
-            return INVALID_SOCKET;
-        }
-        const selectedType = type || PROTOCOL_CATALOG.find(e => (af === AF_UNSPEC || e.af === af)
-            && (protocol === 0 || (protocol >= e.protocol && protocol <= e.protocol + e.maxOffset)))!.type;
-        const id = table.socket(selectedType);
-        setLastError(0);
-        return id;
+    const sockets = makeNetworkSocketExports(table, setLastError, counter, validateSocketTriple, process);
+    if (process) Object.assign(sockets, makeNamespaceExports(process, table, counter, setLastError, resolveWsaName, resolverError));
+    return sockets;
+}
+
+export interface WsaProcessState {
+    table: WsaSocketTable;
+    counter: WsaStartupCount;
+    setError: WsaErrorSetter;
+    getError(): number;
+    reset(): void;
+}
+const processStates = new WeakMap<Process, WsaProcessState>();
+/** Kernel calls can use an authenticated OS descriptor before loading a Winsock DLL. */
+export function getWsaNativeSocketTable(process: Process, socket: number): WsaSocketTable | undefined {
+    // All emulated socket aliases occupy this range; unrelated kernel/file handles
+    // must not initialize a provider or allocate a socket actor client.
+    if (!Number.isInteger(socket) || socket < 0x10000000 || socket > 0x7fffffff) return undefined;
+    const table = (processStates.get(process) ?? getWsaProcessState(process)).table;
+    // isValid is an actor lookup under this process's PID/epoch, never a Winsock
+    // context import. Keep the base identity for shared overlapped queues.
+    return table.nativeHandleView.isValid(socket) ? table : undefined;
+}
+export function hasWsaSocket(process: Process, socket: number): boolean {
+    return getWsaNativeSocketTable(process, socket) !== undefined;
+}
+export function cancelWsaIo(process: Process, socket: number, overlapped = 0, thread?: number): number | null {
+    const table = getWsaNativeSocketTable(process, socket);
+    return table ? getWsaOverlapped(table, process).cancel(socket, overlapped, thread) : null;
+}
+/** Both DLLs are views of the same per-process provider and per-thread last-error state. */
+/** Read-only lookup for Win32 socket-handle bridges; never initializes Winsock. */
+export function getWsaSocketTable(process: Process): WsaSocketTable | undefined { return processStates.get(process)?.table; }
+export function getWsaProcessState(process: Process): WsaProcessState {
+    const old = processStates.get(process);
+    if (old) return old;
+    const inBrowserWorker = typeof (globalThis as { importScripts?: unknown }).importScripts === "function";
+    const table = inBrowserWorker ? createWsaActorTable(lanNetwork, getSocketActorClient) : new WsaSocketTable();
+    const counter = new WsaStartupCount(() => table.reset());
+    let epoch = 0;
+    const thread = () => System.getInstance().scheduler?.getCurrentThreadId?.() ?? 0;
+    const setError: WsaErrorSetter = code => { System.getInstance().scheduler.setLastError(code); };
+    setError.capture = () => {
+        const tid = thread(), generation = epoch, owner = System.getInstance().scheduler, sink = table.blockingErrorSink;
+        return code => { if (generation === epoch) { if (sink) sink(code); else owner.setLastErrorForThread(tid, code); } };
     };
-    const requireSocket = (s: number): boolean => {
-        if (!table.isValid(s)) {
-            setLastError(WSAENOTSOCK);
-            return false;
-        }
-        return true;
-    };
-
-    return {
-        socket: (_ctx, _mem, args) => createSocket(args[0] | 0, args[1] | 0, args[2] | 0),
-        closesocket: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            const ret = table.closesocket(s);
-            setLastError(ret === 0 ? 0 : WSAENOTSOCK);
-            return ret;
-        },
-        connect: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const ret = table.connect(s);
-            setLastError(ret === SOCKET_ERROR ? WSAENOTCONN : 0);
-            return ret;
-        },
-        bind: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            setLastError(0);
-            return table.bind(s);
-        },
-        listen: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const result = table.listen(s);
-            setLastError(result === SOCKET_ERROR ? 10045 : 0);
-            return result;
-        },
-        accept: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!counter.started) { setLastError(WSANOTINITIALISED); return INVALID_SOCKET; }
-            if (!requireSocket(s)) return INVALID_SOCKET;
-            const error = table.acceptError(s);
-            if (error) { setLastError(error); return INVALID_SOCKET; }
-            const result = table.accept(s);
-            if (typeof result === 'number') return result;
-            return result.then<number>(value => {
-                setLastError(10004); // WSAEINTR: close/reset cancelled the blocking call.
-                return value;
-            });
-        },
-        send: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            const len = args[2] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const ret = table.send(s, len);
-            setLastError(ret === SOCKET_ERROR ? WSAENOTCONN : 0);
-            return ret;
-        },
-        recv: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const ret = table.recv(s);
-            setLastError(ret === SOCKET_ERROR ? WSAEWOULDBLOCK : 0);
-            return ret;
-        },
-        recvfrom: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const ret = table.recvfrom(s);
-            setLastError(ret === SOCKET_ERROR ? WSAEWOULDBLOCK : 0);
-            return ret;
-        },
-        sendto: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            const len = args[2] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const ret = table.sendto(s, len);
-            setLastError(ret === SOCKET_ERROR ? WSAENOTCONN : 0);
-            return ret;
-        },
-        setsockopt: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            setLastError(0);
-            return table.setsockopt(s);
-        },
-        getsockopt: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            setLastError(0);
-            return table.getsockopt(s);
-        },
-        shutdown: (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            setLastError(0);
-            return table.shutdown(s);
-        },
-        ioctlsocket: (_ctx, mem, args) => {
-            const s = args[0] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            const ret = table.ioctl(s, args[1] >>> 0, args[2] >>> 0, mem);
-            setLastError(ret === SOCKET_ERROR ? WSAENOTSOCK : 0);
-            return ret;
-        },
-        getpeername: (_ctx, mem, args) => {
-            const s = args[0] >>> 0;
-            const name = args[1] >>> 0;
-            const namelenPtr = args[2] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            if (!table.isConnected(s)) {
-                setLastError(WSAENOTCONN);
-                return SOCKET_ERROR;
-            }
-            if (!name || !namelenPtr) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            const avail = mem
-                ? new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getInt32(namelenPtr, true)
-                : (Mem.readInt32(namelenPtr) ?? 0);
-            if (avail < SOCKADDR_IN_SIZE) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            if (!writeSockaddrInLoopback(name, 0, mem)) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            if (mem) {
-                new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setInt32(namelenPtr, SOCKADDR_IN_SIZE, true);
-            } else if (!Mem.writeUint32(namelenPtr, SOCKADDR_IN_SIZE)) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            setLastError(0);
-            return 0;
-        },
-        getsockname: (_ctx, mem, args) => {
-            const s = args[0] >>> 0;
-            const name = args[1] >>> 0;
-            const namelenPtr = args[2] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-            if (!name || !namelenPtr) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            const avail = mem
-                ? new DataView(mem.buffer, mem.byteOffset, mem.byteLength).getInt32(namelenPtr, true)
-                : (Mem.readInt32(namelenPtr) ?? 0);
-            if (avail < SOCKADDR_IN_SIZE) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            if (!writeSockaddrInLoopback(name, 0, mem)) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            if (mem) {
-                new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setInt32(namelenPtr, SOCKADDR_IN_SIZE, true);
-            } else if (!Mem.writeUint32(namelenPtr, SOCKADDR_IN_SIZE)) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            setLastError(0);
-            return 0;
-        },
-        WSAIoctl: (_ctx, mem, args) => {
-            const s = args[0] >>> 0;
-            const code = args[1] >>> 0;
-            const inBuf = args[2] >>> 0;
-            const outBuf = args[4] >>> 0;
-            const outLen = args[5] >>> 0;
-            const pBytesReturned = args[6] >>> 0;
-            if (!requireSocket(s)) return SOCKET_ERROR;
-
-            const FIONREAD = 0x4004667f;
-            const FIONBIO = 0x8004667e;
-            let bytesReturned = 0;
-
-            if (code === FIONBIO && inBuf) {
-                table.ioctl(s, FIONBIO, inBuf, mem);
-            } else if (code === FIONREAD && outBuf && outLen >= 4) {
-                if (!writeU32(mem, outBuf, 0)) {
-                    setLastError(WSAEFAULT);
-                    return SOCKET_ERROR;
-                }
-                bytesReturned = 4;
-            } else if (outBuf && outLen > 0) {
-                if (mem) {
-                    if (outBuf < 0 || outBuf + outLen > mem.length) {
-                        setLastError(WSAEFAULT);
-                        return SOCKET_ERROR;
-                    }
-                    mem.fill(0, outBuf, outBuf + outLen);
-                } else {
-                    const zeros = new Uint8Array(outLen);
-                    if (Mem.writeBytes(outBuf, zeros) !== outLen) {
-                        setLastError(WSAEFAULT);
-                        return SOCKET_ERROR;
-                    }
-                }
-            }
-
-            if (pBytesReturned && !writeU32(mem, pBytesReturned, bytesReturned)) {
-                setLastError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            setLastError(0);
-            return 0;
-        },
-        // WSASocketA(af, type, protocol, lpProtocolInfo, g, dwFlags). A protocol-info block
-        // supplies the triple itself; its provider is taken as given.
-        WSASocketA: (_ctx, _mem, args) => {
-            if ((args[3] >>> 0) !== 0) {
-                if (!counter.started) {
-                    setLastError(WSANOTINITIALISED);
-                    return INVALID_SOCKET;
-                }
-                const id = table.socket();
-                setLastError(0);
-                return id;
-            }
-            return createSocket(args[0] | 0, args[1] | 0, args[2] | 0);
-        },
-    };
+    const state: WsaProcessState = { table, counter, setError, getError: () => System.getInstance().scheduler.getLastError(),
+        reset: () => { epoch++; table.reset(); counter.reset(); } };
+    processStates.set(process, state);
+    return state;
 }
 
 /**
@@ -1458,7 +1079,7 @@ export function makeWsaStartup(
         if (lpWSAData && !writeWsaData(lpWSAData, wVersionRequested, mem)) return wsaeFault;
         if ((wVersionRequested & 0xff) === 0) return WSAVERNOTSUPPORTED;
         if (!lpWSAData) return wsaeFault;
-        counter.startup();
+        counter.startup(negotiateWsaVersion(wVersionRequested).wVersion);
         setLastError(0);
         return 0;
     };

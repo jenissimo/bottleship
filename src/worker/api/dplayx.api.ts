@@ -10,6 +10,8 @@ import {
     IUnknown,
 } from "./types";
 
+import { hleClassFactoryInterface, hleComServerFunctions } from './com-server';
+
 const p = (name: string): ParameterDescriptor => ({ name, type: "ptr" });
 const u = (name: string): ParameterDescriptor => ({ name, type: "u32" });
 
@@ -57,7 +59,7 @@ export const IDirectPlayLobby3A: InterfaceDescriptor = {
         makeMethod("ReceiveLobbyMessage", 6),
         makeMethod("RunApplication", 5),
         makeMethod("SendLobbyMessage", 5),
-        makeMethod("SetConnectionSettings", 4),
+        makeMethod("SetConnectionSettings", 5),
         makeMethod("SetLobbyMessageEvent", 4),
         makeMethod("CreateCompoundAddress", 5),
         makeMethod("ConnectEx", 5),
@@ -90,7 +92,7 @@ export const IDirectPlayLobbyCompatA: InterfaceDescriptor = {
         makeMethod("ReceiveLobbyMessage", 6),
         makeMethod("RunApplication", 5),
         makeMethod("SendLobbyMessage", 5),
-        makeMethod("SetConnectionSettings", 4),
+        makeMethod("SetConnectionSettings", 5),
         makeMethod("SetLobbyMessageEvent", 4),
         makeMethod("CreateCompoundAddress", 5),
         makeMethod("ConnectEx", 5),
@@ -165,6 +167,25 @@ export const IDirectPlay4A: InterfaceDescriptor = {
     ],
 };
 
+export const IDirectPlay2A: InterfaceDescriptor = {
+    name: "IDirectPlay2A", inherits: "IUnknown", iid: "9d460580-a822-11cf-960c-0080c7534e82",
+    methods: IDirectPlay4A.methods.slice(0, 32).map(method => ({ ...method })),
+};
+export const IDirectPlay3A: InterfaceDescriptor = {
+    name: "IDirectPlay3A", inherits: "IUnknown", iid: "133efe41-32dc-11d0-9cfb-00a0c90a43cb",
+    methods: IDirectPlay4A.methods.slice(0, 45).map(method => ({ ...method })),
+};
+
+export const IDirectPlay2: InterfaceDescriptor = {
+    ...IDirectPlay2A, name: "IDirectPlay2", iid: "2b74f7c0-9154-11cf-a9cd-00aa006886e3",
+};
+export const IDirectPlay3: InterfaceDescriptor = {
+    ...IDirectPlay3A, name: "IDirectPlay3", iid: "133efe40-32dc-11d0-9cfb-00a0c90a43cb",
+};
+export const IDirectPlay4: InterfaceDescriptor = {
+    ...IDirectPlay4A, name: "IDirectPlay4", iid: "0ab1c530-4745-11d1-a7a1-0000f803abfc",
+};
+
 // IDirectPlayLobby interface (original)
 // IID_IDirectPlayLobby: {af465c71-9588-11cf-a020-00aa006157ac}
 // The ANSI variant IID_IDirectPlayLobbyA shares this exact vtable shape, so the object
@@ -184,9 +205,23 @@ export const IDirectPlayLobby: InterfaceDescriptor = {
         makeMethod("ReceiveLobbyMessage", 6),
         makeMethod("RunApplication", 5),
         makeMethod("SendLobbyMessage", 5),
-        makeMethod("SetConnectionSettings", 4),
+        makeMethod("SetConnectionSettings", 5),
         makeMethod("SetLobbyMessageEvent", 4),
     ],
+};
+
+export const IDirectPlayLobbyA: InterfaceDescriptor = {
+    ...IDirectPlayLobby, name: "IDirectPlayLobbyA", iid: "26c66a70-b367-11cf-a024-00aa006157ac",
+};
+export const IDirectPlayLobby2: InterfaceDescriptor = {
+    ...IDirectPlayLobby3A, name: "IDirectPlayLobby2", iid: "0194c220-a303-11d0-9c4f-00a0c905425e",
+    methods: IDirectPlayLobby3A.methods.slice(0, 15).map(method => ({ ...method })),
+};
+export const IDirectPlayLobby2A: InterfaceDescriptor = {
+    ...IDirectPlayLobby2, name: "IDirectPlayLobby2A", iid: "1bb4af80-a303-11d0-9c4f-00a0c905425e",
+};
+export const IDirectPlayLobby3: InterfaceDescriptor = {
+    ...IDirectPlayLobby3A, name: "IDirectPlayLobby3", iid: "2db72490-652c-11d1-a7a8-0000f803abfc",
 };
 
 // IDirectPlay interface (original)
@@ -222,40 +257,19 @@ export const IDirectPlay: InterfaceDescriptor = {
     ],
 };
 
-// DirectPlay 8 Lobby Client (DX8/DX9)
-// IID_IDirectPlay8LobbyClient: {819074a2-016c-11d3-ae14-006097b01411}
-// Not to be confused with IID_IDirectPlay8LobbiedApplication ({819074a3-...}), a distinct
-// 12-slot interface (RegisterProgram/UnRegisterProgram/SetAppAvailable/UpdateStatus).
-export const IDirectPlay8LobbyClient: InterfaceDescriptor = {
-    name: "IDirectPlay8LobbyClient",
-    inherits: "IUnknown",
-    iid: "819074a2-016c-11d3-ae14-006097b01411",
-    methods: [
-        ...IUnknown.methods.map(m => ({ ...m, name: m.name })),
-        makeMethod("Initialize", 4, { params: [p("this"), p("pvUserContext"), p("pfn"), u("dwFlags")] }),
-        makeMethod("EnumLocalPrograms", 6, {
-            params: [p("this"), p("pGuidApplication"), p("pEnumData"), p("pdwEnumData"), p("pdwItems"), u("dwFlags")]
-        }),
-        makeMethod("ConnectApplication", 6, {
-            params: [p("this"), p("pdplConnectionInfo"), p("pvConnectionContext"), p("hApplication"), u("dwTimeOut"), u("dwFlags")]
-        }),
-        makeMethod("Send", 5, { params: [p("this"), u("hConnection"), p("pBuffer"), u("pBufferSize"), u("dwFlags")] }),
-        makeMethod("ReleaseApplication", 3, { params: [p("this"), u("hConnection"), u("dwFlags")] }),
-        makeMethod("Close", 2, { params: [p("this"), u("dwFlags")] }),
-        makeMethod("GetConnectionSettings", 5, {
-            params: [p("this"), u("hConnection"), p("pdplSessionInfo"), p("pdwInfoSize"), u("dwFlags")]
-        }),
-        makeMethod("SetConnectionSettings", 4, {
-            params: [p("this"), u("hConnection"), p("pdplSessionInfo"), u("dwFlags")]
-        }),
-    ],
-};
-
 export const dplayxModule: ModuleDescriptor = {
     name: "dplayx",
     version: "7.0",
-    description: "DirectPlay lobby stubs",
+    description: "DirectPlay virtual LAN and lobby",
     functions: [
+        ...hleComServerFunctions,
+        {
+            name: "DirectPlayEnumerate",
+            ordinal: 9,
+            params: [{ name: "lpEnumCallback", type: "ptr" }, { name: "lpContext", type: "ptr" }],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
         {
             name: "DirectPlayCreate",
             ordinal: 1,
@@ -278,6 +292,16 @@ export const dplayxModule: ModuleDescriptor = {
             callingConvention: "stdcall",
         },
         {
+            name: "DirectPlayEnumerateW",
+            ordinal: 3,
+            params: [
+                { name: "lpEnumCallback", type: "ptr" },
+                { name: "lpContext", type: "ptr" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
+        {
             name: "DirectPlayLobbyCreateA",
             ordinal: 4,
             params: [
@@ -290,6 +314,19 @@ export const dplayxModule: ModuleDescriptor = {
             returnType: "u32",
             callingConvention: "stdcall",
         },
+        {
+            name: "DirectPlayLobbyCreateW",
+            ordinal: 5,
+            params: [
+                { name: "lpGUID", type: "ptr" },
+                { name: "lplpDPL", type: "ptr", direction: "out" },
+                { name: "pUnkOuter", type: "ptr" },
+                { name: "lpData", type: "ptr" },
+                { name: "dwDataSize", type: "u32" },
+            ],
+            returnType: "u32",
+            callingConvention: "stdcall",
+        },
     ],
-    interfaces: [IDirectPlayLobby3A, IDirectPlayLobbyCompatA, IDirectPlay4A, IDirectPlayLobby, IDirectPlay, IDirectPlay8LobbyClient],
+    interfaces: [hleClassFactoryInterface, IDirectPlayLobby3A, IDirectPlayLobby3, IDirectPlayLobby2A, IDirectPlayLobby2, IDirectPlayLobbyA, IDirectPlayLobbyCompatA, IDirectPlay2A, IDirectPlay2, IDirectPlay3A, IDirectPlay3, IDirectPlay4A, IDirectPlay4, IDirectPlayLobby, IDirectPlay],
 };

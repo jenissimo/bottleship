@@ -21,6 +21,7 @@ import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
 import SettingsDrawer from "../settings/SettingsDrawer";
+import { loadNetworkConfig, networkInviteUrl, NETWORK_SETTINGS_KEY, type NetworkConfig, type NetworkStatus } from "../network-config";
 import DevPanel from "./DevPanel";
 import ExitOverlay from "./ExitOverlay";
 import MessageBoxModal, { type MessageBoxRequest } from "../debug/MessageBoxModal";
@@ -384,6 +385,17 @@ export default function App() {
   const [isPaused, setIsPaused] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [uiSettings, setUiSettings] = useState<UiSettings>(() => loadUiSettings());
+  const [network, setNetwork] = useState<NetworkConfig | null>(() => loadNetworkConfig());
+  const networkRef = useRef(network);
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatus>({ state: "offline" });
+  const handleNetworkChange = useCallback((config: NetworkConfig | null) => {
+    networkRef.current = config;
+    window.history.replaceState(null, "", networkInviteUrl(window.location.href, config));
+    setNetwork(config);
+    setNetworkStatus({ state: config ? "connecting" : "offline" });
+    try { localStorage.setItem(NETWORK_SETTINGS_KEY, JSON.stringify(config)); } catch { /* Storage may be unavailable. */ }
+    globalWorker?.postMessage({ type: "set_network", network: config });
+  }, []);
   const [quality, setQuality] = useState<QualityConfig>(() => loadQuality());
   const qualityRef = useRef<QualityConfig>(quality);
   // Quality keys the ACTIVE graphics backend told us (via the set_quality ack) it does
@@ -836,8 +848,9 @@ export default function App() {
   }, []);
   const handleResetSettings = useCallback(() => {
     setUiSettings({ ...DEFAULT_UI_SETTINGS });
+    handleNetworkChange(null);
     setQuality({ ...DEFAULT_QUALITY });
-  }, []);
+  }, [handleNetworkChange]);
 
   // Persist the full quality object + keep the ref current (for the load-"done" re-send) and
   // push it to the worker whenever it changes or the worker becomes ready.
@@ -1018,6 +1031,7 @@ export default function App() {
       // dumps it emits, and those must name the session's own directory — an agent sent
       // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
       globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
+      globalWorker.postMessage({ type: "set_network", network: networkRef.current });
 
       // A self re-exec asked us to reload (see the "reexec" message). Hand the worker the
       // launcher's command line BEFORE any bundle load — it replaces the manifest's `args`
@@ -1277,6 +1291,10 @@ export default function App() {
 
     // 3. Setup Worker Message Handling
     worker.onmessage = (event: MessageEvent) => {
+      if (event.data?.type === "network_state") {
+        setNetworkStatus(event.data.status as NetworkStatus);
+        return;
+      }
       if (event.data?.type === 'child_session') {
         audioEngine?.stopAll();
         setExitInfo(null); exitInfoRef.current = null;
@@ -2963,6 +2981,9 @@ export default function App() {
       overriddenQualityKeys={overriddenQualityKeys}
       uiSettings={uiSettings}
       onUiChange={handleUiChange}
+      network={network}
+      networkStatus={networkStatus}
+      onNetworkChange={handleNetworkChange}
       statsOverlay={statsOverlayEnabled}
       onToggleStatsOverlay={handleToggleStatsOverlay}
       logStreaming={loggingEnabled}
