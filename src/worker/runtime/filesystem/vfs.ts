@@ -79,6 +79,16 @@ export interface VfsFindHandle {
 /** Win32 dwDesiredAccess bits — the only ones this layer branches on. */
 const GENERIC_READ = 0x80000000;
 const GENERIC_WRITE = 0x40000000;
+const GENERIC_ALL = 0x10000000;
+const FILE_WRITE_DATA = 0x0002;
+const FILE_APPEND_DATA = 0x0004;
+
+/** NT5 iomgr/write.c:358: only append granted => EOF on every write, not on open.
+ * VFS retains raw generic bits; GENERIC_WRITE/ALL also grant FILE_WRITE_DATA. */
+function isAppendOnlyAccess(access: number): boolean {
+    return (access & FILE_APPEND_DATA) !== 0
+        && (access & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL)) === 0;
+}
 
 /** Grow the logical length of a byte view geometrically while keeping the exposed view
  * exact-length. Repeated append-only guest writes then copy once per capacity growth,
@@ -1248,14 +1258,17 @@ export class VirtualFileSystem {
         // (fopen "r+b" → fread → fseek → fwrite → fseek → fread). Flipping `source` to
         // overlay under a still-installed whole-ROM-entry window is the same lie.
         this.invalidateReadWindow(handle);
+        const appendOnly = isAppendOnlyAccess(handle.access);
+        const offset = appendOnly ? this.getFileSize(handle.path) : handle.position;
         if (handle.source === "rom") {
             handle.source = "overlay";
         }
         try {
-            const written = this.overlay.writeFileSync(handle.path, handle.position, data);
+            const written = this.overlay.writeFileSync(handle.path, offset, data);
             if (written < 0) return -1;
             // Harness fileWritten event (gated — this is the hot guest-write path).
-            if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset: handle.position, length: written, sync: true });
+            if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset, length: written, sync: true });
+            if (appendOnly) this.setPosition(handle, offset, 0);
             this.advanceCursor(handle, written);
             return written;
         } catch (e) {
@@ -1271,11 +1284,20 @@ export class VirtualFileSystem {
             Logger.warn(LogCategory.SYSTEM, `VFS: write("${handle.path}") failed: overlay not initialized`);
             return 0;
         }
+        const appendOnly = isAppendOnlyAccess(handle.access);
+        if (appendOnly && data.length === 0) return 0;
         try {
             const writeStart = performance.now();
-            const written = await this.overlay.writeFile(handle.path, handle.position, data);
+            const offset = appendOnly ? this.getFileSize(handle.path) : handle.position;
+            // Append admission must publish its EOF extension before another writer can
+            // select EOF. The existing buffered path does so in this host turn; explicit
+            // flush/close retains responsibility for durable OPFS persistence.
+            const written = appendOnly
+                ? this.overlay.writeFileSync(handle.path, offset, data)
+                : await this.overlay.writeFile(handle.path, offset, data);
             const writeTime = performance.now() - writeStart;
-            if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset: handle.position, length: written, sync: false });
+            if (harnessBus.fileEvents && written > 0) harnessBus.emit("fileWritten", { path: handle.path, offset, length: written, sync: false });
+            if (appendOnly) this.setPosition(handle, offset, 0);
             this.advanceCursor(handle, written);
             // Promote source to overlay so subsequent reads from this handle see written data
             if (handle.source === "rom") handle.source = "overlay";
