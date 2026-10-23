@@ -2,7 +2,7 @@ import { Mem } from "../../core/memory/mem-accessor";
 import { DirectPlayGuestMemory } from "./guest-memory";
 import type { SessionDesc, Entity } from "../dplayx/session";
 import type { PlayerInfo } from "./peer";
-import { utf16 } from "./constants";
+import { DPN, utf16 } from "./constants";
 export const byteHex = (bytes: Uint8Array): string => Array.from(bytes, n => n.toString(16).padStart(2, "0")).join("");
 export const fromHex = (hex: string): Uint8Array => Uint8Array.from(hex.match(/../g) ?? [], n => parseInt(n, 16));
 export class StructBuffer {
@@ -36,16 +36,27 @@ export function packApplication(desc: SessionDesc, players: number, base = 0): U
     out.u32(40, desc.maxPlayers); out.u32(44, players); out.blob(48, name); out.blob(52, password);
     out.blob(56, reserved); out.u32(60, reserved.length); out.blob(64, app); out.u32(68, app.length); return out.bytes;
 }
+export function validateInfo(guest: DirectPlayGuestMemory, ptr: number, player = true): number {
+    if (!guest.valid(ptr, 24)) return DPN.INVALIDPOINTER;
+    if (Mem.readUint32(ptr) !== 24) return DPN.INVALIDPARAM;
+    const mask = Mem.readUint32(ptr + 4)!, name = Mem.readUint32(ptr + 8)!, data = Mem.readUint32(ptr + 12)!, size = Mem.readUint32(ptr + 16)!;
+    if (mask & ~3) return DPN.INVALIDFLAGS;
+    if (!(mask & 1) && name) return DPN.INVALIDSTRING;
+    if (!(mask & 2) && data) return DPN.INVALIDPARAM;
+    if (mask & 2 && size && !guest.valid(data, size)) return DPN.INVALIDPOINTER;
+    if (size > 60000) return DPN.INVALIDPARAM;
+    if (mask & 1 && name) { const text = guest.string(name); if (text === null || text.length > 1024) return DPN.INVALIDSTRING; }
+    if (player && Mem.readUint32(ptr + 20)) return DPN.INVALIDFLAGS;
+    return DPN.OK;
+}
 export function readInfo(guest: DirectPlayGuestMemory, ptr: number): { info: PlayerInfo; mask: number } | null {
-    if (!guest.valid(ptr, 24) || Mem.readUint32(ptr) !== 24) return null;
+    if (validateInfo(guest, ptr, false)) return null;
     const mask = Mem.readUint32(ptr + 4)!, namePtr = Mem.readUint32(ptr + 8)!, dataPtr = Mem.readUint32(ptr + 12)!, size = Mem.readUint32(ptr + 16)!;
-    if (mask & ~3 || size > 60000 || (mask & 2 && size && !guest.valid(dataPtr, size))) return null;
-    const name = mask & 1 && namePtr ? guest.string(namePtr) : "";
-    if (name === null || name.length > 1024) return null;
-    return { mask, info: { name, data: mask & 2 && size ? Array.from(Mem.readBytes(dataPtr, size)!) : [], flags: Mem.readUint32(ptr + 20)! } };
+    const name = mask & 1 && namePtr ? guest.string(namePtr)! : "";
+    return { mask, info: { name, nameNull: !namePtr, data: mask & 2 && size ? Array.from(Mem.readBytes(dataPtr, size)!) : [], flags: Mem.readUint32(ptr + 20)! } };
 }
 export function packInfo(entity: Entity, flags: number, base = 0): Uint8Array {
-    const name = entity.name.short ? utf16(entity.name.short + "\0") : new Uint8Array(), data = new Uint8Array(entity.data);
+    const name = entity.name.short || entity.name.shortNull === false ? utf16(entity.name.short + "\0") : new Uint8Array(), data = new Uint8Array(entity.data);
     const out = new StructBuffer(24, name.length + data.length, base);
     out.u32(0, 24); out.u32(4, 3); out.blob(8, name); out.blob(12, data); out.u32(16, data.length); out.u32(20, flags); return out.bytes;
 }

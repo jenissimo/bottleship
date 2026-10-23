@@ -10,22 +10,27 @@ need matching versions and content.
 
 ## Run a LAN server
 
-From the repository root:
+The Rust server requires Rust 1.94 or newer. From the repository root:
 
 ```sh
-bun install
-bun run dev:lan
+cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 127.0.0.1 --port 9001
 ```
 
-The default address is `http://127.0.0.1:9001`. The server is a standalone project
-under [packages/lan](../packages/lan/README.md), with its own dependencies,
-license, CLI, tests and protocol. It can be extracted into a separate
-`bottleship-lan` repository without importing the emulator.
-
-To accept other machines on your LAN:
+The default address is `http://127.0.0.1:9001`. The [Rust server](../packages/lan-rust/README.md)
+has its own CLI, tests, Cargo locks and licenses. Export it into a new standalone
+`bottleship-multiplayer-server` directory without importing the emulator:
 
 ```sh
-bun run dev:lan --host 0.0.0.0 --port 9001
+bun tools/lan-conformance/export-rust-server.ts --out ../bottleship-multiplayer-server
+```
+
+The [TypeScript reference server](../packages/lan/README.md) also supports this
+protocol; run it with `bun install` and `bun run dev:lan`.
+
+To accept other machines on your LAN with the Rust server:
+
+```sh
+cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --host 0.0.0.0 --port 9001
 ```
 
 Use the server machine's reachable address in the emulator. For an HTTPS emulator
@@ -60,7 +65,9 @@ The effective session configuration is exposed as `EmulatorConfig.network`,
 survives a game reset and is inherited by child processes. It is independent of
 the game bundle. The worker waits for the current configuration before starting
 guest execution and posts `network_state` with an offline, connecting, connected,
-disconnected or error status.
+disconnected or error status. Parent and child workers observe one coherent
+snapshot of relay capabilities, DNS, routes and native Host listeners before
+seeing the connection as ready. Reconnect revokes leases from the old generation.
 
 An invite URL uses `?lanServer=https%3A%2F%2Flan.example.org&room=friends`.
 The settings screen stores explicitly selected connections in browser preferences.
@@ -72,6 +79,7 @@ The settings screen stores explicitly selected connections in browser preference
 | Winsock 1.1 / 2 | Shared DLL startup state and per-process descriptors; per-thread errors |
 | Socket duplication | Real same-process and cross-process aliases, shared data/shutdown/port lifetime, retained sockets after source-process exit |
 | IPv4 / IPv6 UDP | Bind, send/receive, broadcast, truncation, peeking and bounded queues |
+| IPv4 UDP multicast | Virtual LAN/loopback groups, shared physical membership and IF/TTL/LOOP state, receiver filtering and queued-packet lifetimes |
 | IPX datagrams | Addressing, socket numbers, packet types and adapter queries |
 | TCP within the virtual LAN | Listen/connect/accept, partial byte-stream I/O, flow control, shutdown and EOF |
 | Winsock notifications | Blocking/nonblocking I/O, select, window/event notifications, scatter/gather and overlapped event/APC completion |
@@ -87,6 +95,14 @@ The settings screen stores explicitly selected connections in browser preference
 | DNS namespace lookup | ANSI/Unicode enumeration, Begin/Next/End, short-buffer retry, cancellation, scoped addresses and owner-thread result publication |
 | Winsock 1.1 blocking hooks | Guest hook execution, cancellation and callable default message pump |
 
+Virtual IPv4 UDP multicast preserves the destination group through the local
+process broker and either relay transport. IP_MULTICAST_IF=0 selects the virtual
+LAN; 127/8 selects loopback. TTL 0 and loopback traffic stay on the virtual host.
+IP_MULTICAST_LOOP follows Windows receiver-side local-origin filtering. Remote
+multicast requires a relay advertising udpMulticast4V1; an older relay returns
+an unsupported-capability result immediately. This is a virtual LAN profile;
+native NIC forwarding and IPv6 multicast remain separate work.
+
 The Winsock implementation also handles MSG_WAITALL, TCP urgent data, conditional
 WSAAccept callbacks, extended IPX datagram headers and raw ICMP echo. Tests against
 native Windows run the same 32-bit PE in Windows and in the browser. The native
@@ -96,13 +112,13 @@ uses exclusive native destination leases across rooms and protocols. Conflicts r
 WSAEADDRINUSE; this restriction remains until tuple translation or separate native
 addresses allow independent sockets to coexist. Native socket permissions still apply.
 
-Remaining gaps include SPX, complete multicast behavior, fragmented raw packets and
+Remaining gaps include SPX, native NIC multicast forwarding, IPv6/source-specific/RAW multicast, fragmented raw packets and
 IPv6 extension headers, the full protocol/namespace provider catalogue,
 Win32 file completion routines on sockets created without overlapped support,
 positive-linger timeout/flush, less common socket options and IOCTLs,
 Windows external out-of-line urgent marks, asynchronous ICMP error attribution
 on the default Node UDP backend,
-DirectPlay security, NATResolver, native DirectPlay Host and classic DP4 provider wire interoperability,
+DirectPlay security, NATResolver, native DirectPlay Host beyond one remote Peer and classic DP4 provider wire interoperability,
 DP8 Lobby launcher/descendant association and some provider scheduling policies. An explicit
 unsupported result is only parity when the corresponding native provider returns it
 under the same conditions.
@@ -136,7 +152,7 @@ participant; peer admission sends no dummy datagram. A further test runs the sam
 COM executable under Windows and in the browser as the third participant: 47 observations
 match on each transport, covering Connect, three player callbacks and their contexts,
 direct guaranteed peer delivery, retained receive data, ReturnBuffer and Close callbacks.
-Larger mesh parity, native Host, remote group mutations, name-table resynchronization,
+Larger mesh parity, Host with multiple remote peers, remote group mutations, name-table resynchronization,
 migration and classic DP4 provider wire remain unfinished.
 Native self-send with COMPLETEONPROCESS and multiple buffers has a separate failing
 Windows diagnostic, including a blocked native Close; that case remains under investigation.
@@ -182,6 +198,19 @@ bun run gate
 
 Tests cover actual WebSocket and polling connections, fallback, room isolation,
 maximum UDP payloads, ordered streams, reconnect and guest API contracts.
+
+The 2026-10-23 production25 checkpoint passed the full gate (6642 tests) and
+70 retained SAME-PE browser fixtures (20198 DWORD observations, no differences).
+It includes multicast membership/alias queues, pointer ordering/capacity and
+nonblocking TCP connects to multicast destinations. The same frozen frontend
+also passed connected SetPeerInfo in both guest Host/native Peer and guest
+Peer/native Host roles over WebSocket and polling: 988 observations per case,
+plus INFO callback query/context traces and physical UDP-port retirement.
+Those four cases used the optimized standalone Rust server. The
+[connected peer information oracle](../tools/lan-conformance/directplay8-peer-info.md)
+describes reproducible commands and their scope. Generated evidence is retained
+under `logs/lan-conformance/production-25`; this checkpoint does not establish
+all-game compatibility or the remaining API/provider coverage.
 
 On Windows with a 32-bit MinGW compiler, compare the same PE against native
 Winsock and the browser emulator:

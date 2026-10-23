@@ -1009,8 +1009,21 @@ export function makeSocketExports(
     setLastError: WsaErrorSetter,
     counter: WsaStartupCount = wsaStartupCount,
     process?: Process,
+    legacyIpOptions = false,
 ): Record<string, ThunkImplementation> {
     const sockets = makeNetworkSocketExports(table, setLastError, counter, validateSocketTriple, process);
+    if (legacyIpOptions) {
+        // wsock32's pre-Winsock2 IP option namespace, NT5 wsock32/sockopt.c.
+        const translated: Record<number, number> = { 2: 9, 3: 10, 4: 11, 5: 12, 6: 13, 7: 4, 8: 3 };
+        for (const name of ["setsockopt", "getsockopt"]) {
+            const implementation = sockets[name]!;
+            sockets[name] = (ctx, mem, args) => {
+                if (args[1] !== 0 || translated[args[2]] === undefined) return implementation(ctx, mem, args);
+                const mapped = args.slice(); mapped[2] = translated[args[2]];
+                return implementation(ctx, mem, mapped);
+            };
+        }
+    }
     if (process) Object.assign(sockets, makeNamespaceExports(process, table, counter, setLastError, resolveWsaName, resolverError));
     return sockets;
 }

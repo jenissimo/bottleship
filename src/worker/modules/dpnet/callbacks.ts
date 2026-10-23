@@ -1,5 +1,5 @@
 import type { Process } from "../../core/process";
-import { DirectPlayCallbackExecutor, type DirectPlayCallbackChannel, type DirectPlayCallbackTask } from "./executor";
+import { DirectPlayCallbackExecutor, type DirectPlayCallbackChannel, type DirectPlayCallbackTask, type DirectPlayCallbackReservation } from "./executor";
 import { Mem } from "../../core/memory/mem-accessor";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { nodeToIpv4 } from "../../net/lan-network";
@@ -16,6 +16,7 @@ export class DirectPlay8Callbacks {
     readonly queue: DirectPlayCallbackChannel;
     private waiting: DirectPlayCallbackTask[] = [];
     private waitingBytes = 0;
+    private inlineReservation?: DirectPlayCallbackReservation;
     private retry?: ReturnType<typeof setTimeout>;
     private closed = false;
     private closing = false;
@@ -34,7 +35,15 @@ export class DirectPlay8Callbacks {
         this.queue.onSpace = () => { this.promote(); if (!this.closed) { this.onSpace?.(); this.session.resumeCallbacks(); } };
     }
     get pending(): number { return this.queue.size + this.waiting.length; }
-    native(type: number, size: number, fill: (ptr: number) => void = () => {}, onReturn?: (hr: number, ptr: number) => boolean | void, onDiscard?: () => void, key?: object): boolean {
+    reserveNative(count: number, storageBytes: number): DirectPlayCallbackReservation | undefined {
+        if (this.closed || this.waiting.length) return;
+        return this.queue.executor.reserve(this.queue, count, storageBytes);
+    }
+    usingNative<T>(reservation: DirectPlayCallbackReservation, run: () => T): T {
+        const previous = this.inlineReservation; this.inlineReservation = reservation;
+        try { return run(); } finally { this.inlineReservation = previous; }
+    }
+    native(type: number, size: number, fill: (ptr: number) => void = () => {}, onReturn?: (hr: number, ptr: number) => boolean | void, onDiscard?: () => void, key?: object, reservation = this.inlineReservation): boolean {
         if (this.closed) return false;
         const task: DirectPlayCallbackTask = {
             storageBytes: size + 64, message: type, key,
@@ -54,6 +63,7 @@ export class DirectPlay8Callbacks {
                     onDiscard: () => { free(); onDiscard?.(); } };
             }, onDiscard,
         };
+        if (reservation) return reservation.enqueue(task);
         if (!this.waiting.length && this.queue.enqueue(task)) return true;
         if (this.waiting.length >= 2048 || this.waitingBytes + size + 64 > 8 * 1024 * 1024) return false;
         this.waitingBytes += size + 64; this.waiting.push(task); this.kick(); return true;
@@ -118,7 +128,7 @@ export class DirectPlay8Callbacks {
         if (event.type === 1 || event.type === 0x12) return this.native(event.type, 20, ptr => {
             [id, event.groupContext ?? 0, event.player ?? 0, event.playerContext ?? 0].forEach((n, i) => Mem.writeUint32(ptr + 4 + i * 4, n));
         });
-        if ([4, 0xc, 0xd, 0x10, 0x15].includes(event.type)) return this.native(event.type, 12, ptr => { Mem.writeUint32(ptr + 4, id); Mem.writeUint32(ptr + 8, context); });
+        if ([4, 0xc, 0xd, 0x10, 0x15].includes(event.type)) return this.native(event.type, 12, ptr => { Mem.writeUint32(ptr + 4, id); Mem.writeUint32(ptr + 8, context); }, () => { event.processed?.(); }, () => { event.processed?.(DPN.USERCANCEL); });
         if (event.type === 0x16) {
             const data = event.data ?? new Uint8Array();
             return this.native(0x16, 16 + data.length, ptr => {

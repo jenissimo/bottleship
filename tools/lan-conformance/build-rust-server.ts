@@ -41,7 +41,8 @@ save("inputs-after.json",after);
 let binarySha256:string|null=null;
 const binary="conformance-server"+(process.platform==="win32"?".exe":"");
 if(code===0&&unchanged){
- const built=join(root,"target",release?"release":"debug","examples",binary);
+ const target=process.env.CARGO_TARGET_DIR?resolve(process.env.CARGO_TARGET_DIR):join(root,"target");
+ const built=join(target,release?"release":"debug","examples",binary);
  copyFileSync(built,join(output,binary));binarySha256=hash(join(output,binary));
 }
 const result={command,exitCode:code,sourceCount:before.length,unchanged,binary:binarySha256?binary:null,binarySha256,runtime:{bun:Bun.version,platform:process.platform},inputs:"inputs.json"};

@@ -15,6 +15,7 @@ export class NativeHostBackend implements DirectPlay8Backend {
     readonly localDelivery = new NativeLocalDelivery();
     onChange?: () => void;
     onMessage?: (id: number) => void;
+    onInfo?: (id: number, returned: (result?: number) => void) => void;
     onTermination?: (data: Uint8Array, reason?: number) => void;
     lost = false;
     private port?: NativeDirectPlayPort;
@@ -27,6 +28,7 @@ export class NativeHostBackend implements DirectPlay8Backend {
     constructor(readonly network: LanNetwork, readonly timeout = 25000, readonly retryInterval = 200) {
         this.host = new NativeDirectPlayHost(network);
         this.host.onMessage = id => this.onMessage?.(id);
+        this.host.onInfo = (id, returned) => { if (this.onInfo) this.onInfo(id, returned); else { this.onChange?.(); returned(); } };
         this.host.onChange = () => {
             if (!this.host.desc) {
                 if (this.ready && !this.closing) { this.lost = true; this.localDelivery.cancel(DPN.CONNECTIONLOST); }
@@ -140,7 +142,13 @@ export class NativeHostBackend implements DirectPlay8Backend {
         return results.find(result => result !== DPN.OK) ?? await local;
     }
     send(_from: number, _to: number, _flags: number, _data: Uint8Array): number { return DPN.UNSUPPORTED; }
-    mutate(_change: Record<string, unknown> & { op: string }): Reply { return { hr: DPN.UNSUPPORTED }; }
+    mutate(change: Record<string, unknown> & { op: string }): Reply {
+        if (change.action !== "info") return { hr: DPN.UNSUPPORTED };
+        const named = change.name as { short?: string; shortNull?: boolean } | undefined, data = change.data as number[] | undefined;
+        if (named && typeof named.short !== "string" || data && (!Array.isArray(data) || data.some(n => !Number.isInteger(n) || n < 0 || n > 255))) return { hr: DPN.INVALIDPARAM };
+        return { hr: this.host.setInfo(Number(change.id) >>> 0, (named ? 1 : 0) | (data ? 2 : 0),
+            named?.shortNull ? null : named?.short ?? null, Uint8Array.from(data ?? [])) };
+    }
     kick(_id: number, _data: Uint8Array): number { return DPN.UNSUPPORTED; }
     terminate(_data: Uint8Array, _reason?: number): number { return DPN.UNSUPPORTED; }
     async shutdown(): Promise<number> {

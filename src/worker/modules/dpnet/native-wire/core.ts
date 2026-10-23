@@ -28,6 +28,7 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
     hostId = 0;
     onMessage?: (id: number) => void;
     onChange?: () => void;
+    onInfo?: (id: number, returned: (result?: number) => void) => void;
     onTermination?: (data: Uint8Array, reason?: number) => void;
     private channel?: NativeDirectPlayChannel;
     private port?: NativeDirectPlayPort;
@@ -241,8 +242,14 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
             const entity = this.entities.get(op.id); if (entity) { if (op.mask! & 1) entity.name = { ...entity.name, short: op.name ?? "", shortNull: op.name === null }; if (op.mask! & 2) entity.data = [...op.data!]; }
         }
         const generation = this.generation;
-        this.onChange?.();
-        if (generation === this.generation && op.requesting === this.localId && op.handle) this.complete(op.handle, { hr: DPN.OK, ...(op.command === 0xd7 ? { id: op.id } : {}) });
+        let returned = false;
+        const complete = (result: number = DPN.OK) => {
+            if (returned) return; returned = true;
+            if (generation === this.generation && op.requesting === this.localId && op.handle)
+                this.complete(op.handle, { hr: result, ...(op.command === 0xd7 ? { id: op.id } : {}) });
+        };
+        if (op.command === 0xdb && this.onInfo) this.onInfo(op.id, complete);
+        else { this.onChange?.(); complete(); }
         return true;
     }
     private sendInternal(bytes: Uint8Array, target = this.hostId): Promise<number> { return (target === this.hostId ? this.channel : this.mesh?.channel(target))?.link.sendReliable(bytes) ?? Promise.resolve(DPN.NOCONNECTION); }
@@ -278,7 +285,8 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         if (change.action === "destroy" && change.group) return this.request(0xd5, [id]);
         if (change.action === "member") return this.request(change.add ? 0xd3 : 0xd4, [id, Number(change.member) >>> 0]);
         if (change.action === "info") {
-            const name = (change.name as { short: string } | undefined)?.short, data = change.data as number[] | undefined;
+            const named = change.name as { short: string; shortNull?: boolean } | undefined;
+            const name = named ? named.shortNull ? null : named.short : undefined, data = change.data as number[] | undefined;
             return this.request(0xd6, [id, (name !== undefined ? 1 : 0) | (data !== undefined ? 2 : 0), 0, 0, 0, 0],
                 [{ field: 8, data: nativeCoreWide(name ?? null) }, { field: 16, data: Uint8Array.from(data ?? []) }]);
         }

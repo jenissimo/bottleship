@@ -39,6 +39,29 @@ function patches(ptr: number, data: Uint8Array): DeferredWrite[] {
     return result;
 }
 function dword(address: number, value: number): DeferredWrite { return { address, value, size: 4 }; }
+function multicastProbe(ptr: number, size: number, write = false): boolean {
+    const mem = Mem.getView();
+    return !!mem && !!ptr && Number.isSafeInteger(size) && size >= 0 && isValidUserAddress(mem, ptr, size, write ? "rw" : "r");
+}
+/** Windows probes the full caller capacity, copies option bytes, then publishes optlen. */
+function getMulticastOption(table: WsaSocketTable, sid: number, type: number, option: number, output: number, lengthPtr: number): Prepared {
+    if (!output || !lengthPtr || !multicastProbe(lengthPtr, 4)) return { value: -1, error: WSA.EFAULT };
+    const capacity = Mem.readUint32(lengthPtr)! | 0;
+    if (capacity <= 0) return { value: -1, error: WSA.EFAULT };
+    const canWriteLength = multicastProbe(lengthPtr, 4, true);
+    const rejected = (error: number): Prepared => ({ value: -1, error: canWriteLength ? error : WSA.EFAULT,
+        writes: canWriteLength ? [dword(lengthPtr, 0)] : [] });
+    if (!multicastProbe(output, capacity, true)) return rejected(WSA.EFAULT);
+    if (option === 12 || option === 13) return rejected(WSA.ENOPROTOOPT);
+    if (type !== 2) return rejected(WSA.EINVAL);
+    if (option === 9 && capacity < 4) return rejected(WSA.EFAULT);
+    const size = option === 9 || capacity >= 4 ? 4 : 1;
+    const value = table.getMulticastOption(sid, option);
+    const writes: DeferredWrite[] = [{ address: output, value, size }];
+    if (!canWriteLength) return { value: -1, error: WSA.EFAULT, writes };
+    writes.push(dword(lengthPtr, size));
+    return { value: 0, error: 0, writes };
+}
 function publish(result: Prepared, deferred: boolean): number | ThunkResult {
     if (deferred) return { value: result.value, deferredWrites: result.writes };
     for (const w of result.writes ?? []) {
@@ -311,13 +334,15 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         return { value, error: 0 };
     });
     api.closesocket = adapt(counter, setError, a => ({ value: table.closesocket(a[0]), error: 0 }));
-    api.bind = adapt(counter, setError, a => ({ value: table.bind(a[0], address(a[1], a[2] | 0)) }));
+    api.bind = adapt(counter, setError, a => ({ value: table.bind(a[0], address(a[1], a[2] | 0)), error: 0 }));
     api.listen = adapt(counter, setError, a => ({ value: table.listen(a[0], a[1]) }));
     api.connect = adapt(counter, setError, a => {
-        const peer = address(a[1], a[2] | 0);
+        const peer = address(a[1], a[2] | 0), nonBlocking = table.get(a[0]).nonBlocking;
         try { return { value: table.connect(a[0], peer) }; }
         catch (e) {
-            if (!(e instanceof WsaFailure) || e.code !== WSA.EWOULDBLOCK) throw e;
+            // A committed nonblocking connect keeps its initial pending result,
+            // even when the actor completes before the next owner-side RPC.
+            if (!(e instanceof WsaFailure) || e.code !== WSA.EWOULDBLOCK || nonBlocking) throw e;
             const signal = table.blockingSignal, abort = () => table.cancelConnect(a[0]);
             const result = waitOperation(table, a[0], () => {
                 const s = table.get(a[0]);
@@ -456,7 +481,7 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     api.ioctlsocket = adapt(counter, setError, a => {
         const s = table.get(a[0]); guard(a[2], 4, true);
         switch (a[1] >>> 0) {
-            case 0x8004667e: table.setNonBlocking(s.id, u32(a[2]) !== 0); return { value: 0 };
+            case 0x8004667e: table.setNonBlocking(s.id, u32(a[2]) !== 0); return { value: 0, error: 0 };
             case 0x4004667f: return { value: 0, writes: [dword(a[2], table.bytesAvailable(s.id))] };
             case 0x40047307: return { value: 0, writes: [dword(a[2], +table.atMark(s.id))] };
             default: fail(WSA.EINVAL);
@@ -549,6 +574,22 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     });
     api.setsockopt = adapt(counter, setError, a => {
         const s = table.get(a[0]);
+        if (s.af === 2 && a[1] === 0 && a[2] >= 9 && a[2] <= 13) {
+            const length = a[4] | 0, option = a[2];
+            if (length < 0 || !multicastProbe(a[3], length)) fail(WSA.EFAULT);
+            if (s.type !== 2) fail(WSA.EINVAL);
+            if (!length) fail(WSA.EFAULT);
+            if (option === 12 || option === 13) {
+                if (length < 8) fail(WSA.EFAULT);
+                const request = bytes(a[3], 8);
+                table.changeMulticastMembership(s.id, request.slice(0, 4), request.slice(4, 8), option === 12);
+            } else {
+                if (option === 9 && length < 4) fail(WSA.EFAULT);
+                const value = length >= 4 ? Mem.readUint32(a[3])! : Mem.readUint8(a[3])!;
+                table.setMulticastOption(s.id, option, value);
+            }
+            return { value: 0, error: 0 };
+        }
         if ((s.af === 2 || s.af === 23) && (((a[1] >>> 0) === 0xffff && a[2] === 8) || (a[1] === 6 && a[2] === 1))) {
             // The native TCP provider consumes a BOOLEAN, including when optlen is four.
             guard(a[3], 1);
@@ -616,7 +657,9 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         return { value: 0 };
     });
     api.getsockopt = adapt(counter, setError, a => {
-        const s = table.get(a[0]); guard(a[4], 4, true);
+        const s = table.get(a[0]);
+        if (s.af === 2 && a[1] === 0 && a[2] >= 9 && a[2] <= 13) return getMulticastOption(table, s.id, s.type, a[2], a[3], a[4]);
+        guard(a[4], 4, true);
         if ((s.af === 2 || s.af === 23) && (((a[1] >>> 0) === 0xffff && a[2] === 8) || (a[1] === 6 && a[2] === 1))) {
             if ((u32(a[4]) | 0) < 1) fail(WSA.EFAULT);
             guard(a[3], 1, true);
@@ -677,7 +720,8 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
             case 0x2003: value = table.maxMessageSize(s.id); break;
             default: fail(WSA.ENOPROTOOPT);
         }
-        return { value: 0, writes: [dword(a[3], value), dword(a[4], 4)] };
+        return { value: 0, error: a[2] === 0x1007 ? 0 : undefined,
+            writes: [dword(a[3], value), dword(a[4], 4)] };
     });
     api.WSAAsyncSelect = adapt(counter, setError, a => {
         table.get(a[0]);
@@ -1078,7 +1122,7 @@ export function makeNetworkSelect(table: WsaSocketTable, setError: WsaErrorSette
             return prepare(ready, count);
         };
         const prepare = (ready: number[][], count: number): Prepared => ({
-            value: count,
+            value: count, error: 0,
             writes: pointers.flatMap((ptr, i) => !ptr ? [] : [dword(ptr, ready[i].length),
                 ...ready[i].map((sid, j) => dword(ptr + 4 + j * 4, sid))]),
         });

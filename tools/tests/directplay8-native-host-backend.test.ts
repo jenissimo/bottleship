@@ -10,17 +10,17 @@ const desc:SessionDesc={instance:"0".repeat(32),application:"1122334455667788990
 const cleanup:(()=>void)[]=[];afterEach(()=>{for(const close of cleanup.splice(0))close();});
 async function turns(){for(let i=0;i<16;i++)await Promise.resolve();}
 function scene(){
- const nets=[21,22].map(n=>new LanNetwork(Uint8Array.of(2,0,0,0,0,n))),sent:number[]=[];
- for(const[i,net]of nets.entries())net.attach({send(frame){const dg=decodeDatagram(frame)!;sent.push(dg.proto);nets[1-i].receiveFrame(encodeDatagram(dg.proto,net.node,dg.dstPort,dg.srcPort,dg.payload));return true;},close(){}});
+ const nets=[21,22].map(n=>new LanNetwork(Uint8Array.of(2,0,0,0,0,n))),sent:number[]=[];let blockHost=false;
+ for(const[i,net]of nets.entries())net.attach({send(frame){const dg=decodeDatagram(frame)!;sent.push(dg.proto);if(i===0&&blockHost)return true;nets[1-i].receiveFrame(encodeDatagram(dg.proto,net.node,dg.dstPort,dg.srcPort,dg.payload));return true;},close(){}});
  const session=new DirectPlay8Session(nets[0]);expect(session.initialize()).toBe(0);
  let releases=0,returns=0;const requests:DirectPlay8HostRequest[]=[],events:any[]=[];
- session.onEvent=e=>{events.push(e);};session.onNativeIndicate=()=>({hr:0,data:Uint8Array.of(8,0,9),context:0x7201,returnBuffer(){returns++;}});
+ session.onEvent=e=>{events.push(e);if(e.type===0x10)e.processed?.();};session.onNativeIndicate=()=>({hr:0,data:Uint8Array.of(8,0,9),context:0x7201,returnBuffer(){returns++;}});
  const ready=(request:DirectPlay8HostRequest):DirectPlay8HostReady=>({address:{node:[2,1,127,0,0,1],port:request.localPort},
  allowIncoming:a=>a.node.every((n,i)=>n===nets[1].node[i]),url:a=>"x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=127.0.0.1;port="+a.port,release(){releases++;}});
  const provider={prepare:async(request:DirectPlay8HostRequest)=>{requests.push(request);return ready(request);}};
  const peer=new NativeDirectPlayCore(nets[1],"peer",500,2);
  cleanup.push(()=>{peer.dispose();session.dispose();nets.forEach(n=>n.attach(null));});
- return{nets,session,peer,provider,requests,events,sent,ready,get releases(){return releases;},get returns(){return returns;},
+ return{nets,session,peer,provider,requests,events,sent,ready,blockHostTraffic(){blockHost=true;},get releases(){return releases;},get returns(){return returns;},
  start:()=>session.hostNative(desc,0x7100,provider,2308,[20,0,2,14,500]),
  join:()=>peer.connect({node:[...nets[0].node],port:2308},desc,{name:{short:"Peer",long:""},data:[1,2],flags:0},Uint8Array.of(4,0,5))};
 }
@@ -125,4 +125,70 @@ test("Close cancels native Host pending self processing once and cannot emit a l
  s.session.onEvent=e=>{if(e.type===0x11)processed=e.processed!;};
  const pending=s.session.send(s.session.localId,12,Uint8Array.of(1),undefined,undefined,hr=>results.push(hr));
  s.session.close();expect(results).toEqual([DPN.USERCANCEL]);processed();expect(results).toHaveLength(1);expect(await pending).toBe(DPN.USERCANCEL);expect(s.releases).toBe(1);
+});
+
+test("native Host SetPeerInfo name mask publishes authority and preserves the unselected data",async()=>{
+ const s=scene();expect(await s.session.setInfo(0,{name:"host-initial",data:[0x20,0,0x40,0],flags:0},3)).toBe(0);
+ expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();s.events.length=0;
+ expect(await s.session.setInfo(s.session.localId,{name:"host-\u0416",data:[0xee],flags:0},1)).toBe(0);
+ await turns();
+ expect(s.session.engine.entities.get(s.session.localId)).toMatchObject({name:{short:"host-\u0416"},data:[0x20,0,0x40,0]});
+ expect(s.peer.entities.get(s.session.localId)).toMatchObject({name:{short:"host-\u0416"},data:[0x20,0,0x40,0]});
+ expect(s.events.filter(e=>e.type===0x10)).toMatchObject([{id:s.session.localId,context:0x7100}]);
+});
+test("native Host processes a real D6 peer info request and completes it from authoritative DB",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();s.events.length=0;
+ const id=s.peer.localId;
+ expect((await s.peer.mutate({op:"mutate",action:"info",id,data:[0x31,0,0x50,1]})).hr).toBe(0);
+ expect(s.peer.entities.get(id)).toMatchObject({name:{short:"Peer"},data:[0x31,0,0x50,1]});
+ expect(s.session.engine.entities.get(id)).toMatchObject({name:{short:"Peer"},data:[0x31,0,0x50,1]});
+ expect(s.events.filter(e=>e.type===0x10)).toMatchObject([{id,context:0x7201}]);
+});
+
+test("native Host rejects an info update before mutation when the real reliable queue is full",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();
+ const before=structuredClone(s.session.engine.entities.get(s.session.localId));s.blockHostTraffic();
+ const pending=[];for(let i=0;i<256;i++)pending.push(s.session.engine.sendDpn!(s.peer.localId,8,Uint8Array.of(1)));
+ expect(await s.session.setInfo(s.session.localId,{name:"must-not-publish",data:[],flags:0},1)).toBe(DPN.TABLEFULL);
+ expect(s.session.engine.entities.get(s.session.localId)).toEqual(before);s.session.close();
+ expect(await Promise.all(pending)).toEqual(Array(256).fill(DPN.USERCANCEL));expect(s.nets[0].isBound(2308,PROTO_UDP)).toBe(false);
+});
+test("reentrant Close from native local INFO cancels its reserved broadcast before wire publication",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();let closed=0;
+ s.session.onEvent=e=>{if(e.type===0x10){closed++;s.session.close();e.processed?.();}};
+ expect(await s.session.setInfo(s.session.localId,{name:"retired",data:[],flags:0},1)).toBe(DPN.USERCANCEL);
+ expect(closed).toBe(1);expect(s.peer.entities.get(s.peer.hostId)?.name.short).not.toBe("retired");expect(s.session.engine.entities.size).toBe(0);expect(s.nets[0].isBound(2308,PROTO_UDP)).toBe(false);
+});
+test("reentrant native local INFO updates preserve reserved authoritative FIFO order",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();let once=false,nested:unknown;
+ const seen:string[]=[];s.peer.onChange=()=>{const name=s.peer.entities.get(s.peer.hostId)?.name.short;if(name&&seen.at(-1)!==name)seen.push(name);};
+ s.session.onEvent=e=>{if(e.type===0x10&&!once){once=true;nested=s.session.setInfo(s.session.localId,{name:"inner",data:[],flags:0},1);}if(e.type===0x10)e.processed?.();};
+ expect(await s.session.setInfo(s.session.localId,{name:"outer",data:[],flags:0},1)).toBe(0);expect(await nested).toBe(0);
+ expect(seen).toEqual(["outer","inner"]);expect(s.peer.entities.get(s.peer.hostId)?.name.short).toBe("inner");
+});
+
+test("native Host reserves DB but publishes only after the local INFO consumer returns",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();let returned!:(result?:number)=>void;
+ const before=s.peer.entities.get(s.session.localId)!.name.short;
+ s.session.onEvent=e=>{if(e.type===0x10)returned=e.processed!;};
+ expect(await s.session.setInfo(s.session.localId,{name:"after-handler",data:[],flags:0},1)).toBe(0);
+ expect(s.peer.entities.get(s.session.localId)!.name.short).toBe(before);expect(returned).toBeFunction();
+ returned();await turns();expect(s.peer.entities.get(s.session.localId)!.name.short).toBe("after-handler");returned();expect(s.peer.entities.get(s.session.localId)!.name.short).toBe("after-handler");
+});
+
+test("native repeated empty DATA updates notify Host and the receiving Peer even when bytes are unchanged",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();s.events.length=0;
+ const infos:number[]=[];(s.peer as any).onInfo=(id:number,returned:(hr?:number)=>void)=>{infos.push(id);returned();};
+ for(let n=0;n<2;n++)expect(await s.session.setInfo(s.session.localId,{name:"",data:[],flags:0},2)).toBe(0);
+ await turns();expect(s.events.filter(e=>e.type===0x10)).toHaveLength(2);expect(infos).toEqual([s.session.localId,s.session.localId]);
+});
+
+test("received native DB completes its request once after INFO return and ignores a stale return after Close",async()=>{
+ for(const close of[false,true]){
+  const s=scene();expect(await s.start()).toBe(0);expect(await s.join()).toBe(0);await turns();
+  let returned!:(hr?:number)=>void,complete=0;(s.peer as any).onInfo=(_id:number,done:(hr?:number)=>void)=>{returned=done;};
+  const pending=s.peer.mutate({op:"mutate",action:"info",id:s.peer.localId,data:[8,0,9]}) as Promise<any>;void pending.then(()=>complete++);
+  await turns();expect(returned).toBeFunction();expect(complete).toBe(0);
+  if(close)s.peer.close();returned();returned();expect((await pending).hr).toBe(close?DPN.CONNECTIONLOST:0);await turns();expect(complete).toBe(1);
+ }
 });

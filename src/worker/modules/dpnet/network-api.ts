@@ -19,7 +19,7 @@ import { isExternalIpv4Node } from "../../net/netplay-wire";
 import { DirectPlayAddressApi } from "./address-api";
 import { DirectPlayAddress } from "./address";
 import { DirectPlayGuestMemory } from "./guest-memory";
-import { packApplication, readApplication, readInfo, packInfo, StructBuffer } from "./structures";
+import { packApplication, readApplication, readInfo, packInfo, validateInfo, StructBuffer } from "./structures";
 import { LobbyPeerRegistration } from "../dpnlobby/peer-bridge";
 import type { Lobby8Settings } from "../dpnlobby/structures";
 import { DPN, DP8_TCPIP, DP8_IPX, DP8_PEER, DP8_CLIENT, DP8_SERVER, guidBytes, guidString, utf16 } from "./constants";
@@ -329,10 +329,37 @@ export class DirectPlay8NetworkApi {
             const reply = s.session.engine.mutate({ op: "mutate", action: "session", desc });
             return reply instanceof Promise ? reply.then<number>(v => dp8Result(v.hr)) : dp8Result(reply.hr);
         };
-        methods.SetInfo = (s, a) => {
+        methods.SetInfo = (s, a, _iface, ctx) => {
             if (a[4] & ~SYNC) return DPN.INVALIDFLAGS;
-            const info = readInfo(this.guest, a[1]); if (!info || info.info.flags) return DPN.INVALIDPARAM;
-            return this.operation(s, a[2], a[3], a[4], "other", () => s.session.setInfo(s.session.localId, info.info, info.mask));
+            const invalid = validateInfo(this.guest, a[1]); if (invalid) return invalid;
+            const info = readInfo(this.guest, a[1])!;
+            if (a[4] & SYNC ? !!a[3] || (_iface !== "IDirectPlay8Peer" && !!a[2]) : !a[3]) return DPN.INVALIDPARAM;
+            if (a[3] && !this.guest.valid(a[3], 4, "rw")) return DPN.INVALIDPOINTER;
+            if (s.session.engine.kind === "native" && s.session.engine.isHost && s.callbacks) {
+                const callbacks = s.callbacks, async = !(a[4] & SYNC), resume = callbacks.queue.pause();
+                const generation = s.generation, epoch = this.process.resetGeneration;
+                const current = () => generation === s.generation && epoch === this.process.resetGeneration && s.callbacks === callbacks && !s.closing;
+                const reserved = callbacks.reserveNative(async ? 2 : 1, async ? 156 : 76);
+                if (!reserved) { resume(); return DPN.TABLEFULL; }
+                const finish = () => { reserved.release(); resume(); };
+                let finalResult: number = async ? DPN.PENDING : DPN.OK;
+                const context = a[2], handlePtr = a[3];
+                const completed = () => {
+                    if (!current()) { finalResult = DPN.USERCANCEL; return; }
+                    const handle = this.handle(s);
+                    if (!callbacks.native(3, 16, ptr => { [handle, context, DPN.OK].forEach((n, i) => Mem.writeUint32(ptr + 4 + i * 4, n)); }, undefined, undefined, undefined, reserved)) { finalResult = DPN.TABLEFULL; return; }
+                    Mem.writeUint32(handlePtr, handle);
+                };
+                let value: number | Promise<number>;
+                try { value = callbacks.usingNative(reserved, () => s.session.setInfo(s.session.localId, info.info, info.mask, async ? completed : undefined)); }
+                catch { finish(); return DPN.GENERIC; }
+                // Host local notification returns on this owner; native peers still complete from DB.
+                if (typeof value !== "number") { finish(); return value.then<ThunkResult>(hr => ({ value: hr || DPN.GENERIC })); }
+                if (value || !current()) { finish(); return value || DPN.USERCANCEL; }
+                return callbacks.queue.runSelected(ctx, 20, task => task.message === 0x10 || task.message === 3,
+                    () => current() ? finalResult : DPN.USERCANCEL, finish);
+            }
+            return this.operation(s, a[4] & SYNC ? 0 : a[2], a[3], a[4], "other", () => s.session.setInfo(s.session.localId, info.info, info.mask));
         };
         methods.GetInfo = (s, a) => {
             if (a[4]) return DPN.INVALIDFLAGS; if (s.session.error) return s.session.error;

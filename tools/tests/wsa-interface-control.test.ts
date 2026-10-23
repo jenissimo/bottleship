@@ -30,7 +30,7 @@ function event(){const h=scheduler.createEvent(true,false);handles.push(h);set(o
 test('interface control overlapped publication signals its event after fresh owner writes',async()=>{
  const e=event();expect(answer(ioctl())).toBe(-1);expect(error).toBe(997);expect(get(returned)).toBe(0xdeadbeef);expect(e.signaled).toBe(false);
  const foreign=new Uint8Array(2<<20);Mem.bind(()=>foreign);await tick();
- expect(get(ov)).toBe(0);expect(get(ov+4)).toBe(152);expect(get(ov+8)).toBe(0xaaaa);expect(e.signaled).toBe(true);expect(get(out)).toBe(3);expect(foreign[out]).toBe(0);
+ expect(get(ov)).toBe(0);expect(get(ov+4)).toBe(152);expect(get(ov+8)).toBe(0xaaaa);expect(e.signaled).toBe(true);expect(get(out)).toBe(0x13);expect(foreign[out]).toBe(0);
 });
 test('control query is independent of a pending receive on the same file object',async()=>{
  event();const provider=getWsaOverlapped(state.table,owner);
@@ -38,7 +38,7 @@ test('control query is independent of a pending receive on the same file object'
  expect(answer(ioctl())).toBe(-1);expect(error).toBe(997);await tick();expect(get(ov)).toBe(0);expect(get(ov+64)).toBe(259);
 });
 test('short control output completes with STATUS_BUFFER_TOO_SMALL and WSAEFAULT',async()=>{
- const e=event();expect(answer(ioctl(out,76))).toBe(-1);expect(error).toBe(997);await tick();expect(e.signaled).toBe(true);expect(get(ov)).toBe(0xc0000023);expect(get(ov+4)).toBe(0);expect(get(out)).toBe(3);
+ const e=event();expect(answer(ioctl(out,76))).toBe(-1);expect(error).toBe(997);await tick();expect(e.signaled).toBe(true);expect(get(ov)).toBe(0xc0000023);expect(get(ov+4)).toBe(0);expect(get(out)).toBe(0x13);
  expect(answer(api.WSAGetOverlappedResult(ctx,ram,[socket,ov,returned,0,returned+4]))).toBe(0);expect(error).toBe(10014);expect(get(returned)).toBe(0);
 });
 test('IOCP control completion defers status until dequeue and reports Win32 buffer-too-small',async()=>{

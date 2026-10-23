@@ -5,6 +5,7 @@ import { NetResolveError } from "./resolve";
 import {
     asBytes, decodeDatagram, isDatagramProtocol, isBroadcastNode, isLanNode, nodeKey, nodeToIpv4,
     PROTOCOL_VERSION, MAX_FRAME_SIZE, SOCKET_PATH, validBindingGeneration, validPort, isProtocol,
+    PROTO_UDP, isMulticastIpv4Node,
     type ClientEvents, type ServerEvents, type UdpPeerLeaseRequest,type UdpPeerLeaseReply,validUdpPeerLeaseRequest,
 } from "./protocol";
 
@@ -111,7 +112,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
     });
     io.on("connection", socket => {
         const { room, lease } = socket.data as { room: Room; lease: Lease };
-        socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4, gatewayIpv6: gatewayRoutes.advertisedIpv6 });
+        socket.emit("ready", { version: PROTOCOL_VERSION, node: Array.from(lease.node), ipv4: Array.from(nodeToIpv4(lease.node)), gatewayIpv4: gatewayRoutes.advertisedIpv4, gatewayIpv6: gatewayRoutes.advertisedIpv6, udpMulticast4V1: true });
         const queue = { frames: 0, bytes: 0 };
         pending.set(socket, queue);
         socket.conn.on("drain", () => { queue.frames = 0; queue.bytes = 0; });
@@ -154,6 +155,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if(udpPending.size>=16||udpLeases.size+udpPending.size>=Math.min(128,options.gateway?.maxUdpFlows??128)){
                 udpReply(id,{error:{code:10055,message:"UDP peer lease limit reached"}});return;
             }
+            if (request.proto === PROTO_UDP) admitUdp(request.localPort, request.bindingGeneration);
             const controller=new AbortController(),entry={request:{proto:request.proto,localPort:request.localPort,bindingGeneration:request.bindingGeneration,node:request.node.slice(),remotePort:request.remotePort},controller};
             udpPending.set(id,entry);
             if(isProtocol(request.proto)&&validPort(request.localPort)&&validBindingGeneration(request.bindingGeneration))
@@ -198,6 +200,16 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             ).finally(() => resolving.delete(id));
         });
         socket.on("cancelResolve", id => { const entry = resolving.get(id); if (entry) entry.cancelled = true; });
+        // At most one entry per UDP port. Tombstones stay until this connection
+        // retires; evicting them would let delayed multicast revive a closed bind.
+        const udpBindings = new Map<number, {generation: number; released: boolean}>();
+        const admitUdp = (port: number, generation: number | undefined): boolean => {
+            const previous = udpBindings.get(port);
+            if (generation === undefined) return previous === undefined;
+            if (previous && (generation < previous.generation || generation === previous.generation && previous.released)) return false;
+            if (!previous || generation > previous.generation) udpBindings.set(port, {generation, released: false});
+            return true;
+        };
         let windowStart = Date.now(), frames = 0, bytes = 0;
         const withinLimits = (size: number): boolean => {
             const now = Date.now();
@@ -209,7 +221,10 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         };
         socket.on("releasePort", (proto, port, generation) => {
             if (!isProtocol(proto) || !validPort(port) || !validBindingGeneration(generation)) { socket.disconnect(true); return; }
-            if (withinLimits(16)) {retireUdpLeases(proto,port,generation,true);gateway.releasePort(proto, port, generation);}
+            if (withinLimits(16)) {
+                if (proto === PROTO_UDP && generation >= (udpBindings.get(port)?.generation ?? 0)) udpBindings.set(port, {generation, released: true});
+                retireUdpLeases(proto,port,generation,true);gateway.releasePort(proto, port, generation);
+            }
         });
         socket.on("frame", (input, generation) => {
             const frame = asBytes(input);
@@ -218,11 +233,24 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (!withinLimits(frame.byteLength)) return;
             datagram.bindingGeneration = generation;
             if(generation!==undefined)retireUdpLeases(datagram.proto,datagram.srcPort,generation,false);
-            if (gateway.handle(datagram)) return;
-            const broadcast = isBroadcastNode(datagram.node);
-            const destination = broadcast ? null : room.peers.get(nodeKey(datagram.node));
+            const multicast = datagram.multicast4;
+            if (multicast) {
+                // The shared decoder accepts the reverse, server-to-client form
+                // too. Only an exact group destination is legal in this direction.
+                if (!isMulticastIpv4Node(datagram.node)) { socket.disconnect(true); return; }
+                if (!admitUdp(datagram.srcPort, generation)) return;
+                if (multicast.interfaceIndex === 1 || multicast.ttl === 0) return;
+            } else {
+                // Observe tagged ordinary UDP without changing its established
+                // routing; a later multicast cannot regress this binding epoch.
+                if (datagram.proto === PROTO_UDP) admitUdp(datagram.srcPort, generation);
+                if (gateway.handle(datagram)) return;
+            }
+            const broadcast = !multicast && isBroadcastNode(datagram.node);
+            const destination = broadcast || multicast ? null : room.peers.get(nodeKey(datagram.node));
             const forwarded = frame.slice();
             forwarded.set(lease.node, 2);
+            if (multicast) forwarded[16] = 2; // Trusted virtual LAN ingress.
             const unreliable = isDatagramProtocol(datagram.proto);
             if (!unreliable && destination && !destination.socket) notifyPeerLeft(socket, destination.node);
             const deliver = (peer: Lease): void => {
@@ -238,7 +266,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
                 queued.bytes += forwarded.byteLength;
                 recipient.emit("frame", forwarded);
             };
-            if (broadcast) { for (const peer of room.peers.values()) deliver(peer); }
+            if (broadcast || multicast) { for (const peer of room.peers.values()) deliver(peer); }
             else if (destination) deliver(destination);
         });
         socket.on("disconnect", () => {

@@ -9,6 +9,8 @@ pub const TCP_HEADER: usize = 20;
 pub const TCP_WINDOW: u32 = 262144;
 pub const TCP_SEGMENT: usize = 16384;
 pub type Node = [u8; 6];
+mod multicast4;
+pub use multicast4::*;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Arg {
@@ -121,6 +123,9 @@ impl Datagram {
         }
         let mut n = [0; 6];
         n.copy_from_slice(&b[2..8]);
+        if is_multicast4_node(&n) {
+            return Err(WireError("Multicast destination requires type3"));
+        }
         Ok(Self {
             proto,
             node: n,
@@ -309,6 +314,10 @@ impl UdpHostRequest {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
+    Multicast4 {
+        datagram: Multicast4Datagram,
+        generation: Option<u32>,
+    },
     Frame {
         datagram: Datagram,
         generation: Option<u32>,
@@ -376,10 +385,17 @@ pub fn decode_event(name: &str, args: &[Arg]) -> Result<InboundEvent, DecodeErro
             } else {
                 Some(j(1).and_then(|v| positive(v, u32::MAX)).ok_or_else(fail)?)
             };
-            Ok(InboundEvent::Frame {
-                datagram: Datagram::decode(b).map_err(Fatal)?,
-                generation,
-            })
+            if b.first() == Some(&WIRE_DGRAM_MULTICAST4) {
+                Ok(InboundEvent::Multicast4 {
+                    datagram: Multicast4Datagram::decode(b).map_err(Fatal)?,
+                    generation,
+                })
+            } else {
+                Ok(InboundEvent::Frame {
+                    datagram: Datagram::decode(b).map_err(Fatal)?,
+                    generation,
+                })
+            }
         }
         "releasePort" => {
             if args.len() != 3 {

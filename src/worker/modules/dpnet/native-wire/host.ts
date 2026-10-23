@@ -8,6 +8,8 @@ import { DN, decodeNativeProtocolFrame } from "./frame-codec";
 import type { NativeReassembledMessage } from "./receive-window";
 import { decodeNativePlayerConnect, encodeNativeCoreConnectInfo, type NativeCoreApplication, type NativePlayerConnectInfo, type NativeNameTableEntry } from "./core-connect-codec";
 import { decodeNativeCoreOperation, nativeCoreWords } from "./core-operations";
+import { decodeNativeInfoRequest, encodeNativeInfoUpdate, type NativeInfoRequest } from "./info-operations";
+import type { NativeReliableReservation } from "./reliable-link";
 
 export interface NativeHostDecision { hr: number; data?: Uint8Array; context?: unknown; release?(): void; returnBuffer?(): void | Promise<void>; }
 export interface NativeHostJoin { address: Address; info: NativePlayerConnectInfo; signal: AbortSignal; }
@@ -44,6 +46,7 @@ export class NativeDirectPlayHost {
     readonly queue: DirectPlay8Message[] = [];
     onChange?: () => void;
     onMessage?: (id: number) => void;
+    onInfo?: (id: number, returned: (result?: number) => void) => void;
     localId = 0;
     desc: SessionDesc | null = null;
     private port?: NativeDirectPlayPort;
@@ -151,6 +154,12 @@ export class NativeDirectPlayHost {
             if (info) { c.phase = "admitting"; void this.admit(c, info, message.payload.length); }
             return true;
         }
+        const info = decodeNativeInfoRequest(message.payload);
+        if (info && c.phase === "connected") {
+            const result = this.updateInfo(info, c.id!);
+            if (result && this.live(c)) void c.channel!.link.sendReliable(nativeCoreWords(0xde, info.handle, result)).then(hr => { if (hr && this.live(c)) this.retire(c, hr); });
+            return true;
+        }
         const op = decodeNativeCoreOperation(message.payload); if (!op) return true;
         if (op.command === 0xc3 && c.phase === "table") { c.c3 = true; this.promote(c); }
         else if (op.command === 0xc9 && c.phase === "connected" && op.version <= this.version)
@@ -162,6 +171,54 @@ export class NativeDirectPlayHost {
             });
         }
         return true;
+    }
+    setInfo(id: number, mask: number, name: string | null, data: Uint8Array): number {
+        return this.updateInfo({ id, mask, name, data, handle: 0 }, this.localId);
+    }
+    private updateInfo(info: NativeInfoRequest, requesting: number): number {
+        if (this.closing) return DPN.ALREADYCLOSING;
+        if (!this.desc || !this.port?.live) return DPN.NOCONNECTION;
+        const entity = this.entities.get(info.id), connection = [...this.connections.values()].find(c => c.id === info.id && c.phase === "connected");
+        const entry = info.id === this.localId ? this.hostEntry : connection?.entry;
+        if (!entity || !entry || entity.group) return DPN.INVALIDPLAYER;
+        if (info.mask & ~3) return DPN.INVALIDFLAGS;
+        if ((info.mask & 1) && (info.name?.length ?? 0) > 1024 || (info.mask & 2) && info.data.length > 60000) return DPN.DATATOOLARGE;
+        if (this.version >= 0xfffffffe) return DPN.TABLEFULL;
+        const generation = this.generation, version = this.version + 1;
+        let packet: Uint8Array, data: Uint8Array, dataList: number[];
+        try { data = info.mask & 2 ? info.data.slice() : entry.data; dataList = info.mask & 2 ? [...data] : entity.data; packet = encodeNativeInfoUpdate({ ...info, data, version, requesting }); }
+        catch { return DPN.OUTOFMEMORY; }
+        const held: { connection: Connection; reservation: NativeReliableReservation }[] = [];
+        for (const c of this.connections.values()) if (c.phase === "connected") {
+            const reservation = c.channel!.link.reserveReliable(packet);
+            if (typeof reservation === "number") { for (const h of held) h.reservation.cancel(); return reservation; }
+            held.push({ connection: c, reservation });
+        }
+        // Native notifies local PEER_INFO before broadcasting its authoritative update.
+        this.version = version;
+        if (info.mask & 1) { entry.name = info.name; entity.name = { ...entity.name, short: info.name ?? "", shortNull: info.name === null }; }
+        if (info.mask & 2) { entry.data = data; entity.data = dataList; }
+        let published = false, notificationError: number = DPN.OK;
+        const publish = (result: number = DPN.OK) => {
+            if (published) return; published = true;
+            if (result || generation !== this.generation || this.closing || !this.desc) {
+                for (const h of held) h.reservation.cancel();
+                if (result && generation === this.generation && !this.closing) this.close();
+                return;
+            }
+            for (const { connection: c, reservation } of held) {
+                reservation.start();
+                void reservation.result.then(hr => { if (hr && this.live(c)) this.retire(c, hr); });
+            }
+        };
+        try {
+            if (this.onInfo) this.onInfo(info.id, publish);
+            else if (this.notifyChange()) publish();
+            else { notificationError = DPN.GENERIC; publish(notificationError); }
+        } catch { notificationError = DPN.GENERIC; publish(notificationError); }
+        if (notificationError) return notificationError;
+        if (generation !== this.generation || this.closing || !this.desc) return DPN.USERCANCEL;
+        return DPN.OK;
     }
     private validate(info: NativePlayerConnectInfo): number {
         const app = this.options!.application;

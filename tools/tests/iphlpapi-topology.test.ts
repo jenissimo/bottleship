@@ -55,17 +55,17 @@ function socketApi(family=2){const table=new WsaSocketTable(net);tables.push(tab
 function ioctl(api:any,socket:number,output=out,size=capacity,returned=ptr){return value(api.WSAIoctl(ctx,ram,[socket,0x4004747f,0,0,output,size,returned,0,0]));}
 test('native SIO_GET_INTERFACE_LIST publishes the same IPv4 topology without binding its socket',()=>{
  const {api,socket,table}=socketApi();ram.fill(0xa5,out,out+capacity);set(ptr,0xdeadbeef);error=0x1234;
- expect(ioctl(api,socket)).toBe(0);expect(error).toBe(0);expect(word(ptr)).toBe(152);expect(word(out)).toBe(3);expect([...ram.slice(out+8,out+12)]).toEqual([10,7,6,5]);expect(ram[out+152]).toBe(0xa5);expect(table.get(socket).local).toBeNull();
+ expect(ioctl(api,socket)).toBe(0);expect(error).toBe(0);expect(word(ptr)).toBe(152);expect(word(out)).toBe(19);expect([...ram.slice(out+8,out+12)]).toEqual([10,7,6,5]);expect(ram[out+152]).toBe(0xa5);expect(table.get(socket).local).toBeNull();
 });
 test('native SIO_GET_INTERFACE_LIST short output retains complete prefix records and resets returned bytes',()=>{
  const {api,socket}=socketApi();ram.fill(0xa5,out,out+capacity);set(ptr,0xdeadbeef);
- expect(ioctl(api,socket,out,76)).toBe(-1);expect(error).toBe(10014);expect(word(ptr)).toBe(0);expect(word(out)).toBe(3);expect(ram[out+76]).toBe(0xa5);
+ expect(ioctl(api,socket,out,76)).toBe(-1);expect(error).toBe(10014);expect(word(ptr)).toBe(0);expect(word(out)).toBe(19);expect(ram[out+76]).toBe(0xa5);
 });
 test('native interface list full-capacity protection probing precedes output, while byte-count protection is checked last',()=>{
  const {api,socket}=socketApi();ram.fill(0xa5,out,out+capacity);set(ptr,0xdeadbeef);protect(out+4096,4096,'r');
  expect(ioctl(api,socket)).toBe(-1);expect(error).toBe(10014);expect(word(ptr)).toBe(0);expect(ram[out]).toBe(0xa5);
  space=new AddressSpace(()=>ram);Object.assign(owner,{addressSpace:space});set(ptr,0xdeadbeef);protect(ptr,4096,'r');
- expect(ioctl(api,socket)).toBe(-1);expect(error).toBe(10014);expect(word(ptr)).toBe(0xdeadbeef);expect(word(out)).toBe(3);
+ expect(ioctl(api,socket)).toBe(-1);expect(error).toBe(10014);expect(word(ptr)).toBe(0xdeadbeef);expect(word(out)).toBe(19);
 });
 test('native interface list NULL byte-count pointer is rejected before touching output',()=>{
  const {api,socket}=socketApi();ram.fill(0xa5,out,out+capacity);

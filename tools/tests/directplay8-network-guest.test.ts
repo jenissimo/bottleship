@@ -585,3 +585,82 @@ test("old native Host completion cannot allocate callbacks after API or process 
     expect(typeof owner === "number" ? owner : owner.value).toBe(DPN.USERCANCEL);
     expect(calls).toEqual([]); expect(ram.every(n => n === 0xa5)).toBe(true); expect(h.released).toBe(1);
 });
+
+test("measured SetPeerInfo ignores SYNC async context and validates masked-out fields without mutation",async()=>{
+ initialize();write(0x3000,24);write(0x3004,1);write(0x3008,0x3100);ram.set(utf16("Host\0"),0x3100);
+ expect((await call("SetPeerInfo",[0x3000,0xb002,0,0x80000000]) as ThunkResult).value).toBe(0);
+ write(0x300c,0x3500);write(0x3010,1);ram[0x3500]=7;
+ expect(await call("SetPeerInfo",[0x3000,0,0,0x80000000])).toBe(DPN.INVALIDPARAM);
+ write(0x3004,2);
+ expect(await call("SetPeerInfo",[0x3000,0,0,0x80000000])).toBe(0x80158440);
+ write(0x3008,0);write(0x3004,4);
+ expect(await call("SetPeerInfo",[0x3000,0,0,0x80000000])).toBe(DPN.INVALIDFLAGS);
+});
+
+test("native Host async SetPeerInfo dispatches INFO and completion before return without a host microtask",async()=>{
+ const h=nativeHostCall();h.finish();const ready=await h.result as ThunkResult;
+ const owner=ready.resumeOnOwner!({esp:0x9000,returnAddr:0x7100,mem:ram}) as ThunkResult;
+ expect(owner.startCallbackChain!({esp:0x9000,returnAddr:0x7100,mem:ram})).toBe(true);
+ const create=calls.at(-1)!,id=read(create.args[2]+4);write(create.args[2]+8,0xa100);expect(create.done(0)).toBe(0);
+ write(0x3000,24);write(0x3004,1);write(0x3008,0x3100);ram.set(utf16("host-\u0416\0"),0x3100);write(0x3600,0xeeeeeeee);
+ const result=call("SetPeerInfo",[0x3000,0xb006,0x3600,0]) as ThunkResult;
+ expect(result.suspendedForCallback).toBe(true);
+ const info=calls.at(-1)!;expect(info.args[1]).toBe(0xffff0010);expect(read(info.args[2])).toBe(12);expect(read(info.args[2]+4)).toBe(id);expect(read(info.args[2]+8)).toBe(0xa100);
+ write(0x3200,128);write(0x3300,24);expect(call("GetPeerInfo",[id,0x3300,0x3200,0])).toBe(0);
+ expect(read(0x3308)).toBeGreaterThan(0);expect(info.done(0)).toBeNull();info.enumerationState!.continueEnumeration();
+ const completion=calls.at(-1)!;expect(completion.args[1]).toBe(0xffff0003);expect(read(completion.args[2])).toBe(16);expect(read(completion.args[2]+4)).toBe(read(0x3600));expect(read(completion.args[2]+8)).toBe(0xb006);expect(read(completion.args[2]+12)).toBe(0);
+ expect(completion.done(0)).toBe(DPN.PENDING);
+});
+
+test("native Host SetPeerInfo keeps NULL name separate from an empty UTF16 string and preserves selected data",async()=>{
+ const h=nativeHostCall();h.finish();const ready=await h.result as ThunkResult,owner=ready.resumeOnOwner!({esp:0x9000,returnAddr:0x7100,mem:ram}) as ThunkResult;
+ expect(owner.startCallbackChain!({esp:0x9000,returnAddr:0x7100,mem:ram})).toBe(true);const create=calls.at(-1)!,id=read(create.args[2]+4);expect(create.done(0)).toBe(0);
+ write(0x3000,24);write(0x3004,3);write(0x3008,0x3100);ram.set(utf16("initial\0"),0x3100);write(0x300c,0x3500);write(0x3010,4);ram.set([0x20,0,0x40,0],0x3500);
+ const first=call("SetPeerInfo",[0x3000,0xb002,0,0x80000000]) as ThunkResult;expect(first.suspendedForCallback).toBe(true);expect(calls.at(-1)!.done(0)).toBe(0);
+ for(const [pointer,size]of[[0,28],[0x3100,30]]){
+  write(0x3004,1);write(0x3008,pointer);write(0x300c,0);write(0x3010,0);ram.set(utf16("\0"),0x3100);
+  const result=call("SetPeerInfo",[0x3000,0xb004,0,0x80000000]) as ThunkResult;expect(result.suspendedForCallback).toBe(true);
+  const info=calls.at(-1)!;expect(info.args[1]).toBe(0xffff0010);write(0x3200,128);write(0x3300,24);expect(call("GetPeerInfo",[id,0x3300,0x3200,0])).toBe(0);
+  expect(read(0x3200)).toBe(size);expect(read(0x3308)!==0).toBe(!!pointer);expect(read(0x3310)).toBe(4);expect([...ram.slice(read(0x330c),read(0x330c)+4)]).toEqual([0x20,0,0x40,0]);expect(info.done(0)).toBe(0);
+ }
+});
+
+test("native Host SetPeerInfo refuses callback saturation before mutation or async HANDLE output",async()=>{
+ const h=nativeHostCall();h.finish();const ready=await h.result as ThunkResult,owner=ready.resumeOnOwner!({esp:0x9000,returnAddr:0x7100,mem:ram}) as ThunkResult;
+ owner.startCallbackChain!({esp:0x9000,returnAddr:0x7100,mem:ram});const create=calls.at(-1)!,id=read(create.args[2]+4);create.done(0);
+ const state=[...(api as any).states.values()][0],cb=state.callbacks,resume=cb.queue.pause();
+ for(let n=0;n<256;n++)expect(cb.native(2,0)).toBe(true);
+ write(0x3000,24);write(0x3004,1);write(0x3008,0x3100);ram.set(utf16("blocked\0"),0x3100);write(0x3600,0xeeeeeeee);
+ expect(call("SetPeerInfo",[0x3000,0xb006,0x3600,0])).toBe(DPN.TABLEFULL);expect(read(0x3600)).toBe(0xeeeeeeee);
+ expect(state.session.engine.entities.get(id).name.short).not.toBe("blocked");resume();
+});
+
+test("nested native Host SetPeerInfo completes the inner INFO before publishing the outer async HANDLE",async()=>{
+ const h=nativeHostCall();h.finish();const ready=await h.result as ThunkResult,owner=ready.resumeOnOwner!({esp:0x9000,returnAddr:0x7100,mem:ram}) as ThunkResult;
+ owner.startCallbackChain!({esp:0x9000,returnAddr:0x7100,mem:ram});calls.at(-1)!.done(0);
+ write(0x3000,24);write(0x3004,1);write(0x3008,0x3100);ram.set(utf16("outer\0"),0x3100);write(0x3600,0xeeeeeeee);write(0x3604,0xdddddddd);
+ const outer=call("SetPeerInfo",[0x3000,0xb006,0x3600,0]) as ThunkResult;expect(outer.suspendedForCallback).toBe(true);const info1=calls.at(-1)!;
+ expect(read(0x3600)).toBe(0xeeeeeeee);
+ ram.set(utf16("inner\0"),0x3100);const inner=call("SetPeerInfo",[0x3000,0xb007,0x3604,0]) as ThunkResult;expect(inner.suspendedForCallback).toBe(true);
+ const info2=calls.at(-1)!;expect(info2.args[1]).toBe(0xffff0010);expect(read(0x3604)).toBe(0xdddddddd);
+ expect(info2.done(0)).toBeNull();info2.enumerationState!.continueEnumeration();const done2=calls.at(-1)!;expect(done2.args[1]).toBe(0xffff0003);expect(read(done2.args[2]+8)).toBe(0xb007);expect(done2.done(0)).toBe(DPN.PENDING);expect(read(0x3600)).toBe(0xeeeeeeee);
+ expect(info1.done(0)).toBeNull();info1.enumerationState!.continueEnumeration();const done1=calls.at(-1)!;expect(read(done1.args[2]+8)).toBe(0xb006);expect(done1.done(0)).toBe(DPN.PENDING);
+});
+
+test("reentrant callback pressure cannot steal the native Host completion reservation",async()=>{
+ const h=nativeHostCall();h.finish();const ready=await h.result as ThunkResult,owner=ready.resumeOnOwner!({esp:0x9000,returnAddr:0x7100,mem:ram}) as ThunkResult;
+ owner.startCallbackChain!({esp:0x9000,returnAddr:0x7100,mem:ram});calls.at(-1)!.done(0);
+ write(0x3000,24);write(0x3004,1);write(0x3008,0x3100);ram.set(utf16("reserved\0"),0x3100);
+ const outer=call("SetPeerInfo",[0x3000,0xb006,0x3600,0]) as ThunkResult;expect(outer.suspendedForCallback).toBe(true);const info=calls.at(-1)!;
+ const cb=[...(api as any).states.values()][0].callbacks;for(let n=0;n<254;n++)expect(cb.native(2,0)).toBe(true);
+ expect(cb.queue.size).toBe(255);expect(info.done(0)).toBeNull();info.enumerationState!.continueEnumeration();const done=calls.at(-1)!;expect(done.args[1]).toBe(0xffff0003);expect(done.done(0)).toBe(DPN.PENDING);
+});
+
+for(const [iface,method]of[["IDirectPlay8Client","SetClientInfo"],["IDirectPlay8Server","SetServerInfo"]]){
+ test(iface+" preserves its existing SYNC-context rejection without relaxing measured PeerInfo",()=>{
+  expect(call("Initialize",[0x1234,0x7000,0],iface)).toBe(0);
+  write(0x3000,24);write(0x3004,1);write(0x3008,0x3100);ram.set(utf16("unchanged\0"),0x3100);
+  expect(call(method,[0x3000,0xb002,0,0x80000000],iface)).toBe(DPN.INVALIDPARAM);
+  const state=[...(api as any).states.values()][0];expect(state.session.localInfo.name).toBe("");
+ });
+}

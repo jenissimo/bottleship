@@ -36,11 +36,11 @@ export function getVirtualNetworkTopology(network: LanNetwork = lanNetwork): Vir
     const loopback6=new Uint8Array(16);loopback6[15]=1;
     return {identity:hex,hostname:virtualHostName(network),interfaces:[
         {index:2,name:`{42534C4E-0000-4000-8000-${hex}}`,description:'BottleShip virtual LAN',
-            physicalAddress:node,type:6,loopback:false,up:true,broadcast:true,multicast:false,mtu:1500,
+            physicalAddress:node,type:6,loopback:false,up:true,broadcast:true,multicast:true,mtu:1500,
             addresses:[{family:2,address:network.ipv4.slice(),prefixLength:8,scopeId:0},
                 {family:23,address:network.ipv6.slice(),prefixLength:LAN_IPV6_PREFIX.length*8,scopeId:0}]},
         {index:1,name:'{42534C4E-0000-4000-8000-000000000001}',description:'Software Loopback Interface',
-            physicalAddress:new Uint8Array(0),type:24,loopback:true,up:true,broadcast:false,multicast:false,mtu:65536,
+            physicalAddress:new Uint8Array(0),type:24,loopback:true,up:true,broadcast:false,multicast:true,mtu:65536,
             addresses:[{family:2,address:Uint8Array.of(127,0,0,1),prefixLength:8,scopeId:0},
                 {family:23,address:loopback6,prefixLength:128,scopeId:0}]},
     ]};
@@ -62,7 +62,7 @@ export function encodeInterfaceList(topology: VirtualNetworkTopology): Uint8Arra
     }
     return bytes;
 }
-/** Prefix routes owned by this adapter, excluding unsupported multicast routes. */
+/** Prefix routes owned by this adapter; multicast support currently covers IPv4 UDP. */
 export function getVirtualInterfacePrefixes(adapter:VirtualNetworkInterface):VirtualUnicastAddress[] {
     const result:VirtualUnicastAddress[]=[];
     const add=(address:VirtualUnicastAddress)=>{
@@ -77,6 +77,8 @@ export function getVirtualInterfacePrefixes(adapter:VirtualNetworkInterface):Vir
             add({...address,address:Uint8Array.of(255,255,255,255),prefixLength:32});
         }
     }
+    if(adapter.multicast&&adapter.addresses.some(address=>address.family===2))
+        add({family:2,address:Uint8Array.of(224,0,0,0),prefixLength:4,scopeId:0});
     return result;
 }
 export function prefixMask(length: number,bits: number): Uint8Array {

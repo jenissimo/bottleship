@@ -7,10 +7,10 @@ import type { NativeHostDecision, NativeHostJoin } from "./native-wire/host";
 import { NativeDirectPlayCore } from "./native-wire/core";
 
 export type DirectPlay8Role = "peer" | "client" | "server";
-export interface PlayerInfo { name: string; data: number[]; flags: number; }
+export interface PlayerInfo { name: string; nameNull?: boolean; data: number[]; flags: number; }
 export interface DirectPlay8Event {
     type: number; id?: number; player?: number; owner?: number; context?: number; groupContext?: number;
-    playerContext?: number; reason?: number; data?: Uint8Array; flags?: number; result?: number; processed?: () => void;
+    playerContext?: number; reason?: number; data?: Uint8Array; flags?: number; result?: number; processed?: (result?: number) => void;
 }
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 export function dp8Result(hr: number): number {
@@ -43,7 +43,7 @@ export class DirectPlay8Session {
     localId = 0;
     initialized = false;
     connecting = false;
-    localInfo: PlayerInfo = { name: "", data: [], flags: 0 };
+    localInfo: PlayerInfo = { name: "", nameNull: true, data: [], flags: 0 };
     onEvent?: (event: DirectPlay8Event) => boolean | void;
     private events: DirectPlay8Event[] = [];
     private eventBytes = 0;
@@ -57,6 +57,8 @@ export class DirectPlay8Session {
     private previousDesc = "";
     private creatingGroups: { context: number; assigned: boolean }[] = [];
     private previousHost = 0;
+    private infoReturned?: () => void;
+    private infoNotification?: { id: number; assigned: boolean; complete(result?: number): void };
     private localClosing = false;
     private localProcessed = new Set<(result: number) => void>();
     private localProcessedBytes = 0;
@@ -70,6 +72,17 @@ export class DirectPlay8Session {
         this.engine = engine;
         engine.onChange = () => { if (this.engine === engine) this.sync(); };
         engine.onMessage = () => { if (this.engine === engine) this.drain(); };
+        engine.onInfo = (id, returned) => {
+            if (this.engine !== engine) { returned(DPN.USERCANCEL); return; }
+            const after = this.infoReturned, prior = this.infoNotification;
+            let finished = false;
+            const notification = { id, assigned: false, complete: (result: number = DPN.OK) => {
+                if (finished) return; finished = true; returned(result); if (!result) after?.();
+            } };
+            this.infoNotification = notification;
+            try { this.sync(); } finally { this.infoNotification = prior; }
+            if (!notification.assigned) notification.complete();
+        };
         engine.onTermination = (data, reason) => { if (this.engine === engine) this.termination = { data, reason: reason ?? DPN.HOSTTERMINATEDSESSION }; };
     }
     private newEngine(): DirectPlaySession {
@@ -106,7 +119,7 @@ export class DirectPlay8Session {
         const hr = dp8Result(this.virtualProvider.create(desc)); if (hr) return hr;
         this.suppress = true;
         const created = this.engine.mutate({ op: "mutate", action: "create", group: false, parent: 0,
-            flags: this.role === "server" ? 0x100 : 0, name: { short: this.localInfo.name, long: "" }, data: this.localInfo.data }) as Reply;
+            flags: this.role === "server" ? 0x100 : 0, name: { short: this.localInfo.name, shortNull: this.localInfo.nameNull, long: "", longNull: true }, data: this.localInfo.data }) as Reply;
         this.suppress = false;
         if (created.hr || !created.id) { this.engine.close(); return dp8Result(created.hr); }
         this.localId = created.id; this.contexts.set(created.id, context); this.sync(); return DPN.OK;
@@ -120,7 +133,7 @@ export class DirectPlay8Session {
         if (this.engine !== this.virtualProvider) this.engine.dispose();
         const backend = new NativeHostBackend(this.network, Math.max(1, caps[4]), Math.max(1, caps[2]));
         this.attach(backend);
-        const result = await backend.start(desc, { name: this.localInfo.name, data: Uint8Array.from(this.localInfo.data) }, provider, port,
+        const result = await backend.start(desc, { name: this.localInfo.nameNull ? null : this.localInfo.name, data: Uint8Array.from(this.localInfo.data) }, provider, port,
             request => this.onNativeIndicate?.(request) ?? { hr: DPN.HOSTREJECTEDCONNECTION },
             (id, value) => { if (this.engine === backend && generation === this.generation) this.contexts.set(id, typeof value === "number" ? value : 0); },
             value => { if (this.engine === backend && !this.disposed) this.emit({ type: 0xf, context: typeof value === "number" ? value : 0 }); });
@@ -137,7 +150,7 @@ export class DirectPlay8Session {
         if ((this.role === "client") !== !!((desc.extended?.flags ?? 0) & 1)) return DPN.INVALIDAPPLICATION;
         this.localClosing = false; this.useVirtual();
         const generation = ++this.generation; this.connecting = true; this.suppress = true;
-        const hr = dp8Result(await this.virtualProvider.join(desc, { name: { short: this.localInfo.name, long: "" }, data: this.localInfo.data, flags: 0 }, data));
+        const hr = dp8Result(await this.virtualProvider.join(desc, { name: { short: this.localInfo.name, shortNull: this.localInfo.nameNull, long: "", longNull: true }, data: this.localInfo.data, flags: 0 }, data));
         if (generation !== this.generation) return DPN.USERCANCEL;
         this.connecting = false; this.suppress = false;
         if (!hr) {
@@ -157,7 +170,7 @@ export class DirectPlay8Session {
         if (this.engine !== this.virtualProvider) this.engine.dispose();
         const backend = new NativeDirectPlayCore(this.network, this.role, Math.max(1, caps[4]), Math.max(1, caps[2]), Math.min(255, caps[3]));
         this.attach(backend);
-        const hr = await backend.connect(address, desc, { name: { short: this.localInfo.name, long: "" }, data: this.localInfo.data, flags: 0 }, data, port).catch(() => { backend.close(); return DPN.GENERIC; });
+        const hr = await backend.connect(address, desc, { name: { short: this.localInfo.name, shortNull: this.localInfo.nameNull, long: "", longNull: true }, data: this.localInfo.data, flags: 0 }, data, port).catch(() => { backend.close(); return DPN.GENERIC; });
         if (generation !== this.generation) return DPN.USERCANCEL;
         this.connecting = false; this.suppress = false;
         if (!hr) { this.localId = backend.localId; this.contexts.set(this.localId, context); this.sync(); }
@@ -211,13 +224,16 @@ export class DirectPlay8Session {
         if (to === this.localId && result === DP.OK) localDelivery();
         return result instanceof Promise ? result.then(dp8Result) : dp8Result(result);
     }
-    async setInfo(id: number, info: PlayerInfo, mask: number): Promise<number> {
+    setInfo(id: number, info: PlayerInfo, mask: number, afterInfo?: () => void): number | Promise<number> {
         if (!this.initialized) return DPN.UNINITIALIZED;
-        if (!id) { if (mask & 1) this.localInfo.name = info.name; if (mask & 2) this.localInfo.data = info.data.slice(); return DPN.OK; }
+        if (!id) { if (mask & 1) { this.localInfo.name = info.name; this.localInfo.nameNull = !!info.nameNull; } if (mask & 2) this.localInfo.data = info.data.slice(); return DPN.OK; }
         if (this.error) return this.error;
-        const result = await this.engine.mutate({ op: "mutate", action: "info", id, ...(mask & 1 ? { name: { short: info.name, long: "" } } : {}),
-            ...(mask & 2 ? { data: info.data } : {}) });
-        return dp8Result(result.hr);
+        const prior = this.infoReturned; this.infoReturned = afterInfo;
+        let result: Reply | Promise<Reply>;
+        try { result = this.engine.mutate({ op: "mutate", action: "info", id, ...(mask & 1 ? { name: { short: info.name, shortNull: !!info.nameNull, long: "", longNull: true } } : {}),
+            ...(mask & 2 ? { data: info.data } : {}) }); }
+        finally { this.infoReturned = prior; }
+        return result instanceof Promise ? result.then(reply => dp8Result(reply.hr)) : dp8Result(result.hr);
     }
     async createGroup(info: PlayerInfo, context: number): Promise<{ hr: number; id?: number }> {
         if (this.error) return { hr: this.error };
@@ -258,12 +274,18 @@ export class DirectPlay8Session {
     }
     /** Resume a backpressured transcript when the guest callback consumer frees capacity. */
     resumeCallbacks(): void { if (!this.disposed) { this.flushEvents(); this.drain(); } }
+    private flushingEvents = false;
     private flushEvents(): void {
-        while (this.events.length) {
-            const event = this.events[0];
-            if (this.onEvent?.(event) === false) break;
-            this.events.shift(); this.eventBytes -= event.data?.length ?? 64;
-        }
+        if (this.flushingEvents) return;
+        this.flushingEvents = true;
+        const generation = this.generation;
+        try {
+            while (this.events.length && generation === this.generation) {
+                const event = this.events[0];
+                if (this.onEvent?.(event) === false) break;
+                if (this.events[0] === event) { this.events.shift(); this.eventBytes -= event.data?.length ?? 64; }
+            }
+        } finally { this.flushingEvents = false; }
         if (this.events.length && !this.eventRetry) {
             this.eventRetry = setTimeout(() => { this.eventRetry = undefined; this.flushEvents(); this.drain(); }, 4);
             (this.eventRetry as unknown as { unref?(): void }).unref?.();
@@ -286,9 +308,11 @@ export class DirectPlay8Session {
                     if (pending) { pending.assigned = true; this.groupContexts.set(id, pending.context); }
                 }
                 if (!(this.role === "client" && this.engine.kind === "native" && !entity.group)) this.emit({ type: entity.group ? 6 : 7, id, owner, context: (entity.group ? this.groupContexts : this.contexts).get(id) ?? 0 });
-            } else if (JSON.stringify(old.name) !== JSON.stringify(entity.name) || JSON.stringify(old.data) !== JSON.stringify(entity.data)) {
+            } else if ((this.infoNotification?.id === id && !this.infoNotification.assigned) || JSON.stringify(old.name) !== JSON.stringify(entity.name) || JSON.stringify(old.data) !== JSON.stringify(entity.data)) {
+                const notification = this.infoNotification?.id === id ? this.infoNotification : undefined;
+                if (notification) notification.assigned = true;
                 this.emit({ type: entity.group ? 0xc : this.role === "client" ? 0x15 : this.role === "server" ? 4 : 0x10,
-                    id, context: (entity.group ? this.groupContexts : this.contexts).get(id) ?? 0 });
+                    id, context: (entity.group ? this.groupContexts : this.contexts).get(id) ?? 0, processed: notification?.complete });
             }
         }
         // Membership callbacks follow all create notifications so both contexts exist.

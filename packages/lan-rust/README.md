@@ -75,6 +75,23 @@ The policy is absent by default; the existing virtual room provider remains sepa
 
 Set logConnections:true for bounded structured connection-close diagnostics. It is disabled by default.
 
+## Virtual IPv4 UDP multicast
+
+The ready event advertises udpMulticast4V1:true. UDP marker `3` uses a 20-byte binary
+header carrying the exact group, virtual ingress interface and TTL; ordinary
+marker `2` frames and Socket.IO event arguments stay unchanged. LAN interface 2 with
+TTL >= 1 fans out once to each other live room participant. Loopback interface 1
+and TTL 0 stay inside the sender's emulator process family. The server rewrites
+the source from its authenticated participant identity, retains the original
+group, and never forwards this envelope to a native gateway. Sender binding
+generations reject stale/released multicast; recipients do not inherit that
+sender generation.
+
+This profile has actual JS client tests over WebSocket and polling with matching
+TS/Rust transcripts, maximum/empty payloads, room isolation, stale generations,
+malformed frames and reconnect without replay. It does not implement native NIC
+multicast, IPv6 multicast, source-specific membership or RAW multicast.
+
 ## Ownership and checks
 
 The core crate owns authentication, rooms, binding generations, request IDs, cancellation and wire leases. The gateway owns physical flows and destination policy. The transport reserves both records and bytes before parsing or serialization and keeps reservations through actual output ownership. Native receive envelopes retain their credits until core effects have been admitted. Forced retirement does not require a free data-queue slot.

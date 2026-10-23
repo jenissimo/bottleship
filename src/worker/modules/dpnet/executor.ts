@@ -6,6 +6,8 @@ import type { ThunkResult, X86Context } from "../../core/thunking/thunk-dispatch
 import { DPN } from "./constants";
 
 export interface DirectPlayCallbackTask extends ModuleCallbackTask { storageBytes?: number; message?: number; key?: object; }
+export interface DirectPlayCallbackReservation { enqueue(task: DirectPlayCallbackTask): boolean; release(): void; }
+interface Reserved { lane: DirectPlayCallbackChannel; count: number; bytes: number; }
 interface Job { lane: DirectPlayCallbackChannel; task: DirectPlayCallbackTask; active: boolean; prepared: boolean; done: boolean; thread: number; bytes: number; invocation?: ModuleCallbackInvocation; }
 interface Observer { routine: number; context: number; }
 interface Worker {
@@ -23,6 +25,7 @@ export class DirectPlayCallbackExecutor {
     }
     private jobs: Job[] = [];
     private jobBytes = 0;
+    private reservations = new Set<Reserved>();
     private channels = new Set<DirectPlayCallbackChannel>();
     private workers: Worker[] = [];
     private activeThreads = new Map<number, number>();
@@ -146,12 +149,37 @@ export class DirectPlayCallbackExecutor {
         worker.queue.close(); worker.started(); worker.finish();
         const index = this.workers.indexOf(worker); if (index >= 0) this.workers.splice(index, 1);
     }
+    private available(lane: DirectPlayCallbackChannel, count: number, bytes: number): boolean {
+        let totalCount = this.jobs.length, totalBytes = this.jobBytes, laneCount = lane.size;
+        let laneBytes = this.jobs.reduce((n, job) => n + (job.lane === lane ? job.bytes : 0), 0);
+        for (const r of this.reservations) {
+            totalCount += r.count; totalBytes += r.bytes;
+            if (r.lane === lane) { laneCount += r.count; laneBytes += r.bytes; }
+        }
+        return this.live && !lane.closed && Number.isSafeInteger(count) && count > 0 && Number.isSafeInteger(bytes) && bytes >= count * 64 &&
+            laneCount + count <= lane.capacity && totalCount + count <= 16384 && totalBytes + bytes <= 16 * 1024 * 1024 && laneBytes + bytes <= 8 * 1024 * 1024;
+    }
+    reserve(lane: DirectPlayCallbackChannel, count: number, bytes: number): DirectPlayCallbackReservation | undefined {
+        if (!this.available(lane, count, bytes)) return;
+        const held: Reserved = { lane, count, bytes }; this.reservations.add(held);
+        return {
+            enqueue: task => {
+                const bytes = Math.max(64, task.storageBytes ?? 64);
+                if (!this.live || lane.closed || !this.reservations.has(held) || !Number.isSafeInteger(bytes) || held.count < 1 || bytes > held.bytes) return false;
+                held.count--; held.bytes -= bytes;
+                this.append(lane, task, bytes); return true;
+            },
+            release: () => { this.reservations.delete(held); },
+        };
+    }
     enqueue(lane: DirectPlayCallbackChannel, task: DirectPlayCallbackTask): boolean {
         const bytes = Math.max(64, task.storageBytes ?? 64);
-        if (!Number.isSafeInteger(bytes) || !this.live || lane.closed || lane.size >= lane.capacity || this.jobs.length >= 16384 ||
-            this.jobBytes + bytes > 16 * 1024 * 1024 || this.jobs.reduce((n, job) => n + (job.lane === lane ? job.bytes : 0), 0) + bytes > 8 * 1024 * 1024) return false;
+        if (!this.available(lane, 1, bytes)) return false;
+        this.append(lane, task, bytes); return true;
+    }
+    private append(lane: DirectPlayCallbackChannel, task: DirectPlayCallbackTask, bytes: number): void {
         this.jobBytes += bytes;
-        this.jobs.push({ lane, task, active: false, prepared: false, done: false, thread: 0, bytes }); this.pump(); return true;
+        this.jobs.push({ lane, task, active: false, prepared: false, done: false, thread: 0, bytes }); this.pump();
     }
     size(lane: DirectPlayCallbackChannel): number { return this.jobs.reduce((n, job) => n + +(job.lane === lane && !job.done), 0); }
     threadId(lane: DirectPlayCallbackChannel): number {
@@ -198,6 +226,7 @@ export class DirectPlayCallbackExecutor {
     }
     discard(lane: DirectPlayCallbackChannel): void {
         this.channels.delete(lane);
+        for (const held of this.reservations) if (held.lane === lane) this.reservations.delete(held);
         for (const worker of this.workers) if (worker.job?.lane === lane && !worker.job.prepared && worker.task) worker.queue.cancel(worker.task);
         for (const job of [...this.jobs]) if (job.lane === lane && !job.active) { job.task.onDiscard?.(); this.finishJob(job); }
         if (!this.channels.size && !this.explicit) void this.change(0).catch(() => {});
@@ -242,7 +271,7 @@ export class DirectPlayCallbackExecutor {
         for (const job of [...this.jobs]) if (job.prepared) job.invocation?.onDiscard?.();
         for (const lane of [...this.channels]) lane.close();
         for (const worker of [...this.workers]) this.finishWorker(worker);
-        this.jobs = []; this.jobBytes = 0; this.activeThreads.clear(); this.observer = undefined; this.target = 0;
+        this.jobs = []; this.jobBytes = 0; this.reservations.clear(); this.activeThreads.clear(); this.observer = undefined; this.target = 0;
     }
 }
 

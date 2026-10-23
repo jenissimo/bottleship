@@ -37,7 +37,8 @@ Set the emulator's network configuration to:
 Players in the same room share a virtual 10.0.0.0/8 LAN and IPv6 ULA addresses
 under `fd42:6273:6c61:6e00::/80`. Room names contain 1–64
 ASCII letters, digits, underscores or hyphens. Different rooms cannot exchange
-unicast or broadcast traffic, including when they use the same virtual addresses.
+unicast, broadcast or virtual IPv4 UDP multicast traffic, including when they use
+the same virtual addresses.
 
 Socket.IO starts with HTTP long-polling and upgrades to WebSocket when available.
 If WebSocket is blocked, polling remains active. TCP and DirectPlay channels use
@@ -107,6 +108,25 @@ Binary `frame` bytes contain:
 | 8 | 2 | Destination port, big-endian |
 | 10 | 2 | Source port, big-endian |
 | 12 | remaining | Payload |
+
+IPv4 UDP multicast uses marker `3` and a 20-byte header. The first 12 bytes keep the
+same fields; bytes 12–15 retain the original class-D group, byte 16 is the virtual
+interface (1 loopback, 2 LAN), byte 17 is TTL, and bytes 18–19 are zero. Payload
+starts at 20 and remains bounded to 65,507 bytes. Outbound destination nodes are
+exactly `02:03:<group IPv4>`; inbound nodes are authenticated sender addresses.
+The server announces `udpMulticast4V1:true` in ready. Socket.IO event arguments
+and the maximum frame size are unchanged.
+
+Interface 1 and TTL 0 stay within one emulator process family. LAN interface 2 with
+TTL >= 1 sends to other live participants in the same room; the broker delivers one
+local copy. The receiver filters the original group/interface and its Windows
+IP_MULTICAST_LOOP setting before queue admission. Memberships and IF/TTL/LOOP
+state belong to the physical socket shared by duplicated descriptors. Dropping
+membership does not discard packets already queued. Default interface 0 selects
+the virtual LAN; 127/8 selects virtual loopback. An older relay without the ready
+capability refuses remote multicast immediately; local-only multicast continues.
+This profile does not implement native NIC multicast forwarding, IPv6 multicast,
+source-specific membership or RAW multicast.
 
 The server emits a trusted `peerLeft { node }` event to the other participants
 in the same room when a participant disconnects. Reliable sends to a disconnected

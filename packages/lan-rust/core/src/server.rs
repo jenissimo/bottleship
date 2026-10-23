@@ -9,6 +9,7 @@ use crate::{
     },
 };
 mod host;
+mod multicast4;
 use host::HostState;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -195,6 +196,7 @@ struct Active {
 struct Participant {
     join: JoinRequest,
     bindings: BindingRegistry,
+    multicast_bindings: BindingRegistry,
     window_start: u64,
     frames: u32,
     bytes: usize,
@@ -304,7 +306,7 @@ impl Core {
                 expires_at: u64::MAX,
             },
         );
-        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4(),"gatewayIpv6":[]});
+        let mut ready = json!({"version":1,"node":join.node,"ipv4":wire::node_ipv4(&join.node),"gatewayIpv4":self.routes.advertised_ipv4(),"gatewayIpv6":[],"udpMulticast4V1":true});
         ready["gatewayIpv6"] = Value::Array(
             self.routes
                 .advertised_ipv6()
@@ -331,6 +333,7 @@ impl Core {
             Participant {
                 join,
                 bindings: BindingRegistry::default(),
+                multicast_bindings: BindingRegistry::default(),
                 window_start: now_ms,
                 frames: 0,
                 bytes: 0,
@@ -469,6 +472,10 @@ impl Core {
         effects: &mut Vec<Effect>,
     ) {
         match event {
+            InboundEvent::Multicast4 {
+                datagram,
+                generation,
+            } => self.multicast4_input(connection, datagram, generation, now_ms, effects),
             InboundEvent::OpenUdpHost { id, request } => {
                 self.host_open(connection, id, request, now_ms, effects)
             }
@@ -482,6 +489,17 @@ impl Core {
             } => {
                 if !self.rate(connection, 12 + datagram.payload.len(), now_ms, effects) {
                     return;
+                }
+                if datagram.proto == 1 {
+                    self.participants
+                        .get_mut(&connection)
+                        .unwrap()
+                        .multicast_bindings
+                        .admit(BindingToken {
+                            proto: 1,
+                            local_port: datagram.src_port,
+                            generation,
+                        });
                 }
                 if wire::external_node(&datagram.node) {
                     let binding = BindingToken {
@@ -588,6 +606,9 @@ impl Core {
                     return;
                 }
                 let p = self.participants.get_mut(&connection).unwrap();
+                if proto == 1 {
+                    p.multicast_bindings.release(proto, port, generation);
+                }
                 if p.bindings.release(proto, port, generation) {
                     self.retire_udp(connection, proto, port, generation, true, effects);
                     effects.push(Effect::NativeOperation {
@@ -689,6 +710,13 @@ impl Core {
                 {
                     effects.push(lease_reply(connection, id, 10057));
                     return;
+                }
+                if request.proto == 1 {
+                    self.participants
+                        .get_mut(&connection)
+                        .unwrap()
+                        .multicast_bindings
+                        .admit(binding);
                 }
                 self.retire_udp(
                     connection,

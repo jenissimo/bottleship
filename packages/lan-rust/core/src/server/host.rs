@@ -133,6 +133,7 @@ impl Core {
             effects.push(reply(c, id, 10057));
             return;
         }
+        p.multicast_bindings.admit(binding);
         self.retire_udp(
             c,
             1,

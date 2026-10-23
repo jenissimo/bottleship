@@ -1,6 +1,6 @@
 // Adapted from cszackrison/bottleship, Apache-2.0; see packages/lan/NOTICE.
 import {
-    BROADCAST_NODE, PROTO_IPX, PROTO_RAW4, validBindingGeneration, decodeDatagram, encodeDatagram, isBroadcastNode, isLanNode,
+    BROADCAST_NODE, PROTO_IPX, PROTO_UDP, PROTO_RAW4, isMulticastIpv4Node, multicast4Node, validMulticast4Header, type UdpMulticast4Header, validBindingGeneration, decodeDatagram, encodeDatagram, isBroadcastNode, isLanNode,
     isProtocol, isRawProtocol, validRawPayload, maxPayload, nodeToIpv4, validPort, isAddressNode, ipv4ToNode, isExternalIpv4Node, isExternalIpv6Node, LAN_IPV6_PREFIX, type GatewayIpv6Address,
 } from "./netplay-wire";
 export {
@@ -13,13 +13,18 @@ import { NetResolveError, type ResolveRequest, type ResolveResult } from "./netp
 export { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
 export const IPX_NETNUM = new Uint8Array([0, 0, 0, 1]);
 export const LAN_NET_OCTET = 10;
-export interface LanDatagram { srcNode: Uint8Array; srcPort: number; data: Uint8Array }
+export interface LanDatagram { srcNode: Uint8Array; srcPort: number; data: Uint8Array; multicast4?: UdpMulticast4Header & {localOrigin: boolean} }
 export interface LanEndpoint { deliver(dg: LanDatagram): void }
 export interface RawDeliveryTarget { port: number; generation: number }
 export interface LanPortDisconnect { node: Uint8Array; port: number; proto: number }
 export interface LanSocketError { node: Uint8Array; localPort: number; remotePort: number; proto: number; code: number; wireId?: number;bindingGeneration?:number }
 export interface NetTransport {
     readonly connected?: boolean;
+    /** Host-owned state may be newer than queued process MessagePort snapshots. */
+    connectionState?(): boolean;
+    /** Apply a coherent host readiness snapshot before synchronous guest APIs. */
+    synchronizeState?(): void;
+    supportsMulticast4?(): boolean;
     readonly routeLocal?: boolean;
     send(frame: Uint8Array<ArrayBuffer>,bindingGeneration?:number): boolean;
     releasePort?(port:number,proto:number,bindingGeneration:number):void;
@@ -44,6 +49,7 @@ export interface LanState {
     gatewayIpv4?: number[][];
     gatewayIpv6?: GatewayIpv6Address[];
     udpHostListenV1?: UdpHostListenCapability;
+    udpMulticast4V1?: true;
     directPlay8?: DirectPlay8NetworkPolicy;
 }
 const EPHEMERAL = [[0x4000, 0x7fff], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [1, 256], [1, 256]];
@@ -70,11 +76,14 @@ export class LanNetwork {
     private generation = 0;
     private nextSocketId = 1;
     private hostCapability?: UdpHostListenCapability;
+    private multicast4Capability = false;
+    configureMulticast4(supported = false): void { this.multicast4Capability = supported; }
+    get udpMulticast4V1(): true | undefined { this.synchronizeState(); return (this.transport?.supportsMulticast4?.() ?? this.multicast4Capability) ? true : undefined; }
     private dp8Policy?: DirectPlay8NetworkPolicy;
-    get directPlay8(): DirectPlay8NetworkPolicy | undefined { return this.dp8Policy && {...this.dp8Policy}; }
+    get directPlay8(): DirectPlay8NetworkPolicy | undefined { this.synchronizeState(); return this.dp8Policy && {...this.dp8Policy}; }
     configureDirectPlay8(policy?: DirectPlay8NetworkPolicy): void { this.dp8Policy = policy && {...policy}; }
     configureUdpHosts(capability?: UdpHostListenCapability): void { this.hostCapability = capability && copyUdpHostCapability(capability); }
-    get udpHostListenV1(): UdpHostListenCapability | undefined { return this.hostCapability && copyUdpHostCapability(this.hostCapability); }
+    get udpHostListenV1(): UdpHostListenCapability | undefined { this.synchronizeState(); return this.hostCapability && copyUdpHostCapability(this.hostCapability); }
     private readonly pendingUdpLeases = new Set<{ localPort: number; proto: number; abort(): void }>();
     private readonly activeUdpLeases = new Set<{ localPort: number; proto: number; release(): void }>();
     private nextBindingGeneration=1;
@@ -96,7 +105,8 @@ export class LanNetwork {
         this.node = node.slice();
     }
     get ipv4(): Uint8Array { return nodeToIpv4(this.node); }
-    get connected(): boolean { return this.online; }
+    private synchronizeState(): void { this.transport?.synchronizeState?.(); }
+    get connected(): boolean { this.synchronizeState(); return this.transport?.connectionState?.() ?? this.online; }
     get ipv6(): Uint8Array {
         const address = new Uint8Array(16); address.set(LAN_IPV6_PREFIX); address.set(this.node, 10); return address;
     }
@@ -113,6 +123,7 @@ export class LanNetwork {
         }
     }
     routeIpv6(address: Uint8Array, scopeId = 0): Uint8Array {
+        this.synchronizeState();
         if (address.length !== 16 || !Number.isInteger(scopeId) || scopeId < 0 || scopeId > 0xffffffff) throw new NetResolveError("NO_DATA");
         if (address.subarray(0, 15).every(n => n === 0) && address[15] === 1) return this.node.slice();
         if (address.subarray(0, 10).every(n => n === 0) && address[10] === 255 && address[11] === 255) return this.routeIpv4(address.subarray(12));
@@ -122,12 +133,14 @@ export class LanNetwork {
         return Uint8Array.from(gateway.node);
     }
     nodeToIpv6(node: Uint8Array): Uint8Array {
+        this.synchronizeState();
         if (isLanNode(node)) { const address = new Uint8Array(16); address.set(LAN_IPV6_PREFIX); address.set(node, 10); return address; }
         if (isExternalIpv4Node(node)) { const address = new Uint8Array(16); address[10] = address[11] = 255; address.set(nodeToIpv4(node), 12); return address; }
         for (const item of this.gatewayIpv6.values()) if (item.node.every((n, i) => n === node[i])) return Uint8Array.from(item.address);
         throw new NetResolveError("NO_DATA", "Unknown IPv6 relay address");
     }
     nodeToIpv6Scope(node: Uint8Array): number {
+        this.synchronizeState();
         for (const item of this.gatewayIpv6.values()) if (item.node.every((n, i) => n === node[i])) return item.scopeId ?? 0;
         return 0;
     }
@@ -148,10 +161,10 @@ export class LanNetwork {
         if (!isLanNode(node) || this.ports.some(ports => ports.size)) throw new Error("Identity must be adopted before binding");
         this.node.set(node);
     }
-    routeIpv4(ip: Uint8Array): Uint8Array { return ipv4ToNode(ip, this.gatewayAddresses.has(ip.join("."))); }
+    routeIpv4(ip: Uint8Array): Uint8Array { this.synchronizeState(); return ipv4ToNode(ip, this.gatewayAddresses.has(ip.join("."))); }
     async resolve(host: string, family: 0 | 4 | 6 = 0, signal?: AbortSignal): Promise<ResolveResult> {
         if (signal?.aborted) throw new NetResolveError("CANCELLED");
-        if (!this.online || !this.transport?.resolve) throw new NetResolveError("NETWORK_DOWN");
+        if (!this.connected || !this.transport?.resolve) throw new NetResolveError("NETWORK_DOWN");
         return this.transport.resolve({ host, family }, signal);
     }
 
@@ -159,7 +172,7 @@ export class LanNetwork {
     async leaseUdpPeer(localPort: number, node: Uint8Array, remotePort: number, signal?: AbortSignal): Promise<{ release(): void }> {
         const proto = isExternalIpv6Node(node) ? 4 : 1, binding = this.bindingGeneration(localPort, proto);
         if (!validPort(localPort) || !validPort(remotePort) || !isAddressNode(node) || !binding) throw new NetResolveError("NO_DATA");
-        if (!this.online || !this.transport) throw new NetResolveError("NETWORK_DOWN");
+        if (!this.connected || !this.transport) throw new NetResolveError("NETWORK_DOWN");
         if (signal?.aborted) throw new NetResolveError("CANCELLED");
         if (this.pendingUdpLeases.size >= 16 || this.activeUdpLeases.size + this.pendingUdpLeases.size >= 128) throw new NetResolveError("ACCESS_DENIED", "UDP peer lease capacity");
         return this.withUdpBinding(localPort, proto, signal, (transport, binding, signal) =>
@@ -169,6 +182,7 @@ export class LanNetwork {
     }
     /** Acquire an acknowledged physical listener for this exact UDP binding. */
     async openUdpHost(localPort: number, listenerId: string, signal?: AbortSignal): Promise<UdpHostLease> {
+        this.synchronizeState();
         if (!/^[A-Za-z0-9_-]{1,64}$/.test(listenerId) || !validPort(localPort) || !this.bindingGeneration(localPort, 1))
             throw new NetResolveError("NO_DATA");
         if (!this.hostCapability?.listeners.some(listener => listener.id === listenerId))
@@ -180,6 +194,7 @@ export class LanNetwork {
             try {
                 if (!lease.isLive()) throw new NetResolveError("CANCELLED");
                 const ready = copyUdpHostReady(lease);
+                this.synchronizeState();
                 const advertised = this.hostCapability?.listeners.find(listener => listener.id === listenerId);
                 if (!advertised || advertised.allowedNodes.length !== ready.allowedNodes.length ||
                     !ready.allowedNodes.every(node => advertised.allowedNodes.some(other => other.every((v, i) => v === node[i]))))
@@ -191,20 +206,20 @@ export class LanNetwork {
         let ended = false;
         void lease.closed.then(() => { ended = true; lease.release(); });
         return {...lease,
-            isLive: () => !ended && this.online && this.generation === epoch && this.bindingGeneration(localPort, 1) === originalBinding && lease.isLive(),
+            isLive: () => this.connected && !ended && this.generation === epoch && this.bindingGeneration(localPort, 1) === originalBinding && lease.isLive(),
             release: () => { ended = true; lease.release(); }};
     }
     private async withUdpBinding<M extends {release(): void}>(localPort: number, proto: number, signal: AbortSignal | undefined,
         open: (transport: NetTransport, binding: number, signal: AbortSignal) => Promise<M>): Promise<M> {
         const binding = this.bindingGeneration(localPort, proto);
-        if (!this.online || !this.transport) throw new NetResolveError("NETWORK_DOWN");
+        if (!this.connected || !this.transport) throw new NetResolveError("NETWORK_DOWN");
         if (signal?.aborted) throw new NetResolveError("CANCELLED");
         if (!binding) throw new NetResolveError("NO_DATA");
         if (this.pendingUdpLeases.size >= 16 || this.activeUdpLeases.size + this.pendingUdpLeases.size >= 128)
             throw new NetResolveError("ACCESS_DENIED", "UDP binding lease capacity");
         const transport = this.transport, epoch = this.generation, controller = new AbortController();
         let adopted = false;
-        const live = () => !controller.signal.aborted && this.online && this.transport === transport && this.generation === epoch && this.bindingGeneration(localPort, proto) === binding;
+        const live = () => this.connected && !controller.signal.aborted && this.transport === transport && this.generation === epoch && this.bindingGeneration(localPort, proto) === binding;
         const pending = { localPort, proto, abort: () => controller.abort() };
         this.pendingUdpLeases.add(pending);
         const cancel = () => controller.abort(); signal?.addEventListener("abort", cancel, { once: true });
@@ -248,10 +263,10 @@ export class LanNetwork {
     setConnected(connected: boolean, reason?: string, force = false): void {
         if (!force && this.online === connected) return;
         this.online = connected;
-        if (!connected || force) { this.retireUdpLeases(); if (!connected) this.hostCapability = undefined; }
+        if (!connected || force) { this.retireUdpLeases(); if (!connected) { this.hostCapability = undefined; this.multicast4Capability = false; } }
         const state: LanState = { connected, node: this.node.slice(), ipv4: this.ipv4, generation: ++this.generation, reason,
             gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()],
-            udpHostListenV1: this.udpHostListenV1, directPlay8: this.directPlay8 };
+            udpHostListenV1: this.udpHostListenV1, udpMulticast4V1: this.udpMulticast4V1, directPlay8: this.directPlay8 };
         for (const listener of this.listeners) listener(state);
     }
     onStateChange(listener: (state: LanState) => void): () => void {
@@ -325,10 +340,33 @@ export class LanNetwork {
             if(!this.portRegistry)this.releaseRemotePort(port,proto,generation);
         }
     }
+    /** Multicast stays a destination-aware packet through the local broker and relay. */
+    sendMulticast4(srcPort: number, group: Uint8Array, dstPort: number, data: Uint8Array, interfaceIndex: 1 | 2, ttl: number,
+        bindingGeneration = this.bindingGeneration(srcPort, PROTO_UDP)): boolean {
+        const multicast4 = {group, interfaceIndex, ttl};
+        if (!validPort(srcPort) || !validPort(dstPort) || data.length > maxPayload(PROTO_UDP) || !validMulticast4Header(multicast4)) return false;
+        const frame = encodeDatagram(PROTO_UDP, multicast4Node(group), dstPort, srcPort, data, multicast4);
+        if (this.transport?.routeLocal) {
+            const accepted = this.transport.send(frame, bindingGeneration);
+            if (accepted) this.stats.sent++; else this.stats.dropped++;
+            return accepted;
+        }
+        if (interfaceIndex === 2 && ttl > 0 && this.connected && this.transport
+            && (!this.udpMulticast4V1 || !this.transport.send(frame, bindingGeneration))) {
+            this.stats.dropped++;
+            return false;
+        }
+        this.deliverLocal(PROTO_UDP, this.node, srcPort, dstPort, data, multicast4);
+        this.stats.sent++;
+        return true;
+    }
     send(srcPort: number, dstNode: Uint8Array, dstPort: number, data: Uint8Array, proto = PROTO_IPX, bindingGeneration=this.bindingGeneration(srcPort,proto)): boolean {
+        this.synchronizeState();
         if (!isProtocol(proto) || !validPort(srcPort) || !validPort(dstPort) || dstNode.length !== 6
             || data.length > maxPayload(proto) || (proto === PROTO_IPX && data.length < 2)
             || (isRawProtocol(proto) && (!validRawPayload(data) || dstPort > 256 || srcPort > 256))) return false;
+        if (isMulticastIpv4Node(dstNode)) return proto === PROTO_UDP
+            && this.sendMulticast4(srcPort, dstNode.subarray(2), dstPort, data, 2, 1, bindingGeneration);
         if (this.transport?.routeLocal) {
             const accepted = this.transport.send(encodeDatagram(proto, dstNode, dstPort, srcPort, data),bindingGeneration);
             if (accepted) this.stats.sent++; else this.stats.dropped++;
@@ -349,15 +387,18 @@ export class LanNetwork {
         this.stats.sent++;
         return true;
     }
-    receiveFrame(frame: Uint8Array, allowLoopback = false,bindingGeneration?:number): void {
+    receiveFrame(frame: Uint8Array, allowLoopback = false,bindingGeneration?:number, deliveryGeneration?:number): void {
         const datagram = decodeDatagram(frame);
         if (!datagram || (bindingGeneration !== undefined && (!validBindingGeneration(bindingGeneration)
             || bindingGeneration !== this.bindingGeneration(datagram.dstPort, datagram.proto)))
+            || (deliveryGeneration !== undefined && (!validBindingGeneration(deliveryGeneration)
+                || deliveryGeneration !== this.deliveryGeneration(datagram.dstPort, datagram.proto)))
+            || (datagram.multicast4 && !allowLoopback && (datagram.multicast4.interfaceIndex !== 2 || datagram.multicast4.ttl === 0))
             || !isAddressNode(datagram.node) || (!allowLoopback && this.isSelf(datagram.node))) {
             this.stats.dropped++;
             return;
         }
-        this.deliverLocal(datagram.proto, datagram.node, datagram.srcPort, datagram.dstPort, datagram.payload);
+        this.deliverLocal(datagram.proto, datagram.node, datagram.srcPort, datagram.dstPort, datagram.payload, datagram.multicast4);
     }
     /** Trusted broker delivery: the capture owner was checked before fanout. */
     receiveRawFrame(frame: Uint8Array, targets: readonly RawDeliveryTarget[]): void {
@@ -411,7 +452,7 @@ export class LanNetwork {
     isSelf(node: Uint8Array): boolean {
         return node.length === 6 && this.node.every((value, index) => value === node[index]);
     }
-    private deliverLocal(proto: number, srcNode: Uint8Array, srcPort: number, dstPort: number, data: Uint8Array): void {
+    private deliverLocal(proto: number, srcNode: Uint8Array, srcPort: number, dstPort: number, data: Uint8Array, multicast4?: UdpMulticast4Header): void {
         if (proto === PROTO_RAW4) {
             this.deliverRawBindings(srcNode, srcPort, data, this.rawTargets(data[0]));
             return;
@@ -424,7 +465,8 @@ export class LanNetwork {
         endpoints.delete(undefined);
         if (!endpoints.size) { this.stats.dropped++; return; }
         this.stats.received++;
-        for (const endpoint of endpoints) endpoint!.deliver({ srcNode: srcNode.slice(), srcPort, data: data.slice() });
+        for (const endpoint of endpoints) endpoint!.deliver({ srcNode: srcNode.slice(), srcPort, data: data.slice(),
+            ...(multicast4 ? {multicast4: {...multicast4, group: multicast4.group.slice(), localOrigin: this.isSelf(srcNode)}} : {}) });
     }
 }
 export const lanNetwork = new LanNetwork();

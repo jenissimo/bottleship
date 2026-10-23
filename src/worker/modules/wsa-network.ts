@@ -3,7 +3,7 @@
  * ABI semantics follow Winsock 1.1/2; TCP here is a private reliable LAN protocol,
  * not an IP/TCP wire implementation. No guest memory is retained by this layer.
  */
-import { lanNetwork, type LanNetwork, type LanEndpoint, ipv4ToNode, nodeToIpv4,
+import { lanNetwork, type LanNetwork, type LanEndpoint, type LanDatagram, ipv4ToNode, nodeToIpv4,
     IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
 import { ipChecksum, ipv4RawPacket, parseRawIp } from "./wsa-raw";
 import { PROTO_RAW4, PROTO_RAW6, RAW_MAX_PACKET, PROTO_IPX, PROTO_UDP, PROTO_TCP, PROTO_UDP6, PROTO_TCP6, TCP_OPTION, TCP_OPTION_KEEPALIVE, TCP_OPTION_NODELAY, SYN_INLINE_FLAG, SYN_KEEPALIVE_FLAG, SYN_NODELAY_FLAG, SYN_WINDOW_MASK, TCP_MAGIC, TCP_HEADER, TCP_SEGMENT, SYN, SYNACK, DATA, FIN, RST, CREDIT, OOB, encodeTcpFrame } from "../net/netplay-wire";
@@ -24,6 +24,7 @@ function fail(code: number): never { throw new WsaFailure(code); }
 const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
 const zeros = (a: Uint8Array) => a.every(v => v === 0);
 const broadcast = (a: Uint8Array) => a.every(v => v === 255);
+const multicast4 = (a?: Uint8Array) => !!a && a[0] >= 224 && a[0] <= 239;
 const BUFFER_LIMIT = 256 * 1024;
 const PACKET_LIMIT = 1024;
 
@@ -52,6 +53,7 @@ interface SocketState {
     extendedAddress: boolean; receiveHeader: boolean;
     headerInclude: boolean; ipTtl: number; ipTos: number; ipOptionsChanged: boolean;
     keepAlive: boolean; noDelay: boolean;
+    multicastInterface: number; multicastTtl: number; multicastLoop: boolean;
     peerId: number; credit: number; writeBlocked: boolean; connectTimer?: ReturnType<typeof setTimeout>;
     broadcast: boolean; reuse: boolean; packetType: number; filterPacketType: number | null; receiveBroadcast: boolean; receiveLimit: number; sendLimit: number;
     receiveTimeout: number; sendTimeout: number; lingerEnabled: boolean; lingerSeconds: number;
@@ -73,6 +75,8 @@ export class WsaSocketTable {
     private listeners = new Set<() => void>();
     private epoch = 0;
     private ipIdentification = 0;
+    private readonly multicastMemberships = new Map<number, Map<string, { group: Uint8Array; interfaceIndex: 1 | 2 }>>();
+    private multicastMembershipCount = 0;
     private networkGeneration: number | undefined;
     private stateUnsubscribe: (() => void) | undefined;
     private writableUnsubscribe: (() => void) | undefined;
@@ -135,9 +139,12 @@ export class WsaSocketTable {
             this.networkGeneration = state.generation;
             if (!state.connected || changed) {
                 for (const s of this.sockets.values()) {
-                    if (s.type !== 1 && s.peer && !same(s.peer.node, this.network.node)) {
+                    if (s.type !== 1 && s.peer && !same(s.peer.node, this.network.node) && !(s.af === 2 && s.type === 2 && multicast4(s.peer.ip))) {
                         s.error = state.connected ? 0 : WSA.ENETDOWN;
                         if (s.error) this.event(s, FD_READ, s.error);
+                    }
+                    if (s.type !== 1 && s.writeBlocked) {
+                        s.writeBlocked = false; this.rearm(s, FD_WRITE); this.refreshEvents(s);
                     }
                     if (s.type === 1 && !s.eof && s.peer && !same(s.peer.node, this.network.node) && (s.state === "connecting" || s.state === "connected")) {
                         if (s.state === "connecting") this.restoreConnectAddress(s);
@@ -158,6 +165,7 @@ export class WsaSocketTable {
         for (const b of this.bindings.values()) this.network.unbind(b.port, b.endpoint, b.proto);
         this.bindings.clear();
         this.sockets.clear(); this.wireSockets.clear();
+        this.multicastMemberships.clear(); this.multicastMembershipCount = 0;
         // Do not recycle IDs: an old async completion must never target a new socket.
         this.epoch++;
         this.stateUnsubscribe?.();
@@ -197,6 +205,56 @@ export class WsaSocketTable {
         state.handleFlags = (state.handleFlags & ~(mask & 3)) | (flags & mask & 3);
         return 0;
     }
+    private multicastSocket(sid: number): SocketState {
+        const socket = this.get(sid);
+        if (socket.af !== 2 || socket.type !== 2) fail(WSA.EINVAL);
+        return socket;
+    }
+    private multicastInterfaceIndex(ip: Uint8Array): 1 | 2 {
+        if (!(ip instanceof Uint8Array) || ip.length !== 4) fail(WSA.EINVAL);
+        if (ip[0] === 127) return 1;
+        if (zeros(ip) || same(ip, this.network.ipv4)) return 2;
+        fail(WSA.EADDRNOTAVAIL);
+    }
+    getMulticastOption(sid: number, option: number): number {
+        const socket = this.multicastSocket(sid);
+        if (option === 9) return socket.multicastInterface;
+        if (option === 10) return socket.multicastTtl;
+        if (option === 11) return +socket.multicastLoop;
+        fail(WSA.ENOPROTOOPT);
+    }
+    setMulticastOption(sid: number, option: number, value: number): number {
+        const socket = this.multicastSocket(sid);
+        if (!Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff) fail(WSA.EINVAL);
+        if (option === 9) {
+            const ip = Uint8Array.of(value & 255, value >>> 8 & 255, value >>> 16 & 255, value >>> 24);
+            this.multicastInterfaceIndex(ip); socket.multicastInterface = value >>> 0;
+        } else if (option === 10) {
+            if (value === -1 || value === 0xffffffff) socket.multicastTtl = 255;
+            else { if (value < 0 || value > 255) fail(WSA.EINVAL); socket.multicastTtl = value; }
+        } else if (option === 11) socket.multicastLoop = value !== 0;
+        else fail(WSA.ENOPROTOOPT);
+        this.changed(); return 0;
+    }
+    changeMulticastMembership(sid: number, group: Uint8Array, rawInterface: Uint8Array, join: boolean): number {
+        this.multicastSocket(sid);
+        if (!(group instanceof Uint8Array) || group.length !== 4 || group[0] < 224 || group[0] > 239) fail(WSA.EADDRNOTAVAIL);
+        const interfaceIndex = this.multicastInterfaceIndex(rawInterface), key = interfaceIndex + ":" + [...group].join(".");
+        const memberships = this.multicastMemberships.get(sid);
+        if (join) {
+            if (memberships?.has(key)) fail(WSA.EINVAL);
+            // Safety bounds, not a claim about the native provider's maximum.
+            if ((memberships?.size ?? 0) >= 256 || this.multicastMembershipCount >= 4096) fail(WSA.ENOBUFS);
+            const current = memberships ?? new Map<string, { group: Uint8Array; interfaceIndex: 1 | 2 }>();
+            current.set(key, { group: group.slice(), interfaceIndex });
+            this.multicastMemberships.set(sid, current); this.multicastMembershipCount++;
+        } else {
+            if (!memberships?.delete(key)) fail(WSA.EADDRNOTAVAIL);
+            this.multicastMembershipCount--;
+            if (!memberships.size) this.multicastMemberships.delete(sid);
+        }
+        this.changed(); return 0;
+    }
     socket(type = 1, af = 2, protocol = 0): number {
         if (af !== 2 && af !== 6 && af !== 23) fail(WSA.EAFNOSUPPORT);
         if (type !== 1 && type !== 2 && type !== 3) fail(WSA.ESOCKTNOSUPPORT);
@@ -214,6 +272,7 @@ export class WsaSocketTable {
             state: "new", backlog: 1, pending: [], packets: [], chunks: [], offset: 0, available: 0,
             readShutdown: false, writeShutdown: false, eof: false, error: 0, pendingError: 0,
             oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, peerId: 0, credit: 0, writeBlocked: false,
+            multicastInterface: 0, multicastTtl: 1, multicastLoop: true,
             broadcast: false, reuse: false, packetType: af === 6 ? selectedProtocol - 1000 : 0,
             filterPacketType: null, receiveBroadcast: true, receiveLimit: BUFFER_LIMIT, sendLimit: BUFFER_LIMIT,
             receiveTimeout: 0, sendTimeout: 0, lingerEnabled: false, lingerSeconds: 0,
@@ -285,6 +344,8 @@ export class WsaSocketTable {
         }
         for (const child of [...s.pending]) if (this.isValid(child)) this.closesocket(child);
         this.detach(s);
+        this.multicastMembershipCount -= this.multicastMemberships.get(sid)?.size ?? 0;
+        this.multicastMemberships.delete(sid);
         this.sockets.delete(sid >>> 0); this.wireSockets.delete(s.wireId);
         this.changed();
         return 0;
@@ -382,7 +443,9 @@ export class WsaSocketTable {
         if (s.type !== 3 && !peer.port) fail(WSA.EADDRNOTAVAIL);
         if (s.type !== 1) {
             this.autoBind(s);
-            s.peer = this.routeAddress({ ...peer, port: s.type === 3 ? 0 : peer.port });
+            s.peer = s.type === 2 && s.af === 2 && peer.ip && peer.ip[0] >= 224 && peer.ip[0] <= 239
+                ? { ...peer, ip: peer.ip.slice(), node: Uint8Array.of(2, 3, ...peer.ip) }
+                : this.routeAddress({ ...peer, port: s.type === 3 ? 0 : peer.port });
             s.error = 0;
             if (s.local!.ip && zeros(s.local!.ip)) s.local!.ip = this.network.ipv4;
             if (s.local!.ip6 && zeros(s.local!.ip6)) s.local!.ip6 = this.network.ipv6;
@@ -404,6 +467,16 @@ export class WsaSocketTable {
             if (s.local!.ip6 && zeros(s.local!.ip6)) s.local!.ip6 = this.network.ipv6;
         s.state = "connecting";
         s.error = 0;
+        if (s.af === 2 && multicast4(peer.ip)) {
+            this.restoreConnectAddress(s);
+            const attemptedPeer = s.peer;
+            queueMicrotask(() => {
+                if (this.sockets.get(s.id) !== s || s.state !== "connecting" || s.peer !== attemptedPeer) return;
+                s.state = "failed"; s.error = WSA.EADDRNOTAVAIL;
+                this.event(s, FD_CONNECT, s.error); this.changed();
+            });
+            fail(WSA.EWOULDBLOCK);
+        }
         if (!this.frame(s, SYN, this.synValue(s))) {
             this.restoreConnectAddress(s);
             s.state = "new";
@@ -459,7 +532,18 @@ export class WsaSocketTable {
             if (bytes.length > this.maxMessageSize(sid)) fail(WSA.EMSGSIZE);
             if (broadcast(dst.node) && !s.broadcast) fail(WSA.EACCES);
             if (s.type !== 3 && !dst.port) fail(WSA.EADDRNOTAVAIL);
+            if (s.type === 3 && s.af === 2 && multicast4(dst.ip)) fail(WSA.EOPNOTSUPP);
             this.autoBind(s);
+            if (s.type === 2 && s.af === 2 && dst.ip && dst.ip[0] >= 224 && dst.ip[0] <= 239) {
+                const value = s.multicastInterface, ip = Uint8Array.of(value & 255, value >>> 8 & 255, value >>> 16 & 255, value >>> 24);
+                const interfaceIndex = this.multicastInterfaceIndex(ip);
+                if (interfaceIndex === 2 && s.multicastTtl > 0 && this.network.connected && !this.network.udpMulticast4V1) fail(WSA.EOPNOTSUPP);
+                if (!this.network.sendMulticast4(this.boundPort(s), dst.ip, dst.port, bytes, interfaceIndex, s.multicastTtl)) {
+                    if (!this.network.connected && interfaceIndex === 2 && s.multicastTtl > 0) fail(WSA.ENETDOWN);
+                    s.writeBlocked = true; this.rearm(s, FD_WRITE); fail(WSA.EWOULDBLOCK);
+                }
+                return bytes.length;
+            }
             let payload: Uint8Array = bytes, destination = this.routeAddress(dst), destinationPort = dst.port;
             if (s.type === 3) {
                 let protocol = s.protocol;
@@ -484,6 +568,7 @@ export class WsaSocketTable {
                     view.setUint32(32, payload.length); pseudo[39] = protocol; pseudo.set(payload, 40);
                     new DataView(payload.buffer).setUint16(offset, ipChecksum(pseudo));
                 }
+                if (s.af === 2 && multicast4(destination.ip)) fail(WSA.EOPNOTSUPP);
                 const prefix = s.ipOptionsChanged ? 5 : 2, framed = new Uint8Array(payload.length + prefix);
                 framed[0] = protocol; framed[1] = +s.headerInclude | (s.ipOptionsChanged ? 2 : 0);
                 if (s.ipOptionsChanged) { new DataView(framed.buffer).setInt16(2, s.ipTtl, true); framed[4] = s.ipTos; }
@@ -713,13 +798,14 @@ export class WsaSocketTable {
         const packet = encodeTcpFrame(kind, srcId, dstId, value, data);
         return this.network.send(srcPort, node, dstPort, packet, proto);
     }
-    private deliver(port: number, proto: number, packet: { srcNode: Uint8Array; srcPort: number; data: Uint8Array }): void {
+    private deliver(port: number, proto: number, packet: LanDatagram): void {
         const binding = this.bindings.get(`${proto}:${port}`);
         if (!binding) return;
         const raw = proto === PROTO_RAW4 || proto === PROTO_RAW6;
         const v6 = proto === PROTO_TCP6 || proto === PROTO_UDP6 || proto === PROTO_RAW6;
+        const multicast = proto === PROTO_UDP ? packet.multicast4 : undefined;
         const from: WsaAddress = { family: proto === PROTO_IPX ? 6 : v6 ? 23 : 2, node: packet.srcNode.slice(), port: raw ? 0 : packet.srcPort,
-            ...(proto === PROTO_IPX ? {} : v6 ? { ip6: this.network.nodeToIpv6(packet.srcNode), scopeId: this.network.nodeToIpv6Scope(packet.srcNode), flowInfo: 0 } : { ip: nodeToIpv4(packet.srcNode) }) };
+            ...(proto === PROTO_IPX ? {} : v6 ? { ip6: this.network.nodeToIpv6(packet.srcNode), scopeId: this.network.nodeToIpv6Scope(packet.srcNode), flowInfo: 0 } : { ip: multicast?.interfaceIndex === 1 ? Uint8Array.of(127, 0, 0, 1) : nodeToIpv4(packet.srcNode) }) };
         if (proto !== PROTO_TCP && proto !== PROTO_TCP6) {
             if (proto === PROTO_IPX && packet.data.length < 2) return;
             let data = proto === PROTO_IPX ? packet.data.subarray(2) : packet.data;
@@ -741,6 +827,10 @@ export class WsaSocketTable {
             if (proto === PROTO_IPX) { from.packetType = packetType; from.flags = ipxFlags; }
             for (const id of binding.sockets) {
                 const s = this.get(id);
+                if (multicast) {
+                    if (s.af !== 2 || s.type !== 2 || !this.multicastMemberships.get(id)?.has(multicast.interfaceIndex + ":" + [...multicast.group].join(".")) ||
+                        (multicast.localOrigin && !s.multicastLoop)) continue;
+                }
                 if (s.af === 6 && ((!s.receiveBroadcast && (ipxFlags & 1)) || (s.filterPacketType !== null && s.filterPacketType !== packetType))) continue;
                 if (s.readShutdown || (s.peer && (!same(s.peer.node, from.node) || s.peer.port !== from.port))) continue;
                 if (s.packets.length >= PACKET_LIMIT || s.available + data.length > s.receiveLimit) continue;

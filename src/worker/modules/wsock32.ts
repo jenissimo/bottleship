@@ -55,7 +55,7 @@ export class Wsock32 implements IModule {
         };
         const setError = state.setError;
         const startup = makeWsaStartup(setError, WSAEFAULT, SOCKET_ERROR, state.counter);
-        const socketExports = makeSocketExports(this.socketTable, setError, state.counter, process);
+        const socketExports = makeSocketExports(this.socketTable, setError, state.counter, process, true);
         const dns = createDnsStubs(process, setError);
         const protoServ = createProtoServStubs(process, setError);
         const asyncLookup = createAsyncLookupStubs(setError, process);

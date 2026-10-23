@@ -35,6 +35,7 @@ export interface DirectPlay8Backend {
     readonly desc: SessionDesc | null;
     readonly joinReply: Reply | null;
     onMessage?: (id: number) => void;
+    onInfo?: (id: number, returned: (result?: number) => void) => void;
     onChange?: () => void;
     onTermination?: (data: Uint8Array, reason?: number) => void;
     playerAddress(id: number): Address | null;

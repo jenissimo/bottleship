@@ -1,6 +1,6 @@
 import { io, type Socket } from "socket.io-client";
 import type { ClientEvents, ServerEvents, LanReady } from "./netplay-wire";
-import { PROTOCOL_VERSION, PROTO_DIRECTPLAY, isTcpProtocol, asBytes, decodeDatagram, isLanNode, nodeToIpv4 } from "./netplay-wire";
+import { PROTOCOL_VERSION, WIRE_DGRAM_MULTICAST4, PROTO_DIRECTPLAY, isTcpProtocol, asBytes, decodeDatagram, isLanNode, nodeToIpv4 } from "./netplay-wire";
 import { LanNetwork, type NetTransport } from "./lan-network";
 import { UdpHostLeaseRpc, type UdpHostLease } from "./udp-host-lease-rpc";
 import { copyUdpHostCapability, validUdpHostOpenRequest, type UdpHostOpenRequest } from "./netplay-wire";
@@ -82,7 +82,15 @@ export class RelayLink implements NetTransport {
         this.socket.on("frame", (input,generation) => {
             if (!this.online || this.closed) return;
             const bytes = asBytes(input);
-            if(bytes&&(generation===undefined||validBindingGeneration(generation)))this.net.receiveFrame(bytes,false,generation);
+            if (!bytes || (generation !== undefined && !validBindingGeneration(generation))) return;
+            if (bytes[0] === WIRE_DGRAM_MULTICAST4) {
+                const datagram = decodeDatagram(bytes);
+                // Backplane overrides receiveFrame to enter the trusted local
+                // broker. Validate remote multicast before that trust boundary.
+                if (!this.net.udpMulticast4V1 || !datagram?.multicast4 || !isLanNode(datagram.node)
+                    || this.net.isSelf(datagram.node) || datagram.multicast4.interfaceIndex !== 2 || datagram.multicast4.ttl === 0) return;
+            }
+            this.net.receiveFrame(bytes, false, generation);
         });
         this.socket.on("peerLeft", peer => {
             if (!this.online || this.closed || !peer || !Array.isArray(peer.node)
@@ -134,7 +142,7 @@ export class RelayLink implements NetTransport {
     send(frame: Uint8Array<ArrayBuffer>,generation=0): boolean {
         const engine = this.socket.io.engine;
         const datagram = decodeDatagram(frame);
-        if (!datagram || this.closed || !this.online || !this.socket.connected || !engine) return false;
+        if (!datagram || this.closed || !this.online || !this.socket.connected || !engine || (datagram.multicast4 && !this.net.udpMulticast4V1)) return false;
         const reliable = isTcpProtocol(datagram.proto) || datagram.proto === PROTO_DIRECTPLAY;
         if (reliable) {
             return this.enqueue({kind:"frame",frame:frame.slice(),generation:generation||undefined},frame.byteLength);
@@ -244,13 +252,15 @@ export class RelayLink implements NetTransport {
         if (!info || typeof info !== "object" || info.version !== PROTOCOL_VERSION || !Array.isArray(info.node) || info.node.length !== 6
             || !info.node.every((value, index) => value === this.net.node[index])
             || !Array.isArray(info.ipv4) || info.ipv4.length !== 4
-            || !info.ipv4.every((value, index) => value === expectedIp[index])) {
+            || !info.ipv4.every((value, index) => value === expectedIp[index])
+            || (info.udpMulticast4V1 !== undefined && info.udpMulticast4V1 !== true)) {
             if (!this.settled) this.failInitial(new Error("Invalid LAN server identity"));
             else this.close();
             return;
         }
         try { this.net.configureUdpHosts(info.udpHostListenV1 === undefined ? undefined : copyUdpHostCapability(info.udpHostListenV1)); }
         catch { if (!this.settled) this.failInitial(new Error("Invalid UDP Host capability")); else this.close(); return; }
+        this.net.configureMulticast4(info.udpMulticast4V1 === true);
         this.net.configureGatewayAddresses(info.gatewayIpv4 ?? []);
         this.net.configureGatewayIpv6(info.gatewayIpv6 ?? []);
         this.online = true;

@@ -2,6 +2,8 @@
 export const PROTOCOL_VERSION = 1;
 export const SOCKET_PATH = "/socket.io";
 export const WIRE_DGRAM = 2;
+export * from "./multicast4-protocol";
+import {WIRE_DGRAM_MULTICAST4, MULTICAST4_DGRAM_HEADER, isIpv4Multicast, isMulticastIpv4Node, multicast4Node, validMulticast4Header, type UdpMulticast4Header} from "./multicast4-protocol";
 export const PROTO_IPX = 0;
 export const PROTO_UDP = 1;
 export const PROTO_TCP = 2;
@@ -48,9 +50,11 @@ export interface LanReady {
     gatewayIpv4?: number[][];
     gatewayIpv6?: GatewayIpv6Address[];
     udpHostListenV1?: UdpHostListenCapability;
+    udpMulticast4V1?: true;
 }
 export function validBindingGeneration(value:unknown):value is number{return Number.isInteger(value)&&Number(value)>=1&&Number(value)<=0xffffffff;}
 export interface DecodedDatagram {
+    multicast4?: UdpMulticast4Header;
     bindingGeneration?:number;
     proto: number;
     node: Uint8Array;
@@ -121,10 +125,11 @@ export function maxPayload(proto: number): number {
     return isRawProtocol(proto) ? RAW_FRAME_MAX_PAYLOAD : proto === PROTO_IPX ? IPX_FRAME_MAX_PAYLOAD : proto === PROTO_UDP6 ? UDP6_MAX_PAYLOAD : UDP_MAX_PAYLOAD;
 }
 export function nodeToIpv4(node: Uint8Array): Uint8Array {
-    return isExternalIpv4Node(node) ? node.slice(2, 6) : new Uint8Array([10, node[3], node[4], node[5]]);
+    return isExternalIpv4Node(node) || isMulticastIpv4Node(node) ? node.slice(2, 6) : new Uint8Array([10, node[3], node[4], node[5]]);
 }
 export function ipv4ToNode(ip: Uint8Array, external = false): Uint8Array {
     if (ip.length !== 4) throw new RangeError("IPv4 address must have four bytes");
+    if (isIpv4Multicast(ip)) return multicast4Node(ip);
     if (ip[0] === 255 && ip[1] === 255 && ip[2] === 255 && ip[3] === 255) return BROADCAST_NODE.slice();
     if (ip[0] === 10 && ip[1] === 255 && ip[2] === 255 && ip[3] === 255) return BROADCAST_NODE.slice();
     return !external && (ip[0] === 10 || ip[0] === 0 || ip[0] === 127)
@@ -132,36 +137,59 @@ export function ipv4ToNode(ip: Uint8Array, external = false): Uint8Array {
         : new Uint8Array([2, 1, ip[0], ip[1], ip[2], ip[3]]);
 }
 export function asBytes(input: unknown): Uint8Array | null {
-    if (input instanceof Uint8Array) return input;
+    // Buffer.slice aliases storage. Consumers rely on Uint8Array.slice owning
+    // its bytes before a later MessagePort transfer detaches the input buffer.
+    if (input instanceof Uint8Array && Object.getPrototypeOf(input) === Uint8Array.prototype) return input;
     if (input instanceof ArrayBuffer) return new Uint8Array(input);
     if (ArrayBuffer.isView(input)) return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
     return null;
 }
-export function encodeDatagram(proto: number, node: Uint8Array, dstPort: number, srcPort: number, payload: Uint8Array): Uint8Array<ArrayBuffer> {
+export function encodeDatagram(proto: number, node: Uint8Array, dstPort: number, srcPort: number, payload: Uint8Array, multicast4?: UdpMulticast4Header): Uint8Array<ArrayBuffer> {
     if (!isProtocol(proto) || node.length !== NODE_LEN || !validPort(srcPort) || !validPort(dstPort)
         || payload.length > maxPayload(proto) || (proto === PROTO_IPX && payload.length < 2)
         || (isRawProtocol(proto) && (!validRawPayload(payload) || dstPort > 256 || srcPort > 256))) throw new RangeError("Invalid LAN datagram");
-    const frame = new Uint8Array(DGRAM_HEADER + payload.length);
-    frame[0] = WIRE_DGRAM;
+    if (multicast4 ? proto !== PROTO_UDP || !validMulticast4Header(multicast4)
+        || (!isLanNode(node) && (!isMulticastIpv4Node(node) || !node.subarray(2).every((byte, i) => byte === multicast4.group[i])))
+        : isMulticastIpv4Node(node)) throw new RangeError("Invalid multicast datagram");
+    const header = multicast4 ? MULTICAST4_DGRAM_HEADER : DGRAM_HEADER;
+    const frame = new Uint8Array(header + payload.length);
+    frame[0] = multicast4 ? WIRE_DGRAM_MULTICAST4 : WIRE_DGRAM;
     frame[1] = proto;
     frame.set(node, 2);
     const view = new DataView(frame.buffer);
     view.setUint16(8, dstPort);
     view.setUint16(10, srcPort);
-    frame.set(payload, DGRAM_HEADER);
+    if (multicast4) {
+        frame.set(multicast4.group, 12);
+        frame[16] = multicast4.interfaceIndex;
+        frame[17] = multicast4.ttl;
+    }
+    frame.set(payload, header);
     return frame;
 }
 export function validPort(port: number): boolean {
     return Number.isInteger(port) && port > 0 && port <= 65535;
 }
 export function decodeDatagram(frame: Uint8Array): DecodedDatagram | null {
-    if (frame.length < DGRAM_HEADER || frame.length > MAX_FRAME_SIZE
-        || frame[0] !== WIRE_DGRAM || !isProtocol(frame[1])
-        || frame.length - DGRAM_HEADER > maxPayload(frame[1])
-        || (frame[1] === PROTO_IPX && frame.length < DGRAM_HEADER + 2)) return null;
+    const bytes = asBytes(frame);
+    if (!bytes) return null;
+    frame = bytes;
+    const multicast = frame[0] === WIRE_DGRAM_MULTICAST4;
+    const header = multicast ? MULTICAST4_DGRAM_HEADER : DGRAM_HEADER;
+    if (frame.length < header || frame.length > MAX_FRAME_SIZE
+        || (!multicast && frame[0] !== WIRE_DGRAM) || !isProtocol(frame[1])
+        || frame.length - header > maxPayload(frame[1])
+        || (frame[1] === PROTO_IPX && frame.length < header + 2)) return null;
+    const node = frame.subarray(2, 8), payload = frame.subarray(header);
+    let multicast4: UdpMulticast4Header | undefined;
+    if (multicast) {
+        multicast4 = {group: frame.subarray(12, 16), interfaceIndex: frame[16] as 1 | 2, ttl: frame[17]};
+        if (frame[1] !== PROTO_UDP || frame[18] !== 0 || frame[19] !== 0 || !validMulticast4Header(multicast4)
+            || (!isLanNode(node) && (!isMulticastIpv4Node(node) || !node.subarray(2).every((byte, i) => byte === multicast4!.group[i])))) return null;
+    } else if (isMulticastIpv4Node(node)) return null;
     const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
     const dstPort = view.getUint16(8), srcPort = view.getUint16(10);
     if (!validPort(dstPort) || !validPort(srcPort)
-        || (isRawProtocol(frame[1]) && (!validRawPayload(frame.subarray(DGRAM_HEADER)) || dstPort > 256 || srcPort > 256))) return null;
-    return { proto: frame[1], node: frame.subarray(2, 8), dstPort, srcPort, payload: frame.subarray(DGRAM_HEADER) };
+        || (isRawProtocol(frame[1]) && (!validRawPayload(payload) || dstPort > 256 || srcPort > 256))) return null;
+    return {proto: frame[1], node, dstPort, srcPort, payload, ...(multicast4 ? {multicast4} : {})};
 }

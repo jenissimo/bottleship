@@ -10,8 +10,9 @@ export interface NativeReliableOptions {
     sendBudget?: { reserve(bytes: number): boolean; release(bytes: number): void };
     receiveBudget?: { reserve(bytes: number, fragments?: number): boolean; release(bytes: number, fragments?: number): void };
 }
+export interface NativeReliableReservation { readonly result: Promise<number>; start(): void; cancel(result?: number): void; }
 export type NativeReliableState = "idle" | "listening" | "connecting" | "connected" | "closed";
-interface SendJob { data: Uint8Array; offset: number; first: boolean; flags: number; control: number; outstanding: number; assigned: boolean; done: boolean; completion: Promise<number>; finish(result: number): void; }
+interface SendJob { held: boolean; data: Uint8Array; offset: number; first: boolean; flags: number; control: number; outstanding: number; assigned: boolean; done: boolean; completion: Promise<number>; finish(result: number): void; }
 interface SentFrame { serial: number; command: number; payload: Uint8Array; job: SendJob; time: number; retries: number; control: number; cancelled?: boolean; }
 /**
  * Native DNET transport state, separate from DirectPlay's core name table/connect
@@ -160,6 +161,11 @@ export class NativeReliableLink {
         if (this.ending) return Promise.resolve(DPN.ALREADYCLOSING);
         return this.enqueueReliable(data, userFlags, sequential);
     }
+    /** Reserve a bounded FIFO position before publishing authoritative local state. */
+    reserveReliable(data: Uint8Array, userFlags: number = DN.USER1, sequential = true): NativeReliableReservation | number {
+        if (this.ending) return DPN.ALREADYCLOSING;
+        return this.enqueueReliable(data, userFlags, sequential, 0, true, true);
+    }
     /** Unreliable payloads complete on carrier acceptance; bounded sequence metadata remains until ACK/cancel. */
     sendUnreliable(data: Uint8Array, userFlags = 0, sequential = true): Promise<number> {
         if (this.ending) return Promise.resolve(DPN.ALREADYCLOSING);
@@ -180,28 +186,39 @@ export class NativeReliableLink {
         return this.ending;
     }
     private finishShutdown(): void { if (this.receivedEnd && this.sentEndAcknowledged) this.close(DPN.OK); }
-    private enqueueReliable(data: Uint8Array, userFlags: number, sequential: boolean, control = 0, reliable = true): Promise<number> {
-        if (this.state !== "connected") return Promise.resolve(DPN.NOCONNECTION);
-        if (userFlags & ~(DN.USER1 | DN.USER2)) return Promise.resolve(DPN.INVALIDFLAGS);
-        if (data.length > this.receiver.maxMessage) return Promise.resolve(DPN.DATATOOLARGE);
-        if ((!control && this.jobs.length >= 256) || this.bytes + data.length > this.maxBuffered) return Promise.resolve(DPN.TABLEFULL);
-        if (this.options.sendBudget && !this.options.sendBudget.reserve(data.length)) return Promise.resolve(DPN.TABLEFULL);
+    private enqueueReliable(data: Uint8Array, userFlags: number, sequential: boolean, control: number, reliable: boolean, deferred: true): NativeReliableReservation | number;
+    private enqueueReliable(data: Uint8Array, userFlags: number, sequential: boolean, control?: number, reliable?: boolean, deferred?: false): Promise<number>;
+    private enqueueReliable(data: Uint8Array, userFlags: number, sequential: boolean, control = 0, reliable = true, deferred = false): Promise<number> | NativeReliableReservation | number {
+        const fail = (hr: number) => deferred ? hr : Promise.resolve(hr);
+        if (this.state !== "connected") return fail(DPN.NOCONNECTION);
+        if (userFlags & ~(DN.USER1 | DN.USER2)) return fail(DPN.INVALIDFLAGS);
+        if (data.length > this.receiver.maxMessage) return fail(DPN.DATATOOLARGE);
+        if ((!control && this.jobs.length >= 256) || this.bytes + data.length > this.maxBuffered) return fail(DPN.TABLEFULL);
+        if (this.options.sendBudget && !this.options.sendBudget.reserve(data.length)) return fail(DPN.TABLEFULL);
         let resolve!: (result: number) => void;
         const reservedBytes = data.length;
         const done = new Promise<number>(finish => { resolve = finish; });
-        const job: SendJob = { data: data.slice(), offset: 0, first: true, flags: userFlags | (reliable ? DN.RELIABLE : 0) | (sequential ? DN.SEQUENTIAL : 0),
+        let copied: Uint8Array;
+        try { copied = data.slice(); } catch { this.options.sendBudget?.release(reservedBytes); return fail(DPN.OUTOFMEMORY); }
+        const job: SendJob = { held: deferred, data: copied, offset: 0, first: true, flags: userFlags | (reliable ? DN.RELIABLE : 0) | (sequential ? DN.SEQUENTIAL : 0),
             control, outstanding: 0, assigned: false, done: false, completion: done, finish: result => {
-                if (job.done) return; job.done = true; this.bytes -= job.data.length; this.jobs = this.jobs.filter(j => j !== job);
+                if (job.done) return; job.done = true; this.bytes -= job.data.length; this.jobs = this.jobs.filter(j => j !== job); this.waiting = this.waiting.filter(j => j !== job);
                 this.options.sendBudget?.release(reservedBytes); resolve(result);
             } };
-        this.jobs.push(job); this.waiting.push(job); this.bytes += data.length; this.pump(); return done;
+        this.jobs.push(job); this.waiting.push(job); this.bytes += data.length;
+        const reservation: NativeReliableReservation = { result: done,
+            start: () => { if (!job.done) { job.held = false; this.pump(); } },
+            cancel: (result = DPN.USERCANCEL) => { job.finish(result); this.pump(); } };
+        if (deferred) return reservation;
+        reservation.start(); return done;
     }
     private pump(): void {
         if (this.pumping || this.state !== "connected") return;
         this.pumping = true;
         try {
             while (this.state === "connected" && this.waiting.length && this.sendNext - this.sendAck < 63) {
-                const job = this.waiting[0], end = Math.min(job.data.length, job.offset + this.fragmentSize);
+                const job = this.waiting[0]; if (job.held) return;
+                const end = Math.min(job.data.length, job.offset + this.fragmentSize);
                 const command = DN.DATA | job.flags | (job.first ? DN.NEW_MESSAGE : 0) | (end === job.data.length ? DN.END_MESSAGE : 0);
                 const frame: SentFrame = { serial: this.sendNext++, command, payload: job.data.slice(job.offset, end), job, time: this.clock(), retries: 0, control: end === job.data.length ? job.control : 0 };
                 job.offset = end; job.first = false; job.outstanding++;
