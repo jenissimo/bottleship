@@ -63,7 +63,7 @@
 | Агент | Текущий участок |
 | --- | --- |
 | /root/lan_transport | Ignored Quake II runner, PRIVATE-console CLI owner, исправление HTTP serving; саму игру запускает Root после tool HOLD |
-| /root/winsock | UDP_CONNRESET native facts и portable oracle; runtime ещё не реализован; готовит неизмеренный IOCP+APC side effect |
+| /root/winsock | UDP_CONNRESET native facts/portable oracle, включая новый976-observation IOCP+APC effect; runtime ещё не реализован; готовит ignored RED и проверяет closed-loopback prerequisite |
 | /root/directplay | Следующий API-only Host+2Peer native oracle; пока только ignored preparation, без compiler/native/browser/runtime |
 
 ## Настоящая игра: где остановились
@@ -79,14 +79,14 @@
 1. j4343c7, game-first: listSessionTabs() ошибочно приняли за scoped по BS_TAB. Функция возвращает все game=dev страницы. Исправлено в ignored role.ts через exact bs + origin. Снимок старых шести scripts сохранён в game-first/input-snapshot/. Старые manifest и FAIL не переписывались.
 2. j622fd1, game-second: абсолютный WGB путь ушёл на /__wgb/ у production preview и получил HTML вместо WGB. CPU оставался до загрузки PE, threads/frames=0, manifest не был прочитан. Вкладка закрыта, siblings сохранены; CLI11880/owner63436 exit0, forced=false, actual port64421 retired. Агент готовит обычные same-origin HTTP URL с exact SHA проверкой, как в уже прошедших PE fixtures.
 
-Поэтому gameIds пока не использованы гостевой игрой. После любого фактического boot для нового независимого повтора нужны новые gameIds, не очистка пользовательского OPFS.
+После первых двух попыток gameIds оставались неиспользованными. В третьей Host уже исполнил PE: для следующего независимого повтора готовятся новые gameIds обеих ролей; старый OPFS не удалять.
 
-Текущий HTTP serving fix: новые dist/apps/q2-proof-v3-host.wgb и q2-proof-v3-peer.wgb; job j0777f4 подтвердил HTTP200 и точные SHA исходных копий. Карта URL сохранена в stage30-quake2-run/preparation-v3.json. MANIFEST-v3.json SHA e336877a1b071ce9c45e99ed126ac7de37f11fe1d939054ddb3a2fcece1608e8, tools HOLD. Из прежних шести scripts изменён только game.ts, SHA51096c437dce328c67cab2f48fea42b255561b33a265557619d994d56acd2663. Проверки archive/HTTP/syntax j5baf9e/j0777f4/j4cf4e0 EXIT0. Не перезапускать Vite и не менять frozen frontend ради этой обвязки. Root запускает новую попытку game-third; узнать её актуальное состояние через project_jobs/project_output.
+Текущий HTTP serving fix: новые dist/apps/q2-proof-v3-host.wgb и q2-proof-v3-peer.wgb; job j0777f4 подтвердил HTTP200 и точные SHA исходных копий. Карта URL сохранена в stage30-quake2-run/preparation-v3.json. MANIFEST-v3.json SHA e336877a1b071ce9c45e99ed126ac7de37f11fe1d939054ddb3a2fcece1608e8, tools HOLD. Из прежних шести scripts изменён только game.ts, SHA51096c437dce328c67cab2f48fea42b255561b33a265557619d994d56acd2663. Проверки archive/HTTP/syntax j5baf9e/j0777f4/j4cf4e0 EXIT0. Не перезапускать Vite и не менять frozen frontend ради этой обвязки. Третий запуск jc646a5 завершён FAIL: Host реально запустил demo1 и ответил настоящим LAN status с BS29Host (host-only-status.json SHA7da4fc4d74196f669fc2c7b73973d6f9c30b7173250921cd1fed038b16be4a9b). Peer не исполнил PE: созданный CDP target ещё имел пустой URL, а harness сразу сделал findTab. Нужен bounded wait exact created target URL/origin/bs и page harness readiness до reload. Обе вкладки закрыты, siblings сохранены; server exit0/no forced. Агент готовит ignored V4 с readiness wait и свежими gameIds/HTTP bundles; самого повторного запуска ещё нет. Host screenshot host-screen.png SHAf3516f62… пока показывает серое окно, поэтому игровой кадр и advancing frames ещё НЕ доказаны.
 
 Команда следующего запуска после окончания подготовки (новый output, не существующий каталог):
 
     Set-Location .wt/lan-network
-    & ./logs/tools/bun-portable/package/bin/bun.exe logs/lan-conformance/stage30-quake2-run/controller.ts --run-authorized --manifest logs/lan-conformance/freeze-30/source.json --expected-sha 71582326701092d11d0766e29a7298bc6cbb3b0c6850be8f33210b70616b40e5 --output logs/lan-conformance/stage30-quake2-run/game-third
+    & ./logs/tools/bun-portable/package/bin/bun.exe logs/lan-conformance/stage30-quake2-run/controller.ts --run-authorized --manifest logs/lan-conformance/freeze-30/source.json --expected-sha 71582326701092d11d0766e29a7298bc6cbb3b0c6850be8f33210b70616b40e5 --output logs/lan-conformance/stage30-quake2-run/game-fourth
 
 Положительный критерий runner: ответ настоящего Quake II status с mapname demo1 и сначала одним, потом ровно двумя именованными игроками; advancing guest/canvas presents у обеих ролей; настоящие GDI окна; повторный two-player status; qconsole logs, reports и screenshots. Observer отправляет только FFFF status newline, не изображает третьего игрового клиента. Обязательно визуально просмотреть screenshots: статус подключения сам по себе ещё не доказывает игровой кадр.
 
@@ -150,9 +150,9 @@ Cleanup: Peer перед Host, обычная попытка disconnect/quit, se
 
 Измеренные особенности: SIO_UDP_CONNRESET0x9800000c читает первый BYTE;256=off,257/on. Успешный nonnull returned pointer не dereference; NULL даёт14. TCP возвращает22 до dereference плохого nonnull input. Нет autobind. Flag физический, общий aliases и reserved import через WSACleanup/startup. Уже queued54 переживает off; suppressed54 не воскресает после on. Event/APC/IOCP и IOSB publication имеют измеренный порядок.
 
-**Ещё не измерен physical toggle side effect при отказе IOCP+APC22.** WSA агент готовит узкий followup; сначала Native probe, затем реализация. Не выбирать atomicity наугад.
+**Physical toggle effect IOCP+APC22 теперь измерен: отказ НЕ атомарный.** Followup je849e5:976 observations/123 records,8/8 cases IPv4/6 × initialON/OFF × queued/noqueued. Несмотря на return-1/10022 requested physical toggle применяется. Старый queued54 сохраняется; новые errors отражают новый flag. Returned sentinel/IOSB259/High0x22222222/offsets неизменны; APC0/IOCP packet отсутствует; live16/16,24ports retired, все процессы завершились. Analysis: iocp-apc-effect-preparation/native-first-analysis.json SHA3e859a9eb342e16bbaa200f93a1b2993f7229787343b2af003bbe5cac2ed96bd; PE2f598d655aa2d48585421cd37fa03b72c7604b1e01506952229c15308cbd3cae, refd5bc21485228c64cc2c79f8b9cbaae2f1a1ad749fcb38ba5c245b2d158e9a28b. Менять physical flag до completion-routine/IOCP rejection, не rollback на22.
 
-Реализация ещё не начата: physical flag + suppression будущих reset errors, точная WSAIoctl pointer/type/LastError/completion branch, actor/alias/lifetime serialization, meaningful RED→GREEN, затем тот же PE6168 в браузере на новом freeze/build. Не сбрасывать уже queued error при off. Не менять default gateway ICMP attribution произвольно.
+Реализация ещё не начата: physical flag + suppression будущих reset errors, точная WSAIoctl pointer/type/LastError/completion branch, actor/alias/lifetime serialization, meaningful RED→GREEN, затем тот же PE6168 в браузере на новом freeze/build. Не сбрасывать уже queued error при off. Не менять default gateway ICMP attribution произвольно. Отдельно проверить prerequisite whole-SAMEPE6168: producer сам создаёт closed loopback UDP port. Если virtual Winsock пока не генерирует соответствующий asynchronous port-unreachable/reset, нужен общий механизм; нельзя подменять expected words или перенаправлять весь127/8 на native gateway ради fixture.
 
 ### 2. Native DirectPlay8 Host с двумя remote Peer
 
