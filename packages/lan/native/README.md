@@ -141,3 +141,85 @@ host permissions reject creation or send; it never elevates privileges:
 ```sh
 python3 native/smoke.py native/build/socket-helper native/build/test-peer
 ```
+
+## Separate ordinary bound UDP backend
+
+Build this opt-in backend independently of the TCP/raw helper:
+
+```sh
+bun run build:native:udp
+```
+
+Set `gateway.nativeUdpHelperPath` to the resulting absolute
+`native/build/udp-bound-helper[.exe]` path. Keep `nativeHelperPath` for TCP,
+raw and scoped UDP. Without the new setting, the Node UDP backend stays active.
+Ordinary unicast IPv4/IPv6 scope-zero peers use one unconnected native socket per
+participant/binding-generation/family port group. Scoped, multicast and mapped
+endpoints retain their existing backend; this helper does not establish their
+error or membership semantics.
+
+The server authorizes the numeric destination against its configured route before
+registering it. PEER_READY acknowledges native admission without sending a UDP
+packet. Only registered, live peer tuples may deliver data. Each native tuple's
+identity is retained until the socket closes; another virtual alias gets another
+socket. Reopening the same identity advances its peer epoch. Native destination
+policy leases also remain held through the actual helper exit.
+
+This private version-1 protocol has a 16-byte header: total length u32LE, version
+u8, opcode u8, reserved u16LE, request id u32LE, binding generation u32LE.
+An address is 24 bytes: family u8 (4/6), reserved u8, port u16BE, scope u32LE,
+and 16 address bytes (IPv4 followed by 12 zero bytes). Scope is zero on this path.
+
+| Command | Opcode | Payload |
+| --- | --- | --- |
+| BIND | 1 | address |
+| PEER | 2 | peer id u32 + epoch u32 + address |
+| SEND | 3 | peer id u32 + epoch u32 + complete datagram |
+| CREDIT | 4 | additional bytes u32 + packets u32 |
+| RETIRE | 5 | peer id u32 + epoch u32 |
+| CLOSE | 6 | empty; finish earlier admitted native work |
+| STATUS | 7 | empty |
+| Ordered STATUS | 9 | empty; fence earlier SEND |
+| ABORT | 10 | empty; close native socket before draining pipe results |
+
+Events 101–111 are READY, PEER_READY, SEND_RESULT, CREDIT_APPLIED, RETIRED,
+CLOSED, RECEIVE, PEER_ERROR, LOSS_COUNTERS, FAILURE and SNAPSHOT. Event 114
+cancels an admitted control during ABORT. READY advertises protocol capabilities
+and all queue limits. Every SEND_RESULT identifies the original send, peer and
+epoch, and reports accepted/refused/cancelled separately from native error data.
+A successful OS send is never retried.
+
+There are 256 TX records and 262,144 payload bytes. Admission reserves the entire
+datagram, including a record for an empty datagram. Each record remains reserved
+until its result is written to the parent. Separate 64-control and 32-error
+escrows prevent a blocked result pipe from blocking socket cancellation. Errors
+coalesce by exact tuple/epoch and native metadata; error overflow and unattributed
+errors have separate counters from dropped RX packets/bytes. RX has 256 records
+and 262,144 bytes; delivery requires both byte and packet credits, with empty
+datagrams consuming a packet credit. The helper keeps draining native ICMP even
+when RX credit is zero. UDP receive overflow may drop packets.
+
+ABORT and CLOSE have reserved admission. ABORT releases the actual port before
+waiting for stdout drainage and preserves a result for every admitted SEND;
+already accepted sends are never replayed. Startup, individual operations and
+shutdown have finite deadlines. A healthy idle binding has no global lifetime
+timer; gateway idle expiry remains a separate configured policy.
+
+On Windows, enabled SIO_UDP_CONNRESET supplies the original destination tuple.
+On Linux, IP_RECVERR/IPV6_RECVERR and MSG_ERRQUEUE supply that tuple. Before each
+Linux send the helper drains queued errors; if a new pending error prevents the
+current SEND from being accepted, it drains that original error and retries the
+same reserved packet. Measured ICMP port-unreachable maps to Winsock 10054 on
+that peer alone and leaves its shared socket and other peers live. Other native
+error metadata remains distinct; this does not establish complete UDP ICMP,
+routing, interface-scope, multicast or SO_REUSEADDR parity.
+
+The finite loopback protocol driver is
+`tools/lan-conformance/bound-udp-driver.py` in the BottleShip checkout.
+`tools/tests/lan-bound-udp-driver.test.ts` exercises the real TypeScript driver,
+including empty datagrams and controlled-clock lifetime.
+`lan-bound-udp-gateway.test.ts` and `lan-bound-udp-leases.test.ts` exercise
+real WebSocket/polling, room isolation, virtual aliases and close/rebind.
+Test builds use distinct source-hash output paths and never rebuild the TCP/raw
+helper. Controlled clock and real ICMP-race commands exist only under explicit
+test compile defines, not in the shipping binary.

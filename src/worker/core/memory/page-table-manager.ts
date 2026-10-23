@@ -327,6 +327,22 @@ export class PageTableManager {
         setWriteMapBase(baseAddr, sizeBytes, flags === PTE_DEFAULT);
     }
 
+    isRangeAccessible(address: number, size: number, write = false): boolean {
+        if (!this.pagingEnabled || size === 0) return true;
+        if (!Number.isSafeInteger(address) || !Number.isSafeInteger(size) ||
+            address < 0 || size < 0 || address + size > 0x100000000) return false;
+        const mem = this.getMemory();
+        if (address + size > mem.length) return false;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const required = PTE_PRESENT | (write ? PTE_RW : 0);
+        const endPage = Math.ceil((address + size) / PAGE_SIZE);
+        for (let page = Math.floor(address / PAGE_SIZE); page < endPage; page++) {
+            const offset = this._getPteOffset(page);
+            if (offset + 4 > mem.length || (view.getUint32(offset, true) & required) !== required) return false;
+        }
+        return true;
+    }
+
     isPagingEnabled(): boolean {
         return this.pagingEnabled;
     }

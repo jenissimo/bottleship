@@ -2,22 +2,34 @@ import { System } from '../system';
 
 type CommitNotifier = (addr: number, sizeBytes: number) => void;
 let commitNotifier: CommitNotifier | null = null;
+let resetNotifier: (() => void) | null = null;
+let committedProbe: ((addr: number, sizeBytes: number) => boolean) | null = null;
 
-/** kernel32 registers this so VirtualQuery sees MEM_COMMIT after implicit recommit. */
+/** kernel32 owns the logical VA state, including while CPU paging is disabled. */
 export function registerGuestCommitNotifier(fn: CommitNotifier): void {
     commitNotifier = fn;
 }
 
-/**
- * Re-commit guest PTEs after MemoryManager hands out a HEAP address.
- * VirtualFree(MEM_DECOMMIT) clears the Present bit without freeing the
- * MemoryManager block; JS mem.fill still works but guest reads #PF until
- * pages are recommitted (Quake2 dsound buffer at ~0x919xxxx).
- */
+export function registerGuestMemoryResetNotifier(fn: () => void): void {
+    resetNotifier = fn;
+}
+
+export function notifyGuestMemoryReset(memory: object): void {
+    if (System.getInstance().process?.memory === memory) resetNotifier?.();
+}
+
+export function registerGuestCommittedProbe(fn: (addr: number, sizeBytes: number) => boolean): void {
+    committedProbe = fn;
+}
+
+export function isGuestRangeCommitted(addr: number, sizeBytes: number): boolean {
+    return committedProbe?.(addr, sizeBytes) ?? true;
+}
+
+/** A MemoryManager handout revives CPU pages and retires stale VA state together. */
 export function ensureGuestPagesCommitted(addr: number, sizeBytes: number): void {
     if (addr === 0 || sizeBytes <= 0) return;
     const ptm = System.getInstance().process?.pageTableManager;
-    if (!ptm?.isPagingEnabled()) return;
-    ptm.ensurePagesCommitted(addr, sizeBytes);
+    if (ptm?.isPagingEnabled()) ptm.ensurePagesCommitted(addr, sizeBytes);
     commitNotifier?.(addr, sizeBytes);
 }

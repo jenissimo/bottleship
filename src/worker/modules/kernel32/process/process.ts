@@ -14,6 +14,7 @@ import {
     VER_PLATFORM_WIN32_WINDOWS,
 } from '../../../core/emulator-config-manager';
 import { isValidAddress, isValidUserAddress } from '../../../core/memory/address-guard';
+import { raiseGuestAccessViolation } from '../../../core/thunking/guest-fault';
 import { ThreadState } from '../../../core/scheduler/types';
 import { Mem } from '../../../core/memory/mem-accessor';
 import { invalidateGuestCode, invalidateAllGuestCode } from '../../../core/memory/guest-code';
@@ -1531,8 +1532,10 @@ export const exports: Record<string, ThunkImplementation> = {
         const attributes = system.resourceProvider.getHandleAttributes(args[0]);
         if (!attributes) { system.scheduler.setLastError(ERROR_INVALID_HANDLE); return 0; }
         const output = args[1] >>> 0;
-        if (!output || output + 4 > mem.length || !isValidUserAddress(mem, output, 4, 'rw')) {
-            system.scheduler.setLastError(998); return 0;
+        if (!isValidUserAddress(mem, output, 4, 'rw')) {
+            let fault = output;
+            while (fault < output + 4 && isValidUserAddress(mem, fault, 1, 'rw')) fault++;
+            return raiseGuestAccessViolation(ctx, mem, fault, 'w', 8);
         }
         Mem.writeUint32(output, attributes.flags);
         return 1;

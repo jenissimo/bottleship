@@ -78,9 +78,10 @@ The settings screen stores explicitly selected connections in browser preference
 | Win32 socket I/O | ReadFile/WriteFile with synchronous or overlapped sockets; shared overlapped WSA ordering/cancellation, event completion, deferred IOCP status and three-argument ReadFileEx/WriteFileEx APCs |
 | DirectPlay 1 / 2 / 3 / 4, ANSI and Unicode | Discovery, host/join/close, players, groups, chat, session notifications, asynchronous SendEx/cancellation and host migration |
 | DirectPlay 8 | Address components/URLs, Peer/Client/Server sessions, retained receive buffers, and a shared ThreadPool with real guest threads and caller-thread DoWork |
-| Native DirectPlay 8 TCP/IP | Binary UDP discovery and guest Peer Connect/Send/Close to configured Windows hosts over WebSocket or polling; native DNET ACKs, fragmentation, metadata, player updates and retained receive buffers |
+| Native DirectPlay 8 TCP/IP | Binary UDP discovery, Peer Connect/Send/Close and direct peer channels to configured Windows sessions; native DNET ACKs, fragmentation, metadata, player updates and retained receive buffers |
 | Native IPv4 / IPv6 gateways | Explicit UDP/TCP routes and scoped DNS; optional native helper for TCP urgent data, ICMP echo and configured raw protocols |
 | Process network namespace | One relay identity, shared port ownership and localhost across parent, child and descendant workers |
+| Virtual interfaces | One stable LAN/loopback topology for IP Helper, interface IOCTLs and local DNS, including while the relay is disconnected |
 | Classic DirectPlay Lobby | Application registration, RunApplication, connection settings, interprocess messages and retained event notifications |
 | DirectPlay 8 Lobby | Separate dpnlobby.dll; client/application COM interfaces, registration, child activation, messages, settings and status notifications |
 | DNS namespace lookup | ANSI/Unicode enumeration, Begin/Next/End, short-buffer retry, cancellation, scoped addresses and owner-thread result publication |
@@ -100,8 +101,8 @@ IPv6 extension headers, the full protocol/namespace provider catalogue,
 Win32 file completion routines on sockets created without overlapped support,
 positive-linger timeout/flush, less common socket options and IOCTLs,
 Windows external out-of-line urgent marks, asynchronous ICMP error attribution
-on the shared native UDP backend,
-DirectPlay security, NATResolver, native DirectPlay Host/full mesh and classic DP4 provider wire interoperability,
+on the default Node UDP backend,
+DirectPlay security, NATResolver, native DirectPlay Host and classic DP4 provider wire interoperability,
 DP8 Lobby launcher/descendant association and some provider scheduling policies. An explicit
 unsupported result is only parity when the corresponding native provider returns it
 under the same conditions.
@@ -126,9 +127,17 @@ message and native echo, retained RECEIVE data and ReturnBuffer, player data upd
 and bidirectional Close with player callback contexts. A separate 74-observation
 fixture covers SendTo flag and asynchronous-handle contracts. Another 121-observation
 fixture verifies COPY/NOCOPY SEND_COMPLETE structures, NOCOMPLETE and reinitialization.
-These checks cover
-one guest and one native host. Native Host/full mesh, remote group mutations,
-name-table resynchronization, migration and classic DP4 provider wire remain unfinished.
+Those PE checks cover one guest and one native host. A separate real UDP test connects
+the Bun native-wire Peer core as the third participant to a Windows host and an existing
+Windows peer, then exchanges a guaranteed message directly with that peer. It passes
+over direct UDP and over WebSocket/polling gateways with both Node UDP and the bound
+native helper. Both native processes observe the same relay source port for the joined
+participant; peer admission sends no dummy datagram. A further test runs the same x86
+COM executable under Windows and in the browser as the third participant: 47 observations
+match on each transport, covering Connect, three player callbacks and their contexts,
+direct guaranteed peer delivery, retained receive data, ReturnBuffer and Close callbacks.
+Larger mesh parity, native Host, remote group mutations, name-table resynchronization,
+migration and classic DP4 provider wire remain unfinished.
 Native self-send with COMPLETEONPROCESS and multiple buffers has a separate failing
 Windows diagnostic, including a blocked native Close; that case remains under investigation.
 Virtual-LAN COMPLETEONPROCESS still lacks remote application-processing acknowledgements;
@@ -144,6 +153,15 @@ process reset reclaim the old reservations without reviving a later object lifet
 The relay forwards virtual guest traffic. Its optional native gateway connects
 configured UDP/TCP destinations; see [gateway configuration](../packages/lan/README.md).
 Unavailable proprietary game backends require their own protocol implementations.
+
+For tuple-attributed UDP errors, build the optional bound helper with
+`bun run --cwd packages/lan build:native:udp` and configure
+`gateway.nativeUdpHelperPath`. It uses one native UDP socket for the binding's peer
+flows, admits inbound peers through an acknowledged lease, and reports measured ICMP
+port-unreachable errors on the original tuple without closing unrelated peers. Empty
+datagrams consume queue slots, and close/abort retain control capacity when data queues
+are full. The default Node UDP backend remains available. Scoped/multicast traffic and
+other ICMP behavior need separate validation; see the [native helper guide](../packages/lan/native/README.md).
 
 A transport reconnect retains the virtual address but does not restore established
 TCP connections. Old UDP packets are discarded. Games must reconnect or rejoin

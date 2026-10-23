@@ -7,11 +7,14 @@ import { Mem } from "../core/memory/mem-accessor";
 import { Marshaler } from "../core/memory/marshaler";
 import { writeGuestCode } from "../core/memory/guest-code";
 import { parseIpv4, parseIpv6, formatIpv6 } from "../net/netplay-wire";
-import { isValidAddress } from "../core/memory/address-guard";
+import { isValidAddress, isValidUserAddress } from "../core/memory/address-guard";
+import { getVirtualNetworkTopology, encodeInterfaceList, INTERFACE_INFO_SIZE } from "../net/virtual-topology";
 import { System } from "../core/system";
 import type { DeferredWrite, ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
 import { WsaSocketTable, WsaFailure, WSA, ipv4Address, ipv6Address, type WsaAddress, type WsaPacket } from "./wsa-network";
 import { IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
+import { hasIoCompletionAssociation } from "./kernel32/sync";
+import { reserveControlApc } from "./wsa-control-apc";
 
 export type WsaErrorSetter = ((code: number) => void) & { capture?: () => (code: number) => void };
 interface Counter { started: boolean; }
@@ -472,6 +475,50 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     };
     api.WSAIoctl = adapt(counter, setError, a => {
         const s = table.get(a[0]);
+        if ((a[1] >>> 0) === 0x4004747f) {
+            // Query outputs are distinct from stream I/O and never bind the socket.
+            // Native probes the complete caller capacity, then copies whole records.
+            if (!a[6]) fail(WSA.EFAULT);
+            const interfaces = encodeInterfaceList(getVirtualNetworkTopology(table.network));
+            const family = s.af, synchronous = !s.overlapped, capacity = a[5] >>> 0;
+            // Capture only host-owned output and scalar faults; a delayed completion
+            // must not probe whichever process happens to own the global Mem binding.
+            const prepared = (() => {
+                const memory = Mem.getView()!;
+                let fault = 0;
+                if (a[3] && !isValidUserAddress(memory, a[2], a[3] >>> 0, "r")) fault = WSA.EFAULT;
+                else if (family !== 2) fault = WSA.EINVAL;
+                else if (capacity && !isValidUserAddress(memory, a[4], capacity, "rw")) fault = WSA.EFAULT;
+                const count = Math.min(interfaces.length, Math.floor(capacity / INTERFACE_INFO_SIZE) * INTERFACE_INFO_SIZE);
+                const result: WsaIoResult = { bytes: capacity < interfaces.length ? 0 : interfaces.length, flags: 0,
+                    writes: patches(a[4], interfaces.subarray(0, count)),
+                    ...(capacity < interfaces.length ? { error: WSA.EFAULT, status: 0xc0000023 } : {}) };
+                return { fault, result };
+            })();
+            const query = (): WsaIoResult => { if (prepared.fault) fail(prepared.fault); return prepared.result; };
+            if (!a[7]) {
+                let result: WsaIoResult;
+                try { result = query(); }
+                catch (error) { if (!(error instanceof WsaFailure)) throw error; result = { bytes: 0, flags: 0, writes: [], error: error.code }; }
+                // An inaccessible non-NULL byte-count pointer faults only after the query copied its output.
+                publish({ value: 0, writes: result.writes }, false);
+                if (!isValidUserAddress(Mem.getView()!, a[6], 4, "rw")) fail(WSA.EFAULT);
+                return { value: result.error ? -1 : 0, error: result.error ?? 0, writes: [dword(a[6], result.bytes)] };
+            }
+            if (!isValidUserAddress(Mem.getView()!, a[7], 20, "rw") ||
+                (a[8] && !isValidUserAddress(Mem.getView()!, a[8], 1, "rx"))) fail(WSA.EFAULT);
+            const event = u32(a[7] + 16), returnedWritable = isValidUserAddress(Mem.getView()!, a[6], 4, "rw");
+            const provider = overlap(), completionApc = synchronous && a[8] ? reserveControlApc(process ?? System.getInstance().process!) : undefined;
+            let lease: ReturnType<WsaSocketTable['acquireNativeIo']>;
+            try { lease = table.acquireNativeIo(a[0]); } catch (error) { completionApc?.onDiscard?.(); throw error; }
+            return provider.issue(a[0], a[7], a[8], "control", query,
+                result => [dword(a[6], result.bytes)], true, undefined,
+                { nativeIoLease: lease, completionApc, forcePending: !synchronous || !returnedWritable,
+                    deferStatusUntilDequeue: !a[8] && !(event & 1) && !(event & ~3) && hasIoCompletionAssociation(a[0]),
+                    completionError: error => error === WSA.EFAULT ? 122 : error,
+                    suppressRoutineOnError: synchronous, completionBytes: synchronous ? () => 0 : undefined,
+                    immediateErrorHasNoCompletion: true });
+        }
         guard(a[6], 4, true);
         if ((a[1] >>> 0) === 0xc8000006) {
             if (a[3] < 16 || a[5] < 4) fail(WSA.EFAULT); guard(a[4], 4, true);

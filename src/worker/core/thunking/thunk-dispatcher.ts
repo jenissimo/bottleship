@@ -37,7 +37,7 @@ import {
     WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW, WBUF_PAYLOAD_MAX_BYTES, wbufEntryStride,
 } from './wbuf-format';
 export { WBUF_ARG_PAYLOAD, WBUF_ARG_SHADER_CONSTANT, WBUF_ARG_UP_DRAW };
-import { cpuViewsForBuffer, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
+import { cpuViews, cpuViewsForBuffer, readRetiredInsns, PROXY_BASELINE } from '../cpu/cpu-views';
 import { PF_HALT_TARGET, TRAP_MARKER_VECTOR } from '../bootloader';
 import { faultRecorder, cr2RegisterCandidates, isFaultEipConsistent, analyzeIndirectCallFault, classifyWildTransfer } from '../memory/fault-recorder';
 import { stubRegistry } from '../diagnostics/stub-registry';
@@ -291,7 +291,10 @@ interface SehDispatchContext {
     startEsp: number;
     scratchAddr: number;
     lastFaultSignature: SehFaultSignature | null;
-    kind: 'av' | 'cxx';
+    kind: 'av' | 'cxx' | 'hle-access';
+    access?: { thunkEsp: number; returnAddr: number };
+    /** The same bounded dispatch owns the UEF call and its return. */
+    awaitingUef?: boolean;
     /** For 'cxx': what the throw carried, so an exhausted x86 chain can still be
      *  re-walked in JS for a catch the native handlers could not serve. */
     cxx?: { pObj: number; pThrow: number; cleanupBytes: number; throwEsp: number; returnAddr: number };
@@ -6319,27 +6322,34 @@ export class ThunkDispatcher {
      * If a handler caught the exception (__except_handler3 longjmps to except block),
      * this OUT never fires � the trampoline is abandoned and game continues.
      */
-    private _handleSehDispatchResult(cpu: any): void {
-        // Pop the topmost dispatch context — read results from its scratchAddr
-        const ctx = this.sehDispatchStack.pop();
-        if (ctx) {
-            this._leaveSehCriticalRuntime('dispatch_result', ctx.generation);
-            Logger.log(LogCategory.SYSTEM,
-                `SEH dispatch result: popped gen=${ctx.generation}, remaining depth=${this.sehDispatchStack.length}`);
-        } else {
-            // Fallback: no context on stack (shouldn't happen, but be safe)
-            Logger.warn(LogCategory.SYSTEM, `SEH dispatch result: no context on stack (idle?)`);
-        }
+    private _snapshotSehControlContext(cpu: any, view: DataView, base: number, flags?: number): void {
+        const control = cpuViews(cpu);
+        view.setUint32(base + 0xc0, flags ?? (typeof cpu.get_eflags === 'function'
+            ? cpu.get_eflags() : control.flags[0] ?? 0x202), true);
+        const segments = control.sreg;
+        for (const [offset, index] of [[0x8c, 5], [0x90, 4], [0x94, 0], [0x98, 3], [0xbc, 1], [0xc8, 2]])
+            view.setUint32(base + offset, (segments?.[index] ?? 0) & 0xffff, true);
+    }
 
+    private _handleSehDispatchResult(cpu: any): void {
+        const ctx = this.sehDispatchStack[this.sehDispatchStack.length - 1];
+        const finishDispatch = () => {
+            if (!ctx || this.sehDispatchStack[this.sehDispatchStack.length - 1] !== ctx) return;
+            this.sehDispatchStack.pop();
+            this._leaveSehCriticalRuntime('dispatch_result', ctx.generation);
+        };
         const view = this.cachedDataView;
         const scratchAddr = ctx?.scratchAddr ?? this.sehScratchAddr;
         if (!view || scratchAddr === 0) {
+            finishDispatch();
             Logger.error(LogCategory.SYSTEM,
                 `SEH dispatch result: no scratch area or DataView`);
             return;
         }
 
-        const result = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.DISPATCH_RESULT, true);
+        const result = ctx?.awaitingUef
+            ? (view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_RESULT, true) === 0xffffffff ? 0 : 1)
+            : view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.DISPATCH_RESULT, true);
         const faultingEip = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.FAULT_EIP, true);
         const lastHandlerResult = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_RESULT, true) >>> 0;
         const lastHandlerFrame = view.getUint32(scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_FRAME, true) >>> 0;
@@ -6347,11 +6357,19 @@ export class ThunkDispatcher {
         const esp = cpu.reg32[4] >>> 0;
 
         if (result === 0) {
+            finishDispatch();
             // ContinueExecution — retry the faulting instruction.
             // Restore full register state from CONTEXT — the handler/filter may have
             // modified registers (e.g., fixing the faulting pointer). On real Windows,
             // NtContinue restores the full CONTEXT including any modifications.
             const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
+            if (view.getUint32(ctxBase, true) & 1) {
+                // NT5 i386.h SANITIZE_FLAGS: preserve user flags, force IF and bit 1.
+                const flags = (view.getUint32(ctxBase + 0xc0, true) & 0x003e0dd7) | 0x202;
+                const control = cpuViews(cpu);
+                control.flags[0] = flags;
+                control.flagsChanged[0] = 0;
+            }
             cpu.reg32[7] = view.getUint32(ctxBase + 0x9C, true); // EDI
             cpu.reg32[6] = view.getUint32(ctxBase + 0xA0, true); // ESI
             cpu.reg32[3] = view.getUint32(ctxBase + 0xA4, true); // EBX
@@ -6368,6 +6386,11 @@ export class ThunkDispatcher {
             // RtlRaiseException, one frame deeper: continuing there unwinds back out and
             // the API simply RETURNS to its caller. Reproduce that contract — unless a
             // filter rewrote the context, in which case its EIP/ESP are the answer.
+            // The API trap temporarily owns this return slot. A continued access
+            // fault retries the API, so its caller frame must be restored first.
+            if (ctx?.kind === 'hle-access' && ctx.access) {
+                view.setUint32(ctx.access.thunkEsp, ctx.access.returnAddr, true);
+            }
             const raised = ctx?.kind === 'cxx' ? ctx.cxx : undefined;
             if (raised && ctxEip === faultingEip && ctxEsp === raised.throwEsp) {
                 ctxEip = raised.returnAddr;
@@ -6407,13 +6430,14 @@ export class ThunkDispatcher {
             // JS with the defer verdict suppressed before declaring the throw unhandled.
             // emitCatchDispatch leaves ESP on the trampoline's return slot, which is
             // exactly what this stub's own RET pops.
-            if (ctx?.kind === 'cxx' && ctx.cxx && this.cachedMem8) {
+            if (!ctx?.awaitingUef && ctx?.kind === 'cxx' && ctx.cxx && this.cachedMem8) {
                 const savedEsp = cpu.reg32[4];
                 cpu.reg32[4] = ctx.cxx.throwEsp | 0;
                 const retry = dispatchCxxException(
                     this.cachedMem8, cpu, ctx.cxx.pObj, ctx.cxx.pThrow, ctx.cxx.cleanupBytes,
                     { allowDeferToX86: false });
                 if (retry && !('deferToX86' in retry)) {
+                    finishDispatch();
                     Logger.warn(LogCategory.SYSTEM,
                         `SEH dispatch: x86 chain exhausted for a C++ throw — served the catch ` +
                         `the native handlers skipped (JS walk, defer suppressed)`);
@@ -6437,7 +6461,7 @@ export class ThunkDispatcher {
             Logger.warn(LogCategory.SYSTEM,
                 `SEH dispatch: unhandled result=${result} lastDisposition=0x${lastHandlerResult.toString(16)} ` +
                 `lastFrame=0x${lastHandlerFrame.toString(16)} lastHandler=0x${lastHandlerAddr.toString(16)}`);
-            if (this.unhandledExceptionFilterAddr !== 0 && this.cachedMem8) {
+            if (ctx && !ctx.awaitingUef && this.unhandledExceptionFilterAddr !== 0 && this.cachedMem8) {
                 const epPtr = scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_POINTERS;
                 const uefAddr = this.unhandledExceptionFilterAddr;
                 Logger.warn(LogCategory.SYSTEM,
@@ -6448,7 +6472,10 @@ export class ThunkDispatcher {
                 if (curEsp >= 16) {
                     const frameEsp = (curEsp - 8) >>> 0;
                     guardStackWrite(frameEsp, 8, 'thunk:uefFrame');
-                    view.setUint32(frameEsp, PF_HALT_TARGET, true);
+                    // UEF returns to a bounded second dispatch_result crossing. Keep
+                    // the owner pinned until that result has consumed its CONTEXT.
+                    const completion = scratchAddr + SEH_SCRATCH_LAYOUT.EH3_FILTER_CTX + 0x20;
+                    view.setUint32(frameEsp, completion, true);
                     view.setUint32(frameEsp + 4, epPtr, true);
 
                     // Write stub in scratch area to set ESP and JMP to UEF
@@ -6461,6 +6488,14 @@ export class ThunkDispatcher {
                     view.setUint32(off, uefAddr, true); off += 4;
                     mem[off++] = 0xFF; mem[off++] = 0xE0; // JMP EAX
 
+                    off = completion;
+                    mem[off++] = 0xa3; // MOV [absolute LAST_HANDLER_RESULT], EAX
+                    view.setUint32(off, scratchAddr + SEH_SCRATCH_LAYOUT.LAST_HANDLER_RESULT, true); off += 4;
+                    mem[off++] = 0xb8; view.setUint32(off, 0x7fff0002, true); off += 4;
+                    mem[off++] = 0xba; view.setUint32(off, 0xb077, true); off += 4;
+                    mem[off++] = 0xef; mem[off++] = 0xc3; // OUT DX,EAX; RET
+                    ctx.awaitingUef = true;
+
                     // After dispatch stub's OUT, the RET pops [ESP]. Write stub address there.
                     if (esp + 4 <= this.memLength) {
                         guardStackWrite(esp, 4, 'thunk:uefRedirect', stubAddr);
@@ -6470,6 +6505,7 @@ export class ThunkDispatcher {
                 }
             }
 
+            finishDispatch();
             Logger.error(LogCategory.SYSTEM,
                 `SEH dispatch: all handlers exhausted (unhandled), halting. Fault EIP=0x${faultingEip.toString(16)}`);
             if (esp + 4 <= this.memLength) {
@@ -6487,7 +6523,7 @@ export class ThunkDispatcher {
      * and redirects the #PF IRET to that stub.
      *
      * UEF is stdcall: LONG WINAPI UEF(EXCEPTION_POINTERS*).
-     * If UEF returns, execution goes to PF_HALT_TARGET (halt).
+     * A returned -1 resumes the edited CONTEXT; other dispositions halt.
      * If UEF is a thunk, it will trap to JS as normal.
      *
      * Returns true if setup succeeded (IRET redirected).
@@ -6503,73 +6539,11 @@ export class ThunkDispatcher {
         view: DataView,
         exceptionCode: number = 0xC0000005,
     ): boolean {
-        const mem = this.cachedMem8;
-        if (!mem) return false;
-
-        const scratchAddr = this.sehScratchAddr;
-        if (scratchAddr === 0) return false;
-
-        const regs = cpu.reg32;
-        const preFaultEsp = (esp + 24) >>> 0;
-        const uefAddr = this.unhandledExceptionFilterAddr;
-
-        // Build EXCEPTION_RECORD in scratch area (params: AV carries 2, others 0)
-        const numParams = exceptionCode === 0xC0000005 ? 2 : 0;
-        const excRec = scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD;
-        view.setUint32(excRec + 0, exceptionCode, true);      // ExceptionCode
-        view.setUint32(excRec + 4, 0, true);                  // ExceptionFlags
-        view.setUint32(excRec + 8, 0, true);                  // ExceptionRecord
-        view.setUint32(excRec + 12, faultingEip, true);       // ExceptionAddress
-        view.setUint32(excRec + 16, numParams, true);         // NumberParameters
-        view.setUint32(excRec + 20, numParams ? (isWrite ? 1 : 0) : 0, true); // [0] = read/write
-        view.setUint32(excRec + 24, numParams ? faultAddr : 0, true);         // [1] = fault address
-
-        // Build minimal CONTEXT
-        const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
-        for (let i = 0; i < 716; i += 4) view.setUint32(ctxBase + i, 0, true);
-        view.setUint32(ctxBase + 0x00, 0x10007, true);  // ContextFlags
-        view.setUint32(ctxBase + 0x9C, regs[7], true);  // EDI
-        view.setUint32(ctxBase + 0xA0, regs[6], true);  // ESI
-        view.setUint32(ctxBase + 0xA4, regs[3], true);  // EBX
-        view.setUint32(ctxBase + 0xA8, savedEdx, true); // EDX
-        view.setUint32(ctxBase + 0xAC, regs[1], true);  // ECX
-        view.setUint32(ctxBase + 0xB0, savedEax, true); // EAX
-        view.setUint32(ctxBase + 0xB4, regs[5], true);  // EBP
-        view.setUint32(ctxBase + 0xB8, faultingEip, true); // EIP
-        view.setUint32(ctxBase + 0xC4, preFaultEsp, true); // ESP
-
-        // Build EXCEPTION_POINTERS
-        const epPtr = scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_POINTERS;
-        view.setUint32(epPtr, excRec, true);
-        view.setUint32(epPtr + 4, ctxBase, true);
-
-        // Build call frame on the game stack below the fault point
-        const frameEsp = (preFaultEsp - 0x208) >>> 0;
-        view.setUint32(frameEsp, PF_HALT_TARGET, true);  // return addr (halt if UEF returns)
-        view.setUint32(frameEsp + 4, epPtr, true);       // arg: EXCEPTION_POINTERS*
-
-        // Write x86 stub in scratch EH3_FILTER_CTX region:
-        //   MOV ESP, frameEsp    ; switch to safe stack with call frame
-        //   MOV EAX, uefAddr     ; UEF entry point
-        //   JMP EAX              ; call UEF (stdcall, pops arg on return)
-        const stubAddr = scratchAddr + SEH_SCRATCH_LAYOUT.EH3_FILTER_CTX;
-        let off = stubAddr;
-        mem[off++] = 0xBC; // MOV ESP, imm32
-        view.setUint32(off, frameEsp, true); off += 4;
-        mem[off++] = 0xB8; // MOV EAX, imm32
-        view.setUint32(off, uefAddr, true); off += 4;
-        mem[off++] = 0xFF; mem[off++] = 0xE0; // JMP EAX
-
-        // Restore saved EAX/EDX on the interrupt frame and redirect IRET to stub
-        view.setUint32(esp, savedEdx, true);
-        view.setUint32(esp + 4, savedEax, true);
-        view.setUint32(esp + 12, stubAddr, true);
-
-        Logger.warn(LogCategory.SYSTEM,
-            `SEH AV unhandled: invoking UnhandledExceptionFilter at 0x${uefAddr.toString(16)} ` +
-            `via stub at 0x${stubAddr.toString(16)}, EXCEPTION_POINTERS at 0x${epPtr.toString(16)}`);
-
-        return true;
+        if (!this.cachedMem8 || !this.sehDispatchStubAddress || !this.unhandledExceptionFilterAddr) return false;
+        // An empty hardware chain uses the same bounded result/UEF continuation as
+        // an exhausted chain; a direct UEF->HALT call cannot implement -1.
+        return this._setupSehDispatchStub(cpu, faultAddr, faultingEip, isWrite, esp,
+            savedEax, savedEdx, view, cpuViews(cpu).segmentOffsets[4] ?? 0, 0xffffffff, exceptionCode);
     }
 
     /**
@@ -7393,6 +7367,7 @@ export class ThunkDispatcher {
             view.setUint32(ctxBase + i, 0, true);
         }
         view.setUint32(ctxBase + 0, 0x10007, true);           // ContextFlags
+        this._snapshotSehControlContext(cpu, view, ctxBase, view.getUint32(esp + 20, true));
         view.setUint32(ctxBase + 0x9C, regs[7], true);        // EDI
         view.setUint32(ctxBase + 0xA0, regs[6], true);        // ESI
         view.setUint32(ctxBase + 0xA4, regs[3], true);        // EBX
@@ -7506,6 +7481,18 @@ export class ThunkDispatcher {
      * Returns ThunkResult with skipStackCheck=true to redirect execution,
      * or null if setup fails.
      */
+    public setupGuestAccessViolationDispatch(
+        cpu: any, mem: Uint8Array, thunkEsp: number,
+        badAddress: number, isWrite: boolean, cleanupBytes: number,
+    ): ThunkResult | null {
+        const stub = this.thunkGenerator.getStubById(this.lastThunkId);
+        if (!stub) return null;
+        return this.setupCxxExceptionX86Dispatch(
+            cpu, mem, thunkEsp, 0xc0000005, 0, 2, 0, cleanupBytes,
+            { address: badAddress >>> 0, write: isWrite, retryEip: stub.address >>> 0 },
+        );
+    }
+
     public setupCxxExceptionX86Dispatch(
         cpu: any,
         mem: Uint8Array,
@@ -7515,6 +7502,7 @@ export class ThunkDispatcher {
         nArgs: number,
         lpArguments: number,
         thunkCleanupBytes: number,
+        accessFault?: { address: number; write: boolean; retryEip: number },
     ): ThunkResult | null {
         if (this.sehScratchAddr === 0) {
             Logger.error(LogCategory.SYSTEM, `CxxException x86 dispatch: scratch area not initialized`);
@@ -7562,7 +7550,7 @@ export class ThunkDispatcher {
         }
 
         // --- Build EXCEPTION_RECORD for C++ exception ---
-        const eip = (cpu.instruction_pointer?.[0] ?? 0) >>> 0;
+        const eip = accessFault?.retryEip ?? ((cpu.instruction_pointer?.[0] ?? 0) >>> 0);
         const excRec = scratchAddr + SEH_SCRATCH_LAYOUT.EXCEPTION_RECORD;
         view.setUint32(excRec + 0, exceptionCode, true);    // ExceptionCode = 0xe06d7363
         view.setUint32(excRec + 4, exceptionFlags, true);   // ExceptionFlags (NONCONTINUABLE=1)
@@ -7571,7 +7559,9 @@ export class ThunkDispatcher {
         view.setUint32(excRec + 16, nArgs, true);            // NumberParameters
         // Copy ExceptionInformation from lpArguments
         for (let i = 0; i < Math.min(nArgs, 4); i++) {
-            const param = lpArguments ? view.getUint32(lpArguments + i * 4, true) : 0;
+            const param = accessFault
+                ? (i === 0 ? (accessFault.write ? 1 : 0) : accessFault.address)
+                : (lpArguments ? view.getUint32(lpArguments + i * 4, true) : 0);
             view.setUint32(excRec + 20 + i * 4, param, true);
         }
 
@@ -7581,6 +7571,7 @@ export class ThunkDispatcher {
             view.setUint32(ctxBase + i, 0, true);
         }
         view.setUint32(ctxBase + 0, 0x10007, true);           // ContextFlags
+        this._snapshotSehControlContext(cpu, view, ctxBase);
         view.setUint32(ctxBase + 0x9C, regs[7], true);        // EDI
         view.setUint32(ctxBase + 0xA0, regs[6], true);        // ESI
         view.setUint32(ctxBase + 0xA4, regs[3], true);        // EBX
@@ -7631,7 +7622,7 @@ export class ThunkDispatcher {
         }
         view.setUint32(frameListOff, 0xFFFFFFFF, true);
 
-        if (frameCount === 0) {
+        if (frameCount === 0 && !accessFault) {
             Logger.error(LogCategory.SYSTEM, `CxxException x86 dispatch: empty SEH chain`);
             return null;
         }
@@ -7654,8 +7645,9 @@ export class ThunkDispatcher {
             startEsp: dispatchEsp,
             scratchAddr,
             lastFaultSignature: null,
-            kind: 'cxx',
-            cxx: {
+            kind: accessFault ? 'hle-access' : 'cxx',
+            access: accessFault ? { thunkEsp: thunkEsp >>> 0, returnAddr: raiseReturnAddr } : undefined,
+            cxx: accessFault ? undefined : {
                 pObj: lpArguments ? view.getUint32(lpArguments + 4, true) >>> 0 : 0,
                 pThrow: lpArguments ? view.getUint32(lpArguments + 8, true) >>> 0 : 0,
                 cleanupBytes: thunkCleanupBytes,

@@ -56,13 +56,33 @@ export interface DecodedDatagram {
     payload: Uint8Array;
 }
 import type { ResolveRequest, ResolveReply } from "./resolve";
+/** Explicit inbound permission; no UDP payload is sent by this operation. */
+export interface UdpPeerLeaseRequest {
+    proto: typeof PROTO_UDP | typeof PROTO_UDP6;
+    localPort: number;
+    bindingGeneration: number;
+    node: number[];
+    remotePort: number;
+}
+export type UdpPeerLeaseReply = { leaseId: number } | { error: { code: number; message: string } };
+export function validUdpPeerLeaseRequest(value:unknown):value is UdpPeerLeaseRequest {
+    if(!value||typeof value!=="object")return false;
+    const r=value as UdpPeerLeaseRequest;
+    return (r.proto===PROTO_UDP||r.proto===PROTO_UDP6)&&validPort(r.localPort)&&validPort(r.remotePort)&&
+        validBindingGeneration(r.bindingGeneration)&&Array.isArray(r.node)&&r.node.length===6&&
+        r.node.every(n=>Number.isInteger(n)&&n>=0&&n<=255)&&isExternalNode(Uint8Array.from(r.node));
+}
 export interface ClientEvents {
     frame: (frame: Uint8Array, bindingGeneration?:number) => void;
     releasePort:(proto:number,port:number,bindingGeneration:number)=>void;
     resolve: (id: number, request: ResolveRequest) => void;
     cancelResolve: (id: number) => void;
+    leaseUdpPeer: (id: number, request: UdpPeerLeaseRequest) => void;
+    cancelUdpPeer: (id: number) => void;
+    releaseUdpPeer: (leaseId: number) => void;
 }
 export interface ServerEvents {
+    udpPeerLeased: (id: number, reply: UdpPeerLeaseReply) => void;
     resolved: (id: number, reply: ResolveReply) => void;
     ready: (info: LanReady) => void;
     frame: (frame: Uint8Array,bindingGeneration?:number) => void;

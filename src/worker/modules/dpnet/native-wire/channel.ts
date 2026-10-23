@@ -3,6 +3,7 @@ import { PROTO_UDP } from "../../../net/netplay-wire";
 import type { Address } from "../../dplayx/session";
 import { DPN } from "../constants";
 import { NativeReliableLink, type NativeReliableOptions } from "./reliable-link";
+import { NativeDirectPlayPort } from "./port";
 
 /** A single native UDP tuple, fenced by the exact local adapter binding. */
 export class NativeDirectPlayChannel implements LanEndpoint {
@@ -19,24 +20,25 @@ export class NativeDirectPlayChannel implements LanEndpoint {
     private closeDeadline = 0;
     private removeWritable?: () => void;
     private binding = 0;
+    private owner: NativeDirectPlayPort;
+    private ownsPort: boolean;
     private released = false;
     private timer?: ReturnType<typeof setInterval>;
     private removeState?: () => void;
     private removeError?: () => void;
-    constructor(readonly network: LanNetwork, readonly remote: Address, options: Omit<NativeReliableOptions, "send">, port = 0) {
+    constructor(readonly network: LanNetwork, readonly remote: Address, options: Omit<NativeReliableOptions, "send">, port = 0, sharedPort?: NativeDirectPlayPort) {
         if (!Number.isInteger(remote.port) || remote.port < 1 || remote.port > 65535 || remote.node.length !== 6 ||
             remote.node.some(n => !Number.isInteger(n) || n < 0 || n > 255) || !Number.isInteger(port) || port < 0 || port > 65535)
             throw new RangeError("Invalid native UDP endpoint");
-        let localPort = port;
-        if (port) { if (!network.bind(port, this, PROTO_UDP)) throw Error("Native UDP port unavailable"); }
-        else { for (localPort = 2302; localPort <= 2400 && !network.bind(localPort, this, PROTO_UDP); localPort++); if (localPort > 2400) throw Error("Native UDP ports exhausted"); }
-        this.localPort = localPort; this.binding = network.bindingGeneration(localPort, PROTO_UDP);
+        this.ownsPort = !sharedPort; this.owner = sharedPort ?? new NativeDirectPlayPort(network, port);
+        if (this.owner.network !== network || !this.owner.attach(remote, this)) { if (this.ownsPort) this.owner.close(); throw Error("Native peer tuple unavailable"); }
+        this.localPort = this.owner.localPort; this.binding = this.owner.binding;
         this.closed = new Promise(resolve => { this.resolveClosed = resolve; });
-        this.link = new NativeReliableLink({ ...options, send: bytes => {
+        this.link = new NativeReliableLink({ ...options, sendBudget: this.owner.sendBudget, receiveBudget: this.owner.receiveBudget, send: bytes => {
             if (!this.live) return false;
             if (!this.pending.length && this.submit(bytes)) return true;
             if (!this.live) return false;
-            if (this.pending.length >= 256 || this.pendingBytes + bytes.length > 4 * 1024 * 1024) { this.link.close(DPN.TABLEFULL); return false; }
+            if (!this.owner.reservePacket(bytes.length)) { this.link.close(DPN.TABLEFULL); return false; }
             this.pending.push(bytes.slice()); this.pendingBytes += bytes.length; this.stats.queued++; return true;
         }, onState: (state, result) => { try { options.onState?.(state, result); } finally { if (state === "closed") { if (result) this.release(result); else { this.closing = true; this.closeResult = result; this.closeDeadline = performance.now() + Math.min(3000, options.timeout ?? 25000); this.flush(); } } } } });
         this.removeState = network.onStateChange(() => { if (!this.live) this.link.close(DPN.NOCONNECTION); });
@@ -62,7 +64,7 @@ export class NativeDirectPlayChannel implements LanEndpoint {
     private flush(): void {
         if (this.flushing || this.released) return; this.flushing = true;
         try {
-            while (this.pending.length && this.live) { const bytes = this.pending[0]; if (!this.submit(bytes) || !this.live) break; this.pending.shift(); this.pendingBytes -= bytes.length; }
+            while (this.pending.length && this.live) { const bytes = this.pending[0]; if (!this.submit(bytes) || !this.live) break; this.pending.shift(); this.pendingBytes -= bytes.length; this.owner.releasePacket(bytes.length); }
         } finally { this.flushing = false; }
         if (this.closing && !this.pending.length) this.release(this.closeResult);
     }
@@ -75,7 +77,8 @@ export class NativeDirectPlayChannel implements LanEndpoint {
     private release(result: number): void {
         if (this.released) return; this.released = true;
         if (this.timer) clearInterval(this.timer); this.timer = undefined; this.removeState?.(); this.removeState = undefined; this.removeError?.(); this.removeError = undefined;
-        this.removeWritable?.(); this.removeWritable = undefined; this.pending = []; this.pendingBytes = 0;
-        this.network.unbind(this.localPort, this, PROTO_UDP); this.resolveClosed(result);
+        this.removeWritable?.(); this.removeWritable = undefined;
+        for (const bytes of this.pending) this.owner.releasePacket(bytes.length); this.pending = []; this.pendingBytes = 0;
+        this.owner.detach(this.remote, this); if (this.ownsPort) this.owner.close(result); this.resolveClosed(result);
     }
 }

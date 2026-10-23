@@ -50,7 +50,7 @@ import { frameVarianceDiagnostics } from '../frame-variance-diagnostics';
 import {
     Thread, ThreadState, THREAD_STATE_NAMES,
     WaitReason, WAIT_REASON_NAMES, WaitInfo, CpuContext, V86Cpu,
-    ThunkBoundaryKind, TimerKind, ApcKind, PendingApc,
+    ThunkBoundaryKind, TimerKind, ApcKind, PendingApc, ApcCallbackLifetime,
     CriticalRuntimeSection, TransientExecRangeKind,
     isValidTransition,
     KernelThreadObject,
@@ -736,6 +736,7 @@ export class Scheduler {
 
     reset(): void {
         for (const thread of this.threads.values()) {
+            this.discardThreadApcs(thread);
             this.resourceProvider.unregisterKernelObject(thread.handle);
         }
         this.syncObjects.reset();
@@ -2174,7 +2175,7 @@ export class Scheduler {
         thread.exitCode = safeExitCode;
         thread.waitInfo = null;
         thread.context = null;
-        thread.apcQueue.length = 0;
+        this.discardThreadApcs(thread);
         this.alertedWaitResults.delete(thread.id);
 
         this.removeFromRunQueue(threadId);
@@ -3771,6 +3772,36 @@ export class Scheduler {
     }
 
     private readonly alertedWaitResults = new Map<number, number>();
+    private readonly activeOwnedApcs = new Map<number, Set<PendingApc>>();
+
+    /** prepare is invoked only after the owning thread and address space are restored. */
+    preparePendingApc(threadId: number, apc: PendingApc, args: readonly number[]): readonly number[] | null {
+        if (!apc.lifetime) return args;
+        const thread = this.threads.get(threadId);
+        if (!thread || thread.state === ThreadState.TERMINATED) { apc.lifetime.onDiscard?.(); return null; }
+        let active = this.activeOwnedApcs.get(threadId);
+        if (!active) this.activeOwnedApcs.set(threadId, active = new Set());
+        active.add(apc);
+        try {
+            const prepared = apc.lifetime.prepare ? apc.lifetime.prepare(args) : args;
+            if (prepared === null) this.finishPendingApc(threadId, apc, false);
+            return prepared;
+        } catch (error) { this.finishPendingApc(threadId, apc, false); throw error; }
+    }
+
+    finishPendingApc(threadId: number, apc: PendingApc, returned: boolean): void {
+        const active = this.activeOwnedApcs.get(threadId);
+        if (!active?.delete(apc)) return;
+        if (!active.size) this.activeOwnedApcs.delete(threadId);
+        if (returned) apc.lifetime?.onReturn?.(); else apc.lifetime?.onDiscard?.();
+    }
+
+    private discardThreadApcs(thread: Thread): void {
+        const queued = thread.apcQueue.splice(0), active = this.activeOwnedApcs.get(thread.id);
+        this.activeOwnedApcs.delete(thread.id);
+        for (const apc of queued) apc.lifetime?.onDiscard?.();
+        for (const apc of active ?? []) apc.lifetime?.onDiscard?.();
+    }
 
     queueUserApcByHandle(threadHandle: number, routine: number, arg0: number): boolean {
         const thread = this.getThreadByHandle(this.resolveHandle(threadHandle >>> 0));
@@ -3798,11 +3829,11 @@ export class Scheduler {
     }
 
     queueWsaCompletionApc(threadId: number, routine: number, errorCode: number,
-        bytes: number, lpOverlapped: number, flags: number): boolean {
+        bytes: number, lpOverlapped: number, flags: number, lifetime?: ApcCallbackLifetime): boolean {
         const thread = this.threads.get(threadId >>> 0);
-        if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
+        if (!thread || thread.state === ThreadState.TERMINATED || !routine) { lifetime?.onDiscard?.(); return false; }
         thread.apcQueue.push({
-            routine: routine >>> 0, arg0: errorCode >>> 0, arg1: bytes >>> 0,
+            lifetime, routine: routine >>> 0, arg0: errorCode >>> 0, arg1: bytes >>> 0,
             arg2: lpOverlapped >>> 0, arg3: flags >>> 0, kind: ApcKind.WSA_COMPLETION,
         });
         this.wakeAlertableThreadForApc(thread);
@@ -3812,7 +3843,8 @@ export class Scheduler {
     /** Put an APC back at the head of the queue — for a delivery that could not start. */
     restorePendingApc(threadId: number, apc: PendingApc): void {
         const thread = this.threads.get(threadId >>> 0);
-        if (thread) thread.apcQueue.unshift(apc);
+        if (thread && thread.state !== ThreadState.TERMINATED) thread.apcQueue.unshift(apc);
+        else apc.lifetime?.onDiscard?.();
     }
 
     /** Pop the next pending APC for a thread (null when the queue is empty). */

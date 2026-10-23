@@ -1,6 +1,7 @@
 import { Logger, LogCategory } from "../logger";
 import { System } from "../system";
 import type { RegionPerms } from "./address-space";
+import { isGuestRangeCommitted } from "./guest-page-commit";
 
 export function isValidAddress(mem: Uint8Array, address: number, size?: number, perms?: RegionPerms): boolean;
 export function isValidAddress(address: number, size?: number, perms?: RegionPerms): boolean;
@@ -62,6 +63,10 @@ export function isValidUserAddress(
         ? (process?.getCurrentMemory?.().length ?? process?.addressSpace?.getMemorySize?.())
         : memOrAddress.length;
     if (memoryLength === undefined || address + size > memoryLength) return false;
+    // A reservation retains its region permissions after MEM_DECOMMIT. PTEs
+    // establish whether the guest can actually touch the proposed user buffer.
+    if (!isGuestRangeCommitted(address, size)) return false;
+    if (process?.pageTableManager?.isRangeAccessible?.(address, size, finalPerms.includes('w')) === false) return false;
 
     return numeric
         ? isValidAddress(address, size, finalPerms)

@@ -5,7 +5,7 @@ import { NetResolveError } from "./resolve";
 import {
     asBytes, decodeDatagram, isDatagramProtocol, isBroadcastNode, isLanNode, nodeKey, nodeToIpv4,
     PROTOCOL_VERSION, MAX_FRAME_SIZE, SOCKET_PATH, validBindingGeneration, validPort, isProtocol,
-    type ClientEvents, type ServerEvents,
+    type ClientEvents, type ServerEvents, type UdpPeerLeaseRequest,type UdpPeerLeaseReply,validUdpPeerLeaseRequest,
 } from "./protocol";
 
 export interface LanServerOptions {
@@ -132,6 +132,50 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             queue.frames++; queue.bytes += 64;
             socket.emit("socketError", error);
         }, lease.node);
+        const udpPending=new Map<number,{request:UdpPeerLeaseRequest;controller:AbortController}>();
+        const udpLeases=new Map<number,{requestId:number;request:UdpPeerLeaseRequest;release:()=>void}>();
+        let nextUdpLease=1,lastUdpRequest=0;
+        const udpReply=(id:number,reply:UdpPeerLeaseReply):void=>{
+            if(!socket.connected)return;
+            if(congested(socket,128)){socket.disconnect(true);return;}
+            queue.frames++;queue.bytes+=128;socket.emit("udpPeerLeased",id,reply);
+        };
+        const retireUdpLeases=(proto:number,port:number,generation:number,inclusive:boolean):void=>{
+            const matches=(r:UdpPeerLeaseRequest)=>r.proto===proto&&r.localPort===port&&
+                (inclusive?r.bindingGeneration<=generation:r.bindingGeneration<generation);
+            for(const pending of udpPending.values())if(matches(pending.request))pending.controller.abort();
+            for(const [id,lease]of udpLeases)if(matches(lease.request)){udpLeases.delete(id);lease.release();}
+        };
+        socket.on("leaseUdpPeer",(id,request)=>{
+            if(!withinLimits(64))return;
+            if(!Number.isInteger(id)||id<1||id>0xffffffff||id<=lastUdpRequest){socket.disconnect(true);return;}
+            lastUdpRequest=id;
+            if(!validUdpPeerLeaseRequest(request)){udpReply(id,{error:{code:10022,message:"Invalid UDP peer request"}});return;}
+            if(udpPending.size>=16||udpLeases.size+udpPending.size>=Math.min(128,options.gateway?.maxUdpFlows??128)){
+                udpReply(id,{error:{code:10055,message:"UDP peer lease limit reached"}});return;
+            }
+            const controller=new AbortController(),entry={request:{proto:request.proto,localPort:request.localPort,bindingGeneration:request.bindingGeneration,node:request.node.slice(),remotePort:request.remotePort},controller};
+            udpPending.set(id,entry);
+            if(isProtocol(request.proto)&&validPort(request.localPort)&&validBindingGeneration(request.bindingGeneration))
+                retireUdpLeases(request.proto,request.localPort,request.bindingGeneration,false);
+            void gateway.leaseUdpPeer(entry.request,controller.signal).then(release=>{
+                if(controller.signal.aborted||!socket.connected){release();return;}
+                if(nextUdpLease>0xffffffff){release();udpReply(id,{error:{code:10055,message:"UDP lease identity exhausted"}});return;}
+                const leaseId=nextUdpLease++;udpLeases.set(leaseId,{requestId:id,request:entry.request,release});udpReply(id,{leaseId});
+            },error=>{
+                if(!controller.signal.aborted)udpReply(id,{error:{code:typeof error?.code==="number"?error.code:10050,message:"UDP peer lease refused"}});
+            }).finally(()=>udpPending.delete(id));
+        });
+        socket.on("cancelUdpPeer",id=>{
+            if(!withinLimits(16))return;
+            udpPending.get(id)?.controller.abort();
+            // An ACK may already be queued when cancellation arrives.
+            for(const [leaseId,lease]of udpLeases)if(lease.requestId===id){udpLeases.delete(leaseId);lease.release();}
+        });
+        socket.on("releaseUdpPeer",id=>{
+            if(!withinLimits(16))return;
+            const lease=udpLeases.get(id);if(!lease)return;udpLeases.delete(id);lease.release();
+        });
         const resolving = new Map<number, { cancelled: boolean }>();
         const resolveReply = (id: number, reply: import("./resolve").ResolveReply): void => {
             if (!socket.connected) return;
@@ -165,7 +209,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
         };
         socket.on("releasePort", (proto, port, generation) => {
             if (!isProtocol(proto) || !validPort(port) || !validBindingGeneration(generation)) { socket.disconnect(true); return; }
-            if (withinLimits(16)) gateway.releasePort(proto, port, generation);
+            if (withinLimits(16)) {retireUdpLeases(proto,port,generation,true);gateway.releasePort(proto, port, generation);}
         });
         socket.on("frame", (input, generation) => {
             const frame = asBytes(input);
@@ -173,6 +217,7 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (!frame || !datagram || (generation !== undefined && !validBindingGeneration(generation))) { socket.disconnect(true); return; }
             if (!withinLimits(frame.byteLength)) return;
             datagram.bindingGeneration = generation;
+            if(generation!==undefined)retireUdpLeases(datagram.proto,datagram.srcPort,generation,false);
             if (gateway.handle(datagram)) return;
             const broadcast = isBroadcastNode(datagram.node);
             const destination = broadcast ? null : room.peers.get(nodeKey(datagram.node));
@@ -197,6 +242,8 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             else if (destination) deliver(destination);
         });
         socket.on("disconnect", () => {
+            for(const pending of udpPending.values())pending.controller.abort();
+            for(const lease of udpLeases.values())lease.release();udpLeases.clear();
             gateway.close();
             for (const entry of resolving.values()) entry.cancelled = true;
             if (lease.socket === socket) {

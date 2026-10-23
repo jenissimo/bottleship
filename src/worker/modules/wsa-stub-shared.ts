@@ -9,6 +9,7 @@ import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { Process } from "../core/process";
 import { System } from "../core/system";
 import { lanNetwork } from "../net/lan-network";
+import { virtualHostName } from "../net/virtual-topology";
 import { parseIpv6, formatIpv6 } from "../net/netplay-wire";
 import { WsaSocketTable } from "./wsa-network";
 import { createWsaActorTable } from "./wsa-actor-table";
@@ -176,10 +177,8 @@ export interface DnsStubs {
  * Local/numeric resolver namespace shared by wsock32 and ws2_32.
  * A remote DNS resolver requires a gateway and unknown names fail explicitly.
  */
-function localHostName(): string {
-    return lanNetwork.connected ? `bottleship-${Array.from(lanNetwork.node.slice(3), b => b.toString(16).padStart(2, "0")).join("")}` : LOOPBACK_HOST_NAME;
-}
-function localHostAddress(): Uint8Array { return lanNetwork.connected ? lanNetwork.ipv4 : LOOPBACK_ADDR_BYTES; }
+function localHostName(): string { return virtualHostName(lanNetwork); }
+function localHostAddress(): Uint8Array { return lanNetwork.ipv4; }
 /** Only the local namespace and numeric IPv4 are available until a resolver gateway exists. */
 function resolveLocalName(name: string): Uint8Array | null {
     if (!name || name.toLowerCase() === localHostName().toLowerCase()) return localHostAddress().slice();

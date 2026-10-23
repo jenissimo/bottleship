@@ -1,6 +1,8 @@
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
 import { LanNetwork, type LanPortRegistry, type NetTransport, type LanState, type LanSocketError, type LanPortDisconnect, type RawDeliveryTarget } from "../net/lan-network";
 import { RelayLink } from "../net/relay-link";
+import { UdpPeerLeaseRpc, udpLeaseError } from "../net/udp-peer-lease-rpc";
+import { type UdpPeerLeaseRequest, validPort, isExternalIpv4Node, isExternalIpv6Node } from "../net/netplay-wire";
 import { decodeDatagram, encodeDatagram, isBroadcastNode, MAX_FRAME_SIZE, NetResolveError,
     type ResolveRequest, type ResolveResult, PROTO_RAW4, validBindingGeneration, isDatagramProtocol, isTcpProtocol, isRawProtocol, parseIpv6, type GatewayIpv6Address, decodeTcpFrame, encodeTcpFrame, RST, SYN, SYNACK, FIN } from "../net/netplay-wire";
 
@@ -218,7 +220,9 @@ export function isNetworkNamespaceProcessLive(shared:SharedArrayBuffer,capacity:
 }
 type PendingOutbound = { kind: "frame"; frame: Uint8Array; generation: number }
     | { kind: "release"; port: number; proto: number; generation: number; last: boolean };
+interface UdpForward { request: UdpPeerLeaseRequest; cancel(): void }
 interface Client {
+    udpPeers: Map<number, UdpForward>;
     pid:number;processEpoch:number;actorAttached:boolean;
     slot: number; epoch: number; port: MessagePort; parent: number; pending: PendingOutbound[]; flushing: boolean;
     dns: Map<number, AbortController>; knownPorts: Map<string,number>; deliveryGenerations: Map<string, number>;
@@ -235,6 +239,8 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     private readonly clients = new Map<number, Client>();
     private readonly tcp = new Map<string, TrackedTcp>();
     private active: { key: string; link: RelayLink } | null = null;
+    private readonly rootUdpPeers = new Map<number, UdpForward>();
+    private nextUdpPeer = 0;
     private closed = false;
     private actor: {worker:Worker;control:MessagePort;lease:ChildNetworkNamespace;stopped:Promise<void>;terminated:boolean}|null=null;
     private actorClient:SocketActorClient|null=null;
@@ -248,7 +254,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.ports = AtomicPorts.create(network.node, capacity,pid);
         this.backplane = new Backplane(network.node);
         this.backplane.onFrame = (frame,generation) => this.deliver(frame,generation);
-        network.setPortRegistry(this.ports.registry(0, 1, (port, proto, claimed,generation,last) => { if (!claimed) { this.cancelTcpPort(0, 1, port, proto, generation); this.portLeft(port, proto,generation,last); } }));
+        network.setPortRegistry(this.ports.registry(0, 1, (port, proto, claimed,generation,last) => { if (!claimed) { this.retireUdpForwards(this.rootUdpPeers, port, proto, generation); this.cancelTcpPort(0, 1, port, proto, generation); this.portLeft(port, proto,generation,last); } }));
         const local: NetTransport = {
             connected: false, routeLocal: true,
             send: (frame,generation=0) => { this.trackTcp(0, 1, frame,generation); return this.route(frame,generation); },
@@ -256,6 +262,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 const result = await this.backplane.resolve(request.host, request.family, signal);
                 this.recordResolved(result); return result;
             },
+            leaseUdpPeer: (request, signal) => this.forwardUdpPeer(null, ++this.nextUdpPeer, request, signal),
             close() {},
         };
         network.attach(local);
@@ -319,6 +326,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         if(this.finishing)return this.finishing;
         if(Atomics.load(this.ports.meta,6)!==this.pid)return this.barrier();
         const identity=this.ports.processIdentity(0,this.pid);
+        this.retireUdpForwards(this.rootUdpPeers);
         this.actorClient?.port.close();this.actorClient=null;
         const finish=this.actorRequest("finish",identity).then(()=>{
             if(this.ports.processIdentity(0,this.pid).epoch===identity.epoch)Atomics.compareExchange(this.ports.meta,6,this.pid,0);
@@ -334,6 +342,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         return this.actorClient;
     }
     dropSocketActorClient():void{
+        this.retireUdpForwards(this.rootUdpPeers);
         const identity=this.ports.processIdentity(0,this.pid);Atomics.store(this.ports.meta,6,0);
         this.actor?.control.postMessage({type:"drop",...identity});
         this.actorClient?.port.close();this.actorClient=null;
@@ -365,7 +374,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const pid=Atomics.load(this.ports.meta,slot*META+6);
         if (!this.ports.alive(slot, epoch) || this.clients.has(slot)||(!service&&pid<1)||pid===this.pid
             ||[...this.clients.values()].some(client=>client.pid===pid)) { port.close();this.ports.drop(slot,epoch);return; }
-        const client: Client = { pid,processEpoch:Atomics.load(this.ports.meta,slot*META+7),actorAttached:false,slot, epoch, parent, port, pending: [], flushing: false, dns: new Map(), knownPorts: new Map(), deliveryGenerations: new Map(), barriers: new Map() };
+        const client: Client = { udpPeers: new Map(), pid,processEpoch:Atomics.load(this.ports.meta,slot*META+7),actorAttached:false,slot, epoch, parent, port, pending: [], flushing: false, dns: new Map(), knownPorts: new Map(), deliveryGenerations: new Map(), barriers: new Map() };
         this.clients.set(slot, client);
         if(pid>0)this.actor?.control.postMessage({type:"process",...this.ports.processIdentity(slot,pid)});
         port.onmessage = event => this.message(client, event.data);
@@ -393,6 +402,10 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     private lastGateways: number[][] = [];
     private lastGateways6: GatewayIpv6Address[] = [];
     private state(state: LanState): void {
+        if (!state.connected) {
+            this.retireUdpForwards(this.rootUdpPeers);
+            for (const client of this.clients.values()) this.retireUdpForwards(client.udpPeers);
+        }
         this.lastGateways = state.gatewayIpv4 ?? [];
         this.network.configureGatewayAddresses(this.lastGateways);
         this.lastGateways6 = state.gatewayIpv6 ?? [];
@@ -531,6 +544,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         return true;
     }
     private releaseClientPort(client: Client, item: Extract<PendingOutbound, { kind: "release" }>): void {
+        this.retireUdpForwards(client.udpPeers, item.port, item.proto, item.generation);
         this.cancelTcpPort(client.slot, client.epoch, item.port, item.proto, item.generation);
         this.portLeft(item.port, item.proto, item.generation, item.last);
     }
@@ -571,12 +585,14 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     }
     private message(client: Client, message: any): void {
         if (!this.ports.alive(client.slot, client.epoch) || this.closed) return;
+        if (message?.type === "leaseUdpPeer" || message?.type === "cancelUdpPeer" || message?.type === "releaseUdpPeer") client.port.postMessage({type: "udpPeerControlAck"});
         if(message?.type==="actorAttach"&&message.port instanceof MessagePort){
             if(client.pid<1||Atomics.load(this.ports.meta,client.slot*META+6)!==client.pid||client.actorAttached||this.actorFailure||!this.actor){message.port.close();return;}
             client.actorAttached=true;this.actor.control.postMessage({type:"client",...this.ports.processIdentity(client.slot,client.pid),port:message.port},[message.port]);
         }else if(message?.type==="actorDrop"){
             if(message.processEpoch!==client.processEpoch)return;
             const identity={pid:client.pid,slot:client.slot,epoch:client.processEpoch};
+            this.retireUdpForwards(client.udpPeers);
             if(Atomics.load(this.ports.meta,client.slot*META+7)===identity.epoch)Atomics.compareExchange(this.ports.meta,client.slot*META+6,client.pid,0);
             this.actor?.control.postMessage({type:"drop",...identity});client.actorAttached=false;
         }else if(message?.type==="actorProcessStart"){
@@ -589,6 +605,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 client.port.postMessage({type:"reply",id:message.id,error:"Process incarnation is no longer live"});return;
             }
             const identity={pid:client.pid,slot:client.slot,epoch:client.processEpoch};
+            this.retireUdpForwards(client.udpPeers);
             void this.actorRequest("finish",identity).then(()=>{
                 if(Atomics.load(this.ports.meta,client.slot*META+7)===identity.epoch)Atomics.compareExchange(this.ports.meta,client.slot*META+6,client.pid,0);
                 if(client.processEpoch===identity.epoch)client.actorAttached=false;
@@ -619,6 +636,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             client.knownPorts.set(key,message.generation??0);
             client.deliveryGenerations.set(key, message.deliveryGeneration);
         } else if (message?.type === "released") {
+            this.retireUdpForwards(client.udpPeers, message.port, message.proto, message.generation);
             const key=message.proto+":"+message.port;
             if (client.deliveryGenerations.get(key) === message.deliveryGeneration) {
                 client.deliveryGenerations.delete(key);
@@ -640,6 +658,21 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 () => client.port.postMessage({ type: "reply", id: message.id }),
                 error => client.port.postMessage({ type: "reply", id: message.id, error: String(error.message ?? error) }),
             );
+        } else if (message?.type === "leaseUdpPeer") {
+            const id = message.id;
+            void this.forwardUdpPeer(client, id, message.request).then(
+                lease => {
+                    if (!this.ports.alive(client.slot, client.epoch) || !client.udpPeers.has(id)) { lease.release(); return; }
+                    client.port.postMessage({type: "udpPeerLeased", id, reply: {leaseId: id}});
+                },
+                error => {
+                    if (this.ports.alive(client.slot, client.epoch)) client.port.postMessage({
+                        type: "udpPeerLeased", id, reply: {error: {code: typeof error.code === "number" ? error.code : 10050, message: String(error.message ?? error)}},
+                    });
+                },
+            );
+        } else if (message?.type === "cancelUdpPeer" || message?.type === "releaseUdpPeer") {
+            client.udpPeers.get(message.id)?.cancel();
         } else if (message?.type === "resolve") {
             if (client.dns.size >= 16) { client.port.postMessage({ type: "reply", id: message.id, error: "TRY_AGAIN", code: "TRY_AGAIN" }); return; }
             const controller = new AbortController();
@@ -653,6 +686,46 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 error => client.port.postMessage({ type: "reply", id: message.id, error: String(error.message ?? error), code: error.code ?? "NO_RECOVERY" }),
             ).finally(() => client.dns.delete(message.id));
         } else if (message?.type === "cancel") client.dns.get(message.id)?.abort();
+    }
+    private retireUdpForwards(entries: Map<number, UdpForward>, port?: number, proto?: number, generation?: number): void {
+        for (const entry of entries.values()) if ((port === undefined || entry.request.localPort === port) &&
+            (proto === undefined || entry.request.proto === proto) &&
+            (generation === undefined || entry.request.bindingGeneration === generation)) entry.cancel();
+    }
+    private async forwardUdpPeer(client: Client | null, id: number, request: UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{release(): void}> {
+        const slot = client?.slot ?? 0, epoch = client?.epoch ?? 1;
+        const entries = client?.udpPeers ?? this.rootUdpPeers;
+        if (!validBindingGeneration(id) || entries.has(id)) throw udpLeaseError(10022, "Invalid UDP peer request identity");
+        if (!request || (request.proto !== 1 && request.proto !== 4) || !validPort(request.localPort) ||
+            !validPort(request.remotePort) || !validBindingGeneration(request.bindingGeneration) ||
+            !Array.isArray(request.node) || request.node.length !== 6 ||
+            !request.node.every(value => Number.isInteger(value) && value >= 0 && value <= 255) ||
+            !(isExternalIpv4Node(Uint8Array.from(request.node)) || (request.proto === 4 && isExternalIpv6Node(Uint8Array.from(request.node))))) {
+            throw udpLeaseError(10022, "Invalid UDP peer tuple");
+        }
+        if (signal?.aborted) throw udpLeaseError(995, "UDP peer request cancelled");
+        if (this.closed || !this.ports.alive(slot, epoch) || !this.active?.link.connected) throw udpLeaseError(10050);
+        if (!this.ports.targets(request.proto, request.localPort).includes(slot) ||
+            this.ports.generation(request.localPort, request.proto) !== request.bindingGeneration) throw udpLeaseError(10022, "UDP binding is not owned by this process");
+        if (entries.size >= 128) throw udpLeaseError(10055);
+        const provider = this.active.link, controller = new AbortController();
+        const processEpoch = Atomics.load(this.ports.meta, slot * META + 7);
+        let lease: {release(): void} | undefined;
+        const entry: UdpForward = {request: {...request, node: [...request.node]}, cancel: () => {
+            if (entries.get(id) !== entry) return;
+            entries.delete(id);signal?.removeEventListener("abort", entry.cancel);controller.abort();lease?.release();
+        }};
+        entries.set(id, entry);signal?.addEventListener("abort", entry.cancel, {once: true});
+        try {
+            lease = await provider.leaseUdpPeer(entry.request, controller.signal);
+            if (entries.get(id) !== entry || !this.ports.alive(slot, epoch) ||
+                !this.ports.targets(request.proto, request.localPort).includes(slot) ||
+                this.ports.generation(request.localPort, request.proto) !== request.bindingGeneration || this.active?.link !== provider ||
+                Atomics.load(this.ports.meta, slot * META + 7) !== processEpoch) {
+                const stale = lease;lease = undefined;stale.release();entry.cancel();throw udpLeaseError(995, "UDP peer owner changed");
+            }
+            return {release: entry.cancel};
+        } catch (error) { entry.cancel();throw error; }
     }
     private portLeft(port: number, proto: number,generation=0,last=true): void {
         if (!last) return;
@@ -674,6 +747,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const actorIdentity=client?this.ports.processIdentity(slot,client.pid):null;
         const ports = this.ports.drop(slot, epoch);
         if (client) {
+            this.retireUdpForwards(client.udpPeers);
             if(client.pid>0){
                 this.actor?.control.postMessage({type:"drop",...actorIdentity!});
                 if(client.processEpoch!==actorIdentity!.epoch)this.actor?.control.postMessage({type:"drop",pid:client.pid,slot,epoch:client.processEpoch});
@@ -736,6 +810,20 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     readonly routeLocal = true;
     private readonly ports: AtomicPorts;
     private readonly pending = new Map<number, { kind: string; resolve: (result: any) => void; reject: (error: Error) => void; cleanup: () => void }>();
+    private udpControlsInFlight = 0;
+    private readonly udpPeers = new UdpPeerLeaseRpc({
+        connected: () => !this.closed && this.connected,
+        request: (id, request) => {
+            if (this.udpControlsInFlight >= 128) return false;
+            this.udpControlsInFlight++;
+            this.boot.port.postMessage({type: "leaseUdpPeer", id, request});return true;
+        },
+        cancel: id => { this.udpControlsInFlight++;this.boot.port.postMessage({type: "cancelUdpPeer", id}); },
+        release: id => { this.udpControlsInFlight++;this.boot.port.postMessage({type: "releaseUdpPeer", id}); },
+    });
+    leaseUdpPeer(request: UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{release(): void}> {
+        return this.udpPeers.open(request, signal);
+    }
     private nextRequest = 1;
     private closed = false;
     private actorClient:SocketActorClient|null=null;
@@ -758,11 +846,16 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
             this.ports.release(this.boot.slot, this.boot.epoch, message.frame.byteLength, true);
             if (message.rawTargets !== undefined) this.network.receiveRawFrame(message.frame, message.rawTargets);
             else this.network.receiveFrame(message.frame, true, message.bindingGeneration);
+        } else if (message?.type === "udpPeerControlAck") {
+            this.udpControlsInFlight = Math.max(0, this.udpControlsInFlight - 1);
+        } else if (message?.type === "udpPeerLeased") {
+            this.udpPeers.accept(message.id, message.reply);
         } else if (message?.type === "gateways") {
             this.network.registerGatewayAddresses(message.addresses);
             this.network.registerGatewayIpv6(message.ipv6 ?? []);
         } else if (message?.type === "state") {
             if (!message.state.connected) {
+                this.udpPeers.disconnect();
                 for (const [id, pending] of this.pending) if (pending.kind === "resolve" || !this.ports.alive(this.boot.slot, this.boot.epoch)) {
                     this.pending.delete(id); pending.cleanup(); pending.reject(new NetResolveError("NETWORK_DOWN"));
                 }
@@ -823,6 +916,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         if(this.finishing)return this.finishing;
         if(Atomics.load(this.ports.meta,this.boot.slot*META+6)!==this.boot.pid)return this.barrier();
         const epoch=this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch;
+        this.udpPeers.retire();
         this.actorClient?.port.close();this.actorClient=null;
         const finish=this.request("actorFinish",{processEpoch:epoch});
         this.finishing=finish.finally(()=>{this.finishing=null;});return this.finishing;
@@ -834,6 +928,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         return this.actorClient;
     }
     dropSocketActorClient():void{
+        this.udpPeers.retire();
         if(!this.closed){const processEpoch=this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch;
             Atomics.store(this.ports.meta,this.boot.slot*META+6,0);this.boot.port.postMessage({type:"actorDrop",processEpoch});}
         this.actorClient?.port.close();this.actorClient=null;
@@ -847,6 +942,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     }
     close(): void {
         if (this.closed) return;
+        this.udpPeers.retire();
         this.dropSocketActorClient();
         this.closed = true;
         for (const pending of this.pending.values()) { pending.cleanup(); pending.reject(new NetResolveError("NETWORK_DOWN")); }

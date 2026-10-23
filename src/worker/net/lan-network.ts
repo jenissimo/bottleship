@@ -21,6 +21,7 @@ export interface NetTransport {
     send(frame: Uint8Array<ArrayBuffer>,bindingGeneration?:number): boolean;
     releasePort?(port:number,proto:number,bindingGeneration:number):void;
     resolve?(request: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>;
+    leaseUdpPeer?(request: import("./netplay-wire").UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{ release(): void }>;
     close(): void;
 }
 export interface LanPortRegistry {
@@ -62,6 +63,8 @@ export class LanNetwork {
     private online = false;
     private generation = 0;
     private nextSocketId = 1;
+    private readonly pendingUdpLeases = new Set<{ localPort: number; proto: number; abort(): void }>();
+    private readonly activeUdpLeases = new Set<{ localPort: number; proto: number; release(): void }>();
     private nextBindingGeneration=1;
     private nextDeliveryGeneration = 1;
     private readonly deliveryBindings = Array.from({ length: 8 }, () => new Map<number, number>());
@@ -140,6 +143,44 @@ export class LanNetwork {
         return this.transport.resolve({ host, family }, signal);
     }
 
+    /** Register an exact incoming native UDP tuple without emitting a datagram. */
+    async leaseUdpPeer(localPort: number, node: Uint8Array, remotePort: number, signal?: AbortSignal): Promise<{ release(): void }> {
+        const proto = isExternalIpv6Node(node) ? 4 : 1, binding = this.bindingGeneration(localPort, proto);
+        if (!validPort(localPort) || !validPort(remotePort) || !isAddressNode(node) || !binding) throw new NetResolveError("NO_DATA");
+        if (!this.online || !this.transport) throw new NetResolveError("NETWORK_DOWN");
+        if (signal?.aborted) throw new NetResolveError("CANCELLED");
+        if (this.pendingUdpLeases.size >= 16 || this.activeUdpLeases.size + this.pendingUdpLeases.size >= 128) throw new NetResolveError("ACCESS_DENIED", "UDP peer lease capacity");
+        const transport = this.transport, epoch = this.generation, controller = new AbortController();
+        const live = () => !controller.signal.aborted && this.online && this.transport === transport && this.generation === epoch && this.bindingGeneration(localPort, proto) === binding;
+        const pending = { localPort, proto, abort: () => controller.abort() };
+        this.pendingUdpLeases.add(pending);
+        const cancel = () => controller.abort(); signal?.addEventListener("abort", cancel, { once: true });
+        let rejectAbort!: (error: NetResolveError) => void;
+        const aborted = new Promise<never>((_ok, reject) => { rejectAbort = reject; });
+        const onAbort = () => rejectAbort(new NetResolveError("CANCELLED"));
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        try {
+            const ready = (isLanNode(node) ? Promise.resolve({ release() {} }) :
+                transport.leaseUdpPeer?.({ proto, localPort, bindingGeneration: binding, node: Array.from(node), remotePort }, controller.signal) ??
+                    Promise.reject(new NetResolveError("ACCESS_DENIED", "Native UDP peer leases unavailable"))).then(underlying => {
+                if (!live()) { underlying.release(); throw new NetResolveError("CANCELLED"); }
+                let released = false;
+                const lease = { localPort, proto, release: () => {
+                    if (released) return; released = true; this.activeUdpLeases.delete(lease); try { underlying.release(); } catch { /* Lifetime cleanup remains idempotent after transport loss. */ }
+                } };
+                this.activeUdpLeases.add(lease); return lease;
+            });
+            return await Promise.race([ready, aborted]);
+        } finally {
+            this.pendingUdpLeases.delete(pending); signal?.removeEventListener("abort", cancel);
+            controller.signal.removeEventListener("abort", onAbort);
+        }
+    }
+    private retireUdpLeases(port?: number, proto?: number): void {
+        for (const pending of [...this.pendingUdpLeases]) if (port === undefined || (pending.localPort === port && pending.proto === proto)) pending.abort();
+        for (const lease of [...this.activeUdpLeases]) if (port === undefined || (lease.localPort === port && lease.proto === proto)) lease.release();
+    }
+
     attach(transport: NetTransport | null): void {
         if (this.transport === transport) return;
         const previous = this.transport;
@@ -152,6 +193,7 @@ export class LanNetwork {
     setConnected(connected: boolean, reason?: string, force = false): void {
         if (!force && this.online === connected) return;
         this.online = connected;
+        if (!connected || force) this.retireUdpLeases();
         const state: LanState = { connected, node: this.node.slice(), ipv4: this.ipv4, generation: ++this.generation, reason,
             gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()] };
         for (const listener of this.listeners) listener(state);
@@ -221,6 +263,7 @@ export class LanNetwork {
     unbind(port: number, endpoint: LanEndpoint, proto = PROTO_IPX): void {
         if (isProtocol(proto) && this.ports[proto].get(port) === endpoint) {
             const generation=this.bindingGeneration(port,proto);
+            this.retireUdpLeases(port, proto);
             this.ports[proto].delete(port);this.bindings[proto].delete(port);this.deliveryBindings[proto].delete(port);
             this.portRegistry?.release(port, proto);
             if(!this.portRegistry)this.releaseRemotePort(port,proto,generation);

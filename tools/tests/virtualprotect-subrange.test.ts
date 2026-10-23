@@ -8,7 +8,7 @@ import { MEM_HEAP_BASE, MEM_PAGETABLE_BASE, MEM_PAGETABLE_SIZE } from "../../src
 import { PageTableManager } from "../../src/worker/core/memory/page-table-manager";
 
 const PAGE = 0x1000, RW = 4, RO = 2, NONE = 1, RWX = 0x40;
-const OUT = 0x8000, QUERY = 0x8100;
+const OUT = 0x10000, QUERY = 0x10100;
 describe("VirtualProtect page subranges", () => {
     let savedProcess: unknown, savedScheduler: unknown;
     let mem: Uint8Array, view: DataView, space: AddressSpace, memory: MemoryManager;
@@ -72,7 +72,7 @@ describe("VirtualProtect page subranges", () => {
         expect(first.slice(0, 6)).toEqual([base, base, RW, PAGE, 0x1000, RW]);
         expect(second.slice(0, 6)).toEqual([base + PAGE, base, RW, PAGE, 0x1000, RO]);
         if (size > 2 * PAGE) {
-            expect(query(base + 2 * PAGE).slice(0, 6)).toEqual([base + 2 * PAGE, base, RW, size - 2 * PAGE, 0x1000, RW]);
+            expect(query(base + 2 * PAGE).slice(0, 6)).toEqual([base + 2 * PAGE, 0, 0, size - 2 * PAGE, 0x10000, NONE]);
         }
         expect(protect(base + PAGE, PAGE, RWX)).toBe(1);
         expect(view.getUint32(OUT, true)).toBe(RO);
@@ -80,13 +80,13 @@ describe("VirtualProtect page subranges", () => {
         expect(view.getUint32(OUT, true)).toBe(RWX);
     });
     test("one call cannot protect pages in two adjacent reservations", () => {
-        const base = alloc(), size = memory.getSize(base)!;
+        const base = alloc(0x10000), size = memory.getSize(base)!;
         const next = call("VirtualAlloc", [base + size, PAGE, 0x3000, RW]);
         expect(next).toBe(base + size);
         view.setUint32(OUT, 0xa5a5a5a5, true);
         expect(protect(base + size - PAGE, 2 * PAGE, RO)).toBe(0);
         expect(error).toBe(487);
-        expect(view.getUint32(OUT, true)).toBe(0xa5a5a5a5);
+        expect(view.getUint32(OUT, true)).toBe(NONE);
         expect(space.validateRange(base + size - PAGE, 2 * PAGE, "w")).toBe(true);
     });
     test("decommitted pages fail atomically without changing the committed neighbour", () => {
@@ -94,7 +94,7 @@ describe("VirtualProtect page subranges", () => {
         expect(call("VirtualFree", [base + PAGE, PAGE, 0x4000])).toBe(1);
         view.setUint32(OUT, 0xdeadbeef, true);
         expect(protect(base, 2 * PAGE, NONE)).toBe(0);
-        expect(view.getUint32(OUT, true)).toBe(0xdeadbeef);
+        expect(view.getUint32(OUT, true)).toBe(NONE);
         expect(space.validateRange(base, PAGE, "w")).toBe(true);
     });
     test("invalid size, protection and old-protection output fail without mutations", () => {
@@ -119,16 +119,16 @@ describe("VirtualProtect page subranges", () => {
         expect(space.validateRange(base, 2 * PAGE, "w")).toBe(false);
         expect(space.validateRange(base, 2 * PAGE, "r")).toBe(true);
     });
-    test("recycled VA retains its registration and can be protected on its next lifetime", () => {
+    test("recycled backing gets a fresh reservation on its next lifetime", () => {
         (globalThis as any).vaCacheEnable(true);
         const base = alloc(), size = memory.getSize(base)!;
         mem[base] = 0x77;
         const before = space.getRegion(base)!;
         expect(before.owner).toBe("VirtualAlloc");
         expect(call("VirtualFree", [base, 0, 0x8000])).toBe(1);
-        // Parked storage and its RW registration remain owned by the allocator.
-        expect(space.getRegion(base)?.allocationId).toBe(before.allocationId);
+        expect(space.findRegionsIntersecting(base, size)).toHaveLength(0);
         expect(alloc()).toBe(base);
+        expect(space.getRegion(base)?.allocationId).not.toBe(before.allocationId);
         expect(mem[base]).toBe(0);
         expect(protect(base + PAGE, PAGE, RO)).toBe(1);
         expect(space.validateRange(base + PAGE, 1, "w")).toBe(false);
@@ -177,7 +177,7 @@ describe("VirtualProtect page subranges", () => {
         expect(fresh.protect(MEM_HEAP_BASE + 2 * PAGE, PAGE, "r")).toBe(true);
         expect(fresh.validateRange(MEM_HEAP_BASE + 2 * PAGE, 1, "w")).toBe(false);
     });
-    test("a rejected AddressSpace protection does not publish old flags or change PTEs", () => {
+    test("a rejected AddressSpace protection publishes failure flags without changing PTEs", () => {
         const base = alloc();
         const original = space.protect;
         let calls = 0;
@@ -189,7 +189,7 @@ describe("VirtualProtect page subranges", () => {
         try {
             expect(protect(base, PAGE, RO)).toBe(0);
             expect(error).toBe(487);
-            expect(view.getUint32(OUT, true)).toBe(0x12345678);
+            expect(view.getUint32(OUT, true)).toBe(NONE);
             expect(calls).toBe(0);
         } finally { space.protect = original; }
     });
@@ -242,9 +242,12 @@ describe("VirtualProtect page subranges", () => {
         expect(protect(base + PAGE, PAGE, RO)).toBe(1);
         expect(pte(base)).toBe(7); expect(pte(base + PAGE)).toBe(5);
         expect(space.validateRange(base + PAGE - 4, 8, "w")).toBe(false);
+        mem[base + PAGE] = 0x77;
         expect(protect(base + PAGE, PAGE, NONE)).toBe(1);
         expect(pte(base + PAGE) & 1).toBe(0);
         expect(space.validateRange(base + PAGE, 4, "r")).toBe(false);
+        expect(call("VirtualAlloc", [base + PAGE, PAGE, 0x1000, RW])).toBe(base + PAGE);
+        expect(mem[base + PAGE]).toBe(0x77);
         expect(protect(base + PAGE, PAGE, RW)).toBe(1);
         expect(pte(base + PAGE)).toBe(7);
         expect(space.validateRange(base, 2 * PAGE, "rw")).toBe(true);
@@ -253,6 +256,15 @@ describe("VirtualProtect page subranges", () => {
         expect(call("VirtualAlloc", [base, 2 * PAGE, 0x3000, RO])).toBe(base);
         expect(pte(base)).toBe(5);
         expect(space.validateRange(base, PAGE, "w")).toBe(false);
+        expect(call("VirtualFree", [base, 0, 0x8000])).toBe(1);
+        (globalThis as any).vaCacheEnable(true);
+        const cached = alloc(3 * PAGE);
+        expect(pte(cached + 3 * PAGE) & 1).toBe(0);
+        expect(call("VirtualFree", [cached, 0, 0x8000])).toBe(1);
+        expect(pte(cached) & 1).toBe(0);
+        expect(alloc(PAGE)).toBe(cached);
+        expect(pte(cached)).toBe(7);
+        expect(pte(cached + PAGE) & 1).toBe(0);
     });
     test("reset discards all protection fragments", () => {
         const base = alloc();

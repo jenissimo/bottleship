@@ -87,6 +87,16 @@ and FIN, and stale releases, frames, replies and errors cannot affect a newer
 binding. An omitted generation selects the legacy, untracked contract; zero is
 not a wire generation. A tracked binding cannot revert to the legacy contract.
 
+Explicit inbound UDP permission uses `leaseUdpPeer(id, request)`, with
+`request { proto: 1|4, localPort, bindingGeneration, node, remotePort }`.
+The server replies `udpPeerLeased(id, {leaseId}|{error:{code,message}})` only after
+that exact configured native peer is ready. Registration emits no dummy datagram.
+`cancelUdpPeer(id)` cancels pending readiness or its already queued ACK lease;
+`releaseUdpPeer(leaseId)` releases one explicit reference. Other references and
+accepted outbound flows keep their binding alive. Port release, reconnect and
+disconnect retire old leases. Requests are bounded to 16 pending and 128 total
+per participant (also constrained by configured flow limits).
+
 Binary `frame` bytes contain:
 
 | Offset | Bytes | Meaning |
@@ -165,9 +175,14 @@ alias. Each port retains at most `maxUdpFlows` peer identities; additional peers
 use another port. Scoped helper flows still use separate connected sockets. The configured UDP idle timeout expires idle flows; the last expired
 flow or binding release closes its native port. A shared source port is a
 prerequisite for peer traffic, while native DirectPlay Host and full mesh remain
-unfinished. The Node shared UDP backend does not yet expose an error queue with
-the original ICMP destination; asynchronous native UDP error parity remains
-unfinished, especially on POSIX.
+unfinished. The default Node shared UDP backend does not expose an original-destination ICMP
+error queue. An opt-in separate ordinary UDP backend supplies measured
+port-unreachable events for the exact peer without closing the shared binding:
+run `bun run build:native:udp` and set `gateway.nativeUdpHelperPath` to its absolute
+executable path. It uses Windows SIO_UDP_CONNRESET or Linux ERRQUEUE, bounded TX/RX
+credits and a reserved ABORT path. Scope-bearing, multicast and mapped endpoints
+retain their existing backend. See [native/README.md](native/README.md) for the
+protocol and capability limits; full asynchronous UDP error parity remains unfinished.
 
 SO_KEEPALIVE and TCP_NODELAY use the actual native TCP socket in both Node and
 helper backends. Both default to false. Initial SYN flags preserve options set

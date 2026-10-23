@@ -7,6 +7,8 @@ export interface NativeReliableOptions {
     onState?(state: NativeReliableState, result: number): void;
     now?(): number; version?: number; sessionId?: number; retryInterval?: number; retries?: number; timeout?: number;
     fragmentSize?: number; maxMessage?: number; maxBuffered?: number;
+    sendBudget?: { reserve(bytes: number): boolean; release(bytes: number): void };
+    receiveBudget?: { reserve(bytes: number, fragments?: number): boolean; release(bytes: number, fragments?: number): void };
 }
 export type NativeReliableState = "idle" | "listening" | "connecting" | "connected" | "closed";
 interface SendJob { data: Uint8Array; offset: number; first: boolean; flags: number; control: number; outstanding: number; assigned: boolean; done: boolean; completion: Promise<number>; finish(result: number): void; }
@@ -61,7 +63,7 @@ export class NativeReliableLink {
             !Number.isInteger(this.retryInterval) || this.retryInterval < 1 || !Number.isInteger(this.retries) || this.retries < 0 || this.retries > 255 ||
             !Number.isInteger(this.timeout) || this.timeout < 1 || !Number.isInteger(this.fragmentSize) || this.fragmentSize < 64 || this.fragmentSize > 65487)
             throw new RangeError("Invalid DNET link limits");
-        this.receiver = new NativeReceiveWindow(0, options.maxMessage ?? 1024 * 1024, this.maxBuffered);
+        this.receiver = new NativeReceiveWindow(0, options.maxMessage ?? 1024 * 1024, this.maxBuffered, 65536, options.receiveBudget);
         this.ready = new Promise(resolve => { this.resolveReady = resolve; });
     }
     get pendingBytes(): number { return this.bytes; }
@@ -183,11 +185,14 @@ export class NativeReliableLink {
         if (userFlags & ~(DN.USER1 | DN.USER2)) return Promise.resolve(DPN.INVALIDFLAGS);
         if (data.length > this.receiver.maxMessage) return Promise.resolve(DPN.DATATOOLARGE);
         if ((!control && this.jobs.length >= 256) || this.bytes + data.length > this.maxBuffered) return Promise.resolve(DPN.TABLEFULL);
+        if (this.options.sendBudget && !this.options.sendBudget.reserve(data.length)) return Promise.resolve(DPN.TABLEFULL);
         let resolve!: (result: number) => void;
+        const reservedBytes = data.length;
         const done = new Promise<number>(finish => { resolve = finish; });
         const job: SendJob = { data: data.slice(), offset: 0, first: true, flags: userFlags | (reliable ? DN.RELIABLE : 0) | (sequential ? DN.SEQUENTIAL : 0),
             control, outstanding: 0, assigned: false, done: false, completion: done, finish: result => {
-                if (job.done) return; job.done = true; this.bytes -= job.data.length; this.jobs = this.jobs.filter(j => j !== job); resolve(result);
+                if (job.done) return; job.done = true; this.bytes -= job.data.length; this.jobs = this.jobs.filter(j => j !== job);
+                this.options.sendBudget?.release(reservedBytes); resolve(result);
             } };
         this.jobs.push(job); this.waiting.push(job); this.bytes += data.length; this.pump(); return done;
     }

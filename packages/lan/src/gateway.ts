@@ -8,8 +8,11 @@ import { NetResolveError, type ResolveRequest, type ResolveResult } from "./reso
 import { NativeHelperSocket } from "./native-helper";
 import { NativeDestinationPolicy } from "./native-policy";
 import { NativeUdpSocket } from "./native-udp";
-import { NativeUdpPortPool } from "./native-udp-port";
+import { NativeUdpPortPool,NativeUdpChannel } from "./native-udp-port";
 import { RawEchoGateway } from "./raw-gateway";
+import {NativeBoundUdpPort} from "./native-bound-udp-port";
+import {supportsBoundUdpHost,udpFailure} from "./udp-bound-protocol";
+import type {UdpPeerLeaseRequest} from "./protocol";
 
 export interface GatewayRoute {
     host: string;
@@ -32,6 +35,8 @@ export interface GatewayOptions {
     udpIdleTimeoutMs?: number;
     /** Explicit path to the optional native TCP helper, enabling MSG_OOB. */
     nativeHelperPath?: string;
+    /** Opt-in separate ordinary UDP backend with original-tuple ICMP events. */
+    nativeUdpHelperPath?: string;
 }
 interface ResolvedRoute { config: GatewayRoute; addresses: string[]; nativeAddresses: string[] }
 const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, "");
@@ -77,9 +82,10 @@ export class GatewayRoutes {
         const family=isIP(ip),addresses=record?.nativeAddresses??[];
         const host=!route.address&&!route.host.includes("%")?ip:(addresses.find(address=>isIP(address)===family)??addresses[0]);
         if(!host)throw Object.assign(new Error("Native destination has no resolved address"),{code:11001});
-        let canonical=host;
+        let canonical=host==="0.0.0.0"?"127.0.0.1":host;
         if(isIP(host)===6){
             const bytes=parseIpv6(host)!;
+            if(bytes.every(byte=>byte===0))bytes[15]=1;
             if(bytes.subarray(0,10).every(n=>n===0)&&bytes[10]===255&&bytes[11]===255)canonical=bytes.subarray(12).join(".");
             else{
                 const zone=host.split("%")[1];
@@ -108,6 +114,7 @@ export class GatewayRoutes {
             if (value !== undefined && (!Number.isInteger(value) || value < 1 || value > maximum)) throw new RangeError("Invalid gateway limit: " + name);
         }
         if (options.nativeHelperPath !== undefined && (typeof options.nativeHelperPath !== "string" || !options.nativeHelperPath || options.nativeHelperPath.length > 4096)) throw new TypeError("Invalid native helper path");
+        if(options.nativeUdpHelperPath!==undefined&&(typeof options.nativeUdpHelperPath!=="string"||!options.nativeUdpHelperPath||options.nativeUdpHelperPath.length>4096))throw new TypeError("Invalid bound UDP helper path");
         for (const route of options.routes) validateRoute(route);
         this.routes = options.routes.map(config => ({ config: structuredClone(config), addresses: [], nativeAddresses: [] }));
     }
@@ -182,6 +189,7 @@ interface GatewayUdpSocket {
 interface UdpFlow {
     socket: GatewayUdpSocket; connected: boolean; pending: Uint8Array[]; bytes: number; packets: number; seen: number;
     node: Uint8Array; localPort: number; remotePort: number; proto: number; bindingGeneration?: number; closed: boolean; release:()=>void;
+    ready:Promise<void>;resolveReady:()=>void;rejectReady:(error:Error)=>void;pins:number;outbound:boolean;
 }
 interface NativeTcpSocket {
     readonly readableLength: number;
@@ -205,6 +213,7 @@ interface TcpFlow {
 export class NativeGateway {
     private readonly udp = new Map<string, UdpFlow>();
     private readonly udpPorts: NativeUdpPortPool;
+    private readonly boundUdpPorts?:NativeUdpPortPool;
     private readonly tcp = new Map<string, TcpFlow>();
     private readonly raw: RawEchoGateway;
     // One bounded port/protocol address space per authenticated participant. A
@@ -219,13 +228,15 @@ export class NativeGateway {
         private readonly reportError: (error: { node: number[]; localPort: number; remotePort: number; proto: number; code: number; bindingGeneration?: number }) => void = () => {},
         guestNode: Uint8Array = Uint8Array.of(2, 0, 0, 0, 0, 1)) {
         this.udpPorts = new NativeUdpPortPool(undefined, routes.options.maxUdpFlows ?? 128);
+        if(routes.options.nativeUdpHelperPath){const path=routes.options.nativeUdpHelperPath;
+            this.boundUdpPorts=new NativeUdpPortPool(undefined,routes.options.maxUdpFlows??128,(family,empty,limit)=>new NativeBoundUdpPort(path,family,empty,limit));}
         this.raw = new RawEchoGateway(routes, emit, reportError, guestNode, this.nativeOwner);
     }
     private startSweep(): void {
         if (this.sweep) return;
         this.sweep = setInterval(() => {
             const deadline = Date.now() - (this.routes.options.udpIdleTimeoutMs ?? 60_000);
-            for (const [key, flow] of this.udp) if (flow.seen < deadline) this.closeUdp(key, flow);
+            for (const [key, flow] of this.udp) if (!flow.pins && flow.seen < deadline) this.closeUdp(key, flow);
         }, 1000);
         this.sweep.unref();
     }
@@ -280,83 +291,112 @@ export class NativeGateway {
     close(): void {
         if (this.closed) return;
         this.closed = true; clearInterval(this.sweep); this.raw.close(); this.bindings.clear();
+        this.boundUdpPorts?.close();
         for (const [key, flow] of this.udp) this.closeUdp(key, flow);
         for (const [key, flow] of this.tcp) this.closeTcp(key, flow);
     }
     private closeUdp(key: string, flow: UdpFlow): void {
         if (flow.closed) return;
-        flow.closed = true; flow.release(); flow.pending.length = 0; flow.bytes = 0; this.udp.delete(key);
+        flow.closed = true; flow.rejectReady(udpFailure(10057,"UDP flow closed","control"));flow.release(); flow.pending.length = 0; flow.bytes = 0; this.udp.delete(key);
         if (!this.udp.size) { clearInterval(this.sweep); this.sweep = undefined; }
         try { flow.socket.close(); } catch (error) {
             if ((error as { code?: string }).code !== "ERR_SOCKET_DGRAM_NOT_RUNNING") throw error;
         }
     }
-    private sendUdp(datagram: DecodedDatagram): void {
-        const ip = this.routes.addressForNode(datagram.node) ?? "";
-        const route = this.routes.find(ip, datagram.dstPort, "udp");
-        if (!route) {
-            this.reportError({ node: Array.from(datagram.node), localPort: datagram.srcPort, remotePort: datagram.dstPort, proto: datagram.proto, bindingGeneration: datagram.bindingGeneration, code: 10013 });
-            return;
-        }
-        const key = datagram.proto + ":" + datagram.srcPort + ":" + nodeKey(datagram.node) + ":" + datagram.dstPort + ":" + (datagram.bindingGeneration ?? "legacy");
-        let flow = this.udp.get(key);
-        if (!flow) {
-            if (this.udp.size >= (this.routes.options.maxUdpFlows ?? 128)) return;
-            let lease:{host:string;release:()=>void};
-            try {lease=this.routes.acquireNative(route,ip,this.nativeOwner);}
-            catch(error){this.reportError({node:[...datagram.node],localPort:datagram.srcPort,remotePort:datagram.dstPort,proto:datagram.proto,bindingGeneration:datagram.bindingGeneration,code:socketError(error)});return;}
-            const nativeHost=lease.host;
-            const family = isIP(nativeHost) === 6 || (!isIP(nativeHost) && isIP(ip) === 6) ? 6 : 4;
-            if (nativeHost.includes("%") && !this.routes.options.nativeHelperPath) {
-                lease.release();
-                this.reportError({ node: Array.from(datagram.node), localPort: datagram.srcPort, remotePort: datagram.dstPort, proto: datagram.proto, bindingGeneration: datagram.bindingGeneration, code: 10045 });
-                return;
-            }
-            const socket: GatewayUdpSocket = nativeHost.includes("%")
-                ? new NativeUdpSocket(this.routes.options.nativeHelperPath!, family)
-                : this.udpPorts.open(datagram.proto+":"+datagram.srcPort+":"+(datagram.bindingGeneration??"legacy"),family,nativeHost,datagram.dstPort,nodeKey(datagram.node));
-            flow = { socket, connected: false, pending: [], bytes: 0, packets: 0, seen: Date.now(),
-                node: datagram.node.slice(), localPort: datagram.srcPort, remotePort: datagram.dstPort, proto: datagram.proto, bindingGeneration: datagram.bindingGeneration, closed: false, release:lease.release };
-            const current = flow;
-            this.udp.set(key, flow); this.startSweep();
-            socket.on("error", error => {
-                if (current.closed) return;
-                this.reportError({ node: Array.from(current.node), localPort: current.localPort, remotePort: current.remotePort,
-                    proto: current.proto, bindingGeneration: current.bindingGeneration, code: socketError(error) === 10061 ? 10054 : socketError(error) });
-                this.closeUdp(key, current);
-            });
-            socket.on("message", bytes => {
-                if (!current.closed && bytes.length <= maxPayload(current.proto)) {
-                    current.seen = Date.now();
-                    this.emit(encodeDatagram(current.proto, current.node, current.localPort, current.remotePort, bytes), false, current.bindingGeneration);
-                }
-            });
-            socket.connect(datagram.dstPort, nativeHost, error => {
-                if (current.closed) return;
-                if (error) {
-                    this.reportError({ node: Array.from(current.node), localPort: current.localPort, remotePort: current.remotePort, proto: current.proto, bindingGeneration: current.bindingGeneration, code: socketError(error) });
-                    this.closeUdp(key, current); return;
-                }
-                current.connected = true;
-                for (const payload of current.pending.splice(0)) this.writeUdp(key, current, payload);
-            });
-        }
-        if (flow.bytes + datagram.payload.length > TCP_WINDOW || flow.packets >= 128) return;
-        flow.seen = Date.now(); flow.bytes += datagram.payload.length; flow.packets++;
-        if (flow.connected) this.writeUdp(key, flow, datagram.payload.slice());
-        else flow.pending.push(datagram.payload.slice());
+    private udpError(flow:UdpFlow,error:unknown):void {
+        this.reportError({node:[...flow.node],localPort:flow.localPort,remotePort:flow.remotePort,
+            proto:flow.proto,bindingGeneration:flow.bindingGeneration,
+            code:socketError(error)===10061?10054:socketError(error)});
     }
-    private writeUdp(key: string, flow: UdpFlow, payload: Uint8Array): void {
-        if (flow.closed) return;
-        const complete = (error?: Error | null) => {
-            if (flow.closed) return;
-            flow.bytes -= payload.length; flow.packets--;
-            if (error) {
-                this.reportError({ node: Array.from(flow.node), localPort: flow.localPort, remotePort: flow.remotePort, proto: flow.proto, bindingGeneration: flow.bindingGeneration, code: socketError(error) === 10061 ? 10054 : socketError(error) });
-                this.closeUdp(key, flow);
+    private ensureUdp(datagram:DecodedDatagram):{key:string;flow:UdpFlow} {
+        const ip=this.routes.addressForNode(datagram.node)??"",route=this.routes.find(ip,datagram.dstPort,"udp");
+        if(!route)throw udpFailure(10013,"UDP destination is not a configured route","control");
+        const key=datagram.proto+":"+datagram.srcPort+":"+nodeKey(datagram.node)+":"+datagram.dstPort+":"+(datagram.bindingGeneration??"legacy");
+        let flow=this.udp.get(key);
+        if(flow)return {key,flow};
+        if(this.udp.size>=(this.routes.options.maxUdpFlows??128))throw udpFailure(10055,"UDP flow limit reached","control");
+        const lease=this.routes.acquireNative(route,ip,this.nativeOwner),nativeHost=lease.host;
+        const family=isIP(nativeHost)===6?6:4;
+        let socket:GatewayUdpSocket,release=lease.release;
+        try{
+            if(nativeHost.includes("%")){
+                if(!this.routes.options.nativeHelperPath)throw udpFailure(10045,"Scoped UDP requires the existing scoped helper","control");
+                socket=new NativeUdpSocket(this.routes.options.nativeHelperPath,family);
+            }else{
+                const bound=!!this.boundUdpPorts&&supportsBoundUdpHost(nativeHost);
+                socket=(bound?this.boundUdpPorts!:this.udpPorts).open(datagram.proto+":"+datagram.srcPort+":"+(datagram.bindingGeneration??"legacy"),
+                    family,nativeHost,datagram.dstPort,nodeKey(datagram.node),bound?lease.release:undefined);
+                // A native tuple tombstone keeps the policy lease until that OS
+                // socket actually closes, including detached aliases.
+                if(bound)release=()=>{};
+            }
+        }catch(error){lease.release();throw error;}
+        let resolveReady!:()=>void,rejectReady!:(error:Error)=>void;
+        const ready=new Promise<void>((ok,no)=>{resolveReady=ok;rejectReady=no;});void ready.catch(()=>{});
+        flow={socket,connected:false,pending:[],bytes:0,packets:0,seen:Date.now(),node:datagram.node.slice(),
+            localPort:datagram.srcPort,remotePort:datagram.dstPort,proto:datagram.proto,bindingGeneration:datagram.bindingGeneration,
+            closed:false,release,ready,resolveReady,rejectReady,pins:0,outbound:false};
+        const current=flow;this.udp.set(key,flow);this.startSweep();
+        socket.on("error",error=>{if(!current.closed){this.udpError(current,error);current.rejectReady(error);this.closeUdp(key,current);}});
+        if(socket instanceof NativeUdpChannel)socket.on("peerError",error=>{if(!current.closed)this.udpError(current,error);});
+        socket.on("message",bytes=>{
+            if(!current.closed&&bytes.length<=maxPayload(current.proto)){
+                current.seen=Date.now();this.emit(encodeDatagram(current.proto,current.node,current.localPort,current.remotePort,bytes),false,current.bindingGeneration);
+            }
+        });
+        socket.connect(datagram.dstPort,nativeHost,error=>{
+            if(current.closed)return;
+            if(error){this.udpError(current,error);current.rejectReady(error);this.closeUdp(key,current);return;}
+            current.connected=true;current.resolveReady();
+            for(const payload of current.pending.splice(0))this.writeUdp(key,current,payload);
+        });
+        return {key,flow};
+    }
+    /** Installs one exact configured inbound peer without emitting a datagram. */
+    async leaseUdpPeer(request:UdpPeerLeaseRequest,signal?:AbortSignal):Promise<()=>void> {
+        if(this.closed||signal?.aborted)throw udpFailure(10004,"UDP peer lease cancelled","control");
+        if(!request||![PROTO_UDP,PROTO_UDP6].includes(request.proto)||!validPort(request.localPort)||
+            !validPort(request.remotePort)||!validBindingGeneration(request.bindingGeneration)||
+            !Array.isArray(request.node)||request.node.length!==6||!request.node.every(n=>Number.isInteger(n)&&n>=0&&n<=255))
+            throw udpFailure(10022,"Invalid UDP peer lease","control");
+        const datagram:DecodedDatagram={proto:request.proto,srcPort:request.localPort,dstPort:request.remotePort,
+            node:Uint8Array.from(request.node),payload:new Uint8Array(),bindingGeneration:request.bindingGeneration};
+        if(!isExternalNode(datagram.node)||!this.acceptBinding(datagram))throw udpFailure(10013,"UDP binding is not live","control");
+        const {key,flow}=this.ensureUdp(datagram);flow.pins++;
+        let released=false;
+        const release=()=>{if(released)return;released=true;signal?.removeEventListener("abort",release);
+            flow.pins--;if(!flow.closed&&!flow.pins&&!flow.outbound)this.closeUdp(key,flow);};
+        signal?.addEventListener("abort",release,{once:true});
+        try{
+            await flow.ready;
+            if(released||flow.closed||this.closed||signal?.aborted)throw udpFailure(10004,"UDP peer lease retired before readiness","control");
+            return release;
+        }catch(error){release();throw error;}
+    }
+    private sendUdp(datagram:DecodedDatagram):void {
+        let entry:{key:string;flow:UdpFlow};
+        try{entry=this.ensureUdp(datagram);}catch(error){
+            this.reportError({node:[...datagram.node],localPort:datagram.srcPort,remotePort:datagram.dstPort,
+                proto:datagram.proto,bindingGeneration:datagram.bindingGeneration,code:socketError(error)});return;
+        }
+        const {key,flow}=entry;
+        if(flow.bytes+datagram.payload.length>TCP_WINDOW||flow.packets>=128)return;
+        flow.outbound=true;flow.seen=Date.now();flow.bytes+=datagram.payload.length;flow.packets++;
+        if(flow.connected)this.writeUdp(key,flow,datagram.payload.slice());else flow.pending.push(datagram.payload.slice());
+    }
+    private writeUdp(key:string,flow:UdpFlow,payload:Uint8Array):void {
+        if(flow.closed)return;
+        const complete=(error?:Error|null)=>{
+            if(flow.closed)return;
+            flow.bytes-=payload.length;flow.packets--;
+            if(error){
+                this.udpError(flow,error);
+                // Native peer and local SEND refusals do not destroy a healthy
+                // bound socket. Unknown/fatal legacy errors retain old cleanup.
+                if(!["peer","send"].includes((error as {kind?:string}).kind??""))this.closeUdp(key,flow);
             }
         };
-        try { flow.socket.send(payload, complete); } catch (error) { complete(error as Error); }
+        try{flow.socket.send(payload,complete);}catch(error){complete(error as Error);}
     }
     private tcpKey(datagram: DecodedDatagram, clientId: number): string {
         return datagram.proto + ":" + datagram.srcPort + ":" + nodeKey(datagram.node) + ":" + datagram.dstPort + ":" + clientId + ":" + (datagram.bindingGeneration ?? "legacy");

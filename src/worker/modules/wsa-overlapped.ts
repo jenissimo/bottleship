@@ -4,12 +4,13 @@
  */
 import { Mem } from "../core/memory/mem-accessor";
 import type { Process } from "../core/process";
+import type { ApcCallbackLifetime } from "../core/scheduler/types";
 import { System } from "../core/system";
 import type { DeferredWrite } from "../core/thunking/thunk-dispatcher";
 import { captureFileIoCompletion, captureSocketIoCompletion, type IoCompletionTarget } from "./kernel32/sync";
 import { WsaSocketTable, WsaFailure, WSA, type WsaNativeIoLease } from "./wsa-network";
 
-export interface WsaIoResult { bytes: number; flags: number; writes: DeferredWrite[]; error?: number; }
+export interface WsaIoResult { bytes: number; flags: number; writes: DeferredWrite[]; error?: number; status?: number; }
 export interface WsaIoAnswer { value: number; writes?: DeferredWrite[]; error?: number; }
 /** Win32 file APIs share request ordering/cancellation but use kernel I/O publication rules. */
 export interface WsaIoPolicy {
@@ -25,11 +26,14 @@ export interface WsaIoPolicy {
     initializePending?: boolean;
     immediateReturnError?: (result: WsaIoResult) => number | undefined;
     completionBytes?: (result: WsaIoResult) => number;
+    /** Synchronous control requests return provider errors without queueing an APC. */
+    suppressRoutineOnError?: boolean;
+    completionApc?: ApcCallbackLifetime;
     immediateErrorHasNoCompletion?: boolean;
 }
 interface Request {
     socket: number; overlapped: number; routine: number; event: number;
-    direction: "read" | "urgent" | "write"; thread: number; generation: number; nativeHandleIo: boolean;
+    direction: "read" | "urgent" | "write" | "control"; thread: number; generation: number; nativeHandleIo: boolean;
     attempt?: () => WsaIoResult; scheduler: ReturnType<typeof System.getInstance>["scheduler"];
     done: boolean; publishing: boolean; cancel?: () => void; result?: WsaIoResult;
     policy?: WsaIoPolicy; deferredStatus?: boolean; processGeneration: number;
@@ -63,10 +67,10 @@ export function wsaStatusError(status: number): number {
         case 0xc0000236: return WSA.ECONNREFUSED;
         case 0xc000023c: return WSA.ENETDOWN;
         case 0xc00000b5: return WSA.ETIMEDOUT;
-        case 0xc0000005: return WSA.EFAULT;
+        case 0xc0000005: case 0xc0000023: return WSA.EFAULT;
         case 0xc0000140: return WSA.ENOTCONN;
         case 0xc00000b0: return WSA.ESHUTDOWN;
-        default: return ((status & 0xffff0000) >>> 0) === 0xc0010000 ? status & 0xffff : WSA.EINVAL;
+        default: return ((status & 0xffff0000) >>> 0) === 0xc0010000 ? status & 0xffff : 317; // ERROR_MR_MID_NOT_FOUND
     }
 }
 const word = (address: number, value: number): DeferredWrite => ({ address, value: value >>> 0, size: 4 });
@@ -111,7 +115,7 @@ export class WsaOverlapped {
                 current.attempt = undefined; current.cancel = undefined; current.policy = undefined; current.operationTable = undefined;
                 current.nativeIoLease = undefined; current.completionTarget = undefined; this.requests.delete(overlapped);
             }
-            owned?.release(); throw error;
+            policy?.completionApc?.onDiscard?.(); owned?.release(); throw error;
         }
     }
     private issueOwned(socket: number, overlapped: number, routine: number, direction: Request["direction"],
@@ -157,7 +161,7 @@ export class WsaOverlapped {
                 if (error.code !== WSA.EWOULDBLOCK) {
                     if(policy?.immediateErrorHasNoCompletion){
                         this.requests.delete(overlapped);request.done=true;request.attempt=undefined;request.cancel=undefined;
-                        this.releaseNativeIo(request); request.policy = undefined; request.completionTarget = undefined;
+                        this.releaseNativeIo(request); request.policy?.completionApc?.onDiscard?.(); request.policy = undefined; request.completionTarget = undefined;
                         publishWsaWrites([word(overlapped+4,originalHigh)]);
                         return {value:-1,error:error.code};
                     }
@@ -201,7 +205,7 @@ export class WsaOverlapped {
         return [...result.writes, ...(request.deferredStatus ? [] : this.statusWrites(request, result))];
     }
     private statusWrites(request: Request, result: WsaIoResult): DeferredWrite[] {
-        return [word(request.overlapped + 4, result.bytes), word(request.overlapped, wsaErrorStatus(result.error ?? 0))];
+        return [word(request.overlapped + 4, result.bytes), word(request.overlapped, result.status ?? wsaErrorStatus(result.error ?? 0))];
     }
     private releaseNativeIo(request: Request): void {
         const lease = request.nativeIoLease;
@@ -212,7 +216,7 @@ export class WsaOverlapped {
     private complete(request: Request, result: WsaIoResult, immediate: boolean): void {
         if (request.done || request.publishing) return;
         if (request.processGeneration !== this.process.resetGeneration) {
-            this.releaseNativeIo(request); request.attempt = undefined; request.cancel = undefined; request.policy = undefined;
+            this.releaseNativeIo(request); request.attempt = undefined; request.cancel = undefined; request.policy?.completionApc?.onDiscard?.(); request.policy = undefined;
             request.completionTarget = undefined; this.requests.delete(request.overlapped); return;
         }
         request.publishing = true;
@@ -225,13 +229,16 @@ export class WsaOverlapped {
             if (request.done || !this.isCurrent(request)) return;
             request.done = true; request.publishing = false;
             // Completed lookups retain scalar results, never host payloads or guest write batches.
-            request.result = { bytes: answer.bytes, flags: answer.flags, error: answer.error, writes: [] };
+            request.result = { bytes: answer.bytes, flags: answer.flags, error: answer.error, status: answer.status, writes: [] };
             request.attempt = undefined; request.cancel = undefined;
             const target = request.completionTarget; request.completionTarget = undefined;
             if (request.routine) {
-                if (request.policy?.completionRoutineKind === 'file') request.scheduler.queueIoCompletionApc(
+                if (answer.error && request.policy?.suppressRoutineOnError) request.policy.completionApc?.onDiscard?.();
+                else if (request.policy?.completionRoutineKind === 'file') request.scheduler.queueIoCompletionApc(
                     request.thread, request.routine, request.policy.completionError?.(answer.error ?? 0) ?? answer.error ?? 0,
                     answer.bytes, request.overlapped);
+                else if (request.policy?.completionApc) request.scheduler.queueWsaCompletionApc(request.thread, request.routine,
+                    answer.error ?? 0, request.policy?.completionBytes?.(answer) ?? answer.bytes, request.overlapped, answer.flags, request.policy.completionApc);
                 else request.scheduler.queueWsaCompletionApc(request.thread, request.routine,
                     answer.error ?? 0, request.policy?.completionBytes?.(answer) ?? answer.bytes, request.overlapped, answer.flags);
             }
@@ -280,7 +287,7 @@ export class WsaOverlapped {
                     request.done = true; request.publishing = false;
                     request.result = { bytes: 0, flags: 0, writes: [], error: 995 };
                     this.releaseNativeIo(request);
-                    request.attempt = undefined; request.cancel = undefined; request.policy = undefined; request.completionTarget = undefined;
+                    request.attempt = undefined; request.cancel = undefined; request.policy?.completionApc?.onDiscard?.(); request.policy = undefined; request.completionTarget = undefined;
                     for (const waiter of request.waiters.splice(0)) waiter(request.result);
                     this.requests.delete(request.overlapped); continue;
                 }
@@ -313,7 +320,12 @@ export class WsaOverlapped {
             return new Promise(resolve => request.waiters.push(result => resolve(answer(result))));
         }
         const status = Mem.readUint32(overlapped) ?? 0;
-        return answer({ bytes: Mem.readUint32(overlapped + 4) ?? 0, flags: 0,
-            writes: [], error: wsaStatusError(status) });
+        const bytes = Mem.readUint32(overlapped + 4) ?? 0, error = wsaStatusError(status);
+        if (status === STATUS_PENDING) return { value: 0, error };
+        // NT_SUCCESS and its DOS last-error translation are independent for
+        // externally supplied IOSBs, including informational/unknown statuses.
+        const success = (status | 0) >= 0;
+        return { value: success ? 1 : 0, error, writes: [
+            ...(bytesOut ? [word(bytesOut, bytes)] : []), ...(flagsOut && success ? [word(flagsOut, 0)] : [])] };
     }
 }

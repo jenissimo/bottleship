@@ -130,7 +130,7 @@ describe("Winsock overlapped I/O contracts", () => {
         expect(h.get(0x404)).toBe(3); expect(h.get(0x408)).toBe(0);
     });
     test("completion routines have four arguments and retain the issuing thread rather than the receiving thread", async () => {
-        const h = fixture(), calls: number[][] = [];
+        const h = fixture(), calls: unknown[][] = [];
         const apc = spyOn(h.scheduler, "queueWsaCompletionApc").mockImplementation((...args) => { calls.push(args); return true; });
         disposers.push(() => apc.mockRestore());
         const event = h.event(); h.set(0x310, event); h.descriptor(0x100, 0x1000, 8); h.set(0x400, 0);
@@ -289,7 +289,7 @@ describe("Winsock creation mode and OVERLAPPED fields", () => {
         }
     });
     test("flags0 completion APC belongs to the blocked issuer and WSASend/To waits for stream credit", async () => {
-        const h=fixture(), calls:number[][]=[];
+        const h=fixture(), calls:unknown[][]=[];
         h.table.get(h.server).overlapped=false;
         const apc=spyOn(h.scheduler,"queueWsaCompletionApc").mockImplementation((...args)=>{calls.push(args);return true;});disposers.push(()=>apc.mockRestore());
         h.descriptor(0x100,0x1000,4);h.set(0x400,0);
@@ -340,7 +340,7 @@ describe("Winsock completed I/O memory ownership", () => {
 });
 describe("Winsock receive warning and flag contracts",()=>{
     test("an immediate hard error leaves pending IOSB and old High without promising an event or APC",async()=>{
-        const h=fixture(),socket=h.table.socket(),calls:number[][]=[];
+        const h=fixture(),socket=h.table.socket(),calls:unknown[][]=[];
         const apc=spyOn(h.scheduler,"queueWsaCompletionApc").mockImplementation((...args)=>{calls.push(args);return true;});disposers.push(()=>apc.mockRestore());
         for(const write of [false,true])for(const routine of [0,0x800]){
             const event=h.event();h.scheduler.setEvent(event);h.set(0x310,event);h.set(0x304,0x55667788);h.set(0x400,0);h.set(0x404,0xabcdef01);h.descriptor(0x100,0x1000,4);

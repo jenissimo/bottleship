@@ -15,7 +15,17 @@ const system=System.getInstance(),scheduler=system.scheduler,resources=system.re
 const savedProcess=system.process,savedError=scheduler.setLastError,savedOwnerError=scheduler.setLastErrorForThread,savedTid=scheduler.getCurrentThreadId;
 const savedMem=Object.getOwnPropertyDescriptors(Mem),register=resources.registerKernelObject;
 let ram:Uint8Array,error:number,created:number[],files:number[],readonly:boolean,kernel:Kernel32;
-const observed:any[]=[];const ctx={} as never;
+const observed:any[]=[];const ctx={esp:0x18000} as never;
+// Native128 lets a valid HANDLE's bad output escape through SEH, preserving LastError.
+// Capture the API/dispatcher boundary here; real x86 dispatch and continuation have their own fixtures.
+function handleOutputFault(handle:number,output:number){
+ const process:any=system.process,previousV86=process.v86,previousDispatcher=process.dispatcher,calls:any[]=[];
+ process.v86={cpu:{}};process.dispatcher={setupGuestAccessViolationDispatch(_cpu:any,memory:Uint8Array,esp:number,badAddress:number,write:boolean,cleanup:number){
+  expect(memory).toBe(ram);calls.push({esp,badAddress,write,cleanup});return {value:0,skipStackCheck:true};
+ }};
+ try{expect(processApi.GetHandleInformation!(ctx,ram,[handle,output])).toEqual({value:0,skipStackCheck:true});return calls;}
+ finally{process.v86=previousV86;process.dispatcher=previousDispatcher;}
+}
 const value=(result:any)=>typeof result==='number'?result:result.value;
 const get=(ptr:number)=>new DataView(ram.buffer).getUint32(ptr,true),set=(ptr:number,n:number)=>new DataView(ram.buffer).setUint32(ptr,n,true);
 function duplicate(source:number,output:number,options:number,inherit=true){return value(processApi.DuplicateHandle!(ctx,ram,[0xffffffff,source,0xffffffff,output,0,+inherit,options]));}
@@ -113,11 +123,11 @@ for(const options of [1,3])test('native182 NT-profile low output CLOSE_SOURCE pr
   expect([get(0x10040),get(0x10044),get(0x10048)]).toEqual([3,42,0x123456]);
  }finally{config.osVersion=previous;}
 });
-for(const output of [1,0xffff])test('Win32 HANDLE information cannot publish into a reserved user range with a real AddressSpace output='+output,()=>{
+for(const output of [1,0xffff])test('native128 HANDLE information faults without publishing into a reserved user range output='+output,()=>{
  ram=new Uint8Array(0x20000);const space=new AddressSpace(()=>ram);Object.assign(system.process!,{addressSpace:space});
  Mem.bind(()=>ram,(pointer,size,perms)=>space.validateRange(pointer,size,perms));
  const {handle,object}=create();resources.setHandleFlags(handle,1,1);ram.fill(0xa5,output,output+4);const before=ram.slice(output,output+4);error=0x1234;
- expect(value(processApi.GetHandleInformation!(ctx,ram,[handle,output]))).toBe(0);expect(error).toBe(998);
+ expect(handleOutputFault(handle,output)).toEqual([{esp:0x18000,badAddress:output,write:true,cleanup:8}]);expect(error).toBe(0x1234);
  expect(ram.slice(output,output+4)).toEqual(before);expect(resources.getKernelObject(handle)).toBe(object);expect(resources.kernelObjectReferenceCount(object)).toBe(1);
 });
 test('NT-profile HANDLE output above the low guard remains writable with a real AddressSpace',()=>{
@@ -132,7 +142,7 @@ test('NT-profile HANDLE output above the low guard remains writable with a real 
 test('handle flags validate the HANDLE and whole writable output while cleanup retires metadata',()=>{
  const {handle}=create();set(0x10050,0xa5a5a5a5);error=0;
  expect(value(processApi.GetHandleInformation!(ctx,ram,[0xdead,0x10050]))).toBe(0);expect(error).toBe(6);expect(get(0x10050)).toBe(0xa5a5a5a5);
- expect(value(processApi.GetHandleInformation!(ctx,ram,[handle,ram.length-1]))).toBe(0);expect(error).toBe(998);
+ expect(handleOutputFault(handle,ram.length-1)).toEqual([{esp:0x18000,badAddress:ram.length,write:true,cleanup:8}]);expect(error).toBe(6);
  expect(close(handle)).toBe(1);expect(resources.getHandleAttributes(handle)).toBeUndefined();
  expect(value(processApi.SetHandleInformation!(ctx,ram,[handle,1,1]))).toBe(0);expect(error).toBe(6);
 });

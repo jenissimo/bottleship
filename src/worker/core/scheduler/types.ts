@@ -154,7 +154,14 @@ export const enum ApcKind {
     WSA_COMPLETION = 4,
 }
 
+/** Optional owner-thread storage whose lifetime ends with callback return or discard. */
+export interface ApcCallbackLifetime {
+    prepare?(args: readonly number[]): readonly number[] | null;
+    onReturn?(): void;
+    onDiscard?(): void;
+}
 export interface PendingApc {
+    lifetime?: ApcCallbackLifetime;
     routine: number;
     arg0: number;
     arg1: number;

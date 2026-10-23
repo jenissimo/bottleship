@@ -40,3 +40,15 @@ test("native RAW leases canonicalize mapped IPv4 and equivalent numeric IPv6 zon
     expect(()=>routes.acquireNative(second,"2001:db8::2",b)).toThrow();
     scoped.release();
 });
+
+test("unspecified UDP destinations and actual loopback own the same native policy lease",async()=>{
+ for(const [unspecified,loopback,advertised]of [["0.0.0.0","127.0.0.1",["203.0.113.201","203.0.113.202"]],["::","::1",["2001:db8::201","2001:db8::202"]]] as const){
+  const routes=new GatewayRoutes({routes:[{host:unspecified,address:advertised[0],ports:[7],protocols:["udp"]},{host:loopback,address:advertised[1],protocols:["raw"],ipProtocols:[1]}]});await routes.initialize();
+  const udp=routes.find(advertised[0],7,"udp")!,raw=routes.findRaw(advertised[1],1)!,a={},b={};
+  const shared=routes.acquireNative(udp,advertised[0],a);
+  expect(()=>routes.acquireNative(raw,advertised[1],b,true)).toThrow();
+  shared.release();const exclusive=routes.acquireNative(raw,advertised[1],b,true);
+  expect(()=>routes.acquireNative(udp,advertised[0],a)).toThrow();
+  exclusive.release();const reopened=routes.acquireNative(udp,advertised[0],a);reopened.release();
+ }
+});

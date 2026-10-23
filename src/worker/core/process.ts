@@ -19,7 +19,7 @@ import {
 } from './guest-cpu-identity';
 import { ModuleRegistry } from './module-registry';
 import { memoryEventBuffer, MemoryEventType } from './memory/memory-event-buffer';
-import { ensureGuestPagesCommitted } from './memory/guest-page-commit';
+import { ensureGuestPagesCommitted, notifyGuestMemoryReset } from './memory/guest-page-commit';
 import { invalidateGuestCode } from './memory/guest-code';
 import type { PageTableManager } from './memory/page-table-manager';
 import { SEH_SCRATCH_TOTAL_SIZE } from './thunking/seh-layout';
@@ -717,6 +717,7 @@ export class MemoryManager {
     }
 
     reset(): void {
+        notifyGuestMemoryReset(this);
         this.allocs.clear();
         this.freeBlocks.clear();
         this.largeFreeBlocks.clear();

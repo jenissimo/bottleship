@@ -11,11 +11,23 @@ function endpoint(host:string,port:number):string {
 }
 function unavailable():Error { return Object.assign(new Error("Native UDP channel closed"),{code:10057}); }
 
+export interface NativeUdpChannelOwner {
+    connect(channel:NativeUdpChannel):void;
+    send(channel:NativeUdpChannel,bytes:Uint8Array,callback:(error?:Error|null)=>void):void;
+    detach(channel:NativeUdpChannel):void;
+}
+export interface PooledNativeUdpPort {
+    available(host:string,port:number,identity:string):boolean;
+    attach(host:string,port:number,identity:string,release?:()=>void):NativeUdpChannel;
+    dispose?():void;
+}
+export type NativeUdpPortFactory=(family:4|6,empty:()=>void,historyLimit:number)=>PooledNativeUdpPort;
+
 /** A routed peer on one real, unconnected UDP socket. */
 export class NativeUdpChannel extends EventEmitter {
     private closed=false;
     private connectCallback:((error?:Error)=>void)|undefined;
-    constructor(private readonly owner:NativeUdpPort,readonly host:string,readonly port:number) { super(); }
+    constructor(private readonly owner:NativeUdpChannelOwner,readonly host:string,readonly port:number) { super(); }
     connect(port:number,host:string,callback:(error?:Error)=>void):void {
         if(this.closed){queueMicrotask(()=>callback(unavailable()));return;}
         if(endpoint(host,port)!==endpoint(this.host,this.port)){
@@ -31,6 +43,7 @@ export class NativeUdpChannel extends EventEmitter {
         if(this.closed)return;
         this.connectCallback=undefined;this.emit("error",error);
     }
+    peerError(error:Error):void { if(!this.closed)this.emit("peerError",error); }
     deliver(bytes:Buffer):void { if(!this.closed)this.emit("message",bytes); }
     send(bytes:Uint8Array,callback:(error?:Error|null)=>void):void {
         if(this.closed){queueMicrotask(()=>callback(unavailable()));return;}
@@ -98,28 +111,32 @@ class NativeUdpPort {
         try { this.socket.close(); }
         catch(error) { if((error as {code?:string}).code!=="ERR_SOCKET_DGRAM_NOT_RUNNING")throw error; }
     }
+    dispose():void { for(const channel of [...this.channels.values()])channel.close(); }
 }
 
 /** Participant-local binding generations own independent native port groups. */
 export class NativeUdpPortPool {
-    private readonly groups=new Map<string,Set<NativeUdpPort>>();
-    constructor(private readonly createNativeSocket:(family:4|6)=>Socket=family=>createSocket(family===4?"udp4":"udp6"),private readonly historyLimit=128) {
+    private readonly groups=new Map<string,Set<PooledNativeUdpPort>>();
+    constructor(private readonly createNativeSocket:(family:4|6)=>Socket=family=>createSocket(family===4?"udp4":"udp6"),private readonly historyLimit=128,private readonly factory?:NativeUdpPortFactory) {
         if(!Number.isSafeInteger(historyLimit)||historyLimit<1)throw new TypeError("Invalid native UDP peer history limit");
     }
-    open(binding:string,family:4|6,host:string,port:number,identity=endpoint(host,port)):NativeUdpChannel {
+    open(binding:string,family:4|6,host:string,port:number,identity=endpoint(host,port),release?:()=>void):NativeUdpChannel {
         const key=binding+":"+family;
         let ports=this.groups.get(key);
         if(!ports){ports=new Set();this.groups.set(key,ports);}
         let owner=[...ports].find(candidate=>candidate.available(host,port,identity));
         if(!owner){
             const group=ports;
-            owner=new NativeUdpPort(family,()=>{
-                group.delete(owner!);if(!group.size&&this.groups.get(key)===group)this.groups.delete(key);
-            },this.createNativeSocket(family),this.historyLimit);
+            const empty=()=>{group.delete(owner!);if(!group.size&&this.groups.get(key)===group)this.groups.delete(key);};
+            owner=this.factory?this.factory(family,empty,this.historyLimit):new NativeUdpPort(family,empty,this.createNativeSocket(family),this.historyLimit);
             group.add(owner);
         }
         // Retain bounded peer identities until the native port closes: a late
         // packet for a retired virtual alias must not enter its replacement.
-        return owner.attach(host,port,identity);
+        return owner.attach(host,port,identity,release);
+    }
+    close():void {
+        for(const group of [...this.groups.values()])for(const port of [...group])port.dispose?.();
+        this.groups.clear();
     }
 }

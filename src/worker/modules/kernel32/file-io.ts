@@ -962,7 +962,7 @@ const fileIoModule = (() => {
         let mappingFile: VfsFileHandle | null = null;
         const vfs0 = System.getInstance().fileSystem;
 
-        if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
+        if ((hFile >>> 0) !== (INVALID_HANDLE_VALUE >>> 0) && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
             const fileObj = resourceProvider.getFileHandle(hFile);
             if (!fileObj || isConsoleDeviceHandle(fileObj)) {
@@ -990,6 +990,7 @@ const fileIoModule = (() => {
         if (name) {
             namedFileMappings.set(name, handle);
         }
+        System.getInstance().scheduler.setLastError(0);
         return handle;
     };
 
@@ -1013,7 +1014,7 @@ const fileIoModule = (() => {
         let mappingFile: VfsFileHandle | null = null;
         const vfs0 = System.getInstance().fileSystem;
 
-        if (hFile !== INVALID_HANDLE_VALUE && hFile !== 0) {
+        if ((hFile >>> 0) !== (INVALID_HANDLE_VALUE >>> 0) && hFile !== 0) {
             const resourceProvider = System.getInstance().resourceProvider;
             const fileObj = resourceProvider.getFileHandle(hFile);
             if (!fileObj || isConsoleDeviceHandle(fileObj)) {
@@ -1041,6 +1042,7 @@ const fileIoModule = (() => {
         if (name) {
             namedFileMappings.set(name, handle);
         }
+        System.getInstance().scheduler.setLastError(0);
         return handle;
     };
 

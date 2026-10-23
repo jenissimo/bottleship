@@ -12,7 +12,10 @@ import { MemoryManager } from '../../core/process';
 import type { PESection } from '../../core/module-registry';
 import { type RegionPerms } from '../../core/memory/address-space';
 import { Mem } from '../../core/memory/mem-accessor';
-import { registerGuestCommitNotifier } from '../../core/memory/guest-page-commit';
+import { ensureGuestPagesCommitted, registerGuestCommitNotifier, registerGuestMemoryResetNotifier,
+    registerGuestCommittedProbe } from '../../core/memory/guest-page-commit';
+import { isValidUserAddress } from '../../core/memory/address-guard';
+import { invalidateGuestCode } from '../../core/memory/guest-code';
 import { profiler } from '../../core/profiler';
 import { GUEST_PROCESSOR_TYPE, GUEST_PROCESSOR_LEVEL, GUEST_PROCESSOR_REVISION } from '../../core/guest-cpu-identity';
 import { hypercallDataManager } from '../../core/cpu/hypercall-data';
@@ -186,6 +189,40 @@ class IntervalMap {
     clear(): void { this.map.clear(); this.sorted = null; }
     [Symbol.iterator](): IterableIterator<[number, number]> { return this.map[Symbol.iterator](); }
 
+    intersects(base: number, size: number): boolean {
+        if (size <= 0) return false;
+        if (this.find(base)) return true;
+        const spans = this.sorted!;
+        let lo = 0, hi = spans.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (spans[mid]!.base < base) lo = mid + 1; else hi = mid;
+        }
+        return lo < spans.length && spans[lo]!.base < base + size;
+    }
+
+    addRange(base: number, size: number): void {
+        if (size <= 0) return;
+        let start = base, end = base + size;
+        for (const [b, length] of this.map) {
+            if (b + length < start || b > end) continue;
+            start = Math.min(start, b); end = Math.max(end, b + length);
+            this.map.delete(b);
+        }
+        this.set(start, end - start);
+    }
+
+    removeRange(base: number, size: number): void {
+        const end = base + size, remaining: Array<[number, number]> = [];
+        for (const [b, length] of this.map) {
+            if (b >= end || b + length <= base) continue;
+            this.delete(b);
+            if (b < base) remaining.push([b, base - b]);
+            if (b + length > end) remaining.push([end, b + length - end]);
+        }
+        for (const [b, length] of remaining) this.set(b, length);
+    }
+
     /** The interval containing `addr`, or null. Entries are disjoint by construction. */
     find(addr: number): { base: number; size: number } | null {
         const a = addr >>> 0;
@@ -222,6 +259,16 @@ const virtualAllocRegions = new IntervalMap();
 // Without tracking, decommit is a no-op and recommit skips zeroing, leaving stale
 // heap metadata that causes heap corruption. VirtualQuery reports these MEM_RESERVE.
 const decommittedPages = new IntervalMap();
+// Released backing and unused allocation-granularity tails, coalesced by page range.
+const freeVirtualPages = new IntervalMap();
+let virtualMemoryOwner: object | undefined;
+function ensureVirtualMemoryOwner(): void {
+    const memory = System.getInstance().process?.memory;
+    if (memory !== virtualMemoryOwner) {
+        resetVirtualAllocationState();
+        virtualMemoryOwner = memory;
+    }
+}
 
 function isVirtualAllocBase(ptr: number): boolean {
     return virtualAllocRegions.has(ptr >>> 0);
@@ -779,30 +826,8 @@ const heapWatch = (op: string, ctx: any, mem: Uint8Array, ptrs: number[], extra 
 export const exports: Record<string, ThunkImplementation> = (() => {
     const exports: Record<string, ThunkImplementation> = {};
 
-    // Track reserved pages (address -> size in bytes)
-    const reservedPages: Map<number, number> = new Map();
-
-    // ── VirtualAlloc block recycler ──────────────────────────────────────────────
-    // A guest that allocates and releases one allocation-granularity block per frame
-    // (UE1's FMallocWindows does exactly that) makes us commit, then un-protect, the same
-    // pages forever — and BOTH ends flush the WHOLE software TLB. v86's full_clear_tlb
-    // also drops the per-page dispatch metadata and bumps the RET-cache epoch, so twice a
-    // frame the entire return-target memo dies and can never amortise. The compiled code
-    // survives, which is why this is invisible to every "is the JIT alive" check.
-    //
-    // Recycle the block instead: a released RESERVE|COMMIT / PAGE_READWRITE block whose
-    // pages are still exactly as we committed them goes on an exact-size LIFO, and the
-    // next identical request takes it back with its PTEs untouched — no commit, no
-    // protection change, no flush. Windows' own low-fragmentation front end recycles VA
-    // the same way, and a released range is never promised a fresh address.
-    //
-    // The guest-visible contract that must NOT move: the block still reads as all zeroes
-    // (we fill it on handout, exactly as commit does), and anything that could have
-    // changed the page state — a VirtualProtect, a MEM_DECOMMIT, a non-RW protection,
-    // MEM_TOP_DOWN, a size that is not the block's own — refuses the cache outright and
-    // falls through to the real free. What it DOES give up is the stale-touch #PF on a
-    // use-after-free of these blocks; that is the price of any pooled allocator, and it is
-    // bounded to RW heap blocks the guest itself released.
+    // The bounded recycler owns physical backing only. Logical reservation identity
+    // and page accessibility end on every release, including a cache admission.
     const VA_CACHE_MAX_BLOCK = 0x100000;        // 1 MB — beyond this one flush is amortised
     const VA_CACHE_MAX_PER_SIZE = 8;
     const VA_CACHE_MAX_BYTES = 4 * 0x100000;    // total parked bytes
@@ -817,7 +842,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     let vaCacheEnabled = true;
     (globalThis as any).vaCacheEnable = (on = true) => {
         vaCacheEnabled = !!on;
-        if (!vaCacheEnabled) { vaFreeCache.clear(); vaCacheBytes = 0; }   // parked blocks would leak
+        if (!vaCacheEnabled) {
+            const process = System.getInstance().process;
+            for (const [size, bases] of vaFreeCache) for (const base of bases) {
+                if (process?.memory.getSize(base) === size) freeHeapBlock(process, base);
+            }
+            vaFreeCache.clear(); vaCacheBytes = 0;
+        }
         return { enabled: vaCacheEnabled };
     };
     (globalThis as any).vaCacheReport = () => ({
@@ -829,47 +860,34 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     });
 
     resetVirtualAllocationState = () => {
-        virtualAllocRegions.clear(); decommittedPages.clear(); reservedPages.clear();
+        virtualAllocRegions.clear(); decommittedPages.clear(); freeVirtualPages.clear();
         vaFreeCache.clear(); vaCacheBytes = 0; vaProtectionTouched.clear();
     };
 
     // virtualAllocRegions / decommittedPages are module-scoped: the fast-path tier
     // and HeapWalk/HeapSize read the same interval indexes.
 
-    // Remove a committed range from decommittedPages, handling partial overlaps.
-    // Storm often decommits a multi-page range then recommits individual pages.
-    // Without splitting, stale entries cause VirtualQuery to report MEM_RESERVE
-    // for pages that are actually committed.
-    function clearDecommittedRange(commitBase: number, commitSize: number): void {
-        const commitEnd = commitBase + commitSize;
-        const toDelete: number[] = [];
-        const toAdd: Array<[number, number]> = [];
-
-        for (const [dcBase, dcSize] of decommittedPages) {
-            const dcEnd = dcBase + dcSize;
-
-            // No overlap — skip
-            if (dcEnd <= commitBase || dcBase >= commitEnd) continue;
-
-            // This entry overlaps the commit range — remove it
-            toDelete.push(dcBase);
-
-            // Re-add the non-overlapping parts (split)
-            // Left remainder: [dcBase, commitBase)
-            if (dcBase < commitBase) {
-                toAdd.push([dcBase, commitBase - dcBase]);
-            }
-            // Right remainder: [commitEnd, dcEnd)
-            if (dcEnd > commitEnd) {
-                toAdd.push([commitEnd, dcEnd - commitEnd]);
-            }
-        }
-
-        for (const key of toDelete) decommittedPages.delete(key);
-        for (const [base, size] of toAdd) decommittedPages.set(base, size);
+    function clearDecommittedRange(base: number, size: number): void {
+        decommittedPages.removeRange(base, size);
     }
 
-    registerGuestCommitNotifier(clearDecommittedRange);
+    registerGuestMemoryResetNotifier(() => {
+        const process = System.getInstance().process;
+        if (process && process.memory === virtualMemoryOwner) {
+            for (const [base] of virtualAllocRegions) process.addressSpace.releaseRegion?.(base);
+        }
+        resetVirtualAllocationState();
+    });
+    registerGuestCommittedProbe((base, size) =>
+        System.getInstance().process?.memory !== virtualMemoryOwner ||
+        (!decommittedPages.intersects(base, size) && !freeVirtualPages.intersects(base, size)));
+    registerGuestCommitNotifier((base, size) => {
+        ensureVirtualMemoryOwner();
+        const start = Math.floor(base / 0x1000) * 0x1000;
+        const end = Math.ceil((base + size) / 0x1000) * 0x1000;
+        clearDecommittedRange(start, end - start);
+        freeVirtualPages.removeRange(start, end - start);
+    });
 
     /**
      * Take a page range out of the committed set: clear Present so a guest touch
@@ -890,20 +908,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             proc.addressSpace.fill(alignedAddress, alignedSize, 0xFE);
         }
 
-        // Merge with existing decommitted entries to keep the map compact.
-        let mergeBase = alignedAddress;
-        let mergeEnd = alignedAddress + alignedSize;
-        const toRemove: number[] = [];
-        for (const [dcBase, dcSize] of decommittedPages) {
-            const dcEnd = dcBase + dcSize;
-            if (dcEnd >= mergeBase && dcBase <= mergeEnd) {
-                mergeBase = Math.min(mergeBase, dcBase);
-                mergeEnd = Math.max(mergeEnd, dcEnd);
-                toRemove.push(dcBase);
-            }
-        }
-        for (const key of toRemove) decommittedPages.delete(key);
-        decommittedPages.set(mergeBase, mergeEnd - mergeBase);
+        decommittedPages.addRange(alignedAddress, alignedSize);
     }
 
     /**
@@ -918,19 +923,17 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     function commitPreservingCommitted(base: number, size: number): void {
         const proc = System.getInstance().process;
         if (!proc) return;
-        const ptm = proc.pageTableManager;
-        if (ptm?.isPagingEnabled()) {
-            ptm.ensurePagesCommitted(base, size);   // zeroes only non-present pages
-            return;
-        }
-        // No page tables to consult: the decommit map is the only record of which pages
-        // lost their contents. Reserved-but-never-committed memory is already zero (the
-        // allocator hands out zeroed blocks), so zeroing the rest would only destroy data.
-        const end = base + size;
+        const ptm = proc.pageTableManager, end = base + size;
+        // Present=0 can also mean committed PAGE_NOACCESS. Only logical decommit
+        // state establishes that contents must be zeroed by MEM_COMMIT.
         for (const [dcBase, dcSize] of decommittedPages) {
-            const from = Math.max(base, dcBase);
-            const to = Math.min(end, dcBase + dcSize);
-            if (from < to) proc.addressSpace.fill(from, to - from, 0);
+            const from = Math.max(base, dcBase), to = Math.min(end, dcBase + dcSize);
+            if (from >= to) continue;
+            if (ptm?.isPagingEnabled()) ptm.commitPages(from, to - from);
+            else {
+                invalidateGuestCode(from, to - from);
+                proc.getCurrentMemory().fill(0, from, to);
+            }
         }
     }
 
@@ -1388,6 +1391,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
     }
 
     exports['VirtualQuery'] = (ctx, mem, args) => {
+        ensureVirtualMemoryOwner();
         const lpAddress = args[0] >>> 0;
         const lpBuffer = args[1];
         const dwLength = args[2];
@@ -1520,8 +1524,13 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 // SmartHeap/Shw32 validates interior pointers against that base; page-
                 // granular AllocationBase made every sub-page look like its own alloc.
                 const va = virtualAllocRegions.find(pageBase);
+                const free = freeVirtualPages.find(pageBase);
 
-                if (va) {
+                if (free) {
+                    allocationBase = 0;
+                    regionSize = free.base + free.size - pageBase;
+                    protect = PAGE_NOACCESS; memType = 0; state = MEM_FREE;
+                } else if (va) {
                     allocationBase = va.base;
                     regionSize = va.base + va.size - pageBase;
                     memType = MEM_PRIVATE;
@@ -1558,8 +1567,9 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             // remain authoritative until an explicit protection has replaced them.
             let allocationProtect = protect;
             const region = system.process?.addressSpace.getRegion(pageBase);
+            const dc = decommittedPages.find(pageBase);
             if (region && region.owner !== "Layout" && state === MEM_COMMIT) {
-                regionSize = Math.min(regionSize, region.base + region.size - pageBase);
+                if (!dc) regionSize = Math.min(regionSize, region.base + region.size - pageBase);
                 if (region.protection !== undefined) {
                     protect = region.protection;
                     allocationProtect = region.allocationProtect ??
@@ -1573,7 +1583,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
             // Decommitted pages within a reserved/committed region read back as MEM_RESERVE.
             if (state === MEM_COMMIT) {
-                const dc = decommittedPages.find(pageBase);
                 if (dc) {
                     state = MEM_RESERVE;
                     // Clip region to the decommitted run so the walker sees the boundary.
@@ -1581,7 +1590,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 }
             }
 
-            const reportProtect = (state === MEM_RESERVE || state === MEM_FREE) ? PAGE_NOACCESS : protect;
+            const reportProtect = state === MEM_RESERVE ? 0 : state === MEM_FREE ? PAGE_NOACCESS : protect;
             view.setUint32(lpBuffer, baseAddress, true);              // BaseAddress
             view.setUint32(lpBuffer + 4, allocationBase, true);       // AllocationBase
             view.setUint32(lpBuffer + 8, state === MEM_FREE ? 0 : allocationProtect, true); // AllocationProtect
@@ -2265,6 +2274,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     // VirtualAlloc - allocate virtual memory
     exports['VirtualAlloc'] = (ctx, mem, args) => {
+        ensureVirtualMemoryOwner();
         const lpAddress = args[0];
         const dwSize = args[1];
         const flAllocationType = args[2];
@@ -2287,7 +2297,12 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             return fail('invalid allocation type');
         }
 
-        const alignedSize = Math.ceil(dwSize / PAGE_SIZE) * PAGE_SIZE;
+        if (!dwSize || !Number.isSafeInteger(dwSize) || dwSize < 0 ||
+            lpAddress + dwSize > 0x100000000) {
+            System.getInstance().scheduler.setLastError(ERROR_INVALID_PARAMETER);
+            return fail("invalid size");
+        }
+        const alignedSize = Math.ceil((dwSize + (lpAddress % PAGE_SIZE)) / PAGE_SIZE) * PAGE_SIZE;
         // When lpAddress is non-zero but not page-aligned, round down to page boundary (Windows-compatible behavior)
         const effectiveAddress = lpAddress !== 0 ? (lpAddress & ~(PAGE_SIZE - 1)) : 0;
 
@@ -2307,35 +2322,23 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         const MEM_TOP_DOWN = 0x00100000;
         const ERROR_NOT_ENOUGH_MEMORY = 8;
 
-        // MEM_COMMIT-only with specific address: commit pages within an already reserved region.
-        // When lpAddress=0, Windows implicitly reserves+commits — fall through to the allocation path.
+        // An addressed commit belongs to one logical reservation, irrespective of the
+        // allocator's larger physical block. Recommit preserves bytes but updates protection.
         const commitOnly = (flAllocationType & MEM_COMMIT) && !(flAllocationType & MEM_RESERVE) && effectiveAddress !== 0;
         if (commitOnly) {
-            profiler.start("VirtualAlloc:reserveScan");
-            let inReserved = false;
-            for (const [base, size] of reservedPages) {
-                if (effectiveAddress >= base && effectiveAddress < base + size) { inReserved = true; break; }
+            const owner = findTrackedAllocRange(effectiveAddress, alignedSize);
+            if (!owner || (typeof process.addressSpace.protect === "function" &&
+                !process.addressSpace.protect(effectiveAddress, alignedSize, perms, flProtect))) {
+                System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
+                return fail("MEM_COMMIT not within one reserved range");
             }
-            profiler.end("VirtualAlloc:reserveScan");
-            if (inReserved) {
-                profiler.start("VirtualAlloc:commitInReserved");
-                commitPreservingCommitted(effectiveAddress, alignedSize);
-                clearDecommittedRange(effectiveAddress, alignedSize);
-                profiler.end("VirtualAlloc:commitInReserved");
-                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in reserved, size=${alignedSize})`);
-                return effectiveAddress;
+            commitPreservingCommitted(effectiveAddress, alignedSize);
+            clearDecommittedRange(effectiveAddress, alignedSize);
+            if (process.pageTableManager?.isPagingEnabled()) {
+                process.pageTableManager.setProtection(effectiveAddress, alignedSize, permsToProtect(perms));
             }
-            // Fallback: region may already be mapped by a prior RESERVE|COMMIT (reservedPages can be out of sync).
-            const region = process.addressSpace.getRegion(effectiveAddress);
-            if (region && (region.kind === 'HEAP' || region.kind === 'HEAP_HIGH') && effectiveAddress + alignedSize <= region.base + region.size) {
-                commitPreservingCommitted(effectiveAddress, alignedSize);
-                clearDecommittedRange(effectiveAddress, alignedSize);
-                Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${effectiveAddress.toString(16)} (COMMIT in HEAP, size=${alignedSize})`);
-                return effectiveAddress;
-            }
-            // Committing without prior reserve is invalid
-            System.getInstance().scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            return fail(`MEM_COMMIT not within reserved region`);
+            if (flProtect !== PAGE_READWRITE) vaProtectionTouched.add(owner[0]);
+            return effectiveAddress;
         }
 
         // Which call shapes actually arrive — a recycler with zero hits and zero misses is
@@ -2372,11 +2375,17 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             }
             if (reuse !== undefined) {
                 vaCacheStats.hits++;
-                // Win32 hands out zeroed pages on commit. With the PTEs already present
-                // and RW this native fill is the entire cost of the reuse.
-                process.addressSpace.fill(reuse, vaCacheKey, 0);
-                reservedPages.set(reuse, vaCacheKey);
-                virtualAllocRegions.set(reuse, vaCacheKey);
+                ensureGuestPagesCommitted(reuse, alignedSize);
+                registerVirtualAllocation(process, reuse, alignedSize, 'rw', PAGE_READWRITE);
+                virtualAllocRegions.set(reuse, alignedSize);
+                invalidateGuestCode(reuse, alignedSize);
+                mem.fill(0, reuse, reuse + alignedSize);
+                if (vaCacheKey > alignedSize) {
+                    freeVirtualPages.addRange(reuse + alignedSize, vaCacheKey - alignedSize);
+                    if (process.pageTableManager?.isPagingEnabled()) {
+                        process.pageTableManager.decommitPages(reuse + alignedSize, vaCacheKey - alignedSize);
+                    }
+                }
                 Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${reuse.toString(16)} (recycled, size=${vaCacheKey})`);
                 return reuse;
             }
@@ -2416,40 +2425,28 @@ export const exports: Record<string, ThunkImplementation> = (() => {
         }
         profiler.end("VirtualAlloc:alloc");
 
-        // allocFromHigh/alloc may round up to 64KB granularity — track the live block size.
-        const committedSize = process.memory.getSize(address) ?? alignedSize;
-        registerVirtualAllocation(process, address, committedSize, perms, flProtect);
-        // Only initial plain-RW reservations may enter the untouched-PTE recycler.
+        const capacity = process.memory.getSize(address) ?? alignedSize;
+        registerVirtualAllocation(process, address, alignedSize, perms, flProtect);
+        virtualAllocRegions.set(address, alignedSize);
         if (flProtect !== PAGE_READWRITE) vaProtectionTouched.add(address);
-
-        if (flAllocationType & MEM_RESERVE) {
-            reservedPages.set(address, committedSize);
-            // Reserve WITHOUT commit hands back address space, not memory. Leaving the
-            // pages present makes a demand-paging design (reserve a window, commit each
-            // page from the access-violation filter) never fault, so the app reads zeros
-            // where it expected the bytes its handler would have paged in.
-            if (!(flAllocationType & MEM_COMMIT)) markDecommitted(address, committedSize);
-            Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Reserved ${committedSize} bytes at 0x${address.toString(16)}`);
-        }
-
-        const trackedSize = virtualAllocRegions.get(address) ?? 0;
-        if (committedSize > trackedSize) {
-            virtualAllocRegions.set(address, committedSize);
+        if (capacity > alignedSize) {
+            freeVirtualPages.addRange(address + alignedSize, capacity - alignedSize);
+            if (process.pageTableManager?.isPagingEnabled()) {
+                process.pageTableManager.decommitPages(address + alignedSize, capacity - alignedSize);
+            }
         }
 
         if (flAllocationType & MEM_COMMIT) {
-            profiler.start("VirtualAlloc:commit");
             const ptm = process.pageTableManager;
             if (ptm?.isPagingEnabled()) {
                 ptm.commitPages(address, alignedSize);
+                if (perms !== 'rw') ptm.setProtection(address, alignedSize, permsToProtect(perms));
             } else {
+                invalidateGuestCode(address, alignedSize);
                 mem.fill(0, address, address + alignedSize);
             }
-            if (ptm?.isPagingEnabled() && perms !== 'rw') {
-                ptm.setProtection(address, alignedSize, permsToProtect(perms));
-            }
-            profiler.end("VirtualAlloc:commit");
-            Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc: Committed ${alignedSize} bytes at 0x${address.toString(16)} perms=${perms}`);
+        } else {
+            markDecommitted(address, alignedSize);
         }
 
         Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualAlloc -> 0x${address.toString(16)} (size=${alignedSize})`);
@@ -2467,6 +2464,7 @@ export const exports: Record<string, ThunkImplementation> = (() => {
 
     // VirtualFree - free virtual memory
     exports['VirtualFree'] = (ctx, mem, args) => {
+        ensureVirtualMemoryOwner();
         const lpAddress = args[0];
         const dwSize = args[1];
         const dwFreeType = args[2];
@@ -2523,24 +2521,24 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 return false;
             })();
 
-            clearDecommittedRange(lpAddress, trackedSize);
-            reservedPages.delete(lpAddress);
-            virtualAllocRegions.delete(lpAddress);
-            // Park it instead of freeing it, when its pages are still exactly what we
-            // committed — then neither this release nor the next allocation of the same
-            // size touches the page tables (see the recycler comment above).
             const blockSize = process.memory.getSize(lpAddress);
+            const capacity = blockSize ?? trackedSize;
+            clearDecommittedRange(lpAddress, capacity);
+            virtualAllocRegions.delete(lpAddress);
+            freeVirtualPages.addRange(lpAddress, capacity);
+            if (process.pageTableManager?.isPagingEnabled()) {
+                process.pageTableManager.decommitPages(lpAddress, capacity);
+            }
+            process.addressSpace.releaseRegion?.(lpAddress);
+
             const touched = vaProtectionTouched.delete(lpAddress);
-            if (vaCacheEnabled && blockSize !== undefined && blockSize === trackedSize && blockSize <= VA_CACHE_MAX_BLOCK
+            if (vaCacheEnabled && blockSize !== undefined && blockSize >= trackedSize && blockSize % 0x10000 === 0 && blockSize <= VA_CACHE_MAX_BLOCK
                 && !hadDecommitted && !touched) {
                 let bucket = vaFreeCache.get(blockSize);
                 if (!bucket) { bucket = []; vaFreeCache.set(blockSize, bucket); }
                 if (bucket.length < VA_CACHE_MAX_PER_SIZE && vaCacheBytes + blockSize <= VA_CACHE_MAX_BYTES) {
-                    bucket.push(lpAddress);
-                    vaCacheBytes += blockSize;
-                    vaCacheStats.parked++;
-                    Logger.verboseLazy(LogCategory.KERNEL32, () => `VirtualFree: parked 0x${lpAddress.toString(16)} (${blockSize} bytes)`);
-                    return 1; // TRUE
+                    bucket.push(lpAddress); vaCacheBytes += blockSize; vaCacheStats.parked++;
+                    return 1;
                 }
                 vaCacheStats.refusedFull++;
             } else if (touched || hadDecommitted) {
@@ -2549,16 +2547,6 @@ export const exports: Record<string, ThunkImplementation> = (() => {
                 vaCacheStats.refusedShape++;
             }
 
-            // Released VA goes back to the allocator, so any protection the app applied
-            // to it dies with the reservation. Leaving a PAGE_READONLY page behind hands
-            // the next owner memory it cannot write — and the recommit-on-handout path
-            // only revives NOT-PRESENT pages, so a read-only one stays read-only forever.
-            {
-                const ptm = process.pageTableManager;
-                if (ptm?.isPagingEnabled()) ptm.setProtection(lpAddress, trackedSize, PAGE_READWRITE);
-            }
-
-            process.addressSpace.releaseRegion?.(lpAddress);
             const allocSize = blockSize;
             if (allocSize === undefined) {
                 Logger.warn(LogCategory.KERNEL32,
@@ -2595,56 +2583,57 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             `VirtualFree: Decommitted ${alignedSize} bytes at 0x${alignedAddress.toString(16)}`);
         return 1; // TRUE
     };
-    // VirtualProtect changes every intersected page within ONE allocation.
+    // VirtualProtect probes its output before target validation. Failed requests
+    // still publish the observed old-protection value, without changing target pages.
     exports['VirtualProtect'] = (ctx, mem, args) => {
+        ensureVirtualMemoryOwner();
         const lpAddress = args[0] >>> 0, dwSize = args[1] >>> 0;
         const flNewProtect = args[2] >>> 0, lpflOldProtect = args[3] >>> 0;
         const system = System.getInstance(), process = system.process;
         if (!process) return 0;
+        if (!isValidUserAddress(mem, lpflOldProtect, 4, "rw")) {
+            system.scheduler.setLastError(998);
+            return 0;
+        }
+        // Initial probe failures reject the request; later output revocation does
+        // not undo a successful protection change.
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const fail = (error: number, oldProtect: number): 0 => {
+            view.setUint32(lpflOldProtect, oldProtect, true);
+            system.scheduler.setLastError(error);
+            return 0;
+        };
         const baseProtection = flNewProtect & 0xff;
         if (!dwSize || ![PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
             PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY].includes(baseProtection) ||
-            (flNewProtect & ~0x7ff) !== 0) {
-            system.scheduler.setLastError(ERROR_INVALID_PARAMETER);
-            return 0;
-        }
+            (flNewProtect & ~0x7ff) !== 0) return fail(ERROR_INVALID_PARAMETER, 0);
         const alignedAddr = Math.floor(lpAddress / 0x1000) * 0x1000;
         const end = Math.ceil((lpAddress + dwSize) / 0x1000) * 0x1000;
         const alignedSize = end - alignedAddr;
         const region = process.addressSpace.getRegion(alignedAddr);
         const owner = virtualAllocRegions.find(alignedAddr);
         let invalid = !region || end > mem.length || end > 0x100000000 ||
-            (owner !== null && end > owner.base + owner.size);
+            (owner !== null && end > owner.base + owner.size) ||
+            decommittedPages.intersects(alignedAddr, alignedSize) ||
+            freeVirtualPages.intersects(alignedAddr, alignedSize);
         for (const [base, size] of virtualAllocRegions) {
             if (base < end && base + size > alignedAddr && base !== owner?.base) invalid = true;
         }
-        for (const [base, size] of decommittedPages) {
-            if (base < end && base + size > alignedAddr) invalid = true;
-        }
-        if (invalid || !region) {
-            system.scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            return 0;
-        }
-        if (!lpflOldProtect || lpflOldProtect + 4 > mem.length ||
-            !process.addressSpace.validateRange(lpflOldProtect, 4, "w")) {
-            system.scheduler.setLastError(998); // ERROR_NOACCESS
-            return 0;
-        }
+        if (invalid || !region) return fail(ERROR_INVALID_ADDRESS, PAGE_NOACCESS);
         const mod = process.moduleRegistry?.getModuleContainingAddress(alignedAddr);
         const oldProtect = region.protection ?? (mod
             ? imageProtectionRun(mod, alignedAddr).protect : permsToProtect(region.perms));
         const newPerms = mapProtectToPerms(flNewProtect);
         if (!process.addressSpace.protect(alignedAddr, alignedSize, newPerms, flNewProtect)) {
-            system.scheduler.setLastError(ERROR_INVALID_ADDRESS);
-            return 0;
+            return fail(ERROR_INVALID_ADDRESS, PAGE_NOACCESS);
         }
         if (owner) vaProtectionTouched.add(owner.base);
-        const ptm = process.pageTableManager;
-        if (ptm?.isPagingEnabled()) {
-            // PTEs encode present/write, not Win32 COW/cache modifiers.
-            ptm.setProtection(alignedAddr, alignedSize, permsToProtect(newPerms));
+        if (process.pageTableManager?.isPagingEnabled()) {
+            process.pageTableManager.setProtection(alignedAddr, alignedSize, permsToProtect(newPerms));
         }
-        new DataView(mem.buffer, mem.byteOffset, mem.byteLength).setUint32(lpflOldProtect, oldProtect, true);
+        if (isValidUserAddress(mem, lpflOldProtect, 4, "rw")) {
+            view.setUint32(lpflOldProtect, oldProtect, true);
+        }
         return 1;
     };
 
@@ -3637,6 +3626,7 @@ function auditVirtualQueryFast(lpAddress: number, lpBuffer: number, mem: Uint8Ar
 }
 
 const virtualQueryFastPath: FastPathImplementation = (esp: number, view: DataView, mem8: Uint8Array) => {
+    ensureVirtualMemoryOwner();
     if (esp + 16 > mem8.length) { vqFastDefers++; return null; }
 
     const lpAddress = view.getUint32(esp + 4, true) >>> 0;
@@ -3655,7 +3645,7 @@ const virtualQueryFastPath: FastPathImplementation = (esp: number, view: DataVie
     if (process.moduleRegistry?.getModuleContainingAddress(lpAddress)) { vqFastDefers++; return null; }
     if (virtualAllocRegions.find(pageBase)) { vqFastDefers++; return null; }
     if (process.addressSpace.getRegion(pageBase)?.protection !== undefined) { vqFastDefers++; return null; }
-    if (decommittedPages.find(pageBase)) { vqFastDefers++; return null; }
+    if (decommittedPages.find(pageBase) || freeVirtualPages.find(pageBase)) { vqFastDefers++; return null; }
 
     view.setUint32(lpBuffer, pageBase, true);                     // BaseAddress
     view.setUint32(lpBuffer + 4, pageBase, true);                 // AllocationBase

@@ -16,6 +16,7 @@
   "scripts": {
     "start": "bun src/cli.ts",
     "build:native": "bun native/build.ts",
+    "build:native:udp": "bun native/build-udp.ts",
     "test": "bun test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

@@ -22,15 +22,29 @@ export function dispatchThreadApcs(
     if (!first) return null;
     const frameId = callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, label);
     if (!frameId) { sched.restorePendingApc(tid, first); return null; }
-    const next = (): number | null => {
-        const apc = sched.takePendingApc(tid);
-        if (!apc) return alertedValue();
-        const args = apcArguments(apc);
-        callbackManager.invokeCallback(apc.routine, args, args.length * 4, next, false, label, frameId);
-        return null;
+    let callbackId = 0;
+    const invoke = (apc: PendingApc): boolean => {
+        let args: readonly number[] | null;
+        try { args = sched.preparePendingApc(tid, apc, apcArguments(apc)); }
+        catch (error) { callbackManager.abandonSuspendedFrame(frameId); throw error; }
+        if (args === null) return false;
+        try {
+            callbackId = callbackManager.invokeCallback(apc.routine, [...args], args.length * 4,
+                () => { sched.finishPendingApc(tid, apc, true); return next(); }, false, label, frameId).callbackId;
+            if (!callbackId) { sched.finishPendingApc(tid, apc, false); return false; }
+            return true;
+        } catch (error) {
+            sched.finishPendingApc(tid, apc, false); callbackManager.abandonSuspendedFrame(frameId); throw error;
+        }
     };
-    const args = apcArguments(first);
-    const { callbackId } = callbackManager.invokeCallback(
-        first.routine, args, args.length * 4, next, false, label, frameId);
+    const next = (): number | null => {
+        let apc: PendingApc | null;
+        while ((apc = sched.takePendingApc(tid))) if (invoke(apc)) return null;
+        return alertedValue();
+    };
+    if (!invoke(first) && next() !== null) {
+        callbackManager.abandonSuspendedFrame(frameId);
+        return { value: alertedValue(), stackCleanup };
+    }
     return { value: WAIT_IO_COMPLETION, suspendedForCallback: true, callbackId, stackCleanup };
 }

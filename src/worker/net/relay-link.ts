@@ -2,6 +2,8 @@ import { io, type Socket } from "socket.io-client";
 import type { ClientEvents, ServerEvents, LanReady } from "./netplay-wire";
 import { PROTOCOL_VERSION, PROTO_DIRECTPLAY, isTcpProtocol, asBytes, decodeDatagram, isLanNode, nodeToIpv4 } from "./netplay-wire";
 import { LanNetwork, type NetTransport } from "./lan-network";
+import { UdpPeerLeaseRpc } from "./udp-peer-lease-rpc";
+import type { UdpPeerLeaseRequest } from "./netplay-wire";
 import { NetResolveError, type ResolveRequest, type ResolveResult, type ResolveReply, parseIpv6, parseIpv4, isExternalIpv6Node, validBindingGeneration } from "./netplay-wire";
 
 export interface RelayLinkOptions {
@@ -15,9 +17,18 @@ export class RelayLink implements NetTransport {
     private online = false;
     private closed = false;
     private settled = false;
-    private readonly reliableQueue:({kind:"frame";frame:Uint8Array<ArrayBuffer>;generation?:number}|{kind:"release";port:number;proto:number;generation:number})[] = [];
+    private readonly reliableQueue:({kind:"frame";frame:Uint8Array<ArrayBuffer>;generation?:number}|{kind:"release";port:number;proto:number;generation:number}|{kind:"leaseRequest";id:number;request:UdpPeerLeaseRequest}|{kind:"leaseCancel";id:number}|{kind:"leaseRelease";id:number})[] = [];
     private queuedBytes = 0;
     private flushing = false;
+    private readonly udpPeers = new UdpPeerLeaseRpc({
+        connected: () => this.online && !this.closed && this.socket.connected,
+        request: (id, request) => this.reliableQueue.length < 128 && this.enqueue({kind:"leaseRequest",id,request},128),
+        cancel: id => { this.enqueue({kind:"leaseCancel",id},16); },
+        release: id => { this.enqueue({kind:"leaseRelease",id},16); },
+    });
+    leaseUdpPeer(request: UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{release(): void}> {
+        return this.udpPeers.open(request, signal);
+    }
     private nextResolve = 1;
     private readonly pendingResolves = new Map<number, { fail: (error: NetResolveError) => void; accept: (reply: ResolveReply) => void }>();
     private resolveReady!: () => void;
@@ -52,6 +63,7 @@ export class RelayLink implements NetTransport {
         });
         this.socket.on("ready", info => this.acceptReady(info));
         this.socket.on("resolved", (id, reply) => this.pendingResolves.get(id)?.accept(reply));
+        this.socket.on("udpPeerLeased", (id, reply) => { if (this.online && !this.closed) this.udpPeers.accept(id, reply); });
         this.socket.on("frame", (input,generation) => {
             if (!this.online || this.closed) return;
             const bytes = asBytes(input);
@@ -73,6 +85,7 @@ export class RelayLink implements NetTransport {
             this.online = false;
             this.clearQueue();
             this.cancelResolves();
+            this.udpPeers.disconnect();
             this.socket.sendBuffer.length = 0;
             this.net.setConnected(false, reason);
 
@@ -84,13 +97,24 @@ export class RelayLink implements NetTransport {
         });
         this.socket.connect();
     }
+    private abortTransport():void {
+        const engine=this.socket.io.engine;
+        // Fatal queue admission cannot wait for an undrained namespace packet.
+        try { this.socket.disconnect(); } finally { engine?.transport?.close(); }
+    }
     private enqueue(item:(typeof this.reliableQueue)[number],bytes:number):boolean{
-        if(this.reliableQueue.length>=256||this.queuedBytes+bytes>1024*1024){this.socket.disconnect();return false;}
+        const cleanup = item.kind === "leaseCancel" || item.kind === "leaseRelease";
+        // Every admitted permission retains room for its cancellation/release,
+        // including when TCP traffic shares this connection's ordered queue.
+        const reserved = cleanup ? 0 : this.udpPeers.controlReservations;
+        if(this.reliableQueue.length>=256||this.queuedBytes+bytes>1024*1024){this.abortTransport();return false;}
+        if(this.reliableQueue.length+1+reserved>256||this.queuedBytes+bytes+reserved*16>1024*1024)return false;
         this.reliableQueue.push(item);this.queuedBytes+=bytes;this.flush();return true;
     }
     releasePort(port:number,proto:number,generation:number):void{
+        this.udpPeers.retire(port, proto, generation);
         if(this.closed||!this.online||!this.socket.connected||!generation)return;
-        this.enqueue({kind:"release",port,proto,generation},16);
+        if (!this.enqueue({kind:"release",port,proto,generation},16)) this.abortTransport();
     }
     send(frame: Uint8Array<ArrayBuffer>,generation=0): boolean {
         const engine = this.socket.io.engine;
@@ -162,7 +186,10 @@ export class RelayLink implements NetTransport {
                     if(item.generation===undefined)this.socket.emit("frame",item.frame);
                     else this.socket.emit("frame",item.frame,item.generation);
                 }
-                else{this.queuedBytes-=16;this.socket.emit("releasePort",item.proto,item.port,item.generation);}
+                else if(item.kind==="release"){this.queuedBytes-=16;this.socket.emit("releasePort",item.proto,item.port,item.generation);}
+                else if(item.kind==="leaseRequest"){this.queuedBytes-=128;this.socket.emit("leaseUdpPeer",item.id,item.request);}
+                else if(item.kind==="leaseCancel"){this.queuedBytes-=16;this.socket.emit("cancelUdpPeer",item.id);}
+                else{this.queuedBytes-=16;this.socket.emit("releaseUdpPeer",item.id);}
             }
         } finally { this.flushing = false; }
     }
@@ -176,6 +203,7 @@ export class RelayLink implements NetTransport {
         this.online = false;
         this.clearQueue();
         this.cancelResolves();
+        this.udpPeers.disconnect();
         clearTimeout(this.deadline);
         this.socket.removeAllListeners();
         this.socket.sendBuffer.length = 0;

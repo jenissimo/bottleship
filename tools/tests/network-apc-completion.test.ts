@@ -23,7 +23,7 @@ function setup(alertable: boolean, suspended = false) {
     const handlers = new Map<string, Function>();
     const generator = new ThunkGenerator();
     generator.setBaseAddress(0x500000);
-    (s as any).process = { resetGeneration: 0, thunkGenerator: generator,
+    (s as any).process = { resetGeneration: 0, thunkGenerator: generator, getCurrentMemory: () => ram,
         addressSpace: { validateRange: (address: number, size: number) => address >= 0 && address + size <= ram.length },
         dispatcher: { callbackManager: {}, register: (_dll: string, name: string, fn: Function) => handlers.set(name, fn) } };
     (s as any).threads.set(t.id, t);
@@ -91,6 +91,30 @@ describe('network asynchronous completion and owner APC', () => {
         expect(calls[0].slice(0, 3)).toEqual([0x402000, [0, 7, 0x410000, 0x20], 16]);
         expect(finish?.()).toBe(123);
         expect(t.apcQueue).toHaveLength(0);
+    });
+    test('owned APC storage is prepared only on the owner and released after guest return', () => {
+        const {s,t}=setup(true);const calls:string[]=[];let complete:Function|undefined;
+        s.queueWsaCompletionApc(t.id,0x402000,0,7,0x410000,0,{prepare(args){calls.push('prepare');return [args[0],0,0x420000,args[3]];},onReturn(){calls.push('return');},onDiscard(){calls.push('discard');}});
+        expect(calls).toEqual([]);(s as any).currentThreadId=t.id;
+        const manager={saveSuspendedThunkContext:()=>9,invokeCallback:(_routine:number,args:number[],_cleanup:number,finish:Function)=>{expect(args).toEqual([0,0,0x420000,0]);complete=finish;return{callbackId:12};}};
+        dispatchThreadApcs(s,manager as any,{} as any,'owned',0);
+        expect(calls).toEqual(['prepare']);complete!();expect(calls).toEqual(['prepare','return']);complete!();expect(calls).toEqual(['prepare','return']);
+    });
+    test('queued and active owned APCs are discarded on thread termination and callback startup failure', () => {
+        for(const mode of ['queued','active','throw','zero','stale']as const){
+            const {s,t}=setup(true);let released=0;
+            s.queueWsaCompletionApc(t.id,0x402000,0,0,0x410000,0,{prepare(){return mode==='stale'?null:[0,0,0x420000,0];},onDiscard(){released++;}});
+            if(mode!=='queued'){
+                (s as any).currentThreadId=t.id;
+                const manager={saveSuspendedThunkContext:()=>9,abandonSuspendedFrame:()=>true,invokeCallback:()=>{if(mode==='throw')throw Error('start');return{callbackId:mode==='zero'?0:12};}};
+                if(mode==='throw')expect(()=>dispatchThreadApcs(s,manager as any,{}as any,'owned',0)).toThrow('start');
+                else dispatchThreadApcs(s,manager as any,{}as any,'owned',0);
+            }
+            if(mode==='queued'||mode==='active'){(s as any).currentThreadId=null;(s as any).terminateThread(t.id,0);}
+            expect(released).toBe(1);(s as any).discardThreadApcs(t);expect(released).toBe(1);
+        }
+        const {s}=setup(true);let rejected=0;
+        expect(s.queueWsaCompletionApc(999,0x402000,0,0,0,0,{onDiscard(){rejected++;}})).toBe(false);expect(rejected).toBe(1);
     });
     test('completion copies descriptors, writes before signalling and survives RAM replacement', async () => {
         let ram = new Uint8Array(64);
