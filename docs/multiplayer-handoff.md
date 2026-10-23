@@ -2,6 +2,12 @@
 
 Обновлено: 2026-10-23. Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
 
+## Текущий следующий шаг
+
+Q2 game-fourth j22b55a завершён FAIL после настоящего соединения двух игроков. Первые sample показали Host guest/canvas63 и Peer22, затем обе страницы перестали отвечать даже на page-side Runtime.evaluate("true"). Следующий шаг — узкая диагностика main-page/render dispatch; увеличение таймаутов и повтор game-fourth вслепую не обоснованы. Runtime/source остаются freeze30 HOLD. Подготовку диагностики ведёт /root/lan_transport.
+
+Новый Native DP8 Host+2Peer baseline уже GREEN: j4f0e6d,599 checks/1198 words, все три exit0/без forced, actual ports55230..55232 rebind. Это reference Windows, не наш многопользовательский Host. Выход: stage30-directplay-host-mesh-preparation/native-runs/host2-native-3001001/verified.json, SHA6cb16f077e31b21c72b3c316bf10385a2764effc8ff9d5af306639d6a5dabdc0. PE4ea595ed91008dd9fd3808a938e6db4b9a5d7b168591ac858021f7457a4dbad3. Отдельно измерено Peer GetLocalHostAddresses=0x80158530 NOTHOST.
+
 ## Сначала прочитать
 
 1. Этот документ, корневые README.md, AGENTS.md и CLAUDE.md. При работе с игрой — .claude/skills/bringup/SKILL.md в активном worktree.
@@ -39,6 +45,8 @@
 - production-25/directplay8-peer-info/verified.json: **9802b741c521b9bb9422990911d027f59e1667760248a57fc6d4d12d1f396a62**.
 - Release Rust CLI standalone-rust29/bin/bottleship-lan.exe: **db838c2af7b5a9c6205a633ba7c81d2baeacd70e61590927990db5502ea60551**.
 - Release conformance-server.exe там же: **dee9548943ad1ac5d2fc745a6f144902108cb5326fc6f4c291d4c421f25e9401**.
+
+Четвёртый Q2 proof: two-player-status.json SHA f2f6ae17bf67cbb33ea151a366f1dc9d42a50420c7310c1816a8e38078ca9619, game/report.json d7210296552a129fc97c406fc5cdc5c0a14b7393224fb1910c4424c9c2b96e36. Следующий host-probe-5 превысил25s, его tool process завершён принудительно; evidence с literal evalPage(true,5000) не ответил на обеих страницах. Console cleanup тоже не ответил. Fallback закрыл только exact owned tabs, siblings сохранены, observer peerLeft подтверждены. Production CLI51412/owner23400 штатно exit0/forced=false, port55702 ECONNREFUSED. Важно различать forced tool deadlines и graceful server shutdown. Оба gameIds V4 использованы, OPFS не удалять.
 
 Итоговые коммиты и ссылки на proof записаны также в production-25/committed.json. Ни один из этих результатов не доказывает полный API-паритет, совместимость всех игр или производительность.
 
@@ -81,9 +89,9 @@
 
 После первых двух попыток gameIds оставались неиспользованными. В третьей Host уже исполнил PE: для следующего независимого повтора готовятся новые gameIds обеих ролей; старый OPFS не удалять.
 
-Текущий HTTP serving fix: новые dist/apps/q2-proof-v3-host.wgb и q2-proof-v3-peer.wgb; job j0777f4 подтвердил HTTP200 и точные SHA исходных копий. Карта URL сохранена в stage30-quake2-run/preparation-v3.json. MANIFEST-v3.json SHA e336877a1b071ce9c45e99ed126ac7de37f11fe1d939054ddb3a2fcece1608e8, tools HOLD. Из прежних шести scripts изменён только game.ts, SHA51096c437dce328c67cab2f48fea42b255561b33a265557619d994d56acd2663. Проверки archive/HTTP/syntax j5baf9e/j0777f4/j4cf4e0 EXIT0. Не перезапускать Vite и не менять frozen frontend ради этой обвязки. Третий запуск jc646a5 завершён FAIL: Host реально запустил demo1 и ответил настоящим LAN status с BS29Host (host-only-status.json SHA7da4fc4d74196f669fc2c7b73973d6f9c30b7173250921cd1fed038b16be4a9b). Peer не исполнил PE: созданный CDP target ещё имел пустой URL, а harness сразу сделал findTab. Нужен bounded wait exact created target URL/origin/bs и page harness readiness до reload. Обе вкладки закрыты, siblings сохранены; server exit0/no forced. Агент готовит ignored V4 с readiness wait и свежими gameIds/HTTP bundles; самого повторного запуска ещё нет. Host screenshot host-screen.png SHAf3516f62… пока показывает серое окно, поэтому игровой кадр и advancing frames ещё НЕ доказаны.
+Текущий HTTP serving fix: новые dist/apps/q2-proof-v3-host.wgb и q2-proof-v3-peer.wgb; job j0777f4 подтвердил HTTP200 и точные SHA исходных копий. Карта URL сохранена в stage30-quake2-run/preparation-v3.json. MANIFEST-v3.json SHA e336877a1b071ce9c45e99ed126ac7de37f11fe1d939054ddb3a2fcece1608e8, tools HOLD. Из прежних шести scripts изменён только game.ts, SHA51096c437dce328c67cab2f48fea42b255561b33a265557619d994d56acd2663. Проверки archive/HTTP/syntax j5baf9e/j0777f4/j4cf4e0 EXIT0. Не перезапускать Vite и не менять frozen frontend ради этой обвязки. Третий запуск jc646a5 завершён FAIL: Host реально запустил demo1 и ответил настоящим LAN status с BS29Host (host-only-status.json SHA7da4fc4d74196f669fc2c7b73973d6f9c30b7173250921cd1fed038b16be4a9b). Peer не исполнил PE: созданный CDP target ещё имел пустой URL, а harness сразу сделал findTab. Нужен bounded wait exact created target URL/origin/bs и page harness readiness до reload. Обе вкладки закрыты, siblings сохранены; server exit0/no forced. V4 подготовлен и запущен: MANIFEST-v4 f5db5f8c00fafd4a8c6b99bff24eed3299919382906483d1d7a4b202e9e9ea58; role d343f9a9…, game b74ae110…; свежие gameIds app:bs30-quake2-v4-a34f1c-host/peer. Третий ранний Host screenshot host-screen.png SHAf3516f62… был серым окном. Четвёртый запуск показал более поздние presents63/22 и соединение двух игроков, но затем page-side диагностика зависла; полного игрового GREEN нет.
 
-Команда следующего запуска после окончания подготовки (новый output, не существующий каталог):
+Ниже использованная команда четвёртого запуска. **Не повторять** существующий output: он содержит FAIL. Для следующей диагностики нужны новый каталог, новые gameIds после фактического boot и отдельный диагностический план:
 
     Set-Location .wt/lan-network
     & ./logs/tools/bun-portable/package/bin/bun.exe logs/lan-conformance/stage30-quake2-run/controller.ts --run-authorized --manifest logs/lan-conformance/freeze-30/source.json --expected-sha 71582326701092d11d0766e29a7298bc6cbb3b0c6850be8f33210b70616b40e5 --output logs/lan-conformance/stage30-quake2-run/game-fourth
@@ -162,7 +170,7 @@ Read-only аудит: stage30-directplay-host-mesh-preparation/review.md SHA f8d
 
 Native source: coreconnect.cpp DNHostConnect1/2, nametable.cpp PackNameTable, worker.cpp DNWTSendNameTableOperation, disconnect.cpp DNHostDisconnect. Старый 3-party native capture показывает C2→D0→C6→C4→D1, но старый IAT diagnostic не является новым API-only oracle.
 
-Следующие шаги: API-only Host/P1/P2 PE/reference → binary-unit RED/GREEN → наш NativeHost+два настоящих native Peer на dgram → configured gateway WS/polling → реальный guest x86 COM Host+два native Peer на новом coherent frontend. Проверять шесть SendTo направлений, роли/metadata/contexts, P2 Close и живой Host↔P1, затем P1 и Host Close, actual ports/PIDs. Агент сейчас создаёт только ignored candidate, никаких Native запусков ещё не разрешено.
+Следующие шаги: API-only Host/P1/P2 PE/reference → binary-unit RED/GREEN → наш NativeHost+два настоящих native Peer на dgram → configured gateway WS/polling → реальный guest x86 COM Host+два native Peer на новом coherent frontend. Проверять шесть SendTo направлений, роли/metadata/contexts, P2 Close и живой Host↔P1, затем P1 и Host Close, actual ports/PIDs. Ignored candidate собран и измерен единственным Native baseline j4f0e6d:599 checks/1198 words, nonce3001001, actual ports55230..55232 retired. Host19932/P126308/P234652 exit0, forced=false, все14 source guards неизменны. verified.json6cb16f07… и PE4ea595ed… зафиксированы выше. Наш Host с двумя remote пока не реализован и не проверен; следующая реализация только после снятия текущего freeze30 HOLD.
 
 Сохранять bounded all-recipient reservations до mutation, owner callback return gates, C3/reply ReturnBuffer once, admission epoch, snapshot/catch-up и reentrant Close/reset. C7/C8/E2/E3 failure arbitration, churn/wrap, группы, migration и security требуют отдельных наблюдений.
 
