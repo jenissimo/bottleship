@@ -10,11 +10,11 @@
 - **Freeze31:2743inputs**, source.json SHA45609bf4161ac20799e4969ca1b647688cc6e8d37ed00399beeb5f63320c134c. capture-source.ts SHAce580fee…. После build inventory/bytes ещё раз unchanged. Теперь source MAIN HOLD31.
 - **Build j976533 EXIT0**, явный VITE_SIDECAR_PORT3003. Log build-stage31-sidecar3003.log SHA25b776bad6bd605f5d1be7ddef6a8ec42c706f605a84f0db1ff385932bf7f0c4; saved job1e2d5af3….
 - Старый own preview j38f28c штатно остановлен Root перед build; **новый own preview5176 job j039c33**. Сохранять dev5175 j1d0d62, sidecar3003, Chrome9334, прежние tabs246B…/FE792…. Новых proof tabs ещё нет.
-- **Следующий шаг:** production26: старые70fixtures/20198DWORD плюс retained SAMEPE UDP6168+976 → **72fixtures/27342observations**. /root/winsock готовит ignored prepare/prove26 scripts (не менять frozen maintained inputs); Root ещё должен выполнить maintained packaging двух PE, проверить actual frontend entry/servedasset hashes, открыть exact owned lan-production-26 tab и один boundedstaticrun. Затем connectedSetPeerInfo Host/Peer×WS/poll и свежий Q2 cohort с новымиIDs. Native/compiler повтор не нужен для retained PE.
+- **Следующий шаг:** production26: старые70fixtures/20198DWORD плюс retained SAMEPE UDP6168+976 → **72fixtures/27342observations**. Maintained packaging уже GREEN **jcc2352 EXIT0**, без compiler/native повторов: stage31-udp-connreset-prepared/portable/build.json SHA8ae685dcec6b3f0145140e1b3db79d25437c92a9c97f7df976e5ab2c949f6d05; effect/build.json SHAc9de884cb10449ea7edf86993d0ed3a558bee6d13dd3cd613392f8b6ce0c9f9b. Actual built entry **/assets/index-nZSJHsUK.js**, SHA885307cd927cd05494a7a5a61d38013a72d2a9b8933e8b8f5912281acc8200bd, encoded sidecar3003; integration-31/built-entry.json SHAe7b8a09f839239da2eda89a289d10a365e09cf9bd891db59a08a65d30a42f582. HTTP/browser checks ещё не выполнены. /root/winsock завершил ignored prepare/prove26 authoring, syntax-only j65487b EXIT0; prepare SHA b3c9b80cc9572465f738aced07426f345ff140ede4c1853e0b819cf569e76cb7, prove SHA a71a0749cde3ba15e28fef4809051169fd0b546382862e44f3cb386d7401fd1e. Команда и pins: logs/lan-conformance/production26-authoring/README.md. Read-only review у /root/directplay; Root готовит bounded exact-ID open/close26. Затем prepare один раз, archive31, HTTP verification, собственная lan-production-26 tab и один bounded static run; далее connectedSetPeerInfo Host/Peer×WS/poll и свежий Q2 cohort с новымиIDs. Всё ещё план, а не browser GREEN.
 - Proper isolated tsc **j7ba3df EXIT0**, source25/25 неизменны до/после; старый212diagnostics jdf47bf был отсутствующим nesteddependency setup, сохранился какinfraRED. HOLD-3 manifest isolated UDP SHA52fa4fc2db39b1e4a0272e1033ae3facbd6b3c94093d3677be381aa7a5d35dd3.
 - **DP mesh НЕ интегрирован.** Isolated134/0/68451assert/15files manifest5a9614c9… сохраняется, однако read-only error-contract addendum e952501d487c17a4c5abd7f72e626c02dfa8f9086526a5798514a2e9f7814045 доказал: NT5 child-send error ignore/continue, wholeHostclose consistency policy не подтверждает parity. Нужно faithful pre/post-commit outcome handling; не объявлять этот134GREEN завершением. C7/C8 — newcomer failure arbitration (не version-gap repair); ntoplist буферит versiongap, C9/CA/history и CB/CCmigration — отдельные механизмы.
 - /root/lan_transport готовит только ignored BunHost+2WindowsPeer interop в DPtree, immutable PE4ea595ed…/nonce3001001/ports55230..32; сравнение реальных native436+300words и отдельныйactualHostAPIaudit, без синтетическихHostCOM462. ActualNative/browser ещё не запускать параллельно Root proof.
-- C: свободно около1.26GB, G:896GB. Старые RED/archives не удалять; при новых runtime archives учитывать дублирование больших assets.
+- На последней проверке C: свободно около7.8GB, G:896GB; перед большими копиями проверить заново. Старые RED/archives не удалять; при новых runtime archives учитывать дублирование больших assets.
 
 ## История игрового этапа перед stage31
 
@@ -135,6 +135,37 @@ Cleanup: Peer перед Host, обычная попытка disconnect/quit, se
 - DirectPlay native wire и виртуальный guest-room protocol — разные backend. Сохранять actual native C2/D0/C6/C4/D1 и callback/lifetime правила, не заменять их собственной совместимой лишь между гостями схемой.
 
 ## Метод работы и ораклы
+
+### Что именно передаём следующему агенту
+
+Подход: воспроизводим наблюдаемую машину состояний Windows на общем владельце ресурса; каждое утверждение связываем с независимым доказательством. Наличие экспорта, unit GREEN, native wire interop и настоящая игра — разные утверждения. Следующий агент продолжает самый ранний недоказанный переход, сохраняя уже проверенные inputs и первые неудачи.
+
+| Уровень | Оракул и обязательные наблюдения | Что этот уровень подтверждает |
+| --- | --- | --- |
+| ABI и validation | Windows headers/source + public API probe: layouts, calling convention, bad pointer, capacity, output sentinel, LastError | Контракт конкретного вызова и конкретного compatibility profile |
+| Состояние и lifetime | Native alias/Close/cleanup/reset/overlapped/completion probes; callback context, buffer ownership и момент публикации | Физический ресурс, дескрипторы и pending operations ведут себя как измеренный Windows |
+| Actor/process/Worker | Реальный Worker/SAB/namespace путь, source/owner epochs, duplicate/import и отрицательные controls | Семантика сохраняется при настоящей межпроцессной доставке и teardown |
+| DirectPlay wire | NT5 source + записанные native datagrams + настоящий Windows COM peer, роли и все направления SendTo | Совместимость измеренного provider/wire сценария; взаимное согласие двух наших engines недостаточно |
+| Production transport | Тот же PE/reference на одном source freeze и проверенных actual entry/HTTP assets; WebSocket и polling отдельно | Сценарий прошёл в собранном эмуляторе на указанном Rust-сервере и транспорте |
+| Игра | Неизменённый игровой PE, настоящий сетевой status, advancing guest/canvas frames, просмотр screenshots, bounded cleanup | Названная игровая сессия действительно работала в пределах сохранённого окна |
+| Производительность | Заданный одинаковый workload, сырые latency/throughput/CPU/memory, N, median/spread и условия | Только измеренные характеристики этой нагрузки; Rust сам по себе не доказывает скорость |
+
+Оракул проверяет результат независимо от исправляемого кода. Нельзя получать expected из того же TypeScript encoder/state machine, который проверяем, заполнять счётчики значениями requested/expected или принимать отсутствие exception за выполнение всех обещанных операций. Для callback ordering различать обязательную причинную связь и случайный порядок независимых threads.
+
+Минимальная карточка нового механизма, которую агент сохраняет рядом с подробным manifest:
+
+    Контракт: входы, выходы, ошибки, порядок validation/publication, владелец состояния.
+    Источник: путь/линии/версия Windows; отдельно факт, гипотеза и принятое решение.
+    Оракул: source/schema/compiler/PE/ref SHA, nonce, args, endpoints, raw capture.
+    RED: первый новый каталог и job, точное расхождение и пройденные controls.
+    Изменение: общий механизм и файлы; epochs, aliases, callback/buffer ownership.
+    GREEN: focused/related/gate и отдельные production/native/game proofs с hashes.
+    Границы: исключения, UNVERIFIED, что результат не измерял, следующий шаг.
+    Продолжение: команда, новый output, preconditions, owned jobs/PIDs/tabs и cleanup.
+
+Классификация неудачи: NATIVE_MISMATCH — измеренное расхождение с валидным native reference; API_NOT_REACHED — prerequisite не дал добраться до API; INFRASTRUCTURE_FAILURE — зависимости/transport/tool process; UNVERIFIED — измерения ещё нет. Если причины ещё не разделены, записать неопределённость и диагностический шаг. Ни один из этих статусов не превращается в GREEN уменьшением числа observations, обновлением expected, silent skip или ростом timeout.
+
+Работа параллельных агентов заканчивается барьером: каждый сдаёт стабильные hashes, список файлов, RED/GREEN, ограничения и отсутствие своих активных proof jobs. Root делает независимый review, переносит только согласованные файлы, запускает общий gate и фиксирует один coherent source/build. Собирать общий результат из разных source freezes нельзя. Main HOLD относится к maintained source; ignored orchestration и документация могут продолжаться с собственными pins.
 
 ### Источники истины
 
