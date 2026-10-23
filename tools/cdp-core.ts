@@ -278,11 +278,56 @@ export class CdpSession {
         };
     }
 
-    static connect(wsUrl: string): Promise<CdpSession> {
+    /** Acquisition-only ownership. Defaults remain unbounded for legacy callers.
+     * A timeout/abort retires the raw socket even before its WebSocket handshake
+     * completes. After success, the caller owns the session and these options no
+     * longer govern it. */
+    static connect(wsUrl: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CdpSession> {
+        const signal = opts.signal, timeoutMs = opts.timeoutMs;
+        if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("CDP ws acquisition aborted", "AbortError"));
+        if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 0x7fffffff)) {
+            return Promise.reject(new RangeError("CDP acquisition timeout must be finite, positive and at most 2147483647ms"));
+        }
         return new Promise((resolve, reject) => {
             const ws = new WebSocket(wsUrl);
-            ws.onopen = () => resolve(new CdpSession(ws));
-            ws.onerror = (e) => reject(new Error(`CDP ws connect failed: ${String((e as any)?.message ?? e)}`));
+            let settled = false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const closeSocket = () => { try { ws.close(); } catch { /* own connection already retired */ } };
+            const cleanup = () => {
+                if (timer !== undefined) clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+            };
+            const failed = (error: unknown) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                // A queued late open may arrive after cancellation. It may only
+                // close the retired socket; it must never publish a live session.
+                ws.onopen = closeSocket;
+                ws.onerror = () => {};
+                ws.onclose = null;
+                closeSocket();
+                reject(error);
+            };
+            const onAbort = () => failed(signal?.reason ?? new DOMException("CDP ws acquisition aborted", "AbortError"));
+            ws.onopen = () => {
+                if (settled) { closeSocket(); return; }
+                if (signal?.aborted) { onAbort(); return; }
+                const session = new CdpSession(ws);
+                settled = true;
+                cleanup();
+                ws.onopen = null;
+                ws.onerror = () => {};
+                ws.onclose = null;
+                resolve(session);
+            };
+            ws.onerror = (e) => failed(new Error("CDP ws connect failed: " + String((e as any)?.message ?? e)));
+            ws.onclose = () => failed(new Error("CDP ws closed before acquisition completed"));
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) { onAbort(); return; }
+            if (timeoutMs !== undefined) timer = setTimeout(() => {
+                failed(new DOMException("CDP ws acquisition timed out after " + timeoutMs + "ms", "TimeoutError"));
+            }, timeoutMs);
         });
     }
 
