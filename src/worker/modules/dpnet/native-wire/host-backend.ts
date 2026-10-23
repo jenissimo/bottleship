@@ -59,7 +59,8 @@ export class NativeHostBackend implements DirectPlay8Backend {
         if (this.disposed) return DPN.INVALIDOBJECT;
         if (this.pending) return DPN.CONNECTING;
         if (this.desc) return DPN.HOSTING;
-        if (desc.maxPlayers !== 2 || (desc.extended?.flags ?? 0)) return DPN.UNSUPPORTED;
+        if (desc.extended?.flags ?? 0) return DPN.UNSUPPORTED;
+        if (!Number.isInteger(desc.maxPlayers) || desc.maxPlayers < 0 || desc.maxPlayers > 0xffffffff) return DPN.INVALIDPARAM;
         this.closing = false; this.lost = false;
         const generation = ++this.generation, controller = new AbortController(); this.pending = controller;
         let port: NativeDirectPlayPort | undefined, offered: DirectPlay8HostReady | undefined;

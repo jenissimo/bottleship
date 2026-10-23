@@ -1,4 +1,11 @@
 export const NATIVE_CORE_MAX_MESSAGE = 1024 * 1024;
+/** A valid full snapshot exceeds this implementation's finite output budget. */
+export class NativeCoreSnapshotCapacityError extends RangeError {
+    constructor(readonly size: number) {
+        super("Core snapshot exceeds message bound");
+        this.name = "NativeCoreSnapshotCapacityError";
+    }
+}
 export interface NativePlayerConnectInfo {
     flags: number; version: number; instance: string; application: string;
     name: string | null; data: Uint8Array; password: string | null; connectData: Uint8Array; url: string | null; alternate: Uint8Array;
@@ -95,7 +102,7 @@ export function encodeNativeCoreConnectInfo(info: NativeCoreConnectInfo): Uint8A
     }
     if (info.members.some(m => [m.player, m.group, m.version, m.unused].some(n => !uint(n)))) throw new RangeError("Invalid membership fields");
     const size = fixed + fields.reduce((n, f) => n + f.bytes.length, 0);
-    if (size + 4 > NATIVE_CORE_MAX_MESSAGE) throw new RangeError("Core snapshot exceeds message bound");
+    if (size + 4 > NATIVE_CORE_MAX_MESSAGE) throw new NativeCoreSnapshotCapacityError(size + 4);
     const out = new Uint8Array(size + 4), view = new DataView(out.buffer), set = (offset: number, value: number) => view.setUint32(4 + offset, value, true);
     view.setUint32(0, 0xc2, true); [80, a.flags, a.maxPlayers, a.players].forEach((n, i) => set(8 + i * 4, n));
     out.set(Uint8Array.from(a.instance.match(/../g)!, b => parseInt(b, 16)), 60);

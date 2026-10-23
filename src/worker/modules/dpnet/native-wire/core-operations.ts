@@ -81,3 +81,23 @@ export function encodeNativeCoreRequest(command: number, handle: number, words: 
     for (const blob of blobs) if (blob.data.length) { tail -= blob.data.length; out.set(blob.data, 8 + tail); view.setUint32(8 + blob.field, tail, true); view.setUint32(12 + blob.field, blob.data.length, true); }
     return out;
 }
+
+/** NT5 PackEntryInfo for ADD_PLAYER; offsets are relative to the 48-byte body. */
+export function encodeNativePlayerAdded(entry: NativeNameTableEntry): Uint8Array {
+    const fields = [entry.id, entry.owner, entry.flags, entry.version, entry.unused, entry.coreVersion];
+    if (fields.some(n => !Number.isInteger(n) || n < 0 || n > 0xffffffff) ||
+        (entry.url !== null && (entry.url.includes("\0") || [...entry.url].some(ch => ch.charCodeAt(0) > 255))))
+        throw new RangeError("Invalid player entry");
+    const blobs = [nativeCoreWide(entry.name), entry.data,
+        entry.url === null ? new Uint8Array() : Uint8Array.from([...entry.url].map(ch => ch.charCodeAt(0)).concat(0))];
+    const size = 48 + blobs.reduce((n, b) => n + b.length, 0);
+    if (size + 4 > NATIVE_CORE_MAX_MESSAGE) throw new RangeError("Player entry exceeds core bound");
+    const out = new Uint8Array(size + 4), view = new DataView(out.buffer);
+    out.set(nativeCoreWords(0xd0, ...fields, 0, 0, 0, 0, 0, 0));
+    let tail = size;
+    for (let i = 0; i < blobs.length; i++) if (blobs[i].length) {
+        tail -= blobs[i].length; out.set(blobs[i], 4 + tail);
+        view.setUint32(28 + i * 8, tail, true); view.setUint32(32 + i * 8, blobs[i].length, true);
+    }
+    return out;
+}
