@@ -1,0 +1,15 @@
+[package]
+name = "bottleship-lan-gateway"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+bottleship-lan-core = { path = "../core" }
+bottleship-lan-native = { path = "../native" }
+bytes = "=1.12.1"
+tokio = { version = "=1.53.2", features = ["rt", "macros", "sync", "time"] }
+
+socket2 = "=0.6.5"

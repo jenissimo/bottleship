@@ -1,7 +1,9 @@
 import { DirectPlaySession, DP, type SessionDesc, type Entity, type JoinRequest, type JoinDecision, type Reply, type Address } from "../dplayx/session";
 import type { LanNetwork } from "../../net/lan-network";
 import { DPN } from "./constants";
-import type { DirectPlay8Backend } from "./backend";
+import type { DirectPlay8Backend, DirectPlay8HostProvider } from "./backend";
+import { NativeHostBackend } from "./native-wire/host-backend";
+import type { NativeHostDecision, NativeHostJoin } from "./native-wire/host";
 import { NativeDirectPlayCore } from "./native-wire/core";
 
 export type DirectPlay8Role = "peer" | "client" | "server";
@@ -47,9 +49,10 @@ export class DirectPlay8Session {
     private eventBytes = 0;
     private eventRetry?: ReturnType<typeof setTimeout>;
     private overflow = false;
-    get pendingLocalProcessing(): number { return this.engine instanceof NativeDirectPlayCore ? this.engine.pendingLocalProcessing : this.localProcessed.size; }
+    get pendingLocalProcessing(): number { return this.engine.pendingLocalProcessing ?? this.localProcessed.size; }
     get pendingEventCount(): number { return this.events.length; }
     onIndicate?: (request: JoinRequest) => JoinDecision | Promise<JoinDecision>;
+    onNativeIndicate?: (request: NativeHostJoin) => NativeHostDecision | Promise<NativeHostDecision>;
     private known = new Map<number, Entity>();
     private previousDesc = "";
     private creatingGroups: { context: number; assigned: boolean }[] = [];
@@ -108,6 +111,24 @@ export class DirectPlay8Session {
         if (created.hr || !created.id) { this.engine.close(); return dp8Result(created.hr); }
         this.localId = created.id; this.contexts.set(created.id, context); this.sync(); return DPN.OK;
     }
+    async hostNative(desc: SessionDesc, context: number, provider: DirectPlay8HostProvider, port = 0, caps = [20, 0, 200, 14, 25000]): Promise<number> {
+        if (!this.initialized) return DPN.UNINITIALIZED;
+        if (this.connecting) return DPN.CONNECTING;
+        if (this.engine.desc) return this.engine.isHost ? DPN.HOSTING : DPN.ALREADYCONNECTED;
+        if (this.role !== "peer") return DPN.UNSUPPORTED;
+        const generation = ++this.generation; this.localClosing = false; this.connecting = true; this.suppress = true;
+        if (this.engine !== this.virtualProvider) this.engine.dispose();
+        const backend = new NativeHostBackend(this.network, Math.max(1, caps[4]), Math.max(1, caps[2]));
+        this.attach(backend);
+        const result = await backend.start(desc, { name: this.localInfo.name, data: Uint8Array.from(this.localInfo.data) }, provider, port,
+            request => this.onNativeIndicate?.(request) ?? { hr: DPN.HOSTREJECTEDCONNECTION },
+            (id, value) => { if (this.engine === backend && generation === this.generation) this.contexts.set(id, typeof value === "number" ? value : 0); },
+            value => { if (this.engine === backend && !this.disposed) this.emit({ type: 0xf, context: typeof value === "number" ? value : 0 }); });
+        if (generation !== this.generation || this.engine !== backend) return DPN.USERCANCEL;
+        this.connecting = false; this.suppress = false;
+        if (!result) { this.localId = backend.localId; this.contexts.set(this.localId, context); this.sync(); }
+        return result;
+    }
     async connect(desc: SessionDesc, context = 0, data = new Uint8Array()): Promise<number> {
         if (!this.initialized) return DPN.UNINITIALIZED;
         if (this.role === "server") return DPN.INVALIDPARAM;
@@ -164,7 +185,7 @@ export class DirectPlay8Session {
         if (this.error) return this.error;
         if (!this.localId || (to && !this.engine.entities.has(to))) return DPN.INVALIDPLAYER;
         const localDelivery = () => delivered?.({ firstFrameRtt: 0, firstFrameRetries: 0, flags: flags & 8 ? 1 : 0 });
-        if (this.engine instanceof NativeDirectPlayCore) return this.engine.sendDpn(to, flags, data, signal, to === this.localId ? localDelivery : undefined, completedLocal);
+        if (this.engine.sendDpn) return this.engine.sendDpn(to, flags, data, signal, to === this.localId ? localDelivery : undefined, completedLocal);
         if (flags & 4) {
             const target = this.engine.entities.get(to);
             const recipients = !to ? [...this.engine.entities.values()].filter(e => !e.group).map(e => e.id) : target!.group ? target!.members : [to];

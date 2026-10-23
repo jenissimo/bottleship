@@ -534,3 +534,54 @@ test("reset during external EnumHosts DNS resolution cannot bind a socket or que
     api.reset(); finish({ addresses: [{ family: 4, address: "198.18.0.61" }] });
     expect((await pending).value).toBe(DPN.USERCANCEL); expect(network.isBound(2302, PROTO_UDP)).toBe(false); expect(calls.length).toBe(0);
 });
+
+function nativeHostCall() {
+    initialize(); network.attach({ send: () => true, close() {} });
+    network.configureDirectPlay8({ provider: "native", hostListener: "test-host" });
+    const device = new DirectPlayAddress(); device.setGuid("provider", DP8_TCPIP); device.setDword("port", 2308);
+    write(0x2000, addresses.create(device)); write(0x4000, 72); write(0x4028, 2); ram.set(guidBytes(DP8_PEER), 0x4018);
+    let opened = 0, released = 0, finish!: (lease: any) => void;
+    const lease = { address: { node: [2,1,127,0,0,1], port: 45001 }, allowedNodes: [[2,1,127,0,0,1]],
+        isLive: () => true, closed: new Promise<never>(() => {}), release() { released++; } };
+    network.openUdpHost = (port, id, signal) => {
+        expect(port).toBe(2308); expect(id).toBe("test-host"); expect(signal?.aborted).toBe(false); opened++;
+        return new Promise(resolve => finish = resolve);
+    };
+    const result = call("Host", [0x4000, 0x2000, 1, 0, 0, 0x5678, 0]);
+    return { result, finish: () => finish(lease), get opened() { return opened; }, get released() { return released; } };
+}
+test("explicit native COM Host waits for READY and starts CREATE only through the issuing owner continuation", async () => {
+    const own = ram, h = nativeHostCall(); expect(h.opened).toBe(1); expect(calls).toEqual([]);
+    expect(network.isBound(2308, PROTO_UDP)).toBe(true);
+    ram = new Uint8Array(own.length).fill(0xa5); h.finish();
+    const result = await h.result as ThunkResult;
+    expect(result.resumeOnOwner).toBeFunction(); expect(calls).toEqual([]);
+    expect(ram.every(n => n === 0xa5)).toBe(true);
+    ram = own;
+    const owner = result.resumeOnOwner!({ esp: 0x9000, returnAddr: 0x7100, mem: ram }) as ThunkResult;
+    expect(owner.value).toBe(DPN.GENERIC); expect(calls).toEqual([]);
+    expect(owner.startCallbackChain!({ esp: 0x9000, returnAddr: 0x7100, mem: ram })).toBe(true);
+    const invocation = calls.at(-1)!; expect(invocation.args[1]).toBe(0xffff0007);
+    const msg = invocation.args[2], id = read(msg + 4); expect(read(msg)).toBe(12); expect(read(msg + 8)).toBe(0x5678);
+    write(msg + 8, 0x4321); expect(invocation.done(0)).toBe(0);
+    expect(call("GetPlayerContext", [id, 0x3400, 0])).toBe(0); expect(read(0x3400)).toBe(0x4321);
+    write(0x3400, 1); expect(call("GetLocalHostAddresses", [0x3500, 0x3400, 0])).toBe(0);
+    const address = addresses.address(read(0x3500))!; expect(address.text("hostname")).toBe("127.0.0.1"); expect(address.dword("port")).toBe(45001);
+    api.reset(); expect(h.released).toBe(1);
+});
+test("native Host READY rejection returns a failure without CREATE or virtual session fallback", async () => {
+    const h = nativeHostCall(); expect(h.opened).toBe(1);
+    network.setConnected(false, "listener unavailable"); h.finish();
+    const result = await h.result as ThunkResult;
+    const owner = result.resumeOnOwner!({ esp: 0x9000, returnAddr: 0x7100, mem: ram });
+    expect(typeof owner === "number" ? owner : owner.value).not.toBe(0); expect(calls).toEqual([]);
+    expect(h.released).toBe(1); expect(network.isBound(2308, PROTO_UDP)).toBe(false);
+});
+test("old native Host completion cannot allocate callbacks after API or process reset", async () => {
+    const h = nativeHostCall(); expect(h.opened).toBe(1); api.reset(); (process as any).resetGeneration++;
+    const next = new Uint8Array(ram.length).fill(0xa5); ram = next; h.finish();
+    const result = await h.result as ThunkResult;
+    const owner = result.resumeOnOwner!({ esp: 0x9000, returnAddr: 0x7100, mem: ram });
+    expect(typeof owner === "number" ? owner : owner.value).toBe(DPN.USERCANCEL);
+    expect(calls).toEqual([]); expect(ram.every(n => n === 0xa5)).toBe(true); expect(h.released).toBe(1);
+});

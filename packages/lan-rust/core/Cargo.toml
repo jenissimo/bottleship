@@ -1,0 +1,12 @@
+[package]
+name = "bottleship-lan-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+description = "Ordered protocol-v1 state machine for BottleShip LAN"
+
+[dependencies]
+bytes = "=1.12.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"

@@ -1,0 +1,1281 @@
+{
+  "reference": "packages/lan/src/protocol.ts",
+  "generationOmittedIsLegacy": true,
+  "frames": [
+    {
+      "name": "short-0",
+      "length": 0,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-1",
+      "length": 1,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-2",
+      "length": 2,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-3",
+      "length": 3,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-4",
+      "length": 4,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-5",
+      "length": 5,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-6",
+      "length": 6,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-7",
+      "length": 7,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-8",
+      "length": 8,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-9",
+      "length": 9,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-10",
+      "length": 10,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-11",
+      "length": 11,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "short-12",
+      "length": 12,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 1,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 0
+      }
+    },
+    {
+      "name": "short-13",
+      "length": 13,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 1,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 1
+      }
+    },
+    {
+      "name": "short-14",
+      "length": 14,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 1,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 2
+      }
+    },
+    {
+      "name": "maximum-0",
+      "length": 560,
+      "prefix": [
+        2,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 0,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 548
+      }
+    },
+    {
+      "name": "oversize-0",
+      "length": 561,
+      "prefix": [
+        2,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-1",
+      "length": 65519,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 1,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 65507
+      }
+    },
+    {
+      "name": "oversize-1",
+      "length": 65520,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-2",
+      "length": 65519,
+      "prefix": [
+        2,
+        2,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 2,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 65507
+      }
+    },
+    {
+      "name": "oversize-2",
+      "length": 65520,
+      "prefix": [
+        2,
+        2,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-3",
+      "length": 65519,
+      "prefix": [
+        2,
+        3,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 3,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 65507
+      }
+    },
+    {
+      "name": "oversize-3",
+      "length": 65520,
+      "prefix": [
+        2,
+        3,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-4",
+      "length": 65539,
+      "prefix": [
+        2,
+        4,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 4,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 65527
+      }
+    },
+    {
+      "name": "oversize-4",
+      "length": 65540,
+      "prefix": [
+        2,
+        4,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-5",
+      "length": 65519,
+      "prefix": [
+        2,
+        5,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 5,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 9000,
+        "srcPort": 2000,
+        "payloadLength": 65507
+      }
+    },
+    {
+      "name": "oversize-5",
+      "length": 65520,
+      "prefix": [
+        2,
+        5,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-6",
+      "length": 65552,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 65540
+      }
+    },
+    {
+      "name": "oversize-6",
+      "length": 65553,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-7",
+      "length": 65552,
+      "prefix": [
+        2,
+        7,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 7,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 65540
+      }
+    },
+    {
+      "name": "oversize-7",
+      "length": 65553,
+      "prefix": [
+        2,
+        7,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "maximum-8",
+      "length": 65519,
+      "prefix": [
+        2,
+        8,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "oversize-8",
+      "length": 65520,
+      "prefix": [
+        2,
+        8,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "raw-flags-0",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        0,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-flags-1",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        1,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-flags-2",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-flags-3",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        3,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-flags-4",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        4,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "raw-ttl--2",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        254,
+        255,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "raw-ttl--1",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        255,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-ttl-0",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        0,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-ttl-255",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        255,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": {
+        "proto": 6,
+        "node": [
+          2,
+          0,
+          0,
+          0,
+          0,
+          1
+        ],
+        "dstPort": 2,
+        "srcPort": 256,
+        "payloadLength": 6
+      }
+    },
+    {
+      "name": "raw-ttl-256",
+      "length": 18,
+      "prefix": [
+        2,
+        6,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        2,
+        1,
+        0,
+        1,
+        2,
+        0,
+        1,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "ipx-needs-two-metadata-bytes",
+      "length": 13,
+      "prefix": [
+        2,
+        0,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "zero-dst",
+      "length": 12,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "zero-src",
+      "length": 12,
+      "prefix": [
+        2,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0,
+        1,
+        0,
+        0
+      ],
+      "fill": 0,
+      "expected": null
+    },
+    {
+      "name": "wrong-kind",
+      "length": 12,
+      "prefix": [
+        3,
+        1,
+        2,
+        0,
+        0,
+        0,
+        0,
+        1,
+        35,
+        40,
+        7,
+        208
+      ],
+      "fill": 0,
+      "expected": null
+    }
+  ],
+  "generations": [
+    {
+      "value": null,
+      "valid": false
+    },
+    {
+      "value": 0,
+      "valid": false
+    },
+    {
+      "value": 1,
+      "valid": true
+    },
+    {
+      "value": -1,
+      "valid": false
+    },
+    {
+      "value": 1.5,
+      "valid": false
+    },
+    {
+      "value": 4294967295,
+      "valid": true
+    },
+    {
+      "value": 4294967296,
+      "valid": false
+    }
+  ]
+}

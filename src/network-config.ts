@@ -1,6 +1,8 @@
+export interface DirectPlay8NetworkPolicy { provider: "native"; hostListener: string }
 export interface NetworkConfig {
   serverUrl: string;
   room: string;
+  directPlay8?: DirectPlay8NetworkPolicy;
 }
 
 export interface NetworkStatus {
@@ -14,7 +16,10 @@ export const NETWORK_SETTINGS_KEY = "bottleship_network_v1";
 export function normalizeNetworkConfig(value: unknown): NetworkConfig | null {
   if (value == null) return null;
   if (typeof value !== "object") throw new Error("Network settings must contain a server URL and room.");
-  const { serverUrl, room } = value as Partial<NetworkConfig>;
+  const { serverUrl, room, directPlay8 } = value as Partial<NetworkConfig>;
+  if (directPlay8 !== undefined && (!directPlay8 || directPlay8.provider !== "native" ||
+      typeof directPlay8.hostListener !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(directPlay8.hostListener)))
+    throw new Error("Native DirectPlay requires a configured UDP Host listener ID.");
   if (typeof serverUrl !== "string" || typeof room !== "string") {
     throw new Error("Enter a LAN server URL and room.");
   }
@@ -31,15 +36,20 @@ export function normalizeNetworkConfig(value: unknown): NetworkConfig | null {
       || url.search || url.hash || url.pathname !== "/") {
     throw new Error("Use an HTTP(S) server address without a path, query or credentials.");
   }
-  return { serverUrl: url.origin, room: name };
+  return { serverUrl: url.origin, room: name, ...(directPlay8 ? {directPlay8: {provider: "native" as const, hostListener: directPlay8.hostListener}} : {}) };
 }
 
 export function networkConfigFromLocation(search: string, saved: NetworkConfig | null): NetworkConfig | null {
   const params = new URLSearchParams(search);
-  if (!params.has("lanServer") && !params.has("room")) return saved;
+  if (!params.has("lanServer") && !params.has("room") && !params.has("dp8Provider") && !params.has("dp8HostListener")) return saved;
+  const provider = params.get("dp8Provider");
+  if (provider !== null && provider !== "native") throw new Error("Invalid DirectPlay provider.");
+  const directPlay8 = params.has("dp8Provider") || params.has("dp8HostListener") ?
+    {provider: "native" as const, hostListener: params.get("dp8HostListener") ?? saved?.directPlay8?.hostListener ?? ""} : saved?.directPlay8;
   return normalizeNetworkConfig({
     serverUrl: params.get("lanServer") ?? saved?.serverUrl,
     room: params.get("room") ?? saved?.room,
+    directPlay8,
   });
 }
 
@@ -52,6 +62,9 @@ export function networkInviteUrl(href: string, config: NetworkConfig | null): st
     url.searchParams.delete("lanServer");
     url.searchParams.delete("room");
   }
+  if (config?.directPlay8) {
+    url.searchParams.set("dp8Provider", "native"); url.searchParams.set("dp8HostListener", config.directPlay8.hostListener);
+  } else { url.searchParams.delete("dp8Provider"); url.searchParams.delete("dp8HostListener"); }
   return url.toString();
 }
 

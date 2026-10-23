@@ -1,0 +1,17 @@
+[package]
+name = "bottleship-lan-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+bytes = "=1.12.1"
+socket2 = "=0.6.5"
+tokio = { version = "=1.53.2", features = ["rt", "macros", "sync", "time", "process", "io-util", "net"] }
+
+[dev-dependencies]
+tokio = { version = "=1.53.2", features = ["rt", "macros", "sync", "time", "process", "io-util", "net", "test-util"] }

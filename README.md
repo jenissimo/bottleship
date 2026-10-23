@@ -82,6 +82,13 @@ Open <http://localhost:5174>.
 
 [Development & self-hosting guide →](docs/development.md)
 
+Multiplayer uses an optional [LAN relay](docs/multiplayer.md) with WebSocket and
+HTTP polling. Virtual DirectPlay remains the default. Experimental native
+DirectPlay 8 hosting requires an explicit provider policy and a configured UDP
+listener; its current backend targets a Host with one remote Peer. See the
+[native Host setup and conformance guide](tools/lan-conformance/directplay8-com-host.md)
+for the supported scope and verification workflow.
+
 ## Import your own games
 
 BottleShip can load:

@@ -12,6 +12,7 @@ import { DirectPlaySendQueue } from "../dplayx/send-queue";
 import type { SessionDesc, Discovery, Address } from "../dplayx/session";
 import { DirectPlay8Session, dp8Result, type DirectPlay8Role } from "./peer";
 import { DirectPlay8Callbacks } from "./callbacks";
+import { lanDirectPlay8HostProvider } from "./lan-host-provider";
 import { DirectPlaySendOperationPool, type DirectPlaySendOperation } from "./send-operations";
 import { NativeDirectPlayDiscovery, type NativeDiscoveryOperation } from "./native-wire/discovery";
 import { isExternalIpv4Node } from "../../net/netplay-wire";
@@ -94,7 +95,8 @@ export class DirectPlay8NetworkApi {
         const desc = state.session.engine.desc; if (!desc) return undefined;
         const address = (value: DirectPlayAddress) => structuredClone({ components: value.components, userData: value.userData });
         const device = state.lobbyDevice?.clone() ?? new DirectPlayAddress();
-        device.setText("hostname", Array.from(this.network.ipv4).join(".")); device.setDword("port", state.session.engine.localAddress.port);
+        const local = state.session.engine.advertisedAddress ?? state.session.engine.localAddress;
+        device.setText("hostname", Array.from(nodeToIpv4(Uint8Array.from(local.node))).join(".")); device.setDword("port", local.port);
         if (!device.guid("provider")) device.setGuid("provider", DP8_TCPIP);
         const remote = state.session.engine.hostAddress;
         return { flags: state.session.engine.isHost ? 1 : 0, desc: structuredClone(desc), players: state.session.engine.currentPlayers,
@@ -196,6 +198,7 @@ export class DirectPlay8NetworkApi {
             s.callbacks = new DirectPlay8Callbacks(this.process, s.session, this.addresses, a[2], a[1]);
             s.callbacks.onSpace = () => s.sends.retryCompletions();
             s.session.onIndicate = request => s.callbacks!.indicate(request);
+            s.session.onNativeIndicate = request => s.callbacks!.indicateNative(request);
             s.session.virtualProvider.onEnumQuery = request => s.callbacks!.query(request);
             const executor = s.callbacks.queue.executor, generation = s.generation;
             return executor.initialized ? executor.ready().then<ThunkResult, ThunkResult>(() => ({ value: generation === s.generation ? DPN.OK : DPN.USERCANCEL }), () => ({ value: DPN.OUTOFMEMORY,
@@ -229,6 +232,29 @@ export class DirectPlay8NetworkApi {
                 if (!address || ![DP8_TCPIP, DP8_IPX].includes(address.guid("provider") ?? "")) return DPN.INVALIDDEVICEADDRESS;
                 if (i) return DPN.INVALIDDEVICEADDRESS;
                 port = address.dword("port") ?? 0;
+            }
+            const provider = lanDirectPlay8HostProvider(this.network);
+            if (provider) {
+                const device = this.addresses.address(Mem.readUint32(a[2])!)!;
+                if (device.guid("provider") !== DP8_TCPIP) return DPN.UNSUPPORTED;
+                s.lobbyDevice = device.clone();
+                const callbacks = s.callbacks!, resume = callbacks.queue.pause(), issuing = { ...ctx };
+                const generation = s.generation, epoch = this.process.resetGeneration, context = a[6];
+                const current = () => generation === s.generation && epoch === this.process.resetGeneration && s.callbacks === callbacks && !s.closing;
+                return s.session.hostNative(desc, context, provider, port, s.caps).then(async result => {
+                    if (current() && !result && s.lobby) await s.lobby.publish(1, this.lobbySettings(s));
+                    if (!current()) resume();
+                    return { value: DPN.GENERIC, resumeOnOwner: () => {
+                        if (!current()) { resume(); return DPN.USERCANCEL; }
+                        const value = result || s.session.error;
+                        if (value) { resume(); return value; }
+                        return { value: DPN.GENERIC, startCallbackChain: frame => {
+                            if (!current()) { resume(); return false; }
+                            const result = callbacks.queue.run({ ...issuing, esp: frame.esp, returnAddr: frame.returnAddr }, 32, value, resume);
+                            return typeof result !== "number" && !!result.suspendedForCallback;
+                        } };
+                    } } satisfies ThunkResult;
+                }).catch(() => { resume(); return { value: DPN.GENERIC, resumeOnOwner: () => current() ? DPN.GENERIC : DPN.USERCANCEL }; });
             }
             const hr = s.session.bindPort(port); if (hr) return hr;
             s.lobbyDevice = this.addresses.address(Mem.readUint32(a[2])!)!.clone();
@@ -324,7 +350,7 @@ export class DirectPlay8NetworkApi {
             if (!this.guest.valid(a[2], 4, "rw")) return DPN.INVALIDPOINTER;
             const count = Mem.readUint32(a[2])!; Mem.writeUint32(a[2], 1);
             if (!count || !a[1]) return DPN.BUFFERTOOSMALL; if (!this.guest.valid(a[1], 4, "rw")) return DPN.INVALIDPOINTER;
-            const ptr = this.addresses.create(this.endpoint(s.session.engine.localAddress)); Mem.writeUint32(a[1], ptr); return ptr ? DPN.OK : DPN.OUTOFMEMORY;
+            const ptr = this.addresses.create(this.endpoint(s.session.engine.advertisedAddress ?? s.session.engine.localAddress)); Mem.writeUint32(a[1], ptr); return ptr ? DPN.OK : DPN.OUTOFMEMORY;
         };
         methods.CreateGroup = (s, a) => {
             if (a[5] & ~SYNC) return DPN.INVALIDFLAGS;

@@ -11,6 +11,7 @@ export class NativeDirectPlayPort implements LanEndpoint {
     readonly maxPeers: number;
     private peers = new Map<string, PeerEndpoint>();
     private ended = false;
+    private incoming?: (packet: LanDatagram) => void;
     private removeState?: () => void;
     private carrierJobs = 0;
     private carrierBytes = 0;
@@ -57,12 +58,18 @@ export class NativeDirectPlayPort implements LanEndpoint {
         this.carrierJobs++; this.carrierBytes += bytes; return true;
     }
     releasePacket(bytes: number): void { this.carrierJobs--; this.carrierBytes -= bytes; }
+    listen(listener: (packet: LanDatagram) => void): boolean {
+        if (!this.live || this.incoming) return false;
+        this.incoming = listener; return true;
+    }
+    stopListening(listener: (packet: LanDatagram) => void): void { if (this.incoming === listener) this.incoming = undefined; }
     deliver(packet: LanDatagram): void {
         if (!this.live) return;
-        this.peers.get(key({ node: Array.from(packet.srcNode), port: packet.srcPort }))?.deliver(packet);
+        const endpoint = this.peers.get(key({ node: Array.from(packet.srcNode), port: packet.srcPort }));
+        if (endpoint) endpoint.deliver(packet); else this.incoming?.(packet);
     }
     close(result: number = DPN.USERCANCEL): void {
-        if (this.ended) return; this.ended = true;
+        if (this.ended) return; this.ended = true; this.incoming = undefined;
         this.removeState?.(); this.removeState = undefined;
         for (const endpoint of [...this.peers.values()]) endpoint.close(result);
         this.peers.clear(); this.network.unbind(this.localPort, this, PROTO_UDP);

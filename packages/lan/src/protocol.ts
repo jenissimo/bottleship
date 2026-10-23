@@ -38,6 +38,8 @@ export interface JoinRequest {
     clientId: string;
     node: number[];
 }
+export * from "./udp-host-protocol";
+import type {UdpHostListenCapability, UdpHostOpenRequest, UdpHostOpenReply} from "./udp-host-protocol";
 export interface GatewayIpv6Address { address: number[]; node: number[]; scopeId?: number }
 export interface LanReady {
     version: number;
@@ -45,6 +47,7 @@ export interface LanReady {
     ipv4: number[];
     gatewayIpv4?: number[][];
     gatewayIpv6?: GatewayIpv6Address[];
+    udpHostListenV1?: UdpHostListenCapability;
 }
 export function validBindingGeneration(value:unknown):value is number{return Number.isInteger(value)&&Number(value)>=1&&Number(value)<=0xffffffff;}
 export interface DecodedDatagram {
@@ -73,6 +76,9 @@ export function validUdpPeerLeaseRequest(value:unknown):value is UdpPeerLeaseReq
         r.node.every(n=>Number.isInteger(n)&&n>=0&&n<=255)&&isExternalNode(Uint8Array.from(r.node));
 }
 export interface ClientEvents {
+    openUdpHost: (id: number, request: UdpHostOpenRequest) => void;
+    cancelUdpHost: (id: number) => void;
+    releaseUdpHost: (leaseId: number) => void;
     frame: (frame: Uint8Array, bindingGeneration?:number) => void;
     releasePort:(proto:number,port:number,bindingGeneration:number)=>void;
     resolve: (id: number, request: ResolveRequest) => void;
@@ -82,6 +88,8 @@ export interface ClientEvents {
     releaseUdpPeer: (leaseId: number) => void;
 }
 export interface ServerEvents {
+    udpHostOpened: (id: number, reply: UdpHostOpenReply) => void;
+    udpHostClosed: (requestId: number, leaseId: number, error: {code: number; message: string}) => void;
     udpPeerLeased: (id: number, reply: UdpPeerLeaseReply) => void;
     resolved: (id: number, reply: ResolveReply) => void;
     ready: (info: LanReady) => void;

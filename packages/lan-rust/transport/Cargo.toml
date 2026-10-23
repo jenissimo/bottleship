@@ -1,0 +1,22 @@
+[package]
+name = "bottleship-lan-transport"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "Apache-2.0"
+[dependencies]
+bottleship-lan-core = { path = "../core" }
+bytes = { version = "=1.12.1", features = ["serde"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+engineioxide = { path = "vendor/engineioxide", default-features = false }
+engineioxide-core = "=0.2.2"
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std"] }
+tokio-util = { version = "0.7.18", features = ["rt"] }
+hyper = { version = "1.9", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1.4"
+http-body-util = "0.1"
+futures-util = { version = "0.3", features = ["sink"] }
+[dev-dependencies]
+tokio-tungstenite = "=0.30.0"

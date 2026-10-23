@@ -9,6 +9,7 @@ import type { DirectPlayAddressApi } from "./address-api";
 import type { DirectPlay8Session, DirectPlay8Event } from "./peer";
 import type { JoinRequest, JoinDecision } from "../dplayx/session";
 import { DPN } from "./constants";
+import type { NativeHostJoin, NativeHostDecision } from "./native-wire/host";
 
 interface ReceiveBuffer { pointer: number; size: number; active: boolean; returned: boolean; release(): void; }
 export class DirectPlay8Callbacks {
@@ -23,6 +24,8 @@ export class DirectPlay8Callbacks {
     private nextBuffer = 1;
     private reservedReceiveCount = 0;
     private reservedReceiveBytes = 0;
+    private nativeAdmissions = new Set<{ cancel(): void }>();
+    private nativeAdmissionBytes = 0;
     private guest: DirectPlayGuestMemory;
     constructor(readonly process: Process, readonly session: DirectPlay8Session, readonly addresses: DirectPlayAddressApi,
         readonly routine: number, readonly userContext: number) {
@@ -38,7 +41,8 @@ export class DirectPlay8Callbacks {
             prepare: () => {
                 const ptr = size ? this.process.memory.alloc(size) : 0;
                 if (size && !ptr) { onDiscard?.(); throw new Error("DirectPlay callback allocation failed"); }
-                if (size) { Mem.writeBytes(ptr, new Uint8Array(size)); Mem.writeUint32(ptr, size); fill(ptr); }
+                try { if (size) { Mem.writeBytes(ptr, new Uint8Array(size)); Mem.writeUint32(ptr, size); fill(ptr); } }
+                catch (error) { if (ptr) this.process.memory.free(ptr); onDiscard?.(); throw error; }
                 let released = false;
                 const free = () => { if (!released && ptr) { released = true; this.process.memory.free(ptr); } };
                 return { routine: this.routine, args: [this.userContext, (0xffff0000 | type) >>> 0, ptr],
@@ -83,6 +87,7 @@ export class DirectPlay8Callbacks {
     close(): void {
         if (this.closed) return; this.closed = true;
         if (this.retry) clearTimeout(this.retry); this.retry = undefined;
+        for (const admission of [...this.nativeAdmissions]) admission.cancel();
         for (const task of this.waiting.splice(0)) task.onDiscard?.(); this.waitingBytes = 0;
         this.queue.close();
         for (const buffer of this.buffers.values()) if (!buffer.active) { this.process.memory.free(buffer.pointer); buffer.release(); }
@@ -98,6 +103,7 @@ export class DirectPlay8Callbacks {
         if (this.closing && event.type === 0x11) return true;
         const id = event.id ?? 0, context = event.context ?? 0;
         if (event.type === 2) return this.native(2, 0);
+        if (event.type === 0xf) return this.native(0xf, 8, ptr => { Mem.writeUint32(ptr + 4, context); });
         if (event.type === 7 || event.type === 6) {
             const group = event.type === 6, size = group ? 20 : 12, contextOffset = group ? 12 : 8;
             return this.native(event.type, size, ptr => {
@@ -142,6 +148,92 @@ export class DirectPlay8Callbacks {
             if (!queued) release(); return queued;
         }
         return false;
+    }
+    private cancelNative(key: object): void {
+        const removed = this.waiting.filter(task => task.key === key);
+        this.waiting = this.waiting.filter(task => task.key !== key);
+        for (const task of removed) { this.waitingBytes -= task.storageBytes!; task.onDiscard?.(); }
+        this.queue.cancelPending(task => task.key === key);
+    }
+    /** All guest outputs are copied at owner callback return; no RAM crosses a Promise. */
+    indicateNative(request: NativeHostJoin): Promise<NativeHostDecision> {
+        const input = request.info.connectData, info = request.info;
+        const bytes = 64 + input.length + info.data.length + info.alternate.length + 2 * ((info.name?.length ?? 0) + (info.password?.length ?? 0) + (info.url?.length ?? 0));
+        if (this.closed || this.closing || request.signal.aborted) return Promise.resolve({ hr: DPN.USERCANCEL });
+        if (this.nativeAdmissions.size >= 16 || bytes > 4 * 1024 * 1024 - this.nativeAdmissionBytes) return Promise.resolve({ hr: DPN.TABLEFULL });
+        return new Promise(resolve => {
+            const epoch = this.process.resetGeneration, indication = {}, returned = {};
+            let resolved = false, finished = false, prepared = false, reply = 0, replyContext = 0;
+            let returnPromise: Promise<void> | undefined, settleReturn: (() => void) | undefined, rejectReturn: (() => void) | undefined;
+            let retry: ReturnType<typeof setTimeout> | undefined;
+            const objects: { release(): number }[] = [];
+            const owner = () => !this.closed && epoch === this.process.resetGeneration;
+            const releaseAddresses = () => { for (const object of objects.splice(0)) object.release(); };
+            const finish = (decision: NativeHostDecision) => { if (!resolved) { resolved = true; resolve(decision); } };
+            const cleanup = () => {
+                if (finished) return; finished = true;
+                if (retry) clearTimeout(retry); retry = undefined;
+                request.signal.removeEventListener("abort", abort); releaseAddresses();
+                if (this.nativeAdmissions.delete(admission)) this.nativeAdmissionBytes -= bytes;
+            };
+            const failReturn = () => { cleanup(); rejectReturn?.(); };
+            const returnOnce = (): Promise<void> => {
+                if (returnPromise) return returnPromise;
+                returnPromise = new Promise<void>((done, reject) => { settleReturn = done; rejectReturn = () => reject(Error("Native reply callback discarded")); });
+                if (!reply) { cleanup(); settleReturn!(); return returnPromise; }
+                const enqueue = () => {
+                    retry = undefined;
+                    if (!owner()) { failReturn(); return; }
+                    const queued = this.native(0x13, 16, ptr => {
+                        Mem.writeUint32(ptr + 4, 0); Mem.writeUint32(ptr + 8, reply); Mem.writeUint32(ptr + 12, replyContext);
+                    }, () => { cleanup(); settleReturn?.(); }, failReturn, returned);
+                    if (!queued) { retry = setTimeout(enqueue, 4); (retry as unknown as { unref?(): void }).unref?.(); }
+                };
+                enqueue(); return returnPromise;
+            };
+            const abort = () => {
+                if (!owner()) {
+                    this.cancelNative(indication); this.cancelNative(returned); cleanup();
+                    finish({ hr: DPN.USERCANCEL }); rejectReturn?.(); return;
+                }
+                if (!resolved) {
+                    this.cancelNative(indication); finish({ hr: DPN.USERCANCEL });
+                    if (!prepared) cleanup();
+                } else { void returnOnce().catch(() => {}); }
+            };
+            const admission = { cancel: abort };
+            this.nativeAdmissions.add(admission); this.nativeAdmissionBytes += bytes;
+            request.signal.addEventListener("abort", abort, { once: true });
+            const queued = this.native(0xe, 36 + input.length, ptr => {
+                prepared = true; Mem.writeUint32(ptr, 36);
+                const remote = new DirectPlayAddress(), device = new DirectPlayAddress();
+                const local = this.session.engine.advertisedAddress ?? this.session.engine.localAddress;
+                remote.buildHost(Array.from(nodeToIpv4(Uint8Array.from(request.address.node))).join("."), request.address.port);
+                device.buildHost(Array.from(nodeToIpv4(Uint8Array.from(local.node))).join("."), local.port);
+                const player = this.addresses.create(remote), localDevice = this.addresses.create(device);
+                for (const pointer of [player, localDevice]) {
+                    const object = SystemResourceProvider.getInstance().getComObjectByAddress(pointer);
+                    if (object) objects.push(object);
+                }
+                if (!player || !localDevice) throw Error("Native admission address allocation failed");
+                Mem.writeUint32(ptr + 4, input.length ? ptr + 36 : 0); Mem.writeUint32(ptr + 8, input.length);
+                Mem.writeUint32(ptr + 28, player); Mem.writeUint32(ptr + 32, localDevice); Mem.writeBytes(ptr + 36, input);
+            }, (hr, ptr) => {
+                if (!owner()) { cleanup(); finish({ hr: DPN.USERCANCEL }); return; }
+                try {
+                    reply = Mem.readUint32(ptr + 12)!; const size = Mem.readUint32(ptr + 16)!;
+                    replyContext = Mem.readUint32(ptr + 20)!; const context = Mem.readUint32(ptr + 24)!;
+                    const valid = size <= 60000 && (!size || this.guest.valid(reply, size));
+                    const data = valid && size ? Mem.readBytes(reply, size)!.slice() : new Uint8Array();
+                    releaseAddresses();
+                    const decision: NativeHostDecision = { hr: valid ? hr : DPN.HOSTREJECTEDCONNECTION, data, context,
+                        returnBuffer: returnOnce, release: () => { void returnOnce().catch(() => {}); } };
+                    if (request.signal.aborted || resolved) { void returnOnce().catch(() => {}); finish({ hr: DPN.USERCANCEL }); }
+                    else { finish(decision); if (!reply) cleanup(); }
+                } catch { cleanup(); finish({ hr: DPN.HOSTREJECTEDCONNECTION }); }
+            }, () => { cleanup(); finish({ hr: DPN.USERCANCEL }); }, indication);
+            if (!queued) { cleanup(); finish({ hr: DPN.TABLEFULL }); }
+        });
     }
     query(request: { address: import("../dplayx/session").Address; data: Uint8Array }): Promise<JoinDecision> {
         return new Promise(resolve => {

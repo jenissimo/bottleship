@@ -6,6 +6,9 @@ import {
 export {
     IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD, DIRECTPLAY_MAX_PAYLOAD, ipv4ToNode, nodeToIpv4,
 } from "./netplay-wire";
+import { copyUdpHostCapability, copyUdpHostReady, type UdpHostListenCapability, type UdpHostOpenRequest, type UdpHostReady } from "./netplay-wire";
+import type { UdpHostLease } from "./udp-host-lease-rpc";
+import type { DirectPlay8NetworkPolicy } from "../../network-config";
 import { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
 export { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
 export const IPX_NETNUM = new Uint8Array([0, 0, 0, 1]);
@@ -22,6 +25,7 @@ export interface NetTransport {
     releasePort?(port:number,proto:number,bindingGeneration:number):void;
     resolve?(request: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>;
     leaseUdpPeer?(request: import("./netplay-wire").UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{ release(): void }>;
+    openUdpHost?(request: UdpHostOpenRequest, signal?: AbortSignal): Promise<UdpHostLease>;
     close(): void;
 }
 export interface LanPortRegistry {
@@ -39,6 +43,8 @@ export interface LanState {
     reason?: string;
     gatewayIpv4?: number[][];
     gatewayIpv6?: GatewayIpv6Address[];
+    udpHostListenV1?: UdpHostListenCapability;
+    directPlay8?: DirectPlay8NetworkPolicy;
 }
 const EPHEMERAL = [[0x4000, 0x7fff], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [1, 256], [1, 256]];
 function randomNode(): Uint8Array {
@@ -63,6 +69,12 @@ export class LanNetwork {
     private online = false;
     private generation = 0;
     private nextSocketId = 1;
+    private hostCapability?: UdpHostListenCapability;
+    private dp8Policy?: DirectPlay8NetworkPolicy;
+    get directPlay8(): DirectPlay8NetworkPolicy | undefined { return this.dp8Policy && {...this.dp8Policy}; }
+    configureDirectPlay8(policy?: DirectPlay8NetworkPolicy): void { this.dp8Policy = policy && {...policy}; }
+    configureUdpHosts(capability?: UdpHostListenCapability): void { this.hostCapability = capability && copyUdpHostCapability(capability); }
+    get udpHostListenV1(): UdpHostListenCapability | undefined { return this.hostCapability && copyUdpHostCapability(this.hostCapability); }
     private readonly pendingUdpLeases = new Set<{ localPort: number; proto: number; abort(): void }>();
     private readonly activeUdpLeases = new Set<{ localPort: number; proto: number; release(): void }>();
     private nextBindingGeneration=1;
@@ -150,7 +162,48 @@ export class LanNetwork {
         if (!this.online || !this.transport) throw new NetResolveError("NETWORK_DOWN");
         if (signal?.aborted) throw new NetResolveError("CANCELLED");
         if (this.pendingUdpLeases.size >= 16 || this.activeUdpLeases.size + this.pendingUdpLeases.size >= 128) throw new NetResolveError("ACCESS_DENIED", "UDP peer lease capacity");
+        return this.withUdpBinding(localPort, proto, signal, (transport, binding, signal) =>
+            isLanNode(node) ? Promise.resolve({release() {}}) :
+                transport.leaseUdpPeer?.({proto, localPort, bindingGeneration: binding, node: Array.from(node), remotePort}, signal) ??
+                    Promise.reject(new NetResolveError("ACCESS_DENIED", "Native UDP peer leases unavailable")));
+    }
+    /** Acquire an acknowledged physical listener for this exact UDP binding. */
+    async openUdpHost(localPort: number, listenerId: string, signal?: AbortSignal): Promise<UdpHostLease> {
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(listenerId) || !validPort(localPort) || !this.bindingGeneration(localPort, 1))
+            throw new NetResolveError("NO_DATA");
+        if (!this.hostCapability?.listeners.some(listener => listener.id === listenerId))
+            throw new NetResolveError("ACCESS_DENIED", "Native UDP Host listener unavailable");
+        const epoch = this.generation, originalBinding = this.bindingGeneration(localPort, 1);
+        const lease = await this.withUdpBinding(localPort, 1, signal, async (transport, binding, signal) => {
+            if (!transport.openUdpHost) throw new NetResolveError("ACCESS_DENIED", "Native UDP Host listeners unavailable");
+            const lease = await transport.openUdpHost({proto: 1, localPort, bindingGeneration: binding, listenerId}, signal);
+            try {
+                if (!lease.isLive()) throw new NetResolveError("CANCELLED");
+                const ready = copyUdpHostReady(lease);
+                const advertised = this.hostCapability?.listeners.find(listener => listener.id === listenerId);
+                if (!advertised || advertised.allowedNodes.length !== ready.allowedNodes.length ||
+                    !ready.allowedNodes.every(node => advertised.allowedNodes.some(other => other.every((v, i) => v === node[i]))))
+                    throw new NetResolveError("NO_RECOVERY", "UDP Host ingress ACL changed");
+                return {...ready, closed: lease.closed, isLive: () => lease.isLive(), release: () => lease.release()};
+            } catch (error) { lease.release(); throw error; }
+        });
+        this.registerGatewayAddresses([lease.address.node.slice(2), ...lease.allowedNodes.map(node => node.slice(2))]);
+        let ended = false;
+        void lease.closed.then(() => { ended = true; lease.release(); });
+        return {...lease,
+            isLive: () => !ended && this.online && this.generation === epoch && this.bindingGeneration(localPort, 1) === originalBinding && lease.isLive(),
+            release: () => { ended = true; lease.release(); }};
+    }
+    private async withUdpBinding<M extends {release(): void}>(localPort: number, proto: number, signal: AbortSignal | undefined,
+        open: (transport: NetTransport, binding: number, signal: AbortSignal) => Promise<M>): Promise<M> {
+        const binding = this.bindingGeneration(localPort, proto);
+        if (!this.online || !this.transport) throw new NetResolveError("NETWORK_DOWN");
+        if (signal?.aborted) throw new NetResolveError("CANCELLED");
+        if (!binding) throw new NetResolveError("NO_DATA");
+        if (this.pendingUdpLeases.size >= 16 || this.activeUdpLeases.size + this.pendingUdpLeases.size >= 128)
+            throw new NetResolveError("ACCESS_DENIED", "UDP binding lease capacity");
         const transport = this.transport, epoch = this.generation, controller = new AbortController();
+        let adopted = false;
         const live = () => !controller.signal.aborted && this.online && this.transport === transport && this.generation === epoch && this.bindingGeneration(localPort, proto) === binding;
         const pending = { localPort, proto, abort: () => controller.abort() };
         this.pendingUdpLeases.add(pending);
@@ -160,19 +213,21 @@ export class LanNetwork {
         const onAbort = () => rejectAbort(new NetResolveError("CANCELLED"));
         controller.signal.addEventListener("abort", onAbort, { once: true });
         try {
-            const ready = (isLanNode(node) ? Promise.resolve({ release() {} }) :
-                transport.leaseUdpPeer?.({ proto, localPort, bindingGeneration: binding, node: Array.from(node), remotePort }, controller.signal) ??
-                    Promise.reject(new NetResolveError("ACCESS_DENIED", "Native UDP peer leases unavailable"))).then(underlying => {
+            const ready = open(transport, binding, controller.signal).then(underlying => {
                 if (!live()) { underlying.release(); throw new NetResolveError("CANCELLED"); }
                 let released = false;
-                const lease = { localPort, proto, release: () => {
-                    if (released) return; released = true; this.activeUdpLeases.delete(lease); try { underlying.release(); } catch { /* Lifetime cleanup remains idempotent after transport loss. */ }
-                } };
-                this.activeUdpLeases.add(lease); return lease;
+                const lease = Object.assign({}, underlying, { localPort, proto, release: () => {
+                    if (released) return; released = true; this.activeUdpLeases.delete(lease);
+                    signal?.removeEventListener("abort", cancel); controller.signal.removeEventListener("abort", lease.release);
+                    try { underlying.release(); } catch { /* Cleanup remains idempotent after transport loss. */ }
+                } });
+                this.activeUdpLeases.add(lease); adopted = true;
+                controller.signal.addEventListener("abort", lease.release, {once: true});
+                return lease;
             });
             return await Promise.race([ready, aborted]);
         } finally {
-            this.pendingUdpLeases.delete(pending); signal?.removeEventListener("abort", cancel);
+            this.pendingUdpLeases.delete(pending); if (!adopted) signal?.removeEventListener("abort", cancel);
             controller.signal.removeEventListener("abort", onAbort);
         }
     }
@@ -193,9 +248,10 @@ export class LanNetwork {
     setConnected(connected: boolean, reason?: string, force = false): void {
         if (!force && this.online === connected) return;
         this.online = connected;
-        if (!connected || force) this.retireUdpLeases();
+        if (!connected || force) { this.retireUdpLeases(); if (!connected) this.hostCapability = undefined; }
         const state: LanState = { connected, node: this.node.slice(), ipv4: this.ipv4, generation: ++this.generation, reason,
-            gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()] };
+            gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()],
+            udpHostListenV1: this.udpHostListenV1, directPlay8: this.directPlay8 };
         for (const listener of this.listeners) listener(state);
     }
     onStateChange(listener: (state: LanState) => void): () => void {

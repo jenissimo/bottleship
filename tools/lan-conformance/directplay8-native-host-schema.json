@@ -1,0 +1,250 @@
+{
+  "status": "binary_schema",
+  "source": {
+    "file": "directplay8-native-host.c",
+    "sha256": "2fa85bd19270c02dcb4b80c422b87407a94d6042479f14b824ea283fd39520b8"
+  },
+  "runner": {
+    "file": "directplay8-native-host.md"
+  },
+  "roles": {
+    "0": "host",
+    "1": "peer"
+  },
+  "modes": {
+    "0": "accept callback S_OK",
+    "1": "reject callback E_FAIL"
+  },
+  "files": {
+    "lan-oracle.bin": {
+      "format": "DWORD little-endian",
+      "header": [
+        "magic=0x42534c4e",
+        "totalWords",
+        "nonce"
+      ],
+      "body": "tag,value pairs; input/output scalar observations; raw pointer/DPNID/timestamps belong in diagnostic files"
+    },
+    "host-progress.bin": {
+      "format": "same BSLN header and prefix as final record",
+      "durability": "written after every main-thread observation"
+    },
+    "callback-events.bin": {
+      "header": [
+        "magic=0x42534845",
+        "version=1",
+        "nonce",
+        "role",
+        "rejectMode",
+        "rowCount",
+        "dropped",
+        "wordsPerRow=20",
+        "phase"
+      ],
+      "row": [
+        "ordinal",
+        "GetTickCount",
+        "threadId",
+        "message",
+        "phase",
+        "dwSize",
+        "subjectDPNID",
+        "contextPointer",
+        "result",
+        "byteCount",
+        "flagsOrNormalizedBits",
+        "extra",
+        "reserved0",
+        "reserved0",
+        "pointer",
+        "handle",
+        "firstPayloadDWORD",
+        "secondPayloadDWORD",
+        "role",
+        "rejectMode"
+      ],
+      "limits": {
+        "rows": 128,
+        "wordsPerRow": 20
+      },
+      "note": "CREATE contextPointer is original incoming context before assigning role marker. INDICATE result is chosen callback return; actual reentrant GetApplicationDesc result is in BSLN snapshot+17."
+    },
+    "native-addresses.bin": {
+      "header": [
+        "magic=0x42534841",
+        "version=1",
+        "nonce",
+        "role",
+        "rejectMode",
+        "rowCount",
+        "dropped",
+        "bytesPerRow=1064"
+      ],
+      "row": [
+        "kind",
+        "subjectRoleOrIndex",
+        "GetComponentByNameHRESULT",
+        "port",
+        "componentType",
+        "GetURLWHRESULT",
+        "URLCharsRequired",
+        "GetTickCount",
+        "threadId",
+        "addressNonNull",
+        "WCHAR URL[512]"
+      ],
+      "kinds": {
+        "1": "GetLocalHostAddresses",
+        "2": "INDICATE player address",
+        "3": "INDICATE device address",
+        "4": "GetPeerAddress"
+      },
+      "limits": {
+        "rows": 16,
+        "urlChars": 512
+      }
+    },
+    "native-wire.bin": {
+      "header": [
+        "magic=0x42534d54",
+        "version=3",
+        "nonce",
+        "role",
+        "hookInstalled",
+        "rowCount",
+        "dropped",
+        "metadataWords=27",
+        "payloadCap=4096"
+      ],
+      "rowBytes": 4204,
+      "limits": {
+        "rows": 512,
+        "payloadBytes": 4096
+      },
+      "metadata": [
+        "GetTickCount",
+        "threadId",
+        "actualSocket",
+        "localIPv4",
+        "localPort",
+        "destinationIPv4",
+        "destinationPort",
+        "originalBytes",
+        "capturedBytes",
+        "WSASendToFlags",
+        "overlappedNonNull",
+        "originalReturn",
+        "originalWSAError",
+        "localFamily",
+        "destinationFamily",
+        "localSockaddrBytes",
+        "destinationSockaddrBytes",
+        "localIPv6DWORD0",
+        "localIPv6DWORD1",
+        "localIPv6DWORD2",
+        "localIPv6DWORD3",
+        "destinationIPv6DWORD0",
+        "destinationIPv6DWORD1",
+        "destinationIPv6DWORD2",
+        "destinationIPv6DWORD3",
+        "localScope",
+        "destinationScope"
+      ]
+    },
+    "watchdog.bin": {
+      "header": [
+        "magic=0x42534857",
+        "nonce",
+        "role",
+        "rejectMode",
+        "phase",
+        "failure"
+      ],
+      "meaning": "FAILED; independent35s watchdog; never a completed reference"
+    },
+    "markers": {
+      "format": "exact4-byte nonce",
+      "names": [
+        "host-ready.bin",
+        "host-admission-done.bin",
+        "peer-admission-done.bin",
+        "exchange-ready.bin",
+        "send-go.bin",
+        "exchange-done.bin",
+        "peer-close-go.bin",
+        "host-peer-closed.bin",
+        "host-close-go.bin",
+        "done.bin"
+      ],
+      "note": "Go markers are created only after measured counterpart state. Marker presence alone is not API proof."
+    }
+  },
+  "tags": {
+    "1": "input role",
+    "2": "input reject mode",
+    "3": "CoInitialize HRESULT",
+    "4": "CoCreate Peer HRESULT",
+    "5": "Initialize HRESULT",
+    "6": "IAT hook installed",
+    "7": "SetCaps HRESULT",
+    "8": "SetPeerInfo HRESULT",
+    "9": "device address result",
+    "10": "Host HRESULT",
+    "11": "host address result",
+    "12": "async Connect immediate HRESULT",
+    "13": "async handle nonzero",
+    "14": "CONNECT_COMPLETE actual HRESULT",
+    "15": "reply size",
+    "16": "reply matches pre-RETURN_BUFFER bytes",
+    "17": "async context matches",
+    "20": "GetLocalHostAddresses HRESULT",
+    "21": "raw returned address count",
+    "30": "post-admission GetApplicationDesc HRESULT",
+    "31": "post-admission currentPlayers",
+    "210": "GetPeerAddress HRESULT",
+    "220": "guaranteed synchronous SendTo HRESULT",
+    "221": "retained RECEIVE pointer present",
+    "222": "actual retained payload DWORD",
+    "223": "first ReturnBuffer HRESULT",
+    "224": "second ReturnBuffer actual HRESULT",
+    "230": "post-exchange GetApplicationDesc HRESULT",
+    "231": "post-exchange currentPlayers",
+    "240": "after peer departure GetApplicationDesc HRESULT",
+    "241": "after peer departure currentPlayers",
+    "242": "departed GetPlayerContext HRESULT",
+    "250": "Close HRESULT",
+    "340": "late callback count after Close returned",
+    "341": "dropped callback rows",
+    "342": "dropped address rows",
+    "343": "dropped wire rows",
+    "399": "fixture orchestration failure code",
+    "100_and_300": "snapshot base (after admission / after Close+Release)",
+    "200_202": "GetPlayerContext HRESULT by role",
+    "201_203": "GetPlayerContext matches assigned role context"
+  },
+  "snapshotOffsets": {
+    "0": "known mask",
+    "1": "INDICATE count",
+    "2": "RETURN_BUFFER count",
+    "3": "INDICATED_CONNECT_ABORTED count",
+    "4": "CONNECT_COMPLETE count",
+    "5": "Connect final HRESULT",
+    "6": "reply size",
+    "7": "reply bytes match",
+    "8": "async context matches",
+    "9": "returned buffer pointer matches",
+    "10": "returned buffer context matches",
+    "11": "returned original bytes match",
+    "12": "INDICATE initially zero outputs",
+    "13": "INDICATE connect input matches",
+    "14": "INDICATE reentrant currentPlayers",
+    "15": "RECEIVE count",
+    "16": "invalid payload/name count",
+    "17": "INDICATE reentrant GetApplicationDesc HRESULT",
+    "20_21": "CREATE counts by role",
+    "22_23": "DESTROY counts by role",
+    "24_25": "CREATE original context match by role",
+    "26_27": "DESTROY assigned context match by role",
+    "28_29": "DESTROY reason by role"
+  }
+}

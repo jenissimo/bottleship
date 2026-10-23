@@ -61,6 +61,19 @@ describe("LAN connection configuration", () => {
     expect(config.network?.room).toBe("friends");
   });
 
+  test("explicit native DirectPlay policy roundtrips through configuration and invitations", () => {
+    const selected = {serverUrl:"https://lan.example.org",room:"friends",directPlay8:{provider:"native" as const,hostListener:"game-host"}};
+    config.setNetwork(selected); selected.directPlay8.hostListener="mutated";
+    expect(config.network?.directPlay8?.hostListener).toBe("game-host");
+    const inherited=config.snapshotForChild(); config.setNetwork(null); config.restoreForChild(inherited);
+    expect(config.network?.directPlay8).toEqual({provider:"native",hostListener:"game-host"});
+    const url=new URL(networkInviteUrl("https://bottleship.example/?game=dev",config.network));
+    expect(networkConfigFromLocation(url.search,null)).toEqual(config.network);
+    expect(new URL(networkInviteUrl(url.href,null)).searchParams.has("dp8Provider")).toBe(false);
+    for(const directPlay8 of [null,{provider:"native"},{provider:"other",hostListener:"game"},{provider:"native",hostListener:"../bad"}])
+      expect(()=>normalizeNetworkConfig({...selected,directPlay8})).toThrow();
+  });
+
   test("invalid settings leave the previous valid configuration intact", () => {
     config.setNetwork({ serverUrl: "https://lan.example.org", room: "friends" });
     expect(() => config.setNetwork({ serverUrl: "bad", room: "friends" })).toThrow();

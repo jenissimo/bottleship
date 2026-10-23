@@ -5,6 +5,7 @@ import type { DirectPlay8Role } from "../peer";
 import { DPN } from "../constants";
 import { NativeDirectPlayChannel } from "./channel";
 import { NativeDirectPlayPort } from "./port";
+import { NativeLocalDelivery } from "./local-delivery";
 import { NativePeerChannels } from "./peer-channels";
 import { DN } from "./frame-codec";
 import type { NativeReassembledMessage } from "./receive-window";
@@ -49,10 +50,10 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
     private requestId = 1;
     private requests = new Map<number, Request>();
     private queueBytes = 0;
-    private localProcessed = new Set<(result: number) => void>();
+    private localDelivery = new NativeLocalDelivery();
     private failedClosing?: Promise<number>;
     constructor(readonly network: LanNetwork, readonly role: DirectPlay8Role, readonly timeout = 25000, readonly retryInterval = 200, readonly retries = 14) {}
-    get pendingLocalProcessing(): number { return this.localProcessed.size; }
+    get pendingLocalProcessing(): number { return this.localDelivery.pending; }
     get localAddress(): Address { return { node: Array.from(this.network.node), port: this.channel?.localPort ?? 0 }; }
     get hostAddress(): Address | null { return this.remote ? copyAddress(this.remote) : null; }
     get ownKey(): string { return key(this.localAddress); }
@@ -296,23 +297,10 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         if (data.length > 1024 * 1024) return DPN.DATATOOLARGE;
         let local = Promise.resolve<number>(DPN.OK);
         if (recipients.includes(this.localId) && !(flags & 0x20)) {
-            if (flags & 4) {
-                if (this.localProcessed.size >= 256) return DPN.TABLEFULL;
-                local = new Promise<number>(resolve => {
-                    const abort = () => finish(DPN.USERCANCEL);
-                    const finish = (result: number) => {
-                        if (!this.localProcessed.delete(finish)) return;
-                        signal?.removeEventListener("abort", abort); resolve(result);
-                        if (to === this.localId) completedLocal?.(result);
-                    }; this.localProcessed.add(finish);
-                    signal?.addEventListener("abort", abort, { once: true });
-                    if (!this.enqueue(this.localId, data, flags & 8 ? 1 : 0, () => finish(DPN.OK))) finish(DPN.TABLEFULL);
-                    else acceptedLocal?.();
-                });
-            } else {
-                if (!this.enqueue(this.localId, data, flags & 8 ? 1 : 0)) return DPN.TABLEFULL;
-                acceptedLocal?.();
-            }
+            const result = this.localDelivery.deliver(to === this.localId, flags, data,
+                (bytes, wireFlags, processed) => this.enqueue(this.localId, bytes, wireFlags, processed), signal, acceptedLocal, completedLocal);
+            if (typeof result === "number" && result) return result;
+            local = Promise.resolve(result);
         }
         if (!remote.length) return local;
         if (flags & 4) {
@@ -349,7 +337,7 @@ export class NativeDirectPlayCore implements DirectPlay8Backend {
         this.mesh?.close(); this.mesh = undefined; this.port?.close(); this.port = undefined; this.requiredPeers.clear(); this.hostAcknowledged = false;
         this.connected = false; this.desc = null; this.entities.clear(); this.entries.clear(); this.operations.clear(); this.operationSizes.clear(); this.pendingOperationBytes = 0; this.tableBytes = 0;
         this.queue.length = 0; this.queueBytes = 0;
-        for (const finish of [...this.localProcessed]) finish(DPN.CONNECTIONLOST);
+        this.localDelivery.cancel(DPN.CONNECTIONLOST);
         for (const id of [...this.requests.keys()]) this.complete(id, { hr: DPN.CONNECTIONLOST });
         this.onChange?.();
     }

@@ -1,10 +1,28 @@
 import type { Address, Entity, Message, Reply, SessionDesc } from "../dplayx/session";
 
 export type DirectPlay8Message = Message & { processed?: () => void };
+export interface DirectPlay8HostRequest {
+    localPort: number; bindingGeneration: number; localAddress: Address; signal: AbortSignal;
+}
+/** Created only after the provider has acknowledged its actual listening binding. */
+export interface DirectPlay8HostReady {
+    address: Address;
+    isLive?(): boolean;
+    closed?: Promise<{ code: number; message: string }>;
+    allowIncoming(address: Address): boolean;
+    url(address: Address): string;
+    release(): void;
+}
+export interface DirectPlay8HostProvider { prepare(request: DirectPlay8HostRequest): Promise<DirectPlay8HostReady>; }
+export type DirectPlay8NativeSend = (to: number, flags: number, data: Uint8Array, signal?: AbortSignal,
+    acceptedLocal?: () => void, completedLocal?: (result: number) => void) => number | Promise<number>;
 
 /** Shared DP8 session state. Provider discovery and host admission belong to their provider. */
 export interface DirectPlay8Backend {
     readonly kind?: "native";
+    readonly advertisedAddress?: Address;
+    readonly pendingLocalProcessing?: number;
+    sendDpn?: DirectPlay8NativeSend;
     readonly entities: Map<number, Entity>;
     readonly queue: DirectPlay8Message[];
     readonly localAddress: Address;
