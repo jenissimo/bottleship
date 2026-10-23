@@ -1,6 +1,7 @@
 import { Logger, LogCategory } from "../logger";
 import { reportMemoryFault, MemoryAccessType } from "./memory-fault";
 import { borrowGuestMemory } from "./guest-memory";
+import type { GuestDataRoutes } from "./guest-data-routes";
 import type { RegionEntry } from "./address-space";
 import { jsWriteTrap } from "./js-write-trap";
 
@@ -20,6 +21,7 @@ export interface WatchRange {
  */
 export class Mem {
     private static memoryGetter: (() => Uint8Array) | null = null;
+    private static dataRoutes: GuestDataRoutes | null = null;
     private static validateRange: ((address: number, size: number, perms: string) => boolean) | null = null;
     private static getRegion: ((address: number) => RegionEntry | null) | null = null;
 
@@ -37,11 +39,13 @@ export class Mem {
     static bind(
         getter: () => Uint8Array,
         validator?: (address: number, size: number, perms: string) => boolean,
-        regionGetter?: (address: number) => RegionEntry | null
+        regionGetter?: (address: number) => RegionEntry | null,
+        dataRoutes?: GuestDataRoutes,
     ): void {
         this.memoryGetter = getter;
         this.validateRange = validator ?? null;
         this.getRegion = regionGetter ?? null;
+        this.dataRoutes = dataRoutes ?? null;
     }
 
     static pushWriteWatchRange(lo: number, hi: number, tag: string, isFatal: boolean = true, limit: number = 0): number {
@@ -105,6 +109,7 @@ export class Mem {
      * Get fresh memory. For use by async thunks that may complete after memory was replaced.
      */
     static getView(): Uint8Array | null {
+        if (this.dataRoutes?.hasMappings) throw new Error("Mapped guest data has no coherent global Uint8Array; use range access");
         return this.getMemory();
     }
 
@@ -141,7 +146,8 @@ export class Mem {
         }
 
         // Validate range if validator is available
-        if (this.validateRange && !this.validateRange(address, size, perms)) {
+        if ((this.validateRange && !this.validateRange(address, size, perms)) ||
+            (this.dataRoutes && !this.dataRoutes.isAccessible(address, size, perms.includes("w")))) {
             const region = this.getRegion?.(address);
             reportMemoryFault({
                 address,
@@ -161,6 +167,7 @@ export class Mem {
     static readUint32(address: number): number | null {
         const mem = this.ensure(address, 4, "r", "Mem.readUint32", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readUint(address, 4);
         const a = address;
         return (
             mem[a] |
@@ -173,18 +180,21 @@ export class Mem {
     static readUint8(address: number): number | null {
         const mem = this.ensure(address, 1, "r", "Mem.readUint8", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readUint(address, 1);
         return mem[address]!;
     }
 
     static readBytes(address: number, length: number): Uint8Array | null {
         const mem = this.ensure(address, length, "r", "Mem.readBytes", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readBytes(address, length);
         return mem.subarray(address, address + length);
     }
 
     static readInt32(address: number): number | null {
         const mem = this.ensure(address, 4, "r", "Mem.readInt32", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readUint(address, 4) | 0;
         const a = address;
         return (
             mem[a] |
@@ -197,6 +207,7 @@ export class Mem {
     static readUint16(address: number): number | null {
         const mem = this.ensure(address, 2, "r", "Mem.readUint16", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readUint(address, 2);
         const a = address;
         return mem[a] | (mem[a + 1] << 8);
     }
@@ -237,6 +248,10 @@ export class Mem {
         if (out.length < count) return false;
         const mem = this.ensure(address, count * 4, "r", "Mem.readFloat32Into", "read");
         if (!mem) return false;
+        if (this.dataRoutes) {
+            for (let i = 0; i < count; i++) out[i] = this.dataRoutes.readFloat(address + i * 4, 4);
+            return true;
+        }
         const view = this.floatView(mem);
         for (let i = 0; i < count; i++) {
             out[i] = view.getFloat32(address + i * 4, true);
@@ -247,12 +262,14 @@ export class Mem {
     static readFloat32(address: number): number | null {
         const mem = this.ensure(address, 4, "r", "Mem.readFloat32", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readFloat(address, 4);
         return this.floatView(mem).getFloat32(address, true);
     }
 
     static readFloat64(address: number): number | null {
         const mem = this.ensure(address, 8, "r", "Mem.readFloat64", "read");
         if (!mem) return null;
+        if (this.dataRoutes) return this.dataRoutes.readFloat(address, 8);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         return view.getFloat64(address, true);
     }
@@ -263,6 +280,7 @@ export class Mem {
         jsWriteTrap.note(address, 4, value);
         const mem = this.ensure(address, 4, "w", "Mem.writeUint32", "write");
         if (!mem) return false;
+        if (this.dataRoutes) { this.dataRoutes.writeUint(address, value, 4); return true; }
         mem[address] = value & 0xff;
         mem[address + 1] = (value >>> 8) & 0xff;
         mem[address + 2] = (value >>> 16) & 0xff;
@@ -276,6 +294,7 @@ export class Mem {
         jsWriteTrap.note(address, 2, value);
         const mem = this.ensure(address, 2, "w", "Mem.writeUint16", "write");
         if (!mem) return false;
+        if (this.dataRoutes) { this.dataRoutes.writeUint(address, value, 2); return true; }
         mem[address] = value & 0xff;
         mem[address + 1] = (value >>> 8) & 0xff;
         return true;
@@ -287,6 +306,7 @@ export class Mem {
         jsWriteTrap.note(address, 1, value);
         const mem = this.ensure(address, 1, "w", "Mem.writeUint8", "write");
         if (!mem) return false;
+        if (this.dataRoutes) { this.dataRoutes.writeUint(address, value, 1); return true; }
         mem[address] = value & 0xff;
         return true;
     }
@@ -297,6 +317,7 @@ export class Mem {
         jsWriteTrap.note(address, 4, value);
         const mem = this.ensure(address, 4, "w", "Mem.writeFloat32", "write");
         if (!mem) return false;
+        if (this.dataRoutes) { this.dataRoutes.writeFloat(address, value, 4); return true; }
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setFloat32(address, value, true);
         return true;
@@ -308,6 +329,7 @@ export class Mem {
         jsWriteTrap.note(address, 8, value);
         const mem = this.ensure(address, 8, "w", "Mem.writeFloat64", "write");
         if (!mem) return false;
+        if (this.dataRoutes) { this.dataRoutes.writeFloat(address, value, 8); return true; }
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         view.setFloat64(address, value, true);
         return true;
@@ -319,6 +341,7 @@ export class Mem {
         jsWriteTrap.note(address, data.length, data);
         const mem = this.ensure(address, data.length, "w", "Mem.writeBytes", "write");
         if (!mem) return 0;
+        if (this.dataRoutes) { this.dataRoutes.writeBytes(address, data); return data.length; }
         mem.set(data, address);
         return data.length;
     }
@@ -326,6 +349,15 @@ export class Mem {
     static memcpy(dest: number, src: number, length: number): boolean {
         const mem = this.ensure(dest, length, "w", "Mem.memcpy", "write");
         if (!mem) return false;
+        if (this.dataRoutes) {
+            if (!this.ensure(src, length, "r", "Mem.memcpy", "read")) return false;
+            const source = this.dataRoutes.readBytes(src, length);
+            this.logStackWrite(dest, length, source);
+            this.checkWatch(dest, length, source);
+            jsWriteTrap.note(dest, length, source);
+            this.dataRoutes.copy(dest, src, length);
+            return true;
+        }
         // Read source bytes
         const source = mem.subarray(src, src + length);
         this.logStackWrite(dest, length, source);
@@ -349,6 +381,14 @@ export class Mem {
         if (!this.ensure(src, length, "r", "Mem.memmove", "read")) return false;
         const mem = this.ensure(dest, length, "w", "Mem.memmove", "write");
         if (!mem) return false;
+        if (this.dataRoutes) {
+            const source = this.dataRoutes.readBytes(src, length);
+            this.logStackWrite(dest, length, source);
+            this.checkWatch(dest, length, source);
+            jsWriteTrap.note(dest, length, source);
+            this.dataRoutes.copy(dest, src, length);
+            return true;
+        }
         const source = mem.subarray(src, src + length);
         this.logStackWrite(dest, length, source);
         this.checkWatch(dest, length, source);

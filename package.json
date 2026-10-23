@@ -85,6 +85,7 @@
     "analyze-trace": "bun tools/analyze-trace.ts",
     "test:fpu-relaxed": "node vendor/v86/tests/fpu-relaxed-diff.mjs",
     "test:rep-differential": "node tools/runtime-test/rep-differential.mjs",
+    "test:section-memory": "bun tools/runtime-test/section-memory-foundation.ts",
     "test:string-differential": "node tools/runtime-test/string-differential.mjs",
     "test:dead-flags": "node vendor/v86/tests/dead-flag-elision-diff.mjs",
     "test:sse-move": "node tools/test-sse-move.mjs",

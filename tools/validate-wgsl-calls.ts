@@ -28,6 +28,7 @@
 
 import { readdirSync, readFileSync, statSync } from "fs";
 import { join, relative, resolve } from "path";
+import * as ts from "typescript";
 
 const ROOT = resolve(import.meta.dir, "..");
 const SCAN_DIRS = ["src/worker", "src/app"];
@@ -179,111 +180,149 @@ function declaredNameExpansions(src: string, body: string): string[] | null {
     return ternary ? [ternary[2]!, ternary[4]!] : null;
 }
 
-const files = SCAN_DIRS.flatMap((d) => walk(join(ROOT, d)));
-const decls = new Map<string, Decl[]>();
-const tsNames = new Set<string>();
-const entryPoints = new Set<string>();
 
-const sources = new Map<string, string>(files.map((f) => [f, blankComments(readFileSync(f, "utf8"))]));
+type SourceSpan = readonly [number, number];
 
-const declSpans = new Map<string, Array<[number, number]>>();
-/** `fn ${...}(` declarations whose name could not be resolved — reported, never silent. */
-let undeclarableNames = 0;
-
-for (const file of files) {
-    const src = sources.get(file)!;
-    for (const m of src.matchAll(/\bfn\s+(?:([A-Za-z_]\w*)|\$\{([^{}]*)\})\s*\(/g)) {
-        const names = m[1] ? [m[1]] : declaredNameExpansions(src, m[2]!);
-        if (!names) { undeclarableNames++; continue; }
-        // Entry points are called by the pipeline, never from WGSL, and each generator
-        // declares its own with whatever inputs that shader needs — comparing those across
-        // files reports an arity conflict that means nothing.
-        const before = src.slice(Math.max(0, m.index! - 120), m.index!);
-        if (/@(?:fragment|vertex|compute)\s*$/.test(before)) {
-            for (const name of names) entryPoints.add(name);
-            continue;
+/** Literal text can contain WGSL; TypeScript declarations and interpolation code cannot. */
+function literalSpans(file: string, source: string): SourceSpan[] {
+    if (file.endsWith(".wgsl")) return [[0, source.length]];
+    const ast = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const spans: SourceSpan[] = [];
+    const visit = (node: ts.Node): void => {
+        if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)
+            || ts.isTemplateTail(node)) {
+            spans.push([node.getStart(ast) + 1, node.end - 1]);
+        } else if (ts.isTemplateHead(node) || ts.isTemplateMiddle(node)) {
+            spans.push([node.getStart(ast) + 1, node.end - 2]);
         }
-        // A parameter list is counted the same way an argument list is: `@location(0)`
-        // and `array<f32, 4>` both carry parens/commas that are not separators.
-        const parsed = countArgs(src, m.index! + m[0]!.length - 1);
-        if (!parsed) continue;
-        for (const name of names) {
-            decls.set(name, [...(decls.get(name) ?? []), { name, arity: parsed.count, file, line: lineOf(src, m.index!) }]);
-            declSpans.set(`${file}:${name}`, [...(declSpans.get(`${file}:${name}`) ?? []), [m.index!, parsed.end]]);
-        }
-    }
-    // A TypeScript function of the same name would make every JS call site look like a
-    // shader call; those names are excluded rather than reported wrongly.
-    for (const m of src.matchAll(/(?:function|const|let|var)\s+([A-Za-z_]\w*)\s*[=(]/g)) tsNames.add(m[1]!);
+        ts.forEachChild(node, visit);
+    };
+    visit(ast);
+    return spans.sort(([a], [b]) => a - b);
 }
 
-const mismatches: Mismatch[] = [];
-const ambiguous: string[] = [];
-let interpolatedCalls = 0;
-let expandedCalls = 0;
-let checkedCalls = 0;
-
-for (const [name, list] of decls) {
-    const arities = new Set(list.map((d) => d.arity));
-    if (tsNames.has(name) || entryPoints.has(name)) continue;
-    if (arities.size > 1) {
-        ambiguous.push(`${name}: ${[...arities].join("/")} args (${list.map((d) => `${relative(ROOT, d.file)}:${d.line}`).join(", ")})`);
-        continue;
+function inSpans(spans: readonly SourceSpan[], offset: number): boolean {
+    let low = 0, high = spans.length;
+    while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (spans[middle]![0] <= offset) low = middle + 1;
+        else high = middle;
     }
-    const want = list[0]!.arity;
+    return low > 0 && offset < spans[low - 1]![1];
+}
+
+export function validateWgslSources(inputs: ReadonlyMap<string, string>) {
+    const files = [...inputs.keys()];
+    const decls = new Map<string, Decl[]>();
+    const entryPoints = new Set<string>();
+    const sources = new Map(files.map((file) => [file, blankComments(inputs.get(file)!)]));
+    const shaderSpans = new Map(files.map((file) => [file, literalSpans(file, inputs.get(file)!)]));
+
+    const declSpans = new Map<string, Array<[number, number]>>();
+    /** `fn ${...}(` declarations whose name could not be resolved — reported, never silent. */
+    let undeclarableNames = 0;
+
     for (const file of files) {
         const src = sources.get(file)!;
-        const spans = declSpans.get(`${file}:${name}`) ?? [];
-        for (const m of src.matchAll(new RegExp(`\\b${name}\\s*\\(`, "g"))) {
-            const line = lineOf(src, m.index!);
-            if (spans.some(([a, b]) => m.index! >= a && m.index! <= b)) continue;
-            const open = src.indexOf("(", m.index!);
-            const parsed = countArgs(src, open);
-            if (!parsed) continue;
-            const snippet = (): string =>
-                src.slice(m.index!, Math.min(parsed.end + 1, m.index! + 120)).replace(/\s+/g, " ");
-            if (!parsed.interpolated) {
-                checkedCalls++;
-                if (parsed.count !== want) {
-                    mismatches.push({ name, file: relative(ROOT, file), line, got: parsed.count, want, snippet: snippet() });
-                }
+        for (const m of src.matchAll(/\bfn\s+(?:([A-Za-z_]\w*)|\$\{([^{}]*)\})\s*\(/g)) {
+            if (!inSpans(shaderSpans.get(file)!, m.index!)) continue;
+            const names = m[1] ? [m[1]] : declaredNameExpansions(src, m[2]!);
+            if (!names) { undeclarableNames++; continue; }
+            // Entry points are called by the pipeline, never from WGSL, and each generator
+            // declares its own with whatever inputs that shader needs — comparing those across
+            // files reports an arity conflict that means nothing.
+            const before = src.slice(Math.max(0, m.index! - 120), m.index!);
+            if (/@(?:fragment|vertex|compute)\s*$/.test(before)) {
+                for (const name of names) entryPoints.add(name);
                 continue;
             }
-            // An interpolated argument list is checked once per KNOWN expansion. Only a
-            // list with an unknowable part is skipped, and that is counted out loud: an
-            // unchecked call is a hole in the check, not a pass.
-            const text = src.slice(open, parsed.end + 1);
-            const candidates = expandArgList(
-                text, parsed.spans.map(([a, b]) => [a - open, b - open] as [number, number]));
-            if (!candidates) { interpolatedCalls++; continue; }
-            checkedCalls++;
-            expandedCalls++;
-            for (const candidate of candidates) {
-                const expansion = countArgs(candidate, 0);
-                if (!expansion || expansion.count === want) continue;
-                mismatches.push({
-                    name, file: relative(ROOT, file), line, got: expansion.count, want,
-                    snippet: `${snippet()}   [expansion: ${name}${candidate.replace(/\s+/g, " ")}]`,
-                });
-                break;
+            // A parameter list is counted the same way an argument list is: `@location(0)`
+            // and `array<f32, 4>` both carry parens/commas that are not separators.
+            const parsed = countArgs(src, m.index! + m[0]!.length - 1);
+            if (!parsed) continue;
+            for (const name of names) {
+                decls.set(name, [...(decls.get(name) ?? []), { name, arity: parsed.count, file, line: lineOf(src, m.index!) }]);
+                declSpans.set(`${file}:${name}`, [...(declSpans.get(`${file}:${name}`) ?? []), [m.index!, parsed.end]]);
             }
         }
     }
-}
 
-if (process.argv.includes("--json")) {
-    console.log(JSON.stringify({ mismatches, ambiguous, helpers: decls.size, checkedCalls, expandedCalls, interpolatedCalls, undeclarableNames }, null, 2));
-} else {
-    console.log(`[wgsl-calls] ${decls.size} shader helpers, ${checkedCalls} calls checked `
-        + `(${expandedCalls} by expanding an interpolated argument list), `
-        + `${interpolatedCalls} skipped (an unknowable interpolation can expand to any count), `
-        + `${undeclarableNames} declarations with an unresolvable interpolated name`);
-    for (const a of ambiguous) console.log(`  ambiguous (not checked): ${a}`);
-    for (const m of mismatches) {
-        console.log(`  MISMATCH ${m.file}:${m.line}  ${m.name} called with ${m.got}, declared with ${m.want}`);
-        console.log(`      ${m.snippet}`);
+    const mismatches: Mismatch[] = [];
+    const ambiguous: string[] = [];
+    let interpolatedCalls = 0;
+    let expandedCalls = 0;
+    let checkedCalls = 0;
+
+    for (const [name, list] of decls) {
+        const arities = new Set(list.map((d) => d.arity));
+        if (entryPoints.has(name)) continue;
+        if (arities.size > 1) {
+            ambiguous.push(`${name}: ${[...arities].join("/")} args (${list.map((d) => `${relative(ROOT, d.file)}:${d.line}`).join(", ")})`);
+            continue;
+        }
+        const want = list[0]!.arity;
+        for (const file of files) {
+            const src = sources.get(file)!;
+            const spans = declSpans.get(`${file}:${name}`) ?? [];
+            for (const m of src.matchAll(new RegExp(`\\b${name}\\s*\\(`, "g"))) {
+                if (!inSpans(shaderSpans.get(file)!, m.index!)) continue;
+                const line = lineOf(src, m.index!);
+                if (spans.some(([a, b]) => m.index! >= a && m.index! <= b)) continue;
+                const open = src.indexOf("(", m.index!);
+                const parsed = countArgs(src, open);
+                if (!parsed) continue;
+                const snippet = (): string =>
+                    src.slice(m.index!, Math.min(parsed.end + 1, m.index! + 120)).replace(/\s+/g, " ");
+                if (!parsed.interpolated) {
+                    checkedCalls++;
+                    if (parsed.count !== want) {
+                        mismatches.push({ name, file: relative(ROOT, file), line, got: parsed.count, want, snippet: snippet() });
+                    }
+                    continue;
+                }
+                // An interpolated argument list is checked once per KNOWN expansion. Only a
+                // list with an unknowable part is skipped, and that is counted out loud: an
+                // unchecked call is a hole in the check, not a pass.
+                const text = src.slice(open, parsed.end + 1);
+                const candidates = expandArgList(
+                    text, parsed.spans.map(([a, b]) => [a - open, b - open] as [number, number]));
+                if (!candidates) { interpolatedCalls++; continue; }
+                checkedCalls++;
+                expandedCalls++;
+                for (const candidate of candidates) {
+                    const expansion = countArgs(candidate, 0);
+                    if (!expansion || expansion.count === want) continue;
+                    mismatches.push({
+                        name, file: relative(ROOT, file), line, got: expansion.count, want,
+                        snippet: `${snippet()}   [expansion: ${name}${candidate.replace(/\s+/g, " ")}]`,
+                    });
+                    break;
+                }
+            }
+        }
     }
-    if (mismatches.length === 0) console.log("[wgsl-calls] OK — every helper call matches its declaration");
+
+    return { mismatches, ambiguous, helpers: decls.size, checkedCalls, expandedCalls, interpolatedCalls, undeclarableNames };
 }
 
-process.exit(mismatches.length > 0 ? 1 : 0);
+if (import.meta.main) {
+    const files = SCAN_DIRS.flatMap((d) => walk(join(ROOT, d)));
+    const report = validateWgslSources(new Map(files.map((file) => [file, readFileSync(file, "utf8")])));
+    const { mismatches, ambiguous, helpers, checkedCalls, expandedCalls, interpolatedCalls, undeclarableNames } = report;
+    if (process.argv.includes("--json")) {
+        console.log(JSON.stringify(report, null, 2));
+    } else {
+        console.log(`[wgsl-calls] ${helpers} shader helpers, ${checkedCalls} calls checked `
+            + `(${expandedCalls} by expanding an interpolated argument list), `
+            + `${interpolatedCalls} skipped (an unknowable interpolation can expand to any count), `
+            + `${undeclarableNames} declarations with an unresolvable interpolated name`);
+        for (const a of ambiguous) console.log(`  ambiguous (not checked): ${a}`);
+        for (const m of mismatches) {
+            console.log(`  MISMATCH ${m.file}:${m.line}  ${m.name} called with ${m.got}, declared with ${m.want}`);
+            console.log(`      ${m.snippet}`);
+        }
+        if (mismatches.length === 0) console.log("[wgsl-calls] OK — every helper call matches its declaration");
+    }
+
+    process.exit(mismatches.length > 0 ? 1 : 0);
+}

@@ -126,3 +126,25 @@ bottleship/
 `vendor/v86/build-wasm.sh`; the generated Rust files are produced by that script and are not
 checked in. From TypeScript, always access v86 properties with bracket notation
 (`this["prop"]`) — the Closure Compiler advanced pass renames dot-notation properties.
+
+### Section data foundation oracle
+
+After changing guest-memory routing, PageTableManager, or v86 mapped/TLB/fast-memory
+paths, run the actual CPU oracle against reviewed built engine artifacts:
+
+```bash
+bun run test:section-memory --lib-sha <reviewed-libv86-sha256> --wasm-sha <reviewed-wasm-sha256> --out <new-report-directory>
+```
+
+It requires Bun and both `vendor/v86/build/libv86.mjs` and `v86.wasm`;
+`--lib` and `--wasm` can select another explicit build. Supply the SHA256 values
+from that build's reviewed receipt. Missing artifacts, SHA mismatches, absent JIT
+execution, and semantic mismatches fail; nothing is skipped. Interpreter and verified
+JIT arms run sequentially and retain source/artifact pins, raw results, and generated
+modules in a fresh directory.
+
+This command is separate from `bun test` and the regular CI gate, which does not build
+v86 artifacts. The pure data-route tests remain in the ordinary gate. The oracle
+covers the opt-in data foundation, including CPU/HLE aliases and protection/lifetime
+guards; it does not establish Win32 Section APIs, file I/O, atomics, or executable
+mapping support.

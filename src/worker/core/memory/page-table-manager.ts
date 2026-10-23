@@ -4,8 +4,8 @@
  * Enables real #PF on decommitted pages instead of zeroing memory (which corrupts
  * heap metadata in games like StarCraft's storm.dll SBH allocator).
  *
- * Identity-mapped: linear address = physical address. Only difference from flat mode
- * is that non-present pages now fault via #PF (vector 14).
+ * Identity-mapped by default; internal data leases may install nonidentity pages.
+ * Non-present pages fault via #PF (vector 14).
  *
  * Maps the FULL 4GB address space (all 1024 PDEs). v86's WASM linear
  * memory is larger than the configured guest memory, so games may access addresses
@@ -44,7 +44,13 @@ const PTE_ACCESSED_DIRTY = 0x60;
 const CR0_PG = 0x80000000; // Paging enable (bit 31)
 const CR0_WP = 0x00010000; // Write protect (bit 16)
 
+export interface ExternalDataPageLease {
+    release(): void;
+    isCurrent(): boolean;
+}
+
 export class PageTableManager {
+    private readonly externalDataPages = new Map<number, object>();
     private pagingEnabled = false;
     private totalMemoryBytes = 0;
     private getMemory: () => Uint8Array;
@@ -62,6 +68,7 @@ export class PageTableManager {
      * memory accesses go directly to the WASM backing store.
      */
     initialize(totalMemoryBytes: number, win9x = false): void {
+        if (this.externalDataPages.size !== 0) throw new Error("Release external data views before page-table initialization");
         this.totalMemoryBytes = totalMemoryBytes;
         const mem = this.getMemory();
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
@@ -147,6 +154,91 @@ export class PageTableManager {
     }
 
     /**
+     * Internal opt-in mapping over caller-reserved VA and MMIO physical ranges.
+     * This creates no Section object and grants no executable/atomic capability.
+     */
+    mapExternalDataPages(base: number, physical: number, size: number, protection = 4): ExternalDataPageLease {
+        const mem = this.getMemory();
+        const aligned = (v: number) => Number.isSafeInteger(v) && v >= 0 && v % PAGE_SIZE === 0;
+        if (!this.pagingEnabled || !aligned(base) || !aligned(physical) || !aligned(size) || size === 0 ||
+            base + size > Math.min(this.totalMemoryBytes, mem.length) ||
+            physical < this.totalMemoryBytes || physical + size > 0x100000000 ||
+            (protection !== 2 && protection !== 4) || this.externalDataPages.size + size / PAGE_SIZE > 4096 ||
+            (base < MEM_PAGETABLE_BASE + MEM_PAGETABLE_SIZE && base + size > MEM_PAGETABLE_BASE)) {
+            throw new RangeError("Invalid external data page mapping");
+        }
+        const first = base / PAGE_SIZE, count = size / PAGE_SIZE;
+        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        for (let i = 0; i < count; i++) {
+            if (this.externalDataPages.has(first + i)) throw new Error("External data page overlap");
+            const pte = view.getUint32(this._getPteOffset(first + i), true);
+            if (((pte & 0xfffff000) >>> 0) !== base + i * PAGE_SIZE) {
+                throw new Error("External data mapping requires caller-owned identity VA");
+            }
+        }
+        const token = {}, flags = protection === 4 ? PTE_DEFAULT : PTE_PRESENT | PTE_USER;
+        for (let i = 0; i < count; i++) {
+            this.externalDataPages.set(first + i, token);
+            view.setUint32(this._getPteOffset(first + i), ((physical + i * PAGE_SIZE) | flags) >>> 0, true);
+        }
+        this.updateDataWriteEligibility(base, size);
+        this.getWasmExports()?.full_clear_tlb?.();
+        let released = false;
+        return {
+            isCurrent: () => !released && this.externalDataPages.get(first) === token,
+            release: () => {
+                if (released) return;
+                released = true;
+                const current = this.getMemory();
+                const currentView = new DataView(current.buffer, current.byteOffset, current.byteLength);
+                for (let i = 0; i < count; i++) {
+                    if (this.externalDataPages.get(first + i) !== token) continue;
+                    const at = this._getPteOffset(first + i);
+                    // Retire the old physical frame as well as Present: a later protect
+                    // must not resurrect a released external backing.
+                    currentView.setUint32(at, ((first + i) * PAGE_SIZE) |
+                        (currentView.getUint32(at, true) & 0xfff & ~PTE_PRESENT), true);
+                    this.externalDataPages.delete(first + i);
+                }
+                // Release leaves identity RAM non-present; allocator recommit may zero/reuse it.
+                this.updateDataWriteEligibility(base, size);
+                this.getWasmExports()?.full_clear_tlb?.();
+            },
+        };
+    }
+
+    private rejectExternalCommit(base: number, size: number): void {
+        if (this.externalDataPages.size === 0) return;
+        const end = Math.ceil((base + size) / PAGE_SIZE);
+        for (let page = Math.floor(base / PAGE_SIZE); page < end; page++) {
+            if (this.externalDataPages.has(page)) throw new Error("Release external data mapping before RAM commit");
+        }
+    }
+
+    private updateDataWriteEligibility(base: number, size: number): void {
+        const mem = this.getMemory(), view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        const exports = this.getWasmExports(), set = exports?.fastmem_write_map_set_base;
+        const start = Math.floor(base / PAGE_SIZE), end = Math.ceil((base + size) / PAGE_SIZE);
+        const ramEnd = this.totalMemoryBytes || mem.length;
+        let run = start, previous: boolean | undefined;
+        const publish = (first: number, last: number, writable: boolean) => {
+            if (set) set(first, last - first, writable ? 1 : 0);
+            else setWriteMapBase(first * PAGE_SIZE, (last - first) * PAGE_SIZE, writable);
+        };
+        for (let page = start; page < end; page++) {
+            const pte = view.getUint32(this._getPteOffset(page), true);
+            const writable = (pte & (PTE_PRESENT | PTE_RW)) === (PTE_PRESENT | PTE_RW) &&
+                ((pte & 0xfffff000) >>> 0) === page * PAGE_SIZE &&
+                page * PAGE_SIZE < ramEnd && !this.externalDataPages.has(page);
+            if (previous !== undefined && writable !== previous) {
+                publish(run, page, previous); run = page;
+            }
+            previous = writable;
+        }
+        if (previous !== undefined) publish(run, end, previous);
+    }
+
+    /**
      * Clear Present bit for pages in range — makes them fault on access.
      * Used by VirtualFree(MEM_DECOMMIT).
      */
@@ -181,6 +273,7 @@ export class PageTableManager {
      * `ensurePagesCommitted`, which leaves present pages (and their protection) alone.
      */
     commitPages(baseAddr: number, sizeBytes: number): void {
+        this.rejectExternalCommit(baseAddr, sizeBytes);
         const startPage = (baseAddr >>> 12);
         const endPage = ((baseAddr + sizeBytes + PAGE_SIZE - 1) >>> 12);
         const mem = this.getMemory();
@@ -241,6 +334,7 @@ export class PageTableManager {
      * Used when MemoryManager reuses VA after VirtualFree(MEM_DECOMMIT).
      */
     ensurePagesCommitted(baseAddr: number, sizeBytes: number): void {
+        this.rejectExternalCommit(baseAddr, sizeBytes);
         const startPage = (baseAddr >>> 12);
         const endPage = ((baseAddr + sizeBytes + PAGE_SIZE - 1) >>> 12);
         const mem = this.getMemory();
@@ -281,6 +375,12 @@ export class PageTableManager {
      * Used by VirtualProtect.
      */
     setProtection(baseAddr: number, sizeBytes: number, protect: number): void {
+        if (protect !== 1 && protect !== 2 && protect !== 4) {
+            const end = Math.ceil((baseAddr + sizeBytes) / PAGE_SIZE);
+            for (let page = Math.floor(baseAddr / PAGE_SIZE); page < end; page++) {
+                if (this.externalDataPages.has(page)) throw new Error("External data pages support data protection only");
+            }
+        }
         const PAGE_NOACCESS = 0x01;
         const PAGE_READONLY = 0x02;
         const PAGE_READWRITE = 0x04;
@@ -305,14 +405,13 @@ export class PageTableManager {
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
         for (let page = startPage; page < endPage; page++) {
-            const physAddr = page * PAGE_SIZE;
             const pteOffset = this._getPteOffset(page);
+            const pte = view.getUint32(pteOffset, true);
             if (flags === 0) {
-                // NOACCESS: clear present, keep physical address
-                const pte = view.getUint32(pteOffset, true);
                 view.setUint32(pteOffset, pte & ~PTE_PRESENT, true);
             } else {
-                view.setUint32(pteOffset, physAddr | flags, true);
+                // Permission changes preserve the existing backing frame.
+                view.setUint32(pteOffset, (pte & 0xfffff000) | flags, true);
             }
         }
 
@@ -320,11 +419,9 @@ export class PageTableManager {
         if (exports?.full_clear_tlb) {
             exports.full_clear_tlb();
         }
-        // Track 2b Phase W: bit0 tracks present + RW at the PTE level. RW (PTE_DEFAULT)
-        // ⇒ writable; RO/NOACCESS ⇒ clear. The Rust envelope + THUNK_CODE exclusion make
-        // an over-broad range safe (this is the sole maintainer for PE sub-page protects,
-        // where the AddressSpace exact-match protect() misses and only PTM runs).
-        setWriteMapBase(baseAddr, sizeBytes, flags === PTE_DEFAULT);
+        // Fast stores require present + RW + identity RAM. A writable external
+        // data page must still take the translated/MMIO path.
+        this.updateDataWriteEligibility(baseAddr, sizeBytes);
     }
 
     isRangeAccessible(address: number, size: number, write = false): boolean {
@@ -382,7 +479,8 @@ export class PageTableManager {
             let runStart = -1;
             for (let page = startPage; page < endPage; page++) {
                 const pte = view.getUint32(this._getPteOffset(page), true);
-                const writable = (pte & RW) === RW;
+                const writable = (pte & RW) === RW && ((pte & 0xfffff000) >>> 0) === page * PAGE_SIZE &&
+                    page * PAGE_SIZE < (this.totalMemoryBytes || mem.length) && !this.externalDataPages.has(page);
                 if (writable) {
                     if (runStart < 0) runStart = page;
                 } else if (runStart >= 0) {
@@ -427,14 +525,15 @@ export class PageTableManager {
             const pte = view.getUint32(this._getPteOffset(page), true) >>> 0;
             const writable = (pte & RW) === RW;
             const inThunk = page >= thunkLo && page < thunkHi;
-            if (!writable || inThunk) {
+            const nonidentity = ((pte & 0xfffff000) >>> 0) !== page * PAGE_SIZE;
+            if (!writable || inThunk || nonidentity) {
                 danger++;
                 if (samples.length < maxReport) {
                     samples.push({
                         page: '0x' + (page * PAGE_SIZE).toString(16),
                         byte: b,
                         pte: '0x' + pte.toString(16),
-                        reason: inThunk ? 'THUNK_CODE' : ((pte & PTE_PRESENT) ? 'READONLY' : 'NOT_PRESENT'),
+                        reason: inThunk ? 'THUNK_CODE' : nonidentity ? 'NONIDENTITY' : ((pte & PTE_PRESENT) ? 'READONLY' : 'NOT_PRESENT'),
                     });
                 }
             }
