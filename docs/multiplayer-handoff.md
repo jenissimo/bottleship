@@ -4,7 +4,7 @@
 
 ## Текущий следующий шаг
 
-Q2 game-fourth j22b55a завершён FAIL после настоящего соединения двух игроков. Первые sample показали Host guest/canvas63 и Peer22, затем обе страницы перестали отвечать даже на page-side Runtime.evaluate("true"). Следующий шаг — узкая диагностика main-page/render dispatch; увеличение таймаутов и повтор game-fourth вслепую не обоснованы. Runtime/source остаются freeze30 HOLD. Подготовку диагностики ведёт /root/lan_transport.
+Q2 game-fourth j22b55a завершён FAIL после настоящего соединения двух игроков. Первые sample показали Host guest/canvas63 и Peer22, затем обе страницы перестали отвечать даже на page-side Runtime.evaluate("true"). Следующий шаг — узкая диагностика main-page/render dispatch; увеличение таймаутов и повтор game-fourth вслепую не обоснованы. Основной .wt/lan-network runtime/source остаётся freeze30 HOLD. Подготовку диагностики ведёт /root/lan_transport. Следующие реализации уже разрешены в отдельных рабочих копиях ниже; это позволяет сохранить прежнюю проверенную сборку для диагностики.
 
 Новый Native DP8 Host+2Peer baseline уже GREEN: j4f0e6d,599 checks/1198 words, все три exit0/без forced, actual ports55230..55232 rebind. Это reference Windows, не наш многопользовательский Host. Выход: stage30-directplay-host-mesh-preparation/native-runs/host2-native-3001001/verified.json, SHA6cb16f077e31b21c72b3c316bf10385a2764effc8ff9d5af306639d6a5dabdc0. PE4ea595ed91008dd9fd3808a938e6db4b9a5d7b168591ac858021f7457a4dbad3. Отдельно измерено Peer GetLocalHostAddresses=0x80158530 NOTHOST.
 
@@ -70,9 +70,19 @@ Q2 game-fourth j22b55a завершён FAIL после настоящего с�
 
 | Агент | Текущий участок |
 | --- | --- |
-| /root/lan_transport | Ignored Quake II runner, PRIVATE-console CLI owner, исправление HTTP serving; саму игру запускает Root после tool HOLD |
-| /root/winsock | UDP_CONNRESET native facts/portable oracle, включая новый976-observation IOCP+APC effect; runtime ещё не реализован; готовит ignored RED и проверяет closed-loopback prerequisite |
-| /root/directplay | Следующий API-only Host+2Peer native oracle; пока только ignored preparation, без compiler/native/browser/runtime |
+| /root/lan_transport | MAIN .wt/lan-network: готовит ignored Q2 V5 independent CDP diagnostic; shipping source не меняет, запуск Root после HOLD |
+| /root/winsock | .wt/lan-udp-connreset: разрешена реализация WSA API/physical flag/actor/completion policy и meaningful RED→GREEN; Native/browser/fullgate отдельно согласует Root |
+| /root/directplay | .wt/lan-dp8-host-mesh: разрешена реализация native Host membership C2/D0/C6/D1 и binary-unit RED→GREEN; Native interop отдельно согласует Root |
+| /root | .wt/lan-udp-connreset: generic local UDP port-unreachable в src/worker/net/* и core/network-namespace.ts; также review, main frozen game diagnosis и интеграция |
+
+Обе новые рабочие копии созданы job jb31a47 EXIT0 от base **5f5fa934468f2c71efca197ffd05428398f44761**:
+
+- C:/Projects/bottleship-oss/.wt/lan-udp-connreset, branch codex/lan-udp-connreset.
+- C:/Projects/bottleship-oss/.wt/lan-dp8-host-mesh, branch codex/lan-dp8-host-mesh.
+
+В каждой только node_modules и logs/tools являются junction к проверенному main worktree. Считать эти два каталога READONLY; не выполнять bun install и не редактировать зависимости через junction. Остальной logs у каждой копии собственный: whole-logs junction намеренно не создан, иначе imports тестов разрешились бы в старый src. Fixtures/tests переносить физически в нужную копию. Старые Native evidence читать по absolute path основного worktree, не редактировать. Package workspace symlinks в общих node_modules могут указывать в main: package-level изменения требуют отдельного решения, текущие реализации ограничены src/worker и tests/tools.
+
+Все команды явно выполнять из соответствующей копии. main frozen frontend и его source manifest не менять. Лёгкие focused unit tests в новых копиях разрешены; перед actual browser/native diagnostic Root останавливает параллельные тесты. Пока не выполнять merges/cherry-picks/push. Сначала stable source manifest и review, затем свежий coherent freeze/build/proof при интеграции. Новые checkout могут иметь CRLF из Git autocrlf: нужны собственные новые source hashes, старые manifest не «исправлять».
 
 ## Настоящая игра: где остановились
 
