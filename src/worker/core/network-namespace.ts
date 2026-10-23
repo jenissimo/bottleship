@@ -7,7 +7,7 @@ import { validUdpHostOpenRequest, type UdpHostOpenRequest } from "../net/netplay
 import { UdpPeerLeaseRpc, udpLeaseError } from "../net/udp-peer-lease-rpc";
 import { type UdpPeerLeaseRequest, validPort, isExternalIpv4Node, isExternalIpv6Node } from "../net/netplay-wire";
 import { decodeDatagram, encodeDatagram, isBroadcastNode, isMulticastIpv4Node, MAX_FRAME_SIZE, NetResolveError,
-    type ResolveRequest, type ResolveResult, PROTO_RAW4, validBindingGeneration, isDatagramProtocol, isTcpProtocol, isRawProtocol, parseIpv6, type GatewayIpv6Address, decodeTcpFrame, encodeTcpFrame, RST, SYN, SYNACK, FIN } from "../net/netplay-wire";
+    type ResolveRequest, type ResolveResult, PROTO_UDP, PROTO_UDP6, PROTO_RAW4, validBindingGeneration, isDatagramProtocol, isTcpProtocol, isRawProtocol, parseIpv6, type GatewayIpv6Address, decodeTcpFrame, encodeTcpFrame, RST, SYN, SYNACK, FIN } from "../net/netplay-wire";
 
 const PORTS = 8 * 65536, WORDS = PORTS / 32, HEADER = 16, META = 8;
 const MAX_BYTES = 1024 * 1024, MAX_FRAMES = 256;
@@ -304,7 +304,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             connected: false, routeLocal: true,
             connectionState: () => !this.closed && !!Atomics.load(this.ports.header, 1),
             supportsMulticast4: () => !this.closed && !!Atomics.load(this.ports.header, 1) && Atomics.load(this.ports.header, MULTICAST4_CAPABILITY) === 1,
-            send: (frame,generation=0) => { this.trackTcp(0, 1, frame,generation); return this.route(frame,generation); },
+            send: (frame,generation=0) => { this.trackTcp(0, 1, frame,generation); return this.route(frame,generation,null); },
             resolve: async (request, signal) => {
                 const result = await this.backplane.resolve(request.host, request.family, signal);
                 this.recordResolved(result); return result;
@@ -599,7 +599,26 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 ...(multicastTargets ? {deliveryGeneration: multicastTargets.get(slot)!.generation} : {}) }, [copy.buffer]);
         }
     }
-    private route(frame: Uint8Array,generation=0): boolean {
+    private queueLocalUdpReset(datagram: NonNullable<ReturnType<typeof decodeDatagram>>, generation: number, client: Client | null): void {
+        const {proto, srcPort: localPort, dstPort: remotePort} = datagram;
+        const slot = client?.slot ?? 0, epoch = client?.epoch ?? 1, key = proto + ":" + localPort;
+        const deliveryGeneration = client ? client.deliveryGenerations.get(key) ?? 0 : this.network.deliveryGeneration(localPort, proto);
+        const processEpoch = Atomics.load(this.ports.meta, slot * META + 7);
+        if (!validBindingGeneration(generation) || !deliveryGeneration || !this.ports.alive(slot, epoch)
+            || this.ports.generation(localPort, proto) !== generation || !this.ports.targets(proto, localPort).includes(slot)) return;
+        const node = this.network.node.slice();
+        queueMicrotask(() => {
+            if (this.closed || !this.ports.alive(slot, epoch) || Atomics.load(this.ports.meta, slot * META + 7) !== processEpoch
+                || this.ports.generation(localPort, proto) !== generation || !this.ports.targets(proto, localPort).includes(slot)) return;
+            const value: LanSocketError = {node, localPort, remotePort, proto, code: 10054, bindingGeneration: generation};
+            if (client) {
+                if (this.clients.get(slot) !== client || client.deliveryGenerations.get(key) !== deliveryGeneration) return;
+                // The owner's incarnation is checked again after MessagePort delivery.
+                client.port.postMessage({type: "socketError", value, deliveryGeneration});
+            } else if (this.network.deliveryGeneration(localPort, proto) === deliveryGeneration) this.network.notifySocketError(value);
+        });
+    }
+    private route(frame: Uint8Array,generation=0,source?:Client|null): boolean {
         if (this.closed) return false;
         const datagram = decodeDatagram(frame);
         if (!datagram) return false;
@@ -615,6 +634,8 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         if (!local && this.backplane.connected) {
             if (!this.backplane.send(datagram.srcPort, datagram.node, datagram.dstPort, datagram.payload, datagram.proto,generation)) return false;
         } else if (!local && !broadcast) return false;
+        if (local && source !== undefined && (datagram.proto === PROTO_UDP || datagram.proto === PROTO_UDP6)
+            && !this.ports.targets(datagram.proto, datagram.dstPort).length) this.queueLocalUdpReset(datagram, generation, source);
         if (local || broadcast) this.deliver(encodeDatagram(datagram.proto, this.network.node, datagram.dstPort, datagram.srcPort, datagram.payload));
         return true;
     }
@@ -642,7 +663,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                     this.releaseClientPort(client, item);
                     continue;
                 }
-                if (!this.route(item.frame, item.generation)) break;
+                if (!this.route(item.frame, item.generation, client)) break;
                 // A synchronous disconnect may already have discarded this item.
                 if (client.pending[0] !== item) continue;
                 client.pending.shift();
@@ -705,7 +726,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             if (client.pending.length) {
                 if (reliable) { if (!this.queueClient(client, { kind: "frame", frame, generation })) return; }
                 else this.ports.release(client.slot, client.epoch, frame.byteLength, false);
-            } else if (!this.route(frame,generation) && reliable && this.backplane.connected) {
+            } else if (!this.route(frame,generation,client) && reliable && this.backplane.connected) {
                 if (!this.queueClient(client, { kind: "frame", frame, generation })) return;
             } else this.ports.release(client.slot, client.epoch, frame.byteLength, false);
             client.port.postMessage({ type: "writable" });
@@ -1031,7 +1052,12 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         } else if (message?.type === "peer") this.network.notifyPeerDisconnected(message.value);
         else if (message?.type === "portLeft") {
             this.network.notifyPortDisconnected(message.value);
-        } else if (message?.type === "socketError") this.network.notifySocketError(message.value);
+        } else if (message?.type === "socketError") {
+            const error = message.value;
+            if (message.deliveryGeneration !== undefined && (!validBindingGeneration(message.deliveryGeneration)
+                || message.deliveryGeneration !== this.network.deliveryGeneration(error?.localPort, error?.proto))) return;
+            this.network.notifySocketError(error);
+        }
         else if (message?.type === "writable") this.network.notifyWritable();
         else if (message?.type === "reply") {
             const pending = this.pending.get(message.id);

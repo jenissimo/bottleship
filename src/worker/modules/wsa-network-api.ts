@@ -500,6 +500,29 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     };
     api.WSAIoctl = adapt(counter, setError, a => {
         const s = table.get(a[0]);
+        if ((a[1] >>> 0) === 0x9800000c && (s.af === 2 || s.af === 23) && (s.type === 1 || s.type === 2)) {
+            // Native validates the three required arguments before selecting the TCP/UDP provider.
+            // The UDP provider consumes only a BOOLEAN; the non-NULL byte-count and output are unused.
+            if (!a[2] || !(a[3] >>> 0) || !a[6]) fail(WSA.EFAULT);
+            if (s.type !== 2) fail(WSA.EINVAL);
+            const memory = Mem.getView()!;
+            if (!isValidUserAddress(memory, a[2], 1, "r")) fail(WSA.EFAULT);
+            table.setUdpConnReset(a[0], Mem.readUint8(a[2]) !== 0);
+            if (!s.overlapped || !a[7]) return { value: 0, error: 0 };
+            if (!isValidUserAddress(memory, a[7], 20, "rw") ||
+                (a[8] && !isValidUserAddress(memory, a[8], 1, "rx"))) fail(WSA.EFAULT);
+            // The physical toggle precedes the measured IOCP+routine rejection. That error
+            // initializes only Internal and promises neither an APC nor an IOCP packet.
+            Mem.writeUint32(a[7], 259);
+            if (a[8] && hasIoCompletionAssociation(a[0])) fail(WSA.EINVAL);
+            const event = u32(a[7] + 16);
+            const deferred = !a[8] && !(event & 1) && !(event & ~3) && hasIoCompletionAssociation(a[0]);
+            const provider = overlap(), lease = table.acquireNativeIo(a[0]);
+            return provider.issue(a[0], a[7], a[8], "control", () => ({ bytes: 0, flags: 0, writes: [] }),
+                () => [], true, undefined,
+                { nativeIoLease: lease, initializePending: false, immediateErrorHasNoCompletion: true,
+                    deferStatusUntilDequeue: deferred, deferStatusWhenImmediate: deferred });
+        }
         if ((a[1] >>> 0) === 0x4004747f) {
             // Query outputs are distinct from stream I/O and never bind the socket.
             // Native probes the complete caller capacity, then copies whole records.

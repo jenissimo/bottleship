@@ -19,6 +19,8 @@ export interface WsaIoPolicy {
     /** issue() takes ownership even when validation throws; terminal operations release exactly once. */
     nativeIoLease?: WsaNativeIoLease;
     deferStatusUntilDequeue?: boolean;
+    /** A successful UDP control request can return zero while IOCP still owns its pending IOSB. */
+    deferStatusWhenImmediate?: boolean;
     forcePending?: boolean | ((result: WsaIoResult) => boolean);
     cancellable?: boolean;
     completionError?: (error: number) => number;
@@ -224,7 +226,7 @@ export class WsaOverlapped {
         request.completionTarget ??= captureSocketIoCompletion(this.table, request.objectId);
         // No operation can execute again after this point; publication retains only copied results.
         this.releaseNativeIo(request);
-        request.deferredStatus = !immediate && !!request.policy?.deferStatusUntilDequeue;
+        request.deferredStatus = !!request.policy?.deferStatusUntilDequeue && (!immediate || !!request.policy?.deferStatusWhenImmediate);
         const notify = (answer: WsaIoResult) => {
             if (request.done || !this.isCurrent(request)) return;
             request.done = true; request.publishing = false;

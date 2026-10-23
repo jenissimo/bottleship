@@ -1,6 +1,6 @@
 // Adapted from cszackrison/bottleship, Apache-2.0; see packages/lan/NOTICE.
 import {
-    BROADCAST_NODE, PROTO_IPX, PROTO_UDP, PROTO_RAW4, isMulticastIpv4Node, multicast4Node, validMulticast4Header, type UdpMulticast4Header, validBindingGeneration, decodeDatagram, encodeDatagram, isBroadcastNode, isLanNode,
+    BROADCAST_NODE, PROTO_IPX, PROTO_UDP, PROTO_UDP6, PROTO_RAW4, isMulticastIpv4Node, multicast4Node, validMulticast4Header, type UdpMulticast4Header, validBindingGeneration, decodeDatagram, encodeDatagram, isBroadcastNode, isLanNode,
     isProtocol, isRawProtocol, validRawPayload, maxPayload, nodeToIpv4, validPort, isAddressNode, ipv4ToNode, isExternalIpv4Node, isExternalIpv6Node, LAN_IPV6_PREFIX, type GatewayIpv6Address,
 } from "./netplay-wire";
 export {
@@ -383,9 +383,24 @@ export class LanNetwork {
             this.stats.dropped++;
             return false;
         }
+        if (local && (proto === PROTO_UDP || proto === PROTO_UDP6) && !this.isBound(dstPort, proto))
+            this.queueLocalUdpReset(srcPort, dstPort, proto, bindingGeneration);
         if (local || broadcast) this.deliverLocal(proto, this.node, srcPort, dstPort, data);
         this.stats.sent++;
         return true;
+    }
+    /** Only trusted local send admission may report a missing UDP address object.
+     * Received frames, rejected sends and receiver-side queue drops cannot do so. */
+    private queueLocalUdpReset(localPort: number, remotePort: number, proto: number, bindingGeneration: number): void {
+        const deliveryGeneration = this.deliveryGeneration(localPort, proto);
+        if (!validBindingGeneration(bindingGeneration) || !deliveryGeneration
+            || bindingGeneration !== this.bindingGeneration(localPort, proto)) return;
+        const node = this.node.slice();
+        queueMicrotask(() => {
+            if (deliveryGeneration !== this.deliveryGeneration(localPort, proto)
+                || bindingGeneration !== this.bindingGeneration(localPort, proto)) return;
+            this.notifySocketError({node, localPort, remotePort, proto, code: 10054, bindingGeneration});
+        });
     }
     receiveFrame(frame: Uint8Array, allowLoopback = false,bindingGeneration?:number, deliveryGeneration?:number): void {
         const datagram = decodeDatagram(frame);

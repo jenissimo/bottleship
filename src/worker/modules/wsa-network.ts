@@ -52,7 +52,7 @@ interface SocketState {
     oob: number | null; oobPending: Array<{ value: number; mark: number }>; oobInline: boolean; readPosition: number; urgentMark: number | null;
     extendedAddress: boolean; receiveHeader: boolean;
     headerInclude: boolean; ipTtl: number; ipTos: number; ipOptionsChanged: boolean;
-    keepAlive: boolean; noDelay: boolean;
+    keepAlive: boolean; noDelay: boolean; udpConnReset: boolean;
     multicastInterface: number; multicastTtl: number; multicastLoop: boolean;
     peerId: number; credit: number; writeBlocked: boolean; connectTimer?: ReturnType<typeof setTimeout>;
     broadcast: boolean; reuse: boolean; packetType: number; filterPacketType: number | null; receiveBroadcast: boolean; receiveLimit: number; sendLimit: number;
@@ -103,6 +103,8 @@ export class WsaSocketTable {
             if (!binding) return;
             for (const id of binding.sockets) {
                 const s = this.get(id);
+                // SIO_UDP_CONNRESET suppresses future ICMP notifications, never an already queued error.
+                if ((error.proto === PROTO_UDP || error.proto === PROTO_UDP6) && error.code === WSA.ECONNRESET && !s.udpConnReset) continue;
                 if (s.peer && ((s.type !== 3 && s.peer.port !== error.remotePort) || !same(s.peer.node, error.node))) continue;
                 if (error.proto === PROTO_TCP || error.proto === PROTO_TCP6) {
                     if (error.wireId !== undefined && s.wireId !== error.wireId) continue;
@@ -271,7 +273,7 @@ export class WsaSocketTable {
             id, wireId, af, type, protocol: selectedProtocol, connectContextPending: false, disconnected: false, connectedAt: 0, nonBlocking: false, overlapped: true, handleFlags: 1, local: null, peer: null,
             state: "new", backlog: 1, pending: [], packets: [], chunks: [], offset: 0, available: 0,
             readShutdown: false, writeShutdown: false, eof: false, error: 0, pendingError: 0,
-            oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, peerId: 0, credit: 0, writeBlocked: false,
+            oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, udpConnReset: true, peerId: 0, credit: 0, writeBlocked: false,
             multicastInterface: 0, multicastTtl: 1, multicastLoop: true,
             broadcast: false, reuse: false, packetType: af === 6 ? selectedProtocol - 1000 : 0,
             filterPacketType: null, receiveBroadcast: true, receiveLimit: BUFFER_LIMIT, sendLimit: BUFFER_LIMIT,
@@ -741,6 +743,12 @@ export class WsaSocketTable {
             socket.oob = updated[0]?.value ?? null; socket.urgentMark = updated[0]?.mark ?? null; socket.oobPending = updated.slice(1);
         }
         socket.oobInline = on; this.refreshEvents(socket); this.changed();
+    }
+    /** This provider option belongs to the physical UDP socket, including reserved aliases. */
+    setUdpConnReset(sid: number, on: boolean): void {
+        const s = this.get(sid);
+        if (typeof on !== "boolean" || s.type !== 2 || (s.af !== 2 && s.af !== 23)) fail(WSA.EINVAL);
+        s.udpConnReset = on;
     }
     setNonBlocking(sid: number, on: boolean): void {
         const s = this.get(sid);

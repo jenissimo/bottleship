@@ -70,11 +70,16 @@ import { runResultToJournal } from "../src/harness/journal";
 import { sessionArtifactPath } from "../src/harness/session";
 
 let _session: CdpSession | null = null;
+let _sessionOpening: Promise<CdpSession> | null = null;
+let _sessionGeneration = 0;
 
-/** Release the CLI transport after an importing tool finishes its harness work. */
+/** Release the CLI transport, including an acquisition that has not finished yet. */
 export function closeHarnessConnection(): void {
-    _session?.close();
+    _sessionGeneration++;
+    _sessionOpening = null;
+    const session = _session;
     _session = null;
+    session?.close();
 }
 
 /** The tab this process drives (`BS_TAB`); "" = the default single-tab session. */
@@ -88,9 +93,26 @@ function artifact(path: string): string {
 
 async function ensureSession(): Promise<CdpSession> {
     if (_session) return _session;
-    const { session } = await connect({ urlMatch: process.env.BS_URL_MATCH });
-    _session = session;
-    return session;
+    if (_sessionOpening) return _sessionOpening;
+
+    const generation = _sessionGeneration;
+    const opening = connect({ urlMatch: process.env.BS_URL_MATCH }).then(({ session }) => {
+        // close() can run while target lookup or the WebSocket handshake is pending.
+        // The late connection still belongs to that retired lifetime, never the next one.
+        if (generation !== _sessionGeneration) {
+            session.close();
+            throw new Error("Harness connection closed while connecting");
+        }
+        _session = session;
+        return session;
+    });
+    _sessionOpening = opening;
+    try {
+        return await opening;
+    } finally {
+        // An old completion must not clear a newer lifetime's pending acquisition.
+        if (_sessionOpening === opening) _sessionOpening = null;
+    }
 }
 
 /** Wait until App mounted, harness facade + loadApp exist, and log streaming is armed. */

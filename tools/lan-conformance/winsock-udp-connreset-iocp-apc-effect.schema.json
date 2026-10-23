@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "status": "SOURCE ONLY; not compiled or run",
+  "format": {
+    "magic": 1112755278,
+    "wordBytes": 4,
+    "byteOrder": "little-endian",
+    "header": [
+      "magic",
+      "totalWordsIncludingHeader",
+      "nonce"
+    ],
+    "record": [
+      "tag",
+      "payloadWords",
+      "payload..."
+    ],
+    "final": {
+      "tag": 65535,
+      "payload": [
+        1398030663
+      ]
+    }
+  },
+  "cases": {
+    "count": 8,
+    "order": "family2/23, initialOn0/1, queued0/1",
+    "targetInputs": "initialON→attemptedOFF DWORD0; initialOFF→attemptedON DWORD1; explicit first byte recorded",
+    "atomicityAssumption": "NONE"
+  },
+  "tags": {
+    "0x0010": [
+      "startupReturn",
+      "LastError",
+      "negotiatedVersion"
+    ],
+    "0x1000": [
+      "WindowsAF",
+      "initialOn",
+      "queued54Requested"
+    ],
+    "0x1001/0x1020/0x1022": [
+      "ordinaryOptionDWORD",
+      "firstByte",
+      "return",
+      "LastError",
+      "returnedSentinel"
+    ],
+    "0x1010/0x1021/0x1050": [
+      "sendReturn",
+      "sendLastError",
+      "selectReturn",
+      "selectLastError",
+      "readReady",
+      "exceptReady"
+    ],
+    "0x1011/0x1040/0x1051": [
+      "recvReturn",
+      "recvLastError",
+      "payloadFirstByte"
+    ],
+    "0x1012/0x1052": [
+      "sendReturn",
+      "sendLastError",
+      "selectReturn",
+      "selectLastError",
+      "readReady",
+      "exceptReady",
+      "recvReturn",
+      "recvLastError",
+      "payloadIsB"
+    ],
+    "0x1030": [
+      "associationSucceeded",
+      "LastError"
+    ],
+    "0x1031": [
+      "targetOptionDWORD",
+      "firstByte",
+      "return",
+      "LastError",
+      "returnedSentinel",
+      "immediateInternal",
+      "immediateHigh",
+      "offset",
+      "offsetHigh"
+    ],
+    "0x1032": [
+      "SleepExReturn",
+      "callbackCount",
+      "callbackError",
+      "callbackBytes",
+      "callbackFlags",
+      "callbackSameThread",
+      "orphanCallbacks",
+      "GQCSReturn",
+      "GQCSError",
+      "packetSameOV",
+      "packetNullOV",
+      "packetBytes",
+      "packetKey",
+      "afterGQCSInternal",
+      "afterGQCSHigh"
+    ],
+    "0x1060": [
+      "clientCloseSucceeded",
+      "livePeerCloseSucceeded",
+      "portCloseSucceeded"
+    ],
+    "0x3002": [
+      "completionSlotIndex",
+      "finalCallbackCount",
+      "callbackError",
+      "callbackBytes",
+      "callbackFlags",
+      "callbackSameThread",
+      "finalInternal",
+      "finalHigh"
+    ],
+    "0x0011": [
+      "cleanupReturn",
+      "LastError"
+    ],
+    "0xfffe": [
+      "unexpectedExceptionCode",
+      "exceptionAccess"
+    ]
+  },
+  "causalOrder": [
+    "Create actual client/live/dead loopback endpoints; warm dead endpoint then close it.",
+    "Ordinary option call establishes initial state BEFORE IOCP association; baseline dead receive and liveB record it.",
+    "Queued cases only: ordinaryON, real dead send and positive read-ready guard, restore initial state, preserve queued error.",
+    "Associate the client with IOCP key42.",
+    "Attempt opposite option with valid static OVERLAPPED+completion routine; record exact error/IOSB/first byte.",
+    "Alertable50ms and GQCS50ms collect callback and packet outcomes.",
+    "Queued cases only: one recv consumes the old queued error; record even unexpected outcome.",
+    "Without any intervening ordinary toggle, send a NEW packet to dead endpoint and observe recv after fixed500ms bound.",
+    "LiveB positive control, close all resources, checkpoint.",
+    "Retain static callback slots through final alertable drain; record late callbacks."
+  ],
+  "comparisonBoundaries": [
+    "No dynamic handles/addresses/TIDs/ports in oracle_results.",
+    "No expected physical result; classify only after fresh native capture.",
+    "Queued and fresh receives use distinct tags; never infer a physical toggle from the old queued54.",
+    "IOCP+APC error22 was measured before, but mutation on that error was not.",
+    "No WSARecvMsg, unsafe pointer, invalid IOSB GetResult, shared section, child process or external endpoint.",
+    "No retry or forced success; any setup/queue prerequisite failure retains checkpoint and exits."
+  ],
+  "auditFile": {
+    "name": "udp-port-audit.bin",
+    "magic": 1112756308,
+    "header": [
+      "magic",
+      "totalWords",
+      "nonce"
+    ],
+    "records": [
+      "WindowsAF",
+      "nativePort"
+    ],
+    "compared": false
+  }
+}
