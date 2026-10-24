@@ -694,6 +694,18 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const s = table.get(a[0]);
         if (s.af === 2 && a[1] === 0 && a[2] >= 9 && a[2] <= 13) return getMulticastOption(table, s.id, s.type, a[2], a[3], a[4]);
         guard(a[4], 4, true);
+        if ((a[1] >>> 0) === 0xffff && (a[2] === 0x2004 || a[2] === 0x2005)) {
+            const wide = a[2] === 0x2005, capacity = u32(a[4]), size = protocolInfoSize(wide);
+            if (!a[3] || (wide ? capacity | 0 : capacity) < size)
+                return { value: -1, error: WSA.EFAULT, writes: wide ? undefined : [dword(a[4], size)] };
+            const entry = wsaProtocols.find(p => p.family === s.af && p.type === s.type && (p.protocol === s.protocol || s.type === 3));
+            if (!entry) fail(WSA.EPROTONOSUPPORT);
+            const image = protocolInfo({ ...entry, protocol: s.protocol }, wide);
+            // ANSI conversion preserves the name's unused tail; the Unicode provider copies the whole record.
+            const written = wide ? size : 116 + Math.min(256, entry.name.length + 1);
+            guard(a[3], written, true);
+            return { value: 0, error: 0, writes: [...patches(a[3], image.subarray(0, written)), dword(a[4], wide ? size : capacity)] };
+        }
         if ((s.af === 2 || s.af === 23) && (((a[1] >>> 0) === 0xffff && a[2] === 8) || (a[1] === 6 && a[2] === 1))) {
             if ((u32(a[4]) | 0) < 1) fail(WSA.EFAULT);
             guard(a[3], 1, true);
