@@ -28,6 +28,8 @@ const broadcast = (a: Uint8Array) => a.every(v => v === 255);
 const multicast4 = (a?: Uint8Array) => !!a && a[0] >= 224 && a[0] <= 239;
 const BUFFER_LIMIT = 256 * 1024;
 const PACKET_LIMIT = 1024;
+// Local engine safety bound for queued UDP errors; not a Windows provider capacity.
+const UDP_ERROR_RECORD_LIMIT = 1024;
 
 export interface WsaAddress {
     family: number;
@@ -56,7 +58,8 @@ export class WsaUdpReceiveFailure extends WsaFailure {
     readonly from: WsaAddress;
     constructor(from: WsaAddress) { super(WSA.ECONNRESET); this.from = copyAddress(from); }
 }
-interface UdpReceiveError { from?: WsaAddress; }
+type UdpReceiveRecord = WsaPacket | { kind: "error"; from?: WsaAddress };
+interface UdpReceiveQueue { records: UdpReceiveRecord[]; dataCount: number; errorCount: number; }
 export interface WsaPacket { data: Uint8Array; from: WsaAddress; truncated?: boolean; ipxHeader?: Uint8Array; }
 interface SocketState {
     id: number; wireId: number; af: number; type: number; protocol: number;
@@ -86,8 +89,9 @@ export type WsaIoPurpose = "data" | "connect" | "accept" | "acceptTarget" | "dis
 export class WsaSocketTable {
     private nextId = 0x10000000; // Opaque socket range, separate from std/file/kernel/COM handles.
     private sockets = new Map<number, SocketState>();
-    // Physical socket state: neither SO_ERROR nor a successful send consumes this receive notification.
-    private readonly udpReceiveErrors = new Map<number, UdpReceiveError>();
+    // Private physical FIFO, shared by all aliases. Never serialized in a SocketState snapshot.
+    // SO_ERROR and a successful send do not consume receive-only error records.
+    private readonly udpReceiveQueues = new Map<number, UdpReceiveQueue>();
     private wireSockets = new Map<number, SocketState>();
     private readonly connectOrigins = new WeakMap<SocketState, WsaAddress>();
     private bindings = new Map<string, Binding>();
@@ -138,8 +142,8 @@ export class WsaSocketTable {
                     if (error.localUdp !== undefined && (!context || context.source.family !== s.af ||
                         context.source.port !== error.localPort || context.destination.port !== error.remotePort ||
                         !(error.node instanceof Uint8Array) || error.node.length !== 6)) continue;
-                    this.udpReceiveErrors.set(s.id, context ? { from: localUdpAddress(context.destination, error.node) } : {});
-                    this.event(s, FD_READ, 0, false);
+                    if (this.enqueueUdp(s, { kind: "error", ...(context ? { from: localUdpAddress(context.destination, error.node) } : {}) }))
+                        this.event(s, FD_READ, 0, false);
                 } else { s.error = error.code; this.event(s, FD_READ, error.code); }
             }
             this.changed();
@@ -192,7 +196,7 @@ export class WsaSocketTable {
         for (const s of this.sockets.values()) if (s.connectTimer) clearTimeout(s.connectTimer);
         for (const b of this.bindings.values()) this.network.unbind(b.port, b.endpoint, b.proto);
         this.bindings.clear();
-        this.sockets.clear(); this.wireSockets.clear(); this.udpReceiveErrors.clear();
+        this.sockets.clear(); this.wireSockets.clear(); this.udpReceiveQueues.clear();
         this.multicastMemberships.clear(); this.multicastMembershipCount = 0;
         // Do not recycle IDs: an old async completion must never target a new socket.
         this.epoch++;
@@ -374,7 +378,7 @@ export class WsaSocketTable {
         this.detach(s);
         this.multicastMembershipCount -= this.multicastMemberships.get(sid)?.size ?? 0;
         this.multicastMemberships.delete(sid);
-        this.sockets.delete(sid >>> 0); this.wireSockets.delete(s.wireId); this.udpReceiveErrors.delete(s.id);
+        this.sockets.delete(sid >>> 0); this.wireSockets.delete(s.wireId); this.udpReceiveQueues.delete(s.id);
         this.changed();
         return 0;
     }
@@ -666,6 +670,44 @@ export class WsaSocketTable {
         return n;
     }
     sendto(sid: number, bytes: Uint8Array | number, to?: WsaAddress): number { return this.send(sid, bytes, to); }
+    /** Admission updates the complete physical record and counters before publishing readiness. */
+    private enqueueUdp(s: SocketState, record: UdpReceiveRecord): boolean {
+        const current = this.udpReceiveQueues.get(s.id);
+        if ("data" in record) {
+            // Preserve the existing data-record and payload bounds. Never evict an admitted head.
+            if ((current?.dataCount ?? 0) >= PACKET_LIMIT || s.available + record.data.length > s.receiveLimit) return false;
+        } else if ((current?.errorCount ?? 0) >= UDP_ERROR_RECORD_LIMIT) return false;
+        const queue: UdpReceiveQueue = current ?? { records: [], dataCount: 0, errorCount: 0 };
+        queue.records.push(record);
+        if ("data" in record) { queue.dataCount++; s.available += record.data.length; }
+        else queue.errorCount++;
+        if (!current) this.udpReceiveQueues.set(s.id, queue);
+        return true;
+    }
+    private receiveUdp(s: SocketState, length: number, flags: number): WsaPacket {
+        const queue = this.udpReceiveQueues.get(s.id), head = queue?.records[0];
+        // Generic socket errors retain their previous priority when no data is queued.
+        // They are separate from receive-only UDP errors and the SO_ERROR latch.
+        if (!queue?.dataCount && s.error) {
+            const error = s.error;
+            if (error !== WSA.ENETDOWN) { s.error = 0; s.pendingError = 0; }
+            fail(error);
+        }
+        if (!queue || !head) fail(WSA.EWOULDBLOCK);
+        if (!(flags & 2)) {
+            queue.records.shift();
+            if ("data" in head) { queue.dataCount--; s.available -= head.data.length; }
+            else queue.errorCount--;
+            if (!queue.records.length) this.udpReceiveQueues.delete(s.id);
+        }
+        this.refreshEvents(s);
+        if (!("data" in head)) {
+            // Every PEEK owns a fresh address copy; caller mutation cannot affect the retained head.
+            if (head.from) throw new WsaUdpReceiveFailure(head.from);
+            fail(WSA.ECONNRESET);
+        }
+        return { from: head.from, data: head.data.slice(0, length), truncated: head.data.length > length };
+    }
     receive(sid: number, length: number, flags = 0): WsaPacket {
         const s = this.get(sid);
         this.rearm(s, FD_READ);
@@ -676,17 +718,10 @@ export class WsaSocketTable {
         if (s.type !== 1) {
             if (flags & 9) fail(WSA.EOPNOTSUPP);
             if (!s.local) { if (s.type === 3) this.autoBind(s); else fail(WSA.EINVAL); }
+            if (s.type === 2 && (s.af === 2 || s.af === 23)) return this.receiveUdp(s, length, flags);
             const packet = s.packets[0];
             if (!packet) {
                 if (s.error) { const error = s.error; if (error !== WSA.ENETDOWN) { s.error = 0; s.pendingError = 0; } fail(error); }
-                const receiveError = this.udpReceiveErrors.get(s.id);
-                if (receiveError) {
-                    if (!(flags & 2)) this.udpReceiveErrors.delete(s.id);
-                    this.refreshEvents(s);
-                    // Each PEEK failure owns a new copy; callers cannot mutate the retained record.
-                    if (receiveError.from) throw new WsaUdpReceiveFailure(receiveError.from);
-                    fail(WSA.ECONNRESET);
-                }
                 fail(WSA.EWOULDBLOCK);
             }
             if (!(flags & 2)) { s.packets.shift(); s.available -= packet.data.length; }
@@ -751,7 +786,11 @@ export class WsaSocketTable {
         const s = this.get(sid);
         if (how < 0 || how > 2) fail(WSA.EINVAL);
         if (s.state !== "connected" && !(s.type === 2 && (s.af === 2 || s.af === 23))) fail(WSA.ENOTCONN);
-        if (how !== 1) { s.readShutdown = true; s.packets = []; s.chunks = []; s.available = 0; }
+        if (how !== 1) {
+            s.readShutdown = true;
+            // NT5 datagram shutdown records the mode without purging the physical receive queue.
+            if (!(s.type === 2 && (s.af === 2 || s.af === 23))) { s.packets = []; s.chunks = []; s.available = 0; }
+        }
         if (how !== 0 && !s.writeShutdown) {
             if (s.type === 1 && !this.frame(s, FIN)) fail(WSA.ENETDOWN);
             s.writeShutdown = true;
@@ -814,7 +853,7 @@ export class WsaSocketTable {
     }
     readable(sid: number): boolean {
         const s = this.get(sid);
-        return !!(s.pending.length || s.packets.length || s.available || s.eof || s.error || this.udpReceiveErrors.has(s.id) || s.readShutdown);
+        return !!(s.pending.length || s.packets.length || s.available || s.eof || s.error || this.udpReceiveQueues.get(s.id)?.records.length || s.readShutdown);
     }
     writable(sid: number): boolean {
         const s = this.get(sid);
@@ -826,7 +865,8 @@ export class WsaSocketTable {
     bytesAvailable(sid: number): number {
         const s = this.get(sid);
         // IP UDP FIONREAD snapshots all queued payload bytes, without consuming a datagram.
-        if (s.type === 2 && (s.af === 2 || s.af === 23)) return s.available;
+        if (s.type === 2 && (s.af === 2 || s.af === 23))
+            return s.available || (this.udpReceiveQueues.get(s.id)?.records.length ? 1 : 0);
         return s.type !== 1 ? (s.packets[0]?.data.length ?? 0) + (s.receiveHeader && s.packets[0]?.ipxHeader ? 30 : 0) : s.available;
     }
     configureEvents(sid: number, mask: number, notify?: (bit: number, error: number) => void): void {
@@ -853,7 +893,7 @@ export class WsaSocketTable {
         if (s.pending.length) this.event(s, FD_ACCEPT);
         if (!s.oobInline && s.oob !== null) this.event(s, FD_OOB);
         if (s.packets.length || s.available) this.event(s, FD_READ);
-        else if (this.udpReceiveErrors.has(s.id)) this.event(s, FD_READ, 0, false);
+        else if (this.udpReceiveQueues.get(s.id)?.records.length) this.event(s, FD_READ, 0, false);
         if (this.writable(s.id)) this.event(s, FD_WRITE);
         if (s.eof && !s.available) this.event(s, FD_CLOSE);
     }
@@ -908,7 +948,9 @@ export class WsaSocketTable {
                 }
                 if (s.af === 6 && ((!s.receiveBroadcast && (ipxFlags & 1)) || (s.filterPacketType !== null && s.filterPacketType !== packetType))) continue;
                 if (s.readShutdown || (s.peer && (!same(s.peer.node, from.node) || s.peer.port !== from.port))) continue;
-                if (s.packets.length >= PACKET_LIMIT || s.available + data.length > s.receiveLimit) continue;
+                const ipUdp = s.type === 2 && (s.af === 2 || s.af === 23);
+                const dataCount = ipUdp ? this.udpReceiveQueues.get(s.id)?.dataCount ?? 0 : s.packets.length;
+                if (dataCount >= PACKET_LIMIT || s.available + data.length > s.receiveLimit) continue;
                 let ipxHeader: Uint8Array | undefined;
                 if (proto === PROTO_IPX) {
                     ipxHeader = new Uint8Array(30); const header = new DataView(ipxHeader.buffer);
@@ -916,7 +958,9 @@ export class WsaSocketTable {
                     ipxHeader.set(IPX_NETNUM, 6); ipxHeader.set(ipxFlags & 1 ? new Uint8Array(6).fill(255) : this.network.node, 10);
                     header.setUint16(16, port); ipxHeader.set(IPX_NETNUM, 18); ipxHeader.set(from.node, 22); header.setUint16(28, from.port);
                 }
-                s.packets.push({ from: copyAddress(from), data: data.slice(), ipxHeader }); s.available += data.length;
+                const received = { from: copyAddress(from), data: data.slice(), ipxHeader };
+                if (ipUdp) { if (!this.enqueueUdp(s, received)) continue; }
+                else { s.packets.push(received); s.available += data.length; }
                 this.event(s, FD_READ);
             }
             this.changed(); return;

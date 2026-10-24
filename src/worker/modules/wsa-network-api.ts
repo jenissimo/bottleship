@@ -493,7 +493,7 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const s = table.get(a[0]); guard(a[2], 4, true);
         switch (a[1] >>> 0) {
             case 0x8004667e: table.setNonBlocking(s.id, u32(a[2]) !== 0); return { value: 0, error: 0 };
-            case 0x4004667f: return { value: 0, writes: [dword(a[2], table.bytesAvailable(s.id))] };
+            case 0x4004667f: return { value: 0, error: 0, writes: [dword(a[2], table.bytesAvailable(s.id))] };
             case 0x40047307: return { value: 0, writes: [dword(a[2], +table.atMark(s.id))] };
             default: fail(WSA.EINVAL);
         }
