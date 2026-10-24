@@ -27,3 +27,41 @@ export function encodeActorValue(value: unknown): string {
 export function decodeActorValue(value: string): any {
     return JSON.parse(value, (_name, item) => item && typeof item === "object" && Array.isArray(item.$wsaBytes) ? Uint8Array.from(item.$wsaBytes) : item);
 }
+
+/** Error-only actor metadata uses plain byte arrays, validated before any Uint8Array conversion. */
+export interface WsaActorUdpReceiveError {
+    version: 1;
+    family: 2 | 23;
+    address: number[];
+    node: number[];
+    port: number;
+    scopeId?: number;
+    flowInfo?: number;
+}
+export function copyActorUdpReceiveError(value: unknown): WsaActorUdpReceiveError | undefined {
+    try {
+        if (!value || typeof value !== "object" || Array.isArray(value) ||
+            Object.getPrototypeOf(value) !== Object.prototype) return;
+        const item = value as Partial<WsaActorUdpReceiveError>;
+        const allowed = new Set(["version", "family", "address", "node", "port", "scopeId", "flowInfo"]);
+        if (Object.keys(item).some(key => !allowed.has(key)) || item.version !== 1 ||
+            (item.family !== 2 && item.family !== 23)) return;
+        const bytes = (input: unknown, length: number): input is number[] => {
+            if (!Array.isArray(input) || Object.getPrototypeOf(input) !== Array.prototype || input.length !== length) return false;
+            for (let i = 0; i < length; i++) {
+                if (!Object.prototype.hasOwnProperty.call(input, i) || !Number.isInteger(input[i]) || input[i] < 0 || input[i] > 255) return false;
+            }
+            return true;
+        };
+        const u32 = (input: unknown): input is number =>
+            typeof input === "number" && Number.isInteger(input) && input >= 0 && input <= 0xffffffff;
+        if (!bytes(item.address, item.family === 2 ? 4 : 16) || !bytes(item.node, 6) ||
+            !Number.isInteger(item.port) || item.port! < 1 || item.port! > 65535 ||
+            (item.scopeId !== undefined && !u32(item.scopeId)) ||
+            (item.flowInfo !== undefined && !u32(item.flowInfo)) ||
+            (item.family === 2 && (item.scopeId !== undefined || item.flowInfo !== undefined))) return;
+        return { version: 1, family: item.family, address: [...item.address], node: [...item.node], port: item.port!,
+            ...(item.scopeId !== undefined ? { scopeId: item.scopeId } : {}),
+            ...(item.flowInfo !== undefined ? { flowInfo: item.flowInfo } : {}) };
+    } catch { return; }
+}

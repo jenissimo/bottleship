@@ -11,7 +11,7 @@ import { isValidAddress, isValidUserAddress } from "../core/memory/address-guard
 import { getVirtualNetworkTopology, encodeInterfaceList, INTERFACE_INFO_SIZE } from "../net/virtual-topology";
 import { System } from "../core/system";
 import type { DeferredWrite, ThunkImplementation, ThunkResult } from "../core/thunking/thunk-dispatcher";
-import { WsaSocketTable, WsaFailure, WSA, ipv4Address, ipv6Address, type WsaAddress, type WsaPacket } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA, ipv4Address, ipv6Address, type WsaAddress, type WsaPacket } from "./wsa-network";
 import { IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
 import { hasIoCompletionAssociation } from "./kernel32/sync";
 import { reserveControlApc } from "./wsa-control-apc";
@@ -439,13 +439,24 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const s = table.get(a[0]), length = a[2] | 0;
         if (length < 0) fail(WSA.EINVAL);
         if (length) guard(a[1], length, true);
+        // recvfrom accepts either both optional name pointers or neither, before consuming a UDP notification.
+        if (from && s.type === 2 && (s.af === 2 || s.af === 23) && !!a[4] !== !!a[5]) fail(WSA.EFAULT);
         const out = from ? outputAddress(a[4], a[5], s.af, s.extendedAddress) : () => [];
         const attempt = receiveAttempt(table, a[0], length, a[3]);
-        return mapPrepared(waitOperation(table, a[0], attempt, s.receiveTimeout, false, attempt.partial),
-            packet => ({ value: packet.truncated ? -1 : packet.data.length, error: packet.truncated ? WSA.EMSGSIZE : 0,
-                writes: [...patches(a[1], packet.data), ...out(packet.from),
-                    // Truncation reports an error while preserving the copied prefix.
-                ] }));
+        const received = (packet: WsaPacket): Prepared => ({
+            value: packet.truncated ? -1 : packet.data.length, error: packet.truncated ? WSA.EMSGSIZE : 0,
+            // Truncation reports an error while preserving the copied prefix.
+            writes: [...patches(a[1], packet.data), ...out(packet.from)],
+        });
+        const failed = (error: unknown): Prepared => {
+            if (!(error instanceof WsaUdpReceiveFailure)) throw error;
+            // The payload remains untouched; adapt publishes these address-only writes for the issuing owner.
+            return { value: -1, error: error.code, writes: out(error.from) };
+        };
+        try {
+            const result = waitOperation(table, a[0], attempt, s.receiveTimeout, false, attempt.partial);
+            return result instanceof Promise ? result.then(received, failed) : received(result);
+        } catch (error) { return failed(error); }
     };
     api.recv = adapt(counter, setError, a => recv(a, false));
     api.recvfrom = adapt(counter, setError, a => recv(a, true));

@@ -1,8 +1,8 @@
 import { LanNetwork } from "../net/lan-network";
 import { ChildProcessNetworkNamespace, readNetworkNamespaceProcesses, isNetworkNamespaceProcessLive, type NetworkNamespaceBoot } from "../core/network-namespace";
-import { WsaSocketTable, WsaFailure, WSA } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA } from "./wsa-network";
 import { WsaActorKernel } from "./wsa-actor-kernel";
-import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_EXECUTING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, actorRequestFits, encodeActorValue, type WsaActorIdentity, type WsaActorRequest } from "./wsa-actor-protocol";
+import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_EXECUTING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, actorRequestFits, encodeActorValue, copyActorUdpReceiveError, type WsaActorIdentity, type WsaActorRequest } from "./wsa-actor-protocol";
 let started = false;
 function start(network: NetworkNamespaceBoot, control: MessagePort): void {
     const lan = new LanNetwork(), namespace = new ChildProcessNetworkNamespace(lan, network), kernel = new WsaActorKernel(new WsaSocketTable(lan));
@@ -30,7 +30,17 @@ function start(network: NetworkNamespaceBoot, control: MessagePort): void {
                 else throw new WsaFailure(WSA.EINVAL);
             }
             result = kernel.execute(identity, message.command, message.args, message.nativeHandleOnly ?? false);
-        } catch (error) { status = WSA_ACTOR_ERROR; result = { error: error instanceof WsaFailure ? error.code : WSA.ENOBUFS }; }
+        } catch (error) {
+            status = WSA_ACTOR_ERROR;
+            if (error instanceof WsaUdpReceiveFailure) {
+                const from = error.from, address = from.family === 2 ? from.ip : from.ip6;
+                const udpReceive = address && copyActorUdpReceiveError({
+                    version: 1, family: from.family, address: Array.from(address), node: Array.from(from.node), port: from.port,
+                    ...(from.family === 23 ? { scopeId: from.scopeId ?? 0, flowInfo: from.flowInfo ?? 0 } : {}),
+                });
+                result = udpReceive ? { error: error.code, udpReceive } : { error: WSA.ENOBUFS };
+            } else result = { error: error instanceof WsaFailure ? error.code : WSA.ENOBUFS };
+        }
         let bytes: Uint8Array;
         try { bytes = new TextEncoder().encode(encodeActorValue(result)); }
         catch { status = WSA_ACTOR_ERROR; bytes = new TextEncoder().encode('{"error":10055}'); }

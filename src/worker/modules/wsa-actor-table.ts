@@ -1,8 +1,8 @@
-import { WsaSocketTable, WsaFailure, WSA, type WsaAddress, type WsaNativeIoLease, type WsaIoPurpose } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA, type WsaAddress, type WsaNativeIoLease, type WsaIoPurpose } from "./wsa-network";
 import type { LanNetwork } from "../net/lan-network";
 import { TCP_SEGMENT } from "../net/netplay-wire";
 import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, WSA_ACTOR_CANCELLED, WSA_ACTOR_EXECUTING,
-    actorRequestFits, decodeActorValue, type WsaActorClientBoot, type WsaActorNotification, type WsaActorRoute } from "./wsa-actor-protocol";
+    actorRequestFits, decodeActorValue, copyActorUdpReceiveError, type WsaActorClientBoot, type WsaActorNotification, type WsaActorRoute } from "./wsa-actor-protocol";
 type State = ReturnType<WsaSocketTable["get"]>;
 export interface WsaActorTable extends WsaSocketTable { duplicate(socket: number, targetPid: number): number; importDuplicate(reservedHandle: number): number; }
 const commands = new Set(["socket","isValid","isConnected","maxMessageSize","bind","closesocket","listen","acceptError","accept","adoptAccepted","disconnect","deferAccepted","rejectAccepted","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setHandleFlags","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","getMulticastOption","setMulticastOption","changeMulticastMembership","setNonBlocking","readable","writable","exceptional","atMark","bytesAvailable","enumEvents"]);
@@ -51,8 +51,21 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
             if (state === WSA_ACTOR_DONE || state === WSA_ACTOR_ERROR) {
                 const length = Atomics.load(header, 1);
                 if (length < 0 || length > mailbox.byteLength - WSA_ACTOR_HEADER_BYTES) { closed = true; throw new WsaFailure(WSA.ENETDOWN); }
-                const result = decodeActorValue(new TextDecoder().decode(new Uint8Array(mailbox, WSA_ACTOR_HEADER_BYTES, length).slice()));
-                if (state === WSA_ACTOR_ERROR) throw new WsaFailure(result.error);
+                const text = new TextDecoder().decode(new Uint8Array(mailbox, WSA_ACTOR_HEADER_BYTES, length).slice());
+                // Error metadata must be checked as plain JSON, before the general byte-array reviver can clamp values.
+                const result = state === WSA_ACTOR_ERROR ? JSON.parse(text) : decodeActorValue(text);
+                if (state === WSA_ACTOR_ERROR) {
+                    if (result && Object.prototype.hasOwnProperty.call(result, "udpReceive")) {
+                        const from = copyActorUdpReceiveError(result.udpReceive);
+                        if (result.error !== WSA.ECONNRESET || !from) { closed = true; throw new WsaFailure(WSA.ENETDOWN); }
+                        throw new WsaUdpReceiveFailure({
+                            family: from.family, port: from.port, node: Uint8Array.from(from.node),
+                            ...(from.family === 2 ? { ip: Uint8Array.from(from.address) } :
+                                { ip6: Uint8Array.from(from.address), scopeId: from.scopeId ?? 0, flowInfo: from.flowInfo ?? 0 }),
+                        });
+                    }
+                    throw new WsaFailure(result.error);
+                }
                 return result;
             }
             const remaining = deadline - performance.now();

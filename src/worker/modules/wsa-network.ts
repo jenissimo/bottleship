@@ -5,6 +5,7 @@
  */
 import { lanNetwork, type LanNetwork, type LanEndpoint, type LanDatagram, ipv4ToNode, nodeToIpv4,
     IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
+import { copyLocalUdpContext, type LocalUdpContext, type LocalUdpEndpoint } from "../net/local-udp-context";
 import { ipChecksum, ipv4RawPacket, parseRawIp } from "./wsa-raw";
 import { PROTO_RAW4, PROTO_RAW6, RAW_MAX_PACKET, PROTO_IPX, PROTO_UDP, PROTO_TCP, PROTO_UDP6, PROTO_TCP6, TCP_OPTION, TCP_OPTION_KEEPALIVE, TCP_OPTION_NODELAY, SYN_INLINE_FLAG, SYN_KEEPALIVE_FLAG, SYN_NODELAY_FLAG, SYN_WINDOW_MASK, TCP_MAGIC, TCP_HEADER, TCP_SEGMENT, SYN, SYNACK, DATA, FIN, RST, CREDIT, OOB, encodeTcpFrame } from "../net/netplay-wire";
 
@@ -40,6 +41,22 @@ export interface WsaAddress {
     packetType?: number;
     flags?: number;
 }
+function copyAddress(address: WsaAddress): WsaAddress {
+    return { ...address, node: Uint8Array.from(address.node),
+        ...(address.ip ? { ip: Uint8Array.from(address.ip) } : {}),
+        ...(address.ip6 ? { ip6: Uint8Array.from(address.ip6) } : {}) };
+}
+function localUdpAddress(endpoint: LocalUdpEndpoint, node: Uint8Array): WsaAddress {
+    return { family: endpoint.family, port: endpoint.port, node: Uint8Array.from(node),
+        ...(endpoint.family === 2 ? { ip: Uint8Array.from(endpoint.address) } :
+            { ip6: Uint8Array.from(endpoint.address), scopeId: endpoint.scopeId ?? 0, flowInfo: endpoint.flowInfo ?? 0 }) };
+}
+/** A receive-only UDP reset may carry the exact destination of its failed datagram. */
+export class WsaUdpReceiveFailure extends WsaFailure {
+    readonly from: WsaAddress;
+    constructor(from: WsaAddress) { super(WSA.ECONNRESET); this.from = copyAddress(from); }
+}
+interface UdpReceiveError { from?: WsaAddress; }
 export interface WsaPacket { data: Uint8Array; from: WsaAddress; truncated?: boolean; ipxHeader?: Uint8Array; }
 interface SocketState {
     id: number; wireId: number; af: number; type: number; protocol: number;
@@ -69,6 +86,8 @@ export type WsaIoPurpose = "data" | "connect" | "accept" | "acceptTarget" | "dis
 export class WsaSocketTable {
     private nextId = 0x10000000; // Opaque socket range, separate from std/file/kernel/COM handles.
     private sockets = new Map<number, SocketState>();
+    // Physical socket state: neither SO_ERROR nor a successful send consumes this receive notification.
+    private readonly udpReceiveErrors = new Map<number, UdpReceiveError>();
     private wireSockets = new Map<number, SocketState>();
     private readonly connectOrigins = new WeakMap<SocketState, WsaAddress>();
     private bindings = new Map<string, Binding>();
@@ -114,6 +133,13 @@ export class WsaSocketTable {
                     s.error = connecting && error.code === WSA.ECONNRESET ? WSA.ECONNREFUSED : error.code;
                     s.state = "failed"; if (s.connectTimer) clearTimeout(s.connectTimer);
                     this.event(s, connecting ? FD_CONNECT : FD_CLOSE, s.error);
+                } else if ((error.proto === PROTO_UDP || error.proto === PROTO_UDP6) && error.code === WSA.ECONNRESET) {
+                    const context = error.localUdp === undefined ? undefined : copyLocalUdpContext(error.localUdp);
+                    if (error.localUdp !== undefined && (!context || context.source.family !== s.af ||
+                        context.source.port !== error.localPort || context.destination.port !== error.remotePort ||
+                        !(error.node instanceof Uint8Array) || error.node.length !== 6)) continue;
+                    this.udpReceiveErrors.set(s.id, context ? { from: localUdpAddress(context.destination, error.node) } : {});
+                    this.event(s, FD_READ, 0, false);
                 } else { s.error = error.code; this.event(s, FD_READ, error.code); }
             }
             this.changed();
@@ -166,7 +192,7 @@ export class WsaSocketTable {
         for (const s of this.sockets.values()) if (s.connectTimer) clearTimeout(s.connectTimer);
         for (const b of this.bindings.values()) this.network.unbind(b.port, b.endpoint, b.proto);
         this.bindings.clear();
-        this.sockets.clear(); this.wireSockets.clear();
+        this.sockets.clear(); this.wireSockets.clear(); this.udpReceiveErrors.clear();
         this.multicastMemberships.clear(); this.multicastMembershipCount = 0;
         // Do not recycle IDs: an old async completion must never target a new socket.
         this.epoch++;
@@ -348,7 +374,7 @@ export class WsaSocketTable {
         this.detach(s);
         this.multicastMembershipCount -= this.multicastMemberships.get(sid)?.size ?? 0;
         this.multicastMemberships.delete(sid);
-        this.sockets.delete(sid >>> 0); this.wireSockets.delete(s.wireId);
+        this.sockets.delete(sid >>> 0); this.wireSockets.delete(s.wireId); this.udpReceiveErrors.delete(s.id);
         this.changed();
         return 0;
     }
@@ -516,6 +542,25 @@ export class WsaSocketTable {
             return { ...peer, node, ip: peer.ip?.slice(), ip6: peer.ip6?.slice() };
         } catch (error) { if (error instanceof WsaFailure) throw error; fail((error as { code?: string })?.code === "ACCESS_DENIED" ? WSA.EACCES : WSA.EADDRNOTAVAIL); }
     }
+    private localUdpContext(s: SocketState, destination: WsaAddress): LocalUdpContext | undefined {
+        if (s.type !== 2 || (s.af !== 2 && s.af !== 23) || !s.local ||
+            !this.network.isSelf(destination.node) || broadcast(destination.node) || multicast4(destination.ip) ||
+            destination.ip6?.[0] === 255) return;
+        const family = s.af;
+        const address = family === 2 ? destination.ip : destination.ip6;
+        if (!address) return; // Legacy node-only callers have no original IP endpoint to preserve.
+        const bound = family === 2 ? s.local.ip : s.local.ip6;
+        const loopback = family === 2 ? address[0] === 127 : address.slice(0, 15).every(v => v === 0) && address[15] === 1;
+        const source = bound && !zeros(bound) ? bound : loopback ?
+            (family === 2 ? Uint8Array.of(127, 0, 0, 1) : Uint8Array.from([...new Array<number>(15).fill(0), 1])) :
+            (family === 2 ? this.network.ipv4 : this.network.ipv6);
+        return copyLocalUdpContext({
+            source: { family, address: source, port: this.boundPort(s),
+                ...(family === 23 ? { scopeId: s.local.scopeId ?? 0, flowInfo: s.local.flowInfo ?? 0 } : {}) },
+            destination: { family, address, port: destination.port,
+                ...(family === 23 ? { scopeId: destination.scopeId ?? 0, flowInfo: destination.flowInfo ?? 0 } : {}) },
+        });
+    }
     send(sid: number, bytes: Uint8Array | number, to?: WsaAddress, flags = 0): number {
         const s = this.get(sid);
         if (typeof bytes === "number") fail(WSA.EFAULT);
@@ -581,7 +626,11 @@ export class WsaSocketTable {
                 payload[0] = s.extendedAddress && dst.packetType !== undefined ? dst.packetType : s.packetType;
                 payload[1] = broadcast(dst.node) ? 1 : 0; payload.set(bytes, 2);
             }
-            if (!this.network.send(this.boundPort(s), destination.node, destinationPort, payload, this.proto(s))) {
+            const localUdp = this.localUdpContext(s, destination);
+            const sent = localUdp ?
+                this.network.send(this.boundPort(s), destination.node, destinationPort, payload, this.proto(s), undefined, localUdp) :
+                this.network.send(this.boundPort(s), destination.node, destinationPort, payload, this.proto(s));
+            if (!sent) {
                 if (!this.network.connected) fail(WSA.ENETDOWN);
                 s.writeBlocked = true; this.rearm(s, FD_WRITE); fail(WSA.EWOULDBLOCK);
             }
@@ -630,6 +679,14 @@ export class WsaSocketTable {
             const packet = s.packets[0];
             if (!packet) {
                 if (s.error) { const error = s.error; if (error !== WSA.ENETDOWN) { s.error = 0; s.pendingError = 0; } fail(error); }
+                const receiveError = this.udpReceiveErrors.get(s.id);
+                if (receiveError) {
+                    if (!(flags & 2)) this.udpReceiveErrors.delete(s.id);
+                    this.refreshEvents(s);
+                    // Each PEEK failure owns a new copy; callers cannot mutate the retained record.
+                    if (receiveError.from) throw new WsaUdpReceiveFailure(receiveError.from);
+                    fail(WSA.ECONNRESET);
+                }
                 fail(WSA.EWOULDBLOCK);
             }
             if (!(flags & 2)) { s.packets.shift(); s.available -= packet.data.length; }
@@ -757,7 +814,7 @@ export class WsaSocketTable {
     }
     readable(sid: number): boolean {
         const s = this.get(sid);
-        return !!(s.pending.length || s.packets.length || s.available || s.eof || s.error || s.readShutdown);
+        return !!(s.pending.length || s.packets.length || s.available || s.eof || s.error || this.udpReceiveErrors.has(s.id) || s.readShutdown);
     }
     writable(sid: number): boolean {
         const s = this.get(sid);
@@ -782,8 +839,8 @@ export class WsaSocketTable {
         s.eventPending = 0; s.eventErrors.fill(0);
         return result;
     }
-    private event(s: SocketState, bit: number, error = 0): void {
-        if (error) s.pendingError = error;
+    private event(s: SocketState, bit: number, error = 0, latchError = true): void {
+        if (error && latchError) s.pendingError = error;
         if (!(s.eventMask & bit) || (s.eventDisabled & bit)) return;
         s.eventPending |= bit; s.eventDisabled |= bit;
         s.eventErrors[Math.log2(bit)] = error;
@@ -794,6 +851,7 @@ export class WsaSocketTable {
         if (s.pending.length) this.event(s, FD_ACCEPT);
         if (!s.oobInline && s.oob !== null) this.event(s, FD_OOB);
         if (s.packets.length || s.available) this.event(s, FD_READ);
+        else if (this.udpReceiveErrors.has(s.id)) this.event(s, FD_READ, 0, false);
         if (this.writable(s.id)) this.event(s, FD_WRITE);
         if (s.eof && !s.available) this.event(s, FD_CLOSE);
     }
@@ -812,8 +870,15 @@ export class WsaSocketTable {
         const raw = proto === PROTO_RAW4 || proto === PROTO_RAW6;
         const v6 = proto === PROTO_TCP6 || proto === PROTO_UDP6 || proto === PROTO_RAW6;
         const multicast = proto === PROTO_UDP ? packet.multicast4 : undefined;
-        const from: WsaAddress = { family: proto === PROTO_IPX ? 6 : v6 ? 23 : 2, node: packet.srcNode.slice(), port: raw ? 0 : packet.srcPort,
+        let from: WsaAddress = { family: proto === PROTO_IPX ? 6 : v6 ? 23 : 2, node: packet.srcNode.slice(), port: raw ? 0 : packet.srcPort,
             ...(proto === PROTO_IPX ? {} : v6 ? { ip6: this.network.nodeToIpv6(packet.srcNode), scopeId: this.network.nodeToIpv6Scope(packet.srcNode), flowInfo: 0 } : { ip: multicast?.interfaceIndex === 1 ? Uint8Array.of(127, 0, 0, 1) : nodeToIpv4(packet.srcNode) }) };
+        if (packet.localUdp !== undefined) {
+            const context = copyLocalUdpContext(packet.localUdp);
+            if ((proto !== PROTO_UDP && proto !== PROTO_UDP6) || multicast || !context ||
+                context.source.family !== from.family || context.source.port !== packet.srcPort ||
+                context.destination.port !== port || !(packet.srcNode instanceof Uint8Array) || packet.srcNode.length !== 6) return;
+            from = localUdpAddress(context.source, packet.srcNode);
+        }
         if (proto !== PROTO_TCP && proto !== PROTO_TCP6) {
             if (proto === PROTO_IPX && packet.data.length < 2) return;
             let data = proto === PROTO_IPX ? packet.data.subarray(2) : packet.data;
@@ -849,7 +914,7 @@ export class WsaSocketTable {
                     ipxHeader.set(IPX_NETNUM, 6); ipxHeader.set(ipxFlags & 1 ? new Uint8Array(6).fill(255) : this.network.node, 10);
                     header.setUint16(16, port); ipxHeader.set(IPX_NETNUM, 18); ipxHeader.set(from.node, 22); header.setUint16(28, from.port);
                 }
-                s.packets.push({ from, data: data.slice(), ipxHeader }); s.available += data.length;
+                s.packets.push({ from: copyAddress(from), data: data.slice(), ipxHeader }); s.available += data.length;
                 this.event(s, FD_READ);
             }
             this.changed(); return;

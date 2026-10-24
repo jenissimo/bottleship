@@ -534,9 +534,27 @@ describe("Winsock IPv6, provider catalog and lifecycle", () => {
         const old=h.network.bindingGeneration(4444,1);h.table.closesocket(first);
         const next=h.table.socket(2,2,17);h.table.bind(next,ipv4Address(h.network.ipv4,4444));
         const fresh=h.network.bindingGeneration(4444,1);expect(fresh).not.toBe(old);
+        h.table.setNonBlocking(next,true);
+        const payload=0x20000,option=0x20100,optionLength=0x20110;
+        h.memory()[payload]=0xa5;
+        const recv=()=>h.call("recvfrom",[next,payload,1,0,0,0]);
         const error={node:h.network.node,localPort:4444,remotePort:5555,proto:1,code:WSA.ECONNRESET};
-        h.network.notifySocketError({...error,bindingGeneration:old});expect(h.table.get(next).error).toBe(0);expect(h.table.readable(next)).toBe(false);
-        h.network.notifySocketError({...error,bindingGeneration:fresh});expect(h.table.get(next).error).toBe(WSA.ECONNRESET);expect(h.table.readable(next)).toBe(true);
+        h.network.notifySocketError({...error,bindingGeneration:old});
+        expect(h.table.readable(next)).toBe(false);
+        expect(recv()).toBe(-1);expect(h.error()).toBe(WSA.EWOULDBLOCK);
+        expect(h.memory()[payload]).toBe(0xa5);
+
+        h.network.notifySocketError({...error,bindingGeneration:fresh});
+        expect(h.table.readable(next)).toBe(true);
+        h.set(option,0xdeadbeef);h.set(optionLength,4);
+        expect(h.call("getsockopt",[next,0xffff,0x1007,option,optionLength])).toBe(0);
+        expect(h.error()).toBe(0);expect(h.get(option)).toBe(0);expect(h.get(optionLength)).toBe(4);
+        // SO_ERROR reports0 without consuming the independent receive-only reset.
+        expect(h.table.readable(next)).toBe(true);
+        expect(recv()).toBe(-1);expect(h.error()).toBe(WSA.ECONNRESET);
+        expect(h.memory()[payload]).toBe(0xa5);expect(h.table.readable(next)).toBe(false);
+        expect(recv()).toBe(-1);expect(h.error()).toBe(WSA.EWOULDBLOCK);
+        expect(h.table.readable(next)).toBe(false);
     });
     test("UDP ICMP errors affect one socket and are consumed rather than permanently poisoning it", () => {
         const h = fixture(), rx = h.table.socket(2), tx = h.table.socket(2);

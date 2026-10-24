@@ -1,6 +1,7 @@
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
 import { LanNetwork, type LanPortRegistry, type NetTransport, type LanState, type LanSocketError, type LanPortDisconnect, type RawDeliveryTarget } from "../net/lan-network";
 import { RelayLink } from "../net/relay-link";
+import { copyLocalUdpContext, localUdpFrameBytes, type LocalUdpContext } from "../net/local-udp-context";
 import { UdpHostLeaseRpc, type UdpHostLease } from "../net/udp-host-lease-rpc";
 import type { UdpBindingRequest } from "../net/udp-binding-lease-rpc";
 import { validUdpHostOpenRequest, type UdpHostOpenRequest } from "../net/netplay-wire";
@@ -11,13 +12,17 @@ import { decodeDatagram, encodeDatagram, isBroadcastNode, isMulticastIpv4Node, M
 
 const PORTS = 8 * 65536, WORDS = PORTS / 32, HEADER = 16, META = 8;
 const MAX_BYTES = 1024 * 1024, MAX_FRAMES = 256;
+const DELIVERY_BYTES = PORTS * Int32Array.BYTES_PER_ELEMENT;
+function isDeliveryShared(value: unknown): value is SharedArrayBuffer {
+    return value instanceof SharedArrayBuffer && value.byteLength === DELIVERY_BYTES;
+}
 // Published by the broker before connected=1; process snapshots are asynchronous.
 const MULTICAST4_CAPABILITY = 2, STATE_REVISION = 14, STATE_LENGTH = 15;
 // Validated ready metadata fits below 1 MiB: 4096 IPv4 + 4096 IPv6
 // addresses, 32 listeners with 32 ACL nodes each, and the small DP8 policy.
 // Keep the physical registry offsets unchanged; the bounded snapshot follows it.
 const STATE_BYTES = 1024 * 1024;
-export interface NetworkNamespaceBoot { shared: SharedArrayBuffer; capacity: number; slot: number; epoch: number; pid: number; port: MessagePort }
+export interface NetworkNamespaceBoot { shared: SharedArrayBuffer; deliveryShared: SharedArrayBuffer; capacity: number; slot: number; epoch: number; pid: number; port: MessagePort }
 export interface NamespaceProcess {pid:number;slot:number;epoch:number}
 export interface SocketActorClient extends NamespaceProcess {port:MessagePort}
 export interface ChildNetworkNamespace { boot: NetworkNamespaceBoot; close(): void }
@@ -149,7 +154,7 @@ class AtomicPorts {
         for(;;){const previous=Atomics.load(this.header,13)>>>0;if(previous===0xffffffff)return 0;
             if(Atomics.compareExchange(this.header,13,previous|0,(previous+1)|0)===(previous|0))return previous+1;}
     }
-    registry(slot: number, epoch: number, changed?: (port: number, proto: number, claimed: boolean,generation:number,last:boolean,deliveryGeneration:number) => void): LanPortRegistry {
+    registry(slot: number, epoch: number, changed?: (port: number, proto: number, claimed: boolean,generation:number,last:boolean,deliveryGeneration:number) => void, deliveryStamps?: Int32Array): LanPortRegistry {
         const deliveryGenerations = new Map<number, number>();
         let nextDeliveryGeneration = 1;
         return {
@@ -177,6 +182,8 @@ class AtomicPorts {
                     generation=owners.length?this.generation(port,proto):this.nextBindingGeneration();if(!generation)return false;
                     deliveryGeneration = nextDeliveryGeneration++;
                     deliveryGenerations.set(index, deliveryGeneration);
+                    // A successful bind is visible before its asynchronous claim message.
+                    if (deliveryStamps) Atomics.store(deliveryStamps, index, deliveryGeneration | 0);
                     Atomics.store(this.generations,index,generation|0);
                     Atomics.store(this.modes, index, reuse ? 2 : 1);
                     Atomics.or(this.bits, slot * WORDS + (index >>> 5), 1 << (index & 31));
@@ -190,12 +197,17 @@ class AtomicPorts {
                 if (!token) throw new Error("Network port registry is busy");
                 const generation=this.generation(port,proto),deliveryGeneration=deliveryGenerations.get(index)??0;let last=false;
                 try {
+                    if (deliveryStamps) Atomics.store(deliveryStamps, index, 0);
                     Atomics.and(this.bits, slot * WORDS + (index >>> 5), ~(1 << (index & 31)));
                     last=this.owners(index).length===0;
                     deliveryGenerations.delete(index);
                 } finally { this.unlock(index, token); changed?.(port, proto, false,generation,last,deliveryGeneration); }
             },
         };
+    }
+    owns(slot: number, epoch: number, proto: number, port: number): boolean {
+        const index = proto * 65536 + port;
+        return this.alive(slot, epoch) && !!(Atomics.load(this.bits, slot * WORDS + (index >>> 5)) & (1 << (index & 31)));
     }
     targets(proto: number, port: number): number[] {
         const index = proto * 65536 + port, mask = 1 << (index & 31), word = index >>> 5;
@@ -215,7 +227,7 @@ class AtomicPorts {
         }
         return ports;
     }
-    drop(slot: number, epoch: number): { port: number; proto: number;generation:number }[] {
+    drop(slot: number, epoch: number, deliveryStamps?: Int32Array): { port: number; proto: number;generation:number }[] {
         if (!this.alive(slot, epoch)) return [];
         const ports = this.ports(slot).map(item=>({...item,generation:this.generation(item.port,item.proto)}));
         if (Atomics.compareExchange(this.meta, slot * META, epoch, -epoch) !== epoch) return [];
@@ -223,7 +235,10 @@ class AtomicPorts {
             const index = proto * 65536 + port;
             const token = this.lock(index, 0);
             if (!token) throw new Error("Cannot release a process network port");
-            try { this.owners(index); } finally { this.unlock(index, token); }
+            try {
+                if (deliveryStamps) Atomics.store(deliveryStamps, index, 0);
+                this.owners(index);
+            } finally { this.unlock(index, token); }
         }
         this.bits.fill(0, slot * WORDS, (slot + 1) * WORDS);
         for (let i = 1; i < META; i++) Atomics.store(this.meta, slot * META + i, 0);
@@ -259,7 +274,7 @@ export function isNetworkNamespaceProcessLive(shared:SharedArrayBuffer,capacity:
     const lease=Atomics.load(ports.meta,slot*META);
     return lease>0&&Atomics.load(ports.meta,slot*META+6)===pid&&Atomics.load(ports.meta,slot*META+7)===epoch&&ports.alive(slot,lease);
 }
-type PendingOutbound = { kind: "frame"; frame: Uint8Array; generation: number }
+type PendingOutbound = { kind: "frame"; frame: Uint8Array; generation: number; localUdp?: LocalUdpContext }
     | { kind: "release"; port: number; proto: number; generation: number; last: boolean };
 interface UdpForward<R extends UdpBindingRequest = UdpPeerLeaseRequest> { request: R; cancel(): void }
 interface Client {
@@ -268,8 +283,10 @@ interface Client {
     pid:number;processEpoch:number;actorAttached:boolean;
     slot: number; epoch: number; port: MessagePort; parent: number; pending: PendingOutbound[]; flushing: boolean;
     dns: Map<number, AbortController>; knownPorts: Map<string,number>; deliveryGenerations: Map<string, number>;
+    deliveryStamps: Int32Array;
     barriers: Map<number, ReturnType<typeof setTimeout>>;
 }
+interface LocalUdpRecipient { epoch: number; processEpoch: number; deliveryGeneration: number; client?: Client }
 interface TrackedTcp { slot: number; epoch: number; localPort: number; remotePort: number; proto: number; id: number; peerId: number; node: Uint8Array; fin: boolean; peerFin: boolean;bindingGeneration:number }
 class Backplane extends LanNetwork {
     onFrame?: (frame: Uint8Array,generation?:number) => void;
@@ -304,7 +321,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             connected: false, routeLocal: true,
             connectionState: () => !this.closed && !!Atomics.load(this.ports.header, 1),
             supportsMulticast4: () => !this.closed && !!Atomics.load(this.ports.header, 1) && Atomics.load(this.ports.header, MULTICAST4_CAPABILITY) === 1,
-            send: (frame,generation=0) => { this.trackTcp(0, 1, frame,generation); return this.route(frame,generation,null); },
+            send: (frame,generation=0,localUdp) => { if (localUdp === undefined) this.trackTcp(0, 1, frame,generation); return this.route(frame,generation,null,localUdp); },
             resolve: async (request, signal) => {
                 const result = await this.backplane.resolve(request.host, request.family, signal);
                 this.recordResolved(result); return result;
@@ -331,9 +348,10 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.startSocketActor();
     }
     private startSocketActor():void{
+        const deliveryShared = new SharedArrayBuffer(DELIVERY_BYTES);
         const identity=this.ports.allocate(0,0,true),networkChannel=new MessageChannel(),control=new MessageChannel();
-        this.attach(networkChannel.port1,identity.slot,identity.epoch,0,true);
-        const lease:ChildNetworkNamespace={boot:{...identity,shared:this.ports.shared,capacity:this.ports.capacity,port:networkChannel.port2},close:()=>this.drop(identity.slot,identity.epoch)};
+        this.attach(networkChannel.port1,identity.slot,identity.epoch,0,deliveryShared,true);
+        const lease:ChildNetworkNamespace={boot:{...identity,shared:this.ports.shared,deliveryShared,capacity:this.ports.capacity,port:networkChannel.port2},close:()=>this.drop(identity.slot,identity.epoch)};
         const worker=new Worker(new URL("../modules/wsa-actor-worker.ts",import.meta.url).href,{type:"module"});
         (worker as unknown as {unref?:()=>void}).unref?.();
         const stopped=new Promise<void>(resolve=>worker.addEventListener("close",()=>resolve(),{once:true}));
@@ -415,17 +433,18 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     }
     createChild(pid?:number): ChildNetworkNamespace {
         if(this.closed||this.closing)throw new Error("Process namespace closed");
+        const deliveryShared = new SharedArrayBuffer(DELIVERY_BYTES);
         const identity = this.ports.allocate(0,pid);
         const channel = new MessageChannel();
-        this.attach(channel.port1, identity.slot, identity.epoch, 0);
-        return { boot: { ...identity, shared: this.ports.shared, capacity: this.ports.capacity, port: channel.port2 },
+        this.attach(channel.port1, identity.slot, identity.epoch, 0, deliveryShared);
+        return { boot: { ...identity, shared: this.ports.shared, deliveryShared, capacity: this.ports.capacity, port: channel.port2 },
             close: () => this.drop(identity.slot, identity.epoch) };
     }
-    private attach(port: MessagePort, slot: number, epoch: number, parent: number,service=false): void {
+    private attach(port: MessagePort, slot: number, epoch: number, parent: number,deliveryShared:unknown,service=false): void {
         const pid=Atomics.load(this.ports.meta,slot*META+6);
-        if (!this.ports.alive(slot, epoch) || this.clients.has(slot)||(!service&&pid<1)||pid===this.pid
+        if (!isDeliveryShared(deliveryShared) || !this.ports.alive(slot, epoch) || this.clients.has(slot)||(!service&&pid<1)||pid===this.pid
             ||[...this.clients.values()].some(client=>client.pid===pid)) { port.close();this.ports.drop(slot,epoch);return; }
-        const client: Client = { udpPeers: new Map(), udpHosts: new Map(), pid,processEpoch:Atomics.load(this.ports.meta,slot*META+7),actorAttached:false,slot, epoch, parent, port, pending: [], flushing: false, dns: new Map(), knownPorts: new Map(), deliveryGenerations: new Map(), barriers: new Map() };
+        const client: Client = { udpPeers: new Map(), udpHosts: new Map(), pid,processEpoch:Atomics.load(this.ports.meta,slot*META+7),actorAttached:false,slot, epoch, parent, port, pending: [], flushing: false, dns: new Map(), knownPorts: new Map(), deliveryGenerations: new Map(), deliveryStamps: new Int32Array(deliveryShared), barriers: new Map() };
         this.clients.set(slot, client);
         if(pid>0)this.actor?.control.postMessage({type:"process",...this.ports.processIdentity(slot,pid)});
         port.onmessage = event => this.message(client, event.data);
@@ -480,7 +499,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         for (const client of this.clients.values()) {
             if (!state.connected) {
                 for (const item of client.pending.splice(0)) {
-                    if (item.kind === "frame") this.ports.release(client.slot, client.epoch, item.frame.byteLength, false);
+                    if (item.kind === "frame") this.ports.release(client.slot, client.epoch, localUdpFrameBytes(item.frame, item.localUdp), false);
                     else this.releaseClientPort(client, item);
                 }
                 this.settleBarriers(client, new NetResolveError("NETWORK_DOWN"));
@@ -520,9 +539,34 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             if (!lease.fin) this.route(encodeDatagram(proto, lease.node, lease.remotePort, port, encodeTcpFrame(RST, lease.id, lease.peerId, 10054)),lease.bindingGeneration);
         }
     }
-    private deliver(frame: Uint8Array,bindingGeneration?:number): void {
+    private snapshotLocalUdpRecipients(proto: number, port: number): Map<number, LocalUdpRecipient> {
+        const recipients = new Map<number, LocalUdpRecipient>();
+        const rootGeneration = this.network.deliveryGeneration(port, proto);
+        if (rootGeneration) recipients.set(0, {epoch: Atomics.load(this.ports.meta, 0),
+            processEpoch: Atomics.load(this.ports.meta, 7), deliveryGeneration: rootGeneration});
+        for (const client of this.clients.values()) {
+            const deliveryGeneration = Atomics.load(client.deliveryStamps, proto * 65536 + port) >>> 0;
+            if (deliveryGeneration) recipients.set(client.slot, {epoch: client.epoch,
+                processEpoch: Atomics.load(this.ports.meta, client.slot * META + 7), deliveryGeneration, client});
+        }
+        return recipients;
+    }
+    private localUdpRecipientCurrent(slot: number, proto: number, port: number, recipient: LocalUdpRecipient): boolean {
+        if (!this.ports.owns(slot, recipient.epoch, proto, port) || recipient.processEpoch < 1
+            || Atomics.load(this.ports.meta, slot * META + 7) !== recipient.processEpoch) return false;
+        return slot === 0 ? this.network.deliveryGeneration(port, proto) === recipient.deliveryGeneration
+            : this.clients.get(slot) === recipient.client
+                && (Atomics.load(recipient.client!.deliveryStamps, proto * 65536 + port) >>> 0) === recipient.deliveryGeneration;
+    }
+    private deliver(frame: Uint8Array,bindingGeneration?:number,localUdp?:LocalUdpContext): void {
         const datagram = decodeDatagram(frame);
         if (!datagram) return;
+        const context = localUdp === undefined ? undefined
+            : this.network.validateLocalUdpContext(localUdp, datagram.proto, datagram.srcPort, datagram.dstPort);
+        if (localUdp !== undefined && (!context || !this.network.isSelf(datagram.node) || !!datagram.multicast4)) return;
+        // Capture before target lookup/callbacks; source lifetime is no longer a DATA fence.
+        const localRecipients = context ? this.snapshotLocalUdpRecipients(datagram.proto, datagram.dstPort) : null;
+        const localTargets = context ? new Map<number, LocalUdpRecipient>() : null;
         const raw4 = datagram.proto === PROTO_RAW4;
         if (bindingGeneration !== undefined) {
             if (!validBindingGeneration(bindingGeneration)
@@ -537,6 +581,11 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const multicastTargets = datagram.multicast4 ? new Map<number, {generation: number; client?: Client}>() : null;
         for (const port of targetPorts) {
             for (const slot of this.ports.targets(datagram.proto, port)) {
+                if (localTargets) {
+                    const recipient = localRecipients!.get(slot);
+                    if (!recipient || !this.localUdpRecipientCurrent(slot, datagram.proto, port, recipient)) continue;
+                    localTargets.set(slot, recipient);
+                }
                 if (rawTargets) {
                     const generation = slot === 0 ? this.network.deliveryGeneration(port, datagram.proto)
                         : this.clients.get(slot)?.deliveryGenerations.get(datagram.proto + ":" + port) ?? 0;
@@ -577,14 +626,16 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             }
         }
         for (const slot of targets) {
+            const localRecipient = localTargets?.get(slot);
+            if (localTargets && (!localRecipient || !this.localUdpRecipientCurrent(slot, datagram.proto, datagram.dstPort, localRecipient))) continue;
             if (!slot) {
                 if (rawTargets) this.network.receiveRawFrame(frame, rawTargets.get(slot)!);
-                else this.network.receiveFrame(frame, true, bindingGeneration, multicastTargets?.get(slot)?.generation);
+                else this.network.receiveFrame(frame, true, bindingGeneration, localRecipient?.deliveryGeneration ?? multicastTargets?.get(slot)?.generation, context);
                 continue;
             }
             const client = this.clients.get(slot);
             if (!client || (multicastTargets && multicastTargets.get(slot)?.client !== client)) continue;
-            if (!this.ports.reserve(slot, client.epoch, frame.byteLength, true)) {
+            if (!this.ports.reserve(slot, client.epoch, localUdpFrameBytes(frame, context), true)) {
                 if (!isDatagramProtocol(datagram.proto)) {
                     const tcp = isTcpProtocol(datagram.proto) ? decodeTcpFrame(datagram.payload) : null;
                     if (tcp) this.backplane.send(datagram.dstPort, datagram.node, datagram.srcPort,
@@ -596,10 +647,12 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             const copy = frame.slice();
             client.port.postMessage({ type: "frame", frame: copy,
                 ...(rawTargets ? { rawTargets: rawTargets.get(slot)! } : { bindingGeneration }),
-                ...(multicastTargets ? {deliveryGeneration: multicastTargets.get(slot)!.generation} : {}) }, [copy.buffer]);
+                ...(multicastTargets ? {deliveryGeneration: multicastTargets.get(slot)!.generation} : {}),
+                ...(context ? {localUdp: copyLocalUdpContext(context)!, deliveryGeneration: localRecipient!.deliveryGeneration,
+                    recipientProcessEpoch: localRecipient!.processEpoch} : {}) }, [copy.buffer]);
         }
     }
-    private queueLocalUdpReset(datagram: NonNullable<ReturnType<typeof decodeDatagram>>, generation: number, client: Client | null): void {
+    private queueLocalUdpReset(datagram: NonNullable<ReturnType<typeof decodeDatagram>>, generation: number, client: Client | null, localUdp?: LocalUdpContext): void {
         const {proto, srcPort: localPort, dstPort: remotePort} = datagram;
         const slot = client?.slot ?? 0, epoch = client?.epoch ?? 1, key = proto + ":" + localPort;
         const deliveryGeneration = client ? client.deliveryGenerations.get(key) ?? 0 : this.network.deliveryGeneration(localPort, proto);
@@ -610,18 +663,25 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         queueMicrotask(() => {
             if (this.closed || !this.ports.alive(slot, epoch) || Atomics.load(this.ports.meta, slot * META + 7) !== processEpoch
                 || this.ports.generation(localPort, proto) !== generation || !this.ports.targets(proto, localPort).includes(slot)) return;
-            const value: LanSocketError = {node, localPort, remotePort, proto, code: 10054, bindingGeneration: generation};
+            const value: LanSocketError = {node, localPort, remotePort, proto, code: 10054, bindingGeneration: generation,
+                ...(localUdp ? {localUdp: copyLocalUdpContext(localUdp)!} : {})};
             if (client) {
                 if (this.clients.get(slot) !== client || client.deliveryGenerations.get(key) !== deliveryGeneration) return;
                 // The owner's incarnation is checked again after MessagePort delivery.
-                client.port.postMessage({type: "socketError", value, deliveryGeneration});
-            } else if (this.network.deliveryGeneration(localPort, proto) === deliveryGeneration) this.network.notifySocketError(value);
+                client.port.postMessage({type: "socketError", value, deliveryGeneration, ...(localUdp ? {recipientProcessEpoch: processEpoch} : {})});
+            } else if (this.network.deliveryGeneration(localPort, proto) === deliveryGeneration) {
+                if (value.localUdp) this.network.notifyLocalUdpError({...value, localUdp: value.localUdp});
+                else this.network.notifySocketError(value);
+            }
         });
     }
-    private route(frame: Uint8Array,generation=0,source?:Client|null): boolean {
+    private route(frame: Uint8Array,generation=0,source?:Client|null,localUdp?:LocalUdpContext): boolean {
         if (this.closed) return false;
         const datagram = decodeDatagram(frame);
         if (!datagram) return false;
+        const context = localUdp === undefined ? undefined
+            : this.network.validateLocalUdpContext(localUdp, datagram.proto, datagram.srcPort, datagram.dstPort);
+        if (localUdp !== undefined && (!context || !this.network.isSelf(datagram.node) || !!datagram.multicast4)) return false;
         if (datagram.multicast4) {
             if (!isMulticastIpv4Node(datagram.node)) return false;
             const meta = datagram.multicast4;
@@ -635,8 +695,8 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             if (!this.backplane.send(datagram.srcPort, datagram.node, datagram.dstPort, datagram.payload, datagram.proto,generation)) return false;
         } else if (!local && !broadcast) return false;
         if (local && source !== undefined && (datagram.proto === PROTO_UDP || datagram.proto === PROTO_UDP6)
-            && !this.ports.targets(datagram.proto, datagram.dstPort).length) this.queueLocalUdpReset(datagram, generation, source);
-        if (local || broadcast) this.deliver(encodeDatagram(datagram.proto, this.network.node, datagram.dstPort, datagram.srcPort, datagram.payload));
+            && !this.ports.targets(datagram.proto, datagram.dstPort).length) this.queueLocalUdpReset(datagram, generation, source, context);
+        if (local || broadcast) this.deliver(encodeDatagram(datagram.proto, this.network.node, datagram.dstPort, datagram.srcPort, datagram.payload), undefined, context);
         return true;
     }
     private queueClient(client: Client, item: PendingOutbound): boolean {
@@ -663,11 +723,11 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                     this.releaseClientPort(client, item);
                     continue;
                 }
-                if (!this.route(item.frame, item.generation, client)) break;
+                if (!this.route(item.frame, item.generation, client, item.localUdp)) break;
                 // A synchronous disconnect may already have discarded this item.
                 if (client.pending[0] !== item) continue;
                 client.pending.shift();
-                this.ports.release(client.slot, client.epoch, item.frame.byteLength, false);
+                this.ports.release(client.slot, client.epoch, localUdpFrameBytes(item.frame, item.localUdp), false);
                 client.port.postMessage({ type: "writable" });
             }
             if (!client.pending.length) this.settleBarriers(client);
@@ -719,16 +779,33 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             const frame = message.frame;
             if (!(frame instanceof Uint8Array) || frame.byteLength > MAX_FRAME_SIZE || !decodeDatagram(frame)) return;
             const datagram = decodeDatagram(frame)!;
-            const generation=message.bindingGeneration??0;if(generation!==0&&!validBindingGeneration(generation))return;
-            client.knownPorts.set(datagram.proto + ":" + datagram.srcPort,generation);
+            const cost = localUdpFrameBytes(frame, message.localUdp);
+            const generation=message.bindingGeneration??0;
+            if (generation !== 0 && !validBindingGeneration(generation) && message.localUdp === undefined) return;
+            const context = message.localUdp === undefined ? undefined
+                : this.network.validateLocalUdpContext(message.localUdp, datagram.proto, datagram.srcPort, datagram.dstPort);
+            const key = datagram.proto + ":" + datagram.srcPort;
+            if ((generation !== 0 && !validBindingGeneration(generation))
+                || (message.localUdp !== undefined && (!context || !this.network.isSelf(datagram.node) || !!datagram.multicast4
+                    || !validBindingGeneration(generation) || client.knownPorts.get(key) !== generation
+                    || !validBindingGeneration(message.senderDeliveryGeneration)
+                    || client.deliveryGenerations.get(key) !== message.senderDeliveryGeneration
+                    || message.senderProcessEpoch !== client.processEpoch
+                    || Atomics.load(this.ports.meta, client.slot * META + 7) !== message.senderProcessEpoch))) {
+                this.ports.release(client.slot, client.epoch, cost, false);
+                client.port.postMessage({type: "writable"});
+                return;
+            }
+            // Claim/frame/release FIFO authenticates already-admitted DATA even after source close.
+            if (!context) client.knownPorts.set(key,generation);
             this.trackTcp(client.slot, client.epoch, frame,generation);
             const reliable = !isDatagramProtocol(datagram.proto);
             if (client.pending.length) {
                 if (reliable) { if (!this.queueClient(client, { kind: "frame", frame, generation })) return; }
-                else this.ports.release(client.slot, client.epoch, frame.byteLength, false);
-            } else if (!this.route(frame,generation,client) && reliable && this.backplane.connected) {
+                else this.ports.release(client.slot, client.epoch, cost, false);
+            } else if (!this.route(frame,generation,client,context) && reliable && this.backplane.connected) {
                 if (!this.queueClient(client, { kind: "frame", frame, generation })) return;
-            } else this.ports.release(client.slot, client.epoch, frame.byteLength, false);
+            } else this.ports.release(client.slot, client.epoch, cost, false);
             client.port.postMessage({ type: "writable" });
         } else if (message?.type === "barrier") {
             if(client.pid===0)this.replyWhenDrained(client,message.id);
@@ -754,7 +831,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         } else if (message?.type === "attach" && message.port instanceof MessagePort) {
             const slot = message.slot, epoch = message.epoch;
             if (Number.isInteger(slot) && slot > 0 && slot < this.ports.capacity
-                && Atomics.load(this.ports.meta, slot * META + 1) === client.slot) this.attach(message.port, slot, epoch, client.slot);
+                && Atomics.load(this.ports.meta, slot * META + 1) === client.slot) this.attach(message.port, slot, epoch, client.slot, message.deliveryShared);
         } else if (message?.type === "drop") {
             if (this.clients.get(message.slot)?.parent === client.slot) this.drop(message.slot, message.epoch);
         } else if (message?.type === "configure") {
@@ -882,7 +959,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             && Atomics.load(this.ports.meta, child * META + 1) === slot) this.drop(child, Atomics.load(this.ports.meta, child * META), reason);
         for (const lease of [...this.tcp.values()]) if (lease.slot === slot && lease.epoch === epoch) this.cancelTcpPort(slot, epoch, lease.localPort, lease.proto);
         const actorIdentity=client?this.ports.processIdentity(slot,client.pid):null;
-        const ports = this.ports.drop(slot, epoch);
+        const ports = this.ports.drop(slot, epoch, client?.deliveryStamps);
         if (client) {
             this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts);
             if(client.pid>0){
@@ -1018,11 +1095,12 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     supportsMulticast4(): boolean { return this.connected && Atomics.load(this.ports.header, MULTICAST4_CAPABILITY) === 1; }
     constructor(readonly network: LanNetwork, private readonly boot: NetworkNamespaceBoot) {
         this.ports = new AtomicPorts(boot.shared, boot.capacity);
+        if(!isDeliveryShared(boot.deliveryShared))throw new Error("Invalid namespace delivery storage");
         if(!this.ports.alive(boot.slot,boot.epoch)||Atomics.load(this.ports.meta,boot.slot*META+6)!==boot.pid)throw new Error("Invalid authenticated process namespace");
         network.adoptIdentity(this.ports.node);
         network.setPortRegistry(this.ports.registry(boot.slot, boot.epoch, (port, proto, claimed,generation,last,deliveryGeneration) => {
             boot.port.postMessage({ type: claimed ? "claim" : "released", port, proto,generation,last,deliveryGeneration });
-        }));
+        }, new Int32Array(boot.deliveryShared)));
         network.attach(this);
         boot.port.onmessage = event => this.message(event.data);
         boot.port.start();
@@ -1030,9 +1108,14 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     private message(message: any): void {
         if (this.closed) return;
         if (message?.type === "frame" && message.frame instanceof Uint8Array) {
-            this.ports.release(this.boot.slot, this.boot.epoch, message.frame.byteLength, true);
-            if (message.rawTargets !== undefined) this.network.receiveRawFrame(message.frame, message.rawTargets);
-            else this.network.receiveFrame(message.frame, true, message.bindingGeneration, message.deliveryGeneration);
+            this.ports.release(this.boot.slot, this.boot.epoch, localUdpFrameBytes(message.frame, message.localUdp), true);
+            if (message.localUdp !== undefined && (!validBindingGeneration(message.deliveryGeneration)
+                || message.recipientProcessEpoch !== Atomics.load(this.ports.meta, this.boot.slot * META + 7)
+                || !this.ports.alive(this.boot.slot, this.boot.epoch))) return;
+            if (message.rawTargets !== undefined) {
+                if (message.localUdp !== undefined) return;
+                this.network.receiveRawFrame(message.frame, message.rawTargets);
+            } else this.network.receiveFrame(message.frame, true, message.bindingGeneration, message.deliveryGeneration, message.localUdp);
         } else if (message?.type === "udpPeerControlAck") {
             this.udpControlsInFlight = Math.max(0, this.udpControlsInFlight - 1);
         } else if (message?.type === "udpHostOpened") {
@@ -1056,7 +1139,12 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
             const error = message.value;
             if (message.deliveryGeneration !== undefined && (!validBindingGeneration(message.deliveryGeneration)
                 || message.deliveryGeneration !== this.network.deliveryGeneration(error?.localPort, error?.proto))) return;
-            this.network.notifySocketError(error);
+            if (error?.localUdp !== undefined) {
+                if (!validBindingGeneration(message.deliveryGeneration)
+                    || message.recipientProcessEpoch !== Atomics.load(this.ports.meta, this.boot.slot * META + 7)
+                    || !this.ports.alive(this.boot.slot, this.boot.epoch)) return;
+                this.network.notifyLocalUdpError(error);
+            } else this.network.notifySocketError(error);
         }
         else if (message?.type === "writable") this.network.notifyWritable();
         else if (message?.type === "reply") {
@@ -1070,16 +1158,24 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
             }
         }
     }
-    send(frame: Uint8Array<ArrayBuffer>,bindingGeneration=0): boolean {
+    send(frame: Uint8Array<ArrayBuffer>,bindingGeneration=0,localUdp?:LocalUdpContext): boolean {
         if (this.closed || !this.ports.alive(this.boot.slot, this.boot.epoch)) return false;
         const datagram = decodeDatagram(frame);
         if (!datagram) return false;
+        const context = localUdp === undefined ? undefined
+            : this.network.validateLocalUdpContext(localUdp, datagram.proto, datagram.srcPort, datagram.dstPort);
+        const senderDeliveryGeneration = this.network.deliveryGeneration(datagram.srcPort, datagram.proto);
+        const senderProcessEpoch = Atomics.load(this.ports.meta, this.boot.slot * META + 7);
+        if (localUdp !== undefined && (!context || !this.network.isSelf(datagram.node) || !!datagram.multicast4
+            || !validBindingGeneration(bindingGeneration) || bindingGeneration !== this.network.bindingGeneration(datagram.srcPort, datagram.proto)
+            || !validBindingGeneration(senderDeliveryGeneration) || senderProcessEpoch < 1)) return false;
         if (datagram.multicast4) {
             if (!isMulticastIpv4Node(datagram.node)) return false;
             if (this.connected && datagram.multicast4.interfaceIndex === 2 && datagram.multicast4.ttl > 0 && !this.network.udpMulticast4V1) return false;
         } else if (!this.connected && !this.network.isSelf(datagram.node) && !isBroadcastNode(datagram.node)) return false;
-        if (!this.ports.reserve(this.boot.slot, this.boot.epoch, frame.byteLength, false)) return false;
-        this.boot.port.postMessage({ type: "frame", frame,bindingGeneration }, [frame.buffer]);
+        if (!this.ports.reserve(this.boot.slot, this.boot.epoch, localUdpFrameBytes(frame, context), false)) return false;
+        this.boot.port.postMessage({ type: "frame", frame,bindingGeneration,
+            ...(context ? {localUdp: context, senderDeliveryGeneration, senderProcessEpoch} : {}) }, [frame.buffer]);
         return true;
     }
     private request(type: string, payload: object, signal?: AbortSignal): Promise<any> {
@@ -1128,10 +1224,11 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         this.actorClient?.port.close();this.actorClient=null;
     }
     createChild(pid?:number): ChildNetworkNamespace {
+        const deliveryShared = new SharedArrayBuffer(DELIVERY_BYTES);
         const identity = this.ports.allocate(this.boot.slot,pid);
         const channel = new MessageChannel();
-        this.boot.port.postMessage({ type: "attach", ...identity, port: channel.port1 }, [channel.port1]);
-        return { boot: { ...identity, shared: this.boot.shared, capacity: this.boot.capacity, port: channel.port2 },
+        this.boot.port.postMessage({ type: "attach", ...identity, deliveryShared, port: channel.port1 }, [channel.port1]);
+        return { boot: { ...identity, shared: this.boot.shared, deliveryShared, capacity: this.boot.capacity, port: channel.port2 },
             close: () => this.boot.port.postMessage({ type: "drop", ...identity }) };
     }
     close(): void {

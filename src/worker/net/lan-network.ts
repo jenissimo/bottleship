@@ -9,15 +9,17 @@ export {
 import { copyUdpHostCapability, copyUdpHostReady, type UdpHostListenCapability, type UdpHostOpenRequest, type UdpHostReady } from "./netplay-wire";
 import type { UdpHostLease } from "./udp-host-lease-rpc";
 import type { DirectPlay8NetworkPolicy } from "../../network-config";
+import { copyLocalUdpContext, type LocalUdpContext } from "./local-udp-context";
+export type { LocalUdpContext, LocalUdpEndpoint } from "./local-udp-context";
 import { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
 export { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
 export const IPX_NETNUM = new Uint8Array([0, 0, 0, 1]);
 export const LAN_NET_OCTET = 10;
-export interface LanDatagram { srcNode: Uint8Array; srcPort: number; data: Uint8Array; multicast4?: UdpMulticast4Header & {localOrigin: boolean} }
+export interface LanDatagram { srcNode: Uint8Array; srcPort: number; data: Uint8Array; multicast4?: UdpMulticast4Header & {localOrigin: boolean}; localUdp?: LocalUdpContext }
 export interface LanEndpoint { deliver(dg: LanDatagram): void }
 export interface RawDeliveryTarget { port: number; generation: number }
 export interface LanPortDisconnect { node: Uint8Array; port: number; proto: number }
-export interface LanSocketError { node: Uint8Array; localPort: number; remotePort: number; proto: number; code: number; wireId?: number;bindingGeneration?:number }
+export interface LanSocketError { node: Uint8Array; localPort: number; remotePort: number; proto: number; code: number; wireId?: number;bindingGeneration?:number; localUdp?: LocalUdpContext }
 export interface NetTransport {
     readonly connected?: boolean;
     /** Host-owned state may be newer than queued process MessagePort snapshots. */
@@ -26,7 +28,7 @@ export interface NetTransport {
     synchronizeState?(): void;
     supportsMulticast4?(): boolean;
     readonly routeLocal?: boolean;
-    send(frame: Uint8Array<ArrayBuffer>,bindingGeneration?:number): boolean;
+    send(frame: Uint8Array<ArrayBuffer>,bindingGeneration?:number,localUdp?:LocalUdpContext): boolean;
     releasePort?(port:number,proto:number,bindingGeneration:number):void;
     resolve?(request: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>;
     leaseUdpPeer?(request: import("./netplay-wire").UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{ release(): void }>;
@@ -286,11 +288,42 @@ export class LanNetwork {
         return () => this.socketErrorListeners.delete(listener);
     }
     notifySocketError(error: LanSocketError): void {
+        // Relay errors may contain unknown properties. They cannot grant local provenance.
+        if (!error || error.localUdp !== undefined) return;
+        this.publishSocketError(error);
+    }
+    /** Only trusted local admission/namespace delivery may publish an address-bearing reset. */
+    notifyLocalUdpError(error: LanSocketError & {localUdp: LocalUdpContext}): void {
+        if (!error || error.code !== 10054 || !(error.node instanceof Uint8Array) || !this.isSelf(error.node)) return;
+        const localUdp = this.validateLocalUdpContext(error.localUdp, error.proto, error.localPort, error.remotePort);
+        if (!localUdp) return;
+        this.publishSocketError({...error, localUdp});
+    }
+    private publishSocketError(error: LanSocketError): void {
         if (!isAddressNode(error.node) || !validPort(error.localPort) || !validPort(error.remotePort)
             || !isProtocol(error.proto) || !Number.isInteger(error.code) || error.code < 10000 || error.code > 12000
             || (error.bindingGeneration!==undefined&&(!Number.isInteger(error.bindingGeneration)||error.bindingGeneration<1||error.bindingGeneration>0xffffffff))
             || (error.wireId !== undefined && (!Number.isInteger(error.wireId) || error.wireId < 1 || error.wireId > 0xffffffff))) return;
-        for (const listener of this.socketErrorListeners) listener({ ...error, node: error.node.slice() });
+        for (const listener of this.socketErrorListeners) listener({ ...error, node: error.node.slice(),
+            ...(error.localUdp ? {localUdp: copyLocalUdpContext(error.localUdp)!} : {}) });
+    }
+    private localUdpAddress(address: Uint8Array): boolean {
+        if (address.length === 4) { const own = this.ipv4; return address[0] === 127 || address.every((n, i) => n === own[i]); }
+        if (address.length !== 16) return false;
+        if (address.subarray(0, 15).every(n => n === 0) && address[15] === 1) return true;
+        if (address.subarray(0, 10).every(n => n === 0) && address[10] === 255 && address[11] === 255)
+            return this.localUdpAddress(address.subarray(12));
+        const own = this.ipv6;
+        return address.every((n, i) => n === own[i]);
+    }
+    /** Validate host-only endpoint provenance against this local interface identity. */
+    validateLocalUdpContext(value: unknown, proto: number, srcPort: number, dstPort: number): LocalUdpContext | undefined {
+        const context = copyLocalUdpContext(value);
+        if (!context || (proto !== PROTO_UDP && proto !== PROTO_UDP6)
+            || context.source.family !== (proto === PROTO_UDP ? 2 : 23)
+            || context.source.port !== srcPort || context.destination.port !== dstPort
+            || !this.localUdpAddress(context.source.address) || !this.localUdpAddress(context.destination.address)) return;
+        return context;
     }
     onPeerDisconnect(listener: (node: Uint8Array) => void): () => void {
         this.peerListeners.add(listener);
@@ -360,15 +393,18 @@ export class LanNetwork {
         this.stats.sent++;
         return true;
     }
-    send(srcPort: number, dstNode: Uint8Array, dstPort: number, data: Uint8Array, proto = PROTO_IPX, bindingGeneration=this.bindingGeneration(srcPort,proto)): boolean {
+    send(srcPort: number, dstNode: Uint8Array, dstPort: number, data: Uint8Array, proto = PROTO_IPX, bindingGeneration=this.bindingGeneration(srcPort,proto), localUdp?: LocalUdpContext): boolean {
         this.synchronizeState();
         if (!isProtocol(proto) || !validPort(srcPort) || !validPort(dstPort) || dstNode.length !== 6
             || data.length > maxPayload(proto) || (proto === PROTO_IPX && data.length < 2)
             || (isRawProtocol(proto) && (!validRawPayload(data) || dstPort > 256 || srcPort > 256))) return false;
+        const context = localUdp === undefined ? undefined : this.validateLocalUdpContext(localUdp, proto, srcPort, dstPort);
+        if (localUdp !== undefined && (!context || !this.isSelf(dstNode)
+            || !validBindingGeneration(bindingGeneration) || bindingGeneration !== this.bindingGeneration(srcPort, proto))) return false;
         if (isMulticastIpv4Node(dstNode)) return proto === PROTO_UDP
             && this.sendMulticast4(srcPort, dstNode.subarray(2), dstPort, data, 2, 1, bindingGeneration);
         if (this.transport?.routeLocal) {
-            const accepted = this.transport.send(encodeDatagram(proto, dstNode, dstPort, srcPort, data),bindingGeneration);
+            const accepted = this.transport.send(encodeDatagram(proto, dstNode, dstPort, srcPort, data),bindingGeneration,context);
             if (accepted) this.stats.sent++; else this.stats.dropped++;
             return accepted;
         }
@@ -384,14 +420,14 @@ export class LanNetwork {
             return false;
         }
         if (local && (proto === PROTO_UDP || proto === PROTO_UDP6) && !this.isBound(dstPort, proto))
-            this.queueLocalUdpReset(srcPort, dstPort, proto, bindingGeneration);
-        if (local || broadcast) this.deliverLocal(proto, this.node, srcPort, dstPort, data);
+            this.queueLocalUdpReset(srcPort, dstPort, proto, bindingGeneration, context);
+        if (local || broadcast) this.deliverLocal(proto, this.node, srcPort, dstPort, data, undefined, context);
         this.stats.sent++;
         return true;
     }
     /** Only trusted local send admission may report a missing UDP address object.
      * Received frames, rejected sends and receiver-side queue drops cannot do so. */
-    private queueLocalUdpReset(localPort: number, remotePort: number, proto: number, bindingGeneration: number): void {
+    private queueLocalUdpReset(localPort: number, remotePort: number, proto: number, bindingGeneration: number, localUdp?: LocalUdpContext): void {
         const deliveryGeneration = this.deliveryGeneration(localPort, proto);
         if (!validBindingGeneration(bindingGeneration) || !deliveryGeneration
             || bindingGeneration !== this.bindingGeneration(localPort, proto)) return;
@@ -399,12 +435,16 @@ export class LanNetwork {
         queueMicrotask(() => {
             if (deliveryGeneration !== this.deliveryGeneration(localPort, proto)
                 || bindingGeneration !== this.bindingGeneration(localPort, proto)) return;
-            this.notifySocketError({node, localPort, remotePort, proto, code: 10054, bindingGeneration});
+            const error = {node, localPort, remotePort, proto, code: 10054, bindingGeneration};
+            if (localUdp) this.notifyLocalUdpError({...error, localUdp});
+            else this.notifySocketError(error);
         });
     }
-    receiveFrame(frame: Uint8Array, allowLoopback = false,bindingGeneration?:number, deliveryGeneration?:number): void {
+    receiveFrame(frame: Uint8Array, allowLoopback = false,bindingGeneration?:number, deliveryGeneration?:number, localUdp?: LocalUdpContext): void {
         const datagram = decodeDatagram(frame);
-        if (!datagram || (bindingGeneration !== undefined && (!validBindingGeneration(bindingGeneration)
+        const context = datagram && localUdp !== undefined ? this.validateLocalUdpContext(localUdp, datagram.proto, datagram.srcPort, datagram.dstPort) : undefined;
+        if (!datagram || (localUdp !== undefined && (!context || !allowLoopback || !this.isSelf(datagram.node) || !!datagram.multicast4))
+            || (bindingGeneration !== undefined && (!validBindingGeneration(bindingGeneration)
             || bindingGeneration !== this.bindingGeneration(datagram.dstPort, datagram.proto)))
             || (deliveryGeneration !== undefined && (!validBindingGeneration(deliveryGeneration)
                 || deliveryGeneration !== this.deliveryGeneration(datagram.dstPort, datagram.proto)))
@@ -413,7 +453,7 @@ export class LanNetwork {
             this.stats.dropped++;
             return;
         }
-        this.deliverLocal(datagram.proto, datagram.node, datagram.srcPort, datagram.dstPort, datagram.payload, datagram.multicast4);
+        this.deliverLocal(datagram.proto, datagram.node, datagram.srcPort, datagram.dstPort, datagram.payload, datagram.multicast4, context);
     }
     /** Trusted broker delivery: the capture owner was checked before fanout. */
     receiveRawFrame(frame: Uint8Array, targets: readonly RawDeliveryTarget[]): void {
@@ -467,7 +507,7 @@ export class LanNetwork {
     isSelf(node: Uint8Array): boolean {
         return node.length === 6 && this.node.every((value, index) => value === node[index]);
     }
-    private deliverLocal(proto: number, srcNode: Uint8Array, srcPort: number, dstPort: number, data: Uint8Array, multicast4?: UdpMulticast4Header): void {
+    private deliverLocal(proto: number, srcNode: Uint8Array, srcPort: number, dstPort: number, data: Uint8Array, multicast4?: UdpMulticast4Header, localUdp?: LocalUdpContext): void {
         if (proto === PROTO_RAW4) {
             this.deliverRawBindings(srcNode, srcPort, data, this.rawTargets(data[0]));
             return;
@@ -481,7 +521,8 @@ export class LanNetwork {
         if (!endpoints.size) { this.stats.dropped++; return; }
         this.stats.received++;
         for (const endpoint of endpoints) endpoint!.deliver({ srcNode: srcNode.slice(), srcPort, data: data.slice(),
-            ...(multicast4 ? {multicast4: {...multicast4, group: multicast4.group.slice(), localOrigin: this.isSelf(srcNode)}} : {}) });
+            ...(multicast4 ? {multicast4: {...multicast4, group: multicast4.group.slice(), localOrigin: this.isSelf(srcNode)}} : {}),
+            ...(localUdp ? {localUdp: copyLocalUdpContext(localUdp)!} : {}) });
     }
 }
 export const lanNetwork = new LanNetwork();
