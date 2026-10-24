@@ -1,6 +1,6 @@
 # Multiplayer: передача работы и план продолжения
 
-Обновлено: 2026-10-23. Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
+Обновлено: 2026-10-24 (stage52). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
 
 ## Быстрый вход для следующего агента
 
@@ -11,6 +11,26 @@
 5. Перед изменением прочитать «Метод работы и ораклы» и «Ближайшие зависимости и критерии выхода». Зафиксировать контракт, независимый оракл и meaningful RED, затем исправлять общий механизм. Обновлять текущий статус, следующий шаг и ownership после каждого законченного окна.
 
 Готовый запрос для передачи: «Продолжи полный сетевой стек BottleShip по `docs/multiplayer-handoff.md`. Сначала проверь текущее состояние удалённого устройства; верхний актуальный раздел отменяет исторические записи. Сохрани исходные неудачи и SAME-PE references, выполни следующую недоказанную задачу, обнови handoff. Локальная разработка, проверки и коммиты разрешены; push, публикация и deploy не разрешены».
+
+## Текущий checkpoint: stage52 SAME-PE16 literal GREEN — три gap'а Stage51 закрыты
+
+Обновлено: 2026-10-24. **Integration commit `cbe8b0768d88e3f4507645c5062ebeca6c740458`, worktree clean.** Полный стек ACTIVE. Stage51 SAME-PE16 `FAIL_NATIVE_MISMATCH` (360 literal DWORD / 176 keyed в трёх группах: успешный `WSAIoctl(FIONREAD)` LE, успешный IP UDP `connect` LE, `select` после `SD_RECEIVE` пустого UDP) **закрыт generic-фиксом** в `wsa-network-api.ts` (успешные query/connect публикуют LastError=0 по измеренным веткам, без blanket reset) и `wsa-network.ts` (`select`-readiness больше не считает readShutdown читаемостью). Queued-zero UDP/TCP EOF/validation errors/memory guards сохранены.
+
+| Окно | Результат |
+| --- | --- |
+| Meaningful actor RED | **j968be9**, natural1/fullEOF: **4pass/20fail** — три gap'а воспроизведены на реальном namespace/Worker. Новый `tools/tests/wsa-udp-query-shutdown-actor.test.ts` (18 cases), усилен `wsa-fionread-actor.test.ts` |
+| Focused GREEN | **je5fb28**: **24pass/0fail** на тех же bytes/assertions |
+| Все Winsock | **jb467e6**: **408pass/0fail/39files** |
+| Required gate | **j9c0fcf**: **6921pass/0fail/719files/9snapshots/2705724assert**, typecheck+WGSL, 53 pins exact. Cert **4c796603…**, freeze **c880eea5…** (`stage52-udp-query-shutdown/`) |
+| Production cohort | inventory **3237/59627841** → source freeze **24421cba…**/archive **4b095c2e…** → af09 dist сохранён обратимо (76 files) → build **j49c532** (75 assets, entry `index-BBOBjr6Z`) → fullHTTP **SERVED_BYTES_EXACT 75/75** на 5177 → **cohort `0de75b9b…`** (`stage52-zero-shutdown-source-setup/`) |
+| Fixture bind | copy-only SAME WGB c8b1bc7b → новый dist/apps, HTTP200 byte-exact, receipt **891610c7…** |
+| SAME-PE16 capture | owned natural0: **CAPTURE_COMPLETE_LIFECYCLE_ACCEPTED_DATA_PENDING**, verified **4cd61c3e…**, IPC PID1234/gen1 = run-info join, 18/18 required retained, container retired |
+| Offline check | **COMPLETE_LITERAL_AND_KEYED_TARGET_MATCH_WITH_ACTUAL_VM_LIFECYCLE**: guest ledger **байт-идентичен** нативному reference 9d2781e1… (74016B), **bodyDifferences 0** (было 360), canonical **1636/1636 records, 0 differences**, dataComplete, VM lifecycle принят |
+| Классификация | `stage52-zero-shutdown-guest-preparation/root-same-pe16-first-classification.json` SHA **04c8cf05…** |
+
+Stage51 firstFAIL (42513eee…) и Stage48 guest96 сохранены без изменений. Preview5177 отдаёт stage52 cohort. Прежний af09 dist — `stage52-zero-shutdown-source-setup/dist-stage51-preserved-first`.
+
+**Следующее действие при передаче:** stage52-фикс закрывает измеренный zero/shutdown16 scope одного PE на современном x86-профиле. Дальше по плану: (1) независимый multierror/data-error-queue oracle и OVERLAPPED (отдельно UNVERIFIED); (2) точные quota/tag pressure, queued shrink, coalescing; (3) новые SAME-PE прогоны нужны при любом новом изменении relevant inputs — текущий принятый capture повторно не запускать. Pressure/history/recovery/migration/security DP8 и DP4 wire — по-прежнему OPEN. Rust relay benchmark — UNVERIFIED.
 
 ## Текущее окно: stage32, изолированная разработка
 
