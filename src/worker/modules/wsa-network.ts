@@ -26,6 +26,11 @@ const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every(
 const zeros = (a: Uint8Array) => a.every(v => v === 0);
 const broadcast = (a: Uint8Array) => a.every(v => v === 255);
 const multicast4 = (a?: Uint8Array) => !!a && a[0] >= 224 && a[0] <= 239;
+const mappedIpv4 = (ip?: Uint8Array): Uint8Array | undefined =>
+    ip?.length === 16 && ip.subarray(0, 10).every(v => v === 0) && ip[10] === 255 && ip[11] === 255 ? ip.slice(12) : undefined;
+function mappedIpv6(ip: Uint8Array): Uint8Array {
+    const address = new Uint8Array(16); address[10] = address[11] = 255; address.set(ip, 12); return address;
+}
 const BUFFER_LIMIT = 256 * 1024;
 const PACKET_LIMIT = 1024;
 // Local engine safety bound for queued UDP errors; not a Windows provider capacity.
@@ -72,7 +77,7 @@ interface SocketState {
     oob: number | null; oobPending: Array<{ value: number; mark: number }>; oobInline: boolean; readPosition: number; urgentMark: number | null;
     extendedAddress: boolean; receiveHeader: boolean;
     headerInclude: boolean; ipTtl: number; ipTos: number; ipOptionsChanged: boolean;
-    keepAlive: boolean; noDelay: boolean; udpConnReset: boolean;
+    keepAlive: boolean; noDelay: boolean; udpConnReset: boolean; v6Only: boolean;
     multicastInterface: number; multicastTtl: number; multicastLoop: boolean;
     peerId: number; credit: number; writeBlocked: boolean; connectTimer?: ReturnType<typeof setTimeout>;
     broadcast: boolean; reuse: boolean; packetType: number; filterPacketType: number | null; receiveBroadcast: boolean; receiveLimit: number; sendLimit: number;
@@ -95,6 +100,10 @@ export class WsaSocketTable {
     private wireSockets = new Map<number, SocketState>();
     private readonly connectOrigins = new WeakMap<SocketState, WsaAddress>();
     private bindings = new Map<string, Binding>();
+    // Logical family ownership and canonical wire coverage are distinct. One endpoint
+    // can cover an AF4 owner and an AF23 dual owner; only the last ref unbinds it.
+    private readonly bindingRefs = new WeakMap<SocketState, Set<Binding>>();
+    private readonly connectionWire = new WeakMap<SocketState, number>();
     private listeners = new Set<() => void>();
     private epoch = 0;
     private ipIdentification = 0;
@@ -129,7 +138,10 @@ export class WsaSocketTable {
                 // SIO_UDP_CONNRESET suppresses future ICMP notifications, never an already queued error.
                 if ((error.proto === PROTO_UDP || error.proto === PROTO_UDP6) && error.code === WSA.ECONNRESET && !s.udpConnReset) continue;
                 if (s.peer && ((s.type !== 3 && s.peer.port !== error.remotePort) || !same(s.peer.node, error.node))) continue;
+                if ((error.proto === PROTO_UDP || error.proto === PROTO_UDP6) && s.peer &&
+                    this.wireAddress(s, s.peer).family !== (error.proto === PROTO_UDP ? 2 : 23)) continue;
                 if (error.proto === PROTO_TCP || error.proto === PROTO_TCP6) {
+                    if (this.proto(s) !== error.proto) continue;
                     if (error.wireId !== undefined && s.wireId !== error.wireId) continue;
                     if (!s.peer || s.eof || (s.state !== "connected" && s.state !== "connecting")) continue;
                     const connecting = s.state === "connecting";
@@ -139,10 +151,14 @@ export class WsaSocketTable {
                     this.event(s, connecting ? FD_CONNECT : FD_CLOSE, s.error);
                 } else if ((error.proto === PROTO_UDP || error.proto === PROTO_UDP6) && error.code === WSA.ECONNRESET) {
                     const context = error.localUdp === undefined ? undefined : copyLocalUdpContext(error.localUdp);
-                    if (error.localUdp !== undefined && (!context || context.source.family !== s.af ||
+                    if (error.localUdp !== undefined && (!context || context.source.family !== (error.proto === PROTO_UDP ? 2 : 23) ||
                         context.source.port !== error.localPort || context.destination.port !== error.remotePort ||
                         !(error.node instanceof Uint8Array) || error.node.length !== 6)) continue;
-                    if (this.enqueueUdp(s, { kind: "error", ...(context ? { from: localUdpAddress(context.destination, error.node) } : {}) }))
+                    const from = context ? this.presentAddress(s, localUdpAddress(context.destination, error.node)) : undefined;
+                    if (context && (!from || (s.peer &&
+                        ((s.peer.ip && from.ip && !same(s.peer.ip, from.ip)) ||
+                         (s.peer.ip6 && from.ip6 && !same(s.peer.ip6, from.ip6)))))) continue;
+                    if (this.enqueueUdp(s, { kind: "error", ...(from ? { from } : {}) }))
                         this.event(s, FD_READ, 0, false);
                 } else { s.error = error.code; this.event(s, FD_READ, error.code); }
             }
@@ -303,7 +319,7 @@ export class WsaSocketTable {
             id, wireId, af, type, protocol: selectedProtocol, connectContextPending: false, disconnected: false, connectedAt: 0, nonBlocking: false, overlapped: true, handleFlags: 1, local: null, peer: null,
             state: "new", backlog: 1, pending: [], packets: [], chunks: [], offset: 0, available: 0,
             readShutdown: false, writeShutdown: false, eof: false, error: 0, pendingError: 0,
-            oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, udpConnReset: true, peerId: 0, credit: 0, writeBlocked: false,
+            oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, udpConnReset: true, v6Only: type !== 3, peerId: 0, credit: 0, writeBlocked: false,
             multicastInterface: 0, multicastTtl: 1, multicastLoop: true,
             broadcast: false, reuse: false, packetType: af === 6 ? selectedProtocol - 1000 : 0,
             filterPacketType: null, receiveBroadcast: true, receiveLimit: BUFFER_LIMIT, sendLimit: BUFFER_LIMIT,
@@ -313,7 +329,62 @@ export class WsaSocketTable {
         this.wireSockets.set(wireId, this.get(id));
         return id;
     }
-    private proto(s: SocketState): number { return s.type === 3 ? (s.af === 23 ? PROTO_RAW6 : PROTO_RAW4) : s.af === 6 ? PROTO_IPX : s.af === 23 ? (s.type === 1 ? PROTO_TCP6 : PROTO_UDP6) : s.type === 1 ? PROTO_TCP : PROTO_UDP; }
+    private baseProto(s: SocketState): number { return s.type === 3 ? (s.af === 23 ? PROTO_RAW6 : PROTO_RAW4) : s.af === 6 ? PROTO_IPX : s.af === 23 ? (s.type === 1 ? PROTO_TCP6 : PROTO_UDP6) : s.type === 1 ? PROTO_TCP : PROTO_UDP; }
+    private proto(s: SocketState): number { return this.connectionWire.get(s) ?? this.baseProto(s); }
+    private wireAddress(s: SocketState, address: WsaAddress): WsaAddress {
+        if (address.family !== s.af) fail(s.af === 23 && address.family === 2 ? WSA.EFAULT : WSA.EAFNOSUPPORT);
+        const ip = s.type !== 3 && s.af === 23 ? mappedIpv4(address.ip6) : undefined;
+        if (!ip) return copyAddress(address);
+        if (s.v6Only) fail(WSA.EADDRNOTAVAIL);
+        return { family: 2, port: address.port, node: address.node.slice(), ip };
+    }
+    private presentAddress(s: SocketState, address: WsaAddress): WsaAddress | undefined {
+        if (s.af === address.family) return copyAddress(address);
+        if (s.af !== 23 || s.v6Only || address.family !== 2 || !address.ip) return;
+        return { family: 23, port: address.port, node: address.node.slice(),
+            ip6: mappedIpv6(address.ip), scopeId: 0, flowInfo: 0 };
+    }
+    private acceptsDestination(s: SocketState, destination?: WsaAddress): boolean {
+        if (!destination) return true;
+        const bound = destination.family === 2 ? (s.af === 23 ? mappedIpv4(s.local?.ip6) : s.local?.ip) : s.local?.ip6;
+        const address = destination.family === 2 ? destination.ip : destination.ip6;
+        return !bound || zeros(bound) || !address || same(bound, address);
+    }
+    private selectConnectLocal(s: SocketState, peer: WsaAddress): void {
+        const wire = this.wireAddress(s, peer), local = s.local!;
+        if (wire.family === 2) {
+            const loopback = wire.ip?.[0] === 127, ip = loopback ? Uint8Array.of(127, 0, 0, 1) : this.network.ipv4;
+            if (local.ip && zeros(local.ip)) local.ip = ip.slice();
+            if (local.ip6 && zeros(local.ip6)) local.ip6 = mappedIpv6(ip);
+        } else if (local.ip6 && zeros(local.ip6)) {
+            const loopback = wire.ip6?.slice(0, 15).every(v => v === 0) && wire.ip6[15] === 1;
+            local.ip6 = (loopback ? wire.ip6! : this.network.ipv6).slice();
+        }
+    }
+    private retainCoverage(s: SocketState, port: number, protocols: number[], initial?: Binding): boolean {
+        const created: Binding[] = initial ? [initial] : [], refs = new Set<Binding>();
+        let committed = false;
+        try {
+            for (const proto of protocols) {
+                const key = proto + ":" + port;
+                let binding = this.bindings.get(key);
+                if (!binding) {
+                    const endpoint: LanEndpoint = { deliver: packet => this.deliver(port, proto, packet) };
+                    if (!this.network.bind(port, endpoint, proto, s.reuse || s.type === 3)) return false;
+                    binding = { port, proto, endpoint, sockets: new Set() };
+                    this.bindings.set(key, binding); created.push(binding);
+                }
+                refs.add(binding);
+            }
+            for (const binding of refs) binding.sockets.add(s.id);
+            this.bindingRefs.set(s, refs); committed = true; return true;
+        } finally {
+            if (!committed) for (const binding of created) {
+                this.network.unbind(binding.port, binding.endpoint, binding.proto);
+                this.bindings.delete(binding.proto + ":" + binding.port);
+            }
+        }
+    }
     private boundPort(s: SocketState): number { return s.type === 3 ? s.protocol + 1 : s.local!.port; }
     maxMessageSize(sid: number): number { const s = this.get(sid); return s.type === 1 ? 0 : s.type === 3 ? RAW_MAX_PACKET - (s.af === 2 && !s.headerInclude ? 20 : 0) : s.af === 6 ? IPX_MAX_PAYLOAD : s.af === 23 ? UDP6_MAX_PAYLOAD : UDP_MAX_PAYLOAD; }
     private localAddress(s: SocketState, port: number): WsaAddress {
@@ -324,27 +395,41 @@ export class WsaSocketTable {
         const s = this.get(sid);
         if (s.local) fail(WSA.EINVAL);
         if (address && address.family !== s.af) fail(WSA.EAFNOSUPPORT);
-        if (address?.ip6 && !zeros(address.ip6) && !same(address.ip6, this.network.ipv6) &&
+        const mapped = s.type !== 3 && s.af === 23 ? mappedIpv4(address?.ip6) : undefined;
+        if (mapped) {
+            if (s.v6Only || (!zeros(mapped) && !same(mapped, this.network.ipv4) && mapped[0] !== 127)) fail(WSA.EADDRNOTAVAIL);
+        } else if (address?.ip6 && !zeros(address.ip6) && !same(address.ip6, this.network.ipv6) &&
             !(address.ip6.slice(0, 15).every(v => !v) && address.ip6[15] === 1)) fail(WSA.EADDRNOTAVAIL);
         if (address && !address.ip6 && !zeros(address.node) && !(address.ip && zeros(address.ip)) && !same(address.node, this.network.node) &&
             !(address.ip?.[0] === 127)) fail(WSA.EADDRNOTAVAIL);
-        const proto = this.proto(s);
+        const primary = mapped ? (s.type === 1 ? PROTO_TCP : PROTO_UDP) : this.baseProto(s);
+        const protocols = s.af === 23 && s.type !== 3 && !s.v6Only && !mapped && (!address?.ip6 || zeros(address.ip6))
+            ? [primary, s.type === 1 ? PROTO_TCP : PROTO_UDP] : [primary];
         let port = s.type === 3 ? s.protocol + 1 : address?.port ?? 0;
         if (port) {
-            const old = this.bindings.get(`${proto}:${port}`);
-            if (old) {
-                if (s.type !== 3 && (s.type === 1 || !s.reuse || [...old.sockets].some(id => !this.get(id).reuse))) fail(WSA.EADDRINUSE);
-                old.sockets.add(sid);
-            } else {
-                const endpoint: LanEndpoint = { deliver: packet => this.deliver(port, proto, packet) };
-                if (!this.network.bind(port, endpoint, proto, s.reuse || s.type === 3)) fail(WSA.EADDRINUSE);
-                this.bindings.set(`${proto}:${port}`, { port, proto, endpoint, sockets: new Set([sid]) });
-            }
+            // Cross-family wire coverage is not an exclusive logical bind claim.
+            const owners = [...this.sockets.values()].filter(other => other !== s && other.local &&
+                other.af === s.af && other.type === s.type && this.boundPort(other) === port &&
+                (s.type !== 3 || other.protocol === s.protocol));
+            if (s.type !== 3 && owners.some(other => s.type === 1 || !s.reuse || !other.reuse)) fail(WSA.EADDRINUSE);
+            if (!this.retainCoverage(s, port, protocols)) fail(WSA.EADDRINUSE);
         } else {
-            const endpoint: LanEndpoint = { deliver: packet => this.deliver(port, proto, packet) };
-            port = this.network.bindEphemeral(endpoint, proto);
-            if (!port) fail(WSA.ENOBUFS);
-            this.bindings.set(`${proto}:${port}`, { port, proto, endpoint, sockets: new Set([sid]) });
+            // One public port, all lanes established before local state is published.
+            let retained = false;
+            for (let attempt = 0; attempt < 16384; attempt++) {
+                const endpoint: LanEndpoint = { deliver: packet => this.deliver(port, primary, packet) };
+                port = this.network.bindEphemeral(endpoint, primary);
+                if (!port) break;
+                // Ephemeral choice can avoid an occupied secondary lane even though
+                // an explicit cross-family same-port bind remains permitted.
+                if (protocols.some(proto => proto !== primary && this.bindings.has(proto + ":" + port))) {
+                    this.network.unbind(port, endpoint, primary); continue;
+                }
+                const binding: Binding = { port, proto: primary, endpoint, sockets: new Set() };
+                this.bindings.set(primary + ":" + port, binding);
+                if (this.retainCoverage(s, port, protocols, binding)) { retained = true; break; }
+            }
+            if (!retained) fail(WSA.ENOBUFS);
         }
         s.local = this.localAddress(s, s.type === 3 ? 0 : port);
         if (s.af === 2) s.local.ip = address?.ip?.slice() ?? new Uint8Array(4);
@@ -358,13 +443,15 @@ export class WsaSocketTable {
         this.connectOrigins.delete(s);
     }
     private detach(s: SocketState): void {
-        if (!s.local) return;
-        const key = `${this.proto(s)}:${this.boundPort(s)}`;
-        const b = this.bindings.get(key);
-        b?.sockets.delete(s.id);
-        if (b && !b.sockets.size) {
-            this.network.unbind(b.port, b.endpoint, b.proto);
-            this.bindings.delete(key);
+        const refs = this.bindingRefs.get(s);
+        if (!refs) return;
+        this.bindingRefs.delete(s);
+        for (const binding of refs) {
+            binding.sockets.delete(s.id);
+            if (!binding.sockets.size) {
+                this.network.unbind(binding.port, binding.endpoint, binding.proto);
+                this.bindings.delete(binding.proto + ":" + binding.port);
+            }
         }
     }
     closesocket(sid: number): number {
@@ -422,8 +509,9 @@ export class WsaSocketTable {
     adoptAccepted(target: number, accepted: number): void {
         const old = this.get(target), socket = this.get(accepted);
         if (old.type !== 1 || old.af !== socket.af || old.local || old.state !== "new") fail(WSA.EINVAL);
-        const binding = this.bindings.get(this.proto(socket) + ":" + socket.local!.port)!;
-        binding.sockets.delete(accepted); binding.sockets.add(target);
+        for (const binding of this.bindingRefs.get(socket) ?? []) {
+            binding.sockets.delete(accepted); binding.sockets.add(target);
+        }
         this.sockets.delete(accepted); this.wireSockets.delete(old.wireId);
         socket.id = target; socket.originalLocal = old.local; socket.nonBlocking = old.nonBlocking; socket.overlapped = old.overlapped;
         socket.eventMask = old.eventMask; socket.notify = old.notify;
@@ -448,7 +536,11 @@ export class WsaSocketTable {
         replacement.receiveLimit = socket.receiveLimit; replacement.sendLimit = socket.sendLimit;
         replacement.receiveTimeout = socket.receiveTimeout; replacement.sendTimeout = socket.sendTimeout; replacement.oobInline = socket.oobInline;
         replacement.lingerEnabled = socket.lingerEnabled; replacement.lingerSeconds = socket.lingerSeconds;
-        replacement.keepAlive = socket.keepAlive; replacement.noDelay = socket.noDelay;
+        replacement.keepAlive = socket.keepAlive; replacement.noDelay = socket.noDelay; replacement.v6Only = socket.v6Only;
+        if (retainLocal) {
+            const refs = this.bindingRefs.get(socket);
+            if (refs) { this.bindingRefs.set(replacement, refs); this.bindingRefs.delete(socket); }
+        }
         replacement.eventMask = socket.eventMask; replacement.notify = socket.notify;
         this.sockets.set(sid, replacement); this.changed();
     }
@@ -471,7 +563,8 @@ export class WsaSocketTable {
             s.state = "new";
             return 0;
         }
-        if (peer.family !== s.af) fail(WSA.EAFNOSUPPORT);
+        const strictMapped = s.type === 1 && s.af === 23 && s.v6Only && !!mappedIpv4(peer.ip6);
+        const wirePeer = strictMapped ? copyAddress(peer) : this.wireAddress(s, peer);
         if (s.type !== 3 && !peer.port) fail(WSA.EADDRNOTAVAIL);
         if (s.type !== 1) {
             this.autoBind(s);
@@ -479,8 +572,7 @@ export class WsaSocketTable {
                 ? { ...peer, ip: peer.ip.slice(), node: Uint8Array.of(2, 3, ...peer.ip) }
                 : this.routeAddress({ ...peer, port: s.type === 3 ? 0 : peer.port });
             s.error = 0;
-            if (s.local!.ip && zeros(s.local!.ip)) s.local!.ip = this.network.ipv4;
-            if (s.local!.ip6 && zeros(s.local!.ip6)) s.local!.ip6 = this.network.ipv6;
+            this.selectConnectLocal(s, s.peer);
             s.state = "connected";
             return 0;
         }
@@ -495,8 +587,20 @@ export class WsaSocketTable {
         this.autoBind(s);
         s.peer = this.routeAddress(peer);
         this.connectOrigins.set(s, { ...s.local!, ip: s.local!.ip?.slice(), ip6: s.local!.ip6?.slice() });
-        if (s.local!.ip && zeros(s.local!.ip)) s.local!.ip = this.network.ipv4;
-            if (s.local!.ip6 && zeros(s.local!.ip6)) s.local!.ip6 = this.network.ipv6;
+        if (strictMapped) {
+            // Modern TCP reports a pending connect, then the address failure through
+            // completion/SO_ERROR. No IPv4 SYN may escape an IPv6-only socket.
+            s.state = "connecting"; s.error = 0;
+            const attemptedPeer = s.peer;
+            queueMicrotask(() => {
+                if (this.sockets.get(s.id) !== s || s.state !== "connecting" || s.peer !== attemptedPeer) return;
+                this.restoreConnectAddress(s); s.state = "failed"; s.error = WSA.EADDRNOTAVAIL;
+                this.event(s, FD_CONNECT, s.error); this.changed();
+            });
+            fail(WSA.EWOULDBLOCK);
+        }
+        this.selectConnectLocal(s, s.peer);
+        this.connectionWire.set(s, wirePeer.family === 2 ? PROTO_TCP : PROTO_TCP6);
         s.state = "connecting";
         s.error = 0;
         if (s.af === 2 && multicast4(peer.ip)) {
@@ -540,7 +644,9 @@ export class WsaSocketTable {
     }
     private routeAddress(peer: WsaAddress): WsaAddress {
         try {
-            const node = peer.ip6 ? this.network.routeIpv6(peer.ip6, peer.scopeId ?? 0) : peer.ip?.[0] === 127 ? this.network.node.slice() :
+            const mapped = mappedIpv4(peer.ip6);
+            const node = mapped ? this.routeAddress(ipv4Address(mapped, peer.port)).node :
+                peer.ip6 ? this.network.routeIpv6(peer.ip6, peer.scopeId ?? 0) : peer.ip?.[0] === 127 ? this.network.node.slice() :
                 peer.ip ? this.network.routeIpv4(peer.ip) : peer.node.slice();
             if (peer.ip6 && peer.scopeId && node[0] === 2 && node[1] === 0) fail(WSA.EADDRNOTAVAIL);
             return { ...peer, node, ip: peer.ip?.slice(), ip6: peer.ip6?.slice() };
@@ -550,10 +656,10 @@ export class WsaSocketTable {
         if (s.type !== 2 || (s.af !== 2 && s.af !== 23) || !s.local ||
             !this.network.isSelf(destination.node) || broadcast(destination.node) || multicast4(destination.ip) ||
             destination.ip6?.[0] === 255) return;
-        const family = s.af;
+        const family = destination.family;
         const address = family === 2 ? destination.ip : destination.ip6;
         if (!address) return; // Legacy node-only callers have no original IP endpoint to preserve.
-        const bound = family === 2 ? s.local.ip : s.local.ip6;
+        const bound = family === 2 ? s.local.ip ?? mappedIpv4(s.local.ip6) : s.local.ip6;
         const loopback = family === 2 ? address[0] === 127 : address.slice(0, 15).every(v => v === 0) && address[15] === 1;
         const source = bound && !zeros(bound) ? bound : loopback ?
             (family === 2 ? Uint8Array.of(127, 0, 0, 1) : Uint8Array.from([...new Array<number>(15).fill(0), 1])) :
@@ -579,8 +685,9 @@ export class WsaSocketTable {
             if (flags & 1) fail(WSA.EOPNOTSUPP);
             const dst = to ?? s.peer;
             if (!dst) fail(WSA.EDESTADDRREQ);
-            if (dst.family !== s.af) fail(WSA.EAFNOSUPPORT);
-            if (bytes.length > this.maxMessageSize(sid)) fail(WSA.EMSGSIZE);
+            const canonical = this.wireAddress(s, dst);
+            const maximum = s.type === 2 && canonical.family === 2 ? UDP_MAX_PAYLOAD : this.maxMessageSize(sid);
+            if (bytes.length > maximum) fail(WSA.EMSGSIZE);
             if (broadcast(dst.node) && !s.broadcast) fail(WSA.EACCES);
             if (s.type !== 3 && !dst.port) fail(WSA.EADDRNOTAVAIL);
             if (s.type === 3 && s.af === 2 && multicast4(dst.ip)) fail(WSA.EOPNOTSUPP);
@@ -595,7 +702,7 @@ export class WsaSocketTable {
                 }
                 return bytes.length;
             }
-            let payload: Uint8Array = bytes, destination = this.routeAddress(dst), destinationPort = dst.port;
+            let payload: Uint8Array = bytes, destination = this.routeAddress(canonical), destinationPort = dst.port;
             if (s.type === 3) {
                 let protocol = s.protocol;
                 if (s.headerInclude) {
@@ -631,9 +738,10 @@ export class WsaSocketTable {
                 payload[1] = broadcast(dst.node) ? 1 : 0; payload.set(bytes, 2);
             }
             const localUdp = this.localUdpContext(s, destination);
+            const wireProto = s.type === 2 && destination.family === 2 && s.af === 23 ? PROTO_UDP : this.proto(s);
             const sent = localUdp ?
-                this.network.send(this.boundPort(s), destination.node, destinationPort, payload, this.proto(s), undefined, localUdp) :
-                this.network.send(this.boundPort(s), destination.node, destinationPort, payload, this.proto(s));
+                this.network.send(this.boundPort(s), destination.node, destinationPort, payload, wireProto, undefined, localUdp) :
+                this.network.send(this.boundPort(s), destination.node, destinationPort, payload, wireProto);
             if (!sent) {
                 if (!this.network.connected) fail(WSA.ENETDOWN);
                 s.writeBlocked = true; this.rearm(s, FD_WRITE); fail(WSA.EWOULDBLOCK);
@@ -846,6 +954,13 @@ export class WsaSocketTable {
         if (typeof on !== "boolean" || s.type !== 2 || (s.af !== 2 && s.af !== 23)) fail(WSA.EINVAL);
         s.udpConnReset = on;
     }
+    setV6Only(sid: number, on: boolean): void {
+        const s = this.get(sid);
+        if (typeof on !== "boolean" || (s.af !== 2 && s.af !== 23)) fail(WSA.EINVAL);
+        if (s.local) fail(WSA.EINVAL);
+        s.v6Only = on;
+        this.changed();
+    }
     setNonBlocking(sid: number, on: boolean): void {
         const s = this.get(sid);
         if (!on && s.eventMask) fail(WSA.EINVAL);
@@ -914,12 +1029,13 @@ export class WsaSocketTable {
         const multicast = proto === PROTO_UDP ? packet.multicast4 : undefined;
         let from: WsaAddress = { family: proto === PROTO_IPX ? 6 : v6 ? 23 : 2, node: packet.srcNode.slice(), port: raw ? 0 : packet.srcPort,
             ...(proto === PROTO_IPX ? {} : v6 ? { ip6: this.network.nodeToIpv6(packet.srcNode), scopeId: this.network.nodeToIpv6Scope(packet.srcNode), flowInfo: 0 } : { ip: multicast?.interfaceIndex === 1 ? Uint8Array.of(127, 0, 0, 1) : nodeToIpv4(packet.srcNode) }) };
+        let localUdp: LocalUdpContext | undefined;
         if (packet.localUdp !== undefined) {
             const context = copyLocalUdpContext(packet.localUdp);
             if ((proto !== PROTO_UDP && proto !== PROTO_UDP6) || multicast || !context ||
                 context.source.family !== from.family || context.source.port !== packet.srcPort ||
                 context.destination.port !== port || !(packet.srcNode instanceof Uint8Array) || packet.srcNode.length !== 6) return;
-            from = localUdpAddress(context.source, packet.srcNode);
+            localUdp = context; from = localUdpAddress(context.source, packet.srcNode);
         }
         if (proto !== PROTO_TCP && proto !== PROTO_TCP6) {
             if (proto === PROTO_IPX && packet.data.length < 2) return;
@@ -940,14 +1056,27 @@ export class WsaSocketTable {
             const packetType = proto === PROTO_IPX ? packet.data[0] : 0;
             const ipxFlags = proto === PROTO_IPX ? (packet.data[1] & 1) | (same(from.node, this.network.node) ? 2 : 0) : 0;
             if (proto === PROTO_IPX) { from.packetType = packetType; from.flags = ipxFlags; }
+            const destination = localUdp ? localUdpAddress(localUdp.destination, this.network.node) : undefined;
+            // Measured native-family preference is independent of bind order.
+            // Queue fullness or a connected-peer filter cannot reroute the packet
+            // into a shadow dual owner after the native endpoint selected it.
+            const native4 = proto === PROTO_UDP && !multicast && [...binding.sockets].some(id => {
+                const owner = this.get(id); return owner.af === 2 && this.acceptsDestination(owner, destination);
+            });
             for (const id of binding.sockets) {
                 const s = this.get(id);
+                if (native4 && s.af !== 2) continue;
                 if (multicast) {
                     if (s.af !== 2 || s.type !== 2 || !this.multicastMemberships.get(id)?.has(multicast.interfaceIndex + ":" + [...multicast.group].join(".")) ||
                         (multicast.localOrigin && !s.multicastLoop)) continue;
                 }
                 if (s.af === 6 && ((!s.receiveBroadcast && (ipxFlags & 1)) || (s.filterPacketType !== null && s.filterPacketType !== packetType))) continue;
-                if (s.readShutdown || (s.peer && (!same(s.peer.node, from.node) || s.peer.port !== from.port))) continue;
+                const presented = this.presentAddress(s, from);
+                if (!presented || s.readShutdown) continue;
+                if (!this.acceptsDestination(s, destination)) continue;
+                if (s.peer && (!same(s.peer.node, presented.node) || s.peer.port !== presented.port ||
+                    (s.peer.ip && presented.ip && !same(s.peer.ip, presented.ip)) ||
+                    (s.peer.ip6 && presented.ip6 && !same(s.peer.ip6, presented.ip6)))) continue;
                 const ipUdp = s.type === 2 && (s.af === 2 || s.af === 23);
                 const dataCount = ipUdp ? this.udpReceiveQueues.get(s.id)?.dataCount ?? 0 : s.packets.length;
                 if (dataCount >= PACKET_LIMIT || s.available + data.length > s.receiveLimit) continue;
@@ -958,7 +1087,7 @@ export class WsaSocketTable {
                     ipxHeader.set(IPX_NETNUM, 6); ipxHeader.set(ipxFlags & 1 ? new Uint8Array(6).fill(255) : this.network.node, 10);
                     header.setUint16(16, port); ipxHeader.set(IPX_NETNUM, 18); ipxHeader.set(from.node, 22); header.setUint16(28, from.port);
                 }
-                const received = { from: copyAddress(from), data: data.slice(), ipxHeader };
+                const received = { from: presented, data: data.slice(), ipxHeader };
                 if (ipUdp) { if (!this.enqueueUdp(s, received)) continue; }
                 else { s.packets.push(received); s.available += data.length; }
                 this.event(s, FD_READ);
@@ -970,10 +1099,16 @@ export class WsaSocketTable {
         if (v.getUint32(0, true) !== TCP_MAGIC) return;
         const kind = v.getUint32(4, true), srcId = v.getUint32(8, true), dstId = v.getUint32(12, true), value = v.getUint32(16, true);
         if (!srcId && kind !== RST) return;
+        // The wire carries node/port identities. Recover exact loopback IPs only
+        // from a live same-root physical sender with this verified wire tuple.
+        const origin = this.network.isSelf(packet.srcNode) ? this.wireSockets.get(srcId) : undefined;
+        const localOrigin = origin?.local && origin.peer && this.proto(origin) === proto &&
+            origin.local.port === packet.srcPort && origin.peer.port === port && this.network.isSelf(origin.peer.node) ? origin : undefined;
+        if (localOrigin?.local) from = this.wireAddress(localOrigin, localOrigin.local);
         if (kind === RST && !dstId && srcId) {
             // A connecting sender has not received our child wire ID yet.
             const child = [...binding.sockets].map(id => this.get(id)).find(s =>
-                s.peerId === srcId && s.peer?.port === from.port && same(s.peer.node, from.node));
+                this.proto(s) === proto && s.peerId === srcId && s.peer?.port === from.port && same(s.peer.node, from.node));
             if (!child) return;
             child.error = value || WSA.ECONNRESET; child.state = "failed"; this.event(child, FD_CLOSE, child.error);
             for (const id of binding.sockets) {
@@ -983,29 +1118,37 @@ export class WsaSocketTable {
             this.changed(); return;
         }
         if (kind === SYN && !dstId) {
-            const listener = [...binding.sockets].map(id => this.get(id)).find(s => s.state === "listening");
+            const destination = localOrigin?.peer ? this.wireAddress(localOrigin, localOrigin.peer) : undefined;
+            const listeners = [...binding.sockets].map(id => this.get(id)).filter(s =>
+                s.state === "listening" && !!this.presentAddress(s, from) && this.acceptsDestination(s, destination));
+            const listener = (proto === PROTO_TCP ? listeners.find(s => s.af === 2) : undefined) ?? listeners[0];
             if (!listener || listener.pending.length >= listener.backlog) {
                 this.sendFrame(port, from.node, from.port, RST, 0, srcId, WSA.ECONNREFUSED, undefined, proto);
                 return;
             }
             const existing = [...binding.sockets].map(id => this.get(id)).find(s =>
-                s.peerId === srcId && s.peer?.port === from.port && same(s.peer.node, from.node));
+                this.proto(s) === proto && s.peerId === srcId && s.peer?.port === from.port && same(s.peer.node, from.node));
             if (existing) { this.frame(existing, SYNACK, this.synValue(existing)); return; }
             const id = this.socket(1, listener.af, 6), child = this.get(id);
-            child.local = this.localAddress(child, port); child.peer = from; child.peerId = srcId;
+            child.v6Only = listener.v6Only;
+            this.connectionWire.set(child, proto);
+            const acceptedLocal = destination ??
+                { family: from.family, port, node: this.network.node.slice(),
+                    ...(from.family === 2 ? { ip: this.network.ipv4.slice() } : { ip6: this.network.ipv6.slice(), scopeId: 0, flowInfo: 0 }) };
+            child.local = this.presentAddress(child, acceptedLocal)!; child.peer = this.presentAddress(child, from)!; child.peerId = srcId;
             child.state = "connected"; child.connectedAt = Date.now(); child.credit = Math.min(value & SYN_WINDOW_MASK, BUFFER_LIMIT); child.nonBlocking = listener.nonBlocking; child.overlapped = listener.overlapped;
             child.receiveLimit = listener.receiveLimit; child.sendLimit = listener.sendLimit;
             child.receiveTimeout = listener.receiveTimeout; child.sendTimeout = listener.sendTimeout; child.oobInline = listener.oobInline;
             child.lingerEnabled = listener.lingerEnabled; child.lingerSeconds = listener.lingerSeconds;
             child.keepAlive = listener.keepAlive; child.noDelay = listener.noDelay;
-            binding.sockets.add(id); listener.pending.push(id);
+            binding.sockets.add(id); this.bindingRefs.set(child, new Set([binding])); listener.pending.push(id);
             if (!this.frame(child, SYNACK, this.synValue(child))) {
                 listener.pending.pop(); this.detach(child); this.sockets.delete(id); this.wireSockets.delete(child.wireId); return;
             }
             this.event(listener, FD_ACCEPT); this.changed(); return;
         }
         const s = this.wireSockets.get(dstId);
-        if (!s || !binding.sockets.has(s.id) || !s.peer || s.peer.port !== from.port || !same(s.peer.node, from.node)) return;
+        if (!s || this.proto(s) !== proto || !binding.sockets.has(s.id) || !s.peer || s.peer.port !== from.port || !same(s.peer.node, from.node)) return;
         if (kind === RST) {
             if (s.state === "connecting") this.restoreConnectAddress(s);
             s.error = value || WSA.ECONNRESET; s.state = "failed";

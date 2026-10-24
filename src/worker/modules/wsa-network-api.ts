@@ -608,6 +608,13 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     });
     api.setsockopt = adapt(counter, setError, a => {
         const s = table.get(a[0]);
+        if ((s.af === 2 || s.af === 23) && a[1] === 41 && a[2] === 27) {
+            const size = s.type === 1 ? 4 : 1;
+            if ((a[4] | 0) < size) fail(WSA.EFAULT);
+            guard(a[3], size);
+            table.setV6Only(s.id, !!(size === 4 ? u32(a[3]) : Mem.readUint8(a[3])));
+            return { value: 0, error: 0 };
+        }
         if (s.af === 2 && a[1] === 0 && a[2] >= 9 && a[2] <= 13) {
             const length = a[4] | 0, option = a[2];
             if (length < 0 || !multicastProbe(a[3], length)) fail(WSA.EFAULT);
@@ -694,6 +701,13 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const s = table.get(a[0]);
         if (s.af === 2 && a[1] === 0 && a[2] >= 9 && a[2] <= 13) return getMulticastOption(table, s.id, s.type, a[2], a[3], a[4]);
         guard(a[4], 4, true);
+        if ((s.af === 2 || s.af === 23) && a[1] === 41 && a[2] === 27) {
+            const size = s.type === 1 ? 4 : 1;
+            if ((u32(a[4]) | 0) < size)
+                return { value: -1, error: WSA.EFAULT, writes: s.type === 1 ? [dword(a[4], 0)] : undefined };
+            guard(a[3], size, true);
+            return { value: 0, error: 0, writes: [{ address: a[3], value: +s.v6Only, size }, dword(a[4], size)] };
+        }
         if ((a[1] >>> 0) === 0xffff && (a[2] === 0x2004 || a[2] === 0x2005)) {
             const wide = a[2] === 0x2005, capacity = u32(a[4]), size = protocolInfoSize(wide);
             if (!a[3] || (wide ? capacity | 0 : capacity) < size)

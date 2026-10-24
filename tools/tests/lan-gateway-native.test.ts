@@ -85,6 +85,7 @@ for (const transport of ["websocket", "polling"] as const) test("native UDP/TCP 
 
         const mapped = new Uint8Array(16); mapped[10] = mapped[11] = 255; mapped.set(udpIp, 12);
         const mappedUdp = table.socket(2, 23);
+        table.setV6Only(mappedUdp, false); // Explicit dual mode; modern AF23 defaults to IPv6-only.
         expect(await send(() => table.send(mappedUdp, payload, ipv6Address(mapped, udpPort)))).toBe(payload.length);
         await until(() => table.readable(mappedUdp), "IPv4-mapped IPv6 native UDP");
         const mappedReply = table.receive(mappedUdp, 100);
@@ -120,6 +121,7 @@ for (const transport of ["websocket", "polling"] as const) test("native UDP/TCP 
 
         mapped.set(tcpIp, 12);
         const mappedTcp = table.socket(1, 23);
+        table.setV6Only(mappedTcp, false);
         expect(code(() => table.connect(mappedTcp, ipv6Address(mapped, tcpPort)))).toBe(WSA.EWOULDBLOCK);
         await until(() => table.isConnected(mappedTcp), "IPv4-mapped IPv6 native TCP");
         expect(await send(() => table.send(mappedTcp, payload))).toBe(payload.length);

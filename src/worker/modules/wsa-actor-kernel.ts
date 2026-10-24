@@ -9,7 +9,7 @@ interface Context extends WsaActorIdentity { aliases: Map<number, Alias>; native
 const cached = new Set<keyof State>(["overlapped","broadcast","reuse","receiveLimit","sendLimit","receiveTimeout","sendTimeout","oobInline","lingerEnabled","lingerSeconds","connectContextPending"]);
 const mutable = new Set<keyof State>([...cached,"packetType","filterPacketType","extendedAddress","receiveHeader","receiveBroadcast","headerInclude","ipTtl","ipTos","ipOptionsChanged","error","pendingError","originalLocal","acceptListener","acceptListenerObjectId","connectExCompleted"]);
 const omitted = new Set(["notify","connectTimer","packets","chunks","oobPending"]);
-const operations = new Set(["bind","listen","acceptError","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setNonBlocking","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","getMulticastOption","setMulticastOption","changeMulticastMembership","readable","writable","exceptional","atMark","bytesAvailable","enumEvents","maxMessageSize","isConnected","disconnect","deferAccepted","rejectAccepted","adoptAccepted"]);
+const operations = new Set(["bind","listen","acceptError","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setNonBlocking","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","setV6Only","getMulticastOption","setMulticastOption","changeMulticastMembership","readable","writable","exceptional","atMark","bytesAvailable","enumEvents","maxMessageSize","isConnected","disconnect","deferAccepted","rejectAccepted","adoptAccepted"]);
 function fail(error: number): never { throw new WsaFailure(error); }
 export class WsaActorKernel {
     private processes = new Map<number, Context>();
