@@ -163,7 +163,10 @@ export class WsaActorKernel {
         if (command === "import") { alias.imported = true; return alias.id; } // Provider cleanup owns descriptors only after WSASocket imports them.
         if (command === "duplicate") {
             const target = this.processes.get(args[1] as number); if (!target) fail(WSA.EINVAL);
-            return this.reserve(target, alias.physical, alias.cache, false);
+            // Existing descriptor caches stay stale; a new UDP provider context sees the latest request.
+            const cache = state.type === 2 && (state.af === 2 || state.af === 23)
+                ? { ...alias.cache, receiveLimit: state.receiveLimit } : alias.cache;
+            return this.reserve(target, alias.physical, cache, false);
         }
         if (command === "set") {
             const values = args[1]; if (!values || typeof values !== "object" || Array.isArray(values)) fail(WSA.EINVAL);

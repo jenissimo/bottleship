@@ -322,7 +322,7 @@ export class WsaSocketTable {
             oob: null, oobPending: [], oobInline: false, readPosition: 0, urgentMark: null, extendedAddress: false, receiveHeader: false, headerInclude: false, ipTtl: 128, ipTos: 0, ipOptionsChanged: false, keepAlive: false, noDelay: false, udpConnReset: true, v6Only: type !== 3, peerId: 0, credit: 0, writeBlocked: false,
             multicastInterface: 0, multicastTtl: 1, multicastLoop: true,
             broadcast: false, reuse: false, packetType: af === 6 ? selectedProtocol - 1000 : 0,
-            filterPacketType: null, receiveBroadcast: true, receiveLimit: BUFFER_LIMIT, sendLimit: BUFFER_LIMIT,
+            filterPacketType: null, receiveBroadcast: true, receiveLimit: type === 2 && (af === 2 || af === 23) ? 65536 : BUFFER_LIMIT, sendLimit: BUFFER_LIMIT,
             receiveTimeout: 0, sendTimeout: 0, lingerEnabled: false, lingerSeconds: 0,
             eventMask: 0, eventPending: 0, eventErrors: new Array(10).fill(0), eventDisabled: 0,
         });
@@ -782,8 +782,9 @@ export class WsaSocketTable {
     private enqueueUdp(s: SocketState, record: UdpReceiveRecord): boolean {
         const current = this.udpReceiveQueues.get(s.id);
         if ("data" in record) {
-            // Preserve the existing data-record and payload bounds. Never evict an admitted head.
-            if ((current?.dataCount ?? 0) >= PACKET_LIMIT || s.available + record.data.length > s.receiveLimit) return false;
+            // AFD tests current occupancy: one whole datagram may cross the requested window.
+            // Requested zero still permits the first packet. The object cap is a local resource bound.
+            if ((current?.dataCount ?? 0) >= PACKET_LIMIT || s.available >= Math.max(1, s.receiveLimit)) return false;
         } else if ((current?.errorCount ?? 0) >= UDP_ERROR_RECORD_LIMIT) return false;
         const queue: UdpReceiveQueue = current ?? { records: [], dataCount: 0, errorCount: 0 };
         queue.records.push(record);
@@ -1079,7 +1080,7 @@ export class WsaSocketTable {
                     (s.peer.ip6 && presented.ip6 && !same(s.peer.ip6, presented.ip6)))) continue;
                 const ipUdp = s.type === 2 && (s.af === 2 || s.af === 23);
                 const dataCount = ipUdp ? this.udpReceiveQueues.get(s.id)?.dataCount ?? 0 : s.packets.length;
-                if (dataCount >= PACKET_LIMIT || s.available + data.length > s.receiveLimit) continue;
+                if (dataCount >= PACKET_LIMIT || (!ipUdp && s.available + data.length > s.receiveLimit)) continue;
                 let ipxHeader: Uint8Array | undefined;
                 if (proto === PROTO_IPX) {
                     ipxHeader = new Uint8Array(30); const header = new DataView(ipxHeader.buffer);

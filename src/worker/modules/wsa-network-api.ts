@@ -608,6 +608,12 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     });
     api.setsockopt = adapt(counter, setError, a => {
         const s = table.get(a[0]);
+        if ((s.af === 2 || s.af === 23) && s.type === 2 && (a[1] >>> 0) === 0xffff && a[2] === 0x1002) {
+            if ((a[4] | 0) < 4) fail(WSA.EFAULT);
+            // Keep the requested provider value, including zero; admission applies the effective window.
+            s.receiveLimit = u32(a[3]);
+            return { value: 0, error: 0 };
+        }
         if ((s.af === 2 || s.af === 23) && a[1] === 41 && a[2] === 27) {
             const size = s.type === 1 ? 4 : 1;
             if ((a[4] | 0) < size) fail(WSA.EFAULT);
@@ -701,6 +707,21 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         const s = table.get(a[0]);
         if (s.af === 2 && a[1] === 0 && a[2] >= 9 && a[2] <= 13) return getMulticastOption(table, s.id, s.type, a[2], a[3], a[4]);
         guard(a[4], 4, true);
+        if ((s.af === 2 || s.af === 23) && s.type === 2 && (a[1] >>> 0) === 0xffff && a[2] === 0x1002) {
+            const capacity = u32(a[4]) | 0;
+            if (capacity < 0) fail(WSA.EFAULT);
+            if (capacity) guard(a[3], capacity, true);
+            // The provider clears the full declared extent, even before a short-buffer failure.
+            // Use bounded scratch storage rather than one deferred write object per output DWORD.
+            const zeros = new Uint8Array(Math.min(capacity, 4096));
+            for (let written = 0; written < capacity;) {
+                const chunk = zeros.subarray(0, Math.min(zeros.length, capacity - written));
+                if (Mem.writeBytes(a[3] + written, chunk) !== chunk.length) fail(WSA.EFAULT);
+                written += chunk.length;
+            }
+            if (capacity < 4) return { value: -1, error: WSA.EFAULT };
+            return { value: 0, error: 0, writes: [dword(a[3], s.receiveLimit), dword(a[4], 4)] };
+        }
         if ((s.af === 2 || s.af === 23) && a[1] === 41 && a[2] === 27) {
             const size = s.type === 1 ? 4 : 1;
             if ((u32(a[4]) | 0) < size)

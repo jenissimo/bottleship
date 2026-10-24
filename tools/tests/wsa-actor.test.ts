@@ -117,7 +117,12 @@ describe("durable Winsock socket actor",()=>{
         const h=fixture(),source=h.socket(),sender=h.socket(h.sibling);h.call(h.root,"bind",[source,h.address]);const target=h.call(h.root,"duplicate",[source,h.child.pid]);
         h.call(h.child,"set",[target,{broadcast:true,receiveLimit:2}]);expect(h.call(h.child,"get",[target]).broadcast).toBe(true);expect(h.call(h.root,"get",[source]).broadcast).toBe(false);
         expect(h.call(h.root,"get",[source]).receiveLimit).toBeGreaterThan(2);
-        h.call(h.sibling,"send",[sender,Uint8Array.of(1,2,3),h.address]);expect(h.call(h.root,"readable",[source])).toBe(false);
+        // The native first-packet probe admits a whole packet beyond a tiny window; NT5 drops later arrivals while full.
+        h.call(h.sibling,"send",[sender,Uint8Array.of(1,2,3),h.address]);expect(h.call(h.root,"readable",[source])).toBe(true);
+        h.call(h.sibling,"send",[sender,Uint8Array.of(7,8,9),h.address]);
+        expect(h.call(h.root,"receive",[source,8,2]).data).toEqual(Uint8Array.of(1,2,3));
+        expect(h.call(h.child,"receive",[target,8]).data).toEqual(Uint8Array.of(1,2,3));
+        fails(()=>h.call(h.root,"receive",[source,8]),WSA.EWOULDBLOCK);
         h.call(h.child,"set",[target,{receiveLimit:8}]);h.call(h.sibling,"send",[sender,Uint8Array.of(4,5,6),h.address]);
         expect(h.call(h.root,"receive",[source,8,2]).data).toEqual(Uint8Array.of(4,5,6));expect(h.call(h.child,"receive",[target,8]).data).toEqual(Uint8Array.of(4,5,6));
         fails(()=>h.call(h.root,"receive",[source,8]),WSA.EWOULDBLOCK);
