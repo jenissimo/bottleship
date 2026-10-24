@@ -81,7 +81,6 @@ async function createActorFixture(){
    await namespace.barrier();
   }
   function available(socket:number){
-   // LastError on success is retained for diagnostics, but its value is not asserted.
    m.ram.fill(0xa5,output,output+12);m.seed(0x5a420003);
    const legacyValue=call("ioctlsocket",[socket,FIONREAD,output]);
    const legacy={value:legacyValue,error:m.error(),count:m.get(output),tail:bytes(output+4,8)};
@@ -115,9 +114,9 @@ type ActorFixture=Awaited<ReturnType<typeof createActorFixture>>;
 type Available=ReturnType<ActorFixture["available"]>;
 type Received=ReturnType<ActorFixture["receive"]>;
 function expectAvailable(actual:Available,wanted:number){
- expect(actual.legacy.value).toBe(0);expect(actual.legacy.count).toBe(wanted);
+ expect(actual.legacy.value).toBe(0);expect(actual.legacy.error).toBe(0);expect(actual.legacy.count).toBe(wanted);
  expect(actual.legacy.tail).toEqual(filled(8));
- expect(actual.wsa.value).toBe(0);expect(actual.wsa.count).toBe(wanted);
+ expect(actual.wsa.value).toBe(0);expect(actual.wsa.error).toBe(0);expect(actual.wsa.count).toBe(wanted);
  expect(actual.wsa.returned).toBe(4);expect(actual.wsa.tail).toEqual(filled(8));
  expect(actual.wsa.returnedTail).toEqual(filled(4));
 }

@@ -337,8 +337,9 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     api.bind = adapt(counter, setError, a => ({ value: table.bind(a[0], address(a[1], a[2] | 0)), error: 0 }));
     api.listen = adapt(counter, setError, a => ({ value: table.listen(a[0], a[1]) }));
     api.connect = adapt(counter, setError, a => {
-        const peer = address(a[1], a[2] | 0), nonBlocking = table.get(a[0]).nonBlocking;
-        try { return { value: table.connect(a[0], peer) }; }
+        const peer = address(a[1], a[2] | 0), socket = table.get(a[0]), nonBlocking = socket.nonBlocking;
+        try { return { value: table.connect(a[0], peer),
+            error: socket.type === 2 && internetDataProvider(socket) ? 0 : undefined }; }
         catch (e) {
             // A committed nonblocking connect keeps its initial pending result,
             // even when the actor completes before the next owner-side RPC.
@@ -602,7 +603,8 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
         if ((a[1] >>> 0) === 0x4004667f) {
             if (a[5] < 4) fail(WSA.EFAULT);
             guard(a[4], 4, true);
-            return { value: 0, writes: [dword(a[4], table.bytesAvailable(s.id)), dword(a[6], 4)] };
+            return { value: 0, error: s.type === 2 && internetDataProvider(s) ? 0 : undefined,
+                writes: [dword(a[4], table.bytesAvailable(s.id)), dword(a[6], 4)] };
         }
         fail(WSA.EOPNOTSUPP);
     });

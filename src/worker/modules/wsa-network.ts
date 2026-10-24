@@ -969,7 +969,10 @@ export class WsaSocketTable {
     }
     readable(sid: number): boolean {
         const s = this.get(sid);
-        return !!(s.pending.length || s.packets.length || s.available || s.eof || s.error || this.udpReceiveQueues.get(s.id)?.records.length || s.readShutdown);
+        const datagram = s.type === 2 && (s.af === 2 || s.af === 23);
+        // UDP shutdown does not create a receive record; retained zero-byte records still count.
+        return !!(s.pending.length || s.packets.length || s.available || s.eof || s.error ||
+            this.udpReceiveQueues.get(s.id)?.records.length || (!datagram && s.readShutdown));
     }
     writable(sid: number): boolean {
         const s = this.get(sid);
