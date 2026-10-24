@@ -825,6 +825,8 @@ export class WsaSocketTable {
     atMark(sid: number): boolean { return this.get(sid).oob === null; }
     bytesAvailable(sid: number): number {
         const s = this.get(sid);
+        // IP UDP FIONREAD snapshots all queued payload bytes, without consuming a datagram.
+        if (s.type === 2 && (s.af === 2 || s.af === 23)) return s.available;
         return s.type !== 1 ? (s.packets[0]?.data.length ?? 0) + (s.receiveHeader && s.packets[0]?.ipxHeader ? 30 : 0) : s.available;
     }
     configureEvents(sid: number, mask: number, notify?: (bit: number, error: number) => void): void {
