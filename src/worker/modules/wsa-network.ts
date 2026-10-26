@@ -35,6 +35,10 @@ const BUFFER_LIMIT = 256 * 1024;
 const PACKET_LIMIT = 1024;
 // Local engine safety bound for queued UDP errors; not a Windows provider capacity.
 const UDP_ERROR_RECORD_LIMIT = 1024;
+// Buffered UDP admission models NT5 x86 free: AFD_BUFFER_TAG is 48 bytes
+// under the default MSVC /Zp8 ABI (DBG=0). This is a source-build model,
+// not a measured quota or allocation cost for modern Windows providers.
+const NT5_X86_UDP_RECEIVE_TAG_BYTES = 48;
 
 export interface WsaAddress {
     family: number;
@@ -781,10 +785,15 @@ export class WsaSocketTable {
     /** Admission updates the complete physical record and counters before publishing readiness. */
     private enqueueUdp(s: SocketState, record: UdpReceiveRecord): boolean {
         const current = this.udpReceiveQueues.get(s.id);
+        const window = Math.max(1, s.receiveLimit);
+        // NT5 recvdg.c and misc.c test CURRENT physical occupancy, including
+        // zero-byte datagrams and receive-only status records. The first whole
+        // record may cross the window; PEEK retains its charge until consumption.
+        if (s.available >= window || (s.available === 0 &&
+            (current?.records.length ?? 0) * NT5_X86_UDP_RECEIVE_TAG_BYTES >= window)) return false;
         if ("data" in record) {
-            // AFD tests current occupancy: one whole datagram may cross the requested window.
-            // Requested zero still permits the first packet. The object cap is a local resource bound.
-            if ((current?.dataCount ?? 0) >= PACKET_LIMIT || s.available >= Math.max(1, s.receiveLimit)) return false;
+            // Object caps remain local resource bounds, separate from the source quota.
+            if ((current?.dataCount ?? 0) >= PACKET_LIMIT) return false;
         } else if ((current?.errorCount ?? 0) >= UDP_ERROR_RECORD_LIMIT) return false;
         const queue: UdpReceiveQueue = current ?? { records: [], dataCount: 0, errorCount: 0 };
         queue.records.push(record);

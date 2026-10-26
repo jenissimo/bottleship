@@ -238,3 +238,43 @@ test("UDP real actor pending reads complete once in admission order; cancelled r
   expect(completed).toEqual([1,1]);
  }finally{for(const stop of stopObservers)stop();await f.disposeActor();}
 },30000);
+
+for(const family of [2,23] as const){
+ test("SOURCE NT5 x86 free UDP status records share current byte/tag pressure AF"+family,()=>{
+  const f=fixture(family);
+  const observe=(peek=false)=>{
+   try{return {packet:f.table.receive(f.rx.id,16,peek?2:0),error:undefined};}
+   catch(error){return {packet:undefined,error};}
+  };
+  let actual:unknown;
+  try{
+   f.memory.put(option,48);
+   const setTag=f.call("setsockopt",[f.rx.id,0xffff,0x1002,option,4]);
+   f.error(f.rx.address,f.a.address);
+   const blockedData=f.table.send(f.live.id,Uint8Array.of(0xd1),f.rx.address);
+   const firstPeek=observe(true);
+   f.error(f.rx.address,f.b.address);
+   const secondPeek=observe(true),takeStatus=observe(),afterStatus=observe();
+   const recoverySend=f.table.send(f.live.id,Uint8Array.of(0xd2),f.rx.address),recovery=observe(),emptyRecovery=observe();
+   f.memory.put(option,1);
+   const setByte=f.call("setsockopt",[f.rx.id,0xffff,0x1002,option,4]);
+   const fullSend=f.table.send(f.live.id,Uint8Array.of(0xd3),f.rx.address);
+   f.error(f.rx.address,f.a.address);
+   const fullData=observe(),afterFull=observe();
+   actual={setTag,blockedData,firstPeek,secondPeek,takeStatus,afterStatus,recoverySend,recovery,emptyRecovery,setByte,fullSend,fullData,afterFull};
+   // Secondary trusted-error producer; every actual observation precedes assertions.
+   expect([setTag,setByte]).toEqual([0,0]);expect([blockedData,recoverySend,fullSend]).toEqual([1,1,1]);
+   for(const row of [firstPeek,secondPeek,takeStatus]){
+    expect(row.error).toBeInstanceOf(WsaUdpReceiveFailure);
+    expect((row.error as WsaUdpReceiveFailure).code).toBe(WSA.ECONNRESET);
+    expect((row.error as WsaUdpReceiveFailure).from).toEqual(f.a.address);
+   }
+   for(const row of [afterStatus,emptyRecovery,afterFull]){
+    expect(row.error).toBeInstanceOf(WsaFailure);
+    expect((row.error as WsaFailure).code).toBe(WSA.EWOULDBLOCK);
+   }
+   expect(recovery.packet).toEqual({from:f.live.address,data:Uint8Array.of(0xd2),truncated:false});
+   expect(fullData.packet).toEqual({from:f.live.address,data:Uint8Array.of(0xd3),truncated:false});
+  }catch(error){console.error(JSON.stringify({basis:"NT5_X86_FREE_SOURCE_SECONDARY_ERROR_ADMISSION",family,actual,error:String(error)}));throw error;}
+ });
+}
