@@ -1,6 +1,6 @@
 # Multiplayer: передача работы и план продолжения
 
-Обновлено: 2026-10-26 (stage53). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
+Обновлено: 2026-10-26 (stage54). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
 
 ## Быстрый вход для следующего агента
 
@@ -12,9 +12,37 @@
 
 Готовый запрос для передачи: «Продолжи полный сетевой стек BottleShip по `docs/multiplayer-handoff.md`. Сначала проверь текущее состояние удалённого устройства; верхний актуальный раздел отменяет исторические записи. Сохрани исходные неудачи и SAME-PE references, выполни следующую недоказанную задачу, обнови handoff. Локальная разработка, проверки и коммиты разрешены; push, публикация и deploy не разрешены».
 
+<a id="stage54"></a>
+
+## Принятый checkpoint: stage54 Rust startup DNS и новый сетевой proof
+
+2026-10-26. Полный goal ACTIVE. В integration и standalone исправлены два неограниченных ожидания при старте: DNS имени listener и configured route hostnames. Numeric listener обходит DNS; hostname listener имеет один dnsTimeoutMs interval; все route hostnames делят ещё один общий deadline, включая ожидание semaphore permit. Timeout маршрута сохраняет TRY_AGAIN и разрешает обычные комнаты/health. Timeout имени listener возвращает TimedOut без фиктивного READY. Actual blocking worker удерживает permit до своего выхода.
+
+| Свидетельство Stage54 | Результат |
+| --- | --- |
+| Meaningful RED → unchanged GREEN | **j45ba98**, Cargo6316 natural101/fullEOF: **1pass/2fail**, оба deadline; permit lifetime control PASS. **jb3c447**, Cargo48632 natural0/fullEOF: **3/0**, те же test bodies/argv, исправлены только deadlines. First RED сохранён |
+| Финальные Cargo checks | **j117f7b** root all-targets **5/0**, Cargo51108; **jd40cee** core all-targets **47/0**, Cargo32472. Natural0/fullEOF/noForce/noTimeout,14/129 pins exact |
+| Свежая release-сборка | **jb05b19**, Cargo70204 natural0/fullEOF,129pins exact. CLI **b6f5d54a…**/4915200B, finite conformance example **32904d78…**/4900864B. Архив121 source inputs/984774B, build manifest **4bb89a71…** |
+| Функциональное сравнение TS/Rust | **j130f1e**, Bun21656 natural0/fullEOF,154pins exact: **12/12 scopes PASS** — WS/polling core+native gateway, CORS/health, controlled polling→WS upgrade с теми же session IDs. UDP0/3/65507:12 packets; TCP400000B×4=1600000B,4 accepts, byte equality/credit/FIN |
+| Завершение Rust example | Original child45684: natural0, exit+close и оба EOF; explicit retirement, no force/unknown/truncation. Native streams закрылись без forced cleanup/errors. Receipt **79ab152b…**, функциональный certificate **86a663ad…**, report **c3f95e74…** |
+| Обязательный полный gate | **j3f4c3e**, Bun62132 natural0/fullEOF,209pins exact: **6925pass/0fail/719files/9snapshots/2705954assert**; typecheck + mandatory WGSL/Naga с valid/bad/sentinel controls. Certificate **25363255…** |
+| Standalone source update | **main/2670f3a86d699ea46921c6321ebe72370742caa5**, clean после commit. Все96 Rust/Cargo/vector files побайтно равны integration, sync **75dd338e…**. Tracked `source-updates/stage54-startup-dns.json` **a158d6a6…** отделён от исторического EXPORT-MANIFEST |
+
+Maintained lib.rs **13afa7f8…**/28435B, новый startup_dns_tests.rs **96ea8b9d…**/7608B. Три теста контролируют реально вошедший held blocking worker, deadline с health до его release и удержание permit после отмены waiter. Затем тесты вынесены в cfg(test) module и отформатированы. Root Cargo не запускает автоматически все path-dependency crates; дополнительные native/gateway/transport Cargo reruns не заявляются.
+
+`tools/lan-conformance/compare-lan-servers.ts` **46f96100…** исправлен только в lifecycle: original ChildProcess, natural exit+close+оба EOF, bounded graceful20s/post-failure3s, durable firstRED перед forced cleanup, kill once только живого original child, unknown/incomplete остаётся FAIL. Imports/12 functional scenarios сохранены; independent source review **adea29be…** без blockers. Это budgets ожиданий, не hardwall синхронного host I/O: внешний owned parent имеет отдельный finite deadline.
+
+Артефакты — integration `logs/lan-conformance/stage54-rust-startup-dns/`: `ROOT-PLAN.json`, `root-causal-*-classification.json`, `root-functional-conformance.json`, `root-required-gate.json`, `rust-build-release-first/manifest.json`. Исходные RED/proposals/old binaries сохранены. Integration parent этого checkpoint — **8ba0957048f2c7dd436665ffda8b0d6af912d263**; итоговые HEAD/status/pins сохраняются отдельным post-commit freeze receipt. Пакетный README и standalone README/STANDALONE описывают новую семантику.
+
+Границы: timeout ограничивает ожидание результата, не отменяет OS resolver; Tokio runtime destruction может ждать застрявший blocking call. Не доказаны конечный whole-process exit, универсальный native DNS timing/scoped grammar, performance/p99 или полный Winsock/DirectPlay parity. Numeric hosts в сетевом proof — регрессия после startup fix; deadline доказывается отдельным causal RED/GREEN. Build/tests выполнены в integration на точном общем96-file графе; отдельный standalone Cargo запуск не заявляется.
+
+**Следующее действие при передаче — DirectPlay Host→Peer COMPLETEONPROCESS:** source-only `stage54-host-complete-on-process/` MANIFEST **a99b65c0…**, runtime patch **77f5ad05…**, шесть draft tests **4315f1c2…**. Maintained DP файлы ещё не менялись. Прочитать README/SOURCE-CONTRACT и exact baseline/candidates; после независимого review продвинуть тест на original maintained path и получить meaningful baseline RED, затем общий E0/E1 механизм. Ignored draft напрямую не запускать: relative imports рассчитаны на `tools/tests/`. Foreign/malformed ACK и локальный cap256 — defensive controls, не измеренная Windows policy/capacity. NT5 E0/E1 source contract и отдельный будущий native public COM callback-return/retained-buffer/ReturnBuffer oracle явно разделены.
+
+Собственных Cargo/conformance/gate процессов после известных terminal результатов нет; commit jobs наблюдать по exact handles. Сохранены j1d0d62:5175, j039c33:5176, ja81fb1:5177, shared CDP9334/sidecar3003; browser/service actions в Stage54 не было. Push/publish/deploy не выполнялись. Принятый Stage52 native/guest proof повторно не создавался.
+
 <a id="stage53"></a>
 
-## Текущий checkpoint: stage53 UDP multierror oracle и Worker GREEN
+## Принятый checkpoint: stage53 UDP multierror oracle и Worker GREEN
 
 Обновлено: 2026-10-26. Продолжение другого агента **Stage52 принято и независимо сверено**: production cohort `0de75b9b…`, SAME-PE16 literal/keyed/canonical — **0 расхождений**. Runtime остаётся `cbe8b0768d88e3f4507645c5062ebeca6c740458`; Stage53 добавляет четыре регрессии в `tools/tests/wsa-udp-mixed-actor.test.ts`, существующий код очереди менять не потребовалось. Цель полного стека ACTIVE.
 

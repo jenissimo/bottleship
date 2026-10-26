@@ -1,6 +1,8 @@
 //! Standalone Socket.IO LAN server. Guest Win32/DirectPlay emulation stays in the client.
 pub mod config;
 mod dispatch;
+#[cfg(test)]
+mod startup_dns_tests;
 use bottleship_lan_core::{
     Command, ConnId, Core, Effect,
     config::GatewayConfig,
@@ -38,22 +40,63 @@ impl Drop for LanServer {
 }
 impl LanServer {
     pub async fn bind(config: ServerConfig) -> Result<Self, Error> {
+        Self::bind_with_startup_resolver(config, resolve_sync).await
+    }
+    async fn bind_with_startup_resolver<F>(config: ServerConfig, resolver: F) -> Result<Self, Error>
+    where
+        F: Fn(&str) -> Result<Vec<NativeAddress>, ResolveError> + Send + Sync + 'static,
+    {
         config.validate().map_err(std::io::Error::other)?;
         let dns = Arc::new(Semaphore::new(config.max_dns_operations));
         let gateway = Arc::new(config.gateway.clone());
         let mut routes = Routes::new(config.gateway.clone())?;
+        let resolver = Arc::new(resolver);
+        // The numeric listener does not need a resolver or its permit.
+        // Hostname listener lookup is performed first, before route work.
+        let address = if let Ok(address) = NativeAddress::parse(&config.host) {
+            address.socket_addr(config.port)
+        } else {
+            let permit = dns.clone().acquire_owned().await?;
+            timeout(
+                Duration::from_millis(config.dns_timeout_ms),
+                resolve_owned(config.host.clone(), permit, resolver.clone()),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Server bind host lookup timed out",
+                )
+            })??
+            .into_iter()
+            .next()
+            .ok_or_else(|| std::io::Error::other("Server host has no address"))?
+            .socket_addr(config.port)
+        };
+        // One phase deadline includes queueing for a permit, not one timeout per batch.
+        let deadline = Instant::now() + Duration::from_millis(config.dns_timeout_ms);
         let mut startup = JoinSet::new();
         for (id, route) in config.gateway.routes.iter().enumerate() {
+            // Routes::new already pins numeric targets without DNS.
+            if NativeAddress::parse(&route.host).is_ok() {
+                continue;
+            }
             let host = route.host.clone();
             let permits = dns.clone();
+            let resolver = resolver.clone();
             startup.spawn(async move {
-                let permit = permits
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ResolveError::new(ResolveCode::NetworkDown, "Resolver stopped"));
-                let result = match permit {
-                    Ok(permit) => resolve_owned(host, permit).await,
-                    Err(error) => Err(error),
+                let lookup = async move {
+                    let permit = permits.acquire_owned().await.map_err(|_| {
+                        ResolveError::new(ResolveCode::NetworkDown, "Resolver stopped")
+                    })?;
+                    resolve_owned(host, permit, resolver).await
+                };
+                let result = match tokio::time::timeout_at(deadline, lookup).await {
+                    Ok(result) => result,
+                    Err(_) => Err(ResolveError::new(
+                        ResolveCode::TryAgain,
+                        "Configured startup destination lookup timed out",
+                    )),
                 };
                 (id, result)
             });
@@ -63,10 +106,6 @@ impl LanServer {
             routes.pin(id, result)?;
         }
         let core = Core::new(config.limits.clone(), routes)?;
-        let address = tokio::net::lookup_host((config.host.as_str(), config.port))
-            .await?
-            .next()
-            .ok_or_else(|| std::io::Error::other("Server host has no address"))?;
         let mut wire = transport::Config::default();
         wire.max_connections = config.max_connections;
         wire.max_tcp_connections = config.max_connections.saturating_mul(4).max(64);
@@ -618,13 +657,17 @@ async fn run(
     }
     failure.map_or(Ok(()), Err)
 }
-async fn resolve_owned(
+async fn resolve_owned<F>(
     host: String,
     permit: tokio::sync::OwnedSemaphorePermit,
-) -> Result<Vec<NativeAddress>, ResolveError> {
+    resolver: Arc<F>,
+) -> Result<Vec<NativeAddress>, ResolveError>
+where
+    F: Fn(&str) -> Result<Vec<NativeAddress>, ResolveError> + Send + Sync + 'static,
+{
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        resolve_sync(&host)
+        resolver(&host)
     })
     .await
     .map_err(|_| ResolveError::new(ResolveCode::NoRecovery, "Resolver worker failed"))?

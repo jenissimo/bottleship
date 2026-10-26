@@ -59,7 +59,11 @@ const udp=createSocket("udp4");let udpPackets=0,tcpBytes=0,tcpAccepted=0;
 tcp.on("connection",socket=>{tcpAccepted++;socket.on("data",data=>tcpBytes+=data.length)});
 udp.on("message",(data,peer)=>{udpPackets++;udp.send(data,peer.port,peer.address,error=>{if(error)nativeErrors.push(String(error))})});
 let tcpListening=false,udpListening=false,rust:ChildProcessWithoutNullStreams|undefined,ts:ReturnType<typeof createLanServer>|undefined;
-let rustExit:Promise<number|null>|undefined,rustLog="",rustErrors="",rustLines:Json[]=[],rustReady:Json|undefined,forced=false;
+let rustExit:Promise<number|null>|undefined,rustClose:Promise<void>|undefined,rustLog="",rustErrors="",rustLines:Json[]=[],rustReady:Json|undefined,forced=false;
+const rustState={exitObserved:false,code:null as number|null,signal:null as string|null,closeObserved:false,closeCode:null as number|null,closeSignal:null as string|null,processError:null as string|null,stdinError:null as string|null};
+const streamState=()=>({bytes:0,eof:false,closed:false,error:null as string|null,truncated:false,abandoned:false});
+const rustStreams={stdout:streamState(),stderr:streamState()};
+let rustRetirement:Json|undefined;
 const closeClients=new Set<Socket>();
 function event(socket:Socket,name:string,predicate:(args:any[])=>boolean=()=>true,ms=6000):Promise<any[]>{
  return new Promise((resolve,reject)=>{
@@ -162,9 +166,18 @@ async function gatewayChecks(url:string,transport:Transport,udpPort:number,tcpPo
 }
 async function startRust(configPath:string){
  rust=spawn(binary,["--config",configPath],{cwd:process.cwd(),stdio:["pipe","pipe","pipe"]});
- rustExit=new Promise((resolve,reject)=>{rust!.once("exit",resolve);rust!.once("error",reject)});
- rust.stdin.on("error",error=>rustErrors+=String(error));
+ rustExit=new Promise((resolve,reject)=>{
+  rust!.once("exit",(code,signal)=>{Object.assign(rustState,{exitObserved:true,code,signal});resolve(code)});
+  rust!.once("error",error=>{rustState.processError=String(error);reject(error)});
+ });
+ rustClose=new Promise(resolve=>rust!.once("close",(closeCode,closeSignal)=>{Object.assign(rustState,{closeObserved:true,closeCode,closeSignal});resolve()}));
+ rust.stdin.on("error",error=>{rustState.stdinError=String(error)});
  rustExit.catch(()=>{});
+ for(const name of ["stdout","stderr"] as const){
+  const stream=rust[name],state=rustStreams[name];
+  stream.on("end",()=>{state.eof=true});stream.on("close",()=>{state.closed=true});stream.on("error",error=>{state.error=String(error)});
+  stream.on("data",chunk=>{state.bytes+=chunk.length;state.truncated=state.bytes>65536});
+ }
  rust.stderr.on("data",chunk=>rustErrors=(rustErrors+chunk.toString()).slice(-65536));
  let readyResolve:(value:Json)=>void;let readyReject:(error:unknown)=>void;
  const ready=new Promise<Json>((resolve,reject)=>{readyResolve=resolve;readyReject=reject});
@@ -180,12 +193,48 @@ async function startRust(configPath:string){
  return"http://127.0.0.1:"+rustReady.port;
 }
 async function stopRust(){
- if(!rust||!rustExit)return undefined;
- rust.stdin.end("shutdown\n");
- let code=await finite(rustExit,"Rust shutdown and native cleanup",20000).catch(()=>{forced=true;rust!.kill();return rustExit!});
- const retired=rustLines.find(line=>line.retired===true);
- assert.equal(forced,false,"Rust shutdown needed kill");assert.equal(code,0);assert.equal(retired?.explicit,true,"Rust did not acknowledge explicit retirement");
- return{pid:rust.pid,code,forced,retired};
+ if(!rust||!rustExit||!rustClose)return undefined;
+ const child=rust,started=Date.now(),issues:string[]=[];let killAttempted=false,killAccepted:boolean|null=null,unrefAttempted=false;
+ const fault=(message:string)=>{issues.push(message);failure??={stage:"rust-retirement",message}};
+ const snapshot=()=>({pid:child.pid??null,...rustState,forced,killAttempted,killAccepted,unrefAttempted,elapsedMs:Date.now()-started,
+  retired:rustLines.find(line=>line.retired===true)??null,stdout:{...rustStreams.stdout},stderr:{...rustStreams.stderr},
+  unknown:!rustState.exitObserved,gracefulLimitMs:20000,retirementLimitMs:3000,issues:[...issues]});
+ const retain=(name:string,value:unknown)=>{try{save(name,value);return true}catch(error){fault("Rust retirement evidence "+name+": "+String(error));return false}};
+ try{
+  child.stdin.end("shutdown\n");
+  await finite(Promise.all([rustExit,rustClose]),"Rust shutdown, exit and stdio close",20000);
+ }catch(error){fault(String(error))}
+ if(!rustState.exitObserved||rustState.code!==0||rustState.signal!==null)fault("Rust did not exit naturally with code 0");
+ if(!rustState.closeObserved||rustState.closeCode!==0||rustState.closeSignal!==null)fault("Rust child close not observed with code 0");
+ if(rustState.processError||rustState.stdinError)fault("Rust process/stdin error");
+ for(const [name,state]of Object.entries(rustStreams)){
+  if(!state.eof||!state.closed||state.error||state.truncated)fault("Rust "+name+" capture incomplete, errored or truncated");
+ }
+ if(rustLines.find(line=>line.retired===true)?.explicit!==true)fault("Rust did not acknowledge explicit retirement");
+ if(issues.length){
+  // Persist the first failure before cleanup; evidence I/O failure must not skip retirement.
+  if(!existsSync(join(output,"first-red.json")))retain("first-red.json",failure);
+  retain("rust-red-before-cleanup.json",snapshot());
+  // Only the original still-live child may be killed, once. Exit without pipe EOF is not a reason to kill another process.
+  if(child.pid!==undefined&&!rustState.exitObserved&&!rustState.closeObserved){
+   forced=true;killAttempted=true;
+   try{killAccepted=child.kill();if(!killAccepted)fault("Rust kill was not accepted")}catch(error){fault("Rust kill: "+String(error))}
+  }
+  if(!rustState.closeObserved){
+   try{await finite(rustClose,"Rust post-failure retirement",3000)}catch(error){fault(String(error))}
+  }
+  // Abandon only local incomplete handles; never turn their destruction into EOF or a natural-exit claim.
+  for(const name of ["stdout","stderr"] as const){
+   if(!rustStreams[name].closed){rustStreams[name].abandoned=true;try{child[name].destroy()}catch(error){fault("Rust "+name+" destroy: "+String(error))}}
+  }
+  if(!rustState.closeObserved){
+   try{child.stdin.destroy()}catch(error){fault("Rust stdin destroy: "+String(error))}
+   unrefAttempted=true;try{child.unref()}catch(error){fault("Rust unref: "+String(error))}
+  }
+ }
+ rustRetirement=snapshot();if(!retain("rust-retirement.json",rustRetirement))rustRetirement=snapshot();
+ if(issues.length)throw Error("Rust retirement failed: "+issues.join("; "));
+ return rustRetirement;
 }
 let retirement:Json|undefined,configPath="",tsPort=0;
 try{
@@ -212,7 +261,7 @@ try{
 finally{
  for(const socket of closeClients){socket.removeAllListeners();socket.disconnect();}
  if(ts){try{await finite(ts.close(),"TS server close",10000)}catch(error){failure??={stage:"typescript-retirement",message:String(error)}}}
- try{retirement=await stopRust()}catch(error){failure??={stage:"rust-retirement",message:String(error)}}
+ try{retirement=await stopRust()}catch(error){retirement=rustRetirement;failure??={stage:"rust-retirement",message:String(error)}}
  let nativeForced=false;
  try{await until(()=>nativeSockets.size===0,"native stream retirement",3000)}catch(error){failure??={stage:"native-retirement",message:String(error)};nativeForced=true;for(const socket of nativeSockets)socket.destroy();}
  if(tcpListening)await finite(new Promise<void>(resolve=>tcp.close(()=>resolve())),"native TCP close");
