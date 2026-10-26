@@ -8,6 +8,10 @@ import { NativeDirectPlayPort } from "./port";
 import { NativeLocalDelivery } from "./local-delivery";
 const clone = (a: Address): Address => ({ node: a.node.slice(), port: a.port });
 const key = (a: Address) => a.node.join(".") + ":" + a.port;
+interface RemoteProcessing {
+    recipient: number; generation: number;
+    resolve(result: number): void; reject(error: unknown): void; removeAbort?(): void;
+}
 /** Native authority attached only after its provider acknowledges the actual listener. */
 export class NativeHostBackend implements DirectPlay8Backend {
     readonly kind = "native" as const;
@@ -25,14 +29,26 @@ export class NativeHostBackend implements DirectPlay8Backend {
     private generation = 0;
     private closing = false;
     private disposed = false;
+    // Local bounded request ownership, not a measured Windows capacity limit.
+    private remoteProcessing = new Map<number, RemoteProcessing>();
+    private nextProcessingHandle = 1; // Never reset/reuse a handle across Host generations.
     constructor(readonly network: LanNetwork, readonly timeout = 25000, readonly retryInterval = 200) {
         this.host = new NativeDirectPlayHost(network);
         this.host.onMessage = id => this.onMessage?.(id);
+        this.host.onProcessingComplete = (id, handle) => {
+            const request = this.remoteProcessing.get(handle);
+            if (request && request.recipient === id && request.generation === this.generation && !this.closing && !this.lost)
+                this.completeRemoteProcessing(handle, DPN.OK);
+        };
         this.host.onInfo = (id, returned) => { if (this.onInfo) this.onInfo(id, returned); else { this.onChange?.(); returned(); } };
         this.host.onChange = () => {
             if (!this.host.desc) {
                 if (this.ready && !this.closing) { this.lost = true; this.localDelivery.cancel(DPN.CONNECTIONLOST); }
+                this.cancelRemoteProcessing(DPN.CONNECTIONLOST);
                 this.releaseReady();
+            } else {
+                for (const [handle, request] of [...this.remoteProcessing])
+                    if (!this.host.entities.has(request.recipient)) this.completeRemoteProcessing(handle, DPN.CONNECTIONLOST);
             }
             this.onChange?.();
         };
@@ -50,6 +66,32 @@ export class NativeHostBackend implements DirectPlay8Backend {
     get isHost(): boolean { return this.host.isHost; }
     get openError(): number { return this.lost ? DPN.CONNECTIONLOST : this.desc ? DPN.OK : DPN.NOCONNECTION; }
     get pendingLocalProcessing(): number { return this.localDelivery.pending; }
+    private takeRemoteProcessing(handle: number): RemoteProcessing | undefined {
+        const request = this.remoteProcessing.get(handle); if (!request) return undefined;
+        this.remoteProcessing.delete(handle); request.removeAbort?.(); return request;
+    }
+    private completeRemoteProcessing(handle: number, result: number): void { this.takeRemoteProcessing(handle)?.resolve(result); }
+    private rejectRemoteProcessing(handle: number, error: unknown): void { this.takeRemoteProcessing(handle)?.reject(error); }
+    private cancelRemoteProcessing(result: number): void {
+        for (const handle of [...this.remoteProcessing.keys()]) this.completeRemoteProcessing(handle, result);
+    }
+    private requestRemoteProcessing(recipient: number, flags: number, data: Uint8Array, signal?: AbortSignal): Promise<number> {
+        if (signal?.aborted) return Promise.resolve(DPN.USERCANCEL);
+        if (this.remoteProcessing.size >= 256 || this.nextProcessingHandle > 0xffffffff) return Promise.resolve(DPN.TABLEFULL);
+        const handle = this.nextProcessingHandle++;
+        let resolve!: (result: number) => void, reject!: (error: unknown) => void;
+        const result = new Promise<number>((done, failed) => { resolve = done; reject = failed; });
+        const abort = () => this.completeRemoteProcessing(handle, DPN.USERCANCEL);
+        this.remoteProcessing.set(handle, { recipient, generation: this.generation, resolve, reject,
+            removeAbort: signal ? () => signal.removeEventListener("abort", abort) : undefined });
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) { this.completeRemoteProcessing(handle, DPN.USERCANCEL); return result; }
+        // Install ownership before sending: a synchronous carrier may deliver E1 reentrantly.
+        void this.host.sendDpn(recipient, flags & 0x1c, data, handle).then(
+            hr => { if (hr) this.completeRemoteProcessing(handle, hr); },
+            error => this.rejectRemoteProcessing(handle, error));
+        return result;
+    }
     private releaseReady(): void {
         const ready = this.ready; this.ready = undefined; this.advertised = undefined;
         try { ready?.release(); } catch { /* Binding teardown must still finish. */ }
@@ -93,6 +135,7 @@ export class NativeHostBackend implements DirectPlay8Backend {
             const providerLost = () => {
                 if (this.ready !== ready || generation !== this.generation || this.closing || this.disposed) return;
                 this.lost = true; this.localDelivery.cancel(DPN.CONNECTIONLOST);
+                this.cancelRemoteProcessing(DPN.CONNECTIONLOST);
                 this.host.close(); port?.close(); if (this.port === port) this.port = undefined; this.releaseReady();
             };
             void ready.closed?.then(providerLost, providerLost);
@@ -130,14 +173,21 @@ export class NativeHostBackend implements DirectPlay8Backend {
         const target = this.entities.get(to); if (to && !target) return DPN.INVALIDPLAYER;
         const recipients = !to ? [...this.entities.values()].filter(e => !e.group).map(e => e.id) : target!.group ? target!.members : [to];
         const remote = recipients.filter(id => id !== this.localId);
-        // The current native Host oracle covers direct remote delivery, not outgoing COP authority.
-        if (remote.length && (flags & 4)) return DPN.UNSUPPORTED;
+        if ((flags & 4) && (remote.length > 256 - this.remoteProcessing.size ||
+            remote.length > 0xffffffff - this.nextProcessingHandle + 1)) return DPN.TABLEFULL;
+        const generation = this.generation;
         let local = Promise.resolve<number>(DPN.OK);
         if (recipients.includes(this.localId) && !(flags & 0x20)) {
             const result = this.localDelivery.deliver(to === this.localId, flags, data,
                 (bytes, wireFlags, processed) => this.host.deliverLocal(bytes, wireFlags, processed), signal, acceptedLocal, completedLocal);
             if (typeof result === "number" && result) return result;
             local = Promise.resolve(result);
+        }
+        if (flags & 4) {
+            if (generation !== this.generation || this.closing) return DPN.USERCANCEL;
+            const [results, localResult] = await Promise.all([
+                Promise.all(remote.map(id => this.requestRemoteProcessing(id, flags, data, signal))), local]);
+            return results.find(result => result !== DPN.OK) ?? localResult;
         }
         const results = await Promise.all(remote.map(id => this.host.sendDpn(id, flags & 0x18, data)));
         return results.find(result => result !== DPN.OK) ?? await local;
@@ -154,10 +204,12 @@ export class NativeHostBackend implements DirectPlay8Backend {
     terminate(_data: Uint8Array, _reason?: number): number { return DPN.UNSUPPORTED; }
     async shutdown(): Promise<number> {
         this.closing = true; this.pending?.abort(); this.localDelivery.cancel(DPN.USERCANCEL);
+        this.cancelRemoteProcessing(DPN.USERCANCEL);
         const result = await this.host.shutdown(); this.releaseReady(); this.port = undefined; return result;
     }
     close(): number {
         this.closing = true; ++this.generation; this.pending?.abort(); this.localDelivery.cancel(DPN.USERCANCEL);
+        this.cancelRemoteProcessing(DPN.USERCANCEL);
         const result = this.host.close(); this.port?.close(); this.port = undefined; this.releaseReady(); return result;
     }
     dispose(): void { this.close(); this.host.dispose(); this.disposed = true; }

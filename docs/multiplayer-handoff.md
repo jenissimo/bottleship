@@ -12,6 +12,32 @@
 
 Готовый запрос для передачи: «Продолжи полный сетевой стек BottleShip по `docs/multiplayer-handoff.md`. Сначала проверь текущее состояние удалённого устройства; верхний актуальный раздел отменяет исторические записи. Сохрани исходные неудачи и SAME-PE references, выполни следующую недоказанную задачу, обнови handoff. Локальная разработка, проверки и коммиты разрешены; push, публикация и deploy не разрешены».
 
+<a id="stage54-cop"></a>
+
+## Текущее окно: stage54 DirectPlay Host→Peer COMPLETEONPROCESS — component GREEN, native proof впереди
+
+2026-10-26. Полный goal ACTIVE. Root применил общий E0/E1 механизм: remote Host COP отправляет reliable USER1 E0 с отдельным nonzero DWORD handle на каждого получателя и ждёт matching E1 после обработки. Carrier ACK сам по себе запрос не завершает. Ledger ставится до send, снимается вместе с AbortSignal listener до terminal completion; Close/restart, provider loss и удаление получателя освобождают старое владение. Handle на backend object не переиспользуется между generations; cap256/точный8B E1/foreign-recipient fence — локальные defensive controls, не измеренная Windows policy/capacity.
+
+| Свидетельство | Результат |
+| --- | --- |
+| Causal first RED | **jd5804c**, Bun58848 natural1/fullEOF/noForce/noTimeout,56pins exact: после actual Host/C1-C2-C3 join/entity prerequisite E0 expected1/observed0; **0pass/1fail/5filtered/8assert**. Базовый source29fba1 возвращал UNSUPPORTED; HRESULT в этом тесте отдельно не записывался |
+| Тот же primary GREEN | **j2ae1b7**, Bun8780 natural0/fullEOF,56pins exact: **1/0/5filtered/19assert**. Test bytes и argv совпадают с RED. Actual E0 sequence/recipient и SACK, доставленный original Host, наблюдаются до pending assertion; manual matching E1 завершает операцию |
+| Все новые component controls | **j24a8c2**, Bun48396 natural0/fullEOF: **6/0/128assert**,56pins exact. Foreign/malformed/unknown/stale/duplicate replies, abort, broadcast, Close/restart и provider loss |
+| Related DirectPlay | **j205a89**, Bun29772 natural0/fullEOF: **299/0/33files/134052assert**,88pins exact |
+| Required gate | **j5b42bc**, Bun69212 natural0/fullEOF/noForce/noTimeout,293pins exact: **6931pass/0fail/720files/9snapshots/2706082assert**, typecheck + mandatory WGSL/Naga valid/bad/sentinel. Certificate **0e539af3…** |
+
+Current maintained source: host.ts **b8e421ac…**/34454B, host-backend.ts **8e460c2a…**/15811B; новый `tools/tests/directplay8-native-host-cop.test.ts` **b8f43bfb…**/11665B. Independent source reviews **abf6a6c7…** и ACK-receipt delta **67aeeb06…** без blockers. NT5 source G:/sources проверен read-only по SHA/строкам: common.cpp2571–2578, async.cpp3720–3839/4031–4054, message.h277–284, corereceive.cpp265–286, paramval.cpp2080–2089. E1 выдаётся после RECEIVE handler return и до retained-buffer lifetime. Это source contract; current component copies не являются COM ReturnBuffer proof.
+
+Артефакты — integration `logs/lan-conformance/stage54-host-complete-on-process/`: `ROOT-PLAN.json`, `root-causal-red-classification.json` **6890041e…**, `root-causal-green-classification.json` **61be5fcd…**, `root-regression-checks.json` **7cf2b48a…**, `root-required-gate.json` **0e539af3…**. Исходные drafts/RED immutable. Во время observation gate была краткая ошибка связи502; после reconnect проверены ТОТ ЖЕ job, durable owner и полные streams, команду не повторяли. Integration parent этого slice — **6870afec52b5e06b4e4b696e57a75ab908165fdb**; commit/status/pins фиксируются post-commit receipt.
+
+**Следующая недоказанная зависимость:** отдельный actual Windows public-COM Host+Peer COP oracle. В `native-oracle-design/` sealed C **8c755944…**/22079B, design **4eb91446…**, plan **4db1ad87…**; C source review **3634df72…** READY. **PE/сборки/нативного прогона ещё нет; controller/manifest/README на момент checkpoint ещё authoring.** Сначала полностью читать готовые operational files и independent review. Public ThreadPool0/DoWork должен дать ordinary GUARANTEED completion при held RECEIVE как положительный prerequisite; отсутствие — INCONCLUSIVE, не COP mismatch и не повод для автоматического fallback/retry. Нужны actual same-DoWork return/TID/pump receipt, живой исходный COM pointer+handle при DPNSUCCESS_PENDING, matching Host SEND_COMPLETE до отдельного ReturnBuffer gate, once actual ReturnBuffer и owned process/endpoint retirement. Pre-return marker/скопированные bytes не подменяют эти факты.
+
+**Shipping proof для новых DP bytes ещё UNVERIFIED.** После native qualification — required source/archive/build/fullHTTP и соответствующий SAME-PE/WS/polling interop/guest proof на новой когорте. Preview5177 всё ещё обслуживает принятый Stage52 cohort; не выдавать его за проверку этого fix. Rust accepted checkpoint ниже сохранён, Rust graph/binaries в COP slice не менялись; повторять готовые 12 scopes/нативные references без нового основания не нужно.
+
+Остальной объём полного goal отражён в source-only snapshot integration `logs/lan-conformance/stage54-remaining-matrix/` (README **d57cbc48…**, JSON **b1a290ea…**): D1 COP/native+shipping; D2 DP4 wire/DP8 authority/recovery/migration/security; W1 UDP queue policy; W2 completion/OVERLAPPED; W3 provider families; P1 Section/broker prerequisites; S1 Rust performance; V1 shipping evidence. D1 в snapshot остановлен на primary PASS; этот верхний раздел добавляет фактические6/299/6931. Старые subjective85%/60–65% в исторических таблицах не являются текущей оценкой: нет закрытой взвешенной матрицы parity. Сначала закончить D1, не запускать весь список одновременно.
+
+Все известные test/gate jobs terminal; preserved j1d0d62:5175, j039c33:5176, ja81fb1:5177, CDP9334/sidecar3003. Собственных native/browser/server запусков в COP slice не было. Локальные изменения/коммиты разрешены, push/publish/deploy не выполнялись.
+
 <a id="stage54"></a>
 
 ## Принятый checkpoint: stage54 Rust startup DNS и новый сетевой proof

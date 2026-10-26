@@ -50,6 +50,7 @@ export class NativeDirectPlayHost {
     onChange?: () => void;
     onMessage?: (id: number) => void;
     onInfo?: (id: number, returned: (result?: number) => void) => void;
+    onProcessingComplete?: (id: number, handle: number) => void;
     localId = 0;
     desc: SessionDesc | null = null;
     private port?: NativeDirectPlayPort;
@@ -169,6 +170,8 @@ export class NativeDirectPlayHost {
         if (op.command === 0xc3 && c.phase === "table") { c.c3 = true; this.promote(c); }
         else if (op.command === 0xc9 && c.phase === "connected" && op.version <= this.version)
             void c.channel!.link.sendReliable(nativeCoreWords(0xca, op.version, 0));
+        else if (op.command === 0xe1 && c.phase === "connected" && message.payload.length === 8)
+            this.onProcessingComplete?.(c.id!, op.handle!);
         else if (op.command === 0xe0 && c.phase === "connected") {
             let acknowledged = false;
             return this.enqueue(c.id!, op.data!, message.command & DN.RELIABLE ? 1 : 0, () => {
@@ -450,13 +453,21 @@ export class NativeDirectPlayHost {
         if (id === this.localId && this.desc) return this.localAddress;
         const c = [...this.connections.values()].find(c => c.id === id && c.phase === "connected"); return c ? clone(c.address) : null;
     }
-    async sendDpn(to: number, flags: number, data: Uint8Array): Promise<number> {
+    async sendDpn(to: number, flags: number, data: Uint8Array, completionHandle?: number): Promise<number> {
         if (this.closing) return DPN.ALREADYCLOSING;
         if (!this.desc) return DPN.NOCONNECTION;
         const c = [...this.connections.values()].find(c => c.id === to && c.phase === "connected");
         if (!c?.channel) return DPN.INVALIDPLAYER;
         if (!data.length || data.length > 1024 * 1024) return DPN.INVALIDPARAM;
-        if (flags & ~0x18) return DPN.UNSUPPORTED;
+        if (flags & ~0x1c) return DPN.UNSUPPORTED;
+        if (flags & 4) {
+            if (!(flags & 8)) return DPN.INVALIDFLAGS;
+            if (!Number.isInteger(completionHandle) || completionHandle! < 1 || completionHandle! > 0xffffffff) return DPN.INVALIDPARAM;
+            // NT5 DN_MSG_INTERNAL_REQ_PROCESS_COMPLETION: DWORD handle, then user bytes.
+            const packet = new Uint8Array(8 + data.length);
+            packet.set(nativeCoreWords(0xe0, completionHandle!)); packet.set(data, 8);
+            return c.channel.link.sendReliable(packet);
+        }
         return flags & 8 ? c.channel.link.sendReliable(data, 0, !(flags & 0x10)) : c.channel.link.sendUnreliable(data, 0, !(flags & 0x10));
     }
     async shutdown(): Promise<number> {
