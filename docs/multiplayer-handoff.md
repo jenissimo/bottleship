@@ -1,6 +1,6 @@
 # Multiplayer: передача работы и план продолжения
 
-Обновлено: 2026-10-24 (stage52). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
+Обновлено: 2026-10-26 (stage53). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
 
 ## Быстрый вход для следующего агента
 
@@ -12,7 +12,35 @@
 
 Готовый запрос для передачи: «Продолжи полный сетевой стек BottleShip по `docs/multiplayer-handoff.md`. Сначала проверь текущее состояние удалённого устройства; верхний актуальный раздел отменяет исторические записи. Сохрани исходные неудачи и SAME-PE references, выполни следующую недоказанную задачу, обнови handoff. Локальная разработка, проверки и коммиты разрешены; push, публикация и deploy не разрешены».
 
-## Текущий checkpoint: stage52 SAME-PE16 literal GREEN — три gap'а Stage51 закрыты
+<a id="stage53"></a>
+
+## Текущий checkpoint: stage53 UDP multierror oracle и Worker GREEN
+
+Обновлено: 2026-10-26. Продолжение другого агента **Stage52 принято и независимо сверено**: production cohort `0de75b9b…`, SAME-PE16 literal/keyed/canonical — **0 расхождений**. Runtime остаётся `cbe8b0768d88e3f4507645c5062ebeca6c740458`; Stage53 добавляет четыре регрессии в `tools/tests/wsa-udp-mixed-actor.test.ts`, существующий код очереди менять не потребовалось. Цель полного стека ACTIVE.
+
+| Свидетельство Stage53 | Результат |
+| --- | --- |
+| Один native x86 прогон | **j28caed**, original PE PID56516 natural0/fullEOF/noForce/noTimeout; 16 required files, fault markers отсутствуют; все16 фактически записанных loopback-портов освобождены и заняты own observer после known original exit |
+| Файловая проверка | **j4fa8fa**, Bun38144 natural0/fullEOF; **788 TLV /420 API /433 contexts /102 recv /74 FION**, 24 warm receives и4 final L controls;10 отрицательных копий отвергнуты |
+| Наблюдаемая последовательность | AF2/23 sequential: обычные A54→B54. AF2/23 retained: первый PEEK(A54), после предложения B ещё два PEEK(A54), затем обычные A54→B54, потом точные L8. Source — реальные queried endpoints, payload/tails проверены |
+| Public Worker regressions | **jcc1375**: **412pass/0fail/39 WSA files/11731assert**, 53 pins exact |
+| Required gate | **jc4e1c8**, original Bun29384 natural0/fullEOF/noForce/noTimeout,57 pins exact: **6925pass/0fail/719files/9snapshots/2705954assert**; typecheck + обязательный WGSL/Naga, positive/bad/sentinel controls; certificate **fcb1ba9d…** |
+
+Артефакты — integration `logs/lan-conformance/stage53-udp-multierror/`: `ROOT-PLAN.json`, `README.md`, `root-native-first-classification.json` **f3b8c276…**, `native-first-file-audit.json` **052b1101…**, `root-required-gate.json` **fcb1ba9d…**. C **52655844…**, PE **e64b8f8b…**, raw ledger31664B **b85b6716…**, current actor test14983B **de69a37e…**. Полные SHA/argv/limits находятся в manifest/receipts рядом; исходный test88b914 сохранён. Независимые source reviews runner/checker/actor tail: **d94c6199… /852af584… /a419f787…**, блокеров нет.
+
+**Сохранённые неудачи:** syntax jb18162 — missing explicit MinGW child PATH; первый file-audit j99930d — неверное ожидание checker о строке SysWOW64 (реальный x86 module filename сообщает System32). Reviewer нашёл пропущенную уникальность raw recv/FION keys; исправлены bijections и добавлены duplicate-key controls. Первый required gate **je5e66d** достиг6913 pass/0fail, но был остановлен own deadline105s без итоговой сводки; **это FAIL/не PASS**. После known retirement выполнен fresh jc4e1c8 с теми же bytes/pins/argv, только finite budget180s вместо105s; завершился за87.257s. Старые результаты и firstRED сохранены.
+
+Граница доказательства: это **diagnostic public return trace**, не deterministic SAME-PE reference. До первого обычного чтения нет независимого non-consuming ACK_B. Send success, FIONREAD, select, pacing и L control не доказывают одновременное admission. Универсальные FIFO/coalescing/drop/replacement/capacity, OVERLAPPED, remote/provider и performance остаются UNVERIFIED. Actor barrier — отдельный механизм синхронизации эмулятора, не Windows ACK_B. Последний empty receive в новых тестах — secondary regression control.
+
+**Следующее действие при передаче:** после сохранения Stage53 переходить к общим функциональным пробелам; не повторять принятый native/guest capture и не менять runtime ради искусственного RED.
+
+1. **Rust startup DNS:** `packages/lan-rust/src/lib.rs` и standalone `.wt/bottleship-multiplayer-server/src/lib.rs` сейчас SHA **30cdbd0f…**. Startup configured route lookups и listener hostname lookup ждут без deadline; runtime `dnsTimeoutMs` их не ограничивает. Агент lan_transport готовит source-only RED/patch proposal в `stage54-rust-startup-dns/`: numeric listener fastpath, bounded hostname wait, общий route deadline включая ожидание permit, TRY_AGAIN snapshot; permit удерживается до реального окончания OS call. Не обещать отмену OS resolver или конечный CLI exit по одному timeout. Root свежим Git подтвердил standalone **main/9ba35981…/clean**, свободно4.30GB. До применения проверить exact proposal, maintained bytes и current status; выполнить causal RED → generic fix → relevant Cargo checks, затем синхронизировать обе копии и export provenance. Агенту пока запрещены maintained edits/exec.
+2. **DirectPlay Host→Peer COMPLETEONPROCESS:** `NativeHostBackend` сейчас возвращает UNSUPPORTED для remote flags&4; Host умеет входящий E0, но не E1. Агент directplay готовит source-only patch/RED в `stage54-host-complete-on-process/`: E0 envelope, connected-recipient E1 observer, per-operation nonreused handle, owner/connection generation, abort/deadline/once completion, close/provider-loss/recipient-removal retirement. NT5 oracle: common.cpp2571–2578, message.h81–82/277–284, corereceive.cpp265–286 (E1 после RECEIVE handler, до pending buffer retention), async.cpp4031–4054. Не расширять pressure/C7/C8/history/security scope; не утверждать native parity до отдельного proof.
+3. После этих общих механизмов остаются остальные пункты полного плана ниже: UDP quota/tag/queued-shrink/coalescing, OVERLAPPED oracle, DP4 wire/DP8 recovery/migration/security, измеримый Rust relay benchmark. Stage52 production остаётся accepted для своих точных runtime bytes; relevant runtime changes требуют нового source/build/fullHTTP/guest proof.
+
+Все задания следующему агенту начинать со свежей проверки device/Git/jobs; proposal — ещё не применённый и не проверенный код. Работа только через MCP luna-project. Сохранены j1d0d62:5175, j039c33:5176, ja81fb1:5177, shared CDP9334/sidecar3003. В Stage53 browser/service actions не было. Push/publish/deploy не разрешены.
+
+## Принятый runtime checkpoint: stage52 SAME-PE16 literal GREEN — три gap'а Stage51 закрыты
 
 Обновлено: 2026-10-24. **Integration commit `cbe8b0768d88e3f4507645c5062ebeca6c740458`, worktree clean.** Полный стек ACTIVE. Stage51 SAME-PE16 `FAIL_NATIVE_MISMATCH` (360 literal DWORD / 176 keyed в трёх группах: успешный `WSAIoctl(FIONREAD)` LE, успешный IP UDP `connect` LE, `select` после `SD_RECEIVE` пустого UDP) **закрыт generic-фиксом** в `wsa-network-api.ts` (успешные query/connect публикуют LastError=0 по измеренным веткам, без blanket reset) и `wsa-network.ts` (`select`-readiness больше не считает readShutdown читаемостью). Queued-zero UDP/TCP EOF/validation errors/memory guards сохранены.
 

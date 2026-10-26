@@ -220,3 +220,49 @@ for(const family of[2,23] as const){
   }
  },30000);
 }
+
+
+/**
+ * Stage53 Windows x86 evidence: native-first-file-audit.json (052b1101...) and
+ * root-native-first-classification.json (f3b8c276...). Four fresh cases observed
+ * sequential A/B errors, or retained-A PEEKs then ordinary A/B returns, followed
+ * by exact L data. This tests that public sequence through a real Worker.
+ * Native offers, FIONREAD/pacing and L delivery are NOT admission ACK_B; the
+ * native trace does not certify simultaneous enqueue or universal FIFO policy.
+ */
+for(const family of[2,23] as const)for(const retained of[false,true]){
+ test("UDP stage53 AF"+family+": "+(retained?"retained A PEEK then A/B returns":"sequential A/B controls")+" through real Worker",async()=>{
+  const x=await createActorFixture(),caseId=(family===2?0:2)+(retained?1:0),nonce=5301001;
+  try{
+   const client=x.socket(family),live=x.socket(family),closedA=x.socket(family),closedB=x.socket(family);
+   x.resetOn(client.socket);
+   // Query-derived actual tuples and unique 8B markers establish both directions
+   // for every destination before it is closed; no fabricated error injection.
+   for(const [index,other]of[live,closedA,closedB].entries()){
+    const payload=twoWords(nonce,0x57000000|(caseId<<8)|(index+1));
+    x.send(client,other,payload);await x.queued();const outward=x.receive(other.socket);
+    x.send(other,client,payload);await x.queued();const inward=x.receive(client.socket);
+    expectDatagram(outward,client,payload);expectDatagram(inward,other,payload);
+   }
+   const trigger=twoWords(nonce,0x45000000|caseId);
+   x.close(closedA.socket);await x.queued();
+   x.send(client,closedA,trigger);await x.queued();
+   const firstA=x.receive(client.socket,retained?2:0);
+   // Positive actual A return is a prerequisite for offering B in both profiles.
+   expectReset(firstA,closedA);
+   x.close(closedB.socket);await x.queued();
+   x.send(client,closedB,trigger);await x.queued();
+   const peeks=retained?[x.receive(client.socket,2),x.receive(client.socket,2)]:[];
+   const ordinary=retained?[x.receive(client.socket),x.receive(client.socket)]:[x.receive(client.socket)];
+   const finalPayload=twoWords(nonce,0x4c000000|caseId);
+   x.send(live,client,finalPayload);await x.queued();
+   const final=x.receive(client.socket),empty=x.receive(client.socket);
+   // Collect target results before asserting ordering. The final positive B
+   // return is checked separately from send acceptance and namespace barriers.
+   for(const peek of peeks)expectReset(peek,closedA);
+   if(retained){expectReset(ordinary[0]!,closedA);expectReset(ordinary[1]!,closedB);}
+   else expectReset(ordinary[0]!,closedB);
+   expectDatagram(final,live,finalPayload);expectEmpty(empty);
+  }finally{await x.dispose();}
+ },30000);
+}
