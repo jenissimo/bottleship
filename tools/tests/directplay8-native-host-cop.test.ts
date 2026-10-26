@@ -97,6 +97,20 @@ test("Host COP sends E0 and waits beyond reliable ACK for the recipient E1; reta
  expect(await s.backend.sendDpn(peer.id,8,Uint8Array.of(0x77))).toBe(0);
  expect(peer.packets.at(-1)).toEqual(Uint8Array.of(0x77));
 },5000);
+test("Ordinary guaranteed completion settles on carrier ACK alone while the same silent lane keeps COP pending",async()=>{
+ const s=scene();expect(await s.start()).toBe(0);const peer=await s.join(1);
+ // Measured native contract (stage56): an ordinary GUARANTEED completion is transport-level
+ // and must not wait for any recipient processing. Bare link delivery, no E1, no reply.
+ const ordinary=observe(s.backend.sendDpn(peer.id,8,Uint8Array.of(1,2,3)));await turns();
+ expect(peer.packets.at(-1)).toEqual(Uint8Array.of(1,2,3));
+ expect(await ordinary.promise).toBe(0);
+ // The identical held lane: COMPLETEONPROCESS stays pending until the recipient E1.
+ const cop=observe(s.backend.sendDpn(peer.id,12,Uint8Array.of(4,5,6)));await turns();
+ expect(peer.cop).toHaveLength(1);expect(cop.values).toEqual([]);
+ expect(await s.ack(peer,peer.cop[0].handle)).toBe(0);expect(await cop.promise).toBe(0);
+ expect(await s.backend.sendDpn(peer.id,8,Uint8Array.of(0x33))).toBe(0);
+ expect(peer.packets.at(-1)).toEqual(Uint8Array.of(0x33));
+},5000);
 test("Host COP rejects malformed, foreign-recipient, unknown and stale E1 without completing a replacement",async()=>{
  const s=scene();expect(await s.start()).toBe(0);const first=await s.join(1),other=await s.join(2);
  const pending=observe(s.backend.sendDpn(first.id,12,Uint8Array.of(1,0,2)));await turns();expect(first.cop).toHaveLength(1);
