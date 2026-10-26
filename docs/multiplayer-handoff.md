@@ -12,6 +12,33 @@
 
 Готовый запрос для передачи: «Продолжи полный сетевой стек BottleShip по `docs/multiplayer-handoff.md`. Сначала проверь текущее состояние удалённого устройства; верхний актуальный раздел отменяет исторические записи. Сохрани исходные неудачи и SAME-PE references, выполни следующую недоказанную задачу, обнови handoff. Локальная разработка, проверки и коммиты разрешены; push, публикация и deploy не разрешены».
 
+<a id="stage56-native-qualified"></a>
+
+## Передача после квалификации: нативный контракт Host→Peer COMPLETEONPROCESS измерен и зелёный
+
+2026-10-26 (продолжение другим агентом на том же устройстве, работа велась локально). Полный сетевой паритет по-прежнему не завершён, но **главная недоказанная зависимость Stage55 закрыта измерением**: отдельный нативный public-COM оракул прошёл целиком с квалифицированным witness'ом возврата callback'а. Актуальный статус — `logs/lan-conformance/stage54-host-complete-on-process/ROOT-PLAN.json` (обновлён) и `native-oracle-design/root-native-worker-fifth-classification.json`. Исторические попытки в `native-oracle-design/worker-return-next-design-review.md` остаются в силе как source-контракт; этот раздел отменяет «первое действие» Stage55 (оно выполнено).
+
+**Что измерено на реальном dpnet этой машины (все прогоны сохранены immutable):**
+
+| Факт | Прогон | Доказательство |
+| --- | --- | --- |
+| Свежий публичный `IDirectPlay8ThreadPool`: `GetThreadCount(all)==0`, DPN_OK — неявного числа воркеров нет | native-worker-first (INCONCLUSIVE) | `root-native-worker-first-classification.json`, peer `pool-default.bin` |
+| Публичный пул с `SetThreadCount(2)`: счётчики держатся 0→2→2, но **ни один колбэк не доставляется воркером** без app-DoWork; connect-установление стопорится, peer получает `DPNERR_NOCONNECTION` (дефолт NT5 connect-parent), `Peer::Close` виснет | native-worker-second (INCONCLUSIVE) | `root-native-worker-second-classification.json` |
+| Внутренний (объектный) пул Peer самообслуживается: connect, CREATE_PLAYER×2, held RECEIVE, 16 probe-сообщений — всё на worker-слотах | native-worker-third/fourth/fifth | audit-ряды слотов 1..15 |
+| **Ordinary GUARANTEED completion приходит ВО ВРЕМЯ удерживаемого RECEIVE** (транспортный ACK не ждёт возврата обработчика) | third/fourth/fifth | `ordinaryCompletionBranch=COMPLETE_DURING_HOLD` |
+| **COP-контракт**: SendTo COMPLETEONPROCESS → `DPNSUCCESS_PENDING`; held снапшот `completeCount==0 при peerHeld==1`; `SEND_COMPLETE DPN_OK` только после возврата обработчика (producer-stamp `peerHeld==0`), ровно один раз, handle-join; ровно один `ReturnBuffer` из главного MTA-потока → `DPN_OK`, сэмпл оригинального storage == payload | fourth (producer-level) / fifth (полный PASS) | `held2-snapshot.bin`, `complete2.bin`, `retained-before-return.bin`, `return-buffer-result.bin` |
+| **Witness возврата callback: QUALIFIED** (probe op4): последующий ненестированный callback (inv 4→6) на том же живом оригинальном воркере (tid 6884), тот же frame 0x0428f9fc и return-site 0x70b70fe4 (внутри dpnet.dll), дубликат-handle оригинального потока `Wait(0)==WAIT_TIMEOUT` (не TID-reuse) | native-worker-fifth | `peer/witness-qualified.bin` |
+
+Финальный прогон: **PASS_TESTED_NATIVE_WORKER_PUBLIC_COM_SCOPE, eligible** — host exit0/8.7s, peer exit0/6.0s, оба natural fullEOF без force/timeout; 72 артефакта, marker-joins 21/19 exact; порты 59418/59419 освобождены. Пины: fixture v4 `2fd30fc3…`, PE `d956e424…`, manifest `7592819f…`, nonce 1427300141. Независимое source-review: `independent-native-worker-v1-source-review.json` (дельты 1–5; блокеры B1 kind-коллизия квитанции, B2 фатальный конец P3, B3 ранний peer-done, B4 висячая ссылка gate-предшественника, D1 ArgumentList/.NET Framework — все исправлены и верифицированы). Witness — **условная нижняя граница** при обычном x86 LIFO ABI: стек/fiber-переключения не исключены, гарантии планировщика это не даёт.
+
+**Первая следующая работа — сверить HLE с измеренным контрактом и закрыть расхождения generic-фиксами (causal RED→GREEN):**
+
+1. `src/worker/modules/dpnet`: (a) обычный guaranteed SEND_COMPLETE не должен ждать возврата guest-обработчика RECEIVE (измерено: приходит во время hold); (b) COP SEND_COMPLETE должен ждать E1 после возврата guest-обработчика (механизм stage54 — сверить тайминги); (c) ReturnBuffer не должен требовать поток-владелец (NT5/нативно: любой MTA-поток с оригинальным интерфейсом).
+2. Известное осознанное расхождение для решения: наша HLE-модель публичного пула с count>0 самообслуживается (реальные guest-треды), тогда как нативный публичный пул на этой dpnet мёртв без DoWork; внутренний пул (default=1) соответствует. Менять только с measurement-обоснованием.
+3. Затем — shipping cohort текущих DP-байтов (source/archive/build/fullHTTP + SAME-PE WS/polling guest/interop) и остаток матрицы `stage54-remaining-matrix/`.
+
+Push/publish/deploy не выполнялись; чужие сервисы (5175/5176/5177, CDP9334, sidecar3003) не тронуты; повторять успешные прогоны не нужно.
+
 <a id="stage55-handoff"></a>
 
 ## Передача после майлстоуна: component GREEN, нативная калибровка сохранена
