@@ -39,6 +39,8 @@
 
 Push/publish/deploy не выполнялись; чужие сервисы (5175/5176/5177, CDP9334, sidecar3003) не тронуты; повторять успешные прогоны не нужно.
 
+Операционная ловушка этого окна: тесты и gate гонять **только bun-portable v1.4.3** (`C:/Projects/bottleship-oss/.wt/lan-network/logs/tools/bun-portable/package/bin/bun.exe`, первым в PATH — вложенные `bun test` в gate-resolve туда же). Системный `~/.bun` v1.3.0 молча виснет на dpnet-файлах (banner без единого результата, per-test timeout не срабатывает). Контрактный pin пункта (a) добавлен в `tools/tests/directplay8-native-host-cop.test.ts` (commit `e278a47`); related-набор 296/0 за 3.09s; полный gate **6932/0** (exit 0) под portable.
+
 <a id="stage55-handoff"></a>
 
 ## Передача после майлстоуна: component GREEN, нативная калибровка сохранена
