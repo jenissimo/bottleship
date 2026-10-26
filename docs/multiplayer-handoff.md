@@ -1,6 +1,6 @@
 # Multiplayer: передача работы и план продолжения
 
-Обновлено: 2026-10-26 (stage54). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Цель остаётся активной. Не объявлять её завершённой по одному успешному этапу.
+Обновлено: 2026-10-26 (stage55 handoff). Цель пользователя: полный сетевой стек BottleShip с паритетом Winsock и DirectPlay, Socket.IO/WebSocket с HTTP polling fallback, настройкой LAN URL в эмуляторе и отдельным производительным Rust-сервером. Полная цель не завершена; пользователь запросил паузу после текущего майлстоуна для передачи другому агенту. Актуальная точка передачи — Stage55 ниже.
 
 ## Быстрый вход для следующего агента
 
@@ -11,6 +11,36 @@
 5. Перед изменением прочитать «Метод работы и ораклы» и «Ближайшие зависимости и критерии выхода». Зафиксировать контракт, независимый оракл и meaningful RED, затем исправлять общий механизм. Обновлять текущий статус, следующий шаг и ownership после каждого законченного окна.
 
 Готовый запрос для передачи: «Продолжи полный сетевой стек BottleShip по `docs/multiplayer-handoff.md`. Сначала проверь текущее состояние удалённого устройства; верхний актуальный раздел отменяет исторические записи. Сохрани исходные неудачи и SAME-PE references, выполни следующую недоказанную задачу, обнови handoff. Локальная разработка, проверки и коммиты разрешены; push, публикация и deploy не разрешены».
+
+<a id="stage55-handoff"></a>
+
+## Передача после майлстоуна: component GREEN, нативная калибровка сохранена
+
+2026-10-26. Пользователь попросил остановиться после текущего майлстоуна и передать работу другому агенту. **Полный сетевой паритет не завершён.** Закрыт этап реализации Host COMPLETEONPROCESS на уровне компонента, обязательных регрессий и фиксации результатов отдельной нативной калибровки. Текущий Root заканчивает только документацию/локальные коммиты и уходит на паузу; новый эксперимент не запускает. Этот раздел отменяет старые ACTIVE/RUNNING/назначения ниже; они описывают историю.
+
+**Принято:** integration runtime commit `eef9228cc766cc81a910f0a80004c7655890bbbc`; causal RED→GREEN, новые controls **6/0**, related DirectPlay **299/0**, required gate **6931/0** с typecheck и обязательным Naga valid/bad/sentinel. После gate production bytes не менялись. Rust checkpoint integration `6870afec…` / standalone `2670f3a86d699ea46921c6321ebe72370742caa5` и **12/12 функциональных scopes** сохранён. Это не процент полного parity и не измерение производительности.
+
+**Два разных native результата сохранены, оба INCONCLUSIVE_PREREQUISITE.** Первый `je7b6a6` не квалифицировал ordinary completion внутри held RECEIVE при одном manual caller; его raw/reference не заменять. Затем новый reviewed dual-manual observer C3 **70d626bd…**, controllerV4 **a656d98d…** собран один раз: `j35b76b`, GCC46260 natural0/fullEOF,21 pins exact, свежий x86 PE **0d8e98af…**/271105B. Однократная dual-first калибровка `j915064` дала actual helper DoWork invocation19 HRESULT **0x80158520 / DPNERR_NOTALLOWED**. RECEIVE1/2, COP и ReturnBuffer не были достигнуты; это не product parity RED/GREEN и не доказательство универсального запрета concurrent DoWork.
+
+Controller54596, Host27732 и Peer10052 завершились естественно с кодом2 и полным EOF, без force/timeout/unknown. Helper завершён через исходный handle до COM Close; coordinated Host abort корректно классифицирован code81/fatal0. 18 outer/9 inner inputs exact; оба предоставленных TCP+UDP порта59268/59269 освобождены и повторно bound/closed. File-only audit: **63 SHA exact**,23Host+27Peer indexed rows и41 marker joins. Сам запуск не повторять таймером, и не менять production HRESULT по этому неизолированному профилю.
+
+Все пути следующего списка — в **integration** `logs/lan-conformance/stage54-host-complete-on-process/`; ignored evidence находится на удалённом устройстве, не переносится одним Git checkout:
+
+| Точка входа | SHA256 / назначение |
+| --- | --- |
+| `ROOT-PLAN.json` | Актуальный машиночитаемый статус, pins/build/owners, первая недоказанная зависимость |
+| `native-oracle-design/root-dual-first-classification.json` | `ee0722964c027ae0b88a02c999331ddab027cc25e924cc7dd6b94046f273ad3b` |
+| `native-oracle-design/root-dual-first-file-audit.json` | `4894f66f5ca74c09c5d33b8ee859745515e7b6afe167026947e0aadbb09d3f48` |
+| `native-oracle-design/runs/dual-first/result.json` | `1d6187dc9a926e62dbe71aaa416129025e33eb575ea353449e7a66ca7fa323a5` |
+| `native-oracle-design/worker-return-next-design-review.md/json` | MD `e219874c…`, JSON `aabcf2c8…`; source-only, readyForNativeExecution=false. Полные SHA в ROOT-PLAN |
+
+**Первое действие после передачи/возобновления:** прочитать critique и существующие `src/worker/modules/dpnet/threadpool-api.ts`/shared executor. Следующий отдельный эксперимент пока только спроектирован: Peer на штатных native workers, Host с одним manual caller и управляемым pumping. Сначала фактически квалифицировать ordinary guaranteed completion, пока RECEIVE удерживается; gate сам по себе этого не гарантирует. Свидетель возврата callback — последующий ненестированный callback на том же ещё живом worker, с тем же frame/return site/stack identity. Это условная нижняя граница при обычном x86 LIFO ABI; исходный duplicate thread handle нужен против TID reuse, compiler/frame/fiber assumptions ещё подлежат проверке. Ограниченное заранее число probes без совпадения означает INCONCLUSIVE. Pre-return marker и копия bytes не доказывают возврат или retained-buffer lifetime.
+
+Только после квалификации: actual исходные COM pointer+handle после DPNSUCCESS_PENDING, matching COP SEND_COMPLETE до отдельного gate ReturnBuffer, один измеренный ReturnBuffer на том же живом объекте. Затем новая shipping cohort: source/archive/build/fullHTTP и SAME-PE guest/interop через WS **и** polling. Native и shipping proof новых DP bytes остаются **UNVERIFIED**; preview5177 обслуживает прежнюю Stage52 cohort.
+
+После этого полный backlog остаётся прежним: DP4 wire/DP8 authority, recovery, migration и security; Winsock UDP queue/completion/OVERLAPPED и provider families; Section/broker prerequisites; Rust delivered-throughput/p50/p95/p99/CPU/RSS и fairness; shipping evidence. Матрица — `stage54-remaining-matrix/`. Честного общего процента и срока по этой незакрытой матрице нет; полный parity имеет масштаб нескольких недель или дольше.
+
+**Владение при передаче:** собственных живых build/test/native процессов нет. Сохранить чужие/ранее принятые сервисы `j1d0d62:5175`, `j039c33:5176`, `ja81fb1:5177`, CDP9334/sidecar3003. Текущие subagents после source-only review — HOLD, их имена не означают активного владельца следующего этапа. Локальные изменения/проверки/коммиты уже разрешены; новый агент продолжает после явной передачи пользователя. Push/publish/deploy не разрешены. Общий gate не повторяли ради только документации; проверить diff, чистоту трёх репозиториев и актуальные receipts.
 
 <a id="stage54-cop"></a>
 
@@ -36,7 +66,7 @@ Current maintained source: host.ts **b8e421ac…**/34454B, host-backend.ts **8e4
 
 Остальной объём полного goal отражён в source-only snapshot integration `logs/lan-conformance/stage54-remaining-matrix/` (README **d57cbc48…**, JSON **b1a290ea…**): D1 COP/native+shipping; D2 DP4 wire/DP8 authority/recovery/migration/security; W1 UDP queue policy; W2 completion/OVERLAPPED; W3 provider families; P1 Section/broker prerequisites; S1 Rust performance; V1 shipping evidence. D1 в snapshot остановлен на primary PASS; этот верхний раздел добавляет фактические6/299/6931. Старые subjective85%/60–65% в исторических таблицах не являются текущей оценкой: нет закрытой взвешенной матрицы parity. Сначала закончить D1, не запускать весь список одновременно.
 
-Все известные test/gate/native jobs terminal; preserved j1d0d62:5175, j039c33:5176, ja81fb1:5177, CDP9334/sidecar3003. Fresh native-first и compiler завершились; собственных живых процессов не осталось. Directplay агент готовит только source-only следующий observer design; Root — единственный executor. Локальные изменения/коммиты разрешены, push/publish/deploy не выполнялись.
+Исторический ownership этого окна superseded верхним Stage55 handoff; текущие владельцы/пауза и завершённые jobs указаны там. Локальные изменения/коммиты разрешены, push/publish/deploy не выполнялись.
 
 <a id="stage54"></a>
 
