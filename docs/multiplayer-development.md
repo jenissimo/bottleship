@@ -132,6 +132,17 @@ Coverage is driven by what games call. Use `tools/api-census.ts` over the catalo
 the LAN games we care about to rank `wsock32`/`ws2_32`/`dplayx`/`dpnet`/`dpnlobby`
 imports by use. That ranking is the backlog.
 
+The census ran over both bundle libraries (100 bundles, `tools/lan-conformance/net-census.ts`
+aggregates the network slice): 92 bundles import no network module that needs work; the
+8 that do are all third-party re-release DLLs (steam_api, GalaxyPeer, ffmpeg/avformat,
+libxml2, guest dpwsockx) importing a classic surface — socket/bind/connect/send/recv,
+WSAEventSelect/EnumNetworkEvents, inet_pton/WSAStringToAddress, blocking-hook ordinals.
+Every one of those rows resolves to an existing HLE implementation registered at runtime
+(`wsa-network-api.ts`, `wsa-blocking.ts`), which the census's static export index cannot
+see — confirm with the runtime binding census on the affected bundle before treating a
+row as real. The open work for games is therefore not new APIs but verified semantics:
+extend the lanprobe case list against the native oracle, one contract at a time.
+
 Each contract is covered at up to three depths:
 
 1. **Normal path**: correct results, data, ordering, notifications.
