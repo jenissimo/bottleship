@@ -19,6 +19,19 @@ const makeFunc = (name: string, argCount: number, overrides: Partial<FunctionDes
 export const shlwapiModule: ModuleDescriptor = {
     name: "shlwapi",
     functions: [
+        makeFunc("ord_66", 3, { ordinal: 66 }), // FindResourceW forwarder
+        makeFunc("ord_52", 7, { ordinal: 52 }), // CreateFileW forwarder
+        makeFunc("PathCreateFromUrlA", 4, { onUnimplemented: "hresult" }),
+        makeFunc("PathCreateFromUrlW", 4, { onUnimplemented: "hresult" }),
+        makeFunc("UrlCreateFromPathA", 4, { onUnimplemented: "hresult" }),
+        makeFunc("UrlCreateFromPathW", 4, { onUnimplemented: "hresult" }),
+        makeFunc("UrlIsA", 2),
+        makeFunc("UrlIsW", 2),
+        makeFunc("StrCmpNW", 3, { returnType: "i32" }),
+        makeFunc("PathIsURLA", 1),
+        makeFunc("PathIsURLW", 1),
+        makeFunc("PathSearchAndQualifyA", 3),
+        makeFunc("PathSearchAndQualifyW", 3),
         makeFunc("PathFindFileNameA", 1),
         makeFunc("PathFindFileNameW", 1),
         makeFunc("PathFindExtensionA", 1),

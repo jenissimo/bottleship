@@ -8,6 +8,7 @@
  * (stageCount, sampledMask).
  */
 
+import { D3D_TRANSFORM_POSITION_WGSL } from "../shared/d3d-position";
 import {
     D3DTOP_DISABLE,
     D3DTOP_SELECTARG1,
@@ -177,20 +178,12 @@ const RHW_DEPTH_CLAMP_WGSL = `let clipPos = out.position;
  * lowering"), taking the whole pipeline with it. Read the position into a `let` and assign
  * the complete vec4 instead; the same discipline the D3D9 emitter uses for its registers.
  */
-function generateZBlock(
-    forceZMidpoint: boolean,
-    minZ = "uniforms.minZ",
-    maxZ = "uniforms.maxZ",
-): string {
-    if (forceZMidpoint) {
-        return `// Debug: force Z = 0.5*w to isolate NDC/projection issues
+/** Debug-only depth override; MinZ/MaxZ is the pass viewport's depth range. */
+function generateZBlock(forceZMidpoint: boolean): string {
+    if (!forceZMidpoint) return "";
+    return `// Debug: force Z = 0.5*w to isolate NDC/projection issues
                     let zMidPos = out.position;
                     out.position = vec4f(zMidPos.xy, 0.5 * zMidPos.w, zMidPos.w);`;
-    }
-    return `let zRemapPos = out.position;
-                    let z_ndc = zRemapPos.z / zRemapPos.w;
-                    let z_ndc2 = z_ndc * (${maxZ} - ${minZ}) + ${minZ};
-                    out.position = vec4f(zRemapPos.xy, z_ndc2 * zRemapPos.w, zRemapPos.w);`;
 }
 
 /** debugView/forceWireColor are the last word on the fragment's colour: emitted right
@@ -225,6 +218,7 @@ function generateTextureSample(textureName: string, samplerName: string, uvExpr:
 export function generateShaderHelpers(): string {
     return `
 ${FFP_FOG_WGSL}
+${D3D_TRANSFORM_POSITION_WGSL}
 
 fn selectTexCoord(rawIndex: u32, uv0: vec2f, uv1: vec2f, uv2: vec2f) -> vec2f {
     let index = rawIndex & 0xffffu;
@@ -501,7 +495,7 @@ export function generateShaderCode(config: ShaderConfig): string {
 
     const vertexOutput = `
             struct VertexOutput {
-                @builtin(position) position: vec4f,
+                @builtin(position) @invariant position: vec4f,
                 @location(0) ${config.flatShading ? "@interpolate(flat) " : ""}color: vec4f,
                 @location(1) ${config.flatShading ? "@interpolate(flat) " : ""}specular: vec4f,
                 @location(2) uv: vec2f,
@@ -551,7 +545,7 @@ export function generateShaderCode(config: ShaderConfig): string {
                         ${RHW_DEPTH_CLAMP_WGSL}
                     }
                 } else {
-                    out.position = uniforms.mvp * vec4f(pos.xyz, 1.0);
+                    out.position = d3dTransformPosition(uniforms.mvp, pos.xyz);
                     ${zBlock}
                 }
 
@@ -815,7 +809,7 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
 
     const vertexOutput = `
             struct VertexOutput {
-                @builtin(position) position: vec4f,
+                @builtin(position) @invariant position: vec4f,
                 @location(0) ${config.flatShading ? "@interpolate(flat) " : ""}color: vec4f,
                 @location(1) ${config.flatShading ? "@interpolate(flat) " : ""}specular: vec4f,
                 @location(2) uv: vec2f,
@@ -856,9 +850,8 @@ export function generateMegaBatchShaderCode(config: ShaderConfig): string {
                         ${RHW_DEPTH_CLAMP_WGSL}
                     }
                 } else {
-                    out.position = draw.mvp * vec4f(pos.xyz, 1.0);
-                    // Z remap
-                    ${generateZBlock(debugFlags.forceZMidpoint, "draw.viewport.z", "draw.viewport.w")}
+                    out.position = d3dTransformPosition(draw.mvp, pos.xyz);
+                    ${generateZBlock(debugFlags.forceZMidpoint)}
                 }
 
                 // Swizzle BGRA -> RGBA

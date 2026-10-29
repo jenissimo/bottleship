@@ -154,6 +154,34 @@ function makeManager(
 }
 
 describe("D3D9 WebGPU query manager", () => {
+    test("a live counting backend refuses a predicate-only adapter",()=>{
+        const manager=new D3D9QueryManager({device:new FakeDevice() as any,queue:new FakeQueue() as any,requireCountedOcclusion:true});
+        expect(manager.getCapability("occlusion")).toMatchObject({supported:false,reason:"counted-occlusion-feature-missing"});
+    });
+    test("attachment counts survive submissions and replace the native predicate readback", async () => {
+        const device = new FakeDevice();
+        const {manager,queue} = makeManager(device);
+        const record = {type:D3D9_QUERYTYPE_OCCLUSION,begun:true,issued:false,issueSerial:0};
+        manager.acquire(42,record);
+        manager.beginCountedOcclusion(42,1);
+        manager.notifySubmitted(1);
+        expect(manager.needsRebegin(42)).toBe(false);
+        const encoder = new FakeCommandEncoder();
+        expect(manager.encodeResolves(encoder as any,[42],1).status).toBe("empty");
+        record.begun=false; record.issued=true; record.issueSerial=2;
+        manager.endCountedOcclusion(42);
+        const count = new FakeBuffer({size:8,usage:4});
+        const batch = manager.encodeResolves(encoder as any,[42],2,new Map([[42,count as any]]));
+        expect(batch.status).toBe("encoded");
+        expect(encoder.calls.map(c=>c.name)).toEqual(["copyBufferToBuffer"]);
+        expect(encoder.calls[0]!.args[0]).toBe(count);
+        const output = encoder.calls[0]!.args[2] as FakeBuffer;
+        new DataView(output.bytes).setBigUint64(0,32000n,true);
+        manager.submit(encoder as any,batch);
+        expect(manager.poll(42).state).toBe("pending");
+        queue.complete(); await manager.waitForBatch(batch);
+        expect(manager.poll(42)).toMatchObject({state:"ready",value:32000n});
+    });
     test("the default pool fits a full WebGPU query set in one render pass", () => {
         const device = new FakeDevice();
         const manager = new D3D9QueryManager({

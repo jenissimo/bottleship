@@ -11,7 +11,7 @@ import { windows, type WindowInfo } from './shared-state';
 import { applyDefaultSetText } from './dialog-control-messages';
 import { sendWindowGetText, sendWindowGetTextLength, sendWindowSetText } from './message';
 import { encodeAnsi } from '../codepage-utils';
-import { getDefDlgProcAddress } from './system-classes';
+import { getDefDlgProcAddress, getDefWindowProcAddress, getDefWindowProcWAddress } from './system-classes';
 
 /**
  * What GWL_WNDPROC reports. For an un-subclassed `#32770` that is DefDlgProc, not the
@@ -21,19 +21,22 @@ import { getDefDlgProcAddress } from './system-classes';
  * handing back the DlgProc makes that chain a no-op, because a DlgProc answers FALSE
  * and does no default processing (no BeginPaint, hence no WM_ERASEBKGND/WM_DRAWITEM).
  */
-function reportedWndProc(window: WindowInfo): number {
+function reportedWndProc(window: WindowInfo, wide: boolean): number {
     const wndProc = window.wndProc >>> 0;
+    if (wide && window.isSystemControl && wndProc && wndProc === getDefWindowProcAddress()) {
+        return getDefWindowProcWAddress() || wndProc;
+    }
     if (window.nativeClassName !== '#32770' || !wndProc) return wndProc;
     if (wndProc !== ((window.extraBytes?.[1] ?? 0) >>> 0)) return wndProc; // already subclassed
     return getDefDlgProcAddress() || wndProc;
 }
 
 export function registerWindowPropExports(exports: Record<string, ThunkImplementation>): void {
-    exports['SetWindowLongA'] = (ctx, mem, args) => {
+    const setWindowLong = (args: number[], wide: boolean): number => {
         const hWnd = args[0];
         const nIndex = args[1];
         const dwNewLong = args[2];
-        Logger.verbose(LogCategory.USER32, `SetWindowLongA(0x${hWnd.toString(16)}, ${nIndex}, 0x${dwNewLong.toString(16)})`);
+        Logger.verbose(LogCategory.USER32, `SetWindowLong${wide ? 'W' : 'A'}(0x${hWnd.toString(16)}, ${nIndex}, 0x${dwNewLong.toString(16)})`);
         const window = windows.get(hWnd);
         if (!window) return 0;
 
@@ -70,16 +73,24 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         }
 
         switch (idx) {
-            case GWL_WNDPROC:
-                prev = reportedWndProc(window);
-                window.wndProc = dwNewLong >>> 0;
+            case GWL_WNDPROC: {
+                prev = reportedWndProc(window, wide);
+                let proc = dwNewLong >>> 0;
+                // Un-subclassing stores back whichever face of the class procedure
+                // GWL_WNDPROC handed out; both are the one class proc, which every identity
+                // check and the text-width choice key on as DefWindowProcA.
+                if (window.isSystemControl && proc !== 0 && proc === getDefWindowProcWAddress()) {
+                    proc = getDefWindowProcAddress();
+                }
+                window.wndProc = proc;
                 // A system control given a guest wndProc is subclassed (e.g. MFC custom
                 // CStatic/CButton that paints itself). It now owns its own painting —
                 // we deliver WM_PAINT to it rather than drawing default chrome.
-                if (window.isSystemControl && (dwNewLong >>> 0) !== 0) {
-                    window.wndProcSubclassed = true;
+                if (window.isSystemControl && proc !== 0) {
+                    window.wndProcSubclassed = proc !== getDefWindowProcAddress();
                 }
                 break;
+            }
             case GWL_ID:
                 prev = window.controlId ?? 0;
                 window.controlId = dwNewLong >>> 0;
@@ -105,12 +116,13 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         return prev >>> 0;
     };
 
-    exports['SetWindowLongW'] = exports['SetWindowLongA'];
+    exports['SetWindowLongA'] = (ctx, mem, args) => setWindowLong(args, false);
+    exports['SetWindowLongW'] = (ctx, mem, args) => setWindowLong(args, true);
     // 32-bit: SetWindowLongPtr is the SetWindowLong macro. ATL CDialogImpl uses it.
     exports['SetWindowLongPtrA'] = exports['SetWindowLongA'];
-    exports['SetWindowLongPtrW'] = exports['SetWindowLongA'];
+    exports['SetWindowLongPtrW'] = exports['SetWindowLongW'];
 
-    exports['GetWindowLongA'] = (ctx, mem, args) => {
+    const getWindowLong = (args: number[], wide: boolean): number => {
         const hWnd = args[0];
         const nIndex = args[1];
         const window = windows.get(hWnd);
@@ -133,7 +145,7 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
 
         switch (idx) {
             case GWL_WNDPROC:
-                return reportedWndProc(window);
+                return reportedWndProc(window, wide);
             case GWL_ID:
                 return (window.controlId ?? 0) >>> 0;
             case GWL_STYLE:
@@ -147,9 +159,10 @@ export function registerWindowPropExports(exports: Record<string, ThunkImplement
         }
     };
 
-    exports['GetWindowLongW'] = exports['GetWindowLongA'];
+    exports['GetWindowLongA'] = (ctx, mem, args) => getWindowLong(args, false);
+    exports['GetWindowLongW'] = (ctx, mem, args) => getWindowLong(args, true);
     exports['GetWindowLongPtrA'] = exports['GetWindowLongA'];
-    exports['GetWindowLongPtrW'] = exports['GetWindowLongA'];
+    exports['GetWindowLongPtrW'] = exports['GetWindowLongW'];
 
     // DWORD GetWindowContextHelpId(HWND hwnd)
     exports['GetWindowContextHelpId'] = (ctx, mem, args) => {

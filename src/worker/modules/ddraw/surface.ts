@@ -50,6 +50,7 @@ import {
     IID_IDirect3DMMXDevice,
     D3DRENDERSTATE_COLORKEYENABLE,
     DDERR_CANNOTDETACHSURFACE, DDERR_SURFACENOTATTACHED, DDERR_INVALIDOBJECT, DDERR_SURFACEBUSY,
+    DDERR_DCALREADYCREATED,
     DDERR_WASSTILLDRAWING,
 } from "./constants";
 import { bytesToGuid, readRect, Rect, absToRel, readU16Abs, readU32Abs, surfaceAt } from "./helpers";
@@ -2210,85 +2211,83 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         return DD_OK;
     };
 
+    // Reserve a surface while its readback suspends the caller. Only publish a seeded DC.
+    const pendingSurfaceDCs = new WeakSet<DirectDrawSurfaceState>();
     exports["IDirectDrawSurface7_GetDC"] = (ctx, mem, args) => {
         const thisPtr = args[0];
         const lphDC = args[1];
-
-        if (!lphDC) return E_POINTER;
-        if (!isValidAddress(mem, lphDC, 4)) return E_POINTER;
-
-        const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+        if (!lphDC || lphDC + 4 > mem.length || !isValidAddress(mem, lphDC, 4, "rw")) return E_POINTER;
         const system = System.getInstance();
-
-        // ✅ FIX: If an HDC is already linked to this surface, reuse it.
-        // This prevents handle leaks and sync issues when games call GetDC in a loop without ReleaseDC.
-        const existingHdc = system.gdiContext.getHDCBySurface(thisPtr);
+        const process = system.process;
+        const gdiContext = system.gdiContext;
+        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
+        if (!obj) return E_FAIL;
+        const state = obj.getState();
+        if (isSurfaceLost(state)) return DDERR_SURFACELOST;
+        if (pendingSurfaceDCs.has(state)) return DDERR_DCALREADYCREATED;
+        if (surfaceAlreadyLocked(state)) return DDERR_SURFACEBUSY;
+        const existingHdc = gdiContext.getHDCBySurface(thisPtr);
         if (existingHdc) {
-            Logger.log(LogCategory.DDRAW, `IDirectDrawSurface7_GetDC: Reusing existing HDC 0x${existingHdc.toString(16)} for surface 0x${thisPtr.toString(16)}`);
-            view.setUint32(lphDC, existingHdc, true);
+            Mem.writeUint32(lphDC, existingHdc);
             return DD_OK;
         }
-
-        // Check if this is a texture, SYSMEM, or BACKBUFFER surface - use surface-sized canvas
-        const obj = context.resourceProvider.getComObjectByAddress(thisPtr) as DirectDrawSurfaceObject | null;
-        const isTexture = obj ? (obj.getState().caps & DDSCAPS_TEXTURE) !== 0 : false;
-        const isSysMem = obj ? (obj.getState().caps & DDSCAPS_SYSTEMMEMORY) !== 0 : false;
-        const isBackBuffer = obj ? (obj.getState().caps & DDSCAPS_BACKBUFFER) !== 0 : false;
-
-        let hdc: number;
-        let state: DirectDrawSurfaceState | undefined;
-        if ((isTexture || isSysMem || isBackBuffer) && obj) {
-            // For SYSMEM/TEXTURE/BACKBUFFER surfaces, create a DC with canvas matching surface size
-            state = obj.getState();
-            hdc = system.gdiContext.createSurfaceDC(state.width, state.height);
+        if (!(state.caps & (DDSCAPS_TEXTURE | DDSCAPS_SYSTEMMEMORY | DDSCAPS_BACKBUFFER))) {
+            // Preserve the existing primary-surface overlay path.
+            const hdc = gdiContext.createOverlayDC();
             if (!hdc) return E_FAIL;
-
-            const surfaceType = isTexture ? 'TEXTURE' : (isSysMem ? 'SYSMEM' : 'BACKBUFFER');
-            const getDCMsg = `IDirectDrawSurface7_GetDC: ${surfaceType} surface=0x${thisPtr.toString(16)} ${state.width}x${state.height} surfacePtr=0x${state.surfacePtr.toString(16)} -> hdc=0x${hdc.toString(16)} (surface-sized canvas)`;
-            Logger.log(LogCategory.SYSTEM, getDCMsg);
-            Logger.log(LogCategory.DDRAW, getDCMsg);
-
-            // Faithful DDraw GetDC: the DC draws over the surface's OWN pixels. For a SYSMEM
-            // surface whose CPU memory is current (the cardinal-sin-free case — no GPU authority),
-            // seed the canvas from those pixels so GDI text composites onto the existing content
-            // (e.g. a Blt'd button frame). ReleaseDC then writes the full canvas back to CPU and
-            // keeps the surface CPU-authoritative, so a later Lock/Blt/Flip never triggers a
-            // blocking GPU→CPU readback. If the GPU holds the latest data, skip seeding and fall
-            // back to the existing GPU-upload path (seeding from stale CPU would be wrong).
-            if (isSysMem && isRenderSurface(state)) {
-                const expectedRgba = state.width * state.height * 4;
-                const scratch = state.rgbaScratch;
-                if (!surfaceSyncManager.needsCPUSync(state).needed) {
-                    // CPU memory is current — seed from it (faithful: DC over surface bits).
-                    const bpp = Math.max(1, Math.floor(state.format.bpp / 8));
-                    const pitch = Math.max(state.pitch, state.width * bpp);
-                    if (state.surfacePtr > 0 && state.surfacePtr + pitch * state.height <= mem.length) {
-                        const rgba = convertSurfaceToRGBA(mem, state.surfacePtr, state.width, state.height, pitch, state.format);
-                        system.gdiContext.seedSurfaceDC(hdc, rgba, state.width, state.height);
-                    }
-                } else if (scratch && scratch.length >= expectedRgba) {
-                    // GPU holds the latest, but rgbaScratch caches the last full composited content
-                    // (kept fresh by ReleaseDC). Seed from it so GDI composites onto the real pixels
-                    // WITHOUT a GPU→CPU readback — then ReleaseDC writes back to CPU and the surface
-                    // becomes CPU-authoritative, breaking the readback cycle.
-                    system.gdiContext.seedSurfaceDC(hdc, scratch, state.width, state.height);
+            gdiContext.linkDCToSurface(hdc, thisPtr);
+            Mem.writeUint32(lphDC, hdc);
+            return DD_OK;
+        }
+        const ownsSurface = (): boolean => system.process === process && system.gdiContext === gdiContext &&
+            context.resourceProvider.getComObjectByAddress(thisPtr) === obj && obj.getState() === state && !isSurfaceLost(state);
+        const finish = (): number => {
+            if (isSurfaceLost(state)) return DDERR_SURFACELOST;
+            if (!ownsSurface()) return E_FAIL;
+            const currentMem = process?.getCurrentMemory() ?? mem;
+            if (lphDC + 4 > currentMem.length || !isValidAddress(currentMem, lphDC, 4, "rw")) return E_POINTER;
+            if (surfaceSyncManager.needsCPUSync(state).needed) return E_FAIL;
+            const bpp = Math.max(1, Math.floor(state.format.bpp / 8));
+            const pitch = state.pitch || state.width * bpp;
+            const size = pitch * state.height;
+            if (state.width <= 0 || state.height <= 0 || pitch < state.width * bpp ||
+                state.surfacePtr <= 0 || !Number.isSafeInteger(size) ||
+                state.surfacePtr + size > currentMem.length ||
+                !isValidAddress(currentMem, state.surfacePtr, size, "r")) return E_FAIL;
+            const rgba = convertSurfaceToRGBA(currentMem, state.surfacePtr, state.width, state.height, pitch, state.format);
+            const hdc = gdiContext.createSurfaceDC(state.width, state.height);
+            if (!hdc) return E_FAIL;
+            let published = false;
+            try {
+                if (!gdiContext.seedSurfaceDC(hdc, rgba, state.width, state.height)) return E_FAIL;
+                gdiContext.linkDCToSurface(hdc, thisPtr);
+                new DataView(currentMem.buffer, currentMem.byteOffset, currentMem.byteLength).setUint32(lphDC, hdc, true);
+                published = true;
+                return DD_OK;
+            } finally {
+                if (!published) {
+                    gdiContext.unlinkDCFromSurface(hdc);
+                    gdiContext.releaseDC(hdc);
                 }
             }
-        } else {
-            // For primary surface only, use overlay canvas
-            hdc = system.gdiContext.createOverlayDC();
-            if (!hdc) return E_FAIL;
-            if (obj) {
-                state = obj.getState();
-            }
-            Logger.log(LogCategory.SYSTEM, `IDirectDrawSurface7_GetDC: PRIMARY surface=0x${thisPtr.toString(16)} -> hdc=0x${hdc.toString(16)} (overlay canvas)`);
+        };
+        const fail = (error: unknown): number => {
+            Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_GetDC: cannot acquire current surface pixels: ${error}`);
+            return E_FAIL;
+        };
+        try {
+            // Flush before choosing CPU authority; stale scratch cannot replace a newer GPU frame.
+            context.executor?.flush();
+            if (!surfaceSyncManager.needsCPUSync(state).needed) return finish();
+            if (!context.executor || !surfaceSyncManager.validateSurfacePtr(state, mem)) return E_FAIL;
+            if (context.executor.syncSurfaceToMemoryFromScratch(state, mem)) return finish();
+            pendingSurfaceDCs.add(state);
+            return context.executor.syncSurfaceToMemory(state)
+                .then(finish).catch(fail).finally(() => pendingSurfaceDCs.delete(state));
+        } catch (error) {
+            pendingSurfaceDCs.delete(state);
+            return fail(error);
         }
-
-        // Link DC to surface for ReleaseDC to copy pixels back
-        system.gdiContext.linkDCToSurface(hdc, thisPtr);
-
-        view.setUint32(lphDC, hdc, true);
-        return DD_OK;
     };
 
     exports["IDirectDrawSurface7_ReleaseDC"] = async (ctx, mem, args) => {
@@ -2297,6 +2296,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
 
         const system = System.getInstance();
         const gdiContext = system.gdiContext;
+        let result = DD_OK;
 
         Logger.verbose(LogCategory.DDRAW, `IDirectDrawSurface7_ReleaseDC: surface=0x${thisPtr.toString(16)} hdc=0x${hdc.toString(16)}`);
 
@@ -2333,6 +2333,16 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                         // would otherwise force (the GPU texture is re-uploaded lazily from CPU on the
                         // next draw via needsGPUSync). Faithful to real DDraw SYSMEM GetDC semantics.
                         const seeded = gdiContext.wasSurfaceSeeded(hdc);
+                        if (seeded) {
+                            mem = system.process?.getCurrentMemory() ?? mem;
+                            const pitch = state.pitch || width * Math.max(1, state.format.bpp / 8);
+                            const size = pitch * height;
+                            if (state.surfacePtr <= 0 || state.surfacePtr + size > mem.length ||
+                                !isValidAddress(mem, state.surfacePtr, size, "rw") ||
+                                !isSafeSurfaceAddress(state.surfacePtr, size)) {
+                                throw new Error("seeded surface DC writeback has no writable pixel buffer");
+                            }
+                        }
 
                         // OPTIMIZATION: Fast Path for GPU-backed surfaces using direct GPU-to-GPU copy
                         if (state.gpuTexture && context.executor && !seeded) {
@@ -2432,11 +2442,9 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                 setAuthorityCpu(state);
                                 state.surfaceEverWritten = true; // Mark as written for deferred Load() detection
 
-                                // ✅ FIX P3: Update rgbaScratch cache for RenderSurface (ReleaseDC slow path)
-                                // When GDI modifies surface via GetDC/ReleaseDC, we need to cache the RGBA data
-                                // so that subsequent GPU uploads don't use stale data
+                                // Cache the bytes actually written, including packed-format quantization.
                                 if (isRenderSurface(state)) {
-                                    state.rgbaScratch = new Uint8Array(fallbackImageData.data);
+                                    state.rgbaScratch = convertSurfaceToRGBA(mem, state.surfacePtr, width, height, pitch, state.format);
                                     state.rgbaScratchVersion = state.version;
                                 }
 
@@ -2461,6 +2469,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                                     }
                                 }
                             } else {
+                                result = E_FAIL;
                                 if (isBackBuffer) {
                                     Logger.warn(LogCategory.DDRAW, `IDirectDrawSurface7_ReleaseDC: Failed to get ImageData for BACKBUFFER surface!`);
                                 }
@@ -2476,6 +2485,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
                         }
                     }
                 } catch (e) {
+                    result = E_FAIL;
                     Logger.warn(LogCategory.SYSTEM, `IDirectDrawSurface7_ReleaseDC: Error copying pixels: ${e}`);
                 }
             }
@@ -2486,7 +2496,7 @@ export const createSurfaceExports = (context: DDrawContext): Record<string, Thun
         }
 
         gdiContext.releaseDC(hdc);
-        return DD_OK;
+        return result;
     };
 
     Object.assign(exports, createSurfaceBltFlipExports(context));

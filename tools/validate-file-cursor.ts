@@ -73,7 +73,7 @@ const MUTATION = /\b(\w*[Hh]andle)\.position\s*(?:\+=|-=|\*=|\/=|\|=|&=|=(?!=))/
 const MUTATION_BUDGET = new Map([
     [join("src", "worker", "runtime", "filesystem", "vfs.ts"), 2],
     [join("src", "worker", "modules", "kernel32", "file-io.ts"), 2],
-    [join("src", "worker", "modules", "msvcrt.ts"), 5],
+    [join("src", "worker", "modules", "msvcrt.ts"), 4],
     [join("src", "worker", "modules", "crtdll.ts"), 1],
 ]);
 

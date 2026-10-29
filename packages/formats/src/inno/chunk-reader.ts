@@ -13,6 +13,7 @@ import {
     type UnpackDecoder,
 } from "../unpack";
 import { BufferSource, type RandomAccessSource } from "../unpack/source";
+import { Inflate } from "pako";
 
 /** chunk.cpp:51 */
 export const CHUNK_MAGIC = new Uint8Array([0x7a, 0x6c, 0x62, 0x1a]); // 'zlb\x1a'
@@ -221,6 +222,24 @@ export function decompressChunkStream(
                     throw new InnoFormatError("output aborted during stored chunk decode", absBase);
                 }
             }
+            break;
+        }
+        case CompressionMethod.Zlib: {
+            // Inno chunks carry a zlib wrapper, so disable pako's gzip autodetection.
+            const source = payloadSource();
+            const inflate = new Inflate({ chunkSize: 256 * 1024, windowBits: 15 });
+            inflate.onData = (bytes) => {
+                if (!onWrite(bytes)) throw new InnoFormatError("output aborted during zlib chunk decode", absBase);
+            };
+            for (let at = 0; at < source.size && !inflate.ended; at += 256 * 1024) {
+                const end = Math.min(source.size, at + 256 * 1024);
+                // Let the stream terminator finish decoding; Z_FINISH reports truncated input differently across pako versions.
+                inflate.push(source.readRangeSync(at, end), false);
+                if (inflate.err) {
+                    throw new InnoFormatError(`zlib decode failed @ slice+0x${chunk.sortOffset.toString(16)}: ${inflate.msg}`, absBase);
+                }
+            }
+            if (!inflate.ended) throw new InnoFormatError("truncated zlib chunk", absBase);
             break;
         }
         case CompressionMethod.LZMA1: {

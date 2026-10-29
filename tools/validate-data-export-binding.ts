@@ -64,6 +64,7 @@ const PINNED_DOUBLE_DECLARED = new Set([
     "msvcp60:??_7out_of_range@std@@6b@",
     "msvcp60:??_7runtime_error@std@@6b@",
     "msvcp60:??_7logic_error@std@@6b@",
+    "msvcp60:??_7bad_cast@std@@6b@",
 ]);
 
 function* walk(dir: string): Generator<string> {

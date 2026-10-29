@@ -8,6 +8,7 @@
  */
 
 import { openSync, closeSync, writeSync, readSync, fstatSync } from "node:fs";
+import { unixToDosDateTime } from "@bottleship/formats/zip";
 
 export const LFH_SIG = 0x04034b50;
 export const CDH_SIG = 0x02014b50;
@@ -19,7 +20,8 @@ export const U16_MAX = 0xffff;
 /** 16 MB streamed copy — bounded RAM regardless of member size. */
 export const COPY_CHUNK = 16 * 1024 * 1024;
 
-export interface OutEntry { nameBuf: Buffer; size: number; crc: number; offset: number }
+/** `dosStamp` is the packed `date << 16 | time` (UTC, see zip/dos-time.ts); 0 = no date. */
+export interface OutEntry { nameBuf: Buffer; size: number; crc: number; offset: number; dosStamp?: number }
 
 const CRC_TABLE = (() => {
     const t = new Uint32Array(256);
@@ -46,13 +48,15 @@ export function crc32(data: Uint8Array): number {
     return crc32Final(crc32Update(data));
 }
 
-export function lfhFor(nameBuf: Buffer, size: number, crc: number): Buffer {
+export function lfhFor(nameBuf: Buffer, size: number, crc: number, dosStamp = 0): Buffer {
     const needsZip64 = size > U32_MAX;
     const extra = needsZip64 ? 20 : 0; // ZIP64 extra: header(4) + uncompressed(8) + compressed(8)
     const lfh = Buffer.alloc(30 + nameBuf.length + extra);
     lfh.writeUInt32LE(LFH_SIG, 0);
     lfh.writeUInt16LE(needsZip64 ? 45 : 20, 4); // version needed (4.5 for ZIP64)
     lfh.writeUInt16LE(0, 8);                    // Store
+    lfh.writeUInt16LE(dosStamp & 0xffff, 10);
+    lfh.writeUInt16LE(dosStamp >>> 16, 12);
     lfh.writeUInt32LE(crc, 14);
     lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 18); // compressed
     lfh.writeUInt32LE(needsZip64 ? U32_MAX : size, 22); // uncompressed
@@ -79,6 +83,8 @@ export function cdhFor(e: OutEntry): Buffer {
     cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 4); // version made by
     cdh.writeUInt16LE(bigSize || bigOff ? 45 : 20, 6); // version needed
     cdh.writeUInt16LE(0, 10); // Store
+    cdh.writeUInt16LE((e.dosStamp ?? 0) & 0xffff, 12);
+    cdh.writeUInt16LE((e.dosStamp ?? 0) >>> 16, 14);
     cdh.writeUInt32LE(e.crc, 16);
     cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 20); // compressed
     cdh.writeUInt32LE(bigSize ? U32_MAX : e.size, 24); // uncompressed
@@ -123,15 +129,19 @@ export class ZipStoreWriter {
     }
 
     /**
-     * Add a member streamed from a file. The header declares the size we measured, so a short
-     * read is fatal: writing fewer bytes than the LFH announces desynchronizes every reader
-     * that trusts it, and the archive would still look well-formed.
+     * Add a member streamed from a file. `modified` (wall-clock seconds, zip/dos-time.ts) is
+     * stamped only when the caller knows the file's real date; otherwise the entry carries no
+     * date, so a bundle does not depend on when its files were extracted. The header declares
+     * the size we measured, so a short read is fatal: writing fewer bytes than the LFH
+     * announces desynchronizes every reader that trusts it, and the archive would still look
+     * well-formed.
      */
-    addFile(name: string, path: string): void {
+    addFile(name: string, path: string, modified?: number): void {
         const nameBuf = Buffer.from(name, "utf8");
         const src = openSync(path, "r");
         try {
             const size = Number(fstatSync(src, { bigint: true }).size);
+            const dosStamp = modified === undefined ? 0 : unixToDosDateTime(modified);
             const entryOffset = this.offset;
             // The LFH carries the CRC, so hash first, then write. Two passes over the file is
             // the price of a Store entry without a data descriptor.
@@ -143,7 +153,7 @@ export class ZipStoreWriter {
                 crc = crc32Update(buf.subarray(0, n), crc);
                 pos += n;
             }
-            this.raw(lfhFor(nameBuf, size, crc32Final(crc)));
+            this.raw(lfhFor(nameBuf, size, crc32Final(crc), dosStamp));
             for (let pos = 0; pos < size;) {
                 const n = readSync(src, buf, 0, Math.min(buf.length, size - pos), pos);
                 if (n <= 0) throw new Error(`${path}: short read at ${pos}/${size} while packing`);
@@ -151,7 +161,7 @@ export class ZipStoreWriter {
                 this.offset += n;
                 pos += n;
             }
-            this.cd.push({ nameBuf, size, crc: crc32Final(crc), offset: entryOffset });
+            this.cd.push({ nameBuf, size, crc: crc32Final(crc), offset: entryOffset, dosStamp });
         } finally {
             closeSync(src);
         }

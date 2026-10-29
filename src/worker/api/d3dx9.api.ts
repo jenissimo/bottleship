@@ -82,6 +82,10 @@ export const d3dx9Module: ModuleDescriptor = {
         makeFunc("D3DXAssembleShader", 7, { onUnimplemented: "hresult" }),
         makeFunc("D3DXDisassembleShader", 4, { onUnimplemented: "hresult" }),
         makeFunc("D3DXCreateBuffer", 2, { onUnimplemented: "hresult" }),
+        // Run-time HLSL: forwarded to D3DCompile in d3dcompiler_43.dll, as d3dx9_43 does.
+        makeFunc("D3DXCompileShader", 10, { onUnimplemented: "hresult" }),
+        makeFunc("D3DXGetVertexShaderProfile", 1),
+        makeFunc("D3DXGetPixelShaderProfile", 1),
         // Reflection over the CTAB block in compiled bytecode — on the path of every
         // SetMatrix/SetVector a title that ships precompiled shaders makes.
         makeFunc("D3DXGetShaderConstantTable", 2, { onUnimplemented: "hresult" }),

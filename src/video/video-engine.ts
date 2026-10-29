@@ -335,6 +335,17 @@ export class VideoEngine {
                 "[VideoEngine] WebM/WebCodecs open failed — falling through to the WASM decoder, which has no matroska demuxer");
         }
         await this.ensureLoaded();
+        return this.openLoaded(fileBytes);
+    }
+
+    /**
+     * open() for a caller that already holds a loaded decoder and cannot yield — a sync
+     * thunk reopening a clip it has played before. WebM needs the async WebCodecs route,
+     * so it is refused here.
+     */
+    openLoaded(fileBytes: Uint8Array): number {
+        if (!this.instance) throw new Error("[VideoEngine] openLoaded before ensureLoaded");
+        if (looksLikeWebm(fileBytes)) throw new Error("[VideoEngine] openLoaded cannot open WebM");
         const exp  = this.exp();
         const size = fileBytes.byteLength;
 

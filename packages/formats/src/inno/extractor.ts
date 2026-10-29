@@ -6,7 +6,7 @@ import { Inflate } from "pako";
 import { filterExtractableFiles } from "./collisions";
 import { checkAllowsLanguage } from "./check-lang";
 import { createChecksumHasher, verifyChecksum } from "../unpack/checksums";
-import { needsExeFilter, InnoExeDecoder5309 } from "./exe-filter";
+import { needsExeFilter, createExeDecoder, type InnoExeDecoder } from "./exe-filter";
 import {
     chunkMapKey,
     decompressChunkStream,
@@ -86,7 +86,7 @@ interface ActiveWrite {
     hasher: ReturnType<typeof createChecksumHasher>;
     expected: Uint8Array;
     checksumType: DataEntry["checksumType"];
-    exeFilter: InnoExeDecoder5309 | null;
+    exeFilter: InnoExeDecoder | null;
     zlibFilter: boolean;
     outputOffset: number;
     outputSize: number;
@@ -409,7 +409,7 @@ function processChunkGroup(
                         hasher: createChecksumHasher(data.checksumType),
                         expected: data.checksum,
                         checksumType: data.checksumType,
-                        exeFilter: needsExeFilter(data.options) ? new InnoExeDecoder5309() : null,
+                        exeFilter: needsExeFilter(data.options) ? createExeDecoder(info.version) : null,
                         zlibFilter: false,
                         outputOffset: 0,
                         outputSize: planned.fileSize,

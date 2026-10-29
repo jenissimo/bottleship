@@ -2662,7 +2662,7 @@ export class ThunkDispatcher {
         this.fillStackArgs(espAtEntry, argCount);
 
         const allowStubPoolRet = this.wndProcThunkFlags[functionId] !== 0
-            || isDefaultWindowProcThunk(thunkName);
+            || isDefaultWindowProcThunk(thunkName) || this.isDirectCallEntry(functionId, espAtEntry);
         if (!this.validateReturnAddrFast(espAtEntry, allowStubPoolRet)) {
             this._slowPathInvalidReturnPreCall(functionId, thunkName, espAtEntry, cpu);
             if (profileThunk) profiler.endAsync(thunkName);
@@ -2782,6 +2782,11 @@ export class ThunkDispatcher {
             hypercallDataManager.refreshTimeAfterThunk(cpu);
         }
 
+        if (isAsync || (typeof result === 'object' && result !== null && result.suspendedForCallback)) {
+            // Suspended handlers retain these inputs while later guest calls run.
+            this.reusableContext = { ...this.reusableContext };
+            this.reusableArgs = this.reusableArgs.slice();
+        }
         this.notifySchedulerBoundary(cpu);
 
         if (!isAsync) {
@@ -2874,6 +2879,21 @@ export class ThunkDispatcher {
         if (id < 0 || id >= MAX_THUNK_ID) return false;
         this.wndProcThunkFlags[id] = 1;
         return true;
+    }
+
+    /**
+     * An API stub called directly by a guest routine (LoadLibraryA, an HLE COM method) is
+     * entered with that invocation's callback return stub at [ESP]. Allowed only while that
+     * invocation is in flight and targets this very stub, so a desync check for the same
+     * API from ordinary guest code stays strict.
+     */
+    private isDirectCallEntry(functionId: number, esp: number): boolean {
+        if (this.callbackStubPoolBase === 0 || esp < 0 || esp + 4 > this.memLength || !this.cachedDataView) return false;
+        let retAddr: number;
+        try { retAddr = this.cachedDataView.getUint32(esp, true); } catch { return false; }
+        if (retAddr < this.callbackStubPoolBase || retAddr >= this.callbackStubPoolEnd) return false;
+        const target = this._callbackManager?.getDirectCallTarget(retAddr) ?? 0;
+        return target !== 0 && this.thunkGenerator.getStubByAddress(target)?.functionId === functionId;
     }
 
     private validateReturnAddrFast(esp: number, allowStubPoolRet = false): boolean {
@@ -3206,7 +3226,8 @@ export class ThunkDispatcher {
         if (typeof result === 'number') {
             reg32[0] = result >>> 0;
             this.winApiRing.recordReturnValue(result >>> 0); // crash-diagnosis ring
-            const allowStub = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name);
+            const allowStub = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name)
+                || this.isDirectCallEntry(id, espAtEntry);
             if (!this.validateReturnAddrFast(espAtEntry, allowStub)) {
                 this._slowPathInvalidReturn(id, name, espAtEntry, result, cpu);
                 this.boundaryKind = ThunkBoundaryKind.THUNK_STUB;
@@ -3258,7 +3279,8 @@ export class ThunkDispatcher {
         this.winApiRing.recordReturnValue(thunkRes.value >>> 0); // crash-diagnosis ring
 
         const mem8 = this.cachedMem8;
-        const allowStubSync = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name);
+        const allowStubSync = this.wndProcThunkFlags[id] !== 0 || isDefaultWindowProcThunk(name)
+            || this.isDirectCallEntry(id, espAtEntry);
         // Skip return address validation for SEH/callback thunks � ESP was moved to catch frame
         if (mem8 && !skipStackCheck && !this.validateReturnAddr(mem8, espAtEntry, `Sync thunk ${name}`, allowStubSync)) {
             Logger.error(LogCategory.THUNK,
@@ -4044,6 +4066,46 @@ export class ThunkDispatcher {
             Logger.warn(LogCategory.THUNK,
                 `[DllMain] Invoking ${dllInits.length} DllMain(s) for ${completionName}: ` +
                 `${dllInits.map(d => `${d.name}@0x${d.entryPoint.toString(16)}`).join(', ')}`);
+
+            // LoadLibrary entered AS a callback target (an HLE routine loading a DLL the way
+            // the real one does — d3dx9 binding d3dcompiler) returns into the outer callback's
+            // live stub, which a suspended frame may not hold. Run the DllMains as direct
+            // thunk returns instead: they resume exactly where LoadLibrary's RET N would have.
+            const stubPool = this._callbackManager.getStubPoolRange();
+            const ret = (returnAddr ?? 0) >>> 0;
+            if (ret >= stubPool.base && ret < stubPool.end) {
+                const callbacks = this._callbackManager;
+                const direct = {
+                    returnAddr: ret,
+                    postEsp: (esp + 4 + cleanupBytes) >>> 0,
+                    entryEsp: esp >>> 0,
+                    complete: (_ret: number): number | null => {
+                        next++;
+                        return next < dllInits.length && invokeInit(next) ? null : baseAddress;
+                    },
+                };
+                let next = 0;
+                const invokeInit = (index: number): boolean => {
+                    const init = dllInits[index];
+                    try {
+                        return callbacks.invokeCallback(
+                            init.entryPoint, [init.baseAddress, 1, 0], 0, undefined, false,
+                            'DllMainChain', undefined, { directThunkReturn: direct },
+                        ).callbackId !== 0;
+                    } catch (e) {
+                        Logger.warn(LogCategory.THUNK, `[DllMain] Failed to invoke ${init.name}: ${e}`);
+                        return false;
+                    }
+                };
+                // Wake only once the callback is set up: the wake drops the parked context the
+                // plain-return fallback restores from.
+                if (invokeInit(0)) {
+                    System.getInstance().scheduler.wakeCurrentThreadForCallbackDispatch();
+                } else {
+                    this._restoreAsyncContext(info, cpu, returnValue, cleanupBytes, completionName, deferredWrites);
+                }
+                return;
+            }
 
             const dllMainFrameId = this._callbackManager.saveSuspendedThunkContext(
                 { esp, returnAddr } as unknown as X86Context,

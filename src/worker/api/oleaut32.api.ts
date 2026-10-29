@@ -48,6 +48,7 @@ export const oleaut32Module: ModuleDescriptor = {
         makeFunc("ord_12", 4, { ordinal: 12 }),   // VariantChangeType
         makeFunc("VariantChangeType", 4, { onUnimplemented: "hresult" }),
         makeFunc("ord_13", 4, { ordinal: 13 }),   // VariantTimeToDosDateTime(DATE, USHORT*, USHORT*)
+        makeFunc("ord_147", 5, { ordinal: 147, onUnimplemented: "hresult" }),
         makeFunc("VariantChangeTypeEx", 5, { onUnimplemented: "hresult" }),
 
         // Active object registration (ordinal + named alias)

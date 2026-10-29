@@ -478,12 +478,12 @@ function writeLightInto(out: Float32Array, base: number, L: FfpLightInput, view:
 export const FFP_LIGHTSET_FLOATS = 4 + LIGHT_FLOATS * FFP_MAX_LIGHTS; // 228
 export const FFP_LIGHTSET_BYTES = FFP_LIGHTSET_FLOATS * 4; // 912
 
-export function packFfpLightSet(out: Float32Array, lights: FfpLightInput[], view: Float32Array = IDENTITY4): void {
-    out.fill(0, 0, FFP_LIGHTSET_FLOATS);
+export function packFfpLightSet(out: Float32Array, lights: FfpLightInput[], view: Float32Array = IDENTITY4, offset = 0): void {
+    out.fill(0, offset, offset + FFP_LIGHTSET_FLOATS);
     const count = Math.min(lights.length, FFP_MAX_LIGHTS);
-    out[0] = count;
+    out[offset] = count;
     for (let i = 0; i < count; i++) {
-        writeLightInto(out, 4 + i * LIGHT_FLOATS, lights[i], view);
+        writeLightInto(out, offset + 4 + i * LIGHT_FLOATS, lights[i], view);
     }
 }
 
@@ -672,7 +672,7 @@ fn ffpSelectColor(src: f32, matCol: vec4<f32>, vDiff: vec4<f32>, vSpec: vec4<f32
  * view space in both current callers, so the non-local-viewer direction is (0,0,-1) and the eye
  * is the origin). Depends on ffpSelectColor (FFP_SELECT_COLOR_WGSL) and FfpLight being in scope.
  */
-export function emitFfpComputeLighting(lightsExpr: string): string {
+export function emitFfpComputeLighting(lightsExpr: string, lightArrayParameter = false): string {
     return `
 const FFP_FLOAT_MAX: f32 = 3.4028234e38;
 
@@ -683,7 +683,8 @@ fn ffpComputeLighting(
     normalizeNormals: bool,
     diffuseSrc: f32, ambientSrc: f32, specularSrc: f32, emissiveSrc: f32,
     globalAmbient: vec3<f32>, numLights: i32,
-    vDiffuse: vec4<f32>, vSpecular: vec4<f32>
+    vDiffuse: vec4<f32>, vSpecular: vec4<f32>${lightArrayParameter ? `,
+    lights: ptr<function, array<FfpLight, ${FFP_MAX_LIGHTS}>>` : ""}
 ) -> array<vec4<f32>, 2> {
     let matDif = ffpSelectColor(diffuseSrc, matDiffuse, vDiffuse, vSpecular);
     let matAmb = ffpSelectColor(ambientSrc, matAmbient, vDiffuse, vSpecular);

@@ -22,6 +22,7 @@
 
 import { Md5 } from "../unpack/checksums";
 import { asBufferSource } from "../dom-buffer";
+import { dosDateTimeToUnix } from "../zip/dos-time";
 
 // ---- flags (cabfile.h) ----
 export const FILE_SPLIT = 1;
@@ -49,15 +50,17 @@ function isRuntimeFileGroup(name: string): boolean {
     return name.startsWith("<"); // <Support>…, <Engine>…, <Disk1>…
 }
 
+/** Destinations rooted at the install directory; the variable's case is not significant. */
+const TARGETDIR_ROOT = /^<TARGETDIR>/i;
+
 /**
  * Resolve a raw InstallShield destination string to a relative install dir:
  * strip a leading `<TARGETDIR>\` or `..\`, convert `\`→`/`, drop a leading slash.
  * `<TARGETDIR>` / `..` / "" → "" (root).
  */
 export function resolveInstallDestination(dest: string): string {
-    let s = dest;
     // strip leading <TARGETDIR> (with or without a following separator)
-    if (s.startsWith("<TARGETDIR>")) s = s.slice("<TARGETDIR>".length);
+    let s = dest.replace(TARGETDIR_ROOT, "");
     // strip any number of leading `..\` / `../` (parent-relative to install root)
     while (s.startsWith("..\\") || s.startsWith("../")) s = s.slice(3);
     if (s === "..") s = "";
@@ -81,6 +84,8 @@ export interface InstallShieldFile {
     linkPrev: number;
     linkNext: number;
     linkFlags: number;
+    /** Last-write time from the v6+ descriptor's DOS stamp, as wall-clock seconds (zip/dos-time.ts); absent for v5 or an invalid stamp. */
+    modified?: number;
 }
 
 /**
@@ -93,6 +98,8 @@ export interface InstallShieldFileGroup {
     name: string;
     firstFile: number;
     lastFile: number;
+    /** Raw destination (`<TARGETDIR>\Data\Motion`); v6+ only, "" otherwise. */
+    destination: string;
 }
 
 /**
@@ -124,6 +131,12 @@ export interface InstallShieldInfo {
      * should be skipped.
      */
     installDirByIndex: Map<number, string | null>;
+    /**
+     * file-index → install dir from its FILE GROUP's `<TARGETDIR>`-rooted destination
+     * (v6+). The cabinet directory of a file is the subfolder of the group's source
+     * folder, so the install path is always `destination/cabinet dir/name`.
+     */
+    groupDirByIndex: Map<number, string>;
     /**
      * True when the cabinet's own per-file directory table carries NO layout for
      * the game files (every installed file sits in cabinet dir ""). Only then is
@@ -176,6 +189,8 @@ export interface ExtractOptions {
         fd: InstallShieldFile,
         outPath: string,
     ) => Promise<Uint8Array | null> | Uint8Array | null;
+    /** Receives each extracted file's last-write time (wall-clock seconds), keyed like the result. */
+    fileTimes?: Map<string, number>;
 }
 
 /** True when a 16-byte MD5 field is all-zero (i.e. "no checksum stored"). */
@@ -290,9 +305,10 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
             //   p = base + file_table_offset2 + index*0x57
             //   flags u16@0; expanded u64@2; compressed u64@0xa; data_offset u64@0x12;
             //   md5[16]@0x1a; skip 0x10; name_offset u32@0x3a; dir_index u16@0x3e;
-            //   (==0x40) skip 0xc; link_prev u32@0x4c; link_next u32@0x50;
-            //   link_flags u8@0x54; volume u16@0x55 (==0x57).
+            //   attributes u16@0x40; skip 2; dos_date u16@0x44; dos_time u16@0x46; skip 4;
+            //   link_prev u32@0x4c; link_next u32@0x50; link_flags u8@0x54; volume u16@0x55 (==0x57).
             const p = base + fileTableOffset2 + i * 0x57;
+            const modified = dosDateTimeToUnix(r.u16(p + 0x44), r.u16(p + 0x46));
             fd = {
                 index: i,
                 flags: r.u16(p + 0x00),
@@ -307,6 +323,7 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
                 linkFlags: r.u8(p + 0x54),
                 volume: r.u16(p + 0x55),
                 dir: "",
+                ...(modified !== undefined ? { modified } : {}),
             };
         }
         fd.dir = dirs[fd.dirIndex] ?? `?${fd.dirIndex}`;
@@ -319,7 +336,7 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
     // cabinet dir "" but the game needs System/, Maps/, Textures/, …). Parsed
     // defensively: any absence/old-format quirk yields an empty map → callers
     // fall back to the cabinet `dir`. Never throws.
-    const { fileGroups, components, installDirByIndex } = parseComponentLayout(
+    const { fileGroups, components, installDirByIndex, groupDirByIndex } = parseComponentLayout(
         r,
         hdr,
         cdOff,
@@ -336,7 +353,7 @@ export function parseInstallShieldHeader(hdr: Uint8Array): InstallShieldInfo {
         (f) => installDirByIndex.get(f.index) === null || !f.dir,
     );
 
-    return { major, dirs, files, fileGroups, components, installDirByIndex, cabinetIsFlat };
+    return { major, dirs, files, fileGroups, components, installDirByIndex, groupDirByIndex, cabinetIsFlat };
 }
 
 type Reader = ReturnType<typeof reader>;
@@ -351,7 +368,7 @@ type Reader = ReturnType<typeof reader>;
  *   - file_group_offsets[71] @ cdOff+0x3e, component_offsets[71] @ cdOff+0x15a.
  *   - OffsetList node: name_offset u32@0, descriptor_offset u32@4, next_offset u32@8.
  *   - FileGroup descriptor: name_offset u32@0; skip (v5: 0x48 / v6+: 0x12);
- *     first_file i32; last_file i32.
+ *     first_file i32; last_file i32; v6+: destination string_offset u32@0x3a.
  *   - Component descriptor: name_offset u32@0; **destination string_offset u32@0x1c**
  *     (the field upstream skips); then skip to file_group_count u16
  *     (v5 @ +0x6e / v6+ @ +0x6f) and file_group_table_offset u32 right after.
@@ -367,10 +384,12 @@ function parseComponentLayout(
     fileGroups: InstallShieldFileGroup[];
     components: InstallShieldComponent[];
     installDirByIndex: Map<number, string | null>;
+    groupDirByIndex: Map<number, string>;
 } {
     const fileGroups: InstallShieldFileGroup[] = [];
     const components: InstallShieldComponent[] = [];
     const installDirByIndex = new Map<number, string | null>();
+    const groupDirByIndex = new Map<number, string>();
 
     // string/buffer pointers in these tables are all relative to cdOff.
     const inBounds = (o: number) => o >= 0 && o < hdr.length;
@@ -393,8 +412,15 @@ function parseComponentLayout(
                     const skip = major <= 5 ? 0x48 : 0x12;
                     const first = (r.u32(d + 4 + skip) | 0);
                     const last = (r.u32(d + 4 + skip + 4) | 0);
-                    const fg: InstallShieldFileGroup = { name, firstFile: first, lastFile: last };
+                    const destination = major >= 6 && inBounds(d + 0x3e) ? str(r.u32(d + 0x3a)) : "";
+                    const fg: InstallShieldFileGroup = { name, firstFile: first, lastFile: last, destination };
                     fileGroups.push(fg);
+                    // Other roots (<WINSYSDIR>, <SUPPORTDIR>, …) are outside the install tree.
+                    if (TARGETDIR_ROOT.test(destination) && !isRuntimeFileGroup(name)) {
+                        const dir = resolveInstallDestination(destination);
+                        const lo = Math.max(0, first), hi = Math.min(fileCount - 1, last);
+                        for (let idx = lo; idx <= hi; idx++) if (!groupDirByIndex.has(idx)) groupDirByIndex.set(idx, dir);
+                    }
                     if (name && !fgByName.has(name)) fgByName.set(name, fg);
                 }
                 next = nextOff;
@@ -449,10 +475,10 @@ function parseComponentLayout(
         }
     } catch {
         // Old/odd header format — abandon the component layout, fall back to dirs.
-        return { fileGroups, components, installDirByIndex: new Map() };
+        return { fileGroups, components, installDirByIndex: new Map(), groupDirByIndex: new Map() };
     }
 
-    return { fileGroups, components, installDirByIndex };
+    return { fileGroups, components, installDirByIndex, groupDirByIndex };
 }
 
 /** Read a v5 (40-byte) or v6 (64-byte) volume header from a `.cab` buffer. */
@@ -640,14 +666,22 @@ export function fileRelPath(fd: InstallShieldFile): string {
 }
 
 /**
- * Resolve the install-relative output path for a file, preferring the
- * component→destination mapping over the cabinet `directory_index`.
+ * Resolve the install-relative output path (forward slashes) for a file.
  *
  * Returns `null` when the file belongs to an InstallShield runtime group
  * (`<Support>`/`<Engine>`/`<Disk1>` — isrt.dll, ikernel.exe, setup.inx, …) and
  * must be skipped.
  *
- * Policy: the component map only WINS for a FLAT cabinet — one whose per-file
+ * A v6+ file group with a `<TARGETDIR>`-rooted destination places its files at
+ * `destination/cabinet dir/name`, as the engine does: the cabinet directory is
+ * relative to the group, never to the install root. That holds even when the two
+ * repeat a name — a real HP2 install has `help/help/*` from group `<TARGETDIR>\help`
+ * with cabinet dir `help`. Installers whose cabinet dirs are install-root paths
+ * give their groups the destination `<TARGETDIR>` (Max Payne: the Levels group,
+ * so x_level*.ras stays at the root), which the composition leaves unchanged.
+ * Groups bound elsewhere (`<WINSYSDIR>`, …) and v5 headers use the component policy:
+ *
+ * The component map only WINS for a FLAT cabinet — one whose per-file
  * directory table carries no layout for the game files (`info.cabinetIsFlat`).
  * That routes flat installers (HP1 demo — every file in cabinet dir "") into
  * System/, Maps/, Textures/, … from the component destinations, while installers
@@ -662,12 +696,15 @@ export function fileRelPath(fd: InstallShieldFile): string {
 export function resolveInstallPath(fd: InstallShieldFile, info: InstallShieldInfo): string | null {
     const mapped = info.installDirByIndex.get(fd.index);
     if (mapped === null) return null; // runtime/scaffolding file → skip
+    const rel = fileRelPath(fd).replace(/\\/g, "/");
+    const groupDir = info.groupDirByIndex.get(fd.index);
+    if (groupDir !== undefined) return groupDir ? `${groupDir}/${rel}` : rel;
     if (mapped !== undefined && !fd.dir && info.cabinetIsFlat) {
         // flat cabinet (no per-file layout) + a component destination → place by destination.
         return mapped ? `${mapped}/${fd.name}` : fd.name;
     }
     // real cabinet directory present (or no component info) → cabinet layout.
-    return fileRelPath(fd);
+    return rel;
 }
 
 /**
@@ -733,6 +770,7 @@ export async function extractInstallShield(
             }
         }
         result.set(outPath, data);
+        if (fd.modified !== undefined) opts.fileTimes?.set(outPath, fd.modified);
         done++;
         opts.onProgress?.(done, live.length, outPath);
     }

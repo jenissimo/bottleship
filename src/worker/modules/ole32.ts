@@ -946,12 +946,15 @@ export class Ole32 implements IModule {
         const interfaceRegistry = InterfaceRegistry.getInstance();
         const process = this.process;
 
-        // DirectMusic classes answer for their own interfaces: one object is reached as
-        // several (IDirectMusicObject, IPersistStream, the class's own), none by IID alone.
-        const dmusic = this.process.modules.get("dmusic") as
-            { coCreateInstance?: (clsid: string, iid: string, ppv: number) => number | null } | undefined;
-        const dmusicResult = dmusic?.coCreateInstance?.(clsidNormalized, iidNormalized, ppv);
-        if (dmusicResult !== undefined && dmusicResult !== null) return dmusicResult;
+        // DirectMusic and multimedia-streaming classes answer for their own interfaces: one
+        // object is reached as several (IDirectMusicObject, IPersistStream, the class's own),
+        // none by IID alone.
+        for (const name of ["dmusic", "amstream"]) {
+            const provider = this.process.modules.get(name) as
+                { coCreateInstance?: (clsid: string, iid: string, ppv: number) => number | null } | undefined;
+            const result = provider?.coCreateInstance?.(clsidNormalized, iidNormalized, ppv);
+            if (result !== undefined && result !== null) return result;
+        }
 
         let targetIID = iidNormalized;
         if (clsidNormalized === "d7b70ee0-4340-11cf-b063-0020afc2cd35") {

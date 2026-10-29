@@ -4,18 +4,20 @@ import { crc32 } from '../installer/binary';
 
 class Bits {
     pos = 0;
-    constructor(readonly bytes: Uint8Array) {}
+    limit: number;
+    constructor(readonly bytes: Uint8Array) { this.limit = bytes.length * 8; }
     peek(n: number): number {
         let value = 0, pos = this.pos;
         for (let left = n; left > 0;) {
             const take = Math.min(left, 8 - (pos & 7));
-            value = value * 2 ** take + (((this.bytes[pos >>> 3] ?? 0) >>> (8 - (pos & 7) - take)) & ((1 << take) - 1));
+            const byte = pos < this.limit ? this.bytes[pos >>> 3] ?? 0 : 0;
+            value = value * 2 ** take + ((byte >>> (8 - (pos & 7) - take)) & ((1 << take) - 1));
             pos += take; left -= take;
         }
         return value;
     }
     read(n: number): number {
-        if (this.pos + n > this.bytes.length * 8) throw new Error('RAR29: truncated bitstream');
+        if (this.pos + n > this.limit) throw new Error('RAR29: truncated bitstream');
         const v = this.peek(n); this.pos += n; return v;
     }
     align(): void { this.read((8 - (this.pos & 7)) & 7); }
@@ -63,7 +65,7 @@ for (const [bits, count] of [4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 14,
 }
 const SHORT_DIST = [0, 4, 8, 16, 32, 64, 128, 192], SHORT_BITS = [2, 2, 3, 4, 5, 6, 6, 6];
 interface FilterDef { kind: number; length: number; }
-interface Filter { start: number; length: number; kind: number; registers: Uint32Array; }
+interface Filter { start: number; fileStart: number; length: number; kind: number; registers: Uint32Array; }
 const FILTERS = [[53, 0xad576887, 1], [57, 0x3cd7e57e, 2], [149, 0x1c2c5dc8, 4], [216, 0xbc85e701, 5], [29, 0x0e06077d, 6]];
 
 function filterBlock(data: Uint8Array, f: Filter): Uint8Array {
@@ -72,7 +74,7 @@ function filterBlock(data: Uint8Array, f: Filter): Uint8Array {
         const view = new DataView(out.buffer);
         for (let i = 0; i < out.length - 4; i++) {
             if (out[i] !== 0xe8 && (f.kind !== 2 || out[i] !== 0xe9)) continue;
-            const offset = f.start + ++i, address = view.getInt32(i, true);
+            const offset = f.start - f.fileStart + ++i, address = view.getInt32(i, true);
             if (address < 0) { if (address + offset >= 0) view.setInt32(i, address + 0x1000000, true); }
             else if (address < 0x1000000) view.setInt32(i, address - offset, true);
             i += 3;
@@ -137,8 +139,27 @@ export interface RarPpmSession {
 }
 
 export function decodeRar29(input: Uint8Array, expectedSize: number, createPpm?: (input: Uint8Array) => RarPpmSession): Uint8Array {
-    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > 512 * 1024 * 1024) throw new Error('RAR29: invalid output size');
+    return decodeRar29Solid([{ input, expectedSize }], createPpm)[0];
+}
+
+export interface Rar29File { input: Uint8Array; expectedSize: number; }
+
+/** A solid group shares unfiltered history, coding tables and the PPM model across file boundaries. */
+export function decodeRar29Solid(files: Rar29File[], createPpm?: (input: Uint8Array) => RarPpmSession): Uint8Array[] {
+    let expectedSize = 0, packedSize = 0;
+    for (const file of files) {
+        if (!Number.isSafeInteger(file.expectedSize) || file.expectedSize < 0) throw new Error('RAR29: invalid output size');
+        expectedSize += file.expectedSize; packedSize += file.input.length;
+    }
+    if (!Number.isSafeInteger(expectedSize) || expectedSize > 512 * 1024 * 1024) throw new Error('RAR29: invalid output size');
+    if (!files.length) return [];
+    const input = files.length === 1 ? files[0].input : new Uint8Array(packedSize);
+    if (files.length > 1) {
+        let at = 0;
+        for (const file of files) { input.set(file.input, at); at += file.input.length; }
+    }
     const bits = new Bits(input), out = new Uint8Array(expectedSize), old = new Uint8Array(404);
+    let fileStart = 0, fileEnd = 0, inputEnd = 0, newTable = true;
     let lit!: Uint16Array, dist!: Uint16Array, low!: Uint16Array, rep!: Uint16Array;
     let pos = 0, lastLength = 0, lastDistance = 0, lowRepeat = 0, previousLow = 0;
     const distances = new Uint32Array(4), definitions: FilterDef[] = [], filters: Filter[] = [];
@@ -150,7 +171,8 @@ export function decodeRar29(input: Uint8Array, expectedSize: number, createPpm?:
             if (bits.peek(1)) {
                 if (!createPpm) throw new Error('RAR29: PPMd codec required');
                 ppm ??= createPpm(input);
-                const result = ppm.decodeBlock(bits.pos / 8, out, pos);
+                const result = ppm.decodeBlock(bits.pos / 8, out.subarray(0, fileEnd), pos);
+                if (result.consumed > inputEnd || result.written > fileEnd) throw new Error('RAR29: PPM block exceeds file extent');
                 pos = result.written; bits.pos = result.consumed * 8; ended = result.ended;
                 if (ended) return;
                 continue;
@@ -184,7 +206,7 @@ export function decodeRar29(input: Uint8Array, expectedSize: number, createPpm?:
         }
     };
     const copy = (length: number, distance: number) => {
-        if (!distance || distance > pos || pos + length > out.length) throw new Error(`RAR29: invalid match ${pos}+${length} distance ${distance}`);
+        if (!distance || distance > pos || pos + length > fileEnd) throw new Error(`RAR29: invalid match ${pos}+${length} distance ${distance}`);
         for (let i = 0; i < length; i++) { out[pos] = out[pos - distance]; pos++; }
     };
     const remember = (distance: number) => { distances.copyWithin(1, 0, 3); distances[0] = distance; };
@@ -225,54 +247,64 @@ export function decodeRar29(input: Uint8Array, expectedSize: number, createPpm?:
             definitions.push({ kind, length: blockLength });
         } else definitions[index].length = blockLength;
         if (flags & 8) throw new Error('RAR29: VM global data is unsupported');
-        if (start + blockLength > out.length || !blockLength) throw new Error('RAR29: invalid filter extent');
-        filters.push({ start, length: blockLength, kind, registers });
+        if (start + blockLength > fileEnd || !blockLength) throw new Error('RAR29: invalid filter extent');
+        filters.push({ start, fileStart, length: blockLength, kind, registers });
     };
     try {
-        readTables();
-        while (!ended) {
-            const n = symbol(bits, lit);
-            if (n < 256) {
-                if (pos >= out.length) throw new Error('RAR29: output overflow');
-                out[pos++] = n; continue;
-            }
-            if (n === 256) {
-                if (bits.read(1)) { readTables(); continue; }
-                bits.read(1); break;
-            }
-            if (n === 257) { vm(); continue; }
-            if (n === 258) { if (lastLength) copy(lastLength, lastDistance); continue; }
-            let length: number, distance: number;
-            if (n >= 271) {
-                const l = n - 271;
-                length = LENGTH[l] + 3 + bits.read(LBITS[l]);
-                const d = symbol(bits, dist), count = DBITS[d];
-                distance = DIST[d] + 1;
-                if (count) {
-                    if (d > 9) {
-                        if (count > 4) distance += bits.read(count - 4) * 16;
-                        if (lowRepeat) { lowRepeat--; distance += previousLow; }
-                        else {
-                            const lo = symbol(bits, low);
-                            if (lo === 16) { lowRepeat = 15; distance += previousLow; }
-                            else { distance += lo; previousLow = lo; }
-                        }
-                    } else distance += bits.read(count);
+        for (const file of files) {
+            fileStart = pos; fileEnd += file.expectedSize;
+            bits.pos = inputEnd * 8; inputEnd += file.input.length; bits.limit = inputEnd * 8;
+            ended = false;
+            if (newTable) readTables();
+            while (!ended) {
+                const n = symbol(bits, lit);
+                if (n < 256) {
+                    if (pos >= fileEnd) throw new Error('RAR29: output overflow');
+                    out[pos++] = n; continue;
                 }
-                if (distance >= 8192) { length++; if (distance >= 262144) length++; }
-                remember(distance);
-            } else if (n < 263) {
-                const d = n - 259; distance = distances[d];
-                distances.copyWithin(1, 0, d); distances[0] = distance;
-                const l = symbol(bits, rep); length = LENGTH[l] + 2 + bits.read(LBITS[l]);
-            } else {
-                const d = n - 263; distance = SHORT_DIST[d] + 1 + bits.read(SHORT_BITS[d]); length = 2; remember(distance);
+                if (n === 256) {
+                    if (bits.read(1)) { readTables(); continue; }
+                    newTable = !!bits.read(1); break;
+                }
+                if (n === 257) { vm(); continue; }
+                if (n === 258) { if (lastLength) copy(lastLength, lastDistance); continue; }
+                let length: number, distance: number;
+                if (n >= 271) {
+                    const l = n - 271;
+                    length = LENGTH[l] + 3 + bits.read(LBITS[l]);
+                    const d = symbol(bits, dist), count = DBITS[d];
+                    distance = DIST[d] + 1;
+                    if (count) {
+                        if (d > 9) {
+                            if (count > 4) distance += bits.read(count - 4) * 16;
+                            if (lowRepeat) { lowRepeat--; distance += previousLow; }
+                            else {
+                                const lo = symbol(bits, low);
+                                if (lo === 16) { lowRepeat = 15; distance += previousLow; }
+                                else { distance += lo; previousLow = lo; }
+                            }
+                        } else distance += bits.read(count);
+                    }
+                    if (distance >= 8192) { length++; if (distance >= 262144) length++; }
+                    remember(distance);
+                } else if (n < 263) {
+                    const d = n - 259; distance = distances[d];
+                    distances.copyWithin(1, 0, d); distances[0] = distance;
+                    const l = symbol(bits, rep); length = LENGTH[l] + 2 + bits.read(LBITS[l]);
+                } else {
+                    const d = n - 263; distance = SHORT_DIST[d] + 1 + bits.read(SHORT_BITS[d]); length = 2; remember(distance);
+                }
+                lastLength = length; lastDistance = distance; copy(length, distance);
             }
-            lastLength = length; lastDistance = distance; copy(length, distance);
+            if (pos !== fileEnd) throw new Error(`RAR29: size mismatch ${pos - fileStart}/${file.expectedSize}`);
+            if (ended) newTable = true;
         }
-        if (pos !== expectedSize) throw new Error(`RAR29: size mismatch ${pos}/${expectedSize}`);
-        // Keep LZ history unfiltered until decoding ends; filters change output, never the dictionary.
+        // Keep LZ history unfiltered until the whole group ends.
         for (const f of filters) out.set(filterBlock(out.subarray(f.start, f.start + f.length), f), f.start);
-        return out;
+        let at = 0;
+        return files.map(file => {
+            const bytes = out.subarray(at, at + file.expectedSize); at += file.expectedSize;
+            return bytes;
+        });
     } finally { ppm?.close(); }
 }

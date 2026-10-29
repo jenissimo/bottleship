@@ -91,6 +91,7 @@ import {
     GL_STENCIL_BUFFER_BIT,
     GL_ZERO,
 } from "../../../modules/opengl32/constants";
+import { baseInternalFormat, BaseFormat } from "../../../modules/opengl32/texture";
 import { Logger, LogCategory } from "../../../core/logger";
 import { WebGPUBackend } from "../webgpu-backend";
 import { statsOverlay } from "../../../core/stats-overlay";
@@ -108,6 +109,7 @@ interface CachedTexture {
     wrapT: number;
     minFilter: number;
     magFilter: number;
+    internalFormat: number;
 }
 
 interface PreparedDrawData {
@@ -433,7 +435,9 @@ export class OpenGLBackendExecutor {
                     const uniformOffset = this.allocateUniformSlot();
                     if (uniformOffset < 0) break;
 
-                    this.writeUniforms(queue, uniformOffset, guestW, guestH, I, F, i, f, useTex0, useTex1);
+                    const format0 = tex0 ? baseInternalFormat(tex0.internalFormat) : BaseFormat.RGBA;
+                    const format1 = tex1 ? baseInternalFormat(tex1.internalFormat) : BaseFormat.RGBA;
+                    this.writeUniforms(queue, uniformOffset, guestW, guestH, I, F, i, f, useTex0, useTex1, format0, format1);
 
                     const stencilTest = (flags & DF_STENCIL_TEST) !== 0;
                     const pipelineCfg: OpenGLPipelineConfig = {
@@ -1063,6 +1067,7 @@ export class OpenGLBackendExecutor {
                 wrapT: src.wrapT,
                 minFilter: src.minFilter,
                 magFilter: src.magFilter,
+                internalFormat: src.internalFormat,
             };
             this.textureCache.set(texId, cached);
             this.bindGroupCache.clear();
@@ -1084,6 +1089,7 @@ export class OpenGLBackendExecutor {
         cached.wrapT = src.wrapT;
         cached.minFilter = src.minFilter;
         cached.magFilter = src.magFilter;
+        cached.internalFormat = src.internalFormat;
         return cached;
     }
 
@@ -1298,6 +1304,8 @@ export class OpenGLBackendExecutor {
         f: number,
         useTex0: boolean,
         useTex1: boolean,
+        format0: BaseFormat,
+        format1: BaseFormat,
     ): void {
         this.uniformScratchF32.fill(0);
         const flags = I[i + CI_FLAGS];
@@ -1346,6 +1354,10 @@ export class OpenGLBackendExecutor {
         this.uniformScratchU32[22] = I[i + CI_COMBINE0_ALPHA] >>> 0;
         this.uniformScratchU32[23] = I[i + CI_COMBINE1_RGB] >>> 0;
         this.uniformScratchU32[24] = I[i + CI_COMBINE1_ALPHA] >>> 0;
+
+        // 100..108 — each unit's texture base format (see applyTexEnv)
+        this.uniformScratchU32[25] = format0;
+        this.uniformScratchU32[26] = format1;
 
         // 112..144 — GL_TEXTURE_ENV_COLOR per unit (vec4 alignment leaves 100..112 pad)
         for (let k = 0; k < 4; k++) {
@@ -1570,8 +1582,8 @@ struct Uniforms {
     comb0Alpha: u32,        // 88..92
     comb1Rgb: u32,          // 92..96
     comb1Alpha: u32,        // 96..100
-    _pad2: u32,             // 100..104
-    _pad3: u32,             // 104..108
+    texFormat0: u32,        // 100..104
+    texFormat1: u32,        // 104..108
     _pad4: u32,             // 108..112
     envColor0: vec4f,       // 112..128
     envColor1: vec4f,       // 128..144
@@ -1674,26 +1686,36 @@ fn combineAlpha(word: u32, rgbWord: u32, texel: vec4f, primary: vec4f, previous:
     return clamp(a * scale, 0.0, 1.0);
 }
 
+// Texels are stored in the COMBINE-source convention (ALPHA → rgb 0, RGB/LUMINANCE → a 1).
+// The classic functions instead pass the fragment's own colour/alpha through for a
+// component the base format lacks (GL 1.3 tables 3.21–3.22), so they need the format.
 fn applyTexEnv(
     mode: u32, incoming: vec4f, texel: vec4f,
-    primary: vec4f, combRgb: u32, combAlpha: u32, konst: vec4f,
+    primary: vec4f, combRgb: u32, combAlpha: u32, konst: vec4f, format: u32,
 ) -> vec4f {
-    if (mode == ${GL_REPLACE}u) {
-        return texel;
-    }
-    if (mode == ${GL_DECAL}u) {
-        return vec4f(mix(incoming.rgb, texel.rgb, texel.a), incoming.a);
-    }
-    if (mode == ${GL_ADD}u) {
-        return vec4f(min(incoming.rgb + texel.rgb, vec3f(1.0)), min(incoming.a + texel.a, 1.0));
-    }
     if (mode == ${GL_COMBINE}u) {
         return vec4f(
             combineRgb(combRgb, texel, primary, incoming, konst),
             combineAlpha(combAlpha, combRgb, texel, primary, incoming, konst),
         );
     }
-    return incoming * texel; // GL_MODULATE / default
+    if (mode == ${GL_DECAL}u) {
+        return vec4f(mix(incoming.rgb, texel.rgb, texel.a), incoming.a);
+    }
+    let hasRgb = format != ${BaseFormat.ALPHA}u;
+    let hasAlpha = format == ${BaseFormat.RGBA}u || format == ${BaseFormat.ALPHA}u
+        || format == ${BaseFormat.LUMINANCE_ALPHA}u || format == ${BaseFormat.INTENSITY}u;
+    if (mode == ${GL_REPLACE}u) {
+        return vec4f(select(incoming.rgb, texel.rgb, hasRgb), select(incoming.a, texel.a, hasAlpha));
+    }
+    if (mode == ${GL_ADD}u) {
+        let a = select(select(incoming.a, incoming.a * texel.a, hasAlpha),
+                       min(incoming.a + texel.a, 1.0), format == ${BaseFormat.INTENSITY}u);
+        return vec4f(select(incoming.rgb, min(incoming.rgb + texel.rgb, vec3f(1.0)), hasRgb), a);
+    }
+    // GL_MODULATE / default
+    return vec4f(select(incoming.rgb, incoming.rgb * texel.rgb, hasRgb),
+                 select(incoming.a, incoming.a * texel.a, hasAlpha));
 }
 
 fn alphaTestPass(alpha: f32, refValue: f32, func: u32) -> bool {
@@ -1750,12 +1772,12 @@ fn fs_main(input: VertexOut) -> @location(0) vec4f {
     if (uniforms.useTex0 != 0u) {
         let t0 = textureSample(tex0, samp0, input.uv0);
         color = applyTexEnv(uniforms.texEnv0, color, t0, primary,
-                            uniforms.comb0Rgb, uniforms.comb0Alpha, uniforms.envColor0);
+                            uniforms.comb0Rgb, uniforms.comb0Alpha, uniforms.envColor0, uniforms.texFormat0);
     }
     if (uniforms.useTex1 != 0u) {
         let t1 = textureSample(tex1, samp1, input.uv1);
         color = applyTexEnv(uniforms.texEnv1, color, t1, primary,
-                            uniforms.comb1Rgb, uniforms.comb1Alpha, uniforms.envColor1);
+                            uniforms.comb1Rgb, uniforms.comb1Alpha, uniforms.envColor1, uniforms.texFormat1);
     }
 
     color = vec4f(clamp(color.rgb, vec3f(0.0), vec3f(1.0)), clamp(color.a, 0.0, 1.0));

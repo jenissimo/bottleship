@@ -180,7 +180,7 @@ export const D3DDEVCAPS_HWRASTERIZATION = 0x00080000;
 
 // D3DPRIMCAPS dwTextureCaps - texture capabilities (d3dcaps.h)
 export const D3DPTEXTURECAPS_PERSPECTIVE = 0x00000001;
-export const D3DPTEXTURECAPS_POW2 = 0x00000002;        // Requires power-of-two textures (NOT set on modern HW)
+export const D3DPTEXTURECAPS_POW2 = 0x00000002;        // Requires power-of-two textures
 export const D3DPTEXTURECAPS_ALPHA = 0x00000004;
 export const D3DPTEXTURECAPS_TRANSPARENCY = 0x00000008;
 export const D3DPTEXTURECAPS_BORDER = 0x00000010;
@@ -422,9 +422,12 @@ export const EMU_D3D_DEFAULT_CAPS = {
         D3DDEVCAPS_HWRASTERIZATION,
 
     // dpcTriCaps.dwTextureCaps — matches real HW
-    // Note: POW2 intentionally NOT set — real HW doesn't require power-of-two textures
+    // POW2: every DX6/DX7-era HAL required power-of-two textures, and titles size their
+    // textures from this bit; one that sees it clear may size a texture exactly and then
+    // refuse its own non-power-of-two image.
     // COLORKEYBLEND needed for games that check it before enabling colorkey in 3D pipeline
     dwTextureCaps:
+        D3DPTEXTURECAPS_POW2 |
         D3DPTEXTURECAPS_PERSPECTIVE |
         D3DPTEXTURECAPS_ALPHA |
         D3DPTEXTURECAPS_TRANSPARENCY |

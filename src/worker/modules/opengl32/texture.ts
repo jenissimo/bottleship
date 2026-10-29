@@ -50,8 +50,15 @@ export function convertPixelsToRGBA8(
     );
 }
 
-/** Base internal format a sized/legacy internal format resolves to (GL 1.x table 3.15). */
-const enum BaseFormat { ALPHA, LUMINANCE, LUMINANCE_ALPHA, INTENSITY, RGB, RGBA }
+/**
+ * Base internal format a sized/legacy internal format resolves to (GL 1.x table 3.15).
+ * The values are also the texel-format code the GL fragment shader receives; RGBA is 0 so
+ * an unwritten uniform means "every component present".
+ */
+export const BaseFormat = {
+    RGBA: 0, RGB: 1, ALPHA: 2, LUMINANCE: 3, LUMINANCE_ALPHA: 4, INTENSITY: 5,
+} as const;
+export type BaseFormat = (typeof BaseFormat)[keyof typeof BaseFormat];
 
 /**
  * The internal format — not the client format — decides which components the texture
@@ -61,7 +68,7 @@ const enum BaseFormat { ALPHA, LUMINANCE, LUMINANCE_ALPHA, INTENSITY, RGB, RGBA 
  *
  * GL 1.0 also allows a bare component COUNT (1/2/3/4) in place of an enum.
  */
-function baseInternalFormat(internalFormat: number): BaseFormat {
+export function baseInternalFormat(internalFormat: number): BaseFormat {
     switch (internalFormat >>> 0) {
         case 1: case GL_LUMINANCE: case GL_LUMINANCE4: case GL_LUMINANCE8:
         case GL_LUMINANCE12: case GL_LUMINANCE16:

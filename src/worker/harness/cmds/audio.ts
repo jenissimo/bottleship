@@ -11,6 +11,8 @@
  */
 
 import type { HarnessService } from "../service";
+import { probeAudio } from "@bottleship/formats/audio";
+import { BufferSource } from "@bottleship/formats/unpack/source";
 import { sys, getModule, symbolize } from "../serialize";
 import { getHostAudioStats, resetHostAudioStats } from "../../worker-handlers/audio-bridge";
 import { CTRL_BLOCK_BYTES } from "../../../audio/audio-ring-buffer";
@@ -302,6 +304,8 @@ export function registerAudioCommands(svc: HarnessService): void {
         const streams: unknown[] = [];
         for (const s of ctx.streams.values()) {
             const src = s.source ?? null;
+            const firstNonzeroByte = s.fileData?.findIndex((byte: number) => byte !== 0) ?? null;
+            const hex = (data: Uint8Array) => Array.from(data, (byte) => byte.toString(16).padStart(2, "0")).join(" ");
             streams.push({
                 id: s.id,
                 handle: s.handle,
@@ -316,6 +320,12 @@ export function registerAudioCommands(svc: HarnessService): void {
                 pcmBytes: s.pcmBytes ?? null,
                 hasCallback: (ctx.streamCallbacks?.get(s.handle) ?? 0) !== 0,
                 wholeFileBytes: s.fileData?.length ?? null,
+                fileHeadHex: s.fileData ? hex(s.fileData.subarray(0, 32)) : null,
+                fileProbe: s.fileData ? probeAudio(new BufferSource(s.fileData)) : null,
+                firstNonzeroByte,
+                firstNonzeroHex: s.fileData && firstNonzeroByte !== null && firstNonzeroByte >= 0
+                    ? hex(s.fileData.subarray(firstNonzeroByte, firstNonzeroByte + 32)) : null,
+                pendingStart: !!s.pendingStart,
                 source: src ? {
                     // Which refill path this stream is on: "vfs" is topped up by the
                     // playback heartbeat, "app" only from the guest's own AIL_serve.
@@ -338,7 +348,7 @@ export function registerAudioCommands(svc: HarnessService): void {
                 ring: pe.describeRing(s.id),
             });
         }
-        return { streams, count: streams.length, engine: { ...eng.streamEngineStats } };
+        return { streams, count: streams.length, fileCallbacks: ctx.fileCallbacks ?? null, engine: { ...eng.streamEngineStats } };
     });
 
     /** mssSamples() — the Miles VOICE pool, per HSAMPLE. The sample-side twin of

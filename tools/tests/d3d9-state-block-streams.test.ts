@@ -30,7 +30,7 @@ import {
     type StreamStateEntry,
 } from "../../src/worker/backends/webgpu/d3d9/d3d9-state-block";
 import { MAX_VERTEX_STREAMS } from "../../src/worker/backends/webgpu/shared/vertex-streams";
-import { getComRefCount, trackComObject } from "../../src/worker/modules/d3d9/com-refs";
+import { forgetComObject, getComRefCount, trackComObject, unpinGuestRefcountStoreForTests } from "../../src/worker/modules/d3d9/com-refs";
 
 /** The device surface the capture/replay uses, over the same flat per-slot shape as
  *  StreamBindingTable. */
@@ -223,31 +223,47 @@ describe("state block: stream entries and the rest of the machinery", () => {
         // reference, so the buffer cannot die under an Apply that is still going to rebind it.
         const vb = 0x5b10_0000;
         const ib = 0x5b10_1000;
-        trackComObject(vb);
-        trackComObject(ib);
-        const data: D3D9StateBlockData = {
-            devicePtr: 0,
-            blockType: D3DSBT_ALL,
-            entries: [
-                { op: "streamSource", stream: 0, vbPtr: vb, offset: 0, stride: 16 },
-                { op: "streamSource", stream: 1, vbPtr: 0, offset: 0, stride: 0 },
-                { op: "indices", ibPtr: ib },
-            ],
-        };
+        // These synthetic pointers have no guest allocation. Own the mirror mode instead
+        // of borrowing whichever guest-memory fixture ran before this test.
+        const flags = globalThis as Record<string, unknown>;
+        const names = ['__d3d9MirrorRefcount', '__d3d9RefcountVerify', '__d3d9InternalBindingRefs'];
+        const previous = names.map(name => flags[name]);
+        unpinGuestRefcountStoreForTests();
+        Object.assign(flags, { __d3d9MirrorRefcount: true, __d3d9RefcountVerify: false, __d3d9InternalBindingRefs: false });
+        try {
+            trackComObject(vb);
+            trackComObject(ib);
+            const data: D3D9StateBlockData = {
+                devicePtr: 0,
+                blockType: D3DSBT_ALL,
+                entries: [
+                    { op: "streamSource", stream: 0, vbPtr: vb, offset: 0, stride: 16 },
+                    { op: "streamSource", stream: 1, vbPtr: 0, offset: 0, stride: 0 },
+                    { op: "indices", ibPtr: ib },
+                ],
+            };
 
-        retainStateBlockRefs(data);
-        expect(getComRefCount(vb)).toBe(2);
-        expect(getComRefCount(ib)).toBe(2);
-        expect(data.retainedRefs).toEqual([vb, ib]); // the unbound slot retains nothing
+            retainStateBlockRefs(data);
+            expect(getComRefCount(vb)).toBe(2);
+            expect(getComRefCount(ib)).toBe(2);
+            expect(data.retainedRefs).toEqual([vb, ib]); // the unbound slot retains nothing
 
-        retainStateBlockRefs(data); // a re-Capture must not stack references
-        expect(getComRefCount(vb)).toBe(2);
+            retainStateBlockRefs(data); // a re-Capture must not stack references
+            expect(getComRefCount(vb)).toBe(2);
 
-        releaseStateBlockRefs(data);
-        expect(getComRefCount(vb)).toBe(1);
-        expect(getComRefCount(ib)).toBe(1);
-        releaseStateBlockRefs(data); // idempotent — Apply/dispose must not double-release
-        expect(getComRefCount(vb)).toBe(1);
+            releaseStateBlockRefs(data);
+            expect(getComRefCount(vb)).toBe(1);
+            expect(getComRefCount(ib)).toBe(1);
+            releaseStateBlockRefs(data); // idempotent — Apply/dispose must not double-release
+            expect(getComRefCount(vb)).toBe(1);
+        } finally {
+            forgetComObject(vb);
+            forgetComObject(ib);
+            names.forEach((name, i) => {
+                if (previous[i] === undefined) delete flags[name];
+                else flags[name] = previous[i];
+            });
+        }
     });
 });
 

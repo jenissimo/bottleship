@@ -8,6 +8,7 @@
 import { Logger, LogCategory } from "../../core/logger";
 import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
 import { System } from "../../core/system";
+import { dibColorMasks } from './bitmap-resolve';
 import { resolveWindowsFontName } from './font-map';
 import { DEFAULT_CHARSET, resolveCharset } from './font-charset';
 import type { GDIContext, GDIObject } from './context';
@@ -251,15 +252,18 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         view.setInt32(lpvObject + 0x20, obj.data.dibTopDown ? -height : height, true);
         view.setUint16(lpvObject + 0x24, 1, true);           // biPlanes
         view.setUint16(lpvObject + 0x26, bitCount, true);    // biBitCount
-        view.setUint32(lpvObject + 0x28, 0, true);           // biCompression = BI_RGB
+        const dibMasks = obj.data.dibMasks as number[] | undefined;
+        view.setUint32(lpvObject + 0x28, dibMasks ? 3 : 0, true); // biCompression: BI_BITFIELDS / BI_RGB
         view.setUint32(lpvObject + 0x2C, stride * height, true); // biSizeImage
         view.setInt32(lpvObject + 0x30, 0, true);            // biXPelsPerMeter
         view.setInt32(lpvObject + 0x34, 0, true);            // biYPelsPerMeter
         view.setUint32(lpvObject + 0x38, palette ? palette.length : 0, true); // biClrUsed
         view.setUint32(lpvObject + 0x3C, 0, true);           // biClrImportant
-        view.setUint32(lpvObject + 0x40, 0, true);           // dsBitfields[0]
-        view.setUint32(lpvObject + 0x44, 0, true);           // dsBitfields[1]
-        view.setUint32(lpvObject + 0x48, 0, true);           // dsBitfields[2]
+        // dsBitfields carry the masks of any DIB deeper than 8 bpp, BI_RGB's included.
+        const masks = bitCount > 8 ? dibColorMasks(bitCount, dibMasks) : [0, 0, 0];
+        view.setUint32(lpvObject + 0x40, masks[0]!, true);   // dsBitfields[0]
+        view.setUint32(lpvObject + 0x44, masks[1]!, true);   // dsBitfields[1]
+        view.setUint32(lpvObject + 0x48, masks[2]!, true);   // dsBitfields[2]
         view.setUint32(lpvObject + 0x4C, 0, true);           // dshSection
         view.setUint32(lpvObject + 0x50, 0, true);           // dsOffset
         Logger.verbose(LogCategory.GDI32, `getObject DIBSECTION(CreateDIBSection): ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bitsPtr.toString(16)}`);
@@ -304,15 +308,18 @@ export function getObject(gdi: GDIContext, hgdiobj: number, cbBuffer: number, lp
         view.setInt32(lpvObject + 0x20, biHeight, true);     // biHeight (sign = orientation)
         view.setUint16(lpvObject + 0x24, 1, true);           // biPlanes
         view.setUint16(lpvObject + 0x26, bitCount, true);    // biBitCount
-        view.setUint32(lpvObject + 0x28, 0, true);           // biCompression = BI_RGB
+        const dibMasks = obj.data.dibMasks as number[] | undefined;
+        view.setUint32(lpvObject + 0x28, dibMasks ? 3 : 0, true); // biCompression: BI_BITFIELDS / BI_RGB
         view.setUint32(lpvObject + 0x2C, stride * height, true); // biSizeImage
         view.setInt32(lpvObject + 0x30, 0, true);            // biXPelsPerMeter
         view.setInt32(lpvObject + 0x34, 0, true);            // biYPelsPerMeter
         view.setUint32(lpvObject + 0x38, obj.data.palette ? (obj.data.palette as Uint32Array).length : 0, true); // biClrUsed
         view.setUint32(lpvObject + 0x3C, 0, true);           // biClrImportant
-        view.setUint32(lpvObject + 0x40, 0, true);           // dsBitfields[0]
-        view.setUint32(lpvObject + 0x44, 0, true);           // dsBitfields[1]
-        view.setUint32(lpvObject + 0x48, 0, true);           // dsBitfields[2]
+        // dsBitfields carry the masks of any DIB deeper than 8 bpp, BI_RGB's included.
+        const masks = bitCount > 8 ? dibColorMasks(bitCount, dibMasks) : [0, 0, 0];
+        view.setUint32(lpvObject + 0x40, masks[0]!, true);   // dsBitfields[0]
+        view.setUint32(lpvObject + 0x44, masks[1]!, true);   // dsBitfields[1]
+        view.setUint32(lpvObject + 0x48, masks[2]!, true);   // dsBitfields[2]
         view.setUint32(lpvObject + 0x4C, 0, true);           // dshSection
         view.setUint32(lpvObject + 0x50, 0, true);           // dsOffset
         Logger.verbose(LogCategory.GDI32, `getObject DIBSECTION: ${width}x${height} ${bitCount}bpp stride=${stride} bmBits=0x${bmBitsPtr.toString(16)}`);

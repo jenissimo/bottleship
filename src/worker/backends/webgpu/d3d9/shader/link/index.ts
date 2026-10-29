@@ -11,6 +11,9 @@
  *   @group(0) @binding(3+n) var texN : texture_2d<f32>     (FRAGMENT)
  */
 
+import { D3D_TRANSFORM_POSITION_WGSL } from "../../../shared/d3d-position";
+import { FFP_VERTEX_LIGHTING_REGISTERS, FFP_VERTEX_LIGHTING_WGSL, emitFixedFunctionVertexLighting,
+    type FixedFunctionVertexLighting } from "./ffp-vertex-lighting";
 import { parseShader, SmProgram } from "../sm-parser";
 import { analyzeVs, emitVsMain, VsAnalysis } from "../emit/vs";
 import { analyzePs, emitPsMain, PsAnalysis, type PsInputBinding } from "../emit/ps";
@@ -215,6 +218,14 @@ export interface LinkOptions {
     clipPlanes?: boolean;
     /** Instance-indexed VS constant transport used by the exact MegaBatch variant. */
     vsConstantMode?: VsConstantMode;
+    /** `vs` is SYNTHESIZED fixed-function vertex processing (a D3D8 declaration-only vertex
+     *  shader paired with a pixel shader). Its position is not the bytecode's oPos but the
+     *  fixed-function transform itself — d3dTransformPosition over c[matrixSlot..+3] (D3D
+     *  rows, pixel centre folded in) — so it is bit-identical to a fixed-function pass over
+     *  the same vertices. */
+    fixedFunctionPosition?: { inputRegister: number; matrixSlot: number } | null;
+    /** Lighting for a synthesized FFP vertex stage paired with a programmable PS. */
+    fixedFunctionLighting?: FixedFunctionVertexLighting | null;
 }
 
 /** WGSL locations for the pre-transformed passthrough vertex stage. Fixed, because there is
@@ -615,7 +626,8 @@ export function linkProgram(opts: LinkOptions): LinkResult {
         }
     }
 
-    const vsConstantCount = vsA.constantCount;
+    const vsConstantCount = Math.max(vsA.constantCount, opts.fixedFunctionLighting
+        ? opts.fixedFunctionLighting.constantSlot + FFP_VERTEX_LIGHTING_REGISTERS : 0);
     const psConstantCount = psA?.constantCount ?? 0;
 
     // ── Assemble module ────────────────────────────────────────────────────
@@ -672,11 +684,26 @@ export function linkProgram(opts: LinkOptions): LinkResult {
     );
     emitter.line("");
 
+    let fixedFunctionPosition: ((vsc: string) => string) | undefined;
+    if (opts.fixedFunctionPosition && !preTransformed) {
+        const { inputRegister, matrixSlot: m } = opts.fixedFunctionPosition;
+        const position = inputExprs.get(inputRegister) ?? "vec4<f32>(0.0, 0.0, 0.0, 1.0)";
+        emitter.line(D3D_TRANSFORM_POSITION_WGSL);
+        emitter.line("");
+        fixedFunctionPosition = (vsc) =>
+            `d3dTransformPosition(mat4x4<f32>(${vsc}.c[${m}], ${vsc}.c[${m + 1}], ${vsc}.c[${m + 2}], ${vsc}.c[${m + 3}]), `
+            + `(${position}).xyz)`;
+    }
+
+    if (opts.fixedFunctionLighting) emitter.line(FFP_VERTEX_LIGHTING_WGSL);
     emitter.line(preTransformed
         ? emitPreTransformedVsMain(interpColors, interpTexcoords, inputExprs,
             preTransformed.viewportWidth, preTransformed.viewportHeight,
             preTransformed.pixelCenterOffset ?? 0.5, needsProgrammableFog)
         : emitVsMain(vs.prog, vsA, {
+            positionOverride: fixedFunctionPosition,
+            lightingOverride: opts.fixedFunctionLighting
+                ? vsc => emitFixedFunctionVertexLighting(opts.fixedFunctionLighting!, inputExprs, vsc) : undefined,
             interpColors,
             interpTexcoords,
             interpFog: needsProgrammableFog,

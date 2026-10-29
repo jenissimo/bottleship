@@ -2,7 +2,7 @@ import type { ThunkImplementation } from '../../core/thunking/thunk-dispatcher';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
-import { VFS_FILETIME } from '../../runtime/filesystem/file-time';
+import { fileTimeOf } from '../../runtime/filesystem/file-time';
 import { readStringA, readStringW } from './file-io-strings';
 
 export function registerFileIoAttributeExports(exports: Record<string, ThunkImplementation>): void {
@@ -22,10 +22,10 @@ export function registerFileIoAttributeExports(exports: Record<string, ThunkImpl
         }
         const size = entry.kind === 'dir' ? 0 : entry.size;
         Mem.writeUint32(output, entry.kind === 'dir' ? 0x10 : 0x20);
-        // Keep every VFS metadata API on the same timestamp until storage records per-file times.
+        const time = fileTimeOf(entry);
         for (let offset = 4; offset < 28; offset += 8) {
-            Mem.writeUint32(output + offset, Number(VFS_FILETIME & 0xffffffffn));
-            Mem.writeUint32(output + offset + 4, Number(VFS_FILETIME >> 32n));
+            Mem.writeUint32(output + offset, Number(time & 0xffffffffn));
+            Mem.writeUint32(output + offset + 4, Number(time >> 32n));
         }
         Mem.writeUint32(output + 28, Math.floor(size / 0x100000000));
         Mem.writeUint32(output + 32, size >>> 0);

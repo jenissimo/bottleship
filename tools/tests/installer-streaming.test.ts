@@ -1,12 +1,14 @@
 import { beforeAll, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { deflateSync, deflateRawSync, gzipSync } from "node:zlib";
 import { deflate } from "pako";
 import { writeZipStream } from "@bottleship/formats/wgb/zip-stream";
 import { BufferSource, ZipArchive } from "@bottleship/formats/zip";
 import { UnpackDecoder, UNPACK_STORE, UNPACK_LZMA1 } from "@bottleship/formats/unpack";
 import { extractInno, type InnoParseResult } from "@bottleship/formats/inno";
 import { CompressionMethod } from "@bottleship/formats/inno/header";
+import { decompressChunkStream } from "@bottleship/formats/inno/chunk-reader";
 import { ExtractionArena, orderInstallerParts } from "../../src/worker/runtime/filesystem/installer-opfs";
 import { writeBytesToFileHandle } from "../../src/save-as";
 
@@ -144,4 +146,69 @@ test("Galaxy segment assembly streams zlib, hashes in file order, and fans out d
     expect([...results.keys()]).toEqual(["data/one.bin", "data/two.bin"]);
     for (const out of results.values()) expect(Buffer.concat(out)).toEqual(expected);
     expect(maxRead).toBeLessThanOrEqual(256 * 1024); expect(closed).toBe(1);
+});
+
+function innoZlibChunk(payload: Uint8Array, declaredSize = payload.length) {
+    const bytes = Buffer.concat([new Uint8Array([0x7a, 0x6c, 0x62, 0x1a]), payload]);
+    const reads: number[] = [];
+    return {
+        chunk: { firstSlice: 0, sortOffset: 0, chunkSize: declaredSize, compression: CompressionMethod.Zlib, encrypted: false },
+        slice: { readSpan(_slice: number, offset: number, length: number) {
+            if (offset >= 4) reads.push(length);
+            return bytes.subarray(offset, offset + length);
+        } },
+        reads,
+    };
+}
+
+test("Inno zlib streams multiple bounded reads and writes using independently compressed data", () => {
+    const data = new Uint8Array(700_000);
+    let seed = 12345;
+    for (let i = 0; i < data.length; i++) {
+        seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+        data[i] = seed & 255;
+    }
+    const input = innoZlibChunk(deflateSync(data));
+    const out: Uint8Array[] = [];
+    decompressChunkStream(input.slice, input.chunk, decoder, bytes => { out.push(bytes.slice()); return true; });
+    expect(Buffer.concat(out)).toEqual(Buffer.from(data));
+    expect(input.reads.length).toBeGreaterThan(1);
+    expect(Math.max(...input.reads)).toBeLessThanOrEqual(256 * 1024);
+    expect(Math.max(...out.map(bytes => bytes.length))).toBeLessThanOrEqual(256 * 1024);
+});
+
+test("Inno zlib refuses missing headers, truncated data, bad checksums and short reads", () => {
+    const packed = deflateSync(new Uint8Array(700_000).fill(42));
+    for (const size of [0, 1, 2, packed.length - 16, packed.length - 4, packed.length - 1]) {
+        const input = innoZlibChunk(packed.subarray(0, size));
+        expect(() => decompressChunkStream(input.slice, input.chunk, decoder, () => true)).toThrow("truncated zlib chunk");
+    }
+    const corrupt = packed.slice();
+    corrupt[corrupt.length - 1]! ^= 1;
+    const bad = innoZlibChunk(corrupt);
+    expect(() => decompressChunkStream(bad.slice, bad.chunk, decoder, () => true)).toThrow("zlib decode failed");
+    const short = innoZlibChunk(packed, packed.length + 1);
+    expect(() => decompressChunkStream(short.slice, short.chunk, decoder, () => true)).toThrow("truncated chunk payload");
+});
+
+test("Inno zlib requires a zlib wrapper and accepts an empty decoded stream", () => {
+    const data = new Uint8Array([1, 2, 3]);
+    for (const packed of [gzipSync(data), deflateRawSync(data)]) {
+        const input = innoZlibChunk(packed);
+        expect(() => decompressChunkStream(input.slice, input.chunk, decoder, () => true)).toThrow("zlib decode failed");
+    }
+    const empty = innoZlibChunk(deflateSync(new Uint8Array(0)));
+    let written = 0;
+    decompressChunkStream(empty.slice, empty.chunk, decoder, bytes => { written += bytes.length; return true; });
+    expect(written).toBe(0);
+});
+
+test("Inno zlib stops on a rejected output block and propagates sink errors", () => {
+    const input = innoZlibChunk(deflateSync(new Uint8Array(2_000_000)));
+    let calls = 0;
+    expect(() => decompressChunkStream(input.slice, input.chunk, decoder, () => { calls++; return false; })).toThrow("aborted");
+    expect(calls).toBe(1);
+    expect(input.reads.length).toBe(1);
+    const failure = new Error("Disk full");
+    expect(() => decompressChunkStream(input.slice, input.chunk, decoder, () => { throw failure; })).toThrow(failure);
 });

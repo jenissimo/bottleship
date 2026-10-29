@@ -542,6 +542,15 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         return this.shaders.isProgrammable();
     }
 
+    /** Whether a draw runs through the programmable link: a compiled vertex shader, or a
+     *  declaration-only one paired with a pixel shader, whose fixed-function vertex stage
+     *  the link receives synthesized (D3D8ProgrammableRenderer.resolveFfpVertexStage). */
+    private usesProgrammableLink(): boolean {
+        if (!this.programmable) return false;
+        return this.shaders.isProgrammable()
+            || this.programmable.resolveFfpVertexStage(this, this.shaders) !== null;
+    }
+
     isDeclOnly(): boolean {
         return this.shaders.isDeclOnly();
     }
@@ -717,6 +726,15 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             return this.syntheticDeclStride;
         }
         return this.getSourceStride(activeFvf);
+    }
+
+    /** Stream-0 stride on the programmable link, which reads every stream in place. A
+     *  declaration-only shader's synthetic stride describes the fixed-function interleave
+     *  target instead, so it does not apply there. */
+    private resolveProgrammableStride(activeFvf: number): number {
+        if (!this.shaders.isDeclOnly()) return this.resolveDrawStride(activeFvf);
+        const stride = this.streamSources[0].stride;
+        return stride > 0 ? stride : (this.declStreamStrides[0] ?? 0);
     }
 
     private updateDeclOnlyMapping(): void {
@@ -1566,6 +1584,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                 minZ: this.viewport.minZ ?? 0, maxZ: this.viewport.maxZ ?? 1,
             },
             lighting: this.getFFPLightingState(),
+            pixelShader: this.pixelShaderHandle,
             executionDiagnostics: (this.renderer as any).getLastDrawDiagnostics?.() ?? null,
         });
     }
@@ -1789,7 +1808,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.bakeTexturePalettes();
         const vertexCount = primCountToVertexCount(primitiveType, primitiveCount);
         this.noteDrawForDebug(primitiveType, vertexCount);
-        if (this.isDeclOnly() && this.declInterleave) {
+        const programmableLink = this.usesProgrammableLink();
+        if (!programmableLink && this.isDeclOnly() && this.declInterleave) {
             return this.drawDeclInterleavedFFP(primitiveType, startVertex, vertexCount);
         }
         const vb = this.vbData.get(this.streamSources[0].vb);
@@ -1799,7 +1819,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         }
 
         const activeFvf = this.resolveDrawFVF(vb.fvf);
-        const sourceStride = this.resolveDrawStride(activeFvf);
+        const sourceStride = programmableLink
+            ? this.resolveProgrammableStride(activeFvf)
+            : this.resolveDrawStride(activeFvf);
         if (sourceStride <= 0) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 DrawPrimitive: invalid source stride=${sourceStride} fvf=0x${activeFvf.toString(16)}`);
             return 0x8876086c;
@@ -1816,7 +1838,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
         const mem = this.getMemoryView();
 
-        if (this.isProgrammable() && this.programmable) {
+        if (this.programmable && programmableLink) {
             if (this.renderer.scrubDraw()) return 0;
             const gpuBuffer = this.uploadVb(this.streamSources[0].vb, vb.guestPtr, vb.size, mem);
             if (!gpuBuffer) return 0x8876086c;
@@ -1847,6 +1869,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     baseVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
                 this.programmable.getCommandRecorder().registerPooledBuffer(ibGpu);
             } else {
@@ -1859,6 +1882,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     startVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
             }
             this.drawDiagLog("DP-prog", vb.guestPtr + vertexByteOffset, vertexCount, sourceStride, activeFvf);
@@ -1899,7 +1923,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.bakeTexturePalettes();
         const vertexCount = primCountToVertexCount(primitiveType, primitiveCount);
         this.noteDrawForDebug(primitiveType, vertexCount);
-        if (this.isDeclOnly() && this.declInterleave) {
+        const programmableLink = this.usesProgrammableLink();
+        if (!programmableLink && this.isDeclOnly() && this.declInterleave) {
             // UP data feeds stream 0; streams ≥ 1 keep their SetStreamSource bindings.
             const s0 = stride > 0 ? stride : (this.declStreamStrides[0] ?? 0);
             if (s0 <= 0) return 0x8876086c;
@@ -1909,15 +1934,15 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const activeFvf = this.isDeclOnly()
             ? this.syntheticDeclFvf
             : (this.shaders.activeVsHandle !== 0 ? this.fvf : this.getActiveVertexToken());
-        const effectiveStride = this.isDeclOnly() && this.syntheticDeclStride > 0
-            ? this.syntheticDeclStride
-            : stride;
+        const effectiveStride = !this.isDeclOnly() ? stride
+            : programmableLink ? (stride > 0 ? stride : (this.declStreamStrides[0] ?? 0))
+            : this.syntheticDeclStride > 0 ? this.syntheticDeclStride : stride;
         if (activeFvf === 0) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 DrawPrimitiveUP: no valid FVF for active vertex shader token=0x${this.getActiveVertexToken().toString(16)}`);
             return 0x8876086c;
         }
 
-        if (this.isProgrammable() && this.programmable) {
+        if (this.programmable && programmableLink) {
             if (this.renderer.scrubDraw()) return 0;
             const device = this.getGpuDevice();
             if (!device) return 0x8876086c;
@@ -1956,6 +1981,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     baseVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
                 this.programmable.getCommandRecorder().registerPooledBuffer(ibGpu);
             } else {
@@ -1968,6 +1994,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     startVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
             }
             return 0;
@@ -2006,7 +2033,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         this.bakeTexturePalettes();
         const indexCount = primCountToVertexCount(primitiveType, primitiveCount);
         this.noteDrawForDebug(primitiveType, numVertices, indexCount);
-        if (this.isDeclOnly() && this.declInterleave) {
+        const programmableLink = this.usesProgrammableLink();
+        if (!programmableLink && this.isDeclOnly() && this.declInterleave) {
             return this.drawIndexedDeclInterleavedFFP(primitiveType, minIndex, numVertices, startIndex, indexCount);
         }
         const vb = this.vbData.get(this.streamSources[0].vb);
@@ -2017,7 +2045,9 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         }
 
         const activeFvf = this.resolveDrawFVF(vb.fvf);
-        const sourceStride = this.resolveDrawStride(activeFvf);
+        const sourceStride = programmableLink
+            ? this.resolveProgrammableStride(activeFvf)
+            : this.resolveDrawStride(activeFvf);
         if (sourceStride <= 0) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 DrawIndexedPrimitive: invalid source stride=${sourceStride} fvf=0x${activeFvf.toString(16)}`);
             return 0x8876086c;
@@ -2048,7 +2078,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
         const mem = this.getMemoryView();
 
-        if (this.isProgrammable() && this.programmable) {
+        if (this.programmable && programmableLink) {
             if (this.renderer.scrubDraw()) return 0;
             const vbGpu = this.uploadVb(this.streamSources[0].vb, vb.guestPtr, vb.size, mem);
             const ibGpu = this.uploadIb(this.indexIB, ib.guestPtr, ib.size, mem);
@@ -2089,6 +2119,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     baseVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
                 this.programmable.getCommandRecorder().registerPooledBuffer(fanIbGpu);
             } else {
@@ -2104,6 +2135,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     baseVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
             }
             return 0;
@@ -2161,7 +2193,8 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const minIndex = minVertexIndex >>> 0;
         const vertexRangeCount = minIndex + (numVertices >>> 0);
 
-        if (this.isDeclOnly() && this.declInterleave) {
+        const programmableLink = this.usesProgrammableLink();
+        if (!programmableLink && this.isDeclOnly() && this.declInterleave) {
             const s0 = stride > 0 ? stride : (this.declStreamStrides[0] ?? 0);
             if (s0 <= 0) return 0x8876086c;
             return this.drawIndexedDeclInterleavedFFP(
@@ -2175,15 +2208,15 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         const activeFvf = this.isDeclOnly()
             ? this.syntheticDeclFvf
             : (this.shaders.activeVsHandle !== 0 ? this.fvf : this.getActiveVertexToken());
-        const effectiveStride = this.isDeclOnly() && this.syntheticDeclStride > 0
-            ? this.syntheticDeclStride
-            : stride;
+        const effectiveStride = !this.isDeclOnly() ? stride
+            : programmableLink ? (stride > 0 ? stride : (this.declStreamStrides[0] ?? 0))
+            : this.syntheticDeclStride > 0 ? this.syntheticDeclStride : stride;
         if (activeFvf === 0 || effectiveStride <= 0) {
             Logger.warn(LogCategory.SYSTEM, `D3D8 DrawIndexedPrimitiveUP: no valid FVF/stride for token=0x${this.getActiveVertexToken().toString(16)}`);
             return 0x8876086c;
         }
 
-        if (this.isProgrammable() && this.programmable) {
+        if (this.programmable && programmableLink) {
             if (this.renderer.scrubDraw()) return 0;
             const device = this.getGpuDevice();
             if (!device) return 0x8876086c;
@@ -2236,6 +2269,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     baseVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
                 this.programmable.getCommandRecorder().registerPooledBuffer(fanIbGpu);
             } else {
@@ -2251,6 +2285,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
                     baseVertex: 0,
                     bindStateIndex,
                     extraStreams: extraStreams.length > 0 ? extraStreams : undefined,
+                    viewport: this.programmable.drawViewport(this),
                 });
             }
             return 0;
@@ -2310,6 +2345,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
         // primary), so it paces on the interval the device declared, exactly like d3d9.
         await framePacer.waitForPresentInterval(this.presentInterval);
         framePacer.reserveFrameSlot();
+        let detachedDrawEncoder: GPUCommandEncoder | null = null;
 
         try {
             this.flushProgrammablePending();
@@ -2325,6 +2361,13 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             const device = webgpu.getDevice();
             const queue = webgpu.getQueue();
             const context = webgpu.getContext();
+            // LockRect/UnlockRect and CopyRects can write the backbuffer on the CPU
+            // without any subsequent primitive draw (native video players do this).
+            // Present must sample the current frame, not the previous GPU copy.
+            // The executor's authority/version check leaves GPU-authored frames alone.
+            if (device && queue && context) {
+                this.renderer.syncSurfaceFromMemory(this.renderTarget);
+            }
             const sourceView = this.renderTarget.gpuTextureView;
             if (!device || !queue || !context || !sourceView) {
                 Logger.warn(
@@ -2353,6 +2396,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             // Two submits (endFrameForPresent then drawTexture) can flicker: the
             // compositor may read the swap-chain texture between submits.
             const drawEncoder = this.renderer.finalizePendingDraws();
+            detachedDrawEncoder = drawEncoder;
 
             // GPU error scopes for first 10 frames
             const useErrorScopes = this.presentCount < 10;
@@ -2430,7 +2474,7 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
             // Post-submit cleanup: rotate ring buffers, destroy pending resources
             this.renderer.sampleFrameStats(); // per-frame draw/skip/ring-HW ring (dbg.fstats)
             this.renderer.ringBufferManager.nextFrame();
-            this.renderer.postSubmitCleanup();
+            this.renderer.postSubmitCleanup(encoder);
 
             // Pop error scopes and log any GPU errors
             if (useErrorScopes) {
@@ -2480,6 +2524,11 @@ export class D3D8DeviceAdapter implements RenderActive, FFPLightingSource {
 
             return 0;
         } finally {
+            // finalizePendingDraws transfers ownership out of the renderer. Any
+            // subsequent swapchain/draw/finish/submit failure abandons that exact
+            // encoder; retire its clear uniforms even before post-submit cleanup.
+            // Normal submission already retired them, so this is idempotent.
+            if (detachedDrawEncoder) this.renderer.discardPendingDraws(detachedDrawEncoder);
             profiler.end("present");
             frameProfiler.endTimer("present", presentStart);
             frameProfiler.markFrame("d3d8");

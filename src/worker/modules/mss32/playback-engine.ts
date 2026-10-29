@@ -198,9 +198,9 @@ export function startStreamingRing(ctx: MSSContext, stream: MSSStream): void {
     setCtrl(sab, CTRL_VOLUME, volumeToCentibels(mixedVolume127(ctx, stream.volume)));
     setCtrl(sab, CTRL_PAN, panToCentibels(stream.pan));
     setCtrl(sab, CTRL_FREQUENCY, stream.playbackRateHz || Math.round(stream.sampleRate * stream.playbackRate));
-    // A streaming ring never "ends" on its own — the engine decides when the source
-    // is exhausted, so loop mode must not make the worklet stop at the ring's end.
-    setCtrl(sab, CTRL_LOOP_MODE, -1);
+    // FLAG_STREAMING wraps the ring; source loops are handled by the producer.
+    // The consumer must hold at WRITE_CURSOR instead of replaying unwritten data.
+    setCtrl(sab, CTRL_LOOP_MODE, 1);
     setCtrl(sab, CTRL_STATE, STATE_PLAYING);
 
     stream.isPlaying = true;
@@ -228,7 +228,7 @@ export function incrementalStreamPosition(stream: MSSStream): number {
         : 0;
     const played = Math.max(0, src.framesDecoded - buffered);
     const total = src.totalFrames > 0 ? src.totalFrames : 0;
-    const frame = total > 0 ? played % total : played;
+    const frame = total > 0 ? (src.exhausted ? Math.min(played, total) : played % total) : played;
     return Math.floor(frame) * Math.max(1, stream.channels) * 2;
 }
 

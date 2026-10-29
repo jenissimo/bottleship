@@ -6,6 +6,7 @@
  */
 
 import { WebGPUBackend } from "../webgpu-backend";
+import { countingFragment, PreciseOcclusion } from "./precise-occlusion";
 import { RenderFrame, RenderCommandType, ProgrammableDrawState, FfpDrawState, type ArenaDrawBinding } from "../render-frame";
 import { Logger, LogCategory } from "../../../core/logger";
 import { recordGpuError } from "../../../core/gpu-error-log";
@@ -551,6 +552,37 @@ interface PassRingEntry {
 export class D3D9BackendExecutor {
     private backend: WebGPUBackend;
     private pipelines: GPURenderPipeline[] = [];
+    retireCountedQuery(id: number): void {
+        this.preciseOcclusion?.active.delete(id);
+        this.preciseOcclusion?.retire(id);
+    }
+    private countingRecipes = new Map<number, { descriptor: GPURenderPipelineDescriptor; source: string }>();
+    private countingPipelines = new Map<string, number>();
+    private preciseOcclusion: PreciseOcclusion | null = null;
+
+    private countingPipeline(id: number, location: number, device: GPUDevice): number {
+        const key = id + ':' + location;
+        const existing = this.countingPipelines.get(key);
+        if (existing !== undefined) return existing;
+        const recipe = this.countingRecipes.get(id);
+        if (!recipe) throw new Error('Missing query pipeline recipe');
+        const module = device.createShaderModule({code:countingFragment(recipe.source, location)});
+        const descriptor = recipe.descriptor;
+        const targets = Array.from(descriptor.fragment!.targets);
+        while (targets.length < location) targets.push(null);
+        if (targets.length !== location) throw new Error('Query attachment overlaps a color target');
+        const pipeline = device.createRenderPipeline({...descriptor,
+            fragment: {...descriptor.fragment!, module, targets:[...targets,
+                {format:'r32float',writeMask:GPUColorWrite.RED,
+                blend:{color:{srcFactor:'one',dstFactor:'one',operation:'add'},
+                       alpha:{srcFactor:'one',dstFactor:'one',operation:'add'}}}]},
+        });
+        const variantId = this.pipelines.length;
+        this.pipelines.push(pipeline);
+        this.pipelineInfo.push({...this.pipelineInfo[id]!,pipeline});
+        this.countingPipelines.set(key,variantId);
+        return variantId;
+    }
     private pipelineInfo: PipelineInfo[] = [];
     /** Full canonical arena identities are registered alongside pipelines. The compact
      * Rust hash is only a bucket; this map lets the executor independently resolve the
@@ -1046,6 +1078,10 @@ export class D3D9BackendExecutor {
         this.renderBundlePsBuffer = null;
         this.pipelines = [];
         this.pipelineInfo = [];
+        this.countingRecipes.clear();
+        this.countingPipelines.clear();
+        this.preciseOcclusion?.destroy();
+        this.preciseOcclusion = null;
         this.arenaPipelinesByIdentity.clear();
         this.currentPipelineId = null;
         this.bindGroupCache.clear();
@@ -1144,9 +1180,11 @@ export class D3D9BackendExecutor {
         attrEnds: number[] = [],
         arenaIdentity?: string,
         ffpCubeMask = 0,
+        countingRecipe?: { descriptor: GPURenderPipelineDescriptor; source: string },
     ): number {
         const id = this.pipelines.length;
         this.pipelines.push(pipeline);
+        if (countingRecipe) this.countingRecipes.set(id, countingRecipe);
         this.pipelineInfo.push({ pipeline, hasTexture, programmable, ffpStageCount, ffpCubeMask, strides, attrEnds });
         if (programmable && arenaIdentity !== undefined) {
             this.arenaPipelinesByIdentity.set(arenaIdentity, id);
@@ -3404,9 +3442,11 @@ export class D3D9BackendExecutor {
 
             // Create command encoder
             const encoder = device.createCommandEncoder();
+            let hasQuery = (this.preciseOcclusion?.active.size ?? 0) > 0;
+            for (let i=0;!hasQuery && i<frame.commandCount;i++) hasQuery = frame.commandTypes[i] === RenderCommandType.BeginOcclusionQuery;
             // WBUF pair-runs are arena-authoritative commands even when the broader per-draw
             // identity bypass is disabled, so MegaBatch is not gated on d3dWasmPath.
-            const megaBatchPlans = this.megaBatchEnabled() && frame.arenaIndexedRuns.length > 0
+            const megaBatchPlans = !hasQuery && this.megaBatchEnabled() && frame.arenaIndexedRuns.length > 0
                 ? this.prepareMegaBatchRuns(frame, device, queue)
                 : new Map<number, MegaBatchRunPlan>();
             // Recorder emits SetPipeline(normal) before each compact arena run. A successful
@@ -3612,10 +3652,24 @@ export class D3D9BackendExecutor {
             const bundleColorFormats = passMultisample
                 ? [passMultisample.colorFormat]
                 : (target?.colorFormats ?? [this.backend.getFormat()!]);
-            const renderBundleSegments = this.prepareRenderBundleSegments(
+            const renderBundleSegments = hasQuery ? new Map() : this.prepareRenderBundleSegments(
                 frame, device, bundleColorFormats, depthFormat, passMultisample?.sampleCount ?? 1,
                 megaBatchFusedDrawSkips,
             );
+            let countingTexture: GPUTexture | null = null;
+            let countingIds: number[] = [];
+            const countingLocation = passMultisample ? 1 : colorAttachments.length;
+            if (hasQuery && device.features.has('float32-blendable' as GPUFeatureName)) {
+                this.preciseOcclusion ??= new PreciseOcclusion(device);
+                for (let i=0;i<frame.commandCount;i++) if (frame.commandTypes[i]===RenderCommandType.BeginOcclusionQuery)
+                    this.preciseOcclusion.begin(frame.commandA[i] >>> 0);
+                countingIds = [...this.preciseOcclusion.active];
+                if (countingIds.length > 0) {
+                    const firstColor = passMultisample?.colorTexture ?? target?.colorSources?.find(t=>t)?.texture ?? this.offscreenTexture!;
+                    countingTexture = this.preciseOcclusion.target(padded?.depthExtent?.width ?? firstColor.width,padded?.depthExtent?.height ?? firstColor.height,passMultisample?.sampleCount ?? 1);
+                    colorAttachments.push({view:countingTexture.createView(),loadOp:'clear',storeOp:'store',clearValue:{r:0,g:0,b:0,a:0}});
+                }
+            }
 
             const renderPass = passMultisample
                 ? beginD3D9MultisampleRenderPass(encoder, passMultisample, {
@@ -3626,6 +3680,7 @@ export class D3D9BackendExecutor {
                      stencilLoadOp: (frame.hasClear && (frame.clear.flags & 4) !== 0) ? "clear" : "load",
                      clearStencil: frame.clear.stencil,
                      occlusionQuerySet,
+                     extraColorAttachments: countingTexture ? [{view:countingTexture.createView(),loadOp:'clear',storeOp:'store',clearValue:{r:0,g:0,b:0,a:0}}] : undefined,
                  })
                  : encoder.beginRenderPass({
                      colorAttachments,
@@ -3712,14 +3767,16 @@ export class D3D9BackendExecutor {
                         const id = frame.commandA[i] >>> 0;
                         // passScale: the interval counts PHYSICAL samples, and D3D9 owes the
                         // guest a count in its own pixels.
-                        if (queryManager) queryManager.beginOcclusion(id, renderPass, undefined, passScale);
+                        if (countingTexture) queryManager?.beginCountedOcclusion(id, passScale);
+                        else if (queryManager) queryManager.beginOcclusion(id, renderPass, undefined, passScale);
                         queryIds.push(id);
                         break;
                     }
 
                     case RenderCommandType.EndOcclusionQuery: {
                         const id = frame.commandA[i] >>> 0;
-                        if (queryManager) queryManager.endOcclusion(id, renderPass);
+                        if (countingTexture) queryManager?.endCountedOcclusion(id);
+                        else if (queryManager) queryManager.endOcclusion(id, renderPass);
                         queryIds.push(id);
                         break;
                     }
@@ -3746,7 +3803,8 @@ export class D3D9BackendExecutor {
                             this.metrics.megaBatchNormalPipelineSkips++;
                             break;
                         }
-                        const newPipelineId = frame.commandA[i];
+                        const originalPipelineId = frame.commandA[i];
+                        const newPipelineId = countingTexture ? this.countingPipeline(originalPipelineId,countingLocation,device) : originalPipelineId;
                         const pipeline = this.pipelines[newPipelineId];
                         if (!pipeline) {
                             // An invalid pipeline id is draw-local input corruption. Keep
@@ -3860,8 +3918,9 @@ export class D3D9BackendExecutor {
                             this.boundVbSize[0] = up.size;
                         }
                         if (arenaUsable && this.currentPipelineId !== arenaBinding!.pipelineId) {
-                            const arenaPipeline = this.pipelines[arenaBinding!.pipelineId]!;
-                            this.currentPipelineId = arenaBinding!.pipelineId;
+                            const variantId = countingTexture ? this.countingPipeline(arenaBinding!.pipelineId,countingLocation,device) : arenaBinding!.pipelineId;
+                            const arenaPipeline = this.pipelines[variantId]!;
+                            this.currentPipelineId = variantId;
                             renderPass.setPipeline(arenaPipeline);
                             this.resetRenderPassBindCache();
                             this.metrics.pipelineSets++;
@@ -3911,8 +3970,9 @@ export class D3D9BackendExecutor {
                             }
                         }
                         if (arenaUsable && this.currentPipelineId !== arenaBinding!.pipelineId) {
-                            const arenaPipeline = this.pipelines[arenaBinding!.pipelineId]!;
-                            this.currentPipelineId = arenaBinding!.pipelineId;
+                            const variantId = countingTexture ? this.countingPipeline(arenaBinding!.pipelineId,countingLocation,device) : arenaBinding!.pipelineId;
+                            const arenaPipeline = this.pipelines[variantId]!;
+                            this.currentPipelineId = variantId;
                             renderPass.setPipeline(arenaPipeline);
                             this.resetRenderPassBindCache();
                             this.metrics.pipelineSets++;
@@ -3994,7 +4054,7 @@ export class D3D9BackendExecutor {
                                 this.metrics.megaBatchFusedOrdinaryDraws++;
                             }
                             if (megaBatchRestoreNormal.has(frame.commandA[i] >>> 0)) {
-                                const normalPipeline = this.pipelines[run.pipelineId];
+                                const normalPipeline = this.pipelines[countingTexture ? this.countingPipeline(run.pipelineId,countingLocation,device) : run.pipelineId];
                                 if (normalPipeline) {
                                     renderPass.setPipeline(normalPipeline);
                                     this.metrics.pipelineSets++;
@@ -4010,7 +4070,7 @@ export class D3D9BackendExecutor {
                             }
                             break;
                         }
-                        const runPipeline = this.pipelines[run.pipelineId];
+                        const runPipeline = this.pipelines[countingTexture ? this.countingPipeline(run.pipelineId,countingLocation,device) : run.pipelineId];
                         if (!runPipeline) {
                             this.arenaDrainStats.arenaRunInvariantFailures++;
                             (globalThis as { __noD3D9ArenaRuns?: boolean }).__noD3D9ArenaRuns = true;
@@ -4262,6 +4322,12 @@ export class D3D9BackendExecutor {
 
             queryManager?.closeOcclusionPass(renderPass);
             renderPass.end();
+            if (countingTexture) {
+                for (const id of countingIds) this.preciseOcclusion!.reduce(encoder,countingTexture,id);
+                for (let i=0;i<frame.commandCount;i++) if(frame.commandTypes[i]===RenderCommandType.EndOcclusionQuery)
+                    this.preciseOcclusion!.active.delete(frame.commandA[i] >>> 0);
+                // Resources are retired only after queue.submit has captured their uses.
+            }
             if (padded) this.depthColorPadding.restore(encoder,padded.colorSources!,
                 padded.depthExtent!.width,padded.depthExtent!.height);
             if (queryManager && querySubmissionSerial !== undefined && queryIds.length > 0) {
@@ -4269,6 +4335,7 @@ export class D3D9BackendExecutor {
                     encoder as unknown as QueryCommandEncoder,
                     [...new Set(queryIds)],
                     querySubmissionSerial,
+                    countingTexture ? this.preciseOcclusion!.results() : undefined,
                 );
             }
 
@@ -4321,6 +4388,10 @@ export class D3D9BackendExecutor {
             if (present) { this.presentCount++; this.censusPresents++; }
             const submitT0 = performance.now();
             queue.submit([encoder.finish()]);
+            if (countingTexture) {
+                countingTexture.destroy();
+                for (const id of countingIds) if(!this.preciseOcclusion!.active.has(id)) this.preciseOcclusion!.retire(id);
+            }
             this.submitMs += performance.now() - submitT0;
             this.d3d9MsaaCache?.flushGarbage();
             if (queryManager && queryBatch?.status === "encoded") {
@@ -5268,8 +5339,13 @@ struct VsOut { @builtin(position) position: vec4<f32> };
         const canvas = this.getCanvasSize();
         const gw = Math.max(1, guest.width | 0);
         const gh = Math.max(1, guest.height | 0);
+        const requestedScale = EmulatorConfig.getInstance().quality.internalScale;
+        // D3D9 exposes its raster sample grid through occlusion queries. Auto must retain
+        // that guest grid: fractional supersampling followed by area normalization changes
+        // coverage at triangle edges. Fixed 2x/4x remain explicit quality enhancements.
         let scale = resolveInternalScaleFactor(
-            EmulatorConfig.getInstance().quality.internalScale, gw, gh, canvas.width, canvas.height,
+            requestedScale === 0 ? 1 : requestedScale,
+            gw, gh, canvas.width, canvas.height,
         );
         const maxDim = device.limits.maxTextureDimension2D;
         // A high guest mode times the factor can exceed the device limit; texture creation

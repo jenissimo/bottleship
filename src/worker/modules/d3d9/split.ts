@@ -50,6 +50,7 @@ export interface SplitRemote {
     /** The worker's GPUDevice: the loss source of every front it renders for. */
     readonly gpuLifecycle: RemoteGpuLifecycle;
     timestampQuerySupported(): boolean;
+    occlusionQuerySupported?(): boolean;
 }
 
 /** Where a remote twin's frames land on this worker (render/d3d9-render-client.ts). */
@@ -451,6 +452,7 @@ class SplitStream {
             this.recordTwinCall(front, "twinQuery", [name, queryPtr >>> 0, arg >>> 0]);
         return {
             timestampSupported: () => remote.timestampQuerySupported(),
+            occlusionSupported: () => remote.occlusionQuerySupported?.() ?? true,
             create: (queryPtr, type) => { if (!op("create", queryPtr, type)) table.counters.unrecorded++; },
             begin: (queryPtr, previous) => {
                 table.forget(previous);

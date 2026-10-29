@@ -32,6 +32,7 @@
  *   --cd-label <str>      Override the volume label D: reports
  *   --disc-dirs           Keep each disc in its own rom/discN/ subtree
  *   --list                Parse + list disc contents, do not pack
+ *   --allow-msi-hash-mismatch  Keep source bytes when MSI hashes are stale; print each mismatch
  */
 
 import { openSync, readSync, writeSync, closeSync, statSync, existsSync, mkdirSync, readFileSync } from "fs";
@@ -439,12 +440,13 @@ async function extractInstallerFromDisc(): Promise<{ files: Map<string, Uint8Arr
         const isCab = is.stem != null && /\.(hdr|cab)$/i.test(base);
         const isExe = base.endsWith(".exe");
         const isIni = base === "setup.ini";
+        const isMsi = base.endsWith(".msi");
         let isArc = false;
         if (/\.(pak|arc|bin)$/i.test(base)) {
             const h = it.disc.image.readExtent(it.entry.lba, 4);
             isArc = h[0] === 0x41 && h[1] === 0x72 && h[2] === 0x43 && h[3] === 0x01; // "ArC\x01"
         }
-        if (!(isCab || isArc || isIni || (isExe && !is.stem))) continue;
+        if (!(isCab || isArc || isIni || isMsi || (isExe && !is.stem))) continue;
         if (isExe && it.entry.size > 256 * 1024 * 1024) continue; // too big to be an installer header
         installerFiles.set(it.romPath, readPackItem(it));
         if (isArc || (isExe && !is.stem)) needWasm = true; // Inno + FreeArc both use the LZMA WASM
@@ -471,6 +473,13 @@ async function extractInstallerFromDisc(): Promise<{ files: Map<string, Uint8Arr
             const hit = packItems.find(
                 (p) => (p.romPath.split("/").pop() ?? p.romPath).toLowerCase() === lc && p.entry.size === size,
             );
+            return hit ? readPackItem(hit) : null;
+        },
+        onMsiHashMismatch: has("--allow-msi-hash-mismatch")
+            ? (path, expected, actual) => console.warn(`MSI hash mismatch: ${path} expected=${expected} actual=${actual}; keeping source bytes`)
+            : undefined,
+        resolveInstallerFile: (path) => {
+            const hit = packItems.find(p => p.romPath.toLowerCase() === path.toLowerCase());
             return hit ? readPackItem(hit) : null;
         },
         onProgress: (pct, label) => {

@@ -5,7 +5,7 @@ BottleShip targets native Win32 games of roughly **1997–2004** — the DirectD
 not exhaustive, and "runs" means different things at different stages (boots to menu vs. fully
 playable). Your mileage will vary with the exact build/version you own.
 
-Updated **2026-10-08** for **BottleShip 0.7**. Working statuses include maintainer reports; every title has not
+Updated **2026-10-26** for **BottleShip 0.7**. Working statuses include maintainer reports; every title has not
 been retested for this release. Observed demo stages are listed separately below. Successful
 GOG extraction does not establish gameplay coverage for that installer edition.
 
@@ -42,7 +42,8 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Unreal Tournament (demo) | playable | |
 | Quake II | playable | ✓ |
 | Half-Life: Uplink / Day One (demos) | playable | |
-| Half-Life 2 | boots | |
+| Half-Life 2 (20th Anniversary) | playable | |
+| Empires: Dawn of the Modern World (2003, GOG) | boots | ✓ |
 | Red Faction | playable | ✓ |
 | Grand Theft Auto III | playable | |
 | Grand Theft Auto: Vice City | playable | |
@@ -53,6 +54,7 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | American McGee's Alice | playable | |
 | Gothic | playable | ✓ |
 | Command & Conquer: Tiberian Sun | playable | |
+| Command & Conquer: Red Alert 3 | playable | |
 | Cossacks: European Wars | playable | ✓ |
 | Worms: Armageddon | playable | ✓ |
 | Discworld Noir | playable | |
@@ -60,9 +62,13 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Tomb Raider II | playable | ✓ |
 | The Elder Scrolls III: Morrowind | playable | ✓ |
 | Nuclear Titbit (Ядерный Титбит) | playable | |
+| Neighbours from Hell (2003, Buka/Russian) | boots; tutorial movement verified | |
 | Airfix Dogfighter (demo) | playable | |
 | The Blackwell Legacy | playable | ✓ |
 | Sea Dogs | playable | ✓ |
+| Sid Meier's Pirates! (2004) | playable | ✓ |
+| Deus Ex: Game of the Year Edition | playable | ✓ |
+| The Longest Journey | playable | ✓ |
 | Overboard! / Shipwreckers! (demo) | playable | |
 | House of 1000 Doors: Family Secrets | playable | |
 | Natalie Brooks: Secrets of Treasure House | playable | |
@@ -79,8 +85,24 @@ GOG extraction does not establish gameplay coverage for that installer edition.
 | Serious Sam: The First Encounter (Classic) | playable | ✓ |
 | KKND2: Krossfire | playable | ✓ |
 | Painkiller Black Edition | playable | ✓ |
+| Empire Earth (2.00, single player) | playable‡ | |
+| Empire Earth: The Art of Conquest (1.00, single player) | playable‡ | |
 
 \* retail has an intermittent mode-switch hiccup; the demo does not.
+
+‡ Single player only, checked 2026-10-21 with the unmodified Empire Earth 2.00
+(v2.00.3466) and The Art of Conquest 1.00 (v1.00.2657) game files: the first Learning
+Scenario's lit world, unit selection and movement, native saving, Quit to the post-game
+statistics, and loading the save in a fresh worker (Empire Earth also after a full browser
+restart). Multiplayer is not covered.
+`tools/harness/regression/empire-earth-single-player.harness.ts` re-checks that path for
+either game (`EE_ROOT` names the install folder). Bundles were packed
+with `tools/make-wgb.ts` from the installed folder kept under its own name: 1024 × 768 × 32,
+`--os winxp --ram 1536`, `--app-dir-dlls "binkw32.dll,mss32.dll"` (the game's own Bink and
+Miles) and the resolution/rasterizer values the installer writes under
+`HKCU\Software\SSSI\Empire Earth`. The Art of Conquest refuses to start without the base
+game, so its bundle carries both installed folders and also
+`HKCU\Software\Mad Doc Software\EE-AOC`.
 
 † The MCIWnd and DirectMusic runtime was imported from LinusU's full-game branch,
 with targeted stack, stream, lifetime and parser regressions. The October 12 integration
@@ -93,6 +115,16 @@ is absent. The trial's earlier gameplay verification does not validate the full 
 The working collection also covers full builds alongside the production demos of Re-Volt,
 Heroes III, StarCraft, Diablo II, Max Payne, Harry Potter 1, NFS Porsche and NFS Underground.
 The Re-Volt beta is a separate working build, not a replacement for the released demo.
+
+On 2026-10-26 the maintainer confirmed Sid Meier's Pirates! (2004), Half-Life 2
+(20th Anniversary), Command & Conquer: Red Alert 3, Deus Ex: Game of the Year Edition
+and The Longest Journey as working. These playable statuses include that maintainer
+report. The local bundles are `sid-meiers-pirates.wgb`, `hl2-20th.wgb`,
+`red-alert-3.wgb`, `deus-ex-goty.wgb` and `the_longest_journey.wgb`.
+Red Alert 3 was also launched through the Bundles UI: the opening movie and the
+Leningrad mission briefing rendered. The observed run recorded a browser-cache write
+failure while the system disk was full; startup subsequently succeeded. This check
+covers the base game; Uprising and campaign completion have not been verified.
 
 System Shock 2 coverage is for the original 1999 game, including previously purchased GOG
 copies; it does not cover the 2025 remaster. Unreal Gold's former GOG edition is delisted.
@@ -110,6 +142,19 @@ The original Bard's Tale and Worms World Party demos are older editions than the
 remasters. The original Bard's Tale demo has now been checked independently (see below);
 Worms World Party's original demo reaches its startup splash; match entry remains unverified.
 
+Empires: Dawn of the Modern World (2003, GOG offline edition): startup is now confirmed
+by the maintainer (2026-10-20), following the resource-loading and x87 precision fixes
+in `7b25393`, now included in main. This updates the earlier startup failure reported in
+[issue #31](https://github.com/jenissimo/bottleship/issues/31). Gameplay, campaign completion
+and stability have not been established by this confirmation; the original macOS/Apple
+Silicon environment from the issue has not been independently retested.
+
+Neighbours from Hell (2003, Russian Buka disc): the title screen, menus, first tutorial,
+character movement and room transition were checked. Russian speech and music play;
+MPEG assets with leading padding are recognized. The original disc's three stale MSI
+hash records require explicit acceptance during import. Later episodes and campaign
+completion have not been tested.
+
 ## Demo coverage
 
 These observations cover the listed demo editions only; a rendered menu does not establish
@@ -117,6 +162,7 @@ full playability.
 
 | Demo | Observed stage | Public catalog |
 |---|---|:---:|
+| The Lord of the Rings: The Return of the King (English 2003 demo) | Entered the Minas Tirith mission as Gandalf; character movement, rendered scene/HUD and sound verified. Mission completion is untested | ✓ |
 | Quake II 3.14 (classic Win32) | Entered a playable level, movement and rendered HUD; OpenGL | ✓ |
 | American McGee's Alice | Main menu, OpenGL; bundled 1280 × 1024, 32-bit color/textures and high texture detail | ✓ |
 | XIII UK demo | Rendered menu, D3D8 | ✓ |
@@ -145,6 +191,7 @@ full playability.
 | [Carmageddon II demo](https://archive.org/details/Carmageddon2CarpocalypseNowDemo) | Rendered Controls screen; race entry remains unverified | ✓ |
 | [Painkiller Demo 2](https://archive.org/details/Painkiller_Demo_2_build_v1.0) | Rendered main menu; level entry remains unverified | ✓ |
 | [Worms World Party original demo](https://ftp.zx.net.nz/pub/archive/ftp.team17.com/pub/t17/goodies/wwp_demo.exe) | Rendered demo splash; match entry remains unverified | ✓ |
+| Crimson Skies trial | [Contributor bring-up (#33)](https://github.com/jenissimo/bottleship/issues/33), independently verified on 2026-10-20: visible pilot-name editing, campaign hangar, voiced briefing, legible Flight Check objectives and the Hawaii mission in flight with HUD and keyboard roll controls. Direct3D 6; graphical glitches remain. Repacked from the original CrimsonTrial.exe with its own TrueType fonts installed under Windows Fonts. Wrapped DrawTextEx measurement and text color after solid GDI blits were fixed against native Windows oracles. Force feedback and mission completion remain unverified | ✓ |
 
 Harry Potter 1 and Unreal Tournament demos also reach their rendered menus.
 
@@ -162,8 +209,6 @@ Montezuma, Natalie Brooks, Farm Frenzy and House of 1000 Doors.
 
 | Title | Status | GOG |
 |-------|--------|:---:|
-| The Longest Journey | in progress | ✓ |
-| Deus Ex | in progress | ✓ |
 | Prince of Persia: The Sands of Time | in progress | ✓ |
 
 ## Reporting compatibility

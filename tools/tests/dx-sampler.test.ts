@@ -199,7 +199,8 @@ describe("DxSamplerCache.resolveDescriptor — quality overrides", () => {
 describe("DxSamplerCache.qualityToken", () => {
     test("moves iff the quality inputs resolveDescriptor reads move", () => {
         const cfg = EmulatorConfig.getInstance();
-        const restore = { anisotropy: cfg.quality.anisotropy, forceTrilinear: cfg.quality.forceTrilinear };
+        // A previous game manifest can override the user preference under test.
+        cfg.reset();
         try {
             cfg.applyQuality({ anisotropy: 1, forceTrilinear: false });
             const t0 = DxSamplerCache.qualityToken();
@@ -217,7 +218,7 @@ describe("DxSamplerCache.qualityToken", () => {
             cfg.applyQuality({ brightness: 1.5 });
             expect(DxSamplerCache.qualityToken()).toBe(t0);
         } finally {
-            cfg.applyQuality(restore);
+            cfg.reset();
         }
     });
 });

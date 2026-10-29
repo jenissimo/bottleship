@@ -233,6 +233,8 @@ function deviceDrawCount(devicePtr: number): number {
 
 type QueryDeviceHooks = {
     getQueryManager?: () => D3D9QueryManager | null;
+    flushQueryCommands?: () => void;
+    releaseQueryCommands?: (queryPtr: number) => void;
     splitQueries?: SplitQueryChannel | null;
     recordQueryBegin?: (queryPtr: number) => void;
     recordQueryEnd?: (queryPtr: number) => void;
@@ -279,11 +281,8 @@ function guestPixelsFromSamples(samples: number, sampleScale: number, mixed: boo
  * compares the count against a coverage threshold, so a constant 1 reads as "one pixel of
  * this object is visible" and the object is culled — large distant geometry vanishes.
  *
- * A non-zero predicate is therefore converted to the only count we can stand behind: an
- * UPPER bound, the viewport's pixel area. The two ways to be wrong are not symmetric —
- * over-reporting draws something the app would have culled (a little wasted fill), while
- * under-reporting deletes geometry and warns nobody. A backend that does return a real
- * sample count (> 1) is trusted and passes through untouched.
+ * The executor therefore accumulates a separate attachment counter. Its result is a real
+ * sample count, including the meaningful one-sample case; never widen it to viewport area.
  */
 function occlusionPixelsFromGpu(
     query: QueryRecord, raw: bigint, sampleScale = 1, sampleScaleMixed = false,
@@ -293,14 +292,8 @@ function occlusionPixelsFromGpu(
     if (raw <= 0n) { ledger.measured++; return 0; }
     const override = (globalThis as { __occlusionPixels?: unknown }).__occlusionPixels;
     if (typeof override === 'number') { ledger.synthesized++; return override >>> 0; }
-    if (raw > 1n) {
-        ledger.measured++;
-        return guestPixelsFromSamples(Number(raw & 0xffff_ffffn) >>> 0, sampleScale, sampleScaleMixed);
-    }
-    ledger.synthesized++;
-    const vp = devices.get(query.devicePtr)?.getViewport?.();
-    const pixels = vp ? (vp.width >>> 0) * (vp.height >>> 0) : 0;
-    return pixels > 0 ? pixels >>> 0 : 1;
+    ledger.measured++;
+    return guestPixelsFromSamples(Number(raw & 0xffff_ffffn) >>> 0, sampleScale, sampleScaleMixed);
 }
 
 /**
@@ -503,6 +496,7 @@ function remoteReadyOnShip(query: QueryRecord): boolean {
  * GetData on a split front, after the END. OCCLUSION and TIMESTAMP wait for the render worker's
  * measured result for THIS generation; EVENT and TIMESTAMPDISJOINT are ready once their END shipped.
  */
+const reportedRemoteQueryErrors = new Set<string>();
 function remoteGetData(query: QueryRecord, queryPtr: number, pData: number, count: number, flags: number): number {
     const remote = query.remote!;
     // One ship per generation: the guest spins on GetData(FLUSH), and everything the END fences
@@ -520,7 +514,14 @@ function remoteGetData(query: QueryRecord, queryPtr: number, pData: number, coun
     if (!result) return S_FALSE;
     remote.noteAnswered();
     if (query.type === D3DQUERYTYPE_OCCLUSION || query.type === D3DQUERYTYPE_TIMESTAMP) {
-        if (result.state === 'unavailable' || result.value === undefined) return D3DERR_NOTAVAILABLE;
+        if (result.state === 'unavailable' || result.value === undefined) {
+            const reason = result.reason ?? 'no measured result';
+            if (!reportedRemoteQueryErrors.has(reason) && reportedRemoteQueryErrors.size < 16) {
+                reportedRemoteQueryErrors.add(reason);
+                Logger.warn(LogCategory.D3D9, `[Query] remote result unavailable: ${reason}`);
+            }
+            return D3DERR_NOTAVAILABLE;
+        }
         if (count === 0) return D3D_OK;
         if (query.type === D3DQUERYTYPE_TIMESTAMP) {
             return writeQueryUint64(pData, Math.min(count, 8), result.value) ? D3D_OK : D3DERR_INVALIDCALL;
@@ -562,6 +563,11 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         if (type === D3DQUERYTYPE_TIMESTAMP && ((manager && !manager.getCapability('timestamp').supported)
             || (remote && !remote.timestampSupported()))) {
             Logger.log(LogCategory.D3D9, 'CreateQuery(TIMESTAMP): timestamp-query feature unavailable');
+            if (ppQuery) initReturnPtr(ppQuery);
+            return D3DERR_NOTAVAILABLE;
+        }
+        if (type === D3DQUERYTYPE_OCCLUSION && ((manager?.getCapability?.('occlusion')?.supported === false)
+            || remote?.occlusionSupported?.() === false)) {
             if (ppQuery) initReturnPtr(ppQuery);
             return D3DERR_NOTAVAILABLE;
         }
@@ -611,6 +617,7 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         registerDeviceChildFinalizer(queryPtr, pDevice, () => {
             // A recycled COM pointer hands this finalizer the NEXT object's record; passing
             // our own lets the manager's guard — and the identity check — keep to our generation.
+            if (!record.remote && queries.get(queryPtr) === record) queryDeviceHooks(record.devicePtr)?.releaseQueryCommands?.(queryPtr);
             record.gpuManager?.release(queryPtr, record);
             if (queries.get(queryPtr) !== record) return;
             record.remote?.release(queryPtr, record.remoteToken);
@@ -823,10 +830,8 @@ export function createQueryExports(): Record<string, ThunkImplementation> {
         if (((args[3] >>> 0) & D3DGETDATA_FLUSH) !== 0) {
             const key = query.devicePtr >>> 0;
             if (hasManagerSubmissionDomain(query.gpuManager)) {
-                // The manager is the live-device submission domain. notifySubmitted
-                // is a seam for a flush; the actual GPU result still has to become
-                // ready through poll(), so this cannot fabricate a timestamp.
-                query.gpuManager!.notifySubmitted(query.issueSerial);
+                // Only the executor advances the live serial, after a real queue submission.
+                queryDeviceHooks(key)?.flushQueryCommands?.();
             } else if (query.issueSerial > (deviceSubmissionSerial.get(key) ?? 0)) {
                 deviceSubmissionSerial.set(key, query.issueSerial);
             }

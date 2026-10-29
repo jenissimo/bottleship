@@ -238,6 +238,7 @@ export interface D3D9MsaaPassOptions {
     stencilStoreOp?: GPUStoreOp;
     /** Single occlusion query set used by beginOcclusionQuery in this pass. */
     occlusionQuerySet?: GPUQuerySet;
+    extraColorAttachments?: GPURenderPassColorAttachment[];
 }
 
 const COPY_SRC = 0x0001;
@@ -349,7 +350,7 @@ export function makeD3D9MultisamplePassDescriptor(
             clearValue: options.clearColor,
             loadOp: options.colorLoadOp ?? "load",
             storeOp: resolvedColorStoreOp,
-        }],
+        }, ...(options.extraColorAttachments ?? [])],
         depthStencilAttachment,
         ...(options.occlusionQuerySet ? { occlusionQuerySet: options.occlusionQuerySet } : {}),
     };

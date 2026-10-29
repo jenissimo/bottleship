@@ -68,7 +68,7 @@ test('RAR4 SFX offsets, stored/LZ bytes and CRC agree with the independent trans
     expect(() => decodeRar29(rarLz(new Uint8Array(), true), 3)).toThrow('invalid match');
 });
 
-test('RAR4 rejects damaged headers, payloads, solid/encrypted files and unsafe paths', () => {
+test('RAR4 rejects damaged headers, payloads, orphaned solid/encrypted files and unsafe paths', () => {
     const badHeader = rarArchive(); badHeader[10] ^= 1;
     expect(() => parseRar4(new BufferSource(badHeader))).toThrow('header CRC');
     const badData = rarArchive(); const e = parseRar4(new BufferSource(badData)).entries[0]; badData[e.dataOffset] ^= 1;

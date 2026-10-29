@@ -1,5 +1,16 @@
 [
   {
+    "id": "lotr-return-of-the-king-demo",
+    "name": "The Lord of the Rings: The Return of the King",
+    "subtitle": "Original PC Demo",
+    "wgbUrl": "/apps/lotr-return-of-the-king-demo.wgb",
+    "coverUrl": "/covers/lotr-return-of-the-king-box.jpg",
+    "description": "Defend Minas Tirith as Gandalf in the original English 2003 PC demo. Mission entry, movement and sound are verified.",
+    "year": "2003",
+    "genre": "Action",
+    "enabled": true
+  },
+  {
     "id": "xiii-demo",
     "name": "XIII",
     "subtitle": "Demo",
@@ -498,6 +509,17 @@
     "description": "Cruise through San Francisco in a Ford Mustang Fastback in the original Microsoft trial.",
     "year": "2000",
     "genre": "Arcade Racing",
+    "enabled": true
+    },
+  {
+    "id": "crimson-skies-demo",
+    "name": "Crimson Skies",
+    "subtitle": "Demo",
+    "wgbUrl": "/apps/crimson-skies-demo.8dce520e30ac61d1379bb8aa8baae043e4bb8aef058029a49ee0afd868ca7df1.wgb",
+    "coverUrl": "/covers/crimson-skies-box.jpg",
+    "description": "Fly Nathan Zachary's Fortune Hunters over Hawaii in search of Sir Francis Drake's treasure in the original Microsoft trial.",
+    "year": "2000",
+    "genre": "Arcade Flight",
     "enabled": true
   }
 ]

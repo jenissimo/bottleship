@@ -11,6 +11,7 @@ import { SystemResourceProvider } from '../../core/resources/system-resource-pro
 import { toPlainGuestMemory } from '../../core/memory/guest-memory';
 import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
 import { writeBackDibSectionRect } from './bitmap-resolve';
+import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
@@ -1553,13 +1554,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         const h = args[4] | 0; // signed
         const rop = args[5];
         Logger.verbose(LogCategory.GDI32, `PatBlt(hdc=0x${hdc.toString(16)}, x=${x}, y=${y}, w=${w}, h=${h}, rop=0x${rop.toString(16)})`);
-        const PATCOPY = 0x00F00021;
-        if (rop === PATCOPY) {
-            return System.getInstance().gdiContext.fillRect(hdc, x, y, x + w, y + h) ? 1 : 0;
-        }
-        // Keep compatibility: unknown ROPs are accepted but logged.
-        Logger.warn(LogCategory.GDI32, `PatBlt: unsupported ROP 0x${rop.toString(16)}, treating as success`);
-        return 1;
+        return patBlt(System.getInstance().gdiContext, hdc, x, y, w, h, rop) ? 1 : 0;
     };
 
     // --- Palette management ---
@@ -1858,6 +1853,12 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             }
         }
 
+        // BI_BITFIELDS masks sit at the same offset after a BITMAPINFOHEADER as inside a
+        // BITMAPV4/V5HEADER.
+        const dibMasks = biCompression === 3 && bpp > 8 && pbmi + 52 <= mem.length
+            ? [view.getUint32(pbmi + 40, true), view.getUint32(pbmi + 44, true), view.getUint32(pbmi + 48, true)]
+            : undefined;
+
         // No RGBA shadow — Lead Tools / decoders write guest bitsPtr; resolveBitmapRgba reads it.
         const handle = SystemResourceProvider.getInstance().registerUserObject({
             type: 'BITMAP',
@@ -1872,6 +1873,7 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
             dibStride: rowStride,
             dibTopDown: biHeight < 0,
             dibPalette,
+            dibMasks,
         } as any);
 
         Logger.log(

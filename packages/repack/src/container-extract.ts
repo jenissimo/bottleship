@@ -46,8 +46,10 @@ import { isWise, extractWise } from '@bottleship/formats/wise';
 import { isVise, extractVise } from '@bottleship/formats/vise';
 import { isInstallShield3, extractInstallShield3 } from '@bottleship/formats/installshield3';
 import { findRar4, extractRar4 } from '@bottleship/formats/rar';
+import { IsoImage, extractIsoToMap } from '@bottleship/formats/iso';
+import { isInstallShieldLauncher, extractInstallShieldLauncher } from '@bottleship/formats/installshield-launcher';
 
-export type InstallerVia = "ea-winzip" | "installshield" | "installshield3" | "wise" | "vise" | "rar4" | "inno" | "freearc" | "pftw" | "cab-sfx" | "msi" | "none";
+export type InstallerVia = "ea-winzip" | "installshield" | "installshield3" | "wise" | "vise" | "rar4" | "iso" | "inno" | "freearc" | "pftw" | "cab-sfx" | "msi" | "installshield-launcher" | "none";
 
 export interface ContainerExtractOptions {
     /** Shared unpack-streaming WASM bytes for Inno/FreeArc LZMA and RAR PPMd. */
@@ -71,11 +73,17 @@ export interface ContainerExtractOptions {
      * file in `files`, so it resolves these from that map without this hook.
      */
     resolveExternalFile?: (name: string, size: number) => Promise<Uint8Array | null> | Uint8Array | null;
+    /** Resolve an exact container-relative MSI cabinet or loose source path on demand. */
+    resolveInstallerFile?: (path: string) => Promise<Uint8Array | null> | Uint8Array | null;
+    /** Explicitly accept stale MSI hash metadata while reporting every mismatch. */
+    onMsiHashMismatch?: (path: string, expected: string, actual: string) => void;
     onProgress?: (pct: number, label: string) => void;
 }
 
 export interface ContainerExtractResult {
     gameFiles: Map<string, Uint8Array>;
+    /** Last-write times (wall-clock seconds, see formats zip/dos-time.ts) by `gameFiles` key, for formats that record them. */
+    fileTimes?: Map<string, number>;
     via: InstallerVia;
     /** Human-readable summary (e.g. "InstallShield cabinet 'data'", "no installer — packaged as-is"). */
     note: string;
@@ -106,7 +114,7 @@ interface InstallerFormat<M = unknown> {
         files: Map<string, Uint8Array>,
         match: M,
         ctx: ContainerExtractOptions,
-    ): Promise<{ gameFiles: Map<string, Uint8Array>; note?: string }>;
+    ): Promise<{ gameFiles: Map<string, Uint8Array>; note?: string; fileTimes?: Map<string, number> }>;
 }
 
 // --- shared helpers ----------------------------------------------------------------
@@ -323,7 +331,9 @@ const installShieldFormat: InstallerFormat<{ header: Uint8Array; volumes: Map<nu
         // disc in `files`, so the loose payload (Max Payne's Levels/x_level*.ras) is
         // here; the streaming CLI instead supplies ctx.resolveExternalFile.
         const resolveLoose = createInstallShieldExternalResolver(files);
+        const fileTimes = new Map<string, number>();
         const gameFiles = await extractInstallShield(vols.header, vols.volumes, {
+            fileTimes,
             verifySize: true,
             verifyMd5: true,
             inflateRaw: ctx.inflateRaw,
@@ -340,7 +350,7 @@ const installShieldFormat: InstallerFormat<{ header: Uint8Array; volumes: Map<nu
             },
         });
         if (gameFiles.size === 0) throw new Error('InstallShield cabinet contains no available game payload');
-        return { gameFiles, note: "InstallShield cabinet" };
+        return { gameFiles, fileTimes, note: "InstallShield cabinet" };
     },
 };
 
@@ -485,6 +495,7 @@ const pftwFormat: InstallerFormat<{ exe: Uint8Array }> = {
         const inner = await unwrapCabSelfExtractor(match, ctx);
         return {
             gameFiles: inner.gameFiles,
+            fileTimes: inner.fileTimes,
             note: `PackageForTheWeb → ${inner.note}`,
         };
     },
@@ -497,7 +508,7 @@ const cabSfxFormat: InstallerFormat<{ exe: Uint8Array }> = {
     detect: files => findCabSelfExtractor(files, false),
     async extract(_files, match, ctx) {
         const inner = await unwrapCabSelfExtractor(match, ctx);
-        return { gameFiles: inner.gameFiles, note: `CAB self-extractor → ${inner.note}` };
+        return { gameFiles: inner.gameFiles, fileTimes: inner.fileTimes, note: `CAB self-extractor → ${inner.note}` };
     },
 };
 
@@ -516,8 +527,12 @@ const msiFormat: InstallerFormat<{ name: string; bytes: Uint8Array }> = {
     async extract(files, match, ctx) {
         const index = new Map([...files].map(([name, bytes]) => [normSlash(name).toLowerCase(), bytes]));
         const root = dirOf(match.name);
-        const gameFiles = await extractMsiPayload(match.bytes, name => index.get((root + normSlash(name)).toLowerCase()) ?? null, {
+        const gameFiles = await extractMsiPayload(match.bytes, name => {
+            const path = root + normSlash(name);
+            return index.get(path.toLowerCase()) ?? ctx.resolveInstallerFile?.(path) ?? null;
+        }, {
             inflateBlock: ctx.cabInflateBlock,
+            onHashMismatch: ctx.onMsiHashMismatch,
             onProgress: (done, total, name) => ctx.onProgress?.(Math.round(done / total * 100), `Extracting ${name}`),
         });
         return {gameFiles, note: 'MSI File/Component/Directory tables → INSTALLDIR (custom actions not executed)'};
@@ -558,16 +573,46 @@ const rar4Format: InstallerFormat<{ bytes: Uint8Array; offset: number }> = {
             createPpmSession: codec ? input => codec.createRarPpmSession(input) : undefined,
         });
         const inner = await extractInstallerFromFiles(files, ctx);
-        return { gameFiles: inner.gameFiles, note: `RAR4 → ${inner.via === 'none' ? 'installed file tree' : inner.note}` };
+        return { gameFiles: inner.gameFiles, fileTimes: inner.fileTimes, note: `RAR4 → ${inner.via === 'none' ? 'installed file tree' : inner.note}` };
+    },
+};
+
+/** The disk image rides behind the launcher stub; unwrap it and let the InstallShield reader take over. */
+const installShieldLauncherFormat: InstallerFormat<Uint8Array> = {
+    id: 'installshield-launcher',
+    label: 'InstallShield setup launcher',
+    detect(files) {
+        for (const [rel, bytes] of files) if (/\.exe$/i.test(rel) && isInstallShieldLauncher(bytes)) return bytes;
+        return null;
+    },
+    async extract(_files, bytes, ctx) {
+        const inner = await extractInstallerFromFiles(extractInstallShieldLauncher(bytes), ctx);
+        return { gameFiles: inner.gameFiles, fileTimes: inner.fileTimes, note: `InstallShield setup launcher → ${inner.note}` };
+    },
+};
+
+const isoFormat: InstallerFormat<Uint8Array> = {
+    id: 'iso', label: 'ISO disc image',
+    detect(files) {
+        // An installed tree may retain a disc image beside its executable.
+        if ([...files.keys()].some(name => /\.exe$/i.test(name))) return null;
+        const images = [...files].filter(([name]) => /\.iso$/i.test(name));
+        if (images.length > 1) throw new Error('Multiple ISO images; import the discs together with iso-to-wgb');
+        return images[0]?.[1] ?? null;
+    },
+    async extract(_files, bytes, ctx) {
+        const files = extractIsoToMap(IsoImage.mount(new BufferSource(bytes)));
+        const inner = await extractInstallerFromFiles(files, ctx);
+        return {gameFiles: inner.gameFiles, note: `ISO → ${inner.note}`};
     },
 };
 
 const INSTALLER_FORMATS: InstallerFormat<any>[] = [
-    eaWinzipFormat, msiFormat, installShieldFormat,
+    eaWinzipFormat, msiFormat, installShieldFormat, installShieldLauncherFormat,
     singlePayload('installshield3', 'InstallShield 3 Z archive', isInstallShield3, extractInstallShield3),
     singlePayload('wise', 'Wise DEFLATE installer', isWise, extractWise),
     singlePayload('vise', 'VISE object-table installer', isVise, extractVise),
-    rar4Format, freeArcFormat, pftwFormat, cabSfxFormat, innoFormat,
+    rar4Format, isoFormat, freeArcFormat, pftwFormat, cabSfxFormat, innoFormat,
 ];
 
 // --- the recursion ------------------------------------------------------------------
@@ -586,8 +631,8 @@ export async function extractInstallerFromFiles(
         const match = await fmt.detect(files, opts);
         if (match == null) continue;
         try {
-            const { gameFiles, note } = await fmt.extract(files, match, opts);
-            return { gameFiles, via: fmt.id, note: note ?? fmt.label };
+            const { gameFiles, note, fileTimes } = await fmt.extract(files, match, opts);
+            return { gameFiles, via: fmt.id, note: note ?? fmt.label, ...(fileTimes?.size ? { fileTimes } : {}) };
         } catch (e) {
             // A format we DETECTED but can't fully extract (e.g. a FreeArc payload using the
             // srep filter we don't decode yet) shouldn't abort the whole build — record it

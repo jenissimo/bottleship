@@ -93,4 +93,41 @@ describe("resolveImportBinding", () => {
         }));
         expect(b.isThunked).toBe(false);
     });
+
+    it("an explicit app-directory rule resolves a versioned CRT before its HLE alias", () => {
+        const b = resolveImportBinding("MSVCR70.dll", [{ name: "swscanf" }], deps({
+            modules: ["msvcrt"], files: ["msvcr70"],
+            known: { "msvcrt:swscanf": 2 },
+            appDirRule: () => "msvcr70",
+        }));
+        expect(b.isThunked).toBe(false);
+        expect(b.dllName).toBe("msvcr70");
+        expect(b.aliasTarget).toBeNull();
+    });
+
+    it("an application rule drops the alias even when both CRT filenames exist", () => {
+        const b = resolveImportBinding("MSVCR70.dll", [PLAIN], deps({
+            modules: ["msvcrt"], files: ["msvcr70", "msvcrt"], known: { "msvcrt:_spawnl": 3 },
+            appDirRule: () => "msvcr70",
+        }));
+        expect(b).toEqual({ dllName: "msvcr70", aliasTarget: null, isThunked: false });
+    });
+
+    it("a rule without the requested CRT file keeps the HLE alias, even if the alias file exists", () => {
+        const b = resolveImportBinding("MSVCR70.dll", [PLAIN], deps({
+            modules: ["msvcrt"], files: ["msvcrt"], known: { "msvcrt:_spawnl": 3 },
+            appDirRule: () => "msvcr70",
+        }));
+        expect(b).toEqual({ dllName: "msvcrt", aliasTarget: "msvcrt", isThunked: true });
+    });
+
+    it("a rule does not treat the requested CRT in System32 as an application copy", () => {
+        const b = resolveImportBinding("MSVCR70.dll", [PLAIN], deps({
+            modules: ["msvcrt"], known: { "msvcrt:_spawnl": 3 },
+            findDllPath: () => "C:\\Windows\\System32\\msvcr70.dll",
+            isUnderSystemDirectory: () => true,
+            appDirRule: () => "msvcr70",
+        }));
+        expect(b).toEqual({ dllName: "msvcrt", aliasTarget: "msvcrt", isThunked: true });
+    });
 });

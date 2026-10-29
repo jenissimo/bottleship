@@ -523,13 +523,18 @@ Archive / installer formats — USE OUR OWN READERS, never `apt install` a third
                       de-obfuscation, LINK_PREV dedup, volume-split files, MD5 verify.
                       CLI: `tools/unshield-extract.ts <data1.hdr> <out> [--list]`.
                       (NOT the same as MSCF — 7-Zip/cabextract cannot read `ISc(`.)
-    - inno/         — Inno Setup headers (LZMA1/2 via the Rust WASM backend). CLI: `tools/inno-inspect.ts`;
+    - inno/         — Inno Setup headers; zlib (pako) and LZMA1/2 (Rust WASM backend) chunks. CLI: `tools/inno-inspect.ts`;
                       end-to-end GOG installer → bundle: `tools/gog-to-wgb.ts`.
     - freearc/      — FreeArc (`.arc`, srep+LZMA) used by some repacks.
-    - rar/          — RAR5 layout + STORED data (the store-only `.rar` a game drop wraps an
-                      installer in), incl. multi-volume `.partN.rar`. CLI:
-                      `tools/rar-extract.ts <a.rar> <out> [--list]`. RAR's own compression,
-                      solid groups, encryption and RAR 1.5–4.x are REFUSED by name.
+    - rar/          — RAR5 STORED data (incl. multi-volume `.partN.rar`); RAR4 Unicode names
+                      and RAR 2.9 LZ/PPMd coding, solid groups and standard filters.
+                      CLI: `tools/rar-extract.ts <a.rar> <out> [--list] [--verbose]`.
+                      Encryption, RAR4 multi-volume and custom VM programs are refused.
+    - msi/          — MSI tables + cabinet or loose-media payloads; restores installed long
+                      names from the source tree without executing custom actions.
+                      CLI: `tools/msi-extract.ts`; `tools/iso-to-wgb.ts` also detects MSI.
+                      Hash mismatches fail by default; `--allow-msi-hash-mismatch` on the
+                      ISO CLI explicitly keeps source bytes and reports every mismatch.
     - iso/          — ISO9660 + BIN/CUE disc images. CLI: `tools/iso-to-wgb.ts`; `tools/bin2iso.ts`.
     - mpq/          — MoPaQ (`MPQ\x1A`, v0/v1), incl. one APPENDED to a Blizzard self-extracting
                       installer, and MPQs nested inside it. Storm crypt + PKWARE DCL implode

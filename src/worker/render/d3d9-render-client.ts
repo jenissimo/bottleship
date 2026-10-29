@@ -204,6 +204,11 @@ export class D3D9RenderClient implements SplitRemote {
 
     /** Until the worker reports its device, this worker's own answers: both request their
      *  device through the same WebGPUBackend code from the same adapter. */
+    occlusionQuerySupported(): boolean {
+        const backend = System.getInstance().services.render.getBackend() as WebGPUBackend | null;
+        return backend?.getDevice()?.features.has('float32-blendable' as GPUFeatureName) === true;
+    }
+
     timestampQuerySupported(): boolean {
         if (this.workerTimestampQuery !== null) return this.workerTimestampQuery;
         const backend = System.getInstance().services.render.getBackend() as WebGPUBackend | null;

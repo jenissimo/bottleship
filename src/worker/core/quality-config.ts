@@ -54,7 +54,8 @@ export interface QualityConfig {
     msaa: number;
     /**
      * Internal-resolution factor for GPU-resident 3D: 0/1/2/4. 0 ("Auto", the default)
-     * tracks the canvas's own physical-pixel size; 1 ("Native") forces exactly the guest's
+     * tracks the canvas's own physical-pixel size (D3D9 retains the native sample grid for
+     * occlusion-query accuracy); 1 ("Native") forces exactly the guest's
      * own resolution (no supersample, the compatibility/low-power fallback); 2/4 are a
      * fixed multiplier of the guest's resolution regardless of canvas size — see
      * backends/webgpu/shared/internal-resolution.ts for the split.

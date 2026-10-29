@@ -11,6 +11,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { VirtualFileSystem } from '../../runtime/filesystem/vfs';
 import { readStringA, readStringW, encodeUTF16LE, encodeFileApiString } from './file-io-strings';
 import { searchPathSafeMode } from '../../core/dll-search-order';
+import { registerFileIoTempExports } from './file-io-temp';
 
 const ERROR_FILE_NOT_FOUND = 2;
 const ERROR_INVALID_PARAMETER = 87;
@@ -54,7 +55,7 @@ const joinWindowsPath = (dir: string, file: string): string => {
     return `${d}\\${f}`.replace(/\//g, '\\');
 };
 
-const collectDefaultSearchDirectories = (): string[] => {
+export const collectDefaultSearchDirectories = (): string[] => {
     const system = System.getInstance();
     const vfs = system.fileSystem;
     const dirs: string[] = [];
@@ -111,7 +112,19 @@ const writeSearchPathResultA = (
     return required - 1;
 };
 
+/**
+ * The directory GetTempPath reports exists on every Windows install, and programs create
+ * files and folders in it without creating it first. Make the TMP and TEMP directories.
+ */
+export function ensureTempDirectories(environment: Map<string, string>, vfs: Pick<VirtualFileSystem, 'ensureDirTreeSync'>): void {
+    for (const name of ['TMP', 'TEMP']) {
+        const dir = environment.get(name);
+        if (dir) vfs.ensureDirTreeSync(dir);
+    }
+}
+
 export function registerFileIoPathExports(exports: Record<string, ThunkImplementation>): void {
+    registerFileIoTempExports(exports);
     exports['GetCurrentDirectoryA'] = (ctx, mem, args) => {
         const nBufferLength = args[0];
         const lpBuffer = args[1];

@@ -21,6 +21,7 @@ import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { LARGE_IO_TRACE_ENABLED, traceLargeRead } from "../core/diagnostics/large-io-trace";
 import { ensureNativeQsort } from "./crt-qsort";
 import { fillStatStruct, STAT32_OFFSETS } from "./crt-vc9-io";
+import { unixTimeOf } from "../runtime/filesystem/file-time";
 
 const formatUnknownError = (err: unknown): string => {
     const forceString = (value: unknown): string => {
@@ -1084,7 +1085,8 @@ export class Crtdll implements IModule {
             return -1;
         }
         fillStatStruct(structPtr, STAT32_OFFSETS, 36, isFile ? vfs.getFileSize(resolved) : 0, isDir,
-            (p, v, n) => { for (let off = 0; off < n; off += 4) Mem.writeUint32(p + off, v); });
+            (p, v, n) => { for (let off = 0; off < n; off += 4) Mem.writeUint32(p + off, v); },
+            unixTimeOf(isFile ? vfs.statEntry(resolved) : null));
         return 0;
     }
 

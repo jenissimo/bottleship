@@ -138,6 +138,36 @@ function readConstantTableTokens(ptr: number): Uint32Array | null {
     return null;
 }
 
+// ── D3DXGetShaderConstantTable(Ex) ──────────────────────────────────────
+// Reflection over the CTAB block fxc embedded in the bytecode. A title that ships
+// compiled shaders still asks where each uniform lives, so this is on the path of
+// every SetMatrix/SetVector it makes — not a diagnostic nicety.
+export function getShaderConstantTable(process: Process, pFunction: number, ppConstantTable: number): number {
+    if (ppConstantTable) Mem.writeUint32(ppConstantTable, 0);
+    if (!pFunction || !ppConstantTable) return D3DERR_INVALIDCALL;
+
+    // A shader compiled without reflection carries no CTAB at all. That is not our
+    // failure and not an empty table: D3DX answers D3DXERR_INVALIDDATA and a caller that
+    // checks takes its no-reflection path. Say so once — "the game asked and we found
+    // nothing" and "the game never asked" look identical from the outside.
+    const refuse = (why: string): number => {
+        noteConstantTableMissing();
+        if (!warnedNoCtab) {
+            warnedNoCtab = true;
+            Logger.warn(LogCategory.D3D9, `D3DXGetShaderConstantTable: ${why}`);
+        }
+        return D3DXERR_INVALIDDATA;
+    };
+
+    const tokens = readConstantTableTokens(pFunction);
+    if (!tokens) return refuse(`no CTAB comment in the shader at 0x${pFunction.toString(16)}`);
+
+    const objPtr = createConstantTable(process, tokens);
+    if (!objPtr) return refuse(`unreadable CTAB in a ${tokens.length}-token shader ` +
+        `(version 0x${(tokens[0] ?? 0).toString(16)})`);
+    return Mem.writeUint32(ppConstantTable, objPtr) ? S_OK : D3DERR_INVALIDCALL;
+}
+
 export function createShaderExports(process: Process): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
 
@@ -213,42 +243,12 @@ export function createShaderExports(process: Process): Record<string, ThunkImple
         return Mem.writeUint32(ppDisassembly, bufPtr) ? S_OK : D3DERR_INVALIDCALL;
     };
 
-    // ── D3DXGetShaderConstantTable(Ex) ──────────────────────────────────────
-    // Reflection over the CTAB block fxc embedded in the bytecode. A title that ships
-    // compiled shaders still asks where each uniform lives, so this is on the path of
-    // every SetMatrix/SetVector it makes — not a diagnostic nicety.
-    const getConstantTable = (pFunction: number, ppConstantTable: number): number => {
-        if (ppConstantTable) Mem.writeUint32(ppConstantTable, 0);
-        if (!pFunction || !ppConstantTable) return D3DERR_INVALIDCALL;
-
-        // A shader compiled without reflection carries no CTAB at all. That is not our
-        // failure and not an empty table: D3DX answers D3DXERR_INVALIDDATA and a caller that
-        // checks takes its no-reflection path. Say so once — "the game asked and we found
-        // nothing" and "the game never asked" look identical from the outside.
-        const refuse = (why: string): number => {
-            noteConstantTableMissing();
-            if (!warnedNoCtab) {
-                warnedNoCtab = true;
-                Logger.warn(LogCategory.D3D9, `D3DXGetShaderConstantTable: ${why}`);
-            }
-            return D3DXERR_INVALIDDATA;
-        };
-
-        const tokens = readConstantTableTokens(pFunction);
-        if (!tokens) return refuse(`no CTAB comment in the shader at 0x${pFunction.toString(16)}`);
-
-        const objPtr = createConstantTable(process, tokens);
-        if (!objPtr) return refuse(`unreadable CTAB in a ${tokens.length}-token shader ` +
-            `(version 0x${(tokens[0] ?? 0).toString(16)})`);
-        return Mem.writeUint32(ppConstantTable, objPtr) ? S_OK : D3DERR_INVALIDCALL;
-    };
-
     exports['D3DXGetShaderConstantTable'] = (_ctx, _mem, args) =>
-        getConstantTable(args[0] >>> 0, args[1] >>> 0);
+        getShaderConstantTable(process, args[0] >>> 0, args[1] >>> 0);
     // The Ex form adds a flags word between the two; D3DXCONSTTABLE_LARGEADDRESSAWARE is
     // the only one defined and changes nothing about what we publish.
     exports['D3DXGetShaderConstantTableEx'] = (_ctx, _mem, args) =>
-        getConstantTable(args[0] >>> 0, args[2] >>> 0);
+        getShaderConstantTable(process, args[0] >>> 0, args[2] >>> 0);
 
     return exports;
 }

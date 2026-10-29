@@ -1661,6 +1661,21 @@ export class CallbackManager {
         return { base: this.stubPoolBase, end: this.stubPoolEnd };
     }
 
+    /**
+     * Target of the in-flight direct-return call (runGuestRoutine, CallWindowProc) whose
+     * return stub starts at `returnAddr`, or 0. Lets the dispatcher accept a callback stub
+     * at [ESP] for exactly the API stub that invocation entered, and only while it runs.
+     */
+    getDirectCallTarget(returnAddr: number): number {
+        const offset = (returnAddr >>> 0) - this.stubPoolBase;
+        if (offset < 0 || (returnAddr >>> 0) >= this.stubPoolEnd || (offset % CALLBACK_STUB_SIZE) !== 0) return 0;
+        const callbackId = CALLBACK_ID_BASE + offset / CALLBACK_STUB_SIZE;
+        const stub = this.stubsById.get(callbackId);
+        if (!stub?.inUse || stub.address !== (returnAddr >>> 0)) return 0;
+        const invocation = this.pendingCallbacks.get(callbackId);
+        return invocation?.directThunkReturn ? invocation.callbackAddress >>> 0 : 0;
+    }
+
     getForensicState(): CallbackForensicState {
         const copy = (record: CallbackForensicRecord | null): CallbackForensicRecord | null => {
             if (!record) return null;

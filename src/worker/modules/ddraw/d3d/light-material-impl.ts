@@ -296,6 +296,8 @@ export const createLightMaterialExports = (context: DDrawContext): D3DExports =>
         };
 
         obj.setMaterialData(data);
+        // A material in use is live: the device lights with its new values from here on.
+        obj.getActiveDevice()?.setMaterial(data);
 
         Logger.log(LogCategory.SYSTEM,
             `IDirect3DMaterial3_SetMaterial: diffuse=(${data.diffuse.r.toFixed(2)},${data.diffuse.g.toFixed(2)},${data.diffuse.b.toFixed(2)}) ` +

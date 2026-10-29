@@ -94,6 +94,44 @@ describe('ThunkDispatcher — failed sync call ABI', () => {
     }
 });
 
+describe('ThunkDispatcher — retained handler inputs', () => {
+    for (const mode of ['async', 'callback'] as const) {
+        it(`${mode} handlers retain their entry registers and arguments across later thunks`, () => {
+            const d = mkDispatcher();
+            const { dv } = bindMemory(d);
+            const id = 0x1000;
+            const cpu = { reg32: d.cachedReg32Raw, instruction_pointer: d.cachedIpRaw, flags: d.cachedFlagsRaw };
+            d.cachedCpu = cpu;
+            d.namesTable[id] = 'kernel32:RetainedInputs';
+            d.argCountsTable[id] = 1;
+            d.stackCleanupTable[id] = 4;
+            d.thunkGenerator = { getStubById: () => ({ dllName: 'kernel32', functionName: 'RetainedInputs', argCount: 1 }) };
+            d.markHleRegistrationComplete();
+            d.validateReturnAddrFast = () => true;
+            d.ensureScheduler = () => ({ isThreadExitId: () => false, getCurrentThreadId: () => 1, getCurrentThread: () => null });
+            d._handleSyncResult = d._handleAsyncResult = d.notifySchedulerBoundary = () => {};
+            const inputs: Array<{ ctx: any; args: number[] }> = [];
+            d.dispatchTable[id] = (ctx: any, _mem: Uint8Array, args: number[]) => {
+                inputs.push({ ctx, args });
+                return mode === 'async' ? new Promise(() => {}) : { value: 0, suspendedForCallback: true };
+            };
+            for (let i = 0; i < 2; i++) {
+                cpu.reg32[4] = 0x1000 + i * 0x100;
+                cpu.reg32[6] = 10 + i;
+                // Keep return-address symbol lookup outside this handler-lifetime fixture.
+                dv.setUint32(cpu.reg32[4], 0x100, true);
+                dv.setUint32(cpu.reg32[4] + 4, 30 + i, true);
+                d._handlePortWriteSlow(id, true);
+            }
+            expect(inputs[0]!.ctx.esp).toBe(0x1000);
+            expect(inputs[0]!.ctx.esi).toBe(10);
+            expect(inputs[0]!.args[0]).toBe(30);
+            expect(inputs[1]!.ctx.esp).toBe(0x1100);
+            expect(inputs[1]!.args[0]).toBe(31);
+        });
+    }
+});
+
 describe('ThunkDispatcher — WBUF dynarec lifecycle', () => {
     it('clears stale descriptors on reset and re-registers VS/PS/barrier hot slots', () => {
         let generation = 0;

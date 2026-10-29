@@ -512,11 +512,7 @@ export const exports: Record<string, ThunkImplementation> = {
             result = mapCaseSimple(src, true);
         }
 
-        if (cchDest === 0) {
-            return result.length + (cchSrc === -1 ? 1 : 0);
-        }
-
-        return Marshaler.writeWideString(mem, lpDestStr, result, cchDest) / 2;
+        return writeCaseMappedW(mem, lpDestStr, cchDest, result, cchSrc === -1);
     },
 
     'LCMapStringA': (ctx, mem, args) => {
@@ -636,11 +632,7 @@ export const exports: Record<string, ThunkImplementation> = {
             result = src.toUpperCase();
         }
 
-        if (cchDest === 0) {
-            return result.length + (cchSrc === -1 ? 1 : 0);
-        }
-
-        return Marshaler.writeWideString(mem, lpDestStr, result, cchDest) / 2;
+        return writeCaseMappedW(mem, lpDestStr, cchDest, result, cchSrc === -1);
     },
 
     'GetCPInfo': (ctx, mem, args) => {
@@ -1270,6 +1262,24 @@ function mapCaseSimple(src: string, upper: boolean): string {
     return out;
 }
 
+/** LCMapStringW's copy-out: exactly the mapped source, NUL included only when cchSrc = -1
+ *  counted one. The CRT's _tolower maps ONE character with cchSrc = cchDest = 1, so a
+ *  writer that reserves a terminator slot hands it back L'\0' for every capital. */
+function writeCaseMappedW(mem: Uint8Array, lpDestStr: number, cchDest: number, mapped: string, withNul: boolean): number {
+    const outLen = mapped.length + (withNul ? 1 : 0);
+    if (cchDest < 0) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
+    if (cchDest === 0) return outLen;
+    if (cchDest < outLen) { setLastError(ERROR_INSUFFICIENT_BUFFER); return 0; }
+    if (!lpDestStr || lpDestStr + outLen * 2 > mem.length) { setLastError(ERROR_INVALID_PARAMETER); return 0; }
+    for (let i = 0; i < outLen; i++) {
+        if (!Mem.writeUint16(lpDestStr + i * 2, i < mapped.length ? mapped.charCodeAt(i) : 0)) {
+            setLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+    }
+    return outLen;
+}
+
 /** Why the MultiByteToWideChar fast path handed a call back to the full thunk. A thunk
  *  whose fast path silently never fires looks exactly like one that is inherently slow;
  *  these counters tell the two apart. Read via the `localeFastPath` harness verb. */
@@ -1583,17 +1593,17 @@ export function registerFastPathLocaleFunctions(dispatcher: HleDispatcher): void
 
         const lut = caseMapLut(dwMapFlags === LCMAP_UPPERCASE);
 
-        // Mirrors the thunk exactly, including writeWideString reserving a terminator slot.
-        if (cchDest === 0) return srcLen + (cchSrc === -1 ? 1 : 0);
-        if (lpDestStr <= 0 || lpDestStr >= mem8.length) return 0;
-        const toWrite = Math.min(srcLen, cchDest - 1);
-        if (toWrite < 0 || lpDestStr + (toWrite + 1) * 2 > mem8.length) return null;
-        for (let i = 0; i < toWrite; i++) {
+        // Same contract as writeCaseMappedW; failures go to the thunk, which owns last-error.
+        const withNul = cchSrc === -1;
+        const outLen = srcLen + (withNul ? 1 : 0);
+        if (cchDest === 0) return outLen;
+        if (cchDest < outLen || !lpDestStr || lpDestStr + outLen * 2 > mem8.length) return null;
+        for (let i = 0; i < srcLen; i++) {
             view.setUint16(lpDestStr + i * 2, lut[view.getUint16(lpSrcStr + i * 2, true)]!, true);
         }
-        view.setUint16(lpDestStr + toWrite * 2, 0, true);
+        if (withNul) view.setUint16(lpDestStr + srcLen * 2, 0, true);
         localeFastPathStats.lcmapFast++;
-        return toWrite + 1;
+        return outLen;
     }, { trivial: true });
 
     // -------------------------------------------------------------------------

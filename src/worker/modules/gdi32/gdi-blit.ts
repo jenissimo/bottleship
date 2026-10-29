@@ -18,6 +18,14 @@ import { DEFAULT_BITMAP_HANDLE, cssToColor } from './gdi-objects';
 import { resolveDibSectionRectRgba, writeBackDibSectionRect } from './bitmap-resolve';
 import type { GDIContext } from './context';
 
+/** A ROP's canvas fill is not a SetTextColor. Invalidate the applied-style cache
+ * so the next TextOut/DrawText restores the DC's unchanged text color. */
+function setBlitFill(gdi: GDIContext, hdc: number, ctx: OffscreenCanvasRenderingContext2D, color: string): void {
+    ctx.fillStyle = color;
+    const state = gdi.hdcStates.get(hdc);
+    if (state) state.appliedFillStyle = '';
+}
+
 /**
  * DIBSection bits live in guest memory and are written by the app directly
  * (no API call to observe) — re-mirror the blitted source rect into the source
@@ -171,6 +179,26 @@ function mirrorToSelectedBitmap(
     } catch { /* mismatched/zero-sized canvases: nothing to mirror */ }
 }
 
+/**
+ * PatBlt: the ROPs that read only the brush and the destination. Those are BitBlt's
+ * source-less ROPs, so they share its path, DIB-section write-back included.
+ */
+export function patBlt(gdi: GDIContext, hdc: number, x: number, y: number, width: number, height: number,
+       rop: number): boolean {
+    const PATCOPY = 0x00F00021;
+    const BLACKNESS = 0x00000042;
+    const WHITENESS = 0x00FF0062;
+    const DSTINVERT = 0x00550009;
+    if (width < 0) { x += width; width = -width; }
+    if (height < 0) { y += height; height = -height; }
+    if (rop === PATCOPY) return gdi.fillRect(hdc, x, y, x + width, y + height);
+    if (rop === BLACKNESS || rop === WHITENESS || rop === DSTINVERT) {
+        return bitBlt(gdi, hdc, x, y, width, height, 0, 0, 0, rop);
+    }
+    Logger.warn(LogCategory.GDI32, `PatBlt: unsupported ROP 0x${rop.toString(16)}, treating as success`);
+    return true;
+}
+
 export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, width: number, height: number,
        hdcSrc: number, xSrc: number, ySrc: number, rop: number): boolean {
 
@@ -234,7 +262,7 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
     // Handle source-less ROPs early if no source context
     if (!srcCtx) {
         if (rop === BLACKNESS || rop === WHITENESS) {
-            destCtx.fillStyle = rop === BLACKNESS ? '#000000' : '#FFFFFF';
+            setBlitFill(gdi, hdcDest, destCtx, rop === BLACKNESS ? '#000000' : '#FFFFFF');
             const clipped = gdi.beginClipOn(hdcDest, destCtx);
             destCtx.fillRect(x, y, width, height);
             if (clipped) destCtx.restore();
@@ -343,11 +371,11 @@ export function bitBlt(gdi: GDIContext, hdcDest: number, x: number, y: number, w
             });
         } else if (rop === BLACKNESS) {
             // Fill with black
-            destCtx.fillStyle = '#000000';
+            setBlitFill(gdi, hdcDest, destCtx, '#000000');
             destCtx.fillRect(x, y, width, height);
         } else if (rop === WHITENESS) {
             // Fill with white
-            destCtx.fillStyle = '#FFFFFF';
+            setBlitFill(gdi, hdcDest, destCtx, '#FFFFFF');
             destCtx.fillRect(x, y, width, height);
         } else {
             // Unknown ROP code - fallback to SRCCOPY
@@ -433,7 +461,7 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         if (hdcSrc === 0 && rop === SRCCOPY && destCtx) {
             Logger.warn(LogCategory.GDI32,
                 `stretchBlt: WORKAROUND - hdcSrc=0 with SRCCOPY, filling dest with black`);
-            destCtx.fillStyle = '#000000';
+            setBlitFill(gdi, hdcDest, destCtx, '#000000');
             const clipped = gdi.beginClipOn(hdcDest, destCtx);
             destCtx.fillRect(xDest, yDest, wDest, hDest);
             if (clipped) destCtx.restore();
@@ -453,7 +481,7 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
         const srcLessClip = gdi.clipCopyRect(hdcDest, xDest, yDest, wDest, hDest);
         if (!srcLessClip) return true; // wholly outside the DC's clip: a successful no-paint
         if (rop === BLACKNESS || rop === WHITENESS) {
-            destCtx.fillStyle = rop === BLACKNESS ? '#000000' : '#FFFFFF';
+            setBlitFill(gdi, hdcDest, destCtx, rop === BLACKNESS ? '#000000' : '#FFFFFF');
             const clipped = gdi.beginClipOn(hdcDest, destCtx);
             destCtx.fillRect(xDest, yDest, wDest, hDest);
             if (clipped) destCtx.restore();
@@ -738,11 +766,11 @@ export function stretchBlt(gdi: GDIContext, hdcDest: number, xDest: number, yDes
             });
         } else if (rop === BLACKNESS) {
             // Fill with black
-            destCtx.fillStyle = '#000000';
+            setBlitFill(gdi, hdcDest, destCtx, '#000000');
             destCtx.fillRect(xDest, yDest, wDest, hDest);
         } else if (rop === WHITENESS) {
             // Fill with white
-            destCtx.fillStyle = '#FFFFFF';
+            setBlitFill(gdi, hdcDest, destCtx, '#FFFFFF');
             destCtx.fillRect(xDest, yDest, wDest, hDest);
         } else {
             // Unknown ROP code - fallback to SRCCOPY

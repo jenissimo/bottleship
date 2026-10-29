@@ -648,8 +648,10 @@ export class PELoader {
 
         const dllNameLower = dllName.toLowerCase().replace(/\.dll$/, '');
 
-        // Skip native load of video DLLs when HLE stubs are active
-        if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllNameLower)) {
+        // Explicit app-directory rules override video HLE only for a shipped copy;
+        // a rule alone must not select a DLL from a system directory.
+        if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllNameLower)
+            && findDllRule(EmulatorConfig.getInstance().appDirDlls, dllName) === null) {
             Logger.log(LogCategory.SYSTEM, `[PE] Skipping native load of "${dllName}" — HLE stubs active`);
             return { kind: "none" }; // IAT will be resolved to HLE thunk stubs
         }
@@ -677,6 +679,10 @@ export class PELoader {
         // Find DLL in VFS
         const dllPath = this.findDllPath(dllNameLower, loadFlags, searchDirectories);
         if (!dllPath) return { kind: "none" };
+        if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllNameLower)
+            && isUnderSystemDirectory(normalizeDllPathToken(dllPath))) {
+            return { kind: "none" };
+        }
         return { kind: "path", path: dllPath, nameLower: dllNameLower };
     }
 

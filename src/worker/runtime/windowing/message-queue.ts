@@ -184,6 +184,7 @@ class RingBuffer {
                         this.ptXs[dst] = this.ptXs[src];
                         this.ptYs[dst] = this.ptYs[src];
                         this.targetThreadIds[dst] = this.targetThreadIds[src];
+                        this.extraInfos[dst] = this.extraInfos[src];
                         this.keyStatePresent[dst] = this.keyStatePresent[src];
                         if (this.keyStatePresent[src]) {
                             const dstOffset = dst * KEY_STATE_BYTES;
@@ -201,7 +202,8 @@ class RingBuffer {
             }
             return null;
         }
-        // No thread filter — take head
+        // No thread filter — take head. The target still travels with the message: a caller
+        // that drains and re-queues (removeWindow) must hand it back to the same thread.
         const idx = this.head;
         this.head = (this.head + 1) & this.mask;
         this.count--;
@@ -213,6 +215,7 @@ class RingBuffer {
             time: this.times[idx],
             ptX: this.ptXs[idx],
             ptY: this.ptYs[idx],
+            targetThreadId: this.targetThreadIds[idx],
             keyStatePacked: this.getKeyStateSnapshot(idx),
             extraInfo: this.extraInfos[idx],
         };
@@ -269,6 +272,7 @@ class RingBuffer {
                     time: this.times[idx],
                     ptX: this.ptXs[idx],
                     ptY: this.ptYs[idx],
+                    targetThreadId: this.targetThreadIds[idx],
                     keyStatePacked: this.getKeyStateSnapshot(idx),
                     extraInfo: this.extraInfos[idx],
                 };
@@ -284,6 +288,7 @@ class RingBuffer {
                     this.ptXs[dst] = this.ptXs[src];
                     this.ptYs[dst] = this.ptYs[src];
                     this.targetThreadIds[dst] = this.targetThreadIds[src];
+                    this.extraInfos[dst] = this.extraInfos[src];
                     this.keyStatePresent[dst] = this.keyStatePresent[src];
                     if (this.keyStatePresent[src]) {
                         const dstOffset = dst * KEY_STATE_BYTES;

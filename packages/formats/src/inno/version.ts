@@ -20,8 +20,8 @@ export const VersionFlags = {
     ISX: 1 << 2,
 } as const;
 
-/** Supported range per M2 spec: [5.2.0, 6.4.x] */
-export const MIN_SUPPORTED_VERSION = INNO_VERSION(5, 2, 0);
+/** Supported range: [5.1.0, 6.4.x]. The 5.1.x field gates are ported from innoextract like the rest. */
+export const MIN_SUPPORTED_VERSION = INNO_VERSION(5, 1, 0);
 export const MAX_SUPPORTED_VERSION = INNO_VERSION_EXT(6, 4, 255, 255);
 
 /** setup/version.cpp:74-189 — known version table (5.x unicode entries required) */
@@ -240,7 +240,7 @@ export function parseVersionString(bytes: Uint8Array, baseOffset = 0): InnoVersi
 export function assertSupportedVersion(version: InnoVersion, offset?: number): void {
     if (version.value < MIN_SUPPORTED_VERSION || version.value > MAX_SUPPORTED_VERSION) {
         throw new InnoFormatError(
-            `unsupported Inno Setup version ${version.toString()} (supported: 5.2.0 – 6.4.x)`,
+            `unsupported Inno Setup version ${version.toString()} (supported: 5.1.0 – 6.4.x)`,
             offset,
         );
     }

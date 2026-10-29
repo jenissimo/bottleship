@@ -3,7 +3,7 @@
 
 import { type HleDispatcher, ThunkImplementation, FastPathImplementation } from '../../../core/thunking/thunk-dispatcher';
 import { TimeService } from '../../../runtime/time';
-import { VFS_FILETIME } from '../../../runtime/filesystem/file-time';
+import { fileTimeOf } from '../../../runtime/filesystem/file-time';
 import { Logger, LogCategory } from '../../../core/logger';
 import { System } from '../../../core/system';
 import { WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION } from '../../../core/scheduler/types';
@@ -336,10 +336,13 @@ function initTimeFunctions(): void {
         Logger.verbose(LogCategory.KERNEL32,
             `GetFileTime(hFile=0x${hFile.toString(16)})`);
 
+        const system = System.getInstance();
+        const path = system.resourceProvider.getFileHandle(hFile >>> 0)?.vfsHandle?.path;
+        const time = fileTimeOf(path ? system.fileSystem.statEntry(path) : null);
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         for (const ptr of [lpCreationTime, lpLastAccessTime, lpLastWriteTime]) {
             if (ptr && ptr + 8 <= mem.length) {
-                view.setBigUint64(ptr, VFS_FILETIME, true);
+                view.setBigUint64(ptr, time, true);
             }
         }
 

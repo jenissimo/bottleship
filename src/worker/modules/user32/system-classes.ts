@@ -69,11 +69,13 @@ export function getBuiltinSystemClass(className: string): BuiltinSystemClass | u
  * When the thunk fires, the DefWindowProcA handler runs in JS.
  */
 let cachedDefWindowProcAddr = 0;
+let cachedDefWindowProcWAddr = 0;
 let cachedDefDlgProcAddr = 0;
 
 /** The thunk layout is rebuilt on bundle switch — the cached stub address dies with it. */
 export function resetDefWindowProcCache(): void {
     cachedDefWindowProcAddr = 0;
+    cachedDefWindowProcWAddr = 0;
     cachedDefDlgProcAddr = 0;
 }
 
@@ -131,6 +133,16 @@ function resolveWndProcStub(exportName: string): number {
 export function getDefWindowProcAddress(): number {
     if (!cachedDefWindowProcAddr) cachedDefWindowProcAddr = resolveWndProcStub('DefWindowProcA');
     return cachedDefWindowProcAddr;
+}
+
+/**
+ * The Unicode face of a system control's class procedure. Win32 hands a W caller of
+ * GWL_WNDPROC the W procedure, so a Unicode subclasser forwards wide text through it
+ * (CallWindowProcW → class proc) and the class proc must read it as wide.
+ */
+export function getDefWindowProcWAddress(): number {
+    if (!cachedDefWindowProcWAddr) cachedDefWindowProcWAddr = resolveWndProcStub('DefWindowProcW');
+    return cachedDefWindowProcWAddr;
 }
 
 /**

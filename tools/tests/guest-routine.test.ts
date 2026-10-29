@@ -4,7 +4,7 @@ import {Mem} from "../../src/worker/core/memory/mem-accessor";
 import {CallbackManager} from "../../src/worker/core/thunking/callback-manager";
 import {Process} from "../../src/worker/core/process";
 import {runGuestRoutine, type GuestRoutine} from "../../src/worker/core/thunking/guest-routine";
-import type {X86Context} from "../../src/worker/core/thunking/thunk-dispatcher";
+import {ThunkDispatcher, type X86Context} from "../../src/worker/core/thunking/thunk-dispatcher";
 
 const system = System.getInstance();
 const saved = {process: system.process, scheduler: system.scheduler, isExiting: system.isExiting};
@@ -64,6 +64,29 @@ describe("guest routines over the real callback manager", () => {
         finish(nextId, 42);
         expect(cpu.reg32[0]).toBe(42);
         expect(manager.getPendingCount()).toBe(0);
+    });
+
+    test("an API stub called by a routine may return to its callback stub only during that call", () => {
+        // The dispatcher's pre/post-call return-address check, over the real callback manager.
+        const API_ID = 0x42;
+        const dispatcher = {
+            callbackStubPoolBase: 0x4000, callbackStubPoolEnd: 0x8000, memLength: mem.length,
+            cachedDataView: new DataView(mem.buffer), _callbackManager: manager,
+            thunkGenerator: {getStubByAddress: (a: number) => a === TARGET ? {functionId: API_ID} : undefined},
+        };
+        const entry = (id: number) => (ThunkDispatcher.prototype as any).isDirectCallEntry.call(dispatcher, id, cpu.reg32[4] >>> 0);
+        const r = runGuestRoutine(ctx(), mem, (function* (): GuestRoutine {
+            return yield {fn: TARGET, args: [1], tag: "LoadLibraryA"};
+        })(), 4, "routine") as any;
+        expect(entry(API_ID)).toBe(true);
+        expect(entry(API_ID + 1)).toBe(false);            // another API on the same stub
+        const stub = new DataView(mem.buffer).getUint32(cpu.reg32[4], true);
+        finish(r.callbackId, 5);
+        expect(manager.getDirectCallTarget(stub)).toBe(0);
+        // The same API reached later with a stale stub address at [ESP] is a desync again.
+        cpu.reg32[4] = ENTRY - 0x100;
+        new DataView(mem.buffer).setUint32(cpu.reg32[4], stub, true);
+        expect(entry(API_ID)).toBe(false);
     });
 
     test("a rejected callback frame returns its stub slot to the pool", () => {

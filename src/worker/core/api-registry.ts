@@ -12,6 +12,7 @@ import { msvcp140Module } from "../api/msvcp140.api";
 import { bcryptModule } from "../api/bcrypt.api";
 import { dpnetModule } from '../api/dpnet.api';
 import { dpnlobbyModule } from '../api/dpnlobby.api';
+import { d3dim700Module } from "../api/d3dim700.api";
 import { kernel32VistaSupplement } from "../api/kernel32-vista-supplement";
 import { REFERENCE_ARG_COUNTS } from "../reference-argcounts.generated";
 import { Logger, LogCategory } from "./logger";
@@ -99,6 +100,7 @@ export class APIRegistry {
         this.registerModule(bcryptModule);
         this.registerModule(dpnetModule);
         this.registerModule(dpnlobbyModule);
+        this.registerModule(d3dim700Module);
 
         try {
             const apiModules = import.meta.glob('../api/*.api.ts', { eager: true });

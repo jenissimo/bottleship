@@ -2,13 +2,13 @@
 /**
  * rar-extract: List or extract a RAR4/RAR5 archive using our own reader
  * (`packages/formats/src/rar/`). RAR5 supports stored entries; RAR4/SFX also supports
- * non-solid RAR 2.9 LZ/PPMd and standard filters. Unsupported coding is refused.
+ * RAR 2.9 LZ/PPMd, solid groups, Unicode names and standard filters. Unsupported coding is refused.
  *
  * Multi-volume sets (`name.part1.rar`, `name.part2.rar`, …) are followed automatically
  * from the first volume, and a file split across volumes is concatenated in order.
  *
  * Usage:
- *   bun tools/rar-extract.ts <archive.rar> <out-dir> [--list] [--quiet] [--no-verify]
+ *   bun tools/rar-extract.ts <archive.rar> <out-dir> [--list] [--verbose] [--quiet] [--no-verify]
  */
 import { openSync, writeSync, closeSync, mkdirSync, existsSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -39,7 +39,10 @@ const rar4Offset = findRar4(firstSource.readRangeSync(0, Math.min(firstSource.si
 if (rar4Offset !== null) {
     const archive = parseRar4(firstSource, rar4Offset);
     if (listOnly) {
-        for (const e of archive.entries) console.log(`${e.isDirectory ? '<DIR>' : e.unpackedSize}\t${e.name}`);
+        for (const e of archive.entries) {
+            const coding = flags.has('--verbose') ? `\tv=${e.version} method=0x${e.method.toString(16)} flags=0x${e.flags.toString(16)}` : '';
+            console.log(`${e.isDirectory ? '<DIR>' : e.unpackedSize}\t${e.name}${coding}`);
+        }
     } else {
         const codec = new UnpackDecoder();
         await codec.init(await Bun.file(new URL('../public/unpack-streaming.wasm', import.meta.url)).arrayBuffer());

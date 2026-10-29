@@ -54,3 +54,22 @@ export function peOverlay(bytes: Uint8Array): number | null {
     }
     return end;
 }
+
+/**
+ * File extent of an Authenticode signature (the security data directory, whose address is a
+ * FILE offset, not an RVA), or null when the image carries none. Signing appends it after
+ * any overlay, so an overlay format that runs "to EOF" really runs to this offset.
+ */
+export function peCertificateTable(bytes: Uint8Array): { offset: number; size: number } | null {
+    if (bytes.length < 64 || bytes[0] !== 0x4d || bytes[1] !== 0x5a) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const pe = view.getUint32(60, true);
+    if (pe + 24 + 2 > bytes.length || view.getUint32(pe, true) !== 0x4550) return null;
+    const opt = pe + 24;
+    const magic = view.getUint16(opt, true);
+    const dirs = magic === 0x10b ? opt + 96 : magic === 0x20b ? opt + 112 : -1;
+    if (dirs < 0 || dirs + 5 * 8 > bytes.length || view.getUint32(dirs - 4, true) < 5) return null;
+    const offset = view.getUint32(dirs + 4 * 8, true), size = view.getUint32(dirs + 4 * 8 + 4, true);
+    if (!offset || !size || offset + size > bytes.length) return null;
+    return { offset, size };
+}

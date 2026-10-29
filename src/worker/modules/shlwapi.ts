@@ -5,6 +5,9 @@ import { Mem } from "../core/memory/mem-accessor";
 import { encodeAnsi, getCodePageDecoder } from "./codepage-utils";
 import { EmulatorConfig } from "../core/emulator-config-manager";
 import { System } from "../core/system";
+import { exports as resourceExports } from "./kernel32/resource";
+import { exports as fileExports } from "./kernel32/file-io";
+import { collectDefaultSearchDirectories } from "./kernel32/file-io-path";
 
 const MAX_PATH = 260;
 const FILE_ATTRIBUTE_DIRECTORY = 0x10;
@@ -14,9 +17,33 @@ export class Shlwapi implements IModule {
     exports: Record<string, ThunkImplementation> = {};
 
     initialize(_process: Process): void {
+        // SHLWAPI ordinal 66 forwards to KERNEL32.FindResourceW on Windows.
+        this.exports["ord_66"] = resourceExports["FindResourceW"];
+        this.exports["ord_52"] = fileExports["CreateFileW"];
         const bindA = (name: string, fn: (args: number[]) => number, stackCleanup: number) => {
             this.exports[name] = (_ctx, _mem, args) => ({ value: fn(args), stackCleanup });
         };
+
+        bindA("StrCmpNW", (args) => {
+            const count = args[2] | 0;
+            for (let i = 0; i < count; i++) {
+                const a = Mem.readUint16(args[0] + i * 2) ?? 0;
+                const b = Mem.readUint16(args[1] + i * 2) ?? 0;
+                if (a !== b) return a - b;
+                if (a === 0) break;
+            }
+            return 0;
+        }, 12);
+        bindA("PathCreateFromUrlA", (args) => this.pathCreateFromUrl(args, false), 16);
+        bindA("PathCreateFromUrlW", (args) => this.pathCreateFromUrl(args, true), 16);
+        bindA("UrlCreateFromPathA", (args) => this.urlCreateFromPath(args, false), 16);
+        bindA("UrlCreateFromPathW", (args) => this.urlCreateFromPath(args, true), 16);
+        bindA("UrlIsA", (args) => this.urlIs(this.readAnsi(args[0]), args[1]), 8);
+        bindA("UrlIsW", (args) => this.urlIs(this.readWide(args[0]), args[1]), 8);
+        bindA("PathIsURLA", (args) => /^[a-z][a-z0-9+.-]+:/i.test(this.readAnsi(args[0] >>> 0)) ? 1 : 0, 4);
+        bindA("PathIsURLW", (args) => /^[a-z][a-z0-9+.-]+:/i.test(this.readWide(args[0] >>> 0)) ? 1 : 0, 4);
+        bindA("PathSearchAndQualifyA", (args) => this.searchAndQualify(args, false), 12);
+        bindA("PathSearchAndQualifyW", (args) => this.searchAndQualify(args, true), 12);
 
         bindA("PathFindFileNameA", (args) => this.findFileNameAnsi(args[0] >>> 0), 4);
         bindA("PathFindFileNameW", (args) => this.findFileNameWide(args[0] >>> 0), 4);
@@ -213,6 +240,85 @@ export class Shlwapi implements IModule {
         }
         Mem.writeBytes(ptr, bytes);
         return true;
+    }
+
+    private pathCreateFromUrl(args: number[], wide: boolean): number {
+        const [source, destination, lengthPtr] = args;
+        if (!source || !lengthPtr) return 0x80070057;
+        const url = wide ? this.readWide(source, 4096) : this.readAnsi(source, 4096);
+        if (!/^file:/i.test(url)) return 0x80070057;
+        let path = url.slice(5);
+        if (path.startsWith("///")) path = path.slice(3);
+        else if (/^\/\/[a-z]:/i.test(path)) path = path.slice(2);
+        else if (/^\/\/[a-z]/i.test(path)) path = "//" + path.slice(2);
+        try { path = decodeURIComponent(path); } catch { return 0x80070057; }
+        path = path.split("/").join(String.fromCharCode(92));
+        const capacity = Mem.readUint32(lengthPtr) ?? 0;
+        const required = wide ? path.length : encodeAnsi(path).length;
+        if (!destination || capacity <= required) {
+            Mem.writeUint32(lengthPtr, required + 1);
+            return 0x80004003;
+        }
+        if (wide) this.writeWide(destination, path, capacity);
+        else this.writeAnsi(destination, path, capacity);
+        Mem.writeUint32(lengthPtr, required);
+        return 0;
+    }
+
+    private urlCreateFromPath(args: number[], wide: boolean): number {
+        const [source, destination, lengthPtr] = args;
+        if (!source || !lengthPtr) return 0x80070057;
+        const capacity = Mem.readUint32(lengthPtr) ?? 0;
+        const path = wide ? this.readWide(source) : this.readAnsi(source);
+        const alreadyUrl = /^[a-z][a-z0-9+.-]+:/i.test(path);
+        const normalized = path.split(String.fromCharCode(92)).join("/");
+        const url = alreadyUrl ? path : "file:" + (normalized.startsWith("//") ? "" : "///")
+            + encodeURI(normalized).replace(/#/g, "%23").replace(/[?]/g, "%3F");
+        const required = wide ? url.length : encodeAnsi(url).length;
+        if (!destination || capacity <= required) {
+            Mem.writeUint32(lengthPtr, required + 1);
+            return 0x80004003;
+        }
+        if (wide) this.writeWide(destination, url, capacity);
+        else this.writeAnsi(destination, url, capacity);
+        Mem.writeUint32(lengthPtr, required);
+        return alreadyUrl ? 1 : 0;
+    }
+
+    private urlIs(url: string, kind: number): number {
+        const match = /^([a-z][a-z0-9+.-]+):/i.exec(url);
+        if (!match) return 0;
+        const scheme = match[1].toLowerCase();
+        switch (kind) {
+            case 0: return 1;
+            case 1: return url.slice(match[0].length).startsWith("//") ? 0 : 1;
+            case 2: return /^(about|javascript|vbscript)$/.test(scheme) ? 1 : 0;
+            case 3: return scheme === "file" ? 1 : 0;
+            case 4: return scheme === "file" || scheme === "http" || scheme === "https" ? 1 : 0;
+            case 5: return url.split(/[?#]/)[0].endsWith("/") ? 1 : 0;
+            case 6: return url.includes("?") ? 1 : 0;
+            default: return 0;
+        }
+    }
+
+    private searchAndQualify(args: number[], wide: boolean): number {
+        const [source, destination, capacity] = args;
+        if (!source || !destination || !capacity) return 0;
+        const path = wide ? this.readWide(source) : this.readAnsi(source);
+        if (!path) return 0;
+        const vfs = System.getInstance().fileSystem;
+        let qualified = vfs.resolvePath(path);
+        if (!/[\\\\/:]/.test(path)) {
+            for (const directory of collectDefaultSearchDirectories()) {
+                const candidate = vfs.resolvePath(this.joinPath(directory, path));
+                if (vfs.fileExists(candidate) && !vfs.directoryExists(candidate)) {
+                    qualified = candidate;
+                    break;
+                }
+            }
+        }
+        return (wide ? this.writeWide(destination, qualified, capacity)
+            : this.writeAnsi(destination, qualified, capacity)) ? 1 : 0;
     }
 
     private normalizeSlashes(path: string): string {

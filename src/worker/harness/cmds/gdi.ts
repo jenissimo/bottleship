@@ -13,6 +13,8 @@
 import type { HarnessService } from "../service";
 import { HarnessError, HarnessErrorCode } from "../rpc";
 import { sys } from "../serialize";
+import { SystemResourceProvider } from "../../core/resources/system-resource-provider";
+import { dibColorMasks } from "../../modules/gdi32/bitmap-resolve";
 import { bytesToBase64, debugDumpPath } from "./screen";
 
 interface Coverage {
@@ -94,6 +96,20 @@ export function registerGdiCommands(svc: HarnessService): void {
      * `pixels:false` skips the coverage read (a getImageData per surface) when only the
      * topology is wanted.
      */
+    /** The DIB section selected into a DC, as the guest laid out its bits — the depth and
+     *  masks a reader of `bitsPtr` decodes with. Null for anything that is not one. */
+    const dibSectionInfo = (hBitmap: number | undefined) => {
+        const o = hBitmap ? SystemResourceProvider.getInstance().getUserObject(hBitmap) as
+            { bitsPtr?: number; dibBpp?: number; dibStride?: number; dibTopDown?: boolean; dibMasks?: number[] } | undefined : undefined;
+        if (!o?.bitsPtr || !o.dibStride) return null;
+        const bpp = o.dibBpp ?? 32;
+        return {
+            bitsPtr: hex(o.bitsPtr), bpp, stride: o.dibStride, topDown: !!o.dibTopDown,
+            masks: bpp > 8 ? dibColorMasks(bpp, o.dibMasks).map(m => hex(m)) : null,
+            bitfields: !!o.dibMasks,
+        };
+    };
+
     svc.register("gdiDcs", (args) => {
         const opts = (args[0] ?? {}) as { pixels?: boolean };
         const wantPixels = opts.pixels !== false;
@@ -121,6 +137,7 @@ export function registerGdiCommands(svc: HarnessService): void {
                 dirty: !!st["dirty"],
                 skipOverlayFlush: !!st["skipOverlayFlush"],
                 linkedBitmapCanvas: !!(canvas as { __bitmapCanvas?: unknown } | undefined)?.__bitmapCanvas,
+                dib: dibSectionInfo(st["hBitmap"] as number | undefined),
                 coverage: wantPixels && canvas ? coverage(canvas) : null,
             };
         });

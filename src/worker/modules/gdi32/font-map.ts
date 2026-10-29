@@ -1,8 +1,9 @@
 /**
  * Windows → bundled-font name mapping for GDI text rendering. Maps common
  * Windows face names games request to the metric-compatible Liberation fonts
- * we ship (WINDOWS_FONT_MAP).
+ * we ship (WINDOWS_FONT_MAP), unless the face itself is installed.
  */
+import { isInstalledFontName } from './font-resource';
 
 const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'arial':                'Liberation Sans',
@@ -24,9 +25,10 @@ const WINDOWS_FONT_MAP: Readonly<Record<string, string>> = {
     'impact':               'Liberation Sans',
 };
 
-/** Map a requested Windows face name to a bundled font; unknown names pass through. */
+/** Map a requested Windows face name to a bundled font; installed and unknown names pass through. */
 export function resolveWindowsFontName(faceName: string): string {
     if (!faceName) return 'Liberation Sans';
+    if (isInstalledFontName(faceName)) return faceName;
     const mapped = WINDOWS_FONT_MAP[faceName.toLowerCase()];
     return mapped ?? faceName;
 }

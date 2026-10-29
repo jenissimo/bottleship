@@ -1,11 +1,12 @@
 /**
  * Thread-stack release.
  *
- * Windows deallocates a thread's stack when the thread terminates; holding it for the life
- * of the process is the deviation, and at 8 MB of SizeOfStackReserve a handful of dead
- * threads exhaust the guest heap. Releasing introduces address REUSE, though — the leak was
- * accidentally protective — so these pin BOTH halves: the footprint stops growing, AND every
- * reference we cannot prove dead still blocks the release.
+ * Windows deallocates a thread's stack when the thread terminates (PspThreadDelete →
+ * MmDeleteKernelStack); holding it is the deviation, and at 8 MB of SizeOfStackReserve a
+ * spawn storm of dead threads exhausts the guest heap (CreateThread fails mid-load). These
+ * pin BOTH halves of the contract: the footprint tracks live concurrency, AND every
+ * reference we cannot prove dead still blocks the release — with a blocked stack retried
+ * on later reap passes instead of leaking its VA.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -22,7 +23,6 @@ const GUARD = 0x1000;
 const PAGE_NOACCESS = 0x01;
 const PAGE_READWRITE = 0x04;
 const MEM_BYTES = 64 * MB;
-const REAP_AFTER = 1e12; // far past REAP_GRACE_MS for any terminatedAt
 
 /** Bump allocator with an exact-fit free list — enough shape that a released block really
  *  can come back, which is what makes the guard-page reset observable. */
@@ -120,7 +120,7 @@ function kill(s: Scheduler, id: number): void {
 }
 
 function reap(s: Scheduler): void {
-    (s as any).reapTerminatedThreads(REAP_AFTER);
+    (s as any).reapTerminatedThreads();
 }
 
 function thread(s: Scheduler, id: number): Thread {
@@ -261,9 +261,10 @@ describe("scheduler/thread-stack release — stale-reference gates", () => {
         kill(s, id);
         reap(s);
 
-        // The Thread record is gone, but the stack is NOT pooled — the completion may still
-        // write into the frame it parked on.
-        expect(thread(s, id)).toBeUndefined();
+        // The stack is NOT pooled — the completion may still write into the frame it
+        // parked on — and the Thread record stays queued for the retry pass (dropping it
+        // is what used to turn a pinned stack into a permanent leak).
+        expect(thread(s, id)).toBeDefined();
         expect(s.getStackFootprint().pooledBlocks).toBe(0);
         expect(s.getStackFootprint().stats.heldAsyncInFlight).toBe(1);
         expect(memory.freed).toEqual([]);
@@ -271,6 +272,12 @@ describe("scheduler/thread-stack release — stale-reference gates", () => {
         // …and nothing hands that VA to the next thread.
         const id2 = spawn(s, mem);
         expect(thread(s, id2).stackBase).not.toBe(base);
+
+        // Once the reference drops, the retry pass releases the stack and reaps the record.
+        asyncThreads.delete(id);
+        reap(s);
+        expect(thread(s, id)).toBeUndefined();
+        expect(s.getStackFootprint().pooledBlocks).toBe(1);
     });
 
     test("a live suspended-thunk frame pins the stack it will be resumed from", () => {
@@ -318,16 +325,29 @@ describe("scheduler/thread-stack release — stale-reference gates", () => {
         const base = thread(s, id).stackBase;
         asyncThreads.add(id);
         kill(s, id);
-        // Reap while pinned would drop the Thread record with the stack still held, so
-        // exercise the gate through the release entry point directly, as the reaper does.
-        const t = thread(s, id);
-        (s as any).releaseStack(t);
+        reap(s);
         expect(s.getStackFootprint().pooledBlocks).toBe(0);
 
+        // A later pass, after the reference dropped, releases and re-hands the SAME block.
         asyncThreads.delete(id);
-        (s as any).releaseStack(t);
+        reap(s);
         expect(s.getStackFootprint().pooledBlocks).toBe(1);
         expect(spawnBase(s, mem)).toBe(base);
+    });
+
+    test("the reaper does not delete the record of a thread whose stack it could not take", () => {
+        const asyncThreads = new Set<number>();
+        const { s, mem } = setup({ asyncThreads });
+        const id = spawn(s, mem);
+        asyncThreads.add(id);
+        kill(s, id);
+        reap(s);
+        // Retryable, not leaked: the record survives with the stack it pins — the stack is
+        // still reserved and still ours, just not pooled or handed out again.
+        expect(thread(s, id)).toBeDefined();
+        const f = s.getStackFootprint();
+        expect(f.reservedBytes).toBe(1 * MB + GUARD);
+        expect(f.pooledBytes).toBe(0);
     });
 
     test("a stack the scheduler did not allocate is never released", () => {

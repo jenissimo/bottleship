@@ -427,6 +427,8 @@ export type RecordDrawCallParams = {
     viewport?: { x: number; y: number; width: number; height: number; minZ: number; maxZ: number } | null;
     /** Draw-time FFP lighting state. It is copied into plain data before capture returns. */
     lighting?: FFPLightingState | null;
+    /** D3D8 pixel-shader handle bound at draw time (0 = fixed-function pixel pipeline). */
+    pixelShader?: number;
     executionDiagnostics: {
         useTexture: boolean;
         minFilter: number;
@@ -771,6 +773,7 @@ export function recordDrawCall(p: RecordDrawCallParams): void {
         warnings,
         mvp: p.mvp ? Array.from(p.mvp) : null,
         viewport: p.viewport ? { ...p.viewport } : null,
+        ...(p.pixelShader !== undefined ? { pixelShader: p.pixelShader >>> 0 } : {}),
         tex0Pixels,
     };
 

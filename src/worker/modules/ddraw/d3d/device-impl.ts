@@ -47,6 +47,12 @@ import {
     D3DVIEWPORT7_SIZE,
     D3DVIEWPORT7_OFFSETS,
     E_INVALIDARG,
+    D3DRENDERSTATE_AMBIENT,
+    D3DRENDERSTATE_COLORVERTEX,
+    D3DRENDERSTATE_FOGDENSITY,
+    D3DRENDERSTATE_FOGEND,
+    D3DRENDERSTATE_FOGSTART,
+    D3DRENDERSTATE_FOGVERTEXMODE,
 } from "../constants";
 import { ComObjectFactory } from "../../../core/com/base-com-object";
 import { allocateComObject } from "../../../core/com/com-memory";
@@ -55,6 +61,7 @@ import {
     DirectDrawSurfaceState,
     Direct3DDevice3Object,
     Direct3DDevice7Object,
+    Direct3DMaterial3Object,
     Direct3DViewport3Object,
     Direct3DVertexBufferObject,
     isRenderSurface,
@@ -1938,6 +1945,60 @@ export const createDeviceExports = (
     // =========================================================================
     // DEVICE3 GETTER METHODS
     // =========================================================================
+
+    // DX5/DX6 light state: the material by handle, the colour model, and six values that
+    // are render states under another name (Wine d3d_device3_SetLightState).
+    const D3DLIGHTSTATE_MATERIAL = 1;
+    const D3DLIGHTSTATE_COLORMODEL = 3;
+    const D3DCOLOR_MONO = 1;
+    const D3DCOLOR_RGB = 2;
+    const lightStateRenderState: Readonly<Record<number, number>> = {
+        2: D3DRENDERSTATE_AMBIENT,
+        4: D3DRENDERSTATE_FOGVERTEXMODE,
+        5: D3DRENDERSTATE_FOGSTART,
+        6: D3DRENDERSTATE_FOGEND,
+        7: D3DRENDERSTATE_FOGDENSITY,
+        8: D3DRENDERSTATE_COLORVERTEX,
+    };
+
+    exports["IDirect3DDevice3_SetLightState"] = (ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
+        if (!obj) return D3DERR_INVALIDCALL;
+        const type = args[1] >>> 0;
+        const value = args[2] >>> 0;
+        if (type === D3DLIGHTSTATE_MATERIAL) {
+            if (value) {
+                const material = resourceProvider.getComObject(value);
+                if (!(material instanceof Direct3DMaterial3Object)) return E_INVALIDARG;
+                obj.setMaterial(material.getMaterialData());
+                material.setActiveDevice(obj);
+            }
+            obj.setLightStateMaterial(value);
+            return D3D_OK;
+        }
+        if (type === D3DLIGHTSTATE_COLORMODEL) {
+            if (value !== D3DCOLOR_MONO && value !== D3DCOLOR_RGB) return E_INVALIDARG;
+            obj.setColorModel(value);
+            return D3D_OK;
+        }
+        const renderState = lightStateRenderState[type];
+        if (renderState === undefined) return E_INVALIDARG;
+        return exports["IDirect3DDevice3_SetRenderState"]!(ctx, mem, [args[0], renderState, value]);
+    };
+
+    exports["IDirect3DDevice3_GetLightState"] = (ctx, mem, args) => {
+        const obj = resourceProvider.getComObjectByAddress(args[0]) as Direct3DDevice3Object | null;
+        const type = args[1] >>> 0;
+        const pValue = args[2] >>> 0;
+        if (!obj || !pValue || !isValidAddress(mem, pValue, 4, "rw")) return D3DERR_INVALIDCALL;
+        if (type === D3DLIGHTSTATE_MATERIAL || type === D3DLIGHTSTATE_COLORMODEL) {
+            getDataView(mem).setUint32(pValue, type === D3DLIGHTSTATE_MATERIAL ? obj.getLightStateMaterial() : obj.getColorModel(), true);
+            return D3D_OK;
+        }
+        const renderState = lightStateRenderState[type];
+        if (renderState === undefined) return E_INVALIDARG;
+        return exports["IDirect3DDevice3_GetRenderState"]!(ctx, mem, [args[0], renderState, pValue]);
+    };
 
     exports["IDirect3DDevice3_GetRenderState"] = (ctx, mem, args) => {
         const thisPtr = args[0];

@@ -1898,9 +1898,9 @@ export class DSound implements IModule {
             if (audioPtr1 >= buffer.ptr && audioPtr1 < buffer.ptr + buffer.bytes) {
                 offset = audioPtr1 - buffer.ptr;
                 firstSize = Math.min(bytes1, buffer.bytes - offset);
-                // Part 2 is Lock's wrap segment at offset 0; the two spans of one Lock
-                // never cover more than the buffer.
-                secondSize = Math.min(bytes2, buffer.bytes - offset - firstSize);
+                // Lock's second region starts at zero, not offset + firstSize;
+                // the two spans together never cover more than the buffer.
+                secondSize = Math.min(bytes2, buffer.bytes - firstSize);
             } else {
                 offset = buffer.lockOffset ?? 0;
                 firstSize = buffer.lockFirstSize ?? 0;

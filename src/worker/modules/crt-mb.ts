@@ -16,6 +16,73 @@ export interface CrtMbHost {
 export function registerCrtMbExports(exports: Record<string, ThunkImplementation>, host: CrtMbHost): void {
     const chr = (ptr: number, i: number) => Mem.readUint8(ptr + i) ?? 0;
 
+    // The counted forms. Under the SBCS code page bytes are characters; a DBCS code page
+    // needs lead-byte-aware traversal, so refuse it rather than miscount.
+    const requireSbcs = () => {
+        if (host.getMbcp() !== 0) throw new Error('CRT counted multibyte helpers: DBCS is not implemented');
+    };
+    const byte = (ptr: number): number => {
+        const value = ptr ? Mem.readUint8(ptr) : null;
+        if (value == null) throw new Error(`CRT multibyte string: invalid guest pointer 0x${ptr.toString(16)}`);
+        return value;
+    };
+    const countBytes = (ptr: number, max: number): number => {
+        let n = 0;
+        while (n < max && byte(ptr + n) !== 0) n++;
+        return n;
+    };
+    const put = (ptr: number, value: number): void => {
+        if (!ptr || !Mem.writeUint8(ptr, value))
+            throw new Error(`CRT multibyte string: invalid guest destination 0x${ptr.toString(16)}`);
+    };
+    exports['_mbslen'] = (_c, _m, a) => {
+        requireSbcs();
+        return countBytes(a[0] ?? 0, 0xffffffff);
+    };
+    exports['_mbsnbcnt'] = exports['_mbsnccnt'] = (_c, _m, a) => {
+        requireSbcs();
+        return countBytes(a[0] ?? 0, (a[1] ?? 0) >>> 0);
+    };
+    exports['_mbsninc'] = (_c, _m, a) => {
+        requireSbcs();
+        const p = a[0] ?? 0;
+        return p ? (p + countBytes(p, (a[1] ?? 0) >>> 0)) >>> 0 : 0;
+    };
+    exports['_mbsncpy'] = (_c, _m, a) => {
+        requireSbcs();
+        const dst = a[0] ?? 0, src = a[1] ?? 0, count = (a[2] ?? 0) >>> 0;
+        let ended = false;
+        for (let i = 0; i < count; i++) {
+            const b = ended ? 0 : byte(src + i);
+            if (b === 0) ended = true;
+            put(dst + i, b);
+        }
+        return dst >>> 0;
+    };
+    exports['_mbsncmp'] = (_c, _m, a) => {
+        requireSbcs();
+        const left = a[0] ?? 0, right = a[1] ?? 0, count = (a[2] ?? 0) >>> 0;
+        for (let i = 0; i < count; i++) {
+            const l = byte(left + i), r = byte(right + i);
+            if (l !== r) return l < r ? -1 : 1;
+            if (l === 0) break;
+        }
+        return 0;
+    };
+    exports['_mbsnbcat'] = (_c, _m, a) => {
+        requireSbcs();
+        const dst = a[0] ?? 0, src = a[1] ?? 0, count = (a[2] ?? 0) >>> 0;
+        const end = dst + countBytes(dst, 0xffffffff);
+        let copied = 0;
+        while (copied < count) {
+            const b = byte(src + copied);
+            if (b === 0) break;
+            put(end + copied++, b);
+        }
+        put(end + copied, 0);
+        return dst >>> 0;
+    };
+
     exports["_mbschr"] = (_c, _m, a) => {
         const str = a[0] ?? 0;
         const ch = (a[1] ?? 0) & 0xff;
@@ -119,6 +186,15 @@ export function registerCrtMbExports(exports: Record<string, ThunkImplementation
         const ptr = a[0] ?? 0;
         if (!ptr) return 0;
         return chr(ptr, 0) === 0 ? 0 : 1;
+    };
+
+    // Characters, not bytes; with one byte per character that is strlen.
+    exports["_mbstrlen"] = (_c, _m, a) => {
+        const ptr = a[0] ?? 0;
+        if (!ptr) return 0;
+        let n = 0;
+        while (n < 0x7fffffff && chr(ptr, n) !== 0) n++;
+        return n;
     };
 
     exports["_mbsrev"] = (_c, _m, a) => {

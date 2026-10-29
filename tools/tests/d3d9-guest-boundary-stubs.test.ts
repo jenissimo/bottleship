@@ -19,6 +19,8 @@ import {
     resetGuestAddRefStubForTests,
 } from '../../src/worker/modules/d3d9/guest-addref-stub';
 
+import { unpinGuestRefcountStoreForTests } from '../../src/worker/modules/d3d9/com-refs';
+
 const MEM_SIZE = 1 << 20;
 const EXPECT_VTABLE = 0x20400;
 const PREDICT = 0x20100;
@@ -56,6 +58,7 @@ function clearFlags(): void {
 afterEach(() => {
     clearFlags();
     resetGuestAddRefStubForTests();
+    unpinGuestRefcountStoreForTests();
 });
 
 describe('guest AddRef stub — what the emitted bytes actually do', () => {

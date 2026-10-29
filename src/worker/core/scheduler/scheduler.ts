@@ -607,11 +607,13 @@ export class Scheduler {
         }
     }
 
-    // Deferred thread reaping — terminated threads stay briefly for GetExitCodeThread / WaitForSingleObject
-    private reapQueue: Array<{ threadId: number; terminatedAt: number }> = [];
+    // Deferred thread reaping — terminated threads stay until their stack is released
+    // (GetExitCodeThread / WaitForSingleObject answer from the kernel object after that).
+    private reapQueue: Array<{ threadId: number }> = [];
     private reapHead = 0;
+    /** Terminated threads whose stack a canReleaseStack gate still held — retried per pass. */
+    private reapRetryQueue: number[] = [];
     private lastReapCheckMs = 0;
-    private static readonly REAP_GRACE_MS = 5000;
     private static readonly REAP_THROTTLE_MS = 250;
 
     // Sub-ms yields: one host task in flight at a time (see postHostTask)
@@ -912,7 +914,7 @@ export class Scheduler {
         // 2b. Reap terminated threads (throttled)
         if (now - this.lastReapCheckMs >= Scheduler.REAP_THROTTLE_MS) {
             this.lastReapCheckMs = now;
-            this.reapTerminatedThreads(now);
+            this.reapTerminatedThreads();
         }
 
         // 3a. Dispatch timer thread callback if we ARE the timer thread
@@ -1891,8 +1893,8 @@ export class Scheduler {
      *
      * Freeing a stack introduces address REUSE, and the leak it replaces was accidentally
      * protective: nothing else could ever be handed those bytes. Every refusal below is a
-     * live reference we cannot prove dead, and each one costs exactly one leaked stack —
-     * which is the trade this whole path is built around.
+     * live reference we cannot prove dead; the reaper retries a refused stack on later
+     * passes rather than leaking it, so a refusal costs a retry, not the VA.
      */
     private canReleaseStack(thread: Thread): boolean {
         const s = this.stackPoolStats;
@@ -2019,14 +2021,24 @@ export class Scheduler {
             const acquired = this.acquireStack(size);
             stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
             reusedStack = acquired.reused;
-        } catch (e) {
-            const f = this.getStackFootprint();
-            Logger.error(LogCategory.THREAD,
-                `CreateThread failed: ${e} (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
-                `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
-                `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
-                `the stack pool, ${f.heldBytes} leaked by a refused release)`);
-            return 0;
+        } catch {
+            // A burst of spawns inside one reap-throttle window can pin released-eligible
+            // dead stacks past heap exhaustion; reap now (failure path — no throttle) and
+            // retry once before reporting the guest-visible failure.
+            this.reapTerminatedThreads();
+            try {
+                const acquired = this.acquireStack(size);
+                stackBase = acquired.allocBase + Scheduler.STACK_GUARD;
+                reusedStack = acquired.reused;
+            } catch (e) {
+                const f = this.getStackFootprint();
+                Logger.error(LogCategory.THREAD,
+                    `CreateThread failed: ${e} (wanted ${size} bytes; dwStackSize=${stackSize}, ` +
+                    `image reserve=${this.imageStackReserve}, ${this.threads.size} thread(s) hold ` +
+                    `${f.liveBytes} of ${f.reservedBytes} bytes of stack, ${f.pooledBytes} idle in ` +
+                    `the stack pool, ${f.heldBytes} leaked by a refused release)`);
+                return 0;
+            }
         }
 
         const stackTop = stackBase + size;
@@ -2204,43 +2216,70 @@ export class Scheduler {
         // Wake threads waiting on this thread handle
         this.wakeWaitingThreadsForHandle(thread.handle);
 
-        // Enqueue for deferred reaping (preserves Thread record for a grace period)
-        this.reapQueue.push({ threadId, terminatedAt: this.timeService.nowMs() });
+        // Enqueue for deferred reaping (preserves the Thread record until the stack is out)
+        this.reapQueue.push({ threadId });
 
         this.updateMultiThreadMode();
     }
 
-    /** Reap threads that have been TERMINATED for longer than the grace period. 
+    /** Reap terminated threads: release the stack, then drop the record. NT frees a dead
+     *  thread's stack at object teardown (PspThreadDelete → MmDeleteKernelStack); a timed
+     *  hold is a deviation that a spawn storm of short-lived task threads converts into
+     *  guest-visible exhaustion — with each dead thread's SizeOfStackReserve pinned, a
+     *  loader that spawns one task thread per work item runs out mid-load and CreateThread
+     *  fails. Protection against re-handing-out a dying stack's address is canReleaseStack
+     *  (every refusal there is a provably-live reference), not elapsed time; a refused
+     *  thread is retried on later passes so a transient gate does not cost a leaked stack.
      *  Uses index-based head to avoid Array.shift() overhead. */
-    private reapTerminatedThreads(now: number): void {
+    private reapTerminatedThreads(): void {
+        // Retry pass FIRST: entries refused here get another attempt on the next pass,
+        // not twice within this one.
+        for (let i = this.reapRetryQueue.length - 1; i >= 0; i--) {
+            if (this.tryReap(this.reapRetryQueue[i])) {
+                this.reapRetryQueue.splice(i, 1);
+            }
+        }
         const q = this.reapQueue;
         while (this.reapHead < q.length) {
             const entry = q[this.reapHead];
-            if (now - entry.terminatedAt < Scheduler.REAP_GRACE_MS) break;
-            // Never reap the thread the scheduler still considers current — currentThreadId
-            // is only reassigned when another thread goes RUNNING, so until a switch happens
-            // it points here. Deleting it would make getCurrentThread() return null and the
-            // step-7 switch path (gated on a non-null current historically) strand a later
-            // survivor wake. Leave it queued; it gets reaped once a switch moves `current` on.
-            if (entry.threadId === this.currentThreadId) break;
-            const thread = this.threads.get(entry.threadId);
-            if (thread && thread.state === ThreadState.TERMINATED) {
-                // Release before the record goes: releaseStack reads stackBase/stackSize
-                // and the gate walks the live threads for a foreign ESP in this span.
-                // Reap time, not terminate time — the grace period is what puts thousands
-                // of context switches between the last instruction executed on this stack
-                // and the moment its address can be handed out again.
-                this.releaseStack(thread);
-                this.threads.delete(entry.threadId);
-                this.stackSpanIndex = null;
+            if (this.tryReap(entry.threadId)) {
+                this.reapHead++;
+            } else {
+                // Still held (a gate, or the scheduler's current thread until a switch
+                // moves `current` on) — queued for the next pass; skip past it so it
+                // does not block releasable threads behind it.
+                this.reapRetryQueue.push(entry.threadId);
+                this.reapHead++;
             }
-            this.reapHead++;
         }
         // Compact: once head reaches a reasonable threshold, trim consumed entries
         if (this.reapHead > 32) {
             this.reapQueue = q.slice(this.reapHead);
             this.reapHead = 0;
         }
+    }
+
+    /** One reap attempt: release `threadId`'s stack and, once it is out of
+     *  ownedStackBases, drop the record. False = still held, retry later. */
+    private tryReap(threadId: number): boolean {
+        const thread = this.threads.get(threadId);
+        if (!thread) return true;
+        if (thread.state !== ThreadState.TERMINATED) return false;
+        // Never reap the thread the scheduler still considers current — currentThreadId
+        // is only reassigned when another thread goes RUNNING, so until a switch happens
+        // it points here. Deleting it would make getCurrentThread() return null and the
+        // step-7 switch path (gated on a non-null current historically) strand a later
+        // survivor wake. This guard must sit BEFORE the release: canReleaseStack only
+        // reaches the current-thread check through a stack we own, so a foreign-stack
+        // current thread would otherwise fall straight through to deletion.
+        if (threadId === this.currentThreadId) return false;
+        // Release before the record goes: releaseStack reads stackBase/stackSize
+        // and the gate walks the live threads for a foreign ESP in this span.
+        this.releaseStack(thread);
+        if (this.ownedStackBases.has(thread.stackBase >>> 0)) return false;
+        this.threads.delete(threadId);
+        this.stackSpanIndex = null;
+        return true;
     }
 
     terminateThreadByHandle(handle: number, exitCode: number): boolean {
@@ -3658,6 +3697,23 @@ export class Scheduler {
     setLastErrorForThread(threadId: number, code: number): void {
         const thread = this.threads.get(threadId >>> 0);
         if (thread && thread.state !== ThreadState.TERMINATED) this.setThreadLastError(thread, code);
+    }
+
+    /** The last-error setter for an API that completes after an await: it targets the thread
+     *  that made the call (this thread object, not a possibly reused id), and does nothing
+     *  once that thread or the process is gone. */
+    captureLastError(): (code: number) => void {
+        const caller = this.getCurrentThread();
+        const process = this.process;
+        return (code: number): void => {
+            if (this.process !== process) return;
+            if (!caller) {
+                if (!this.getCurrentThread()) this.setLastError(code);
+                return;
+            }
+            if (this.threads.get(caller.id) !== caller || caller.state === ThreadState.TERMINATED) return;
+            this.setThreadLastError(caller, code);
+        };
     }
 
     /** Last error of a thread that may not be current: a wait completed at its wake. */

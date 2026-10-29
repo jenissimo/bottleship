@@ -1,5 +1,7 @@
 import { asBlobPart } from "../dom-buffer";
 import { inflateRawSync as inflateRawInto } from './inflate';
+import { dosDateTimeToUnix } from './dos-time';
+export { dosDateTimeToUnix, unixToDosDateTime, wallClockToInstant, instantToWallClock } from './dos-time';
 
 // Synchronous inflate — usable where DecompressionStream is not (guest traps).
 export { adler32, inflateRawSync, inflateZlibSync } from "./inflate";
@@ -73,6 +75,8 @@ export interface ZipEntry {
     compression: number;
     localHeaderOffset: number;
     isDirectory: boolean;
+    /** Last-modified time from the DOS stamp, as wall-clock seconds (zip/dos-time.ts); absent when the entry has none. */
+    modified?: number;
 }
 
 export class BufferSource implements ZipSource {
@@ -367,6 +371,7 @@ export class ZipArchive {
             const extraLen = view.getUint16(offset + 30, true);
             const commentLen = view.getUint16(offset + 32, true);
             let localHeaderOffset = view.getUint32(offset + 42, true);
+            const modified = dosDateTimeToUnix(view.getUint16(offset + 14, true), view.getUint16(offset + 12, true));
 
             // ZIP64 extended info (0x0001): the 64-bit values appear in this fixed order, but
             // ONLY for the 32-bit fields that actually held the sentinel — reading all three
@@ -399,6 +404,7 @@ export class ZipArchive {
                 compression,
                 localHeaderOffset,
                 isDirectory,
+                ...(modified !== undefined ? { modified } : {}),
             });
 
             offset += 46 + nameLen + extraLen + commentLen;

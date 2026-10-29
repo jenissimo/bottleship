@@ -60,6 +60,11 @@
  *                         directory and resolves its data paths against it. Example:
  *                         --working-dir "C:\\" for an exe that lives under Data\.
  *   --skip-video          Set emulator.skipVideo=true
+ *   --file-times          Stamp each file's mtime into the bundle as its last-write time.
+ *                         Only for a game-dir whose mtimes are the real ones (a copied
+ *                         install, or tools/installer-extract.ts output, which restores
+ *                         the installer's dates); otherwise files carry no date and the
+ *                         bundle does not depend on when they were extracted.
  *   --codepage <n>       ANSI code page (default: 1252). Use 1251 for Cyrillic
  *   --oem-codepage <n>   OEM code page (default: 437). Use 866 for Cyrillic OEM
  *   --lcid <hex>         Locale ID in hex (default: 0409). Use 0419 for Russian
@@ -86,6 +91,7 @@
  */
 
 import { readdirSync, statSync, readFileSync, existsSync } from 'fs';
+import { instantToWallClock } from '@bottleship/formats/zip';
 import { join, basename, extname, resolve } from 'path';
 import { orderFilesByProfile, parseIoProfile } from "@bottleship/formats/wgb/io-profile";
 import { ZipStoreWriter } from './internal/zip-store-writer';
@@ -425,7 +431,10 @@ writer.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2),
 writer.addBuffer('registry.json', Buffer.from(JSON.stringify(registry, null, 2), 'utf8'));
 const orderProfile = get('--order');
 const orderedFiles = orderProfile ? orderFilesByProfile(romFiles, parseIoProfile(JSON.parse(readFileSync(orderProfile, 'utf8')))) : [...romFiles];
-for (const [zipName, path] of orderedFiles) writer.addFile(zipName, path);
+const fileTimes = has('--file-times');
+for (const [zipName, path] of orderedFiles) {
+    writer.addFile(zipName, path, fileTimes ? instantToWallClock(statSync(path).mtimeMs / 1000) : undefined);
+}
 const { bytes, entries: entryCount } = writer.finish();
 
 if (has('--content-addressed')) {

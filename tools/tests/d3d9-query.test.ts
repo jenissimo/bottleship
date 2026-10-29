@@ -186,6 +186,31 @@ describe("D3D9 query submission readiness", () => {
         expect(call("IDirect3DQuery9_GetData", unknownFlags, DATA_OUT, 4, 0)).toBe(D3D_OK);
     });
 
+    test("FLUSH submits pending device work rather than declaring its serial submitted", () => {
+        let submitted = 0;
+        let flushes = 0;
+        const manager = {
+            acquire: () => ({ mode: "gpu" }),
+            release: () => undefined,
+            getSubmittedSerial: () => submitted,
+            notifySubmitted: () => { throw new Error("Only the executor may observe submission"); },
+            poll: () => ({ state: "pending" }),
+        };
+        devices.set(DEVICE, {
+            getQueryManager: () => manager,
+            getDrawCount: () => 1,
+            flushQueryCommands: () => { flushes++; submitted++; },
+        } as any);
+        call("IDirect3DDevice9_CreateQuery", DEVICE, D3DQUERYTYPE_OCCLUSION, QUERY_OUT);
+        const query = Mem.readUint32(QUERY_OUT)!;
+        call("IDirect3DQuery9_Issue", query, D3DISSUE_BEGIN);
+        call("IDirect3DQuery9_Issue", query, D3DISSUE_END);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, 0)).toBe(S_FALSE);
+        expect(flushes).toBe(0);
+        expect(call("IDirect3DQuery9_GetData", query, DATA_OUT, 4, D3DGETDATA_FLUSH)).toBe(S_FALSE);
+        expect(flushes).toBe(1);
+    });
+
     test("the live-device serial domain is not satisfied by an old present counter", () => {
         let managerSerial = 100;
         const manager = {
@@ -332,11 +357,8 @@ describe("D3D9 query submission readiness", () => {
         expect(Mem.readUint32(DATA_OUT)).toBe(0);
     });
 
-    test("a WebGPU occlusion PREDICATE is reported as a pixel count, not as 1", () => {
-        // WebGPU's occlusion query answers "did any sample pass" and Dawn spells that 1.
-        // D3D9 promises a visible-pixel COUNT, and engines compare it against a coverage
-        // threshold — passing the 1 through culls almost everything that is actually on
-        // screen (Far Cry's ocean surface, and most distant geometry with it).
+    test("a measured one-sample result is never widened to the viewport", () => {
+        // The backend supplies measured counts; a one-sample interval must remain one.
         let managerSerial = 0;
         let gpuValue = 1n;
         const manager = {
@@ -368,9 +390,8 @@ describe("D3D9 query submission readiness", () => {
             return Mem.readUint32(DATA_OUT)!;
         };
 
-        // The predicate becomes the upper bound we can stand behind: the viewport's area.
         gpuValue = 1n;
-        expect(runQuery()).toBe(64 * 32);
+        expect(runQuery()).toBe(1);
         // "Nothing passed" stays exactly zero — the one answer the predicate states outright.
         gpuValue = 0n;
         expect(runQuery()).toBe(0);
@@ -605,7 +626,7 @@ describe("D3D9 query lifecycle ledger", () => {
         expect(getD3D9QueryLedger()).toMatchObject({ ready: 1, pending: 1, missing: 0 });
     });
 
-    test("a synthesized occlusion upper bound is never counted as a measurement", () => {
+    test("small measured counts remain measurements", () => {
         let gpuValue = 1n;
         const manager = gpuManagerStub({
             poll: () => ({ state: "ready", submissionSerial: 99, value: gpuValue }),
@@ -630,13 +651,12 @@ describe("D3D9 query lifecycle ledger", () => {
             return Mem.readUint32(DATA_OUT)!;
         };
 
-        // The predicate is widened to the viewport area — a number nobody measured.
-        expect(runQuery()).toBe(64 * 32);
-        expect(getD3D9QueryLedger()).toMatchObject({ synthesized: 1, measured: 0 });
+        expect(runQuery()).toBe(1);
+        expect(getD3D9QueryLedger()).toMatchObject({ synthesized: 0, measured: 1 });
         // A backend that really counts samples passes through, and says so.
         gpuValue = 4321n;
         expect(runQuery()).toBe(4321);
-        expect(getD3D9QueryLedger()).toMatchObject({ synthesized: 1, measured: 1 });
+        expect(getD3D9QueryLedger()).toMatchObject({ synthesized: 0, measured: 2 });
     });
 
     test("a re-arm that cannot reserve a generation is counted as an error", () => {

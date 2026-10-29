@@ -101,10 +101,14 @@ export function resolveImportBinding(
     // skips. A rule with no file on disk stays thunked: metadata must not be able to turn an
     // import into an unbound one.
     if (isThunked && deps.appDirRule(dllNameRaw) !== null) {
-        const appDirPath = deps.findDllPath(dllName);
+        const appDirPath = deps.findDllPath(dllNameBeforeAlias);
         if (appDirPath && !deps.isUnderSystemDirectory(appDirPath)) {
             deps.log(`[PE] "${dllNameRaw}" -> the game's own ${appDirPath} (manifest.appDirDlls), not the HLE module`);
             isThunked = false;
+            // An explicit app-directory rule selects the actual requested image.
+            // Keeping an HLE alias here would try loading a different filename.
+            dllName = dllNameBeforeAlias;
+            aliasTarget = null;
         }
     }
 

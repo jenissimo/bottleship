@@ -1,8 +1,9 @@
 /**
  * Synchronous WM_DESTROY / WM_NCDESTROY delivery for window teardown (DestroyWindow + EndDialog).
  *
- * Real Windows' DestroyWindow synchronously sends WM_DESTROY, destroys children, then
- * WM_NCDESTROY — and MFC's CWnd::OnNcDestroy (run on WM_NCDESTROY) detaches the CWnd from
+ * Real Windows' DestroyWindow synchronously sends WM_DESTROY to the window and then to each
+ * descendant, parent first, while every child still exists; WM_NCDESTROY then follows children
+ * first. MFC's CWnd::OnNcDestroy (run on WM_NCDESTROY) detaches the CWnd from
  * afxMapHWND. We must do the same SYNCHRONOUSLY (re-entering the guest before the teardown
  * thunk returns) so MFC detaches BEFORE any later queued message (e.g. an owner-draw button's
  * hover WM_TIMER) is pumped — otherwise a pre-translate (CWnd::WalkPreTranslateTree) calls
@@ -26,6 +27,8 @@ interface DeliverAction {
     msg: number;
     /** Finalize (remove from maps) this hwnd after the callback completes. */
     finalizeAfter: boolean;
+    /** False for a window with no guest procedure: it is only finalized, in order. */
+    deliver: boolean;
 }
 
 export interface SyncDestroySuspendResult {
@@ -37,9 +40,10 @@ export interface SyncDestroySuspendResult {
 }
 
 /**
- * Deliver WM_DESTROY/WM_NCDESTROY to the rootHwnd subtree (children first), finalizing each
- * window after its WM_NCDESTROY. Returns a suspend result when at least one guest callback was
- * scheduled; otherwise runs `afterAll` and returns null (the caller should then just return).
+ * Deliver WM_DESTROY (parent first) then WM_NCDESTROY (children first) to the rootHwnd
+ * subtree, finalizing each window after its WM_NCDESTROY. Returns a suspend result when at
+ * least one guest callback was scheduled; otherwise runs `afterAll` and returns null (the
+ * caller should then just return).
  * `afterAll` (owner reactivation, etc.) runs once all destroy deliveries complete.
  */
 export function beginSyncDestroyDelivery(
@@ -60,37 +64,39 @@ export function beginSyncDestroyDelivery(
         return null;
     }
 
-    // Collect target + descendants, children-first (post-order) so a child's WM_NCDESTROY
-    // precedes its parent's, matching MFC/Windows teardown.
-    const order: number[] = [];
+    // A parent's WM_DESTROY handler may still read its children (an MFC dialog's OnDestroy
+    // reading the selection of a combo it subclassed), so they are torn down only afterwards.
+    const preOrder: number[] = [];
+    const postOrder: number[] = [];
     const collect = (h: number) => {
         const wi = windows.get(h);
         if (!wi) return;
+        preOrder.push(h);
         for (const c of [...wi.children]) collect(c);
-        order.push(h);
+        postOrder.push(h);
     };
     collect(rootHwnd);
 
-    const actions: DeliverAction[] = [];
-    for (const h of order) {
+    // JS-owned native controls use HLE DefWindowProc thunks; only subclassed controls
+    // have a guest WNDPROC that needs WM_DESTROY/WM_NCDESTROY delivery.
+    const hasGuestProc = (h: number): boolean => {
         const wi = windows.get(h);
-        if (!wi) continue;
-        const wndProc = wi.wndProc ?? 0;
-        // JS-owned native controls use HLE DefWindowProc thunks; only subclassed controls
-        // have a guest WNDPROC that needs WM_DESTROY/WM_NCDESTROY delivery.
-        const hasGuestProc = !!wndProc
-            && !isSentinelWndProc(wndProc)
-            && (!wi.isSystemControl || !!wi.wndProcSubclassed);
-        if (hasGuestProc) {
-            actions.push({ hwnd: h, msg: WM_DESTROY, finalizeAfter: false });
-            actions.push({ hwnd: h, msg: WM_NCDESTROY, finalizeAfter: true });
-        } else {
-            // Pure JS control / no proc — nothing to detach in MFC; remove immediately.
-            finalize(h);
-        }
+        const wndProc = wi?.wndProc ?? 0;
+        return !!wi && !!wndProc && !isSentinelWndProc(wndProc) && (!wi.isSystemControl || !!wi.wndProcSubclassed);
+    };
+    const actions: DeliverAction[] = [];
+    for (const h of preOrder) {
+        if (hasGuestProc(h)) actions.push({ hwnd: h, msg: WM_DESTROY, finalizeAfter: false, deliver: true });
+    }
+    for (const h of postOrder) {
+        actions.push({ hwnd: h, msg: WM_NCDESTROY, finalizeAfter: true, deliver: hasGuestProc(h) });
     }
 
-    if (actions.length === 0) { afterAll?.(); return null; }
+    if (!actions.some(a => a.deliver)) {
+        for (const h of postOrder) finalize(h);
+        afterAll?.();
+        return null;
+    }
 
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     const thunkReturnAddr = view.getUint32(ctx.esp, true);
@@ -116,7 +122,7 @@ export function beginSyncDestroyDelivery(
     const runFrom = (): number | null => {
         while (i < actions.length) {
             const a = actions[i]!;
-            const wndProc = procOf(a.hwnd);
+            const wndProc = a.deliver ? procOf(a.hwnd) : 0;
             if (!wndProc) {
                 if (a.finalizeAfter) finalize(a.hwnd);
                 i++;
@@ -137,7 +143,7 @@ export function beginSyncDestroyDelivery(
     let firstCallbackId = 0;
     while (i < actions.length) {
         const a = actions[i]!;
-        const wndProc = procOf(a.hwnd);
+        const wndProc = a.deliver ? procOf(a.hwnd) : 0;
         if (!wndProc) {
             if (a.finalizeAfter) finalize(a.hwnd);
             i++;

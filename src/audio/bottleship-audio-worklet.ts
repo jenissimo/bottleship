@@ -81,7 +81,7 @@ const LIMIT_K = 1 - LIMIT_T;
 // audio-engine.ts verifies the echo and logs loudly on a mismatch or timeout,
 // because a cache hit that silently skips this whole file is worse than a version
 // bump you forgot: the failure otherwise looks identical to "nothing is wrong".
-const WORKLET_MODULE_VERSION = 10;
+const WORKLET_MODULE_VERSION = 11;
 
 // Discontinuity detector threshold: |s[n]−s[n−1]| above this between adjacent
 // output samples counts as a click/splice candidate.
@@ -693,11 +693,12 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
         // Streaming: check if play position has caught up to write cursor
         // Output silence (don't advance pos) until app writes more data
+        let availableFrames = 0;
         if (streamingHold) {
           const playFrame = Math.floor(pos) % totalFrames;
           // Check if we've caught up: available = (write - play + total) % total
-          const available = (writeCursorFrame - playFrame + totalFrames) % totalFrames;
-          if (available === 0) {
+          availableFrames = (writeCursorFrame - playFrame + totalFrames) % totalFrames;
+          if (availableFrames === 0) {
             // Play position caught up to write cursor — no more data this block.
             if (i === 0) starvedBlocks++; else underrunMid++;
             starvedThisSource++; // TEMP PROBE
@@ -728,7 +729,9 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
 
           // Next sample for interpolation
           let nextFrame = wrappedFrame + 1;
-          if (isCircular) {
+          if (streamingHold && availableFrames === 1) {
+            nextFrame = wrappedFrame; // interpolation cannot read beyond the producer's frontier
+          } else if (isCircular) {
             nextFrame = nextFrame % totalFrames;
           } else {
             nextFrame = Math.min(nextFrame, totalFrames - 1);
@@ -765,7 +768,8 @@ class BottleShipAudioProcessor extends AudioWorkletProcessor {
         }
 
         if (fadeIn > 0) fadeIn--;
-        pos += rate;
+        // A resampling step can cross WRITE_CURSOR without ever landing on it.
+        pos += streamingHold ? Math.min(rate, availableFrames - frac) : rate;
       }
 
       if (srcPeak > 0) {

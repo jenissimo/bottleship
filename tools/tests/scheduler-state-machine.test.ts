@@ -1473,11 +1473,11 @@ describe("scheduler/thread-exit liveness — survivor switched in after a siblin
         }
     });
 
-    test("F4: the reaper does not delete the thread still marked current (no +5s door-slam)", () => {
+    test("F4: the reaper does not delete the thread still marked current (no door-slam)", () => {
         const s = mkProcSched();
         inject(s, mkThread(3, ThreadState.TERMINATED), { current: true });
-        (s as any).reapQueue.push({ threadId: 3, terminatedAt: 0 });
-        (s as any).reapTerminatedThreads(1e9); // now ≫ REAP_GRACE_MS
+        (s as any).reapQueue.push({ threadId: 3 });
+        (s as any).reapTerminatedThreads();
 
         // Still present because it is currentThreadId — deleting it is what slammed the door.
         expect((s as any).threads.has(3)).toBe(true);

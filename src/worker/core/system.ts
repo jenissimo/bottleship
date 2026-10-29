@@ -525,7 +525,8 @@ export class System {
             // Guest threads have exited; this worker still owns the live child's VFS.
             // The child reports its own final exit over the page's foreground port.
             const notifyParent = this.onProcessExit;
-            void Promise.all([stopChildProcesses(true), networkFinished]).then(() => this.drainDurableState())
+            void Promise.all([stopChildProcesses(true).then(() => this.cleanupProcessFilesQuietly()), networkFinished])
+                .then(() => this.drainDurableState())
                 .then(() => { if (currentLifetime()) notifyParent?.({ ...payload, broker: true }); })
                 .catch(error => Logger.warn(LogCategory.SYSTEM, `parent exit flush failed: ${error}`));
             return;
@@ -533,7 +534,8 @@ export class System {
         const childrenStopped = stopChildProcesses();
         if (this.onProcessExit) {
             const onExit = this.onProcessExit;
-            void Promise.all([childrenStopped, networkFinished]).then(() => { if (currentLifetime()) onExit(payload); });
+            void Promise.all([childrenStopped.then(() => this.cleanupProcessFilesQuietly()), networkFinished])
+                .then(() => { if (currentLifetime()) onExit(payload); });
             return;
         }
         // A launcher exiting into its own re-exec is a restart, not an exit — but the
@@ -554,7 +556,7 @@ export class System {
                 `process exit: flushAll did not drain within ${System.EXIT_FLUSH_BUDGET_MS}ms — notifying host anyway`);
             post();
         }, System.EXIT_FLUSH_BUDGET_MS) as unknown as number;
-        Promise.all([childrenStopped.then(() => this.drainDurableState()), networkFinished])
+        Promise.all([childrenStopped.then(() => this.cleanupProcessFilesQuietly()).then(() => this.drainDurableState()), networkFinished])
             .catch((e) => Logger.warn(LogCategory.SYSTEM, `process exit: flushAll failed: ${e}`))
             .then(() => { clearTimeout(budget); post(); });
     }
@@ -567,6 +569,19 @@ export class System {
             this.registry.flush().catch((e) =>
                 Logger.warn(LogCategory.SYSTEM, `process exit: registry flush failed: ${e}`)),
         ]);
+    }
+
+    /** Exit-time file cleanup is logged if it fails and never blocks the durable drain or the host notification. */
+    private cleanupProcessFilesQuietly(): Promise<void> {
+        return this.cleanupProcessFiles().catch(error =>
+            Logger.warn(LogCategory.SYSTEM, `process exit: file cleanup failed: ${error}`));
+    }
+
+    async cleanupProcessFiles(): Promise<void> {
+        const modules = this.process?.modules;
+        if (!modules) return;
+        // DLL aliases may refer to one module object. Invoke its lifecycle once.
+        await Promise.all(Array.from(new Set(modules.values()), module => module.cleanupProcessFiles?.()));
     }
 
     /**
@@ -949,6 +964,7 @@ export class System {
 
         // Per-game singletons that must not leak into the next load.
         this.registry.reset();
+        await this.cleanupProcessFiles();
         this.fileSystem.reset();
         TimeService.getInstance().resetForGameSwitch();
         videoEngine.closeAll();
@@ -1073,7 +1089,9 @@ export class System {
 
                 // Re-register module exports in dispatcher (since dispatcher was reset)
                 if (module && module.exports) {
-                    this.process.dispatcher.registerModule(module.name, module.exports);
+                    for (const dll of [module.name, ...(module.aliases ?? [])]) {
+                        this.process.dispatcher.registerModule(dll, module.exports);
+                    }
                 }
             }
         }

@@ -14,7 +14,8 @@ import { getSystemColorBrush } from './system';
 import { asArrayBufferView } from '../../../dom-buffer';
 
 const DT_CALCRECT = 0x00000400;
-const DT_SINGLELINE = 0x00000020;
+/** cbSize, iTabLength, iLeftMargin, iRightMargin, uiLengthDrawn. */
+const DRAWTEXTPARAMS_SIZE = 20;
 
 /** Highest COLOR_* index; bounds the sys-color-plus-one pseudo-brush encoding. */
 const COLOR_ENDCOLORS = 24;
@@ -25,7 +26,7 @@ const COLOR_ENDCOLORS = 24;
  * the measured extent back into the caller's RECT and draws nothing — a guest that sizes
  * a control or a dialog from that call gets a garbage layout if the RECT is not updated.
  */
-function drawTextCommon(hdc: number, text: string, mem: Uint8Array, lpRect: number, format: number): number {
+function drawTextCommon(hdc: number, text: string, mem: Uint8Array, lpRect: number, format: number, lpParams = 0): number {
     let rect: { left: number; top: number; right: number; bottom: number } | undefined;
     const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
     if (lpRect && lpRect + 16 <= mem.length) {
@@ -37,14 +38,20 @@ function drawTextCommon(hdc: number, text: string, mem: Uint8Array, lpRect: numb
         };
     }
 
+    // DRAWTEXTPARAMS: a structure of any other size fails the call.
+    if (lpParams && (lpParams + DRAWTEXTPARAMS_SIZE > mem.length || view.getUint32(lpParams, true) !== DRAWTEXTPARAMS_SIZE)) {
+        return 0;
+    }
+
     const layout = System.getInstance().gdiContext.drawText(hdc, text, rect, format);
     if (!layout) return 0;
+    // uiLengthDrawn is how a caller drawing long text a line at a time finds the next line.
+    if (lpParams) view.setUint32(lpParams + 16, layout.lengthDrawn, true);
 
     if (rect && lpRect && (format & DT_CALCRECT) !== 0) {
-        // A wrapped calc keeps the caller's width (it is the wrap limit); an unwrapped one
-        // reports the widest line.
-        const wrapped = (format & 0x10 /* DT_WORDBREAK */) !== 0 && (format & DT_SINGLELINE) === 0;
-        if (!wrapped) view.setInt32(lpRect + 8, rect.left + layout.width, true);
+        // The incoming width is a wrap limit, not the measured result. Native GDI
+        // shrinks even wrapped text to its widest line, or expands for a long word.
+        view.setInt32(lpRect + 8, rect.left + layout.width, true);
         view.setInt32(lpRect + 12, rect.top + layout.height, true);
     }
     return layout.height;
@@ -266,13 +273,14 @@ export function registerWindowDrawingExports(exports: Record<string, ThunkImplem
         const cchText = args[2] | 0;
         const lprc = args[3];
         const format = args[4];
+        const lpdtp = args[5] >>> 0;
 
         let text = Marshaler.readString(mem, lpchText);
         if (cchText >= 0) text = text.substring(0, cchText);
 
         Logger.verbose(LogCategory.USER32,
             `DrawTextExA(0x${hdc.toString(16)}, fmt=0x${(format >>> 0).toString(16)}, "${text}")`);
-        return drawTextCommon(hdc, text, mem, lprc, format);
+        return drawTextCommon(hdc, text, mem, lprc, format, lpdtp);
     };
 
     exports['TabbedTextOutA'] = (ctx, mem, args) => {

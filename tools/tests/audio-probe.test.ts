@@ -6,7 +6,7 @@
 
 import { describe, it, expect } from "bun:test";
 import { BufferSource, type RandomAccessSource } from "@bottleship/formats/unpack/source";
-import { probeAudio } from "@bottleship/formats/audio";
+import { probeAudio, sniffAudioContainer } from "@bottleship/formats/audio";
 
 /** The narrow view the MCI/virtual-CD caller consumes; these cases are about length. */
 function streamInfo(src: RandomAccessSource) {
@@ -404,6 +404,31 @@ describe("probeAudioStream / ogg", () => {
 });
 
 describe("probeAudioStream / mp3", () => {
+    it("recognizes MPEG frames behind leading padding without counting the padding as audio", () => {
+        const file = concat(new Uint8Array(417), mp3Frame(1), mp3Frame(2), mp3Frame(3));
+        expect(sniffAudioContainer(new BufferSource(file))).toBe("mp3");
+        expect(probeAudio(new BufferSource(file))).toMatchObject({
+            format: "mp3", sampleRate: 44100, channels: 2, dataStart: 417,
+            dataEnd: file.length, durationMs: Math.round((3 * 417 * 8000) / 128000),
+        });
+    });
+
+    it("requires a consistent successor when searching past non-audio bytes", () => {
+        const single = concat(new Uint8Array(417), mp3Frame(1));
+        expect(sniffAudioContainer(new BufferSource(single))).toBeNull();
+        const wrongOffset = concat(new Uint8Array(417), mp3Frame(1), new Uint8Array(1), mp3Frame(2));
+        expect(sniffAudioContainer(new BufferSource(wrongOffset))).toBeNull();
+        const wrongRate = mp3Frame(2);
+        wrongRate[2] = 0x94; // 48 kHz disagrees with the first frame
+        expect(sniffAudioContainer(new BufferSource(concat(new Uint8Array(417), mp3Frame(1), wrongRate)))).toBeNull();
+    });
+
+    it("bounds the padded-stream search on large non-audio inputs", () => {
+        const src = new CountingSource(concat(new Uint8Array(9000), mp3Frame(1), mp3Frame(2)));
+        expect(sniffAudioContainer(src)).toBeNull();
+        expect(src.bytesRead).toBeLessThanOrEqual(8192 + 16);
+    });
+
     it("uses the Xing frame count", () => {
         const file = concat(xingFrame(1000), mp3Frame(1), mp3Frame(2));
         expect(streamInfo(new BufferSource(file))).toEqual({

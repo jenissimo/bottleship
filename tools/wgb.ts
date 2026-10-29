@@ -63,6 +63,8 @@ interface ZipEntry {
     size: number;
     /** Offset of the Local File Header in the archive */
     lfhOffset: number;
+    /** Packed DOS `date << 16 | time` from the central directory. */
+    dosStamp: number;
 }
 
 /** Locate the central directory, following the ZIP64 locator when the EOCD fields are sentinels. */
@@ -132,7 +134,7 @@ function parseCentralDir(fd: number, fileSize: number): ZipEntry[] {
             }
         }
 
-        entries.push({ name, compression, crc, compressedSize, size, lfhOffset });
+        entries.push({ name, compression, crc, compressedSize, size, lfhOffset, dosStamp: cd.readUInt32LE(pos + 12) });
         pos += 46 + nameLen + extraLen + commentLen;
     }
     return entries;
@@ -204,9 +206,9 @@ function rebuildStreaming(
                 cd.push({ nameBuf, size: override.length, crc, offset: entryOffset });
             } else if (copyFrom) {
                 // Copy the existing Store entry verbatim (reuse its CRC; stream the data).
-                writeAt(lfhFor(nameBuf, copyFrom.size, copyFrom.crc));
+                writeAt(lfhFor(nameBuf, copyFrom.size, copyFrom.crc, copyFrom.dosStamp));
                 streamStoreData(srcFd, copyFrom, (chunk) => { writeSync(outFd, chunk, 0, chunk.length); offset += chunk.length; });
-                cd.push({ nameBuf, size: copyFrom.size, crc: copyFrom.crc, offset: entryOffset });
+                cd.push({ nameBuf, size: copyFrom.size, crc: copyFrom.crc, offset: entryOffset, dosStamp: copyFrom.dosStamp });
             }
         };
 
@@ -395,10 +397,11 @@ function cmdAddDir(wgbPath: string, entryPrefix: string, localDir: string) {
 
     const tmp = `${wgbPath}.wgbtmp`;
     const result = withArchive(wgbPath, (fd, _size, entries) => {
-        const byName = new Map(files.map(f => [f.name, f.data]));
-        const existing = new Set(entries.map(e => e.name));
-        const extra = files.filter(f => !existing.has(f.name));
-        return rebuildStreaming(fd, entries, tmp, (n) => byName.get(n) ?? null, extra);
+        const key = (name: string) => name.replace(/\\/g, "/").toLowerCase();
+        const byName = new Map(files.map(f => [key(f.name), f.data]));
+        const existing = new Set(entries.map(e => key(e.name)));
+        const extra = files.filter(f => !existing.has(key(f.name)));
+        return rebuildStreaming(fd, entries, tmp, (n) => byName.get(key(n)) ?? null, extra);
     });
     renameSync(tmp, wgbPath);
     const bytes = files.reduce((n, f) => n + f.data.length, 0);

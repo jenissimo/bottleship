@@ -2255,13 +2255,25 @@ export class D3D9Device {
         const queue = this.backend.getQueue();
         if (!device || !queue) return null;
         if (!this.gpuQueryManager) {
-            this.gpuQueryManager = new D3D9QueryManager({ device, queue });
+            this.gpuQueryManager = new D3D9QueryManager({ device, queue, requireCountedOcclusion: true });
         }
         return this.gpuQueryManager;
     }
 
-    recordQueryBegin(queryPtr: number): void { this.commandRecorder.recordBeginOcclusionQuery(queryPtr); }
-    recordQueryEnd(queryPtr: number): void { this.commandRecorder.recordEndOcclusionQuery(queryPtr); }
+    flushQueryCommands(): void { this.submitFrame(false); }
+    releaseQueryCommands(queryPtr: number): void {
+        this.submitFrame(false);
+        this.backendExecutor.retireCountedQuery(queryPtr);
+    }
+
+    recordQueryBegin(queryPtr: number): void {
+        this.submitFrame(false);
+        this.commandRecorder.recordBeginOcclusionQuery(queryPtr);
+    }
+    recordQueryEnd(queryPtr: number): void {
+        this.commandRecorder.recordEndOcclusionQuery(queryPtr);
+        this.submitFrame(false);
+    }
     recordQueryTimestamp(queryPtr: number): void { this.commandRecorder.recordTimestampQuery(queryPtr); }
 
     /**
@@ -10398,6 +10410,7 @@ export class D3D9Device {
             : null;
 
         let shaderModule: GPUShaderModule;
+        let countingSource = '';
         let vertexBuffers: (GPUVertexBufferLayout | null)[];
         let hasTexture: boolean;
         // Stages this pipeline's shader will declare bindings for. Both fixed-function paths
@@ -10416,7 +10429,7 @@ export class D3D9Device {
             // shader + tightly-packed layout straight from the synthetic FVF (ignore decl/stream).
             const layout = buildVertexLayout(fvfOverride);
             shaderModule = gpuDevice.createShaderModule({
-                code: buildShader(fvfOverride, alphaTest, false, 1, false, 0, ffpSamplerStates,
+                code: countingSource = buildShader(fvfOverride, alphaTest, false, 1, false, 0, ffpSamplerStates,
                     this.flatShadingEnabled(), cubeMask),
             });
             this.observeShaderCompilation(shaderModule, null, "ffp-point-sprite");
@@ -10435,7 +10448,7 @@ export class D3D9Device {
             const strides = this.slotStrides(stride0Override);
             const built = buildShaderFromDecl(declElements, alphaTest, lit, ffpStageCount, strides, slotMask,
                 this.texGenActive(ffpStageCount), ffpSamplerStates, this.flatShadingEnabled(), cubeMask);
-            shaderModule = gpuDevice.createShaderModule({ code: built.wgsl });
+            shaderModule = gpuDevice.createShaderModule({ code: countingSource = built.wgsl });
             this.observeShaderCompilation(shaderModule, null, "ffp-declaration");
             vertexBuffers = built.buffers;
             hasTexture = built.hasTexture;
@@ -10451,7 +10464,7 @@ export class D3D9Device {
             ffpStageCount = this.activeStageCount();
             const texGen = this.texGenActive(ffpStageCount);
             shaderModule = gpuDevice.createShaderModule({
-                code: buildShader(fvf, alphaTest, lit, ffpStageCount, texGen, boundStride, ffpSamplerStates,
+                code: countingSource = buildShader(fvf, alphaTest, lit, ffpStageCount, texGen, boundStride, ffpSamplerStates,
                     this.flatShadingEnabled(), cubeMask),
             });
             this.observeShaderCompilation(shaderModule, null, "ffp-fvf");
@@ -10474,9 +10487,10 @@ export class D3D9Device {
         // A throw here (an unsupported format, a layout the shader disagrees with) must cost
         // this draw alone — uncaught it unwinds through the recorder and the whole frame dies.
         let pipeline: GPURenderPipeline;
+        let countingDescriptor: GPURenderPipelineDescriptor;
         gpuDevice.pushErrorScope("validation");
         try {
-            pipeline = gpuDevice.createRenderPipeline({
+            pipeline = gpuDevice.createRenderPipeline(countingDescriptor = {
                 // Shared explicit layout when the FFP dynamic-offset shape is on (one cached bind
                 // group serves every FFP draw); WebGPU's implicit per-pipeline layout otherwise.
                 layout: this.backendExecutor.getFfpPipelineLayout(cubeMask),
@@ -10516,7 +10530,8 @@ export class D3D9Device {
         // with — the executor sizes every non-indexed draw against both (planVertexRangePadding).
         d3d9NoteFfpSamplerDims(cubeMask);
         const pipelineId = this.backendExecutor.registerPipeline(pipeline, hasTexture, false, ffpStageCount,
-            layoutStrides(vertexBuffers), layoutAttributeEnds(vertexBuffers), undefined, cubeMask);
+            layoutStrides(vertexBuffers), layoutAttributeEnds(vertexBuffers), undefined, cubeMask,
+            { descriptor: countingDescriptor!, source: countingSource });
         this.pipelineCache.set(cacheKey, pipelineId);
         return pipelineId;
     }
@@ -10952,8 +10967,9 @@ export class D3D9Device {
             pair.pipelineState = { colorTargets, vertexBuffers: buffers, depthStencil };
             gpuDevice.pushErrorScope("validation");
             let pipeline: GPURenderPipeline;
+            let countingDescriptor: GPURenderPipelineDescriptor;
             try {
-                pipeline = gpuDevice.createRenderPipeline({
+                pipeline = gpuDevice.createRenderPipeline(countingDescriptor = {
                     layout: pipelineLayout,
                     vertex: {
                         module,
@@ -10977,7 +10993,8 @@ export class D3D9Device {
             }
             this.observePipelineValidation(gpuDevice, pair, `programmable-pipeline:${pair.handle}`);
             const pipelineId = this.backendExecutor.registerPipeline(pipeline, link.hasTexture, true,
-                1, layoutStrides(buffers), layoutAttributeEnds(buffers), arenaIdentity);
+                1, layoutStrides(buffers), layoutAttributeEnds(buffers), arenaIdentity, 0,
+                { descriptor: countingDescriptor!, source: link.wgsl });
             // Exact programmable MegaBatch variant. It is created while the complete shader
             // and fixed pipeline descriptor are still available; GPURenderPipeline itself is
             // intentionally opaque and cannot be cloned later by the executor.

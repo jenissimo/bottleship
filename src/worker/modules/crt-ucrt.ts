@@ -481,7 +481,7 @@ export function registerUcrtExports(exports: Record<string, ThunkImplementation>
      * there is nothing to set and this reports failure rather than claiming success —
      * callers treat it as an advisory step and continue.
      */
-    exports["_utime64"] = () => {
+    exports["_utime64"] = exports["_utime"] = exports["_utime32"] = () => {
         host.setErrno(EACCES);
         return -1;
     };

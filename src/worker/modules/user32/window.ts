@@ -1569,13 +1569,15 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
     };
     registerWindowDestroyFinalizer(finalizeDestroy);
 
-    exports['DefWindowProcA'] = (ctx, mem, args) => {
+    const defWindowProc = (
+        ctx: X86Context, mem: Uint8Array, args: number[], textWidth?: 'ansi' | 'wide',
+    ): number | ThunkResult => {
         const hWnd = args[0];
         const Msg = args[1];
         const wParam = args[2];
         const lParam = args[3];
 
-        Logger.verbose(LogCategory.USER32, `DefWindowProcA(0x${hWnd.toString(16)}, ${Msg}, 0x${wParam.toString(16)}, 0x${lParam.toString(16)})`);
+        Logger.verbose(LogCategory.USER32, `DefWindowProc${textWidth === 'wide' ? 'W' : 'A'}(0x${hWnd.toString(16)}, ${Msg}, 0x${wParam.toString(16)}, 0x${lParam.toString(16)})`);
 
         const WM_SETTEXT_DEF = 0x000C;
         const WM_GETTEXT_DEF = 0x000D;
@@ -1698,7 +1700,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
                 }
                 return 0;
             }
-            const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem);
+            const result = handleSystemControlMessage(win, Msg, wParam, lParam, mem, textWidth);
             if (isContentChangingMessage(win, Msg)) {
                 // A CAPTION alone needs the old pixels dropped: on a guest-painted parent
                 // a repaint can only STAMP the control, so the new text would land on top
@@ -1753,6 +1755,8 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
         return 0; // 0 = processed
     };
 
+    exports['DefWindowProcA'] = (ctx, mem, args) => defWindowProc(ctx, mem, args);
+
     // DefWindowProc never awaits, so the dialog manager can call it inline.
     defWindowProcImpl = exports['DefWindowProcA'] as SyncWndProcImpl;
 
@@ -1766,7 +1770,7 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             && (Msg === 0x000C || Msg === 0x000D || Msg === 0x000E)) {
             return defaultWindowText(win, Msg, args[2], args[3], mem, true);
         }
-        return exports['DefWindowProcA'](ctx, mem, args);
+        return defWindowProc(ctx, mem, args, 'wide');
     };
     exports['DefMDIChildProcA'] = exports['DefWindowProcA'];
     exports['DefMDIChildProcW'] = exports['DefWindowProcA'];

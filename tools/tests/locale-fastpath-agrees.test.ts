@@ -15,6 +15,7 @@ import { exports as kernelExports } from "../../src/worker/modules/kernel32/loca
 import { invalidateLocaleCache } from "../../src/worker/modules/kernel32/locale-data";
 import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { System } from "../../src/worker/core/system";
+import { Mem } from "../../src/worker/core/memory/mem-accessor";
 
 const SRC = 0x200;
 const DST = 0x400;
@@ -74,6 +75,7 @@ function compare(
     const fast = callFastPath(name, fastMem, args);
 
     const slowMem = fresh(); seed(slowMem);
+    Mem.bind(() => slowMem);
     const handler = (kernelExports as Record<string, (c: unknown, m: Uint8Array, a: number[]) => number>)[name]!;
     const slow = handler(ctx, slowMem, args);
 
@@ -195,15 +197,39 @@ describe("LCMapStringW fast path agrees with the thunk", () => {
             expect(r.fast).toBe(r.slow);
         });
 
-        test(`${flagName}: a destination smaller than the source truncates like the thunk`, () => {
+        test(`${flagName}: a destination smaller than the source fails instead of truncating`, () => {
             const text = "LongResourceName";
-            const r = compare("LCMapStringW",
+            const { value: r, err } = withLastError(() => compare("LCMapStringW",
                 (m) => putWide(m, SRC, text),
-                [0x409, flag, SRC, text.length, DST, 5]);
+                [0x409, flag, SRC, text.length, DST, 5]));
+            expect(r.fast).toBeNull();
+            expect(r.slow).toBe(0);
+            expect(err).toBe(122); // ERROR_INSUFFICIENT_BUFFER
+            expect(r.slowMem[DST]).toBe(0xcc);
+        });
+
+        test(`${flagName}: a counted source gets exactly that many characters, no terminator`, () => {
+            // The CRT's _tolower: one character in, one out, into a one-WCHAR buffer.
+            const ch = flag === LOWER ? "V" : "v";
+            const r = compare("LCMapStringW",
+                (m) => putWide(m, SRC, ch, false),
+                [0x409, flag, SRC, 1, DST, 1]);
+            expect(r.slow).toBe(1);
             expect(r.fast).toBe(r.slow);
-            expect([...r.fastMem.subarray(DST, DST + 12)]).toEqual([...r.slowMem.subarray(DST, DST + 12)]);
+            const want = flag === LOWER ? "v" : "V";
+            expect(new DataView(r.slowMem.buffer).getUint16(DST, true)).toBe(want.charCodeAt(0));
+            expect([...r.fastMem.subarray(DST, DST + 4)]).toEqual([...r.slowMem.subarray(DST, DST + 4)]);
+            expect(r.slowMem[DST + 2]).toBe(0xcc);
         });
     }
+
+    test("a negative cchDest is ERROR_INVALID_PARAMETER", () => {
+        const r = bothTiers("LCMapStringW", (m) => putWide(m, SRC, "abc"), [0x409, LOWER, SRC, -1, DST, -1]);
+        expect(r.fast).toBeNull();
+        expect(r.slow).toBe(0);
+        expect(r.slowErr).toBe(87);
+        expect(r.slowMem[DST]).toBe(0xcc);
+    });
 
     test("declines sort keys", () => {
         const r = compare("LCMapStringW",
@@ -219,9 +245,9 @@ describe("LCMapStringW fast path agrees with the thunk", () => {
             (m) => putWide(m, SRC, "AİB"),
             [0x409, LOWER, SRC, 3, DST, 64]);
         expect(r.fast).toBe(r.slow);
-        // 3 source chars + the terminator this implementation always writes. Full case
-        // mapping would have made it 5.
-        expect(r.slow).toBe(4);
+        // 3 source chars and no terminator, since cchSrc did not count one. Full case
+        // mapping would have made it 4.
+        expect(r.slow).toBe(3);
         expect([...r.fastMem.subarray(DST, DST + 8)]).toEqual([...r.slowMem.subarray(DST, DST + 8)]);
     });
 });
@@ -328,6 +354,7 @@ function bothTiers(name: FastPathName, seed: (m: Uint8Array) => void, args: numb
     const f = withLastError(() => callFastPath(name, fastMem, args));
 
     const slowMem = fresh(); seed(slowMem);
+    Mem.bind(() => slowMem);
     const handler = (kernelExports as Record<string, (c: unknown, m: Uint8Array, a: number[]) => number>)[name]!;
     const sl = withLastError(() => handler(ctx, slowMem, args));
 

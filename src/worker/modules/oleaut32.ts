@@ -242,6 +242,7 @@ export class Oleaut32 implements IModule {
         // the LCID only matters for locale-sensitive string conversions we do not do.
         this.exports["VariantChangeTypeEx"] = (ctx, mem, args) =>
             variantChangeType(mem, args[0], args[1], args[4]);
+        this.exports["ord_147"] = this.exports["VariantChangeTypeEx"];
 
         // ---- Active Object Registration ----
 

@@ -19,7 +19,7 @@
 import { WindowSource, type RandomAccessSource } from "../unpack/source";
 import { id3v2Size, readAt, tagAt } from "./bytes";
 import { probeFlac } from "./flac";
-import { probeMp3 } from "./mp3";
+import { hasMpegFrames, probeMp3 } from "./mp3";
 import { probeOgg } from "./ogg";
 import { probeWav } from "./wav";
 
@@ -80,9 +80,9 @@ export function probeAudioAt(buf: Uint8Array, base: number, length: number): Aud
 }
 
 /**
- * Container from magic bytes alone, seeing past a prepended ID3v2 tag. Cheap
- * enough for a hot dispatch and honest about a header-sized buffer, which is
- * all a caller choosing a decoder route has.
+ * Container from magic bytes, seeing past a prepended ID3v2 tag. If no magic
+ * matches, search at most 8 KiB for two consistent MPEG frames: valid streams
+ * can carry leading padding. Header-only callers still get the cheap magic path.
  */
 export function sniffAudioContainer(src: RandomAccessSource): AudioContainer | null {
     const head = readAt(src, 0, 16);
@@ -97,5 +97,5 @@ export function sniffAudioContainer(src: RandomAccessSource): AudioContainer | n
         return tagAt(body, 0, "fLaC") ? "flac" : "mp3";
     }
     if (head[0] === 0xff && (head[1]! & 0xe0) === 0xe0) return "mp3";
-    return null;
+    return hasMpegFrames(src) ? "mp3" : null;
 }

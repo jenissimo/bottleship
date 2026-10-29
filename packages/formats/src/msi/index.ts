@@ -3,6 +3,8 @@
  * File/Component/Directory layouts: Microsoft Windows Installer table reference.
  */
 import {readCompoundStreams} from './compound';
+import {payloadPath} from '../installer/binary';
+import {decodeMsi1251} from './codepage';
 export {readCompoundStreams} from './compound';
 const ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._';
 
@@ -41,7 +43,8 @@ export class MsiDatabase {
         const flags = pv.getUint16(2, true);
         this.strWidth = flags & 0x8000 ? 3 : 2;
         const cp = pv.getUint16(0, true) + (flags & 0x7fff) * 65536;
-        const decoder = new TextDecoder(cp === 65001 ? 'utf-8' : cp === 0 || cp === 1252 ? 'windows-1252' : `windows-${cp}`, {fatal: true});
+        const decoder = cp === 1251 ? {decode: decodeMsi1251}
+            : new TextDecoder(cp === 65001 ? 'utf-8' : cp === 0 || cp === 1252 ? 'windows-1252' : `windows-${cp}`, {fatal: true});
         let offset = 0;
         for (let p = 4; p < pool.length; p += 4) {
             let size = pv.getUint16(p, true);
@@ -103,13 +106,13 @@ export class MsiDatabase {
     }
 }
 
-export interface MsiFilePath {key: string; path: string; size: number; sequence: number}
+export interface MsiFilePath {key: string; path: string; size: number; sequence: number; sourcePath?: string; sourceShortPath?: string; attributes?: number}
 function targetName(value: string): string {
     const target = value.split(':')[0]!;
     return target.includes('|') ? target.split('|')[1]! : target;
 }
 /** Resolve beneath an install directory, whose ancestors (ProgramFilesFolder etc.) are omitted. */
-export function msiFilePaths(db: MsiDatabase, installDirectory: string): MsiFilePath[] {
+export function msiFilePaths(db: MsiDatabase, installDirectory: string, sourcePaths = false): MsiFilePath[] {
     const dirs = new Map(db.table('Directory').map(row => [row.Directory as string, row]));
     const components = new Map(db.table('Component').map(row => [row.Component as string, row.Directory_ as string]));
     if (!dirs.has(installDirectory)) throw new Error(`MSI install directory missing: ${installDirectory}`);
@@ -136,6 +139,26 @@ export function msiFilePaths(db: MsiDatabase, installDirectory: string): MsiFile
         if (/[\\/]/.test(leaf) || leaf === '..') throw new Error(`Unsafe MSI directory name: ${leaf}`);
         return parent ? `${parent}/${leaf}` : leaf;
     };
+    const sourceName = (value: string, short: boolean, directory = false) => {
+        const parts = value.split(':');
+        if (parts.length > (directory ? 2 : 1)) throw new Error('Unsafe MSI source name');
+        const source = directory ? parts[1] ?? parts[0] : parts[0];
+        const names = source.split('|');
+        const leaf = short ? names[0] : names[1] ?? names[0];
+        if (directory && leaf === '.') return '';
+        if (/[\\/]/.test(leaf)) throw new Error('Unsafe MSI source name');
+        return payloadPath(leaf);
+    };
+    const sourceDir = (id: string, short: boolean, visited = new Set<string>()): string => {
+        if (visited.has(id)) throw new Error('Cyclic MSI source directory');
+        visited.add(id);
+        const row = dirs.get(id);
+        if (!row) throw new Error(`MSI source directory missing: ${id}`);
+        if (!row.Directory_Parent) return '';
+        const parent = sourceDir(row.Directory_Parent as string, short, visited);
+        const leaf = sourceName(row.DefaultDir as string, short, true);
+        return [parent, leaf].filter(Boolean).join('/');
+    };
     return db.table('File').flatMap(row => {
         const componentDir = components.get(row.Component_ as string);
         if (!componentDir) throw new Error(`MSI component missing for file ${row.File}`);
@@ -144,6 +167,8 @@ export function msiFilePaths(db: MsiDatabase, installDirectory: string): MsiFile
         const filename = targetName(row.FileName as string);
         if (!filename || filename === '.' || filename === '..' || /[\\/]/.test(filename)) throw new Error('Unsafe MSI filename');
         if (typeof row.File !== 'string' || !row.File || typeof row.FileSize !== 'number' || row.FileSize < 0 || typeof row.Sequence !== 'number' || row.Sequence < 1) throw new Error('Invalid MSI File table');
-        return [{key: row.File as string, path: dir ? `${dir}/${filename}` : filename, size: row.FileSize, sequence: row.Sequence}];
+        const source = (short: boolean) => payloadPath([sourceDir(componentDir, short), sourceName(row.FileName as string, short)].filter(Boolean).join('/'));
+        return [{key: row.File as string, path: dir ? `${dir}/${filename}` : filename, size: row.FileSize, sequence: row.Sequence,
+            ...(sourcePaths ? {sourcePath: source(false), sourceShortPath: source(true), attributes: Number(row.Attributes ?? 0)} : {})}];
     });
 }

@@ -114,39 +114,34 @@ export function createBootloader(
     code.push(0xdb, 0xe3);
 
     // (F) DllMain Init Trampoline
-    // Call DllMain(hModule, DLL_PROCESS_ATTACH=1, lpReserved=0) for each real DLL.
-    // DllMain is stdcall — callee cleans 12 bytes (3 params × 4).
-    // When DllMain code calls kernel32/etc through IAT, it hits thunk stubs → JS handlers → returns normally.
-    for (const dll of dllInits) {
-        // PUSH 1 (lpReserved = non-NULL → static/implicit load)
-        // Windows passes non-NULL for DLLs loaded via import table (before process start).
-        // NULL is only for runtime LoadLibrary() calls.
-        code.push(0x68, 0x01, 0x00, 0x00, 0x00);
-        // PUSH 1 (fdwReason = DLL_PROCESS_ATTACH)
-        code.push(0x68, 0x01, 0x00, 0x00, 0x00);
-        // PUSH hModule (baseAddress)
-        code.push(0x68,
-            dll.baseAddress & 0xff,
-            (dll.baseAddress >> 8) & 0xff,
-            (dll.baseAddress >> 16) & 0xff,
-            (dll.baseAddress >> 24) & 0xff
-        );
-        // MOV EAX, entryPoint
-        code.push(0xb8,
-            dll.entryPoint & 0xff,
-            (dll.entryPoint >> 8) & 0xff,
-            (dll.entryPoint >> 16) & 0xff,
-            (dll.entryPoint >> 24) & 0xff
-        );
-        // CALL EAX
-        code.push(0xff, 0xd0);
-
-        // (F1) DEBUG: OUT 0xB077, 0xDEAD000A "DllMain result"
-        code.push(0x89, 0xc1);                   // MOV ECX, EAX (Save result in ECX)
-        code.push(0xb8, 0x0a, 0x00, 0xad, 0xde); // MOV EAX, 0xDEAD000A
-        code.push(0xba, 0x77, 0xb0, 0x00, 0x00); // MOV EDX, 0xB077
-        code.push(0xef);                         // OUT DX, EAX
-    }
+    // Call DllMain(hModule, DLL_PROCESS_ATTACH=1, lpReserved=1) for each real DLL, walking a
+    // {hModule, entry} table that sits after the fault handlers: the code above must fit in
+    // the 510 bytes before the boot signature and GDT, and an unrolled call per DLL does not
+    // once a title links a dozen. lpReserved is non-NULL because these are static loads.
+    // DllMain is stdcall (callee cleans 12 bytes). ESI, the table cursor, is saved across the
+    // call rather than trusted to the callee-saved convention a hand-written entry may break.
+    code.push(0xbe);                         // MOV ESI, dllTable
+    const dllTablePos = code.length;
+    code.push(0x00, 0x00, 0x00, 0x00);
+    const dllLoop = code.length;
+    code.push(0x8b, 0x46, 0x04);             // MOV EAX, [ESI+4]
+    code.push(0x85, 0xc0);                   // TEST EAX, EAX
+    code.push(0x74, 0x00);                   // JZ done
+    const dllDoneJz = code.length - 1;
+    code.push(0x56);                         // PUSH ESI
+    code.push(0x6a, 0x01);                   // PUSH 1 (lpReserved)
+    code.push(0x6a, 0x01);                   // PUSH 1 (DLL_PROCESS_ATTACH)
+    code.push(0xff, 0x36);                   // PUSH DWORD [ESI] (hModule)
+    code.push(0xff, 0xd0);                   // CALL EAX
+    code.push(0x5e);                         // POP ESI
+    // (F1) DEBUG: OUT 0xB077, 0xDEAD000A "DllMain result"
+    code.push(0x89, 0xc1);                   // MOV ECX, EAX (Save result in ECX)
+    code.push(0xb8, 0x0a, 0x00, 0xad, 0xde); // MOV EAX, 0xDEAD000A
+    code.push(0xba, 0x77, 0xb0, 0x00, 0x00); // MOV EDX, 0xB077
+    code.push(0xef);                         // OUT DX, EAX
+    code.push(0x83, 0xc6, 0x08);             // ADD ESI, 8
+    code.push(0xeb, (dllLoop - (code.length + 2)) & 0xff); // JMP loop
+    code[dllDoneJz] = code.length - (dllDoneJz + 1);
 
     // (G) Jump to EXE Entry Point
     code.push(0xb8);
@@ -224,6 +219,22 @@ export function createBootloader(
 
     const totalSize = 512 + 32 + idtSize + 1024;
     const finalBuffer = new Uint8Array(totalSize);
+
+    if (code.length > 510) throw new Error(`Bootloader code is ${code.length} bytes; it must end before the boot signature`);
+    const dllTableOff = hOfOff + handlerSize;
+    if (dllTableOff + (dllInits.length + 1) * 8 > totalSize) {
+        throw new Error(`Bootloader: ${dllInits.length} DllMain entries overflow the boot image`);
+    }
+    const dllTableLinear = loadAddress + dllTableOff;
+    code[dllTablePos] = dllTableLinear & 0xff;
+    code[dllTablePos + 1] = (dllTableLinear >> 8) & 0xff;
+    code[dllTablePos + 2] = (dllTableLinear >> 16) & 0xff;
+    code[dllTablePos + 3] = (dllTableLinear >> 24) & 0xff;
+    const tableView = new DataView(finalBuffer.buffer, dllTableOff, (dllInits.length + 1) * 8);
+    dllInits.forEach((dll, i) => {
+        tableView.setUint32(i * 8, dll.baseAddress >>> 0, true);
+        tableView.setUint32(i * 8 + 4, dll.entryPoint >>> 0, true);
+    });
 
     // Copy bootloader code
     finalBuffer.set(code, 0);

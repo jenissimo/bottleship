@@ -18,6 +18,8 @@ unpack/   ← dependency-free CORE
 inno/         Inno Setup installer reader        → unpack (+ pako)
 freearc/      FreeArc .arc / repack reader       → unpack
 iso/          ISO9660 / BIN+CUE disc images      → unpack
+rar/          RAR5 stored; RAR4 Unicode + solid  → unpack + installer/binary
+msi/          MSI tables and source/target paths → installer/binary
 installshield/ InstallShield 5/6 cabinets        → unpack
 rtf/          Rich Text Format documents        → (nothing)
 ```
@@ -43,6 +45,10 @@ The srep + LZMA decode is verified byte-exact against references compiled with M
 - `inno`: `parseInnoHeader`, `extractInnoToMap`, `MultiSliceReader`, …
 - `freearc`: `detectFreeArc`, `readFreeArcListing`, `extractFreeArc`, `extractFreeArcToMap`.
 - `iso`: `IsoImage`, `parseIso9660`, `extractIsoToMap`, `parseCue`.
+- `rar`: `parseRar`, `parseRar4`, `extractRar4`; RAR 2.9 solid groups share coding state.
+- `msi`: `MsiDatabase`, `msiFilePaths`; the repack package resolves cabinet and loose media.
+  MSI hashes are strict by default. The ISO CLI's `--allow-msi-hash-mismatch` reports each
+  mismatch and preserves source bytes when an installer carries stale hash metadata.
 - `installshield`: `detectInstallShieldStem`, `extractInstallShield`.
 - `rtf`: `isRtf`, `parseRtf` (styled runs; pass `decode` to supply code-page tables).
 

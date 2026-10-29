@@ -6,6 +6,7 @@ import { BufferSource, ZipArchive } from "@bottleship/formats/zip";
 import { wgbEtag } from "../../deploy/wgb-etag";
 import { WgbCache } from "../../src/worker/runtime/filesystem/wgb-cache";
 import { FakeDirHandle } from "./fixtures/fake-opfs";
+import { ZipStoreWriter } from "../internal/zip-store-writer";
 
 function fixture(): string {
     const logs = resolve("logs"); mkdirSync(logs, { recursive: true });
@@ -15,6 +16,27 @@ function cleanup(root: string): void {
     if (!resolve(root).startsWith(resolve("logs") + sep)) throw new Error("Fixture outside logs");
     rmSync(root, { recursive: true, force: true });
 }
+
+test("add-dir replaces Windows-spelled entries without creating path aliases", async () => {
+    const root = fixture(), archivePath = join(root, "assets.wgb"), assets = join(root, "assets");
+    mkdirSync(assets);
+    const writer = new ZipStoreWriter(archivePath);
+    writer.addBuffer("Assets\\Texture.bmp", Buffer.from("old"));
+    writer.finish();
+    writeFileSync(join(assets, "texture.bmp"), "replacement");
+    try {
+        for (let i = 0; i < 2; i++) {
+            const child = Bun.spawn(["bun", "tools/wgb.ts", "add-dir", archivePath, "assets", assets], { stdout: "pipe", stderr: "pipe" });
+            const [code, , stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+            expect(code, stderr).toBe(0);
+            const zip = new ZipArchive(new BufferSource(new Uint8Array(await Bun.file(archivePath).arrayBuffer())));
+            await zip.init();
+            expect(zip.listEntries()).toHaveLength(1);
+            const entry = zip.listEntries()[0]!;
+            expect(new TextDecoder().decode(await zip.readEntry(entry))).toBe("replacement");
+        }
+    } finally { cleanup(root); }
+});
 
 test("local WGB ETags coalesce probes and detect a same-size rewrite", async () => {
     const root = fixture(), path = join(root, "test.wgb");

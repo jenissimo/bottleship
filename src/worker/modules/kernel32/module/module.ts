@@ -818,6 +818,7 @@ function initModuleFunctions(): void {
         if (moduleRegistry && !requestsSystemCopyOfAppDirDll(dllName)) {
             const existing = moduleRegistry.getByName(dllName);
             if (existing) {
+                rememberLoadLibraryHandle(dllName, existing.baseAddress);
                 Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}") -> 0x${existing.baseAddress.toString(16)} (already loaded)`);
                 return { value: existing.baseAddress, stackCleanup: 12 };
             }
@@ -839,6 +840,7 @@ function initModuleFunctions(): void {
 
 
         const loaded = (module: { baseAddress: number }): ThunkResult => {
+            rememberLoadLibraryHandle(dllName, module.baseAddress);
             const dllInits = loader!.getPendingDllInits();
             if (dllInits.length > 0) {
                 Logger.log(LogCategory.KERNEL32,
@@ -907,6 +909,7 @@ function initModuleFunctions(): void {
         if (moduleRegistry && !requestsSystemCopyOfAppDirDll(dllName)) {
             const existing = moduleRegistry.getByName(dllName);
             if (existing) {
+                rememberLoadLibraryHandle(dllName, existing.baseAddress);
                 Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}") -> 0x${existing.baseAddress.toString(16)} (already loaded)`);
                 return { value: existing.baseAddress, stackCleanup: 12 };
             }
@@ -928,6 +931,7 @@ function initModuleFunctions(): void {
 
 
         const loaded = (module: { baseAddress: number }): ThunkResult => {
+            rememberLoadLibraryHandle(dllName, module.baseAddress);
             const dllInits = loader!.getPendingDllInits();
             if (dllInits.length > 0) {
                 Logger.log(LogCategory.KERNEL32,

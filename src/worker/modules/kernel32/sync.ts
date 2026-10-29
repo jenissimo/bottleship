@@ -28,6 +28,9 @@ import { namedObjects } from './named-objects';
 import { getWsaNativeSocketTable } from '../wsa-stub-shared';
 import type { WsaSocketTable } from '../wsa-network';
 
+/** Milliseconds from the FILETIME epoch (1601-01-01) to the Unix epoch. */
+const FILETIME_UNIX_EPOCH_MS = 11644473600000;
+
 interface IoCompletionAssociation { portHandle: number; key: number; port: object; }
 const ioCompletionAssociations = new Map<number, IoCompletionAssociation>();
 interface SocketCompletionScope {
@@ -1795,8 +1798,14 @@ const syncModule = (() => {
         const pDueTime = args[1] >>> 0;
         const lPeriod = args[2] | 0;
 
+        const scheduler = System.getInstance().scheduler;
         const timer = waitableTimers.get(hTimer);
         if (!timer) {
+            scheduler.setLastError(6); // ERROR_INVALID_HANDLE
+            return 0;
+        }
+        if (lPeriod < 0) {
+            scheduler.setLastError(ERROR_INVALID_PARAMETER);
             return 0;
         }
 
@@ -1809,27 +1818,31 @@ const syncModule = (() => {
         // advanced in-band with guest execution (virtual time), so it fires deterministically
         // regardless of how long the guest spins. Mirrors winmm timeSetEvent. (HP freeze,
         // root-caused 2026-06-26.)
-        const scheduler = System.getInstance().scheduler;
         const wheel = scheduler.timerWheel;
         if (timer.wheelId !== null) {
             wheel.cancel(timer.wheelId);
             timer.wheelId = null;
         }
+        // Arming a timer cancels it and makes it non-signalled again.
+        scheduler.resetEvent(hTimer);
 
-        // FILETIME/relative due-time semantics are approximated here.
+        // lpDueTime is a signed LARGE_INTEGER in 100 ns units: negative is relative to now,
+        // positive an absolute FILETIME, measured on the clock GetSystemTimeAsFileTime reads.
         let delayMs = 1;
         if (pDueTime) {
             const low = Mem.readUint32(pDueTime) ?? 0;
             const high = Mem.readUint32(pDueTime + 4) ?? 0;
-            const signedHigh = (high << 0);
-            if (signedHigh < 0) {
-                const due100ns = ((BigInt(high >>> 0) << 32n) | BigInt(low >>> 0));
-                const abs100ns = due100ns < 0n ? -due100ns : due100ns;
-                delayMs = Number(abs100ns / 10000n);
+            // Doubles round past 2^53 (100 ns units), i.e. by microseconds; delays are whole ms.
+            const dueMs = ((high | 0) * 4294967296 + (low >>> 0)) / 10000;
+            if (dueMs < 0) {
+                delayMs = Math.floor(-dueMs);
+            } else {
+                const remaining = Math.floor(dueMs - (TimeService.getInstance().nowUnixMs() + FILETIME_UNIX_EPOCH_MS));
+                delayMs = remaining > 0 ? remaining : 0;
             }
         }
 
-        timer.periodMs = Math.max(0, lPeriod);
+        timer.periodMs = lPeriod;
         const fire = () => { System.getInstance().scheduler.setEvent(hTimer); };
 
         if (timer.periodMs > 0) {

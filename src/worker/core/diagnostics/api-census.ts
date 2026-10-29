@@ -88,7 +88,7 @@ export function isSuspectSilentStub(name: string, arity: number, argCount: numbe
  */
 const HRESULT_MODULES = new Set<string>([
     "d3d9", "d3dx9", "d3d8", "d3dx8", "ddraw", "dsound", "dinput", "dinput8",
-    "quartz", "dplayx", "dmusic", "d3drm", "wined3d",
+    "quartz", "dplayx", "dmusic", "amstream", "d3drm", "wined3d",
 ]);
 
 export interface ApiFailureRecord {

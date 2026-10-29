@@ -14,6 +14,7 @@ import { createEffectExports, resetEffectState } from './effects';
 import { createBufferExports, resetD3DXBuffers } from './buffer';
 import { createEffectPoolExports, resetEffectPools, resetEffectPoolVtable } from './effect-pool';
 import { createShaderExports, resetShaderAsmState } from './shaders';
+import { createCompileShaderExports, resetCompileShaderState } from './compile-shader';
 import { createConstantTableExports, resetD3DXConstantTables } from './constant-table';
 import { createTextureRequirementExports } from './texture-requirements';
 import { resetEffectInstances } from './effect-state';
@@ -53,6 +54,7 @@ export class D3dx9 implements IModule {
         Object.assign(this.exports, createBufferExports(process));
         Object.assign(this.exports, createEffectPoolExports(process));
         Object.assign(this.exports, createShaderExports(process));
+        Object.assign(this.exports, createCompileShaderExports(process));
         Object.assign(this.exports, createConstantTableExports());
         Object.assign(this.exports, createTextureRequirementExports());
 
@@ -84,6 +86,7 @@ export class D3dx9 implements IModule {
         resetEffectPools();
         resetEffectPoolVtable();
         resetShaderAsmState();
+        resetCompileShaderState();
         resetD3DXConstantTables();
         // The effect registry is keyed by GUEST pointer: leaving it populated lets a new
         // effect that lands on a recycled address inherit the previous process's model.

@@ -67,8 +67,10 @@ class FakeWorker {
     readonly gpu = new FakeGpu();
     readonly manager = new D3D9QueryManager({ device: this.gpu as unknown as QueryManagerDevice, queue: fakeQueue });
     readonly frame: Array<[string, number]> = [];
+    flushes = 0;
     readonly host = new SplitQueryHost({
         getQueryManager: () => this.manager,
+        flushQueryCommands: () => { this.flushes++; },
         recordQueryBegin: (q) => { this.frame.push(["begin", q]); },
         recordQueryEnd: (q) => { this.frame.push(["end", q]); },
         recordQueryTimestamp: (q) => { this.frame.push(["timestamp", q]); },
@@ -241,6 +243,17 @@ describe("split D3D9 query results (render-worker arm)", () => {
         deliverResults();
         expect(call("IDirect3DQuery9_GetData", q, DATA_OUT, 4, 0)).toBe(D3D_OK);
         expect(Mem.readUint32(DATA_OUT)).toBe(55);
+    });
+
+    test("FLUSH reaches the device executor without fabricating submission or a result", () => {
+        const q = createQuery(OCCLUSION);
+        call("IDirect3DQuery9_Issue", q, ISSUE_BEGIN);
+        call("IDirect3DQuery9_Issue", q, ISSUE_END);
+        expect(call("IDirect3DQuery9_GetData", q, DATA_OUT, 4, FLUSH)).toBe(S_FALSE);
+        expect(worker.flushes).toBe(1);
+        expect(worker.manager.getSubmittedSerial()).toBe(0);
+        expect(worker.host.collect()).toEqual([]);
+        expect(worker.frame).toEqual([["begin", q], ["end", q]]);
     });
 
     test("OCCLUSION answers the count the worker measured, not the CPU viewport fallback", async () => {

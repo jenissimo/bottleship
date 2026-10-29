@@ -908,6 +908,9 @@ export class Direct3DDevice3Object extends BaseComObject {
     private material: D3DMaterial7Data = createDefaultMaterial();
     /** SetMaterial was called at least once — the DX6 ProcessVertices D3DVOP_LIGHT gate. */
     private materialSet: boolean = false;
+    private lightStateMaterial: number = 0;
+    /** D3DLIGHTSTATE_COLORMODEL; D3DCOLOR_RGB until set. */
+    private colorModel: number = 2;
     private lights: Map<number, D3DLight7Data> = new Map();
     private lightsEnabled: Set<number> = new Set();
 
@@ -929,6 +932,23 @@ export class Direct3DDevice3Object extends BaseComObject {
     setMaterial(mat: D3DMaterial7Data): void {
         this.material = mat;
         this.materialSet = true;
+    }
+
+    /** D3DLIGHTSTATE_MATERIAL: the handle of the material in use, 0 for none. */
+    getLightStateMaterial(): number {
+        return this.lightStateMaterial;
+    }
+
+    setLightStateMaterial(handle: number): void {
+        this.lightStateMaterial = handle;
+    }
+
+    getColorModel(): number {
+        return this.colorModel;
+    }
+
+    setColorModel(model: number): void {
+        this.colorModel = model;
     }
 
     isMaterialSet(): boolean {
@@ -1554,6 +1574,7 @@ export class Direct3DLightObject extends BaseComObject {
 export class Direct3DMaterial3Object extends BaseComObject {
     private materialData: D3DMaterial7Data = createDefaultMaterial();
     private materialHandle: number = 0;
+    private activeDevice: Direct3DDevice3Object | null = null;
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DMaterial3, vtableAddress);
@@ -1569,6 +1590,16 @@ export class Direct3DMaterial3Object extends BaseComObject {
 
     setMaterialHandle(h: number): void {
         this.materialHandle = h;
+    }
+
+    /** The device whose D3DLIGHTSTATE_MATERIAL last named this material. */
+    setActiveDevice(device: Direct3DDevice3Object): void {
+        this.activeDevice = device;
+    }
+
+    /** That device, while it still has this material in use. */
+    getActiveDevice(): Direct3DDevice3Object | null {
+        return this.activeDevice?.getLightStateMaterial() === this.materialHandle ? this.activeDevice : null;
     }
 
     getMaterialHandle(): number {

@@ -8,12 +8,12 @@
  * cmds/* modules, which pull in the whole worker; this isolates the contract.)
  */
 
-import { describe, expect, test, beforeEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 
-// Capture worker->page messages. service.ts / event-bus.ts post via
-// `(self as Worker).postMessage`; in Bun `self === globalThis`, so override here.
+// Own the worker transport for each test; other fixtures may replace self.
 const posted: any[] = [];
-(globalThis as any).postMessage = (m: any) => { posted.push(m); };
+let previousSelf: PropertyDescriptor | undefined;
+let previousPostMessage: PropertyDescriptor | undefined;
 
 import { HarnessService } from "../../src/worker/harness/service";
 import { harnessBus } from "../../src/worker/harness/event-bus";
@@ -26,7 +26,20 @@ const replies = () => posted.filter((m) => m.type === HARNESS_REPLY);
 const events = () => posted.filter((m) => m.type === HARNESS_EVENT);
 
 describe("HarnessService contract", () => {
-    beforeEach(() => { posted.length = 0; });
+    beforeEach(() => {
+        posted.length = 0;
+        previousSelf = Object.getOwnPropertyDescriptor(globalThis, 'self');
+        previousPostMessage = Object.getOwnPropertyDescriptor(globalThis, 'postMessage');
+        Object.defineProperty(globalThis, 'self', { configurable: true, writable: true, value: globalThis });
+        Object.defineProperty(globalThis, 'postMessage', { configurable: true, writable: true,
+            value: (m: any) => { posted.push(m); } });
+    });
+    afterEach(() => {
+        for (const [name, descriptor] of [['self', previousSelf], ['postMessage', previousPostMessage]] as const) {
+            if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+            else Reflect.deleteProperty(globalThis, name);
+        }
+    });
 
     test("ok result is id-correlated", async () => {
         const svc = new HarnessService();

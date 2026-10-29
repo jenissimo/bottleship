@@ -18,7 +18,7 @@ import { Mem } from '../../core/memory/mem-accessor';
 import { System } from '../../core/system';
 import { Process } from '../../core/process';
 import { VfsFileHandle, VirtualFileSystem } from '../../runtime/filesystem/vfs';
-import { VFS_FILETIME } from '../../runtime/filesystem/file-time';
+import { fileTimeOf } from '../../runtime/filesystem/file-time';
 import { noteBootFileActivity } from '../../runtime/boot-status';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { getCodePageDecoder } from '../codepage-utils';
@@ -189,6 +189,12 @@ const GENERIC_WRITE = 0x40000000;
 const OPEN_EXISTING = 3;
 const CREATE_ALWAYS = 2;
 const FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
+
+/** The time the file behind a handle reports (see file-time.ts). */
+function handleFileTime(fileHandle: { vfsHandle?: VfsFileHandle } | null | undefined): bigint {
+    const path = fileHandle?.vfsHandle?.path;
+    return fileTimeOf(path ? System.getInstance().fileSystem.statEntry(path) : null);
+}
 
 /** Record the caller's declared access pattern on the file object. NT takes this at
  *  face value and reads ahead on it; below us it is what tells the block cache that a
@@ -632,6 +638,18 @@ const fileIoModule = (() => {
         const iReadWrite = args[1] >>> 0;
         return exports['OpenFile']!(ctx, mem, [lpPathName, 0, iReadWrite]);
     };
+
+    // _lcreat - create or truncate for read/write; iAttribute's low bits are FILE_ATTRIBUTE_*.
+    // INVALID_HANDLE_VALUE and HFILE_ERROR are both -1.
+    exports['_lcreat'] = (ctx, mem, args) => exports['CreateFileA']!(ctx, mem, [
+        args[0],
+        0xC0000000, // GENERIC_READ|GENERIC_WRITE
+        3,          // FILE_SHARE_READ|FILE_SHARE_WRITE
+        0,
+        2,          // CREATE_ALWAYS
+        args[1] & 7,
+        0,
+    ]);
 
     exports['CreateFileW'] = (ctx, mem, args) => {
         const lpFileName = args[0];
@@ -1785,6 +1803,30 @@ const fileIoModule = (() => {
         }
     };
 
+    // _hread - the Win16 "huge" read; identical to _lread on Win32.
+    exports['_hread'] = (ctx, mem, args) => exports['_lread']!(ctx, mem, args);
+
+    // _hwrite - WriteFile returning the count (HFILE_ERROR on failure); a zero count is
+    // SetEndOfFile at the cursor. Both results drop the callee's stdcall cleanup for ours.
+    exports['_hwrite'] = (ctx, mem, args) => {
+        const hFile = args[0];
+        const lpBuffer = args[1];
+        const count = args[2] >>> 0;
+        const asHfile = (res: number | ThunkResult) => ((typeof res === 'number' ? res : res.value) ? count : HFILE_ERROR);
+        const delegate = (r: ReturnType<ThunkImplementation>) =>
+            r instanceof Promise ? r.then(res => ({ value: asHfile(res) })) : asHfile(r);
+
+        if (count === 0) return delegate(exports['SetEndOfFile']!(ctx, mem, [hFile]));
+        if (!lpBuffer || lpBuffer + count > mem.length) {
+            System.getInstance().scheduler.setLastError(ERROR_NOACCESS);
+            return HFILE_ERROR;
+        }
+        return delegate(exports['WriteFile']!(ctx, mem, [hFile, lpBuffer, count, 0, 0]));
+    };
+
+    // _lwrite - the UINT-count form of _hwrite.
+    exports['_lwrite'] = (ctx, mem, args) => exports['_hwrite']!(ctx, mem, args);
+
     exports['GetFileSize'] = (ctx, mem, args) => {
         const hFile = args[0];
         const lpFileSizeHigh = args[1];
@@ -2271,7 +2313,7 @@ const fileIoModule = (() => {
         // +44: nFileIndexHigh (DWORD)
         // +48: nFileIndexLow (DWORD)
         view.setUint32(lpFileInformation + 0, 0x80, true);   // FILE_ATTRIBUTE_NORMAL
-        const fakeTime = VFS_FILETIME;
+        const fakeTime = handleFileTime(fileHandle);
         view.setBigUint64(lpFileInformation + 4, fakeTime, true);
         view.setBigUint64(lpFileInformation + 12, fakeTime, true);
         view.setBigUint64(lpFileInformation + 20, fakeTime, true);
@@ -2332,7 +2374,7 @@ const fileIoModule = (() => {
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
         const fileSize = fileHandle.size >>> 0;
-        const fakeTime = VFS_FILETIME;
+        const fakeTime = handleFileTime(fileHandle);
 
         // FileBasicInfo = 0 (40 bytes)
         if (infoClass === 0) {

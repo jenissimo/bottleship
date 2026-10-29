@@ -1,11 +1,15 @@
 /**
- * Every surface that reports a file's time reports the SAME, non-zero instant.
+ * Every surface that reports a file's time reports the SAME, non-zero instant: the time a
+ * ROM entry records, else the shared default.
  *
  * MSVC's _findfirst/_stat convert a zero FILETIME to time_t -1, and localtime(-1) is NULL:
  * a title that formats a save's date dereferences it. Four producers answering four
- * different instants (zero among them) is how that slipped through.
+ * different instants (zero among them) is how that slipped through. A title can also
+ * check a data file's date against the one it shipped with, and take another load path
+ * when they differ. That date is a DOS wall-clock reading, so the guest must see it as LOCAL
+ * time: the FILETIME is the reading converted to UTC with the guest's bias.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { System } from "../../src/worker/core/system";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { exports as fileIo } from "../../src/worker/modules/kernel32/file-io";
@@ -19,6 +23,13 @@ const FT_OUT = 0x800;
 
 const save: VfsEntry = { path: "C:\\Saves\\Rage\\Rage", name: "Rage", kind: "file", size: 16, source: "overlay" };
 const dir: VfsEntry = { path: "C:\\Saves\\Rage", name: "Rage", kind: "dir", size: 0, source: "overlay" };
+/** 2001-10-05 12:07:22 wall clock, as an installer recorded it. */
+const SHIPPED = 1002283642;
+/** Pinned so the bias is known and non-zero: Tokyo is UTC+9 with no DST. */
+const ZONE = "Asia/Tokyo";
+const SHIPPED_FILETIME = (BigInt(SHIPPED - 9 * 3600) + 11644473600n) * 10_000_000n;
+const map: VfsEntry = { path: "C:\\Mods\\mp_castle.map", name: "mp_castle.map", kind: "file", size: 3214482, source: "rom", modified: SHIPPED };
+const SAVE_HANDLE = 0x50004, MAP_HANDLE = 0x50008;
 
 let mem: Uint8Array;
 let view: DataView;
@@ -35,6 +46,13 @@ function findTimes(): bigint[] {
 }
 
 describe("kernel32 file times", () => {
+    const hostZone = process.env.TZ;
+    beforeAll(() => { process.env.TZ = ZONE; });
+    afterAll(() => {
+        if (hostZone === undefined) delete process.env.TZ;
+        else process.env.TZ = hostZone;
+    });
+
     beforeEach(() => {
         mem = new Uint8Array(0x4000);
         view = new DataView(mem.buffer);
@@ -42,7 +60,7 @@ describe("kernel32 file times", () => {
         const system = System.getInstance() as any;
         const fs = system.fileSystem;
         const { statEntry, listDirectory } = fs;
-        fs.statEntry = (p: string) => (p.toLowerCase() === save.path.toLowerCase() ? save : null);
+        fs.statEntry = (p: string) => [save, map].find((e) => e.path.toLowerCase() === p.toLowerCase()) ?? null;
         fs.listDirectory = () => [dir, save];
         restore.push(() => { fs.statEntry = statEntry; fs.listDirectory = listDirectory; });
         const rp = system.resourceProvider;
@@ -53,6 +71,8 @@ describe("kernel32 file times", () => {
             registerKernelObject: (o: unknown) => { objects.set(next += 4, o); return next; },
             getKernelObject: (h: number) => objects.get(h),
             unregisterKernelObject: (h: number) => objects.delete(h),
+            getFileHandle: (h: number) => h === SAVE_HANDLE ? { vfsHandle: { path: save.path } }
+                : h === MAP_HANDLE ? { vfsHandle: { path: map.path } } : null,
         };
         restore.push(() => { system.resourceProvider = rp; });
     });
@@ -90,8 +110,28 @@ describe("kernel32 file times", () => {
     });
 
     test("GetFileTime reports the same instant as the find data", () => {
-        expect(time["GetFileTime"]!(null as any, mem, [0x44, FT_OUT, FT_OUT + 8, FT_OUT + 16])).toBe(1);
+        expect(time["GetFileTime"]!(null as any, mem, [SAVE_HANDLE, FT_OUT, FT_OUT + 8, FT_OUT + 16])).toBe(1);
         expect([0, 8, 16].map((o) => view.getBigUint64(FT_OUT + o, true)))
             .toEqual([VFS_FILETIME, VFS_FILETIME, VFS_FILETIME]);
+    });
+
+    test("a ROM entry's recorded time reaches the find data, GetFileTime and GetFileAttributesEx", () => {
+        writeA(PATH, map.path);
+        expect(fileIo["FindFirstFileA"]!(null as any, mem, [PATH, FIND_DATA])).not.toBe(-1);
+        expect(findTimes()).toEqual([SHIPPED_FILETIME, SHIPPED_FILETIME, SHIPPED_FILETIME]);
+
+        expect(time["GetFileTime"]!(null as any, mem, [MAP_HANDLE, FT_OUT, FT_OUT + 8, FT_OUT + 16])).toBe(1);
+        expect([0, 8, 16].map((o) => view.getBigUint64(FT_OUT + o, true)))
+            .toEqual([SHIPPED_FILETIME, SHIPPED_FILETIME, SHIPPED_FILETIME]);
+
+        mem.fill(0, FIND_DATA, FIND_DATA + 64);
+        expect(fileIo["GetFileAttributesExA"]!(null as any, mem, [PATH, 0, FIND_DATA])).toBe(1);
+        expect(findTimes()).toEqual([SHIPPED_FILETIME, SHIPPED_FILETIME, SHIPPED_FILETIME]);
+    });
+
+    test("the guest's local view of a ROM entry's time is the recorded reading", () => {
+        expect(time["GetFileTime"]!(null as any, mem, [MAP_HANDLE, 0, 0, FT_OUT])).toBe(1);
+        time["FileTimeToLocalFileTime"]!(null as any, mem, [FT_OUT, FT_OUT + 8]);
+        expect(view.getBigUint64(FT_OUT + 8, true)).toBe((BigInt(SHIPPED) + 11644473600n) * 10_000_000n);
     });
 });

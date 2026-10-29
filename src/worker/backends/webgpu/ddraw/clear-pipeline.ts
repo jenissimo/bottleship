@@ -21,6 +21,8 @@ type ClearPipelineSet = {
     depthAndStencil: GPURenderPipeline;
 };
 
+type DepthUniformBinding = { buffer: GPUBuffer; bindGroup: GPUBindGroup };
+
 /** Depth/stencil-only pipelines: no color target. Used when partial clear has only Z/stencil. */
 type DepthOnlyPipelineSet = {
     depthOnly: GPURenderPipeline;
@@ -68,9 +70,13 @@ export class ClearPipeline {
     private pipelines = new Map<GPUTextureFormat, ClearPipelineSet>();
     private depthOnlyPipelines: DepthOnlyPipelineSet | null = null;
     private clearVertexBuffer: GPUBuffer | null = null;
-    private depthUniformBuffer: GPUBuffer | null = null;
+    // Queue writes are not encoder-local. Every recorded clear must keep an immutable
+    // value until submission; reusing one mutable buffer makes earlier clears read
+    // the final value. Common 0/1 bindings are retained, other values belong to the
+    // exact encoder that records them and are retired only after its submission.
+    private commonDepthBindings = new Map<number, DepthUniformBinding>();
+    private encoderDepthBindings = new Map<GPUCommandEncoder, Map<number, DepthUniformBinding>>();
     private depthBindGroupLayout: GPUBindGroupLayout | null = null;
-    private depthBindGroup: GPUBindGroup | null = null;
     private shaderModule: GPUShaderModule | null = null;
 
     constructor(
@@ -94,21 +100,51 @@ export class ClearPipeline {
         });
         this.queue.writeBuffer(this.clearVertexBuffer, 0, vertices);
 
-        this.depthUniformBuffer = this.device.createBuffer({
-            size: 16,
-            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        });
         this.depthBindGroupLayout = this.device.createBindGroupLayout({
             entries: [
                 { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
             ],
         });
-        this.depthBindGroup = this.device.createBindGroup({
-            layout: this.depthBindGroupLayout,
-            entries: [{ binding: 0, resource: { buffer: this.depthUniformBuffer } }],
-        });
         const shaderCode = generateClearShaderCode();
         this.shaderModule = this.device.createShaderModule({ code: shaderCode });
+    }
+
+    private depthBindingFor(encoder: GPUCommandEncoder, depth: number): GPUBindGroup {
+        if (!this.depthBindGroupLayout) throw new Error("ClearPipeline has been destroyed");
+        const value = Math.fround(depth);
+        const common = value === 0 || value === 1;
+        let bindings = common ? this.commonDepthBindings : this.encoderDepthBindings.get(encoder);
+        const existing = bindings?.get(value);
+        if (existing) return existing.bindGroup;
+        const buffer = this.device.createBuffer({
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+        let bindGroup: GPUBindGroup;
+        try {
+            this.queue.writeBuffer(buffer, 0, new Float32Array([value, 0, 0, 0]));
+            bindGroup = this.device.createBindGroup({
+                layout: this.depthBindGroupLayout,
+                entries: [{ binding: 0, resource: { buffer } }],
+            });
+        } catch (error) {
+            buffer.destroy();
+            throw error;
+        }
+        if (!bindings) {
+            bindings = new Map();
+            this.encoderDepthBindings.set(encoder, bindings);
+        }
+        bindings.set(value, { buffer, bindGroup });
+        return bindGroup;
+    }
+
+    /** Call only after this encoder was submitted or permanently discarded. */
+    destroyPendingAfterSubmit(encoder: GPUCommandEncoder): void {
+        const bindings = this.encoderDepthBindings.get(encoder);
+        if (!bindings) return;
+        this.encoderDepthBindings.delete(encoder);
+        for (const binding of bindings.values()) binding.buffer.destroy();
     }
 
     /**
@@ -487,6 +523,12 @@ export class ClearPipeline {
 
         if (colorAttachments.length === 0 && !depthStencilAttachment) return;
 
+        const depthValue = needsDepth
+            ? ((config.depth !== undefined && !isNaN(config.depth)) ? config.depth : 1.0)
+            : 0.0;
+        // Prepare before beginning a pass: allocation/upload failure must not leave
+        // the encoder locked in a partially configured pass.
+        const depthBinding = this.depthBindingFor(encoder, depthValue);
         const renderPass = encoder.beginRenderPass({
             colorAttachments,
             depthStencilAttachment,
@@ -495,16 +537,7 @@ export class ClearPipeline {
         if (hasColor) renderPass.setBlendConstant(clearColor);
         if (needsStencil) renderPass.setStencilReference(config.stencil ?? 0);
 
-        if (this.depthUniformBuffer && this.depthBindGroup) {
-            if (needsDepth) {
-                const depthValue = (config.depth !== undefined && !isNaN(config.depth))
-                    ? config.depth
-                    : 1.0;
-                const depthData = new Float32Array([depthValue, 0, 0, 0]);
-                this.queue.writeBuffer(this.depthUniformBuffer, 0, depthData);
-            }
-            renderPass.setBindGroup(0, this.depthBindGroup);
-        }
+        renderPass.setBindGroup(0, depthBinding);
 
         renderPass.setPipeline(pipeline);
         renderPass.setVertexBuffer(0, this.clearVertexBuffer);
@@ -614,12 +647,10 @@ export class ClearPipeline {
             this.clearVertexBuffer.destroy();
             this.clearVertexBuffer = null;
         }
-        if (this.depthUniformBuffer) {
-            this.depthUniformBuffer.destroy();
-            this.depthUniformBuffer = null;
-        }
+        for (const binding of this.commonDepthBindings.values()) binding.buffer.destroy();
+        this.commonDepthBindings.clear();
+        for (const encoder of this.encoderDepthBindings.keys()) this.destroyPendingAfterSubmit(encoder);
         this.depthBindGroupLayout = null;
-        this.depthBindGroup = null;
         this.shaderModule = null;
         this.pipelines.clear();
         this.depthOnlyPipelines = null;

@@ -17,9 +17,10 @@
  */
 
 import { describe, expect, test } from "bun:test";
-// d3d/types.ts builds its default render-state table at module scope out of ../constants,
-// so the module graph has to be entered through it; starting anywhere else resolves the
-// ddraw import cycle into a temporal-dead-zone error.
+// Enter the ddraw module graph through its index, as the worker does: starting anywhere else
+// resolves the ddraw import cycle into a temporal-dead-zone error (BaseComObject, or the
+// default render-state table d3d/types.ts builds at module scope out of ../constants).
+import "../../src/worker/modules/ddraw/index";
 import "../../src/worker/modules/ddraw/d3d/types";
 import {
     createExecuteBufferExports,

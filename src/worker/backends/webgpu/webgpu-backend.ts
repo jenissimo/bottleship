@@ -125,6 +125,9 @@ export class WebGPUBackend implements RenderBackend {
         if (adapter.features.has("float32-filterable")) {
             requiredFeatures.push("float32-filterable");
         }
+        if (adapter.features.has("float32-blendable" as GPUFeatureName)) {
+            requiredFeatures.push("float32-blendable" as GPUFeatureName);
+        }
         return await adapter.requestDevice({ requiredFeatures });
     }
 

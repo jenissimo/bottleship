@@ -41,8 +41,22 @@ const BS0 = "?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@0";
 
 export const msvcp60Module: ModuleDescriptor = {
     name: "msvcp60",
-    description: "MSVC 6.0 C++ standard library (std::string subset)",
+    description: "MSVC 6.0 C++ standard library (string and C-locale subset)",
     functions: [
+        // Eight-byte POD return values occupy EDX:EAX, not a hidden pointer.
+        makeCdecl("_Getcoll", 0),
+        makeCdecl("_Getcvt", 0),
+        // _Ctypevec is 16 bytes and uses a hidden caller-cleaned result pointer.
+        makeCdecl("_Getctype", 4),
+        makeCdecl("_Mbrtowc", 20),
+        makeCdecl("_Wcrtomb", 16),
+        makeCdecl("_Strcoll", 20),
+        makeCdecl("_Strxfrm", 20),
+        makeCdecl("_Tolower", 8),
+        makeCdecl("_Toupper", 8),
+        makeCdecl("btowc", 4),
+        makeCdecl("wctob", 4),
+
         makeThiscall(`?_Tidy@${BS}@@AAEX_N@Z`, 4),
         makeCdecl("?_Xlen@std@@YAXXZ", 0, { returnType: "void" }),
         makeThiscall(`?_Copy@${BS}@@AAEXI@Z`, 4),
@@ -88,6 +102,11 @@ export const msvcp60Module: ModuleDescriptor = {
         makeCdecl(`??Hstd@@YA?AV${BS0}@ABV10@PBD@Z`, 12),
 
         // Exception / CRT lock helpers
+        makeCdecl("??_7bad_cast@std@@6B@", 0),
+        makeThiscall("??0bad_cast@std@@QAE@PBD@Z", 4),
+        makeThiscall("??0bad_cast@std@@QAE@ABV01@@Z", 4),
+        makeThiscall("??1bad_cast@std@@UAE@XZ", 0, { returnType: "void" }),
+        makeThiscall("??4bad_cast@std@@QAEAAV01@ABV01@@Z", 4),
         makeCdecl("??_7out_of_range@std@@6B@", 0),
         makeThiscall("??0out_of_range@std@@QAE@ABV01@@Z", 4),
         makeThiscall("??1out_of_range@std@@UAE@XZ", 0),
@@ -100,5 +119,6 @@ export const msvcp60Module: ModuleDescriptor = {
         makeThiscall("??0logic_error@std@@QAE@ABV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@1@@Z", 4),
         makeThiscall("??0_Lockit@std@@QAE@XZ", 0),
         makeThiscall("??1_Lockit@std@@QAE@XZ", 0),
+        makeThiscall("??4_Lockit@std@@QAEAAV01@ABV01@@Z", 4),
     ],
 };

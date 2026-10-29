@@ -2,6 +2,7 @@
  * IFC20.dll — Immersion TouchSense force-feedback (stub implementation).
  *
  * HoMM3 imports CImmMouse, CImmProject, CImmDevice, CImmCompoundEffect.
+ * IFC21/IFC22 export the same classes, so this module answers for every 2.x DLL.
  * Real hardware is never present in browser, so all methods return "no device"
  * or no-op. The critical requirement is that constructors write a valid vtable
  * pointer so virtual calls don't #PF through a NULL vtable.
@@ -29,6 +30,7 @@ const CIMMPROJECT_SIZE = 0x10; // 16 bytes
 
 export class IFC20 implements IModule {
     name = 'ifc20';
+    aliases = ['ifc21', 'ifc22'];
     exports: Record<string, ThunkImplementation> = {};
     private process!: Process;
     private mouseVtableAddr = 0;

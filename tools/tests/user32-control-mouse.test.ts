@@ -5,6 +5,9 @@
  * the guest forwards to DefWindowProc.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+// Enter user32 through its index, as the worker does: control-interaction.ts first would run
+// dialog-paint.ts's registerFullDialogRepainter() before its own hook variable exists.
+import "../../src/worker/modules/user32/index";
 import { System } from "../../src/worker/core/system";
 import {
     handleSystemControlMouseAtScreen,

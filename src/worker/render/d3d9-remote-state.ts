@@ -121,6 +121,7 @@ export class SplitQueryResultTable {
 export interface SplitQueryChannel {
     /** CreateQuery(TIMESTAMP) support, as the worker's device answers it. */
     timestampSupported(): boolean;
+    occlusionSupported?(): boolean;
     create(queryPtr: number, type: number): void;
     /** Issue(BEGIN); `previous` is the generation it supersedes (0 for none). */
     begin(queryPtr: number, previous: number): void;

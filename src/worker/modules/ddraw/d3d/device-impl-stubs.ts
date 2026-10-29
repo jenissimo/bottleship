@@ -43,8 +43,6 @@ export function createDeviceStubsExports(): Record<string, ThunkImplementation> 
         "Vertex",
         "Index",
         "End",
-        "GetLightState",
-        "SetLightState",
     ];
 
     for (const method of d3dDevice3Stubs) {

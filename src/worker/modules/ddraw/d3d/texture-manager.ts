@@ -322,13 +322,9 @@ export const createTextureManager = (context: DDrawContext): TextureManager => {
             if (!entry.srcColorKey && entry.format && !entry.format.aMask && entry.format.bpp === 16) {
                 entry.srcColorKey = { low: 0, high: 0 };
             }
-            const handleComAddr = resourceProvider.getAddressForHandle(textureId);
-            if (handleComAddr !== null) {
-                deviceObj.setTexture(stage, handleComAddr);
-            } else {
-                deviceObj.setTexture(stage, textureId);
-                Logger.verbose(LogCategory.DDRAW, `SetTexture: Persistent handle 0x${textureId.toString(16)} - COM object released, storing handle`);
-            }
+            // Keep the registry key: this binding owns no COM reference. Converting it
+            // to a surface address makes unbinding mistake it for an owned COM binding.
+            deviceObj.setTexture(stage, textureId);
             return;
         }
 

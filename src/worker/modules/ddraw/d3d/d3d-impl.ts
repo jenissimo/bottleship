@@ -482,7 +482,9 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         };
     };
 
-    exports["IDirect3D3_EvictManagedTextures"] = () => D3D_OK;
+    // Every texture keeps its system-memory copy and its GPU copy follows it, so there is
+    // no driver-managed video-memory copy to discard.
+    exports["IDirect3D3_EvictManagedTextures"] = (_ctx, _mem, _args) => D3D_OK;
 
     // IDirect3D3::CreateLight(this, lplpLight, pUnkOuter)
     exports["IDirect3D3_CreateLight"] = (ctx, mem, args) => {
@@ -1105,7 +1107,7 @@ export const createD3DInterfaceExports = (context: DDrawContext): D3DExports => 
         return D3D_OK;
     };
 
-    exports["IDirect3D7_EvictManagedTextures"] = () => D3D_OK;
+    exports["IDirect3D7_EvictManagedTextures"] = (_ctx, _mem, _args) => D3D_OK;
 
     return exports;
 };

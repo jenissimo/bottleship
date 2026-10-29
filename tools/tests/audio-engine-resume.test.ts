@@ -15,7 +15,7 @@ test("a gesture retries resume while a pre-gesture request is pending", async ()
             return Promise.resolve();
         },
     };
-    Object.assign(engine, { context, ensureReady: async () => { ready++; } });
+    Object.assign(engine, { ensureContext: () => context, ensureReady: async () => { ready++; } });
     const first = engine.resume();
     const second = engine.resume();
     expect(resumes).toBe(2);
@@ -30,7 +30,7 @@ test("running-context requests share source restoration", async () => {
     let finishReady!: () => void;
     let ready = 0;
     Object.assign(engine, {
-        context: { state: "running" },
+        ensureContext: () => ({ state: "running" }),
         ensureReady: () => { ready++; return new Promise<void>(resolve => { finishReady = resolve; }); },
     });
     const first = engine.resume();

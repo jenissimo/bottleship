@@ -65,6 +65,7 @@ export interface QueryManagerOptions {
     queue: QueryManagerQueue;
     /** Number of slots in each lazily-created query set. */
     querySetCapacity?: number;
+    requireCountedOcclusion?: boolean;
     fallback?: QueryFallbackContext;
 }
 
@@ -136,6 +137,7 @@ type RecordState = {
     reason?: string;
     fallbackValue?: bigint;
     began: boolean;
+    precise?: boolean;
     recorded: boolean;
     encoded: boolean;
     submitted: boolean;
@@ -219,11 +221,15 @@ function destroyGpuObject(object: { destroy?: () => void } | undefined): void {
  * query of that kind is first acquired; exhausted pools grow in another query set so
  * an in-flight readback is never overwritten by a later D3D query.
  */
+import { Logger, LogCategory } from "../../core/logger";
+
 export class D3D9QueryManager {
+    private reportedErrors = new Set<string>();
     private readonly device: QueryManagerDevice;
     private readonly queue: QueryManagerQueue;
     private readonly capacity: number;
     private readonly fallback: QueryFallbackContext | undefined;
+    private readonly requireCountedOcclusion: boolean;
     private readonly pools = new Map<QueryKind, SlotPool[]>();
     private readonly records = new Map<string, RecordState>();
     /** A displaced generation is no longer reachable from `records`, but still owns its
@@ -250,6 +256,7 @@ export class D3D9QueryManager {
         this.capacity = Math.min(MAX_QUERY_SET_CAPACITY,
             Math.max(1, Math.trunc(options.querySetCapacity ?? MAX_QUERY_SET_CAPACITY)));
         this.fallback = options.fallback;
+        this.requireCountedOcclusion = options.requireCountedOcclusion === true;
         if (options.device.lost) {
             void options.device.lost.then((info) => {
                 this.markDeviceLost(`device-lost${info?.reason ? `:${info.reason}` : ''}`);
@@ -262,6 +269,8 @@ export class D3D9QueryManager {
     /** Query capability is deterministic and side-effect free; allocation remains lazy. */
     getCapability(kind: QueryKind): QueryCapability {
         if (this.deviceLost) return { kind, supported: false, reason: this.deviceLossReason };
+        if (kind === 'occlusion' && this.requireCountedOcclusion && !this.device.features?.has('float32-blendable'))
+            return {kind,supported:false,reason:'counted-occlusion-feature-missing'};
         const failure = this.capabilityFailures.get(kind);
         if (failure) return { kind, supported: false, reason: failure };
         if (kind === 'timestamp' && !this.device.features?.has('timestamp-query')) {
@@ -286,7 +295,8 @@ export class D3D9QueryManager {
 
     /** True when an occlusion BEGIN crossed a command-buffer submission boundary. */
     needsRebegin(id: QueryId): boolean {
-        return this.records.get(keyOf(id))?.splitSubmission !== undefined;
+        const state = this.records.get(keyOf(id));
+        return !state?.precise && state?.splitSubmission !== undefined;
     }
 
     /** WebGPU loss is surfaced as D3DERR_DEVICELOST by query.ts before polling data. */
@@ -314,7 +324,7 @@ export class D3D9QueryManager {
         // of leaving the manager waiting for a resolve that can never be encoded.
         for (const state of this.records.values()) {
             if (state.mode !== 'gpu' || state.kind !== 'occlusion'
-                || !state.began || state.recorded || state.encoded || state.submitted) continue;
+                || state.precise || !state.began || state.recorded || state.encoded || state.submitted) continue;
             state.splitSubmission = serial;
             state.began = false;
         }
@@ -533,6 +543,22 @@ export class D3D9QueryManager {
         return { ok: true, mode: 'gpu', index: state.index! };
     }
 
+    /** Attachment counters survive render-pass boundaries; native predicates do not. */
+    beginCountedOcclusion(id: QueryId, scale = 1): void {
+        const state = this.records.get(keyOf(id));
+        if (!state || state.kind !== 'occlusion' || state.mode !== 'gpu') return;
+        state.precise = true;
+        state.began = true;
+        state.sampleScale = scale;
+    }
+
+    endCountedOcclusion(id: QueryId): void {
+        const state = this.records.get(keyOf(id));
+        if (!state?.precise || !state.began) return;
+        state.began = false;
+        state.recorded = true;
+    }
+
     /** End an occlusion query in the caller's active render pass. */
     endOcclusion(id: QueryId, pass: QueryPassEncoder, record?: QueryRecordContract): QueryOperationResult {
         const state = this.records.get(keyOf(id));
@@ -591,6 +617,7 @@ export class D3D9QueryManager {
         encoder: QueryCommandEncoder,
         ids: readonly QueryId[],
         submissionSerial: number,
+        preciseResults?: ReadonlyMap<QueryId, GPUBuffer>,
     ): QueryResolveBatch {
         if (!validSerial(submissionSerial)) {
             return this.rejectedBatch(submissionSerial, 'invalid-submission-serial');
@@ -640,6 +667,10 @@ export class D3D9QueryManager {
             for (let i = 0; i < entries.length; i++) {
                 const entry = entries[i];
                 const resolveOffset = i * RESOLVE_ALIGNMENT;
+                const precise = preciseResults?.get(entry.state.id);
+                if (precise) {
+                    encoder.copyBufferToBuffer(precise, 0, readbackBuffer, entry.byteOffset, RESULT_BYTES);
+                } else {
                 encoder.resolveQuerySet(
                     entry.state.pool!.querySet,
                     entry.state.index!,
@@ -654,6 +685,7 @@ export class D3D9QueryManager {
                     entry.byteOffset,
                     RESULT_BYTES,
                 );
+                }
                 entry.state.encoded = true;
                 entry.state.submissionSerial = submissionSerial;
             }
@@ -778,6 +810,11 @@ export class D3D9QueryManager {
     poll(id: QueryId): QueryReadback {
         const state = this.records.get(keyOf(id));
         if (!state) return { state: 'unavailable', reason: 'query-not-acquired' };
+        const failure = state.error ?? (state.mode === 'fallback' ? state.reason : undefined);
+        if (failure && !this.reportedErrors.has(failure) && this.reportedErrors.size < 16) {
+            this.reportedErrors.add(failure);
+            Logger.warn(LogCategory.D3D9, `[Query] result unavailable: ${failure}`);
+        }
         if (state.mode === 'fallback') {
             return {
                 state: 'fallback', reason: state.reason!,

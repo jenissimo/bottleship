@@ -22,6 +22,8 @@ const D3DQUERYTYPE_TIMESTAMPDISJOINT = 11;
 
 export interface SplitQueryHostDevice {
     getQueryManager(): D3D9QueryManager | null;
+    flushQueryCommands(): void;
+    releaseQueryCommands?(queryPtr: number): void;
     recordQueryBegin(queryPtr: number): void;
     recordQueryEnd(queryPtr: number): void;
     recordQueryTimestamp(queryPtr: number): void;
@@ -168,17 +170,18 @@ export class SplitQueryHost {
         else if (q.type === D3DQUERYTYPE_TIMESTAMP && q.gpuMode) this.device.recordQueryTimestamp(ptr);
     }
 
-    /** D3DGETDATA_FLUSH: the same submission-domain advance query.ts makes on a local manager. */
+    /** Submit recorded work so a poll before Present can start its GPU readback. */
     private flush(ptr: number, token: number): void {
         const q = this.lookup(ptr);
         if (!q || q.token !== token || !q.manager) return;
         this.counters.flushes++;
-        q.manager.notifySubmitted(q.record.issueSerial);
+        this.device.flushQueryCommands();
     }
 
     private release(ptr: number): void {
         const q = this.lookup(ptr);
         if (!q) return;
+        this.device.releaseQueryCommands?.(ptr);
         q.manager?.release(ptr, q.record);
         this.queries.delete(ptr);
     }

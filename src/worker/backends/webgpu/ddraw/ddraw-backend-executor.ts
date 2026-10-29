@@ -3606,6 +3606,7 @@ export class DDrawWebGPUExecutor {
             this.currentRenderPass = null;
         }
         if (this.currentEncoder) {
+            const submittedEncoder = this.currentEncoder;
             const submitStart = frameProfiler.startTimer();
             try {
                 this.queue.submit([this.currentEncoder.finish()]);
@@ -3615,6 +3616,9 @@ export class DDrawWebGPUExecutor {
                 // frame an unusable encoder — one bad frame becomes every frame after it.
                 recordGpuError("throw", "ddrawExecutor.flush", String(e));
                 Logger.error(LogCategory.DDRAW, `[WEBGPU] flush() submit failed — frame discarded: ${e}`);
+            } finally {
+                // Queue submission or permanent abandonment releases this encoder only.
+                this.clearPipeline.destroyPendingAfterSubmit(submittedEncoder);
             }
             frameProfiler.endTimer("gpu", submitStart);
             this.currentEncoder = null;
@@ -3633,11 +3637,17 @@ export class DDrawWebGPUExecutor {
         this.resetBindFastPath();
     }
 
+    /** Retire clear uniforms when an external caller abandons a detached encoder. */
+    discardPendingDraws(encoder: GPUCommandEncoder): void {
+        this.clearPipeline.destroyPendingAfterSubmit(encoder);
+    }
+
     /**
      * Post-submit cleanup for single-submit present path (D3D8).
      * Call after queue.submit() when using finalizePendingDraws().
      */
-    postSubmitCleanup(): void {
+    postSubmitCleanup(submittedEncoder: GPUCommandEncoder): void {
+        this.clearPipeline.destroyPendingAfterSubmit(submittedEncoder);
         this.depthManager.flushGarbage();
         this.msaaColorManager.flushGarbage();
         this.textureConverter.destroyPendingAfterSubmit();

@@ -67,14 +67,24 @@ export function probeMp3(src: RandomAccessSource): AudioProbe | null {
     };
 }
 
+/** Bounded fallback for MPEG streams with padding or junk before their first frame.
+ *  Unlike a magic-byte check, this requires a second consistent frame at the
+ *  exact byte offset predicted by the first header. */
+export function hasMpegFrames(src: RandomAccessSource): boolean {
+    return findFrame(readAt(src, 0, SEARCH_WINDOW), 0, true) !== null;
+}
+
 /** First frame whose successor lands exactly where its own size says it should. */
-function findFrame(window: Uint8Array, windowBase: number): FrameHeader | null {
+function findFrame(window: Uint8Array, windowBase: number, requireFollower = false): FrameHeader | null {
     for (let i = 0; i + 4 <= window.length; i++) {
         if (window[i] !== 0xff || (window[i + 1]! & 0xe0) !== 0xe0) continue;
         const frame = parseFrameHeader(window, i, windowBase);
         if (!frame) continue;
         const next = i + frame.frameSize;
-        if (next + 4 > window.length) return frame; // no room to confirm; header was self-consistent
+        if (next + 4 > window.length) {
+            if (!requireFollower) return frame; // probing an already identified, short image
+            continue;
+        }
         const follower = parseFrameHeader(window, next, windowBase);
         if (follower && follower.version === frame.version && follower.layer === frame.layer && follower.sampleRate === frame.sampleRate) {
             return frame;

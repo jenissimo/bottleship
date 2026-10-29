@@ -5,7 +5,7 @@
 import { Mem } from "../core/memory/mem-accessor";
 import { System } from "../core/system";
 import type { VfsEntry, VfsFileHandle } from "../runtime/filesystem/vfs";
-import { VFS_FILE_TIME_UNIX_SECONDS } from "../runtime/filesystem/file-time";
+import { VFS_FILE_TIME_UNIX_SECONDS, unixTimeOf } from "../runtime/filesystem/file-time";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { getCPU } from "../core/thunking/thunk-utils";
 import { ArrayVaListReader, scanCLazy } from "./crt-format";
@@ -120,10 +120,10 @@ function findAttrib(entry: VfsEntry): number {
     return entry.kind === "dir" ? A_SUBDIR : (A_NORMAL | A_ARCH);
 }
 
-/** Write the VFS file time (see file-time.ts) as a time_t at `offset`; `wide` selects
+/** Write a file time (see file-time.ts) as a time_t at `offset`; `wide` selects
  *  the 64-bit __time64_t layout. */
-function writeTimeT(structPtr: number, offset: number, wide: boolean): void {
-    Mem.writeUint32(structPtr + offset, VFS_FILE_TIME_UNIX_SECONDS);
+function writeTimeT(structPtr: number, offset: number, wide: boolean, time: number): void {
+    Mem.writeUint32(structPtr + offset, time);
     if (wide) Mem.writeUint32(structPtr + offset + 4, 0);
 }
 
@@ -140,9 +140,10 @@ function fillFindData64i32(structPtr: number, entry: VfsEntry, host: Vc9IoHost):
     writeFindName(structPtr, FINDDATA64I32_OFFSETS.name, FINDDATA64I32_NAME_CHARS, entry.name);
     Mem.writeUint32(structPtr + FINDDATA64I32_OFFSETS.size, entry.size >>> 0);
     Mem.writeUint32(structPtr + FINDDATA64I32_OFFSETS.attrib, findAttrib(entry));
-    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_create, true);
-    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_access, true);
-    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_write, true);
+    const time = unixTimeOf(entry);
+    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_create, true, time);
+    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_access, true, time);
+    writeTimeT(structPtr, FINDDATA64I32_OFFSETS.time_write, true, time);
 }
 
 function fillFindData32(structPtr: number, entry: VfsEntry, host: Vc9IoHost): void {
@@ -150,9 +151,10 @@ function fillFindData32(structPtr: number, entry: VfsEntry, host: Vc9IoHost): vo
     writeFindName(structPtr, FINDDATA32_OFFSETS.name, FINDDATA32_NAME_CHARS, entry.name);
     Mem.writeUint32(structPtr + FINDDATA32_OFFSETS.size, entry.size >>> 0);
     Mem.writeUint32(structPtr + FINDDATA32_OFFSETS.attrib, findAttrib(entry));
-    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_create, false);
-    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_access, false);
-    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_write, false);
+    const time = unixTimeOf(entry);
+    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_create, false, time);
+    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_access, false, time);
+    writeTimeT(structPtr, FINDDATA32_OFFSETS.time_write, false, time);
 }
 
 /*
@@ -189,7 +191,7 @@ const S_IFREG = 0x8000;
 const MODE_FILE = S_IFREG | 0x1b6;      // 0x81b6 — rw-rw-rw-
 const MODE_DIR = S_IFDIR | 0x1ff;       // 0x41ff — rwxrwxrwx
 
-/** st_mode/st_nlink/st_size, written at the offsets of the requested variant. */
+/** st_mode/st_nlink/st_size/times, written at the offsets of the requested variant. */
 export function fillStatStruct(
     structPtr: number,
     offsets: typeof STAT32_OFFSETS | typeof STAT64I32_OFFSETS | typeof STAT64_OFFSETS | typeof STATI64_OFFSETS,
@@ -197,6 +199,7 @@ export function fillStatStruct(
     size: number,
     isDir: boolean,
     memset: (ptr: number, val: number, size: number) => unknown,
+    time = VFS_FILE_TIME_UNIX_SECONDS,
 ): void {
     memset(structPtr, 0, totalSize);
     Mem.writeUint16(structPtr + offsets.st_mode, isDir ? MODE_DIR : MODE_FILE);
@@ -206,29 +209,29 @@ export function fillStatStruct(
     if (offsets.st_atime - offsets.st_size === 8) Mem.writeUint32(structPtr + offsets.st_size + 4, 0);
     // 64-bit time_t is what puts st_mtime 8 bytes after st_atime; _stat's is 4.
     const wideTime = offsets.st_mtime - offsets.st_atime === 8;
-    writeTimeT(structPtr, offsets.st_atime, wideTime);
-    writeTimeT(structPtr, offsets.st_mtime, wideTime);
-    writeTimeT(structPtr, offsets.st_ctime, wideTime);
+    writeTimeT(structPtr, offsets.st_atime, wideTime, time);
+    writeTimeT(structPtr, offsets.st_mtime, wideTime, time);
+    writeTimeT(structPtr, offsets.st_ctime, wideTime, time);
 }
 
 /** __stat64 (56 bytes) — 64-bit st_size. */
-function fillStat64(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost): void {
-    fillStatStruct(structPtr, STAT64_OFFSETS, 56, size, isDir, host.memset.bind(host));
+function fillStat64(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost, time?: number): void {
+    fillStatStruct(structPtr, STAT64_OFFSETS, 56, size, isDir, host.memset.bind(host), time);
 }
 
 /** _stat64i32 (48 bytes) — the layout `_stat64i32`/`_fstat64i32` actually take. */
-function fillStat64i32(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost): void {
-    fillStatStruct(structPtr, STAT64I32_OFFSETS, 48, size, isDir, host.memset.bind(host));
+function fillStat64i32(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost, time?: number): void {
+    fillStatStruct(structPtr, STAT64I32_OFFSETS, 48, size, isDir, host.memset.bind(host), time);
 }
 
 /** struct _stati64 (48 bytes) — 64-bit st_size, 32-bit time_t. */
-function fillStati64(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost): void {
-    fillStatStruct(structPtr, STATI64_OFFSETS, 48, size, isDir, host.memset.bind(host));
+function fillStati64(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost, time?: number): void {
+    fillStatStruct(structPtr, STATI64_OFFSETS, 48, size, isDir, host.memset.bind(host), time);
 }
 
 /** struct _stat (36 bytes) — 32-bit time_t and st_size. */
-function fillStat32(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost): void {
-    fillStatStruct(structPtr, STAT32_OFFSETS, 36, size, isDir, host.memset.bind(host));
+function fillStat32(structPtr: number, size: number, isDir: boolean, host: Vc9IoHost, time?: number): void {
+    fillStatStruct(structPtr, STAT32_OFFSETS, 36, size, isDir, host.memset.bind(host), time);
 }
 
 /**
@@ -250,7 +253,7 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
     const statByPath = (
         pathPtr: number,
         structPtr: number,
-        fill: (ptr: number, size: number, isDir: boolean, h: Vc9IoHost) => void,
+        fill: (ptr: number, size: number, isDir: boolean, h: Vc9IoHost, time?: number) => void,
     ): number => {
         if (!pathPtr || !structPtr) {
             host.setErrno(22);
@@ -266,7 +269,7 @@ export function registerVc9IoExports(exports: Record<string, ThunkImplementation
             host.setErrno(2);
             return -1;
         }
-        fill(structPtr, vfs.getFileSize(path), false, host);
+        fill(structPtr, vfs.getFileSize(path), false, host, unixTimeOf(vfs.statEntry(path)));
         return 0;
     };
     const statByFd = (
