@@ -64,12 +64,13 @@ emulator; their observation logs must match. This is the only kind of evidence t
 counts as parity. Unit tests of our own state machines are regression tests, not
 parity proof.
 
-### Target toolchain (to build first)
+### Toolchain
 
-The existing harness (`tools/lan-conformance/build-native.ts` +
-`compare.harness.ts`) already compares one PE's DWORD record against native. Its cost
-is that every behaviour needs a hand-written C fixture, a bespoke orchestrator and a
-fresh native run, and its diffs are anonymous DWORD indices. Replace that with:
+`lanprobe` + `lan-diff` (`tools/lan-conformance/probe/`) are the conformance
+tool for Winsock today; see [probe/README.md](../tools/lan-conformance/probe/README.md).
+One generic x86 probe interprets a `.lp` script, logging every result with
+symbolic handles/ports/errors, and one runner records the native golden
+(`record`) and diffs the emulator against it (`check`):
 
 1. **`lanprobe.exe` — one generic x86 probe.** A small interpreter that reads a test
    script and performs API calls, logging every result as readable text:
@@ -84,10 +85,9 @@ fresh native run, and its diffs are anonymous DWORD indices. Replace that with:
    recvfrom s 64                          # logged: ret=-1 err=WSAECONNRESET
    ```
 
-   Commands cover Winsock calls, waits/events/APC/IOCP, threads, and DirectPlay COM
-   methods; callbacks are logged as events (`cb DPN_MSGID_RECEIVE size=… data=…`).
    Handles, ports, addresses and pointers are named symbolically by the probe itself,
-   so logs are comparable without post-hoc normalization.
+   so logs are comparable without post-hoc normalization. LastError is preset to 0
+   before each call and read after every call.
 
 2. **`lan-diff` — one runner.** Runs a case natively (Windows + MinGW build of the
    probe, built once), runs the same `lanprobe.exe` + script in the emulator through
@@ -106,8 +106,13 @@ fresh native run, and its diffs are anonymous DWORD indices. Replace that with:
    compared against the same golden log. These join the gate; full PE runs stay in a
    separate conformance suite.
 
-Writing a new conformance check is then: write a 10–30 line script, record native,
-make the emulator match. No new C, no new orchestrator, no review of the oracle itself.
+The older DWORD-record fixtures (`build-native.ts` + `compare.harness.ts`) remain
+for the lifetime/IOCP contracts whose probes need threads, overlapped I/O and
+completion ports — the probe grows those verbs (`waits/events/APC/IOCP`, threads,
+DirectPlay COM methods, callbacks logged as events) rather than growing fixture
+count. Writing a new conformance check is then: write a 10–30 line script, record
+native, make the emulator match. No new C, no new orchestrator, no review of the
+oracle itself.
 
 ### Evidence levels
 

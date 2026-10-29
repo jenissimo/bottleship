@@ -1,0 +1,29 @@
+wsastartup 0x202 -> ret=0 err=0 ver=2.2 high=2.2
+socket AF_INET SOCK_DGRAM 0 -> ret=c err=0
+bind c 127.0.0.1:0 -> ret=0 err=0 addr=127.0.0.1:<c>.port
+socket AF_INET SOCK_DGRAM 0 -> ret=r err=0
+bind r 127.0.0.1:0 -> ret=0 err=0 addr=127.0.0.1:<r>.port
+udp_open_port -> ret=dead err=0 addr=127.0.0.1:<dead>.port
+ioctlsocket c FIONBIO u32:1 -> ret=0 err=0
+sendto c dead.addr "w" -> ret=1 err=0
+select t=500 r=dead -> ret=1 err=0 rd=dead
+recvfrom dead 8 -> ret=1 err=0 from=127.0.0.1:<c>.port data="w"
+closesocket dead -> ret=0 err=0
+ioctlsocket c FIONREAD -> ret=0 err=0 out=0
+wsaioctl c SIO_UDP_CONNRESET in=u8:0 -> ret=0 err=0
+sendto c dead.addr "x" -> ret=1 err=0
+sleep 400 -> ret=0 err=0
+recvfrom c 8 -> ret=-1 err=WSAEWOULDBLOCK
+sendto c r.addr "B" -> ret=1 err=0
+sleep 100 -> ret=0 err=0
+recvfrom r 8 -> ret=1 err=0 from=127.0.0.1:<c>.port data="B"
+wsaioctl c SIO_UDP_CONNRESET in=u8:1 -> ret=0 err=0
+sendto c dead.addr "x" -> ret=1 err=0
+sleep 400 -> ret=0 err=0
+recvfrom c 8 -> ret=-1 err=WSAECONNRESET
+recvfrom c 8 -> ret=-1 err=WSAEWOULDBLOCK
+sendto c r.addr "C" -> ret=1 err=0
+sleep 100 -> ret=0 err=0
+recvfrom r 8 -> ret=1 err=0 from=127.0.0.1:<c>.port data="C"
+wsacleanup -> ret=0 err=0
+exit 0
