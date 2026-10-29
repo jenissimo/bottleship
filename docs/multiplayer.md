@@ -1,7 +1,7 @@
 # Multiplayer over a virtual LAN
 
-For development continuation, current checkpoints, the implementation plan and
-native-oracle methodology, see [the multiplayer handoff](multiplayer-handoff.md).
+For architecture, verification method, scope and workflow, see
+[multiplayer development](multiplayer-development.md).
 
 BottleShip can connect browser instances to a shared virtual network. Open
 **Settings → Network**, enter the LAN server address and a room name, then connect.
