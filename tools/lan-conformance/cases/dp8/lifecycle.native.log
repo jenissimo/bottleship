@@ -1,0 +1,14 @@
+cocreate CLSID_DirectPlay8Peer IID_IDirectPlay8Peer -> ret=-1 hr=CO_E_NOTINITIALIZED
+cominit -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Peer IID_IDirectPlay8Peer -> ret=a hr=S_OK
+initialize a -> ret=0 hr=S_OK
+initialize a -> ret=-2146074496 hr=DPNERR_ALREADYINITIALIZED
+cocreate CLSID_DirectPlay8Address IID_IDirectPlay8Address -> ret=x hr=S_OK
+setsp x CLSID_DP8SP_TCPIP -> ret=0 hr=S_OK
+addport x 23913 -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Peer IID_IDirectPlay8Address -> ret=-1 hr=E_NOINTERFACE
+release x -> ret=0 hr=S_OK
+close a -> ret=0 hr=S_OK
+release a -> ret=0 hr=S_OK
+comfree -> ret=0
+exit 0

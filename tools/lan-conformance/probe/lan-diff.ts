@@ -140,7 +140,7 @@ async function buildProbe(): Promise<string> {
     const compile = Bun.spawnSync([
         compiler, "-O1", "-nostdlib", "-fno-builtin", "-fno-stack-protector",
         "-Wl,--entry,_entry", "-Wl,--subsystem,console", "-o", exe,
-        source, "-lws2_32", "-lkernel32",
+        source, "-lws2_32", "-lkernel32", "-lole32", "-ldxguid",
     ], { env, stdout: "pipe", stderr: "pipe" });
     if (compile.exitCode !== 0) {
         throw new Error(`lanprobe compile failed (exit ${compile.exitCode}): ` +
@@ -267,6 +267,9 @@ async function check(caseId: string) {
     const bundle = await packBundle(caseId, script, work);
 
     try {
+        // reload first: a reused tab keeps its live worker, and load_bundle
+        // into the old worker would run stale worker sources
+        await harness().reload().run();
         await bootBundle(bundle);
         const deadline = Date.now() + 120_000;
         let guestLog = "";

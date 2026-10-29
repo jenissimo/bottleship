@@ -51,7 +51,7 @@
 #define MAX_LINE 512
 #define MAX_TOKS 24
 #define MAX_SYM 128
-#define SYM_NAME 24
+#define SYM_NAME 32
 #define SEL_MAX 16
 
 typedef struct {
@@ -765,6 +765,489 @@ static void cmd_signal(const char *name) {
     log_line(lineBuf);
 }
 
+/* ---------------- COM / DirectPlay ---------------- */
+
+#define COBJMACROS
+#include <objbase.h>
+#include <dplay8.h>
+#include <dpaddr.h>
+
+static const struct { const char *name; const GUID *guid; } guidTable[] = {
+    {"CLSID_DirectPlay8Peer", &CLSID_DirectPlay8Peer},
+    {"CLSID_DirectPlay8Address", &CLSID_DirectPlay8Address},
+    {"CLSID_DP8SP_TCPIP", &CLSID_DP8SP_TCPIP},
+    {"IID_IUnknown", &IID_IUnknown},
+    {"IID_IDirectPlay8Peer", &IID_IDirectPlay8Peer},
+    {"IID_IDirectPlay8Address", &IID_IDirectPlay8Address},
+    {0, 0}
+};
+static const GUID *guid_by_name(const char *s, DWORD len) {
+    char nm[SYM_NAME];
+    DWORD i;
+    if (len >= SYM_NAME) return 0;
+    wcopy(nm, s, len);
+    nm[len] = 0;
+    for (i = 0; guidTable[i].name; i++) if (wstreq(nm, guidTable[i].name)) return guidTable[i].guid;
+    return 0;
+}
+static const struct { const char *name; long hr; } hrNames[] = {
+    {"S_OK", 0}, {"S_FALSE", 1},
+    {"E_NOTIMPL", (long)0x80004001}, {"E_NOINTERFACE", (long)0x80004002},
+    {"E_POINTER", (long)0x80004003}, {"E_ABORT", (long)0x80004004},
+    {"E_FAIL", (long)0x80004005}, {"E_HANDLE", (long)0x80070006},
+    {"E_OUTOFMEMORY", (long)0x8007000E}, {"E_INVALIDARG", (long)0x80070057},
+    {"CLASS_E_CLASSNOTAVAILABLE", (long)0x80040111},
+    {"REGDB_E_CLASSNOTREG", (long)0x80040154},
+    {"CO_E_NOTINITIALIZED", (long)0x800401F0}, {"CO_E_ALREADYINITIALIZED", (long)0x800401F1},
+    {"RPC_E_CHANGED_MODE", (long)0x80010106},
+    {"DPNERR_ABORTED", (long)0x80150000 | (0x030 + 0x8000)},
+    {"DPNERR_ADDRESSING", (long)0x80150000 | (0x040 + 0x8000)},
+    {"DPNERR_ALREADYCLOSING", (long)0x80150000 | (0x050 + 0x8000)},
+    {"DPNERR_ALREADYCONNECTED", (long)0x80150000 | (0x060 + 0x8000)},
+    {"DPNERR_ALREADYDISCONNECTING", (long)0x80150000 | (0x070 + 0x8000)},
+    {"DPNERR_ALREADYINITIALIZED", (long)0x80150000 | (0x080 + 0x8000)},
+    {"DPNERR_ALREADYREGISTERED", (long)0x80150000 | (0x090 + 0x8000)},
+    {"DPNERR_BUFFERTOOSMALL", (long)0x80150000 | (0x100 + 0x8000)},
+    {"DPNERR_CANNOTCANCEL", (long)0x80150000 | (0x110 + 0x8000)},
+    {"DPNERR_CANTCREATEGROUP", (long)0x80150000 | (0x120 + 0x8000)},
+    {"DPNERR_CANTCREATEPLAYER", (long)0x80150000 | (0x130 + 0x8000)},
+    {"DPNERR_CANTLAUNCHAPPLICATION", (long)0x80150000 | (0x140 + 0x8000)},
+    {"DPNERR_CONNECTING", (long)0x80150000 | (0x150 + 0x8000)},
+    {"DPNERR_CONNECTIONLOST", (long)0x80150000 | (0x160 + 0x8000)},
+    {"DPNERR_CONVERSION", (long)0x80150000 | (0x170 + 0x8000)},
+    {"DPNERR_DATATOOLARGE", (long)0x80150000 | (0x175 + 0x8000)},
+    {"DPNERR_DOESNOTEXIST", (long)0x80150000 | (0x180 + 0x8000)},
+    {"DPNERR_DPNSVRNOTAVAILABLE", (long)0x80150000 | (0x185 + 0x8000)},
+    {"DPNERR_DUPLICATECOMMAND", (long)0x80150000 | (0x190 + 0x8000)},
+    {"DPNERR_ENDPOINTNOTRECEIVING", (long)0x80150000 | (0x200 + 0x8000)},
+    {"DPNERR_ENUMQUERYTOOLARGE", (long)0x80150000 | (0x210 + 0x8000)},
+    {"DPNERR_ENUMRESPONSETOOLARGE", (long)0x80150000 | (0x220 + 0x8000)},
+    {"DPNERR_EXCEPTION", (long)0x80150000 | (0x230 + 0x8000)},
+    {"DPNERR_GROUPNOTEMPTY", (long)0x80150000 | (0x240 + 0x8000)},
+    {"DPNERR_HOSTING", (long)0x80150000 | (0x250 + 0x8000)},
+    {"DPNERR_HOSTREJECTEDCONNECTION", (long)0x80150000 | (0x260 + 0x8000)},
+    {"DPNERR_HOSTTERMINATEDSESSION", (long)0x80150000 | (0x270 + 0x8000)},
+    {"DPNERR_INCOMPLETEADDRESS", (long)0x80150000 | (0x280 + 0x8000)},
+    {"DPNERR_INVALIDADDRESSFORMAT", (long)0x80150000 | (0x290 + 0x8000)},
+    {"DPNERR_INVALIDAPPLICATION", (long)0x80150000 | (0x300 + 0x8000)},
+    {"DPNERR_INVALIDCOMMAND", (long)0x80150000 | (0x310 + 0x8000)},
+    {"DPNERR_INVALIDDEVICEADDRESS", (long)0x80150000 | (0x320 + 0x8000)},
+    {"DPNERR_INVALIDENDPOINT", (long)0x80150000 | (0x330 + 0x8000)},
+    {"DPNERR_INVALIDFLAGS", (long)0x80150000 | (0x340 + 0x8000)},
+    {"DPNERR_INVALIDGROUP", (long)0x80150000 | (0x350 + 0x8000)},
+    {"DPNERR_INVALIDHANDLE", (long)0x80150000 | (0x360 + 0x8000)},
+    {"DPNERR_INVALIDHOSTADDRESS", (long)0x80150000 | (0x370 + 0x8000)},
+    {"DPNERR_INVALIDINSTANCE", (long)0x80150000 | (0x380 + 0x8000)},
+    {"DPNERR_INVALIDINTERFACE", (long)0x80150000 | (0x390 + 0x8000)},
+    {"DPNERR_INVALIDOBJECT", (long)0x80150000 | (0x400 + 0x8000)},
+    {"DPNERR_INVALIDPASSWORD", (long)0x80150000 | (0x410 + 0x8000)},
+    {"DPNERR_INVALIDPLAYER", (long)0x80150000 | (0x420 + 0x8000)},
+    {"DPNERR_INVALIDPRIORITY", (long)0x80150000 | (0x430 + 0x8000)},
+    {"DPNERR_INVALIDSTRING", (long)0x80150000 | (0x440 + 0x8000)},
+    {"DPNERR_INVALIDURL", (long)0x80150000 | (0x450 + 0x8000)},
+    {"DPNERR_INVALIDVERSION", (long)0x80150000 | (0x460 + 0x8000)},
+    {"DPNERR_NOCAPS", (long)0x80150000 | (0x470 + 0x8000)},
+    {"DPNERR_NOCONNECTION", (long)0x80150000 | (0x480 + 0x8000)},
+    {"DPNERR_NOHOSTPLAYER", (long)0x80150000 | (0x490 + 0x8000)},
+    {"DPNERR_NOMOREADDRESSCOMPONENTS", (long)0x80150000 | (0x500 + 0x8000)},
+    {"DPNERR_NORESPONSE", (long)0x80150000 | (0x510 + 0x8000)},
+    {"DPNERR_NOTALLOWED", (long)0x80150000 | (0x520 + 0x8000)},
+    {"DPNERR_NOTHOST", (long)0x80150000 | (0x530 + 0x8000)},
+    {"DPNERR_NOTREADY", (long)0x80150000 | (0x540 + 0x8000)},
+    {"DPNERR_NOTREGISTERED", (long)0x80150000 | (0x550 + 0x8000)},
+    {"DPNERR_PLAYERALREADYINGROUP", (long)0x80150000 | (0x560 + 0x8000)},
+    {"DPNERR_PLAYERLOST", (long)0x80150000 | (0x570 + 0x8000)},
+    {"DPNERR_PLAYERNOTINGROUP", (long)0x80150000 | (0x580 + 0x8000)},
+    {"DPNERR_PLAYERNOTREACHABLE", (long)0x80150000 | (0x590 + 0x8000)},
+    {"DPNERR_SENDTOOLARGE", (long)0x80150000 | (0x600 + 0x8000)},
+    {"DPNERR_SESSIONFULL", (long)0x80150000 | (0x610 + 0x8000)},
+    {"DPNERR_TABLEFULL", (long)0x80150000 | (0x620 + 0x8000)},
+    {"DPNERR_TIMEDOUT", (long)0x80150000 | (0x630 + 0x8000)},
+    {"DPNERR_UNINITIALIZED", (long)0x80150000 | (0x640 + 0x8000)},
+    {"DPNERR_USERCANCEL", (long)0x80150000 | (0x650 + 0x8000)},
+    {0, 0}
+};
+static void append_hr(char **p, long hr) {
+    DWORD i;
+    out_append(p, " hr=");
+    for (i = 0; hrNames[i].name; i++) if (hrNames[i].hr == hr) { out_append(p, hrNames[i].name); return; }
+    if (hr >= 0 && hr <= 1) { out_int(p, hr); return; }
+    out_hex(p, (unsigned long)hr);
+}
+
+/* DirectPlay callbacks arrive on internal threads; the handler only queues
+ * compact lines, and cbwait drains them from the main thread in arrival
+ * order — an interleaving the golden can pin down. */
+#define CB_MAX 64
+static char cbLines[CB_MAX][192];
+static DWORD cbMsgId[CB_MAX];
+static DWORD cbCount;
+static DWORD createdIds[16];
+static DWORD createdCount;
+static int comInitialized;
+
+static void cb_queue(DWORD messageId, const char *line) {
+    if (cbCount < CB_MAX) {
+        char *dst = cbLines[cbCount];
+        cbMsgId[cbCount] = messageId;
+        out_append(&dst, line);
+        cbCount++;
+    }
+}
+
+static HRESULT WINAPI dp8_handler(PVOID context, DWORD message, PVOID data) {
+    (void)context;
+    if (message == DPN_MSGID_CREATE_PLAYER) {
+        DPNMSG_CREATE_PLAYER *m = (DPNMSG_CREATE_PLAYER *)data;
+        if (createdCount < 16) createdIds[createdCount++] = m->dpnidPlayer;
+        cb_queue(DPN_MSGID_CREATE_PLAYER, "cb create-player");
+    } else if (message == DPN_MSGID_DESTROY_PLAYER) {
+        cb_queue(DPN_MSGID_DESTROY_PLAYER, "cb destroy-player");
+    } else if (message == DPN_MSGID_CONNECT_COMPLETE) {
+        DPNMSG_CONNECT_COMPLETE *m = (DPNMSG_CONNECT_COMPLETE *)data;
+        char line[192], *p = line;
+        out_append(&p, "cb connect-complete");
+        append_hr(&p, (long)m->hResultCode);
+        *p = 0;
+        cb_queue(DPN_MSGID_CONNECT_COMPLETE, line);
+    } else if (message == DPN_MSGID_INDICATE_CONNECT) {
+        cb_queue(DPN_MSGID_INDICATE_CONNECT, "cb indicate-connect");
+    } else if (message == DPN_MSGID_RECEIVE) {
+        DPNMSG_RECEIVE *m = (DPNMSG_RECEIVE *)data;
+        char line[192], *p = line;
+        out_append(&p, "cb receive size=");
+        out_int(&p, (long)m->dwReceiveDataSize);
+        out_append(&p, " data=");
+        append_data(&p, (const char *)m->pReceiveData, (int)m->dwReceiveDataSize);
+        *p = 0;
+        cb_queue(DPN_MSGID_RECEIVE, line);
+    } else if (message == DPN_MSGID_TERMINATE_SESSION) {
+        cb_queue(DPN_MSGID_TERMINATE_SESSION, "cb terminate-session");
+    }
+    return S_OK;
+}
+
+static void cmd_cominit(int mta) {
+    long hr = mta ? (long)CoInitializeEx(0, COINIT_MULTITHREADED) : (long)CoInitialize(0);
+    char *p = lineBuf;
+    if (SUCCEEDED(hr)) comInitialized = 1;
+    out_append(&p, mta ? "cominit mta" : "cominit");
+    out_append(&p, " -> ret=0");
+    append_hr(&p, hr);
+    *p = 0;
+    log_line(lineBuf);
+}
+static void cmd_comfree(void) {
+    if (comInitialized) CoUninitialize();
+    comInitialized = 0;
+    log_line("comfree -> ret=0");
+}
+static void cmd_cocreate(const char *clsid, const char *iid, const char *assigned) {
+    const GUID *cid = guid_by_name(clsid, wstrlen(clsid));
+    const GUID *rid = guid_by_name(iid, wstrlen(iid));
+    void *obj = 0;
+    long hr;
+    char prefix[MAX_LINE], *p;
+    Sym *sym;
+    if (!cid || !rid) { err_line("error cocreate needs known CLSID/IID names"); return; }
+    if (!assigned) { err_line("error cocreate requires assignment"); return; }
+    p = prefix;
+    out_append(&p, "cocreate ");
+    out_append(&p, clsid);
+    out_ch(&p, ' ');
+    out_append(&p, iid);
+    *p = 0;
+    if (!comInitialized) {
+        char *q = lineBuf;
+        out_append(&q, prefix);
+        out_append(&q, " -> ret=-1");
+        append_hr(&q, CO_E_NOTINITIALIZED);
+        *q = 0;
+        log_line(lineBuf);
+        failedCommands++;
+        return;
+    }
+    hr = (long)CoCreateInstance(cid, 0, CLSCTX_INPROC_SERVER, rid, &obj);
+    if (hr == 0 && obj) {
+        sym = sym_socket(assigned, wstrlen(assigned), (SOCKET)obj);
+        if (!sym) { err_line("error symbol table full"); return; }
+        p = lineBuf;
+        out_append(&p, prefix);
+        out_append(&p, " -> ret=");
+        out_append(&p, assigned);
+        append_hr(&p, hr);
+        *p = 0;
+        log_line(lineBuf);
+    } else {
+        char *q = lineBuf;
+        out_append(&q, prefix);
+        out_append(&q, " -> ret=-1");
+        append_hr(&q, hr);
+        *q = 0;
+        log_line(lineBuf);
+        failedCommands++;
+    }
+}
+static void com_result(const char *verb, HRESULT hr, const char *suffix) {
+    char *p = lineBuf;
+    out_append(&p, verb);
+    out_append(&p, " -> ret=");
+    if (hr == 0) out_append(&p, "0"); else out_int(&p, (long)hr);
+    append_hr(&p, (long)hr);
+    if (suffix && suffix[0]) out_append(&p, suffix);
+    *p = 0;
+    log_line(lineBuf);
+}
+static Sym *com_sym(const struct Token *t) {
+    Sym *s = sym_find(t->start, t->len);
+    if (!s || !s->hasHandle) return 0;
+    return s;
+}
+static void cmd_release(struct Token *obj) {
+    Sym *s = com_sym(obj);
+    char prefix[MAX_LINE], *p;
+    IUnknown *unk;
+    unsigned long refs;
+    if (!s) { err_line("error release needs a COM object symbol"); return; }
+    unk = (IUnknown *)s->handle;
+    p = prefix;
+    out_append(&p, "release ");
+    out_append(&p, s->name);
+    *p = 0;
+    refs = unk->lpVtbl->Release(unk);
+    s->hasHandle = 0;
+    com_result(prefix, 0, refs == 0 ? "" : "");
+    (void)refs;
+}
+static void cmd_initialize(struct Token *obj) {
+    Sym *s = com_sym(obj);
+    IDirectPlay8Peer *peer;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!s) { err_line("error initialize needs a COM object symbol"); return; }
+    peer = (IDirectPlay8Peer *)s->handle;
+    p = prefix;
+    out_append(&p, "initialize ");
+    out_append(&p, s->name);
+    *p = 0;
+    hr = IDirectPlay8Peer_Initialize(peer, 0, dp8_handler, 0);
+    com_result(prefix, hr, "");
+}
+static void cmd_close(struct Token *obj) {
+    Sym *s = com_sym(obj);
+    IDirectPlay8Peer *peer;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!s) { err_line("error close needs a COM object symbol"); return; }
+    peer = (IDirectPlay8Peer *)s->handle;
+    p = prefix;
+    out_append(&p, "close ");
+    out_append(&p, s->name);
+    *p = 0;
+    hr = IDirectPlay8Peer_Close(peer, 0);
+    com_result(prefix, hr, "");
+}
+static void cmd_setsp(struct Token *obj, const char *spName) {
+    Sym *s = com_sym(obj);
+    const GUID *sp = guid_by_name(spName, wstrlen(spName));
+    IDirectPlay8Address *addr;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!s || !sp) { err_line("error setsp needs an address object and a service name"); return; }
+    addr = (IDirectPlay8Address *)s->handle;
+    p = prefix;
+    out_append(&p, "setsp ");
+    out_append(&p, s->name);
+    out_ch(&p, ' ');
+    out_append(&p, spName);
+    *p = 0;
+    hr = IDirectPlay8Address_SetSP(addr, sp);
+    com_result(prefix, hr, "");
+}
+static void cmd_addcomponent_port(struct Token *obj, long port) {
+    Sym *s = com_sym(obj);
+    IDirectPlay8Address *addr;
+    char prefix[MAX_LINE], *p;
+    DWORD value = (DWORD)port;
+    HRESULT hr;
+    if (!s || port <= 0 || port > 65535) { err_line("error addport needs an address object and a port"); return; }
+    addr = (IDirectPlay8Address *)s->handle;
+    p = prefix;
+    out_append(&p, "addport ");
+    out_append(&p, s->name);
+    out_ch(&p, ' ');
+    out_int(&p, port);
+    *p = 0;
+    hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_PORT, &value, sizeof(value), DPNA_DATATYPE_DWORD);
+    com_result(prefix, hr, "");
+}
+static void cmd_addhost(struct Token *obj, const char *hostName) {
+    Sym *s = com_sym(obj);
+    IDirectPlay8Address *addr;
+    WCHAR wide[64];
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    DWORD i;
+    if (!s || wstrlen(hostName) >= 64) { err_line("error addhost needs an address object and a host name"); return; }
+    addr = (IDirectPlay8Address *)s->handle;
+    for (i = 0; i <= wstrlen(hostName); i++) wide[i] = (WCHAR)(unsigned char)hostName[i];
+    p = prefix;
+    out_append(&p, "addhost ");
+    out_append(&p, s->name);
+    out_ch(&p, ' ');
+    out_append(&p, hostName);
+    *p = 0;
+    hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_HOSTNAME, wide,
+                                          (DWORD)((wstrlen(hostName) + 1) * sizeof(WCHAR)), DPNA_DATATYPE_STRING);
+    com_result(prefix, hr, "");
+}
+/* The TCPIP SP device address component; "adapter" is the GUID the working
+ * DP8 fixtures use to select the default local adapter. */
+static void cmd_setdevice(struct Token *obj, const char *guidName) {
+    Sym *s = com_sym(obj);
+    IDirectPlay8Address *addr;
+    static const GUID adapterGuid = {0x4ce725f6,0x7b7f,0x4297,{0xba,0x6f,0x11,0xf9,0x65,0xbc,0x42,0x99}};
+    const GUID *g = wstreq(guidName, "adapter") ? &adapterGuid : guid_by_name(guidName, wstrlen(guidName));
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!s || !g) { err_line("error setdevice needs an address and a known device name"); return; }
+    addr = (IDirectPlay8Address *)s->handle;
+    p = prefix;
+    out_append(&p, "setdevice ");
+    out_append(&p, s->name);
+    out_ch(&p, ' ');
+    out_append(&p, guidName);
+    *p = 0;
+    hr = IDirectPlay8Address_SetDevice(addr, g);
+    com_result(prefix, hr, "");
+}
+static void cmd_settraversal(struct Token *obj, long mode) {
+    Sym *s = com_sym(obj);
+    IDirectPlay8Address *addr;
+    DWORD value = (DWORD)mode;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!s || mode < 0 || mode > 65535) { err_line("error settraversal needs an address and a mode"); return; }
+    addr = (IDirectPlay8Address *)s->handle;
+    p = prefix;
+    out_append(&p, "settraversal ");
+    out_append(&p, s->name);
+    out_ch(&p, ' ');
+    out_int(&p, mode);
+    *p = 0;
+    hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_TRAVERSALMODE, &value, sizeof(value), DPNA_DATATYPE_DWORD);
+    com_result(prefix, hr, "");
+}
+static void cmd_host(struct Token *peerTok, struct Token *addrTok, const char *session) {
+    Sym *ps = com_sym(peerTok), *as = com_sym(addrTok);
+    IDirectPlay8Peer *peer;
+    IDirectPlay8Address *addr;
+    DPN_APPLICATION_DESC app;
+    WCHAR name[64];
+    DWORD i;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!ps || !as || wstrlen(session) >= 64) { err_line("error host needs a peer, an address and a session name"); return; }
+    peer = (IDirectPlay8Peer *)ps->handle;
+    addr = (IDirectPlay8Address *)as->handle;
+    for (i = 0; i <= wstrlen(session); i++) name[i] = (WCHAR)(unsigned char)session[i];
+    memzero(&app, sizeof(app));
+    app.dwSize = sizeof(app);
+    app.guidApplication = IID_IDirectPlay8Peer;
+    app.pwszSessionName = name;
+    app.dwMaxPlayers = 8;
+    p = prefix;
+    out_append(&p, "host ");
+    out_append(&p, ps->name);
+    out_ch(&p, ' ');
+    out_append(&p, as->name);
+    out_ch(&p, ' ');
+    out_append(&p, session);
+    *p = 0;
+    hr = IDirectPlay8Peer_Host(peer, &app, &addr, 1, 0, 0, 0, 0);
+    com_result(prefix, hr, "");
+}
+static void cmd_connect(struct Token *peerTok, struct Token *addrTok, struct Token *devTok) {
+    Sym *ps = com_sym(peerTok), *as = com_sym(addrTok), *ds = devTok ? com_sym(devTok) : 0;
+    IDirectPlay8Peer *peer;
+    IDirectPlay8Address *addr;
+    IDirectPlay8Address *device;
+    DPN_APPLICATION_DESC app;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (!ps || !as || !ds) { err_line("error connect needs a peer, a host address and a local device address"); return; }
+    peer = (IDirectPlay8Peer *)ps->handle;
+    addr = (IDirectPlay8Address *)as->handle;
+    device = (IDirectPlay8Address *)ds->handle;
+    memzero(&app, sizeof(app));
+    app.dwSize = sizeof(app);
+    app.guidApplication = IID_IDirectPlay8Peer;
+    p = prefix;
+    out_append(&p, "connect ");
+    out_append(&p, ps->name);
+    out_ch(&p, ' ');
+    out_append(&p, as->name);
+    *p = 0;
+    hr = IDirectPlay8Peer_Connect(peer, &app, addr, device, 0, 0, 0, 0, 0, 0, 0, DPNCONNECT_SYNC);
+    com_result(prefix, hr, "");
+}
+static void cmd_sendpeer(struct Token *peerTok, long nth, const char *data, int dataLen) {
+    Sym *ps = com_sym(peerTok);
+    IDirectPlay8Peer *peer;
+    DPN_BUFFER_DESC buf;
+    DPNID id;
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    if (nth == -1) nth = (long)createdCount;
+    if (nth == 0 || nth < -1 || nth > (long)createdCount || dataLen < 0) {
+        err_line("error sendpeer needs a peer, a player index and data");
+        return;
+    }
+    peer = (IDirectPlay8Peer *)ps->handle;
+    id = createdIds[nth - 1];
+    buf.dwBufferSize = (DWORD)dataLen;
+    buf.pBufferData = (BYTE *)data;
+    p = prefix;
+    out_append(&p, "sendpeer ");
+    out_append(&p, ps->name);
+    out_ch(&p, ' ');
+    if (nth == -1) out_append(&p, "last"); else out_int(&p, nth);
+    out_ch(&p, ' ');
+    append_data(&p, data, dataLen);
+    *p = 0;
+    hr = IDirectPlay8Peer_SendTo(peer, id, &buf, 1, 0, 0, 0, DPNSEND_SYNC);
+    com_result(prefix, hr, "");
+}
+/* Waits for N callbacks of one message type, then drains the queued lines to
+ * the log from THIS thread in arrival order — the interleaving the golden pins. */
+static void cmd_cbwait(DWORD messageId, const char *msgName, long want, long timeoutMs) {
+    DWORD deadline = GetTickCount() + (DWORD)timeoutMs;
+    DWORD seen, last = 0, i, k;
+    char tail[MAX_LINE], *t;
+    for (;;) {
+        seen = 0;
+        for (i = 0; i < cbCount; i++) if (cbMsgId[i] == messageId) seen++;
+        if (seen >= (DWORD)want || GetTickCount() > deadline) break;
+        Sleep(40);
+    }
+    last = 0;
+    for (i = 0; i < cbCount; i++) if (cbMsgId[i] == messageId) last++;
+    for (i = 0, k = 0; i < cbCount; i++) {
+        if (cbMsgId[i] == messageId) log_line(cbLines[i]);
+        else { wcopy(cbLines[k], cbLines[i], wstrlen(cbLines[i]) + 1); cbMsgId[k] = cbMsgId[i]; k++; }
+    }
+    cbCount = k;
+    t = tail;
+    out_append(&t, "cbwait ");
+    out_append(&t, msgName);
+    out_ch(&t, ' ');
+    out_int(&t, want);
+    out_append(&t, " -> ret=");
+    out_int(&t, (long)last);
+    *t = 0;
+    log_line(tail);
+}
+
 static void run_line(const char *lineStart, DWORD lineLen) {
     const char *s = lineStart;
     DWORD remain = lineLen;
@@ -1396,6 +1879,142 @@ static void run_line(const char *lineStart, DWORD lineLen) {
             } else { err_line("error unknown waitaddr argument"); return; }
         }
         cmd_waitaddr(tmp, ms, assigned);
+        return;
+    }
+    if (wstreq(verb, "cominit")) {
+        int mta = 0;
+        if (ntok >= 2 && !toks[1].isStr) {
+            tok_text(&toks[1], tmp);
+            if (wstreq(tmp, "mta")) mta = 1;
+            else { err_line("error unknown cominit apartment"); return; }
+        }
+        cmd_cominit(mta);
+        return;
+    }
+    if (wstreq(verb, "comfree")) { cmd_comfree(); return; }
+    if (wstreq(verb, "cocreate")) {
+        char clsid[SYM_NAME], iid[SYM_NAME];
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr
+            || toks[1].len >= SYM_NAME || toks[2].len >= SYM_NAME) {
+            err_line("error cocreate needs CLSID and IID names");
+            return;
+        }
+        tok_text(&toks[1], clsid);
+        tok_text(&toks[2], iid);
+        cmd_cocreate(clsid, iid, assigned);
+        return;
+    }
+    if (wstreq(verb, "release")) {
+        if (ntok < 2 || toks[1].isStr) { err_line("error release needs an object"); return; }
+        cmd_release(&toks[1]);
+        return;
+    }
+    if (wstreq(verb, "initialize") || wstreq(verb, "dp8close")) {
+        if (ntok < 2 || toks[1].isStr) { err_line("error needs an object"); return; }
+        if (verb[0] == 'i') cmd_initialize(&toks[1]); else cmd_close(&toks[1]);
+        return;
+    }
+    if (wstreq(verb, "setsp")) {
+        char sp[SYM_NAME];
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr || toks[2].len >= SYM_NAME) {
+            err_line("error setsp needs an address and a service");
+            return;
+        }
+        tok_text(&toks[2], sp);
+        cmd_setsp(&toks[1], sp);
+        return;
+    }
+    if (wstreq(verb, "addport")) {
+        long port = 0;
+        if (ntok < 3 || toks[1].isStr || !parse_int_tok(2, &port)) {
+            err_line("error addport needs an address and a port");
+            return;
+        }
+        cmd_addcomponent_port(&toks[1], port);
+        return;
+    }
+    if (wstreq(verb, "setdevice")) {
+        char gn[SYM_NAME];
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr || toks[2].len >= SYM_NAME) {
+            err_line("error setdevice needs an address and a device name");
+            return;
+        }
+        tok_text(&toks[2], gn);
+        cmd_setdevice(&toks[1], gn);
+        return;
+    }
+    if (wstreq(verb, "settraversal")) {
+        long mode = 0;
+        if (ntok < 3 || toks[1].isStr || !parse_int_tok(2, &mode)) {
+            err_line("error settraversal needs an address and a mode");
+            return;
+        }
+        cmd_settraversal(&toks[1], mode);
+        return;
+    }
+    if (wstreq(verb, "addhost")) {
+        char hn[SYM_NAME];
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr || toks[2].len >= SYM_NAME) {
+            err_line("error addhost needs an address and a host name");
+            return;
+        }
+        tok_text(&toks[2], hn);
+        cmd_addhost(&toks[1], hn);
+        return;
+    }
+    if (wstreq(verb, "host") || wstreq(verb, "dp8connect")) {
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr) {
+            err_line("error needs a peer and an address");
+            return;
+        }
+        if (verb[0] == 'h') {
+            char session[SYM_NAME];
+            if (ntok < 4 || toks[3].isStr || toks[3].len >= SYM_NAME) { err_line("error host needs a session name"); return; }
+            tok_text(&toks[3], session);
+            cmd_host(&toks[1], &toks[2], session);
+        } else {
+            if (ntok < 4 || toks[3].isStr) { err_line("error dp8connect needs a device address"); return; }
+            cmd_connect(&toks[1], &toks[2], &toks[3]);
+        }
+        return;
+    }
+    if (wstreq(verb, "sendpeer")) {
+        long nth = 0;
+        int n;
+        if (ntok < 4 || toks[1].isStr) { err_line("error sendpeer needs peer/player/data"); return; }
+        tok_text(&toks[2], tmp2buf);
+        if (wstreq(tmp2buf, "last")) nth = -1;
+        else if (!parse_int_tok(2, &nth)) { err_line("error sendpeer needs peer/player/data"); return; }
+        if ((n = parse_data_tok(3, dataBuf)) < 0) { err_line("error sendpeer needs peer/player/data"); return; }
+        cmd_sendpeer(&toks[1], nth, dataBuf, n);
+        return;
+    }
+    if (wstreq(verb, "cbwait")) {
+        static const struct { const char *name; DWORD id; } cbNames[] = {
+            {"create-player", DPN_MSGID_CREATE_PLAYER},
+            {"destroy-player", DPN_MSGID_DESTROY_PLAYER},
+            {"connect-complete", DPN_MSGID_CONNECT_COMPLETE},
+            {"indicate-connect", DPN_MSGID_INDICATE_CONNECT},
+            {"receive", DPN_MSGID_RECEIVE},
+            {"terminate-session", DPN_MSGID_TERMINATE_SESSION},
+            {0, 0}
+        };
+        char nm[SYM_NAME];
+        long want = 1, ms = 20000;
+        DWORD id = 0;
+        int k;
+        if (ntok < 2 || toks[1].isStr || toks[1].len >= SYM_NAME) { err_line("error cbwait needs a message name"); return; }
+        tok_text(&toks[1], nm);
+        if (ntok >= 3 && !parse_int_tok(2, &want)) { err_line("error bad cbwait count"); return; }
+        if (ntok >= 4 && !toks[3].isStr) {
+            tok_text(&toks[3], tmp2buf);
+            if (tmp2buf[0] == 't' && tmp2buf[1] == '=') {
+                if (!parse_int_text(tmp2buf + 2, wstrlen(tmp2buf) - 2, &ms)) { err_line("error bad cbwait timeout"); return; }
+            } else { err_line("error unknown cbwait argument"); return; }
+        }
+        for (k = 0; cbNames[k].name; k++) if (wstreq(nm, cbNames[k].name)) { id = cbNames[k].id; break; }
+        if (!id) { err_line("error unknown cbwait message name"); return; }
+        cmd_cbwait(id, nm, want, ms);
         return;
     }
     if (wstreq(verb, "signal")) {
