@@ -2,7 +2,8 @@ import {beforeAll,expect,test} from "bun:test";
 import {spawn} from "node:child_process";
 import {dirname,join} from "node:path";
 import {buildNativeForTests,nativeTestHelper} from "../../packages/lan/native/testing";
-beforeAll(buildNativeForTests);
+// Compiling the native helper can exceed the default 5 s hook budget under full-gate load.
+beforeAll(buildNativeForTests, 120_000);
 test("native raw NAT checksum adjustment matches complete IPv4/IPv6 pseudo-header oracles",async()=>{
     const executable=join(dirname(nativeTestHelper),"test-checksum"+(process.platform==="win32"?".exe":""));
     const result=await new Promise<{code:number|null;text:string}>((resolve,reject)=>{

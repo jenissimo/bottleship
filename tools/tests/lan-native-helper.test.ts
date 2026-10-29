@@ -19,7 +19,8 @@ async function until(check: () => boolean, label: string): Promise<void> {
 function code(fn: () => unknown): number {
     try { fn(); return 0; } catch (error) { if (error instanceof WsaFailure) return error.code; throw error; }
 }
-beforeAll(buildNativeForTests);
+// Compiling the native helper can exceed the default 5 s hook budget under full-gate load.
+beforeAll(buildNativeForTests, 120_000);
 
 for (const initialInline of [false, true]) for (const transport of ["websocket", "polling"] as const) test("real TCP MSG_OOB and native inline=" + initialInline + " survive the helper, relay and Winsock over " + transport, async () => {
     const peer: ChildProcessWithoutNullStreams = spawn(peerExecutable, [], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });

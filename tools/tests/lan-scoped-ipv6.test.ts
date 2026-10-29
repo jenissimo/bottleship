@@ -9,7 +9,8 @@ import { LanNetwork } from "../../src/worker/net/lan-network";
 import { RelayLink } from "../../src/worker/net/relay-link";
 import { WsaSocketTable, WsaFailure, WSA, ipv6Address } from "../../src/worker/modules/wsa-network";
 
-beforeAll(buildNativeForTests);
+// Compiling the native helper can exceed the default 5 s hook budget under full-gate load.
+beforeAll(buildNativeForTests, 120_000);
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 async function until(check: () => boolean, reason: string): Promise<void> {
     const deadline = Date.now()+8000;

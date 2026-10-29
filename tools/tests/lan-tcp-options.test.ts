@@ -13,7 +13,8 @@ async function until(check: () => boolean, label: string) {
     const deadline = Date.now() + 8000;
     while (!check()) { if (Date.now() >= deadline) throw Error("Timeout: " + label); await pause(5); }
 }
-beforeAll(buildNativeForTests);
+// Compiling the native helper can exceed the default 5 s hook budget under full-gate load.
+beforeAll(buildNativeForTests, 120_000);
 for (const transport of ["websocket", "polling"] as const) for (const helper of [false, true])
 for (const scenario of ["defaults", "initial", "connecting"] as const)
 test("native TCP option bridge " + scenario + ", helper=" + helper + ", " + transport, async () => {

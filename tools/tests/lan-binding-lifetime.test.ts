@@ -32,7 +32,8 @@ async function portFree(port: number): Promise<boolean> {
         socket.bind(port, "0.0.0.0", () => socket.close(() => resolve(true)));
     });
 }
-beforeAll(buildNativeForTests);
+// Compiling the native helper can exceed the default 5 s hook budget under full-gate load.
+beforeAll(buildNativeForTests, 120_000);
 
 for (const transport of ["websocket", "polling"] as const) {
     test("legacy unbound datagrams and reliable control frames omit optional metadata over " + transport, async () => {
