@@ -177,21 +177,28 @@ async function readCaseLog(): Promise<string> {
     return new TextDecoder().decode(Uint8Array.from(atob(record.content), c => c.charCodeAt(0)));
 }
 
-/** Pack the probe + one script (as C:\case.lp) into a fresh bundle. */
-async function packBundle(caseId: string, scriptPath: string, work: string) {
+/** Pack the probe + one script (as C:\case.lp) into a fresh bundle. The
+ * guest FS persists across boots in a reused tab, so every coordination file
+ * the case can produce must be wiped at boot (deleteOnBoot), or a role driver
+ * mirrors a PREVIOUS run's address and the probe connects to a dead session.
+ * `fsTag` namespaces the game id: OPFS is per-origin, so two role tabs loading
+ * the same game id would share one overlay and each boot's deleteOnBoot would
+ * fight the OTHER tab's live probe holding the file open. */
+async function packBundle(caseId: string, scriptPath: string, work: string, deleteFiles: string[] = ["C:\\case.log"], fsTag = "") {
     const exe = await buildProbe();
     const gameDir = join(work, "game");
     const bundle = join(work, "lanprobe.wgb");
     mkdirSync(gameDir, { recursive: true });
     cpSync(exe, join(gameDir, "lanprobe.exe"));
     cpSync(scriptPath, join(gameDir, "case.lp"));
+    const gameId = fsTag ? `app:lan-conformance-${fsTag}` : "app:lan-conformance";
     const pack = Bun.spawnSync([bun, "tools/make-wgb.ts", gameDir, bundle,
-        "--exe", "lanprobe.exe", "--name", `lanprobe ${caseId}`, "--game-id", "app:lan-conformance",
+        "--exe", "lanprobe.exe", "--name", `lanprobe ${caseId}`, "--game-id", gameId,
         "--ram", "128", "--args", "C:\\case.lp C:\\case.log",
     ], { cwd: root, stdout: "inherit", stderr: "inherit" });
     if (pack.exitCode !== 0) throw new Error("Could not package the lanprobe bundle.");
     const patch = Bun.spawnSync([bun, "tools/wgb.ts", "patch-manifest", bundle,
-        "emulator.deleteOnBoot", JSON.stringify(["C:\\case.log"]),
+        "emulator.deleteOnBoot", JSON.stringify(deleteFiles),
     ], { cwd: root, stdout: "inherit", stderr: "inherit" });
     if (patch.exitCode !== 0) throw new Error("Could not configure fresh case output.");
     return bundle;
@@ -279,6 +286,19 @@ function gateNames(scriptText: string): string[] {
     return [...names];
 }
 
+/** Names each role publishes through `publishaddr <s> <name>` scripts. */
+function publishedNamesByRole(caseId: string, roles: string[]): Map<string, string[]> {
+    const out = new Map<string, string[]>();
+    for (const role of roles) {
+        const names = new Set<string>();
+        for (const m of readFileSync(rolePaths(caseId, role).script, "utf8").matchAll(/^publishaddr \S+ ([a-z0-9-]+)$/gm)) {
+            names.add(m[1]);
+        }
+        out.set(role, [...names]);
+    }
+    return out;
+}
+
 interface RoleResult { ok: boolean; log: string; error?: string }
 
 /**
@@ -298,7 +318,17 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
     if (emulated) {
         // each role child drives its own BS_TAB tab; create it if absent
         await findOrCreateTab(DEFAULT_DEV_URL);
-        const bundle = await packBundle(`${caseId}/${role}`, roleScript, join(work, `game-${role}`));
+        const roles = caseRoles(caseId);
+        const deleteFiles = ["C:\\case.log"];
+        for (const r of roles) {
+            for (const name of gateNames(readFileSync(rolePaths(caseId, r).script, "utf8"))) {
+                deleteFiles.push(`C:\\gate-${name}.open`);
+            }
+            for (const name of publishedNamesByRole(caseId, roles).get(r) ?? []) {
+                deleteFiles.push(`C:\\addr-${name}.txt`);
+            }
+        }
+        const bundle = await packBundle(`${caseId}/${role}`, roleScript, join(work, `game-${role}`), deleteFiles, role);
         await bootBundle(bundle);
         logPath = "guest:C:\\case.log";
         gateDir = "guest:C:\\";
@@ -316,10 +346,56 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
 
     const relayedGates = new Set<string>();
     const reportedGates = new Set<string>();
+    // address publishing: mirror my addr-*.txt into the coordination dir and
+    // the other roles' addr-*.txt back into my probe's gate directory
+    const allRoles = caseRoles(caseId);
+    const myPublish = publishedNamesByRole(caseId, [role]).get(role) ?? [];
+    const otherPublish = [...publishedNamesByRole(caseId, allRoles).entries()]
+        .flatMap(([r, names]) => r === role ? [] : names);
+    const emitted = new Set<string>();
+    const ingested = new Set<string>();
+    const emitAddress = async (name: string) => {
+        if (emulated) {
+            try {
+                const result = await harness().fsRead("C:\\addr-" + name + ".txt").run();
+                const record = result.named.fsRead as { content?: string } | undefined;
+                if (!result.ok || record?.content === undefined) return false;
+                const body = new TextDecoder().decode(Uint8Array.from(atob(record.content), c => c.charCodeAt(0)));
+                if (!/^\d+\.\d+\.\d+\.\d+:\d+$/.test(body.trim())) return false;
+                await Bun.write(join(coordDir, `addr-${name}.txt`), body);
+                return true;
+            } catch { return false; }
+        }
+        const path = join(gateDir, `addr-${name}.txt`);
+        if (!existsSync(path)) return false;
+        const body = readFileSync(path, "utf8");
+        if (!/^\d+\.\d+\.\d+\.\d+:\d+$/.test(body.trim())) return false;
+        writeFileSync(join(coordDir, `addr-${name}.txt`), body);
+        return true;
+    };
+    const ingestAddress = async (name: string) => {
+        const path = join(coordDir, `addr-${name}.txt`);
+        if (!existsSync(path)) return;
+        const body = await Bun.file(path).text();
+        if (emulated) {
+            await harness().fsWrite("C:\\addr-" + name + ".txt", body).run();
+        } else {
+            writeFileSync(join(gateDir, `addr-${name}.txt`), body);
+        }
+    };
     let finished = false;
     let lastLog = "";
     while (Date.now() < deadline && !finished) {
         await Bun.sleep(150);
+        for (const name of myPublish) {
+            if (!emitted.has(name) && await emitAddress(name)) emitted.add(name);
+        }
+        for (const name of otherPublish) {
+            if (!ingested.has(name) && existsSync(join(coordDir, `addr-${name}.txt`))) {
+                ingested.add(name);
+                await ingestAddress(name);
+            }
+        }
         let log = "";
         try {
             log = emulated ? await readCaseLog() : await Bun.file(logPath).text();
@@ -362,7 +438,7 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
  * Parent of a multi-role run: spawns one role child per role, watches the
  * shared coordination directory, releases gates once every role arrived.
  */
-async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean) {
+async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean): Promise<boolean> {
     const roles = caseRoles(caseId);
     if (!roles.length) throw new Error(`No role scripts for ${caseId}`);
     for (const role of roles) {
@@ -449,7 +525,7 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
         }
     }
     if (mode === "check" && ok) console.log(`${caseId}: all ${roles.length} roles match native.`);
-    if (!ok) process.exitCode = 1;
+    return ok;
 }
 
 /* ---------------- main ---------------- */
@@ -484,7 +560,10 @@ if (cmd === "_run-role") {
                     console.log(`SKIP ${id} (emu-skip: ${skip})`);
                     continue;
                 }
-                await runMultiRole(id, "check", force);
+                if (!(await runMultiRole(id, "check", force))) {
+                    failed++;
+                    process.exitCode = 1;
+                }
             } else {
                 await check(id);
             }

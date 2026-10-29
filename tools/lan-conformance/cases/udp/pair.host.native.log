@@ -1,11 +1,12 @@
 wsastartup 0x202 -> ret=0 err=0 ver=2.2 high=2.2
 socket AF_INET SOCK_DGRAM 0 -> ret=h err=0
-bind h 127.0.0.1:23911 -> ret=0 err=0 addr=127.0.0.1:<h>.port
-gate meet enter
-gate meet -> ret=0
-recvfrom h 16 -> ret=4 err=0 from=127.0.0.1:23912 data="ping"
-sendto h 127.0.0.1:23912 "ack" -> ret=3 err=0
-sleep 100 -> ret=0 err=0
+bind h 0.0.0.0:23911 -> ret=0 err=0 addr=0.0.0.0:<h>.port
+publishaddr h host -> ret=0
+waitaddr peer enter
+waitaddr peer -> ret=peeraddr err=0
+connect h peeraddr -> ret=0 err=0
+recv h 16 -> ret=4 err=0 data="ping"
+send h "ack" -> ret=3 err=0
 ioctlsocket h FIONREAD -> ret=0 err=0 out=0
 closesocket h -> ret=0 err=0
 wsacleanup -> ret=0 err=0

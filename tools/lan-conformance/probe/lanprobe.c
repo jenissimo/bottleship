@@ -32,6 +32,11 @@
  *   sleep <ms>
  *   gate <name> [t=<ms>]            — role barrier: logs "enter", then blocks
  *                                     until <logdir>/gate-<name>.open appears
+ *   publishaddr <s> <name>          — write the socket's address to the role
+ *                                     coordinator (addr-<name>.txt); bound to
+ *                                     0.0.0.0, the best local IP is published
+ *   [v =] waitaddr <name> [t=<ms>]  — wait for a peer's published address and
+ *                                     bind it to a symbolic sendto target
  *   [v =] udp_open_port             — bind 127.0.0.1:0, keep open
  *   [v =] udp_closed_port           — bind 127.0.0.1:0, close
  * Data literals: "bytes", u8:<v>, u32:<v> (LE), buf:<n>.
@@ -574,6 +579,164 @@ static void cmd_gate(const char *name, long timeoutMs) {
             return;
         }
         Sleep(40);
+    }
+}
+
+/* Best local IPv4 as a dotted quad: the host name's first non-loopback
+ * address. Natively that is a real NIC; in the emulator the virtual LAN's
+ * per-session 10.x.y.z. Never logged — it travels through coordinator files. */
+static int best_local_ip(char *out) {
+    char name[256];
+    struct hostent *he;
+    int i;
+    out[0] = 0;
+    if (gethostname(name, sizeof(name) - 1) != 0) return 0;
+    name[sizeof(name) - 1] = 0;
+    he = gethostbyname(name);
+    if (!he || he->h_addrtype != AF_INET || !he->h_addr_list || !he->h_addr_list[0]) return 0;
+    for (i = 0; he->h_addr_list[i]; i++) {
+        if (((const unsigned char *)he->h_addr_list[i])[0] != 127) {
+            wcopy(out, inet_ntoa(*(const struct in_addr *)he->h_addr_list[i]), 16);
+            return 1;
+        }
+    }
+    wcopy(out, inet_ntoa(*(const struct in_addr *)he->h_addr_list[0]), 16);
+    return 1;
+}
+
+/* Publish this role's bound address under a coordinator file name. A socket
+ * bound to 0.0.0.0 publishes the best local IP instead — the address travels
+ * through coordinator files, never into the log. */
+static void cmd_publishaddr(const char *sockName, const char *name) {
+    Sym *sym;
+    SOCKADDR_IN a;
+    int n = sizeof(a);
+    char path[MAX_LINE], body[32], *p;
+    DWORD written;
+    sym = sym_find(sockName, wstrlen(sockName));
+    if (!sym || !sym->hasHandle) { err_line("error publishaddr needs an open socket symbol"); return; }
+    memzero(&a, sizeof(a));
+    if (getsockname(sym->handle, (struct sockaddr *)&a, &n) != 0) {
+        long err = (long)WSAGetLastError();
+        p = lineBuf;
+        out_append(&p, "publishaddr ");
+        out_append(&p, sockName);
+        out_append(&p, " ");
+        out_append(&p, name);
+        out_append(&p, " -> ret=-1");
+        append_err(&p, err);
+        *p = 0;
+        log_line(lineBuf);
+        failedCommands++;
+        return;
+    }
+    p = body;
+    if (a.sin_addr.s_addr == INADDR_ANY) {
+        char ip[16];
+        if (!best_local_ip(ip)) { wcopy(ip, "127.0.0.1", 9); ip[9] = 0; }
+        out_append(&p, ip);
+    } else {
+        out_append(&p, inet_ntoa(a.sin_addr));
+    }
+    out_ch(&p, ':');
+    out_int(&p, (long)ntohs(a.sin_port));
+    *p = 0;
+    p = path;
+    out_append(&p, gateDir);
+    out_append(&p, "addr-");
+    out_append(&p, name);
+    out_append(&p, ".txt");
+    *p = 0;
+    {
+        HANDLE f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+        if (f == INVALID_HANDLE_VALUE) { err_line("error publishaddr cannot write the address file"); return; }
+        WriteFile(f, body, wstrlen(body), &written, 0);
+        CloseHandle(f);
+    }
+    p = lineBuf;
+    out_append(&p, "publishaddr ");
+    out_append(&p, sockName);
+    out_append(&p, " ");
+    out_append(&p, name);
+    out_append(&p, " -> ret=0");
+    *p = 0;
+    log_line(lineBuf);
+}
+
+/* Wait for another role's published address ("<ip>:<port>") and bind it to a
+ * symbolic address the script can send to. */
+static void cmd_waitaddr(const char *name, long timeoutMs, const char *assigned) {
+    char path[MAX_LINE], body[64];
+    DWORD start = GetTickCount();
+    char *p;
+    if (!assigned) { err_line("error waitaddr requires assignment"); return; }
+    p = lineBuf;
+    out_append(&p, "waitaddr ");
+    out_append(&p, name);
+    out_append(&p, " enter");
+    *p = 0;
+    log_line(lineBuf);
+
+    p = path;
+    out_append(&p, gateDir);
+    out_append(&p, "addr-");
+    out_append(&p, name);
+    out_append(&p, ".txt");
+    *p = 0;
+    body[0] = 0;
+    for (;;) {
+        HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, 0, 0);
+        if (f != INVALID_HANDLE_VALUE) {
+            DWORD read = 0;
+            ReadFile(f, body, sizeof(body) - 1, &read, 0);
+            CloseHandle(f);
+            body[read] = 0;
+            break;
+        }
+        if (GetTickCount() - start > (DWORD)timeoutMs) {
+            p = lineBuf;
+            out_append(&p, "waitaddr ");
+            out_append(&p, name);
+            out_append(&p, " -> ret=-1 timeout");
+            *p = 0;
+            log_line(lineBuf);
+            failedCommands++;
+            return;
+        }
+        Sleep(40);
+    }
+    {
+        char *colon = body;
+        unsigned long ip;
+        long port = 0;
+        Sym *sym;
+        while (*colon && *colon != ':') colon++;
+        if (*colon) {
+            char *q = colon + 1;
+            long v = 0;
+            int any = *q != 0;
+            while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+            if (any) port = v;
+            *colon = 0;
+        }
+        ip = inet_addr(body);
+        if (ip == INADDR_NONE || port <= 0 || port > 65535) { err_line("error waitaddr malformed address file"); return; }
+        sym = sym_make(assigned, wstrlen(assigned));
+        if (!sym) { err_line("error symbol table full"); return; }
+        sym->isAddr = 1;
+        sym->hasAddr = 1;
+        memzero(&sym->addr, sizeof(sym->addr));
+        sym->addr.sin_family = AF_INET;
+        sym->addr.sin_port = htons((unsigned short)port);
+        sym->addr.sin_addr.s_addr = ip;
+        p = lineBuf;
+        out_append(&p, "waitaddr ");
+        out_append(&p, name);
+        out_append(&p, " -> ret=");
+        out_append(&p, assigned);
+        out_append(&p, " err=0");
+        *p = 0;
+        log_line(lineBuf);
     }
 }
 
@@ -1185,6 +1348,29 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         }
         *p = 0;
         log_line(lineBuf);
+        return;
+    }
+    if (wstreq(verb, "publishaddr")) {
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr || toks[2].len >= SYM_NAME) {
+            err_line("error publishaddr needs a socket and a name");
+            return;
+        }
+        tok_text(&toks[1], tmp);
+        tok_text(&toks[2], tmp2buf);
+        cmd_publishaddr(tmp, tmp2buf);
+        return;
+    }
+    if (wstreq(verb, "waitaddr")) {
+        long ms = 30000;
+        if (ntok < 2 || toks[1].isStr || toks[1].len >= SYM_NAME) { err_line("error waitaddr needs a name"); return; }
+        tok_text(&toks[1], tmp);
+        if (ntok >= 3 && !toks[2].isStr) {
+            tok_text(&toks[2], tmp2buf);
+            if (tmp2buf[0] == 't' && tmp2buf[1] == '=') {
+                if (!parse_int_text(tmp2buf + 2, wstrlen(tmp2buf) - 2, &ms)) { err_line("error bad waitaddr timeout"); return; }
+            } else { err_line("error unknown waitaddr argument"); return; }
+        }
+        cmd_waitaddr(tmp, ms, assigned);
         return;
     }
     if (wstreq(verb, "udp_open_port") || wstreq(verb, "udp_closed_port")) {

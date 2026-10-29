@@ -35,25 +35,26 @@ Roles synchronize through `gate <name>` barriers: the probe logs
 `gate <name> enter`, then blocks until `gate-<name>.open` appears next to its
 log (a real file natively, the guest FS via harness `fsWrite` in the
 emulator). The parent coordinator releases a gate once every role arrived.
-Role scripts must use FIXED ports — addresses stay symbolic without
-cross-role discovery. Role scripts can declare `# emu-skip <reason>` when the
-emulator run is not expressible yet; `check` then reports SKIP instead of
-FAIL.
 
-Emulator fact the pair case established: guest loopback (127.0.0.1) is
-per-process-local, so two tabs cannot exchange datagrams over 127.0.0.1 —
-cross-tab roles need the virtual LAN's per-session `10.x.y.z` address, which
-is assigned per boot. The planned design is role-address publishing: each
-role writes its bound address into a coordinator file the other roles read
-(`publishaddr`/`waitaddr` probe verbs), keeping addresses symbolic in the log
-while the transport uses whatever address each environment really has.
+Cross-tab data exchange cannot use guest loopback — 127.0.0.1 is
+per-process-local — and the virtual LAN's per-session `10.x.y.z` is assigned
+per boot, so roles publish their addresses: `publishaddr <s> <name>` writes
+the socket's address (bound to 0.0.0.0, the best local IP) into the
+coordinator, `peeraddr = waitaddr peer [t=<ms>]` waits for a peer's address
+and binds it to a symbolic sendto/connect target. The address travels through
+coordinator files and never enters the log — `connect h peeraddr` logs the
+token, so native and emulator logs stay identical.
 
-Determinism contract: the probe names every nondeterminism itself — socket
-handles are their assignment names, ephemeral ports print as `<socket>.port`,
-error codes as `WSAE*` names. Bind every socket whose address may appear in a
-log. LastError is preset to 0 before each call and read after every call, so a
-success that leaves a real error behind (truncated recv → `WSAEMSGSIZE`) is
-part of the golden.
+Role drivers mirror every coordination file (`gate-*`, `addr-*`) between the
+coordinator directory and their probe's gate directory. Each role bundle gets
+its own game id (`app:lan-conformance-<role>`): OPFS is per-origin, so same-id
+bundles would share one overlay across tabs and every boot's `deleteOnBoot`
+would fight the other tab's live probe holding the file open. Every
+coordination file the case can produce is wiped at boot (`deleteOnBoot`) — a
+reused tab must not hand the driver a previous run's address.
+
+A role script can declare `# emu-skip <reason>` (one line) when the emulator
+run is not expressible yet; `check` then reports SKIP instead of FAIL.
 
 The script language is documented in the `lanprobe.c` header. Extending
 coverage is: write a 10–30 line script, record native, make the emulator
