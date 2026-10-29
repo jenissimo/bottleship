@@ -44,11 +44,21 @@ function usage(): never {
 function parseArgs(argv: string[]) {
     const rest: string[] = [];
     let force = false;
+    let roleModes: Record<string, "native" | "emu"> | undefined;
     for (const a of argv) {
         if (a === "--force") force = true;
-        else rest.push(a);
+        else if (a.startsWith("--as=")) {
+            roleModes = {};
+            for (const pair of a.slice("--as=".length).split(",")) {
+                const [role, mode] = pair.split("=");
+                if (!/^[a-z0-9]+$/.test(role ?? "") || (mode !== "native" && mode !== "emu")) {
+                    throw new Error(`Bad --as entry "${pair}" (want role=native|emu)`);
+                }
+                roleModes[role] = mode;
+            }
+        } else rest.push(a);
     }
-    return { rest, force };
+    return { rest, force, roleModes };
 }
 
 function casePaths(caseId: string) {
@@ -299,6 +309,19 @@ function publishedNamesByRole(caseId: string, roles: string[]): Map<string, stri
     return out;
 }
 
+/** Names each role raises through `signal <name>` (local gate-<name>.open). */
+function signalNamesByRole(caseId: string, roles: string[]): Map<string, string[]> {
+    const out = new Map<string, string[]>();
+    for (const role of roles) {
+        const names = new Set<string>();
+        for (const m of readFileSync(rolePaths(caseId, role).script, "utf8").matchAll(/^signal ([a-z0-9-]+)$/gm)) {
+            names.add(m[1]);
+        }
+        out.set(role, [...names]);
+    }
+    return out;
+}
+
 interface RoleResult { ok: boolean; log: string; error?: string }
 
 /**
@@ -321,9 +344,9 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
         const roles = caseRoles(caseId);
         const deleteFiles = ["C:\\case.log"];
         for (const r of roles) {
-            for (const name of gateNames(readFileSync(rolePaths(caseId, r).script, "utf8"))) {
-                deleteFiles.push(`C:\\gate-${name}.open`);
-            }
+            const scriptText = readFileSync(rolePaths(caseId, r).script, "utf8");
+            for (const name of gateNames(scriptText)) deleteFiles.push(`C:\\gate-${name}.open`);
+            for (const name of signalNamesByRole(caseId, roles).get(r) ?? []) deleteFiles.push(`C:\\gate-${name}.open`);
             for (const name of publishedNamesByRole(caseId, roles).get(r) ?? []) {
                 deleteFiles.push(`C:\\addr-${name}.txt`);
             }
@@ -354,6 +377,11 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
         .flatMap(([r, names]) => r === role ? [] : names);
     const emitted = new Set<string>();
     const ingested = new Set<string>();
+    const mySignals = signalNamesByRole(caseId, [role]).get(role) ?? [];
+    const otherSignals = [...signalNamesByRole(caseId, allRoles).entries()]
+        .flatMap(([r, names]) => r === role ? [] : names);
+    const emittedSignals = new Set<string>();
+    const ingestedSignals = new Set<string>();
     const emitAddress = async (name: string) => {
         if (emulated) {
             try {
@@ -394,6 +422,24 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
             if (!ingested.has(name) && existsSync(join(coordDir, `addr-${name}.txt`))) {
                 ingested.add(name);
                 await ingestAddress(name);
+            }
+        }
+        for (const name of mySignals) {
+            if (emittedSignals.has(name)) continue;
+            const path = join(gateDir, `gate-${name}.open`);
+            if (existsSync(path)) {
+                await Bun.write(join(coordDir, `gate-${name}.open`), readFileSync(path));
+                emittedSignals.add(name);
+            }
+        }
+        for (const name of otherSignals) {
+            if (!ingestedSignals.has(name) && existsSync(join(coordDir, `gate-${name}.open`))) {
+                ingestedSignals.add(name);
+                if (emulated) {
+                    await harness().fsWrite("C:\\gate-" + name + ".open", "").run();
+                } else {
+                    writeFileSync(join(gateDir, `gate-${name}.open`), "");
+                }
             }
         }
         let log = "";
@@ -438,7 +484,7 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
  * Parent of a multi-role run: spawns one role child per role, watches the
  * shared coordination directory, releases gates once every role arrived.
  */
-async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean): Promise<boolean> {
+async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean, roleModes?: Record<string, "native" | "emu">): Promise<boolean> {
     const roles = caseRoles(caseId);
     if (!roles.length) throw new Error(`No role scripts for ${caseId}`);
     for (const role of roles) {
@@ -465,11 +511,14 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
     const baseTab = process.env.BS_TAB ?? "";
     const children = roles.map(role => {
         const tab = baseTab ? `${baseTab}-${role}` : `lanprobe-${role}`;
+        // goldens are recorded from an all-native run; check pins each role to
+        // its requested environment (default emu; --as role=native pins mixed)
+        const roleMode = mode === "record" ? "native" : roleModes?.[role] ?? "emu";
         return Bun.spawn([bun, import.meta.path, "_run-role", caseId, role], {
             cwd: root,
             env: {
                 ...process.env,
-                BS_LANDIFF_MODE: mode === "record" ? "native" : "emu",
+                BS_LANDIFF_MODE: roleMode,
                 BS_LANDIFF_COORD: coordDir,
                 BS_TAB: tab,
             },
@@ -528,10 +577,31 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
     return ok;
 }
 
+/* ---------------- gateway config ---------------- */
+
+/**
+ * Write a relay-server config whose gateway route targets THIS machine's
+ * LAN address (the same system-resolver address a native probe's
+ * publishaddr publishes), so an emulated role sending to the native role's
+ * published address is routed through the relay gateway as an external
+ * destination. Start the server with:
+ *   bun packages/lan/src/cli.ts --config <out> --port 9001
+ */
+async function gatewayConfig(out: string, ports: number[]) {
+    const os = await import("node:os");
+    const dns = await import("node:dns");
+    const host = await new Promise<string>((res, rej) =>
+        dns.lookup(os.hostname(), { family: 4 }, (e, a) => e ? rej(e) : res(String(a))));
+    await Bun.write(out, JSON.stringify({
+        gateway: { routes: [{ host, address: host, ports, protocols: ["udp"] }] },
+    }, null, 2) + "\n");
+    console.log(`${out}: gateway route ${host} udp ports ${ports.join(",")}`);
+}
+
 /* ---------------- main ---------------- */
 
 const [cmd, ...argv] = process.argv.slice(2);
-const { rest, force } = parseArgs(argv);
+const { rest, force, roleModes } = parseArgs(argv);
 if (cmd === "_run-role") {
     // child of runMultiRole — mode and tab come from the environment
     if (rest.length !== 2) usage();
@@ -547,6 +617,7 @@ if (cmd === "_run-role") {
     if (!rest.length) usage();
     const targets = rest.includes("all")
         ? listCases().filter(id => {
+            if (roleModes) return false; // --as targets explicit cases, not all
             if (caseRoles(id).length) return caseRoles(id).every(r => existsSync(rolePaths(id, r).golden));
             return existsSync(casePaths(id).golden);
         })
@@ -560,7 +631,7 @@ if (cmd === "_run-role") {
                     console.log(`SKIP ${id} (emu-skip: ${skip})`);
                     continue;
                 }
-                if (!(await runMultiRole(id, "check", force))) {
+                if (!(await runMultiRole(id, "check", force, roleModes))) {
                     failed++;
                     process.exitCode = 1;
                 }
@@ -576,6 +647,10 @@ if (cmd === "_run-role") {
     if (targets.length > 1) {
         console.log(`${targets.length - failed}/${targets.length} cases match native.`);
     }
+} else if (cmd === "gateway-config") {
+    const out = rest[0] ?? join(root, "logs/lan-conformance/gateway-server.json");
+    const ports = rest.slice(1).map(Number).filter(Number.isInteger);
+    await gatewayConfig(out, ports.length ? ports : [23911, 23912]);
 } else if (cmd === "list") {
     for (const id of listCases()) {
         const roles = caseRoles(id);

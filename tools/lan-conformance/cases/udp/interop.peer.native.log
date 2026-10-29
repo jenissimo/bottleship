@@ -1,0 +1,13 @@
+wsastartup 0x202 -> ret=0 err=0 ver=2.2 high=2.2
+socket AF_INET SOCK_DGRAM 0 -> ret=p err=0
+bind p 0.0.0.0:23912 -> ret=0 err=0 addr=0.0.0.0:<p>.port
+publishaddr p peer -> ret=0
+waitaddr host enter
+waitaddr host -> ret=hostaddr err=0
+connect p hostaddr -> ret=0 err=0
+send p "ping" -> ret=4 err=0
+gate got-ping enter
+gate got-ping -> ret=0
+closesocket p -> ret=0 err=0
+wsacleanup -> ret=0 err=0
+exit 0

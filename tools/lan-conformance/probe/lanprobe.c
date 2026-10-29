@@ -37,6 +37,7 @@
  *                                     0.0.0.0, the best local IP is published
  *   [v =] waitaddr <name> [t=<ms>]  — wait for a peer's published address and
  *                                     bind it to a symbolic sendto target
+ *   signal <name>                   — raise a coordinator flag (gate-<name>.open)
  *   [v =] udp_open_port             — bind 127.0.0.1:0, keep open
  *   [v =] udp_closed_port           — bind 127.0.0.1:0, close
  * Data literals: "bytes", u8:<v>, u32:<v> (LE), buf:<n>.
@@ -740,6 +741,30 @@ static void cmd_waitaddr(const char *name, long timeoutMs, const char *assigned)
     }
 }
 
+/* Raise a coordinator flag from the script itself: the role driver mirrors
+ * gate-<name>.open into the coordination directory, where the other roles'
+ * drivers pick it up. Lets a native role confirm an observation without a
+ * network path back into the emulated world. */
+static void cmd_signal(const char *name) {
+    char path[MAX_LINE], *p;
+    HANDLE f;
+    p = path;
+    out_append(&p, gateDir);
+    out_append(&p, "gate-");
+    out_append(&p, name);
+    out_append(&p, ".open");
+    *p = 0;
+    f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (f == INVALID_HANDLE_VALUE) { err_line("error signal cannot write the flag file"); return; }
+    CloseHandle(f);
+    p = lineBuf;
+    out_append(&p, "signal ");
+    out_append(&p, name);
+    out_append(&p, " -> ret=0");
+    *p = 0;
+    log_line(lineBuf);
+}
+
 static void run_line(const char *lineStart, DWORD lineLen) {
     const char *s = lineStart;
     DWORD remain = lineLen;
@@ -1371,6 +1396,12 @@ static void run_line(const char *lineStart, DWORD lineLen) {
             } else { err_line("error unknown waitaddr argument"); return; }
         }
         cmd_waitaddr(tmp, ms, assigned);
+        return;
+    }
+    if (wstreq(verb, "signal")) {
+        if (ntok < 2 || toks[1].isStr || toks[1].len >= SYM_NAME) { err_line("error signal needs a name"); return; }
+        tok_text(&toks[1], tmp);
+        cmd_signal(tmp);
         return;
     }
     if (wstreq(verb, "udp_open_port") || wstreq(verb, "udp_closed_port")) {

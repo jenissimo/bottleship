@@ -56,6 +56,35 @@ reused tab must not hand the driver a previous run's address.
 A role script can declare `# emu-skip <reason>` (one line) when the emulator
 run is not expressible yet; `check` then reports SKIP instead of FAIL.
 
+## Mixed native/emulated roles
+
+`check <case> --as=host=native,peer=emu` pins each role to an environment
+(goldens always come from the all-native run). The guest-to-native direction
+is the supported interop path: a native role binds a REAL socket and
+publishes its address; an emulated role sending to that address hits the
+relay gateway (the destination is not a `10.x` virtual address, so the
+worker routes it as an external node) and the relay forwards to the real
+port. The reverse direction has no path — a native process cannot send into
+the virtual LAN unprompted; scenarios needing native-originated traffic use
+the existing WS-bridge fixtures.
+
+Run the relay with a gateway route pointing at this machine's LAN address:
+
+```bash
+bun tools/lan-conformance/probe/lan-diff.ts gateway-config logs/lan-conformance/gateway-server.json [ports...]
+bun packages/lan/src/cli.ts --config logs/lan-conformance/gateway-server.json --port 9001
+BS_LAN_SERVER=http://127.0.0.1:9001 bun tools/lan-conformance/probe/lan-diff.ts check udp/interop --as=host=native,peer=emu
+```
+
+The route address must equal what the native role publishes (both derive
+from the system resolver's answer for the host name). `signal <name>` lets a
+native role confirm an observation through the coordinator instead of a
+network path back — the emulated role waits on it with `gate <name>`.
+
+Note: `127.0.0.1` never reaches the gateway — the worker hard-routes loopback
+destinations to its own node, and a native role publishing a loopback address
+is therefore unreachable from an emulated role. Bind `0.0.0.0` and publish.
+
 The script language is documented in the `lanprobe.c` header. Extending
 coverage is: write a 10–30 line script, record native, make the emulator
 match. When a case needs an API the probe does not speak yet, add the verb to
