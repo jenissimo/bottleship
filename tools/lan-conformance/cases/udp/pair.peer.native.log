@@ -1,0 +1,10 @@
+wsastartup 0x202 -> ret=0 err=0 ver=2.2 high=2.2
+socket AF_INET SOCK_DGRAM 0 -> ret=p err=0
+bind p 127.0.0.1:23912 -> ret=0 err=0 addr=127.0.0.1:<p>.port
+gate meet enter
+gate meet -> ret=0
+sendto p 127.0.0.1:23911 "ping" -> ret=4 err=0
+recvfrom p 16 -> ret=3 err=0 from=127.0.0.1:23911 data="ack"
+closesocket p -> ret=0 err=0
+wsacleanup -> ret=0 err=0
+exit 0

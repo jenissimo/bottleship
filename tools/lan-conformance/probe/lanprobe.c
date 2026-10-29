@@ -30,9 +30,12 @@
  *   setsockopt <s> <level> <opt> <buf> / getsockopt <s> <level> <opt> <size>
  *   select [t=<ms>] [r=s1,s2] [w=..] [e=..]    (t=-1 blocks)
  *   sleep <ms>
+ *   gate <name> [t=<ms>]            — role barrier: logs "enter", then blocks
+ *                                     until <logdir>/gate-<name>.open appears
  *   [v =] udp_open_port             — bind 127.0.0.1:0, keep open
  *   [v =] udp_closed_port           — bind 127.0.0.1:0, close
  * Data literals: "bytes", u8:<v>, u32:<v> (LE), buf:<n>.
+ * Multi-role cases use FIXED ports on every role so addresses stay symbolic.
  */
 #define _WIN32_WINNT 0x0600
 #define WIN32_LEAN_AND_MEAN
@@ -478,6 +481,7 @@ static char prefixBuf[MAX_LINE * 2];
 static char suffixBuf[MAX_LINE];
 static char dataBuf[448];
 static char dataBuf2[448];
+static char tmp2buf[MAX_LINE];
 
 static void err_line(const char *msg) {
     log_line(msg);
@@ -521,6 +525,55 @@ static void udp_port_cmd(const char *assigned, int keepOpen) {
         if (closesocket(s) != 0) log_result("closesocket", -1, 0, "");
         sym->hasHandle = 0;
         sym->isAddr = 1;
+    }
+}
+
+/* ---------------- role barriers ---------------- */
+
+/* Gate files live next to the log: natively the host coordinator writes them
+ * into the run directory; in the emulator the role driver mirrors them into
+ * the guest FS via the harness fsWrite verb. Two log lines per gate — the
+ * "enter" line is how the coordinator sees the role arrive. */
+static char gateDir[MAX_LINE];
+
+static void cmd_gate(const char *name, long timeoutMs) {
+    char path[MAX_LINE];
+    DWORD start = GetTickCount();
+    char *p;
+    p = lineBuf;
+    out_append(&p, "gate ");
+    out_append(&p, name);
+    out_append(&p, " enter");
+    *p = 0;
+    log_line(lineBuf);
+
+    p = path;
+    out_append(&p, gateDir);
+    out_append(&p, "gate-");
+    out_append(&p, name);
+    out_append(&p, ".open");
+    *p = 0;
+    for (;;) {
+        if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+            p = lineBuf;
+            out_append(&p, "gate ");
+            out_append(&p, name);
+            out_append(&p, " -> ret=0");
+            *p = 0;
+            log_line(lineBuf);
+            return;
+        }
+        if (GetTickCount() - start > (DWORD)timeoutMs) {
+            p = lineBuf;
+            out_append(&p, "gate ");
+            out_append(&p, name);
+            out_append(&p, " -> ret=-1 timeout");
+            *p = 0;
+            log_line(lineBuf);
+            failedCommands++;
+            return;
+        }
+        Sleep(40);
     }
 }
 
@@ -1138,6 +1191,19 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         udp_port_cmd(assigned, wstreq(verb, "udp_open_port"));
         return;
     }
+    if (wstreq(verb, "gate")) {
+        long ms = 30000;
+        if (ntok < 2 || toks[1].isStr || toks[1].len >= SYM_NAME) { err_line("error gate needs a name"); return; }
+        tok_text(&toks[1], tmp);
+        if (ntok >= 3 && !toks[2].isStr) {
+            tok_text(&toks[2], tmp2buf);
+            if (tmp2buf[0] == 't' && tmp2buf[1] == '=') {
+                if (!parse_int_text(tmp2buf + 2, wstrlen(tmp2buf) - 2, &ms)) { err_line("error bad gate timeout"); return; }
+            } else { err_line("error unknown gate argument"); return; }
+        }
+        cmd_gate(tmp, ms);
+        return;
+    }
 
     /* unknown */
     {
@@ -1211,8 +1277,21 @@ void entry(void) {
     CloseHandle(file);
     scriptLen = read;
 
-    logHandle = CreateFileA(logPath, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    /* share-read: the multi-role coordinator tails the log while we run */
+    logHandle = CreateFileA(logPath, GENERIC_WRITE, FILE_SHARE_READ, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
     if (logHandle == INVALID_HANDLE_VALUE) ExitProcess(3);
+
+    /* gate files are looked up next to the log */
+    {
+        char *cut = logPath + wstrlen(logPath);
+        while (cut > logPath && *cut != '\\' && *cut != '/') cut--;
+        if (cut > logPath) {
+            wcopy(gateDir, logPath, (DWORD)(cut - logPath + 1));
+            gateDir[cut - logPath + 1] = 0;
+        } else {
+            gateDir[0] = 0;
+        }
+    }
 
     p = scriptBuf;
     end = scriptBuf + scriptLen;
