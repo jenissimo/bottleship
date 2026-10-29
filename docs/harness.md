@@ -20,6 +20,10 @@ silently otherwise), opens the bare emulator page, and waits until everything is
 
 In the browser console the same capability is on `window.__BS__.harness`.
 
+The default profile is `~/.bottleship-cdp-profile`, shared by every checkout and worktree so
+OPFS holds one copy of each game instead of one per worktree. Only one Chrome can use a
+profile at a time; give a parallel browser its own profile and port.
+
 `BS_CHROME_PROFILE` selects the Chrome profile directory on a cold launch. Put it on
 a drive with ample free space: OPFS lives inside the profile, and browser eviction
 under disk pressure can remove saves together with cached bundles. `BS_CDP_PORT`

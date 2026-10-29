@@ -20,6 +20,7 @@
  *     from "something dereferenced garbage".
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 const EXCEPTION_NAMES: Record<number, string> = {
@@ -182,7 +183,7 @@ export function parseMinidump(path: string): CrashReport | null {
     };
 }
 
-export function crashpadDir(profile = process.env.BS_CHROME_PROFILE ?? `${process.cwd()}/tmp/cdp-profile`): string {
+export function crashpadDir(profile = process.env.BS_CHROME_PROFILE ?? `${homedir()}/.bottleship-cdp-profile`): string {
     return join(profile, "Crashpad", "reports");
 }
 

@@ -20,7 +20,7 @@ import { createGzip } from "node:zlib";
 import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, rmSync, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
 import { attachEmulatorWorker } from "./cdp-worker-session";
@@ -38,9 +38,9 @@ const CHROME_PATH = IS_MAC
     : "C:/Program Files/Google/Chrome/Application/chrome.exe";
 /** Where a detached Chrome's stdout/stderr land — see launchChrome. */
 export const CHROME_STDIO_DIR = `${process.cwd()}/logs/chrome`;
-const DEFAULT_PROFILE = process.env.BS_CHROME_PROFILE ?? (IS_MAC
-    ? `${process.env.HOME}/.bottleship-cdp-profile`
-    : `${process.cwd()}/tmp/cdp-profile`);
+/** One profile for every checkout: the emulator keeps game bundles in the profile's OPFS,
+ *  so a per-worktree profile stored a full copy of every game per worktree. */
+const DEFAULT_PROFILE = process.env.BS_CHROME_PROFILE ?? `${homedir()}/.bottleship-cdp-profile`;
 
 export interface CdpTarget {
     id: string;

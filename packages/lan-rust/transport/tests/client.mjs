@@ -10,7 +10,7 @@ const dir='packages/lan-rust/transport';
 const sourceSnapshot=process.argv[2]??null;
 const attempt='logs/lan-conformance/rust-transport-spike/patched-'+new Date().toISOString().replaceAll(':','-').replaceAll('.','-');
 mkdirSync(attempt,{recursive:false});
-const binary=resolve(dir,'target/debug/examples/compat.exe'),rows=[],clients=[],events=[];
+const binary=resolve(process.env.CARGO_TARGET_DIR??'packages/lan-rust/target','debug/examples/compat.exe'),rows=[],clients=[],events=[];
 const sha=p=>createHash('sha256').update(readFileSync(p)).digest('hex');
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 const until=async fn=>{let end=Date.now()+2500;while(!fn()){if(Date.now()>end)throw Error('finite condition deadline');await pause(10)}};

@@ -1,0 +1,5 @@
+# core/, gateway/, native/ and transport/ are separate Cargo projects (own lockfiles).
+# Building each into its own target/ duplicated every dependency; share one directory.
+# Relative to this .cargo directory's parent: packages/lan-rust/target.
+[build]
+target-dir = "target"

@@ -179,3 +179,6 @@ mechanisms and validation order; the native log decides behaviour.
 - Native fixtures need 32-bit MinGW (`BS_MINGW_CC`, default `C:/msys64/mingw32/bin/gcc.exe`).
 - Browser comparisons use the project harness (`tools/harness.ts`), one fixture per tab.
 - Rust server: `cargo run --release --locked --manifest-path packages/lan-rust/Cargo.toml -- --port 9001`.
+- Run cargo for the sub-crates from inside `packages/lan-rust/`: its `.cargo/config.toml`
+  makes `core`, `gateway`, `native` and `transport` share `packages/lan-rust/target`
+  (Cargo reads that config from the working directory, not from `--manifest-path`).
