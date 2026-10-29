@@ -16,7 +16,7 @@ export default function SettingsNetworkSection({
   const connect = (event: React.FormEvent) => {
     event.preventDefault();
     try {
-      const config = normalizeNetworkConfig({ serverUrl, room });
+      const config = normalizeNetworkConfig({ serverUrl, room, directPlay8: network?.directPlay8, winsock: network?.winsock });
       if (config && window.location.protocol === "https:" && new URL(config.serverUrl).protocol !== "https:") {
         throw new Error("Use an HTTPS LAN server from this page.");
       }

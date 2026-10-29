@@ -11,6 +11,10 @@ function failure(code: number, message: string): Error & { code: number } { retu
 /** One explicitly configured helper process owns one native TCP socket. */
 export class NativeHelperSocket extends EventEmitter {
     private child: ChildProcessWithoutNullStreams | null = null;
+    private finishPhysical!: () => void;
+    private readonly physicalClosed = new Promise<void>(resolve => { this.finishPhysical = resolve; });
+    /** Resolves only after the owned helper process and its pipes have closed. */
+    whenPhysicalClosed(): Promise<void> { return this.physicalClosed; }
     private input: Buffer = Buffer.alloc(0);
     private readonly reads: ReadItem[] = [];
     private readonly writes = new Map<number, { bytes: number; callback: (error?: Error | null) => void }>();
@@ -58,6 +62,7 @@ export class NativeHelperSocket extends EventEmitter {
         child.stdin.on("error", failure => { if (!this.closed && !["EPIPE", "ECONNRESET"].includes((failure as { code?: string }).code ?? "")) this.fail(failure); });
         child.on("error", error => this.fail(Object.assign(error, { code: 10045 })));
         child.on("close", code => {
+            this.finishPhysical();
             if (this.closed) return;
             if (!this.sawClose && !(this.sawEof && code === 0)) this.fail(failure(10054, "Native socket helper exited unexpectedly"));
             else this.maybeEnd();
@@ -231,8 +236,10 @@ export class NativeHelperSocket extends EventEmitter {
         for (const pending of this.writes.values()) pending.callback(failure(10054, "Native helper socket closed"));
         this.writes.clear(); this.controls.clear(); this.writeBytes = 0; this.pendingCommandBytes = 0;
         this.pendingCredit = 0; this.endCallbacks.length = 0;
-        this.child?.stdin.destroy(); this.child?.stdout.destroy(); this.child?.stderr.destroy();
-        this.child?.kill(); this.child = null;
+        const child = this.child;
+        child?.stdin.destroy(); child?.stdout.destroy(); child?.stderr.destroy();
+        if (child) child.kill(); else this.finishPhysical();
+        this.child = null;
         if (!this.emittedClose) { this.emittedClose = true; this.emit("close"); }
     }
 }

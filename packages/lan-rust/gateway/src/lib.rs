@@ -5,10 +5,12 @@ mod plain_udp;
 mod raw;
 mod raw_packet;
 mod tcp;
+mod tcp_accept;
+mod tcp_host;
 mod udp;
 mod udp_carrier;
 use bottleship_lan_core::{
-    ConnId, GatewayEvent, GatewayInput,
+    ConnId, GatewayEvent, GatewayInput, TcpChildKey, TcpOfferKey,
     config::GatewayConfig,
     gateway::{BindingRegistry, BindingToken, DestinationPolicy},
     wire::unreliable,
@@ -184,6 +186,7 @@ impl Gateway {
             policy.clone(),
             events.clone(),
         );
+        let tcp_host = tcp_host::TcpHostPool::new(connection, policy.clone(), events.clone(), config.max_tcp_connections, tcp.quota.clone());
         let udp = UdpPool::new(
             connection,
             config.native_udp_helper_path.as_ref().map(Into::into),
@@ -199,6 +202,9 @@ impl Gateway {
             tcp,
             raw,
             host,
+            tcp_host,
+            tcp_children: HashMap::new(),
+            tcp_offers: HashMap::new(),
             bindings: BindingRegistry::default(),
             receiver,
             events: event_rx,
@@ -256,7 +262,8 @@ impl GatewayHandle {
             _ => {}
         }
         let bytes = match &input {
-            GatewayInput::Frame { datagram, .. } | GatewayInput::HostFrame { datagram, .. } => {
+            GatewayInput::Frame { datagram, .. } | GatewayInput::HostFrame { datagram, .. }
+            | GatewayInput::TcpListenerFrame { datagram, .. } | GatewayInput::TcpChildFrame { datagram, .. } => {
                 datagram.payload.len() + 256
             }
             _ => 256,
@@ -268,7 +275,8 @@ impl GatewayHandle {
             .try_reserve()
             .map_err(|_| NativeError::new(10055, "gateway command channel full"))?;
         if let GatewayInput::LeaseUdpPeer { operation, .. }
-        | GatewayInput::OpenUdpHost { operation, .. } = &input
+        | GatewayInput::OpenUdpHost { operation, .. }
+        | GatewayInput::OpenTcpListener { operation_id: operation, .. } = &input
         {
             let mut pending = self
                 .inner
@@ -339,6 +347,8 @@ impl GatewayHandle {
     }
 }
 enum Internal {
+    TcpHostAccepted { id: u64, binding: BindingToken, accepted_id: u64, _slot: tokio::sync::OwnedSemaphorePermit },
+    TcpHostClosed { id: u64, code: u32 },
     HostRead {
         id: u64,
         packet: bottleship_lan_native::listener::ListenerDatagram,
@@ -378,23 +388,28 @@ enum Internal {
     },
     TcpRead {
         key: TcpKey,
+        server_id: u32,
         read: bottleship_lan_native::tcp::TcpRead,
     },
     TcpEof {
         key: TcpKey,
+        server_id: u32,
     },
     TcpClosed {
         key: TcpKey,
+        server_id: u32,
         status: bottleship_lan_native::tcp::TcpStatus,
     },
     TcpWriteDone {
         key: TcpKey,
+        server_id: u32,
         amount: u32,
         result: Result<(), NativeError>,
         _permit: Permit,
     },
     TcpFinishDone {
         key: TcpKey,
+        server_id: u32,
         result: Result<(), NativeError>,
     },
     UdpReceive {
@@ -426,6 +441,9 @@ struct Actor {
     tcp: TcpPool,
     raw: raw::RawPool,
     host: host::HostPool,
+    tcp_host: tcp_host::TcpHostPool,
+    tcp_children: HashMap<TcpKey, TcpChildKey>,
+    tcp_offers: HashMap<u32, TcpOfferKey>,
     bindings: BindingRegistry,
     receiver: mpsc::Receiver<Envelope>,
     events: mpsc::Receiver<Internal>,
@@ -458,6 +476,7 @@ impl Actor {
              event=self.events.recv()=>match event{Some(event)=>self.event(event).await,None=>break},
              _=sweep.tick()=>{tokio::select!{biased;_ =closing.changed()=>break,_=self.sweep()=>Ok(())}}
             };
+            let result = result.and_then(|()| self.retire_tcp_children()).and_then(|()| self.retire_tcp_offers());
             self.publish_counts();
             if let Err(failure) = result {
                 error = Some(failure);
@@ -470,12 +489,14 @@ impl Actor {
         self.tcp.abort();
         self.raw.abort();
         self.host.abort();
+        self.tcp_host.abort();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
         self.udp.close().await;
         self.tcp.close().await;
         self.raw.close().await;
         self.host.close().await;
+        self.tcp_host.close().await;
         self.output_budget.close();
         self.cancellations
             .lock()
@@ -515,9 +536,23 @@ impl Actor {
         event: GatewayEvent,
         receive: Option<Box<dyn Send>>,
     ) -> Result<(), NativeError> {
+        let event = match event {
+            GatewayEvent::Frame { binding, datagram } if binding.proto == 2 => {
+                let key = bottleship_lan_core::wire::TcpFrame::decode(datagram.payload.clone()).ok().and_then(|frame| {
+                    let lookup = TcpKey { binding, node: datagram.node, remote_port: datagram.src_port, client_id: frame.dst_id };
+                    self.tcp_children.get(&lookup).filter(|owner| owner.native_id == frame.src_id).copied()
+                });
+                match key {
+                    Some(key) => GatewayEvent::TcpChildFrame { key, datagram },
+                    None => GatewayEvent::Frame { binding, datagram },
+                }
+            }
+            other => other,
+        };
         let unreliable = matches!(&event,GatewayEvent::Frame{binding,..}|GatewayEvent::HostFrame{binding,..}if unreliable(binding.proto));
         let bytes = match &event {
-            GatewayEvent::Frame { datagram, .. } | GatewayEvent::HostFrame { datagram, .. } => {
+            GatewayEvent::Frame { datagram, .. } | GatewayEvent::HostFrame { datagram, .. }
+            | GatewayEvent::TcpListenerFrame { datagram, .. } | GatewayEvent::TcpChildFrame { datagram, .. } => {
                 datagram.payload.len() + 64
             }
             _ => 128,
@@ -539,6 +574,60 @@ impl Actor {
             return Ok(());
         }
         result
+    }
+    fn retire_tcp_offers(&mut self) -> Result<(), NativeError> {
+        let retired: Vec<_> = self.tcp_offers.iter()
+            .filter(|(id, _)| !self.tcp.inbound.contains(**id))
+            .map(|(id, key)| (*id, *key)).collect();
+        for (id, _) in retired {
+            self.finish_tcp_offer(id, true)?;
+        }
+        Ok(())
+    }
+    fn finish_tcp_offer(&mut self, id: u32, reset: bool) -> Result<(), NativeError> {
+        let Some(key) = self.tcp_offers.remove(&id) else { return Ok(()); };
+        if reset {
+            let datagram = bottleship_lan_core::wire::Datagram {
+                proto: 2, node: key.node, src_port: key.remote_port, dst_port: key.binding.local_port,
+                payload: bottleship_lan_core::wire::TcpFrame { kind: 5, src_id: key.native_id,
+                    dst_id: 0, value: 10054, data: bytes::Bytes::new() }.encode(),
+            };
+            self.output(GatewayEvent::TcpListenerFrame { lease_id: key.lease_id, binding: key.binding, datagram }, None)?;
+        }
+        self.output(GatewayEvent::TcpOfferClosed { key }, None)
+    }
+    fn finish_tcp_offer_exact(&mut self, child: TcpChildKey) -> Result<(), NativeError> {
+        if self.tcp_offers.get(&child.native_id).is_some_and(|offer|
+            offer.lease_id == child.lease_id && offer.binding == child.binding
+            && offer.node == child.node && offer.remote_port == child.remote_port) {
+            self.finish_tcp_offer(child.native_id, false)?;
+        }
+        Ok(())
+    }
+    fn retire_tcp_children(&mut self) -> Result<(), NativeError> {
+        let closed: Vec<_> = self.tcp_children.iter()
+            .filter(|(key, child)| !self.tcp.owns_event(**key, child.native_id))
+            .map(|(key, child)| (*key, *child)).collect();
+        for (key, child) in closed {
+            self.tcp_children.remove(&key);
+            self.output(GatewayEvent::TcpChildClosed { key: child }, None)?;
+        }
+        Ok(())
+    }
+    fn reject_tcp_child(&self, child: TcpChildKey, code: u32) -> Result<(), NativeError> {
+        let reply = bottleship_lan_core::wire::Datagram {
+            proto: 2, node: child.node, src_port: child.remote_port, dst_port: child.binding.local_port,
+            payload: bottleship_lan_core::wire::TcpFrame { kind: 5, src_id: child.native_id,
+                dst_id: child.guest_id, value: code, data: bytes::Bytes::new() }.encode(),
+        };
+        self.output(GatewayEvent::TcpListenerFrame { lease_id: child.lease_id, binding: child.binding, datagram: reply }, None)?;
+        self.output(GatewayEvent::TcpChildClosed { key: child }, None)
+    }
+    async fn retire_tcp_listener(&mut self, id: u64) {
+        if let Some((binding, Some(epoch))) = self.tcp_host.identity(id) {
+            self.tcp.inbound.cancel_listener(binding, epoch);
+        }
+        self.tcp_host.remove(id).await;
     }
     fn error(&self, key: FlowKey, code: u32) -> Result<(), NativeError> {
         self.output(
@@ -585,6 +674,9 @@ impl Actor {
             self.remove_flow(key).await;
         }
         if let Some(g) = binding.generation {
+            for id in self.tcp_host.ids_for_port(binding.proto, binding.local_port, g - 1) {
+                self.retire_tcp_listener(id).await;
+            }
             self.tcp
                 .release_port(binding.proto, binding.local_port, g - 1)
                 .await;
@@ -603,6 +695,108 @@ impl Actor {
     }
     async fn input(&mut self, Envelope { input, permit }: Envelope) -> Result<(), NativeError> {
         match input {
+            GatewayInput::OpenTcpListener { operation_id, binding, config } => {
+                if self.cancelled(operation_id) {
+                    self.finish_operation(operation_id);
+                    return Ok(());
+                }
+                if !self.config.tcp_listeners.iter().any(|allowed| allowed == &config) {
+                    self.finish_operation(operation_id);
+                    return self.output(GatewayEvent::TcpListenerFailed { operation_id, code: 10013 }, None);
+                }
+                if !self.admit_binding(binding).await {
+                    self.finish_operation(operation_id);
+                    return self.output(GatewayEvent::TcpListenerFailed { operation_id, code: 10057 }, None);
+                }
+                if self.tcp_host.contains_binding(binding) {
+                    self.finish_operation(operation_id);
+                    return self.output(GatewayEvent::TcpListenerFailed { operation_id, code: 10048 }, None);
+                }
+                let cancellations = self.cancellations.clone();
+                let wake = self.cancel_notify.clone();
+                let result = {
+                    let opening = self.tcp_host.open(binding, config);
+                    tokio::pin!(opening);
+                    loop {
+                        if cancellations.lock().unwrap_or_else(|e| e.into_inner()).get(&operation_id).copied().unwrap_or(true) {
+                            break None;
+                        }
+                        tokio::select! { biased; _ = wake.notified() => {}, result = &mut opening => break Some(result) }
+                    }
+                };
+                if result.is_none() || self.cancelled(operation_id) {
+                    self.tcp_host.cancel_binding(binding).await;
+                    self.finish_operation(operation_id);
+                    return Ok(());
+                }
+                self.finish_operation(operation_id);
+                match result.unwrap() {
+                    Ok((lease_id, address)) => self.output(GatewayEvent::TcpListenerReady { operation_id, lease_id, binding, address }, None)?,
+                    Err(error) => self.output(GatewayEvent::TcpListenerFailed { operation_id, code: error.code }, None)?,
+                }
+            }
+            GatewayInput::CancelTcpOffer { key } => {
+                if self.tcp_offers.get(&key.native_id) == Some(&key) {
+                    self.tcp.inbound.cancel(key.native_id);
+                    self.finish_tcp_offer(key.native_id, true)?;
+                }
+            }
+            GatewayInput::CloseTcpListener { lease_id } => {
+                self.retire_tcp_listener(lease_id).await;
+            }
+            GatewayInput::TcpListenerFrame { lease_id, binding, datagram } => {
+                let frame = match bottleship_lan_core::wire::TcpFrame::decode(datagram.payload.clone()) {
+                    Ok(frame) => frame, Err(_) => return Ok(()),
+                };
+                let child = TcpChildKey { lease_id, binding, node: datagram.node, remote_port: datagram.dst_port,
+                    native_id: frame.dst_id, guest_id: frame.src_id };
+                if frame.kind == 2 && (frame.src_id == 0 || frame.dst_id == 0) { return Ok(()); }
+                if frame.kind == 2 && !frame.data.is_empty() { self.reject_tcp_child(child, 10022)?; return Ok(()); }
+                // A duplicate handshake for an already established exact child must
+                // never retire it, even if a stale control frame bypasses Core.
+                let lookup = TcpKey { binding, node: child.node, remote_port: child.remote_port, client_id: child.guest_id };
+                if frame.kind == 2 && self.tcp_children.get(&lookup) == Some(&child) { return Ok(()); }
+                let epoch = self.tcp_host.epoch(lease_id, binding);
+                if !self.bindings.is_live(binding) || epoch.is_none() {
+                    if frame.kind == 2 { self.reject_tcp_child(child, 10054)?; self.finish_tcp_offer_exact(child)?; }
+                    return Ok(());
+                }
+                let epoch = epoch.unwrap();
+                if frame.kind == 5 {
+                    if self.tcp.inbound.reset(binding, epoch, &datagram) { self.finish_tcp_offer_exact(child)?; }
+                } else if frame.kind == 2 {
+                    match self.tcp.establish_inbound(binding, epoch, &datagram) {
+                        Ok(Some(key)) => {
+                            self.tcp_children.insert(key, child);
+                            self.output(GatewayEvent::TcpChildEstablished { key: child }, None)?;
+                        }
+                        Ok(None) => self.reject_tcp_child(child, 10054)?,
+                        Err(error) => self.reject_tcp_child(child, error.code)?,
+                    }
+                    self.finish_tcp_offer_exact(child)?;
+                }
+            }
+            GatewayInput::TcpChildFrame { key, datagram } => {
+                let lookup = TcpKey { binding: key.binding, node: key.node, remote_port: key.remote_port, client_id: key.guest_id };
+                if self.tcp_children.get(&lookup) != Some(&key) || !self.tcp.owns_event(lookup, key.native_id)
+                    || !self.bindings.is_live(key.binding) || datagram.proto != 2 || datagram.node != key.node
+                    || datagram.src_port != key.binding.local_port || datagram.dst_port != key.remote_port { return Ok(()); }
+                let Ok(frame) = bottleship_lan_core::wire::TcpFrame::decode(datagram.payload.clone()) else { return Ok(()); };
+                if frame.src_id != key.guest_id || frame.dst_id != key.native_id || frame.kind == 1 || frame.kind == 2 { return Ok(()); }
+                let address = std::net::Ipv4Addr::new(key.node[2], key.node[3], key.node[4], key.node[5]);
+                let target = bottleship_lan_core::routes::Target {
+                    route_id: 0, address: bottleship_lan_core::routes::NativeAddress::parse(&address.to_string()).unwrap(),
+                    port: key.remote_port, canonical_policy_key: address.to_string(), raw_mode: None,
+                };
+                let deliveries = self.tcp.process(datagram, key.binding, target, permit).await?;
+                for delivery in deliveries { self.output(delivery.event, delivery.guard)?; }
+            }
+            GatewayInput::CloseTcpChild { key } => {
+                let lookup = TcpKey { binding: key.binding, node: key.node, remote_port: key.remote_port, client_id: key.guest_id };
+                if self.tcp_children.get(&lookup) == Some(&key) {
+                    self.tcp.close_child(lookup, key.native_id).await;
+                }
+            }
             GatewayInput::OpenUdpHost {
                 operation,
                 binding,
@@ -886,6 +1080,9 @@ impl Actor {
                 generation,
             } => {
                 if self.bindings.release(proto, port, generation) {
+                    for id in self.tcp_host.ids_for_port(proto, port, generation) {
+                        self.retire_tcp_listener(id).await;
+                    }
                     self.tcp.release_port(proto, port, generation).await;
                     self.raw.release_port(proto, port, generation).await;
                     self.host.release_port(proto, port, generation).await;
@@ -911,6 +1108,26 @@ impl Actor {
     }
     async fn event(&mut self, event: Internal) -> Result<(), NativeError> {
         match event {
+            Internal::TcpHostAccepted { id, binding, accepted_id, _slot } => {
+                let Some(accepted) = self.tcp_host.take_accepted(id, binding, accepted_id) else { return Ok(()); };
+                if !self.bindings.is_live(binding) || !self.tcp_host.accept_epoch(id, binding, accepted.epoch) {
+                    return Ok(());
+                }
+                if let Ok(datagram) = self.tcp.admit_inbound(accepted, binding) {
+                    let frame = bottleship_lan_core::wire::TcpFrame::decode(datagram.payload.clone())
+                        .expect("internally encoded TCP SYN");
+                    let key = TcpOfferKey { lease_id: id, binding, node: datagram.node,
+                        remote_port: datagram.src_port, native_id: frame.src_id };
+                    self.tcp_offers.insert(frame.src_id, key);
+                    self.output(GatewayEvent::TcpListenerFrame { lease_id: id, binding, datagram }, None)?;
+                }
+            }
+            Internal::TcpHostClosed { id, code } => {
+                if self.tcp_host.identity(id).is_some() {
+                    self.retire_tcp_listener(id).await;
+                    self.output(GatewayEvent::TcpListenerClosed { lease_id: id, code }, None)?;
+                }
+            }
             Internal::HostRead { id, packet } => {
                 if let Some(event) = self.host.receive(id, &packet) {
                     self.output(event, Some(Box::new(packet)))?;
@@ -1000,33 +1217,39 @@ impl Actor {
                         .saturating_add(delta.unattributed_errors);
                 });
             }
-            Internal::TcpRead { key, read } => {
-                for delivery in self.tcp.read(key, read) {
+            Internal::TcpRead { key, server_id, read } => {
+                if !self.tcp.owns_event(key, server_id) { return Ok(()); }
+                for delivery in self.tcp.read(key, server_id, read) {
                     self.output(delivery.event, delivery.guard)?;
                 }
             }
-            Internal::TcpEof { key } => {
-                for delivery in self.tcp.eof(key) {
+            Internal::TcpEof { key, server_id } => {
+                if !self.tcp.owns_event(key, server_id) { return Ok(()); }
+                for delivery in self.tcp.eof(key, server_id) {
                     self.output(delivery.event, delivery.guard)?;
                 }
             }
-            Internal::TcpClosed { key, status } => {
-                for delivery in self.tcp.closed(key, status).await {
+            Internal::TcpClosed { key, server_id, status } => {
+                if !self.tcp.owns_event(key, server_id) { return Ok(()); }
+                for delivery in self.tcp.closed(key, server_id, status).await {
                     self.output(delivery.event, delivery.guard)?;
                 }
             }
             Internal::TcpWriteDone {
                 key,
+                server_id,
                 amount,
                 result,
                 ..
             } => {
-                for delivery in self.tcp.wrote(key, amount, result).await {
+                if !self.tcp.owns_event(key, server_id) { return Ok(()); }
+                for delivery in self.tcp.wrote(key, server_id, amount, result).await {
                     self.output(delivery.event, delivery.guard)?;
                 }
             }
-            Internal::TcpFinishDone { key, result } => {
-                for delivery in self.tcp.finished(key, result).await {
+            Internal::TcpFinishDone { key, server_id, result } => {
+                if !self.tcp.owns_event(key, server_id) { return Ok(()); }
+                for delivery in self.tcp.finished(key, server_id, result).await {
                     self.output(delivery.event, delivery.guard)?;
                 }
             }
@@ -1066,6 +1289,7 @@ impl Actor {
         Ok(())
     }
     async fn sweep(&mut self) {
+        self.tcp.inbound.sweep();
         let deadline = Instant::now() - Duration::from_millis(self.config.udp_idle_timeout_ms);
         let keys: Vec<_> = self
             .udp

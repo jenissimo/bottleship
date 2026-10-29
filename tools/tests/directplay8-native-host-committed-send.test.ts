@@ -289,3 +289,35 @@ test("a public admission-signal abort listener can replace Host without moving t
     expect(s.networks[0].isBound(s.port(0), PROTO_UDP)).toBe(false);
     expect(s.releaseCounts[3]).toBe(1); expect(s.returnCounts[3]).toBe(1);
 }, 10000);
+
+test("DestroyPeer refuses a full target reliable queue without deleting either player", async () => {
+    const s = scene(); expect(s.start()).toBe(DPN.OK);
+    const target = await s.join(1), sibling = await s.join(2);
+    const targetId = s.snapshot(target).localId, siblingId = s.snapshot(sibling).localId;
+    const version = (s.host as unknown as { version: number }).version;
+    const entity = s.host.entities.get(targetId), siblingEntity = s.host.entities.get(siblingId);
+    const destroyed: [number, number][] = [];
+    s.host.onPlayerDestroyReason = (id, reason) => destroyed.push([id, reason]);
+
+    expect(await s.fill(target, 256)).toBe(targetId);
+    expect(s.heldAcknowledgements.length).toBeGreaterThan(0);
+    const dfCount = s.packets(target, 0xdf).length, siblingD1 = s.packets(sibling, 0xd1).length;
+    expect(s.host.kick(targetId, Uint8Array.of(0x44, 0, 0x55))).toBe(DPN.TABLEFULL);
+
+    expect(s.host.entities.get(targetId)).toBe(entity);
+    expect(s.host.entities.get(siblingId)).toBe(siblingEntity);
+    expect(s.host.currentPlayers).toBe(3);
+    expect((s.host as unknown as { version: number }).version).toBe(version);
+    expect(destroyed).toEqual([]);
+    expect(s.packets(target, 0xdf)).toHaveLength(dfCount);
+    expect(s.packets(sibling, 0xd1)).toHaveLength(siblingD1);
+    expect(target.link.state).toBe("connected");
+    await s.traffic(sibling, siblingId, 0x31);
+
+    // Replay the actual observed target ACKs; no synthetic admission result.
+    expect(await s.resume()).toEqual(Array(256).fill(DPN.OK));
+    await s.traffic(target, targetId, 0x32);
+    expect(s.host.entities.get(targetId)).toBe(entity);
+    expect(destroyed).toEqual([]);
+    expect(s.packets(target, 0xdf)).toHaveLength(dfCount);
+}, 10000);

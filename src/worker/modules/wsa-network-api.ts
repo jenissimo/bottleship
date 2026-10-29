@@ -335,7 +335,23 @@ export function makeNetworkSocketExports(table: WsaSocketTable, setError: WsaErr
     });
     api.closesocket = adapt(counter, setError, a => ({ value: table.closesocket(a[0]), error: 0 }));
     api.bind = adapt(counter, setError, a => ({ value: table.bind(a[0], address(a[1], a[2] | 0)), error: 0 }));
-    api.listen = adapt(counter, setError, a => ({ value: table.listen(a[0], a[1]) }));
+    api.listen = adapt(counter, setError, a => {
+        const signal = table.blockingSignal, operation = table.network.allocateSocketId();
+        let result: number | Promise<number>;
+        try { result = waitOperation(table, a[0], () => table.listen(a[0], a[1], !signal?.aborted, operation), 0, true, undefined, true); }
+        catch (error) {
+            if (signal?.aborted) { try { table.cancelListen(a[0], operation); } catch { /* The owner may already be closed. */ } }
+            throw error;
+        }
+        if (result instanceof Promise && signal) {
+            const abort = () => { try { table.cancelListen(a[0], operation); } catch { /* The owner may already be closed. */ } };
+            signal.addEventListener("abort", abort, {once: true});
+            if (signal.aborted) abort();
+            return result.then(value => { signal.removeEventListener("abort", abort); return {value}; },
+                error => { signal.removeEventListener("abort", abort); throw error; });
+        }
+        return mapPrepared(result, value => ({value}));
+    });
     api.connect = adapt(counter, setError, a => {
         const peer = address(a[1], a[2] | 0), socket = table.get(a[0]), nonBlocking = socket.nonBlocking;
         try { return { value: table.connect(a[0], peer),

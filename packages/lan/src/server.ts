@@ -2,10 +2,12 @@ import { createServer, type Server as HttpServer } from "node:http";
 import { Server, type Socket } from "socket.io";
 import { GatewayRoutes, NativeGateway, type GatewayOptions } from "./gateway";
 import { NetResolveError } from "./resolve";
+import {TcpHostOwner} from "./tcp-host-owner";
+import {TcpAcceptHostOwner} from "./tcp-accept-host-owner";
 import {
     asBytes, decodeDatagram, isDatagramProtocol, isBroadcastNode, isLanNode, nodeKey, nodeToIpv4,
     PROTOCOL_VERSION, MAX_FRAME_SIZE, SOCKET_PATH, validBindingGeneration, validPort, isProtocol,
-    PROTO_UDP, isMulticastIpv4Node,
+    PROTO_UDP, PROTO_TCP, isExternalNode, isMulticastIpv4Node, validTcpHostOpenRequest,
     type ClientEvents, type ServerEvents, type UdpPeerLeaseRequest,type UdpPeerLeaseReply,validUdpPeerLeaseRequest,
 } from "./protocol";
 
@@ -133,6 +135,106 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             queue.frames++; queue.bytes += 64;
             socket.emit("socketError", error);
         }, lease.node);
+        // TCP Host remains opt-in and unadvertised until end-to-end parity.
+        type TcpOwner=TcpHostOwner|TcpAcceptHostOwner;
+        type TcpPending={request:import("./protocol").TcpHostOpenRequest;controller:AbortController;owner:TcpOwner};
+        type TcpActive={requestId:number;request:import("./protocol").TcpHostOpenRequest;owner:TcpOwner};
+        const tcpPending=new Map<number,TcpPending>(),tcpActive=new Map<number,TcpActive>();
+        const tcpOwners=new Set<TcpOwner>();
+        const tcpBindings=new Map<number,{generation:number;released:boolean}>();
+        let lastTcpHostRequest=0;
+        const tcpReply=(id:number,reply:import("./protocol").TcpHostOpenReply):boolean=>{
+            if(!socket.connected)return false;
+            if(congested(socket,256)){socket.disconnect(true);return false;}
+            queue.frames++;queue.bytes+=256;socket.emit("tcpHostOpened",id,reply);return true;
+        };
+        const closeTcpOwner=(owner:TcpOwner,all:boolean):void=>{
+            if(all)owner.close();
+            void owner.closeListener().then(()=>tcpOwners.delete(owner));
+        };
+        const retireTcp=(port:number,generation:number,inclusive:boolean):void=>{
+            const match=(r:import("./protocol").TcpHostOpenRequest)=>r.localPort===port &&
+                (inclusive?r.bindingGeneration<=generation:r.bindingGeneration<generation);
+            for(const [id,p] of tcpPending)if(match(p.request)){
+                tcpPending.delete(id);p.controller.abort();closeTcpOwner(p.owner,true);
+            }
+            for(const [id,a] of tcpActive)if(match(a.request)){
+                tcpActive.delete(id);closeTcpOwner(a.owner,true);
+            }
+            for(const owner of tcpOwners)if(owner.bindingRetiredBy(port,generation,inclusive))closeTcpOwner(owner,true);
+        };
+        socket.on("openTcpHost",(id,request)=>{
+            if(!withinLimits(128))return;
+            if(!Number.isInteger(id)||id<1||id>0xffffffff||id<=lastTcpHostRequest){socket.disconnect(true);return;}
+            lastTcpHostRequest=id;
+            if(!validTcpHostOpenRequest(request)){tcpReply(id,{error:{code:10022,message:"Invalid TCP Host request"}});return;}
+            const config=gatewayRoutes.tcpListeners.find(item=>item.id===request.listenerId);
+            if(!config){tcpReply(id,{error:{code:10013,message:"TCP listener is not configured"}});return;}
+            if(tcpPending.size>=16||tcpOwners.size>=32){tcpReply(id,{error:{code:10055,message:"TCP listener capacity"}});return;}
+            const previous=tcpBindings.get(request.localPort);
+            if(previous&&(request.bindingGeneration<previous.generation||
+                request.bindingGeneration===previous.generation&&previous.released)){
+                tcpReply(id,{error:{code:10057,message:"TCP binding retired"}});return;
+            }
+            if([...tcpPending.values(),...tcpActive.values()].some(v=>v.request.localPort===request.localPort&&v.request.bindingGeneration===request.bindingGeneration)){
+                tcpReply(id,{error:{code:10048,message:"TCP listener binding in use"}});return;
+            }
+            if(!previous||request.bindingGeneration>previous.generation){
+                retireTcp(request.localPort,request.bindingGeneration,false);
+                if(request.bindingGeneration>1)gateway.releasePort(PROTO_TCP,request.localPort,request.bindingGeneration-1);
+                tcpBindings.set(request.localPort,{generation:request.bindingGeneration,released:false});
+            }
+            const controller=new AbortController();
+            const copy={...request};
+            let entry:TcpPending;
+            let owner:TcpOwner;
+            const onFailure=(code:number)=>{
+                for(const [leaseId,active] of tcpActive)if(active.owner===owner){
+                    tcpActive.delete(leaseId);
+                    if(socket.connected){
+                        if(congested(socket,128)){socket.disconnect(true);return;}
+                        queue.frames++;queue.bytes+=128;
+                        socket.emit("tcpHostClosed",active.requestId,leaseId,{code,message:"TCP listener closed"});
+                    }
+                    closeTcpOwner(owner,false);
+                }
+            };
+            try {
+                const helper=gatewayRoutes.options.nativeTcpAcceptHelperPath;
+                owner=helper?new TcpAcceptHostOwner(gatewayRoutes.tcpHostRegistry,gatewayRoutes.tcpAcceptQuota,helper,
+                    gatewayRoutes.tcpHostRegistry.nextId(),(frame,generation)=>emitGateway(frame,true,generation),onFailure):
+                    new TcpHostOwner(gatewayRoutes.tcpHostRegistry,(frame,generation)=>emitGateway(frame,true,generation),onFailure,true);
+            } catch {
+                tcpReply(id,{error:{code:10055,message:"TCP listener identity exhausted"}});return;
+            }
+            entry={request:copy,controller,owner};
+            tcpPending.set(id,entry);tcpOwners.add(owner);
+            void owner.open(config,{localPort:copy.localPort,generation:copy.bindingGeneration},controller.signal).then(opened=>{
+                if(controller.signal.aborted||!socket.connected||tcpPending.get(id)!==entry){closeTcpOwner(owner,true);return;}
+                tcpPending.delete(id);
+                const current=tcpBindings.get(copy.localPort);
+                if(!current||current.released||current.generation!==copy.bindingGeneration){closeTcpOwner(owner,true);return;}
+                tcpActive.set(opened.leaseId,{requestId:id,request:copy,owner});
+                if(tcpReply(id,opened)) {
+                    try{owner.activate();}catch{tcpActive.delete(opened.leaseId);closeTcpOwner(owner,true);socket.disconnect(true);}
+                } else {tcpActive.delete(opened.leaseId);closeTcpOwner(owner,true);}
+            },error=>{
+                if(tcpPending.get(id)===entry)tcpPending.delete(id);
+                closeTcpOwner(owner,true);
+                if(!controller.signal.aborted)tcpReply(id,{error:{code:typeof error?.code==="number"?error.code:10050,message:"TCP Host listener refused"}});
+            });
+        });
+        socket.on("cancelTcpHost",id=>{
+            if(!withinLimits(16))return;
+            const p=tcpPending.get(id);
+            if(p){tcpPending.delete(id);p.controller.abort();closeTcpOwner(p.owner,true);}
+            for(const [leaseId,a] of tcpActive)if(a.requestId===id){tcpActive.delete(leaseId);closeTcpOwner(a.owner,false);}
+        });
+        socket.on("releaseTcpHost",leaseId=>{
+            if(!withinLimits(16))return;
+            const a=tcpActive.get(leaseId);if(!a)return;
+            tcpActive.delete(leaseId);closeTcpOwner(a.owner,false);
+        });
         const udpPending=new Map<number,{request:UdpPeerLeaseRequest;controller:AbortController}>();
         const udpLeases=new Map<number,{requestId:number;request:UdpPeerLeaseRequest;release:()=>void}>();
         let nextUdpLease=1,lastUdpRequest=0;
@@ -223,6 +325,9 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             if (!isProtocol(proto) || !validPort(port) || !validBindingGeneration(generation)) { socket.disconnect(true); return; }
             if (withinLimits(16)) {
                 if (proto === PROTO_UDP && generation >= (udpBindings.get(port)?.generation ?? 0)) udpBindings.set(port, {generation, released: true});
+                if(proto===PROTO_TCP && generation >= (tcpBindings.get(port)?.generation ?? 0)) {
+                    tcpBindings.set(port,{generation,released:true});retireTcp(port,generation,true);
+                }
                 retireUdpLeases(proto,port,generation,true);gateway.releasePort(proto, port, generation);
             }
         });
@@ -244,6 +349,21 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
                 // Observe tagged ordinary UDP without changing its established
                 // routing; a later multicast cannot regress this binding epoch.
                 if (datagram.proto === PROTO_UDP) admitUdp(datagram.srcPort, generation);
+                if(datagram.proto===PROTO_TCP && isExternalNode(datagram.node)){
+                    const binding=tcpBindings.get(datagram.srcPort);
+                    if(binding&&(generation===undefined||generation<binding.generation||
+                        generation===binding.generation&&binding.released))return;
+                    if(generation!==undefined && binding && generation>binding.generation){
+                        retireTcp(datagram.srcPort,generation,false);
+                        tcpBindings.set(datagram.srcPort,{generation,released:false});
+                    }
+                    let owned=false;
+                    for(const owner of tcpOwners) {
+                        if(owner.ownsBinding(datagram.srcPort,generation))owned=true;
+                        if(owner.handle(datagram))return;
+                    }
+                    if(owned)return;
+                }
                 if (gateway.handle(datagram)) return;
             }
             const broadcast = !multicast && isBroadcastNode(datagram.node);
@@ -270,6 +390,9 @@ export function createLanServer(options: LanServerOptions = {}): LanServer {
             else if (destination) deliver(destination);
         });
         socket.on("disconnect", () => {
+            for(const pending of tcpPending.values())pending.controller.abort();
+            tcpPending.clear();tcpActive.clear();
+            for(const owner of tcpOwners)closeTcpOwner(owner,true);
             for(const pending of udpPending.values())pending.controller.abort();
             for(const lease of udpLeases.values())lease.release();udpLeases.clear();
             gateway.close();

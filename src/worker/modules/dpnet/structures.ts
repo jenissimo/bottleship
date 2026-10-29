@@ -55,6 +55,30 @@ export function readInfo(guest: DirectPlayGuestMemory, ptr: number): { info: Pla
     const name = mask & 1 && namePtr ? guest.string(namePtr)! : "";
     return { mask, info: { name, nameNull: !namePtr, data: mask & 2 && size ? Array.from(Mem.readBytes(dataPtr, size)!) : [], flags: Mem.readUint32(ptr + 20)! } };
 }
+/** SetGroupInfo keeps DN_ValidGroupInfo HRESULTs and normalizes only selected fields. */
+export function readSetGroupInfo(guest: DirectPlayGuestMemory, ptr: number):
+    { hr: number; value: NonNullable<ReturnType<typeof readInfo>> | null } {
+    const fail = (hr: number) => ({ hr, value: null });
+    if (!guest.valid(ptr, 24)) return fail(DPN.INVALIDPOINTER);
+    if (Mem.readUint32(ptr) !== 24) return fail(DPN.INVALIDPARAM);
+    const mask = Mem.readUint32(ptr + 4)!, namePtr = Mem.readUint32(ptr + 8)!;
+    const dataPtr = Mem.readUint32(ptr + 12)!, size = Mem.readUint32(ptr + 16)!, flags = Mem.readUint32(ptr + 20)!;
+    if (mask & ~3) return fail(DPN.INVALIDFLAGS);
+    let name = "";
+    if (mask & 1) {
+        if (namePtr) {
+            const text = guest.string(namePtr);
+            if (text === null) return fail(DPN.INVALIDSTRING);
+            name = text;
+        }
+    } else if (namePtr) return fail(DPN.INVALIDSTRING);
+    if (mask & 2) {
+        if (size && (!dataPtr || !guest.valid(dataPtr, size))) return fail(DPN.INVALIDPOINTER);
+    } else if (dataPtr) return fail(DPN.INVALIDPARAM);
+    if (flags & ~1) return fail(DPN.INVALIDFLAGS);
+    return { hr: DPN.OK, value: { mask, info: { name, nameNull: !namePtr,
+        data: mask & 2 && size ? Array.from(Mem.readBytes(dataPtr, size)!) : [], flags } } };
+}
 export function packInfo(entity: Entity, flags: number, base = 0): Uint8Array {
     const name = entity.name.short || entity.name.shortNull === false ? utf16(entity.name.short + "\0") : new Uint8Array(), data = new Uint8Array(entity.data);
     const out = new StructBuffer(24, name.length + data.length, base);

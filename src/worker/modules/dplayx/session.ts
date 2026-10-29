@@ -31,6 +31,7 @@ export interface SessionDesc {
     password: string;
     nameNull?: boolean; passwordNull?: boolean;
     user: number[];
+    reserved?: [number, number];
     extended?: { flags: number; reserved: number[]; application: number[] };
 }
 export interface PlayerName { short: string; long: string; shortNull?: boolean; longNull?: boolean; }
@@ -43,7 +44,11 @@ export interface JoinPlayer { name: PlayerName; data: number[]; flags: number; }
 export interface JoinDecision { hr: number; data?: Uint8Array; context?: number; }
 export interface JoinRequest { address: Address; data: Uint8Array; player: JoinPlayer; }
 interface SessionState { desc: SessionDesc; entities: Entity[]; peers: Address[]; }
-export interface Discovery { desc: SessionDesc; currentPlayers: number; address: Address; seen: number; data?: Uint8Array; }
+export interface Discovery {
+    desc: SessionDesc; currentPlayers: number; address: Address; seen: number; data?: Uint8Array; native?: true;
+    nativeProvider?: {sockaddr: Uint8Array; version: number; peer: {family: number; node: Uint8Array; ip?: Uint8Array; port: number}};
+    nativeEpoch?: object;
+}
 export interface SystemMessage { completion?: import("./send-queue").SendCompletion; chat?: { from: number; to: number; group: number; flags: number; text: string }; type: number; entity?: Entity; group?: number; player?: number; oldOwner?: number; currentPlayers?: number; desc?: SessionDesc; }
 export interface Message { from: number; to: number; data: Uint8Array; flags?: number; system?: SystemMessage; }
 export interface Reply { hr: number; id?: number; data?: Uint8Array; }
@@ -106,6 +111,8 @@ class DiscoveryHub implements LanEndpoint {
 }
 const hubs = new WeakMap<LanNetwork, DiscoveryHub>();
 
+/** Owned initialization bytes; interpretation belongs to the selected provider. */
+export interface DirectPlayConnectionAddress { provider: string; bytes: Uint8Array; }
 export class DirectPlaySession implements LanEndpoint {
     initialized = false;
     lost = false;
@@ -134,11 +141,14 @@ export class DirectPlaySession implements LanEndpoint {
     private partials = new Map<string, PartialPacket>();
     private heartbeat?: ReturnType<typeof setInterval>;
     private discoveryTimer?: ReturnType<typeof setInterval>;
+    private nativeDiscovery?: AbortController;
+    private nativeCacheEpoch: object = {};
     private lastHostSeen = 0;
     private stopState: () => void;
     private stopPeer: () => void;
     private stopPort: () => void;
     private disposed = false;
+    private connectionAddress?: DirectPlayConnectionAddress;
     private losing = false;
     private lifecycle = 0;
     private queuedBytes = 0;
@@ -163,7 +173,7 @@ export class DirectPlaySession implements LanEndpoint {
         });
         this.stopState = network.onStateChange(state => {
             if (!state.connected && this.desc) this.lose();
-            if (!state.connected) this.discovered.clear();
+            if (!state.connected) { this.stopDiscovery(); this.invalidateNativeDiscovery(); this.discovered.clear(); }
         });
     }
     get isHost(): boolean { return this.hostMode; }
@@ -178,12 +188,17 @@ export class DirectPlaySession implements LanEndpoint {
     get currentPlayers(): number { return [...this.entities.values()].filter(e => !e.group).length; }
     get readyError(): number { return this.lost ? DP.SESSIONLOST : this.initialized ? DP.OK : DP.UNINITIALIZED; }
     get openError(): number { return this.readyError || (this.desc ? DP.OK : DP.NOSESSIONS); }
-    initialize(): number {
+    getConnectionAddress(): DirectPlayConnectionAddress | undefined {
+        const value = this.connectionAddress;
+        return value && {provider: value.provider, bytes: value.bytes.slice()};
+    }
+    initialize(address?: DirectPlayConnectionAddress): number {
         if (this.initialized) return DP.ALREADYINITIALIZED;
         if (this.disposed) return DP.UNAVAILABLE;
         if (!this.hub.bind()) return DP.UNAVAILABLE;
         this.port = this.network.bindEphemeral(this, PROTO_DIRECTPLAY);
         if (!this.port) return DP.UNAVAILABLE;
+        this.connectionAddress = address && {provider: address.provider, bytes: address.bytes.slice()};
         this.initialized = true;
         this.lost = false;
         return DP.OK;
@@ -210,7 +225,29 @@ export class DirectPlaySession implements LanEndpoint {
         this.discoveryTimer = setInterval(() => this.discover(application), interval);
         (this.discoveryTimer as unknown as { unref?: () => void }).unref?.();
     }
+    // Cache invalidation is a local safety policy for future native Join.
+    private invalidateNativeDiscovery(): void {
+        this.nativeCacheEpoch = {};
+        for (const [id, item] of this.discovered) if (item.native) this.discovered.delete(id);
+    }
+    /** A finished discovery retains its cache epoch; replacement and close invalidate it. */
+    isCurrentNativeDiscovery(item: Discovery): boolean {
+        return !this.disposed && item.native === true && item.nativeEpoch === this.nativeCacheEpoch
+            && this.discovered.get(item.desc.instance) === item;
+    }
+    /** One native operation per session; replacement invalidates the old owner. */
+    beginNativeDiscovery(): {signal: AbortSignal; epoch: object; current(): boolean; finish(): void} {
+        this.stopDiscovery();
+        this.invalidateNativeDiscovery();
+        const controller = new AbortController(), epoch = this.nativeCacheEpoch;
+        this.nativeDiscovery = controller;
+        return {signal: controller.signal, epoch,
+            current: () => !this.disposed && this.nativeCacheEpoch === epoch
+                && this.nativeDiscovery === controller && !controller.signal.aborted,
+            finish: () => { if (this.nativeDiscovery === controller) this.nativeDiscovery = undefined; }};
+    }
     stopDiscovery(): void {
+        const native = this.nativeDiscovery; this.nativeDiscovery = undefined; native?.abort();
         if (this.discoveryTimer) clearInterval(this.discoveryTimer);
         this.discoveryTimer = undefined;
     }
@@ -254,12 +291,14 @@ export class DirectPlaySession implements LanEndpoint {
         const lifecycle = ++this.lifecycle;
         const current = (): boolean => !this.disposed && this.lifecycle === lifecycle;
         let found = this.discovered.get(desc.instance);
+        if (found?.native) return DP.UNAVAILABLE;
         if (!found) {
             this.discover(desc.application);
             await new Promise(resolve => setTimeout(resolve, Math.min(300, this.timeout)));
             if (!current()) return DP.SESSIONLOST;
             found = this.discovered.get(desc.instance);
         }
+        if (found?.native) return DP.UNAVAILABLE;
         if (!found) return DP.NOSESSIONS;
         this.host = found.address;
         this.desc = clone(desc);
@@ -273,6 +312,7 @@ export class DirectPlaySession implements LanEndpoint {
     }
     close(): number {
         this.stopDiscovery();
+        this.invalidateNativeDiscovery();
         const previous = this.desc;
         if (previous && this.hostMode) this.broadcast({ op: previous.flags & 4 ? "migrate" : "lost" });
         else if (previous && this.host) this.transmit({ op: "leave", session: previous.instance }, EMPTY, this.host);
@@ -283,6 +323,8 @@ export class DirectPlaySession implements LanEndpoint {
     dispose(): void {
         this.close();
         this.disposed = true;
+        this.connectionAddress = undefined;
+        this.discovered.clear();
         this.stopState();
         this.stopPeer();
         this.stopPort();

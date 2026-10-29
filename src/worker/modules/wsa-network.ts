@@ -6,6 +6,7 @@
 import { lanNetwork, type LanNetwork, type LanEndpoint, type LanDatagram, ipv4ToNode, nodeToIpv4,
     IPX_NETNUM, IPX_MAX_PAYLOAD, UDP_MAX_PAYLOAD, UDP6_MAX_PAYLOAD } from "../net/lan-network";
 import { copyLocalUdpContext, type LocalUdpContext, type LocalUdpEndpoint } from "../net/local-udp-context";
+import type { TcpHostLease } from "../net/tcp-host-lease-rpc";
 import { ipChecksum, ipv4RawPacket, parseRawIp } from "./wsa-raw";
 import { PROTO_RAW4, PROTO_RAW6, RAW_MAX_PACKET, PROTO_IPX, PROTO_UDP, PROTO_TCP, PROTO_UDP6, PROTO_TCP6, TCP_OPTION, TCP_OPTION_KEEPALIVE, TCP_OPTION_NODELAY, SYN_INLINE_FLAG, SYN_KEEPALIVE_FLAG, SYN_NODELAY_FLAG, SYN_WINDOW_MASK, TCP_MAGIC, TCP_HEADER, TCP_SEGMENT, SYN, SYNACK, DATA, FIN, RST, CREDIT, OOB, encodeTcpFrame } from "../net/netplay-wire";
 
@@ -20,6 +21,10 @@ export const WSA = {
 } as const;
 export class WsaFailure extends Error {
     constructor(readonly code: number) { super(`Winsock error ${code}`); }
+}
+/** The actor may have created a socket without returning its identity. */
+export class WsaOwnedSocketOutcomeUnknown extends WsaFailure {
+    constructor(code: number) { super(code); }
 }
 function fail(code: number): never { throw new WsaFailure(code); }
 const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((v, i) => v === b[i]);
@@ -108,6 +113,11 @@ export class WsaSocketTable {
     // can cover an AF4 owner and an AF23 dual owner; only the last ref unbinds it.
     private readonly bindingRefs = new WeakMap<SocketState, Set<Binding>>();
     private readonly connectionWire = new WeakMap<SocketState, number>();
+    private readonly nativeListeners = new Map<SocketState, {
+        token: number; controller: AbortController; state: "opening" | "ready" | "failed"; error: number; lease?: TcpHostLease;
+        waiters: Set<number>; committed: boolean;
+    }>();
+    private nextNativeListenerToken = 1;
     private listeners = new Set<() => void>();
     private epoch = 0;
     private ipIdentification = 0;
@@ -213,6 +223,7 @@ export class WsaSocketTable {
     }
 
     reset(): void {
+        for (const s of this.nativeListeners.keys()) this.retireNativeListener(s);
         for (const s of this.sockets.values()) if (s.connectTimer) clearTimeout(s.connectTimer);
         for (const b of this.bindings.values()) this.network.unbind(b.port, b.endpoint, b.proto);
         this.bindings.clear();
@@ -332,6 +343,16 @@ export class WsaSocketTable {
         });
         this.wireSockets.set(wireId, this.get(id));
         return id;
+    }
+    /** Identity is captured in the same synchronous operation as socket creation. */
+    socketOwned(type = 1, af = 2, protocol = 0): {handle:number; object:number} {
+        const handle=this.socket(type,af,protocol);
+        return {handle,object:handle};
+    }
+    /** Identity is captured in the same synchronous operation as accept. */
+    acceptOwned(listener:number): {handle:number; object:number} {
+        const handle=this.accept(listener);
+        return {handle,object:handle};
     }
     private baseProto(s: SocketState): number { return s.type === 3 ? (s.af === 23 ? PROTO_RAW6 : PROTO_RAW4) : s.af === 6 ? PROTO_IPX : s.af === 23 ? (s.type === 1 ? PROTO_TCP6 : PROTO_UDP6) : s.type === 1 ? PROTO_TCP : PROTO_UDP; }
     private proto(s: SocketState): number { return this.connectionWire.get(s) ?? this.baseProto(s); }
@@ -466,6 +487,7 @@ export class WsaSocketTable {
             this.frame(s, (s.lingerEnabled && !s.lingerSeconds) || s.available || s.state === "connecting" ? RST : FIN);
         }
         for (const child of [...s.pending]) if (this.isValid(child)) this.closesocket(child);
+        this.retireNativeListener(s);
         this.detach(s);
         this.multicastMembershipCount -= this.multicastMemberships.get(sid)?.size ?? 0;
         this.multicastMemberships.delete(sid);
@@ -473,14 +495,102 @@ export class WsaSocketTable {
         this.changed();
         return 0;
     }
-    listen(sid: number, backlog = 5): number {
+    listen(sid: number, backlog = 5, allowNativeOpen = true, operation = 0): number {
         const s = this.get(sid);
         if (s.type !== 1) fail(WSA.EOPNOTSUPP);
         if (s.state === "connected" || s.state === "connecting") fail(WSA.EISCONN);
         this.autoBind(s);
+        const policy = this.network.winsock;
+        let owner = this.nativeListeners.get(s);
+        // An in-flight native owner retains its original mode across policy
+        // changes; a waiting caller must never turn into virtual success.
+        if ((policy || owner) && s.af !== 6) {
+            if (s.af !== 2) fail(WSA.EAFNOSUPPORT);
+            if (!owner) {
+                if (!policy) fail(WSA.ENETDOWN);
+                if (!allowNativeOpen) fail(WSA.EINTR);
+                if (!Number.isSafeInteger(this.nextNativeListenerToken)) fail(WSA.ENOBUFS);
+                const controller = new AbortController();
+                owner = {token: this.nextNativeListenerToken++, controller, state: "opening", error: 0, waiters: new Set(), committed: false};
+                this.nativeListeners.set(s, owner);
+                const original = owner, generation = this.epoch, port = this.boundPort(s);
+                void this.network.openTcpHost(port, policy.hostListener, controller.signal).then(lease => {
+                    if (this.epoch !== generation || this.nativeListeners.get(s) !== original || controller.signal.aborted) {
+                        lease.release(); return;
+                    }
+                    original.lease = lease; original.state = "ready";
+                    s.state = "listening"; s.backlog = Math.min(128, Math.max(1, backlog | 0));
+                    void lease.closed.then(error => {
+                        if (this.nativeListeners.get(s) !== original) return;
+                        original.lease = undefined; original.state = "failed"; original.error = error.code;
+                        if (!original.waiters.size) this.nativeListeners.delete(s);
+                        s.error = error.code; s.state = "failed"; this.changed();
+                    });
+                    this.changed();
+                }, error => {
+                    if (this.nativeListeners.get(s) !== original) return;
+                    const code = (error as {code?: unknown})?.code;
+                    original.error = typeof code === "number" && Number.isInteger(code) && code >= 10000 && code <= 12000 ? code :
+                        code === "ACCESS_DENIED" ? WSA.EACCES : code === "NO_DATA" ? WSA.EINVAL :
+                        code === "CANCELLED" ? WSA.EINTR : WSA.ENETDOWN;
+                    original.state = "failed"; this.changed();
+                });
+            }
+            if (owner.state === "opening") {
+                if (!allowNativeOpen) fail(WSA.EINTR);
+                if (!owner.waiters.has(operation) && owner.waiters.size >= 128) fail(WSA.ENOBUFS);
+                owner.waiters.add(operation);
+                fail(WSA.EWOULDBLOCK);
+            }
+            if (owner.state === "ready" && !owner.lease?.isLive()) {
+                owner.state = "failed"; owner.error = WSA.ENETDOWN;
+                s.state = "failed"; s.error = owner.error;
+            }
+            if (owner.state === "failed") {
+                owner.waiters.delete(operation);
+                if (!owner.waiters.size) this.retireNativeListener(s);
+                fail(owner.error);
+            }
+            owner.waiters.delete(operation);
+            owner.committed = true;
+        }
         s.state = "listening";
         s.backlog = Math.min(128, Math.max(1, backlog | 0));
         return 0;
+    }
+    /** Serializable READY snapshot; ownerToken changes on every listener incarnation. */
+    nativeListenerSnapshot(sid: number): {address: {node: number[]; port: number}; ownerToken: number} | undefined {
+        const owner = this.nativeListeners.get(this.get(sid)), lease = owner?.lease;
+        if (!owner?.committed || owner.state !== "ready" || !lease || !lease.isLive()) return undefined;
+        return {address: {node: lease.address.node.slice(), port: lease.address.port}, ownerToken: owner.token};
+    }
+    nativeListenerCurrent(sid: number, token: number): boolean {
+        if (!Number.isSafeInteger(token) || token <= 0 || !this.isValid(sid)) return false;
+        const owner = this.nativeListeners.get(this.get(sid));
+        return !!owner && owner.token === token && owner.committed && owner.state === "ready" && !!owner.lease?.isLive();
+    }
+    private retireNativeListener(s: SocketState): void {
+        const owner = this.nativeListeners.get(s);
+        if (!owner) return;
+        this.nativeListeners.delete(s);
+        owner.controller.abort();
+        owner.lease?.release();
+    }
+    cancelListen(sid: number, operation = 0): void {
+        const s = this.get(sid), owner = this.nativeListeners.get(s);
+        if (!owner || !owner.waiters.delete(operation)) return;
+        if (!owner.committed && !owner.waiters.size) {
+            // A SYN may have arrived after READY but before any listen caller
+            // observed success. Retire the listener-owned backlog first; sockets
+            // already returned by accept are independent and keep their binding.
+            const pending = s.pending.splice(0);
+            this.nativeListeners.delete(s);
+            if (s.state === "listening") s.state = "new";
+            for (const child of pending) if (this.isValid(child)) this.closesocket(child);
+            owner.controller.abort();
+            owner.lease?.release();
+        }
+        this.changed();
     }
     acceptError(sid: number): number {
         if (!this.isValid(sid)) return WSA.ENOTSOCK;

@@ -4,6 +4,6 @@ pub mod gateway;
 pub mod routes;
 mod server;
 pub mod wire;
-pub use server::{Command, Core, CoreError, Effect, GatewayEvent, GatewayInput};
+pub use server::{Command, Core, CoreError, Effect, GatewayEvent, GatewayInput, TcpChildKey, TcpOfferKey};
 pub use wire::{Arg, InboundEvent, ServerEvent};
 pub type ConnId = u64;

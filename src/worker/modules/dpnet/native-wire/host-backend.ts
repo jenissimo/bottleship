@@ -1,11 +1,12 @@
 import type { LanNetwork } from "../../../net/lan-network";
 import { isAddressNode } from "../../../net/netplay-wire";
-import type { Address, Reply, SessionDesc } from "../../dplayx/session";
+import type { Address, Entity, Reply, SessionDesc } from "../../dplayx/session";
 import type { DirectPlay8Backend, DirectPlay8HostProvider, DirectPlay8HostReady } from "../backend";
 import { DPN } from "../constants";
-import { NativeDirectPlayHost, type NativeHostDecision, type NativeHostJoin } from "./host";
+import { NativeDirectPlayHost, type NativeHostDecision, type NativeHostJoin, type NativeHostRole } from "./host";
 import { NativeDirectPlayPort } from "./port";
 import { NativeLocalDelivery } from "./local-delivery";
+import type { GroupState, MemberHook } from "./group-memberships";
 const clone = (a: Address): Address => ({ node: a.node.slice(), port: a.port });
 const key = (a: Address) => a.node.join(".") + ":" + a.port;
 interface RemoteProcessing {
@@ -19,8 +20,14 @@ export class NativeHostBackend implements DirectPlay8Backend {
     readonly localDelivery = new NativeLocalDelivery();
     onChange?: () => void;
     onMessage?: (id: number) => void;
-    onInfo?: (id: number, returned: (result?: number) => void) => void;
+    onInfo?: (id: number, returned: (result?: number) => void, notify?: boolean) => void;
+    onPlayerCreated?: (id: number, returned: (result?: number) => void) => void;
+    onPlayerDestroyReason?: (id: number, reason: number) => void;
+    onGroupCreated?: (id: number, returned: (result?: number) => void, context?: number) => void;
+    onGroupDestroyed?: (id: number, returned: (result?: number) => void) => void;
+    onGroupMember?: MemberHook;
     onTermination?: (data: Uint8Array, reason?: number) => void;
+    onLocalTermination?: (reason: number) => void;
     lost = false;
     private port?: NativeDirectPlayPort;
     private ready?: DirectPlay8HostReady;
@@ -32,7 +39,7 @@ export class NativeHostBackend implements DirectPlay8Backend {
     // Local bounded request ownership, not a measured Windows capacity limit.
     private remoteProcessing = new Map<number, RemoteProcessing>();
     private nextProcessingHandle = 1; // Never reset/reuse a handle across Host generations.
-    constructor(readonly network: LanNetwork, readonly timeout = 25000, readonly retryInterval = 200) {
+    constructor(readonly network: LanNetwork, readonly timeout = 25000, readonly retryInterval = 200, readonly role: NativeHostRole = "peer") {
         this.host = new NativeDirectPlayHost(network);
         this.host.onMessage = id => this.onMessage?.(id);
         this.host.onProcessingComplete = (id, handle) => {
@@ -40,10 +47,28 @@ export class NativeHostBackend implements DirectPlay8Backend {
             if (request && request.recipient === id && request.generation === this.generation && !this.closing && !this.lost)
                 this.completeRemoteProcessing(handle, DPN.OK);
         };
-        this.host.onInfo = (id, returned) => { if (this.onInfo) this.onInfo(id, returned); else { this.onChange?.(); returned(); } };
+        this.host.onInfo = (id, returned, notify = true) => { if (this.onInfo) this.onInfo(id, returned, notify); else { if (notify) this.onChange?.(); returned(); } };
+        this.host.onPlayerDestroyReason = (id, reason) => this.onPlayerDestroyReason?.(id, reason);
+        this.host.onPlayerCreated = (id, returned) => {
+            if (this.onPlayerCreated) this.onPlayerCreated(id, returned);
+            else { this.onChange?.(); returned(); }
+        };
+        this.host.onGroupCreated = (id, returned, context) => {
+            if (this.onGroupCreated) this.onGroupCreated(id, returned, context);
+            else { this.onChange?.(); returned(); }
+        };
+        this.host.onGroupDestroyed = (id, returned) => {
+            if (this.onGroupDestroyed) this.onGroupDestroyed(id, returned);
+            else returned();
+        };
+        this.host.onGroupMember = (group, player, add, returned) => {
+            if (this.onGroupMember) this.onGroupMember(group, player, add, returned);
+            else { this.onChange?.(); returned(); }
+        };
         this.host.onChange = () => {
             if (!this.host.desc) {
                 if (this.ready && !this.closing) { this.lost = true; this.localDelivery.cancel(DPN.CONNECTIONLOST); }
+                if (this.closing) this.localDelivery.cancel(DPN.CONNECTIONLOST);
                 this.cancelRemoteProcessing(DPN.CONNECTIONLOST);
                 this.releaseReady();
             } else {
@@ -54,6 +79,8 @@ export class NativeHostBackend implements DirectPlay8Backend {
         };
     }
     get entities() { return this.host.entities; }
+    queryGroup(id: number): Entity | undefined { return this.host.queryGroup(id); }
+    groupState(id: number): GroupState { return this.host.groupState(id); }
     get queue() { return this.host.queue; }
     get desc() { return this.host.desc; }
     get localId(): number { return this.host.localId; }
@@ -101,7 +128,8 @@ export class NativeHostBackend implements DirectPlay8Backend {
         if (this.disposed) return DPN.INVALIDOBJECT;
         if (this.pending) return DPN.CONNECTING;
         if (this.desc) return DPN.HOSTING;
-        if (desc.extended?.flags ?? 0) return DPN.UNSUPPORTED;
+        if ((this.role === "server") !== !!((desc.extended?.flags ?? 0) & 1)) return DPN.INVALIDPARAM;
+        if ((desc.extended?.flags ?? 0) & ~1) return DPN.UNSUPPORTED;
         if (!Number.isInteger(desc.maxPlayers) || desc.maxPlayers < 0 || desc.maxPlayers > 0xffffffff) return DPN.INVALIDPARAM;
         this.closing = false; this.lost = false;
         const generation = ++this.generation, controller = new AbortController(); this.pending = controller;
@@ -144,7 +172,7 @@ export class NativeHostBackend implements DirectPlay8Backend {
                 const bytes = crypto.getRandomValues(new Uint8Array(16)); bytes[7] = (bytes[7] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
                 instance = Array.from(bytes, n => n.toString(16).padStart(2, "0")).join("");
             }
-            const result = this.host.start({ port, application: { instance, application: desc.application,
+            const result = this.host.start({ port, role: this.role, application: { instance, application: desc.application,
                 flags: desc.extended?.flags ?? 0, maxPlayers: desc.maxPlayers, players: 1, name: desc.nameNull ? null : desc.name,
                 password: desc.passwordNull || !desc.password ? null : desc.password,
                 reserved: Uint8Array.from(desc.extended?.reserved ?? []), applicationData: Uint8Array.from(desc.extended?.application ?? []) },
@@ -193,15 +221,54 @@ export class NativeHostBackend implements DirectPlay8Backend {
         return results.find(result => result !== DPN.OK) ?? await local;
     }
     send(_from: number, _to: number, _flags: number, _data: Uint8Array): number { return DPN.UNSUPPORTED; }
-    mutate(change: Record<string, unknown> & { op: string }): Reply {
+    mutate(change: Record<string, unknown> & { op: string }): Reply | Promise<Reply> {
+        if (change.action === "create" && change.group) {
+            const completed = typeof change.completed === "function" ? change.completed as (reply: Reply) => void : undefined;
+            const refuse = (hr: number): Reply => { const reply = { hr }; completed?.(reply); return reply; };
+            const name = change.name as { short?: string; shortNull?: boolean } | undefined, data = change.data;
+            const flags = Number(change.flags), context = change.context === undefined ? 0 : Number(change.context);
+            if (name && typeof name.short !== "string" || !Array.isArray(data) ||
+                data.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return refuse(DPN.INVALIDPARAM);
+            return this.host.createGroup(flags, name?.shortNull ? null : name?.short ?? null, Uint8Array.from(data),
+                this.localId, 0, context, completed);
+        }
+        if (change.action === "destroy" && change.group) {
+            const completed = typeof change.completed === "function" ? change.completed as (reply: Reply) => void : undefined;
+            return this.host.destroyGroup(Number(change.id), this.localId, 0, completed);
+        }
+        if (change.action === "member") {
+            const completed = typeof change.completed === "function" ? change.completed as (reply: Reply) => void : undefined;
+            if (typeof change.add !== "boolean") { const reply = { hr: DPN.INVALIDPARAM }; completed?.(reply); return reply; }
+            return this.host.member(Number(change.id), Number(change.member), change.add, this.localId, 0, completed);
+        }
         if (change.action !== "info") return { hr: DPN.UNSUPPORTED };
         const named = change.name as { short?: string; shortNull?: boolean } | undefined, data = change.data as number[] | undefined;
         if (named && typeof named.short !== "string" || data && (!Array.isArray(data) || data.some(n => !Number.isInteger(n) || n < 0 || n > 255))) return { hr: DPN.INVALIDPARAM };
         return { hr: this.host.setInfo(Number(change.id) >>> 0, (named ? 1 : 0) | (data ? 2 : 0),
             named?.shortNull ? null : named?.short ?? null, Uint8Array.from(data ?? [])) };
     }
-    kick(_id: number, _data: Uint8Array): number { return DPN.UNSUPPORTED; }
+    kick(id: number, data: Uint8Array): number { return this.host.kick(id, data); }
     terminate(_data: Uint8Array, _reason?: number): number { return DPN.UNSUPPORTED; }
+    beginNativeTermination(data: Uint8Array): number | { current(): boolean; returned(): number; cancel(): void } {
+        if (this.closing) return DPN.ALREADYCLOSING;
+        if (this.openError) return this.openError;
+        const generation = this.generation, ready = this.ready, port = this.port;
+        const owner = this.host.beginNativeTermination(data, () => {
+            if (generation !== this.generation || this.closing || this.ready !== ready || this.port !== port) throw Error("Retired Host termination");
+            this.closing = true;
+            try { this.onLocalTermination?.(DPN.HOSTTERMINATEDSESSION); }
+            catch (error) {
+                if (generation === this.generation && this.ready === ready && this.port === port) this.closing = false;
+                throw error;
+            }
+            if (generation !== this.generation || this.ready !== ready || this.port !== port || !this.closing) throw Error("Retired Host termination");
+            this.ready = undefined; this.port = undefined; this.advertised = undefined;
+            return () => { port?.close(); try { ready?.release(); } catch { /* Release the captured provider once. */ } };
+        });
+        if (typeof owner === "number") return owner;
+        const current = () => generation === this.generation && !this.closing && owner.current();
+        return { current, returned: () => current() ? owner.returned() : DPN.USERCANCEL, cancel: () => owner.cancel() };
+    }
     async shutdown(): Promise<number> {
         this.closing = true; this.pending?.abort(); this.localDelivery.cancel(DPN.USERCANCEL);
         this.cancelRemoteProcessing(DPN.USERCANCEL);

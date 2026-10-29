@@ -1,21 +1,25 @@
 /** Host socket objects outlive individual guest descriptors and issuing processes. */
 import { WsaSocketTable, WsaFailure, WSA, type WsaIoPurpose } from "./wsa-network";
 import type { WsaActorIdentity, WsaActorNotification } from "./wsa-actor-protocol";
+import type { UdpHostLease } from "../net/udp-host-lease-rpc";
 type State = ReturnType<WsaSocketTable["get"]>;
 type Cache = Partial<State>;
-interface Alias { id: number; physical: number; owner: Context; cache: Cache; imported: boolean; handleFlags: number; }
+interface Alias { id: number; physical: number; owner: Context; cache: Cache; imported: boolean; handleFlags: number; listenOperations: Map<number, number>; }
 interface NativeIo extends Alias { purpose: WsaIoPurpose; }
-interface Context extends WsaActorIdentity { aliases: Map<number, Alias>; nativeIo: Map<number, NativeIo>; notify?: (message: WsaActorNotification) => void; }
+interface UdpHostOperation { alias: Alias; controller: AbortController; port: number; binding: number; generation: number; listener: string; state: "opening"|"ready"|"failed"; lease?: UdpHostLease; }
+interface Context extends WsaActorIdentity { aliases: Map<number, Alias>; nativeIo: Map<number, NativeIo>; udpHosts: Map<number,UdpHostOperation>; notify?: (message: WsaActorNotification) => void; }
 const cached = new Set<keyof State>(["overlapped","broadcast","reuse","receiveLimit","sendLimit","receiveTimeout","sendTimeout","oobInline","lingerEnabled","lingerSeconds","connectContextPending"]);
 const mutable = new Set<keyof State>([...cached,"packetType","filterPacketType","extendedAddress","receiveHeader","receiveBroadcast","headerInclude","ipTtl","ipTos","ipOptionsChanged","error","pendingError","originalLocal","acceptListener","acceptListenerObjectId","connectExCompleted"]);
 const omitted = new Set(["notify","connectTimer","packets","chunks","oobPending"]);
-const operations = new Set(["bind","listen","acceptError","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setNonBlocking","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","setV6Only","getMulticastOption","setMulticastOption","changeMulticastMembership","readable","writable","exceptional","atMark","bytesAvailable","enumEvents","maxMessageSize","isConnected","disconnect","deferAccepted","rejectAccepted","adoptAccepted"]);
+const operations = new Set(["bind","listen","cancelListen","acceptError","nativeListenerSnapshot","nativeListenerCurrent","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setNonBlocking","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","setV6Only","getMulticastOption","setMulticastOption","changeMulticastMembership","readable","writable","exceptional","atMark","bytesAvailable","enumEvents","maxMessageSize","isConnected","disconnect","deferAccepted","rejectAccepted","adoptAccepted"]);
 function fail(error: number): never { throw new WsaFailure(error); }
 export class WsaActorKernel {
     private processes = new Map<number, Context>();
     private references = new Map<number, Set<Alias>>();
     private nextHandle = 0x10000000;
     private nextNativeIo = 1;
+    private nextListenOperation = 1;
+    private nextUdpHostOperation = 1;
     private ended = new Set<string>();
     private identityKey(identity:WsaActorIdentity):string{return identity.pid+":"+identity.slot+":"+identity.epoch;}
     private selected = new Map<number, Alias>();
@@ -27,7 +31,7 @@ export class WsaActorKernel {
         if(this.ended.has(this.identityKey(identity))) fail(WSA.EACCES);
         const old = this.processes.get(identity.pid);
         if (old) { if (old.slot !== identity.slot || old.epoch !== identity.epoch) fail(WSA.EACCES); return; }
-        this.processes.set(identity.pid, { ...identity, aliases: new Map(), nativeIo: new Map() });
+        this.processes.set(identity.pid, { ...identity, aliases: new Map(), nativeIo: new Map(), udpHosts: new Map() });
     }
     reconcile(live: WsaActorIdentity[]): void {
         for (const context of [...this.processes.values()]) if (!live.some(item => item.pid === context.pid && item.slot === context.slot && item.epoch === context.epoch)) this.drop(context);
@@ -46,6 +50,7 @@ export class WsaActorKernel {
         if (!context || context.slot !== identity.slot || context.epoch !== identity.epoch) return;
         this.processes.delete(identity.pid); this.ended.add(this.identityKey(identity)); context.notify = undefined;
         context.nativeIo.clear();
+        for (const id of [...context.udpHosts.keys()]) this.retireUdpHost(context,id);
         for (const alias of [...context.aliases.values()]) this.release(alias, abortive);
     }
     private alias(context: Context, id: number): Alias {
@@ -57,12 +62,20 @@ export class WsaActorKernel {
         if (context.aliases.size >= 4096 || this.nextHandle > 0x7fffffff) fail(WSA.ENOBUFS);
         const id = this.nextHandle++, state = this.table.get(physical), values: Cache = {};
         for (const key of cached) (values as any)[key] = cache && Object.hasOwn(cache, key) ? cache[key] : state[key];
-        const alias: Alias = { id, physical, owner: context, cache: values, imported, handleFlags: 1 };
+        const alias: Alias = { id, physical, owner: context, cache: values, imported, handleFlags: 1, listenOperations: new Map() };
         context.aliases.set(id, alias);
         let refs = this.references.get(physical); if (!refs) this.references.set(physical, refs = new Set());
         refs.add(alias); return id;
     }
+    private retireUdpHost(context: Context,id:number): void {
+        const op=context.udpHosts.get(id); if(!op)return;
+        context.udpHosts.delete(id);op.controller.abort();op.lease?.release();
+    }
     private release(alias: Alias, abortive = false): void {
+        for (const [id,op] of alias.owner.udpHosts) if(op.alias===alias)this.retireUdpHost(alias.owner,id);
+        if (this.table.isValid(alias.physical)) for (const operation of alias.listenOperations.values())
+            this.table.cancelListen(alias.physical, operation);
+        alias.listenOperations.clear();
         alias.owner.aliases.delete(alias.id);
         const refs = this.references.get(alias.physical); refs?.delete(alias);
         if (this.selected.get(alias.physical) === alias) { this.selected.delete(alias.physical); if (this.table.isValid(alias.physical)) this.table.configureEvents(alias.physical, 0); }
@@ -82,6 +95,51 @@ export class WsaActorKernel {
     execute(identity: WsaActorIdentity, command: string, args: unknown[], nativeHandleOnly = false): unknown {
         const context = this.context(identity);
         if (nativeHandleOnly && !["get", "isValid", "send", "receive", "readable", "writable", "closesocket", "setHandleFlags", "fileObjectId", "hasFileObject", "acquireNativeIo", "nativeIo", "releaseNativeIo"].includes(command)) fail(WSA.EINVAL);
+        if (command === "startUdpHost") {
+            const alias=this.alias(context,args[0] as number), listener=args[1];
+            const state=this.table.get(alias.physical),port=state.local?.port;
+            if(state.type!==2||state.af!==2||!port||typeof listener!=="string"||!/^[A-Za-z0-9_-]{1,64}$/.test(listener))fail(WSA.EINVAL);
+            if(context.udpHosts.size>=128||this.nextUdpHostOperation>0xffffffff)fail(WSA.ENOBUFS);
+            const binding=this.table.network.bindingGeneration(port,1);if(!binding)fail(WSA.EINVAL);
+            const id=this.nextUdpHostOperation++,controller=new AbortController();
+            const op:UdpHostOperation={alias,controller,port,binding,generation:this.table.generation,listener,state:"opening"};
+            context.udpHosts.set(id,op);
+            const current=()=>this.processes.get(context.pid)===context&&context.udpHosts.get(id)===op&&
+                context.aliases.get(alias.id)===alias&&this.table.generation===op.generation&&this.table.isValid(alias.physical)&&
+                this.table.network.bindingGeneration(port,1)===binding&&!controller.signal.aborted;
+            let pending:Promise<UdpHostLease>;
+            try {pending=this.table.network.openUdpHost(port,listener,controller.signal);}
+            catch(error){this.retireUdpHost(context,id);throw error;}
+            void pending.then(lease=>{
+                let live=false;try{live=lease.isLive();}catch{}
+                if(!live||!current()){
+                    try{lease.release();}catch{}
+                    if(current()){op.state="failed";context.notify?.({type:"changed"});}return;
+                }
+                op.lease=lease;op.state="ready";
+                void lease.closed.then(()=>{if(current()){op.state="failed";context.notify?.({type:"changed"});}});
+                context.notify?.({type:"changed"});
+            },()=>{if(current()){op.state="failed";context.notify?.({type:"changed"});}});
+            return id;
+        }
+        if (command === "inspectUdpHost") {
+            const id=args[0] as number,op=context.udpHosts.get(id);
+            if(!op||context.aliases.get(op.alias.id)!==op.alias||this.table.generation!==op.generation||
+                !this.table.isValid(op.alias.physical)||this.table.network.bindingGeneration(op.port,1)!==op.binding)fail(WSA.ENOTSOCK);
+            if(op.state==="failed")fail(WSA.ENETDOWN);
+            if(op.state==="opening")return null;
+            const lease=op.lease;if(!lease)fail(WSA.ENETDOWN);
+            const policy=this.table.network.udpHostPolicySnapshot();
+            const capability=policy.capability?.listeners.find(item=>item.id===op.listener);
+            if(!policy.connected||!capability||capability.allowedNodes.length!==lease.allowedNodes.length||
+                !lease.allowedNodes.every(node=>capability.allowedNodes.some(other=>other.every((v,i)=>v===node[i])))||
+                !lease.isLive()||!this.table.network.udpHostPolicyEpochCurrent(policy.epoch)||
+                context.udpHosts.get(id)!==op||context.aliases.get(op.alias.id)!==op.alias||
+                this.table.generation!==op.generation||!this.table.isValid(op.alias.physical)||
+                this.table.network.bindingGeneration(op.port,1)!==op.binding)fail(WSA.ENETDOWN);
+            return {address:lease.address,allowedNodes:lease.allowedNodes,port:op.port,binding:op.binding,physical:op.alias.physical};
+        }
+        if (command === "retireUdpHost") {this.retireUdpHost(context,args[0] as number);return null;}
         if (command === "fileObjectId") return this.alias(context, args[0] as number).physical;
         if (command === "hasFileObject") return this.table.isValid(args[0] as number) && [...context.aliases.values()].some(alias => alias.physical === args[0]);
         if (command === "acquireNativeIo") {
@@ -145,13 +203,26 @@ export class WsaActorKernel {
             try { return (this.table[operation as keyof WsaSocketTable] as (...values: any[]) => unknown).apply(this.table, forwarded); }
             finally { if (this.table.isValid(lease.physical)) { state.broadcast = broadcast; state.reuse = reuse; } }
         }
-        if (command === "socket") {
+        if (command === "socket" || command === "socketOwned") {
             const physical = this.table.socket(args[0] as number, args[1] as number, args[2] as number);
-            try { return this.reserve(context, physical); } catch (error) { this.table.closesocket(physical); throw error; }
+            try {
+                const handle=this.reserve(context, physical);
+                return command==="socketOwned" ? {handle,object:physical} : handle;
+            } catch (error) { this.table.closesocket(physical); throw error; }
         }
         if (command === "reset") { for (const alias of [...context.aliases.values()]) if(alias.imported)this.release(alias); return null; }
         if (command === "isValid") { const alias = context.aliases.get((args[0] as number) >>> 0); return !!alias && this.table.isValid(alias.physical); }
         if (command === "accept") return this.accept(identity, args[0] as number);
+        if (command === "acceptOwned") {
+            const parent=this.alias(context,args[0] as number), physical=this.table.accept(parent.physical);
+            parent.imported=true;
+            // This operation always owns a fresh alias, even when another alias
+            // already references the physical child, so rollback is exact.
+            try {
+                const handle=this.reserve(context,physical,parent.cache);
+                return {handle,object:physical};
+            } catch(error) {this.table.deferAccepted(parent.physical,physical);throw error;}
+        }
         const alias = this.alias(context, args[0] as number), state = this.table.get(alias.physical);
         // A Winsock lookup can attach the duplicated OS handle before an explicit WSASocket import.
         if (!nativeHandleOnly) alias.imported = true;
@@ -189,7 +260,26 @@ export class WsaActorKernel {
             }); return null;
         }
         if (!operations.has(command)) fail(WSA.EINVAL);
+        const listenOperation = command === "listen" ? (args[3] === undefined ? -alias.id : args[3]) : undefined;
+        if (command === "listen" && (!Number.isInteger(listenOperation) ||
+            (args[3] !== undefined && ((listenOperation as number) < 1 || (listenOperation as number) > 0xffffffff)))) fail(WSA.EINVAL);
         const actual = args.slice(); actual[0] = alias.physical;
+        if (command === "listen") {
+            let physicalOperation = alias.listenOperations.get(listenOperation as number);
+            if (physicalOperation === undefined) {
+                if (this.nextListenOperation > 0xffffffff) fail(WSA.ENOBUFS);
+                physicalOperation = this.nextListenOperation++;
+                alias.listenOperations.set(listenOperation as number, physicalOperation);
+            }
+            actual[3] = physicalOperation;
+        }
+        if (command === "cancelListen") {
+            const operation = args[1] === undefined ? -alias.id : args[1] as number;
+            const physicalOperation = alias.listenOperations.get(operation);
+            if (physicalOperation === undefined) return null;
+            alias.listenOperations.delete(operation);
+            actual[1] = physicalOperation;
+        }
         if (["deferAccepted","adoptAccepted"].includes(command)) actual[1] = this.alias(context, args[1] as number).physical;
         // These checks use the caller's provider context; the queue/window/OOB mode stay shared.
         const broadcast = state.broadcast, reuse = state.reuse;
@@ -206,8 +296,15 @@ export class WsaActorKernel {
                 return result;
             }
             const result = (this.table[command as keyof WsaSocketTable] as (...args: any[]) => unknown).apply(this.table, actual);
+            if (command === "listen") alias.listenOperations.delete(listenOperation as number);
             if (command === "setOobInline") alias.cache.oobInline = !!args[1];
             return result;
+        } catch (error) {
+            if (command === "listen") {
+                if (!(error instanceof WsaFailure && error.code === WSA.EWOULDBLOCK))
+                    alias.listenOperations.delete(listenOperation as number);
+            }
+            throw error;
         } finally {
             if (this.table.isValid(alias.physical)) { const current = this.table.get(alias.physical); current.broadcast = broadcast; current.reuse = reuse; }
             for (const [physical, refs] of this.references) if (!this.table.isValid(physical)) {

@@ -75,6 +75,29 @@ Select the native DirectPlay8 Host provider explicitly in the emulator configura
 
 The policy is absent by default; the existing virtual room provider remains separate. Native Host requires the advertised udpHostListenV1 capability and a successful listener READY. Unsupported native modes return an error. The currently measured native Host scope is DirectPlay8 Peer Host plus one remote participant (maxPlayers=2); the option does not establish arbitrary mesh, classic DirectPlay or complete DirectPlay8 parity.
 
+### Native TCP listeners
+
+The optional `gateway.tcpListeners` array authorizes incoming IPv4 TCP separately from outgoing routes. Each listener has a unique `id`, numeric `bindHost`, unicast `advertisedHost`, `port` (zero selects an OS port), and a nonempty `allowedHosts` source-IP list. `maxOwners` defaults to 1, `maxPending` to 64, and `startupTimeoutMs` to 10000. `maxPending` must not exceed `gateway.maxTcpConnections`. The limits and address validation are described by the server configuration.
+
+For example, add this inside `gateway`:
+
+```json
+{
+  "tcpListeners": [{
+    "id": "game-tcp",
+    "bindHost": "127.0.0.1",
+    "advertisedHost": "127.0.0.1",
+    "port": 0,
+    "allowedHosts": ["127.0.0.1"],
+    "maxPending": 8
+  }]
+}
+```
+
+Select the listener in the emulator's network configuration with `"winsock": {"provider": "native", "hostListener": "game-tcp"}`. The server advertises `tcpHostListenV1` only when TCP listeners are configured; an actual listener still requires a successful bind and READY. Its source ACL, participant, binding generation and lease govern incoming connections. The source ACL controls connecting native IP addresses; any participant admitted to the server can request a configured listener ID, subject to its owner limit. Closing the listener leaves already accepted connections alive.
+
+The Rust accepted-socket path supports ordinary TCP streams. Native urgent/OOB data and `SO_OOBINLINE` on accepted sockets are not yet fully supported, even when a native outbound helper is configured. Configuring a listener does not imply complete Winsock or DirectPlay compatibility.
+
 Set logConnections:true for bounded structured connection-close diagnostics. It is disabled by default.
 
 ## Virtual IPv4 UDP multicast

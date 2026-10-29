@@ -10,7 +10,9 @@ use crate::{
 };
 mod host;
 mod multicast4;
+mod tcp_host;
 use host::HostState;
+use tcp_host::TcpHostState;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,9 +23,34 @@ impl std::fmt::Display for CoreError {
     }
 }
 impl std::error::Error for CoreError {}
+/// Identity of a native accepted TCP flow, scoped to its original participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TcpChildKey {
+    pub lease_id: u64,
+    pub binding: BindingToken,
+    pub node: Node,
+    pub remote_port: u16,
+    pub native_id: u32,
+    pub guest_id: u32,
+}
+/// One native SYN offer, scoped to its original participant and listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TcpOfferKey {
+    pub lease_id: u64,
+    pub binding: BindingToken,
+    pub node: Node,
+    pub remote_port: u16,
+    pub native_id: u32,
+}
 /// The native adapter consumes these in effect order for each exact ConnId.
 #[derive(Debug, Clone)]
 pub enum GatewayInput {
+    CancelTcpOffer { key: TcpOfferKey },
+    TcpChildFrame { key: TcpChildKey, datagram: Datagram },
+    CloseTcpChild { key: TcpChildKey },
+    OpenTcpListener { operation_id: u64, binding: BindingToken, config: crate::config::TcpListenerConfig },
+    CloseTcpListener { lease_id: u64 },
+    TcpListenerFrame { lease_id: u64, binding: BindingToken, datagram: Datagram },
     OpenUdpHost {
         operation: u64,
         binding: BindingToken,
@@ -64,6 +91,14 @@ pub enum GatewayInput {
 }
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
+    TcpOfferClosed { key: TcpOfferKey },
+    TcpChildEstablished { key: TcpChildKey },
+    TcpChildClosed { key: TcpChildKey },
+    TcpChildFrame { key: TcpChildKey, datagram: Datagram },
+    TcpListenerReady { operation_id: u64, lease_id: u64, binding: BindingToken, address: std::net::SocketAddrV4 },
+    TcpListenerFailed { operation_id: u64, code: u32 },
+    TcpListenerClosed { lease_id: u64, code: u32 },
+    TcpListenerFrame { lease_id: u64, binding: BindingToken, datagram: Datagram },
     HostSocketError {
         lease_id: u64,
         binding: BindingToken,
@@ -206,6 +241,7 @@ struct Participant {
     active: HashMap<u32, Active>,
     resolving: HashMap<u32, PendingResolve>,
     host: HostState,
+    tcp_host: TcpHostState,
 }
 pub struct Core {
     pub limits: Limits,
@@ -328,6 +364,15 @@ impl Core {
         if !self.routes.config.udp_listeners.is_empty() {
             ready["udpHostListenV1"] = json!({"listeners":self.routes.config.udp_listeners.iter().map(|l|json!({"id":l.id,"allowedNodes":l.allowed_nodes()})).collect::<Vec<_>>()});
         }
+        if !self.routes.config.tcp_listeners.is_empty() {
+            ready["tcpHostListenV1"] = json!({"listeners":self.routes.config.tcp_listeners.iter().map(|l| {
+                let nodes: Vec<Node> = l.allowed_hosts.iter().map(|host| {
+                    let b = host.parse::<std::net::Ipv4Addr>().expect("validated TCP listener ACL").octets();
+                    [2, 1, b[0], b[1], b[2], b[3]]
+                }).collect();
+                json!({"id": l.id, "allowedNodes": nodes})
+            }).collect::<Vec<_>>()});
+        }
         self.participants.insert(
             connection,
             Participant {
@@ -343,6 +388,7 @@ impl Core {
                 active: HashMap::new(),
                 resolving: HashMap::new(),
                 host: HostState::default(),
+                tcp_host: TcpHostState::default(),
             },
         );
         effects.push(emit(
@@ -370,6 +416,7 @@ impl Core {
      Err(DecodeError::Fatal(_))=>self.disconnect(connection,now_ms,"Invalid LAN event",&mut effects),
      Err(DecodeError::Lease{id})=>{if self.lease_admission(connection,id,now_ms,&mut effects){effects.push(lease_reply(connection,id,10022))}},
      Err(DecodeError::Host{id})=>self.host_malformed(connection,id,now_ms,&mut effects),
+     Err(DecodeError::TcpHost{id})=>self.tcp_host_malformed(connection,id,now_ms,&mut effects),
      Err(DecodeError::Resolve{id})=>effects.push(emit(connection,json_event("resolved",vec![json!(id),json!({"error":ResolveError::new(ResolveCode::NoRecovery,"Invalid DNS request")})]),true,None)),
      Err(DecodeError::Ignore)=>{}
     }
@@ -476,6 +523,9 @@ impl Core {
                 datagram,
                 generation,
             } => self.multicast4_input(connection, datagram, generation, now_ms, effects),
+            InboundEvent::OpenTcpHost { id, request } => self.tcp_host_open(connection,id,request,now_ms,effects),
+            InboundEvent::CancelTcpHost { id } => self.tcp_host_cancel(connection,id,now_ms,effects),
+            InboundEvent::ReleaseTcpHost { id } => self.tcp_host_release(connection,id,now_ms,effects),
             InboundEvent::OpenUdpHost { id, request } => {
                 self.host_open(connection, id, request, now_ms, effects)
             }
@@ -525,6 +575,12 @@ impl Core {
                             false,
                             effects,
                         );
+                    }
+                    if let Some(g) = generation {
+                        self.tcp_host_retire_binding(connection, datagram.proto, datagram.src_port, g, false, effects);
+                    }
+                    if self.tcp_host_outbound(connection, binding, &datagram, effects) {
+                        return;
                     }
                     if self.host_outbound(connection, binding, &datagram, effects) {
                         return;
@@ -611,6 +667,7 @@ impl Core {
                 }
                 if p.bindings.release(proto, port, generation) {
                     self.retire_udp(connection, proto, port, generation, true, effects);
+                    self.tcp_host_retire_binding(connection, proto, port, generation, true, effects);
                     effects.push(Effect::NativeOperation {
                         connection,
                         input: GatewayInput::ReleasePort {
@@ -886,6 +943,18 @@ impl Core {
         effects: &mut Vec<Effect>,
     ) {
         match event {
+            GatewayEvent::TcpOfferClosed { key } => self.tcp_offer_closed(connection,key),
+            GatewayEvent::TcpChildEstablished { key } => self.tcp_child_established(connection,key,effects),
+            GatewayEvent::TcpChildClosed { key } => self.tcp_child_closed(connection,key),
+            GatewayEvent::TcpChildFrame { key, datagram } => self.tcp_child_inbound(connection,key,datagram,effects),
+            GatewayEvent::TcpListenerReady { operation_id, lease_id, binding, address } =>
+                self.tcp_host_ready(connection,operation_id,lease_id,binding,address,effects),
+            GatewayEvent::TcpListenerFailed { operation_id, code } =>
+                self.tcp_host_failed(connection,operation_id,code,effects),
+            GatewayEvent::TcpListenerClosed { lease_id, code } =>
+                self.tcp_host_closed(connection,lease_id,code,effects),
+            GatewayEvent::TcpListenerFrame { lease_id, binding, datagram } =>
+                self.tcp_host_inbound(connection,lease_id,binding,datagram,effects),
             GatewayEvent::HostSocketError {
                 lease_id,
                 binding,
@@ -924,6 +993,7 @@ impl Core {
                     .get(&connection)
                     .is_none_or(|p| !p.bindings.is_live(binding))
                     || self.host_binding_owned(connection, binding)
+                    || self.tcp_host_owned(connection, binding)
                     || datagram.proto != binding.proto
                     || datagram.dst_port != binding.local_port
                 {
@@ -948,7 +1018,7 @@ impl Core {
                 code,
                 wire_id,
             } => {
-                if !self.host_binding_owned(connection, binding) {
+                if !self.host_binding_owned(connection, binding) && !self.tcp_host_owned(connection, binding) {
                     self.socket_error(
                         connection,
                         binding,
@@ -1141,6 +1211,9 @@ impl Core {
                 connection,
                 operation: pending.operation,
             });
+        }
+        for operation in p.tcp_host.pending_operations() {
+            effects.push(Effect::NativeOperation { connection, input: GatewayInput::CancelOperation { operation } });
         }
         for operation in p.host.pending_operations() {
             effects.push(Effect::NativeOperation {

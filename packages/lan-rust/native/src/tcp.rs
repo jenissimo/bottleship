@@ -178,6 +178,45 @@ impl NativeTcp {
                 "inline urgent data requires the native helper",
             ));
         }
+        let (handle, events, common, input, cancelling) = Self::parts(&options);
+        if let Some(path) = options.helper.as_deref() {
+            helper::spawn(path, endpoint, &options, common, input, cancelling)?;
+        } else {
+            tokio::spawn(start_plain(
+                endpoint,
+                options.clone(),
+                common,
+                input,
+                cancelling,
+            ));
+        }
+        Ok((handle, events))
+    }
+
+    /// Adopt an already accepted Tokio stream using the ordinary TCP actor.
+    /// The optional helper cannot adopt an existing socket; urgent inline mode
+    /// therefore remains unavailable on this path.
+    pub fn from_accepted(
+        stream: TcpStream,
+        options: TcpOptions,
+    ) -> Result<(Self, TcpEvents), NativeError> {
+        if options.timeout.is_zero() {
+            return Err(NativeError::new(10022, "invalid native TCP timeout"));
+        }
+        if options.helper.is_some() || options.inline {
+            return Err(NativeError::new(10045, "accepted TCP helper/inline unsupported"));
+        }
+        stream.peer_addr().map_err(|error| NativeError::io(error, "accepted TCP stream is not connected"))?;
+        stream.set_nodelay(options.no_delay)
+            .and_then(|_| socket2::SockRef::from(&stream).set_keepalive(options.keep_alive))
+            .map_err(|error| NativeError::io(error, "native TCP socket options failed"))?;
+        let (handle, events, common, input, cancelling) = Self::parts(&options);
+        common.status.send_modify(|status| status.connected = true);
+        tokio::spawn(plain(Arc::new(stream), common, input, cancelling));
+        Ok((handle, events))
+    }
+
+    fn parts(options: &TcpOptions) -> (Self, TcpEvents, Arc<Common>, mpsc::Receiver<Command>, watch::Receiver<bool>) {
         let (commands, input) = mpsc::channel(321);
         let (cancel, cancelling) = watch::channel(false);
         let (state, status) = watch::channel(TcpStatus {
@@ -209,18 +248,7 @@ impl NativeTcp {
                 startup_timeout: options.timeout,
             }),
         };
-        if let Some(path) = options.helper.as_deref() {
-            helper::spawn(path, endpoint, &options, common, input, cancelling)?;
-        } else {
-            tokio::spawn(start_plain(
-                endpoint,
-                options.clone(),
-                common,
-                input,
-                cancelling,
-            ));
-        }
-        Ok((handle, TcpEvents { reads: events }))
+        (handle, TcpEvents { reads: events }, common, input, cancelling)
     }
     pub async fn connect(
         endpoint: SocketAddr,

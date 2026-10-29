@@ -8,7 +8,9 @@ export {
 } from "./netplay-wire";
 import { copyUdpHostCapability, copyUdpHostReady, type UdpHostListenCapability, type UdpHostOpenRequest, type UdpHostReady } from "./netplay-wire";
 import type { UdpHostLease } from "./udp-host-lease-rpc";
-import type { DirectPlay8NetworkPolicy } from "../../network-config";
+import { copyTcpHostCapability, copyTcpHostReady, type TcpHostListenCapability, type TcpHostOpenRequest } from "./netplay-wire";
+import type { TcpHostLease } from "./tcp-host-lease-rpc";
+import type { DirectPlay8NetworkPolicy, WinsockNetworkPolicy } from "../../network-config";
 import { copyLocalUdpContext, type LocalUdpContext } from "./local-udp-context";
 export type { LocalUdpContext, LocalUdpEndpoint } from "./local-udp-context";
 import { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
@@ -33,6 +35,7 @@ export interface NetTransport {
     resolve?(request: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>;
     leaseUdpPeer?(request: import("./netplay-wire").UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{ release(): void }>;
     openUdpHost?(request: UdpHostOpenRequest, signal?: AbortSignal): Promise<UdpHostLease>;
+    openTcpHost?(request: TcpHostOpenRequest, signal?: AbortSignal): Promise<TcpHostLease>;
     close(): void;
 }
 export interface LanPortRegistry {
@@ -53,6 +56,8 @@ export interface LanState {
     udpHostListenV1?: UdpHostListenCapability;
     udpMulticast4V1?: true;
     directPlay8?: DirectPlay8NetworkPolicy;
+    winsock?: WinsockNetworkPolicy;
+    tcpHostListenV1?: TcpHostListenCapability;
 }
 const EPHEMERAL = [[0x4000, 0x7fff], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [49152, 65535], [1, 256], [1, 256]];
 function randomNode(): Uint8Array {
@@ -78,14 +83,40 @@ export class LanNetwork {
     private generation = 0;
     private nextSocketId = 1;
     private hostCapability?: UdpHostListenCapability;
+    private udpHostPolicyEpoch: object = {};
+    private tcpHostCapability?: TcpHostListenCapability;
+    private winsockPolicy?: WinsockNetworkPolicy;
+    private tcpHostPolicyEpoch: object = {};
+    configureWinsock(policy?: WinsockNetworkPolicy): void { this.winsockPolicy = policy && {...policy}; this.tcpHostPolicyEpoch = {}; }
+    get winsock(): WinsockNetworkPolicy | undefined { this.synchronizeState(); return this.winsockPolicy && {...this.winsockPolicy}; }
+    configureTcpHosts(capability?: TcpHostListenCapability): void { this.tcpHostCapability = capability && copyTcpHostCapability(capability); this.tcpHostPolicyEpoch = {}; }
+    get tcpHostListenV1(): TcpHostListenCapability | undefined { this.synchronizeState(); return this.tcpHostCapability && copyTcpHostCapability(this.tcpHostCapability); }
+    /** One coherent policy snapshot after all potentially reentrant transport calls. */
+    tcpHostPolicySnapshot(): {connected: boolean; epoch: object; winsock?: WinsockNetworkPolicy; capability?: TcpHostListenCapability} {
+        this.synchronizeState();
+        const connected = this.transport?.connectionState?.() ?? this.online;
+        return {connected, epoch: this.tcpHostPolicyEpoch, winsock: this.winsockPolicy && {...this.winsockPolicy},
+            capability: this.tcpHostCapability && copyTcpHostCapability(this.tcpHostCapability)};
+    }
+    /** No synchronization or callbacks: used only after a coherent policy snapshot. */
+    get tcpHostPolicyCurrentEpoch(): object { return this.tcpHostPolicyEpoch; }
     private multicast4Capability = false;
     configureMulticast4(supported = false): void { this.multicast4Capability = supported; }
     get udpMulticast4V1(): true | undefined { this.synchronizeState(); return (this.transport?.supportsMulticast4?.() ?? this.multicast4Capability) ? true : undefined; }
     private dp8Policy?: DirectPlay8NetworkPolicy;
     get directPlay8(): DirectPlay8NetworkPolicy | undefined { this.synchronizeState(); return this.dp8Policy && {...this.dp8Policy}; }
     configureDirectPlay8(policy?: DirectPlay8NetworkPolicy): void { this.dp8Policy = policy && {...policy}; }
-    configureUdpHosts(capability?: UdpHostListenCapability): void { this.hostCapability = capability && copyUdpHostCapability(capability); }
+    configureUdpHosts(capability?: UdpHostListenCapability): void { this.hostCapability = capability && copyUdpHostCapability(capability); this.udpHostPolicyEpoch = {}; }
     get udpHostListenV1(): UdpHostListenCapability | undefined { this.synchronizeState(); return this.hostCapability && copyUdpHostCapability(this.hostCapability); }
+    /** Snapshot after the last potentially reentrant transport operation. */
+    udpHostPolicySnapshot(): {connected:boolean; epoch:object; capability?:UdpHostListenCapability} {
+        this.synchronizeState();
+        const connected=this.transport?.connectionState?.() ?? this.online;
+        return {connected,epoch:this.udpHostPolicyEpoch,
+            capability:this.hostCapability && copyUdpHostCapability(this.hostCapability)};
+    }
+    /** Callback-free comparison after the actor has checked physical ownership. */
+    udpHostPolicyEpochCurrent(epoch:object):boolean { return this.udpHostPolicyEpoch===epoch; }
     private readonly pendingUdpLeases = new Set<{ localPort: number; proto: number; abort(): void }>();
     private readonly activeUdpLeases = new Set<{ localPort: number; proto: number; release(): void }>();
     private nextBindingGeneration=1;
@@ -211,6 +242,35 @@ export class LanNetwork {
             isLive: () => this.connected && !ended && this.generation === epoch && this.bindingGeneration(localPort, 1) === originalBinding && lease.isLive(),
             release: () => { ended = true; lease.release(); }};
     }
+    /** Acquire a policy-authorized physical TCP listener for the exact binding. */
+    async openTcpHost(localPort: number, listenerId: string, signal?: AbortSignal): Promise<TcpHostLease> {
+        this.synchronizeState();
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(listenerId) || !validPort(localPort) || !this.bindingGeneration(localPort, 2))
+            throw new NetResolveError("NO_DATA");
+        if (!this.tcpHostCapability?.listeners.some(listener => listener.id === listenerId))
+            throw new NetResolveError("ACCESS_DENIED", "Native TCP Host listener unavailable");
+        const epoch = this.generation, originalBinding = this.bindingGeneration(localPort, 2);
+        const lease = await this.withUdpBinding(localPort, 2, signal, async (transport, binding, signal) => {
+            if (!transport.openTcpHost) throw new NetResolveError("ACCESS_DENIED", "Native TCP Host listeners unavailable");
+            const lease = await transport.openTcpHost({proto: 2, localPort, bindingGeneration: binding, listenerId}, signal);
+            try {
+                if (!lease.isLive()) throw new NetResolveError("CANCELLED");
+                const ready = copyTcpHostReady(lease);
+                this.synchronizeState();
+                const advertised = this.tcpHostCapability?.listeners.find(listener => listener.id === listenerId);
+                if (!advertised || advertised.allowedNodes.length !== ready.allowedNodes.length ||
+                    !ready.allowedNodes.every(node => advertised.allowedNodes.some(other => other.every((v, i) => v === node[i]))))
+                    throw new NetResolveError("NO_RECOVERY", "TCP Host ingress ACL changed");
+                return {...ready, closed: lease.closed, isLive: () => lease.isLive(), release: () => lease.release()};
+            } catch (error) { lease.release(); throw error; }
+        });
+        this.registerGatewayAddresses([lease.address.node.slice(2), ...lease.allowedNodes.map(node => node.slice(2))]);
+        let ended = false;
+        void lease.closed.then(() => { ended = true; lease.release(); });
+        return {...lease,
+            isLive: () => this.connected && !ended && this.generation === epoch && this.bindingGeneration(localPort, 2) === originalBinding && lease.isLive(),
+            release: () => { ended = true; lease.release(); }};
+    }
     private async withUdpBinding<M extends {release(): void}>(localPort: number, proto: number, signal: AbortSignal | undefined,
         open: (transport: NetTransport, binding: number, signal: AbortSignal) => Promise<M>): Promise<M> {
         const binding = this.bindingGeneration(localPort, proto);
@@ -264,11 +324,12 @@ export class LanNetwork {
     }
     setConnected(connected: boolean, reason?: string, force = false): void {
         if (!force && this.online === connected) return;
+        this.udpHostPolicyEpoch = {}; this.tcpHostPolicyEpoch = {};
         this.online = connected;
-        if (!connected || force) { this.retireUdpLeases(); if (!connected) { this.hostCapability = undefined; this.multicast4Capability = false; } }
+        if (!connected || force) { this.retireUdpLeases(); if (!connected) { this.hostCapability = undefined; this.tcpHostCapability = undefined; this.multicast4Capability = false; } }
         const state: LanState = { connected, node: this.node.slice(), ipv4: this.ipv4, generation: ++this.generation, reason,
             gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()],
-            udpHostListenV1: this.udpHostListenV1, udpMulticast4V1: this.udpMulticast4V1, directPlay8: this.directPlay8 };
+            udpHostListenV1: this.udpHostListenV1, tcpHostListenV1: this.tcpHostListenV1, udpMulticast4V1: this.udpMulticast4V1, directPlay8: this.directPlay8, winsock: this.winsock };
         for (const listener of this.listeners) listener(state);
     }
     onStateChange(listener: (state: LanState) => void): () => void {

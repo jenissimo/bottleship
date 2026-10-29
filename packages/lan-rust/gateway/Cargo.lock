@@ -18,6 +18,7 @@ dependencies = [
  "bottleship-lan-core",
  "bottleship-lan-native",
  "bytes",
+ "serde_json",
  "socket2",
  "tokio",
 ]

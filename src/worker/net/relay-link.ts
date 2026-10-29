@@ -3,6 +3,8 @@ import type { ClientEvents, ServerEvents, LanReady } from "./netplay-wire";
 import { PROTOCOL_VERSION, WIRE_DGRAM_MULTICAST4, PROTO_DIRECTPLAY, isTcpProtocol, asBytes, decodeDatagram, isLanNode, nodeToIpv4 } from "./netplay-wire";
 import { LanNetwork, type NetTransport } from "./lan-network";
 import { UdpHostLeaseRpc, type UdpHostLease } from "./udp-host-lease-rpc";
+import { TcpHostLeaseRpc, type TcpHostLease } from "./tcp-host-lease-rpc";
+import { copyTcpHostCapability, validTcpHostOpenRequest, type TcpHostOpenRequest } from "./netplay-wire";
 import { copyUdpHostCapability, validUdpHostOpenRequest, type UdpHostOpenRequest } from "./netplay-wire";
 import { UdpPeerLeaseRpc } from "./udp-peer-lease-rpc";
 import type { UdpPeerLeaseRequest } from "./netplay-wire";
@@ -19,7 +21,7 @@ export class RelayLink implements NetTransport {
     private online = false;
     private closed = false;
     private settled = false;
-    private readonly reliableQueue:({kind:"frame";frame:Uint8Array<ArrayBuffer>;generation?:number}|{kind:"release";port:number;proto:number;generation:number}|{kind:"leaseRequest";id:number;request:UdpPeerLeaseRequest}|{kind:"leaseCancel";id:number}|{kind:"leaseRelease";id:number}|{kind:"hostRequest";id:number;request:UdpHostOpenRequest}|{kind:"hostCancel";id:number}|{kind:"hostRelease";id:number})[] = [];
+    private readonly reliableQueue:({kind:"frame";frame:Uint8Array<ArrayBuffer>;generation?:number}|{kind:"release";port:number;proto:number;generation:number}|{kind:"leaseRequest";id:number;request:UdpPeerLeaseRequest}|{kind:"leaseCancel";id:number}|{kind:"leaseRelease";id:number}|{kind:"hostRequest";id:number;request:UdpHostOpenRequest}|{kind:"hostCancel";id:number}|{kind:"hostRelease";id:number}|{kind:"tcpHostRequest";id:number;request:TcpHostOpenRequest}|{kind:"tcpHostCancel";id:number}|{kind:"tcpHostRelease";id:number})[] = [];
     private queuedBytes = 0;
     private flushing = false;
     private readonly udpPeers = new UdpPeerLeaseRpc({
@@ -34,10 +36,22 @@ export class RelayLink implements NetTransport {
         cancel: id => { this.enqueue({kind:"hostCancel",id},16); },
         release: id => { this.enqueue({kind:"hostRelease",id},16); },
     });
+    // Capability is published only by a server that explicitly enables this path.
+    private readonly tcpHosts = new TcpHostLeaseRpc({
+        connected: () => this.online && !this.closed && this.socket.connected,
+        request: (id, request) => this.reliableQueue.length < 128 && this.enqueue({kind:"tcpHostRequest",id,request},128),
+        cancel: id => { this.enqueue({kind:"tcpHostCancel",id},16); },
+        release: id => { this.enqueue({kind:"tcpHostRelease",id},16); },
+    });
     openUdpHost(request: UdpHostOpenRequest, signal?: AbortSignal): Promise<UdpHostLease> {
         if (!validUdpHostOpenRequest(request) || !this.net.udpHostListenV1?.listeners.some(info => info.id === request.listenerId))
             return Promise.reject(Object.assign(new Error("UDP Host listener unavailable"), {code:10045}));
         return this.udpHosts.open(request, signal);
+    }
+    openTcpHost(request: TcpHostOpenRequest, signal?: AbortSignal): Promise<TcpHostLease> {
+        if (!validTcpHostOpenRequest(request) || !this.net.tcpHostListenV1?.listeners.some(info => info.id === request.listenerId))
+            return Promise.reject(Object.assign(new Error("TCP Host listener unavailable"), {code:10045}));
+        return this.tcpHosts.open(request, signal);
     }
     leaseUdpPeer(request: UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{release(): void}> {
         return this.udpPeers.open(request, signal);
@@ -79,6 +93,8 @@ export class RelayLink implements NetTransport {
         this.socket.on("udpPeerLeased", (id, reply) => { if (this.online && !this.closed) this.udpPeers.accept(id, reply); });
         this.socket.on("udpHostOpened", (id, reply) => { if (this.online && !this.closed) this.udpHosts.accept(id, reply); });
         this.socket.on("udpHostClosed", (id, lease, error) => { if (this.online && !this.closed) this.udpHosts.acceptClosed(id, lease, error); });
+        this.socket.on("tcpHostOpened", (id, reply) => { if (this.online && !this.closed) this.tcpHosts.accept(id, reply); });
+        this.socket.on("tcpHostClosed", (id, lease, error) => { if (this.online && !this.closed) this.tcpHosts.acceptClosed(id, lease, error); });
         this.socket.on("frame", (input,generation) => {
             if (!this.online || this.closed) return;
             const bytes = asBytes(input);
@@ -108,7 +124,7 @@ export class RelayLink implements NetTransport {
             this.online = false;
             this.clearQueue();
             this.cancelResolves();
-            this.udpPeers.disconnect(); this.udpHosts.disconnect();
+            this.udpPeers.disconnect(); this.udpHosts.disconnect(); this.tcpHosts.disconnect();
             this.socket.sendBuffer.length = 0;
             this.net.setConnected(false, reason);
 
@@ -126,16 +142,16 @@ export class RelayLink implements NetTransport {
         try { this.socket.disconnect(); } finally { engine?.transport?.close(); }
     }
     private enqueue(item:(typeof this.reliableQueue)[number],bytes:number):boolean{
-        const cleanup = item.kind === "leaseCancel" || item.kind === "leaseRelease" || item.kind === "hostCancel" || item.kind === "hostRelease";
+        const cleanup = item.kind === "leaseCancel" || item.kind === "leaseRelease" || item.kind === "hostCancel" || item.kind === "hostRelease" || item.kind === "tcpHostCancel" || item.kind === "tcpHostRelease";
         // Every admitted permission retains room for its cancellation/release,
         // including when TCP traffic shares this connection's ordered queue.
-        const reserved = cleanup ? 0 : this.udpPeers.controlReservations + this.udpHosts.controlReservations;
+        const reserved = cleanup ? 0 : this.udpPeers.controlReservations + this.udpHosts.controlReservations + this.tcpHosts.controlReservations;
         if(this.reliableQueue.length>=256||this.queuedBytes+bytes>1024*1024){this.abortTransport();return false;}
         if(this.reliableQueue.length+1+reserved>256||this.queuedBytes+bytes+reserved*16>1024*1024)return false;
         this.reliableQueue.push(item);this.queuedBytes+=bytes;this.flush();return true;
     }
     releasePort(port:number,proto:number,generation:number):void{
-        this.udpPeers.retire(port, proto, generation); this.udpHosts.retire(port, proto, generation);
+        this.udpPeers.retire(port, proto, generation); this.udpHosts.retire(port, proto, generation); this.tcpHosts.retire(port, proto, generation);
         if(this.closed||!this.online||!this.socket.connected||!generation)return;
         if (!this.enqueue({kind:"release",port,proto,generation},16)) this.abortTransport();
     }
@@ -215,7 +231,10 @@ export class RelayLink implements NetTransport {
                 else if(item.kind==="leaseRelease"){this.queuedBytes-=16;this.socket.emit("releaseUdpPeer",item.id);}
                 else if(item.kind==="hostRequest"){this.queuedBytes-=128;this.socket.emit("openUdpHost",item.id,item.request);}
                 else if(item.kind==="hostCancel"){this.queuedBytes-=16;this.socket.emit("cancelUdpHost",item.id);}
-                else{this.queuedBytes-=16;this.socket.emit("releaseUdpHost",item.id);}
+                else if(item.kind==="hostRelease"){this.queuedBytes-=16;this.socket.emit("releaseUdpHost",item.id);}
+                else if(item.kind==="tcpHostRequest"){this.queuedBytes-=128;this.socket.emit("openTcpHost",item.id,item.request);}
+                else if(item.kind==="tcpHostCancel"){this.queuedBytes-=16;this.socket.emit("cancelTcpHost",item.id);}
+                else{this.queuedBytes-=16;this.socket.emit("releaseTcpHost",item.id);}
             }
         } finally { this.flushing = false; }
     }
@@ -229,7 +248,7 @@ export class RelayLink implements NetTransport {
         this.online = false;
         this.clearQueue();
         this.cancelResolves();
-        this.udpPeers.disconnect(); this.udpHosts.disconnect();
+        this.udpPeers.disconnect(); this.udpHosts.disconnect(); this.tcpHosts.disconnect();
         clearTimeout(this.deadline);
         this.socket.removeAllListeners();
         this.socket.sendBuffer.length = 0;
@@ -258,6 +277,8 @@ export class RelayLink implements NetTransport {
             else this.close();
             return;
         }
+        try { this.net.configureTcpHosts(info.tcpHostListenV1 === undefined ? undefined : copyTcpHostCapability(info.tcpHostListenV1)); }
+        catch { if (!this.settled) this.failInitial(new Error("Invalid TCP Host capability")); else this.close(); return; }
         try { this.net.configureUdpHosts(info.udpHostListenV1 === undefined ? undefined : copyUdpHostCapability(info.udpHostListenV1)); }
         catch { if (!this.settled) this.failInitial(new Error("Invalid UDP Host capability")); else this.close(); return; }
         this.net.configureMulticast4(info.udpMulticast4V1 === true);

@@ -17,6 +17,8 @@ export class DirectPlay8Callbacks {
     private waiting: DirectPlayCallbackTask[] = [];
     private waitingBytes = 0;
     private inlineReservation?: DirectPlayCallbackReservation;
+    private inlineMessages?: readonly number[];
+    private inlineKey?: object;
     private retry?: ReturnType<typeof setTimeout>;
     private closed = false;
     private closing = false;
@@ -26,12 +28,14 @@ export class DirectPlay8Callbacks {
     private reservedReceiveCount = 0;
     private reservedReceiveBytes = 0;
     private nativeAdmissions = new Set<{ cancel(): void }>();
+    private nativeTerminations = new Set<object>();
     private nativeAdmissionBytes = 0;
     private guest: DirectPlayGuestMemory;
     constructor(readonly process: Process, readonly session: DirectPlay8Session, readonly addresses: DirectPlayAddressApi,
         readonly routine: number, readonly userContext: number) {
         this.queue = DirectPlayCallbackExecutor.forProcess(process).channel();
         this.guest = new DirectPlayGuestMemory(process);
+        session.onCancelNativeTermination = this.cancelNativeTerminations;
         this.queue.onSpace = () => { this.promote(); if (!this.closed) { this.onSpace?.(); this.session.resumeCallbacks(); } };
     }
     get pending(): number { return this.queue.size + this.waiting.length; }
@@ -39,14 +43,20 @@ export class DirectPlay8Callbacks {
         if (this.closed || this.waiting.length) return;
         return this.queue.executor.reserve(this.queue, count, storageBytes);
     }
-    usingNative<T>(reservation: DirectPlayCallbackReservation, run: () => T): T {
-        const previous = this.inlineReservation; this.inlineReservation = reservation;
-        try { return run(); } finally { this.inlineReservation = previous; }
+    usingNative<T>(reservation: DirectPlayCallbackReservation, run: () => T, messages?: readonly number[]): T {
+        const previous = this.inlineReservation, priorMessages = this.inlineMessages;
+        this.inlineReservation = reservation; this.inlineMessages = messages;
+        try { return run(); } finally { this.inlineReservation = previous; this.inlineMessages = priorMessages; }
     }
-    native(type: number, size: number, fill: (ptr: number) => void = () => {}, onReturn?: (hr: number, ptr: number) => boolean | void, onDiscard?: () => void, key?: object, reservation = this.inlineReservation): boolean {
+    /** Select only callbacks released by this synchronous owner continuation. */
+    usingNativeKey<T>(key: object, run: () => T): T {
+        const previous = this.inlineKey; this.inlineKey = key;
+        try { return run(); } finally { this.inlineKey = previous; }
+    }
+    native(type: number, size: number, fill: (ptr: number) => void = () => {}, onReturn?: (hr: number, ptr: number) => boolean | void, onDiscard?: () => void, key?: object, reservation = this.inlineMessages && !this.inlineMessages.includes(type) ? undefined : this.inlineReservation): boolean {
         if (this.closed) return false;
         const task: DirectPlayCallbackTask = {
-            storageBytes: size + 64, message: type, key,
+            storageBytes: size + 64, message: type, key: key ?? reservation ?? this.inlineKey,
             prepare: () => {
                 const ptr = size ? this.process.memory.alloc(size) : 0;
                 if (size && !ptr) { onDiscard?.(); throw new Error("DirectPlay callback allocation failed"); }
@@ -81,8 +91,12 @@ export class DirectPlay8Callbacks {
         }, 4);
         (this.retry as unknown as { unref?(): void }).unref?.();
     }
+    private cancelNativeTerminations = (): void => {
+        for (const key of [...this.nativeTerminations]) this.cancelNative(key);
+    };
     beginClose(): void {
         this.closing = true;
+        this.cancelNativeTerminations();
         const resume = this.queue.pause();
         const retained: DirectPlayCallbackTask[] = [];
         for (const task of this.waiting) {
@@ -96,6 +110,7 @@ export class DirectPlay8Callbacks {
     async flush(): Promise<void> { while (!this.closed && this.pending) await new Promise(resolve => setTimeout(resolve, 4)); }
     close(): void {
         if (this.closed) return; this.closed = true;
+        if (this.session.onCancelNativeTermination === this.cancelNativeTerminations) this.session.onCancelNativeTermination = undefined;
         if (this.retry) clearTimeout(this.retry); this.retry = undefined;
         for (const admission of [...this.nativeAdmissions]) admission.cancel();
         for (const task of this.waiting.splice(0)) task.onDiscard?.(); this.waitingBytes = 0;
@@ -112,6 +127,13 @@ export class DirectPlay8Callbacks {
     emit(event: DirectPlay8Event): boolean {
         if (this.closing && event.type === 0x11) return true;
         const id = event.id ?? 0, context = event.context ?? 0;
+        const messages = this.inlineMessages, ownerKey = this.inlineKey;
+        const reservation = messages && !messages.includes(event.type) ? undefined : this.inlineReservation;
+        const processed = (result?: number) => {
+            const run = () => ownerKey ? this.usingNativeKey(ownerKey, () => event.processed?.(result)) : event.processed?.(result);
+            if (reservation) this.usingNative(reservation, run, messages);
+            else run();
+        };
         if (event.type === 2) return this.native(2, 0);
         if (event.type === 0xf) return this.native(0xf, 8, ptr => { Mem.writeUint32(ptr + 4, context); });
         if (event.type === 7 || event.type === 6) {
@@ -120,21 +142,40 @@ export class DirectPlay8Callbacks {
                 Mem.writeUint32(ptr + 4, id);
                 if (group) { Mem.writeUint32(ptr + 8, event.owner ?? 0); Mem.writeUint32(ptr + 16, this.session.contexts.get(event.owner ?? 0) ?? 0); }
                 Mem.writeUint32(ptr + contextOffset, (group ? this.session.groupContexts : this.session.contexts).get(id) ?? context);
-            }, (_hr, ptr) => { (group ? this.session.groupContexts : this.session.contexts).set(id, Mem.readUint32(ptr + contextOffset)!); });
+            }, (_hr, ptr) => {
+                if (event.isCurrent?.() !== false)
+                    (group ? this.session.groupContexts : this.session.contexts).set(id, Mem.readUint32(ptr + contextOffset)!);
+                // CREATE_GROUP ignores the handler HRESULT; its context writeback precedes publication.
+                processed();
+            }, () => { processed(DPN.USERCANCEL); });
         }
         if (event.type === 8 || event.type === 9) return this.native(event.type, 16, ptr => {
             Mem.writeUint32(ptr + 4, id); Mem.writeUint32(ptr + 8, context); Mem.writeUint32(ptr + 12, event.reason ?? 1);
-        }, () => { (event.type === 8 ? this.session.groupContexts : this.session.contexts).delete(id); });
+        }, () => {
+            if (event.isCurrent?.() !== false) (event.type === 8 ? this.session.groupContexts : this.session.contexts).delete(id);
+            processed();
+        }, () => { processed(DPN.USERCANCEL); });
         if (event.type === 1 || event.type === 0x12) return this.native(event.type, 20, ptr => {
             [id, event.groupContext ?? 0, event.player ?? 0, event.playerContext ?? 0].forEach((n, i) => Mem.writeUint32(ptr + 4 + i * 4, n));
-        });
-        if ([4, 0xc, 0xd, 0x10, 0x15].includes(event.type)) return this.native(event.type, 12, ptr => { Mem.writeUint32(ptr + 4, id); Mem.writeUint32(ptr + 8, context); }, () => { event.processed?.(); }, () => { event.processed?.(DPN.USERCANCEL); });
+        }, () => processed(), () => processed(DPN.USERCANCEL));
+        if ([4, 0xc, 0xd, 0x10, 0x15].includes(event.type)) return this.native(event.type, 12, ptr => { Mem.writeUint32(ptr + 4, id); Mem.writeUint32(ptr + 8, context); }, () => { processed(); }, () => { processed(DPN.USERCANCEL); });
         if (event.type === 0x16) {
             const data = event.data ?? new Uint8Array();
-            return this.native(0x16, 16 + data.length, ptr => {
+            const fill = (ptr: number) => {
                 Mem.writeUint32(ptr, 16); Mem.writeUint32(ptr + 4, event.result ?? DPN.CONNECTIONLOST);
                 Mem.writeUint32(ptr + 8, data.length ? ptr + 16 : 0); Mem.writeUint32(ptr + 12, data.length); Mem.writeBytes(ptr + 16, data);
-            });
+            };
+            if (!event.isCurrent) return this.native(0x16, 16 + data.length, fill);
+            if (!event.isCurrent()) { processed(DPN.USERCANCEL); return true; }
+            const key = {}; this.nativeTerminations.add(key);
+            const completed = () => {
+                this.nativeTerminations.delete(key);
+                processed(event.isCurrent?.() === false ? DPN.USERCANCEL : DPN.OK);
+            };
+            const discarded = () => { this.nativeTerminations.delete(key); processed(DPN.USERCANCEL); };
+            const accepted = this.native(0x16, 16 + data.length, fill, completed, discarded, key);
+            if (!accepted) this.nativeTerminations.delete(key);
+            return accepted;
         }
         if (event.type === 0x11) {
             const data = event.data ?? new Uint8Array(), handle = this.nextBuffer++ >>> 0 || this.nextBuffer++ >>> 0;
@@ -151,7 +192,7 @@ export class DirectPlay8Callbacks {
                 buffer.active = false;
                 // NT5 acknowledges COMPLETEONPROCESS after the handler returns,
                 // including PENDING; ReturnBuffer controls storage lifetime separately.
-                event.processed?.();
+                processed();
                 if (hr === DPN.PENDING && !buffer.returned && !this.closed) return true;
                 this.buffers.delete(handle); release();
             }, () => { this.buffers.delete(handle); release(); });
@@ -159,6 +200,7 @@ export class DirectPlay8Callbacks {
         }
         return false;
     }
+    cancelNativeOwner(key: object): void { this.cancelNative(key); }
     private cancelNative(key: object): void {
         const removed = this.waiting.filter(task => task.key === key);
         this.waiting = this.waiting.filter(task => task.key !== key);

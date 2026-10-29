@@ -1,11 +1,11 @@
-import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA, type WsaAddress, type WsaNativeIoLease, type WsaIoPurpose } from "./wsa-network";
+import { WsaSocketTable, WsaFailure, WsaOwnedSocketOutcomeUnknown, WsaUdpReceiveFailure, WSA, type WsaAddress, type WsaNativeIoLease, type WsaIoPurpose } from "./wsa-network";
 import type { LanNetwork } from "../net/lan-network";
 import { TCP_SEGMENT } from "../net/netplay-wire";
 import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, WSA_ACTOR_CANCELLED, WSA_ACTOR_EXECUTING,
     actorRequestFits, decodeActorValue, copyActorUdpReceiveError, type WsaActorClientBoot, type WsaActorNotification, type WsaActorRoute } from "./wsa-actor-protocol";
 type State = ReturnType<WsaSocketTable["get"]>;
 export interface WsaActorTable extends WsaSocketTable { duplicate(socket: number, targetPid: number): number; importDuplicate(reservedHandle: number): number; }
-const commands = new Set(["socket","isValid","isConnected","maxMessageSize","bind","closesocket","listen","acceptError","accept","adoptAccepted","disconnect","deferAccepted","rejectAccepted","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setHandleFlags","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","setV6Only","getMulticastOption","setMulticastOption","changeMulticastMembership","setNonBlocking","readable","writable","exceptional","atMark","bytesAvailable","enumEvents"]);
+const commands = new Set(["socket","socketOwned","acceptOwned","isValid","isConnected","nativeListenerSnapshot","nativeListenerCurrent","maxMessageSize","bind","closesocket","listen","cancelListen","acceptError","accept","adoptAccepted","disconnect","deferAccepted","rejectAccepted","connect","cancelConnect","send","sendto","receive","recv","recvfrom","shutdown","setHandleFlags","setOobInline","setKeepAlive","setNoDelay","setUdpConnReset","setV6Only","getMulticastOption","setMulticastOption","changeMulticastMembership","setNonBlocking","readable","writable","exceptional","atMark","bytesAvailable","enumEvents"]);
 /** Each command is an immediate kernel operation; blocking guest calls wait on readiness after this returns. */
 export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorClientBoot | (()=>WsaActorClientBoot)): WsaActorTable {
     const local = new WsaSocketTable(network), listeners = new Set<() => void>(), notifications = new Map<number, (bit:number,error:number)=>void>();
@@ -38,6 +38,7 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
         }catch{return[];} // Preserve the kernel operation\u2019s validation/error precedence for unknown destinations.
     };
     const call = (command: string, args: unknown[], routes:WsaActorRoute[]=[], nativeHandleOnly = false, expectedBoot?: WsaActorClientBoot): any => {
+        const ownedMutation=command==="socketOwned"||command==="acceptOwned";
         renew();
         if (expectedBoot && expectedBoot !== boot) throw new WsaFailure(WSA.ENETDOWN);
         if (closed) throw new WsaFailure(WSA.ENETDOWN);
@@ -50,11 +51,16 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
             const state = Atomics.load(header, 0);
             if (state === WSA_ACTOR_DONE || state === WSA_ACTOR_ERROR) {
                 const length = Atomics.load(header, 1);
-                if (length < 0 || length > mailbox.byteLength - WSA_ACTOR_HEADER_BYTES) { closed = true; throw new WsaFailure(WSA.ENETDOWN); }
+                if (length < 0 || length > mailbox.byteLength - WSA_ACTOR_HEADER_BYTES) { closed = true; throw ownedMutation ? new WsaOwnedSocketOutcomeUnknown(WSA.ENETDOWN) : new WsaFailure(WSA.ENETDOWN); }
                 const text = new TextDecoder().decode(new Uint8Array(mailbox, WSA_ACTOR_HEADER_BYTES, length).slice());
                 // Error metadata must be checked as plain JSON, before the general byte-array reviver can clamp values.
-                const result = state === WSA_ACTOR_ERROR ? JSON.parse(text) : decodeActorValue(text);
+                let result:any;
+                try { result = state === WSA_ACTOR_ERROR ? JSON.parse(text) : decodeActorValue(text); }
+                catch(error) { if(ownedMutation){closed=true;throw new WsaOwnedSocketOutcomeUnknown(WSA.ENETDOWN);} throw error; }
                 if (state === WSA_ACTOR_ERROR) {
+                    if(ownedMutation && (!result || !Number.isInteger(result.error) || result.error<10000 || result.error>12000)) {
+                        closed=true;throw new WsaOwnedSocketOutcomeUnknown(WSA.ENETDOWN);
+                    }
                     if (result && Object.prototype.hasOwnProperty.call(result, "udpReceive")) {
                         const from = copyActorUdpReceiveError(result.udpReceive);
                         if (result.error !== WSA.ECONNRESET || !from) { closed = true; throw new WsaFailure(WSA.ENETDOWN); }
@@ -66,15 +72,21 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
                     }
                     throw new WsaFailure(result.error);
                 }
+                if(ownedMutation && (!result || !Number.isInteger(result.handle) || result.handle<=0 ||
+                    !Number.isInteger(result.object) || result.object<=0)) {
+                    closed=true;throw new WsaOwnedSocketOutcomeUnknown(WSA.ENETDOWN);
+                }
                 return result;
             }
             const remaining = deadline - performance.now();
             if (remaining <= 0) {
                 // Never retry an uncertain mutation. Pending commands can be cancelled before execution.
-                Atomics.compareExchange(header, 0, WSA_ACTOR_PENDING, WSA_ACTOR_CANCELLED);
-                closed = true; throw new WsaFailure(WSA.ETIMEDOUT);
+                const previous=Atomics.compareExchange(header, 0, WSA_ACTOR_PENDING, WSA_ACTOR_CANCELLED);
+                closed = true;
+                if(ownedMutation && previous!==WSA_ACTOR_PENDING)throw new WsaOwnedSocketOutcomeUnknown(WSA.ETIMEDOUT);
+                throw new WsaFailure(WSA.ETIMEDOUT);
             }
-            if (state !== WSA_ACTOR_PENDING && state !== WSA_ACTOR_EXECUTING) { closed = true; throw new WsaFailure(WSA.ENETDOWN); }
+            if (state !== WSA_ACTOR_PENDING && state !== WSA_ACTOR_EXECUTING) { closed = true; throw ownedMutation ? new WsaOwnedSocketOutcomeUnknown(WSA.ENETDOWN) : new WsaFailure(WSA.ENETDOWN); }
             Atomics.wait(header, 0, state, remaining);
         }
     };
@@ -142,6 +154,15 @@ export function createWsaActorTable(network: LanNetwork, initialBoot: WsaActorCl
         } };
     };
     const overrides: Record<string, unknown> = {
+        startActorUdpHost(socket:number, listener:string) {
+            const token=call("startUdpHost",[socket,listener]), issuingBoot=boot;
+            let retired=false;
+            return {
+                inspect:()=>{if(retired)throw new WsaFailure(WSA.ENOTSOCK);return call("inspectUdpHost",[token],[],false,issuingBoot);},
+                release:()=>{if(retired)return;retired=true;if(closed||boot!==issuingBoot)return;
+                    try{call("retireUdpHost",[token],[],false,issuingBoot);}catch{/* process teardown owns uncertain operation */}},
+            };
+        },
         acquireNativeIo,
         fileObjectId(socket: number) { return call("fileObjectId", [socket], [], true); },
         hasFileObject(objectId: number) { try { return !!call("hasFileObject", [objectId], [], true); } catch { return false; } },

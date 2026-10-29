@@ -3,8 +3,9 @@ import { LanNetwork, type LanPortRegistry, type NetTransport, type LanState, typ
 import { RelayLink } from "../net/relay-link";
 import { copyLocalUdpContext, localUdpFrameBytes, type LocalUdpContext } from "../net/local-udp-context";
 import { UdpHostLeaseRpc, type UdpHostLease } from "../net/udp-host-lease-rpc";
+import { TcpHostLeaseRpc, type TcpHostLease } from "../net/tcp-host-lease-rpc";
 import type { UdpBindingRequest } from "../net/udp-binding-lease-rpc";
-import { validUdpHostOpenRequest, type UdpHostOpenRequest } from "../net/netplay-wire";
+import { validUdpHostOpenRequest, type UdpHostOpenRequest, validTcpHostOpenRequest, type TcpHostOpenRequest } from "../net/netplay-wire";
 import { UdpPeerLeaseRpc, udpLeaseError } from "../net/udp-peer-lease-rpc";
 import { type UdpPeerLeaseRequest, validPort, isExternalIpv4Node, isExternalIpv6Node } from "../net/netplay-wire";
 import { decodeDatagram, encodeDatagram, isBroadcastNode, isMulticastIpv4Node, MAX_FRAME_SIZE, NetResolveError,
@@ -280,7 +281,8 @@ interface UdpForward<R extends UdpBindingRequest = UdpPeerLeaseRequest> { reques
 interface Client {
     udpPeers: Map<number, UdpForward>;
     udpHosts: Map<number, UdpForward<UdpHostOpenRequest>>;
-    pid:number;processEpoch:number;actorAttached:boolean;
+    tcpHosts: Map<number, UdpForward<TcpHostOpenRequest>>;
+    pid:number;processEpoch:number;actorAttached:boolean;service:boolean;
     slot: number; epoch: number; port: MessagePort; parent: number; pending: PendingOutbound[]; flushing: boolean;
     dns: Map<number, AbortController>; knownPorts: Map<string,number>; deliveryGenerations: Map<string, number>;
     deliveryStamps: Int32Array;
@@ -302,6 +304,8 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     private nextUdpPeer = 0;
     private readonly rootUdpHosts = new Map<number, UdpForward<UdpHostOpenRequest>>();
     private nextUdpHost = 0;
+    private readonly rootTcpHosts = new Map<number, UdpForward<TcpHostOpenRequest>>();
+    private nextTcpHost = 0;
     private closed = false;
     private actor: {worker:Worker;control:MessagePort;lease:ChildNetworkNamespace;stopped:Promise<void>;terminated:boolean}|null=null;
     private actorClient:SocketActorClient|null=null;
@@ -316,7 +320,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.backplane = new Backplane(network.node);
         this.ports.publishState({connected: false, node: network.node, ipv4: network.ipv4, generation: 0});
         this.backplane.onFrame = (frame,generation) => this.deliver(frame,generation);
-        network.setPortRegistry(this.ports.registry(0, 1, (port, proto, claimed,generation,last) => { if (!claimed) { this.retireUdpForwards(this.rootUdpPeers, port, proto, generation); this.retireUdpForwards(this.rootUdpHosts, port, proto, generation); this.cancelTcpPort(0, 1, port, proto, generation); this.portLeft(port, proto,generation,last); } }));
+        network.setPortRegistry(this.ports.registry(0, 1, (port, proto, claimed,generation,last) => { if (!claimed) { this.retireUdpForwards(this.rootUdpPeers, port, proto, generation); this.retireUdpForwards(this.rootUdpHosts, port, proto, generation); this.retireUdpForwards(this.rootTcpHosts, port, proto, generation); this.cancelTcpPort(0, 1, port, proto, generation); this.portLeft(port, proto,generation,last); } }));
         const local: NetTransport = {
             connected: false, routeLocal: true,
             connectionState: () => !this.closed && !!Atomics.load(this.ports.header, 1),
@@ -328,6 +332,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             },
             leaseUdpPeer: (request, signal) => this.forwardUdpPeer(null, ++this.nextUdpPeer, request, signal),
             openUdpHost: (request, signal) => this.forwardUdpHost(null, ++this.nextUdpHost, request, signal),
+            openTcpHost: (request, signal) => this.forwardTcpHost(null, ++this.nextTcpHost, request, signal),
             close() {},
         };
         network.attach(local);
@@ -391,7 +396,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         if(this.finishing)return this.finishing;
         if(Atomics.load(this.ports.meta,6)!==this.pid)return this.barrier();
         const identity=this.ports.processIdentity(0,this.pid);
-        this.retireUdpForwards(this.rootUdpPeers); this.retireUdpForwards(this.rootUdpHosts);
+        this.retireUdpForwards(this.rootUdpPeers); this.retireUdpForwards(this.rootUdpHosts); this.retireUdpForwards(this.rootTcpHosts);
         this.actorClient?.port.close();this.actorClient=null;
         const finish=this.actorRequest("finish",identity).then(()=>{
             if(this.ports.processIdentity(0,this.pid).epoch===identity.epoch)Atomics.compareExchange(this.ports.meta,6,this.pid,0);
@@ -407,7 +412,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         return this.actorClient;
     }
     dropSocketActorClient():void{
-        this.retireUdpForwards(this.rootUdpPeers); this.retireUdpForwards(this.rootUdpHosts);
+        this.retireUdpForwards(this.rootUdpPeers); this.retireUdpForwards(this.rootUdpHosts); this.retireUdpForwards(this.rootTcpHosts);
         const identity=this.ports.processIdentity(0,this.pid);Atomics.store(this.ports.meta,6,0);
         this.actor?.control.postMessage({type:"drop",...identity});
         this.actorClient?.port.close();this.actorClient=null;
@@ -418,8 +423,9 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const key = config ? JSON.stringify(config) : "";
         if (this.active?.key === key && (this.active.link.connected || this.active.link.connecting)) return this.active.link.ready;
         this.backplane.configureDirectPlay8(config?.directPlay8);
+        this.backplane.configureWinsock(config?.winsock);
         this.active = null; this.backplane.attach(null);
-        if (!config) { this.network.configureDirectPlay8(); return; }
+        if (!config) { this.network.configureDirectPlay8(); this.network.configureWinsock(); return; }
         const link = new RelayLink(config.serverUrl, config.room, this.backplane);
         this.active = { key, link }; this.backplane.attach(link);
         try {
@@ -444,7 +450,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const pid=Atomics.load(this.ports.meta,slot*META+6);
         if (!isDeliveryShared(deliveryShared) || !this.ports.alive(slot, epoch) || this.clients.has(slot)||(!service&&pid<1)||pid===this.pid
             ||[...this.clients.values()].some(client=>client.pid===pid)) { port.close();this.ports.drop(slot,epoch);return; }
-        const client: Client = { udpPeers: new Map(), udpHosts: new Map(), pid,processEpoch:Atomics.load(this.ports.meta,slot*META+7),actorAttached:false,slot, epoch, parent, port, pending: [], flushing: false, dns: new Map(), knownPorts: new Map(), deliveryGenerations: new Map(), deliveryStamps: new Int32Array(deliveryShared), barriers: new Map() };
+        const client: Client = { udpPeers: new Map(), udpHosts: new Map(), tcpHosts: new Map(), service, pid,processEpoch:Atomics.load(this.ports.meta,slot*META+7),actorAttached:false,slot, epoch, parent, port, pending: [], flushing: false, dns: new Map(), knownPorts: new Map(), deliveryGenerations: new Map(), deliveryStamps: new Int32Array(deliveryShared), barriers: new Map() };
         this.clients.set(slot, client);
         if(pid>0)this.actor?.control.postMessage({type:"process",...this.ports.processIdentity(slot,pid)});
         port.onmessage = event => this.message(client, event.data);
@@ -454,7 +460,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     private snapshot(): LanState {
         return { connected: this.backplane.connected, node: this.backplane.node.slice(), ipv4: this.backplane.ipv4, generation: this.stateGeneration,
             gatewayIpv4: this.gatewayAddresses(), gatewayIpv6: this.lastGateways6,
-            udpHostListenV1: this.backplane.udpHostListenV1, udpMulticast4V1: this.backplane.udpMulticast4V1, directPlay8: this.backplane.directPlay8 };
+            udpHostListenV1: this.backplane.udpHostListenV1, tcpHostListenV1: this.backplane.tcpHostListenV1, winsock: this.backplane.winsock, udpMulticast4V1: this.backplane.udpMulticast4V1, directPlay8: this.backplane.directPlay8 };
     }
     private recordResolved(result: ResolveResult): void {
         const addresses = result.addresses.filter(item => item.family === 4).map(item => item.address.split(".").map(Number));
@@ -486,10 +492,12 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         } else this.sharedStateFailure = null;
         this.network.configureDirectPlay8(state.directPlay8);
         this.network.configureUdpHosts(state.udpHostListenV1);
+        this.network.configureTcpHosts(state.tcpHostListenV1);
+        this.network.configureWinsock(state.winsock);
         this.network.configureMulticast4(state.udpMulticast4V1 === true);
         if (!state.connected) {
-            this.retireUdpForwards(this.rootUdpPeers); this.retireUdpForwards(this.rootUdpHosts);
-            for (const client of this.clients.values()) { this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts); }
+            this.retireUdpForwards(this.rootUdpPeers); this.retireUdpForwards(this.rootUdpHosts); this.retireUdpForwards(this.rootTcpHosts);
+            for (const client of this.clients.values()) { this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts); this.retireUdpForwards(client.tcpHosts); }
         }
         this.lastGateways = state.gatewayIpv4 ?? [];
         this.network.configureGatewayAddresses(this.lastGateways);
@@ -708,7 +716,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         return true;
     }
     private releaseClientPort(client: Client, item: Extract<PendingOutbound, { kind: "release" }>): void {
-        this.retireUdpForwards(client.udpPeers, item.port, item.proto, item.generation); this.retireUdpForwards(client.udpHosts, item.port, item.proto, item.generation);
+        this.retireUdpForwards(client.udpPeers, item.port, item.proto, item.generation); this.retireUdpForwards(client.udpHosts, item.port, item.proto, item.generation); this.retireUdpForwards(client.tcpHosts, item.port, item.proto, item.generation);
         this.cancelTcpPort(client.slot, client.epoch, item.port, item.proto, item.generation);
         this.portLeft(item.port, item.proto, item.generation, item.last);
     }
@@ -747,16 +755,22 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         if(!client.pending.length)client.port.postMessage({type:"reply",id});
         else client.barriers.set(id,setTimeout(()=>this.settleBarriers(client,new NetResolveError("TRY_AGAIN","Network exit drain timed out")),10000));
     }
+    private tcpClientLive(client: Client, processEpoch: number): boolean {
+        if (!this.ports.alive(client.slot, client.epoch) || processEpoch < 1 || client.processEpoch !== processEpoch ||
+            Atomics.load(this.ports.meta, client.slot * META + 7) !== processEpoch ||
+            Atomics.load(this.ports.meta, client.slot * META + 6) !== client.pid) return false;
+        return client.service ? client.pid === 0 && this.actor?.lease.boot.slot === client.slot && this.actor.lease.boot.epoch === client.epoch : client.pid > 0;
+    }
     private message(client: Client, message: any): void {
         if (!this.ports.alive(client.slot, client.epoch) || this.closed) return;
-        if (["leaseUdpPeer","cancelUdpPeer","releaseUdpPeer","openUdpHost","cancelUdpHost","releaseUdpHost"].includes(message?.type)) client.port.postMessage({type: "udpPeerControlAck"});
+        if (["leaseUdpPeer","cancelUdpPeer","releaseUdpPeer","openUdpHost","cancelUdpHost","releaseUdpHost","openTcpHost","cancelTcpHost","releaseTcpHost"].includes(message?.type)) client.port.postMessage({type: "udpPeerControlAck"});
         if(message?.type==="actorAttach"&&message.port instanceof MessagePort){
             if(client.pid<1||Atomics.load(this.ports.meta,client.slot*META+6)!==client.pid||client.actorAttached||this.actorFailure||!this.actor){message.port.close();return;}
             client.actorAttached=true;this.actor.control.postMessage({type:"client",...this.ports.processIdentity(client.slot,client.pid),port:message.port},[message.port]);
         }else if(message?.type==="actorDrop"){
             if(message.processEpoch!==client.processEpoch)return;
             const identity={pid:client.pid,slot:client.slot,epoch:client.processEpoch};
-            this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts);
+            this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts); this.retireUdpForwards(client.tcpHosts);
             if(Atomics.load(this.ports.meta,client.slot*META+7)===identity.epoch)Atomics.compareExchange(this.ports.meta,client.slot*META+6,client.pid,0);
             this.actor?.control.postMessage({type:"drop",...identity});client.actorAttached=false;
         }else if(message?.type==="actorProcessStart"){
@@ -769,7 +783,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 client.port.postMessage({type:"reply",id:message.id,error:"Process incarnation is no longer live"});return;
             }
             const identity={pid:client.pid,slot:client.slot,epoch:client.processEpoch};
-            this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts);
+            this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts); this.retireUdpForwards(client.tcpHosts);
             void this.actorRequest("finish",identity).then(()=>{
                 if(Atomics.load(this.ports.meta,client.slot*META+7)===identity.epoch)Atomics.compareExchange(this.ports.meta,client.slot*META+6,client.pid,0);
                 if(client.processEpoch===identity.epoch)client.actorAttached=false;
@@ -817,7 +831,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             client.knownPorts.set(key,message.generation??0);
             client.deliveryGenerations.set(key, message.deliveryGeneration);
         } else if (message?.type === "released") {
-            this.retireUdpForwards(client.udpPeers, message.port, message.proto, message.generation); this.retireUdpForwards(client.udpHosts, message.port, message.proto, message.generation);
+            this.retireUdpForwards(client.udpPeers, message.port, message.proto, message.generation); this.retireUdpForwards(client.udpHosts, message.port, message.proto, message.generation); this.retireUdpForwards(client.tcpHosts, message.port, message.proto, message.generation);
             const key=message.proto+":"+message.port;
             if (client.deliveryGenerations.get(key) === message.deliveryGeneration) {
                 client.deliveryGenerations.delete(key);
@@ -853,6 +867,30 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             });
         } else if (message?.type === "cancelUdpHost" || message?.type === "releaseUdpHost") {
             client.udpHosts.get(message.id)?.cancel();
+        } else if (message?.type === "openTcpHost") {
+            const id = message.id, processEpoch = client.processEpoch;
+            if (message.processEpoch !== processEpoch || !this.tcpClientLive(client, processEpoch)) return;
+            const current = () => this.tcpClientLive(client, processEpoch);
+            const operation = this.forwardTcpHost(client, id, message.request);
+            const entry = client.tcpHosts.get(id);
+            void operation.then(lease => {
+                if (!current() || !entry || client.tcpHosts.get(id) !== entry) { lease.release(); return; }
+                if (!lease.isLive()) {
+                    client.port.postMessage({type: "tcpHostOpened", id, reply: {error: {code: 10054, message: "TCP listener closed before readiness"}}});
+                    lease.release(); return;
+                }
+                client.port.postMessage({type: "tcpHostOpened", id, reply: {leaseId: id, address: lease.address, allowedNodes: lease.allowedNodes}});
+                void lease.closed.then(error => {
+                    if (current() && client.tcpHosts.get(id) === entry)
+                        client.port.postMessage({type: "tcpHostClosed", id, leaseId: id, error});
+                    lease.release();
+                });
+            }, error => {
+                if (current()) client.port.postMessage({type: "tcpHostOpened", id,
+                    reply: {error: {code: typeof error.code === "number" ? error.code : 10050, message: String(error.message ?? error).slice(0,256)}}});
+            });
+        } else if (message?.type === "cancelTcpHost" || message?.type === "releaseTcpHost") {
+            if (message.processEpoch === client.processEpoch && this.tcpClientLive(client, client.processEpoch)) client.tcpHosts.get(message.id)?.cancel();
         } else if (message?.type === "leaseUdpPeer") {
             const id = message.id;
             void this.forwardUdpPeer(client, id, message.request).then(
@@ -899,6 +937,30 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         this.lastGateways = [...new Map([...this.lastGateways, ...addresses].map(ip => [ip.join("."), ip])).values()];
         this.state(this.snapshot());
         void lease.closed.then(() => lease.release());
+        return lease;
+    }
+    private async forwardTcpHost(client: Client | null, id: number, request: TcpHostOpenRequest, signal?: AbortSignal): Promise<TcpHostLease> {
+        if (!validTcpHostOpenRequest(request)) throw udpLeaseError(10022, "Invalid TCP Host request");
+        if (client ? !this.tcpClientLive(client, client.processEpoch) : Atomics.load(this.ports.meta, 6) !== this.pid)
+            throw udpLeaseError(10050, "TCP Host process owner is not live");
+        if (this.ports.targets(request.proto, request.localPort).length !== 1) throw udpLeaseError(10048, "TCP Host binding must have one process owner");
+        const lease = await this.forwardUdpBinding(client, id, {...request}, client?.tcpHosts ?? this.rootTcpHosts, signal,
+            (provider, request, signal) => provider.openTcpHost(request, signal));
+        if (!lease.isLive() || (client ? !this.tcpClientLive(client, client.processEpoch) : Atomics.load(this.ports.meta, 6) !== this.pid) ||
+            this.ports.targets(request.proto, request.localPort).length !== 1) {
+            lease.release(); throw udpLeaseError(10054, "TCP Host listener owner changed before readiness");
+        }
+        const addresses = [lease.address.node.slice(2), ...lease.allowedNodes.map(node => node.slice(2))];
+        this.network.registerGatewayAddresses(addresses);
+        this.backplane.registerGatewayAddresses(addresses);
+        this.lastGateways = [...new Map([...this.lastGateways, ...addresses].map(ip => [ip.join("."), ip])).values()];
+        this.state(this.snapshot());
+        if (!lease.isLive() || (client ? !this.tcpClientLive(client, client.processEpoch) : Atomics.load(this.ports.meta, 6) !== this.pid) ||
+            this.ports.targets(request.proto, request.localPort).length !== 1) {
+            lease.release(); throw udpLeaseError(10054, "TCP Host listener closed while publishing readiness");
+        }
+        // Child IPC owns notification and cleanup; root callers need automatic retirement.
+        if (!client) void lease.closed.then(() => lease.release());
         return lease;
     }
     private async forwardUdpPeer(client: Client | null, id: number, request: UdpPeerLeaseRequest, signal?: AbortSignal): Promise<{release(): void}> {
@@ -961,7 +1023,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const actorIdentity=client?this.ports.processIdentity(slot,client.pid):null;
         const ports = this.ports.drop(slot, epoch, client?.deliveryStamps);
         if (client) {
-            this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts);
+            this.retireUdpForwards(client.udpPeers); this.retireUdpForwards(client.udpHosts); this.retireUdpForwards(client.tcpHosts);
             if(client.pid>0){
                 this.actor?.control.postMessage({type:"drop",...actorIdentity!});
                 if(client.processEpoch!==actorIdentity!.epoch)this.actor?.control.postMessage({type:"drop",pid:client.pid,slot,epoch:client.processEpoch});
@@ -1025,6 +1087,18 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     private readonly ports: AtomicPorts;
     private readonly pending = new Map<number, { kind: string; resolve: (result: any) => void; reject: (error: Error) => void; cleanup: () => void }>();
     private udpControlsInFlight = 0;
+    private readonly tcpHosts = new TcpHostLeaseRpc({
+        connected: () => !this.closed && this.connected,
+        request: (id, request) => {
+            if (this.udpControlsInFlight >= 128) return false;
+            this.udpControlsInFlight++;
+            this.boot.port.postMessage({type:"openTcpHost",id,request,processEpoch:this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch});
+            return true;
+        },
+        cancel: id => { this.udpControlsInFlight++; this.boot.port.postMessage({type:"cancelTcpHost",id,processEpoch:this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch}); },
+        release: id => { this.udpControlsInFlight++; this.boot.port.postMessage({type:"releaseTcpHost",id,processEpoch:this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch}); },
+    });
+    openTcpHost(request: TcpHostOpenRequest, signal?: AbortSignal): Promise<TcpHostLease> { return this.tcpHosts.open(request, signal); }
     private readonly udpHosts = new UdpHostLeaseRpc({
         connected: () => !this.closed && this.connected,
         request: (id, request) => {
@@ -1074,6 +1148,8 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
             if (!state.connected) this.retireState();
             this.network.configureDirectPlay8(state.directPlay8);
             this.network.configureUdpHosts(state.udpHostListenV1);
+        this.network.configureTcpHosts(state.tcpHostListenV1);
+        this.network.configureWinsock(state.winsock);
             this.network.configureMulticast4(state.udpMulticast4V1 === true);
             this.network.configureGatewayAddresses(state.gatewayIpv4 ?? []);
             this.network.configureGatewayIpv6(state.gatewayIpv6 ?? []);
@@ -1081,7 +1157,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         } finally { this.synchronizing = false; }
     }
     private retireState(): void {
-        this.udpPeers.disconnect(); this.udpHosts.disconnect();
+        this.udpPeers.disconnect(); this.udpHosts.disconnect(); this.tcpHosts.disconnect();
         for (const [id, pending] of this.pending) if (pending.kind === "resolve" || !this.ports.alive(this.boot.slot, this.boot.epoch)) {
             this.pending.delete(id); pending.cleanup(); pending.reject(new NetResolveError("NETWORK_DOWN"));
         }
@@ -1118,6 +1194,11 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
             } else this.network.receiveFrame(message.frame, true, message.bindingGeneration, message.deliveryGeneration, message.localUdp);
         } else if (message?.type === "udpPeerControlAck") {
             this.udpControlsInFlight = Math.max(0, this.udpControlsInFlight - 1);
+        } else if (message?.type === "tcpHostOpened") {
+            this.tcpHosts.accept(message.id, message.reply);
+        } else if (message?.type === "tcpHostClosed") {
+            const error = message.error?.code === 995 ? {...message.error,code:10004} : message.error;
+            this.tcpHosts.acceptClosed(message.id, message.leaseId, error);
         } else if (message?.type === "udpHostOpened") {
             this.udpHosts.accept(message.id, message.reply);
         } else if (message?.type === "udpHostClosed") {
@@ -1206,7 +1287,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         if(this.finishing)return this.finishing;
         if(Atomics.load(this.ports.meta,this.boot.slot*META+6)!==this.boot.pid)return this.barrier();
         const epoch=this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch;
-        this.udpPeers.retire(); this.udpHosts.retire();
+        this.udpPeers.retire(); this.udpHosts.retire(); this.tcpHosts.retire();
         this.actorClient?.port.close();this.actorClient=null;
         const finish=this.request("actorFinish",{processEpoch:epoch});
         this.finishing=finish.finally(()=>{this.finishing=null;});return this.finishing;
@@ -1218,7 +1299,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
         return this.actorClient;
     }
     dropSocketActorClient():void{
-        this.udpPeers.retire(); this.udpHosts.retire();
+        this.udpPeers.retire(); this.udpHosts.retire(); this.tcpHosts.retire();
         if(!this.closed){const processEpoch=this.ports.processIdentity(this.boot.slot,this.boot.pid).epoch;
             Atomics.store(this.ports.meta,this.boot.slot*META+6,0);this.boot.port.postMessage({type:"actorDrop",processEpoch});}
         this.actorClient?.port.close();this.actorClient=null;
@@ -1233,7 +1314,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     }
     close(): void {
         if (this.closed) return;
-        this.udpPeers.retire(); this.udpHosts.retire();
+        this.udpPeers.retire(); this.udpHosts.retire(); this.tcpHosts.retire();
         this.dropSocketActorClient();
         this.closed = true;
         for (const pending of this.pending.values()) { pending.cleanup(); pending.reject(new NetResolveError("NETWORK_DOWN")); }

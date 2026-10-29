@@ -2,7 +2,8 @@ import { LanNetwork } from "../net/lan-network";
 import { ChildProcessNetworkNamespace, readNetworkNamespaceProcesses, isNetworkNamespaceProcessLive, type NetworkNamespaceBoot } from "../core/network-namespace";
 import { WsaSocketTable, WsaFailure, WsaUdpReceiveFailure, WSA } from "./wsa-network";
 import { WsaActorKernel } from "./wsa-actor-kernel";
-import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_EXECUTING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, actorRequestFits, encodeActorValue, copyActorUdpReceiveError, type WsaActorIdentity, type WsaActorRequest } from "./wsa-actor-protocol";
+import { encodeWsaActorResponse } from "./wsa-actor-response";
+import { WSA_ACTOR_MAILBOX_BYTES, WSA_ACTOR_HEADER_BYTES, WSA_ACTOR_PENDING, WSA_ACTOR_EXECUTING, WSA_ACTOR_DONE, WSA_ACTOR_ERROR, actorRequestFits, copyActorUdpReceiveError, type WsaActorIdentity, type WsaActorRequest } from "./wsa-actor-protocol";
 let started = false;
 function start(network: NetworkNamespaceBoot, control: MessagePort): void {
     const lan = new LanNetwork(), namespace = new ChildProcessNetworkNamespace(lan, network), kernel = new WsaActorKernel(new WsaSocketTable(lan));
@@ -41,10 +42,9 @@ function start(network: NetworkNamespaceBoot, control: MessagePort): void {
                 result = udpReceive ? { error: error.code, udpReceive } : { error: WSA.ENOBUFS };
             } else result = { error: error instanceof WsaFailure ? error.code : WSA.ENOBUFS };
         }
-        let bytes: Uint8Array;
-        try { bytes = new TextEncoder().encode(encodeActorValue(result)); }
-        catch { status = WSA_ACTOR_ERROR; bytes = new TextEncoder().encode('{"error":10055}'); }
-        if (bytes.length > message.mailbox.byteLength - WSA_ACTOR_HEADER_BYTES) { status = WSA_ACTOR_ERROR; bytes = new TextEncoder().encode('{"error":10055}'); }
+        // Do not publish a failed serialization of an owned socket.
+        const encoded=encodeWsaActorResponse(kernel,identity,message.command,result,status,message.mailbox.byteLength-WSA_ACTOR_HEADER_BYTES);
+        status=encoded.status;const bytes=encoded.bytes;
         new Uint8Array(message.mailbox, WSA_ACTOR_HEADER_BYTES, bytes.length).set(bytes);
         Atomics.store(header, 1, bytes.length); Atomics.store(header, 0, status); Atomics.notify(header, 0);
     };

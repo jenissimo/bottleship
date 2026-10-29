@@ -7,6 +7,8 @@ import { parseIpv6, formatIpv6 } from "./ip-address";
 import { NetResolveError, type ResolveRequest, type ResolveResult } from "./resolve";
 import { NativeHelperSocket } from "./native-helper";
 import { NativeDestinationPolicy } from "./native-policy";
+import {TcpHostCapacity,TcpHostRegistry,validateTcpHostConfig,type TcpHostConfig} from "./tcp-host-owner";
+import {TcpAcceptQuota} from "./tcp-accept-quota";
 import { NativeUdpSocket } from "./native-udp";
 import { NativeUdpPortPool,NativeUdpChannel } from "./native-udp-port";
 import { RawEchoGateway } from "./raw-gateway";
@@ -28,6 +30,7 @@ export interface GatewayRoute {
 }
 export interface GatewayOptions {
     routes: GatewayRoute[];
+    tcpListeners?: TcpHostConfig[];
     maxTcpConnections?: number;
     maxUdpFlows?: number;
     maxRawFlows?: number;
@@ -37,6 +40,8 @@ export interface GatewayOptions {
     nativeHelperPath?: string;
     /** Opt-in separate ordinary UDP backend with original-tuple ICMP events. */
     nativeUdpHelperPath?: string;
+    /** Experimental opt-in TCP accept process; capability remains unadvertised. */
+    nativeTcpAcceptHelperPath?: string;
 }
 interface ResolvedRoute { config: GatewayRoute; addresses: string[]; nativeAddresses: string[] }
 const normalizeHost = (host: string) => host.toLowerCase().replace(/\.$/, "");
@@ -77,6 +82,10 @@ export class GatewayRoutes {
     private nextEcho = 1;
     private readonly echoIds = new Set<number>();
     private readonly nativePolicy=new NativeDestinationPolicy();
+    readonly tcpCapacity:TcpHostCapacity;
+    readonly tcpAcceptQuota:TcpAcceptQuota;
+    readonly tcpHostRegistry:TcpHostRegistry;
+    readonly tcpListeners:ReadonlyArray<ReturnType<typeof validateTcpHostConfig>>;
     acquireNative(route:GatewayRoute,ip:string,owner:object,exclusive=false):{host:string;release:()=>void} {
         const record=this.routes.find(item=>item.config===route);
         const family=isIP(ip),addresses=record?.nativeAddresses??[];
@@ -115,7 +124,18 @@ export class GatewayRoutes {
         }
         if (options.nativeHelperPath !== undefined && (typeof options.nativeHelperPath !== "string" || !options.nativeHelperPath || options.nativeHelperPath.length > 4096)) throw new TypeError("Invalid native helper path");
         if(options.nativeUdpHelperPath!==undefined&&(typeof options.nativeUdpHelperPath!=="string"||!options.nativeUdpHelperPath||options.nativeUdpHelperPath.length>4096))throw new TypeError("Invalid bound UDP helper path");
+        if(options.nativeTcpAcceptHelperPath!==undefined&&(typeof options.nativeTcpAcceptHelperPath!=="string"||!options.nativeTcpAcceptHelperPath||options.nativeTcpAcceptHelperPath.length>4096))throw new TypeError("Invalid TCP accept helper path");
         for (const route of options.routes) validateRoute(route);
+        if(options.tcpListeners!==undefined && (!Array.isArray(options.tcpListeners)||options.tcpListeners.length>32))
+            throw new TypeError("Invalid TCP listener list");
+        this.tcpCapacity=new TcpHostCapacity(options.maxTcpConnections??128);
+        this.tcpAcceptQuota=new TcpAcceptQuota(this.tcpCapacity);
+        this.tcpHostRegistry=new TcpHostRegistry(this.nativePolicy,this.tcpCapacity);
+        const listeners=(options.tcpListeners??[]).map(validateTcpHostConfig);
+        if(new Set(listeners.map(l=>l.id)).size!==listeners.length ||
+            listeners.some(l=>l.maxPending>this.tcpCapacity.max))
+            throw new TypeError("Invalid TCP listener configuration");
+        this.tcpListeners=listeners;
         this.routes = options.routes.map(config => ({ config: structuredClone(config), addresses: [], nativeAddresses: [] }));
     }
     async initialize(): Promise<void> {
@@ -419,10 +439,20 @@ export class NativeGateway {
                     encodeTcpFrame(RST, 0, packet.srcId, !route ? 10013 : requiresHelper && !this.routes.options.nativeHelperPath ? 10045 : 10055)), true, datagram.bindingGeneration);
                 return;
             }
+            const releaseCapacity=this.routes.tcpCapacity.acquire();
+            if(!releaseCapacity) {
+                this.emit(encodeDatagram(datagram.proto,datagram.node,datagram.srcPort,datagram.dstPort,
+                    encodeTcpFrame(RST,0,packet.srcId,10055)),true,datagram.bindingGeneration);return;
+            }
             let lease:{host:string;release:()=>void};
             try {lease=this.routes.acquireNative(route,ip,this.nativeOwner);}
-            catch(error){this.emit(encodeDatagram(datagram.proto,datagram.node,datagram.srcPort,datagram.dstPort,encodeTcpFrame(RST,0,packet.srcId,socketError(error))),true,datagram.bindingGeneration);return;}
-            const socket: NativeTcpSocket = this.routes.options.nativeHelperPath ? new NativeHelperSocket(this.routes.options.nativeHelperPath, requiresHelper) : new NativeSocket({ allowHalfOpen: true });
+            catch(error){releaseCapacity();this.emit(encodeDatagram(datagram.proto,datagram.node,datagram.srcPort,datagram.dstPort,encodeTcpFrame(RST,0,packet.srcId,socketError(error))),true,datagram.bindingGeneration);return;}
+            let socket: NativeTcpSocket;
+            try {socket=this.routes.options.nativeHelperPath ? new NativeHelperSocket(this.routes.options.nativeHelperPath, requiresHelper) : new NativeSocket({ allowHalfOpen: true });}
+            catch {lease.release();releaseCapacity();this.emit(encodeDatagram(datagram.proto,datagram.node,datagram.srcPort,datagram.dstPort,encodeTcpFrame(RST,0,packet.srcId,10055)),true,datagram.bindingGeneration);return;}
+            const releasePhysical=()=>{lease.release();releaseCapacity();};
+            if(socket instanceof NativeHelperSocket) void socket.whenPhysicalClosed().then(releasePhysical);
+            else socket.on("close",releasePhysical);
             socket.setNoDelay(!!(packet.value & SYN_NODELAY_FLAG));
             socket.setKeepAlive(!!(packet.value & SYN_KEEPALIVE_FLAG));
             flow = { socket, node: datagram.node.slice(), localPort: datagram.srcPort, remotePort: datagram.dstPort, proto: datagram.proto,
@@ -447,7 +477,8 @@ export class NativeGateway {
                 if (!current.closed && !(current.sentFin && current.receivedFin)) this.reply(current, RST, 10054);
                 this.closeTcp(key, current);
             });
-            socket.connect(datagram.dstPort, lease.host);
+            try {socket.connect(datagram.dstPort, lease.host);}
+            catch {this.abortTcp(key,current,10054);}
             return;
         }
         if (!flow || flow.closed) return;
@@ -533,6 +564,6 @@ export class NativeGateway {
     }
     private closeTcp(key: string, flow: TcpFlow): void {
         if (flow.closed) return;
-        flow.closed = true; flow.release(); clearTimeout(flow.timer); this.tcp.delete(key); flow.socket.destroy();
+        flow.closed = true; clearTimeout(flow.timer); this.tcp.delete(key); flow.socket.destroy();
     }
 }

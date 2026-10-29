@@ -13,3 +13,6 @@ bytes = "=1.12.1"
 tokio = { version = "=1.53.2", features = ["rt", "macros", "sync", "time"] }
 
 socket2 = "=0.6.5"
+
+[dev-dependencies]
+serde_json = "=1.0.154"

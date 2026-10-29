@@ -10,6 +10,11 @@ import { dplayxModule } from "../../api/dplayx.api";
 import { lanNetwork, type LanNetwork } from "../../net/lan-network";
 import { decodeAnsiString, encodeAnsi, getAnsiCodePage } from "../codepage-utils";
 import { DirectPlaySendQueue } from "./send-queue";
+import { getWsaProcessState } from "../wsa-stub-shared";
+import type { WsaSocketTable } from "../wsa-network";
+import { discoverNativeSessions } from "./native-wire/lan-discovery";
+import { nativeEnumDestination, nativeEnumTcpPort } from "./native-wire/connection";
+import { nativeDiscoveryOwner } from "./native-wire/peer-address";
 import { DirectPlayLobbyEndpoint, type LobbySettings, type LobbyReply } from "./lobby-broker";
 import { DIRECTPLAY_APPLICATIONS, registeredDirectPlayApplications, guidString } from "./lobby-registry";
 import { prepareChildLaunch, type PreparedChildLaunch } from "../../core/launch-child";
@@ -26,6 +31,7 @@ const PROVIDERS = [
     { guid: "00c45b682c9dcf11a9cd00aa006886e3", name: "IPX Connection For DirectPlay" },
 ];
 const SERVICE_GUID = "c016d907afe0cf119c4e00a0c905425e";
+const LOBBY_GUID = "4056b9596796d011a77d0000f803abfc";
 const TOTAL_GUID = "60f518132c91d0119daa00a0c90a43cb";
 const INET_GUID = "a04da5c4afe0cf119c4e00a0c905425e";
 const INET_PORT_GUID = "414552e4a58ed1118a96006097b01411";
@@ -82,6 +88,7 @@ function packDesc(desc: SessionDesc, players: number, base: number, legacy: bool
     b.u32(40, desc.maxPlayers); b.u32(44, players);
     if (!desc.nameNull) b.string(48, desc.name, wide);
     if (!desc.passwordNull) b.string(52, desc.password, wide);
+    if (desc.reserved) { b.u32(56, desc.reserved[0]); b.u32(60, desc.reserved[1]); }
     desc.user.forEach((n, i) => b.u32(64 + i * 4, n)); return b.bytes;
 }
 export function packDirectPlayMessage(m: Message, base: number, currentPlayers: number, wide = false): Uint8Array {
@@ -151,7 +158,8 @@ export class DirectPlayNetworkApi {
     private lobbyEndpoint?: DirectPlayLobbyEndpoint;
     private lobbyEvents = new Map<number, Map<number, number>>();
     private lobbyOwnedEvents = new Set<number>();
-    constructor(private process: Process, private tables: () => Record<string, VTableInfo>, private network: LanNetwork = lanNetwork) {}
+    constructor(private process: Process, private tables: () => Record<string, VTableInfo>, private network: LanNetwork = lanNetwork,
+        private nativeSockets: () => WsaSocketTable = () => getWsaProcessState(process).table) {}
     private valid(ptr: number, size: number, perms: "r" | "rw" | "rx" = "r"): boolean {
         return Number.isSafeInteger(ptr) && ptr >= 0x1000 && Number.isSafeInteger(size) && size >= 0
             && ptr + size <= this.process.getCurrentMemory().length && (this.process.addressSpace?.validateRange(ptr, size, perms) ?? true);
@@ -314,7 +322,7 @@ export class DirectPlayNetworkApi {
         if (!this.valid(out, size, "rw")) return E_POINTER;
         Mem.writeBytes(out, pack(out)); return DP.OK;
     }
-    private enumerate(frame: Frame, callback: number, cleanup: number, entries: EnumerationEntry[]): number | ThunkResult {
+    private enumerate(frame: Frame, callback: number, cleanup: number, entries: EnumerationEntry[], current: () => boolean = () => true, finish: () => void = () => {}): number | ThunkResult {
         if (!this.valid(callback, 1, "rx")) return DP.INVALIDPARAMS;
         if (!entries.length) return DP.OK;
         const manager = this.process.dispatcher.callbackManager;
@@ -325,12 +333,13 @@ export class DirectPlayNetworkApi {
         const id = manager.saveSuspendedThunkContext(frame, cleanup, "DirectPlay enumeration");
         if (!id) { this.process.memory.free(allocation); return DP.UNAVAILABLE; }
         let index = 0, first = 0;
-        const release = (): void => this.process.memory.free(allocation);
+        let released = false;
+        const release = (): void => { if (!released) { released = true; this.process.memory.free(allocation); finish(); } };
         const next = (): void => {
             const entry = entries[index++];
             Mem.writeBytes(allocation, entry.pack(allocation));
             const invocation = manager.invokeCallback(callback, entry.args(allocation), 0, value => {
-                if (!value || index === entries.length) { release(); return DP.OK; }
+                if (!value || index === entries.length || !current()) { release(); return DP.OK; }
                 return null;
             }, false, "DirectPlay enumeration", id);
             if (!first) first = invocation.callbackId;
@@ -346,19 +355,44 @@ export class DirectPlayNetworkApi {
         // NT5 iplay.c DP_Initialize is obsolete and always answers ALREADYINITIALIZED.
         methods.Initialize = () => DP.ALREADYINITIALIZED;
         methods.InitializeConnection = (s, a) => {
+            // NT5 connect.c:291-333 checks initialized object and the readable
+            // minimal/declared address before validating flags.
+            if (s.session.initialized) return DP.ALREADYINITIALIZED;
+            if (!this.valid(a[1], 24)) return DP.INVALIDPARAMS;
+            const start = a[1], firstType = hex(Mem.readBytes(start, 16)!);
+            if (firstType !== TOTAL_GUID) return DP.INVALIDPARAMS;
+            if (Mem.readUint32(start + 16) !== 4 || !this.valid(start + 20, 4)) return DP.INVALIDPARAMS;
+            const total = Mem.readUint32(start + 20)!;
+            if (total < 24 || total > 65536 || !this.valid(start, total)) return DP.INVALIDPARAMS;
             if (a[2]) return DP.INVALIDFLAGS;
-            if (!this.valid(a[1], 20)) return DP.INVALIDPARAMS;
-            let ptr = a[1], total = 0, provider = "";
-            for (let i = 0; i < 64; i++) {
-                if (!this.valid(ptr, 20)) break;
-                const type = hex(Mem.readBytes(ptr, 16)!), size = Mem.readUint32(ptr + 16)!;
-                if (size > 65536 || !this.valid(ptr + 20, size)) return DP.INVALIDPARAMS;
-                if (type === TOTAL_GUID && size === 4) total = Mem.readUint32(ptr + 20)!;
-                if (type === SERVICE_GUID && size === 16) { provider = hex(Mem.readBytes(ptr + 20, 16)!); break; }
-                ptr += 20 + size;
-                if (total && ptr >= a[1] + total) break;
-            }
-            return PROVIDERS.some(p => p.guid === provider) ? s.session.initialize() : DP.UNAVAILABLE;
+            // NT5 connect.c:345-397 enumerates LobbyProvider first, then
+            // ServiceProvider; each callback stops at the first match, even if
+            // a later chunk is malformed. wsock/dpsp.c:4956-4964 ignores the
+            // provider's EnumAddress failure. Native oracle: tail-byte succeeds.
+            // Copy the whole declared blob; short GUID chunks and the traversal
+            // cap remain local safety rules rather than native policy.
+            const bytes = Mem.readBytes(start, total)!.slice();
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const find = (guid: string): string => {
+                let offset = 0, count = 0;
+                while (offset < total && ++count <= 64) {
+                    if (total - offset < 20) return "";
+                    const size = view.getUint32(offset + 16, true);
+                    if (size > total - offset - 20) return "";
+                    const type = hex(bytes.subarray(offset, offset + 16));
+                    if (type === guid)
+                        return size >= 16 ? hex(bytes.subarray(offset + 20, offset + 36)) : "";
+                    offset += 20 + size;
+                }
+                return "";
+            };
+            const lobby = find(LOBBY_GUID);
+            // Lobby providers are not implemented here; never fall back to SP
+            // after a non-null lobby GUID wins the first pass.
+            if (lobby && lobby !== ZERO_GUID) return DP.UNAVAILABLE;
+            const provider = find(SERVICE_GUID);
+            if (!provider || provider === ZERO_GUID) return DP.INVALIDPARAMS;
+            return PROVIDERS.some(p => p.guid === provider) ? s.session.initialize({provider, bytes}) : DP.UNAVAILABLE;
         };
         methods.Open = (s, a, legacy, ctx, wide = false) => {
             if (s.session.readyError) return s.session.readyError;
@@ -659,12 +693,24 @@ export class DirectPlayNetworkApi {
             if (a[5] & ~0xf3) return DP.INVALIDFLAGS;
             if (!this.valid(a[3], 1, "rx")) return DP.INVALIDPARAMS;
             const desc = this.desc(a[1], legacy, wide); if (!desc) return DP.INVALIDPARAMS;
-            const error = s.session.discover(desc.application); if (error) return error;
+            if (s.session.readyError) return s.session.readyError;
+            const connection = s.session.getConnectionAddress();
+            const nativeMode = this.network.winsock?.provider === "native" && connection?.provider === PROVIDERS[0].guid;
             const timeout = Math.min(a[2] || 1000, 30000);
             const entriesForCache = (): EnumerationEntry[] => {
                 const entries: EnumerationEntry[] = [...s.session.discovered.values()]
-                    .filter(d => desc.application === ZERO_GUID || d.desc.application === desc.application)
-                    .filter(d => !(a[5] & 1) || !d.desc.maxPlayers || d.currentPlayers < d.desc.maxPlayers)
+                    .filter(d => !!d.native === nativeMode)
+                    .filter(d => (nativeMode && (a[5] & 2) !== 0) || desc.application === ZERO_GUID || d.desc.application === desc.application)
+                    .filter(d => {
+                        // NT5 enum.c CheckSessionDesc: ALL takes precedence;
+                        // flags=0 defaults to AVAILABLE in DP_EnumSessions.
+                        if (nativeMode) {
+                            const available = !(a[5] & 2) && (!a[5] || !!(a[5] & 1));
+                            return !available || ((!d.desc.maxPlayers || d.currentPlayers < d.desc.maxPlayers) &&
+                                !(d.desc.flags & 0x21));
+                        }
+                        return !(a[5] & 1) || !d.desc.maxPlayers || d.currentPlayers < d.desc.maxPlayers;
+                    })
                     .map(d => ({
                         pack: (base: number) => {
                             const sd = packDesc(d.desc, d.currentPlayers, base, legacy, wide), bytes = new Uint8Array(sd.length + 4);
@@ -678,6 +724,52 @@ export class DirectPlayNetworkApi {
                 entries.push({ pack: () => new Uint8Array(4), args: base => legacy ? [0, a[4], base, 1] : [0, base, 1, a[4]] });
                 return entries;
             };
+            if (nativeMode) {
+                // Only AVAILABLE and ALL have an implemented native slice.
+                // ASYNC, PASSWORDREQUIRED and RETURNSTATUS have additional
+                // semantics; do not send a request claiming to support them.
+                // Outbound-only connection reuse remains unsupported.
+                if ((a[5] & ~0x03) || desc.password || !connection) return DP.UNAVAILABLE;
+                const destination = nativeEnumDestination(connection.bytes, this.network);
+                const tcpPort = nativeEnumTcpPort(connection.bytes);
+                if (!destination || tcpPort === undefined) return DP.UNAVAILABLE;
+                const owner = s.session.beginNativeDiscovery(), ownerEpoch = owner.epoch;
+                let socketTable: WsaSocketTable;
+                try { socketTable = this.nativeSockets(); }
+                catch { owner.finish(); return DP.UNAVAILABLE; }
+                return discoverNativeSessions(socketTable, {
+                    applicationGuid: unhex(desc.application), flags: a[5], destination, tcpPort,
+                    timeoutMs: timeout, maxFrameBytes: 65536, signal: owner.signal,
+                }).then<ThunkResult, ThunkResult>(replies => {
+                    if (!owner.current()) return {value: DP.SESSIONLOST};
+                    for (const reply of replies) {
+                        if (reply.size !== 80 || (reply.name?.length ?? 0) > 1024) continue;
+                        const instance = hex(reply.instanceGuid), application = hex(reply.applicationGuid);
+                        const peerOwner = nativeDiscoveryOwner(reply.providerSockaddr, reply.peer, reply.version, this.network);
+                        if (!owner.current()) return {value: DP.SESSIONLOST};
+                        if (!peerOwner) continue;
+                        if (!(a[5] & 2) && desc.application !== ZERO_GUID && application !== desc.application) continue;
+                        if (s.session.discovered.size >= 256 && !s.session.discovered.has(instance)) continue;
+                        s.session.discovered.set(instance, {
+                            desc: {instance, application, flags: reply.flags, maxPlayers: reply.maxPlayers,
+                                name: reply.name ?? "", nameNull: reply.name === null,
+                                password: "", passwordNull: true, reserved: [...reply.reserved], user: [...reply.user]},
+                            currentPlayers: reply.currentPlayers,
+                            address: peerOwner.address,
+                            nativeProvider: {sockaddr: peerOwner.sockaddr, peer: peerOwner.peer, version: peerOwner.version},
+                            seen: Date.now(), native: true, nativeEpoch: ownerEpoch,
+                        });
+                    }
+                    if (!owner.current()) return {value: DP.SESSIONLOST};
+                    return {value: DP.OK, startCallbackChain: frame => {
+                        if (!owner.current()) { owner.finish(); return false; }
+                        const result = this.enumerate(frame, a[3], 24, entriesForCache(), owner.current, owner.finish);
+                        if (typeof result !== "object" || !result.suspendedForCallback) owner.finish();
+                        return typeof result === "object" && !!result.suspendedForCallback;
+                    }};
+                }, () => { const current = owner.current(); owner.finish(); return {value: current ? DP.UNAVAILABLE : DP.SESSIONLOST}; });
+            }
+            const error = s.session.discover(desc.application); if (error) return error;
             if (a[5] & 0x10) {
                 s.session.startDiscovery(desc.application, timeout);
                 return this.enumerate(ctx, a[3], 24, entriesForCache());
@@ -689,14 +781,23 @@ export class DirectPlayNetworkApi {
                 },
             }), timeout));
         };
-        methods.EnumConnections = (_s, a, _legacy, ctx, wide = false) => this.enumerate(ctx, a[2], 20, PROVIDERS.map(provider => ({
-            pack: (base: number) => {
-                const name = { short: provider.name, long: provider.name }, b = new BufferWriter(16 + 36 + 16, nameExtra(name, wide), base);
-                b.bytes.set(unhex(provider.guid)); b.bytes.set(unhex(SERVICE_GUID), 16); b.u32(32, 16); b.bytes.set(unhex(provider.guid), 36);
-                writeName(b, 52, name, wide); return b.bytes;
-            },
-            args: base => [base, base + 16, 36, base + 52, 1, a[3]],
-        })));
+        methods.EnumConnections = (_s, a, _legacy, ctx, wide = false) => {
+            if (a[1] && !this.valid(a[1], 16)) return DP.INVALIDPARAMS;
+            if (a[4] & ~3) return DP.INVALIDFLAGS;
+            const flags = a[4] || 1;
+            // NT5 connect.c:105-114 and dplaypr.h:229-237: ADDRESSHEADER
+            // includes a zeroed third DPADDRESS and is 80 bytes on x86.
+            const providers = flags & 1 ? PROVIDERS : [];
+            return this.enumerate(ctx, a[2], 20, providers.map(provider => ({
+                pack: (base: number) => {
+                    const name = { short: provider.name, long: provider.name }, b = new BufferWriter(80 + 16, nameExtra(name, wide), base);
+                    b.bytes.set(unhex(TOTAL_GUID), 0); b.u32(16, 4); b.u32(20, 80);
+                    b.bytes.set(unhex(SERVICE_GUID), 24); b.u32(40, 16); b.bytes.set(unhex(provider.guid), 44);
+                    writeName(b, 80, name, wide); return b.bytes;
+                },
+                args: base => [base + 44, base, 80, base + 80, flags, a[3]],
+            })));
+        };
         const resource = SystemResourceProvider.getInstance();
         const bind = (ifaceName: string, methodName: string): ThunkImplementation => {
             const iface = dplayxModule.interfaces!.find(i => i.name === ifaceName)!;

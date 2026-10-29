@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { DirectPlayNetworkApi, packDirectPlayMessage } from "../../src/worker/modules/dplayx/network-api";
 import { DP, DirectPlaySession } from "../../src/worker/modules/dplayx/session";
-import { decodeDatagram, encodeDatagram, isBroadcastNode } from "../../src/worker/net/netplay-wire";
+import { decodeDatagram, encodeDatagram, encodeTcpFrame, PROTO_TCP, PROTO_UDP, PROTO_DIRECTPLAY, SYN, DATA, TCP_WINDOW, isBroadcastNode } from "../../src/worker/net/netplay-wire";
 import { LanNetwork } from "../../src/worker/net/lan-network";
+import { WsaSocketTable } from "../../src/worker/modules/wsa-network";
 import { Mem } from "../../src/worker/core/memory/mem-accessor";
 import { System } from "../../src/worker/core/system";
 import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
@@ -157,6 +158,308 @@ test("remote CreatePlayer returns deferred writes and cannot touch another activ
         expect(result.deferredWrites).toEqual([{ address: 0x4000, value: 1, size: 4 }]);
     } finally { Mem.bind(() => mem); host.dispose(); }
 });
+test("InitializeConnection owns the complete bounded address regardless of element order", () => {
+    const totalGuid = "60f518132c91d0119daa00a0c90a43cb";
+    const providerGuid = "c016d907afe0cf119c4e00a0c905425e";
+    const inetGuid = "a04da5c4afe0cf119c4e00a0c905425e";
+    const portGuid = "414552e4a58ed1118a96006097b01411";
+    const provider = "e05ee9367785cf11960c0080c7534e82";
+    const elements = [
+        {guid:providerGuid, data:Uint8Array.from(provider.match(/../g)!, x=>parseInt(x,16))},
+        {guid:inetGuid, data:new TextEncoder().encode("192.0.2.42\0")},
+        {guid:portGuid, data:Uint8Array.of(0x18,0xba)},
+    ];
+    const write = (base:number, order:number[]) => {
+        const length=24+order.reduce((sum,i)=>sum+20+elements[i].data.length,0);
+        bytes(base,totalGuid); u32(base+16,4); u32(base+20,length);
+        let p=base+24;
+        for(const i of order) { const e=elements[i]; bytes(p,e.guid); u32(p+16,e.data.length); mem.set(e.data,p+20); p+=20+e.data.length; }
+        return mem.slice(base,base+length);
+    };
+    const first=write(0x2000,[0,1,2]);
+    expect(call("InitializeConnection",[0x2000,0])).toBe(DP.OK);
+    const firstSession=(api as any).state(primary).session as DirectPlaySession;
+    mem.fill(0x99,0x2000,0x2000+first.length);
+    const copy=firstSession.getConnectionAddress()!;
+    expect(copy.provider).toBe(provider); expect(copy.bytes).toEqual(first);
+    copy.bytes.fill(0);
+    expect(firstSession.getConnectionAddress()!.bytes).toEqual(first);
+    const replacement=write(0x3000,[2,1,0]);
+    expect(call("InitializeConnection",[0x3000,0])).toBe(DP.ALREADYINITIALIZED);
+    expect(firstSession.getConnectionAddress()!.bytes).toEqual(first);
+    primary=object();
+    expect(call("InitializeConnection",[0x3000,0])).toBe(DP.OK);
+    const secondSession=(api as any).state(primary).session as DirectPlaySession;
+    expect(secondSession.getConnectionAddress()!.bytes).toEqual(replacement);
+    api.reset();
+    expect(firstSession.getConnectionAddress()).toBeUndefined();
+    expect(secondSession.getConnectionAddress()).toBeUndefined();
+});
+test("EnumConnections returns the 80-byte source ADDRESSHEADER accepted by InitializeConnection",()=>{
+    const result=call("EnumConnections",[0,0x7000,0x1234,0]) as ThunkResult;
+    expect(result.suspendedForCallback).toBe(true);
+    const [provider, address, size, name, flags, context]=callbacks[0].args;
+    expect([provider,address+44,size,name,flags,context]).toEqual([address+44,address+44,80,address+80,1,0x1234]);
+    const hex=(value:Uint8Array)=>[...value].map(n=>n.toString(16).padStart(2,"0")).join("");
+    expect(hex(mem.slice(address,address+16))).toBe("60f518132c91d0119daa00a0c90a43cb");
+    expect(read(address+16)).toBe(4); expect(read(address+20)).toBe(80);
+    expect(hex(mem.slice(address+24,address+40))).toBe("c016d907afe0cf119c4e00a0c905425e");
+    expect(read(address+40)).toBe(16);
+    expect(hex(mem.slice(address+44,address+60))).toBe("e05ee9367785cf11960c0080c7534e82");
+    expect([...mem.slice(address+60,address+80)]).toEqual(Array(20).fill(0));
+    const owned=mem.slice(address,address+80);
+    expect(call("InitializeConnection",[address,0])).toBe(DP.OK);
+    expect(((api as any).state(primary).session as DirectPlaySession).getConnectionAddress()!.bytes).toEqual(owned);
+    expect(callbacks[0].done?.(0)).toBe(DP.OK);
+});
+test("InitializeConnection rejects an address without its size header or service provider",()=>{
+    bytes(0x2000,"c016d907afe0cf119c4e00a0c905425e");u32(0x2010,16);
+    bytes(0x2014,"e05ee9367785cf11960c0080c7534e82");
+    expect(call("InitializeConnection",[0x2000,1])).toBe(DP.INVALIDPARAMS);
+    bytes(0x2000,"60f518132c91d0119daa00a0c90a43cb");u32(0x2010,4);u32(0x2014,24);
+    expect(call("InitializeConnection",[0x2000,0])).toBe(DP.INVALIDPARAMS);
+});
+test("InitializeConnection checks object and address before flags",()=>{
+    expect(call("InitializeConnection",[0,1])).toBe(DP.INVALIDPARAMS);
+    const base=0x2000;
+    bytes(base,"60f518132c91d0119daa00a0c90a43cb");u32(base+16,4);u32(base+20,0x100000);
+    expect(call("InitializeConnection",[base,1])).toBe(DP.INVALIDPARAMS);
+    u32(base+20,60);
+    bytes(base+24,"c016d907afe0cf119c4e00a0c905425e");u32(base+40,16);
+    bytes(base+44,"e05ee9367785cf11960c0080c7534e82");
+    expect(call("InitializeConnection",[base,1])).toBe(DP.INVALIDFLAGS);
+    expect(call("InitializeConnection",[base,0])).toBe(DP.OK);
+    expect(call("InitializeConnection",[0,1])).toBe(DP.ALREADYINITIALIZED);
+});
+test("InitializeConnection follows native tail-byte and malformed SP observations",()=>{
+    // Oracle dp4-address-oracle-20261028-second: tail-byte INIT 0,
+    // tail-before-sp INIT INVALIDPARAMS.
+    const base=0x2000;
+    bytes(base,"60f518132c91d0119daa00a0c90a43cb");u32(base+16,4);u32(base+20,91);
+    bytes(base+24,"c016d907afe0cf119c4e00a0c905425e");u32(base+40,0x1000);
+    bytes(base+44,"e05ee9367785cf11960c0080c7534e82");
+    bytes(base+60,"a04da5c4afe0cf119c4e00a0c905425e");u32(base+76,10);
+    bytes(base+80,"3132372e302e302e3100");mem[base+90]=0xa5;
+    expect(call("InitializeConnection",[base,0])).toBe(DP.INVALIDPARAMS);
+    expect(((api as any).state(primary).session as DirectPlaySession).getConnectionAddress()).toBeUndefined();
+    u32(base+40,16);
+    const owned=mem.slice(base,base+91);
+    expect(call("InitializeConnection",[base,0])).toBe(DP.OK);
+    expect(((api as any).state(primary).session as DirectPlaySession).getConnectionAddress()!.bytes).toEqual(owned);
+});
+test("a LobbyProvider wins the NT5 first pass even when a supported SP comes first",()=>{
+    const base=0x2000;
+    bytes(base,"60f518132c91d0119daa00a0c90a43cb");u32(base+16,4);u32(base+20,96);
+    bytes(base+24,"c016d907afe0cf119c4e00a0c905425e");u32(base+40,16);
+    bytes(base+44,"e05ee9367785cf11960c0080c7534e82");
+    bytes(base+60,"4056b9596796d011a77d0000f803abfc");u32(base+76,16);
+    bytes(base+80,"0102030405060708090a0b0c0d0e0f10");
+    // Lobby loading is not implemented, so report unavailable and do not use SP.
+    expect(call("InitializeConnection",[base,0])).toBe(DP.UNAVAILABLE);
+    expect(((api as any).state(primary).session as DirectPlaySession).getConnectionAddress()).toBeUndefined();
+});
+
+function nativeDiscoveryFixture() {
+    api.reset();
+    const network=new LanNetwork(Uint8Array.of(2,0,0,1,2,3)), sent: Uint8Array[]=[];
+    let open!: (lease: any)=>void, releases=0, isLive=true;
+    let ended!: (error:{code:number;message:string})=>void;
+    const closed=new Promise<{code:number;message:string}>(ok=>{ended=ok;});
+    const allowed=[[2,1,127,0,0,1]];
+    const lease={address:{node:allowed[0],port:2309},allowedNodes:allowed,isLive:()=>isLive,closed,
+        release(){if(isLive){isLive=false;releases++;ended({code:10054,message:"closed"});}}};
+    network.attach({connected:true,send(frame){sent.push(frame.slice());return true;},close(){},
+        openTcpHost(){return new Promise(ok=>{open=ok;});}});
+    network.configureGatewayAddresses([[192,0,2,1]]);
+    network.configureTcpHosts({listeners:[{id:"game",allowedNodes:allowed}]});
+    network.configureWinsock({provider:"native",hostListener:"game"});
+    const table=new WsaSocketTable(network);
+    const tables=(api as any).tables as () => Record<string,VTableInfo>;
+    api=new DirectPlayNetworkApi(process,tables,network,()=>table);exports={};api.install(exports);
+    const base=0x2000;
+    bytes(base,"60f518132c91d0119daa00a0c90a43cb");u32(base+16,4);u32(base+20,90);
+    bytes(base+24,"c016d907afe0cf119c4e00a0c905425e");u32(base+40,16);
+    bytes(base+44,"e05ee9367785cf11960c0080c7534e82");
+    bytes(base+60,"a04da5c4afe0cf119c4e00a0c905425e");u32(base+76,10);
+    bytes(base+80,"3139322e302e322e3100");
+    expect(call("InitializeConnection",[base,0])).toBe(DP.OK);
+    u32(0x3000,80); bytes(0x3018,"101112131415161718191a1b1c1d1e1f");
+    const run=(flags=0)=>call("EnumSessions",[0x3000,60,0x7000,0,flags]) as Promise<ThunkResult>;
+    return {network,table,sent,ready:()=>open(lease),releases:()=>releases,run};
+}
+const nativeReply=Uint8Array.from(Buffer.from(
+    "7600b0fa020008fcc00002010000000000000000"+
+    "706c617901000b005000000000200000000102030405060708090a0b0c0d0e0f"+
+    "101112131415161718191a1b1c1d1e1f08000000030000000000000000000000"+
+    "0403020188776655010000000200000003000000040000005c000000410016040000","hex"));
+async function discoveryTick(){await new Promise(resolve=>setTimeout(resolve,5));}
+test("native EnumSessions uses READY, native reply and normal timeout callback chain",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();expect(f.sent).toHaveLength(0);
+        f.ready();await discoveryTick();
+        const udp=f.sent.map(decodeDatagram).find(d=>d?.proto===PROTO_UDP);
+        expect(udp?.dstPort).toBe(47624);
+        expect(f.sent.map(decodeDatagram).some(d=>d?.proto===PROTO_DIRECTPLAY)).toBe(false);
+        const port=f.table.get(0x10000000).local!.port, source=Uint8Array.of(2,1,127,0,0,1);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(SYN,88,0,TCP_WINDOW)));
+        await discoveryTick();
+        const child=f.table.get(0x10000003);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(DATA,88,child.wireId,0,nativeReply)));
+        const result=await pending;expect(result.value).toBe(DP.OK);
+        expect(result.startCallbackChain!({esp:0x9000} as never)).toBe(true);
+        expect(callbacks).toHaveLength(1);
+        const record=callbacks[0].args[0];
+        expect(read(record+40)).toBe(8);expect(read(record+44)).toBe(3);
+        expect(read(record+56)).toBe(0x01020304);expect(read(record+60)).toBe(0x55667788);
+        expect(callbacks[0].done?.(1)).toBeNull();
+        (callbacks[0] as any).enumerationState.continueEnumeration();
+        expect(callbacks).toHaveLength(2);
+        expect(callbacks[1].args[0]).toBe(0);
+        expect(callbacks[1].args[2]).toBe(1);
+        expect(callbacks[1].done?.(1)).toBe(DP.OK);
+        const state=(api as any).state(primary).session as DirectPlaySession;
+        const entry=[...state.discovered.values()][0];
+        expect(entry.native).toBe(true);
+        expect(entry.address).toEqual({node:[2,1,192,0,2,1],port:2300});
+        expect(entry.nativeProvider?.version).toBe(11);
+        expect([...entry.nativeProvider!.sockaddr.slice(4,8)]).toEqual([192,0,2,1]);
+        expect([...entry.nativeProvider!.peer.ip!]).toEqual([127,0,0,1]);
+        expect(entry.nativeProvider?.peer.port).toBe(4000);
+        expect(await state.join(entry.desc)).toBe(DP.UNAVAILABLE);
+        expect(f.releases()).toBe(1);
+    } finally {f.table.reset();}
+});
+test("native reply zero advertised IP is rehomed from the accepted peer, keeping host port",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();f.ready();await discoveryTick();
+        const port=f.table.get(0x10000000).local!.port, source=Uint8Array.of(2,1,127,0,0,1);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(SYN,88,0,TCP_WINDOW)));
+        await discoveryTick();
+        const child=f.table.get(0x10000003), frame=nativeReply.slice();
+        frame.fill(0,8,12);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(DATA,88,child.wireId,0,frame)));
+        frame.fill(0xff);source.fill(0xff);
+        const result=await pending;expect(result.value).toBe(DP.OK);
+        const session=(api as any).state(primary).session as DirectPlaySession, entry=[...session.discovered.values()][0];
+        expect(entry.address).toEqual({node:[2,1,127,0,0,1],port:2300});
+        expect([...entry.nativeProvider!.sockaddr.slice(4,8)]).toEqual([127,0,0,1]);
+        expect(entry.nativeProvider?.version).toBe(11);
+        session.dispose();expect(session.discovered.size).toBe(0);
+        expect(result.startCallbackChain!({esp:0x9000} as never)).toBe(false);
+        expect(callbacks).toHaveLength(0);
+    } finally {f.table.reset();}
+});
+test("reentrant disconnect while routing a reply cannot replace a new virtual entry",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();f.ready();await discoveryTick();
+        const port=f.table.get(0x10000000).local!.port, source=Uint8Array.of(2,1,127,0,0,1);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(SYN,88,0,TCP_WINDOW)));
+        await discoveryTick();
+        const child=f.table.get(0x10000003);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(DATA,88,child.wireId,0,nativeReply)));
+        const session=(api as any).state(primary).session as DirectPlaySession;
+        const instance="000102030405060708090a0b0c0d0e0f";
+        const virtual={desc:{instance,application:"1".repeat(32),flags:0,maxPlayers:8,name:"virtual",password:"",user:[0,0,0,0]},
+            currentPlayers:1,address:{node:[2,0,0,0,0,1],port:1234},seen:Date.now()};
+        const route=f.network.routeIpv4.bind(f.network);
+        let routeCalls=0;
+        f.network.routeIpv4=(ip:Uint8Array)=>{
+            if (ip.join(".")==="192.0.2.1") {
+                routeCalls++;
+                f.network.setConnected(false,"injected reentrant disconnect");
+                session.discovered.set(instance,virtual);
+            }
+            return route(ip);
+        };
+        const result=await pending;
+        expect(routeCalls).toBe(1);
+        expect(result.value).toBe(DP.SESSIONLOST);
+        expect(session.discovered.get(instance)).toBe(virtual);
+        expect([...session.discovered.values()].some(item=>item.native)).toBe(false);
+        expect(result.startCallbackChain).toBeUndefined();
+        expect(callbacks).toHaveLength(0);
+    } finally {f.table.reset();}
+});
+test("native EnumSessions cancellation after READY prevents old result publication",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();f.ready();await discoveryTick();
+        expect(call("EnumSessions",[0,0,0,0,0x20])).toBe(DP.OK);
+        expect((await pending).value).toBe(DP.SESSIONLOST);
+        expect(((api as any).state(primary).session as DirectPlaySession).discovered.size).toBe(0);
+        expect(f.releases()).toBe(1);
+    } finally {f.table.reset();}
+});
+test("native default AVAILABLE filters disabled hosts before timeout callback",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();f.ready();await discoveryTick();
+        const port=f.table.get(0x10000000).local!.port, source=Uint8Array.of(2,1,127,0,0,1);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(SYN,88,0,TCP_WINDOW)));
+        await discoveryTick();
+        const child=f.table.get(0x10000003), disabled=nativeReply.slice();
+        new DataView(disabled.buffer).setUint32(32,0x21,true);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(DATA,88,child.wireId,0,disabled)));
+        const result=await pending;
+        expect(result.startCallbackChain!({esp:0x9000} as never)).toBe(true);
+        expect(callbacks).toHaveLength(1);
+        expect(callbacks[0].args[0]).toBe(0);expect(callbacks[0].args[2]).toBe(1);
+        expect(callbacks[0].done?.(1)).toBe(DP.OK);
+    } finally {f.table.reset();}
+});
+test("native ALL takes precedence over AVAILABLE and application filter",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run(3);f.ready();await discoveryTick();
+        const port=f.table.get(0x10000000).local!.port, source=Uint8Array.of(2,1,127,0,0,1);
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(SYN,88,0,TCP_WINDOW)));
+        await discoveryTick();
+        const child=f.table.get(0x10000003), reply=nativeReply.slice();
+        new DataView(reply.buffer).setUint32(32,0x21,true);
+        reply[52]^=0xff;
+        f.network.receiveFrame(encodeDatagram(PROTO_TCP,source,port,4000,encodeTcpFrame(DATA,88,child.wireId,0,reply)));
+        const result=await pending;
+        expect(result.startCallbackChain!({esp:0x9000} as never)).toBe(true);
+        expect(callbacks[0].args[0]).not.toBe(0);
+        expect(read(callbacks[0].args[0]+4)).toBe(0x21);
+        expect(callbacks[0].done?.(0)).toBe(DP.OK);
+    } finally {f.table.reset();}
+});
+test("COM disposal aborts the original native owner before object reuse",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();f.ready();await discoveryTick();
+        api.reset();
+        expect((await pending).value).toBe(DP.SESSIONLOST);
+        expect(f.releases()).toBe(1);
+        primary=object();
+        expect(call("InitializeConnection",[0x2000,0])).toBe(DP.OK);
+        expect(((api as any).state(primary).session as DirectPlaySession).discovered.size).toBe(0);
+    } finally {f.table.reset();}
+});
+test("stop after completion suppresses a not-yet-started callback chain",async()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        const pending=f.run();f.ready();
+        const result=await pending;
+        expect(result.value).toBe(DP.OK);
+        expect(call("EnumSessions",[0,0,0,0,0x20])).toBe(DP.OK);
+        expect(result.startCallbackChain!({esp:0x9000} as never)).toBe(false);
+        expect(callbacks).toHaveLength(0);
+    } finally {f.table.reset();}
+});
+test("native unsupported async and missing endpoint never send virtual discovery",()=>{
+    const f=nativeDiscoveryFixture();
+    try {
+        for (const flags of [0x10,0x40,0x80,0x41,0x82])
+            expect(call("EnumSessions",[0x3000,60,0x7000,0,flags])).toBe(DP.UNAVAILABLE);
+        expect(f.sent).toHaveLength(0);
+    } finally {f.table.reset();}
+});
+
 test("native Lobby compound addresses validate element extents and round-trip through InitializeConnection", () => {
     bytes(0x2000, "c016d907afe0cf119c4e00a0c905425e");
     u32(0x2010, 16); u32(0x2014, 0x2100); bytes(0x2100, "e05ee9367785cf11960c0080c7534e82");
@@ -166,7 +469,7 @@ test("native Lobby compound addresses validate element extents and round-trip th
     expect(call("CreateCompoundAddress", [0x2000, 1, 0x10000, 0x2200], "IDirectPlayLobby3A")).toBe(DP.OK);
     expect(read(0x10010)).toBe(4); expect(read(0x10014)).toBe(60);
     expect(call("InitializeConnection", [0x10000, 0])).toBe(DP.OK);
-    expect(call("InitializeConnection", [0x10000, 1])).toBe(DP.INVALIDFLAGS);
+    expect(call("InitializeConnection", [0x10000, 1])).toBe(DP.ALREADYINITIALIZED);
     u32(0x2010, 0xfffffff0);
     expect(call("CreateCompoundAddress", [0x2000, 1, 0x10000, 0x2200], "IDirectPlayLobby3A")).toBe(DP.INVALIDPARAMS);
 });

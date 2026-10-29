@@ -195,11 +195,51 @@ impl UdpListenerConfig {
             .collect()
     }
 }
+fn listener_startup_timeout() -> u64 {
+    10000
+}
+/// TCP listeners are opt-in and never acquire a native socket merely by being configured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpListenerConfig {
+    pub id: String,
+    pub bind_host: String,
+    pub advertised_host: String,
+    pub port: u16,
+    pub allowed_hosts: Vec<String>,
+    #[serde(default = "one_owner")]
+    pub max_owners: usize,
+    #[serde(default = "listener_peers")]
+    pub max_pending: usize,
+    #[serde(default = "listener_startup_timeout")]
+    pub startup_timeout_ms: u64,
+}
+impl TcpListenerConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        // Reuse the UDP policy's strict numeric IPv4, unicast and ACL validation.
+        let policy = UdpListenerConfig {
+            id: self.id.clone(),
+            bind_host: self.bind_host.clone(),
+            advertised_host: self.advertised_host.clone(),
+            port: self.port,
+            allowed_hosts: self.allowed_hosts.clone(),
+            max_owners: self.max_owners,
+            max_peers: self.max_pending,
+            idle_timeout_ms: 1,
+        };
+        policy.validate().map_err(|_| err("Invalid TCP listener policy"))?;
+        if !(1..=120000).contains(&self.startup_timeout_ms) {
+            return Err(err("Invalid TCP listener startup timeout"));
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GatewayConfig {
     pub routes: Vec<RouteConfig>,
     pub udp_listeners: Vec<UdpListenerConfig>,
+    pub tcp_listeners: Vec<TcpListenerConfig>,
     pub max_tcp_connections: usize,
     pub max_udp_flows: usize,
     pub max_raw_flows: usize,
@@ -213,6 +253,7 @@ impl Default for GatewayConfig {
         Self {
             routes: vec![],
             udp_listeners: vec![],
+            tcp_listeners: vec![],
             max_tcp_connections: 128,
             max_udp_flows: 128,
             max_raw_flows: 64,
@@ -227,6 +268,7 @@ impl GatewayConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.routes.len() > 128
             || self.udp_listeners.len() > 32
+            || self.tcp_listeners.len() > 32
             || [
                 self.max_tcp_connections,
                 self.max_udp_flows,
@@ -253,6 +295,16 @@ impl GatewayConfig {
             listener.validate()?;
             if !ids.insert(&listener.id) {
                 return Err(err("Duplicate UDP listener identity"));
+            }
+        }
+        ids.clear();
+        for listener in &self.tcp_listeners {
+            listener.validate()?;
+            if listener.max_pending > self.max_tcp_connections {
+                return Err(err("TCP listener pending limit exceeds gateway capacity"));
+            }
+            if !ids.insert(&listener.id) {
+                return Err(err("Duplicate TCP listener identity"));
             }
         }
         Ok(())

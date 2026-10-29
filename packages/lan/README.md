@@ -204,6 +204,51 @@ credits and a reserved ABORT path. Scope-bearing, multicast and mapped endpoints
 retain their existing backend. See [native/README.md](native/README.md) for the
 protocol and capability limits; full asynchronous UDP error parity remains unfinished.
 
+The TypeScript server also has an **experimental** pre-accept TCP listener
+backend for conformance work. It is selected only by an explicit absolute
+`gateway.nativeTcpAcceptHelperPath`; normal clients do not receive the
+`tcpHostListenV1` capability, so configuring this backend alone does not
+enable TCP hosting in the emulator. Non-inline urgent data and urgent-mark
+semantics remain unfinished. Do not use this backend as a parity claim.
+
+Build its helper from `packages/lan/native` with a C11 compiler. On Windows
+(MinGW):
+
+```powershell
+gcc -std=c11 -O1 tcp-accept-process.c tcp-accept-framer.c tcp-accept-actor.c tcp-accept-owner.c tcp-accept-flow.c -lws2_32 -o tcp-accept-process.exe
+```
+
+On POSIX:
+
+```sh
+cc -std=c11 -O1 tcp-accept-process-posix.c tcp-accept-framer.c tcp-accept-actor.c tcp-accept-owner.c tcp-accept-flow.c -o tcp-accept-process
+```
+
+For an owned local test, configure the absolute helper path and server-controlled
+listener ACL, for example:
+
+```json
+{
+  "gateway": {
+    "routes": [],
+    "nativeTcpAcceptHelperPath": "C:/bottleship-lan/native/tcp-accept-process.exe",
+    "tcpListeners": [{
+      "id": "game",
+      "bindHost": "127.0.0.1",
+      "advertisedHost": "127.0.0.1",
+      "port": 0,
+      "allowedHosts": ["127.0.0.1"]
+    }]
+  }
+}
+```
+
+The helper enforces at most 60 children per process on Windows and 128 on POSIX;
+all helper children and outbound connections share `maxTcpConnections`.
+Listener release stops new accepts while established children retain their
+binding until they close. Full urgent-data behavior, actual full-pipe pressure,
+and end-to-end guest interoperability still need verification.
+
 SO_KEEPALIVE and TCP_NODELAY use the actual native TCP socket in both Node and
 helper backends. Both default to false. Initial SYN flags preserve options set
 before connect; live option frames also work while SYNACK is pending. TCP_OPTION

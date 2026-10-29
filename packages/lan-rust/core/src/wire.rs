@@ -313,6 +313,49 @@ impl UdpHostRequest {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpHostRequest {
+    pub proto: u8,
+    pub local_port: u16,
+    pub binding_generation: u32,
+    pub listener_id: String,
+}
+impl TcpHostRequest {
+    pub fn decode(v: &Value) -> Result<Self, WireError> {
+        let fail = WireError("Invalid TCP Host request");
+        let proto = v
+            .get("proto")
+            .and_then(|v| number(v, 2))
+            .filter(|v| *v == 2)
+            .ok_or(fail.clone())? as u8;
+        let local_port = v
+            .get("localPort")
+            .and_then(|v| positive(v, 65535))
+            .ok_or(fail.clone())? as u16;
+        let binding_generation = v
+            .get("bindingGeneration")
+            .and_then(|v| positive(v, u32::MAX))
+            .ok_or(fail.clone())?;
+        let id = v
+            .get("listenerId")
+            .and_then(Value::as_str)
+            .ok_or(fail.clone())?;
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(fail);
+        }
+        Ok(Self {
+            proto,
+            local_port,
+            binding_generation,
+            listener_id: id.into(),
+        })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundEvent {
     Multicast4 {
         datagram: Multicast4Datagram,
@@ -322,6 +365,9 @@ pub enum InboundEvent {
         datagram: Datagram,
         generation: Option<u32>,
     },
+    OpenTcpHost { id: u32, request: TcpHostRequest },
+    CancelTcpHost { id: u32 },
+    ReleaseTcpHost { id: u32 },
     OpenUdpHost {
         id: u32,
         request: UdpHostRequest,
@@ -361,6 +407,7 @@ pub enum DecodeError {
     Ignore,
     Lease { id: u32 },
     Host { id: u32 },
+    TcpHost { id: u32 },
     Resolve { id: u32 },
 }
 fn json_arg(a: &Arg) -> Option<&Value> {
@@ -405,6 +452,23 @@ pub fn decode_event(name: &str, args: &[Arg]) -> Result<InboundEvent, DecodeErro
                 proto: j(0).and_then(|v| number(v, 7)).ok_or_else(fail)? as u8,
                 port: j(1).and_then(|v| positive(v, 65535)).ok_or_else(fail)? as u16,
                 generation: j(2).and_then(|v| positive(v, u32::MAX)).ok_or_else(fail)?,
+            })
+        }
+        "openTcpHost" => {
+            let id = id().ok_or_else(fail)?;
+            if args.len() != 2 { return Err(TcpHost { id }); }
+            Ok(InboundEvent::OpenTcpHost {
+                id, request: TcpHostRequest::decode(j(1).ok_or(TcpHost { id })?)
+                    .map_err(|_| TcpHost { id })?,
+            })
+        }
+        "cancelTcpHost" | "releaseTcpHost" => {
+            if args.len() != 1 { return Err(Ignore); }
+            let id = id().ok_or(Ignore)?;
+            Ok(if name == "cancelTcpHost" {
+                InboundEvent::CancelTcpHost { id }
+            } else {
+                InboundEvent::ReleaseTcpHost { id }
             })
         }
         "openUdpHost" => {

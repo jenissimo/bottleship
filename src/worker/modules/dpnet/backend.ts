@@ -1,6 +1,20 @@
 import type { Address, Entity, Message, Reply, SessionDesc } from "../dplayx/session";
 
 export type DirectPlay8Message = Message & { processed?: () => void };
+export type NativeGroupState = "live" | "disconnecting" | "deleted" | "missing";
+/** Owner created before Client handshake completion; only the actual notification return releases its receives. */
+export interface DirectPlay8ConnectCompletionLease {
+    readonly entered: boolean;
+    enter(): void;
+    current(): boolean;
+    complete(): void;
+    cancel(result?: number): void;
+}
+export interface DirectPlay8NativeTerminationLease {
+    current(): boolean;
+    returned(): number;
+    cancel(): void;
+}
 export interface DirectPlay8HostRequest {
     localPort: number; bindingGeneration: number; localAddress: Address; signal: AbortSignal;
 }
@@ -22,6 +36,8 @@ export interface DirectPlay8Backend {
     readonly kind?: "native";
     readonly advertisedAddress?: Address;
     readonly pendingLocalProcessing?: number;
+    connectCompletionLease?(): DirectPlay8ConnectCompletionLease | undefined;
+    beginNativeTermination?(data: Uint8Array): number | DirectPlay8NativeTerminationLease;
     sendDpn?: DirectPlay8NativeSend;
     readonly entities: Map<number, Entity>;
     readonly queue: DirectPlay8Message[];
@@ -35,9 +51,18 @@ export interface DirectPlay8Backend {
     readonly desc: SessionDesc | null;
     readonly joinReply: Reply | null;
     onMessage?: (id: number) => void;
-    onInfo?: (id: number, returned: (result?: number) => void) => void;
+    onInfo?: (id: number, returned: (result?: number) => void, notify?: boolean) => void;
+    onPlayerCreated?: (id: number, returned: (result?: number) => void) => void;
+    onGroupCreated?: (id: number, returned: (result?: number) => void, context?: number) => void;
+    onGroupDestroyed?: (id: number, returned: (result?: number) => void) => void;
+    onGroupMember?: (group: number, player: number, add: boolean, returned: (result?: number) => void) => void;
+    queryGroup?(id: number): Entity | undefined;
+    groupState?(id: number): NativeGroupState;
     onChange?: () => void;
     onTermination?: (data: Uint8Array, reason?: number) => void;
+    onLocalTermination?: (reason: number) => void;
+    onNativeTermination?: (data: Uint8Array, reason: number, returned: (result?: number) => void) => void;
+    onPlayerDestroyReason?: (id: number, reason: number) => void;
     playerAddress(id: number): Address | null;
     removeMessage(index: number): void;
     send(from: number, to: number, flags: number, data: Uint8Array): number | Promise<number>;
