@@ -42,10 +42,20 @@ export const LANGUAGE_PRESETS: LanguagePreset[] = [
   { id: "vi-VN", label: "Vietnamese", v: { codepage: 1258, oemCodepage: 1258, lcid: 0x042A } },
 ];
 
+export type LanguageFields = { codepage?: number; oemCodepage?: number; lcid?: number };
+
+/** Keep explicit values on an unchanged selection; changing it writes the complete preset. */
+export function languageFieldsForSave(original: LanguageFields, selected: string): LanguageFields {
+  if (selected === detectLanguagePreset(original)) {
+    return Object.fromEntries(Object.entries(original).filter(([, value]) => value !== undefined));
+  }
+  return LANGUAGE_PRESETS.find((p) => p.id === selected)?.v ?? original;
+}
+
 /** The preset an emulator block selects (no fields = Windows' en-US default), or "" when
  *  its codepage/lcid match none. */
-export function detectLanguagePreset(e: { codepage?: number; lcid?: number } | undefined): string {
+export function detectLanguagePreset(e: { codepage?: number; oemCodepage?: number; lcid?: number } | undefined): string {
   const lcid = e?.lcid ?? 0x0409;
   const codepage = e?.codepage ?? 1252;
-  return LANGUAGE_PRESETS.find((p) => p.v.lcid === lcid && p.v.codepage === codepage)?.id ?? "";
+  return LANGUAGE_PRESETS.find((p) => p.v.lcid === lcid && p.v.codepage === codepage && (e?.oemCodepage === undefined || p.v.oemCodepage === e.oemCodepage))?.id ?? "";
 }
