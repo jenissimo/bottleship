@@ -58,13 +58,13 @@ export function registerFastPathTimeFunctions(dispatcher: HleDispatcher): void {
 
 function initTimeFunctions(): void {
     exports['GetTickCount'] = (ctx, mem, args): number => {
-        return TimeService.getInstance().nowMs() | 0;
+        return TimeService.getInstance().guestTickMs() | 0;
     };
 
     // ULONGLONG GetTickCount64(void): the same clock, unwrapped; EDX:EAX. Its low dword is
     // what GetTickCount answers at the same instant.
     exports['GetTickCount64'] = (): number => {
-        const ms = Math.max(0, Math.floor(TimeService.getInstance().nowMs()));
+        const ms = Math.max(0, Math.floor(TimeService.getInstance().guestTickMs()));
         const cpu = getCPU(System.getInstance().process?.v86);
         if (cpu) cpuViews(cpu).reg32[2] = Math.floor(ms / 0x100000000) | 0;
         return ms >>> 0;

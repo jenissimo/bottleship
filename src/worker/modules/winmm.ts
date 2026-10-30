@@ -1298,7 +1298,7 @@ export class WinMM implements IModule {
     initialize(process: Process): void {
 
         this.exports["timeGetTime"] = () => {
-            return TimeService.getInstance().nowMs() | 0;
+            return TimeService.getInstance().guestTickMs() | 0;
         };
 
         this.exports["timeGetDevCaps"] = (ctx, mem, args) => {

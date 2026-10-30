@@ -718,7 +718,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         view.setUint32(lpMsg + 4, WM_QUIT, true);   // message = WM_QUIT
         view.setUint32(lpMsg + 8, exitCode, true);   // wParam = exit code
         view.setUint32(lpMsg + 12, 0, true);         // lParam = 0
-        view.setUint32(lpMsg + 16, TimeService.getInstance().nowMs() | 0, true); // time
+        view.setUint32(lpMsg + 16, TimeService.getInstance().guestTickMs() | 0, true); // time
         view.setInt32(lpMsg + 20, 0, true);          // pt.x
         view.setInt32(lpMsg + 24, 0, true);          // pt.y
     }
