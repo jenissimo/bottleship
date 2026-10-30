@@ -782,9 +782,17 @@ export const createDeviceExports = (
         const obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
         if (!obj) return D3DERR_INVALIDCALL;
 
-        const success = obj.applyStateBlock(handle);
-        Logger.verboseLazy(LogCategory.DDRAW, () => `IDirect3DDevice7_ApplyStateBlock: handle=${handle} success=${success}`);
-        return success ? D3D_OK : D3DERR_INVALIDCALL;
+        const block = obj.applyStateBlock(handle);
+        if (block) {
+            const stages = obj.stateBlockTextureStages(block);
+            for (let stage = 0; stage < 8; stage++) {
+                if ((stages & (1 << stage)) && obj.getTexture(stage) !== block.textures[stage]) {
+                    textureManager.setDeviceTexture(obj, stage, block.textures[stage]);
+                }
+            }
+        }
+        Logger.verboseLazy(LogCategory.DDRAW, () => `IDirect3DDevice7_ApplyStateBlock: handle=${handle} success=${!!block}`);
+        return block ? D3D_OK : D3DERR_INVALIDCALL;
     };
 
     exports["IDirect3DDevice7_DeleteStateBlock"] = (ctx, mem, args) => {

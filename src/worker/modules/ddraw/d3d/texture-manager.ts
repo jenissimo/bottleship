@@ -271,6 +271,11 @@ export const createTextureManager = (context: DDrawContext): TextureManager => {
      */
     const setDeviceTexture = (deviceObj: Direct3DDevice3Object | Direct3DDevice7Object, stage: number, textureId: number): void => {
         if (!deviceObj) return;
+        // A recorded binding is not bound yet: the references move when the block is applied.
+        if (deviceObj.isRecording()) {
+            deviceObj.setTexture(stage, textureId);
+            return;
+        }
 
         const deviceHandle = deviceObj.handle;
         const oldAddr = deviceObj.getTexture(stage);

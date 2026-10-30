@@ -14,7 +14,7 @@ test("switching persistent texture handles preserves their surface ownership", (
         },
     };
     const device = {
-        handle: 123, getTexture: () => binding,
+        handle: 123, getTexture: () => binding, isRecording: () => false,
         setTexture: (_stage: number, value: number) => { binding = value; },
     };
     const manager = createTextureManager(context as any);
