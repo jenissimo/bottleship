@@ -15,6 +15,7 @@ import { hypercallDataManager } from '../../core/cpu/hypercall-data';
 import { installHook, uninstallHook, getHooksOfType, getNextHookInChain, hasHooksOfType, pushActiveHook, popActiveHook, currentActiveHook, WH_KEYBOARD, WH_GETMESSAGE, WH_CBT, HC_ACTION, HC_NOREMOVE } from './hooks';
 import { isSentinelWndProc } from './dialog';
 import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
+import type { Message } from '../../runtime/windowing/message-queue';
 import { getDefDlgProcAddress, getDefWindowProcAddress } from './system-classes';
 import { tryRichEditStreamMessage } from './rich-edit-stream';
 import { eraseControlOverlayRect, repaintDialogAfterContentChange } from './dialog-paint';
@@ -145,6 +146,38 @@ export function invokeWindowMessageSync(
     return invokeGuestWndProcSync(
         ctx, mem, win.wndProc, hwnd, message, wParam, lParam,
         stackCleanup, tag, onReturn,
+    );
+}
+
+/**
+ * The WM_SETCURSOR Windows SENDS from inside GetMessage/PeekMessage when the message it
+ * removes is a mouse move: one retrieval runs the window's cursor handler and hands out
+ * the move. The caller has already written the MSG; the thunk returns `value` once the
+ * window has answered. Null when there is nothing for the guest to run.
+ */
+function sendRetrievalSetCursor(
+    ctx: X86Context,
+    mem: Uint8Array,
+    msg: { hwnd: number; sentSetCursor?: { wParam: number; lParam: number } },
+    stackCleanup: number,
+    value: number,
+    tag: string,
+): ThunkResult | null {
+    const sc = msg.sentSetCursor;
+    if (!sc) return null;
+    const win = windows.get(msg.hwnd);
+    if (win?.isSystemControl && !win.wndProcSubclassed) {
+        const plan = defWindowProcSetCursor(msg.hwnd, sc.wParam, sc.lParam);
+        if (typeof plan === 'number') return null;
+        const forwarded = invokeWindowMessageSync(
+            ctx, mem, plan.forwardTo, WM_SETCURSOR_MSG, sc.wParam, sc.lParam, stackCleanup, tag,
+            (parentResult) => { plan.onParentResult(parentResult >>> 0); return value; },
+        );
+        if (!forwarded) plan.onParentResult(0);
+        return forwarded;
+    }
+    return invokeWindowMessageSync(
+        ctx, mem, msg.hwnd, WM_SETCURSOR_MSG, sc.wParam, sc.lParam, stackCleanup, tag, () => value,
     );
 }
 
@@ -747,6 +780,14 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             });
             Logger.verboseLazy(LogCategory.USER32, () =>
                 `GetMessageW(sync): msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
+            // WH_GETMESSAGE would need a second guest call chained after the send; with a
+            // hook installed the move is delivered without its WM_SETCURSOR.
+            if (msg.sentSetCursor && getMessageHooksFor(currentThreadId).length === 0) {
+                noteRetrievedExtraInfo(currentThreadId, msg);
+                writeMsgToMemory(mem, lpMsg, msg);
+                return sendRetrievalSetCursor(ctx, mem, msg, 16, retVal, 'GetMessage:WM_SETCURSOR')
+                    ?? { value: retVal, stackCleanup: 16 };
+            }
             if (isKeyboardHookMessage(msg.message)) {
                 // GetMessage blocking semantics vs discard-to-empty: delivering
                 // WM_NULL would be wrong, but a hook that discards is expected to
@@ -826,6 +867,20 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
                 // Got a real message — break out
                 break;
+            }
+
+            // No guest call can run from this resumed wait, so the WM_SETCURSOR the move
+            // carries is handed out as the message and the move goes back as pending: the
+            // next GetMessage retrieves it at once.
+            const pendingMove = waitMsg as Message;
+            if (pendingMove.sentSetCursor) {
+                system.windowManager.restorePendingMouseMove(pendingMove);
+                waitMsg = {
+                    hwnd: pendingMove.hwnd, message: WM_SETCURSOR_MSG,
+                    wParam: pendingMove.sentSetCursor.wParam, lParam: pendingMove.sentSetCursor.lParam,
+                    time: pendingMove.time, ptX: pendingMove.ptX, ptY: pendingMove.ptY,
+                    extraInfo: pendingMove.extraInfo,
+                };
             }
 
             restartRemovedTimer(waitMsg);
@@ -1083,6 +1138,12 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             LogCategory.USER32,
             () => `PeekMessageW: thread=${threadId} found msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} wParam=0x${msg.wParam.toString(16)} lParam=0x${msg.lParam.toString(16)}`
         );
+
+        if (msg.sentSetCursor && getMessageHooksFor(callerThreadId).length === 0) {
+            noteRetrievedExtraInfo(callerThreadId, msg);
+            writeMsgToMemory(mem, lpMsg, msg);
+            return sendRetrievalSetCursor(ctx, mem, msg, 20, 1, 'PeekMessage:WM_SETCURSOR') ?? 1;
+        }
 
         if (isKeyboardHookMessage(msg.message)) {
             const suspended = dispatchKeyboardHookChain(
