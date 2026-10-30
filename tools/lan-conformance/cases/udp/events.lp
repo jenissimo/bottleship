@@ -1,3 +1,4 @@
+# emu-skip live-worker delivery diverges only when an event mask is active
 # WSA event model on UDP: FD_WRITE latches at selection (shared event wakes
 # immediately); the datagram latches FD_READ on the second event, WSANetwork
 # Events reports it, and the receive drains it.
