@@ -20,11 +20,12 @@ const cli = new Map<string, string>();
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i += 2) {
     const name = argv[i], value = argv[i + 1];
-    if (!["--port", "--ready"].includes(name) || !value) throw new Error(`usage: dp8-wire-host.ts --port <n> --ready <file>`);
+    if (!["--port", "--ready", "--addr-file"].includes(name) || !value) throw new Error(`usage: dp8-wire-host.ts --port <n> --ready <file> [--addr-file <file>]`);
     cli.set(name, value);
 }
 const port = Number(cli.get("--port"));
 const readyFile = resolve(cli.get("--ready")!);
+const addrFile = cli.get("--addr-file") ? resolve(cli.get("--addr-file")!) : null;
 if (!Number.isInteger(port) || port <= 0) throw new Error("bad --port");
 
 // Announce the address clients must dial: the gateway route address (this
@@ -39,9 +40,14 @@ const host = new NativeDirectPlayHost(network);
 const socket: Socket = createSocket("udp4");
 
 const errors: string[] = [];
+// Replies go to the ACTUAL UDP source (the relay gateway's flow socket), not to
+// the virtual node encoded in the frame — the gateway maps them back to the guest.
+const lastSource = new Map<number, { address: string; port: number }>();
 socket.on("error", error => errors.push(String(error)));
 socket.on("message", (data, source) => {
-    if (source.address !== "127.0.0.1") return; // carrier is loopback; the gateway owns external reach
+    const decoded = decodeDatagram(data);
+    if (!decoded || decoded.proto !== PROTO_UDP) return;
+    lastSource.set(decoded.srcPort, { address: source.address, port: source.port });
     // Feed the datagram into the host session as if it arrived on this network.
     network.receiveFrame(encodeDatagram(PROTO_UDP, node, port, source.port, data), true);
 });
@@ -50,16 +56,17 @@ network.attach({
     send(frame) {
         const dg = decodeDatagram(frame);
         if (!dg || dg.proto !== PROTO_UDP || dg.srcPort !== port) return false;
-        socket.send(dg.payload, dg.dstPort, "127.0.0.1", error => { if (error) errors.push(String(error)); });
+        const replyTo = lastSource.get(dg.dstPort) ?? { address: "127.0.0.1", port: dg.dstPort };
+        socket.send(dg.payload, replyTo.port, replyTo.address, error => { if (error) errors.push(String(error)); });
         return true;
     },
     close() {},
 });
 
-socket.bind(port, "127.0.0.1", () => {
+socket.bind(port, () => {
     const hr = host.start({
         port,
-        application: { instance: "0".repeat(32), application: "5102dacf241b11d3aea7006097b01411", flags: 0, maxPlayers: 0, name: "session", password: "", user: [0, 0, 0, 0] },
+        application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: "a1".repeat(16), name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
         player: { name: "host", data: new Uint8Array(0) },
         url: a => `x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=${gatewayIp};port=${a.port}`,
         allowIncoming: () => true,
