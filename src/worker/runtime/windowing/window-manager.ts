@@ -877,6 +877,10 @@ export class WindowManager {
         return this.messageQueue.snapshot();
     }
 
+    restorePendingMouseMove(msg: Message): void {
+        this.messageQueue.restorePendingMouseMove(msg);
+    }
+
     hasMessages(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
         return this.messageQueue.hasMessages(msgMin, msgMax, callerThreadId);
     }

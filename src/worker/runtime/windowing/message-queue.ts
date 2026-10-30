@@ -19,8 +19,11 @@ export interface Message {
     keyStatePacked?: Uint8Array;
     /** dwExtraInfo of the input that produced it; GetMessageExtraInfo reads it back. */
     extraInfo?: number;
+    /** On a removed WM_MOUSEMOVE: the WM_SETCURSOR the retrieving call must SEND first. */
+    sentSetCursor?: { wParam: number; lParam: number };
 }
 
+const WM_SETCURSOR = 0x0020;
 const WM_MOUSEMOVE = 0x0200;
 const WM_PAINT = 0x000F;
 const WM_TIMER = 0x0113;
@@ -370,6 +373,13 @@ export class MessageQueue {
 
     // Mouse coalescing - only keep latest per hwnd
     private lastMouseMove: Map<number, PendingMessage> = new Map();
+    // The WM_SETCURSOR a mouse move carries (HIWORD(lParam) = WM_MOUSEMOVE) coalesces WITH
+    // that move and rides out on it as `sentSetCursor`: Windows SENDS it from inside the
+    // call that retrieves the mouse message, so it never occupies a retrieval of its own.
+    // Queued per move it flushed every pending move (a one-message-per-frame pump replayed
+    // the pointer's whole path); retrieved separately, each new move's copy jumped ahead
+    // of the still-pending move and starved it.
+    private moveSetCursor: Map<number, PendingMessage> = new Map();
     private waiters: Array<{ deliver: (msg: Message) => void; settled: boolean; threadId: number }> = [];
 
     // Wake-reason telemetry: classifies how each waitForMessage park ends —
@@ -475,7 +485,19 @@ export class MessageQueue {
     ): boolean {
         const time = TimeService.getInstance().guestTickMs() | 0;
 
-        if (msg === WM_MOUSEMOVE && coalesceMouseMoveEnabled) {
+        if (msg === WM_SETCURSOR && (lParam >>> 16) === WM_MOUSEMOVE && coalesceMouseMoveEnabled) {
+            this.moveSetCursor.set(hwnd, {
+                wParam,
+                lParam,
+                time,
+                ptX,
+                ptY,
+                targetThreadId,
+                keyStatePacked: keyStatePacked ? keyStatePacked.slice(0, KEY_STATE_BYTES) : undefined,
+                extraInfo,
+            });
+            return false;
+        } else if (msg === WM_MOUSEMOVE && coalesceMouseMoveEnabled) {
             // Coalesce mouse moves - replace previous.
             // Do NOT wake waiters here: coalesced mouse moves are low-priority
             // and will be delivered when the next discrete event flushes them,
@@ -526,7 +548,17 @@ export class MessageQueue {
             this.drainWaiters();
             return true;
         } else {
-            // Flush any pending mouse move before other input
+            // Flush any pending mouse move (and its WM_SETCURSOR) before other input
+            const pendingSetCursor = this.moveSetCursor.get(hwnd);
+            if (pendingSetCursor) {
+                this.inputQueue.enqueue(
+                    hwnd, WM_SETCURSOR, pendingSetCursor.wParam, pendingSetCursor.lParam,
+                    pendingSetCursor.time, pendingSetCursor.ptX, pendingSetCursor.ptY,
+                    pendingSetCursor.targetThreadId, pendingSetCursor.keyStatePacked,
+                    pendingSetCursor.extraInfo ?? 0
+                );
+                this.moveSetCursor.delete(hwnd);
+            }
             const pendingMouse = this.lastMouseMove.get(hwnd);
             if (pendingMouse) {
                 this.inputQueue.enqueue(
@@ -559,6 +591,7 @@ export class MessageQueue {
         return {
             input: this.inputQueue.snapshot(),
             mouseMove: [...this.lastMouseMove].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
+            mouseSetCursor: [...this.moveSetCursor].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
             paint: [...this.paintPending].map(([hwnd, p]) => ({ hwnd, targetThreadId: p.targetThreadId })),
             timer: [...this.timerPending].map(([key, e]) => ({ key, hwnd: e.hwnd, targetThreadId: e.pending.targetThreadId })),
         };
@@ -585,6 +618,8 @@ export class MessageQueue {
                     continue; // belongs to another thread
                 }
                 this.lastMouseMove.delete(hwnd);
+                const setCursor = this.moveSetCursor.get(hwnd);
+                this.moveSetCursor.delete(hwnd);
                 const msg: Message = {
                     hwnd,
                     message: WM_MOUSEMOVE,
@@ -595,6 +630,7 @@ export class MessageQueue {
                     ptY: pending.ptY,
                     keyStatePacked: pending.keyStatePacked,
                     extraInfo: pending.extraInfo,
+                    ...(setCursor ? { sentSetCursor: { wParam: setCursor.wParam, lParam: setCursor.lParam } } : {}),
                 };
                 this.trackDequeued(msg, callerThreadId);
                 return msg;
@@ -843,6 +879,7 @@ export class MessageQueue {
      */
     removeWindow(hwnd: number): void {
         this.lastMouseMove.delete(hwnd);
+        this.moveSetCursor.delete(hwnd);
         this.paintPending.delete(hwnd);
         for (const [key, entry] of this.timerPending) {
             if (entry.hwnd === (hwnd >>> 0)) this.timerPending.delete(key);
@@ -861,6 +898,21 @@ export class MessageQueue {
         }
     }
 
+    /** Put a removed mouse move back as the pending one, unless a newer move replaced it. */
+    restorePendingMouseMove(msg: Message): void {
+        if (this.lastMouseMove.has(msg.hwnd)) return;
+        this.lastMouseMove.set(msg.hwnd, {
+            wParam: msg.wParam,
+            lParam: msg.lParam,
+            time: msg.time,
+            ptX: msg.ptX,
+            ptY: msg.ptY,
+            targetThreadId: msg.targetThreadId ?? 0,
+            keyStatePacked: msg.keyStatePacked,
+            extraInfo: msg.extraInfo,
+        });
+    }
+
     clearPaint(hwnd: number): boolean {
         return this.paintPending.delete(hwnd);
     }
@@ -870,6 +922,7 @@ export class MessageQueue {
             // drain
         }
         this.lastMouseMove.clear();
+        this.moveSetCursor.clear();
         this.timerPending.clear();
         this.paintPending.clear();
         this.waiters = []; // Clear any pending waiters
