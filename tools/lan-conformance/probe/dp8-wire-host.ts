@@ -50,6 +50,13 @@ socket.on("error", error => errors.push(String(error)));
 socket.on("message", (data, source) => {
     console.log(`[wire-host] IN ${data.length}b head=${[...data.subarray(0, Math.min(12, data.length))].map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
     // The native peer enumerates first: answer the query with the session desc.
+    // Native DNET enum query: 88 01 0000 0600 0100 <first 8 app GUID bytes>;
+    // the short response echoes the query with type 02 (capture map, stage28).
+    if (data.length >= 16 && data[0] === 0x88 && data[1] === 0x01 && data[4] === 0x06 && data[5] === 0x00) {
+        const response = Uint8Array.of(0x88, 0x02, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, ...data.subarray(8, 16));
+        socket.send(response, source.port, source.address, error => { if (error) errors.push(String(error)); });
+        return;
+    }
     const query = decodeNativeEnumQuery(data);
     if (query) {
         if (query.application !== null && query.application !== APP_GUID) return;
