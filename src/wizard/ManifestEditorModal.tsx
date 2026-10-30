@@ -5,6 +5,7 @@ import s from "./ManifestEditorModal.module.css";
 import ms from "../ui/Modal/Modal.module.css";
 import { useHostModal } from "../harness/use-host-modal";
 import { ActionButton } from "../ui/ActionButton";
+import { LANGUAGE_PRESETS, detectLanguagePreset } from "./language-presets";
 
 interface ManifestEditorModalProps {
   gameKey: string | null;
@@ -47,18 +48,20 @@ interface FormState {
   resH: string;
   resBpp: string;
   os: string;
+  language: string;
   cdPath: string;
   skipVideo: boolean;
   touchLayout: string;
 }
 
-const EMPTY: FormState = { name: "", entrypoint: "", args: "", ramMB: "", resW: "", resH: "", resBpp: "", os: "", cdPath: "", skipVideo: false, touchLayout: "" };
+const EMPTY: FormState = { name: "", entrypoint: "", args: "", ramMB: "", resW: "", resH: "", resBpp: "", os: "", language: "", cdPath: "", skipVideo: false, touchLayout: "" };
 
 export default function ManifestEditorModal({ gameKey, onClose, onSaved }: ManifestEditorModalProps) {
   const [form, setForm] = useState<FormState>(EMPTY);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [languageNamed, setLanguageNamed] = useState(false);
 
   useEffect(() => {
     if (!gameKey) return;
@@ -68,6 +71,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
       .then((m) => {
         const e = m.emulator ?? {};
         const res = e.screenResolution ?? {};
+        setLanguageNamed(e.codepage !== undefined || e.lcid !== undefined);
         setForm({
           name: m.name ?? "",
           entrypoint: m.entrypoint ?? "",
@@ -77,6 +81,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
           resH: res.height ? String(res.height) : "",
           resBpp: res.bpp ? String(res.bpp) : "",
           os: detectOsPreset(e.osVersion),
+          language: detectLanguagePreset(e),
           cdPath: e.cdPath ?? "",
           skipVideo: !!e.skipVideo,
           // Only a preset id is editable here; an authored ControlLayout object is left
@@ -107,6 +112,10 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
     }
     const preset = OS_PRESETS.find((p) => p.id === form.os);
     if (preset?.v) emulator.osVersion = preset.v;
+    const language = LANGUAGE_PRESETS.find((p) => p.id === form.language);
+    // The override is rewritten whole on save, so a named language is always carried; only
+    // the implicit en-US default stays unwritten.
+    if (language && (languageNamed || language.id !== "en-US")) Object.assign(emulator, language.v);
     if (form.cdPath.trim()) emulator.cdPath = form.cdPath.trim();
     emulator.skipVideo = form.skipVideo;
     if (form.touchLayout) emulator.touch = { layout: form.touchLayout };
@@ -200,6 +209,13 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
                   <input className={s["addgame__field"]} type="number" placeholder="bpp" value={form.resBpp} onChange={(e) => set("resBpp", e.target.value)} />
                 </div>
               </div>
+              <label className={s["medit-row"]}>
+                <span className={s["medit-label"]}>Language for non-Unicode programs</span>
+                <select className={s["addgame__field"]} value={form.language} onChange={(e) => set("language", e.target.value)}>
+                  {form.language === "" && <option value="">(custom code page)</option>}
+                  {LANGUAGE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+                </select>
+              </label>
               <label className={s["medit-row"]}>
                 <span className={s["medit-label"]}>CD redirect (D:)</span>
                 <input className={s["addgame__field"]} value={form.cdPath} spellCheck={false} placeholder="e.g. C:\Game\CD1" onChange={(e) => set("cdPath", e.target.value)} />
