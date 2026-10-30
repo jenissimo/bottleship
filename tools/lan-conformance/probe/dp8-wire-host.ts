@@ -15,6 +15,9 @@ import { resolve } from "node:path";
 import { LanNetwork } from "../../../src/worker/net/lan-network";
 import { PROTO_UDP, decodeDatagram, encodeDatagram } from "../../../src/worker/net/netplay-wire";
 import { NativeDirectPlayHost } from "../../../src/worker/modules/dpnet/native-wire/host";
+import { decodeNativeEnumQuery, encodeNativeEnumResponse } from "../../../src/worker/modules/dpnet/native-wire/discovery-codec";
+
+const APP_GUID = "5102dacf241b11d3aea7006097b01411";
 
 const cli = new Map<string, string>();
 const argv = process.argv.slice(2);
@@ -66,7 +69,7 @@ network.attach({
 socket.bind(port, () => {
     const hr = host.start({
         port,
-        application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: "5102dacf".repeat(4), name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
+        application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: APP_GUID, name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
         player: { name: "host", data: new Uint8Array(0) },
         url: a => `x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=${gatewayIp};port=${a.port}`,
         allowIncoming: () => true,
