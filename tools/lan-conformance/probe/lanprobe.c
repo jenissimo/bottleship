@@ -40,6 +40,10 @@
  *   [v =] waitaddr <name> [t=<ms>]  — wait for a peer's published address and
  *                                     bind it to a symbolic sendto target
  *   signal <name>                   — raise a coordinator flag (gate-<name>.open)
+ *   wsaeventcreate / wsaeventclose <ev>   — WSA event objects (symbol = name)
+ *   wsaeventselect <s> <ev> 0x<mask>      — FD_READ|FD_WRITE|FD_CLOSE|...
+ *   wsawait <ev...> [t=<ms>]        — WSAWaitForMultipleEvents, ret = ready index
+ *   wsaenumnetevents <s> <ev>       — WSANetworkEvents: bits=..., err=...
  *   addhostfromaddr <addr> <sym>    — HOSTNAME component from a published address
  *   [v =] udp_open_port             — bind 127.0.0.1:0, keep open
  *   [v =] udp_closed_port           — bind 127.0.0.1:0, close
@@ -1349,6 +1353,136 @@ static void cmd_cbwait(DWORD messageId, const char *msgName, long want, long tim
     log_line(tail);
 }
 
+/* ---------------- WSA event model ---------------- */
+
+static HANDLE eventHandles[MAX_SYM];
+static char eventNames[MAX_SYM][SYM_NAME];
+
+static HANDLE eventHandle(const char *name, DWORD len) {
+    DWORD i;
+    char nm[SYM_NAME];
+    if (len >= SYM_NAME) return WSA_INVALID_EVENT;
+    wcopy(nm, name, len); nm[len] = 0;
+    for (i = 0; i < MAX_SYM; i++) if (eventNames[i][0] && wstreq(eventNames[i], nm)) return eventHandles[i];
+    return WSA_INVALID_EVENT;
+}
+static HANDLE eventCreate(const char *name) {
+    DWORD i;
+    for (i = 0; i < MAX_SYM; i++) if (!eventNames[i][0]) {
+        HANDLE h = WSACreateEvent();
+        if (h == WSA_INVALID_EVENT) return 0;
+        eventHandles[i] = h;
+        wcopy(eventNames[i], name, wstrlen(name));
+        eventNames[i][wstrlen(name)] = 0;
+        return h;
+    }
+    return 0;
+}
+static void eventForget(const char *name) {
+    DWORD i;
+    char nm[SYM_NAME];
+    if (wstrlen(name) >= SYM_NAME) return;
+    wcopy(nm, name, wstrlen(name));
+    nm[wstrlen(name)] = 0;
+    for (i = 0; i < MAX_SYM; i++) if (eventNames[i][0] && wstreq(eventNames[i], nm)) {
+        WSACloseEvent(eventHandles[i]);
+        eventHandles[i] = 0;
+        eventNames[i][0] = 0;
+        return;
+    }
+}
+static void cmd_eventcreate(const char *assigned) {
+    HANDLE h = eventCreate(assigned);
+    char *p = lineBuf;
+    out_append(&p, "wsaeventcreate -> ret=");
+    if (h) { out_append(&p, assigned); out_append(&p, " err=0"); }
+    else out_append(&p, "-1 err=WSA_NOT_ENOUGH_MEMORY");
+    *p = 0;
+    log_line(lineBuf);
+}
+static void cmd_eventclose(const char *name) {
+    eventForget(name);
+    log_line("wsaeventclose -> ret=0");
+}
+static void cmd_eventselect(const char *sockName, const char *eventName, long mask) {
+    Sym *s = sym_find(sockName, wstrlen(sockName));
+    HANDLE ev = eventHandle(eventName, wstrlen(eventName));
+    char prefix[MAX_LINE], *p = prefix;
+    int r;
+    if (!s || !s->hasHandle) { err_line("error wsaeventselect needs an open socket"); return; }
+    out_append(&p, "wsaeventselect ");
+    out_append(&p, sockName);
+    out_ch(&p, ' ');
+    out_append(&p, eventName);
+    out_append(&p, " ");
+    out_hex(&p, (unsigned long)mask);
+    *p = 0;
+    r = WSAEventSelect(s->handle, ev, (long)mask);
+    {
+        char *q = lineBuf;
+        out_append(&q, prefix);
+        out_append(&q, " -> ret=");
+        out_int(&q, r);
+        out_append(&q, " err=");
+        if (r == 0) out_append(&q, "0");
+        else { const char *n = errName((long)WSAGetLastError()); if (n) out_append(&q, n); else out_int(&q, (long)WSAGetLastError()); }
+        *q = 0;
+        log_line(lineBuf);
+    }
+}
+/* Wait on up to WSA_MAXIMUM_WAIT_EVENTS events; report the ready index. */
+static void cmd_wait(const char *const *names, int count, long timeoutMs) {
+    WSAEVENT handles[WSA_MAXIMUM_WAIT_EVENTS];
+    int i;
+    char *p = lineBuf;
+    DWORD r;
+    for (i = 0; i < count; i++) handles[i] = eventHandle(names[i], wstrlen(names[i]));
+    r = WSAWaitForMultipleEvents((DWORD)count, handles, FALSE, (DWORD)timeoutMs, FALSE);
+    out_append(&p, "wsawait ");
+    for (i = 0; i < count; i++) { if (i) out_ch(&p, ','); out_append(&p, names[i]); }
+    out_ch(&p, ' ');
+    out_int(&p, timeoutMs);
+    out_append(&p, " -> ret=");
+    if (r >= WSA_WAIT_EVENT_0 && r < (DWORD)(WSA_WAIT_EVENT_0 + count)) out_int(&p, (long)(r - WSA_WAIT_EVENT_0));
+    else if (r == WSA_WAIT_TIMEOUT) out_append(&p, "timeout");
+    else out_int(&p, (long)r);
+    out_append(&p, " err=0");
+    *p = 0;
+    log_line(lineBuf);
+}
+static void cmd_enumnetevents(const char *sockName, const char *eventName) {
+    Sym *s = sym_find(sockName, wstrlen(sockName));
+    HANDLE ev = eventHandle(eventName, wstrlen(eventName));
+    WSANETWORKEVENTS ne;
+    int r;
+    char *p = lineBuf;
+    memzero(&ne, sizeof(ne));
+    r = WSAEnumNetworkEvents(s->handle, ev, &ne);
+    out_append(&p, "wsaenumnetevents ");
+    out_append(&p, sockName);
+    out_ch(&p, ' ');
+    out_append(&p, eventName);
+    out_append(&p, " -> ret=");
+    out_int(&p, r);
+    if (r == 0) {
+        out_append(&p, " bits=");
+        if (ne.lNetworkEvents & FD_READ) out_append(&p, "FD_READ,");
+        if (ne.lNetworkEvents & FD_WRITE) out_append(&p, "FD_WRITE,");
+        if (ne.lNetworkEvents & FD_OOB) out_append(&p, "FD_OOB,");
+        if (ne.lNetworkEvents & FD_ACCEPT) out_append(&p, "FD_ACCEPT,");
+        if (ne.lNetworkEvents & FD_CONNECT) out_append(&p, "FD_CONNECT,");
+        if (ne.lNetworkEvents & FD_CLOSE) out_append(&p, "FD_CLOSE,");
+        out_append(&p, " err=");
+        out_int(&p, ne.iErrorCode[0]);
+    } else {
+        const char *name = errName((long)WSAGetLastError());
+        out_append(&p, " err=");
+        if (name) out_append(&p, name); else out_int(&p, (long)WSAGetLastError());
+    }
+    *p = 0;
+    log_line(lineBuf);
+}
+
 static void run_line(const char *lineStart, DWORD lineLen) {
     const char *s = lineStart;
     DWORD remain = lineLen;
@@ -2148,6 +2282,50 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         for (k = 0; cbNames[k].name; k++) if (wstreq(nm, cbNames[k].name)) { id = cbNames[k].id; break; }
         if (!id) { err_line("error unknown cbwait message name"); return; }
         cmd_cbwait(id, nm, want, ms);
+        return;
+    }
+    if (wstreq(verb, "wsaeventcreate")) {
+        if (!assigned) { err_line("error wsaeventcreate requires assignment"); return; }
+        cmd_eventcreate(assigned);
+        return;
+    }
+    if (wstreq(verb, "wsaeventclose")) {
+        if (ntok < 2 || toks[1].isStr) { err_line("error wsaeventclose needs a name"); return; }
+        tok_text(&toks[1], tmp);
+        cmd_eventclose(tmp);
+        return;
+    }
+    if (wstreq(verb, "wsaeventselect")) {
+        long mask = 0;
+        if (ntok < 4 || toks[1].isStr || toks[2].isStr || toks[3].isStr) { err_line("error wsaeventselect needs a socket, an event and a mask"); return; }
+        tok_text(&toks[1], tmp);
+        tok_text(&toks[2], tmp2buf);
+        if (!parse_int_text(toks[3].start, toks[3].len, &mask)) { err_line("error wsaeventselect mask must be numeric"); return; }
+        cmd_eventselect(tmp, tmp2buf, mask);
+        return;
+    }
+    if (wstreq(verb, "wsawait")) {
+        static char nameSlots[WSA_MAXIMUM_WAIT_EVENTS][SYM_NAME];
+        const char *names[WSA_MAXIMUM_WAIT_EVENTS];
+        int count = 0;
+        long ms = 30000;
+        for (int k = 1; k < ntok && count < WSA_MAXIMUM_WAIT_EVENTS; k++) {
+            if (toks[k].isStr) continue;
+            tok_text(&toks[k], tmp2buf);
+            if (tmp2buf[0] == 't' && tmp2buf[1] == '=') { parse_int_text(tmp2buf + 2, wstrlen(tmp2buf) - 2, &ms); continue; }
+            wcopy(nameSlots[count], tmp2buf, toks[k].len); nameSlots[count][toks[k].len] = 0;
+            names[count] = nameSlots[count];
+            count++;
+        }
+        if (!count) { err_line("error wsawait needs event names"); return; }
+        cmd_wait(names, count, ms);
+        return;
+    }
+    if (wstreq(verb, "wsaenumnetevents")) {
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr) { err_line("error wsaenumnetevents needs a socket and an event"); return; }
+        tok_text(&toks[1], tmp);
+        tok_text(&toks[2], tmp2buf);
+        cmd_enumnetevents(tmp, tmp2buf);
         return;
     }
     if (wstreq(verb, "signal")) {
