@@ -66,7 +66,7 @@ network.attach({
 socket.bind(port, () => {
     const hr = host.start({
         port,
-        application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: "a1".repeat(16), name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
+        application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: "5102dacf".repeat(4), name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
         player: { name: "host", data: new Uint8Array(0) },
         url: a => `x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=${gatewayIp};port=${a.port}`,
         allowIncoming: () => true,
