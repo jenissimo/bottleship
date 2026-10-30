@@ -194,7 +194,14 @@ export class LanNetwork {
         if (!isLanNode(node) || this.ports.some(ports => ports.size)) throw new Error("Identity must be adopted before binding");
         this.node.set(node);
     }
-    routeIpv4(ip: Uint8Array): Uint8Array { this.synchronizeState(); return ipv4ToNode(ip, this.gatewayAddresses.has(ip.join("."))); }
+    routeIpv4(ip: Uint8Array): Uint8Array {
+        this.synchronizeState();
+        if (ip.length !== 4) throw new RangeError("IPv4 address must have four bytes");
+        const external = this.gatewayAddresses.has(ip.join("."));
+        // Explicit native gateway endpoints retain their route; ordinary loopback is local.
+        if (ip[0] === 127 && !external) return this.node.slice();
+        return ipv4ToNode(ip, external);
+    }
     async resolve(host: string, family: 0 | 4 | 6 = 0, signal?: AbortSignal): Promise<ResolveResult> {
         if (signal?.aborted) throw new NetResolveError("CANCELLED");
         if (!this.connected || !this.transport?.resolve) throw new NetResolveError("NETWORK_DOWN");

@@ -698,12 +698,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
             this.deliver(encodeDatagram(datagram.proto, this.network.node, datagram.dstPort, datagram.srcPort, datagram.payload, meta));
             return true;
         }
-        // A frame addressed to the canonical loopback node (127.0.0.1) is always
-        // local delivery: the adopted session identity has a different node, and
-        // treating the loopback node as foreign silently drops self-addressed
-        // DirectPlay discovery traffic (client sees DPNERR_NORESPONSE).
-        const local = this.network.isSelf(datagram.node) || (datagram.node.length === 6 && datagram.node[0] === 2 && datagram.node[1] === 0 && datagram.node[2] === 0 && datagram.node[3] === 0 && datagram.node[4] === 0 && datagram.node[5] === 1);
-        const broadcast = isBroadcastNode(datagram.node);
+        const local = this.network.isSelf(datagram.node), broadcast = isBroadcastNode(datagram.node);
         if (!local && this.backplane.connected) {
             if (!this.backplane.send(datagram.srcPort, datagram.node, datagram.dstPort, datagram.payload, datagram.proto,generation)) return false;
         } else if (!local && !broadcast) return false;

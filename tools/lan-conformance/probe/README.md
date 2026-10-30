@@ -1,74 +1,60 @@
 # lanprobe + lan-diff
 
-One generic x86 probe (`lanprobe.c`) and one runner (`lan-diff.ts`) for
-differential Winsock conformance: the same probe PE runs on native Windows and
-in the emulator, and the observation logs must match line by line.
+One generic x86 probe interprets `.lp` scripts on native Windows and in the
+emulator. The runner compares their observation logs line by line.
 
 ```bash
-bun tools/lan-conformance/probe/lan-diff.ts record <area>/<case> [--force]  # native → golden
-bun tools/lan-conformance/probe/lan-diff.ts check <area>/<case>|all         # emulator → diff
+bun tools/lan-conformance/probe/lan-diff.ts record <area>/<case> [--force]
+bun tools/lan-conformance/probe/lan-diff.ts check <area>/<case>|all
+bun tools/lan-conformance/probe/lan-diff.ts run <area>/<case> --as=host=native,peer=native
 bun tools/lan-conformance/probe/lan-diff.ts list
 ```
 
-- Cases live in `../cases/<area>/<case>.lp` next to the committed golden
-  `<case>.native.log`. Goldens are recorded only from native Windows; the
-  emulator side runs anywhere.
-- `check` needs the harness browser (`bun tools/harness.ts up`); use
-  `BS_TAB=<name>` when other agents share the Chrome. `BS_LAN_SERVER` /
-  `BS_LAN_ROOM` are passed through for cases that need the relay.
-- The probe PE is compiled once with 32-bit MinGW (`BS_MINGW_CC`) and cached
-  under `logs/lan-conformance/lanprobe/`, keyed by the C source hash.
-- Artifacts per run (bundle, guest log) land in ignored
-  `logs/lan-conformance/lan-diff/<case>/`.
+- Scripts and committed native goldens live in `../cases/`.
+- `record` uses native roles and updates goldens only when every role finishes
+  successfully. Existing goldens require `--force`.
+- `check` compares with committed goldens. Its summary counts matched, failed
+  and skipped cases separately; differences produce exit code 1.
+- `run` executes a multi-role diagnostic without reading or writing goldens.
+  Completion is not a parity claim: inspect API results in the logs.
+- `# emu-skip <reason>` works in both single-script and role cases. It applies
+  only to roles actually running in the emulator.
+- Native compilation needs 32-bit MinGW (`BS_MINGW_CC`). The probe PE is cached
+  by source hash. Use the project's pinned Bun.
+- Browser runs use the project harness. Set `BS_TAB` to an unused session name
+  and `BS_DEV_URL` when testing a separate dev server. Reload worker sources
+  through the harness after code changes.
 
-## Multi-role cases
+Each invocation creates a new directory below ignored
+`logs/lan-conformance/lan-diff/<case>/`. A multi-role run keeps the coordinator
+and each role's working directory together under `run-*/`; previous role
+addresses, signals and logs are never reused. Guest bundle IDs include the run
+identity and role because OPFS is shared by tabs on the same origin.
 
-A case is multi-role when role scripts sit next to each other
-(`<case>.host.lp`, `<case>.peer.lp`); each gets its own golden
-(`<case>.<role>.native.log`). `record`/`check` spawn one role driver per role:
+## Coordination
 
-- Natively, a probe process per role in the run directory.
-- In the emulator, one role child per role, each with its own harness tab
-  (`<BS_TAB>-<role>`), its own bundle and its own guest FS.
+Multi-role scripts use `<case>.host.lp`, `<case>.peer.lp`, etc.
 
-Roles synchronize through `gate <name>` barriers: the probe logs
-`gate <name> enter`, then blocks until `gate-<name>.open` appears next to its
-log (a real file natively, the guest FS via harness `fsWrite` in the
-emulator). The parent coordinator releases a gate once every role arrived.
+- `gate ready` is a barrier. The coordinator releases it after every participating
+  role has arrived.
+- `signal got-ping` has an explicit producer. A waiting role cannot release that
+  signal merely by reaching its gate.
+- `publishaddr socket name`, `publishlocal name port` and
+  `publiship name ip port` all publish `addr-<name>.txt`.
+- `target = waitaddr name t=30000` reads a published endpoint. Its name also
+  participates in guest boot cleanup, including externally supplied addresses.
+- Role drivers relay addresses and signals in both native and guest filesystems.
+  Coordinator writes are atomic; failed guest writes and gate timeouts fail the run.
+- Positive scenarios use `require_success` to reject prior API failures or missing
+  callbacks before reporting receipt. `sendpeer peer all "ping"` addresses all
+  players without depending on CREATE_PLAYER callback order.
+- `addhostfromaddr` sets both hostname and port from the published endpoint.
 
-Cross-tab data exchange cannot use guest loopback — 127.0.0.1 is
-per-process-local — and the virtual LAN's per-session `10.x.y.z` is assigned
-per boot, so roles publish their addresses: `publishaddr <s> <name>` writes
-the socket's address (bound to 0.0.0.0, the best local IP) into the
-coordinator, `peeraddr = waitaddr peer [t=<ms>]` waits for a peer's address
-and binds it to a symbolic sendto/connect target. The address travels through
-coordinator files and never enters the log — `connect h peeraddr` logs the
-token, so native and emulator logs stay identical.
-
-Role drivers mirror every coordination file (`gate-*`, `addr-*`) between the
-coordinator directory and their probe's gate directory. Each role bundle gets
-its own game id (`app:lan-conformance-<role>`): OPFS is per-origin, so same-id
-bundles would share one overlay across tabs and every boot's `deleteOnBoot`
-would fight the other tab's live probe holding the file open. Every
-coordination file the case can produce is wiped at boot (`deleteOnBoot`) — a
-reused tab must not hand the driver a previous run's address.
-
-A role script can declare `# emu-skip <reason>` (one line) when the emulator
-run is not expressible yet; `check` then reports SKIP instead of FAIL.
+Native probes are owned by their role driver. The driver waits for their actual
+exit status and retires them on failure; the parent also retires its role
+processes and wire host on coordinator failure.
 
 ## Mixed native/emulated roles
-
-`check <case> --as=host=native,peer=emu` pins each role to an environment
-(goldens always come from the all-native run). The guest-to-native direction
-is the supported interop path: a native role binds a REAL socket and
-publishes its address; an emulated role sending to that address hits the
-relay gateway (the destination is not a `10.x` virtual address, so the
-worker routes it as an external node) and the relay forwards to the real
-port. The reverse direction has no path — a native process cannot send into
-the virtual LAN unprompted; scenarios needing native-originated traffic use
-the existing WS-bridge fixtures.
-
-Run the relay with a gateway route pointing at this machine's LAN address:
 
 ```bash
 bun tools/lan-conformance/probe/lan-diff.ts gateway-config logs/lan-conformance/gateway-server.json [ports...]
@@ -76,16 +62,36 @@ bun packages/lan/src/cli.ts --config logs/lan-conformance/gateway-server.json --
 BS_LAN_SERVER=http://127.0.0.1:9001 bun tools/lan-conformance/probe/lan-diff.ts check udp/interop --as=host=native,peer=emu
 ```
 
-The route address must equal what the native role publishes (both derive
-from the system resolver's answer for the host name). `signal <name>` lets a
-native role confirm an observation through the coordinator instead of a
-network path back — the emulated role waits on it with `gate <name>`.
+The native role publishes its reachable LAN address and the relay must allow
+that address and port. An emulated peer routes `127.x` to itself, so loopback
+must not be published as a native host's address in mixed mode.
+Guest-initiated gateway flows can carry replies; unprompted native-originated
+traffic requires the explicit host-listener/bridge fixtures.
 
-Note: `127.0.0.1` never reaches the gateway — the worker hard-routes loopback
-destinations to its own node, and a native role publishing a loopback address
-is therefore unreachable from an emulated role. Bind `0.0.0.0` and publish.
+## DP8 wire-host diagnostics
 
-The script language is documented in the `lanprobe.c` header. Extending
-coverage is: write a 10–30 line script, record native, make the emulator
-match. When a case needs an API the probe does not speak yet, add the verb to
-`lanprobe.c` (same for DirectPlay COM later), never a one-off fixture.
+```bash
+bun tools/lan-conformance/probe/lan-diff.ts run dp8/interop --wire-host --as=peer=native
+```
+
+This replaces the host role with `dp8-wire-host.ts`, an adapter from real UDP
+to the project's `NativeDirectPlayHost`. It is an implementation under test,
+not a native-Windows oracle. `record --wire-host` is rejected; keep golden
+recording independent. `check --wire-host` compares the peer's observations
+with an existing native baseline.
+
+The driver accepts `--addr-file` and/or `--ready`, writes the actual endpoint
+after binding, and accepts port 0 for an ephemeral socket. `BS_WIRE_HOST_IP`
+selects the advertised address; `BS_WIRE_HOST_PORT` selects its UDP port.
+Native-only diagnostics default to an ephemeral port; emulated clients use
+23913 by default and require a configured gateway.
+Raw DNET packets are adapted using their real source IP and port. The 16-byte
+`88 01 ...` packet is a DNET CONNECT, handled by the reliable link; enumeration
+uses `discovery-codec`. A host-side receive file releases the omitted host
+role's receive-confirmation signals only after actual user data arrives.
+
+Passing local wire-host tests proves the adapter path. Native interop requires
+a separate successful native-role run.
+
+The script language is documented in `lanprobe.c`. Add reusable probe verbs
+when a contract needs them, then keep cases as short scripts.

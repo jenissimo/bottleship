@@ -22,9 +22,10 @@
  * keyed by the C source hash. Requires the harness browser for `check`
  * (`bun tools/harness.ts up`); BS_LAN_SERVER/BS_LAN_ROOM are passed through.
  */
-import { resolve, dirname, join } from "node:path";
-import { mkdirSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve, dirname, join, basename } from "node:path";
+import { mkdirSync, mkdtempSync, cpSync, existsSync, readdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { parseArgs, scriptMetadata, planRoles, checkSkip, type RunMode } from "./case-metadata";
 import { harness, closeHarnessConnection } from "../../harness";
 import { findOrCreateTab, DEFAULT_DEV_URL } from "../../cdp-core";
 
@@ -39,28 +40,6 @@ function usage(): never {
     console.error("usage: lan-diff.ts record <area>/<case> [--force]\n" +
         "       lan-diff.ts check <area>/<case>|all [more...]");
     process.exit(2);
-}
-
-function parseArgs(argv: string[]) {
-    const rest: string[] = [];
-    let force = false;
-    let wireHost = false;
-    let roleModes: Record<string, "native" | "emu"> | undefined;
-    for (const a of argv) {
-        if (a === "--force") force = true;
-        else if (a === "--wire-host") wireHost = true;
-        else if (a.startsWith("--as=")) {
-            roleModes = {};
-            for (const pair of a.slice("--as=".length).split(",")) {
-                const [role, mode] = pair.split("=");
-                if (!/^[a-z0-9]+$/.test(role ?? "") || (mode !== "native" && mode !== "emu")) {
-                    throw new Error(`Bad --as entry "${pair}" (want role=native|emu)`);
-                }
-                roleModes[role] = mode;
-            }
-        } else rest.push(a);
-    }
-    return { rest, force, roleModes, wireHost };
 }
 
 function casePaths(caseId: string) {
@@ -85,17 +64,6 @@ function caseRoles(caseId: string): string[] {
         if (m && m[1] === base) roles.push(m[2]);
     }
     return roles.sort();
-}
-
-/** `# emu-skip <reason>` in a role script: emulator run not expressible yet. */
-function emuSkipReason(caseId: string): string | null {
-    for (const role of caseRoles(caseId)) {
-        const path = rolePaths(caseId, role).script;
-        if (!existsSync(path)) continue;
-        const m = /^# emu-skip (.+)$/m.exec(readFileSync(path, "utf8"));
-        if (m) return m[1].trim();
-    }
-    return null;
 }
 
 function rolePaths(caseId: string, role: string) {
@@ -161,8 +129,8 @@ async function record(caseId: string, force: boolean) {
         throw new Error(`Golden exists: ${golden} (pass --force to re-record)`);
     }
     const exe = await buildProbe();
-    const nativeDir = join(work, "native");
-    mkdirSync(nativeDir, { recursive: true });
+    mkdirSync(work, { recursive: true });
+    const nativeDir = mkdtempSync(join(work, "native-"));
     const outLog = join(nativeDir, "case.log");
     const run = Bun.spawnSync([exe, script, outLog], {
         cwd: nativeDir, stdout: "inherit", stderr: "inherit", timeout: 60000,
@@ -266,11 +234,13 @@ async function check(caseId: string) {
     if (!existsSync(script)) throw new Error(`No case script: ${script}`);
     if (!existsSync(golden)) throw new Error(`No golden log: ${golden} — run 'record ${caseId}' first`);
     const goldenLog = await Bun.file(golden).text();
-    const bundle = await packBundle(caseId, script, work);
+    mkdirSync(work, { recursive: true });
+    const runDir = mkdtempSync(join(work, "run-"));
+    const bundle = await packBundle(caseId, script, runDir, ["C:\\case.log"], basename(runDir));
 
     try {
-        // reload first: a reused tab keeps its live worker, and load_bundle
-        // into the old worker would run stale worker sources
+        await findOrCreateTab(DEFAULT_DEV_URL);
+        // Worker sources are replaced only by a full page reload.
         await harness().reload().run();
         await bootBundle(bundle);
         const deadline = Date.now() + 120_000;
@@ -284,9 +254,9 @@ async function check(caseId: string) {
             const report = await harness().report().run();
             throw new Error(`Guest did not finish within the deadline; last log:\n${guestLog}\nreport: ${JSON.stringify(report).slice(0, 2000)}`);
         }
-        const guestPath = join(work, "guest.log");
+        const guestPath = join(runDir, "guest.log");
         await Bun.write(guestPath, guestLog);
-        if (!diffLogs(caseId, goldenLog, guestLog, golden, guestPath)) process.exitCode = 1;
+        return diffLogs(caseId, goldenLog, guestLog, golden, guestPath);
     } finally {
         closeHarnessConnection();
     }
@@ -294,40 +264,15 @@ async function check(caseId: string) {
 
 /* ---------------- multi-role coordination ---------------- */
 
-/** Gate names in a script (`gate <name>`) or a running log (`gate <name> enter`). */
-function gateNames(scriptText: string): string[] {
-    const names = new Set<string>();
-    for (const m of scriptText.matchAll(/^gate ([a-z0-9-]+)/gm)) names.add(m[1]);
-    return [...names];
+function publishFile(path: string, body: string) {
+    const temporary = path + "." + process.pid + ".tmp";
+    writeFileSync(temporary, body); renameSync(temporary, path);
 }
 
-/** Names each role publishes through `publishaddr <s> <name>` scripts. */
-function publishedNamesByRole(caseId: string, roles: string[]): Map<string, string[]> {
-    const out = new Map<string, string[]>();
-    for (const role of roles) {
-        const names = new Set<string>();
-        for (const m of readFileSync(rolePaths(caseId, role).script, "utf8").matchAll(/^publish(?:addr \S+|local) ([a-z0-9-]+)(?: \d+)?$/gm)) {
-            names.add(m[1]);
-        }
-        out.set(role, [...names]);
-    }
-    return out;
+async function guestWrite(path: string, body: string) {
+    const result = await harness().fsWrite(path, body).run();
+    if (!result.ok) throw new Error("Could not relay coordination file " + path);
 }
-
-/** Names each role raises through `signal <name>` (local gate-<name>.open). */
-function signalNamesByRole(caseId: string, roles: string[]): Map<string, string[]> {
-    const out = new Map<string, string[]>();
-    for (const role of roles) {
-        const names = new Set<string>();
-        for (const m of readFileSync(rolePaths(caseId, role).script, "utf8").matchAll(/^signal ([a-z0-9-]+)$/gm)) {
-            names.add(m[1]);
-        }
-        out.set(role, [...names]);
-    }
-    return out;
-}
-
-interface RoleResult { ok: boolean; log: string; error?: string }
 
 /**
  * One role of a multi-role case, as a child process. Native roles run the
@@ -337,281 +282,192 @@ interface RoleResult { ok: boolean; log: string; error?: string }
  */
 async function runRoleChild(caseId: string, role: string, coordDir: string) {
     const emulated = process.env.BS_LANDIFF_MODE === "emu";
-    const { script, work } = casePaths(caseId);
-    const { script: roleScript } = rolePaths(caseId, role);
-    const deadline = Date.now() + 150_000;
-    let logPath: string;
-    let gateDir: string;
-
-    if (emulated) {
-        // each role child drives its own BS_TAB tab; create it if absent
-        await findOrCreateTab(DEFAULT_DEV_URL);
-        const roles = caseRoles(caseId);
-        const deleteFiles = ["C:\\case.log"];
-        for (const r of roles) {
-            const scriptText = readFileSync(rolePaths(caseId, r).script, "utf8");
-            for (const name of gateNames(scriptText)) deleteFiles.push(`C:\\gate-${name}.open`);
-            for (const name of signalNamesByRole(caseId, roles).get(r) ?? []) deleteFiles.push(`C:\\gate-${name}.open`);
-            for (const name of publishedNamesByRole(caseId, roles).get(r) ?? []) {
-                deleteFiles.push(`C:\\addr-${name}.txt`);
-            }
-        }
-        const bundle = await packBundle(`${caseId}/${role}`, roleScript, join(work, `game-${role}`), deleteFiles, role);
-        await bootBundle(bundle);
-        logPath = "guest:C:\\case.log";
-        gateDir = "guest:C:\\";
-    } else {
-        const roleDir = join(work, `native-${role}`);
-        mkdirSync(roleDir, { recursive: true });
-        logPath = join(roleDir, "case.log");
-        gateDir = roleDir;
-        const exe = await buildProbe();
-        const child = Bun.spawn([exe, roleScript, logPath], {
-            cwd: roleDir, stdout: "inherit", stderr: "inherit",
-        });
-        child.unref();
-    }
-
-    const relayedGates = new Set<string>();
-    const reportedGates = new Set<string>();
-    // address publishing: mirror my addr-*.txt into the coordination dir and
-    // the other roles' addr-*.txt back into my probe's gate directory
-    const allRoles = caseRoles(caseId);
-    const myPublish = publishedNamesByRole(caseId, [role]).get(role) ?? [];
-    const otherPublish = [...publishedNamesByRole(caseId, allRoles).entries()]
-        .flatMap(([r, names]) => r === role ? [] : names);
-    const emitted = new Set<string>();
-    const ingested = new Set<string>();
-    const mySignals = signalNamesByRole(caseId, [role]).get(role) ?? [];
-    const otherSignals = [...signalNamesByRole(caseId, allRoles).entries()]
-        .flatMap(([r, names]) => r === role ? [] : names);
-    const emittedSignals = new Set<string>();
-    const ingestedSignals = new Set<string>();
-    const emitAddress = async (name: string) => {
+    const roles = caseRoles(caseId);
+    const metadata = new Map(roles.map(r => [r, scriptMetadata(readFileSync(rolePaths(caseId, r).script, "utf8"))]));
+    const mine = metadata.get(role);
+    if (!mine) throw new Error("Unknown role: " + role);
+    const work = join(coordDir, role);
+    mkdirSync(work, { recursive: true });
+    const names = new Set([...metadata.values()].flatMap(m => [...m.published, ...m.required]));
+    const gateNames = new Set([...metadata.values()].flatMap(m => [...m.gates, ...m.signals]));
+    const ownSignals = new Set(mine.signals);
+    const ownPublish = new Set(mine.published);
+    let native: Bun.Subprocess | undefined, lastLog = "";
+    const nativeLog = join(work, "case.log");
+    try {
         if (emulated) {
-            try {
-                const result = await harness().fsRead("C:\\addr-" + name + ".txt").run();
-                const record = result.named.fsRead as { content?: string } | undefined;
-                if (!result.ok || record?.content === undefined) return false;
-                const body = new TextDecoder().decode(Uint8Array.from(atob(record.content), c => c.charCodeAt(0)));
-                if (!/^\d+\.\d+\.\d+\.\d+:\d+$/.test(body.trim())) return false;
-                await Bun.write(join(coordDir, `addr-${name}.txt`), body);
-                return true;
-            } catch { return false; }
-        }
-        const path = join(gateDir, `addr-${name}.txt`);
-        if (!existsSync(path)) return false;
-        const body = readFileSync(path, "utf8");
-        if (!/^\d+\.\d+\.\d+\.\d+:\d+$/.test(body.trim())) return false;
-        writeFileSync(join(coordDir, `addr-${name}.txt`), body);
-        return true;
-    };
-    const ingestAddress = async (name: string) => {
-        const path = join(coordDir, `addr-${name}.txt`);
-        if (!existsSync(path)) return;
-        const body = await Bun.file(path).text();
-        if (emulated) {
-            await harness().fsWrite("C:\\addr-" + name + ".txt", body).run();
+            await findOrCreateTab(DEFAULT_DEV_URL);
+            const deleteFiles = ["C:\\case.log", ...[...names].map(n => "C:\\addr-" + n + ".txt"),
+                ...[...gateNames].map(n => "C:\\gate-" + n + ".open")];
+            const bundle = await packBundle(caseId + "/" + role, rolePaths(caseId, role).script,
+                work, deleteFiles, basename(coordDir) + "-" + role);
+            await bootBundle(bundle);
         } else {
-            writeFileSync(join(gateDir, `addr-${name}.txt`), body);
+            native = Bun.spawn([await buildProbe(), rolePaths(caseId, role).script, nativeLog],
+                { cwd: work, stdout: "inherit", stderr: "inherit" });
         }
-    };
-    let finished = false;
-    let lastLog = "";
-    while (Date.now() < deadline && !finished) {
-        await Bun.sleep(150);
-        for (const name of myPublish) {
-            if (!emitted.has(name) && await emitAddress(name)) emitted.add(name);
-        }
-        for (const name of otherPublish) {
-            if (!ingested.has(name) && existsSync(join(coordDir, `addr-${name}.txt`))) {
-                ingested.add(name);
-                await ingestAddress(name);
-            }
-        }
-        for (const name of mySignals) {
-            if (emittedSignals.has(name)) continue;
-            const path = join(gateDir, `gate-${name}.open`);
-            if (existsSync(path)) {
-                await Bun.write(join(coordDir, `gate-${name}.open`), readFileSync(path));
-                emittedSignals.add(name);
-            }
-        }
-        for (const name of otherSignals) {
-            if (!ingestedSignals.has(name) && existsSync(join(coordDir, `gate-${name}.open`))) {
-                ingestedSignals.add(name);
-                if (emulated) {
-                    await harness().fsWrite("C:\\gate-" + name + ".open", "").run();
-                } else {
-                    writeFileSync(join(gateDir, `gate-${name}.open`), "");
+        const readLocal = async (file: string): Promise<string | null> => {
+            if (!emulated) { try { return await Bun.file(join(work, file)).text(); } catch { return null; } }
+            const result = await harness().fsRead("C:\\" + file).run();
+            const content = (result.named.fsRead as {content?: string} | undefined)?.content;
+            return result.ok && content !== undefined ? Buffer.from(content, "base64").toString("utf8") : null;
+        };
+        const writeLocal = async (file: string, body: string) => {
+            if (emulated) await guestWrite("C:\\" + file, body); else publishFile(join(work, file), body);
+        };
+        const emitted = new Set<string>(), ingested = new Set<string>(), reported = new Set<string>();
+        const deadline = Date.now() + 150_000;
+        let finished = false;
+        while (Date.now() < deadline) {
+            for (const name of ownPublish) {
+                const file = "addr-" + name + ".txt";
+                if (emitted.has(file)) continue;
+                const body = await readLocal(file);
+                if (body !== null && /^\d+\.\d+\.\d+\.\d+:\d+$/.test(body.trim())) {
+                    publishFile(join(coordDir, file), body);
+                    emitted.add(file);
                 }
             }
-        }
-        let log = "";
-        try {
-            log = emulated ? await readCaseLog() : await Bun.file(logPath).text();
-        } catch { continue; }
-        if (log !== lastLog) {
-            lastLog = log;
-            await Bun.write(join(coordDir, `${role}.log`), log);
-        }
-        for (const name of gateNames(log)) {
-            if (!reportedGates.has(name)) {
-                reportedGates.add(name);
-                await Bun.write(join(coordDir, `${role}.at-${name}`), "");
-            }
-            if (!relayedGates.has(name) && existsSync(join(coordDir, `gate-${name}.open`))) {
-                relayedGates.add(name);
-                if (emulated) {
-                    await harness().fsWrite("C:\\gate-" + name + ".open", "").run();
-                } else {
-                    writeFileSync(join(gateDir, `gate-${name}.open`), "");
+            for (const name of names) {
+                const file = "addr-" + name + ".txt", path = join(coordDir, file);
+                if (!ownPublish.has(name) && !ingested.has(file) && existsSync(path)) {
+                    await writeLocal(file, readFileSync(path, "utf8"));
+                    ingested.add(file);
                 }
             }
+            for (const name of ownSignals) {
+                const file = "gate-" + name + ".open";
+                if (!emitted.has(file) && await readLocal(file) !== null) {
+                    publishFile(join(coordDir, file), "");
+                    emitted.add(file);
+                }
+            }
+            for (const name of gateNames) {
+                const file = "gate-" + name + ".open", path = join(coordDir, file);
+                if (!ownSignals.has(name) && !ingested.has(file) && existsSync(path)) {
+                    await writeLocal(file, "");
+                    ingested.add(file);
+                }
+            }
+            const log = emulated ? await readLocal("case.log") : await Bun.file(nativeLog).text().catch(() => null);
+            if (log !== null) {
+                lastLog = log;
+                publishFile(join(coordDir, role + ".log"), log);
+                for (const name of mine.gates) {
+                    if (!reported.has(name) && log.includes("gate " + name + " enter")) {
+                        publishFile(join(coordDir, role + ".at-" + name), "");
+                        reported.add(name);
+                    }
+                }
+                if (/^exit \d+$/m.test(log)) { finished = true; break; }
+            }
+            if (native && native.exitCode !== null) break;
+            await Bun.sleep(150);
         }
-        if (/^exit \d+$/m.test(log)) finished = true;
-    }
-    if (!finished) {
-        if (emulated) {
-            try {
-                const report = await harness().report().run();
-                console.error(`[${caseId}/${role}] guest did not finish; report: ${JSON.stringify(report).slice(0, 1500)}`);
-            } catch { /* report is best-effort */ }
+        if (!finished) {
+            if (emulated) console.error(JSON.stringify(await harness().report().run()).slice(0, 2000));
+            throw new Error(role + " did not finish; last log:\n" + lastLog);
         }
-        console.error(`[${caseId}/${role}] role did not finish within the deadline; last log:\n${lastLog}`);
-        process.exit(1);
+        publishFile(join(coordDir, role + ".final.log"), lastLog);
+        if (native && await native.exited !== 0) throw new Error("Native role exited with failure: " + role);
+    } finally {
+        if (native && native.exitCode === null) { native.kill(); await native.exited; }
+        if (emulated) closeHarnessConnection();
     }
-    await Bun.write(join(coordDir, `${role}.final.log`), lastLog);
-    if (emulated) closeHarnessConnection();
 }
 
 /**
  * Parent of a multi-role run: spawns one role child per role, watches the
  * shared coordination directory, releases gates once every role arrived.
  */
-async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean,
+async function runMultiRole(caseId: string, mode: RunMode, force: boolean,
     roleModes?: Record<string, "native" | "emu">, wireHost = false): Promise<boolean> {
-    const roles = caseRoles(caseId);
-    if (!roles.length) throw new Error(`No role scripts for ${caseId}`);
-    const runRoles = wireHost ? roles.filter(r => r !== "host") : roles;
-    console.log(`[wd] record=${mode === "record"} wireHost=${wireHost} runRoles=${runRoles.join(",")}`);
-    for (const role of runRoles) {
-        const { script, golden } = rolePaths(caseId, role);
-        if (!existsSync(script)) throw new Error(`No role script: ${script}`);
-        if (mode === "check" && !existsSync(golden)) {
-            throw new Error(`No golden log: ${golden} — run 'record ${caseId}' first`);
-        }
-        if (mode === "record" && existsSync(golden) && !force) {
-            throw new Error(`Golden exists: ${golden} (pass --force to re-record)`);
-        }
+    const roles = caseRoles(caseId), plan = planRoles(roles, mode, roleModes, wireHost);
+    await buildProbe();
+    for (const {role} of plan) {
+        const { golden } = rolePaths(caseId, role);
+        if (mode === "check" && !existsSync(golden)) throw new Error("No golden log: " + golden + " — use run for diagnostics");
+        if (mode === "record" && existsSync(golden) && !force) throw new Error("Golden exists: " + golden);
     }
-    const gateNamesByRole: Array<{ role: string; gates: string[] }> = [];
-    for (const role of runRoles) {
-        const { script } = rolePaths(caseId, role);
-        gateNamesByRole.push({ role, gates: gateNames(await Bun.file(script).text()) });
-    }
-    const allGateNames = [...new Set(gateNamesByRole.flatMap(r => r.gates))];
-
     const { work } = casePaths(caseId);
-    const coordDir = join(work, `coord-${Date.now()}`);
-    mkdirSync(coordDir, { recursive: true });
-
-    const baseTab = process.env.BS_TAB ?? "";
-    // Wire-host oracle environment: a NativeDirectPlayHost process replaces the
-    // host role; only the remaining roles run and get diffed. The oracle
-    // publishes its address (BS_WIRE_HOST_IP or loopback) as addr-host.txt.
-    let wireHostProcess: Bun.Subprocess | undefined;
-    const activeRoles = wireHost ? roles.filter(r => r !== "host") : roles;
-    if (wireHost) {
-        if (mode === "record") {
-            // the oracle address for a native baseline is loopback
-            process.env.BS_WIRE_HOST_IP = "127.0.0.1";
-        } else if (!process.env.BS_WIRE_HOST_IP) {
-            const os = await import("node:os"), dns = await import("node:dns");
-            process.env.BS_WIRE_HOST_IP = await new Promise<string>((res, rej) =>
-                dns.lookup(os.hostname(), { family: 4 }, (e, a) => e ? rej(e) : res(String(a))));
-        }
-        mkdirSync(coordDir, { recursive: true });
-        wireHostProcess = Bun.spawn([bun, join(root, "tools/lan-conformance/probe/dp8-wire-host.ts"),
-            "--port", "23913", "--addr-file", join(coordDir, "addr-host.txt")],
-            { cwd: root, stdout: "inherit", stderr: "inherit" });
-        const readyDeadline = Date.now() + 20000;
-        while (!existsSync(join(coordDir, "addr-host.txt")) && Date.now() < readyDeadline) await Bun.sleep(100);
-        if (!existsSync(join(coordDir, "addr-host.txt"))) {
-            wireHostProcess.kill();
-            throw new Error("wire-host oracle did not become ready");
-        }
-    }
-    const children = activeRoles.map(role => {
-        const tab = baseTab ? `${baseTab}-${role}` : `lanprobe-${role}`;
-        // goldens are recorded from an all-native run; check pins each role to
-        // its requested environment (default emu; --as role=native pins mixed)
-        const roleMode = mode === "record" ? "native" : roleModes?.[role] ?? "emu";
-        return Bun.spawn([bun, import.meta.path, "_run-role", caseId, role], {
-            cwd: root,
-            env: {
-                ...process.env,
-                BS_LANDIFF_MODE: roleMode,
-                BS_LANDIFF_COORD: coordDir,
-                BS_TAB: tab,
-            },
-            stdout: "inherit", stderr: "inherit",
-        });
-    });
-
-    const released = new Set<string>();
-    const coordDeadline = Date.now() + 180_000;
-    while (Date.now() < coordDeadline) {
-        await Bun.sleep(100);
-        let allDone = true;
-        for (const child of children) if (child.exitCode === null) allDone = false;
-        for (const name of allGateNames) {
-            if (released.has(name)) continue;
-            const everyone = gateNamesByRole.every(({ role, gates }) =>
-                !gates.includes(name) || existsSync(join(coordDir, `${role}.at-${name}`)));
-            if (everyone) {
-                released.add(name);
-                await Bun.write(join(coordDir, `gate-${name}.open`), "");
+    mkdirSync(work, { recursive: true });
+    const coordDir = mkdtempSync(join(work, "run-"));
+    console.log("Run artifacts: " + coordDir);
+    const metadata = new Map(roles.map(role => [role, scriptMetadata(readFileSync(rolePaths(caseId, role).script, "utf8"))]));
+    const signals = new Set([...metadata.values()].flatMap(m => m.signals));
+    // A signal has a producer. A waiting role must never release it as a barrier.
+    const gates = new Set(plan.flatMap(({role}) => metadata.get(role)!.gates).filter(name => !signals.has(name)));
+    const children: Bun.Subprocess[] = [];
+    let wire: Bun.Subprocess | undefined;
+    try {
+        if (wireHost) {
+            const os = await import("node:os"), dns = await import("node:dns/promises");
+            const ip = process.env.BS_WIRE_HOST_IP ??
+                (plan.every(p => p.mode === "native") ? "127.0.0.1" : (await dns.lookup(os.hostname(), {family: 4})).address);
+            const wirePort = process.env.BS_WIRE_HOST_PORT ?? (plan.every(p => p.mode === "native") ? "0" : "23913");
+            wire = Bun.spawn([bun, join(root, "tools/lan-conformance/probe/dp8-wire-host.ts"),
+                "--port", wirePort, "--addr-file", join(coordDir, "addr-host.txt"),
+                "--receive-file", join(coordDir, "wire-receive.txt")],
+                { cwd: root, env: {...process.env, BS_WIRE_HOST_IP: ip}, stdout: "inherit", stderr: "inherit" });
+            const deadline = Date.now() + 20000;
+            while (!existsSync(join(coordDir, "addr-host.txt"))) {
+                if (wire.exitCode !== null) throw new Error("Wire host exited before readiness: " + wire.exitCode);
+                if (Date.now() > deadline) throw new Error("Wire host readiness timeout");
+                await Bun.sleep(100);
             }
         }
-        if (allDone) break;
+        const baseTab = process.env.BS_TAB ?? "lanprobe";
+        for (const {role, mode: roleMode} of plan) {
+            children.push(Bun.spawn([bun, import.meta.path, "_run-role", caseId, role], {
+                cwd: root, env: {...process.env, BS_LANDIFF_MODE: roleMode, BS_LANDIFF_COORD: coordDir,
+                    BS_TAB: baseTab + "-" + role}, stdout: "inherit", stderr: "inherit",
+            }));
+        }
+        const released = new Set<string>(), deadline = Date.now() + 180000;
+        while (children.some(child => child.exitCode === null)) {
+            if (Date.now() > deadline) throw new Error("Role coordinator deadline");
+            if (wire && wire.exitCode !== null) throw new Error("Wire host exited during run");
+            if (wire && existsSync(join(coordDir, "wire-receive.txt"))) {
+                for (const name of metadata.get("host")!.signals) if (!released.has(name)) {
+                    publishFile(join(coordDir, "gate-" + name + ".open"), "");
+                    released.add(name);
+                }
+            }
+            for (const name of gates) {
+                if (!released.has(name) && plan.every(({role}) => !metadata.get(role)!.gates.includes(name) ||
+                    existsSync(join(coordDir, role + ".at-" + name)))) {
+                    publishFile(join(coordDir, "gate-" + name + ".open"), "");
+                    released.add(name);
+                }
+            }
+            await Bun.sleep(100);
+        }
+        const exits = await Promise.all(children.map(child => child.exited));
+        let ok = exits.every(code => code === 0);
+        for (const {role} of plan) {
+            const finalPath = join(coordDir, role + ".final.log");
+            if (!existsSync(finalPath)) { console.error("FAIL " + caseId + "/" + role + ": no final log"); ok = false; continue; }
+            const log = readFileSync(finalPath, "utf8");
+            if (!log.endsWith("exit 0\n")) { console.error("FAIL " + role + ":\n" + log); ok = false; continue; }
+            if (mode === "check") {
+                if (!diffLogs(caseId + "/" + role, readFileSync(rolePaths(caseId, role).golden, "utf8"), log,
+                    rolePaths(caseId, role).golden, finalPath)) ok = false;
+            }
+        }
+        // Commit a complete native run only after every role has finished successfully.
+        if (mode === "record" && ok) for (const {role} of plan) {
+            writeFileSync(rolePaths(caseId, role).golden, readFileSync(join(coordDir, role + ".final.log")));
+        }
+        if (mode === "run") console.log((ok ? "Completed " : "Failed ") + caseId + " (diagnostic; no parity claim)");
+        return ok;
+    } finally {
+        for (const child of children) if (child.exitCode === null) child.kill();
+        await Promise.all(children.map(child => child.exited));
+        if (wire) { if (wire.exitCode === null) wire.kill(); await wire.exited; }
     }
-    await Promise.all(children.map(c => c.exited));
-
-    let ok = true;
-    for (const role of activeRoles) {
-        const finalPath = join(coordDir, `${role}.final.log`);
-        if (!existsSync(finalPath)) {
-            console.error(`FAIL ${caseId}/${role}: no final log (role crashed or timed out)`);
-            ok = false;
-            continue;
-        }
-        const log = await Bun.file(finalPath).text();
-        if (!log.endsWith("exit 0\n")) {
-            console.error(`FAIL ${caseId}/${role}: probe did not exit cleanly:\n${log}`);
-            ok = false;
-            continue;
-        }
-        if (mode === "record") {
-            const { golden } = rolePaths(caseId, role);
-            mkdirSync(dirname(golden), { recursive: true });
-            await Bun.write(golden, log);
-            console.log(log);
-            console.log(`golden: ${golden}`);
-        } else {
-            const { golden } = rolePaths(caseId, role);
-            const goldenLog = await Bun.file(golden).text();
-            const guestPath = join(coordDir, `${role}.guest.log`);
-            await Bun.write(guestPath, log);
-            if (!diffLogs(`${caseId}/${role}`, goldenLog, log, golden, guestPath)) ok = false;
-        }
-    }
-    if (mode === "check" && ok) console.log(`${caseId}: all ${activeRoles.length} role(s) match native.`);
-    if (wireHostProcess) { try { wireHostProcess.kill(); } catch { /* already gone */ } }
-    return ok;
 }
 
-/* ---------------- gateway config ---------------- */
+/* ---------------- gateway config/* ---------------- gateway config ---------------- */
 
 /**
  * Write a relay-server config whose gateway route targets THIS machine's
@@ -637,59 +493,49 @@ async function gatewayConfig(out: string, ports: number[]) {
 const [cmd, ...argv] = process.argv.slice(2);
 const { rest, force, roleModes, wireHost } = parseArgs(argv);
 if (cmd === "_run-role") {
-    // child of runMultiRole — mode and tab come from the environment
-    if (rest.length !== 2) usage();
-    await runRoleChild(rest[0], rest[1], resolve(process.env.BS_LANDIFF_COORD ?? ""));
-} else if (cmd === "record") {
+    if (rest.length !== 2 || !process.env.BS_LANDIFF_COORD) usage();
+    await runRoleChild(rest[0], rest[1], resolve(process.env.BS_LANDIFF_COORD));
+} else if (cmd === "record" || cmd === "run") {
     if (rest.length !== 1) usage();
     if (caseRoles(rest[0]).length) {
-        await runMultiRole(rest[0], "record", force, undefined, wireHost);
+        if (!(await runMultiRole(rest[0], cmd, force, roleModes, wireHost))) process.exitCode = 1;
     } else {
+        if (cmd === "run" || wireHost || roleModes) throw new Error("These options require a multi-role case");
         await record(rest[0], force);
     }
 } else if (cmd === "check") {
     if (!rest.length) usage();
-    const targets = rest.includes("all")
-        ? listCases().filter(id => {
-            if (roleModes) return false; // --as targets explicit cases, not all
-            if (caseRoles(id).length) return caseRoles(id).every(r => existsSync(rolePaths(id, r).golden));
-            return existsSync(casePaths(id).golden);
-        })
-        : rest;
-    let failed = 0;
+    if (rest.includes("all") && (roleModes || wireHost)) throw new Error("--as and --wire-host require an explicit case");
+    const targets = rest.includes("all") ? listCases().filter(id => {
+        const roles = caseRoles(id);
+        return roles.length ? roles.every(role => existsSync(rolePaths(id, role).golden)) : existsSync(casePaths(id).golden);
+    }) : rest;
+    let passed = 0, failed = 0, skipped = 0;
     for (const id of targets) {
         try {
-            if (caseRoles(id).length) {
-                const skip = emuSkipReason(id);
-                if (skip) {
-                    console.log(`SKIP ${id} (emu-skip: ${skip})`);
-                    continue;
-                }
-                if (!(await runMultiRole(id, "check", force, roleModes))) {
-                    failed++;
-                    process.exitCode = 1;
-                }
-            } else {
-                await check(id);
-            }
+            const roles = caseRoles(id);
+            if (!roles.length && (wireHost || roleModes)) throw new Error("Role options require a multi-role case");
+            const scripts = roles.length
+                ? planRoles(roles, "check", roleModes, wireHost).map(p => ({text: readFileSync(rolePaths(id, p.role).script, "utf8"), mode: p.mode}))
+                : [{text: readFileSync(casePaths(id).script, "utf8"), mode: "emu" as const}];
+            const skip = checkSkip(scripts);
+            if (skip) { console.log("SKIP " + id + ": " + skip); skipped++; continue; }
+            const ok = roles.length ? await runMultiRole(id, "check", force, roleModes, wireHost) : await check(id);
+            if (ok) passed++; else failed++;
         } catch (error) {
             failed++;
-            console.error(`FAIL ${id}: ${error instanceof Error ? error.message : error}`);
-            process.exitCode = 1;
+            console.error("FAIL " + id + ": " + (error instanceof Error ? error.message : error));
         }
     }
-    if (targets.length > 1) {
-        console.log(`${targets.length - failed}/${targets.length} cases match native.`);
-    }
+    console.log(passed + " matched, " + failed + " failed, " + skipped + " skipped");
+    if (failed) process.exitCode = 1;
 } else if (cmd === "gateway-config") {
     const out = rest[0] ?? join(root, "logs/lan-conformance/gateway-server.json");
     const ports = rest.slice(1).map(Number).filter(Number.isInteger);
-    await gatewayConfig(out, ports.length ? ports : [23911, 23912]);
+    await gatewayConfig(out, ports.length ? ports : [23911, 23912, 23913, 23914]);
 } else if (cmd === "list") {
     for (const id of listCases()) {
         const roles = caseRoles(id);
-        console.log(roles.length ? `${id} [${roles.join(",")}]` : id);
+        console.log(roles.length ? id + " [" + roles.join(",") + "]" : id);
     }
-} else {
-    usage();
-}
+} else usage();

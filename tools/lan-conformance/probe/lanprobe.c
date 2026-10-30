@@ -30,6 +30,8 @@
  *   setsockopt <s> <level> <opt> <buf> / getsockopt <s> <level> <opt> <size>
  *   select [t=<ms>] [r=s1,s2] [w=..] [e=..]    (t=-1 blocks)
  *   sleep <ms>
+ *   require_success                — fail the script if any prior API/wait failed
+ *   sendpeer <peer> <index|last|all> <data>
  *   gate <name> [t=<ms>]            — role barrier: logs "enter", then blocks
  *                                     until <logdir>/gate-<name>.open appears
  *   publishlocal <name> <port>      — publish best-local-IP:port without a socket
@@ -584,7 +586,7 @@ static void cmd_gate(const char *name, long timeoutMs) {
             out_append(&p, " -> ret=-1 timeout");
             *p = 0;
             log_line(lineBuf);
-            failedCommands++;
+            scriptErrors++;
             return;
         }
         Sleep(40);
@@ -1069,6 +1071,7 @@ static void com_result(const char *verb, HRESULT hr, const char *suffix) {
     if (hr == 0) out_append(&p, "0"); else out_int(&p, (long)hr);
     append_hr(&p, (long)hr);
     if (suffix && suffix[0]) out_append(&p, suffix);
+    if (FAILED(hr)) failedCommands++;
     *p = 0;
     log_line(lineBuf);
 }
@@ -1212,8 +1215,7 @@ static void cmd_settraversal(struct Token *obj, long mode) {
     hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_TRAVERSALMODE, &value, sizeof(value), DPNA_DATATYPE_DWORD);
     com_result(prefix, hr, "");
 }
-/* Add a HOSTNAME component taken from a waitaddr-published address symbol, so
- * a client can target whatever address a native role announced. */
+/* Resolve the whole endpoint announced by a native role, including its port. */
 static void cmd_addhostfromaddr(struct Token *addrTok, const char *symName) {
     Sym *s = com_sym(addrTok);
     Sym *src = sym_find(symName, wstrlen(symName));
@@ -1242,6 +1244,10 @@ static void cmd_addhostfromaddr(struct Token *addrTok, const char *symName) {
     out_append(&p, symName);
     *p = 0;
     hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_HOSTNAME, wide, (DWORD)((wstrlen(ip) + 1) * sizeof(WCHAR)), DPNA_DATATYPE_STRING);
+    if (SUCCEEDED(hr)) {
+        DWORD port = (DWORD)ntohs(src->addr.sin_port);
+        hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_PORT, &port, sizeof(port), DPNA_DATATYPE_DWORD);
+    }
     com_result(prefix, hr, "");
 }
 static void cmd_host(struct Token *peerTok, struct Token *addrTok, const char *session) {
@@ -1305,19 +1311,19 @@ static void cmd_sendpeer(struct Token *peerTok, long nth, const char *data, int 
     char prefix[MAX_LINE], *p;
     HRESULT hr;
     if (nth == -1) nth = (long)createdCount;
-    if (nth == 0 || nth < -1 || nth > (long)createdCount || dataLen < 0) {
+    if (!ps || nth < -1 || nth > (long)createdCount || dataLen < 0) {
         err_line("error sendpeer needs a peer, a player index and data");
         return;
     }
     peer = (IDirectPlay8Peer *)ps->handle;
-    id = createdIds[nth - 1];
+    id = nth == 0 ? DPNID_ALL_PLAYERS_GROUP : createdIds[nth - 1];
     buf.dwBufferSize = (DWORD)dataLen;
     buf.pBufferData = (BYTE *)data;
     p = prefix;
     out_append(&p, "sendpeer ");
     out_append(&p, ps->name);
     out_ch(&p, ' ');
-    if (nth == -1) out_append(&p, "last"); else out_int(&p, nth);
+    if (nth == 0) out_append(&p, "all"); else if (nth == -1) out_append(&p, "last"); else out_int(&p, nth);
     out_ch(&p, ' ');
     append_data(&p, data, dataLen);
     *p = 0;
@@ -1352,6 +1358,7 @@ static void cmd_cbwait(DWORD messageId, const char *msgName, long want, long tim
     out_int(&t, (long)last);
     *t = 0;
     log_line(tail);
+    if (last < (DWORD)want) failedCommands++;
 }
 
 /* ---------------- WSA event model ---------------- */
@@ -1563,6 +1570,11 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         }
         *p = 0;
         log_line(lineBuf);
+        return;
+    }
+    if (wstreq(verb, "require_success")) {
+        log_line(failedCommands ? "require_success -> ret=-1" : "require_success -> ret=0");
+        if (failedCommands) scriptErrors++;
         return;
     }
     if (wstreq(verb, "sleep")) {
@@ -2262,6 +2274,7 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         if (ntok < 4 || toks[1].isStr) { err_line("error sendpeer needs peer/player/data"); return; }
         tok_text(&toks[2], tmp2buf);
         if (wstreq(tmp2buf, "last")) nth = -1;
+        else if (wstreq(tmp2buf, "all")) nth = 0;
         else if (!parse_int_tok(2, &nth)) { err_line("error sendpeer needs peer/player/data"); return; }
         if ((n = parse_data_tok(3, dataBuf)) < 0) { err_line("error sendpeer needs peer/player/data"); return; }
         cmd_sendpeer(&toks[1], nth, dataBuf, n);

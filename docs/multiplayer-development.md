@@ -126,6 +126,24 @@ oracle itself.
 
 A unit test, an export audit or a passing component test is not parity evidence.
 
+### Verified coverage and open work
+
+- Routing regressions cover local `127.x`, a remote `10.0.0.1`, and explicitly
+  configured native gateway endpoints. These addresses must retain distinct routes.
+- Browser runs of the actual probe executable match the native goldens for
+  `udp/events` and `dp8/selfhost`. Native host and peer runs of `udp/pair` also
+  match their committed goldens.
+- A native Windows DP8 peer connects to the raw UDP wire-host and delivers a
+  four-byte message. This checks interoperability with our implementation; the
+  wire-host is not an independent native oracle. A successful all-native DP8
+  host/peer baseline and a mixed browser/native run through the relay remain open.
+  See [the probe guide](../tools/lan-conformance/probe/README.md) for role selection,
+  isolated run directories and positive success checks.
+- Quake II uses Winsock UDP. A historical short two-client session reached gameplay;
+  the current build still needs a repeatable two-client game check covering movement,
+  shooting and damage, death and respawn, reconnection, and a sustained match.
+  Component and probe results do not establish that game-level result.
+
 ## Scope
 
 Coverage is driven by what games call. Use `tools/api-census.ts` over the catalog and

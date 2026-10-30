@@ -1,5 +1,4 @@
-# STATUS: scripts encode the design; no goldens — native two-process DP8 over the adapter socket
-# STATUS: does not complete yet (host receives no query; adapter/firewall diagnosis pending).
+# Native baseline must complete before recording goldens or claiming interop.
 # Emulated DP8 peer role: connects to the native host's published address
 # (through the relay gateway under --as) and waits for the coordinator
 # confirmation that the datagram arrived.
@@ -17,8 +16,9 @@ hostaddr = waitaddr host t=30000
 addhostfromaddr y hostaddr
 dp8connect p y d
 cbwait connect-complete 1 t=30000
-sendpeer p 1 "ping"
+sendpeer p all "ping"
 gate got-ping t=30000
+require_success
 dp8close p
 release p
 comfree

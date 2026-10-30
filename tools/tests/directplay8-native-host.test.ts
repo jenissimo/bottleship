@@ -99,6 +99,9 @@ test("unknown data/voice/foreign initial frames never allocate a Host endpoint",
  const s=scene();expect(s.start()).toBe(0);
  const emit=(port:number,data:Uint8Array)=>s.hostNet.receiveFrame(encodeDatagram(PROTO_UDP,s.peerNet.node,fixture.ports[0],port,data));
  emit(fixture.ports[1],Uint8Array.of(0x7f,0,0,0));
+ const fakeConnect=new Uint8Array(16);fakeConnect[0]=DN.CONNECT;
+ new DataView(fakeConnect.buffer).setUint32(4,0x10006,true);
+ emit(fixture.ports[1],encodeNativeProtocolFrame({kind:"data",command:DN.DATA|DN.NEW_MESSAGE|DN.END_MESSAGE,control:0,sequence:0,nextReceive:0,masks:[],payload:fakeConnect}));
  emit(fixture.ports[1],encodeNativeProtocolFrame({kind:"data",command:DN.DATA|DN.RELIABLE|DN.NEW_MESSAGE|DN.END_MESSAGE,control:0,sequence:0,nextReceive:0,masks:[],payload:c1}));
  emit(fixture.ports[1]+1,encodeNativeProtocolFrame({kind:"control",command:0x88,opcode:1,messageId:0,responseId:0,version:0x10002,sessionId:9,timestamp:0,extra:new Uint8Array()}));
  expect(s.host.peerCount).toBe(0);expect(s.host.currentPlayers).toBe(1);

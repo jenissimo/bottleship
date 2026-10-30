@@ -1,104 +1,127 @@
 /**
- * dp8-wire-host — a DP8 native-wire host oracle for lan-diff mixed runs.
+ * Real UDP carrier for NativeDirectPlayHost. This is an implementation under
+ * test, not a native-Windows oracle; record goldens with the native probe.
  *
- * Hosts a session on a real UDP socket (default 127.0.0.1:23913) speaking the
- * native DNET wire protocol via NativeDirectPlayHost, so an EMULATED role can
- * connect to it through the relay gateway exactly as it would to a native
- * Windows host. The driver publishes readiness by writing a coordinator file;
- * the gateway route address is what clients must be told to dial.
- *
- *   bun dp8-wire-host.ts --port 23913 --ready <coord>/wire-host.ready
+ * bun dp8-wire-host.ts --port 23913 --addr-file <run>/addr-host.txt
  */
-import { createSocket, type Socket } from "node:dgram";
-import { writeFileSync } from "node:fs";
+import { createSocket } from "node:dgram";
+import { writeFileSync, renameSync } from "node:fs";
 import { resolve } from "node:path";
 import { LanNetwork } from "../../../src/worker/net/lan-network";
-import { PROTO_UDP, decodeDatagram, encodeDatagram } from "../../../src/worker/net/netplay-wire";
+import { PROTO_UDP, decodeDatagram, encodeDatagram, ipv4ToNode, nodeToIpv4, parseIpv4, isExternalIpv4Node } from "../../../src/worker/net/netplay-wire";
 import { NativeDirectPlayHost } from "../../../src/worker/modules/dpnet/native-wire/host";
 import { decodeNativeEnumQuery, encodeNativeEnumResponse } from "../../../src/worker/modules/dpnet/native-wire/discovery-codec";
 
-const APP_GUID = "5102dacf241b11d3aea7006097b01411";
+import { DP8_PEER, guidBytes } from "../../../src/worker/modules/dpnet/constants";
 
-const cli = new Map<string, string>();
-const argv = process.argv.slice(2);
-for (let i = 0; i < argv.length; i += 2) {
-    const name = argv[i], value = argv[i + 1];
-    if (!["--port", "--ready", "--addr-file"].includes(name) || !value) throw new Error(`usage: dp8-wire-host.ts --port <n> --ready <file> [--addr-file <file>]`);
-    cli.set(name, value);
+export const WIRE_APP_GUID = Buffer.from(guidBytes(DP8_PEER)).toString("hex");
+export interface WireHostOptions {
+    port?: number;
+    advertisedIp?: string;
+    bindIp?: string;
+    onMessage?(data: Uint8Array): void;
+    onError?(error: Error): void;
 }
-const port = Number(cli.get("--port"));
-const readyFile = resolve(cli.get("--ready")!);
-const addrFile = cli.get("--addr-file") ? resolve(cli.get("--addr-file")!) : null;
-if (!Number.isInteger(port) || port <= 0) throw new Error("bad --port");
 
-// Announce the address clients must dial: the gateway route address (this
-// machine's LAN IP), not the socket's own 127.0.0.1 binding.
-const gatewayIp = (process.env.BS_WIRE_HOST_IP ?? "").trim() || "127.0.0.1";
-const octets = gatewayIp.split(".").map(Number);
-if (octets.length !== 4 || octets.some(n => !Number.isInteger(n) || n < 0 || n > 255)) throw new Error(`bad BS_WIRE_HOST_IP "${gatewayIp}"`);
-
-const node = Uint8Array.of(2, 0, 0, octets[0], octets[1], octets[2]);
-const network = new LanNetwork(node);
-const host = new NativeDirectPlayHost(network);
-const socket: Socket = createSocket("udp4");
-
-const errors: string[] = [];
-// Replies go to the ACTUAL UDP source (the relay gateway's flow socket), not to
-// the virtual node encoded in the frame — the gateway maps them back to the guest.
-const lastSource = new Map<number, { address: string; port: number }>();
-socket.on("error", error => errors.push(String(error)));
-socket.on("message", (data, source) => {
-    console.log(`[wire-host] IN ${data.length}b head=${[...data.subarray(0, Math.min(12, data.length))].map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
-    // The native peer enumerates first: answer the query with the session desc.
-    // Native DNET enum query: 88 01 0000 0600 0100 <first 8 app GUID bytes>;
-    // the short response echoes the query with type 02 (capture map, stage28).
-    if (data.length >= 16 && data[0] === 0x88 && data[1] === 0x01 && data[4] === 0x06 && data[5] === 0x00) {
-        const response = Uint8Array.of(0x88, 0x02, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, ...data.subarray(8, 16));
-        socket.send(response, source.port, source.address, error => { if (error) errors.push(String(error)); });
-        return;
-    }
-    const query = decodeNativeEnumQuery(data);
-    if (query) {
-        if (query.application !== null && query.application !== APP_GUID) return;
-        const response = encodeNativeEnumResponse({
-            token: query.token, instance: "5102dacf".repeat(4), application: APP_GUID,
-            flags: 0, maxPlayers: 8, players: 1, name: "session", password: "",
-            reserved: new Uint8Array(), applicationData: new Uint8Array(), data: query.data,
+export async function startWireHost(options: WireHostOptions = {}) {
+    const advertisedIp = options.advertisedIp ?? "127.0.0.1";
+    if (!parseIpv4(advertisedIp)) throw new Error("Invalid advertised IPv4 address");
+    const requestedPort = options.port ?? 23913;
+    if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) throw new Error("Invalid UDP port");
+    const socket = createSocket("udp4"), network = new LanNetwork(), host = new NativeDirectPlayHost(network);
+    let closed = false;
+    socket.on("error", error => options.onError?.(error));
+    const close = async () => {
+        if (closed) return;
+        closed = true;
+        host.dispose(); network.attach(null);
+        await new Promise<void>(resolve => { try { socket.close(() => resolve()); } catch { resolve(); } });
+    };
+    try {
+        await new Promise<void>((resolve, reject) => {
+            socket.once("error", reject);
+            socket.bind(requestedPort, options.bindIp ?? "0.0.0.0", () => {
+                socket.removeListener("error", reject); resolve();
+            });
         });
-        socket.send(response, source.port, source.address, error => { if (error) errors.push(String(error)); });
-        return;
-    }
-    const decoded = decodeDatagram(data);
-    if (!decoded || decoded.proto !== PROTO_UDP) return;
-    lastSource.set(decoded.srcPort, { address: source.address, port: source.port });
-    // Feed the datagram into the host session as if it arrived on this network.
-    network.receiveFrame(encodeDatagram(PROTO_UDP, node, port, source.port, data), true);
-});
-network.attach({
-    routeLocal: true,
-    send(frame) {
-        const dg = decodeDatagram(frame);
-        if (!dg || dg.proto !== PROTO_UDP || dg.srcPort !== port) return false;
-        const replyTo = lastSource.get(dg.dstPort) ?? { address: "127.0.0.1", port: dg.dstPort };
-        socket.send(dg.payload, replyTo.port, replyTo.address, error => { if (error) errors.push(String(error)); });
-        return true;
-    },
-    close() {},
-});
+        const port = socket.address().port;
+        const send = (data: Uint8Array, remotePort: number, ip: string) => {
+            if (closed) return false;
+            socket.send(data, remotePort, ip, error => { if (error && !closed) options.onError?.(error); });
+            return true;
+        };
+        network.attach({
+            connected: true, routeLocal: true,
+            send(frame) {
+                const dg = decodeDatagram(frame);
+                if (!dg || dg.proto !== PROTO_UDP || dg.srcPort !== port || !isExternalIpv4Node(dg.node)) return false;
+                return send(dg.payload, dg.dstPort, [...nodeToIpv4(dg.node)].join("."));
+            },
+            close() {},
+        });
+        const hr = host.start({
+            port,
+            application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: WIRE_APP_GUID,
+                name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
+            player: { name: "host", data: new Uint8Array() },
+            url: address => {
+                const ip = network.isSelf(Uint8Array.from(address.node)) ? advertisedIp : [...nodeToIpv4(Uint8Array.from(address.node))].join(".");
+                return "x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=" + ip + ";port=" + address.port;
+            },
+            allowIncoming: () => true,
+            admit: () => ({ hr: 0, data: new Uint8Array() }),
+            timeout: 10000, retryInterval: 100,
+        });
+        if (hr) throw new Error("Wire host start failed: " + hr);
+        host.onMessage = () => {
+            while (host.queue.length) {
+                const data = host.queue[0].data.slice();
+                host.removeMessage(0);
+                options.onMessage?.(data);
+            }
+        };
+        socket.on("message", (data, source) => {
+            if (closed) return;
+            const query = decodeNativeEnumQuery(data);
+            if (query) {
+                if (query.application !== null && query.application !== WIRE_APP_GUID) return;
+                send(encodeNativeEnumResponse({
+                    token: query.token, instance: host.desc!.instance, application: WIRE_APP_GUID,
+                    flags: 0, maxPlayers: 8, players: host.currentPlayers, name: "session", password: "",
+                    reserved: new Uint8Array(), applicationData: new Uint8Array(), data: query.data,
+                }), source.port, source.address);
+                return;
+            }
+            const ip = parseIpv4(source.address);
+            if (ip) network.receiveFrame(encodeDatagram(PROTO_UDP, ipv4ToNode(ip, true), port, source.port, data));
+        });
+        return { host, port, address: advertisedIp + ":" + port, close };
+    } catch (error) { await close(); throw error; }
+}
 
-socket.bind(port, () => {
-    const hr = host.start({
-        port,
-        application: { flags: 0, maxPlayers: 8, players: 1, instance: "5102dacf".repeat(4), application: APP_GUID, name: "session", password: null, reserved: new Uint8Array(), applicationData: new Uint8Array() },
-        player: { name: "host", data: new Uint8Array(0) },
-        url: a => `x-directplay:/provider=%7BEBFE7BA0-628D-11D2-AE0F-006097B01411%7D;hostname=${gatewayIp};port=${a.port}`,
-        allowIncoming: () => true,
-        admit: () => ({ hr: 0, data: new Uint8Array(0) }),
-        timeout: 1000,
-        retryInterval: 20,
+function publish(path: string, body: string) {
+    const target = resolve(path), temporary = target + "." + process.pid + ".tmp";
+    writeFileSync(temporary, body); renameSync(temporary, target);
+}
+
+if (import.meta.main) {
+    const cli = new Map<string, string>(), argv = process.argv.slice(2);
+    for (let i = 0; i < argv.length; i += 2) {
+        if (!["--port", "--ready", "--addr-file", "--receive-file"].includes(argv[i]) || !argv[i + 1]) throw new Error("Invalid wire-host option");
+        cli.set(argv[i], argv[i + 1]);
+    }
+    if (!cli.has("--ready") && !cli.has("--addr-file")) throw new Error("Provide --addr-file or --ready");
+    let running: Awaited<ReturnType<typeof startWireHost>> | undefined;
+    const server = running = await startWireHost({
+        port: cli.has("--port") ? Number(cli.get("--port")) : 23913,
+        advertisedIp: process.env.BS_WIRE_HOST_IP,
+        onError: error => { console.error(error); process.exitCode = 1; void running?.close(); },
+        onMessage: data => {
+            console.log("[wire-host] received " + data.length + " bytes");
+            if (cli.has("--receive-file")) publish(cli.get("--receive-file")!, Buffer.from(data).toString("base64") + "\n");
+        },
     });
-    if (hr !== 0) throw new Error(`wire host start failed: ${hr}`);
-    writeFileSync(readyFile, `${gatewayIp}:${port}\n`);
-    console.log(`[wire-host] ready on 127.0.0.1:${port} (advertised ${gatewayIp}:${port})`);
-});
-setInterval(() => { if (errors.length) { console.error(`[wire-host] errors: ${errors.splice(0).join("; ")}`); } }, 5000).unref();
+    for (const key of ["--ready", "--addr-file"]) if (cli.has(key)) publish(cli.get(key)!, server.address + "\n");
+    console.log("[wire-host] ready " + server.address);
+    for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => { void server.close(); });
+}

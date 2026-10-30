@@ -161,16 +161,7 @@ export class NativeDirectPlayHost {
     private acceptPacket(packet: LanDatagram): void {
         if (!this.port?.live || !this.options || this.closing) return;
         const address = { node: Array.from(packet.srcNode), port: packet.srcPort };
-        let frame = decodeNativeProtocolFrame(packet.data);
-        // Native Windows peers wrap the CONNECT opcode in a data frame: the
-        // payload starts with the opcode and carries the control body
-        // (version, session id, timestamp, extra) after it. Normalize such
-        // frames so admission sees the same shape our own link produces.
-        if (frame?.kind === "data" && frame.payload.length >= 16 && frame.payload[0] === DN.CONNECT) {
-            const body = frame.payload, view = new DataView(body.buffer, body.byteOffset, body.byteLength);
-            frame = { kind: "control", command: frame.command, opcode: DN.CONNECT, messageId: frame.sequence, responseId: frame.nextReceive,
-                version: view.getUint32(4, true), sessionId: view.getUint32(8, true), timestamp: view.getUint32(12, true), extra: body.subarray(16) };
-        }
+        const frame = decodeNativeProtocolFrame(packet.data);
         if (!frame || frame.kind !== "control" || frame.opcode !== DN.CONNECT || frame.version >>> 16 !== 1 ||
             this.connections.size >= 16) return;
         const port = this.port, options = this.options, generation = this.generation;
