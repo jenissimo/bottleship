@@ -44,9 +44,11 @@ function usage(): never {
 function parseArgs(argv: string[]) {
     const rest: string[] = [];
     let force = false;
+    let wireHost = false;
     let roleModes: Record<string, "native" | "emu"> | undefined;
     for (const a of argv) {
         if (a === "--force") force = true;
+        else if (a === "--wire-host") wireHost = true;
         else if (a.startsWith("--as=")) {
             roleModes = {};
             for (const pair of a.slice("--as=".length).split(",")) {
@@ -58,7 +60,7 @@ function parseArgs(argv: string[]) {
             }
         } else rest.push(a);
     }
-    return { rest, force, roleModes };
+    return { rest, force, roleModes, wireHost };
 }
 
 function casePaths(caseId: string) {
@@ -487,10 +489,13 @@ async function runRoleChild(caseId: string, role: string, coordDir: string) {
  * Parent of a multi-role run: spawns one role child per role, watches the
  * shared coordination directory, releases gates once every role arrived.
  */
-async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean, roleModes?: Record<string, "native" | "emu">): Promise<boolean> {
+async function runMultiRole(caseId: string, mode: "record" | "check", force: boolean,
+    roleModes?: Record<string, "native" | "emu">, wireHost = false): Promise<boolean> {
     const roles = caseRoles(caseId);
     if (!roles.length) throw new Error(`No role scripts for ${caseId}`);
-    for (const role of roles) {
+    const runRoles = wireHost ? roles.filter(r => r !== "host") : roles;
+    console.log(`[wd] record=${mode === "record"} wireHost=${wireHost} runRoles=${runRoles.join(",")}`);
+    for (const role of runRoles) {
         const { script, golden } = rolePaths(caseId, role);
         if (!existsSync(script)) throw new Error(`No role script: ${script}`);
         if (mode === "check" && !existsSync(golden)) {
@@ -501,7 +506,7 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
         }
     }
     const gateNamesByRole: Array<{ role: string; gates: string[] }> = [];
-    for (const role of roles) {
+    for (const role of runRoles) {
         const { script } = rolePaths(caseId, role);
         gateNamesByRole.push({ role, gates: gateNames(await Bun.file(script).text()) });
     }
@@ -512,7 +517,32 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
     mkdirSync(coordDir, { recursive: true });
 
     const baseTab = process.env.BS_TAB ?? "";
-    const children = roles.map(role => {
+    // Wire-host oracle environment: a NativeDirectPlayHost process replaces the
+    // host role; only the remaining roles run and get diffed. The oracle
+    // publishes its address (BS_WIRE_HOST_IP or loopback) as addr-host.txt.
+    let wireHostProcess: Bun.Subprocess | undefined;
+    const activeRoles = wireHost ? roles.filter(r => r !== "host") : roles;
+    if (wireHost) {
+        if (mode === "record") {
+            // the oracle address for a native baseline is loopback
+            process.env.BS_WIRE_HOST_IP = "127.0.0.1";
+        } else if (!process.env.BS_WIRE_HOST_IP) {
+            const os = await import("node:os"), dns = await import("node:dns");
+            process.env.BS_WIRE_HOST_IP = await new Promise<string>((res, rej) =>
+                dns.lookup(os.hostname(), { family: 4 }, (e, a) => e ? rej(e) : res(String(a))));
+        }
+        mkdirSync(coordDir, { recursive: true });
+        wireHostProcess = Bun.spawn([bun, join(root, "tools/lan-conformance/probe/dp8-wire-host.ts"),
+            "--port", "23913", "--addr-file", join(coordDir, "addr-host.txt")],
+            { cwd: root, stdout: "inherit", stderr: "inherit" });
+        const readyDeadline = Date.now() + 20000;
+        while (!existsSync(join(coordDir, "addr-host.txt")) && Date.now() < readyDeadline) await Bun.sleep(100);
+        if (!existsSync(join(coordDir, "addr-host.txt"))) {
+            wireHostProcess.kill();
+            throw new Error("wire-host oracle did not become ready");
+        }
+    }
+    const children = activeRoles.map(role => {
         const tab = baseTab ? `${baseTab}-${role}` : `lanprobe-${role}`;
         // goldens are recorded from an all-native run; check pins each role to
         // its requested environment (default emu; --as role=native pins mixed)
@@ -549,7 +579,7 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
     await Promise.all(children.map(c => c.exited));
 
     let ok = true;
-    for (const role of roles) {
+    for (const role of activeRoles) {
         const finalPath = join(coordDir, `${role}.final.log`);
         if (!existsSync(finalPath)) {
             console.error(`FAIL ${caseId}/${role}: no final log (role crashed or timed out)`);
@@ -576,7 +606,8 @@ async function runMultiRole(caseId: string, mode: "record" | "check", force: boo
             if (!diffLogs(`${caseId}/${role}`, goldenLog, log, golden, guestPath)) ok = false;
         }
     }
-    if (mode === "check" && ok) console.log(`${caseId}: all ${roles.length} roles match native.`);
+    if (mode === "check" && ok) console.log(`${caseId}: all ${activeRoles.length} role(s) match native.`);
+    if (wireHostProcess) { try { wireHostProcess.kill(); } catch { /* already gone */ } }
     return ok;
 }
 
@@ -604,7 +635,7 @@ async function gatewayConfig(out: string, ports: number[]) {
 /* ---------------- main ---------------- */
 
 const [cmd, ...argv] = process.argv.slice(2);
-const { rest, force, roleModes } = parseArgs(argv);
+const { rest, force, roleModes, wireHost } = parseArgs(argv);
 if (cmd === "_run-role") {
     // child of runMultiRole — mode and tab come from the environment
     if (rest.length !== 2) usage();
@@ -612,7 +643,7 @@ if (cmd === "_run-role") {
 } else if (cmd === "record") {
     if (rest.length !== 1) usage();
     if (caseRoles(rest[0]).length) {
-        await runMultiRole(rest[0], "record", force);
+        await runMultiRole(rest[0], "record", force, undefined, wireHost);
     } else {
         await record(rest[0], force);
     }
