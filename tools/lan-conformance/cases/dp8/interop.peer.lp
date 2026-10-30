@@ -1,3 +1,5 @@
+# STATUS: scripts encode the design; no goldens — native two-process DP8 over the adapter socket
+# STATUS: does not complete yet (host receives no query; adapter/firewall diagnosis pending).
 # Emulated DP8 peer role: connects to the native host's published address
 # (through the relay gateway under --as) and waits for the coordinator
 # confirmation that the datagram arrived.
