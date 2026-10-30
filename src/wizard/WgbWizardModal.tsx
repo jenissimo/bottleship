@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LANGUAGE_PRESETS, detectLanguagePreset } from "./language-presets";
+import { LanguagePicker } from "./LanguagePicker";
 import { cx } from "../ui/cx";
 import s from "./WgbWizardModal.module.css";
 import os from "../ui/Overlay/Overlay.module.css";
@@ -234,6 +236,7 @@ interface FormState {
   bpp: string;
   ram: string; // MB
   os: string;
+  language: string;
   skipVideo: boolean;
   cdPath: string;
 }
@@ -262,6 +265,7 @@ function manifestToForm(m: Manifest): FormState {
     bpp: String(res.bpp ?? 32),
     ram: String(Math.round((ramBytes ?? 128 * 1024 * 1024) / (1024 * 1024))),
     os: osKeyFromManifest(m),
+    language: detectLanguagePreset(emu),
     skipVideo: Boolean(emu.skipVideo),
     cdPath: String(emu.cdPath ?? ""),
   };
@@ -294,6 +298,10 @@ function applyFormToManifest(base: Manifest, f: FormState): Manifest {
   }
   const preset = OS_PRESETS[f.os];
   if (preset) emu.osVersion = { ...preset };
+  // Only write a language the manifest does not already mean: an untouched English default
+  // stays implicit instead of stamping three fields into every new bundle.
+  const language = LANGUAGE_PRESETS.find((p) => p.id === f.language);
+  if (language && language.id !== detectLanguagePreset(emu)) Object.assign(emu, language.v);
   emu.skipVideo = f.skipVideo;
   if (f.cdPath) emu.cdPath = f.cdPath; else delete emu.cdPath;
   out.emulator = emu;
@@ -1081,6 +1089,11 @@ export default function WgbWizardModal({
                         <option value="yes">yes</option>
                       </select>
                     </div>
+                  </div>
+
+                  <div className={s["field"]}>
+                    <label>Language for non-Unicode programs</label>
+                    <LanguagePicker value={form.language} onChange={(value) => setForm({ ...form, language: value })} />
                   </div>
 
                   <div className={sh["sect-h"]} style={{ marginTop: 22 }}>
