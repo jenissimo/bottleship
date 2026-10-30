@@ -41,6 +41,7 @@
  *                                     bind it to a symbolic sendto target
  *   signal <name>                   — raise a coordinator flag (gate-<name>.open)
  *   wsaeventcreate / wsaeventclose <ev>   — WSA event objects (symbol = name)
+ *   wsaeventreset <ev>                    — ResetEvent on a WSA event
  *   wsaeventselect <s> <ev> 0x<mask>      — FD_READ|FD_WRITE|FD_CLOSE|...
  *   wsawait <ev...> [t=<ms>]        — WSAWaitForMultipleEvents, ret = ready index
  *   wsaenumnetevents <s> <ev>       — WSANetworkEvents: bits=..., err=...
@@ -1404,6 +1405,16 @@ static void cmd_eventclose(const char *name) {
     eventForget(name);
     log_line("wsaeventclose -> ret=0");
 }
+static void cmd_eventreset(const char *name) {
+    HANDLE ev = eventHandle(name, wstrlen(name));
+    char *p = lineBuf;
+    out_append(&p, "wsaeventreset ");
+    out_append(&p, name);
+    if (ev && ResetEvent(ev)) out_append(&p, " -> ret=0");
+    else { out_append(&p, " -> ret=-1 err=INVALID_HANDLE"); }
+    *p = 0;
+    log_line(lineBuf);
+}
 static void cmd_eventselect(const char *sockName, const char *eventName, long mask) {
     Sym *s = sym_find(sockName, wstrlen(sockName));
     HANDLE ev = eventHandle(eventName, wstrlen(eventName));
@@ -2287,6 +2298,12 @@ static void run_line(const char *lineStart, DWORD lineLen) {
     if (wstreq(verb, "wsaeventcreate")) {
         if (!assigned) { err_line("error wsaeventcreate requires assignment"); return; }
         cmd_eventcreate(assigned);
+        return;
+    }
+    if (wstreq(verb, "wsaeventreset")) {
+        if (ntok < 2 || toks[1].isStr) { err_line("error wsaeventreset needs a name"); return; }
+        tok_text(&toks[1], tmp);
+        cmd_eventreset(tmp);
         return;
     }
     if (wstreq(verb, "wsaeventclose")) {
