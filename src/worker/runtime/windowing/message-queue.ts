@@ -473,7 +473,7 @@ export class MessageQueue {
         keyStatePacked?: Uint8Array,
         extraInfo = 0
     ): boolean {
-        const time = TimeService.getInstance().nowMs() | 0;
+        const time = TimeService.getInstance().guestTickMs() | 0;
 
         if (msg === WM_MOUSEMOVE && coalesceMouseMoveEnabled) {
             // Coalesce mouse moves - replace previous.
@@ -804,7 +804,7 @@ export class MessageQueue {
                         message: 0x0000, // WM_NULL
                         wParam: 0,
                         lParam: 0,
-                        time: TimeService.getInstance().nowMs() | 0,
+                        time: TimeService.getInstance().guestTickMs() | 0,
                         ptX: 0,
                         ptY: 0
                     });
@@ -825,7 +825,7 @@ export class MessageQueue {
             message: 0x0000, // WM_NULL
             wParam: 0,
             lParam: 0,
-            time: TimeService.getInstance().nowMs() | 0,
+            time: TimeService.getInstance().guestTickMs() | 0,
             ptX: 0,
             ptY: 0
         };
