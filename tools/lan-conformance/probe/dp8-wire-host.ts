@@ -48,6 +48,19 @@ const errors: string[] = [];
 const lastSource = new Map<number, { address: string; port: number }>();
 socket.on("error", error => errors.push(String(error)));
 socket.on("message", (data, source) => {
+    console.log(`[wire-host] IN ${data.length}b head=${[...data.subarray(0, Math.min(12, data.length))].map(b => b.toString(16).padStart(2, "0")).join(" ")}`);
+    // The native peer enumerates first: answer the query with the session desc.
+    const query = decodeNativeEnumQuery(data);
+    if (query) {
+        if (query.application !== null && query.application !== APP_GUID) return;
+        const response = encodeNativeEnumResponse({
+            token: query.token, instance: "5102dacf".repeat(4), application: APP_GUID,
+            flags: 0, maxPlayers: 8, players: 1, name: "session", password: "",
+            reserved: new Uint8Array(), applicationData: new Uint8Array(), data: query.data,
+        });
+        socket.send(response, source.port, source.address, error => { if (error) errors.push(String(error)); });
+        return;
+    }
     const decoded = decodeDatagram(data);
     if (!decoded || decoded.proto !== PROTO_UDP) return;
     lastSource.set(decoded.srcPort, { address: source.address, port: source.port });
