@@ -1,4 +1,3 @@
-# emu-skip DIRECTPLAY self-loopback through the namespace backplane is broken (generic fix pending)
 # Two DirectPlay 8 peer objects in one process: host over loopback, connect,
 # exchange one datagram each way. The second receive proves the datagram
 # reached the host player and the reply reached the client player.
