@@ -304,7 +304,7 @@ function publishedNamesByRole(caseId: string, roles: string[]): Map<string, stri
     const out = new Map<string, string[]>();
     for (const role of roles) {
         const names = new Set<string>();
-        for (const m of readFileSync(rolePaths(caseId, role).script, "utf8").matchAll(/^publishaddr \S+ ([a-z0-9-]+)$/gm)) {
+        for (const m of readFileSync(rolePaths(caseId, role).script, "utf8").matchAll(/^publish(?:addr \S+|local) ([a-z0-9-]+)(?: \d+)?$/gm)) {
             names.add(m[1]);
         }
         out.set(role, [...names]);

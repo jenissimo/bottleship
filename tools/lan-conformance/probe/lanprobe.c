@@ -32,12 +32,14 @@
  *   sleep <ms>
  *   gate <name> [t=<ms>]            — role barrier: logs "enter", then blocks
  *                                     until <logdir>/gate-<name>.open appears
+ *   publishlocal <name> <port>      — publish best-local-IP:port without a socket
  *   publishaddr <s> <name>          — write the socket's address to the role
  *                                     coordinator (addr-<name>.txt); bound to
  *                                     0.0.0.0, the best local IP is published
  *   [v =] waitaddr <name> [t=<ms>]  — wait for a peer's published address and
  *                                     bind it to a symbolic sendto target
  *   signal <name>                   — raise a coordinator flag (gate-<name>.open)
+ *   addhostfromaddr <addr> <sym>    — HOSTNAME component from a published address
  *   [v =] udp_open_port             — bind 127.0.0.1:0, keep open
  *   [v =] udp_closed_port           — bind 127.0.0.1:0, close
  * Data literals: "bytes", u8:<v>, u32:<v> (LE), buf:<n>.
@@ -605,6 +607,39 @@ static int best_local_ip(char *out) {
     return 1;
 }
 
+/* Publish an explicit local endpoint (best local IP + port) without owning a
+ * socket symbol — the DP8 roles announce themselves before they have one. */
+static void cmd_publishlocal(const char *name, long port) {
+    char ip[16], path[MAX_LINE], body[32], *p;
+    HANDLE f;
+    DWORD written;
+    if (port <= 0 || port > 65535) { err_line("error publishlocal needs a name and a port"); return; }
+    if (!best_local_ip(ip)) { wcopy(ip, "127.0.0.1", 9); ip[9] = 0; }
+    p = body;
+    out_append(&p, ip);
+    out_ch(&p, ':');
+    out_int(&p, port);
+    *p = 0;
+    p = path;
+    out_append(&p, gateDir);
+    out_append(&p, "addr-");
+    out_append(&p, name);
+    out_append(&p, ".txt");
+    *p = 0;
+    f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (f == INVALID_HANDLE_VALUE) { err_line("error publishlocal cannot write the address file"); return; }
+    WriteFile(f, body, wstrlen(body), &written, 0);
+    CloseHandle(f);
+    p = lineBuf;
+    out_append(&p, "publishlocal ");
+    out_append(&p, name);
+    out_ch(&p, ' ');
+    out_int(&p, port);
+    out_append(&p, " -> ret=0");
+    *p = 0;
+    log_line(lineBuf);
+}
+
 /* Publish this role's bound address under a coordinator file name. A socket
  * bound to 0.0.0.0 publishes the best local IP instead — the address travels
  * through coordinator files, never into the log. */
@@ -1136,6 +1171,38 @@ static void cmd_settraversal(struct Token *obj, long mode) {
     out_int(&p, mode);
     *p = 0;
     hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_TRAVERSALMODE, &value, sizeof(value), DPNA_DATATYPE_DWORD);
+    com_result(prefix, hr, "");
+}
+/* Add a HOSTNAME component taken from a waitaddr-published address symbol, so
+ * a client can target whatever address a native role announced. */
+static void cmd_addhostfromaddr(struct Token *addrTok, const char *symName) {
+    Sym *s = com_sym(addrTok);
+    Sym *src = sym_find(symName, wstrlen(symName));
+    IDirectPlay8Address *addr;
+    char ip[16];
+    WCHAR wide[32];
+    char prefix[MAX_LINE], *p;
+    HRESULT hr;
+    unsigned long raw;
+    int i;
+    if (!s || !src || !src->hasAddr) { err_line("error addhostfromaddr needs an address object and a published address"); return; }
+    addr = (IDirectPlay8Address *)s->handle;
+    raw = ntohl(src->addr.sin_addr.s_addr);
+    p = ip;
+    out_int(&p, (long)((raw >> 24) & 255)); out_ch(&p, '.');
+    out_int(&p, (long)((raw >> 16) & 255)); out_ch(&p, '.');
+    out_int(&p, (long)((raw >> 8) & 255)); out_ch(&p, '.');
+    out_int(&p, (long)(raw & 255));
+    *p = 0;
+    for (i = 0; i <= (int)wstrlen(ip); i++) wide[i] = (WCHAR)(unsigned char)ip[i];
+    wide[wstrlen(ip) + 1] = 0;
+    p = prefix;
+    out_append(&p, "addhostfromaddr ");
+    out_append(&p, s->name);
+    out_ch(&p, ' ');
+    out_append(&p, symName);
+    *p = 0;
+    hr = IDirectPlay8Address_AddComponent(addr, DPNA_KEY_HOSTNAME, wide, (DWORD)((wstrlen(ip) + 1) * sizeof(WCHAR)), DPNA_DATATYPE_STRING);
     com_result(prefix, hr, "");
 }
 static void cmd_host(struct Token *peerTok, struct Token *addrTok, const char *session) {
@@ -1858,6 +1925,16 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         log_line(lineBuf);
         return;
     }
+    if (wstreq(verb, "publishlocal")) {
+        long port = 0;
+        if (ntok < 3 || toks[1].isStr || toks[1].len >= SYM_NAME || !parse_int_tok(2, &port)) {
+            err_line("error publishlocal needs a name and a port");
+            return;
+        }
+        tok_text(&toks[1], tmp);
+        cmd_publishlocal(tmp, port);
+        return;
+    }
     if (wstreq(verb, "publishaddr")) {
         if (ntok < 3 || toks[1].isStr || toks[2].isStr || toks[2].len >= SYM_NAME) {
             err_line("error publishaddr needs a socket and a name");
@@ -1931,6 +2008,16 @@ static void run_line(const char *lineStart, DWORD lineLen) {
             return;
         }
         cmd_addcomponent_port(&toks[1], port);
+        return;
+    }
+    if (wstreq(verb, "addhostfromaddr")) {
+        char gn[SYM_NAME];
+        if (ntok < 3 || toks[1].isStr || toks[2].isStr || toks[2].len >= SYM_NAME) {
+            err_line("error addhostfromaddr needs an address object and a published symbol");
+            return;
+        }
+        tok_text(&toks[2], gn);
+        cmd_addhostfromaddr(&toks[1], gn);
         return;
     }
     if (wstreq(verb, "setdevice")) {
