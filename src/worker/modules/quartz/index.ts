@@ -50,6 +50,7 @@ import {
     E_ABORT,
     EC_COMPLETE,
     FilterState,
+    VFW_E_WRONG_STATE,
 } from "./constants";
 
 type DetectedAudio = {
@@ -574,25 +575,29 @@ export class Quartz implements IModule {
 
             const fg = this.getFilterGraph(mem, thisPtr);
             if (!fg) return E_FAIL;
+            if (!pEvCode) return E_POINTER;
+            if (!Mem.writeUint32(pEvCode, 0)) return E_POINTER;
 
-            Logger.log(LogCategory.COM, `[Quartz] IMediaEvent::WaitForCompletion(timeout=${msTimeout})`);
+            Logger.log(LogCategory.COM, `[Quartz] IMediaEvent::WaitForCompletion(timeout=${msTimeout | 0})`);
 
-            if (fg.state !== FilterState.COMPLETED) {
-                // Wait for completion or timeout
-                const timeout = (msTimeout === -1 || msTimeout === 0xFFFFFFFF) ? 0 : msTimeout;
-                await fg.waitForCompletion(timeout);
+            // Only a running graph can complete; COMPLETED is our Running-after-EOS. Waiting
+            // on a stopped/paused graph would never end, so DirectShow refuses it.
+            if (fg.state !== FilterState.RUNNING && fg.state !== FilterState.COMPLETED) {
+                return VFW_E_WRONG_STATE;
+            }
+
+            const infinite = (msTimeout | 0) === -1;
+            const completed = await fg.waitForCompletion(infinite ? null : Math.max(0, msTimeout | 0));
+            if (!completed) {
+                Logger.log(LogCategory.COM, `[Quartz] WaitForCompletion timed out (state=${FilterState[fg.state]})`);
+                return E_ABORT;
             }
 
             // WaitForCompletion consumes the completion event — a later GetEvent drain
             // must not see it a second time.
             while (fg.dequeueEvent()) { /* drain */ }
 
-            // Write event code
-            if (pEvCode) {
-                const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-                view.setInt32(pEvCode, EC_COMPLETE, true);
-            }
-
+            Mem.writeUint32(pEvCode, EC_COMPLETE);
             Logger.log(LogCategory.COM, `[Quartz] WaitForCompletion returned (state=${FilterState[fg.state]})`);
             return S_OK;
         };
