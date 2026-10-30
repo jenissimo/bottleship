@@ -505,8 +505,9 @@ export function registerFastPathD3DFunctions(dispatcher: HleDispatcher, context:
                 lastD3D7Obj = resourceProvider.getComObjectByAddress(thisPtr) as Direct3DDevice7Object | null;
                 lastD3D7TSS = lastD3D7Obj?.getAllTextureStageStates() ?? null;
             }
-            // D3DTSS_ADDRESS sets ADDRESSU and ADDRESSV too: the device's own setter fans it out.
-            if (type === D3DTSS_ADDRESS) {
+            // D3DTSS_ADDRESS sets ADDRESSU and ADDRESSV too, and a recording state block
+            // must capture the write instead of the device: both go through the setter.
+            if (type === D3DTSS_ADDRESS || lastD3D7Obj?.isRecording()) {
                 lastD3D7Obj?.setTextureStageState(stage, type, value);
             } else if (lastD3D7TSS && stage < 8 && type < 32) {
                 const idx = stage * 32 + type;
@@ -526,7 +527,9 @@ export function registerFastPathD3DFunctions(dispatcher: HleDispatcher, context:
                 lastD3D7TSS = lastD3D7Obj?.getAllTextureStageStates() ?? null;
             }
             if (lastD3D7Obj) {
-                if (lastD3D7Obj.getTexture(stage) !== texture) lastD3D7Obj.setTexture(stage, texture);
+                if (lastD3D7Obj.isRecording() || lastD3D7Obj.getTexture(stage) !== texture) {
+                    lastD3D7Obj.setTexture(stage, texture);
+                }
             }
         }, true);
 
