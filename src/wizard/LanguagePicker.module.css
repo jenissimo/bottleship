@@ -1,0 +1,9 @@
+.picker { position: relative; min-width: 0; flex: 1; }
+.picker input { width: 100%; box-sizing: border-box; padding: 9px 12px; border: 1px solid var(--line-2); border-radius: var(--r-sm); background: var(--ink-900); color: var(--fg-1); font: inherit; }
+.picker input:focus { outline: 0; border-color: var(--cyan); box-shadow: var(--glow-cyan); }
+.popup { position: absolute; z-index: 10; top: 100%; left: 0; right: 0; background: var(--surf-1); border: 1px solid var(--line-2); border-radius: var(--r-sm); box-shadow: var(--sh-3); }
+.list { max-height: 220px; overflow-y: auto; }
+.list [role="option"], .empty { padding: 8px 10px; font-size: var(--fs-sm); color: var(--fg-1); }
+.list [role="option"] { cursor: pointer; }
+.list .active { background: var(--surf-cyan); }
+.empty { color: var(--fg-3); }

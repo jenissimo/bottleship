@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LANGUAGE_PRESETS, detectLanguagePreset } from "./language-presets";
+import { LanguagePicker } from "./LanguagePicker";
 import { cx } from "../ui/cx";
 import s from "./WgbWizardModal.module.css";
 import os from "../ui/Overlay/Overlay.module.css";
@@ -1092,14 +1093,7 @@ export default function WgbWizardModal({
 
                   <div className={s["field"]}>
                     <label>Language for non-Unicode programs</label>
-                    <select value={form.language} onChange={(e) => setForm({ ...form, language: e.target.value })}>
-                      {form.language === "" && <option value="">(custom code page)</option>}
-                      {LANGUAGE_PRESETS.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.label}
-                        </option>
-                      ))}
-                    </select>
+                    <LanguagePicker value={form.language} onChange={(value) => setForm({ ...form, language: value })} />
                   </div>
 
                   <div className={sh["sect-h"]} style={{ marginTop: 22 }}>

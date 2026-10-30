@@ -5,7 +5,8 @@ import s from "./ManifestEditorModal.module.css";
 import ms from "../ui/Modal/Modal.module.css";
 import { useHostModal } from "../harness/use-host-modal";
 import { ActionButton } from "../ui/ActionButton";
-import { LANGUAGE_PRESETS, detectLanguagePreset } from "./language-presets";
+import { detectLanguagePreset, languageFieldsForSave, type LanguageFields } from "./language-presets";
+import { LanguagePicker } from "./LanguagePicker";
 
 interface ManifestEditorModalProps {
   gameKey: string | null;
@@ -61,7 +62,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [languageNamed, setLanguageNamed] = useState(false);
+  const [originalLanguage, setOriginalLanguage] = useState<LanguageFields>({});
 
   useEffect(() => {
     if (!gameKey) return;
@@ -71,7 +72,7 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
       .then((m) => {
         const e = m.emulator ?? {};
         const res = e.screenResolution ?? {};
-        setLanguageNamed(e.codepage !== undefined || e.lcid !== undefined);
+        setOriginalLanguage({ codepage: e.codepage, oemCodepage: e.oemCodepage, lcid: e.lcid });
         setForm({
           name: m.name ?? "",
           entrypoint: m.entrypoint ?? "",
@@ -112,10 +113,8 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
     }
     const preset = OS_PRESETS.find((p) => p.id === form.os);
     if (preset?.v) emulator.osVersion = preset.v;
-    const language = LANGUAGE_PRESETS.find((p) => p.id === form.language);
-    // The override is rewritten whole on save, so a named language is always carried; only
-    // the implicit en-US default stays unwritten.
-    if (language && (languageNamed || language.id !== "en-US")) Object.assign(emulator, language.v);
+    // Saving replaces the override, so preserve explicit values on an unchanged selection.
+    Object.assign(emulator, languageFieldsForSave(originalLanguage, form.language));
     if (form.cdPath.trim()) emulator.cdPath = form.cdPath.trim();
     emulator.skipVideo = form.skipVideo;
     if (form.touchLayout) emulator.touch = { layout: form.touchLayout };
@@ -209,13 +208,10 @@ export default function ManifestEditorModal({ gameKey, onClose, onSaved }: Manif
                   <input className={s["addgame__field"]} type="number" placeholder="bpp" value={form.resBpp} onChange={(e) => set("resBpp", e.target.value)} />
                 </div>
               </div>
-              <label className={s["medit-row"]}>
+              <div className={s["medit-row"]}>
                 <span className={s["medit-label"]}>Language for non-Unicode programs</span>
-                <select className={s["addgame__field"]} value={form.language} onChange={(e) => set("language", e.target.value)}>
-                  {form.language === "" && <option value="">(custom code page)</option>}
-                  {LANGUAGE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-                </select>
-              </label>
+                <LanguagePicker value={form.language} onChange={(value) => set("language", value)} />
+              </div>
               <label className={s["medit-row"]}>
                 <span className={s["medit-label"]}>CD redirect (D:)</span>
                 <input className={s["addgame__field"]} value={form.cdPath} spellCheck={false} placeholder="e.g. C:\Game\CD1" onChange={(e) => set("cdPath", e.target.value)} />
