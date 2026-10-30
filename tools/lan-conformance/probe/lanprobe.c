@@ -33,6 +33,7 @@
  *   gate <name> [t=<ms>]            — role barrier: logs "enter", then blocks
  *                                     until <logdir>/gate-<name>.open appears
  *   publishlocal <name> <port>      — publish best-local-IP:port without a socket
+ *   publiship <name> <ip> <port>    — publish an explicit ip:port endpoint
  *   publishaddr <s> <name>          — write the socket's address to the role
  *                                     coordinator (addr-<name>.txt); bound to
  *                                     0.0.0.0, the best local IP is published
@@ -633,6 +634,39 @@ static void cmd_publishlocal(const char *name, long port) {
     p = lineBuf;
     out_append(&p, "publishlocal ");
     out_append(&p, name);
+    out_ch(&p, ' ');
+    out_int(&p, port);
+    out_append(&p, " -> ret=0");
+    *p = 0;
+    log_line(lineBuf);
+}
+
+/* Publish an explicit ip:port endpoint (loopback baselines). */
+static void cmd_publiship(const char *name, const char *ip, long port) {
+    char path[MAX_LINE], body[32], *p;
+    HANDLE f;
+    DWORD written;
+    if (port <= 0 || port > 65535 || wstrlen(ip) >= 16) { err_line("error publiship needs a name, an ip and a port"); return; }
+    p = body;
+    out_append(&p, ip);
+    out_ch(&p, ':');
+    out_int(&p, port);
+    *p = 0;
+    p = path;
+    out_append(&p, gateDir);
+    out_append(&p, "addr-");
+    out_append(&p, name);
+    out_append(&p, ".txt");
+    *p = 0;
+    f = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+    if (f == INVALID_HANDLE_VALUE) { err_line("error publiship cannot write the address file"); return; }
+    WriteFile(f, body, wstrlen(body), &written, 0);
+    CloseHandle(f);
+    p = lineBuf;
+    out_append(&p, "publiship ");
+    out_append(&p, name);
+    out_ch(&p, ' ');
+    out_append(&p, ip);
     out_ch(&p, ' ');
     out_int(&p, port);
     out_append(&p, " -> ret=0");
@@ -1923,6 +1957,18 @@ static void run_line(const char *lineStart, DWORD lineLen) {
         }
         *p = 0;
         log_line(lineBuf);
+        return;
+    }
+    if (wstreq(verb, "publiship")) {
+        char ipn[16];
+        long port = 0;
+        if (ntok < 4 || toks[1].isStr || toks[1].len >= SYM_NAME || toks[2].isStr || toks[2].len >= 16 || !parse_int_tok(3, &port)) {
+            err_line("error publiship needs a name, an ip and a port");
+            return;
+        }
+        tok_text(&toks[1], tmp);
+        tok_text(&toks[2], ipn);
+        cmd_publiship(tmp, ipn, port);
         return;
     }
     if (wstreq(verb, "publishlocal")) {
