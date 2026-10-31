@@ -1695,6 +1695,30 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     private nextStateBlockId: number = 1;
     private isRecordingStateBlock: boolean = false;
     private recordingStateBlock: D3DStateBlock | null = null;
+    private stateBlockTextureRefs = new Map<D3DStateBlock, (BaseComObject | null)[]>();
+
+    private setBlockTexture(block: D3DStateBlock, stage: number, addr: number): void {
+        const rp = SystemResourceProvider.getInstance();
+        const obj = addr ? (rp.getComObjectByAddress(addr) ?? rp.getComObject(addr)) : null;
+        let refs = this.stateBlockTextureRefs.get(block);
+        if (!refs) {
+            refs = new Array(8).fill(null);
+            this.stateBlockTextureRefs.set(block, refs);
+        }
+        const previous = refs[stage];
+        if (previous !== obj) {
+            obj?.addRef();
+            refs[stage] = obj;
+            previous?.release();
+        }
+        block.textures[stage] = addr;
+    }
+
+    private releaseBlockTextures(block: D3DStateBlock): void {
+        const refs = this.stateBlockTextureRefs.get(block);
+        this.stateBlockTextureRefs.delete(block);
+        if (refs) for (const ref of refs) ref?.release();
+    }
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DDevice7, vtableAddress);
@@ -1749,6 +1773,8 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
         this.lightsEnabled.clear();
 
         // Reset state blocks
+        for (const block of this.stateBlocks.values()) this.releaseBlockTextures(block);
+        if (this.recordingStateBlock) this.releaseBlockTextures(this.recordingStateBlock);
         this.stateBlocks.clear();
         this.nextStateBlockId = 1;
         this.isRecordingStateBlock = false;
@@ -1798,7 +1824,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
         if (stage >= 0 && stage < 8) {
             const rec = this.recordingStateBlock;
             if (rec?.recorded) {
-                rec.textures[stage] = addr;
+                this.setBlockTexture(rec, stage, addr);
                 rec.recorded.textures |= 1 << stage;
                 return;
             }
@@ -2141,6 +2167,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
             lightsEnabled: new Set(this.lightsEnabled),
             viewport: this.viewportData ? { ...this.viewportData } : null,
         };
+        for (let stage = 0; stage < 8; stage++) this.setBlockTexture(block, stage, block.textures[stage]);
         this.stateBlocks.set(id, block);
         return id;
     }
@@ -2155,7 +2182,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
         }
         block.renderStates.set(this.renderStates);
         block.textureStageStates.set(this.textureStageStates);
-        block.textures = [...this.textureAddrs];
+        for (let stage = 0; stage < 8; stage++) this.setBlockTexture(block, stage, this.textureAddrs[stage]);
         block.transforms.world = new Float32Array(this.worldMatrix);
         block.transforms.view = new Float32Array(this.viewMatrix);
         block.transforms.projection = new Float32Array(this.projMatrix);
@@ -2172,7 +2199,7 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
             if (mask.textureStageStates[i]) block.textureStageStates[i] = this.textureStageStates[i];
         }
         for (let stage = 0; stage < 8; stage++) {
-            if (mask.textures & (1 << stage)) block.textures[stage] = this.textureAddrs[stage];
+            if (mask.textures & (1 << stage)) this.setBlockTexture(block, stage, this.textureAddrs[stage]);
         }
         const t = block.transforms;
         if (t.world) t.world.set(this.worldMatrix);
@@ -2234,11 +2261,18 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     deleteStateBlock(handle: number): boolean {
-        return this.stateBlocks.delete(handle);
+        const block = this.stateBlocks.get(handle);
+        if (!block) return false;
+        this.stateBlocks.delete(handle);
+        this.releaseBlockTextures(block);
+        return true;
     }
 
     protected destroy(): void {
         this._destroying = true;
+        for (const block of this.stateBlocks.values()) this.releaseBlockTextures(block);
+        this.stateBlocks.clear();
+        if (this.recordingStateBlock) this.releaseBlockTextures(this.recordingStateBlock);
         const resourceProvider = SystemResourceProvider.getInstance();
 
         // Release bound textures

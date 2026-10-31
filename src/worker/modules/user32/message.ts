@@ -162,6 +162,7 @@ function sendRetrievalSetCursor(
     stackCleanup: number,
     value: number,
     tag: string,
+    finish: () => number | null = () => value,
 ): ThunkResult | null {
     const sc = msg.sentSetCursor;
     if (!sc) return null;
@@ -171,13 +172,13 @@ function sendRetrievalSetCursor(
         if (typeof plan === 'number') return null;
         const forwarded = invokeWindowMessageSync(
             ctx, mem, plan.forwardTo, WM_SETCURSOR_MSG, sc.wParam, sc.lParam, stackCleanup, tag,
-            (parentResult) => { plan.onParentResult(parentResult >>> 0); return value; },
+            (parentResult) => { plan.onParentResult(parentResult >>> 0); return finish(); },
         );
         if (!forwarded) plan.onParentResult(0);
         return forwarded;
     }
     return invokeWindowMessageSync(
-        ctx, mem, msg.hwnd, WM_SETCURSOR_MSG, sc.wParam, sc.lParam, stackCleanup, tag, () => value,
+        ctx, mem, msg.hwnd, WM_SETCURSOR_MSG, sc.wParam, sc.lParam, stackCleanup, tag, finish,
     );
 }
 
@@ -654,6 +655,24 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         return { value: 0, suspendedForCallback: true, callbackId: r.callbackId, stackCleanup };
     }
 
+    function dispatchMoveSetCursor(
+        ctx: X86Context, mem: Uint8Array, msg: Message, threadId: number,
+        lpMsg: number, stackCleanup: number, value: number, label: string,
+    ): ThunkResult | null {
+        const system = System.getInstance();
+        const callbackManager = system.process?.dispatcher?.callbackManager;
+        const finish = (): number | null => {
+            if (!callbackManager) return value;
+            const frameId = callbackManager.getActiveSuspendedFrameId();
+            const freshMem = (): Uint8Array | null => system.process?.getCurrentMemory() ?? null;
+            const result = applyGetMessageHook(frameId, msg, true, threadId, lpMsg,
+                delivered => delivered?.message === WM_QUIT ? 0 : value,
+                `${label}:WH_GETMESSAGE`, callbackManager, freshMem);
+            return typeof result === 'number' ? result : null;
+        };
+        return sendRetrievalSetCursor(ctx, mem, msg, stackCleanup, value, label, finish);
+    }
+
     /**
      * Real USER32 invokes the topmost WH_KEYBOARD hook proc from INSIDE
      * GetMessage/PeekMessage whenever a WM_(SYS)KEY(DOWN|UP) is about to be
@@ -780,13 +799,11 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             });
             Logger.verboseLazy(LogCategory.USER32, () =>
                 `GetMessageW(sync): msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
-            // WH_GETMESSAGE would need a second guest call chained after the send; with a
-            // hook installed the move is delivered without its WM_SETCURSOR.
-            if (msg.sentSetCursor && getMessageHooksFor(currentThreadId).length === 0) {
+            if (msg.sentSetCursor) {
                 noteRetrievedExtraInfo(currentThreadId, msg);
                 writeMsgToMemory(mem, lpMsg, msg);
-                return sendRetrievalSetCursor(ctx, mem, msg, 16, retVal, 'GetMessage:WM_SETCURSOR')
-                    ?? { value: retVal, stackCleanup: 16 };
+                const sent = dispatchMoveSetCursor(ctx, mem, msg, currentThreadId, lpMsg, 16, retVal, 'GetMessage:WM_SETCURSOR');
+                if (sent) return sent;
             }
             if (isKeyboardHookMessage(msg.message)) {
                 // GetMessage blocking semantics vs discard-to-empty: delivering
@@ -835,7 +852,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             // causes crashes when null messages are processed (e.g. some galaxy.dll builds).
             let waitMsg: { hwnd: number; message: number; wParam: number; lParam: number; time: number; ptX?: number; ptY?: number; extraInfo?: number };
             for (;;) {
-                waitMsg = await system.windowManager.waitForMessage(currentThreadId);
+                waitMsg = await system.windowManager.waitForMessage(currentThreadId, wMsgFilterMin, wMsgFilterMax);
 
                 // If paused, block return to v86 until unpaused.
                 while (system.isPaused) {
@@ -869,20 +886,6 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 break;
             }
 
-            // No guest call can run from this resumed wait, so the WM_SETCURSOR the move
-            // carries is handed out as the message and the move goes back as pending: the
-            // next GetMessage retrieves it at once.
-            const pendingMove = waitMsg as Message;
-            if (pendingMove.sentSetCursor) {
-                system.windowManager.restorePendingMouseMove(pendingMove);
-                waitMsg = {
-                    hwnd: pendingMove.hwnd, message: WM_SETCURSOR_MSG,
-                    wParam: pendingMove.sentSetCursor.wParam, lParam: pendingMove.sentSetCursor.lParam,
-                    time: pendingMove.time, ptX: pendingMove.ptX, ptY: pendingMove.ptY,
-                    extraInfo: pendingMove.extraInfo,
-                };
-            }
-
             restartRemovedTimer(waitMsg);
 
             // Note: Get fresh memory reference after async operation!
@@ -896,7 +899,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
             const keyHookPending = isKeyboardHookMessage(waitMsg.message) && keyboardHooksFor(currentThreadId).length > 0;
             const getMsgHookPending = getMessageHooksFor(currentThreadId).length > 0;
-            if (keyHookPending || getMsgHookPending) {
+            if ((keyHookPending || getMsgHookPending) && !(waitMsg as Message).sentSetCursor) {
                 // Async wake path can't suspend for a guest callback (thunk context
                 // already transformed). Rare for WH_KEYBOARD: MFC-style pumps only call
                 // GetMessage after PeekMessage(PM_NOREMOVE) said a message exists, which
@@ -917,6 +920,19 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
                 `GetMessageW(async): msg=0x${waitMsg.message.toString(16)} hwnd=0x${waitMsg.hwnd.toString(16)} -> ${retVal} thread=${currentThreadId}`);
 
             writeMsgToMemory(freshMem, lpMsg, waitMsg);
+            const pendingMove = waitMsg as Message;
+            if (pendingMove.sentSetCursor) {
+                return {
+                    value: retVal, stackCleanup: 16,
+                    startCallbackChain: ({ esp, returnAddr, mem }: { esp: number; returnAddr: number; mem: Uint8Array }) => {
+                        const callbackCtx = { ...ctx, esp, returnAddr };
+                        const sent = dispatchMoveSetCursor(callbackCtx, mem, pendingMove, currentThreadId, lpMsg, 16, retVal, 'GetMessage:WM_SETCURSOR');
+                        if (sent?.suspendedForCallback) return true;
+                        return dispatchGetMessageHook(callbackCtx, pendingMove, true, currentThreadId, lpMsg, 16,
+                            delivered => delivered?.message === WM_QUIT ? 0 : retVal, 'GetMessage:WH_GETMESSAGE') !== null;
+                    },
+                };
+            }
             return { value: retVal, stackCleanup: 16 };
         };
 
@@ -1139,10 +1155,11 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             () => `PeekMessageW: thread=${threadId} found msg=0x${msg.message.toString(16)} hwnd=0x${msg.hwnd.toString(16)} wParam=0x${msg.wParam.toString(16)} lParam=0x${msg.lParam.toString(16)}`
         );
 
-        if (msg.sentSetCursor && getMessageHooksFor(callerThreadId).length === 0) {
+        if (msg.sentSetCursor) {
             noteRetrievedExtraInfo(callerThreadId, msg);
             writeMsgToMemory(mem, lpMsg, msg);
-            return sendRetrievalSetCursor(ctx, mem, msg, 20, 1, 'PeekMessage:WM_SETCURSOR') ?? 1;
+            const sent = dispatchMoveSetCursor(ctx, mem, msg, callerThreadId, lpMsg, 20, 1, 'PeekMessage:WM_SETCURSOR');
+            if (sent) return sent;
         }
 
         if (isKeyboardHookMessage(msg.message)) {

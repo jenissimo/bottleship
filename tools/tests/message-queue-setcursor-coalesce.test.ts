@@ -54,6 +54,17 @@ describe("WM_SETCURSOR coalesces with its mouse move", () => {
         expect(q.dequeue(WM_MOUSEMOVE, WM_MOUSEMOVE)?.sentSetCursor).toBeDefined();
     });
 
+    it("a blocked filtered retrieval leaves other messages queued", async () => {
+        const q = new MessageQueue();
+        const waiting = q.waitForMessage(0, WM_MOUSEMOVE, WM_MOUSEMOVE);
+        q.enqueue(HWND, 0x400, 0, 0);
+        postMove(q, 5);
+        const move = await waiting;
+        expect(move.message).toBe(WM_MOUSEMOVE);
+        expect(move.sentSetCursor).toBeDefined();
+        expect(q.dequeue()?.message).toBe(0x400);
+    });
+
     it("a click flushes the pending pair ahead of it, in order", () => {
         const q = new MessageQueue();
         postMove(q, 3);
