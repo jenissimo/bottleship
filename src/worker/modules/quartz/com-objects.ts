@@ -572,29 +572,28 @@ export class FilterGraphObject extends BaseComObject {
     }
 
     /**
-     * Wait until playback completes.
+     * Wait until playback completes. Resolves true on completion, false when the
+     * timeout expires first; timeoutMs null waits forever, 0 only polls.
      */
-    waitForCompletion(timeoutMs: number): Promise<void> {
-        if (this.state === FilterState.COMPLETED) {
-            return Promise.resolve();
-        }
+    waitForCompletion(timeoutMs: number | null): Promise<boolean> {
+        if (this.state === FilterState.COMPLETED) return Promise.resolve(true);
+        if (timeoutMs === 0) return Promise.resolve(false);
 
-        return new Promise<void>((resolve) => {
-            if (timeoutMs > 0 && timeoutMs < 0x7FFFFFFF) {
-                const timer = setTimeout(() => {
-                    // Timeout — resolve anyway
-                    const idx = this.completionResolvers.indexOf(resolve);
-                    if (idx >= 0) this.completionResolvers.splice(idx, 1);
-                    resolve();
-                }, timeoutMs);
-
-                this.completionResolvers.push(() => {
-                    clearTimeout(timer);
-                    resolve();
-                });
-            } else {
-                this.completionResolvers.push(resolve);
+        return new Promise<boolean>((resolve) => {
+            if (timeoutMs === null) {
+                this.completionResolvers.push(() => resolve(true));
+                return;
             }
+            const onComplete = () => {
+                clearTimeout(timer);
+                resolve(true);
+            };
+            const timer = setTimeout(() => {
+                const idx = this.completionResolvers.indexOf(onComplete);
+                if (idx >= 0) this.completionResolvers.splice(idx, 1);
+                resolve(false);
+            }, timeoutMs);
+            this.completionResolvers.push(onComplete);
         });
     }
 

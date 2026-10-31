@@ -850,8 +850,8 @@ export class WindowManager {
         return this.messageQueue.dequeue();
     }
 
-    waitForMessage(callerThreadId = 0): Promise<Message> {
-        return this.messageQueue.waitForMessage(callerThreadId);
+    waitForMessage(callerThreadId = 0, msgMin = 0, msgMax = 0): Promise<Message> {
+        return this.messageQueue.waitForMessage(callerThreadId, msgMin, msgMax);
     }
 
     /**
@@ -875,6 +875,10 @@ export class WindowManager {
     /** Diagnostic: what is queued, per priority tier, with each entry's target thread. */
     messageQueueSnapshot(): Record<string, unknown> {
         return this.messageQueue.snapshot();
+    }
+
+    restorePendingMouseMove(msg: Message): void {
+        this.messageQueue.restorePendingMouseMove(msg);
     }
 
     hasMessages(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {

@@ -50,6 +50,7 @@ import {
     D3DMaterial7Data,
     D3DLight7Data,
     D3DStateBlock,
+    D3DStateBlockMask,
     createDefaultMaterial,
     createDefaultLight,
 } from "./d3d/types";
@@ -58,6 +59,18 @@ import {
     D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1, D3DTSS_ALPHAARG2,
 } from "./constants";
 import type { Rect } from "./helpers";
+
+function copyMaterial(m: D3DMaterial7Data): D3DMaterial7Data {
+    return { ...m, diffuse: { ...m.diffuse }, ambient: { ...m.ambient }, specular: { ...m.specular }, emissive: { ...m.emissive } };
+}
+
+function copyLight(l: D3DLight7Data): D3DLight7Data {
+    return { ...l, diffuse: { ...l.diffuse }, specular: { ...l.specular }, ambient: { ...l.ambient }, position: { ...l.position }, direction: { ...l.direction } };
+}
+
+function copyLights(lights: Map<number, D3DLight7Data>): Map<number, D3DLight7Data> {
+    return new Map(Array.from(lights, ([k, v]) => [k, copyLight(v)]));
+}
 
 export { DirectDrawObject, DirectDrawClipperObject, DirectDrawPaletteObject } from "./com-objects-ddraw";
 
@@ -738,8 +751,8 @@ export class DirectDrawSurfaceObject extends BaseComObject {
                     if (deviceObj) {
                         // Check if device is Device3 or Device7
                         if (deviceObj instanceof Direct3DDevice3Object || deviceObj instanceof Direct3DDevice7Object) {
-                            // Set texture to NULL on this stage to unbind
-                            deviceObj.setTexture(stage, 0);
+                            if (deviceObj instanceof Direct3DDevice7Object) deviceObj.unbindTexture(stage);
+                            else deviceObj.setTexture(stage, 0);
                             Logger.verbose(LogCategory.COM,
                                 `DirectDrawSurfaceObject: Unbound from device 0x${deviceHandle.toString(16)} stage ${stage}`
                             );
@@ -1682,6 +1695,30 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     private nextStateBlockId: number = 1;
     private isRecordingStateBlock: boolean = false;
     private recordingStateBlock: D3DStateBlock | null = null;
+    private stateBlockTextureRefs = new Map<D3DStateBlock, (BaseComObject | null)[]>();
+
+    private setBlockTexture(block: D3DStateBlock, stage: number, addr: number): void {
+        const rp = SystemResourceProvider.getInstance();
+        const obj = addr ? (rp.getComObjectByAddress(addr) ?? rp.getComObject(addr)) : null;
+        let refs = this.stateBlockTextureRefs.get(block);
+        if (!refs) {
+            refs = new Array(8).fill(null);
+            this.stateBlockTextureRefs.set(block, refs);
+        }
+        const previous = refs[stage];
+        if (previous !== obj) {
+            obj?.addRef();
+            refs[stage] = obj;
+            previous?.release();
+        }
+        block.textures[stage] = addr;
+    }
+
+    private releaseBlockTextures(block: D3DStateBlock): void {
+        const refs = this.stateBlockTextureRefs.get(block);
+        this.stateBlockTextureRefs.delete(block);
+        if (refs) for (const ref of refs) ref?.release();
+    }
 
     constructor(vtableAddress: number) {
         super(IID_IDirect3DDevice7, vtableAddress);
@@ -1736,6 +1773,8 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
         this.lightsEnabled.clear();
 
         // Reset state blocks
+        for (const block of this.stateBlocks.values()) this.releaseBlockTextures(block);
+        if (this.recordingStateBlock) this.releaseBlockTextures(this.recordingStateBlock);
         this.stateBlocks.clear();
         this.nextStateBlockId = 1;
         this.isRecordingStateBlock = false;
@@ -1769,6 +1808,10 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setViewportData(v: Device7Viewport | null): void {
+        if (this.recordingStateBlock) {
+            this.recordingStateBlock.viewport = v ? { ...v } : null;
+            return;
+        }
         this.viewportData = v;
     }
 
@@ -1779,8 +1822,19 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     setTexture(stage: number, addr: number): void {
         if (this._destroying) return;
         if (stage >= 0 && stage < 8) {
+            const rec = this.recordingStateBlock;
+            if (rec?.recorded) {
+                this.setBlockTexture(rec, stage, addr);
+                rec.recorded.textures |= 1 << stage;
+                return;
+            }
             this.textureAddrs[stage] = addr;
         }
+    }
+
+    /** Drop a binding whose texture is being destroyed — live state, never a recording. */
+    unbindTexture(stage: number): void {
+        if (stage >= 0 && stage < 8) this.textureAddrs[stage] = 0;
     }
 
     getTexture(stage: number): number {
@@ -1789,6 +1843,12 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
 
     setRenderState(state: number, value: number): void {
         if (state < 0 || state >= 256) return;
+        const rec = this.recordingStateBlock;
+        if (rec?.recorded) {
+            rec.renderStates[state] = value;
+            rec.recorded.renderStates[state] = 1;
+            return;
+        }
         if (state === D3DRENDERSTATE_TEXTUREMAPBLEND) {
             this.renderStates[D3DRENDERSTATE_TEXTUREMAPBLEND] = value;
             translateTexMapBlend(this.textureStageStates, value);
@@ -1808,6 +1868,12 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     private setTextureStageStateRaw(stage: number, type: number, value: number): void {
         if (stage >= 0 && stage < 8 && type >= 0 && type < 32) {
             const idx = stage * 32 + type;
+            const rec = this.recordingStateBlock;
+            if (rec?.recorded) {
+                rec.textureStageStates[idx] = value;
+                rec.recorded.textureStageStates[idx] = 1;
+                return;
+            }
             if (this.textureStageStates[idx] !== value) {
                 this.textureStageStates[idx] = value;
             }
@@ -1849,6 +1915,13 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     setTransform(type: number, matrix: Float32Array): void {
         // D3D3: D3DTRANSFORMSTATE_WORLD=1, VIEW=2, PROJECTION=3
         // D3D7: D3DTS_WORLD=256, VIEW=2, PROJECTION=3
+        const rec = this.recordingStateBlock;
+        if (rec) {
+            if (type === 1 || type === 256) rec.transforms.world = new Float32Array(matrix);
+            else if (type === 2) rec.transforms.view = new Float32Array(matrix);
+            else if (type === 3) rec.transforms.projection = new Float32Array(matrix);
+            return;
+        }
         if (type === 1 || type === 256) { // D3DTRANSFORMSTATE_WORLD (D3D3) or D3DTS_WORLD (D3D7)
             this.worldMatrix.set(matrix);
             this.transformVersion++;
@@ -1927,6 +2000,10 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     // --- Lighting system methods ---
 
     setMaterial(mat: D3DMaterial7Data): void {
+        if (this.recordingStateBlock) {
+            this.recordingStateBlock.material = copyMaterial(mat);
+            return;
+        }
         this.material = mat;
         this.materialSet = true;
     }
@@ -1940,6 +2017,10 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setLight(index: number, light: D3DLight7Data): void {
+        if (this.recordingStateBlock) {
+            this.recordingStateBlock.lights.set(index, copyLight(light));
+            return;
+        }
         this.lights.set(index, light);
     }
 
@@ -1948,6 +2029,11 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     setLightEnabled(index: number, enabled: boolean): void {
+        const rec = this.recordingStateBlock;
+        if (rec?.recorded) {
+            rec.recorded.lightEnable.set(index, enabled);
+            return;
+        }
         if (enabled) {
             this.lightsEnabled.add(index);
         } else {
@@ -2020,6 +2106,11 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     }
 
     // --- State block methods ---
+    //
+    // While a block is being recorded, the Set* methods write into it INSTEAD of the device
+    // (wined3d routes them to the recording stateblock), and the block later applies or
+    // captures only the states that were set. Applying the whole zero-initialized arrays
+    // would wipe every render/stage state and texture binding the block never mentioned.
 
     isRecording(): boolean {
         return this.isRecordingStateBlock;
@@ -2037,6 +2128,12 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
             lights: new Map(),
             lightsEnabled: new Set(),
             viewport: null,
+            recorded: {
+                renderStates: new Uint8Array(256),
+                textureStageStates: new Uint8Array(8 * 32),
+                textures: 0,
+                lightEnable: new Map(),
+            },
         };
     }
 
@@ -2065,11 +2162,12 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
                 view: new Float32Array(this.viewMatrix),
                 projection: new Float32Array(this.projMatrix),
             },
-            material: { ...this.material, diffuse: { ...this.material.diffuse }, ambient: { ...this.material.ambient }, specular: { ...this.material.specular }, emissive: { ...this.material.emissive } },
-            lights: new Map(Array.from(this.lights.entries()).map(([k, v]) => [k, { ...v, diffuse: { ...v.diffuse }, specular: { ...v.specular }, ambient: { ...v.ambient }, position: { ...v.position }, direction: { ...v.direction } }])),
+            material: copyMaterial(this.material),
+            lights: copyLights(this.lights),
             lightsEnabled: new Set(this.lightsEnabled),
             viewport: this.viewportData ? { ...this.viewportData } : null,
         };
+        for (let stage = 0; stage < 8; stage++) this.setBlockTexture(block, stage, block.textures[stage]);
         this.stateBlocks.set(id, block);
         return id;
     }
@@ -2077,47 +2175,104 @@ export class Direct3DDevice7Object extends BaseComObject implements FFPLightingS
     captureStateBlock(handle: number): boolean {
         const block = this.stateBlocks.get(handle);
         if (!block) return false;
-        // Update block with current state
+        const mask = block.recorded;
+        if (mask) {
+            this.captureMasked(block, mask);
+            return true;
+        }
         block.renderStates.set(this.renderStates);
         block.textureStageStates.set(this.textureStageStates);
-        block.textures = [...this.textureAddrs];
+        for (let stage = 0; stage < 8; stage++) this.setBlockTexture(block, stage, this.textureAddrs[stage]);
         block.transforms.world = new Float32Array(this.worldMatrix);
         block.transforms.view = new Float32Array(this.viewMatrix);
         block.transforms.projection = new Float32Array(this.projMatrix);
-        block.material = { ...this.material, diffuse: { ...this.material.diffuse }, ambient: { ...this.material.ambient }, specular: { ...this.material.specular }, emissive: { ...this.material.emissive } };
-        block.lights = new Map(Array.from(this.lights.entries()).map(([k, v]) => [k, { ...v, diffuse: { ...v.diffuse }, specular: { ...v.specular }, ambient: { ...v.ambient }, position: { ...v.position }, direction: { ...v.direction } }]));
+        block.material = copyMaterial(this.material);
+        block.lights = copyLights(this.lights);
         block.lightsEnabled = new Set(this.lightsEnabled);
         block.viewport = this.viewportData ? { ...this.viewportData } : null;
         return true;
     }
 
-    applyStateBlock(handle: number): boolean {
-        const block = this.stateBlocks.get(handle);
-        if (!block) return false;
-        // Restore state from block
-        this.renderStates.set(block.renderStates);
-        this.textureStageStates.set(block.textureStageStates);
-        this.textureAddrs = [...block.textures];
-        if (block.transforms.world) this.worldMatrix.set(block.transforms.world);
-        if (block.transforms.view) this.viewMatrix.set(block.transforms.view);
-        if (block.transforms.projection) this.projMatrix.set(block.transforms.projection);
-        if (block.material) {
-            this.material = { ...block.material, diffuse: { ...block.material.diffuse }, ambient: { ...block.material.ambient }, specular: { ...block.material.specular }, emissive: { ...block.material.emissive } };
+    private captureMasked(block: D3DStateBlock, mask: D3DStateBlockMask): void {
+        for (let i = 0; i < 256; i++) {
+            if (mask.renderStates[i]) block.renderStates[i] = this.renderStates[i];
+            if (mask.textureStageStates[i]) block.textureStageStates[i] = this.textureStageStates[i];
         }
-        this.lights = new Map(Array.from(block.lights.entries()).map(([k, v]) => [k, { ...v, diffuse: { ...v.diffuse }, specular: { ...v.specular }, ambient: { ...v.ambient }, position: { ...v.position }, direction: { ...v.direction } }]));
-        this.lightsEnabled = new Set(block.lightsEnabled);
+        for (let stage = 0; stage < 8; stage++) {
+            if (mask.textures & (1 << stage)) this.setBlockTexture(block, stage, this.textureAddrs[stage]);
+        }
+        const t = block.transforms;
+        if (t.world) t.world.set(this.worldMatrix);
+        if (t.view) t.view.set(this.viewMatrix);
+        if (t.projection) t.projection.set(this.projMatrix);
+        if (block.material) block.material = copyMaterial(this.material);
+        for (const index of block.lights.keys()) {
+            const light = this.lights.get(index);
+            if (light) block.lights.set(index, copyLight(light));
+        }
+        for (const index of mask.lightEnable.keys()) {
+            mask.lightEnable.set(index, this.lightsEnabled.has(index));
+        }
+        if (block.viewport && this.viewportData) block.viewport = { ...this.viewportData };
+    }
+
+    /**
+     * Apply everything but texture bindings, which the caller routes through the texture
+     * manager (it owns the bound surfaces' references). Returns the block, or null.
+     */
+    applyStateBlock(handle: number): D3DStateBlock | null {
+        const block = this.stateBlocks.get(handle);
+        if (!block) return null;
+        const mask = block.recorded;
+        if (mask) {
+            for (let i = 0; i < 256; i++) {
+                if (mask.renderStates[i]) this.setRenderState(i, block.renderStates[i]);
+            }
+            for (let i = 0; i < 256; i++) {
+                if (mask.textureStageStates[i]) this.textureStageStates[i] = block.textureStageStates[i];
+            }
+        } else {
+            this.renderStates.set(block.renderStates);
+            this.textureStageStates.set(block.textureStageStates);
+        }
+        if (block.transforms.world) this.setTransform(256, block.transforms.world);
+        if (block.transforms.view) this.setTransform(2, block.transforms.view);
+        if (block.transforms.projection) this.setTransform(3, block.transforms.projection);
+        if (block.material) {
+            this.material = copyMaterial(block.material);
+            this.materialSet = true;
+        }
+        if (mask) {
+            for (const [index, light] of block.lights) this.lights.set(index, copyLight(light));
+            for (const [index, enabled] of mask.lightEnable) this.setLightEnabled(index, enabled);
+        } else {
+            this.lights = copyLights(block.lights);
+            this.lightsEnabled = new Set(block.lightsEnabled);
+        }
         if (block.viewport) {
             this.viewportData = { ...block.viewport };
         }
-        return true;
+        return block;
+    }
+
+    /** Stages whose binding a block sets: the recorded ones, or all eight for a full block. */
+    stateBlockTextureStages(block: D3DStateBlock): number {
+        return block.recorded ? block.recorded.textures : 0xFF;
     }
 
     deleteStateBlock(handle: number): boolean {
-        return this.stateBlocks.delete(handle);
+        const block = this.stateBlocks.get(handle);
+        if (!block) return false;
+        this.stateBlocks.delete(handle);
+        this.releaseBlockTextures(block);
+        return true;
     }
 
     protected destroy(): void {
         this._destroying = true;
+        for (const block of this.stateBlocks.values()) this.releaseBlockTextures(block);
+        this.stateBlocks.clear();
+        if (this.recordingStateBlock) this.releaseBlockTextures(this.recordingStateBlock);
         const resourceProvider = SystemResourceProvider.getInstance();
 
         // Release bound textures

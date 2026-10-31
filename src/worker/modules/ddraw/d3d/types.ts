@@ -129,6 +129,18 @@ export interface D3DStateBlock {
         minZ: number;
         maxZ: number;
     } | null;
+    /**
+     * Set on a BeginStateBlock/EndStateBlock block: only the states set while recording
+     * are applied or captured. Absent on CreateStateBlock blocks, which cover every state.
+     */
+    recorded?: D3DStateBlockMask;
+}
+
+export interface D3DStateBlockMask {
+    renderStates: Uint8Array;                // 256 flags
+    textureStageStates: Uint8Array;          // 8*32 flags
+    textures: number;                        // bit per stage
+    lightEnable: Map<number, boolean>;
 }
 
 export interface TextureResolution {

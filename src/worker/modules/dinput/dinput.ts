@@ -2330,7 +2330,7 @@ export class DInput implements IModule {
         if (maxItems === 0) { if (pdwInOut) view.setUint32(pdwInOut, 0, true); return DI_OK; }
 
         const stride = Math.max(cbObjectData, DIDEVICEOBJECTDATA8_SIZE);
-        const tick = (System.getInstance().services.time.nowMs() | 0) >>> 0;
+        const tick = (System.getInstance().services.time.guestTickMs() | 0) >>> 0;
         const n = Math.min(queue.length, maxItems);
         const wv = this.freshView();
         for (let i = 0; i < n; i++) {

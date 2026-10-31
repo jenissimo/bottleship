@@ -188,6 +188,19 @@ export class TimeService {
         this._timerResolutionMs = ms !== null && ms > 0 ? ms : TimeService.DEFAULT_TIMER_RESOLUTION_MS;
     }
 
+    /**
+     * Uptime the guest boots with. Windows has been up for a while by the time any game
+     * runs, and titles rely on it: a slot allocator that frees on `now - freedAt > N` with
+     * never-used slots at freedAt 0 refuses every slot while uptime < N. Kept well under
+     * the days at which float32 ms clocks lose their step.
+     */
+    static readonly GUEST_BOOT_UPTIME_MS = 3_600_000;
+
+    /** System uptime as the guest sees it: GetTickCount, timeGetTime, MSG.time. */
+    guestTickMs(): number {
+        return this.nowMs() + TimeService.GUEST_BOOT_UPTIME_MS;
+    }
+
     nowMs(): number {
         let currentMs: number;
         if (this.mode === "manual") {
@@ -263,7 +276,7 @@ export class TimeService {
      */
 
     static fastPathGetTickCount: FastPathImplementation = () => {
-        return TimeService.getInstance().nowMs() | 0;
+        return TimeService.getInstance().guestTickMs() | 0;
     };
 
     static fastPathQueryPerformanceCounter: FastPathImplementation = (esp, view, memory) => {

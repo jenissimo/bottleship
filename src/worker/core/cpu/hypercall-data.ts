@@ -1392,7 +1392,8 @@ export class HypercallDataManager {
 
         // Tick count (truncated to 32-bit ms) — derived from the SAME microseconds as QPC, so
         // the two clocks cannot disagree about whether time went backwards.
-        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT, Math.floor(nowMicros / 1000) >>> 0, true);
+        this.view.setUint32(this.hpBase + OFF_HC_TICK_COUNT,
+            (Math.floor(nowMicros / 1000) + TimeService.GUEST_BOOT_UPTIME_MS) >>> 0, true);
         this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_LO, nowMicros & 0xFFFFFFFF, true);
         this.view.setUint32(this.hpBase + OFF_HC_PERF_COUNTER_HI,
             Math.floor(nowMicros / 0x100000000), true);
