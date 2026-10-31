@@ -850,8 +850,8 @@ export class WindowManager {
         return this.messageQueue.dequeue();
     }
 
-    waitForMessage(callerThreadId = 0): Promise<Message> {
-        return this.messageQueue.waitForMessage(callerThreadId);
+    waitForMessage(callerThreadId = 0, msgMin = 0, msgMax = 0): Promise<Message> {
+        return this.messageQueue.waitForMessage(callerThreadId, msgMin, msgMax);
     }
 
     /**

@@ -5,6 +5,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { SystemResourceProvider } from "../../src/worker/core/resources/system-resource-provider";
+import { BaseComObject } from "../../src/worker/core/com/base-com-object";
 import { Direct3DDevice7Object } from "../../src/worker/modules/ddraw/com-objects";
 import {
     D3DRENDERSTATE_ALPHABLENDENABLE, D3DRENDERSTATE_LIGHTING, D3DRENDERSTATE_ZENABLE, D3DTSS_COLOROP,
@@ -37,7 +38,49 @@ function record(call: ReturnType<typeof setup>["call"], view: DataView, body: ()
     return view.getUint32(OUT, true);
 }
 
+class TestTexture extends BaseComObject {
+    destroyed = false;
+    constructor() { super("test-texture", 0); }
+    protected destroy(): void { this.destroyed = true; }
+}
+
 describe("IDirect3DDevice7 recorded state blocks", () => {
+    test("recorded texture survives release until its state block is deleted", () => {
+        const rp = SystemResourceProvider.getInstance();
+        const device = new Direct3DDevice7Object(0);
+        const texture = new TestTexture();
+        const address = 0x7010;
+        rp.mapAddressToHandle(address, texture.handle);
+        device.beginStateBlock();
+        device.setTexture(0, address);
+        expect(texture.refCount).toBe(2);
+        const block = device.endStateBlock();
+        texture.release();
+        expect(texture.destroyed).toBe(false);
+        expect(device.applyStateBlock(block)?.textures[0]).toBe(address);
+        expect(device.deleteStateBlock(block)).toBe(true);
+        expect(texture.destroyed).toBe(true);
+        device.release();
+    });
+
+    test("capture replaces the state block's retained texture", () => {
+        const rp = SystemResourceProvider.getInstance();
+        const device = new Direct3DDevice7Object(0);
+        const first = new TestTexture(), second = new TestTexture();
+        rp.mapAddressToHandle(0x7020, first.handle);
+        rp.mapAddressToHandle(0x7030, second.handle);
+        device.beginStateBlock();
+        device.setTexture(0, 0x7020);
+        const block = device.endStateBlock();
+        device.setTexture(0, 0x7030);
+        expect(device.captureStateBlock(block)).toBe(true);
+        expect(first.refCount).toBe(1);
+        expect(second.refCount).toBe(2);
+        device.deleteStateBlock(block);
+        expect(second.refCount).toBe(1);
+        device.unbindTexture(0);
+        first.release(); second.release(); device.release();
+    });
     test("Set* while recording does not touch the device", () => {
         const { device, call, view } = setup();
         call("SetRenderState", D3DRENDERSTATE_ZENABLE, 1);

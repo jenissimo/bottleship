@@ -380,7 +380,7 @@ export class MessageQueue {
     // the pointer's whole path); retrieved separately, each new move's copy jumped ahead
     // of the still-pending move and starved it.
     private moveSetCursor: Map<number, PendingMessage> = new Map();
-    private waiters: Array<{ deliver: (msg: Message) => void; settled: boolean; threadId: number }> = [];
+    private waiters: Array<{ deliver: (msg: Message) => void; settled: boolean; threadId: number; msgMin: number; msgMax: number }> = [];
 
     // Wake-reason telemetry: classifies how each waitForMessage park ends —
     // a real message delivered via drainWaiters (by msg type), a coalesced/paint
@@ -782,11 +782,11 @@ export class MessageQueue {
         return this.waiters.length > 0;
     }
 
-    waitForMessage(callerThreadId = 0): Promise<Message> {
+    waitForMessage(callerThreadId = 0, msgMin = 0, msgMax = 0): Promise<Message> {
         // Check all sources: discrete input, coalesced mouse moves, pending paint.
         // GetMessageW processes one message per call then returns to frame work —
         // no tight-spin risk from draining coalesced mouse moves here.
-        const msg = this.dequeue(0, 0, callerThreadId);
+        const msg = this.dequeue(msgMin, msgMax, callerThreadId);
         if (msg) {
             return Promise.resolve(msg);
         }
@@ -796,7 +796,7 @@ export class MessageQueue {
         // Only poll once (not in a loop) to avoid WM_MOUSEMOVE spin.
         if (this.inputPollCallback) {
             this.inputPollCallback();
-            const afterPoll = this.dequeue(0, 0, callerThreadId);
+            const afterPoll = this.dequeue(msgMin, msgMax, callerThreadId);
             if (afterPoll) {
                 return Promise.resolve(afterPoll);
             }
@@ -807,9 +807,11 @@ export class MessageQueue {
         // real input events (keys, clicks). Timeout returns WM_NULL as idle signal.
         const parkStart = performance.now();
         return new Promise(resolve => {
-            const waiterObj: { deliver: (msg: Message) => void; settled: boolean; threadId: number } = {
+            const waiterObj = {
                 settled: false,
                 threadId: callerThreadId,
+                msgMin,
+                msgMax,
                 deliver: (msg: Message) => {
                     if (waiterObj.settled) return;
                     waiterObj.settled = true;
@@ -828,7 +830,7 @@ export class MessageQueue {
                     this.waiters.splice(idx, 1);
                 }
                 // On timeout, deliver any coalesced mouse move or paint
-                const pending = this.dequeue(0, 0, callerThreadId);
+                const pending = this.dequeue(msgMin, msgMax, callerThreadId);
                 if (pending) {
                     this.recordWake('timeout-pending', pending.message, parkStart);
                     resolve(pending);
@@ -938,7 +940,7 @@ export class MessageQueue {
         while (i < this.waiters.length) {
             const waiter = this.waiters[i];
             if (waiter.settled) { this.waiters.splice(i, 1); continue; }
-            const msg = this.dequeue(0, 0, waiter.threadId);
+            const msg = this.dequeue(waiter.msgMin, waiter.msgMax, waiter.threadId);
             if (msg) {
                 this.waiters.splice(i, 1);
                 waiter.deliver(msg);
