@@ -38,6 +38,7 @@ import {
     simdSnapshot,
 } from '../fpu-helper';
 import { TimerWheel } from './timer-wheel';
+import { dispatchThreadApcs } from './apc-dispatch';
 import { SyncObjectManager, recordSyncEvent } from './sync-objects';
 import { WaitEngine } from './wait-engine';
 import { CallbackCoordinator } from './callback-coord';
@@ -49,7 +50,7 @@ import { frameVarianceDiagnostics } from '../frame-variance-diagnostics';
 import {
     Thread, ThreadState, THREAD_STATE_NAMES,
     WaitReason, WAIT_REASON_NAMES, WaitInfo, CpuContext, V86Cpu,
-    ThunkBoundaryKind, TimerKind, ApcKind, PendingApc,
+    ThunkBoundaryKind, TimerKind, ApcKind, PendingApc, ApcCallbackLifetime,
     CriticalRuntimeSection, TransientExecRangeKind,
     isValidTransition,
     KernelThreadObject,
@@ -737,12 +738,16 @@ export class Scheduler {
 
     reset(): void {
         for (const thread of this.threads.values()) {
+            this.discardThreadApcs(thread);
             this.resourceProvider.unregisterKernelObject(thread.handle);
         }
         this.syncObjects.reset();
         this.timerWheel.reset();
         this.waitEngine.reset();
         this.callbackCoord.reset();
+        this.apcDispatchStub = 0;
+        this.apcDispatchGeneration = -1;
+        this.alertedWaitResults.clear();
         this.threads.clear();
         this.stackSpanIndex = null;
         this.runQueue = [];
@@ -1657,11 +1662,6 @@ export class Scheduler {
 
         // Save current thread context if RUNNING
         if (current && current.state === ThreadState.RUNNING) {
-            // Sync lastError from WASM hypercall page
-            if (hypercallDataManager.isInitialized()) {
-                current.lastError = hypercallDataManager.readLastError();
-            }
-
             const context = this.saveContext(cpu, kind, cleanup);
             if (!context) {
                 const canContinue = this.handleUnsaveableCurrentThread(current, cpu, kind, cleanup, "performSwitch");
@@ -1680,9 +1680,6 @@ export class Scheduler {
             // Without this the thread re-enters the run queue with no context and
             // performSwitch spins "T<id> has no context". (WAITING/async-park threads manage
             // their own resume via the async-restore path, so they're intentionally excluded.)
-            if (hypercallDataManager.isInitialized()) {
-                current.lastError = hypercallDataManager.readLastError();
-            }
             const context = this.saveContext(cpu, kind, cleanup);
             if (context) current.context = context;
         }
@@ -1781,11 +1778,6 @@ export class Scheduler {
         // Update FS segment for new thread's TEB
         if (next.tebAddress > 0) {
             setFsBase(cpu, next.tebAddress);
-        }
-
-        // Sync thread data to WASM hypercall page
-        if (hypercallDataManager.isInitialized()) {
-            hypercallDataManager.syncThreadData(next.id, next.lastError, next.tebAddress);
         }
 
         // Notify ThunkDispatcher
@@ -2195,7 +2187,8 @@ export class Scheduler {
         thread.exitCode = safeExitCode;
         thread.waitInfo = null;
         thread.context = null;
-        thread.apcQueue.length = 0;
+        this.discardThreadApcs(thread);
+        this.alertedWaitResults.delete(thread.id);
 
         this.removeFromRunQueue(threadId);
 
@@ -2469,7 +2462,7 @@ export class Scheduler {
         if (!thread) return WAIT_FAILED;
 
         const resolved = this.resolveHandles(handles, thread);
-        if (!this.syncObjects.validateHandles(resolved)) return WAIT_FAILED;
+        if (!this.syncObjects.validateHandles(resolved)) { this.setLastError(6); return WAIT_FAILED; }
 
         const decision = this.syncObjects.checkWait(resolved, waitAll, thread.id, (tid) => this.threads.get(tid) ?? null);
         if (decision.ready) { this.syncObjects.consumeWait(decision, thread.id); return decision.result; }
@@ -2555,7 +2548,7 @@ export class Scheduler {
         let resolved: number[] = [];
         if (handles.length > 0) {
             resolved = this.resolveHandles(handles, thread);
-            if (!this.syncObjects.validateHandles(resolved)) return WAIT_FAILED;
+            if (!this.syncObjects.validateHandles(resolved)) { this.setLastError(6); return WAIT_FAILED; }
             const decision = this.syncObjects.checkWait(
                 resolved, waitAll, thread.id, (tid) => this.threads.get(tid) ?? null);
             if (decision.ready) { this.syncObjects.consumeWait(decision, thread.id); return decision.result; }
@@ -3195,7 +3188,7 @@ export class Scheduler {
 
     setEvent(handle: number): boolean {
         const ok = this.syncObjects.setEvent(handle);
-        const waiters = ok ? this.waitEngine.getHandleWaiters(handle) : [];
+        const waiters = ok ? this.syncObjects.getEventAliases(handle).flatMap(alias => this.waitEngine.getHandleWaiters(alias)) : [];
         recordSyncEvent("setBy", handle, this.currentThreadId ?? 0, `ok=${ok} waiters=${waiters.length}`);
         if (ok && waiters.length > 0) {
             this.wakeWaitingThreadsForHandle(handle);
@@ -3211,7 +3204,7 @@ export class Scheduler {
     pulseEvent(handle: number): boolean {
         const ok = this.syncObjects.setEvent(handle);
         if (!ok) return false;
-        if (this.waitEngine.getHandleWaiters(handle).length > 0) {
+        if (this.syncObjects.getEventAliases(handle).some(alias => this.waitEngine.getHandleWaiters(alias).length > 0)) {
             this.wakeWaitingThreadsForHandle(handle);
         }
         return this.syncObjects.resetEvent(handle);
@@ -3233,7 +3226,8 @@ export class Scheduler {
 
     /** Check if any threads are currently waiting on the given handle. */
     hasWaitersForHandle(handle: number): boolean {
-        return this.waitEngine.getHandleWaiters(handle).length > 0;
+        const aliases = this.syncObjects.getEventAliases(handle);
+        return (aliases.length ? aliases : [handle]).some(alias => this.waitEngine.getHandleWaiters(alias).length > 0);
     }
 
     createSemaphore(initialCount: number, maxCount: number): number {
@@ -3699,6 +3693,12 @@ export class Scheduler {
         }
     }
 
+    /** Publish a host completion's error to its issuing thread, without rebinding the CPU. */
+    setLastErrorForThread(threadId: number, code: number): void {
+        const thread = this.threads.get(threadId >>> 0);
+        if (thread && thread.state !== ThreadState.TERMINATED) this.setThreadLastError(thread, code);
+    }
+
     /** The last-error setter for an API that completes after an await: it targets the thread
      *  that made the call (this thread object, not a possibly reused id), and does nothing
      *  once that thread or the process is gone. */
@@ -3728,6 +3728,11 @@ export class Scheduler {
 
     getLastError(): number {
         const t = this.getCurrentThread();
+        // The WASM fast SetLastError does not enter JS; the live owner reads its
+        // hypercall slot until parking snapshots it into the Thread record.
+        if (t?.state === ThreadState.RUNNING && hypercallDataManager.isInitialized()) {
+            return hypercallDataManager.readLastError();
+        }
         return t ? t.lastError >>> 0 : (this.process?.lastError ?? 0);
     }
 
@@ -3781,10 +3786,84 @@ export class Scheduler {
         if (t && t.kernelPinCount > 0) t.kernelPinCount--;
     }
 
+    private apcDispatchStub = 0;
+    private apcDispatchGeneration = -1;
+
+    /**
+     * An APC arriving after a wait has parked must execute before the wait returns.
+     * Redirect only the saved owner context to an ordinary zero-argument thunk;
+     * no guest callback runs on the host event's current/foreign thread.
+     */
+    private wakeAlertableThreadForApc(thread: Thread): void {
+        if (thread.state !== ThreadState.WAITING || !thread.waitInfo?.alertable || !thread.context) return;
+        const process = this.process;
+        if (!process?.dispatcher?.callbackManager) return;
+        if (this.apcDispatchGeneration !== process.resetGeneration || !this.apcDispatchStub) {
+            const stub = process.thunkGenerator.generateStubDll('bottleship.runtime', [
+                { name: 'DispatchAlertedApcs', argCount: 0 },
+            ]);
+            if (Mem.writeBytes(stub.baseAddress, stub.stubCode) !== stub.stubCode.length) return;
+            this.apcDispatchStub = stub.exportTable.get('dispatchalertedapcs') ?? 0;
+            this.apcDispatchGeneration = process.resetGeneration;
+            process.dispatcher.register('bottleship.runtime', 'DispatchAlertedApcs', ctx => {
+                const tid = this.getCurrentThreadId();
+                const result = this.alertedWaitResults.get(tid) ?? WAIT_IO_COMPLETION;
+                this.alertedWaitResults.delete(tid);
+                return dispatchThreadApcs(this, process.dispatcher.callbackManager,
+                    ctx, 'AlertedWait:APC', 0, () => result) ?? result;
+            });
+        }
+        if (!this.apcDispatchStub) return;
+        const context = thread.context;
+        const entryEsp = context.esp - 4;
+        if (!process.addressSpace.validateRange(entryEsp, 4, 'w')) return;
+        // This word belongs to the blocked owner, immediately below its post-RET ESP.
+        guardStackWrite(entryEsp, 4, 'sched:alertedApcReturn', context.eip);
+        if (!Mem.writeUint32(entryEsp, context.eip)) return;
+        this.wakeThread(thread, WAIT_IO_COMPLETION);
+        // wakeThread applies the API-specific mapping (e.g. GetOverlappedResultEx BOOL).
+        this.alertedWaitResults.set(thread.id, context.eax);
+        context.esp = entryEsp;
+        context.eip = this.apcDispatchStub;
+    }
+
+    private readonly alertedWaitResults = new Map<number, number>();
+    private readonly activeOwnedApcs = new Map<number, Set<PendingApc>>();
+
+    /** prepare is invoked only after the owning thread and address space are restored. */
+    preparePendingApc(threadId: number, apc: PendingApc, args: readonly number[]): readonly number[] | null {
+        if (!apc.lifetime) return args;
+        const thread = this.threads.get(threadId);
+        if (!thread || thread.state === ThreadState.TERMINATED) { apc.lifetime.onDiscard?.(); return null; }
+        let active = this.activeOwnedApcs.get(threadId);
+        if (!active) this.activeOwnedApcs.set(threadId, active = new Set());
+        active.add(apc);
+        try {
+            const prepared = apc.lifetime.prepare ? apc.lifetime.prepare(args) : args;
+            if (prepared === null) this.finishPendingApc(threadId, apc, false);
+            return prepared;
+        } catch (error) { this.finishPendingApc(threadId, apc, false); throw error; }
+    }
+
+    finishPendingApc(threadId: number, apc: PendingApc, returned: boolean): void {
+        const active = this.activeOwnedApcs.get(threadId);
+        if (!active?.delete(apc)) return;
+        if (!active.size) this.activeOwnedApcs.delete(threadId);
+        if (returned) apc.lifetime?.onReturn?.(); else apc.lifetime?.onDiscard?.();
+    }
+
+    private discardThreadApcs(thread: Thread): void {
+        const queued = thread.apcQueue.splice(0), active = this.activeOwnedApcs.get(thread.id);
+        this.activeOwnedApcs.delete(thread.id);
+        for (const apc of queued) apc.lifetime?.onDiscard?.();
+        for (const apc of active ?? []) apc.lifetime?.onDiscard?.();
+    }
+
     queueUserApcByHandle(threadHandle: number, routine: number, arg0: number): boolean {
         const thread = this.getThreadByHandle(this.resolveHandle(threadHandle >>> 0));
         if (!thread || thread.state === ThreadState.TERMINATED || !routine) return false;
         thread.apcQueue.push({ routine: routine >>> 0, arg0: arg0 >>> 0, arg1: 0, arg2: 0, kind: ApcKind.USER32_QUEUE_USER_APC });
+        this.wakeAlertableThreadForApc(thread);
         return true;
     }
 
@@ -3801,13 +3880,27 @@ export class Scheduler {
             routine: routine >>> 0, arg0: errorCode >>> 0, arg1: bytes >>> 0, arg2: lpOverlapped >>> 0,
             kind: ApcKind.IO_COMPLETION,
         });
+        this.wakeAlertableThreadForApc(thread);
+        return true;
+    }
+
+    queueWsaCompletionApc(threadId: number, routine: number, errorCode: number,
+        bytes: number, lpOverlapped: number, flags: number, lifetime?: ApcCallbackLifetime): boolean {
+        const thread = this.threads.get(threadId >>> 0);
+        if (!thread || thread.state === ThreadState.TERMINATED || !routine) { lifetime?.onDiscard?.(); return false; }
+        thread.apcQueue.push({
+            lifetime, routine: routine >>> 0, arg0: errorCode >>> 0, arg1: bytes >>> 0,
+            arg2: lpOverlapped >>> 0, arg3: flags >>> 0, kind: ApcKind.WSA_COMPLETION,
+        });
+        this.wakeAlertableThreadForApc(thread);
         return true;
     }
 
     /** Put an APC back at the head of the queue — for a delivery that could not start. */
     restorePendingApc(threadId: number, apc: PendingApc): void {
         const thread = this.threads.get(threadId >>> 0);
-        if (thread) thread.apcQueue.unshift(apc);
+        if (thread && thread.state !== ThreadState.TERMINATED) thread.apcQueue.unshift(apc);
+        else apc.lifetime?.onDiscard?.();
     }
 
     /** Pop the next pending APC for a thread (null when the queue is empty). */
@@ -3822,6 +3915,7 @@ export class Scheduler {
         if (!thread || thread.state === ThreadState.TERMINATED) return 0xC0000008; // STATUS_INVALID_HANDLE
         if (!routine) return 0xC0000001; // STATUS_UNSUCCESSFUL
         thread.apcQueue.push({ routine: routine >>> 0, arg0: arg0 >>> 0, arg1: arg1 >>> 0, arg2: arg2 >>> 0, kind: ApcKind.NTDLL_NT_QUEUE_APC });
+        this.wakeAlertableThreadForApc(thread);
         return 0; // STATUS_SUCCESS
     }
 
@@ -4744,7 +4838,10 @@ export class Scheduler {
     }
 
     private wakeWaitingThreadsForHandle(triggerHandle: number): void {
-        const waiterIds = this.waitEngine.getHandleWaiters(triggerHandle);
+        const aliases = this.syncObjects.getEventAliases(triggerHandle);
+        const waiterIds = aliases.length > 1
+            ? [...new Set(aliases.flatMap(handle => this.waitEngine.getHandleWaiters(handle)))]
+            : this.waitEngine.getHandleWaiters(triggerHandle);
         for (const threadId of waiterIds) {
             const thread = this.threads.get(threadId);
             if (!thread || thread.state !== ThreadState.WAITING || !thread.waitInfo) continue;
@@ -4796,6 +4893,10 @@ export class Scheduler {
         if (newState === ThreadState.RUNNING) {
             thread.context = null; // Context is in CPU now
             this.currentThreadId = thread.id;
+            // Async wake and ordinary switches publish the same owner metadata.
+            if (hypercallDataManager.isInitialized()) {
+                hypercallDataManager.syncThreadData(thread.id, thread.lastError, thread.tebAddress);
+            }
         } else if (context) {
             thread.context = context;
         }
@@ -4822,6 +4923,12 @@ export class Scheduler {
      * the state write through here for validation.
      */
     private setThreadState(thread: Thread, newState: ThreadState): void {
+        // SetLastError can execute entirely in WASM. Save its live value before
+        // any park/suspend relinquishes CPU ownership, including blocking waits.
+        if (thread.state === ThreadState.RUNNING && newState !== ThreadState.RUNNING &&
+            thread.id === this.currentThreadId && hypercallDataManager.isInitialized()) {
+            thread.lastError = hypercallDataManager.readLastError();
+        }
         if (!isValidTransition(thread.state, newState)) {
             Logger.error(LogCategory.THREAD,
                 `Illegal state write: T${thread.id} ${THREAD_STATE_NAMES[thread.state]} -> ${THREAD_STATE_NAMES[newState]}`);

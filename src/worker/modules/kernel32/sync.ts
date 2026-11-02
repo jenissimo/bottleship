@@ -5,13 +5,15 @@
  */
 
 import { type HleDispatcher, ThunkImplementation, ThunkResult, X86Context } from '../../core/thunking/thunk-dispatcher';
-import type { FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
+import type { DeferredWrite, FastPathImplementation } from '../../core/thunking/thunk-dispatcher';
 import { Logger, LogCategory } from '../../core/logger';
 import { recordSyncEvent } from '../../core/scheduler/sync-objects';
 import { System } from '../../core/system';
+import { IO_COMPLETION_MODIFY_STATE } from '../../core/resources/system-resource-provider';
 import { EmulatorConfig, getCodePageDecoder } from '../../core/emulator-config-manager';
-import { WAIT_FAILED, WAIT_TIMEOUT, WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION, TimerKind, ApcKind, PendingApc } from '../../core/scheduler/types';
+import { WAIT_FAILED, WAIT_TIMEOUT, WAIT_BLOCKED_NO_SWITCH, WAIT_IO_COMPLETION, TimerKind } from '../../core/scheduler/types';
 import { Mem } from '../../core/memory/mem-accessor';
+import { dispatchThreadApcs } from '../../core/scheduler/apc-dispatch';
 import { TimeService } from '../../runtime/time';
 import { asBufferSource } from '../../../dom-buffer';
 import {
@@ -23,47 +25,106 @@ import {
     tryAcquireSrwShared,
 } from './srw-lock';
 import { namedObjects } from './named-objects';
+import { getWsaNativeSocketTable } from '../wsa-stub-shared';
+import type { WsaSocketTable } from '../wsa-network';
 
 /** Milliseconds from the FILETIME epoch (1601-01-01) to the Unix epoch. */
 const FILETIME_UNIX_EPOCH_MS = 11644473600000;
 
-/**
- * fileHandle -> the completion port it was associated with. Module scope, not the
- * factory's: the I/O paths that COMPLETE a request live in file-io.ts and have to
- * reach the same table.
- */
-const ioCompletionAssociations: Map<number, { portHandle: number; key: number }> = new Map();
+interface IoCompletionAssociation { portHandle: number; key: number; port: object; }
+const ioCompletionAssociations = new Map<number, IoCompletionAssociation>();
+interface SocketCompletionScope {
+    generation: number;
+    bindings: Map<number, IoCompletionAssociation>;
+    unsubscribe(): void;
+}
+const socketCompletionScopes = new Map<WsaSocketTable, SocketCompletionScope>();
+
+function releaseEmptySocketScope(table: WsaSocketTable, scope: SocketCompletionScope): void {
+    if (scope.bindings.size || socketCompletionScopes.get(table) !== scope) return;
+    scope.unsubscribe(); socketCompletionScopes.delete(table);
+}
+function socketCompletionScope(table: WsaSocketTable, create = false): SocketCompletionScope | undefined {
+    let scope = socketCompletionScopes.get(table);
+    if (scope && scope.generation !== table.generation) {
+        scope.unsubscribe(); socketCompletionScopes.delete(table); scope = undefined;
+    }
+    if (!scope && create) {
+        scope = { generation: table.generation, bindings: new Map(), unsubscribe() {} };
+        const current = scope;
+        socketCompletionScopes.set(table, scope);
+        scope.unsubscribe = table.subscribe(() => {
+            if (socketCompletionScopes.get(table) !== current) return;
+            if (current.generation !== table.generation) current.bindings.clear();
+            else for (const objectId of current.bindings.keys()) {
+                if (!table.hasFileObject(objectId)) current.bindings.delete(objectId);
+            }
+            releaseEmptySocketScope(table, current);
+        });
+    }
+    return scope;
+}
+function fileIoCompletionAssociation(fileHandle: number): IoCompletionAssociation | undefined {
+    const process = System.getInstance().process;
+    const table = process && getWsaNativeSocketTable(process, fileHandle)?.nativeHandleView;
+    return table ? socketCompletionScope(table)?.bindings.get(table.fileObjectId(fileHandle)) :
+        ioCompletionAssociations.get(fileHandle >>> 0);
+}
 
 const ERROR_INVALID_PARAMETER = 87;
 
-/**
- * Queue an I/O completion packet for a finished overlapped operation, exactly as
- * the OS does when the handle is associated with a completion port. Signalling
- * the OVERLAPPED's hEvent is NOT a substitute: a worker pool blocked in
- * GetQueuedCompletionStatus never learns its read finished, and waits forever
- * (an asset loader that runs its reads through such a pool sees nothing complete).
- *
- * Returns whether a packet was queued — false when the handle belongs to no port,
- * which is the common, non-error case.
- */
-export function postFileIoCompletion(fileHandle: number, bytesTransferred: number, lpOverlapped: number): boolean {
-    const assoc = ioCompletionAssociations.get(fileHandle >>> 0);
-    if (!assoc) return false;
-    const port = System.getInstance().resourceProvider.getKernelObject(assoc.portHandle) as
-        { kind?: string; queue?: Array<{ bytesTransferred: number; completionKey: number; overlapped: number }> } | undefined;
-    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue)) return false;
-    queueCompletionPacket(assoc.portHandle, {
-        bytesTransferred: bytesTransferred >>> 0,
-        completionKey: assoc.key >>> 0,
-        overlapped: lpOverlapped >>> 0,
-    });
-    return true;
+/** Kernel ReadFile/WriteFile can defer their IOSB until an IOCP packet is removed. */
+export interface IoCompletionPublication {
+    deferredWrites: DeferredWrite[];
+    isCurrent(): boolean;
+    didPublish?(): void;
+}
+export interface IoCompletionTarget {
+    post(bytesTransferred: number, overlapped: number, error?: number, publication?: IoCompletionPublication): boolean;
+}
+/** Keep the original destination when an issued request outlives its HANDLE. */
+export function captureFileIoCompletion(fileHandle: number): IoCompletionTarget | undefined {
+    return captureIoCompletionAssociation(fileIoCompletionAssociation(fileHandle));
+}
+/** A pending request can observe a later binding through another live alias. */
+export function captureSocketIoCompletion(table: WsaSocketTable, objectId: number): IoCompletionTarget | undefined {
+    return captureIoCompletionAssociation(socketCompletionScope(table.nativeHandleView)?.bindings.get(objectId));
+}
+function captureIoCompletionAssociation(association?: IoCompletionAssociation): IoCompletionTarget | undefined {
+    if (!association) return undefined;
+    const { key } = association;
+    const system = System.getInstance(), owner = system.process, generation = owner?.resetGeneration;
+    const port = getLivePortObject(association.port);
+    if (!port) return undefined;
+    return { post(bytesTransferred, overlapped, error = 0, publication) {
+        if (owner !== System.getInstance().process || owner?.resetGeneration !== generation ||
+            !system.resourceProvider.hasKernelObjectReference(port)) return false;
+        queueCompletionPacket(port, {
+            bytesTransferred: bytesTransferred >>> 0,
+            completionKey: key >>> 0,
+            overlapped: overlapped >>> 0,
+            ...(error ? { error: error >>> 0 } : {}),
+            ...(publication ? { publication } : {}),
+        });
+        return true;
+    } };
+}
+export function hasIoCompletionAssociation(fileHandle: number): boolean {
+    return fileIoCompletionAssociation(fileHandle) !== undefined;
+}
+
+/** Queue to the file object's associated completion port. */
+export function postFileIoCompletion(fileHandle: number, bytesTransferred: number, lpOverlapped: number, error = 0, publication?: IoCompletionPublication): boolean {
+    return captureFileIoCompletion(fileHandle)?.post(bytesTransferred, lpOverlapped, error, publication) ?? false;
 }
 
 export interface IoCompletionPacket {
     bytesTransferred: number;
     completionKey: number;
     overlapped: number;
+    /** Failed I/O still dequeues a packet; GQCS returns FALSE and this Win32 error. */
+    error?: number;
+    publication?: IoCompletionPublication;
 }
 
 /**
@@ -74,25 +135,32 @@ export interface IoCompletionPacket {
 export const IO_COMPLETION_ABANDONED = 'abandoned';
 export type IoCompletionWake = IoCompletionPacket | null | typeof IO_COMPLETION_ABANDONED;
 
-/** Threads parked in GetQueuedCompletionStatus, per port, in arrival order. */
-const ioCompletionWaiters = new Map<number, Array<(wake: IoCompletionWake) => void>>();
-
-function getPortQueue(portHandle: number): IoCompletionPacket[] | null {
-    const port = System.getInstance().resourceProvider.getKernelObject(portHandle >>> 0) as
-        { kind?: string; queue?: IoCompletionPacket[] } | undefined;
-    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue)) return null;
-    return port.queue;
+interface IoCompletionPort {
+    kind: 'iocp';
+    queue: IoCompletionPacket[];
 }
 
-/** Post a packet and hand it straight to a thread already waiting for one. */
-export function queueCompletionPacket(portHandle: number, packet: IoCompletionPacket): void {
-    const waiters = ioCompletionWaiters.get(portHandle >>> 0);
+/** Threads parked on one port object, shared by all of its HANDLE aliases. */
+const ioCompletionWaiters = new Map<IoCompletionPort, Array<(wake: IoCompletionWake) => void>>();
+
+function getLivePortObject(handleOrObject: number | object): IoCompletionPort | null {
+    const provider = System.getInstance().resourceProvider;
+    const port = (typeof handleOrObject === 'number' ? provider.getKernelObject(handleOrObject >>> 0) : handleOrObject) as IoCompletionPort | null;
+    if (!port || port.kind !== 'iocp' || !Array.isArray(port.queue) || !provider.hasKernelObjectReference(port)) return null;
+    return port;
+}
+
+/** Post through an alias or a captured object while at least one alias is open. */
+export function queueCompletionPacket(portHandle: number | IoCompletionPort, packet: IoCompletionPacket): void {
+    const port = getLivePortObject(portHandle);
+    if (!port) return;
+    const waiters = ioCompletionWaiters.get(port);
     const waiter = waiters?.shift();
     if (waiter) {
         waiter(packet);
         return;
     }
-    getPortQueue(portHandle)?.push(packet);
+    port.queue.push(packet);
 }
 
 /**
@@ -102,8 +170,9 @@ export function queueCompletionPacket(portHandle: number, packet: IoCompletionPa
  * starves the very thread that would post the work.
  */
 export function waitForCompletionPacket(portHandle: number, timeoutMs: number): Promise<IoCompletionWake> {
+    const key = getLivePortObject(portHandle);
+    if (!key) return Promise.resolve(IO_COMPLETION_ABANDONED);
     return new Promise((resolve) => {
-        const key = portHandle >>> 0;
         let settled = false;
         let timer: ReturnType<typeof setTimeout> | null = null;
         const finish = (wake: IoCompletionWake) => {
@@ -129,7 +198,7 @@ export function waitForCompletionPacket(portHandle: number, timeoutMs: number): 
             if (settled) return;
             timer = null;  // the wait continues; only the warning was one-shot
             Logger.warn(LogCategory.KERNEL32,
-                `GetQueuedCompletionStatus: a thread has waited 10s on port 0x${key.toString(16)} — ` +
+                `GetQueuedCompletionStatus: a thread has waited 10s on port 0x${portHandle.toString(16)} — ` +
                 `if the guest is stuck, an I/O completion is not being posted for some operation`);
         }, 10_000);
     });
@@ -141,17 +210,16 @@ export function waitForCompletionPacket(portHandle: number, timeoutMs: number): 
  * strands the threads on a handle no packet can ever reach again.
  */
 export function abandonIoCompletionWaiters(portHandle: number): void {
-    const key = portHandle >>> 0;
+    const key = getLivePortObject(portHandle);
+    if (!key) return;
     const list = ioCompletionWaiters.get(key);
     if (list) {
         for (const waiter of list.slice()) waiter(IO_COMPLETION_ABANDONED);
         ioCompletionWaiters.delete(key);
     }
-    // A handle bound to this port must not keep naming it: handle values are recycled,
-    // and a later file would post its completions into a dead port.
-    for (const [fileHandle, assoc] of ioCompletionAssociations) {
-        if (assoc.portHandle === key) ioCompletionAssociations.delete(fileHandle);
-    }
+    // The file object keeps its original completion context after the port handle
+    // closes. It cannot be rebound; requests without an event still defer their IOSB.
+    // File/last-alias closure and process reset release these bounded associations.
 }
 
 /** Forget a closed file handle's port binding, so a recycled value cannot inherit it. */
@@ -179,42 +247,11 @@ export function resetIoCompletionWaiters(): void {
  */
 export function deliverPendingApcs(
     ctx: X86Context, label: string, stackCleanup: number,
-    /** EAX once the queue is drained, for an API whose alerted answer is not WAIT_IO_COMPLETION. */
     alertedValue: () => number = () => WAIT_IO_COMPLETION,
 ): ThunkResult | null {
     const system = System.getInstance();
-    const sched = system.scheduler;
-    const tid = sched.getCurrentThread()?.id ?? 0;
-    if (!tid) return null;
-    const callbackManager = system.process?.dispatcher?.callbackManager;
-    if (!callbackManager) return null;
-    const first = sched.takePendingApc(tid);
-    if (!first) return null;
-
-    // Only QueueUserAPC's routine takes one argument. NtQueueApcThread's takes three
-    // (ApcContext, IoStatusBlock, Reserved), as does a FILE_IO_COMPLETION_ROUTINE — and the
-    // argument count IS the RET N, so getting it wrong leaves 8 bytes of caller stack behind.
-    const argsFor = (apc: PendingApc): number[] =>
-        apc.kind === ApcKind.USER32_QUEUE_USER_APC ? [apc.arg0] : [apc.arg0, apc.arg1, apc.arg2];
-    const cleanupFor = (apc: PendingApc): number => argsFor(apc).length * 4;
-
-    const frameId = callbackManager.saveSuspendedThunkContext(ctx, stackCleanup, label);
-    if (!frameId) {
-        // The APC was already dequeued; dropping it here would leave the issuer waiting on a
-        // completion that can never arrive — the deadlock this whole path exists to avoid.
-        sched.restorePendingApc(tid, first);
-        return null;
-    }
-
-    const next = (): number | null => {
-        const apc = sched.takePendingApc(tid);
-        if (!apc) return alertedValue();
-        callbackManager.invokeCallback(apc.routine, argsFor(apc), cleanupFor(apc), next, false, label, frameId);
-        return null;
-    };
-    const { callbackId } = callbackManager.invokeCallback(
-        first.routine, argsFor(first), cleanupFor(first), next, false, label, frameId);
-    return { value: WAIT_IO_COMPLETION, suspendedForCallback: true, callbackId, stackCleanup };
+    return dispatchThreadApcs(system.scheduler, system.process?.dispatcher?.callbackManager,
+        ctx, label, stackCleanup, alertedValue);
 }
 
 const syncModule = (() => {
@@ -951,11 +988,28 @@ const syncModule = (() => {
         const resourceProvider = System.getInstance().resourceProvider;
         const scheduler = System.getInstance().scheduler;
 
+        if (fileHandle !== 0xffffffff) {
+            const process = System.getInstance().process;
+            const socketTable = process && getWsaNativeSocketTable(process, fileHandle);
+            if (!resourceProvider.getFileHandle(fileHandle) && !socketTable) {
+                scheduler.setLastError(6); // ERROR_INVALID_HANDLE
+                return 0;
+            }
+            if (socketTable && !socketTable.nativeHandleView.get(fileHandle).overlapped) {
+                scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+            const association = fileIoCompletionAssociation(fileHandle);
+            if (association) {
+                scheduler.setLastError(ERROR_INVALID_PARAMETER);
+                return 0;
+            }
+        }
         let portHandle = existingPortHandle;
         if (portHandle === 0) {
             const port = {
                 kind: 'iocp',
-                queue: [] as Array<{ bytesTransferred: number; completionKey: number; overlapped: number }>,
+                queue: [] as IoCompletionPacket[],
                 concurrentThreads,
             };
             portHandle = resourceProvider.registerKernelObject(port);
@@ -967,10 +1021,16 @@ const syncModule = (() => {
             }
         }
 
-        // Bind the handle to the port: overlapped ReadFile/WriteFile completions post here
-        // (postFileIoCompletion), and CloseHandle drops the binding again.
-        if (fileHandle !== 0 && fileHandle !== 0xFFFFFFFF) {
-            ioCompletionAssociations.set(fileHandle, { portHandle: portHandle >>> 0, key: completionKey });
+        if (fileHandle !== 0 && fileHandle !== 0xffffffff) {
+            if (!resourceProvider.hasHandleAccess(portHandle, IO_COMPLETION_MODIFY_STATE)) {
+                scheduler.setLastError(5); return 0;
+            }
+            const process = System.getInstance().process;
+            const table = process && getWsaNativeSocketTable(process, fileHandle)?.nativeHandleView;
+            const binding = { portHandle: portHandle >>> 0, key: completionKey,
+                port: resourceProvider.getKernelObject(portHandle) as object };
+            if (table) socketCompletionScope(table, true)!.bindings.set(table.fileObjectId(fileHandle), binding);
+            else ioCompletionAssociations.set(fileHandle, binding);
         }
 
         return portHandle >>> 0;
@@ -991,6 +1051,11 @@ const syncModule = (() => {
             return 0;
         }
 
+        if (!resourceProvider.hasHandleAccess(completionPortHandle, IO_COMPLETION_MODIFY_STATE)) {
+            scheduler.setLastError(5); // ERROR_ACCESS_DENIED on this alias only.
+            return 0;
+        }
+
         // The packet is delivered VERBATIM — the three values are opaque to the
         // OS, which is what makes this the standard way to wake a worker pool
         // with a private shutdown key rather than a real I/O completion.
@@ -999,11 +1064,10 @@ const syncModule = (() => {
             completionKey: dwCompletionKey,
             overlapped: lpOverlapped,
         });
-        scheduler.setLastError(0);
-        return 1;
+        return 1; // Successful posting preserves LastError.
     };
 
-    exports['GetQueuedCompletionStatus'] = (ctx, mem, args): number | Promise<number> => {
+    exports['GetQueuedCompletionStatus'] = (ctx, mem, args): number | ThunkResult | Promise<ThunkResult> => {
         const completionPortHandle = args[0] >>> 0;
         const lpNumberOfBytesTransferred = args[1] >>> 0;
         const lpCompletionKey = args[2] >>> 0;
@@ -1019,16 +1083,46 @@ const syncModule = (() => {
             return 0;
         }
 
-        const deliver = (wake: IoCompletionWake): number => {
-            const sched = System.getInstance().scheduler;
+        if (!resourceProvider.hasHandleAccess(completionPortHandle, IO_COMPLETION_MODIFY_STATE)) {
+            scheduler.setLastError(5);
+            if (lpOverlapped) Mem.writeUint32(lpOverlapped, 0);
+            return 0;
+        }
+        const owner = System.getInstance().process;
+        const generation = owner?.resetGeneration;
+        const threadId = scheduler.getCurrentThreadId();
+        const deliver = (wake: IoCompletionWake, deferred = false): ThunkResult => {
             const packet = wake === IO_COMPLETION_ABANDONED ? null : wake;
-            if (lpNumberOfBytesTransferred) Mem.writeUint32(lpNumberOfBytesTransferred, packet ? packet.bytesTransferred >>> 0 : 0);
-            if (lpCompletionKey) Mem.writeUint32(lpCompletionKey, packet ? packet.completionKey >>> 0 : 0);
-            if (lpOverlapped) Mem.writeUint32(lpOverlapped, packet ? packet.overlapped >>> 0 : 0);
-            // A closed port is not a timeout: ERROR_ABANDONED_WAIT_0 is the only answer
-            // that tells a retry-on-timeout pool to stop.
-            sched.setLastError(packet ? 0 : (wake === IO_COMPLETION_ABANDONED ? 735 : WAIT_TIMEOUT));
-            return packet ? 1 : 0;
+            const error = packet ? (packet.error ?? 0) : (wake === IO_COMPLETION_ABANDONED ? 735 : WAIT_TIMEOUT);
+            // A host completion can run while a different guest thread owns the CPU.
+            if (error && owner?.resetGeneration === generation) {
+                if (threadId) scheduler.setLastErrorForThread(threadId, error);
+                else scheduler.setLastError(error);
+            }
+            const publication = packet?.publication;
+            const currentPublication = publication?.isCurrent() && owner?.resetGeneration === generation ? publication : undefined;
+            const deferredWrites: NonNullable<ThunkResult['deferredWrites']> =
+                !deferred && currentPublication ? [...currentPublication.deferredWrites] : [];
+            if (deferred && currentPublication && owner) {
+                // Queue before this promise resolves: IOSB publication precedes the caller's
+                // resumed thunk and wakes other GetOverlappedResult waiters only afterwards.
+                owner.enqueueCompletion(currentPublication.deferredWrites, published => {
+                    if (published && owner.resetGeneration === generation && currentPublication.isCurrent()) currentPublication.didPublish?.();
+                }, () => owner.resetGeneration === generation && currentPublication.isCurrent());
+            }
+            if (packet && lpNumberOfBytesTransferred) deferredWrites.push({ address: lpNumberOfBytesTransferred, value: packet.bytesTransferred, size: 4 });
+            if (packet && lpCompletionKey) deferredWrites.push({ address: lpCompletionKey, value: packet.completionKey, size: 4 });
+            if (lpOverlapped) deferredWrites.push({ address: lpOverlapped, value: packet?.overlapped ?? 0, size: 4 });
+            const value = packet && !error ? 1 : 0;
+            if (deferred) return { value, deferredWrites };
+            let published = true;
+            for (const write of deferredWrites) {
+                const written = write.size === 1 ? Mem.writeUint8(write.address, write.value) :
+                    write.size === 2 ? Mem.writeUint16(write.address, write.value) : Mem.writeUint32(write.address, write.value);
+                published = written && published;
+            }
+            if (published && currentPublication?.isCurrent()) currentPublication.didPublish?.();
+            return { value };
         };
 
         const queued = Array.isArray(port.queue) && port.queue.length > 0 ? port.queue.shift() : null;
@@ -1040,7 +1134,7 @@ const syncModule = (() => {
         // packet it waits for is posted by a thread that then never gets to run.
         // Only the WAITING branch is a promise: a packet already queued must stay a
         // plain sync return, or every dequeue pays the async park/resume round trip.
-        return waitForCompletionPacket(completionPortHandle, dwMilliseconds).then(deliver);
+        return waitForCompletionPacket(completionPortHandle, dwMilliseconds).then(wake => deliver(wake, true));
     };
 
     exports['SetEvent'] = (ctx, mem, args) => {
@@ -2053,6 +2147,8 @@ const syncModule = (() => {
         timerQueueHandles.clear();
         registeredWaits.clear();
         ioCompletionAssociations.clear();
+        for (const scope of socketCompletionScopes.values()) scope.unsubscribe();
+        socketCompletionScopes.clear();
         resetIoCompletionWaiters();
         nextTimerQueueHandle = 0x00060000;
         nextTimerQueueTimerHandle = 0x00070000;

@@ -13,6 +13,7 @@ import { LOGPEN_OFFSETS, LOGPEN_SIZE } from './gdi-objects';
 import { writeBackDibSectionRect } from './bitmap-resolve';
 import { patBlt } from './gdi-blit';
 import { extTextOut } from './ext-text-out';
+import { fontCellHeight, prefixWidths } from './text-extent-cache';
 import { Mem } from '../../core/memory/mem-accessor';
 import { isValidAddress } from '../../core/memory/address-guard';
 // Track GetPixel HDC usage for profiling
@@ -1995,13 +1996,8 @@ export function createPaintingExports(): Record<string, ThunkImplementation> {
         let cy = 16;
         if (dcCtx) {
             try {
-                for (let i = 0; i < text.length; i++) {
-                    cum[i] = Math.round(dcCtx.measureText(text.substring(0, i + 1)).width);
-                }
-                const fm = dcCtx.measureText(text || 'Wg');
-                if (fm.fontBoundingBoxAscent !== undefined) {
-                    cy = Math.ceil(fm.fontBoundingBoxAscent + fm.fontBoundingBoxDescent);
-                }
+                prefixWidths(dcCtx, text, cum);
+                cy = fontCellHeight(dcCtx) ?? cy;
             } catch (_) { /* fall through to 8px/char fallback below */ }
         }
         for (let i = 0; i < text.length; i++) {

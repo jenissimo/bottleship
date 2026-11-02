@@ -1,0 +1,370 @@
+{
+  "version": 1,
+  "status": "SOURCE ONLY, not compiled or measured; SAME-PE candidate after fresh native baseline",
+  "format": {
+    "magic": 1112755278,
+    "wordBytes": 4,
+    "byteOrder": "little-endian",
+    "header": [
+      "magic",
+      "totalWordsIncludingHeader",
+      "nonce"
+    ],
+    "record": [
+      "tag",
+      "payloadWords",
+      "payload..."
+    ],
+    "final": {
+      "tag": 65535,
+      "payload": [
+        1398030663
+      ]
+    }
+  },
+  "fixedCoverage": {
+    "versionMatrix": [
+      257,
+      514
+    ],
+    "socketKinds": 5,
+    "pointerModes": 25,
+    "matrixCases": 250,
+    "physicalFamilies": [
+      2,
+      23
+    ],
+    "booleanValues": [
+      0,
+      1,
+      256,
+      65536,
+      16777216,
+      257,
+      4294967295,
+      2
+    ],
+    "completionCases": 32,
+    "estimatedRecords": 560,
+    "estimatedObservations": 6368,
+    "estimateIsNotMeasured": true
+  },
+  "pointerModes": {
+    "0": "TRUE DWORD;len4",
+    "1": "FALSE DWORD;len4",
+    "2": "NULL input;len4",
+    "3": "NULL input;len0",
+    "4": "nonnull input;len0",
+    "5": "input len1",
+    "6": "input len3",
+    "7": "input len8",
+    "8": "READONLY input",
+    "9": "NOACCESS input",
+    "10": "input starts two bytes before NOACCESS boundary",
+    "11": "NULL lpBytesReturned",
+    "12": "lpBytesReturned address1",
+    "13": "READONLY lpBytesReturned",
+    "14": "NOACCESS lpBytesReturned",
+    "15": "lpBytesReturned crosses READONLY boundary",
+    "16": "NOACCESS output buffer;outlen4",
+    "17": "input address1",
+    "18": "NULL output buffer;outlen4",
+    "19": "input DWORD256",
+    "20": "input len0xffffffff",
+    "21": "input needed prefix readable;unused tail NOACCESS;len8",
+    "22": "NOACCESS input+lpBytesReturned1",
+    "23": "NOACCESS input+READONLY lpBytesReturned",
+    "24": "output address1;outlen0xffffffff"
+  },
+  "completionModes": {
+    "0": "NULL OV/no completion routine",
+    "1": "OV with manual-reset hEvent",
+    "2": "OV+completion routine",
+    "3": "completion routine but NULL OV",
+    "4": "OV+IOCP association",
+    "5": "OV+IOCP association+completion routine"
+  },
+  "tags": {
+    "0x0001": {
+      "fields": [
+        "return",
+        "lastError",
+        "returnedSentinelAfter"
+      ]
+    },
+    "0x0010": {
+      "fields": [
+        "requestedVersion",
+        "startupReturn",
+        "negotiatedVersion"
+      ]
+    },
+    "0x0011": {
+      "fields": [
+        "cleanupReturn"
+      ]
+    },
+    "0x1001": {
+      "fields": [
+        "requestedVersion",
+        "socketKind",
+        "pointerMode",
+        "inputLength",
+        "outputLength",
+        "return",
+        "lastError",
+        "returnedSentinelAfter",
+        "inputBaseDWORDAfter",
+        "outputBaseDWORDAfter"
+      ]
+    },
+    "0x2100": {
+      "fields": [
+        "WindowsAF"
+      ]
+    },
+    "duplicate": {
+      "tags": [
+        8449,
+        8450,
+        9730,
+        9731,
+        9734,
+        9735
+      ],
+      "fields": [
+        "returnNormalized",
+        "lastError",
+        "reservedOrImportedIdentityBoolean"
+      ]
+    },
+    "ioctlScalar": {
+      "tags": [
+        8480,
+        8496,
+        8512,
+        8705,
+        8707,
+        8708,
+        9216,
+        9473,
+        9729,
+        9739
+      ],
+      "fields": [
+        "return",
+        "lastError",
+        "returnedSentinelAfter"
+      ]
+    },
+    "sendReadiness": {
+      "tags": [
+        8464,
+        8481,
+        8497,
+        8513,
+        8706,
+        8961,
+        9218,
+        9736,
+        9740
+      ],
+      "fields": [
+        "sendReturn",
+        "sendLastError",
+        "selectReturn",
+        "selectLastError",
+        "readReady",
+        "exceptReady"
+      ]
+    },
+    "errorReceive": {
+      "tags": [
+        8465,
+        8482,
+        8498,
+        8514,
+        8709,
+        8962,
+        9219,
+        9737,
+        9741
+      ],
+      "fields": [
+        "recvReturn",
+        "recvLastError",
+        "payloadFirstByte"
+      ],
+      "note": "No name buffer; sockaddr-on-error copyback is a separate gap, not silently covered"
+    },
+    "livePeerControl": {
+      "tags": [
+        8466,
+        8483,
+        8499,
+        8515,
+        8710,
+        8963,
+        9220,
+        9738,
+        9742
+      ],
+      "fields": [
+        "sendReturn",
+        "sendLastError",
+        "selectReturn",
+        "selectLastError",
+        "readReady",
+        "exceptReady",
+        "recvReturn",
+        "recvLastError",
+        "payloadIsB"
+      ]
+    },
+    "0x2200": {
+      "fields": [
+        "WindowsAF",
+        "mode:0=queuedOnThenOff/1=offThenOn/2=queuedOnThenOffThenOn"
+      ]
+    },
+    "0x2300": {
+      "fields": [
+        "WindowsAF",
+        "BOOLEANInputDWORD",
+        "return",
+        "lastError",
+        "returnedSentinelAfter"
+      ]
+    },
+    "0x2401": {
+      "fields": [
+        "WindowsAF",
+        "mode:0=returnedNULL/1=inputNOACCESS/2=inputLength0",
+        "return",
+        "lastError",
+        "returnedSentinelAfter"
+      ]
+    },
+    "0x2500": {
+      "fields": [
+        "WindowsAF",
+        "socketCreationFlags",
+        "getsocknameReturn",
+        "lastError",
+        "nameLength",
+        "nameFamily",
+        "portIsZero"
+      ]
+    },
+    "0x2502": {
+      "fields": [
+        "getsocknameReturn",
+        "lastError",
+        "nameLength",
+        "nameFamily",
+        "portIsZero"
+      ]
+    },
+    "0x2600": {
+      "fields": [
+        "WindowsAF"
+      ]
+    },
+    "0x2604/0x2605": {
+      "fields": [
+        "cleanupOrStartupReturn",
+        "lastError"
+      ]
+    },
+    "0x3000": {
+      "fields": [
+        "socketKind",
+        "socketCreationFlags",
+        "completionMode",
+        "socketValid",
+        "eventValid",
+        "associationAttempted",
+        "associationSucceeded",
+        "associationLastError",
+        "eventInitiallySignaled",
+        "returnedMode"
+      ]
+    },
+    "0x3001": {
+      "fields": [
+        "socketKind",
+        "socketCreationFlags",
+        "completionMode",
+        "return",
+        "lastError",
+        "returnedAfter",
+        "immediateInternal",
+        "immediateHigh",
+        "offset",
+        "offsetHigh",
+        "eventWaitBefore",
+        "SleepExReturn",
+        "callbackCount",
+        "callbackError",
+        "callbackBytes",
+        "callbackFlags",
+        "callbackSameThread",
+        "orphanCallbackCount",
+        "eventWaitAfter",
+        "afterInternal",
+        "afterHigh",
+        "GQCSReturn",
+        "GQCSError",
+        "packetSameOV",
+        "packetNullOV",
+        "packetBytes",
+        "packetKey",
+        "finalInternal",
+        "finalHigh"
+      ],
+      "note": "No WSAGetOverlappedResult on invalid IOSB; no IOCP+APC switch side-effect inference"
+    },
+    "0x3002": {
+      "fields": [
+        "completionSlotIndex",
+        "finalCallbackCount",
+        "callbackError",
+        "callbackBytes",
+        "callbackFlags",
+        "callbackSameThread",
+        "finalInternal",
+        "finalHigh"
+      ]
+    },
+    "0xfffe": {
+      "fields": [
+        "unexpectedExceptionCode",
+        "exceptionAccess"
+      ],
+      "note": "Fatal checkpoint only; never recovered or accepted as a completed oracle"
+    }
+  },
+  "auditFile": {
+    "path": "udp-port-audit.bin",
+    "magic": 1112756308,
+    "header": [
+      "magic",
+      "totalWords",
+      "nonce"
+    ],
+    "record": [
+      "WindowsAF",
+      "actualBoundPort"
+    ],
+    "compared": false,
+    "purpose": "Exact native post-exit loopback exclusive-rebind audit only"
+  },
+  "cautions": [
+    "Prepared producer is unmeasured until native grant and first fresh capture.",
+    "Modern Windows11 x86 reference provenance is explicit; no historical Win9x assumption.",
+    "No dynamic ports, HANDLEs, TIDs, guest addresses or measured durations appear in compared records.",
+    "Unknown native outcomes remain raw RED; no expected-word forcing, threshold normalization or retries.",
+    "Invalid OV/routine pointers, RAW/IPX, cross-process alias toggling, WSARecvMsg and sockaddr-on-error output are excluded.",
+    "Exact loopback ICMP behavior depends on platform; capture the full first failure if peer/error prerequisites do not hold."
+  ]
+}

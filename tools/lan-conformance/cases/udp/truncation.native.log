@@ -1,0 +1,16 @@
+wsastartup 0x202 -> ret=0 err=0 ver=2.2 high=2.2
+socket AF_INET SOCK_DGRAM 0 -> ret=x err=0
+bind x 127.0.0.1:0 -> ret=0 err=0 addr=127.0.0.1:<x>.port
+ioctlsocket x FIONBIO u32:1 -> ret=0 err=0
+socket AF_INET SOCK_DGRAM 0 -> ret=y err=0
+bind y 127.0.0.1:0 -> ret=0 err=0 addr=127.0.0.1:<y>.port
+sendto y x.addr "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789" -> ret=100 err=0
+sleep 200 -> ret=0 err=0
+ioctlsocket x FIONREAD -> ret=0 err=0 out=100
+recvfrom x 10 peek -> ret=-1 err=WSAEMSGSIZE
+ioctlsocket x FIONREAD -> ret=0 err=0 out=100
+recvfrom x 10 -> ret=-1 err=WSAEMSGSIZE
+recvfrom x 64 -> ret=-1 err=WSAEWOULDBLOCK
+ioctlsocket x FIONREAD -> ret=0 err=0 out=0
+wsacleanup -> ret=0 err=0
+exit 0

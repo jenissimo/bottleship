@@ -534,6 +534,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("__pioinfo", 0),
         makeFunc("__badioinfo", 0),
         makeFunc("_tempnam", 2),
+        makeFunc("_mktemp", 1),
+        makeFunc("_getdiskfree", 2),
 
         // VC9 CRT (msvcr90) — exact decorated names from boot log
         makeFunc("_configthreadlocale", 1),
@@ -585,6 +587,8 @@ export const msvcrtModule: ModuleDescriptor = {
         makeFunc("strcspn", 2),
         makeFunc("strspn", 2),
         makeFunc("_gcvt", 4),   // double occupies two stack dwords + ndec + buf
+        makeFunc("_ecvt", 5),   // double (two dwords) + ndigit + int *dec + int *sign
+        makeFunc("_fcvt", 5),
         makeFunc("_ismbblead", 1),
         makeFunc("localtime", 1),
         makeFunc("ctime", 1),

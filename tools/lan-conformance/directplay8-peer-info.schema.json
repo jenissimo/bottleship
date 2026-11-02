@@ -1,0 +1,179 @@
+{
+  "fixture": "directplay8-peer-info",
+  "version": 1,
+  "scope": "Native Host and one Peer, connected SetPeerInfo; ordinary IPv4 loopback, maxPlayers=2.",
+  "words": {
+    "header": [
+      "magic BSLN/0x42534c4e",
+      "total DWORD count",
+      "nonce"
+    ],
+    "observation": "tag DWORD, value DWORD; all words, tags and ordering compare exactly",
+    "rawObservations": 988,
+    "hostRawObservations": 500,
+    "peerRawObservations": 488
+  },
+  "sizes": {
+    "DPN_PLAYER_INFO": 24,
+    "DPNMSG_PEER_INFO": 12,
+    "DPNMSG_ASYNC_OP_COMPLETE": 16
+  },
+  "limits": {
+    "rawWordsPerRole": 2048,
+    "callbackRowsPerRole": 128,
+    "callbackWords": 16,
+    "roleWaitMs": 8000,
+    "watchdogMs": 60000
+  },
+  "phases": [
+    {
+      "step": 2,
+      "role": "host",
+      "mask": 1,
+      "flags": "SYNC",
+      "effect": "name host-Ж; data unchanged"
+    },
+    {
+      "step": 3,
+      "role": "peer",
+      "mask": 2,
+      "flags": "ASYNC",
+      "effect": "data31 00 50 01; name unchanged"
+    },
+    {
+      "step": 4,
+      "role": "host",
+      "mask": 1,
+      "flags": "SYNC",
+      "effect": "NULL name; data unchanged"
+    },
+    {
+      "step": 5,
+      "role": "peer",
+      "mask": 2,
+      "flags": "SYNC",
+      "effect": "NULL/zero data; name unchanged"
+    },
+    {
+      "step": 6,
+      "role": "host",
+      "mask": 3,
+      "flags": "ASYNC",
+      "effect": "copy mutable host-Ж and 30 00 50 00, source poisoned after return"
+    },
+    {
+      "step": 7,
+      "role": "host",
+      "mask": 1,
+      "flags": "SYNC",
+      "effect": "non-NULL empty UTF16 name; data unchanged"
+    },
+    {
+      "step": 8,
+      "role": "peer",
+      "mask": 2,
+      "flags": "SYNC",
+      "effect": "non-NULL data pointer with size0 becomes NULL stored data"
+    }
+  ],
+  "tagRanges": {
+    "1": "role",
+    "2": "sizeof PEER_INFO",
+    "3": "sizeof ASYNC_COMPLETE",
+    "4": "sizeof PLAYER_INFO",
+    "40": "initial Host snapshot12",
+    "60": "initial Peer snapshot12",
+    "80": "DATA without mask returns INVALIDPARAM",
+    "81": "NAME without mask returns INVALIDSTRING",
+    "82": "SYNC plus handle pointer returns INVALIDPARAM",
+    "83": "output sentinel untouched",
+    "84": "unknown info mask returns INVALIDFLAGS",
+    "900": "Close HRESULT",
+    "901": "Host CREATE count",
+    "902": "Peer CREATE count",
+    "903": "Host DESTROY count",
+    "904": "Peer DESTROY count",
+    "905": "late callbacks",
+    "906": "trace dropped",
+    "999": "failure reason, must0",
+    "step*100+1..6": "initiator HRESULT,handle-present,completion-before-return,result,handle-match,context-match",
+    "step*100+20..31": "Host snapshot",
+    "step*100+40..51": "Peer snapshot",
+    "step*100+70": "changed peer INFO delta",
+    "step*100+71": "async completion count"
+  },
+  "query": [
+    "NULL buffer HRESULT",
+    "required size",
+    "GetPeerInfo HRESULT",
+    "output size",
+    "player flags",
+    "name pointer present",
+    "name classification",
+    "name hash UTF16 bytes (FNV1a)",
+    "data pointer present",
+    "data size",
+    "data classification",
+    "data byte hash (FNV1a)"
+  ],
+  "classification": {
+    "name": [
+      "initial",
+      "updated",
+      "NULL",
+      "empty",
+      "other"
+    ],
+    "data": [
+      "initial",
+      "updated",
+      "NULL/zero",
+      "nonNULL/zero",
+      "other"
+    ]
+  },
+  "callbacks": {
+    "magic": "BSIF/0x42534946",
+    "header": [
+      "magic",
+      "version1",
+      "nonce",
+      "role",
+      "row count",
+      "dropped"
+    ],
+    "row": [
+      "sequence",
+      "tick",
+      "thread ID",
+      "message",
+      "phase",
+      "struct size",
+      "raw player ID",
+      "normalized role",
+      "context",
+      "result",
+      "raw handle",
+      "query HRESULT",
+      "name classification",
+      "data classification",
+      "name hash",
+      "data hash"
+    ],
+    "normalization": "Raw callback rows are diagnostic; DWORD observations normalize role IDs and opaque handles."
+  },
+  "nativeEvidence": {
+    "original988": "logs/lan-conformance/stage29-host-peer-info/empty-runs/1792760288734/verified.json",
+    "reportSha256": "15e2de040cde6cc4da8f5fb6ad48820362331f7fba524a49d0875f368bc9ab28",
+    "peSha256": "37e9fdcef29b0d69ae05d02bbe6c0a6acbdc7b09ce10fe1744f83226296099c1",
+    "sourceSha256": "1ea01926588983162ddc31232f5a5db586949b53f7bdc63225be8964e1839c58",
+    "wire": "logs/lan-conformance/stage29-host-peer-info/wire-runs/1792759342852/verified.json"
+  },
+  "cleanup": "Both native processes exit0 without forced kill; role markers bounded; both UDP ports rebound after Close, before server shutdown for interop; input/source/PE/reference SHA guards immutable.",
+  "limitations": [
+    "Not Host groups, migration or security parity",
+    "Not arbitrary Host player count",
+    "Native DLL scheduling timings are observed values, not a scheduler generalization",
+    "No performance claim"
+  ]
+}

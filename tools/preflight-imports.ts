@@ -329,6 +329,7 @@ function* walk(dir: string): Generator<string> {
 // extracted whole); a directory scan sniffs the header instead and needs no list at all.
 const PE_EXTENSIONS = new Set([
     ".exe", ".dll", ".asi", ".ax", ".ocx", ".cpl", ".drv", ".acm", ".flt", ".mix", ".m3d", ".game",
+    ".x32", // Macromedia Director Xtras, LoadLibrary'd from Xtras/
 ]);
 
 function listWgbEntries(archive: string): string[] {
@@ -342,10 +343,13 @@ function listWgbEntries(archive: string): string[] {
         .filter(Boolean);
 }
 
-/** (name, bytes) for every PE in a .wgb, read through our own container tool. */
-function* peFilesFromWgb(archive: string, entries = listWgbEntries(archive)): Generator<[string, Uint8Array]> {
-    for (const entry of entries) {
-        if (!PE_EXTENSIONS.has(extname(entry).toLowerCase())) continue;
+/**
+ * (name, bytes) for every PE in a .wgb, read through our own container tool. `queue` is read
+ * live, so an entry appended while iterating (a shipped DLL found through an import) is scanned too.
+ */
+function* peFilesFromWgb(archive: string, queue: string[]): Generator<[string, Uint8Array]> {
+    for (let i = 0; i < queue.length; i++) {
+        const entry = queue[i]!;
         const cat = spawnSync("bun", [join(REPO, "tools", "wgb.ts"), "cat", archive, entry], {
             maxBuffer: 1 << 29,
         });
@@ -453,18 +457,22 @@ async function main(): Promise<void> {
 
     const isArchive = statSync(target).isFile();
     const resolvedTarget = resolve(target);
-    const archiveEntries = isArchive ? listWgbEntries(resolvedTarget) : undefined;
+    const bundleFiles = isArchive ? listWgbEntries(resolvedTarget) : [...walk(resolvedTarget)];
+    const wgbQueue = isArchive ? bundleFiles.filter(entry => PE_EXTENSIONS.has(extname(entry).toLowerCase())) : [];
     const source = isArchive
-        ? peFilesFromWgb(resolvedTarget, archiveEntries)
+        ? peFilesFromWgb(resolvedTarget, wgbQueue)
         : peFilesFromDir(resolvedTarget);
     // An imported DLL with no HLE descriptor is safe to skip only when the bundle
     // actually carries that guest DLL. Otherwise the runtime must synthesize stubs
     // for its imports, and still needs exact stdcall arities (e.g. oledlg in Painkiller).
-    const guestDlls = new Set((isArchive
-        ? archiveEntries!
-        : [...walk(resolvedTarget)])
-        .filter(file => extname(file).toLowerCase() === ".dll")
-        .map(file => basename(file, extname(file)).toLowerCase()));
+    // Keyed the way PELoader.findDllPath probes: an import keeps any extension it has
+    // (Reflexive's `raw_005.wdt`) and gains `.dll` only when it has none, so an
+    // extensionless file is never what an import binds.
+    const guestDlls = new Map<string, string>();
+    for (const file of bundleFiles) {
+        if (!extname(file)) continue;
+        guestDlls.set(basename(file).toLowerCase().replace(/\.dll$/, ""), file);
+    }
 
     for (const [name, bytes] of source) {
         if (!isPeImage(bytes)) continue;
@@ -480,7 +488,12 @@ async function main(): Promise<void> {
             const mod = resolveThunkedDllAlias(importedMod);
             if (onlyDll && importedMod !== onlyDll && mod !== onlyDll) continue;
             const hasDescriptor = tables.byDll.has(mod);
-            if (!hasDescriptor && guestDlls.has(importedMod)) continue;
+            const shipped = guestDlls.get(importedMod);
+            if (!hasDescriptor && shipped !== undefined) {
+                // The runtime loads it as real code whatever its extension, so its own imports count.
+                if (isArchive && !wgbQueue.includes(shipped)) wgbQueue.push(shipped);
+                continue;
+            }
             for (const entry of dll.entries) {
                 // The runtime exposes import-by-ordinal entries as `ord_N`; skipping
                 // them makes preflight claim a bundle is clean, then the real loader

@@ -1,13 +1,17 @@
 /**
- * WS2_32 (Winsock 2) stub module.
+ * WS2_32 (Winsock 2) module backed by the shared virtual LAN provider.
  * Ordinal layout follows ws2_32.dll (differs from wsock32 for several slots).
  */
 
 import { IModule } from "../core/module";
+import { ws2_32Module } from "../api/ws2_32.api";
 import { Process } from "../core/process";
+import { installWsaBlockingHooks } from "./wsa-blocking";
 import { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 import { System } from "../core/system";
+import { deliverPendingApcs } from "./kernel32/sync";
 import { Mem } from "../core/memory/mem-accessor";
+import { Marshaler } from "../core/memory/marshaler";
 import { hypercallDataManager } from "../core/cpu/hypercall-data";
 import { WAIT_BLOCKED_NO_SWITCH } from "../core/scheduler/types";
 import {
@@ -17,7 +21,8 @@ import {
     makeSocketExports,
     makeWsaStartup,
     makeWsaCleanup,
-    wsaStartupCount,
+    getWsaProcessState,
+    type WsaProcessState,
     inetAddr,
     createDnsStubs,
     createProtoServStubs,
@@ -30,7 +35,7 @@ import {
     WSAEWOULDBLOCK,
 } from "./wsa-stub-shared";
 
-const WSA_INVALID_EVENT = 0xffffffff;
+const WSA_INVALID_EVENT = 0;
 const WSANOTINITIALISED = 10093;
 const WSAEINVAL = 10022;
 const WSAEOPNOTSUPP = 10045;
@@ -40,13 +45,14 @@ const WSA_WAIT_FAILED = 0xffffffff;
 export class Ws2_32 implements IModule {
     name = "ws2_32";
     exports: Record<string, ThunkImplementation> = {};
-    private socketTable = new WsaSocketTable();
+    private socketTable!: WsaSocketTable;
+    private wsaState?: WsaProcessState;
     private resetAddrInfo: (() => void) | null = null;
 
     initialize(process: Process): void {
-        let wsaLastError = 0;
+        const state = this.wsaState = getWsaProcessState(process);
+        this.socketTable = state.table;
 
-        const ok = () => 0;
         const htons = (_ctx: unknown, _mem: unknown, args: number[]) => {
             const value = args[0] ?? 0;
             return ((value & 0xff) << 8) | ((value >>> 8) & 0xff);
@@ -60,35 +66,34 @@ export class Ws2_32 implements IModule {
                 ((value >>> 24) & 0xff)
             ) >>> 0;
         };
-        const getLastError = () => wsaLastError >>> 0;
+        const getLastError = () => state.getError() >>> 0;
         const setLastError = (_ctx: unknown, _mem: unknown, args: number[]) => {
-            wsaLastError = (args[0] ?? 0) | 0;
+            state.setError((args[0] ?? 0) | 0);
             return 0;
         };
-        const setError = (code: number) => {
-            wsaLastError = code | 0;
-        };
-        const startup = makeWsaStartup(setError, WSAEFAULT, SOCKET_ERROR);
-        const socketExports = makeSocketExports(this.socketTable, setError);
+        const setError = state.setError;
+        const startup = makeWsaStartup(setError, WSAEFAULT, SOCKET_ERROR, state.counter);
+        const socketExports = makeSocketExports(this.socketTable, setError, state.counter, process);
         const dns = createDnsStubs(process, setError);
         const protoServ = createProtoServStubs(process, setError);
         const addrInfo = createAddrInfoStubs(process, setError);
         this.resetAddrInfo = addrInfo.reset;
-        const asyncLookup = createAsyncLookupStubs(setError);
-        const selectImpl = makeSelect(this.socketTable, setError);
+        const asyncLookup = createAsyncLookupStubs(setError, process);
+        const selectImpl = makeSelect(this.socketTable, setError, state.counter);
         const fdIsSet = makeFdIsSet();
 
         const requireStarted = (): boolean => {
-            if (wsaStartupCount.started) return true;
+            if (state.counter.started) return true;
             setError(WSANOTINITIALISED);
             return false;
         };
 
         this.exports["WSAStartup"] = startup;
-        this.exports["WSACleanup"] = makeWsaCleanup(wsaStartupCount, setError);
+        this.exports["WSACleanup"] = makeWsaCleanup(state.counter, setError);
         this.exports["WSAGetLastError"] = getLastError;
         this.exports["WSASetLastError"] = setLastError;
-        Object.assign(this.exports, socketExports);
+        const publicSockets = new Set(ws2_32Module.functions.map(fn => fn.name));
+        Object.assign(this.exports, Object.fromEntries(Object.entries(socketExports).filter(([name]) => publicSockets.has(name))));
         this.exports["htons"] = htons;
         this.exports["htonl"] = htonl;
         this.exports["ntohs"] = htons;
@@ -107,29 +112,16 @@ export class Ws2_32 implements IModule {
         this.exports["getnameinfo"] = addrInfo.getnameinfo;
         this.exports["select"] = selectImpl;
         this.exports["__WSAFDIsSet"] = fdIsSet;
-        this.exports["WSAAsyncSelect"] = (_ctx, _mem, args) => {
-            const s = args[0] >>> 0;
-            if (!this.socketTable.isValid(s)) {
-                setError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-            this.socketTable.setNonBlocking(s, true);
-            setError(0);
-            return 0;
-        };
+        this.exports["WSAAsyncSelect"] = socketExports.WSAAsyncSelect!;
         this.exports["WSAAsyncGetHostByAddr"] = asyncLookup.WSAAsyncGetHostByAddr;
         this.exports["WSAAsyncGetHostByName"] = asyncLookup.WSAAsyncGetHostByName;
         this.exports["WSAAsyncGetProtoByNumber"] = asyncLookup.WSAAsyncGetProtoByNumber;
         this.exports["WSAAsyncGetProtoByName"] = asyncLookup.WSAAsyncGetProtoByName;
         this.exports["WSAAsyncGetServByPort"] = asyncLookup.WSAAsyncGetServByPort;
         this.exports["WSAAsyncGetServByName"] = asyncLookup.WSAAsyncGetServByName;
-        this.exports["WSACancelAsyncRequest"] = ok;
-        this.exports["WSASetBlockingHook"] = ok;
-        this.exports["WSAUnhookBlockingHook"] = ok;
-        this.exports["WSACancelBlockingCall"] = ok;
-        this.exports["WSAIsBlocking"] = ok;
-        // WSAAccept(s, addr, addrlen, lpfnCondition, dwCallbackData) — condition proc ignored in stub
-        this.exports["WSAAccept"] = socketExports.accept!;
+        this.exports["WSACancelAsyncRequest"] = asyncLookup.WSACancelAsyncRequest;
+        // Conditional accept runs the application callback on its owning guest thread.
+        this.exports["WSAAccept"] = socketExports.WSAAccept!;
         this.exports["WSAIoctl"] = socketExports.WSAIoctl!;
 
         // Ordinal exports — authoritative ws2_32.dll layout: the Berkeley socket functions
@@ -172,20 +164,17 @@ export class Ws2_32 implements IModule {
         this.exports["ord_105"] = asyncLookup.WSAAsyncGetProtoByName;
         this.exports["ord_106"] = asyncLookup.WSAAsyncGetServByPort;
         this.exports["ord_107"] = asyncLookup.WSAAsyncGetServByName;
-        this.exports["ord_108"] = ok;        // WSACancelAsyncRequest
-        this.exports["ord_109"] = ok;        // WSASetBlockingHook
-        this.exports["ord_110"] = ok;        // WSAUnhookBlockingHook
+        this.exports["ord_108"] = asyncLookup.WSACancelAsyncRequest;        // WSACancelAsyncRequest
         this.exports["ord_111"] = getLastError;
         this.exports["ord_112"] = setLastError;
-        this.exports["ord_113"] = ok;        // WSACancelBlockingCall
-        this.exports["ord_114"] = ok;        // WSAIsBlocking
         this.exports["ord_115"] = this.exports["WSAStartup"]!;
         this.exports["ord_116"] = this.exports["WSACleanup"]!;
         this.exports["ord_151"] = fdIsSet;    // __WSAFDIsSet, same slot as wsock32
 
         this.exports["WSACreateEvent"] = () => {
             if (!requireStarted()) return WSA_INVALID_EVENT;
-            return System.getInstance().scheduler.createEvent(true, false) >>> 0;
+            const handle = System.getInstance().scheduler.createEvent(true, false) >>> 0;
+            setError(0); return handle;
         };
 
         this.exports["WSACloseEvent"] = (_ctx, _mem, args) => {
@@ -234,7 +223,7 @@ export class Ws2_32 implements IModule {
             const handlesPtr = args[1] >>> 0;
             const waitAll = (args[2] >>> 0) !== 0;
             const timeout = args[3] >>> 0;
-            if (count === 0 || !handlesPtr || handlesPtr + count * 4 > mem.length) {
+            if (count === 0 || count > 64 || !handlesPtr || handlesPtr + count * 4 > mem.length) {
                 setError(WSAEINVAL);
                 return WSA_WAIT_FAILED;
             }
@@ -247,6 +236,7 @@ export class Ws2_32 implements IModule {
             const postReturnEsp = ctx.esp + 24;
 
             const sched = System.getInstance().scheduler;
+            if (args[4]) { const apcs = deliverPendingApcs(ctx, "WSAWaitForMultipleEvents:APC", 20); if (apcs) return apcs; }
             const result = sched.waitForObjectsWithContext(
                 handles,
                 waitAll,
@@ -254,6 +244,7 @@ export class Ws2_32 implements IModule {
                 returnAddr,
                 postReturnEsp,
                 { ecx: ctx.ecx, edx: ctx.edx, ebx: ctx.ebx, ebp: ctx.ebp, esi: ctx.esi, edi: ctx.edi, eflags: ctx.eflags },
+                !!args[4],
             );
             if (result === WAIT_BLOCKED_NO_SWITCH) {
                 return { value: 0, blockedNoSwitch: true, stackCleanup: 20 };
@@ -261,100 +252,14 @@ export class Ws2_32 implements IModule {
             return result >>> 0;
         };
 
-        this.exports["WSAEventSelect"] = (_ctx, _mem, args) => {
-            if (!requireStarted()) return SOCKET_ERROR;
-            const socket = args[0] | 0;
-            if (!this.socketTable.isValid(socket)) {
-                setError(WSAEINVAL);
-                return SOCKET_ERROR;
-            }
-            this.socketTable.setNonBlocking(socket, true);
-            return 0;
-        };
+        for (const name of ["WSAEventSelect", "WSAEnumNetworkEvents", "WSASend", "WSASendTo",
+            "WSARecv", "WSARecvFrom", "WSAGetOverlappedResult"]) this.exports[name] = socketExports[name]!;
+        installWsaBlockingHooks(this.exports, ws2_32Module, state, process);
 
-        this.exports["WSAEnumNetworkEvents"] = (_ctx, mem, args) => {
-            if (!requireStarted()) return SOCKET_ERROR;
-            const socket = args[0] | 0;
-            const lpNetworkEvents = args[2] >>> 0;
-            if (!this.socketTable.isValid(socket) || !lpNetworkEvents || lpNetworkEvents + 8 > mem.length) {
-                setError(WSAEINVAL);
-                return SOCKET_ERROR;
-            }
-            const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
-            view.setUint32(lpNetworkEvents, 0, true);
-            view.setUint32(lpNetworkEvents + 4, 0, true);
-            return 0;
-        };
-
-        // Winsock 2 scatter/gather over the same socket table as send/recv. The
-        // non-overlapped form is the whole contract we can honor; an OVERLAPPED request or
-        // completion routine is refused outright, because the alternative is a caller
-        // waiting forever on a completion nothing will ever post. Declared-but-unhandled
-        // is not an option here: that path returns 50, which is neither 0 nor SOCKET_ERROR.
-        const wsaBufTotal = (lpBuffers: number, count: number): number => {
-            let total = 0;
-            for (let i = 0; i < count; i++) total += (Mem.readUint32(lpBuffers + i * 8) ?? 0) >>> 0;
-            return total;
-        };
-        const wsaSend = (args: number[], overlappedIdx: number): number => {
-            if (!requireStarted()) return SOCKET_ERROR;
-            const s = args[0] | 0;
-            if (args[overlappedIdx] || args[overlappedIdx + 1]) {
-                setError(WSAEOPNOTSUPP);
-                return SOCKET_ERROR;
-            }
-            if (args[3]) Mem.writeUint32(args[3] >>> 0, 0);
-            if (!this.socketTable.isValid(s)) {
-                setError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-            if (!args[1] || !args[2]) {
-                setError(WSAEFAULT);
-                return SOCKET_ERROR;
-            }
-            const sent = this.socketTable.send(s, wsaBufTotal(args[1] >>> 0, args[2] >>> 0));
-            if (sent === SOCKET_ERROR) {
-                setError(WSAENOTCONN);
-                return SOCKET_ERROR;
-            }
-            if (args[3]) Mem.writeUint32(args[3] >>> 0, sent >>> 0);
-            setError(0);
-            return 0;
-        };
-        const wsaRecv = (args: number[], overlappedIdx: number): number => {
-            if (!requireStarted()) return SOCKET_ERROR;
-            const s = args[0] | 0;
-            if (args[overlappedIdx] || args[overlappedIdx + 1]) {
-                setError(WSAEOPNOTSUPP);
-                return SOCKET_ERROR;
-            }
-            if (args[3]) Mem.writeUint32(args[3] >>> 0, 0);
-            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);
-            if (!this.socketTable.isValid(s)) {
-                setError(WSAENOTSOCK);
-                return SOCKET_ERROR;
-            }
-            // The table never has data pending, so a recv is always "would block".
-            setError(this.socketTable.recv(s) === SOCKET_ERROR ? WSAEWOULDBLOCK : 0);
-            return SOCKET_ERROR;
-        };
-        this.exports["WSASend"] = (_ctx, _mem, args) => wsaSend(args, 5);
-        this.exports["WSASendTo"] = (_ctx, _mem, args) => wsaSend(args, 7);
-        this.exports["WSARecv"] = (_ctx, _mem, args) => wsaRecv(args, 5);
-        this.exports["WSARecvFrom"] = (_ctx, _mem, args) => wsaRecv(args, 7);
-        this.exports["WSAGetOverlappedResult"] = (_ctx, _mem, args) => {
-            if (args[2]) Mem.writeUint32(args[2] >>> 0, 0);
-            if (args[4]) Mem.writeUint32(args[4] >>> 0, 0);
-            setError(WSAEOPNOTSUPP);
-            return 0;   // FALSE — no overlapped request was ever accepted
-        };
-
-        this.exports["inet_pton"] = () => 0;
     }
 
     reset(): void {
-        this.socketTable.reset();
+        this.wsaState?.reset();
         this.resetAddrInfo?.();
-        wsaStartupCount.reset();
     }
 }

@@ -54,7 +54,7 @@ const WM_GETTEXT_MSG = 0x000D;
 const WM_GETTEXTLENGTH_MSG = 0x000E;
 const USER_TIMER_MINIMUM = 10;
 
-type TimerMessage = { hwnd: number; message: number; wParam: number; lParam: number };
+type TimerMessage = { hwnd: number; message: number; wParam: number; lParam: number; generatedTimer?: boolean; timerEpoch?: number };
 let noteFastPathTimerDelivery: ((msg: TimerMessage, removed: boolean) => void) | null = null;
 
 /**
@@ -267,6 +267,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
     interface TimerState {
         wheelTimerId: number;
+        epoch: number;
         hWnd: number;
         timerId: number;
         timerFunc: number;
@@ -320,6 +321,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
     const timers: Map<string, TimerState> = new Map();
     const timerKey = (hWnd: number, id: number) => `${hWnd >>> 0}:${id >>> 0}`;
     let nextTimerId = 1;
+    let nextTimerEpoch = 1;
 
     function cancelTimerState(state: TimerState): void {
         System.getInstance().scheduler?.timerWheel.cancel(state.wheelTimerId);
@@ -347,10 +349,10 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         );
     }
 
-    function restartRemovedTimer(msg: { hwnd: number; message: number; wParam: number; lParam: number }): void {
-        if (msg.message !== WM_TIMER) return;
+    function restartRemovedTimer(msg: TimerMessage): void {
+        if (msg.message !== WM_TIMER || !msg.generatedTimer) return;
         const state = timers.get(timerKey(msg.hwnd, msg.wParam));
-        if (!state || state.timerFunc !== (msg.lParam >>> 0)) return;
+        if (!state || state.epoch !== msg.timerEpoch || state.timerFunc !== (msg.lParam >>> 0)) return;
         armTimerState(state);
     }
 
@@ -427,7 +429,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         }
 
         for (let i = 0; i < toPost; i++) {
-            system.windowManager.postMessage(state.hWnd, WM_TIMER, state.timerId, state.timerFunc);
+            system.windowManager.postMessage(state.hWnd, WM_TIMER, state.timerId, state.timerFunc, 0, 0, 0, undefined, 0, true, state.epoch);
             timerDiag.posted++;
         }
         if (toPost > 0) {
@@ -1592,6 +1594,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
         const timerState: TimerState = {
             wheelTimerId: 0,
+            epoch: nextTimerEpoch++,
             hWnd,
             timerId,
             timerFunc: lpTimerFunc >>> 0,
@@ -1603,7 +1606,10 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         // old wheel entry first so we don't leak an orphaned one.
         const key = timerKey(hWnd, timerId);
         const existing = timers.get(key);
-        if (existing) cancelTimerState(existing);
+        if (existing) {
+            cancelTimerState(existing);
+            System.getInstance().windowManager.cancelPendingTimer(hWnd, timerId);
+        }
 
         timers.set(key, timerState);
         armTimerState(timerState);
@@ -1618,6 +1624,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const timerState = timers.get(key);
         if (timerState) {
             cancelTimerState(timerState);
+            System.getInstance().windowManager.cancelPendingTimer(hWnd, uIDEvent);
             if (timerState.pendingTicks > 0) {
                 timerDiag.pendingDropped += timerState.pendingTicks;
                 timerState.pendingTicks = 0;
@@ -1800,7 +1807,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const lParam = args[3];
         Logger.log(LogCategory.USER32, `PostMessageW(hwnd=0x${hWnd.toString(16)}, msg=0x${msg.toString(16)}, wParam=0x${wParam.toString(16)}, lParam=0x${lParam.toString(16)})`);
         const system = System.getInstance();
-        system.windowManager.postMessage(hWnd, msg, wParam, lParam);
+        system.windowManager.postMessage(hWnd, msg, wParam, lParam, 0, 0, 0, undefined, 0, false);
         // Wake any threads blocked in GetMessage/WaitMessage
         system.scheduler.wakeMessageWaiters();
         return 1; // TRUE
@@ -1815,7 +1822,7 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
         const system = System.getInstance();
         Logger.verbose(LogCategory.USER32, `PostThreadMessageA(tid=${threadId}, msg=0x${msg.toString(16)}, wParam=0x${wParam.toString(16)}, lParam=0x${lParam.toString(16)})`);
         // Tag message with target thread ID so only that thread's GetMessage dequeues it
-        system.windowManager.postMessage(0, msg, wParam, lParam, 0, 0, threadId);
+        system.windowManager.postMessage(0, msg, wParam, lParam, 0, 0, threadId, undefined, 0, false);
         if (threadId !== 0) {
             system.scheduler.wakeMessageWaiters(threadId);
         } else {

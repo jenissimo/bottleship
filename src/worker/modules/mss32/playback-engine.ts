@@ -17,6 +17,8 @@ import {
     CTRL_PLAY_CURSOR,
     CTRL_STATE,
     CTRL_LOOP_MODE,
+    CTRL_LOOP_START_FRAME,
+    CTRL_LOOP_END_FRAME,
     CTRL_VOLUME,
     CTRL_PAN,
     CTRL_FREQUENCY,
@@ -330,6 +332,19 @@ function volumeToCentibels(vol127: number): number {
     return Math.max(-10000, Math.round(2000 * Math.log10(linear)));
 }
 
+/** Publish the sample's loop block in frames of the ring's data (0/0 = whole sample). */
+function writeLoopBlock(sab: SharedArrayBuffer, sample: MSSSample): void {
+    const guestAlign = Math.max(1, sample.blockAlign
+        || Math.max(1, sample.channels) * Math.max(1, sample.bitsPerSample >> 3));
+    const start = sample.loopStartBytes ?? 0;
+    const end = sample.loopEndBytes ?? -1;
+    const startFrame = Math.floor(start / guestAlign);
+    const endFrame = end > 0 ? Math.floor(end / guestAlign) : 0;
+    const valid = endFrame === 0 || endFrame > startFrame;
+    setCtrl(sab, CTRL_LOOP_START_FRAME, valid ? startFrame : 0);
+    setCtrl(sab, CTRL_LOOP_END_FRAME, valid ? endFrame : 0);
+}
+
 /** Convert loopCount to ring buffer loop mode: -1=forever, 1+=play N times */
 function loopCountToMode(loopCount: number | undefined): number {
     if (loopCount === 0 || loopCount === -1) return -1; // loop forever
@@ -444,6 +459,7 @@ export function playSample(ctx: MSSContext, sample: MSSSample): void {
     const freqHz = sample.playbackRateHz || Math.round(sample.sampleRate * sample.playbackRate);
     setCtrl(sab, CTRL_FREQUENCY, freqHz);
     setCtrl(sab, CTRL_LOOP_MODE, loopCountToMode(sample.loopCount));
+    writeLoopBlock(sab, sample);
     setCtrl(sab, CTRL_RESERVED, 1); // signal worklet to reset position & loopsCompleted
     if (sample.is3D) applySample3D(sample); // write CTRL_3D_* before the worklet starts mixing
     setCtrl(sab, CTRL_STATE, STATE_PLAYING);
@@ -471,6 +487,7 @@ export function updateSamplePlayback(ctx: MSSContext, sample: MSSSample): void {
             : Math.round(sample.sampleRate * sample.playbackRate);
         setCtrl(entry.sab, CTRL_FREQUENCY, freqHz);
         setCtrl(entry.sab, CTRL_LOOP_MODE, loopCountToMode(sample.loopCount));
+        writeLoopBlock(entry.sab, sample);
         return;
     }
 
@@ -543,7 +560,7 @@ export function stopRingBuffer(id: number): boolean {
  * CTRL_PLAY_CURSOR on the next block once CTRL_RESET_POSITION is raised.
  * Returns false when the voice has no ring buffer (host-decoded formats).
  */
-export function seekRingBuffer(sample: MSSSample, positionBytes: number): boolean {
+export function seekRingBuffer(sample: MSSSample | MSSStream, positionBytes: number): boolean {
     const entry = ringBuffers.get(sample.id);
     if (!entry) return false;
     const guestAlign = Math.max(1, sample.blockAlign
@@ -649,6 +666,14 @@ function tryKickPendingSampleStart(ctx: MSSContext, sample: MSSSample): void {
 // ==================== Stream Playback ====================
 
 export function playStream(ctx: MSSContext, stream: MSSStream): void {
+    // Playback begins where the stream is positioned: an app that seeks a stream it has
+    // not started yet (AIL_set_stream_ms_position, then AIL_pause_stream(S,0)) is
+    // resuming it there — a radio station picked up mid-song.
+    const totalBytes = getPlaybackLengthBytes(stream);
+    const startBytes = stream.position > 0 && stream.position < totalBytes ? stream.position : 0;
+    const bytesPerSec = getBytesPerSecond(stream);
+    const startMs = bytesPerSec > 0 ? startBytes * 1000 / bytesPerSec : 0;
+    const elapsedMs = startMs / (stream.playbackRate || 1);
     if (!stream.decodedData || stream.decodedData.length === 0) {
         if (stream.fileData && isEncodedFormat(stream.fileFormat)) {
             const volume = mixedVolume127(ctx, stream.volume) / 127.0;
@@ -672,16 +697,17 @@ export function playStream(ctx: MSSContext, stream: MSSStream): void {
                     positionRateHz: stream.sampleRate,
                     volume: volume,
                     pan: pan,
-                    loopCount: stream.loopCount
+                    loopCount: stream.loopCount,
+                    startOffsetMs: startMs,
+                    // A Miles loop replays the whole stream, not the resume point.
+                    loopRestartMs: 0,
                 }
             } as any, [payloadData.buffer] as any);
 
             stream.isPlaying = true;
             stream.isPaused = false;
-            stream.position = 1024;
-            if (!stream.startTime) {
-                stream.startTime = performance.now();
-            }
+            stream.position = startBytes || 1024;
+            stream.startTime = performance.now() - elapsedMs;
             stream.pendingStart = false;
             writeStreamPosition(ctx, stream, stream.position);
             setStreamStatus(ctx, stream, SMP_PLAYING);
@@ -714,15 +740,15 @@ export function playStream(ctx: MSSContext, stream: MSSStream): void {
     const freqHz = stream.playbackRateHz || Math.round(stream.sampleRate * stream.playbackRate);
     setCtrl(sab, CTRL_FREQUENCY, freqHz);
     setCtrl(sab, CTRL_LOOP_MODE, loopCountToMode(stream.loopCount));
+    const guestAlign = Math.max(1, stream.blockAlign || stream.channels * 2);
+    setCtrl(sab, CTRL_PLAY_CURSOR, Math.floor(startBytes / guestAlign) * Math.max(1, getCtrl(sab, CTRL_BLOCK_ALIGN)));
     setCtrl(sab, CTRL_RESERVED, 1); // signal worklet to reset position & loopsCompleted
     setCtrl(sab, CTRL_STATE, STATE_PLAYING);
 
     stream.isPlaying = true;
     stream.isPaused = false;
-    stream.position = 1024;
-    if (!stream.startTime) {
-        stream.startTime = performance.now();
-    }
+    stream.position = startBytes || 1024;
+    stream.startTime = performance.now() - elapsedMs;
     stream.pendingStart = false;
     writeStreamPosition(ctx, stream, stream.position);
     setStreamStatus(ctx, stream, SMP_PLAYING);

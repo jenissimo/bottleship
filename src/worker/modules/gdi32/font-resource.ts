@@ -6,6 +6,7 @@
  * FontFace registered here.
  */
 import { Logger, LogCategory } from "../../core/logger";
+import { invalidateTextExtentCache } from "./text-extent-cache";
 
 const SFNT_TTCF = 0x74746366; // 'ttcf'
 const SFNT_V1 = 0x00010000;
@@ -123,6 +124,7 @@ export function resetFontResources(): void {
     for (const entry of installedFonts.values()) {
         for (const face of entry.faces) (self as unknown as { fonts: FontFaceSet }).fonts.delete(face);
     }
+    invalidateTextExtentCache();
     installedFonts.clear();
     pendingFonts.clear();
 }
@@ -149,6 +151,7 @@ export async function addFontResource(resolvedPath: string, data: Uint8Array, fl
         if (!entry) {
             entry = loaded;
             for (const face of entry.faces) (self as unknown as { fonts: FontFaceSet }).fonts.add(face);
+            invalidateTextExtentCache();
             installedFonts.set(key, entry);
         }
     }
@@ -236,6 +239,7 @@ export function removeFontResource(resolvedPath: string, flags = 0): boolean {
     else entry.references.delete(flags);
     if (entry.references.size > 0) return true;
     for (const face of entry.faces) (self as unknown as { fonts: FontFaceSet }).fonts.delete(face);
+    invalidateTextExtentCache();
     installedFonts.delete(key);
     return true;
 }

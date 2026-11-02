@@ -1,14 +1,16 @@
 /**
  * CRT conversion functions (atoi/atol/atof, strtol/strtoul/strtod, _ltoa/_ultoa/
- * _itoa, toupper/tolower, abs/labs, mbstowcs/wcstombs/wctomb, _wtoi/wcstoul).
+ * _itoa, toupper/tolower, abs/labs, mbstowcs/wcstombs/wctomb, _wtoi/wcstoul, _ecvt/_fcvt).
  *
  * Host supplies codepage-aware string readers/writers, FPU push for
  * double-returning functions (atof/strtod), and locale-aware case-fold LUT
  * addresses (toupper/tolower index the same guest tables the trap-free inline
- * stubs use — see Msvcrt.buildCaseTables). No state lives here.
+ * stubs use — see Msvcrt.buildCaseTables). The only state is _ecvt/_fcvt's
+ * per-thread _cvtbuf, forgotten with the process via resetCrtConvStatics.
  */
 
 import { Mem } from "../core/memory/mem-accessor";
+import { System } from "../core/system";
 import { fpuPush } from "../core/fpu-helper";
 import { Logger, LogCategory } from "../core/logger";
 import { encodeAnsi } from "./crt-format";
@@ -253,4 +255,86 @@ export function registerCrtConvExports(exports: Record<string, ThunkImplementati
     exports["mbstowcs"] = (ctx, mem, args) => mbstowcs(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
     exports["wcstombs"] = (ctx, mem, args) => wcstombs(args[0] ?? 0, args[1] ?? 0, args[2] ?? 0);
     exports["wctomb"] = (ctx, mem, args) => wctomb(args[0] ?? 0, args[1] ?? 0);
+
+    /** _ecvt/_fcvt: write the digits into the calling thread's _cvtbuf; *dec and *sign as the CRT reports them. */
+    function cvt(lo: number, hi: number, ndigit: number, fixed: boolean, decPtr: number, signPtr: number): number {
+        const flt = fltout(lo >>> 0, hi >>> 0);
+        const digits = fixed ? flt.decpt + ndigit : ndigit;
+        const rounded = fptostr(flt, Math.min(digits, CVTBUFSIZE - 2));
+        const { decpt } = rounded;
+        // _ecvt drops the extra character a carry adds ("99" -> "100" -> "10"); _fcvt's count already grew with decpt.
+        const text = !fixed && digits > 0 ? rounded.text.slice(0, digits) : rounded.text;
+        if (decPtr) Mem.writeUint32(decPtr, decpt);
+        if (signPtr) Mem.writeUint32(signPtr, flt.negative ? 1 : 0);
+        const tid = System.getInstance().scheduler.getCurrentThreadId();
+        let buf = cvtBuffers.get(tid);
+        if (!buf) {
+            buf = host.process.memory.alloc(CVTBUFSIZE, "THUNK_DATA", "rw");
+            cvtBuffers.set(tid, buf);
+        }
+        host.writeCString(buf, text);
+        return buf >>> 0;
+    }
+
+    // The double occupies args[0..1]; then ndigit, int *dec, int *sign.
+    exports["_ecvt"] = (ctx, mem, args) => cvt(args[0] ?? 0, args[1] ?? 0, (args[2] ?? 0) | 0, false, args[3] ?? 0, args[4] ?? 0);
+    exports["_fcvt"] = (ctx, mem, args) => cvt(args[0] ?? 0, args[1] ?? 0, (args[2] ?? 0) | 0, true, args[3] ?? 0, args[4] ?? 0);
+}
+
+/** _CVTBUFSIZE (309 + 40): the per-thread buffer _ecvt and _fcvt share. */
+const CVTBUFSIZE = 349;
+
+/** Per-thread _cvtbuf addresses. Guest memory that Process.reset() rewinds — see resetCrtConvStatics. */
+const cvtBuffers = new Map<number, number>();
+
+export function resetCrtConvStatics(): void {
+    cvtBuffers.clear();
+}
+
+export interface Fltout {
+    /** Significant digits, trailing zeros stripped ("" for zero), or the "1#INF"-style special. */
+    mantissa: string;
+    /** value = 0.mantissa × 10^decpt. */
+    decpt: number;
+    negative: boolean;
+}
+
+/** The CRT's _fltout2: at most 17 significant digits, the precision every msvcrt float conversion starts from. */
+export function fltout(lo: number, hi: number): Fltout {
+    const negative = (hi >>> 31) === 1;
+    const exponent = (hi >>> 20) & 0x7ff;
+    const fractionHi = hi & 0xfffff;
+    if (exponent === 0x7ff) {
+        let mantissa: string;
+        if (fractionHi === 0 && lo === 0) mantissa = "1#INF";
+        else if (negative && fractionHi === 0x80000 && lo === 0) mantissa = "1#IND";
+        else mantissa = (fractionHi & 0x80000) ? "1#QNAN" : "1#SNAN";
+        return { mantissa, decpt: 1, negative };
+    }
+    const bits = new Uint32Array([lo, hi]);
+    const abs = Math.abs(new Float64Array(bits.buffer)[0] ?? 0);
+    if (abs === 0) return { mantissa: "", decpt: 0, negative };
+    const es = abs.toExponential(16);
+    const eIdx = es.indexOf("e");
+    const mantissa = (es.slice(0, 1) + es.slice(2, eIdx)).replace(/0+$/, "");
+    return { mantissa, decpt: parseInt(es.slice(eIdx + 1), 10) + 1, negative };
+}
+
+/**
+ * The CRT's _fptostr: take `digits` mantissa characters (zero-padded), rounding half-up on
+ * the next one. A negative count yields "" with no rounding; a carry out of the first digit
+ * keeps a leading '1' and moves the decimal point. It rounds raw characters, specials
+ * included, which is where VC's "1.$" for a one-digit infinity comes from.
+ */
+export function fptostr(flt: Fltout, digits: number): { text: string; decpt: number } {
+    const n = Math.max(0, digits);
+    const out: number[] = [48];
+    for (let i = 0; i < n; i++) out.push(i < flt.mantissa.length ? flt.mantissa.charCodeAt(i) : 48);
+    if (digits >= 0 && (flt.mantissa.charCodeAt(n) || 0) >= 53) {
+        let i = out.length - 1;
+        while (out[i] === 57) out[i--] = 48;
+        out[i] = (out[i] ?? 48) + 1;
+    }
+    if (out[0] === 49) return { text: String.fromCharCode(...out), decpt: flt.decpt + 1 };
+    return { text: String.fromCharCode(...out.slice(1)), decpt: flt.decpt };
 }

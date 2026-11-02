@@ -148,6 +148,24 @@ function getVolumeBytes(): { total: number; free: number } {
     return { total: volumeTotalBytes, free: volumeFreeBytes };
 }
 
+export interface LegacyDiskGeometry {
+    sectorsPerCluster: number;
+    bytesPerSector: number;
+    freeClusters: number;
+    totalClusters: number;
+}
+
+/** The cluster-count view of the volume (2GB-clamped), shared by GetDiskFreeSpace and the CRT's _getdiskfree. */
+export function legacyDiskGeometry(): LegacyDiskGeometry {
+    const { total, free } = getVolumeBytes();
+    return {
+        sectorsPerCluster: SECTORS_PER_CLUSTER,
+        bytesPerSector: BYTES_PER_SECTOR,
+        freeClusters: Math.floor(Math.min(free, total, LEGACY_MAX_BYTES) / BYTES_PER_CLUSTER),
+        totalClusters: Math.floor(Math.min(total, LEGACY_MAX_BYTES) / BYTES_PER_CLUSTER),
+    };
+}
+
 const writeU64 = (view: DataView, addr: number, value: number): void => {
     if (!addr) return;
     view.setUint32(addr, value >>> 0, true);
@@ -334,12 +352,10 @@ export function registerFileIoVolumeExports(exports: Record<string, ThunkImpleme
 
         const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
 
-        const { total, free } = getVolumeBytes();
-        const totalClusters = Math.floor(Math.min(total, LEGACY_MAX_BYTES) / BYTES_PER_CLUSTER);
-        const freeClusters = Math.floor(Math.min(free, total, LEGACY_MAX_BYTES) / BYTES_PER_CLUSTER);
+        const { sectorsPerCluster, bytesPerSector, freeClusters, totalClusters } = legacyDiskGeometry();
 
-        if (lpSectorsPerCluster) view.setUint32(lpSectorsPerCluster, SECTORS_PER_CLUSTER, true);
-        if (lpBytesPerSector) view.setUint32(lpBytesPerSector, BYTES_PER_SECTOR, true);
+        if (lpSectorsPerCluster) view.setUint32(lpSectorsPerCluster, sectorsPerCluster, true);
+        if (lpBytesPerSector) view.setUint32(lpBytesPerSector, bytesPerSector, true);
         if (lpNumberOfFreeClusters) view.setUint32(lpNumberOfFreeClusters, freeClusters, true);
         if (lpTotalNumberOfClusters) view.setUint32(lpTotalNumberOfClusters, totalClusters, true);
 

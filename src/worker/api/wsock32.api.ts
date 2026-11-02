@@ -81,6 +81,10 @@ const WSOCK_ORDINALS: Array<{ name: string; ordinal: number; argCount: number }>
 export const wsock32Module: ModuleDescriptor = {
     name: "wsock32",
     functions: [
+        makeFunc("WSARecvEx", 4, { ordinal: 1107 }),
+        makeFunc("TransmitFile", 7, { ordinal: 1140 }),
+        makeFunc("AcceptEx", 8, { ordinal: 1141 }),
+        makeFunc("GetAcceptExSockaddrs", 8, { ordinal: 1142 }),
         makeFunc("WSAStartup", 2),
         makeFunc("WSACleanup", 0),
         makeFunc("socket", 3, { onUnimplemented: "invalidHandle" }),

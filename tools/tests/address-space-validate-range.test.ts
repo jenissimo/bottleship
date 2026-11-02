@@ -4,7 +4,7 @@
  * validateRange is the mandated check on every guest-supplied pointer, so it is on
  * every HLE hot path; it answers from a stabbing index rather than a linear sweep of
  * `regions` (a loaded level registers ~1900 of them). The index is only sound if it
- * returns the SAME narrowest containing region as the sweep it replaced, including
+ * checks the SAME effective per-segment permissions as an independent full sweep, including
  * for the deliberately-overlapping layout buckets — so the sweep is kept here as the
  * oracle and both are run over a randomised region map.
  *
@@ -18,24 +18,35 @@ import { AddressSpace, type RegionEntry, type RegionPerms } from "../../src/work
 const MEM = new Uint8Array(0);
 const mk = () => new AddressSpace(() => MEM);
 
-/** The pre-index implementation, verbatim, as the oracle. */
+/** Full-sweep point lookup, independent of the indexed intersection implementation. */
 function sweepNarrowest(regions: RegionEntry[], address: number, size: number): RegionEntry | undefined {
     const end = address + size;
     let best: RegionEntry | undefined;
     for (const region of regions) {
         if (address < region.base || end > region.base + region.size) continue;
-        if (!best || region.size < best.size) best = region;
+        if (!best || region.size < best.size ||
+            (region.size === best.size && best.owner === "Layout" && region.owner !== "Layout")) best = region;
     }
     return best;
 }
 
 function sweepValidate(regions: RegionEntry[], address: number, size: number, perms: string): boolean {
     if (address < 0 || size < 0) return false;
-    const best = sweepNarrowest(regions, address, size);
-    if (!best) return false;
-    if (best.perms === "noaccess") return false;
-    if (perms.includes("w") && !best.perms.includes("w")) return false;
-    if (perms.includes("x") && !best.perms.includes("x")) return false;
+    const end = address + size;
+    const points = new Set<number>([address]);
+    // Every region edge is a possible change in effective permissions. A full
+    // linear sweep at each point deliberately shares no index/query machinery.
+    for (const region of regions) {
+        for (const edge of [region.base, region.base + region.size]) {
+            if (edge > address && edge < end) points.add(edge);
+        }
+    }
+    for (const point of points) {
+        const best = sweepNarrowest(regions, point, size === 0 ? 0 : 1);
+        if (!best || best.perms === "noaccess") return false;
+        if (perms.includes("w") && !best.perms.includes("w")) return false;
+        if (perms.includes("x") && !best.perms.includes("x")) return false;
+    }
     return true;
 }
 

@@ -1,0 +1,24 @@
+cominit -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Peer IID_IDirectPlay8Peer -> ret=p hr=S_OK
+initialize p -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Address IID_IDirectPlay8Address -> ret=y hr=S_OK
+setsp y CLSID_DP8SP_TCPIP -> ret=0 hr=S_OK
+addport y 23913 -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Address IID_IDirectPlay8Address -> ret=d hr=S_OK
+setsp d CLSID_DP8SP_TCPIP -> ret=0 hr=S_OK
+addport d 23914 -> ret=0 hr=S_OK
+setdevice d adapter -> ret=0 hr=S_OK
+waitaddr host enter
+waitaddr host -> ret=hostaddr err=0
+addhostfromaddr y hostaddr -> ret=0 hr=S_OK
+connect p y -> ret=0 hr=S_OK
+cb connect-complete hr=S_OK
+cbwait connect-complete 1 -> ret=1
+sendpeer p all "ping" -> ret=0 hr=S_OK
+gate got-ping enter
+gate got-ping -> ret=0
+require_success -> ret=0
+close p -> ret=0 hr=S_OK
+release p -> ret=0 hr=S_OK
+comfree -> ret=0
+exit 0

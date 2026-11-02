@@ -1,7 +1,7 @@
 /**
  * CRT path/directory functions (_getcwd, _fullpath, _makepath, _splitpath,
- * _chdir, _mkdir, _access, _tempnam, remove/_unlink/rename, and the EACCES
- * stubs _chmod/_rmdir).
+ * _chdir, _mkdir, _access, _tempnam, _mktemp, _getdiskfree, remove/_unlink/rename,
+ * and the EACCES stubs _chmod/_rmdir).
  *
  * Host supplies codepage-aware string readers/writers, CRT malloc
  * (getcwd(NULL)/_tempnam return heap blocks the guest free()s), errno, and the
@@ -13,7 +13,9 @@
  */
 
 import { System } from "../core/system";
+import { Mem } from "../core/memory/mem-accessor";
 import { Logger, LogCategory } from "../core/logger";
+import { legacyDiskGeometry } from "./kernel32/file-io-volume";
 import type { ThunkImplementation } from "../core/thunking/thunk-dispatcher";
 
 export interface CrtPathHost {
@@ -380,6 +382,54 @@ export function registerCrtPathExports(exports: Record<string, ThunkImplementati
     exports["rename"] = (ctx, mem, args) => renameImpl(args[0] ?? 0, args[1] ?? 0);
 
     exports["_tempnam"] = (ctx, mem, args) => tempnam(args[0] ?? 0, args[1] ?? 0);
+
+    /**
+     * _mktemp(template): the trailing "XXXXXX" becomes a letter plus the low five decimal
+     * digits of the thread id, in place; the letter walks 'a'..'z' past names that exist.
+     * NULL when there are fewer than six trailing X's or all 26 names are taken.
+     */
+    function mktemp(templatePtr: number): number {
+        if (!templatePtr) {
+            host.setErrno(22); // EINVAL
+            return 0;
+        }
+        const chars = host.readCString(templatePtr, 512).split("");
+        let number = System.getInstance().scheduler.getCurrentThreadId() >>> 0;
+        let i = chars.length - 1;
+        for (let xcount = 0; xcount < 5; xcount++, i--) {
+            if (i < 0 || chars[i] !== "X") return 0;
+            chars[i] = String.fromCharCode(48 + (number % 10));
+            number = Math.floor(number / 10);
+        }
+        if (i < 0 || chars[i] !== "X") return 0;
+        const vfs = System.getInstance().fileSystem;
+        for (let letter = 97; letter <= 122; letter++) {
+            chars[i] = String.fromCharCode(letter);
+            const candidate = chars.join("");
+            const resolved = vfs.resolvePath(candidate);
+            if (vfs.fileExists(resolved) || vfs.directoryExists(resolved)) continue;
+            host.writeCString(templatePtr, candidate);
+            return templatePtr >>> 0;
+        }
+        return 0;
+    }
+
+    /** _getdiskfree(drive, struct _diskfree_t*): drive 0 is the current one, 1 is A:. Returns 0 or a Win32 error. */
+    function getdiskfree(drive: number, diskfreePtr: number): number {
+        if (drive > 26 || !diskfreePtr) {
+            host.setErrno(22); // EINVAL
+            return 87; // ERROR_INVALID_PARAMETER
+        }
+        const g = legacyDiskGeometry();
+        Mem.writeUint32(diskfreePtr + 0, g.totalClusters);
+        Mem.writeUint32(diskfreePtr + 4, g.freeClusters);
+        Mem.writeUint32(diskfreePtr + 8, g.sectorsPerCluster);
+        Mem.writeUint32(diskfreePtr + 12, g.bytesPerSector);
+        return 0;
+    }
+
+    exports["_mktemp"] = (ctx, mem, args) => mktemp(args[0] ?? 0);
+    exports["_getdiskfree"] = (ctx, mem, args) => getdiskfree((args[0] ?? 0) >>> 0, args[1] ?? 0);
 
     return { getcwd };
 }

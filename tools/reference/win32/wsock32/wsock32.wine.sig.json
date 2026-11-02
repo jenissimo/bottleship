@@ -273,7 +273,9 @@
     },
     {
       "name": "ord_1140",
-      "argCount": 6
+      "argCount": 7,
+      "source": "Microsoft NT5 public/sdk/inc/mswsock.h:101-109; wsock32.def ordinal1140 forwards MSWSOCK.TransmitFile",
+      "signature": "BOOL TransmitFile(SOCKET hSocket, HANDLE hFile, DWORD nNumberOfBytesToWrite, DWORD nNumberOfBytesPerSend, LPOVERLAPPED lpOverlapped, LPTRANSMIT_FILE_BUFFERS lpTransmitBuffers, DWORD dwReserved)"
     },
     {
       "name": "ord_1141",
@@ -453,7 +455,9 @@
     },
     {
       "name": "TransmitFile",
-      "argCount": 6
+      "argCount": 7,
+      "source": "Microsoft NT5 public/sdk/inc/mswsock.h:101-109; wsock32.def ordinal1140 forwards MSWSOCK.TransmitFile",
+      "signature": "BOOL TransmitFile(SOCKET hSocket, HANDLE hFile, DWORD nNumberOfBytesToWrite, DWORD nNumberOfBytesPerSend, LPOVERLAPPED lpOverlapped, LPTRANSMIT_FILE_BUFFERS lpTransmitBuffers, DWORD dwReserved)"
     },
     {
       "name": "WEP",
