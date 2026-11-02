@@ -13,7 +13,7 @@ import {
 } from "./helpers";
 import {
     playStream, updateStreamPlayback, stopRingBuffer, resumeRingBuffer,
-    incrementalStreamPosition, releaseStreamRing,
+    incrementalStreamPosition, releaseStreamRing, seekRingBuffer,
 } from "./playback-engine";
 import { decodeStreamFile } from "./audio-decode";
 import { GuestCallChain, hasAppFileCallbacks, readWholeFileViaApp, runGuestCallChain } from "./app-file-io";
@@ -368,6 +368,9 @@ export function createStreamExports(ctx: MSSContext): Record<string, ThunkImplem
         if (stream.isPlaying) {
             const bytesPerSec = getBytesPerSecond(stream);
             const seekTimeMs = bytesPerSec > 0 ? (position / bytesPerSec) * 1000 : 0;
+            // The wall-clock estimate is anchored at startTime, so it moves with the seek.
+            stream.startTime = performance.now() - seekTimeMs / (stream.playbackRate || 1);
+            if (seekRingBuffer(stream, position)) return 0;
             self.postMessage({
                 type: "audio_seek",
                 payload: { id: stream.id, timeMs: seekTimeMs }

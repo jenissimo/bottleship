@@ -6,6 +6,7 @@ import {
 import {
     ensureStreamingRing, appendStreamingRing, startStreamingRing,
     incrementalStreamFinished, incrementalStreamPosition, finishIncrementalStream, resetMssRingBuffers,
+    playStream,
 } from "../../src/worker/modules/mss32/playback-engine";
 import type { MSSStream, MSSStreamSource } from "../../src/worker/modules/mss32/types";
 import type { MSSContext } from "../../src/worker/modules/mss32/context";
@@ -122,5 +123,46 @@ describe("Miles streaming ring consumption", () => {
         for (let i = 0; i < 10; i++) {
             expect(quantum(processor)[0].every(value => value > 0.1)).toBe(true);
         }
+    });
+});
+
+describe("Miles stream start position", () => {
+    function capturePosts(run: () => void): any[] {
+        const posted: any[] = [];
+        const host = (globalThis as any).self;
+        const saved = host.postMessage;
+        host.postMessage = (msg: unknown) => { posted.push(msg); };
+        try { run(); } finally { host.postMessage = saved; }
+        return posted;
+    }
+
+    function encodedStream(position: number): { ctx: MSSContext; stream: MSSStream } {
+        const memory = new Uint8Array(4096);
+        const ctx = {
+            process: { getCurrentMemory: () => memory }, digitalDriverHandle: 0,
+        } as unknown as MSSContext;
+        const stream = {
+            id: 9, handle: 64, channels: 2, sampleRate: 44100, playbackRate: 1, bitsPerSample: 16,
+            blockAlign: 4, volume: 127, pan: 64, loopCount: 1, position, fileFormat: "mp3",
+            fileData: new Uint8Array(16), decodedData: null, encodedDurationMs: 200_000,
+            isPlaying: false, isPaused: false, pendingStart: false,
+        } as unknown as MSSStream;
+        return { ctx, stream };
+    }
+
+    test("a stream seeked before its first start begins there", () => {
+        const { ctx, stream } = encodedStream(44100 * 4 * 30);
+        const posted = capturePosts(() => playStream(ctx, stream));
+        const play = posted.find(m => m.type === "audio_play_encoded");
+        expect(play.payload.startOffsetMs).toBeCloseTo(30_000, 3);
+        expect(play.payload.loopRestartMs).toBe(0);
+        expect(stream.position).toBe(44100 * 4 * 30);
+    });
+
+    test("an unseeked stream begins at the top", () => {
+        const { ctx, stream } = encodedStream(0);
+        const posted = capturePosts(() => playStream(ctx, stream));
+        const play = posted.find(m => m.type === "audio_play_encoded");
+        expect(play.payload.startOffsetMs).toBe(0);
     });
 });
