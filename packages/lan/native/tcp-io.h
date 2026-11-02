@@ -148,6 +148,9 @@ static uint32_t tcp_complete_send(void) {
 }
 static int tcp_run(socket_t connection,int inline_mode) {
     int eof=0,fin=0,urgent=0,failure=0;
+#ifndef _WIN32
+    int consumed_oob_mark=0;
+#endif
     for(;;){
         failure=tcp_acknowledge_wake(connection);
         if(failure)break;
@@ -160,6 +163,22 @@ static int tcp_run(socket_t connection,int inline_mode) {
         if(failure||stop)break;
         if(eof&&fin&&!command&&!have_control){if(!emit(EV_CLOSED,NULL,0))failure=10054;break;}
         int progress=0;
+#ifndef _WIN32
+        /* Linux can expose a byte already read with MSG_OOB after SO_OOBINLINE
+         * is enabled. A normal read advances past the consumed urgent mark. */
+        if(eof)consumed_oob_mark=0;
+        if(consumed_oob_mark && have_control && control.option==0 && control.enabled && credit && !eof){
+            unsigned char byte;int received=recv(connection,(char*)&byte,1,0);
+            if(received>0){
+                LOCK(&mutex);receive_credit--;UNLOCK(&mutex);credit--;
+                if(!emit(EV_DATA,&byte,1)){failure=10054;break;}
+                progress=1;
+            }else if(!received){eof=1;progress=1;if(!emit(EV_EOF,NULL,0)){failure=10054;break;}}
+            else if(SOCKERR()!=WOULD_BLOCK){failure=native_error(SOCKERR());break;}
+            consumed_oob_mark=0;
+        }
+        if(consumed_oob_mark && have_control && control.option==0 && control.enabled){have_control=0;command=NULL;}
+#endif
         if(have_control){
             failure=tcp_apply_control(connection,control,&inline_mode,&urgent);
             if(failure)break;
@@ -218,6 +237,9 @@ static int tcp_run(socket_t connection,int inline_mode) {
                 LOCK(&mutex);receive_credit--;UNLOCK(&mutex);credit--;
                 if(!emit(EV_OOB,&byte,1)){failure=10054;break;}
                 urgent=0;progress=1;
+#ifndef _WIN32
+                consumed_oob_mark=1;
+#endif
             }else if(received==SOCKET_ERROR&&SOCKERR()!=WOULD_BLOCK){failure=native_error(SOCKERR());break;}
         }
         if(credit&&!eof&&FD_ISSET(connection,&reads)){
