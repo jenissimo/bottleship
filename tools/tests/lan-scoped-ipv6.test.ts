@@ -25,7 +25,7 @@ for(const transport of ["websocket","polling"] as const) test("native scoped IPv
     const udp6=createSocket("udp6"),udp4=createSocket("udp4"),sockets=new Set<Socket>();
     udp6.on("message",(bytes,peer)=>udp6.send(Buffer.concat([Buffer.from([6]),bytes]),peer.port,peer.address));
     udp4.on("message",(bytes,peer)=>udp4.send(Buffer.concat([Buffer.from([4]),bytes]),peer.port,peer.address));
-    await new Promise<void>((resolve,reject)=>{udp6.once("error",reject);udp6.bind({address:"::",port:0,ipv6Only:true},resolve);});
+    await new Promise<void>((resolve,reject)=>{udp6.once("error",reject);udp6.bind({address:host,port:0,ipv6Only:true},resolve);});
     const nativePort=udp6.address().port;
     await new Promise<void>((resolve,reject)=>{udp4.once("error",reject);udp4.bind(nativePort,"127.0.0.1",resolve);});
     const tcp=createServer({allowHalfOpen:true},socket=>{
