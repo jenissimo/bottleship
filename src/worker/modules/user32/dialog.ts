@@ -26,6 +26,7 @@ import { showDialogWindow } from './window-visibility';
 import { paintDialogToOverlay, finalizeDialogPaint, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange } from './dialog-paint';
 import { handleSystemControlMessage, applyStaticSetImageAutoSize, isContentChangingMessage } from './dialog-control-messages';
 import { getDefWindowProcAddress } from './system-classes';
+import { getWindowClassByName } from './class';
 import { runDefaultWindowPaint, defaultWindowProc } from './window';
 import { EmulatorConfig } from '../../core/emulator-config-manager';
 import { emitDialogShow } from '../../core/debug/dbg-commands';
@@ -483,6 +484,8 @@ export function createDialogChildren(
         const childW = dluToPixelX(ctrl.cx, base);
         const childH = dluToPixelY(ctrl.cy, base);
 
+        // Built-in controls must have their class styles before input reaches them.
+        getWindowClassByName(ctrl.className);
         const childHwnd = system.windowManager.createWindow(
             ctrl.className,
             ctrl.title,

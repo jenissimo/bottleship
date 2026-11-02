@@ -27,6 +27,9 @@ export interface DirectPlay4JoinChannelOptions {
 type SocketRef={id:number;generation:number;object:number};
 type Child={ref:SocketRef;reader:DirectPlay4MixedTcpStream;peer?:WsaAddress};
 type Write={bytes:Uint8Array;offset:number;resolve:()=>void;reject:(error:Error)=>void};
+// At most one previously partial frame plus 31 minimum-sized frames per read.
+// TCP may coalesce arbitrarily many frames, so bound reads rather than reject valid traffic.
+const READ_BYTES=31*28;
 const blocked=(error:unknown)=>error instanceof WsaFailure && error.code===WSA.EWOULDBLOCK;
 const copyAddress=(a:WsaAddress):WsaAddress=>({
     ...a,node:Uint8Array.from(a.node),...(a.ip?{ip:Uint8Array.from(a.ip)}:{}),
@@ -163,14 +166,14 @@ export class DirectPlay4JoinChannel {
                 catch(error){if(blocked(error))break;throw error;}
                 const id=ref.id;
                 if(!this.current()||this.children.size>=this.options.maxChildren){this.closeRef(ref);if(!this.current())throw new Error("Join owner retired");continue;}
-                this.children.set(id,{ref,reader:new DirectPlay4MixedTcpStream(this.options.maxFrameBytes,32,Math.max(this.options.maxFrameBytes,65536))});
+                this.children.set(id,{ref,reader:new DirectPlay4MixedTcpStream(this.options.maxFrameBytes,32,Math.max(this.options.maxFrameBytes+READ_BYTES,65536))});
             }
             if(accepted===8)this.wake();
             for(const [id,child] of this.children) {
                 for(let reads=0;reads<4;reads++) {
                     if(!this.current()||!this.exact(child.ref))throw new Error("Join child owner retired");
                     let packet:ReturnType<WsaSocketTable["receive"]>;
-                    try{packet=this.table.receive(id,Math.min(65536,this.options.maxFrameBytes));}
+                    try{packet=this.table.receive(id,Math.min(READ_BYTES,this.options.maxFrameBytes));}
                     catch(error){if(blocked(error))break;throw error;}
                     if(!this.current()||!this.exact(child.ref))throw new Error("Join child owner retired");
                     if(!packet.data.length){child.reader.finish();this.children.delete(id);this.closeRef(child.ref);break;}

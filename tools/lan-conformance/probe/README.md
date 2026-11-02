@@ -68,6 +68,16 @@ must not be published as a native host's address in mixed mode.
 Guest-initiated gateway flows can carry replies; unprompted native-originated
 traffic requires the explicit host-listener/bridge fixtures.
 
+`dp8/interop` is a special native-loopback fixture: `setdevice adapter` selects
+its measured Windows loopback device, so its host publishes `127.0.0.1:23913`.
+For a mixed DP8 run, explicitly configure a gateway route with host and address
+`127.0.0.1`, UDP port 23913. The DP8 native backend recognizes this explicitly
+advertised external endpoint; do not infer the same behavior for ordinary guest
+Winsock loopback. The generic `gateway-config` command instead selects a local
+NIC and is not the right configuration for this particular fixture. The native
+loopback adapter GUID is machine-specific; verify the bound socket on a new
+machine. An all-emulated run is skipped because its host is a native fixture.
+
 ## DP8 wire-host diagnostics
 
 ```bash

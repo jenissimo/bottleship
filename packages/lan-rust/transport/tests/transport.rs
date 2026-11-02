@@ -138,6 +138,32 @@ async fn websocket(server: &mut BoundTransport) -> (Ws, u64) {
     (ws, id)
 }
 #[tokio::test]
+async fn polling_handshake_closes_http_connection_before_another_session_can_reuse_it() {
+    let server = bind("127.0.0.1:0".parse().unwrap(), Config::default()).await.unwrap();
+    let mut socket = TcpStream::connect(server.address).await.unwrap();
+    let handshake = format!(
+        "GET /socket.io/?EIO=4&transport=polling HTTP/1.1\r\nHost: {}\r\n\r\n",
+        server.address
+    );
+    socket.write_all(handshake.as_bytes()).await.unwrap();
+    let mut bytes = Vec::new();
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut bytes))
+        .await.expect("polling handshake left its HTTP connection reusable").unwrap();
+    let response = String::from_utf8(bytes).unwrap();
+    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
+    assert!(headers.to_ascii_lowercase().contains("connection: close"), "{headers}");
+    assert!(body.starts_with("0{"), "{body}");
+
+    // The first Engine.IO session is still alive, so a fresh HTTP connection
+    // must be able to open another one without hitting the per-TCP limit.
+    let (status, second) = request(server.address, "GET",
+        "/socket.io/?EIO=4&transport=polling", "", None).await;
+    assert_eq!(status, 200);
+    assert!(second.starts_with("0{"));
+}
+
+#[tokio::test]
 async fn polling_full_queue_abort_retires_exact_sid_and_releases_all_output() {
     let mut config = Config::default();
     config.output_records = 2;

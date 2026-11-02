@@ -833,8 +833,13 @@ pub async fn bind(address: SocketAddr, config: Config) -> io::Result<BoundTransp
                  }else if req.method()==http::Method::GET{
                   let Some(leases)=Leases::acquire(&tcp.sessions,&context.session_budget,1,0) else{return Ok(error(503))};Some(Arc::new(leases))
                  }else{None};
+                 // A TCP connection is owned by one Engine.IO session until its
+                 // retained outputs retire. Browsers pool HTTP connections across
+                 // tabs and sessions, so polling responses must not be reused.
+                 let polling=req.uri().query().is_some_and(|query|query.split('&').any(|part|part=="transport=polling"));
                  req.extensions_mut().insert(RequestContext{peer,origin:origin.clone(),tcp,reservation});
                  let mut response=if req.method()==http::Method::OPTIONS{error(204)}else{engine.call(req).await?};
+                 if polling{response.headers_mut().insert(http::header::CONNECTION,http::HeaderValue::from_static("close"));}
                  if let Some(origin)=origin{
                   if let Ok(value)=origin.parse(){response.headers_mut().insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN,value);}
                   response.headers_mut().insert(http::header::VARY,http::HeaderValue::from_static("Origin"));

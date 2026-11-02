@@ -74,6 +74,24 @@ describe("LAN connection configuration", () => {
       expect(()=>normalizeNetworkConfig({...selected,directPlay8})).toThrow();
   });
 
+  test("native DirectPlay 4 requires matching explicit TCP and UDP listeners and survives invitations", () => {
+    const selected={serverUrl:"https://lan.example.org",room:"friends",winsock:{provider:"native" as const,hostListener:"tcp-game"},
+      directPlay4:{provider:"native" as const,tcpHostListener:"tcp-game",udpHostListener:"udp-game"}};
+    config.setNetwork(selected);selected.directPlay4.udpHostListener="changed";
+    expect(config.network?.directPlay4?.udpHostListener).toBe("udp-game");
+    const inherited=config.snapshotForChild();config.setNetwork(null);config.restoreForChild(inherited);
+    const url=new URL(networkInviteUrl("https://bottleship.example/?game=dev",config.network));
+    expect(networkConfigFromLocation(url.search,null)).toEqual(config.network);
+    const cleared=new URL(networkInviteUrl(url.href,null));
+    expect(cleared.searchParams.has("dp4Provider")).toBe(false);
+    for(const directPlay4 of [null,{provider:"native",tcpHostListener:"tcp-game"},
+      {provider:"other",tcpHostListener:"tcp-game",udpHostListener:"udp-game"},
+      {provider:"native",tcpHostListener:"../bad",udpHostListener:"udp-game"},
+      {provider:"native",tcpHostListener:"another",udpHostListener:"udp-game"}])
+      expect(()=>normalizeNetworkConfig({...selected,directPlay4})).toThrow();
+    expect(()=>normalizeNetworkConfig({...selected,winsock:undefined})).toThrow();
+  });
+
   test("invalid settings leave the previous valid configuration intact", () => {
     config.setNetwork({ serverUrl: "https://lan.example.org", room: "friends" });
     expect(() => config.setNetwork({ serverUrl: "bad", room: "friends" })).toThrow();

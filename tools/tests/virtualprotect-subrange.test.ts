@@ -44,6 +44,16 @@ describe("VirtualProtect page subranges", () => {
         system.process = savedProcess; system.scheduler = savedScheduler;
     });
 
+    test("VirtualQuery advances by a whole page over a sub-page heap allocation", () => {
+        const page = MEM_HEAP_BASE + 0x100000;
+        space.mapRegion(page, 1152, "rw", "HEAP", "heap allocation");
+        const mbi = query(page);
+        expect(mbi[0]).toBe(page);
+        expect(mbi[3]).toBe(PAGE);
+        expect(mbi[0] + mbi[3]).toBeGreaterThan(page);
+        expect(query(page + 1151)[3]).toBe(PAGE);
+    });
+
     test("a second-page RO protection rejects writes crossing the boundary", () => {
         const base = alloc();
         expect(base).toBeGreaterThan(0);

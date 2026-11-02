@@ -1,6 +1,7 @@
 import {expect,test} from "bun:test";
 import {DirectPlay4JoinChannel} from "../../src/worker/modules/dplayx/native-wire/join-channel";
 import {DirectPlay4CreatePlayer} from "../../src/worker/modules/dplayx/native-wire/create-player";
+import {DirectPlay4NativeSession,type DirectPlay4NativeSessionDriver} from "../../src/worker/modules/dplayx/native-wire/native-session";
 import {encodeDirectPlay4PlayerTcpFrame} from "../../src/worker/modules/dplayx/native-wire/player-tcp";
 import {encodeDirectPlay4PlayerWrapper} from "../../src/worker/modules/dplayx/native-wire/player-wrapper";
 import {runDirectPlay4JoinHandshake} from "../../src/worker/modules/dplayx/native-wire/join-handshake";
@@ -9,7 +10,7 @@ import {WsaFailure,WSA,type WsaSocketTable} from "../../src/worker/modules/wsa-n
 const peer={family:2,node:Uint8Array.of(2,1,192,0,2,2),ip:Uint8Array.of(192,0,2,2),port:1234};
 const sockaddr=Uint8Array.of(2,0,8,252,192,0,2,1,0,0,0,0,0,0,0,0);
 class Fake {
- generation=1; next=10; sockets=new Map<number,number>(); queue:number[]=[]; packets=new Map<number,Uint8Array[]>(); handlers=new Set<()=>void>(); commands:number[]=[]; requests:Uint8Array[]=[]; reply=true; rejectForward=false; idCount=0; beforeId?:Uint8Array;
+ generation=1; next=10; sockets=new Map<number,number>(); queue:number[]=[]; packets=new Map<number,Uint8Array[]>(); handlers=new Set<()=>void>(); commands:number[]=[]; requests:Uint8Array[]=[]; reply=true; rejectForward=false; idCount=0; beforeId?:Uint8Array; beforeForward?:Uint8Array; nameTable?:Uint8Array;
  subscribe(f:()=>void){this.handlers.add(f);return ()=>this.handlers.delete(f);}
  signal(){for(const f of this.handlers)f();}
  socketOwned(){const id=this.next++;this.sockets.set(id,id+100);return {handle:id,object:id+100};}
@@ -26,9 +27,11 @@ class Fake {
    let inner:Uint8Array;
    if(command===5){inner=new Uint8Array(48);const v=new DataView(inner.buffer);v.setUint32(0,0x79616c70,true);v.setUint16(4,7,true);v.setUint16(6,14,true);v.setUint32(8,0x12345678+this.idCount++,true);}
    else if(this.rejectForward){inner=new Uint8Array(12);const v=new DataView(inner.buffer);v.setUint32(0,0x79616c70,true);v.setUint16(4,36,true);v.setUint16(6,14,true);v.setUint32(8,0x8877014a,true);}
+   else if(this.nameTable)inner=this.nameTable;
    else {inner=new Uint8Array(116);const v=new DataView(inner.buffer);v.setUint32(0,0x79616c70,true);v.setUint16(4,41,true);v.setUint16(6,14,true);v.setUint32(16,116,true);v.setUint32(24,36,true);v.setUint32(36,80,true);}
    const c=this.socketOwned().handle;const reply=encodeDirectPlay4SystemTcpFrame(sockaddr,inner,1024);
-   const message=command===5&&this.idCount===1&&this.beforeId?Uint8Array.from([...this.beforeId,...reply]):reply;
+   const before=command===5&&this.idCount===1?this.beforeId:command===19?this.beforeForward:undefined;
+   const message=before?Uint8Array.from([...before,...reply]):reply;
    this.packets.set(c,[message]);this.queue.push(c);this.signal();
   }
   return data.length;
@@ -80,10 +83,29 @@ test("pending and live raw player frames cross the session transfer in order",as
  const raw=encodeDirectPlay4PlayerTcpFrame(sockaddr,7,8,Uint8Array.of(42),1024);f.table.injectRaw(raw);
  await new Promise(resolve=>setTimeout(resolve,15));
  const lease=result.transfer({signal:signal.signal,current:()=>true,exists:()=>false,
-  applyPending:m=>{const v=new DataView(m.bytes.buffer,m.bytes.byteOffset,m.bytes.byteLength);events.push("pending:"+v.getUint32(0,true));},
+  applyPending:m=>{const v=new DataView(m.bytes.buffer,m.bytes.byteOffset,m.bytes.byteLength);expect(m.peer?.family).toBe(2);expect([...m.peer!.ip!]).toEqual([192,0,2,2]);expect(m.peer!.port).toBe(1234);events.push("pending:"+v.getUint32(0,true));},
   onFrame:()=>{},onPlayerFrame:frame=>events.push("live:"+frame.from),onFailure:()=>{}});
  f.table.injectRaw(raw);await new Promise(resolve=>setTimeout(resolve,15));expect(events).toEqual(["pending:7","live:7"]);
  f.table.reply=false;await lease.sendPlayer(raw);expect(f.table.requests.at(-1)).toEqual(raw);lease.release();expect(f.releases()).toEqual([1,1]);
+});
+test("pending authorized delete passes the real handshake into the private session roster",async()=>{
+ const f=setup(),nameTable=new Uint8Array(136),v=new DataView(nameTable.buffer);
+ v.setUint32(0,0x79616c70,true);v.setUint16(4,41,true);v.setUint16(6,14,true);
+ v.setUint32(8,1,true);v.setUint32(16,116,true);v.setUint32(24,36,true);v.setUint32(36,80,true);
+ v.setUint32(116,16,true);v.setUint32(124,2,true);f.table.nameTable=nameTable;
+ const del=new Uint8Array(28),dv=new DataView(del.buffer);
+ dv.setUint32(0,0x79616c70,true);dv.setUint16(4,11,true);dv.setUint16(6,14,true);dv.setUint32(12,2,true);
+ f.table.beforeForward=encodeDirectPlay4SystemTcpFrame(sockaddr,del,1024);
+ const driver:DirectPlay4NativeSessionDriver={
+  acquireTcp:async()=>f.o.tcp as any,acquireUdp:async()=>f.o.udp as any,
+  handshake:(tcp,udp,signal,current)=>runDirectPlay4JoinHandshake({...f.o,tcp,udp,signal,current}),
+ };
+ const seen:number[]=[],session=new DirectPlay4NativeSession(driver,()=>true,{
+  authorizePlayer:()=>true,authorizeSystem:(id,source)=>id===2&&source.port===1234&&source.ip?.[3]===2,
+  onSystem:frame=>seen.push(frame.command),onPlayer:()=>{},onFailure:()=>{},
+ });
+ const snapshot=await session.open();expect(snapshot.players).toEqual([]);expect(seen).toEqual([11]);
+ session.close();expect(f.releases()).toEqual([1,1]);expect(f.table.sockets.size).toBe(0);
 });
 test("lease release and external abort promptly cancel held player-ID request",async()=>{
  for(const action of ["release","external"]){
@@ -131,7 +153,7 @@ test("pending replay precedes live delivery; abort inside replay releases both o
  expect(g.releases()).toEqual([1,1]);expect(g.table.sockets.size).toBe(0);
 });
 test("reentrant ingress during replay respects the combined budget and cancels",async()=>{
- const f=setup();f.o.maxPendingBytes=132;let channel:DirectPlay4JoinChannel|undefined;
+ const f=setup();f.o.maxPendingBytes=142;let channel:DirectPlay4JoinChannel|undefined;
  const original=DirectPlay4JoinChannel.prototype.send;
  DirectPlay4JoinChannel.prototype.send=function(frame){channel=this;return original.call(this,frame);};
  try {
@@ -146,7 +168,7 @@ test("reentrant ingress during replay respects the combined budget and cancels",
  } finally {DirectPlay4JoinChannel.prototype.send=original;}
 });
 test("transition budget retains the current frame through a reentrant consumer",async()=>{
- const f=setup();f.o.maxPendingBytes=132;let channel:DirectPlay4JoinChannel|undefined;
+ const f=setup();f.o.maxPendingBytes=142;let channel:DirectPlay4JoinChannel|undefined;
  const original=DirectPlay4JoinChannel.prototype.send;
  DirectPlay4JoinChannel.prototype.send=function(frame){channel=this;return original.call(this,frame);};
  try {

@@ -2,6 +2,24 @@ import {expect,test} from "bun:test";
 import {DirectPlay4JoinPending} from "../../src/worker/modules/dplayx/native-wire/join-pending";
 const system=(cmd:number,id=0)=>{const b=Buffer.alloc(16);b.write("play");b.writeUInt16LE(cmd,4);b.writeUInt16LE(14,6);b.writeUInt32LE(id,12);return b;};
 
+test("pending replay owns the authorized transport peer and charges its bytes",()=>{
+ const q=new DirectPlay4JoinPending(3,36,()=>true),bytes=Uint8Array.of(1,2,3,4,5,6,7,8);
+ const peer={family:2,port:2300,node:Uint8Array.of(2,1,10,20,30,40),ip:Uint8Array.of(10,20,30,40)};
+ expect(q.receivePlayer(bytes,new Uint8Array(16),0,peer).kind).toBe("queued");expect(q.queuedBytes).toBe(34);
+ bytes.fill(0);peer.node.fill(0);peer.ip.fill(0);peer.port=2;
+ let seen:any;expect(q.drain(()=>false,msg=>{seen=msg;})).toBe(true);
+ expect([...seen.bytes]).toEqual([1,2,3,4,5,6,7,8]);expect([...seen.peer.node]).toEqual([2,1,10,20,30,40]);
+ expect([...seen.peer.ip]).toEqual([10,20,30,40]);expect(seen.peer.port).toBe(2300);
+ const bounded=new DirectPlay4JoinPending(1,33,()=>true);
+ const valid={family:2,port:2300,node:Uint8Array.of(2,1,10,20,30,40),ip:Uint8Array.of(10,20,30,40)};
+ expect(()=>bounded.receivePlayer(new Uint8Array(8),new Uint8Array(16),0,valid)).toThrow("budget");
+ expect(()=>bounded.receivePlayer(new Uint8Array(8),null,0,valid)).toThrow("retired");
+});
+test("pending rejects malformed transport peer instead of erasing provenance",()=>{
+ const q=new DirectPlay4JoinPending(2,100,()=>true);
+ const bad={family:2,port:0,node:Uint8Array.of(2,1,1,2,3,4),ip:Uint8Array.of(1,2,3,4)};
+ expect(()=>q.receivePlayer(new Uint8Array(8),null,0,bad)).toThrow();
+});
 test("expected reply matching includes source fallback and owns payload/header",()=>{
     for(const [wanted,received,match] of [[7,7,true],[7,3,false],[41,3,true],[41,36,true],[3,36,true],[3,41,false]] as const) {
         const q=new DirectPlay4JoinPending(5,100,()=>true), b=system(received), header=Buffer.from([1,2]);

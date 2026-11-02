@@ -422,10 +422,11 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
         const config = normalizeNetworkConfig(value);
         const key = config ? JSON.stringify(config) : "";
         if (this.active?.key === key && (this.active.link.connected || this.active.link.connecting)) return this.active.link.ready;
+        this.backplane.configureDirectPlay4(config?.directPlay4);
         this.backplane.configureDirectPlay8(config?.directPlay8);
         this.backplane.configureWinsock(config?.winsock);
         this.active = null; this.backplane.attach(null);
-        if (!config) { this.network.configureDirectPlay8(); this.network.configureWinsock(); return; }
+        if (!config) { this.network.configureDirectPlay4(); this.network.configureDirectPlay8(); this.network.configureWinsock(); return; }
         const link = new RelayLink(config.serverUrl, config.room, this.backplane);
         this.active = { key, link }; this.backplane.attach(link);
         try {
@@ -460,7 +461,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
     private snapshot(): LanState {
         return { connected: this.backplane.connected, node: this.backplane.node.slice(), ipv4: this.backplane.ipv4, generation: this.stateGeneration,
             gatewayIpv4: this.gatewayAddresses(), gatewayIpv6: this.lastGateways6,
-            udpHostListenV1: this.backplane.udpHostListenV1, tcpHostListenV1: this.backplane.tcpHostListenV1, winsock: this.backplane.winsock, udpMulticast4V1: this.backplane.udpMulticast4V1, directPlay8: this.backplane.directPlay8 };
+            udpHostListenV1: this.backplane.udpHostListenV1, tcpHostListenV1: this.backplane.tcpHostListenV1, winsock: this.backplane.winsock, udpMulticast4V1: this.backplane.udpMulticast4V1, directPlay4: this.backplane.directPlay4, directPlay8: this.backplane.directPlay8 };
     }
     private recordResolved(result: ResolveResult): void {
         const addresses = result.addresses.filter(item => item.family === 4).map(item => item.address.split(".").map(Number));
@@ -490,6 +491,7 @@ export class RootNetworkNamespace implements ProcessNetworkNamespace {
                 reason: this.sharedStateFailure.message};
             this.ports.publishState(state);
         } else this.sharedStateFailure = null;
+        this.network.configureDirectPlay4(state.directPlay4);
         this.network.configureDirectPlay8(state.directPlay8);
         this.network.configureUdpHosts(state.udpHostListenV1);
         this.network.configureTcpHosts(state.tcpHostListenV1);
@@ -1128,6 +1130,7 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
     private finishing:Promise<void>|null=null;
     private stateRevision = 0;
     private stateGeneration: number | undefined;
+    private policySnapshot?: {generation:number; dp4:string; dp8:string; udp:string; tcp:string; winsock:string};
     private synchronizing = false;
     synchronizeState(): void {
         if (this.closed || this.synchronizing || !this.ports.alive(this.boot.slot, this.boot.epoch)) return;
@@ -1146,10 +1149,21 @@ export class ChildProcessNetworkNamespace implements ProcessNetworkNamespace, Ne
             }
             this.stateGeneration = state.generation;
             if (!state.connected) this.retireState();
-            this.network.configureDirectPlay8(state.directPlay8);
-            this.network.configureUdpHosts(state.udpHostListenV1);
-        this.network.configureTcpHosts(state.tcpHostListenV1);
-        this.network.configureWinsock(state.winsock);
+            // A revision can republish the same readiness state (for example,
+            // when DNS adds a route). Preserve policy epochs in that
+            // case; a changed value or network generation still revokes them.
+            const key = (value:unknown) => JSON.stringify(value) ?? "undefined";
+            const next = {generation:state.generation, dp4:key(state.directPlay4), dp8:key(state.directPlay8),
+                udp:key(state.udpHostListenV1), tcp:key(state.tcpHostListenV1), winsock:key(state.winsock)};
+            const previous = this.policySnapshot;
+            const changed = (name:"dp4"|"dp8"|"udp"|"tcp"|"winsock") =>
+                !previous || previous.generation !== next.generation || previous[name] !== next[name];
+            this.policySnapshot = next;
+            if (changed("dp4")) this.network.configureDirectPlay4(state.directPlay4);
+            if (changed("dp8")) this.network.configureDirectPlay8(state.directPlay8);
+            if (changed("udp")) this.network.configureUdpHosts(state.udpHostListenV1);
+            if (changed("tcp")) this.network.configureTcpHosts(state.tcpHostListenV1);
+            if (changed("winsock")) this.network.configureWinsock(state.winsock);
             this.network.configureMulticast4(state.udpMulticast4V1 === true);
             this.network.configureGatewayAddresses(state.gatewayIpv4 ?? []);
             this.network.configureGatewayIpv6(state.gatewayIpv6 ?? []);

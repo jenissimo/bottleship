@@ -42,6 +42,45 @@ test("finish and stop preserve native cache, close and replacement invalidate on
     session.dispose();
 });
 
+test("exact native cache owner is revoked synchronously on replacement, expiry and close", () => {
+    const net = new LanNetwork(), session = new DirectPlaySession(net);
+    net.attach({send:()=>true, close:()=>{}});
+    expect(session.initialize()).toBe(0);
+    const first = session.beginNativeDiscovery(), old = entry(first.epoch);
+    session.cacheDiscovery(old); first.finish();
+    const signal = session.nativeDiscoverySignal(old)!;
+    expect(signal.aborted).toBe(false);
+    session.cacheDiscovery(entry());
+    expect(signal.aborted).toBe(true);
+    expect(session.nativeDiscoverySignal(old)).toBeUndefined();
+    const expired = entry(first.epoch); expired.seen = Date.now() - 31000;
+    session.cacheDiscovery(expired);
+    const expirySignal = session.nativeDiscoverySignal(expired)!;
+    session.discover(expired.desc.application);
+    expect(expirySignal.aborted).toBe(true);
+    const next = session.beginNativeDiscovery(), fresh = entry(next.epoch);
+    session.cacheDiscovery(fresh); next.finish();
+    const freshSignal = session.nativeDiscoverySignal(fresh)!;
+    session.close();
+    expect(freshSignal.aborted).toBe(true);
+    session.dispose();
+});
+
+test("reentrant cache replacement retires only the exact previous owner", () => {
+    const session = new DirectPlaySession(new LanNetwork());
+    const discovery = session.beginNativeDiscovery(), old = entry(discovery.epoch);
+    session.cacheDiscovery(old); discovery.finish();
+    const signal = session.nativeDiscoverySignal(old)!, replacement = entry(discovery.epoch), latest = entry(discovery.epoch);
+    signal.addEventListener("abort", () => session.cacheDiscovery(latest), {once:true});
+    session.cacheDiscovery(replacement);
+    expect(signal.aborted).toBe(true);
+    expect(session.discovered.get(instance)).toBe(latest);
+    const latestSignal = session.nativeDiscoverySignal(latest)!;
+    expect(latestSignal.aborted).toBe(false);
+    session.close(); expect(latestSignal.aborted).toBe(true);
+    session.dispose();
+});
+
 test("disconnect and dispose invalidate cache and old operations across reconnect", () => {
     const net = new LanNetwork(), session = new DirectPlaySession(net);
     net.attach({send:()=>true, close:()=>{}});

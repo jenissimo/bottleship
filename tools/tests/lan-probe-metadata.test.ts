@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { checkSkip, parseArgs, planRoles, scriptMetadata } from "../lan-conformance/probe/case-metadata";
 
 test("all address verbs and consumers participate in coordination and boot cleanup", () => {
@@ -17,6 +19,15 @@ test("single-script skip is honored only for emulated roles", () => {
     expect(checkSkip([{ text, mode: "emu" }])).toBe("pending browser diagnosis");
     expect(checkSkip([{ text, mode: "native" }])).toBeNull();
     expect(checkSkip([{ text: "echo ok", mode: "emu" }, { text, mode: "native" }])).toBeNull();
+});
+
+test("the DP8 native-loopback host is skipped only when that host is emulated", () => {
+    const cases = join(import.meta.dir, "../lan-conformance/cases/dp8");
+    const host = readFileSync(join(cases, "interop.host.lp"), "utf8");
+    const peer = readFileSync(join(cases, "interop.peer.lp"), "utf8");
+    expect(checkSkip([{text:host,mode:"emu"}, {text:peer,mode:"emu"}])).toContain("Windows loopback");
+    expect(checkSkip([{text:host,mode:"native"}, {text:peer,mode:"emu"}])).toBeNull();
+    expect(checkSkip([{text:host,mode:"native"}, {text:peer,mode:"native"}])).toBeNull();
 });
 
 test("wire-host check and diagnostic runs use the same role plan", () => {

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { DirectPlayNetworkApi, packDirectPlayMessage } from "../../src/worker/modules/dplayx/network-api";
+import { EmulatorConfig } from "../../src/worker/core/emulator-config-manager";
 import { DP, DirectPlaySession } from "../../src/worker/modules/dplayx/session";
 import { decodeDatagram, encodeDatagram, encodeTcpFrame, PROTO_TCP, PROTO_UDP, PROTO_DIRECTPLAY, SYN, DATA, TCP_WINDOW, isBroadcastNode } from "../../src/worker/net/netplay-wire";
 import { LanNetwork } from "../../src/worker/net/lan-network";
@@ -130,6 +131,90 @@ test("system message native layout includes in-buffer names and remote data poin
     expect(v.getUint32(0, true)).toBe(3); expect(v.getUint32(4, true)).toBe(1); expect(v.getUint32(8, true)).toBe(2);
     expect(v.getUint32(16, true)).toBe(0x20030); expect(v.getUint32(20, true)).toBe(2); expect(v.getUint32(24, true)).toBe(16);
     expect(v.getUint32(32, true)).toBe(0x20032); expect(v.getUint32(36, true)).toBe(0x20036);
+});
+test("native Windows create and destroy player messages place names and data in their observed order",()=>{
+    const entity={id:2,group:false,owner:"peer",flags:0,name:{short:"Client",long:"Client Long"},data:[0x12,0x34,0x56,0x78],members:[],parent:0,groupOwner:0};
+    const offsets=(type:3|5,wide:boolean)=>{
+        const bytes=packDirectPlayMessage({from:0,to:1,data:new Uint8Array(),system:{type,entity,currentPlayers:2}},0x2000,2,wide);
+        const v=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+        return [bytes.length,v.getUint32(type===3?32:36,true)-0x2000,v.getUint32(type===3?36:40,true)-0x2000,v.getUint32(type===3?16:20,true)-0x2000];
+    };
+    // Two-process Windows DirectPlay 4 Receive oracle, names and data nonempty.
+    expect(offsets(3,true)).toEqual([90,48,62,86]);
+    expect(offsets(5,true)).toEqual([94,56,70,52]);
+    expect(offsets(3,false)).toEqual([71,52,59,48]);
+    expect(offsets(5,false)).toEqual([75,56,63,52]);
+});
+test("native Windows ANSI player messages preserve CP1251 names and data offsets",()=>{
+    const config=EmulatorConfig.getInstance(),previous=config.ansiCodePage;config.ansiCodePage=1251;
+    try {
+        const entity={id:2,group:false,owner:"peer",flags:0,name:{short:"Игрок",long:"Игрок Тест"},data:[0x12,0x34,0x56,0x78],members:[],parent:0,groupOwner:0};
+        for(const [type,expected] of [[3,[69,52,58,48]],[5,[73,56,62,52]]] as const){
+            const b=packDirectPlayMessage({from:0,to:1,data:new Uint8Array(),system:{type,entity,currentPlayers:2}},0x2000,2,false),v=new DataView(b.buffer);
+            const offsets=[b.length,v.getUint32(type===3?32:36,true)-0x2000,v.getUint32(type===3?36:40,true)-0x2000,v.getUint32(type===3?16:20,true)-0x2000];
+            expect(offsets).toEqual(expected);
+            expect([...b.subarray(offsets[1],offsets[1]+6)]).toEqual([0xc8,0xe3,0xf0,0xee,0xea,0]);
+            expect([...b.subarray(offsets[2],offsets[2]+11)]).toEqual([0xc8,0xe3,0xf0,0xee,0xea,0x20,0xd2,0xe5,0xf1,0xf2,0]);
+            expect([...b.subarray(offsets[3],offsets[3]+4)]).toEqual([0x12,0x34,0x56,0x78]);
+        }
+    } finally {config.ansiCodePage=previous;}
+});
+test("native CreatePlayer installs its event before early player delivery",async()=>{
+ open();const state=[...(api as unknown as {states:Map<number,{session:DirectPlaySession}>}).states.values()][0];
+ Object.defineProperty(state.session,"isNative",{value:true,configurable:true});
+ state.session.mutate=((_change:unknown,publish:(id:number)=>void)=>{
+  state.session.entities.set(7,{id:7,group:false,owner:state.session.ownKey,flags:0,name:{short:"",long:""},data:[],members:[],parent:0,groupOwner:0});
+  publish(7);state.session.onMessage?.(7);return Promise.resolve({hr:DP.OK,id:7});
+ }) as typeof state.session.mutate;
+ u32(0x4000,0xfeed);const result=await call("CreatePlayer",[0x4000,0,0x123,0,0,0]) as ThunkResult;
+ expect(events).toEqual([0x123]);expect(read(0x4000)).toBe(0xfeed);
+ const resumed=result.resumeOnOwner!({esp:0x9000,returnAddr:0x7000,mem}) as ThunkResult;
+ expect(resumed.value).toBe(DP.OK);expect(resumed.deferredWrites).toEqual([{address:0x4000,value:7,size:4}]);
+});
+test("native CreatePlayer does not publish a deferred ID after COM reset",async()=>{
+ open();const state=[...(api as unknown as {states:Map<number,{session:DirectPlaySession}>}).states.values()][0];
+ Object.defineProperty(state.session,"isNative",{value:true,configurable:true});
+ let finish!:(reply:{hr:number;id:number})=>void;
+ state.session.mutate=()=>new Promise(resolve=>{finish=resolve;});
+ u32(0x4000,0xfeed);const pending=call("CreatePlayer",[0x4000,0,0,0,0,0]);
+ api.reset();finish({hr:DP.OK,id:7});const result=await pending as ThunkResult;
+ expect(result.value).toBe(DP.SESSIONLOST);expect(result.deferredWrites).toBeUndefined();expect(read(0x4000)).toBe(0xfeed);
+});
+test("native CreatePlayer rechecks its owner at deferred guest-write time",async()=>{
+ open();const state=[...(api as unknown as {states:Map<number,{session:DirectPlaySession}>}).states.values()][0];
+ Object.defineProperty(state.session,"isNative",{value:true,configurable:true});
+ state.session.mutate=()=>{state.session.entities.set(7,{id:7,group:false,owner:state.session.ownKey,flags:0,name:{short:"",long:""},data:[],members:[],parent:0,groupOwner:0});return Promise.resolve({hr:DP.OK,id:7});};
+ u32(0x4000,0xfeed);const result=await call("CreatePlayer",[0x4000,0,0,0,0,0]) as ThunkResult;
+ expect(result.resumeOnOwner).toBeDefined();api.reset();
+ expect(result.resumeOnOwner!({esp:0x9000,returnAddr:0x7000,mem})).toBe(DP.SESSIONLOST);expect(read(0x4000)).toBe(0xfeed);
+});
+test("native DestroyPlayer rechecks COM ownership after submission",async()=>{
+ open();const state=[...(api as unknown as {states:Map<number,{session:DirectPlaySession}>}).states.values()][0];
+ Object.defineProperty(state.session,"isNative",{value:true,configurable:true});
+ state.session.entities.set(7,{id:7,group:false,owner:state.session.ownKey,flags:0,name:{short:"",long:""},data:[],members:[],parent:0,groupOwner:0});
+ state.session.mutate=()=>{state.session.entities.delete(7);return Promise.resolve({hr:DP.OK});};
+ const result=await call("DestroyPlayer",[7]) as ThunkResult;
+ expect(result.resumeOnOwner!({esp:0x9000,returnAddr:0x7000,mem})).toBe(DP.OK);
+ api.reset();expect(result.resumeOnOwner!({esp:0x9000,returnAddr:0x7000,mem})).toBe(DP.SESSIONLOST);
+});
+test("native Send rechecks COM ownership after asynchronous submission",async()=>{
+ open();const state=[...(api as unknown as {states:Map<number,{session:DirectPlaySession}>}).states.values()][0];
+ Object.defineProperty(state.session,"isNative",{value:true,configurable:true});
+ state.session.send=()=>Promise.resolve(DP.OK);
+ const result=await call("Send",[7,8,1,0,0]) as ThunkResult;
+ expect(result.resumeOnOwner!({esp:0x9000,returnAddr:0x7000,mem})).toBe(DP.OK);
+ api.reset();expect(result.resumeOnOwner!({esp:0x9000,returnAddr:0x7000,mem})).toBe(DP.SESSIONLOST);
+});
+test("native CreatePlayer retires its session if the output pointer becomes invalid",async()=>{
+ open();const state=[...(api as unknown as {states:Map<number,{session:DirectPlaySession}>}).states.values()][0];
+ Object.defineProperty(state.session,"isNative",{value:true,configurable:true});
+ let finish!:(reply:{hr:number;id:number})=>void;state.session.mutate=()=>new Promise(resolve=>{finish=resolve;});
+ u32(0x4000,0xfeed);const pending=call("CreatePlayer",[0x4000,0,0,0,0,0]);
+ state.session.entities.set(7,{id:7,group:false,owner:state.session.ownKey,flags:0,name:{short:"",long:""},data:[],members:[],parent:0,groupOwner:0});
+ const validate=process.addressSpace!.validateRange.bind(process.addressSpace);
+ process.addressSpace!.validateRange=((address:number,size:number,perms:any)=>address===0x4000?false:validate(address,size,perms)) as typeof process.addressSpace.validateRange;
+ finish({hr:DP.OK,id:7});const result=await pending as ThunkResult;
+ expect(result.value).toBe(0x80004003);expect(result.deferredWrites).toBeUndefined();expect(read(0x4000)).toBe(0xfeed);expect(state.session.desc).toBeNull();
 });
 test("remote CreatePlayer returns deferred writes and cannot touch another active process memory", async () => {
     initialize();
@@ -508,6 +593,46 @@ test("enumeration callback false stops and releases frame storage, player filter
     expect(a).not.toBe(b);
 });
 
+test("remote session enumeration keeps player properties available only during callbacks", async () => {
+    initialize();
+    const client = ((api as any).state(primary).session) as DirectPlaySession;
+    const hostNet = new LanNetwork(new Uint8Array([2, 0, 0, 0, 0, 2])), clientNet = client.network;
+    const route = (source: LanNetwork, target: LanNetwork) => ({
+        send: (frame: Uint8Array) => {
+            const p = decodeDatagram(frame)!;
+            if (isBroadcastNode(p.node) || target.isSelf(p.node))
+                queueMicrotask(() => target.receiveFrame(encodeDatagram(p.proto, source.node, p.dstPort, p.srcPort, p.payload)));
+            return true;
+        }, close() {},
+    });
+    clientNet.attach(route(clientNet, hostNet)); hostNet.attach(route(hostNet, clientNet));
+    const host = new DirectPlaySession(hostNet);
+    try {
+        host.initialize();
+        expect(host.create({ instance: "0".repeat(32), application: "1".repeat(32), flags: 0,
+            maxPlayers: 8, name: "room", password: "", user: [0, 0, 0, 0] })).toBe(DP.OK);
+        const player = await host.mutate({ op: "mutate", action: "create", group: false, parent: 0,
+            flags: 0, name: { short: "host", long: "" }, data: [] });
+        expect(player.hr).toBe(DP.OK);
+        client.discover(host.desc!.application); await Bun.sleep(1);
+        bytes(0x2100, host.desc!.instance);
+        const result = await call("EnumPlayers", [0x2100, 0x7000, 0, 0x80]) as ThunkResult;
+        expect(result.value).toBe(DP.OK);
+        expect(result.startCallbackChain?.({ esp: 0x9000 } as never)).toBe(true);
+        expect(callbacks[0].args[0]).toBe(player.id);
+        u32(0x5000, 40);
+        expect(call("GetPlayerCaps", [player.id, 0x5000, 0])).toBe(DP.OK);
+        expect(call("GetPlayerFlags", [player.id, 0x5100])).toBe(DP.OK);
+        expect(callbacks[0].done?.(0)).toBe(DP.OK);
+        expect(call("GetPlayerCaps", [player.id, 0x5000, 0])).toBe(DP.INVALIDPLAYER);
+        expect(client.desc).toBeNull();
+        // Windows joins using only guidInstance, with guidApplication left zero.
+        mem.fill(0, 0x3000, 0x3050); u32(0x3000, 80); bytes(0x3008, host.desc!.instance);
+        expect(await call("Open", [0x3000, 1])).toBe(DP.OK);
+        expect(client.desc?.application).toBe(host.desc!.application);
+    } finally { host.dispose(); }
+});
+
 function wide(ptr: number, text: string): void {
     const view = new DataView(mem.buffer);
     for (let i = 0; i <= text.length; i++) view.setUint16(ptr + i * 2, text.charCodeAt(i) || 0, true);
@@ -565,6 +690,12 @@ test("SendEx asynchronous completion, priority, cancellation and native completi
     expect(call("CancelMessage", [0xdead, 0])).toBe(DP.UNKNOWNMESSAGE);
     expect(call("CancelPriority", [10, 1, 0])).toBe(DP.INVALIDPARAMS);
     expect(call("SendEx", [a, b, 0x200, 0x5000, 1, 0x10000, 0, 0, 0x4300])).toBe(DP.INVALIDPRIORITY);
+    drain();
+    // Re-Volt uses ASYNC | NOSENDCOMPLETEMSG and does not request a message ID.
+    expect(call("SendEx", [a, b, 0x600, 0x5000, 1, 0, 2000, 0, 0])).toBe(DP.PENDING);
+    await Bun.sleep(5);
+    u32(0x4108, b); expect(receive(0x10000, 4096, 2)).toBe(DP.OK); expect(mem[0x10000]).toBe(1);
+    expect(receive()).toBe(DP.NOMESSAGES);
 });
 test("native service-provider-specific rejections and implemented spectator/server/group filters", async () => {
     expect(call("SaveSession", [0], "IDirectPlay")).toBe(DP.UNSUPPORTED);

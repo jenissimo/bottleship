@@ -28,7 +28,7 @@ pub(crate) struct TcpKey {
     pub remote_port: u16,
     pub client_id: u32,
 }
-pub(crate) type Connecting = Arc<Mutex<HashMap<TcpKey, NativeTcp>>>;
+pub(crate) type Connecting = Arc<Mutex<HashMap<TcpKey, (u32, NativeTcp, Arc<Mutex<bool>>)>>>;
 pub(crate) struct Delivery {
     pub event: GatewayEvent,
     pub guard: Option<Box<dyn Send>>,
@@ -157,7 +157,7 @@ impl TcpPool {
             }
         };
         let forward = self.forward(key, accepted.native_id, &handle, native);
-        self.connecting.lock().unwrap_or_else(|e| e.into_inner()).insert(key, handle.clone());
+        self.connecting.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (accepted.native_id, handle.clone(), Arc::new(Mutex::new(true))));
         self.flows.insert(key, Flow {
             key, handle, server_id: accepted.native_id, remote_credit: accepted.guest_credit, write_credit: TCP_WINDOW,
             pending: VecDeque::new(), sent_fin: false, received_fin: false, remote_eof: false,
@@ -250,7 +250,13 @@ impl TcpPool {
             drop(flow);
         }
     }
+    fn invalidate_owner(&self, key: &TcpKey) {
+        if let Some((_,_,live))=self.connecting.lock().unwrap_or_else(|e|e.into_inner()).get(key) {
+            *live.lock().unwrap_or_else(|e|e.into_inner())=false;
+        }
+    }
     async fn abort_flow(&mut self, key: &TcpKey, code: u32) -> Vec<Delivery> {
+        self.invalidate_owner(key);
         let packet = self
             .flows
             .get(key)
@@ -332,7 +338,7 @@ impl TcpPool {
             self.connecting
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(key, handle.clone());
+                .insert(key, (server_id, handle.clone(), Arc::new(Mutex::new(true))));
             self.flows.insert(
                 key,
                 Flow {
@@ -371,6 +377,7 @@ impl TcpPool {
             return Ok(vec![]);
         };
         if p.kind == 5 && (p.dst_id == 0 || p.dst_id == flow.server_id) {
+            self.invalidate_owner(&key);
             self.remove(&key).await;
             return Ok(vec![]);
         }
@@ -454,6 +461,10 @@ impl TcpPool {
             _ => {}
         }
         Ok(vec![])
+    }
+    pub(crate) fn read_owner(&self, key: TcpKey, server_id: u32) -> Option<Arc<Mutex<bool>>> {
+        self.connecting.lock().unwrap_or_else(|e|e.into_inner()).get(&key)
+            .filter(|(id,_,_)|*id==server_id).map(|(_,_,live)|live.clone())
     }
     pub fn read(&mut self, key: TcpKey, server_id: u32, read: TcpRead) -> Vec<Delivery> {
         if !self.owns_event(key, server_id) { return vec![]; }
@@ -611,6 +622,7 @@ impl TcpPool {
             .copied()
             .collect();
         for key in keys {
+            self.invalidate_owner(&key);
             let flow = self.flows.get_mut(&key).unwrap();
             if flow.received_fin {
                 flow.released = true;
@@ -624,7 +636,7 @@ impl TcpPool {
         }
     }
     pub(crate) async fn close_child(&mut self, key: TcpKey, server_id: u32) {
-        if self.owns_event(key, server_id) { self.remove(&key).await; }
+        if self.owns_event(key, server_id) { self.invalidate_owner(&key); self.remove(&key).await; }
     }
     pub(crate) fn owns_event(&self, key: TcpKey, server_id: u32) -> bool {
         self.flows.get(&key).is_some_and(|flow| flow.server_id == server_id)

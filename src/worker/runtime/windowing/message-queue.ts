@@ -19,6 +19,9 @@ export interface Message {
     keyStatePacked?: Uint8Array;
     /** dwExtraInfo of the input that produced it; GetMessageExtraInfo reads it back. */
     extraInfo?: number;
+    /** Internal provenance: only a generated timer message restarts a USER timer. */
+    generatedTimer?: boolean;
+    timerEpoch?: number;
 }
 
 const WM_MOUSEMOVE = 0x0200;
@@ -38,6 +41,7 @@ type PendingMessage = {
     targetThreadId: number;
     keyStatePacked?: Uint8Array;
     extraInfo?: number;
+    timerEpoch?: number;
 };
 
 (globalThis as Record<string, any>).h3QueueSetMouseMoveCoalescing = (enabled: boolean): boolean => {
@@ -366,7 +370,17 @@ export class MessageQueue {
     private paintPending: Map<number, PendingMessage> = new Map(); // hwnd -> pending paint
     // USER synthesizes at most one pending WM_TIMER per (thread, window, id).
     // Keeping ticks as ordinary posts can permanently starve a modal loop's idle path.
-    private timerPending: Map<string, { hwnd: number; pending: PendingMessage }> = new Map();
+    private timerPending: Map<string, { hwnd: number; pending: PendingMessage; materialized: boolean }> = new Map();
+    private nextTimerMessage = 1;
+
+    /** A due timer is generated lazily; a WM_TIMER already returned by PM_NOREMOVE survives cancellation. */
+    cancelTimer(hwnd: number, id: number): void {
+        for (const [key, entry] of this.timerPending) {
+            if (entry.hwnd === (hwnd >>> 0) && (entry.pending.wParam >>> 0) === (id >>> 0) && !entry.materialized) {
+                this.timerPending.delete(key);
+            }
+        }
+    }
 
     // Mouse coalescing - only keep latest per hwnd
     private lastMouseMove: Map<number, PendingMessage> = new Map();
@@ -471,7 +485,9 @@ export class MessageQueue {
         ptY = 0,
         targetThreadId = 0,
         keyStatePacked?: Uint8Array,
-        extraInfo = 0
+        extraInfo = 0,
+        synthesizedTimer = true,
+        timerEpoch = 0
     ): boolean {
         const time = TimeService.getInstance().nowMs() | 0;
 
@@ -508,9 +524,13 @@ export class MessageQueue {
             // spins in guest code forever while paint sits in paintPending (HL launcher).
             this.drainWaiters();
             return true;
-        } else if (msg === WM_TIMER) {
-            const key = `${targetThreadId >>> 0}:${hwnd >>> 0}:${wParam >>> 0}`;
+        } else if (msg === WM_TIMER && synthesizedTimer) {
+            const existing = [...this.timerPending].find(([, entry]) => !entry.materialized &&
+                entry.hwnd === (hwnd >>> 0) && (entry.pending.wParam >>> 0) === (wParam >>> 0) &&
+                (entry.pending.targetThreadId >>> 0) === (targetThreadId >>> 0));
+            const key = existing?.[0] ?? String(this.nextTimerMessage++);
             this.timerPending.set(key, {
+                materialized: false,
                 hwnd: hwnd >>> 0,
                 pending: {
                     wParam,
@@ -521,6 +541,7 @@ export class MessageQueue {
                     targetThreadId,
                     keyStatePacked: keyStatePacked ? keyStatePacked.slice(0, KEY_STATE_BYTES) : undefined,
                     extraInfo,
+                    timerEpoch,
                 },
             });
             this.drainWaiters();
@@ -631,6 +652,8 @@ export class MessageQueue {
                 const msg: Message = {
                     hwnd: entry.hwnd,
                     message: WM_TIMER,
+                    generatedTimer: true,
+                    timerEpoch: pending.timerEpoch,
                     wParam: pending.wParam,
                     lParam: pending.lParam,
                     time: pending.time,
@@ -696,9 +719,12 @@ export class MessageQueue {
                     && pending.targetThreadId !== callerThreadId) {
                     continue;
                 }
+                entry.materialized = true;
                 return {
                     hwnd: entry.hwnd,
                     message: WM_TIMER,
+                    generatedTimer: true,
+                    timerEpoch: pending.timerEpoch,
                     wParam: pending.wParam,
                     lParam: pending.lParam,
                     time: pending.time,

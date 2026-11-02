@@ -1,5 +1,10 @@
 import { LanNetwork, type LanDatagram, type LanEndpoint } from "../../net/lan-network";
 import { PROTO_DIRECTPLAY } from "../../net/netplay-wire";
+import type { WsaSocketTable } from "../wsa-network";
+import { createDirectPlay4NativeJoinPlan, type DirectPlay4NativeJoinPlan } from "./native-wire/join-plan";
+import type { DirectPlay4OwnedNameTable } from "./native-wire/join-name-table-owner";
+import type { DirectPlay4NativeSession } from "./native-wire/native-session";
+import { projectDirectPlay4RemotePlayers, directPlay4GuestEntity } from "./native-wire/roster-projection";
 
 export const DP = {
     OK: 0, INVALIDPARAMS: 0x80070057, OUTOFMEMORY: 0x8007000e, UNSUPPORTED: 0x80004001,
@@ -143,6 +148,11 @@ export class DirectPlaySession implements LanEndpoint {
     private discoveryTimer?: ReturnType<typeof setInterval>;
     private nativeDiscovery?: AbortController;
     private nativeCacheEpoch: object = {};
+    private nativeCacheOwners = new Map<Discovery, AbortController>();
+    private nativeJoinReservation?: { desc: SessionDesc | null; plan?: DirectPlay4NativeJoinPlan };
+    private nativeMode = false;
+    private nativeBackend?: DirectPlay4NativeSession;
+    get isNative(): boolean { return this.nativeMode; }
     private lastHostSeen = 0;
     private stopState: () => void;
     private stopPeer: () => void;
@@ -216,7 +226,10 @@ export class DirectPlaySession implements LanEndpoint {
     }
     discover(application: string, data: Uint8Array = EMPTY): number {
         if (this.readyError) return this.readyError;
-        for (const [id, item] of this.discovered) if (Date.now() - item.seen > 30000) this.discovered.delete(id);
+        for (const [id, item] of this.discovered) if (Date.now() - item.seen > 30000) {
+            this.discovered.delete(id);
+            this.retireNativeCacheOwner(item);
+        }
         return this.transmit({ op: "discover", application }, data, { node: Array.from(BROADCAST), port: DISCOVERY_PORT })
             ? DP.OK : DP.UNAVAILABLE;
     }
@@ -226,9 +239,88 @@ export class DirectPlaySession implements LanEndpoint {
         (this.discoveryTimer as unknown as { unref?: () => void }).unref?.();
     }
     // Cache invalidation is a local safety policy for future native Join.
+    private retireNativeCacheOwner(item: Discovery): void {
+        const owner = this.nativeCacheOwners.get(item);
+        this.nativeCacheOwners.delete(item);
+        owner?.abort();
+    }
+    /** Replace a discovery entry before notifying its former native owner. */
+    cacheDiscovery(item: Discovery): void {
+        const previous = this.discovered.get(item.desc.instance);
+        this.discovered.set(item.desc.instance, item);
+        if (previous && previous !== item) this.retireNativeCacheOwner(previous);
+    }
+    private retireNativeJoinOwners(): void {
+        // Detach before callbacks: a reentrant new discovery owns a new map.
+        const owners = this.nativeCacheOwners;
+        this.nativeCacheOwners = new Map();
+        for (const owner of owners.values()) owner.abort();
+    }
     private invalidateNativeDiscovery(): void {
         this.nativeCacheEpoch = {};
         for (const [id, item] of this.discovered) if (item.native) this.discovered.delete(id);
+        this.retireNativeJoinOwners();
+    }
+    /** The exact cached entry owns this signal until replacement or invalidation. */
+    nativeDiscoverySignal(item: Discovery): AbortSignal | undefined {
+        if (!this.isCurrentNativeDiscovery(item)) return undefined;
+        let owner = this.nativeCacheOwners.get(item);
+        if (!owner) { owner = new AbortController(); this.nativeCacheOwners.set(item, owner); }
+        return owner.signal;
+    }
+    /** Reserve a checked native Join owner; no COM session is published here. */
+    prepareNativeJoin(table: WsaSocketTable, item: Discovery): DirectPlay4NativeJoinPlan {
+        if (this.version !== 4 || this.readyError || this.desc || this.nativeJoinReservation || !this.isCurrentNativeDiscovery(item))
+            throw new Error("native join session unavailable");
+        // Reserve before calling any policy code, including reentrant callbacks.
+        const reservation: { desc: SessionDesc | null; plan?: DirectPlay4NativeJoinPlan } = { desc: null };
+        this.nativeJoinReservation = reservation;
+        const release = () => { if (this.nativeJoinReservation === reservation) this.nativeJoinReservation = undefined; };
+        try {
+            const signal = this.nativeDiscoverySignal(item);
+            if (!signal) throw new Error("native discovery owner retired");
+            const plan = createDirectPlay4NativeJoinPlan(this.network, table, item,
+                () => this.nativeJoinReservation === reservation && this.desc === reservation.desc && !this.readyError && this.isCurrentNativeDiscovery(item), signal);
+            reservation.plan = plan;
+            // Abort listeners release the actual native sockets synchronously.
+            // Defer readmission until all listeners have finished running.
+            plan.signal.addEventListener("abort", () => queueMicrotask(release), {once:true});
+            if (plan.signal.aborted) { release(); throw new Error("native join owner retired"); }
+            return plan;
+        } catch (error) { release(); throw error; }
+    }
+    /** Publish only a fully staged native snapshot; COM Open is not enabled here. */
+    commitNativeJoin(plan: DirectPlay4NativeJoinPlan, item: Discovery, snapshot: DirectPlay4OwnedNameTable, backend: DirectPlay4NativeSession): void {
+        const reservation = this.nativeJoinReservation;
+        if (!reservation || reservation.plan !== plan || reservation.desc || this.desc || this.entities.size || this.queue.length ||
+            !this.isCurrentNativeDiscovery(item) || !plan.current() || !backend || backend.nameTable() !== snapshot) throw new Error("native join owner unavailable");
+        const wire = snapshot?.sessionDescription;
+        if (!Array.isArray(wire) || wire.length !== 80 || !wire.every(x => Number.isInteger(x) && x >= 0 && x <= 255))
+            throw new Error("native session description unavailable");
+        const bytes = Uint8Array.from(wire), view = new DataView(bytes.buffer), discovery = plan.discovery;
+        const same = (offset: number, value: Uint8Array) => value.every((byte, index) => bytes[offset + index] === byte);
+        if (snapshot.version !== discovery.version || view.getUint32(0, true) !== 80 ||
+            view.getUint32(4, true) !== discovery.flags || !same(8, discovery.instanceGuid) ||
+            !same(24, discovery.applicationGuid) || view.getUint32(56, true) !== discovery.reserved1)
+            throw new Error("native session identity mismatch");
+        const projected = projectDirectPlay4RemotePlayers(snapshot).map(directPlay4GuestEntity);
+        let total = 0;
+        if (projected.length > 128) throw new Error("native roster too large");
+        for (const entity of projected) { total += entity.data.length + 2 * (entity.name.short.length + entity.name.long.length); }
+        if (total > MAX_STATE) throw new Error("native roster too large");
+        const description = clone(item.desc);
+        const abort = () => { if (this.nativeJoinReservation === reservation && this.desc === description) this.lose(); };
+        plan.signal.addEventListener("abort", abort, { once: true });
+        let stillCurrent = false;
+        try { stillCurrent = this.isCurrentNativeDiscovery(item) && plan.current() && backend.nameTable() === snapshot &&
+            !plan.signal.aborted && !this.desc && !this.entities.size && !this.queue.length; } catch {}
+        if (!stillCurrent) {
+            plan.signal.removeEventListener("abort", abort); throw new Error("native join owner retired");
+        }
+        // No callback or await occurs between promoting the owner and publishing.
+        reservation.desc = description;
+        this.desc = description; this.nativeMode = true; this.nativeBackend = backend; this.hostMode = false; this.host = null;
+        for (const entity of projected) this.entities.set(entity.id, entity);
     }
     /** A finished discovery retains its cache epoch; replacement and close invalidate it. */
     isCurrentNativeDiscovery(item: Discovery): boolean {
@@ -275,13 +367,14 @@ export class DirectPlaySession implements LanEndpoint {
         // Migration and security need protocols beyond the host-authoritative provider.
         if (desc.flags & 0x100) return DP.UNSUPPORTED;
         if ((desc.flags & 4) && (desc.flags & 0x1800)) return DP.INVALIDFLAGS;
-        ++this.lifecycle;
+        const lifecycle = ++this.lifecycle;
         this.desc = clone({ ...desc, instance: newGuid() });
         this.hostMode = true;
         this.host = { node: Array.from(this.network.node), port: this.port };
         this.lost = false;
         this.startHeartbeat();
-        return DP.OK;
+        this.retireNativeJoinOwners();
+        return !this.disposed && this.lifecycle === lifecycle ? DP.OK : DP.SESSIONLOST;
     }
     async join(desc: SessionDesc, player?: JoinPlayer, connectData: Uint8Array = EMPTY): Promise<number> {
         if (this.disposed) return DP.UNAVAILABLE;
@@ -302,6 +395,8 @@ export class DirectPlaySession implements LanEndpoint {
         if (!found) return DP.NOSESSIONS;
         this.host = found.address;
         this.desc = clone(desc);
+        this.retireNativeJoinOwners();
+        if (!current()) return DP.SESSIONLOST;
         const reply = await this.request({ op: "join", password: desc.password, application: desc.application, ...(player ? { player } : {}) }, connectData);
         if (!current()) return DP.SESSIONLOST;
         this.joinReply = reply;
@@ -340,7 +435,7 @@ export class DirectPlaySession implements LanEndpoint {
         for (const p of this.pending.values()) { clearTimeout(p.timer); p.resolve({ hr: DP.SESSIONLOST }); }
         this.pending.clear(); this.pendingJoins.clear(); this.partials.clear(); this.peers.clear(); this.entities.clear();
         this.joinReply = null;
-        this.desc = null; this.host = null; this.hostMode = false; this.nextId = 1;
+        this.desc = null; this.host = null; this.hostMode = false; this.nativeMode = false; this.nativeBackend = undefined; this.nextId = 1;
     }
     private lose(): void {
         if (!this.desc || this.losing) return;
@@ -452,6 +547,7 @@ export class DirectPlaySession implements LanEndpoint {
         } catch { return null; }
     }
     deliver(dg: LanDatagram): void {
+        if (this.nativeMode) return;
         const decoded = this.decode(dg);
         if (!decoded) return;
         const { packet: p, data } = decoded;
@@ -461,7 +557,7 @@ export class DirectPlaySession implements LanEndpoint {
             if (!descValid(p.desc) || !uint(p.currentPlayers) || p.currentPlayers > (this.version === 8 ? 65535 : 64)) return;
             if (this.discovered.size >= 256 && !this.discovered.has(p.desc.instance)) return;
             const item: Discovery = { desc: p.desc, currentPlayers: p.currentPlayers, address: source, seen: Date.now(), data: data.slice() };
-            this.discovered.set(p.desc.instance, item); this.onDiscovery?.(item);
+            this.cacheDiscovery(item); this.onDiscovery?.(item);
             return;
         }
         if (!this.desc || p.session !== this.desc.instance) return;
@@ -634,6 +730,44 @@ export class DirectPlaySession implements LanEndpoint {
         if (this.queue.length >= 4096 || this.queuedBytes + 256 > 4 * 1024 * 1024) return false;
         this.enqueue({ from: 0, to: player, data: EMPTY, system }); return true;
     }
+    /** Commit one authorized native roster change and all its notifications. */
+    enqueueNativeRosterChange(players: readonly number[], system: SystemMessage, mayNotify: () => boolean): boolean {
+        const remote = system.entity;
+        if (this.version !== 4 || this.openError || !remote || remote.group ||
+            !remote.owner.startsWith("native:") || (system.type !== 3 && system.type !== 5) ||
+            new Set(players).size !== players.length || players.length > 128 ||
+            players.some(id => { const target = this.entities.get(id); return id === remote.id || !target || target.group || target.owner !== this.ownKey; })) return false;
+        const previous = this.entities.get(remote.id);
+        if (system.type === 3 ? !!previous || this.entities.size >= 128 :
+            !previous || JSON.stringify(previous) !== JSON.stringify(remote)) return false;
+        if (system.type === 3) {
+            let bytes = remote.data.length + 2 * (remote.name.short.length + remote.name.long.length);
+            for (const entity of this.entities.values()) bytes += entity.data.length + 2 * (entity.name.short.length + entity.name.long.length);
+            if (bytes > MAX_STATE) return false;
+        }
+        if (this.queue.length + players.length > 4096 || this.queuedBytes + 256 * players.length > 4 * 1024 * 1024) return false;
+        const published = system.type === 3 ? clone(remote) : undefined;
+        const messages = players.map(player => ({ from: 0, to: player, data: EMPTY, system: clone(system) }));
+        if (published) this.entities.set(remote.id, published); else this.entities.delete(remote.id);
+        // The roster and every notification become visible before callbacks.
+        this.queue.push(...messages);
+        this.queuedBytes += 256 * messages.length;
+        for (const player of players) {
+            if (!mayNotify()) throw new Error("native roster notification owner retired");
+            this.onMessage?.(player);
+        }
+        return true;
+    }
+    /** Queue an already transport-authorized native DP4 player message. */
+    enqueueNativePlayer(from: number, to: number, data: Uint8Array): boolean {
+        if (this.version !== 4 || this.openError || !uint(from) || !uint(to) || from === to ||
+            !(data instanceof Uint8Array) || data.length > DPLAY_MAX_MESSAGE) return false;
+        const source = this.entities.get(from), target = this.entities.get(to);
+        if (!source || source.group || source.owner === this.ownKey ||
+            !target || target.group || target.owner !== this.ownKey) return false;
+        if (this.queue.length >= 4096 || this.queuedBytes + data.length > 4 * 1024 * 1024) return false;
+        this.enqueue({from, to, data: data.slice()}); return true;
+    }
     removeMessage(index: number): void {
         const [m] = this.queue.splice(index, 1);
         if (m) this.queuedBytes -= m.data.length + (m.system ? 256 : 0);
@@ -660,10 +794,57 @@ export class DirectPlaySession implements LanEndpoint {
         if (!this.transmit({ op: "lost", session: this.desc!.instance }, data, peer.address)) return DP.CONNECTIONLOST;
         this.removePeer(entity.owner); return this.openError || DP.OK;
     }
-    mutate(change: Packet): Promise<Reply> | Reply {
+    mutate(change: Packet, onNativePublished?: (id: number) => void): Promise<Reply> | Reply {
         if (this.openError) return { hr: this.openError };
+        if (this.nativeMode) {
+            if (change.action === "destroy" && change.group === false && uint(change.id)) return this.destroyNativePlayer(change.id);
+            if (change.action !== "create" || change.group !== false || change.flags !== 0 || change.parent !== 0 ||
+                !nameValid(change.name) || !bytesValid(change.data)) return { hr: DP.UNAVAILABLE };
+            return this.createNativePlayer(change.name, change.data, onNativePublished);
+        }
         if (this.hostMode) return this.execute({ ...change, op: "mutate" }, this.ownKey);
         return this.request({ ...change, op: "mutate" });
+    }
+    private async createNativePlayer(name: PlayerName, data: number[], onPublished?: (id: number) => void): Promise<Reply> {
+        const backend = this.nativeBackend, reservation = this.nativeJoinReservation, description = this.desc;
+        if (!backend || !reservation?.plan || !description || this.openError ||
+            [...this.entities.values()].some(entity => !entity.group && entity.owner === this.ownKey)) return { hr: DP.UNAVAILABLE };
+        const savedName = clone(name), savedData = [...data], plan = reservation.plan;
+        let published: Entity | undefined;
+        const current = () => this.nativeMode && this.nativeBackend === backend && this.nativeJoinReservation === reservation &&
+            this.desc === description && !this.openError && plan.current();
+        try {
+            if (!current()) return { hr: DP.SESSIONLOST };
+            const result = await backend.createPlayer({ shortName: savedName.shortNull ? null : savedName.short,
+                longName: savedName.longNull ? null : savedName.long, data: Uint8Array.from(savedData) }, submitted => {
+                if (!current() || !uint(submitted.playerId) || !submitted.playerId || submitted.playerId >= 0xfffffff0 ||
+                    this.entities.has(submitted.playerId) || this.entities.size >= 128) throw new Error("native player owner retired");
+                published = { id: submitted.playerId, group: false, owner: this.ownKey, flags: 0,
+                    name: savedName, data: savedData, members: [], parent: 0, groupOwner: 0 };
+                this.entities.set(submitted.playerId, published);
+                onPublished?.(submitted.playerId);
+                if (!current() || this.entities.get(submitted.playerId) !== published) throw new Error("native player owner retired");
+            });
+            if (!current() || !published || this.entities.get(result.playerId) !== published) return { hr: DP.SESSIONLOST };
+            return { hr: DP.OK, id: result.playerId };
+        } catch { return { hr: current() ? DP.UNAVAILABLE : DP.SESSIONLOST }; }
+    }
+    private async destroyNativePlayer(id: number): Promise<Reply> {
+        const backend = this.nativeBackend, reservation = this.nativeJoinReservation, description = this.desc;
+        const player = this.entities.get(id);
+        if (!player || player.group || player.owner !== this.ownKey) return { hr: DP.INVALIDPLAYER };
+        if (!backend || !reservation?.plan || !description) return { hr: DP.UNAVAILABLE };
+        const plan = reservation.plan;
+        const current = () => this.nativeMode && this.nativeBackend === backend && this.nativeJoinReservation === reservation &&
+            this.desc === description && !this.openError && plan.current() && this.entities.get(id) === player;
+        try {
+            if (!current()) return { hr: DP.SESSIONLOST };
+            await backend.destroyPlayer(id);
+            if (!current()) return { hr: DP.SESSIONLOST };
+            this.entities.delete(id);
+            for (let i = this.queue.length - 1; i >= 0; i--) if (this.queue[i].to === id) this.removeMessage(i);
+            return { hr: DP.OK };
+        } catch { return { hr: current() ? DP.UNAVAILABLE : DP.SESSIONLOST }; }
     }
     private execute(p: Packet, owner: string, beforePublish?: (id: number) => void): Reply {
         if (!this.desc) return { hr: DP.NOSESSIONS };
@@ -745,6 +926,7 @@ export class DirectPlaySession implements LanEndpoint {
     }
     send(from: number, to: number, flags: number, data: Uint8Array): Promise<number> | number {
         if (this.openError) return this.openError;
+        if (this.nativeMode) return this.sendNative(from, to, flags, data);
         const source = this.entities.get(from);
         if (!source || source.group || source.owner !== this.ownKey) return DP.INVALIDPLAYER;
         if (flags & ~(this.version === 8 ? 0x1001f : 0x1f)) return DP.INVALIDFLAGS;
@@ -753,6 +935,24 @@ export class DirectPlaySession implements LanEndpoint {
         if (this.hostMode) return this.route(from, to, flags, data, this.ownKey);
         if (flags & 1) return this.request({ op: "send", from, to, flags }, data).then(reply => reply.hr);
         return this.transmit({ op: "send", session: this.desc!.instance, from, to, flags }, data, this.host!) ? DP.OK : DP.CONNECTIONLOST;
+    }
+    private sendNative(from: number, to: number, flags: number, data: Uint8Array): number | Promise<number> {
+        const backend = this.nativeBackend, reservation = this.nativeJoinReservation, description = this.desc;
+        const source = this.entities.get(from), target = this.entities.get(to);
+        if (!source || source.group || source.owner !== this.ownKey) return DP.INVALIDPLAYER;
+        // Only the measured guaranteed unicast path is implemented. The backend
+        // independently authorizes the destination against the live host roster.
+        if (flags !== 1 || !to || !target || target.group || target.owner === this.ownKey || data.length > 60000 ||
+            !backend || !reservation?.plan || !description) return DP.UNAVAILABLE;
+        const plan = reservation.plan, payload = data.slice();
+        const current = () => this.nativeMode && this.nativeBackend === backend && this.nativeJoinReservation === reservation &&
+            this.desc === description && !this.openError && plan.current() &&
+            this.entities.get(from) === source && this.entities.get(to) === target;
+        if (!current()) return DP.SESSIONLOST;
+        return backend.sendToHost(from, to, payload).then(
+            () => current() ? DP.OK : DP.SESSIONLOST,
+            () => current() ? DP.UNAVAILABLE : DP.SESSIONLOST,
+        );
     }
     sendChat(from: number, to: number, flags: number, text: string): number | Promise<number> {
         if (this.openError) return this.openError;

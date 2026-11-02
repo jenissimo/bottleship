@@ -1,3 +1,5 @@
+import type {WsaAddress} from "../../wsa-network";
+
 /**
  * Isolated pending/reply arbitration slice for future DP4 Join.
  * NT5 dplay/api.c:958-1073, handler.c:3876-3904,4193-4218,
@@ -6,7 +8,7 @@
  * Queue limits and fail-closed handling are local safety policy.
  */
 export type DirectPlay4PendingHeader = Uint8Array | "local" | null;
-export interface DirectPlay4PendingMessage { kind:"system"|"player"; bytes:Uint8Array; header:DirectPlay4PendingHeader; sendFlags:number; }
+export interface DirectPlay4PendingMessage { kind:"system"|"player"; bytes:Uint8Array; header:DirectPlay4PendingHeader; sendFlags:number; peer?:WsaAddress; }
 export type DirectPlay4PendingResult =
     | {kind:"reply"; message:DirectPlay4PendingMessage; command:number}
     | {kind:"queued"} | {kind:"not-handled"} | {kind:"unsupported"};
@@ -47,18 +49,24 @@ export class DirectPlay4JoinPending {
             throw new Error("cannot register expected reply");
         this.expected=command;
     }
-    receive(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number):DirectPlay4PendingResult {
-        return this.receiveTyped(bytes,header,sendFlags,false);
+    receive(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number,peer?:WsaAddress):DirectPlay4PendingResult {
+        return this.receiveTyped(bytes,header,sendFlags,false,peer);
     }
     /** Already-classified player data: an ID equal to MSG_HDR must not be
      * reinterpreted as a system command (e.g. a decoded PLAYERWRAPPER). */
-    receivePlayer(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number):DirectPlay4PendingResult {
-        return this.receiveTyped(bytes,header,sendFlags,true);
+    receivePlayer(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number,peer?:WsaAddress):DirectPlay4PendingResult {
+        return this.receiveTyped(bytes,header,sendFlags,true,peer);
     }
-    private receiveTyped(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number,player:boolean):DirectPlay4PendingResult {
+    private receiveTyped(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number,player:boolean,peer?:WsaAddress):DirectPlay4PendingResult {
         if(!this.current())throw new Error("pending Join owner retired");
         if(!(bytes instanceof Uint8Array)||!(header===null||header==="local"||header instanceof Uint8Array)||!uint(sendFlags))
             throw new TypeError("invalid pending message");
+        // The native channel already authorizes the transport peer. Keep its
+        // exact IPv4 provenance for deferred authorization during replay.
+        if(peer!==undefined && (!peer||peer.family!==2||!Number.isInteger(peer.port)||peer.port<1||peer.port>65535||
+            !(peer.node instanceof Uint8Array)||peer.node.length!==6||peer.node[0]!==2||peer.node[1]!==1||
+            !(peer.ip instanceof Uint8Array)||peer.ip.length!==4||peer.ip6!==undefined||
+            !peer.ip.every((x,i)=>x===peer.node[i+2])))throw new TypeError("invalid pending peer");
         let command:number|null=null;
         if(player && bytes.length<8)throw new RangeError("truncated player message");
         if(!player && bytes.length>=4) {
@@ -69,7 +77,7 @@ export class DirectPlay4JoinPending {
             }
         }
         if(command!==null && unsupported.has(command))return {kind:"unsupported"};
-        const size=bytes.length+(header instanceof Uint8Array?header.length:0);
+        const size=bytes.length+(header instanceof Uint8Array?header.length:0)+(peer?peer.node.length+peer.ip!.length:0);
         // Replies are copied too and are restricted by the same single-message budget.
         if(size>this.maxBytes){this.cancel();throw new RangeError("pending message exceeds budget");}
         const message=():DirectPlay4PendingMessage=>({
@@ -77,6 +85,7 @@ export class DirectPlay4JoinPending {
             bytes:Uint8Array.from(bytes),
             header:header instanceof Uint8Array?Uint8Array.from(header):header,
             sendFlags,
+            ...(peer?{peer:{family:peer.family,port:peer.port,node:Uint8Array.from(peer.node),ip:Uint8Array.from(peer.ip!)}}:{}),
         });
         if(command!==null && replies.has(command)) {
             const expected=this.expected;

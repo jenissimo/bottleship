@@ -112,6 +112,14 @@ function ordinary(r: Reader, group: boolean): DirectPlay4PackedEntry {
     return {flags,id,fixedSize:fixed,versionOrSystemId:sys,version,shortName,longName,spData,playerData,
         parentId:parent,memberIds,ordinaryBytes:copy(r.bytes.subarray(start,start+size))};
 }
+/** Decode exactly one ordinary PackPlayer record, with owned fields. */
+export function decodeDirectPlay4PackedPlayer(input:Uint8Array,maxBytes:number):DirectPlay4PackedEntry {
+    if(!(input instanceof Uint8Array)||!Number.isInteger(maxBytes)||maxBytes<48||maxBytes>0xfffff||
+        input.length<48||input.length>maxBytes)throw new RangeError("invalid packed player extent");
+    const reader=new Reader(input),result=ordinary(reader,false);
+    if(reader.pos!==input.length)throw new RangeError("trailing packed player bytes");
+    return result;
+}
 function superEntry(r: Reader, group: boolean): DirectPlay4PackedEntry {
     const start=r.pos; r.range(start,16);
     const fixed=r.dword(), flags=r.dword(), id=r.dword(), mask=r.dword();

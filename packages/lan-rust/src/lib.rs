@@ -13,7 +13,7 @@ use bottleship_lan_gateway::{
     Gateway, GatewayEvents, GatewayHandle, GatewayOptions, GatewayOutput,
 };
 use bottleship_lan_transport::{
-    self as transport, BoundTransport, Egress, IncomingKind, TransportHandle,
+    self as transport, BoundTransport, DeliveryTicket, Egress, IncomingKind, TransportHandle,
 };
 use config::ServerConfig;
 use std::{
@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Semaphore, mpsc, watch},
+    sync::{Semaphore, mpsc, oneshot, watch},
     task::{AbortHandle, JoinSet},
     time::{Instant, MissedTickBehavior, timeout},
 };
@@ -142,7 +142,7 @@ impl LanServer {
 }
 type Resolution = Vec<(usize, Result<Vec<NativeAddress>, ResolveError>)>;
 enum Event {
-    Gateway(GatewayOutput),
+    Gateway(GatewayOutput, oneshot::Sender<(GatewayOutput, Vec<DeliveryTicket>)>),
     GatewayClosed {
         connection: ConnId,
         error: Option<String>,
@@ -265,6 +265,9 @@ impl Dispatcher {
             .map_err(|error| error.to_string())
     }
     fn effects(&mut self, effects: Vec<Effect>) -> Result<(), String> {
+        self.effects_tracked(effects, &mut Vec::new())
+    }
+    fn effects_tracked(&mut self, effects: Vec<Effect>, tickets: &mut Vec<DeliveryTicket>) -> Result<(), String> {
         let mut pending = VecDeque::from(effects);
         while let Some(effect) = pending.pop_front() {
             let next = match effect {
@@ -282,13 +285,18 @@ impl Dispatcher {
                         reliable,
                         sender: source,
                     }) {
-                        Ok(_) => vec![],
-                        Err(rejected) => self.core.apply(Command::DeliveryRejected {
-                            to: rejected.recipient,
-                            source: rejected.sender,
-                            reliable: rejected.reliable,
-                            now_ms: self.now(),
-                        }),
+                        Ok(ticket) => { tickets.push(ticket); vec![] },
+                        Err(rejected) => {
+                            if self.log_connections {
+                                eprintln!("{}", serde_json::json!({"event":"deliveryRejected","connection":rejected.recipient,"reason":rejected.reason,"reliable":rejected.reliable}));
+                            }
+                            self.core.apply(Command::DeliveryRejected {
+                                to: rejected.recipient,
+                                source: rejected.sender,
+                                reliable: rejected.reliable,
+                                now_ms: self.now(),
+                            })
+                        },
                     }
                 }
                 Effect::Disconnect { connection, reason } => {
@@ -424,7 +432,7 @@ async fn forward_gateway(
     mut events: GatewayEvents,
     sender: mpsc::Sender<Event>,
 ) {
-    let unexpected = loop {
+    let unexpected = 'forward: loop {
         if events.status.borrow().closed {
             break None;
         }
@@ -434,7 +442,28 @@ async fn forward_gateway(
                 break (!events.status.borrow().closed).then(||"Native gateway driver stopped".to_string())
             },
             output=events.outputs.recv()=>match output{
-                Some(output)=>if sender.send(Event::Gateway(output)).await.is_err(){return},
+                Some(output)=>{
+                    // Hold native TCP read credit through transport drain; other
+                    // gateway events keep their existing delivery/drop policy.
+                    let tcp = match &output.event {
+                        bottleship_lan_core::GatewayEvent::Frame { binding, .. } => bottleship_lan_core::wire::tcp(binding.proto),
+                        bottleship_lan_core::GatewayEvent::TcpChildFrame { .. } => true,
+                        _ => false,
+                    };
+                    let (done, complete) = oneshot::channel();
+                    if sender.send(Event::Gateway(output, done)).await.is_err(){return}
+                    let (output, tickets) = tokio::select! {
+                        result=complete=>match result { Ok(value)=>value, Err(_)=>return },
+                        _=events.status.wait_for(|state| state.closed)=>break None
+                    };
+                    if tcp { for ticket in tickets {
+                        tokio::select! {
+                            _=ticket.released()=>{},
+                            _=events.status.wait_for(|state| state.closed)=>break 'forward None
+                        }
+                    }}
+                    drop(output);
+                },
                 None=>break (!events.status.borrow().closed).then(||"Native gateway output stopped".to_string()),
             }
         }
@@ -583,13 +612,14 @@ async fn run(
             },
             dispatch::Selected::Event(event) => match event {
                 None => break,
-                Some(Event::Gateway(output)) => {
+                Some(Event::Gateway(output, done)) => {
                     let effect = dispatcher.core.apply(Command::GatewayEvent {
                         connection: output.connection,
                         event: output.event.clone(),
                     });
-                    let result = dispatcher.effects(effect);
-                    drop(output);
+                    let mut tickets = Vec::new();
+                    let result = dispatcher.effects_tracked(effect, &mut tickets);
+                    let _ = done.send((output, tickets));
                     result
                 }
                 Some(Event::GatewayClosed { connection, error }) => {

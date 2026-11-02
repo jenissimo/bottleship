@@ -10,7 +10,7 @@ import { copyUdpHostCapability, copyUdpHostReady, type UdpHostListenCapability, 
 import type { UdpHostLease } from "./udp-host-lease-rpc";
 import { copyTcpHostCapability, copyTcpHostReady, type TcpHostListenCapability, type TcpHostOpenRequest } from "./netplay-wire";
 import type { TcpHostLease } from "./tcp-host-lease-rpc";
-import type { DirectPlay8NetworkPolicy, WinsockNetworkPolicy } from "../../network-config";
+import type { DirectPlay4NetworkPolicy, DirectPlay8NetworkPolicy, WinsockNetworkPolicy } from "../../network-config";
 import { copyLocalUdpContext, type LocalUdpContext } from "./local-udp-context";
 export type { LocalUdpContext, LocalUdpEndpoint } from "./local-udp-context";
 import { NetResolveError, type ResolveRequest, type ResolveResult } from "./netplay-wire";
@@ -56,6 +56,7 @@ export interface LanState {
     udpHostListenV1?: UdpHostListenCapability;
     udpMulticast4V1?: true;
     directPlay8?: DirectPlay8NetworkPolicy;
+    directPlay4?: DirectPlay4NetworkPolicy;
     winsock?: WinsockNetworkPolicy;
     tcpHostListenV1?: TcpHostListenCapability;
 }
@@ -103,6 +104,16 @@ export class LanNetwork {
     private multicast4Capability = false;
     configureMulticast4(supported = false): void { this.multicast4Capability = supported; }
     get udpMulticast4V1(): true | undefined { this.synchronizeState(); return (this.transport?.supportsMulticast4?.() ?? this.multicast4Capability) ? true : undefined; }
+    private dp4Policy?: DirectPlay4NetworkPolicy;
+    private dp4PolicyEpoch: object = {};
+    get directPlay4(): DirectPlay4NetworkPolicy | undefined { this.synchronizeState(); return this.dp4Policy && {...this.dp4Policy}; }
+    configureDirectPlay4(policy?: DirectPlay4NetworkPolicy): void { this.dp4Policy = policy && {...policy}; this.dp4PolicyEpoch = {}; }
+    directPlay4PolicySnapshot(): {connected:boolean;epoch:object;policy?:DirectPlay4NetworkPolicy} {
+        this.synchronizeState();
+        return {connected:this.transport?.connectionState?.() ?? this.online,epoch:this.dp4PolicyEpoch,
+            policy:this.dp4Policy && {...this.dp4Policy}};
+    }
+    directPlay4PolicyEpochCurrent(epoch:object):boolean { return this.dp4PolicyEpoch===epoch; }
     private dp8Policy?: DirectPlay8NetworkPolicy;
     get directPlay8(): DirectPlay8NetworkPolicy | undefined { this.synchronizeState(); return this.dp8Policy && {...this.dp8Policy}; }
     configureDirectPlay8(policy?: DirectPlay8NetworkPolicy): void { this.dp8Policy = policy && {...policy}; }
@@ -194,6 +205,8 @@ export class LanNetwork {
         if (!isLanNode(node) || this.ports.some(ports => ports.size)) throw new Error("Identity must be adopted before binding");
         this.node.set(node);
     }
+    /** Local gateway advertisement/registration; the relay still enforces its route ACL. */
+    hasGatewayIpv4(ip:Uint8Array):boolean { this.synchronizeState(); return ip.length===4 && this.gatewayAddresses.has(ip.join(".")); }
     routeIpv4(ip: Uint8Array): Uint8Array {
         this.synchronizeState();
         if (ip.length !== 4) throw new RangeError("IPv4 address must have four bytes");
@@ -336,7 +349,7 @@ export class LanNetwork {
         if (!connected || force) { this.retireUdpLeases(); if (!connected) { this.hostCapability = undefined; this.tcpHostCapability = undefined; this.multicast4Capability = false; } }
         const state: LanState = { connected, node: this.node.slice(), ipv4: this.ipv4, generation: ++this.generation, reason,
             gatewayIpv4: [...this.gatewayAddresses].map(ip => ip.split(".").map(Number)), gatewayIpv6: [...this.gatewayIpv6.values()],
-            udpHostListenV1: this.udpHostListenV1, tcpHostListenV1: this.tcpHostListenV1, udpMulticast4V1: this.udpMulticast4V1, directPlay8: this.directPlay8, winsock: this.winsock };
+            udpHostListenV1: this.udpHostListenV1, tcpHostListenV1: this.tcpHostListenV1, udpMulticast4V1: this.udpMulticast4V1, directPlay4: this.directPlay4, directPlay8: this.directPlay8, winsock: this.winsock };
         for (const listener of this.listeners) listener(state);
     }
     onStateChange(listener: (state: LanState) => void): () => void {

@@ -22,7 +22,7 @@ class Table {
     get(){return {state:"connecting"};}
     send(_id:number,bytes:Uint8Array){const n=Math.min(5,bytes.length);this.writes.push(...bytes.subarray(0,n));return n;}
     accept(_listener?:number){const id=this.queue.shift();if(!id)throw new WsaFailure(WSA.EWOULDBLOCK);return id;}
-    receive(id:number){const data=this.packets.get(id)?.shift();if(!data)throw new WsaFailure(WSA.EWOULDBLOCK);return {data,from:peer};}
+    receive(id:number,max:number){const queue=this.packets.get(id),data=queue?.shift();if(!data)throw new WsaFailure(WSA.EWOULDBLOCK);if(data.length>max)queue!.unshift(data.subarray(max));return {data:data.subarray(0,max),from:peer};}
     child(chunks:Uint8Array[]){const id=this.socket();this.packets.set(id,chunks);this.queue.push(id);this.signal();return id;}
 }
 function options(frames:number[],errors:string[]):DirectPlay4JoinChannelOptions {
@@ -39,6 +39,15 @@ test("partial writes and fragmented reply preserve wire order and ownership",asy
     await sent;await tick();
     expect(table.writes).toEqual([...frame]);expect(frames).toEqual([7]);expect(errors).toEqual([]);
     channel.close();expect(table.sockets.size).toBe(0);
+});
+test("coalesced TCP traffic exceeding one parser batch is delivered in order",async()=>{
+    const table=new Table(),frames:number[]=[],errors:string[]=[],o=options(frames,errors);o.maxFrameBytes=65536;o.maxWriteBytes=65536;
+    let done!:()=>void;const received=new Promise<void>(resolve=>done=resolve);
+    o.onFrame=f=>{frames.push(f.command);if(frames.length===300)done();};
+    const channel=new DirectPlay4JoinChannel(table as unknown as WsaSocketTable,o);
+    const bytes=new Uint8Array(frame.length*300);for(let i=0;i<300;i++)bytes.set(frame,i*frame.length);
+    table.child([bytes]);await received;
+    expect(frames).toEqual(Array(300).fill(7));expect(errors).toEqual([]);channel.close();expect(table.sockets.size).toBe(0);
 });
 test("source ACL denial fails closed and retires every owned socket",async()=>{
     const table=new Table(),frames:number[]=[],errors:string[]=[],o=options(frames,errors);

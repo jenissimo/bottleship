@@ -99,8 +99,13 @@ export function packDirectPlayMessage(m: Message, base: number, currentPlayers: 
         const b = new BufferWriter(size, e.data.length + nameExtra(e.name, wide), base);
         b.u32(0, s.type); b.u32(4, e.group ? 0 : 1); b.u32(8, e.id);
         if (s.type === 3) {
-            b.u32(12, s.currentPlayers ?? currentPlayers); b.blob(16, new Uint8Array(e.data)); b.u32(20, e.data.length);
-            writeName(b, 24, e.name, wide); b.u32(40, e.parent); b.u32(44, e.flags);
+            b.u32(12, s.currentPlayers ?? currentPlayers);
+            // Native Unicode CREATEPLAYER places names before player data;
+            // ANSI CREATEPLAYER and both DESTROYPLAYER variants put data first.
+            if (wide) writeName(b, 24, e.name, wide);
+            b.blob(16, new Uint8Array(e.data)); b.u32(20, e.data.length);
+            if (!wide) writeName(b, 24, e.name, wide);
+            b.u32(40, e.parent); b.u32(44, e.flags);
         } else {
             b.blob(20, new Uint8Array(e.data)); b.u32(24, e.data.length);
             writeName(b, 28, e.name, wide); b.u32(44, e.parent); b.u32(48, e.flags);
@@ -405,6 +410,10 @@ export class DirectPlayNetworkApi {
                 const found = [...s.session.discovered.keys()].find(id => id.startsWith(desc.instance.slice(0, 8)));
                 if (found) desc.instance = found;
             }
+            // DPOPEN_JOIN identifies the session by instance; native DirectPlay
+            // also accepts a descriptor with an empty application GUID.
+            const discovered = s.session.discovered.get(desc.instance);
+            if (discovered) desc.application = discovered.desc.application;
             return s.session.join(desc);
         };
         methods.Close = s => { s.asyncSends.reset(); s.events.clear(); s.localData.clear(); s.sendQueue.clear(); return s.session.close(); };
@@ -420,8 +429,19 @@ export class DirectPlayNetworkApi {
                 if (flags & ~(group ? 0x1800 : 0x300)) return DP.INVALIDFLAGS;
                 if (dataSize > DPLAY_MAX_MESSAGE || (dataSize && !this.valid(dataPtr, dataSize))) return DP.INVALIDPARAMS;
                 const event = group ? 0 : legacy ? (a[4] && this.valid(a[4], 4) ? Mem.readUint32(a[4])! : 0) : a[3];
+                const nativeCreate = !group && s.session.isNative, nativeDesc = s.session.desc, nativeGeneration = this.generation;
+                const nativeObject = nativeCreate ? SystemResourceProvider.getInstance().getComObjectByAddress(a[0]) : undefined;
+                const nativeCurrent = (id: number) => this.generation === nativeGeneration && !!nativeObject &&
+                    SystemResourceProvider.getInstance().getComObjectByAddress(a[0]) === nativeObject &&
+                    s.session.isNative && s.session.desc === nativeDesc && !s.session.openError &&
+                    s.session.entities.get(id)?.owner === s.session.ownKey;
+                let nativeEventId = 0, nativePointerInvalid = false;
                 const result = s.session.mutate({ op: "mutate", action: "create", group, flags, name, parent: group ? a[6] ?? 0 : 0,
-                    data: dataSize ? Array.from(Mem.readBytes(dataPtr, dataSize)!) : [] });
+                    data: dataSize ? Array.from(Mem.readBytes(dataPtr, dataSize)!) : [] }, nativeCreate ? id => {
+                    if (!nativeCurrent(id)) throw new Error("native player owner retired");
+                    if (!this.valid(a[1], 4, "rw")) { nativePointerInvalid = true; throw new Error("native player output retired"); }
+                    if (event) { s.events.set(id, event); nativeEventId = id; }
+                } : undefined);
                 const finish = (reply: Reply): number => {
                     if (!reply.hr && reply.id) {
                         if (!this.valid(a[1], 4, "rw")) return E_POINTER;
@@ -431,18 +451,42 @@ export class DirectPlayNetworkApi {
                 };
                 if (!(result instanceof Promise)) return finish(result);
                 return result.then<ThunkResult>(reply => {
-                    if (reply.hr || !reply.id) return { value: reply.hr };
-                    if (!this.valid(a[1], 4, "rw")) return { value: E_POINTER };
+                    if (reply.hr || !reply.id) {
+                        if (nativeEventId && s.session.desc === nativeDesc && s.events.get(nativeEventId) === event) s.events.delete(nativeEventId);
+                        return { value: nativePointerInvalid ? E_POINTER : reply.hr };
+                    }
+                    if (nativeCreate && !nativeCurrent(reply.id)) return { value: DP.SESSIONLOST };
+                    if (!this.valid(a[1], 4, "rw")) { if (nativeCreate) s.session.close(); return { value: E_POINTER }; }
                     if (event) s.events.set(reply.id, event);
+                    if (nativeCreate) {
+                        const id = reply.id;
+                        return { value: DP.SESSIONLOST, resumeOnOwner: () => {
+                            if (!nativeCurrent(id)) return DP.SESSIONLOST;
+                            if (!this.valid(a[1], 4, "rw")) { s.session.close(); return E_POINTER; }
+                            return { value: DP.OK, deferredWrites: [{ address: a[1], value: id, size: 4 }] };
+                        } };
+                    }
                     return { value: DP.OK, deferredWrites: [{ address: a[1], value: reply.id, size: 4 }] };
                 });
             };
             methods["Destroy" + kind] = (s, a) => {
                 const e = s.session.entities.get(a[1]);
                 if (e?.group !== group) return group ? DP.INVALIDGROUP : DP.INVALIDPLAYER;
+                const nativeDestroy = !group && s.session.isNative, nativeDesc = s.session.desc, nativeGeneration = this.generation;
+                const nativeObject = nativeDestroy ? SystemResourceProvider.getInstance().getComObjectByAddress(a[0]) : undefined;
+                const current = () => this.generation === nativeGeneration && !!nativeObject &&
+                    SystemResourceProvider.getInstance().getComObjectByAddress(a[0]) === nativeObject &&
+                    s.session.isNative && s.session.desc === nativeDesc && !s.session.openError && !s.session.entities.has(a[1]);
                 const result = s.session.mutate({ op: "mutate", action: "destroy", id: a[1], group });
                 const finish = (r: Reply): number => { if (!r.hr) { s.events.delete(a[1]); s.localData.delete(a[1]); } return r.hr; };
-                return result instanceof Promise ? result.then<number>(finish) : finish(result);
+                if (!(result instanceof Promise)) return finish(result);
+                if (!nativeDestroy) return result.then<number>(finish);
+                return result.then<ThunkResult>(r => {
+                    if (r.hr) return { value: r.hr };
+                    if (!current()) return { value: DP.SESSIONLOST };
+                    finish(r);
+                    return { value: DP.SESSIONLOST, resumeOnOwner: () => current() ? DP.OK : DP.SESSIONLOST };
+                });
             };
             methods["Get" + kind + "Name"] = (s, a, legacy, _ctx, wide = false) => {
                 const e = s.session.entities.get(a[1]);
@@ -504,17 +548,18 @@ export class DirectPlayNetworkApi {
             if (a[2] && !s.session.entities.has(a[2])) return DP.INVALIDPLAYER;
             if (a[3] & ~0xe7f || (a[3] & 0x60) || (!(a[3] & 0x200) && (a[3] & 0x400))) return DP.INVALIDFLAGS;
             if (a[6] > 0xffff) return DP.INVALIDPRIORITY;
-            if (!this.valid(a[9], 4, "rw") || !a[5] || a[5] > DPLAY_MAX_MESSAGE || !this.valid(a[4], a[5])) return DP.INVALIDPARAMS;
+            if ((a[9] && !this.valid(a[9], 4, "rw")) || !a[5] || a[5] > DPLAY_MAX_MESSAGE || !this.valid(a[4], a[5])) return DP.INVALIDPARAMS;
             if (!(a[3] & 0x200)) {
-                Mem.writeUint32(a[9], 0);
+                if (a[9]) Mem.writeUint32(a[9], 0);
                 return methods.Send(s, a.slice(0, 6), legacy, ctx, wide);
             }
+            if (s.session.isNative) return DP.UNAVAILABLE;
             const admissionError = s.asyncSends.admissionError(a[5]); if (admissionError) return admissionError;
             const copied = a[3] & 0x800 ? null : Mem.readBytes(a[4], a[5])!.slice();
             const admitted = s.asyncSends.enqueue({ from: a[1], to: a[2], flags: a[3], priority: a[6], timeout: a[7], context: a[8],
                 data: () => copied ?? (this.valid(a[4], a[5]) ? this.process.getCurrentMemory().slice(a[4], a[4] + a[5]) : null) }, a[5]);
             if (admitted.hr) return admitted.hr;
-            Mem.writeUint32(a[9], admitted.id); return DP.PENDING;
+            if (a[9]) Mem.writeUint32(a[9], admitted.id); return DP.PENDING;
         };
         methods.CancelMessage = (s, a) => a[2] ? DP.INVALIDFLAGS : s.asyncSends.cancel(a[1]);
         methods.CancelPriority = (s, a) => a[3] ? DP.INVALIDFLAGS : s.asyncSends.cancelPriority(a[1], a[2]);
@@ -550,10 +595,22 @@ export class DirectPlayNetworkApi {
         methods.Send = (s, a) => {
             if (a[5] > DPLAY_MAX_MESSAGE || (a[5] && !this.valid(a[4], a[5]))) return DP.INVALIDPARAMS;
             const data = a[5] ? Mem.readBytes(a[4], a[5])!.slice() : EMPTY;
+            const nativeSend = s.session.isNative, nativeDesc = s.session.desc, nativeGeneration = this.generation;
+            const nativeObject = nativeSend ? SystemResourceProvider.getInstance().getComObjectByAddress(a[0]) : undefined;
+            const nativeSource = s.session.entities.get(a[1]), nativeTarget = s.session.entities.get(a[2]);
+            const current = () => this.generation === nativeGeneration && !!nativeObject &&
+                SystemResourceProvider.getInstance().getComObjectByAddress(a[0]) === nativeObject &&
+                s.session.isNative && s.session.desc === nativeDesc && !s.session.openError &&
+                s.session.entities.get(a[1]) === nativeSource && s.session.entities.get(a[2]) === nativeTarget;
             const id = s.nextMessage++, result = s.session.send(a[1], a[2], a[3], data);
             if (!(result instanceof Promise)) return result;
             s.sendQueue.set(id, { from: a[1], to: a[2], bytes: data.length });
-            return result.then<number>(hr => { s.sendQueue.delete(id); return hr; });
+            if (!nativeSend) return result.then<number>(hr => { s.sendQueue.delete(id); return hr; });
+            return result.then<ThunkResult>(hr => {
+                s.sendQueue.delete(id);
+                if (hr !== DP.OK) return { value: hr };
+                return { value: DP.SESSIONLOST, resumeOnOwner: () => current() ? DP.OK : DP.SESSIONLOST };
+            });
         };
         methods.Receive = (s, a, legacy, ctx, wide = false) => {
             if (a[3] & ~15 || (a[3] & 1 && a[3] & 6)) return DP.INVALIDFLAGS;
@@ -591,6 +648,7 @@ export class DirectPlayNetworkApi {
         };
         methods.GetPlayerAddress = (s, a) => {
             const e = s.session.entities.get(a[1]); if (!e || e.group) return DP.INVALIDPLAYER;
+            if (s.session.isNative) return DP.UNAVAILABLE;
             const node = e.owner.split(":")[0].split(".").map(Number);
             const address = encodeAnsi([10, node[3], node[4], node[5]].join(".") + "\0");
             return this.buffer(a[2], a[3], () => packAddress([
@@ -676,9 +734,13 @@ export class DirectPlayNetworkApi {
                     const target = s.session.discovered.get(instance); if (!target) return DP.NOSESSIONS;
                     return s.session.join(target.desc).then<ThunkResult>(hr => {
                         if (hr) return { value: hr };
-                        const items = entries(); s.session.close();
+                        // Native DirectPlay exposes the temporary session during callbacks;
+                        // games query each enumerated player's caps and flags reentrantly.
+                        const items = entries(), joined = s.session.desc;
+                        const finish = (): void => { if (s.session.desc === joined) s.session.close(); };
                         return { value: DP.OK, startCallbackChain: frame => {
-                            const result = this.enumerate(frame, cb, cleanup, items);
+                            const result = this.enumerate(frame, cb, cleanup, items, () => s.session.desc === joined, finish);
+                            if (typeof result !== "object" || !result.suspendedForCallback) finish();
                             return typeof result === "object" && !!result.suspendedForCallback;
                         } };
                     });
@@ -750,7 +812,7 @@ export class DirectPlayNetworkApi {
                         if (!peerOwner) continue;
                         if (!(a[5] & 2) && desc.application !== ZERO_GUID && application !== desc.application) continue;
                         if (s.session.discovered.size >= 256 && !s.session.discovered.has(instance)) continue;
-                        s.session.discovered.set(instance, {
+                        s.session.cacheDiscovery({
                             desc: {instance, application, flags: reply.flags, maxPlayers: reply.maxPlayers,
                                 name: reply.name ?? "", nameNull: reply.name === null,
                                 password: "", passwordNull: true, reserved: [...reply.reserved], user: [...reply.user]},

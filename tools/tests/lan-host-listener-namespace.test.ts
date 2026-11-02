@@ -33,10 +33,20 @@ for(const transport of ["websocket","polling"]as const)test("physical Host lease
  const childBoot=root.createChild(92002),childNet=new LanNetwork(),child=new ChildProcessNetworkNamespace(childNet,childBoot.boot);
  const a={deliver(){}},b={deliver(){}};
  try{
-  const config={serverUrl:"http://127.0.0.1:"+port,room:"host-control",directPlay8:{provider:"native"as const,hostListener:"game"}};
+  const config={serverUrl:"http://127.0.0.1:"+port,room:"host-control",directPlay8:{provider:"native"as const,hostListener:"game"},winsock:{provider:"native"as const,hostListener:"tcp-game"},directPlay4:{provider:"native"as const,tcpHostListener:"tcp-game",udpHostListener:"game"}};
   await root.configure(config);await until(()=>childNet.connected);
   expect(childNet.directPlay8).toEqual(config.directPlay8);expect(network.directPlay8).toEqual(config.directPlay8);
+  expect(childNet.directPlay4).toEqual(config.directPlay4);expect(network.directPlay4).toEqual(config.directPlay4);
+  const copy=childNet.directPlay4!;copy.udpHostListener="other";expect(childNet.directPlay4?.udpHostListener).toBe("game");
   expect(childNet.udpHostListenV1?.listeners).toEqual([{id:"game",allowedNodes}]);
+  const dp4Epoch=childNet.directPlay4PolicySnapshot().epoch,tcpEpoch=childNet.tcpHostPolicySnapshot().epoch,udpEpoch=childNet.udpHostPolicySnapshot().epoch;
+  // DNS resolution republishes readiness with a new route but unchanged policies.
+  (root as any).recordResolved({addresses:[{family:4,address:"198.51.100.20"}]});
+  expect(childNet.connected).toBe(true);
+  expect(childNet.directPlay4PolicyEpochCurrent(dp4Epoch)).toBe(true);
+  expect(childNet.tcpHostPolicyCurrentEpoch).toBe(tcpEpoch);
+  expect(childNet.udpHostPolicyEpochCurrent(udpEpoch)).toBe(true);
+  expect(childNet.hasGatewayIpv4(Uint8Array.of(198,51,100,20))).toBe(true);
   expect(network.bind(47126,a,1)).toBe(true);expect(childNet.bind(47127,b,1)).toBe(true);await child.barrier();
   const rootLease=await network.openUdpHost(47126,"game"),childLease=await childNet.openUdpHost(47127,"game");
   expect(opens.map(r=>r.request.localPort)).toEqual([47126,47127]);expect(connections).toBe(1);expect(payloads).toBe(0);
@@ -52,6 +62,8 @@ for(const transport of ["websocket","polling"]as const)test("physical Host lease
    const rebound=createSocket("udp4");await new Promise<void>((resolve,reject)=>{rebound.once("error",reject);rebound.bind(localPort,"127.0.0.1",()=>resolve())});
    await new Promise<void>(resolve=>rebound.close(()=>resolve()));
   }
+  await root.configure(null);await until(()=>!childNet.connected);
+  expect(network.directPlay4).toBeUndefined();expect(childNet.directPlay4).toBeUndefined();
  }finally{
   child.close();childBoot.close();network.unbind(47126,a,1);await root.close();
   for(const lease of [...leases.values()])await lease.end();await server.close();

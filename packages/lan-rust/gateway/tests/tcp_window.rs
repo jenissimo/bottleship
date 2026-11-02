@@ -40,6 +40,26 @@ fn frame(port: u16, packet: TcpFrame) -> GatewayInput {
     }
 }
 #[tokio::test]
+async fn stale_outbound_reset_does_not_abort_the_current_native_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let policy = Arc::new(Mutex::new(DestinationPolicy::default()));
+    let (gateway, mut events) = Gateway::spawn(1, GatewayConfig::default(), policy, GatewayOptions::default()).unwrap();
+    gateway.try_submit(frame(port, TcpFrame { kind: 1, src_id: 99, dst_id: 0, value: 8192, data: Bytes::new() })).unwrap();
+    let (mut peer, _) = timeout(Duration::from_secs(3), listener.accept()).await.unwrap().unwrap();
+    let output = timeout(Duration::from_secs(3), events.outputs.recv()).await.unwrap().unwrap();
+    let server = match &output.event {
+        GatewayEvent::Frame { datagram, .. } => { let packet = TcpFrame::decode(datagram.payload.clone()).unwrap(); assert_eq!(packet.kind, 2); packet.src_id },
+        other => panic!("unexpected: {other:?}"),
+    };drop(output);
+    gateway.try_submit(frame(port, TcpFrame { kind: 5, src_id: 99, dst_id: server.wrapping_add(1), value: 10054, data: Bytes::new() })).unwrap();
+    gateway.try_submit(frame(port, TcpFrame { kind: 3, src_id: 99, dst_id: server, value: 0, data: Bytes::from_static(b"alive") })).unwrap();
+    let mut data = [0; 5];timeout(Duration::from_secs(3), peer.read_exact(&mut data)).await.unwrap().unwrap();assert_eq!(&data, b"alive");
+    gateway.try_submit(frame(port, TcpFrame { kind: 5, src_id: 99, dst_id: server, value: 10054, data: Bytes::new() })).unwrap();
+    let mut byte = [0; 1];assert!(matches!(timeout(Duration::from_secs(3), peer.read(&mut byte)).await.unwrap(), Ok(0) | Err(_)));
+    gateway.abort();timeout(Duration::from_secs(3), gateway.wait_closed()).await.unwrap().unwrap();
+}
+#[tokio::test]
 async fn native_eof_with_uncredited_tail_drains_all_400k_then_reclaims_flow() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

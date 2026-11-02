@@ -1569,7 +1569,10 @@ export const exports: Record<string, ThunkImplementation> = (() => {
             const region = system.process?.addressSpace.getRegion(pageBase);
             const dc = decommittedPages.find(pageBase);
             if (region && region.owner !== "Layout" && state === MEM_COMMIT) {
-                if (!dc) regionSize = Math.min(regionSize, region.base + region.size - pageBase);
+                // AddressSpace also tracks sub-page allocator objects. VirtualQuery
+                // describes whole pages, so a fragment ending inside this page cannot
+                // truncate the reported run to a non-page boundary (or stall a walker).
+                if (!dc) regionSize = Math.min(regionSize, Math.ceil((region.base + region.size) / 0x1000) * 0x1000 - pageBase);
                 if (region.protection !== undefined) {
                     protect = region.protection;
                     allocationProtect = region.allocationProtect ??

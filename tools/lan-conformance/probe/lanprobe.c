@@ -1178,8 +1178,9 @@ static void cmd_addhost(struct Token *obj, const char *hostName) {
                                           (DWORD)((wstrlen(hostName) + 1) * sizeof(WCHAR)), DPNA_DATATYPE_STRING);
     com_result(prefix, hr, "");
 }
-/* The TCPIP SP device address component; "adapter" is the GUID the working
- * DP8 fixtures use to select the default local adapter. */
+/* The TCPIP SP device address component. "adapter" is the measured Windows
+ * loopback device GUID used by the DP8 fixtures, not a default LAN adapter.
+ * Its mapping is machine-specific and must be verified on another host. */
 static void cmd_setdevice(struct Token *obj, const char *guidName) {
     Sym *s = com_sym(obj);
     IDirectPlay8Address *addr;

@@ -107,7 +107,7 @@ export async function runDirectPlay4JoinHandshake(o:DirectPlay4JoinHandshakeOpti
                 else {if(!session!.onPlayerFrame)throw new Error("player frame handler unavailable");session!.onPlayerFrame(value.frame,peer);}
                 return;
             }
-            const size=(value.kind==="system"?value.frame.message.length:8+value.frame.data.length)+header.length;
+            const size=(value.kind==="system"?value.frame.message.length:8+value.frame.data.length)+header.length+peer.node.length+(peer.ip?.length??0);
             if(phase==="transfer"){
                 if(transition.length+pending.queuedEntries>=o.maxEntries || size>o.maxPendingBytes-transitionBytes-pending.queuedBytes)throw new RangeError("Join transfer queue full");
                 transition.push({value,peer:{...peer,node:Uint8Array.from(peer.node),...(peer.ip?{ip:Uint8Array.from(peer.ip)}:{}),...(peer.ip6?{ip6:Uint8Array.from(peer.ip6)}:{})},size});transitionBytes+=size;return;
@@ -115,7 +115,7 @@ export async function runDirectPlay4JoinHandshake(o:DirectPlay4JoinHandshakeOpti
             let message:Uint8Array;
             if(value.kind==="system")message=value.frame.message;
             else {message=new Uint8Array(8+value.frame.data.length);const view=new DataView(message.buffer);view.setUint32(0,value.frame.from,true);view.setUint32(4,value.frame.to,true);message.set(value.frame.data,8);}
-            const result=value.kind==="player"?pending.receivePlayer(message,header,0):pending.receive(message,header,0);
+            const result=value.kind==="player"?pending.receivePlayer(message,header,0,peer):pending.receive(message,header,0,peer);
             if(result.kind==="unsupported")throw new Error("unsupported Join message");
             if(result.kind==="reply") {const resolve=resolveReply;resolveReply=undefined;rejectReply=undefined;if(!resolve)throw new Error("unexpected Join reply");resolve(result);}
         };
