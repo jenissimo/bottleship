@@ -406,8 +406,8 @@ if (cmd === "run") {
 } else {
     const { golden } = casePaths(caseId);
     if (!existsSync(golden)) { console.error(`FAIL ${caseId}: no golden ${golden}`); process.exit(1); }
-    const goldenLines = readFileSync(golden, "utf8").split("\n").filter(l => l.length);
-    const guestLines = log.split("\n").filter(l => l.length);
+    const goldenLines = readFileSync(golden, "utf8").split(/\r?\n/).filter(l => l.length);
+    const guestLines = log.split(/\r?\n/).filter(l => l.length);
     const differences: Array<{ line: number; native: string; guest: string }> = [];
     for (let i = 0; i < Math.max(goldenLines.length, guestLines.length); i++) {
         if (goldenLines[i] !== guestLines[i]) differences.push({ line: i + 1, native: goldenLines[i] ?? "<missing>", guest: guestLines[i] ?? "<missing>" });

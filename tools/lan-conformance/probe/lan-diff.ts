@@ -208,8 +208,8 @@ async function bootBundle(bundle: string) {
 }
 
 function diffLogs(caseId: string, goldenLog: string, guestLog: string, goldenPath: string, guestPath: string) {
-    const goldenLines = goldenLog.split("\n").filter(l => l.length);
-    const guestLines = guestLog.split("\n").filter(l => l.length);
+    const goldenLines = goldenLog.split(/\r?\n/).filter(l => l.length);
+    const guestLines = guestLog.split(/\r?\n/).filter(l => l.length);
     const differences: Array<{ line: number; native: string; guest: string }> = [];
     for (let i = 0; i < Math.max(goldenLines.length, guestLines.length); i++) {
         const a = goldenLines[i]; const b = guestLines[i];
