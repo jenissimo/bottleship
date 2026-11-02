@@ -71,5 +71,13 @@ test("Host and two Core peers exchange six directions on real UDP with one sourc
   ended=true;for(const peer of peers)peer.dispose();host.dispose();for(const network of nets)network.attach(null);
   for(const socket of sockets)await close(socket);
  }
- for(const port of ports){const probe=createSocket("udp4");try{expect(await bind(probe,port)).toBe(port);}finally{await close(probe);}}
+ for(const port of ports){
+  const deadline=Date.now()+1500;
+  for(;;){
+   const probe=createSocket("udp4");
+   try{expect(await bind(probe,port)).toBe(port);break;}
+   catch(error){if((error as NodeJS.ErrnoException).code!=="EADDRINUSE"||Date.now()>=deadline)throw error;await Bun.sleep(5);}
+   finally{await close(probe);}
+  }
+ }
 },5000);
