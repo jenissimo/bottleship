@@ -136,7 +136,7 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         sampleObj.pan = 64;
         sampleObj.playbackRate = 1.0;
         sampleObj.playbackRateHz = 22050;
-        sampleObj.loopCount = 1;
+        resetSampleLoopState(sampleObj);
         sampleObj.isPlaying = false;
         sampleObj.isStopped = false;
         sampleObj.pendingStart = false;
@@ -436,6 +436,21 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
         }
         return 0;
     };
+
+    // void AIL_set_sample_loop_block(HSAMPLE S, S32 loop_start_offset, S32 loop_end_offset)
+    // — the region a looping voice repeats. The first pass still plays from the top, so
+    // an engine or siren keeps its attack once and then cycles the sustain; looping the
+    // whole buffer instead replays the attack every pass.
+    const setSampleLoopBlock: ThunkImplementation = (ctxThunk, mem, args) => {
+        const sampleObj = ctx.samples.get(args[0]);
+        if (!sampleObj) return 0;
+        sampleObj.loopStartBytes = Math.max(0, args[1] | 0);
+        sampleObj.loopEndBytes = args[2] | 0;
+        if (sampleObj.isPlaying) updateSamplePlayback(ctx, sampleObj);
+        return 0;
+    };
+    exports["_AIL_set_sample_loop_block@12"] = setSampleLoopBlock;
+    exports["_AIL_set_3D_sample_loop_block@12"] = setSampleLoopBlock;
 
     // _AIL_set_sample_file@12
     exports["_AIL_set_sample_file@12"] = (ctxThunk, mem, args) => {
@@ -1148,6 +1163,8 @@ export function createSampleExports(ctx: MSSContext): Record<string, ThunkImplem
  */
 function resetSampleLoopState(sample: MSSSample): void {
     sample.loopCount = 1;
+    sample.loopStartBytes = undefined;
+    sample.loopEndBytes = undefined;
 }
 
 /**

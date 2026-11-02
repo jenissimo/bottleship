@@ -23,6 +23,8 @@ export type AudioPlayEncodedPayload = {
   loopCount?: number;
   /** Begin at this offset into the stream (CD "play from"). Loops restart here too. */
   startOffsetMs?: number;
+  /** Where a finite loop restarts; defaults to startOffsetMs. */
+  loopRestartMs?: number;
   /** End playback here instead of at the stream's end (CD "play to"). */
   endOffsetMs?: number;
   /** Force the streaming path regardless of container — for sources that must not
@@ -69,7 +71,7 @@ const STREAMING_THRESHOLD_BYTES = 512 * 1024;
 // to be discovered as "the counters are all zero for no visible reason" —
 // AudioContext caches a worklet module by exact URL, so an unbumped `v` after
 // an edit serves the OLD module (old code, old baked-in version) silently.
-const AUDIO_WORKLET_VERSION = 11;
+const AUDIO_WORKLET_VERSION = 12;
 /** How long to wait for a worklet's "ready" handshake before treating a missing
  *  one as a stale-module load worth a loud console.error rather than silence. */
 const WORKLET_READY_TIMEOUT_MS = 3000;
@@ -85,8 +87,10 @@ type EncodedSource = {
    *  else the decoded sample rate — i.e. frames). */
   sampleRate?: number;
   positionHandler?: () => void;
-  /** Loop/seek origin in seconds (payload.startOffsetMs). */
+  /** Seek origin in seconds (payload.startOffsetMs). */
   startTime: number;
+  /** Where a finite loop restarts, in seconds (payload.loopRestartMs, else startTime). */
+  loopTime: number;
   /** The startTime seek has been attempted; element time is meaningful from here on. */
   startApplied?: boolean;
   /** Stop here instead of at the stream's end; null = play to the end. */
@@ -825,6 +829,7 @@ export class AudioEngine {
       sampleRate: payload.positionRateHz ?? sampleRate ?? undefined,
       positionHandler: reportPosition,
       startTime,
+      loopTime: typeof payload.loopRestartMs === "number" ? Math.max(0, payload.loopRestartMs / 1000) : startTime,
       endTime,
     });
 
@@ -904,7 +909,7 @@ export class AudioEngine {
     if (source.loopsRemaining === Infinity) return;
     if (source.loopsRemaining > 1) {
       source.loopsRemaining -= 1;
-      source.element.currentTime = source.startTime;
+      source.element.currentTime = source.loopTime;
       void source.element.play();
       return;
     }

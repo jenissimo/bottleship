@@ -329,8 +329,6 @@ export function createCoreExports(ctx: MSSContext): Record<string, ThunkImplemen
     // S32 AIL_digital_CPU_percent(HDIGDRIVER) — a mixer we do not run costs nothing.
     exports["_AIL_digital_CPU_percent@4"] = () => 0;
 
-    exports["_AIL_set_sample_loop_block@12"] = () => 0;
-    exports["_AIL_set_3D_sample_loop_block@12"] = () => 0;
     exports["_AIL_set_3D_sample_obstruction@8"] = () => 0;
     exports["_AIL_set_3D_sample_occlusion@8"] = () => 0;
     exports["_AIL_set_3D_sample_preference@12"] = () => 0;

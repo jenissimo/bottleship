@@ -95,6 +95,11 @@ export const FLAG3D_HAS_3D = 1;
 /** CTRL_3D_FLAGS bit 1: use CTRL_3D_ROLLOFF instead of the listener's rolloff */
 export const FLAG3D_SOURCE_ROLLOFF = 2;
 
+/** Loop region start, in frames of the data (non-circular looping sources only) */
+export const CTRL_LOOP_START_FRAME = 35;
+/** Loop region end, in frames; 0 = the end of the data */
+export const CTRL_LOOP_END_FRAME = 36;
+
 /** Int32 entries in the control block */
 export const CTRL_SLOTS = 64;
 /** Size of control block in bytes (CTRL_SLOTS × 4) */
@@ -339,6 +344,8 @@ export function createAudioRingBuffer(
     Atomics.store(ctrl, CTRL_3D_ROLLOFF, floatToI32(1.0));
     Atomics.store(ctrl, CTRL_3D_MIN_GAIN, floatToI32(0.0));
     Atomics.store(ctrl, CTRL_3D_MAX_GAIN, floatToI32(1.0));
+    Atomics.store(ctrl, CTRL_LOOP_START_FRAME, 0);
+    Atomics.store(ctrl, CTRL_LOOP_END_FRAME, 0);
 
     return sab;
 }
