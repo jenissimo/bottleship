@@ -6,6 +6,41 @@ const WM_TIMER = 0x0113;
 const WM_PAINT = 0x000f;
 
 describe("MessageQueue WM_TIMER synthesis", () => {
+    test("cancelling an expired timer removes it until it has been observed", () => {
+        const q = new MessageQueue();
+        q.enqueue(0x10001, WM_TIMER, 1, 0);
+        q.cancelTimer(0x10001, 1);
+        expect(q.dequeue()).toBeNull();
+    });
+
+    test("a timer observed by PM_NOREMOVE survives cancellation", () => {
+        const q = new MessageQueue();
+        q.enqueue(0x10001, WM_TIMER, 1, 0);
+        expect(q.peek()?.message).toBe(WM_TIMER);
+        q.cancelTimer(0x10001, 1);
+        expect(q.dequeue()?.wParam).toBe(1);
+        expect(q.dequeue()).toBeNull();
+    });
+
+    test("a materialized timer and a new expiration with the same id remain distinct", () => {
+        const q = new MessageQueue();
+        q.enqueue(0x10001, WM_TIMER, 1, 0);
+        expect(q.peek()?.message).toBe(WM_TIMER);
+        q.cancelTimer(0x10001, 1);
+        q.enqueue(0x10001, WM_TIMER, 1, 0);
+        expect(q.dequeue()?.message).toBe(WM_TIMER);
+        expect(q.dequeue()?.message).toBe(WM_TIMER);
+        expect(q.dequeue()).toBeNull();
+    });
+
+    test("explicitly posted timer messages survive cancellation and keep posted priority", () => {
+        const q = new MessageQueue();
+        q.enqueue(0x10001, WM_TIMER, 1, 0, 0, 0, 0, undefined, 0, false);
+        q.enqueue(0x10001, WM_PAINT, 0, 0);
+        q.cancelTimer(0x10001, 1);
+        expect(q.dequeue()?.message).toBe(WM_TIMER);
+        expect(q.dequeue()?.message).toBe(WM_PAINT);
+    });
     test("coalesces repeated ticks for the same window and timer id", () => {
         const q = new MessageQueue();
         q.enqueue(0x10001, WM_TIMER, 1, 0);

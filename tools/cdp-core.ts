@@ -20,7 +20,7 @@ import { createGzip } from "node:zlib";
 import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, rmSync, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pickSessionTab, sessionFromEnv, sessionOwnsUrl, sessionUrl } from "../src/harness/session";
 import { attachEmulatorWorker } from "./cdp-worker-session";
@@ -38,9 +38,9 @@ const CHROME_PATH = IS_MAC
     : "C:/Program Files/Google/Chrome/Application/chrome.exe";
 /** Where a detached Chrome's stdout/stderr land — see launchChrome. */
 export const CHROME_STDIO_DIR = `${process.cwd()}/logs/chrome`;
-const DEFAULT_PROFILE = process.env.BS_CHROME_PROFILE ?? (IS_MAC
-    ? `${process.env.HOME}/.bottleship-cdp-profile`
-    : `${process.cwd()}/tmp/cdp-profile`);
+/** One profile for every checkout: the emulator keeps game bundles in the profile's OPFS,
+ *  so a per-worktree profile stored a full copy of every game per worktree. */
+const DEFAULT_PROFILE = process.env.BS_CHROME_PROFILE ?? `${homedir()}/.bottleship-cdp-profile`;
 
 export interface CdpTarget {
     id: string;
@@ -179,11 +179,13 @@ async function launchChrome(port: number, profile: string, autoplay: boolean): P
         // else — not in the trace, not in the page, not in any CDP event. Without this a
         // renderer or worker that dies of memory pressure leaves no evidence at all.
         mkdirSync(CHROME_STDIO_DIR, { recursive: true });
+        // The launcher must not capture pipes inherited by the detached daemon.
+        // Bun waits for their EOF even after PowerShell exits, blocking until Chrome exits.
         const psArgs = args.map((a) => `'${a}'`).join(",");
         Bun.spawnSync(["powershell", "-NoProfile", "-Command",
             `Start-Process -WindowStyle Hidden -FilePath '${CHROME_PATH}' -ArgumentList ${psArgs}` +
             ` -RedirectStandardOutput '${CHROME_STDIO_DIR}/stdout.log'` +
-            ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`]);
+            ` -RedirectStandardError '${CHROME_STDIO_DIR}/stderr.log'`], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
     }
     return waitForChrome(port, 50);
 }
@@ -276,11 +278,56 @@ export class CdpSession {
         };
     }
 
-    static connect(wsUrl: string): Promise<CdpSession> {
+    /** Acquisition-only ownership. Defaults remain unbounded for legacy callers.
+     * A timeout/abort retires the raw socket even before its WebSocket handshake
+     * completes. After success, the caller owns the session and these options no
+     * longer govern it. */
+    static connect(wsUrl: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CdpSession> {
+        const signal = opts.signal, timeoutMs = opts.timeoutMs;
+        if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("CDP ws acquisition aborted", "AbortError"));
+        if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 0x7fffffff)) {
+            return Promise.reject(new RangeError("CDP acquisition timeout must be finite, positive and at most 2147483647ms"));
+        }
         return new Promise((resolve, reject) => {
             const ws = new WebSocket(wsUrl);
-            ws.onopen = () => resolve(new CdpSession(ws));
-            ws.onerror = (e) => reject(new Error(`CDP ws connect failed: ${String((e as any)?.message ?? e)}`));
+            let settled = false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const closeSocket = () => { try { ws.close(); } catch { /* own connection already retired */ } };
+            const cleanup = () => {
+                if (timer !== undefined) clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+            };
+            const failed = (error: unknown) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                // A queued late open may arrive after cancellation. It may only
+                // close the retired socket; it must never publish a live session.
+                ws.onopen = closeSocket;
+                ws.onerror = () => {};
+                ws.onclose = null;
+                closeSocket();
+                reject(error);
+            };
+            const onAbort = () => failed(signal?.reason ?? new DOMException("CDP ws acquisition aborted", "AbortError"));
+            ws.onopen = () => {
+                if (settled) { closeSocket(); return; }
+                if (signal?.aborted) { onAbort(); return; }
+                const session = new CdpSession(ws);
+                settled = true;
+                cleanup();
+                ws.onopen = null;
+                ws.onerror = () => {};
+                ws.onclose = null;
+                resolve(session);
+            };
+            ws.onerror = (e) => failed(new Error("CDP ws connect failed: " + String((e as any)?.message ?? e)));
+            ws.onclose = () => failed(new Error("CDP ws closed before acquisition completed"));
+            signal?.addEventListener("abort", onAbort, { once: true });
+            if (signal?.aborted) { onAbort(); return; }
+            if (timeoutMs !== undefined) timer = setTimeout(() => {
+                failed(new DOMException("CDP ws acquisition timed out after " + timeoutMs + "ms", "TimeoutError"));
+            }, timeoutMs);
         });
     }
 
@@ -449,18 +496,16 @@ export async function connect(opts: { port?: number; urlMatch?: string } = {}): 
 /** Evaluate an expression in the PAGE context; returns the deserialized value. */
 export async function pageEval(session: CdpSession, expr: string, opts: { timeoutMs?: number; awaitPromise?: boolean; returnByValue?: boolean; userGesture?: boolean } = {}): Promise<any> {
     const timeoutMs = opts.timeoutMs ?? 30_000;
-    const r = await Promise.race([
-        session.send("Runtime.evaluate", {
-            expression: expr,
-            awaitPromise: opts.awaitPromise ?? true,
-            returnByValue: opts.returnByValue ?? true,
-            // Gesture-gated APIs (requestPointerLock, requestFullscreen, AudioContext.resume)
-            // reject without user activation, which no harness verb can otherwise grant.
-            userGesture: opts.userGesture ?? false,
-        }),
-        Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
-    ]);
-    if ((r as any).__timeout) throw new Error(`pageEval timed out after ${timeoutMs}ms`);
+    // The request owns its deadline and clears it on every reply. A losing sleep
+    // in Promise.race kept successful CLI processes alive for the whole step budget.
+    const r = await session.send("Runtime.evaluate", {
+        expression: expr,
+        awaitPromise: opts.awaitPromise ?? true,
+        returnByValue: opts.returnByValue ?? true,
+        // Gesture-gated APIs (requestPointerLock, requestFullscreen, AudioContext.resume)
+        // reject without user activation, which no harness verb can otherwise grant.
+        userGesture: opts.userGesture ?? false,
+    }, undefined, { timeoutMs });
     const res = (r as any).result;
     if (res?.exceptionDetails) {
         throw new Error(`page eval exception: ${res.exceptionDetails.text} ${res.exceptionDetails.exception?.description ?? ""}`);
@@ -499,11 +544,8 @@ export async function workerEval(session: CdpSession, expr: string, opts: { time
     const timeoutMs = opts.timeoutMs ?? 30_000;
     const sessionId = await attachEmulatorWorker(session);
     await session.send("Runtime.enable", {}, sessionId, { timeoutMs });
-    const r = await Promise.race([
-        session.send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true }, sessionId),
-        Bun.sleep(timeoutMs).then(() => ({ __timeout: true } as any)),
-    ]);
-    if ((r as any).__timeout) throw new Error(`workerEval timed out after ${timeoutMs}ms`);
+    const r = await session.send("Runtime.evaluate",
+        { expression: expr, returnByValue: true, awaitPromise: true }, sessionId, { timeoutMs });
     const res = (r as any).result;
     if (res?.exceptionDetails) throw new Error(`worker eval exception: ${res.exceptionDetails.text}`);
     return res?.result?.value ?? res?.result;
@@ -845,8 +887,9 @@ function repairViteDepCache(listening: boolean): boolean {
 
 /** Detached `bun run dev`, so it outlives this process on every platform. */
 function spawnVite(): void {
+    const port = new URL(DEFAULT_DEV_URL).port || "5174";
     if (!IS_WIN) {
-        Bun.spawn(["bun", "run", "dev"], {
+        Bun.spawn(["bun", "run", "dev", "--port", port, "--strictPort"], {
             cwd: process.cwd(), stdin: "ignore", stdout: "ignore", stderr: "ignore",
         }).unref();
         return;
@@ -856,7 +899,7 @@ function spawnVite(): void {
     // would otherwise terminate the string and change the command.
     const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
     Bun.spawnSync(["powershell", "-NoProfile", "-Command",
-        `Start-Process -FilePath 'bun' -ArgumentList 'run','dev' -WorkingDirectory ${q(process.cwd())} -WindowStyle Hidden`]);
+        `Start-Process -FilePath 'bun' -ArgumentList 'run','dev','--port',${q(port)},'--strictPort' -WorkingDirectory ${q(process.cwd())} -WindowStyle Hidden`]);
 }
 
 function killWedgedVite(): void {
@@ -962,7 +1005,8 @@ export async function ensureSidecar(): Promise<{ ok: boolean; action: string }> 
             const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
             Bun.spawnSync(["powershell", "-NoProfile", "-Command",
                 `Start-Process -FilePath 'bun' -ArgumentList 'run',${q(script)} -WorkingDirectory ${q(process.cwd())} ` +
-                `-WindowStyle Hidden -RedirectStandardOutput ${q(out)} -RedirectStandardError ${q(err)}`]);
+                `-WindowStyle Hidden -RedirectStandardOutput ${q(out)} -RedirectStandardError ${q(err)}`],
+                { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
         } else {
             Bun.spawn(["bun", "run", script], {
                 cwd: process.cwd(), stdin: "ignore",

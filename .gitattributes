@@ -1,0 +1,5 @@
+# Retained native oracle inputs are verified by their exact measured bytes.
+/tools/lan-conformance/winsock-udp-connreset.c text eol=lf
+/tools/lan-conformance/winsock-udp-connreset.schema.json text eol=lf
+/tools/lan-conformance/winsock-udp-connreset-iocp-apc-effect.c text eol=lf
+/tools/lan-conformance/winsock-udp-connreset-iocp-apc-effect.schema.json text eol=lf

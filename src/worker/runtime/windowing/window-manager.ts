@@ -184,17 +184,13 @@ export class WindowManager {
         for (const observer of this.foregroundQueueObservers) observer(incoming, prev);
     }
 
-    /**
-     * Is this window hit-testable — user32's copy of WS_VISIBLE when it knows it.
-     *
-     * DISABLED is deliberately not consulted: WindowFromPoint returns a disabled window
-     * (Wine's NtUserWindowFromPoint calls window_from_point with no style filter; only
-     * ChildWindowFromPointEx skips disabled, and only when asked via CWP_SKIPDISABLED).
-     * A modal dialog disables its owner, and Windows still routes clicks on the owner TO
-     * the owner, which ignores them; skipping it here sends them somewhere else instead.
-     */
+    /** Use user32's current visibility and enabled state when available. */
     private isHitTestable(win: WindowObject): boolean {
         return this.windowStateProvider?.(win.hwnd)?.visible ?? win.visible;
+    }
+
+    private isDisabled(win: WindowObject): boolean {
+        return this.windowStateProvider?.(win.hwnd)?.disabled ?? (win.style & WS_DISABLED) !== 0;
     }
 
     /**
@@ -231,7 +227,8 @@ export class WindowManager {
             const win = this.windows.get(hwnd);
             if (!win || !this.isHitTestable(win)) continue;
             if (!this.rectContains(win, screenX, screenY)) continue;
-            // Descend into children (deepest hit wins). Child rects are parent-relative.
+            // A disabled top-level still owns the point, but none of its children do.
+            if (this.isDisabled(win)) return hwnd;
             return this.descendToChildAtPoint(hwnd, win.rect.x, win.rect.y, screenX, screenY);
         }
         return 0;
@@ -272,7 +269,9 @@ export class WindowManager {
         const children = this.childrenFrontToBack(parentHwnd);
         for (let i = 0; i < children.length; i++) {
             const child = children[i];
-            if (!this.isHitTestable(child)) continue;
+            // Native WindowFromPoint and physical input skip disabled children, allowing
+            // an enabled sibling below them, or their parent, to receive the point.
+            if (!this.isHitTestable(child) || this.isDisabled(child)) continue;
             const cx = originX + child.rect.x;
             const cy = originY + child.rect.y;
             if (screenX >= cx && screenX < cx + child.rect.w && screenY >= cy && screenY < cy + child.rect.h) {
@@ -822,14 +821,16 @@ export class WindowManager {
         ptY = 0,
         targetThreadId = 0,
         keyStatePacked?: Uint8Array,
-        extraInfo = 0
+        extraInfo = 0,
+        synthesizedTimer = true,
+        timerEpoch = 0
     ): void {
         // Auto-resolve thread targeting from window ownership (matches Windows behavior:
         // PostMessage routes to the thread that created the window)
         if (targetThreadId === 0 && hwnd > 0) {
             targetThreadId = this.getWindowOwnerThread(hwnd);
         }
-        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo);
+        const discrete = this.messageQueue.enqueue(hwnd, msg, wParam, lParam, ptX, ptY, targetThreadId, keyStatePacked, extraInfo, synthesizedTimer, timerEpoch);
         if (discrete) {
             // Eagerly update shared flag so WASM PeekMessage sees new messages immediately.
             // Coalesced WM_MOUSEMOVE does NOT set the flag (starvation / spin avoidance).
@@ -883,6 +884,11 @@ export class WindowManager {
 
     hasMessages(msgMin = 0, msgMax = 0, callerThreadId = 0): boolean {
         return this.messageQueue.hasMessages(msgMin, msgMax, callerThreadId);
+    }
+
+    cancelPendingTimer(hwnd: number, id: number): void {
+        this.messageQueue.cancelTimer(hwnd, id);
+        hypercallDataManager.updateMessageQueueFlag(this.messageQueue.hasMessages());
     }
 
     /** MAKELONG(x, y) from the last dequeued message — for GetMessagePos(). */

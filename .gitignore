@@ -32,6 +32,8 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 logs/
+# lan-conformance golden logs are committed evidence, not run artifacts
+!tools/lan-conformance/cases/**/*.native.log
 
 # Environment
 .env

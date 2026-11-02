@@ -37,6 +37,7 @@ import {
     resetUser32SharedState, windows, type WindowInfo,
 } from "../../src/worker/modules/user32/shared-state";
 import { createWindowExports, defWindowProcSetCursor } from "../../src/worker/modules/user32/window";
+import { createDialogChildren } from "../../src/worker/modules/user32/dialog";
 
 const WS_CHILD = 0x40000000;
 const WS_VISIBLE = 0x10000000;
@@ -157,6 +158,20 @@ describe("built-in classes carry the cursor the OS registered them with", () => 
 
         expect(wm.getWindow(hwnd)!.wndClass.style).toBe(0x0800 | 0x0008);
         expect(wm.getWindow(hwnd)!.wndClass.wndProc).toBe(DEF_DLG_PROC_ADDR);
+    });
+
+    test("dialog template list boxes have double-click class style immediately", () => {
+        const parent = mkWindow({});
+        const info = windows.get(parent)!;
+        createDialogChildren(System.getInstance(), parent, info, {
+            style: 0, exStyle: 0, x: 0, y: 0, cx: 100, cy: 100,
+            title: "", menuId: 0, windowClass: "#32770",
+            controls: [{ className: "ListBox", title: "", style: WS_VISIBLE,
+                exStyle: 0, x: 0, y: 0, cx: 40, cy: 20, id: 1 }],
+        }, 0x400000);
+        const child = wm.getWindow(info.children[0])!;
+        expect(child.wndClass.style & 0x0008).toBe(0x0008);
+        expect(child.wndClass.wndProc).toBe(DEF_WINDOW_PROC_ADDR);
     });
 
     test("registerBuiltinClass defaults to the arrow, and an explicit NULL survives", () => {

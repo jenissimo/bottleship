@@ -12,6 +12,7 @@ import { deliverPendingApcs } from './sync';
 import { Logger, LogCategory } from '../../core/logger';
 import { System } from '../../core/system';
 import { Mem } from '../../core/memory/mem-accessor';
+import { socketCompletionWait } from './socket-completion-wait';
 
 const ERROR_INVALID_PARAMETER = 87;
 const ERROR_IO_INCOMPLETE = 996;
@@ -50,6 +51,9 @@ function ioStatusToWin32(status: number): number {
         case 0xC00000BB: return 50;   // STATUS_NOT_SUPPORTED
         case 0xC0000120: return 995;  // STATUS_CANCELLED -> ERROR_OPERATION_ABORTED
         case 0xC000014B: return 109;  // STATUS_PIPE_BROKEN
+        case 0xC000020D: return 64;   // STATUS_CONNECTION_RESET -> ERROR_NETNAME_DELETED
+        case 0xC0000236: return 1225; // STATUS_CONNECTION_REFUSED
+        case 0xC00000B5: return 121;  // STATUS_IO_TIMEOUT
         default: return 317;          // ERROR_MR_MID_NOT_FOUND, RtlNtStatusToDosError's own default
     }
 }
@@ -75,9 +79,12 @@ function overlappedResult(
         let status = Mem.readUint32(lpOverlapped) ?? 0;
         if (lpBytes) Mem.writeUint32(lpBytes, Mem.readUint32(lpOverlapped + 4) ?? 0);
         if (status === STATUS_PENDING) status = 0;
-        return status === 0 ? { value: 1 } : { value: 0, lastError: ioStatusToWin32(status) };
+        // Current Windows reports ERROR_SUCCESS even when the IOSB was already complete.
+        return status === 0 ? { value: 1, lastError: 0 } : { value: 0, lastError: ioStatusToWin32(status) };
     };
+    let socketWait: ReturnType<typeof socketCompletionWait> = null;
     const afterWait = (waitResult: number): { value: number; lastError?: number } => {
+        socketWait?.release();
         if (waitResult === WAIT_OBJECT_0) return complete();
         if (waitResult === WAIT_FAILED) return { value: 0, lastError: 6 }; // ERROR_INVALID_HANDLE
         return { value: 0, lastError: waitResult };                      // WAIT_TIMEOUT / WAIT_IO_COMPLETION
@@ -99,7 +106,8 @@ function overlappedResult(
     }
 
     const hEvent = Mem.readUint32(lpOverlapped + 16) ?? 0;
-    const waitOn = (hEvent ? hEvent : hFile) & ~3;
+    if (!hEvent) socketWait = socketCompletionWait(hFile, lpOverlapped);
+    const waitOn = socketWait ? socketWait.handle : (hEvent ? hEvent : hFile) & ~3;
     const returnAddr = Mem.readUint32(ctx.esp) ?? 0;
     const result = sched.waitForObjectsWithContext(
         [waitOn >>> 0], false, timeoutMs, returnAddr, ctx.esp + 4 + cleanup,

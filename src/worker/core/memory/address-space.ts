@@ -41,6 +41,14 @@ export interface RegionEntry {
     tag?: string;
     allowOverlap?: boolean;
     skipOverlapCheck?: boolean;
+    /** Protection fragments retain their original allocation identity and bounds. */
+    allocationId?: number;
+    allocationBase?: number;
+    allocationSize?: number;
+    allocationPerms?: RegionPerms;
+    allocationProtect?: number;
+    /** Exact Win32 protection flags when supplied by the virtual-memory API. */
+    protection?: number;
 }
 
 interface LayoutBucket {
@@ -118,8 +126,8 @@ export class AddressSpace {
 
     registerRegion(entry: Omit<RegionEntry, "id">): number {
         const newEntry: RegionEntry = {
-            id: this.nextRegionId++,
             ...entry,
+            id: this.nextRegionId++,
         };
 
         const conflict = newEntry.skipOverlapCheck ? undefined : this.regions.find(other =>
@@ -133,6 +141,11 @@ export class AddressSpace {
             throw new Error(msg);
         }
 
+        newEntry.allocationId ??= newEntry.id;
+        newEntry.allocationBase ??= newEntry.base;
+        newEntry.allocationSize ??= newEntry.size;
+        newEntry.allocationPerms ??= newEntry.perms;
+        if (entry.allocationId === undefined) newEntry.allocationProtect ??= newEntry.protection;
         this.regions.push(newEntry);
         this.noteRegionAdded(newEntry);
         if (entry.owner === "Layout") {
@@ -157,17 +170,17 @@ export class AddressSpace {
      * blocks many times a second, which is a rate that keeps the JIT permanently cold.
      */
     releaseRegion(base: number): boolean {
-        const idx = this.regions.findIndex(region => region.base === base && region.owner !== "Layout");
-        if (idx >= 0) {
-            const released = this.regions[idx];
-            this.regions.splice(idx, 1);
-            this.noteRegionRemoved(released);
-            // A released VA is no longer a known writable region — drop bit0.
-            // (Data map, read per store, no generation guard — see codegen gen_safe_write.)
-            setWriteMapBase(released.base, released.size, false);
-            return true;
+        const root = this.regions.find(region => region.base === base && region.owner !== "Layout");
+        if (!root) return false;
+        const id = root.allocationId ?? root.id;
+        const removed = this.regions.filter(region => region.owner !== "Layout" &&
+            (region.allocationId ?? region.id) === id);
+        this.regions = this.regions.filter(region => !removed.includes(region));
+        for (const region of removed) {
+            this.noteRegionRemoved(region);
+            setWriteMapBase(region.base, region.size, false);
         }
-        return false;
+        return true;
     }
 
     /**
@@ -196,12 +209,66 @@ export class AddressSpace {
             .map(r => ({ base: r.base, size: r.size }));
     }
 
-    protect(base: number, size: number, perms: RegionPerms): boolean {
-        const region = this.regions.find(r => r.base === base && r.size === size);
-        if (!region) return false;
-        region.perms = perms;
-        // Re-derive bit0 from the new perms + kind (RO/NOACCESS ⇒ clear).
-        setWriteMapBase(region.base, region.size, isWriteMapFastRegion(region.kind, perms));
+    protect(base: number, size: number, perms: RegionPerms, protection?: number): boolean {
+        if (!Number.isSafeInteger(base) || !Number.isSafeInteger(size) || base < 0 || size <= 0 ||
+            base + size > 0x100000000) return false;
+        let first = this.getRegion(base);
+        if (!first) return false;
+        const end = base + size;
+        const allocationBase = first.allocationBase ?? first.base;
+        const allocationSize = first.allocationSize ?? first.size;
+        if (base < allocationBase || end > allocationBase + allocationSize) return false;
+
+        // A heap layout intentionally has no per-HeapAlloc records. Materialize its
+        // protection spans only when needed; the Layout bucket stays a coarse fallback.
+        if (first.owner === "Layout") {
+            const shadow: RegionEntry = { ...first, id: this.nextRegionId++,
+                owner: "Protection", allowOverlap: true, skipOverlapCheck: true };
+            this.regions.push(shadow);
+            first = shadow;
+        }
+        const allocationId = first.allocationId ?? first.id;
+        const affected = this.regions.filter(region => region.owner !== "Layout" &&
+            (region.allocationId ?? region.id) === allocationId &&
+            region.base < end && region.base + region.size > base);
+        let covered = base;
+        for (const region of [...affected].sort((a, b) => a.base - b.base)) {
+            if (region.base > covered) return false;
+            covered = Math.max(covered, Math.min(end, region.base + region.size));
+        }
+        if (covered < end) return false;
+        const replacements: RegionEntry[] = [];
+        const fragment = (region: RegionEntry, start: number, stop: number, changed = false): void => {
+            if (stop <= start) return;
+            replacements.push({
+                ...region, id: this.nextRegionId++, base: start, size: stop - start,
+                perms: changed ? perms : region.perms,
+                protection: changed ? protection : region.protection,
+            });
+        };
+        for (const region of affected) {
+            fragment(region, region.base, Math.min(base, region.base + region.size));
+            fragment(region, Math.max(base, region.base), Math.min(end, region.base + region.size), true);
+            fragment(region, Math.max(end, region.base), region.base + region.size);
+        }
+        this.regions = this.regions.filter(region => !affected.includes(region));
+        this.regions.push(...replacements);
+
+        // Coalesce equal siblings, while keeping the allocation's original identity.
+        const siblings = this.regions.filter(region => region.owner !== "Layout" &&
+            (region.allocationId ?? region.id) === allocationId).sort((a, b) => a.base - b.base);
+        for (let i = 1; i < siblings.length; i++) {
+            const left = siblings[i - 1]!, right = siblings[i]!;
+            if (left.base + left.size === right.base && left.perms === right.perms &&
+                left.protection === right.protection) {
+                left.size += right.size;
+                this.regions.splice(this.regions.indexOf(right), 1);
+                siblings.splice(i--, 1);
+            }
+        }
+        // Membership and lengths changed together; rebuild lazily on the next query.
+        this.invalidateRegionIndex();
+        setWriteMapBase(base, size, isWriteMapFastRegion(first.kind, perms));
         return true;
     }
 
@@ -327,6 +394,7 @@ export class AddressSpace {
         const existing = this.regions.find(region => region.kind === "LOW_MEM");
         if (existing) {
             existing.size = size;
+            existing.allocationSize = size;
             existing.perms = "rw";
             // A non-bucket region's `size` is baked into the index's prefix-max end, which the
             // index holds by VALUE (unlike `perms`/bucket sizes, read live through the
@@ -347,20 +415,68 @@ export class AddressSpace {
     }
 
     validateRange(address: number, size: number, requiredPerms: string = "rw"): boolean {
-        if (address < 0 || size < 0) return false;
+        if (!Number.isSafeInteger(address) || !Number.isSafeInteger(size) ||
+            address < 0 || size < 0 || address + size > 0x100000000) return false;
+        const end = address + size;
+        if (size === 0) {
+            const region = this.findNarrowestContaining(address, address);
+            return !!region && region.perms !== "noaccess" &&
+                (!requiredPerms.includes("w") || region.perms.includes("w")) &&
+                (!requiredPerms.includes("x") || region.perms.includes("x"));
+        }
+        const regions = this.intersectingRegions(address, end);
+        // Even a range that fits a coarse bucket may cross a narrower protected span.
+        // Check each effective segment; no bucket can hide a RO/NOACCESS sub-page.
+        const boundaries = [address, end];
+        for (const region of regions) {
+            if (region.base > address && region.base < end) boundaries.push(region.base);
+            const stop = region.base + region.size;
+            if (stop > address && stop < end) boundaries.push(stop);
+        }
+        boundaries.sort((a, b) => a - b);
+        for (let i = 0; i < boundaries.length - 1; i++) {
+            if (i > 0 && boundaries[i] === boundaries[i - 1]) continue;
+            const point = boundaries[i]!;
+            let best: RegionEntry | undefined;
+            for (const region of regions) {
+                if (point < region.base || point >= region.base + region.size) continue;
+                if (!best || this.preferRegion(region, best)) best = region;
+            }
+            if (!best || best.perms === "noaccess" ||
+                (requiredPerms.includes("r") && !best.perms.includes("r")) ||
+                (requiredPerms.includes("w") && !best.perms.includes("w")) ||
+                (requiredPerms.includes("x") && !best.perms.includes("x"))) return false;
+        }
+        return regions.length > 0;
+    }
 
-        // Layout buckets are coarse containers that DELIBERATELY overlap the real regions
-        // registered inside them (allowOverlap), so "first containing region wins" answers
-        // with the bucket's blanket perms — a write into a mapped DLL's .data reads as a
-        // write into read-only ROM. The narrowest containing region is the one that actually
-        // describes this address; the bucket is only the fallback when nothing finer exists.
-        const best = this.findNarrowestContaining(address, address + size);
-        if (!best) return false;
+    private preferRegion(candidate: RegionEntry, current: RegionEntry): boolean {
+        // Equal-size actual mappings override their Layout container.
+        return candidate.size < current.size ||
+            (candidate.size === current.size && current.owner === "Layout" && candidate.owner !== "Layout");
+    }
 
-        if (best.perms === "noaccess") return false;
-        if (requiredPerms.includes("w") && !best.perms.includes("w")) return false;
-        if (requiredPerms.includes("x") && !best.perms.includes("x")) return false;
-        return true;
+    /** Indexed intersection query: costs only the few real mappings near the range. */
+    private intersectingRegions(start: number, end: number): RegionEntry[] {
+        if (!this.idxBuilt) this.rebuildRegionIndex();
+        const result: RegionEntry[] = [];
+        const consider = (region: RegionEntry): void => {
+            if (region.base <= end && region.base + region.size >= start &&
+                (start === end || (region.base < end && region.base + region.size > start))) result.push(region);
+        };
+        for (const region of this.idxBuckets) consider(region);
+        for (const region of this.idxRecent) consider(region);
+        let lo = 0, hi = this.idxSorted.length - 1, last = -1;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (this.idxSorted[mid]!.base <= end) { last = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        for (let i = last; i >= 0; i--) {
+            if (this.idxMaxEnd[i]! < start) break;
+            const region = this.idxSorted[i]!;
+            if (!this.idxRemoved.has(region.id)) consider(region);
+        }
+        return result;
     }
 
     // ── stabbing index ────────────────────────────────────────────────────────
@@ -450,7 +566,7 @@ export class AddressSpace {
         let best: RegionEntry | undefined;
         const consider = (r: RegionEntry): void => {
             if (start < r.base || end > r.base + r.size) return;
-            if (!best || r.size < best.size) best = r;
+            if (!best || this.preferRegion(r, best)) best = r;
         };
         const buckets = this.idxBuckets;
         for (let i = 0; i < buckets.length; i++) consider(buckets[i]);
@@ -541,6 +657,7 @@ export class AddressSpace {
 
         const oldSize = bucket.size;
         bucket.size = requestedSize;
+        bucket.allocationSize = requestedSize;
 
         Logger.log(LogCategory.SYSTEM,
             `[AddressSpace] Expanded ${kind} bucket: 0x${bucket.base.toString(16)}..0x${newEnd.toString(16)} ` +
@@ -558,7 +675,7 @@ export class AddressSpace {
     }
 
     getRegion(address: number): RegionEntry | null {
-        return this.regions.find(region => address >= region.base && address < region.base + region.size) ?? null;
+        return this.findNarrowestContaining(address, address + 1) ?? null;
     }
 
     getRegions(): RegionEntry[] {

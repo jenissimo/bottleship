@@ -150,13 +150,23 @@ export const enum ApcKind {
     /** FILE_IO_COMPLETION_ROUTINE(dwErrorCode, dwBytesTransferred, lpOverlapped) —
      *  ReadFileEx/WriteFileEx. Three args, cdecl-free stdcall, cleanup 12. */
     IO_COMPLETION = 3,
+    /** WSAOVERLAPPED_COMPLETION_ROUTINE(error, bytes, overlapped, flags). */
+    WSA_COMPLETION = 4,
 }
 
+/** Optional owner-thread storage whose lifetime ends with callback return or discard. */
+export interface ApcCallbackLifetime {
+    prepare?(args: readonly number[]): readonly number[] | null;
+    onReturn?(): void;
+    onDiscard?(): void;
+}
 export interface PendingApc {
+    lifetime?: ApcCallbackLifetime;
     routine: number;
     arg0: number;
     arg1: number;
     arg2: number;
+    arg3?: number;
     kind: ApcKind;
 }
 

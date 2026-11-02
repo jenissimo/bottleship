@@ -14,7 +14,7 @@ import { resolveThunkedDllAlias } from '../../../core/dll-aliases';
 import { FORCE_NATIVE_PACKAGE_LOAD, isUnderSystemDirectory } from '../../../core/hle-system-catalog';
 import { findDllRule } from '../../../core/dll-rules';
 import { validLoadLibrarySearchFlags } from '../../../core/dll-search-order';
-import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, markHleModuleLoaded } from '../../../core/hle-module-images';
+import { hleImageBase, hleModuleNameByBase, isHleModuleLoaded, loadedHleModules, retainHleModuleLoaded, type HleModuleLoadReference } from '../../../core/hle-module-images';
 import { getProcAddressRegistry, type GetProcResolution } from '../../../core/diagnostics/get-proc-address-registry';
 import { moduleHandleMissRegistry } from '../../../core/diagnostics/module-handle-miss-registry';
 import { isSuspectSilentStub } from '../../../core/diagnostics/api-census';
@@ -43,6 +43,7 @@ const loggedUnknownModuleHandles = new Set<number>();
 // them. Only explicitly LoadLibrary'd modules unload at refcount 0.
 const pinnedModuleBases = new Set<number>();
 const dynamicLoadRefs = new Map<number, number>();
+const hleLibraryReferences = new Map<number, Map<string, HleModuleLoadReference>>();
 let cacheOwnerProcess: any = null;
 let cacheOwnerResetGeneration = -1;
 
@@ -66,6 +67,8 @@ function ensureProcessLocalCaches(): void {
     moduleHandleMissRegistry.clear();
     pinnedModuleBases.clear();
     dynamicLoadRefs.clear();
+    for (const aliases of hleLibraryReferences.values()) for (const reference of aliases.values()) reference.release();
+    hleLibraryReferences.clear();
 }
 
 /** Pin every registered module that holds no dynamic LoadLibrary ref (see
@@ -182,11 +185,22 @@ function getThunkedModuleName(value: string): string {
 }
 
 function getThunkedDllBase(dllName: string): number | undefined {
-    const thunkedName = getThunkedModuleName(dllName);
-    const base = hleImageBase(thunkedName);
-    // Asking for a module by name IS loading it, as far as the loader list is concerned.
-    if (base !== undefined) markHleModuleLoaded(thunkedName);
-    return base;
+    return hleImageBase(getThunkedModuleName(dllName));
+}
+
+/** A materialized HLE image is not necessarily in this process' loader list. */
+function getLoadedThunkedDllBase(dllName: string): number | undefined {
+    // Keep the requested spelling: an alias can have its own materialized slot.
+    return isHleModuleLoaded(dllName) ? getThunkedDllBase(dllName) : undefined;
+}
+
+function getLoadedModuleByAddress(address: number): number {
+    const native = System.getInstance().process?.moduleRegistry?.getModuleContainingAddress(address);
+    if (native) return native.baseAddress;
+    for (const image of loadedHleModules()) {
+        if (address >= image.base && address < image.base + image.size) return image.base;
+    }
+    return 0;
 }
 
 function getDllBaseName(value: string): string {
@@ -223,6 +237,16 @@ function rememberModuleHandlePath(handle: number, pathOrName: string, moduleName
     if (!h) return;
     const path = formatModulePath(pathOrName, moduleName);
     if (path) handleToPathCache.set(h, path);
+}
+
+function rememberHleLibraryReference(name: string, handle: number): void {
+    let aliases = hleLibraryReferences.get(handle);
+    if (!aliases) hleLibraryReferences.set(handle, aliases = new Map());
+    const key = getDllBaseName(name);
+    if (!aliases.has(key)) {
+        const reference = retainHleModuleLoaded(name);
+        if (reference) aliases.set(key, reference);
+    }
 }
 
 function rememberLoadLibraryHandle(name: string, handle: number): void {
@@ -489,7 +513,7 @@ function initModuleFunctions(): void {
         const thunkedName = getThunkedModuleName(name);
 
         // Check if it's a thunked (HLE) system DLL - return pseudo-handle
-        const pseudoBase = getThunkedDllBase(nameLower);
+        const pseudoBase = getLoadedThunkedDllBase(name);
         if (pseudoBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(name, thunkedName, 4, "GetModuleHandleA");
             if (blocked) {
@@ -538,7 +562,7 @@ function initModuleFunctions(): void {
         const thunkedName = getThunkedModuleName(name);
 
         // Check if it's a thunked (HLE) system DLL - return pseudo-handle
-        const pseudoBase = getThunkedDllBase(nameLower);
+        const pseudoBase = getLoadedThunkedDllBase(name);
         if (pseudoBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(name, thunkedName, 4, "GetModuleHandleW");
             if (blocked) {
@@ -569,25 +593,14 @@ function initModuleFunctions(): void {
         let moduleHandle = 0;
 
         if (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
-            // Treat lpModuleName as an address and find module containing it
-            if (moduleRegistry) {
-                const mod = moduleRegistry.getModuleContainingAddress(lpModuleName);
-                if (mod) {
-                    moduleHandle = mod.baseAddress;
-                    Logger.verbose(LogCategory.KERNEL32,
-                        `GetModuleHandleExW(FROM_ADDRESS, 0x${lpModuleName.toString(16)}) -> 0x${moduleHandle.toString(16)}`);
-                } else {
-                    const exeMod = moduleRegistry.getExecutableModule();
-                    if (exeMod) {
-                        const base = exeMod.baseAddress;
-                        if (lpModuleName >= base && lpModuleName < base + exeMod.size) {
-                            moduleHandle = base;
-                        }
-                    }
-                }
-            }
+            moduleHandle = getLoadedModuleByAddress(lpModuleName);
             if (moduleHandle === 0) {
-                moduleHandle = getMainExeHandle();
+                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                if (phModule !== 0 && phModule + 4 <= mem.length) {
+                    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                    view.setUint32(phModule, 0, true);
+                }
+                return { value: 0, stackCleanup: 12 };
             }
         } else if (lpModuleName !== 0) {
             const name = Marshaler.readStringW(mem, lpModuleName);
@@ -604,7 +617,7 @@ function initModuleFunctions(): void {
             // Check thunked DLLs
             if (moduleHandle === 0) {
                 const thunkedName = getThunkedModuleName(name);
-                const pseudoBase = getThunkedDllBase(nameLower);
+                const pseudoBase = getLoadedThunkedDllBase(name);
                 if (pseudoBase !== undefined) {
                     const blocked = tryBlockThunkedDllLoad(name, thunkedName, 12, "GetModuleHandleExW");
                     if (blocked) {
@@ -651,22 +664,14 @@ function initModuleFunctions(): void {
         let moduleHandle = 0;
 
         if (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
-            if (moduleRegistry) {
-                const mod = moduleRegistry.getModuleContainingAddress(lpModuleName);
-                if (mod) {
-                    moduleHandle = mod.baseAddress;
-                } else {
-                    const exeMod = moduleRegistry.getExecutableModule();
-                    if (exeMod) {
-                        const base = exeMod.baseAddress;
-                        if (lpModuleName >= base && lpModuleName < base + exeMod.size) {
-                            moduleHandle = base;
-                        }
-                    }
-                }
-            }
+            moduleHandle = getLoadedModuleByAddress(lpModuleName);
             if (moduleHandle === 0) {
-                moduleHandle = getMainExeHandle();
+                system.process!.lastError = 126; // ERROR_MOD_NOT_FOUND
+                if (phModule !== 0 && phModule + 4 <= mem.length) {
+                    const view = new DataView(mem.buffer, mem.byteOffset, mem.byteLength);
+                    view.setUint32(phModule, 0, true);
+                }
+                return { value: 0, stackCleanup: 12 };
             }
         } else if (lpModuleName !== 0) {
             const name = Marshaler.readString(mem, lpModuleName);
@@ -683,7 +688,7 @@ function initModuleFunctions(): void {
             // Check thunked DLLs
             if (moduleHandle === 0) {
                 const thunkedName = getThunkedModuleName(name);
-                const pseudoBase = getThunkedDllBase(nameLower);
+                const pseudoBase = getLoadedThunkedDllBase(name);
                 if (pseudoBase !== undefined) {
                     const blocked = tryBlockThunkedDllLoad(name, thunkedName, 12, "GetModuleHandleExA");
                     if (blocked) {
@@ -827,6 +832,7 @@ function initModuleFunctions(): void {
             if (blocked) {
                 return blocked;
             }
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             Logger.log(LogCategory.KERNEL32, `LoadLibraryExW("${dllName}") -> 0x${thunkedBase.toString(16)} (thunked DLL)`);
             return { value: thunkedBase, stackCleanup: 12 };
@@ -917,6 +923,7 @@ function initModuleFunctions(): void {
             if (blocked) {
                 return blocked;
             }
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             Logger.log(LogCategory.KERNEL32, `LoadLibraryExA("${dllName}") -> 0x${thunkedBase.toString(16)} (thunked DLL)`);
             return { value: thunkedBase, stackCleanup: 12 };
@@ -1003,6 +1010,7 @@ function initModuleFunctions(): void {
         if (thunkedBase !== undefined) {
             const blocked = tryBlockThunkedDllLoad(dllName, thunkedName, 4, "LoadLibraryW");
             if (blocked) return blocked;
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             return { value: thunkedBase, stackCleanup: 4 };
         }
@@ -1105,6 +1113,7 @@ function initModuleFunctions(): void {
                 return { value: 0, stackCleanup: 4 };
             }
 
+            rememberHleLibraryReference(dllName, thunkedBase);
             rememberLoadLibraryHandle(dllName, thunkedBase);
             return { value: thunkedBase, stackCleanup: 4 };
         }
@@ -1165,7 +1174,20 @@ function initModuleFunctions(): void {
         const registry = System.getInstance().process?.moduleRegistry;
         const mod = registry?.getByBase?.(hModule);
 
-        // Pinned (EXE + static imports), thunked pseudo-bases, and unknown handles:
+        if (!mod && hleModuleNameByBase(hModule) !== undefined) {
+            const refs = dynamicLoadRefs.get(hModule) ?? 0;
+            if (refs > 1) dynamicLoadRefs.set(hModule, refs - 1);
+            else if (refs === 1) {
+                dynamicLoadRefs.delete(hModule);
+                for (const reference of hleLibraryReferences.get(hModule)?.values() ?? []) reference.release();
+                hleLibraryReferences.delete(hModule);
+                for (const [key, value] of loadLibraryHandleCache) if (value === hModule) loadLibraryHandleCache.delete(key);
+                handleToPathCache.delete(hModule);
+            }
+            return { value: 1, stackCleanup: 4 };
+        }
+
+        // Pinned (EXE + static imports) and unknown handles:
         // report success without unloading (a static import holds a permanent ref).
         if (!mod || pinnedModuleBases.has(hModule)) {
             Logger.verbose(LogCategory.KERNEL32, `FreeLibrary(0x${hModule.toString(16)}) -> 1 (pinned/unknown)`);
@@ -1489,11 +1511,8 @@ export function registerFastPathModuleFunctions(dispatcher: HleDispatcher): void
         if (registry?.getByName(name)) return null;
         if (appDirDllShadowsHle(name) || requestsSystemCopyOfAppDirDll(name)) return null;
         if (findDisabledDllRule(name) || findDisabledDllRule(thunkedName)) return null;
-        const base = hleImageBase(thunkedName);
-        if (base !== undefined) {
-            markHleModuleLoaded(thunkedName);
-            return base;
-        }
+        const base = getLoadedThunkedDllBase(name);
+        if (base !== undefined) return base;
         return null; // Fall through to slow path for real DLLs, exe name, etc.
     };
 

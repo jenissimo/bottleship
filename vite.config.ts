@@ -192,12 +192,17 @@ function serveWgbFromDisk(): Plugin {
 // only ever wasted minutes/gigabytes on `vite build`. Copy everything else, skip apps/.
 // (BYO games and agent/make-wgb loads stream off disk via serveWgbFromDisk — never in public/.)
 function copyPublicDirExceptApps(): Plugin {
+  let resolvedOutDir: string | undefined;
   return {
     name: "copy-public-dir-except-apps",
     apply: "build",
+    configResolved(config) {
+      resolvedOutDir = path.resolve(config.root, config.build.outDir);
+    },
     closeBundle() {
       const publicDir = path.resolve(__dirname, "public");
-      const outDir = path.resolve(__dirname, "dist");
+      const outDir = resolvedOutDir;
+      if (!outDir) throw new Error("Resolved build.outDir required");
       if (!fs.existsSync(publicDir)) return;
       fs.mkdirSync(outDir, { recursive: true });
       for (const entry of fs.readdirSync(publicDir, { withFileTypes: true })) {

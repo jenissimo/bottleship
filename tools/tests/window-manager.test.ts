@@ -224,10 +224,7 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(80, 80)).toBe(grandchild);
     });
 
-    // WindowFromPoint does NOT filter on WS_DISABLED (Wine NtUserWindowFromPoint calls
-    // window_from_point with no style filter; only ChildWindowFromPointEx skips disabled,
-    // and only when asked via CWP_SKIPDISABLED). A modal dialog disables its owner and
-    // Windows still routes clicks on the owner TO the owner, which ignores them.
+    // A disabled top-level remains the hit, but Windows does not descend into it.
     test("WS_DISABLED top-level still answers (Windows does not skip it)", () => {
         mkTopLevel(wm, 0, 0, 200, 200);
         const disabled = mkTopLevel(wm, 0, 0, 200, 200, { disabled: true });
@@ -246,10 +243,20 @@ describe("WindowManager WindowFromPoint", () => {
         expect(wm.windowFromPoint(75, 75)).toBe(top);
     });
 
-    test("disabled child still answers (same no-filter rule as a top-level)", () => {
+    test("disabled child falls through to the parent or an enabled sibling", () => {
         const top = mkTopLevel(wm, 0, 0, 300, 300);
-        const child = mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
-        expect(wm.windowFromPoint(75, 75)).toBe(child);
+        const disabled = mkChild(wm, top, 50, 50, 100, 100, { disabled: true });
+        expect(wm.windowFromPoint(75, 75)).toBe(top);
+        const underlying = mkChild(wm, top, 50, 50, 100, 100);
+        expect(wm.windowFromPoint(75, 75)).toBe(underlying);
+        wm.registerWindowStateProvider(hwnd => hwnd === disabled ? { visible: true, disabled: false } : undefined);
+        expect(wm.windowFromPoint(75, 75)).toBe(disabled);
+    });
+
+    test("disabled top-level owns the hit without descending into children", () => {
+        const top = mkTopLevel(wm, 0, 0, 300, 300, { disabled: true });
+        mkChild(wm, top, 50, 50, 100, 100);
+        expect(wm.windowFromPoint(75, 75)).toBe(top);
     });
 
     // The sibling list lives in user32 and SetWindowPos reorders it there; a child raised

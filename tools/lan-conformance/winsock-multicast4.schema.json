@@ -1,0 +1,233 @@
+{
+  "format": "BottleShip independent x86 Windows oracle",
+  "byteOrder": "little-endian",
+  "wordBytes": 4,
+  "header": [
+    "magic:0x42534c4e",
+    "totalWordsIncludingHeader",
+    "ORACLE_NONCE"
+  ],
+  "profiles": {
+    "measured": "Windows 11 Pro 10.0.26300 x64; native x86 process",
+    "scope": "A modern Windows provider observation; does not establish historical Win9x/XP defaults or host-independent interface-zero routing."
+  },
+  "transport": "Loopback IPv4 multicast, explicit 127/8 interface, TTL0; nonblocking TCP destination probe.",
+  "fixtures": [
+    {
+      "source": "winsock-multicast4.c",
+      "observations": 692,
+      "layout": "tagged",
+      "notes": "Scalar option/default/length errors and seven local receive/filter phases. Record sizes follow tag families in the C producer."
+    },
+    {
+      "source": "winsock-multicast4-pointer-order.c",
+      "observations": 4882,
+      "startupWords": 1,
+      "caseCount": 345,
+      "caseWords": 14,
+      "caseFields": [
+        "api:0=get/1=set",
+        "kind:0=UDP/1=TCP/2=invalidSocket",
+        "IPPROTO_IP option",
+        "pointerMode",
+        "capacityBefore",
+        "return",
+        "lastErrorUnlessFaulted",
+        "faultCount",
+        "exceptionCode",
+        "exceptionAccess",
+        "faultAddressClass",
+        "capacityOrProviderStateAfter",
+        "valueDWORD0",
+        "valueDWORD1"
+      ],
+      "caseOrder": "api ascending, kind ascending, option 9..13; get modes 0..12, set modes 0..9",
+      "tail": {
+        "interfaceCases": 5,
+        "wordsPerCase": 10,
+        "fields": [
+          "tag9000",
+          "IPv4 interface DWORD",
+          "setReturn",
+          "setLastError",
+          "getReturn",
+          "getLastError",
+          "getLength",
+          "getValue",
+          "joinReturn",
+          "joinLastError"
+        ],
+        "cleanupWords": 1
+      }
+    },
+    {
+      "source": "winsock-multicast4-pointer-capacity.c",
+      "observations": 5512,
+      "startupWords": 1,
+      "caseCount": 390,
+      "caseWords": 14,
+      "caseFields": "Same fields as pointer-order",
+      "caseOrder": "api ascending, kind ascending, option 9..13; get modes 0..14, set modes 0..10",
+      "additionalGetModes": {
+        "13": "capacity8, first4 RW, unused tail NOACCESS",
+        "14": "capacity8, first4 RW, unused tail READONLY"
+      },
+      "additionalSetModes": {
+        "10": "needed prefix RW, unused caller extent tail NOACCESS"
+      },
+      "tail": "Same five interface records and cleanup word as pointer-order"
+    },
+    {
+      "source": "winsock-multicast4-alias-queue.c",
+      "observations": 365,
+      "layout": "tagged",
+      "defaultFields": [
+        "tag",
+        "return",
+        "lastError"
+      ],
+      "getOption": {
+        "tags": [
+          110,
+          111,
+          112,
+          140,
+          141,
+          142,
+          150,
+          151,
+          152,
+          170,
+          171,
+          172,
+          180,
+          181,
+          182,
+          200,
+          201,
+          202,
+          354,
+          355,
+          356,
+          410,
+          411,
+          412
+        ],
+        "fields": [
+          "tag",
+          "return",
+          "lastError",
+          "length",
+          "value"
+        ]
+      },
+      "duplicate": {
+        "tags": [
+          130,
+          131,
+          305,
+          306,
+          341,
+          342,
+          405,
+          408
+        ],
+        "fields": [
+          "tag",
+          "return",
+          "lastError",
+          "reservedHandleNonzeroOrImportedIdentity"
+        ]
+      },
+      "socketName": {
+        "tags": [
+          302,
+          312,
+          352
+        ],
+        "fields": [
+          "tag",
+          "return",
+          "lastError",
+          "length",
+          "hasNonzeroPort"
+        ]
+      },
+      "receive": {
+        "tags": [
+          323,
+          326,
+          334,
+          337,
+          346,
+          359
+        ],
+        "absentFields": [
+          "tag",
+          "0xfeed"
+        ],
+        "presentFields": [
+          "tag",
+          "return",
+          "lastError",
+          "marker",
+          "nameLength",
+          "isAF_INET",
+          "is127001"
+        ]
+      }
+    },
+    {
+      "source": "winsock-tcp-multicast-destination.c",
+      "observations": 97,
+      "startupFields": [
+        "return",
+        "lastError"
+      ],
+      "caseCount": 3,
+      "caseWords": 31,
+      "caseFields": [
+        "bindMode:0=unbound/1=ANY/2=127001",
+        "socketReturn",
+        "socketLastError",
+        "nonblockingReturn",
+        "nonblockingLastError",
+        "bindReturnOrFEED",
+        "bindLastErrorOrFEED",
+        "beforeNameReturn",
+        "beforeNameLastError",
+        "beforeNameLength",
+        "beforeFamily",
+        "beforeIPv4",
+        "beforeHasPort",
+        "connectReturn",
+        "connectLastError",
+        "afterNameReturn",
+        "afterNameLastError",
+        "afterNameLength",
+        "afterFamily",
+        "afterIPv4",
+        "afterHasPort",
+        "selectReturn",
+        "selectLastError",
+        "writeReady",
+        "exceptReady",
+        "getErrorReturn",
+        "getErrorLastError",
+        "getErrorLength",
+        "socketError",
+        "closeReturn",
+        "closeLastError"
+      ],
+      "cleanupFields": [
+        "return",
+        "lastError"
+      ]
+    }
+  ],
+  "exclusions": [
+    "Interface-zero membership routing is configuration-dependent and is kept as raw evidence in a separate finite probe, not normalized into an exact production match.",
+    "Safety quota 256 memberships/socket and 4096/table is not a measured native maximum.",
+    "RAW multicast is not established by these UDP/TCP probes."
+  ]
+}

@@ -1,0 +1,28 @@
+wsastartup 0x202 -> ret=0 err=0 ver=2.2 high=2.2
+socket AF_INET SOCK_STREAM 0 -> ret=l err=0
+bind l 127.0.0.1:0 -> ret=0 err=0 addr=127.0.0.1:<l>.port
+listen l 2 -> ret=0 err=0
+socket AF_INET SOCK_STREAM 0 -> ret=c err=0
+bind c 127.0.0.1:0 -> ret=0 err=0 addr=127.0.0.1:<c>.port
+select t=50 r=l -> ret=0 err=0
+connect c l.addr -> ret=0 err=0
+select t=500 r=l -> ret=1 err=0 rd=l
+accept l -> ret=a err=0 from=127.0.0.1:<c>.port
+select t=50 r=a -> ret=0 err=0
+send c "ping" -> ret=4 err=0
+sleep 200 -> ret=0 err=0
+select t=500 r=a -> ret=1 err=0 rd=a
+recv a 64 -> ret=4 err=0 data="ping"
+send a "pong" -> ret=4 err=0
+sleep 200 -> ret=0 err=0
+select t=500 r=c -> ret=1 err=0 rd=c
+recv c 64 -> ret=4 err=0 data="pong"
+ioctlsocket c FIONREAD -> ret=0 err=0 out=0
+shutdown c SD_SEND -> ret=0 err=0
+select t=500 r=a -> ret=1 err=0 rd=a
+recv a 64 -> ret=0 err=0 data=""
+closesocket c -> ret=0 err=0
+closesocket a -> ret=0 err=0
+closesocket l -> ret=0 err=0
+wsacleanup -> ret=0 err=0
+exit 0

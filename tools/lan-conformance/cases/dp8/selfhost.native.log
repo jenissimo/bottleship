@@ -1,0 +1,41 @@
+cominit -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Peer IID_IDirectPlay8Peer -> ret=a hr=S_OK
+initialize a -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Peer IID_IDirectPlay8Peer -> ret=b hr=S_OK
+initialize b -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Address IID_IDirectPlay8Address -> ret=x hr=S_OK
+setsp x CLSID_DP8SP_TCPIP -> ret=0 hr=S_OK
+addport x 23913 -> ret=0 hr=S_OK
+setdevice x adapter -> ret=0 hr=S_OK
+settraversal x 0 -> ret=0 hr=S_OK
+host a x session -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Address IID_IDirectPlay8Address -> ret=y hr=S_OK
+setsp y CLSID_DP8SP_TCPIP -> ret=0 hr=S_OK
+addport y 23913 -> ret=0 hr=S_OK
+addhost y 127.0.0.1 -> ret=0 hr=S_OK
+cocreate CLSID_DirectPlay8Address IID_IDirectPlay8Address -> ret=d hr=S_OK
+setsp d CLSID_DP8SP_TCPIP -> ret=0 hr=S_OK
+addport d 23914 -> ret=0 hr=S_OK
+setdevice d adapter -> ret=0 hr=S_OK
+connect b y -> ret=0 hr=S_OK
+cb connect-complete hr=S_OK
+cbwait connect-complete 1 -> ret=1
+cb create-player
+cb create-player
+cb create-player
+cb create-player
+cbwait create-player 4 -> ret=4
+sendpeer b 1 "ping" -> ret=0 hr=S_OK
+cb receive size=4 data="ping"
+cbwait receive 1 -> ret=1
+sendpeer a 4 "ack" -> ret=0 hr=S_OK
+cb receive size=3 data="ack"
+cbwait receive 2 -> ret=1
+close a -> ret=0 hr=S_OK
+close b -> ret=0 hr=S_OK
+release y -> ret=0 hr=S_OK
+release x -> ret=0 hr=S_OK
+release b -> ret=0 hr=S_OK
+release a -> ret=0 hr=S_OK
+comfree -> ret=0
+exit 0

@@ -114,7 +114,7 @@ export class SessionWorker extends EventTarget implements Worker {
             const reset = new MessageEvent('message', { data: { type: 'child_session_reset' } });
             this.dispatchEvent(reset);
         }
-        if (['set_session', 'set_quality', 'set_debug_flag', 'logging_global_enable'].includes(message?.type)) {
+        if (['set_session', 'set_quality', 'set_network', 'set_debug_flag', 'logging_global_enable'].includes(message?.type)) {
             this.settings.set(`${message.type}:${message.key ?? ''}`, message);
         }
         // `target:'root'` addresses the ROOT worker even while a child holds the
@@ -130,7 +130,7 @@ export class SessionWorker extends EventTarget implements Worker {
         }
         // The original canvas remains the input/layout anchor. Its backing dimensions
         // still follow host resize even while another canvas supplies the visible image.
-        if (this.foreground && message?.type === 'resize') this.root.postMessage(message);
+        if (this.foreground && (message?.type === 'resize' || message?.type === 'set_network')) this.root.postMessage(message);
         (this.foreground ?? this.root).postMessage(message, options as Transferable[]);
     }
 

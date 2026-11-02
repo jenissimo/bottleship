@@ -1,5 +1,6 @@
 import type { QualityConfig } from "../worker/core/quality-config";
 import type { UiSettings } from "../ui-settings";
+import type { NetworkConfig, NetworkStatus } from "../network-config";
 
 export interface SettingsDrawerProps {
   isOpen: boolean;
@@ -16,6 +17,9 @@ export interface SettingsDrawerProps {
   overriddenQualityKeys?: ReadonlySet<string>;
   uiSettings: UiSettings;
   onUiChange: (patch: Partial<UiSettings>) => void;
+  network: NetworkConfig | null;
+  networkStatus: NetworkStatus;
+  onNetworkChange: (config: NetworkConfig | null) => void;
   statsOverlay: boolean;
   onToggleStatsOverlay: (enabled: boolean) => void;
   logStreaming: boolean;
@@ -29,4 +33,4 @@ export interface SettingsDrawerProps {
   onOpenDevConsole?: () => void;
 }
 
-export type SettingsSectionId = "graphics" | "audio" | "input" | "storage" | "advanced" | "about";
+export type SettingsSectionId = "graphics" | "audio" | "input" | "network" | "storage" | "advanced" | "about";

@@ -15,7 +15,8 @@ import {
     resetControlInteractionState,
     takePendingControlNotification,
 } from "../../src/worker/modules/user32/control-interaction";
-import { windows, type WindowInfo } from "../../src/worker/modules/user32/shared-state";
+import { windows, getOrCreateListState, type WindowInfo } from "../../src/worker/modules/user32/shared-state";
+import { handleSystemControlMessage } from "../../src/worker/modules/user32/dialog-control-messages";
 
 const WM_COMMAND = 0x0111;
 const WM_LBUTTONDOWN = 0x0201;
@@ -105,6 +106,18 @@ describe("system-control mouse", () => {
         expect(clickButton(WM_LBUTTONUP)).toBe(true);
         expect(capture).toBe(0);
         expect(clicked()).toBe(true);
+    });
+
+    test("a list box reports a row height consistent with selecting its second row", () => {
+        const list = makeWindow({ handle: 0x1002, parent: DIALOG, x: 20, y: 20, width: 60, height: 50,
+            controlId: 8, isSystemControl: true, systemControlClass: "ListBox" });
+        windows.set(list.handle, list);
+        const state = getOrCreateListState(list.handle);
+        state.items = [{ text: "Lobby", data: 0 }, { text: "Game", data: 0 }];
+        const height = handleSystemControlMessage(list, 0x01a1, 0, 0, new Uint8Array(1024));
+        expect(height).toBeGreaterThan(0);
+        expect(handleSystemControlClassMouse(list, WM_LBUTTONDOWN, 0, ((height + 3) << 16) | 5)).toBe(true);
+        expect(state.selectedIndex).toBe(1);
     });
 
     test("a SUBCLASSED button is left to the guest's wndproc", () => {

@@ -15,5 +15,5 @@
     }
   },
   "include": ["src", "packages"],
-  "exclude": ["src/worker/tools/**", "src/worker/api/codegen-atomic.ts", "tools/**"]
+  "exclude": ["src/worker/tools/**", "src/worker/api/codegen-atomic.ts", "tools/**", "**/*.test.ts", "**/*.test.tsx"]
 }
