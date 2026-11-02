@@ -220,6 +220,13 @@ describe("Miles stream start position", () => {
         expect(stream.position).toBe(44100 * 4 * 30);
     });
 
+    test("a seeked stream retains its media offset at twice normal speed", () => {
+        const { ctx, stream } = encodedStream(44100 * 4 * 30);
+        stream.playbackRate = 2;
+        const posted = capturePosts(() => playStream(ctx, stream));
+        expect(posted.find(m => m.type === "audio_play_encoded").payload.startOffsetMs).toBeCloseTo(30_000, 3);
+    });
+
     test("an unseeked stream begins at the top", () => {
         const { ctx, stream } = encodedStream(0);
         const posted = capturePosts(() => playStream(ctx, stream));

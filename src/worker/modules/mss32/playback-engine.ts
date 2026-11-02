@@ -671,8 +671,9 @@ export function playStream(ctx: MSSContext, stream: MSSStream): void {
     // resuming it there — a radio station picked up mid-song.
     const totalBytes = getPlaybackLengthBytes(stream);
     const startBytes = stream.position > 0 && stream.position < totalBytes ? stream.position : 0;
-    const bytesPerSec = getBytesPerSecond(stream) * (stream.playbackRate || 1);
+    const bytesPerSec = getBytesPerSecond(stream);
     const startMs = bytesPerSec > 0 ? startBytes * 1000 / bytesPerSec : 0;
+    const elapsedMs = startMs / (stream.playbackRate || 1);
     if (!stream.decodedData || stream.decodedData.length === 0) {
         if (stream.fileData && isEncodedFormat(stream.fileFormat)) {
             const volume = mixedVolume127(ctx, stream.volume) / 127.0;
@@ -706,7 +707,7 @@ export function playStream(ctx: MSSContext, stream: MSSStream): void {
             stream.isPlaying = true;
             stream.isPaused = false;
             stream.position = startBytes || 1024;
-            stream.startTime = performance.now() - startMs;
+            stream.startTime = performance.now() - elapsedMs;
             stream.pendingStart = false;
             writeStreamPosition(ctx, stream, stream.position);
             setStreamStatus(ctx, stream, SMP_PLAYING);
@@ -747,7 +748,7 @@ export function playStream(ctx: MSSContext, stream: MSSStream): void {
     stream.isPlaying = true;
     stream.isPaused = false;
     stream.position = startBytes || 1024;
-    stream.startTime = performance.now() - startMs;
+    stream.startTime = performance.now() - elapsedMs;
     stream.pendingStart = false;
     writeStreamPosition(ctx, stream, stream.position);
     setStreamStatus(ctx, stream, SMP_PLAYING);
