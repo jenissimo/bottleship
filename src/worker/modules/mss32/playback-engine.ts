@@ -17,6 +17,8 @@ import {
     CTRL_PLAY_CURSOR,
     CTRL_STATE,
     CTRL_LOOP_MODE,
+    CTRL_LOOP_START_FRAME,
+    CTRL_LOOP_END_FRAME,
     CTRL_VOLUME,
     CTRL_PAN,
     CTRL_FREQUENCY,
@@ -330,6 +332,19 @@ function volumeToCentibels(vol127: number): number {
     return Math.max(-10000, Math.round(2000 * Math.log10(linear)));
 }
 
+/** Publish the sample's loop block in frames of the ring's data (0/0 = whole sample). */
+function writeLoopBlock(sab: SharedArrayBuffer, sample: MSSSample): void {
+    const guestAlign = Math.max(1, sample.blockAlign
+        || Math.max(1, sample.channels) * Math.max(1, sample.bitsPerSample >> 3));
+    const start = sample.loopStartBytes ?? 0;
+    const end = sample.loopEndBytes ?? -1;
+    const startFrame = Math.floor(start / guestAlign);
+    const endFrame = end > 0 ? Math.floor(end / guestAlign) : 0;
+    const valid = endFrame === 0 || endFrame > startFrame;
+    setCtrl(sab, CTRL_LOOP_START_FRAME, valid ? startFrame : 0);
+    setCtrl(sab, CTRL_LOOP_END_FRAME, valid ? endFrame : 0);
+}
+
 /** Convert loopCount to ring buffer loop mode: -1=forever, 1+=play N times */
 function loopCountToMode(loopCount: number | undefined): number {
     if (loopCount === 0 || loopCount === -1) return -1; // loop forever
@@ -444,6 +459,7 @@ export function playSample(ctx: MSSContext, sample: MSSSample): void {
     const freqHz = sample.playbackRateHz || Math.round(sample.sampleRate * sample.playbackRate);
     setCtrl(sab, CTRL_FREQUENCY, freqHz);
     setCtrl(sab, CTRL_LOOP_MODE, loopCountToMode(sample.loopCount));
+    writeLoopBlock(sab, sample);
     setCtrl(sab, CTRL_RESERVED, 1); // signal worklet to reset position & loopsCompleted
     if (sample.is3D) applySample3D(sample); // write CTRL_3D_* before the worklet starts mixing
     setCtrl(sab, CTRL_STATE, STATE_PLAYING);
@@ -471,6 +487,7 @@ export function updateSamplePlayback(ctx: MSSContext, sample: MSSSample): void {
             : Math.round(sample.sampleRate * sample.playbackRate);
         setCtrl(entry.sab, CTRL_FREQUENCY, freqHz);
         setCtrl(entry.sab, CTRL_LOOP_MODE, loopCountToMode(sample.loopCount));
+        writeLoopBlock(entry.sab, sample);
         return;
     }
 
