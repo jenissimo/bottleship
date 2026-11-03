@@ -2042,6 +2042,9 @@ const loadBundleImpl = async (payload: { data?: Uint8Array; url?: string; blob?:
       system.registry.seed({ root: "HKDD", path: k, values: [] });
     }
 
+    // Before seeding: the game's own registry redirects decide where its seeds land.
+    system.registry.setRedirects(bundle.manifest.emulator?.registryRedirects);
+
     // Apply the manifest registry seed (bundle DEFAULTS) BEFORE restoring persisted
     // state. seed() overwrites and restore() overwrites — "last write wins" — so the
     // persisted (game-written) values like screen resolution must be restored LAST,
@@ -3241,6 +3244,7 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         // image before restoring inherited objects; otherwise that stale TEB survives
         // while the new bootloader resets FS, and CRT startup faults at fs:[0].
         await prepareFullGameSwitch();
+        system.registry.setRedirects(EmulatorConfig.getInstance().registryRedirects);
         if (boot.registry) system.registry.restore(boot.registry);
         // The hive is the parent's; this worker only holds a copy of it. postToParent, not
         // the overridden self.postMessage: a child that owns the screen talks to the PAGE,

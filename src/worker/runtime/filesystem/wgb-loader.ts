@@ -1,5 +1,6 @@
 import { BlobSource, BufferSource, SyncHttpRangeSource, ZipArchive, ZipEntry } from "@bottleship/formats/zip";
 import type { ZipSource } from "@bottleship/formats/zip";
+import type { RegistryRedirect } from "@bottleship/formats/sdb";
 import { CachedSource, computeAdaptiveMaxBytes } from "./cached-source";
 import { SabIoSource } from "./sab-io-source";
 import { Logger, LogCategory } from "../../core/logger";
@@ -209,6 +210,13 @@ export interface WgbManifest {
          * Same rule syntax as disabledDlls ("ddraw", "ddraw.dll", wildcards).
          */
         appDirDlls?: string[];
+        /**
+         * Registry subtrees the guest names under one key but Windows serves from another — the
+         * VirtualRegistry ADDREDIRECT shims a game's own `.sdb` declares (make-wgb reads them).
+         * Applied to every process of the bundle: a database the game ships names its own exes.
+         * Example: { from: "HKLM\\SOFTWARE\\Vendor\\Game", to: "HKCU\\Software\\Vendor\\Game" }.
+         */
+        registryRedirects?: RegistryRedirect[];
         /** Glob patterns for files to eagerly prefetch during startup (e.g. ["*.dll", "data/sprites.vga"]) */
         prefetch?: string[];
         /** VFS paths to delete from CoW overlay on every boot (e.g. crash-sentinel files like Running.ini) */

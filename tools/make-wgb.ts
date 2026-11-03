@@ -55,6 +55,9 @@
  *                         ships a wrapper/proxy DLL — an ASI loader, a Glide or ddraw
  *                         shim — which otherwise never executes. Example:
  *                         --app-dir-dlls "ddraw"
+ *                         Shim databases (*.sdb) in the game directory are read without a
+ *                         flag: their VirtualRegistry ADDREDIRECT rules for exes the game
+ *                         ships become manifest registryRedirects (Steam's Mafia needs one).
  *   --working-dir <path>  Guest cwd at boot when it is NOT the entrypoint's folder —
  *                         an engine module a launcher starts inherits the LAUNCHER's
  *                         directory and resolves its data paths against it. Example:
@@ -97,6 +100,7 @@ import { orderFilesByProfile, parseIoProfile } from "@bottleship/formats/wgb/io-
 import { ZipStoreWriter } from './internal/zip-store-writer';
 import { isValidGameId, deriveGameId, KNOWN_GAME_ID_SCHEMES } from '@bottleship/formats/wgb/container-id';
 import { parseRegFile, mergeRegSeeds, type RegSeed } from '@bottleship/formats/reg';
+import { parseSdb, virtualRegistryRedirects, type RegistryRedirect } from '@bottleship/formats/sdb';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -262,6 +266,25 @@ const appDirDlls = (get('--app-dir-dlls') ?? '')
     .split(/[,;]/)
     .map((d) => d.trim())
     .filter((d) => d.length > 0);
+
+// A re-release can ship a compatibility database (registered by sdbinst at install) instead of
+// patching the binary; Windows applies its shims silently, so they have to travel with the bundle.
+const shippedExes = new Set([...romFiles.keys()].filter((p) => /\.exe$/i.test(p)).map((p) => basename(p).toLowerCase()));
+const registryRedirects: RegistryRedirect[] = [];
+for (const [zipName, full] of romFiles) {
+    if (!/\.sdb$/i.test(zipName)) continue;
+    let exes;
+    try {
+        exes = parseSdb(readFileSync(full)).filter((e) => shippedExes.has(e.name.toLowerCase()));
+    } catch (err) {
+        console.warn(`Warning: ${zipName} is not a readable shim database (${err}); its shims are not applied.`);
+        continue;
+    }
+    for (const rule of virtualRegistryRedirects(exes, (reason) => console.warn(`Warning: ${zipName}: ${reason}`))) {
+        registryRedirects.push(rule);
+        console.log(`  shim:       ${zipName}: registry ${rule.from} -> ${rule.to}`);
+    }
+}
 if (emptyDirs.size > 0) {
     console.log(`  empty dirs: auto-detected ${emptyDirs.size} (added to createDirs): ${[...emptyDirs].sort().join(', ')}`);
 }
@@ -319,6 +342,7 @@ const manifest: Record<string, unknown> = {
         ...(get('--lcid') ? { lcid: parseInt(get('--lcid')!, 16) } : {}),
         ...(createDirs.length > 0 ? { createDirs } : {}),
         ...(appDirDlls.length > 0 ? { appDirDlls } : {}),
+        ...(registryRedirects.length > 0 ? { registryRedirects } : {}),
         ...(cdPath ? { cdPath } : {}),
         ...(cdLabel ? { cdLabel } : {}),
         ...(touch ? { touch } : {}),

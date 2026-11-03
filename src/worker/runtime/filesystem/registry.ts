@@ -1,6 +1,7 @@
 import { RegistryPersistence, RegistryAccessLogEntry, PersistedRegistryState } from "./registry-persistence";
 import { Logger, LogCategory } from "../../core/logger";
 import { EmulatorConfig } from "../../core/emulator-config-manager";
+import type { RegistryRedirect } from "@bottleship/formats/sdb";
 
 export type RegistryValueType = "REG_SZ" | "REG_DWORD" | "REG_BINARY" | "REG_MULTI_SZ";
 
@@ -25,6 +26,19 @@ const ROOT_ALIASES: Record<string, string> = {
 function canonicalRoot(root: string): string {
     const upper = root.toUpperCase();
     return ROOT_ALIASES[upper] ?? upper;
+}
+
+/** The form a key is stored under: short root, backslashes, no edge separators, lowercase. */
+function keyOf(root: string, path: string): string {
+    const cleanPath = path.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
+    return `${canonicalRoot(root)}\\${cleanPath}`.toLowerCase();
+}
+
+/** "HKEY_LOCAL_MACHINE\Software\X" → ["HKEY_LOCAL_MACHINE", "Software\X"]. */
+function splitKey(spec: string): [string, string] {
+    const clean = spec.replace(/\//g, "\\").replace(/^\\+/, "");
+    const sep = clean.indexOf("\\");
+    return sep < 0 ? [clean, ""] : [clean.slice(0, sep), clean.slice(sep + 1)];
 }
 
 function validateRegType(type: string): RegistryValueType {
@@ -156,9 +170,12 @@ export class RegistryStore {
     private downstreamSink: ((mutation: RegistryMutation, exceptChildId?: number) => void) | null = null;
     private replayOrigin: RegistryOrigin | null = null;
     private readonly MAX_LOG_BUFFER_SIZE = 1000;
+    /** VirtualRegistry redirects in stored-key form: [from, from + "\\", to]. */
+    private redirects: Array<[string, string, string]> = [];
 
     reset(): void {
         this.keys.clear();
+        this.redirects = [];
         this.systemDefaults = null;
         this.accessLogBuffer = [];
         this.gameId = "";
@@ -453,10 +470,26 @@ export class RegistryStore {
         return list;
     }
 
+    /**
+     * Windows' VirtualRegistry ADDREDIRECT: a key under `from` is the key at the same place
+     * under `to`, for opens, creates and writes alike. Applied where a name becomes a key, so
+     * handles already carry the redirected key and every later call follows them.
+     */
+    setRedirects(rules: ReadonlyArray<RegistryRedirect> | undefined): void {
+        this.redirects = (rules ?? [])
+            .filter((r) => typeof r?.from === "string" && typeof r?.to === "string" && r.from && r.to)
+            .map((r): [string, string, string] => {
+                const from = keyOf(...splitKey(r.from));
+                return [from, `${from}\\`, keyOf(...splitKey(r.to))];
+            });
+    }
+
     private normalizeKey(root: string, path: string): string {
-        const cleanRoot = canonicalRoot(root);
-        const cleanPath = path.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
-        return `${cleanRoot}\\${cleanPath}`.toLowerCase();
+        const key = keyOf(root, path);
+        for (const [from, under, to] of this.redirects) {
+            if (key === from || key.startsWith(under)) return to + key.slice(from.length);
+        }
+        return key;
     }
 
     private resolveKey(baseKey: string, subKey?: string): string {
@@ -464,10 +497,7 @@ export class RegistryStore {
         if (!subKey) return cleanBase;
         const cleanSub = subKey.replace(/\//g, "\\").replace(/^\\+/, "").replace(/\\+$/, "");
         if (!cleanSub) return cleanBase;
-        if (cleanBase.includes("\\")) {
-            return `${cleanBase}\\${cleanSub}`.toLowerCase();
-        }
-        return this.normalizeKey(cleanBase, cleanSub);
+        return this.normalizeKey(...splitKey(`${cleanBase}\\${cleanSub}`));
     }
 
     /**

@@ -10,6 +10,7 @@ import {
 import { QualityConfig, DEFAULT_QUALITY, mergeQuality } from "./quality-config";
 import { asBufferSource } from "../../dom-buffer";
 import { normalizeNetworkConfig, type NetworkConfig } from "../../network-config";
+import type { RegistryRedirect } from "@bottleship/formats/sdb";
 
 // OS Version constants
 export const VER_PLATFORM_WIN32_WINDOWS = 0x1;
@@ -358,6 +359,10 @@ export class EmulatorConfig {
     // disabledDlls. Opt-in per bundle while the default order is still HLE-first.
     public appDirDlls: string[] = [];
 
+    // The game's own VirtualRegistry shims. The owner hands them to its hive at load; a child
+    // process inherits them here and applies them to its copy (RegistryStore.setRedirects).
+    public registryRedirects: RegistryRedirect[] = [];
+
     // VFS paths to delete from CoW overlay on every boot
     public deleteOnBoot: string[] = [];
 
@@ -635,6 +640,14 @@ export class EmulatorConfig {
             );
         }
 
+        if (config.registryRedirects && config.registryRedirects.length > 0) {
+            this.registryRedirects = config.registryRedirects;
+            Logger.log(
+                LogCategory.SYSTEM,
+                `EmulatorConfig: registryRedirects loaded: ${this.registryRedirects.map((r) => `${r.from} -> ${r.to}`).join(", ")}`
+            );
+        }
+
         // Apply deleteOnBoot list
         if (config.deleteOnBoot && config.deleteOnBoot.length > 0) {
             this.deleteOnBoot = config.deleteOnBoot
@@ -711,6 +724,7 @@ export class EmulatorConfig {
         this.fpuStrict = false;
         this.disabledDlls = [];
         this.appDirDlls = [];
+        this.registryRedirects = [];
         this.deleteOnBoot = [];
         this.writeFiles = [];
         this.createDirs = [];
