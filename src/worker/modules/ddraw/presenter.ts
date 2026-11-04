@@ -30,6 +30,24 @@ import { onFrameEnd as frameCaptureOnFrameEnd } from "./frame-capture";
 import { statsOverlay } from "../../core/stats-overlay";
 import { registerGpuDeviceObserver } from "../../core/gpu/gpu-device-lifecycle";
 
+const FLIP_HOLD_MAX_MS = 100;
+const FLIP_HOLD_FLIP_INTERVALS = 1.5;
+const LOCK_HOLD_MAX_MS = 50;
+const REFRESH_BACKSTOP_MS = 50;
+
+/** Time and refresh source of the presenter; tests inject a manual one. */
+export interface PresentClock {
+    now(): number;
+    onRefresh(callback: () => void): () => void;
+    setTimer(callback: () => void, ms: number): () => void;
+}
+
+const defaultPresentClock: PresentClock = {
+    now: () => performance.now(),
+    onRefresh: (callback) => framePacer.registerOnFrame(callback),
+    setTimer: (callback, ms) => { const id = setTimeout(callback, ms); return () => clearTimeout(id); },
+};
+
 export class DDrawPresenter implements RenderActive {
     private process: Process;
     private canvas: OffscreenCanvas | null = null;
@@ -42,9 +60,16 @@ export class DDrawPresenter implements RenderActive {
     private presentEarlyReturns = 0;
     private lastPresentTime = 0;
     private pendingSurface: DirectDrawSurfaceState | null = null;
-    private pendingOptions: { throttle?: boolean } | null = null;
+    private pendingOptions: { throttle?: boolean; flip?: boolean } | null = null;
     private pendingResolvers: Array<{ resolve: () => void, reject: (reason?: unknown) => void }> = [];
     private pumpRunning = false;
+    private pumpQueued = false;
+    presentClock: PresentClock = defaultPresentClock;
+    private latchedSince = -1;
+    private refreshUnregister: (() => void) | null = null;
+    private backstopCancel: (() => void) | null = null;
+    private lastFlipAt = -Infinity;
+    private flipIntervalMs = 0;
 
     // Phase-blend present mode (C). When enabled, guest Flips only SNAPSHOT into the interpolator;
     // a per-rAF callback (blendFrameUnreg) re-presents mix(prev,new,phase) at full refresh so a
@@ -233,8 +258,16 @@ export class DDrawPresenter implements RenderActive {
         }
     }
 
-    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
+    async present(surface: DirectDrawSurfaceState, _mem: Uint8Array, options: { throttle?: boolean; frameAlreadyMarked?: boolean; flip?: boolean; snapshotTextureView?: GPUTextureView } = {}): Promise<void> {
         this.presentCallCount++;
+        const now = this.presentClock.now();
+        if (options.flip) {
+            if (this.lastFlipAt > -Infinity) {
+                const interval = now - this.lastFlipAt;
+                this.flipIntervalMs = this.flipIntervalMs > 0 ? this.flipIntervalMs * 0.75 + interval * 0.25 : interval;
+            }
+            this.lastFlipAt = now;
+        }
         return new Promise<void>((resolve, reject) => {
             if (this.pendingSurface || this.pendingResolvers.length > 0) {
                 const supersededResolvers = this.pendingResolvers.splice(0);
@@ -246,8 +279,91 @@ export class DDrawPresenter implements RenderActive {
             this.pendingSurface = surface;
             this.pendingOptions = options;
             this.pendingResolvers.push({ resolve, reject });
-            void this.pumpLoop();
+            if (options.flip) {
+                this.releaseRefreshLatch();
+                void this.pumpLoop();
+            } else {
+                this.schedulePump(options.throttle === true);
+            }
         });
+    }
+
+    /**
+     * The primary is scanout, so its image reaches the screen once per refresh:
+     * - Flip draws at once.
+     * - An explicit present (throttle off) draws when the current guest slice returns, so
+     *   presents within one slice collapse into one draw.
+     * - An implicit present (Unlock/Blt/palette of the primary) is latched: the latest state
+     *   is drawn at the next refresh, once per refresh. Never while the primary is still
+     *   locked, for at most LOCK_HOLD_MAX_MS. A guest that Flips composes its next frame in
+     *   the front buffer in several passes, which emulation stretches across refreshes; its
+     *   next Flip shows the finished image, so the latch waits for it, at most
+     *   FLIP_HOLD_FLIP_INTERVALS of the guest's own Flip interval (capped). An implicit
+     *   present is never dropped: when no Flip follows, it is drawn once the hold ends.
+     */
+    private schedulePump(implicit: boolean): void {
+        if (!implicit) {
+            this.releaseRefreshLatch();
+            if (this.pumpQueued) return;
+            this.pumpQueued = true;
+            queueMicrotask(() => {
+                this.pumpQueued = false;
+                void this.pumpLoop();
+            });
+            return;
+        }
+        if (this.pumpQueued) return;
+        if (this.latchedSince < 0) this.latchedSince = this.presentClock.now();
+        if (!this.refreshUnregister) this.refreshUnregister = this.presentClock.onRefresh(() => this.onRefresh());
+        this.armBackstop();
+    }
+
+    private flipHoldMs(): number {
+        if (this.lastFlipAt === -Infinity) return 0;
+        if (this.flipIntervalMs <= 0) return FLIP_HOLD_MAX_MS;
+        return Math.min(FLIP_HOLD_MAX_MS, this.flipIntervalMs * FLIP_HOLD_FLIP_INTERVALS);
+    }
+
+    private implicitReady(now: number): boolean {
+        if (now - this.lastFlipAt < this.flipHoldMs()) return false;
+        const locked = (this.pendingSurface as { activeLeaseId?: number } | null)?.activeLeaseId !== undefined;
+        return !locked || now - this.latchedSince >= LOCK_HOLD_MAX_MS;
+    }
+
+    private onRefresh(): void {
+        if (!this.pendingIsImplicit()) {
+            this.releaseRefreshLatch();
+            return;
+        }
+        if (this.pumpRunning || !this.implicitReady(this.presentClock.now())) return;
+        this.releaseRefreshLatch();
+        void this.pumpLoop();
+    }
+
+    private armBackstop(): void {
+        this.backstopCancel?.();
+        this.backstopCancel = this.presentClock.setTimer(() => {
+            this.backstopCancel = null;
+            if (!this.pendingIsImplicit()) return;
+            if (this.implicitReady(this.presentClock.now())) {
+                this.releaseRefreshLatch();
+                void this.pumpLoop();
+            } else {
+                this.armBackstop();
+            }
+        }, REFRESH_BACKSTOP_MS);
+    }
+
+    private pendingIsImplicit(): boolean {
+        return this.pendingSurface !== null && this.pendingOptions?.throttle === true && !this.pendingOptions.flip;
+    }
+
+    private releaseRefreshLatch(): void {
+        this.latchedSince = -1;
+        this.refreshUnregister?.();
+        this.refreshUnregister = null;
+        this.backstopCancel?.();
+        this.backstopCancel = null;
     }
 
     private async pumpLoop(): Promise<void> {
@@ -270,7 +386,8 @@ export class DDrawPresenter implements RenderActive {
         } finally {
             this.pumpRunning = false;
             if (this.pendingSurface) {
-                void this.pumpLoop();
+                if (this.pendingOptions?.flip) void this.pumpLoop();
+                else this.schedulePump(this.pendingOptions?.throttle === true);
             }
         }
     }
