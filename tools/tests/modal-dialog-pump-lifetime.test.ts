@@ -231,6 +231,16 @@ describe('a modal pump that cannot dispatch', () => {
         expect(removed).toContain(0x0113);
     });
 
+    test('a key the dialog manager does not claim is translated into WM_CHAR', async () => {
+        const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);
+        System.getInstance().windowManager.postMessage(dialogHwnd, 0x0100 /* WM_KEYDOWN */, 0x41, 0x1e0001);
+
+        await completeUntil(invocations, 0x0102);
+
+        const char = pumpDispatches(invocations).find(i => i.args[1] === 0x0102);
+        expect(char?.args.slice(0, 4)).toEqual([dialogHwnd, 0x0102, 0x61, 0x1e0001]);
+    });
+
     test('a WM_TIMER carrying a TIMERPROC calls the TIMERPROC, not the dialog procedure', async () => {
         const timerProc = 0x403000;
         const { invocations, dialogHwnd } = runDialog(() => 0x2000, 0);

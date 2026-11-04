@@ -23,6 +23,7 @@ import { handleAnimateMessage } from './animate-control';
 import { handleMciWndMessage } from '../msvfw32-mciwnd';
 import { windows, buttonCheckStates, registerWindowTimerKiller, registerRemovedTimerHook, finalizeWindowDestroy, getAbsoluteWindowPosition, getWindowByHandle, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
+import { translateKeyMessage } from './translate-message';
 import { repaintChildControls, isButtonSystemControl, hitTestSystemControlAtClient } from './controls';
 import { isOwnerDrawButton } from './owner-draw';
 import { defWindowProcSetCursor, runOwnerDrawButtonPaint } from './window';
@@ -1487,88 +1488,13 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
 
     exports['DispatchMessageA'] = exports['DispatchMessageW'];
 
-    // VK-to-character mapping for TranslateMessage (US keyboard layout)
-    const VK_SHIFT = 0x10;
-    const VK_CAPITAL = 0x14;
-
-    function vkToChar(vk: number, shiftDown: boolean, capsLock: boolean): number {
-        const upper = shiftDown !== capsLock; // XOR: shift or caps, not both
-
-        // Letters A-Z (VK 0x41-0x5A)
-        if (vk >= 0x41 && vk <= 0x5A) {
-            return upper ? vk : (vk + 32); // 'A'=65, 'a'=97
-        }
-
-        // Digits 0-9 (VK 0x30-0x39)
-        if (vk >= 0x30 && vk <= 0x39) {
-            if (shiftDown) {
-                const shiftDigits = ')!@#$%^&*(';
-                return shiftDigits.charCodeAt(vk - 0x30);
-            }
-            return vk; // '0'=0x30 .. '9'=0x39
-        }
-
-        // Numpad 0-9 (VK 0x60-0x69)
-        if (vk >= 0x60 && vk <= 0x69) return 0x30 + (vk - 0x60);
-
-        // Numpad operators
-        if (vk === 0x6A) return 0x2A; // *
-        if (vk === 0x6B) return 0x2B; // +
-        if (vk === 0x6D) return 0x2D; // -
-        if (vk === 0x6E) return 0x2E; // .
-        if (vk === 0x6F) return 0x2F; // /
-
-        // Common keys
-        if (vk === 0x20) return 0x20; // Space
-        if (vk === 0x0D) return 0x0D; // Enter
-        if (vk === 0x08) return 0x08; // Backspace
-        if (vk === 0x09) return 0x09; // Tab
-        if (vk === 0x1B) return 0x1B; // Escape
-
-        // OEM keys (US layout)
-        const oemMap: Record<number, [number, number]> = {
-            0xBA: [0x3B, 0x3A], // ;  :
-            0xBB: [0x3D, 0x2B], // =  +
-            0xBC: [0x2C, 0x3C], // ,  <
-            0xBD: [0x2D, 0x5F], // -  _
-            0xBE: [0x2E, 0x3E], // .  >
-            0xBF: [0x2F, 0x3F], // /  ?
-            0xC0: [0x60, 0x7E], // `  ~
-            0xDB: [0x5B, 0x7B], // [  {
-            0xDC: [0x5C, 0x7C], // \  |
-            0xDD: [0x5D, 0x7D], // ]  }
-            0xDE: [0x27, 0x22], // '  "
-        };
-        const oem = oemMap[vk];
-        if (oem) return shiftDown ? oem[1] : oem[0];
-
-        return 0; // No character for this VK (arrows, F-keys, etc.)
-    }
-
     exports['TranslateMessage'] = (ctx, mem, args) => {
         const lpMsg = args[0];
         if (!lpMsg) return 0;
-
-        const message = Mem.readUint32(lpMsg + 4);
-
-        // Only translate WM_KEYDOWN (0x0100) and WM_SYSKEYDOWN (0x0104)
-        if (message !== 0x0100 && message !== 0x0104) return 0;
-
-        const hwnd = Mem.readUint32(lpMsg);
-        const vkValue = Mem.readUint32(lpMsg + 8);
-        const lParam = Mem.readUint32(lpMsg + 12);
-        if (hwnd === null || vkValue === null || lParam === null) return 0;
-        const vk = vkValue & 0xFF;
-
-        const input = System.getInstance().inputManager;
-        const charCode = vkToChar(vk, (input.getKeyState(VK_SHIFT) & 0x8000) !== 0,
-            (input.getKeyState(VK_CAPITAL) & 1) !== 0);
-        if (charCode === 0) return 0;
-
-        // Post WM_CHAR (or WM_SYSCHAR for SYSKEYDOWN)
-        const charMsg = message === 0x0104 ? 0x0106 : 0x0102; // WM_SYSCHAR : WM_CHAR
-        System.getInstance().windowManager.postMessage(hwnd, charMsg, charCode, lParam);
-        return 1; // TRUE - message was translated
+        const hwnd = Mem.readUint32(lpMsg), message = Mem.readUint32(lpMsg + 4);
+        const wParam = Mem.readUint32(lpMsg + 8), lParam = Mem.readUint32(lpMsg + 12);
+        if (hwnd === null || message === null || wParam === null || lParam === null) return 0;
+        return translateKeyMessage(hwnd, message, wParam, lParam) ? 1 : 0;
     };
 
     exports['PostQuitMessage'] = (ctx, mem, args) => {

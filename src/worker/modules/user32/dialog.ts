@@ -14,6 +14,7 @@ import { registerMessageBoxExports } from './dialog-messagebox';
 import { System } from '../../core/system';
 import { WindowInfo, windows, controlImageHandles, getAbsoluteWindowPosition, getGroupSiblingRange, getVirtualScreenRect, killWindowTimers, noteTimerMessageRemoved, finalizeWindowDestroy, buttonCheckStates, findChildByControlId, isEffectivelyVisible } from './shared-state';
 import { validateWindow } from './paint-region';
+import { translateKeyMessage } from './translate-message';
 import { WH_CBT, HCBT_CREATEWND, getHooksOfType } from './hooks';
 import { parseDlgTemplate, dluToPixelX, dluToPixelY, getDialogBaseUnits, logDlgTemplateDump, ParsedDlgTemplate } from './dialog-template';
 import { findResourceInPE } from '../../modules/kernel32/resource';
@@ -1088,6 +1089,9 @@ function runModalDialog(
             schedulePump(0);
             return;
         }
+        // DialogBox's own loop runs TranslateMessage on what IsDialogMessage did not
+        // claim; without it an Edit in a modal dialog never receives a character.
+        translateKeyMessage(hwnd, message, wParam, lParam);
 
         // --- Modal dialog mouse re-routing ---
         // Real modal dialogs are active owned top-level windows. If an already queued
