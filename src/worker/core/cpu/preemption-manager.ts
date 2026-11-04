@@ -283,6 +283,12 @@ export class PreemptionManager {
         }
 
         if (this.wasmExports.set_jit_config) {
+            // DEV-only experiment knob: boot with the JIT disabled (idx 0) so a device that
+            // dies inside JIT codegen can be bisected without racing dbg.jitOff() against boot.
+            if (import.meta.env?.DEV && import.meta.env?.VITE_BS_JIT_OFF) {
+                this.applyJitConfig(this.wasmExports, 0, 1);
+                console.warn("[PERF] JIT DISABLED at init (VITE_BS_JIT_OFF)");
+            }
             this.applyJitConfig(this.wasmExports, 5, this.deadFlagElisionEnabled ? 1 : 0);
             console.log(`[PERF] JIT dead-flag elision ${this.deadFlagElisionEnabled ? "enabled" : "DISABLED"}`);
 

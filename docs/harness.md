@@ -59,6 +59,30 @@ so any timing you read while two are running is noise — `harness trace` refuse
 second guest tab is open. Each tab also costs a full emulator (its own worker, SAB and VRAM), so
 memory, not CPU, sets the ceiling; 2-3 concurrent bring-ups is the sane range on a normal desktop.
 
+## Remote devices (iPhone, iPad, any browser without CDP)
+
+`tools/remote-bridge.ts` lets the same CLI drive a page on a device that has no Chrome DevTools
+Protocol. The bridge impersonates a CDP endpoint; the page (dev builds only, opted in with
+`?bridge=<token>`) connects back through the dev server's `/__bridge` proxy and evaluates what the
+CLI sends. Every verb that runs in the page works unchanged; what needs real CDP (worker targets,
+`stack`, tracing, trusted input, compositor screenshots) fails with an explicit error.
+
+```bash
+VITE_SSL=1 bun run dev                     # a LAN IP is a secure context only over HTTPS
+bun tools/remote-bridge.ts --lan           # prints the device URL and a QR code
+BS_CDP_PORT=9444 BS_TAB=iphone bun tools/harness.ts eval "navigator.userAgent"
+```
+
+The device must be on the same network; Safari warns about the self-signed certificate once.
+`--tunnel` publishes the dev server through a cloudflared quick tunnel instead (start Vite with
+`BS_TUNNEL=1`) — only viable with a fast uplink, since the device downloads every module and
+bundle from this machine. Page console output, window errors and the worker log stream are
+appended to `logs/remote/` and survive the page being killed. The page holds a screen wake lock
+(re-acquired on the first tap after each reload); set Auto-Lock to Never for long runs.
+
+Dev-only knobs for bisecting device failures: `VITE_BS_RAM_MB=<n>` sizes guest RAM without
+repacking a bundle; `VITE_BS_JIT_OFF=1` boots with the JIT disabled.
+
 ## Driving a game
 
 The harness exposes a fluent, self-checking DSL. A bring-up script reads like the steps a human

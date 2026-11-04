@@ -25,6 +25,12 @@ const BUILD_SHA = (
 // cert). Opt into a self-signed HTTPS dev/preview server with VITE_SSL=1.
 const useSsl = !!process.env.VITE_SSL;
 
+// Remote harness bridge (tools/remote-bridge.ts): the page reaches the bridge through this
+// dev server so a cloudflared tunnel needs ONE public origin. BS_TUNNEL=1 admits the
+// tunnel's Host header, which Vite otherwise refuses (DNS-rebinding guard).
+const bridgePort = Number(process.env.BS_BRIDGE_PORT ?? 9444);
+const tunnelHosts = process.env.BS_TUNNEL ? [".trycloudflare.com"] : [];
+
 const coopCoepHeaders = {
   "Cross-Origin-Opener-Policy": "same-origin",
   "Cross-Origin-Embedder-Policy": "require-corp"
@@ -246,6 +252,10 @@ export default defineConfig({
     strictPort: true,
     ...useSsl ? { https: true } : {},
     hmr: false,
+    ...tunnelHosts.length ? { allowedHosts: tunnelHosts } : {},
+    proxy: {
+      "/__bridge": { target: `ws://localhost:${bridgePort}`, ws: true },
+    },
     watch: {
       // Chokidar registers one fs.watch handle PER FILE and its defaults ignore only
       // .git/node_modules/the cache dir. These trees hold no importable module and tens of
