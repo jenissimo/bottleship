@@ -990,6 +990,21 @@ export class WinMM implements IModule {
         return removed;
     }
 
+    /**
+     * True while a posted callback matching `match` is still queued, or is the one running
+     * on a live pump thread. False means it was delivered or lost (queue reset, pump thread
+     * gone) and its onReturn will never run — callers that coalesce on it can stop waiting.
+     */
+    hasPostedGuestCallback(match: (cb: PendingTimerCallback) => boolean): boolean {
+        for (let i = this.pendingTimerHead; i < this.pendingTimerCallbacks.length; i++) {
+            const cb = this.pendingTimerCallbacks[i];
+            if (!cb.sourceTimer && match(cb)) return true;
+        }
+        const running = this.dispatchingPosted;
+        if (!running || !match(running)) return false;
+        return System.getInstance().scheduler?.isThreadAlive(this.timerThreadId) ?? false;
+    }
+
     /** The timer-pump callback that just returned: finish a posted callback's instance. */
     notePostedCallbackReturned(callbackAddr: number): void {
         const cb = this.dispatchingPosted;

@@ -2,11 +2,10 @@
  * The cursor clip is a GLOBAL input mode that Windows drops when the foreground input
  * queue switches.
  *
- * NT5 xxxSetForegroundWindow2 (ntuser/kernel/focusact.c) does it inside
- * `if (gpqForeground != gpqForegroundPrev)`: "Remove the clip cursor rectangle - it is a
- * global mode that gets removed when switching." wineserver set_foreground_input is the
- * same rule (`set_clip_rectangle(desktop, NULL, SET_CURSOR_NOCLIP, 1)` after an early
- * return when the foreground input is unchanged).
+ * Reference: wineserver set_foreground_input (`set_clip_rectangle(desktop, NULL,
+ * SET_CURSOR_NOCLIP, 1)` after an early return when the foreground input is unchanged),
+ * which matches the behavior observed on Windows; ClipCursor's documentation describes
+ * the cursor as a shared resource.
  *
  * Two halves, and the second is what makes this safe to ship: a queue is a THREAD's, so
  * moving the foreground between two windows of one thread is NOT a switch and must leave
@@ -62,8 +61,8 @@ describe("cursor clip vs the foreground queue", () => {
 
         wm.setActiveWindow(mkTop(2));
 
-        // zzzClipCursor(NULL) stores grcCursorClip = rcScreen, so the guest reads back the
-        // whole virtual screen — there is no "no clip" value to report.
+        // GetClipCursor documents that an unconfined cursor reports the screen rectangle,
+        // so there is no separate "no clip" value for the guest to read.
         expect(getCursorClipRect()).toBeNull();
         expect(describePointerPolicy().facts.clipped).toBe(false);
         expect(describePointerPolicy().clipRect).toBeNull();

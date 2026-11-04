@@ -40,10 +40,6 @@ const BUFFER_LIMIT = 256 * 1024;
 const PACKET_LIMIT = 1024;
 // Local engine safety bound for queued UDP errors; not a Windows provider capacity.
 const UDP_ERROR_RECORD_LIMIT = 1024;
-// Buffered UDP admission models NT5 x86 free: AFD_BUFFER_TAG is 48 bytes
-// under the default MSVC /Zp8 ABI (DBG=0). This is a source-build model,
-// not a measured quota or allocation cost for modern Windows providers.
-const NT5_X86_UDP_RECEIVE_TAG_BYTES = 48;
 
 export interface WsaAddress {
     family: number;
@@ -896,13 +892,15 @@ export class WsaSocketTable {
     private enqueueUdp(s: SocketState, record: UdpReceiveRecord): boolean {
         const current = this.udpReceiveQueues.get(s.id);
         const window = Math.max(1, s.receiveLimit);
-        // NT5 recvdg.c and misc.c test CURRENT physical occupancy, including
-        // zero-byte datagrams and receive-only status records. The first whole
-        // record may cross the window; PEEK retains its charge until consumption.
-        if (s.available >= window || (s.available === 0 &&
-            (current?.records.length ?? 0) * NT5_X86_UDP_RECEIVE_TAG_BYTES >= window)) return false;
+        // SO_RCVBUF docs: datagrams arriving while the receive buffer is full are
+        // dropped. Admission tests the queued payload bytes; observed on Windows (the
+        // native first-packet probe in wsa-actor.test.ts), the first whole datagram may
+        // cross a tiny window. PEEK keeps its bytes queued until consumption. A window of
+        // 0 is treated as 1 (engine choice). Zero-byte datagrams and error records hold
+        // no payload bytes; only the local record caps below bound them.
+        if (s.available >= window) return false;
         if ("data" in record) {
-            // Object caps remain local resource bounds, separate from the source quota.
+            // Object caps are local resource bounds, not a Windows quota.
             if ((current?.dataCount ?? 0) >= PACKET_LIMIT) return false;
         } else if ((current?.errorCount ?? 0) >= UDP_ERROR_RECORD_LIMIT) return false;
         const queue: UdpReceiveQueue = current ?? { records: [], dataCount: 0, errorCount: 0 };
@@ -1016,7 +1014,8 @@ export class WsaSocketTable {
         if (s.state !== "connected" && !(s.type === 2 && (s.af === 2 || s.af === 23))) fail(WSA.ENOTCONN);
         if (how !== 1) {
             s.readShutdown = true;
-            // NT5 datagram shutdown records the mode without purging the physical receive queue.
+            // shutdown docs: for UDP, SD_RECEIVE disallows later recv calls but incoming
+            // datagrams are still accepted and queued, so the queue is not purged.
             if (!(s.type === 2 && (s.af === 2 || s.af === 23))) { s.packets = []; s.chunks = []; s.available = 0; }
         }
         if (how !== 0 && !s.writeShutdown) {
@@ -1102,7 +1101,10 @@ export class WsaSocketTable {
     atMark(sid: number): boolean { return this.get(sid).oob === null; }
     bytesAvailable(sid: number): number {
         const s = this.get(sid);
-        // IP UDP FIONREAD snapshots all queued payload bytes, without consuming a datagram.
+        // IP UDP FIONREAD (Winsock IOCTLs docs; cases/udp/fionread.native.log) reports all
+        // queued payload bytes without consuming a datagram. Observed on Windows (the
+        // native captures behind wsa-udp-mixed-actor / wsa-udp-query-shutdown-actor): a
+        // queue holding only zero-byte datagrams or error records reports 1.
         if (s.type === 2 && (s.af === 2 || s.af === 23))
             return s.available || (this.udpReceiveQueues.get(s.id)?.records.length ? 1 : 0);
         return s.type !== 1 ? (s.packets[0]?.data.length ?? 0) + (s.receiveHeader && s.packets[0]?.ipxHeader ? 30 : 0) : s.available;

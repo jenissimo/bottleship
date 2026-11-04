@@ -2,9 +2,8 @@
 /* Isolated COPY variant: same cancellation lifecycle, COPY buffer ownership. Baseline refs are unchanged. */
 /* Native-only pending-send lifecycle probe. Every observation is flushed before
  * entering Close, so a native hang leaves a nonce-specific durable transcript.
- * NT5 reference: dnet/core/common.cpp DN_Close:581 cancels USER_SEND and
- * INTERNAL_SEND; async.cpp:1941 DNCompleteSendHandle calls DNUserSendComplete.
- * Source alone is not the observable Windows contract measured here. */
+ * The IDirectPlay8Peer::Close docs say outstanding operations are cancelled
+ * (DPNERR_USERCANCEL); this probe measures what Windows actually reports. */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>

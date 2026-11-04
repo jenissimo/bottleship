@@ -1,18 +1,14 @@
 /**
  * DirectSound premix ramp — the write-cursor lead over play.
  *
- * On a LOCSOFTWARE buffer GetCurrentPosition derives the secondary's write cursor from
- * the distance between the primary's write cursor and the mixer's next-mix position, so
- * the reported lead IS the premixed region (nt5 dsound `CGrace::GetBytePosition`: "the
- * region from the write cursor to the mix cursor is the premixed region"). The mixer
- * thread ramps that region on a timer — `MIXER_MINPREMIX` (45 ms) after a remix, then
- * `premix += step; step += 2` per refresh up to `MIXER_MAXPREMIX` (200 ms), sleeping
- * min(premixed/2, nextNotify) clamped to [MIN/2, MAX/2] in between (nt5 dsound
- * `CNaGrace::MixThread`).
+ * BottleShip models the LOCSOFTWARE write-cursor lead as a premixed region that restarts
+ * at 45 ms after a remix and grows per refresh (increment +2 ms each step) to a 200 ms
+ * ceiling. The DirectSound docs do not publish these numbers; they are the engine's model
+ * (see the PREMIX_* comment in dsound.ts) and this test pins the model, not Windows.
  *
- * These bounds are load-bearing and silent when wrong: a music pump slower than the
+ * The bounds are load-bearing and silent when wrong: a music pump slower than the
  * ceiling writes into already-consumed data and crackles, with nothing returning an
- * error. So the curve is pinned here against those two source constants.
+ * error. So the curve is pinned here.
  *
  * `advancePremix` reads and writes only the buffer's own premix fields, so it is
  * exercised through the prototype — no Process, no SAB, no v86.

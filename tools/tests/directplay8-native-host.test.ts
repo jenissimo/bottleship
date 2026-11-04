@@ -51,7 +51,7 @@ test("captured native C1 admits once, returns reply before CREATE, and sends act
  expect(info.reply).toEqual(reference.reply);expect(info.localId).toBe(reference.localId);
  expect(info.version).toBe(3);expect(info.application.players).toBe(2);
  const mask=new DataView(bytes(info.application.instance).buffer).getUint32(0,true);
- // NT5 CNameTable.FindEntry decodes the index and verifies the version in the handle.
+ // [MC-DPL8CS] 2.2.7: the DPNID carries the name-table index and the entry version.
  for(const entry of info.entries){const handle=(entry.id^mask)>>>0;expect(handle>>>20).toBe(entry.version&0xfff);expect(handle&0xfffff).toBeGreaterThan(1);expect(handle&0xfffff).toBeLessThan(16);}
  expect(info.entries.map(e=>[e.flags,e.version,e.name])).toEqual(reference.entries.map(e=>[e.flags,e.version,e.name]));
  expect(s.events).toEqual(["indicate","reply-returned","create-remote"]);expect(s.releases).toBe(1);expect(s.context).toBe("peer");

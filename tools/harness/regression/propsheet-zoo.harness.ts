@@ -18,7 +18,7 @@
  *    units (6 x 13) where our canvas font gives ~6.08 x ~13.6 — so absolute pixels
  *    cannot line up. It stays as an eyeball reference, and `compareReference` (which
  *    palette-remaps it) is available for a manual look; BEVELS come from the spec
- *    (Wine dlls/comctl32/tab.c, the NT5 source), never from diffing this capture.
+ *    (Wine dlls/comctl32/tab.c and the DrawEdge docs), never from diffing this capture.
  *
  * PIXEL-EXACTNESS is used only where BOTH sides are ours, which costs nothing and is
  * unambiguous: a page switched away and back must return byte-identical, and a

@@ -48,6 +48,26 @@ It generates `manifest.json` + `registry.json` and packs everything in one step.
 | `--args` | command-line arguments |
 | `--skip-video` | make MCI/Bink/Smacker intros complete instantly |
 | `--codepage` / `--lcid` | locale for non-Western titles |
+| `--sdb <relpath>` | apply a shim database the game's installer registers (repeatable); see below |
+
+### Shim databases (`--sdb`)
+
+Some re-releases ship an application-compatibility database (`.sdb`) and have their installer
+register it with `sdbinst` instead of patching the old binary. On Windows such a database takes
+effect only once it is installed; a `.sdb` that just lies in the game folder does nothing. So
+make-wgb never applies one on its own: it reports every `.sdb` it finds, and you pass
+`--sdb <path relative to game-dir>` for the ones the installer actually registers (Steam's
+Mafia: `--sdb mafia.sdb`).
+
+Of a selected database, only VirtualRegistry `ADDREDIRECT(from^to)` rules are used. They are
+written to `manifest.emulator.registryRedirects` as `{ exe, from, to }`, bound to the exe whose
+entry declares them. Each process gets the rules for its own image name when it starts, a child
+process included, and a process no entry names sees the registry without redirects. Entries are
+matched by exe file name only: MATCHING_FILE attributes are not checked, and entries that only
+MATCHING_FILE could identify (NAME `*`) are skipped and reported, as are other shims and other
+VirtualRegistry commands. Per exe, a rule whose target overlaps a source (its own or another
+rule's: a target inside the source, chains, cycles) and a rule on a whole root key (`HKLM`) are
+rejected with a warning, both here and again when the bundle loads.
 
 ## Inspecting & patching: `wgb.ts`
 

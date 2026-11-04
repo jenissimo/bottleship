@@ -51,11 +51,11 @@ try{
  check(rinfo.address==="127.0.0.1"&&rinfo.family==="IPv4"&&rinfo.port>0,"unexpected UDP source");
  check(packet.length===52,"invalid UDP request length");
  const port=packet.readUInt16BE(6);check(port>0,"invalid advertised port");
- // Independent NT5 source-layout literal: only the return port and per-run GUID vary.
+ // Literal from [MC-DPL4CS] 2.2.6/2.2.29 (DX8VERSION): only the return port and per-run GUID vary.
  const expected=Buffer.from("3400b0fa020000007f0000010000000000000000706c617902000d00000000000000000000000000000000000000000000000000","hex");
  expected.writeUInt16BE(port,6);guid.copy(expected,28);
  writeFileSync(join(output,"request-expected.bin"),expected);result.expectedRequestSha256=hash(join(output,"request-expected.bin"));
- check(packet.equals(expected),"UDP request differs from source-layout literal");
+ check(packet.equals(expected),"UDP request differs from the [MC-DPL4CS] literal");
  peer=createConnection({host:"127.0.0.1",port});await bounded(once(peer,"connect"));
  const reply=Buffer.from("7600b0fa020008fcc00002010000000000000000"+"706c617901000b005000000000200000000102030405060708090a0b0c0d0e0f"+"101112131415161718191a1b1c1d1e1f08000000030000000000000000000000"+"0403020188776655010000000200000003000000040000005c000000410016040000","hex");
  guid.copy(reply,52);writeFileSync(join(output,"reply.bin"),reply);result.replyWire={hex:reply.toString("hex"),sha256:hash(join(output,"reply.bin"))};

@@ -243,7 +243,7 @@ test("graceful close retires session when lease is revoked during the first subm
  await Promise.resolve();await Promise.resolve();f.abortLease();await expect(pending).rejects.toThrow();gate.resolve();
  expect(f.destroyed).toEqual([3]);expect(f.counts()).toEqual([1,1,1,0]);
 });
-test("normal native destroy encodes the source-derived cmd11 layout",()=>{
+test("normal native destroy encodes the [MC-DPL4CS] 2.2.25 DELETEPLAYER layout",()=>{
  const inner=encodeDirectPlay4DestroyPlayer(0x12345678,14),v=new DataView(inner.buffer);
  expect(inner.length).toBe(28);expect(v.getUint32(0,true)).toBe(0x79616c70);
  expect(v.getUint16(4,true)).toBe(11);expect(v.getUint16(6,true)).toBe(14);

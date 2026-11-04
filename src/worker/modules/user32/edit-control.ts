@@ -634,7 +634,8 @@ function undoEdit(child: WindowInfo, state: EditState): boolean {
     return true;
 }
 
-/** EM_SETSEL: out-of-order endpoints swap and both clamp (NT5 EditSL_ChangeSelection);
+/** EM_SETSEL: out-of-order endpoints swap and both clamp (EM_SETSEL docs: "the lower of
+ *  the two values specifies the first character"; Wine edit.c EDIT_EM_SetSel);
  *  the caret then sits at the end of the selection. */
 function setSelection(child: WindowInfo, state: EditState, start: number, end: number): void {
     const len = child.title.length;

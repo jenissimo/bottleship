@@ -4,8 +4,8 @@
  * The zoo builds two radio sets with plain CreateWindowEx calls, A1 A2 A3 then B1 B2,
  * each set opened by a WS_GROUP button (bottleship-demos/control_zoo/src/main.c). That
  * is the path a dialog TEMPLATE never takes, and the two must agree: in Win32 the
- * sibling list IS the Z-order, a new child is linked at the BOTTOM of it (NT
- * createw.c; Wine user32/tests/win.c test_children_zorder), so children come out in
+ * sibling list IS the Z-order, a new child is linked at the BOTTOM of it (Wine
+ * user32/tests/win.c test_children_zorder, a conformance test that passes on Windows), so children come out in
  * creation order and GetNextDlgGroupItem's GW_HWNDNEXT walk yields the author's order
  * whether the controls came from a template or from CreateWindowEx.
  *

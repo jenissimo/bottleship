@@ -280,7 +280,7 @@ test("InitializeConnection owns the complete bounded address regardless of eleme
     expect(firstSession.getConnectionAddress()).toBeUndefined();
     expect(secondSession.getConnectionAddress()).toBeUndefined();
 });
-test("EnumConnections returns the 80-byte source ADDRESSHEADER accepted by InitializeConnection",()=>{
+test("EnumConnections returns the 80-byte connection blob (address oracle) accepted by InitializeConnection",()=>{
     const result=call("EnumConnections",[0,0x7000,0x1234,0]) as ThunkResult;
     expect(result.suspendedForCallback).toBe(true);
     const [provider, address, size, name, flags, context]=callbacks[0].args;
@@ -332,7 +332,7 @@ test("InitializeConnection follows native tail-byte and malformed SP observation
     expect(call("InitializeConnection",[base,0])).toBe(DP.OK);
     expect(((api as any).state(primary).session as DirectPlaySession).getConnectionAddress()!.bytes).toEqual(owned);
 });
-test("a LobbyProvider wins the NT5 first pass even when a supported SP comes first",()=>{
+test("a LobbyProvider chunk takes precedence even when a supported SP comes first",()=>{
     const base=0x2000;
     bytes(base,"60f518132c91d0119daa00a0c90a43cb");u32(base+16,4);u32(base+20,96);
     bytes(base+24,"c016d907afe0cf119c4e00a0c905425e");u32(base+40,16);

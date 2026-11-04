@@ -1,9 +1,11 @@
+import {DPSP_MSG, DPSP_SIGNATURE, DPSP_TOKEN_REMOTE, DPSP_VERSION} from "./spec";
+
 /**
- * NT5 legacy TCP/IP provider, no-password ENUMSESSIONS request only.
- * dplay/dplay/dpmess.h:162-178,237-248; dplay/dplay/enum.c:1507-1536;
- * dplay/wsock/dpsp.h:97-127,300-305; dplay/wsock/dpsp.c:484-493,2073-2076.
+ * [MC-DPL4CS] 2.2.29 DPSP_MSG_ENUMSESSIONS, no-password form only (PasswordOffset 0),
+ * framed by 2.2.6 DPSP_MSG_HEADER; see the 4.1 example. Version is DX8VERSION (13,
+ * 2.2.3), which native Windows hosts answer in the DP4 interop fixtures
+ * (tools/lan-conformance/directplay4-native-*-e2e.ts).
  * The inputs are Win32 in-memory GUID and SOCKADDR_IN bytes, not strings.
- * This is source-derived encoding, not evidence of native interoperability.
  */
 export function encodeDirectPlay4EnumSessionsRequest(
     applicationGuid: Uint8Array,
@@ -21,18 +23,19 @@ export function encodeDirectPlay4EnumSessionsRequest(
 
     const result = new Uint8Array(52), view = new DataView(result.buffer);
     // Provider size includes its own 20 bytes; sockaddr contains network-order port/address.
-    view.setUint32(0, 0xfab00000 | result.length, true);
+    view.setUint32(0, ((DPSP_TOKEN_REMOTE << 20) | result.length) >>> 0, true);
     result.set(returnSockaddr, 4);
     // Inner offsets are relative to the first 'p', not to the provider header.
-    view.setUint32(20, 0x79616c70, true);
-    view.setUint32(24, (13 << 16) | 2, true);
+    view.setUint32(20, DPSP_SIGNATURE, true);
+    view.setUint16(24, DPSP_MSG.ENUMSESSIONS, true);
+    view.setUint16(26, DPSP_VERSION.DX8, true);
     result.set(applicationGuid, 28);
     view.setUint32(44, 0, true); // no password
     view.setUint32(48, flags, true);
     return result;
 }
 
-/** 32-bit normal, nonsecure session description as stored in MSG_ENUMSESSIONSREPLY. */
+/** 2.2.5 DPSESSIONDESC2 fields as carried in 2.2.30 DPSP_MSG_ENUMSESSIONSREPLY (nonsecure). */
 export interface DirectPlay4EnumReply {
     version: number;
     size: number;
@@ -47,10 +50,11 @@ export interface DirectPlay4EnumReply {
 }
 
 /**
- * Internal reply only. NT5 dplay/dpmess.h:237-258, dplay/handler.c:1496-1544,
- * dplay/dplay.h:417-442. Version is explicit because DoReply may change it.
- * This excludes the provider header, empty names, and secure-server replies.
- * Bounds are this encoder's contract, not native decoder acceptance rules.
+ * [MC-DPL4CS] 2.2.30 DPSP_MSG_ENUMSESSIONSREPLY without the provider prefix:
+ * header, 2.2.5 DPSESSIONDESC2 (80 bytes; SessionName/Password pointer
+ * placeholders zero), NameOffset, then the NUL-terminated UTF-16 SessionName.
+ * The version is an explicit input. Empty names and secure sessions are not
+ * produced. Bounds are this encoder's contract, not native decoder rules.
  */
 export function encodeDirectPlay4EnumSessionsReply(reply: DirectPlay4EnumReply): Uint8Array {
     const uint = (value: number) => Number.isInteger(value) && value >= 0 && value <= 0xffffffff;
@@ -67,8 +71,9 @@ export function encodeDirectPlay4EnumSessionsReply(reply: DirectPlay4EnumReply):
         throw new RangeError("name must be a nonempty UTF-16 string without embedded NUL");
 
     const result = new Uint8Array(92 + (reply.name.length + 1) * 2), view = new DataView(result.buffer);
-    view.setUint32(0, 0x79616c70, true);
-    view.setUint32(4, (reply.version << 16) | 1, true);
+    view.setUint32(0, DPSP_SIGNATURE, true);
+    view.setUint16(4, DPSP_MSG.ENUMSESSIONSREPLY, true);
+    view.setUint16(6, reply.version, true);
     view.setUint32(8, reply.size, true);
     view.setUint32(12, reply.flags, true);
     result.set(reply.instanceGuid, 16);
@@ -84,7 +89,7 @@ export function encodeDirectPlay4EnumSessionsReply(reply: DirectPlay4EnumReply):
     return result;
 }
 
-/** A source-layout reply; pointer DWORDs and provider sockaddr are raw wire bytes. */
+/** A decoded 2.2.30 reply; pointer placeholder DWORDs and provider sockaddr are raw wire bytes. */
 export interface DirectPlay4DecodedEnumReply {
     consumed: number;
     providerSockaddr: Uint8Array;
@@ -103,10 +108,9 @@ export interface DirectPlay4DecodedEnumReply {
 }
 
 /**
- * Decode one TCP provider frame containing an ENUMSESSIONSREPLY.
- * dplay/wsock/dpsp.h:94-130,300-305; dpsp.c:1119-1169,1242-1402;
- * dplay/handler.c:1496-1544,3519-3562. The first receive stage is the
- * four-byte token/size, although the full provider header is 20 bytes.
+ * Decode one TCP frame containing a 2.2.30 DPSP_MSG_ENUMSESSIONSREPLY. The
+ * size/token DWORD (2.2.6) is read first; it gives the length of the whole
+ * frame including the 20-byte size/token + SockAddr prefix.
  *
  * Returns null for an incomplete frame; consumed permits concatenated frames.
  * The explicit bound and strict offset/terminator checks are local safety
@@ -123,13 +127,13 @@ export function decodeDirectPlay4TcpEnumReply(
     if (input.length < 4) return null;
     const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
     const header = view.getUint32(0, true);
-    if ((header & 0xfff00000) >>> 0 !== 0xfab00000)
+    if (header >>> 20 !== DPSP_TOKEN_REMOTE)
         throw new RangeError("unsupported provider token");
     const length = header & 0xfffff;
     if (length < 112 || length > maxFrameBytes) throw new RangeError("invalid frame size");
     if (input.length < length) return null;
     const base = 20;
-    if (view.getUint32(base, true) !== 0x79616c70 || view.getUint16(base + 4, true) !== 1)
+    if (view.getUint32(base, true) !== DPSP_SIGNATURE || view.getUint16(base + 4, true) !== DPSP_MSG.ENUMSESSIONSREPLY)
         throw new RangeError("not an enum sessions reply");
     const offset = view.getUint32(base + 88, true);
     let name: string | null = null;

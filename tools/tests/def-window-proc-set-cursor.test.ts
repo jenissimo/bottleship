@@ -2,13 +2,14 @@
  * WM_SETCURSOR is the only route by which a pointer comes back after SetCursor(NULL),
  * and DefWindowProc is the whole of it.
  *
- * NT5 ntuser/kernel/dwp.c xxxDWP_SetCursor, in order: a sizing border answers with its own
- * cursor and stops; every other hit code is SENT to the parent first (`GetChildParent`,
- * i.e. WS_CHILD only, desktop excluded) and stops if the parent returns nonzero; only a
- * declining parent lets the HIT window's class cursor apply, and only
- * `if (pwndHit->pcls->spcur != NULL)` — a NULL class cursor makes DefWindowProc do
- * nothing. Wine's win32u/defwnd.c (WM_SETCURSOR → send_message(parent) → handle_set_cursor)
- * is the same rule, and its win32u/class.c `builtin_classes[]` is the table of what those
+ * The WM_SETCURSOR documentation: DefWindowProc passes the message to a child's parent
+ * first and stops if the parent returns TRUE; otherwise the client area gets the HIT
+ * window's class cursor — and a NULL class cursor (WNDCLASS.hCursor docs) leaves the shape
+ * to the application. The engine answers a sizing border with its sizing cursor before the
+ * parent offer; Wine offers the parent first there too, and that ordering detail has not
+ * been captured on Windows yet. Wine's
+ * win32u/defwnd.c (WM_SETCURSOR → send_message(parent) → handle_set_cursor) is the same
+ * rule, and its win32u/class.c `builtin_classes[]` is the table of what those
  * class cursors are: IDC_ARROW for everything, IDC_IBEAM for Edit, and `#32770`
  * (CS_SAVEBITS|CS_DBLCLKS, DLGWINDOWEXTRA, IDC_ARROW) for the dialog class.
  *
@@ -212,7 +213,7 @@ describe("DefWindowProc's class cursor never overrides the guest's ShowCursor co
     });
 
     test("a NULL class cursor makes DefWindowProc do nothing at all", () => {
-        // Not "hide the pointer": dwp.c only calls zzzSetCursor inside the != NULL test.
+        // Not "hide the pointer": with a NULL class cursor the shape is the app's business.
         // An app that wants no pointer registers a NULL cursor AND hides it itself.
         registerBuiltinClass("ReBarWindow32", { cbWndExtra: 4, hCursor: 0 });
         const before = getCurrentCursorHandle();
@@ -244,7 +245,7 @@ describe("WM_SETCURSOR is offered to the parent before any class cursor", () => 
         // Nothing may be installed until the parent has answered.
         expect(getCurrentCursorHandle()).toBe(before);
 
-        // Nonzero = the parent set the cursor itself. dwp.c returns TRUE and stops.
+        // Nonzero = the parent set the cursor itself; per the WM_SETCURSOR docs processing halts.
         expect((plan as any).onParentResult(1)).toBe(1);
         expect(getCurrentCursorHandle()).toBe(before);
     });
@@ -259,15 +260,15 @@ describe("WM_SETCURSOR is offered to the parent before any class cursor", () => 
         });
 
         const plan = defWindowProcSetCursor(child, child, setCursorLParam(HTCLIENT)) as any;
-        // FALSE from the parent, and DefWindowProc's own answer is FALSE too (dwp.c falls
-        // out of the switch to `return FALSE`; returning TRUE would halt the chain above).
+        // FALSE from the parent, and DefWindowProc's own answer is FALSE too (returning
+        // TRUE would halt the chain above, per the WM_SETCURSOR docs).
         expect(plan.onParentResult(0)).toBe(0);
         expect(getCurrentCursorHandle()).toBe(getSystemCursorHandle(IDC_IBEAM));
     });
 
     test("the class cursor comes from wParam, the window the pointer is OVER", () => {
-        // dwp.c reads pwndHit->pcls->spcur, and hwndHit rides wParam unchanged all the way
-        // up the chain — so the dialog handling the offer still applies its EDIT's I-beam.
+        // The WM_SETCURSOR docs: wParam is the window that contains the cursor, and it rides
+        // unchanged all the way up the chain (Wine passes it through the same way) — so the dialog handling the offer still applies its EDIT's I-beam.
         const dlg = mkWindow({ nativeClassName: "#32770", style: WS_POPUP | WS_VISIBLE });
         const edit = mkWindow({
             nativeClassName: "Edit", style: WS_CHILD | WS_VISIBLE, parent: dlg,

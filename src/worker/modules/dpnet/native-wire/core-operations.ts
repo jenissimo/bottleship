@@ -82,7 +82,8 @@ export function encodeNativeCoreRequest(command: number, handle: number, words: 
     return out;
 }
 
-/** NT5 PackEntryInfo for ADD_PLAYER; offsets are relative to the 48-byte body. */
+/** [MC-DPL8CS] 2.2.1.7 DN_ADD_PLAYER carrying a 2.2.1.5 DN_NAMETABLE_ENTRY_INFO (twelve
+ * DWORDs); name/data/URL offsets are relative to that 48-byte body. */
 export function encodeNativePlayerAdded(entry: NativeNameTableEntry): Uint8Array {
     const fields = [entry.id, entry.owner, entry.flags, entry.version, entry.unused, entry.coreVersion];
     if (fields.some(n => !Number.isInteger(n) || n < 0 || n > 0xffffffff) ||

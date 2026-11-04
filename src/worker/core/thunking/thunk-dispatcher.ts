@@ -6426,7 +6426,9 @@ export class ThunkDispatcher {
             // NtContinue restores the full CONTEXT including any modifications.
             const ctxBase = scratchAddr + SEH_SCRATCH_LAYOUT.CONTEXT;
             if (view.getUint32(ctxBase, true) & 1) {
-                // NT5 i386.h SANITIZE_FLAGS: preserve user flags, force IF and bit 1.
+                // A user-mode CONTEXT cannot raise privilege: drop IOPL, NT and RF (Intel SDM
+                // vol. 1 §3.4.3 system flags), keep the status/control flags, force IF and
+                // the always-one reserved bit 1.
                 const flags = (view.getUint32(ctxBase + 0xc0, true) & 0x003e0dd7) | 0x202;
                 const control = cpuViews(cpu);
                 control.flags[0] = flags;

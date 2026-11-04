@@ -1,10 +1,14 @@
 import type {WsaAddress} from "../../wsa-network";
+import {DPSP_MSG, DPSP_SIGNATURE} from "./spec";
 
 /**
- * Isolated pending/reply arbitration slice for future DP4 Join.
- * NT5 dplay/api.c:958-1073, handler.c:3876-3904,4193-4218,
- * pending.c:40-107,128-195,201-295 and iplay.c:5378-5399.
- * This does not parse packetization, authentication or apply player changes.
+ * Reply arbitration for a DP4 Join ([MC-DPL4CS] 3.1.4.2, 3.1.5.1, 3.1.5.7, 3.1.5.8).
+ * While the join waits for REQUESTPLAYERREPLY or for the name table
+ * (SUPERENUMPLAYERSREPLY / ENUMPLAYERSREPLY, or ADDFORWARDREPLY on failure), other
+ * messages are held in arrival order. Once the reply is merged into the player list
+ * (3.1.5.7) they are replayed; a create message for an ID the merged list already has
+ * is skipped, which keeps the merge idempotent. This hold-and-replay design is the
+ * engine's own. Packetization and authentication are not parsed here.
  * Queue limits and fail-closed handling are local safety policy.
  */
 export type DirectPlay4PendingHeader = Uint8Array | "local" | null;
@@ -13,11 +17,14 @@ export type DirectPlay4PendingResult =
     | {kind:"reply"; message:DirectPlay4PendingMessage; command:number}
     | {kind:"queued"} | {kind:"not-handled"} | {kind:"unsupported"};
 type Entry = {message:DirectPlay4PendingMessage; command:number | null; size:number};
-type Expected = 3 | 7 | 41;
-const replies = new Set([3,7,36,41]);
-// These bypass NT5 pending, but require packet reassembly/auth handling not
-// provided by this isolated slice. The caller must reject or handle them.
-const unsupported = new Set([21,28,29,30,31,44,48,49]);
+type Expected = typeof DPSP_MSG.ENUMPLAYERSREPLY | typeof DPSP_MSG.REQUESTPLAYERREPLY | typeof DPSP_MSG.SUPERENUMPLAYERSREPLY;
+const replies = new Set<number>([DPSP_MSG.ENUMPLAYERSREPLY,DPSP_MSG.REQUESTPLAYERREPLY,DPSP_MSG.ADDFORWARDREPLY,DPSP_MSG.SUPERENUMPLAYERSREPLY]);
+// Packetized (2.2.39-2.2.41) and secure-session (2.2.16-2.2.17, 2.2.29-2.2.30
+// logon, 2.2.35) messages need reassembly or authentication that this engine
+// does not implement; they are reported as unsupported for the caller to reject.
+const unsupported = new Set<number>([DPSP_MSG.PACKET,DPSP_MSG.CHALLENGE,DPSP_MSG.ACCESSGRANTED,DPSP_MSG.LOGONDENIED,
+    DPSP_MSG.AUTHERROR,DPSP_MSG.KEYEXCHANGEREPLY,DPSP_MSG.PACKET2_DATA,DPSP_MSG.PACKET2_ACK]);
+const creates = new Set<number>([DPSP_MSG.CREATEPLAYER,DPSP_MSG.CREATEGROUP,DPSP_MSG.CREATEPLAYERVERIFY]);
 const uint=(n:number)=>Number.isInteger(n)&&n>=0&&n<=0xffffffff;
 
 export class DirectPlay4JoinPending {
@@ -45,14 +52,14 @@ export class DirectPlay4JoinPending {
     }
     private isPending():boolean{return this.state==="pending";}
     expectReply(command:Expected):void {
-        if(![3,7,41].includes(command)||!this.current()||this.expected!==undefined)
+        if(![DPSP_MSG.ENUMPLAYERSREPLY,DPSP_MSG.REQUESTPLAYERREPLY,DPSP_MSG.SUPERENUMPLAYERSREPLY].includes(command)||!this.current()||this.expected!==undefined)
             throw new Error("cannot register expected reply");
         this.expected=command;
     }
     receive(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number,peer?:WsaAddress):DirectPlay4PendingResult {
         return this.receiveTyped(bytes,header,sendFlags,false,peer);
     }
-    /** Already-classified player data: an ID equal to MSG_HDR must not be
+    /** Already-classified player data: an idFrom equal to the 'play' signature must not be
      * reinterpreted as a system command (e.g. a decoded PLAYERWRAPPER). */
     receivePlayer(bytes:Uint8Array,header:DirectPlay4PendingHeader,sendFlags:number,peer?:WsaAddress):DirectPlay4PendingResult {
         return this.receiveTyped(bytes,header,sendFlags,true,peer);
@@ -71,7 +78,7 @@ export class DirectPlay4JoinPending {
         if(player && bytes.length<8)throw new RangeError("truncated player message");
         if(!player && bytes.length>=4) {
             const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
-            if(view.getUint32(0,true)===0x79616c70) {
+            if(view.getUint32(0,true)===DPSP_SIGNATURE) {
                 if(bytes.length<8)throw new RangeError("truncated system message");
                 command=view.getUint16(4,true);
             }
@@ -89,7 +96,13 @@ export class DirectPlay4JoinPending {
         });
         if(command!==null && replies.has(command)) {
             const expected=this.expected;
-            const matched=command===expected || (expected===41&&(command===3||command===36)) || (expected===3&&command===36);
+            // The host picks the name-table form from the CS session flag (notes in 2.2.28 /
+            // 2.2.53): a client expecting SUPERENUMPLAYERSREPLY also accepts ENUMPLAYERSREPLY,
+            // one that saw CS expects only ENUMPLAYERSREPLY; either may instead get
+            // ADDFORWARDREPLY when the join failed (3.1.5.8).
+            const matched=command===expected ||
+                (expected===DPSP_MSG.SUPERENUMPLAYERSREPLY&&(command===DPSP_MSG.ENUMPLAYERSREPLY||command===DPSP_MSG.ADDFORWARDREPLY)) ||
+                (expected===DPSP_MSG.ENUMPLAYERSREPLY&&command===DPSP_MSG.ADDFORWARDREPLY);
             if(!matched)return {kind:"not-handled"};
             this.expected=undefined;
             return {kind:"reply",message:message(),command};
@@ -117,13 +130,13 @@ export class DirectPlay4JoinPending {
                 const item=this.queue.shift()!;
                 try {
                     let duplicate=false;
-                    // dpmess.h:221-235: MSG_PLAYERMGMTMESSAGE.dwPlayerID is
-                    // inner +12; pending.c:145-180 selects player vs group.
-                    if(item.command===8||item.command===9||item.command===56) {
+                    // 2.2.20 / 2.2.21 / 2.2.22: PlayerID is at inner +12; for CREATEGROUP it
+                    // is the new group's ID, for the other two a player's.
+                    if(item.command!==null&&creates.has(item.command)) {
                         if(item.message.bytes.length<16)throw new RangeError("truncated create message");
                         const b=item.message.bytes;
                         const id=new DataView(b.buffer,b.byteOffset,b.byteLength).getUint32(12,true);
-                        duplicate=exists(item.command===9?"group":"player",id);
+                        duplicate=exists(item.command===DPSP_MSG.CREATEGROUP?"group":"player",id);
                         if(!this.current())return false;
                     }
                     if(!duplicate)apply(item.message);

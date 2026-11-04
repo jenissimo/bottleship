@@ -20,7 +20,7 @@ test("pending rejects malformed transport peer instead of erasing provenance",()
  const bad={family:2,port:0,node:Uint8Array.of(2,1,1,2,3,4),ip:Uint8Array.of(1,2,3,4)};
  expect(()=>q.receivePlayer(new Uint8Array(8),null,0,bad)).toThrow();
 });
-test("expected reply matching includes source fallback and owns payload/header",()=>{
+test("expected reply matching includes the name-table fallbacks and owns payload/header",()=>{
     for(const [wanted,received,match] of [[7,7,true],[7,3,false],[41,3,true],[41,36,true],[3,36,true],[3,41,false]] as const) {
         const q=new DirectPlay4JoinPending(5,100,()=>true), b=system(received), header=Buffer.from([1,2]);
         q.expectReply(wanted);const result=q.receive(b,header,4);
@@ -29,8 +29,8 @@ test("expected reply matching includes source fallback and owns payload/header",
         if(!match)expect(q.receive(system(wanted),null,0).kind).toBe("reply");
     }
 });
-// dpmess.h:221-235 stores dwPlayerID at inner +12; pending.c:145-180
-// checks commands 8/56 in the player table and 9 in the group table.
+// [MC-DPL4CS] 2.2.20-2.2.22 put PlayerID at inner +12; CREATEPLAYER (8) and
+// CREATEPLAYERVERIFY (56) name players, CREATEGROUP (9) a group.
 test("wrapped player with magic ID cannot consume expected cmd7 and replays as player",()=>{
     const q=new DirectPlay4JoinPending(4,100,()=>true),player=Buffer.alloc(12);
     player.write("play");player.writeUInt32LE(7,4);player.writeUInt32LE(0x1234,8);

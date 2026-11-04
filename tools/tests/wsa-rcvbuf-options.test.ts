@@ -1,7 +1,8 @@
 /**
  * ABI/alias literals come from modern native8dc9e864... and getter0b05c800...;
- * NT5 current-occupancy admission cases are separately labelled SOURCE, not
- * a modern exact-capacity claim. Existing abbb default RED source stays immutable.
+ * Admission cases labelled MODEL follow the SO_RCVBUF docs (datagrams arriving while
+ * the buffer is full are dropped) plus engine choices; they are not a modern
+ * exact-capacity claim. Existing abbb default RED source stays immutable.
  */
 import {expect,test} from "bun:test";
 import {RootNetworkNamespace} from "../../src/worker/core/network-namespace";
@@ -79,10 +80,10 @@ for(const family of[2,23] as const){
  }),15000);
 }
 for(const family of[2,23] as const){
- test("SOURCE NT5 zero window admits whole first datagram; alias FIFO AF"+family,async()=>run("NT5_SOURCE_NOT_MODERN_CAPACITY",async(f,ns,pid)=>{
+ test("MODEL zero window admits whole first datagram; alias FIFO AF"+family,async()=>run("MODEL_NOT_MODERN_CAPACITY",async(f,ns,pid)=>{
   const original=f.socket(family),target=f.bind(original,family);
   const alias=f.importInfo(f.duplicate(original,pid)),sender=f.socket(family),source=f.bind(sender,family);
-  const zero=f.set(original,0); // NT5 physical effective window=max(1,requested), public query may remain0.
+  const zero=f.set(original,0); // Engine choice: effective window=max(1,requested); the public query may remain 0.
   const a=[0x51,0x01,0x03],b=[0x51,0x02,0x05,0x25,0x35],c=[0x51,0x03,0x07,0x37,0x47,0x57,0x67];
   const offerA=f.send(sender,target,a);await ns.barrier();
   const offerB=f.send(sender,target,b);await ns.barrier();
@@ -90,7 +91,7 @@ for(const family of[2,23] as const){
   const offerC=f.send(sender,target,c);await ns.barrier();
   const next=f.receive(alias),after=f.available(original);
   f.note({zero,offerA,offerB,offerC,before,afterPeek,empty,after,peek,first,next});
-  // Independent NT5 recvdg1168 CURRENT occupancy check, not available+incoming.
+  // Admission tests current queued bytes, not available+incoming.
   expect(zero.rc).toBe(0);expect([offerA,offerB,offerC]).toEqual([a.length,b.length,c.length]);
   expect(before).toBe(a.length);expect(afterPeek).toBe(a.length);
   checkData(peek,source,a);checkData(first,source,a);expect(empty).toBe(0);

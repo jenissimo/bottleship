@@ -85,7 +85,9 @@ const GENERIC_ALL = 0x10000000;
 const FILE_WRITE_DATA = 0x0002;
 const FILE_APPEND_DATA = 0x0004;
 
-/** NT5 iomgr/write.c:358: only append granted => EOF on every write, not on open.
+/** File Access Rights docs (FILE_APPEND_DATA without FILE_WRITE_DATA): every write goes to
+ * EOF, and opening does not move the position; also the documented WriteFile behavior.
+ * NtWriteFile docs: with only append access the ByteOffset is ignored.
  * VFS retains raw generic bits; GENERIC_WRITE/ALL also grant FILE_WRITE_DATA. */
 function isAppendOnlyAccess(access: number): boolean {
     return (access & FILE_APPEND_DATA) !== 0

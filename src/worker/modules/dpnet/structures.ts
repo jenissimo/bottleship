@@ -55,7 +55,8 @@ export function readInfo(guest: DirectPlayGuestMemory, ptr: number): { info: Pla
     const name = mask & 1 && namePtr ? guest.string(namePtr)! : "";
     return { mask, info: { name, nameNull: !namePtr, data: mask & 2 && size ? Array.from(Mem.readBytes(dataPtr, size)!) : [], flags: Mem.readUint32(ptr + 20)! } };
 }
-/** SetGroupInfo keeps DN_ValidGroupInfo HRESULTs and normalizes only selected fields. */
+/** SetGroupInfo validates DPN_GROUP_INFO (dwSize, dwInfoFlags) with the HRESULTs the
+ * SetGroupInfo docs list, and normalizes only selected fields. */
 export function readSetGroupInfo(guest: DirectPlayGuestMemory, ptr: number):
     { hr: number; value: NonNullable<ReturnType<typeof readInfo>> | null } {
     const fail = (hr: number) => ({ hr, value: null });

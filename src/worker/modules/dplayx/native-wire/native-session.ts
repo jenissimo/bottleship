@@ -211,8 +211,8 @@ export class DirectPlay4NativeSession {
                     if(!this.events.authorizeSystem(id,source,target.versionOrSystemId,before)||!this.current()||this.state!=="opening"||snapshot!==before)
                         throw new Error("native pending delete unauthorized");
                     const players=Object.freeze(before.players.filter(x=>x.id!==id));
-                    // NT5 rebuilds the application-player count while unpacking,
-                    // then decrements it when a non-system player is removed.
+                    // The engine keeps DPSESSIONDESC2.CurrentPlayerCount ([MC-DPL4CS] 2.2.5)
+                    // equal to the number of non-system players after every change.
                     const description=Uint8Array.from(snapshot!.sessionDescription);
                     new DataView(description.buffer).setUint32(44,players.filter(x=>!(x.flags&1)).length,true);
                     snapshot=Object.freeze({...snapshot!,players,sessionDescription:Object.freeze([...description])});
@@ -302,7 +302,8 @@ export class DirectPlay4NativeSession {
                 const currentRoster=this.snapshot,authorizationRoster=item.roster??currentRoster;
                 if(!currentRoster||!authorizationRoster||!this.active()||!this.events.authorizePlayer(candidate,candidatePeer,authorizationRoster)||!this.active()||this.snapshot!==currentRoster)
                     throw new Error("native player identity unauthorized");
-                // NT5 handler.c:4401-4473 drops unknown source/target and system target.
+                // Local policy over 2.2.45 idFrom/idTo: drop a message from an unknown
+                // player, to a player that is not ours, or from a player to itself.
                 const accept=this.knownPlayers.has(f.from)&&f.from!==f.to&&(this.creating||this.localPlayers.has(f.to));
                 if(accept){if(this.creating)this.held.push(item);else this.deliverPlayer(f,p);}
                 else this.queuedBytes-=f.data.length;

@@ -137,13 +137,14 @@ const flag = (n: string): string | undefined => {
     const i = argv.indexOf(n);
     return i >= 0 ? argv[i + 1] : undefined;
 };
-const wineDir = flag("--wine") ?? process.env.BS_WINE_DLLS ?? "G:/sources/wine/dlls";
+const wineDir = flag("--wine") ?? process.env.BS_WINE_DLLS
+    ?? (process.env.BS_WINE_SRC ? join(process.env.BS_WINE_SRC, "dlls") : "");
 const dlls = (flag("--dlls") ?? "").trim() ? flag("--dlls")!.split(",").map((s) => s.trim()) : DEFAULT_DLLS;
 const dry = argv.includes("--dry");
 
-if (!existsSync(wineDir)) {
+if (!wineDir || !existsSync(wineDir)) {
     console.error(`Wine dlls directory not found: ${wineDir}`);
-    console.error(`Set BS_WINE_DLLS or pass --wine <dir> (a Wine source checkout's dlls/).`);
+    console.error(`Set BS_WINE_DLLS (or BS_WINE_SRC) or pass --wine <dir> (a Wine source checkout's dlls/).`);
     process.exit(1);
 }
 

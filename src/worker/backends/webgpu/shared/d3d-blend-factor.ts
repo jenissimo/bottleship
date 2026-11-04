@@ -6,7 +6,7 @@
  *
  * Reference: DXVK src/d3d9/d3d9_util.cpp DecodeBlendFactor / DecodeBlendOp and
  * d3d9_util.h FixupBlendState (the DirectX-6 BOTH*SRCALPHA legacy fixup); confirmed
- * against G:/sources/dxvk/src/d3d8/d3d8_device.cpp FixupBlendState for the D3D8 port.
+ * against dxvk/src/d3d8/d3d8_device.cpp FixupBlendState for the D3D8 port.
  */
 
 // ── D3DBLEND ──────────────────────────────────────────────────────────────

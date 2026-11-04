@@ -4,6 +4,26 @@ import { System } from "../../core/system";
 import { TimerKind } from "../../core/scheduler/types";
 import { TimeService } from "../../runtime/time";
 import { MSSContext } from "./context";
+import { MSSTimer } from "./types";
+
+/**
+ * Withdraw ticks of `timer` that have not run yet: the one queued on the timer pump and any
+ * in the AIL_serve fallback queue. Real Miles serialises AIL_stop_timer /
+ * AIL_release_timer_handle with the callback on its timer mutex, so no callback is seen
+ * after either returns. A tick already running cannot be recalled; it finishes on its own.
+ */
+function withdrawPendingTicks(ctx: MSSContext, timer: MSSTimer): void {
+    const onReturn = timer.pumpOnReturn;
+    if (onReturn) {
+        System.getInstance().scheduler?.cancelTimerCallbacks((cb) => cb.onReturn === onReturn);
+    }
+    timer.pumpOnReturn = undefined;
+    timer.inFlight = false;
+    const queue = ctx.pendingTimerCallbacks;
+    for (let i = queue.length - 1; i >= 0; i--) {
+        if (queue[i].handle === timer.handle) queue.splice(i, 1);
+    }
+}
 
 export function createTimerExports(ctx: MSSContext): Record<string, ThunkImplementation> {
     const exports: Record<string, ThunkImplementation> = {};
@@ -59,12 +79,31 @@ export function createTimerExports(ctx: MSSContext): Record<string, ThunkImpleme
             // virtual-time timer wheel, NOT host setInterval — a busy-spinning guest thread starves
             // host macrotasks, so the mixer would never be serviced → audio stall + audio-gated game
             // logic stall (Re-Volt mac). The wheel is polled in-band with guest execution.
+            // Miles runs timer callbacks on its own background thread, independent of whether
+            // the app ever calls AIL_serve, so ticks go to the shared timer-pump thread; the
+            // AIL_serve queue is only the fallback when no pump thread can be created.
+            scheduler.ensureTimerPumpThread();
+            const cbArgs = [0];
+            // A tick posted by an earlier start (still running after a stop) must not clear
+            // this start's coalescing flag, hence the identity check.
+            const onReturn = () => { if (timer.pumpOnReturn === onReturn) timer.inFlight = false; };
+            const isOurs = (posted: { onReturn?: () => void }) => posted.onReturn === onReturn;
+            timer.pumpOnReturn = onReturn;
+            timer.inFlight = false;
             timer.timerId = scheduler.timerWheel.add(
                 periodMs, true, TimerKind.MSS_TIMER,
                 () => {
                     if (!timer.active || !cb) return;
                     if (!system.process || system.isExiting) return;
-                    ctx.pendingTimerCallbacks.push({ callback: cb, user: timer.user });
+                    // Coalesce while our tick is queued or running. If it was lost without
+                    // returning (pump queue reset, pump thread gone) stop waiting for it.
+                    if (timer.inFlight && scheduler.isTimerCallbackPending(isOurs)) return;
+                    timer.inFlight = true;
+                    cbArgs[0] = timer.user;
+                    if (!scheduler.postTimerCallback(cb, cbArgs, onReturn)) {
+                        timer.inFlight = false;
+                        ctx.pendingTimerCallbacks.push({ callback: cb, user: timer.user, handle });
+                    }
                 },
                 TimeService.getInstance().nowMs(),
             );
@@ -82,6 +121,7 @@ export function createTimerExports(ctx: MSSContext): Record<string, ThunkImpleme
                 System.getInstance().scheduler?.timerWheel.cancel(timer.timerId);
                 timer.timerId = undefined;
             }
+            withdrawPendingTicks(ctx, timer);
         }
         return 0;
     };
@@ -90,8 +130,13 @@ export function createTimerExports(ctx: MSSContext): Record<string, ThunkImpleme
     exports["_AIL_release_timer_handle@4"] = (ctxThunk, mem, args) => {
         const handle = args[0];
         const timer = ctx.timers.get(handle);
-        if (timer?.timerId) {
-            System.getInstance().scheduler?.timerWheel.cancel(timer.timerId);
+        if (timer) {
+            timer.active = false;
+            if (timer.timerId) {
+                System.getInstance().scheduler?.timerWheel.cancel(timer.timerId);
+                timer.timerId = undefined;
+            }
+            withdrawPendingTicks(ctx, timer);
         }
         ctx.timers.delete(handle);
         return 0;

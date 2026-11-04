@@ -2,7 +2,7 @@
 
 This revision has not yet been compiled or executed. This x86 PE calls the public
 IDirectPlay4 and IDirectPlayLobby3A APIs and writes raw binary observations.
-It does not capture wire packets or prove browser, LAN-server, or NT5 parity.
+It does not capture wire packets or prove browser or LAN-server parity.
 Existing directplay.c remains unchanged.
 
 Build on the reference Windows machine with the same 32-bit MinGW profile used
@@ -58,9 +58,9 @@ finite DURATION_MS timeout. A matching app must be verified from actual rows,
 including GUID, name and player counts; zero matching rows is a recorded
 observation, not a passing comparison. The callback records DPESC_TIMEDOUT and
 returns FALSE for it, ending the finite synchronous pass; it returns TRUE for
-ordinary rows. The NT5 DP_EnumSessions loop (enum.c 1627–1650; snapshot
-plan/DP4-enum-timeout-groundtruth-root.json) uses that return value to decide
-whether to start another pass. An oracle watchdog timeout is a failure. A
+ordinary rows. Per the IDirectPlay4::EnumSessions / EnumSessionsCallback2
+documentation, returning FALSE for DPESC_TIMEDOUT stops the enumeration and TRUE
+starts another pass. An oracle watchdog timeout is a failure. A
 mismatch run needs its own fresh pair.
 
 host-result.bin and enum-result.bin contain the exact little-endian x86 in-memory
@@ -100,6 +100,6 @@ IPv4 DirectPlay 4 discovery can involve both UDP and TCP, a return sockaddr and
 a fixed legacy discovery service port. This API-only helper establishes none of
 those wire facts. A later separately owned and bounded socket capture/proxy must
 record actual tuples and bytes, avoid port collisions, and replay unmodified
-flows. The NT5 source snapshots explain candidate framing but are not substitute
-native observations. Do not use this probe as evidence of an emulator match
+flows. [MC-DPL4CS] (2.1, 2.2.29, 2.2.30) explains the framing but is not a
+substitute for native observations. Do not use this probe as evidence of an emulator match
 until the same reference executable and a frozen shipping build are compared.

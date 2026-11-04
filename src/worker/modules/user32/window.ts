@@ -802,7 +802,7 @@ export function defaultWindowProc(
 }
 
 // ---------------------------------------------------------------------------
-// DefWindowProc's WM_SETCURSOR (NT5 ntuser/kernel/dwp.c xxxDWP_SetCursor).
+// DefWindowProc's WM_SETCURSOR (WM_SETCURSOR docs; Wine win32u/defwnd.c as reference).
 //
 //   wParam        = the window the cursor is OVER (hwndHit) — not the receiver.
 //   LOWORD lParam = hit-test code, HIWORD lParam = the mouse message that provoked it.
@@ -819,7 +819,7 @@ const HTCLIENT_DWP = 1;
 const HTSIZEFIRST = 10; // HTLEFT
 const HTSIZELAST = 17;  // HTBOTTOMRIGHT
 
-/** IDC_* per sizing hit code, HTLEFT..HTBOTTOMRIGHT in order (dwp.c:433-450). */
+/** IDC_* per sizing hit code, HTLEFT..HTBOTTOMRIGHT in order (WM_NCHITTEST / LoadCursor docs). */
 const SIZE_BORDER_CURSORS = [
     IDC_SIZEWE,   // HTLEFT
     IDC_SIZEWE,   // HTRIGHT
@@ -839,7 +839,7 @@ export function resetWindowMessageForwardState(): void {
     setCursorForwardInFlight.clear();
 }
 
-/** The parent send xxxDWP_SetCursor owes, and how to finish once it answers. */
+/** The parent send DefWindowProc's WM_SETCURSOR owes, and how to finish once it answers. */
 export interface SetCursorParentForward {
     /** Parent hwnd that must receive WM_SETCURSOR before any class cursor applies. */
     forwardTo: number;
@@ -895,7 +895,8 @@ export function defWindowProcSetCursor(
         if (codeHT === HTCLIENT_DWP) {
             const classCursor = classCursorOf(hit);
             // A NULL class cursor is not an instruction to hide: DefWindowProc leaves the
-            // pointer exactly as it found it (dwp.c "if (pwndHit->pcls->spcur != NULL)").
+            // pointer exactly as it found it (WNDCLASS.hCursor docs: with a NULL class
+            // cursor the application must set the shape itself).
             if (classCursor !== 0) installCursorAndUpdateHostVisibility(classCursor);
             return 0;
         }
@@ -1131,9 +1132,9 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             const parent = windows.get(hWndParent);
             if (parent) {
                 // children[] is the Z-order sibling list (index 0 = topmost; see
-                // WindowInfo.children). NT xxxCreateWindowEx positions a CHILD at the
-                // BOTTOM of it (createw.c: "Defaultly position child windows at bottom
-                // of their list", overriding even the CBT hook's hwndInsertAfter), so
+                // WindowInfo.children). CreateWindowEx links a new CHILD at the BOTTOM
+                // of it (Wine win32u create_window links children at HWND_BOTTOM; on
+                // Windows a dialog's tab order follows its template order), so
                 // children come out in CREATION order — which is what makes template
                 // order the tab/WS_GROUP order. An owned popup is not really a sibling
                 // of the owner's children at all (Win32 keeps it in the desktop's list,
@@ -3074,8 +3075,9 @@ export function registerFastPathWindowFunctions(dispatcher: HleDispatcher): void
         const visible = (win.style & 0x10000000) !== 0;
         if (cmd === 0 && !visible) return 0;
         if (cmd === 5 && visible) return 1;
-        // NT xxxShowWindow returns immediately for SW_SHOWNORMAL/SW_RESTORE when
-        // an already-visible window is neither minimized nor maximized.
+        // ShowWindow returns immediately for SW_SHOWNORMAL/SW_RESTORE when an
+        // already-visible window is neither minimized nor maximized (Wine show_window
+        // has the same early-out; the return value is the previous visibility).
         if ((cmd === 1 || cmd === 9) && visible
             && (win.style & (0x20000000 | 0x01000000)) === 0) return 1;
         return null;

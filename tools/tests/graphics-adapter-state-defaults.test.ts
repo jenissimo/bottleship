@@ -1,7 +1,7 @@
 /**
  * Pins every graphics-adapter device-state DEFAULT (render states, texture-stage states, D3D9
  * sampler states) against ground truth (wined3d's stateblock.c state_init_default /
- * init_default_texture_state / init_default_sampler_states — G:/sources/wine/dlls/wined3d/
+ * init_default_texture_state / init_default_sampler_states — wine/dlls/wined3d/
  * stateblock.c — cross-checked against dxvk's d3d8/d3d9 device state).
  *
  * Each adapter's render-state array is an Int32Array (or, for D3D9's TSS/sampler blocks, a Map

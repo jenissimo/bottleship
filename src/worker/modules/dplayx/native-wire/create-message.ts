@@ -1,8 +1,9 @@
 import {decodeDirectPlay4PackedPlayer,type DirectPlay4PackedEntry} from "./name-table";
 
-/** Normal, nonsecure v14 CREATEPLAYER management message observed on Windows.
- * Other versions, password-bearing forward requests and group records are not
- * accepted by this decoder. The six-byte allocation suffix is opaque.
+/** [MC-DPL4CS] 2.2.21 DPSP_MSG_CREATEPLAYER, nonsecure, version 14 (DX9VERSION) as
+ * observed from Windows hosts. Other versions, password-bearing forward requests and
+ * group records are unsupported by this decoder. The optional six-byte suffix is the
+ * spec's Reserved1/Reserved2 and is ignored.
  */
 export function decodeDirectPlay4CreatePlayer(input:Uint8Array,maxBytes:number):{version:number;playerId:number;player:DirectPlay4PackedEntry} {
     if(!(input instanceof Uint8Array)||!Number.isInteger(maxBytes)||maxBytes<76||maxBytes>65536||

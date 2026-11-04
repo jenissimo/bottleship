@@ -4,8 +4,8 @@ import {decodeDirectPlay4NameTable} from "../../src/worker/modules/dplayx/native
 
 const bytes=(s:string)=>Uint8Array.from(Buffer.from(s.replace(/\s/g,""),"hex"));
 
-// Synthetic cmd41 accepted by native Open JOIN in oracle result
-// logs/lan-conformance/dp4-join-wire-20261028-eighth/result.json (e818720c2d7454ae).
+// Synthetic SUPERENUMPLAYERSREPLY ([MC-DPL4CS] 2.2.53) that a native Windows client
+// accepted for Open JOIN in the DP4 join wire oracle (directplay4-join-wire-capture.ts).
 // This is a generated reply to a native client, not a native host capture.
 const frame=bytes(
     "bd00b0fa0200dcd47f0000010000000000000000706c617929000e000100000000000000"+
@@ -15,7 +15,7 @@ const frame=bytes(
     "89674523040000000e000000200200dcd47f00000100000000000000000200ba087f0000"+
     "010000000000000000",
 );
-test("source decoder accepts synthetic name table verified by native Open JOIN",()=>{
+test("decoder accepts synthetic name table verified by native Open JOIN",()=>{
     const outer=decodeDirectPlay4SystemTcpFrame(frame,1024)!;
     expect(outer.consumed).toBe(189);
     expect(outer.command).toBe(41);expect(outer.version).toBe(14);

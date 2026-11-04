@@ -1429,7 +1429,7 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
     exports['ToUnicodeEx'] = (ctx, mem, args) => exports['ToUnicode']!(ctx, mem, args) as number;
 
     // Decode a WM_KEYDOWN-style lParam into a Set 1 / US-layout key name.
-    // Bit 24 = extended, bit 25 = "don't care about left vs. right" (nt5 xlate.c _GetKeyNameText):
+    // Bit 24 = extended, bit 25 = "do not care" about left vs. right (GetKeyNameText docs):
     // right Shift folds onto left Shift, and the extended bit is dropped for Ctrl/Alt only —
     // Win95 compatibility keeps it for the other extended keys (cursor pad, numpad Enter).
     const resolveKeyName = (lParam: number): { name: string; scanCode: number; extended: number } => {
@@ -1492,9 +1492,8 @@ export function createSystemExports(): Record<string, ThunkImplementation> {
 
         if (!lpString) return 0;
 
-        // cchSize < 1 makes the kernel bail without touching the buffer, but the ANSI client
-        // wrapper terminates its output unconditionally afterwards (nt5 client/ntcftxt.h), so A
-        // still stores a NUL where W leaves the caller's buffer alone.
+        // cchSize < 1: W leaves the caller's buffer alone; the engine's A variant still
+        // stores a NUL. Not documented; kept as the current model pending a Windows capture.
         if (cchSize <= 0) {
             if (!wide) Marshaler.writeString(mem, lpString, '', 1);
             return 0;

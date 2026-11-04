@@ -1,10 +1,12 @@
 /**
- * Common physical UDP receive queue controls. NT5 source audit8cad1e82:
- * misc.c tail-admits status/source records; recvdg.c consumes one head unless PEEK;
- * receive.c returns payload-byte total, or1 when Count>0 and the byte total is0.
- * Multiple errors, zero datagrams and SD_RECEIVE here are SOURCE/mechanism controls,
- * not additional modern-Windows measurements. Stage45 f8b2 remains the real-Worker
- * primary for the certified single-error-before-later-D transcript.
+ * Common physical UDP receive queue controls: records (datagrams and receive-only
+ * errors) queue in arrival order, a receive consumes one head unless MSG_PEEK
+ * (recvfrom docs), and FIONREAD reports the queued payload bytes (Winsock IOCTLs
+ * docs, cases/udp/fionread.native.log), or 1 for a queue of only zero-byte datagrams
+ * or errors (observed: the native captures behind wsa-udp-mixed-actor). Multiple errors, zero datagrams and
+ * SD_RECEIVE (shutdown docs) here are engine/mechanism controls, not additional
+ * modern-Windows measurements. cases/udp/connreset.native.log is the native record
+ * for the single-error-before-later-datagram transcript.
  */
 import {afterEach,expect,test} from "bun:test";
 import {LanNetwork} from "../../src/worker/net/lan-network";
@@ -102,7 +104,7 @@ for(const family of[2,23] as const){
   failed(()=>f.table.receive(f.rx.id,16),WSA.EWOULDBLOCK);
  });
 
- test("UDP queue NT5-source AF"+family+": zero datagrams count as records, not payload bytes",()=>{
+ test("UDP queue AF"+family+": zero datagrams count as records, not payload bytes",()=>{
   const f=fixture(family),data=Uint8Array.of(0x61,0x62,0x63);
   f.table.send(f.live.id,new Uint8Array(0),f.rx.address);f.table.send(f.live.id,data,f.rx.address);
   expect(f.table.bytesAvailable(f.rx.id)).toBe(3);
@@ -121,7 +123,7 @@ for(const family of[2,23] as const){
  });
 }
 
-test("UDP physical aliases retain FIFO across close and NT5-source SD_RECEIVE, then final reset revokes it",()=>{
+test("UDP physical aliases retain FIFO across close and SD_RECEIVE, then final reset revokes it",()=>{
  const f=fixture(2),kernel=new WsaActorKernel(f.table);
  const owner:WsaActorIdentity={pid:45101,slot:0,epoch:1},child:WsaActorIdentity={pid:45102,slot:1,epoch:2};
  kernel.register(owner);kernel.register(child);
@@ -136,7 +138,7 @@ test("UDP physical aliases retain FIFO across close and NT5-source SD_RECEIVE, t
  call(owner,"closesocket",[source]);
  expect((call(child,"receive",[alias,16,2]) as {data:Uint8Array}).data).toEqual(Uint8Array.of(7,8,9));
  expect(call(child,"bytesAvailable",[alias])).toBe(3);
- // NT5 disconn.c says just remember UDP shutdown: later recv fails, queued data is not purged.
+ // shutdown docs: for UDP, SD_RECEIVE disallows later recv; datagrams stay queued.
  call(child,"shutdown",[alias,0]);
  expect(call(child,"bytesAvailable",[alias])).toBe(3);expect(call(child,"readable",[alias])).toBe(true);
  failed(()=>call(child,"receive",[alias,16]),WSA.ESHUTDOWN);
@@ -238,43 +240,3 @@ test("UDP real actor pending reads complete once in admission order; cancelled r
   expect(completed).toEqual([1,1]);
  }finally{for(const stop of stopObservers)stop();await f.disposeActor();}
 },30000);
-
-for(const family of [2,23] as const){
- test("SOURCE NT5 x86 free UDP status records share current byte/tag pressure AF"+family,()=>{
-  const f=fixture(family);
-  const observe=(peek=false)=>{
-   try{return {packet:f.table.receive(f.rx.id,16,peek?2:0),error:undefined};}
-   catch(error){return {packet:undefined,error};}
-  };
-  let actual:unknown;
-  try{
-   f.memory.put(option,48);
-   const setTag=f.call("setsockopt",[f.rx.id,0xffff,0x1002,option,4]);
-   f.error(f.rx.address,f.a.address);
-   const blockedData=f.table.send(f.live.id,Uint8Array.of(0xd1),f.rx.address);
-   const firstPeek=observe(true);
-   f.error(f.rx.address,f.b.address);
-   const secondPeek=observe(true),takeStatus=observe(),afterStatus=observe();
-   const recoverySend=f.table.send(f.live.id,Uint8Array.of(0xd2),f.rx.address),recovery=observe(),emptyRecovery=observe();
-   f.memory.put(option,1);
-   const setByte=f.call("setsockopt",[f.rx.id,0xffff,0x1002,option,4]);
-   const fullSend=f.table.send(f.live.id,Uint8Array.of(0xd3),f.rx.address);
-   f.error(f.rx.address,f.a.address);
-   const fullData=observe(),afterFull=observe();
-   actual={setTag,blockedData,firstPeek,secondPeek,takeStatus,afterStatus,recoverySend,recovery,emptyRecovery,setByte,fullSend,fullData,afterFull};
-   // Secondary trusted-error producer; every actual observation precedes assertions.
-   expect([setTag,setByte]).toEqual([0,0]);expect([blockedData,recoverySend,fullSend]).toEqual([1,1,1]);
-   for(const row of [firstPeek,secondPeek,takeStatus]){
-    expect(row.error).toBeInstanceOf(WsaUdpReceiveFailure);
-    expect((row.error as WsaUdpReceiveFailure).code).toBe(WSA.ECONNRESET);
-    expect((row.error as WsaUdpReceiveFailure).from).toEqual(f.a.address);
-   }
-   for(const row of [afterStatus,emptyRecovery,afterFull]){
-    expect(row.error).toBeInstanceOf(WsaFailure);
-    expect((row.error as WsaFailure).code).toBe(WSA.EWOULDBLOCK);
-   }
-   expect(recovery.packet).toEqual({from:f.live.address,data:Uint8Array.of(0xd2),truncated:false});
-   expect(fullData.packet).toEqual({from:f.live.address,data:Uint8Array.of(0xd3),truncated:false});
-  }catch(error){console.error(JSON.stringify({basis:"NT5_X86_FREE_SOURCE_SECONDARY_ERROR_ADMISSION",family,actual,error:String(error)}));throw error;}
- });
-}

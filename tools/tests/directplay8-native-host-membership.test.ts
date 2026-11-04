@@ -81,7 +81,7 @@ test("whole Host Close from third-player CREATE cannot publish a stale C6 or ret
  expect(s.nets[0].isBound(fixture.ports[0],PROTO_UDP)).toBe(false);
 });
 
-test("D0 writer matches the independently captured native PackEntryInfo bytes",()=>{
+test("D0 writer matches the independently captured native DN_ADD_PLAYER entry bytes",()=>{
  const packet=bytes(fixture.messages.find(m=>m.core===0xd0)!.payload),entry=decodeNativeCoreOperation(packet)!.entry!;
  expect(encodeNativePlayerAdded(entry)).toEqual(packet);
 });
@@ -116,7 +116,7 @@ test("full survivor FIFO does not undo a committed departure or close the surviv
  const s=scene();expect(s.start()).toBe(0);await s.join(1);await s.join(2);const first=s.snapshot(1),departing=s.snapshot(2).localId;
  s.block(1);const pending=Array.from({length:256},()=>s.host.sendDpn(first.localId,8,Uint8Array.of(9)));
  expect(await s.links[2].shutdown()).toBe(0);await until(()=>s.host.currentPlayers===2);
- // NT5 commits deletion before its worker; a refused D1 child is not a Host termination.
+ // Engine policy: the deletion is committed first; a refused D1 send to one peer is not a Host termination.
  expect(s.host.isHost).toBe(true);expect(s.host.entities.has(first.localId)).toBe(true);expect(s.host.entities.has(departing)).toBe(false);
  expect(s.host.peerCount).toBe(1);expect(s.packets(1,0xd1)).toHaveLength(0);
  expect(s.nets[0].isBound(fixture.ports[0],PROTO_UDP)).toBe(true);

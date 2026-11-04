@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { decodeDirectPlay4TcpEnumReply } from "../../src/worker/modules/dplayx/native-wire/discovery";
 
 const bytes = (hex: string) => Uint8Array.from(Buffer.from(hex.replace(/\s/g, ""), "hex"));
-// Source-derived literal, not a native capture.
+// Literal built from [MC-DPL4CS] 2.2.6/2.2.30, not a native capture.
 const tcpReply = bytes(
     "7600b0fa 020008fc c0000201 0000000000000000 " +
     "706c6179 01000b00 50000000 00200000 000102030405060708090a0b0c0d0e0f " +

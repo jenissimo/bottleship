@@ -3,7 +3,7 @@ import {decodeDirectPlay4PlayerWrapper,encodeDirectPlay4PlayerWrapper} from "../
 
 const literal=Buffer.from("2600b0fa020008fcc00002010000000000000000706c617919000e00706c6179785634120102","hex");
 
-test("source-derived wrapper preserves an ID colliding with the system signature",()=>{
+test("[MC-DPL4CS] 2.2.47 wrapper preserves an ID colliding with the system signature",()=>{
     const address=Buffer.from("020008fcc00002010000000000000000","hex"),data=Buffer.from([1,2]);
     const wire=encodeDirectPlay4PlayerWrapper(address,0x79616c70,0x12345678,data,14,38);
     expect(wire).toEqual(Uint8Array.from(literal));

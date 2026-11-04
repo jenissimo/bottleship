@@ -1,15 +1,12 @@
-BottleShip LAN Rust core
+BottleShip LAN Rust gateway
 
-The virtual adapter design and binary datagram layout are based on
+Native UDP/TCP gateway adapters for the bottleship-lan relay. They carry the
+virtual LAN datagram layout of bottleship-lan-core, which is based on
 https://github.com/cszackrison/bottleship
 (src/worker/net/lan-network.ts and src/worker/net/netplay-wire.ts),
 licensed under the Apache License, Version 2.0.
 
 Copyright BottleShip contributors and cszackrison/bottleship contributors.
-Modified for Socket.IO, isolated rooms, reconnect lifecycle, bounded queues,
-source-address validation, and additional protocol channels.
 
-The relay server and Socket.IO transport are new implementations.
+The gateway itself is a new implementation.
 See LICENSE for the Apache License, Version 2.0.
-
-The Rust core ports protocol/configuration/room lifecycle behavior from the BottleShip LAN TypeScript reference; native and transport adapters are separate crates.

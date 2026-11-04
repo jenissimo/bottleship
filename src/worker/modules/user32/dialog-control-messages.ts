@@ -421,7 +421,7 @@ export function handleSystemControlMessage(
             const LBS_EXTENDEDSEL = 0x0800;
             const multiSelect = (child.style & (LBS_MULTIPLESEL | LBS_EXTENDEDSEL)) !== 0;
 
-            // NT5 lb1.c / Wine listbox.c: reject an invalid caret. A single-select list
+            // Wine listbox.c (LB_SETCARETINDEX): reject an invalid caret. A single-select list
             // that ALREADY has a selection rejects this message too — there the caret is
             // the selection, and LB_SETCURSEL has moved iSelBase with it.
             if (idx < 0 || idx >= state.items.length || (!multiSelect && state.selectedIndex !== -1)) {

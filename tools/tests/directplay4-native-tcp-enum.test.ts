@@ -29,7 +29,7 @@ function fixture(onFrame:(network:LanNetwork, frame:Uint8Array)=>void) {
 const request=(tcpPort:number,signal?:AbortSignal)=>({applicationGuid:new Uint8Array(16),flags:0,
     destination:address,tcpPort,timeoutMs:120,maxFrameBytes:1024,signal});
 
-test("TCP port decodes source WORD little endian and last INetPort wins",()=>{
+test("TCP port decodes the DPAID_INetPort WORD little endian and last INetPort wins",()=>{
     expect(nativeEnumTcpPort(header)).toBe(47624);
     const twice=new Uint8Array(header.length+portChunk.length*2);
     twice.set(header);twice.set(portChunk,header.length);twice.set(portChunk,header.length+portChunk.length);
@@ -103,7 +103,7 @@ test("cancellation closes connecting socket and ignores its late SYNACK",async()
     } finally {f.table.reset();}
 });
 
-test("real loopback TCP receives source-derived request while UDP path remains separate",async()=>{
+test("real loopback TCP receives the [MC-DPL4CS] request while UDP path remains separate",async()=>{
     let received!: (data:Uint8Array)=>void;
     const complete=new Promise<Uint8Array>(ok=>{received=ok;});
     const server=createServer(socket=>{const chunks:Uint8Array[]=[];socket.on("data",part=>chunks.push(Uint8Array.from(part)));

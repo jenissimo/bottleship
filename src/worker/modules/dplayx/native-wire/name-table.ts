@@ -1,16 +1,21 @@
 /**
- * Isolated x86 legacy DirectPlay Join messages, without SP framing.
- * NT5 dpmess.h:221-235,261-280, dplaypr.h:670-703,
- * sysmess.c:1223-1340, handler.c:710-845, pack.c:345-386,450-551,
- * superpac.c:48-55,133-226,341-382,390-495,650-814.
+ * DirectPlay 4 join messages without the size/token/SockAddr prefix ([MC-DPL4CS]):
+ * 2.2.11 DPSP_MSG_ADDFORWARDREQUEST, 2.2.28 DPSP_MSG_ENUMPLAYERSREPLY (2.2.2
+ * DPLAYI_PACKEDPLAYER entries) and 2.2.53 DPSP_MSG_SUPERENUMPLAYERSREPLY (2.2.3
+ * DPLAYI_SUPERPACKEDPLAYER entries).
  * Local safety bounds are not a claim about native malformed-input policy.
  */
+import {DPLAYI_PLAYER,DPSP_MSG,DPSP_SIGNATURE,DPSP_VERSION} from "./spec";
+
 const u32 = (n: number): boolean => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
 const copy = (input: Uint8Array): Uint8Array => Uint8Array.from(input);
 
-/** Encode a forwarded system player using a caller-supplied PackPlayer blob. */
+/** 2.2.11 DPSP_MSG_ADDFORWARDREQUEST for a system player, using a caller-supplied 2.2.2
+ * packed player: IDTo 0, PlayerID, GroupID 0, CreateOffset 28, PasswordOffset,
+ * PlayerInfo, Password (UTF-16, NUL-terminated, possibly empty), TickCount. */
 export function encodeDirectPlay4AddForward(
-    playerId: number, packedPlayer: Uint8Array, password: string, tickCount: number, maxBytes: number, version = 13,
+    playerId: number, packedPlayer: Uint8Array, password: string, tickCount: number, maxBytes: number,
+    version: number = DPSP_VERSION.DX8,
 ): Uint8Array {
     if (!Number.isInteger(version) || version < 0 || version > 0xffff) throw new RangeError("invalid version");
     if (!u32(playerId) || !u32(tickCount)) throw new RangeError("IDs must be unsigned DWORDs");
@@ -29,8 +34,8 @@ export function encodeDirectPlay4AddForward(
     const size = 28 + packedPlayer.length + passwordBytes + 4;
     if (size > maxBytes) throw new RangeError("message exceeds limit");
     const output = new Uint8Array(size), view = new DataView(output.buffer);
-    view.setUint32(0, 0x79616c70, true);
-    view.setUint16(4, 19, true); view.setUint16(6, version, true);
+    view.setUint32(0, DPSP_SIGNATURE, true);
+    view.setUint16(4, DPSP_MSG.ADDFORWARDREQUEST, true); view.setUint16(6, version, true);
     view.setUint32(12, playerId, true);
     view.setUint32(20, 28, true);
     const passwordOffset = 28 + packedPlayer.length;
@@ -112,7 +117,7 @@ function ordinary(r: Reader, group: boolean): DirectPlay4PackedEntry {
     return {flags,id,fixedSize:fixed,versionOrSystemId:sys,version,shortName,longName,spData,playerData,
         parentId:parent,memberIds,ordinaryBytes:copy(r.bytes.subarray(start,start+size))};
 }
-/** Decode exactly one ordinary PackPlayer record, with owned fields. */
+/** Decode exactly one 2.2.2 DPLAYI_PACKEDPLAYER (player) record, with owned fields. */
 export function decodeDirectPlay4PackedPlayer(input:Uint8Array,maxBytes:number):DirectPlay4PackedEntry {
     if(!(input instanceof Uint8Array)||!Number.isInteger(maxBytes)||maxBytes<48||maxBytes>0xfffff||
         input.length<48||input.length>maxBytes)throw new RangeError("invalid packed player extent");
@@ -120,27 +125,42 @@ export function decodeDirectPlay4PackedPlayer(input:Uint8Array,maxBytes:number):
     if(reader.pos!==input.length)throw new RangeError("trailing packed player bytes");
     return result;
 }
-function superEntry(r: Reader, group: boolean): DirectPlay4PackedEntry {
+/** 2.2.3 PlayerInfoMask bits. Bits above SC SHOULD be zero when sent and MUST be ignored on receipt. */
+const SPP = {SN:0x1, LN:0x2, SL_SHIFT:2, PD_SHIFT:4, PC_SHIFT:6, PI:0x100, SC_SHIFT:9} as const;
+
+/**
+ * One 2.2.3 DPLAYI_SUPERPACKEDPLAYER, fields in the order the spec lists them:
+ * Size/Flags/ID/PlayerInfoMask (Size is the fixed header length), VersionOrSystemPlayerID,
+ * ShortName, LongName, PlayerDataLength+PlayerData, ServiceProviderDataLength+Data,
+ * PlayerCount+PlayerIDs, ParentID, ShortcutIDCount+ShortcutIDs.
+ */
+function superRecord(r: Reader) {
     const start=r.pos; r.range(start,16);
     const fixed=r.dword(), flags=r.dword(), id=r.dword(), mask=r.dword();
-    if (fixed < 16 || (mask & ~0x7ff) !== 0) throw new RangeError("unsupported superpacked header");
+    if (fixed < 16) throw new RangeError("unsupported superpacked header");
     r.range(start,fixed); r.pos=start+fixed;
     const versionOrSystemId=r.dword();
-    const shortName=(mask&1) ? r.string() : null, longName=(mask&2) ? r.string() : null;
-    const playerData=r.take(r.sized((mask>>>4)&3)), spData=r.take(r.sized((mask>>>2)&3));
-    if (!group && (mask & (0x100 | 0xc0))) throw new RangeError("group fields on player");
-    const parentId=(mask&0x100) ? r.dword() : 0;
-    const memberIds=group ? r.ids(r.sized((mask>>>6)&3)) : [];
-    return {flags,id,fixedSize:fixed,versionOrSystemId,version:(flags&1) ? versionOrSystemId : 0,shortName,longName,playerData,spData,parentId,memberIds};
+    const shortName=(mask&SPP.SN) ? r.string() : null, longName=(mask&SPP.LN) ? r.string() : null;
+    const playerData=r.take(r.sized((mask>>>SPP.PD_SHIFT)&3)), spData=r.take(r.sized((mask>>>SPP.SL_SHIFT)&3));
+    const memberIds=r.ids(r.sized((mask>>>SPP.PC_SHIFT)&3));
+    const parentId=(mask&SPP.PI) ? r.dword() : 0;
+    const shortcutIds=r.ids(r.sized((mask>>>SPP.SC_SHIFT)&3));
+    return {flags,id,fixed,mask,versionOrSystemId,shortName,longName,playerData,spData,memberIds,parentId,shortcutIds};
 }
+function superEntry(r: Reader, group: boolean): DirectPlay4PackedEntry {
+    const e=superRecord(r);
+    // Local policy: a player record carrying group-only fields is rejected rather than guessed at.
+    if (!group && ((e.mask & SPP.PI) || ((e.mask>>>SPP.PC_SHIFT)&3) || ((e.mask>>>SPP.SC_SHIFT)&3)))
+        throw new RangeError("group fields on player");
+    return {flags:e.flags,id:e.id,fixedSize:e.fixed,versionOrSystemId:e.versionOrSystemId,
+        version:(e.flags&DPLAYI_PLAYER.SYSPLAYER) ? e.versionOrSystemId : 0,shortName:e.shortName,longName:e.longName,
+        playerData:e.playerData,spData:e.spData,parentId:e.parentId,memberIds:e.memberIds};
+}
+/** 2.2.53: the trailing ShortcutCount entries are superpacked groups whose ShortcutIDs list
+ * the groups added to them with DPSP_MSG_ADDSHORTCUTTOGROUP. */
 function shortcut(r: Reader): DirectPlay4Shortcut {
-    const start=r.pos; r.range(start,16);
-    const fixed=r.dword(), flags=r.dword(), id=r.dword(), mask=r.dword();
-    // NT5 reads only bits 9..10; other bits may contain allocator garbage.
-    // Those two width bits themselves must still describe the encoded count.
-    if (fixed < 16) throw new RangeError("unsupported shortcut header");
-    r.range(start,fixed); r.pos=start+fixed;
-    return {flags,id,groupIds:r.ids(r.sized((mask>>>9)&3))};
+    const e=superRecord(r);
+    return {flags:e.flags,id:e.id,groupIds:e.shortcutIds};
 }
 
 /** Decode one complete inner name-table reply; this never creates live players or groups. */
@@ -151,11 +171,12 @@ export function decodeDirectPlay4NameTable(input: Uint8Array, maxBytes: number, 
         throw new RangeError("invalid limits");
     if (input.length < 116 || input.length > maxBytes) throw new RangeError("invalid name table size");
     const r=new Reader(input);
-    if (r.wordAt(0)!==0x79616c70) throw new RangeError("invalid message signature");
+    if (r.wordAt(0)!==DPSP_SIGNATURE) throw new RangeError("invalid message signature");
     const cmd=r.view.getUint16(4,true), version=r.view.getUint16(6,true);
-    if (cmd!==3 && cmd!==41) throw new RangeError("invalid name table command");
+    if (cmd!==DPSP_MSG.ENUMPLAYERSREPLY && cmd!==DPSP_MSG.SUPERENUMPLAYERSREPLY) throw new RangeError("invalid name table command");
     const players=r.wordAt(8), groups=r.wordAt(12), packedOffset=r.wordAt(16);
-    const shortcuts=cmd===41 ? r.wordAt(20) : 0;
+    // 2.2.28: ShortcutCount of ENUMPLAYERSREPLY MUST be ignored on receipt.
+    const shortcuts=cmd===DPSP_MSG.SUPERENUMPLAYERSREPLY ? r.wordAt(20) : 0;
     if (players+groups+shortcuts > maxEntries) throw new RangeError("too many name table records");
     const descOffset=r.wordAt(24), nameOffset=r.wordAt(28), passwordOffset=r.wordAt(32);
     if (descOffset<36) throw new RangeError("invalid session description offset");
@@ -172,8 +193,9 @@ export function decodeDirectPlay4NameTable(input: Uint8Array, maxBytes: number, 
     const sessionDescription=copy(input.subarray(descOffset,descOffset+80));
     r.pos=packedOffset;
     const playerEntries: DirectPlay4PackedEntry[]=[], groupEntries: DirectPlay4PackedEntry[]=[], shortcutEntries: DirectPlay4Shortcut[]=[];
-    for(let i=0;i<players;i++) playerEntries.push(cmd===3 ? ordinary(r,false) : superEntry(r,false));
-    for(let i=0;i<groups;i++) groupEntries.push(cmd===3 ? ordinary(r,true) : superEntry(r,true));
+    const plain=cmd===DPSP_MSG.ENUMPLAYERSREPLY;
+    for(let i=0;i<players;i++) playerEntries.push(plain ? ordinary(r,false) : superEntry(r,false));
+    for(let i=0;i<groups;i++) groupEntries.push(plain ? ordinary(r,true) : superEntry(r,true));
     for(let i=0;i<shortcuts;i++) shortcutEntries.push(shortcut(r));
     return {command:cmd,version,sessionDescription,name,password,players:playerEntries,groups:groupEntries,shortcuts:shortcutEntries};
 }

@@ -1,5 +1,5 @@
 /**
- * EDIT control contracts, pinned to Wine edit.c / NT5 editsl.c: the buffer/selection
+ * EDIT control contracts, pinned to Wine edit.c and the EM_* documentation: the buffer/selection
  * protocol (EM_GETLINE, EM_GETSEL/EM_SETSEL), the single-level undo, WM_SETTEXT's
  * relationship to the text limit, and which messages count as a content change for
  * the parent's repaint (that decision runs on the message-pump hot path).
@@ -81,7 +81,7 @@ describe("EDIT EM_GETLINE", () => {
 });
 
 describe("EDIT selection", () => {
-    // NT5 EditSL_ChangeSelection swaps out-of-order endpoints and clamps both to cch.
+    // EM_SETSEL docs: the lower value is the start; Wine clamps both endpoints to cch.
     test("EM_SETSEL swaps reversed endpoints and clamps past the end", () => {
         const win = edit("abcdef");
         send(win, EM_SETSEL, 5, 2);

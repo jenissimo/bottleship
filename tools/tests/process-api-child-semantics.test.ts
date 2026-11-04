@@ -180,6 +180,25 @@ describe('file and child-process API contracts', () => {
         await stopChildProcesses();
         expect(worker.terminated).toBe(true);
     });
+    test('WinExec starts the helper, closes the PROCESS_INFORMATION handles and returns above 31', async () => {
+        let freed = 0;
+        system.process = { memory: { alloc: () => 3072, free: () => { freed++; } }, environment: [] } as never;
+        const result = await processApi.WinExec!(undefined as never, memory, [text('C:\\System\\helper.exe -probe'), 1]);
+        expect((typeof result === 'number' ? result : result.value) >>> 0).toBeGreaterThan(31);
+        const worker = await booted();
+        expect(worker.boot!.commandLine).toBe('-probe');
+        const processHandle = Mem.readUint32(3072)!, threadHandle = Mem.readUint32(3076)!;
+        expect(processHandle).not.toBe(0);
+        expect(system.resourceProvider.getResource(processHandle)).toBeNull();
+        expect(system.resourceProvider.getResource(threadHandle)).toBeNull();
+        expect(freed).toBe(1);
+    });
+    test('WinExec reports a missing image as ERROR_FILE_NOT_FOUND, never as success', async () => {
+        system.process = { memory: { alloc: () => 3072, free: () => {} }, environment: [] } as never;
+        const result = await processApi.WinExec!(undefined as never, memory, [text('C:\\System\\absent.exe'), 1]);
+        expect(typeof result === 'number' ? result : result.value).toBe(2);
+        expect(workers).toHaveLength(0);
+    });
     test('ShellExecuteEx returns a waitable handle backed by the actual helper', async () => {
         const module = new Shell32(); module.initialize(undefined as never);
         const info = 2048;
