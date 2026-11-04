@@ -32,8 +32,10 @@ import { versionVerifyExports } from './version-verify';
 import { GUEST_COMPUTER_NAME } from '../../../core/guest-identity';
 
 const ERROR_INVALID_HANDLE = 6;
-const ERROR_ACCESS_DENIED = 5;
 const ERROR_INVALID_PARAMETER = 87;
+const ERROR_FILE_NOT_FOUND = 2;
+const ERROR_PATH_NOT_FOUND = 3;
+const ERROR_BAD_FORMAT = 11;
 const ERROR_CALL_NOT_IMPLEMENTED = 120;
 const ERROR_PARTIAL_COPY = 299;
 const ERROR_NO_MORE_FILES = 18;
@@ -1086,18 +1088,33 @@ export const exports: Record<string, ThunkImplementation> = {
 
     // UINT WinExec(LPCSTR lpCmdLine, UINT uCmdShow)
     //
-    // MUST have a real handler even though it only ever fails: WinExec encodes failure as
-    // a return value BELOW 32, so the UNIMPLEMENTED path's ERROR_NOT_SUPPORTED (50) would
-    // read as SUCCESS and the guest would proceed believing it spawned a child.
-    'WinExec': (ctx, mem, args): ThunkResult => {
-        const commandLine = readNullableProcessString(mem, args[0] >>> 0, false);
-        System.getInstance().scheduler.setLastError(ERROR_ACCESS_DENIED);
-        Logger.warn(
-            LogCategory.KERNEL32,
-            `WinExec("${commandLine}", show=${args[1] >>> 0}) -> ERROR_ACCESS_DENIED ` +
-            `(single-process HLE cannot spawn a real child)`
-        );
-        return { value: ERROR_ACCESS_DENIED, stackCleanup: 8 };
+    // CreateProcess(NULL, lpCmdLine, ...) whose PROCESS_INFORMATION handles are closed again.
+    // Success is any value above 31; failure is the error code itself (0 = out of resources),
+    // so an error must never leak out as a value that reads as success.
+    'WinExec': (ctx, mem, args): ThunkResult | Promise<ThunkResult> => {
+        const lpCmdLine = args[0] >>> 0;
+        const system = System.getInstance();
+        const ownerProcess = system.process;
+        let processInfo = 0;
+        try { processInfo = ownerProcess?.memory.alloc(16, 'THUNK_DATA', 'rw') ?? 0; } catch { processInfo = 0; }
+        if (!processInfo) return { value: 0, stackCleanup: 8 };
+        const release = (): void => { if (system.process === ownerProcess) ownerProcess?.memory.free(processInfo); };
+        const toWinExec = (created: ThunkResult, failure: number): ThunkResult => {
+            if ((created.value >>> 0) === 0) {
+                release();
+                return { value: failure, stackCleanup: 8 };
+            }
+            for (const offset of [0, 4]) {
+                const handle = Mem.readUint32(processInfo + offset);
+                if (handle) fileIo.CloseHandle!(ctx, mem, [handle]);
+            }
+            release();
+            return { value: 33, stackCleanup: 8 };
+        };
+        const result = createVirtualProcess(mem, [0, lpCmdLine, 0, 0, 0, 0, 0, 0, 0, processInfo], false);
+        if (result instanceof Promise) return result.then(r => toWinExec(r, ERROR_BAD_FORMAT));
+        const error = system.scheduler.getLastError();
+        return toWinExec(result, error === 193 ? ERROR_BAD_FORMAT : error === ERROR_PATH_NOT_FOUND ? ERROR_PATH_NOT_FOUND : ERROR_FILE_NOT_FOUND);
     },
 
     // CreateProcessAsUser* = CreateProcess* with hToken prepended (11 args).
