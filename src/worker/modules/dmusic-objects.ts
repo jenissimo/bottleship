@@ -91,6 +91,7 @@ export class LoaderObject extends DMusicObject {
     readonly interfaces = { [IID_IDirectMusicLoader]: "IDirectMusicLoader8", [IID_IDirectMusicLoader8]: "IDirectMusicLoader8" };
     /** The default GM collection, one per loader, made on first request. */
     defaultCollection: CollectionObject | null = null;
+    searchDirectory = "";
 }
 
 export interface PendingNotification {

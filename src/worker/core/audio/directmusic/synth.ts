@@ -178,6 +178,8 @@ export function findInstrument(collection: DlsCollection, patch: number): DlsIns
         if (((inst.bank & F_INSTRUMENT_DRUMS) !== 0) !== drums) continue;
         return inst;
     }
+    if (bankLsb !== 0 || bankMsb !== 0) return findInstrument(collection, (patch & 0x7f) | (patch & F_INSTRUMENT_DRUMS));
+    if (drums && program !== 0) return findInstrument(collection, F_INSTRUMENT_DRUMS);
     return null;
 }
 

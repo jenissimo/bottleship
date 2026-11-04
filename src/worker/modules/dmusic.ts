@@ -15,7 +15,7 @@
 import { type Band, parseBand } from "@bottleship/formats/dmusic/band";
 import { type DlsCollection, parseDls } from "@bottleship/formats/dmusic/dls";
 import {
-    DMUS_OBJ_CATEGORY, DMUS_OBJ_CLASS, DMUS_OBJ_FILENAME, DMUS_OBJ_LOADED, DMUS_OBJ_NAME, DMUS_OBJ_OBJECT,
+    DMUS_OBJ_CATEGORY, DMUS_OBJ_CLASS, DMUS_OBJ_FILENAME, DMUS_OBJ_FULLPATH, DMUS_OBJ_LOADED, DMUS_OBJ_NAME, DMUS_OBJ_OBJECT,
     DMUS_OBJ_VERSION, type ObjectReference, parseIdentity,
 } from "@bottleship/formats/dmusic/reference";
 import { riffChunks } from "@bottleship/formats/dmusic/riff";
@@ -24,6 +24,7 @@ import { parseStyle, ticksPerMeasure } from "@bottleship/formats/dmusic/style";
 import { dmusicModule } from "../api/dmusic.api";
 import { createVTablesFromDescriptor, VTableInfo } from "../api/adapters/module-adapter";
 import { buildSegment, loadBand } from "../core/audio/directmusic/build";
+import { isStandardMidiFile, smfToSegment } from "../core/audio/directmusic/smf";
 import {
     DMUS_SEGF_SECONDARY, type LoadedBand, PerfSegment, type PerfSegmentState, Performance,
 } from "../core/audio/directmusic/performance";
@@ -646,6 +647,25 @@ export class DMusic implements IModule {
         return obj;
     }
 
+    private objectFromFile(loader: LoaderObject, bytes: Uint8Array, fileName: string): LoadableObject | null {
+        if (!isStandardMidiFile(bytes)) return null;
+        const gmRef = {
+            validData: DMUS_OBJ_OBJECT, classId: "", objectId: GUID_DefaultGMCollection, name: "", category: "",
+            fileName: "", versionMS: 0, versionLS: 0,
+        };
+        const file = smfToSegment(bytes, fileName, gmRef);
+        if (!file) return null;
+        const gm = this.defaultCollection(loader);
+        const obj = new SegmentObject();
+        obj.file = file;
+        obj.identity = { ...file.identity };
+        obj.fileName = fileName;
+        obj.segment = buildSegment(file, () => null, (ref) => ref.objectId === GUID_DefaultGMCollection ? gm.collection : null);
+        obj.tracks = file.tracks.map((t) => ({ classId: t.classId, group: t.group, object: null }));
+        obj.loaded = true;
+        return obj;
+    }
+
     private readSystemFile(paths: string[]): Uint8Array | null {
         const vfs = System.getInstance().fileSystem;
         for (const path of paths) {
@@ -675,8 +695,6 @@ export class DMusic implements IModule {
     private registerLoaderExports(): void {
         const e = this.exports;
         // HRESULT GetObject(LPDMUS_OBJECTDESC pDesc, REFIID riid, LPVOID *ppv)
-        // The system loader answers for the one object that is the system's own: the default
-        // GM collection. Files are found by the application's own loader in the titles we run.
         e["IDirectMusicLoader8_GetObject"] = (_c, _m, a) => {
             const loader = this.object<LoaderObject>(a[0]);
             const desc = a[1] >>> 0;
@@ -688,11 +706,29 @@ export class DMusic implements IModule {
                 return this.queryInterface(this.defaultCollection(loader), guidAt(a[2]! >>> 0), ppv);
             }
             const name = valid & DMUS_OBJ_FILENAME ? readWide(desc + DESC.fileName, DESC_FILENAME_CHARS) : "";
-            Logger.log(LogCategory.COM, `[DMusic] system loader GetObject("${name}") -> DMUS_E_LOADER_OBJECTNOTFOUND`);
-            return name ? DMUS_E_LOADER_FAILEDOPEN : DMUS_E_LOADER_OBJECTNOTFOUND;
+            if (name) {
+                const dir = loader.searchDirectory;
+                const full = (valid & DMUS_OBJ_FULLPATH) || !dir || /^[a-z]:|^\\/i.test(name)
+                    ? name : dir.replace(/[\\/]+$/, "") + "\\" + name;
+                const bytes = this.readSystemFile([full]);
+                const obj = bytes ? this.objectFromFile(loader, bytes, name) : null;
+                Logger.log(LogCategory.COM, `[DMusic] system loader GetObject("${full}") -> ${obj ? "loaded" : "DMUS_E_LOADER_FAILEDOPEN"}`);
+                if (!obj) return DMUS_E_LOADER_FAILEDOPEN;
+                const hr = this.queryInterface(obj, guidAt(a[2]! >>> 0), ppv);
+                obj.release();
+                return hr;
+            }
+            Logger.log(LogCategory.COM, `[DMusic] system loader GetObject -> DMUS_E_LOADER_OBJECTNOTFOUND`);
+            return DMUS_E_LOADER_OBJECTNOTFOUND;
         };
         e["IDirectMusicLoader8_SetObject"] = () => S_OK;
-        e["IDirectMusicLoader8_SetSearchDirectory"] = () => S_OK;
+        e["IDirectMusicLoader8_SetSearchDirectory"] = (_c, _m, a) => {
+            const loader = this.object<LoaderObject>(a[0]);
+            if (!loader) return E_POINTER;
+            const path = readWide(a[2]! >>> 0, DESC_FILENAME_CHARS);
+            if (path) loader.searchDirectory = path;
+            return S_OK;
+        };
         e["IDirectMusicLoader8_ScanDirectory"] = () => S_FALSE;   // "no files found"
         e["IDirectMusicLoader8_CacheObject"] = () => S_OK;
         e["IDirectMusicLoader8_ReleaseObject"] = () => S_OK;
