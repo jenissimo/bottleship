@@ -21,6 +21,7 @@ import {
     detectInstallShieldStem,
     FILE_COMPRESSED,
     FILE_OBFUSCATED,
+    FILE_INVALID,
 } from "@bottleship/formats/installshield";
 
 const CAB_SIGNATURE = 0x28635349;
@@ -267,6 +268,25 @@ describe("InstallShield 5 extraction", () => {
         expect([...out.keys()].sort()).toEqual(["Drivers/voodoo.dll", "Game.exe"]);
         expect(out.get("Game.exe")).toEqual(exe);
         expect(out.get("Drivers/voodoo.dll")).toEqual(big);
+    });
+
+    test("an empty source folder's zero-length invalid placeholder becomes a directory entry", async () => {
+        const exe = new Uint8Array([0x4d, 0x5a]);
+        const { header, cab } = buildIs5(
+            ["", "player", "data"],
+            [
+                { name: "game.exe", dirIndex: 0, data: exe, compress: false },
+                { name: "Ð", dirIndex: 1, data: new Uint8Array(0), compress: false },
+                { name: "stale.bin", dirIndex: 2, data: new Uint8Array(0), compress: false },
+                { name: "level.gmp", dirIndex: 2, data: exe, compress: false },
+            ],
+        );
+        const dv = new DataView(header.buffer);
+        const base = COMMON_HEADER_SIZE + dv.getUint32(COMMON_HEADER_SIZE + 0x0c, true);
+        for (const index of [1, 2]) dv.setUint16(base + dv.getUint32(base + (3 + index) * 4, true) + 8, FILE_INVALID, true);
+        const out = await extractInstallShield(header, new Map([[1, cab]]), { inflateRaw: nodeInflate });
+        expect([...out.keys()].sort()).toEqual(["data/level.gmp", "game.exe", "player/"]);
+        expect(out.get("player/")!.length).toBe(0);
     });
 
     test("throws on a corrupted compressed descriptor (size mismatch)", async () => {
