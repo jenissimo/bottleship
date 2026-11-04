@@ -321,6 +321,11 @@ export class VirtualFileSystem {
     private readonly PIN_FILE_MAX = 1 * 1024 * 1024; // 1MB — configs/text are tiny
     private readonly PIN_TOTAL_MAX = 24 * 1024 * 1024; // 24MB total ceiling
     private overlay: OpfsOverlay | null = null;
+
+    /** Overlay (game save tree) writes not yet durable in OPFS. */
+    pendingOverlayWrites(): number {
+        return this.overlay?.pendingWriteCount() ?? 0;
+    }
     /** gameId the current overlay is rooted at — re-init when it changes (game switch). */
     private overlayGameId: string | null = null;
     /** Chunk size for readInto async path to avoid huge temp buffers (256KB) */
@@ -2424,6 +2429,11 @@ interface WriterCacheEntry {
 }
 
 class OpfsOverlay {
+    /** Overlay writes buffered or still being committed to OPFS. */
+    pendingWriteCount(): number {
+        return this.writerCache.size + this.pendingFlushes.size;
+    }
+
     private root: FileSystemDirectoryHandle | null = null;
     /** Container dir (parent of overlay/) — where the shadow-index sidecar lives. */
     private container: FileSystemDirectoryHandle | null = null;

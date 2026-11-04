@@ -147,6 +147,11 @@ export class CallbackManager {
     private getMemory: () => Uint8Array;
 
     private pendingCallbacks: Map<number, CallbackInvocation> = new Map();
+
+    /** Guest callbacks invoked from JS whose completion has not run yet. */
+    pendingCallbackCount(): number {
+        return this.pendingCallbacks.size;
+    }
     private pendingSlotByCallbackId = new Map<number, number>();
     private pendingSlotActive = new Uint8Array(MAX_PENDING_CALLBACK_SLOTS);
     private pendingSlotCallbackId = new Uint32Array(MAX_PENDING_CALLBACK_SLOTS);

@@ -488,3 +488,8 @@ export function runChildProcess(vfs: VirtualFileSystem, request: ChildProcessReq
 ): Promise<number> {
     return startChildProcess(vfs, request, createWorker).completion;
 }
+
+/** Child process workers that are booting, running, or not yet reaped. */
+export function liveChildProcessCount(): number {
+    return active.size + unfinished.size;
+}

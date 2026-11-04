@@ -1,3 +1,4 @@
+import { markRestartable } from '../../core/thunking/restartable';
 /**
  * User32 Message functions
  *
@@ -949,7 +950,8 @@ export function createMessageExports(): Record<string, ThunkImplementation> {
             return { value: retVal, stackCleanup: 16 };
         };
 
-        return asyncBody();
+        // Nothing guest-visible happens before the first await: a savestate may rewind it.
+        return markRestartable(asyncBody());
     };
 
     exports['GetMessageA'] = exports['GetMessageW'];

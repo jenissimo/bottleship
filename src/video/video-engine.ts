@@ -218,6 +218,11 @@ export class VideoEngine {
 
     /** Map from JS-side unique handle → session state */
     private sessions: Map<number, DecoderSession> = new Map();
+
+    /** Decoder sessions currently open (video playback in progress). */
+    activeSessionCount(): number {
+        return this.sessions.size + this.wcSessions.size;
+    }
     /** WebCodecs-backed sessions. Disjoint from `sessions` — one handle space, two backends. */
     private wcSessions: Map<number, WebCodecsEntry> = new Map();
     private nextJsHandle = 1;
