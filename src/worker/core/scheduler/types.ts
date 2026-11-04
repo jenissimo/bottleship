@@ -173,6 +173,8 @@ export interface PendingApc {
 // ─── Thread Record ──────────────────────────────────────────────────────────────
 
 export interface Thread {
+    /** Object identity survives closure of the original handle while aliases remain. */
+    kernelObject?: KernelThreadObject;
     // Identity
     readonly id: number;
     readonly handle: number;
@@ -328,6 +330,8 @@ export interface WaitDecision {
 // ─── Kernel Objects ─────────────────────────────────────────────────────────────
 
 export interface KernelThreadObject {
+    /** Last real scheduler values retained for queries after reaping. */
+    basicInformation?: { tebAddress: number; relativePriority: number };
     kind: 'thread';
     threadId: number;
     /** Set when the thread terminates; survives scheduler reaping. */

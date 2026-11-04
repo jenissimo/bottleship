@@ -68,6 +68,9 @@ const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
 let currentPriorityClass = NORMAL_PRIORITY_CLASS;
 
+/** Shared with native thread-information queries; no duplicate priority-class state. */
+export function getCurrentProcessPriorityClass(): number { return currentPriorityClass; }
+
 /**
  * The relative priorities SetThreadPriority accepts: IDLE and TIME_CRITICAL always,
  * LOWEST..HIGHEST in the ordinary classes, and the wider -7..6 band under REALTIME
