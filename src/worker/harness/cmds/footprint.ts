@@ -88,7 +88,15 @@ export function collectFootprint(opts: { verify?: boolean; repair?: boolean } = 
         let live = 0;
         const end = Math.min(table.length, WASM_TABLE_OFFSET + WASM_TABLE_SIZE);
         for (let i = WASM_TABLE_OFFSET; i < end; i++) { try { if (table.get(i)) live++; } catch { /* */ } }
-        jit = { liveModules: live, slots: WASM_TABLE_SIZE - 1 };
+        // v86 counts every module it emits into __jitCompileStats (cpu.js codegen_finalize).
+        // Live bytes are not tracked per slot, so the live figure is the mean emitted module
+        // size times the live slot count: wasm bytes, before the engine compiles them to
+        // machine code (typically a few times larger).
+        const cs = (globalThis as { __jitCompileStats?: { count: number; bytes: number } }).__jitCompileStats;
+        const mean = cs && cs.count > 0 ? cs.bytes / cs.count : 0;
+        jit = { liveModules: live, slots: WASM_TABLE_SIZE - 1,
+            compiledModules: cs?.count ?? null, compiledWasmMB: mb(cs?.bytes),
+            meanModuleKB: cs ? Math.round(mean / 102.4) / 10 : null, liveWasmEstimateMB: mb(mean * live) };
     }
 
     const blockCache = (globalThis as { __wgbBlockCache?: { stats?: () => { residentBytes: number; blocks: number } } }).__wgbBlockCache;
@@ -97,6 +105,14 @@ export function collectFootprint(opts: { verify?: boolean; repair?: boolean } = 
 
     const sab = sharedBufferCensus();
     const gpu = gpuMemoryCensus();
+    // Legacy D3D/DDraw geometry rings (grow on demand, see RingBufferManager).
+    let ddrawRings: unknown = null;
+    try {
+        const dd = process?.getModule?.("ddraw") as { context?: { executor?: { ringBufferManager?: { getGeometryRingStats?: () => {
+            vertexSizes: number[]; indexSizes: number[]; growths: unknown; retired: number } } } } } | undefined;
+        const s = dd?.context?.executor?.ringBufferManager?.getGeometryRingStats?.();
+        if (s) ddrawRings = { vertexMB: s.vertexSizes.map(mb), indexMB: s.indexSizes.map(mb), growths: s.growths, retired: s.retired };
+    } catch { /* no ddraw executor */ }
     const perfMemory = (performance as unknown as { memory?: { usedJSHeapSize: number; totalJSHeapSize: number } }).memory;
 
     // The rough "what we hold" sum: guest pages that may be resident + SABs + JS caches.
@@ -115,7 +131,8 @@ export function collectFootprint(opts: { verify?: boolean; repair?: boolean } = 
         gpu: { buffers: gpu.buffers, bufferMB: mb(gpu.bufferBytes), textures: gpu.textures, textureMB: mb(gpu.textureBytes),
             created: { buffers: gpu.createdBuffers, textures: gpu.createdTextures },
             destroyed: { buffers: gpu.destroyedBuffers, textures: gpu.destroyedTextures },
-            largeBuffers: gpu.largeBuffers.map((b) => ({ label: b.label, mb: mb(b.bytes), usage: '0x' + b.usage.toString(16) })) },
+            largeBuffers: gpu.largeBuffers.map((b) => ({ label: b.label, mb: mb(b.bytes), usage: '0x' + b.usage.toString(16) })),
+            ddrawRings },
         jsCaches,
         jsHeap: perfMemory ? { usedMB: mb(perfMemory.usedJSHeapSize), totalMB: mb(perfMemory.totalJSHeapSize) } : null,
         jit,
@@ -123,5 +140,9 @@ export function collectFootprint(opts: { verify?: boolean; repair?: boolean } = 
 }
 
 export function registerFootprintCommands(svc: HarnessService): void {
+    // Arm v86's JIT compile counter for the life of the worker (one add per emitted module).
+    // The aot `compileReset` verb restarts it; the census then counts from there.
+    const g = globalThis as { __jitCompileStats?: { count: number; bytes: number } };
+    g.__jitCompileStats ??= { count: 0, bytes: 0 };
     svc.register("footprint", (args) => collectFootprint((args[0] ?? {}) as { verify?: boolean; repair?: boolean }));
 }

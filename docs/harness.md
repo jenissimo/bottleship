@@ -168,9 +168,13 @@ on current iPhones) that counts written (dirty) and compressed pages, not reserv
   rings). The page facade adds the page realm's own census under `page`.
 - `gpu`: estimated bytes of live GPUBuffers and GPUTextures on this worker's devices, with the
   largest buffers listed. Sizes come from the descriptors, so driver padding is not included.
-  On iOS these live in the GPU process, not in WebContent.
-- `jsCaches` (bundle block cache), `jsHeap` (where the realm exposes it), `jit` (live JIT
-  module slots).
+  `ddrawRings` shows the legacy D3D/DDraw geometry rings, which start small and double on
+  demand: current sizes per ring and how often they grew. On an iPhone 15 Pro this GPU memory
+  counted against the tab's limit (889 MB of fixed rings got Hitman killed, the same build with
+  small rings survived), so an unexpectedly large `bufferMB` is worth chasing.
+- `jsCaches` (bundle block cache), `jsHeap` (where the realm exposes it), `jit`: live JIT
+  module slots, modules and wasm bytes emitted so far, and `liveWasmEstimateMB` (mean module
+  size times live slots; wasm bytes, the compiled machine code is larger).
 
 `estimateMB` sums guest dirty pages, SABs and JS caches. Use it to compare runs, not as an OS
 number. On desktop the ground truth is the renderer's private working set:
