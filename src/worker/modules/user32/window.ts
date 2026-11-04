@@ -51,6 +51,8 @@ import {
 import { isSentinelWndProc } from './dialog';
 import { applyDefaultSetText, handleSystemControlMessage, isContentChangingMessage } from './dialog-control-messages';
 import { encodeAnsi, readAnsiOrWideFromGuest } from '../codepage-utils';
+
+const ERROR_CANNOT_FIND_WND_CLASS = 1407;
 import { noteDialogOverlayCandidate, eraseDialogOverlay, isWindowFullyCoveredByHigherTopLevel } from './dialog-overlay';
 import { eraseControlOverlayRect, eraseHiddenWindowPixels, repaintDialogOverlayIfVisible, repaintDialogAfterContentChange, requestGuestDialogPaint } from './dialog-paint';
 import {
@@ -1026,7 +1028,19 @@ export function createWindowExports(): Record<string, ThunkImplementation> {
             classInfo = getWindowClassByName(className);
         }
 
+        // An empty class name can never name a registered class: CreateWindowEx fails with
+        // ERROR_CANNOT_FIND_WND_CLASS (Wine WIN_CreateWindowEx). Apps that fill a fixed control
+        // table create the unused slots this way and rely on the NULL HWND; a placeholder window
+        // there is an invisible-in-intent top-level window covering the app's own dialog.
+        if (!classInfo && className === '') {
+            Logger.warn(LogCategory.USER32, `CreateWindowEx: class ${JSON.stringify(className)} is not registered`);
+            System.getInstance().scheduler.setLastError(ERROR_CANNOT_FIND_WND_CLASS);
+            return null;
+        }
+
         if (!classInfo && typeof className === 'string') {
+            // A named class we do not implement is a missing implementation, not an app
+            // error; the placeholder keeps the gap visible in the log.
             Logger.warn(LogCategory.USER32, `CreateWindowEx: class "${className}" not found, using dummy`);
             classInfo = { lpfnWndProc: 0 };
         }
