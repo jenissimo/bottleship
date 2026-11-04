@@ -34,6 +34,9 @@ export function showDialogWindow(hwnd: number): boolean {
     const wmWin = wm.getWindow(hwnd);
     if (wmWin) wmWin.visible = true;
     if ((win.style & WS_CHILD) === 0) wm.setWindowZOrder(hwnd, HWND_TOP);
+    // Same report ShowWindow makes for a top-level window: a process whose first window
+    // is a dialog (a launcher's child, a network setup box) is asking for the screen.
+    if ((win.style & WS_CHILD) === 0 && !win.parent) System.getInstance().notifyWindowTitle(win.title, 'DialogShow', true);
 
     // A dialog reaching the screen while the game owns it is a live overlay.
     noteDialogOverlayCandidate(win);
