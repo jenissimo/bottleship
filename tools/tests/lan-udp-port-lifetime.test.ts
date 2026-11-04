@@ -67,8 +67,8 @@ test("a failed native UDP bind retires its channels before a replacement owner i
 });
 
 for(const family of [4,6] as const)test("native unspecified UDP target accepts its normalized loopback reply, IPv"+family,()=>{
-    // Actual Windows and Linux UDP sendto observations are retained in
-    // logs/lan-conformance/udp-normalize-{windows,posix}-40.json.
+    // Matches UDP sendto observations recorded on Windows and Linux (40 cases each;
+    // the raw records are kept locally, not committed).
     const {pool,sockets}=setup(),host=family===4?"0.0.0.0":"::",source=family===4?"127.0.0.1":"::1";
     const channel=pool.open("udp:47003:4",family,host,2345);let ready=0;
     connect(channel,2345,host,()=>ready++);sockets[0].finishBind();expect(ready).toBe(1);

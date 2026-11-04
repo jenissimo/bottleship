@@ -163,11 +163,11 @@
     "normalization": "Raw callback rows are diagnostic; DWORD observations normalize role IDs and opaque handles."
   },
   "nativeEvidence": {
-    "original988": "logs/lan-conformance/stage29-host-peer-info/empty-runs/1792760288734/verified.json",
+    "original988": "verified.json of the 988-observation Windows run (kept locally, not committed)",
     "reportSha256": "15e2de040cde6cc4da8f5fb6ad48820362331f7fba524a49d0875f368bc9ab28",
     "peSha256": "37e9fdcef29b0d69ae05d02bbe6c0a6acbdc7b09ce10fe1744f83226296099c1",
     "sourceSha256": "1ea01926588983162ddc31232f5a5db586949b53f7bdc63225be8964e1839c58",
-    "wire": "logs/lan-conformance/stage29-host-peer-info/wire-runs/1792759342852/verified.json"
+    "wire": "verified.json of the native D6/DB loopback proxy capture (kept locally, not committed)"
   },
   "cleanup": "Both native processes exit0 without forced kill; role markers bounded; both UDP ports rebound after Close, before server shutdown for interop; input/source/PE/reference SHA guards immutable.",
   "limitations": [

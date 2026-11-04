@@ -61,8 +61,8 @@ vendor/UPSTREAM.md. Polling guards follow the rejected peek or encoded Bytes own
 through HTTP Body/Hyper. WS guards survive until flush or sink drop; every sink
 await is cancellation-aware. Fatal retirement never awaits a blocked writer flush.
 
-Validation retained under logs/lan-conformance/rust-transport-spike/:
-stock source audit and exact-SID diagnostics; maintained Rust budget/codec/race and
+Validation performed (records kept locally, not committed): an audit of the stock
+engineioxide source against the crates.io archive and exact-SID diagnostics; maintained Rust budget/codec/race and
 actual loopback tests; external socket.io-client 4.8.4 forced polling, WS and
 controlled same-SID upgrade with binary before/after; permanent no-GET polling and
 paused real WS TCP reader, output refusal, immediate unknown SID and physical

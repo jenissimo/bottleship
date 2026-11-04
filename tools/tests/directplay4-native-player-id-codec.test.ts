@@ -12,7 +12,7 @@ test("REQUESTPLAYERID has command 5, current version and raw little-endian flags
 });
 
 test("captured native REQUESTPLAYERID supplies version 14 explicitly", () => {
-    // Oracle logs/lan-conformance/dp4-join-wire-20261028-sixth/result.json.
+    // Bytes from a Windows DP4 join wire capture (directplay4-join-wire-capture.ts; kept locally).
     // Sockaddr is copied verbatim; its padding is not asserted to have a policy.
     const sockaddr = bytes("020012c95e13de350000700063000000");
     const result = encodeDirectPlay4SystemTcpFrame(sockaddr, encodeDirectPlay4RequestPlayerId(9, 14), 1024);

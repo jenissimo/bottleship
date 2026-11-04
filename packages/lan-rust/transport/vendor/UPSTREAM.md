@@ -4,8 +4,10 @@ Upstream: https://github.com/totodore/socketioxide
 Crate: engineioxide 0.17.7, MIT, crates.io archive SHA256
 0235543b6e1a5fef2a8a7871ae410d5d1c440d8ced9217ec0f1b344edfe30673.
 VCS commit: 708ea9fc5ee549229d7236924e4975ec5977a59c, crates/engineioxide.
-Unmodified archive/source retained at logs/lan-conformance/rust-transport-spike/audit/.
-The published crate omitted LICENSE. LICENSE was fetched from the exact VCS commit
+To see the local changes, download engineioxide 0.17.7 from crates.io (the archive
+hash above) and diff it against this directory. The packaging metadata files
+Cargo.toml.orig and .cargo_vcs_info.json were dropped; the VCS commit and path they
+recorded are given here. The published crate omitted LICENSE. LICENSE was fetched from the exact VCS commit
 root (SHA256 c2d36f491861e7d2a6c34f34b54dfb1b9aede4bc5db8f8c6fbe8310471b9c822).
 
 This copy adds explicit public ownership hooks, not private-field access or unsafe:
@@ -26,5 +28,4 @@ Socket.IO v5 LAN subset (connect/auth, disconnect, JSON and binary events). It d
 not add application ACK messages or create arbitrary namespaces. Protocol v3 is
 not enabled by the production adapter. Socketioxide is not vendored/linked.
 
-Stock diagnostic report (including failures) is FINAL.md in the spike directory.
 There are no performance claims from the stock debug echo fixtures.
