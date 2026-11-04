@@ -64,6 +64,17 @@ describe("single contact — tap", () => {
         expect(out).toEqual([{ k: "cursor", x: 320, y: 240 + FINGER_OFFSET_Y_PX }]);
     });
 
+    test("a plain tap clicks under the finger, not at the aim offset", () => {
+        const s = rec({ cursorAid: true });
+        step(s, ev(1, "down", 320, 240), 0);
+        const out = step(s, ev(1, "up", 320, 240), 60);
+        const cursors = out.filter((i) => i.k === "cursor");
+        expect(cursors.at(-1)).toEqual({ k: "cursor", x: 320, y: 240 });
+        // ...and the cursor is there BEFORE the button goes down.
+        const firstButton = out.findIndex((i) => i.k === "button");
+        expect(out.findIndex((i) => i.k === "cursor" && i.y === 240)).toBeLessThan(firstButton);
+    });
+
     test("a REFINE slide resolves to a tap at the FINAL (refined) position", () => {
         const s = rec();
         step(s, ev(1, "down", 100, 100), 0);
