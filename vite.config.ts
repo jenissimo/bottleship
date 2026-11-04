@@ -248,7 +248,9 @@ export default defineConfig({
   },
   server: {
     host: true,
-    port: 5174,
+    // BS_DEV_PORT runs a second dev stack beside the default one (e.g. a device build while
+    // a desktop harness owns :5174). tools/remote-bridge.ts reads the same variable.
+    port: Number(process.env.BS_DEV_PORT ?? 5174),
     strictPort: true,
     ...useSsl ? { https: true } : {},
     hmr: false,
