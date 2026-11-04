@@ -145,7 +145,7 @@ export class AudioEngine {
   private ready: Promise<void> | null = null;
   private pausePromise: Promise<void> | null = null;
   private resumePromise: Promise<void> | null = null;
-  /** True only while the user has intentionally paused (Space toggle). Auto-resume
+  /** True while intentionally paused (UI or harness). Auto-resume
    *  (gesture / statechange) is suppressed while set, so a stray click during a
    *  manual pause never un-mutes the game. */
   private userPaused = false;
@@ -639,10 +639,24 @@ export class AudioEngine {
     }
   }
 
+  /** Automatic registration/gesture unlock must not cancel a UI or harness pause. */
+  async resumeIfNotPaused(): Promise<void> {
+    if (this.userPaused) return;
+    await this.ensureRunning();
+  }
+
+  /** Explicit unpause; automatic callers must use resumeIfNotPaused(). */
   async resume(): Promise<void> {
-    // Any resume request (gesture, statechange, or explicit unpause) means we want
-    // audio running again — clear the intentional-pause flag.
     this.userPaused = false;
+    await this.ensureRunning();
+  }
+
+  private async ensureRunning(): Promise<void> {
+    if (this.userPaused) return;
+    // An explicit unpause can arrive before the previous suspend settles.
+    // Finish that transition first, then re-check the latest pause intent.
+    if (this.pausePromise) await this.pausePromise;
+    if (this.userPaused) return;
     const context = this.ensureContext();
     // A pre-gesture resume may stay pending; a later gesture needs a fresh request.
     if (context.state === "suspended") {
@@ -657,6 +671,12 @@ export class AudioEngine {
         return;
       }
     }
+    // A browser resume promise may settle after a later intentional pause.
+    // Re-suspend rather than letting that stale automatic request undo it.
+    if (this.userPaused) {
+      await this.pause();
+      return;
+    }
     if (context.state !== "running") return;
     if (this.resumePromise) {
       await this.resumePromise;
@@ -665,23 +685,30 @@ export class AudioEngine {
 
     this.resumePromise = (async () => {
       await this.ensureReady();
+      if (this.userPaused) return;
 
       // Resume encoded sources that were playing before pause
       const pausedIds = Array.from(this.pausedEncodedSources);
       if (pausedIds.length === 0) return; // Nothing to resume
 
-      this.pausedEncodedSources.clear();
-
       for (const id of pausedIds) {
+        if (this.userPaused) break;
         const source = this.encodedSources.get(id);
         if (!source) {
           // Source was removed while paused, skip it
+          this.pausedEncodedSources.delete(id);
           continue;
         }
         try {
           await source.element.play();
+          if (this.userPaused) {
+            await this.pause();
+            break;
+          }
+          this.pausedEncodedSources.delete(id);
           console.log("BottleShip: Encoded source resumed", { id });
         } catch (err) {
+          if (!this.userPaused) this.pausedEncodedSources.delete(id);
           const error = err instanceof Error ? err.message : String(err);
           console.error("BottleShip: Failed to resume encoded source", { id, error });
           // Source might have been stopped/removed, which is fine
