@@ -33,6 +33,7 @@ import { libHleManager } from "./hle-lib/lib-hle-manager";
 import { hookRegistry } from "./hooks";
 import { resetSehDispatchState } from "./seh-dispatch";
 import { namedObjects } from "../modules/kernel32/named-objects";
+import { hasWaitingModalPump } from "../modules/user32/modal-dialog-state";
 import { hypercallDataManager } from "./cpu/hypercall-data";
 import type { PointerClipRect } from "./pointer-policy";
 
@@ -430,7 +431,7 @@ export class System {
         this.scheduler.onHasPendingAsyncRestores = () => {
             return dispatcher.hasPendingAsyncRestores();
         };
-        this.scheduler.onHasMessageWaiters = () => this.windowManager.hasWaiters();
+        this.scheduler.onHasMessageWaiters = () => this.windowManager.hasWaiters() || hasWaitingModalPump();
         this.scheduler.onThreadOwnsSuspendedFrame = (threadId) => {
             return dispatcher.threadOwnsSuspendedFrame(threadId);
         };

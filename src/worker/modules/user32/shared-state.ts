@@ -120,6 +120,18 @@ export function killWindowTimers(hwnd: number): void {
     windowTimerKiller?.(hwnd >>> 0);
 }
 
+// USER restarts an expired timer only when its WM_TIMER is REMOVED from the queue, by
+// whichever loop removes it — the timer map lives in message.ts, the modal dialog pump
+// in dialog.ts retrieves messages without going through Get/PeekMessage.
+type RemovedTimerMessage = { hwnd: number; message: number; wParam: number; lParam: number; generatedTimer?: boolean; timerEpoch?: number };
+let removedTimerHook: ((msg: RemovedTimerMessage) => void) | null = null;
+export function registerRemovedTimerHook(fn: (msg: RemovedTimerMessage) => void): void {
+    removedTimerHook = fn;
+}
+export function noteTimerMessageRemoved(msg: RemovedTimerMessage): void {
+    removedTimerHook?.(msg);
+}
+
 // Deferred-destroy finalizer: window.ts registers the real teardown (remove from the
 // user32 + WindowManager maps); message.ts DispatchMessageW calls it once WM_NCDESTROY
 // has been delivered to the window's wndProc. Cross-module hook (same pattern as the

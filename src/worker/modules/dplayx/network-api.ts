@@ -724,7 +724,9 @@ export class DirectPlayNetworkApi {
                         args: (base: number) => {
                             const callbackFlags = flags | e.flags | (parent?.groupOwner === e.id ? 0x2000 : 0)
                                 | (e.group && parent && e.parent !== parent.id ? 0x400 : 0);
-                            return legacy ? [e.id, base + 16, base + 16 + encodeAnsi(e.name.short + "\\0").length, callbackFlags, context]
+                            // packName lays out DPNAME, then the short name, then the long one.
+                            const shortBytes = e.name.shortNull ? 0 : encodeText(e.name.short + "\0", wide).length;
+                            return legacy ? [e.id, e.name.shortNull ? 0 : base + 16, e.name.longNull ? 0 : base + 16 + shortBytes, callbackFlags, context]
                                 : [e.id, e.group ? 0 : 1, base, callbackFlags, context];
                         },
                     }));
@@ -1190,7 +1192,7 @@ export class DirectPlayNetworkApi {
         const enumerateProviders = (wide: boolean): ThunkImplementation => (ctx, _mem, args) => {
             const a = args.slice(0, 2);
             return this.enumerate(ctx, a[0], 8, PROVIDERS.map(provider => ({
-                pack: () => { const bytes = new Uint8Array(16 + encodeText(provider.name + "\\0", wide).length); bytes.set(unhex(provider.guid)); bytes.set(encodeText(provider.name + "\\0", wide), 16); return bytes; },
+                pack: () => { const name = encodeText(provider.name + "\0", wide), bytes = new Uint8Array(16 + name.length); bytes.set(unhex(provider.guid)); bytes.set(name, 16); return bytes; },
                 args: base => [base, base + 16, 6, 0, a[1]],
             })));
         };

@@ -55,6 +55,15 @@ export function createPumpScheduler(): PumpScheduler {
     };
 }
 
+/**
+ * A modal pump with its next step armed is a thread blocked in the dialog's GetMessage:
+ * like a GetMessage waiter, it can only be woken by a message, and USER timers are on
+ * the virtual-time wheel, so the scheduler must keep that clock moving for it.
+ */
+export function hasWaitingModalPump(): boolean {
+    return pendingTimers.size > 0;
+}
+
 /** Process teardown / new bundle load: no pump armed so far may run again. */
 export function resetDialogPumps(): void {
     pumpEpoch++;
