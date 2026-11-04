@@ -8,6 +8,7 @@ import type { VirtualFileSystem } from '../runtime/filesystem/vfs';
 import type { RegistryMutation, RegistryStore } from '../runtime/filesystem/registry';
 import type { NamedObjectSpec } from '../modules/kernel32/named-objects';
 import type { GuestImagePatch } from './system';
+import type { HostJitMode } from '../../utils/host-jit-policy';
 
 export interface ChildProcessPreparation { imagePatches?: GuestImagePatch[]; }
 
@@ -32,6 +33,8 @@ export interface ChildBoot extends ChildProcessRequest {
     config?: Record<string, unknown>;
     registry?: ReturnType<RegistryStore['serialize']>;
     namedObjects?: NamedObjectSpec[];
+    /** The parent's host JIT mode: the page that decided it is not this worker's. */
+    jitMode?: HostJitMode;
 }
 
 export interface ChildProcessRecord extends ChildProcessRequest {
@@ -107,7 +110,7 @@ let nextChildBootId = 1;
 const unfinished = new Set<ChildProcessRecord>();
 let publishSession: ((port: MessagePort, record: ChildProcessRecord) => void) | undefined;
 let sessionFinished: (() => void) | undefined;
-let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects'>) | undefined;
+let bootContext: (() => Pick<ChildBoot, 'config' | 'registry' | 'namedObjects' | 'jitMode'>) | undefined;
 export function setChildBootContext(provider: typeof bootContext): void { bootContext = provider; }
 
 /** Applies a child's registry write to THIS process's store — the registry is system-wide,

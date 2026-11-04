@@ -4,6 +4,7 @@ import { ThunkGenerator } from "./core/thunking/thunk-generator";
 import { adoptFreshGuestMemory } from "./core/memory/guest-page-dirty";
 import { Process } from "./core/process";
 import { System, type GuestImagePatch } from "./core/system";
+import { applyHostJitMode, isHostJitMode, type HostJitMode } from "../utils/host-jit-policy";
 import { childProcessHistory, stopChildProcesses, setChildSessionPublisher, setChildBootContext, setChildRegistrySink, forwardRegistryToChildren, type ChildBoot, type ChildProcessPreparation } from "./core/child-process";
 import { ChildStartupGate } from "./core/child-startup";
 import { createChildVfsClient } from "./core/child-vfs";
@@ -32,7 +33,10 @@ setChildSessionPublisher((port, record) => {
   System.getInstance().inputManager.setInputBuffer(null);
   (self as unknown as Worker).postMessage({ type: 'child_session', port, imagePath: record.imagePath, record }, [port]);
 }, () => System.getInstance().releaseChildSessionBroker());
+/** Set by the page (set_jit_policy) or inherited by a child; applied at every v86 init. */
+let hostJitMode: HostJitMode = "on";
 setChildBootContext(() => ({
+  jitMode: hostJitMode,
   config: EmulatorConfig.getInstance().snapshotForChild(),
   registry: System.getInstance().registry.serialize(),
   namedObjects: namedObjects.snapshot(),
@@ -2967,6 +2971,11 @@ const initV86 = async (canvas: OffscreenCanvas) => {
             cpu.wm.exports.set_jit_config(0, 1);
             console.warn("[dbg] JIT DISABLED at init (VITE_BS_JIT_OFF)");
           }
+          // Host policy (iOS WebKit 27 gate / ?jit=). Same placement and reason as above.
+          const hostJitWrites = applyHostJitMode(cpu.wm.exports, hostJitMode);
+          if (hostJitWrites.length) {
+            Logger.log(LogCategory.SYSTEM, `[JIT] host mode "${hostJitMode}": set_jit_config ${hostJitWrites.map(([i, v]) => `${i}=${v}`).join(",")}`);
+          }
           hypercallDataManager.initialize(cpu, preemptionManager.getHypercallPageBase());
           // Report the effective FPU mode this bundle booted with (manifest fpuStrict OR a
           // persisted dbg.relaxedFpu(false)) so the dev toolbar "FPU: Strict/Relaxed" button
@@ -3427,6 +3436,7 @@ const handleWorkerMessage = (event: MessageEvent): void => {
     childFrameClock = new ChildFrameClock(() => postToParent({ type: 'child_animation_request' }));
     self.requestAnimationFrame = childFrameClock.request;
     self.cancelAnimationFrame = childFrameClock.cancel;
+    if (isHostJitMode(childBoot.jitMode)) hostJitMode = childBoot.jitMode;
     if (childBoot.config) EmulatorConfig.getInstance().restoreForChild(childBoot.config);
     applySessionNetwork(EmulatorConfig.getInstance().network);
     const canvas = new OffscreenCanvas(640, 480);
@@ -3492,6 +3502,14 @@ const handleWorkerMessage = (event: MessageEvent): void => {
   if (message?.type === "dbg") {
     // Guest debugger bridge: window.dbg.<cmd>(...args) on the page -> here.
     handleDbgCommand(message.cmd, message.args);
+    return;
+  }
+
+  if (message?.type === "set_jit_policy") {
+    // Must arrive before load_bundle: the mode is applied when v86 initialises.
+    if (isHostJitMode(message.mode)) hostJitMode = message.mode;
+    // JIT_DISABLED only stops compiling; a replayed AOT recording would still run modules.
+    if (hostJitMode === "off") (globalThis as Record<string, unknown>).__aotNoAutoLoad = true;
     return;
   }
 

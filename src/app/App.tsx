@@ -17,6 +17,7 @@ import { AudioEngine, AudioPlayEncodedPayload, AudioPlayPayload, AudioUpdatePayl
 import { getLogClient, sendLogToServer, writeDebugFile, writeDebugFileBase64, rotateLogFile, logArtifactPath } from "../utils/log-client";
 import { bundleLogName } from "../utils/bundle-url";
 import { sessionFromLocation } from "../harness/session";
+import { resolveHostJitPolicy } from "../utils/host-jit-policy";
 import { installHarnessFacade } from "../harness/facade";
 import { getCachedGamepadMeta, initGamepadCache, readLiveGamepad, rescanGamepads } from "../gamepad-cache";
 import GameSelectScreen, { type GameEntry } from "../library/GameSelectScreen";
@@ -1032,6 +1033,13 @@ export default function App() {
       // to logs/debug/ while its PNG went to logs/alpha/debug/ reads a sibling's evidence.
       globalWorker.postMessage({ type: "set_session", session: sessionFromLocation(window.location.search) });
       globalWorker.postMessage({ type: "set_network", network: networkRef.current });
+      const jitPolicy = resolveHostJitPolicy({
+        userAgent: navigator.userAgent,
+        maxTouchPoints: navigator.maxTouchPoints,
+        search: window.location.search,
+      });
+      globalWorker.postMessage({ type: "set_jit_policy", mode: jitPolicy.mode });
+      if (jitPolicy.reason !== "default") console.info(`[bs] JIT ${jitPolicy.mode} (${jitPolicy.reason}); ?jit=1 forces it on`);
 
       // A self re-exec asked us to reload (see the "reexec" message). Hand the worker the
       // launcher's command line BEFORE any bundle load — it replaces the manifest's `args`
