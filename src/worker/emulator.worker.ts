@@ -2959,6 +2959,13 @@ const initV86 = async (canvas: OffscreenCanvas) => {
         const cpu = v86?.cpu || v86?.v86?.cpu;
         if (cpu?.wm?.exports?.get_hypercall_page_ptr) {
           preemptionManager.initialize(cpu);
+          // DEV-only experiment knob (VITE_BS_JIT_OFF): boot with the JIT disabled so a device
+          // that dies inside JIT codegen can be bisected without racing dbg.jitOff() against
+          // boot. Kept out of PreemptionManager, whose JIT slots must match the shipping config.
+          if (import.meta.env?.DEV && import.meta.env?.VITE_BS_JIT_OFF && cpu.wm.exports.set_jit_config) {
+            cpu.wm.exports.set_jit_config(0, 1);
+            console.warn("[dbg] JIT DISABLED at init (VITE_BS_JIT_OFF)");
+          }
           hypercallDataManager.initialize(cpu, preemptionManager.getHypercallPageBase());
           // Report the effective FPU mode this bundle booted with (manifest fpuStrict OR a
           // persisted dbg.relaxedFpu(false)) so the dev toolbar "FPU: Strict/Relaxed" button

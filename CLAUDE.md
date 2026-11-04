@@ -503,6 +503,10 @@ Tooling:
     you pack from a source that already lost the empty dirs, pass `--create-dirs
     "user\rosters,user\save\photos"` explicitly. The manifest field is the sanctioned
     fix — it replicates the installer's on-disk layout, NOT a per-game hack.
+    The same applies to FILES an installer script copies from one it shipped (InstallScript
+    copying the selected `language-<lang>.zip` to the name the game reads): they are in no
+    cabinet, so an extraction lacks them. Pass `--copy "SRC=DST"` (repeatable) — a game
+    whose strings come out as raw resource keys is the typical symptom.
   - wgb.ts — Unified WGB archive tool (list/cat/extract/replace/manifest/set-manifest/patch-manifest).
     Replaces pack-wgb, repack-wgb, extract-wgb, list-wgb. Store-only ZIP, own parser.
     Usage: bun tools/wgb.ts <command> <archive.wgb> [args...]
