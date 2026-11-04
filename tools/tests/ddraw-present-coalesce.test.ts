@@ -39,13 +39,14 @@ async function flush(): Promise<void> {
 
 const REFRESH = 1000 / 60;
 
-function presenterWithDrawLog() {
+function presenterWithDrawLog(hold = false) {
     const clock = new ManualClock();
     const presenter = Object.create(DDrawPresenter.prototype) as any;
     Object.assign(presenter, {
         presentCallCount: 0, pendingSurface: null, pendingOptions: null, pendingResolvers: [],
         pumpRunning: false, pumpQueued: false, presentClock: clock, latchedSince: -1,
         refreshUnregister: null, backstopCancel: null, lastFlipAt: -Infinity, flipIntervalMs: 0,
+        lockedSince: -1, holdUntilFlip: () => hold,
     });
     const drawn: Array<{ options: any; at: number; surface: any }> = [];
     presenter.drawFrame = async (surface: unknown, options: unknown) => { drawn.push({ surface, options, at: clock.t }); };
@@ -110,8 +111,8 @@ test("a primary that stays locked is still drawn after the bounded hold", async 
     expect(drawn[0]!.at).toBeLessThanOrEqual(50 + REFRESH);
 });
 
-test("Flip, an implicit present 10 ms later, then 300 ms idle: the implicit present is drawn", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog();
+test("Flip, an implicit present 10 ms later, then 300 ms idle: the implicit present is drawn (Flip hold opted in)", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog(true);
     await presenter.present(primary, mem, flip);
     expect(drawn).toHaveLength(1);
     await clock.advance(10, REFRESH);
@@ -123,8 +124,8 @@ test("Flip, an implicit present 10 ms later, then 300 ms idle: the implicit pres
     expect(drawn[1]!.at).toBeLessThanOrEqual(100 + REFRESH);
 });
 
-test("a guest that keeps flipping shows its Flips; front-buffer passes between them are not drawn", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog();
+test("with the Flip hold opted in, front-buffer passes between Flips are not drawn", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog(true);
     for (let frame = 0; frame < 30; frame++) {
         void presenter.present(primary, mem, flip);
         await clock.advance(1.5, REFRESH);
@@ -137,8 +138,8 @@ test("a guest that keeps flipping shows its Flips; front-buffer passes between t
     expect(drawn.every(d => d.options.flip === true)).toBe(true);
 });
 
-test("the Flip hold follows the guest's Flip cadence: a slow flipper's last implicit present is drawn after 1.5 intervals", async () => {
-    const { presenter, drawn, clock } = presenterWithDrawLog();
+test("the opted-in Flip hold follows the guest's Flip cadence: a slow flipper's last implicit present is drawn after 1.5 intervals", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog(true);
     for (let i = 0; i < 4; i++) { void presenter.present(primary, mem, flip); await clock.advance(40, REFRESH); }
     void presenter.present(primary, mem, flip);
     await clock.advance(5, REFRESH);
@@ -155,4 +156,56 @@ test("without refresh ticks an implicit present is still drawn by the backstop",
     expect(drawn).toHaveLength(0);
     await clock.advance(2);
     expect(drawn).toHaveLength(1);
+});
+
+test("by default a front-buffer update after each Flip is drawn at the next refresh", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog();
+    for (let frame = 0; frame < 30; frame++) {
+        void presenter.present(primary, mem, flip);
+        await clock.advance(2, REFRESH);
+        void presenter.present(primary, mem, implicit);
+        await clock.advance(1000 / 30 - 2, REFRESH);
+    }
+    expect(drawn.filter(d => d.options.flip === true)).toHaveLength(30);
+    expect(drawn.filter(d => d.options.flip !== true)).toHaveLength(30);
+});
+
+test("Flip, an implicit present 10 ms later, then 300 ms idle: drawn at the next refresh by default", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog();
+    await presenter.present(primary, mem, flip);
+    await clock.advance(10, REFRESH);
+    void presenter.present(primary, mem, implicit);
+    await clock.advance(300, REFRESH);
+    expect(drawn).toHaveLength(2);
+    expect(drawn[1]!.at).toBeLessThanOrEqual(10 + REFRESH);
+});
+
+test("a primary that stays locked is drawn once per refresh after the first hold", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog();
+    const surface = { surfacePtr: 0x1000, activeLeaseId: 3 } as unknown as DirectDrawSurfaceState;
+    for (let t = 0; t < 1000; t += REFRESH) {
+        void presenter.present(surface, mem, implicit);
+        await clock.advance(REFRESH, REFRESH);
+    }
+    expect(drawn.length).toBeGreaterThanOrEqual(55);
+    expect(drawn[0]!.at).toBeLessThanOrEqual(50 + REFRESH);
+});
+
+test("a Flip superseded by an implicit present while a draw is in flight is still drawn at once", async () => {
+    const { presenter, drawn, clock } = presenterWithDrawLog(true);
+    let release!: () => void;
+    const p = presenter as any;
+    const draw = p.drawFrame;
+    p.drawFrame = (surface: unknown, options: unknown) => new Promise<void>(r => { release = () => { void draw(surface, options).then(r); }; });
+    void presenter.present(primary, mem, flip);
+    await clock.advance(1);
+    void presenter.present(primary, mem, flip);
+    const late = { surfacePtr: 0x3000 } as DirectDrawSurfaceState;
+    void presenter.present(late, mem, implicit);
+    p.drawFrame = draw;
+    release();
+    await clock.advance(0);
+    expect(drawn).toHaveLength(2);
+    expect(drawn[1]!.surface).toBe(late);
+    expect(drawn[1]!.at).toBe(1);
 });

@@ -66,6 +66,8 @@ export class DDrawPresenter implements RenderActive {
     private pumpQueued = false;
     presentClock: PresentClock = defaultPresentClock;
     private latchedSince = -1;
+    private lockedSince = -1;
+    holdUntilFlip: () => boolean = () => EmulatorConfig.getInstance().ddrawHoldPresentsUntilFlip;
     private refreshUnregister: (() => void) | null = null;
     private backstopCancel: (() => void) | null = null;
     private lastFlipAt = -Infinity;
@@ -276,10 +278,11 @@ export class DDrawPresenter implements RenderActive {
                 }
             }
 
+            const supersededFlip = this.pendingSurface !== null && this.pendingOptions?.flip === true;
             this.pendingSurface = surface;
-            this.pendingOptions = options;
+            this.pendingOptions = supersededFlip && !options.flip ? { ...options, flip: true } : options;
             this.pendingResolvers.push({ resolve, reject });
-            if (options.flip) {
+            if (this.pendingOptions.flip) {
                 this.releaseRefreshLatch();
                 void this.pumpLoop();
             } else {
@@ -290,16 +293,17 @@ export class DDrawPresenter implements RenderActive {
 
     /**
      * The primary is scanout, so its image reaches the screen once per refresh:
-     * - Flip draws at once.
+     * - Flip draws at once; a Flip superseded while a draw is in flight stays a Flip.
      * - An explicit present (throttle off) draws when the current guest slice returns, so
      *   presents within one slice collapse into one draw.
      * - An implicit present (Unlock/Blt/palette of the primary) is latched: the latest state
-     *   is drawn at the next refresh, once per refresh. Never while the primary is still
-     *   locked, for at most LOCK_HOLD_MAX_MS. A guest that Flips composes its next frame in
-     *   the front buffer in several passes, which emulation stretches across refreshes; its
-     *   next Flip shows the finished image, so the latch waits for it, at most
-     *   FLIP_HOLD_FLIP_INTERVALS of the guest's own Flip interval (capped). An implicit
-     *   present is never dropped: when no Flip follows, it is drawn once the hold ends.
+     *   is drawn at the next refresh, once per refresh. A primary that is locked is held for
+     *   at most LOCK_HOLD_MAX_MS from when it was first seen locked; one that stays locked
+     *   is a continuous scanout writer and is drawn once per refresh after that.
+     * - Opt-in (manifest emulator.ddrawHoldPresentsUntilFlip): for a guest that Flips, the
+     *   latch waits for its next Flip, at most FLIP_HOLD_FLIP_INTERVALS of its Flip interval
+     *   (capped at FLIP_HOLD_MAX_MS), then draws the held state. Worst-case added latency of
+     *   an implicit present after a Flip: FLIP_HOLD_MAX_MS plus one refresh.
      */
     private schedulePump(implicit: boolean): void {
         if (!implicit) {
@@ -319,7 +323,7 @@ export class DDrawPresenter implements RenderActive {
     }
 
     private flipHoldMs(): number {
-        if (this.lastFlipAt === -Infinity) return 0;
+        if (this.lastFlipAt === -Infinity || !this.holdUntilFlip()) return 0;
         if (this.flipIntervalMs <= 0) return FLIP_HOLD_MAX_MS;
         return Math.min(FLIP_HOLD_MAX_MS, this.flipIntervalMs * FLIP_HOLD_FLIP_INTERVALS);
     }
@@ -327,7 +331,9 @@ export class DDrawPresenter implements RenderActive {
     private implicitReady(now: number): boolean {
         if (now - this.lastFlipAt < this.flipHoldMs()) return false;
         const locked = (this.pendingSurface as { activeLeaseId?: number } | null)?.activeLeaseId !== undefined;
-        return !locked || now - this.latchedSince >= LOCK_HOLD_MAX_MS;
+        if (!locked) { this.lockedSince = -1; return true; }
+        if (this.lockedSince < 0) this.lockedSince = this.latchedSince;
+        return now - this.lockedSince >= LOCK_HOLD_MAX_MS;
     }
 
     private onRefresh(): void {
