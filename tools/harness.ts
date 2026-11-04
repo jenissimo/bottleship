@@ -62,8 +62,9 @@ import { readCanvasGeometry } from "./cdp-geometry";
 import { watchWorkerHealth, formatWorkerHealth } from "./cdp-worker-health";
 import { listCrashes, formatCrash } from "./cdp-crashes";
 import { DEFAULT_TRACE_CATEGORIES } from "./cdp-core";
-import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch } from "./cdp-touch";
+import { applyDevice, tap, touchDrag, longPress, twoFingerTap, pinch, touchTimeline, pageShot, type TimelineFinger } from "./cdp-touch";
 import { hostClick, hostMove } from "./cdp-mouse";
+import { hostKey } from "./cdp-keyboard";
 import { HarnessChain } from "../src/harness/dsl";
 import type { HarnessStep, HarnessRunResult, HarnessStepResult } from "../src/harness/types";
 import { runResultToJournal } from "../src/harness/journal";
@@ -162,7 +163,7 @@ let _journalSeq = 0;
 
 /** Verbs the CLI executes over CDP itself instead of shipping to the page: the
  *  page can neither reload itself mid-chain nor synthesize trusted touch input. */
-const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "pointerLock", "evalPage", "hostClick", "hostMove"]);
+const CDP_STEPS = new Set(["reload", "device", "tap", "touchDrag", "longPress", "twoFingerTap", "pinch", "touchTimeline", "pageShot", "pointerLock", "evalPage", "hostClick", "hostMove", "hostKey"]);
 
 async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unknown> {
     const a = step.args as (number | string | undefined)[];
@@ -176,11 +177,14 @@ async function runCdpStep(session: CdpSession, step: HarnessStep): Promise<unkno
         case "longPress": return longPress(session, n(0), n(1), opt(2));
         case "twoFingerTap": return twoFingerTap(session, n(0), n(1), opt(2));
         case "pinch": return pinch(session, n(0), n(1), n(2), { ms: opt(3) });
+        case "touchTimeline": return touchTimeline(session, (step.args[0] ?? []) as TimelineFinger[]);
+        case "pageShot": return pageShot(session, a[0] === undefined ? undefined : artifact(String(a[0])));
         case "pointerLock": return setPointerLock(session, a[0] !== false && a[0] !== 0);
         // The browser's own input stack — everything in front of the SAB that the
         // worker-side injectors skip, Pointer Lock engagement included.
         case "hostClick": return hostClick(session, (step.args[0] ?? {}) as Parameters<typeof hostClick>[1]);
         case "hostMove": return hostMove(session, n(0), n(1), opt(2) ?? 1);
+        case "hostKey": return hostKey(session, String(a[0]), opt(1));
         // Reading the CANVAS is a page-side act: the worker's own screenshot routes cannot see
         // what the compositor put on screen, and a PNG round-trip through `shot` throws away
         // the pixels a numeric assertion needs.
